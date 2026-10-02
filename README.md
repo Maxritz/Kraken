@@ -245,6 +245,9 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## Supported models
 
+Open issues, pending work and known races are tracked in
+[docs/TODO.md](docs/TODO.md).
+
 LLaMA-family checkpoints speaking the standard GGUF tensor schema:
 
 `llama`, `llama3`, `mistral`, `qwen2`, `qwen3` (QK-norm), `smollm`, `granite`,
@@ -265,6 +268,12 @@ partial RoPE are all handled.
 proposer. Verified in one batched forward, accepted tokens are bit-identical to
 plain greedy output (proven by the test suite); sampling requests fall back to
 the plain loop. `--bench` prints the acceptance rate.
+
+**Gated delta net (hybrid recurrent/attention)**: `qwen35` and `qwen35moe`
+(Qwen3.5 — conv + gated delta rule in place of attention on most layers). The
+f32 CPU path reproduces llama.cpp token for token. **The GPU path is not yet
+reproducible** — see [docs/TODO.md](docs/TODO.md) for what has been ruled out
+and what is next.
 
 **Not supported in v0.1**, and rejected loudly at load rather than mis-decoded:
 the IQ* (`IQ2_XXS`, `IQ3_*`, `IQ4_XS`, ...) formats. `kraken-inspect model.gguf

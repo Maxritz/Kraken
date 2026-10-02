@@ -1,5 +1,9 @@
 # KRAKEN — current status
 
+> **Pending work and open issues live in [TODO.md](TODO.md).** This document
+> records what has been built and measured; that one records what is still
+> broken and unfinished.
+
 Snapshot of the engine as it stands, what is proven, what is written but
 unproven, and what is next. Sections 1–7 record the session that added HTTP
 server mode, a real MoE model and the GPU bring-up checklist on top of the
