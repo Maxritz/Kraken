@@ -51,6 +51,12 @@ struct GenerateParams {
     std::vector<std::string> stop;
     StreamSink sink;
     bool echo_prompt = false;
+    // Debug: when > 0, write the top-k candidates and their log-probs for
+    // every sampled token to stderr, at full precision. Two runs that pick
+    // different tokens are then distinguishable by eye: identical log-probs
+    // up to a step and different ones after it means drift, while the very
+    // first step already differing means something raced.
+    i32 debug_topk = 0;
 };
 
 enum Finish : int {

@@ -36,6 +36,55 @@ i32 argmax_of(const f32 *logits, i64 n) {
     return best;
 }
 
+// Diagnostic for the top-k candidates of one decoding step. Printed with
+// %.9g so two runs can be diffed byte for byte: if the top-1 log-prob changes
+// between runs the divergence is already in the logits at that step, and if it
+// only starts changing several steps in, something upstream is drifting
+// rather than racing.
+void dump_topk(i32 k, i32 step, i64 pos, const f32 *logits, i64 n) {
+    const i32 kk = static_cast<i32>(std::min<i64>(k, n));
+    // Partial selection sort over a private copy: k passes over the vocab.
+    // NaN counts are reported because a single non-finite logit is enough to
+    // make the whole softmax meaningless, and it is invisible in the top-1.
+    i64 nan = 0, inf = 0;
+    for (i64 i = 0; i < n; i++) {
+        if (std::isnan(logits[i])) nan++;
+        else if (std::isinf(logits[i])) inf++;
+    }
+    std::vector<f32> work(logits, logits + n);
+    std::vector<i32> ids;
+    std::vector<f32> vals;
+    ids.reserve(static_cast<size_t>(kk));
+    vals.reserve(static_cast<size_t>(kk));
+    for (i32 c = 0; c < kk; c++) {
+        i64 best = c;
+        for (i64 i = c + 1; i < n; i++)
+            if (work[static_cast<size_t>(i)] > work[static_cast<size_t>(best)])
+                best = i;
+        if (c > 0 && best == c &&
+            !(work[static_cast<size_t>(c)] > work[static_cast<size_t>(c - 1)]))
+            break; // the tail is already in order; nothing left to rank
+        std::swap(work[static_cast<size_t>(c)], work[static_cast<size_t>(best)]);
+        ids.push_back(static_cast<i32>(best));
+        vals.push_back(work[static_cast<size_t>(c)]);
+    }
+    f32 mx = vals.empty() ? 0.0f : vals[0];
+    f32 sum = 0.0f;
+    for (f32 v : vals) sum += std::exp(static_cast<f64>(v - mx));
+    std::fprintf(stderr, "step %d pos %lld nan=%lld inf=%lld top%d:", step,
+                 static_cast<long long>(pos), static_cast<long long>(nan),
+                 static_cast<long long>(inf), static_cast<int>(vals.size()));
+    for (size_t i = 0; i < vals.size(); i++) {
+        const f64 lp = static_cast<f64>(vals[i]) -
+                       (std::log(static_cast<f64>(sum)) +
+                        static_cast<f64>(mx));
+        std::fprintf(stderr, " %d=%.9g(%.6f)", ids[i],
+                     static_cast<double>(vals[i]), lp);
+    }
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
 } // namespace
 
 Engine::~Engine() { shutdown(); }
@@ -1024,6 +1073,8 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     std::string pending;
 
     for (i32 gen = 0; gen < p.max_tokens; gen++) {
+        if (p.debug_topk > 0) dump_topk(p.debug_topk, gen, pos, logits_host_,
+                                         n_vocab_);
         const i32 token = sampler.sample(logits_host_, n_vocab_);
         if (token == tok_.eos()) {
             res->finish = FinishEos;

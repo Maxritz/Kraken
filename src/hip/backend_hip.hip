@@ -127,7 +127,10 @@ public:
         if (bytes == 0) bytes = 1;
         const size_t rounded = (bytes + 255u) & ~static_cast<size_t>(255u);
         void *p = nullptr;
-        KRK_HIP(hipMalloc(&p, rounded));
+        const hipError_t e = hipMalloc(&p, rounded);
+        if (e != hipSuccess) {
+            oom(rounded, e);
+        }
         allocated_ += rounded;
         return p;
     }
@@ -165,6 +168,33 @@ public:
         KRK_HIP(hipMemset(dst, 0, bytes));
     }
     void sync() override { KRK_HIP(hipDeviceSynchronize()); }
+
+    // Out of device memory. The bare hipErrorOutOfMemory tells the user
+    // nothing they can act on, and the amount that failed to allocate is
+    // usually only one slice of a much larger budget: report what the
+    // card has, what this process already holds, and the flags that
+    // actually move the numbers.
+    [[noreturn]] void oom(size_t want, hipError_t e) const {
+        size_t free_b = 0, total_b = 0;
+        hipMemGetInfo(&free_b, &total_b);
+        KRK_ERROR("out of VRAM: could not allocate %.1f MiB on %s", 
+                  static_cast<double>(want) / (1024.0 * 1024.0), 
+                  caps_.name.c_str());
+        KRK_ERROR("  device total %.2f GiB, free %.2f GiB, already held by "
+                  "this process %.2f GiB", 
+                  static_cast<double>(total_b) / (1024.0 * 1024.0 * 1024.0),
+                  static_cast<double>(free_b) / (1024.0 * 1024.0 * 1024.0),
+                  static_cast<double>(allocated_) / (1024.0 * 1024.0 * 1024.0));
+        KRK_ERROR("  (HIP reported %s)", hip_err_name(e));
+        KRK_ERROR("  another process may be holding VRAM; check with rocm-smi "
+                  "--showmeminfo vram");
+        KRK_ERROR("  to fit in this much VRAM, try a smaller model, or:");
+        KRK_ERROR("    --ctx N          smaller context (KV cache is the big term)");
+        KRK_ERROR("    --chunk N        smaller prefill batch (cuts workspace)");
+        KRK_ERROR("    --expert-cache-mb 0   for MoE, bound expert residency");
+        KRK_ERROR("    --expert-cache-slots 1 --expert-l2-mb 0");
+        std::abort();
+    }
 
     void download_f32(f32 *dst, const void *src, i64 n) override {
         std::vector<u16> tmp(static_cast<size_t>(n));

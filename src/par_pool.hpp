@@ -115,6 +115,10 @@ public:
         // when blocks < participants; participants whose range is empty
         // simply do nothing.
         const i64 stride = (blocks + participants - 1) / participants;
+        // The calling thread is the last participant. It publishes and
+        // claims its own slice in one critical section, so no worker can
+        // observe a half-written task.
+        Slice s;
         {
             std::unique_lock<std::mutex> lk(mu_);
             n_ = n;
@@ -126,10 +130,10 @@ public:
             // Release-order bump: workers acquire-load the id, so every
             // field written above is visible the moment they observe it.
             task_id_.fetch_add(1, std::memory_order_release);
+            s = snapshot();
             cv_start_.notify_all();
         }
-        // The calling thread is the last participant.
-        run_range(participants - 1);
+        run_slice(s, participants - 1);
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_done_.wait(lk, [&] { return done_ >= blocks_; });
@@ -144,17 +148,34 @@ private:
     // whole forward pass.
     static constexpr int kSpinMs = 2;
 
-    // Run this participant's slice of the current task. n_, grain_,
-    // blocks_ and stride_ are stable for the lifetime of a task: they
-    // are written under mu_ before the task id is bumped, and the next
-    // task cannot start until every participant has reported done.
-    void run_range(i64 me) {
-        const i64 b = me * stride_;
-        if (b >= blocks_) return;
-        const i64 e = std::min(b + stride_, blocks_);
-        const std::function<void(i64, i64)> &fn = *body_;
+    // One participant's slice of the current task, plus the geometry it was
+    // computed from. The caller rewrites n_/grain_/blocks_/stride_ for the
+    // NEXT task the moment every participant has reported done, so these
+    // fields may only be read while mu_ is held. Reading them unlocked let a
+    // participant run a slice built from one task's geometry against another
+    // task's body, covering some indices twice and others not at all
+    // (test_par_pool_covers_every_block failed ~1 run in 3).
+    struct Slice {
+        i64 n = 0, grain = 0, blocks = 0, stride = 0;
+        const std::function<void(i64, i64)> *body = nullptr;
+    };
+
+    // Snapshot the published geometry. Called under mu_.
+    Slice snapshot() const {
+        return Slice{n_, grain_, blocks_, stride_, body_};
+    }
+
+    // Run blocks [me*stride, min((me+1)*stride, blocks)) of the task
+    // described by `s`, then report completion. `s` is a private copy taken
+    // under the lock, so a concurrent publish of the next task cannot change
+    // the range out from under the body while it runs.
+    void run_slice(const Slice &s, i64 me) {
+        const i64 b = me * s.stride;
+        if (b >= s.blocks) return;
+        const i64 e = std::min(b + s.stride, s.blocks);
+        const std::function<void(i64, i64)> &fn = *s.body;
         for (i64 i = b; i < e; i++)
-            fn(i * grain_, std::min((i + 1) * grain_, n_));
+            fn(i * s.grain, std::min((i + 1) * s.grain, s.n));
         // One completion report per participant per task — staggered by
         // work completion, so the mutex sees almost no contention.
         {
@@ -202,7 +223,9 @@ private:
             // Watch the atomic task id without touching the mutex: a
             // back-to-back op finds every worker already hot, so the
             // pool costs zero syscalls on the decode hot path.
+            bool have = false;
             i64 run_id = 0;
+            Slice s;
             const auto deadline =
                 std::chrono::steady_clock::now() + std::chrono::milliseconds(kSpinMs);
             for (;;) {
@@ -211,8 +234,24 @@ private:
                     return;
                 const i64 t = task_id_.load(std::memory_order_acquire);
                 if (t > seen) {
-                    run_id = t;
-                    break;
+                    // Claim the geometry for THIS task id under the lock.
+                    // Reading it separately from the id let the two
+                    // disagree: a worker could observe id N, then snapshot
+                    // the geometry of N+1 after the caller had already
+                    // retired it — running a slice twice, or with a body
+                    // that had been reset to nullptr.
+                    std::lock_guard<std::mutex> lk(mu_);
+                    if (task_id_.load(std::memory_order_acquire) > seen) {
+                        run_id = task_id_.load(std::memory_order_acquire);
+                        s = snapshot();
+                        have = s.body != nullptr;
+                    }
+                    if (have) break;
+                    // The task was retired before we could claim it (the
+                    // caller's fast path can clear body_ without us).
+                    // Re-read the id and try again.
+                    seen = task_id_.load(std::memory_order_acquire);
+                    continue;
                 }
                 if (std::chrono::steady_clock::now() >= deadline) {
                     // ---- park phase ----
@@ -225,12 +264,22 @@ private:
                     if (quit_.load(std::memory_order_acquire) ||
                         my_gen != gen_.load(std::memory_order_acquire))
                         return;
+                    // Claim it here too, still under the lock, so the id
+                    // and the geometry always come from the same publish.
                     run_id = task_id_.load(std::memory_order_acquire);
+                    s = snapshot();
+                    have = run_id > seen && s.body != nullptr;
+                    if (!have) {
+                        seen = run_id;
+                        lk.unlock();
+                        continue;
+                    }
+                    lk.unlock();
                     break;
                 }
                 cpu_relax();
             }
-            run_range(my_idx);
+            run_slice(s, my_idx);
             // Mark the task just drained — NOT whatever task_id_ says now.
             // The caller may publish the next op while we report, and
             // re-reading the id here would swallow that task: its blocks

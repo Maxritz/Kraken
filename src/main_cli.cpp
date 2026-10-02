@@ -35,6 +35,7 @@ struct Args {
     bool chat = false;
     bool info = false;
     bool bench = false;
+    int debug_topk = 0; // stderr dump of top-k logprobs per token
     bool verbose = false;
     bool interactive = true;
     f32 temp = 0.8f;
@@ -71,6 +72,8 @@ void usage() {
         "  --draft-tokens N      speculation window (default 4)\n"
         "  --info                print model and device info, then exit\n"
         "  --bench               prefill/decode benchmark on a fixed prompt\n"
+        "  --debug-topk N        dump the top-N candidates and their log-probs\n"
+        "                        for every token to stderr (at full precision)\n"
         "  -v                    verbose logging\n"
         "  -h, --help            this message\n",
         kEngineName, kEngineVersion);
@@ -114,6 +117,8 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--cpu") a->cpu = true;
         else if (f == "--info") a->info = true;
         else if (f == "--bench") a->bench = true;
+        else if (f == "--debug-topk")
+            a->debug_topk = std::atoi(next("--debug-topk"));
         else if (f == "-v" || f == "--verbose") a->verbose = true;
         else if (f == "-h" || f == "--help") { usage(); std::exit(0); }
         else {
@@ -357,6 +362,7 @@ int main(int argc, char **argv) {
         p.sampler.greedy = a.greedy;
         p.sampler.seed = a.seed;
         p.stop = {"<|im_end|>", "<|eot_id|>"};
+        p.debug_topk = a.debug_topk;
         p.sink.fn = sink_cb;
         p.sink.user = &sink;
 

@@ -8,6 +8,7 @@
 #include <krk/model.hpp>
 
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -468,6 +469,14 @@ int gdn_suite(Backend *cpu, Backend *gpu) {
 } // namespace
 
 int main(int argc, char **argv) {
+    // A probe run is long and its output is usually piped into head or grep.
+    // The reader goes away first, the pipe closes, and a process that keeps
+    // writing blocks in write() forever instead of exiting — one of these
+    // probes sat for three hours before anyone noticed. Default SIGPIPE
+    // disposition turns that into an ordinary exit.
+#ifdef SIGPIPE
+    std::signal(SIGPIPE, SIG_DFL);
+#endif
     if (argc > 1 && std::string(argv[1]) == "--gdn") {
         std::string err;
         Backend *c = make_cpu_backend();
