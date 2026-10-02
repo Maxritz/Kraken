@@ -172,6 +172,35 @@ pass, the sampler and both tokenizer families are all covered end to end.
 
 ---
 
+## Benchmarks
+
+Measured with `kraken --bench` (greedy, ctx 4096, chunk 256) on
+**SmolLM2 135M Instruct** (Q4_K_M; 30 layers, 576 embd, GQA 9/3
+heads, head_dim 64, FF 1536, vocab 49152):
+
+| device | HIP | prefill, 51 tok | decode, 64 tok | decode, 256 tok |
+|---|---|---|---|---|
+| AMD Radeon RX 9070 XT (gfx1201, RDNA4, WMMA, 32 WGPs) | 7.16 | 3.7–4.4k tok/s | 448–476 tok/s | 430–433 tok/s |
+| AMD Radeon RX 6700 XT (gfx1031, RDNA2, no WMMA, 20 MPs) | 7.15 | 577–837 tok/s | 304–372 tok/s | — |
+
+Ranges are min–max over repeated runs. The 5-round engine A/B on the
+9070 XT averages **427.6 tok/s** decode with both kernel fusions on
+(defaults) and **440.1 tok/s** on the best arm (`KRK_FUSED_LAYER=0`,
+`KRK_FUSED_ATTN=1`); prefill is unaffected by either flag. Kernel-level
+probes put the 9070 XT decode step at 727 tok/s launched and 741 tok/s
+under a HIP graph (wall-clock), and a 51-token prefill chunk at
+12.2k tok/s. The full decode-bandwidth campaign, fusion A/B and graph
+timing methodology are in [docs/STATUS.md](docs/STATUS.md) (§8–§11).
+
+**Qwen3-MoE-4x0.6B-2.4B** (Q4_K_M, 965 MB — fetched with
+`scripts/fetch_moe_model.sh`) loads and completes real greedy forward
+passes on the CPU oracle. The oracle is scalar and single-threaded
+(minutes per 28-layer MoE forward), so it proves correctness, not
+speed — interactive MoE decode is what the GPU backends are for. Use
+`--ctx 256/512` for MoE runs on small machines.
+
+---
+
 ## HTTP server (OpenAI-compatible)
 
 ```sh
