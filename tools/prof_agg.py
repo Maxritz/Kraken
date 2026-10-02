@@ -4,6 +4,16 @@
 Usage:
     rocprofv3 --pmc ... -f csv -d /tmp/prof -- ./app
     python3 tools/prof_agg.py /tmp/prof/<host>/<pid>_counter_collection.csv
+    python3 tools/prof_agg.py --guard /tmp/prof/<host>/<pid>_counter_collection.csv
+
+The last form is a REGRESSION GUARD, not a report: it exits non-zero when any
+kernel's LDS reads serialise on bank conflicts beyond a budget. That is the
+defect class that held the gfx10 tile GEMMs at 2.9 TFLOP/s (fp16) and 6.2 TOP/s
+(int8) while every average-based check stayed green -- SQC_LDS_BANK_CONFLICT
+over SQ_INSTS_LDS measured 16.4 and 19.4 respectively, against 0.0-2.5 for the
+same kernels once their fetch was rotated off the aliased banks. The limit
+here is 6.0, comfortably above every clean kernel measured on gfx1031 and
+comfortably below the bug. scripts/check_lds.sh drives the whole check.
 
 Why this exists: rocprofv3 emits one CSV row per (dispatch, counter). A single
 GEMM run is thousands of rows and the interesting questions are all ratios
@@ -114,8 +124,92 @@ def main(path: str) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# the guard
+# ---------------------------------------------------------------------------
+
+# Conflicts per LDS instruction. Clean kernels on gfx1031 measure 0.0 (every
+# non-GEMM kernel, and the rotated fp16 tile), 2.2 (Q4_K/Q5_K int8 tiles) and
+# up to 3.9 (Q6_K's staging); the aliased fetch measured 16.4 (fp16) and 19.4
+# (int8). 6.0 therefore sits an order of magnitude below the defect and 1.5x
+# above the worst clean kernel, which is what a guard threshold is for.
+DEFAULT_CONFLICT_LIMIT = 6.0
+# A ratio needs volume to mean anything: a kernel with 500 LDS reads can show
+# any ratio at all from one scheduling accident.
+MIN_DISPATCH_LDS = 10000.0
+MIN_KERNEL_LDS = 100000.0
+
+
+def guard(path: str, limit: float) -> int:
+    """Fail when any kernel's LDS reads serialise on bank conflicts."""
+    per = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))
+    collected = False
+    with open(path, newline="") as fh:
+        for r in csv.DictReader(fh):
+            c = (r.get("Counter_Name") or "").strip()
+            if c not in ("SQ_INSTS_LDS", "SQC_LDS_BANK_CONFLICT"):
+                continue
+            collected = True
+            slot = per[r.get("Kernel_Name", "?")][r.get("Dispatch_Id", "?")]
+            slot[0 if c == "SQ_INSTS_LDS" else 1] = float(r.get("Counter_Value") or 0)
+    if not collected:
+        print("guard: no LDS counters in this CSV; profile with "
+              "--pmc SQ_INSTS_LDS SQC_LDS_BANK_CONFLICT")
+        return 2
+
+    print(f"LDS bank-conflict guard: limit {limit:.1f} conflicts per LDS "
+          f"instruction")
+    print(f"{'kernel':40s} {'disp':>5s} {'lds':>12s} {'worst/disp':>11s} "
+          f"{'weighted':>9s}  verdict")
+    worst_kernel, worst_rate = None, 0.0
+    checked = 0
+    for kern in sorted(per, key=lambda k: -sum(v[0] for v in per[k].values())):
+        total_lds = sum(v[0] for v in per[kern].values())
+        total_bcf = sum(v[1] for v in per[kern].values())
+        if total_lds < MIN_KERNEL_LDS:
+            continue
+        # Per-dispatch ratios, because one pathological dispatch must not be
+        # able to hide behind a large clean volume.
+        rates = [v[1] / v[0] for v in per[kern].values() if v[0] >= MIN_DISPATCH_LDS]
+        worst = max(rates) if rates else 0.0
+        weighted = total_bcf / total_lds if total_lds else 0.0
+        checked += 1
+        bad = worst > limit
+        if worst > worst_rate:
+            worst_kernel, worst_rate = kern, worst
+        print(f"{kern[:40]:40s} {len(per[kern]):>5d} {total_lds:>12.3g} "
+              f"{worst:>11.3f} {weighted:>9.3f}  "
+              f"{'FAIL' if bad else 'ok'}")
+
+    if checked == 0:
+        print("guard: no kernel issued enough LDS traffic to judge; is this a "
+              "real workload?")
+        return 2
+    if worst_rate > limit:
+        print(f"\n*** {worst_kernel} reaches {worst_rate:.2f} conflicts per LDS "
+              f"instruction (limit {limit:.1f}). ***")
+        print("    The gfx10 tile kernels measured 16-19 when a tile row's stride "
+              "put every lane on one bank;")
+        print("    see docs/TODO.md P1b for the rotation that fixed it and "
+              "tools/gemm_i8.cpp §3 for the ablation.")
+        return 1
+    print(f"\nPASS: {checked} LDS-issuing kernels inside the budget "
+          f"(worst {worst_rate:.3f}).")
+    return 0
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    want_guard = "--guard" in args
+    limit = DEFAULT_CONFLICT_LIMIT
+    if "--limit" in args:
+        i = args.index("--limit")
+        limit = float(args[i + 1])
+        del args[i:i + 2]
+    paths = [a for a in args if a != "--guard"]
+    if len(paths) != 1:
         print(__doc__)
         raise SystemExit(2)
-    raise SystemExit(main(sys.argv[1]))
+    if want_guard:
+        raise SystemExit(guard(paths[0], limit))
+    raise SystemExit(main(paths[0]))
