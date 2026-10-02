@@ -35,6 +35,21 @@
 //  the fp32 FMA and dp4c numbers this is compared against. MAC/s is printed
 //  next to it so the two are never confused.
 //
+//  THE WIDE (16-BYTE) FETCH IS AN EXPERIMENT, AND IT MEASURED EQUAL TO THE
+//  NARROW ONE. Section 3c exists because the ISA census raised a real
+//  question: the plain fetch's adjacent quads merge into one 128-bit LDS read
+//  (32x ds_read_b128 per k-tile) and the per-quad rotation forbids that merge
+//  (64x ds_read2_b32 instead). Rotating the 16-byte GROUP rather than the quad
+//  ought to give the merge back. It does not: clang emits the SAME two forms
+//  from both sources (verified with -S on the emitted ISA), the wall clock
+//  matches to four digits (9.28 vs 9.29 TOP/s; 11.27 vs 11.28), and the plain
+//  variants are equally identical to each other. Two conclusions, both
+//  measured: the fetch width is not the limiter any more, and the rotated
+//  kernels are no slower with 64 narrow reads than with 32 wide ones, so
+//  further LDS-fetch tuning is the wrong lever. What is left on this kernel is
+//  the global->LDS staging path, which is also what the fp16 ablation found
+//  (59.5% of its remaining time).
+//
 //  THE TILE'S LDS READS WERE BANK-ALIASED, AND ROTATION FIXES THEM. The tile
 //  rows are BK = 32 bytes = 8 words wide, which is 0 mod 32 banks, so the row
 //  index cancels out of the bank number and the plain k-quad index q makes the
@@ -317,7 +332,8 @@ Peak measure_peak(int cus, double clk_ghz, const int *rot) {
 // of K and writes int32 partials, which reduce_kernel sums in a fixed loop
 // order. Deliberately NOT float atomicAdd: atomic ordering is non-deterministic
 // and this engine's output has to be reproducible run to run.
-template <int BM, int BN, int BK, int TM, int TN, int STAGES, int SPLIT, bool ROT>
+template <int BM, int BN, int BK, int TM, int TN, int STAGES, int SPLIT, bool ROT,
+          bool WIDE = false>
 __global__ void __launch_bounds__((BM / TM) * (BN / TN))
     gemm_i8_kernel(const int8_t *__restrict__ A, const int8_t *__restrict__ B,
                    const float *__restrict__ row_scale,
@@ -420,6 +436,36 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN))
         const int8_t *Ac = As[stage] + ty * TM * BK;
         const int8_t *Bc = Bs[stage] + tx * TN * BK;
 
+#if WIDE
+        // 16-byte groups: one load supplies FOUR quads, so the same k values
+        // arrive in a quarter of the instructions — and, unlike the narrow
+        // form, LLVM can keep the 128-bit LDS read it emits for adjacent quads.
+        // The rotation moves the GROUP index instead of the quad: with a
+        // 32-byte row there are only two groups (KQ/4 == 2 at BK=32), so the
+        // lanes land on two of the row's eight words rather than one. Every
+        // lane still consumes both groups exactly once, in its own order, so
+        // the int32 sum is unchanged.
+#pragma unroll
+        for (int g = 0; g < KQ / 4; g++) {
+            const int gg = ROT ? (g ^ (tx & (KQ / 4 - 1))) : g;
+            int4 a[TM], b[TN];
+#pragma unroll
+            for (int i = 0; i < TM; i++)
+                a[i] = *reinterpret_cast<const int4 *>(Ac + i * BK + gg * 16);
+#pragma unroll
+            for (int j = 0; j < TN; j++)
+                b[j] = *reinterpret_cast<const int4 *>(Bc + j * BK + gg * 16);
+#pragma unroll
+            for (int i = 0; i < TM; i++)
+#pragma unroll
+                for (int j = 0; j < TN; j++) {
+                    acc[i][j] = __builtin_amdgcn_sdot4(a[i].x, b[j].x, acc[i][j], 0);
+                    acc[i][j] = __builtin_amdgcn_sdot4(a[i].y, b[j].y, acc[i][j], 0);
+                    acc[i][j] = __builtin_amdgcn_sdot4(a[i].z, b[j].z, acc[i][j], 0);
+                    acc[i][j] = __builtin_amdgcn_sdot4(a[i].w, b[j].w, acc[i][j], 0);
+                }
+        }
+#else
 #pragma unroll
         for (int q = 0; q < KQ; q++) {
             // qq keeps the tx lanes off each other's banks; see the aliasing
@@ -440,6 +486,7 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN))
                 for (int j = 0; j < TN; j++)
                     acc[i][j] = __builtin_amdgcn_sdot4(a[i], b[j], acc[i][j], 0);
         }
+#endif
 
         __syncthreads();
         stage = nxt;
@@ -590,27 +637,60 @@ struct Run {
     bool deterministic;
 };
 
-template <int BM, int BN, int BK, int TM, int TN, int STAGES, int SPLIT, bool ROT>
+template <int BM, int BN, int BK, int TM, int TN, int STAGES, int SPLIT, bool ROT,
+          bool WIDE = false>
 Run bench(int M, int N, int K, const int8_t *dA, const int8_t *dB,
           const float *dRS, const float *dCS, int8_t *dC, int32_t *dP);
 
 // The ablation's (rot, split) dispatch: each arm is a real specialization of
 // the same tile, so the comparison is between emitted kernels, not branches.
-template <int BM, int BN, int BK, int TM, int TN, int STAGES, bool ROT>
+template <int BM, int BN, int BK, int TM, int TN, int STAGES, bool ROT,
+          bool WIDE = false>
 Run bench_rot_split(int split, int M, int N, int K, const int8_t *dA,
                     const int8_t *dB, const float *dRS, const float *dCS,
                     int8_t *dC, int32_t *dP) {
     if (split == 1)
-        return bench<BM, BN, BK, TM, TN, STAGES, 1, ROT>(M, N, K, dA, dB, dRS,
-                                                         dCS, dC, dP);
+        return bench<BM, BN, BK, TM, TN, STAGES, 1, ROT, WIDE>(M, N, K, dA, dB,
+                                                              dRS, dCS, dC, dP);
     if (split == 2)
-        return bench<BM, BN, BK, TM, TN, STAGES, 2, ROT>(M, N, K, dA, dB, dRS,
-                                                         dCS, dC, dP);
+        return bench<BM, BN, BK, TM, TN, STAGES, 2, ROT, WIDE>(M, N, K, dA, dB,
+                                                              dRS, dCS, dC, dP);
     if (split == 4)
-        return bench<BM, BN, BK, TM, TN, STAGES, 4, ROT>(M, N, K, dA, dB, dRS,
-                                                         dCS, dC, dP);
-    return bench<BM, BN, BK, TM, TN, STAGES, 8, ROT>(M, N, K, dA, dB, dRS, dCS,
-                                                     dC, dP);
+        return bench<BM, BN, BK, TM, TN, STAGES, 4, ROT, WIDE>(M, N, K, dA, dB,
+                                                              dRS, dCS, dC, dP);
+    return bench<BM, BN, BK, TM, TN, STAGES, 8, ROT, WIDE>(M, N, K, dA, dB, dRS,
+                                                           dCS, dC, dP);
+}
+
+// 3c's dispatch: the three configs that led the sweep, each in all four
+// narrow/wide x rotated/plain fetches. Split is 1: this section is about the
+// fetch, and split only moves K-parallelism.
+template <int BM, int BN, int BK, int TM, int TN, int STAGES>
+Run fetch_arm(bool rot, bool wide, int M, int N, int K, const int8_t *dA,
+              const int8_t *dB, const float *dRS, const float *dCS, int8_t *dC,
+              int32_t *dP) {
+    if (wide)
+        return rot ? bench_rot_split<BM, BN, BK, TM, TN, STAGES, true, true>(
+                         1, M, N, K, dA, dB, dRS, dCS, dC, dP)
+                   : bench_rot_split<BM, BN, BK, TM, TN, STAGES, false, true>(
+                         1, M, N, K, dA, dB, dRS, dCS, dC, dP);
+    return rot ? bench_rot_split<BM, BN, BK, TM, TN, STAGES, true, false>(
+                     1, M, N, K, dA, dB, dRS, dCS, dC, dP)
+               : bench_rot_split<BM, BN, BK, TM, TN, STAGES, false, false>(
+                     1, M, N, K, dA, dB, dRS, dCS, dC, dP);
+}
+
+Run run_fetch(int cfg, bool rot, bool wide, int M, int N, int K, const int8_t *dA,
+              const int8_t *dB, const float *dRS, const float *dCS, int8_t *dC,
+              int32_t *dP) {
+    if (cfg == 0)
+        return fetch_arm<128, 128, 32, 8, 8, 2>(rot, wide, M, N, K, dA, dB, dRS,
+                                                dCS, dC, dP);
+    if (cfg == 1)
+        return fetch_arm<128, 128, 16, 8, 8, 4>(rot, wide, M, N, K, dA, dB, dRS,
+                                                dCS, dC, dP);
+    return fetch_arm<128, 128, 64, 8, 8, 2>(rot, wide, M, N, K, dA, dB, dRS, dCS,
+                                            dC, dP);
 }
 
 // Tile shapes worth re-comparing once the fetch is conflict-free. Stages,
@@ -623,6 +703,11 @@ static const char *const kArmName[] = {
     "64x128x32 s2",  "128x128x32 TM4", "128x128x16 s4",
 };
 static constexpr int kArms = 7;
+
+// The three configs section 3c compares both fetch widths on: the two that led
+// the shape sweep plus the deepest K tile.
+static const char *const kFetchCfg[] = {"128x128x32 s2", "128x128x16 s4",
+                                        "128x128x64 s2"};
 
 Run run_arm(int id, int M, int N, int K, const int8_t *dA, const int8_t *dB,
             const float *dRS, const float *dCS, int8_t *dC, int32_t *dP) {
@@ -648,7 +733,8 @@ Run run_arm(int id, int M, int N, int K, const int8_t *dA, const int8_t *dB,
                                                  dP);
 }
 
-template <int BM, int BN, int BK, int TM, int TN, int STAGES, int SPLIT, bool ROT>
+template <int BM, int BN, int BK, int TM, int TN, int STAGES, int SPLIT, bool ROT,
+          bool WIDE>
 Run bench(int M, int N, int K, const int8_t *dA, const int8_t *dB,
           const float *dRS, const float *dCS, int8_t *dC, int32_t *dP) {
     const dim3 grid(static_cast<unsigned>((N + BN - 1) / BN),
@@ -657,7 +743,7 @@ Run bench(int M, int N, int K, const int8_t *dA, const int8_t *dB,
     constexpr int THREADS = (BM / TM) * (BN / TN);
 
     auto once = [&] {
-        gemm_i8_kernel<BM, BN, BK, TM, TN, STAGES, SPLIT, ROT>
+        gemm_i8_kernel<BM, BN, BK, TM, TN, STAGES, SPLIT, ROT, WIDE>
             <<<grid, THREADS>>>(dA, dB, dRS, dCS, dC, dP, M, N, K, K, N, N);
         if (SPLIT > 1) {
             const int total = M * N;
@@ -887,6 +973,36 @@ int main(int argc, char **argv) {
             std::printf("    %-14s %9.3f ms  %6.2f TFLOP/s  %6.1f%%  maxerr %d%s\n",
                         kArmName[arm], r.ms, r.tops, 100.0 * r.tops / ref,
                         ck.maxerr, r.deterministic ? "" : "  NONDET");
+        }
+
+        // 3c. Fetch width x rotation on the three leading configs. The ISA
+        // raised the question: the unrotated fetch's adjacent quads merge into
+        // one 128-bit LDS read, which the narrow per-quad rotation forbids, so
+        // the narrow fix traded 32 wide aliased reads for 64 narrow spread
+        // ones. Rotating the 16-byte GROUP instead should keep the merge while
+        // still moving the lanes off each other's banks. Measured, not argued.
+        for (int cfg = 0; cfg < 3; cfg++) {
+            for (int wide = 0; wide <= 1; wide++) {
+                for (int rot = 0; rot <= 1; rot++) {
+                    const Run r = run_fetch(cfg, rot != 0, wide != 0, c.M, c.N,
+                                            c.K, dA, dB, dRS, dCS, dC, dP);
+                    std::vector<int8_t> got(out_elems);
+                    HIP_CHECK(hipMemcpy(got.data(), dC, out_elems,
+                                        hipMemcpyDeviceToHost));
+                    const Check ck = verify_gemm(got, A, B, rs.data(), cs.data(),
+                                                 c.M, c.N, c.K, c.K, c.N);
+                    if (ck.bad || !r.deterministic) all_correct = false;
+                    if (ck.bad)
+                        dump_first_mismatches(got, A, B, rs.data(), cs.data(),
+                                              c.M, c.N, c.K, c.K, c.N, 4);
+                    std::printf("    %-14s %-6s %-5s %9.3f ms  %6.2f TFLOP/s  "
+                                "%6.1f%%  maxerr %d%s\n",
+                                kFetchCfg[cfg], rot ? "rot" : "plain",
+                                wide ? "wide" : "narrow", r.ms, r.tops,
+                                100.0 * r.tops / ref, ck.maxerr,
+                                r.deterministic ? "" : "  NONDET");
+                }
+            }
         }
         std::printf("\n");
         HIP_CHECK(hipFree(dA));

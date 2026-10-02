@@ -161,6 +161,16 @@ target_link_libraries(kraken-inspect PRIVATE krk_core)
 if(KRK_HIP_AVAILABLE)
     add_executable(kraken-oracle tools/oracle_probe.cpp)
     target_link_libraries(kraken-oracle PRIVATE krk_core krk_hip)
+    # Checks the int8 DP4A weight staging (Q8_0/Q4_K/Q5_K/Q6_K) against the
+    # host reference decoder, code position by code position. Two
+    # implementations of the same block layout is where a silent mis-read
+    # hides, so it is a test rather than a comment.
+    add_executable(kraken-i8k tools/gemm_i8k_verify.cpp)
+    target_link_libraries(kraken-i8k PRIVATE krk_core krk_hip)
+    # The kernel headers are included as the backend includes them
+    # ("kernels/..."), so the tool compiles the same file the engine does.
+    target_include_directories(kraken-i8k PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/hip)
 endif()
 
 # ---------------------------------------------------------------------------

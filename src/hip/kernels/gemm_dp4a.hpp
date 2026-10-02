@@ -1,50 +1,68 @@
 // ============================================================================
-//  gemm_dp4a.hpp — Q8_0 prefill GEMM on the int8 dot pipe (v_dot4c_i32_i8).
+//  gemm_dp4a.hpp — int8 dot-pipe GEMM (DP4A) for the quantized weight formats.
 //
 //  WHAT THIS IS
-//    out[rows, n_out] = X[rows, n_in] * W[n_out, n_in]^T   for W in Q8_0.
+//    out[rows, n_out] = X[rows, n_in] * W[n_out, n_in]^T
 //
-//    Q8_0 is the one GGUF weight format whose payload *is* int8: 32 signed
-//    codes behind a single fp16 scale. v_dot4c_i32_i8 consumes those bytes
-//    directly — four int8 MACs per lane per instruction, lane-local on this
-//    part — so the weight tile needs no dequantize-to-fp16 staging at all. The
-//    activations are quantized to int8 per 32-value block on the way in, and
-//    each k-tile's int32 partial is folded into the fp32 accumulator with the
-//    product of the two blocks' scales.
+//    for W in Q8_0, Q4_K, Q5_K or Q6_K. v_dot4c_i32_i8 computes four int8 MACs
+//    per lane per instruction and is lane-local on RDNA2 (probe_gemm_tile.hip
+//    §1 settles that by running it), so the kernel is a plain int8 tile GEMM:
+//    the weights are staged into LDS as the *codes* the format already stores,
+//    the activations are quantized to int8 per 32-value block, and each k-tile
+//    folds its int32 partial into the fp32 accumulator with the block scales.
+//    No dequantize-to-fp16 staging on the weight side at all.
+//
+//  THE AFFINE FORM. Q8_0's codes are values on their own (value = d*q), but the
+//  K-quants are affine: value = scale*q - min, with `min` from a second
+//  quantized field (Q4_K/Q5_K: dmin*m per 32-value sub-block; Q6_K: a fixed
+//  32*scale offset). A dot product against an affine operand splits exactly:
+//
+//      sum_k a_k * (S*q_k - M)  =  S * sum_k (a_k q_k)  -  M * sum_k a_k
+//
+//  so the kernel needs the sum of the ACTIVATION codes per block as well as
+//  their dot with the weight codes. The activation sum is computed once per
+//  row per k-tile during staging and folded with the same FMA that applies the
+//  scale, which is why the K-quant path costs one extra FMA per output element
+//  per tile rather than a second accumulator.
+//
+//  Q6_K's SCALE GRANULARITY IS 16, NOT 32. Its int8 scale vector has two
+//  entries per 32-value chunk, so the tile is split into two halves: the int32
+//  partials are accumulated per half and folded twice, each with its own
+//  (scale, min) and its own activation sum. Q4_K/Q5_K/Q8_0 fold once.
+//
+//  THIS FILE MIRRORS dequant.hpp's FORMAT KNOWLEDGE. Which byte holds which
+//  code and where a sub-block scale lives is the format's business, and
+//  dequant.hpp already decodes all four formats for the fp16 kernels. The
+//  staging below reads the same fields; tools/gemm_i8k_verify.cpp checks every
+//  produced code against the HOST reference decoder in quant.hpp, so a drift
+//  between the two implementations fails a test rather than silently
+//  mis-reading weights.
 //
 //  WHY IT IS BEHIND A FLAG (KRK_GEMM_INT8=1) AND OFF BY DEFAULT
-//    * It is a LOSSY path. Every other kernel in this tree dequantizes exactly
-//      and produces bit-identical results run to run and path to path; int8
-//      activations carry about seven significant bits, so this path's logits
-//      differ from the fp16 path's in the last hundredths. That is the deal
-//      every DP4A engine makes, but it is a different deal from the one the
-//      rest of kraken makes, so it earns its place with a measurement rather
-//      than by becoming the default.
-//    * On gfx1031 (RX 6700 XT) the measured register-only ceilings are
-//      52.08 TOP/s for int8 against 25.3 TFLOP/s for packed fp16 — 2x, not the
-//      4x the raw issue rates suggest — and the per-block scale folding costs
-//      part of that back in VALU ops. It is most likely to win where the
-//      weights are the traffic (Q8_0 is 1.06 B/value against fp16's 2 B) and
-//      least likely where the multiply is the wall.
-//    * With the flag absent, nothing here runs and no default path changes.
-//
-//  MEASURED ON THE CARD (gfx1031, Llama-3.2-1B-Q8_0, one binary, the flag the
-//  only difference): prefill 1109 -> 1371 tok/s (+24%); decode unchanged, since
-//  rows == 1 is the gemv path and never reaches here. The greedy token stream
-//  is identical, the top-3 log-probs differ by at most 0.03 on ~19.0 (0.2%),
-//  and two runs are byte-identical. rocprofv3 on this kernel: 1.97 bank
-//  conflicts per LDS instruction (the 2-way floor for a 32-byte row), 112
-//  VGPRs, 0 scratch.
+//    * It is a LOSSY path: int8 activations carry about seven significant bits,
+//      so logits differ from the fp16 path's in the last hundredths. Every
+//      other kernel here dequantizes exactly; that is a different promise, so
+//      this one earns its place with a measurement instead of a default.
+//    * Measured ceilings on gfx1031: 52.08 TOP/s int8 against 25.3 TFLOP/s
+//      packed fp16, and the per-block folding costs part of that back. On
+//      Llama-3.2-1B-Q8_0 prefill (one binary, the flag the only difference):
+//      1109 -> 1371 tok/s, identical greedy token stream, top-3 log-probs
+//      within 0.2%, identical runs, and the kernel profiles at 1.97 bank
+//      conflicts per LDS instruction with 112 VGPRs and no scratch.
+//    * With the flag absent nothing here runs and no default path changes.
 //
 //  LDS TILING. Same tile and the same lane-rotated fetch as the fp16 SIMT
-//  kernel, for the same reason: a tile row is BK = 32 bytes = 8 words, so the
-//  row index cancels out of the bank number and the plain k-quad index puts
-//  all 16 tx lanes on ONE bank (16 different addresses, 16 replays). Rotating
-//  the quad by the thread's tx (q -> q ^ tx) is a bijection over the 8 quads,
-//  so every thread still consumes every quad exactly once and the int32 sum is
-//  unchanged. tools/gemm_i8.cpp measured the rotation on this exact tile:
-//  SQC_LDS_BANK_CONFLICT/SQ_INSTS_LDS 19.4 -> 7.4 and 6.20 -> 9.27 TOP/s at
-//  4096^3 (11.26 with a BK=16 tile), maxerr 0 against its CPU reference.
+//  kernel: a tile row is BK = 32 bytes = 8 words, so the row index cancels out
+//  of the bank number and the plain k-quad index puts all 16 tx lanes on ONE
+//  bank. Rotating the quad by the thread's tx (q -> q ^ tx) is a bijection over
+//  the 8 quads, so every thread still consumes every quad exactly once and the
+//  int32 sum is unchanged. tools/gemm_i8.cpp measured it: SQC_LDS_BANK_CONFLICT
+//  /SQ_INSTS_LDS 19.4 -> 7.4 and 6.20 -> 9.27 TOP/s at 4096^3 (11.26 with a
+//  BK=16 tile), maxerr 0 against its CPU reference. The same harness also
+//  settled the fetch width: a 16-byte-group rotation emits the identical ISA
+//  and the identical time as the per-quad rotation, so the fetch is no longer
+//  the limiter and the wide/narrow question is closed (measurement, not
+//  preference — see §3c of that file).
 //
 //  NO SPLIT-K. The expert blocks this exists for are short-K and few-row, and
 //  split-K's fp32 partial traffic costs more than the parallelism it buys at
@@ -57,27 +75,53 @@
 
 namespace krk {
 
+// ---------------------------------------------------------------------------
+// the weight formats this kernel stages, and their per-32-code layout
+// ---------------------------------------------------------------------------
+
+enum Dp4aWeight {
+    kDp4aWq8 = 0, // Q8_0: 32 signed codes, one scale per 32
+    kDp4aWq4 = 1, // Q4_K: 32 nibbles, scale + min per 32-value sub-block
+    kDp4aWq5 = 2, // Q5_K: as Q4_K plus a 5th bit from a second plane
+    kDp4aWq6 = 3, // Q6_K: 32 six-bit codes, scale + 32*scale per 16 values
+};
+
+// -1 when the format cannot be staged as int8 codes.
+inline int dp4a_kind(int wt) {
+    switch (static_cast<DType>(wt)) {
+        case DType::Q8_0: return kDp4aWq8;
+        case DType::Q4_K: return kDp4aWq4;
+        case DType::Q5_K: return kDp4aWq5;
+        case DType::Q6_K: return kDp4aWq6;
+        default: return -1;
+    }
+}
+
 namespace dp4a_cfg {
 // 64 rows rather than 128: the routed-expert GEMMs that motivate this path run
 // a few dozen rows per block, and a taller tile mostly multiplies the wasted
 // staging. TX=16 keeps the rotated fetch on 16 banks.
 constexpr int BM = 64;
 constexpr int BN = 128;
-constexpr int BK = 32; // one Q8_0 block; see the fold's static_assert
+constexpr int BK = 32; // one 32-value sub-block; see the fold's static_assert
 constexpr int TM = 4;
 constexpr int TN = 8;
 constexpr int STAGES = 2;
 constexpr int TX = BN / TN; // 16
 constexpr int TY = BM / TM; // 16
 constexpr int THREADS = TX * TY;
-// Bytes of one Q8_0 block: 2 B fp16 scale + 32 int8 codes.
+// A K-quant superblock is 256 values = 8 sub-blocks of 32, so eight k-tiles
+// share one block header.
+constexpr int KBLOCK_CHUNKS = 8;
 constexpr size_t Q8_BLOCK_BYTES = 34;
 
-// The fold multiplies one k-tile's int32 partial by a single scale pair, so a
-// k-tile that straddled two blocks of different scale would be wrong. Q8_0
-// blocks are 32 values, hence BK == 32.
-static_assert(BK == 32, "the per-block fold assumes one Q8_0 block per k-tile");
+// The fold applies one (scale, min) pair to one k-tile's int32 partial, so a
+// k-tile that straddled two sub-blocks would be wrong. Every format above has
+// 32-value sub-blocks, except Q6_K whose 16-value halves are handled by
+// splitting the tile.
+static_assert(BK == 32, "the per-block fold assumes 32-value sub-blocks");
 static_assert(TX == 16, "the rotated fetch wants 16 tx lanes");
+static_assert(KBLOCK_CHUNKS == 8, "K-quant superblocks hold eight 32-value chunks");
 } // namespace dp4a_cfg
 
 // ---------------------------------------------------------------------------
@@ -117,21 +161,191 @@ __global__ void quantize_act_kernel(const _Float16 *__restrict__ x,
 }
 
 // ---------------------------------------------------------------------------
+// weight staging: one output row's 32 codes for one k-tile
+// ---------------------------------------------------------------------------
+//
+// Every branch mirrors exactly one decoder in dequant.hpp (dequant_chunk<T>);
+// the fields it reads are named for the format they come from. `kt` is the
+// global k-tile index and `cpb` the chunks per superblock, so the block header
+// is only re-read when the tile crosses into a new superblock — the point of
+// staging 32 values at a time is that a K-quant superblock's scale bytes are
+// read 8x less often than the codes.
+template <int WQ>
+__device__ __forceinline__ void stage_weight_tile(const u8 *__restrict__ w,
+                                                  size_t w_row_bytes, i64 gc,
+                                                  i64 kt, i8 *dst, f32 *sc,
+                                                  f32 *mn) {
+    const u8 *b = w + static_cast<size_t>(gc) * w_row_bytes;
+
+    if (WQ == kDp4aWq8) {
+        // 34-byte block: f16 scale then 32 signed codes, 4-byte aligned only
+        // when the tile index is even, so the codes are assembled from bytes.
+        const u8 *blk = b + static_cast<size_t>(kt) * dp4a_cfg::Q8_BLOCK_BYTES;
+        sc[0] = d_h2f(static_cast<u16>(blk[0] | (blk[1] << 8)));
+        mn[0] = 0.0f; // Q8_0 is not affine
+        const u8 *c = blk + 2;
+#pragma unroll
+        for (int z = 0; z < dp4a_cfg::BK / 4; z++) {
+            const u8 *c4 = c + z * 4;
+            *reinterpret_cast<u32 *>(dst + z * 4) = static_cast<u32>(c4[0]) |
+                                                    (static_cast<u32>(c4[1]) << 8) |
+                                                    (static_cast<u32>(c4[2]) << 16) |
+                                                    (static_cast<u32>(c4[3]) << 24);
+        }
+        return;
+    }
+
+    const int chunk = static_cast<int>(kt % dp4a_cfg::KBLOCK_CHUNKS);
+    const u8 *blk = b + (static_cast<size_t>(kt) / dp4a_cfg::KBLOCK_CHUNKS) *
+                            dtype_block_bytes_dev(static_cast<int>(
+                                WQ == kDp4aWq4   ? DType::Q4_K
+                                : WQ == kDp4aWq5 ? DType::Q5_K
+                                                 : DType::Q6_K));
+
+    if (WQ == kDp4aWq4 || WQ == kDp4aWq5) {
+        const f32 d = d_h2f(static_cast<u16>(blk[0] | (blk[1] << 8)));
+        const f32 dmin = d_h2f(static_cast<u16>(blk[2] | (blk[3] << 8)));
+        const u8 *scales = blk + 4;
+        const int g = chunk / 2;
+        const int half = chunk % 2;
+        u8 si = 0, mi = 0;
+        dev_scale_min_k4(g * 2 + half, scales, &si, &mi);
+        sc[0] = d * static_cast<f32>(si);
+        mn[0] = dmin * static_cast<f32>(mi);
+        if (WQ == kDp4aWq4) {
+            const u8 *q = blk + 16;
+            const int shift = half == 0 ? 0 : 4;
+#pragma unroll
+            for (int z = 0; z < dp4a_cfg::BK / 4; z++) {
+                const u32 pack = d_u32(q + g * 32 + z * 4);
+                u32 out = 0u;
+#pragma unroll
+                for (int e = 0; e < 4; e++)
+                    out |= static_cast<u32>((pack >> (8 * e + shift)) & 0xF) << (8 * e);
+                *reinterpret_cast<u32 *>(dst + z * 4) = out;
+            }
+        } else {
+            // Q5_K: the 4-bit plane plus a high bit per code, held in a plane
+            // whose bit position depends on the sub-block (2*g or 2*g+1).
+            const u8 *qh = blk + 16;
+            const u8 *q = blk + 48;
+            const u8 bit = static_cast<u8>(half == 0 ? (1u << (2 * g)) : (2u << (2 * g)));
+#pragma unroll
+            for (int z = 0; z < dp4a_cfg::BK / 4; z++) {
+                u32 out = 0u;
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int l = z * 4 + e;
+                    const int base = half == 0 ? (q[g * 32 + l] & 0xF)
+                                               : (q[g * 32 + l] >> 4);
+                    const int v = base + ((qh[l] & bit) ? 16 : 0);
+                    out |= static_cast<u32>(v) << (8 * e);
+                }
+                *reinterpret_cast<u32 *>(dst + z * 4) = out;
+            }
+        }
+        return;
+    }
+
+    // Q6_K: 6-bit codes from a 4-bit plane and a 2-bit plane, one int8 scale
+    // per 16 values. The tile is two halves of 16; each half gets its own
+    // (scale, min) pair, which is why the fold runs twice for this format.
+    const f32 d = d_h2f(static_cast<u16>(blk[208] | (blk[209] << 8)));
+    const int g = chunk / 4;
+    const int p = chunk % 4;
+    const u8 *ql = blk + g * 64;
+    const u8 *qh = blk + 128 + g * 32;
+    const i8 *sb = reinterpret_cast<const i8 *>(blk + 192 + g * 8);
+    // The codes are built as eight dwords and stored as dwords, with the
+    // quadrant (p) selected ONCE rather than per code. Measured on the 9B's own
+    // shapes: the byte-store form with a per-code quadrant branch compiled to
+    // 208 VGPRs and 272 B of scratch (register spills) against 128 VGPRs and 0
+    // scratch for Q4_K, and it cost 9.6 ms per dispatch against 0.46 -- the
+    // single largest cost in that model's prefill with the flag on. Same bits,
+    // one quarter of the stores, and the quadrant is loop-invariant.
+    u32 pack[8];
+    if (p == 0) {
+#pragma unroll
+        for (int z = 0; z < 8; z++) {
+            u32 v = 0u;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int l = z * 4 + e;
+                v |= static_cast<u32>((ql[l] & 0xF) | ((qh[l] & 3) << 4)) << (8 * e);
+            }
+            pack[z] = v;
+        }
+    } else if (p == 1) {
+#pragma unroll
+        for (int z = 0; z < 8; z++) {
+            u32 v = 0u;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int l = z * 4 + e;
+                v |= static_cast<u32>((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4))
+                     << (8 * e);
+            }
+            pack[z] = v;
+        }
+    } else if (p == 2) {
+#pragma unroll
+        for (int z = 0; z < 8; z++) {
+            u32 v = 0u;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int l = z * 4 + e;
+                v |= static_cast<u32>((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4))
+                     << (8 * e);
+            }
+            pack[z] = v;
+        }
+    } else {
+#pragma unroll
+        for (int z = 0; z < 8; z++) {
+            u32 v = 0u;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int l = z * 4 + e;
+                v |= static_cast<u32>((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4))
+                     << (8 * e);
+            }
+            pack[z] = v;
+        }
+    }
+#pragma unroll
+    for (int z = 0; z < 8; z++)
+        *reinterpret_cast<u32 *>(dst + z * 4) = pack[z];
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+        const f32 s = d * static_cast<f32>(sb[h + 2 * p]);
+        sc[h] = s;
+        mn[h] = 32.0f * s; // the format stores (q - 32) * scale
+    }
+}
+
+// ---------------------------------------------------------------------------
 // the tile kernel
 // ---------------------------------------------------------------------------
 
+template <int WQ>
 __global__ void __launch_bounds__(dp4a_cfg::THREADS)
     gemm_dp4a_kernel(const u8 *__restrict__ w, i64 n_out, i64 n_in,
                      size_t w_row_bytes, const i8 *__restrict__ codes,
                      const f32 *__restrict__ scales, i64 rows,
                      _Float16 *__restrict__ out) {
     using namespace dp4a_cfg;
+    constexpr int NH = (WQ == kDp4aWq6) ? 2 : 1; // (scale, min) pairs per tile
+
     __shared__ __align__(16) i8 aw[STAGES][BM * BK];
     __shared__ __align__(16) i8 bw[STAGES][BN * BK];
-    // One f32 per row per stage: with BK == 32 a k-tile is exactly one block,
-    // so a stage needs one scale per row, not one per row per k.
+    // One scale per row per tile, one (scale, min) per row per half for the
+    // weight side, and the activation code sums the affine form needs.
     __shared__ f32 asc[STAGES][BM];
-    __shared__ f32 bsc[STAGES][BN];
+    __shared__ f32 asum[STAGES][2][BM];
+    // Per row, then per half, so the staging writes both of a Q6_K row's
+    // (scale, min) pairs through one pointer.
+    __shared__ f32 bsc[STAGES][BN][NH];
+    __shared__ f32 bmin[STAGES][BN][NH];
 
     const i64 row_base = static_cast<i64>(blockIdx.y) * BM;
     const i64 col_base = static_cast<i64>(blockIdx.x) * BN;
@@ -149,9 +363,7 @@ __global__ void __launch_bounds__(dp4a_cfg::THREADS)
 
     // Stage `stage` holds k-tile `kt`. The activation side is already int8,
     // row-major, and 4-byte aligned (rows are n_in wide and n_in is a multiple
-    // of 32), so it copies as u32. The weight side is a Q8_0 block: 2 bytes of
-    // fp16 scale plus 32 codes at an arbitrary byte offset inside the row, so
-    // the codes are assembled from bytes rather than a misaligned u32 read.
+    // of 32), so it copies as u32.
     auto load_stage = [&](int stage, i64 kt) {
         const i64 k0 = kt * BK;
 
@@ -168,28 +380,54 @@ __global__ void __launch_bounds__(dp4a_cfg::THREADS)
             const i64 gr = row_base + r;
             asc[stage][r] = gr < rows ? scales[gr * nblk + kt] : 0.0f;
         }
+        // The affine formats need sum_k a_k per half. Taken from GLOBAL rather
+        // than from the LDS tile written just above: that copy is spread across
+        // threads, so summing the tile here reads rows other threads have not
+        // finished filling. Measured: that race put ~1e+3 of absolute error into
+        // Q6_K's outputs (whose -32 offset multiplies any error in this sum by
+        // 32*scale), which is what tools/gemm_i8k_verify.cpp exists to catch.
+        // Global reads need no barrier and hit L1/L2, and 8 dword loads + 32
+        // signed byte adds per row per tile is nothing against TM*TN*8 dots.
+        // Q8_0 is not affine, so it neither computes nor reads this at all.
+        if (WQ != kDp4aWq8) {
+            for (int r = tid; r < BM; r += THREADS) {
+                const i64 gr = row_base + r;
+                i32 lo = 0, hi = 0;
+                if (gr < rows) {
+#pragma unroll
+                    for (int z = 0; z < BK / 4; z++) {
+                        const u32 v = *reinterpret_cast<const u32 *>(
+                            codes + gr * n_in + k0 + z * 4);
+#pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            const i32 c = static_cast<i32>(
+                                static_cast<i8>((v >> (8 * e)) & 0xFF));
+                            if (z < BK / 8) lo += c;
+                            else hi += c;
+                        }
+                    }
+                }
+                asum[stage][0][r] = static_cast<f32>(lo);
+                asum[stage][1][r] = static_cast<f32>(hi);
+            }
+        }
 
         for (int r = tid; r < BN; r += THREADS) {
             const i64 gc = col_base + r;
-            u32 *dst = reinterpret_cast<u32 *>(&bw[stage][r * BK]);
+            i8 *dst = &bw[stage][r * BK];
+#pragma unroll
+            for (int h = 0; h < NH; h++) {
+                bsc[stage][r][h] = 0.0f;
+                bmin[stage][r][h] = 0.0f;
+            }
             if (gc >= n_out) {
 #pragma unroll
-                for (int z = 0; z < BK / 4; z++) dst[z] = 0u;
-                bsc[stage][r] = 0.0f;
+                for (int z = 0; z < BK / 4; z++)
+                    *reinterpret_cast<u32 *>(dst + z * 4) = 0u;
                 continue;
             }
-            const u8 *blk = w + static_cast<size_t>(gc) * w_row_bytes +
-                            static_cast<size_t>(kt) * Q8_BLOCK_BYTES;
-            bsc[stage][r] = d_h2f(static_cast<u16>(blk[0] | (blk[1] << 8)));
-            const u8 *c = blk + 2;
-#pragma unroll
-            for (int z = 0; z < BK / 4; z++) {
-                const u8 *c4 = c + z * 4;
-                dst[z] = static_cast<u32>(c4[0]) |
-                         (static_cast<u32>(c4[1]) << 8) |
-                         (static_cast<u32>(c4[2]) << 16) |
-                         (static_cast<u32>(c4[3]) << 24);
-            }
+            stage_weight_tile<WQ>(w, w_row_bytes, gc, kt, dst, &bsc[stage][r][0],
+                                  &bmin[stage][r][0]);
         }
     };
 
@@ -201,16 +439,25 @@ __global__ void __launch_bounds__(dp4a_cfg::THREADS)
         const int nxt = (stage + 1) % STAGES;
         if (kt + 1 < k_tiles) load_stage(nxt, kt + 1);
 
-        i32 iacc[TM][TN];
-#pragma unroll
-        for (int i = 0; i < TM; i++)
-#pragma unroll
-            for (int j = 0; j < TN; j++) iacc[i][j] = 0;
-
         // Packed quad fetch with the lane-rotated index; see the header note.
+        i32 iacc[NH][TM][TN];
+#pragma unroll
+        for (int h = 0; h < NH; h++)
+#pragma unroll
+            for (int i = 0; i < TM; i++)
+#pragma unroll
+                for (int j = 0; j < TN; j++) iacc[h][i][j] = 0;
+
 #pragma unroll
         for (int q = 0; q < BK / 4; q++) {
+            // The rotation below is what selects the quad being read, so the
+            // half a quad belongs to must come from qq, not from q. Taking it
+            // from q silently pairs half 0's activations with half 1's scale
+            // for every lane whose tx flips the bit that separates the halves —
+            // columns 32 and up at TN=8, which is exactly where the code probe
+            // in tools/gemm_i8k_verify.cpp put the mismatch before this fix.
             const int qq = (q ^ tx) & (BK / 4 - 1);
+            const int h = (NH == 2) ? (qq >= BK / 8 ? 1 : 0) : 0;
             i32 a[TM], b[TN];
 #pragma unroll
             for (int i = 0; i < TM; i++)
@@ -222,20 +469,29 @@ __global__ void __launch_bounds__(dp4a_cfg::THREADS)
             for (int i = 0; i < TM; i++)
 #pragma unroll
                 for (int j = 0; j < TN; j++)
-                    iacc[i][j] = d_dot4(a[i], b[j], iacc[i][j]);
+                    iacc[h][i][j] = d_dot4(a[i], b[j], iacc[h][i][j]);
         }
 
-        // Fold this k-tile's int32 partial with its two block scales. One
-        // k-tile is one 32-code block, so the fp32 accumulator never sums a
-        // partial whose scale it does not know: the multiply is exact for the
-        // block it came from.
+        // Fold: acc += (sa*S) * dot - (sa*sum) * M, the two terms of the
+        // affine product. Q8_0 has M == 0 and one half, Q4_K/Q5_K one half
+        // with M from dmin*m, Q6_K two halves with M = 32*S.
 #pragma unroll
-        for (int i = 0; i < TM; i++) {
-            const f32 sa = asc[stage][ty * TM + i];
+        for (int h = 0; h < NH; h++) {
 #pragma unroll
-            for (int j = 0; j < TN; j++) {
-                const f32 sb = bsc[stage][tx * TN + j];
-                acc[i][j] = fmaf(static_cast<f32>(iacc[i][j]), sa * sb, acc[i][j]);
+            for (int i = 0; i < TM; i++) {
+                const int ri = ty * TM + i;
+                const f32 sa = asc[stage][ri];
+                const f32 ssum = (NH == 2) ? sa * asum[stage][h][ri]
+                                           : sa * (asum[stage][0][ri] +
+                                                   asum[stage][1][ri]);
+#pragma unroll
+                for (int j = 0; j < TN; j++) {
+                    const int cj = tx * TN + j;
+                    acc[i][j] = fmaf(sa * bsc[stage][cj][h],
+                                     static_cast<f32>(iacc[h][i][j]), acc[i][j]);
+                    if (WQ != kDp4aWq8)
+                        acc[i][j] = fmaf(-ssum, bmin[stage][cj][h], acc[i][j]);
+                }
             }
         }
 
@@ -260,17 +516,46 @@ __global__ void __launch_bounds__(dp4a_cfg::THREADS)
 // host-side entry point
 // ---------------------------------------------------------------------------
 
-// Legality, not policy: the caller still decides whether the path is enabled
-// at all. Shapes below a full tile row are excluded because a block would then
-// spend more on staging its own tile than on the rows it actually has.
+// Legality, not policy: the caller still decides whether the path is enabled at
+// all. Shapes below a full tile row are excluded because a block would then
+// spend more on staging its own tile than on the rows it actually has. The
+// K-quants additionally need whole 256-value superblocks in the row, because
+// the block header is addressed from the k-tile index.
+//
+// Q6_K is excluded on measured cost, not on correctness: the format's mixed
+// 6-bit planes plus a per-16-value scale *and* offset make the staging body
+// wide enough that the compiler spills (208 VGPR, 272 B scratch) whatever
+// packing it is written with. On the 9B Q4_K_M MoE model that one kernel cost
+// 245 ms over 32 dispatches, which on its own turned the whole flagged path
+// into a net loss (327 ms of GEMM against the fp16 tile's 256 ms). It stays
+// compiled and is covered by tools/gemm_i8k_verify.cpp so that a register
+// budget can re-enable it here once the staging is narrow enough.
+constexpr bool kDp4aEnableQ6K = false;
+
+// The staging only amortises over a long K. Every call pays the activation
+// quantize (rows*n_in bytes written plus one scale per 32 values) and every
+// k-tile pays its own unpack, so the win is a function of how much arithmetic
+// those fixed costs are spread over. Measured model-level A/B, one binary, the
+// flag the only difference: SmolLM2-135M (K = 576/1536) 2827 -> 1641 tok/s,
+// Llama-3.2-1B (K = 2048/8192) 1120 -> 2060, Qwen3.5-9B (K = 4096/12288)
+// 175.6 -> 198.7. The floor sits between the two groups, and per-shape
+// attribution of the 135M loss (K against output width against tile occupancy)
+// is still open — this is the measured boundary, not a derived one.
+constexpr i64 kDp4aMinK = 2048;
+
 inline bool dp4a_ok(int wt, i64 rows, i64 n_out, i64 n_in) {
-    return wt == static_cast<int>(DType::Q8_0) && rows >= 16 && n_out > 0 &&
-           n_in >= dp4a_cfg::BK && (n_in & (dp4a_cfg::BK - 1)) == 0;
+    const int kind = dp4a_kind(wt);
+    if (kind < 0 || rows < 16 || n_out <= 0 || n_in < kDp4aMinK) return false;
+    if (kind == kDp4aWq6 && !kDp4aEnableQ6K) return false;
+    if ((n_in & (dp4a_cfg::BK - 1)) != 0) return false;
+    if (kind != kDp4aWq8 && (n_in % 256) != 0) return false;
+    return true;
 }
 
 // Quantize then tile. `codes` is [rows, n_in] int8 and `scales` is
 // [rows, n_in/32] f32 — both owned by the caller (the backend keeps them
 // across calls) so nothing allocates on this path.
+template <int WQ>
 inline void gemm_dp4a_launch(const u8 *w, i64 n_out, i64 n_in, size_t w_row_bytes,
                              const _Float16 *x, i64 rows, _Float16 *out,
                              i8 *codes, f32 *scales) {
@@ -282,8 +567,35 @@ inline void gemm_dp4a_launch(const u8 *w, i64 n_out, i64 n_in, size_t w_row_byte
                         (n_out + dp4a_cfg::BN - 1) / dp4a_cfg::BN),
                     static_cast<unsigned>(
                         (rows + dp4a_cfg::BM - 1) / dp4a_cfg::BM));
-    gemm_dp4a_kernel<<<grid, dp4a_cfg::THREADS>>>(w, n_out, n_in, w_row_bytes,
-                                                 codes, scales, rows, out);
+    gemm_dp4a_kernel<WQ><<<grid, dp4a_cfg::THREADS>>>(w, n_out, n_in, w_row_bytes,
+                                                     codes, scales, rows, out);
+}
+
+// Runtime dtype -> kernel. Returns false when the format has no int8 staging,
+// which the caller turns into "keep the fp16 tile".
+inline bool gemm_dp4a_dispatch(int wt, const u8 *w, i64 n_out, i64 n_in,
+                               size_t w_row_bytes, const _Float16 *x, i64 rows,
+                               _Float16 *out, i8 *codes, f32 *scales) {
+    switch (dp4a_kind(wt)) {
+        case kDp4aWq8:
+            gemm_dp4a_launch<kDp4aWq8>(w, n_out, n_in, w_row_bytes, x, rows, out,
+                                       codes, scales);
+            return true;
+        case kDp4aWq4:
+            gemm_dp4a_launch<kDp4aWq4>(w, n_out, n_in, w_row_bytes, x, rows, out,
+                                       codes, scales);
+            return true;
+        case kDp4aWq5:
+            gemm_dp4a_launch<kDp4aWq5>(w, n_out, n_in, w_row_bytes, x, rows, out,
+                                       codes, scales);
+            return true;
+        case kDp4aWq6:
+            gemm_dp4a_launch<kDp4aWq6>(w, n_out, n_in, w_row_bytes, x, rows, out,
+                                       codes, scales);
+            return true;
+        default:
+            return false;
+    }
 }
 
 } // namespace krk

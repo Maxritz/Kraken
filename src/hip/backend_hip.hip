@@ -388,8 +388,11 @@ public:
                 int8s_ = nullptr;
                 KRK_HIP(hipMalloc(&int8s_, int8s_cap_));
             }
-            gemm_dp4a_launch(wh, n_out, n_in, row_bytes, xh, rows, oh,
-                             reinterpret_cast<i8 *>(int8q_), int8s_);
+            // The dispatcher picks the kernel for this weight format; every
+            // format it stages was checked against the host decoder by
+            // tools/gemm_i8k_verify.cpp (built as kraken-i8k).
+            gemm_dp4a_dispatch(static_cast<int>(wt), wh, n_out, n_in, row_bytes, xh,
+                               rows, oh, reinterpret_cast<i8 *>(int8q_), int8s_);
         } else {
             const dim3 grid(
                 static_cast<unsigned>((n_out + simt_cfg::BN - 1) / simt_cfg::BN),

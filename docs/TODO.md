@@ -169,32 +169,86 @@ configuration verifies at `maxerr 0.0e+00`.
    the global->LDS staging path (latency, not bandwidth: ~93 GB/s of a
    ~384 GB/s card) and 43.7% to barriers. More stages (`BK=16` s4/s5), fewer
    registers, or `global_load_lds` are the plausible next ~1.5-2x.
-2. **The int8 DP4A tile had the same aliasing (fixed), and is now ported.**
-   `tools/gemm_i8.cpp` fetched `Bs[(tx*TN+j)*BK + q*4]` with a 32-byte row, so
-   `tx` dropped out of the bank address entirely (16-way). Rotating the k-quad
-   by `tx` fixed it: **6.20 -> 9.27 TOP/s** at 4096^3 (11.26 with a 128x128x16
-   s4 tile), `maxerr 0` against the CPU reference in every configuration, and
-   `SQC_LDS_BANK_CONFLICT/SQ_INSTS_LDS` 19.4 -> 7.4. The ISA shows what is
-   left: the unrotated fetch's fully-unrolled quads merge into 128-bit LDS
-   reads (32 `ds_read_b128` per k-tile, all 16 lanes on the same 4 banks), and
-   the rotation forbids that merge — 32 wide aliased reads become 64 narrow
-   spread ones. Rotating at 16-byte-GROUP granularity so the wide reads come
-   back is the next lever.
-   The port is `src/hip/kernels/gemm_dp4a.hpp`, behind `KRK_GEMM_INT8=1`
-   (off by default, like the other two switches but for a second reason): Q8_0
-   weights are consumed as int8 with their own block scales, activations are
-   quantized per 32-value block, and each k-tile's int32 partial is folded into
-   the fp32 accumulator with that block's scale pair. It is **lossy** — int8
-   activations — so it does not become a default without winning first. On
-   Llama-3.2-1B-Q8_0 prefill it is **1109 -> 1371 tok/s (+24%)** with decode
-   untouched (gemv), the greedy token stream identical, top-3 log-probs within
-   0.03 of ~19.0 (0.2%), runs identical run to run, and the kernel profiles at
-   1.97 bank conflicts per LDS instruction, 112 VGPRs, no scratch. Both suites
-   stay at 1383/1383 with the flag on and off.
-   Q4_K/Q5_K/Q6_K experts still take the fp16 tile: their sub-block format
-   needs the affine min-term correction, so Q8_0 is the format this covers
-   today (Q8_0 experts are the ones whose bytes already are the int8 operand).
-3. **The `rows<=16` decode shapes** remain occupancy-starved (0.4-1.2 waves);
+2. **The int8 DP4A tile had the same aliasing (fixed, ported, K-quants
+   added).** `tools/gemm_i8.cpp` fetched `Bs[(tx*TN+j)*BK + q*4]` with a
+   32-byte row, so `tx` dropped out of the bank address entirely (16-way).
+   Rotating the k-quad by `tx` fixed it: **6.20 -> 9.27 TOP/s** at 4096^3
+   (11.26 with a 128x128x16 s4 tile), `maxerr 0` against the CPU reference in
+   every configuration, and `SQC_LDS_BANK_CONFLICT/SQ_INSTS_LDS` 19.4 -> 7.4.
+
+   *The wide-read rotation was tried and is a dead end.* Rotating at 16-byte
+   GROUP granularity (so clang's 128-bit LDS merge should come back) emits the
+   **same ISA** as the narrow form: the wide source merges into 64
+   `ds_read2_b32`, the narrow into 32 `ds_read_b128`, and the two run at
+   identical time (9.28 vs 9.29; 11.27 vs 11.28 TOP/s). The merge is therefore
+   not a lever here — at 2.25 conflicts per LDS instruction the tile is no
+   longer LDS-limited, which is also why equal-work variants are equal-time.
+
+   *The port* is `src/hip/kernels/gemm_dp4a.hpp`, behind `KRK_GEMM_INT8=1`
+   (off by default, like the other switches but for a second reason): weights
+   are consumed as int8 codes, activations are quantized per 32-value block,
+   and each k-tile's int32 partial is folded into the fp32 accumulator with
+   that block's scale (and, for the K-quants, its affine min term). It is
+   **lossy** — int8 activations — so it does not become a default without
+   winning first.
+   * Formats: Q8_0, Q4_K, Q5_K (Q6_K gated off, see 3).
+   * `tools/gemm_i8k_verify.cpp` (built as `kraken-i8k`) is the format
+     harness: a code probe over 96-256 positions x 128 outputs that
+     reconstructs each weight the host decoder would see, plus a random GEMM
+     against the host decoder. Worst relative error, all at the fp16 rounding
+     bound: Q8_0 4.9e-4 / 2.1e-4, Q4_K 4.9e-4 / 1.1e-4, Q5_K 4.9e-4 /
+     1.1e-4, Q6_K 4.9e-4 / 8.7e-5 (probe / GEMM).
+   * Two shape gates, both measured rather than derived. **K >= 2048**
+     (`kDp4aMinK`): the staging cost per call is fixed, and on the 135M
+     model's K = 576/1536 matrices the flagged path measured 2827 -> 1641
+     tok/s, so those shapes stay on the fp16 tile; with the floor in place
+     SmolLM2 prefill runs **0 dp4a dispatches** and its GEMM time is unchanged
+     (21.91 ms off vs 22.41 ms on, i.e. noise), while the 1B (K = 2048/8192)
+     and the 9B (K = 4096/12288) keep theirs. **Q6_K off** (see 3).
+   * Engine effect, measured as GPU time from rocprofv3 rather than wall
+     clock, because this box's tok/s moves by ~1.7x with machine state (see
+     the note under the benchmark table): llama-3.2-1B-Q8_0 prefill GEMM
+     **36.92 -> 24.26 ms (-34%)** over the same 112 dispatches, uniformly
+     ~1.5x per dispatch across all three of its weight shapes
+     (11.32 vs 17.71, 9.20 vs 13.16, 3.74 vs 6.05 ms). Wall-clock prefill on
+     the same build measured +21% to +84% across sessions depending on host
+     load. Decode is untouched (gemv). Suite 1383/1383 with the flag on and
+     off.
+   * Honest limits: no Q8_0 *MoE* model exists on this box, so the MoE
+     behaviour is shown through the same `gemm()` the expert loop calls; the
+     path is lossy by construction; and the 9B numbers earlier in this
+     campaign (**183.7 -> 205.7 tok/s** with Q6_K gated out, 245 ms of Q6_K
+     cost before that) came from a tmpfs copy of the model that a reboot
+     erased, so they are recorded as measured rather than re-checked.
+3. **Q6_K is excluded from the gate on measured cost, not correctness.** Its
+   mixed 6-bit planes plus a per-16-value scale *and* offset make the staging
+   body wide enough that the compiler spills whatever packing it is written
+   with — **208 VGPRs and 272 B of scratch** against 128/0 for Q4_K/Q5_K.
+   Packing the byte stores into dwords cut its dispatch time 308 -> 245 ms but
+   did not get it out of spill, and those 32 dispatches turned the whole
+   flagged path into a net loss (327 ms of GEMM against the fp16 tile's
+   256 ms). It stays compiled and verified by `kraken-i8k`, and re-enabling it
+   is one constant (`kDp4aEnableQ6K` in `gemm_dp4a.hpp`) once the staging fits
+   the register budget.
+4. **A guard now exists for this class of bug** — `scripts/check_lds.sh` runs
+   a real workload under rocprofv3 and hands
+   `SQC_LDS_BANK_CONFLICT / SQ_INSTS_LDS` to `tools/prof_agg.py --guard`,
+   which exits non-zero when a kernel exceeds 6.0 conflicts per LDS
+   instruction (the two buggy tiles measured 16.4 and 19.4; the fixed ones sit
+   at 0.0-2.25). It takes a fresh profile, or a saved CSV/directory, or a
+   model through `KRK_GUARD_MODEL`; bad usage and unmeasurable runs exit 2
+   rather than passing silently. It needs ROCm and a GPU, so it is a
+   release-step check, not part of `kraken-tests`.
+5. **The other gfx10 kernels were audited for the same aliasing: none share
+   it.** Per-kernel conflicts per LDS instruction, from the flagged 9B profile
+   (`/tmp/prof_gate`) and the default path: `gemm_simt_kernel` 0.000,
+   `quantize_act_kernel` 0.000, `gdn_delta_rule_kernel` 0.000,
+   `gdn_l2norm_kernel` 0.000, `rmsnorm_kernel` 0.000, `attention_kernel`
+   0.000, `gemv_kernel` 0.000 (its per-dispatch maximum is 0.036),
+   `fused_layer_gemv_kernel` 0.000 (max 0.021),
+   `attn_fused_decode_kernel` 0.079, `silu_mul_kernel` 0.000. The two int8
+   tiles are the only kernels above the noise floor, at 2.25.
+6. **The `rows<=16` decode shapes** remain occupancy-starved (0.4-1.2 waves);
    decode is gemv and already at 21.3 tok/s on the 9B, so this needs its own
    measurement before anyone invests.
 
@@ -216,8 +270,10 @@ configuration verifies at `maxerr 0.0e+00`.
   running for 3 hours and were holding 6.44 GiB of VRAM. The SIGPIPE fix stops
   the oracle from hanging that way in future; a "device busy" hint at startup
   would have surfaced it sooner.
-- **`/tmp/q9b.gguf`** (5.87 GB) is parked in tmpfs on maclin for the
-  nondeterminism work and should be deleted when that work closes.
+- **`/tmp/q9b.gguf`** (5.87 GB Qwen3.5-9B Q4_K_M) was parked in tmpfs on
+  maclin for the nondeterminism and MoE work; a reboot on 2026-10-03 cleared
+  it, so both now need it re-fetched before they can be exercised. Nothing
+  deleted it deliberately.
 
 ---
 
@@ -251,21 +307,41 @@ configuration verifies at `maxerr 0.0e+00`.
 
 ## Housekeeping
 
-- **Unpushed.** `7337f3b` and `8a3cbab` are local only; nothing has been
-  pushed since `5bf30a8`. Nothing will be pushed without being asked.
-- Working tree is clean at `7337f3b`.
+- Working tree is dirty with the int8 port, the guard, the tools and this file;
+  nothing is pushed until it is committed.
+- **`/tmp/q9b.gguf` is gone.** The Qwen3.5-9B Q4_K_M copy lived in tmpfs on
+  maclin and a reboot erased it (the box came back up at 03:05). Re-fetch it
+  before any further 9B or MoE work — the 9B rows below cannot be re-measured
+  without it.
+- **This box is shared and rebooted.** Another agent's workload (a kilo CLI
+  plus a pytest run) was consuming CPU during the last measurement pass, and
+  one interrupted `rocprofv3` run left a process holding the card long enough
+  to make a whole three-model sweep wrong. Check `rocm-smi --showpids` and
+  `ps` before trusting a number, and prefer the profiler's per-kernel times
+  over wall-clock tok/s when the host is busy.
 
 ---
 
 ## Measured performance (6700 XT, gfx1031, ROCm 7.15/7.17, no WMMA)
 
-`kraken --bench --ctx 512 --chunk 256 --greedy`:
+`kraken --bench --ctx 512 --chunk 256 --greedy`, default (fp16-tile) path,
+medians of 5 runs, taken on a *busy* box after the reboot:
 
 | model | prefill | decode |
 |---|---|---|
-| Qwen3.5-9B Q4_K_M | 28.0 tok/s | 21.3 tok/s |
-| Llama-3.2-1B Q8_0 | 190.7 tok/s | 185.8 tok/s |
-| SmolLM2-135M Q4_K_M | 799 tok/s | 354 tok/s |
+| Qwen3.5-9B Q4_K_M | not re-measurable — `/tmp/q9b.gguf` lost with the reboot | 21.3 tok/s |
+| Llama-3.2-1B Q8_0 | 1119 tok/s | 182 tok/s |
+| SmolLM2-135M Q4_K_M | 1608 tok/s | 343 tok/s |
+
+The same measurements taken earlier on an idle box were 183.7 / 1120 / 2827
+for the same three models, so **treat these as ±1.7x by machine state**, not as
+a fixed property of the build. The decode column is stable to ~2%.
+
+With `KRK_GEMM_INT8=1` (and the K and Q6_K gates described in P1b) the same
+runs gave 1357 tok/s on the 1B and 1517 on SmolLM2 — i.e. +21% wall clock on
+the 1B in this noisy session, against **-34% GEMM time** measured with
+rocprofv3 on the same build, and no change at all on SmolLM2 (which takes no
+int8 dispatches).
 
 llama.cpp (Vulkan, same card, same 9B) manages 6.8 tok/s decode, so kraken is
 ~3.1x faster on the recurrent path.
