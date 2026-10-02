@@ -98,8 +98,29 @@ the original seven were the `par_pool` race fixed in `7337f3b`. The rest:
 
 ---
 
+## P1b — prefill throughput on gfx1031 (dense models)
+
+Dense prefill on the 6700 XT runs at **~0.6 TFLOP/s**, roughly 4% of what the
+card can do in packed f16. The SIMT GEMM tile is 64x64 with a 4x4 register
+tile, so the inner loop issues 16 FMAs per 8 LDS reads — a 2:1 ratio that
+makes it shared-memory bound. An 8x8 tile would give 4:1.
+
+**Tried and rejected:** a 128x128 block tile with 8x8 register tiles. It is
+the textbook fix and the oracle still agreed, but prefill got **2x worse**
+(3245 ms -> 6882 ms for 801 tokens) because the wider tile cuts the grid from
+~19 waves to ~5 over 40 CUs, starving the card. On a 40-CU part the wide tile
+needs split-K to recover its occupancy, and split-K is currently gated behind
+`has_wmma` (`pick_split` is only called from the WMMA branch of `gemm()`), so
+gfx1031 never gets it. **The real next step is split-K for the SIMT path**, not
+a wider tile.
+
 ## P2 — robustness and diagnostics
 
+- **CU count was under-reported (fixed).** HIP returns 20 CUs for a 40-CU
+  gfx1031; every occupancy heuristic sized itself against the wrong number.
+  `kfd_compute_units()` now reads the KFD topology. Reported as 40 CU. This
+  alone did not move prefill (3245 -> 3245 ms) because the path that needs the
+  occupancy — split-K — does not run on gfx1031 at all; see P1b.
 - **Engine utilization counters are Windows-only.** `--bench` prints
   "engine counters are Windows-only" on Linux, so there is no per-engine
   GPU utilization on the machine where the profiling work happens. The

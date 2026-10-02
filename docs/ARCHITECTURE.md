@@ -1,5 +1,74 @@
 # Architecture
 
+> Structure of the decode path as it stands after the engine pass. Read this
+> before changing [src/engine.cpp](../src/engine.cpp): it says which piece of
+> decode policy lives where, and why.
+
+## The decode path, and who owns what
+
+A generation is a prefill followed by a decode loop. Two loops exist — plain
+greedy and speculative — and they deliberately share the parts that are policy
+rather than mechanism.
+
+| Concern | Owner | Notes |
+|---|---|---|
+| Forward pass, workspaces, recurrent state | `Engine` | `forward`, `forward_core`, `fetch_logits` |
+| Layer math that differs by architecture | `Engine::gdn_forward`, `Engine::moe_ffn` | one method per layer kind; `forward_core` just dispatches |
+| **Token emission policy** | **`TokenEmitter`** (file-local, [engine.cpp](../src/engine.cpp)) | owns the stop-string test, the holdback buffer, and the sink |
+| Which token comes next | `Sampler` | pure, seeded, knows nothing about streaming |
+| Tokenizer | `Tokenizer` | SPM + BPE, independent of the engine |
+| Device capability | `Backend` subclasses | `DeviceCaps` is the one description of a target |
+
+`TokenEmitter` is the piece worth knowing about. Appending a token to the
+result, matching it against the stop strings, holding streamed text back so a
+stop string cannot straddle a token boundary, and flushing the tail are one
+policy. It used to be written out twice — once inside `generate`, once inside
+`generate_speculative` — and the duplication had already produced a bug: a
+debug flag added to one loop silently did nothing in the other. Both loops now
+call `TokenEmitter::accept`, which returns whether a stop string completed, and
+`TokenEmitter::finish`, which flushes. Adding a third decode path means calling
+those two methods, not copying the policy again.
+
+### Data flow for one accepted token
+
+```
+sampler.sample(logits_host_)   -> token
+TokenEmitter::accept(token)     -> piece appended to the result
+|                                stop strings matched
+|                                holdback flushed to the sink
+v
+Engine::forward(&token, 1, pos) -> the next logits_host_
+```
+
+The only state the two loops share that neither owns is the KV cache and the
+logits buffer, both `Engine` members; the speculative loop additionally drives
+a second `Engine` (`draft_`) through the same three methods.
+
+## Why the diagnostic lives in the engine
+
+`--debug-topk` needs the logits row and the step index, and both exist only
+inside the decode loop, so `dump_topk` is a file-local helper there rather than
+a public API. It is deliberately not part of `Backend`: it describes one run,
+not a device.
+
+## Layering rules the code follows
+
+* `include/krk/*.hpp` is the library surface. `src/*.cpp` is portable C++17
+  with no HIP; `src/hip/**` is the only place that knows about devices.
+* A backend never calls back into the engine. `Engine` drives, `Backend`
+  answers — which is what lets the CPU backend stay a valid oracle.
+* Policy both loops share belongs in one type (the `TokenEmitter` rule).
+  Policy that differs between them stays in the loop.
+
+## Device capability is read once, authoritatively
+
+`cu_count` comes from the KFD topology, not from
+`hipDeviceProp_t::multiProcessorCount`: HIP under-reports that field on gfx10
+(a 40-CU RX 6700 XT comes back as 20), and every occupancy heuristic in
+[src/hip](../src/hip) is sized against `cu_count`. See `kfd_compute_units()`
+in [backend_hip.hip](../src/hip/backend_hip.hip) — on Windows, where KFD does
+not exist, it returns 0 and the HIP value is kept.
+
 ## The seam
 
 ```

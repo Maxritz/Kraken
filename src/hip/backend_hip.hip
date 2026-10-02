@@ -94,6 +94,36 @@ bool hip_runtime_matches_sdk() {
 #endif
 }
 
+// Real CU count from the KFD topology, or 0 when it cannot be read (Windows,
+// a container without /sys, an unexpected layout). Every GPU node reports
+// `simd_count`, which is SIMDs — two per CU — alongside a zero
+// `cpu_cores_count` that distinguishes it from the CPU node. The largest
+// such node wins, so a multi-GPU host still reports one card's width.
+i64 kfd_compute_units() {
+#if defined(__linux__)
+    i64 best = 0;
+    for (int node = 0; node < 64; node++) {
+        char path[160];
+        std::snprintf(path, sizeof(path),
+                      "/sys/class/kfd/kfd/topology/nodes/%d/properties", node);
+        std::FILE *f = std::fopen(path, "r");
+        if (!f) continue;
+        i64 simds = -1, cores = -1;
+        char key[64];
+        long long val = 0;
+        while (std::fscanf(f, "%63s %lld", key, &val) == 2) {
+            if (std::strcmp(key, "simd_count") == 0) simds = val;
+            else if (std::strcmp(key, "cpu_cores_count") == 0) cores = val;
+        }
+        std::fclose(f);
+        if (simds > 0 && cores == 0) best = std::max(best, simds / 2);
+    }
+    return best;
+#else
+    return 0;
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // HipBackend
 // ---------------------------------------------------------------------------
@@ -805,6 +835,16 @@ Backend *make_hip_backend(int device_index, std::string *err) {
     c.family = family_from_gfx(c.gfx);
     c.wave_size = 32; // every RDNA target here is wave32
     c.cu_count = props.multiProcessorCount;
+    // HIP under-reports multiProcessorCount on some gfx10 parts: a RX 6700 XT
+    // (gfx1031, 40 CUs) comes back as 20. Every occupancy heuristic here is
+    // sized against cu_count, so believing it halves the launch geometry and
+    // leaves half the card idle. KFD's per-node topology is authoritative —
+    // simd_count is SIMDs, two per CU — so prefer it and keep the HIP value
+    // only as a fallback.
+    {
+        const i64 real_cus = kfd_compute_units();
+        if (real_cus > 0) c.cu_count = static_cast<int>(real_cus);
+    }
     c.lds_bytes = props.sharedMemPerBlock > 0 ? props.sharedMemPerBlock : 65536;
     c.vram_total = props.totalGlobalMem;
     c.vram_free = props.totalGlobalMem * 9 / 10;

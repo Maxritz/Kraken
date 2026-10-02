@@ -85,6 +85,76 @@ void dump_topk(i32 k, i32 step, i64 pos, const f32 *logits, i64 n) {
     std::fflush(stderr);
 }
 
+// How one accepted token reaches the caller: appended to the result, matched
+// against the stop strings, and streamed out with enough held back to cover a
+// stop string straddling a token boundary.
+//
+// Both decode loops emit tokens through this one policy. It used to be
+// duplicated verbatim in `generate` and `generate_speculative`, which is how a
+// debug flag added to one of them silently did nothing in the other.
+class TokenEmitter {
+public:
+    TokenEmitter(const GenerateParams &p, const Tokenizer &tok, Sampler &smp,
+                 GenerateResult *res, const std::vector<i32> &prompt_ids)
+        : p_(p), tok_(tok), smp_(smp), res_(res) {
+        for (const std::string &s : p_.stop)
+            max_stop_ = std::max(max_stop_, s.size());
+        if (p_.echo_prompt) {
+            res_->text = p_.prompt;
+            res_->tokens = prompt_ids;
+            p_.sink.emit(p_.prompt.c_str(), -1, false);
+        }
+    }
+
+    // Records one accepted token and returns true if it completed a stop
+    // string, in which case the caller must stop generating.
+    bool accept(i32 token) {
+        const std::string piece = tok_.decode(&token, 1);
+        res_->tokens.push_back(token);
+        res_->text += piece;
+        res_->generated++;
+        smp_.accept(token);
+
+        size_t stop_len = 0;
+        for (const std::string &s : p_.stop) {
+            if (!s.empty() && ends_with(res_->text, s) && s.size() > stop_len)
+                stop_len = s.size();
+        }
+        const bool stop_hit = stop_len != 0;
+
+        pending_ += piece;
+        if (stop_hit) {
+            res_->text.resize(res_->text.size() - stop_len);
+            const size_t keep =
+                pending_.size() >= stop_len ? pending_.size() - stop_len : 0;
+            pending_.resize(keep);
+        }
+        if (pending_.size() > max_stop_) {
+            const size_t flush = pending_.size() - max_stop_;
+            p_.sink.emit(pending_.substr(0, flush).c_str(), token, false);
+            pending_.erase(0, flush);
+        }
+        return stop_hit;
+    }
+
+    // Flushes the held-back tail and the end-of-stream marker. `stopped`
+    // suppresses the tail: a matched stop string already consumed it.
+    void finish(bool stopped) {
+        if (!stopped && !pending_.empty())
+            p_.sink.emit(pending_.c_str(), -1, false);
+        pending_.clear();
+        p_.sink.emit(nullptr, -1, true);
+    }
+
+private:
+    const GenerateParams &p_;
+    const Tokenizer &tok_;
+    Sampler &smp_;
+    GenerateResult *res_;
+    size_t max_stop_ = 0;
+    std::string pending_;
+};
+
 } // namespace
 
 Engine::~Engine() { shutdown(); }
@@ -786,53 +856,13 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
     Sampler sampler;
     sampler.reset(p.sampler);
     sampler.accept(ids.data(), static_cast<int>(ids.size()));
-    if (p.echo_prompt) {
-        res->text = p.prompt;
-        res->tokens = ids;
-        p.sink.emit(p.prompt.c_str(), -1, false);
-    }
-
-    // A stop string may straddle token boundaries; hold streamed text back
-    // exactly as the plain loop does.
-    size_t max_stop = 0;
-    for (const std::string &s : p.stop) max_stop = std::max(max_stop, s.size());
-    std::string pending;
-    auto emit_token = [&](i32 token) {
-        const std::string piece = tok_.decode(&token, 1);
-        res->tokens.push_back(token);
-        res->text += piece;
-        res->generated++;
-        sampler.accept(token);
-        bool stop_hit = false;
-        size_t stop_len = 0;
-        for (const std::string &s : p.stop) {
-            if (!s.empty() && ends_with(res->text, s) && s.size() > stop_len) {
-                stop_hit = true;
-                stop_len = s.size();
-            }
-        }
-        pending += piece;
-        if (stop_hit) {
-            res->text.resize(res->text.size() - stop_len);
-            const size_t keep =
-                pending.size() >= stop_len ? pending.size() - stop_len : 0;
-            pending.resize(keep);
-        }
-        if (pending.size() > max_stop) {
-            const size_t flush = pending.size() - max_stop;
-            p.sink.emit(pending.substr(0, flush).c_str(), token, false);
-            pending.erase(0, flush);
-        }
-        return stop_hit;
-    };
+    TokenEmitter emit(p, tok_, sampler, res, ids);
 
     const Timer decode_timer;
     auto finish_run = [&](Finish f) {
         res->finish = f;
         *decode_ms = decode_timer.ms();
-        if (f != FinishStop && !pending.empty())
-            p.sink.emit(pending.c_str(), -1, false);
-        p.sink.emit(nullptr, -1, true);
+        emit.finish(f == FinishStop);
     };
 
     i64 pos = static_cast<i64>(ids.size());
@@ -843,6 +873,8 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
     //   target KV holds [0, pos), logits_host_ predicts position pos
     //   draft  KV holds [0, pos), draft logits predict position pos
     while (res->generated < p.max_tokens && pos < kv_cap_) {
+        if (p.debug_topk > 0)
+            dump_topk(p.debug_topk, res->generated, pos, logits_host_, n_vocab_);
         const i32 first = argmax_of(logits_host_, n_vocab_);
 
         // ---- draft: propose up to k continuations -------------------------
@@ -873,7 +905,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
                 finish_run(FinishEos);
                 return true;
             }
-            emit_token(first);
+            emit.accept(first);
             if (pos + 1 >= kv_cap_) {
                 finish_run(FinishContext);
                 return true;
@@ -928,7 +960,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
             if (res->generated >= p.max_tokens) break;
             const i32 t = prop[static_cast<size_t>(j)];
             draft_accepted_++;
-            stop_hit = emit_token(t);
+            stop_hit = emit.accept(t);
             emitted++;
             if (stop_hit) break;
         }
@@ -947,7 +979,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
                 finish_run(FinishEos);
                 return true;
             }
-            emit_token(bonus);
+            emit.accept(bonus);
             emitted++;
             if (pos + emitted < kv_cap_ && res->generated < p.max_tokens) {
                 const i32 b = res->tokens.back();
@@ -1056,59 +1088,21 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     Sampler sampler;
     sampler.reset(p.sampler);
     sampler.accept(ids.data(), static_cast<int>(ids.size()));
-
-    if (p.echo_prompt) {
-        res->text = p.prompt;
-        res->tokens = ids;
-        p.sink.emit(p.prompt.c_str(), -1, false);
-    }
+    TokenEmitter emit(p, tok_, sampler, res, ids);
 
     i64 pos = static_cast<i64>(ids.size());
     const Timer decode_timer;
 
-    // A stop string may straddle token boundaries, so streamed text is held
-    // back by max_stop_len characters until it is known not to be a stop.
-    size_t max_stop = 0;
-    for (const std::string &s : p.stop) max_stop = std::max(max_stop, s.size());
-    std::string pending;
-
     for (i32 gen = 0; gen < p.max_tokens; gen++) {
-        if (p.debug_topk > 0) dump_topk(p.debug_topk, gen, pos, logits_host_,
-                                         n_vocab_);
+        if (p.debug_topk > 0)
+            dump_topk(p.debug_topk, gen, pos, logits_host_, n_vocab_);
         const i32 token = sampler.sample(logits_host_, n_vocab_);
         if (token == tok_.eos()) {
             res->finish = FinishEos;
             break;
         }
 
-        const std::string piece = tok_.decode(&token, 1);
-        res->tokens.push_back(token);
-        res->text += piece;
-        res->generated++;
-        sampler.accept(token);
-
-        bool stop_hit = false;
-        size_t stop_len = 0;
-        for (const std::string &s : p.stop) {
-            if (!s.empty() && ends_with(res->text, s) && s.size() > stop_len) {
-                stop_hit = true;
-                stop_len = s.size();
-            }
-        }
-
-        pending += piece;
-        if (stop_hit) {
-            res->text.resize(res->text.size() - stop_len);
-            const size_t keep = pending.size() >= stop_len ? pending.size() - stop_len : 0;
-            pending.resize(keep);
-        }
-        if (pending.size() > max_stop) {
-            const size_t flush = pending.size() - max_stop;
-            p.sink.emit(pending.substr(0, flush).c_str(), token, false);
-            pending.erase(0, flush);
-        }
-
-        if (stop_hit) {
+        if (emit.accept(token)) {
             res->finish = FinishStop;
             break;
         }
@@ -1125,11 +1119,9 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         fetch_logits();
     }
 
-    if (res->finish != FinishStop && !pending.empty())
-        p.sink.emit(pending.c_str(), -1, false);
+    emit.finish(res->finish == FinishStop);
 
     res->decode_ms = decode_timer.ms();
-    p.sink.emit(nullptr, -1, true);
     return true;
 }
 
