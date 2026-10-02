@@ -599,6 +599,20 @@ __global__ void __launch_bounds__(THREADS)
 //
 // 64x64 block tile, 32-deep K tile, 16x16 threads each owning a 4x4 register
 // tile. The compute stage uses v_dot2_f32_f16 where the target has it.
+//
+// THE COMPUTE FETCH IS PACKED AND LANE-ROTATED (gfx10, KRK_SIMT_USE_DOT2).
+// The ws rows are BK+8 halves = 80 B = 20 words, so consecutive tx lanes sit
+// 80 B apart: the bank of a pair index q is (row*20 + q) % 32 and the tx lane
+// only enters through tx&1, i.e. 8 of the 16 tx lanes serialize on EVERY ws
+// fetch. Rotating the pair index by the thread's tx (q -> q ^ tx) is a
+// bijection over the 16 pairs -- each thread still consumes all of k, in its
+// own deterministic order -- and spreads the lanes over 16 banks. Fetching
+// each pair as one u32 also halves the LDS op count: 8 loads per 16 dots
+// instead of 16. Measured on gfx1031 at 4096^3 in the standalone tile
+// harness (tools/gemm_fp16_tune.cpp): 2.98 -> 8.28 TFLOP/s, and
+// SQC_LDS_BANK_CONFLICT/SQ_INSTS_LDS fell from 16.4 to ~1. Before this fix
+// the kernel spent ~43 of its 48 ms serialized in LDS, which is why a wider
+// tile or split-K never helped: the wall was never arithmetic or occupancy.
 // ---------------------------------------------------------------------------
 
 namespace simt_cfg {
@@ -617,8 +631,10 @@ __global__ void __launch_bounds__(simt_cfg::THREADS)
                      size_t w_row_bytes, const _Float16 *__restrict__ x, i64 rows,
                      _Float16 *__restrict__ out) {
     using namespace simt_cfg;
-    __shared__ _Float16 xs[BM][BK + 8];
-    __shared__ _Float16 ws[BN][BK + 8];
+    // 16 B alignment so the packed pair loads below are legal, and so each
+    // 80 B row lands on a legal u32 boundary.
+    __shared__ __align__(16) _Float16 xs[BM][BK + 8];
+    __shared__ __align__(16) _Float16 ws[BN][BK + 8];
 
     const i64 row_base = static_cast<i64>(blockIdx.y) * BM;
     const i64 col_base = static_cast<i64>(blockIdx.x) * BN;
@@ -666,6 +682,30 @@ __global__ void __launch_bounds__(simt_cfg::THREADS)
         }
         __syncthreads();
 
+#if defined(KRK_SIMT_USE_DOT2)
+        // Packed pair fetch with the lane-rotated pair index; see the header
+        // note above the kernel. q ^ tx keeps the 16 tx lanes on 16 banks and
+        // one u32 load supplies both halves of the pair.
+#pragma unroll
+        for (int q = 0; q < BK / 2; q++) {
+            const int qq = (q ^ tx) & (BK / 2 - 1);
+            u32 a[TM], b[TN];
+#pragma unroll
+            for (int i = 0; i < TM; i++)
+                a[i] = *reinterpret_cast<const u32 *>(&xs[ty * TM + i][qq * 2]);
+#pragma unroll
+            for (int j = 0; j < TN; j++)
+                b[j] = *reinterpret_cast<const u32 *>(&ws[tx * TN + j][qq * 2]);
+#pragma unroll
+            for (int i = 0; i < TM; i++) {
+#pragma unroll
+                for (int j = 0; j < TN; j++) {
+                    // 2-wide dot: consume the k and k+1 halves in one op
+                    acc[i][j] = d_dot2_pk(a[i], b[j], acc[i][j]);
+                }
+            }
+        }
+#else
 #pragma unroll
         for (int k = 0; k < BK; k += 2) {
             _Float16 a[TM];
@@ -685,6 +725,7 @@ __global__ void __launch_bounds__(simt_cfg::THREADS)
                 }
             }
         }
+#endif
         __syncthreads();
     }
 

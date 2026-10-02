@@ -98,29 +98,94 @@ the original seven were the `par_pool` race fixed in `7337f3b`. The rest:
 
 ---
 
-## P1b — prefill throughput on gfx1031 (dense models)
+## P1b — prefill throughput on gfx1031: it was an LDS bank-conflict bug (FIXED)
 
-Dense prefill on the 6700 XT runs at **~0.6 TFLOP/s**, roughly 4% of what the
-card can do in packed f16. The SIMT GEMM tile is 64x64 with a 4x4 register
-tile, so the inner loop issues 16 FMAs per 8 LDS reads — a 2:1 ratio that
-makes it shared-memory bound. An 8x8 tile would give 4:1.
+**The previous entry here was wrong and is retracted.** It reported a
+"measured ceiling" of 0.81 TFLOP/s from `tools/probe_gemm_tile.hip` and
+concluded that the 6700 XT "simply cannot do dense GEMM quickly" and that
+"there is no structural prefill bug on this part". All of that came from a
+probe that was broken three ways: it no longer compiled against the current
+`krk_hip.hpp` (it borrowed a `HIP_CHECK` the header had since dropped), it
+sized its grid from `multiProcessorCount` (20 on a 40-CU part), and it timed
+0.084 GFLOP per launch — tens of microseconds of work whose measurement is
+launch ramp and drain, not pipe throughput. The file is fixed: it carries its
+own `HIP_CHECK`, takes the CU count from argv, runs ~21 GFLOP per launch, and
+prints a flatness check. Its section-2 table is flat at ~24.1 TFLOP/s from
+NACC 4 up, against a 25.3 TFLOP/s register-only reference
+(`tools/dot2_ceiling.cpp`).
 
-**Tried and rejected:** a 128x128 block tile with 8x8 register tiles. It is
-the textbook fix and the oracle still agreed, but prefill got **2x worse**
-(3245 ms -> 6882 ms for 801 tokens) because the wider tile cuts the grid from
-~19 waves to ~5 over 40 CUs, starving the card. On a 40-CU part the wide tile
-needs split-K to recover its occupancy, and split-K is currently gated behind
-`has_wmma` (`pick_split` is only called from the WMMA branch of `gemm()`), so
-gfx1031 never gets it. **The real next step is split-K for the SIMT path**, not
-a wider tile.
+### The actual bug: the SIMT tile's LDS fetch aliased every lane onto one bank
+
+`gemm_simt_kernel` (the gfx10 prefill path) fetched each k-pair as two
+`_Float16` loads, and re-read `k+1` inside the `(i,j)` loop on top. Its tiles
+are padded to `BK+8` halves = 80 B = 20 words per row, so consecutive `tx`
+lanes are 80 B apart and the bank of a fetch is `(row*20 + q) % 32`: `tx`
+enters only through `tx & 1`. All 16 `tx` lanes of a wave therefore landed on
+2 banks — an 8-way serialization on every `ws` fetch. rocprofv3 on the
+standalone 128x128x32 tile: **`SQC_LDS_BANK_CONFLICT / SQ_INSTS_LDS = 16.4`**,
+`MeanOccupancyPerCU = 15.9` of 32 (VGPR=120), `GRBM_COUNT` = 94% of a 49 ms
+run. The kernel was never arithmetic- or occupancy-bound: roughly 43 of those
+49 ms were spent serialized in LDS. That is also why the earlier attempts
+could not work — a wider tile changes the LDS ops per dot, not the aliasing,
+and split-K changes nothing at all.
+
+**The fix, applied to `gemm_simt_kernel`:** fetch the k-pair as ONE u32, and
+rotate the pair index by the thread's `tx` (`q -> q ^ tx`). The rotation is a
+bijection over the 16 pairs — every thread still sums all of k, in its own
+order, so the result stays deterministic run to run — and it spreads the 16
+lanes over 16 banks. Measured:
+
+| workload | before | after |
+|---|---|---|
+| tile harness 128x128x16 s3 TM8 TN8, 4096^3 (verified maxerr 0) | 2.98 TFLOP/s | **8.28 TFLOP/s** |
+| tile harness 128x128x32 s2 TM8 TN8 | 2.87 TFLOP/s | 7.35 TFLOP/s |
+| `--bench` SmolLM2-135M Q4_K_M, 51-token prefill | 584 tok/s | **1406 tok/s** |
+| `--bench` Qwen3.5-9B Q4_K_M, 55-token prefill | 27.9 tok/s | **180-190 tok/s** |
+| `--bench` Qwen3.5-9B, decode 256 | 21.3 tok/s | 21.3 tok/s (decode is gemv, untouched) |
+
+The old 27.9 tok/s *was* the llama.cpp reference for this model (28.0), which
+is where the "we are at the ground truth, so nothing big is left" reading came
+from. There was: 6.5x.
+
+**Correctness:** `kraken-tests` 1383/1383 on the HIP build; the oracle's
+per-layer divergence profile (including the pre-existing layer-7 blowup in the
+qwen35 test model) is identical before and after the change; every tile-harness
+configuration verifies at `maxerr 0.0e+00`.
+
+### What was tried and why it failed
+
+* **128x128 block tile with 8x8 register tiles.** The textbook fix for a
+  2:1 FMA:LDS ratio, and the oracle still agreed. Prefill got **2x worse**
+  (3245 -> 6882 ms over 801 tokens). Now explained: the wider tile does not
+  touch the bank aliasing, and it cuts the grid from ~19 waves to ~5 over 40
+  CUs on top. Reverted, correctly.
+* **split-K.** Proposed as the fix, never justified. With the tile at 12% of
+  the pipe, neither occupancy nor tile shape was ever the constraint.
+
+### What is actually left on this path
+
+1. **The tile is now at 8.28 of the 25.3 TFLOP/s register-only ceiling (33%).**
+   The ablation on the fixed kernel attributes 59.5% of the remaining time to
+   the global->LDS staging path (latency, not bandwidth: ~93 GB/s of a
+   ~384 GB/s card) and 43.7% to barriers. More stages (`BK=16` s4/s5), fewer
+   registers, or `global_load_lds` are the plausible next ~1.5-2x.
+2. **The int8 DP4A tile has the same aliasing.** `tools/gemm_i8.cpp` fetches
+   `Bs[(tx*TN+j)*BK + q*4]` with a 32-byte row, so `tx` drops out of the bank
+   address entirely (a 16-way conflict): its 6.20 TOP/s is LDS-serialized for
+   the same reason. Rotate the k-quad index before porting it as the MoE
+   expert path.
+3. **The `rows<=16` decode shapes** remain occupancy-starved (0.4-1.2 waves);
+   decode is gemv and already at 21.3 tok/s on the 9B, so this needs its own
+   measurement before anyone invests.
 
 ## P2 — robustness and diagnostics
 
 - **CU count was under-reported (fixed).** HIP returns 20 CUs for a 40-CU
   gfx1031; every occupancy heuristic sized itself against the wrong number.
-  `kfd_compute_units()` now reads the KFD topology. Reported as 40 CU. This
-  alone did not move prefill (3245 -> 3245 ms) because the path that needs the
-  occupancy — split-K — does not run on gfx1031 at all; see P1b.
+  `kfd_compute_units()` now reads the KFD topology. Reported as 40 CU. It did
+  not move prefill at the time (3245 -> 3245 ms) because the constraint was
+  the LDS bank conflict in P1b, not occupancy; with that fixed the same 9B
+  prefill went 27.9 -> 180 tok/s.
 - **Engine utilization counters are Windows-only.** `--bench` prints
   "engine counters are Windows-only" on Linux, so there is no per-engine
   GPU utilization on the machine where the profiling work happens. The
