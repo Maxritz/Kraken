@@ -130,14 +130,49 @@ struct Act {
     std::vector<f32> scales; // [rows, n_in/32]
 };
 
+// The per-half dot loop in gemm_dp4a_kernel leans on one property of the index
+// map: across its NH*RH (half, round) pairs a thread visits every quad group of
+// the k-tile exactly once, and each pair's rotated index lands in the half it is
+// accumulating for. Both are properties of dp4a_quad_index alone, so they are
+// checked here on the CPU -- before any device work, and on a machine whose GPU
+// this path may not run on at all.
+bool check_quad_index_map() {
+    using namespace dp4a_cfg;
+    constexpr int rounds = BK / 4;
+    for (int nh = 1; nh <= 2; nh++) {
+        for (int tx = 0; tx < TX; tx++) {
+            int seen[rounds] = {0};
+            for (int h = 0; h < nh; h++) {
+                for (int r = 0; r < rounds / nh; r++) {
+                    const int qq = dp4a_quad_index(h, r, tx, nh);
+                    if (qq < 0 || qq >= rounds) return false;      // in range
+                    if (nh == 2 && qq / (rounds / 2) != h) return false;
+                    if (seen[qq]++) return false;                  // exactly once
+                }
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
+    std::printf("index map: NH*RH rotated indices cover every quad group once and "
+                "stay in their own half (CPU check, no GPU needed)  %s\n\n",
+                check_quad_index_map() ? "OK" : "FAIL");
+    if (!check_quad_index_map()) return 1;
+
     hipDeviceProp_t p{};
     HIP_CHECK(hipGetDeviceProperties(&p, 0));
-    std::printf("device: %s  %s\n\n", p.name, p.gcnArchName);
+    // The buffers this tool uploads are sized in this type, so its width is part
+    // of the test's contract, not an implementation detail: a host _Float16 that
+    // is not two bytes would upload activations the device reads as garbage
+    // while every host-side value still printed correctly.
+    std::printf("device: %s  %s  (sizeof(_Float16) = %zu)\n\n", p.name,
+                p.gcnArchName, sizeof(_Float16));
 
     const Format formats[] = {
         {DType::Q8_0, "Q8_0", 96, kDp4aWq8},
@@ -161,6 +196,7 @@ int main(int argc, char **argv) {
         // 16 rows, each with a single nonzero code at a different k, one launch
         // per group of 16 positions, until the whole row has been covered.
         {
+            const bool dbg = std::getenv("KRK_I8K_DEBUG") != nullptr;
             const i64 rows = 16, n_out = 128, n_in = f.n_in;
             std::vector<u8> w = random_weights(f.wt, n_out, n_in, rng);
             set_scale_fields(f.wt, w, n_out, n_in, rng);
@@ -181,6 +217,34 @@ int main(int argc, char **argv) {
             std::vector<i8> acodes(static_cast<size_t>(rows * n_in));
             std::vector<f32> ascales(static_cast<size_t>(rows) * (n_in / 32));
 
+            // The probe below can only judge positions whose host-decoded
+            // weight is nonzero, so a degenerate test vector would make it
+            // report a clean pass over nothing. Check the data, not just the
+            // kernel: an all-zero decode is a broken setup and says so.
+            {
+                double mags = 0.0;
+                for (i64 j = 0; j < 4 && j < n_out; j++) {
+                    dequant_row(f.wt,
+                                w.data() + static_cast<size_t>(j) *
+                                               static_cast<size_t>(dtype_row_bytes(f.wt, n_in)),
+                                wrow.data(), n_in);
+                    for (i64 k = 0; k < n_in; k++)
+                        mags += std::fabs(static_cast<double>(wrow[static_cast<size_t>(k)]));
+                }
+                if (!(mags > 0.0)) {
+                    std::printf("  FAIL: the host decoder returned an all-zero row -- "
+                                "the test data is degenerate, so nothing below would "
+                                "be measuring the kernel\n\n");
+                    all_ok = false;
+                    HIP_CHECK(hipFree(dcodes));
+                    HIP_CHECK(hipFree(dscales));
+                    HIP_CHECK(hipFree(dx));
+                    HIP_CHECK(hipFree(dout));
+                    HIP_CHECK(hipFree(dw));
+                    continue;
+                }
+            }
+
             double worst = 0.0;
             i64 worst_at = -1, worst_j = -1, skipped = 0;
             int shown = 0;
@@ -199,6 +263,29 @@ int main(int argc, char **argv) {
                                     hipMemcpyDeviceToHost));
                 HIP_CHECK(hipMemcpy(ascales.data(), dscales, ascales.size() * 4,
                                     hipMemcpyDeviceToHost));
+
+                // What the device actually produced, when asked for. A run
+                // where every position is skipped is a device-side readback
+                // problem, not a staging problem, and the two look identical
+                // from the outside without this.
+                if (dbg && c0 == 0) {
+                    // Each row's one-hot sits at (c0 + m) % n_in, so at c0 == 0
+                    // the nonzero activation of row m is at index m * n_in + m.
+                    const size_t k1 = static_cast<size_t>(n_in) + 1;
+                    std::printf("     [diag] x[0]=%g x[%lld]=%g  code[0]=%d code[%lld]=%d "
+                                "scale[%lld]=%.6g  out[0]=%g out[%lld]=%g\n",
+                                static_cast<double>(x[0]),
+                                static_cast<long long>(k1),
+                                static_cast<double>(x[k1]),
+                                static_cast<int>(acodes[0]),
+                                static_cast<long long>(k1),
+                                static_cast<int>(acodes[k1]),
+                                static_cast<long long>(n_in / 32 + 1),
+                                static_cast<double>(ascales[static_cast<size_t>(n_in / 32) + 1]),
+                                static_cast<double>(out[0]),
+                                static_cast<long long>(n_out),
+                                static_cast<double>(out[static_cast<size_t>(n_out)]));
+                }
 
                 for (i64 j = 0; j < n_out; j++) {
                     dequant_row(f.wt,

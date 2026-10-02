@@ -64,6 +64,13 @@ struct LayerWeights {
     f32 *ssm_norm = nullptr;
 };
 
+// The final-logit bound some archs declare (`final_logit_softcapping`). A free
+// function so the formula has one home and can be checked on its own; the engine
+// applies it in the one place logits become host-visible.
+inline f32 apply_logit_softcap(f32 x, f32 cap) {
+    return cap > 0.0f ? cap * std::tanh(x / cap) : x;
+}
+
 struct ModelConfig {
     std::string arch = "llama";
     std::string name;
@@ -83,6 +90,12 @@ struct ModelConfig {
     f32 rope_attn_scale = 1.0f; // YaRN mscale (1.0 when unused)
     f32 rope_frac = 1.0f;       // fraction of head dims rotated (Phi partial RoPE)
     f32 rms_eps = 1e-5f;
+    // Gemma 2/3/4 bound the output logits with cap * tanh(logit / cap). The
+    // transform is monotone, so argmax and every sampler that only compares
+    // probabilities are unaffected by *ranking* — it matters for the value of
+    // the log-probs a sampler sees and for anything that mixes logits from
+    // different sources. 0 disables it. See apply_logit_softcap.
+    f32 logit_softcap = 0.0f;
     bool tied_embeddings = false;
     bool has_bias = false;
     bool qk_norm = false;

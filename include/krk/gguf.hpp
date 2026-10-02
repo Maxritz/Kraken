@@ -55,6 +55,11 @@ struct GgufTensor {
     std::string name;
     DType type = DType::Unknown;
     u32 type_id = 0xFFFFFFFFu;
+    // False for a format this build does not implement (Q1_0, ...). The
+    // container still reads and describes the entry so a caller can say
+    // *which* format it cannot decode; only the loader has to refuse it, and
+    // `data`/`n_bytes` stay unset because the payload size is unknown.
+    bool dtype_known = true;
     i32 n_dims = 0;
     u64 ne[4] = {1, 1, 1, 1};
     u64 offset = 0;      // relative to the tensor data section

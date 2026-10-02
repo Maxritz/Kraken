@@ -68,6 +68,16 @@
 #define KRK_HAS_DOT2 1
 #endif
 
+// Whether a WMMA GEMM kernel exists in this binary at all. The family macros
+// above answer "which device pass is this", which is the wrong question for a
+// dispatch decision: a fat binary may hold several targets, and the device that
+// actually runs is chosen at runtime. The offload macros say what code objects
+// the binary carries, so they are what decides this, and the *runtime* device
+// then decides whether to use the rung.
+#if defined(KRK_GFX11) || defined(KRK_GFX12)
+#define KRK_WMMA_COMPILED 1
+#endif
+
 #if defined(KRK_GFX10) || defined(KRK_GFX11)
 #define KRK_SIMT_USE_DOT2 1
 #endif
@@ -169,10 +179,15 @@ __device__ __forceinline__ f32 d_dot2(const _Float16 *a, const _Float16 *b, f32 
 //
 // The intrinsic is only *used* by the opt-in int8 path (kernels/gemm_dp4a.hpp);
 // the scalar form keeps this header compilable on a target without the
-// instruction. That fallback takes the address of its parameters, which forces
-// them into scratch — acceptable precisely because it never runs on a target
-// this tree builds for.
-#if defined(KRK_GFX10) || defined(KRK_GFX11) || defined(KRK_GFX12)
+// instruction.
+//
+// It is gfx10/gfx11 only, and that is a compiler gate rather than a hardware
+// one: clang rejects the builtin for gfx1201 with "needs target feature
+// dot1-insts", which selecting the arch does not enable. Writing the intrinsic
+// behind the wider guard made the whole HIP target fail to compile on the
+// gfx1201 machine after the int8 port landed -- nothing here had compiled that
+// path for gfx12, so the break went unnoticed until it was built there.
+#if defined(KRK_GFX10) || defined(KRK_GFX11)
 #define KRK_HAS_DOT4 1
 #endif
 
@@ -181,13 +196,20 @@ __device__ __forceinline__ i32 d_dot4(i32 a, i32 b, i32 c) {
     return __builtin_amdgcn_sdot4(a, b, c, 0);
 }
 #else
+// Four signed byte products, exact, with the bytes taken by shifting rather
+// than through a byte pointer: the pointer form took the address of its
+// parameters, which forces them into scratch on a target that cannot issue the
+// instruction. Arithmetic right shift of a signed value is what sign-extends
+// each byte here.
 __device__ __forceinline__ i32 d_dot4(i32 a, i32 b, i32 c) {
-    const i8 *ap = reinterpret_cast<const i8 *>(&a);
-    const i8 *bp = reinterpret_cast<const i8 *>(&b);
-    return c + static_cast<i32>(ap[0]) * static_cast<i32>(bp[0]) +
-           static_cast<i32>(ap[1]) * static_cast<i32>(bp[1]) +
-           static_cast<i32>(ap[2]) * static_cast<i32>(bp[2]) +
-           static_cast<i32>(ap[3]) * static_cast<i32>(bp[3]);
+    i32 r = c;
+#pragma unroll
+    for (int s = 0; s < 4; s++) {
+        const i32 av = (a << (24 - 8 * s)) >> 24;
+        const i32 bv = (b << (24 - 8 * s)) >> 24;
+        r += av * bv;
+    }
+    return r;
 }
 #endif
 

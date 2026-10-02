@@ -36,6 +36,7 @@
 #include <unistd.h>
 #endif
 
+#include "krk/arch.hpp"
 #include "krk/backend.hpp"
 #include "krk/engine.hpp"
 #include "krk/gguf.hpp"
@@ -43,6 +44,7 @@
 #include "krk/json.hpp"
 #include "krk/quant.hpp"
 #include "krk/server.hpp"
+#include "krk/verdict.hpp"
 
 // The CPU backend's worker pool lives next to the sources, not in the public
 // headers; the tests reach in for it because its scheduling contract (every
@@ -468,7 +470,7 @@ static void test_vec_dot() {
 static const char *kTestModelPath = "kraken-test-model.gguf";
 
 // Builds a 1-layer, 32-wide LLaMA-family model with byte-fallback SPM vocab.
-static bool build_tiny_model(const std::string &path, bool bpe) {
+static bool build_tiny_model(const std::string &path, bool bpe, f32 softcap = 0.0f) {
     const int n_embd = 32, n_layer = 1, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
     const int vocab = bpe ? 300 : 260;
@@ -487,6 +489,7 @@ static bool build_tiny_model(const std::string &path, bool bpe) {
     b.meta_u32("llama.attention.key_length", hd);
     b.meta_f32("llama.attention.layer_norm_rms_epsilon", 1e-5f);
     b.meta_f32("llama.rope.freq_base", 10000.0f);
+    if (softcap > 0.0f) b.meta_f32("llama.final_logit_softcapping", softcap);
 
     // --- tokenizer -------------------------------------------------------
     std::vector<std::string> tokens;
@@ -1310,6 +1313,258 @@ static void test_gdn_ops() {
     delete cpu;
 }
 
+// ---------------------------------------------------------------------------
+// architecture table and load verdict
+// ---------------------------------------------------------------------------
+
+// Splits arch_known_names() on ", " — the same string a user is shown — so the
+// test checks what the error message will actually contain.
+static std::vector<std::string> split_names(const std::string &s) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        const size_t j = s.find(", ", i);
+        out.push_back(s.substr(i, j == std::string::npos ? j : j - i));
+        if (j == std::string::npos) break;
+        i = j + 2;
+    }
+    return out;
+}
+
+static void test_arch_table() {
+    // The table is the only place an arch string is spelled out, so its own
+    // invariants are worth checking: names distinct, every non-Yes entry
+    // carrying a reason, and lookup agreeing with the name list.
+    CHECK(arch_lookup("llama") != nullptr, "llama is in the table");
+    CHECK(arch_lookup("qwen35moe") != nullptr, "qwen35moe is in the table");
+    CHECK(arch_lookup("") == nullptr, "the empty arch name is not in the table");
+    CHECK(arch_lookup("no-such-arch-anywhere") == nullptr,
+          "an unlisted arch is not in the table");
+
+    const std::vector<std::string> names = split_names(arch_known_names());
+    CHECK(names.size() >= 20, "the table covers the inventoried architectures");
+    for (const std::string &n : names) {
+        const ArchSpec *s = arch_lookup(n);
+        CHECK(s != nullptr && n == s->name, "every listed name looks itself up");
+        if (!s) continue;
+        CHECK(s->support == ArchSupport::Yes || (s->why && s->why[0]),
+              "a partial or refused arch says why");
+        CHECK(arch_support_name(s->support)[0] != '?',
+              "support has a name for messages");
+        CHECK(arch_shape_name(s->shape)[0] != '?', "shape has a name");
+        CHECK(arch_role_name(s->role)[0] != '?', "role has a name");
+    }
+    for (size_t i = 0; i < names.size(); i++)
+        for (size_t j = i + 1; j < names.size(); j++)
+            CHECK(names[i] != names[j], "arch names are distinct");
+
+    // The fallback: known to nobody, but still a usable spec.
+    bool known = true;
+    const ArchSpec &fallback = arch_spec("who-knows", &known);
+    CHECK(!known, "an unlisted arch reports itself unknown");
+    CHECK(fallback.support == ArchSupport::Partial && fallback.why[0],
+          "the fallback loads, with the default reason recorded");
+    CHECK(std::string(fallback.family) == "llama",
+          "the fallback is read against llama defaults");
+}
+
+static void test_arch_tensor_maps() {
+    // One name, two meanings: the delta net's fused projection is implemented,
+    // a fused *attention* projection is not.
+    CHECK(arch_tensor_gap("blk.0.attn_qkv.weight", ArchShape::Recurrent) == nullptr,
+          "the gated delta net's attn_qkv is not a gap");
+    CHECK(arch_tensor_gap("blk.0.attn_qkv.weight", ArchShape::Dense) != nullptr,
+          "a dense fused attn_qkv is a gap");
+    CHECK(arch_tensor_gap("blk.0.attn_gate.weight", ArchShape::Recurrent) == nullptr,
+          "the delta net's own gate is not a gap");
+    CHECK(arch_tensor_gap("blk.7.attn_gate.weight", ArchShape::Moe) != nullptr,
+          "a dense attention output gate is a gap");
+    CHECK(arch_tensor_gap("blk.7.attn_v_gate.bias", ArchShape::Moe) != nullptr,
+          "a gate on attention values is a gap");
+    CHECK(arch_tensor_gap("blk.2.attn_kv_a.weight", ArchShape::Moe) != nullptr,
+          "MLA compression is a gap");
+    CHECK(arch_tensor_gap("blk.2.ssm_out.weight", ArchShape::Dense) != nullptr,
+          "a Mamba block in a dense file is a gap");
+    CHECK(arch_tensor_gap("blk.2.ssm_out.weight", ArchShape::Recurrent) == nullptr,
+          "the delta net's ssm_out is not a gap");
+    // Names that are ordinary parts of a loadable schema must stay ordinary.
+    CHECK(arch_tensor_gap("blk.2.attn_q.weight", ArchShape::Dense) == nullptr,
+          "attn_q is not a gap");
+    CHECK(arch_tensor_gap("blk.2.ffn_gate_exps.weight", ArchShape::Moe) == nullptr,
+          "routed-expert FFN weights are not a gap");
+    CHECK(arch_tensor_gap("blk.2.attn_q_norm.weight", ArchShape::Dense) == nullptr,
+          "QK-norm is not a gap");
+
+    // Heads are noted, not refused.
+    CHECK(arch_tensor_head("dflash.aux_hidden_norm.0.weight") != nullptr,
+          "a dflash head is recognized");
+    CHECK(arch_tensor_head("dspark.markov_head_a.weight") != nullptr,
+          "a dspark head is recognized");
+    CHECK(arch_tensor_head("mtp.0.attn_kv.weight") != nullptr,
+          "an MTP head is recognized");
+    CHECK(arch_tensor_head("blk.3.ffn_up.weight") == nullptr,
+          "an ordinary tensor is not a head");
+}
+
+// Writes a one-tensor GGUF whose architecture and tensor name are the only
+// things that matter to the verdict, into a file named after the case. Each
+// case gets its own path because a file that is still mapped cannot be
+// rewritten on Windows, and these fixtures are written repeatedly.
+static std::string build_verdict_fixture(const std::string &tag, const std::string &arch,
+                                         const std::string &tensor, u32 tensor_type,
+                                         i32 nextn) {
+    const std::string path = std::string("kraken-verdict-") + tag + ".gguf";
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", nextn > 0 ? 2 : 1);
+    if (nextn > 0) b.meta_u32(arch + ".nextn_predict_layers", static_cast<u32>(nextn));
+    const std::vector<f32> data{1.0f, 2.0f, 3.0f, 4.0f};
+    if (tensor_type == 0)
+        b.tensor_f32(tensor, {2, 2}, data);
+    else
+        b.tensor_raw(tensor, tensor_type, {2, 2}, data.data(), data.size() * 4);
+    if (!b.write(path)) return std::string();
+    return path;
+}
+
+static void test_load_verdict() {
+    Backend *cpu = make_cpu_backend();
+    std::vector<std::string> made;
+
+    // A plain supported schema with no extras: runnable, and nothing to say.
+    {
+        const std::string path =
+            build_verdict_fixture("llama", "llama", "blk.0.attn_q.weight", 0, 0);
+        CHECK(!path.empty(), "wrote a verdict fixture");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "the fixture loads");
+        const ModelVerdict v = assess_model(g);
+        CHECK(v.runnable && v.known && v.arch == "llama", "llama is runnable");
+        CHECK(v.blockers.empty(), "llama has no blockers");
+        CHECK(v.notes.empty(), "a supported arch with no extras has no notes");
+        CHECK(v.mtp_blocks == 0, "no MTP blocks declared");
+        CHECK(v.headline().find("supported") != std::string::npos,
+              "the headline names the support level");
+        made.push_back(path);
+    }
+
+    // An unlisted arch is a note, never a refusal.
+    {
+        const std::string path = build_verdict_fixture(
+            "unlisted", "totally-unlisted", "blk.0.attn_q.weight", 0, 0);
+        CHECK(!path.empty(), "wrote an unlisted-arch fixture");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "the fixture loads");
+        const ModelVerdict v = assess_model(g);
+        CHECK(v.runnable && !v.known, "an unlisted arch still runs");
+        CHECK(v.notes.size() == 1 &&
+                  v.notes[0].find("not in the architecture table") != std::string::npos,
+              "and says so");
+        Model m;
+        std::string lerr;
+        const bool loaded = m.load(*cpu, path, &lerr);
+        if (!lerr.empty()) std::fprintf(stderr, "  (unlisted arch: %s)\n", lerr.c_str());
+        CHECK(!loaded, "the loader fails on the schema, not on the arch");
+        CHECK(lerr.find("geometry") != std::string::npos &&
+                  lerr.find("not supported") == std::string::npos,
+              "and does not blame the architecture");
+        made.push_back(path);
+    }
+
+    // A refused arch: the reason reaches both the verdict and the loader.
+    {
+        const std::string path =
+            build_verdict_fixture("laguna", "laguna", "blk.0.attn_gate.weight", 0, 0);
+        CHECK(!path.empty(), "wrote a laguna fixture");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "the fixture loads");
+        const ModelVerdict v = assess_model(g);
+        CHECK(!v.runnable, "laguna is refused");
+        CHECK(v.blockers.size() >= 2,
+              "its arch and its gate tensor are separate causes");
+        bool arch_reason = false, gate_reason = false;
+        for (const std::string &b : v.blockers) {
+            if (b.find("attention output gate") != std::string::npos) arch_reason = true;
+            if (b.find("does not implement") != std::string::npos) gate_reason = true;
+        }
+        CHECK(arch_reason && gate_reason, "both causes are named");
+        Model m;
+        std::string lerr;
+        CHECK(!m.load(*cpu, path, &lerr), "the loader refuses the file");
+        CHECK(lerr.find("laguna") != std::string::npos &&
+                  lerr.find("attention output gate") != std::string::npos,
+              "and its error names the arch and the missing piece");
+        made.push_back(path);
+    }
+
+    // A draft file: refused as a model, with the role as the reason.
+    {
+        const std::string path =
+            build_verdict_fixture("dflash", "dflash", "blk.0.ffn_up.weight", 0, 0);
+        CHECK(!path.empty(), "wrote a dflash fixture");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "the fixture loads");
+        const ModelVerdict v = assess_model(g);
+        CHECK(!v.runnable && v.spec && v.spec->role == ArchRole::Draft,
+              "a draft file is refused and labelled a draft");
+        CHECK(v.headline().find("draft") != std::string::npos,
+              "the headline calls it a draft file");
+        CHECK(v.blockers.size() == 1 &&
+                  v.blockers[0].find("--draft") != std::string::npos,
+              "the reason says what to use instead");
+        made.push_back(path);
+    }
+
+    // MTP blocks riding along in a target: a note, and the count the loader uses.
+    {
+        const std::string path =
+            build_verdict_fixture("mtp", "qwen35", "blk.0.attn_qkv.weight", 0, 1);
+        CHECK(!path.empty(), "wrote an MTP fixture");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "the fixture loads");
+        const ModelVerdict v = assess_model(g);
+        CHECK(v.runnable, "a target with MTP blocks runs");
+        CHECK(v.mtp_blocks == 1, "the MTP block count is reported");
+        bool said = false;
+        for (const std::string &n : v.notes)
+            if (n.find("multi-token-prediction") != std::string::npos) said = true;
+        CHECK(said, "and the note says which blocks are skipped");
+        // attn_qkv on a recurrent arch is the delta net's own projection.
+        CHECK(v.blockers.empty(), "the delta net's attn_qkv is not held against it");
+        made.push_back(path);
+    }
+
+    // A format this build cannot dequantize is reported by name, not as a
+    // corrupt file: the container still opens it.
+    {
+        const std::string path =
+            build_verdict_fixture("q1_0", "llama", "blk.0.attn_q.weight", 41, 0);
+        CHECK(!path.empty(), "wrote a Q1_0 fixture");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "an unknown format still parses");
+        const GgufTensor *t = g.tensor("blk.0.attn_q.weight");
+        CHECK(t && !t->dtype_known && t->data == nullptr,
+              "the entry is described, without a payload pointer");
+        const ModelVerdict v = assess_model(g);
+        CHECK(!v.runnable, "the unknown format makes the file unrunnable");
+        bool named = false;
+        for (const std::string &b : v.blockers)
+            if (b.find("#41") != std::string::npos) named = true;
+        CHECK(named, "the blocker names the on-disk format id");
+        made.push_back(path);
+    }
+
+    for (const std::string &p : made) std::remove(p.c_str());
+    delete cpu;
+}
+
 static void test_gguf_roundtrip() {
     CHECK(build_tiny_model(kTestModelPath, false), "wrote a synthetic GGUF");
 
@@ -2118,6 +2373,50 @@ static void test_moe_matches_dense_twin() {
 // end-to-end CPU generation
 // ---------------------------------------------------------------------------
 
+// Gemma 2/3/4 bound the final logits: cap * tanh(logit / cap). The engine
+// applies it where logits become host-visible, so the check is on what the
+// sampler would see.
+static void test_logit_softcap() {
+    const std::string path = "kraken-softcap-test.gguf";
+    const f32 cap = 0.5f;
+    CHECK(build_tiny_model(path, false, cap), "wrote a softcapped model");
+
+    Backend *cpu = make_cpu_backend();
+    Engine engine;
+    EngineConfig cfg;
+    cfg.model_path = path;
+    cfg.n_ctx = 64;
+    cfg.prefill_chunk = 4;
+    std::string err;
+    CHECK(engine.init(cpu, cfg, &err), "the softcapped model loads");
+    CHECK(engine.model().cfg().logit_softcap == cap,
+          "final_logit_softcapping is read from the metadata");
+
+    // The formula itself: bounded by the cap, monotone (so the ranking a greedy
+    // sampler sees is untouched), and an exact pass-through when disabled.
+    CHECK_NEAR(apply_logit_softcap(0.0f, cap), 0.0f, 1e-7, "softcap fixes zero");
+    CHECK(std::fabs(apply_logit_softcap(100.0f, cap)) <= cap,
+          "a huge logit stays inside the cap");
+    CHECK(apply_logit_softcap(3.0f, cap) > apply_logit_softcap(1.0f, cap),
+          "the softcap is monotone");
+    CHECK_NEAR(apply_logit_softcap(2.5f, 0.0f), 2.5f, 1e-6f,
+               "cap 0 is a pass-through");
+
+    // The plumbing: a real model loads with the cap declared, and generation
+    // still runs with it applied.
+    GenerateParams p;
+    p.prompt = "the";
+    p.max_tokens = 4;
+    p.sampler.greedy = true;
+    GenerateResult r;
+    CHECK(engine.generate(p, &r), "a softcapped model generates");
+    CHECK(r.generated > 0, "and produces tokens");
+
+    engine.shutdown();
+    delete cpu;
+    std::remove(path.c_str());
+}
+
 static void test_end_to_end_cpu() {
     Backend *cpu = make_cpu_backend();
     Engine engine;
@@ -2576,9 +2875,13 @@ int main() {
     test_iq4_xs_layout();
     test_nvfp4_layout();
     test_vec_dot();
+    test_arch_table();
+    test_arch_tensor_maps();
+    test_load_verdict();
     test_gguf_roundtrip();
     test_tokenizer_spm_and_bpe();
     test_sampler_determinism();
+    test_logit_softcap();
     test_end_to_end_cpu();
     test_moe_schema_and_laziness();
     test_moe_matches_dense_twin();

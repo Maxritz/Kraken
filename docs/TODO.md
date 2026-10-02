@@ -220,17 +220,63 @@ configuration verifies at `maxerr 0.0e+00`.
      campaign (**183.7 -> 205.7 tok/s** with Q6_K gated out, 245 ms of Q6_K
      cost before that) came from a tmpfs copy of the model that a reboot
      erased, so they are recorded as measured rather than re-checked.
-3. **Q6_K is excluded from the gate on measured cost, not correctness.** Its
-   mixed 6-bit planes plus a per-16-value scale *and* offset make the staging
-   body wide enough that the compiler spills whatever packing it is written
-   with — **208 VGPRs and 272 B of scratch** against 128/0 for Q4_K/Q5_K.
-   Packing the byte stores into dwords cut its dispatch time 308 -> 245 ms but
-   did not get it out of spill, and those 32 dispatches turned the whole
-   flagged path into a net loss (327 ms of GEMM against the fp16 tile's
-   256 ms). It stays compiled and verified by `kraken-i8k`, and re-enabling it
-   is one constant (`kDp4aEnableQ6K` in `gemm_dp4a.hpp`) once the staging fits
-   the register budget.
-4. **A guard now exists for this class of bug** — `scripts/check_lds.sh` runs
+3. **Q6_K is excluded from the gate, and its register budget is now fixed.**
+   The cost was never the staging: it was that Q6_K is the only format with two
+   *halves*, so the dot loop held `iacc[2][4][8]` — 64 live int32 accumulators
+   against 32 for the rest. Reshaping the staging had not moved the numbers at
+   all (206 VGPRs / 260 B both before and after packing its byte stores into
+   dwords), which is what pointed at the accumulators.
+
+   Counts below are gfx1031 metadata from the production flags, read with
+   `hipcc --offload-arch=gfx1031 -S` and `.vgpr_count` /
+   `.private_segment_fixed_size` in the kernel descriptors:
+
+   | kernel | before | after |
+   |---|---|---|
+   | `gemm_dp4a_kernel<3>` Q6_K | 206 VGPR, 260 B, 1 block/CU | **128 VGPR, 28 B, 2 blocks/CU** |
+   | `gemm_dp4a_kernel<0>` Q8_0 | 137 VGPR, 0 B, 1 block/CU | **124 VGPR, 0 B, 2 blocks/CU** |
+   | `gemm_dp4a_kernel<1>` Q4_K | 116 VGPR, 0 B, 2 blocks/CU | 117 VGPR, 0 B, 2 blocks/CU |
+   | `gemm_dp4a_kernel<2>` Q5_K | 117 VGPR, 0 B, 2 blocks/CU | 118 VGPR, 0 B, 2 blocks/CU |
+
+   Two things moved it. The dot now runs **one half at a time** (`TM*TN` int
+   accumulators live instead of `TM*TN` per half, folded per half with that
+   half's scale and offset), and the kernel carries an
+   `__attribute__((amdgpu_waves_per_eu(8)))` budget: `__launch_bounds__`'s
+   second argument — the min-blocks slot that asks for the same thing — changed
+   **not one register** on either arch, so the budget is spelled the AMD way.
+   In the Q6_K body there are then 256 `v_dot4c_i32_i8` per k-tile, 70
+   `ds_read2_b32` for the rotated fetches, and **no spill instructions at all**
+   — the 28 B private segment is the prologue's reservation, not loop traffic.
+
+   The per-half loop's correctness rests on the index map, and that part is now
+   proved on the CPU rather than measured on a card: `dp4a_quad_index` is
+   host-callable, and `kraken-i8k` checks before it touches the device that the
+   `NH*RH` (half, round) pairs visit every quad group exactly once and that each
+   one's rotated index lands inside its own half, for both NH values and all 16
+   `tx` lanes. That is the whole invariant the fold depends on.
+
+   **What is still missing is the measurement, not the budget**: per-dispatch
+   time against the fp16 tile on gfx1031. `kDp4aEnableQ6K` stays false until
+   that is taken, and the two lines that need to exist for it are the counts
+   above (done) and a dispatch time (blocked: maclin was down).
+4. **The int8 port broke the gfx1201 build, and nothing had noticed.**
+   `KRK_HAS_DOT4` was defined for gfx10/gfx11/gfx12 alike, but clang rejects
+   `__builtin_amdgcn_sdot4` on gfx1201 with "needs target feature dot1-insts" —
+   so every `gfx1201` compile of the HIP backend failed from the moment the
+   int8 path landed, because that path had only ever been compiled for gfx1031.
+   The guard is now gfx10/gfx11, and the fallback is exact four-byte arithmetic
+   that no longer takes the address of its operands (the old fallback forced
+   them into scratch). `kraken-tests` on the 9070 XT: 1383/1383.
+5. **`kraken-i8k` cannot validate the int8 path on gfx1201 yet.** On that box
+   the code probe reports every position skipped while the host activations are
+   demonstrably correct (`x[0]=1` at the one-hot index) and a Q4_K output is
+   nonzero — i.e. the codes and scales it reads back are all zero while the
+   kernel that consumes them evidently did not see zeros. That is a readback or
+   launch problem on that platform, not a staging bug, and it is open. It now
+   has a data-sanity check (an all-zero host decode fails loudly instead of
+   reporting a clean pass over nothing) and `KRK_I8K_DEBUG=1` prints the first
+   launch's activations, codes, scales and outputs.
+6. **A guard now exists for this class of bug** — `scripts/check_lds.sh` runs
    a real workload under rocprofv3 and hands
    `SQC_LDS_BANK_CONFLICT / SQ_INSTS_LDS` to `tools/prof_agg.py --guard`,
    which exits non-zero when a kernel exceeds 6.0 conflicts per LDS
@@ -239,7 +285,7 @@ configuration verifies at `maxerr 0.0e+00`.
    model through `KRK_GUARD_MODEL`; bad usage and unmeasurable runs exit 2
    rather than passing silently. It needs ROCm and a GPU, so it is a
    release-step check, not part of `kraken-tests`.
-5. **The other gfx10 kernels were audited for the same aliasing: none share
+7. **The other gfx10 kernels were audited for the same aliasing: none share
    it.** Per-kernel conflicts per LDS instruction, from the flagged 9B profile
    (`/tmp/prof_gate`) and the default path: `gemm_simt_kernel` 0.000,
    `quantize_act_kernel` 0.000, `gdn_delta_rule_kernel` 0.000,
@@ -248,7 +294,7 @@ configuration verifies at `maxerr 0.0e+00`.
    `fused_layer_gemv_kernel` 0.000 (max 0.021),
    `attn_fused_decode_kernel` 0.079, `silu_mul_kernel` 0.000. The two int8
    tiles are the only kernels above the noise floor, at 2.25.
-6. **The `rows<=16` decode shapes** remain occupancy-starved (0.4-1.2 waves);
+8. **The `rows<=16` decode shapes** remain occupancy-starved (0.4-1.2 waves);
    decode is gemv and already at 21.3 tok/s on the 9B, so this needs its own
    measurement before anyone invests.
 
@@ -307,8 +353,17 @@ configuration verifies at `maxerr 0.0e+00`.
 
 ## Housekeeping
 
-- Working tree is dirty with the int8 port, the guard, the tools and this file;
-  nothing is pushed until it is committed.
+- The int8 port, the guard, the K-quant work and this file are committed and
+  pushed through `251d694`.
+- **Uncommitted**: the Q6_K register work (`gemm_dp4a.hpp`, `krk_hip.hpp`,
+  `tools/gemm_i8k_verify.cpp`) — counts and the CPU index-map proof are in, the
+  gfx1031 dispatch time is not, and nothing here is pushed without being asked.
+- **maclin was down** (`10.0.0.12`, unreachable from 03:30 onward) when this was
+  written, which is why the Q6_K timing, the fp16 staging work and any 9B
+  measurement are all stated as pending rather than done. Everything measured
+  in this round was measured on the Windows box (RX 9070 XT, gfx1201) or read
+  out of a gfx1031 assembly dump compiled there with
+  `hipcc --offload-arch=gfx1031`.
 - **`/tmp/q9b.gguf` is gone.** The Qwen3.5-9B Q4_K_M copy lived in tmpfs on
   maclin and a reboot erased it (the box came back up at 03:05). Re-fetch it
   before any further 9B or MoE work — the 9B rows below cannot be re-measured

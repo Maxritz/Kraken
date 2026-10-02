@@ -143,13 +143,17 @@ bool Gguf::load(const std::string &path, std::string *err) {
             return false;
         }
         t.type = static_cast<DType>(t.type_id);
+        t.dtype_known = dtype_block_bytes(t.type) != 0;
         t.n_elements = 1;
         for (i32 d = 0; d < t.n_dims; d++)
             t.n_elements *= static_cast<i64>(t.ne[d]);
-        t.n_bytes = (t.n_dims >= 1)
-                        ? dtype_row_bytes(t.type, static_cast<i64>(t.ne[0])) *
-                              static_cast<size_t>(t.n_elements / std::max<i64>(1, static_cast<i64>(t.ne[0])))
-                        : 0;
+        t.n_bytes = !t.dtype_known
+                        ? 0
+                        : (t.n_dims >= 1)
+                              ? dtype_row_bytes(t.type, static_cast<i64>(t.ne[0])) *
+                                    static_cast<size_t>(t.n_elements /
+                                                        std::max<i64>(1, static_cast<i64>(t.ne[0])))
+                              : 0;
         tensors_.push_back(std::move(t));
     }
 
@@ -167,6 +171,11 @@ bool Gguf::load(const std::string &path, std::string *err) {
     data_base_ = file_.data() + off;
 
     for (auto &t : tensors_) {
+        // A format this build does not implement has no known payload size, so
+        // there is nothing to bounds-check and no pointer to hand out. The
+        // entry stays in the directory (its name and id are what tell the
+        // caller which format is missing) and the verdict refuses the file.
+        if (!t.dtype_known) continue;
         // bounds check the tensor payload
         size_t bytes = 0;
         if (t.n_dims >= 1) {
@@ -175,9 +184,8 @@ bool Gguf::load(const std::string &path, std::string *err) {
             const i64 rows = t.n_elements / std::max<i64>(1, inner);
             bytes = row * static_cast<size_t>(rows);
         }
-        if (t.type_id == 0xFFFFFFFFu || dtype_block_bytes(t.type) == 0 ||
-            t.offset + bytes > file_.size() - off) {
-            if (err) *err = "tensor '" + t.name + "' has an unsupported type or overruns the file";
+        if (t.offset + bytes > file_.size() - off) {
+            if (err) *err = "tensor '" + t.name + "' overruns the file";
             return false;
         }
         t.data = data_base_ + t.offset;

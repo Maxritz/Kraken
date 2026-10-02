@@ -256,14 +256,15 @@ __device__ __forceinline__ void stage_weight_tile(const u8 *__restrict__ w,
     const u8 *ql = blk + g * 64;
     const u8 *qh = blk + 128 + g * 32;
     const i8 *sb = reinterpret_cast<const i8 *>(blk + 192 + g * 8);
-    // The codes are built as eight dwords and stored as dwords, with the
-    // quadrant (p) selected ONCE rather than per code. Measured on the 9B's own
-    // shapes: the byte-store form with a per-code quadrant branch compiled to
-    // 208 VGPRs and 272 B of scratch (register spills) against 128 VGPRs and 0
-    // scratch for Q4_K, and it cost 9.6 ms per dispatch against 0.46 -- the
-    // single largest cost in that model's prefill with the flag on. Same bits,
-    // one quarter of the stores, and the quadrant is loop-invariant.
-    u32 pack[8];
+    // The codes are built and stored one dword at a time, with the quadrant (p)
+    // selected ONCE rather than per code. Measured on gfx1031, production
+    // flags: the byte-store form with a per-code quadrant branch needed 206
+    // VGPRs and 260 B of scratch against 116/117 and 0 for Q4_K/Q5_K, and cost
+    // 9.6 ms per dispatch against 0.46. Building all eight dwords into a local
+    // array first (the previous shape of this code) still needed 206/260 -- the
+    // array stayed live across the quadrant branch -- so the store sits inside
+    // the loop, where only one dword is live at a time.
+    u32 *dst32 = reinterpret_cast<u32 *>(dst);
     if (p == 0) {
 #pragma unroll
         for (int z = 0; z < 8; z++) {
@@ -273,7 +274,7 @@ __device__ __forceinline__ void stage_weight_tile(const u8 *__restrict__ w,
                 const int l = z * 4 + e;
                 v |= static_cast<u32>((ql[l] & 0xF) | ((qh[l] & 3) << 4)) << (8 * e);
             }
-            pack[z] = v;
+            dst32[z] = v;
         }
     } else if (p == 1) {
 #pragma unroll
@@ -285,7 +286,7 @@ __device__ __forceinline__ void stage_weight_tile(const u8 *__restrict__ w,
                 v |= static_cast<u32>((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4))
                      << (8 * e);
             }
-            pack[z] = v;
+            dst32[z] = v;
         }
     } else if (p == 2) {
 #pragma unroll
@@ -297,7 +298,7 @@ __device__ __forceinline__ void stage_weight_tile(const u8 *__restrict__ w,
                 v |= static_cast<u32>((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4))
                      << (8 * e);
             }
-            pack[z] = v;
+            dst32[z] = v;
         }
     } else {
 #pragma unroll
@@ -309,12 +310,9 @@ __device__ __forceinline__ void stage_weight_tile(const u8 *__restrict__ w,
                 v |= static_cast<u32>((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4))
                      << (8 * e);
             }
-            pack[z] = v;
+            dst32[z] = v;
         }
     }
-#pragma unroll
-    for (int z = 0; z < 8; z++)
-        *reinterpret_cast<u32 *>(dst + z * 4) = pack[z];
 #pragma unroll
     for (int h = 0; h < 2; h++) {
         const f32 s = d * static_cast<f32>(sb[h + 2 * p]);
@@ -327,8 +325,36 @@ __device__ __forceinline__ void stage_weight_tile(const u8 *__restrict__ w,
 // the tile kernel
 // ---------------------------------------------------------------------------
 
+// Which quad group the rotated fetch reads for a given (half, round). Host-
+// callable on purpose: the property the per-half dot loop depends on -- that
+// the NH*RH (half, round) pairs visit all BK/4 quads exactly once, and that each
+// pair's rotated index lands inside its OWN half -- follows from this mapping
+// alone, so tools/gemm_i8k_verify.cpp checks it on the CPU.
+//
+// tx enters the rotation as `q ^ tx`, so the index whose image falls in half h
+// is the one whose own bit 2 equals h ^ tx's bit 2; that is what the ^ below
+// selects. Deriving the half from the loop's `q` instead of the rotated `qq`
+// pairs one half's activations with the other half's scale for every lane whose
+// tx flips that bit -- columns 32 and up at TN=8, which is exactly where the
+// code probe put the mismatch when this was first written.
+__host__ __device__ inline int dp4a_quad_index(int h, int r, int tx, int nh) {
+    constexpr int rounds = dp4a_cfg::BK / 4;
+    const int rh = rounds / nh;
+    const int q = (nh == 2) ? (((h ^ ((tx >> 2) & 1)) * rh) | r) : r;
+    return (q ^ tx) & (rounds - 1);
+}
+
+// waves_per_eu is the register budget that actually binds on AMD: 8 waves per
+// EU asks for two 256-thread blocks per CU, which on gfx10 means
+// 65536 / (2 * 256) = 128 VGPRs per thread. The second argument of
+// __launch_bounds__ does NOT do this -- adding it changed neither arch's
+// counts by a single register -- so the budget is spelled this way instead.
+// Q6_K is the format that needs it: with its scratch gone it still sat at 161
+// VGPRs against 116/117 for Q4_K/Q5_K, and anything above 128 drops a block to
+// one per CU.
 template <int WQ>
 __global__ void __launch_bounds__(dp4a_cfg::THREADS)
+                       __attribute__((amdgpu_waves_per_eu(8)))
     gemm_dp4a_kernel(const u8 *__restrict__ w, i64 n_out, i64 n_in,
                      size_t w_row_bytes, const i8 *__restrict__ codes,
                      const f32 *__restrict__ scales, i64 rows,
@@ -440,43 +466,48 @@ __global__ void __launch_bounds__(dp4a_cfg::THREADS)
         if (kt + 1 < k_tiles) load_stage(nxt, kt + 1);
 
         // Packed quad fetch with the lane-rotated index; see the header note.
-        i32 iacc[NH][TM][TN];
-#pragma unroll
-        for (int h = 0; h < NH; h++)
-#pragma unroll
-            for (int i = 0; i < TM; i++)
-#pragma unroll
-                for (int j = 0; j < TN; j++) iacc[h][i][j] = 0;
-
-#pragma unroll
-        for (int q = 0; q < BK / 4; q++) {
-            // The rotation below is what selects the quad being read, so the
-            // half a quad belongs to must come from qq, not from q. Taking it
-            // from q silently pairs half 0's activations with half 1's scale
-            // for every lane whose tx flips the bit that separates the halves —
-            // columns 32 and up at TN=8, which is exactly where the code probe
-            // in tools/gemm_i8k_verify.cpp put the mismatch before this fix.
-            const int qq = (q ^ tx) & (BK / 4 - 1);
-            const int h = (NH == 2) ? (qq >= BK / 8 ? 1 : 0) : 0;
-            i32 a[TM], b[TN];
-#pragma unroll
-            for (int i = 0; i < TM; i++)
-                a[i] = *reinterpret_cast<const i32 *>(&aw[stage][(ty * TM + i) * BK + qq * 4]);
-#pragma unroll
-            for (int j = 0; j < TN; j++)
-                b[j] = *reinterpret_cast<const i32 *>(&bw[stage][(tx * TN + j) * BK + qq * 4]);
-#pragma unroll
-            for (int i = 0; i < TM; i++)
-#pragma unroll
-                for (int j = 0; j < TN; j++)
-                    iacc[h][i][j] = d_dot4(a[i], b[j], iacc[h][i][j]);
-        }
-
-        // Fold: acc += (sa*S) * dot - (sa*sum) * M, the two terms of the
-        // affine product. Q8_0 has M == 0 and one half, Q4_K/Q5_K one half
-        // with M from dmin*m, Q6_K two halves with M = 32*S.
+        //
+        // The k-tile is dotted one HALF at a time, with TM*TN int accumulators
+        // live rather than TM*TN per half. Q6_K is the format that needs two
+        // halves, and holding both at once measured 206 VGPRs and 260 B of
+        // scratch on gfx1031 against 116/117 and 0 for Q4_K/Q5_K -- the live
+        // accumulators were the whole difference, which is why reshaping the
+        // staging never moved those numbers. For NH == 1 this is the single
+        // pass it always was: RH == BK/4 and h is always 0.
+        constexpr int ROUNDS = BK / 4; // quad groups per k-tile
+        constexpr int RH = ROUNDS / NH; // quad groups per half
+        i32 iacc[TM][TN];
 #pragma unroll
         for (int h = 0; h < NH; h++) {
+#pragma unroll
+            for (int i = 0; i < TM; i++)
+#pragma unroll
+                for (int j = 0; j < TN; j++) iacc[i][j] = 0;
+
+#pragma unroll
+            for (int r = 0; r < RH; r++) {
+                // Which quad group this pass reads; the mapping and the reason
+                // it is written that way are in dp4a_quad_index above.
+                const int qq = dp4a_quad_index(h, r, tx, NH);
+                i32 a[TM], b[TN];
+#pragma unroll
+                for (int i = 0; i < TM; i++)
+                    a[i] = *reinterpret_cast<const i32 *>(
+                        &aw[stage][(ty * TM + i) * BK + qq * 4]);
+#pragma unroll
+                for (int j = 0; j < TN; j++)
+                    b[j] = *reinterpret_cast<const i32 *>(
+                        &bw[stage][(tx * TN + j) * BK + qq * 4]);
+#pragma unroll
+                for (int i = 0; i < TM; i++)
+#pragma unroll
+                    for (int j = 0; j < TN; j++)
+                        iacc[i][j] = d_dot4(a[i], b[j], iacc[i][j]);
+            }
+
+            // Fold: acc += (sa*S) * dot - (sa*sum) * M, the two terms of the
+            // affine product. Q8_0 has M == 0 and one half, Q4_K/Q5_K one half
+            // with M from dmin*m, Q6_K two halves with M = 32*S.
 #pragma unroll
             for (int i = 0; i < TM; i++) {
                 const int ri = ty * TM + i;
@@ -488,7 +519,7 @@ __global__ void __launch_bounds__(dp4a_cfg::THREADS)
                 for (int j = 0; j < TN; j++) {
                     const int cj = tx * TN + j;
                     acc[i][j] = fmaf(sa * bsc[stage][cj][h],
-                                     static_cast<f32>(iacc[h][i][j]), acc[i][j]);
+                                     static_cast<f32>(iacc[i][j]), acc[i][j]);
                     if (WQ != kDp4aWq8)
                         acc[i][j] = fmaf(-ssum, bmin[stage][cj][h], acc[i][j]);
                 }

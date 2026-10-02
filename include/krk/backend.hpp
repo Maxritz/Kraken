@@ -36,7 +36,7 @@ struct DeviceCaps {
     int cu_count = 0;
     int lds_bytes = 65536;
     size_t vram_total = 0;
-    size_t vram_free = 0;
+    size_t vram_free = 0; // as of device enumeration, not a live figure
     bool has_wmma = false;      // gfx11+ dense WMMA
     bool has_wmma_gfx12 = false; // gfx12 K-split layout + fp8
     bool has_dot2 = false;      // v_dot2_f32_f16 / packed fp16 rate
@@ -206,9 +206,10 @@ public:
     //
     //   dst[rows[i] * n + j] += alpha[i] * src[i * n + j]
     //
-    // alpha points at n_rows host f32 weights; they are staged to the device
-    // once per call. Every expert writes distinct rows of dst, so no atomics
-    // are needed.
+    // `rows` and `alpha` are in this backend's own address space, the same as
+    // dst and src: a device backend is handed buffers its caller allocated
+    // through alloc(), so a host copy of either is neither made nor expected.
+    // Every expert writes distinct rows of dst, so no atomics are needed.
     virtual void scatter_axpy_rows(void *dst, const void *src, const i32 *rows,
                                    const f32 *alpha, i64 n_rows, i64 n) = 0;
 

@@ -129,6 +129,11 @@ i64 kfd_compute_units() {
 // HipBackend
 // ---------------------------------------------------------------------------
 
+// The GEMM ladder this backend walks, and the switch that pins a rung for
+// measurement. See HipBackend::gemm_rung for how the device picks.
+enum class GemmRung { kWmma, kDp4a, kSimt };
+enum class GemmPath { kAuto, kWmma, kDp4a, kSimt };
+
 class HipBackend final : public Backend {
 public:
     HipBackend(int index, const hipDeviceProp_t &p, const DeviceCaps &c)
@@ -154,6 +159,27 @@ public:
         // (including its absence) leaves the fp16 tile in place.
         const char *ie = std::getenv("KRK_GEMM_INT8");
         int8_gemm_ = ie && std::strcmp(ie, "0") != 0;
+        // Which rung of the GEMM ladder to use, for measurement and for
+        // pinning a path when comparing two builds. Absent or "auto" means the
+        // device decides (see gemm_rung).
+        const char *pe = std::getenv("KRK_GEMM_PATH");
+        if (pe == nullptr || std::strcmp(pe, "auto") == 0) path_ = GemmPath::kAuto;
+        else if (std::strcmp(pe, "wmma") == 0) path_ = GemmPath::kWmma;
+        else if (std::strcmp(pe, "dp4a") == 0) path_ = GemmPath::kDp4a;
+        else if (std::strcmp(pe, "simt") == 0) path_ = GemmPath::kSimt;
+        else {
+            KRK_WARN("KRK_GEMM_PATH=%s is not one of auto/wmma/dp4a/simt; "
+                     "using the device's own choice", pe);
+            path_ = GemmPath::kAuto;
+        }
+        // A rung that was asked for and is not there is a warning, not a
+        // failure: the ladder falls through to the next one.
+        if (path_ == GemmPath::kWmma && !caps_.has_wmma)
+            KRK_WARN("KRK_GEMM_PATH=wmma, but %s has no WMMA; the ladder will "
+                     "fall through", caps_.gfx.c_str());
+        if (path_ == GemmPath::kDp4a && !int8_gemm_)
+            KRK_WARN("KRK_GEMM_PATH=dp4a also turns on the int8 activations, "
+                     "which are lossy by construction");
     }
 
     BackendKind kind() const override { return BackendKind::HIP; }
@@ -242,11 +268,49 @@ public:
         for (i64 i = 0; i < n; i++) dst[i] = fp16_to_fp32(tmp[static_cast<size_t>(i)]);
     }
 
+    // Which GEMM family to run, decided from the DEVICE rather than from how
+    // this binary was built: WMMA where the part has it, DP4A for the formats
+    // and shapes it can stage (when that path is enabled), and the packed-math
+    // SIMT tile everywhere else. Two reasons it is a runtime ladder. A build may
+    // hold several targets, so a build-time answer would be the wrong device's;
+    // and a rung that is not present must fall THROUGH to the next one instead
+    // of launching nothing, which is what the previous shape of this code did
+    // whenever the device had WMMA but the kernel had not been compiled in.
+    GemmRung gemm_rung(DType wt, i64 rows, i64 n_out, i64 n_in) const {
+        const bool wmma_present = caps_.has_wmma
+#if defined(KRK_WMMA_COMPILED)
+                                  ;
+#else
+                                  && false;
+#endif
+        // Forcing a rung means exactly that: a forced path is not silently
+        // upgraded, and a forced rung the device lacks falls through with the
+        // warning that was printed once at startup.
+        const bool force_wmma = path_ == GemmPath::kWmma;
+        const bool force_dp4a = path_ == GemmPath::kDp4a;
+        const bool force_simt = path_ == GemmPath::kSimt;
+        if (!force_dp4a && !force_simt && wmma_present) return GemmRung::kWmma;
+        if (!force_simt && !force_wmma && (int8_gemm_ || force_dp4a) &&
+            dp4a_ok(static_cast<int>(wt), rows, n_out, n_in))
+            return GemmRung::kDp4a;
+        return GemmRung::kSimt;
+    }
+
+    // The highest rung this device can reach, for the banner: it names the
+    // family the engine would prefer, not what every individual call takes
+    // (a shape or format outside DP4A's rules still lands on the SIMT tile).
+    const char *gemm_rung_name() const {
+        switch (gemm_rung(DType::Q4_K, 64, 256, 256)) {
+            case GemmRung::kWmma: return caps_.has_wmma_gfx12 ? "WMMA gfx12" : "WMMA";
+            case GemmRung::kDp4a: return "DP4A int8";
+            default: return "packed-math";
+        }
+    }
+
     std::string describe() const override {
         return format("%s (%s, %s, %d CU, wave32, %s)", caps_.name.c_str(),
                       caps_.gfx.c_str(), caps_.family_name(), caps_.cu_count,
-                      caps_.has_wmma ? (caps_.has_wmma_gfx12 ? "WMMA gfx12" : "WMMA")
-                                     : "packed-math");
+                      gemm_rung_name());
     }
 
     // ---- ops -------------------------------------------------------------
@@ -296,6 +360,7 @@ public:
             std::abort();
         }
 
+        const GemmRung rung = gemm_rung(wt, rows, n_out, n_in);
         if (rows == 1) {
             // One 256-thread block covers THREADS/32 rows (one warp
             // per row), so the grid is n_out warps, not n_out blocks —
@@ -303,7 +368,7 @@ public:
             gemv_kernel<256><<<static_cast<unsigned>((n_out + 7) / 8),
                                 256>>>(
                 wh, static_cast<int>(wt), n_out, n_in, row_bytes, xh, oh);
-        } else if (caps_.has_wmma) {
+        } else if (rung == GemmRung::kWmma) {
 #if defined(KRK_GFX11) || defined(KRK_GFX12)
             const unsigned bx = static_cast<unsigned>(
                 (n_out + wmma_cfg::BN - 1) / wmma_cfg::BN);
@@ -361,7 +426,7 @@ public:
                         256>>>(parts, split, pstride, total, oh);
             }
 #endif
-        } else if (int8_gemm_ && dp4a_ok(static_cast<int>(wt), rows, n_out, n_in)) {
+        } else if (rung == GemmRung::kDp4a) {
             // The opt-in int8 path (see the constructor and the header of
             // kernels/gemm_dp4a.hpp). Q8_0 only, because Q8_0's payload is
             // already int8; rows >= 16, because a tile below that spends more
@@ -715,17 +780,18 @@ public:
     void scatter_axpy_rows(void *dst, const void *src, const i32 *rows,
                            const f32 *alpha, i64 n_rows, i64 n) override {
         if (n_rows <= 0 || n <= 0) return;
-        // alpha is host memory; stage it next to the row plan (pinned-style
-        // staging through a small scratch keeps this one memcpy).
-        std::vector<f32> a(static_cast<size_t>(n_rows));
-        std::memcpy(a.data(), alpha, static_cast<size_t>(n_rows) * sizeof(f32));
-        f32 *alpha_dev = static_cast<f32 *>(alloc(a.size() * sizeof(f32)));
-        KRK_HIP(hipMemcpy(alpha_dev, a.data(), a.size() * sizeof(f32),
-                          hipMemcpyHostToDevice));
+        // alpha lives in this backend's address space, exactly like `rows`: the
+        // caller is a device backend's user and hands over buffers it allocated
+        // here. This used to memcpy it as if it were host memory, which is a
+        // read of device memory from the host: harmless-looking on a Linux
+        // driver that maps device pages into the process, an access violation
+        // (0xC0000005) on Windows, and undefined everywhere in between. The MoE
+        // path's first use on Windows hit it, in Engine::moe_ffn. Staging the
+        // copy also cost a per-expert H2D transfer that the caller had already
+        // paid for when it uploaded the same weights.
         scatter_axpy_rows_kernel<<<static_cast<unsigned>(n_rows), 256>>>(
             static_cast<_Float16 *>(dst), static_cast<const _Float16 *>(src),
-            rows, alpha_dev, n);
-        release(alpha_dev);
+            rows, alpha, n);
     }
 
     ~HipBackend() override {
@@ -767,6 +833,7 @@ private:
     bool attn_fused_ = true;
     // Opt-in int8 DP4A prefill GEMM on Q8_0 weights (see the constructor).
     bool int8_gemm_ = false;
+    GemmPath path_ = GemmPath::kAuto;
     // Quantized activations for that path: [rows, n_in] int8 codes and one
     // fp32 scale per 32-value block, grown on demand.
     void *int8q_ = nullptr;
@@ -900,7 +967,29 @@ Backend *make_hip_backend(int device_index, std::string *err) {
     // only as a fallback.
     {
         const i64 real_cus = kfd_compute_units();
-        if (real_cus > 0) c.cu_count = static_cast<int>(real_cus);
+        if (real_cus > 0) {
+            c.cu_count = static_cast<int>(real_cus);
+        } else if (c.family != GfxFamily::Unknown) {
+            // No KFD to ask (Windows, or a kernel without the topology). What
+            // HIP reports on RDNA is the WGP count, and a WGP is two CUs: the
+            // 6700 XT's 40 CUs arrive as 20 (which KFD confirmed), and the
+            // 9070 XT's 64 arrive as the 32 this backend used to believe. Every
+            // occupancy heuristic, every grid and pick_split's cost model are
+            // sized against cu_count, so believing half of it halves the
+            // launch geometry on exactly the machines that cannot be corrected
+            // any other way.
+            c.cu_count *= 2;
+        }
+        // A/B switch for the above, and the escape hatch if a part reports
+        // something that is neither CUs nor WGPs.
+        if (const char *cu = std::getenv("KRK_CU_OVERRIDE")) {
+            const int v = std::atoi(cu);
+            if (v > 0) {
+                KRK_WARN("KRK_CU_OVERRIDE=%d replaces the detected %d CU", v,
+                         c.cu_count);
+                c.cu_count = v;
+            }
+        }
     }
     c.lds_bytes = props.sharedMemPerBlock > 0 ? props.sharedMemPerBlock : 65536;
     c.vram_total = props.totalGlobalMem;

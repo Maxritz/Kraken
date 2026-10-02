@@ -60,11 +60,9 @@ def main(path, filt=None):
             t = u32()
             v = value(t)
             keys.append((key, t, v))
-        # Tensor info follows, 32-byte aligned.
-        pos = f.tell()
-        pad = (-pos) % 32
-        if pad:
-            f.seek(pad, 1)
+        # Tensor info follows the metadata directly. (The `alignment` key
+        # applies to where tensor *data* starts, not to this section; seeking
+        # 32 here desyncs the whole tensor list.)
         tensors = []
         for _ in range(n_tensors):
             name = sval()

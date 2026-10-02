@@ -1,5 +1,7 @@
 // model.cpp — resolve GGUF metadata + tensor schema into device-resident weights.
 #include "krk/model.hpp"
+#include "krk/arch.hpp"
+#include "krk/verdict.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -25,22 +27,39 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.name = gguf_.get_str("general.name", "model");
     const std::string a = cfg_.arch;
 
+    // What this file is, and whether this build can run it: the arch table, the
+    // quantization formats, and the tensors that name unimplemented pieces, all
+    // answered from the metadata before any weight is uploaded (verdict.hpp).
+    // An unrecognized arch is not fatal — most llama-schema variants load and
+    // run — but it is reported, because the alternative is a model that decodes
+    // nonsense while the log says nothing.
+    const ModelVerdict verdict = assess_model(gguf_);
+    const ArchSpec &aspec = *verdict.spec;
+    for (const std::string &n : verdict.notes)
+        KRK_WARN("architecture '%s': %s (known: %s)", a.c_str(), n.c_str(),
+                 arch_known_names().c_str());
+    if (!verdict.runnable) {
+        if (err) {
+            std::string msg = "cannot run this file ('" +
+                              (verdict.arch.empty() ? std::string("no arch") : verdict.arch) +
+                              "')";
+            for (const std::string &b : verdict.blockers) msg += ". " + b;
+            *err = msg;
+        }
+        return false;
+    }
+
     auto key = [&a](const char *suffix) { return a + suffix; };
 
     // block_count counts every block in the file, which includes any
     // next-token-prediction (MTP) blocks. Those are extra prediction heads
     // appended to the stack, not transformer layers: they carry attention and a
     // FFN but no ssm tensors, so loading them as layers fails on the missing
-    // delta-net weights. The converter records how many in
-    // `<arch>.nextn_predict_layers` (an array, one entry per head).
+    // delta-net weights. How many there are is `nextn_predict_layers`, read by
+    // the verdict (verdict.hpp) so the loader and the report on a file cannot
+    // disagree about it.
     const i32 block_count = static_cast<i32>(gguf_.get_i64(key(".block_count"), 0));
-    i32 nextn = 0;
-    if (const std::vector<i32> *nl = gguf_.get_i32_array(key(".nextn_predict_layers"))) {
-        if (!nl->empty()) nextn = (*nl)[0];
-    } else {
-        nextn = static_cast<i32>(gguf_.get_i64(key(".nextn_predict_layers"), 0));
-    }
-    if (nextn < 0 || nextn > block_count) nextn = 0;
+    const i32 nextn = verdict.mtp_blocks;
     cfg_.n_layer_nextn = nextn;
     cfg_.n_layer = block_count - nextn;
     cfg_.n_embd = static_cast<i32>(gguf_.get_i64(key(".embedding_length"), 0));
@@ -57,6 +76,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         static_cast<f32>(gguf_.get_f64(key(".attention.layer_norm_rms_epsilon"), 1e-5));
     cfg_.rope_base = static_cast<f32>(gguf_.get_f64(key(".rope.freq_base"), 10000.0));
     cfg_.rope_scale = static_cast<f32>(gguf_.get_f64(key(".rope.scaling.factor"), 1.0));
+    cfg_.logit_softcap =
+        static_cast<f32>(gguf_.get_f64(key(".final_logit_softcapping"), 0.0));
     {
         const std::string st = gguf_.get_str(key(".rope.scaling.type"), "");
         if (st == "none" || st.empty()) cfg_.rope_scale = 1.0f;
@@ -87,7 +108,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
     // Gemma-style models scale the embedding by sqrt(n_embd); the schema here
     // only needs to know the norm epsilon and head geometry.
-    if (cfg_.arch == "gemma" || cfg_.arch == "gemma2" || cfg_.arch == "gemma3") {
+    if (aspec.gemma_norm) {
         cfg_.rms_eps = static_cast<f32>(
             gguf_.get_f64(key(".attention.layer_norm_rms_epsilon"), 1e-6));
         cfg_.rope_base = 10000.0f;
@@ -98,7 +119,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // attention every `full_attention_interval` layers. The ssm.* keys carry
     // the recurrent block's shape; the tensor schema is validated per layer
     // further down, where the split is actually known.
-    cfg_.recurrent = (a == "qwen35" || a == "qwen35moe");
+    cfg_.recurrent = (aspec.shape == ArchShape::Recurrent ||
+                      aspec.shape == ArchShape::RecurrentMoe);
     if (cfg_.recurrent) {
         cfg_.full_attention_interval = static_cast<i32>(
             gguf_.get_i64(key(".full_attention_interval"), 4));
@@ -483,7 +505,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         } else {
             // Qwen3.5's attending layers pack a per-head output gate into the
             // query projection, so its row count is twice the head width.
-            const i64 expect_q = (a == "qwen35" || a == "qwen35moe") ? 2 * q_dim : q_dim;
+            const i64 expect_q = aspec.q_output_gate ? 2 * q_dim : q_dim;
             if (L.wq.n_out != expect_q || L.wk.n_out != kv_dim ||
                 L.wv.n_out != kv_dim || L.wo.n_in != q_dim) {
                 if (err)

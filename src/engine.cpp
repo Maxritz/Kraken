@@ -1,6 +1,7 @@
 // engine.cpp — prefill (batched) + decode (single token) with a paged-free
 // contiguous KV cache, streaming output and stop-string handling.
 #include "krk/engine.hpp"
+#include "krk/arch.hpp"
 #include "par_pool.hpp"
 
 #include <algorithm>
@@ -189,7 +190,9 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // Qwen3.5's attending layers carry a per-head output gate in the same
     // projection as the query, so the buffer is twice the head width until the
     // engine splits the two apart.
-    q_proj_ = (mc.arch == "qwen35" || mc.arch == "qwen35moe") ? 2 * q_dim_ : q_dim_;
+    // The arch table owns this rule; the engine only mirrors it (see
+    // include/krk/arch.hpp for why it lives in one place).
+    q_proj_ = arch_spec(mc.arch).q_output_gate ? 2 * q_dim_ : q_dim_;
     conv_dim_ = model_.conv_dim();
     value_dim_ = model_.value_dim();
     n_vocab_ = mc.n_vocab;
@@ -827,6 +830,14 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
 void Engine::fetch_logits() {
     be_->sync();
     be_->download_f32(logits_host_, ws_logits_, n_vocab_);
+    // Gemma 2/3/4 cap the *final* logits. This is the one place logits become
+    // host-visible, so every path (plain, speculative, draft) gets the bound for
+    // free, and it is monotone — greedy decoding cannot change because of it.
+    const f32 cap = model_.cfg().logit_softcap;
+    if (cap > 0.0f) {
+        for (i32 v = 0; v < n_vocab_; v++)
+            logits_host_[v] = apply_logit_softcap(logits_host_[v], cap);
+    }
 }
 
 bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,

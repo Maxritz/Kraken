@@ -39,6 +39,8 @@ set(KRK_GPU_TARGETS "gfx1031;gfx1201"
 
 set(KRK_CORE_SOURCES
     src/common.cpp
+    src/arch.cpp
+    src/verdict.cpp
     src/quant.cpp
     src/gguf.cpp
     src/tokenizer.cpp

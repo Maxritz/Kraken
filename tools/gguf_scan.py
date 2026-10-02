@@ -22,7 +22,13 @@ def rd_str(f):
     n = struct.unpack('<Q', f.read(8))[0]
     return f.read(n).decode('utf-8', 'replace')
 
-def rd_val(f, t):
+# How many elements of an array to keep in the report. Every element is still
+# read — GGUF packs the values with no length prefix, so skipping any desyncs
+# the rest of the file. (A tokenizer array is a quarter million strings; the
+# report only needs to know it is there.)
+KEEP = 64
+
+def rd_val(f, t, keep=KEEP):
     if t == 0: return struct.unpack('<B', f.read(1))[0]
     if t == 1: return struct.unpack('<b', f.read(1))[0]
     if t == 2: return struct.unpack('<H', f.read(2))[0]
@@ -38,7 +44,13 @@ def rd_val(f, t):
     if t == 9:
         et = struct.unpack('<I', f.read(4))[0]
         n = struct.unpack('<Q', f.read(8))[0]
-        return [rd_val(f, et) for _ in range(min(n, 4096))]
+        if et == 9: raise ValueError('nested array')
+        out = []
+        for i in range(n):
+            v = rd_val(f, et, 0)
+            if i < keep: out.append(v)
+        if n > keep: out.append('...%d more' % (n - keep))
+        return out
     raise ValueError('bad gguf type %d' % t)
 
 def scan(path):

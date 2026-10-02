@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "krk/gguf.hpp"
+#include "krk/verdict.hpp"
 
 namespace {
 
@@ -78,14 +79,32 @@ int main(int argc, char **argv) {
     std::printf("tensors    %zu\n", g.tensors().size());
 
     size_t total = 0;
+    size_t unknown = 0; // tensors in formats this build does not implement
     std::map<int, std::pair<int, size_t>> by_type; // type id -> (count, bytes)
     for (const GgufTensor &t : g.tensors()) {
         total += t.n_bytes;
+        if (!t.dtype_known) unknown++;
         auto &e = by_type[static_cast<int>(t.type)];
         e.first++;
         e.second += t.n_bytes;
     }
-    std::printf("payload    %s\n", human(total).c_str());
+    if (unknown)
+        std::printf("payload    %s in known formats + %zu tensor(s) of unknown size\n",
+                    human(total).c_str(), unknown);
+    else
+        std::printf("payload    %s\n", human(total).c_str());
+
+    // What the engine would decide about this file, before any device work:
+    // the arch table's verdict plus the formats and tensors that stop it.
+    {
+        const ModelVerdict v = assess_model(g);
+        std::printf("arch       %s\n", v.headline().c_str());
+        std::printf("verdict    %s\n", v.runnable ? "runnable" : "refused");
+        for (const std::string &b : v.blockers)
+            std::printf("           - %s\n", b.c_str());
+        for (const std::string &n : v.notes)
+            std::printf("           . %s\n", n.c_str());
+    }
 
     if (!quant_only) {
         std::printf("\nmetadata:\n");
@@ -95,10 +114,16 @@ int main(int argc, char **argv) {
 
     if (!meta_only) {
         std::printf("\nformat histogram:\n");
-        for (const auto &kv : by_type)
-            std::printf("  %-8s %6d tensors  %s\n",
-                        dtype_name(static_cast<DType>(kv.first)), kv.second.first,
-                        human(kv.second.second).c_str());
+        for (const auto &kv : by_type) {
+            // A format this build does not implement has no size in the
+            // histogram, so print the on-disk type id instead of a name.
+            std::string name = dtype_name(static_cast<DType>(kv.first));
+            if (name == "UNKNOWN")
+                name = format("#%d", kv.first);
+            std::printf("  %-8s %6d tensors  %s\n", name.c_str(), kv.second.first,
+                        kv.second.second ? human(kv.second.second).c_str()
+                                         : "(unknown format)");
+        }
     }
 
     if (!meta_only && !quant_only) {
