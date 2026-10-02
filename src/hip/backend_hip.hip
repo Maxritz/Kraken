@@ -16,6 +16,7 @@
 #include "kernels/attention.hpp"
 #include "kernels/fused.hpp"
 #include "kernels/gemm.hpp"
+#include "kernels/gemm_dp4a.hpp"
 #include "kernels/gdn.hpp"
 
 namespace krk {
@@ -145,6 +146,14 @@ public:
         // separate launches (A/B and fallback switch).
         const char *ae = std::getenv("KRK_FUSED_ATTN");
         attn_fused_ = !ae || std::strcmp(ae, "0") != 0;
+        // int8 DP4A prefill GEMM for Q8_0 weights (kernels/gemm_dp4a.hpp).
+        // Opt-in, unlike the two switches above: that path quantizes the
+        // activations to int8, so its logits are close to the fp16 path's but
+        // not bit-identical, and no default in this tree is allowed to be
+        // lossy. KRK_GEMM_INT8=1 enables it for measurement; anything else
+        // (including its absence) leaves the fp16 tile in place.
+        const char *ie = std::getenv("KRK_GEMM_INT8");
+        int8_gemm_ = ie && std::strcmp(ie, "0") != 0;
     }
 
     BackendKind kind() const override { return BackendKind::HIP; }
@@ -352,6 +361,35 @@ public:
                         256>>>(parts, split, pstride, total, oh);
             }
 #endif
+        } else if (int8_gemm_ && dp4a_ok(static_cast<int>(wt), rows, n_out, n_in)) {
+            // The opt-in int8 path (see the constructor and the header of
+            // kernels/gemm_dp4a.hpp). Q8_0 only, because Q8_0's payload is
+            // already int8; rows >= 16, because a tile below that spends more
+            // on its own staging than on the rows it has. Everything else
+            // keeps the fp16 tile, which is also what happens when the flag
+            // is absent.
+            //
+            // Quantized-activation staging: [rows, n_in] codes plus one fp32
+            // scale per 32-value block. Grown on demand and kept across calls,
+            // like the split-K partials, so the hot path never allocates.
+            const size_t need =
+                static_cast<size_t>(rows) * static_cast<size_t>(n_in);
+            if (need > int8q_cap_) {
+                if (int8q_) KRK_HIP(hipFree(int8q_));
+                int8q_cap_ = (need + 255u) & ~static_cast<size_t>(255u);
+                int8q_ = nullptr;
+                KRK_HIP(hipMalloc(&int8q_, int8q_cap_));
+            }
+            const size_t sneed = static_cast<size_t>(rows) *
+                                 static_cast<size_t>(n_in / 32) * sizeof(f32);
+            if (sneed > int8s_cap_) {
+                if (int8s_) KRK_HIP(hipFree(int8s_));
+                int8s_cap_ = (sneed + 255u) & ~static_cast<size_t>(255u);
+                int8s_ = nullptr;
+                KRK_HIP(hipMalloc(&int8s_, int8s_cap_));
+            }
+            gemm_dp4a_launch(wh, n_out, n_in, row_bytes, xh, rows, oh,
+                             reinterpret_cast<i8 *>(int8q_), int8s_);
         } else {
             const dim3 grid(
                 static_cast<unsigned>((n_out + simt_cfg::BN - 1) / simt_cfg::BN),
@@ -704,6 +742,14 @@ public:
             (void)hipFree(split_dev_);
             split_dev_ = nullptr;
         }
+        if (int8q_) {
+            (void)hipFree(int8q_);
+            int8q_ = nullptr;
+        }
+        if (int8s_) {
+            (void)hipFree(int8s_);
+            int8s_ = nullptr;
+        }
         for (const GdnTaps &e : gdn_taps_) (void)hipFree(e.dev);
         gdn_taps_.clear();
     }
@@ -716,6 +762,14 @@ private:
     bool fused_layer_ = true;
     // Fused non-GEMM decode chain on/off (see the constructor).
     bool attn_fused_ = true;
+    // Opt-in int8 DP4A prefill GEMM on Q8_0 weights (see the constructor).
+    bool int8_gemm_ = false;
+    // Quantized activations for that path: [rows, n_in] int8 codes and one
+    // fp32 scale per 32-value block, grown on demand.
+    void *int8q_ = nullptr;
+    size_t int8q_cap_ = 0;
+    f32 *int8s_ = nullptr;
+    size_t int8s_cap_ = 0;
     // Device staging for the host token-id array embed() reads (grown
     // on demand; see embed()).
     void *tok_dev_ = nullptr;

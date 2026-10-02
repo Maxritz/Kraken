@@ -169,11 +169,31 @@ configuration verifies at `maxerr 0.0e+00`.
    the global->LDS staging path (latency, not bandwidth: ~93 GB/s of a
    ~384 GB/s card) and 43.7% to barriers. More stages (`BK=16` s4/s5), fewer
    registers, or `global_load_lds` are the plausible next ~1.5-2x.
-2. **The int8 DP4A tile has the same aliasing.** `tools/gemm_i8.cpp` fetches
-   `Bs[(tx*TN+j)*BK + q*4]` with a 32-byte row, so `tx` drops out of the bank
-   address entirely (a 16-way conflict): its 6.20 TOP/s is LDS-serialized for
-   the same reason. Rotate the k-quad index before porting it as the MoE
-   expert path.
+2. **The int8 DP4A tile had the same aliasing (fixed), and is now ported.**
+   `tools/gemm_i8.cpp` fetched `Bs[(tx*TN+j)*BK + q*4]` with a 32-byte row, so
+   `tx` dropped out of the bank address entirely (16-way). Rotating the k-quad
+   by `tx` fixed it: **6.20 -> 9.27 TOP/s** at 4096^3 (11.26 with a 128x128x16
+   s4 tile), `maxerr 0` against the CPU reference in every configuration, and
+   `SQC_LDS_BANK_CONFLICT/SQ_INSTS_LDS` 19.4 -> 7.4. The ISA shows what is
+   left: the unrotated fetch's fully-unrolled quads merge into 128-bit LDS
+   reads (32 `ds_read_b128` per k-tile, all 16 lanes on the same 4 banks), and
+   the rotation forbids that merge — 32 wide aliased reads become 64 narrow
+   spread ones. Rotating at 16-byte-GROUP granularity so the wide reads come
+   back is the next lever.
+   The port is `src/hip/kernels/gemm_dp4a.hpp`, behind `KRK_GEMM_INT8=1`
+   (off by default, like the other two switches but for a second reason): Q8_0
+   weights are consumed as int8 with their own block scales, activations are
+   quantized per 32-value block, and each k-tile's int32 partial is folded into
+   the fp32 accumulator with that block's scale pair. It is **lossy** — int8
+   activations — so it does not become a default without winning first. On
+   Llama-3.2-1B-Q8_0 prefill it is **1109 -> 1371 tok/s (+24%)** with decode
+   untouched (gemv), the greedy token stream identical, top-3 log-probs within
+   0.03 of ~19.0 (0.2%), runs identical run to run, and the kernel profiles at
+   1.97 bank conflicts per LDS instruction, 112 VGPRs, no scratch. Both suites
+   stay at 1383/1383 with the flag on and off.
+   Q4_K/Q5_K/Q6_K experts still take the fp16 tile: their sub-block format
+   needs the affine min-term correction, so Q8_0 is the format this covers
+   today (Q8_0 experts are the ones whose bytes already are the int8 operand).
 3. **The `rows<=16` decode shapes** remain occupancy-starved (0.4-1.2 waves);
    decode is gemv and already at 21.3 tok/s on the 9B, so this needs its own
    measurement before anyone invests.

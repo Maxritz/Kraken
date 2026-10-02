@@ -34,6 +34,18 @@
 //  Top/s convention: one MAC counts as 2 ops, so TOP/s = 2*M*N*K/t, matching
 //  the fp32 FMA and dp4c numbers this is compared against. MAC/s is printed
 //  next to it so the two are never confused.
+//
+//  THE TILE'S LDS READS WERE BANK-ALIASED, AND ROTATION FIXES THEM. The tile
+//  rows are BK = 32 bytes = 8 words wide, which is 0 mod 32 banks, so the row
+//  index cancels out of the bank number and the plain k-quad index q makes the
+//  b[j] fetch read (8*j + q) % 32 in all 16 tx lanes -- sixteen addresses
+//  serialized on one bank. This is the same defect that held the fp16 tile at
+//  2.9 TFLOP/s until it was found with rocprofv3 counters
+//  (SQC_LDS_BANK_CONFLICT / SQ_INSTS_LDS = 16.4), and it is why the int8 kernel
+//  below sat at 6.2 TOP/s, an eighth of the card's DP4A ceiling. Rotating the
+//  quad index by the thread's tx makes the lanes land on different banks while
+//  still covering every quad exactly once. Section 3 prints rot=0 and rot=1
+//  side by side so the delta is measured, not assumed.
 // ============================================================================
 #include <hip/hip_runtime.h>
 
@@ -284,11 +296,20 @@ Peak measure_peak(int cus, double clk_ghz, const int *rot) {
 //
 // LDS budget. int8 tiles are four times denser than the fp16 ones, so 64 KiB
 // is not the binding constraint: double-buffered 128x128 with BK=32 costs
-// 2*(128*32 + 128*32) = 16 KiB, a quarter of the budget. Wave count is: one
-// wave of 32 lanes holds TX*TN... concretely, with TX=TY=16 a wave spans two
-// ty values and sixteen tx values, so each wave touches only TWO distinct
-// As addresses and TWO distinct Bs addresses — both broadcast, so the k-quad
-// reads are bank-conflict-free without padding the row stride.
+// 2*(128*32 + 128*32) = 16 KiB, a quarter of the budget.
+//
+// LDS BANK ALIASING. A tile row is BK = 32 bytes = 8 words, and 8 divides 32,
+// so the row index leaves no trace in the bank number. With the plain quad
+// index q, the b[j] fetch reads word (64*tx + 8*j + q) in every lane, i.e.
+// bank (8*j + q) % 32 — all 16 tx lanes on ONE bank, 16 different addresses,
+// so the hardware replays it 16 times. The a[i] fetch, read by two ty groups
+// per wave, collides 2-way for the same reason. Rotating the quad by the
+// thread's tx (qq = (q ^ tx) & (KQ-1)) is a bijection over the KQ quads, so
+// every thread still consumes each quad exactly once and the int32 sum is
+// unchanged, but the lanes now land on KQ distinct banks: b[j] drops from
+// 16-way to 2-way, which is the floor for this row stride (any row base is a
+// whole number of bank cycles, so only the KQ words inside a row can move a
+// lane's bank). ROT=0 keeps the old fetch so the two can be compared.
 //
 // SPLIT-K. At prefill shapes the plain grid is tiny: M=256, N=2048 with a
 // 128x128 tile is 2*16 = 32 blocks for a 40-CU card, so most of the GPU sits
@@ -296,7 +317,7 @@ Peak measure_peak(int cus, double clk_ghz, const int *rot) {
 // of K and writes int32 partials, which reduce_kernel sums in a fixed loop
 // order. Deliberately NOT float atomicAdd: atomic ordering is non-deterministic
 // and this engine's output has to be reproducible run to run.
-template <int BM, int BN, int BK, int TM, int TN, int STAGES, int SPLIT>
+template <int BM, int BN, int BK, int TM, int TN, int STAGES, int SPLIT, bool ROT>
 __global__ void __launch_bounds__((BM / TM) * (BN / TN))
     gemm_i8_kernel(const int8_t *__restrict__ A, const int8_t *__restrict__ B,
                    const float *__restrict__ row_scale,
@@ -401,13 +422,18 @@ __global__ void __launch_bounds__((BM / TM) * (BN / TN))
 
 #pragma unroll
         for (int q = 0; q < KQ; q++) {
+            // qq keeps the tx lanes off each other's banks; see the aliasing
+            // note above. Applied to A as well as B because both tiles are
+            // read in the same quad, and rotating one without the other would
+            // pair mismatched k values.
+            const int qq = ROT ? ((q ^ tx) & (KQ - 1)) : q;
             int a[TM], b[TN];
 #pragma unroll
             for (int i = 0; i < TM; i++)
-                a[i] = *reinterpret_cast<const int *>(Ac + i * BK + q * 4);
+                a[i] = *reinterpret_cast<const int *>(Ac + i * BK + qq * 4);
 #pragma unroll
             for (int j = 0; j < TN; j++)
-                b[j] = *reinterpret_cast<const int *>(Bc + j * BK + q * 4);
+                b[j] = *reinterpret_cast<const int *>(Bc + j * BK + qq * 4);
 #pragma unroll
             for (int i = 0; i < TM; i++)
 #pragma unroll
@@ -554,6 +580,8 @@ struct Case {
     const char *name;
 };
 
+// The helpers below run configurations that are defined further down, so the
+// two things they return and call are declared here first.
 struct Run {
     double ms;
     double tops;
@@ -562,7 +590,65 @@ struct Run {
     bool deterministic;
 };
 
-template <int BM, int BN, int BK, int TM, int TN, int STAGES, int SPLIT>
+template <int BM, int BN, int BK, int TM, int TN, int STAGES, int SPLIT, bool ROT>
+Run bench(int M, int N, int K, const int8_t *dA, const int8_t *dB,
+          const float *dRS, const float *dCS, int8_t *dC, int32_t *dP);
+
+// The ablation's (rot, split) dispatch: each arm is a real specialization of
+// the same tile, so the comparison is between emitted kernels, not branches.
+template <int BM, int BN, int BK, int TM, int TN, int STAGES, bool ROT>
+Run bench_rot_split(int split, int M, int N, int K, const int8_t *dA,
+                    const int8_t *dB, const float *dRS, const float *dCS,
+                    int8_t *dC, int32_t *dP) {
+    if (split == 1)
+        return bench<BM, BN, BK, TM, TN, STAGES, 1, ROT>(M, N, K, dA, dB, dRS,
+                                                         dCS, dC, dP);
+    if (split == 2)
+        return bench<BM, BN, BK, TM, TN, STAGES, 2, ROT>(M, N, K, dA, dB, dRS,
+                                                         dCS, dC, dP);
+    if (split == 4)
+        return bench<BM, BN, BK, TM, TN, STAGES, 4, ROT>(M, N, K, dA, dB, dRS,
+                                                         dCS, dC, dP);
+    return bench<BM, BN, BK, TM, TN, STAGES, 8, ROT>(M, N, K, dA, dB, dRS, dCS,
+                                                     dC, dP);
+}
+
+// Tile shapes worth re-comparing once the fetch is conflict-free. Stages,
+// K-depth, N-width, block height and the register tile each move something
+// different (latency hiding, LDS footprint, row reuse), and the bank aliasing
+// that used to dominate all of them is gone, so the ranking has to be measured
+// again rather than inherited from the pre-fix numbers.
+static const char *const kArmName[] = {
+    "128x128x32 s2", "128x128x32 s3", "128x128x64 s2", "128x256x32 s2",
+    "64x128x32 s2",  "128x128x32 TM4", "128x128x16 s4",
+};
+static constexpr int kArms = 7;
+
+Run run_arm(int id, int M, int N, int K, const int8_t *dA, const int8_t *dB,
+            const float *dRS, const float *dCS, int8_t *dC, int32_t *dP) {
+    if (id == 0)
+        return bench<128, 128, 32, 8, 8, 2, 1, true>(M, N, K, dA, dB, dRS, dCS,
+                                                     dC, dP);
+    if (id == 1)
+        return bench<128, 128, 32, 8, 8, 3, 1, true>(M, N, K, dA, dB, dRS, dCS,
+                                                     dC, dP);
+    if (id == 2)
+        return bench<128, 128, 64, 8, 8, 2, 1, true>(M, N, K, dA, dB, dRS, dCS,
+                                                     dC, dP);
+    if (id == 3)
+        return bench<128, 256, 32, 8, 8, 2, 1, true>(M, N, K, dA, dB, dRS, dCS,
+                                                     dC, dP);
+    if (id == 4)
+        return bench<64, 128, 32, 8, 8, 2, 1, true>(M, N, K, dA, dB, dRS, dCS, dC,
+                                                    dP);
+    if (id == 5)
+        return bench<128, 128, 32, 4, 8, 2, 1, true>(M, N, K, dA, dB, dRS, dCS,
+                                                     dC, dP);
+    return bench<128, 128, 16, 8, 8, 4, 1, true>(M, N, K, dA, dB, dRS, dCS, dC,
+                                                 dP);
+}
+
+template <int BM, int BN, int BK, int TM, int TN, int STAGES, int SPLIT, bool ROT>
 Run bench(int M, int N, int K, const int8_t *dA, const int8_t *dB,
           const float *dRS, const float *dCS, int8_t *dC, int32_t *dP) {
     const dim3 grid(static_cast<unsigned>((N + BN - 1) / BN),
@@ -571,7 +657,7 @@ Run bench(int M, int N, int K, const int8_t *dA, const int8_t *dB,
     constexpr int THREADS = (BM / TM) * (BN / TN);
 
     auto once = [&] {
-        gemm_i8_kernel<BM, BN, BK, TM, TN, STAGES, SPLIT>
+        gemm_i8_kernel<BM, BN, BK, TM, TN, STAGES, SPLIT, ROT>
             <<<grid, THREADS>>>(dA, dB, dRS, dCS, dC, dP, M, N, K, K, N, N);
         if (SPLIT > 1) {
             const int total = M * N;
@@ -719,8 +805,11 @@ int main(int argc, char **argv) {
         {4096, 4096, 4096, "big  4096^3"},
     };
 
-    std::printf("=== 3. Tiled DP4A GEMM, 128x128x32, TM=TN=8, double buffered ===\n");
-    std::printf("%-24s %8s %9s %9s %7s %6s  %s\n", "case", "split", "ms", "TFLOP/s",
+    std::printf("=== 3. Tiled DP4A GEMM: bank-conflict rotation ablation ===\n");
+    std::printf("    128x128x32 tile, TM=TN=8, 2 stages, 256 threads. rot=1 is the\n");
+    std::printf("    lane-rotated quad fetch, rot=0 the aliased one it replaced.\n");
+    std::printf("%-24s %5s %5s %9s %9s %7s %7s  %s\n", "case", "split", "rot", "ms",
+                "TFLOP/s",
                 "%ref", "maxerr", "checked");
 
     bool all_correct = true;
@@ -754,34 +843,50 @@ int main(int argc, char **argv) {
         HIP_CHECK(hipMemcpy(dCS, cs.data(), cs.size() * sizeof(float),
                             hipMemcpyHostToDevice));
 
-        for (int split : {1, 2, 4, 8}) {
-            const Run r =
-                (split == 1)
-                    ? bench<128, 128, 32, 8, 8, 2, 1>(c.M, c.N, c.K, dA, dB, dRS,
-                                                       dCS, dC, dP)
-                    : (split == 2)
-                          ? bench<128, 128, 32, 8, 8, 2, 2>(c.M, c.N, c.K, dA, dB,
-                                                           dRS, dCS, dC, dP)
-                          : (split == 4)
-                                ? bench<128, 128, 32, 8, 8, 2, 4>(c.M, c.N, c.K, dA, dB,
-                                                                   dRS, dCS, dC, dP)
-                                : bench<128, 128, 32, 8, 8, 2, 8>(c.M, c.N, c.K, dA, dB,
-                                                                dRS, dCS, dC, dP);
+        for (int rot = 0; rot <= 1; rot++) {
+            for (int split : {1, 2, 4, 8}) {
+                const Run r =
+                    rot ? bench_rot_split<128, 128, 32, 8, 8, 2, true>(
+                              split, c.M, c.N, c.K, dA, dB, dRS, dCS, dC, dP)
+                        : bench_rot_split<128, 128, 32, 8, 8, 2, false>(
+                              split, c.M, c.N, c.K, dA, dB, dRS, dCS, dC, dP);
 
+                std::vector<int8_t> got(out_elems);
+                HIP_CHECK(
+                    hipMemcpy(got.data(), dC, out_elems, hipMemcpyDeviceToHost));
+                const Check ck = verify_gemm(got, A, B, rs.data(), cs.data(), c.M,
+                                             c.N, c.K, c.K, c.N);
+                if (ck.bad || !r.deterministic) all_correct = false;
+                if (ck.bad)
+                    dump_first_mismatches(got, A, B, rs.data(), cs.data(), c.M,
+                                          c.N, c.K, c.K, c.N, 4);
+
+                std::printf("%-24s %5d %5d %9.3f %9.2f %6.1f%% %7d  %s%s%s\n",
+                            c.name, split, rot, r.ms, r.tops,
+                            100.0 * r.tops / ref, ck.maxerr,
+                            ck.exhaustive ? "exhaustive" : "sampled  ",
+                            ck.bad ? " MISMATCH" : " ok",
+                            r.deterministic ? "" : " NONDET");
+            }
+        }
+        std::printf("  rot=1 vs rot=0 at the same split is the bank-conflict delta;\n"
+                    "  split itself only moves K-parallelism, not the fetch.\n");
+
+        // 3b. Tile shapes, rotation on, split 1: which tiling wins now that the
+        // fetch is no longer the wall. Each row is verified like every other.
+        for (int arm = 0; arm < kArms; arm++) {
+            const Run r = run_arm(arm, c.M, c.N, c.K, dA, dB, dRS, dCS, dC, dP);
             std::vector<int8_t> got(out_elems);
             HIP_CHECK(hipMemcpy(got.data(), dC, out_elems, hipMemcpyDeviceToHost));
             const Check ck = verify_gemm(got, A, B, rs.data(), cs.data(), c.M, c.N,
                                          c.K, c.K, c.N);
             if (ck.bad || !r.deterministic) all_correct = false;
             if (ck.bad)
-                dump_first_mismatches(got, A, B, rs.data(), cs.data(), c.M, c.N, c.K,
-                                      c.K, c.N, 4);
-
-            std::printf("%-24s %8d %9.3f %9.2f %6.1f%% %6d  %s%s%s\n", c.name, split,
-                        r.ms, r.tops, 100.0 * r.tops / ref, ck.maxerr,
-                        ck.exhaustive ? "exhaustive" : "sampled  ",
-                        ck.bad ? " MISMATCH" : " ok",
-                        r.deterministic ? "" : " NONDET");
+                dump_first_mismatches(got, A, B, rs.data(), cs.data(), c.M, c.N,
+                                      c.K, c.K, c.N, 4);
+            std::printf("    %-14s %9.3f ms  %6.2f TFLOP/s  %6.1f%%  maxerr %d%s\n",
+                        kArmName[arm], r.ms, r.tops, 100.0 * r.tops / ref,
+                        ck.maxerr, r.deterministic ? "" : "  NONDET");
         }
         std::printf("\n");
         HIP_CHECK(hipFree(dA));

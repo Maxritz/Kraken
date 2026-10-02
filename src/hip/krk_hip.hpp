@@ -153,6 +153,44 @@ __device__ __forceinline__ f32 d_dot2(const _Float16 *a, const _Float16 *b, f32 
                      *reinterpret_cast<const u32 *>(b), c);
 }
 
+// ---------------------------------------------------------------------------
+// int8 packed dot: v_dot4c_i32_i8, d = a0*b0 + a1*b1 + a2*b2 + a3*b3 + c
+//
+// Four int8 MACs per lane into an int32 accumulator, and LANE-LOCAL: section 1
+// of tools/probe_gemm_tile.hip settles that by running the instruction rather
+// than assuming it (all 32 lanes agree when they are given the same operands,
+// and a per-lane operand ramp returns each lane's own four bytes). That is what
+// makes a plain row-major int8 tile usable: four consecutive k values per 32-bit
+// register, each thread owning a disjoint output tile, no shuffles.
+//
+// The clamp flag is 0 (exact, no saturation) — the int8 GEMM harness verified
+// its results against a CPU reference with this form. RDNA2 measures the
+// register-only rate at 52.08 TOP/s, 93% of the 256 MAC/clk/CU issue rate.
+//
+// The intrinsic is only *used* by the opt-in int8 path (kernels/gemm_dp4a.hpp);
+// the scalar form keeps this header compilable on a target without the
+// instruction. That fallback takes the address of its parameters, which forces
+// them into scratch — acceptable precisely because it never runs on a target
+// this tree builds for.
+#if defined(KRK_GFX10) || defined(KRK_GFX11) || defined(KRK_GFX12)
+#define KRK_HAS_DOT4 1
+#endif
+
+#if defined(KRK_HAS_DOT4)
+__device__ __forceinline__ i32 d_dot4(i32 a, i32 b, i32 c) {
+    return __builtin_amdgcn_sdot4(a, b, c, 0);
+}
+#else
+__device__ __forceinline__ i32 d_dot4(i32 a, i32 b, i32 c) {
+    const i8 *ap = reinterpret_cast<const i8 *>(&a);
+    const i8 *bp = reinterpret_cast<const i8 *>(&b);
+    return c + static_cast<i32>(ap[0]) * static_cast<i32>(bp[0]) +
+           static_cast<i32>(ap[1]) * static_cast<i32>(bp[1]) +
+           static_cast<i32>(ap[2]) * static_cast<i32>(bp[2]) +
+           static_cast<i32>(ap[3]) * static_cast<i32>(bp[3]);
+}
+#endif
+
 // Wave primitives. RDNA1/2/3/4 are all wave32; the width is fixed here rather
 // than probed so the reductions unroll to exactly five shuffle steps.
 constexpr int kWaveSize = 32;
