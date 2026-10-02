@@ -16,6 +16,7 @@
 #include "kernels/attention.hpp"
 #include "kernels/fused.hpp"
 #include "kernels/gemm.hpp"
+#include "kernels/gdn.hpp"
 
 namespace krk {
 
@@ -495,6 +496,113 @@ public:
                           hipMemcpyHostToDevice));
     }
 
+    // ---- gated delta net (Qwen3.5 / Qwen3-Next) -------------------------
+    // kernels/gdn.hpp, one launch per op, f16 activations over the f32
+    // recurrent state. The model loader consults gdn_supported() and refuses a
+    // recurrent checkpoint rather than running it on a backend that would
+    // silently skip these.
+    bool gdn_supported() const override { return true; }
+
+    void l2norm(void *o, const void *x, i64 n_tok, i64 n_head, i64 hd,
+                i64 stride, f32 eps) override {
+        if (n_tok <= 0 || n_head <= 0 || hd <= 0) return;
+        const dim3 grid(static_cast<unsigned>(n_head),
+                        static_cast<unsigned>(std::min<i64>(n_tok, 65535)));
+        _Float16 *od = static_cast<_Float16 *>(o);
+        const _Float16 *xd = static_cast<const _Float16 *>(x);
+        // hd is the reduction width, so the block matches it: one thread per
+        // channel at 128, which is what Qwen3.5's head width is.
+        if (hd <= 64)
+            gdn_l2norm_kernel<64><<<grid, 64>>>(od, xd, hd, stride, eps);
+        else
+            gdn_l2norm_kernel<128><<<grid, 128>>>(od, xd, hd, stride, eps);
+    }
+
+    void sigmoid_act(void *x, i64 n) override {
+        if (n <= 0) return;
+        const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
+        gdn_sigmoid_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(x), n);
+    }
+
+    void softplus_act(void *x, i64 n) override {
+        if (n <= 0) return;
+        const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
+        gdn_softplus_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(x), n);
+    }
+
+    void scale_act(void *x, f32 alpha, i64 n_tok, i64 width, i64 stride) override {
+        if (n_tok <= 0 || width <= 0) return;
+        const dim3 grid(static_cast<unsigned>((width + 255) / 256),
+                        static_cast<unsigned>(std::min<i64>(n_tok, 65535)));
+        gdn_scale_act_kernel<<<grid, 256>>>(static_cast<_Float16 *>(x), alpha,
+                                            width, stride, n_tok);
+    }
+
+    void mul_act(void *a, const void *b, i64 n) override {
+        if (n <= 0) return;
+        const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
+        gdn_mul_act_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(a),
+                                            static_cast<const _Float16 *>(b), n);
+    }
+
+    void add_bias_cols(void *x, const f32 *bias, i64 n_row, i64 n_col) override {
+        if (n_row <= 0 || n_col <= 0) return;
+        const dim3 grid(1, static_cast<unsigned>(std::min<i64>(n_row, 65535)));
+        gdn_add_bias_cols_kernel<<<grid, 64>>>(static_cast<_Float16 *>(x), bias,
+                                               n_col, n_row);
+    }
+
+    void scale_cols(void *x, const f32 *col, i64 n_row, i64 n_col) override {
+        if (n_row <= 0 || n_col <= 0) return;
+        const dim3 grid(1, static_cast<unsigned>(std::min<i64>(n_row, 65535)));
+        gdn_scale_cols_kernel<<<grid, 64>>>(static_cast<_Float16 *>(x), col, n_col,
+                                            n_row);
+    }
+
+    void scale_rows(void *x, const void *alpha, i64 n_row, i64 n) override {
+        if (n_row <= 0 || n <= 0) return;
+        const dim3 grid(1, static_cast<unsigned>(std::min<i64>(n_row, 65535)));
+        gdn_scale_rows_kernel<<<grid, 256>>>(static_cast<_Float16 *>(x),
+                                             static_cast<const _Float16 *>(alpha),
+                                             n, n_row);
+    }
+
+    void qwen3_next_split(void *q, void *gate, const void *packed, i64 n_tok,
+                          i64 n_head, i64 hd) override {
+        if (n_tok <= 0 || n_head <= 0 || hd <= 0) return;
+        const dim3 grid(static_cast<unsigned>(n_head),
+                        static_cast<unsigned>(std::min<i64>(n_tok, 65535)));
+        gdn_qwen3_next_split_kernel<<<grid, 128>>>(static_cast<_Float16 *>(q),
+                                                   static_cast<_Float16 *>(gate),
+                                                   static_cast<const _Float16 *>(packed),
+                                                   hd, n_tok);
+    }
+
+    void conv1d_silu(void *out, const void *in, void *state, const void *kern,
+                     DType wt, i64 n_tok, i64 chan, i64 ksize) override {
+        if (n_tok <= 0 || chan <= 0 || ksize <= 0) return;
+        // The taps are a constant weight: decode them once per layer, not once
+        // per token. This is the only place a quantized buffer is read on the
+        // delta net's hot path.
+        const _Float16 *taps = stage_gdn_taps(kern, wt, ksize * chan);
+        gdn_conv1d_silu_launch(static_cast<_Float16 *>(out),
+                               static_cast<const _Float16 *>(in),
+                               static_cast<f32 *>(state), taps, n_tok, chan,
+                               ksize);
+    }
+
+    void delta_rule(void *out, void *state, const void *q, const void *k,
+                    const void *v, const void *g, const void *beta, i64 n_tok,
+                    i64 n_k_head, i64 n_v_head, i64 d_state, i64 hd,
+                    i64 row_stride) override {
+        gdn_delta_rule_launch(
+            static_cast<_Float16 *>(out), static_cast<f32 *>(state),
+            static_cast<const _Float16 *>(q), static_cast<const _Float16 *>(k),
+            static_cast<const _Float16 *>(v), static_cast<const _Float16 *>(g),
+            static_cast<const _Float16 *>(beta), n_tok, n_k_head, n_v_head,
+            d_state, hd, row_stride);
+    }
+
     void gather_rows(void *dst, const void *src, const i32 *rows, i64 n_rows,
                      i64 n) override {
         if (n_rows <= 0 || n <= 0) return;
@@ -536,6 +644,8 @@ public:
             (void)hipFree(split_dev_);
             split_dev_ = nullptr;
         }
+        for (const GdnTaps &e : gdn_taps_) (void)hipFree(e.dev);
+        gdn_taps_.clear();
     }
 
 private:
@@ -571,6 +681,37 @@ private:
     // demand to the largest split GEMM the model runs).
     f32 *split_dev_ = nullptr;
     size_t split_cap_ = 0;
+    // Decoded short-convolution taps, one entry per recurrent layer (see
+    // stage_gdn_taps). The engine walks the layers in order, so the scan is one
+    // entry per layer compared against one pointer.
+    struct GdnTaps {
+        const void *src;
+        int type;
+        i64 n;
+        _Float16 *dev;
+    };
+    std::vector<GdnTaps> gdn_taps_;
+
+    const _Float16 *stage_gdn_taps(const void *kern, DType wt, i64 n) {
+        const int t = static_cast<int>(wt);
+        for (const GdnTaps &e : gdn_taps_)
+            if (e.src == kern && e.type == t && e.n == n) return e.dev;
+        // Whole 32-value chunks only, which every real conv width satisfies
+        // (and is the same limit the host dequant has).
+        if (n <= 0 || (n & 31) != 0) {
+            KRK_ERROR("gdn conv taps: %lld values is not a whole number of "
+                      "32-value chunks",
+                      static_cast<long long>(n));
+            std::abort();
+        }
+        _Float16 *dev =
+            static_cast<_Float16 *>(alloc(static_cast<size_t>(n) * sizeof(_Float16)));
+        const unsigned blocks = static_cast<unsigned>(((n / 32) + 255) / 256);
+        gdn_dequant_taps_kernel<<<blocks, 256>>>(dev,
+                                                 static_cast<const u8 *>(kern), t, n);
+        gdn_taps_.push_back({kern, t, n, dev});
+        return dev;
+    }
 
     void stage_pos(i64 pos0) {
         if (pos_valid_ && pos_staged_ == pos0) return;

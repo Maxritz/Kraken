@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -42,6 +43,11 @@
 #include "krk/json.hpp"
 #include "krk/quant.hpp"
 #include "krk/server.hpp"
+
+// The CPU backend's worker pool lives next to the sources, not in the public
+// headers; the tests reach in for it because its scheduling contract (every
+// block runs exactly once, every task terminates) is load-bearing.
+#include "../src/par_pool.hpp"
 
 using namespace krk;
 
@@ -806,9 +812,21 @@ static bool build_tiny_gdn_model(const std::string &path, int n_layer,
                          vec(static_cast<size_t>(n_embd) * conv_dim, 100));
             b.tensor_f16(p + "attn_gate.weight", {u64(n_embd), u64(value_dim)},
                          vec(static_cast<size_t>(n_embd) * value_dim, 200));
-            // depthwise: one 4-tap kernel per channel
-            b.tensor_f32(p + "ssm_conv1d.weight", {u64(conv_k), u64(conv_dim)},
-                         vec(static_cast<size_t>(conv_k) * conv_dim, 300));
+            // Depthwise: one ksize-tap kernel per channel, in FILE order. GGUF's
+            // ne[0] is the tap axis, so a channel's taps are CONTIGUOUS and the
+            // stored element for (channel, tap) sits at c*conv_k + j. The values
+            // are distinct per (tap, channel) on purpose: a constant kernel would
+            // make a transposed read produce the same numbers and the whole
+            // layout would go untested.
+            {
+                std::vector<f32> kern(static_cast<size_t>(conv_k) * conv_dim);
+                for (i64 c = 0; c < conv_dim; c++)
+                    for (i64 j = 0; j < conv_k; j++)
+                        kern[static_cast<size_t>(c * conv_k + j)] =
+                            static_cast<f32>(1 + j * 10 + c * 100);
+                b.tensor_f32(p + "ssm_conv1d.weight", {u64(conv_k), u64(conv_dim)},
+                             kern);
+            }
             b.tensor_f32(p + "ssm_dt.bias", {u64(n_v_head)},
                          vec(static_cast<size_t>(n_v_head), 400));
             // A_log as the converter stores it: already -exp(A_log).
@@ -904,6 +922,22 @@ static void test_gdn_model_loads() {
               "the delta net layer's projections match ssm geometry");
         CHECK(g.ssm_conv1d.n_in == 4 && g.ssm_conv1d.n_out == 64,
               "its short conv is [kernel, conv_dim]");
+            // The loader must transpose the file's channel-major kernel into the
+            // op's [ksize, conv_dim] order; read back a few (tap, channel) pairs
+            // and compare against the values the builder wrote.
+            {
+                const f32 *kern = static_cast<const f32 *>(g.ssm_conv1d.data);
+                const i64 cdim = c.ssm_conv_dim, ks = c.ssm_d_conv;
+                bool layout_ok = g.ssm_conv1d.type == DType::F32;
+                for (i64 cc : {i64(0), i64(1), i64(5), cdim - 1})
+                    for (i64 j = 0; j < ks; j++)
+                        layout_ok = layout_ok &&
+                            std::fabs(kern[j * cdim + cc] -
+                                      static_cast<f32>(1 + j * 10 + cc * 100)) < 1e-6f;
+                CHECK(layout_ok,
+                      "the conv kernel is transposed from the file's "
+                      "[conv_dim, ksize] order into the op's [ksize, conv_dim]");
+            }
         CHECK(g.ssm_out.n_in == 32 && g.ssm_out.n_out == 32, "its output projection");
         CHECK(g.ssm_dt && g.ssm_a && g.ssm_norm, "its state parameters are resident");
         CHECK(g.ssm_alpha.present() && g.ssm_beta.present(),
@@ -1134,6 +1168,38 @@ static void test_gdn_ops() {
             CHECK(std::fabs(outv[static_cast<size_t>(t * chan + c)] - want) < 1e-5f,
                   "conv1d_silu matches the closed form with a fresh window");
         }
+
+    // In place, and across calls. The engine convolves the projection buffer
+    // onto ITSELF, and output row t reaches back ksize-1 rows that earlier
+    // outputs have already overwritten — so those rows have to be held, not
+    // re-read. A kernel that re-reads them produces a plausible wrong answer,
+    // which is exactly what happened here. Hand-computed, one channel, taps
+    // [1, 10, 100] (newest last), a zero state and in = [1, 2, 4]:
+    //   t0: 1*0  + 10*0 + 100*1 =  100
+    //   t1: 1*0  + 10*1 + 100*2 =  210
+    //   t2: 1*1  + 10*2 + 100*4 =  421
+    // and the state left behind is the LAST ksize-1 inputs, [in1, in2] =
+    // [2, 4], so a second call on [8] reads 1*2 + 10*4 + 100*8 = 842.
+    // (Every acc is large and positive, where silu is the identity in f32.)
+    {
+        const i64 k1 = 1, ks3 = 3, nt3 = 3;
+        std::vector<f32> buf{1.0f, 2.0f, 4.0f};
+        std::vector<f32> kern3{1.0f, 10.0f, 100.0f};
+        std::vector<f32> st3(2, 0.0f);
+        cpu->conv1d_silu(buf.data(), buf.data(), st3.data(), kern3.data(),
+                         DType::F32, nt3, k1, ks3);
+        CHECK(std::fabs(buf[0] - 100.0f) < 1e-4f, "in-place conv, first row");
+        CHECK(std::fabs(buf[1] - 210.0f) < 1e-4f,
+              "in-place conv, second row reads a row the first row overwrote");
+        CHECK(std::fabs(buf[2] - 421.0f) < 1e-4f, "in-place conv, third row");
+        CHECK(std::fabs(st3[0] - 2.0f) < 1e-6f && std::fabs(st3[1] - 4.0f) < 1e-6f,
+              "the in-place conv leaves the last ksize-1 inputs behind");
+        std::vector<f32> buf2{8.0f};
+        cpu->conv1d_silu(buf2.data(), buf2.data(), st3.data(), kern3.data(),
+                         DType::F32, 1, k1, ks3);
+        CHECK(std::fabs(buf2[0] - 842.0f) < 1e-4f,
+              "the carried state continues the sequence in place");
+    }
 
     // The delta rule on one head, hand-checked. With g = 0 the state does not
     // decay and beta = 1 makes the update a full rank-1 write, so from a zero
@@ -2455,6 +2521,47 @@ static void test_http_server() {
 }
 
 // ---------------------------------------------------------------------------
+// The pool's completion accounting IS the correctness argument: a worker that
+// mistimes its completion marker either strands the caller in run() forever or
+// replays a block, and the difference is a hang or two threads writing the same
+// bytes. Decode fires hundreds of back-to-back tasks of shifting geometry, so
+// hammer exactly that shape and require every block to be covered exactly once.
+// ---------------------------------------------------------------------------
+static void test_par_pool_covers_every_block() {
+    u64 rng = 0x9e3779b97f4a7c15ull;
+    auto next = [&](u64 m) {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return static_cast<i64>(rng % m);
+    };
+    std::vector<i32> hits(4096, 0);
+    i64 tasks = 0, blocks = 0;
+    for (int task = 0; task < 400; task++) {
+        const i64 n = 1 + next(4000);
+        const i64 grain = 1 + next(static_cast<u64>(std::min<i64>(64, n)));
+        std::fill(hits.begin(), hits.begin() + static_cast<size_t>(n), 0);
+        Pool::get().run(n, grain, [&](i64 b, i64 e) {
+            // Exactly what the backend's bodies do: each block owns a
+            // disjoint slice of the output and touches nothing shared.
+            for (i64 i = b; i < e; i++) hits[static_cast<size_t>(i)]++;
+        });
+        tasks++;
+        blocks += (n + grain - 1) / grain;
+        i64 covered = 0, doubled = 0;
+        for (i64 i = 0; i < n; i++) {
+            if (hits[static_cast<size_t>(i)] == 1) covered++;
+            else if (hits[static_cast<size_t>(i)] > 1) doubled++;
+        }
+        if (covered != n || doubled != 0) {
+            CHECK(false, "pool: every index runs exactly once");
+            return;
+        }
+    }
+    CHECK(tasks == 400 && blocks > 400, "pool: back-to-back tasks all completed");
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::fprintf(stderr, "kraken test suite\n");
@@ -2484,6 +2591,7 @@ int main() {
     test_speculative_decoding();
     test_json();
     test_http_server();
+    test_par_pool_covers_every_block();
     std::remove(kTestModelPath);
     std::remove(kMoeTestPath);
     std::remove(kMoeDenseTwinPath);

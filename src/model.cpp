@@ -212,6 +212,39 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         return q;
     };
 
+    // The short-convolution kernel is stored the OTHER way round from the op
+    // contract. GGUF's ne[0] is the fastest axis, and for ssm_conv1d that axis
+    // is the tap, so the file holds kern[c * ksize + j] — each channel's taps
+    // contiguous — while conv1d_silu indexes kern[j * conv_dim + c], the newest
+    // tap last. (ggml's ssm_conv reads c[i0 + i1 * d_conv], the same
+    // channel-major order, which is how llama.cpp feeds it unmodified.)
+    // Transposing once here costs 4 x 8192 values at load time and leaves the
+    // op — and its per-layer tap cache — on a single stride.
+    auto upload_conv1d = [&](const std::string &name) -> QuantTensor {
+        QuantTensor q;
+        const GgufTensor *t = gguf_.tensor(name);
+        if (!t || t->n_dims < 2) return q;
+        const i64 ksize = static_cast<i64>(t->ne[0]);
+        const i64 chan = static_cast<i64>(t->ne[1]);
+        const i64 n = ksize * chan;
+        if (ksize <= 0 || chan <= 0 || n != t->n_elements) return q;
+        f32 *host = static_cast<f32 *>(host_alloc(static_cast<size_t>(n) * 4));
+        dequant_row(t->type, t->data, host, n);
+        std::vector<f32> tap(static_cast<size_t>(n));
+        for (i64 c = 0; c < chan; c++)
+            for (i64 j = 0; j < ksize; j++)
+                tap[static_cast<size_t>(j * chan + c)] =
+                    host[static_cast<size_t>(c * ksize + j)];
+        host_free(host);
+        q.data = be.alloc(static_cast<size_t>(n) * 4);
+        be.upload(q.data, tap.data(), static_cast<size_t>(n) * 4);
+        q.type = DType::F32;
+        q.n_in = ksize;
+        q.n_out = chan;
+        weight_bytes_ += n * 4;
+        return q;
+    };
+
     // Uploads a 1-D f32 tensor (norm weights, biases, per-head norms).
     auto upload_f32 = [&](const std::string &name) -> f32 * {
         const GgufTensor *t = gguf_.tensor(name);
@@ -339,7 +372,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         if (L.gdn) {
             L.wqkv = need(blk_key("blk.%d.attn_qkv.weight", l));
             L.wqkv_gate = need(blk_key("blk.%d.attn_gate.weight", l));
-            L.ssm_conv1d = need(blk_key("blk.%d.ssm_conv1d.weight", l));
+            L.ssm_conv1d = upload_conv1d(blk_key("blk.%d.ssm_conv1d.weight", l));
             L.ssm_out = need(blk_key("blk.%d.ssm_out.weight", l));
             L.ssm_dt = upload_f32(blk_key("blk.%d.ssm_dt.bias", l));
             L.ssm_a = upload_f32(blk_key("blk.%d.ssm_a", l));

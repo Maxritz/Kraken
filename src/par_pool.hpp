@@ -89,10 +89,14 @@ public:
         for (std::thread &t : workers_)
             if (t.joinable()) t.join();
         workers_.clear();
+        // No task can be in flight here (body_ == nullptr), so the new
+        // generation starts at the CURRENT id: seeding it with 0 would send
+        // every fresh worker chasing a task that was drained long ago.
+        const i64 start = task_id_.load(std::memory_order_acquire);
         for (i64 i = 0; i < want; i++)
             workers_.emplace_back(
-                [this, g = gen_.load(std::memory_order_acquire), idx = i] {
-                    worker_loop(g, idx);
+                [this, g = gen_.load(std::memory_order_acquire), idx = i, start] {
+                    worker_loop(g, idx, start);
                 });
     }
 
@@ -168,9 +172,10 @@ private:
         }
         if (hc < 1) hc = 1;
         const i64 nw = std::min<i64>(hc - 1, 63);
+        const i64 start = task_id_.load(std::memory_order_acquire);
         for (i64 i = 0; i < nw; i++)
-            workers_.emplace_back([this, g = gen_.load(), idx = i] {
-                worker_loop(g, idx);
+            workers_.emplace_back([this, g = gen_.load(), idx = i, start] {
+                worker_loop(g, idx, start);
             });
     }
 
@@ -187,17 +192,17 @@ private:
     Pool(const Pool &) = delete;
     Pool &operator=(const Pool &) = delete;
 
-    void worker_loop(i64 my_gen, i64 my_idx) {
-        // Task generation this worker has already drained. Waiting for a
+    void worker_loop(i64 my_gen, i64 my_idx, i64 seen) {
+        // Id of the task this worker has already drained. Waiting for a
         // NEW id (not for body_ != nullptr, which stays set until the
         // caller finishes) is what keeps idle workers asleep instead of
         // spinning on the mutex.
-        i64 seen = 0;
         for (;;) {
             // ---- spin phase ----
             // Watch the atomic task id without touching the mutex: a
             // back-to-back op finds every worker already hot, so the
             // pool costs zero syscalls on the decode hot path.
+            i64 run_id = 0;
             const auto deadline =
                 std::chrono::steady_clock::now() + std::chrono::milliseconds(kSpinMs);
             for (;;) {
@@ -206,7 +211,7 @@ private:
                     return;
                 const i64 t = task_id_.load(std::memory_order_acquire);
                 if (t > seen) {
-                    seen = t;
+                    run_id = t;
                     break;
                 }
                 if (std::chrono::steady_clock::now() >= deadline) {
@@ -220,15 +225,17 @@ private:
                     if (quit_.load(std::memory_order_acquire) ||
                         my_gen != gen_.load(std::memory_order_acquire))
                         return;
-                    seen = task_id_.load(std::memory_order_acquire);
+                    run_id = task_id_.load(std::memory_order_acquire);
                     break;
                 }
                 cpu_relax();
             }
             run_range(my_idx);
-            // run() only returns once every participant has reported,
-            // so catching up to the current id never skips live work.
-            seen = task_id_.load(std::memory_order_acquire);
+            // Mark the task just drained — NOT whatever task_id_ says now.
+            // The caller may publish the next op while we report, and
+            // re-reading the id here would swallow that task: its blocks
+            // would go uncovered and the caller would wait forever.
+            seen = run_id;
         }
     }
 

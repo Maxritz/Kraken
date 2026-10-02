@@ -419,22 +419,29 @@ public:
         // touches only its own column of `state`, so the pool can split here.
         par_for(chan, 32, 4.0 * static_cast<f64>(n_tok) * chan * ksize,
                 [&](i64 cb, i64 ce) {
-                    // X(m) is the window the tap j of output t reads: the
-                    // ksize-1 stored steps first, then this call's rows.
-                    auto X = [&](i64 m, i64 c) -> f32 {
-                        return m < keep ? st[m * chan + c]
-                                        : xp[(m - keep) * chan + c];
-                    };
                     for (i64 c = cb; c < ce; c++) {
+                        // The ksize-1 stored steps, then this call's rows, held
+                        // in registers rather than re-read: the engine convolves
+                        // IN PLACE (out == in), and the receptive field of row t
+                        // reaches back ksize-1 rows that earlier outputs have
+                        // already overwritten. A window that slides forward is
+                        // the only way to read those rows before they die.
+                        f32 win[kMaxConvKernel];
+                        for (i64 i = 1; i < ksize; i++)
+                            win[i] = st[(ksize - 1 - i) * chan + c];
+                        win[0] = xp[c];
                         for (i64 t = 0; t < n_tok; t++) {
                             f32 acc = 0;
                             for (i64 j = 0; j < ksize; j++)
-                                acc += w[static_cast<size_t>(j * chan + c)] * X(t + j, c);
+                                acc += w[static_cast<size_t>(j * chan + c)] * win[keep - j];
                             o[t * chan + c] = silu_scalar(acc);
+                            for (i64 i = ksize - 1; i > 0; i--) win[i] = win[i - 1];
+                            if (t + 1 < n_tok) win[0] = xp[(t + 1) * chan + c];
                         }
-                        // The window slides: keep the last ksize-1 steps.
+                        // The window now spans X(n_tok + keep - i), so these are
+                        // the rows the next call continues from.
                         for (i64 j = 0; j < keep; j++)
-                            st[j * chan + c] = X(n_tok + j, c);
+                            st[j * chan + c] = win[keep - j];
                     }
                 });
     }
