@@ -133,6 +133,25 @@ public:
     void release(void *p) override {
         if (p) KRK_HIP(hipFree(p));
     }
+    // The expert cache's L2 tier. Page-locked so demote (device->host) and
+    // promote (host->device) are straight DMAs; unpinned staging would spend
+    // more time in the driver's bounce buffer than on the copy. Pinned memory
+    // is a finite pool, so a failure degrades the tier instead of aborting the
+    // run: the caller falls back to dropping the evicted expert to the mapping.
+    void *alloc_host(size_t bytes) override {
+        if (bytes == 0) bytes = 1;
+        void *p = nullptr;
+        if (hipHostMalloc(&p, bytes) != hipSuccess) {
+            static_cast<void>(hipGetLastError()); // clear the sticky error, keep going
+            KRK_WARN("expert L2 tier: pinned host allocation of %zu bytes failed",
+                     bytes);
+            return nullptr;
+        }
+        return p;
+    }
+    void release_host(void *p) override {
+        if (p) KRK_HIP(hipHostFree(p));
+    }
     void upload(void *dst, const void *src, size_t bytes, size_t off) override {
         KRK_HIP(hipMemcpy(static_cast<char *>(dst) + off, src, bytes,
                           hipMemcpyHostToDevice));

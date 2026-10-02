@@ -52,7 +52,10 @@ a byte-budgeted residency set. The policy is **LFU with aging**, not LRU:
 expert popularity is skewed and sticky, so every hit earns a counter, a hot
 expert gets **pinned** against eviction, and periodic decay makes pins lapse
 when traffic moves on — a favourite of the first thousand tokens cannot squat
-on its slot forever. The tokens that picked the same expert are permuted into
+on its slot forever. Give it a second tier with `--expert-l2-mb` and an evicted
+expert is demoted into page-locked host RAM instead of being dropped, so coming
+back is a DMA rather than a re-read of the mapping. The tokens that picked the
+same expert are permuted into
 one contiguous block (`gather_rows`), so each expert runs **three GEMMs per
 layer regardless of how many tokens chose it**, and results fold back through a
 fused weighted scatter. A machine with far less memory than the model still
@@ -273,8 +276,19 @@ Expert weights dwarf everything else in an MoE model, and only a handful run per
 token. Loading them eagerly would need the full model resident, so KRAKEN does
 not load them at all: the loader records where each expert's three matrices live
 in the mapping, the router picks the top-k per token, and `ExpertCache`
-materializes exactly those matrices on demand into an LRU bounded by a byte
-budget. Evicted slots are released.
+materializes exactly those matrices on demand into a residency set bounded by a
+byte budget. The policy is **LFU with aging**: every hit earns a counter, a hot
+counter pins the slot against eviction, and periodic decay releases pins when
+traffic moves on. Without a pin an expert goes to least-frequent, then oldest.
+
+Evicted experts are *demoted*, not thrown away, when you give the cache a second
+tier: `--expert-l2-mb N` reserves N MiB of page-locked host memory that holds
+experts evicted from VRAM. Their next request becomes a DMA instead of a re-read
+of the file — a fault storm on a mapping thousands of times larger than the
+weights themselves. The LFU counter, the pin and the load order all survive the
+round trip, so a demoted expert is still the same expert when it comes back, and
+the two tiers are budgeted independently: VRAM holds what is about to be used,
+RAM holds what was just used.
 
 ```sh
 # cap resident expert memory (a 235B-A22B model on a 12 GB card)
@@ -282,6 +296,9 @@ kraken --model Qwen3-235B-A22B-Q4_K_M.gguf --expert-cache-mb 8000 --prompt "Hi"
 
 # or bound it by slot count instead: one expert resident per layer
 kraken --model model.gguf --expert-cache-slots 48 --prompt "Hi"
+
+# keep evicted experts in page-locked host RAM instead of dropping them
+kraken --model model.gguf --expert-cache-mb 4096 --expert-l2-mb 16384 --prompt "Hi"
 
 # see the geometry and the active budget
 kraken --model model.gguf --info

@@ -28,6 +28,12 @@ struct EngineConfig {
     i32 expert_cache_mb = 0;
     // Hard cap on resident (layer, expert) slots, regardless of budget. 0 = auto.
     i32 expert_cache_slots = 0;
+    // Second-tier budget in MiB: page-locked host memory that evicted experts
+    // are demoted to instead of being released back to the GGUF mapping. Sized
+    // independently of the device budget, because the two tiers answer
+    // different questions — VRAM holds what is about to be used, RAM holds what
+    // was just used. 0 disables the tier.
+    i32 expert_l2_mb = 0;
 };
 
 struct StreamSink {
@@ -104,6 +110,9 @@ public:
     // simply treated as shorter — no zeroing is needed because every forward
     // fully overwrites the rows it touches and attention never reads past
     // kv_pos(). This is the primitive speculative decoding builds on.
+    // A recurrent model is the exception: the delta rule has no inverse, so
+    // only a rewind to 0 is honoured (the server's per-request isolation,
+    // after which the caller replays the prompt and rebuilds the state).
     bool kv_rollback(i64 pos);
 
     // Speculation telemetry (valid after a run with a draft loaded).
@@ -136,6 +145,13 @@ private:
     void moe_ffn(const LayerWeights &L, i32 layer, i32 n);
     // Chooses the expert residency budget from cfg_ and the device.
     void configure_expert_cache();
+    // One gated-delta-net (recurrent) layer: the fused [q|k|v] projection, the
+    // causal short conv, the per-head gate/forget, the delta rule, and the
+    // gated output projection. Advances the layer's recurrent state.
+    void gdn_forward(const LayerWeights &L, i32 l, i32 n);
+    // Clears the convolution windows and delta-rule states (f32, one set per
+    // recurrent layer). Only correct to call at a sequence boundary.
+    void recurrent_reset();
     // Downloads the last row of logits into logits_host_.
     void fetch_logits();
     // Greedy speculative step; false when the draft cannot help.
@@ -158,23 +174,45 @@ private:
     u64 spec_steps_ = 0;
 
     i64 q_dim_ = 0, kv_dim_ = 0, n_embd_ = 0, n_ff_ = 0, n_vocab_ = 0;
+    // Row width of the attention query buffer: Qwen3.5 packs a per-head output
+    // gate behind the query, so its projection is 2*q_dim wide before the
+    // engine splits it apart.
+    i64 q_proj_ = 0;
+    i64 conv_dim_ = 0, value_dim_ = 0;
     i64 kv_cap_ = 0;
     i64 kv_pos_ = 0;
     i32 chunk_ = 1;
 
     void *kcache_ = nullptr;
     void *vcache_ = nullptr;
+    // Gated delta net: f32, one block per recurrent layer, persistent across
+    // forwards. conv_state_ is the short conv's last (ksize-1) steps; rec_state_
+    // is the delta rule's [n_v_head, d_state, hd] matrix. This is the model's
+    // memory of the sequence — unlike the KV cache it cannot be recomputed
+    // from a position, which is why rollback to 0 resets it.
+    void *conv_state_ = nullptr;
+    void *rec_state_ = nullptr;
+    i32 rec_layers_ = 0;
+    i64 conv_state_span_ = 0; // f32 per recurrent layer
+    i64 rec_state_span_ = 0;  // f32 per recurrent layer
     // workspaces, sized for `chunk_` rows
     void *ws_x_ = nullptr;    // [chunk, n_embd]
     void *ws_xn_ = nullptr;   // [chunk, n_embd]
     void *ws_x2_ = nullptr;   // [chunk, n_embd]
-    void *ws_q_ = nullptr;    // [chunk, q_dim]
+    void *ws_q_ = nullptr;    // [chunk, q_proj]
     void *ws_k_ = nullptr;    // [chunk, kv_dim]
     void *ws_v_ = nullptr;    // [chunk, kv_dim]
     void *ws_attn_ = nullptr; // [chunk, q_dim]
     void *ws_gate_ = nullptr; // [chunk, max(n_ff, n_ff_exp, n_ff_shexp)]
     void *ws_up_ = nullptr;   // [chunk, same]
     void *ws_logits_ = nullptr;
+    // Gated delta net workspaces (null unless the model is recurrent)
+    void *ws_qkv_ = nullptr;      // [chunk, conv_dim] fused q|k|v, post-conv
+    void *ws_z_ = nullptr;        // [chunk, value_dim] the z gate
+    void *ws_h_ = nullptr;        // [chunk, value_dim] delta-rule output
+    void *ws_ssm_ = nullptr;      // [chunk, n_v_head] alpha/gate scalars
+    void *ws_beta_ = nullptr;     // [chunk, n_v_head] forget gates
+    void *ws_agate_ = nullptr;    // [chunk, q_dim] full-attn output gates
     // MoE-only workspaces (null for dense models)
     void *ws_router_ = nullptr; // [chunk, n_expert]
     void *ws_ffn_ = nullptr;    // [chunk, n_embd] MoE output accumulator
@@ -188,7 +226,6 @@ private:
     void *ws_plan_ = nullptr;   // device i32 row ids for the current expert group
     void *ws_alpha_ = nullptr;  // device f32 gate weights for the current group
     f32 *logits_host_ = nullptr;
-    f32 *tok_host_ = nullptr; // pinned staging for token ids
     std::vector<i32> tok_scratch_;
     // Host-side router scratch, sized [chunk, n_expert]
     std::vector<f32> router_host_;

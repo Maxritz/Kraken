@@ -86,6 +86,15 @@ public:
     // ---- memory ----------------------------------------------------------
     virtual void *alloc(size_t bytes) = 0;
     virtual void release(void *p) = 0;
+    // Host-side allocation for the expert cache's second tier. The GPU backend
+    // returns page-locked memory, so moving an evicted expert between VRAM and
+    // the tier is a DMA in either direction instead of a staged copy through a
+    // pageable bounce buffer. Distinct from alloc() because pinned pages are a
+    // scarce, non-swappable resource: spending them on activations would trade
+    // a 12 GiB VRAM problem for a host-RAM one. The default is ordinary aligned
+    // host memory, which is all the CPU reference backend needs.
+    virtual void *alloc_host(size_t bytes) { return host_alloc(bytes ? bytes : 1); }
+    virtual void release_host(void *p) { host_free(p); }
     virtual void upload(void *dst, const void *src, size_t bytes, size_t off = 0) = 0;
     virtual void download(void *dst, const void *src, size_t bytes, size_t off = 0) = 0;
     virtual void fill0(void *dst, size_t bytes) = 0;
@@ -206,6 +215,98 @@ public:
     // Stages n i32 values to device memory. The batched path builds its row
     // plan on the host and ships it through this; a no-op on the CPU backend.
     virtual void upload_i32(i32 *dst, const i32 *src, i64 n) = 0;
+
+    // ---- gated delta net (Qwen3.5 / Qwen3-Next linear attention) ---------
+    //
+    // A recurrent layer keeps state across tokens, so unlike every op above
+    // these are only correct for a backend that can address the state buffers
+    // it is handed. The default bodies therefore do nothing and the flag below
+    // is what the model loader consults: a backend that reports false is
+    // refused a recurrent model at load time, loudly, rather than being handed
+    // a checkpoint it would silently mis-decode. The CPU backend implements
+    // all of them and is the reference oracle.
+    virtual bool gdn_supported() const { return false; }
+
+    // Per-head L2 normalization, in place or via a distinct output:
+    //   o[t, h, i] = x[t, h, i] / sqrt(sum_j x[t, h, j]^2 + eps)
+    // `stride` is the element distance between consecutive tokens, so a region
+    // carved out of a wider fused row (the gated delta net's post-conv buffer)
+    // is handled without a copy. o and x may be the same pointer.
+    virtual void l2norm(void *o, const void *x, i64 n_tok, i64 n_head, i64 hd,
+                        i64 stride, f32 eps) {
+        (void)o; (void)x; (void)n_tok; (void)n_head; (void)hd; (void)stride;
+        (void)eps;
+    }
+
+    // x <- sigmoid(x), and x <- softplus(x) = log1p(exp(x)). Both in place.
+    virtual void sigmoid_act(void *x, i64 n) { (void)x; (void)n; }
+    virtual void softplus_act(void *x, i64 n) { (void)x; (void)n; }
+
+    // x <- alpha * x over n_tok rows of `width` elements spaced `stride` apart,
+    // and the elementwise product a[i] *= b[i] (both dense).
+    virtual void scale_act(void *x, f32 alpha, i64 n_tok, i64 width, i64 stride) {
+        (void)x; (void)alpha; (void)n_tok; (void)width; (void)stride;
+    }
+    virtual void mul_act(void *a, const void *b, i64 n) { (void)a; (void)b; (void)n; }
+
+    // Per-column (per-head) vectors broadcast down the rows:
+    //   x[i, j] += bias[j]     and    x[i, j] *= col[j]
+    // Used for the ssm_dt bias and the A_log decay scale.
+    virtual void add_bias_cols(void *x, const f32 *bias, i64 n_row, i64 n_col) {
+        (void)x; (void)bias; (void)n_row; (void)n_col;
+    }
+    virtual void scale_cols(void *x, const f32 *col, i64 n_row, i64 n_col) {
+        (void)x; (void)col; (void)n_row; (void)n_col;
+    }
+    // Per-row scalars from an activation buffer: x[i, :] *= alpha[i].
+    virtual void scale_rows(void *x, const void *alpha, i64 n_row, i64 n) {
+        (void)x; (void)alpha; (void)n_row; (void)n;
+    }
+
+    // Splits Qwen3.5's packed attention query. The projection interleaves each
+    // head's query and output gate inside one 2*hd block, so neither is
+    // contiguous and attention cannot be fed the packed buffer:
+    //   q[t, h, i]    <- packed[t, h*2*hd + i]
+    //   gate[t, h, i] <- packed[t, h*2*hd + hd + i]
+    // `gate` may be null when only the query part is wanted. `q` may alias
+    // `packed`: every write lands at a lower offset than the read it comes
+    // from, so an in-place unpack is safe.
+    virtual void qwen3_next_split(void *q, void *gate, const void *packed,
+                                  i64 n_tok, i64 n_head, i64 hd) {
+        (void)q; (void)gate; (void)packed; (void)n_tok; (void)n_head; (void)hd;
+    }
+
+    // The gated-delta-net short convolution, depthwise over `chan` channels:
+    //   out[t, c] = silu( sum_{j<ksize} kern[j, c] * X[t + j, c] )
+    // where X is `state` (the ksize-1 previous steps) followed by the n_tok new
+    // rows in `in`, and kern is [ksize, chan] with the newest tap last, stored
+    // in the given (possibly quantized) weight format. On return `state` holds
+    // the last ksize-1 rows of that window, which is what makes the next call
+    // continue the same sequence. ksize <= 16.
+    virtual void conv1d_silu(void *out, const void *in, void *state,
+                             const void *kern, DType wt, i64 n_tok, i64 chan,
+                             i64 ksize) {
+        (void)out; (void)in; (void)state; (void)kern; (void)wt;
+        (void)n_tok; (void)chan; (void)ksize;
+    }
+
+    // The delta rule, run over n_tok consecutive tokens of one sequence:
+    //   S *= exp(g[t]);  kv = S^T k;  d = (v - kv) * beta;  S += k (x) d
+    //   out[t] = S^T q
+    // `state` is f32 [n_v_head, d_state, hd] and persists across calls. q, k
+    // and v are the three regions of one fused post-conv row — token t starts
+    // at t * row_stride, and each holds n_k_head/n_k_head/n_v_head heads of
+    // d_state/hd — while `out`, `g` and `beta` are dense. Qwen3-Next runs 16
+    // key heads over 32 value heads by tiling, so value head h reads key head
+    // h % n_k_head.
+    virtual void delta_rule(void *out, void *state, const void *q, const void *k,
+                            const void *v, const void *g, const void *beta,
+                            i64 n_tok, i64 n_k_head, i64 n_v_head, i64 d_state,
+                            i64 hd, i64 row_stride) {
+        (void)out; (void)state; (void)q; (void)k; (void)v; (void)g;
+        (void)beta; (void)n_tok; (void)n_k_head; (void)n_v_head;
+        (void)d_state; (void)hd; (void)row_stride;
+    }
 };
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <utility>
+#include <vector>
 
 namespace krk {
 
@@ -26,6 +27,13 @@ namespace {
 // spin-then-park wake policy makes the round trip nearly free when
 // ops arrive back to back, so the floor can stay low.
 constexpr f64 kParFlopFloor = 1.0e5;
+
+// The gated delta net's short convolution is a fixed 4-tap FIR in the shipped
+// checkpoints; 16 is a generous ceiling that still keeps the rolling window on
+// the stack.
+constexpr i64 kMaxConvKernel = 16;
+
+inline f32 silu_scalar(f32 x) { return x / (1.0f + std::exp(-x)); }
 
 // Parallel-for over disjoint index ranges. `est_flops` gates pool use;
 // the serial fallback skips std::function construction entirely.
@@ -269,6 +277,224 @@ public:
     // The reference backend shares one address space, so "staging" is a copy.
     void upload_i32(i32 *dst, const i32 *src, i64 n) override {
         std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(i32));
+    }
+
+    // ---- gated delta net (the reference oracle) -------------------------
+    bool gdn_supported() const override { return true; }
+
+    void l2norm(void *o, const void *x, i64 n_tok, i64 n_head, i64 hd, i64 stride,
+                f32 eps) override {
+        const f32 *s = static_cast<const f32 *>(x);
+        f32 *d = static_cast<f32 *>(o);
+        // Each head carries its own reduction, so (token, head) pairs are the
+        // units. Safe in place: the reduction finishes before the write.
+        par_for(n_tok, 1, 3.0 * static_cast<f64>(n_tok) * n_head * hd,
+                [&](i64 b, i64 e) {
+                    for (i64 t = b; t < e; t++) {
+                        for (i64 h = 0; h < n_head; h++) {
+                            const f32 *sh = s + t * stride + h * hd;
+                            f32 *dh = d + t * stride + h * hd;
+                            f32 ss = 0;
+                            for (i64 i = 0; i < hd; i++) ss += sh[i] * sh[i];
+                            const f32 inv = 1.0f / std::sqrt(ss + eps);
+                            for (i64 i = 0; i < hd; i++) dh[i] = sh[i] * inv;
+                        }
+                    }
+                });
+    }
+
+    void sigmoid_act(void *x, i64 n) override {
+        f32 *p = static_cast<f32 *>(x);
+        par_for(n, 8192, 4.0 * static_cast<f64>(n),
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) p[i] = 1.0f / (1.0f + std::exp(-p[i]));
+                });
+    }
+
+    void softplus_act(void *x, i64 n) override {
+        f32 *p = static_cast<f32 *>(x);
+        par_for(n, 8192, 4.0 * static_cast<f64>(n),
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        // log1p(exp(x)) overflows well before the value matters;
+                        // above the threshold softplus(x) == x to f32 accuracy.
+                        const f32 v = p[i];
+                        p[i] = v > 20.0f ? v : std::log1p(std::exp(v));
+                    }
+                });
+    }
+
+    void scale_act(void *x, f32 alpha, i64 n_tok, i64 width, i64 stride) override {
+        f32 *p = static_cast<f32 *>(x);
+        par_for(n_tok, 1, static_cast<f64>(n_tok) * width,
+                [&](i64 b, i64 e) {
+                    for (i64 t = b; t < e; t++) {
+                        f32 *row = p + t * stride;
+                        for (i64 i = 0; i < width; i++) row[i] *= alpha;
+                    }
+                });
+    }
+
+    void mul_act(void *a, const void *b, i64 n) override {
+        f32 *p = static_cast<f32 *>(a);
+        const f32 *s = static_cast<const f32 *>(b);
+        par_for(n, 8192, 2.0 * static_cast<f64>(n),
+                [&](i64 lo, i64 e) {
+                    for (i64 i = lo; i < e; i++) p[i] *= s[i];
+                });
+    }
+
+    void add_bias_cols(void *x, const f32 *bias, i64 n_row, i64 n_col) override {
+        f32 *p = static_cast<f32 *>(x);
+        par_for(n_row, 1, static_cast<f64>(n_row) * n_col,
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        f32 *row = p + i * n_col;
+                        for (i64 j = 0; j < n_col; j++) row[j] += bias[j];
+                    }
+                });
+    }
+
+    void scale_cols(void *x, const f32 *col, i64 n_row, i64 n_col) override {
+        f32 *p = static_cast<f32 *>(x);
+        par_for(n_row, 1, static_cast<f64>(n_row) * n_col,
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        f32 *row = p + i * n_col;
+                        for (i64 j = 0; j < n_col; j++) row[j] *= col[j];
+                    }
+                });
+    }
+
+    void scale_rows(void *x, const void *alpha, i64 n_row, i64 n) override {
+        f32 *p = static_cast<f32 *>(x);
+        const f32 *a = static_cast<const f32 *>(alpha);
+        par_for(n_row, 1, 2.0 * static_cast<f64>(n_row) * n,
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        f32 *row = p + i * n;
+                        const f32 s = a[i];
+                        for (i64 j = 0; j < n; j++) row[j] *= s;
+                    }
+                });
+    }
+
+    void qwen3_next_split(void *q, void *gate, const void *packed, i64 n_tok,
+                          i64 n_head, i64 hd) override {
+        const f32 *p = static_cast<const f32 *>(packed);
+        f32 *qd = static_cast<f32 *>(q);
+        f32 *gd = static_cast<f32 *>(gate);
+        par_for(n_tok, 1, 2.0 * static_cast<f64>(n_tok) * n_head * hd,
+                [&](i64 b, i64 e) {
+                    for (i64 t = b; t < e; t++) {
+                        for (i64 h = 0; h < n_head; h++) {
+                            const f32 *src = p + (t * n_head + h) * 2 * hd;
+                            f32 *dst = qd + (t * n_head + h) * hd;
+                            std::memcpy(dst, src, static_cast<size_t>(hd) * sizeof(f32));
+                            if (gd)
+                                std::memcpy(gd + (t * n_head + h) * hd, src + hd,
+                                            static_cast<size_t>(hd) * sizeof(f32));
+                        }
+                    }
+                });
+    }
+
+    void conv1d_silu(void *out, const void *in, void *state, const void *kern,
+                     DType wt, i64 n_tok, i64 chan, i64 ksize) override {
+        if (ksize <= 0 || ksize > kMaxConvKernel) return;
+        const f32 *xp = static_cast<const f32 *>(in);
+        f32 *st = static_cast<f32 *>(state);
+        f32 *o = static_cast<f32 *>(out);
+        const i64 keep = ksize - 1;
+        // One tap value per (tap, channel), dequantized once per call — the
+        // kernel is tiny and every channel reads all of it.
+        const i64 nk = ksize * chan;
+        std::vector<f32> w(static_cast<size_t>(nk));
+        if (wt == DType::F32) {
+            std::memcpy(w.data(), kern, static_cast<size_t>(nk) * sizeof(f32));
+        } else {
+            dequant_row(wt, kern, w.data(), nk);
+        }
+        // Channels are independent down the whole time axis, and each worker
+        // touches only its own column of `state`, so the pool can split here.
+        par_for(chan, 32, 4.0 * static_cast<f64>(n_tok) * chan * ksize,
+                [&](i64 cb, i64 ce) {
+                    // X(m) is the window the tap j of output t reads: the
+                    // ksize-1 stored steps first, then this call's rows.
+                    auto X = [&](i64 m, i64 c) -> f32 {
+                        return m < keep ? st[m * chan + c]
+                                        : xp[(m - keep) * chan + c];
+                    };
+                    for (i64 c = cb; c < ce; c++) {
+                        for (i64 t = 0; t < n_tok; t++) {
+                            f32 acc = 0;
+                            for (i64 j = 0; j < ksize; j++)
+                                acc += w[static_cast<size_t>(j * chan + c)] * X(t + j, c);
+                            o[t * chan + c] = silu_scalar(acc);
+                        }
+                        // The window slides: keep the last ksize-1 steps.
+                        for (i64 j = 0; j < keep; j++)
+                            st[j * chan + c] = X(n_tok + j, c);
+                    }
+                });
+    }
+
+    void delta_rule(void *out, void *state, const void *q, const void *k,
+                    const void *v, const void *g, const void *beta, i64 n_tok,
+                    i64 n_k_head, i64 n_v_head, i64 d_state, i64 hd,
+                    i64 row_stride) override {
+        f32 *S = static_cast<f32 *>(state);
+        const f32 *qp = static_cast<const f32 *>(q);
+        const f32 *kp = static_cast<const f32 *>(k);
+        const f32 *vp = static_cast<const f32 *>(v);
+        const f32 *gp = static_cast<const f32 *>(g);
+        const f32 *bp = static_cast<const f32 *>(beta);
+        f32 *op = static_cast<f32 *>(out);
+        // Value heads own disjoint state, so they are the parallel units; the
+        // token loop inside one head is sequential by definition.
+        par_for(n_v_head, 1, 8.0 * static_cast<f64>(n_tok) * n_v_head * d_state * hd,
+                [&](i64 hb, i64 he) {
+                    std::vector<f32> kv(static_cast<size_t>(hd));
+                    for (i64 h = hb; h < he; h++) {
+                        f32 *Sh = S + h * d_state * hd;
+                        const i64 kh = h % n_k_head; // tiled key head
+                        for (i64 t = 0; t < n_tok; t++) {
+                            const f32 decay = std::exp(gp[t * n_v_head + h]);
+                            const f32 bta = bp[t * n_v_head + h];
+                            const f32 *qt = qp + t * row_stride + kh * d_state;
+                            const f32 *kt = kp + t * row_stride + kh * d_state;
+                            const f32 *vt = vp + t * row_stride + h * hd;
+
+                            // S <- S * exp(g)
+                            for (i64 i = 0; i < d_state; i++) {
+                                f32 *row = Sh + i * hd;
+                                for (i64 j = 0; j < hd; j++) row[j] *= decay;
+                            }
+                            // kv = S^T k  (kv[j] = sum_i S[i, j] k[i])
+                            for (i64 j = 0; j < hd; j++) {
+                                f32 acc = 0;
+                                for (i64 i = 0; i < d_state; i++)
+                                    acc += Sh[i * hd + j] * kt[i];
+                                kv[static_cast<size_t>(j)] = acc;
+                            }
+                            // S += k (x) d, d = (v - kv) * beta
+                            for (i64 i = 0; i < d_state; i++) {
+                                f32 *row = Sh + i * hd;
+                                const f32 ki = kt[i];
+                                for (i64 j = 0; j < hd; j++)
+                                    row[j] += ki * (vt[j] - kv[static_cast<size_t>(j)]) * bta;
+                            }
+                            // out = S^T q
+                            f32 *ot = op + (t * n_v_head + h) * hd;
+                            for (i64 j = 0; j < hd; j++) {
+                                f32 acc = 0;
+                                for (i64 i = 0; i < d_state; i++)
+                                    acc += Sh[i * hd + j] * qt[i];
+                                ot[j] = acc;
+                            }
+                        }
+                    }
+                });
     }
 
     void gather_rows(void *dst, const void *src, const i32 *rows, i64 n_rows,

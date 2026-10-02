@@ -74,7 +74,7 @@ row in its quantized form and dequantizes on the fly.
 | `include/krk/gguf.hpp` / `src/gguf.cpp` | GGUF v2/v3 reader over the mapping; KV store, tensor directory, alignment handling |
 | `include/krk/backend.hpp` | the `Backend` interface and `DeviceCaps` |
 | `include/krk/model.hpp` / `src/model.cpp` | metadata resolution, tensor schema validation, upload, MoE geometry, host-side RoPE table |
-| `include/krk/expert_cache.hpp` / `src/expert_cache.cpp` | lazy, byte-budgeted, frequency-aware residency for MoE expert matrices (LFU + aging + pinning; `ExpertSource`, `ResidentExpert`, `ExpertCache`) |
+| `include/krk/expert_cache.hpp` / `src/expert_cache.cpp` | lazy, byte-budgeted, frequency-aware residency for MoE expert matrices (LFU + aging + pinning; `ExpertSource`, `ResidentExpert`, `ExpertCache`), plus the optional second tier: with `--expert-l2-mb` a victim is demoted to page-locked host memory (`Backend::alloc_host` → `hipHostMalloc`) instead of released, and promoted back with a DMA on its next request. Pins do not protect host copies — the tier is a cache of a cache |
 | `include/krk/tokenizer.hpp` / `src/tokenizer.cpp` | SPM unigram (Viterbi) and byte-level BPE (GPT-2 / Qwen2 / Llama3 pre-tokenizers) |
 | `include/krk/sampler.hpp` / `src/sampler.cpp` | seedable xorshift128+ RNG, rep-penalty → temp → top-k → top-p → min-p |
 | `include/krk/engine.hpp` / `src/engine.cpp` | workspace allocation, chunked prefill, decode loop, streaming with stop-string holdback |
@@ -201,3 +201,7 @@ On the MoE path specifically, the remaining candidates for optimisation are:
   lapse when traffic moves on. `--bench` reports loads, evictions, hit rate and
   the pinned count. Tuning `kPinThreshold`/`kPinDecay` per model family, or a
   persistent “hot set” sized from a calibration pass, are the next steps.
+* expert loads are synchronous: a miss blocks the layer while the slice is
+  uploaded. Prefetching the next token's top-k+1 from the router distribution
+  while the current step's GEMMs run is the next win, and it is orthogonal to
+  the tier above — a promotion can be prefetched just as a load can.

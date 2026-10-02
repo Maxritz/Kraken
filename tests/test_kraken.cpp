@@ -107,6 +107,13 @@ public:
         put_raw(v.data(), v.size() * 4);
     }
 
+    void meta_i32_array(const std::string &k, const std::vector<i32> &v) {
+        put_key(k, 9);
+        put_u32(5); // element type = Int32
+        put_u64(v.size());
+        put_raw(v.data(), v.size() * 4);
+    }
+
     void tensor_f32(const std::string &name, const std::vector<u64> &ne,
                     const std::vector<f32> &data) {
         add_tensor(name, 0, ne, data.size() * 4);
@@ -706,6 +713,537 @@ static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
     return b.write(path);
 }
 
+// ---------------------------------------------------------------------------
+// Qwen3.5 / gated delta net
+// ---------------------------------------------------------------------------
+
+static const char *kGdnTestPath = "kraken-gdn-test.gguf";
+
+// A miniature qwen35moe: `n_layer` layers where every full_attention_interval'th
+// one keeps real attention (with a packed output gate) and the rest are delta
+// net layers. Deliberately tiny (d_state 8, 2 key / 4 value heads) so the CPU
+// oracle can run it, but structurally identical to the 35B checkpoint's schema.
+static bool build_tiny_gdn_model(const std::string &path, int n_layer,
+                                 int interval) {
+    const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
+    const int d_state = 8, n_k_head = 2, n_v_head = 4, conv_k = 4;
+    const int rope_dim = 4;
+    const int key_dim = n_k_head * d_state;
+    const int value_dim = n_v_head * d_state;
+    const int conv_dim = key_dim * 2 + value_dim;
+    const int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32, n_expert = 4, vocab = 260,
+              ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string arch = "qwen35moe";
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-gdn-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".rope.dimension_count", static_cast<u32>(rope_dim));
+    b.meta_i32_array(arch + ".rope.dimension_sections", {rope_dim / 2, 1, 1, 0});
+    // ssm.* drives the recurrent block's geometry.
+    b.meta_u32(arch + ".ssm.conv_kernel", static_cast<u32>(conv_k));
+    b.meta_u32(arch + ".ssm.state_size", static_cast<u32>(d_state));
+    b.meta_u32(arch + ".ssm.time_step_rank", static_cast<u32>(n_v_head));
+    b.meta_u32(arch + ".ssm.group_count", static_cast<u32>(n_k_head));
+    b.meta_u32(arch + ".ssm.inner_size", static_cast<u32>(value_dim));
+    b.meta_u32(arch + ".full_attention_interval", static_cast<u32>(interval));
+    // MoE geometry, identical to the qwen2moe path.
+    b.meta_u32(arch + ".expert_count", static_cast<u32>(n_expert));
+    b.meta_u32(arch + ".expert_used_count", 2);
+    b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
+    b.meta_u32(arch + ".expert_shared_feed_forward_length", static_cast<u32>(n_ff_sh));
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    // An explicit (untied) output head with a single live row. The point of
+    // this model is the recurrent mechanics, not the text, and the head has to
+    // earn its keep twice over:
+    //   * only one id can ever be non-zero, so a run can never stop on EOS and
+    //     the tests can assert on token counts and the KV cursor;
+    //   * that row is a *random* vector, so the winning token is the sign of
+    //     dot(activation, row) — a genuine function of the delta-rule state. A
+    //     constant row would pin the argmax and make every state-corruption
+    //     test in this file pass no matter how badly the state was wrong.
+    {
+        std::vector<f32> head(static_cast<size_t>(n_embd) * vocab, 0.0f);
+        const size_t live = 5;
+        const std::vector<f32> row = vec(static_cast<size_t>(n_embd), 4242);
+        for (int r = 0; r < n_embd; r++)
+            head[static_cast<size_t>(r) * vocab + live] = row[static_cast<size_t>(r)];
+        b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)}, head);
+    }
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        // Qwen3.5 spells the post-attention norm differently from the rest of
+        // the family; the loader has to fall back to it.
+        b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
+
+        if (((l + 1) % interval) != 0) {
+            // ---- delta net layer ----
+            b.tensor_f16(p + "attn_qkv.weight", {u64(n_embd), u64(conv_dim)},
+                         vec(static_cast<size_t>(n_embd) * conv_dim, 100));
+            b.tensor_f16(p + "attn_gate.weight", {u64(n_embd), u64(value_dim)},
+                         vec(static_cast<size_t>(n_embd) * value_dim, 200));
+            // depthwise: one 4-tap kernel per channel
+            b.tensor_f32(p + "ssm_conv1d.weight", {u64(conv_k), u64(conv_dim)},
+                         vec(static_cast<size_t>(conv_k) * conv_dim, 300));
+            b.tensor_f32(p + "ssm_dt.bias", {u64(n_v_head)},
+                         vec(static_cast<size_t>(n_v_head), 400));
+            // A_log as the converter stores it: already -exp(A_log).
+            std::vector<f32> a(static_cast<size_t>(n_v_head));
+            for (int h = 0; h < n_v_head; h++) a[static_cast<size_t>(h)] = -0.5f - 0.1f * h;
+            b.tensor_f32(p + "ssm_a", {u64(n_v_head)}, a);
+            b.tensor_f16(p + "ssm_alpha.weight", {u64(n_embd), u64(n_v_head)},
+                         vec(static_cast<size_t>(n_embd) * n_v_head, 500));
+            b.tensor_f16(p + "ssm_beta.weight", {u64(n_embd), u64(n_v_head)},
+                         vec(static_cast<size_t>(n_embd) * n_v_head, 600));
+            b.tensor_f32(p + "ssm_norm.weight", {u64(d_state)}, ones(d_state));
+            b.tensor_f16(p + "ssm_out.weight", {u64(value_dim), u64(n_embd)},
+                         vec(static_cast<size_t>(value_dim) * n_embd, 700));
+        } else {
+            // ---- full attention with a packed per-head output gate ----
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(2 * q_dim)},
+                         vec(static_cast<size_t>(n_embd) * 2 * q_dim, 100));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, 200));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, 300));
+            b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                         vec(static_cast<size_t>(q_dim) * n_embd, 400));
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        }
+
+        // ---- MoE FFN, shared by both layer kinds ----
+        std::vector<f32> router(static_cast<size_t>(n_embd) * n_expert);
+        for (size_t i = 0; i < router.size(); i++) router[i] = wv(static_cast<i64>(i) * 3 + 7);
+        b.tensor_f16(p + "ffn_gate_inp.weight", {u64(n_embd), u64(n_expert)}, router);
+        const size_t gsz = static_cast<size_t>(n_embd) * n_ff_exp;
+        const size_t dsz = static_cast<size_t>(n_ff_exp) * n_embd;
+        const size_t ne = static_cast<size_t>(n_expert);
+        std::vector<f32> gate(gsz * ne), up(gsz * ne), down(dsz * ne);
+        for (size_t e = 0; e < ne; e++) {
+            const i64 bump = static_cast<i64>(e) * 7919;
+            for (size_t k = 0; k < gsz; k++) {
+                gate[e * gsz + k] = wv(500 + static_cast<i64>(k) + bump);
+                up[e * gsz + k] = wv(900 + static_cast<i64>(k) + bump);
+            }
+            for (size_t k = 0; k < dsz; k++) down[e * dsz + k] = wv(1300 + static_cast<i64>(k) + bump);
+        }
+        b.tensor_f16(p + "ffn_gate_exps.weight", {u64(n_embd), u64(n_ff_exp), u64(ne)}, gate);
+        b.tensor_f16(p + "ffn_up_exps.weight", {u64(n_embd), u64(n_ff_exp), u64(ne)}, up);
+        b.tensor_f16(p + "ffn_down_exps.weight", {u64(n_ff_exp), u64(n_embd), u64(ne)}, down);
+        b.tensor_f16(p + "ffn_gate_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                     vec(static_cast<size_t>(n_embd) * n_ff_sh, 1700));
+        b.tensor_f16(p + "ffn_up_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                     vec(static_cast<size_t>(n_embd) * n_ff_sh, 2100));
+        b.tensor_f16(p + "ffn_down_shexp.weight", {u64(n_ff_sh), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff_sh) * n_embd, 2500));
+        // The Qwen3.5 shared-expert gate: one row per token.
+        b.tensor_f32(p + "ffn_gate_inp_shexp.weight", {u64(n_embd)},
+                     vec(static_cast<size_t>(n_embd), 2900));
+    }
+    return b.write(path);
+}
+
+static void test_gdn_model_loads() {
+    CHECK(build_tiny_gdn_model(kGdnTestPath, 4, 4), "wrote a synthetic qwen35moe GGUF");
+
+    Backend *cpu = make_cpu_backend();
+    Model m;
+    std::string err;
+    CHECK(m.load(*cpu, kGdnTestPath, &err), "a qwen35moe checkpoint loads");
+    if (!err.empty()) std::fprintf(stderr, "  (gdn: %s)\n", err.c_str());
+    if (m.cfg().arch == "qwen35moe") {
+        const ModelConfig &c = m.cfg();
+        CHECK(c.recurrent, "the model declares itself recurrent");
+        CHECK(c.full_attention_interval == 4, "full_attention_interval is read");
+        CHECK(c.ssm_d_state == 8 && c.ssm_dt_rank == 4 && c.ssm_n_group == 2,
+              "ssm state/head geometry is read");
+        CHECK(c.ssm_d_conv == 4, "ssm.conv_kernel is read");
+        CHECK(m.value_dim() == 32 && m.key_dim() == 16 && m.conv_dim() == 64,
+              "derived key/value/conv widths");
+        CHECK(c.rope_dim == 4, "rope.dimension_count narrows the rotation");
+        CHECK(c.rope_sections[0] == 2 && c.rope_sections[3] == 0,
+              "rope.dimension_sections is read");
+        CHECK(m.inv_freq().size() == 2,
+              "the inverse-frequency table follows rope_dim, not head_dim");
+        CHECK(m.recurrent_layers() == 3,
+              "three of four layers are delta net (every 4th attends)");
+        // Layer 3 attends, layers 0..2 recur.
+        // Layers 0..2 recur, layer 3 attends (every 4th).
+        const bool classified = m.layers()[0].gdn && m.layers()[1].gdn &&
+                                m.layers()[2].gdn && !m.layers()[3].gdn;
+        CHECK(classified, "layers 0-2 are delta net and layer 3 is full attention");
+        CHECK(m.layers()[3].wq.n_out == 64, "the attending layer's q packs q+gate");
+        CHECK(m.layers()[3].wo.n_in == 32, "its output projection is the head width");
+        const LayerWeights &g = m.layers()[0];
+        CHECK(g.wqkv.n_out == 64 && g.wqkv_gate.n_out == 32,
+              "the delta net layer's projections match ssm geometry");
+        CHECK(g.ssm_conv1d.n_in == 4 && g.ssm_conv1d.n_out == 64,
+              "its short conv is [kernel, conv_dim]");
+        CHECK(g.ssm_out.n_in == 32 && g.ssm_out.n_out == 32, "its output projection");
+        CHECK(g.ssm_dt && g.ssm_a && g.ssm_norm, "its state parameters are resident");
+        CHECK(g.ssm_alpha.present() && g.ssm_beta.present(),
+              "alpha/beta are matmul weights");
+        CHECK(g.ffn_norm != nullptr,
+              "post_attention_norm stands in for the missing ffn_norm");
+        CHECK(g.shexp_inp_gate.present(), "the shared-expert gate row is loaded");
+        CHECK(m.experts().loads() == 0, "no expert loaded straight after load");
+    }
+    m.unload();
+    delete cpu;
+}
+
+static void test_gdn_generation() {
+    std::FILE *probe = std::fopen(kGdnTestPath, "rb");
+    if (!probe) {
+        std::fprintf(stderr, "  (gdn model missing, skipping)\n");
+        return;
+    }
+    std::fclose(probe);
+
+    // A recurrent model must decode, and it must be deterministic: the state
+    // advances token by token, so any drift in the ops shows up immediately.
+    std::vector<i32> first;
+    for (int pass = 0; pass < 2; pass++) {
+        Backend *cpu = make_cpu_backend();
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = kGdnTestPath;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = 4; // force several chunks: the conv window and the
+                               // delta state have to survive the chunk boundary
+        std::string err;
+        if (!engine.init(cpu, cfg, &err)) {
+            std::fprintf(stderr, "  (gdn engine: %s)\n", err.c_str());
+            delete cpu;
+            CHECK(false, "the engine initialised on a qwen35moe model");
+            return;
+        }
+        GenerateParams p;
+        p.prompt = "the";
+        p.max_tokens = 8;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        GenerateResult r;
+        const bool ok = engine.generate(p, &r);
+        CHECK(ok && !r.tokens.empty(), "a recurrent model generates tokens");
+        CHECK(engine.kv_pos() == static_cast<i64>(1 + 8),
+              "the KV cursor advanced once per token");
+        // A draft would need a partial rewind, which a delta rule cannot do.
+        std::string derr;
+        CHECK(!engine.load_draft(kTestModelPath, &derr),
+              "speculative decoding is refused for a recurrent model");
+        engine.shutdown();
+        delete cpu;
+        if (pass == 0) {
+            first = r.tokens;
+        } else {
+            CHECK(r.tokens == first, "a recurrent model decodes deterministically");
+        }
+    }
+
+    // Chunking must not change the answer: a 4-token prefill chunk and a
+    // 1-token one compute the same sequence, so the state threading is exact.
+    auto run_with = [&](i32 chunk, std::vector<i32> *out) {
+        Backend *cpu = make_cpu_backend();
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = kGdnTestPath;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = chunk;
+        std::string err;
+        if (!engine.init(cpu, cfg, &err)) {
+            delete cpu;
+            return false;
+        }
+        GenerateParams p;
+        p.prompt = "the";
+        p.max_tokens = 8;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        GenerateResult r;
+        const bool ok = engine.generate(p, &r);
+        *out = r.tokens;
+        engine.shutdown();
+        delete cpu;
+        return ok;
+    };
+    std::vector<i32> chunked, whole;
+    CHECK(run_with(1, &whole), "generation with a 1-token prefill chunk");
+    CHECK(run_with(4, &chunked), "generation with a 4-token prefill chunk");
+    // The prompt is more than one token, so a 1-token chunk really does split
+    // the prefill: getting the same tokens back proves the conv window and the
+    // delta state thread across chunk boundaries exactly.
+    CHECK(!whole.empty() && whole == chunked,
+          "the recurrent state threads across prefill chunks exactly");
+    CHECK(!whole.empty() && whole == chunked,
+          "the recurrent state threads across prefill chunks exactly");
+    CHECK(!whole.empty() && whole == first,
+          "chunking does not change the generated tokens");
+
+    // A full rewind is the honest reset: the server does it per request, and
+    // the replayed prompt rebuilds the state. A partial one must be refused.
+    {
+        Backend *cpu = make_cpu_backend();
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = kGdnTestPath;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = 4;
+        std::string err;
+        CHECK(engine.init(cpu, cfg, &err), "engine for the rollback test");
+        GenerateParams p;
+        p.prompt = "the";
+        p.max_tokens = 6;
+        p.sampler.greedy = true;
+        GenerateResult r;
+        engine.generate(p, &r);
+        const std::vector<i32> before = r.tokens;
+        // Tokens alone are a weak witness: the head has one live row, so the
+        // argmax can land the same way whatever the state did. The logits are
+        // the real function of the state, so compare those too.
+        const std::vector<f32> before_logits(engine.last_logits(),
+                                             engine.last_logits() + 16);
+        const auto same_logits = [&](const char *what) {
+            bool eq = true;
+            for (size_t i = 0; i < before_logits.size(); i++)
+                if (before_logits[i] != engine.last_logits()[i]) eq = false;
+            CHECK(eq, what);
+        };
+        CHECK(!engine.kv_rollback(engine.kv_pos() - 2),
+              "a partial rewind is refused for a recurrent model");
+        CHECK(engine.kv_pos() == 7, "the refused rewind left the cursor alone");
+        CHECK(engine.kv_rollback(0), "a full rewind is accepted");
+        CHECK(engine.kv_pos() == 0, "the full rewind moved the cursor to 0");
+        // Replaying the same prompt from the reset state must reproduce the run.
+        GenerateResult r2;
+        engine.generate(p, &r2);
+        CHECK(r2.tokens == before,
+              "a replay after kv_rollback(0) reproduces the same tokens");
+        same_logits("a replay after kv_rollback(0) reproduces the same logits");
+
+        // A second generate() on the same engine is a new sequence whether or
+        // not the caller thought to roll back: the prefill starts at 0, so the
+        // recurrent state has to start there too. Without the reset the state
+        // still holds the previous run and every logit drifts.
+        GenerateResult r3;
+        engine.generate(p, &r3);
+        CHECK(r3.tokens == before,
+              "generate() after another generate() repeats the same tokens");
+        same_logits("generate() resets the recurrent state instead of inheriting it");
+        engine.shutdown();
+        delete cpu;
+    }
+}
+
+// The ops behind the recurrent block, checked in isolation so a failure points
+// at the kernel rather than at the model.
+static void test_gdn_ops() {
+    Backend *cpu = make_cpu_backend();
+    const i64 hd = 8, heads = 2, n = 3;
+
+    // l2norm: each head gets unit norm with its own denominator, for every
+    // token, including when the rows are strided out of a wider buffer.
+    std::vector<f32> x(static_cast<size_t>(heads * hd));
+    for (size_t i = 0; i < x.size(); i++) x[i] = static_cast<f32>(i + 1);
+    std::vector<f32> y(x.size());
+    cpu->l2norm(y.data(), x.data(), 1, heads, hd, heads * hd, 0.0f);
+    for (i64 h = 0; h < heads; h++) {
+        f32 ss = 0;
+        for (i64 i = 0; i < hd; i++) ss += y[static_cast<size_t>(h * hd + i)] * y[static_cast<size_t>(h * hd + i)];
+        CHECK(std::fabs(ss - 1.0f) < 1e-5f, "l2norm gives each head unit norm");
+    }
+    {
+        // Strided: 3 tokens inside rows wider than the heads, so a dense
+        // l2norm would normalize the wrong elements. The stride must clear the
+        // heads or the rows would overlap.
+        const i64 nt = 3, stride = heads * hd + 3;
+        std::vector<f32> s(static_cast<size_t>(nt * stride), 100.0f);
+        for (i64 t = 0; t < nt; t++)
+            for (i64 i = 0; i < heads * hd; i++)
+                s[static_cast<size_t>(t * stride + i)] = static_cast<f32>(t + 1) * (i + 1);
+        std::vector<f32> d(s);
+        cpu->l2norm(d.data(), s.data(), nt, heads, hd, stride, 0.0f);
+        for (i64 t = 0; t < nt; t++)
+            for (i64 h = 0; h < heads; h++) {
+                f32 ss = 0;
+                for (i64 i = 0; i < hd; i++) {
+                    const f32 val = d[static_cast<size_t>(t * stride + h * hd + i)];
+                    ss += val * val;
+                }
+                CHECK(std::fabs(ss - 1.0f) < 1e-5f,
+                      "l2norm honours the row stride (per token, per head)");
+                CHECK(d[static_cast<size_t>(t * stride + heads * hd)] == 100.0f,
+                      "l2norm leaves the padding past the heads alone");
+            }
+    }
+
+    // softplus and sigmoid against the closed forms.
+    std::vector<f32> a = {-2.0f, 0.0f, 3.0f, 25.0f};
+    std::vector<f32> a0 = a;
+    cpu->softplus_act(a.data(), 4);
+    CHECK(std::fabs(a[0] - std::log1p(std::exp(-2.0f))) < 1e-5f, "softplus(-2)");
+    CHECK(std::fabs(a[1] - std::log(2.0f)) < 1e-5f, "softplus(0) = log 2");
+    CHECK(std::fabs(a[2] - std::log1p(std::exp(3.0f))) < 1e-5f, "softplus(3)");
+    CHECK(std::fabs(a[3] - 25.0f) < 1e-4f, "softplus saturates to x without overflow");
+    std::vector<f32> s = a0;
+    cpu->sigmoid_act(s.data(), 4);
+    for (size_t i = 0; i < s.size(); i++)
+        CHECK(std::fabs(s[i] - 1.0f / (1.0f + std::exp(-a0[i]))) < 1e-6f,
+              "sigmoid matches the logistic");
+
+    // The short conv: a two-tap identity kernel must reproduce its input on a
+    // fresh state, which pins the tap order (newest last) and the window.
+    const i64 chan = 2, ksize = 3;
+    std::vector<f32> in(static_cast<size_t>(chan * 3)), outv(in.size());
+    for (size_t i = 0; i < in.size(); i++) in[i] = static_cast<f32>(i) - 2.0f;
+    std::vector<f32> kern(static_cast<size_t>(chan * ksize), 0.0f);
+    for (i64 c = 0; c < chan; c++) kern[static_cast<size_t>((ksize - 1) * chan + c)] = 4.0f;
+    std::vector<f32> state(static_cast<size_t>((ksize - 1) * chan), 0.0f);
+    cpu->conv1d_silu(outv.data(), in.data(), state.data(), kern.data(), DType::F32, 3,
+                     chan, ksize);
+    // silu(4 * x) is not x, so compare against the closed form instead.
+    for (i64 t = 0; t < 3; t++)
+        for (i64 c = 0; c < chan; c++) {
+            const f32 x = in[static_cast<size_t>(t * chan + c)];
+            const f32 want = (4.0f * x) / (1.0f + std::exp(-4.0f * x));
+            CHECK(std::fabs(outv[static_cast<size_t>(t * chan + c)] - want) < 1e-5f,
+                  "conv1d_silu matches the closed form with a fresh window");
+        }
+
+    // The delta rule on one head, hand-checked. With g = 0 the state does not
+    // decay and beta = 1 makes the update a full rank-1 write, so from a zero
+    // state:  S = k (x) v  and  out[j] = sum_i S[i][j] q[i] = v[j] * (k . q).
+    const i64 ds = 4, nh = 1;
+    const std::vector<f32> k = {0, 1, 0, 0}, v = {1, 2, 3, 4}, g0 = {0.0f},
+                          beta1 = {1.0f}, q_orth = {1, 0, 0, 0}, q_ones = {1, 1, 1, 1};
+    std::vector<f32> o(static_cast<size_t>(ds));
+    std::vector<f32> st(static_cast<size_t>(ds * ds), 0.0f);
+    cpu->delta_rule(o.data(), st.data(), q_orth.data(), k.data(), v.data(),
+                    g0.data(), beta1.data(), 1, nh, nh, ds, ds, ds);
+    for (i64 j = 0; j < ds; j++)
+        CHECK(std::fabs(o[static_cast<size_t>(j)]) < 1e-5f,
+              "a query orthogonal to k gives a zero delta-rule output");
+    for (i64 i = 0; i < ds; i++)
+        for (i64 j = 0; j < ds; j++)
+            CHECK(std::fabs(st[static_cast<size_t>(i * ds + j)] -
+                            k[static_cast<size_t>(i)] * v[static_cast<size_t>(j)]) < 1e-5f,
+                  "the state holds the rank-1 write k (x) v");
+
+    // Decay: exp(g) scales the state *before* the kv read-back and the write,
+    // so a state of ones with g = log 2 lands on 0.5 + k[i] * (v[j] - 0.5).
+    std::vector<f32> sd(static_cast<size_t>(ds * ds), 1.0f);
+    const std::vector<f32> glog2 = {-std::log(2.0f)};
+    cpu->delta_rule(o.data(), sd.data(), q_orth.data(), k.data(), v.data(),
+                    glog2.data(), beta1.data(), 1, nh, nh, ds, ds, ds);
+    for (i64 i = 0; i < ds; i++)
+        for (i64 j = 0; j < ds; j++) {
+            const f32 want =
+                0.5f + k[static_cast<size_t>(i)] * (v[static_cast<size_t>(j)] - 0.5f);
+            CHECK(std::fabs(sd[static_cast<size_t>(i * ds + j)] - want) < 1e-5f,
+                  "exp(g) decays the state before the rank-1 write");
+        }
+
+    // Reading the state back: out[j] = sum_i S[i][j] q[i], which for
+    // S = k (x) v and q = ones is v[j] * (k . q) = v[j].
+    std::vector<f32> s2(static_cast<size_t>(ds * ds), 0.0f);
+    cpu->delta_rule(o.data(), s2.data(), q_ones.data(), k.data(), v.data(),
+                    g0.data(), beta1.data(), 1, nh, nh, ds, ds, ds);
+    for (i64 j = 0; j < ds; j++)
+        CHECK(std::fabs(o[static_cast<size_t>(j)] - v[static_cast<size_t>(j)]) < 1e-5f,
+              "S^T q reads the rank-1 state back");
+
+    // A partial forget: beta scales the write, so the state lands halfway
+    // between the old value and the full rank-1 update.
+    std::vector<f32> s3(static_cast<size_t>(ds * ds), 0.0f);
+    const std::vector<f32> beta_half = {0.5f};
+    cpu->delta_rule(o.data(), s3.data(), q_orth.data(), k.data(), v.data(),
+                    g0.data(), beta_half.data(), 1, nh, nh, ds, ds, ds);
+    for (i64 i = 0; i < ds; i++)
+        for (i64 j = 0; j < ds; j++)
+            CHECK(std::fabs(s3[static_cast<size_t>(i * ds + j)] -
+                            0.5f * k[static_cast<size_t>(i)] *
+                                v[static_cast<size_t>(j)]) < 1e-5f,
+                  "beta scales the rank-1 write");
+
+    // Two tokens in one call must equal two calls of one token each: the state
+    // threading is exactly what makes a prefill chunk equivalent to decoding
+    // the same tokens one at a time.
+    {
+        const std::vector<f32> v2b = {4, 3, 2, 1};
+        std::vector<f32> qq(2 * ds), kk(2 * ds), vv(2 * ds), gg(2, 0.0f), bb(2, 1.0f);
+        for (i64 i = 0; i < ds; i++) {
+            qq[static_cast<size_t>(i)] = q_ones[static_cast<size_t>(i)];
+            kk[static_cast<size_t>(i)] = k[static_cast<size_t>(i)];
+            vv[static_cast<size_t>(i)] = v[static_cast<size_t>(i)];
+            qq[static_cast<size_t>(ds + i)] = q_ones[static_cast<size_t>(i)];
+            kk[static_cast<size_t>(ds + i)] = k[static_cast<size_t>(i)];
+            vv[static_cast<size_t>(ds + i)] = v2b[static_cast<size_t>(i)];
+        }
+        std::vector<f32> block(static_cast<size_t>(2 * ds));
+        std::vector<f32> whole(static_cast<size_t>(ds * ds), 0.0f);
+        cpu->delta_rule(block.data(), whole.data(), qq.data(), kk.data(), vv.data(),
+                        gg.data(), bb.data(), 2, nh, nh, ds, ds, ds);
+        std::vector<f32> step(static_cast<size_t>(ds * ds), 0.0f);
+        std::vector<f32> o1(static_cast<size_t>(ds)), o2(static_cast<size_t>(ds));
+        const std::vector<f32> g1 = {0.0f};
+        cpu->delta_rule(o1.data(), step.data(), q_ones.data(), k.data(), v.data(),
+                        g1.data(), beta1.data(), 1, nh, nh, ds, ds, ds);
+        cpu->delta_rule(o2.data(), step.data(), q_ones.data(), k.data(), v2b.data(),
+                        g1.data(), beta1.data(), 1, nh, nh, ds, ds, ds);
+        for (i64 i = 0; i < ds; i++) {
+            CHECK(std::fabs(block[static_cast<size_t>(i)] -
+                            o1[static_cast<size_t>(i)]) < 1e-5f,
+                  "a two-token block matches the first single token");
+            CHECK(std::fabs(block[static_cast<size_t>(ds + i)] -
+                            o2[static_cast<size_t>(i)]) < 1e-5f,
+                  "a two-token block matches the second single token, so the "
+                  "state threads within the call");
+        }
+    }
+    (void)n; (void)heads;
+
+    // The packed query split: interleaved halves come apart correctly.
+    std::vector<f32> packed(2 * 2 * 4), qo(2 * 2 * 4), gate(2 * 2 * 4);
+    for (size_t i = 0; i < packed.size(); i++) packed[i] = static_cast<f32>(i);
+    cpu->qwen3_next_split(qo.data(), gate.data(), packed.data(), 2, 2, 4);
+    for (i64 t = 0; t < 2; t++)
+        for (i64 h = 0; h < 2; h++)
+            for (i64 i = 0; i < 4; i++) {
+                const f32 src = packed[static_cast<size_t>((t * 2 + h) * 8 + i)];
+                const f32 gsrc = packed[static_cast<size_t>((t * 2 + h) * 8 + 4 + i)];
+                CHECK(std::fabs(qo[static_cast<size_t>((t * 2 + h) * 4 + i)] - src) < 1e-6f,
+                      "the query half unpacks in place");
+                CHECK(std::fabs(gate[static_cast<size_t>((t * 2 + h) * 4 + i)] - gsrc) < 1e-6f,
+                      "the gate half follows the query in its block");
+            }
+    delete cpu;
+}
+
 static void test_gguf_roundtrip() {
     CHECK(build_tiny_model(kTestModelPath, false), "wrote a synthetic GGUF");
 
@@ -831,10 +1369,14 @@ struct MoeRun {
     u64 evictions = 0;
     size_t resident_slots = 0;
     size_t capacity_slots = 0;
+    u64 demotions = 0;
+    u64 promotions = 0;
+    size_t host_slots = 0;
 };
 
 // Greedy generation through a MoE model, reporting what the expert cache did.
-static MoeRun run_moe(const char *path, i32 cache_mb, i32 cache_slots, int max_tokens) {
+static MoeRun run_moe(const char *path, i32 cache_mb, i32 cache_slots,
+                      int max_tokens, i32 l2_mb = 0) {
     MoeRun out;
     Backend *cpu = make_cpu_backend();
     Engine engine;
@@ -844,6 +1386,7 @@ static MoeRun run_moe(const char *path, i32 cache_mb, i32 cache_slots, int max_t
     cfg.prefill_chunk = 8;
     cfg.expert_cache_mb = cache_mb;
     cfg.expert_cache_slots = cache_slots;
+    cfg.expert_l2_mb = l2_mb;
     std::string err;
     if (!engine.init(cpu, cfg, &err)) {
         std::fprintf(stderr, "  moe init failed: %s\n", err.c_str());
@@ -863,6 +1406,9 @@ static MoeRun run_moe(const char *path, i32 cache_mb, i32 cache_slots, int max_t
     out.evictions = ec.evictions();
     out.resident_slots = ec.resident_slots();
     out.capacity_slots = ec.capacity_slots();
+    out.demotions = ec.demotions();
+    out.promotions = ec.promotions();
+    out.host_slots = ec.host_slots();
     engine.shutdown();
     delete cpu;
     return out;
@@ -932,6 +1478,16 @@ static void test_moe_schema_and_laziness() {
     // Same configuration twice must be deterministic.
     const MoeRun again = run_moe(kMoeTestPath, 0, 1, 6);
     CHECK(again.tokens == tiny.tokens, "MoE generation is deterministic");
+
+    // --- the second tier must not change a single token -------------------
+    const MoeRun tiered = run_moe(kMoeTestPath, 0, 1, 6, 64);
+    CHECK(tiered.ok, "MoE generation works with a host L2 tier");
+    CHECK(tiered.demotions > 0 && tiered.promotions > 0,
+          "a 1-slot cache with a tier demotes and promotes instead of dropping");
+    CHECK(tiered.loads < tiny.loads,
+          "the tier converts mapping reloads into DMA promotions");
+    CHECK(tiered.tokens == tiny.tokens,
+          "generation is bit-identical with and without the host tier");
 }
 
 // ---------------------------------------------------------------------------
@@ -953,6 +1509,17 @@ public:
     void release(void *p) override {
         if (p) releases_++;
         inner_->release(p);
+    }
+    // The host tier's own counters: a demotion is visible as host allocations,
+    // a promotion (or a recycled tier slot) as host releases.
+    void *alloc_host(size_t bytes) override {
+        void *p = inner_->alloc_host(bytes);
+        if (p) host_allocs_++;
+        return p;
+    }
+    void release_host(void *p) override {
+        if (p) host_releases_++;
+        inner_->release_host(p);
     }
     void upload(void *d, const void *s, size_t b, size_t o) override {
         inner_->upload(d, s, b, o);
@@ -1016,15 +1583,20 @@ public:
     }
 
     u64 releases() const { return releases_; }
+    u64 host_allocs() const { return host_allocs_; }
+    u64 host_releases() const { return host_releases_; }
 
 private:
     Backend *inner_;
     u64 releases_ = 0;
+    u64 host_allocs_ = 0;
+    u64 host_releases_ = 0;
 };
 
-static void test_expert_cache_policy() {
-    // A four-expert source whose slices are 8 bytes each, so a budget of 32
-    // bytes yields exactly four slots and every policy decision is visible.
+// A four-expert source whose slices are 8 bytes each, so a 96-byte budget is
+// exactly four slots and every policy decision is visible. Shared by the
+// residency-policy tests, which differ only in how they configure the cache.
+static bool build_expert_source_model(const std::string &path) {
     GgufBuilder b;
     b.meta_str("general.architecture", "llama");
     b.meta_u32("general.alignment", 32);
@@ -1045,8 +1617,23 @@ static void test_expert_cache_policy() {
                  sizeof(up_blob));
     b.tensor_raw("blk.0.ffn_down_exps.weight", 1, {2, 2, 4}, down_blob,
                  sizeof(down_blob));
+    return b.write(path);
+}
+
+static ExpertSource expert_source(Gguf &g) {
+    ExpertSource src;
+    src.gate = g.tensor("blk.0.ffn_gate_exps.weight");
+    src.up = g.tensor("blk.0.ffn_up_exps.weight");
+    src.down = g.tensor("blk.0.ffn_down_exps.weight");
+    src.n_expert = 4;
+    src.n_embd = 2;
+    src.n_ff_exp = 2;
+    return src;
+}
+
+static void test_expert_cache_policy() {
     const std::string path = "kraken-policy-test.gguf";
-    CHECK(b.write(path), "wrote the policy-test GGUF");
+    CHECK(build_expert_source_model(path), "wrote the policy-test GGUF");
 
     Backend *cpu = make_cpu_backend();
     CountingBackend be(cpu);
@@ -1055,13 +1642,7 @@ static void test_expert_cache_policy() {
     CHECK(g.load(path, &err), "loaded the policy-test GGUF");
     if (!err.empty()) std::fprintf(stderr, "  (policy gguf: %s)\n", err.c_str());
 
-    ExpertSource src;
-    src.gate = g.tensor("blk.0.ffn_gate_exps.weight");
-    src.up = g.tensor("blk.0.ffn_up_exps.weight");
-    src.down = g.tensor("blk.0.ffn_down_exps.weight");
-    src.n_expert = 4;
-    src.n_embd = 2;
-    src.n_ff_exp = 2;
+    const ExpertSource src = expert_source(g);
     CHECK(src.present(), "policy-test expert source is complete");
     CHECK(src.expert_bytes() == 3 * 8, "one expert is 24 bytes");
 
@@ -1150,6 +1731,94 @@ static void test_expert_cache_policy() {
     CHECK(touch(0), "expert 0 loads first");
     CHECK(touch(1), "expert 1 (recently hot) takes the slot from 0");
     CHECK(cache.touch_count(0, 1) >= 1, "the winner kept its history within the generation");
+
+    cache.clear();
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// ExpertCache second tier: VRAM slots over a page-locked host tier
+// ---------------------------------------------------------------------------
+
+static void test_expert_cache_l2_tier() {
+    const std::string path = "kraken-l2-test.gguf";
+    CHECK(build_expert_source_model(path), "wrote the L2-tier test GGUF");
+
+    Backend *cpu = make_cpu_backend();
+    CountingBackend be(cpu);
+    Gguf g;
+    std::string err;
+    CHECK(g.load(path, &err), "loaded the L2-tier test GGUF");
+    if (!err.empty()) std::fprintf(stderr, "  (l2 gguf: %s)\n", err.c_str());
+    const ExpertSource src = expert_source(g);
+    CHECK(src.present(), "L2-test expert source is complete");
+
+    ExpertCache cache;
+    const auto touch = [&](i32 e) { return cache.acquire(src, 0, e) != nullptr; };
+
+    // 1. Two VRAM slots, four host slots. Nothing is demoted until a miss.
+    cache.configure(&be, 48, 96);
+    CHECK(cache.host_budget_bytes() == 96, "the host tier is configured");
+    CHECK(touch(0) && touch(1), "the first two experts load into VRAM");
+    CHECK(cache.resident_slots() == 2 && cache.host_slots() == 0,
+          "VRAM holds both experts and the tier is untouched");
+    CHECK(cache.tracked_slots() == 2, "only the two loaded experts are tracked");
+
+    // 2. A victim is demoted, not released. Both experts have one touch, so the
+    //    older load loses — and it must lose into the tier, keeping its history.
+    CHECK(touch(2), "expert 2 needs a slot");
+    CHECK(cache.evictions() == 1 && cache.demotions() == 1,
+          "the eviction demoted instead of releasing to the mapping");
+    CHECK(cache.resident_slots() == 2 && cache.host_slots() == 1,
+          "VRAM is full again and the tier holds the victim");
+    CHECK(cache.touch_count(0, 0) == 1, "a demoted expert keeps its LFU counter");
+    CHECK(be.host_allocs() == 3, "the demotion allocated one host copy per tensor");
+
+    // 3. Re-requesting the demoted expert is a DMA, not a reload of the mapping.
+    const u64 loads_before = cache.loads();
+    CHECK(touch(0), "the demoted expert comes back");
+    CHECK(cache.loads() == loads_before, "a promotion does not re-read the mapping");
+    CHECK(cache.promotions() == 1 && cache.host_hits() == 1,
+          "the acquire was served by the host tier");
+    CHECK(cache.resident_slots() == 2, "the slot is back in VRAM");
+    CHECK(cache.host_slots() == 1,
+          "the slot it displaced to make room demoted into the tier");
+    CHECK(be.host_releases() == 3, "the promotion released the pinned copies");
+    CHECK(cache.touch_count(0, 0) == 2,
+          "a promoted expert keeps counting — it was hot before the eviction");
+
+    // 4. The tier is bounded by its own budget: room for one expert, so the
+    //    second demotion recycles the first one out of the tier.
+    cache.clear();
+    cache.configure(&be, 48, 24);
+    CHECK(touch(0) && touch(1) && touch(2) && touch(3), "four loads, two slots");
+    CHECK(cache.host_slots() == 1, "a one-expert tier never holds more than one");
+    CHECK(cache.resident_slots() == 2, "VRAM still holds its two slots");
+    CHECK(cache.demotions() == 2, "both evictions demoted into the tier");
+    CHECK(cache.touch_count(0, 0) == 0,
+          "the recycled expert was forgotten, not left as a zero-count ghost");
+    CHECK(touch(1), "the expert still in the tier is reachable");
+    CHECK(cache.promotions() == 1, "it came back by promotion");
+
+    // 5. An expert larger than the whole tier is dropped, not demoted: keeping
+    //    it would mean evicting everything and still not fitting.
+    cache.clear();
+    cache.configure(&be, 24, 8);
+    CHECK(touch(0) && touch(1), "a one-slot cache still makes progress");
+    CHECK(cache.demotions() == 0, "an expert bigger than the tier is never demoted");
+    CHECK(cache.host_slots() == 0 && cache.tracked_slots() == 1,
+          "the tier stays empty and the dropped slot leaves no trace");
+
+    // 6. With no tier configured the original behaviour is byte-for-byte intact.
+    const u64 host_allocs_before = be.host_allocs();
+    cache.clear();
+    cache.configure(&be, 24);
+    CHECK(touch(0) && touch(1), "loads proceed without a tier");
+    CHECK(cache.demotions() == 0 && cache.host_slots() == 0, "no tier, no demotions");
+    CHECK(be.host_allocs() == host_allocs_before,
+          "a disabled tier never touches host memory");
+    CHECK(cache.touch_count(0, 0) == 0,
+          "an evicted expert without a tier is gone, history and all");
 
     cache.clear();
     std::remove(path.c_str());
@@ -1808,12 +2477,19 @@ int main() {
     test_moe_matches_dense_twin();
     test_moe_grouped_prefill_matches_tokenwise();
     test_expert_cache_policy();
+    test_expert_cache_l2_tier();
+    test_gdn_ops();
+    test_gdn_model_loads();
+    test_gdn_generation();
     test_speculative_decoding();
     test_json();
     test_http_server();
     std::remove(kTestModelPath);
     std::remove(kMoeTestPath);
     std::remove(kMoeDenseTwinPath);
+    std::remove("kraken-l2-test.gguf");
+    std::remove("kraken-policy-test.gguf");
+    std::remove(kGdnTestPath);
 
     std::fprintf(stderr, "\n%d/%d checks passed\n", g_passed, g_run);
     return g_passed == g_run ? 0 : 1;

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 namespace krk {
 
@@ -13,9 +14,6 @@ namespace {
 // Activation-typed pointer arithmetic: all workspaces are contiguous.
 inline char *act_at(void *base, size_t act_size, i64 elem) {
     return static_cast<char *>(base) + static_cast<size_t>(elem) * act_size;
-}
-inline const char *act_at(const void *base, size_t act_size, i64 elem) {
-    return static_cast<const char *>(base) + static_cast<size_t>(elem) * act_size;
 }
 
 bool ends_with(const std::string &s, const std::string &suffix) {
@@ -69,6 +67,12 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     n_ff_ = mc.n_ff;
     q_dim_ = model_.q_dim();
     kv_dim_ = model_.kv_dim();
+    // Qwen3.5's attending layers carry a per-head output gate in the same
+    // projection as the query, so the buffer is twice the head width until the
+    // engine splits the two apart.
+    q_proj_ = (mc.arch == "qwen35" || mc.arch == "qwen35moe") ? 2 * q_dim_ : q_dim_;
+    conv_dim_ = model_.conv_dim();
+    value_dim_ = model_.value_dim();
     n_vocab_ = mc.n_vocab;
     kv_cap_ = std::min<i64>(cfg_.n_ctx > 0 ? cfg_.n_ctx : mc.n_ctx_train,
                             mc.n_ctx_train > 0 ? mc.n_ctx_train : 32768);
@@ -93,7 +97,9 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     ws_x_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     ws_xn_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     ws_x2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
-    ws_q_ = alloc(static_cast<size_t>(C * q_dim_) * as);
+    // q_proj_ is the projection's width: Qwen3.5 packs a per-head output gate
+    // behind the query, so the buffer has to hold both until the split.
+    ws_q_ = alloc(static_cast<size_t>(C * q_proj_) * as);
     ws_k_ = alloc(static_cast<size_t>(C * kv_dim_) * as);
     ws_v_ = alloc(static_cast<size_t>(C * kv_dim_) * as);
     ws_attn_ = alloc(static_cast<size_t>(C * q_dim_) * as);
@@ -102,6 +108,25 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     ws_gate_ = alloc(static_cast<size_t>(C * ff_ws) * as);
     ws_up_ = alloc(static_cast<size_t>(C * ff_ws) * as);
     ws_logits_ = alloc(static_cast<size_t>(n_vocab_) * as);
+    if (model_.is_recurrent()) {
+        rec_layers_ = model_.recurrent_layers();
+        ws_qkv_ = alloc(static_cast<size_t>(C * conv_dim_) * as);
+        ws_z_ = alloc(static_cast<size_t>(C * value_dim_) * as);
+        ws_h_ = alloc(static_cast<size_t>(C * value_dim_) * as);
+        // One scalar pair per value head: tiny next to the projections.
+        ws_ssm_ = alloc(static_cast<size_t>(C * mc.ssm_dt_rank) * as);
+        ws_beta_ = alloc(static_cast<size_t>(C * mc.ssm_dt_rank) * as);
+        ws_agate_ = alloc(static_cast<size_t>(C * q_dim_) * as);
+        // f32, not activation-typed: the state outlives the forward and is
+        // accumulated at higher precision than the activations it is fed.
+        conv_state_span_ = static_cast<i64>(mc.ssm_d_conv - 1) * conv_dim_;
+        rec_state_span_ = static_cast<i64>(mc.ssm_dt_rank) * mc.ssm_d_state *
+                          mc.ssm_d_state;
+        conv_state_ = alloc(static_cast<size_t>(rec_layers_) *
+                            static_cast<size_t>(conv_state_span_) * sizeof(f32));
+        rec_state_ = alloc(static_cast<size_t>(rec_layers_) *
+                           static_cast<size_t>(rec_state_span_) * sizeof(f32));
+    }
     logits_host_ = static_cast<f32 *>(host_alloc(static_cast<size_t>(n_vocab_) * 4));
     tok_scratch_.resize(static_cast<size_t>(C));
 
@@ -130,6 +155,13 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                             static_cast<size_t>(kv_dim_) * as);
     be_->fill0(vcache_, static_cast<size_t>(mc.n_layer) * static_cast<size_t>(kv_cap_) *
                             static_cast<size_t>(kv_dim_) * as);
+    if (model_.is_recurrent()) {
+        recurrent_reset();
+        const f64 rec_mb = static_cast<f64>(rec_layers_) *
+                           static_cast<f64>(conv_state_span_ + rec_state_span_) * 4.0 /
+                           (1024.0 * 1024.0);
+        KRK_INFO("recurrent state: %d layers, %.1f MiB f32", rec_layers_, rec_mb);
+    }
     be_->sync();
 
     const f64 load_ms = load_timer.ms();
@@ -160,7 +192,9 @@ void Engine::shutdown() {
     be_->sync();
     for (void **p : {&kcache_, &vcache_, &ws_x_, &ws_xn_, &ws_x2_, &ws_q_, &ws_k_,
                      &ws_v_, &ws_attn_, &ws_gate_, &ws_up_, &ws_logits_, &ws_router_,
-                     &ws_ffn_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_}) {
+                     &ws_ffn_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
+                     &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
+                     &conv_state_, &rec_state_}) {
         if (*p) {
             be_->release(*p);
             *p = nullptr;
@@ -204,6 +238,25 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         const LayerWeights &L = layers[static_cast<size_t>(l)];
 
         be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, n, n_embd_, mc.rms_eps);
+
+        if (L.gdn) {
+            // Recurrent layer: a short conv plus the delta rule replaces
+            // attention entirely, and there is nothing to append to the KV
+            // cache. The residual lands in ws_x_ before the FFN below.
+            gdn_forward(L, l, n);
+            be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps);
+            if (L.moe) {
+                moe_ffn(L, l, n);
+            } else {
+                be_->gemm(ws_gate_, ws_xn_, L.wgate.data, L.wgate.type, n_ff_, n_embd_, n);
+                be_->gemm(ws_up_, ws_xn_, L.wup.data, L.wup.type, n_ff_, n_embd_, n);
+                be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_);
+                be_->gemm(ws_x2_, ws_gate_, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n);
+                be_->add_inplace(ws_x_, ws_x2_, n * n_embd_);
+            }
+            continue;
+        }
+
         // q/k/v all read the attention-norm output and have no
         // dependency between them, so they ride one fused launch
         // on the decode row (backend falls back per-matrix for
@@ -211,14 +264,20 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         if (L.wq.type == L.wk.type && L.wk.type == L.wv.type) {
             void *qkv[3] = {ws_q_, ws_k_, ws_v_};
             const void *wqkv[3] = {L.wq.data, L.wk.data, L.wv.data};
-            const i64 nqkv[3] = {q_dim_, kv_dim_, kv_dim_};
+            const i64 nqkv[3] = {q_proj_, kv_dim_, kv_dim_};
             be_->gemm_group(qkv, ws_xn_, wqkv, L.wq.type,
                             nqkv, n_embd_, 3, n);
         } else {
-            be_->gemm(ws_q_, ws_xn_, L.wq.data, L.wq.type, q_dim_, n_embd_, n);
+            be_->gemm(ws_q_, ws_xn_, L.wq.data, L.wq.type, q_proj_, n_embd_, n);
             be_->gemm(ws_k_, ws_xn_, L.wk.data, L.wk.type, kv_dim_, n_embd_, n);
             be_->gemm(ws_v_, ws_xn_, L.wv.data, L.wv.type, kv_dim_, n_embd_, n);
         }
+
+        // Qwen3.5 interleaves each head's output gate into the query
+        // projection, so the packed rows have to be split before anything
+        // else touches them. The query half stays in place.
+        if (q_proj_ != q_dim_)
+            be_->qwen3_next_split(ws_q_, ws_agate_, ws_q_, n, mc.n_head, mc.head_dim);
 
         if (L.q_bias) be_->add_bias_rows(ws_q_, L.q_bias, q_dim_, n);
         if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, kv_dim_, n);
@@ -235,9 +294,10 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // the k/v rows never round-trip through global memory between
         // three launches. Gated on what the fused kernel cannot
         // express: qk_norm (which must run between the projections
-        // and the rotation) and multi-token rows (prefill).
+        // and the rotation), multi-token rows (prefill), and a packed
+        // output gate (which must multiply the result afterwards).
         // Unsupported backends and shapes keep the separate chain.
-        if (!(n == 1 && !mc.qk_norm &&
+        if (!(n == 1 && !mc.qk_norm && q_proj_ == q_dim_ &&
               be_->attn_fused_chain(ws_attn_, ws_q_, kcache_, vcache_,
                                       ws_k_, ws_v_, d,
                                       model_.inv_freq().data(),
@@ -247,6 +307,13 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                       mc.rope_frac);
             be_->kv_append(kcache_, vcache_, ws_k_, ws_v_, d);
             be_->attention(ws_attn_, ws_q_, kcache_, vcache_, d);
+        }
+
+        // Qwen3.5's output gate is a sigmoid applied to the attention result,
+        // not to the projection: gate it before wo.
+        if (q_proj_ != q_dim_) {
+            be_->sigmoid_act(ws_agate_, static_cast<i64>(n) * q_dim_);
+            be_->mul_act(ws_attn_, ws_agate_, static_cast<i64>(n) * q_dim_);
         }
 
         be_->gemm(ws_x2_, ws_attn_, L.wo.data, L.wo.type, n_embd_, q_dim_, n);
@@ -292,6 +359,21 @@ void Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
 bool Engine::kv_rollback(i64 pos) {
     if (pos < 0 || pos > kv_pos_) return false;
     if (pos == kv_pos_) return true;
+    if (model_.is_recurrent()) {
+        // The delta rule has no inverse. Rewinding the attention rows alone
+        // would leave the recurrent state describing tokens the caller is
+        // about to replace, so the honest options are a full rewind (the
+        // server's per-request isolation, after which the prompt is replayed
+        // and the state is rebuilt token by token) or refusing. A partial
+        // rewind is what speculative decoding needs, so it is refused there.
+        if (pos != 0) {
+            KRK_WARN("a recurrent model cannot rewind to position %lld — "
+                     "only a full rewind rebuilds the delta-rule state",
+                     static_cast<long long>(pos));
+            return false;
+        }
+        recurrent_reset();
+    }
     // If the shrink is large, clear the tail once so the cache never carries
     // stale keys from an unrelated context; a small shrink (the speculative
     // hot path) is pure pointer arithmetic. Every forward fully overwrites
@@ -325,11 +407,20 @@ void Engine::configure_expert_cache() {
         budget = static_cast<size_t>(cfg_.expert_cache_mb) * 1024u * 1024u;
     } else {
         const DeviceCaps &dc = be_->caps();
-        // Auto: keep a fraction of free device memory for experts; on the CPU
-        // (no VRAM accounting) allow a generous fixed share of host RAM.
+        // Auto: prefer the whole routed-expert set when it fits in a
+        // generous share of free memory. A partial budget is worse than
+        // useless at MoE scale — top-k routing touches every expert
+        // within a few dozen tokens, so a set that only partly fits
+        // churns (evict + free + alloc + re-upload) forever, which costs
+        // far more than the memory the cap saves. When the set does not
+        // fit, fall back to a generous share of free memory and let the
+        // cache page. On the CPU (no VRAM accounting) allow a generous
+        // fixed share of host RAM.
         budget = dc.vram_free > 0
-                     ? static_cast<size_t>(static_cast<f64>(dc.vram_free) * 0.4)
+                     ? static_cast<size_t>(static_cast<f64>(dc.vram_free) * 0.9)
                      : static_cast<size_t>(512) * 1024u * 1024u;
+        const size_t total = model_.total_expert_bytes();
+        if (total > 0 && total < budget) budget = total;
     }
 
     if (cfg_.expert_cache_slots > 0) {
@@ -338,15 +429,36 @@ void Engine::configure_expert_cache() {
             budget = one * static_cast<size_t>(cfg_.expert_cache_slots);
     }
 
-    model_.set_expert_budget(budget);
-    KRK_INFO("expert cache: budget %.1f MiB, %d experts x top-%d, %d layers, "
+    // The second tier is sized independently of the device budget: VRAM holds
+    // what is about to be used, the tier holds what was just used, and a
+    // demoted expert comes back as a DMA rather than a re-read of the mapping.
+    size_t l2 = 0;
+    if (cfg_.expert_l2_mb > 0)
+        l2 = static_cast<size_t>(cfg_.expert_l2_mb) * 1024u * 1024u;
+
+    model_.set_expert_budget(budget, l2);
+    char l2_note[64] = "";
+    if (l2 > 0)
+        std::snprintf(l2_note, sizeof(l2_note), " + %.0f MiB L2",
+                      static_cast<f64>(l2) / (1024.0 * 1024.0));
+    KRK_INFO("expert cache: budget %.1f MiB%s, %d experts x top-%d, %d layers, "
              "policy LFU+aging (pin at %u hits, decay every %u)",
-             static_cast<f64>(budget) / (1024.0 * 1024.0), mc.n_expert,
+             static_cast<f64>(budget) / (1024.0 * 1024.0), l2_note, mc.n_expert,
              mc.n_expert_used, mc.n_layer, ExpertCache::kPinThreshold,
              ExpertCache::kPinDecay);
 }
 
 bool Engine::load_draft(const std::string &path, std::string *err) {
+    if (model_.is_recurrent()) {
+        // Speculation verifies a block and then rewinds to the accepted
+        // prefix; a delta-rule state has no inverse, so the rewind would leave
+        // the state describing rejected tokens. Refuse rather than decode
+        // something plausible and wrong.
+        if (err)
+            *err = "speculative decoding needs a partial KV rewind, which a "
+                   "recurrent (gated delta net) model cannot do";
+        return false;
+    }
     if (!be_) {
         if (err) *err = "the engine must be initialised before the draft model";
         return false;
@@ -360,6 +472,7 @@ bool Engine::load_draft(const std::string &path, std::string *err) {
     dcfg.model_path = path;
     dcfg.warmup = false;
     dcfg.expert_cache_mb = cfg_.expert_cache_mb;
+    dcfg.expert_l2_mb = cfg_.expert_l2_mb;
     if (!draft_->init(be_, dcfg, err)) {
         delete draft_;
         draft_ = nullptr;
@@ -395,6 +508,77 @@ void Engine::unload_draft() {
     draft_proposed_ = 0;
     draft_accepted_ = 0;
     spec_steps_ = 0;
+}
+
+void Engine::recurrent_reset() {
+    if (!conv_state_ || !rec_state_) return;
+    be_->fill0(conv_state_, static_cast<size_t>(rec_layers_) *
+                                  static_cast<size_t>(conv_state_span_) * sizeof(f32));
+    be_->fill0(rec_state_, static_cast<size_t>(rec_layers_) *
+                                 static_cast<size_t>(rec_state_span_) * sizeof(f32));
+}
+
+void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
+    const ModelConfig &mc = model_.cfg();
+    const size_t as = be_->act_size();
+    const i64 kdim = model_.key_dim();
+    const i64 cdim = conv_dim_;
+    const i64 vdim = value_dim_;
+    const i32 ksize = mc.ssm_d_conv;
+    const i32 ri = model_.recurrent_index(l);
+
+    // 1. One projection for [q | k | v] and one for the z gate. Both read the
+    //    same attention-norm output, so they are independent.
+    be_->gemm(ws_qkv_, ws_xn_, L.wqkv.data, L.wqkv.type, cdim, n_embd_, n);
+    be_->gemm(ws_z_, ws_xn_, L.wqkv_gate.data, L.wqkv_gate.type, vdim, n_embd_, n);
+
+    // 2. The causal short convolution, carrying the previous ksize-1 steps, and
+    //    the SiLU that follows it. After this ws_qkv_ is the post-conv block.
+    f32 *cstate = static_cast<f32 *>(conv_state_) +
+                  static_cast<size_t>(ri) * static_cast<size_t>(conv_state_span_);
+    be_->conv1d_silu(ws_qkv_, ws_qkv_, cstate, L.ssm_conv1d.data, L.ssm_conv1d.type,
+                     n, cdim, ksize);
+
+    // 3. The post-conv buffer splits into q | k | v. They are regions of one
+    //    fused row, so every op below works on a row stride of cdim, not on a
+    //    packed [n_tok, ...] block. q and k are L2-normalized per head (the
+    //    delta rule is scale-free) and q picks up 1/sqrt(state).
+    char *qbase = act_at(ws_qkv_, as, 0);
+    char *kbase = act_at(ws_qkv_, as, kdim);
+    const char *vbase = act_at(ws_qkv_, as, 2 * kdim);
+    be_->l2norm(qbase, qbase, n, mc.ssm_n_group, mc.ssm_d_state, cdim, 1e-6f);
+    be_->l2norm(kbase, kbase, n, mc.ssm_n_group, mc.ssm_d_state, cdim, 1e-6f);
+    be_->scale_act(qbase, 1.0f / std::sqrt(static_cast<f64>(mc.ssm_d_state)), n, kdim,
+                   cdim);
+
+    // 4. The per-head gate and forget. A_log arrives already as -exp(A_log), so
+    //    the decay is exp(-exp(A_log) * softplus(alpha + dt_bias)).
+    be_->gemm(ws_ssm_, ws_xn_, L.ssm_alpha.data, L.ssm_alpha.type, mc.ssm_dt_rank,
+              n_embd_, n);
+    be_->add_bias_cols(ws_ssm_, L.ssm_dt, n, mc.ssm_dt_rank);
+    be_->softplus_act(ws_ssm_, static_cast<i64>(n) * mc.ssm_dt_rank);
+    be_->scale_cols(ws_ssm_, L.ssm_a, n, mc.ssm_dt_rank);
+
+    be_->gemm(ws_beta_, ws_xn_, L.ssm_beta.data, L.ssm_beta.type, mc.ssm_dt_rank,
+              n_embd_, n);
+    be_->sigmoid_act(ws_beta_, static_cast<i64>(n) * mc.ssm_dt_rank);
+
+    // 5. The delta rule, in order, carrying this layer's state to the next token.
+    f32 *state = static_cast<f32 *>(rec_state_) +
+                 static_cast<size_t>(ri) * static_cast<size_t>(rec_state_span_);
+    be_->delta_rule(ws_h_, state, qbase, kbase, vbase, ws_ssm_, ws_beta_, n,
+                    mc.ssm_n_group, mc.ssm_dt_rank, mc.ssm_d_state, mc.ssm_d_state,
+                    cdim);
+
+    // 6. Gated normalization: a plain RMSNorm per head (its weight is stored
+    //    verbatim, not zero-centred) then the silu(z) gate.
+    be_->rmsnorm(ws_h_, ws_h_, L.ssm_norm, static_cast<i64>(n) * mc.ssm_dt_rank,
+                 mc.ssm_d_state, mc.rms_eps);
+    be_->silu_mul(ws_h_, ws_z_, ws_h_, static_cast<i64>(n) * vdim);
+
+    // 7. Output projection and the residual.
+    be_->gemm(ws_x2_, ws_h_, L.ssm_out.data, L.ssm_out.type, n_embd_, vdim, n);
+    be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
 }
 
 void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
@@ -507,6 +691,14 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         be_->gemm(ws_up_, ws_xn_, L.shexp_up.data, L.shexp_up.type, ff_sh, n_embd_, n);
         be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * ff_sh);
         be_->gemm(ws_x2_, ws_gate_, L.shexp_down.data, L.shexp_down.type, n_embd_, ff_sh, n);
+        // Qwen3.5 scales the shared expert by a per-token sigmoid of a small
+        // vector before folding it in; the Qwen2/Qwen3 schema has no such gate.
+        if (L.shexp_inp_gate.present()) {
+            be_->gemm(ws_ssm_, ws_xn_, L.shexp_inp_gate.data, L.shexp_inp_gate.type,
+                      1, n_embd_, n);
+            be_->sigmoid_act(ws_ssm_, n);
+            be_->scale_rows(ws_x2_, ws_ssm_, n, n_embd_);
+        }
         be_->add_inplace(ws_ffn_, ws_x2_, n * n_embd_);
     }
 
@@ -759,6 +951,18 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     if (!be_ || n_vocab_ <= 0) return false;
     *res = GenerateResult{};
 
+    // A generation always prefills from position 0, so it *is* a new sequence.
+    // The prefill overwrites the KV rows it touches, but the cursor is a
+    // high-water mark: left alone it would keep pointing past this run's
+    // prompt, and attention would read the previous run's keys and values. A
+    // recurrent model has the sharper version of the same problem — its
+    // delta-rule states and conv windows cannot be reconstructed by a prefill
+    // at all, so they would carry the previous run's history into this one.
+    // (The server's per-request kv_rollback(0) agrees; this just makes the
+    // primitive correct on its own.)
+    kv_pos_ = 0;
+    if (model_.is_recurrent()) recurrent_reset();
+
     // ---- tokenize ---------------------------------------------------------
     std::vector<i32> ids;
     if (tok_.encode(p.prompt, ids, true) < 0) return false;
@@ -776,7 +980,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     // Greedy-only fast path: with a draft loaded and argmax sampling requested,
     // speculative decoding produces bit-identical output to the plain loop, so
     // there is nothing to choose between them — take the faster one.
-    if (draft_ && p.sampler.greedy) {
+    if (draft_ && p.sampler.greedy && !model_.is_recurrent()) {
         f64 prefill_ms = 0, decode_ms = 0;
         const bool ok =
             generate_speculative(p, res, ids, &prefill_ms, &decode_ms);

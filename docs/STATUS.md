@@ -37,7 +37,7 @@ WMMA**).
 | `include/krk/json.hpp`, `src/json.cpp` | JSON value tree; recursive-descent parser (`\uXXXX` incl. surrogate pairs), compact writer with RFC 8259 escaping and integer-preserving number output. Rejects leading zeros, trailing commas, trailing garbage, bad literals, unterminated strings. |
 | `include/krk/http.hpp`, `src/http.cpp` | HTTP/1.1: bind/listen (winsock2 or POSIX), request-line + header + `Content-Length` body parsing, buffered responses, chunked `text/event-stream` framing (`http_sse_begin/event/end`), percent-decoding. Thread-per-connection, 64 KiB header / 8 MiB body caps. |
 | `include/krk/server.hpp`, `src/server.cpp` | `OpenAiService`: the four endpoints, ChatML rendering of `messages`, sampling-parameter mapping, per-request `kv_rollback(0)` isolation, generation serialized behind an injected mutex. Shared by the binary and the tests so both exercise the same code. |
-| `src/main_server.cpp` | `kraken-server`: arg parsing mirroring the CLI (`--model --host --port --ctx --chunk --device --expert-cache-mb/-slots --draft --draft-tokens --cpu -v`), backend/engine init with CPU fallback, banner, accept loop. |
+| `src/main_server.cpp` | `kraken-server`: arg parsing mirroring the CLI (`--model --host --port --ctx --chunk --device --expert-cache-mb/-slots --expert-l2-mb --draft --draft-tokens --cpu -v`), backend/engine init with CPU fallback, banner, accept loop. |
 | build wiring | `CMakeLists.txt` (core sources + `kraken-server` target + `ws2_32`), `scripts/build_linux.sh` (CPU and HIP paths), `scripts/build_windows.ps1` (CPU and HIP paths). |
 
 ### Behaviour
@@ -96,8 +96,10 @@ WMMA**).
   512 MiB expert cache). Use `--ctx 256/512` for MoE runs on small machines.
 * Synthetic MoE coverage in the suite remains the fast oracle for behaviour:
   schema/laziness, a single-expert layer reproducing its dense twin exactly,
-  grouped-prefill vs token-at-a-time routing parity, and the LFU+aging+pin
-  residency policy under a one-slot cache.
+  grouped-prefill vs token-at-a-time routing parity, the LFU+aging+pin
+  residency policy under a one-slot cache, and the pinned host L2 tier
+  (demote-on-evict, promote-on-request, tier recycling, and bit-identical
+  generation with and without the tier).
 
 ---
 

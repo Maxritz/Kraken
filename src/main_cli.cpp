@@ -28,6 +28,7 @@ struct Args {
     int threads = 0;
     int expert_cache_mb = 0;    // MoE expert residency budget (MiB), 0 = auto
     int expert_cache_slots = 0; // MoE resident (layer, expert) slot cap, 0 = auto
+    int expert_l2_mb = 0;       // MoE expert second tier in host RAM (MiB), 0 = off
     int draft_tokens = 4;       // speculative decoding window
     bool cpu = false;
     bool greedy = false;
@@ -65,6 +66,7 @@ void usage() {
         "  --device N            HIP device index (default 0)\n"
         "  --expert-cache-mb N   MoE expert residency budget in MiB (0 = auto)\n"
         "  --expert-cache-slots N  cap resident (layer, expert) slots (0 = auto)\n"
+        "  --expert-l2-mb N       pinned host-RAM tier for evicted experts (MiB, 0 = off)\n"
         "  --draft MODEL         draft model for greedy speculative decoding\n"
         "  --draft-tokens N      speculation window (default 4)\n"
         "  --info                print model and device info, then exit\n"
@@ -105,6 +107,8 @@ bool parse(int argc, char **argv, Args *a) {
             a->expert_cache_mb = std::atoi(next("--expert-cache-mb"));
         else if (f == "--expert-cache-slots")
             a->expert_cache_slots = std::atoi(next("--expert-cache-slots"));
+        else if (f == "--expert-l2-mb")
+            a->expert_l2_mb = std::atoi(next("--expert-l2-mb"));
         else if (f == "--greedy") a->greedy = true;
         else if (f == "--chat") a->chat = true;
         else if (f == "--cpu") a->cpu = true;
@@ -229,6 +233,13 @@ int run_bench(Engine &engine, const Args &a) {
                     acq > 0 ? 100.0 * static_cast<f64>(hits) / static_cast<f64>(acq)
                             : 0.0,
                     ec.pinned_slots(), ec.resident_slots());
+        if (ec.host_budget_bytes() > 0)
+            std::printf("expert L2      %.0f MiB pinned host, %zu expert(s) demoted, "
+                        "%llu promoted, %.0f MiB held\n",
+                        static_cast<f64>(ec.host_budget_bytes()) / (1024.0 * 1024.0),
+                        ec.host_slots(),
+                        static_cast<unsigned long long>(ec.promotions()),
+                        static_cast<f64>(ec.host_resident_bytes()) / (1024.0 * 1024.0));
     }
     return 0;
 }
@@ -261,6 +272,7 @@ int main(int argc, char **argv) {
     cfg.seed = a.seed;
     cfg.expert_cache_mb = a.expert_cache_mb;
     cfg.expert_cache_slots = a.expert_cache_slots;
+    cfg.expert_l2_mb = a.expert_l2_mb;
 
     Engine engine;
     if (!engine.init(be, cfg, &err)) {
@@ -305,6 +317,11 @@ int main(int argc, char **argv) {
                         static_cast<f64>(ec.budget_bytes()) / (1024.0 * 1024.0),
                         ec.resident_slots(), ec.capacity_slots(),
                         ExpertCache::kPinThreshold);
+            if (ec.host_budget_bytes() > 0)
+                std::printf("expert L2      %.0f MiB pinned host tier "
+                            "(evicted experts demote, not drop)\n",
+                            static_cast<f64>(ec.host_budget_bytes()) /
+                                (1024.0 * 1024.0));
         }
         std::printf("weights        %.2f GiB on device\n",
                     static_cast<f64>(engine.model().weight_bytes()) /

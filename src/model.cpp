@@ -27,7 +27,22 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
     auto key = [&a](const char *suffix) { return a + suffix; };
 
-    cfg_.n_layer = static_cast<i32>(gguf_.get_i64(key(".block_count"), 0));
+    // block_count counts every block in the file, which includes any
+    // next-token-prediction (MTP) blocks. Those are extra prediction heads
+    // appended to the stack, not transformer layers: they carry attention and a
+    // FFN but no ssm tensors, so loading them as layers fails on the missing
+    // delta-net weights. The converter records how many in
+    // `<arch>.nextn_predict_layers` (an array, one entry per head).
+    const i32 block_count = static_cast<i32>(gguf_.get_i64(key(".block_count"), 0));
+    i32 nextn = 0;
+    if (const std::vector<i32> *nl = gguf_.get_i32_array(key(".nextn_predict_layers"))) {
+        if (!nl->empty()) nextn = (*nl)[0];
+    } else {
+        nextn = static_cast<i32>(gguf_.get_i64(key(".nextn_predict_layers"), 0));
+    }
+    if (nextn < 0 || nextn > block_count) nextn = 0;
+    cfg_.n_layer_nextn = nextn;
+    cfg_.n_layer = block_count - nextn;
     cfg_.n_embd = static_cast<i32>(gguf_.get_i64(key(".embedding_length"), 0));
     cfg_.n_ff = static_cast<i32>(gguf_.get_i64(key(".feed_forward_length"), 0));
     cfg_.n_head = static_cast<i32>(gguf_.get_i64(key(".attention.head_count"), 0));
@@ -76,6 +91,68 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         cfg_.rms_eps = static_cast<f32>(
             gguf_.get_f64(key(".attention.layer_norm_rms_epsilon"), 1e-6));
         cfg_.rope_base = 10000.0f;
+    }
+
+    // ---- gated delta net geometry (Qwen3.5 / Qwen3-Next) -----------------
+    // These archs interleave linear-attention ("recurrent") layers with real
+    // attention every `full_attention_interval` layers. The ssm.* keys carry
+    // the recurrent block's shape; the tensor schema is validated per layer
+    // further down, where the split is actually known.
+    cfg_.recurrent = (a == "qwen35" || a == "qwen35moe");
+    if (cfg_.recurrent) {
+        cfg_.full_attention_interval = static_cast<i32>(
+            gguf_.get_i64(key(".full_attention_interval"), 4));
+        if (cfg_.full_attention_interval <= 0) cfg_.full_attention_interval = 4;
+        cfg_.ssm_d_state = static_cast<i32>(gguf_.get_i64(key(".ssm.state_size"), 0));
+        cfg_.ssm_dt_rank = static_cast<i32>(gguf_.get_i64(key(".ssm.time_step_rank"), 0));
+        cfg_.ssm_n_group = static_cast<i32>(gguf_.get_i64(key(".ssm.group_count"), 0));
+        cfg_.ssm_d_conv = static_cast<i32>(gguf_.get_i64(key(".ssm.conv_kernel"), 4));
+        const i32 ssm_inner =
+            static_cast<i32>(gguf_.get_i64(key(".ssm.inner_size"), 0));
+        if (cfg_.ssm_d_state <= 0 || cfg_.ssm_dt_rank <= 0 || cfg_.ssm_n_group <= 0) {
+            if (err)
+                *err = "arch '" + a +
+                       "' is a gated delta net but its ssm.* geometry is missing";
+            return false;
+        }
+        cfg_.ssm_key_dim = cfg_.ssm_n_group * cfg_.ssm_d_state;
+        cfg_.ssm_value_dim = ssm_inner > 0 ? ssm_inner
+                                           : cfg_.ssm_dt_rank * cfg_.ssm_d_state;
+        cfg_.ssm_conv_dim = cfg_.ssm_key_dim * 2 + cfg_.ssm_value_dim;
+        if (cfg_.ssm_value_dim != cfg_.ssm_dt_rank * cfg_.ssm_d_state) {
+            if (err)
+                *err = "arch '" + a + "': ssm.inner_size (" +
+                       std::to_string(cfg_.ssm_value_dim) +
+                       ") disagrees with time_step_rank * state_size (" +
+                       std::to_string(cfg_.ssm_dt_rank * cfg_.ssm_d_state) + ")";
+            return false;
+        }
+        if (cfg_.ssm_d_conv <= 0 || cfg_.ssm_d_conv > 16) {
+            if (err)
+                *err = "arch '" + a + "': ssm.conv_kernel " +
+                       std::to_string(cfg_.ssm_d_conv) + " is out of range";
+            return false;
+        }
+        // A recurrent model needs a backend that can carry its state; refusing
+        // here is much better than decoding garbage on one that cannot.
+        if (!be.gdn_supported()) {
+            if (err)
+                *err = "arch '" + a +
+                       "' needs the gated delta net kernels, which this backend "
+                       "does not implement";
+            return false;
+        }
+        // Partial rotary: the converter records how many dims are rotated.
+        const i32 rope_dim =
+            static_cast<i32>(gguf_.get_i64(key(".rope.dimension_count"), 0));
+        cfg_.rope_dim = rope_dim > 0 ? std::min(rope_dim, cfg_.head_dim) : 0;
+        if (cfg_.rope_dim > 0 && cfg_.head_dim > 0)
+            cfg_.rope_frac = static_cast<f32>(cfg_.rope_dim) /
+                             static_cast<f32>(cfg_.head_dim);
+        if (const std::vector<i32> *sec = gguf_.get_i32_array(key(".rope.dimension_sections"))) {
+            for (size_t i = 0; i < sec->size() && i < 4; i++)
+                cfg_.rope_sections[i] = (*sec)[i];
+        }
     }
 
     if (cfg_.n_layer <= 0 || cfg_.n_embd <= 0 || cfg_.n_head <= 0) {
@@ -231,15 +308,50 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
         L.attn_norm = upload_f32(blk_key("blk.%d.attn_norm.weight", l));
         L.ffn_norm = upload_f32(blk_key("blk.%d.ffn_norm.weight", l));
+        // Qwen3.5 renamed the post-attention norm; when the classic key is
+        // absent this is the same role (norm before the FFN), so accept either
+        // rather than rejecting a checkpoint that spells it differently.
+        if (!L.ffn_norm)
+            L.ffn_norm = upload_f32(blk_key("blk.%d.post_attention_norm.weight", l));
         if (!L.attn_norm || !L.ffn_norm) {
             if (err) *err = "layer " + std::to_string(l) + " is missing its norm weights";
             return false;
         }
 
-        L.wq = need(blk_key("blk.%d.attn_q.weight", l));
-        L.wk = need(blk_key("blk.%d.attn_k.weight", l));
-        L.wv = need(blk_key("blk.%d.attn_v.weight", l));
-        L.wo = need(blk_key("blk.%d.attn_output.weight", l));
+        // ---- which kind of layer is this? ---------------------------------
+        if (cfg_.recurrent) {
+            // An explicit layer_types array wins. Otherwise the converter's
+            // default is "every full_attention_interval'th layer attends",
+            // counted from 1 — layers 3, 7, 11... for an interval of 4. That
+            // makes the *last* layer attend whenever the depth is a multiple of
+            // the interval, which is why MTP blocks must be excluded above
+            // rather than special-cased here.
+            L.gdn = true;
+            if (const std::vector<i32> *rec =
+                    gguf_.get_i32_array(key(".attention.recurrent_layers"))) {
+                if (l < static_cast<i32>(rec->size()))
+                    L.gdn = (*rec)[static_cast<size_t>(l)] != 0;
+            } else {
+                L.gdn = ((l + 1) % cfg_.full_attention_interval) != 0;
+            }
+        }
+
+        if (L.gdn) {
+            L.wqkv = need(blk_key("blk.%d.attn_qkv.weight", l));
+            L.wqkv_gate = need(blk_key("blk.%d.attn_gate.weight", l));
+            L.ssm_conv1d = need(blk_key("blk.%d.ssm_conv1d.weight", l));
+            L.ssm_out = need(blk_key("blk.%d.ssm_out.weight", l));
+            L.ssm_dt = upload_f32(blk_key("blk.%d.ssm_dt.bias", l));
+            L.ssm_a = upload_f32(blk_key("blk.%d.ssm_a", l));
+            L.ssm_alpha = need(blk_key("blk.%d.ssm_alpha.weight", l));
+            L.ssm_beta = need(blk_key("blk.%d.ssm_beta.weight", l));
+            L.ssm_norm = upload_f32(blk_key("blk.%d.ssm_norm.weight", l));
+        } else {
+            L.wq = need(blk_key("blk.%d.attn_q.weight", l));
+            L.wk = need(blk_key("blk.%d.attn_k.weight", l));
+            L.wv = need(blk_key("blk.%d.attn_v.weight", l));
+            L.wo = need(blk_key("blk.%d.attn_output.weight", l));
+        }
 
         // A layer is MoE when it carries routed-expert tensors. This is decided
         // per layer: hybrid stacks (dense early layers, MoE later ones) load
@@ -288,6 +400,10 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 upload_weight(blk_key("blk.%d.ffn_up_shexp.weight", l), true, &e);
             L.shexp_down =
                 upload_weight(blk_key("blk.%d.ffn_down_shexp.weight", l), true, &e);
+            // Qwen3.5 gates the shared expert with a per-token scalar built
+            // from a 1-D row; the Qwen2/Qwen3 schema has no such vector.
+            L.shexp_inp_gate =
+                upload_weight(blk_key("blk.%d.ffn_gate_inp_shexp.weight", l), true, &e);
         }
         if (!e.empty()) {
             if (err) *err = e;
@@ -295,12 +411,53 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         }
 
         // geometric sanity: the tensor schema must match the metadata
-        if (L.wq.n_out != q_dim || L.wk.n_out != kv_dim || L.wv.n_out != kv_dim ||
-            L.wo.n_in != q_dim) {
-            if (err)
-                *err = "layer " + std::to_string(l) +
-                       " attention tensors disagree with the declared head geometry";
-            return false;
+        if (L.gdn) {
+            // The recurrent block has no head geometry at all: one fused
+            // [q|k|v] projection and one output projection, both sized by the
+            // ssm.* keys.
+            if (L.wqkv.n_out != cfg_.ssm_conv_dim || L.wqkv.n_in != cfg_.n_embd) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " attn_qkv disagrees with the declared ssm geometry";
+                return false;
+            }
+            if (L.wqkv_gate.n_out != cfg_.ssm_value_dim) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " attn_gate disagrees with ssm.inner_size";
+                return false;
+            }
+            if (L.ssm_out.n_in != cfg_.ssm_value_dim || L.ssm_out.n_out != cfg_.n_embd) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " ssm_out disagrees with ssm.inner_size/embedding_length";
+                return false;
+            }
+            if (L.ssm_conv1d.n_in != cfg_.ssm_d_conv ||
+                L.ssm_conv1d.n_out != cfg_.ssm_conv_dim) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " ssm_conv1d disagrees with ssm.conv_kernel/inner_size";
+                return false;
+            }
+            if (!L.ssm_dt || !L.ssm_a || !L.ssm_norm || !L.ssm_alpha.present() ||
+                !L.ssm_beta.present()) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " is missing its ssm state parameters";
+                return false;
+            }
+        } else {
+            // Qwen3.5's attending layers pack a per-head output gate into the
+            // query projection, so its row count is twice the head width.
+            const i64 expect_q = (a == "qwen35" || a == "qwen35moe") ? 2 * q_dim : q_dim;
+            if (L.wq.n_out != expect_q || L.wk.n_out != kv_dim ||
+                L.wv.n_out != kv_dim || L.wo.n_in != q_dim) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " attention tensors disagree with the declared head geometry";
+                return false;
+            }
         }
         if (!L.moe && (L.wgate.n_out != cfg_.n_ff || L.wdown.n_in != cfg_.n_ff)) {
             if (err)
@@ -341,16 +498,27 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     }
 
     // ---- rotary inverse frequencies (host) --------------------------------
-    const i64 half = cfg_.head_dim / 2;
+    // Partial rotary: Qwen3.5 rotates only the first `rope_dim` dims of each
+    // head and leaves the tail untouched, so the table is rope_dim/2 long and
+    // the engine passes the fraction to the rotation op.
+    const i64 rope_dim = cfg_.rope_dim > 0 ? cfg_.rope_dim : cfg_.head_dim;
+    const i64 half = rope_dim / 2;
     inv_freq_.resize(static_cast<size_t>(half));
     for (i64 i = 0; i < half; i++) {
-        const f32 exponent = static_cast<f32>(2 * i) / static_cast<f32>(cfg_.head_dim);
+        const f32 exponent = static_cast<f32>(2 * i) / static_cast<f32>(rope_dim);
         inv_freq_[static_cast<size_t>(i)] = std::pow(cfg_.rope_base, -exponent);
     }
 
     KRK_INFO("loaded %s (%s): %d layers, %d embd, %d/%d heads, hd=%d, ff=%d, vocab=%d",
              cfg_.name.c_str(), cfg_.arch.c_str(), cfg_.n_layer, cfg_.n_embd,
              cfg_.n_head, cfg_.n_head_kv, cfg_.head_dim, cfg_.n_ff, cfg_.n_vocab);
+    if (cfg_.recurrent) {
+        KRK_INFO("gated delta net: %d recurrent layers of %d (every %d attends), "
+                 "ssm %d key x %d value heads, state %d, conv kernel %d, rope %d/%d",
+                 recurrent_layers(), cfg_.n_layer, cfg_.full_attention_interval,
+                 cfg_.ssm_n_group, cfg_.ssm_dt_rank, cfg_.ssm_d_state,
+                 cfg_.ssm_d_conv, rope_dim, cfg_.head_dim);
+    }
     return true;
 }
 
@@ -366,9 +534,13 @@ void Model::unload() {
         if (L.v_bias) be_->release(L.v_bias);
         if (L.q_norm) be_->release(L.q_norm);
         if (L.k_norm) be_->release(L.k_norm);
+        for (f32 *f : {L.ssm_dt, L.ssm_a, L.ssm_norm})
+            if (f) be_->release(f);
         for (QuantTensor *q : {&L.wq, &L.wk, &L.wv, &L.wo, &L.wgate, &L.wup,
                                &L.wdown, &L.router, &L.shexp_gate, &L.shexp_up,
-                               &L.shexp_down})
+                               &L.shexp_down, &L.shexp_inp_gate, &L.wqkv,
+                               &L.wqkv_gate, &L.ssm_conv1d, &L.ssm_out,
+                               &L.ssm_alpha, &L.ssm_beta})
             if (q->present()) be_->release(q->data);
     }
     layers_.clear();

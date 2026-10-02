@@ -5,12 +5,15 @@
 //  an MoE model: Qwen3-235B-A22B carries ~235B parameters but only ~22B are
 //  touched per token. Uploading every expert at load time would demand the whole
 //  model resident and defeat the architecture.
-//
 //  So experts are never eagerly loaded. The loader keeps only the GGUF mapping;
 //  the router decides per token which experts run, and ExpertCache materializes
-//  exactly those three matrices on demand into a byte-budgeted residency set.
+  ////  exactly those three matrices on demand into a byte-budgeted residency set.
 //  Evicted slots are released, so a machine with far less memory than the model
-//  still decodes — just with more reload traffic.
+  ////  still decodes — just with more reload traffic. The engine sizes the default
+  ////  budget to keep the *whole* routed set resident whenever it fits: top-k
+  ////  routing touches every expert within a few dozen tokens, so a set that only
+  ////  partly fits churns (evict + free + alloc + re-upload) forever, which costs
+  ////  far more than the memory the cap saves.
 //
 //  The residency policy is LFU with aging, not LRU. Expert popularity is
 //  extremely skewed and roughly stable across a conversation: a handful of
@@ -28,6 +31,22 @@
 //  A victim is chosen by: unpinned first, then the lowest counter, then the
 //  oldest load. Guarantee: if at least one slot can hold the request, a pinned
 //  expert is never evicted; and the cache always makes progress (see acquire).
+//
+//  --- the second tier ---------------------------------------------------------
+//  Dropping a victim back to the GGUF mapping is the expensive part: the next
+//  request for it pays a fault storm and a re-read of a file, thousands of
+//  times larger than the weights. So a victim is *demoted* instead — copied to
+//  page-locked host memory and kept there under its own byte budget. The next
+//  request for that expert promotes it back into VRAM with a DMA instead of a
+//  reload, and the LFU counter, the pin and the load order all survive the
+//  round trip: a demoted expert is still the same expert. This is the shape
+//  the two-tier VRAM+RAM caches use, and it is where their measured ~1.4x
+//  decode speedup over a VRAM-only cache comes from.
+//
+//  The tiers differ in one deliberate way: host copies ignore pins. A pin is a
+//  promise about VRAM residency, and a host copy is a cache of a cache — losing
+//  one costs a future DMA, never correctness — so the tier never lets a stale
+//  pin keep a slot alive that VRAM traffic has moved on from.
 //
 //  Pointers returned by acquire() stay valid until the next acquire() call.
 // ============================================================================
@@ -82,17 +101,23 @@ struct ResidentExpert {
 
 class ExpertCache {
 public:
-    // Counters reaching this value pin a slot; every PIN_DECAY acquires all
-    // counters are halved, so a pin must be continuously re-earned.
+    // Counters reaching this value pin a slot; every decay window
+    // cools all counters, so a pin must be continuously re-earned.
+    // The window is kPinDecay acquires per resident slot (see
+    // decay_period): a fixed 64-acquire window would cool every
+    // counter faster than any single expert is re-selected once a
+    // model has hundreds of slots, and nothing could ever pin.
     static constexpr u32 kPinThreshold = 24;
     static constexpr u32 kPinDecay = 64;
     // Per-decay subtraction, applied when a counter exceeds it (keeps small
     // counts meaningful instead of driving everything to the same floor).
     static constexpr u32 kPinDecayStep = 8;
 
-    // budget_bytes is a soft cap on resident expert memory. At least one slot is
-    // always allowed, even if a single expert exceeds the budget.
-    void configure(Backend *be, size_t budget_bytes);
+    // budget_bytes is a soft cap on device-resident expert memory. At least one
+    // slot is always allowed, even if a single expert exceeds the budget.
+    // host_budget_bytes caps the second tier; 0 (the default) disables it and
+    // evicted experts are dropped to the mapping exactly as before.
+    void configure(Backend *be, size_t budget_bytes, size_t host_budget_bytes = 0);
     void clear();
 
     // Returns the resident matrices for (layer, expert), loading on a miss.
@@ -102,12 +127,26 @@ public:
 
     size_t budget_bytes() const { return budget_; }
     size_t resident_bytes() const { return bytes_; }
-    size_t resident_slots() const { return slots_.size(); }
+    // Device-resident slots, i.e. the ones whose weights are in VRAM right now.
+    size_t resident_slots() const { return vram_slots_; }
     size_t capacity_slots() const { return capacity_; }
+    // Second tier.
+    size_t host_budget_bytes() const { return host_budget_; }
+    size_t host_resident_bytes() const { return host_bytes_; }
+    size_t host_slots() const;
+    // Every slot the cache is tracking, in both tiers.
+    size_t tracked_slots() const { return slots_.size(); }
     u64 loads() const { return loads_; }
     u64 evictions() const { return evictions_; }
     u64 hits() const { return hits_; }
-    u64 acquires() const { return acquires_; }
+    // Acquires served by promoting out of the host tier — a DMA instead of a
+    // reload of the mapping. The load itself is not repeated, so this is
+    // reported apart from hits() and loads().
+    u64 host_hits() const { return host_hits_; }
+    u64 demotions() const { return demotions_; }
+    u64 promotions() const { return promotions_; }
+    // Lifetime acquire count (hits + loads) since the last clear().
+    u64 acquires() const { return total_acquires_; }
     u64 decay_events() const { return decays_; }
     size_t pinned_slots() const;
     // Current LFU counter of one slot, or 0 when it is not resident. Because a
@@ -119,27 +158,75 @@ private:
     struct Slot {
         i32 layer = -1;
         i32 expert = -1;
-        ResidentExpert m;
-        size_t bytes = 0;
+        ResidentExpert m; // device copy
+        ResidentExpert h; // host (L2) copy
+        size_t bytes = 0;      // device footprint of this expert
+        size_t host_bytes = 0; // host footprint, nonzero only while in the tier
+        // Per-tensor slice size (gate, up, down). A property of the source
+        // tensors, so it outlives residency and is what a demote/promote sizes
+        // its copies from.
+        size_t slice[3] = {};
         u32 count = 0;      // LFU counter, decayed
         u64 seq = 0;        // load order, the tie-break for victims
         bool pinned = false;
+        // A slot lives in exactly one tier at a time, so this is a promotion or
+        // demotion rather than a second copy.
+        bool in_vram() const { return m.gate.present(); }
+        bool in_host() const { return h.gate.present(); }
     };
 
+    // One acquire on a resident slot: counters earn pins, pins are never free.
+    void touch(Slot &s);
+    // Frees the device copy. Leaves the footprint, counter and load order in
+    // place — a slot that is only in the host tier still knows what it is.
     void drop(Slot &s);
+    void drop_host(Slot &s);
+    // Device -> host tier when the tier has room, else a full drop.
+    void retire(Slot &s, u64 keep_host_key);
+    // Copies the device weights into the tier and frees them there. False when
+    // the tier cannot take them (budget, or a failed pinned allocation).
+    bool demote_to_host(Slot &s, u64 keep_host_key);
+    // Host -> device. Makes VRAM room first, so it can evict like any miss.
+    bool promote_to_vram(Slot &s);
+    // Evicts until one more device slot fits. Over-resides by one rather than
+    // stalling when every resident slot is pinned. keep_host_key names a slot
+    // mid-promotion whose host copy must survive the evictions this triggers.
+    void make_vram_room(u64 keep_host_key);
+    // Evicts host copies until need bytes fit. Pins do not apply here.
+    void make_host_room(size_t need, u64 keep_host_key);
+    // Drops a slot from the map once it lives in neither tier.
+    void forget_if_dead(std::unordered_map<u64, Slot>::iterator it);
     // Halves counters past the step and releases pins that no longer qualify.
     void decay();
-    // Picks the slot to sacrifice: unpinned, then rarest, then oldest.
-    u64 pick_victim();
+    // Acquires per decay window. Scales with the slot count so a pin
+    // stays earnable at any model size: one window per ~kPinDecay
+    // full sweeps of the resident set.
+    u64 decay_period() const {
+        const u64 slots = capacity_ > 0 ? static_cast<u64>(capacity_) : 1ULL;
+        return static_cast<u64>(kPinDecay) * slots;
+    }
+    // Picks the slot to sacrifice from device: unpinned, then rarest, then
+    // oldest. Host-tier copies are not candidates — they are not in the way.
+    bool pick_victim(u64 *out);
+    // Same ordering for the host tier, but pins do not protect a copy there
+    // and the caller's own slot is never a candidate.
+    bool pick_host_victim(u64 *out, u64 keep_key);
 
     Backend *be_ = nullptr;
     size_t budget_ = 0;
     size_t bytes_ = 0;
     size_t capacity_ = 0;
-    u64 acquires_ = 0; // since the last decay
+    size_t vram_slots_ = 0;
+    size_t host_budget_ = 0;
+    size_t host_bytes_ = 0;
+    u64 acquires_ = 0;      // since the last decay (drives the window)
+    u64 total_acquires_ = 0; // lifetime, for hit-rate reporting
     u64 loads_ = 0;
     u64 evictions_ = 0;
     u64 hits_ = 0;
+    u64 host_hits_ = 0;
+    u64 demotions_ = 0;
+    u64 promotions_ = 0;
     u64 decays_ = 0;
     u64 seq_ = 0;
     std::unordered_map<u64, Slot> slots_;
