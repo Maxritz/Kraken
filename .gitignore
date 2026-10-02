@@ -1,0 +1,18 @@
+# Whitelist-based ignore: this workspace also holds experiment scratch,
+# build outputs, logs, and model/data artifacts. Only the Kraken project
+# itself is tracked.
+/*
+!/.gitignore
+!/CMakeLists.txt
+!/README.md
+!/include/
+!/src/
+!/tests/
+!/scripts/
+!/tools/
+!/docs/
+!/palcfg/
+
+# Docs: keep the written docs, drop probe transcripts
+/docs/*
+!/docs/*.md
