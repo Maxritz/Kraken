@@ -283,6 +283,16 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         router_host_.resize(static_cast<size_t>(C) * static_cast<size_t>(mc.n_expert));
         moe_prob_.resize(static_cast<size_t>(mc.n_expert));
         moe_sel_.resize(static_cast<size_t>(C) * static_cast<size_t>(k));
+        // Only sized when a scan is actually requested: [n_layer * n_expert]
+        // doubles and u64 counters, which is 3584 * 12 B = 43 kB for a
+        // 28x128 model and nothing at all otherwise.
+        if (expert_scan_) {
+            const size_t cells = static_cast<size_t>(mc.n_layer) *
+                                 static_cast<size_t>(mc.n_expert);
+            expert_mass_.assign(cells, 0.0);
+            expert_hits_.assign(cells, 0);
+            expert_scan_tokens_ = 0;
+        }
         moe_wt_.resize(static_cast<size_t>(C) * static_cast<size_t>(k));
         group_rows_.reserve(static_cast<size_t>(C));
         group_wt_.reserve(static_cast<size_t>(C));
@@ -778,6 +788,87 @@ void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
     be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
 }
 
+// Writes the routing statistics as `<model>.krakenexperts.json`, beside the
+// model so it travels with it.
+//
+// The file deliberately stores a *ranking with weights*, not a chosen hot set.
+// Which experts deserve VRAM is a function of the card, and the cards this
+// runs on differ by 2x (6 GB and 12 GB) while the free host memory is a
+// different number again. Baking "the top 8" into the file would be right for
+// one machine and wrong for the next one; storing each expert's routing mass
+// and its byte cost lets the loader solve for whatever budget it actually has.
+// A 300B model needs ~70% coverage to fit a 24 GB host tier, where a 30B needs
+// ~10%; the file is the same either way.
+void Engine::write_expert_index(const std::string &path) const {
+    const ModelConfig &mc = model_.cfg();
+    if (!mc.is_moe || mc.n_expert <= 0) return;
+    const i32 ne = mc.n_expert;
+    const size_t one = model_.max_expert_bytes();
+    // Size and mtime travel with the index so a loader can refuse a list
+    // written for a different build of the same weights. Matching the Laguna
+    // edge0-index fields, which the collections already ship.
+    unsigned long long src_size = 0, src_mtime = 0;
+    {
+        struct stat st;
+        if (::stat(cfg_.model_path.c_str(), &st) == 0) {
+            src_size = static_cast<unsigned long long>(st.st_size);
+            src_mtime = static_cast<unsigned long long>(st.st_mtime);
+        }
+    }
+
+    FILE *f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        KRK_WARN("expert scan: cannot write %s", path.c_str());
+        return;
+    }
+    std::fprintf(f,
+                 "{\n  \"version\": 1,\n"
+                 "  \"kind\": \"kraken-expert-index\",\n"
+                 "  \"mode\": \"%s\",\n"
+                 "  \"source_path\": \"%s\",\n"
+                 "  \"source_size\": %llu,\n"
+                 "  \"source_mtime\": %llu,\n"
+                 "  \"arch\": \"%s\",\n"
+                 "  \"n_layer\": %d,\n  \"n_expert\": %d,\n"
+                 "  \"n_expert_used\": %d,\n"
+                 "  \"expert_bytes\": %llu,\n"
+                 "  \"positions_scanned\": %lld,\n"
+                 "  \"layers\": [\n",
+                 expert_stub_ ? "routers-only" : "full-forward",
+                 cfg_.model_path.c_str(),
+                 src_size, src_mtime,
+                 mc.arch.c_str(), mc.n_layer, ne, mc.n_expert_used,
+                 static_cast<unsigned long long>(one),
+                 static_cast<long long>(expert_scan_tokens_));
+    for (i32 l = 0; l < mc.n_layer; l++) {
+        const LayerWeights &L = model_.layers()[static_cast<size_t>(l)];
+        if (!L.moe) continue;
+        const double *mass = expert_mass_.data() + static_cast<size_t>(l) * ne;
+        const u64 *hits = expert_hits_.data() + static_cast<size_t>(l) * ne;
+        // Highest mass first, so a reader can take a prefix and know it is the
+        // hot set without sorting.
+        std::vector<i32> ord(static_cast<size_t>(ne));
+        for (i32 e = 0; e < ne; e++) ord[static_cast<size_t>(e)] = e;
+        std::sort(ord.begin(), ord.end(), [&](i32 a, i32 b) {
+            if (mass[a] != mass[b]) return mass[a] > mass[b];
+            return a < b; // stable: equal mass ranks the lower id first
+        });
+        std::fprintf(f, "    {\"layer\": %d, \"experts\": [", l);
+        for (i32 i = 0; i < ne; i++) {
+            const i32 e = ord[static_cast<size_t>(i)];
+            std::fprintf(f,
+                         "%s{\"e\": %d, \"mass\": %.9g, \"hits\": %llu}", i ? ", " : "",
+                         e, mass[e], static_cast<unsigned long long>(hits[e]));
+        }
+        std::fprintf(f, "]}%s\n", l + 1 < mc.n_layer ? "," : "");
+    }
+    std::fprintf(f, "  ]\n}\n");
+    std::fclose(f);
+    KRK_INFO("expert scan: wrote %s (%lld positions, %s)", path.c_str(),
+             static_cast<long long>(expert_scan_tokens_),
+             expert_stub_ ? "routers only, experts stubbed" : "full forward");
+}
+
 void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
@@ -810,6 +901,17 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             const f32 inv = sum > 0 ? 1.0f / sum : 0.0f;
             for (i32 e = 0; e < ne; e++) moe_prob_[static_cast<size_t>(e)] *= inv;
 
+            // Fold this token's routing distribution into the scan. Mass is
+            // recorded for every expert, not just the k selected, because the
+            // question the index answers is "what coverage does the top N buy",
+            // and that needs the whole curve.
+            if (expert_scan_) {
+                double *mass = expert_mass_.data() +
+                               static_cast<size_t>(layer) * static_cast<size_t>(ne);
+                for (i32 e = 0; e < ne; e++)
+                    mass[e] += static_cast<double>(moe_prob_[static_cast<size_t>(e)]);
+            }
+
             i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
             f32 *wt = moe_wt_.data() + static_cast<size_t>(t) * k;
             for (i32 s = 0; s < k; s++) {
@@ -827,6 +929,10 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 }
                 sel[s] = best;
                 wt[s] = bestp > 0 ? bestp : 0.0f;
+                if (expert_scan_ && best >= 0)
+                    expert_hits_[static_cast<size_t>(layer) *
+                                     static_cast<size_t>(ne) +
+                                 static_cast<size_t>(best)] += 1;
             }
             f32 ksum = 0;
             for (i32 s = 0; s < k; s++) ksum += wt[s];
@@ -838,7 +944,13 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // Every (token, slot) pair is one work item. Items that picked the same
         // expert share one permuted activation block and one set of GEMMs, so a
         // layer costs O(k) GEMMs per matrix instead of O(k * n).
-        for (i32 e = 0; e < ne; e++) {
+        //
+        // The stub skips them all, leaving ws_ffn_ zeroed. The routers above
+        // have already run and still saw the true dense-path activation, so the
+        // statistics are collected; only the layer's own expert contribution to
+        // the residual is missing, which is what makes the list approximate.
+        if (expert_stub_) expert_stubbed_ran_ = true;
+        for (i32 e = 0; !expert_stub_ && e < ne; e++) {
             group_rows_.clear();
             group_wt_.clear();
             for (i32 t = 0; t < n; t++) {
@@ -883,7 +995,7 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
 
     // The shared expert runs on every token (Qwen2-MoE); it is a single expert,
     // so it stays resident.
-    if (ff_sh > 0 && L.shexp_gate.present()) {
+    if (!expert_stub_ && ff_sh > 0 && L.shexp_gate.present()) {
         be_->gemm(ws_gate_, ws_xn_, L.shexp_gate.data, L.shexp_gate.type, ff_sh, n_embd_, n);
         be_->gemm(ws_up_, ws_xn_, L.shexp_up.data, L.shexp_up.type, ff_sh, n_embd_, n);
         be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * ff_sh);
@@ -1215,6 +1327,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         forward(ids.data() + i, n, static_cast<i32>(i), last);
     }
     fetch_logits(device_topk);
+    if (expert_scan_) expert_scan_tokens_ += static_cast<i64>(ids.size());
     res->prefill_ms = prefill_timer.ms();
 
     Sampler sampler;
@@ -1253,6 +1366,8 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         forward(&token, 1, static_cast<i32>(pos), true);
         pos++;
         fetch_logits(device_topk);
+        // One token position folded into the routing statistics.
+        if (expert_scan_) expert_scan_tokens_++;
     }
 
     emit.finish(res->finish == FinishStop);

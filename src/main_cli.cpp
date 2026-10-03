@@ -36,6 +36,8 @@ struct Args {
     bool info = false;
     bool bench = false;
     bool profile = false;
+    bool expert_scan = false;   // measure routing and write an expert index
+    bool expert_stub = false;   // run the routers with every expert FFN removed
     int debug_topk = 0; // stderr dump of top-k logprobs per token
     bool verbose = false;
     bool interactive = true;
@@ -78,6 +80,12 @@ void usage() {
         "                        (KRK_PROFILE_STEPS/FROM/OPS tune the window)\n"
         "  --debug-topk N        dump the top-N candidates and their log-probs\n"
         "                        for every token to stderr (at full precision)\n"
+        "  --expert-scan        measure which experts the routers actually pick\n"
+        "                        and write <model>.krakenexperts.json\n"
+        "  --expert-stub        with --expert-scan: run only the routers, with\n"
+        "                        every expert FFN skipped (no expert weights\n"
+        "                        are read). The list is then approximate; the\n"
+        "                        two modes exist so they can be compared\n"
         "  -v                    verbose logging\n"
         "  -h, --help            this message\n",
         kEngineName, kEngineVersion);
@@ -122,6 +130,8 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--info") a->info = true;
         else if (f == "--bench") a->bench = true;
         else if (f == "--profile") a->profile = true;
+        else if (f == "--expert-scan") a->expert_scan = true;
+        else if (f == "--expert-stub") a->expert_stub = true;
         else if (f == "--debug-topk")
             a->debug_topk = std::atoi(next("--debug-topk"));
         else if (f == "-v" || f == "--verbose") a->verbose = true;
@@ -299,6 +309,7 @@ int main(int argc, char **argv) {
     cfg.expert_l2_mb = a.expert_l2_mb;
 
     Engine engine;
+    engine.set_expert_scan(a.expert_scan, a.expert_stub);
     if (!engine.init(be, cfg, &err)) {
         std::fprintf(stderr, "kraken: %s\n", err.c_str());
         delete be;
@@ -315,6 +326,18 @@ int main(int argc, char **argv) {
     }
 
     std::printf("%s %s | %s\n", kEngineName, kEngineVersion, be->describe().c_str());
+
+    if (a.expert_scan && a.prompt.empty() && !a.bench) {
+        // Nothing to measure without tokens: a scan over an empty prompt would
+        // write an index with zero mass in every expert, which reads as "this
+        // model routes nowhere" rather than as "this scan measured nothing".
+        std::fprintf(stderr,
+                     "kraken: --expert-scan needs --prompt (or --bench) so there "
+                     "are token positions to measure the routers on\n");
+        engine.shutdown();
+        delete be;
+        return 2;
+    }
 
     if (a.info) {
         const ModelConfig &mc = engine.model().cfg();
@@ -414,6 +437,16 @@ int main(int argc, char **argv) {
             }
             std::printf("\n");
         }
+    }
+
+    if (a.expert_scan) {
+        // Written after the run, beside the model, so the list travels with the
+        // weights and a later load on a different card can still apply it. The
+        // file stores each expert's routing mass, not a chosen hot set: which
+        // experts deserve VRAM depends on the card (6 GB and 12 GB are both
+        // targets) and on the free host tier, so the choice belongs at load
+        // time, not here.
+        engine.write_expert_index(a.model + ".krakenexperts.json");
     }
 
     engine.shutdown();

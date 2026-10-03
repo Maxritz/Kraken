@@ -132,6 +132,16 @@ public:
     const f32 *last_logits() const { return logits_host_; }
     const DeviceCaps &device() const { return be_ ? be_->caps() : no_caps_; }
 
+    // ---- routing scan (public surface; see the members for why) ----------
+    // Turns the routing scan on, and (optionally) the expert-stubs-only
+    // approximation. Must be called before init(): the buffers are sized there.
+    void set_expert_scan(bool scan, bool stub) {
+        expert_scan_ = scan;
+        expert_stub_ = scan && stub;
+    }
+    // Writes <path> with each expert's routing mass, sorted hottest-first.
+    void write_expert_index(const std::string &path) const;
+
 private:
     // One batched forward over n tokens starting at pos0. LogitMode picks how
     // much of the output head runs: none (mid-prefill), the last row (plain
@@ -279,6 +289,29 @@ private:
     std::vector<f32> moe_wt_;     // [chunk, k] renormalized gate weight
     std::vector<i32> group_rows_; // [<=chunk] token ids in the current group
     std::vector<f32> group_wt_;   // [<=chunk] their gate weights
+
+    // ---- expert routing scan (--expert-scan) ----------------------------
+    //
+    // A hot-expert list cannot be built from the model file: which experts a
+    // token routes to is a function of the residual stream, so it has to be
+    // measured. These accumulate what the routers actually chose, weighted by
+    // the routing probability rather than by a count -- a count cannot tell you
+    // whether the top 8 of 128 carry 90% of the traffic or 40%, and that
+    // number is what sizes a residency budget.
+    //
+    // `expert_stub_` runs the routers with every expert FFN replaced by
+    // nothing, which is the cheap approximation: the routers only need the
+    // dense path, so the whole expert tensor set stays unmapped. It is only
+    // valid if stubbing does not change what the routers choose, which is an
+    // assumption with nothing behind it until it is measured -- see
+    // tools/expert_scan_diff.py.
+    std::vector<double> expert_mass_; // [n_layer * n_expert] summed P(expert)
+    std::vector<u64> expert_hits_;     // [n_layer * n_expert] times selected
+    i64 expert_scan_tokens_ = 0;       // token positions folded in so far
+    bool expert_scan_ = false;         // accumulate
+    bool expert_stub_ = false;         // skip the expert GEMMs while scanning
+    bool expert_stubbed_ran_ = false;  // stub was requested and did run
+
     std::vector<i32> plan_dev_;   // staging mirror for ws_plan_
     std::vector<f32> alpha_dev_;  // staging mirror for ws_alpha_
 };
