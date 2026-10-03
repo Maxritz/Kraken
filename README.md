@@ -216,6 +216,125 @@ Use `--ctx 256/512` for MoE runs on small machines.
 
 ---
 
+## Usage switches and worked examples
+
+`kraken --help` lists every switch. These are the ones that change what you
+see rather than what the model does.
+
+### `--profile` — where a decode token goes
+
+Prints a per-op timeline for the last complete decode step: every op in issue
+order, its cumulative position on the device clock, the **device-idle gap
+before it**, bytes and effective GB/s, then a per-component rollup and a
+per-op rollup.
+
+```sh
+kraken -m models/Qwen3.5-0.8B.Q4_K_M.gguf -p "hi" -n 6 --greedy --profile
+```
+
+```
+-- step 1/1: ops 3031..3571
+   541 ops | host wall 23.592 ms | device spans 12.805 ms (54.3%) | device idle 11.461 ms (48.6%)
+     # op                          t+ us    dev us   idle us   host us       MB     GB/s
+       0 embed                        0.00      7.52     20.28      6.20     0.00      0.0
+       1 rmsnorm                     27.80     20.48     16.24      2.30     0.00      0.0
+     ...
+     538 gemm(gemv)               23793.83    362.00     14.88      1.40   208.59    576.2
+     539 logits_topk              24170.71      5.68    100.32     14.00     0.00      0.0
+     540 download                  24276.71     68.70     76.20     75.50     0.00      0.0
+
+     component           ops   %dev      dev us     idle us     host us
+     projections        159   36.6%     4929.41    4165.46     614.00
+     recurrent           90   16.0%     2151.67    2461.78     350.00
+     attention-mix       72   13.3%     1786.35    1638.89     245.50
+     norms               67   12.0%     1619.32    2281.73     322.00
+     ...
+   instrumentation floor, 256 empty ops timed through the same begin/end path: 0.69 us host, 18.82 us device each.
+```
+
+Read the floor line first: on this stack a timed op costs ~19 µs of device
+time to measure, so **any row under that is the recorder, not the kernel**.
+Order, call counts and GB/s are exact at every size; use `KRK_TIME=<op>` or a
+`--bench` wall delta when you need an undistorted device time.
+
+Tune the window with `KRK_PROFILE_STEPS=N` (last N steps, default 1),
+`KRK_PROFILE_FROM=S` (count back from the last), `KRK_PROFILE_OPS=N` (fallback
+window when there is no `embed` marker to split on).
+
+### `--expert-cache-mb` / `--expert-cache-slots` — MoE residency
+
+The auto budget already covers the whole routed expert set when it fits, so
+these are only needed to *pin it down* or to cap it deliberately.
+
+```sh
+# cap residency for a model whose experts exceed VRAM
+kraken -m /g/More-models/GLM-4.7-Flash-Q4_K_M.gguf --expert-cache-mb 4096 --ctx 4096
+
+# exactly 256 (layer, expert) rows resident, whatever their size
+kraken -m /g/More-models/Laguna-S-2.1-UD-Q4_K_M.gguf --expert-cache-slots 256
+
+# check what the cache is doing, and whether it is thrashing
+kraken -m models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf --info | grep -E 'expert|moe'
+```
+
+A **hit rate near 0%** means the working set does not fit — raise the budget.
+`loads` plateauing early and `evictions` staying flat is the healthy shape.
+
+### `--bench` — throughput and the honest wall clock
+
+```sh
+kraken -m models/Qwen3.5-0.8B.Q4_K_M.gguf --bench -n 64 --greedy
+```
+
+Prefill and decode are timed separately. `--greedy` matters: the sampled path
+does the full host-side cut and is a different measurement.
+
+### `--expert-l2-mb` — pinned host tier for evicted experts
+
+```sh
+kraken -m /g/More-models/GLM-4.7-Flash-Q4_K_M.gguf --expert-cache-mb 2048 --expert-l2-mb 8192
+```
+
+Evicted experts demote to a page-locked host tier instead of going back to the
+GGUF mapping, so a re-promotion is a DMA rather than a file read. Costs host
+RAM; reports `promotions`/`demoted` in `--info`.
+
+### `--draft` / `--draft-tokens` — greedy speculative decoding
+
+```sh
+kraken -m /g/More-models/Qwen3-8B-Q4_K_M.gguf --draft models/Qwen3.5-0.8B.Q4_K_M.gguf \
+       --draft-tokens 4 --greedy -p "explain quicksort" -n 128
+```
+
+Several target tokens per host round-trip. Greedy-only; sampling runs without
+the draft and says so.
+
+### Finding a divergence between the two backends
+
+```sh
+KRK_DUMP=a.txt ./build-hip/kraken -m M -p "..." -n 1 --greedy            # device
+KRK_DUMP=b.txt ./build-hip/kraken -m M -p "..." -n 1 --greedy --cpu      # scalar f32
+python tools/dump_diff.py a.txt b.txt
+```
+
+The first differing line names the stage and the layer.
+
+### Gates
+
+```sh
+ninja -C build-hip kraken kraken-tests kraken-bench
+ninja -C build-hip gate                       # numeric tolerances + logits_topk differential
+./build-hip/kraken-tests                      # 1847 checks
+KRK_N=16 KRK_CHAT=1 bash scripts/coherence_check.sh models/*.gguf
+```
+
+`gate` exits non-zero on a NaN, an inf, an out-of-tolerance value or a
+`logits_topk` mismatch, so it fails the build rather than printing a
+reassuring number. Run all three after any kernel change — a fast wrong kernel
+is the failure mode a code review does not catch.
+
+---
+
 ## HTTP server (OpenAI-compatible)
 
 ```sh

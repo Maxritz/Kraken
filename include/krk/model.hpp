@@ -202,12 +202,25 @@ public:
             if (L.moe && L.experts.expert_bytes() > m) m = L.experts.expert_bytes();
         return m;
     }
-    // Sum of one expert slice (gate+up+down) across every MoE layer:
-    // the bytes needed to keep the whole routed set resident (0 when dense).
+    // Bytes needed to keep the *whole routed set* resident (0 when dense):
+    // every expert of every MoE layer, not one expert per layer.
+    //
+    // It summed only expert_bytes() per layer, which is the footprint of a
+    // single expert and understated the answer by exactly n_expert. The
+    // budget is then compared against this in configure_expert_cache, so a
+    // 4-expert layer got a budget for 1 expert's worth of the whole model:
+    // 152.6 MiB where ~610 MiB was needed, ~28 of 112 expert rows resident
+    // against 56 accessed per token, and a 0.0% hit rate — every expert
+    // re-fetched from host memory on every step. Qwen3-MoE-4x0.6B-2.4B ran at
+    // 16.0 tok/s; with the correct total the budget covers the whole set and
+    // it runs at 77.5 tok/s (4.8x), with 4096 MiB buying nothing further.
     size_t total_expert_bytes() const {
         size_t t = 0;
-        for (const LayerWeights &L : layers_)
-            if (L.moe) t += L.experts.expert_bytes();
+        for (const LayerWeights &L : layers_) {
+            if (!L.moe) continue;
+            const i64 ne = L.experts.n_expert > 0 ? L.experts.n_expert : 1;
+            t += L.experts.expert_bytes() * static_cast<size_t>(ne);
+        }
         return t;
     }
 

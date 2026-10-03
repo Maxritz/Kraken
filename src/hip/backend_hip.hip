@@ -795,8 +795,9 @@ public:
 
     void upload_i32(i32 *dst, const i32 *src, i64 n) override {
         KRK_TIME_OP("upload_i32");
-        KRK_HIP(hipMemcpy(dst, src, static_cast<size_t>(n) * sizeof(i32),
-                          hipMemcpyHostToDevice));
+        const size_t bytes = static_cast<size_t>(n) * sizeof(i32);
+        if (stage_upload(dst, src, bytes)) return;
+        KRK_HIP(hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice));
     }
 
     // ---- gated delta net (Qwen3.5 / Qwen3-Next) -------------------------
