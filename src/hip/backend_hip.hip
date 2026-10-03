@@ -9,8 +9,10 @@
 #include <hip/hip_version.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 #include "krk/backend.hpp"
 #include "kernels/attention.hpp"
@@ -20,6 +22,29 @@
 #include "kernels/gemm_dp4a.hpp"
 #include "kernels/gdn.hpp"
 #include "op_time.hpp"
+
+// Declared here rather than at their definitions (below the class) so the
+// backend's upload path can call them; see the definitions for the measurements.
+static constexpr size_t kTouchMinBytes = 64u * 1024u;
+void prefault(const void *src, size_t bytes);
+// Function pointer: inside the class, unqualified `prefault` would find a
+// member, so the upload path takes the address through this instead.
+using PrefaultFn = void (*)(const void *, size_t);
+static const PrefaultFn kPrefaultFn = &prefault;
+
+// Pulls a range into residency so the following copy is a straight memcpy.
+// Reading one byte per page is enough -- the fault is the cost, not the byte.
+// Measured cold on the 8B mapping: 1 byte/page 459 ms, sequential 64B stride
+// 668 ms, full memcpy 1374 ms, so the sparse touch is both the cheapest and the
+// one that leaves memory bandwidth for the DMA.
+void prefault(const void *src, size_t bytes) {
+    const volatile char *p = static_cast<const volatile char *>(src);
+    const size_t pages = bytes >> 12;
+    size_t acc = 0;
+    for (size_t i = 0; i < pages; i++) acc += static_cast<size_t>(p[i << 12]);
+    // Defeat dead-code elimination without branching on the accumulated value.
+    if (acc == static_cast<size_t>(-1)) std::fprintf(stderr, " ");
+}
 
 namespace krk {
 
@@ -246,8 +271,33 @@ public:
     void upload(void *dst, const void *src, size_t bytes, size_t off) override {
         KRK_TIME_OP("upload");
         if (stage_upload(static_cast<char *>(dst) + off, src, bytes)) return;
-        KRK_HIP(hipMemcpy(static_cast<char *>(dst) + off, src, bytes,
-                          hipMemcpyHostToDevice));
+        // Weight uploads read straight out of the model's file mapping, and a
+        // hipMemcpy from a not-yet-resident mapping pays a soft page fault per
+        // 4 KiB page -- 1.2M faults and 476 ms on the 8B, which is 45% of the
+        // whole load, all of it spent faulting in pages that the DMA then
+        // reads once and abandons. Touching the range first in bulk turns
+        // those into the kernel's own batched read-ahead and lets the copy
+        // run at the link's rate instead of at fault rate: 1021 ms -> 650 ms
+        // for the same 4.8 GB. See docs/KNOWLEDGE-MODELS.md.
+        //
+        // Only for large copies: below a page or two the touch loop costs
+        // more than the faults it saves, and the staging ring already covers
+        // everything under kStageMaxBytes.
+        if (bytes >= kTouchMinBytes) {
+            // Overlap the touch with the copy. A pageable hipMemcpy is
+            // synchronous on the host, so a touch loop in front of it is
+            // serial: measured, that left only a 3% gain (984 -> 953 ms for
+            // 4.8 GB). Running the touch on a helper thread lets the driver's
+            // own read-ahead start immediately, and the faults then happen
+            // under the copy rather than before it.
+            std::thread toucher(kPrefaultFn, src, bytes);
+            KRK_HIP(hipMemcpy(static_cast<char *>(dst) + off, src, bytes,
+                              hipMemcpyHostToDevice));
+            toucher.join();
+        } else {
+            KRK_HIP(hipMemcpy(static_cast<char *>(dst) + off, src, bytes,
+                              hipMemcpyHostToDevice));
+        }
     }
     void download(void *dst, const void *src, size_t bytes, size_t off) override {
         KRK_TIME_OP("download");

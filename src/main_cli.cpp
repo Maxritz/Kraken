@@ -1,4 +1,5 @@
 // main_cli.cpp — the kraken command line front end.
+#include <chrono>
 #include <cstdio>
 #include <iostream>
 #include <string>
@@ -266,7 +267,38 @@ int run_bench(Engine &engine, const Args &a) {
 
 } // namespace
 
+// Process-phase timeline (KRK_PHASE=1). `--bench` reports prefill and decode,
+// but not what else the process spends its time on -- and on the 8B that was
+// 1531 ms of load against 2973 ms of decode, i.e. a third of start-to-end that
+// the benchmark never mentioned. This prints every phase's wall time to stderr
+// so the budget is attributed rather than guessed. Costs one getenv when off.
+struct PhaseClock {
+    const char *on;
+    f64 t0;
+    f64 last;
+    PhaseClock() {
+        on = std::getenv("KRK_PHASE");
+        t0 = now();
+        last = t0;
+    }
+    static f64 now() {
+        return static_cast<f64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count()) / 1000.0;
+    }
+    void mark(const char *what) {
+        if (!on) return;
+        const f64 t = now();
+        std::fprintf(stderr, "[phase] %-22s %8.1f ms  (total %8.1f ms)\n",
+                     what,
+                     t - last, t - t0);
+        std::fflush(stderr);
+        last = t;
+    }
+};
+
 int main(int argc, char **argv) {
+    PhaseClock ph;
+    ph.mark("process start");
     Args a;
     if (!parse(argc, argv, &a)) return 2;
     log_set_level(a.verbose ? Log::Debug : Log::Info);
@@ -308,6 +340,7 @@ int main(int argc, char **argv) {
     cfg.expert_cache_slots = a.expert_cache_slots;
     cfg.expert_l2_mb = a.expert_l2_mb;
 
+    ph.mark("backend create");
     Engine engine;
     engine.set_expert_scan(a.expert_scan, a.expert_stub);
     if (!engine.init(be, cfg, &err)) {
@@ -315,6 +348,7 @@ int main(int argc, char **argv) {
         delete be;
         return 1;
     }
+    ph.mark("engine.init (load)");
     if (!a.draft.empty()) {
         engine.set_draft_window(a.draft_tokens);
         if (!engine.load_draft(a.draft, &err)) {
@@ -382,10 +416,14 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    ph.mark("banner + draft");
     if (a.bench) {
         const int rc = run_bench(engine, a);
+        ph.mark("run_bench (prefill+decode)");
         engine.shutdown();
+        ph.mark("engine.shutdown");
         delete be;
+        ph.mark("delete be -> exit");
         return rc;
     }
 

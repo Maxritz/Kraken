@@ -4,6 +4,7 @@
 #include "krk/verdict.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 namespace krk {
@@ -18,9 +19,33 @@ std::string blk_key(const char *fmt, i32 layer) {
 
 } // namespace
 
+// Load-phase timeline (KRK_PHASE=1). The engine reports one "load N ms" line,
+// which cannot say whether the time went to the mapping, the metadata, the
+// embedding, the per-layer loop, or the transfers -- and the answer decides
+// what is worth optimising. See docs/KNOWLEDGE-MODELS.md §6.
+struct LoadPhase {
+    const char *on = std::getenv("KRK_PHASE");
+    f64 t0 = now();
+    f64 last = t0;
+    static f64 now() {
+        return static_cast<f64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count()) / 1000.0;
+    }
+    void mark(const char *what) {
+        if (!on) return;
+        const f64 t = now();
+        std::fprintf(stderr, "[load ] %-24s %8.1f ms  (total %8.1f ms)\n", what,
+                     t - last, t - t0);
+        std::fflush(stderr);
+        last = t;
+    }
+};
+
 bool Model::load(Backend &be, const std::string &path, std::string *err) {
+    LoadPhase lp;
     be_ = &be;
     if (!gguf_.load(path, err)) return false;
+    lp.mark("gguf map + metadata");
 
     // ---- architecture -----------------------------------------------------
     cfg_.arch = gguf_.get_str("general.architecture", "llama");
@@ -201,6 +226,34 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     const i64 kv_dim = static_cast<i64>(cfg_.n_head_kv) * cfg_.head_dim;
 
     // ---- helpers ----------------------------------------------------------
+    // Total upload accounting: the per-tensor dump only covers tensors over
+    // 32 MiB, so it cannot say what fraction of load is actually transfer.
+    u64 up_bytes = 0;
+    f64 up_ms = 0;
+    // Size histogram: the copy-size sweep shows the transfer rate is set by
+    // the NUMBER of copies (4 KiB -> 0.04 GB/s, 16 MiB -> 10.6 GB/s), so the
+    // thing to know is how the model's tensors are distributed.
+    u64 bucket_n[8] = {0};
+    u64 bucket_b[8] = {0};
+    auto bucket_of = [](size_t bytes) {
+        if (bytes < 4096u) return 0;
+        if (bytes < 16384u) return 1;
+        if (bytes < 65536u) return 2;
+        if (bytes < 262144u) return 3;
+        if (bytes < 1048576u) return 4;
+        if (bytes < 4194304u) return 5;
+        if (bytes < 16777216u) return 6;
+        return 7;
+    };
+    auto upload_timed = [&](void *dst, const void *src, size_t bytes) {
+        const f64 t0 = LoadPhase::now();
+        be.upload(dst, src, bytes);
+        up_ms += LoadPhase::now() - t0;
+        up_bytes += bytes;
+        const int bi = bucket_of(bytes);
+        bucket_n[bi]++;
+        bucket_b[bi] += bytes;
+    };
     auto require_tensor = [&](const std::string &name, std::string *e) -> const GgufTensor * {
         const GgufTensor *t = gguf_.tensor(name);
         if (!t) {
@@ -224,8 +277,18 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // Uploads a tensor verbatim (quantized blocks stay packed).
     auto upload_raw = [&](const GgufTensor *t, DType as) -> QuantTensor {
         QuantTensor q;
+        const f64 a0 = LoadPhase::now();
         q.data = be.alloc(t->n_bytes);
-        be.upload(q.data, t->data, t->n_bytes);
+        const f64 a1 = LoadPhase::now();
+        upload_timed(q.data, t->data, t->n_bytes);
+        const f64 a2 = LoadPhase::now();
+        if (std::getenv("KRK_PHASE") && t->n_bytes > (32u << 20))
+            std::fprintf(stderr,
+                         "[alloc] %-24s alloc %8.1f ms  upload %8.1f ms  (%.2f GB/s)\n",
+                         t->name.c_str(), a1 - a0, a2 - a1,
+                         static_cast<f64>(t->n_bytes) / 1073741824.0 /
+                             ((a2 - a1) / 1000.0));
+        if (std::getenv("KRK_PHASE")) std::fflush(stderr);
         q.type = as;
         q.n_in = static_cast<i64>(t->ne[0]);
         q.n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
@@ -259,7 +322,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     host[static_cast<size_t>(c * ksize + j)];
         host_free(host);
         q.data = be.alloc(static_cast<size_t>(n) * 4);
-        be.upload(q.data, tap.data(), static_cast<size_t>(n) * 4);
+        upload_timed(q.data, tap.data(), static_cast<size_t>(n) * 4);
         q.type = DType::F32;
         q.n_in = ksize;
         q.n_out = chan;
@@ -309,7 +372,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 half[i] = fp32_to_fp16(tmp[i]);
             QuantTensor q;
             q.data = be.alloc(static_cast<size_t>(t->n_elements) * 2);
-            be.upload(q.data, half, static_cast<size_t>(t->n_elements) * 2);
+            upload_timed(q.data, half, static_cast<size_t>(t->n_elements) * 2);
             host_free(tmp);
             host_free(half);
             q.type = DType::F16;
@@ -321,6 +384,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         return upload_raw(t, t->type);
     };
 
+    lp.mark("arch + metadata resolve");
     // ---- token embedding + head ------------------------------------------
     {
         std::string e;
@@ -331,6 +395,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         }
         tok_embd_ = upload_raw(te, te->type);
         cfg_.n_vocab = static_cast<i32>(te->ne[1]);
+        lp.mark("  token_embd upload");
     }
     if (cfg_.tied_embeddings) {
         out_head_ = tok_embd_;
@@ -342,17 +407,22 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             return false;
         }
         out_head_ = upload_raw(oh, oh->type);
+        lp.mark("  output.weight upload");
     }
     out_norm_ = upload_f32("output_norm.weight");
+    lp.mark("  output_norm upload");
     if (!out_norm_) {
         if (err) *err = "output_norm.weight is missing";
         return false;
     }
 
+    lp.mark("token_embd + output head");
+
     // ---- per-layer weights ------------------------------------------------
     layers_.resize(static_cast<size_t>(cfg_.n_layer));
     for (i32 l = 0; l < cfg_.n_layer; l++) {
         LayerWeights &L = layers_[static_cast<size_t>(l)];
+        if (l == 1) lp.mark("  layer 0 only");
         std::string e;
 
         auto need = [&](const std::string &n) -> QuantTensor {
@@ -552,6 +622,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         if (L.q_norm || L.k_norm) cfg_.qk_norm = true;
     }
 
+    lp.mark("per-layer loop (all weights)");
+
     // ---- rotary inverse frequencies (host) --------------------------------
     // Partial rotary: Qwen3.5 rotates only the first `rope_dim` dims of each
     // head and leaves the tail untouched, so the table is rope_dim/2 long and
@@ -574,6 +646,22 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                  cfg_.ssm_n_group, cfg_.ssm_dt_rank, cfg_.ssm_d_state,
                  cfg_.ssm_d_conv, rope_dim, cfg_.head_dim);
     }
+    if (std::getenv("KRK_PHASE"))
+        std::fprintf(stderr,
+                     "[load ] TOTAL upload: %.1f MiB in %.1f ms = %.2f GB/s\n",
+                     static_cast<f64>(up_bytes) / 1048576.0, up_ms,
+                     static_cast<f64>(up_bytes) / 1073741824.0 / (up_ms / 1000.0));
+    if (std::getenv("KRK_PHASE")) {
+        static const char *nm[8] = {"<4K", "4-16K", "16-64K", "64-256K",
+                                    "256K-1M", "1-4M", "4-16M", ">16M"};
+        for (int i = 0; i < 8; i++)
+            if (bucket_n[i])
+                std::fprintf(stderr, "[load ]   %-9s %5llu copies  %8.1f MiB\n",
+                             nm[i], static_cast<unsigned long long>(bucket_n[i]),
+                             static_cast<f64>(bucket_b[i]) / 1048576.0);
+        std::fflush(stderr);
+    }
+    lp.mark("post-load (rope table etc)");
     return true;
 }
 
