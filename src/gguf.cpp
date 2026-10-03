@@ -169,6 +169,7 @@ bool Gguf::load(const std::string &path, std::string *err) {
         return false;
     }
     data_base_ = file_.data() + off;
+    data_section_off_ = off;
 
     for (auto &t : tensors_) {
         // A format this build does not implement has no known payload size, so

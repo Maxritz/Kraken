@@ -191,6 +191,7 @@ bool MappedFile::open(const std::string &path, std::string *err) {
     native_map_ = mh;
     data_ = static_cast<const u8 *>(view);
     size_ = static_cast<size_t>(li.QuadPart);
+    path_ = path;
     return true;
 }
 
@@ -208,6 +209,67 @@ void MappedFile::close() {
         native_handle_ = nullptr;
     }
     size_ = 0;
+    path_.clear();
+}
+
+FileReader::~FileReader() { close(); }
+
+bool FileReader::open(const std::string &path) {
+    close();
+    HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) return false;
+    handle_ = fh;
+    return true;
+}
+
+void FileReader::close() {
+    if (handle_) {
+        CloseHandle(static_cast<HANDLE>(handle_));
+        handle_ = nullptr;
+    }
+}
+
+bool FileReader::at(size_t off, void *dst, size_t len) {
+    if (!handle_) return false;
+    HANDLE fh = static_cast<HANDLE>(handle_);
+    OVERLAPPED ov{};
+    ov.Offset = static_cast<DWORD>(off & 0xffffffffull);
+    ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+    char *p = static_cast<char *>(dst);
+    size_t got = 0;
+    while (got < len) {
+        DWORD want = static_cast<DWORD>(len - got > 0x40000000u ? 0x40000000u : len - got);
+        DWORD n = 0;
+        if (!ReadFile(fh, p + got, want, &n, &ov)) return false;
+        if (n == 0) return false;
+        got += n;
+        ov.Offset += n;
+        if (ov.Offset < n) ov.OffsetHigh++;
+    }
+    return true;
+}
+
+// See the header: a cold mapping faults per page, read() does not.
+bool MappedFile::read_at(size_t off, void *dst, size_t len) const {
+    if (!native_handle_) return false;
+    if (off > size_ || len > size_ - off) return false;
+    HANDLE fh = static_cast<HANDLE>(native_handle_);
+    OVERLAPPED ov{};
+    ov.Offset = static_cast<DWORD>(off & 0xffffffffull);
+    ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+    char *p = static_cast<char *>(dst);
+    size_t got = 0;
+    while (got < len) {
+        DWORD want = static_cast<DWORD>(len - got > 0x40000000u ? 0x40000000u : len - got);
+        DWORD n = 0;
+        if (!ReadFile(fh, p + got, want, &n, &ov)) return false;
+        if (n == 0) return false;
+        got += n;
+        ov.Offset += n;
+        if (ov.Offset < n) ov.OffsetHigh++;
+    }
+    return true;
 }
 
 #else
@@ -237,6 +299,7 @@ bool MappedFile::open(const std::string &path, std::string *err) {
     native_handle_ = reinterpret_cast<void *>(static_cast<intptr_t>(fd));
     data_ = static_cast<const u8 *>(p);
     size_ = static_cast<size_t>(st.st_size);
+    path_ = path;
     return true;
 }
 
@@ -250,6 +313,51 @@ void MappedFile::close() {
         native_handle_ = nullptr;
     }
     size_ = 0;
+    path_.clear();
+}
+
+FileReader::~FileReader() { close(); }
+
+bool FileReader::open(const std::string &path) {
+    close();
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    handle_ = reinterpret_cast<void *>(static_cast<intptr_t>(fd));
+    return true;
+}
+
+void FileReader::close() {
+    if (handle_) {
+        ::close(static_cast<int>(reinterpret_cast<intptr_t>(handle_)));
+        handle_ = nullptr;
+    }
+}
+
+bool FileReader::at(size_t off, void *dst, size_t len) {
+    if (!handle_) return false;
+    const int fd = static_cast<int>(reinterpret_cast<intptr_t>(handle_));
+    char *p = static_cast<char *>(dst);
+    size_t got = 0;
+    while (got < len) {
+        const ssize_t n = pread(fd, p + got, len - got, static_cast<off_t>(off + got));
+        if (n <= 0) return false;
+        got += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool MappedFile::read_at(size_t off, void *dst, size_t len) const {
+    if (!native_handle_) return false;
+    if (off > size_ || len > size_ - off) return false;
+    const int fd = static_cast<int>(reinterpret_cast<intptr_t>(native_handle_));
+    char *p = static_cast<char *>(dst);
+    size_t got = 0;
+    while (got < len) {
+        const ssize_t n = pread(fd, p + got, len - got, static_cast<off_t>(off + got));
+        if (n <= 0) return false;
+        got += static_cast<size_t>(n);
+    }
+    return true;
 }
 
 #endif

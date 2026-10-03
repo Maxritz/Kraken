@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <memory>
 
 namespace krk {
 
@@ -46,6 +47,16 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     be_ = &be;
     if (!gguf_.load(path, err)) return false;
     lp.mark("gguf map + metadata");
+
+    // Large weights are pulled in with read() rather than DMA'd out of the cold
+    // mapping: 6.2 GB/s single-threaded and 16.3 with four handles, against
+    // 3.87 for a cold mapping, because the mapping's cost is one soft page fault
+    // per 4 KiB (measured 1208.8 ms vs 109.1 ms for the 8B). The backend owns
+    // the pipeline and overlaps the reads with the copies; it falls back to the
+    // direct copy if pinned memory cannot be had, so this is an optimisation,
+    // not a requirement. See docs/KNOWLEDGE-MODELS.md.
+    be.set_weight_pull(path, gguf_.file().data(), gguf_.file().size(),
+                       gguf_.data_section_off());
 
     // ---- architecture -----------------------------------------------------
     cfg_.arch = gguf_.get_str("general.architecture", "llama");

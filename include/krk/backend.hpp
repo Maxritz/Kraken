@@ -12,6 +12,7 @@
 #ifndef KRK_BACKEND_HPP
 #define KRK_BACKEND_HPP
 
+#include <functional>
 #include "krk/common.hpp"
 #include "krk/quant.hpp"
 
@@ -96,6 +97,29 @@ public:
     virtual void *alloc_host(size_t bytes) { return host_alloc(bytes ? bytes : 1); }
     virtual void release_host(void *p) { host_free(p); }
     virtual void upload(void *dst, const void *src, size_t bytes, size_t off = 0) = 0;
+    // Direct copy with no staging side effects. The HIP backend's read()-based
+    // weight path calls this per chunk; a backend without that path can simply
+    // forward to upload().
+    virtual bool upload_now(void *dst, const void *src, size_t bytes, size_t off = 0) {
+        upload(dst, src, bytes, off);
+        return true;
+    }
+    // Optional hook for pull-style weight loading; see HipBackend::set_weight_pull.
+    //
+    // Large weights are better read() out of the file than DMA'd straight from
+    // the mapping: a cold mapping faults one 4 KiB page at a time (measured
+    // 1208.8 ms to get the 8B into RAM that way, 3.87 GB/s), and the fault path
+    // -- not the transfer -- is the cost. The loader owns the mapping, so it
+    // hands over the path and the mapping's address range; the backend then owns
+    // the whole pipeline (independent handles, pinned buffers, side streams) and
+    // overlaps the reads with the copies. `map_base`/`map_size` describe the
+    // mapping and `data_off` its tensor data section, which together let the
+    // backend turn a source pointer back into a file offset. A backend that
+    // ignores this keeps the direct copy.
+    virtual void set_weight_pull(const std::string &path, const void *map_base,
+                                 size_t map_size, size_t data_off) {
+        (void)path; (void)map_base; (void)map_size; (void)data_off;
+    }
     virtual void download(void *dst, const void *src, size_t bytes, size_t off = 0) = 0;
     virtual void fill0(void *dst, size_t bytes) = 0;
     virtual void sync() = 0;

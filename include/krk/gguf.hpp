@@ -96,10 +96,15 @@ public:
     const std::vector<std::string> *get_str_array(const std::string &key) const;
 
     const MappedFile &file() const { return file_; }
+    // File offset of the tensor data section. `GgufTensor::data` points into the
+    // mapping, so `(t.data - file().data())` is the same number; this exposes it
+    // once instead of at every call site.
+    size_t data_section_off() const { return data_section_off_; }
     u64 alignment() const { return alignment_; }
 
 private:
     MappedFile file_;
+    size_t data_section_off_ = 0;
     u32 version_ = 0;
     u64 alignment_ = 32;
     std::vector<std::pair<std::string, GgufValue>> kvs_;

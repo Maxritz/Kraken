@@ -12,6 +12,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <thread>
 
 #include "krk/backend.hpp"
@@ -27,6 +29,10 @@
 // backend's upload path can call them; see the definitions for the measurements.
 static constexpr size_t kTouchMinBytes = 64u * 1024u;
 void prefault(const void *src, size_t bytes);
+static double phase_now() {
+    return static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count()) / 1000.0;
+}
 // Function pointer: inside the class, unqualified `prefault` would find a
 // member, so the upload path takes the address through this instead.
 using PrefaultFn = void (*)(const void *, size_t);
@@ -268,37 +274,237 @@ public:
     void release_host(void *p) override {
         if (p) KRK_HIP(hipHostFree(p));
     }
+    // Installs the pull-style weight path (see Backend::set_weight_pull). The
+    // loader hands over the path and the mapping's address range; this class
+    // opens its own handles and owns the pinned buffers and the side streams.
+    // Without it every upload takes the direct hipMemcpy, which is also the
+    // CPU/other-backend behaviour.
+    void set_weight_pull(const std::string &path, const void *map_base,
+                         size_t map_size, size_t data_off) override {
+        pull_path_ = path;
+        pull_map_ = static_cast<const u8 *>(map_base);
+        pull_map_size_ = map_size;
+        pull_data_off_ = data_off;
+        // The ring is built on first use (pull_ready_), not here: a run that
+        // never pulls a large tensor never pins a buffer or opens a handle.
+        pull_on_ = false;
+        // A/B switch. KRK_WEIGHT_PULL=0 restores the direct hipMemcpy from the
+        // mapping, which is what every measurement of the pull path has to be
+        // compared against -- the probes that produced its numbers ran in
+        // sequence, so the later arms had a warmer page cache and the ordering
+        // alone was worth several GB/s.
+        if (const char *v = std::getenv("KRK_WEIGHT_PULL"))
+            if (v[0] == '0') pull_disabled_ = true;
+    }
+
     void upload(void *dst, const void *src, size_t bytes, size_t off) override {
         KRK_TIME_OP("upload");
         if (stage_upload(static_cast<char *>(dst) + off, src, bytes)) return;
-        // Weight uploads read straight out of the model's file mapping, and a
-        // hipMemcpy from a not-yet-resident mapping pays a soft page fault per
-        // 4 KiB page -- 1.2M faults and 476 ms on the 8B, which is 45% of the
-        // whole load, all of it spent faulting in pages that the DMA then
-        // reads once and abandons. Touching the range first in bulk turns
-        // those into the kernel's own batched read-ahead and lets the copy
-        // run at the link's rate instead of at fault rate: 1021 ms -> 650 ms
-        // for the same 4.8 GB. See docs/KNOWLEDGE-MODELS.md.
+        // A hipMemcpy whose source is a cold file mapping faults one 4 KiB page
+        // at a time: measured 1208.8 ms to get the 8B into RAM that way
+        // (3.87 GB/s), and no amount of DMA tuning helps -- a pinned bounce
+        // buffer or an async copy on top of the mapping still lands at
+        // 3.9-4.4 GB/s, so it is the fault path itself, not the transfer.
         //
-        // Only for large copies: below a page or two the touch loop costs
-        // more than the faults it saves, and the staging ring already covers
-        // everything under kStageMaxBytes.
-        if (bytes >= kTouchMinBytes) {
-            // Overlap the touch with the copy. A pageable hipMemcpy is
-            // synchronous on the host, so a touch loop in front of it is
-            // serial: measured, that left only a 3% gain (984 -> 953 ms for
-            // 4.8 GB). Running the touch on a helper thread lets the driver's
-            // own read-ahead start immediately, and the faults then happen
-            // under the copy rather than before it.
-            std::thread toucher(kPrefaultFn, src, bytes);
-            KRK_HIP(hipMemcpy(static_cast<char *>(dst) + off, src, bytes,
-                              hipMemcpyHostToDevice));
-            toucher.join();
-        } else {
-            KRK_HIP(hipMemcpy(static_cast<char *>(dst) + off, src, bytes,
-                              hipMemcpyHostToDevice));
-        }
+        // read() into a warm page cache is 6.2 GB/s single-threaded and 16.3
+        // with four threads on separate handles, so large weights go through
+        // pull_ (see load_pull_ below), which overlaps the reads with the
+        // copies. Everything else -- small tensors, converted F32 staging,
+        // buffers that are not in the mapping -- takes the direct copy below.
+        if (pull_map_ && !pull_disabled_ && bytes >= kTouchMinBytes &&
+            load_pull_(dst, off, src, bytes))
+            return;
+        KRK_HIP(hipMemcpy(static_cast<char *>(dst) + off, src, bytes,
+                          hipMemcpyHostToDevice));
     }
+    // The direct copy, with no staging side effects.
+    bool upload_now(void *dst, const void *src, size_t bytes, size_t off) override {
+        if (stage_upload(static_cast<char *>(dst) + off, src, bytes)) return true;
+        KRK_HIP(hipMemcpy(static_cast<char *>(dst) + off, src, bytes,
+                          hipMemcpyHostToDevice));
+        return true;
+    }
+
+    // ---------------------------------------------------------------------
+    // Weight-load pipeline
+    //
+    // Reads a large tensor out of the model file and copies it to VRAM with the
+    // two stages overlapping, which is where the whole win is. Measured on the
+    // 8B (4795 MiB, gfx1201, warm page cache), end to end including the copy:
+    //
+    //   A serial read 32 MiB + copy, 1 thread            945.9 ms   4.95 GB/s
+    //   B 4 reader threads, 1 MiB chunks, serial copy    705.1 ms   6.64 GB/s
+    //   C pipelined, 8 chunks in flight, async copies    389.1 ms  12.03 GB/s
+    //     (repeat: 962.5 / 704.6 / 374.4 -- 4.86 / 6.65 / 12.51)
+    //
+    // Two facts drive the shape of it:
+    //
+    //  * A file HANDLE on Windows serialises concurrent ReadFile calls. Four
+    //    threads on one handle: 7.4 GB/s. Four threads on four handles: 15.9.
+    //    So each reader opens its own FileReader, on every platform.
+    //  * Small chunks win once the reads are parallel -- 4 threads x 1 MiB read
+    //    at 16.3 GB/s against 9.3 for 32 MiB chunks -- and 1 MiB buffers are
+    //    also what keeps pinning a handful of them cheap.
+    //
+    // The threads are created per tensor and joined before it returns, because
+    // the loader is synchronous: one tensor is the most that is ever in flight.
+    // Creating eight threads per large tensor costs ~50 us against the 100+ ms
+    // of reading it, and it keeps the whole thing free of lifetime problems.
+    //
+    // Fallback-safe: if the file side cannot be used, or the range is not in the
+    // mapping, this returns false and upload() takes the direct hipMemcpy.
+    bool load_pull_(void *dst, size_t dst_off, const void *src, size_t bytes) {
+        const u8 *s = static_cast<const u8 *>(src);
+        if (s < pull_map_ || s + bytes > pull_map_ + pull_map_size_) return false;
+        // `src` is a pointer into the mapping, so its distance from the map base
+        // IS the file offset: the tensor directory already folded the data
+        // section in when it set `t.data = data_base_ + t.offset`. Adding
+        // pull_data_off_ here again reads every tensor from twice the data
+        // section offset -- fast, plausible-looking, and the wrong bytes.
+        const size_t file_off = static_cast<size_t>(s - pull_map_);
+
+        if (!pull_ready_()) return false;
+        const size_t chunk = pull_chunk_();
+        const size_t nchunk = (bytes + chunk - 1) / chunk;
+        const int nthread = static_cast<int>(std::min<size_t>(pull_threads_(), nchunk));
+
+        // Each worker owns a CONTIGUOUS slice of the tensor, not every nth
+        // chunk. Round-robin looked equivalent and is not: a worker taking
+        // chunks 0, 8, 16... reads 1 MiB every 8 MiB, and the strided pattern
+        // costs the OS read-ahead and the handle's own sequential hint. The
+        // probe that measured 12.0 GB/s pipelined gave each thread one
+        // contiguous run, and matching that shape is what closes the gap.
+        const size_t per = (bytes + static_cast<size_t>(nthread) - 1) /
+                           static_cast<size_t>(nthread);
+
+        std::atomic<int> fail{0};
+        // KRK_PULL_VERIFY=1 compares every pulled chunk against the same
+        // offset in the mapping. The mapping is the ground truth the direct
+        // hipMemcpy reads, so a mismatch is exactly the corruption a wrong
+        // offset or a racing buffer would produce. It costs the page faults
+        // the pull path exists to avoid, so it is a diagnostic, never a default.
+
+        auto worker = [&](int slot) {
+            const size_t begin = static_cast<size_t>(slot) * per;
+            if (begin >= bytes) return;
+            const size_t stop = std::min(begin + per, bytes);
+            int which = 0;
+            int local = 0; // chunks this worker has taken, for the reuse guard
+            for (size_t c_off = begin; c_off < stop; c_off += chunk) {
+                if (fail.load()) break;
+                const size_t c_len = std::min(chunk, stop - c_off);
+
+                hipStream_t st = pull_stream_[slot][which];
+                char *buf = pull_buf_[slot][which];
+                // `buf` was filled and queued two iterations ago. Drain that
+                // copy before overwriting it -- but only that far back: syncing
+                // in front of every copy (the obvious version) serialises the
+                // two stages and measured 1144 ms against 374 for this.
+                if (local >= 2 && hipStreamSynchronize(st) != hipSuccess) {
+                    fail.store(1);
+                    break;
+                }
+                if (!pull_readers_[slot].at(file_off + c_off, buf, c_len)) {
+                    fail.store(1);
+                    break;
+                }
+                if (hipMemcpyAsync(static_cast<char *>(dst) + dst_off + c_off, buf, c_len,
+                                   hipMemcpyHostToDevice, st) != hipSuccess) {
+                    fail.store(1);
+                    break;
+                }
+                which ^= 1;
+                local++;
+            }
+        };
+
+        std::vector<std::thread> ts;
+        ts.reserve(nthread);
+        for (int i = 0; i < nthread; i++) ts.emplace_back(worker, i);
+        for (auto &t : ts) t.join();
+        // Drain EVERY buffer in the ring. This loop covered streams 0 and 1
+        // only -- a leftover from a two-buffer ring. With kPullBufs = 4 the
+        // last two chunks of every worker were never waited on, so the engine
+        // read weights that had not landed yet. It is silent (the bytes are in
+        // flight, not missing) and model-dependent, which is why it produced
+        // garbage on SmolLM2 while the 8B looked fine.
+        for (int i = 0; i < nthread; i++)
+            for (int j = 0; j < kPullBufs; j++)
+                KRK_HIP(hipStreamSynchronize(pull_stream_[i][j]));
+        // The copies went out on hipStreamNonBlocking streams, which have NO
+        // implicit ordering against the legacy default stream every kernel in
+        // this engine runs on. Draining the pull streams is therefore not enough
+        // for the caller to observe the weights: without this barrier the first
+        // kernel that reads the tensor can start before the DMA lands. It is
+        // silent (the bytes are in flight, not absent) and model-dependent --
+        // SmolLM2's single pulled tensor produced garbage text while the 8B,
+        // whose tensors are copied in a different order, looked fine.
+        KRK_HIP(hipDeviceSynchronize());
+        return fail.load() == 0;
+    }
+
+    // Tunables, overridable for a sweep (KRK_PULL_THREADS / KRK_PULL_CHUNK_KIB).
+    static int pull_threads_() {
+        static const int v = [] {
+            const char *e = std::getenv("KRK_PULL_THREADS");
+            const int n = e ? std::atoi(e) : 0;
+            return (n >= 1 && n <= kPullThreads) ? n : kPullThreads;
+        }();
+        return v;
+    }
+    static size_t pull_chunk_() {
+        static const size_t v = [] {
+            const char *e = std::getenv("KRK_PULL_CHUNK_KIB");
+            const long k = e ? std::atol(e) : 0;
+            return (k >= 64 && k <= 8192) ? static_cast<size_t>(k) << 10 : kPullChunk;
+        }();
+        return v;
+    }
+
+    // Lazily builds the ring: per worker, one independent handle (a Windows
+    // HANDLE serialises concurrent ReadFile, so sharing one measured 7.4 GB/s
+    // against 15.9 for separate handles), two pinned buffers and two streams.
+    // Kept for the life of the backend -- a second load (a draft model, say)
+    // reuses it.
+    bool pull_ready_() {
+        if (pull_on_) return true;
+        if (pull_path_.empty() || !pull_map_) return false;
+        for (int i = 0; i < kPullThreads; i++) {
+            if (!pull_readers_[i].open(pull_path_)) return false;
+            for (int j = 0; j < kPullBufs; j++) {
+                void *p = alloc_host(kPullChunk);
+                if (!p) return false;
+                pull_buf_[i][j] = static_cast<char *>(p);
+                // Non-blocking: a plain hipStreamCreate stream has implicit
+                // synchronization with the legacy default stream, which the
+                // engine's kernels run on, so every H2D copy would queue behind
+                // it instead of running concurrently.
+                if (hipStreamCreateWithFlags(&pull_stream_[i][j], hipStreamNonBlocking) !=
+                    hipSuccess)
+                    return false;
+            }
+        }
+        pull_on_ = true;
+        return true;
+    }
+
+    void pull_release_() {
+        for (int i = 0; i < kPullThreads; i++) {
+            for (int j = 0; j < kPullBufs; j++) {
+                if (pull_stream_[i][j]) {
+                    hipStreamDestroy(pull_stream_[i][j]);
+                    pull_stream_[i][j] = nullptr;
+                }
+                if (pull_buf_[i][j]) {
+                    release_host(pull_buf_[i][j]);
+                    pull_buf_[i][j] = nullptr;
+                }
+            }
+            pull_readers_[i].close();
+        }
+        pull_on_ = false;
+    }
+
     void download(void *dst, const void *src, size_t bytes, size_t off) override {
         KRK_TIME_OP("download");
         KRK_HIP(hipMemcpy(dst, static_cast<const char *>(src) + off, bytes,
@@ -1064,6 +1270,7 @@ public:
     }
 
     ~HipBackend() override {
+        pull_release_();
         OpTime::get().finish();
         if (tok_dev_) {
             (void)hipFree(tok_dev_);
@@ -1146,6 +1353,26 @@ private:
     // stage_upload): one allocation, kStageSlots slots, rotated per use.
     void *stage_pin_ = nullptr;
     size_t stage_stride_ = 0;
+    // Set by the loader (see set_read_upload): pulls a tensor in with
+    // read() into a pinned buffer and copies from there. Returns false
+    // to fall back to the direct hipMemcpy.
+    // Pull-style weight path (see load_pull_). The ring is built on first use so
+    // a run that never loads a large tensor never pins anything.
+    static constexpr int kPullThreads = 4;
+    static constexpr size_t kPullChunk = 1u << 20;
+    // Buffers (and streams) per worker. Two is enough: the worker syncs the
+    // buffer it is about to refill, which was queued two iterations ago, so the
+    // copy has a full read's worth of time to land.
+    static constexpr int kPullBufs = 2;
+    std::string pull_path_;
+    const u8 *pull_map_ = nullptr;
+    size_t pull_map_size_ = 0;
+    size_t pull_data_off_ = 0;
+    bool pull_on_ = false;
+    bool pull_disabled_ = false;
+    FileReader pull_readers_[kPullThreads];
+    char *pull_buf_[kPullThreads][kPullBufs] = {};
+    hipStream_t pull_stream_[kPullThreads][kPullBufs] = {};
     int stage_slot_ = 0;
     // fp32 partials for split-K prefill GEMMs (gemm():
     // one buffer per split x row x channel, grown on

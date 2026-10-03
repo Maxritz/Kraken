@@ -85,11 +85,52 @@ public:
     const u8 *data() const { return data_; }
     size_t size() const { return size_; }
 
+    // Reads [off, off+len) into `dst` with read(), bypassing the mapping's page
+    // faults. A cold mmap costs a soft fault per 4 KiB page (~0.4 us each, 1.2M
+    // faults and 1209 ms for the 8B), while read() into a warm page cache runs
+    // at 42 GB/s. The mapping is still what the loader parses out of; this is
+    // only for pulling whole tensors into a staging buffer.
+    bool read_at(size_t off, void *dst, size_t len) const;
+
+    // Path the file was opened from, so a caller can open its own handle to the
+    // same bytes. Weight loading needs this: on Windows a file HANDLE serialises
+    // concurrent ReadFile calls, so N reader threads on one handle measure
+    // 7.4 GB/s where N threads with N handles measure 15.9. The mapping itself
+    // stays single-handle -- only the pull path wants the extra handles.
+    const std::string &path() const { return path_; }
+
 private:
     const u8 *data_ = nullptr;
     size_t size_ = 0;
+    std::string path_;
     void *native_handle_ = nullptr; // fd (POSIX) or file HANDLE (Win32)
     void *native_map_ = nullptr;    // mapping handle (Win32 only)
+};
+
+// A second handle onto a file already mapped by MappedFile. Independent of the
+// mapping's own handle, so each reader thread in the weight-load pipeline can
+// issue its own pread/ReadFile without serialising against the others. All
+// methods are safe to call from any thread; `at()` is the only hot one.
+class FileReader {
+public:
+    FileReader() = default;
+    ~FileReader();
+    FileReader(const FileReader &) = delete;
+    FileReader &operator=(const FileReader &) = delete;
+
+    // Opens a read-only handle. Returns false if the file cannot be opened.
+    bool open(const std::string &path);
+    void close();
+    bool ok() const { return handle_ != nullptr; }
+
+    // Reads [off, off+len) into dst, retrying short reads. Safe to call
+    // concurrently with other FileReaders, and with itself on POSIX; on Windows
+    // concurrent calls on the SAME FileReader are serialised by the OS, which is
+    // why the pipeline gives each thread its own.
+    bool at(size_t off, void *dst, size_t len);
+
+private:
+    void *handle_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
