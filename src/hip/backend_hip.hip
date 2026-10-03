@@ -703,9 +703,36 @@ public:
         // packed lane slice cannot cover.
         if (d.n_tok == 1 && attention_decode_supported(d.hd)) {
             stage_pos(d.pos0);
+            // Split the key range so the grid fills the card. n_head alone is
+            // 8 blocks on 64 CUs for this model; the split is sized from the
+            // key count so a short context still collapses to one block per
+            // head and takes the original path unchanged.
+            const i64 n_keys = d.pos0 + 1;
+            int n_split = attention_decode_splits(
+                n_keys, d.n_head, caps_.cu_count);
+            // A/B knob: KRK_ATTN_SPLIT=0 forces one block per head so the
+            // split path can be diffed against it on identical input. The two
+            // are algebraically the same computation, so the text must match.
+            if (const char *kv = std::getenv("KRK_ATTN_SPLIT"))
+                if (kv[0] == '0') n_split = 1;
+            f32 *part = nullptr;
+            if (n_split > 1) {
+                const size_t per = static_cast<size_t>(d.n_head) *
+                                   static_cast<size_t>(n_split) *
+                                   static_cast<size_t>(2 + kWaveSize * (d.hd / 32)) *
+                                   sizeof(f32);
+                if (per > attn_part_cap_) {
+                    if (attn_part_) KRK_HIP(hipFree(attn_part_));
+                    attn_part_ = nullptr;
+                    attn_part_cap_ = (per + 255u) & ~static_cast<size_t>(255u);
+                    KRK_HIP(hipMalloc(&attn_part_, attn_part_cap_));
+                }
+                part = attn_part_;
+            }
             attention_decode(out, q, kc, vc, d.n_head, d.n_kv, d.hd,
                              pos_dev_, d.pos_stride, d.causal ? 1 : 0,
-                             d.scale);
+                             d.scale, nullptr, part, n_split,
+                             caps_.cu_count);
             return;
         }
 
@@ -973,6 +1000,10 @@ public:
             (void)hipFree(int8s_);
             int8s_ = nullptr;
         }
+        if (attn_part_) {
+            (void)hipFree(attn_part_);
+            attn_part_ = nullptr;
+        }
         for (const GdnTaps &e : gdn_taps_) (void)hipFree(e.dev);
         gdn_taps_.clear();
         if (stage_pin_) {
@@ -998,6 +1029,10 @@ private:
     size_t int8q_cap_ = 0;
     f32 *int8s_ = nullptr;
     size_t int8s_cap_ = 0;
+    // Decode-attention key-split partials: [n_head][n_split][2 + 32*VPT].
+    // One allocation, grown on demand, reused every layer and every token.
+    f32 *attn_part_ = nullptr;
+    size_t attn_part_cap_ = 0;
     // Device staging for the host token-id array embed() reads (grown
     // on demand; see embed()).
     void *tok_dev_ = nullptr;

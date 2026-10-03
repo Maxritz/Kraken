@@ -364,22 +364,210 @@ inline void attention_decode_launch(void *out, const void *q, const void *kcache
         n_head, n_kv, hd, pos0, pos_stride, causal, scale);
 }
 
+// ---------------------------------------------------------------------------
+// key-split decode
+//
+// One block per head is not enough of a grid. Qwen3.5-0.8B has 8 query heads
+// per layer on a 64-CU card: the decode kernel launched 8 blocks and left 56
+// CUs idle, and because the tiled fallback has grid (n_head, n_tok) it did the
+// same while additionally staging K and V tiles through LDS. Measured at ~4900
+// keys that is 4.80 ms for one call over 10.0 MB of KV — 2.1 GB/s, 270x below
+// what the card sustains on a large read.
+//
+// The fix is the split-K pattern the GEMMs already use here: cut the key range
+// into `n_split` chunks, give each chunk a block, and merge the per-chunk
+// (m, l, O) triples. Online softmax composes exactly, so the merge is the same
+// arithmetic the single-block epilogue already does — it is not an
+// approximation, and n_split == 1 reproduces the old kernel bit for bit.
+//
+// `n_split` is chosen from the key count, not fixed: chunks must be long
+// enough to amortise a block (64 keys), so at a short context this collapses
+// to 1 and changes nothing, while at long context it fills the device.
+// ---------------------------------------------------------------------------
+
+// Per split: running max, denominator, then VPT output channels.
+template <int VPT>
+__global__ void __launch_bounds__(kAttnDecThreads)
+    attention_decode_split_kernel(_Float16 *__restrict__ out,
+                                  const _Float16 *__restrict__ q,
+                                  const _Float16 *__restrict__ kcache,
+                                  const _Float16 *__restrict__ vcache, i64 n_head,
+                                  i64 n_kv, i64 hd, const i64 *__restrict__ pos0,
+                                  i64 pos_stride, i64 causal, f32 scale,
+                                  f32 *__restrict__ part, int n_split) {
+    const i64 h = blockIdx.x;
+    const int sp = static_cast<int>(blockIdx.y);
+    const i64 n_rep = n_kv > 0 ? n_head / n_kv : 1;
+    const i64 hkv = n_rep > 0 ? h / n_rep : 0;
+    const i64 p0 = *pos0;
+    const i64 n_keys = p0 + 1;
+
+    // Split into equal chunks, rounded to a multiple of the warp count so each
+    // block's warps still get whole keys and the ranges tile exactly.
+    const i64 per = ((n_keys + n_split - 1) / n_split + kAttnDecWarps - 1) /
+                    kAttnDecWarps * kAttnDecWarps;
+    const i64 j0 = static_cast<i64>(sp) * per;
+    const i64 j1 = min(n_keys, j0 + per);
+
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+
+    u32 qp[VPT / 2];
+#pragma unroll
+    for (int e = 0; e < VPT / 2; e++)
+        qp[e] = *reinterpret_cast<const u32 *>(q + h * hd + lane * VPT + 2 * e);
+
+    const _Float16 *kb = kcache + hkv * hd;
+    const _Float16 *vb = vcache + hkv * hd;
+
+    f32 m = -1.0e30f;
+    f32 l = 0.0f;
+    f32 acc[VPT];
+#pragma unroll
+    for (int e = 0; e < VPT; e++) acc[e] = 0.0f;
+
+    for (i64 j = j0 + warp; j < j1; j += kAttnDecWarps) {
+        const _Float16 *krow = kb + j * pos_stride;
+        const _Float16 *vrow = vb + j * pos_stride;
+        const f32 s = d_wave_reduce_sum(attn_lane_dot<VPT>(qp, krow, lane)) * scale;
+        const f32 mnew = fmaxf(m, s);
+        const f32 a = __expf(m - mnew);
+        const f32 p = __expf(s - mnew);
+        l = l * a + p;
+#pragma unroll
+        for (int e = 0; e < VPT; e++)
+            acc[e] = acc[e] * a + p * static_cast<f32>(vrow[lane * VPT + e]);
+        m = mnew;
+    }
+
+    // Reduce the warps of this block first, so one thread per split writes the
+    // partial rather than all 256 threads writing the same address.
+    __shared__ f32 s_m[kAttnDecWarps];
+    __shared__ f32 s_l[kAttnDecWarps];
+    __shared__ f32 s_o[kAttnDecWarps * kWaveSize * VPT];
+    if (lane == 0) { s_m[warp] = m; s_l[warp] = l; }
+    __syncthreads();
+    f32 mstar = -1.0e30f;
+#pragma unroll
+    for (int w = 0; w < kAttnDecWarps; w++) mstar = fmaxf(mstar, s_m[w]);
+    const f32 aw = __expf(m - mstar);
+    f32 *slot = s_o + (warp * kWaveSize + lane) * VPT;
+#pragma unroll
+    for (int e = 0; e < VPT; e++) slot[e] = acc[e] * aw;
+    __syncthreads();
+    f32 lt = 0.0f, ot[VPT];
+#pragma unroll
+    for (int e = 0; e < VPT; e++) ot[e] = 0.0f;
+    if (lane == 0) lt = s_l[warp] * aw;
+#pragma unroll
+    for (int w = 0; w < kAttnDecWarps; w++) {
+        lt += s_l[w] * __expf(s_m[w] - mstar);
+        const f32 *s2 = s_o + (w * kWaveSize + lane) * VPT;
+#pragma unroll
+        for (int e = 0; e < VPT; e++) ot[e] += s2[e];
+    }
+    // Write this block's partial in the same lane-major shape the single-block
+    // epilogue uses: lane L owns output channels [L*VPT, (L+1)*VPT), so the
+    // merge kernel can be the same reduction with one extra loop over splits.
+    f32 *p = part + (h * n_split + sp) * (2 + kWaveSize * VPT);
+    if (lane == 0) {
+        p[0] = mstar;
+        p[1] = lt;
+    }
+    f32 *pa = p + 2 + lane * VPT;
+#pragma unroll
+    for (int e = 0; e < VPT; e++) pa[e] = ot[e];
+}
+
+template <int VPT>
+__global__ void __launch_bounds__(kAttnDecThreads)
+    attention_decode_merge_kernel(_Float16 *__restrict__ out, i64 n_head, i64 hd,
+                                  const f32 *__restrict__ part, int n_split) {
+    const i64 h = blockIdx.x;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int stride = 2 + kWaveSize * VPT;
+    const f32 *p = part + h * n_split * stride;
+    f32 mstar = -1.0e30f;
+    for (int s = 0; s < n_split; s++) mstar = fmaxf(mstar, p[s * stride]);
+    f32 ot[VPT];
+#pragma unroll
+    for (int e = 0; e < VPT; e++) ot[e] = 0.0f;
+    f32 den = 0.0f;
+    for (int s = 0; s < n_split; s++) {
+        const f32 *e = p + s * stride;
+        const f32 aw = __expf(e[0] - mstar);
+        den += e[1] * aw;
+        const f32 *a = e + 2 + lane * VPT;
+#pragma unroll
+        for (int v = 0; v < VPT; v++) ot[v] += a[v] * aw;
+    }
+    const f32 inv = den > 0.0f ? 1.0f / den : 0.0f;
+    _Float16 *orow = out + h * hd + lane * VPT;
+#pragma unroll
+    for (int e = 0; e < VPT; e++) orow[e] = static_cast<_Float16>(ot[e] * inv);
+}
+
 // Host dispatch: VPT = hd/32 must be an even lane slice that the packed pair
-// form covers (4 bytes per load, 8 bytes per wave lane group). Heads of 64 and
-// 128 are the ones this engine actually sees; anything else falls back to the
-// tiled kernel.
-inline bool attention_decode_supported(i64 hd) { return hd == 64 || hd == 128; }
+// form covers (4 bytes per load, 8 bytes per wave lane group). hd = 256 is the
+// Qwen3.5-0.8B head width and was missing here, which is why that model ran
+// the tiled kernel: 8 blocks, no split, 2.1 GB/s.
+inline bool attention_decode_supported(i64 hd) {
+    return hd == 64 || hd == 128 || hd == 256;
+}
+
+// How many key chunks to cut into, given the key count and the device. One
+// block per head is the floor; the target is a few blocks per CU, and a chunk
+// must be long enough to pay for its own block.
+inline int attention_decode_splits(i64 n_keys, i64 n_head, int cu_count) {
+    const i64 target_blocks = static_cast<i64>(cu_count) * 4;
+    if (n_head >= target_blocks) return 1;
+    i64 want = (target_blocks + n_head - 1) / n_head;
+    // A chunk shorter than kAttnDecWarps*8 keys cannot keep 8 warps fed.
+    const i64 min_keys = kAttnDecWarps * 8;
+    const i64 by_len = n_keys / min_keys;
+    if (want > by_len) want = by_len;
+    if (want < 1) want = 1;
+    if (want > 256) want = 256;
+    return static_cast<int>(want);
+}
 
 inline void attention_decode(void *out, const void *q, const void *kcache,
                              const void *vcache, i64 n_head, i64 n_kv, i64 hd,
                              const i64 *pos0, i64 pos_stride, int causal,
-                             f32 scale, hipStream_t stream = nullptr) {
-    if (hd == 64)
-        attention_decode_launch<2>(out, q, kcache, vcache, n_head, n_kv, hd, pos0,
-                                   pos_stride, causal, scale, stream);
-    else if (hd == 128)
-        attention_decode_launch<4>(out, q, kcache, vcache, n_head, n_kv, hd, pos0,
-                                   pos_stride, causal, scale, stream);
+                             f32 scale, hipStream_t stream = nullptr,
+                             f32 *part = nullptr, int n_split = 1,
+                             int cu_count = 0) {
+    (void)causal;
+    if (n_split < 1 || part == nullptr) n_split = 1;
+    if (n_split == 1) {
+        if (hd == 64)
+            attention_decode_launch<2>(out, q, kcache, vcache, n_head, n_kv, hd,
+                                       pos0, pos_stride, causal, scale, stream);
+        else if (hd == 128)
+            attention_decode_launch<4>(out, q, kcache, vcache, n_head, n_kv, hd,
+                                       pos0, pos_stride, causal, scale, stream);
+        else
+            attention_decode_launch<8>(out, q, kcache, vcache, n_head, n_kv, hd,
+                                       pos0, pos_stride, causal, scale, stream);
+        return;
+    }
+#define KRK_ATTN_SPLIT(VPT)                                                   \
+    do {                                                                      \
+        const dim3 g(static_cast<unsigned>(n_head),                          \
+                     static_cast<unsigned>(n_split));                         \
+        attention_decode_split_kernel<VPT><<<g, kAttnDecThreads, 0, stream>>>( \
+            static_cast<_Float16 *>(out), static_cast<const _Float16 *>(q),   \
+            static_cast<const _Float16 *>(kcache),                            \
+            static_cast<const _Float16 *>(vcache), n_head, n_kv, hd, pos0,     \
+            pos_stride, causal, scale, part, n_split);                        \
+        attention_decode_merge_kernel<VPT>                                    \
+            <<<static_cast<unsigned>(n_head), kAttnDecThreads, 0, stream>>>(  \
+                static_cast<_Float16 *>(out), n_head, hd, part, n_split);      \
+    } while (0)
+    if (hd == 64) KRK_ATTN_SPLIT(2);
+    else if (hd == 128) KRK_ATTN_SPLIT(4);
+    else KRK_ATTN_SPLIT(8);
+#undef KRK_ATTN_SPLIT
 }
 
 // ---------------------------------------------------------------------------
