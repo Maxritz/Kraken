@@ -177,15 +177,66 @@ pass, the sampler and both tokenizer families are all covered end to end.
 
 ## Benchmarks
 
-Measured with `kraken --bench` (greedy, ctx 4096, chunk 256) on the
-**AMD Radeon RX 9070 XT** (gfx1201, RDNA4, WMMA, 64 CU), HIP 7.16,
-ROCm 10.1. Ranges are min–max over repeated runs.
+### The command
 
-| model | prefill | decode, 64 tok | decode, 256 tok |
+Every number below comes from one command, run three times per model:
+
+```
+kraken --model <MODEL> --bench
+```
+
+`--bench` is self-contained and needs no flags: it feeds a fixed **51-token
+prompt**, generates **256 tokens**, and reports prefill and decode as separate
+rates. Defaults in force for every row: greedy sampling, `--ctx 4096`,
+`--chunk 256`. Two timings are reported and they mean different things:
+
+- **prefill** — prompt tokens / time to process them. Throughput, so higher is
+  better and it scales with batch size.
+- **decode** — generated tokens / time to generate them. The context grows
+  during the run, so this is the *average* over 256 tokens ending at ~300
+  tokens of context, not a short-context number.
+
+Configuration: **AMD Radeon RX 9070 XT** (gfx1201, RDNA4, wave32, WMMA gfx12,
+64 CU, 15.9 GiB VRAM), HIP 7.16.26323, clang 23.0.0, ROCm 10.1, host Windows 11.
+Build `989944e`.
+
+### Results (3 runs each, range = min–max)
+
+| model | layers / embd | prefill tok/s | decode tok/s |
 |---|---|---|---|
-| SmolLM2-135M-Instruct Q4_K_M | 3.3–4.5k tok/s | 585–594 tok/s | 524–534 tok/s |
-| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 2.9–3.2k tok/s | 368.0–368.8 tok/s | 361.3–367.4 tok/s |
-| Qwen3-8B Q4_K_M | 642–695 tok/s | 95.1–95.4 tok/s (32 tok) | — |
+| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 3915–4100 | 493–505 |
+| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 3019–3062 | 279–280 |
+| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 24 / 2048 | 202–204 | 99–102 |
+| Qwen3-8B Q4_K_M | 36 / 4096 | 635–681 | 87.3–87.6 |
+
+To reproduce, substituting your own path:
+
+```
+kraken --model models/SmolLM2-135M-Instruct.Q4_K_M.gguf          --bench
+kraken --model models/Qwen3.5-0.8B.Q4_K_M.gguf                 --bench
+kraken --model models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf         --bench
+kraken --model "G:/More-models/Qwen3-8B-Q4_K_M.gguf"            --bench
+```
+
+Run-to-run spread is 2–5% on prefill and under 2% on decode, so treat
+differences smaller than that as noise. The MoE row is the only one that
+depends on a tunable: it assumes the default expert budget, which is why it
+looks slow next to the MoE numbers further down.
+
+### Short-context decode
+
+`--bench` deliberately measures decode at a few hundred tokens of context,
+where attention is still cheap. To see decode with a nearly empty cache, give
+the run a short window:
+
+```
+kraken --model models/Qwen3.5-0.8B.Q4_K_M.gguf --ctx 64  -n 256 --greedy -v
+kraken --model models/Qwen3.5-0.8B.Q4_K_M.gguf --ctx 256 -n 256 --greedy -v
+```
+
+`-v` prints `[N prompt / N generated | prefill X ms | decode Y tok/s]` after the
+answer. The same model reads **368 tok/s** at ctx 64 and **279 tok/s** over the
+256-token `--bench` run; that gap is context cost, not a regression.
 
 ### Decode rate is now flat in context
 

@@ -239,6 +239,64 @@ n_split == 1 at its context, as intended).
 The lane layout was already correct and needed no work: lanes cover channels,
 so a warp's KV read is contiguous.
 
+### B6 — Prefill is 95% attention — OPEN, kernel written but NOT correct
+
+**Status: blocked.** The diagnosis is solid; the kernel that fixes it is fast but
+wrong, so it is **opt-in only** (`KRK_ATTN_QTILE=1`) and the shipped prefill is
+still the per-token tiled kernel.
+
+Diagnosis (`--profile`, 0.8B, 2048-token chunk): 577,373 us across 6 `attention`
+calls = 96.2 ms/call, vs 18.1 ms for 186 `gemm(wmma)` calls. The score math is
+17.18 GFLOP = 353 us at 48.7 TFLOP/s, so attention is **270x off** its own
+ceiling. Two compounding defects in `attention_kernel`, one block per
+(head, token):
+
+1. **1024x redundant KV staging.** Grid (8 heads, 256 tokens) = 2048 blocks,
+   each re-staging the whole K and V history: 2048 x 2048 keys x 2 x 256 hd x
+   2 B = 4.29 GB/layer against 4.2 MB of unique KV.
+2. **4% thread utilization on the scores.** `if (tid < tile)` with `tile_k=32`
+   against `kAttnBlock=128` leaves 32 of 128 threads computing scores, each
+   running a 256-long serial FMA, with ~5 `__syncthreads()` per tile over 63
+   tiles.
+
+`attention_qtile_kernel<QT>` fixes the shape: one block per (head, 8 queries),
+grid `(n_head, ceil(n_tok/8))`, so the K/V tile is staged once for 8 queries.
+**Measured speed is real**: prompt 1360 560 -> 195 ms (2.87x), prompt 2720
+1991 -> 371 ms (5.37x), prefill 6974 -> 7332 tok/s.
+
+**It is not correct, and the output is worse than useless** — fluent, confident,
+wrong text (`", and the number of people who are in the"` for "What is the
+capital of France?"). Two real bugs were found and fixed along the way:
+
+* Q rows are **strided by `n_head*hd`, not contiguous.** Staging `nq*hd`
+  elements as one run walks into the next head's row, so every query after the
+  first scored against the wrong head. This is why the failure read as
+  *fluent* rather than as noise. Fixed.
+* `n_keys` was derived from the chunk-relative last position, omitting `pos0`,
+  so any chunk after the first would attend to too few keys. Fixed.
+
+**What is still wrong**, measured by `tools/probe_attn_qtile.hip` (which runs
+both kernels on identical buffers, so the tiled kernel is the arbiter):
+
+* Error scales with the **number of key tiles**, not the tile size — rel 6e-2
+  for one tile, 2.4e-1 at `tile_k=4`, 5.3e-1 at `tile_k=1`. So the cross-tile
+  rescaling is the suspect, not the intra-tile layout.
+* The **per-key score matrix is verified correct** against a double-precision
+  CPU reference (0 mismatches, single tile), which puts the defect downstream of
+  the scores: in the per-query max / normalizer / accumulator stage.
+* Not a compiler artifact: identical failure at `-O0`, `-O1`, `-O2`, `-O3`.
+* Not the fully-unrolled loop `break` (`#pragma unroll 1` unchanged), and not
+  the read-`s_sh`-then-rewrite-`s_sh` race inside the query loop (an explicit
+  barrier between the read-only max pass and the in-place softmax pass made it
+  *worse*, 8 more live registers).
+
+Two dead ends worth recording, because both produced confident wrong answers:
+an earlier m/l dump read as if `m == 1.0` (provably impossible given `alpha`),
+and the probe's own CPU reference used `n_head*hd` as the KV position stride
+instead of `pos_stride`. Both made it look like the kernel was wrong in a place
+it was not. **The dump values were racy too** — every block writes one `dbg`
+buffer, so only `n_head == 1` gives coherent numbers.
+
 ### B5 (historical) — Attention at decode context
 
 `attention` measured 190 µs/call on the 0.8B when the KV traffic at ~311 keys is

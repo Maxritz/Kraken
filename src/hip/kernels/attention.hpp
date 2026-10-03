@@ -216,6 +216,201 @@ __global__ void __launch_bounds__(kAttnBlock)
 }
 
 // ---------------------------------------------------------------------------
+// query-tiled flash prefill
+//
+// The tiled kernel above launches one block per (head, token) and re-stages the
+// entire K and V history in every one of them. Measured on Qwen3.5-0.8B at a
+// 2048-token chunk: 2048 blocks x 2048 keys x 2 x 256 x 2 B = 4.29 GB of KV
+// staging per layer, against 4.2 MB of unique KV -- 1024x redundancy -- and
+// 96.2 ms per call for score math that costs 353 us at the card's 48.7
+// TFLOP/s. It was also only using 32 of its 128 threads for the scores, one
+// key each doing a 256-long serial FMA.
+//
+// This kernel gives each block QT consecutive query tokens, so the K/V tile is
+// staged once and amortized across all of them, and every thread carries a
+// query's scores. Same online-softmax formulation, so it is a reformulation:
+// only the summation order changes.
+//
+// Thread map (kAttnBlock = 128 = 4 waves, QT queries, tile_k keys):
+//   * one wave owns QPW = QT/4 queries; lane L owns key L of the tile and
+//     computes that query's dot product over the head, then the wave reduces
+//     the max and the sum;
+//   * every thread owns output channels {tid, tid+kAttnBlock} for *every*
+//     query, so the V accumulation is also fully parallel over threads.
+// Accumulators are kMaxOv * QT floats per thread (2*8 = 16 for QT=8), which is
+// what bounds QT here rather than LDS.
+// ---------------------------------------------------------------------------
+template <int QT>
+__global__ void __launch_bounds__(kAttnBlock)
+    attention_qtile_kernel(_Float16 *__restrict__ out, const _Float16 *__restrict__ q,
+                           const _Float16 *__restrict__ kcache,
+                           const _Float16 *__restrict__ vcache, i64 n_head, i64 n_kv,
+                           i64 hd, i64 n_tok, i64 pos0, i64 pos_stride, i64 causal,
+                           f32 scale, int tile_k) {
+    constexpr int kWaves = kAttnBlock / kWaveSize;
+    constexpr int kQPW = QT / kWaves; // queries per wave
+    extern __shared__ u8 smem[];
+    f32 *s_sh = reinterpret_cast<f32 *>(smem); // [QT][tile_k]
+    const size_t sbytes = (static_cast<size_t>(QT) * tile_k * sizeof(f32) + 15u) & ~static_cast<size_t>(15u);
+    _Float16 *q_sh = reinterpret_cast<_Float16 *>(smem + sbytes); // [QT][hd]
+    _Float16 *k_sh = q_sh + static_cast<i64>(QT) * hd;           // [tile_k][hd]
+    _Float16 *v_sh = k_sh + static_cast<i64>(tile_k) * hd;
+
+    const i64 t0 = static_cast<i64>(blockIdx.y) * QT;
+    const i64 h = blockIdx.x;
+    if (t0 >= n_tok) return;
+    const int nq = static_cast<int>(min(static_cast<i64>(QT), n_tok - t0));
+    const i64 n_rep = n_kv > 0 ? n_head / n_kv : 1;
+    const i64 hkv = n_rep > 0 ? h / n_rep : 0;
+    // Causal: the newest query in the block sees the most keys, so the shared
+    // bound is that one. Queries inside the tile mask themselves off via
+    // `key_ok`, which keeps the K/V staging identical for every query in it.
+    const i64 tmax = pos0 + t0 + nq - 1;
+    const i64 n_keys = (causal ? tmax + 1 : pos0 + n_tok);
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+
+    // Q rows are strided by n_head*hd, NOT contiguous: query qi of this block
+    // lives at ((t0+qi)*n_head + h)*hd. Staging nq*hd elements as one run walks
+    // straight into the next head's row, so every query past the first scored
+    // against the wrong head's vector. That is what made the prefill output
+    // read as fluent garbage rather than fail outright.
+    for (i64 i = tid; i < static_cast<i64>(nq) * hd; i += kAttnBlock) {
+        const i64 qi = i / hd, d = i % hd;
+        q_sh[i] = q[((t0 + qi) * n_head + h) * hd + d];
+    }
+
+    const _Float16 *kb = kcache + hkv * hd;
+    const _Float16 *vb = vcache + hkv * hd;
+
+    f32 acc[QT][kMaxOv];
+    f32 mq[QT], lq[QT];
+#pragma unroll
+    for (int r = 0; r < QT; r++) {
+        mq[r] = -1.0e30f;
+        lq[r] = 0.0f;
+#pragma unroll
+        for (int o = 0; o < kMaxOv; o++) acc[r][o] = 0.0f;
+    }
+
+    for (i64 k0 = 0; k0 < n_keys; k0 += tile_k) {
+        const int tile = static_cast<int>(
+            (n_keys - k0) < tile_k ? (n_keys - k0) : tile_k);
+        const i64 tile_elems = static_cast<i64>(tile) * hd;
+        for (i64 i = tid; i < tile_elems; i += kAttnBlock) {
+            const i64 j = i / hd, d = i % hd;
+            k_sh[i] = kb[(k0 + j) * pos_stride + d];
+        }
+        for (i64 i = tid; i < tile_elems; i += kAttnBlock) {
+            const i64 j = i / hd, d = i % hd;
+            v_sh[i] = vb[(k0 + j) * pos_stride + d];
+        }
+        __syncthreads();
+
+        // Scores: wave owns kQPW queries, lane owns key `lane` of the tile.
+        // Only key `lane` is computed, so the wave needs tile_k == kWaveSize
+        // keys per pass; larger tiles loop.
+        for (int jb = 0; jb < tile; jb += kWaveSize) {
+            const int j = jb + lane;
+            const bool live = j < tile;
+#pragma unroll
+            for (int r = 0; r < kQPW; r++) {
+                const int qi = wave * kQPW + r;
+                if (!live || qi >= nq) continue;
+                const _Float16 *qj = q_sh + static_cast<i64>(qi) * hd;
+                const _Float16 *kj = k_sh + static_cast<i64>(j) * hd;
+                f32 dot = 0.0f;
+#pragma unroll 8
+                for (i64 d = 0; d < hd; d++)
+                    dot += static_cast<f32>(qj[d]) * static_cast<f32>(kj[d]);
+                // Each lane writes its OWN key's score. Reducing across the
+                // wave here would collapse 32 different keys into one value;
+                // the per-query max and sum are taken from LDS below.
+                s_sh[static_cast<i64>(qi) * tile_k + j] = dot * scale;
+            }
+        }
+        __syncthreads();
+
+        // Online softmax per query, then the V accumulation. Both are fully
+        // parallel over the block: the reductions are over LDS.
+#pragma unroll
+        for (int qi = 0; qi < QT; qi++) {
+            if (qi >= nq) continue;
+            // Absolute position of this query. blockIdx.y indexes the chunk,
+            // but the KV cache rows it attends to are at absolute positions, so
+            // the causal bound needs pos0 added -- the tiled kernel computes
+            // `pos = pos0 + t` and the causal bound from that. Dropping pos0
+            // silently lets every query after the first chunk attend to keys it
+            // must not see.
+            const i64 my = pos0 + t0 + qi;
+            // A tile that starts past this query's bound holds no live keys.
+            // Skipping the query entirely is what keeps alpha = exp(m - m) = 1;
+            // letting it fall through with an empty tile gives tmax = -1e30 and
+            // alpha = exp(0) = 1 only by luck, while acc = acc*alpha + 0 wipes
+            // everything the earlier tiles contributed.
+            if (k0 > my) continue;
+            f32 tmax = -1.0e30f;
+            for (int j = 0; j < tile; j++) {
+                const i64 kk = k0 + j;
+                if (causal && kk > my) break; // keys are contiguous: stop at the bound
+                tmax = fmaxf(tmax, s_sh[static_cast<i64>(qi) * tile_k + j]);
+            }
+            const f32 mnew = fmaxf(mq[qi], tmax);
+            const f32 alpha = __expf(mq[qi] - mnew);
+            f32 rowsum = 0.0f;
+            for (int j = 0; j < tile; j++) {
+                const i64 kk = k0 + j;
+                if (causal && kk > my) break;
+                const f32 e = __expf(s_sh[static_cast<i64>(qi) * tile_k + j] - mnew);
+                s_sh[static_cast<i64>(qi) * tile_k + j] = e;
+                rowsum += e;
+            }
+            lq[qi] = lq[qi] * alpha + rowsum;
+            mq[qi] = mnew;
+#pragma unroll
+            for (int o = 0; o < kMaxOv; o++) {
+                const i64 d = tid + static_cast<i64>(o) * kAttnBlock;
+                if (d >= hd) continue;
+                f32 a = 0.0f;
+                for (int j = 0; j < tile; j++) {
+                    const i64 kk = k0 + j;
+                    if (causal && kk > my) break;
+                    a += s_sh[static_cast<i64>(qi) * tile_k + j] *
+                         static_cast<f32>(v_sh[static_cast<i64>(j) * hd + d]);
+                }
+                acc[qi][o] = acc[qi][o] * alpha + a;
+            }
+        }
+        __syncthreads();
+    }
+
+    const int nov = static_cast<int>((hd + kAttnBlock - 1) / kAttnBlock);
+#pragma unroll
+    for (int qi = 0; qi < QT; qi++) {
+        if (qi >= nq) continue;
+        const f32 inv = lq[qi] > 0.0f ? 1.0f / lq[qi] : 0.0f;
+        for (int o = 0; o < nov && o < kMaxOv; o++) {
+            const i64 d = tid + static_cast<i64>(o) * kAttnBlock;
+            if (d < hd)
+                out[((t0 + qi) * n_head + h) * hd + d] =
+                    static_cast<_Float16>(acc[qi][o] * inv);
+        }
+    }
+}
+
+// LDS for QT queries: scores [QT][tile], q [QT][hd], then the K and V tiles.
+template <int QT>
+inline size_t attn_qtile_smem_bytes(int tile_k, i64 hd) {
+    const size_t scores = static_cast<size_t>(QT) * static_cast<size_t>(tile_k) * sizeof(f32);
+    const size_t aligned = (scores + 15u) & ~static_cast<size_t>(15u);
+    return aligned + sizeof(_Float16) *
+                         (static_cast<size_t>(QT) + 2u * static_cast<size_t>(tile_k)) *
+                         static_cast<size_t>(hd) * 2u;
+}
+
+// ---------------------------------------------------------------------------
 // flash attention — decode (n_tok == 1)
 //
 // The tiled kernel above parallelizes over output channels and hands each whole

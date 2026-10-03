@@ -740,6 +740,45 @@ public:
         const int tile_k = static_cast<int>(
             std::min<i64>(64, std::max<i64>(8, 8192 / std::max<i64>(1, d.hd))));
         const size_t smem = attn_smem_bytes(tile_k, d.hd);
+
+        // Query-tiled prefill: QT tokens share one staged K/V tile instead of
+        // every token staging the whole history alone. QT=8 is what the
+        // register budget allows (kMaxOv * QT accumulators per thread); the
+        // tile is cut back if LDS cannot hold the wider q tile.
+        // KNOWN WRONG -- opt in with KRK_ATTN_QTILE=1, see attn_qtile_on().
+        constexpr int kQT = 8;
+        // The q tile adds QT*hd halves on top of the two key tiles, so the key
+        // tile has to shrink to fit LDS. Shrinking is the right knob because
+        // the sharing factor (QT) is what buys the win, while tile_k only
+        // controls barrier count -- 16 keys already keeps every lane of the
+        // staging loops busy at kAttnBlock = 128.
+        int qtile_k = tile_k;
+        while (qtile_k > 8 &&
+               attn_qtile_smem_bytes<kQT>(qtile_k, d.hd) > caps_.lds_bytes)
+            qtile_k /= 2;
+        if (const char *fk = std::getenv("KRK_ATTN_QTILE_K")) {
+            const int want = std::atoi(fk);
+            if (want > 0 &&
+                attn_qtile_smem_bytes<kQT>(want, d.hd) <= caps_.lds_bytes)
+                qtile_k = want;
+        }
+        if (attn_qtile_on() &&
+            attn_qtile_smem_bytes<kQT>(qtile_k, d.hd) <= caps_.lds_bytes) {
+            const size_t qsmem = attn_qtile_smem_bytes<kQT>(qtile_k, d.hd);
+            const dim3 grid(static_cast<unsigned>(d.n_head),
+                            static_cast<unsigned>((d.n_tok + kQT - 1) / kQT));
+            KRK_HIP(hipFuncSetAttribute(
+                reinterpret_cast<const void *>(&attention_qtile_kernel<kQT>),
+                hipFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(qsmem + 512)));
+            attention_qtile_kernel<kQT><<<grid, kAttnBlock, qsmem>>>(
+                static_cast<_Float16 *>(out), static_cast<const _Float16 *>(q),
+                static_cast<const _Float16 *>(kc), static_cast<const _Float16 *>(vc),
+                d.n_head, d.n_kv, d.hd, d.n_tok, d.pos0, d.pos_stride,
+                d.causal ? 1 : 0, d.scale, qtile_k);
+            return;
+        }
+
         if (smem > caps_.lds_bytes) {
             KRK_ERROR("attention: %zu bytes of LDS requested, device has %d", smem,
                       caps_.lds_bytes);
@@ -1157,7 +1196,22 @@ bool stage_upload(void *dst, const void *src, size_t bytes) {
     return true;
 }
 
-void stage_pos(i64 pos0) {
+// Opt-IN. The query-tiled prefill kernel is FAST but not yet correct: with
+    // identical inputs it disagrees with attention_kernel, and the error grows
+    // with the number of key tiles (rel 6e-2 on a single tile, 5.3e-1 at
+    // tile_k = 1). The per-key score matrix is verified correct against a
+    // double-precision CPU reference, so the defect is downstream of it, in
+    // the per-query softmax/normalizer/accumulator stage. It is off by default
+    // because a wrong-but-fluent prefill is strictly worse than a slow one;
+    // probe_attn_qtile.hip reproduces the comparison.
+//   KRK_ATTN_QTILE=1  use it (needs attention_qtile_kernel to be fixed)
+//   KRK_ATTN_QTILE_K=N  force the key tile size when running the probe
+    static bool attn_qtile_on() {
+        const char *v = std::getenv("KRK_ATTN_QTILE");
+        return v && v[0] == '1';
+    }
+
+    void stage_pos(i64 pos0) {
         if (pos_valid_ && pos_staged_ == pos0) return;
         if (!pos_dev_) KRK_HIP(hipMalloc(&pos_dev_, sizeof(i64)));
         stage_upload(pos_dev_, &pos0, sizeof(i64));

@@ -225,6 +225,29 @@ if(KRK_BUILD_PROBES AND KRK_HIP_AVAILABLE)
             target_compile_definitions(${probe} PRIVATE "KRK_OFFLOAD_${tgt_uc}=1")
         endforeach()
     endforeach()
+
+    # probe_attn_qtile lives in tools/ rather than the repo root because it is
+    # the one probe that has to stay version-controlled: it is the A/B that
+    # reproduces the attention_qtile_kernel correctness question, and .gitignore
+    # drops everything at the root. Built the same way, from a different path.
+    add_executable(probe_attn_qtile
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_attn_qtile.hip)
+    target_include_directories(probe_attn_qtile PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/hip)
+    if(TARGET hip::device)
+        target_link_libraries(probe_attn_qtile PRIVATE hip::device)
+    elseif(HIP_FOUND)
+        target_link_libraries(probe_attn_qtile PRIVATE ${HIP_LIBRARIES})
+    endif()
+    target_compile_options(probe_attn_qtile PRIVATE
+                           -O3 -ffast-math -fno-finite-math-only)
+    foreach(tgt IN LISTS CMAKE_HIP_ARCHITECTURES)
+        string(TOUPPER "${tgt}" tgt_uc)
+        target_compile_definitions(probe_attn_qtile PRIVATE
+                                   "KRK_OFFLOAD_${tgt_uc}=1")
+    endforeach()
 endif()
 
 # ---------------------------------------------------------------------------
