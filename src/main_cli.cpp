@@ -191,7 +191,7 @@ void sink_cb(void *user, const char *text, i32 token, bool done) {
     std::fflush(stdout);
 }
 
-int run_bench(Engine &engine, const Args &a) {
+int run_bench(Engine &engine, const Args &a, f64 load_ms, f64 start_ms) {
     GenerateParams p;
     p.prompt =
         "The history of computing is a history of abstraction: from relays to "
@@ -230,6 +230,21 @@ int run_bench(Engine &engine, const Args &a) {
                 r.prefill_ms, prefill_tps);
     std::printf("decode         %d tokens in %.1f ms  (%.1f tok/s)\n", r.generated,
                 r.decode_ms, decode_tps);
+    // The load phase is a third of start-to-end on every model measured (8B:
+    // 1531 ms of load against 2973 ms of decode), and it stays invisible here
+    // unless it is printed. Reporting only prefill and decode invites
+    // optimising two thirds of the process.
+    if (load_ms >= 0) {
+        // start_ms is the uptime before the load began (argument parsing plus
+        // backend creation), so total_ms is start-to-end minus only the tail
+        // after the last decode token. Without this line the report covers two
+        // thirds of the process and the load phase is invisible.
+        const f64 total_ms = start_ms + load_ms + r.prefill_ms + r.decode_ms;
+        std::printf("startup        %.1f ms  (arg parse + backend create)\n", start_ms);
+        std::printf("load           %.1f ms  (%.0f%% of start-to-end)\n", load_ms,
+                    total_ms > 0 ? 100.0 * load_ms / total_ms : 0.0);
+        std::printf("total          %.1f ms  (startup + load + prefill + decode)\n", total_ms);
+    }
     usage.report(stdout);
     if (engine.has_draft() && engine.spec_steps() > 0) {
         const f64 rate =
@@ -343,11 +358,17 @@ int main(int argc, char **argv) {
     ph.mark("backend create");
     Engine engine;
     engine.set_expert_scan(a.expert_scan, a.expert_stub);
+    const f64 load_t0 = PhaseClock::now();
     if (!engine.init(be, cfg, &err)) {
         std::fprintf(stderr, "kraken: %s\n", err.c_str());
         delete be;
         return 1;
     }
+    // Wall time of the load, and this process's uptime at the same moment: the
+    // benchmark reports both so start-to-end is a number it prints rather than
+    // one the reader has to reconstruct from KRK_PHASE.
+    const f64 bench_load_ms = PhaseClock::now() - load_t0;
+    const f64 bench_start_ms = load_t0 - ph.t0;
     ph.mark("engine.init (load)");
     if (!a.draft.empty()) {
         engine.set_draft_window(a.draft_tokens);
@@ -418,7 +439,7 @@ int main(int argc, char **argv) {
 
     ph.mark("banner + draft");
     if (a.bench) {
-        const int rc = run_bench(engine, a);
+        const int rc = run_bench(engine, a, bench_load_ms, bench_start_ms);
         ph.mark("run_bench (prefill+decode)");
         engine.shutdown();
         ph.mark("engine.shutdown");
