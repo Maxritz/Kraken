@@ -188,28 +188,50 @@ kraken --model <MODEL> --bench
 ```
 
 `--bench` is self-contained and needs no flags: it feeds a fixed **51-token
-prompt**, generates **256 tokens**, and reports prefill and decode as separate
-rates. Defaults in force for every row: greedy sampling, `--ctx 4096`,
-`--chunk 256`. Two timings are reported and they mean different things:
+prompt**, generates **256 tokens**, and reports the *whole* process budget, not
+just the two phases it owns. Defaults in force for every row: greedy sampling,
+`--ctx 4096`, `--chunk 256`.
+
+```
+prefill        55 tokens in 83.9 ms  (655.2 tok/s)
+decode         256 tokens in 2896.3 ms  (88.4 tok/s)
+startup        8.3 ms  (arg parse + backend create)
+load           1410.5 ms  (32% of start-to-end)
+total          4399.0 ms  (startup + load + prefill + decode)
+```
 
 - **prefill** — prompt tokens / time to process them. Throughput, so higher is
   better and it scales with batch size.
 - **decode** — generated tokens / time to generate them. The context grows
   during the run, so this is the *average* over 256 tokens ending at ~300
   tokens of context, not a short-context number.
+- **load** — reading the weights into VRAM. It is **32–40% of start-to-end** on
+  every model here, which is why it is printed: a report covering only prefill
+  and decode invites optimising two thirds of the process.
 
 Configuration: **AMD Radeon RX 9070 XT** (gfx1201, RDNA4, wave32, WMMA gfx12,
 64 CU, 15.9 GiB VRAM), HIP 7.16.26323, clang 23.0.0, ROCm 10.1, host Windows 11.
-Build `989944e`.
 
 ### Results (3 runs each, range = min–max)
 
-| model | layers / embd | prefill tok/s | decode tok/s |
-|---|---|---|---|
-| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 3915–4100 | 493–505 |
-| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 3019–3062 | 279–280 |
-| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 24 / 2048 | 202–204 | 99–102 |
-| Qwen3-8B Q4_K_M | 36 / 4096 | 635–681 | 87.3–87.6 |
+| model | layers / embd | prefill tok/s | decode tok/s | load ms |
+|---|---|---|---|---|
+| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 3145–3349 | 424–432 | 351 |
+| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 2462–2550 | 241–253 | 522 |
+| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 24 / 2048 | 143–157 | 89–99 | 405 |
+| Qwen3-8B Q4_K_M | 36 / 4096 | 642–697 | 87–88 | 1411 |
+
+### How close is this to the hardware?
+
+The card's real read bandwidth is **585 GB/s**, not the 644 GB/s on the spec
+sheet — measured with a 4096 MiB streaming read (584.9 GB/s). An 8B Q4_K_M
+token has to read **5.02 GB** of weights, so the absolute floor is **8.58 ms =
+117 tok/s**. Kraken does **88.7 tok/s, 76% of that ceiling**.
+
+The gap is not bandwidth: **3.78 ms of the 11.27 ms token (34%)** is five
+elementwise ops (`rmsnorm`, `rope`, `qk_norm`, `kv_append`, `add_inplace`) that
+move 8–16 KB each, 253 launches per token. `rmsnorm` alone is 1165x off its own
+memory floor. Fusing that chain is the next large win.
 
 To reproduce, substituting your own path:
 

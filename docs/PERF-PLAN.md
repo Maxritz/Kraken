@@ -129,6 +129,56 @@ Consequences, and they are rules, not caveats:
 
 Ranked by measured end-to-end impact, not by microbenchmark.
 
+### B0 — The hardware ceiling, measured, and how far the 8B is from it
+
+Every percentage below is meaningless without the denominator, and the
+denominator is not the spec sheet. A 4096 MiB streaming read on this 9070 XT
+measures **584.9 GB/s**, against 644 GB/s nominal — so the achievable number is
+585, not 644, and any efficiency claim against 644 is overstated by 10%.
+
+| quantity | value |
+|---|---|
+| measured VRAM read ceiling | **585 GB/s** |
+| 8B Q4_K_M weights read per token | **5.02 GB** |
+| absolute floor per token | **8.58 ms = 117 tok/s** |
+| measured | **11.27 ms = 88.7 tok/s** |
+| efficiency | **76% of the measured ceiling** |
+
+Decode is **flat in context** — 88.7 tok/s at ctx 512, 1024, 2048 and 4096 —
+so it is bound by weight traffic and launch count, not by attention or KV size.
+That rules out the whole KV/attention family as a lever for this model.
+
+### B0a — 34% of a decode token is elementwise launch overhead (PROVEN)
+
+Five ops that each move 8-16 KB account for 3.78 ms of the 11.27 ms token:
+
+| op | calls/token | us/call | bytes moved | its memory floor | off by | ms/token |
+|---|---|---|---|---|---|---|
+| rmsnorm | 73 | 16.3 | 8 KB | 0.01 us | **1165x** | 1.19 |
+| rope | 36 | 24.3 | 16 KB | 0.03 us | **866x** | 0.87 |
+| qk_norm | 36 | 18.4 | 16 KB | 0.03 us | **658x** | 0.66 |
+| kv_append | 36 | 15.7 | 16 KB | 0.03 us | **559x** | 0.56 |
+| add_inplace | 72 | 6.8 | 16 KB | 0.03 us | 242x | 0.49 |
+| **total** | **253** | | | | | **3.78** |
+
+These are launch- and latency-bound, not bandwidth-bound: an empty 64x256 launch
+measures **0.98 us** marginal and a 1x32 launch **1.58 us**, so 253 launches is
+0.25-0.40 ms of pure submission and the rest is the serialisation each tiny
+kernel pays between dependent stages.
+
+Removing them is additive to the weight floor: 8.58 + 3.78 = 12.36 ms, so
+fusing this chain to ~0.8 ms should land near **8.3 ms = ~120 tok/s**.
+The plan is to fold the per-layer chain — `rmsnorm` + `add_inplace` + `silu_mul`
+on the FFN side, `rope` + `qk_norm` + `kv_append` on the attention side — into
+the kernels that already read those buffers, rather than 253 separate launches.
+
+### B1 (historical note) — the launch floor was 2.65 us, now 0.98
+
+The B1 text below quotes a 2.65 us launch floor. Re-measured after the pinned
+staging ring and the pull path, an empty 64x256 launch is **0.98 us** and a
+1x32 launch is 1.58 us. The conclusion is unchanged — small shapes are
+launch-dominated — but the constant moved.
+
 ### B1 — Dense decode is call-count-bound, and Q6_K is instruction-bound (both proven)
 
 `Qwen3-8B Q4_K_M` keeps the compute engine **91.7% busy** at **299 GB/s** of
