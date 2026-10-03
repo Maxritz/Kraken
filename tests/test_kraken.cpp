@@ -1865,6 +1865,12 @@ public:
               i64 r) override {
         inner_->gemm(o, x, w, wt, no, ni, r);
     }
+    void logits_topk(const void *lg, i64 n, i32 k, const void *pm, f32 rp,
+                     f32 sc, f32 tp, i32 *ids, f32 *vals, f32 *mass_out,
+                     void *scratch, i32 cand_cap, i64 *count_out) override {
+        inner_->logits_topk(lg, n, k, pm, rp, sc, tp, ids, vals, mass_out,
+                            scratch, cand_cap, count_out);
+    }
     void rope(void *q, void *k, i64 nh, i64 nk, i64 hd, i64 nt, i64 p0,
               const f32 *iv, f32 s, f32 f) override {
         inner_->rope(q, k, nh, nk, hd, nt, p0, iv, s, f);

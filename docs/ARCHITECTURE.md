@@ -51,6 +51,39 @@ inside the decode loop, so `dump_topk` is a file-local helper there rather than
 a public API. It is deliberately not part of `Backend`: it describes one run,
 not a device.
 
+## Finding where two backends disagree
+
+A stage dump turns "the device and the reference produce different text" into
+"stage X of layer N is the first one that is wrong":
+
+```
+KRK_DUMP=a.txt ./kraken -m M -p "..." -n 1 ...          # device
+KRK_DUMP=b.txt ./kraken -m M --cpu -p "..." -n 1 ...    # f32 reference
+python tools/dump_diff.py a.txt b.txt
+```
+
+`KRK_DUMP` makes `Engine::dump_row` append the last row of every stage — the
+embedding, each layer's input/output, and the inside of both layer kinds (the
+attention projections, the output gate, the gated result, the `wo` output, the
+residual, the FFN norm/gate, and the delta-net conv and delta-rule output) — so
+the first line whose relative error jumps to O(1) names the guilty stage and
+the rest is cascade. It is a hook on the hot path's *shape*, not its math:
+inert unless the variable is set. Delete the files between runs; the engine
+appends.
+
+`scripts/coherence_check.sh` is the acceptance gate that sits above it: for
+each runnable model it greedy-decodes the same prompt on both backends and
+compares the *text*, with a documented tie classification for fp16 rounding
+(see [docs/TODO.md](TODO.md)). A backend that matches every activation can
+still print numbers, so the output being human-readable words is the test.
+
+One lesson from the bug this found, for anyone adding an op: **an activation
+buffer that changes layout must never be its own source.** `qwen3_next_split`
+compacts a packed `q|gate` row into half the width, so an in-place call had
+block `h` writing over the source rows of blocks `2h` and `2h+1`, and the
+winner of that race changed the text. Ops that shrink a row now take a
+distinct destination (see the contract on `Backend::qwen3_next_split`).
+
 ## Layering rules the code follows
 
 * `include/krk/*.hpp` is the library surface. `src/*.cpp` is portable C++17

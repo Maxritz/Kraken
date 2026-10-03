@@ -516,6 +516,135 @@ __device__ __forceinline__ void dequant_chunk_dev(int t, const u8 *b, int chunk,
 // chunk-range dot products — the GEMV inner loop
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// packed decode for the two 5/6-bit K-quants (Q5_K, Q6_K)
+//
+// Measured, not assumed: kraken-bench rows=1 puts Q4_K at 563-674 GB/s and
+// Q6_K at 143 GB/s on a 4096x4096 matrix that fits in the 64 MB Infinity
+// Cache, and at 195 GB/s where Q4_K does 572 on a 208 MB one. A matrix that
+// is *in* cache and still four times slower than its neighbour is not
+// bandwidth-bound, it is instruction-bound — and the count agrees: the
+// generic path re-reads `p`, which varies per lane because lane L owns chunks
+// L, L+32, ... of the same row, through a four-way branch inside the value
+// loop, and then converts every value through f32.
+//
+// The packed form rests on one identity: f16(1024 + n) is *exactly*
+// 0x6400 | n for n in [0, 1023] (that exponent field is 2^10 with a zero
+// mantissa), so a 5- or 6-bit code becomes a half with no convert and no
+// branch. Weights enter the dot as f16(1024 + code); the 1024 comes back out
+// as one f32 correction against the chunk's own activation sum, which the
+// same loop produces for free as the dot against 1.0. Four weights cost two
+// dword loads, six shift/mask ops, two byte moves and four dot2 — and the
+// accumulator is f32 throughout, so this is *more* accurate than the path it
+// replaces, which rounded every weight to f16 first.
+//
+//   Q5_K: w = dl*v - mn     ->  dl*dot - (1024*dl + mn) * sum(x)
+//   Q6_K: w = ds*(q - 32)   ->  ds * (dot - 1056 * sum(x))   per 16-value half
+//
+// kraken-bench 4096x4096 rows=1, gfx1201: Q6_K 143 -> 541 GB/s, head
+// (248320x1024) 195 -> 564, Q5_K 352 -> 535, Q4_K unchanged at 584.
+// ---------------------------------------------------------------------------
+
+#if defined(KRK_HAS_DOT2)
+
+// f16 1.0 in both halves: the second operand of the activation-sum dot.
+constexpr u32 kDotOnes = 0x3C003C00u;
+
+// Four 5/6-bit codes (one per byte) -> two packed f16 pairs, each half
+// exactly f16(1024 + code). The f16 exponent byte of both halves is the
+// constant 0x64, so a pair is "two code bytes moved into the low byte of each
+// half, or in 0x6400".
+//
+// This was written first as v_perm_b32 (one instruction, byte 0/4/1/4 of an
+// 8-byte source pair). The inline asm compiled and *silently returned
+// garbage* — every Q6_K/Q5_K output was NaN — while this form is correct and
+// the same speed, so the compiler is already fusing it. Kept as C on purpose.
+__device__ __forceinline__ void dot_pair_codes(u32 codes, u32 *w01, u32 *w23) {
+    *w01 = (codes & 0x0000003Fu) | ((codes & 0x00003F00u) << 8) | 0x64006400u;
+    *w23 = ((codes >> 16) & 0x0000003Fu) | ((codes >> 8) & 0x003F0000u) |
+           0x64006400u;
+}
+
+// One packed f16 pair of activations, as the dot2 operand. Callers pass
+// x + c*32 + l with l a multiple of 4, so this is an aligned 32-bit load.
+__device__ __forceinline__ u32 dot_pair_act(const _Float16 *p) {
+    return *reinterpret_cast<const u32 *>(p);
+}
+
+// Q6_K. A chunk is 32 codes: 32 bytes of `ql` (offset and nibble selected by
+// p) plus 32 bytes of `qh`, split into two 16-value halves that carry
+// different int8 scales.
+__device__ __forceinline__ f32 dot_chunk_q6k(const u8 *b, int cc,
+                                              const _Float16 *x) {
+    const int g = cc >> 2;
+    const int p = cc & 3;
+    const u8 *ql = b + g * 64 + ((p & 1) ? 32 : 0);
+    const u8 *qh = b + 128 + g * 32;
+    const i8 *sc = reinterpret_cast<const i8 *>(b + 192 + g * 8);
+    const u32 nsh = (p & 2) ? 4u : 0u; // low nibble for p<2, high for p>=2
+    const u32 hsh = static_cast<u32>(p) * 2u;
+
+    f32 ad = 0.0f, as = 0.0f, bd = 0.0f, bs = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 32; l += 4) {
+        const u32 lo = (d_u32(ql + l) >> nsh) & 0x0F0F0F0Fu;
+        const u32 hi = (d_u32(qh + l) >> hsh) & 0x03030303u;
+        u32 w01 = 0, w23 = 0;
+        dot_pair_codes(lo | (hi << 4), &w01, &w23);
+        const u32 a01 = dot_pair_act(x + l);
+        const u32 a23 = dot_pair_act(x + l + 2);
+        if (l < 16) {
+            ad = d_dot2_pk(w01, a01, ad);
+            ad = d_dot2_pk(w23, a23, ad);
+            as = d_dot2_pk(kDotOnes, a01, as);
+            as = d_dot2_pk(kDotOnes, a23, as);
+        } else {
+            bd = d_dot2_pk(w01, a01, bd);
+            bd = d_dot2_pk(w23, a23, bd);
+            bs = d_dot2_pk(kDotOnes, a01, bs);
+            bs = d_dot2_pk(kDotOnes, a23, bs);
+        }
+    }
+    const f32 dd = d_h2f(static_cast<u16>(b[208] | (b[209] << 8)));
+    return dd * static_cast<f32>(sc[2 * p]) * (ad - 1056.0f * as) +
+           dd * static_cast<f32>(sc[2 * p + 1]) * (bd - 1056.0f * bs);
+}
+
+// Q5_K. Same shape; the nibble selector is `half = cc&1` rather than p>>1,
+// and both dl and mn are constant across the whole chunk, so one correction
+// covers all 32 values.
+__device__ __forceinline__ f32 dot_chunk_q5k(const u8 *b, int cc,
+                                              const _Float16 *x) {
+    const int g = cc >> 1;
+    const int half = cc & 1;
+    u8 si, mi;
+    dev_scale_min_k4(g * 2 + half, b + 4, &si, &mi);
+    const u32 nsh = static_cast<u32>(half) * 4u;
+    const u32 hsh = static_cast<u32>(g * 2 + half);
+
+    f32 acc = 0.0f, sum = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 32; l += 4) {
+        const u32 lo = (d_u32(b + 48 + g * 32 + l) >> nsh) & 0x0F0F0F0Fu;
+        const u32 hi = (d_u32(b + 16 + l) >> hsh) & 0x01010101u;
+        u32 w01 = 0, w23 = 0;
+        dot_pair_codes(lo | (hi << 4), &w01, &w23);
+        const u32 a01 = dot_pair_act(x + l);
+        const u32 a23 = dot_pair_act(x + l + 2);
+        acc = d_dot2_pk(w01, a01, acc);
+        acc = d_dot2_pk(w23, a23, acc);
+        sum = d_dot2_pk(kDotOnes, a01, sum);
+        sum = d_dot2_pk(kDotOnes, a23, sum);
+    }
+    const f32 dl =
+        d_h2f(static_cast<u16>(b[0] | (b[1] << 8))) * static_cast<f32>(si);
+    const f32 mn =
+        d_h2f(static_cast<u16>(b[2] | (b[3] << 8))) * static_cast<f32>(mi);
+    return dl * acc - (1024.0f * dl + mn) * sum;
+}
+
+#endif // KRK_HAS_DOT2
+
 // dot over chunks [c0, c1) of a weight row against fp16 activations.
 template <DType T>
 __device__ __forceinline__ f32 dot_chunks_t(const u8 *wrow, const _Float16 *x, int c0,
@@ -536,6 +665,32 @@ __device__ __forceinline__ f32 dot_chunks_t(const u8 *wrow, const _Float16 *x, i
     }
     return acc0 + acc1;
 }
+
+// The packed specializations. They accumulate in f32 with no intermediate f16
+// rounding, so for these two formats they replace the generic loop outright.
+#if defined(KRK_HAS_DOT2)
+template <>
+__device__ __forceinline__ f32 dot_chunks_t<DType::Q6_K>(const u8 *wrow,
+                                                         const _Float16 *x,
+                                                         int c0, int c1) {
+    f32 acc = 0.0f;
+    for (int c = c0; c < c1; c++)
+        acc += dot_chunk_q6k(wrow + (c >> 3) * 210, c & 7,
+                             x + static_cast<i64>(c) * 32);
+    return acc;
+}
+
+template <>
+__device__ __forceinline__ f32 dot_chunks_t<DType::Q5_K>(const u8 *wrow,
+                                                         const _Float16 *x,
+                                                         int c0, int c1) {
+    f32 acc = 0.0f;
+    for (int c = c0; c < c1; c++)
+        acc += dot_chunk_q5k(wrow + (c >> 3) * 176, c & 7,
+                             x + static_cast<i64>(c) * 32);
+    return acc;
+}
+#endif
 
 // Runtime dispatch; the dtype is uniform across a launch.
 __device__ __forceinline__ f32 dot_chunks(int t, const u8 *wrow, const _Float16 *x,

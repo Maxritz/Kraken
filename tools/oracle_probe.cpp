@@ -271,11 +271,14 @@ int gdn_suite(Backend *cpu, Backend *gpu) {
         gdn_report("qwen3_next_split q", q.ref(), q.got(), kA, kR);
         gdn_report("qwen3_next_split gate", gate.ref(), gate.got(), kA, kR);
 
-        // in place with no gate: the unpack the engine actually runs
+        // Query only, into a buffer that does not alias the source: the
+        // unpack is a gather and must not write over rows it still has to
+        // read (the destination is half the width of the source row).
         packed.set(v);
-        cpu->qwen3_next_split(packed.c, nullptr, packed.c, tok, n_k, hd);
-        gpu->qwen3_next_split(packed.g, nullptr, packed.g, tok, n_k, hd);
-        gdn_report("qwen3_next_split in place", packed.ref(), packed.got(), kA, kR);
+        q.set(std::vector<f32>(static_cast<size_t>(nq), 0.0f));
+        cpu->qwen3_next_split(q.c, nullptr, packed.c, tok, n_k, hd);
+        gpu->qwen3_next_split(q.g, nullptr, packed.g, tok, n_k, hd);
+        gdn_report("qwen3_next_split q only", q.ref(), q.got(), kA, kR);
     }
 
     // ---- the convolution by hand, one value per (tap, channel) ----------

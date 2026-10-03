@@ -177,30 +177,42 @@ pass, the sampler and both tokenizer families are all covered end to end.
 
 ## Benchmarks
 
-Measured with `kraken --bench` (greedy, ctx 4096, chunk 256) on
-**SmolLM2 135M Instruct** (Q4_K_M; 30 layers, 576 embd, GQA 9/3
-heads, head_dim 64, FF 1536, vocab 49152):
+Measured with `kraken --bench` (greedy, ctx 4096, chunk 256) on the
+**AMD Radeon RX 9070 XT** (gfx1201, RDNA4, WMMA, 64 CU), HIP 7.16,
+ROCm 10.1. Ranges are min–max over repeated runs.
 
-| device | HIP | prefill, 51 tok | decode, 64 tok | decode, 256 tok |
+| model | prefill | decode, 64 tok | decode, 256 tok |
+|---|---|---|---|
+| SmolLM2-135M-Instruct Q4_K_M | 4.18–4.50k tok/s | 578–589 tok/s | 527–531 tok/s |
+| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 3.07–3.24k tok/s | 308–313 tok/s | 267–269 tok/s |
+| Qwen3-8B Q4_K_M | 683–688 tok/s | 94.6–94.9 tok/s (32 tok) | — |
+
+SmolLM2 135M: 30 layers, 576 embd, GQA 9/3 heads, head_dim 64, FF 1536,
+vocab 49152. Qwen3.5-0.8B: 24 layers (18 recurrent), 1024 embd, FF 3584,
+vocab 248320. Kernel-level probes put the 9070 XT decode step at 727 tok/s
+launched and 741 tok/s under a HIP graph (wall-clock). The decode-bandwidth
+campaign, fusion A/B and graph timing methodology are in
+[docs/STATUS.md](docs/STATUS.md) (§8–§11); the current bottleneck analysis is
+in [docs/PERF-PLAN.md](docs/PERF-PLAN.md).
+
+### MoE: the residency budget, not the kernels
+
+`Qwen3-MoE-4x0.6B-2.4B` (Q4_K_M, 4 experts/layer, top-2) is **4.8x faster with
+a larger expert cache**, and nothing else:
+
+| `--expert-cache-mb` | auto (152.6 MiB) | 256 | 1024 | 4096 |
 |---|---|---|---|---|
-| AMD Radeon RX 9070 XT (gfx1201, RDNA4, WMMA, 32 WGPs) | 7.16 | 3.7–4.4k tok/s | 448–476 tok/s | 430–433 tok/s |
-| AMD Radeon RX 6700 XT (gfx1031, RDNA2, no WMMA, 20 MPs) | 7.15 | 577–837 tok/s | 304–372 tok/s | — |
+| decode, 16 tok | 16.0 tok/s | 15.6 tok/s | **77.5 tok/s** | 78.7 tok/s |
 
-Ranges are min–max over repeated runs. The 5-round engine A/B on the
-9070 XT averages **427.6 tok/s** decode with both kernel fusions on
-(defaults) and **440.1 tok/s** on the best arm (`KRK_FUSED_LAYER=0`,
-`KRK_FUSED_ATTN=1`); prefill is unaffected by either flag. Kernel-level
-probes put the 9070 XT decode step at 727 tok/s launched and 741 tok/s
-under a HIP graph (wall-clock), and a 51-token prefill chunk at
-12.2k tok/s. The full decode-bandwidth campaign, fusion A/B and graph
-timing methodology are in [docs/STATUS.md](docs/STATUS.md) (§8–§11).
+The default budget (152.6 MiB) holds ~28 of the layer's 112 expert rows while a
+token routes through 56 of them per step, so the hit rate is **0.0%** — 951
+loads and 925 evictions across 16 tokens, every expert weight re-fetched from
+host memory every step. Raising the budget past the ~600 MiB working set makes
+the paging disappear entirely, and 4096 MiB buys nothing further. The card has
+15.9 GiB free, so the budget was never the binding constraint — the default
+was.
 
-**Qwen3-MoE-4x0.6B-2.4B** (Q4_K_M, 965 MB — fetched with
-`scripts/fetch_moe_model.sh`) loads and completes real greedy forward
-passes on the CPU oracle. The oracle is scalar and single-threaded
-(minutes per 28-layer MoE forward), so it proves correctness, not
-speed — interactive MoE decode is what the GPU backends are for. Use
-`--ctx 256/512` for MoE runs on small machines.
+Use `--ctx 256/512` for MoE runs on small machines.
 
 ---
 

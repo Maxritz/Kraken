@@ -140,6 +140,11 @@ private:
     void forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode);
     // Runs the output head on one row of ws_x_ into ws_logits_.
     void head_compute(i32 row);
+
+    // KRK_DUMP: append the last row of `buf` (width x rows elements, f32 host
+    // or f16 device) to the dump file, one text line per call. A CPU run and a
+    // HIP run of the same prompt then differ at exactly one line per stage.
+    void dump_row(const char *what, i32 layer, const void *buf, i64 width, i64 rows);
     // Zero-fill rollback for the (rare) shrink-a-lot path; the common small
     // rollback in speculative decoding is pure pointer arithmetic.
     void kv_rollback_zero(i64 pos);
@@ -149,6 +154,10 @@ private:
     // regardless of how many tokens chose it. Experts are paged in through the
     // model's cache.
     void moe_ffn(const LayerWeights &L, i32 layer, i32 n);
+    // The dense (non-MoE) SwiGLU FFN both layer shapes share: gate/up on one
+    // fused launch, silu, down, residual. Shared because the recurrent path's
+    // copy was the stale one and had drifted off the fused group.
+    void dense_ffn(const LayerWeights &L, i32 l, i64 n);
     // Chooses the expert residency budget from cfg_ and the device.
     void configure_expert_cache();
     // One gated-delta-net (recurrent) layer: the fused [q|k|v] projection, the
@@ -158,8 +167,17 @@ private:
     // Clears the convolution windows and delta-rule states (f32, one set per
     // recurrent layer). Only correct to call at a sequence boundary.
     void recurrent_reset();
-    // Downloads the last row of logits into logits_host_.
-    void fetch_logits();
+    // Downloads the last row of logits into logits_host_. With device_only true the
+    // row stays in VRAM and is reduced to a single greedy argmax by
+    // topk_argmax() instead; see fetch_logits() for when that is legal. The
+    // flag reads the same way as the caller's, on purpose: an inverted sense
+    // here silently disables the fast path with identical output.
+    void fetch_logits(bool device_only = false);
+    // Device top-k, reduced to the one number greedy decoding needs. Returns
+    // false when the caller must use the host row instead: a CPU backend, or a
+    // cut so wide the candidate buffer overflowed (a whole shelf of tied
+    // logits, which is what a softcapped model produces at the very top).
+    bool topk_argmax(i32 *out);
     // Greedy speculative step; false when the draft cannot help.
     bool generate_speculative(const GenerateParams &p, GenerateResult *res,
                               const std::vector<i32> &ids, f64 *prefill_ms,
@@ -205,7 +223,11 @@ private:
     void *ws_x_ = nullptr;    // [chunk, n_embd]
     void *ws_xn_ = nullptr;   // [chunk, n_embd]
     void *ws_x2_ = nullptr;   // [chunk, n_embd]
-    void *ws_q_ = nullptr;    // [chunk, q_proj]
+    void *ws_q_ = nullptr;    // [chunk, q_dim]
+    // [chunk, q_proj] the raw query projection: Qwen3.5 packs a per-head
+    // output gate behind the query, so its projection is twice as wide as the
+    // query it has to be split into. Null when the model does not pack one.
+    void *ws_qpack_ = nullptr;
     void *ws_k_ = nullptr;    // [chunk, kv_dim]
     void *ws_v_ = nullptr;    // [chunk, kv_dim]
     void *ws_attn_ = nullptr; // [chunk, q_dim]
@@ -233,8 +255,24 @@ private:
     void *ws_alpha_ = nullptr;  // device f32 gate weights for the current group
     f32 *logits_host_ = nullptr;
     std::vector<i32> tok_scratch_;
+    // Device top-k. The candidate buffer is sized for a degenerate cut; k is
+    // one today (an argmax) but the buffers allow more without reallocating.
+    static constexpr i32 kTopK = 1;
+    static constexpr i32 kTopKCap = 4096;
+    void *topk_scratch_ = nullptr; // 4096 B header + kTopKCap u64 keys
+    // One 16-byte device landing zone for the whole op: i32 id | f32 value |
+    // i64 collected count. Keeping the three fields adjacent is what turns the
+    // readback into a single 16-byte transfer instead of three.
+    void *topk_out_ = nullptr;
+    alignas(8) char topk_out_h_[16] = {};
+    i64 topk_n_ = 0;    // the collected count of the last successful call
+    i32 topk_id_ = 0;   // its argmax, valid only while topk_valid_
+    bool topk_valid_ = false;
     // Host-side router scratch, sized [chunk, n_expert]
     std::vector<f32> router_host_;
+    // KRK_DUMP destination (see Engine::init): empty means the per-stage dump
+    // hook in forward_core is inert.
+    std::string dump_path_;
     std::vector<f32> moe_prob_;
     // The routing plan for the current chunk: which tokens each expert got.
     std::vector<i32> moe_sel_;    // [chunk, k] expert id per (token, slot)

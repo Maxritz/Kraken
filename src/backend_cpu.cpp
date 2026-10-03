@@ -113,6 +113,60 @@ public:
         rmsnorm_rows(static_cast<f32 *>(out), static_cast<const f32 *>(x), w, rows,
                      n, eps);
     }
+    // The scalar twin of the device radix select (kernels/topk.hpp). Same
+    // contract and same order -- transform first, then rank by (value, id)
+    // descending -- so the two backends can be compared token for token. This
+    // one has no download to save, so it exists for comparability, not speed.
+    void logits_topk(const void *logits, i64 n, i32 k, const void *pen_mask,
+                     f32 rep_pen, f32 softcap, f32 temp, i32 *ids, f32 *vals,
+                     f32 *mass_out, void *scratch, i32 cand_cap,
+                     i64 *count_out) override {
+        (void)scratch;
+        (void)cand_cap;
+        const f32 *l = static_cast<const f32 *>(logits);
+        const u32 *pm = static_cast<const u32 *>(pen_mask);
+        auto key = [&](i32 i) {
+            f32 v = l[i];
+            if (softcap > 0.0f)
+                v = v > softcap ? softcap : (v < -softcap ? -softcap : v);
+            if (pm && rep_pen > 0.0f && rep_pen != 1.0f &&
+                ((pm[static_cast<u32>(i) >> 5] >> (static_cast<u32>(i) & 31)) & 1u))
+                v = v > 0.0f ? v / rep_pen : v * rep_pen;
+            return v;
+        };
+        const i64 keep = std::min<i64>(n, k);
+        std::vector<i32> idx(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; i++) idx[static_cast<size_t>(i)] = static_cast<i32>(i);
+        // This O(n log k) sort is exactly the host work the device kernels
+        // exist to avoid; here it is what makes the scalar backend a usable
+        // oracle for the fast path.
+        std::partial_sort(idx.begin(), idx.begin() + keep, idx.end(),
+                          [&](i32 a, i32 b) {
+                              const f32 ka = key(a), kb = key(b);
+                              return ka != kb ? ka > kb : a < b;
+                          });
+        const f32 maxv = key(idx[0]);
+        for (i32 r = 0; r < k; r++) {
+            if (r < keep) {
+                ids[r] = idx[static_cast<size_t>(r)];
+                vals[r] = key(ids[r]);
+            } else {
+                // Fewer than k elements exist. The device kernel writes the
+                // same marker, so the two backends stay interchangeable.
+                ids[r] = -1;
+                vals[r] = -FLT_MAX;
+            }
+        }
+        if (mass_out) {
+            const f32 inv = temp > 0.0f ? 1.0f / temp : 1.0f;
+            f32 m = 0.0f;
+            for (i64 i = 0; i < n; i++)
+                m += std::exp((key(static_cast<i32>(i)) - maxv) * inv);
+            *mass_out = m;
+        }
+        if (count_out) *count_out = keep;
+    }
+
 
     void gemm(void *out, const void *x, const void *w, DType wt, i64 n_out,
               i64 n_in, i64 rows) override {
@@ -384,18 +438,30 @@ public:
         const f32 *p = static_cast<const f32 *>(packed);
         f32 *qd = static_cast<f32 *>(q);
         f32 *gd = static_cast<f32 *>(gate);
+        auto one = [&](i64 t) {
+            for (i64 h = 0; h < n_head; h++) {
+                const f32 *src = p + (t * n_head + h) * 2 * hd;
+                f32 *dst = qd + (t * n_head + h) * hd;
+                std::memcpy(dst, src, static_cast<size_t>(hd) * sizeof(f32));
+                if (gd)
+                    std::memcpy(gd + (t * n_head + h) * hd, src + hd,
+                                static_cast<size_t>(hd) * sizeof(f32));
+            }
+        };
+        // Callers must not alias `packed` (see the contract in backend.hpp):
+        // the row being written is half the width of the row being read, so a
+        // token's output lands inside another token's input. The scalar
+        // backend can still be exact where the device cannot — a token's
+        // writes only ever hit the sources of the tokens before it, so
+        // walking tokens in order is safe — and it is the reference, so it
+        // should not be the one that quietly races.
+        if (qd == p) {
+            for (i64 t = 0; t < n_tok; t++) one(t);
+            return;
+        }
         par_for(n_tok, 1, 2.0 * static_cast<f64>(n_tok) * n_head * hd,
                 [&](i64 b, i64 e) {
-                    for (i64 t = b; t < e; t++) {
-                        for (i64 h = 0; h < n_head; h++) {
-                            const f32 *src = p + (t * n_head + h) * 2 * hd;
-                            f32 *dst = qd + (t * n_head + h) * hd;
-                            std::memcpy(dst, src, static_cast<size_t>(hd) * sizeof(f32));
-                            if (gd)
-                                std::memcpy(gd + (t * n_head + h) * hd, src + hd,
-                                            static_cast<size_t>(hd) * sizeof(f32));
-                        }
-                    }
+                    for (i64 t = b; t < e; t++) one(t);
                 });
     }
 

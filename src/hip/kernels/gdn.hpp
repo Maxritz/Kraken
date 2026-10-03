@@ -181,8 +181,10 @@ __global__ void gdn_scale_rows_kernel(_Float16 *__restrict__ x,
 // query with its output gate, so neither is contiguous:
 //     q[t, h, i]    <- packed[t, h*2*hd + i]
 //     gate[t, h, i] <- packed[t, h*2*hd + hd + i]
-// `gate` may be null. In place is safe by index order: head h writes at
-// (h*2*hd + hd) - hd, and no other head reads from below that.
+// `gate` may be null. The destination must not alias the source: head h
+// writes hd values at h*hd, which lands inside the 2*hd source window of
+// heads 2h and 2h+1 (and, for a later token, of the token half its way
+// back), so an in-place unpack races its own readers.
 // grid.x = heads, grid.y = tokens.
 // ---------------------------------------------------------------------------
 

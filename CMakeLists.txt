@@ -173,6 +173,26 @@ if(KRK_HIP_AVAILABLE)
     # ("kernels/..."), so the tool compiles the same file the engine does.
     target_include_directories(kraken-i8k PRIVATE
                                ${CMAKE_CURRENT_SOURCE_DIR}/src/hip)
+    # Per-shape raw kernel speed with the launch cost amortized out of the
+    # measurement: `(T(N) - T(1)) / (N - 1)`. This is the number the perf plan's
+    # acceptance criteria are written against, because the engine's own per-op
+    # timer cannot see below the ~10-27 µs an event record costs.
+    add_executable(kraken-bench tools/bench_ops.cpp)
+    target_link_libraries(kraken-bench PRIVATE krk_core krk_hip)
+
+    # The numeric gate. Exits non-zero on NaN, on inf, on a value outside the
+    # dtype's tolerance, or on a logits_topk mismatch, so `ninja -C build-hip
+    # gate` fails rather than printing a reassuring number. It exists because
+    # this harness previously scored a NaN-producing Q6_K kernel as a perfect
+    # chk=0 and a hand-written v_perm_b32 helper's garbage went unnoticed:
+    # a fast wrong kernel is the failure mode a code review does not catch.
+    add_custom_target(gate
+        COMMAND $<TARGET_FILE:kraken-bench> --gate
+        DEPENDS kraken-bench
+        COMMENT "numeric gate: dtype tolerances + logits_topk differential")
+    if(KRK_BUILD_TESTS)
+        add_test(NAME kraken-gate COMMAND kraken-bench --gate)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,49 @@ Status of each area is in [docs/STATUS.md](STATUS.md); this file is the
 
 ## P0 — correctness
 
-### The qwen35 GPU path is not reproducible (P0 GATE NOT CLOSED)
+### The qwen35 GPU path is not reproducible (FIXED 2026-10-03 on gfx1201; gfx1031 confirmation outstanding)
+
+**Root cause: the packed-query split raced its own source.** Qwen3.5 packs a
+per-head output gate behind the query, and the engine unpacked it in place —
+`qwen3_next_split(q = ws_q_, gate = ws_agate_, packed = ws_q_)`. A head's
+source row is twice the width of the row it writes, so head `h` writes over
+`[h*hd, (h+1)*hd)`, which is exactly the source window of heads `2h` (its
+query half) and `2h+1` (its gate half) — for every token, and across tokens
+too, since a token's compacted row lands inside the packed row of the token
+before it. With one block per head, whichever block stores first decides what
+its neighbours read, so the query and gate came back different from run to
+run.
+
+Measured on the 9070 XT with `-p "A" -n 1`: the layer dump put the first
+one-order-of-magnitude break in `attn.gate L03` at rel 1.5, with heads 0..7
+wrong and 8..15 correct — exactly the heads whose source lies inside the write
+range — while the query half of the *same kernel* was correct; three identical
+command lines produced two identical dumps and one different one. With a
+9-token prompt the race corrupted the layer *after* the first attention layer
+(`gdn.conv L04`, rel 0.105) instead, which is what made it look like a
+recurrent-state bug at first.
+
+The fix is structural: the packed projection lands in its own workspace
+(`Engine::ws_qpack_`) and the split is a pure gather from a buffer it never
+writes. `Backend::qwen3_next_split` now documents the no-alias contract, the
+scalar backend walks tokens in order when a caller aliases anyway (it can be
+exact there; the device cannot), and the HIP kernel's "in place is safe by
+index order" comment — the assumption that produced the bug — is gone.
+
+**Evidence after the fix:** the CPU/HIP stage dumps agree to ≤ 8.6e-3 across
+all 24 layers of Qwen3.5-0.8B (fp16 rounding, no structural break), the HIP
+completion of `"The capital of France is"` is byte-identical to the CPU
+reference, `Qwen3.5-9b-Sushi-Coder-RL.Q4_K_M` is byte-identical across five
+runs with bit-identical step-0 logits, and `scripts/coherence_check.sh`
+reports 9 of 9 local runnable models printing the same readable text as the
+reference.
+
+**Still to confirm on gfx1031** when maclin is back: the same five-run
+reproducibility test on `Qwen3.5-9B-Q4_K_M.gguf`, whose reference completion is
+`' Paris.\nThe capital of France is Paris.\nThe capital of France is'`.
+
+What follows is the original report, kept because its negative results are
+still worth not repeating:
 
 `kraken --model Qwen3.5-9B-Q4_K_M.gguf --prompt "The capital of France is"`
 on the 6700 XT produces a different 16-token greedy completion on almost every
@@ -58,7 +100,9 @@ kernel whose result depends on uninitialised or mis-launched state.
 The CPU f32 path over the same prompt and the same build is bit-identical
 step for step, which is the control that makes this a GPU-path bug.
 
-**Next steps, in order of expected yield:**
+**Next steps, in order of expected yield** (mostly overtaken by the fix above;
+the ablation route is what actually found it — a per-layer stage dump of the
+same 5-token prompt on both backends, `KRK_DUMP` + `tools/dump_diff.py`):
 
 1. Dump and compare a *single* GDN op's output across two GPU processes using
    `tools/oracle_probe.cpp --gdn` with the real 9B weights — the per-op suite
@@ -76,6 +120,43 @@ step for step, which is the control that makes this a GPU-path bug.
    for `ssm_conv1d`.
 4. Install compute-sanitizer on maclin if a package is available — it would
    settle this in one run.
+
+### Text that is not text: the coherence gate
+
+Coherence is checked as *readable output*, not as a logit distance, because a
+backend can match every activation and still print numbers, degenerate loops,
+or an answer to a different question. `scripts/coherence_check.sh` runs greedy
+decoding on the CPU reference and on the device for each runnable model and
+reports:
+
+- **PASS** — byte-identical text.
+- **PASS (tie)** — the text differs, but the first differing step is a coin
+  flip at activation precision: both backends rank the same two tokens inside
+  `KRK_TOL` (0.05) of each other. Example: SmolLM2-135M Q4_K_M at step 6 ranks
+  tokens 338 and 351; fp16 puts them at exactly 27.265625, the f32 reference
+  separates them by 0.006. Either answer is correct rounding behaviour, and
+  both continuations are fluent.
+- **FAIL (drift)** — a real gap at the first differing step.
+- **FAIL (text)** — the continuation is >25% digits or has no letters.
+
+Current sweep 2026-10-03 (9070 XT, 32 tokens, `--greedy`): 9 models coherent —
+SmolLM2-135M (tie), Qwen3-MoE-4x0.6B, Qwen3.5-0.8B, Qwen3-4B-2507-Q6_K,
+Qwen3-4B-Q8_0, Qwen3-8B-Q4_K_M, Qwen2.5-Coder-7B-Q5_K_M, Qwen3.5-9b-Sushi-Coder,
+Q3.5-9B-GLM-5.1-DA.
+
+**Drive instruct models the way they were trained, or the gate lies to you.**
+The first version of the sweep asked a raw sentence — `The capital of France is`
+— and every Qwen3.5 model answered by *repeating the question* until the token
+budget ran out: `the capital of France. The capital of France is the capital of
+France.` Both backends produced it byte for byte, so the sweep called it a pass
+while the output was useless to a human. It is the model behaving as trained: an
+instruct model handed a bare sentence has no reason to answer it, and the
+llama.cpp reference recorded earlier in this file repeats the same prompt too. The sweep now wraps the prompt in the ChatML turn markers the models
+expect (`--chat`, `KRK_CHAT=0` for base models) and asks a real question; the
+same four models then print `The capital of France is **Paris**. It serves as the
+country's seat…` and agree byte for byte. A coherence result on an untemplated
+prompt is not evidence about a backend, and "the text is degenerate" is worth
+checking against the *reference* before it is treated as a kernel bug.
 
 ---
 
@@ -297,6 +378,82 @@ configuration verifies at `maxerr 0.0e+00`.
 8. **The `rows<=16` decode shapes** remain occupancy-starved (0.4-1.2 waves);
    decode is gemv and already at 21.3 tok/s on the 9B, so this needs its own
    measurement before anyone invests.
+
+## P1c — device kernel speed on gfx1201 (plan: [docs/PERF-PLAN.md](PERF-PLAN.md))
+
+Ranked by measured end-to-end impact. Every claim is a number in PERF-PLAN.md;
+proven causes and open hypotheses are separated there.
+
+1. **Q6_K (and Q5_K) decode is the format that is 3-4x slow**, and Q4_K is not:
+   `kraken-bench` measures Q4_K at 572-674 GB/s (89-105% of the 640 GB/s DRAM
+   envelope, so at or above parity with f16) but Q6_K at **143 GB/s on a 13.8 MB
+   matrix that fits the 64 MB Infinity Cache** and 195 GB/s on a cache-exceeding
+   208 MB one — i.e. instruction-bound in the chunk decode, not memory-bound.
+   Q5_K sits at 352. Fix = packed-f16 decode (`v_pk_mul_f16`/`v_pk_fma_f16`, the
+   family `krk_hip.hpp` already exposes) with a branch-free 6-bit unpack and a
+   precomputed `d * scale` in f16. Falsifier: 4096x4096 Q6_K > 400 GB/s.
+2. **Prefill GEMM runs at 22% of its memory-bound ceiling because the dequant
+   staging blocks it.** rows=32 Q4_K: 15.67 TFLOP/s / 137 GB/s against a ~72
+   TFLOP/s memory-bound ceiling (9.44 MB per 1.07 GFLOP at 640 GB/s), while
+   rocBLAS' f16 GEMM at the same shape is at 773 GB/s (memory-bound, 43.4 µs).
+   Reading 3.5x fewer bytes and running 1.58x slower than that is only
+explainable by time before the WMMA units see data — which the kernel's own
+§2c note already measured as 55-97% of prefill GEMM time. WMMA itself is not
+the suspect. Fix = take dequant off the critical path: double-buffered LDS, a
+   producer/consumer split, then decode the B fragment straight into VGPRs.
+   Target > 40 TFLOP/s at rows=32.
+3. **Call count is the dense-decode tax.** The launch floor is 2.65 µs on a
+   6.2-7.8 µs call for the k/v, g/u and down shapes: 34-43% of each call, every
+   token. The engine's fused group already costs 2.9x less *per matrix* than the
+   separate calls. Fix = group more projections per launch.
+4. **One sync point per token.** `download_f32` = 3.4 ms/token on the 8B (21%,
+   2.7 ms of it device *idle*) and ~0.6 ms on the 0.8B. Fix = softcap + top-K
+   candidates on device, copy back 8-128 pairs instead of the 151k row, with a
+   tail-mass guard so the host-side filters provably do not need a candidate
+   they were not given.
+5. **Small models are op-count-bound.** 541 device ops/token on the 0.8B against
+   a 10.3 us budget each, 30.6% compute-busy; ~250 of those ops are tiny
+   elementwise/norm calls. Fix = fuse the norm+elementwise chain, and add the
+   per-op timings to the fused layer path.
+6. **MoE is not compute at all.** 7.3% compute-busy, 69 ms/token on the 4x0.6B
+   (13 GB/s). Fix = trace the expert cache first, then expert-only residency,
+   device-side router top-k, one batched transfer per step.
+7. **Attention at decode context.** 35-190 us/call where the KV traffic is
+   ~4 us; one thread per key, each reading a whole head vector. Fix =
+   warp-per-(head,q-token) with lanes across channels and a shuffle reduce.
+8. **Split-K policy and `rows<=16` occupancy** need their own measurement on
+   gfx1201 before anyone invests (the gfx1031 numbers do not transfer).
+
+### Capability work the same pass owes
+
+- **Landed**: final-logit softcapping (one place, all paths); per-stage
+  coherence instrumentation; `KRK_TIME` per-op timing with a filter; the
+  coherence gate with instruct templates.
+- **Sliding-window attention** (per-layer patterns) — the arch table records it
+  as a blocker for gemma2/gemma3; needs the per-layer window in `AttnDesc` and
+  a mask in the attention kernels.
+- **Per-layer input embeddings** (gemma4) — a second embedding table read per
+  layer, plus the shared-KV 18-layer geometry it comes with.
+- **YaRN rope scaling** — `rope_scale`/`rope_frac` exist; YaRN needs the
+  frequency-dependent ramp and the attention scale that goes with it (laguna,
+  long-context use generally).
+- **RadixAttention / prefix cache** — shared prefixes across requests in the
+  server, so a repeated system prompt is prefill-free. Needs a token trie over
+  the KV cache and a rollback story for the recurrent models (see Tail-Replay
+  in [docs/implementing-papers.md](implementing-papers.md)).
+- **LLaDA / diffusion (DLLM)** — loader schema (fused `attn_qkv`, group-limited
+  routing + gate bias) and the block-diffusion sampler; research and tensor map
+  already in [docs/LLaDA.md](LLaDA.md).
+- **MTP / dflash / dspark draft blocks** — currently skipped with a note; the
+  verdict counts them (`mtp_blocks`), so the next step is to load them as a
+  draft head and wire them into the existing speculative loop.
+- **Architecture pass over every file in the model folders** — the inventory is
+  at 44 runnable of 87; the refused ones need either a named dequantizer
+  (quant type #100/#101/#102/#107) or a documented reason, and the runnable set
+  needs a load-and-generate smoke test each.
+- **Paper backlog** — all 12 summarized with what each would change here in
+  [docs/implementing-papers.md](implementing-papers.md); Tail-Replay first
+  because it repairs the recurrent `kv_rollback` refusal.
 
 ## P2 — robustness and diagnostics
 

@@ -14,10 +14,12 @@
 
 #include "krk/backend.hpp"
 #include "kernels/attention.hpp"
+#include "kernels/topk.hpp"
 #include "kernels/fused.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/gemm_dp4a.hpp"
 #include "kernels/gdn.hpp"
+#include "op_time.hpp"
 
 namespace krk {
 
@@ -129,6 +131,26 @@ i64 kfd_compute_units() {
 // HipBackend
 // ---------------------------------------------------------------------------
 
+// The four top-k launches for one logits row, typed on how the row is stored.
+// Nothing between them touches the host: stage 2 writes the cut and stage 3
+// reads it back from device memory, so the whole ranking is one async chain.
+template <typename T, int kThreads>
+void topk_launch(const T *logits, const u32 *pm, f32 rep_pen, f32 softcap,
+                 f32 inv_temp, i32 n, i32 k, u32 *hist,
+                 unsigned long long *gmax, u32 *cut, unsigned long long *count,
+                 float *mass, unsigned long long *cand, i32 cand_cap, i32 *ids,
+                 f32 *vals, unsigned long long *count_out, unsigned blocks,
+                 i32 span) {
+    topk_hist_kernel<T, kThreads><<<blocks, kThreads>>>(
+        logits, pm, rep_pen, softcap, hist, gmax, n, span);
+    topk_scan_kernel<<<1, 1>>>(hist, k, cut);
+    topk_collect_kernel<T, kThreads><<<blocks, kThreads>>>(
+        logits, pm, rep_pen, softcap, cut, gmax, cand, cand_cap, count, mass,
+        inv_temp, n, span);
+    topk_final_kernel<kThreads><<<1, kThreads>>>(cand, count, cand_cap, k, ids,
+                                                vals, count_out);
+}
+
 // The GEMM ladder this backend walks, and the switch that pins a rung for
 // measurement. See HipBackend::gemm_rung for how the device picks.
 enum class GemmRung { kWmma, kDp4a, kSimt };
@@ -222,14 +244,18 @@ public:
         if (p) KRK_HIP(hipHostFree(p));
     }
     void upload(void *dst, const void *src, size_t bytes, size_t off) override {
+        KRK_TIME_OP("upload");
+        if (stage_upload(static_cast<char *>(dst) + off, src, bytes)) return;
         KRK_HIP(hipMemcpy(static_cast<char *>(dst) + off, src, bytes,
                           hipMemcpyHostToDevice));
     }
     void download(void *dst, const void *src, size_t bytes, size_t off) override {
+        KRK_TIME_OP("download");
         KRK_HIP(hipMemcpy(dst, static_cast<const char *>(src) + off, bytes,
                           hipMemcpyDeviceToHost));
     }
     void fill0(void *dst, size_t bytes) override {
+        KRK_TIME_OP("fill0");
         KRK_HIP(hipMemset(dst, 0, bytes));
     }
     void sync() override { KRK_HIP(hipDeviceSynchronize()); }
@@ -262,6 +288,7 @@ public:
     }
 
     void download_f32(f32 *dst, const void *src, i64 n) override {
+        KRK_TIME_OP("download_f32");
         std::vector<u16> tmp(static_cast<size_t>(n));
         KRK_HIP(hipMemcpy(tmp.data(), src, static_cast<size_t>(n) * 2,
                           hipMemcpyDeviceToHost));
@@ -314,8 +341,8 @@ public:
     }
 
     // ---- ops -------------------------------------------------------------
-    void embed(void *out, const void *tok_embd, DType tt, i64 n_vocab, i64 n_embd,
-               const i32 *tokens, i64 n_tok) override {
+    void embed(void *out, const void *tok_embd, DType tt, i64 n_vocab, i64 n_embd,                const i32 *tokens, i64 n_tok) override {
+        KRK_TIME_OP("embed");
         if (n_tok <= 0) return;
         const size_t row_bytes = dtype_row_bytes(tt, n_embd);
         // `tokens` is host memory (the Backend contract — the CPU backend
@@ -329,7 +356,7 @@ public:
             tok_dev_ = nullptr;
             KRK_HIP(hipMalloc(&tok_dev_, tok_cap_));
         }
-        KRK_HIP(hipMemcpy(tok_dev_, tokens, need, hipMemcpyHostToDevice));
+        stage_upload(tok_dev_, tokens, need);
         embed_kernel<128><<<static_cast<unsigned>(n_tok), 128>>>(
             static_cast<_Float16 *>(out), static_cast<const u8 *>(tok_embd),
             static_cast<int>(tt), n_vocab, n_embd, row_bytes,
@@ -338,13 +365,102 @@ public:
 
     void rmsnorm(void *out, const void *x, const f32 *w, i64 rows,
                  i64 n, f32 eps) override {
+        KRK_TIME_OP("rmsnorm");
         rmsnorm_kernel<256><<<static_cast<unsigned>(rows), 256>>>(
             static_cast<_Float16 *>(out),
             static_cast<const _Float16 *>(x), w, n, eps);
     }
+    // Top-k of the logits row, entirely on the device (kernels/topk.hpp).
+    // Four launches and no readback between them: stage 2 writes the cut and
+    // stage 3 reads it back from device memory, so the only transfer at the
+    // end is k ids, k values, the mass and the count -- a few hundred bytes
+    // where the download this replaces was 993 kB, and none of the host
+    // partial_sort over 248320 elements that used to follow it.
+    //
+    // `logits` is the head's output buffer, so it is in the *activation* type
+    // (f16 on the fast path), not f32. The dispatch below is the only thing
+    // that knows it; the kernels are templated on the load.
+    //
+    // Scratch layout (caller-owned; 4096 B header then cand_cap u64 keys):
+    //   0 hist[512] u32 | 2048 gmax u64 | 2056 cut u32 | 2064 count u64
+    //   2072 mass f32   | 4096 cand[cand_cap] u64
+    void logits_topk(const void *logits, i64 n, i32 k, const void *pen_mask,
+                     f32 rep_pen, f32 softcap, f32 temp, i32 *ids, f32 *vals,
+                     f32 *mass_out, void *scratch, i32 cand_cap,
+                     i64 *count_out) override {
+        KRK_TIME_OP("logits_topk");
+        constexpr int kThreads = 256;
+        if (n <= 0 || k <= 0) return;
+        u8 *sc = static_cast<u8 *>(scratch);
+        u32 *hist = reinterpret_cast<u32 *>(sc);
+        auto *gmax = reinterpret_cast<unsigned long long *>(sc + 2048);
+        u32 *cut = reinterpret_cast<u32 *>(sc + 2056);
+        auto *count = reinterpret_cast<unsigned long long *>(sc + 2064);
+        float *mass = reinterpret_cast<float *>(sc + 2072);
+        auto *cand = reinterpret_cast<unsigned long long *>(sc + 4096);
 
-    void gemm(void *out, const void *x, const void *w, DType wt, i64 n_out,
-              i64 n_in, i64 rows) override {
+        // One block per ~16 chunks per thread, capped at the device width so
+        // a 248k row does not launch a thousand blocks of mostly-idle work.
+        const i64 want = (n + kThreads * 16 - 1) / (kThreads * 16);
+        const unsigned blocks =
+            static_cast<unsigned>(want < 1 ? 1 : (want > 1024 ? 1024 : want));
+        const i32 span = static_cast<i32>((n + blocks - 1) / blocks);
+
+        KRK_HIP(hipMemsetAsync(hist, 0, 2048));
+        KRK_HIP(hipMemsetAsync(gmax, 0, 8));
+        KRK_HIP(hipMemsetAsync(count, 0, 8));
+        KRK_HIP(hipMemsetAsync(mass, 0, 4));
+
+        const f32 inv_temp = temp > 0.0f ? 1.0f / temp : 1.0f;
+        const u32 *pm = static_cast<const u32 *>(pen_mask);
+        auto *co = reinterpret_cast<unsigned long long *>(count_out);
+
+        // k == 1 and no mass wanted: one pass, one max, two launches. This is
+        // the greedy decode path and the only one wired up today.
+        if (k == 1 && mass_out == nullptr) {
+            KRK_HIP(hipMemsetAsync(gmax, 0, 8));
+            if (act_type() == DType::F16) {
+                topk_argmax_kernel<_Float16, kThreads>
+                    <<<blocks, kThreads>>>(
+                        static_cast<const _Float16 *>(logits), pm, rep_pen,
+                        softcap, static_cast<i32>(n), span, gmax);
+            } else {
+                topk_argmax_kernel<f32, kThreads><<<blocks, kThreads>>>(
+                    static_cast<const f32 *>(logits), pm, rep_pen, softcap,
+                    static_cast<i32>(n), span, gmax);
+            }
+            topk_unpack_kernel<<<1, 1>>>(
+                gmax, reinterpret_cast<unsigned long long *>(count_out), ids, vals);
+            KRK_HIP(hipGetLastError());
+            (void)inv_temp;
+            (void)cut;
+            (void)hist;
+            (void)mass;
+            (void)cand;
+            (void)cand_cap;
+            return;
+        }
+
+        if (act_type() == DType::F16) {
+            topk_launch<_Float16, kThreads>(
+                static_cast<const _Float16 *>(logits), pm, rep_pen, softcap,
+                inv_temp, static_cast<i32>(n), k, hist, gmax, cut, count, mass,
+                cand, cand_cap, ids, vals, co, blocks, span);
+        } else {
+            topk_launch<f32, kThreads>(
+                static_cast<const f32 *>(logits), pm, rep_pen, softcap, inv_temp,
+                static_cast<i32>(n), k, hist, gmax, cut, count, mass, cand,
+                cand_cap, ids, vals, co, blocks, span);
+        }
+        KRK_HIP(hipGetLastError());
+        // count_out is written by the final kernel; mass is computed into the
+        // scratch for anyone who asks for it through the four-stage path.
+        (void)mass_out;
+    }
+
+
+    void gemm(void *out, const void *x, const void *w, DType wt, i64 n_out,               i64 n_in, i64 rows) override {
+        KRK_TIME_OP("gemm");
         if (rows <= 0 || n_out <= 0 || n_in <= 0) return;
         const size_t row_bytes = dtype_row_bytes(wt, n_in);
         const _Float16 *xh = static_cast<const _Float16 *>(x);
@@ -361,6 +477,15 @@ public:
         }
 
         const GemmRung rung = gemm_rung(wt, rows, n_out, n_in);
+        // The rung the shape actually took is the first thing to know when a
+        // GEMM looks slow: WMMA is only reachable for rows > 1, and the decode
+        // row runs a GEMV with no tile at all.
+        krk_op_scope.retag(rows == 1                 ? "gemm(gemv)"
+                           : rung == GemmRung::kWmma ? "gemm(wmma)"
+                           : rung == GemmRung::kDp4a ? "gemm(dp4a)"
+                                                     : "gemm(simt)");
+        krk_op_scope.bytes(static_cast<i64>(dtype_row_bytes(wt, n_in)) * n_out);
+        krk_op_scope.flops(2 * rows * n_out * n_in);
         if (rows == 1) {
             // One 256-thread block covers THREADS/32 rows (one warp
             // per row), so the grid is n_out warps, not n_out blocks —
@@ -471,6 +596,7 @@ public:
                     const void *const w[], DType wt,
                     const i64 n_out[], i64 n_in, int n_mat,
                     i64 rows) override {
+        KRK_TIME_OP("gemm_group");
         // The fused kernels express the M=1 decode row only
         // (row-parallel over n_out, no M dimension); prefill
         // rows and anything the group cannot express keep the
@@ -520,6 +646,7 @@ public:
 
     void rope(void *q, void *k, i64 n_head, i64 n_kv, i64 hd, i64 n_tok, i64 pos0,
               const f32 *inv_freq, f32 scale, f32 frac) override {
+        KRK_TIME_OP("rope");
         // `inv_freq` is host memory (Model keeps the table in a
         // std::vector), but the kernel reads it per thread on the
         // device; stage_freq() stages it, caching the upload.
@@ -535,6 +662,7 @@ public:
 
     void qk_norm(void *q, void *k, const f32 *wq, const f32 *wk, i64 n_head,
                  i64 n_kv, i64 hd, i64 n_tok, f32 eps) override {
+        KRK_TIME_OP("qk_norm");
         if (wq) {
             head_norm_kernel<128>
                 <<<dim3(static_cast<unsigned>(n_head), static_cast<unsigned>(n_tok)),
@@ -549,6 +677,7 @@ public:
 
     void kv_append(void *kcache, void *vcache, const void *k, const void *v,
                    const AttnDesc &d) override {
+        KRK_TIME_OP("kv_append");
         _Float16 *kc = static_cast<_Float16 *>(kcache) + d.layer * d.layer_stride;
         _Float16 *vc = static_cast<_Float16 *>(vcache) + d.layer * d.layer_stride;
         const i64 total = d.n_tok * d.pos_stride;
@@ -562,6 +691,7 @@ public:
 
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {
+        KRK_TIME_OP("attention");
         const void *kc =
             static_cast<const _Float16 *>(kcache) + d.layer * d.layer_stride;
         const void *vc =
@@ -604,6 +734,7 @@ public:
                             const void *k, const void *v, const AttnDesc &d,
                             const f32 *inv_freq, f32 rope_scale,
                             f32 rope_frac) override {
+        KRK_TIME_OP("attn_fused");
         // The fused kernel expresses the single-query-token decode row
         // only, and only the head widths its packed lane slice covers
         // (the same rule as the decode attention path above). Anything
@@ -626,6 +757,7 @@ public:
     }
 
     void silu_mul(void *out, const void *gate, const void *up, i64 n) override {
+        KRK_TIME_OP("silu_mul");
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         silu_mul_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(out),
                                          static_cast<const _Float16 *>(gate),
@@ -633,6 +765,7 @@ public:
     }
 
     void add_bias_rows(void *out, const f32 *bias, i64 n, i64 rows) override {
+        KRK_TIME_OP("add_bias_rows");
         const i64 total = n * rows;
         const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
         add_bias_rows_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(out), bias, n,
@@ -640,24 +773,28 @@ public:
     }
 
     void add_inplace(void *a, const void *b, i64 n) override {
+        KRK_TIME_OP("add_inplace");
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         add_inplace_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(a),
                                             static_cast<const _Float16 *>(b), n);
     }
 
     void copy_act(void *dst, const void *src, i64 n) override {
+        KRK_TIME_OP("copy_act");
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         copy_h2h_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(dst),
                                          static_cast<const _Float16 *>(src), n);
     }
 
     void axpy(void *dst, const void *src, f32 alpha, i64 n) override {
+        KRK_TIME_OP("axpy");
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         axpy_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(dst),
                                      static_cast<const _Float16 *>(src), alpha, n);
     }
 
     void upload_i32(i32 *dst, const i32 *src, i64 n) override {
+        KRK_TIME_OP("upload_i32");
         KRK_HIP(hipMemcpy(dst, src, static_cast<size_t>(n) * sizeof(i32),
                           hipMemcpyHostToDevice));
     }
@@ -671,6 +808,7 @@ public:
 
     void l2norm(void *o, const void *x, i64 n_tok, i64 n_head, i64 hd,
                 i64 stride, f32 eps) override {
+        KRK_TIME_OP("l2norm");
         if (n_tok <= 0 || n_head <= 0 || hd <= 0) return;
         const dim3 grid(static_cast<unsigned>(n_head),
                         static_cast<unsigned>(std::min<i64>(n_tok, 65535)));
@@ -685,18 +823,21 @@ public:
     }
 
     void sigmoid_act(void *x, i64 n) override {
+        KRK_TIME_OP("sigmoid_act");
         if (n <= 0) return;
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         gdn_sigmoid_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(x), n);
     }
 
     void softplus_act(void *x, i64 n) override {
+        KRK_TIME_OP("softplus_act");
         if (n <= 0) return;
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         gdn_softplus_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(x), n);
     }
 
     void scale_act(void *x, f32 alpha, i64 n_tok, i64 width, i64 stride) override {
+        KRK_TIME_OP("scale_act");
         if (n_tok <= 0 || width <= 0) return;
         const dim3 grid(static_cast<unsigned>((width + 255) / 256),
                         static_cast<unsigned>(std::min<i64>(n_tok, 65535)));
@@ -705,6 +846,7 @@ public:
     }
 
     void mul_act(void *a, const void *b, i64 n) override {
+        KRK_TIME_OP("mul_act");
         if (n <= 0) return;
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         gdn_mul_act_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(a),
@@ -712,6 +854,7 @@ public:
     }
 
     void add_bias_cols(void *x, const f32 *bias, i64 n_row, i64 n_col) override {
+        KRK_TIME_OP("add_bias_cols");
         if (n_row <= 0 || n_col <= 0) return;
         const dim3 grid(1, static_cast<unsigned>(std::min<i64>(n_row, 65535)));
         gdn_add_bias_cols_kernel<<<grid, 64>>>(static_cast<_Float16 *>(x), bias,
@@ -719,6 +862,7 @@ public:
     }
 
     void scale_cols(void *x, const f32 *col, i64 n_row, i64 n_col) override {
+        KRK_TIME_OP("scale_cols");
         if (n_row <= 0 || n_col <= 0) return;
         const dim3 grid(1, static_cast<unsigned>(std::min<i64>(n_row, 65535)));
         gdn_scale_cols_kernel<<<grid, 64>>>(static_cast<_Float16 *>(x), col, n_col,
@@ -726,6 +870,7 @@ public:
     }
 
     void scale_rows(void *x, const void *alpha, i64 n_row, i64 n) override {
+        KRK_TIME_OP("scale_rows");
         if (n_row <= 0 || n <= 0) return;
         const dim3 grid(1, static_cast<unsigned>(std::min<i64>(n_row, 65535)));
         gdn_scale_rows_kernel<<<grid, 256>>>(static_cast<_Float16 *>(x),
@@ -735,6 +880,7 @@ public:
 
     void qwen3_next_split(void *q, void *gate, const void *packed, i64 n_tok,
                           i64 n_head, i64 hd) override {
+        KRK_TIME_OP("q3_split");
         if (n_tok <= 0 || n_head <= 0 || hd <= 0) return;
         const dim3 grid(static_cast<unsigned>(n_head),
                         static_cast<unsigned>(std::min<i64>(n_tok, 65535)));
@@ -746,6 +892,7 @@ public:
 
     void conv1d_silu(void *out, const void *in, void *state, const void *kern,
                      DType wt, i64 n_tok, i64 chan, i64 ksize) override {
+        KRK_TIME_OP("conv1d_silu");
         if (n_tok <= 0 || chan <= 0 || ksize <= 0) return;
         // The taps are a constant weight: decode them once per layer, not once
         // per token. This is the only place a quantized buffer is read on the
@@ -761,6 +908,7 @@ public:
                     const void *v, const void *g, const void *beta, i64 n_tok,
                     i64 n_k_head, i64 n_v_head, i64 d_state, i64 hd,
                     i64 row_stride) override {
+        KRK_TIME_OP("delta_rule");
         gdn_delta_rule_launch(
             static_cast<_Float16 *>(out), static_cast<f32 *>(state),
             static_cast<const _Float16 *>(q), static_cast<const _Float16 *>(k),
@@ -771,6 +919,8 @@ public:
 
     void gather_rows(void *dst, const void *src, const i32 *rows, i64 n_rows,
                      i64 n) override {
+        KRK_TIME_OP("gather_rows");
+        krk_op_scope.bytes(n_rows * n * 2);
         if (n_rows <= 0 || n <= 0) return;
         gather_rows_kernel<<<static_cast<unsigned>(n_rows), 256>>>(
             static_cast<_Float16 *>(dst),            static_cast<const _Float16 *>(src), rows,
@@ -779,6 +929,8 @@ public:
 
     void scatter_axpy_rows(void *dst, const void *src, const i32 *rows,
                            const f32 *alpha, i64 n_rows, i64 n) override {
+        KRK_TIME_OP("scatter_axpy");
+        krk_op_scope.bytes(n_rows * n * 2);
         if (n_rows <= 0 || n <= 0) return;
         // alpha lives in this backend's address space, exactly like `rows`: the
         // caller is a device backend's user and hands over buffers it allocated
@@ -795,6 +947,7 @@ public:
     }
 
     ~HipBackend() override {
+        OpTime::get().finish();
         if (tok_dev_) {
             (void)hipFree(tok_dev_);
             tok_dev_ = nullptr;
@@ -821,6 +974,10 @@ public:
         }
         for (const GdnTaps &e : gdn_taps_) (void)hipFree(e.dev);
         gdn_taps_.clear();
+        if (stage_pin_) {
+            (void)hipHostFree(stage_pin_);
+            stage_pin_ = nullptr;
+        }
     }
 
 private:
@@ -860,6 +1017,11 @@ private:
     i64 *pos_dev_ = nullptr;
     i64 pos_staged_ = 0;
     bool pos_valid_ = false;
+    // Pinned staging ring for the small hot-path H2D transfers (see
+    // stage_upload): one allocation, kStageSlots slots, rotated per use.
+    void *stage_pin_ = nullptr;
+    size_t stage_stride_ = 0;
+    int stage_slot_ = 0;
     // fp32 partials for split-K prefill GEMMs (gemm():
     // one buffer per split x row x channel, grown on
     // demand to the largest split GEMM the model runs).
@@ -897,11 +1059,72 @@ private:
         return dev;
     }
 
-    void stage_pos(i64 pos0) {
+    // ---- host->device staging ------------------------------------------------
+//
+// A pageable hipMemcpy is synchronous with respect to the *host* and is
+// ordered after everything already queued on the null stream. Called between
+// decode steps it therefore blocks until the previous token's entire kernel
+// stream has retired, which is a full pipeline drain per token for the sake of
+// four bytes: measured on the 0.8B, embed() spent 274 us of host time per call
+// (65 times its kernel launch) and the decode step's host column put ~17% of
+// the token inside that one call. It is the single clearest reason the step is
+// launch-bound — the GPU is drained at the top of every token, so it cannot
+// overlap with the host enqueueing the next one.
+//
+// Staging through pinned memory and issuing hipMemcpyAsync on the same stream
+// keeps the ordering the kernels rely on (the DMA is still ahead of every
+// kernel that reads the buffer) while returning to the host at once.
+//
+// The pinned source has to be rotated: the DMA reads it asynchronously, so the
+// host must not overwrite the slot an earlier copy is still reading. On the
+// decode path the host does ~2.5 us of work per kernel launch between two
+// uploads and a 4-byte DMA retires in well under a microsecond, so the depth
+// here is orders of magnitude more than the in-flight count. It is a named
+// constant rather than a computed bound because the thing it is bounding is
+// "uploads issued per unit of host work", which no allocation policy can
+// express — a path that batches uploads more tightly than it launches kernels
+// would need a bigger ring, and the coherence gate is what would catch it.
+//
+// Above kStageMaxBytes the pageable copy stays: those are the one-shot weight
+// loads, where a pinned slot the size of a tensor is neither available nor
+// worth having, and nothing is queued behind them to overlap with.
+static constexpr size_t kStageMaxBytes = 64u * 1024u;
+static constexpr int kStageSlots = 32;
+
+// Returns false when the caller should fall back to the blocking pageable copy.
+bool stage_upload(void *dst, const void *src, size_t bytes) {
+    if (bytes == 0) return true;
+    if (bytes > kStageMaxBytes) return false;
+    if (!stage_pin_ || bytes > stage_stride_) {
+        if (stage_pin_) (void)hipHostFree(stage_pin_);
+        stage_pin_ = nullptr;
+        // Round the stride up so the common growth path reallocates rarely.
+        size_t want = 256;
+        while (want < bytes) want <<= 1;
+        stage_stride_ = want;
+        if (hipHostMalloc(&stage_pin_, kStageSlots * stage_stride_) !=
+            hipSuccess) {
+            // Pinned memory is a finite pool. Losing it must degrade the
+            // staging path, not the run: fall back to the blocking copy.
+            (void)hipGetLastError();
+            stage_pin_ = nullptr;
+            stage_stride_ = 0;
+            return false;
+        }
+        stage_slot_ = 0;
+    }
+    stage_slot_ = (stage_slot_ + 1) % kStageSlots;
+    char *p = static_cast<char *>(stage_pin_) +
+              static_cast<size_t>(stage_slot_) * stage_stride_;
+    std::memcpy(p, src, bytes);
+    KRK_HIP(hipMemcpyAsync(dst, p, bytes, hipMemcpyHostToDevice, 0));
+    return true;
+}
+
+void stage_pos(i64 pos0) {
         if (pos_valid_ && pos_staged_ == pos0) return;
         if (!pos_dev_) KRK_HIP(hipMalloc(&pos_dev_, sizeof(i64)));
-        KRK_HIP(hipMemcpy(pos_dev_, &pos0, sizeof(i64),
-                          hipMemcpyHostToDevice));
+        stage_upload(pos_dev_, &pos0, sizeof(i64));
         pos_staged_ = pos0;
         pos_valid_ = true;
     }

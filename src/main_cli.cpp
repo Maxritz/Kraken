@@ -35,6 +35,7 @@ struct Args {
     bool chat = false;
     bool info = false;
     bool bench = false;
+    bool profile = false;
     int debug_topk = 0; // stderr dump of top-k logprobs per token
     bool verbose = false;
     bool interactive = true;
@@ -72,6 +73,9 @@ void usage() {
         "  --draft-tokens N      speculation window (default 4)\n"
         "  --info                print model and device info, then exit\n"
         "  --bench               prefill/decode benchmark on a fixed prompt\n"
+        "  --profile             per-op device timeline for the last decode\n"
+        "                        step(s), with the idle gap before each op\n"
+        "                        (KRK_PROFILE_STEPS/FROM/OPS tune the window)\n"
         "  --debug-topk N        dump the top-N candidates and their log-probs\n"
         "                        for every token to stderr (at full precision)\n"
         "  -v                    verbose logging\n"
@@ -117,6 +121,7 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--cpu") a->cpu = true;
         else if (f == "--info") a->info = true;
         else if (f == "--bench") a->bench = true;
+        else if (f == "--profile") a->profile = true;
         else if (f == "--debug-topk")
             a->debug_topk = std::atoi(next("--debug-topk"));
         else if (f == "-v" || f == "--verbose") a->verbose = true;
@@ -255,6 +260,20 @@ int main(int argc, char **argv) {
     Args a;
     if (!parse(argc, argv, &a)) return 2;
     log_set_level(a.verbose ? Log::Debug : Log::Info);
+
+    // The per-op timeline lives in the HIP backend (src/hip/op_time.hpp), which
+    // this translation unit cannot include — it is compiled for both backends.
+    // The handshake is the environment, read once when the profiler's singleton
+    // is constructed at the first instrumented op, so setting it here (before
+    // the backend exists) is early enough. `--profile` implies timing every op:
+    // a filtered timeline is missing most of the step.
+    if (a.profile) {
+#ifdef _WIN32
+        _putenv_s("KRK_PROFILE", "1");
+#else
+        setenv("KRK_PROFILE", "1", 1);
+#endif
+    }
 
     std::string err;
     Backend *be = nullptr;

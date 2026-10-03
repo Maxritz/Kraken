@@ -163,6 +163,13 @@ Engine::~Engine() { shutdown(); }
 bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     be_ = be;
     cfg_ = cfg;
+    // KRK_DUMP=<path>: append every stage of the forward pass (the hidden state
+    // after embed and after each layer, for the row that decides the next
+    // token) as text, so the same prompt can be run on two backends and the
+    // first stage that disagrees found by diffing the files. A debug hook on
+    // the hot path's *shape*, not its math: nothing here is compiled out, it
+    // just does nothing unless the variable is set.
+    if (const char *dump = std::getenv("KRK_DUMP")) dump_path_ = dump;
     // Size the CPU worker pool before the first forward pass.
     // 0 (the default) keeps the pool's own sizing: one worker per
     // hardware thread minus the calling thread.
@@ -219,9 +226,14 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     ws_x_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     ws_xn_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     ws_x2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
-    // q_proj_ is the projection's width: Qwen3.5 packs a per-head output gate
-    // behind the query, so the buffer has to hold both until the split.
-    ws_q_ = alloc(static_cast<size_t>(C * q_proj_) * as);
+    // Qwen3.5 packs a per-head output gate behind the query, so its query
+    // projection is twice the query width and the split has to gather out of
+    // it. The split reads a wider row than it writes, which means an in-place
+    // call has head `h` writing over rows that other heads have not read yet:
+    // block order decides the result. Keep the projection in its own buffer.
+    ws_q_ = alloc(static_cast<size_t>(C * q_dim_) * as);
+    if (q_proj_ != q_dim_)
+        ws_qpack_ = alloc(static_cast<size_t>(C * q_proj_) * as);
     ws_k_ = alloc(static_cast<size_t>(C * kv_dim_) * as);
     ws_v_ = alloc(static_cast<size_t>(C * kv_dim_) * as);
     ws_attn_ = alloc(static_cast<size_t>(C * q_dim_) * as);
@@ -251,6 +263,11 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     }
     logits_host_ = static_cast<f32 *>(host_alloc(static_cast<size_t>(n_vocab_) * 4));
     tok_scratch_.resize(static_cast<size_t>(C));
+    // Device top-k. A fixed 36 kB of candidate buffer, allocated for every
+    // backend so that "can we use the fast path" is a runtime check and not a
+    // different code path with a null to forget.
+    topk_scratch_ = alloc(4096 + static_cast<size_t>(kTopKCap) * 8);
+    topk_out_ = alloc(16);
 
     if (mc.is_moe && mc.n_expert > 0) {
         const i32 k = std::max<i32>(1, mc.n_expert_used);
@@ -312,11 +329,12 @@ void Engine::shutdown() {
         return;
     }
     be_->sync();
-    for (void **p : {&kcache_, &vcache_, &ws_x_, &ws_xn_, &ws_x2_, &ws_q_, &ws_k_,
+    for (void **p : {&kcache_, &vcache_, &ws_x_, &ws_xn_, &ws_x2_, &ws_q_,
+                     &ws_qpack_, &ws_k_,
                      &ws_v_, &ws_attn_, &ws_gate_, &ws_up_, &ws_logits_, &ws_router_,
                      &ws_ffn_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
                      &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
-                     &conv_state_, &rec_state_}) {
+                     &conv_state_, &rec_state_, &topk_scratch_, &topk_out_}) {
         if (*p) {
             be_->release(*p);
             *p = nullptr;
@@ -326,6 +344,24 @@ void Engine::shutdown() {
     logits_host_ = nullptr;
     model_.unload();
     be_ = nullptr;
+}
+
+void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
+                      i64 rows) {
+    if (dump_path_.empty() || rows <= 0) return;
+    be_->sync();
+    std::vector<f32> row(static_cast<size_t>(width));
+    be_->download_f32(row.data(),
+                      act_at(const_cast<void *>(buf), be_->act_size(),
+                             (rows - 1) * width),
+                      width);
+    std::FILE *f = std::fopen(dump_path_.c_str(), "a");
+    if (!f) return;
+    std::fprintf(f, "%s L%02d n=%lld", what, layer, static_cast<long long>(rows));
+    for (i64 i = 0; i < width; i++)
+        std::fprintf(f, " %.7g", row[static_cast<size_t>(i)]);
+    std::fputc('\n', f);
+    std::fclose(f);
 }
 
 void Engine::head_compute(i32 row) {
@@ -356,8 +392,17 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(mc.head_dim))) *
               mc.rope_attn_scale;
 
+    // One dump hook per stage, taking the row this call will predict from (the
+    // last one): a CPU run and a HIP run of the same prompt then differ at
+    // exactly one line per stage, and the first differing line names the layer.
+    auto dump_stage = [&](const char *what, i32 layer) {
+        dump_row(what, layer, ws_x_, n_embd_, n);
+    };
+    dump_stage("embed", -1);
+
     for (i32 l = 0; l < mc.n_layer; l++) {
         const LayerWeights &L = layers[static_cast<size_t>(l)];
+        dump_stage("enter", l);
 
         be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, n, n_embd_, mc.rms_eps);
 
@@ -370,12 +415,9 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             if (L.moe) {
                 moe_ffn(L, l, n);
             } else {
-                be_->gemm(ws_gate_, ws_xn_, L.wgate.data, L.wgate.type, n_ff_, n_embd_, n);
-                be_->gemm(ws_up_, ws_xn_, L.wup.data, L.wup.type, n_ff_, n_embd_, n);
-                be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_);
-                be_->gemm(ws_x2_, ws_gate_, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n);
-                be_->add_inplace(ws_x_, ws_x2_, n * n_embd_);
+                dense_ffn(L, l, n);
             }
+            dump_stage("gdn", l);
             continue;
         }
 
@@ -383,14 +425,15 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // dependency between them, so they ride one fused launch
         // on the decode row (backend falls back per-matrix for
         // prefill rows or a dtype mix).
+        void *q_out = q_proj_ != q_dim_ ? ws_qpack_ : ws_q_;
         if (L.wq.type == L.wk.type && L.wk.type == L.wv.type) {
-            void *qkv[3] = {ws_q_, ws_k_, ws_v_};
+            void *qkv[3] = {q_out, ws_k_, ws_v_};
             const void *wqkv[3] = {L.wq.data, L.wk.data, L.wv.data};
             const i64 nqkv[3] = {q_proj_, kv_dim_, kv_dim_};
             be_->gemm_group(qkv, ws_xn_, wqkv, L.wq.type,
                             nqkv, n_embd_, 3, n);
         } else {
-            be_->gemm(ws_q_, ws_xn_, L.wq.data, L.wq.type, q_proj_, n_embd_, n);
+            be_->gemm(q_out, ws_xn_, L.wq.data, L.wq.type, q_proj_, n_embd_, n);
             be_->gemm(ws_k_, ws_xn_, L.wk.data, L.wk.type, kv_dim_, n_embd_, n);
             be_->gemm(ws_v_, ws_xn_, L.wv.data, L.wv.type, kv_dim_, n_embd_, n);
         }
@@ -398,8 +441,14 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // Qwen3.5 interleaves each head's output gate into the query
         // projection, so the packed rows have to be split before anything
         // else touches them. The query half stays in place.
-        if (q_proj_ != q_dim_)
-            be_->qwen3_next_split(ws_q_, ws_agate_, ws_q_, n, mc.n_head, mc.head_dim);
+        if (q_proj_ != q_dim_) {
+            be_->qwen3_next_split(ws_q_, ws_agate_, q_out, n, mc.n_head,
+                                  mc.head_dim);
+            // The gate half is the one buffer between the projections and the
+            // layer output that no earlier stage covers.
+            dump_row("attn.qp", l, q_out, q_proj_, n);
+            dump_row("attn.gate", l, ws_agate_, q_dim_, n);
+        }
 
         if (L.q_bias) be_->add_bias_rows(ws_q_, L.q_bias, q_dim_, n);
         if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, kv_dim_, n);
@@ -430,38 +479,37 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             be_->kv_append(kcache_, vcache_, ws_k_, ws_v_, d);
             be_->attention(ws_attn_, ws_q_, kcache_, vcache_, d);
         }
+        // Where inside the attention layer a single-token step goes wrong:
+        // q/k are post-rope here, so a divergence in them is rope or the
+        // projection, and agreeing inputs with a wrong "out" is the attention
+        // kernel itself.
+        dump_row("attn.q", l, ws_q_, q_dim_, n);
+        dump_row("attn.k", l, ws_k_, kv_dim_, n);
+        dump_row("attn.out", l, ws_attn_, q_dim_, n);
 
         // Qwen3.5's output gate is a sigmoid applied to the attention result,
         // not to the projection: gate it before wo.
         if (q_proj_ != q_dim_) {
             be_->sigmoid_act(ws_agate_, static_cast<i64>(n) * q_dim_);
             be_->mul_act(ws_attn_, ws_agate_, static_cast<i64>(n) * q_dim_);
+            dump_row("attn.gated", l, ws_attn_, q_dim_, n);
         }
 
         be_->gemm(ws_x2_, ws_attn_, L.wo.data, L.wo.type, n_embd_, q_dim_, n);
+        dump_row("attn.proj", l, ws_x2_, n_embd_, n);
         be_->add_inplace(ws_x_, ws_x2_, n * n_embd_);
+        dump_row("attn.res", l, ws_x_, n_embd_, n);
 
         be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps);
+        dump_row("attn.ffnn", l, ws_xn_, n_embd_, n);
         if (L.moe) {
             moe_ffn(L, l, n);
         } else {
-            // gate/up share the FFN-norm output: one fused
-            // launch on the decode row, like q/k/v above.
-            if (L.wgate.type == L.wup.type) {
-                void *gu[2] = {ws_gate_, ws_up_};
-                const void *wgu[2] = {L.wgate.data, L.wup.data};
-                const i64 ngu[2] = {n_ff_, n_ff_};
-                be_->gemm_group(gu, ws_xn_, wgu, L.wgate.type,
-                                ngu, n_embd_, 2, n);
-            } else {
-                be_->gemm(ws_gate_, ws_xn_, L.wgate.data, L.wgate.type, n_ff_, n_embd_, n);
-                be_->gemm(ws_up_, ws_xn_, L.wup.data, L.wup.type, n_ff_, n_embd_, n);
-            }
-            be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_);
-            be_->gemm(ws_x2_, ws_gate_, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n);
-            be_->add_inplace(ws_x_, ws_x2_, n * n_embd_);
+            dense_ffn(L, l, n);
         }
+        dump_stage("attn", l);
     }
+    dump_stage("final", mc.n_layer);
 
     // Vocab projection: the expensive part of the head, so it runs on as few
     // rows as the caller asked for. Prefill chunks skip it entirely.
@@ -471,6 +519,31 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         return;
     }
     for (i32 r = 0; r < n; r++) head_compute(r);
+}
+
+// The dense SwiGLU FFN both layer shapes share: xn -> gate/up -> silu -> down
+// -> residual. It was written out twice, and the GDN copy was the stale one:
+// it still issued gate and up as two separate gemm() calls while the attention
+// copy had been moved onto the fused group launch. That is 18 layers x 1
+// wasted launch on the 0.8B, which is 18 of the step's 541 ops — pure op-count
+// tax, since the two matrices read the same activation and have no dependency
+// between them, exactly the condition gemm_group exists for.
+void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
+    // gate/up share the FFN-norm output: one fused launch on the decode row.
+    if (L.wgate.type == L.wup.type) {
+        void *gu[2] = {ws_gate_, ws_up_};
+        const void *wgu[2] = {L.wgate.data, L.wup.data};
+        const i64 ngu[2] = {n_ff_, n_ff_};
+        be_->gemm_group(gu, ws_xn_, wgu, L.wgate.type, ngu, n_embd_, 2, n);
+    } else {
+        be_->gemm(ws_gate_, ws_xn_, L.wgate.data, L.wgate.type, n_ff_, n_embd_, n);
+        be_->gemm(ws_up_, ws_xn_, L.wup.data, L.wup.type, n_ff_, n_embd_, n);
+    }
+    be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_);
+    dump_row("attn.ffng", l, ws_gate_, n_ff_, n);
+    be_->gemm(ws_x2_, ws_gate_, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n);
+    dump_row("attn.down", l, ws_x2_, n_embd_, n);
+    be_->add_inplace(ws_x_, ws_x2_, n * n_embd_);
 }
 
 void Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
@@ -660,6 +733,7 @@ void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
                   static_cast<size_t>(ri) * static_cast<size_t>(conv_state_span_);
     be_->conv1d_silu(ws_qkv_, ws_qkv_, cstate, L.ssm_conv1d.data, L.ssm_conv1d.type,
                      n, cdim, ksize);
+    dump_row("gdn.conv", l, ws_qkv_, cdim, n);
 
     // 3. The post-conv buffer splits into q | k | v. They are regions of one
     //    fused row, so every op below works on a row stride of cdim, not on a
@@ -691,6 +765,7 @@ void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
     be_->delta_rule(ws_h_, state, qbase, kbase, vbase, ws_ssm_, ws_beta_, n,
                     mc.ssm_n_group, mc.ssm_dt_rank, mc.ssm_d_state, mc.ssm_d_state,
                     cdim);
+    dump_row("gdn.delta", l, ws_h_, vdim, n);
 
     // 6. Gated normalization: a plain RMSNorm per head (its weight is stored
     //    verbatim, not zero-centred) then the silu(z) gate.
@@ -827,7 +902,22 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     be_->add_inplace(ws_x_, ws_ffn_, n * n_embd_);
 }
 
-void Engine::fetch_logits() {
+void Engine::fetch_logits(bool device_only) {
+    // Greedy decode reads exactly one number out of this row. Downloading it
+    // first cost 993 kB of PCIe and, on the 8B, 2.7 ms of *device* idle per
+    // token: the GPU had finished and sat waiting for the host. The device
+    // top-k returns the same integer with the row never leaving VRAM. Every
+    // other caller (sampling, --debug-topk, the speculative and draft paths)
+    // passes false and gets the whole row exactly as before.
+    //
+    // The parameter says "leave it on the device", matching the flag the decode
+    // loop computes. It used to be the other way round -- `want_host` -- and a
+    // call site passed the device-side flag straight into it, so the row was
+    // downloaded on every token and the topk path never ran at all. Nothing in
+    // the output differed, which is exactly why it survived: a polarity bug in
+    // a boolean is invisible until you measure the thing it controls.
+    if (device_only && topk_argmax(&topk_id_)) return;
+    topk_valid_ = false;
     be_->sync();
     be_->download_f32(logits_host_, ws_logits_, n_vocab_);
     // Gemma 2/3/4 cap the *final* logits. This is the one place logits become
@@ -838,6 +928,33 @@ void Engine::fetch_logits() {
         for (i32 v = 0; v < n_vocab_; v++)
             logits_host_[v] = apply_logit_softcap(logits_host_[v], cap);
     }
+}
+
+bool Engine::topk_argmax(i32 *out) {
+    // The CPU twin of this op is a plain partial_sort over the whole row, so
+    // calling it there would be strictly slower than the host argmax loop it is
+    // replacing. Only the device path can win, and it wins by not moving data.
+    if (!be_ || be_->kind() == BackendKind::CPU || topk_scratch_ == nullptr)
+        return false;
+    be_->sync();
+    char *zone = static_cast<char *>(topk_out_);
+    be_->logits_topk(ws_logits_, n_vocab_, kTopK, nullptr, 1.0f,
+                     model_.cfg().logit_softcap, 1.0f,
+                     reinterpret_cast<i32 *>(zone), reinterpret_cast<f32 *>(zone + 4),
+                     nullptr, topk_scratch_, kTopKCap,
+                     reinterpret_cast<i64 *>(zone + 8));
+    be_->sync();
+    // 16 bytes: the answer and the proof that it was not truncated. The old
+    // path moved 993 kB and then compared 248320 of them on the host.
+    be_->download(topk_out_h_, topk_out_, sizeof(topk_out_h_), 0);
+    const i32 id = *reinterpret_cast<const i32 *>(topk_out_h_);
+    topk_n_ = *reinterpret_cast<const i64 *>(topk_out_h_ + 8);
+    // An overflow means the candidate buffer was too small for the tie sitting
+    // on the cut, so the ranking cannot be trusted. Fall back, never guess.
+    if (topk_n_ > kTopKCap || id < 0) return false;
+    *out = id;
+    topk_valid_ = true;
+    return true;
 }
 
 bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
@@ -1086,6 +1203,10 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     }
 
     // ---- prefill ----------------------------------------------------------
+    // Greedy decoding, and nothing that intends to read the host logits row
+    // afterwards: the device top-k leaves the row in VRAM. --debug-topk dumps
+    // that row, so it asks for the host copy and stays a faithful diff tool.
+    const bool device_topk = p.sampler.greedy && p.debug_topk <= 0;
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
         const i32 n = static_cast<i32>(
@@ -1093,7 +1214,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         const bool last = (i + n) == static_cast<i64>(ids.size());
         forward(ids.data() + i, n, static_cast<i32>(i), last);
     }
-    fetch_logits();
+    fetch_logits(device_topk);
     res->prefill_ms = prefill_timer.ms();
 
     Sampler sampler;
@@ -1107,7 +1228,11 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     for (i32 gen = 0; gen < p.max_tokens; gen++) {
         if (p.debug_topk > 0)
             dump_topk(p.debug_topk, gen, pos, logits_host_, n_vocab_);
-        const i32 token = sampler.sample(logits_host_, n_vocab_);
+        // The fast path hands back the argmax the device already computed.
+        // Greedy skips the repetition penalty by design (Sampler::sample does
+        // the same), so this is the identical token, not an approximation.
+        const i32 token = topk_valid_ ? topk_id_
+                                       : sampler.sample(logits_host_, n_vocab_);
         if (token == tok_.eos()) {
             res->finish = FinishEos;
             break;
@@ -1127,7 +1252,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         }
         forward(&token, 1, static_cast<i32>(pos), true);
         pos++;
-        fetch_logits();
+        fetch_logits(device_topk);
     }
 
     emit.finish(res->finish == FinishStop);

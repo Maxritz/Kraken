@@ -118,6 +118,28 @@ public:
     virtual void gemm(void *out, const void *x, const void *w, DType wt,
                       i64 n_out, i64 n_in, i64 rows) = 0;
 
+    // Top-k of one logits row, on the device, so the row never has to be
+    // downloaded. `logits` is the output head's buffer, which means it is in
+    // the backend's activation type (`act_type()`, f16 here) and not
+    // necessarily f32 — there is no dtype argument, so a caller that hands
+    // over some other layout gets a plausible answer to the wrong question.
+    // Applies `softcap` and the repetition penalty (selected by
+    // the bitmask `pen_mask`, one bit per token id) BEFORE ranking — a penalty
+    // can raise a token, so ranking first would miss candidates.
+    //
+    // Writes `k` ids and values, descending, ties broken toward the lower id
+    // (the host argmax rule); `mass_out` receives sum(exp((v-max)/temp)) over
+    // the whole row so the caller can tell whether the returned set carries
+    // enough probability mass for an exact top-p cut. `mass_out` may be null.
+    //
+    // `cand_cap` bounds the device candidate buffer; *count_out receives how
+    // many elements landed at or above the cut, so a value above cand_cap
+    // means the set was truncated and the caller should fall back.
+    virtual void logits_topk(const void *logits, i64 n, i32 k, const void *pen_mask,
+                             f32 rep_pen, f32 softcap, f32 temp, i32 *ids, f32 *vals,
+                             f32 *mass_out, void *scratch, i32 cand_cap,
+                             i64 *count_out) = 0;
+
     // A group of n_mat projections that all read the same activation
     // x and have no dependency between them (a decode layer's q/k/v,
     // or its gate/up), issued as one launch. Only the M=1 decode row
@@ -269,9 +291,10 @@ public:
     // contiguous and attention cannot be fed the packed buffer:
     //   q[t, h, i]    <- packed[t, h*2*hd + i]
     //   gate[t, h, i] <- packed[t, h*2*hd + hd + i]
-    // `gate` may be null when only the query part is wanted. `q` may alias
-    // `packed`: every write lands at a lower offset than the read it comes
-    // from, so an in-place unpack is safe.
+    // `gate` may be null when only the query part is wanted. `q` must *not*
+    // alias `packed`: a row's two source halves are twice the width of its
+    // destination, so an in-place unpack has one head writing over rows its
+    // neighbours have not read yet and the block order decides the result.
     virtual void qwen3_next_split(void *q, void *gate, const void *packed,
                                   i64 n_tok, i64 n_head, i64 hd) {
         (void)q; (void)gate; (void)packed; (void)n_tok; (void)n_head; (void)hd;
