@@ -10,6 +10,51 @@ Status of each area is in [docs/STATUS.md](STATUS.md); this file is the
 
 ## P0 — correctness
 
+### Spark_one.Q6_K: one prompt of five diverges from the CPU reference — NO DEFECT FOUND
+
+`FAIL (drift step 12 (474 vs 11694))` in the full sweep; it is the only
+failure of 31 runnable models. **This entry records five dead ends so they are
+not repeated.** It is NOT fixed, because no cause was found — not because it
+was judged unimportant.
+
+Spark_one is Qwen2.5-3B architecture (qwen2, 36 layers, embd 2048, 16 heads /
+2 KV heads = GQA 8:1, hd 128, rope_freq_base 1e6) quantised **Q6_K**. It is
+the only qwen2-arch Q6_K model in the corpus; the other Q6_K models are qwen3
+and qwen35, and `qwen2.5-coder-3b-instruct-q8_0` — same architecture, Q8_0 —
+passes.
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Race / nondeterminism | GPU x3, CPU x2, md5 of text | Byte-identical every run — deterministic, so not a race |
+| GEMM bug | `KRK_GEMM_PATH=wmma` / `simt` / `dp4a` | **All three bit-identical**, same drift step. Three independent GEMM implementations agreeing exactly rules out the GEMM |
+| Prefill attention rewrite | `KRK_ATTN_QTILE` unset / `0` / `1` | Identical |
+| Decode key-range split | `KRK_ATTN_SPLIT=0` | No-op here — `attention_decode_splits` keeps `n_split == 1` until 128 keys |
+| KV cache stride | `--ctx 256` / `512` / `1024` / `2048` | Drift stays at step 12, so not `pos_stride` |
+| Fixed absolute position | prompt lengths 9 / 14 / 15 / 18 / 26 | Drift **moves with prompt length** (plen 15 -> step 12 = pos 27; plen 26 -> step 2 = pos 28), so not a fixed position |
+| Model-specific kernel bug | 5 prompts on the same model | **3 PASS** (`Hello`, `Write a Python function that reverses a list.`, `The quick brown fox jumps over`), 2 drift. Anything model-blind would fail on all five |
+
+What the stage dump shows: the per-forward end-of-model error is flat in the
+**2e-3 – 1.3e-2** band for prefill and the first 11 decode steps — the normal
+fp16 activation band, and the same band `qwen2.5-coder-3b` produces. It then
+jumps to 8.3e-2 on one forward and 3.6e-1 on the next. The last of those is
+meaningless (the two backends had already fed different tokens by then); the
+8.3e-2 one is the first divergence and has an **identical input token** on both
+sides, which is the part that is not yet explained.
+
+Most likely remaining explanation is fp16-vs-f32 rather than a kernel defect:
+the device keeps activations and the logits row in fp16 while the reference is
+f32 throughout, and at the divergence step the reference's own top-2 gap is
+0.52 — close, but not a coin flip, which is why the gate does not accept it as
+a tie. The `qwen2`-at-`Q6_K` combination is the one cell of the architecture x
+quantisation matrix with no passing model in it, so the gap in coverage and the
+gap in behaviour coincide and neither can be separated yet.
+
+**Do not "fix" this by loosening the gate.** The next step that would actually
+discriminate is a device-vs-host Q6_K dequant comparison over a real tensor
+(`tools/probe_attn_qtile.hip` shows how to host a kernel-side dump); the test
+suite only checks Q6_K dequant on a synthetic block, so whole-tensor agreement
+is currently unverified.
+
 ### The qwen35 GPU path is not reproducible (FIXED 2026-10-03 on gfx1201; gfx1031 confirmation outstanding)
 
 **Root cause: the packed-query split raced its own source.** Qwen3.5 packs a
