@@ -183,9 +183,26 @@ ROCm 10.1. Ranges are min–max over repeated runs.
 
 | model | prefill | decode, 64 tok | decode, 256 tok |
 |---|---|---|---|
-| SmolLM2-135M-Instruct Q4_K_M | 4.18–4.50k tok/s | 578–589 tok/s | 527–531 tok/s |
-| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 3.07–3.24k tok/s | 308–313 tok/s | 267–269 tok/s |
-| Qwen3-8B Q4_K_M | 683–688 tok/s | 94.6–94.9 tok/s (32 tok) | — |
+| SmolLM2-135M-Instruct Q4_K_M | 3.3–4.5k tok/s | 585–594 tok/s | 524–534 tok/s |
+| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 2.9–3.2k tok/s | 368.0–368.8 tok/s | 361.3–367.4 tok/s |
+| Qwen3-8B Q4_K_M | 642–695 tok/s | 95.1–95.4 tok/s (32 tok) | — |
+
+### Decode rate is now flat in context
+
+The 0.8B used to lose 90% of its decode rate as the context grew, because its
+decode attention never reached the decode kernel at all (head width 256 was
+not in the supported set) and ran on 8 blocks of a 64-CU card. With that fixed
+and the key range split across blocks, context costs almost nothing:
+
+| prompt ctx | decode, before | decode, after |
+|---|---|---|
+| 24 | 344 tok/s | 377 tok/s |
+| 480 | 178 tok/s | 375 tok/s |
+| 1920 | 72 tok/s | 361 tok/s |
+| 4800 | 33 tok/s | 357 tok/s |
+
+`KRK_ATTN_SPLIT=0` forces the single-block path so the two can be diffed on
+identical input; 40 greedy tokens at ctx 4800 are byte-identical between them.
 
 SmolLM2 135M: 30 layers, 576 embd, GQA 9/3 heads, head_dim 64, FF 1536,
 vocab 49152. Qwen3.5-0.8B: 24 layers (18 recurrent), 1024 embd, FF 3584,

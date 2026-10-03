@@ -217,7 +217,29 @@ small; it is a latency problem, not a throughput one.
    signal, exactly as the user said — and why halo fusions
    (`attn_fused_chain`, `gemm_group`, `fused_layer_`) pay for themselves.
 
-### B5 — Attention at decode context
+### B5 — Attention at decode context — CLOSED, twice over
+
+**Status: fixed.** The cause was not the lane layout this section suspected.
+Two independent defects, both in the launch shape, both found by `--profile`:
+
+1. `attention_decode_supported()` accepted head widths 64 and 128 only, so
+   Qwen3.5-0.8B (hd=256) never reached the decode kernel and fell to the tiled
+   kernel, whose grid is (n_head, n_tok) — 8 blocks on 64 CUs.
+2. The decode kernel itself launches one block per head, which is also 8
+   blocks for that model.
+
+Both are now fixed: hd=256 supported (VPT=8), and the key range split across
+blocks with the per-chunk (m, l, O) triples merged in a second launch — the
+same split-K shape the GEMMs use. One attention call at ~4900 keys went
+4.80 ms -> 0.67 ms (2.1 -> 10.0 GB/s of KV traffic), and decode went from
+33.2 to 356.8 tok/s at ctx 4800 while the 64/128-width models are unchanged
+(interleaved A/B on the 8B: 95.5 vs 95.3 tok/s, i.e. noise — the 8B takes
+n_split == 1 at its context, as intended).
+
+The lane layout was already correct and needed no work: lanes cover channels,
+so a warp's KV read is contiguous.
+
+### B5 (historical) — Attention at decode context
 
 `attention` measured 190 µs/call on the 0.8B when the KV traffic at ~311 keys is
 ~3.6 µs. Even discounted for instrumentation (its filtered wall delta was only
