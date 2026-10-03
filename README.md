@@ -1,3 +1,5 @@
+<img width="768" height="512" alt="Octopus AI Workshop in a Vintage Study" src="https://github.com/user-attachments/assets/7cff7936-e8fe-4da3-a3c8-6be9c04c5b06" />
+
 # KRAKEN
 
 A GGUF inference engine in C++17, built directly on the ROCm HIP SDK, tuned for
