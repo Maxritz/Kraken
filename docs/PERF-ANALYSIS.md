@@ -278,3 +278,45 @@ Practical consequence for this document: every `KRK_SPLIT` number below is
 still valid, because a timing probe that lands a few microseconds differently
 cannot change what the 96.84 ms split *is* -- forward versus fetch_logits. But
 a `KRK_SPLIT` run must never be used to compare generated text.
+
+## 9. Localised: the race is in the device argmax, not the model
+
+Using the `KRK_SPLIT` switch from section 8 to provoke divergence every time,
+three runs were compared on the same prompt:
+
+| what is compared | result across 3 runs |
+|---|---|
+| generated text | **3 different outputs** |
+| full `KRK_DUMP` forward trace (9,696 lines) | **bit-identical** |
+
+The dump is not a summary. `dump_row` syncs and writes every element of the
+row at `%.7g`, and the stages it covers include the MoE FFN (`attn.ffnn`,
+`attn.ffng`, `attn.gated`, `attn.down`) as well as every attention stage,
+`embed`, `enter` and `final`, for the prefill and all 24 decode steps. So the
+entire model computation is bit-identical across runs that produce different
+text.
+
+Adding `--debug-topk 4` compares the logits directly. Two runs give identical
+top-4 values and identical selected tokens at all 12 steps:
+
+```
+33586 81 340 989 395 9599 966 340 9626 377 15360 83   (run 1)
+33586 81 340 989 395 9599 966 340 9626 377 15360 83   (run 2)
+```
+
+But `--debug-topk` forces `device_topk = false`, so the row is downloaded and
+sampled on the host. Without it, three runs diverge. The only difference
+between the two configurations is which of the two sampling paths runs:
+
+- **host** (`sampler.sample` over the downloaded row): deterministic
+- **device** (`logits_topk` + `topk_argmax`): nondeterministic
+
+The margins rule out a near-tie: the top-1 lead is 1.6 to 6.4 logits, which is
+far wider than fp16 resolution, so argmax over a fixed row cannot legitimately
+change. That leaves `logits_topk` itself, and specifically the `topk_scratch_`
+buffer it is handed -- an uninitialised or under-ordered scratch would explain
+a result that varies with scheduling while the input row does not.
+
+This is the first localisation of the bug that has ever held across runs. It
+also gives an immediate mitigation: `--debug-topk` (or any host-sampling path)
+is correct today, at the cost of downloading 993 kB per token.
