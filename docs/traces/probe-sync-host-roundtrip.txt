@@ -1,0 +1,37 @@
+# probe_sync -- host cost of the ops a decode token does 40x
+# 2026-10-04T21:47:26Z  RX 9070 XT gfx1201, build 5d1fbe7
+
+device: gfx1201  CUs=32  memClk=1259000 kHz
+
+spin calibration:     1000 cycles ->   107.30 us
+spin calibration:    20000 cycles ->   168.10 us
+spin calibration:   100000 cycles ->    87.00 us
+
+one queued spin + hipDeviceSynchronize: 73.40 us
+
+
+operation                                    queue          host us
+empty-ish kernel launch (host time)          0                 0.70
+empty-ish kernel launch (host time)          40                0.70
+hipDeviceSynchronize (empty queue)           0                 0.10
+hipDeviceSynchronize behind spins            1                75.70
+hipDeviceSynchronize behind spins            10              136.50
+hipDeviceSynchronize behind spins            40              352.30
+hipDeviceSynchronize behind spins            200            1391.50
+blocking D2H 512 B, PAGEABLE                 0                74.80
+blocking D2H 512 B, PAGEABLE                 10              142.30
+blocking D2H 512 B, PAGEABLE                 40              361.70
+blocking D2H 512 B, PINNED                   0                77.20
+blocking D2H 512 B, PINNED                   10              141.90
+blocking D2H 512 B, PINNED                   40              354.20
+async D2H 512 B on side stream + sync        0                74.00
+async D2H 512 B on side stream + sync        10               95.40
+async D2H 512 B on side stream + sync        40               96.10
+async D2H 512 B on DEFAULT stream + sync     0                73.90
+async D2H 512 B on DEFAULT stream + sync     40              362.60
+std::vector<u16>(256) allocation             0                 0.00
+
+The engine does 40 of the depth=40 rows per decode token. Multiply
+the last column by 40 and compare with the ~96 ms/token it takes:
+that product is the part of the token spent round-tripping the
+device, and it is the budget any fused router has to recover.

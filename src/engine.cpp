@@ -29,17 +29,24 @@ bool ends_with(const std::string &s, const std::string &suffix) {
 // The per-op recorder cannot answer this question. It inserts an event pair
 // around every op, which is the same thing being measured -- it perturbs the
 // queue it is timing, and at ~20 us per op it is larger than most of what it
-// would report. This is plain host wall clock around the two calls the loop
-// actually makes, so it costs two clock reads per token.
+// would report.
+//
+// The flag was once believed to make this model generate different text run to
+// run, which would have made it a race trigger as well as a timer. It does
+// not: the two clock reads below are taken UNCONDITIONALLY and only the
+// accumulation into the totals is gated, so the flag's whole effect is a few
+// floating-point adds per token. 8+8 interleaved runs give 16 identical
+// outputs. docs/PERF-ANALYSIS.md section 8 has the retraction; what survives is
+// that a timing probe is worth nothing as evidence about which code path ran.
 namespace {
 
-// KRK_SYNC_MOE / KRK_SYNC_EXPERT bisect the laguna race, which is masked by
-// any slowdown (stdout, a per-stage sync) and so cannot be found by reading
-// the timing. Each switch inserts one host drain at a different depth; the one
-// that restores determinism names the region that was racing.
-bool sync_moe() {
+// KRK_ROUTER_SYNC / KRK_SYNC_EXPERT are the A/B switches for the two host
+// drains that a decode token can pay for. KRK_ROUTER_SYNC restores the explicit
+// hipDeviceSynchronize that moe_ffn used to issue before it pulled the router
+// row (40 per token); KRK_SYNC_EXPERT inserts one after each expert acquire.
+bool router_sync() {
     static const bool on = [] {
-        const char *v = std::getenv("KRK_SYNC_MOE");
+        const char *v = std::getenv("KRK_ROUTER_SYNC");
         return v && *v && std::string(v) != "0";
     }();
     return on;
@@ -1046,7 +1053,14 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // Routing runs on the host: the logits are tiny ([n, n_expert]) and the
         // selection is what builds the plan.
         be_->gemm(ws_router_, ws_xn_, L.router.data, L.router.type, ne, n_embd_, n);
-        be_->sync();
+        // The blocking device-to-host copy below already orders itself behind
+        // every kernel queued on the default stream, so the explicit
+        // hipDeviceSynchronize this used to issue first was redundant. Forty of
+        // them per decode token is not free on WDDM: each one is a driver-wide
+        // drain that hands the thread back to the scheduler and takes it back.
+        // KRK_ROUTER_SYNC=1 puts the explicit drain back, which is the arm the
+        // cost of removing it is measured against.
+        if (router_sync()) be_->sync();
         be_->download_f32(router_host_.data(), ws_router_, static_cast<i64>(n) * ne);
 
         // ---- build the routing plan -------------------------------------

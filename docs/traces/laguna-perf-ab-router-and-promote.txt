@@ -1,0 +1,30 @@
+# Final interleaved A/B: the previous behaviour (both A/B switches restored)
+# against the new default. laguna-xs2-Q4_K_M, prompt "what is the capital
+# of france?", -n 24 --temp 0 --chat, 4 interleaved repetitions.
+# 2026-10-04T21:48:05Z  build 5d1fbe7
+# a0 = KRK_ROUTER_SYNC=1 KRK_PROMOTE_WAIT=host (old), a1 = default (new)
+
+# interleaved A/B, 4 repetitions, arms alternate run by run
+# each arm's text hash is shown, so a speed win that changed the output
+# is visible in the same table
+
+run       arm                                    text      ms/tok       tok/s
+r1-a0     a                                      2f7a7f77  111.2        9.0
+r2-a0     a                                      2f7a7f77  110.7        9.0
+r3-a0     a                                      2f7a7f77  110.7        9.0
+r4-a0     a                                      2f7a7f77  107.8        9.3
+r1-a1     a                                      2f7a7f77  97.3         10.3
+r2-a1     a                                      2f7a7f77  92.7         10.8
+r3-a1     a                                      2f7a7f77  100.2        10.0
+r4-a1     a                                      2f7a7f77  95.2         10.5
+
+a0 median 110.70 ms/tok (9.03 tok/s), 1 distinct output(s): 2f7a7f77
+a1 median 97.30 ms/tok (10.28 tok/s), 1 distinct output(s): 2f7a7f77
+r1-a0     expert-path read   2148.9 ms | room     44.5 ms | alloc   1184.4 ms | xfer   2244.5 ms | (promote total      8.4 ms)
+r1-a1     expert-path read   2151.0 ms | room     31.7 ms | alloc   1187.5 ms | xfer    522.5 ms | (promote total      4.1 ms)
+r2-a0     expert-path read   2187.3 ms | room     31.6 ms | alloc   1168.6 ms | xfer   2177.4 ms | (promote total      6.6 ms)
+r2-a1     expert-path read   2126.0 ms | room     27.8 ms | alloc   1119.7 ms | xfer    501.2 ms | (promote total      3.3 ms)
+r3-a0     expert-path read   2376.5 ms | room     40.2 ms | alloc   1195.7 ms | xfer   2718.8 ms | (promote total      7.7 ms)
+r3-a1     expert-path read   2156.0 ms | room     22.6 ms | alloc   1147.4 ms | xfer    560.3 ms | (promote total      2.6 ms)
+r4-a0     expert-path read   2010.8 ms | room     27.6 ms | alloc   1126.5 ms | xfer   2155.8 ms | (promote total      6.2 ms)
+r4-a1     expert-path read   2039.1 ms | room     24.2 ms | alloc   1146.3 ms | xfer    494.3 ms | (promote total      2.3 ms)

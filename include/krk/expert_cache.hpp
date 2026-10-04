@@ -147,6 +147,16 @@ public:
     // behind a token: MiB/s out of the host tier.
     f64 promote_ms() const { return promote_ms_; }
 
+    // The expert path is 90% of a laguna-xs2 decode token, and promote_ms()
+    // does not say which part of it is slow: the file read, the room-making,
+    // the allocator, or the host->VRAM copy. These are wall time in each of
+    // those four, accumulated over the whole run, so one run localises the
+    // cost instead of a sequence of A/B arms.
+    f64 read_ms() const { return read_ms_; }   // read_host / mapping memcpy
+    f64 room_ms() const { return room_ms_; }   // make_vram_room: evict + retire
+    f64 alloc_ms() const { return alloc_ms_; } // alloc_pooled: pool wait or malloc
+    f64 xfer_ms() const { return xfer_ms_; }   // upload_paged_batch, host wait in
+
     size_t budget_bytes() const { return budget_; }
     size_t resident_bytes() const { return bytes_; }
     // Device-resident slots, i.e. the ones whose weights are in VRAM right now.
@@ -285,6 +295,10 @@ private:
     u64 bytes_promoted_ = 0; // WARM -> VRAM
     u64 bytes_staged_ = 0;   // file -> WARM ahead of the run (prefetch)
     f64 promote_ms_ = 0;     // wall time in promote_to_vram
+    f64 read_ms_ = 0;        // wall time in the WARM file read
+    f64 room_ms_ = 0;        // wall time making VRAM room
+    f64 alloc_ms_ = 0;       // wall time in alloc_pooled
+    f64 xfer_ms_ = 0;        // wall time in the pageable -> VRAM batch copy
     u64 promotions_ = 0;
     u64 decays_ = 0;
     u64 seq_ = 0;

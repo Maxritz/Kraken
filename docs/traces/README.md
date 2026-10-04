@@ -57,6 +57,33 @@ bash scripts/run_ref.sh "G:/More-models/laguna-xs2-Q4_K_M.gguf" /tmp/out.log \
 `run_ref.sh` records peak working set and always kills `llama-cli.exe` when it
 finishes, so a reference run cannot outlive its own measurement.
 
+## Decode-cost localisation and the two fixes it produced
+
+The files below are the evidence behind section 10 of
+`docs/PERF-ANALYSIS.md`. All of them are on `laguna-xs2-Q4_K_M`, prompt
+`"what is the capital of france?"`, `-n 24 --temp 0 --chat`.
+
+| file | what it shows |
+|---|---|
+| `laguna-perf-ab-router-and-promote.txt` | 4 interleaved repetitions of the previous behaviour against the new default: **110.70 -> 96.25 ms/token (9.00 -> 10.40 tok/s)**, one identical text hash in all 8 runs, with the `expert-path` split per run |
+| `laguna-determinism-promote-wait.txt` | 8+8 interleaved runs of `KRK_PROMOTE_WAIT=host` vs `event`: **16/16 identical**, and identical to the host-wait arm |
+| `laguna-expert-path-split.txt` | the run the four-way split came from: read / xfer / alloc / room = 84% of the wall |
+| `probe-sync-host-roundtrip.txt` | `probe_sync`: a host round trip on this machine costs ~85 us of fixed cost, independent of kind and of queue depth |
+| `probe-promote-dma-depths.txt` | `probe_promote`: 2.06 MiB pageable-to-VRAM copies at 6-9.5 GB/s; in-flight depth changes almost nothing, so the shipped host wait, not the copy, was the cost |
+| `probe-read-file-bandwidth.txt` | `probe_read.py`: the model file saturates at ~3.8-4.1 GB/s at every thread count from 1 to 32 |
+
+Reproduce:
+
+```bash
+bash scripts/ab_perf.sh G:/More-models/laguna-xs2-Q4_K_M.gguf 4 \
+  "KRK_ROUTER_SYNC=1 KRK_PROMOTE_WAIT=host :: " "X=0 :: "
+bash scripts/determinism.sh G:/More-models/laguna-xs2-Q4_K_M.gguf 8 \
+  "KRK_PROMOTE_WAIT=host" "KRK_PROMOTE_WAIT=event"
+./build-hip/probe_sync.exe 300
+./build-hip/probe_promote.exe 4096
+python3 tools/probe_read.py G:/More-models/laguna-xs2-Q4_K_M.gguf 4 16
+```
+
 ## Kraken per-op traces
 
 `laguna-krk_time.err` is the full `KRK_TIME=1 KRK_PHASE=1` per-op table for

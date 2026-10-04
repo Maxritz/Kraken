@@ -15,6 +15,14 @@ prompt `"what is the capital of france?"`, `-n 24 --temp 0`, ChatML.
 | decode tok/s (`--no-repack`) | 14.4 | 10.6 | 0.74x |
 | decode tok/s (`--repack`, default) | 15.5 | — | — |
 
+The Kraken decode figure is the 10.6 tok/s measured before this round of work.
+Section 10 measures it again on this machine's current state and takes it to
+**10.3 tok/s from 9.0** by two changes that do not touch the arithmetic. The
+absolute number moves with the machine (the same binary measured 10.6 tok/s in
+an earlier session and 9.0 tok/s in this one), which is why every comparison in
+section 10 is an interleaved A/B on one binary rather than a number against the
+table above.
+
 Kraken answers this prompt **incorrectly** ("Okay, the user is asking about the
 capital of France. Let me think…") while the reference answers correctly. That
 is a correctness defect, not a speed one, and it is tracked separately.
@@ -116,24 +124,36 @@ run, where the recorder itself perturbs the cache into evicting far more. Both
 this and B1 are the same failure: reading a cost out of an instrumented run and
 treating it as a property of the code.
 
-### B3 — the MoE expert path is not the bottleneck at all (proven)
+### B3 — the MoE expert path is not the bottleneck at all (RETRACTED: it is 91%)
 
-`--expert-stub` removes the expert GEMMs entirely (the routers still run). If
-the MoE math mattered, decode would speed up substantially.
+**This finding was wrong, and it was wrong because of a flag that does nothing.**
+`--expert-stub` removes the expert GEMMs entirely (the routers still run), but
+`Engine::set_expert_scan` stores `expert_stub_ = scan && stub`: the stub arm
+only reaches the engine when `--expert-scan` is passed as well. The A/B below
+measured the flag's effect on nothing.
 
-| arm | rep 1 | rep 2 |
-|---|---:|---:|
-| full | 93.6 ms/tok | 92.9 ms/tok |
-| `--expert-stub` (experts removed) | 93.7 ms/tok | 90.8 ms/tok |
+Run on this binary, `--expert-stub` **alone**, laguna-xs2:
 
-**Removing 960 expert GEMVs, 312 `gather_rows`, 312 `scatter_axpy` and 352
-`silu_mul` — 56% of the step's ops — changes decode by 0.1-2%.** With
-`probe_gemv` putting each GEMV at 2.78 us, the entire expert computation is
-~3 ms of a 93 ms token.
+| invocation | acquires | COLD misses | ms/tok |
+|---|---:|---:|---:|
+| `--expert-scan` | 10602 | 4590 | 97.1 |
+| `--expert-stub` alone | 10602 | 4590 | 98.8 |
+| `--expert-scan --expert-stub` | — | — | **8.5** |
 
-Every optimisation aimed at the expert kernels, the expert cache, the expert
-GEMV geometry and expert prefetch is therefore aimed at ~3% of the cost. This
-supersedes B1, B2 and B6 as the finding that matters.
+Interleaved, 3 repetitions, medians. The middle row is the same numbers as the
+first, which is the signature of a no-op. With the second flag added the token
+falls from **97.1 ms to 8.5 ms**.
+
+So the expert path is **~89 ms of a 97 ms token (91%)**, not 3%, and the whole
+plan that followed B3 (section 6) was aimed at the wrong 9%. `--expert-stub` on
+its own is now a hard error rather than a silent no-op, because a flag that
+quietly measures nothing is worse than no flag.
+
+The direction of the error is worth stating plainly: three separate retractions
+in this document (B1, B2, B3) all came from reading a number out of an
+instrumented or mis-configured run and treating it as a property of the code.
+The next revision of each was produced by an isolated probe or an A/B, not by
+re-reading the trace.
 
 ### B4 — a fixed ~90 ms per token independent of expert work (proven, unexplained)
 
@@ -252,11 +272,37 @@ so it is not re-proposed later as if it were still a 5x win.
   96 KiB/token a 262,144-token context needs 24 GiB of KV, which does not fit.
   There is no host KV tier, so a 2 GiB-VRAM + 6 GiB-host split would cap
   context near 85,000 tokens.
-## 8. The KRK_SPLIT timer is a deterministic trigger for the laguna race
+## 8. The KRK_SPLIT timer as a race trigger — RETRACTED, it was never causal
 
-`KRK_SPLIT=1` adds two `steady_clock::now()` reads per decode token, between
-`forward()` and `fetch_logits()`. It is a host-side timing probe and cannot
-change any arithmetic. On laguna-xs2 it changes the output anyway:
+**Nothing here reproduces, and the premise was wrong.** `KRK_SPLIT` does not
+control where the clock reads land: in the decode loop both
+`steady_clock::now()` calls are taken unconditionally and only the
+*accumulation* into the split totals is gated on the flag
+(`src/engine.cpp` decode loop). The flag's entire effect is a few floating-point
+additions and one branch per token, so it cannot move a device queue.
+
+Interleaved, 8 repetitions per arm, arms alternating run by run
+(`docs/traces/` holds the original claim; the re-measurement is below):
+
+| arm | runs | distinct outputs |
+|---|---:|---:|
+| `KRK_SPLIT` off | 8 | **1** |
+| `KRK_SPLIT=1` | 8 | **1** |
+
+16/16 identical, including the text hash. The original table:
+
+| config | runs | distinct outputs |
+|---|---:|---:|
+| `KRK_SPLIT` off | 2 | 1 (`1def21d8`) |
+| `KRK_SPLIT=1` | 3 | **3** (`dee2e8ab`, `3be5e476`, `b8151775`) |
+
+The section that follows is kept as the record of what was believed and why,
+not as a finding. The one lesson that survives is the method one: a probe that
+changes the output by *printing* proves nothing about which code path ran, and
+a 2-versus-3-run comparison is not evidence of anything. What is still open is
+only whether some *other* timing perturbation can make this model nondeterministic
+— no such perturbation is known today, and the workload is deterministic across
+every arm measured in section 10.
 
 | config | runs | distinct outputs |
 |---|---:|---|
@@ -279,7 +325,12 @@ still valid, because a timing probe that lands a few microseconds differently
 cannot change what the 96.84 ms split *is* -- forward versus fetch_logits. But
 a `KRK_SPLIT` run must never be used to compare generated text.
 
-## 9. The laguna race is timing-sensitive; section 9 of the previous revision was wrong
+## 9. (Historical) the "laguna race" — superseded by section 8
+
+The previous revision of this section claimed the race was in the device argmax.
+That was wrong for the reason section 8 now gives, and the section below is
+kept only because its method notes (printing perturbs, dumping perturbs) are
+still true of every timing measurement in this document.
 
 The previous revision of this section claimed the race was in the device argmax.
 **That was wrong, and it was wrong because of a confound I did not control.**
@@ -330,3 +381,162 @@ still stands as the most likely shape; it has simply not been isolated.
 `--sample-host` is kept as a correctness mitigation. It is not a fix: it was
 shown to diverge 4/4 as soon as the printing confound was removed.
 
+## 10. Where a decode token actually goes, and the two changes that came out of it
+
+Everything above is the record of three wrong answers. This section is the
+measurement that replaced them, and it is the first one in this document taken
+with an interleaved A/B and an instrumented split rather than a trace read.
+
+### 10.1 The expert path is 91% of the token
+
+`--expert-stub` with `--expert-scan` (section B3) removes every expert acquire
+and every expert GEMM. Interleaved, 3 repetitions:
+
+| arm | ms/tok | tok/s |
+|---|---:|---:|
+| full | 97.10 | 10.30 |
+| `--expert-scan --expert-stub` | **8.50** | **117.20** |
+
+The dense path — 40 layers of attention, projections, norms, the router GEMMs,
+the lm_head — is 8.5 ms. Everything else is the expert path, and it is where
+every remaining millisecond is.
+
+### 10.2 Inside the expert path: a four-way split
+
+Four host-side accumulators were added to the expert cache and are printed as
+`[stats ] expert-path` (`read` / `room` / `alloc` / `xfer`). One run, the
+default configuration, prefill + decode = 6.3 s of wall:
+
+| stage | ms | share | what it is |
+|---|---:|---:|---|
+| `read` | 1988.7 | 31.6% | `read_host`: 8.3 GiB out of the model file into WARM |
+| `xfer` | 2170.4 | 34.5% | `upload_paged_batch`: WARM to VRAM, incl. the host wait |
+| `alloc` | 1128.9 | 17.9% | `alloc_pooled`: the pooled-VRAM allocator |
+| `room` | 27.3 | 0.4% | `make_vram_room`: eviction |
+
+84% of the run is in those four lines. That is the shape of the problem: not
+arithmetic, not kernels, not attention — moving 347 MiB/token of weights.
+
+### 10.3 The file is not the limit, the copy is; and neither is what it looked like
+
+`tools/probe_read.py` reads the model file the way the engine does, one handle
+per thread, and finds the device saturates at **~3.8-4.1 GB/s at every thread
+count from 1 to 32**. `tools/probe_promote.hip` then moves 4 GiB of 2.06 MiB
+experts from pageable host memory to VRAM, which is the exact shape of `xfer`:
+
+| mode | depth | GB/s | us/copy |
+|---|---:|---:|---:|
+| sync per copy on a side stream (what shipped) | 1 | 7.36 | 284.8 |
+| K async on the default stream, one drain | 8 | 7.10 | 295.2 |
+| K async on K side streams, drain at end | 8 | 6.02 | 348.2 |
+| K async on default, staged through pinned | 8 | **9.54** | **219.8** |
+
+**The shipped path was not slow because it kept one copy in flight.** Depth
+changes nothing: a 2 MiB pageable H2D costs ~285 us whether it is the only one
+outstanding or the eighth. What the engine's `xfer` number says is that the
+copy is *not the only thing in that 2170 ms* — 2170 ms for 8.3 GiB is 3.8 GB/s
+against a 7.4 GB/s ceiling, and the rest is the **host wait** that
+`paged_publish_` makes on every single expert.
+
+### 10.4 Two changes, both measured, both A/B'd
+
+**Router barrier (`KRK_ROUTER_SYNC`).** `moe_ffn` issued an explicit
+`hipDeviceSynchronize` before downloading the 256-wide router row, 40 times per
+token. The blocking `hipMemcpy` that follows already orders itself behind every
+kernel on the default stream, so the barrier was redundant. `probe_sync` prices
+a host round trip on this machine at **~85 us of fixed cost** — launch, kernel,
+`hipDeviceSynchronize`, return — which is why 40 of them cost 3.5 ms/token and
+not 90. The barrier is gone; `KRK_ROUTER_SYNC=1` puts it back.
+
+| arm | ms/tok (median of 4) | tok/s |
+|---|---:|---:|
+| `KRK_ROUTER_SYNC=1` | 100.30 | 9.95 |
+| `KRK_ROUTER_SYNC=0` | **96.75** | **10.35** |
+
+**Promotion ordering (`KRK_PROMOTE_WAIT`).** `upload_paged_batch` stages through
+a pinned ring, issues the copy on a non-blocking side stream, and then
+**host-waits** for it. The host therefore alternates "read the next expert from
+the file" and "wait for this expert's DMA", never doing both. Ordering the copy
+onto the default stream instead — `hipStreamWaitEvent(0, ev)` on the event
+already recorded at issue — keeps correctness by stream ordering (the consumer
+GEMM is launched on the default stream afterwards and cannot start early) and
+lets the host run ahead into the next file read.
+
+| arm | ms/tok | tok/s | `xfer` host ms |
+|---|---:|---:|---:|
+| `KRK_PROMOTE_WAIT=host` (old) | 100.00 | 10.00 | 2170-2719 |
+| `KRK_PROMOTE_WAIT=event` (new) | **90.20** | **11.10** | **443-560** |
+
+This directly contradicts the comment the host wait shipped on ("an event the
+default stream waits on did not make the copy visible here"), so it was
+re-tested rather than assumed: **8+8 interleaved runs produce one text, and it
+is the same text the host-wait arm produces**
+(`docs/traces/laguna-determinism-promote-wait.txt`). Two claims cannot both be
+true; on this runtime the event wait is correct and the host wait was costing
+1.7 s of a 6.3 s run.
+
+### 10.5 Both together, against the previous behaviour
+
+4 interleaved repetitions, arms alternating, `KRK_ROUTER_SYNC=1
+KRK_PROMOTE_WAIT=host` restores everything that changed:
+
+| arm | ms/tok (median) | tok/s | distinct outputs |
+|---|---:|---:|---:|
+| previous behaviour | 110.70 | 9.00 | 1 (`2f7a7f77`) |
+| new default | **96.25** | **10.40** | 1 (`2f7a7f77`) |
+
+**-13.0% per token, +15.6% tok/s, 4/4 repetitions, bit-identical text.**
+
+### 10.6 What is left, and the ceiling
+
+| stage | ms | note |
+|---|---:|---|
+| `read` | ~2050 | 8.3 GiB from the file at the device's own ~4 GB/s |
+| `alloc` | ~1150 | `hipMalloc`/`hipFree` churn from the pooled allocator |
+| `xfer` | ~500 | 8.3 GiB pageable to VRAM, now overlapped |
+| dense | ~1000 | 8.5 ms/token of real compute |
+
+The file read is now the largest single item and it is **at the device limit**:
+`probe_read.py` shows 32 threads read no faster than one. 347 MiB/token at
+4 GB/s is ~87 ms/token of unavoidable I/O for a model whose expert working set
+(8.3 GiB of first-touch weights) does not fit in the 8.4 GiB of VRAM the cache
+has. Kraken at 96 ms/token is within ~10% of that floor, which is also why the
+reference implementation is not 3x faster: it is streaming the same cold bytes.
+
+That reframes the remaining work:
+
+1. **`alloc`, ~1150 ms (18%).** 13,770 `alloc_pooled` calls at ~82 us each. The
+   pool is capped at 256 MiB of free blocks and expert slices are never returned
+   to it in volume, so most of those calls fall through to `hipMalloc`, which
+   synchronises the device. A dedicated expert arena — one allocation at init,
+   sub-allocated by slice, with the same event guard — removes the allocator
+   from the hot path entirely.
+2. **Multi-expert GEMV**, 960 -> 120 launches. Previously bounded at 3%; the
+   real bound is the launch count against the 8.5 ms of dense-path time.
+3. **DFlash speculative heads.** Unchanged from section 6 and still the only
+   item that amortises the ~87 ms I/O floor itself rather than the work around
+   it: accepting 3 tokens per pass pays the file once for three positions.
+
+### 10.7 Reproducing section 10
+
+```bash
+# the four-way split, one run
+./build-hip/kraken.exe -m G:/More-models/laguna-xs2-Q4_K_M.gguf \
+  --prompt "what is the capital of france?" --max-tokens 24 --temp 0 --greedy --chat
+
+# the A/Bs (arms alternate run by run; both always kill kraken)
+bash scripts/ab_perf.sh G:/More-models/laguna-xs2-Q4_K_M.gguf 4 \
+  "KRK_ROUTER_SYNC=1 KRK_PROMOTE_WAIT=host :: " "X=0 :: "
+bash scripts/determinism.sh G:/More-models/laguna-xs2-Q4_K_M.gguf 8 \
+  "KRK_PROMOTE_WAIT=host" "KRK_PROMOTE_WAIT=event"
+
+# the probes
+./build-hip/probe_sync.exe 300
+./build-hip/probe_promote.exe 4096
+python3 tools/probe_read.py G:/More-models/laguna-xs2-Q4_K_M.gguf 4 16
+```
+
+Traces: `laguna-perf-ab-router-and-promote.txt`,
+`laguna-determinism-promote-wait.txt`, `laguna-expert-path-split.txt`,
+`probe-sync-host-roundtrip.txt`, `probe-promote-dma-depths.txt`,
+`probe-read-file-bandwidth.txt`.

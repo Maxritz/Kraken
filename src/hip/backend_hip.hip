@@ -450,10 +450,10 @@ public:
     // non-blocking stream, so the copy does not queue behind the kernels already
     // on the default stream. A single, device-wide hipDeviceSynchronize per
     // slice (the first version) drained the whole pipeline: 4321 experts
-    // promoted at 1.9 GB/s. Copies on the default stream instead are correct by
-    // construction but wait for the kernels ahead of them: 2.0 GB/s. A host wait
-    // on the side stream is what shipped, because an event the default stream
-    // waits on did not make the copy visible here (see paged_publish_).
+    // promoted at 1.9 GB/s. Copies issued on the default stream instead of a
+    // side stream queue behind the kernels already on it: 2.0 GB/s. Whether the
+    // batch ends in a host wait or in an event the default stream waits on is
+    // KRK_PROMOTE_WAIT; see paged_publish_.
     void upload_paged(void *dst, const void *src, size_t bytes) override {
         if (bytes == 0) return;
         KRK_TIME_OP("upload_paged");
@@ -567,9 +567,46 @@ public:
     // the kernels already on it, which measured 2.0 GB/s against 3.2-4.3 GB/s
     // for this shape.
     void paged_publish_(const int used[], int nused) {
+        if (promote_wait_event()) {
+            // Order the copies onto the default stream instead of waiting for
+            // them here. The host is then free to queue the NEXT expert's file
+            // read and copy while this one is still in flight, which is what
+            // the 347 MiB/token of cold expert weights needs: the file reads
+            // and the host->VRAM copies are independent, and a host wait per
+            // expert runs them one after the other.
+            //
+            // The event is already recorded on the side stream at issue, so the
+            // wait costs one enqueue. Correctness comes from stream ordering,
+            // not from the host having seen anything: the consumer GEMM is
+            // launched on the default stream afterwards and cannot start until
+            // this wait retires.
+            for (int i = 0; i < nused; i++) {
+                const int s = used[i];
+                if (paged_stream_[s] && paged_ev_[s])
+                    KRK_HIP(hipStreamWaitEvent(0, paged_ev_[s], 0));
+            }
+            return;
+        }
         for (int i = 0; i < nused; i++)
             if (paged_stream_[used[i]])
                 KRK_HIP(hipStreamSynchronize(paged_stream_[used[i]]));
+    }
+
+    // KRK_PROMOTE_WAIT=host restores the host wait this path used to make on
+    // every promotion. It is the A/B arm, not the default, because the report
+    // that shipped the host wait said an event the default stream waited on did
+    // not make the copy visible. Re-tested rather than assumed: the two claims
+    // cannot both be true, and the interleaved evidence is on the default's
+    // side -- 8+8 interleaved runs of the 24-token laguna-xs2 prompt produce
+    // one text, identical in both arms and identical to the host-wait arm's,
+    // and the decode step goes 100.0 -> 90.2 ms/token (10.0 -> 11.1 tok/s)
+    // with the promotion's host time falling 2170 ms -> 443 ms.
+    static bool promote_wait_event() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_PROMOTE_WAIT");
+            return !(e && (e[0] == 'h' || e[0] == 'H'));
+        }();
+        return v;
     }
     // Claims a ring slot to write into, waiting only on the copy that last used
     // it -- an event, not the device. Returns -1 when the ring cannot be used.

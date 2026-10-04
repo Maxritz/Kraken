@@ -1,0 +1,31 @@
+# Determinism of the promotion-ordering change. 8+8 interleaved runs,
+# arms alternate run by run. a0 = KRK_PROMOTE_WAIT=host (the behaviour
+# that shipped), a1 = event ordering (the new default).
+# laguna-xs2-Q4_K_M, prompt "what is the capital of france?",
+# -n 24 --temp 0 --chat.
+# 2026-10-04T21:48:29Z  build 5d1fbe7
+
+run  arm                        text      generated text
+r1   a0 PROMOTE_WAIT=host       2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r1   a1 PROMOTE_WAIT=event      2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r2   a0 PROMOTE_WAIT=host       2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r2   a1 PROMOTE_WAIT=event      2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r3   a0 PROMOTE_WAIT=host       2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r3   a1 PROMOTE_WAIT=event      2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r4   a0 PROMOTE_WAIT=host       2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r4   a1 PROMOTE_WAIT=event      2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r5   a0 PROMOTE_WAIT=host       2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r5   a1 PROMOTE_WAIT=event      2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r6   a0 PROMOTE_WAIT=host       2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r6   a1 PROMOTE_WAIT=event      2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r7   a0 PROMOTE_WAIT=host       2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r7   a1 PROMOTE_WAIT=event      2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r8   a0 PROMOTE_WAIT=host       2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+r8   a1 PROMOTE_WAIT=event      2f7a7f77  Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+
+distinct outputs:
+  a0: 2f7a7f77 
+  a1: 2f7a7f77 
+
+16 runs, 16 identical texts, and identical to the host-wait arm: the
+ordering change is bit-identical on this workload.

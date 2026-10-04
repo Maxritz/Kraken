@@ -16,6 +16,8 @@
 // above can never turn into a hit.
 #include "krk/expert_cache.hpp"
 
+#include <chrono>
+
 // ---------------------------------------------------------------------------
 // Expert access trace (opt-in, KRK_TRACE_EXPERTS=1).
 //
@@ -35,6 +37,23 @@ namespace {
 using krk::u32;
 using krk::i32;
 using krk::u8;
+
+// Adds the time it was alive to *acc. Four of these carve the expert path into
+// the parts that cost, so "promotion is 1.8 GB/s" can be answered with "the
+// copy is 7 GB/s and the room-making is the rest".
+struct MsTimer {
+    krk::f64 *acc;
+    std::chrono::steady_clock::time_point t0;
+    explicit MsTimer(krk::f64 *a)
+        : acc(a), t0(std::chrono::steady_clock::now()) {}
+    MsTimer(const MsTimer &) = delete;
+    MsTimer &operator=(const MsTimer &) = delete;
+    ~MsTimer() {
+        *acc += std::chrono::duration<krk::f64, std::milli>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count();
+    }
+};
 
 struct XRec {
     u32 seq;
@@ -254,7 +273,10 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
         // on top of itself. read_host falls back to the mapping when the file
         // path is unavailable.
         const void *mapped = t->data + static_cast<size_t>(expert) * per;
-        if (!be_->read_host(p, mapped, per)) std::memcpy(p, mapped, per);
+        {
+            MsTimer t(&read_ms_);
+            if (!be_->read_host(p, mapped, per)) std::memcpy(p, mapped, per);
+        }
         to[i]->data = p;
         to[i]->type = t->type;
         to[i]->n_in = static_cast<i64>(t->ne[0]);
@@ -299,7 +321,10 @@ bool ExpertCache::promote_to_vram(Slot &s) {
     } clock_out{&promote_ms_, t0};
     if (!be_ || !s.in_host()) return false;
     const u64 key = slot_key(s.layer, s.expert);
-    make_vram_room();
+    {
+        MsTimer t(&room_ms_);
+        make_vram_room();
+    }
 
     // Eviction never touches WARM copies (retire keeps them), so the slot's own
     // copy cannot be taken out from under this promotion. Re-establishing the
@@ -323,7 +348,11 @@ bool ExpertCache::promote_to_vram(Slot &s) {
     int nb = 0;
     for (int i = 0; i < 3; i++) {
         if (!from[i]->present()) continue;
-        void *p = be_->alloc_pooled(s.slice[i]);
+        void *p = nullptr;
+        {
+            MsTimer t(&alloc_ms_);
+            p = be_->alloc_pooled(s.slice[i]);
+        }
         if (!p) {
             for (int j = 0; j < 3; j++)
                 if (to[j]->present() && to[j]->data)
@@ -337,7 +366,10 @@ bool ExpertCache::promote_to_vram(Slot &s) {
         batch_len[nb] = s.slice[i];
         nb++;
     }
-    be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
+    {
+        MsTimer t(&xfer_ms_);
+        be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
+    }
     s.m = m;
     vram_slots_++;
     bytes_ += s.bytes;
@@ -537,7 +569,10 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
 
     xtrace(layer, expert, 2);
 
-    make_vram_room();
+    {
+        MsTimer t(&room_ms_);
+        make_vram_room();
+    }
 
     const i32 e = expert;
     const GgufTensor *srcs[3] = {src.gate, src.up, src.down};
@@ -552,7 +587,10 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
         const GgufTensor *t = srcs[i];
         const size_t per = lens[i];
         if (!t || per == 0) continue;
-        dsts[i]->data = be_->alloc_pooled(per);
+        {
+            MsTimer tm(&alloc_ms_);
+            dsts[i]->data = be_->alloc_pooled(per);
+        }
         dsts[i]->type = t->type;
         dsts[i]->n_in = static_cast<i64>(t->ne[0]);
         dsts[i]->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
@@ -567,7 +605,10 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
             be_->upload(dsts[i]->data, t->data + static_cast<size_t>(e) * per, per);
         }
     }
-    be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
+    {
+        MsTimer t(&xfer_ms_);
+        be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
+    }
 
     bytes_ += need;
     vram_slots_++;

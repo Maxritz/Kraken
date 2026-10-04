@@ -1,0 +1,35 @@
+# probe_promote -- cold expert weights, pageable host source to VRAM
+# 2026-10-04T21:47:28Z  RX 9070 XT gfx1201, build 5d1fbe7
+
+device: gfx1201  CUs=32
+shape : 2.00 MiB per expert, 4096 MiB total, 2048 copies
+
+mode                                            depth       GB/s    us/copy   s total
+sync per copy on a side stream                      1       6.87      305.2      0.63
+
+blocking hipMemcpy per copy                         1       6.94      302.3      0.62
+blocking hipMemcpy per copy                         2       6.67      314.5      0.64
+blocking hipMemcpy per copy                         4       6.81      307.8      0.63
+blocking hipMemcpy per copy                         8       6.79      308.7      0.63
+
+K async on the DEFAULT stream, one drain            1       6.33      331.2      0.68
+K async on the DEFAULT stream, one drain            2       6.85      306.0      0.63
+K async on the DEFAULT stream, one drain            4       6.66      314.7      0.64
+K async on the DEFAULT stream, one drain            8       6.83      307.1      0.63
+
+K async on K side streams, drain at end             1       6.89      304.2      0.62
+K async on K side streams, drain at end             2       6.02      348.2      0.71
+K async on K side streams, drain at end             4       6.20      338.2      0.69
+K async on K side streams, drain at end             8       6.02      348.5      0.71
+
+K async on DEFAULT, staged through pinned           1       6.38      328.8      0.67
+K async on DEFAULT, staged through pinned           2       7.50      279.5      0.57
+K async on DEFAULT, staged through pinned           4       8.39      250.0      0.51
+K async on DEFAULT, staged through pinned           8       8.83      237.4      0.49
+
+347 MiB/token, i.e. ms/token at each rate:
+    1.8 GB/s ->  197.4 ms/token
+    4.0 GB/s ->   88.8 ms/token
+    8.0 GB/s ->   44.4 ms/token
+   16.0 GB/s ->   22.2 ms/token
+   25.0 GB/s ->   14.2 ms/token

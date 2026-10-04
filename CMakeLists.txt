@@ -272,6 +272,53 @@ if(KRK_BUILD_PROBES AND KRK_HIP_AVAILABLE)
         target_compile_definitions(probe_gemv PRIVATE
                                    "KRK_OFFLOAD_${tgt_uc}=1")
     endforeach()
+
+    # probe_sync prices the host-side operations a decode token performs 40
+    # times over: a launch, a device barrier, and a 512 B D2H copy of the
+    # router row. probe_gemv says the arithmetic is cheap; this says what the
+    # round trip costs, at the queue depths the engine actually has.
+    add_executable(probe_sync
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_sync.hip)
+    target_include_directories(probe_sync PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/hip)
+    if(TARGET hip::device)
+        target_link_libraries(probe_sync PRIVATE hip::device)
+    elseif(HIP_FOUND)
+        target_link_libraries(probe_sync PRIVATE ${HIP_LIBRARIES})
+    endif()
+    target_compile_options(probe_sync PRIVATE
+                           -O3 -ffast-math -fno-finite-math-only)
+    foreach(tgt IN LISTS CMAKE_HIP_ARCHITECTURES)
+        string(TOUPPER "${tgt}" tgt_uc)
+        target_compile_definitions(probe_sync PRIVATE
+                                   "KRK_OFFLOAD_${tgt_uc}=1")
+    endforeach()
+
+    # probe_promote measures the copy a decode token cannot avoid: 347 MiB of
+    # cold expert weights, pageable host source to VRAM. The shipped path keeps
+    # exactly one of those copies in flight and host-waits for each, which is
+    # where the ~89 ms/token of expert time goes; this prices the in-flight
+    # depths that would recover it.
+    add_executable(probe_promote
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_promote.hip)
+    target_include_directories(probe_promote PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/hip)
+    if(TARGET hip::device)
+        target_link_libraries(probe_promote PRIVATE hip::device)
+    elseif(HIP_FOUND)
+        target_link_libraries(probe_promote PRIVATE ${HIP_LIBRARIES})
+    endif()
+    target_compile_options(probe_promote PRIVATE
+                           -O3 -ffast-math -fno-finite-math-only)
+    foreach(tgt IN LISTS CMAKE_HIP_ARCHITECTURES)
+        string(TOUPPER "${tgt}" tgt_uc)
+        target_compile_definitions(probe_promote PRIVATE
+                                   "KRK_OFFLOAD_${tgt_uc}=1")
+    endforeach()
 endif()
 
 # ---------------------------------------------------------------------------

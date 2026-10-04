@@ -105,10 +105,12 @@ void usage() {
         "                        for every token to stderr (at full precision)\n"
         "  --expert-scan        measure which experts the routers actually pick\n"
         "                        and write <model>.krakenexperts.json\n"
-        "  --expert-stub        with --expert-scan: run only the routers, with\n"
-        "                        every expert FFN skipped (no expert weights\n"
-        "                        are read). The list is then approximate; the\n"
-        "                        two modes exist so they can be compared\n"
+        "  --expert-stub        requires --expert-scan: run only the routers,\n"
+        "                        with every expert FFN skipped (no expert\n"
+        "                        weights are read). The list is then\n"
+        "                        approximate; the two modes exist so they can\n"
+        "                        be compared. On its own the flag does\n"
+        "                        nothing, so it is refused rather than ignored\n"
         "  -v                    verbose logging\n"
         "  -h, --help            this message\n",
         kEngineName, kEngineVersion);
@@ -291,6 +293,14 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                  static_cast<f64>(ec.bytes_demoted()) / 1048576.0,
                  static_cast<f64>(ec.bytes_loaded()) / 1048576.0,
                  static_cast<f64>(ec.bytes_loaded()) / 1048576.0 / token_div);
+    // The expert path split. promote_ms() alone cannot say whether a token is
+    // slow because of the file, the allocator or the copy, and those three have
+    // three different fixes, so all four are timed and printed together.
+    std::fprintf(out,
+                 "[stats ] expert-path  read %8.1f ms | room %8.1f ms | "
+                 "alloc %8.1f ms | xfer %8.1f ms | (promote total %8.1f ms)\n",
+                 ec.read_ms(), ec.room_ms(), ec.alloc_ms(), ec.xfer_ms(),
+                 prom_ms);
     std::fprintf(out,
                  "[stats ] warm      %.0f MiB capacity, %.1f%% in use | %llu admissions, "
                  "%llu evictions, %llu rejects | %llu device evictions, %llu decay events\n",
@@ -489,6 +499,22 @@ int main(int argc, char **argv) {
     const f64 bench_load_ms = PhaseClock::now() - load_t0;
     const f64 bench_start_ms = load_t0 - ph.t0;
     ph.mark("engine.init (load)");
+    if (a.expert_stub && !a.expert_scan) {
+        // --expert-stub on its own does NOTHING: set_expert_scan stores
+        // `scan && stub`, so the stub arm never reaches the engine and the run
+        // looks exactly like a normal one. That is not a cosmetic trap -- it
+        // is how this repository came to record "the MoE expert path is ~3% of
+        // a decode token" when it is 91% (docs/PERF-ANALYSIS.md section B3,
+        // retracted). Measured on laguna-xs2 with the flag passed alone:
+        // 10602 acquires, 4590 COLD misses, 98.8 ms/token, i.e. no stub at all;
+        // with --expert-scan added: 8.5 ms/token.
+        std::fprintf(stderr,
+                     "kraken: --expert-stub only means something together with "
+                     "--expert-scan (it stubs the experts the scan measures); "
+                     "passing it alone is a silent no-op\n");
+        return 2;
+    }
+
     if (!a.draft.empty()) {
         engine.set_draft_window(a.draft_tokens);
         if (!engine.load_draft(a.draft, &err)) {
