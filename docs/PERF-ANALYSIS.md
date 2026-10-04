@@ -252,3 +252,29 @@ so it is not re-proposed later as if it were still a 5x win.
   96 KiB/token a 262,144-token context needs 24 GiB of KV, which does not fit.
   There is no host KV tier, so a 2 GiB-VRAM + 6 GiB-host split would cap
   context near 85,000 tokens.
+## 8. The KRK_SPLIT timer is a deterministic trigger for the laguna race
+
+`KRK_SPLIT=1` adds two `steady_clock::now()` reads per decode token, between
+`forward()` and `fetch_logits()`. It is a host-side timing probe and cannot
+change any arithmetic. On laguna-xs2 it changes the output anyway:
+
+| config | runs | distinct outputs |
+|---|---:|---|
+| `KRK_SPLIT` off | 2 | 1 (`1def21d8`) |
+| `KRK_SPLIT=1` | 3 | **3** (`dee2e8ab`, `3be5e476`, `b8151775`) |
+
+Three of three. Nothing else differs between those runs, so the only variable
+is where two clock reads land relative to the pipeline drain. That is not a bug
+in the probe -- it is the fastest reproduction of the open laguna
+nondeterminism found so far, and it converts an intermittent failure into a
+switch.
+
+It also corrects an over-claim: the `KRK_TIME` tracer was verified
+byte-identical on this prompt, but the split timer is **not** output-neutral
+here, so its archived log's text is one of several valid variants and must not
+be used as a reference output.
+
+Practical consequence for this document: every `KRK_SPLIT` number below is
+still valid, because a timing probe that lands a few microseconds differently
+cannot change what the 96.84 ms split *is* -- forward versus fetch_logits. But
+a `KRK_SPLIT` run must never be used to compare generated text.
