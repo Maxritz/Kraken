@@ -15,14 +15,28 @@
 // a 4096x4096 f16 GEMV reads 33.5 MB in 47 µs (710 GB/s); the same matrix as a
 // 32-row f16 GEMM takes 43 µs (772 GB/s, 24.7 TFLOP/s).
 //
-// Reading the table: the spans and the idle column describe the *same* event
-// records, and a record costs ~10-27 µs here, so both are inflated by the
-// measurement. They are trustworthy for ops whose span is tens of microseconds
-// or more (a 300 KB logits copy, a GEMM), and meaningless for the small ones —
-// a filtered run (`KRK_TIME=gemm`) keeps the distortion off everything else,
-// and the >= 30 µs rows are the ones to quote. For anything smaller, the honest
-// instruments are the wall clock and the GPU-engine busy percentage that
-// `--bench` samples.
+// Reading the table: the aggregate now reports device time NET of the recorder's
+// own per-op floor, measured at startup rather than remembered. The floor is
+// real and large — around 20 us here — because the two event records sit on the
+// stream either side of the launch, so an op that launches nothing still spans
+// that much. Any op whose NET reads 0.00 is marked <-at floor: it is not free,
+// it is unresolvable, and its real cost is somewhere under the floor. The raw
+// column is kept beside NET so the correction is visible rather than silent,
+// and the summary line bounds the combined cost of everything unresolvable.
+//
+// Two things this table still does NOT tell you, and which cost a real
+// misreading if forgotten:
+//
+//   - It aggregates the WHOLE run, prefill and decode together. An op class
+//     that looks enormous is often doing all its work in warmup. On laguna-xs2
+//     `upload_paged` shows ~4600 calls, which is exactly the cold misses plus
+//     the handful of promotions, i.e. all of it before the first decode token.
+//     A per-token cost has to come from --profile, which delimits a step.
+//
+//   - NET is the aggregate average over a row's calls. A row can clear the
+//     floor on average while individual calls sit under it. For one call, use
+//     KRK_TIME=<op>, or an isolated probe like tools/probe_gemv.hip, which is
+//     how a 2.78 us kernel came to be misread as 34 us for a whole session.
 //
 // `--profile` (KRK_PROFILE=1) adds the *timeline*: every timed op in issue
 // order with its device-idle gap, for the last complete decode step. The
@@ -88,6 +102,11 @@ public:
     }
 
     bool on() const { return on_; }
+
+    // The measured cost of one begin/end pair, in microseconds. Any per-op
+    // device time below this is unresolvable, not fast.
+    double dev_floor_us() const { return dev_floor_us_; }
+    double host_floor_us() const { return host_floor_us_; }
 
     // Recording a pair of events per op is not free — on a 400-op token it
     // slows the run by more than it measures — so KRK_TIME may name the ops to
@@ -160,50 +179,88 @@ public:
         for (Slot &s : pool_) resolve(s);
         if (rows_.empty()) return;
         std::vector<std::pair<const std::string *, const Row *>> order;
-        double dev_total = 0.0, gap_total = 0.0, wall = 0.0;
+        double dev_total = 0.0, gap_total = 0.0, host_total = 0.0,
+               wall = 0.0;
         i64 ops = 0;
         for (const auto &kv : rows_) {
             order.push_back({&kv.first, &kv.second});
             dev_total += kv.second.dev_ms;
             gap_total += kv.second.gap_ms;
+            host_total += kv.second.host_ms;
             ops += kv.second.calls;
         }
-        std::sort(order.begin(), order.end(),
-                  [](const auto &a, const auto &b) {
-                      return a.second->dev_ms > b.second->dev_ms;
-                  });
         wall = std::chrono::duration<double, std::milli>(
                    std::chrono::steady_clock::now() - start_).count();
         if (profile_ && !tl_.empty()) print_timeline();
+        // Every op pays one begin/end pair, and that pair costs dev_floor_us_
+        // of device time whatever the kernel underneath does. An empty op is
+        // not zero: the two event records sit on the stream either side of the
+        // launch, so the span measures them plus the work. Subtracting the
+        // measured floor is the only way a per-op device time means what its
+        // row claims, and it gets its own column so the raw number is corrected
+        // rather than hidden.
+        const double floor_ms = dev_floor_us_ / 1000.0;
+        double net_total = 0.0;
+        i64 unresolved = 0;
+        std::sort(order.begin(), order.end(),
+                  [floor_ms](const auto &a, const auto &b) {
+                      return (a.second->dev_ms - floor_ms * a.second->calls) >
+                             (b.second->dev_ms - floor_ms * b.second->calls);
+                  });
         std::fprintf(stderr,
-                     "\n== KRK_TIME per-op device time (%lld ops)\n"
-                     "%-26s %8s %10s %9s %9s %9s %8s %8s\n",
-                     static_cast<long long>(ops), "op", "calls", "dev ms",
-                     "idle ms", "host ms", "MB", "GB/s", "TFLOP/s");
+                     "\n== KRK_TIME per-op device time, net of a %.2f us "
+                     "recorder floor (%lld ops)\n"
+                     "%-26s %8s %9s %9s %9s %9s %9s %8s %8s\n",
+                     dev_floor_us_, static_cast<long long>(ops), "op", "calls",
+                     "raw ms", "floor ms", "NET ms", "idle ms", "host ms",
+                     "MB", "GB/s");
         for (const auto &e : order) {
             const Row &r = *e.second;
+            const double fl = floor_ms * static_cast<double>(r.calls);
+            double net = r.dev_ms - fl;
+            // Clamped rather than allowed to go negative: a row whose raw time
+            // is under the floor is not negative, it is UNRESOLVED. Printing a
+            // negative cost would be a lie, and printing the raw number alone
+            // is exactly the failure this column exists to prevent.
+            const bool ok = net > 0.0;
+            if (!ok) { net = 0.0; unresolved += r.calls; }
+            net_total += net;
             const double gbs =
-                r.bytes && r.dev_ms > 0.0
-                    ? static_cast<double>(r.bytes) / (r.dev_ms * 1e6)
-                    : 0.0;
-            const double tfs = r.flops && r.dev_ms > 0.0
-                                   ? static_cast<double>(r.flops) /
-                                         (r.dev_ms * 1e9)
-                                   : 0.0;
+                ok && r.bytes > 0.0 ? static_cast<double>(r.bytes) / (net * 1e6)
+                                    : 0.0;
             std::fprintf(stderr,
-                         "%-26s %8lld %10.2f %9.2f %9.2f %9.2f %8.1f %8.2f\n",
+                         "%-26s %8lld %9.2f %9.2f %9.2f %9.2f %9.2f %8.1f %8.1f%s\n",
                          e.first->c_str(), static_cast<long long>(r.calls),
-                         r.dev_ms, r.gap_ms, r.host_ms,
-                         static_cast<double>(r.bytes) / 1e6, gbs, tfs);
+                         r.dev_ms, fl, net, r.gap_ms, r.host_ms,
+                         static_cast<double>(r.bytes) / 1e6, gbs,
+                         ok ? "" : "  <-at floor");
         }
         std::fprintf(stderr,
-                     "%-26s %8lld %10.2f %9.2f\n"
-                     "device spans are %.1f%% of %.1f ms wall; %.1f ms idle "
-                     "between ops (%.1f%%); %.1f ms neither (not ops)\n",
+                     "%-26s %8lld %9.2f %9.2f %9.2f %9.2f %9.2f\n"
+                     "device spans NET of the recorder are %.1f%% of %.1f ms "
+                     "wall; %.1f ms idle between ops (%.1f%%); %.1f ms neither "
+                     "(not ops)\n",
                      "TOTAL", static_cast<long long>(ops), dev_total,
-                     gap_total, wall > 0.0 ? 100.0 * dev_total / wall : 0.0,
+                     floor_ms * static_cast<double>(ops), net_total, gap_total,
+                     host_total,
+                     wall > 0.0 ? 100.0 * net_total / wall : 0.0,
                      wall, gap_total, wall > 0.0 ? 100.0 * gap_total / wall : 0.0,
-                     wall - dev_total - gap_total);
+                     wall - net_total - gap_total);
+        if (unresolved > 0) {
+            std::fprintf(stderr,
+                         "!! %lld of %lld ops (%.1f%%) sit at or below the "
+                         "%.2f us floor and are NOT individually resolvable; "
+                         "their true combined cost is bounded above by %.1f ms. "
+                         "Do not read this table's row order as a cost order "
+                         "for those rows -- use KRK_TIME=<op> for a single op, "
+                         "or an isolated probe, to resolve one.\n",
+                         static_cast<long long>(unresolved),
+                         static_cast<long long>(ops),
+                         100.0 * static_cast<double>(unresolved) /
+                             static_cast<double>(ops > 0 ? ops : 1),
+                         dev_floor_us_,
+                         static_cast<double>(unresolved) * floor_ms);
+        }
     }
 
 private:
@@ -247,7 +304,13 @@ private:
             // Timing the ops that follow costs tens of microseconds each; the
             // table says so rather than leaving the reader to guess why the
             // instrumented run is several times slower than the real one.
-            if (profile_) calibrate();
+            // Always, for both KRK_TIME and --profile. The floor used to be
+            // measured only under --profile and only printed as a caveat, so a
+            // KRK_TIME table could attribute tens of microseconds per op to
+            // kernels that take single digits. Calibration is 512 empty
+            // begin/end pairs once at startup; measuring it here is what lets
+            // every table below report an honest net number.
+            calibrate();
         }
     }
 

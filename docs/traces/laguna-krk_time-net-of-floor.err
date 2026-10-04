@@ -1,0 +1,45 @@
+[info ] HIP 7.16.26323 | AMD Radeon RX 9070 XT | gfx1201 | 64 CU | 15.9 GiB VRAM
+[info ] rope: YaRN over 64 of 128 dims, base 500000, factor 32.0, original context 4096, beta_fast/slow 64/1
+[info ] rope pairing: NeoX half-split (channel j with j + 32)
+[info ] loaded Laguna XS.2 (laguna): 40 layers, 2048 embd, 64/8 heads, hd=128, ff=8192, vocab=100352
+[info ] hybrid attention: 3 of every 4 layers attend fully, the rest within 512 tokens; rope 128/128 dims at base 10000 on the windowed layers
+[info ] expert cache: budget 8443.8 MiB + WARM 18102 MiB pageable, 256 experts x top-8, 40 layers, policy LFU+aging (pin at 24 hits, decay every 64); cold reads are read-through
+[info ] workspaces ready: chunk=256 ctx=4096 KV=640 MiB (load 878 ms)
+
+[stats ] load      878 ms, 1.16 GiB uploaded of 1.16 GiB weights in 480 ms = 2.4 GB/s
+[stats ] prefill   30 tok in 4506.5 ms = 6.7 tok/s
+[stats ] decode    24 tok in 5407.7 ms = 4.4 tok/s (225.3 ms/tok)
+[stats ] device    15.04 GiB in use of 15.92 GiB (0.88 GiB free)
+[stats ] experts   8444 MiB VRAM budget, 4340/4340 slots resident, 0 pinned | WARM 18102 MiB pageable, 4590 held (8329 MiB, 0 MiB prefetched)
+[stats ] cache     10602 acquires | HOT hits 6003 (56.6%) | WARM hits 9 (0.1%) | COLD misses 4590 (43.3%)
+[stats ] transfer  9 promotions, 18 MiB in 10.3 ms = 1.7 GB/s (1148.3 us/expert) | 259 VRAM evictions kept in WARM, 484 MiB | 8329 MiB read from the file (347.03 MiB/tok)
+[stats ] warm      18102 MiB capacity, 46.0% in use | 4590 admissions, 0 evictions, 0 rejects | 259 device evictions, 0 decay events
+
+== KRK_TIME per-op device time, net of a 20.51 us recorder floor (124870 ops)
+op                            calls    raw ms  floor ms    NET ms   idle ms   host ms       MB     GB/s
+upload_paged                   4599   1464.16     94.31   1369.85    933.50   2659.21   8751.7      6.4
+upload                        11124    888.18    228.12    660.06    840.63    489.04      0.0      0.0
+gemm(gemv)                    33366   1089.45    684.25    405.21    896.59    122.53  37428.6     92.4
+warm_read                     13770    676.96    282.39    394.57    400.11   2271.56      0.0      0.0
+upload_i32                    10602    521.88    217.42    304.46    267.99     54.30      0.0      0.0
+gemm(wmma)                     5654    246.12    115.95    130.17    162.39     27.73   4315.2     33.2
+scatter_axpy                  10602    310.33    217.42     92.91    303.73     31.61     67.7      0.7
+silu_mul                      11562    312.31    237.11     75.21    318.50     43.17      0.0      0.0
+download_f32                    936     71.25     19.19     52.05     88.17     91.37      0.0      0.0
+gather_rows                   10602    243.06    217.42     25.64    401.44     47.07     67.7      2.6
+gemm_group                      483     26.77      9.91     16.87     10.53      1.94      0.0      0.0
+attention                       960     36.08     19.69     16.39     27.75      8.35      0.0      0.0
+embed                            24     10.12      0.49      9.63      1.80      9.03      0.0      0.0
+fill0                           938     27.59     19.24      8.35     68.82      3.20      0.0      0.0
+rope                            960     26.76     19.69      7.07     23.04      5.95      0.0      0.0
+download                         24      2.03      0.49      1.54      2.21      2.17      0.0      0.0
+softplus_act                    960     21.01     19.69      1.32     23.27      2.89      0.0      0.0
+rmsnorm                        1944     41.16     39.87      1.30     57.48      7.34      0.0      0.0
+logits_topk                      24      0.88      0.49      0.39      2.72      0.38      0.0      0.0
+qk_norm                         960     17.56     19.69      0.00     15.59      4.94      0.0      0.0  <-at floor
+kv_append                       960     16.42     19.69      0.00     24.68      3.65      0.0      0.0  <-at floor
+mul_head_bcast                  960     16.37     19.69      0.00     26.52      2.98      0.0      0.0  <-at floor
+add_inplace                    2856     54.28     58.57      0.00     59.70      9.87      0.0      0.0  <-at floor
+TOTAL                        124870   6120.74   2560.75   3572.99   4957.14   5900.27
+device spans NET of the recorder are 29.2% of 12235.8 ms wall; 4957.1 ms idle between ops (40.5%); 3705.7 ms neither (not ops)
+!! 5736 of 124870 ops (4.6%) sit at or below the 20.51 us floor and are NOT individually resolvable; their true combined cost is bounded above by 117.6 ms. Do not read this table's row order as a cost order for those rows -- use KRK_TIME=<op> for a single op, or an isolated probe, to resolve one.
