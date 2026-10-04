@@ -103,16 +103,54 @@ launches is still the right direction — but as an op-count fix, worth perhaps
 small ops must come from isolated probes (as here) or from wall-clock A/B, not
 from the aggregate table.
 
-### B2 — transfer ops carry 27.7% of device time (proven, partly addressed)
+### B2 — expert staging host waits (RETRACTED, also an artifact)
 
-`upload`/`upload_i32`/`upload_paged`/`download_f32` total 30.4 ms. The host
-column is the tell: `upload_paged` is 21 calls costing 4.7 ms device but
-**15.1 ms host**, and `warm_read` is 60 calls costing 2.8 ms device but
-**11.5 ms host**. These are staging operations waiting on file I/O.
+The host column appeared to show `upload_paged` at **721 us/call** (15.1 ms per
+step) and `warm_read` at **192 us/call** (11.5 ms per step) — 26.6 ms of a 93 ms
+token in synchronous staging. The host floor is only 0.63 us/op, so those looked
+real.
 
-### B3 — `rope` host stall (proven cause, fixed, small effect)
+They are not. An uninstrumented run does **9 promotions totalling 18 MiB for
+the entire 54-token generation**. The 21-per-step figure came from the profiled
+run, where the recorder itself perturbs the cache into evicting far more. Both
+this and B1 are the same failure: reading a cost out of an instrumented run and
+treating it as a property of the code.
 
-Before the fix: 40 calls, **51,827 us host = 1,296 us/call**. Control: the same
+### B3 — the MoE expert path is not the bottleneck at all (proven)
+
+`--expert-stub` removes the expert GEMMs entirely (the routers still run). If
+the MoE math mattered, decode would speed up substantially.
+
+| arm | rep 1 | rep 2 |
+|---|---:|---:|
+| full | 93.6 ms/tok | 92.9 ms/tok |
+| `--expert-stub` (experts removed) | 93.7 ms/tok | 90.8 ms/tok |
+
+**Removing 960 expert GEMVs, 312 `gather_rows`, 312 `scatter_axpy` and 352
+`silu_mul` — 56% of the step's ops — changes decode by 0.1-2%.** With
+`probe_gemv` putting each GEMV at 2.78 us, the entire expert computation is
+~3 ms of a 93 ms token.
+
+Every optimisation aimed at the expert kernels, the expert cache, the expert
+GEMV geometry and expert prefetch is therefore aimed at ~3% of the cost. This
+supersedes B1, B2 and B4 as the finding that matters.
+
+### B4 — a fixed ~90 ms per token independent of expert work (proven, unexplained)
+
+Since removing more than half the ops changes nothing, the cost is not
+proportional to the op count. The GPU is idle ~93% of the run (`--bench` reports
+6.8% compute busy on this model). A decode token takes 93 ms and the sum of its
+kernels is a few ms, so **roughly 90 ms is spent outside the kernels**, in a
+per-token serialised path. That is the actual bottleneck and it is still
+undiagnosed.
+
+The leading candidate is a host round-trip per token — the sampler needs to
+learn the sampled token before it can build the next step, so any
+download/synchronise/upload in that path is a full pipeline drain exactly once
+per token. The next investigation is to find that sync, not to tune MoE
+kernels.
+
+### B5 — `rope` host stall (proven cause, fixed, small effect)
 kernel on the non-hybrid `Qwen3-MOE-4x0.6B` costs **3.2 us/call** — a 405x
 difference on an identical kernel.
 
@@ -126,7 +164,7 @@ End-to-end this bought only **98.9 -> 94.8 ms/tok (+4.1%)**, because the
 clearest example in this document of why host time and device time must not be
 added together or treated as interchangeable.
 
-### B4 — expert slot capacity (proven NOT a bottleneck)
+### B6 — expert slot capacity (proven NOT a bottleneck)
 
 Interleaved A/A/B/B, because sequential arms differ by more than the effect
 under test (two back-to-back default runs measured 10.6 and 6.6 tok/s from page
