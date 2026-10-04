@@ -485,6 +485,246 @@ for round in 1 2 3 4 5; do for L in 1 0; do for A in 1 0; do
 done; done; done   # raw per-sample table: ab_engine.txt
 ```
 
+## 10a. Split (`split.*`) shard sets
+
+`Gguf::load` now loads a sharded model as one model. Given any shard it derives
+the siblings from the `-NNNNN-of-MMMMM.gguf` naming, maps each file separately,
+and merges every shard's tensor directory into one lookup. Metadata is read from
+the shard whose `split.no == 0`, which is the only one carrying the full KV
+block in a llama.cpp-produced set.
+
+**The two numbering conventions are not the same and must not be conflated:**
+the `-NNNNN-` field in the filename is **1-based** ("00001" is the first shard)
+while `split.no` is **0-based** (0 is the first shard). Getting this wrong
+produced a request for `...-00000-of-00003.gguf`, which is what the first build
+did. The loader keeps the filename number and the split index in separate
+variables and converts explicitly.
+
+Verified on `Laguna-S-2.1-UD-Q4_K_M` (3 shards, 73 GB):
+
+| shard | split.no | tensors | carries |
+|---|---:|---:|---|
+| 00001 | 0 | 0 | full metadata (72 keys) |
+| 00002 | 1 | 568 | tensors + split.* only |
+| 00003 | 2 | 246 | tensors + split.* only |
+
+`kraken-inspect` on **either end** of the set reports `tensors 814` and
+`payload 68.09 GiB` — 814 is exactly the `split.tensors.count` the file
+declares (0 + 568 + 246), so the merge is complete. Single-file models are
+unchanged (`SmolLM2-135M` still reports 272 tensors / runnable).
+
+The verdict no longer refuses a split set as a format; it refuses only an
+*incomplete* one, by comparing the merged count against `split.tensors.count`.
+
+**Known limitation — the read()-based weight pull is inactive on split sets.**
+`Model::load` installs it with `gguf_.file()`, which is now the *metadata*
+shard. For a llama.cpp-produced set that shard carries no tensors and its data
+section is empty, so every tensor falls outside the pull map and
+`HipBackend::load_pull_` declines, falling back to a direct `hipMemcpy` from
+the mapping. That is correct but it is the slow path (a cold mapping faults one
+4 KiB page at a time, the very cost the pull path exists to avoid), so a large
+split model loads at mapping speed rather than read() speed. Fixing it means
+handing the backend a per-shard table and opening readers per shard; it is not
+done here.
+
+**Not done: `laguna` is still `ArchSupport::No`.** The set loads and describes
+itself correctly, but the architecture needs an attention output gate
+(`attn_gate`), a routed-expert selection bias (`exp_probs_b`) and YaRN rope
+scaling before it can run. Those are arch features, not sharding features.
+
+---
+
+## 10b. Ternary formats (TQ1_0 / TQ2_0) + the zero-block question
+
+Added the two BitNet ternary formats end to end: `DType::TQ1_0 = 34` and
+`DType::TQ2_0 = 35` (ggml's on-disk ids), host reference decoders in
+`src/quant.cpp`, and device support in `src/hip/kernels/dequant.hpp` (traits,
+`dequant_chunk`, `dot_chunks`, `dequant_row`). Both are 256-value super-blocks
+with one fp16 scale; TQ1_0 packs 5 trits per byte in base 3 (54 B/block,
+1.6875 bpw), TQ2_0 uses 2-bit codes (66 B/block, 2.0625 bpw).
+
+**Verified, not assumed.** `tools/probe_tq.cpp` round-trips the decoders
+against ggml's own reference *encoder* (`quantize_row_tq{1,2}_0_ref`, copied
+from ggml-quants.c) — an independent check, because encoder and decoder were
+derived from different source functions. Both formats are exact on random
+trit data and on a d=0.5 scale, and `vec_dot` matches a scalar sum of the same
+decoded values.
+
+Two real bugs were caught this way, both invisible to a code read:
+
+* **TQ1_0's trit decode truncates to 8 bits.** ggml writes
+  `uint8_t q = x.qs[j+m] * pow3[n]`, so the product wraps to a byte *before*
+  the `*3 >> 8`. Keeping the full product — the obvious reading — decoded
+  every plane above n=0 wrong (1467/2048 values).
+* **TQ1_0's qh tail is plane-major.** Byte index is `t % 4`, trit plane is
+  `t / 4`; swapping them costs 66/2048 values.
+
+A third oddity is real and documented rather than "fixed": the qh path packs
+four trits then shifts one place further up, so all-+1 truncates 765 -> 253.
+That is ggml's encoder behaviour.
+
+The suite grew to **1874/1874** (`test_tq2_0_layout`, `test_tq1_0_layout`).
+
+**A real ternary model loads and runs.** `H:/Models/gguf-exp/probe_TQ2_0.gguf`
+(Qwen2.5-0.5B, 290 tensors, 24 TQ2_0 FFN tensors) went from `verdict refused`
+to `verdict runnable`; `tools/probe_tq_file.cpp` decodes its real bytes to
+trits in {-d, 0, +d} with sane per-tensor scales and 88-98% exact zeros,
+which is the correct signature for a ternary FFN.
+
+### Negative result: block-level zero skipping has no yield
+
+The request was to skip all-zero quant blocks when paging MoE experts. Measured
+with `tools/probe_zero_blocks.cpp`, which decodes every block with the engine's
+own reference decoder and tests for *all values exactly zero*:
+
+| file | dtype | blocks | all-zero blocks |
+|---|---|---:|---:|
+| Qwen3-MoE-4x0.6B (Q4_K_M) | Q4_K | 4,129,678 | **0 (0.000%)** |
+| Qwen3-MoE-4x0.6B (Q4_K_M) | Q6_K | 656,519 | **0 (0.000%)** |
+| probe_TQ2_0 (BitNet-style) | TQ2_0 | 408,576 | **0 (0.000%)** |
+
+Zeros are abundant *per element* (0.01% Q4_K, 2.7% Q6_K, ~90% TQ2_0) but never
+fill a whole block. TQ2_0 is the clearest case: ~90% of its weights are zero,
+yet not one of its 408,576 blocks is entirely zero — a block of 256 values
+would need all 256 to be zero at once.
+
+**Consequence: the "skip all-zero blocks" policy is not implemented, because
+its yield is zero.** It would add a per-block test to every page-in and save
+nothing. This is a measured dead end, recorded so it is not re-attempted.
+
+What *is* real is element-wise sparsity, and exploiting it needs a different
+mechanism — a sparse kernel that skips zero *work* (in the style of the
+BITCOS presence-bitmap layout in the compressed-expert spec), not a page-in
+that skips zero *bytes*.
+
+## 10c. Laguna (poolside) — schema read, engine side landed (rope fix in §10d)
+
+`general.architecture = "laguna"` was in the table as `No` with a flat "not
+implemented" reason. The schema is now read and the reason names the real
+remainder. **Laguna-S-2.1-UD-Q4_K_M is still refused**, deliberately: the loader
+has the whole schema but the engine does not execute it yet, and a file that
+loads and decodes plausible nonsense is worse than an honest refusal.
+
+**The reference is llama.cpp's own `src/models/laguna.cpp`**, not a
+reconstruction. Everything below was cross-checked against it, and the tensor
+shapes against the three shards directly (a small GGUF reader, because
+`attention.head_count` is an array and the tensor list differs per layer kind):
+
+```
+laguna.block_count 48          laguna.expert_count 256        top-10, ff 1024
+laguna.embedding_length 3072   laguna.expert_shared_feed_forward_length 1024
+laguna.attention.head_count = [48 i32]   il % 4 == 0 -> 48, else -> 72
+laguna.attention.head_count_kv 8         key/value length 128
+laguna.attention.sliding_window 512      leading_dense_block_count 1
+laguna.rope.dimension_count 64           freq_base 500000, type yarn, factor 32,
+laguna.rope.dimension_count_swa 128      original_context_length 8192,
+laguna.rope.freq_base_swa 10000          yarn_beta_fast 32, yarn_beta_slow 1
+laguna.expert_gating_func 2 (sigmoid)    expert_weights_norm 1, scale 2.5
+```
+
+Confirmed per layer from the files: `attn_q` `[3072, 6144]` on the 48-head
+layers (`{0,4,8,...,32,36,40,44}`) and `[3072, 9216]` on the 72-head ones, with
+`attn_output` `[6144, 3072]`/`[9216, 3072]` matching, and `attn_gate`
+`[3072, 48]`/`[3072, 72]`. **The gate is per-head**, not per-element: its second
+dim equals `n_head_il`, which is the test llama.cpp's loader uses to choose
+between the two shapes (XS.2 is per-head, M.1 is per-element).
+
+What landed:
+
+1. `attention.head_count` is read as an **array**; `n_head` becomes its maximum
+   and `Model::n_head_at(l)` / `q_dim_at(l)` give a layer's own width. The
+   `n_embd % n_head` identity is skipped when the vector is present — it is
+   meaningless for 72 heads of 128 over a 3072 embedding — which is why
+   `attention.key_length` is what the loader trusts.
+2. `rope.dimension_count` is now read for **every** arch, not only recurrent
+   ones. That was a latent bug: a non-recurrent partial-rotary checkpoint kept
+   its key and the table ignored it, while llama.cpp reads it with the same
+   head_dim default. Verified no regression: Qwen3.5-0.8B is the partial-rotary
+   case and still passes coherence.
+3. **YaRN is folded into `inv_freq` at load time**, matching ggml's `rope_yarn`
+   and `rope_yarn_corr_dims` exactly — extrapolated frequency fading into
+   interpolated across the pair range `[low, high]`, with low/high computed in
+   dim units and compared against pair indices, as both references do. Folding
+   it also resets `rope_scale` to 1.0, because the 1/factor is in the frequency
+   now and the kernel divides the *position* by `rope_scale`; leaving both would
+   apply it twice. The magnitude half is folded away rather than implemented:
+   `llama_context` pre-divides `yarn_attn_factor` by `1 + 0.1*ln(factor)`, so a
+   checkpoint asking for 1.0 cancels and the attention scale is plain
+   `1/sqrt(head_dim)`.
+4. The hybrid geometry is parsed and the windowed layers get their **own plain
+   RoPE table** at base 10000 over all 128 dims — which is what llama.cpp passes
+   them (`ext_factor` 0) — instead of inheriting the full layers' YaRN.
+5. `attn_gate.weight`, `ffn_exp_probs_b.bias` and the router keys are loaded and
+   carried on `LayerWeights`/`ModelConfig`.
+6. The gap map learned an exemption: a tensor that is a gap in general is not one
+   for the schema that implements it, so `attn_gate` and `exp_probs_b` no longer
+   block `laguna` (they still block `muse-glimmer`, `k2-horizon`, `deepseek4`,
+   every other carrier). `arch_tensor_gap` takes the arch name as a third,
+   defaulted argument, so a caller with no arch to give keeps the old behaviour.
+
+Remaining work is spelled out in [TODO.md](TODO.md) under "Laguna (poolside) —
+loader done, engine side open": the per-layer query width in the layer loop, the
+gate's broadcast multiply (a new backend op — `mul_act` is elementwise and
+cannot stand in), the sigmoid+bias router in `moe_ffn`, and the window bound in
+all four HIP attention paths. Then one line flips the table entry to `Yes`.
+
+**The verification step is the expensive one.** There is no small laguna in the
+collection: `laguna-xs2-Q4_K_M.gguf` is 18.9 GiB and Laguna-S is a 73 GB
+three-shard set, so coherence costs a full load. Note also that the `read()`-based
+weight pull is still inactive on split sets (§10a), which is exactly the path a
+first touch of a 73 GB model wants.
+
+---
+
+## 10d. The RoPE pair convention — one engine-wide bug, six architectures
+
+Finishing laguna turned up a defect that was never laguna's: the engine
+rotated the wrong channels, for every architecture that does not use the
+llama layout. It is written up here because it is the more useful finding.
+
+RoPE has two pair conventions. llama.cpp keeps the choice in a per-arch table
+(`llm_arch_rope`, `src/llama-model.cpp`): **norm** rotates the adjacent
+channels `(2i, 2i+1)`, **neox** rotates channel `j` with `j + n_rot/2` inside
+the rotated prefix — `ggml/src/ggml-cuda/rope.cu` shows it directly,
+`x[ix + n_offs/2 + 0]` against `x[ix + n_offs/2 + n_dims/2]`.
+
+A file needs one or the other because of how it was exported, and the tensor
+cannot say which: both conventions stay finite and in range, and only the
+*relative* rotation between a query and a key reaches the score. A wrong
+pairing therefore mixes the wrong channels and the model keeps emitting
+plausible text. Kraken paired adjacent channels everywhere — right for llama,
+SmolLM3, Muse-Glimmer, DeepSeek2 and Qwen3.5 (IMROPE), wrong for the NeoX
+family: **qwen2, qwen3, qwen3moe, qwen3vl, gemma (2/3/4), laguna**.
+
+**Landed.** `ArchSpec::rope_neox` (the table is the single source, as with
+every other schema flag), `ModelConfig::rope_neox`, logged at load and
+overridable with `KRK_ROPE_NEOX=0/1` for bisecting a file that disagrees with
+llama.cpp. `Backend::rope` grew the argument; the CPU reference
+(`rope_apply`) and the HIP kernel (`rope_kernel`) both implement it as pair
+`(i, i + rot)` versus `(2i, 2i+1)`, same frequencies, same rotated prefix.
+The fused decode chain rotates adjacent pairs only, so NeoX models keep the
+separate rope + kv_append + attention chain — the same treatment qk_norm, a
+window and the output gate already get. New coverage: `test_rope_pair_convention`
+(one live channel names its partner) and a NeoX arm in `kraken-oracle` that
+compares device against the scalar reference under the second convention.
+
+**Evidence.** `laguna-xs2`, the same file and prompt the reference was run
+on, went from `the capital of the/aan ... union/capital of` to `The capital
+of France is Paris.` — what both of the llama.cpp builds print. And
+`Qwen3-MoE-4x0.6B` is now token-for-token identical to
+`llama-completion --no-conversation` over 16 greedy tokens, on the device and
+on the CPU; before the fix its pairing was wrong by construction, and no
+kraken-side check could see it, because device and CPU were wrong together.
+
+**Caveat, recorded so it is not rediscovered.** On `laguna-xs2` the two
+backends answer identically and then diverge: step 0 picks the same token on
+both (logit gap 0.75 device, 1.66 CPU), step 1 the CPU's runner-up wins by
+0.35 logits. Qwen3-MoE agreeing exactly on both backends, and on the
+reference, is the control: this is fp16 against f32 on a chaotic small model,
+not a backend defect. Consequence: laguna-xs2 stays out of the coherence
+gate's default set (its 19 GiB scalar pass is minutes of every core), and an
+explicit run of it is reported as not-tested rather than as a pass.
+
 ## 11. gfx1031 bandwidth campaign — RX 6700 XT (Task 3)
 
 Same §2f/§2g/§2h/§2i sections re-run on the second machine to separate

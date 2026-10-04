@@ -72,6 +72,20 @@ void *host_realloc(void *p, size_t bytes, size_t alignment) {
     return q;
 }
 
+size_t host_available_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX st;
+    st.dwLength = sizeof(st);
+    if (GlobalMemoryStatusEx(&st)) return static_cast<size_t>(st.ullAvailPhys);
+    return 0;
+#else
+    const long pages = sysconf(_SC_AVPHYS_PAGES);
+    const long page = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page <= 0) return 0;
+    return static_cast<size_t>(pages) * static_cast<size_t>(page);
+#endif
+}
+
 void host_free(void *p) {
     if (!p) return;
 #if defined(_WIN32)

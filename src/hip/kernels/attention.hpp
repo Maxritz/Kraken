@@ -111,7 +111,7 @@ __global__ void __launch_bounds__(kAttnBlock)
                      const _Float16 *__restrict__ kcache,
                      const _Float16 *__restrict__ vcache, i64 n_head, i64 n_kv,
                      i64 hd, i64 n_tok, i64 pos0, i64 pos_stride, i64 causal,
-                     f32 scale, int tile_k) {
+                     i64 window, f32 scale, int tile_k) {
     extern __shared__ u8 smem[];
     f32 *s_sh = reinterpret_cast<f32 *>(smem);
     const size_t sbytes = (static_cast<size_t>(tile_k) * sizeof(f32) + 15u) &
@@ -127,6 +127,12 @@ __global__ void __launch_bounds__(kAttnBlock)
     const i64 pos = pos0 + t;
     const i64 n_keys = causal ? pos + 1 : pos0 + n_tok;
     if (n_keys <= 0) return;
+    // Sliding window (laguna's hybrid layers): the oldest key this query can
+    // see. The tile loop starts at the tile *containing* the bound, not at the
+    // bound itself, so the first tile always holds at least one unmasked key
+    // and the online softmax's running max stays finite -- a tile in which
+    // every key is masked would contribute exp(0) = 1 to the denominator.
+    const i64 k_lo = window > 0 && window < n_keys ? n_keys - window : 0;
 
     const int tid = static_cast<int>(threadIdx.x);
     const _Float16 *qrow = q + (t * n_head + h) * hd;
@@ -144,7 +150,7 @@ __global__ void __launch_bounds__(kAttnBlock)
 
     __shared__ f32 bcast[2]; // [0] = new running max, [1] = rescale factor
 
-    for (i64 k0 = 0; k0 < n_keys; k0 += tile_k) {
+    for (i64 k0 = (k_lo / tile_k) * tile_k; k0 < n_keys; k0 += tile_k) {
         const int tile = static_cast<int>(
             (n_keys - k0) < tile_k ? (n_keys - k0) : tile_k);
 
@@ -162,14 +168,20 @@ __global__ void __launch_bounds__(kAttnBlock)
         }
         __syncthreads();
 
-        // one key per thread: full head-width dot product
+        // one key per thread: full head-width dot product. Keys below the
+        // window bound stay in the tile -- the staging is uniform across the
+        // block -- but never reach the max or the denominator.
         if (tid < tile) {
-            f32 dot = 0.0f;
-            const _Float16 *kj = k_sh + static_cast<i64>(tid) * hd;
+            if (k0 + static_cast<i64>(tid) < k_lo) {
+                s_sh[tid] = -1.0e30f;
+            } else {
+                f32 dot = 0.0f;
+                const _Float16 *kj = k_sh + static_cast<i64>(tid) * hd;
 #pragma unroll 8
-            for (i64 d = 0; d < hd; d++)
-                dot += static_cast<f32>(q_sh[d]) * static_cast<f32>(kj[d]);
-            s_sh[tid] = dot * scale;
+                for (i64 d = 0; d < hd; d++)
+                    dot += static_cast<f32>(q_sh[d]) * static_cast<f32>(kj[d]);
+                s_sh[tid] = dot * scale;
+            }
         }
         __syncthreads();
 
@@ -456,7 +468,7 @@ __global__ void __launch_bounds__(kAttnDecThreads)
                            const _Float16 *__restrict__ kcache,
                            const _Float16 *__restrict__ vcache, i64 n_head, i64 n_kv,
                            i64 hd, const i64 *__restrict__ pos0, i64 pos_stride,
-                           i64 causal, f32 scale) {
+                           i64 causal, i64 window, f32 scale) {
     const i64 h = blockIdx.x;
     const i64 n_rep = n_kv > 0 ? n_head / n_kv : 1;
     const i64 hkv = n_rep > 0 ? h / n_rep : 0;
@@ -465,6 +477,9 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     // device memory so a captured graph replays without re-binding.
     const i64 p0 = *pos0;
     const i64 n_keys = causal ? p0 + 1 : p0 + 1;
+    // Sliding window: keys below the bound are skipped rather than masked,
+    // so they never enter the online softmax at all.
+    const i64 j_lo = window > 0 && window < n_keys ? n_keys - window : 0;
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -485,7 +500,7 @@ __global__ void __launch_bounds__(kAttnDecThreads)
 #pragma unroll
     for (int e = 0; e < VPT; e++) acc[e] = 0.0f;
 
-    for (i64 j = warp; j < n_keys; j += kAttnDecWarps) {
+    for (i64 j = j_lo + warp; j < n_keys; j += kAttnDecWarps) {
         const _Float16 *krow = kb + j * pos_stride;
         const _Float16 *vrow = vb + j * pos_stride;
         const f32 s = d_wave_reduce_sum(attn_lane_dot<VPT>(qp, krow, lane)) * scale;
@@ -551,12 +566,13 @@ template <int VPT>
 inline void attention_decode_launch(void *out, const void *q, const void *kcache,
                                     const void *vcache, i64 n_head, i64 n_kv, i64 hd,
                                     const i64 *pos0, i64 pos_stride, int causal,
-                                    f32 scale, hipStream_t stream = nullptr) {
+                                    i64 window, f32 scale,
+                                    hipStream_t stream = nullptr) {
     attention_decode_kernel<VPT><<<static_cast<unsigned>(n_head), kAttnDecThreads, 0,
                                    stream>>>(
         static_cast<_Float16 *>(out), static_cast<const _Float16 *>(q),
         static_cast<const _Float16 *>(kcache), static_cast<const _Float16 *>(vcache),
-        n_head, n_kv, hd, pos0, pos_stride, causal, scale);
+        n_head, n_kv, hd, pos0, pos_stride, causal, window, scale);
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +604,7 @@ __global__ void __launch_bounds__(kAttnDecThreads)
                                   const _Float16 *__restrict__ kcache,
                                   const _Float16 *__restrict__ vcache, i64 n_head,
                                   i64 n_kv, i64 hd, const i64 *__restrict__ pos0,
-                                  i64 pos_stride, i64 causal, f32 scale,
+                                  i64 pos_stride, i64 causal, i64 window, f32 scale,
                                   f32 *__restrict__ part, int n_split) {
     const i64 h = blockIdx.x;
     const int sp = static_cast<int>(blockIdx.y);
@@ -596,12 +612,16 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     const i64 hkv = n_rep > 0 ? h / n_rep : 0;
     const i64 p0 = *pos0;
     const i64 n_keys = p0 + 1;
+    // Sliding window: the splits tile the *visible* range. Chunks entirely
+    // below the bound would launch a block to do nothing but their epilogue.
+    const i64 j_lo = window > 0 && window < n_keys ? n_keys - window : 0;
+    const i64 n_vis = n_keys - j_lo;
 
     // Split into equal chunks, rounded to a multiple of the warp count so each
     // block's warps still get whole keys and the ranges tile exactly.
-    const i64 per = ((n_keys + n_split - 1) / n_split + kAttnDecWarps - 1) /
+    const i64 per = ((n_vis + n_split - 1) / n_split + kAttnDecWarps - 1) /
                     kAttnDecWarps * kAttnDecWarps;
-    const i64 j0 = static_cast<i64>(sp) * per;
+    const i64 j0 = j_lo + static_cast<i64>(sp) * per;
     const i64 j1 = min(n_keys, j0 + per);
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -729,7 +749,7 @@ inline int attention_decode_splits(i64 n_keys, i64 n_head, int cu_count) {
 inline void attention_decode(void *out, const void *q, const void *kcache,
                              const void *vcache, i64 n_head, i64 n_kv, i64 hd,
                              const i64 *pos0, i64 pos_stride, int causal,
-                             f32 scale, hipStream_t stream = nullptr,
+                             i64 window, f32 scale, hipStream_t stream = nullptr,
                              f32 *part = nullptr, int n_split = 1,
                              int cu_count = 0) {
     (void)causal;
@@ -737,13 +757,16 @@ inline void attention_decode(void *out, const void *q, const void *kcache,
     if (n_split == 1) {
         if (hd == 64)
             attention_decode_launch<2>(out, q, kcache, vcache, n_head, n_kv, hd,
-                                       pos0, pos_stride, causal, scale, stream);
+                                       pos0, pos_stride, causal, window, scale,
+                                       stream);
         else if (hd == 128)
             attention_decode_launch<4>(out, q, kcache, vcache, n_head, n_kv, hd,
-                                       pos0, pos_stride, causal, scale, stream);
+                                       pos0, pos_stride, causal, window, scale,
+                                       stream);
         else
             attention_decode_launch<8>(out, q, kcache, vcache, n_head, n_kv, hd,
-                                       pos0, pos_stride, causal, scale, stream);
+                                       pos0, pos_stride, causal, window, scale,
+                                       stream);
         return;
     }
 #define KRK_ATTN_SPLIT(VPT)                                                   \
@@ -754,7 +777,7 @@ inline void attention_decode(void *out, const void *q, const void *kcache,
             static_cast<_Float16 *>(out), static_cast<const _Float16 *>(q),   \
             static_cast<const _Float16 *>(kcache),                            \
             static_cast<const _Float16 *>(vcache), n_head, n_kv, hd, pos0,     \
-            pos_stride, causal, scale, part, n_split);                        \
+            pos_stride, causal, window, scale, part, n_split);                \
         attention_decode_merge_kernel<VPT>                                    \
             <<<static_cast<unsigned>(n_head), kAttnDecThreads, 0, stream>>>(  \
                 static_cast<_Float16 *>(out), n_head, hd, part, n_split);      \

@@ -33,6 +33,12 @@ enum class DType : i32 {
     IQ4_NL = 20,
     IQ4_XS = 23,
     BF16 = 30,
+    // BitNet-style ternary: 1.6875 bpw and 2.0625 bpw. Both pack
+    // {-1, 0, +1} codes, so a third of the weights are exactly zero --
+    // which is a *filter*, not just compression (see ExpertCache's
+    // zero-block skipping).
+    TQ1_0 = 34,
+    TQ2_0 = 35,
     NVFP4 = 40,
 };
 

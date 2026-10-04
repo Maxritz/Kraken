@@ -575,7 +575,14 @@ int main(int argc, char **argv) {
         StageStat worst{"", 0, 0, 0, 0, 0};
         auto note = [&](StageStat s) {
             if (s.maxabs > worst.maxabs) worst = s;
-            if (s.maxabs > 0.5) print_stat(s); // suspicious stage detail
+            // Suspicious stages print in full, and so do the two ops this
+            // probe exists to cover: a mask or a broadcast that is wrong can
+            // be wrong by a little and still be wrong, and a silent pass on
+            // them is not evidence.
+            if (s.maxabs > 0.5 || !std::strcmp(s.name, "attention window") ||
+                !std::strcmp(s.name, "attention decode window") ||
+                !std::strcmp(s.name, "mul_head_broadcast"))
+                print_stat(s);
         };
 
         cpu->rmsnorm(xn_c, xc, Lc.attn_norm, N, n_embd, c.rms_eps);
@@ -610,12 +617,23 @@ int main(int argc, char **argv) {
         }
 
         cpu->rope(qc, kc, c.n_head, c.n_head_kv, c.head_dim, N, POS0,
-                  mc.inv_freq().data(), c.rope_scale, c.rope_frac);
+                  mc.inv_freq().data(), c.rope_scale, c.rope_frac, false);
         gpu->rope(qg, kg, c.n_head, c.n_head_kv, c.head_dim, N, POS0,
-                  mg.inv_freq().data(), c.rope_scale, c.rope_frac);
+                  mg.inv_freq().data(), c.rope_scale, c.rope_frac, false);
         note(compare("rope q", grab(cpu, qc, (size_t)N * q_dim),
                      grab(gpu, qg, (size_t)N * q_dim)));
         note(compare("rope k", grab(cpu, kc, (size_t)N * kv_dim),
+                     grab(gpu, kg, (size_t)N * kv_dim)));
+        // The same rows again under the NeoX pair convention. The input is
+        // already rotated, which does not matter: both engines get the same
+        // bytes, so the pair is still the pairing the kernel chose.
+        cpu->rope(qc, kc, c.n_head, c.n_head_kv, c.head_dim, N, POS0,
+                  mc.inv_freq().data(), c.rope_scale, c.rope_frac, true);
+        gpu->rope(qg, kg, c.n_head, c.n_head_kv, c.head_dim, N, POS0,
+                  mg.inv_freq().data(), c.rope_scale, c.rope_frac, true);
+        note(compare("rope q (neox)", grab(cpu, qc, (size_t)N * q_dim),
+                     grab(gpu, qg, (size_t)N * q_dim)));
+        note(compare("rope k (neox)", grab(cpu, kc, (size_t)N * kv_dim),
                      grab(gpu, kg, (size_t)N * kv_dim)));
 
         AttnDesc d;
@@ -645,6 +663,37 @@ int main(int argc, char **argv) {
             note(compare("kv_append k", ref, got));
         }
 
+        // Sliding window (laguna's windowed layers): the same K/V with a bound
+        // must agree too. A plain causal run never exercises this mask, and the
+        // bound is what makes a hybrid stack's windowed layers different from
+        // its full ones.
+        {
+            ActBuf a(cpu, gpu, N * q_dim);
+            AttnDesc w = d;
+            w.window = 2;
+            cpu->attention(a.c, qc, kch, vch, w);
+            gpu->attention(a.g, qg, kgh, vgh, w);
+            note(compare("attention window", a.ref(), a.got()));
+        }
+
+        // Decode attention (one query token) with a window: the path every
+        // laguna decode step takes, and the only place the bound's key-range
+        // clamp runs. The query is the last token written above.
+        {
+            AttnDesc w = d;
+            w.n_tok = 1;
+            w.pos0 = POS0 + N - 1;
+            w.window = 2;
+            ActBuf a(cpu, gpu, q_dim);
+            cpu->attention(a.c,
+                           static_cast<const f32 *>(qc) + (N - 1) * q_dim,
+                           kch, vch, w);
+            gpu->attention(a.g,
+                           static_cast<const char *>(qg) + (N - 1) * q_dim * 2,
+                           kgh, vgh, w);
+            note(compare("attention decode window", a.ref(), a.got()));
+        }
+
         cpu->attention(ac, qc, kch, vch, d);
         gpu->attention(ag, qg, kgh, vgh, d);
         note(compare("attention", grab(cpu, ac, (size_t)N * q_dim),
@@ -654,6 +703,23 @@ int main(int argc, char **argv) {
         gpu->gemm(x2_g, ag, Lg.wo.data, Lg.wo.type, n_embd, q_dim, N);
         note(compare("gemm wo", grab(cpu, x2_c, (size_t)N * n_embd),
                      grab(gpu, x2_g, (size_t)N * n_embd)));
+
+        // laguna's per-head output gate (mul_head_broadcast): one scalar per
+        // (token, head) times the whole head row, which no elementwise op can
+        // express because the two operands have different lengths. Uses the
+        // attention output, whose last reader above is done with it.
+        {
+            const i64 ng = N * c.n_head;
+            ActBuf g(cpu, gpu, ng);
+            std::vector<f32> gv(static_cast<size_t>(ng));
+            for (i64 i = 0; i < ng; i++)
+                gv[static_cast<size_t>(i)] = 0.25f + 0.1f * (i % 5);
+            g.set(gv);
+            cpu->mul_head_broadcast(ac, g.c, N, c.n_head, c.head_dim);
+            gpu->mul_head_broadcast(ag, g.g, N, c.n_head, c.head_dim);
+            note(compare("mul_head_broadcast", grab(cpu, ac, (size_t)N * q_dim),
+                         grab(gpu, ag, (size_t)N * q_dim)));
+        }
 
         cpu->add_inplace(xc, x2_c, N * n_embd);
         gpu->add_inplace(xg, x2_g, N * n_embd);

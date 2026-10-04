@@ -56,6 +56,11 @@ void *host_alloc(size_t bytes, size_t alignment = 64);
 void *host_realloc(void *p, size_t bytes, size_t alignment = 64);
 void host_free(void *p);
 
+// Free physical memory in bytes, or 0 when the platform cannot say. Used to
+// size the expert tier's host half: guessing high there is what makes a
+// machine swap, which costs far more than the re-read the tier avoids.
+size_t host_available_bytes();
+
 // ---------------------------------------------------------------------------
 // half / bfloat16 conversion
 // ---------------------------------------------------------------------------

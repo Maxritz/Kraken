@@ -87,6 +87,22 @@ struct ArchSpec {
     bool q_output_gate; // attn_q packs a per-head output gate (Qwen3.5)
     bool qkv_bias;      // attn_q / attn_k / attn_v carry a bias
     bool gemma_norm;    // embedding scaled by sqrt(n_embd), eps 1e-6
+    // A *separate* per-head output gate tensor (`attn_gate.weight`, laguna):
+    // projected from the same hidden state q/k/v read, softplus'd, and
+    // multiplied into the attention result before wo. Not the packed-query
+    // gate above — different tensor, different activation, different operand.
+    bool attn_gate = false;
+    // The RoPE pair convention the file's q/k rows were exported in.
+    // llama.cpp calls the two "norm" and "neox": norm pairs the *adjacent*
+    // channels (2i, 2i+1), neox pairs channel j with j + n_rot/2 inside the
+    // rotated prefix. Only the relative rotation between a query and a key
+    // reaches the score, so the wrong one mixes the wrong channels and every
+    // token still lands on the same order of magnitude — a plausible wrong
+    // answer rather than a crash. The convention is a property of the
+    // architecture (llama.cpp's llm_arch_rope table), not of the tensor, so it
+    // has to be declared here. Absent means norm, which is what every file in
+    // this collection used before the flag existed.
+    bool rope_neox = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.
@@ -109,8 +125,13 @@ const char *arch_role_name(ArchRole r);
 // The unimplemented piece a tensor name implies, or nullptr when it implies
 // none. `shape` matters because one name can mean two things: `attn_gate` is a
 // gate inside the gated delta net (implemented) on a recurrent arch, and a gate
-// on the attention output (not implemented) on a dense one.
-const char *arch_tensor_gap(std::string_view tensor_name, ArchShape shape);
+// on the attention output (not implemented) on a dense one. `arch` is the
+// second exemption, and it is the opposite direction: a tensor that is a gap in
+// general is not one for a schema that has code for it, and the table entry is
+// the only place that knows which schemas those are. Empty means "no
+// exemptions", which is what a caller with no arch name to give gets.
+const char *arch_tensor_gap(std::string_view tensor_name, ArchShape shape,
+                            std::string_view arch = {});
 
 // The speculative/MTP head a tensor name belongs to, or nullptr. A head is not
 // a gap: a target that carries one still runs, it just does not use it, so the

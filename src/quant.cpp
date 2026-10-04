@@ -416,6 +416,78 @@ void deq_nvfp4(const u8 *b, f32 *y, i64 nblk) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ternary (BitNet) formats
+//
+// Both store {-1, 0, +1} codes with one fp16 scale per 256-value super-block.
+// The difference is only how the codes are packed.
+//
+//   TQ2_0: 2 bits per element, q in {0,1,2} -> q - 1. 64 bytes + d = 66.
+//           Four 2-bit planes: byte j carries elements j, j+32, j+64, j+96.
+//
+//   TQ1_0: 5 trits per byte, base-3 packed. 3^5 = 243 < 256, so a byte holds
+//          five codes (the quantizer scales by 256/243 to use the range).
+//          Decoding is q * 3^n >> 8 with a multiply high, NOT a division --
+//          ggml's own decoder. 48 bytes of qs cover 240 elements; the last 16
+//          come from qh, 4 trits per byte. 48 + 4 + 2 = 54 bytes.
+//
+// The layouts are planar: the low 32 elements of a group live in one trit
+// plane, the next 32 in the next plane, and so on. A "chunk" of 32
+// consecutive elements is therefore one (group, plane) pair, never a
+// contiguous byte run.
+// ---------------------------------------------------------------------------
+
+// ((uint16_t)(q * 3^n) * 3) >> 8 -- ggml's multiply-high trit decode.
+//
+// The 8-bit truncation is load-bearing, not an accident of typing: ggml writes
+// `uint8_t q = x.qs[j+m] * pow3[n];`, so the product wraps to a byte BEFORE the
+// *3 >> 8. Keeping the full product (the obvious-looking reading) decodes every
+// plane above n=0 to the wrong trit. Confirmed against ggml's own encoder by
+// tools/probe_tq.cpp: with the wrap the round trip is exact, without it 1467 of
+// 2048 values differ.
+inline int tq1_trit_of(int q, int n) {
+    static const int pow3[6] = {1, 3, 9, 27, 81, 243};
+    const u8 w = static_cast<u8>(q * pow3[n]);
+    return static_cast<int>((static_cast<u16>(w) * 3u) >> 8) - 1;
+}
+
+// Element `idx` (0..255) of a TQ1_0 block, as a trit in {-1, 0, 1}.
+inline int tq1_trit_at(const u8 *b, int idx) {
+    if (idx < 160) {
+        const int n = idx / 32, m = idx % 32;
+        return tq1_trit_of(b[m], n);
+    }
+    if (idx < 240) {
+        const int t = idx - 160;
+        return tq1_trit_of(b[32 + (t % 16)], t / 16);
+    }
+    // ggml emits qh as: for n in 0..3 { for j in 0..3 { qh[j] } }, so the
+    // byte index is t % 4 and the trit plane is t / 4 -- not the other way
+    // round. (Swapping them costs 66 of 2048 values in the round trip.)
+    const int t = idx - 240;
+    return tq1_trit_of(b[48 + (t % 4)], t / 4);
+}
+
+void deq_tq1_0(const u8 *b, f32 *y, i64 nblk) {
+    for (i64 i = 0; i < nblk; i++, b += 54, y += 256) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(b[52] | (b[53] << 8)));
+        for (int v = 0; v < 256; v++)
+            y[v] = d * static_cast<f32>(tq1_trit_at(b, v));
+    }
+}
+
+void deq_tq2_0(const u8 *b, f32 *y, i64 nblk) {
+    for (i64 i = 0; i < nblk; i++, b += 66, y += 256) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(b[64] | (b[65] << 8)));
+        for (int j = 0; j < 64; j += 32)
+            for (int l = 0; l < 4; l++)
+                for (int m = 0; m < 32; m++)
+                    y[j * 4 + l * 32 + m] =
+                        d * static_cast<f32>(
+                                static_cast<int>((b[j + m] >> (l * 2)) & 3) - 1);
+    }
+}
+
 // One whole block of `t` decoded into buf (>= block_size floats).
 void dequant_block(DType t, const u8 *p, f32 *buf) {
     switch (t) {
@@ -441,6 +513,8 @@ void dequant_block(DType t, const u8 *p, f32 *buf) {
         case DType::IQ2_XXS: deq_iq2_xxs(p, buf, 1); break;
         case DType::IQ4_XS: deq_iq4_xs(p, buf, 1); break;
         case DType::NVFP4: deq_nvfp4(p, buf, 1); break;
+        case DType::TQ1_0: deq_tq1_0(p, buf, 1); break;
+        case DType::TQ2_0: deq_tq2_0(p, buf, 1); break;
         default: break;
     }
 }
@@ -470,6 +544,8 @@ const char *dtype_name(DType t) {
         case DType::IQ2_XXS: return "IQ2_XXS";
         case DType::IQ4_XS: return "IQ4_XS";
         case DType::NVFP4: return "NVFP4";
+        case DType::TQ1_0: return "TQ1_0";
+        case DType::TQ2_0: return "TQ2_0";
         default: return "UNKNOWN";
     }
 }
@@ -495,6 +571,8 @@ bool dtype_supported(DType t) {
         case DType::IQ2_XXS:
         case DType::IQ4_XS:
         case DType::NVFP4:
+        case DType::TQ1_0:
+        case DType::TQ2_0:
             return true;
         default:
             return false;
@@ -513,7 +591,9 @@ int dtype_block_size(DType t) {
         case DType::Q6_K:
         case DType::Q8_K:
         case DType::IQ2_XXS:
-        case DType::IQ4_XS: return 256;
+        case DType::IQ4_XS:
+        case DType::TQ1_0:
+        case DType::TQ2_0: return 256;
         case DType::NVFP4: return 64;
         default: return 32;
     }
@@ -540,6 +620,8 @@ int dtype_block_bytes(DType t) {
         case DType::IQ2_XXS: return 66;
         case DType::IQ4_XS: return 136;
         case DType::NVFP4: return 36;
+        case DType::TQ1_0: return 54;
+        case DType::TQ2_0: return 66;
         default: return 0;
     }
 }

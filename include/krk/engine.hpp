@@ -33,7 +33,10 @@ struct EngineConfig {
     // independently of the device budget, because the two tiers answer
     // different questions — VRAM holds what is about to be used, RAM holds what
     // was just used. 0 disables the tier.
-    i32 expert_l2_mb = 0;
+    // -1 (the default) sizes the tier itself: the expert bytes the device
+    // budget could not hold, capped by what the host actually has free. 0
+    // disables it, a positive value is that many MiB.
+    i32 expert_l2_mb = -1;
 };
 
 struct StreamSink {

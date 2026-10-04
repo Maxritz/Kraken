@@ -7,6 +7,8 @@
 #ifndef KRK_GGUF_HPP
 #define KRK_GGUF_HPP
 
+#include <memory>
+
 #include "krk/common.hpp"
 #include "krk/quant.hpp"
 
@@ -66,6 +68,19 @@ struct GgufTensor {
     const u8 *data = nullptr;
     i64 n_elements = 0;
     size_t n_bytes = 0;
+    // Which shard `data` points into. 0 for a single-file model. The weight
+    // pull path needs this: it converts a pointer back to a file offset with
+    // `src - shard_base`, and each shard has its own base.
+    u32 shard = 0;
+};
+
+// One file of a split (`split.*`) model, or the whole single-file model.
+// Each shard keeps its own mapping alive because its tensors point into it.
+struct GgufShard {
+    std::unique_ptr<MappedFile> file;
+    size_t data_off = 0;   // tensor data section inside this shard
+    i32 split_no = 0;      // split.no, 0-based
+    int n_tensors = 0;     // tensors carried by this shard
 };
 
 class Gguf {
@@ -75,7 +90,19 @@ public:
     Gguf(const Gguf &) = delete;
     Gguf &operator=(const Gguf &) = delete;
 
+    // Loads a GGUF. A split model (`split.count > 1`) is loaded as a set: the
+    // path may name any shard, the siblings are derived from the
+    // `-NNNNN-of-MMMMM.gguf` naming, and every shard's tensors are merged into
+    // one directory. Metadata comes from split.no == 0, which is the shard that
+    // carries the full key/value block.
     bool load(const std::string &path, std::string *err);
+
+    // Number of files backing this model (1 unless it is a split set).
+    size_t shard_count() const { return shards_.size(); }
+    const std::vector<GgufShard> &shards() const { return shards_; }
+    bool is_split() const { return shards_.size() > 1; }
+    // Total tensor entries across every shard (the merged directory size).
+    size_t tensor_count() const { return tensors_.size(); }
 
     u32 version() const { return version_; }
     const std::vector<GgufTensor> &tensors() const { return tensors_; }
@@ -95,7 +122,9 @@ public:
     const std::vector<i32> *get_i32_array(const std::string &key) const;
     const std::vector<std::string> *get_str_array(const std::string &key) const;
 
-    const MappedFile &file() const { return file_; }
+    // The mapping of the metadata shard (the whole file for a single-file
+     // model). A split set has more mappings; see shards().
+    const MappedFile &file() const { return *shards_.front().file; }
     // File offset of the tensor data section. `GgufTensor::data` points into the
     // mapping, so `(t.data - file().data())` is the same number; this exposes it
     // once instead of at every call site.
@@ -103,7 +132,14 @@ public:
     u64 alignment() const { return alignment_; }
 
 private:
-    MappedFile file_;
+    // Parses one mapping's header, metadata and tensor directory. `only_split_kv`
+    // keeps only the split.* keys, which is all a non-zero shard carries.
+    bool parse_shard(MappedFile &f, i32 shard_index, bool keep_all_kv,
+                     std::vector<GgufTensor> *out,
+                     std::vector<std::pair<std::string, GgufValue>> *kvs_out,
+                     size_t *data_off_out, std::string *err);
+
+    std::vector<GgufShard> shards_;
     size_t data_section_off_ = 0;
     u32 version_ = 0;
     u64 alignment_ = 32;

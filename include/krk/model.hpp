@@ -37,6 +37,12 @@ struct LayerWeights {
     // described by `experts` and materialized lazily by ExpertCache.
     bool moe = false;
     QuantTensor router;                           // ffn_gate_inp.weight
+    // Per-expert selection bias (laguna), added to the router's probabilities
+    // before the top-k and deliberately not to the weights.
+    f32 *router_bias = nullptr;                   // ffn_exp_probs_b.bias [n_expert]
+    // Per-head attention output gate: one scalar per query head, off the
+    // pre-attention hidden state.
+    QuantTensor wattn_gate;                       // attn_gate.weight [n_embd, n_head]
     QuantTensor shexp_gate, shexp_up, shexp_down; // shared expert, if any
     QuantTensor shexp_inp_gate;                   // [n_embd] per-token gate
     ExpertSource experts;                         // lazily-loaded routed experts
@@ -100,6 +106,57 @@ struct ModelConfig {
     bool has_bias = false;
     bool qk_norm = false;
 
+    // ---- hybrid full / sliding-window attention (laguna) ------------------
+    // Some archs alternate layer kinds. Every layer whose index is not a
+    // multiple of `swa_period` attends only the last `swa_window` positions,
+    // and carries its own rotary table: laguna-S is 48 layers of period 4
+    // (full at il % 4 == 0), window 512, full layers rotating 64 of 128 dims
+    // under YaRN and the windowed ones rotating all 128 under plain RoPE.
+    // `swa_period` 0 or 1 means every layer attends fully.
+    i32 swa_period = 0;
+    i32 swa_window = 0;
+    i32 rope_dim_swa = 0;
+    f32 rope_frac_swa = 1.0f;
+    f32 rope_base_swa = 10000.0f;
+    // `n_head` above is the head count of the *full* layers. When a model
+    // varies it per layer (`attention.head_count` stored as an array) the whole
+    // vector is kept here, and `n_head` is its maximum — which is what the
+    // workspaces size to, since the query projection is the widest one.
+    std::vector<i32> n_head_layer;
+    // Per-head softplus output gate (laguna `attn_gate.weight`): one scalar per
+    // query head, projected from the *same* hidden state q/k/v read, then
+    // softplus'd and multiplied into the attention result before wo. Distinct
+    // from the packed query gate of Qwen3.5, which is a sigmoid off the query
+    // projection rather than a separate tensor.
+    bool attn_gate = false;
+    // RoPE pair convention, read off the arch table (ArchSpec::rope_neox): true
+    // pairs channel j with j + rope_dim/2 (NeoX half-split), false pairs the
+    // adjacent channels (2i, 2i+1). It travels with the model because it is a
+    // property of how the file was exported, not of the kernel, and both the
+    // prefill and the decode path have to agree on it.
+    bool rope_neox = false;
+    // Router shape. `router_bias` is a per-expert selection bias
+    // (`ffn_exp_probs_b.bias`) added to the *probs* before the top-k but not to
+    // the weights the experts are combined with; `router_sigmoid` selects
+    // sigmoid over softmax; the selected weights are then optionally
+    // sum-normalized (`expert_w_norm`) and scaled (`expert_w_scale`).
+    bool router_bias = false;
+    bool router_sigmoid = false;
+    // Whether the rope table was built with YaRN's frequency correction, i.e.
+    // whether `rope_scale` has already been folded into `inv_freq` and must be
+    // left at 1.0 for the rotation op.
+    bool rope_yarn = false;
+    // 1 = sum-normalize the selected expert weights, 0 = keep the raw
+    // probabilities, -1 = the file does not declare the key. The engine has
+    // always normalized, and every model in the collection that *does* declare
+    // it declares 1, so the absent value has to keep the legacy behaviour
+    // rather than silently switching every Qwen MoE to unnormalized weights.
+    i32 expert_w_norm = -1;
+    f32 expert_w_scale = 1.0f;
+    // Leading layers whose FFN is dense rather than MoE
+    // (`leading_dense_block_count`).
+    i32 n_dense_lead = 0;
+
     // Mixture-of-Experts geometry (is_moe == false for dense models).
     bool is_moe = false;
     i32 n_expert = 0;        // routed experts per MoE layer
@@ -142,7 +199,37 @@ public:
 
     i64 n_ctx() const { return cfg_.n_ctx_train; }
     i64 kv_dim() const { return static_cast<i64>(cfg_.n_head_kv) * cfg_.head_dim; }
+    // Widest query projection any layer asks for. A model with a per-layer head
+    // count (laguna) is smaller on some layers than others, so this is what a
+    // shared workspace has to be sized against; the width of one particular
+    // layer is q_dim_at().
     i64 q_dim() const { return static_cast<i64>(cfg_.n_head) * cfg_.head_dim; }
+
+    // ---- per-layer geometry (laguna alternates two layer kinds) ----------
+    i32 n_head_at(i32 layer) const {
+        if (cfg_.n_head_layer.empty()) return cfg_.n_head;
+        if (layer < 0 || layer >= static_cast<i32>(cfg_.n_head_layer.size()))
+            return cfg_.n_head;
+        return cfg_.n_head_layer[static_cast<size_t>(layer)];
+    }
+    i64 q_dim_at(i32 layer) const {
+        return static_cast<i64>(n_head_at(layer)) * cfg_.head_dim;
+    }
+    // True when this layer attends a bounded window instead of the whole past.
+    bool is_swa(i32 layer) const {
+        return cfg_.swa_period > 1 && cfg_.swa_window > 0 &&
+               (layer % cfg_.swa_period) != 0;
+    }
+    // Rotary table this layer rotates with: the windowed layers of a hybrid
+    // model carry their own (plain RoPE over the full head, where the full
+    // layers run YaRN over a prefix). Falls back to the single table when the
+    // model has no per-layer-kind rotary.
+    const std::vector<f32> &inv_freq_at(i32 layer) const {
+        return is_swa(layer) && !inv_freq_swa_.empty() ? inv_freq_swa_ : inv_freq_;
+    }
+    f32 rope_frac_at(i32 layer) const {
+        return is_swa(layer) ? cfg_.rope_frac_swa : cfg_.rope_frac;
+    }
     i64 n_ff() const { return cfg_.n_ff; }
     i64 n_embd() const { return cfg_.n_embd; }
     // Widest FFN a layer may need (dense, routed expert, or shared expert).
@@ -196,6 +283,12 @@ public:
         experts_.configure(be_, bytes, host_bytes);
     }
     // Largest single-expert footprint across the MoE layers (0 when dense).
+    // What the load phase copied to the device and how long it took. The
+    // per-size breakdown stays behind KRK_PHASE; this is the total the run
+    // report needs on every run.
+    size_t upload_bytes() const { return upload_bytes_; }
+    f64 upload_ms() const { return upload_ms_; }
+
     size_t max_expert_bytes() const {
         size_t m = 0;
         for (const LayerWeights &L : layers_)
@@ -232,8 +325,11 @@ private:
     QuantTensor tok_embd_, out_head_;
     f32 *out_norm_ = nullptr;
     std::vector<f32> inv_freq_;
+    std::vector<f32> inv_freq_swa_;
     i64 weight_bytes_ = 0;
     ExpertCache experts_;
+    size_t upload_bytes_ = 0;
+    f64 upload_ms_ = 0;
 };
 
 } // namespace krk

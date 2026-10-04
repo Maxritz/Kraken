@@ -7,8 +7,14 @@
 //
 // Eviction has two destinations. Without a host budget a victim is released
 // and the next request re-reads the GGUF mapping; with one it is demoted to
-// page-locked host memory first, so the next request is a DMA.
+// page-locked host memory first, so the next request is a DMA. The tier can
+// also be filled ahead of the run (preload, below): on a stack with hundreds
+// of experts per layer a short generation is dominated by *first* touches,
+// and those are a miss the policy above can never turn into a hit.
 #include "krk/expert_cache.hpp"
+
+#include <chrono>
+#include <cstring>
 
 namespace krk {
 
@@ -83,9 +89,11 @@ void ExpertCache::touch(Slot &s) {
 
 void ExpertCache::drop(Slot &s) {
     if (!be_) return;
-    for (QuantTensor *q : {&s.m.gate, &s.m.up, &s.m.down}) {
-        if (q->present() && q->data) be_->release(q->data);
-        *q = {};
+    QuantTensor *q[3] = {&s.m.gate, &s.m.up, &s.m.down};
+    for (int i = 0; i < 3; i++) {
+        if (q[i]->present() && q[i]->data)
+            be_->release_pooled(q[i]->data, s.slice[i]);
+        *q[i] = {};
     }
     s.m = {};
 }
@@ -185,11 +193,23 @@ bool ExpertCache::demote_to_host(Slot &s, u64 keep_host_key) {
     s.h = h;
     s.host_bytes = s.bytes;
     host_bytes_ += s.host_bytes;
+    bytes_demoted_ += s.host_bytes;
     drop(s); // the weights live in the tier now
     return true;
 }
 
 bool ExpertCache::promote_to_vram(Slot &s) {
+    const std::chrono::steady_clock::time_point t0 =
+        std::chrono::steady_clock::now();
+    struct ClockOut {
+        f64 *ms;
+        std::chrono::steady_clock::time_point t;
+        ~ClockOut() {
+            *ms += std::chrono::duration<f64, std::milli>(
+                       std::chrono::steady_clock::now() - t)
+                       .count();
+        }
+    } clock_out{&promote_ms_, t0};
     if (!be_ || !s.in_host()) return false;
     const u64 key = slot_key(s.layer, s.expert);
     make_vram_room(key);
@@ -210,10 +230,11 @@ bool ExpertCache::promote_to_vram(Slot &s) {
     QuantTensor *to[3] = {&m.gate, &m.up, &m.down};
     for (int i = 0; i < 3; i++) {
         if (!from[i]->present()) continue;
-        void *p = be_->alloc(s.slice[i]);
+        void *p = be_->alloc_pooled(s.slice[i]);
         if (!p) {
-            for (QuantTensor *q : to)
-                if (q->present() && q->data) be_->release(q->data);
+            for (int j = 0; j < 3; j++)
+                if (to[j]->present() && to[j]->data)
+                    be_->release_pooled(to[j]->data, s.slice[j]);
             return false;
         }
         be_->upload(p, from[i]->data, s.slice[i]);
@@ -226,6 +247,7 @@ bool ExpertCache::promote_to_vram(Slot &s) {
     // The RAM copy has done its job; keeping it would double-count the bytes
     // without making the next promotion any faster.
     drop_host(s);
+    bytes_promoted_ += s.bytes;
     promotions_++;
     return true;
 }
@@ -305,6 +327,66 @@ bool ExpertCache::pick_host_victim(u64 *out, u64 keep_key) {
     return true;
 }
 
+bool ExpertCache::stage_host(const ExpertSource &src, i32 expert, Slot &s) {
+    const GgufTensor *from[3] = {src.gate, src.up, src.down};
+    QuantTensor *to[3] = {&s.h.gate, &s.h.up, &s.h.down};
+    size_t bytes = 0;
+    for (int i = 0; i < 3; i++) {
+        const GgufTensor *t = from[i];
+        const size_t per = s.slice[i];
+        if (!t || per == 0) continue;
+        void *p = be_->alloc_host(per);
+        if (!p) return false; // partial copies are dropped by the caller
+        // A host copy out of the mapping is a memcpy, not a device call. On a
+        // cold mapping the pages fault in one at a time — once, here, instead
+        // of on the token that first routes to this expert.
+        std::memcpy(p, t->data + static_cast<size_t>(expert) * per, per);
+        to[i]->data = p;
+        to[i]->type = t->type;
+        to[i]->n_in = static_cast<i64>(t->ne[0]);
+        to[i]->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
+        bytes += per;
+    }
+    s.host_bytes = bytes;
+    return true;
+}
+
+size_t ExpertCache::preload_one(const ExpertSource &src, i32 layer, i32 expert) {
+    if (!be_ || !src.present() || host_budget_ == 0) return 0;
+    if (expert < 0 || expert >= src.n_expert) return 0;
+    const size_t need = src.per_expert(src.gate) + src.per_expert(src.up) +
+                        src.per_expert(src.down);
+    if (need == 0 || host_bytes_ + need > host_budget_) return 0;
+    const u64 key = slot_key(layer, expert);
+    if (slots_.count(key)) return 0; // already resident in some tier
+    Slot s;
+    s.layer = layer;
+    s.expert = expert;
+    s.bytes = need;
+    s.slice[0] = src.per_expert(src.gate);
+    s.slice[1] = src.per_expert(src.up);
+    s.slice[2] = src.per_expert(src.down);
+    s.seq = seq_++;
+    if (!stage_host(src, expert, s)) {
+        drop_host(s);
+        return 0; // the pinned pool is the limit; stop rather than thrash
+    }
+    host_bytes_ += s.host_bytes;
+    bytes_staged_ += s.host_bytes;
+    slots_.emplace(key, std::move(s));
+    return need;
+}
+
+size_t ExpertCache::preload(const ExpertSource &src, i32 layer) {
+    size_t staged = 0;
+    for (i32 e = 0; e < src.n_expert; e++) {
+        const size_t one = preload_one(src, layer, e);
+        if (one == 0) break;
+        staged += one;
+    }
+    return staged;
+}
+
 const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
                                            i32 expert) {
     if (!be_ || !src.present()) return nullptr;
@@ -359,7 +441,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     const i32 e = expert;
     auto load = [&](const GgufTensor *t, size_t per, QuantTensor *out) {
         if (!t || per == 0) return;
-        out->data = be_->alloc(per);
+        out->data = be_->alloc_pooled(per);
         be_->upload(out->data, t->data + static_cast<size_t>(e) * per, per);
         out->type = t->type;
         out->n_in = static_cast<i64>(t->ne[0]);
@@ -372,6 +454,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     bytes_ += need;
     vram_slots_++;
     loads_++;
+    bytes_loaded_ += need;
     auto ins = slots_.emplace(key, std::move(s));
     if (++acquires_ >= decay_period()) decay();
     return &ins.first->second.m;

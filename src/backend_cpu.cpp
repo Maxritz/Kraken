@@ -198,9 +198,9 @@ public:
     }
 
     void rope(void *q, void *k, i64 n_head, i64 n_kv, i64 hd, i64 n_tok, i64 pos0,
-              const f32 *inv_freq, f32 scale, f32 frac) override {
-        rope_apply(static_cast<f32 *>(q), n_head, hd, n_tok, pos0, inv_freq, scale, frac);
-        rope_apply(static_cast<f32 *>(k), n_kv, hd, n_tok, pos0, inv_freq, scale, frac);
+              const f32 *inv_freq, f32 scale, f32 frac, bool neox) override {
+        rope_apply(static_cast<f32 *>(q), n_head, hd, n_tok, pos0, inv_freq, scale, frac, neox);
+        rope_apply(static_cast<f32 *>(k), n_kv, hd, n_tok, pos0, inv_freq, scale, frac, neox);
     }
 
     void qk_norm(void *q, void *k, const f32 *wq, const f32 *wk, i64 n_head,
@@ -250,20 +250,28 @@ public:
                         const i64 h = u - t * d.n_head;
                         const i64 pos = d.pos0 + t;
                         const i64 n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
-                        scores.resize(static_cast<size_t>(n_keys));
+                        // Sliding window (laguna's hybrid layers): the query
+                        // sees only the `window` most recent keys, so the ones
+                        // below the bound are skipped outright -- they never
+                        // enter the max or the denominator.
+                        const i64 j_lo = d.window > 0
+                                             ? std::max<i64>(0, n_keys - d.window)
+                                             : 0;
+                        const i64 n_vis = n_keys - j_lo;
+                        scores.resize(static_cast<size_t>(n_vis));
                         const i64 hkv = n_rep > 0 ? h / n_rep : 0;
                         const f32 *qh = qf + t * (d.n_head * d.hd) + h * d.hd;
-                        for (i64 j = 0; j < n_keys; j++) {
-                            const f32 *kj = kc + j * d.pos_stride + hkv * d.hd;
+                        for (i64 j = 0; j < n_vis; j++) {
+                            const f32 *kj = kc + (j_lo + j) * d.pos_stride + hkv * d.hd;
                             f32 dot = 0;
                             for (i64 i = 0; i < d.hd; i++) dot += qh[i] * kj[i];
                             scores[static_cast<size_t>(j)] = dot * d.scale;
                         }
                         f32 mx = scores[0];
-                        for (i64 j = 1; j < n_keys; j++)
+                        for (i64 j = 1; j < n_vis; j++)
                             mx = std::max(mx, scores[static_cast<size_t>(j)]);
                         f32 sum = 0;
-                        for (i64 j = 0; j < n_keys; j++) {
+                        for (i64 j = 0; j < n_vis; j++) {
                             const f32 ex = std::exp(scores[static_cast<size_t>(j)] - mx);
                             scores[static_cast<size_t>(j)] = ex;
                             sum += ex;
@@ -271,9 +279,9 @@ public:
                         const f32 inv = sum > 0 ? 1.0f / sum : 0.0f;
                         f32 *oh = of + t * (d.n_head * d.hd) + h * d.hd;
                         for (i64 i = 0; i < d.hd; i++) oh[i] = 0;
-                        for (i64 j = 0; j < n_keys; j++) {
+                        for (i64 j = 0; j < n_vis; j++) {
                             const f32 p = scores[static_cast<size_t>(j)] * inv;
-                            const f32 *vj = vc + j * d.pos_stride + hkv * d.hd;
+                            const f32 *vj = vc + (j_lo + j) * d.pos_stride + hkv * d.hd;
                             for (i64 i = 0; i < d.hd; i++) oh[i] += p * vj[i];
                         }
                     }
@@ -395,6 +403,22 @@ public:
         par_for(n, 8192, 2.0 * static_cast<f64>(n),
                 [&](i64 lo, i64 e) {
                     for (i64 i = lo; i < e; i++) p[i] *= s[i];
+                });
+    }
+
+    void mul_head_broadcast(void *x, const void *g, i64 n_tok, i64 n_head,
+                            i64 hd) override {
+        f32 *xf = static_cast<f32 *>(x);
+        const f32 *gf = static_cast<const f32 *>(g);
+        par_for(n_tok, 1, 2.0 * static_cast<f64>(n_tok) * n_head * hd,
+                [&](i64 b, i64 e) {
+                    for (i64 t = b; t < e; t++) {
+                        for (i64 h = 0; h < n_head; h++) {
+                            const f32 w = gf[t * n_head + h];
+                            f32 *row = xf + (t * n_head + h) * hd;
+                            for (i64 i = 0; i < hd; i++) row[i] *= w;
+                        }
+                    }
                 });
     }
 
@@ -610,9 +634,15 @@ private:
     // stored in this layout (the HF exporter permutes the half-split rows),
     // so pairing adjacent channels reproduces HF's rotate_half semantics.
     // `frac` limits rotation to a prefix of the hd/2 pairs (Phi-2/Gemma
-    // partial RoPE); `scale` divides the position (linear scaling).
+    // partial RoPE); `scale` divides the position (linear scaling). `neox`
+    // switches to the half-split convention the NeoX family is exported with:
+    // pair i is channel i with channel i + rot, where rot is the number of
+    // rotated pairs. Both conventions leave every other channel untouched, so
+    // the only difference is *which* channels a pair is made of — and since
+    // only the relative rotation between q and k reaches the score, that is
+    // the difference between the reference answer and a plausible wrong one.
     static void rope_apply(f32 *x, i64 n_heads, i64 hd, i64 n_tok, i64 pos0,
-                           const f32 *inv_freq, f32 scale, f32 frac) {
+                           const f32 *inv_freq, f32 scale, f32 frac, bool neox) {
         const i64 half = hd / 2;
         const i64 rot = std::max<i64>(1, static_cast<i64>(static_cast<f32>(half) * frac));
         const f32 s = scale > 0 ? scale : 1.0f;
@@ -628,9 +658,11 @@ private:
                         for (i64 i = 0; i < rot && i < half; i++) {
                             const f32 theta = p * inv_freq[i];
                             const f32 c = std::cos(theta), sn = std::sin(theta);
-                            const f32 a = hx[2 * i], bb = hx[2 * i + 1];
-                            hx[2 * i] = a * c - bb * sn;
-                            hx[2 * i + 1] = a * sn + bb * c;
+                            const i64 ia = neox ? i : 2 * i;
+                            const i64 ib = neox ? i + rot : 2 * i + 1;
+                            const f32 a = hx[ia], bb = hx[ib];
+                            hx[ia] = a * c - bb * sn;
+                            hx[ib] = a * sn + bb * c;
                         }
                     }
                 });

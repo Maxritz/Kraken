@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "krk/gguf.hpp"
+#include "krk/tokenizer.hpp"
 #include "krk/verdict.hpp"
 
 namespace {
@@ -47,14 +48,17 @@ std::string value_str(const GgufValue &v) {
 
 int main(int argc, char **argv) {
     std::string path;
+    std::string tokens;
     bool meta_only = false;
     bool quant_only = false;
     for (int i = 1; i < argc; i++) {
         const std::string f = argv[i];
         if (f == "--meta") meta_only = true;
         else if (f == "--quant") quant_only = true;
+        else if (f == "--tokens" && i + 1 < argc) tokens = argv[++i];
         else if (f == "-h" || f == "--help") {
-            std::printf("usage: kraken-inspect model.gguf [--meta] [--quant]\n");
+            std::printf("usage: kraken-inspect model.gguf [--meta] [--quant] "
+                        "[--tokens \"text\"]\n");
             return 0;
         } else {
             path = f;
@@ -71,6 +75,28 @@ int main(int argc, char **argv) {
     if (!g.load(path, &err)) {
         std::fprintf(stderr, "kraken-inspect: %s\n", err.c_str());
         return 1;
+    }
+
+    // --tokens: encode a string with the file's own tokenizer and print the
+    // ids. The reference engine (llama.cpp) has the same mode, so a
+    // disagreement about a prompt's tokens is settled by diffing two lists
+    // instead of by argument.
+    if (!tokens.empty()) {
+        Tokenizer tk;
+        if (!tk.load(g, &err)) {
+            std::fprintf(stderr, "kraken-inspect: %s\n", err.c_str());
+            return 1;
+        }
+        std::vector<i32> ids;
+        if (!tk.encode(tokens, ids, true)) {
+            std::fprintf(stderr, "kraken-inspect: encode failed\n");
+            return 1;
+        }
+        std::printf("n=%zu\n", ids.size());
+        for (size_t i = 0; i < ids.size(); i++)
+            std::printf("%s%d", i ? ", " : "[", ids[i]);
+        std::printf("]\n");
+        return 0;
     }
 
     std::printf("file       %s\n", path.c_str());

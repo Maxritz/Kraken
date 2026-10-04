@@ -95,13 +95,21 @@ ModelVerdict assess_model(const Gguf &g) {
     // models; saying so beats loading 45 GB of half a model and failing on a
     // missing layer.
     {
+        // Split (`split.*`) sets are loaded as one model: the loader derives
+        // the sibling files from the `-NNNNN-of-MMMMM.gguf` naming and merges
+        // their tensor directories. Refuse only a set that is actually short of
+        // tensors, which is a real download error rather than a format one.
         const i32 split_count = static_cast<i32>(g.get_i64("split.count", 0));
         if (split_count > 1) {
-            const i32 part = static_cast<i32>(g.get_i64("split.no", 0)) + 1;
-            add_unique(v.blockers,
-                       format("shard %d of %d of a split model (split.*); kraken "
-                              "loads single-file builds, not shard sets",
-                              part, split_count));
+            const i64 declared = g.get_i64("split.tensors.count", 0);
+            const i64 have = static_cast<i64>(g.tensor_count());
+            if (declared > 0 && have != declared)
+                add_unique(v.blockers,
+                           format("split model is incomplete: %lld of %lld tensors "
+                                  "across %d shards (split.tensors.count)",
+                                  static_cast<long long>(have),
+                                  static_cast<long long>(declared),
+                                  static_cast<int>(split_count)));
         }
         const std::string type = g.get_str("general.type", "");
         if (!type.empty() && type != "model")
@@ -166,7 +174,7 @@ ModelVerdict assess_model(const Gguf &g) {
     // table's Partial/No verdicts hold for a checkpoint whose arch string is
     // correct but whose tensors are from a variant nobody listed.
     for (const GgufTensor &t : g.tensors()) {
-        if (const char *gap = arch_tensor_gap(t.name, shape)) {
+        if (const char *gap = arch_tensor_gap(t.name, shape, v.arch)) {
             add_unique(v.blockers,
                        "uses " + std::string(gap) +
                            ", which this engine does not implement");

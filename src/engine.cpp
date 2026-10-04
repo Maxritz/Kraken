@@ -5,6 +5,7 @@
 #include "par_pool.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 
@@ -237,6 +238,12 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     ws_k_ = alloc(static_cast<size_t>(C * kv_dim_) * as);
     ws_v_ = alloc(static_cast<size_t>(C * kv_dim_) * as);
     ws_attn_ = alloc(static_cast<size_t>(C * q_dim_) * as);
+    // Two arches carry an attention output gate and they hold it differently:
+    // Qwen3.5 packs it behind the query projection (only for its recurrent
+    // stack), laguna projects it separately. Both need the buffer, and this is
+    // the only place it is allocated.
+    if (model_.is_recurrent() || mc.attn_gate)
+        ws_agate_ = alloc(static_cast<size_t>(C * q_dim_) * as);
     // The widest FFN a layer can ask for: dense, routed expert, or shared expert.
     const i64 ff_ws = model_.n_ff_ws();
     ws_gate_ = alloc(static_cast<size_t>(C * ff_ws) * as);
@@ -250,7 +257,6 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // One scalar pair per value head: tiny next to the projections.
         ws_ssm_ = alloc(static_cast<size_t>(C * mc.ssm_dt_rank) * as);
         ws_beta_ = alloc(static_cast<size_t>(C * mc.ssm_dt_rank) * as);
-        ws_agate_ = alloc(static_cast<size_t>(C * q_dim_) * as);
         // f32, not activation-typed: the state outlives the forward and is
         // accumulated at higher precision than the activations it is fed.
         conv_state_span_ = static_cast<i64>(mc.ssm_d_conv - 1) * conv_dim_;
@@ -387,6 +393,10 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     const ModelConfig &mc = model_.cfg();
     const auto &layers = model_.layers();
     const QuantTensor &embd = model_.tok_embd();
+    // Qwen3.5 packs its output gate behind the query (a per-layer shape only
+    // when the arch says so); laguna projects its own. Decided once from the
+    // arch, the same way Engine::init decided the packed workspace.
+    const bool packed_gate = q_proj_ != q_dim_;
 
     be_->embed(ws_x_, embd.data, embd.type, mc.n_vocab, mc.n_embd, toks, n);
 
@@ -412,6 +422,17 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
 
     for (i32 l = 0; l < mc.n_layer; l++) {
         const LayerWeights &L = layers[static_cast<size_t>(l)];
+        // Per-layer geometry. A hybrid stack (laguna) alternates two layer
+        // kinds with different head counts and different rotary tables, so the
+        // query width, the head count handed to rope/qk_norm/attention, and
+        // the rotation fraction are the layer's own. q_dim_/n_head remain the
+        // maximum, which is what the shared workspaces are sized against.
+        const i64 lh = model_.n_head_at(l);
+        const i64 lq = model_.q_dim_at(l);
+        const i64 lq_proj = packed_gate ? 2 * lq : lq;
+        // A sliding-window layer sees only its last `swa_window` keys; the full
+        // layers of the same stack see the whole prefix.
+        d.window = (mc.swa_window > 0 && model_.is_swa(l)) ? mc.swa_window : 0;
         dump_stage("enter", l);
 
         be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, n, n_embd_, mc.rms_eps);
@@ -435,15 +456,15 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // dependency between them, so they ride one fused launch
         // on the decode row (backend falls back per-matrix for
         // prefill rows or a dtype mix).
-        void *q_out = q_proj_ != q_dim_ ? ws_qpack_ : ws_q_;
+        void *q_out = packed_gate ? ws_qpack_ : ws_q_;
         if (L.wq.type == L.wk.type && L.wk.type == L.wv.type) {
             void *qkv[3] = {q_out, ws_k_, ws_v_};
             const void *wqkv[3] = {L.wq.data, L.wk.data, L.wv.data};
-            const i64 nqkv[3] = {q_proj_, kv_dim_, kv_dim_};
+            const i64 nqkv[3] = {lq_proj, kv_dim_, kv_dim_};
             be_->gemm_group(qkv, ws_xn_, wqkv, L.wq.type,
                             nqkv, n_embd_, 3, n);
         } else {
-            be_->gemm(q_out, ws_xn_, L.wq.data, L.wq.type, q_proj_, n_embd_, n);
+            be_->gemm(q_out, ws_xn_, L.wq.data, L.wq.type, lq_proj, n_embd_, n);
             be_->gemm(ws_k_, ws_xn_, L.wk.data, L.wk.type, kv_dim_, n_embd_, n);
             be_->gemm(ws_v_, ws_xn_, L.wv.data, L.wv.type, kv_dim_, n_embd_, n);
         }
@@ -451,21 +472,21 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // Qwen3.5 interleaves each head's output gate into the query
         // projection, so the packed rows have to be split before anything
         // else touches them. The query half stays in place.
-        if (q_proj_ != q_dim_) {
-            be_->qwen3_next_split(ws_q_, ws_agate_, q_out, n, mc.n_head,
+        if (packed_gate) {
+            be_->qwen3_next_split(ws_q_, ws_agate_, q_out, n, lh,
                                   mc.head_dim);
             // The gate half is the one buffer between the projections and the
             // layer output that no earlier stage covers.
-            dump_row("attn.qp", l, q_out, q_proj_, n);
-            dump_row("attn.gate", l, ws_agate_, q_dim_, n);
+            dump_row("attn.qp", l, q_out, lq_proj, n);
+            dump_row("attn.gate", l, ws_agate_, lq, n);
         }
 
-        if (L.q_bias) be_->add_bias_rows(ws_q_, L.q_bias, q_dim_, n);
+        if (L.q_bias) be_->add_bias_rows(ws_q_, L.q_bias, lq, n);
         if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, kv_dim_, n);
         if (L.v_bias) be_->add_bias_rows(ws_v_, L.v_bias, kv_dim_, n);
 
         if (mc.qk_norm)
-            be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, mc.n_head, mc.n_head_kv,
+            be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, lh, mc.n_head_kv,
                          mc.head_dim, n, mc.rms_eps);
 
         d.layer = l;
@@ -475,17 +496,22 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // the k/v rows never round-trip through global memory between
         // three launches. Gated on what the fused kernel cannot
         // express: qk_norm (which must run between the projections
-        // and the rotation), multi-token rows (prefill), and a packed
-        // output gate (which must multiply the result afterwards).
+        // and the rotation), multi-token rows (prefill), a packed
+        // output gate (which must multiply the result afterwards), a
+        // sliding window (the fused kernel has no bound) and a NeoX rope
+        // pairing (the fused kernel rotates adjacent channels only, and the
+        // two conventions rotate different channels, so it would silently
+        // disagree with the CPU reference and with the fallback below).
         // Unsupported backends and shapes keep the separate chain.
-        if (!(n == 1 && !mc.qk_norm && q_proj_ == q_dim_ &&
+        if (!(n == 1 && !mc.qk_norm && !packed_gate && d.window == 0 &&
+              !mc.attn_gate && !mc.rope_neox &&
               be_->attn_fused_chain(ws_attn_, ws_q_, kcache_, vcache_,
                                       ws_k_, ws_v_, d,
-                                      model_.inv_freq().data(),
-                                      mc.rope_scale, mc.rope_frac))) {
-            be_->rope(ws_q_, ws_k_, mc.n_head, mc.n_head_kv, mc.head_dim,
-                      n, pos0, model_.inv_freq().data(), mc.rope_scale,
-                      mc.rope_frac);
+                                      model_.inv_freq_at(l).data(),
+                                      mc.rope_scale, model_.rope_frac_at(l)))) {
+            be_->rope(ws_q_, ws_k_, lh, mc.n_head_kv, mc.head_dim,
+                      n, pos0, model_.inv_freq_at(l).data(), mc.rope_scale,
+                      model_.rope_frac_at(l), mc.rope_neox);
             be_->kv_append(kcache_, vcache_, ws_k_, ws_v_, d);
             be_->attention(ws_attn_, ws_q_, kcache_, vcache_, d);
         }
@@ -493,19 +519,33 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // q/k are post-rope here, so a divergence in them is rope or the
         // projection, and agreeing inputs with a wrong "out" is the attention
         // kernel itself.
-        dump_row("attn.q", l, ws_q_, q_dim_, n);
+        dump_row("attn.q", l, ws_q_, lq, n);
         dump_row("attn.k", l, ws_k_, kv_dim_, n);
-        dump_row("attn.out", l, ws_attn_, q_dim_, n);
+        dump_row("attn.out", l, ws_attn_, lq, n);
+
+        // laguna's output gate: a separate [n_head] projection of the same
+        // attention-norm output q/k/v read, softplus'd, and applied as one
+        // scalar per head over that head's whole output row. Before wo, which
+        // is what makes it a gate on the attention result rather than on the
+        // residual.
+        if (mc.attn_gate && L.wattn_gate.present()) {
+            be_->gemm(ws_agate_, ws_xn_, L.wattn_gate.data, L.wattn_gate.type, lh,
+                      n_embd_, n);
+            be_->softplus_act(ws_agate_, static_cast<i64>(n) * lh);
+            dump_row("attn.gate", l, ws_agate_, lh, n);
+            be_->mul_head_broadcast(ws_attn_, ws_agate_, n, lh, mc.head_dim);
+            dump_row("attn.gated", l, ws_attn_, lq, n);
+        }
 
         // Qwen3.5's output gate is a sigmoid applied to the attention result,
         // not to the projection: gate it before wo.
-        if (q_proj_ != q_dim_) {
-            be_->sigmoid_act(ws_agate_, static_cast<i64>(n) * q_dim_);
-            be_->mul_act(ws_attn_, ws_agate_, static_cast<i64>(n) * q_dim_);
-            dump_row("attn.gated", l, ws_attn_, q_dim_, n);
+        if (packed_gate) {
+            be_->sigmoid_act(ws_agate_, static_cast<i64>(n) * lq);
+            be_->mul_act(ws_attn_, ws_agate_, static_cast<i64>(n) * lq);
+            dump_row("attn.gated", l, ws_attn_, lq, n);
         }
 
-        be_->gemm(ws_x2_, ws_attn_, L.wo.data, L.wo.type, n_embd_, q_dim_, n);
+        be_->gemm(ws_x2_, ws_attn_, L.wo.data, L.wo.type, n_embd_, lq, n);
         dump_row("attn.proj", l, ws_x2_, n_embd_, n);
         be_->add_inplace(ws_x_, ws_x2_, n * n_embd_);
         dump_row("attn.res", l, ws_x_, n_embd_, n);
@@ -621,8 +661,16 @@ void Engine::configure_expert_cache() {
         // fit, fall back to a generous share of free memory and let the
         // cache page. On the CPU (no VRAM accounting) allow a generous
         // fixed share of host RAM.
-        budget = dc.vram_free > 0
-                     ? static_cast<size_t>(static_cast<f64>(dc.vram_free) * 0.9)
+        // Three fifths of what is free *now*, not of what the card has. The
+        // budget is a soft cap on resident expert bytes only, and the KV
+        // cache, the workspaces, the dense trunk, the weight-pull staging
+        // buffers and the driver's own allocations all live beside it: at
+        // 0.75 a 15.9 GiB card measured 13.7 GiB in use, which is a cache
+        // decision made for the user rather than by them. 0.6 leaves ~5 GiB
+        // of headroom and --expert-cache-mb takes any number deliberately.
+        const size_t free_now = be_->device_free_bytes();
+        budget = free_now > 0
+                     ? static_cast<size_t>(static_cast<f64>(free_now) * 0.6)
                      : static_cast<size_t>(512) * 1024u * 1024u;
         const size_t total = model_.total_expert_bytes();
         if (total > 0 && total < budget) budget = total;
@@ -637,11 +685,92 @@ void Engine::configure_expert_cache() {
     // The second tier is sized independently of the device budget: VRAM holds
     // what is about to be used, the tier holds what was just used, and a
     // demoted expert comes back as a DMA rather than a re-read of the mapping.
+    //
+    // A negative setting (the default) holds the *whole* routed expert set in
+    // host RAM when the machine has room for it, capped by half of what is
+    // actually free, because a tier that pushes the host into swap costs more
+    // than the re-read it saves. Holding all of it is the point: the set is the
+    // model's home and the device budget is the hot subset on top, so a VRAM
+    // miss becomes a DMA out of RAM rather than a read of the file. Measured on
+    // Laguna XS.2, staging the 4.9 GiB the old "leftover" rule sized dropped
+    // file traffic 212.6 -> 157.5 MiB/token and decode 8.35 -> 9.35 tok/s; the
+    // half it did not stage was still being read from the file. A tier that
+    // cannot hold a handful of experts only adds copies, so it stays off. The
+    // CPU backend has no device budget to be the remainder of -- its mapping is
+    // host memory already -- so it stays off there.
     size_t l2 = 0;
-    if (cfg_.expert_l2_mb > 0)
+    if (cfg_.expert_l2_mb > 0) {
         l2 = static_cast<size_t>(cfg_.expert_l2_mb) * 1024u * 1024u;
+    } else if (cfg_.expert_l2_mb < 0 && be_->caps().vram_free > 0) {
+        size_t want = model_.total_expert_bytes();
+        const size_t avail = host_available_bytes();
+        // Hold back a reserve before taking half of what is left: an eager
+        // tier is page-locked, and pinned pages plus the file mapping plus
+        // everything else that lives in RAM is what turns "more cache" into
+        // a machine that swaps. 8 GiB is the reserve, so a 16 GiB box still
+        // gets 4 GiB of tier and a 96 GiB box cannot eat the machine.
+        const size_t reserve = static_cast<size_t>(8) * 1024u * 1024u * 1024u;
+        const size_t spendable = avail > reserve ? avail - reserve : 0;
+        size_t cap = spendable / 2;
+        // ...and an absolute default ceiling. Staging is a memcpy out of the
+        // mapping, so every staged byte also makes a page of the mapping
+        // resident: host RAM ends up holding the tier twice, and an 18 GiB
+        // tier on an 18.9 GiB file measured 50+ GiB of RAM in use. 4 GiB is
+        // the default because it costs ~8 GiB of RAM and is worth ~30% of
+        // prefill and decode on a stack that does not fit (measured: 8.7
+        // tok/s with no tier, 11.3 at 8 GiB, 17.0 at the full 18 GiB);
+        // --expert-l2-mb takes any amount deliberately, and the staging line
+        // below reports what it actually cost.
+        const size_t ceiling = static_cast<size_t>(4) * 1024u * 1024u * 1024u;
+        if (cap > ceiling) cap = ceiling;
+        if (want > cap) want = cap;
+        const size_t floor_bytes = model_.max_expert_bytes() * 4;
+        l2 = want >= floor_bytes ? want : 0;
+    }
 
     model_.set_expert_budget(budget, l2);
+
+    // Stage the routed experts in the tier once, at load. Measured on Laguna
+    // XS.2 before this: 212 MiB/token read out of the model file at 8 tok/s,
+    // 66.9% hits and zero demotions — the misses were compulsory, so the tier
+    // was never asked for anything. After staging, the first touch of an
+    // expert is a DMA out of RAM instead of a read of the file.
+    // KRK_EXPERT_PRELOAD=0 turns it off, for the A/B.
+    if (l2 > 0 && be_->caps().vram_free > 0 &&
+        !(std::getenv("KRK_EXPERT_PRELOAD") &&
+          std::getenv("KRK_EXPERT_PRELOAD")[0] == '0')) {
+        const std::chrono::steady_clock::time_point t0 =
+            std::chrono::steady_clock::now();
+        const size_t ram_before = host_available_bytes();
+        // Expert-major, layer-minor: with a bounded tier this fills every
+        // layer's expert 0 before any layer's expert 1, so a tier smaller
+        // than the corpus is shared out evenly instead of being spent on the
+        // first few layers. Routing mass is the better order when the model
+        // carries a .krakenexperts.json; this is the order that needs no
+        // prior run and does not concentrate the hot set in one place.
+        size_t staged = 0;
+        for (i32 e = 0; e < mc.n_expert; e++) {
+            for (i32 l = 0; l < mc.n_layer; l++) {
+                const LayerWeights &L = model_.layers()[static_cast<size_t>(l)];
+                if (!L.experts.present()) continue;
+                staged += model_.experts().preload_one(L.experts, l, e);
+            }
+        }
+        const f64 stage_ms = std::chrono::duration<f64, std::milli>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+        // Both sides of the cost: the pinned tier is what the tier holds, and
+        // the drop in free RAM is what it actually took, mapping pages
+        // included. The two differ by the size of the staged ranges.
+        const size_t ram_after = host_available_bytes();
+        const f64 ram_mib = ram_before > ram_after
+                                ? static_cast<f64>(ram_before - ram_after) / 1048576.0
+                                : 0.0;
+        KRK_INFO("expert L2: staged %.1f MiB in pinned host RAM in %.0f ms, "
+                 "host RAM in use up %.1f MiB (a VRAM miss is a DMA now, not "
+                 "a file read)",
+                 static_cast<f64>(staged) / 1048576.0, stage_ms, ram_mib);
+    }
     char l2_note[64] = "";
     if (l2 > 0)
         std::snprintf(l2_note, sizeof(l2_note), " + %.0f MiB L2",
@@ -891,15 +1020,26 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // over the k selected experts (the Qwen convention).
         for (i32 t = 0; t < n; t++) {
             const f32 *logits = router_host_.data() + static_cast<i64>(t) * ne;
-            f32 mx = logits[0];
-            for (i32 e = 1; e < ne; e++) mx = std::max(mx, logits[e]);
-            f32 sum = 0;
-            for (i32 e = 0; e < ne; e++) {
-                moe_prob_[static_cast<size_t>(e)] = std::exp(logits[e] - mx);
-                sum += moe_prob_[static_cast<size_t>(e)];
+            // The probability the selected experts are mixed with. Softmax is
+            // the Qwen convention, sigmoid is laguna's (`expert_gating_func`
+            // 2); sigmoid probabilities are not renormalized, which is exactly
+            // what the reference does.
+            if (mc.router_sigmoid) {
+                for (i32 e = 0; e < ne; e++)
+                    moe_prob_[static_cast<size_t>(e)] =
+                        1.0f / (1.0f + std::exp(-logits[e]));
+            } else {
+                f32 mx = logits[0];
+                for (i32 e = 1; e < ne; e++) mx = std::max(mx, logits[e]);
+                f32 sum = 0;
+                for (i32 e = 0; e < ne; e++) {
+                    moe_prob_[static_cast<size_t>(e)] = std::exp(logits[e] - mx);
+                    sum += moe_prob_[static_cast<size_t>(e)];
+                }
+                const f32 inv = sum > 0 ? 1.0f / sum : 0.0f;
+                for (i32 e = 0; e < ne; e++)
+                    moe_prob_[static_cast<size_t>(e)] *= inv;
             }
-            const f32 inv = sum > 0 ? 1.0f / sum : 0.0f;
-            for (i32 e = 0; e < ne; e++) moe_prob_[static_cast<size_t>(e)] *= inv;
 
             // Fold this token's routing distribution into the scan. Mass is
             // recorded for every expert, not just the k selected, because the
@@ -912,6 +1052,17 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                     mass[e] += static_cast<double>(moe_prob_[static_cast<size_t>(e)]);
             }
 
+            // The per-expert bias (`ffn_exp_probs_b.bias`) shifts *selection*
+            // only: the weights stay the unbiased probabilities, which is what
+            // the reference means by "leave probs unbiased as it's later used
+            // to get expert weights". Adding it to the weights as well is a
+            // plausible-looking and wrong change.
+            const f32 *rb = L.router_bias;
+            auto sel_score = [&](i32 e) {
+                return moe_prob_[static_cast<size_t>(e)] +
+                       (rb ? rb[static_cast<size_t>(e)] : 0.0f);
+            };
+
             i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
             f32 *wt = moe_wt_.data() + static_cast<size_t>(t) * k;
             for (i32 s = 0; s < k; s++) {
@@ -922,22 +1073,32 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                     for (i32 p = 0; p < s; p++)
                         if (sel[p] == e) { taken = true; break; }
                     if (taken) continue;
-                    if (moe_prob_[static_cast<size_t>(e)] > bestp) {
-                        bestp = moe_prob_[static_cast<size_t>(e)];
+                    if (sel_score(e) > bestp) {
+                        bestp = sel_score(e);
                         best = e;
                     }
                 }
                 sel[s] = best;
-                wt[s] = bestp > 0 ? bestp : 0.0f;
+                // The weight is the probability, never the biased score.
+                wt[s] = best >= 0 ? moe_prob_[static_cast<size_t>(best)] : 0.0f;
                 if (expert_scan_ && best >= 0)
                     expert_hits_[static_cast<size_t>(layer) *
                                      static_cast<size_t>(ne) +
                                  static_cast<size_t>(best)] += 1;
             }
-            f32 ksum = 0;
-            for (i32 s = 0; s < k; s++) ksum += wt[s];
-            const f32 kinv = ksum > 0 ? 1.0f / ksum : 0.0f;
-            for (i32 s = 0; s < k; s++) wt[s] *= kinv;
+            // Sum-normalize, then scale. llama.cpp does both only when the
+            // file asks for them, but this engine normalized unconditionally
+            // before the flag existed and no model in the collection declares
+            // 0, so absent (-1) keeps normalizing. laguna declares 1 and a
+            // scale of 2.5, which is the pair that has to reach the mix.
+            if (mc.expert_w_norm != 0) {
+                f32 ksum = 0;
+                for (i32 s = 0; s < k; s++) ksum += wt[s];
+                const f32 kinv = ksum > 0 ? 1.0f / ksum : 0.0f;
+                for (i32 s = 0; s < k; s++) wt[s] *= kinv;
+            }
+            if (mc.expert_w_scale != 0.0f && mc.expert_w_scale != 1.0f)
+                for (i32 s = 0; s < k; s++) wt[s] *= mc.expert_w_scale;
         }
 
         // ---- grouped expert GEMMs ----------------------------------------

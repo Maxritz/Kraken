@@ -244,6 +244,21 @@ static void test_quant_geometry() {
     CHECK(dtype_supported(DType::IQ2_XXS) && dtype_supported(DType::IQ4_XS) &&
               dtype_supported(DType::NVFP4),
           "new quant formats are supported");
+    // Ternary (BitNet). Both are 256-value super-blocks with one fp16 scale;
+    // the ids 34/35 are ggml's on-disk GGML_TYPE_TQ1_0/TQ2_0 and must not move.
+    CHECK(static_cast<int>(DType::TQ1_0) == 34, "TQ1_0 keeps ggml type id 34");
+    CHECK(static_cast<int>(DType::TQ2_0) == 35, "TQ2_0 keeps ggml type id 35");
+    CHECK(dtype_block_size(DType::TQ1_0) == 256, "TQ1_0 block is 256");
+    CHECK(dtype_block_bytes(DType::TQ1_0) == 54, "TQ1_0 block is 54 bytes (1.6875 bpw)");
+    CHECK(dtype_block_size(DType::TQ2_0) == 256, "TQ2_0 block is 256");
+    CHECK(dtype_block_bytes(DType::TQ2_0) == 66, "TQ2_0 block is 66 bytes (2.0625 bpw)");
+    CHECK(dtype_row_bytes(DType::TQ2_0, 512) == 132, "TQ2_0 row of 512 is 132 bytes");
+    CHECK(dtype_row_aligned(DType::TQ2_0, 512), "TQ2_0 rows are 256-aligned");
+    CHECK(!dtype_row_aligned(DType::TQ2_0, 100), "TQ2_0 rejects a non-multiple row");
+    CHECK(dtype_supported(DType::TQ1_0) && dtype_supported(DType::TQ2_0),
+          "ternary formats are supported");
+    CHECK(std::strcmp(dtype_name(DType::TQ1_0), "TQ1_0") == 0, "TQ1_0 name");
+    CHECK(std::strcmp(dtype_name(DType::TQ2_0), "TQ2_0") == 0, "TQ2_0 name");
 }
 
 static void test_q4_0_layout() {
@@ -448,6 +463,122 @@ static void test_nvfp4_layout() {
     std::vector<f32> x(64, 1.0f);
     CHECK_NEAR(vec_dot(DType::NVFP4, blk, x.data(), 64), 20.0f, 1e-3,
                "NVFP4 vec_dot");
+}
+
+// TQ2_0 / TQ1_0 — the BitNet ternary formats.
+//
+// Both pack {-1, 0, +1} with one fp16 scale per 256 values, so they are the
+// only formats in this engine where a weight can be *exactly* zero. The
+// layout is planar in both cases: the codes for consecutive elements are not
+// consecutive bytes. That is what these tests pin down.
+//
+// The decoder was written from ggml's dequantize_row_tq*_0 and validated
+// against ggml's own *encoder* in tools/probe_tq.cpp (a round trip, exact for
+// both formats). The synthetic blocks here pin the same layouts from the byte
+// side, so a future edit that "simplifies" the packing fails here rather than
+// in a model run.
+static void test_tq2_0_layout() {
+    // 66 bytes: qs[64] then fp16 d. Codes 0/1/2 -> -1/0/+1.
+    //
+    // Byte (g*32 + m) holds, in shifts 0/2/4/6, the elements
+    // (g*128 + m), (g*128 + m + 32), (g*128 + m + 64), (g*128 + m + 96).
+    // So byte 0 carries elements 0/32/64/96 and byte 32 carries 128/160/192/224.
+    u8 blk[66];
+    std::memset(blk, 0, sizeof(blk));
+    const u16 one = fp32_to_fp16(1.0f);
+    blk[64] = static_cast<u8>(one & 0xFF);
+    blk[65] = static_cast<u8>(one >> 8);
+    // Byte 0: elem 0 (shift 0) = 2 -> +1, elem 32 (shift 2) = 1 -> 0,
+    //         elem 64 (shift 4) = 0 -> -1, elem 96 (shift 6) = 2 -> +1.
+    blk[0] = static_cast<u8>(2 | (1 << 2) | (0 << 4) | (2 << 6));
+    f32 out[256];
+    dequant_row(DType::TQ2_0, blk, out, 256);
+    CHECK_NEAR(out[0], 1.0f, 1e-6, "TQ2_0 code 2 is +1");
+    CHECK_NEAR(out[32], 0.0f, 1e-6, "TQ2_0 code 1 is 0");
+    CHECK_NEAR(out[64], -1.0f, 1e-6, "TQ2_0 code 0 is -1");
+    CHECK_NEAR(out[96], 1.0f, 1e-6, "TQ2_0 fourth plane of byte 0");
+    // Every untouched byte is 0x00 -> all four of its elements -1, and the
+    // second 128-element group (byte 32 onward) is entirely untouched.
+    CHECK_NEAR(out[1], -1.0f, 1e-6, "TQ2_0 untouched byte is -1");
+    CHECK_NEAR(out[128], -1.0f, 1e-6, "TQ2_0 untouched second group is -1");
+    // An all-zero weight block is the 0x55 pattern: the property the MoE
+    // zero-block skip depends on.
+    std::memset(blk, 0x55, 64);
+    dequant_row(DType::TQ2_0, blk, out, 256);
+    int nz = 0;
+    for (int i = 0; i < 256; i++)
+        if (out[i] != 0.0f) nz++;
+    CHECK(nz == 0, "TQ2_0 0x55 block decodes to all zeros");
+    std::vector<f32> x(256, 1.0f);
+    CHECK_NEAR(vec_dot(DType::TQ2_0, blk, x.data(), 256), 0.0f, 1e-6,
+               "TQ2_0 all-zero vec_dot is zero");
+}
+
+static void test_tq1_0_layout() {
+    // 54 bytes: qs[48] (5 trits/byte, base-3) + qh[4] (4 trits/byte) + fp16 d.
+    // The base-3 code is scaled by 256/243 and decoded with a multiply high;
+    // the 8-bit wrap in ggml's `uint8_t q = x.qs[j+m] * pow3[n]` is part of the
+    // format (see quant.cpp).
+    //
+    // A trit of +1 has the base-3 code 2, so five of them pack to
+    // 2*(81+27+9+3+1) = 242 -> ceil(242*256/243) = 255. The qh path packs four
+    // trits and then shifts one place further up (q *= 3), giving
+    // 242*3 = 726 -> ceil(726*256/243) = 765, which does not fit a byte and
+    // truncates to 253. That truncation is in ggml's encoder and is why the
+    // all-+1 tail is 253 rather than 255.
+    u8 blk[54];
+    const u16 one = fp32_to_fp16(1.0f);
+    std::memset(blk, 255, 48);
+    std::memset(blk + 48, 253, 4);
+    blk[52] = static_cast<u8>(one & 0xFF);
+    blk[53] = static_cast<u8>(one >> 8);
+    f32 out[256];
+    dequant_row(DType::TQ1_0, blk, out, 256);
+    int wrong = 0;
+    for (int i = 0; i < 256; i++)
+        if (std::fabs(out[i] - 1.0f) > 1e-6f) wrong++;
+    CHECK(wrong == 0, "TQ1_0 all-plus-1 block decodes to 256 +1s");
+    CHECK_NEAR(out[255], 1.0f, 1e-6, "TQ1_0 last element comes from qh");
+
+    // The all-zero weight block. A trit of 0 has base-3 code 1, so a run of
+    // five zeros is 1*3^4+1*3^3+1*3^2+1*3+1 = 121, stored as
+    // ceil(121*256/243) = 128 in qs; qh shifts one place further, giving
+    // 1*3^4+1*3^3+1*3^2+1*3 = 120 -> ceil(120*256/243) = 127.
+    std::memset(blk, 128, 48);
+    std::memset(blk + 48, 127, 4);
+    dequant_row(DType::TQ1_0, blk, out, 256);
+    int nz = 0;
+    for (int i = 0; i < 256; i++)
+        if (out[i] != 0.0f) nz++;
+    CHECK(nz == 0, "TQ1_0 zero block decodes to all zeros");
+
+    // Scale: d = 0.5 halves the reconstruction. This must run on the all-+1
+    // block -- scaling the zero block above would test nothing but 0 * 0.5.
+    std::memset(blk, 255, 48);
+    std::memset(blk + 48, 253, 4);
+    const u16 half = fp32_to_fp16(0.5f);
+    blk[52] = static_cast<u8>(half & 0xFF);
+    blk[53] = static_cast<u8>(half >> 8);
+    dequant_row(DType::TQ1_0, blk, out, 256);
+    CHECK_NEAR(out[0], 0.5f, 1e-6, "TQ1_0 d scales the trit");
+    CHECK_NEAR(out[255], 0.5f, 1e-6, "TQ1_0 d scales the qh tail");
+
+    std::vector<f32> x(256, 1.0f);
+    CHECK_NEAR(vec_dot(DType::TQ1_0, blk, x.data(), 256), 128.0f, 1e-3,
+               "TQ1_0 vec_dot sums the scaled trits");
+
+    // The zero block is what makes ternary interesting for MoE paging, so the
+    // property is asserted in the form the paging policy will use it: a
+    // decoded weight is *exactly zero, not merely small.
+    std::memset(blk, 128, 48);
+    std::memset(blk + 48, 127, 4);
+    blk[52] = static_cast<u8>(one & 0xFF);
+    blk[53] = static_cast<u8>(one >> 8);
+    dequant_row(DType::TQ1_0, blk, out, 256);
+    int exactly_zero = 0;
+    for (int i = 0; i < 256; i++)
+        if (out[i] == 0.0f) exactly_zero++;
+    CHECK(exactly_zero == 256, "TQ1_0 zero block is exactly zero, not merely small");
 }
 
 static void test_vec_dot() {
@@ -1474,7 +1605,15 @@ static void test_load_verdict() {
         made.push_back(path);
     }
 
-    // A refused arch: the reason reaches both the verdict and the loader.
+    // laguna is the supported-arch-that-used-to-be-refused case, and it is the
+    // interesting one because its schema is read: per-layer head counts, the
+    // per-head gate tensor, the selection bias and the YaRN table all load. The
+    // fixture carries the gate tensor, which the gap map exempts for this arch
+    // only, so the verdict must accept it and NOT report "an attention output
+    // gate ... which this engine does not implement" -- naming a
+    // successfully-read tensor as unimplemented is the failure this guards.
+    // (The engine side that consumes each piece is checked by the oracle and by
+    // a real laguna file; this fixture has no geometry to load.)
     {
         const std::string path =
             build_verdict_fixture("laguna", "laguna", "blk.0.attn_gate.weight", 0, 0);
@@ -1483,7 +1622,34 @@ static void test_load_verdict() {
         std::string err;
         CHECK(g.load(path, &err), "the fixture loads");
         const ModelVerdict v = assess_model(g);
-        CHECK(!v.runnable, "laguna is refused");
+        CHECK(v.runnable && v.known && v.arch == "laguna",
+              "laguna is supported");
+        CHECK(v.blockers.empty(), "nothing blocks it");
+        bool tensor_reason = false;
+        for (const std::string &b : v.blockers)
+            if (b.find("does not implement") != std::string::npos) tensor_reason = true;
+        CHECK(!tensor_reason, "and the gate tensor is not called unimplemented");
+        Model m;
+        std::string lerr;
+        CHECK(!m.load(*cpu, path, &lerr), "the loader still needs geometry");
+        CHECK(lerr.find("geometry") != std::string::npos &&
+                  lerr.find("not supported") == std::string::npos,
+              "and the failure is the schema, not the architecture");
+        made.push_back(path);
+    }
+
+    // An arch refusal and a gap tensor are *independent* causes, and both have
+    // to be reported: this file would be refused for its tensor alone even if
+    // its arch were supported.
+    {
+        const std::string path = build_verdict_fixture(
+            "muse-glimmer", "muse-glimmer", "blk.0.attn_gate.weight", 0, 0);
+        CHECK(!path.empty(), "wrote a muse-glimmer fixture");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "the fixture loads");
+        const ModelVerdict v = assess_model(g);
+        CHECK(!v.runnable, "muse-glimmer is refused");
         CHECK(v.blockers.size() >= 2,
               "its arch and its gate tensor are separate causes");
         bool arch_reason = false, gate_reason = false;
@@ -1495,9 +1661,8 @@ static void test_load_verdict() {
         Model m;
         std::string lerr;
         CHECK(!m.load(*cpu, path, &lerr), "the loader refuses the file");
-        CHECK(lerr.find("laguna") != std::string::npos &&
-                  lerr.find("attention output gate") != std::string::npos,
-              "and its error names the arch and the missing piece");
+        CHECK(lerr.find("muse-glimmer") != std::string::npos,
+              "and its error names the arch");
         made.push_back(path);
     }
 
@@ -1872,8 +2037,8 @@ public:
                             scratch, cand_cap, count_out);
     }
     void rope(void *q, void *k, i64 nh, i64 nk, i64 hd, i64 nt, i64 p0,
-              const f32 *iv, f32 s, f32 f) override {
-        inner_->rope(q, k, nh, nk, hd, nt, p0, iv, s, f);
+              const f32 *iv, f32 s, f32 f, bool nx) override {
+        inner_->rope(q, k, nh, nk, hd, nt, p0, iv, s, f, nx);
     }
     void kv_append(void *kc, void *vc, const void *k, const void *v,
                    const AttnDesc &d) override {
@@ -2423,6 +2588,38 @@ static void test_logit_softcap() {
     std::remove(path.c_str());
 }
 
+// RoPE's pair convention: llama.cpp rotates adjacent channels (2i, 2i+1) for
+// the llama family and channel j with j + n_rot/2 for the NeoX family, and a
+// file's q/k rows are stored in whichever its architecture uses. The two are
+// indistinguishable from the output statistics alone — both stay finite and
+// in range, only the attention scores differ — so this pins the wiring with a
+// row that has exactly one live channel: the partner channel it moves into
+// names the convention.
+static void test_rope_pair_convention() {
+    Backend *cpu = make_cpu_backend();
+    const i64 hd = 8;
+    const i64 rot = hd / 2; // frac 1.0 rotates every pair
+    const f32 iv[4] = {1.0f, 0.5f, 0.25f, 0.125f};
+    f32 q[8], k[8];
+    const f32 cs = std::cos(iv[0]), sn = std::sin(iv[0]); // pos 1, pair 0
+    for (int neox = 0; neox <= 1; neox++) {
+        std::memset(q, 0, sizeof(q));
+        std::memset(k, 0, sizeof(k));
+        q[0] = 1.0f;
+        k[0] = 1.0f;
+        cpu->rope(q, k, 1, 1, hd, 1, 1, iv, 1.0f, 1.0f, neox != 0);
+        const i64 partner = neox ? rot : 1;
+        CHECK_NEAR(q[0], cs, 1e-6, "rope leaves the pair's first channel on the cos");
+        CHECK_NEAR(q[partner], sn, 1e-6,
+                   neox ? "neox rope pairs channel j with j + rot"
+                        : "norm rope pairs adjacent channels");
+        CHECK_NEAR(k[partner], sn, 1e-6, "rope pairs k the same way as q");
+        CHECK_NEAR(q[neox ? 1 : rot], 0.0f, 1e-6,
+                   "the partner of the other convention is not rotated");
+    }
+    delete cpu;
+}
+
 static void test_end_to_end_cpu() {
     Backend *cpu = make_cpu_backend();
     Engine engine;
@@ -2880,6 +3077,8 @@ int main() {
     test_iq2_xxs_layout();
     test_iq4_xs_layout();
     test_nvfp4_layout();
+    test_tq2_0_layout();
+    test_tq1_0_layout();
     test_vec_dot();
     test_arch_table();
     test_arch_tensor_maps();
@@ -2888,6 +3087,7 @@ int main() {
     test_tokenizer_spm_and_bpe();
     test_sampler_determinism();
     test_logit_softcap();
+    test_rope_pair_convention();
     test_end_to_end_cpu();
     test_moe_schema_and_laziness();
     test_moe_matches_dense_twin();

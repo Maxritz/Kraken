@@ -8,6 +8,153 @@ Status of each area is in [docs/STATUS.md](STATUS.md); this file is the
 
 ---
 
+## Laguna (poolside) — runs end to end; what is left is verification and paging
+
+Read off `G:/More-models/Laguna-S-2.1-UD-Q4_K_M-000{1,2,3}-of-00003.gguf` and
+cross-checked against llama.cpp's `src/models/laguna.cpp`, which is the
+reference for every piece below. Laguna-S is 48 layers, 3072 embedding,
+262144 context, 256 experts top-10 of 1024-wide, one shared expert.
+
+**Runs now.** The engine side landed: per-layer query width, the softplus
+per-head output gate, the sigmoid + selection-bias router with the
+sum-norm and 2.5 scale, and the 512-token window in all four attention
+kernels (`AttnDesc::window`). The arch entry is `Yes`. `laguna-xs2` answers
+`The capital of France is Paris.` on the device, matching llama.cpp, and
+`Laguna-S-2.1` parses as an 814-tensor shard set.
+
+The last blocker was not a laguna feature at all: **RoPE's pair convention
+was wrong engine-wide** (adjacent channels everywhere, while the NeoX family
+— qwen2/qwen3/qwen3moe/gemma/laguna — pairs channel `j` with `j + n_rot/2`).
+The write-up is [STATUS.md](STATUS.md) §10d; the fix is `ArchSpec::rope_neox`
+plus `KRK_ROPE_NEOX=0/1`.
+
+**Landed.** The architecture is out of the gap map (`attn_gate`/`exp_probs_b`
+are exempted for `laguna`), the schema is read, and `laguna` refuses with a
+reason that names the real remainder instead of a flat "not implemented":
+
+- `attention.head_count` is an **array** — 48 on the full-attention layers and
+  72 on the windowed ones, which is why `attn_q` is `[3072, 6144]` on one layer
+  kind and `[3072, 9216]` on the other, and why the loader no longer requires
+  `n_embd % n_head == 0`. `Model::n_head_at(l)` / `q_dim_at(l)` give the
+  per-layer width; `q_dim()` is the maximum, which is what a shared workspace
+  sizes to.
+- `rope.dimension_count` is now read for **every** arch, not only recurrent
+  ones. It was a latent bug: a non-recurrent partial-rotary checkpoint kept its
+  key and the table ignored it. Default is head_dim, the same default llama.cpp
+  uses.
+- YaRN is folded into `inv_freq` at load time, matching ggml's `rope_yarn` +
+  `rope_yarn_corr_dims` exactly: extrapolated frequency fading into interpolated
+  over the pair range `[low, high]` with `low`/`high` computed in dim units and
+  compared against pair indices, exactly as both references do. It also resets
+  `rope_scale` to 1.0, because the 1/factor is now in the frequency and the
+  kernel divides the *position* by `rope_scale`. The magnitude part of YaRN is
+  folded away rather than implemented: the reference driver pre-divides
+  `yarn_attn_factor` by `1 + 0.1*ln(factor)`, so a checkpoint that asks for 1.0
+  cancels and the attention scale is plain `1/sqrt(head_dim)`.
+- The hybrid geometry (`attention.sliding_window`, `rope.freq_base_swa`,
+  `rope.dimension_count_swa`) is parsed; the windowed layers get their own
+  plain-RoPE table at base 10000 over all 128 dims, which is what llama.cpp
+  passes them (`ext_factor` 0).
+- `attn_gate.weight`, `ffn_exp_probs_b.bias` and the `expert_weights_*` /
+  `expert_gating_func` keys are loaded and carried on `LayerWeights` /
+  `ModelConfig`, unused until the engine side lands.
+
+**Remaining, in the order they have to happen.**
+
+1. Engine, per-layer geometry. The layer loop uses `mc.n_head` and `q_dim_` for
+   the query width; both have to become `model_.n_head_at(l)` / `q_dim_at(l)`,
+   with `ws_q_`, `ws_attn_` and `ws_agate_` sized to the maximum. The two rope
+   call sites take `inv_freq_at(l)` / `rope_frac_at(l)`.
+2. The output gate. `ws_agate_` gets a `gemm` from `ws_xn_` (the attention-norm
+   output, which is the same hidden state q/k/v read — not the attention
+   result), then `softplus_act`, then a **per-head broadcast** multiply into
+   `ws_attn_` before `wo`. The broadcast is the one new backend op: it does not
+   exist in either backend today, and `mul_act` is elementwise and cannot stand
+   in for it.
+3. The router. `moe_ffn` is softmax over all experts then top-k, then an
+   unconditional sum-normalize. Laguna needs sigmoid, a per-expert bias added to
+   the *probabilities* for selection but **not** to the weights, and the
+   normalize/scale pair. Keep the unconditional normalize as the default when
+   `expert_weights_norm` is absent, or every Qwen MoE changes behaviour.
+4. Sliding window. `AttnDesc` needs the bound and all four HIP attention paths
+   need it: `attention_kernel` (mask the tile-start keys below the bound and
+   start the tile loop at the bound's tile), `attention_qtile_kernel` (already
+   wrong, leave it out), `attention_decode_split_kernel` (clamp `j0`), and the
+   CPU reference. The subtlety is the online softmax: starting the first tile at
+   a tile boundary *below* the bound is what keeps `tmax` finite, since a tile
+   with every key masked gives `exp(0) = 1`. Gate `attn_fused_chain` off when a
+   bound is set.
+5. Then flip `{"laguna", ...}` to `ArchSupport::Yes` with an empty `why`, and
+   check coherence on a real laguna file. There is no small laguna in the
+   collection: `laguna-xs2-Q4_K_M.gguf` is 18.9 GiB and Laguna-S is a 3-shard
+   73 GB set, so this is the slow step.
+
+The `dflash` draft shard of the same family (`laguna-s-2.1-DFlash-Q4_K_M.gguf`)
+is refused as a draft; `attn_gate` still blocks it there, which is right, since
+a draft file is not a target.
+
+---
+
+**Left on this path.**
+
+- `laguna-xs2` is *not* a clean coherence entry: device and CPU pick the same
+  first token, then part company at a 0.35-logit near-tie (see §10d). It is
+  fp16-vs-f32 on a small chaotic model, and the gate's size cap now excludes
+  it by default rather than hanging the machine on a scalar pass.
+- `Laguna-S-2.1` is a **3-shard split set**, so the `read()`-based weight pull
+  is inactive there (STATUS.md §10a) and every tensor falls back to a cold
+  mapping. Until the per-shard pull table exists, Laguna-S is the worst case
+  for the paging work below, not a test of it.
+- The expert tier has no host half yet: `--expert-l2-mb` defaults to 0, so a
+  miss re-reads from the file instead of a pinned host copy.
+
+## Closed / negative results
+
+### Block-level zero skipping for MoE expert paging — MEASURED, NO YIELD
+
+The idea: ternary (and low-bit) expert weights are mostly zero, so an all-zero
+quant block could be skipped without reading it, reducing page-in traffic.
+
+Measured with `tools/probe_zero_blocks.cpp` on the real files named in the
+request, decoding every block with the engine's own reference decoder and
+testing for all values exactly zero:
+
+| file | dtype | blocks scanned | all-zero blocks |
+|---|---|---:|---:|
+| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | Q4_K | 4,129,678 | **0 (0.000%)** |
+| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | Q6_K | 656,519 | **0 (0.000%)** |
+| probe_TQ2_0 (BitNet-style) | TQ2_0 | 408,576 | **0 (0.000%)** |
+
+Zeros are plentiful per *element* (0.01% Q4_K, 2.68% Q6_K, 88-98% TQ2_0) but
+never fill a whole block at 256- or 32-value granularity. The TQ2_0 case is
+decisive: ~90% of its weights are zero and not one of its 408,576 blocks is
+entirely zero, because a 256-value block needs all 256 values zero at once.
+
+**Not implemented, deliberately.** The policy would add a per-block test to
+every page-in and save zero bytes. Do not re-attempt this shape of the idea.
+Element-wise sparsity is real but needs a kernel that skips zero *work* (e.g.
+a presence-bitmap representation), which is a different feature.
+
+### The RoPE pair convention — FIXED 2026-10-04 (was silently wrong for six archs)
+
+The engine paired adjacent head channels for every architecture. llama.cpp's
+`llm_arch_rope` table says that is the llama family only; qwen2, qwen3,
+qwen3moe, qwen3vl, the gemma family and laguna use the NeoX pairing (channel
+`j` with `j + n_rot/2`). Both conventions are finite and in range, and only
+the relative rotation between a query and a key reaches the score, so the
+wrong one produced fluent-looking text instead of an error — which is why it
+survived every self-consistency check (device and CPU were wrong together).
+It surfaced by comparing against llama.cpp, not against ourselves.
+Details and evidence: [STATUS.md](STATUS.md) §10d.
+
+### TQ1_0 / TQ2_0 — DONE (was an open refusal)
+
+Both ternary formats are now decoded on host and device; `probe_TQ2_0.gguf`
+loads and runs. See [STATUS.md](STATUS.md) §10b for the validation and the two
+packing bugs the round-trip probe caught.
+
+---
+
 ## P0 — correctness
 
 ### Spark_one.Q6_K: one prompt of five diverges from the CPU reference — NO DEFECT FOUND

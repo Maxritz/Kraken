@@ -69,6 +69,12 @@ struct AttnDesc {
     i64 pos_stride = 0;    // elements between positions in the KV cache
     f32 scale = 1.0f;      // 1/sqrt(hd)
     bool causal = true;
+    // Sliding-window bound: when > 0 a query attends only to the `window`
+    // most recent keys, i.e. key j is visible when j >= n_keys - window.
+    // 0 means no bound, the whole (causal) prefix. laguna's hybrid stacks
+    // need this: the windowed layers carry a 512-key window while the full
+    // layers see everything, so the bound is per layer, not per model.
+    i64 window = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -95,7 +101,28 @@ public:
     // a 12 GiB VRAM problem for a host-RAM one. The default is ordinary aligned
     // host memory, which is all the CPU reference backend needs.
     virtual void *alloc_host(size_t bytes) { return host_alloc(bytes ? bytes : 1); }
+    // Live device memory, when the backend can ask the driver. caps().vram_free
+    // is a fixed snapshot taken at enumeration -- on the HIP backend it is
+    // total * 0.9, not free at all -- so anything that sizes itself against
+    // free VRAM (the expert budget does) has to ask, or it over-commits a
+    // card something else is already using.
+    virtual size_t device_free_bytes() const { return caps().vram_free; }
+    virtual size_t device_total_bytes() const { return caps().vram_total; }
+
     virtual void release_host(void *p) { host_free(p); }
+
+    // Small-object device allocations, pooled by the expert cache. A
+    // promotion is a handful of ~1-2 MiB slices and the default
+    // alloc/release pair is hipMalloc/hipFree, which are
+    // device-synchronising: measured on the prefill of a 40-layer MoE, the
+    // expert cache issued 13198 uploads and 2594 ms of device time went into
+    // them against 1330 ms of device idle. Backends without a pool just
+    // forward to alloc/release.
+    virtual void *alloc_pooled(size_t bytes) { return alloc(bytes); }
+    virtual void release_pooled(void *p, size_t bytes) {
+        (void)bytes;
+        if (p) release(p);
+    }
     virtual void upload(void *dst, const void *src, size_t bytes, size_t off = 0) = 0;
     // Direct copy with no staging side effects. The HIP backend's read()-based
     // weight path calls this per chunk; a backend without that path can simply
@@ -179,9 +206,18 @@ public:
         return false;
     }
 
-    // NeoX-style rotary embedding applied in place to q and k.
+    // Rotary embedding applied in place to q and k. `inv_freq` is the
+    // rope_dim/2 frequency table and `frac` the rotated fraction of the
+    // head, so rot = hd*frac/2 pairs are rotated and the rest are copied
+    // through. `neox` picks which channels a pair is made of: false pairs
+    // (2i, 2i+1) — llama.cpp's "norm" layout — and true pairs channel i
+    // with i + rot, the half-split layout of the NeoX family. It is a
+    // property of the file's architecture (ModelConfig::rope_neox) and it
+    // has to reach the kernel: only the relative rotation between a query
+    // and a key reaches the score, so the wrong pairing stays finite.
     virtual void rope(void *q, void *k, i64 n_head, i64 n_kv, i64 hd, i64 n_tok,
-                      i64 pos0, const f32 *inv_freq, f32 scale, f32 frac) = 0;
+                      i64 pos0, const f32 *inv_freq, f32 scale, f32 frac,
+                      bool neox) = 0;
 
     // Per-head RMSNorm on q/k (Qwen3, Gemma3). No-op when w == nullptr.
     virtual void qk_norm(void *q, void *k, const f32 *wq, const f32 *wk,
@@ -208,8 +244,8 @@ public:
     // scaling) and rope_frac is the rotation fraction. Returns
     // true when the fused chain ran; anything it cannot express
     // (multi-token rows, head widths the packed lane slice cannot
-    // cover) falls back to the separate rope() + kv_append() +
-    // attention() calls the engine then runs instead.
+    // cover, a NeoX rope pairing) falls back to the separate rope() +
+    // kv_append() + attention() calls the engine then runs instead.
     virtual bool attn_fused_chain(void *out, void *q, void *kcache,
                                     void *vcache, const void *k,
                                     const void *v, const AttnDesc &d,
@@ -295,6 +331,18 @@ public:
         (void)x; (void)alpha; (void)n_tok; (void)width; (void)stride;
     }
     virtual void mul_act(void *a, const void *b, i64 n) { (void)a; (void)b; (void)n; }
+
+    // Per-head broadcast product (laguna's attention output gate):
+    //   x[t, h, i] *= g[t, h]     for i in [0, hd)
+    // `x` is [n_tok, n_head*hd] and `g` is a dense [n_tok, n_head] row-major
+    // buffer, so the two have different lengths: mul_act() is elementwise and
+    // cannot express this. Applied to the attention result before the output
+    // projection. The Qwen3.5 output gate is per *element* and stays on
+    // mul_act(); this is the per-head form.
+    virtual void mul_head_broadcast(void *x, const void *g, i64 n_tok, i64 n_head,
+                                    i64 hd) {
+        (void)x; (void)g; (void)n_tok; (void)n_head; (void)hd;
+    }
 
     // Per-column (per-head) vectors broadcast down the rows:
     //   x[i, j] += bias[j]     and    x[i, j] *= col[j]

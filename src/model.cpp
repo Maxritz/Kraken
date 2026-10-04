@@ -101,6 +101,16 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.n_embd = static_cast<i32>(gguf_.get_i64(key(".embedding_length"), 0));
     cfg_.n_ff = static_cast<i32>(gguf_.get_i64(key(".feed_forward_length"), 0));
     cfg_.n_head = static_cast<i32>(gguf_.get_i64(key(".attention.head_count"), 0));
+    // A hybrid arch stores the head count per layer (laguna is 48 heads on the
+    // full-attention layers and 72 on the windowed ones). Keep the whole vector
+    // and let `n_head` be its maximum, which is the width the shared query
+    // workspace has to hold; the layer's own width is n_head_at().
+    if (const std::vector<i32> *hc =
+            gguf_.get_i32_array(key(".attention.head_count"))) {
+        cfg_.n_head_layer = *hc;
+        for (i32 v : *hc)
+            if (v > cfg_.n_head) cfg_.n_head = v;
+    }
     cfg_.n_head_kv =
         static_cast<i32>(gguf_.get_i64(key(".attention.head_count_kv"), cfg_.n_head));
     cfg_.n_ctx_train =
@@ -121,6 +131,69 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // linear factor is a good first-order approximation and is what the
         // engine applies to inv_freq at load time.
     }
+    // ---- rotary: how many dims rotate, and YaRN -------------------------
+    // `rope.dimension_count` is the number of head dims the rotation covers and
+    // may be narrower than head_dim (partial rotary). llama.cpp reads it the
+    // same way — default to the full head, let the key override — so a file
+    // that declares it means the same thing to both engines.
+    cfg_.rope_dim = static_cast<i32>(gguf_.get_i64(key(".rope.dimension_count"), 0));
+    if (cfg_.rope_dim <= 0 || (cfg_.head_dim > 0 && cfg_.rope_dim > cfg_.head_dim))
+        cfg_.rope_dim = cfg_.head_dim;
+    if (cfg_.head_dim > 0)
+        cfg_.rope_frac = static_cast<f32>(cfg_.rope_dim) /
+                         static_cast<f32>(cfg_.head_dim);
+    cfg_.rope_yarn = gguf_.get_str(key(".rope.scaling.type"), "") == "yarn";
+
+    // ---- hybrid full / sliding-window attention (laguna) -----------------
+    // The windowed layers of a hybrid stack carry their own window, their own
+    // rotated width and their own rotary table; the full layers keep the keys
+    // above. laguna-S alternates full / window x3 — period 4 with the full
+    // layer first, which is also what llama.cpp's laguna loader hard-codes.
+    cfg_.swa_window = 0;
+    if (const i64 win = gguf_.get_i64(key(".attention.sliding_window"), 0); win > 0) {
+        cfg_.swa_window = static_cast<i32>(win);
+        cfg_.swa_period = 4;
+        cfg_.rope_base_swa =
+            static_cast<f32>(gguf_.get_f64(key(".rope.freq_base_swa"), 10000.0));
+        const i32 rd = static_cast<i32>(
+            gguf_.get_i64(key(".rope.dimension_count_swa"), cfg_.rope_dim));
+        cfg_.rope_dim_swa =
+            (rd > 0 && (cfg_.head_dim <= 0 || rd <= cfg_.head_dim)) ? rd
+                                                                   : cfg_.head_dim;
+        cfg_.rope_frac_swa = cfg_.head_dim > 0
+                                 ? static_cast<f32>(cfg_.rope_dim_swa) /
+                                       static_cast<f32>(cfg_.head_dim)
+                                 : 1.0f;
+    }
+
+    // The attention output gate is a property of the schema, not of a tensor:
+    // the loader has to know to look for it before the layer loop starts.
+    cfg_.attn_gate = aspec.attn_gate;
+    // RoPE's pair convention is a property of the export, so it comes from
+    // the arch table rather than from the tensors. KRK_ROPE_NEOX=0/1 forces
+    // it, for bisecting a file that disagrees with llama.cpp: with the wrong
+    // pairing a model still runs, and still emits fluent-looking text.
+    cfg_.rope_neox = aspec.rope_neox;
+    if (const char *rn = std::getenv("KRK_ROPE_NEOX"))
+        cfg_.rope_neox = rn[0] == '1';
+
+    // ---- router shape ----------------------------------------------------
+    // 1 is softmax (the Qwen convention) and 2 is sigmoid (laguna, and the HF
+    // default when the key is absent). The bias tensor itself is found per
+    // layer; this records only the activation.
+    cfg_.n_dense_lead =
+        static_cast<i32>(gguf_.get_i64(key(".leading_dense_block_count"), 0));
+    cfg_.router_sigmoid =
+        static_cast<i32>(gguf_.get_i64(key(".expert_gating_func"), 1)) == 2;
+    // Tri-state: -1 keeps the engine's legacy always-normalize for files that
+    // do not declare it (see ModelConfig::expert_w_norm).
+    cfg_.expert_w_norm =
+        gguf_.find(key(".expert_weights_norm")) != nullptr
+            ? (gguf_.get_bool(key(".expert_weights_norm")) ? 1 : 0)
+            : -1;
+    cfg_.expert_w_scale =
+        static_cast<f32>(gguf_.get_f64(key(".expert_weights_scale"), 1.0));
+
     cfg_.tied_embeddings = (gguf_.tensor("output.weight") == nullptr);
 
     // ---- Mixture-of-Experts geometry -------------------------------------
@@ -200,13 +273,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                        "does not implement";
             return false;
         }
-        // Partial rotary: the converter records how many dims are rotated.
-        const i32 rope_dim =
-            static_cast<i32>(gguf_.get_i64(key(".rope.dimension_count"), 0));
-        cfg_.rope_dim = rope_dim > 0 ? std::min(rope_dim, cfg_.head_dim) : 0;
-        if (cfg_.rope_dim > 0 && cfg_.head_dim > 0)
-            cfg_.rope_frac = static_cast<f32>(cfg_.rope_dim) /
-                             static_cast<f32>(cfg_.head_dim);
+        // Interleaved multi-rotary sections (Phi). `rope.dimension_count`
+        // itself is read once above, for every arch rather than only this one.
         if (const std::vector<i32> *sec = gguf_.get_i32_array(key(".rope.dimension_sections"))) {
             for (size_t i = 0; i < sec->size() && i < 4; i++)
                 cfg_.rope_sections[i] = (*sec)[i];
@@ -217,7 +285,13 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         if (err) *err = "GGUF metadata is missing core geometry (arch='" + a + "')";
         return false;
     }
-    if (cfg_.n_embd % cfg_.n_head != 0) {
+    // A per-layer head count makes this identity meaningless: laguna's
+    // windowed layers carry 72 heads of 128 dims over a 3072-wide embedding,
+    // which is not a whole number of heads' worth of embedding at all. head_dim
+    // is declared in the file (`attention.key_length`) and is what the loader
+    // and the kernels actually use, so only check the identity when there is a
+    // single head count for it to hold for.
+    if (cfg_.n_head_layer.empty() && cfg_.n_embd % cfg_.n_head != 0) {
         if (err) *err = "n_embd is not divisible by head count";
         return false;
     }
@@ -430,6 +504,17 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     lp.mark("token_embd + output head");
 
     // ---- per-layer weights ------------------------------------------------
+    // A layer's own head count. The model maximum (`cfg_.n_head`) is only what
+    // the shared query workspace is sized against; every per-layer check below
+    // has to use this.
+    const auto head_at = [&](i32 layer) -> i64 {
+        if (cfg_.n_head_layer.empty())
+            return static_cast<i64>(cfg_.n_head);
+        if (layer < 0 || layer >= static_cast<i32>(cfg_.n_head_layer.size()))
+            return static_cast<i64>(cfg_.n_head);
+        return static_cast<i64>(cfg_.n_head_layer[static_cast<size_t>(layer)]);
+    };
+
     layers_.resize(static_cast<size_t>(cfg_.n_layer));
     for (i32 l = 0; l < cfg_.n_layer; l++) {
         LayerWeights &L = layers_[static_cast<size_t>(l)];
@@ -487,6 +572,11 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             L.wk = need(blk_key("blk.%d.attn_k.weight", l));
             L.wv = need(blk_key("blk.%d.attn_v.weight", l));
             L.wo = need(blk_key("blk.%d.attn_output.weight", l));
+            // laguna's per-head output gate is a projection of its own off the
+            // same hidden state q/k/v read — not a slice of attn_q — so it is a
+            // weight like any other and is uploaded with them.
+            if (cfg_.attn_gate)
+                L.wattn_gate = need(blk_key("blk.%d.attn_gate.weight", l));
         }
 
         // A layer is MoE when it carries routed-expert tensors. This is decided
@@ -503,6 +593,11 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // only *described* here — nothing is uploaded, which is what keeps
             // a 235B-A22B model from needing 235B of VRAM at load time.
             L.router = need(blk_key("blk.%d.ffn_gate_inp.weight", l));
+            // A per-expert selection bias (laguna): added to the router's
+            // *probabilities* before the top-k, and deliberately not to the
+            // weights the selected experts are mixed with.
+            L.router_bias = upload_f32(blk_key("blk.%d.ffn_exp_probs_b.bias", l));
+            if (L.router_bias) cfg_.router_bias = true;
             const GgufTensor *g = gguf_.tensor(exps_gate);
             const GgufTensor *up = gguf_.tensor(blk_key("blk.%d.ffn_up_exps.weight", l));
             const GgufTensor *dn =
@@ -586,12 +681,27 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         } else {
             // Qwen3.5's attending layers pack a per-head output gate into the
             // query projection, so its row count is twice the head width.
-            const i64 expect_q = aspec.q_output_gate ? 2 * q_dim : q_dim;
+            // The head count is per *layer* on a hybrid stack (laguna runs 48
+            // heads on its full layers and 72 on its windowed ones), so the
+            // expected width is this layer's own -- comparing against the
+            // model maximum would reject every layer that is not the widest.
+            const i64 lq_dim = head_at(l) * cfg_.head_dim;
+            const i64 expect_q = aspec.q_output_gate ? 2 * lq_dim : lq_dim;
             if (L.wq.n_out != expect_q || L.wk.n_out != kv_dim ||
-                L.wv.n_out != kv_dim || L.wo.n_in != q_dim) {
+                L.wv.n_out != kv_dim || L.wo.n_in != lq_dim) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
                            " attention tensors disagree with the declared head geometry";
+                return false;
+            }
+            // laguna's output gate is one scalar per query head, projected
+            // from the embedding, so its shape is a second, independent check
+            // of the head count this layer is supposed to have.
+            if (cfg_.attn_gate &&
+                (L.wattn_gate.n_out != head_at(l) || L.wattn_gate.n_in != cfg_.n_embd)) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " attention output gate disagrees with the head count";
                 return false;
             }
         }
@@ -636,16 +746,97 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     lp.mark("per-layer loop (all weights)");
 
     // ---- rotary inverse frequencies (host) --------------------------------
-    // Partial rotary: Qwen3.5 rotates only the first `rope_dim` dims of each
+    // Partial rotary: a layer rotates only the first `rope_dim` dims of each
     // head and leaves the tail untouched, so the table is rope_dim/2 long and
     // the engine passes the fraction to the rotation op.
-    const i64 rope_dim = cfg_.rope_dim > 0 ? cfg_.rope_dim : cfg_.head_dim;
-    const i64 half = rope_dim / 2;
-    inv_freq_.resize(static_cast<size_t>(half));
-    for (i64 i = 0; i < half; i++) {
-        const f32 exponent = static_cast<f32>(2 * i) / static_cast<f32>(rope_dim);
-        inv_freq_[static_cast<size_t>(i)] = std::pow(cfg_.rope_base, -exponent);
+    //
+    // YaRN is folded in *here*, into the frequency itself. Its correction is a
+    // per-dimension weight on the frequency and not a function of position, so
+    // nothing about it has to run per token; doing it once also leaves the
+    // kernel exactly what it was (a position times a frequency) and keeps the
+    // position-scaling path free for the linear scaling it already implements.
+    //
+    // The magnitude half of YaRN is deliberately left out: its mscale is
+    // 1 + 0.1*ln(factor) applied to cos/sin, and the reference driver
+    // (llama.cpp's llama_context) pre-divides the checkpoint's
+    // `yarn_attn_factor` by exactly that before handing it to the rope op. For
+    // a checkpoint whose yarn_attn_factor is 1 the two cancel and the attention
+    // scale is plain 1/sqrt(head_dim), which is what rope_attn_scale staying at
+    // 1.0 means; a checkpoint that asks for something else would need the
+    // mscale folded into the attention scale instead.
+    //
+    // Folding the factor in also means rope_scale must go back to 1.0: the
+    // interpolated frequency already carries the 1/factor, and the kernel
+    // divides the *position* by rope_scale, so leaving both would apply it
+    // twice.
+    const i64 half = std::max<i64>(1, cfg_.rope_dim / 2);
+    auto build_inv_freq = [](std::vector<f32> &tab, i32 n_dims, f32 base) {
+        const i64 h = std::max<i32>(1, n_dims / 2);
+        tab.assign(static_cast<size_t>(h), 0.0f);
+        for (i64 i = 0; i < h; i++) {
+            const f32 exponent =
+                static_cast<f32>(2 * i) / static_cast<f32>(n_dims);
+            tab[static_cast<size_t>(i)] = std::pow(base, -exponent);
+        }
+    };
+    auto build_yarn = [](std::vector<f32> &tab, i32 n_dims, f32 base, f32 factor,
+                         i32 n_ctx_orig, f32 beta_fast, f32 beta_slow) {
+        // YaRN (Peng et al., jquesnelle/yarn), matching ggml's rope_yarn +
+        // rope_yarn_corr_dims so this table is the one llama.cpp builds at run
+        // time: the extrapolated frequency fades into the interpolated one over
+        // the pair range [low, high], and everything past `high` — the
+        // low-frequency end, which is where long context aliases — is fully
+        // interpolated. Note that low and high are computed in *dim* units but
+        // compared against pair indices; that is what both references do.
+        const i64 h = std::max<i32>(1, n_dims / 2);
+        tab.assign(static_cast<size_t>(h), 0.0f);
+        const f32 two_pi = 6.28318530717958647692f;
+        const f32 l2b = 2.0f * std::log(base);
+        f32 low = std::floor(static_cast<f32>(n_dims) *
+                             std::log(static_cast<f32>(n_ctx_orig) /
+                                      (beta_fast * two_pi)) / l2b);
+        f32 high = std::ceil(static_cast<f32>(n_dims) *
+                             std::log(static_cast<f32>(n_ctx_orig) /
+                                      (beta_slow * two_pi)) / l2b);
+        low = std::max(0.0f, low);
+        high = std::min(static_cast<f32>(n_dims - 1), high);
+        if (high <= low) high = low + 0.001f;
+        const f32 fscale = factor > 0.0f ? 1.0f / factor : 1.0f;
+        for (i64 i = 0; i < h; i++) {
+            const f32 extrap =
+                std::pow(base, -static_cast<f32>(2 * i) / static_cast<f32>(n_dims));
+            const f32 interp = fscale * extrap;
+            const f32 y = (static_cast<f32>(i) - low) / std::max(0.001f, high - low);
+            const f32 ramp = 1.0f - std::min(1.0f, std::max(0.0f, y));
+            tab[static_cast<size_t>(i)] = interp * (1.0f - ramp) + extrap * ramp;
+        }
+    };
+    if (cfg_.rope_yarn) {
+        const f32 factor = cfg_.rope_scale;
+        const i32 orig = static_cast<i32>(gguf_.get_i64(
+            key(".rope.scaling.original_context_length"), cfg_.n_ctx_train));
+        const f32 beta_fast = static_cast<f32>(
+            gguf_.get_f64(key(".rope.scaling.yarn_beta_fast"), 32.0));
+        const f32 beta_slow = static_cast<f32>(
+            gguf_.get_f64(key(".rope.scaling.yarn_beta_slow"), 1.0));
+        build_yarn(inv_freq_, cfg_.rope_dim, cfg_.rope_base, factor, orig,
+                   beta_fast, beta_slow);
+        cfg_.rope_scale = 1.0f;
+        KRK_INFO("rope: YaRN over %d of %d dims, base %.0f, factor %.1f, "
+                 "original context %d, beta_fast/slow %.0f/%.0f",
+                 cfg_.rope_dim, cfg_.head_dim, static_cast<f64>(cfg_.rope_base),
+                 static_cast<f64>(factor), orig, static_cast<f64>(beta_fast),
+                 static_cast<f64>(beta_slow));
+    } else {
+        build_inv_freq(inv_freq_, cfg_.rope_dim, cfg_.rope_base);
     }
+    // The windowed layers of a hybrid stack keep plain RoPE: llama.cpp passes
+    // them an ext_factor of 0, which is the same statement.
+    if (cfg_.swa_window > 0)
+        build_inv_freq(inv_freq_swa_, cfg_.rope_dim_swa, cfg_.rope_base_swa);
+    if (cfg_.rope_neox)
+        KRK_INFO("rope pairing: NeoX half-split (channel j with j + %d)",
+                 cfg_.rope_dim / 2);
 
     KRK_INFO("loaded %s (%s): %d layers, %d embd, %d/%d heads, hd=%d, ff=%d, vocab=%d",
              cfg_.name.c_str(), cfg_.arch.c_str(), cfg_.n_layer, cfg_.n_embd,
@@ -655,8 +846,18 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                  "ssm %d key x %d value heads, state %d, conv kernel %d, rope %d/%d",
                  recurrent_layers(), cfg_.n_layer, cfg_.full_attention_interval,
                  cfg_.ssm_n_group, cfg_.ssm_dt_rank, cfg_.ssm_d_state,
-                 cfg_.ssm_d_conv, rope_dim, cfg_.head_dim);
+                 cfg_.ssm_d_conv, cfg_.rope_dim, cfg_.head_dim);
     }
+    if (cfg_.swa_window > 0) {
+        KRK_INFO("hybrid attention: %d of every %d layers attend fully, the rest "
+                 "within %d tokens; rope %d/%d dims at base %.0f on the windowed "
+                 "layers",
+                 cfg_.swa_period - 1, cfg_.swa_period, cfg_.swa_window,
+                 cfg_.rope_dim_swa, cfg_.head_dim,
+                 static_cast<f64>(cfg_.rope_base_swa));
+    }
+    upload_bytes_ = up_bytes;
+    upload_ms_ = up_ms;
     if (std::getenv("KRK_PHASE"))
         std::fprintf(stderr,
                      "[load ] TOTAL upload: %.1f MiB in %.1f ms = %.2f GB/s\n",
@@ -688,12 +889,13 @@ void Model::unload() {
         if (L.v_bias) be_->release(L.v_bias);
         if (L.q_norm) be_->release(L.q_norm);
         if (L.k_norm) be_->release(L.k_norm);
-        for (f32 *f : {L.ssm_dt, L.ssm_a, L.ssm_norm})
+        for (f32 *f : {L.ssm_dt, L.ssm_a, L.ssm_norm, L.router_bias})
             if (f) be_->release(f);
         for (QuantTensor *q : {&L.wq, &L.wk, &L.wv, &L.wo, &L.wgate, &L.wup,
                                &L.wdown, &L.router, &L.shexp_gate, &L.shexp_up,
                                &L.shexp_down, &L.shexp_inp_gate, &L.wqkv,
-                               &L.wqkv_gate, &L.ssm_conv1d, &L.ssm_out,
+                               &L.wqkv_gate, &L.wattn_gate, &L.ssm_conv1d,
+                               &L.ssm_out,
                                &L.ssm_alpha, &L.ssm_beta})
             if (q->present()) be_->release(q->data);
     }

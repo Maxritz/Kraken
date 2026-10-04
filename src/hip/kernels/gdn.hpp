@@ -141,6 +141,22 @@ __global__ void gdn_mul_act_kernel(_Float16 *__restrict__ a,
     a[i] = static_cast<_Float16>(static_cast<f32>(a[i]) * static_cast<f32>(b[i]));
 }
 
+// Laguna's attention output gate: one scalar per (token, head) multiplies the
+// whole head row. x is [n_tok, n_head*hd] and g is dense [n_tok, n_head], so
+// the elementwise gdn_mul_act_kernel above cannot express it -- the operands
+// have different lengths. The head index costs a division, but the gate buffer
+// is the narrow one (n_head values per token) and is read once per element.
+__global__ void gdn_mul_head_broadcast_kernel(_Float16 *__restrict__ x,
+                                             const _Float16 *__restrict__ g,
+                                             i64 n_head, i64 hd, i64 total) {
+    const i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const i64 h = (i / hd) % n_head;
+    const i64 t = i / (n_head * hd);
+    x[i] = static_cast<_Float16>(static_cast<f32>(x[i]) *
+                                 static_cast<f32>(g[t * n_head + h]));
+}
+
 // x[i, j] += bias[j]  /  x[i, j] *= col[j]   over n_row rows of n_col.
 // One block per row, so the per-head vector is read once per row and stays
 // resident in L1 for the whole row.

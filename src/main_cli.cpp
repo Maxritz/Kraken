@@ -29,7 +29,7 @@ struct Args {
     int threads = 0;
     int expert_cache_mb = 0;    // MoE expert residency budget (MiB), 0 = auto
     int expert_cache_slots = 0; // MoE resident (layer, expert) slot cap, 0 = auto
-    int expert_l2_mb = 0;       // MoE expert second tier in host RAM (MiB), 0 = off
+    int expert_l2_mb = -1;      // MoE second tier in host RAM (MiB): <0 auto, 0 off
     int draft_tokens = 4;       // speculative decoding window
     bool cpu = false;
     bool greedy = false;
@@ -71,7 +71,10 @@ void usage() {
         "  --device N            HIP device index (default 0)\n"
         "  --expert-cache-mb N   MoE expert residency budget in MiB (0 = auto)\n"
         "  --expert-cache-slots N  cap resident (layer, expert) slots (0 = auto)\n"
-        "  --expert-l2-mb N       pinned host-RAM tier for evicted experts (MiB, 0 = off)\n"
+        "  --expert-l2-mb N       pinned host-RAM tier for evicted experts,\n"
+        "                        which turns a re-read from the file into a DMA\n"
+                        "                        (MiB; <0 auto = leftover experts capped\n"
+                        "                        by free RAM, 0 off)\n"
         "  --draft MODEL         draft model for greedy speculative decoding\n"
         "  --draft-tokens N      speculation window (default 4)\n"
         "  --info                print model and device info, then exit\n"
@@ -191,6 +194,85 @@ void sink_cb(void *user, const char *text, i32 token, bool done) {
     std::fflush(stdout);
 }
 
+// One block per run, always on: what the load cost, what the run cost, and what
+// the expert cache did. Every number here already existed as a counter — a
+// paging policy nobody can read back is not a measurement. Goes to stderr so
+// stdout stays exactly the generated text (the coherence check depends on it).
+static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
+                            f64 load_ms, size_t dev_free, size_t dev_total) {
+    const Model &m = engine.model();
+    const ModelConfig &mc = m.cfg();
+    const f64 ptps = r.prefill_ms > 0 ? r.prompt_tokens / (r.prefill_ms / 1000.0) : 0.0;
+    const f64 dtps = r.decode_ms > 0 ? r.generated / (r.decode_ms / 1000.0) : 0.0;
+    std::fprintf(out, "\n[stats ] load      %.0f ms", load_ms);
+    if (m.upload_bytes() > 0) {
+        const f64 gb = static_cast<f64>(m.upload_bytes()) / 1073741824.0;
+        const f64 gbs = m.upload_ms() > 0 ? gb / (m.upload_ms() / 1000.0) : 0.0;
+        std::fprintf(out, ", %.2f GiB uploaded of %.2f GiB weights in %.0f ms = %.1f GB/s",
+                     gb, static_cast<f64>(m.weight_bytes()) / 1073741824.0,
+                     m.upload_ms(), gbs);
+    }
+    std::fprintf(out, "\n[stats ] prefill   %d tok in %.1f ms = %.1f tok/s\n",
+                 r.prompt_tokens, r.prefill_ms, ptps);
+    std::fprintf(out, "[stats ] decode    %d tok in %.1f ms = %.1f tok/s (%.1f ms/tok)\n",
+                 r.generated, r.decode_ms, dtps,
+                 r.generated > 0 ? r.decode_ms / r.generated : 0.0);
+    if (dev_total > 0)
+        std::fprintf(out,
+                     "[stats ] device    %.2f GiB in use of %.2f GiB (%.2f GiB free)\n",
+                     static_cast<f64>(dev_total - dev_free) / 1073741824.0,
+                     static_cast<f64>(dev_total) / 1073741824.0,
+                     static_cast<f64>(dev_free) / 1073741824.0);
+    if (!mc.is_moe) return;
+    const ExpertCache &ec = m.experts();
+    const u64 acq = ec.acquires();
+    const f64 token_div = r.generated > 0 ? static_cast<f64>(r.generated) : 1.0;
+    std::fprintf(out,
+                 "[stats ] experts   %.0f MiB VRAM budget, %zu/%zu slots resident, "
+                 "%zu pinned | L2 %.0f MiB budget, %zu held (%.0f MiB, "
+                 "%.0f MiB staged at load)\n",
+                 static_cast<f64>(ec.budget_bytes()) / 1048576.0, ec.resident_slots(),
+                 ec.capacity_slots(), ec.pinned_slots(),
+                 static_cast<f64>(ec.host_budget_bytes()) / 1048576.0, ec.host_slots(),
+                 static_cast<f64>(ec.host_resident_bytes()) / 1048576.0,
+                 static_cast<f64>(ec.bytes_staged()) / 1048576.0);
+    // The three tiers reported apart. A single "hit rate" reads as "the
+    // cache works 20% of the time" when VRAM 20% / RAM 80% / file 0% is
+    // exactly the policy working: the tiers answer different questions and
+    // only the last one is the storage path.
+    const f64 share = acq > 0 ? 100.0 / static_cast<f64>(acq) : 0.0;
+    std::fprintf(out,
+                 "[stats ] cache     %llu acquires | VRAM hits %llu (%.1f%%) | "
+                 "RAM hits %llu (%.1f%%) | file loads %llu (%.1f%%)\n",
+                 static_cast<unsigned long long>(acq),
+                 static_cast<unsigned long long>(ec.hits()), share * static_cast<f64>(ec.hits()),
+                 static_cast<unsigned long long>(ec.host_hits()),
+                 share * static_cast<f64>(ec.host_hits()),
+                 static_cast<unsigned long long>(ec.loads()),
+                 share * static_cast<f64>(ec.loads()));
+    const f64 prom_ms = ec.promote_ms();
+    const f64 prom_mib = static_cast<f64>(ec.bytes_promoted()) / 1048576.0;
+    std::fprintf(out,
+                 "[stats ] transfer  %llu promotions, %.0f MiB in %.1f ms = %.1f GB/s "
+                 "(%.1f us/expert) | %llu demotions, %.0f MiB | "
+                 "%.0f MiB read from the file (%.2f MiB/tok)\n",
+                 static_cast<unsigned long long>(ec.promotions()), prom_mib, prom_ms,
+                 prom_ms > 0 ? prom_mib / 1024.0 / (prom_ms / 1000.0) : 0.0,
+                 ec.promotions() > 0
+                     ? prom_ms * 1000.0 / static_cast<f64>(ec.promotions())
+                     : 0.0,
+                 static_cast<unsigned long long>(ec.demotions()),
+                 static_cast<f64>(ec.bytes_demoted()) / 1048576.0,
+                 static_cast<f64>(ec.bytes_loaded()) / 1048576.0,
+                 static_cast<f64>(ec.bytes_loaded()) / 1048576.0 / token_div);
+    std::fprintf(out, "[stats ] churn     %llu evictions, %llu demotions, %llu promotions, "
+                      "%llu decay events\n",
+                 static_cast<unsigned long long>(ec.evictions()),
+                 static_cast<unsigned long long>(ec.demotions()),
+                 static_cast<unsigned long long>(ec.promotions()),
+                 static_cast<unsigned long long>(ec.decay_events()));
+}
+
 int run_bench(Engine &engine, const Args &a, f64 load_ms, f64 start_ms) {
     GenerateParams p;
     p.prompt =
@@ -246,6 +328,7 @@ int run_bench(Engine &engine, const Args &a, f64 load_ms, f64 start_ms) {
         std::printf("total          %.1f ms  (startup + load + prefill + decode)\n", total_ms);
     }
     usage.report(stdout);
+    print_run_stats(stdout, engine, r, load_ms, 0, 0);
     if (engine.has_draft() && engine.spec_steps() > 0) {
         const f64 rate =
             engine.draft_proposed() > 0
@@ -451,6 +534,7 @@ int main(int argc, char **argv) {
     SinkCtx sink;
     sink.chat = a.chat;
 
+    const f64 load_ms = bench_load_ms;
     auto generate_once = [&](const std::string &prompt) -> bool {
         GenerateParams p;
         p.prompt = prompt;
@@ -469,11 +553,8 @@ int main(int argc, char **argv) {
 
         GenerateResult r;
         if (!engine.generate(p, &r)) return false;
-        const f64 dtps = r.generated > 0 ? r.generated / (r.decode_ms / 1000.0) : 0;
-        if (a.verbose)
-            std::fprintf(stderr,
-                         "\n[%d prompt / %d generated | prefill %.0f ms | decode %.1f tok/s]\n",
-                         r.prompt_tokens, r.generated, r.prefill_ms, dtps);
+        print_run_stats(stderr, engine, r, load_ms,
+                        be->device_free_bytes(), be->device_total_bytes());
         return true;
     };
 

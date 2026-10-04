@@ -85,7 +85,7 @@ static void run_case(i64 n_head, i64 n_kv, i64 hd, i64 n_tok, i64 pos0,
     const dim3 rgrid(static_cast<unsigned>(n_head), static_cast<unsigned>(n_tok));
     attention_kernel<<<rgrid, kAttnBlock, rsmem>>>(
         ref, q, kc, vc, n_head, n_kv, hd, n_tok, pos0, pos_stride, causal ? 1 : 0,
-        scale, tile_k);
+        0, scale, tile_k);
     KRK_HIP(hipDeviceSynchronize());
 
     const size_t qsmem = attn_qtile_smem_bytes<QT>(tile_k, hd);
@@ -96,7 +96,7 @@ static void run_case(i64 n_head, i64 n_kv, i64 hd, i64 n_tok, i64 pos0,
                      static_cast<unsigned>((n_tok + QT - 1) / QT));
     attention_qtile_kernel<QT><<<qgrid, kAttnBlock, qsmem>>>(
         got, q, kc, vc, n_head, n_kv, hd, n_tok, pos0, pos_stride, causal ? 1 : 0,
-        scale, tile_k);
+        0, scale, tile_k);
     KRK_HIP(hipDeviceSynchronize());
     KRK_HIP(hipGetLastError());
 
@@ -165,7 +165,7 @@ static void run_tiny(i64 n_head, i64 hd, i64 n_tok, i64 pos0, i64 ctx,
                                 static_cast<int>(rsmem + 512)));
     attention_kernel<<<dim3(static_cast<unsigned>(n_head), static_cast<unsigned>(n_tok)),
                        kAttnBlock, rsmem>>>(ref, q, kc, vc, n_head, n_head, hd, n_tok,
-                                            pos0, pos_stride, 1, scale, tile_k);
+                                            pos0, pos_stride, 1, 0, scale, tile_k);
     const size_t qsmem = attn_qtile_smem_bytes<QT>(tile_k, hd);
     KRK_HIP(hipFuncSetAttribute(
         reinterpret_cast<const void *>(&attention_qtile_kernel<QT>),

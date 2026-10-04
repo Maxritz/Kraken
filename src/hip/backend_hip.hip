@@ -255,6 +255,44 @@ public:
     void release(void *p) override {
         if (p) KRK_HIP(hipFree(p));
     }
+    size_t device_free_bytes() const override {
+        size_t free_b = 0, total_b = 0;
+        if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) return caps_.vram_free;
+        return free_b;
+    }
+    // Free lists keyed by exact rounded size. The expert cache allocates and
+    // releases the same few slice sizes thousands of times per chunk, and
+    // hipMalloc/hipFree synchronise the device, so the pool is the difference
+    // between overlapping the promotion copies and waiting on the allocator.
+    // Bounded twice over, because a pool that only grows is a leak with extra
+    // steps: blocks over 4 MiB are never kept (a workspace-sized block is a
+    // resident workspace), and the whole pool holds at most 256 MiB of free
+    // blocks. The first version kept up to 512 blocks per size with no total
+    // cap and pushed the card into its own allocations on a 1.2 GiB model.
+    void *alloc_pooled(size_t bytes) override {
+        const size_t rounded = (bytes + 255u) & ~static_cast<size_t>(255u);
+        auto it = pool_.find(rounded);
+        if (it != pool_.end() && !it->second.empty()) {
+            void *p = it->second.back();
+            it->second.pop_back();
+            pool_bytes_ -= rounded;
+            return p;
+        }
+        return alloc(rounded);
+    }
+    void release_pooled(void *p, size_t bytes) override {
+        if (!p) return;
+        const size_t rounded = (bytes + 255u) & ~static_cast<size_t>(255u);
+        if (rounded <= (4u << 20) && pool_bytes_ + rounded <= kPoolCapBytes) {
+            pool_[rounded].push_back(p);
+            pool_bytes_ += rounded;
+            return;
+        }
+        hipFree(p);
+    }
+    static constexpr size_t kPoolCapBytes = 256u << 20;
+    std::unordered_map<size_t, std::vector<void *>> pool_;
+    size_t pool_bytes_ = 0;
     // The expert cache's L2 tier. Page-locked so demote (device->host) and
     // promote (host->device) are straight DMAs; unpinned staging would spend
     // more time in the driver's bounce buffer than on the copy. Pinned memory
@@ -901,7 +939,7 @@ public:
     }
 
     void rope(void *q, void *k, i64 n_head, i64 n_kv, i64 hd, i64 n_tok, i64 pos0,
-              const f32 *inv_freq, f32 scale, f32 frac) override {
+              const f32 *inv_freq, f32 scale, f32 frac, bool neox) override {
         KRK_TIME_OP("rope");
         // `inv_freq` is host memory (Model keeps the table in a
         // std::vector), but the kernel reads it per thread on the
@@ -910,10 +948,10 @@ public:
         stage_pos(pos0);
         const dim3 gq(static_cast<unsigned>(n_head), static_cast<unsigned>(n_tok));
         rope_kernel<<<gq, 128>>>(static_cast<_Float16 *>(q), n_head, hd,
-                                 pos_dev_, fd, scale, frac);
+                                 pos_dev_, fd, scale, frac, neox);
         const dim3 gk(static_cast<unsigned>(n_kv), static_cast<unsigned>(n_tok));
         rope_kernel<<<gk, 128>>>(static_cast<_Float16 *>(k), n_kv, hd,
-                                 pos_dev_, fd, scale, frac);
+                                 pos_dev_, fd, scale, frac, neox);
     }
 
     void qk_norm(void *q, void *k, const f32 *wq, const f32 *wk, i64 n_head,
@@ -964,8 +1002,11 @@ public:
             // key count so a short context still collapses to one block per
             // head and takes the original path unchanged.
             const i64 n_keys = d.pos0 + 1;
+            // A windowed layer only visits the visible range, so the split
+            // count is sized from that rather than from the whole history.
+            const i64 n_vis = d.window > 0 && d.window < n_keys ? d.window : n_keys;
             int n_split = attention_decode_splits(
-                n_keys, d.n_head, caps_.cu_count);
+                n_vis, d.n_head, caps_.cu_count);
             // A/B knob: KRK_ATTN_SPLIT=0 forces one block per head so the
             // split path can be diffed against it on identical input. The two
             // are algebraically the same computation, so the text must match.
@@ -987,7 +1028,7 @@ public:
             }
             attention_decode(out, q, kc, vc, d.n_head, d.n_kv, d.hd,
                              pos_dev_, d.pos_stride, d.causal ? 1 : 0,
-                             d.scale, nullptr, part, n_split,
+                             d.window, d.scale, nullptr, part, n_split,
                              caps_.cu_count);
             return;
         }
@@ -1018,7 +1059,7 @@ public:
                 attn_qtile_smem_bytes<kQT>(want, d.hd) <= caps_.lds_bytes)
                 qtile_k = want;
         }
-        if (attn_qtile_on() &&
+        if (attn_qtile_on() && d.window == 0 &&
             attn_qtile_smem_bytes<kQT>(qtile_k, d.hd) <= caps_.lds_bytes) {
             const size_t qsmem = attn_qtile_smem_bytes<kQT>(qtile_k, d.hd);
             const dim3 grid(static_cast<unsigned>(d.n_head),
@@ -1049,7 +1090,7 @@ public:
             static_cast<_Float16 *>(out), static_cast<const _Float16 *>(q),
             static_cast<const _Float16 *>(kc), static_cast<const _Float16 *>(vc),
             d.n_head, d.n_kv, d.hd, d.n_tok, d.pos0, d.pos_stride, d.causal ? 1 : 0,
-            d.scale, tile_k);
+            d.window, d.scale, tile_k);
     }
 
     bool attn_fused_chain(void *out, void *q, void *kcache, void *vcache,
@@ -1061,9 +1102,12 @@ public:
         // only, and only the head widths its packed lane slice covers
         // (the same rule as the decode attention path above). Anything
         // else keeps the separate rope() + kv_append() + attention()
-        // chain the engine runs as the fallback.
+        // chain the engine runs as the fallback. The kernel rotates
+        // adjacent channel pairs, which is the llama-family layout, so a
+        // NeoX-pairing model (ModelConfig::rope_neox) stays on that
+        // fallback until the packed lane slice can express the pair.
         if (d.n_tok != 1 || !attn_fused_decode_supported(d.hd) ||
-            !attn_fused_)
+            !attn_fused_ || d.window > 0)
             return false;
         const f32 *fd = stage_freq(inv_freq, d.hd);
         stage_pos(d.pos0);
@@ -1174,6 +1218,18 @@ public:
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         gdn_mul_act_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(a),
                                             static_cast<const _Float16 *>(b), n);
+    }
+
+    // Laguna's per-head output gate: x[t, h, :] *= g[t, h].
+    void mul_head_broadcast(void *x, const void *g, i64 n_tok, i64 n_head,
+                            i64 hd) override {
+        KRK_TIME_OP("mul_head_bcast");
+        if (n_tok <= 0 || n_head <= 0 || hd <= 0) return;
+        const i64 total = n_tok * n_head * hd;
+        const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
+        gdn_mul_head_broadcast_kernel<<<blocks, 256>>>(
+            static_cast<_Float16 *>(x), static_cast<const _Float16 *>(g),
+            n_head, hd, total);
     }
 
     void add_bias_cols(void *x, const f32 *bias, i64 n_row, i64 n_col) override {

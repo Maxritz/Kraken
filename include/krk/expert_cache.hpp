@@ -125,6 +125,25 @@ public:
     // The returned pointer is valid until the next acquire().
     const ResidentExpert *acquire(const ExpertSource &src, i32 layer, i32 expert);
 
+    // Fills the host tier from the source ahead of the run: the answer to
+    // *compulsory* misses, which is what a short generation is made of.
+    // Top-8 routing over a 256-expert stack reaches most of the set within a
+    // few dozen tokens, and without this every first touch reads three slices
+    // out of the model file (Laguna XS.2 measured 212 MiB/token that way at
+    // 8 tok/s, against 66.9% hits and zero demotions — the misses were not
+    // capacity misses, so the tier never saw them). Staged slots are
+    // demote-eligible like any other and carry an LFU count of 0, so they are
+    // the first out of the tier when room is needed. Returns bytes staged.
+    size_t preload(const ExpertSource &src, i32 layer);
+    // One expert, so the caller can choose the order: expert-major across
+    // layers when the tier is smaller than the corpus.
+    size_t preload_one(const ExpertSource &src, i32 layer, i32 expert);
+    u64 bytes_staged() const { return bytes_staged_; }
+    // Wall time spent copying promotions into VRAM, so the report can print
+    // the one number that decides whether promotion is fast enough to hide
+    // behind a token: MiB/s out of the host tier.
+    f64 promote_ms() const { return promote_ms_; }
+
     size_t budget_bytes() const { return budget_; }
     size_t resident_bytes() const { return bytes_; }
     // Device-resident slots, i.e. the ones whose weights are in VRAM right now.
@@ -147,6 +166,13 @@ public:
     u64 promotions() const { return promotions_; }
     // Lifetime acquire count (hits + loads) since the last clear().
     u64 acquires() const { return total_acquires_; }
+    // Bytes that crossed a boundary, which is the traffic a residency policy
+    // is actually trading against: loaded = read out of the model file (a
+    // miss), demoted = written into the host tier, promoted = read back out
+    // of it (a DMA instead of a file re-read).
+    u64 bytes_loaded() const { return bytes_loaded_; }
+    u64 bytes_demoted() const { return bytes_demoted_; }
+    u64 bytes_promoted() const { return bytes_promoted_; }
     u64 decay_events() const { return decays_; }
     size_t pinned_slots() const;
     // Current LFU counter of one slot, or 0 when it is not resident. Because a
@@ -185,6 +211,9 @@ private:
     void retire(Slot &s, u64 keep_host_key);
     // Copies the device weights into the tier and frees them there. False when
     // the tier cannot take them (budget, or a failed pinned allocation).
+    // Copies one expert's three slices into page-locked host memory straight
+    // from the mapping, without a device copy in between.
+    bool stage_host(const ExpertSource &src, i32 expert, Slot &s);
     bool demote_to_host(Slot &s, u64 keep_host_key);
     // Host -> device. Makes VRAM room first, so it can evict like any miss.
     bool promote_to_vram(Slot &s);
@@ -226,6 +255,11 @@ private:
     u64 hits_ = 0;
     u64 host_hits_ = 0;
     u64 demotions_ = 0;
+    u64 bytes_loaded_ = 0;   // read from the mapping into VRAM
+    u64 bytes_demoted_ = 0;  // VRAM -> pinned host tier
+    u64 bytes_promoted_ = 0; // pinned host tier -> VRAM
+    u64 bytes_staged_ = 0;   // mapping -> pinned host tier, at load
+    f64 promote_ms_ = 0;     // wall time in promote_to_vram
     u64 promotions_ = 0;
     u64 decays_ = 0;
     u64 seq_ = 0;

@@ -164,6 +164,8 @@ KRK_QTRAIT(DType::Q4_K, 8);
 KRK_QTRAIT(DType::Q5_K, 8);
 KRK_QTRAIT(DType::Q6_K, 8);
 KRK_QTRAIT(DType::Q8_K, 8);
+KRK_QTRAIT(DType::TQ1_0, 8);
+KRK_QTRAIT(DType::TQ2_0, 8);
 #undef KRK_QTRAIT
 
 // True byte stride of one block. This is what maps a global chunk index onto
@@ -189,6 +191,8 @@ __device__ __forceinline__ int dtype_block_bytes_dev(int t) {
         case static_cast<int>(DType::Q5_K): return 176;
         case static_cast<int>(DType::Q6_K): return 210;
         case static_cast<int>(DType::Q8_K): return 292;
+        case static_cast<int>(DType::TQ1_0): return 54;
+        case static_cast<int>(DType::TQ2_0): return 66;
         default: return 0;
     }
 }
@@ -204,6 +208,8 @@ __device__ __forceinline__ int dtype_chunks_per_block_dev(int t) {
         case static_cast<int>(DType::IQ2_XXS):
         case static_cast<int>(DType::IQ4_XS):
         case static_cast<int>(DType::Q8_K): return 8;
+        case static_cast<int>(DType::TQ1_0): return 8;
+        case static_cast<int>(DType::TQ2_0): return 8;
         case static_cast<int>(DType::NVFP4): return 2;
         default: return 1;
     }
@@ -218,6 +224,51 @@ __device__ __forceinline__ void dev_scale_min_k4(int j, const u8 *q, u8 *d, u8 *
         *d = static_cast<u8>((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
         *m = static_cast<u8>((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
     }
+}
+
+// ---------------------------------------------------------------------------
+// ternary (TQ1_0 / TQ2_0) device helpers
+//
+// Both formats are planar, so a 32-element "chunk" is never a contiguous byte
+// run. See quant.cpp for the host reference of the same layouts.
+// ---------------------------------------------------------------------------
+
+// ggml's multiply-high trit decode: ((uint16_t)(q * 3^n) * 3) >> 8, minus 1.
+// The & 0xFF is load-bearing: ggml stores the product into a uint8_t first, so
+// it wraps to a byte before the *3 >> 8 (see the host decoder in quant.cpp).
+__device__ __forceinline__ int tq1_trit_of_dev(int q, int n) {
+    const int p = (n == 0) ? 1 : (n == 1) ? 3 : (n == 2) ? 9 : (n == 3) ? 27
+                : (n == 4) ? 81 : 243;
+    return static_cast<int>(((static_cast<u32>(q * p) & 0xFFu) * 3u) >> 8) - 1;
+}
+
+// Element `idx` (0..255) of a TQ1_0 block. 240 elements come from qs in two
+// runs of 5 trit planes (32-byte groups then 16-byte groups); the last 16
+// come from qh, 4 trits per byte.
+__device__ __forceinline__ int tq1_trit_at_dev(const u8 *b, int idx) {
+    if (idx < 160) return tq1_trit_of_dev(b[idx % 32], idx / 32);
+    if (idx < 240) {
+        const int t = idx - 160;
+        return tq1_trit_of_dev(b[32 + (t % 16)], t / 16);
+    }
+    // qh is emitted plane-major: byte index t % 4, trit plane t / 4.
+    const int t = idx - 240;
+    return tq1_trit_of_dev(b[48 + (t % 4)], t / 4);
+}
+
+// True when every code in a TQ2_0 block decodes to exactly 0. TQ2_0 stores
+// 0 as the code 1, so an all-zero weight block is the byte pattern 0x55 --
+// one 8-byte compare per 32 bytes, and no multiply. This is the whole point
+// of the format for MoE paging: a skipped block is a block never read.
+__device__ __forceinline__ bool tq2_0_block_is_zero(const u8 *b) {
+    const u64 ones = 0x0101010101010101ull;
+#pragma unroll
+    for (int i = 0; i < 64; i += 8) {
+        u64 v;
+        __builtin_memcpy(&v, b + i, 8);
+        if (v != ones) return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +525,23 @@ __device__ __forceinline__ void dequant_chunk(const u8 *b, int chunk, _Float16 *
 #pragma unroll
         for (int l = 0; l < 32; l++)
             y[l] = static_cast<_Float16>(d * static_cast<f32>(qs[chunk * 32 + l]));
+    } else if constexpr (T == DType::TQ2_0) {
+        // 2 bits per element, q in {0,1,2} -> q - 1. Planar: chunks 0-3 use
+        // bytes 0..31 with shifts 0/2/4/6, chunks 4-7 use bytes 32..63.
+        const f32 d = d_h2f(static_cast<u16>(b[64] | (b[65] << 8)));
+        const int off = (chunk >= 4) ? 32 : 0;
+        const int sh = (chunk & 3) * 2;
+#pragma unroll
+        for (int m = 0; m < 32; m++)
+            y[m] = static_cast<_Float16>(
+                d * static_cast<f32>(static_cast<int>((b[off + m] >> sh) & 3) - 1));
+    } else if constexpr (T == DType::TQ1_0) {
+        // 5 trits per byte, base-3 packed; 54-byte block.
+        const f32 d = d_h2f(static_cast<u16>(b[52] | (b[53] << 8)));
+#pragma unroll
+        for (int m = 0; m < 32; m++)
+            y[m] = static_cast<_Float16>(
+                d * static_cast<f32>(tq1_trit_at_dev(b, chunk * 32 + m)));
     } else {
         (void)b;
         (void)chunk;
@@ -505,6 +573,8 @@ __device__ __forceinline__ void dequant_chunk_dev(int t, const u8 *b, int chunk,
         case static_cast<int>(DType::Q5_K): dequant_chunk<DType::Q5_K>(b, chunk, y); break;
         case static_cast<int>(DType::Q6_K): dequant_chunk<DType::Q6_K>(b, chunk, y); break;
         case static_cast<int>(DType::Q8_K): dequant_chunk<DType::Q8_K>(b, chunk, y); break;
+        case static_cast<int>(DType::TQ1_0): dequant_chunk<DType::TQ1_0>(b, chunk, y); break;
+        case static_cast<int>(DType::TQ2_0): dequant_chunk<DType::TQ2_0>(b, chunk, y); break;
         default:
 #pragma unroll
             for (int i = 0; i < 32; i++) y[i] = static_cast<_Float16>(0.0f);
@@ -715,6 +785,8 @@ __device__ __forceinline__ f32 dot_chunks(int t, const u8 *wrow, const _Float16 
         case static_cast<int>(DType::Q5_K): return dot_chunks_t<DType::Q5_K>(wrow, x, c0, c1);
         case static_cast<int>(DType::Q6_K): return dot_chunks_t<DType::Q6_K>(wrow, x, c0, c1);
         case static_cast<int>(DType::Q8_K): return dot_chunks_t<DType::Q8_K>(wrow, x, c0, c1);
+        case static_cast<int>(DType::TQ1_0): return dot_chunks_t<DType::TQ1_0>(wrow, x, c0, c1);
+        case static_cast<int>(DType::TQ2_0): return dot_chunks_t<DType::TQ2_0>(wrow, x, c0, c1);
         default: return 0.0f;
     }
 }
@@ -755,6 +827,8 @@ __device__ __forceinline__ void dequant_row_dev(int t, const u8 *src, _Float16 *
         case static_cast<int>(DType::Q5_K): dequant_row_t<DType::Q5_K>(src, dst, n); break;
         case static_cast<int>(DType::Q6_K): dequant_row_t<DType::Q6_K>(src, dst, n); break;
         case static_cast<int>(DType::Q8_K): dequant_row_t<DType::Q8_K>(src, dst, n); break;
+        case static_cast<int>(DType::TQ1_0): dequant_row_t<DType::TQ1_0>(src, dst, n); break;
+        case static_cast<int>(DType::TQ2_0): dequant_row_t<DType::TQ2_0>(src, dst, n); break;
         default: break;
     }
 }

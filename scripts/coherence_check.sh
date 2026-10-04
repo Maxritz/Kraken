@@ -11,12 +11,29 @@
 #                 within `tol` of each other, so either choice is rounding
 #   FAIL (drift)  the first differing step is a real gap
 #   FAIL (text)   the generated text is not text (>25% digits, or no letters)
+#   FAIL (empty)  a backend produced no text at all, or died, or did not finish
+#                 inside KRK_TIMEOUT. An empty run is a failure, not a skip: the
+#                 acceptance criterion for this script is "a human can read the
+#                 answer", and no answer is not an answer.
+#
+# Exit status is non-zero when anything failed *or* when a model the caller
+# named was not tested because it is over the cap — an untested model must not
+# read as a passing one. KRK_ALLOW_BIG=1 runs those anyway; see the warning
+# below for why the cap exists.
 #
 #   scripts/coherence_check.sh                      # every runnable model <= 8 GiB
 #   scripts/coherence_check.sh models/foo.gguf ...  # just these
 #
 # Environment: KRK_BIN (default build-hip/kraken.exe), KRK_PROMPT, KRK_N (tokens
-# to generate), KRK_CTX, KRK_CHUNK, KRK_MAX_MB (default 8192), KRK_TOL.
+# to generate), KRK_CTX, KRK_CHUNK, KRK_MAX_MB (default 8192), KRK_TOL,
+# KRK_TIMEOUT (seconds per engine run, default 120), KRK_ALLOW_BIG (0/1).
+#
+# The cap is not a preference. The CPU side of this check is the *scalar*
+# reference, which dequantizes in place: on the 19 GiB laguna-xs2 it needs
+# about 7 s per token, so the default 32-token run pins every core for ~4
+# minutes and, alongside any other work on the machine, that reads as a hung
+# system. Raise KRK_MAX_MB or set KRK_ALLOW_BIG=1 deliberately, never by
+# accident, and keep KRK_TIMEOUT bounded when you do.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -27,6 +44,8 @@ CTX=${KRK_CTX:-512}
 CHUNK=${KRK_CHUNK:-32}
 MAX_MB=${KRK_MAX_MB:-8192}
 TOL=${KRK_TOL:-0.05}
+TIMEOUT=${KRK_TIMEOUT:-120}
+ALLOW_BIG=${KRK_ALLOW_BIG:-0}
 # Instruct models fed a raw sentence do the one thing their training never
 # asked of them: they continue the sentence, so the "answer" is the question
 # again (Qwen3.5-0.8B loops "The capital of France is the capital of France"
@@ -41,10 +60,19 @@ CHAT=${KRK_CHAT:-1}
 
 # Generated text only: the banner and the [info ]/[warn ] chatter are not part
 # of the answer. stdout carries exactly the continuation.
+# Runs the engine once and echoes the generated text. Returns the engine's own
+# status (124 when `timeout` killed it), which the caller checks: a pass that
+# never finished has not passed, and stdout is captured through a file so the
+# status survives the pipeline that strips the banner.
 gen() {
-    "$BIN" -m "$1" ${2:-} $CHAT_ARG -p "$PROMPT" -n "$N" --greedy --ctx "$CTX" \
-        --chunk "$CHUNK" 2>/dev/null | grep -v '^KRAKEN 0.1.0' |
-        sed 's/[[:space:]]*$//'
+    local f rc
+    f=$(mktemp) || return 1
+    timeout "$TIMEOUT" "$BIN" -m "$1" ${2:-} $CHAT_ARG -p "$PROMPT" \
+        -n "$N" --greedy --ctx "$CTX" --chunk "$CHUNK" >"$f" 2>/dev/null
+    rc=$?
+    grep -v '^KRAKEN 0.1.0' "$f" | sed 's/[[:space:]]*$//'
+    rm -f "$f"
+    return $rc
 }
 
 # "id=value id=value" for the top two at each step, one line per step. The
@@ -52,8 +80,9 @@ gen() {
 # otherwise interleave with it and an anchored match would drop a line, which
 # reads as a divergence one step early.
 steps() {
-    "$BIN" -m "$1" ${2:-} $CHAT_ARG -p "$PROMPT" -n "$N" --greedy --ctx "$CTX" \
-        --chunk "$CHUNK" --debug-topk 2 2>&1 1>/dev/null |
+    timeout "$TIMEOUT" "$BIN" -m "$1" ${2:-} $CHAT_ARG -p "$PROMPT" \
+        -n "$N" --greedy --ctx "$CTX" --chunk "$CHUNK" --debug-topk 2 \
+        2>&1 1>/dev/null |
         grep '^step ' |
         sed -e 's/^step [0-9]* pos [0-9]* nan=[0-9]* inf=[0-9]* top2: //' \
             -e 's/([^)]*)//g'
@@ -98,18 +127,51 @@ if [ ${#models[@]} -eq 0 ]; then
     done < <(grep '| runnable |' "$ROOT/docs/model-inventory.md")
 fi
 
+# A model named on the command line gets the same cap as the scan: an explicit
+# argument is not a reason to start a multi-minute all-core scalar run by
+# accident. Skipped models are reported and counted, and the script exits
+# non-zero while any remain, because "not tested" is not "passes".
+excluded=0
+if [ ${#models[@]} -gt 0 ] && [ "$ALLOW_BIG" != "1" ]; then
+    kept=()
+    for m in "${models[@]}"; do
+        bytes=$(stat -c%s "$m" 2>/dev/null || echo 0)
+        mb=$(( (bytes + 1048575) / 1048576 ))
+        if [ "$mb" -gt "$MAX_MB" ]; then
+            echo "SKIP  $(basename "$m") (${mb} MiB > KRK_MAX_MB=${MAX_MB}): not tested"
+            echo "      set KRK_ALLOW_BIG=1 to run it (~$((mb / 3))s per CPU token)"
+            excluded=$((excluded + 1))
+        else
+            kept+=("$m")
+        fi
+    done
+    models=(${kept[@]+"${kept[@]}"})
+fi
+
 CHAT_ARG=""
 [ "$CHAT" = "1" ] && CHAT_ARG="--chat"
 
 echo "prompt: $PROMPT   n=$N   ctx=$CTX   chunk=$CHUNK   chat=$CHAT   tie tol=$TOL"
+echo "per-run timeout ${TIMEOUT}s"
 pass=0
 fail=0
 for m in "${models[@]}"; do
     name=$(basename "$m")
-    gpu=$(gen "$m" "") || true
-    cpu=$(gen "$m" "--cpu") || true
+    gpu=$(gen "$m" ""); grc=$?
+    cpu=$(gen "$m" "--cpu"); crc=$?
+    if [ "$grc" -ne 0 ] || [ "$crc" -ne 0 ]; then
+        why="device rc=$grc, cpu rc=$crc"
+        [ "$grc" -eq 124 ] || [ "$crc" -eq 124 ] &&
+            why="did not finish in ${TIMEOUT}s (device rc=$grc, cpu rc=$crc)"
+        fail=$((fail + 1))
+        printf '%-22s %-42s %s\n' "FAIL" "$name" "$why"
+        continue
+    fi
     if [ -z "$gpu" ] || [ -z "$cpu" ]; then
-        echo "SKIP  $name (no output)"
+        which="$([ -z "$gpu" ] && echo device || echo cpu)"
+        [ -z "$gpu" ] && [ -z "$cpu" ] && which="both"
+        fail=$((fail + 1))
+        printf '%-22s %-42s %s\n' "FAIL" "$name" "$which produced no text"
         continue
     fi
     if [ "$gpu" == "$cpu" ]; then
@@ -130,4 +192,7 @@ for m in "${models[@]}"; do
         "$(echo "$gpu" | tr '\n' ' ' | cut -c1-88)"
 done
 echo "$pass coherent, $fail not"
-[ "$fail" -eq 0 ]
+if [ "$excluded" -gt 0 ]; then
+    echo "$excluded not tested (over KRK_MAX_MB=$MAX_MB): the run does not pass"
+fi
+[ "$fail" -eq 0 ] && [ "$excluded" -eq 0 ]

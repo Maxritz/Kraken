@@ -38,14 +38,17 @@ constexpr ArchSpec kTable[] = {
     // ---- the schemas this engine runs ------------------------------------
     {"llama", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
      false, false, false, false},
-    // Qwen2 adds a bias on q/k/v; everything else is the llama schema.
+    // Qwen2 adds a bias on q/k/v; everything else is the llama schema. It is
+    // the first arch here whose rope is the *NeoX* pairing (llama.cpp's table
+    // lists qwen2 under LLAMA_ROPE_TYPE_NEOX): the pair is channel j with
+    // j + n_rot/2, not two adjacent channels.
     {"qwen2", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
-     false, false, true, false},
-    // Qwen3 adds per-head QK-norm.
+     false, false, true, false, false, true},
+    // Qwen3 adds per-head QK-norm, and keeps Qwen2's NeoX rope pairing.
     {"qwen3", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "qwen3", "",
-     true, false, false, false},
+     true, false, false, false, false, true},
     {"qwen3moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "qwen3", "",
-     true, false, false, false},
+     true, false, false, false, false, true},
     // Qwen3.5 and its MoE sibling: gated delta net blocks interleaved with
     // attention, and the attending layers pack an output gate into attn_q.
     {"qwen35", ArchShape::Recurrent, ArchSupport::Yes, ArchRole::Target, "qwen35",
@@ -60,17 +63,17 @@ constexpr ArchSpec kTable[] = {
     {"gemma", ArchShape::Dense, ArchSupport::Partial, ArchRole::Target, "gemma",
      "not validated against a file in this collection; the schema is llama plus "
      "embedding scaling",
-     true, false, false, true},
+     true, false, false, true, false, true},
     // Gemma 2 adds a softcap on the *attention* logits (inside the softmax,
     // where a host-side fix cannot reach) and alternating sliding-window
     // attention. Neither is implemented.
     {"gemma2", ArchShape::Dense, ArchSupport::No, ArchRole::Target, "gemma",
      "attention-logit softcapping and alternating sliding-window attention are "
      "not implemented",
-     true, false, false, true},
+     true, false, false, true, false, true},
     {"gemma3", ArchShape::Dense, ArchSupport::No, ArchRole::Target, "gemma",
      "alternating sliding-window attention is not implemented",
-     true, false, false, true},
+     true, false, false, true, false, true},
     // Gemma 4 (E-series) as the file in the collection declares it: 42 layers,
     // shared-KV layers, two attention geometries (global heads of 512 with 512
     // rope dims, sliding-window heads of 256 with 256) and per-layer input
@@ -79,7 +82,7 @@ constexpr ArchSpec kTable[] = {
      "per-layer input embeddings, shared-KV layers, two attention geometries "
      "(global + sliding window) and the attention-logit softcap are not "
      "implemented",
-     true, false, false, true},
+     true, false, false, true, false, true},
 
     // ---- loads and runs, with a named gap ---------------------------------
     // The language tower of a vision model is the text schema; the vision tower
@@ -87,7 +90,7 @@ constexpr ArchSpec kTable[] = {
     {"qwen3vl", ArchShape::Dense, ArchSupport::Partial, ArchRole::Target, "qwen3",
      "the vision tower and multimodal projector are not read; images are "
      "ignored and the text tower loads as qwen3",
-     true, false, false, false},
+     true, false, false, false, false, true},
 
     // ---- recognized, and refused with the reason --------------------------
     // Multi-head latent attention: a compressed KV path (attn_kv_a/kv_b and
@@ -129,12 +132,31 @@ constexpr ArchSpec kTable[] = {
      "qwen35",
      "qwen3.5 draft head set (dflash.*) rather than a model",
      false, true, false, false},
-    // MoE with an attention output gate, a routed-expert selection bias and
-    // YaRN rope scaling: three separate pieces the engine has no code for.
-    {"laguna", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "laguna",
-     "the attention output gate, the routed-expert selection bias and YaRN "
-     "rope scaling are not implemented",
-     true, false, false, false},
+    // Laguna (poolside): MoE with a sigmoid router, a per-expert selection
+    // bias added to the probabilities before the top-k, a per-head softplus
+    // gate on the attention output, and a hybrid full/sliding-window stack
+    // whose two layer kinds run different rotary tables (YaRN over 64 of 128
+    // dims on the full layers, plain RoPE over all 128 on the windowed ones).
+    //
+    // The schema was read off Laguna-S-2.1-UD-Q4_K_M and cross-checked against
+    // llama.cpp's own src/models/laguna.cpp, which is the reference for every
+    // piece of it; `attention.head_count` there is an array (48 heads on the
+    // full layers, 72 on the windowed ones), which is what makes the query
+    // projection a per-layer width and why the loader no longer insists that
+    // n_embd divide by it.
+    //
+    // The loader reads all of that today: the two head counts, the gate tensor,
+    // the bias, the YaRN table folded into inv_freq and the window geometry.
+    // What is still missing is the engine side — the gate projection and its
+    // broadcast, the sigmoid+bias router, and the window mask in the attention
+    // kernels — so the entry stays a refusal until those land, because the
+    // alternative is a file that loads and decodes plausible nonsense.
+    // docs/TODO.md has the remaining list.
+    // Its rope is the NeoX pairing as well (llama.cpp's table lists laguna
+    // under LLAMA_ROPE_TYPE_NEOX), which is what the last flag says.
+    {"laguna", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "laguna",
+     "",
+     true, false, false, false, true, true},
     // MoVA: the attention *values* are a routed expert set of their own, on top
     // of an attention output gate.
     {"k2-horizon", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "k2-horizon",
@@ -174,6 +196,10 @@ struct GapTensor {
     // When true the entry only applies to a non-recurrent (dense/MoE) arch:
     // the gated delta net has its own gate tensor of the same name.
     bool dense_only;
+    // The arch that implements this tensor, so the gap does not fire on the
+    // schema that has code for it. Empty means it is a gap everywhere the
+    // dense_only rule leaves it standing.
+    const char *exempt_arch = nullptr;
 };
 
 constexpr GapTensor kGapTensors[] = {
@@ -181,14 +207,16 @@ constexpr GapTensor kGapTensors[] = {
     // is what the loader uploads; on a dense one it is a fused attention
     // projection this engine has no shape for.
     {"attn_qkv.weight", "a fused query/key/value projection (attn_qkv)", true},
-    {"attn_gate.weight", "an attention output gate (attn_gate)", true},
+    {"attn_gate.weight", "an attention output gate (attn_gate)", true,
+     "laguna"},
     {"attn_v_exps.weight", "routed experts on the attention values (attn_v_exps)",
      false},
     {"attn_v_gate.", "a gate on the attention values (attn_v_gate)", false},
     {"attn_kv_a.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false},
     {"attn_kv_b.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false},
     {"attn_kv.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false},
-    {"exp_probs_b.bias", "a routed-expert selection bias (exp_probs_b)", false},
+    {"exp_probs_b.bias", "a routed-expert selection bias (exp_probs_b)", false,
+     "laguna"},
     {"ssm_conv1d.weight", "a Mamba-style SSM block (ssm_conv1d)", true},
     {"ssm_out.weight", "a Mamba-style SSM block (ssm_out)", true},
     {"attn_sinks.weight", "attention sinks (attn_sinks)", false},
@@ -271,10 +299,12 @@ const char *arch_role_name(ArchRole r) {
     return "?";
 }
 
-const char *arch_tensor_gap(std::string_view tensor_name, ArchShape shape) {
+const char *arch_tensor_gap(std::string_view tensor_name, ArchShape shape,
+                            std::string_view arch) {
     const bool dense = shape == ArchShape::Dense || shape == ArchShape::Moe;
     for (const GapTensor &g : kGapTensors) {
         if (g.dense_only && !dense) continue;
+        if (g.exempt_arch != nullptr && arch == g.exempt_arch) continue;
         if (has(tensor_name, g.needle)) return g.gap;
     }
     return nullptr;

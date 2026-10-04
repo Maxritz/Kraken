@@ -104,10 +104,16 @@ __global__ void __launch_bounds__(THREADS)
 // RoPE scaling factor.
 // ---------------------------------------------------------------------------
 
+// Rotary embedding over one (head, token) row per block. `neox` selects the
+// pair convention: false rotates the adjacent channels (2i, 2i+1) — llama.cpp's
+// "norm" layout — and true rotates channel i with channel i + rot, the
+// half-split layout the NeoX family is exported in. Which one a file needs is
+// a property of its architecture (ArchSpec::rope_neox), because the two are
+// indistinguishable from the tensor alone: both stay finite and in range.
 __global__ void rope_kernel(_Float16 *__restrict__ x, i64 n_heads, i64 hd,
                             const i64 *__restrict__ pos0,
                             const f32 *__restrict__ inv_freq, f32 scale,
-                            f32 frac) {
+                            f32 frac, bool neox) {
     const i64 h = blockIdx.x;
     const i64 t = blockIdx.y;
     const i64 half = hd / 2;
@@ -122,10 +128,12 @@ __global__ void rope_kernel(_Float16 *__restrict__ x, i64 n_heads, i64 hd,
         const f32 theta = p * inv_freq[i];
         f32 sn, cs;
         __sincosf(theta, &sn, &cs);
-        const f32 a = static_cast<f32>(xh[2 * i]);
-        const f32 b = static_cast<f32>(xh[2 * i + 1]);
-        xh[2 * i] = static_cast<_Float16>(a * cs - b * sn);
-        xh[2 * i + 1] = static_cast<_Float16>(a * sn + b * cs);
+        const i64 ia = neox ? i : 2 * i;
+        const i64 ib = neox ? i + rot : 2 * i + 1;
+        const f32 a = static_cast<f32>(xh[ia]);
+        const f32 b = static_cast<f32>(xh[ib]);
+        xh[ia] = static_cast<_Float16>(a * cs - b * sn);
+        xh[ib] = static_cast<_Float16>(a * sn + b * cs);
     }
 }
 
