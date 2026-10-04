@@ -313,12 +313,78 @@ public:
             pool_bytes_ -= rounded;
             return b.p;
         }
+        if (expert_arena()) return arena_take_(rounded);
         return alloc(rounded);
+    }
+
+    // ---------------------------------------------------------------------
+    // Expert arena
+    //
+    // The expert cache asks for the same three slice sizes thousands of times
+    // per token and hands each one back on eviction. Measured on laguna-xs2:
+    // 13,770 alloc_pooled calls in one 24-token run, of which 777 came from
+    // the free pool, so ~12,900 went to hipMalloc -- and the releases that
+    // overflowed the 256 MiB pool cap went to hipFree, which synchronises the
+    // device just as hard. Together that is the `alloc` line of the
+    // expert-path split: ~1,130 ms of a 6,300 ms run, ~82 us a call.
+    //
+    // The arena removes the allocator from the hot path: one hipMalloc per
+    // size class per 256 MiB, carved into fixed cells, and the existing pool
+    // (with the event guard that makes reuse safe) does the recycling. Nothing
+    // about the lifetime changes -- an arena cell is only ever handed out by
+    // alloc_pooled and only ever returned by release_pooled -- so the use-after
+    // -free the guard exists to prevent is still prevented.
+    void *arena_take_(size_t rounded) {
+        auto &v = arena_[rounded];
+        for (auto &c : v) {
+            if (c.next + c.stride <= c.bytes) {
+                void *p = static_cast<char *>(c.base) + c.next;
+                c.next += c.stride;
+                return p;
+            }
+        }
+        const size_t cells = kArenaGrowBytes / rounded ? kArenaGrowBytes / rounded
+                                                       : 1;
+        void *base = alloc(cells * rounded);
+        if (!base) return nullptr;
+        ArenaChunk c;
+        c.base = base;
+        c.bytes = cells * rounded;
+        c.stride = rounded;
+        c.next = rounded; // cell 0 is this call's
+        v.push_back(c);
+        arena_bytes_ += c.bytes;
+        return base;
+    }
+    // True when p is a cell of one of this size class's arenas. Only called on
+    // release, which is a few hundred times a run, and there are one or two
+    // chunks per class.
+    bool arena_owns_(size_t rounded, const void *p) {
+        auto it = arena_.find(rounded);
+        if (it == arena_.end()) return false;
+        for (const auto &c : it->second) {
+            const char *b = static_cast<const char *>(c.base);
+            if (p >= b && p < b + c.bytes) return true;
+        }
+        return false;
+    }
+    // KRK_EXPERT_ARENA=0 restores one hipMalloc per miss, which is the A/B arm
+    // the arena's cost is measured against.
+    static bool expert_arena() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_EXPERT_ARENA");
+            return !(e && (e[0] == '0'));
+        }();
+        return v;
     }
     void release_pooled(void *p, size_t bytes) override {
         if (!p) return;
         const size_t rounded = (bytes + 255u) & ~static_cast<size_t>(255u);
-        if (rounded <= (4u << 20) && pool_bytes_ + rounded <= kPoolCapBytes) {
+        // An arena cell is already ours, so it is always recyclable and never
+        // counted against the cap -- the cap exists to stop the pool growing
+        // without limit, and an arena cannot grow past what it allocated.
+        if (arena_owns_(rounded, p) ||
+            (rounded <= (4u << 20) && pool_bytes_ + rounded <= kPoolCapBytes)) {
             hipEvent_t ev = nullptr;
             if (hipEventCreateWithFlags(&ev, hipEventDisableTiming) != hipSuccess) {
                 static_cast<void>(hipGetLastError());
@@ -326,8 +392,9 @@ public:
                 return;
             }
             (void)hipEventRecord(ev, 0);
+            const bool owned = arena_owns_(rounded, p);
             pool_[rounded].push_back(PoolBlock{p, ev});
-            pool_bytes_ += rounded;
+            if (!owned) pool_bytes_ += rounded;
             return;
         }
         hipFree(p);
@@ -335,6 +402,16 @@ public:
     static constexpr size_t kPoolCapBytes = 256u << 20;
     std::unordered_map<size_t, std::vector<PoolBlock>> pool_;
     size_t pool_bytes_ = 0;
+    struct ArenaChunk {
+        void *base = nullptr;
+        size_t bytes = 0;
+        size_t stride = 0;
+        size_t next = 0;
+    };
+    // One hipMalloc per (size class, 256 MiB). Carved, never freed.
+    static constexpr size_t kArenaGrowBytes = 256u << 20;
+    std::unordered_map<size_t, std::vector<ArenaChunk>> arena_;
+    size_t arena_bytes_ = 0;
     // The expert cache's L2 tier. Page-locked so demote (device->host) and
     // promote (host->device) are straight DMAs; unpinned staging would spend
     // more time in the driver's bounce buffer than on the copy. Pinned memory

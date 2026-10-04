@@ -24,6 +24,11 @@ KR=${KR:-$ROOT/build-hip/kraken.exe}
 NTOK=${NTOK:-24}
 PROMPT=${PROMPT:-what is the capital of france?}
 OUT=${OUT:-/tmp/krk-ab}
+# Wipe, do not merge. A previous A/B with more repetitions leaves r4-a0.err and
+# friends behind, and a trace assembled from the directory then silently reports
+# an older run's numbers next to the current ones. That happened once here and
+# produced four rows of evidence that were never measured.
+rm -rf "$OUT"
 mkdir -p "$OUT"
 
 cleanup() { taskkill //F //IM kraken.exe //T >/dev/null 2>&1 || true; }

@@ -13,8 +13,19 @@ import sys
 
 out_dir = sys.argv[1]
 label = sys.argv[2] if len(sys.argv) > 2 else "arm"
-reps = max(int(n[1:].split("-")[0]) for n in os.listdir(out_dir)
-           if n.endswith(".err"))
+# The repetition count is an argument, never inferred from the directory: the
+# directory can hold runs from a longer earlier A/B, and inferring the count is
+# how a trace ends up quoting numbers that were never measured together.
+reps = int(sys.argv[3]) if len(sys.argv) > 3 else None
+if reps is None:
+    sys.exit("usage: trace_ab.py <out_dir> [label] <reps>")
+have = sorted(int(n[1:].split("-")[0]) for n in os.listdir(out_dir)
+              if n.endswith(".err"))
+missing = [r for r in range(1, reps + 1) if r not in have]
+if missing:
+    sys.exit("out_dir %s is missing repetitions %s; re-run the A/B or pass a "
+             "smaller count -- do not let it quote a partial run as a whole"
+             % (out_dir, missing))
 
 decode_re = re.compile(r"decode\s+(\d+) tok in ([\d.]+) ms = ([\d.]+) tok/s "
                        r"\(([\d.]+) ms/tok\)")
@@ -56,11 +67,15 @@ for a in sorted(rows):
           (a, med, 1000.0 / med if med else 0.0, len(hashes),
            ", ".join(hashes)))
 
-for tag in sorted(os.listdir(out_dir)):
-    if not tag.endswith(".err"):
-        continue
-    with open(os.path.join(out_dir, tag), errors="replace") as fh:
-        for line in fh:
-            m = expert_re.search(line)
-            if m:
-                print("%-9s expert-path %s" % (tag[:-4], m.group(1).strip()))
+# Same repetition range as the table above. Listing the directory instead is
+# how a longer earlier A/B leaks rows into this one.
+for a in range(2):
+    for r in range(1, reps + 1):
+        path = os.path.join(out_dir, "r%d-a%d.err" % (r, a))
+        if not os.path.exists(path):
+            continue
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                m = expert_re.search(line)
+                if m:
+                    print("r%d-a%d     expert-path %s" % (r, a, m.group(1).strip()))

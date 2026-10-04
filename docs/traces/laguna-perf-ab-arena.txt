@@ -1,0 +1,35 @@
+# Expert VRAM arena A/B. 3 interleaved repetitions, arms alternate run
+# by run. a0 = KRK_EXPERT_ARENA=0 (one hipMalloc per miss, what shipped),
+# a1 = arena (one 256 MiB allocation per size class, carved; the default).
+# laguna-xs2-Q4_K_M, prompt "what is the capital of france?", -n 24 --temp 0 --chat.
+# 2026-10-04T21:57:52Z  build c3dd000
+
+# interleaved A/B, 3 repetitions, arms alternate run by run
+# each arm's text hash is shown, so a speed win that changed the output
+# is visible in the same table
+
+run       arena                                  text      ms/tok       tok/s
+r1-a0     a                                      2f7a7f77  93.2         10.7
+r2-a0     a                                      2f7a7f77  90.0         11.1
+r3-a0     a                                      2f7a7f77  88.0         11.4
+r1-a1     a                                      2f7a7f77  63.2         15.8
+r2-a1     a                                      2f7a7f77  66.8         15.0
+r3-a1     a                                      2f7a7f77  63.8         15.7
+
+a0 median 90.00 ms/tok (11.11 tok/s), 1 distinct output(s): 2f7a7f77
+a1 median 63.80 ms/tok (15.67 tok/s), 1 distinct output(s): 2f7a7f77
+r1-a0     expert-path read   2163.1 ms | room     22.6 ms | alloc   1131.3 ms | xfer    546.5 ms | (promote total      2.4 ms)
+r2-a0     expert-path read   2049.5 ms | room     22.2 ms | alloc   1105.1 ms | xfer    487.9 ms | (promote total      2.2 ms)
+r3-a0     expert-path read   2004.7 ms | room     20.3 ms | alloc   1117.4 ms | xfer    477.2 ms | (promote total      2.0 ms)
+r1-a1     expert-path read   1975.9 ms | room     19.8 ms | alloc    276.9 ms | xfer    470.4 ms | (promote total      1.6 ms)
+r2-a1     expert-path read   2027.8 ms | room     27.4 ms | alloc    276.9 ms | xfer    489.2 ms | (promote total      2.3 ms)
+r3-a1     expert-path read   2009.9 ms | room     21.2 ms | alloc    288.0 ms | xfer    474.9 ms | (promote total      1.9 ms)
+
+VRAM in use after the run (arena arm):
+[stats ] device    10.23 GiB in use of 15.92 GiB (5.70 GiB free)
+[stats ] device    10.23 GiB in use of 15.92 GiB (5.70 GiB free)
+[stats ] device    10.23 GiB in use of 15.92 GiB (5.70 GiB free)
+VRAM in use after the run (hipMalloc arm):
+[stats ] device    15.04 GiB in use of 15.92 GiB (0.88 GiB free)
+[stats ] device    15.04 GiB in use of 15.92 GiB (0.88 GiB free)
+[stats ] device    15.04 GiB in use of 15.92 GiB (0.88 GiB free)
