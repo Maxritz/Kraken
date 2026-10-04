@@ -698,34 +698,92 @@ void Engine::configure_expert_cache() {
     const ModelConfig &mc = model_.cfg();
     if (!mc.is_moe || mc.n_expert <= 0) return;
 
+    // Device memory policy, in one place, because it decides how much of the
+    // card the user is left with.
+    //
+    // The rule: plan for 6 GiB of device memory in total, and step up by 2 GiB
+    // only when there is both the headroom for it and a model that needs it,
+    // never above 12 GiB. A small model on a large card therefore uses a few
+    // hundred MiB, a large MoE on a 16 GiB card stops at 12 GiB instead of
+    // filling the card, and a model that genuinely needs more than 6 GiB gets
+    // it in 2 GiB increments rather than all at once. Everything the run does
+    // not plan for -- the KV cache the user asked for, a second application,
+    // the driver's own allocations -- is what the headroom is for.
+    //
+    // This replaces "60% of whatever is free right now", which on a 15.9 GiB
+    // card produced a 15.04 GiB working set: the cache made the decision for the
+    // user and left 0.88 GiB for everything else.
+    const size_t gib = static_cast<size_t>(1) << 30;
+    const size_t kCapFirst = 6 * gib;
+    const size_t kCapStep = 2 * gib;
+    const size_t kCapMax = 12 * gib;
+    const size_t kReserve = 512u * 1024u * 1024u; // driver + fragmentation
+    const size_t total_bytes = model_.total_expert_bytes();
+    const size_t total_vram = be_->device_total_bytes();
+    const size_t free_now = be_->device_free_bytes();
+    const size_t used_now = (total_vram > free_now) ? total_vram - free_now : 0;
+    // What the run needs if nothing constrains it: the fixed allocations that
+    // already exist (weights, KV, workspaces) plus the whole routed set.
+    const size_t demand = used_now + total_bytes;
+    const size_t hard =
+        total_vram > kReserve ? total_vram - kReserve : total_vram / 2;
+
+    size_t vram_cap = 0;
+    if (cfg_.vram_cap_mb > 0) {
+        vram_cap = static_cast<size_t>(cfg_.vram_cap_mb) * 1024u * 1024u;
+        if (vram_cap > hard) vram_cap = hard;
+    } else {
+        vram_cap = kCapFirst < hard ? kCapFirst : hard;
+        while (vram_cap < kCapMax && vram_cap + kCapStep <= hard &&
+               demand > vram_cap)
+            vram_cap += kCapStep;
+    }
+
     size_t budget = 0;
     if (cfg_.expert_cache_mb > 0) {
+        // An explicit restriction wins over the policy: the user has said how
+        // much they want to spend, in expert bytes alone.
         budget = static_cast<size_t>(cfg_.expert_cache_mb) * 1024u * 1024u;
+    } else if (be_->caps().vram_free == 0) {
+        // CPU backend, or a driver that cannot say: no device memory to
+        // divide, so a generous fixed share of host RAM instead.
+        budget = static_cast<size_t>(512) * 1024u * 1024u;
+        if (total_bytes > 0 && total_bytes < budget) budget = total_bytes;
     } else {
-        const DeviceCaps &dc = be_->caps();
-        // Auto: prefer the whole routed-expert set when it fits in a
-        // generous share of free memory. A partial budget is worse than
-        // useless at MoE scale — top-k routing touches every expert
-        // within a few dozen tokens, so a set that only partly fits
-        // churns (evict + free + alloc + re-upload) forever, which costs
-        // far more than the memory the cap saves. When the set does not
-        // fit, fall back to a generous share of free memory and let the
-        // cache page. On the CPU (no VRAM accounting) allow a generous
-        // fixed share of host RAM.
-        // Three fifths of what is free *now*, not of what the card has. The
-        // budget is a soft cap on resident expert bytes only, and the KV
-        // cache, the workspaces, the dense trunk, the weight-pull staging
-        // buffers and the driver's own allocations all live beside it: at
-        // 0.75 a 15.9 GiB card measured 13.7 GiB in use, which is a cache
-        // decision made for the user rather than by them. 0.6 leaves ~5 GiB
-        // of headroom and --expert-cache-mb takes any number deliberately.
-        const size_t free_now = be_->device_free_bytes();
-        budget = free_now > 0
-                     ? static_cast<size_t>(static_cast<f64>(free_now) * 0.6)
-                     : static_cast<size_t>(512) * 1024u * 1024u;
-        const size_t total = model_.total_expert_bytes();
-        if (total > 0 && total < budget) budget = total;
+        // A partial budget is worse than useless at MoE scale: top-k routing
+        // touches every expert within a few dozen tokens, so a set that only
+        // partly fits churns (evict + free + alloc + re-upload) forever, which
+        // costs far more than the memory the cap saves. So the budget is
+        // whatever is left of the cap, and when the whole routed set fits in
+        // that, the set is what it holds.
+        budget = vram_cap > used_now ? vram_cap - used_now : 0;
+        if (total_bytes > 0 && total_bytes < budget) budget = total_bytes;
+        if (budget == 0 && total_bytes > 0) {
+            // The fixed allocations (weights, KV, workspaces) already fill the
+            // cap, which on a small card means the weights plus a default
+            // context do. A zero budget is legal -- every acquire is a file
+            // read -- but it is the worst shape this engine has, so keep a few
+            // experts resident and say so. --ctx is the real fix: KV is the
+            // elastic part, and a card this full wants a shorter context, not
+            // a slower cache.
+            const size_t floor_bytes = model_.max_expert_bytes() * 4;
+            budget = floor_bytes < total_bytes ? floor_bytes : total_bytes;
+            KRK_WARN("vram policy: weights, KV and workspaces already fill "
+                     "the %.1f GiB cap; expert budget floored at %.1f MiB "
+                     "(4 experts). A smaller --ctx is what actually buys VRAM "
+                     "back here.",
+                     static_cast<f64>(vram_cap) / static_cast<f64>(gib),
+                     static_cast<f64>(budget) / (1024.0 * 1024.0));
+        }
     }
+    KRK_INFO("vram policy: %.1f GiB cap (%.1f GiB already in use, %.1f GiB "
+             "demand, %.1f GiB free of %.1f GiB) -> expert budget %.1f MiB",
+             static_cast<f64>(vram_cap) / static_cast<f64>(gib),
+             static_cast<f64>(used_now) / static_cast<f64>(gib),
+             static_cast<f64>(demand) / static_cast<f64>(gib),
+             static_cast<f64>(free_now) / static_cast<f64>(gib),
+             static_cast<f64>(total_vram) / static_cast<f64>(gib),
+             static_cast<f64>(budget) / (1024.0 * 1024.0));
 
     if (cfg_.expert_cache_slots > 0) {
         const size_t one = model_.max_expert_bytes();

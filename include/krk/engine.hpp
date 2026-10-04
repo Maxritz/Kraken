@@ -42,6 +42,12 @@ struct EngineConfig {
     // sweep costs the whole corpus in wall time and RAM before the first token,
     // and read-through already admits every expert the run touches.
     bool expert_warm_prefetch = false;
+    // Total device memory this run is allowed to plan for, in MiB. 0 (the
+    // default) is the stepped policy in Engine::configure_expert_cache: 6 GiB
+    // to begin with, +2 GiB at a time while the card has the headroom and the
+    // model actually needs more, never above 12 GiB. A positive value is that
+    // many MiB and skips the policy entirely.
+    i32 vram_cap_mb = 0;
 };
 
 struct StreamSink {

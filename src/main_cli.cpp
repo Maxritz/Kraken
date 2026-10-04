@@ -28,6 +28,7 @@ struct Args {
     int device = 0;
     int threads = 0;
     int expert_cache_mb = 0;    // MoE expert residency budget (MiB), 0 = auto
+    int vram_cap_mb = 0;        // total device memory to plan for (MiB), 0 = policy
     int expert_cache_slots = 0; // MoE resident (layer, expert) slot cap, 0 = auto
     int expert_warm_mb = -1;     // MoE WARM tier in pageable host RAM (MiB): <0 auto, 0 off
     bool expert_warm_prefetch = false; // fill WARM at load instead of on demand
@@ -80,6 +81,12 @@ void usage() {
         "  --cpu                 use the scalar reference backend\n"
         "  --device N            HIP device index (default 0)\n"
         "  --expert-cache-mb N   MoE expert residency budget in MiB (0 = auto)\n"
+        "  --vram-cap-mb N       total device memory to plan for, in MiB. 0 uses\n"
+        "                        the policy: 6 GiB, then +2 GiB at a time while\n"
+        "                        the card has room and the model needs it, up to\n"
+        "                        12 GiB. Anything the run does not plan for -- a\n"
+        "                        long KV context, another application -- is what\n"
+        "                        the headroom is for.\n"
         "  --expert-cache-slots N  cap resident (layer, expert) slots (0 = auto)\n"
         "  --expert-warm-mb N     WARM expert cache in pageable host RAM. Cold\n"
         "                        reads land here before VRAM, VRAM evictions stay\n"
@@ -146,6 +153,8 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--seed") a->seed = std::strtoull(next("--seed"), nullptr, 10);
         else if (f == "--device") a->device = std::atoi(next("--device"));
         else if (f == "--threads") a->threads = std::atoi(next("--threads"));
+        else if (f == "--vram-cap-mb")
+            a->vram_cap_mb = std::atoi(next("--vram-cap-mb"));
         else if (f == "--expert-cache-mb")
             a->expert_cache_mb = std::atoi(next("--expert-cache-mb"));
         else if (f == "--expert-cache-slots")
@@ -480,6 +489,7 @@ int main(int argc, char **argv) {
     cfg.threads = a.threads;
     cfg.seed = a.seed;
     cfg.expert_cache_mb = a.expert_cache_mb;
+    cfg.vram_cap_mb = a.vram_cap_mb;
     cfg.expert_cache_slots = a.expert_cache_slots;
     cfg.expert_warm_mb = a.expert_warm_mb;
     cfg.expert_warm_prefetch = a.expert_warm_prefetch;
