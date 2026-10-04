@@ -1,0 +1,84 @@
+# Speculation heads and Qwen3.8 variants present on this machine, as kraken
+# sees them. Raw kraken-inspect output for the DFlash family.
+# 2026-10-04T22:11:14Z
+
+######## laguna-s-2.1-DFlash-Q4_K_M.gguf
+file       G:/More-models/laguna-s-2.1-DFlash-Q4_K_M.gguf
+version    GGUF v3
+alignment  32
+tensors    76
+payload    618.4 MiB
+arch       dflash — draft file (not a model)
+verdict    refused
+           - dflash speculative head set (dflash.*, 5-6 blocks) rather than a model; kraken's speculation drafts with --draft, a full model of the family
+           - uses an attention output gate (attn_gate), which this engine does not implement
+
+metadata:
+  general.architecture                           = "dflash"
+  general.type                                   = "model"
+  general.name                                   = "S21 Dflash"
+
+######## Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+file       G:/More-models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+version    GGUF v3
+alignment  32
+tensors    81
+payload    1.05 GiB
+arch       dflash — draft file (not a model)
+verdict    refused
+           - dflash speculative head set (dflash.*, 5-6 blocks) rather than a model; kraken's speculation drafts with --draft, a full model of the family
+
+metadata:
+  general.architecture                           = "dflash"
+  general.type                                   = "model"
+  general.name                                   = "Qwen3.8-27B-DFlash2"
+  general.author                                 = "Inco AI"
+
+######## Qwen3.8-27B-DSpark-Q8_0.gguf
+file       G:/More-models/Qwen3.8-27B-DSpark-Q8_0.gguf
+version    GGUF v3
+alignment  32
+tensors    62
+payload    1.35 GiB
+arch       dflash — draft file (not a model)
+verdict    refused
+           - dflash speculative head set (dflash.*, 5-6 blocks) rather than a model; kraken's speculation drafts with --draft, a full model of the family
+
+metadata:
+  general.architecture                           = "dflash"
+  general.type                                   = "model"
+  general.name                                   = "Source"
+  general.size_label                             = "1.4B"
+
+######## Qwen3.5-9B-DeepSeek-V4-Flash-MTP-Q3_K_M.gguf
+file       G:/More-models/Qwen3.5-9B-DeepSeek-V4-Flash-MTP-Q3_K_M.gguf
+version    GGUF v3
+alignment  32
+tensors    442
+payload    4.40 GiB
+arch       qwen35 — supported (recurrent)
+verdict    runnable
+           . carries 1 multi-token-prediction block(s) (blk.32) that this engine skips
+
+metadata:
+  general.architecture                           = "qwen35"
+  general.type                                   = "model"
+  general.name                                   = "Qwen3.5 9B DeepSeek V4 Flash MTP HF"
+  general.version                                = "V4"
+
+######## qwen3.8-flash-next-Q4.gguf
+file       G:/More-models/qwen3.8-flash-next-Q4.gguf
+version    GGUF v3
+alignment  32
+tensors    866
+payload    15.92 GiB
+arch       qwen35 — supported (recurrent)
+verdict    runnable
+           . carries 1 multi-token-prediction block(s) (blk.64) that this engine skips
+
+metadata:
+  general.architecture                           = "qwen35"
+  general.type                                   = "model"
+  general.sampling.top_k                         = 20
+  general.sampling.top_p                         = 0.95
+

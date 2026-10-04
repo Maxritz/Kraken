@@ -62,6 +62,85 @@ experts while the GPU works on the rest of the token. It is the obvious next
 lever for a Vulkan engine with no compute queue of its own, but their README
 does not say so and this repo has not measured it.
 
+## The speculation landscape
+
+Five methods are in wide use, and every one of them is **lossless** -- the
+accepted output is bit-identical to running the target alone, which is the only
+kind worth having here (vLLM's speculators docs and NVIDIA's TensorRT Edge-LLM
+guide both state it, and DFlash/DFlash2/DSpark/MTP all fall under it).
+
+| method | what it is | what it costs |
+|---|---|---|
+| **MTP** | extra block(s) inside the model file, trained to predict t+2, t+3 | nothing extra to load: the weights are already in the GGUF |
+| **DFlash** | block-parallel drafter: drafts a whole block of tokens in one pass | a second file, 0.6-1.8 GiB |
+| **DFlash2** | block-diffusion successor to DFlash; keeps the top candidates at every position. Reported "+20% more output from every verification pass for 1.3% added latency", up to **3.4x** end to end | a second file, 0.7-1.1 GiB |
+| **DSpark** | another drafter family in the same slot | a second file, 1.4-2.5 GiB |
+| **EAGLE-3 / P-EAGLE** | feature-level drafters | a separate model |
+
+What kraken sees of these locally, from `kraken-inspect`:
+
+| file | arch | verdict |
+|---|---|---|
+| `laguna-s-2.1-DFlash-Q4_K_M.gguf` | `dflash`, 6 blocks | refused: not a model |
+| `laguna-xs21-dflash-q8.gguf` | `dflash` | refused: not a model |
+| `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` | `dflash`, 5 blocks, 1.05 GiB | refused: not a model |
+| `Qwen3.8-27B-DSpark-Q8_0.gguf` | `dflash`, 5 blocks | refused: not a model |
+| `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` | `qwen35` | refused, but only on quant types this build cannot dequantize (#17/18/21/22/29) |
+| `Qwen3.5-9B-DeepSeek-V4-Flash-MTP-Q3_K_M.gguf` | `qwen35` | **runnable** |
+| `qwen3.8-flash-next-Q4.gguf` | `qwen35`, 65 blocks | **runnable** |
+
+Two conclusions fall out of that table and they change the priority order:
+
+1. **All three drafter families share one GGUF contract.** DFlash, DFlash2 and
+   DSpark are all `arch = dflash` with a `dflash.*` metadata block and `blk.N.*`
+   tensors. One loader path serves all three; there is no need to implement them
+   one at a time.
+2. **MTP is already loaded and deliberately skipped.** `src/model.cpp` reads
+   `nextn_predict_layers` and subtracts it from `n_layer`, so
+   `Qwen3.5-9B-DeepSeek-V4-Flash-MTP-Q3_K_M.gguf` runs today with its `blk.32`
+   prediction head present in VRAM and unused. Turning an already-resident head
+   into a drafter is strictly cheaper work than downloading a second file, which
+   matters more here than anywhere else: a second file is a second 0.6-2.5 GiB
+   of reads on a workload whose bottleneck is already 347 MiB/token of
+   compulsory I/O.
+
+Caveat worth recording: Poolside's own `Laguna-S-2.1-DFlash` card says it
+"requires Poolside's llama.cpp fork, branch `laguna` -- upstream llama.cpp ships
+the generic DFlash framework but not the Laguna decoder contract". The head
+inspects as six blocks with the target's own embedding and head geometry
+(3072 / 72 heads, 8 KV / head_dim 128, rms_eps 1e-6), so the decoder contract it
+needs is the one this engine already implements for Laguna -- but that is an
+inference from the tensors, not from running it.
+
+## Qwen3.8-Flash-Next: what it changes, and what kraken has
+
+Qwen3.8-Flash-Next is 125B of MoE plus a **51B-parameter n-gram embedding
+table** (20M entries, indexed by bigrams and trigrams) with 6B active, on a
+hybrid stack of **36 Gated DeltaNet layers and 12 Qwen Sparse Attention layers in
+a 3:1 schedule**, with **Gated Residual** (an element-wise data-dependent read
+gate and a per-branch scalar write gate on the residual stream) and a training
+recipe that splits Muon and AdamW across weight categories.
+
+None of that file is on this machine. What is here, under the filename
+`qwen3.8-flash-next-Q4.gguf`, is **Qwen3.8-27B** -- `general.name = "Qwen3.8-27B"`,
+65 blocks, 15.92 GiB, and it is **runnable in kraken today**: `qwen35` arch,
+Gated DeltaNet weights (`ssm_a`, `ssm_alpha`, `ssm_beta`, `ssm_conv1d`,
+`ssm_dt`, `ssm_norm`, `ssm_out`), gated attention (`attn_gate` on the 3:1
+schedule's attention layers), and one MTP block at `blk.64`.
+
+So the three Flash-Next-specific features are all **absent from kraken**:
+
+| feature | what it would take |
+|---|---|
+| **QSA** | a lightweight indexer that compresses the sequence into micro-blocks and selects at *micro-block* granularity, before the attention itself. Kraken's attention is full plus sliding-window; there is no indexer, and this is a long-context feature, not a decode one |
+| **Gated Residual** | an element-wise read gate plus a per-branch scalar write gate on the residual stream. Distinct from the `attn_gate` and the packed output gate the engine already has: those gate an attention *output*, this gates the residual *stream* |
+| **N-gram Embedding** | 20M-entry lookup table indexed by bigram/trigram. Not a matmul, so it wants exactly the tiering this engine already has for experts -- WARM, read-through, promotion -- with a different key. The one to build first of the three: it is the feature most aligned with what this engine already does well, and 51B of parameters that are looked up rather than multiplied is the cheapest kind of parameter scaling to serve from host RAM |
+
+The naming is worth a warning: a file called `qwen3.8-flash-next` that is
+actually Qwen3.8-27B will be counted as "Flash-Next supported" by anyone
+reading a filename list. Kraken prints `general.name`, which is how this was
+caught.
+
 ## The DFlash head Poolside ships for Laguna
 
 Not a separate project, but the other half of this one, and worth recording
