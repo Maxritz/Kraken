@@ -32,21 +32,27 @@
 //  oldest load. Guarantee: if at least one slot can hold the request, a pinned
 //  expert is never evicted; and the cache always makes progress (see acquire).
 //
-//  --- the second tier ---------------------------------------------------------
-//  Dropping a victim back to the GGUF mapping is the expensive part: the next
-//  request for it pays a fault storm and a re-read of a file, thousands of
-//  times larger than the weights. So a victim is *demoted* instead — copied to
-//  page-locked host memory and kept there under its own byte budget. The next
-//  request for that expert promotes it back into VRAM with a DMA instead of a
-//  reload, and the LFU counter, the pin and the load order all survive the
-//  round trip: a demoted expert is still the same expert. This is the shape
-//  the two-tier VRAM+RAM caches use, and it is where their measured ~1.4x
-//  decode speedup over a VRAM-only cache comes from.
+//  --- WARM: the read-through tier ---------------------------------------------
+//  COLD (the GGUF mapping) is the immutable canonical store, WARM is pageable
+//  host RAM, HOT is VRAM. Every expert read out of the file is admitted to WARM
+//  before it is copied on to VRAM (always-admit; see warm_admit), so a file
+//  read is never a one-shot: the next request for that expert is a promotion
+//  out of RAM instead of another read of the file. A VRAM eviction then costs
+//  nothing at all — the WARM copy is already there, so the slot simply stops
+//  being resident on the device and no bytes move. WARM eviction is a free():
+//  the file holds the canonical copy, and nothing is ever written back to it.
 //
-//  The tiers differ in one deliberate way: host copies ignore pins. A pin is a
-//  promise about VRAM residency, and a host copy is a cache of a cache — losing
-//  one costs a future DMA, never correctness — so the tier never lets a stale
-//  pin keep a slot alive that VRAM traffic has moved on from.
+//  WARM is inclusive — promotion keeps the RAM copy — and that is exactly why
+//  HOT -> WARM is free. It also means the WARM budget has to cover the hot set
+//  plus the recently loaded experts, and it is why WARM is pageable rather than
+//  page-locked: a tier sized in tens of GiB cannot come out of the pinned pool.
+//  The DMA that feeds VRAM is staged through a small bounded pinned ring
+//  instead (Backend::upload_paged), so the two allocations stay separate.
+//
+//  Host copies ignore pins: a pin is a promise about VRAM residency, and a WARM
+//  copy is a cache of a cache — losing one costs a future file read, never
+//  correctness — so the tier never lets a stale pin defend a copy that VRAM
+//  traffic has moved on from.
 //
 //  Pointers returned by acquire() stay valid until the next acquire() call.
 // ============================================================================
@@ -125,15 +131,12 @@ public:
     // The returned pointer is valid until the next acquire().
     const ResidentExpert *acquire(const ExpertSource &src, i32 layer, i32 expert);
 
-    // Fills the host tier from the source ahead of the run: the answer to
-    // *compulsory* misses, which is what a short generation is made of.
-    // Top-8 routing over a 256-expert stack reaches most of the set within a
-    // few dozen tokens, and without this every first touch reads three slices
-    // out of the model file (Laguna XS.2 measured 212 MiB/token that way at
-    // 8 tok/s, against 66.9% hits and zero demotions — the misses were not
-    // capacity misses, so the tier never saw them). Staged slots are
-    // demote-eligible like any other and carry an LFU count of 0, so they are
-    // the first out of the tier when room is needed. Returns bytes staged.
+    // Fills WARM from the source ahead of the run: the answer to *compulsory*
+    // misses, which is what a short generation is made of. Opt-in, because
+    // read-through already admits every expert the run touches and an eager
+    // sweep pays the whole corpus up front. Staged slots carry an LFU count of
+    // 0, so they are the first out of the tier when room is needed. Returns
+    // bytes staged.
     size_t preload(const ExpertSource &src, i32 layer);
     // One expert, so the caller can choose the order: expert-major across
     // layers when the tier is smaller than the corpus.
@@ -149,10 +152,14 @@ public:
     // Device-resident slots, i.e. the ones whose weights are in VRAM right now.
     size_t resident_slots() const { return vram_slots_; }
     size_t capacity_slots() const { return capacity_; }
-    // Second tier.
+    // WARM tier (the second tier). The warm_* names are the ones the reports
+    // use; the host_* spellings are kept for existing callers.
+    size_t warm_capacity_bytes() const { return host_budget_; }
+    size_t warm_used_bytes() const { return host_bytes_; }
+    size_t warm_slots() const;
     size_t host_budget_bytes() const { return host_budget_; }
     size_t host_resident_bytes() const { return host_bytes_; }
-    size_t host_slots() const;
+    size_t host_slots() const { return warm_slots(); }
     // Every slot the cache is tracking, in both tiers.
     size_t tracked_slots() const { return slots_.size(); }
     u64 loads() const { return loads_; }
@@ -162,6 +169,17 @@ public:
     // reload of the mapping. The load itself is not repeated, so this is
     // reported apart from hits() and loads().
     u64 host_hits() const { return host_hits_; }
+    // Acquires served by promoting out of WARM: every one of these is a file
+    // read that read-through turned into a RAM read.
+    u64 warm_hits() const { return host_hits_; }
+    // Experts admitted to WARM, and why admission ever failed: a tier that
+    // could not fit the expert after eviction, or an expert larger than the
+    // whole tier. Always-admit means rejects are rare by design.
+    u64 warm_admissions() const { return warm_admissions_; }
+    u64 warm_evictions() const { return warm_evictions_; }
+    u64 warm_rejects() const { return warm_rejects_; }
+    // Acquires that had to read the model file: the COLD tier's traffic.
+    u64 cold_misses() const { return loads_; }
     u64 demotions() const { return demotions_; }
     u64 promotions() const { return promotions_; }
     // Lifetime acquire count (hits + loads) since the last clear().
@@ -195,8 +213,9 @@ private:
         u32 count = 0;      // LFU counter, decayed
         u64 seq = 0;        // load order, the tie-break for victims
         bool pinned = false;
-        // A slot lives in exactly one tier at a time, so this is a promotion or
-        // demotion rather than a second copy.
+        // WARM is inclusive: a slot may sit in both tiers at once, and a HOT
+        // slot's WARM copy is what makes its eviction free. A slot in neither
+        // tier is forgotten (see forget_if_dead).
         bool in_vram() const { return m.gate.present(); }
         bool in_host() const { return h.gate.present(); }
     };
@@ -207,22 +226,24 @@ private:
     // place — a slot that is only in the host tier still knows what it is.
     void drop(Slot &s);
     void drop_host(Slot &s);
-    // Device -> host tier when the tier has room, else a full drop.
-    void retire(Slot &s, u64 keep_host_key);
-    // Copies the device weights into the tier and frees them there. False when
-    // the tier cannot take them (budget, or a failed pinned allocation).
-    // Copies one expert's three slices into page-locked host memory straight
-    // from the mapping, without a device copy in between.
-    bool stage_host(const ExpertSource &src, i32 expert, Slot &s);
-    bool demote_to_host(Slot &s, u64 keep_host_key);
+    // VRAM eviction. The device copy is released; a WARM copy, when the tier
+    // holds one, is what the slot falls back to — the bytes are already there,
+    // so the move is a counter, not a copy. Without one the slot falls to COLD.
+    void retire(Slot &s);
+    // One expert's three slices, read out of the model file into the pageable
+    // WARM buffers of `s` (read_host: a read(), not a mapping fault). A partial
+    // copy is dropped by the caller.
+    bool warm_fill(const ExpertSource &src, i32 expert, Slot &s);
+    // COLD -> WARM: makes room, fills, and counts the admission. Always-admit,
+    // except for an expert that cannot fit the entire tier.
+    bool warm_admit(const ExpertSource &src, i32 expert, Slot &s);
     // Host -> device. Makes VRAM room first, so it can evict like any miss.
     bool promote_to_vram(Slot &s);
     // Evicts until one more device slot fits. Over-resides by one rather than
-    // stalling when every resident slot is pinned. keep_host_key names a slot
-    // mid-promotion whose host copy must survive the evictions this triggers.
-    void make_vram_room(u64 keep_host_key);
-    // Evicts host copies until need bytes fit. Pins do not apply here.
-    void make_host_room(size_t need, u64 keep_host_key);
+    // stalling when every resident slot is pinned.
+    void make_vram_room();
+    // Evicts WARM copies until need bytes fit. Pins do not apply here.
+    void make_warm_room(size_t need);
     // Drops a slot from the map once it lives in neither tier.
     void forget_if_dead(std::unordered_map<u64, Slot>::iterator it);
     // Halves counters past the step and releases pins that no longer qualify.
@@ -237,9 +258,10 @@ private:
     // Picks the slot to sacrifice from device: unpinned, then rarest, then
     // oldest. Host-tier copies are not candidates — they are not in the way.
     bool pick_victim(u64 *out);
-    // Same ordering for the host tier, but pins do not protect a copy there
-    // and the caller's own slot is never a candidate.
-    bool pick_host_victim(u64 *out, u64 keep_key);
+    // WARM victim: a copy that is not backing a HOT slot goes first, then the
+    // same frequency ordering as the device tier. Pins do not protect a copy
+    // here.
+    bool pick_warm_victim(u64 *out);
 
     Backend *be_ = nullptr;
     size_t budget_ = 0;
@@ -255,10 +277,13 @@ private:
     u64 hits_ = 0;
     u64 host_hits_ = 0;
     u64 demotions_ = 0;
-    u64 bytes_loaded_ = 0;   // read from the mapping into VRAM
-    u64 bytes_demoted_ = 0;  // VRAM -> pinned host tier
-    u64 bytes_promoted_ = 0; // pinned host tier -> VRAM
-    u64 bytes_staged_ = 0;   // mapping -> pinned host tier, at load
+    u64 warm_admissions_ = 0;
+    u64 warm_evictions_ = 0;
+    u64 warm_rejects_ = 0;
+    u64 bytes_loaded_ = 0;   // read out of the model file, via WARM
+    u64 bytes_demoted_ = 0;  // VRAM evicted with a WARM copy already in place
+    u64 bytes_promoted_ = 0; // WARM -> VRAM
+    u64 bytes_staged_ = 0;   // file -> WARM ahead of the run (prefetch)
     f64 promote_ms_ = 0;     // wall time in promote_to_vram
     u64 promotions_ = 0;
     u64 decays_ = 0;

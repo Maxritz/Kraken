@@ -1872,7 +1872,7 @@ static MoeRun run_moe(const char *path, i32 cache_mb, i32 cache_slots,
     cfg.prefill_chunk = 8;
     cfg.expert_cache_mb = cache_mb;
     cfg.expert_cache_slots = cache_slots;
-    cfg.expert_l2_mb = l2_mb;
+    cfg.expert_warm_mb = l2_mb;
     std::string err;
     if (!engine.init(cpu, cfg, &err)) {
         std::fprintf(stderr, "  moe init failed: %s\n", err.c_str());
@@ -2232,82 +2232,94 @@ static void test_expert_cache_policy() {
 // ExpertCache second tier: VRAM slots over a page-locked host tier
 // ---------------------------------------------------------------------------
 
-static void test_expert_cache_l2_tier() {
-    const std::string path = "kraken-l2-test.gguf";
-    CHECK(build_expert_source_model(path), "wrote the L2-tier test GGUF");
+// ---------------------------------------------------------------------------
+// ExpertCache WARM tier: read-through residency over pageable host RAM
+// ---------------------------------------------------------------------------
+
+static void test_expert_cache_warm_tier() {
+    const std::string path = "kraken-warm-test.gguf";
+    CHECK(build_expert_source_model(path), "wrote the WARM-tier test GGUF");
 
     Backend *cpu = make_cpu_backend();
     CountingBackend be(cpu);
     Gguf g;
     std::string err;
-    CHECK(g.load(path, &err), "loaded the L2-tier test GGUF");
-    if (!err.empty()) std::fprintf(stderr, "  (l2 gguf: %s)\n", err.c_str());
+    CHECK(g.load(path, &err), "loaded the WARM-tier test GGUF");
+    if (!err.empty()) std::fprintf(stderr, "  (warm gguf: %s)\n", err.c_str());
     const ExpertSource src = expert_source(g);
-    CHECK(src.present(), "L2-test expert source is complete");
+    CHECK(src.present(), "WARM-test expert source is complete");
 
     ExpertCache cache;
     const auto touch = [&](i32 e) { return cache.acquire(src, 0, e) != nullptr; };
 
-    // 1. Two VRAM slots, four host slots. Nothing is demoted until a miss.
+    // 1. Read-through: a cold load lands in WARM first and is copied on to VRAM
+    //    from there, so the tier holds what the run actually touched instead of
+    //    being a staging area that empties itself.
     cache.configure(&be, 48, 96);
-    CHECK(cache.host_budget_bytes() == 96, "the host tier is configured");
-    CHECK(touch(0) && touch(1), "the first two experts load into VRAM");
-    CHECK(cache.resident_slots() == 2 && cache.host_slots() == 0,
-          "VRAM holds both experts and the tier is untouched");
-    CHECK(cache.tracked_slots() == 2, "only the two loaded experts are tracked");
+    CHECK(cache.warm_capacity_bytes() == 96, "the WARM tier is configured");
+    CHECK(touch(0) && touch(1), "the first two experts load");
+    CHECK(cache.warm_admissions() == 2, "both cold loads were admitted to WARM");
+    CHECK(cache.warm_slots() == 2 && cache.resident_slots() == 2,
+          "and both are still resident, in WARM and in VRAM");
+    CHECK(cache.warm_hits() == 0 && cache.demotions() == 0,
+          "nothing has been served out of WARM yet");
+    CHECK(be.host_allocs() == 6,
+          "read-through allocated one pageable copy per tensor, per expert");
 
-    // 2. A victim is demoted, not released. Both experts have one touch, so the
-    //    older load loses — and it must lose into the tier, keeping its history.
+    // 2. A VRAM eviction keeps the WARM copy and costs nothing: the one expert's
+    //    worth of host allocations here is the *new* expert's admission, not a
+    //    download of the victim. HOT -> WARM moves no bytes at all.
+    const u64 host_allocs_before = be.host_allocs();
     CHECK(touch(2), "expert 2 needs a slot");
-    CHECK(cache.evictions() == 1 && cache.demotions() == 1,
-          "the eviction demoted instead of releasing to the mapping");
-    CHECK(cache.resident_slots() == 2 && cache.host_slots() == 1,
-          "VRAM is full again and the tier holds the victim");
-    CHECK(cache.touch_count(0, 0) == 1, "a demoted expert keeps its LFU counter");
-    CHECK(be.host_allocs() == 3, "the demotion allocated one host copy per tensor");
+    CHECK(cache.evictions() == 1, "one VRAM eviction");
+    CHECK(cache.demotions() == 1, "the evicted expert stayed resident in WARM");
+    CHECK(cache.warm_slots() == 3, "WARM kept its own copy, not the device's");
+    CHECK(be.host_allocs() == host_allocs_before + 3,
+          "the eviction allocated nothing; only the new admission did");
+    CHECK(cache.touch_count(0, 0) == 1, "the evicted expert keeps its LFU counter");
 
-    // 3. Re-requesting the demoted expert is a DMA, not a reload of the mapping.
+    // 3. Re-requesting it is a promotion out of WARM, not a re-read of the file.
     const u64 loads_before = cache.loads();
-    CHECK(touch(0), "the demoted expert comes back");
-    CHECK(cache.loads() == loads_before, "a promotion does not re-read the mapping");
-    CHECK(cache.promotions() == 1 && cache.host_hits() == 1,
-          "the acquire was served by the host tier");
-    CHECK(cache.resident_slots() == 2, "the slot is back in VRAM");
-    CHECK(cache.host_slots() == 1,
-          "the slot it displaced to make room demoted into the tier");
-    CHECK(be.host_releases() == 3, "the promotion released the pinned copies");
+    CHECK(touch(0), "the WARM-resident expert comes back");
+    CHECK(cache.loads() == loads_before, "a promotion does not read the file");
+    CHECK(cache.promotions() == 1 && cache.warm_hits() == 1,
+          "the acquire was served out of WARM");
+    CHECK(cache.warm_slots() == 3, "WARM is inclusive: the copy outlived promotion");
+    CHECK(be.host_releases() == 0, "and no host copy was freed to make room for it");
     CHECK(cache.touch_count(0, 0) == 2,
           "a promoted expert keeps counting — it was hot before the eviction");
 
-    // 4. The tier is bounded by its own budget: room for one expert, so the
-    //    second demotion recycles the first one out of the tier.
+    // 4. WARM is bounded by its own budget: room for one expert, so each new
+    //    admission recycles the previous one out of the tier. Eviction is a
+    //    plain free: the file is the canonical copy and nothing is written back.
     cache.clear();
     cache.configure(&be, 48, 24);
     CHECK(touch(0) && touch(1) && touch(2) && touch(3), "four loads, two slots");
-    CHECK(cache.host_slots() == 1, "a one-expert tier never holds more than one");
+    CHECK(cache.warm_slots() == 1, "a one-expert tier never holds more than one");
     CHECK(cache.resident_slots() == 2, "VRAM still holds its two slots");
-    CHECK(cache.demotions() == 2, "both evictions demoted into the tier");
-    CHECK(cache.touch_count(0, 0) == 0,
-          "the recycled expert was forgotten, not left as a zero-count ghost");
-    CHECK(touch(1), "the expert still in the tier is reachable");
-    CHECK(cache.promotions() == 1, "it came back by promotion");
+    CHECK(cache.warm_evictions() > 0, "the tier evicted to stay inside its budget");
+    CHECK(cache.warm_rejects() == 0, "an expert that fits is never rejected");
 
-    // 5. An expert larger than the whole tier is dropped, not demoted: keeping
-    //    it would mean evicting everything and still not fitting.
+    // 5. An expert larger than the whole tier is rejected, not admitted: keeping
+    //    it would mean evicting everything and still not fitting. The load still
+    //    happens — from the mapping, as it did before the tier existed.
     cache.clear();
     cache.configure(&be, 24, 8);
     CHECK(touch(0) && touch(1), "a one-slot cache still makes progress");
-    CHECK(cache.demotions() == 0, "an expert bigger than the tier is never demoted");
-    CHECK(cache.host_slots() == 0 && cache.tracked_slots() == 1,
-          "the tier stays empty and the dropped slot leaves no trace");
+    CHECK(cache.warm_rejects() > 0, "an expert bigger than the tier is rejected");
+    CHECK(cache.warm_slots() == 0, "and nothing stays in the tier");
+    CHECK(cache.resident_slots() == 1 && cache.tracked_slots() == 1,
+          "the expert is still loaded, straight from the mapping");
 
-    // 6. With no tier configured the original behaviour is byte-for-byte intact.
-    const u64 host_allocs_before = be.host_allocs();
+    // 6. With no tier configured the original behaviour is intact: every miss is
+    //    a file read and an eviction drops the slot to COLD.
+    const u64 host_allocs_none = be.host_allocs();
     cache.clear();
     cache.configure(&be, 24);
     CHECK(touch(0) && touch(1), "loads proceed without a tier");
-    CHECK(cache.demotions() == 0 && cache.host_slots() == 0, "no tier, no demotions");
-    CHECK(be.host_allocs() == host_allocs_before,
+    CHECK(cache.warm_admissions() == 0 && cache.warm_slots() == 0,
+          "no tier, no admissions");
+    CHECK(be.host_allocs() == host_allocs_none,
           "a disabled tier never touches host memory");
     CHECK(cache.touch_count(0, 0) == 0,
           "an evicted expert without a tier is gone, history and all");
@@ -3093,7 +3105,7 @@ int main() {
     test_moe_matches_dense_twin();
     test_moe_grouped_prefill_matches_tokenwise();
     test_expert_cache_policy();
-    test_expert_cache_l2_tier();
+    test_expert_cache_warm_tier();
     test_gdn_ops();
     test_gdn_model_loads();
     test_gdn_generation();

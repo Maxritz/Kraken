@@ -5,12 +5,15 @@
 // for the reasoning — expert popularity is skewed and sticky, which is exactly
 // the workload LRU is worst at.
 //
-// Eviction has two destinations. Without a host budget a victim is released
-// and the next request re-reads the GGUF mapping; with one it is demoted to
-// page-locked host memory first, so the next request is a DMA. The tier can
-// also be filled ahead of the run (preload, below): on a stack with hundreds
-// of experts per layer a short generation is dominated by *first* touches,
-// and those are a miss the policy above can never turn into a hit.
+// Every cold read is read-through: the file read lands in WARM first and is
+// copied on to VRAM from there, so a compulsory miss is paid once and the next
+// request for that expert is a promotion. WARM is inclusive — a promotion keeps
+// the RAM copy — which is what makes a VRAM eviction free (no download, no
+// writeback), and a WARM eviction is a plain free(), because the file already
+// holds the canonical copy. The tier can also be filled ahead of the run
+// (preload, below): on a stack with hundreds of experts per layer a short
+// generation is dominated by *first* touches, and those are a miss the policy
+// above can never turn into a hit.
 #include "krk/expert_cache.hpp"
 
 #include <chrono>
@@ -24,10 +27,6 @@ u64 slot_key(i32 layer, i32 expert) {
     return (static_cast<u64>(static_cast<u32>(layer)) << 32) |
            static_cast<u32>(expert);
 }
-
-// Sentinel for "do not exclude any slot". Layer and expert ids are both
-// non-negative, so this key cannot name a real slot.
-constexpr u64 kNoSlot = ~static_cast<u64>(0);
 
 } // namespace
 
@@ -61,6 +60,9 @@ void ExpertCache::clear() {
     demotions_ = 0;
     promotions_ = 0;
     decays_ = 0;
+    warm_admissions_ = 0;
+    warm_evictions_ = 0;
+    warm_rejects_ = 0;
 }
 
 u32 ExpertCache::touch_count(i32 layer, i32 expert) const {
@@ -75,7 +77,7 @@ size_t ExpertCache::pinned_slots() const {
     return n;
 }
 
-size_t ExpertCache::host_slots() const {
+size_t ExpertCache::warm_slots() const {
     size_t n = 0;
     for (const auto &kv : slots_)
         if (kv.second.in_host()) n++;
@@ -101,7 +103,9 @@ void ExpertCache::drop(Slot &s) {
 void ExpertCache::drop_host(Slot &s) {
     if (!be_) return;
     for (QuantTensor *q : {&s.h.gate, &s.h.up, &s.h.down}) {
-        if (q->present() && q->data) be_->release_host(q->data);
+        // Deferred: a promotion copy of this expert may still be in flight on a
+        // side stream, and freeing the source under it is a use-after-free.
+        if (q->present() && q->data) be_->release_host_deferred(q->data);
         *q = {};
     }
     s.h = {};
@@ -114,87 +118,103 @@ void ExpertCache::forget_if_dead(std::unordered_map<u64, Slot>::iterator it) {
     if (!it->second.in_vram() && !it->second.in_host()) slots_.erase(it);
 }
 
-void ExpertCache::retire(Slot &s, u64 keep_host_key) {
+void ExpertCache::retire(Slot &s) {
     vram_slots_--;
     bytes_ -= s.bytes;
-    if (demote_to_host(s, keep_host_key)) {
+    drop(s);
+    // The device copy is gone. A WARM copy is exactly the destination the
+    // lifecycle asks for, and it costs nothing: the bytes are already resident,
+    // so HOT -> WARM is "stop counting VRAM", not a copy and not a write.
+    // Without one the slot falls to COLD (the file), where it came from.
+    if (s.in_host()) {
         demotions_++;
+        bytes_demoted_ += s.host_bytes;
         // The pin promised VRAM residency and that just went away under duress
         // (every other device slot was pinned). Keep the counter, drop the pin:
-        // the host tier must not inherit protection that VRAM traffic revoked.
+        // WARM must not inherit protection that VRAM traffic revoked.
         if (s.pinned) s.pinned = false;
-        return;
     }
-    drop(s);
 }
 
-void ExpertCache::make_vram_room(u64 keep_host_key) {
+void ExpertCache::make_vram_room() {
     // Evict until this one fits. The scan skips pinned slots; if every resident
     // slot is pinned and none can be dropped, the policy never gets stuck —
     // we simply over-reside by one slot and keep going. Correctness first:
     // the resident set is a performance hint, never an invariant.
-    //
-    // keep_host_key names a slot that is mid-promotion: it has no device copy
-    // yet, so it is invisible to pick_victim, but it still owns the host copy
-    // the promotion is about to read. The key is threaded all the way down so
-    // the demotions triggered here cannot evict it out from under us.
     while (vram_slots_ >= capacity_ && vram_slots_ > 0) {
         u64 victim = 0;
         if (!pick_victim(&victim)) break;
         auto vit = slots_.find(victim);
         if (vit == slots_.end()) break;
         const bool all_pinned = vit->second.pinned;
-        retire(vit->second, keep_host_key);
+        retire(vit->second);
         forget_if_dead(vit);
         evictions_++;
         if (all_pinned) break; // nothing unpinned existed; stop, do not pin-sweep
     }
 }
 
-void ExpertCache::make_host_room(size_t need, u64 keep_key) {
+void ExpertCache::make_warm_room(size_t need) {
+    // WARM eviction is cheap on purpose: the file is the immutable canonical
+    // copy, so a victim costs a free() and nothing else — no writeback, no
+    // demotion, no device traffic. Nothing here writes to the model file.
     if (host_budget_ == 0) return;
     while (host_bytes_ + need > host_budget_) {
         u64 victim = 0;
-        // `keep_key` is never a candidate: the slot being promoted still has
-        // its host copy at this point, and evicting it would free the very node
-        // the caller is holding a reference to.
-        if (!pick_host_victim(&victim, keep_key)) return; // nothing left to evict
+        if (!pick_warm_victim(&victim)) return; // nothing left to evict
         auto vit = slots_.find(victim);
         if (vit == slots_.end()) return;
         drop_host(vit->second);
+        warm_evictions_++;
         forget_if_dead(vit);
     }
 }
 
-bool ExpertCache::demote_to_host(Slot &s, u64 keep_host_key) {
-    if (!be_ || host_budget_ == 0 || !s.in_vram()) return false;
-    make_host_room(s.bytes, keep_host_key);
-    // An expert larger than the whole tier never fits: the alternative would be
-    // evicting the entire tier for one copy that still does not fit.
-    if (host_bytes_ + s.bytes > host_budget_) return false;
-
-    ResidentExpert h;
-    const QuantTensor *from[3] = {&s.m.gate, &s.m.up, &s.m.down};
-    QuantTensor *to[3] = {&h.gate, &h.up, &h.down};
+bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
+    if (!be_) return false;
+    const GgufTensor *from[3] = {src.gate, src.up, src.down};
+    QuantTensor *to[3] = {&s.h.gate, &s.h.up, &s.h.down};
+    size_t bytes = 0;
     for (int i = 0; i < 3; i++) {
-        if (!from[i]->present()) continue;
-        void *p = be_->alloc_host(s.slice[i]);
-        if (!p) {
-            // Pinned pool exhausted. Undo the partial copy and let the caller
-            // fall back to dropping the expert to the mapping.
-            for (QuantTensor *q : to)
-                if (q->present() && q->data) be_->release_host(q->data);
-            return false;
-        }
-        be_->download(p, from[i]->data, s.slice[i]);
-        *to[i] = *from[i];
+        const GgufTensor *t = from[i];
+        const size_t per = s.slice[i];
+        if (!t || per == 0) continue;
+        void *p = be_->alloc_host_pageable(per);
+        if (!p) return false; // partial copies are dropped by the caller
+        // A read() out of the page cache, not a memcpy of the mapping: the
+        // mapping faults one 4 KiB page at a time and would leave a resident
+        // page per staged byte, so the tier would cost the model's size in RAM
+        // on top of itself. read_host falls back to the mapping when the file
+        // path is unavailable.
+        const void *mapped = t->data + static_cast<size_t>(expert) * per;
+        if (!be_->read_host(p, mapped, per)) std::memcpy(p, mapped, per);
         to[i]->data = p;
+        to[i]->type = t->type;
+        to[i]->n_in = static_cast<i64>(t->ne[0]);
+        to[i]->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
+        bytes += per;
     }
-    s.h = h;
-    s.host_bytes = s.bytes;
+    s.host_bytes = bytes;
+    return true;
+}
+
+bool ExpertCache::warm_admit(const ExpertSource &src, i32 expert, Slot &s) {
+    if (!be_ || host_budget_ == 0 || s.bytes == 0) return false;
+    make_warm_room(s.bytes);
+    // An expert larger than the whole tier never fits: the alternative would be
+    // evicting the entire tier for one copy that still does not fit. That, and
+    // a failed allocation, are the only two rejects under always-admit.
+    if (host_bytes_ + s.bytes > host_budget_) {
+        warm_rejects_++;
+        return false;
+    }
+    if (!warm_fill(src, expert, s)) {
+        drop_host(s);
+        warm_rejects_++;
+        return false;
+    }
     host_bytes_ += s.host_bytes;
-    bytes_demoted_ += s.host_bytes;
-    drop(s); // the weights live in the tier now
+    warm_admissions_++;
     return true;
 }
 
@@ -212,13 +232,12 @@ bool ExpertCache::promote_to_vram(Slot &s) {
     } clock_out{&promote_ms_, t0};
     if (!be_ || !s.in_host()) return false;
     const u64 key = slot_key(s.layer, s.expert);
-    make_vram_room(key);
+    make_vram_room();
 
-    // Making room can demote (and therefore recurse through the tier), so
-    // re-establish that this slot is still tracked and still holds its copy
-    // before touching it. With the exclusion below it always is; this is the
-    // belt to that braces, and it turns any future aliasing into a plain miss
-    // instead of a write into a freed node.
+    // Eviction never touches WARM copies (retire keeps them), so the slot's own
+    // copy cannot be taken out from under this promotion. Re-establishing the
+    // reference anyway turns any future aliasing into a plain miss instead of a
+    // write into a freed node.
     {
         const auto it = slots_.find(key);
         if (it == slots_.end() || !it->second.in_host()) return false;
@@ -228,6 +247,13 @@ bool ExpertCache::promote_to_vram(Slot &s) {
     ResidentExpert m;
     const QuantTensor *from[3] = {&s.h.gate, &s.h.up, &s.h.down};
     QuantTensor *to[3] = {&m.gate, &m.up, &m.down};
+    // The three slices as one batch: the source is pageable WARM memory, and a
+    // batch lets the bounded pinned staging ring overlap the copies instead of
+    // serialising them through one buffer.
+    void *batch_dst[3] = {};
+    const void *batch_src[3] = {};
+    size_t batch_len[3] = {};
+    int nb = 0;
     for (int i = 0; i < 3; i++) {
         if (!from[i]->present()) continue;
         void *p = be_->alloc_pooled(s.slice[i]);
@@ -237,16 +263,20 @@ bool ExpertCache::promote_to_vram(Slot &s) {
                     be_->release_pooled(to[j]->data, s.slice[j]);
             return false;
         }
-        be_->upload(p, from[i]->data, s.slice[i]);
         *to[i] = *from[i];
         to[i]->data = p;
+        batch_dst[nb] = p;
+        batch_src[nb] = from[i]->data;
+        batch_len[nb] = s.slice[i];
+        nb++;
     }
+    be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
     s.m = m;
     vram_slots_++;
     bytes_ += s.bytes;
-    // The RAM copy has done its job; keeping it would double-count the bytes
-    // without making the next promotion any faster.
-    drop_host(s);
+    // The WARM copy stays — WARM is inclusive. It is what makes the next VRAM
+    // eviction of this expert free, and it costs only the RAM the tier has
+    // already budgeted for.
     bytes_promoted_ += s.bytes;
     promotions_++;
     return true;
@@ -299,23 +329,38 @@ bool ExpertCache::pick_victim(u64 *out) {
     return true;
 }
 
-bool ExpertCache::pick_host_victim(u64 *out, u64 keep_key) {
-    // Same frequency ordering as the device tier, minus the pin: a host copy is
-    // a cache of the mapping, so losing one costs a future DMA, not a reload
-    // storm. Letting a stale pin defend it here would make the tier grow into a
+bool ExpertCache::pick_warm_victim(u64 *out) {
+    // Same frequency ordering as the device tier, minus the pin: a WARM copy is
+    // a cache of the file, so losing one costs a future read, not a reload
+    // storm. Letting a stale pin defend it would make the tier grow into a
     // graveyard of experts VRAM traffic abandoned long ago.
+    //
+    // One addition: a copy that is not backing a VRAM-resident expert goes
+    // before one that is. A WARM-only slot is a promise of a cheap promotion;
+    // a WARM copy behind a HOT slot is a promise of a cheap eviction, so it is
+    // worth more. Only when the tier is entirely HOT shadows does a victim come
+    // from there.
     u64 best = 0;
     bool have = false;
+    bool best_shadow = false; // the copy backs an expert that is in VRAM
     for (const auto &kv : slots_) {
         const Slot &s = kv.second;
-        if (kv.first == keep_key) continue; // the caller's own slot
         if (!s.in_host()) continue;
+        const bool shadow = s.in_vram();
         if (!have) {
             best = kv.first;
+            best_shadow = shadow;
             have = true;
             continue;
         }
         const Slot &cur = slots_.at(best);
+        if (shadow != best_shadow) {
+            if (best_shadow) {
+                best = kv.first;
+                best_shadow = shadow;
+            }
+            continue;
+        }
         if (s.count < cur.count) {
             best = kv.first;
             continue;
@@ -327,54 +372,30 @@ bool ExpertCache::pick_host_victim(u64 *out, u64 keep_key) {
     return true;
 }
 
-bool ExpertCache::stage_host(const ExpertSource &src, i32 expert, Slot &s) {
-    const GgufTensor *from[3] = {src.gate, src.up, src.down};
-    QuantTensor *to[3] = {&s.h.gate, &s.h.up, &s.h.down};
-    size_t bytes = 0;
-    for (int i = 0; i < 3; i++) {
-        const GgufTensor *t = from[i];
-        const size_t per = s.slice[i];
-        if (!t || per == 0) continue;
-        void *p = be_->alloc_host(per);
-        if (!p) return false; // partial copies are dropped by the caller
-        // A host copy out of the mapping is a memcpy, not a device call. On a
-        // cold mapping the pages fault in one at a time — once, here, instead
-        // of on the token that first routes to this expert.
-        std::memcpy(p, t->data + static_cast<size_t>(expert) * per, per);
-        to[i]->data = p;
-        to[i]->type = t->type;
-        to[i]->n_in = static_cast<i64>(t->ne[0]);
-        to[i]->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
-        bytes += per;
-    }
-    s.host_bytes = bytes;
-    return true;
-}
-
 size_t ExpertCache::preload_one(const ExpertSource &src, i32 layer, i32 expert) {
     if (!be_ || !src.present() || host_budget_ == 0) return 0;
     if (expert < 0 || expert >= src.n_expert) return 0;
-    const size_t need = src.per_expert(src.gate) + src.per_expert(src.up) +
-                        src.per_expert(src.down);
-    if (need == 0 || host_bytes_ + need > host_budget_) return 0;
     const u64 key = slot_key(layer, expert);
     if (slots_.count(key)) return 0; // already resident in some tier
     Slot s;
     s.layer = layer;
     s.expert = expert;
-    s.bytes = need;
+    s.bytes = src.per_expert(src.gate) + src.per_expert(src.up) +
+              src.per_expert(src.down);
     s.slice[0] = src.per_expert(src.gate);
     s.slice[1] = src.per_expert(src.up);
     s.slice[2] = src.per_expert(src.down);
     s.seq = seq_++;
-    if (!stage_host(src, expert, s)) {
+    // Count 0 on purpose: a prefetched slot has earned nothing, so it is the
+    // first thing out of the tier when a run-time admission needs the room.
+    if (!warm_admit(src, expert, s)) {
         drop_host(s);
-        return 0; // the pinned pool is the limit; stop rather than thrash
+        return 0; // the tier is the limit; stop rather than thrash
     }
-    host_bytes_ += s.host_bytes;
-    bytes_staged_ += s.host_bytes;
+    const size_t staged = s.host_bytes;
+    bytes_staged_ += staged;
     slots_.emplace(key, std::move(s));
-    return need;
+    return staged;
 }
 
 size_t ExpertCache::preload(const ExpertSource &src, i32 layer) {
@@ -413,8 +434,8 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
             if (++acquires_ >= decay_period()) decay();
             return &s.m;
         }
-        // L2 hit: the weights are already in RAM, so this acquire costs a DMA
-        // instead of a re-read of the mapping. It also earns the same counter —
+        // WARM hit: the weights are already in RAM, so this acquire costs a DMA
+        // instead of a re-read of the file. It also earns the same counter —
         // an expert hot enough to be evicted is still hot.
         if (promote_to_vram(s)) {
             touch(s);
@@ -426,8 +447,6 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
         // the mapping; the host copy survives, so the next request is cheaper.
     }
 
-    make_vram_room(kNoSlot);
-
     Slot s;
     s.layer = layer;
     s.expert = expert;
@@ -438,18 +457,46 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     s.count = 1; // a fresh load has already earned one touch
     s.seq = seq_++;
 
+    // COLD -> WARM -> HOT, in that order. Read-through is the invariant: the
+    // file read lands in WARM before it lands in VRAM, so this miss is paid
+    // once and the next request for the expert is a promotion instead of
+    // another read. (The earlier path read straight into VRAM and dropped the
+    // bytes, which is why 41% of acquires stayed file loads forever.) Admission
+    // is always-admit; when the tier refuses — disabled, or an expert larger
+    // than the whole tier — the load still happens, from the mapping.
+    warm_admit(src, expert, s);
+
+    make_vram_room();
+
     const i32 e = expert;
-    auto load = [&](const GgufTensor *t, size_t per, QuantTensor *out) {
-        if (!t || per == 0) return;
-        out->data = be_->alloc_pooled(per);
-        be_->upload(out->data, t->data + static_cast<size_t>(e) * per, per);
-        out->type = t->type;
-        out->n_in = static_cast<i64>(t->ne[0]);
-        out->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
-    };
-    load(src.gate, gate_b, &s.m.gate);
-    load(src.up, up_b, &s.m.up);
-    load(src.down, down_b, &s.m.down);
+    const GgufTensor *srcs[3] = {src.gate, src.up, src.down};
+    QuantTensor *dsts[3] = {&s.m.gate, &s.m.up, &s.m.down};
+    const QuantTensor *warms[3] = {&s.h.gate, &s.h.up, &s.h.down};
+    const size_t lens[3] = {gate_b, up_b, down_b};
+    void *batch_dst[3] = {};
+    const void *batch_src[3] = {};
+    size_t batch_len[3] = {};
+    int nb = 0;
+    for (int i = 0; i < 3; i++) {
+        const GgufTensor *t = srcs[i];
+        const size_t per = lens[i];
+        if (!t || per == 0) continue;
+        dsts[i]->data = be_->alloc_pooled(per);
+        dsts[i]->type = t->type;
+        dsts[i]->n_in = static_cast<i64>(t->ne[0]);
+        dsts[i]->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
+        if (warms[i]->present() && warms[i]->data) {
+            batch_dst[nb] = dsts[i]->data;
+            batch_src[nb] = warms[i]->data;
+            batch_len[nb] = per;
+            nb++;
+        } else {
+            // Rejected or no tier: read it in the way the cache did before the
+            // tier existed, straight from the mapping through the pull path.
+            be_->upload(dsts[i]->data, t->data + static_cast<size_t>(e) * per, per);
+        }
+    }
+    be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
 
     bytes_ += need;
     vram_slots_++;

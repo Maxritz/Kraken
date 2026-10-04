@@ -187,6 +187,13 @@ void topk_launch(const T *logits, const u32 *pm, f32 rep_pen, f32 softcap,
 enum class GemmRung { kWmma, kDp4a, kSimt };
 enum class GemmPath { kAuto, kWmma, kDp4a, kSimt };
 
+// Small hot-path H2D staging (see HipBackend::stage_upload): one pinned
+// allocation, kStageSlots slots, rotated per use, each guarded by its own
+// event. kStageMaxBytes is the largest upload that rides the ring; a larger
+// source is a weight that goes through the pull path or a pageable copy.
+static constexpr size_t kStageMaxBytes = 64u * 1024u;
+static constexpr int kStageSlots = 64;
+
 class HipBackend final : public Backend {
 public:
     HipBackend(int index, const hipDeviceProp_t &p, const DeviceCaps &c)
@@ -269,14 +276,42 @@ public:
     // resident workspace), and the whole pool holds at most 256 MiB of free
     // blocks. The first version kept up to 512 blocks per size with no total
     // cap and pushed the card into its own allocations on a 1.2 GiB model.
+    // A pooled block remembers the moment it became reusable. An expert
+    // evicted on the host side may still be read by kernels already queued on
+    // the default stream, and the pool is exactly what would hand that block to
+    // the next expert before they are done: measured on a 3 GiB VRAM budget the
+    // engine emitted different text on every run until this event existed.
+    struct PoolBlock {
+        void *p = nullptr;
+        hipEvent_t ev = nullptr; // recorded on the default stream at release
+    };
     void *alloc_pooled(size_t bytes) override {
         const size_t rounded = (bytes + 255u) & ~static_cast<size_t>(255u);
         auto it = pool_.find(rounded);
         if (it != pool_.end() && !it->second.empty()) {
-            void *p = it->second.back();
-            it->second.pop_back();
+            std::vector<PoolBlock> &v = it->second;
+            // Prefer a block the device is already done with; the events are
+            // in release order, so the first ready one is also the oldest.
+            size_t pick = 0;
+            for (size_t i = 0; i < v.size(); i++) {
+                if (!v[i].ev || hipEventQuery(v[i].ev) == hipSuccess) {
+                    pick = i;
+                    break;
+                }
+                static_cast<void>(hipGetLastError()); // hipErrorNotReady is not
+                                                      // a sticky failure
+            }
+            PoolBlock b = v[pick];
+            v.erase(v.begin() + pick);
+            if (b.ev) {
+                // Nothing was ready: wait for that block's reuse point rather
+                // than allocating new VRAM. The wait is bounded by the queue
+                // the device had already been given.
+                KRK_HIP(hipEventSynchronize(b.ev));
+                (void)hipEventDestroy(b.ev);
+            }
             pool_bytes_ -= rounded;
-            return p;
+            return b.p;
         }
         return alloc(rounded);
     }
@@ -284,14 +319,21 @@ public:
         if (!p) return;
         const size_t rounded = (bytes + 255u) & ~static_cast<size_t>(255u);
         if (rounded <= (4u << 20) && pool_bytes_ + rounded <= kPoolCapBytes) {
-            pool_[rounded].push_back(p);
+            hipEvent_t ev = nullptr;
+            if (hipEventCreateWithFlags(&ev, hipEventDisableTiming) != hipSuccess) {
+                static_cast<void>(hipGetLastError());
+                hipFree(p); // no guard to be had: take the synchronising free
+                return;
+            }
+            (void)hipEventRecord(ev, 0);
+            pool_[rounded].push_back(PoolBlock{p, ev});
             pool_bytes_ += rounded;
             return;
         }
         hipFree(p);
     }
     static constexpr size_t kPoolCapBytes = 256u << 20;
-    std::unordered_map<size_t, std::vector<void *>> pool_;
+    std::unordered_map<size_t, std::vector<PoolBlock>> pool_;
     size_t pool_bytes_ = 0;
     // The expert cache's L2 tier. Page-locked so demote (device->host) and
     // promote (host->device) are straight DMAs; unpinned staging would spend
@@ -311,6 +353,304 @@ public:
     }
     void release_host(void *p) override {
         if (p) KRK_HIP(hipHostFree(p));
+    }
+
+    // The WARM tier, in pageable RAM. This is where the expert set lives when
+    // it does not fit in VRAM: tens of GiB on a big box, swappable, and free to
+    // shrink, so it must not be drawn from the pinned pool (that pool is small,
+    // non-swappable, and shared with the pull ring and the hot-path staging
+    // ring, all of which stop working when it is exhausted). The WARM -> HOT
+    // promotion stages through a bounded pinned ring instead (upload_paged), so
+    // every DMA keeps a real pinned source of about 16 MiB whatever WARM costs.
+    void *alloc_host_pageable(size_t bytes) override {
+        return host_alloc(bytes ? bytes : 1, 64);
+    }
+    void release_host_pageable(void *p) override {
+        if (p) host_free(p);
+    }
+    // WARM memory given back while a promotion copy may still be reading it.
+    // The copies are ordered back into the default stream, so an event recorded
+    // there marks the point after which the buffer is really free. Freeing it
+    // eagerly is a use-after-free that a greedy decode reports as "plausible
+    // text, different every run" -- which is exactly what the 3 GiB-VRAM arm
+    // did before this list existed.
+    struct DeferredHostFree {
+        void *p = nullptr;
+        hipEvent_t ev = nullptr;
+    };
+    static constexpr size_t kDeferredMax = 256;
+    std::vector<DeferredHostFree> host_pending_;
+    void release_host_deferred(void *p) override {
+        if (!p) return;
+        if (host_pending_.size() >= kDeferredMax) host_deferred_flush_(false);
+        hipEvent_t ev = nullptr;
+        if (hipEventCreateWithFlags(&ev, hipEventDisableTiming) != hipSuccess) {
+            static_cast<void>(hipGetLastError());
+            release_host_pageable(p); // no guard available: free it the safe way
+            return;
+        }
+        (void)hipEventRecord(ev, 0);
+        host_pending_.push_back(DeferredHostFree{p, ev});
+    }
+    // Frees every pending buffer whose copy has landed. `drain` waits for the
+    // device first and is for teardown, when no copy may outlive the backend.
+    void host_deferred_flush_(bool drain) {
+        if (drain) (void)hipDeviceSynchronize();
+        size_t keep = 0;
+        for (size_t i = 0; i < host_pending_.size(); i++) {
+            DeferredHostFree d = host_pending_[i];
+            bool done = drain || !d.ev;
+            if (!done) {
+                done = hipEventQuery(d.ev) == hipSuccess;
+                if (!done) static_cast<void>(hipGetLastError());
+            }
+            if (!done) {
+                host_pending_[keep++] = d;
+                continue;
+            }
+            if (d.ev) (void)hipEventDestroy(d.ev);
+            release_host_pageable(d.p);
+        }
+        host_pending_.resize(keep);
+    }
+    // A cold expert is read() straight into its WARM slot. Through the mapping
+    // it would fault one 4 KiB page at a time (the same 3.87 GB/s fault path
+    // upload()'s comment describes); read() out of the page cache is several
+    // times that and leaves no mapping page resident, so the tier does not
+    // double-count the model in RAM. Falls back to the mapping copy whenever
+    // the file path is unavailable, so callers never see an unfilled buffer.
+    bool read_host(void *dst, const void *mapped_src, size_t bytes) override {
+        if (bytes == 0) return true;
+        KRK_TIME_OP("warm_read");
+        const u8 *s = static_cast<const u8 *>(mapped_src);
+        if (pull_path_.empty() || !pull_map_ || pull_disabled_ || s < pull_map_ ||
+            s + bytes > pull_map_ + pull_map_size_) {
+            std::memcpy(dst, mapped_src, bytes);
+            return true;
+        }
+        if (!warm_reader_.ok() && !warm_reader_.open(pull_path_)) {
+            std::memcpy(dst, mapped_src, bytes);
+            return true;
+        }
+        // As in load_pull_: the pointer's distance from the map base IS the
+        // file offset, because the tensor directory already folded the data
+        // section in when it set t.data.
+        const size_t off = static_cast<size_t>(s - pull_map_);
+        if (warm_reader_.at(off, dst, bytes)) return true;
+        std::memcpy(dst, mapped_src, bytes); // read failed: never hand back garbage
+        return true;
+    }
+    // WARM -> HOT. A pageable hipMemcpy works but performs the whole transfer
+    // inside the driver's bounce buffer; this stages the copy through the small
+    // bounded pinned ring instead, double-buffered, so the DMA overlaps the
+    // next memcpy. A batch smaller than one chunk rides the hot-path staging
+    // ring (stage_upload) and never allocates anything.
+    //
+    // Each chunk lands in a pinned ring slot and is copied on that slot's own
+    // non-blocking stream, so the copy does not queue behind the kernels already
+    // on the default stream. A single, device-wide hipDeviceSynchronize per
+    // slice (the first version) drained the whole pipeline: 4321 experts
+    // promoted at 1.9 GB/s. Copies on the default stream instead are correct by
+    // construction but wait for the kernels ahead of them: 2.0 GB/s. A host wait
+    // on the side stream is what shipped, because an event the default stream
+    // waits on did not make the copy visible here (see paged_publish_).
+    void upload_paged(void *dst, const void *src, size_t bytes) override {
+        if (bytes == 0) return;
+        KRK_TIME_OP("upload_paged");
+        if (!host_pending_.empty()) host_deferred_flush_(false);
+        if (paged_blocking_()) {
+            // A/B switch: the blocking pageable copy, ordered behind everything
+            // already queued on the default stream. Slow, and it drains the
+            // queue, but it is the reference the side-stream path is measured
+            // against -- and the fallback when the pinned ring cannot be built.
+            KRK_HIP(hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice));
+            return;
+        }
+        if (bytes <= kStageMaxBytes && stage_upload(dst, src, bytes)) return;
+        if (!paged_ready_()) {
+            // Pinned memory is finite and losing the ring must degrade the
+            // path, not the run (same rule as the pull fallback).
+            KRK_HIP(hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice));
+            return;
+        }
+        int used[kPagedBufs];
+        int nused = 0;
+        const char *s = static_cast<const char *>(src);
+        char *d = static_cast<char *>(dst);
+        for (size_t off = 0; off < bytes; off += paged_chunk_) {
+            const size_t len = std::min(paged_chunk_, bytes - off);
+            const int slot = paged_take_();
+            if (slot < 0) { // ring unusable: fall back to the blocking copy
+                KRK_HIP(hipMemcpy(d + off, s + off, len, hipMemcpyHostToDevice));
+                continue;
+            }
+            std::memcpy(paged_buf_[slot], s + off, len);
+            KRK_HIP(hipMemcpyAsync(d + off, paged_buf_[slot], len,
+                                   hipMemcpyHostToDevice, paged_stream_[slot]));
+            KRK_HIP(hipEventRecord(paged_ev_[slot], paged_stream_[slot]));
+            paged_used_[slot] = true;
+            if (nused < kPagedBufs) used[nused++] = slot;
+        }
+        paged_publish_(used, nused);
+    }
+    // One expert is three slices, and three separate calls serialise: each one
+    // waits for the buffer it is about to refill. Batching them shares a single
+    // ring cursor, so slice N+1 stages while slice N is still in flight.
+    void upload_paged_batch(void *const dst[], const void *const src[],
+                            const size_t bytes[], int n) override {
+        if (n <= 0) return;
+        KRK_TIME_OP("upload_paged");
+        i64 batch_bytes = 0;
+        if (!host_pending_.empty()) host_deferred_flush_(false);
+        if (paged_blocking_()) {
+            for (int i = 0; i < n; i++)
+                if (dst[i] && src[i] && bytes[i])
+                    KRK_HIP(hipMemcpy(dst[i], src[i], bytes[i], hipMemcpyHostToDevice));
+            return;
+        }
+        if (!paged_ready_()) {
+            for (int i = 0; i < n; i++)
+                if (dst[i] && src[i] && bytes[i])
+                    upload_paged(dst[i], src[i], bytes[i]);
+            return;
+        }
+        if (paged_direct_() && paged_ready_()) {
+            // KRK_WARM_DMA=2. The driver stages a pageable source into its own
+            // pinned buffer; issuing all three slices on one side stream then
+            // leaves one host wait for the batch instead of one per slice.
+            for (int i = 0; i < n; i++) {
+                if (!dst[i] || !src[i] || !bytes[i]) continue;
+                KRK_HIP(hipMemcpyAsync(dst[i], src[i], bytes[i],
+                                       hipMemcpyHostToDevice, paged_stream_[0]));
+                batch_bytes += static_cast<i64>(bytes[i]);
+            }
+            KRK_HIP(hipStreamSynchronize(paged_stream_[0]));
+            krk_op_scope.bytes(batch_bytes);
+            return;
+        }
+        int used[kPagedBufs];
+        int nused = 0;
+        for (int i = 0; i < n; i++) {
+            if (!dst[i] || !src[i] || !bytes[i]) continue;
+            char *d = static_cast<char *>(dst[i]);
+            const char *s = static_cast<const char *>(src[i]);
+            for (size_t off = 0; off < bytes[i]; off += paged_chunk_) {
+                const size_t len = std::min(paged_chunk_, bytes[i] - off);
+                const int slot = paged_take_();
+                if (slot < 0) {
+                    KRK_HIP(hipMemcpy(d + off, s + off, len, hipMemcpyHostToDevice));
+                    continue;
+                }
+                std::memcpy(paged_buf_[slot], s + off, len);
+                KRK_HIP(hipMemcpyAsync(d + off, paged_buf_[slot], len,
+                                       hipMemcpyHostToDevice, paged_stream_[slot]));
+                KRK_HIP(hipEventRecord(paged_ev_[slot], paged_stream_[slot]));
+                batch_bytes += static_cast<i64>(len);
+                paged_used_[slot] = true;
+                if (nused < kPagedBufs) used[nused++] = slot;
+            }
+        }
+        krk_op_scope.bytes(batch_bytes);
+        paged_publish_(used, nused);
+    }
+    // Closes a batch of side-stream copies. The host waits for the copies --
+    // not for the kernel queue: each copy runs on its own stream, beside the
+    // kernels, and the wait is only for that stream. When this returns, the
+    // weights are in VRAM, the staging slot is idle and so is the WARM source.
+    //
+    // The host wait is the correct part, and it was measured three ways. An
+    // event the default stream waits on (recorded after the copy: per slot, or
+    // per batch from a ring) did not make the copy visible to the next kernel on
+    // this runtime. The prefetch arm emitted garbage on roughly one run in four
+    // with each of them, and 4/4 clean once the host waited here. Copies issued
+    // on the default stream instead are correct by construction but queue behind
+    // the kernels already on it, which measured 2.0 GB/s against 3.2-4.3 GB/s
+    // for this shape.
+    void paged_publish_(const int used[], int nused) {
+        for (int i = 0; i < nused; i++)
+            if (paged_stream_[used[i]])
+                KRK_HIP(hipStreamSynchronize(paged_stream_[used[i]]));
+    }
+    // Claims a ring slot to write into, waiting only on the copy that last used
+    // it -- an event, not the device. Returns -1 when the ring cannot be used.
+    int paged_take_() {
+        for (int tries = 0; tries < kPagedBufs; tries++) {
+            const int i = paged_next_;
+            paged_next_ = (paged_next_ + 1) % kPagedBufs;
+            if (!paged_used_[i]) return i; // nothing has filled this slot yet
+            if (hipEventSynchronize(paged_ev_[i]) == hipSuccess) return i;
+            static_cast<void>(hipGetLastError());
+        }
+        return -1;
+    }
+    // Lazily builds the promotion ring. Chunk size, and with it the pinned
+    // footprint (kPagedBufs * chunk), is sweepable with KRK_WARM_STAGE_KIB.
+    // KRK_WARM_DMA=0 restores the blocking copy for the WARM -> HOT path, so a
+    // change here can be measured against what it replaced. KRK_WARM_DMA=2
+    // skips the ring and has the runtime stage a pageable source itself, on one
+    // side stream -- the same double copy without the ring bookkeeping, and one
+    // sync per batch instead of one per slice.
+    static bool paged_blocking_() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_WARM_DMA");
+            return e && e[0] == '0';
+        }();
+        return v;
+    }
+    static bool paged_direct_() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_WARM_DMA");
+            return e && e[0] == '2';
+        }();
+        return v;
+    }
+    bool paged_ready_() {
+        if (paged_on_) return true;
+        if (paged_failed_) return false;
+        if (const char *e = std::getenv("KRK_WARM_STAGE_KIB")) {
+            const long k = std::atol(e);
+            if (k >= 64 && k <= 8192) paged_chunk_ = static_cast<size_t>(k) << 10;
+        }
+        for (int i = 0; i < kPagedBufs; i++) {
+            if (hipHostMalloc(&paged_buf_[i], paged_chunk_) != hipSuccess) {
+                static_cast<void>(hipGetLastError());
+                KRK_WARN("warm promotion ring: pinned staging of %zu bytes failed",
+                         paged_chunk_);
+                paged_failed_ = true;
+                return false;
+            }
+            // Non-blocking: a plain stream has implicit synchronization with
+            // the legacy default stream every kernel runs on, which is the
+            // queueing this whole exercise exists to avoid.
+            if (hipStreamCreateWithFlags(&paged_stream_[i], hipStreamNonBlocking) !=
+                    hipSuccess ||
+                hipEventCreateWithFlags(&paged_ev_[i], hipEventDisableTiming) !=
+                    hipSuccess) {
+                static_cast<void>(hipGetLastError());
+                paged_failed_ = true;
+                return false;
+            }
+        }
+        paged_on_ = true;
+        return true;
+    }
+    void paged_release_() {
+        for (int i = 0; i < kPagedBufs; i++) {
+            if (paged_buf_[i]) {
+                (void)hipHostFree(paged_buf_[i]);
+                paged_buf_[i] = nullptr;
+            }
+            if (paged_ev_[i]) {
+                (void)hipEventDestroy(paged_ev_[i]);
+                paged_ev_[i] = nullptr;
+            }
+            if (paged_stream_[i]) {
+                (void)hipStreamDestroy(paged_stream_[i]);
+                paged_stream_[i] = nullptr;
+            }
+            paged_used_[i] = false;
+        }
+        paged_on_ = false;
     }
     // Installs the pull-style weight path (see Backend::set_weight_pull). The
     // loader hands over the path and the mapping's address range; this class
@@ -650,7 +990,11 @@ public:
             tok_dev_ = nullptr;
             KRK_HIP(hipMalloc(&tok_dev_, tok_cap_));
         }
-        stage_upload(tok_dev_, tokens, need);
+        // Same rule as stage_pos: the ring declines anything over
+        // kStageMaxBytes, and an upload that silently did not happen would
+        // embed whatever the buffer happened to hold.
+        if (!stage_upload(tok_dev_, tokens, need))
+            KRK_HIP(hipMemcpy(tok_dev_, tokens, need, hipMemcpyHostToDevice));
         embed_kernel<128><<<static_cast<unsigned>(n_tok), 128>>>(
             static_cast<_Float16 *>(out), static_cast<const u8 *>(tok_embd),
             static_cast<int>(tt), n_vocab, n_embd, row_bytes,
@@ -1327,6 +1671,14 @@ public:
 
     ~HipBackend() override {
         pull_release_();
+        paged_release_();
+        for (int i = 0; i < kStageSlots; i++) {
+            if (stage_ev_[i]) {
+                (void)hipEventDestroy(stage_ev_[i]);
+                stage_ev_[i] = nullptr;
+            }
+        }
+        host_deferred_flush_(true); // no copy may outlive the backend
         OpTime::get().finish();
         if (tok_dev_) {
             (void)hipFree(tok_dev_);
@@ -1406,9 +1758,12 @@ private:
     i64 pos_staged_ = 0;
     bool pos_valid_ = false;
     // Pinned staging ring for the small hot-path H2D transfers (see
-    // stage_upload): one allocation, kStageSlots slots, rotated per use.
+    // stage_upload): one allocation, kStageSlots slots, each guarded by an
+    // event that marks the copy the slot still owes the device.
     void *stage_pin_ = nullptr;
     size_t stage_stride_ = 0;
+    // One event per slot: it marks the copy the slot still owes the device.
+    hipEvent_t stage_ev_[kStageSlots] = {};
     // Set by the loader (see set_read_upload): pulls a tensor in with
     // read() into a pinned buffer and copies from there. Returns false
     // to fall back to the direct hipMemcpy.
@@ -1427,6 +1782,28 @@ private:
     bool pull_on_ = false;
     bool pull_disabled_ = false;
     FileReader pull_readers_[kPullThreads];
+    // WARM fill path. Its own handle, like every pull reader: a Windows HANDLE
+    // serialises concurrent ReadFile, so sharing one with the pull ring would
+    // put cold-expert reads and weight pulls in each other's way.
+    FileReader warm_reader_;
+    // Bounded pinned staging ring for WARM -> HOT promotions (upload_paged).
+    // Small on purpose: it is the DMA's in-flight pipeline, not a cache, and
+    // nothing in it outlives the copy. Total pinned bytes is kPagedBufs *
+    // paged_chunk_, 16 MiB by default -- sitting beside a WARM tier that may be
+    // tens of GiB, which is the point of keeping the two allocations apart.
+    static constexpr int kPagedBufs = 4;
+    static constexpr size_t kPagedChunk = 4u << 20;
+    void *paged_buf_[kPagedBufs] = {};
+    hipStream_t paged_stream_[kPagedBufs] = {};
+    // One event per slot, recorded on that slot's stream. It guards the slot
+    // against being refilled before its own copy landed, and it is what the
+    // default stream waits on to observe the weights.
+    hipEvent_t paged_ev_[kPagedBufs] = {};
+    bool paged_used_[kPagedBufs] = {};
+    int paged_next_ = 0;
+    bool paged_on_ = false;
+    bool paged_failed_ = false;
+    size_t paged_chunk_ = kPagedChunk;
     char *pull_buf_[kPullThreads][kPullBufs] = {};
     hipStream_t pull_stream_[kPullThreads][kPullBufs] = {};
     int stage_slot_ = 0;
@@ -1484,48 +1861,114 @@ private:
 // kernel that reads the buffer) while returning to the host at once.
 //
 // The pinned source has to be rotated: the DMA reads it asynchronously, so the
-// host must not overwrite the slot an earlier copy is still reading. On the
-// decode path the host does ~2.5 us of work per kernel launch between two
-// uploads and a 4-byte DMA retires in well under a microsecond, so the depth
-// here is orders of magnitude more than the in-flight count. It is a named
-// constant rather than a computed bound because the thing it is bounding is
-// "uploads issued per unit of host work", which no allocation policy can
-// express — a path that batches uploads more tightly than it launches kernels
-// would need a bigger ring, and the coherence gate is what would catch it.
+// host must not overwrite a slot an earlier copy is still reading. The first
+// version simply trusted the rotation depth, on the theory that a 4-byte DMA
+// retires long before the ring wraps. That theory is wrong: the retire time is
+// not the bound, the queue position is. A prefill layer queues thousands of
+// kernels, every upload sits behind all of them, and a slot rewritten while its
+// DMA was still queued made that DMA read the *new* bytes -- a plan or alpha
+// belonging to a different expert, silently. Measured on a 682-token prompt: 5
+// runs, 4 distinct outputs with the unguarded ring, against 3 runs and one
+// output with KRK_STAGE_SYNC=1 (blocking copies). The guard is one event per
+// slot: a slot is reused only once its own copy has completed, and when all 64
+// slots are still in flight the ring takes the blocking copy instead.
 //
 // Above kStageMaxBytes the pageable copy stays: those are the one-shot weight
 // loads, where a pinned slot the size of a tensor is neither available nor
 // worth having, and nothing is queued behind them to overlap with.
-static constexpr size_t kStageMaxBytes = 64u * 1024u;
-static constexpr int kStageSlots = 32;
+
+// KRK_STAGE_SYNC=1 takes the direct blocking copy for every small upload,
+// which is what the callers do when this returns false. It exists to separate
+// the staging ring from the copy itself, so a change to the ring can be
+// measured against the copy it replaced.
+static bool stage_sync_() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_STAGE_SYNC");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
+// KRK_STAGE_WAIT=1 keeps the ring and its pinned source but host-waits each
+// copy, which separates two different claims: "the slot was reused too early"
+// and "an async H2D copy on the legacy default stream is not ordered before
+// the kernels queued behind it". The first is fixed by the per-slot event
+// guard; the second is a runtime property, not a policy.
+static bool stage_wait_() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_STAGE_WAIT");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
 
 // Returns false when the caller should fall back to the blocking pageable copy.
 bool stage_upload(void *dst, const void *src, size_t bytes) {
     if (bytes == 0) return true;
     if (bytes > kStageMaxBytes) return false;
-    if (!stage_pin_ || bytes > stage_stride_) {
-        if (stage_pin_) (void)hipHostFree(stage_pin_);
-        stage_pin_ = nullptr;
-        // Round the stride up so the common growth path reallocates rarely.
-        size_t want = 256;
-        while (want < bytes) want <<= 1;
-        stage_stride_ = want;
-        if (hipHostMalloc(&stage_pin_, kStageSlots * stage_stride_) !=
+    if (stage_sync_()) {
+        // The A/B shape, not a reason to skip the copy: stage_pos and embed()
+        // call this for their side effect, so returning false here left the
+        // position and the token ids un-uploaded and the run answered "S".
+        KRK_HIP(hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice));
+        return true;
+    }
+    // One allocation, at full stride, for the life of the backend. The ring
+    // used to grow to fit the largest upload seen so far and hipHostFree the
+    // old block to do it; a DMA still queued against that block then read
+    // memory the allocator had handed back, which is the same use-after-free
+    // the pooled-VRAM guard exists for, in the one place with no guard at all.
+    // Four MiB pinned once is cheaper than a second allocation path.
+    if (!stage_pin_) {
+        if (hipHostMalloc(&stage_pin_, kStageSlots * kStageMaxBytes) !=
             hipSuccess) {
             // Pinned memory is a finite pool. Losing it must degrade the
             // staging path, not the run: fall back to the blocking copy.
             (void)hipGetLastError();
             stage_pin_ = nullptr;
-            stage_stride_ = 0;
             return false;
         }
+        stage_stride_ = kStageMaxBytes;
         stage_slot_ = 0;
     }
-    stage_slot_ = (stage_slot_ + 1) % kStageSlots;
+    // A slot may only be overwritten once the async copy that last read it has
+    // completed. Without the guard the ring was a silent correctness hole: the
+    // slot rotation is 32 deep, a prefill layer queues far more than 32 small
+    // uploads behind its own GEMMs, and a slot handed to a new upload while its
+    // DMA still sat in the queue made that DMA read the new bytes -- the plan
+    // and alpha of a *different* expert, silently, at a rate that varied with
+    // queue depth. It showed up as "plausible text, different every run" on a
+    // long prompt (5 runs, 4 distinct outputs; 3 runs with KRK_STAGE_SYNC=1, one
+    // output) while a 31-token prompt never tripped it.
+    int pick = -1;
+    for (int i = 0; i < kStageSlots; i++) {
+        const int s = (stage_slot_ + 1 + i) % kStageSlots;
+        hipEvent_t ev = stage_ev_[s];
+        if (!ev) {
+            pick = s;
+            break;
+        }
+        if (hipEventQuery(ev) == hipSuccess) {
+            pick = s;
+            break;
+        }
+        static_cast<void>(hipGetLastError()); // hipErrorNotReady is not sticky
+    }
+    if (pick < 0) {
+        // Every slot is still in flight: take the blocking copy rather than
+        // overwrite one. Correct, and rare -- 64 slots of 64 KiB.
+        KRK_HIP(hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice));
+        return true;
+    }
+    if (!stage_ev_[pick])
+        KRK_HIP(hipEventCreateWithFlags(&stage_ev_[pick], hipEventDisableTiming));
     char *p = static_cast<char *>(stage_pin_) +
-              static_cast<size_t>(stage_slot_) * stage_stride_;
+              static_cast<size_t>(pick) * stage_stride_;
     std::memcpy(p, src, bytes);
     KRK_HIP(hipMemcpyAsync(dst, p, bytes, hipMemcpyHostToDevice, 0));
+    KRK_HIP(hipEventRecord(stage_ev_[pick], 0));
+    if (stage_wait_()) KRK_HIP(hipStreamSynchronize(0));
+    stage_slot_ = pick;
     return true;
 }
 
@@ -1547,7 +1990,9 @@ bool stage_upload(void *dst, const void *src, size_t bytes) {
     void stage_pos(i64 pos0) {
         if (pos_valid_ && pos_staged_ == pos0) return;
         if (!pos_dev_) KRK_HIP(hipMalloc(&pos_dev_, sizeof(i64)));
-        stage_upload(pos_dev_, &pos0, sizeof(i64));
+        if (!stage_upload(pos_dev_, &pos0, sizeof(i64)))
+            KRK_HIP(hipMemcpy(pos_dev_, &pos0, sizeof(i64),
+                                  hipMemcpyHostToDevice));
         pos_staged_ = pos0;
         pos_valid_ = true;
     }

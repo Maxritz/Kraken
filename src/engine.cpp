@@ -682,63 +682,51 @@ void Engine::configure_expert_cache() {
             budget = one * static_cast<size_t>(cfg_.expert_cache_slots);
     }
 
-    // The second tier is sized independently of the device budget: VRAM holds
-    // what is about to be used, the tier holds what was just used, and a
-    // demoted expert comes back as a DMA rather than a re-read of the mapping.
+    // WARM is sized independently of the device budget: VRAM holds what is
+    // about to be used, RAM holds what was just used and the read-through copy
+    // of what is being used. It is pageable (not pinned) and sized from the
+    // machine, because a fixed number is wrong everywhere but on the box it was
+    // chosen for: the same runtime has to behave on 24 GiB and on 96 GiB.
     //
-    // A negative setting (the default) holds the *whole* routed expert set in
-    // host RAM when the machine has room for it, capped by half of what is
-    // actually free, because a tier that pushes the host into swap costs more
-    // than the re-read it saves. Holding all of it is the point: the set is the
-    // model's home and the device budget is the hot subset on top, so a VRAM
-    // miss becomes a DMA out of RAM rather than a read of the file. Measured on
-    // Laguna XS.2, staging the 4.9 GiB the old "leftover" rule sized dropped
-    // file traffic 212.6 -> 157.5 MiB/token and decode 8.35 -> 9.35 tok/s; the
-    // half it did not stage was still being read from the file. A tier that
-    // cannot hold a handful of experts only adds copies, so it stays off. The
-    // CPU backend has no device budget to be the remainder of -- its mapping is
-    // host memory already -- so it stays off there.
-    size_t l2 = 0;
-    if (cfg_.expert_l2_mb > 0) {
-        l2 = static_cast<size_t>(cfg_.expert_l2_mb) * 1024u * 1024u;
-    } else if (cfg_.expert_l2_mb < 0 && be_->caps().vram_free > 0) {
-        size_t want = model_.total_expert_bytes();
+    // A negative setting (the default) targets the whole routed expert set,
+    // capped by half of what is left after a reserve. The set is the model's
+    // home and the device budget is the hot subset on top of it, so a VRAM miss
+    // becomes a promotion out of RAM instead of a read of the file; holding all
+    // of it is the point, and the cap is what keeps a 24 GiB box from swapping.
+    // Half of the post-reserve pool is the design target (25-50% of RAM) with
+    // the reserve holding the mapping, the trunk, the KV cache and the OS. A
+    // positive value is that many MiB — the explicit restriction, 0 disables
+    // WARM entirely. The CPU backend's mapping is host memory already, so auto
+    // stays off there; a tier that cannot hold a few experts only adds copies.
+    size_t warm = 0;
+    if (cfg_.expert_warm_mb > 0) {
+        warm = static_cast<size_t>(cfg_.expert_warm_mb) * 1024u * 1024u;
+    } else if (cfg_.expert_warm_mb < 0 && be_->caps().vram_free > 0) {
         const size_t avail = host_available_bytes();
-        // Hold back a reserve before taking half of what is left: an eager
-        // tier is page-locked, and pinned pages plus the file mapping plus
-        // everything else that lives in RAM is what turns "more cache" into
-        // a machine that swaps. 8 GiB is the reserve, so a 16 GiB box still
-        // gets 4 GiB of tier and a 96 GiB box cannot eat the machine.
         const size_t reserve = static_cast<size_t>(8) * 1024u * 1024u * 1024u;
         const size_t spendable = avail > reserve ? avail - reserve : 0;
-        size_t cap = spendable / 2;
-        // ...and an absolute default ceiling. Staging is a memcpy out of the
-        // mapping, so every staged byte also makes a page of the mapping
-        // resident: host RAM ends up holding the tier twice, and an 18 GiB
-        // tier on an 18.9 GiB file measured 50+ GiB of RAM in use. 4 GiB is
-        // the default because it costs ~8 GiB of RAM and is worth ~30% of
-        // prefill and decode on a stack that does not fit (measured: 8.7
-        // tok/s with no tier, 11.3 at 8 GiB, 17.0 at the full 18 GiB);
-        // --expert-l2-mb takes any amount deliberately, and the staging line
-        // below reports what it actually cost.
-        const size_t ceiling = static_cast<size_t>(4) * 1024u * 1024u * 1024u;
-        if (cap > ceiling) cap = ceiling;
-        if (want > cap) want = cap;
+        size_t want = spendable / 2;
+        const size_t total = model_.total_expert_bytes();
+        if (total > 0 && total < want) want = total; // never cache past the corpus
         const size_t floor_bytes = model_.max_expert_bytes() * 4;
-        l2 = want >= floor_bytes ? want : 0;
+        warm = want >= floor_bytes ? want : 0;
     }
 
-    model_.set_expert_budget(budget, l2);
+    model_.set_expert_budget(budget, warm);
 
-    // Stage the routed experts in the tier once, at load. Measured on Laguna
-    // XS.2 before this: 212 MiB/token read out of the model file at 8 tok/s,
-    // 66.9% hits and zero demotions — the misses were compulsory, so the tier
-    // was never asked for anything. After staging, the first touch of an
-    // expert is a DMA out of RAM instead of a read of the file.
-    // KRK_EXPERT_PRELOAD=0 turns it off, for the A/B.
-    if (l2 > 0 && be_->caps().vram_free > 0 &&
-        !(std::getenv("KRK_EXPERT_PRELOAD") &&
-          std::getenv("KRK_EXPERT_PRELOAD")[0] == '0')) {
+    // Prefetch is opt-in. Read-through admits every expert the run actually
+    // touches, so an eager sweep of the corpus is only worth its wall time when
+    // the run is short and its routing is broad — and it costs RAM and time
+    // before the first token (measured on Laguna XS.2: 4 GiB staged in 1903 ms
+    // against ~1.9 s of decode it then improved). --expert-warm-prefetch, or
+    // KRK_EXPERT_PRELOAD=1, turns it on; KRK_EXPERT_PRELOAD=0 forces it off, so
+    // the A/B is one environment variable away.
+    const char *pre_env = std::getenv("KRK_EXPERT_PRELOAD");
+    const bool prefetch = pre_env && pre_env[0] == '0'
+                              ? false
+                              : (cfg_.expert_warm_prefetch ||
+                                 (pre_env && pre_env[0] == '1'));
+    if (warm > 0 && be_->caps().vram_free > 0 && prefetch) {
         const std::chrono::steady_clock::time_point t0 =
             std::chrono::steady_clock::now();
         const size_t ram_before = host_available_bytes();
@@ -759,25 +747,27 @@ void Engine::configure_expert_cache() {
         const f64 stage_ms = std::chrono::duration<f64, std::milli>(
                                  std::chrono::steady_clock::now() - t0)
                                  .count();
-        // Both sides of the cost: the pinned tier is what the tier holds, and
+        // Both sides of the cost: the pageable tier is what it holds, and
         // the drop in free RAM is what it actually took, mapping pages
         // included. The two differ by the size of the staged ranges.
         const size_t ram_after = host_available_bytes();
         const f64 ram_mib = ram_before > ram_after
                                 ? static_cast<f64>(ram_before - ram_after) / 1048576.0
                                 : 0.0;
-        KRK_INFO("expert L2: staged %.1f MiB in pinned host RAM in %.0f ms, "
-                 "host RAM in use up %.1f MiB (a VRAM miss is a DMA now, not "
-                 "a file read)",
+        KRK_INFO("expert WARM: prefetched %.1f MiB in %.0f ms, host RAM in use "
+                 "up %.1f MiB (a VRAM miss is a promotion now, not a file read)",
                  static_cast<f64>(staged) / 1048576.0, stage_ms, ram_mib);
     }
-    char l2_note[64] = "";
-    if (l2 > 0)
-        std::snprintf(l2_note, sizeof(l2_note), " + %.0f MiB L2",
-                      static_cast<f64>(l2) / (1024.0 * 1024.0));
+    char warm_note[80] = "";
+    if (warm > 0)
+        std::snprintf(warm_note, sizeof(warm_note),
+                      " + WARM %.0f MiB pageable%s",
+                      static_cast<f64>(warm) / (1024.0 * 1024.0),
+                      prefetch ? " (prefetched)" : "");
     KRK_INFO("expert cache: budget %.1f MiB%s, %d experts x top-%d, %d layers, "
-             "policy LFU+aging (pin at %u hits, decay every %u)",
-             static_cast<f64>(budget) / (1024.0 * 1024.0), l2_note, mc.n_expert,
+             "policy LFU+aging (pin at %u hits, decay every %u); cold reads are "
+             "read-through",
+             static_cast<f64>(budget) / (1024.0 * 1024.0), warm_note, mc.n_expert,
              mc.n_expert_used, mc.n_layer, ExpertCache::kPinThreshold,
              ExpertCache::kPinDecay);
 }
@@ -806,7 +796,7 @@ bool Engine::load_draft(const std::string &path, std::string *err) {
     dcfg.model_path = path;
     dcfg.warmup = false;
     dcfg.expert_cache_mb = cfg_.expert_cache_mb;
-    dcfg.expert_l2_mb = cfg_.expert_l2_mb;
+    dcfg.expert_warm_mb = cfg_.expert_warm_mb;
     if (!draft_->init(be_, dcfg, err)) {
         delete draft_;
         draft_ = nullptr;

@@ -28,7 +28,7 @@ struct Args {
     int threads = 0;
     int expert_cache_mb = 0;
     int expert_cache_slots = 0;
-    int expert_l2_mb = 0;
+    int expert_warm_mb = -1; // WARM expert cache (MiB): <0 auto, 0 off
     std::string draft;
     int draft_tokens = 4;
     bool cpu = false;
@@ -48,7 +48,8 @@ void usage() {
         "  --device N            HIP device index\n"
         "  --expert-cache-mb N   MoE expert residency budget in MiB\n"
         "  --expert-cache-slots N  cap resident (layer, expert) slots\n"
-        "  --expert-l2-mb N       pinned host-RAM tier for evicted experts (MiB)\n"
+        "  --expert-warm-mb N     WARM expert cache in pageable host RAM (MiB;\n"
+        "                        <0 auto, 0 off); --expert-l2-mb also accepted\n"
         "  --draft MODEL         draft model for greedy speculative decoding\n"
         "  --draft-tokens N      speculation window (default 4)\n"
         "  --cpu                 use the scalar reference backend\n"
@@ -78,8 +79,8 @@ bool parse(int argc, char **argv, Args *a) {
             a->expert_cache_mb = std::atoi(next("--expert-cache-mb"));
         else if (f == "--expert-cache-slots")
             a->expert_cache_slots = std::atoi(next("--expert-cache-slots"));
-        else if (f == "--expert-l2-mb")
-            a->expert_l2_mb = std::atoi(next("--expert-l2-mb"));
+        else if (f == "--expert-warm-mb" || f == "--expert-l2-mb")
+            a->expert_warm_mb = std::atoi(next("--expert-warm-mb"));
         else if (f == "--draft") a->draft = next("--draft");
         else if (f == "--draft-tokens") a->draft_tokens = std::atoi(next("--draft-tokens"));
         else if (f == "--cpu") a->cpu = true;
@@ -124,7 +125,7 @@ int main(int argc, char **argv) {
     cfg.threads = a.threads;
     cfg.expert_cache_mb = a.expert_cache_mb;
     cfg.expert_cache_slots = a.expert_cache_slots;
-    cfg.expert_l2_mb = a.expert_l2_mb;
+    cfg.expert_warm_mb = a.expert_warm_mb;
 
     Engine engine;
     if (!engine.init(be, cfg, &err)) {

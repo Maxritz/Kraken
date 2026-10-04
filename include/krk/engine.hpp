@@ -28,15 +28,20 @@ struct EngineConfig {
     i32 expert_cache_mb = 0;
     // Hard cap on resident (layer, expert) slots, regardless of budget. 0 = auto.
     i32 expert_cache_slots = 0;
-    // Second-tier budget in MiB: page-locked host memory that evicted experts
-    // are demoted to instead of being released back to the GGUF mapping. Sized
-    // independently of the device budget, because the two tiers answer
-    // different questions — VRAM holds what is about to be used, RAM holds what
-    // was just used. 0 disables the tier.
-    // -1 (the default) sizes the tier itself: the expert bytes the device
-    // budget could not hold, capped by what the host actually has free. 0
-    // disables it, a positive value is that many MiB.
-    i32 expert_l2_mb = -1;
+    // WARM tier budget in MiB: pageable host RAM that holds the expert set
+    // beside the device's hot subset, and the tier every cold read lands in
+    // before it is promoted (see expert_cache.cpp). Sized independently of the
+    // device budget, because the two answer different questions — VRAM holds
+    // what is about to be used, RAM holds what was just used.
+    // -1 (the default) sizes it from the machine: the expert set, capped by half
+    // of what is free after a reserve, so 24/32/48/96 GiB boxes each get a
+    // proportional tier. 0 disables it (HOT only, every miss re-reads the
+    // file), and a positive value is that many MiB — the explicit restriction.
+    i32 expert_warm_mb = -1;
+    // Fill WARM ahead of the run rather than on demand. Off by default: an eager
+    // sweep costs the whole corpus in wall time and RAM before the first token,
+    // and read-through already admits every expert the run touches.
+    bool expert_warm_prefetch = false;
 };
 
 struct StreamSink {

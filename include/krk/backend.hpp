@@ -12,6 +12,7 @@
 #ifndef KRK_BACKEND_HPP
 #define KRK_BACKEND_HPP
 
+#include <cstring>
 #include <functional>
 #include "krk/common.hpp"
 #include "krk/quant.hpp"
@@ -110,6 +111,50 @@ public:
     virtual size_t device_total_bytes() const { return caps().vram_total; }
 
     virtual void release_host(void *p) { host_free(p); }
+
+    // Host-side allocation for the expert cache's WARM tier: ordinary pageable
+    // RAM, the largest tier in the hierarchy and the one sized in tens of GiB.
+    // Deliberately NOT alloc_host(): pinned pages are non-swappable and drawn
+    // from a small driver pool, so a WARM cache built out of them charges the
+    // whole machine -- and every DMA path that genuinely needs a pin -- for a
+    // cache that must stay free to shrink. The default forwards to the pinned
+    // allocator, which on any backend that does not override it is aligned
+    // malloc; the HIP backend overrides it with plain pageable memory.
+    virtual void *alloc_host_pageable(size_t bytes) {
+        return alloc_host(bytes ? bytes : 1);
+    }
+    virtual void release_host_pageable(void *p) { release_host(p); }
+    // Releases host memory an asynchronous copy may still be reading. The
+    // default frees it immediately; a backend that stages copies keeps the
+    // pointer until the copy has landed, because freeing the source of an
+    // in-flight DMA is a use-after-free, and with a greedy decode it shows up
+    // as text that is plausible but different from run to run.
+    virtual void release_host_deferred(void *p) { release_host_pageable(p); }
+    // Fills `dst` (pageable host memory) with `bytes` taken from `mapped_src`,
+    // a pointer into the weight mapping. A backend that can read the file
+    // directly (see set_weight_pull) does so, because a cold expert should cost
+    // one read() into RAM and not a page fault per 4 KiB of mapping; backends
+    // without that path copy the mapping. Returns true when `dst` was filled.
+    virtual bool read_host(void *dst, const void *mapped_src, size_t bytes) {
+        std::memcpy(dst, mapped_src, bytes);
+        return true;
+    }
+    // Host->device copy whose source is pageable host memory: the WARM -> HOT
+    // promotion path. HIP routes it through a small, bounded pinned staging
+    // ring so the transfer is a real DMA rather than the driver's internal
+    // bounce-buffer copy; backends without a ring forward to upload().
+    virtual void upload_paged(void *dst, const void *src, size_t bytes) {
+        upload(dst, src, bytes);
+    }
+    // A batch of pageable-source copies issued together, so a backend with a
+    // staging ring can overlap them: one expert is three slices, and three
+    // separate calls serialise on the same first buffer. Backends without a
+    // ring just forward.
+    virtual void upload_paged_batch(void *const dst[], const void *const src[],
+                                    const size_t bytes[], int n) {
+        for (int i = 0; i < n; i++)
+            if (dst[i] && src[i] && bytes[i]) upload_paged(dst[i], src[i], bytes[i]);
+    }
 
     // Small-object device allocations, pooled by the expert cache. A
     // promotion is a handful of ~1-2 MiB slices and the default

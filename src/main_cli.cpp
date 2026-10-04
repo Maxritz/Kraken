@@ -29,7 +29,8 @@ struct Args {
     int threads = 0;
     int expert_cache_mb = 0;    // MoE expert residency budget (MiB), 0 = auto
     int expert_cache_slots = 0; // MoE resident (layer, expert) slot cap, 0 = auto
-    int expert_l2_mb = -1;      // MoE second tier in host RAM (MiB): <0 auto, 0 off
+    int expert_warm_mb = -1;     // MoE WARM tier in pageable host RAM (MiB): <0 auto, 0 off
+    bool expert_warm_prefetch = false; // fill WARM at load instead of on demand
     int draft_tokens = 4;       // speculative decoding window
     bool cpu = false;
     bool greedy = false;
@@ -71,10 +72,14 @@ void usage() {
         "  --device N            HIP device index (default 0)\n"
         "  --expert-cache-mb N   MoE expert residency budget in MiB (0 = auto)\n"
         "  --expert-cache-slots N  cap resident (layer, expert) slots (0 = auto)\n"
-        "  --expert-l2-mb N       pinned host-RAM tier for evicted experts,\n"
-        "                        which turns a re-read from the file into a DMA\n"
-                        "                        (MiB; <0 auto = leftover experts capped\n"
-                        "                        by free RAM, 0 off)\n"
+        "  --expert-warm-mb N     WARM expert cache in pageable host RAM. Cold\n"
+        "                        reads land here before VRAM, VRAM evictions stay\n"
+        "                        here, and WARM eviction never writes to the file\n"
+        "                        (MiB; <0 auto = the expert set, capped by half of\n"
+        "                        free RAM after a reserve; 0 off).\n"
+        "                        --expert-l2-mb is the old spelling of this flag.\n"
+        "  --expert-warm-prefetch  fill WARM at load instead of on demand (costs\n"
+        "                        RAM and time before the first token)\n"
         "  --draft MODEL         draft model for greedy speculative decoding\n"
         "  --draft-tokens N      speculation window (default 4)\n"
         "  --info                print model and device info, then exit\n"
@@ -126,8 +131,10 @@ bool parse(int argc, char **argv, Args *a) {
             a->expert_cache_mb = std::atoi(next("--expert-cache-mb"));
         else if (f == "--expert-cache-slots")
             a->expert_cache_slots = std::atoi(next("--expert-cache-slots"));
-        else if (f == "--expert-l2-mb")
-            a->expert_l2_mb = std::atoi(next("--expert-l2-mb"));
+        else if (f == "--expert-warm-mb" || f == "--expert-l2-mb")
+            a->expert_warm_mb = std::atoi(next("--expert-warm-mb"));
+        else if (f == "--expert-warm-prefetch")
+            a->expert_warm_prefetch = std::atoi(next("--expert-warm-prefetch")) != 0;
         else if (f == "--greedy") a->greedy = true;
         else if (f == "--chat") a->chat = true;
         else if (f == "--cpu") a->cpu = true;
@@ -229,12 +236,12 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     const f64 token_div = r.generated > 0 ? static_cast<f64>(r.generated) : 1.0;
     std::fprintf(out,
                  "[stats ] experts   %.0f MiB VRAM budget, %zu/%zu slots resident, "
-                 "%zu pinned | L2 %.0f MiB budget, %zu held (%.0f MiB, "
-                 "%.0f MiB staged at load)\n",
+                 "%zu pinned | WARM %.0f MiB pageable, %zu held (%.0f MiB, "
+                 "%.0f MiB prefetched)\n",
                  static_cast<f64>(ec.budget_bytes()) / 1048576.0, ec.resident_slots(),
                  ec.capacity_slots(), ec.pinned_slots(),
-                 static_cast<f64>(ec.host_budget_bytes()) / 1048576.0, ec.host_slots(),
-                 static_cast<f64>(ec.host_resident_bytes()) / 1048576.0,
+                 static_cast<f64>(ec.warm_capacity_bytes()) / 1048576.0, ec.warm_slots(),
+                 static_cast<f64>(ec.warm_used_bytes()) / 1048576.0,
                  static_cast<f64>(ec.bytes_staged()) / 1048576.0);
     // The three tiers reported apart. A single "hit rate" reads as "the
     // cache works 20% of the time" when VRAM 20% / RAM 80% / file 0% is
@@ -242,8 +249,8 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     // only the last one is the storage path.
     const f64 share = acq > 0 ? 100.0 / static_cast<f64>(acq) : 0.0;
     std::fprintf(out,
-                 "[stats ] cache     %llu acquires | VRAM hits %llu (%.1f%%) | "
-                 "RAM hits %llu (%.1f%%) | file loads %llu (%.1f%%)\n",
+                 "[stats ] cache     %llu acquires | HOT hits %llu (%.1f%%) | "
+                 "WARM hits %llu (%.1f%%) | COLD misses %llu (%.1f%%)\n",
                  static_cast<unsigned long long>(acq),
                  static_cast<unsigned long long>(ec.hits()), share * static_cast<f64>(ec.hits()),
                  static_cast<unsigned long long>(ec.host_hits()),
@@ -254,7 +261,7 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     const f64 prom_mib = static_cast<f64>(ec.bytes_promoted()) / 1048576.0;
     std::fprintf(out,
                  "[stats ] transfer  %llu promotions, %.0f MiB in %.1f ms = %.1f GB/s "
-                 "(%.1f us/expert) | %llu demotions, %.0f MiB | "
+                 "(%.1f us/expert) | %llu VRAM evictions kept in WARM, %.0f MiB | "
                  "%.0f MiB read from the file (%.2f MiB/tok)\n",
                  static_cast<unsigned long long>(ec.promotions()), prom_mib, prom_ms,
                  prom_ms > 0 ? prom_mib / 1024.0 / (prom_ms / 1000.0) : 0.0,
@@ -265,11 +272,18 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                  static_cast<f64>(ec.bytes_demoted()) / 1048576.0,
                  static_cast<f64>(ec.bytes_loaded()) / 1048576.0,
                  static_cast<f64>(ec.bytes_loaded()) / 1048576.0 / token_div);
-    std::fprintf(out, "[stats ] churn     %llu evictions, %llu demotions, %llu promotions, "
-                      "%llu decay events\n",
+    std::fprintf(out,
+                 "[stats ] warm      %.0f MiB capacity, %.1f%% in use | %llu admissions, "
+                 "%llu evictions, %llu rejects | %llu device evictions, %llu decay events\n",
+                 static_cast<f64>(ec.warm_capacity_bytes()) / 1048576.0,
+                 ec.warm_capacity_bytes() > 0
+                     ? 100.0 * static_cast<f64>(ec.warm_used_bytes()) /
+                           static_cast<f64>(ec.warm_capacity_bytes())
+                     : 0.0,
+                 static_cast<unsigned long long>(ec.warm_admissions()),
+                 static_cast<unsigned long long>(ec.warm_evictions()),
+                 static_cast<unsigned long long>(ec.warm_rejects()),
                  static_cast<unsigned long long>(ec.evictions()),
-                 static_cast<unsigned long long>(ec.demotions()),
-                 static_cast<unsigned long long>(ec.promotions()),
                  static_cast<unsigned long long>(ec.decay_events()));
 }
 
@@ -352,13 +366,15 @@ int run_bench(Engine &engine, const Args &a, f64 load_ms, f64 start_ms) {
                     acq > 0 ? 100.0 * static_cast<f64>(hits) / static_cast<f64>(acq)
                             : 0.0,
                     ec.pinned_slots(), ec.resident_slots());
-        if (ec.host_budget_bytes() > 0)
-            std::printf("expert L2      %.0f MiB pinned host, %zu expert(s) demoted, "
-                        "%llu promoted, %.0f MiB held\n",
-                        static_cast<f64>(ec.host_budget_bytes()) / (1024.0 * 1024.0),
-                        ec.host_slots(),
+        if (ec.warm_capacity_bytes() > 0)
+            std::printf("expert WARM    %.0f MiB pageable, %zu expert(s) held, "
+                        "%llu admissions, %llu promotions, %llu evictions, %llu rejects\n",
+                        static_cast<f64>(ec.warm_capacity_bytes()) / (1024.0 * 1024.0),
+                        ec.warm_slots(),
+                        static_cast<unsigned long long>(ec.warm_admissions()),
                         static_cast<unsigned long long>(ec.promotions()),
-                        static_cast<f64>(ec.host_resident_bytes()) / (1024.0 * 1024.0));
+                        static_cast<unsigned long long>(ec.warm_evictions()),
+                        static_cast<unsigned long long>(ec.warm_rejects()));
     }
     return 0;
 }
@@ -436,7 +452,8 @@ int main(int argc, char **argv) {
     cfg.seed = a.seed;
     cfg.expert_cache_mb = a.expert_cache_mb;
     cfg.expert_cache_slots = a.expert_cache_slots;
-    cfg.expert_l2_mb = a.expert_l2_mb;
+    cfg.expert_warm_mb = a.expert_warm_mb;
+    cfg.expert_warm_prefetch = a.expert_warm_prefetch;
 
     ph.mark("backend create");
     Engine engine;
@@ -502,10 +519,10 @@ int main(int argc, char **argv) {
                         static_cast<f64>(ec.budget_bytes()) / (1024.0 * 1024.0),
                         ec.resident_slots(), ec.capacity_slots(),
                         ExpertCache::kPinThreshold);
-            if (ec.host_budget_bytes() > 0)
-                std::printf("expert L2      %.0f MiB pinned host tier "
-                            "(evicted experts demote, not drop)\n",
-                            static_cast<f64>(ec.host_budget_bytes()) /
+            if (ec.warm_capacity_bytes() > 0)
+                std::printf("expert WARM    %.0f MiB pageable host tier "
+                            "(cold reads are read-through; VRAM misses promote)\n",
+                            static_cast<f64>(ec.warm_capacity_bytes()) /
                                 (1024.0 * 1024.0));
         }
         std::printf("weights        %.2f GiB on device\n",
