@@ -16,6 +16,73 @@
 // above can never turn into a hit.
 #include "krk/expert_cache.hpp"
 
+// ---------------------------------------------------------------------------
+// Expert access trace (opt-in, KRK_TRACE_EXPERTS=1).
+//
+// The tier counters answer "how often did each tier win". They cannot answer
+// the question the cache policy actually turns on: how far apart in the access
+// stream two uses of the same expert are. That distance is what decides both
+// how big HOT has to be and whether WARM earns its keep at all -- a reuse
+// distance shorter than the HOT slot count is invisible to WARM, and a longer
+// one makes WARM mandatory. Both cases look identical in the counters.
+//
+// This records one line per acquire so tools/expert_trace.py can build the
+// distance histogram offline. It is off by default and costs one branch when
+// off; the buffer is bounded so a long run cannot grow without limit.
+// ---------------------------------------------------------------------------
+namespace {
+
+using krk::u32;
+using krk::i32;
+using krk::u8;
+
+struct XRec {
+    u32 seq;
+    i32 layer;
+    i32 expert;
+    u8 tier;  // 0 = HOT hit, 1 = WARM hit (promotion), 2 = COLD miss
+};
+
+std::vector<XRec> g_xrec;
+bool g_xtrace_on = false;
+const char *g_xtrace_path = "expert_trace.tsv";
+
+struct XInit {
+    XInit() {
+        const char *v = std::getenv("KRK_TRACE_EXPERTS");
+        g_xtrace_on = v && *v && std::string(v) != "0";
+        const char *p = std::getenv("KRK_TRACE_PATH");
+        if (p && *p) g_xtrace_path = p;
+        if (g_xtrace_on) g_xrec.reserve(1u << 22);
+    }
+};
+
+void xtrace_dump() {
+    if (!g_xtrace_on || g_xrec.empty()) return;
+    FILE *f = std::fopen(g_xtrace_path, "w");
+    if (!f) return;
+    std::fprintf(f, "seq\tlayer\texpert\ttier\n");
+    for (const XRec &r : g_xrec)
+        std::fprintf(f, "%u\t%d\t%d\t%u\n", r.seq, r.layer, r.expert,
+                     static_cast<unsigned>(r.tier));
+    std::fclose(f);
+}
+
+struct XAtExit {
+    ~XAtExit() { xtrace_dump(); }
+};
+
+XInit g_xinit;
+XAtExit g_xexit;
+
+inline void xtrace(i32 layer, i32 expert, u8 tier) {
+    if (!g_xtrace_on) return;
+    if (g_xrec.size() >= g_xrec.capacity()) return;  // bounded; no realloc storm
+    g_xrec.push_back(XRec{static_cast<u32>(g_xrec.size()), layer, expert, tier});
+}
+
+}  // namespace
+
 #include <chrono>
 #include <cstring>
 
@@ -431,6 +498,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
             // Hit: the traffic that makes an expert hot happens here.
             touch(s);
             hits_++;
+            xtrace(layer, expert, 0);
             if (++acquires_ >= decay_period()) decay();
             return &s.m;
         }
@@ -440,6 +508,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
         if (promote_to_vram(s)) {
             touch(s);
             host_hits_++;
+            xtrace(layer, expert, 1);
             if (++acquires_ >= decay_period()) decay();
             return &s.m;
         }
@@ -465,6 +534,8 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     // is always-admit; when the tier refuses — disabled, or an expert larger
     // than the whole tier — the load still happens, from the mapping.
     warm_admit(src, expert, s);
+
+    xtrace(layer, expert, 2);
 
     make_vram_room();
 

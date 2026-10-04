@@ -1,0 +1,18 @@
+[info ] HIP 7.16.26323 | AMD Radeon RX 9070 XT | gfx1201 | 64 CU | 15.9 GiB VRAM
+[info ] rope: YaRN over 64 of 128 dims, base 500000, factor 32.0, original context 8192, beta_fast/slow 32/1
+[info ] rope pairing: NeoX half-split (channel j with j + 32)
+[info ] loaded Laguna-S-2.1 (laguna): 48 layers, 3072 embd, 72/8 heads, hd=128, ff=12288, vocab=100352
+[info ] hybrid attention: 3 of every 4 layers attend fully, the rest within 512 tokens; rope 128/128 dims at base 10000 on the windowed layers
+[info ] expert cache: budget 4673.9 MiB + WARM 24576 MiB pageable, 256 experts x top-10, 48 layers, policy LFU+aging (pin at 24 hits, decay every 64); cold reads are read-through
+[info ] workspaces ready: chunk=256 ctx=21845 KV=4096 MiB (load 4893 ms)
+KRAKEN 0.1.0 | AMD Radeon RX 9070 XT (gfx1201, RDNA4, 64 CU, wave32, WMMA gfx12)
+〈|UNK|〉〈|UNK|〉〈|UNK|〉〈|UNK|〉〈|UNK|〉〈|UNK|〉〈|UNK|〉�
+[stats ] load      4893 ms, 3.93 GiB uploaded of 3.93 GiB weights in 3881 ms = 1.0 GB/s
+[stats ] prefill   30 tok in 70518.5 ms = 0.4 tok/s
+[stats ] decode    8 tok in 8435.6 ms = 0.9 tok/s (1054.5 ms/tok)
+[stats ] device    15.36 GiB in use of 15.92 GiB (0.56 GiB free)
+[stats ] experts   4674 MiB VRAM budget, 800/800 slots resident, 0 pinned | WARM 24576 MiB pageable, 4511 held (24572 MiB, 0 MiB prefetched)
+[stats ] cache     7521 acquires | HOT hits 2107 (28.0%) | WARM hits 774 (10.3%) | COLD misses 4640 (61.7%)
+[stats ] transfer  774 promotions, 4210 MiB in 1043.0 ms = 3.9 GB/s (1347.5 us/expert) | 4614 VRAM evictions kept in WARM, 25126 MiB | 25274 MiB read from the file (3159.23 MiB/tok)
+[stats ] warm      24576 MiB capacity, 100.0% in use | 4640 admissions, 129 evictions, 0 rejects | 4614 device evictions, 0 decay events
+

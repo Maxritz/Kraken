@@ -1,0 +1,18 @@
+[info ] HIP 7.16.26323 | AMD Radeon RX 9070 XT | gfx1201 | 64 CU | 15.9 GiB VRAM
+[info ] rope: YaRN over 64 of 128 dims, base 500000, factor 32.0, original context 4096, beta_fast/slow 64/1
+[info ] rope pairing: NeoX half-split (channel j with j + 32)
+[info ] loaded Laguna XS.2 (laguna): 40 layers, 2048 embd, 64/8 heads, hd=128, ff=8192, vocab=100352
+[info ] hybrid attention: 3 of every 4 layers attend fully, the rest within 512 tokens; rope 128/128 dims at base 10000 on the windowed layers
+[info ] expert cache: budget 8443.8 MiB + WARM 18102 MiB pageable, 256 experts x top-8, 40 layers, policy LFU+aging (pin at 24 hits, decay every 64); cold reads are read-through
+[info ] workspaces ready: chunk=256 ctx=4096 KV=640 MiB (load 794 ms)
+KRAKEN 0.1.0 | AMD Radeon RX 9070 XT (gfx1201, RDNA4, 64 CU, wave32, WMMA gfx12)
+Okay, the user is asking about the capital of France. Let me think about what the capital of Franc
+[stats ] load      794 ms, 1.16 GiB uploaded of 1.16 GiB weights in 410 ms = 2.8 GB/s
+[stats ] prefill   30 tok in 3781.9 ms = 7.9 tok/s
+[stats ] decode    24 tok in 2274.9 ms = 10.6 tok/s (94.8 ms/tok)
+[stats ] device    15.04 GiB in use of 15.92 GiB (0.88 GiB free)
+[stats ] experts   8444 MiB VRAM budget, 4340/4340 slots resident, 0 pinned | WARM 18102 MiB pageable, 4590 held (8329 MiB, 0 MiB prefetched)
+[stats ] cache     10602 acquires | HOT hits 6003 (56.6%) | WARM hits 9 (0.1%) | COLD misses 4590 (43.3%)
+[stats ] transfer  9 promotions, 18 MiB in 5.2 ms = 3.3 GB/s (573.9 us/expert) | 259 VRAM evictions kept in WARM, 484 MiB | 8329 MiB read from the file (347.03 MiB/tok)
+[stats ] warm      18102 MiB capacity, 46.0% in use | 4590 admissions, 0 evictions, 0 rejects | 259 device evictions, 0 decay events
+

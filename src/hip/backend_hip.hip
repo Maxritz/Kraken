@@ -1684,9 +1684,11 @@ public:
             (void)hipFree(tok_dev_);
             tok_dev_ = nullptr;
         }
-        if (freq_dev_) {
-            (void)hipFree(freq_dev_);
-            freq_dev_ = nullptr;
+        for (FreqSlot &s : freq_) {
+            if (s.dev) {
+                (void)hipFree(s.dev);
+                s.dev = nullptr;
+            }
         }
         if (pos_dev_) {
             (void)hipFree(pos_dev_);
@@ -1741,13 +1743,31 @@ private:
     // on demand; see embed()).
     void *tok_dev_ = nullptr;
     size_t tok_cap_ = 0;
-    // Device staging for the host inv_freq table rope() reads; the
-    // (pointer, length, signature) triple caches the upload.
-    void *freq_dev_ = nullptr;
-    size_t freq_cap_ = 0;
-    const f32 *freq_src_ = nullptr;
-    size_t freq_n_ = 0;
-    f32 freq_sig_ = 0.0f;
+    // Device staging for the host inv_freq table rope() reads.
+    //
+    // This has to be more than one slot. A hybrid-attention model interleaves
+    // two rope tables (inv_freq_ on the full-attention layers, inv_freq_swa_ on
+    // the windowed ones), so a single-entry cache misses at every layer
+    // boundary -- and the miss it takes is a BLOCKING hipMemcpy, which drains
+    // everything already queued on the stream behind it. On laguna-xs2 that
+    // measured 1296 us of host time per rope() call against 3.2 us on a
+    // non-hybrid MoE: 51.8 ms of a ~99 ms decode step spent copying a table
+    // that is 256 bytes and already resident four layers earlier.
+    //
+    // A 4-entry LRU keyed on (pointer, length, signature) keeps both tables
+    // resident for a whole step, so the upload happens once per distinct table
+    // per run instead of once per layer boundary.
+    static constexpr int kFreqSlots = 4;
+    struct FreqSlot {
+        void *dev = nullptr;
+        size_t cap = 0;
+        const f32 *src = nullptr;
+        size_t n = 0;
+        f32 sig = 0.0f;
+        i64 stamp = 0;   // LRU clock; ties break on the lowest slot index
+    };
+    FreqSlot freq_[kFreqSlots] = {};
+    i64 freq_clock_ = 0;
     // Device-side position scalar for the decode path (rope,
     // kv_append, decode attention). Those kernels read pos0 from
     // device memory so a captured HIP graph can replay a whole
@@ -1998,27 +2018,37 @@ bool stage_upload(void *dst, const void *src, size_t bytes) {
     }
 
     // Stages the host inv_freq table for the device-side RoPE
-    // kernels (rope(), attn_fused_chain()); the (pointer, length,
-    // signature) triple caches the upload, so the layers of a
-    // step share one memcpy.
+    // kernels (rope(), attn_fused_chain()). Keyed on the (pointer,
+    // length, signature) triple so the layers of a step share one
+    // memcpy -- and held in a small LRU rather than a single slot, so a
+    // model that interleaves two tables does not re-upload one of them at
+    // every layer boundary (see the freq_ members).
     const f32 *stage_freq(const f32 *inv_freq, i64 hd) {
         const size_t n = static_cast<size_t>(hd / 2);
         const f32 sig = n >= 2 ? inv_freq[1] : 0.0f;
-        if (inv_freq != freq_src_ || n != freq_n_ || sig != freq_sig_) {
-            const size_t need = n * sizeof(f32);
-            if (need > freq_cap_) {
-                if (freq_dev_) KRK_HIP(hipFree(freq_dev_));
-                freq_cap_ = (need + 255u) & ~static_cast<size_t>(255u);
-                freq_dev_ = nullptr;
-                KRK_HIP(hipMalloc(&freq_dev_, freq_cap_));
+        FreqSlot *victim = &freq_[0];
+        for (int i = 0; i < kFreqSlots; i++) {
+            FreqSlot &s = freq_[i];
+            if (s.dev && s.src == inv_freq && s.n == n && s.sig == sig) {
+                s.stamp = ++freq_clock_;
+                return static_cast<const f32 *>(s.dev);
             }
-            KRK_HIP(hipMemcpy(freq_dev_, inv_freq, need,
-                              hipMemcpyHostToDevice));
-            freq_src_ = inv_freq;
-            freq_n_ = n;
-            freq_sig_ = sig;
+            if (s.stamp <= victim->stamp) victim = &s;
         }
-        return static_cast<const f32 *>(freq_dev_);
+        const size_t need = n * sizeof(f32);
+        if (need > victim->cap) {
+            if (victim->dev) KRK_HIP(hipFree(victim->dev));
+            victim->cap = (need + 255u) & ~static_cast<size_t>(255u);
+            victim->dev = nullptr;
+            KRK_HIP(hipMalloc(&victim->dev, victim->cap));
+        }
+        KRK_HIP(hipMemcpy(victim->dev, inv_freq, need,
+                          hipMemcpyHostToDevice));
+        victim->src = inv_freq;
+        victim->n = n;
+        victim->sig = sig;
+        victim->stamp = ++freq_clock_;
+        return static_cast<const f32 *>(victim->dev);
     }
 };
 
