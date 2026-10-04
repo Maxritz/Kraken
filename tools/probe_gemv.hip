@@ -60,8 +60,10 @@ int main() {
     const Shape shapes[] = {
         {"decode gate/up [1024,2048]", 1024, 2048},   // laguna-xs2 expert
         {"decode down   [2048,1024]", 2048, 1024},   // laguna-xs2 expert
-        {"large         [8192,2048]", 8192, 2048},   // 8x the work, same kernel
-        {"large         [16384,2048]", 16384, 2048},  // 16x
+        {"L2-resident   [8192,2048]", 8192, 2048},   // 9.4 MB  -- fits in L2
+        {"L2-resident   [16384,2048]", 16384, 2048}, // 18.9 MB -- fits in L2
+        {"L3-defeating  [131072,2048]", 131072, 2048}, // 151 MB -- exceeds L2
+        {"L3-defeating  [524288,2048]", 524288, 2048}, // 604 MB -- far exceeds L2
     };
 
     u8 *w = nullptr;

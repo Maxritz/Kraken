@@ -23,6 +23,30 @@ bool ends_with(const std::string &s, const std::string &suffix) {
            s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+// KRK_SPLIT=1 separates the two halves of a decode step: the forward pass,
+// and the fetch_logits that drains the stream to learn the sampled token.
+//
+// The per-op recorder cannot answer this question. It inserts an event pair
+// around every op, which is the same thing being measured -- it perturbs the
+// queue it is timing, and at ~20 us per op it is larger than most of what it
+// would report. This is plain host wall clock around the two calls the loop
+// actually makes, so it costs two clock reads per token.
+namespace {
+
+bool split_timing_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_SPLIT");
+        return v && *v && std::string(v) != "0";
+    }();
+    return on;
+}
+
+double g_split_fwd_us = 0.0;
+double g_split_fetch_us = 0.0;
+i64 g_split_steps = 0;
+
+}  // namespace
+
 // Greedy selection over a device-downloaded logits row. The sampler is not
 // used here because speculative verification only pursues argmax branches —
 // that is what makes accepted tokens bit-identical to plain greedy decoding.
@@ -1514,9 +1538,20 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
             res->finish = FinishContext;
             break;
         }
+        const bool split = split_timing_enabled();
+        auto t0 = std::chrono::steady_clock::now();
         forward(&token, 1, static_cast<i32>(pos), true);
+        auto t1 = std::chrono::steady_clock::now();
         pos++;
         fetch_logits(device_topk);
+        if (split) {
+            const auto t2 = std::chrono::steady_clock::now();
+            g_split_fwd_us +=
+                std::chrono::duration<double, std::micro>(t1 - t0).count();
+            g_split_fetch_us +=
+                std::chrono::duration<double, std::micro>(t2 - t1).count();
+            g_split_steps++;
+        }
         // One token position folded into the routing statistics.
         if (expert_scan_) expert_scan_tokens_++;
     }
@@ -1524,6 +1559,16 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     emit.finish(res->finish == FinishStop);
 
     res->decode_ms = decode_timer.ms();
+    if (g_split_steps > 0) {
+        const double n = static_cast<double>(g_split_steps);
+        std::fprintf(stderr,
+                     "[split ] %lld decode steps | forward %9.1f ms "
+                     "(%6.2f ms/step) | fetch_logits %9.1f ms "
+                     "(%6.2f ms/step)\n",
+                     static_cast<long long>(g_split_steps), g_split_fwd_us / 1e3,
+                     g_split_fwd_us / 1e3 / n, g_split_fetch_us / 1e3,
+                     g_split_fetch_us / 1e3 / n);
+    }
     return true;
 }
 

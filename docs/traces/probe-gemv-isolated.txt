@@ -2,10 +2,12 @@ device: gfx1201  SMs(CUs)=32  memClk=1259000 kHz  busWidth=256 bit
 theoretical peak: 81 GB/s
 
 shape                         n_out   n_in     grid blocks/CU   us/call      GB/s   %peak
-decode gate/up [1024,2048]     1024   2048      128      4.00      2.94     400.6  497.2%
-decode down   [2048,1024]      2048   1024      256      8.00      3.54     333.1  413.4%
-large         [8192,2048]      8192   2048     1024     32.00     14.72     641.1  795.7%
-large         [16384,2048]    16384   2048     2048     64.00     23.54     801.9  995.2%
+decode gate/up [1024,2048]     1024   2048      128      4.00      3.05     387.4  480.8%
+decode down   [2048,1024]      2048   1024      256      8.00      3.48     339.0  420.7%
+L2-resident   [8192,2048]      8192   2048     1024     32.00     15.15     623.0  773.1%
+L2-resident   [16384,2048]    16384   2048     2048     64.00     28.66     658.5  817.3%
+L3-defeating  [131072,2048]  131072   2048    16384    512.00    266.85     565.9  702.3%
+L3-defeating  [524288,2048]  524288   2048    65536   2048.00   1048.92     575.8  714.6%
 
 Reading the table: a row near %peak would mean the kernel is fine
 and the decode geometry is what starves it. Every row stuck at a
