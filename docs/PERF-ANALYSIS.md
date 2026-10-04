@@ -133,7 +133,7 @@ the MoE math mattered, decode would speed up substantially.
 
 Every optimisation aimed at the expert kernels, the expert cache, the expert
 GEMV geometry and expert prefetch is therefore aimed at ~3% of the cost. This
-supersedes B1, B2 and B4 as the finding that matters.
+supersedes B1, B2 and B6 as the finding that matters.
 
 ### B4 — a fixed ~90 ms per token independent of expert work (proven, unexplained)
 
@@ -203,34 +203,44 @@ warmup cost, not a steady-state miss rate.
 
 **Suspected, not yet proven.**
 
-6. That the ~24 us/op gap between the kernel and the step is host submission
-   (`hipEventRecord` x2 plus the launch call per op) rather than device-side
-   queue drain. The discriminator is a run with the per-op recorder off and
-   wall-clock deltas around a single op class.
-7. That folding the 8 per-layer experts into one launch is worth 10-20%, by
-   cutting launches rather than by making the kernel faster.
+6. That the ~90 ms sits in a per-token host round trip — the sampler must know
+   the sampled token before the next step can be built, so a
+   download/synchronise/upload in that path drains the pipeline once per token.
+   The discriminator is to time the pre-sample and post-sample halves of a
+   decode step separately with the recorder off.
+7. That the gap is host submission (two `hipEventRecord` calls plus the launch
+   per op) rather than device-side queue drain. These are not exclusive of 6 and
+   only the step-halves timing separates them.
 
 **Unresolved.**
 
-7. Why Kraken answers this prompt incorrectly while the reference does not. Not
+8. Why Kraken answers this prompt incorrectly while the reference does not. Not
    addressed by anything in this document.
-8. Whether 8 top-k experts across 40 layers have exploitable temporal locality
-   that would let a prefetcher convert B1's latency into bandwidth.
+9. Whether 8 top-k experts across 40 layers have exploitable temporal locality
+   worth a prefetcher. Note this is now a *second-order* question: a prefetcher
+   only pays if the staging it removes is real, and the uninstrumented run does
+   9 promotions for the whole generation.
 
 ## 6. Plan
 
+The plan was rewritten after B3. Its first three items were all MoE-side and all
+targeted work that `--expert-stub` shows is ~3% of the cost.
+
 | # | Change | Expected | Validation |
 |---|---|---|---|
-| 1 | Multi-expert GEMV: one launch for all top-k experts of a layer | 960 -> 120 launches; cuts op count, not kernel time | identical text hash; ms/tok |
-| 2 | Measure the host path directly (wall-clock A/B, recorder off) | sizes hypothesis 6, which is now the leading candidate | ms/tok at fixed op count |
-| 3 | Keep `upload_paged`/`warm_read` host waits but overlap them with the next layer's attention | targets B2's 26.6 ms host | ms/tok, transfer MB |
-| 4 | DFlash speculative heads (`laguna-s-2.1-DFlash-Q4_K_M.gguf`, 652 MB) | amortises per-token work over >1 token | accept rate, tok/s |
+| 1 | **Find the ~90 ms/token serialised path.** Time the pre-sample and post-sample halves of a decode step with the recorder off; if it is the round trip, batch the token or overlap the next step's staging | up to ~90 ms/token — the whole remaining budget | ms/tok at unchanged op count |
+| 2 | DFlash speculative heads (`laguna-s-2.1-DFlash-Q4_K_M.gguf`, 652 MB) | amortises per-token cost over >1 token; also attacks item 1, because a round trip per *pass* rather than per token is still cheaper | accept rate, tok/s |
+| 3 | Multi-expert GEMV: 960 -> 120 launches | bounded by the ~3 ms of expert math, so **<=3%** | identical text hash; ms/tok |
+| 4 | Overlap `upload_paged`/`warm_read` with attention | **not currently justified** — the uninstrumented run does 9 promotions per generation. Revisit only if item 1 turns out to be staging | ms/tok, transfer MB |
 
-Item 4 now looks strongest: the math is only ~4% of a decode step, so the wins
-available in the kernel are small, while a speculative head that accepts 3 tokens
-per pass removes **two thirds of every per-token cost** regardless of what it
-is. Poolside ships the heads; Kraken currently **refuses** the `dflash`
-architecture as "draft file, not a model".
+Item 2 is the only change here that can pay regardless of what item 1 finds,
+because a speculative head that accepts 3 tokens per pass removes two thirds of
+*every* per-token cost — including an unknown one. Poolside ships the heads;
+Kraken currently **refuses** the `dflash` architecture as "draft file, not a
+model".
+
+Item 3 is deliberately retained with a 3% ceiling attached rather than dropped,
+so it is not re-proposed later as if it were still a 5x win.
 
 ## 7. Not measured
 
