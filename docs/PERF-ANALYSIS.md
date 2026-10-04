@@ -62,25 +62,46 @@ Rollup by component: `projections` 40.5%, `transfer` 27.7%, `other` 14.5%,
 
 ## 4. Ranked bottlenecks
 
-### B1 — m=1 expert GEMV at 3.9% of memory peak (proven)
+### B1 — m=1 expert GEMV — RETRACTED, it was a measurement artifact
 
-`gemm(gemv)` is **1234 calls, 42.2 ms, 1,482 MB** = **35.1 GB/s**. The card's
-GDDR6 peak is ~896 GB/s, and an op this small should be launch/latency bound
-rather than bandwidth bound — 1.2 MB at peak is 1.34 us against a measured
-**34.2 us per call**, so it is **25x off** the roofline.
+**This finding was wrong and is withdrawn.** `gemm(gemv)` appeared to be the
+dominant cost at **1234 calls, 42.2 ms, 35.1 GB/s, 3.9% of peak, 25x off the
+roofline**. `tools/probe_gemv.hip` runs the same kernel back to back with
+nothing else queued, and it is fast:
 
-Launch geometry is `gemv_kernel<256><<<(n_out+7)/8, 256>>>`. For a
-1024-row expert projection that is **128 blocks of 256 threads on 64 CUs** —
-2 blocks/CU, ~16 warps/CU. Far too little occupancy to hide memory latency.
+| shape | grid | µs/call | GB/s |
+|---|---:|---:|---:|
+| decode gate/up `[1024,2048]` | 128 | **2.78** | **424.6** |
+| decode down `[2048,1024]` | 256 | 3.54 | 333.6 |
+| large `[16384,2048]` | 2048 | 22.75 | 829.7 |
 
-The structural cause: the expert path *does* group by expert (`group_rows_`),
-but at decode `n == 1`, so each of the top-8 experts receives exactly **one
-row**. Grouping cannot batch anything, and the MoE shape forces **960 separate
-m=1 GEMV launches per token** — 1234 including attention and the shared expert.
+Two things follow.
 
-A plain LRU(4340) replay of the access trace scores 6,741 COLD / 0 HOT, against
-kraken's actual 4,590 COLD / 6,003 HOT, so the residency policy is not the
-problem and there is no cheap win in the cache.
+**The kernel already exceeds the 200 GB/s target** by more than 2x at the decode
+shape. There is nothing to win there, and the 830 GB/s the large shape reaches
+matches the 710 GB/s rocBLAS reference recorded in `op_time.hpp`, so it is a
+real ceiling on this machine rather than a probe artefact.
+
+**The trace could not have measured it.** The profile reports its own floor:
+**19.63 us of device time per op**, for 3,457 ops in a step — **67.9 ms of the
+111.4 ms "device spans" is the recorder itself**. A 2.78 us kernel is seven
+times *below* that floor, so the 42.2 ms attributed to `gemv(gemv)` is mostly
+the cost of observing it.
+
+This is the trap the enforcement rules name: *never equate aggregate device
+time with individual invocation latency*. The aggregate said gemv owned 44% of
+the step; the invocation latency says the math is ~4% of it.
+
+**What is left is real and is not the math.** A decode step is 3,457 ops in
+94.8 ms, or 27 us per op. The kernel needs 2.78 us. The remaining ~24 us per op
+is submission and scheduling, so the bottleneck is the **op count and the host
+path**, not the device. Collapsing 960 expert launches into fewer, larger
+launches is still the right direction — but as an op-count fix, worth perhaps
+10-20%, not the 5x the GB/s figure implied.
+
+`KRK_TIME` cannot resolve anything below ~30 us. Per-op device time for the
+small ops must come from isolated probes (as here) or from wall-clock A/B, not
+from the aggregate table.
 
 ### B2 — transfer ops carry 27.7% of device time (proven, partly addressed)
 
@@ -132,22 +153,24 @@ warmup cost, not a steady-state miss rate.
 
 1. `stage_freq` single-entry cache thrashes on hybrid rope tables, and the miss
    path is a blocking `hipMemcpy`. Fixed; 277x host reduction, +4.1% end-to-end.
-2. Decode-step expert GEMVs run at 35.1 GB/s = 3.9% of peak, at 128 blocks on
-   64 CUs, 25x off the latency roofline.
-3. All COLD misses are first touches; the working set is 4,590 keys and slot
+2. The expert GEMV kernel is **not** a bottleneck: 2.78 us at the decode shape
+   (424.6 GB/s) against a 19.63 us/op measurement floor. The earlier 44% claim
+   was the recorder, not the kernel.
+3. A decode step is **3,457 ops in 94.8 ms = 27 us/op** while the dominant
+   kernel needs 2.78 us. Op count and host submission dominate decode.
+4. All COLD misses are first touches; the working set is 4,590 keys and slot
    capacity is not the constraint.
-4. The ROCm reference defaults to `--repack`, which costs ~64 GiB of host RAM
+5. The ROCm reference defaults to `--repack`, which costs ~64 GiB of host RAM
    for 1.08x decode.
 
 **Suspected, not yet proven.**
 
-5. That the 42.2 ms is split between wave-quantisation (128 blocks is not a
-   multiple of 64 CUs, so a whole wave idles) and per-launch fixed cost. The
-   discriminator is a split-K variant: if wave quantisation dominates, split-K
-   recovers most of it; if fixed cost dominates, it does not.
-6. That `upload_i32` (13.3 ms, 312 calls, 42.7 us each) is mostly host-side
-   `assign()` + upload latency rather than device work. The host column is only
-   1191 us total, which argues against it, so this is weakly supported.
+6. That the ~24 us/op gap between the kernel and the step is host submission
+   (`hipEventRecord` x2 plus the launch call per op) rather than device-side
+   queue drain. The discriminator is a run with the per-op recorder off and
+   wall-clock deltas around a single op class.
+7. That folding the 8 per-layer experts into one launch is worth 10-20%, by
+   cutting launches rather than by making the kernel faster.
 
 **Unresolved.**
 
@@ -160,16 +183,16 @@ warmup cost, not a steady-state miss rate.
 
 | # | Change | Expected | Validation |
 |---|---|---|---|
-| 1 | Multi-expert GEMV: one launch for all top-k experts of a layer, blocks split across experts | 960 -> 120 launches; B1 at full occupancy | identical text hash; ms/tok |
-| 2 | Split-K on the expert GEMV | tests hypothesis 5 | identical text hash |
+| 1 | Multi-expert GEMV: one launch for all top-k experts of a layer | 960 -> 120 launches; cuts op count, not kernel time | identical text hash; ms/tok |
+| 2 | Measure the host path directly (wall-clock A/B, recorder off) | sizes hypothesis 6, which is now the leading candidate | ms/tok at fixed op count |
 | 3 | Keep `upload_paged`/`warm_read` host waits but overlap them with the next layer's attention | targets B2's 26.6 ms host | ms/tok, transfer MB |
-| 4 | DFlash speculative heads (`laguna-s-2.1-DFlash-Q4_K_M.gguf`, 652 MB) | amortises expert reads over >1 token; the highest-value item for a bandwidth-bound MoE | accept rate, tok/s |
+| 4 | DFlash speculative heads (`laguna-s-2.1-DFlash-Q4_K_M.gguf`, 652 MB) | amortises per-token work over >1 token | accept rate, tok/s |
 
-Item 4 is the one with the largest expected effect and the least code: a
-speculative head that accepts 3 tokens per pass divides the per-token expert
-traffic by ~3, which attacks B1 and B2 together. Poolside ships the heads;
-Kraken currently **refuses** the `dflash` architecture as "draft file, not a
-model".
+Item 4 now looks strongest: the math is only ~4% of a decode step, so the wins
+available in the kernel are small, while a speculative head that accepts 3 tokens
+per pass removes **two thirds of every per-token cost** regardless of what it
+is. Poolside ships the heads; Kraken currently **refuses** the `dflash`
+architecture as "draft file, not a model".
 
 ## 7. Not measured
 

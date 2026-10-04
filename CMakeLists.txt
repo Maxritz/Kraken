@@ -248,6 +248,30 @@ if(KRK_BUILD_PROBES AND KRK_HIP_AVAILABLE)
         target_compile_definitions(probe_attn_qtile PRIVATE
                                    "KRK_OFFLOAD_${tgt_uc}=1")
     endforeach()
+
+    # probe_gemv answers a question the decode trace cannot: the trace's device
+    # span includes launch-to-arrival idle, so 35 GB/s there does not separate
+    # "the kernel is slow" from "the op is starved". This runs the same kernel
+    # back to back at the decode shapes and at oversized ones, which separates
+    # kernel quality from shape/geometry.
+    add_executable(probe_gemv
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_gemv.hip)
+    target_include_directories(probe_gemv PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/hip)
+    if(TARGET hip::device)
+        target_link_libraries(probe_gemv PRIVATE hip::device)
+    elseif(HIP_FOUND)
+        target_link_libraries(probe_gemv PRIVATE ${HIP_LIBRARIES})
+    endif()
+    target_compile_options(probe_gemv PRIVATE
+                           -O3 -ffast-math -fno-finite-math-only)
+    foreach(tgt IN LISTS CMAKE_HIP_ARCHITECTURES)
+        string(TOUPPER "${tgt}" tgt_uc)
+        target_compile_definitions(probe_gemv PRIVATE
+                                   "KRK_OFFLOAD_${tgt_uc}=1")
+    endforeach()
 endif()
 
 # ---------------------------------------------------------------------------
