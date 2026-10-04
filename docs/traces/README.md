@@ -65,3 +65,33 @@ streams of interleaved A/B determinism runs (`none`, `vram3`, `pf` arms).
 `results.tsv` is the 26-model device benchmark sweep.
 
 These are the raw material for `docs/PERF-ANALYSIS.md`.
+## Coherence sweep
+
+`coherence-24-of-25-samastam-degenerate.log` is a device-versus-CPU-reference
+check across 25 models, each asked the same question and compared on generated
+text. **24 coherent, 1 not.**
+
+The one failure is `Samastam-2.5B-Q8_0.gguf` with the reason `both produced no
+text`. That is degenerate rather than a disagreement: Samastam is a base model
+and emits EOS immediately under a ChatML wrapper on *both* backends, so there is
+nothing to compare. Run it with `KRK_CHAT=0` (no chat wrapper) and it passes.
+The count is 24/25, not 25/25, and the filename says so.
+
+## Headline scores
+
+Measured on the reference build `b11146-7fe450e19`, `--no-repack` unless noted.
+`--repack` is that build's default and costs ~64 GiB of host RAM.
+
+| model | metric | kraken | llama.cpp ROCm |
+|---|---|---:|---:|
+| laguna-xs2-Q4_K_M | decode tok/s | 10.6 | 14.4 |
+| laguna-xs2-Q4_K_M | prompt tok/s | 7.9 | 25.2 |
+| Laguna-S-2.1 (68 GiB, 3 shards) | decode tok/s | 0.9 | *not comparable* |
+
+Laguna-S-2.1 has no valid llama.cpp baseline: at most 23.4% of a 68.09 GiB model
+fits in 15.9 GiB of VRAM, so 76.6% of it was CPU-computed. Its kraken figure is
+real and its output is garbage (`|UNK|`), so treat the row as "runs, wrong
+answer, slow" rather than a speed comparison.
+
+Per-model speed and coherence for the 26-model sweep is in
+`results.tsv` and rendered in `docs/MODEL-STATUS.md`.

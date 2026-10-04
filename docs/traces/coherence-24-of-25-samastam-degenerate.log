@@ -1,0 +1,28 @@
+prompt: What is the capital of France?   n=16   ctx=512   chunk=32   chat=1   tie tol=0.05
+per-run timeout 180s
+PASS                   SmolLM2-135M-Instruct.Q4_K_M.gguf          The capital of France is Paris. It is located in the northern pa 
+PASS                   SmolLM2-135M-Instruct.IQ4_XS.gguf          The capital of France is Paris. Paris is a city that is know 
+PASS                   Qwen3.5-0.8B.Q4_K_M.gguf                   <think>  </think>  The capital of France is **Paris**. 
+PASS                   Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf          <think> Okay, so I need to figure out the capital of Fr 
+PASS                   smolcode-coder-cpp-1.5b-q4_k_m.gguf        The capital of France 
+PASS                   smolcode-coder-cpp-3b-q4_k_m.gguf          The capital of France 
+PASS                   Phi-3.5-mini-instruct-python_coding_assistanQ4_K_M.gguf   ### Response  The user is asking for a Py 
+FAIL                   Samastam-2.5B-Q8_0.gguf                    both produced no text
+PASS                   qwen3.5-4b-nvfp4.gguf                      <think> Thinking Process:  1.  **Analyze the Reque 
+PASS                   Spark_one.Q6_K.gguf                        The capital of France is Paris.<|endoftext|>Human: What is the capital 
+PASS                   VibeThinker-3B.Q8_0.gguf                   <think>The user asks: "What is the capital of France?" 
+PASS                   Qwen3-4B-Instruct-2507-Q6_K.gguf           The capital of France 
+PASS                   qwen3-1.7b-coder-distilled-sft-f16.gguf    <think> Okay, the user is asking for the capital of Franc 
+PASS                   qwen3-1.7b-stem-proof-f16.gguf             <think> Okay, the user is asking for the capital of Franc 
+PASS                   Qwen3-4B-Q8_0.gguf                         <think> Okay, the user is asking for the capital of Franc 
+PASS                   Opus4.7-GODs.Ghost.Codex.Distill.4B-Q8_0.gguf <think> The user is asking for the capital of Fr 
+PASS                   Qwen3.5-9B-DeepSeek-V4-Flash-MTP-Q3_K_M.gguf <think> Thinking Process: 1.  **Identify the core qu 
+PASS                   Qwen3-8B-Q4_K_M.gguf                       <think> Okay, the user is asking for the capital of Franc 
+PASS                   mythos-9b-unhinged-heretic.i1-Q4_K_M.gguf  <think> Okay, the user is asking for the capital of Franc 
+PASS                   lacuna-v1-Q4_K_M.gguf                      The capital of France is Paris.<| 
+PASS                   Qwen2.5-Coder-7B-Instruct-Q5_K_M.gguf      The capital of France 
+PASS                   qwen3.5-9b-nvfp4.gguf                      <think>  </think>  The capital of France is **Paris**. 
+PASS                   qwen35-9b-instruct-nvfp4.gguf              <think>  </think>  The capital of France is **Paris**. 
+PASS                   Qwen3.5-9b-Sushi-Coder-RL.Q4_K_M.gguf      <think> The user is asking for the capital of France. This is a straig 
+PASS                   omnicoder-9b-q6_k.gguf                     <think> Thinking Process:  1.  **Identify the core qu 
+24 coherent, 1 not
