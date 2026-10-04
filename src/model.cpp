@@ -416,6 +416,9 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     };
 
     // Uploads a 1-D f32 tensor (norm weights, biases, per-head norms).
+    // Latches the one-shot router-bias spelling warning, below.
+    bool warned_bias = false;
+
     auto upload_f32 = [&](const std::string &name) -> f32 * {
         const GgufTensor *t = gguf_.tensor(name);
         if (!t) return nullptr;
@@ -621,13 +624,18 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                         host_alloc(static_cast<size_t>(n) * sizeof(f32)));
                     dequant_row(bt->type, bt->data, host, n);
                     L.router_bias = host;
-                    if (strcmp(fmt, spellings[0]) == 0)
-                        KRK_WARN("blk.%d router bias found as "
-                                 "exp_probs_b.bias (no ffn_ prefix); the "
-                                 "engine expected the prefixed spelling, so "
-                                 "earlier builds ran this model's expert "
-                                 "selection un-biased",
-                                 l);
+                    // Once per model. laguna has 39 routed layers, and 39
+                    // identical lines on every load is a warning nobody reads
+                    // -- which is how the first one would have stayed unread
+                    // anyway.
+                    if (strcmp(fmt, spellings[0]) == 0 && !warned_bias) {
+                        warned_bias = true;
+                        KRK_WARN("router selection bias found as "
+                                 "exp_probs_b.bias (no ffn_ prefix); the engine "
+                                 "expected the prefixed spelling, so builds "
+                                 "before this one ran this model's expert "
+                                 "selection un-biased");
+                    }
                     break;
                 }
                 if (L.router_bias) cfg_.router_bias = true;
