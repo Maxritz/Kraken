@@ -42,8 +42,20 @@ __device__ __forceinline__ f32 ue4m3_to_fp32_dev(u8 x) {
     return raw * 0.5f;
 }
 
+// E8M0 exponent byte to MXFP4's half scale (its value table is doubled).
+// Dev twin of e8m0_to_fp32_half in src/quant.cpp; the two denormal bytes
+// (2^-128, 2^-127) are the x<2 branch.
+__device__ __forceinline__ f32 e8m0_half_dev(u8 x) {
+    return __uint_as_float((x < 2) ? (0x00200000u << x)
+                                   : (static_cast<u32>(x - 1) << 23));
+}
+
 __device__ static const i8 kDevValuesFp4[16] = {
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+};
+// ROCmFPX fork value set (kvalues_rocmfp4): top level 10, not 12.
+__device__ static const i8 kDevValuesRocmFp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10,
 };
 __device__ static const i8 kDevIq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
@@ -158,6 +170,9 @@ KRK_QTRAIT(DType::IQ4_NL, 1);
 KRK_QTRAIT(DType::IQ2_XXS, 8);
 KRK_QTRAIT(DType::IQ4_XS, 8);
 KRK_QTRAIT(DType::NVFP4, 2);
+KRK_QTRAIT(DType::MXFP4, 1);
+KRK_QTRAIT(DType::ROCMFP4, 1);
+KRK_QTRAIT(DType::ROCMFP4_FAST, 1);
 KRK_QTRAIT(DType::Q2_K, 8);
 KRK_QTRAIT(DType::Q3_K, 8);
 KRK_QTRAIT(DType::Q4_K, 8);
@@ -185,6 +200,9 @@ __device__ __forceinline__ int dtype_block_bytes_dev(int t) {
         case static_cast<int>(DType::IQ2_XXS): return 66;
         case static_cast<int>(DType::IQ4_XS): return 136;
         case static_cast<int>(DType::NVFP4): return 36;
+        case static_cast<int>(DType::MXFP4): return 17;
+        case static_cast<int>(DType::ROCMFP4): return 18;
+        case static_cast<int>(DType::ROCMFP4_FAST): return 17;
         case static_cast<int>(DType::Q2_K): return 84;
         case static_cast<int>(DType::Q3_K): return 110;
         case static_cast<int>(DType::Q4_K): return 144;
@@ -403,6 +421,37 @@ __device__ __forceinline__ void dequant_chunk(const u8 *b, int chunk, _Float16 *
                     static_cast<f32>(kDevValuesFp4[qs[j] >> 4]) * d);
             }
         }
+    } else if constexpr (T == DType::MXFP4) {
+        // One E8M0 exponent then 16 packed nibbles: low -> j, high -> j+16.
+        const f32 d = e8m0_half_dev(b[0]);
+        const u8 *qs = b + 1;
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            y[j] = static_cast<_Float16>(
+                static_cast<f32>(kDevValuesFp4[qs[j] & 0xF]) * d);
+            y[j + 16] = static_cast<_Float16>(
+                static_cast<f32>(kDevValuesFp4[qs[j] >> 4]) * d);
+        }
+    } else if constexpr (T == DType::ROCMFP4) {
+        // 16 packed nibbles then two UE4M3 half-block scales.
+        const f32 d0 = ue4m3_to_fp32_dev(b[16]);
+        const f32 d1 = ue4m3_to_fp32_dev(b[17]);
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            y[j] = static_cast<_Float16>(
+                static_cast<f32>(kDevValuesRocmFp4[b[j] & 0xF]) * d0);
+            y[j + 16] = static_cast<_Float16>(
+                static_cast<f32>(kDevValuesRocmFp4[b[j] >> 4]) * d1);
+        }
+    } else if constexpr (T == DType::ROCMFP4_FAST) {
+        const f32 d = ue4m3_to_fp32_dev(b[16]);
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            y[j] = static_cast<_Float16>(
+                static_cast<f32>(kDevValuesRocmFp4[b[j] & 0xF]) * d);
+            y[j + 16] = static_cast<_Float16>(
+                static_cast<f32>(kDevValuesRocmFp4[b[j] >> 4]) * d);
+        }
     } else if constexpr (T == DType::Q2_K) {
         // Four-plane layout: chunk c is group g = c/4, plane j = c%4.
         const f32 d = d_h2f(static_cast<u16>(b[80] | (b[81] << 8)));
@@ -567,6 +616,9 @@ __device__ __forceinline__ void dequant_chunk_dev(int t, const u8 *b, int chunk,
         case static_cast<int>(DType::IQ2_XXS): dequant_chunk<DType::IQ2_XXS>(b, chunk, y); break;
         case static_cast<int>(DType::IQ4_XS): dequant_chunk<DType::IQ4_XS>(b, chunk, y); break;
         case static_cast<int>(DType::NVFP4): dequant_chunk<DType::NVFP4>(b, chunk, y); break;
+        case static_cast<int>(DType::MXFP4): dequant_chunk<DType::MXFP4>(b, chunk, y); break;
+        case static_cast<int>(DType::ROCMFP4): dequant_chunk<DType::ROCMFP4>(b, chunk, y); break;
+        case static_cast<int>(DType::ROCMFP4_FAST): dequant_chunk<DType::ROCMFP4_FAST>(b, chunk, y); break;
         case static_cast<int>(DType::Q2_K): dequant_chunk<DType::Q2_K>(b, chunk, y); break;
         case static_cast<int>(DType::Q3_K): dequant_chunk<DType::Q3_K>(b, chunk, y); break;
         case static_cast<int>(DType::Q4_K): dequant_chunk<DType::Q4_K>(b, chunk, y); break;
@@ -779,6 +831,9 @@ __device__ __forceinline__ f32 dot_chunks(int t, const u8 *wrow, const _Float16 
         case static_cast<int>(DType::IQ2_XXS): return dot_chunks_t<DType::IQ2_XXS>(wrow, x, c0, c1);
         case static_cast<int>(DType::IQ4_XS): return dot_chunks_t<DType::IQ4_XS>(wrow, x, c0, c1);
         case static_cast<int>(DType::NVFP4): return dot_chunks_t<DType::NVFP4>(wrow, x, c0, c1);
+        case static_cast<int>(DType::MXFP4): return dot_chunks_t<DType::MXFP4>(wrow, x, c0, c1);
+        case static_cast<int>(DType::ROCMFP4): return dot_chunks_t<DType::ROCMFP4>(wrow, x, c0, c1);
+        case static_cast<int>(DType::ROCMFP4_FAST): return dot_chunks_t<DType::ROCMFP4_FAST>(wrow, x, c0, c1);
         case static_cast<int>(DType::Q2_K): return dot_chunks_t<DType::Q2_K>(wrow, x, c0, c1);
         case static_cast<int>(DType::Q3_K): return dot_chunks_t<DType::Q3_K>(wrow, x, c0, c1);
         case static_cast<int>(DType::Q4_K): return dot_chunks_t<DType::Q4_K>(wrow, x, c0, c1);
@@ -821,6 +876,9 @@ __device__ __forceinline__ void dequant_row_dev(int t, const u8 *src, _Float16 *
         case static_cast<int>(DType::IQ2_XXS): dequant_row_t<DType::IQ2_XXS>(src, dst, n); break;
         case static_cast<int>(DType::IQ4_XS): dequant_row_t<DType::IQ4_XS>(src, dst, n); break;
         case static_cast<int>(DType::NVFP4): dequant_row_t<DType::NVFP4>(src, dst, n); break;
+        case static_cast<int>(DType::MXFP4): dequant_row_t<DType::MXFP4>(src, dst, n); break;
+        case static_cast<int>(DType::ROCMFP4): dequant_row_t<DType::ROCMFP4>(src, dst, n); break;
+        case static_cast<int>(DType::ROCMFP4_FAST): dequant_row_t<DType::ROCMFP4_FAST>(src, dst, n); break;
         case static_cast<int>(DType::Q2_K): dequant_row_t<DType::Q2_K>(src, dst, n); break;
         case static_cast<int>(DType::Q3_K): dequant_row_t<DType::Q3_K>(src, dst, n); break;
         case static_cast<int>(DType::Q4_K): dequant_row_t<DType::Q4_K>(src, dst, n); break;

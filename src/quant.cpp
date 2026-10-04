@@ -105,6 +105,26 @@ const u64 kIq2xxsGrid[256] = {
     0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
 };
 
+// The ROCmFP4 code ladder: E2M1 magnitudes 0..8 with the top level 10
+// instead of 12 (fork rocmfp4_decode). Bit 3 is the sign.
+inline int rocmfp4_code(int q) {
+    const int m = q & 7;
+    const int mag = m <= 4 ? m : 2 * m - 4;
+    return (q & 8) ? -mag : mag;
+}
+
+// E8M0 exponent byte to the half scale MXFP4 uses (its table is doubled).
+// Mirrors ggml_e8m0_to_fp32_half exactly, including its two denormal
+// exponent bytes (2^-128 and 2^-127) and its choice not to special-case
+// the 0xFF NaN pattern.
+f32 e8m0_to_fp32_half(u8 x) {
+    const u32 bits = (x < 2) ? (0x00200000u << x)
+                              : (static_cast<u32>(x - 1) << 23);
+    f32 f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
 void deq_q4_0(const u8 *b, f32 *y, i64 nblk) {
     for (i64 i = 0; i < nblk; i++, b += 18, y += 32) {
         const f32 d = fp16_to_fp32(static_cast<u16>(b[0] | (b[1] << 8)));
@@ -416,6 +436,47 @@ void deq_nvfp4(const u8 *b, f32 *y, i64 nblk) {
     }
 }
 
+// MXFP4: one E8M0 exponent byte then 16 bytes of packed E2M1 nibbles.
+// Element j is the LOW nibble of qs[j] and j+16 the HIGH nibble, and the
+// value table is doubled, so the exponent decodes at half scale.
+void deq_mxfp4(const u8 *b, f32 *y, i64 nblk) {
+    for (i64 i = 0; i < nblk; i++, b += 17, y += 32) {
+        const f32 d = e8m0_to_fp32_half(b[0]);
+        const u8 *qs = b + 1;
+        for (int j = 0; j < 16; j++) {
+            y[j] = static_cast<f32>(kValuesFp4[qs[j] & 0xF]) * d;
+            y[j + 16] = static_cast<f32>(kValuesFp4[qs[j] >> 4]) * d;
+        }
+    }
+}
+
+// ROCmFP4 (type 100): 16 packed nibbles then two UE4M3 half-block scales.
+// Same nibble pairing as MXFP4: low -> j, high -> j+16, with e[0] scaling
+// the first 16 values and e[1] the second 16. The code ladder is the
+// fork's kvalues_rocmfp4 (0..4, 6, 8, 10 with sign in bit 3).
+void deq_rocmfp4(const u8 *b, f32 *y, i64 nblk) {
+    for (i64 i = 0; i < nblk; i++, b += 18, y += 32) {
+        const f32 d0 = ue4m3_to_fp32(b[16]);
+        const f32 d1 = ue4m3_to_fp32(b[17]);
+        for (int j = 0; j < 16; j++) {
+            y[j] = static_cast<f32>(rocmfp4_code(b[j] & 0xF)) * d0;
+            y[j + 16] = static_cast<f32>(rocmfp4_code(b[j] >> 4)) * d1;
+        }
+    }
+}
+
+// ROCmFP4_FAST (type 101): the same 16 packed nibbles with a single
+// UE4M3 scale for all 32 values. 17 bytes, still 4.25 bpw.
+void deq_rocmfp4_fast(const u8 *b, f32 *y, i64 nblk) {
+    for (i64 i = 0; i < nblk; i++, b += 17, y += 32) {
+        const f32 d = ue4m3_to_fp32(b[16]);
+        for (int j = 0; j < 16; j++) {
+            y[j] = static_cast<f32>(rocmfp4_code(b[j] & 0xF)) * d;
+            y[j + 16] = static_cast<f32>(rocmfp4_code(b[j] >> 4)) * d;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ternary (BitNet) formats
 //
@@ -513,6 +574,9 @@ void dequant_block(DType t, const u8 *p, f32 *buf) {
         case DType::IQ2_XXS: deq_iq2_xxs(p, buf, 1); break;
         case DType::IQ4_XS: deq_iq4_xs(p, buf, 1); break;
         case DType::NVFP4: deq_nvfp4(p, buf, 1); break;
+        case DType::MXFP4: deq_mxfp4(p, buf, 1); break;
+        case DType::ROCMFP4: deq_rocmfp4(p, buf, 1); break;
+        case DType::ROCMFP4_FAST: deq_rocmfp4_fast(p, buf, 1); break;
         case DType::TQ1_0: deq_tq1_0(p, buf, 1); break;
         case DType::TQ2_0: deq_tq2_0(p, buf, 1); break;
         default: break;
@@ -543,7 +607,10 @@ const char *dtype_name(DType t) {
         case DType::IQ4_NL: return "IQ4_NL";
         case DType::IQ2_XXS: return "IQ2_XXS";
         case DType::IQ4_XS: return "IQ4_XS";
+        case DType::MXFP4: return "MXFP4";
         case DType::NVFP4: return "NVFP4";
+        case DType::ROCMFP4: return "Q4_0_ROCMFP4";
+        case DType::ROCMFP4_FAST: return "Q4_0_ROCMFP4_FAST";
         case DType::TQ1_0: return "TQ1_0";
         case DType::TQ2_0: return "TQ2_0";
         default: return "UNKNOWN";
@@ -571,6 +638,9 @@ bool dtype_supported(DType t) {
         case DType::IQ2_XXS:
         case DType::IQ4_XS:
         case DType::NVFP4:
+        case DType::MXFP4:
+        case DType::ROCMFP4:
+        case DType::ROCMFP4_FAST:
         case DType::TQ1_0:
         case DType::TQ2_0:
             return true;
@@ -620,6 +690,9 @@ int dtype_block_bytes(DType t) {
         case DType::IQ2_XXS: return 66;
         case DType::IQ4_XS: return 136;
         case DType::NVFP4: return 36;
+        case DType::MXFP4: return 17;
+        case DType::ROCMFP4: return 18;
+        case DType::ROCMFP4_FAST: return 17;
         case DType::TQ1_0: return 54;
         case DType::TQ2_0: return 66;
         default: return 0;

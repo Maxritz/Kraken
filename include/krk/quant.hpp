@@ -39,7 +39,17 @@ enum class DType : i32 {
     // zero-block skipping).
     TQ1_0 = 34,
     TQ2_0 = 35,
+    // MXFP4 (ggml id 39): 32-value blocks of E2M1 codes behind one E8M0
+    // exponent byte. The value table is doubled, so the scale is used at
+    // half strength (ggml_e8m0_to_fp32_half).
+    MXFP4 = 39,
     NVFP4 = 40,
+    // ROCmFPX fork formats (github.com/charlie12345/ROCmFPX). These ids
+    // are not upstream: 100 is Q4_0_ROCMFP4 (dual UE4M3 half-block
+    // scales) and 101 is Q4_0_ROCMFP4_FAST (one scale per 32 values).
+    // Both pack an E2M1-derived codebook whose top level is 10, not 12.
+    ROCMFP4 = 100,
+    ROCMFP4_FAST = 101,
 };
 
 const char *dtype_name(DType t);

@@ -259,6 +259,30 @@ static void test_quant_geometry() {
           "ternary formats are supported");
     CHECK(std::strcmp(dtype_name(DType::TQ1_0), "TQ1_0") == 0, "TQ1_0 name");
     CHECK(std::strcmp(dtype_name(DType::TQ2_0), "TQ2_0") == 0, "TQ2_0 name");
+    // MXFP4 is ggml id 39 (gpt-oss); 100/101 are the ROCmFPX fork's
+    // Q4_0_ROCMFP4 / Q4_0_ROCMFP4_FAST. All three are 32-value blocks.
+    CHECK(static_cast<int>(DType::MXFP4) == 39, "MXFP4 keeps ggml type id 39");
+    CHECK(static_cast<int>(DType::ROCMFP4) == 100, "ROCmFP4 type id 100");
+    CHECK(static_cast<int>(DType::ROCMFP4_FAST) == 101, "ROCmFP4_FAST type id 101");
+    CHECK(dtype_block_size(DType::MXFP4) == 32, "MXFP4 block is 32");
+    CHECK(dtype_block_bytes(DType::MXFP4) == 17, "MXFP4 block is 17 bytes");
+    CHECK(dtype_block_size(DType::ROCMFP4) == 32, "ROCmFP4 block is 32");
+    CHECK(dtype_block_bytes(DType::ROCMFP4) == 18, "ROCmFP4 block is 18 bytes");
+    CHECK(dtype_block_size(DType::ROCMFP4_FAST) == 32, "ROCmFP4_FAST block is 32");
+    CHECK(dtype_block_bytes(DType::ROCMFP4_FAST) == 17, "ROCmFP4_FAST block is 17 bytes");
+    CHECK(dtype_row_bytes(DType::MXFP4, 64) == 34, "MXFP4 row of 64 is 34 bytes");
+    CHECK(dtype_row_bytes(DType::ROCMFP4, 64) == 36, "ROCmFP4 row of 64 is 36 bytes");
+    CHECK(dtype_row_bytes(DType::ROCMFP4_FAST, 64) == 34, "ROCmFP4_FAST row of 64");
+    CHECK(dtype_row_aligned(DType::MXFP4, 64), "MXFP4 rows are 32-aligned");
+    CHECK(!dtype_row_aligned(DType::MXFP4, 33), "MXFP4 rejects a non-multiple row");
+    CHECK(dtype_supported(DType::MXFP4) && dtype_supported(DType::ROCMFP4) &&
+              dtype_supported(DType::ROCMFP4_FAST),
+          "MXFP4 and the ROCmFPX formats are dequantizable");
+    CHECK(std::strcmp(dtype_name(DType::MXFP4), "MXFP4") == 0, "MXFP4 name");
+    CHECK(std::strcmp(dtype_name(DType::ROCMFP4), "Q4_0_ROCMFP4") == 0,
+          "ROCmFP4 name");
+    CHECK(std::strcmp(dtype_name(DType::ROCMFP4_FAST), "Q4_0_ROCMFP4_FAST") == 0,
+          "ROCmFP4_FAST name");
 }
 
 static void test_q4_0_layout() {
@@ -463,6 +487,92 @@ static void test_nvfp4_layout() {
     std::vector<f32> x(64, 1.0f);
     CHECK_NEAR(vec_dot(DType::NVFP4, blk, x.data(), 64), 20.0f, 1e-3,
                "NVFP4 vec_dot");
+}
+
+static void test_mxfp4_layout() {
+    // MXFP4 (ggml id 39): 17 bytes = one E8M0 exponent byte then 16 bytes of
+    // packed E2M1 nibbles. Element j is the LOW nibble of qs[j], element
+    // j+16 the HIGH nibble. The value table is doubled (0,1,2,3,4,6,8,12),
+    // so the exponent decodes at half scale: 127 -> 2^-1 and 126 -> 2^-2.
+    u8 blk[17];
+    std::memset(blk, 0, sizeof(blk));
+    blk[0] = 127; // d = 0.5
+    for (int j = 0; j < 16; j++) blk[1 + j] = 0x11;
+    f32 out[32];
+    dequant_row(DType::MXFP4, blk, out, 32);
+    for (int j = 0; j < 32; j++)
+        CHECK_NEAR(out[j], 0.5f, 1e-6, "MXFP4 code 1 at exponent 127");
+    std::vector<f32> x(32, 1.0f);
+    CHECK_NEAR(vec_dot(DType::MXFP4, blk, x.data(), 32), 16.0f, 1e-3,
+               "MXFP4 vec_dot");
+    // The exponent byte alone rescales the block: 126 halves every value.
+    blk[0] = 126;
+    dequant_row(DType::MXFP4, blk, out, 32);
+    for (int j = 0; j < 32; j++)
+        CHECK_NEAR(out[j], 0.25f, 1e-6, "MXFP4 exponent 126 is half of 127");
+    // The full E2M1 ladder plus its negative half, all at d = 0.5.
+    blk[0] = 127;
+    for (int j = 0; j < 16; j++) blk[1 + j] = static_cast<u8>(j | (j << 4));
+    dequant_row(DType::MXFP4, blk, out, 32);
+    const f32 ladder[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+                            -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    for (int j = 0; j < 16; j++) {
+        CHECK_NEAR(out[j], ladder[j], 1e-6, "MXFP4 low-nibble ladder");
+        CHECK_NEAR(out[16 + j], ladder[j], 1e-6, "MXFP4 high-nibble ladder");
+    }
+    // Denormal exponent bytes 0 and 1 are 2^-128 and 2^-127, not zero.
+    for (int e = 0; e < 2; e++) {
+        blk[0] = static_cast<u8>(e);
+        for (int j = 0; j < 16; j++) blk[1 + j] = 0x01;
+        dequant_row(DType::MXFP4, blk, out, 32);
+        CHECK(out[0] > 0.0f && std::isfinite(out[0]),
+              "MXFP4 denormal exponent is a positive finite scale");
+        CHECK_NEAR(out[16], 0.0f, 1e-30, "MXFP4 code 0 is zero");
+    }
+}
+
+static void test_rocmfp4_layout() {
+    // ROCmFP4 (charlie12345/ROCmFPX): type 100 is 16 packed 4-bit codes
+    // followed by TWO UE4M3 half-block scales (18 bytes); type 101 is the
+    // same codes with ONE scale for the whole 32-value block (17 bytes).
+    // Nibble pairing matches MXFP4: low -> j scaled by e[0], high -> j+16
+    // scaled by e[1]. Scale bytes: 0x40 = 1.0, 0x38 = 0.5, 0x7F = 0.
+    u8 blk[18];
+    std::memset(blk, 0, sizeof(blk));
+    for (int j = 0; j < 16; j++) blk[j] = static_cast<u8>(j | (j << 4));
+    blk[16] = 0x40; // first 16 values at 1.0
+    blk[17] = 0x38; // second 16 values at 0.5
+    f32 out[32];
+    dequant_row(DType::ROCMFP4, blk, out, 32);
+    // Code ladder 0..15: 0,1,2,3,4,6,8,10 then 0,-1,-2,-3,-4,-6,-8,-10.
+    const f32 ladder[16] = {0.0f,  1.0f,  2.0f,  3.0f,  4.0f,  6.0f,  8.0f,  10.0f,
+                            -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -10.0f};
+    for (int j = 0; j < 16; j++)
+        CHECK_NEAR(out[j], ladder[j], 1e-5, "ROCmFP4 first half at scale 1.0");
+    for (int j = 0; j < 16; j++)
+        CHECK_NEAR(out[16 + j], ladder[j] * 0.5f, 1e-5,
+                   "ROCmFP4 second half at scale 0.5");
+    // The single-scale layout sees only byte 16 and maps it to all 32 values.
+    dequant_row(DType::ROCMFP4_FAST, blk, out, 32);
+    for (int j = 0; j < 16; j++) {
+        CHECK_NEAR(out[j], ladder[j], 1e-5, "ROCmFP4_FAST scale is byte 16");
+        CHECK_NEAR(out[16 + j], ladder[j], 1e-5, "ROCmFP4_FAST high nibble");
+    }
+    blk[16] = 0x38;
+    dequant_row(DType::ROCMFP4_FAST, blk, out, 32);
+    for (int j = 0; j < 16; j++)
+        CHECK_NEAR(out[j], ladder[j] * 0.5f, 1e-5,
+                   "ROCmFP4_FAST follows a 0.5 scale byte");
+    // 0x7F and 0x00 are the invalid/zero scale bytes, exactly as NVFP4.
+    for (int e = 0; e < 2; e++) {
+        blk[16] = static_cast<u8>(e == 0 ? 0x7F : 0x00);
+        dequant_row(DType::ROCMFP4_FAST, blk, out, 32);
+        for (int j = 0; j < 32; j++) CHECK_NEAR(out[j], 0.0f, 1e-30, "scale 0");
+    }
+    std::vector<f32> x(32, 1.0f);
+    blk[16] = 0x40;
+    CHECK_NEAR(vec_dot(DType::ROCMFP4_FAST, blk, x.data(), 32), 0.0f, 1e-3,
+               "ROCmFP4_FAST vec_dot of the signed ladder");
 }
 
 // TQ2_0 / TQ1_0 — the BitNet ternary formats.
@@ -3089,6 +3199,8 @@ int main() {
     test_iq2_xxs_layout();
     test_iq4_xs_layout();
     test_nvfp4_layout();
+    test_mxfp4_layout();
+    test_rocmfp4_layout();
     test_tq2_0_layout();
     test_tq1_0_layout();
     test_vec_dot();

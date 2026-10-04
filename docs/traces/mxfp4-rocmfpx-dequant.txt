@@ -1,0 +1,187 @@
+MXFP4 (39) and ROCmFP4 (100/101) dequantization — evidence
+Generated 2026-10-04 22:44:27 UTC on gfx1201 / RX 9070 XT
+
+########################################################################
+# 1. What the formats are, from the producers' own sources
+########################################################################
+
+$ grep -n 'ROCMFP4\|MXFP4' /tmp/rocmfpx/ggml/include/ggml.h   # fork charlie12345/ROCmFPX
+429:        GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
+432:        GGML_TYPE_Q4_0_ROCMFP4      = 100, // ROCmFP4 experimental UE4M3 scales + packed AMD FP4 blocks
+433:        GGML_TYPE_Q4_0_ROCMFP4_FAST = 101, // ROCmFP4 single-scale speed layout
+434:        GGML_TYPE_Q6_0_ROCMFPX      = 102, // ROCmFPx experimental 6-bit UE4M3-scale reference layout
+435:        GGML_TYPE_Q8_0_ROCMFPX      = 103, // ROCmFPx experimental 8-bit UE4M3-scale reference layout
+436:        GGML_TYPE_Q3_0_ROCMFPX      = 104, // ROCmFPx experimental 3-bit UE4M3-scale reference layout
+439:        GGML_TYPE_Q2_0_ROCMFPX      = 107, // ROCmFPx experimental 2-bit S40 codebook + dual UE4M3 scales
+441:        GGML_TYPE_COUNT   = 109,
+776:    GGML_API enum ggml_type ggml_type_from_name(const char * name); // GGML_TYPE_COUNT if unknown
+
+$ sed -n '/AMD-tuned compact layout/,/^$/p' /tmp/rocmfpx/ggml/rocmfp4/rocmfp4.h
+// AMD-tuned compact layout: 16 bytes of packed E2M1-derived 4-bit codes, then
+// one unsigned E4M3 scale byte per 16-weight half block.
+typedef struct {
+    uint8_t qs[QK_ROCMFP4/2];
+    uint8_t e[2];
+} block_rocmfp4;
+
+// Speed-focused layout: same 32 packed ROCmFP4 nibbles, but one UE4M3 scale
+// for the whole block. This is a separate GGUF type so fast 4.25 BPW artifacts
+// never alias the safer dual-scale format above.
+typedef struct {
+    uint8_t qs[QK_ROCMFP4/2];
+    uint8_t e;
+} block_rocmfp4_fast;
+
+$ grep -n 'kvalues_rocmfp4' -A4 /tmp/rocmfpx/ggml/src/ggml-common.h
+1144:GGML_TABLE_BEGIN(int8_t, kvalues_rocmfp4, 16)
+1145-    0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10,
+1146-GGML_TABLE_END()
+1147-
+1148-#define NGRID_IQ1S 2048
+
+$ grep -n 'rocmfp4_dequantize_row_q4_0' -A14 /tmp/rocmfpx/ggml/rocmfp4/rocmfp4.c
+556:void rocmfp4_dequantize_row_q4_0(const block_rocmfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+557-    assert(k % QK_ROCMFP4 == 0);
+558-
+559-    const int64_t nb = k / QK_ROCMFP4;
+560-    for (int64_t ib = 0; ib < nb; ++ib) {
+561-        const float d0 = rocmfp4_ue4m3_to_fp32_half(x[ib].e[0]);
+562-        const float d1 = rocmfp4_ue4m3_to_fp32_half(x[ib].e[1]);
+563-
+564-        for (int j = 0; j < QK_ROCMFP4/2; ++j) {
+565-            y[ib*QK_ROCMFP4 + j]                 = (float) rocmfp4_decode(x[ib].qs[j] & 0x0f) * d0;
+566-            y[ib*QK_ROCMFP4 + j + QK_ROCMFP4/2] = (float) rocmfp4_decode(x[ib].qs[j] >> 4)   * d1;
+567-        }
+568-    }
+569-}
+570-
+
+$ grep -n 'GGML_E8M0_TO_FP32_HALF' -A18 H:/LLAMA-bins/llama.cpp/ggml/src/ggml-impl.h
+489:static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
+490-    uint32_t bits;
+491-
+492-    // For x < 2: use precomputed denormal patterns
+493-    if (x < 2) {
+494-        // 0x00200000 = 2^(-128), 0x00400000 = 2^(-127)
+495-        bits = 0x00200000 << x;
+496-    }
+497-    // For x >= 2: normalized exponent adjustment
+498-    else {
+499-        // 0.5 * 2^(x-127) = 2^(x-128) = normalized with exponent (x-1)
+500-        bits = (uint32_t)(x - 1) << 23;
+501-    }
+502-    // Note: NaNs are not handled here
+503-
+504-    float result;
+505-    memcpy(&result, &bits, sizeof(float));
+506-    return result;
+507-}
+
+$ grep -n -A18 'void dequantize_row_mxfp4' H:/LLAMA-bins/llama.cpp/ggml/src/ggml-quants.c
+569:void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+570-    static const int qk = QK_MXFP4;
+571-
+572-    assert(k % qk == 0);
+573-
+574-    const int nb = k / qk;
+575-
+576-    for (int i = 0; i < nb; i++) {
+577-        const float d = GGML_E8M0_TO_FP32_HALF(x[i].e);
+578-
+579-        for (int j = 0; j < qk/2; ++j) {
+580-            const int8_t x0 = kvalues_mxfp4[x[i].qs[j] & 0x0F];
+581-            const int8_t x1 = kvalues_mxfp4[x[i].qs[j] >>   4];
+582-
+583-            y[i*qk + j + 0   ] = x0*d;
+584-            y[i*qk + j + qk/2] = x1*d;
+585-        }
+586-    }
+587-}
+
+########################################################################
+# 2. The row-size formula checked against the producers' tensor offsets
+#    (not against our own arithmetic: every inter-tensor gap must be
+#     alignment padding, and the last tensor must end exactly at EOF)
+########################################################################
+
+$ python3 /tmp/oracle/layout_check.py qwable... Ornith...
+== G:/More-models/qwable-v1-mxfp4_moe.gguf
+   file bytes 20261570752, data section starts at 10991296, tensors 753, unknown-type 0
+   last tensor end + data_off = 20261570752 vs file 20261570752 (slack 0 bytes)
+   inter-tensor gaps within [0,31]: 752 of 752
+   bytes per type id: {0: (310, 87), 8: (320, 2498), 39: (123, 16728)}
+== G:/More-models/Ornith-1.0-9b-ROCmFPX-STRIX_LEAN.gguf
+   file bytes 4957544640, data section starts at 10967232, tensors 427, unknown-type 0
+   last tensor end + data_off = 4957544640 vs file 4957544640 (slack 0 bytes)
+   inter-tensor gaps within [0,31]: 426 of 426
+   bytes per type id: {0: (177, 4), 13: (1, 667), 100: (40, 468), 101: (209, 3578)}
+
+########################################################################
+# 3. Byte-level oracle: kraken's host dequant_row vs the producers'
+#    own reference decoders, on real tensor bytes
+#    (dequantize_row_mxfp4 from upstream llama.cpp; rocmfp4.c from the
+#     ROCmFPX fork; both extracted/compiled verbatim, not retyped)
+########################################################################
+
+$ python3 /tmp/oracle/run_oracle.py
+== built both decoders
+qwable-v1-mxfp4_moe.gguf           type 39   tensor blk.0.ffn_down_exps.weight   n=123360 exact 123360/123360  max|d|=0  max rel=0
+Ornith-1.0-9b-ROCmFPX-STRIX_LEAN.gguf type 100  tensor blk.0.attn_qkv.weight        n=116480 exact 116480/116480  max|d|=0  max rel=0
+Ornith-1.0-9b-ROCmFPX-STRIX_LEAN.gguf type 101  tensor output.weight                n=123360 exact 123360/123360  max|d|=0  max rel=0
+== wrote C:/Users/rr/AppData/Local/Temp/oracle\oracle-report.txt
+
+########################################################################
+# 4. End-to-end: GPU and scalar CPU backends must agree on real models.
+#    The CPU backend dequantizes through src/quant.cpp (host), the GPU
+#    through src/hip/kernels/dequant.hpp — so this compares the device
+#    kernel against the host oracle on the whole model.
+########################################################################
+
+$ KRK_N=8 ./scripts/coherence_check.sh Ornith-1.0-9b-ROCmFPX-STRIX_LEAN.gguf
+prompt: What is the capital of France?   n=8   ctx=512   chunk=32   chat=1   tie tol=0.05
+per-run timeout 420s
+PASS                   Ornith-1.0-9b-ROCmFPX-STRIX_LEAN.gguf      <think> Thinking Pr 
+1 coherent, 0 not
+
+$ KRK_N=6 KRK_ALLOW_BIG=1 KRK_TIMEOUT=900 ./scripts/coherence_check.sh qwable-v1-mxfp4_moe.gguf
+prompt: What is the capital of France?   n=6   ctx=512   chunk=32   chat=1   tie tol=0.05
+per-run timeout 900s
+PASS                   qwable-v1-mxfp4_moe.gguf                   <think> Thinking P 
+1 coherent, 0 not
+
+########################################################################
+# 5. External sanity: upstream llama.cpp reads MXFP4 (type 39) itself,
+#    so for qwable there is a third implementation to compare against.
+#    (Types 100/101 exist only in the ROCmFPX fork, whose Windows
+#    binaries are gfx1151-only; section 3 is the oracle for those.)
+########################################################################
+
+$ H:/LLAMA-bins/rocm10/llama-cli.exe -m qwable-v1-mxfp4_moe.gguf \
+      -p 'The capital of France is' -n 12 --temp 0 --no-repack -ngl 0 --single-turn
+[ Prompt: 19.7 t/s | Generation: 8.1 t/s ]
+[0m
+
+Exiting...
+
+$ ./build-hip/kraken.exe -m qwable-v1-mxfp4_moe.gguf -p 'The capital of France is' \
+      -n 12 --temp 0 --greedy --ctx 512 --chunk 32     (device)
+KRAKEN 0.1.0 | AMD Radeon RX 9070 XT (gfx1201, RDNA4, 64 CU, wave32, WMMA gfx12)
+ Paris, a city renowned for its iconic landmarks such as the
+
+[stats ] decode    12 tok in 972.9 ms = 12.3 tok/s (81.1 ms/tok)
+[stats ] device    6.47 GiB in use of 15.92 GiB (9.46 GiB free)
+[stats ] experts   9297 MiB VRAM budget, 2100/5833 slots resident, 0 pinned | WARM 16320 MiB pageable, 2100 held (3347 MiB, 0 MiB prefetched)
+[stats ] cache     4637 acquires | HOT hits 2537 (54.7%) | WARM hits 0 (0.0%) | COLD misses 2100 (45.3%)
+
+$ ./build-hip/kraken-inspect.exe  (verdicts before/after)
+  before: refused — 'uses quantization type #39/#100/#101, which this build cannot dequantize'
+          payload '2.52 GiB in known formats + 123 tensor(s) of unknown size' (qwable)
+  after:
+payload    18.86 GiB
+arch       qwen35moe — supported (recurrent-moe)
+verdict    runnable
+payload    4.61 GiB
+arch       qwen35 — supported (recurrent)
+verdict    runnable
+
+$ reference text (stdout, above the timing line): "The user is asking for the capital of France. I know"
