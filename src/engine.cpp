@@ -481,6 +481,16 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         const i64 lh = model_.n_head_at(l);
         const i64 lq = model_.q_dim_at(l);
         const i64 lq_proj = packed_gate ? 2 * lq : lq;
+        // The attention descriptor carries the layer's own head count, not the
+        // stack's maximum. On a hybrid stack (laguna) those differ, and the
+        // count is not just a loop bound: the op derives the GQA grouping from
+        // it (n_rep = n_head / n_kv). A 48-head layer running as 64 heads read
+        // its KV head as h/8 instead of h/6 — every query head grouped with
+        // the wrong keys, and two of the eight KV heads never read at all —
+        // and the 16 phantom heads were computed off whatever the workspace
+        // held, which is why the same prompt answered differently at different
+        // prefill chunk sizes.
+        d.n_head = lh;
         // A sliding-window layer sees only its last `swa_window` keys; the full
         // layers of the same stack see the whole prefix.
         d.window = (mc.swa_window > 0 && model_.is_swa(l)) ? mc.swa_window : 0;

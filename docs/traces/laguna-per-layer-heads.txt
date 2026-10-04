@@ -1,0 +1,102 @@
+laguna: the attention op ran with the stack's widest head count
+===============================================================
+
+Symptom
+-------
+With the tokenizer already fixed (docs/traces/laguna-chat-tokenizer.txt),
+the reference ChatML prompt still answered wrong:
+
+  reference : "The capital of France is Paris."
+  kraken    : "Okay, the user is asking about the capital of France ..."
+
+Step-0 logits, identical 27-token prompt:
+
+  before : 33586 = 20.40625   ("Okay")   785 = 16.078125  ("The")
+  after  :   785 = 29.765625             33586 = 23.28125
+
+The CPU backend picked the same wrong token as the device, so the defect
+was in shared model logic, not a HIP kernel.
+
+Cause
+-----
+`Engine::forward_core` built the attention descriptor once:
+
+    AttnDesc d;
+    d.n_head = mc.n_head;      // the WIDEST query projection in the stack
+
+and never updated it per layer. `mc.n_head` is the maximum over the
+per-layer head counts, which is the right number for sizing the shared
+workspaces — and the wrong number for the op. On a hybrid stack the count
+is not just a loop bound:
+
+  * GQA grouping: the attention op derives `n_rep = n_head / n_kv`. On
+    laguna XS.2's full layers the file says 48 heads (GGUF carries a
+    40-entry `attention.head_count` array, 48 on il%4==0, 64 otherwise),
+    so the correct grouping is 48/8 = 6 query heads per KV head. Running
+    as 64 gave 8, i.e. query head h read KV head h/8 instead of h/6 —
+    every group shifted, and KV heads 6 and 7 never read at all.
+  * 16 phantom heads (48..63) were computed from query rows the
+    projection never wrote, so they read whatever the workspace held.
+
+That second half is what made the failure look non-deterministic: the
+phantom rows contain different bytes on the f16 device workspace and the
+f32 CPU workspace, which is why device-vs-CPU coherence failed, and why
+the same prompt picked different tokens at different prefill chunk sizes.
+
+Fix
+---
+    const i64 lh = model_.n_head_at(l);
+    const i64 lq = model_.q_dim_at(l);
+    ...
+    d.n_head = lh;             // the layer's own count reaches attention
+
+Laguna-S-2.1 (48 full / 72 windowed) is the same bug on the other layer
+kind: there the windowed layers were the ones running at the wrong width.
+
+Evidence
+--------
+Answer, same command, same 27-token prompt (`--chat -p "what is the
+capital of france?" --greedy`):
+
+    after : "The capital of France is Paris."
+    ref   : "The capital of France is Paris."   (llama-cli b11146)
+
+Step-0 top-4, chunked prefill at two chunk sizes (was: the winner
+changed with the chunk size):
+
+    --chunk 16  : 785=29.421875  71070=25.5      33586=23.140625  1686=22.359375
+    --chunk 256 : 785=29.765625  71070=24.765625 33586=23.28125   1686=22.03125
+
+Same ranking; the residual differences are f16 accumulation over
+differently shaped batches.
+
+Device vs CPU coherence on laguna-xs2 (was FAIL, drift step 2):
+
+    KRK_N=4 KRK_ALLOW_BIG=1 KRK_MAX_MB=32768 KRK_TIMEOUT=1800 \
+        ./scripts/coherence_check.sh G:/More-models/laguna-xs2-Q4_K_M.gguf
+    PASS  laguna-xs2-Q4_K_M.gguf  The capital
+    1 coherent, 0 not   (rc=0)
+
+Gate after the change:
+
+    ninja -C build-hip kraken kraken-tests   rc=0, 0 "error:" lines
+    kraken-tests                             2154/2154 checks passed, rc=0
+    kraken-bench --gate                      rc=0
+    coherence spot check (SmolLM2-135M, Qwen3.5-0.8B, Qwen3-MoE-4x0.6B)
+                                             3/3 PASS, rc=0
+
+Scope
+-----
+`n_head_at()` returns the model's single head count for every layer when
+the file has no per-layer array, so dense and single-geometry MoE models
+are untouched — the gate above is that statement for the three spot-check
+models. Only hybrid stacks (laguna) change.
+
+Work effect: on XS.2's ten full layers the attention op now iterates 48
+heads instead of 64, i.e. 25% less work in those layers' attention; the
+windowed layers were already correct at 64. No A/B of the wall-clock
+effect was run, so none is claimed.
+
+Repo state at the time of this trace
+-----------------------------------
+c9bdfe5 (tokenizer fix + --tokenize) is pushed; this fix follows it.
