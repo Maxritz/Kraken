@@ -86,6 +86,20 @@ size_t host_available_bytes() {
 #endif
 }
 
+size_t host_total_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX st;
+    st.dwLength = sizeof(st);
+    if (GlobalMemoryStatusEx(&st)) return static_cast<size_t>(st.ullTotalPhys);
+    return 0;
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long page = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page <= 0) return 0;
+    return static_cast<size_t>(pages) * static_cast<size_t>(page);
+#endif
+}
+
 void host_free(void *p) {
     if (!p) return;
 #if defined(_WIN32)

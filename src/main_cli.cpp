@@ -29,6 +29,7 @@ struct Args {
     int threads = 0;
     int expert_cache_mb = 0;    // MoE expert residency budget (MiB), 0 = auto
     int vram_cap_mb = 0;        // total device memory to plan for (MiB), 0 = policy
+    int host_ram_mb = 0;        // host memory to plan for (MiB), 0 = policy
     int expert_cache_slots = 0; // MoE resident (layer, expert) slot cap, 0 = auto
     int expert_warm_mb = -1;     // MoE WARM tier in pageable host RAM (MiB): <0 auto, 0 off
     bool expert_warm_prefetch = false; // fill WARM at load instead of on demand
@@ -81,6 +82,10 @@ void usage() {
         "  --cpu                 use the scalar reference backend\n"
         "  --device N            HIP device index (default 0)\n"
         "  --expert-cache-mb N   MoE expert residency budget in MiB (0 = auto)\n"
+        "  --host-ram-mb N       host memory to plan for, in MiB. 0 uses a\n"
+        "                        quarter of installed RAM. Bounds every host\n"
+        "                        tier inside the process; the model mapping and\n"
+        "                        the dense trunk sit outside it.\n"
         "  --vram-cap-mb N       total device memory to plan for, in MiB. 0 uses\n"
         "                        the policy: 6 GiB, then +2 GiB at a time while\n"
         "                        the card has room and the model needs it, up to\n"
@@ -153,6 +158,8 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--seed") a->seed = std::strtoull(next("--seed"), nullptr, 10);
         else if (f == "--device") a->device = std::atoi(next("--device"));
         else if (f == "--threads") a->threads = std::atoi(next("--threads"));
+        else if (f == "--host-ram-mb")
+            a->host_ram_mb = std::atoi(next("--host-ram-mb"));
         else if (f == "--vram-cap-mb")
             a->vram_cap_mb = std::atoi(next("--vram-cap-mb"));
         else if (f == "--expert-cache-mb")
@@ -490,6 +497,7 @@ int main(int argc, char **argv) {
     cfg.seed = a.seed;
     cfg.expert_cache_mb = a.expert_cache_mb;
     cfg.vram_cap_mb = a.vram_cap_mb;
+    cfg.host_ram_mb = a.host_ram_mb;
     cfg.expert_cache_slots = a.expert_cache_slots;
     cfg.expert_warm_mb = a.expert_warm_mb;
     cfg.expert_warm_prefetch = a.expert_warm_prefetch;

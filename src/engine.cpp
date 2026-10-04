@@ -807,19 +807,52 @@ void Engine::configure_expert_cache() {
     // positive value is that many MiB — the explicit restriction, 0 disables
     // WARM entirely. The CPU backend's mapping is host memory already, so auto
     // stays off there; a tier that cannot hold a few experts only adds copies.
+    // Host memory policy, the mirror of the device one above and for the same
+    // reason: a tier that sizes itself from "whatever is free right now" is a
+    // decision made for the user, and on a 96 GiB box the old rule aimed at 45
+    // GiB of WARM. The budget is a quarter of installed RAM by default, never
+    // more than half of what is actually free, never more than the corpus, and
+    // --host-ram-mb replaces it outright. The mapping, the dense trunk and the
+    // OS live outside it, which is what the reserve is for.
+    const size_t ram_total = host_total_bytes();
+    size_t host_budget = 0;
+    if (cfg_.host_ram_mb > 0) {
+        host_budget = static_cast<size_t>(cfg_.host_ram_mb) * 1024u * 1024u;
+    } else if (ram_total > 0) {
+        host_budget = ram_total / 4;
+    }
+
     size_t warm = 0;
     if (cfg_.expert_warm_mb > 0) {
         warm = static_cast<size_t>(cfg_.expert_warm_mb) * 1024u * 1024u;
+        // An explicit tier can still exceed the budget the user set for the
+        // process; the budget is the outer limit, the tier is a request inside
+        // it. Say so rather than silently taking the larger number.
+        if (host_budget > 0 && warm > host_budget) {
+            KRK_WARN("WARM tier requested %.0f MiB, clamped to the %.0f MiB host "
+                     "budget (--host-ram-mb)",
+                     static_cast<f64>(warm) / (1024.0 * 1024.0),
+                     static_cast<f64>(host_budget) / (1024.0 * 1024.0));
+            warm = host_budget;
+        }
     } else if (cfg_.expert_warm_mb < 0 && be_->caps().vram_free > 0) {
         const size_t avail = host_available_bytes();
-        const size_t reserve = static_cast<size_t>(8) * 1024u * 1024u * 1024u;
-        const size_t spendable = avail > reserve ? avail - reserve : 0;
-        size_t want = spendable / 2;
+        size_t want = host_budget;
+        if (avail > 0 && want > (avail / 2)) want = avail / 2;
         const size_t total = model_.total_expert_bytes();
         if (total > 0 && total < want) want = total; // never cache past the corpus
         const size_t floor_bytes = model_.max_expert_bytes() * 4;
         warm = want >= floor_bytes ? want : 0;
     }
+    if (host_budget > 0 || cfg_.host_ram_mb > 0)
+        KRK_INFO("ram policy: %.1f GiB budget (%.1f GiB installed, %.1f GiB "
+                 "free) -> WARM tier %.0f MiB%s",
+                 static_cast<f64>(host_budget) / static_cast<f64>(gib),
+                 static_cast<f64>(ram_total) / static_cast<f64>(gib),
+                 static_cast<f64>(host_available_bytes()) / static_cast<f64>(gib),
+                 static_cast<f64>(warm) / (1024.0 * 1024.0),
+                 cfg_.expert_warm_mb == 0 ? " (disabled by --expert-warm-mb 0)"
+                                          : "");
 
     model_.set_expert_budget(budget, warm);
 

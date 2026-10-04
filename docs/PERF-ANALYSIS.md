@@ -487,13 +487,53 @@ KRK_PROMOTE_WAIT=host` restores everything that changed:
 
 **-13.0% per token, +15.6% tok/s, 4/4 repetitions, bit-identical text.**
 
-### 10.6 What is left, and the ceiling
+### 10.6 The two memory budgets are now the user's to set
+
+The device policy in section 10.5's commit is 6 GiB of VRAM to begin with, +2 GiB
+at a time while the card has the headroom and the model needs it, never above 12
+GiB, stated at run time and overridable with `--vram-cap-mb`. The host side got
+the same treatment, because it had the same defect: WARM was sized at "half of
+whatever is free after an 8 GiB reserve", which on a 96 GiB box aimed at 45 GiB
+of tier. It is now a quarter of *installed* RAM (available memory is a function
+of how long the machine has been up, not of this program), bounded by half of
+what is actually free, bounded by the corpus, overridable with `--host-ram-mb`,
+and an explicit `--expert-warm-mb` is clamped to the budget rather than silently
+exceeding it.
+
+Measured on laguna-xs2: default 24.0 GiB budget -> 18102 MiB of WARM;
+`--host-ram-mb 8192` -> 8192 MiB; `--expert-warm-mb 40000 --host-ram-mb 8192`
+-> a warning and 8192 MiB. On the device side the same run now reports
+10.73 GiB in use with 5.20 GiB free, against 15.04 GiB and 0.88 GiB before.
+
+### 10.7 The file read is not a cache-miss problem, so it is not a prefetch problem
+
+Three runs back to back, same binary, same prompt:
+
+| run | `read` | `alloc` | `xfer` | ms/tok |
+|---|---:|---:|---:|---:|
+| 1 | 1875.3 ms | 285.2 ms | 435.9 ms | 59.6 |
+| 2 | 1906.7 ms | 301.2 ms | 438.4 ms | 60.3 |
+| 3 | 1902.9 ms | 290.7 ms | 439.7 ms | 60.5 |
+
+The second and third runs read exactly the same bytes out of a file the first
+run had already pulled in, and the read time does not move. So this is not a
+cold-cache cost that a warmer cache or a bigger read would remove: it is the
+device's rate for scattered 0.7 MiB slices, at about 5 GB/s inside the engine
+and 19 GB/s for the same pattern out of `probe_read.py` when the pages are hot.
+`probe_read.py`'s scattered mode says the *pattern* is not the problem either --
+one thread and eight threads are within 6% of each other -- so the lever is
+overlap, not parallelism.
+
+That is also what Edge0's prerouter is for, and why the next item below is the
+one that matters.
+
+### 10.8 What is left, and the ceiling
 
 | stage | ms | note |
 |---|---:|---|
-| `read` | ~2050 | 8.3 GiB from the file at the device's own ~4 GB/s |
-| `alloc` | ~1150 | `hipMalloc`/`hipFree` churn from the pooled allocator |
-| `xfer` | ~500 | 8.3 GiB pageable to VRAM, now overlapped |
+| `read` | ~1900 | 8.3 GiB of scattered slices out of the file; the device's rate, not a cache miss |
+| `alloc` | ~290 | was ~1150; the arena took it out |
+| `xfer` | ~440 | 8.3 GiB pageable to VRAM, overlapped behind the reads |
 | dense | ~1000 | 8.5 ms/token of real compute |
 
 The file read is now the largest single item and it is **at the device limit**:
@@ -505,19 +545,36 @@ reference implementation is not 3x faster: it is streaming the same cold bytes.
 
 That reframes the remaining work:
 
-1. **`alloc`, ~1150 ms (18%).** 13,770 `alloc_pooled` calls at ~82 us each. The
-   pool is capped at 256 MiB of free blocks and expert slices are never returned
-   to it in volume, so most of those calls fall through to `hipMalloc`, which
-   synchronises the device. A dedicated expert arena — one allocation at init,
-   sub-allocated by slice, with the same event guard — removes the allocator
-   from the hot path entirely.
-2. **Multi-expert GEMV**, 960 -> 120 launches. Previously bounded at 3%; the
-   real bound is the launch count against the 8.5 ms of dense-path time.
-3. **DFlash speculative heads.** Unchanged from section 6 and still the only
-   item that amortises the ~87 ms I/O floor itself rather than the work around
-   it: accepting 3 tokens per pass pays the file once for three positions.
+1. **DFlash speculative heads** — the only item that amortises the file read
+   itself rather than the work around it. `kraken-inspect` on the shipped head:
+   six dense blocks (no experts), 330 MiB of weights that all stay resident,
+   `block_size = 16` so up to 16 candidates per pass, `decoder_arch = laguna`
+   and the same embedding and head geometry as the target, and
+   `target_layers = 6` so verifying a candidate costs six layers of the target.
+   On a workload where one position costs 347 MiB of compulsory first-touch
+   bytes, accepting four tokens per pass pays that read once for four
+   positions. `docs/REFERENCES.md` has the full field list and
+   `docs/traces/dflash-head-inspect.txt` the raw output.
+2. **Route-ahead prefetch**, the untrained version of Edge0's prerouter: start
+   the file read for a layer's likely expert set from the previous token's
+   routing before that layer's GEMMs are issued. The routing traces this repo
+   already collects would say first whether it predicts anything; the reads are
+   ~35 ms of a 60 ms token and the compute available to hide them is 8.5 ms, so
+   this is worth ~14% and no more.
+3. **Multi-expert GEMV**, 960 -> 120 launches, and the router plan uploads with
+   it: 640 tiny host-to-device copies per token go to 80 if the plan is built
+   once per layer and the per-expert views are pointer offsets into it.
+4. **Fusing the 40 router top-k passes.** Worth naming honestly, because the
+   request is a good one and the answer is a dependency rather than a budget:
+   layer L+1's router reads layer L's output, so 40 routers cannot be computed
+   in one pass for the same token. What *can* be fused is the plan: one kernel
+   per layer producing the k indices and weights, one download instead of a
+   host softmax and top-k over a 256-wide row, and one plan upload instead of
+   two per expert. The round trips themselves stay, because the host has to
+   know which experts to page in. `probe_sync` prices what removing them would
+   be worth if it were possible: ~85 us a trip, 40 a token, ~5% of 60 ms.
 
-### 10.7 Reproducing section 10
+### 10.9 Reproducing section 10
 
 ```bash
 # the four-way split, one run

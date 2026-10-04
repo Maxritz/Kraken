@@ -57,6 +57,14 @@ bash scripts/run_ref.sh "G:/More-models/laguna-xs2-Q4_K_M.gguf" /tmp/out.log \
 `run_ref.sh` records peak working set and always kills `llama-cli.exe` when it
 finishes, so a reference run cannot outlive its own measurement.
 
+## Memory budgets and the DFlash head
+
+| file | what it shows |
+|---|---|
+| `laguna-perf-ab-arena.txt` | 3 interleaved repetitions of the expert VRAM arena against one hipMalloc per slice: **90.00 -> 63.80 ms/token (11.11 -> 15.67 tok/s)**, and device memory after the run falls 15.04 GiB -> 10.23 GiB |
+| `laguna-determinism-promote-wait.txt` | 8+8 interleaved runs of the promotion ordering change: 16/16 identical |
+| `dflash-head-inspect.txt` | `kraken-inspect` on both Poolside DFlash heads: 6 dense blocks, `block_size=16`, `decoder_arch=laguna`, `target_layers=6`, no experts |
+
 ## Decode-cost localisation and the two fixes it produced
 
 The files below are the evidence behind section 10 of

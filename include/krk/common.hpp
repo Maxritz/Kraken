@@ -61,6 +61,12 @@ void host_free(void *p);
 // machine swap, which costs far more than the re-read the tier avoids.
 size_t host_available_bytes();
 
+// Installed physical memory, or 0 when the platform cannot say. The available
+// figure alone cannot size a tier: on a machine that has been up for a week,
+// "available" is what is left after the page cache, and a budget derived from
+// it shrinks for reasons that have nothing to do with this program.
+size_t host_total_bytes();
+
 // ---------------------------------------------------------------------------
 // half / bfloat16 conversion
 // ---------------------------------------------------------------------------

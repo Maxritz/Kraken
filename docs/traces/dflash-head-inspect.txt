@@ -1,0 +1,249 @@
+# What kraken sees of a Poolside DFlash speculative head.
+# 2026-10-04T22:06:57Z  kraken-inspect on the shipped file
+
+file       G:/More-models/laguna-s-2.1-DFlash-Q4_K_M.gguf
+version    GGUF v3
+alignment  32
+tensors    76
+payload    618.4 MiB
+arch       dflash — draft file (not a model)
+verdict    refused
+           - dflash speculative head set (dflash.*, 5-6 blocks) rather than a model; kraken's speculation drafts with --draft, a full model of the family
+           - uses an attention output gate (attn_gate), which this engine does not implement
+
+metadata:
+  general.architecture                           = "dflash"
+  general.type                                   = "model"
+  general.name                                   = "S21 Dflash"
+  general.size_label                             = "1.1B"
+  general.license                                = "other"
+  general.base_model.count                       = 1
+  general.base_model.0.name                      = "Laguna S 2.1"
+  general.base_model.0.version                   = "2.1"
+  general.base_model.0.organization              = "Poolside"
+  general.base_model.0.repo_url                  = "https://huggingface.co/poolside/Laguna-S-2.1"
+  general.tags                                   = [3 strings]
+  dflash.block_count                             = 6
+  dflash.context_length                          = 1048576
+  dflash.embedding_length                        = 3072
+  dflash.feed_forward_length                     = 12288
+  dflash.attention.head_count                    = 72
+  dflash.attention.head_count_kv                 = 8
+  dflash.rope.freq_base                          = 500000
+  dflash.attention.layer_norm_rms_epsilon        = 1e-06
+  dflash.attention.key_length                    = 128
+  dflash.attention.value_length                  = 128
+  dflash.block_size                              = 16
+  dflash.target_layers                           = [6 i32]
+  dflash.decoder_arch                            = "laguna"
+  tokenizer.ggml.model                           = "gpt2"
+  tokenizer.ggml.pre                             = "laguna"
+  tokenizer.ggml.tokens                          = [100352 strings]
+  tokenizer.ggml.token_type                      = [100352 i32]
+  tokenizer.ggml.merges                          = [100026 strings]
+  tokenizer.ggml.bos_token_id                    = 2
+  tokenizer.ggml.eos_token_id                    = 2
+  tokenizer.ggml.unknown_token_id                = 0
+  tokenizer.ggml.seperator_token_id              = 8
+  tokenizer.ggml.padding_token_id                = 9
+  tokenizer.ggml.mask_token_id                   = 12
+  tokenizer.ggml.add_bos_token                   = true
+  tokenizer.ggml.add_sep_token                   = true
+  tokenizer.chat_template                        = "{% include 'chat_template.jinja' %}"
+  general.quantization_version                   = 2
+  general.file_type                              = 15
+
+format histogram:
+  F32          27 tensors  246.0 KiB
+  Q4_K         45 tensors  554.2 MiB
+  Q6_K          4 tensors  64.0 MiB
+
+tensors:
+  name                                           type    shape                    bytes
+  enc.aux_norm.weight                            F32     6x3072                   72.0 KiB
+  enc.output_norm.weight                         F32     3072                     12.0 KiB
+  fc.weight                                      Q4_K    3072x18432               30.4 MiB
+  output_norm.weight                             F32     3072                     12.0 KiB
+  blk.0.attn_gate.weight                         Q4_K    72x3072                  121.5 KiB
+  blk.0.attn_k.weight                            Q4_K    1024x3072                1.7 MiB
+  blk.0.attn_k_norm.weight                       F32     128                      512 B
+  blk.0.attn_norm.weight                         F32     3072                     12.0 KiB
+  blk.0.attn_output.weight                       Q4_K    3072x9216                15.2 MiB
+  blk.0.attn_q.weight                            Q4_K    9216x3072                15.2 MiB
+  blk.0.attn_q_norm.weight                       F32     128                      512 B
+  blk.0.attn_v.weight                            Q4_K    1024x3072                1.7 MiB
+  blk.0.ffn_down.weight                          Q4_K    3072x12288               20.2 MiB
+  blk.0.ffn_gate.weight                          Q4_K    12288x3072               20.2 MiB
+  blk.0.ffn_norm.weight                          F32     3072                     12.0 KiB
+  blk.0.ffn_up.weight                            Q4_K    12288x3072               20.2 MiB
+  blk.1.attn_gate.weight                         Q4_K    72x3072                  121.5 KiB
+  blk.1.attn_k.weight                            Q4_K    1024x3072                1.7 MiB
+  blk.1.attn_k_norm.weight                       F32     128                      512 B
+  blk.1.attn_norm.weight                         F32     3072                     12.0 KiB
+  blk.1.attn_output.weight                       Q4_K    3072x9216                15.2 MiB
+  blk.1.attn_q.weight                            Q4_K    9216x3072                15.2 MiB
+  blk.1.attn_q_norm.weight                       F32     128                      512 B
+  blk.1.attn_v.weight                            Q4_K    1024x3072                1.7 MiB
+  blk.1.ffn_down.weight                          Q4_K    3072x12288               20.2 MiB
+  blk.1.ffn_gate.weight                          Q4_K    12288x3072               20.2 MiB
+  blk.1.ffn_norm.weight                          F32     3072                     12.0 KiB
+  blk.1.ffn_up.weight                            Q4_K    12288x3072               20.2 MiB
+  blk.2.attn_gate.weight                         Q4_K    72x3072                  121.5 KiB
+  blk.2.attn_k.weight                            Q4_K    1024x3072                1.7 MiB
+  blk.2.attn_k_norm.weight                       F32     128                      512 B
+  blk.2.attn_norm.weight                         F32     3072                     12.0 KiB
+  blk.2.attn_output.weight                       Q4_K    3072x9216                15.2 MiB
+  blk.2.attn_q.weight                            Q4_K    9216x3072                15.2 MiB
+  blk.2.attn_q_norm.weight                       F32     128                      512 B
+  blk.2.attn_v.weight                            Q6_K    1024x3072                2.5 MiB
+  blk.2.ffn_down.weight                          Q6_K    3072x12288               29.5 MiB
+  blk.2.ffn_gate.weight                          Q4_K    12288x3072               20.2 MiB
+  blk.2.ffn_norm.weight                          F32     3072                     12.0 KiB
+  blk.2.ffn_up.weight                            Q4_K    12288x3072               20.2 MiB
+  blk.3.attn_gate.weight                         Q4_K    72x3072                  121.5 KiB
+  blk.3.attn_k.weight                            Q4_K    1024x3072                1.7 MiB
+  blk.3.attn_k_norm.weight                       F32     128                      512 B
+  blk.3.attn_norm.weight                         F32     3072                     12.0 KiB
+  blk.3.attn_output.weight                       Q4_K    3072x9216                15.2 MiB
+  blk.3.attn_q.weight                            Q4_K    9216x3072                15.2 MiB
+  blk.3.attn_q_norm.weight                       F32     128                      512 B
+  blk.3.attn_v.weight                            Q4_K    1024x3072                1.7 MiB
+  blk.3.ffn_down.weight                          Q4_K    3072x12288               20.2 MiB
+  blk.3.ffn_gate.weight                          Q4_K    12288x3072               20.2 MiB
+  blk.3.ffn_norm.weight                          F32     3072                     12.0 KiB
+  blk.3.ffn_up.weight                            Q4_K    12288x3072               20.2 MiB
+  blk.4.attn_gate.weight                         Q4_K    72x3072                  121.5 KiB
+  blk.4.attn_k.weight                            Q4_K    1024x3072                1.7 MiB
+  blk.4.attn_k_norm.weight                       F32     128                      512 B
+  blk.4.attn_norm.weight                         F32     3072                     12.0 KiB
+  blk.4.attn_output.weight                       Q4_K    3072x9216                15.2 MiB
+  blk.4.attn_q.weight                            Q4_K    9216x3072                15.2 MiB
+  blk.4.attn_q_norm.weight                       F32     128                      512 B
+  blk.4.attn_v.weight                            Q4_K    1024x3072                1.7 MiB
+  blk.4.ffn_down.weight                          Q4_K    3072x12288               20.2 MiB
+  blk.4.ffn_gate.weight                          Q4_K    12288x3072               20.2 MiB
+  blk.4.ffn_norm.weight                          F32     3072                     12.0 KiB
+  blk.4.ffn_up.weight                            Q4_K    12288x3072               20.2 MiB
+  blk.5.attn_gate.weight                         Q4_K    72x3072                  121.5 KiB
+  blk.5.attn_k.weight                            Q4_K    1024x3072                1.7 MiB
+  blk.5.attn_k_norm.weight                       F32     128                      512 B
+  blk.5.attn_norm.weight                         F32     3072                     12.0 KiB
+  blk.5.attn_output.weight                       Q4_K    3072x9216                15.2 MiB
+  blk.5.attn_q.weight                            Q4_K    9216x3072                15.2 MiB
+  blk.5.attn_q_norm.weight                       F32     128                      512 B
+  blk.5.attn_v.weight                            Q6_K    1024x3072                2.5 MiB
+  blk.5.ffn_down.weight                          Q6_K    3072x12288               29.5 MiB
+  blk.5.ffn_gate.weight                          Q4_K    12288x3072               20.2 MiB
+  blk.5.ffn_norm.weight                          F32     3072                     12.0 KiB
+  blk.5.ffn_up.weight                            Q4_K    12288x3072               20.2 MiB
+
+# --- the smaller, q8 head ---
+
+file       G:/More-models/laguna-xs21-dflash-q8.gguf
+version    GGUF v3
+alignment  32
+tensors    68
+payload    468.9 MiB
+arch       qwen35-dflash-draft — draft file (not a model)
+verdict    refused
+           - qwen3.5 draft head set (dflash.*) rather than a model; kraken's speculation drafts with --draft, a full model of the family
+           . carries dflash speculative head tensors, which this engine does not use
+
+metadata:
+  general.architecture                           = "qwen35-dflash-draft"
+  general.name                                   = "DFlash-Draft-2048h-5L"
+  qwen35-dflash-draft.context_length             = 262144
+  qwen35-dflash-draft.embedding_length           = 2048
+  qwen35-dflash-draft.block_count                = 5
+  qwen35-dflash-draft.feed_forward_length        = 8192
+  qwen35-dflash-draft.attention.head_count       = 64
+  qwen35-dflash-draft.attention.head_count_kv    = 8
+  qwen35-dflash-draft.attention.key_length       = 128
+  qwen35-dflash-draft.attention.value_length     = 128
+  qwen35-dflash-draft.vocab_size                 = 100352
+  qwen35-dflash-draft.attention.layer_norm_rms_epsilon = 1e-06
+  qwen35-dflash-draft.rope.freq_base             = 500000
+  qwen35-dflash-draft.attention.sliding_window   = 512
+  qwen35-dflash-draft.attention.sliding_window_pattern = [5 bytes]
+  qwen35-dflash-draft.dflash.n_target_layers     = 5
+  qwen35-dflash-draft.dflash.block_size          = 16
+  qwen35-dflash-draft.dflash.mask_token_id       = 12
+  qwen35-dflash-draft.dflash.context_kv_layer_norm = 0
+  qwen35-dflash-draft.dflash.zero_mask_embedding = 0
+  qwen35-dflash-draft.dflash.target_layer_ids    = [5 i32]
+
+format histogram:
+  F32          27 tensors  141.0 KiB
+  F16           5 tensors  1.2 MiB
+  Q8_0         36 tensors  467.5 MiB
+
+tensors:
+  name                                           type    shape                    bytes
+  dflash.aux_hidden_norm.0.weight                F32     2048                     8.0 KiB
+  dflash.aux_hidden_norm.1.weight                F32     2048                     8.0 KiB
+  dflash.aux_hidden_norm.2.weight                F32     2048                     8.0 KiB
+  dflash.aux_hidden_norm.3.weight                F32     2048                     8.0 KiB
+  dflash.aux_hidden_norm.4.weight                F32     2048                     8.0 KiB
+  dflash.fc.weight                               Q8_0    2048x10240               21.2 MiB
+  dflash.hidden_norm.weight                      F32     2048                     8.0 KiB
+  output_norm.weight                             F32     2048                     8.0 KiB
+  blk.0.attn_gate.weight                         F16     64x2048                  256.0 KiB
+  blk.0.attn_k.weight                            Q8_0    1024x2048                2.1 MiB
+  blk.0.attn_k_norm.weight                       F32     128                      512 B
+  blk.0.attn_norm.weight                         F32     2048                     8.0 KiB
+  blk.0.attn_output.weight                       Q8_0    2048x8192                17.0 MiB
+  blk.0.attn_q.weight                            Q8_0    8192x2048                17.0 MiB
+  blk.0.attn_q_norm.weight                       F32     128                      512 B
+  blk.0.attn_v.weight                            Q8_0    1024x2048                2.1 MiB
+  blk.0.ffn_down.weight                          Q8_0    2048x8192                17.0 MiB
+  blk.0.ffn_gate.weight                          Q8_0    8192x2048                17.0 MiB
+  blk.0.ffn_norm.weight                          F32     2048                     8.0 KiB
+  blk.0.ffn_up.weight                            Q8_0    8192x2048                17.0 MiB
+  blk.1.attn_gate.weight                         F16     64x2048                  256.0 KiB
+  blk.1.attn_k.weight                            Q8_0    1024x2048                2.1 MiB
+  blk.1.attn_k_norm.weight                       F32     128                      512 B
+  blk.1.attn_norm.weight                         F32     2048                     8.0 KiB
+  blk.1.attn_output.weight                       Q8_0    2048x8192                17.0 MiB
+  blk.1.attn_q.weight                            Q8_0    8192x2048                17.0 MiB
+  blk.1.attn_q_norm.weight                       F32     128                      512 B
+  blk.1.attn_v.weight                            Q8_0    1024x2048                2.1 MiB
+  blk.1.ffn_down.weight                          Q8_0    2048x8192                17.0 MiB
+  blk.1.ffn_gate.weight                          Q8_0    8192x2048                17.0 MiB
+  blk.1.ffn_norm.weight                          F32     2048                     8.0 KiB
+  blk.1.ffn_up.weight                            Q8_0    8192x2048                17.0 MiB
+  blk.2.attn_gate.weight                         F16     64x2048                  256.0 KiB
+  blk.2.attn_k.weight                            Q8_0    1024x2048                2.1 MiB
+  blk.2.attn_k_norm.weight                       F32     128                      512 B
+  blk.2.attn_norm.weight                         F32     2048                     8.0 KiB
+  blk.2.attn_output.weight                       Q8_0    2048x8192                17.0 MiB
+  blk.2.attn_q.weight                            Q8_0    8192x2048                17.0 MiB
+  blk.2.attn_q_norm.weight                       F32     128                      512 B
+  blk.2.attn_v.weight                            Q8_0    1024x2048                2.1 MiB
+  blk.2.ffn_down.weight                          Q8_0    2048x8192                17.0 MiB
+  blk.2.ffn_gate.weight                          Q8_0    8192x2048                17.0 MiB
+  blk.2.ffn_norm.weight                          F32     2048                     8.0 KiB
+  blk.2.ffn_up.weight                            Q8_0    8192x2048                17.0 MiB
+  blk.3.attn_gate.weight                         F16     64x2048                  256.0 KiB
+  blk.3.attn_k.weight                            Q8_0    1024x2048                2.1 MiB
+  blk.3.attn_k_norm.weight                       F32     128                      512 B
+  blk.3.attn_norm.weight                         F32     2048                     8.0 KiB
+  blk.3.attn_output.weight                       Q8_0    2048x8192                17.0 MiB
+  blk.3.attn_q.weight                            Q8_0    8192x2048                17.0 MiB
+  blk.3.attn_q_norm.weight                       F32     128                      512 B
+  blk.3.attn_v.weight                            Q8_0    1024x2048                2.1 MiB
+  blk.3.ffn_down.weight                          Q8_0    2048x8192                17.0 MiB
+  blk.3.ffn_gate.weight                          Q8_0    8192x2048                17.0 MiB
+  blk.3.ffn_norm.weight                          F32     2048                     8.0 KiB
+  blk.3.ffn_up.weight                            Q8_0    8192x2048                17.0 MiB
+  blk.4.attn_gate.weight                         F16     64x2048                  256.0 KiB
+  blk.4.attn_k.weight                            Q8_0    1024x2048                2.1 MiB
+  blk.4.attn_k_norm.weight                       F32     128                      512 B
+  blk.4.attn_norm.weight                         F32     2048                     8.0 KiB
+  blk.4.attn_output.weight                       Q8_0    2048x8192                17.0 MiB
+  blk.4.attn_q.weight                            Q8_0    8192x2048                17.0 MiB
+  blk.4.attn_q_norm.weight                       F32     128                      512 B
+  blk.4.attn_v.weight                            Q8_0    1024x2048                2.1 MiB
+  blk.4.ffn_down.weight                          Q8_0    2048x8192                17.0 MiB
+  blk.4.ffn_gate.weight                          Q8_0    8192x2048                17.0 MiB
+  blk.4.ffn_norm.weight                          F32     2048                     8.0 KiB
+  blk.4.ffn_up.weight                            Q8_0    8192x2048                17.0 MiB

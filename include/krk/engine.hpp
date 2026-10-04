@@ -48,6 +48,11 @@ struct EngineConfig {
     // model actually needs more, never above 12 GiB. A positive value is that
     // many MiB and skips the policy entirely.
     i32 vram_cap_mb = 0;
+    // Host memory this run is allowed to plan for, in MiB. 0 (the default) is
+    // a quarter of installed RAM; a positive value is that many MiB and bounds
+    // every host tier inside the process. The mapping and the dense trunk sit
+    // outside it, which is what the reserve is for.
+    i32 host_ram_mb = 0;
 };
 
 struct StreamSink {
