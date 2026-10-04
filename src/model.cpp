@@ -596,8 +596,42 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // A per-expert selection bias (laguna): added to the router's
             // *probabilities* before the top-k, and deliberately not to the
             // weights the selected experts are mixed with.
-            L.router_bias = upload_f32(blk_key("blk.%d.ffn_exp_probs_b.bias", l));
-            if (L.router_bias) cfg_.router_bias = true;
+            //
+            // Two spellings exist in the wild and the difference is not
+            // cosmetic. laguna-xs2-Q4_K_M ships `blk.N.exp_probs_b.bias`, with
+            // no `ffn_` prefix; looking only for the prefixed name returned
+            // nullptr for every layer of every laguna model, `cfg_.router_bias`
+            // stayed false, and expert selection ran un-biased -- silently, with
+            // no warning and no failure, because a missing bias tensor and a
+            // model without one look identical from here. That is a plausible
+            // cause of this engine answering laguna incorrectly while every
+            // other MoE model it runs is coherent, and it was invisible because
+            // laguna has never been run against the CPU reference (7 s/token).
+            // Accept either spelling, and say which one this file used.
+            {
+                const char *spellings[2] = {"blk.%d.exp_probs_b.bias",
+                                           "blk.%d.ffn_exp_probs_b.bias"};
+                for (const char *fmt : spellings) {
+                    const GgufTensor *bt = gguf_.tensor(blk_key(fmt, l));
+                    if (!bt) continue;
+                    const i64 n = bt->n_elements;
+                    // Host memory: the selection top-k runs here, not on the
+                    // device. See the note on LayerWeights::router_bias.
+                    f32 *host = static_cast<f32 *>(
+                        host_alloc(static_cast<size_t>(n) * sizeof(f32)));
+                    dequant_row(bt->type, bt->data, host, n);
+                    L.router_bias = host;
+                    if (strcmp(fmt, spellings[0]) == 0)
+                        KRK_WARN("blk.%d router bias found as "
+                                 "exp_probs_b.bias (no ffn_ prefix); the "
+                                 "engine expected the prefixed spelling, so "
+                                 "earlier builds ran this model's expert "
+                                 "selection un-biased",
+                                 l);
+                    break;
+                }
+                if (L.router_bias) cfg_.router_bias = true;
+            }
             const GgufTensor *g = gguf_.tensor(exps_gate);
             const GgufTensor *up = gguf_.tensor(blk_key("blk.%d.ffn_up_exps.weight", l));
             const GgufTensor *dn =
@@ -889,8 +923,16 @@ void Model::unload() {
         if (L.v_bias) be_->release(L.v_bias);
         if (L.q_norm) be_->release(L.q_norm);
         if (L.k_norm) be_->release(L.k_norm);
-        for (f32 *f : {L.ssm_dt, L.ssm_a, L.ssm_norm, L.router_bias})
+        for (f32 *f : {L.ssm_dt, L.ssm_a, L.ssm_norm})
             if (f) be_->release(f);
+        // The router bias is HOST memory (see LayerWeights::router_bias): the
+        // top-k that reads it runs on the host. It used to be freed through
+        // be_->release() on the strength of having been filled by upload_f32(),
+        // which is the same device-pointer assumption the read side got wrong.
+        if (L.router_bias) {
+            host_free(L.router_bias);
+            L.router_bias = nullptr;
+        }
         for (QuantTensor *q : {&L.wq, &L.wk, &L.wv, &L.wo, &L.wgate, &L.wup,
                                &L.wdown, &L.router, &L.shexp_gate, &L.shexp_up,
                                &L.shexp_down, &L.shexp_inp_gate, &L.wqkv,

@@ -159,10 +159,19 @@ constexpr ArchSpec kTable[] = {
      true, false, false, false, true, true},
     // MoVA: the attention *values* are a routed expert set of their own, on top
     // of an attention output gate.
+    //
+    // The gate is NOT part of the gap. The engine loads attn_gate.weight behind
+    // ArchSpec::attn_gate, softplus's it and broadcasts it over the attention
+    // result before wo -- code driven by the schema flag, not by which arch
+    // asked for it, and laguna has been running through it all along. Listing
+    // it here was a false blocker: it made this entry look further from working
+    // than it is, and a wrong diagnosis costs the next person a kernel to write.
+    // The real gap is the routed expert set on the attention values, and only
+    // that.
     {"k2-horizon", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "k2-horizon",
-     "attention values are routed experts (attn_v_exps/attn_v_gate) and the "
-     "attention output is gated; neither is implemented",
-     false, false, false, false},
+     "attention values are a routed expert set of their own "
+     "(attn_v_exps/attn_v_gate); that is not implemented",
+     false, false, false, false, true, false},
     // Dense FFN with an attention output gate and Gemma-style post-norms.
     {"muse-glimmer", ArchShape::Dense, ArchSupport::No, ArchRole::Target,
      "muse-glimmer",
@@ -196,10 +205,18 @@ struct GapTensor {
     // When true the entry only applies to a non-recurrent (dense/MoE) arch:
     // the gated delta net has its own gate tensor of the same name.
     bool dense_only;
-    // The arch that implements this tensor, so the gap does not fire on the
-    // schema that has code for it. Empty means it is a gap everywhere the
-    // dense_only rule leaves it standing.
-    const char *exempt_arch = nullptr;
+    // When set, an arch whose schema carries this flag IS served, so the gap
+    // does not fire on it.
+    //
+    // This replaced a hardcoded arch name, which is the wrong shape for the
+    // question: whether a tensor is implemented depends on whether the schema
+    // turns the code on, not on which architecture happens to be first. Naming
+    // `laguna` exempted laguna and nothing else, so k2-horizon -- which carries
+    // the same gate tensor and the same existing code path -- was refused for a
+    // feature the engine has. A name list cannot fix itself when a second arch
+    // shows up.
+    enum class Served : unsigned char { Never, ByAttnGateFlag };
+    Served served = Served::Never;
 };
 
 constexpr GapTensor kGapTensors[] = {
@@ -207,16 +224,24 @@ constexpr GapTensor kGapTensors[] = {
     // is what the loader uploads; on a dense one it is a fused attention
     // projection this engine has no shape for.
     {"attn_qkv.weight", "a fused query/key/value projection (attn_qkv)", true},
+    // Implemented: src/model.cpp loads attn_gate.weight behind
+    // ArchSpec::attn_gate and src/engine.cpp softplus-gates and broadcasts it
+    // over the attention result before wo.
     {"attn_gate.weight", "an attention output gate (attn_gate)", true,
-     "laguna"},
+     GapTensor::Served::ByAttnGateFlag},
     {"attn_v_exps.weight", "routed experts on the attention values (attn_v_exps)",
      false},
     {"attn_v_gate.", "a gate on the attention values (attn_v_gate)", false},
     {"attn_kv_a.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false},
     {"attn_kv_b.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false},
     {"attn_kv.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false},
-    {"exp_probs_b.bias", "a routed-expert selection bias (exp_probs_b)", false,
-     "laguna"},
+    // NOT a gap: the router selection bias is loaded and applied. It was a gap
+    // only because the loader looked for `ffn_exp_probs_b.bias` while the files
+    // that carry it spell it `exp_probs_b.bias` -- so it was loaded for nothing,
+    // and the engine's own consumer dereferenced a device pointer as if it were
+    // host memory on the path that could never be reached. Both are fixed, so
+    // this entry is gone rather than narrowed: a refusal for a feature that
+    // exists sends the next reader looking for code to write.
     {"ssm_conv1d.weight", "a Mamba-style SSM block (ssm_conv1d)", true},
     {"ssm_out.weight", "a Mamba-style SSM block (ssm_out)", true},
     {"attn_sinks.weight", "attention sinks (attn_sinks)", false},
@@ -304,7 +329,9 @@ const char *arch_tensor_gap(std::string_view tensor_name, ArchShape shape,
     const bool dense = shape == ArchShape::Dense || shape == ArchShape::Moe;
     for (const GapTensor &g : kGapTensors) {
         if (g.dense_only && !dense) continue;
-        if (g.exempt_arch != nullptr && arch == g.exempt_arch) continue;
+        if (g.served == GapTensor::Served::ByAttnGateFlag &&
+            arch_spec(arch).attn_gate)
+            continue;
         if (has(tensor_name, g.needle)) return g.gap;
     }
     return nullptr;

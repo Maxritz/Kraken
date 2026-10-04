@@ -39,7 +39,16 @@ struct LayerWeights {
     QuantTensor router;                           // ffn_gate_inp.weight
     // Per-expert selection bias (laguna), added to the router's probabilities
     // before the top-k and deliberately not to the weights.
-    f32 *router_bias = nullptr;                   // ffn_exp_probs_b.bias [n_expert]
+    //
+    // HOST memory, and that is load-bearing rather than incidental: the top-k it
+    // feeds runs on the host, on the router row this engine already downloads.
+    // It was declared next to the QuantTensors and filled with upload_f32(),
+    // which returns a DEVICE pointer, so `rb[e]` in the selection score read
+    // VRAM from the CPU and took the process down. The bias was never loaded --
+    // the tensor name did not match -- so the path had never run and the bug sat
+    // in it unnoticed. n_expert floats is 1 KiB a layer; there is no reason for
+    // it to be on the device at all.
+    f32 *router_bias = nullptr;  // HOST f32[n_expert], owned; exp_probs_b.bias
     // Per-head attention output gate: one scalar per query head, off the
     // pre-attention hidden state.
     QuantTensor wattn_gate;                       // attn_gate.weight [n_embd, n_head]

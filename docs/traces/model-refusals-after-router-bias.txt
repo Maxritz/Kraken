@@ -1,0 +1,89 @@
+# Model support after the router-bias fix: refusals, from kraken-inspect.
+# 2026-10-04T22:19:04Z
+# Two of the reasons below were stale and are gone in this build; what is
+# left is what is actually missing.
+
+######## K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf
+file       G:/More-models/K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf
+version    GGUF v3
+alignment  32
+tensors    798
+payload    20.82 GiB
+arch       k2-horizon — not supported
+verdict    refused
+           - attention values are a routed expert set of their own (attn_v_exps/attn_v_gate); that is not implemented
+           - uses routed experts on the attention values (attn_v_exps), which this engine does not implement
+           - uses a gate on the attention values (attn_v_gate), which this engine does not implement
+
+metadata:
+
+######## NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-noMTP.gguf
+file       G:/More-models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-noMTP.gguf
+version    GGUF v3
+alignment  32
+tensors    494
+payload    18.42 GiB
+arch       nemotron_h_moe — not supported
+verdict    refused
+           - Mamba-2 blocks (ssm_*) are not the gated delta net this engine implements
+
+metadata:
+  general.architecture                           = "nemotron_h_moe"
+  general.type                                   = "model"
+
+######## DeepSeek-V4-Flash-0731-K160-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix.gguf
+file       G:/More-models/DeepSeek-V4-Flash-0731-K160-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix.gguf
+version    GGUF v3
+alignment  32
+tensors    1328
+payload    53.51 GiB in known formats + 3 tensor(s) of unknown size
+arch       deepseek4 — not supported
+verdict    refused
+           - multi-head latent attention plus compressed-attention tensors are not implemented
+           - uses attention sinks (attn_sinks), which this engine does not implement
+           - uses latent KV compression (MLA: attn_kv_a/attn_kv_b), which this engine does not implement
+           - uses quantization type #26, which this build cannot dequantize
+           . carries 1 multi-token-prediction block(s) (blk.42) that this engine skips
+
+######## Ornith-1.0-9b-ROCmFPX-STRIX_LEAN.gguf
+file       G:/More-models/Ornith-1.0-9b-ROCmFPX-STRIX_LEAN.gguf
+version    GGUF v3
+alignment  32
+tensors    427
+payload    670.9 MiB in known formats + 249 tensor(s) of unknown size
+arch       qwen35 — supported (recurrent)
+verdict    refused
+           - uses quantization type #101, which this build cannot dequantize
+           - uses quantization type #100, which this build cannot dequantize
+
+metadata:
+  general.architecture                           = "qwen35"
+
+######## qwable-v1-mxfp4_moe.gguf
+file       G:/More-models/qwable-v1-mxfp4_moe.gguf
+version    GGUF v3
+alignment  32
+tensors    753
+payload    2.52 GiB in known formats + 123 tensor(s) of unknown size
+arch       qwen35moe — supported (recurrent-moe)
+verdict    refused
+           - uses quantization type #39, which this build cannot dequantize
+           . carries 1 multi-token-prediction block(s) (blk.40) that this engine skips
+
+metadata:
+  general.architecture                           = "qwen35moe"
+
+######## laguna-xs2-Q4_K_M.gguf
+file       G:/More-models/laguna-xs2-Q4_K_M.gguf
+version    GGUF v3
+alignment  32
+tensors    678
+payload    18.88 GiB
+arch       laguna — supported (moe)
+verdict    runnable
+
+metadata:
+  general.architecture                           = "laguna"
+  general.type                                   = "model"
+  general.sampling.top_p                         = 0.9
+

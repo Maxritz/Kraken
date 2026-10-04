@@ -165,3 +165,53 @@ have to be re-run per candidate token.
 The loader currently refuses architecture `dflash` as "draft file (not a model)",
 which is right for `--draft` and wrong as a refusal: the head wants a code path
 of its own, not to masquerade as a model of the family.
+
+## What the models on this machine are refused for, and what is cheapest to fix
+
+After the router-bias fix (see below), `kraken-inspect` on every large model
+here says one of these. Raw output in
+`docs/traces/model-refusals-after-router-bias.txt`.
+
+| model | arch | blocked by | size of the job |
+|---|---|---|---|
+| `Qwen3.8-27B-*` | `qwen35` | runs | -- |
+| `Qwen3.5-9B-...-MTP` | `qwen35` | runs (MTP block skipped) | -- |
+| `qwable-v1-mxfp4_moe` | `qwen35moe` | **quant type #39 only** (MXFP4) | one dequant path |
+| `Ornith-1.0-9b-ROCmFPX` | `qwen35` | **quant types #100 and #101 only** (ROCm FPX) | two dequant paths |
+| `K2-Horizon-MoVA-36B-A4B` | `k2-horizon` | routed experts on the attention *values* (`attn_v_exps`/`attn_v_gate`) | a new expert family, on top of a gate we already have |
+| `NVIDIA-Nemotron-3.5-Lightning` | `nemotron_h_moe` | Mamba-2 blocks instead of the gated delta net | a new recurrence, not a delta rule |
+| `DeepSeek-V4-Flash` | `deepseek4` | MLA, attention sinks, quant #26 | three real gaps |
+
+The cheapest unblocks on this machine are therefore **three quantization types,
+not three architectures**: `qwable-v1-mxfp4_moe` and `Ornith-1.0-9b` are both
+`qwen35` models whose *architecture this engine already runs*, blocked by
+dequantization alone. That is a much better first move than a new architecture,
+and it is the one a user with a folder of models actually feels.
+
+## Two refusal reasons that were wrong
+
+Both were found while checking the models above, and both are fixed in this
+build. They are recorded because a wrong refusal is not a neutral thing: it
+sends the next reader looking for code to write.
+
+**`exp_probs_b`, the per-expert router selection bias.** The loader asked for
+`blk.N.ffn_exp_probs_b.bias`; the files that carry it spell it
+`blk.N.exp_probs_b.bias`. The lookup returned nullptr for every layer of every
+laguna model, so `cfg_.router_bias` stayed false and **expert selection ran
+un-biased** -- silently, with no warning, because a file without the tensor and
+a file spelled differently look identical from there. Turning the fix on then
+segfaulted, which located the second half of the same bug: the field was filled
+by `upload_f32()` (a *device* pointer) and read as `rb[e]` by a host-side top-k,
+and freed through `be_->release()`. The bias is host memory now, 1 KiB a layer,
+and the loader accepts both spellings with a warning naming the one it found.
+Measured: laguna's output on the capital-of-France prompt is **unchanged**, so
+this was a real defect and it is not why laguna answers that prompt wrongly.
+
+**`attn_gate`, the per-head attention output gate.** Listed as unimplemented,
+with the loader exempted for `laguna` by name. The engine loads the tensor
+behind `ArchSpec::attn_gate`, softplus-gates it and broadcasts it over the
+attention result before `wo` -- driven by the schema flag, not by which
+architecture asked, so any arch that declares it is served. `k2-horizon` carries
+the same tensor and was refused for it anyway. The name-based exemption is now
+a flag-based one: naming `laguna` exempted laguna and nothing else, and a name
+list cannot fix itself when a second arch shows up.
