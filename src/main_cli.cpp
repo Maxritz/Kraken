@@ -45,6 +45,12 @@ struct Args {
     bool sample_host = false;
     bool verbose = false;
     bool interactive = true;
+    // Whether --prompt/-p appeared at all. It has to be tracked separately
+    // from prompt.empty(): an empty string is a legitimate prompt (generate
+    // from an empty context), but conflating the two made `--prompt ""` fall
+    // through to the interactive loop and block on stdin, so a script that
+    // interpolated an empty file hung instead of running.
+    bool prompt_given = false;
     f32 temp = 0.8f;
     int top_k = 40;
     f32 top_p = 0.95f;
@@ -57,7 +63,8 @@ void usage() {
     std::printf(
         "%s %s — RDNA-native GGUF inference\n\n"
         "usage: kraken --model model.gguf [options]\n\n"
-        "  --prompt STR          prompt to complete (omit for interactive mode)\n"
+        "  --prompt STR          prompt to complete; an empty value still counts\n"
+        "                        as given (omit the flag for interactive)\n"
         "  --max-tokens N        tokens to generate (default 256)\n"
         "  --ctx N               KV capacity in tokens (default 4096)\n"
         "  --chunk N             prefill batch size (default 256)\n"
@@ -118,7 +125,10 @@ bool parse(int argc, char **argv, Args *a) {
             return argv[++i];
         };
         if (f == "--model" || f == "-m") a->model = next("--model");
-        else if (f == "--prompt" || f == "-p") a->prompt = next("--prompt");
+        else if (f == "--prompt" || f == "-p") {
+            a->prompt = next("--prompt");
+            a->prompt_given = true;
+        }
         else if (f == "--system") a->system = next("--system");
         else if (f == "--draft" || f == "-d") a->draft = next("--draft");
         else if (f == "--draft-tokens")
@@ -495,9 +505,16 @@ int main(int argc, char **argv) {
         // Nothing to measure without tokens: a scan over an empty prompt would
         // write an index with zero mass in every expert, which reads as "this
         // model routes nowhere" rather than as "this scan measured nothing".
+        // An empty --prompt is a distinct mistake from a missing one, so it
+        // gets its own message rather than being told to pass a flag it passed.
         std::fprintf(stderr,
-                     "kraken: --expert-scan needs --prompt (or --bench) so there "
-                     "are token positions to measure the routers on\n");
+                     a.prompt_given
+                         ? "kraken: --expert-scan needs a non-empty --prompt "
+                           "(or --bench): there are no token positions to "
+                           "measure the routers on\n"
+                         : "kraken: --expert-scan needs --prompt (or --bench) "
+                           "so there are token positions to measure the routers "
+                           "on\n");
         engine.shutdown();
         delete be;
         return 2;
@@ -586,7 +603,7 @@ int main(int argc, char **argv) {
     };
 
     int rc = 0;
-    if (!a.prompt.empty()) {
+    if (a.prompt_given) {
         rc = generate_once(a.chat ? chatml(a.system, a.prompt) : a.prompt) ? 0 : 1;
         std::printf("\n");
     } else if (a.interactive) {
