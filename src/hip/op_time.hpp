@@ -297,7 +297,18 @@ private:
             // a longer run; the default covers a `--bench`.
             const char *pp = std::getenv("KRK_TIME_POOL");
             const long want = pp ? std::atol(pp) : 131072;
-            pool_.resize(want > 0 ? static_cast<size_t>(want) : 131072u);
+            // Floor the pool at 2*kCalibN. calibrate() times kCalibN begin/end
+            // pairs, and with fewer slots than that, begin() finds a slot still
+            // marked used and resolves it mid-pass -- so it stops measuring an
+            // empty op and starts measuring whatever happened to land in that
+            // slot since. The result is not a small error, it is a different
+            // quantity: a 64-slot pool reported 8.18 us where the default
+            // reported 19.59. Raising the pool costs ~40 bytes a slot, which is
+            // nothing, and makes the floor a measurement everywhere.
+            const size_t min_pool = 2u * static_cast<size_t>(kCalibN);
+            size_t sz = want > 0 ? static_cast<size_t>(want) : 131072u;
+            if (sz < min_pool) sz = min_pool;
+            pool_.resize(sz);
             if (profile_) tl_.reserve(pool_.size());
             start_ = std::chrono::steady_clock::now();
             base_ = start_;
@@ -589,8 +600,19 @@ static const char *component_of(const char *op) {
         calib_ = false;
         auto it = rows_.find("calib");
         if (it != rows_.end()) {
-            host_floor_us_ = it->second.host_ms * 1000.0 / kCalibN;
-            dev_floor_us_ = it->second.dev_ms * 1000.0 / kCalibN;
+            // Divide by the samples that actually landed, NOT by kCalibN. The
+            // pool can be smaller than kCalibN (KRK_TIME_POOL), and resolve()
+            // consumes a slot once -- the later passes find it already clear
+            // and return without counting. Dividing by the intended count
+            // instead of the real one silently understates the floor, and an
+            // understated floor makes every NET column read too generous, which
+            // is the one thing this subtraction exists to prevent. Measured:
+            // pool 64 reported 11.97 us where the default pool reported 19.69.
+            const double n = it->second.calls > 0
+                                  ? static_cast<double>(it->second.calls)
+                                  : 1.0;
+            host_floor_us_ = it->second.host_ms * 1000.0 / n;
+            dev_floor_us_ = it->second.dev_ms * 1000.0 / n;
             rows_.erase(it);
         }
     }

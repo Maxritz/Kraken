@@ -41,6 +41,8 @@ struct Args {
     bool expert_scan = false;   // measure routing and write an expert index
     bool expert_stub = false;   // run the routers with every expert FFN removed
     int debug_topk = 0; // stderr dump of top-k logprobs per token
+    // argmax on the host from the downloaded row, not on the device
+    bool sample_host = false;
     bool verbose = false;
     bool interactive = true;
     f32 temp = 0.8f;
@@ -88,6 +90,11 @@ void usage() {
         "                        step(s), with the idle gap before each op\n"
         "                        (KRK_PROFILE_STEPS/FROM/OPS tune the window)\n"
         "  --debug-topk N        dump the top-N candidates and their log-probs\n"
+        "  --sample-host         take the argmax on the host from the downloaded\n"
+        "                        logits row instead of on the device. Costs about a\n"
+        "                        1 MB download per token; the device argmax path is\n"
+        "                        the one carrying the laguna race, so this is the\n"
+        "                        correct path until that is fixed\n"
         "                        for every token to stderr (at full precision)\n"
         "  --expert-scan        measure which experts the routers actually pick\n"
         "                        and write <model>.krakenexperts.json\n"
@@ -145,6 +152,8 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--expert-stub") a->expert_stub = true;
         else if (f == "--debug-topk")
             a->debug_topk = std::atoi(next("--debug-topk"));
+        else if (f == "--sample-host")
+            a->sample_host = true;
         else if (f == "-v" || f == "--verbose") a->verbose = true;
         else if (f == "-h" || f == "--help") { usage(); std::exit(0); }
         else {
@@ -565,6 +574,7 @@ int main(int argc, char **argv) {
         p.sampler.seed = a.seed;
         p.stop = {"<|im_end|>", "<|eot_id|>"};
         p.debug_topk = a.debug_topk;
+        p.sample_host = a.sample_host;
         p.sink.fn = sink_cb;
         p.sink.user = &sink;
 

@@ -65,6 +65,15 @@ struct GenerateParams {
     // up to a step and different ones after it means drift, while the very
     // first step already differing means something raced.
     i32 debug_topk = 0;
+
+    // Force the argmax on the host from the downloaded logits row instead of
+    // on the device via logits_topk. Costs a 993 kB download per token at this
+    // vocab, and buys determinism: the device argmax path is the one carrying
+    // the laguna race (see docs/PERF-ANALYSIS.md section 9), so this is the
+    // correct path until that is fixed. --debug-topk reaches the same code but
+    // also prints per token, which serialises the run and confounds any test of
+    // it -- hence a flag that changes one variable and not the other.
+    bool sample_host = false;
 };
 
 enum Finish : int {

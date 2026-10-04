@@ -33,6 +33,26 @@ bool ends_with(const std::string &s, const std::string &suffix) {
 // actually makes, so it costs two clock reads per token.
 namespace {
 
+// KRK_SYNC_MOE / KRK_SYNC_EXPERT bisect the laguna race, which is masked by
+// any slowdown (stdout, a per-stage sync) and so cannot be found by reading
+// the timing. Each switch inserts one host drain at a different depth; the one
+// that restores determinism names the region that was racing.
+bool sync_moe() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_SYNC_MOE");
+        return v && *v && std::string(v) != "0";
+    }();
+    return on;
+}
+
+bool sync_expert() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_SYNC_EXPERT");
+        return v && *v && std::string(v) != "0";
+    }();
+    return on;
+}
+
 bool split_timing_enabled() {
     static const bool on = [] {
         const char *v = std::getenv("KRK_SPLIT");
@@ -1144,6 +1164,7 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // regardless of how small the cache is.
             const ResidentExpert *re = model_.experts().acquire(L.experts, layer, e);
             if (!re) continue;
+            if (sync_expert()) be_->sync();
 
             const i64 m = static_cast<i64>(group_rows_.size());
             plan_dev_.assign(group_rows_.begin(), group_rows_.end());
@@ -1493,7 +1514,8 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     // Greedy decoding, and nothing that intends to read the host logits row
     // afterwards: the device top-k leaves the row in VRAM. --debug-topk dumps
     // that row, so it asks for the host copy and stays a faithful diff tool.
-    const bool device_topk = p.sampler.greedy && p.debug_topk <= 0;
+    const bool device_topk = p.sampler.greedy && p.debug_topk <= 0 &&
+                            !p.sample_host;
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
         const i32 n = static_cast<i32>(

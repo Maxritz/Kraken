@@ -279,44 +279,54 @@ still valid, because a timing probe that lands a few microseconds differently
 cannot change what the 96.84 ms split *is* -- forward versus fetch_logits. But
 a `KRK_SPLIT` run must never be used to compare generated text.
 
-## 9. Localised: the race is in the device argmax, not the model
+## 9. The laguna race is timing-sensitive; section 9 of the previous revision was wrong
 
-Using the `KRK_SPLIT` switch from section 8 to provoke divergence every time,
-three runs were compared on the same prompt:
+The previous revision of this section claimed the race was in the device argmax.
+**That was wrong, and it was wrong because of a confound I did not control.**
+`--debug-topk` both selects host sampling *and* prints a line per token, and
+the printing serialises the run. Determinism there proved nothing about which
+sampling path was taken.
 
-| what is compared | result across 3 runs |
-|---|---|
-| generated text | **3 different outputs** |
-| full `KRK_DUMP` forward trace (9,696 lines) | **bit-identical** |
+`--sample-host` was added to remove the confound: it selects host sampling with
+no printing at all.
 
-The dump is not a summary. `dump_row` syncs and writes every element of the
-row at `%.7g`, and the stages it covers include the MoE FFN (`attn.ffnn`,
-`attn.ffng`, `attn.gated`, `attn.down`) as well as every attention stage,
-`embed`, `enter` and `final`, for the prefill and all 24 decode steps. So the
-entire model computation is bit-identical across runs that produce different
-text.
+| config | runs | distinct outputs |
+|---|---:|---|
+| device argmax (default) | 3 | 3 |
+| `KRK_SPLIT` + `KRK_WARM_DMA=0` | 2 | 2 |
+| `KRK_SPLIT` + `KRK_WARM_DMA=1` | 2 | 2 |
+| `KRK_SPLIT` + `KRK_WARM_DMA=2` | 2 | 2 |
+| `KRK_SPLIT` + `KRK_STAGE_WAIT=1` | 3 | 3 |
+| `KRK_SPLIT` + `KRK_SYNC_EXPERT=1` | 3 | 3 |
+| `KRK_SPLIT` + `KRK_SYNC_MOE=1` | 3 | 3 |
+| `KRK_SPLIT` + `--debug-topk` (prints) | 4 | **1** |
+| `KRK_SPLIT` + `--sample-host` (no print) | 4 | **4** |
 
-Adding `--debug-topk 4` compares the logits directly. Two runs give identical
-top-4 values and identical selected tokens at all 12 steps:
+The last two rows are the whole argument: the only difference is whether the run
+prints. Every configuration that does not slow the pipeline diverges; every one
+that does is stable. The same explains the earlier "bit-identical dumps": 
+`dump_row` calls `be_->sync()` before every stage, so the dump runs were never
+measuring the unsynchronised path at all.
 
-```
-33586 81 340 989 395 9599 966 340 9626 377 15360 83   (run 1)
-33586 81 340 989 395 9599 966 340 9626 377 15360 83   (run 2)
-```
+So what is established:
 
-But `--debug-topk` forces `device_topk = false`, so the row is downloaded and
-sampled on the host. Without it, three runs diverge. The only difference
-between the two configurations is which of the two sampling paths runs:
+- The race is **timing-sensitive somewhere in the pipeline**, and any
+  serialisation hides it. `KRK_SPLIT` reproduces it 3/3 reliably, which is the
+  single most useful fact here.
+- It is **not** the device argmax, **not** the warm/DMA staging path in any of
+  its three modes, **not** the small-transfer staging wait, and **not** the MoE
+  block or per-expert paging.
+- It is **not** the model arithmetic, insofar as a fully synchronised run is
+  bit-identical run to run.
 
-- **host** (`sampler.sample` over the downloaded row): deterministic
-- **device** (`logits_topk` + `topk_argmax`): nondeterministic
+What is **not** established, and was wrongly claimed before: where the race
+lives. The remaining candidates are the deferred host reads
+(`host_pending_` / `host_deferred_flush_`), the KV-cache writes, or an ordering
+between the default stream and the non-blocking `paged_stream_` that
+`hipStreamSynchronize` does not actually cover. The AGENTS.md note about
+non-blocking streams having no implicit ordering against the default stream
+still stands as the most likely shape; it has simply not been isolated.
 
-The margins rule out a near-tie: the top-1 lead is 1.6 to 6.4 logits, which is
-far wider than fp16 resolution, so argmax over a fixed row cannot legitimately
-change. That leaves `logits_topk` itself, and specifically the `topk_scratch_`
-buffer it is handed -- an uninitialised or under-ordered scratch would explain
-a result that varies with scheduling while the input row does not.
+`--sample-host` is kept as a correctness mitigation. It is not a fix: it was
+shown to diverge 4/4 as soon as the printing confound was removed.
 
-This is the first localisation of the bug that has ever held across runs. It
-also gives an immediate mitigation: `--debug-topk` (or any host-sampling path)
-is correct today, at the cost of downloading 993 kB per token.
