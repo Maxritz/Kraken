@@ -1,0 +1,66 @@
+[phase] process start               0.0 ms  (total      0.0 ms)
+[info ] HIP 7.16.26323 | AMD Radeon RX 9070 XT | gfx1201 | 64 CU | 15.9 GiB VRAM
+[phase] backend create             17.0 ms  (total     17.0 ms)
+[load ] gguf map + metadata           6.9 ms  (total      6.9 ms)
+[load ] arch + metadata resolve       0.3 ms  (total      7.1 ms)
+[alloc] token_embd.weight        alloc    174.8 ms  upload     85.8 ms  (1.26 GB/s)
+[load ]   token_embd upload         260.6 ms  (total    267.8 ms)
+[alloc] output.weight            alloc      5.0 ms  upload     18.6 ms  (8.42 GB/s)
+[load ]   output.weight upload       23.7 ms  (total    291.5 ms)
+[load ]   output_norm upload          0.1 ms  (total    291.6 ms)
+[load ] token_embd + output head      0.0 ms  (total    291.6 ms)
+[load ]   layer 0 only               19.5 ms  (total    311.1 ms)
+[load ] per-layer loop (all weights)    479.9 ms  (total    791.0 ms)
+[info ] rope: YaRN over 64 of 128 dims, base 500000, factor 32.0, original context 4096, beta_fast/slow 64/1
+[info ] rope pairing: NeoX half-split (channel j with j + 32)
+[info ] loaded Laguna XS.2 (laguna): 40 layers, 2048 embd, 64/8 heads, hd=128, ff=8192, vocab=100352
+[info ] hybrid attention: 3 of every 4 layers attend fully, the rest within 512 tokens; rope 128/128 dims at base 10000 on the windowed layers
+[load ] TOTAL upload: 1189.8 MiB in 441.6 ms = 2.63 GB/s
+[load ]   16-64K       10 copies       0.5 MiB
+[load ]   64-256K      30 copies       2.1 MiB
+[load ]   256K-1M     117 copies      70.7 MiB
+[load ]   1-4M        119 copies     139.3 MiB
+[load ]   4-16M        83 copies     706.1 MiB
+[load ]   >16M          2 copies     271.0 MiB
+[load ] post-load (rope table etc)      0.1 ms  (total    791.1 ms)
+[info ] expert WARM: prefetched 18102.0 MiB in 4511 ms, host RAM in use up 17292.1 MiB (a VRAM miss is a promotion now, not a file read)
+[info ] expert cache: budget 3000.0 MiB + WARM 18102 MiB pageable (prefetched), 256 experts x top-8, 40 layers, policy LFU+aging (pin at 24 hits, decay every 64); cold reads are read-through
+[info ] workspaces ready: chunk=256 ctx=4096 KV=640 MiB (load 5356 ms)
+[phase] engine.init (load)       5356.2 ms  (total   5373.2 ms)
+[phase] banner + draft              0.0 ms  (total   5373.2 ms)
+
+[stats ] load      5356 ms, 1.16 GiB uploaded of 1.16 GiB weights in 442 ms = 2.6 GB/s
+[stats ] prefill   31 tok in 3187.2 ms = 9.7 tok/s
+[stats ] decode    16 tok in 3611.1 ms = 4.4 tok/s (225.7 ms/tok)
+[stats ] device    7.35 GiB in use of 15.92 GiB (8.57 GiB free)
+[stats ] experts   3000 MiB VRAM budget, 1542/1542 slots resident, 0 pinned | WARM 18102 MiB pageable, 9984 held (18102 MiB, 18102 MiB prefetched)
+[stats ] cache     8197 acquires | HOT hits 2499 (30.5%) | WARM hits 5698 (69.5%) | COLD misses 0 (0.0%)
+[stats ] transfer  5698 promotions, 10326 MiB in 4678.6 ms = 2.2 GB/s (821.1 us/expert) | 4156 VRAM evictions kept in WARM, 7528 MiB | 0 MiB read from the file (0.00 MiB/tok)
+[stats ] warm      18102 MiB capacity, 100.0% in use | 9984 admissions, 0 evictions, 0 rejects | 4156 device evictions, 0 decay events
+
+== KRK_TIME per-op device time (110173 ops)
+op                            calls     dev ms   idle ms   host ms        MB     GB/s  TFLOP/s
+warm_read                     29952    3926.64    783.24   4306.85      0.00      0.0     0.00
+gemm(gemv)                    23446     784.10    773.28    148.59  25531.11     32.6     0.10
+upload                         8719     754.06    591.63    477.34      0.00      0.0     0.00
+gather_rows                    8197     345.32    294.80     58.99     58.79      0.2     0.00
+gemm(wmma)                     5975     320.70    216.66     40.65   4518.63     14.1     0.47
+silu_mul                       8837     294.40    258.24     44.88      0.00      0.0     0.00
+upload_i32                     8197     275.01   1778.93     63.64      0.00      0.0     0.00
+scatter_axpy                   8197     264.25    264.48     43.12     58.79      0.2     0.00
+rope                            640      60.99     11.96    572.78      0.00      0.0     0.00
+download_f32                    624      57.48     61.68     63.45      0.00      0.0     0.00
+add_inplace                    1904      35.37     37.27     11.91      0.00      0.0     0.00
+rmsnorm                        1296      34.47     33.25      7.98      0.00      0.0     0.00
+attention                       640      19.90     25.48      7.73      0.00      0.0     0.00
+fill0                           626      19.62     14.35      3.20      0.00      0.0     0.00
+gemm_group                      315      18.45      8.28      3.08      0.00      0.0     0.00
+qk_norm                         640      13.07     10.93      6.80      0.00      0.0     0.00
+softplus_act                    640      11.78     14.06      4.74      0.00      0.0     0.00
+kv_append                       640       9.97     12.88      4.57      0.00      0.0     0.00
+mul_head_bcast                  640       9.43     21.84      4.09      0.00      0.0     0.00
+embed                            16       7.19      1.37      7.08      0.00      0.0     0.00
+download                         16       1.52      1.46      1.43      0.00      0.0     0.00
+logits_topk                      16       0.41      1.81      0.28      0.00      0.0     0.00
+TOTAL                        110173    7264.13   5217.90
+device spans are 48.4% of 15003.1 ms wall; 5217.9 ms idle between ops (34.8%); 2521.0 ms neither (not ops)

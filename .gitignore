@@ -17,3 +17,8 @@
 # Docs: keep the written docs, drop probe transcripts
 /docs/*
 !/docs/*.md
+
+# Shareable performance evidence: per-op traces, baseline runs, results.
+/docs/*
+!/docs/traces/
+!/docs/traces/**
