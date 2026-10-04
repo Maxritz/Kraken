@@ -36,6 +36,7 @@ struct Args {
     int draft_tokens = 4;       // speculative decoding window
     bool cpu = false;
     bool greedy = false;
+    bool tokenize = false;
     bool chat = false;
     bool info = false;
     bool bench = false;
@@ -77,6 +78,7 @@ void usage() {
         "  --repeat-penalty F    repetition penalty (default 1.1)\n"
         "  --seed N              RNG seed\n"
         "  --greedy              force argmax decoding\n"
+        "  --tokenize            print the prompt's token ids and exit\n"
         "  --chat                wrap the prompt in a ChatML template\n"
         "  --system STR          system message for --chat\n"
         "  --cpu                 use the scalar reference backend\n"
@@ -171,6 +173,7 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--expert-warm-prefetch")
             a->expert_warm_prefetch = std::atoi(next("--expert-warm-prefetch")) != 0;
         else if (f == "--greedy") a->greedy = true;
+        else if (f == "--tokenize") a->tokenize = true;
         else if (f == "--chat") a->chat = true;
         else if (f == "--cpu") a->cpu = true;
         else if (f == "--info") a->info = true;
@@ -616,6 +619,26 @@ int main(int argc, char **argv) {
         delete be;
         ph.mark("delete be -> exit");
         return rc;
+    }
+
+    // --tokenize: what the model actually sees. A reference comparison is a
+    // token-id list, so template markers and the tokenizer's special-token
+    // rules can be diffed instead of inferred from the generated text.
+    if (a.tokenize) {
+        const std::string text =
+            a.prompt_given ? (a.chat ? chatml(a.system, a.prompt) : a.prompt)
+                           : std::string();
+        std::vector<i32> ids;
+        const int n = engine.tokenizer().encode(text, ids, true);
+        std::printf("%d tokens\n[", n);
+        for (int i = 0; i < n; i++) std::printf("%s%d", i ? ", " : "", ids[i]);
+        std::printf("]\n");
+        for (int i = 0; i < n; i++)
+            std::printf("%6d  %s\n", ids[i],
+                        engine.tokenizer().piece(ids[i]).c_str());
+        engine.shutdown();
+        delete be;
+        return 0;
     }
 
     SinkCtx sink;

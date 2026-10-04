@@ -282,6 +282,15 @@ std::vector<std::string> pre_tokenize(const std::string &text, PreMode mode) {
 }
 
 PreMode pre_mode_from_name(const std::string &pre) {
+    // "laguna" (Poolside) tokenizes like qwen2, not like GPT-2. The two
+    // pre-tokenizer patterns differ on punctuation that abuts a word: GPT-2
+    // cuts `_start` into `_` + `start`, while qwen2 keeps an optional single
+    // non-letter prefix with the following letters, so the `_start` merge can
+    // fire. That is the whole ChatML prompt: under GPT-2 rules `<|im_start|>`
+    // reached the model as `im` + `_` + `start`, and a model asked a prompt it
+    // was never trained on answers a different question than the reference
+    // does (token ids compared in docs/traces/laguna-chat-tokenizer.txt).
+    if (pre.find("laguna") != std::string::npos) return PreMode::Qwen2;
     if (pre.find("qwen2") != std::string::npos) return PreMode::Qwen2;
     if (pre.find("llama3") != std::string::npos ||
         pre.find("llama-bpe") != std::string::npos)

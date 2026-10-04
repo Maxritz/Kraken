@@ -1,0 +1,98 @@
+laguna: the ChatML prompt was tokenized with the wrong pre-tokenizer
+==================================================================
+
+Symptom
+-------
+Kraken answered the reference ChatML prompt ("what is the capital of
+france?") with "Okay, the user is asking about ..." while llama.cpp
+(b11146, H:/LLAMA-Bins/rocm10/llama-cli.exe, the same model file) answers
+"The capital of France is Paris.". First-token logits on kraken:
+
+    33586 = 20.40625   ("Okay")
+      785 = 16.078125  ("The")
+
+A 4.3-logit gap is a path difference, not fp16 noise.
+
+Cause
+-----
+`general.architecture = laguna` ships `tokenizer.ggml.pre = "laguna"`.
+Kraken's `pre_mode_from_name()` only knew qwen2 / llama3 / llama-bpe /
+deepseek and fell through to `PreMode::Gpt2` for everything else.
+
+The two patterns differ on punctuation that abuts a word:
+
+  * GPT-2   : ` ?\p{L}+`  — a letter run starts at a letter, so the `_`
+              in `im_start` is its own symbol chunk.
+  * Qwen2   : `[^\r\n\p{L}\p{N}]?\p{L}+` — an optional single
+              non-letter prefix stays with the letter run, so `_start`
+              is one chunk.
+
+That matters here because laguna's ChatML markers are NOT single special
+tokens in the vocabulary. `<|im_start|>` is a BPE merge chain:
+
+    97 "<"  +  161 "|"  +  379 "im"  +  7801 "_start"  +  13334 "|>"
+
+The `_start` merge (token 7801) can only fire if `_` and `start` reach
+BPE inside one pre-tokenizer chunk. Under GPT-2 rules the marker
+tokenized as `im` + `_` + `start`, and the model was asked a prompt it
+was never trained on.
+
+Fix
+---
+`src/tokenizer.cpp`: `pre.find("laguna") -> PreMode::Qwen2`.
+
+Evidence
+--------
+Prompt text (80 bytes, byte-exact; `\n` is a real newline):
+
+    <|im_start|>user\nwhat is the capital of france?<|im_end|>\n<|im_start|>assistant\n
+
+Reference tokenizer (the oracle):
+
+    H:/LLAMA-Bins/rocm10/llama-tokenize.exe \
+        -m G:/More-models/laguna-xs2-Q4_K_M.gguf -f /tmp/chatml.txt --ids --no-bos
+
+    [97, 161, 379, 7801, 13334, 1437, 268, 13864, 395, 340, 9626, 377,
+     76807, 58716, 161, 379, 9180, 13334, 268, 97, 161, 379, 7801,
+     13334, 76963, 268]
+    (26 ids)
+
+Kraken after the fix (`--tokenize` also prints id -> piece):
+
+    ./build-hip/kraken.exe -m G:/More-models/laguna-xs2-Q4_K_M.gguf \
+        --chat -p "what is the capital of france?" --tokenize
+
+    [2, 97, 161, 379, 7801, 13334, 1437, 268, 13864, 395, 340, 9626, 377,
+     76807, 58716, 161, 379, 9180, 13334, 268, 97, 161, 379, 7801, 13334,
+     76963, 268]
+    (27 ids)
+
+The leading 2 is BOS (bos = eos = 2, add_bos_token = 1); the remaining 26
+are bit-identical to the reference list above. The piece dump shows the
+five-token marker: 97 "<", 161 "|", 379 "im", 7801 "_start", 13334 "|>".
+
+Before the fix the same command returned 30 tokens with `im`, `_` and
+`start` as separate ids.
+
+State after the fix
+-------------------
+Tokenizer now agrees with the reference, and the answer is still wrong:
+kraken ChatML picks 33586 with the same 4.3-logit gap. The prompt ids are
+no longer a candidate; the remaining divergence is in shared model logic
+(the CPU backend picks the same wrong token as the device at chunk 256).
+Suspects, in the order they will be checked against
+H:/LLAMA-bins/llama.cpp/src/models/laguna.cpp:
+
+  * YaRN tables on the full layers (factor 32, rope_dim 64) vs plain
+    RoPE on the SWA layers (rope_dim 128, base 10000);
+  * per-head softplus output gate taken from the pre-attention norm;
+  * sigmoid router + exp_probs_b selection bias + sum-norm + scale 2.5
+    against the shared expert;
+  * per-layer head counts (GGUF ships a 40-entry array: 48 on
+    il%4==0, 64 otherwise; Laguna-S-2.1 the same with 72).
+
+Tooling added with this trace
+-----------------------------
+`--tokenize` (src/main_cli.cpp) prints the token count, a
+Python-parseable id list, and one `id  piece` line per token, then exits.
+It is how the two token lists above were produced.
