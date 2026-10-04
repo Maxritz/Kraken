@@ -19,6 +19,9 @@
 !/docs/*.md
 
 # Shareable performance evidence: per-op traces, baseline runs, results.
+# This repeats /docs/* so the traces whitelist sits after it; without the
+# repeat the earlier !/docs/*.md is overridden and every new doc is ignored.
 /docs/*
+!/docs/*.md
 !/docs/traces/
 !/docs/traces/**
