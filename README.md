@@ -181,16 +181,18 @@ pass, the sampler and both tokenizer families are all covered end to end.
 
 ### The command
 
-Every number below comes from one command, run three times per model:
+Every number below comes from one command (headline rows: three runs per model; full sweep: one run each):
 
 ```
 kraken --model <MODEL> --bench
 ```
 
-`--bench` is self-contained and needs no flags: it feeds a fixed **51-token
-prompt**, generates **256 tokens**, and reports the *whole* process budget, not
-just the two phases it owns. Defaults in force for every row: greedy sampling,
-`--ctx 4096`, `--chunk 256`.
+`--bench` is self-contained and needs no flags: it feeds a fixed prompt (which
+tokenizes to **51–125 tokens depending on the model's tokenizer** — 51 for
+SmolLM2, 55 for most Qwen-family files, 122–125 for a few others), generates
+**256 tokens**, and reports the *whole* process budget, not just the two phases
+it owns. Defaults in force for every row: greedy sampling, `--ctx 4096`,
+`--chunk 256`. The per-model prompt length is listed in the sweep table below.
 
 ```
 prefill        55 tokens in 83.9 ms  (655.2 tok/s)
@@ -216,17 +218,22 @@ Configuration: **AMD Radeon RX 9070 XT** (gfx1201, RDNA4, wave32, WMMA gfx12,
 
 | model | layers / embd | prefill tok/s | decode tok/s | load ms |
 |---|---|---|---|---|
-| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 3145–3349 | 424–432 | 351 |
-| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 2462–2550 | 241–253 | 522 |
-| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 24 / 2048 | 143–157 | 89–99 | 405 |
-| Qwen3-8B Q4_K_M | 36 / 4096 | 642–697 | 87–88 | 1411 |
+| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 2271–2643 | 472–483 | 342–459 |
+| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 2365–2443 | 339–340 | 517–651 |
+| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 28 / 1024 | 123–218 | 109–117 | 421–587 |
+| Qwen3-8B Q4_K_M | 36 / 4096 | 784–853 | 87–89 | 1384–3461 |
+
+These four get three runs each; the MoE prefill band is wide because the first
+run pages experts in cold (see the residency section below). The 8B load band
+is wide for the opposite reason: one run hit a cold file cache (~3.4 s) while
+the other two read at 1.6–5.0 GB/s.
 
 ### How close is this to the hardware?
 
 The card's real read bandwidth is **585 GB/s**, not the 644 GB/s on the spec
 sheet — measured with a 4096 MiB streaming read (584.9 GB/s). An 8B Q4_K_M
 token has to read **5.02 GB** of weights, so the absolute floor is **8.58 ms =
-117 tok/s**. Kraken does **88.7 tok/s, 76% of that ceiling**.
+117 tok/s**. Kraken does **87–89 tok/s, ~76% of that ceiling**.
 
 The gap is not bandwidth: **3.78 ms of the 11.27 ms token (34%)** is five
 elementwise ops (`rmsnorm`, `rope`, `qk_norm`, `kv_append`, `add_inplace`) that
@@ -243,9 +250,80 @@ kraken --model "G:/More-models/Qwen3-8B-Q4_K_M.gguf"            --bench
 ```
 
 Run-to-run spread is 2–5% on prefill and under 2% on decode, so treat
-differences smaller than that as noise. The MoE row is the only one that
-depends on a tunable: it assumes the default expert budget, which is why it
-looks slow next to the MoE numbers further down.
+differences smaller than that as noise. MoE rows depend on a tunable: they
+assume the default expert budget (40% of free VRAM), which is why a small MoE
+can look slow next to a dense model far above its weight.
+
+### Full sweep: every loadable file on the box, one run each
+
+66 `.gguf` files were tried (everything in `models/` plus `G:/More-models/`,
+skipping only the 3-part Laguna shard set, which is not a loadable model).
+38 ran; 28 were refused loudly at load — the refusal reasons are grouped below
+the table. Dense rows are VRAM-bound decode; MoE rows (marked \*) page experts
+through the default budget, so their prefill includes cold-cache paging.
+
+| file | size | arch · layers / embd | prompt tok | prefill tok/s | decode tok/s | load ms |
+|---|---|---|---|---|---|---|
+| SmolLM2-135M-Instruct.IQ4_XS | 0.09 GB | llama · 30 / 576 | 51 | 2301 | 482 | 344 |
+| SmolLM2-135M-Instruct.Q4_K_M | 0.11 GB | llama · 30 / 576 | 51 | 2271 | 472 | 342 |
+| Qwen3.5-0.8B.Q4_K_M | 0.53 GB | qwen35 · 24 / 1024 | 55 | 2365 | 339 | 549 |
+| Qwen3-MOE-4x0.6B-2.4B-Q4_K_M \* | 0.96 GB | qwen3moe · 28 / 1024 | 55 | 123 | 109 | 587 |
+| smolcode-coder-cpp-1.5b-q4_k_m | 1.12 GB | qwen2 · 28 / 1536 | 55 | 1808 | 235 | 649 |
+| smolcode-coder-cpp-3b-q4_k_m | 2.10 GB | qwen2 · 36 / 2048 | 55 | 1308 | 160 | 879 |
+| Phi-3.5-mini Q4_K_M | 2.32 GB | llama · 32 / 3072 | 125 | 1354 | 95 | 1653 |
+| qwen3vl-4b-q4_k_m | 2.50 GB | qwen3vl · 36 / 2560 | 55 | 971 | 130 | 2188 |
+| Spark_one.Q6_K | 2.54 GB | qwen2 · 36 / 2048 | 55 | 607 | 122 | 2384 |
+| qwen3.5-4b-nvfp4 | 2.54 GB | qwen35 · 32 / 2560 | 55 | 947 | 128 | 1066 |
+| Samastam-2.5B-Q8_0 | 2.69 GB | llama · 28 / 2048 | 122 | 2546 | 160 | 2407 |
+| VibeThinker-3B.Q8_0 | 3.29 GB | qwen2 · 36 / 2048 | 55 | 1464 | — † | 1925 |
+| Qwen3-4B-Instruct-2507-Q6_K | 3.31 GB | qwen3 · 36 / 2560 | 55 | 459 | 99 | 2113 |
+| qwen2.5-coder-3b-instruct-q8_0 | 3.62 GB | qwen2 · 36 / 2048 | 55 | 1407 | 124 | 2388 |
+| qwen3-1.7b-stem-proof-f16 | 4.07 GB | qwen3 · 28 / 2048 | 55 | 1481 | 132 | 3614 |
+| qwen3-1.7b-coder-distilled-sft-f16 | 4.07 GB | qwen3 · 28 / 2048 | 55 | 1313 | 132 | 3674 |
+| Qwen3-4B-Q8_0 | 4.28 GB | qwen3 · 36 / 2560 | 55 | 1247 | 102 | 1377 |
+| Opus4.7 Distill 4B Q8_0 | 4.48 GB | qwen35 · 32 / 2560 | 55 | 1402 | 97 | 1401 |
+| Qwen3.5-9B-DeepSeek-V4-Flash-MTP Q3_K_M | 4.74 GB | qwen35 · 32 / 4096 | 55 | 914 | 77 | 3038 |
+| Ornith-1.0-9b STRIX_LEAN | 4.96 GB | qwen35 · 32 / 4096 | 55 | 897 | 96 | 2661 |
+| Qwen3-8B-Q4_K_M | 5.03 GB | qwen3 · 36 / 4096 | 55 | 784 | 89 | 1450 |
+| mythos-9b-unhinged-heretic.i1-Q4_K_M | 5.03 GB | qwen3 · 36 / 4096 | 55 | 801 | 89 | 1384 |
+| lacuna-v1-Q4_K_M | 5.07 GB | llama · 32 / 4096 | 52 | 751 | 92 | 5026 |
+| qwen3.5-9b-nvfp4 | 5.31 GB | qwen35 · 32 / 4096 | 55 | 1009 | 88 | 3519 |
+| qwen35-9b-instruct-nvfp4 | 5.31 GB | qwen35 · 32 / 4096 | 55 | 930 | 88 | 4653 |
+| Q3.5-9B-GLM-5.1-DA Q4_K_S | 5.35 GB | qwen35 · 32 / 4096 | 55 | 949 | 88 | 4136 |
+| Qwen2.5-Coder-7B Q5_K_M | 5.44 GB | qwen2 · 28 / 3584 | 55 | 687 | 85 | 3991 |
+| Qwen3.5-9b-Sushi-Coder-RL Q4_K_M | 5.63 GB | qwen35 · 32 / 4096 | 55 | 726 | 82 | 3671 |
+| omnicoder-9b-q6_k | 7.36 GB | qwen35 · 32 / 4096 | 55 | 294 | 60 | 4395 |
+| Qwen3.8-9B-Q6_K | 7.56 GB | qwen35 · 32 / 4096 | 55 | 320 | 60 | 8041 |
+| Qwen3-30B-A3B Q2_K \* | 11.26 GB | qwen3moe · 48 / 2048 | 55 | 9 | 21 | 1182 |
+| Qwen2.5-Coder-32B Q4_K_M ‡ | 19.85 GB | qwen2 · 64 / 5120 | 55 | 44 | 1.0 | 17319 |
+| qwable-v1-mxfp4_moe \* | 20.26 GB | qwen35moe · 40 / 2048 | 55 | 6 | 13 | 4737 |
+| laguna-xs2-Q4_K_M \* | 20.27 GB | laguna · 40 / 2048 | 51 | 4 | 9 | 1871 |
+| Unsloth-Ornith-1.5-35B-A3B Q4_K_XL \* | 22.36 GB | qwen35moe · 40 / 2048 | 55 | 7 | 17 | 2620 |
+| Tiel-Coder-35B-A3B Q5_K_XL \* | 26.59 GB | qwen35moe · 40 / 2048 | 55 | 5 | 9 | 2411 |
+| Tiel-Coder-35B-A3B-MTP-APEX \* | 26.67 GB | qwen35moe · 40 / 2048 | 55 | 5 | 15 | 3146 |
+| ornith-35b-Q8_0 \* | 36.90 GB | qwen35moe · 40 / 2048 | 55 | 3 | 10 | 2665 |
+
+† VibeThinker emits EOS on the bench prompt, so there is nothing to time: honest
+prefill, no decode. ‡ The 32B dense model is larger than VRAM (18.5 GiB resident
+on a 15.9 GiB card) and runs oversubscribed at 1 tok/s — it proves the loader
+refuses nothing silently, not that this is a configuration anyone should use.
+
+NVFP4 and MXFP4 dequantize fine (the 4B/9B NVFP4 and the MXFP4 MoE rows above);
+`nemotron-3-nano-4b-NVFP4` below is refused for its Mamba blocks, not its quant.
+
+### Refused at load (28 files, each with its reason)
+
+| reason | files |
+|---|---|
+| Speculative-head shard, not a model (runs only via `--draft`) | laguna-xs21-dflash-q8, laguna-s-2.1-DFlash-Q4_K_M, Qwen3.8-27B-DFlash2-Q2_K, Qwen3.8-27B-DFlash2-Q4_K_M, Qwen3.8-27B-DSpark-Q8_0, Qwen3.8-27B-DFlash-bootstrap-Q8_0, DeepSeek-V4-Flash-REAP-MTP, Ternary-Bonsai-27B-dspark-Q4_1 |
+| MLA / latent KV compression not implemented | GLM-4.7-Flash-Q4_K_M (deepseek2), DeepSeek-V4-Flash-imatrix (deepseek4) |
+| gemma4 geometry not implemented (shared-KV layers, sliding window, softcap) | gemma-4-E4B-it-Q4_K_M, gemma4-coding-Q6_K |
+| Mamba-2 blocks (nemotron_h) | nemotron-3-nano-4b-NVFP4 |
+| Fused QKV / attention output gate (spark2_5) | Spark-X2.5-4B-Q8_0 |
+| Routed attention values (k2-horizon) | K2-Horizon-MoVA-36B-A4B-Q4_K_M |
+| Attention output gate (muse-glimmer) | Muse-Glimmer-30B-UD-Q8_K_XL |
+| Quant type this build cannot dequantize | Bonsai-27B-Q1_0 (#41), Ternary-Bonsai-2-27B-PQ2_0 (#142), Qwen3.8-27B-UD-Q2_K_XL (#18/#29/#21), Qwen3.8-27B-GSQ-RCO-IQ3_S (#22 + IQ2_XS), Qwen3.8-Distill-35B-Q2KXL (#102/#107), Laguna-XS-2.1-IQ3_XXS (#21/#18/#22), ornith-1.0-35B-Q3_0 (#104/#102) |
+| Head geometry the loader rejects | Qwen3.8-27B-Opus-Distill-IQ2_XXS, qwen3.8-flash-next-Q4 (`n_embd` not divisible by head count), Qwen3.8-27B-WebGGUF-Q4_0 (same) |
 
 ### Short-context decode
 
