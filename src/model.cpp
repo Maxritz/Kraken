@@ -291,11 +291,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // is declared in the file (`attention.key_length`) and is what the loader
     // and the kernels actually use, so only check the identity when there is a
     // single head count for it to hold for.
+    // Both of these are integer divisions on values that come straight from the
+    // file, so a zero has to be refused rather than divided by: the kernel took
+    // SIGFPE here, core dumped, before reading a single tensor, on any model
+    // whose head-count metadata is absent or empty. A model we cannot use is
+    // not a model we should crash on.
+    if (cfg_.n_head <= 0) {
+        if (err) *err = "model declares no attention head count";
+        return false;
+    }
     if (cfg_.n_head_layer.empty() && cfg_.n_embd % cfg_.n_head != 0) {
         if (err) *err = "n_embd is not divisible by head count";
         return false;
     }
-    if (cfg_.n_head % cfg_.n_head_kv != 0) {
+    if (cfg_.n_head_kv <= 0 || cfg_.n_head % cfg_.n_head_kv != 0) {
         if (err) *err = "head count is not a multiple of the KV head count";
         return false;
     }
@@ -555,8 +564,16 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     gguf_.get_i32_array(key(".attention.recurrent_layers"))) {
                 if (l < static_cast<i32>(rec->size()))
                     L.gdn = (*rec)[static_cast<size_t>(l)] != 0;
-            } else {
+            } else if (cfg_.full_attention_interval > 0) {
                 L.gdn = ((l + 1) % cfg_.full_attention_interval) != 0;
+            } else {
+                // No usable interval: treat every layer as a full-attention
+                // layer, which is what an interval of 1 means. This used to be
+                // an unguarded modulo and any model that reached this branch
+                // without the clamp above took its course -- SIGFPE, core
+                // dumped, before a single tensor was read. Laguna-XS.2-IQ4_XS
+                // did exactly that on gfx1031.
+                L.gdn = false;
             }
         }
 

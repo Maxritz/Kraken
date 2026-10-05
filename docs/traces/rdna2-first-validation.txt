@@ -1,0 +1,107 @@
+First real RDNA2 validation — gfx1031, RX 6700 XT (2026-10-05)
+============================================================
+maclin: rr@10.0.0.12, Linux, 12 cores, 46 GiB RAM, /opt/rocm 7.17 (SDK 7.15),
+AMD Radeon RX 6700 XT, gfx1031, 40 CU, 12.0 GiB VRAM. Models on nvme1n1p1
+(ntfs3) at /run/media/rr/52CA9D9BCA9D7BC3/x.
+
+THIS IS THE FIRST TIME THE PRIMARY TARGET HAS EVER BEEN EXERCISED.
+docs/HARDWARE.md names gfx1031 the primary target; until now every RDNA2 claim
+in this repo was untested by construction.
+
+THE BUILD NEVER WORKED ON LINUX
+--------------------------------
+build-hip on maclin failed with 4 errors that MSVC's transitive headers hid on
+Windows, so the tree could not compile for its own primary target:
+
+    include/krk/model.hpp     missing <cmath>      (std::tanh)
+    src/backend_cpu.cpp       missing <cfloat>      (FLT_MAX)
+    src/engine.cpp            missing <sys/stat.h>  (struct stat)
+    src/hip/backend_hip.hip   missing <atomic>      (std::atomic fail counter)
+
+Plus one defect this work introduced: attn_qtile_scores_bytes was defined AFTER
+the kernel that calls it, which Linux/clang rejects (a dependent call to a later
+declaration is not found by ADL) and the Windows toolchain accepted.
+
+After those: build rc=0, 0 `error:` lines, and **kraken-tests 2154/2154 rc=0 on
+gfx1031** — first time.
+
+A CRASH ON THE PRIMARY TARGET
+-----------------------------
+Laguna-XS.2-IQ4_XS.gguf died with `Floating point exception (core dumped)`,
+rc=136, after three lines of banner and before reading a single tensor. Located
+with a RelWithDebInfo build + gdb: src/model.cpp:298,
+`cfg_.n_head % cfg_.n_head_kv`, with n_head_kv == 0. It defaults to n_head, and
+this file's head-count metadata yields zero, while the line above short-circuits
+on `n_head_layer.empty()` and never validates. A second unguarded modulo at
+line 559 (`% full_attention_interval`) had the same shape.
+
+Both are now refusals, not divisions:
+
+    kraken: head count is not a multiple of the KV head count     rc=1
+
+THROUGHPUT (first RDNA2 numbers; prompt ~76 tok, ctx 1024, chunk 512)
+----------------------------------------------------------------------
+Qwen3-8B-Q4_K_M  dense 4.7G, fits
+    banner   AMD Radeon RX 6700 XT (gfx1031, RDNA2, 40 CU, wave32, packed-math)
+    prefill  173.0 tok/s      decode  51.0 tok/s (19.6 ms/tok)
+    device   5.32 GiB of 11.98 GiB
+    load     16400 ms at 0.3 GB/s
+
+olmoe-1b-7b  MoE, 3.96 GiB
+    prefill    1.9 tok/s      decode  26.2 tok/s (38.2 ms/tok)
+    cache      4835 acquires | HOT 3948 (81.7%) | WARM 887 (18.3%) | COLD 887
+    transfer   887 promotions, 3225 MiB in 232.2 ms = 13.6 GB/s (261.8 us/expert)
+    expert-path  read 37262.2 ms | room 0.0 | alloc 1.5 | xfer 230.5
+
+For scale: the same 8B model on the 9070 XT (gfx1201) decodes at 111.6 tok/s
+against 51.0 here. The 6700 XT has 384 GB/s to the 9070's 644 GB/s (1.68x), so
+1.30x of the gap is bandwidth and ~1.30x is the RDNA2 path being slower.
+
+RDNA2 DECODE PROFILE (olmoe-1b-7b, KRK_PROFILE_STEPS=3, 14074 ops)
+------------------------------------------------------------------
+op                     calls    NET ms      MB     GB/s
+warm_read                21   440.64     0.0       0.0   <- 440 ms, the whole run
+upload                 1608    88.91     0.0       0.0   <- per-expert plan/alpha
+gemm(simt)              566    68.35   779.9      11.4   <- RDNA2 packed-math tile
+upload_paged            826    45.14  3150.2     69.8
+gemm(gemv_m)           1512    44.09  1927.4     43.7
+gemm(gemv)             2671    30.70  4069.1    132.5   <- healthy
+upload_i32             1461    15.59     0.0       0.0
+scatter_axpy           1461     8.63    20.4      2.4
+gather_rows            1461     8.48    20.4      2.4
+silu_mul               1461     5.75     0.0       0.0
+embed                     6     4.85
+attention               96     1.94
+download_f32            96     1.40     0.0       0.0   <- host 122.65 ms
+rmsnorm                198     1.34
+
+THREE THINGS THIS SAYS, IN ORDER
+---------------------------------
+1. `warm_read` is 440 ms and everything else combined is ~270 ms. That is the
+   ntfs3 path, not the engine: the same tree loads at 3.1 GB/s on Windows. Any
+   RDNA2 throughput number measured on this mount is disk-bound and must not be
+   read as a kernel result.
+2. `gemm(simt)` runs at 11.4 GB/s against `gemm(gemv)`'s 132.5. That is the
+   RDNA2 analogue of the staged-dequant problem on gfx12 (24 GB/s) and is the
+   one genuine kernel finding on this card.
+3. `download_f32` costs 1.40 ms of device but **122.65 ms of host** across 96
+   calls -- 1.28 ms per blocking router-logit drain, worse per call than the
+   0.151 ms barrier measured on the 9070 XT. The device-side routing plan is
+   worth more on RDNA2 than on RDNA4, not less.
+
+COHERENCE (gfx1031, device vs --cpu oracle)
+-------------------------------------------
+PASS   Qwen3.8-4B-Q8_0.gguf
+PASS   Qwen2.5-Coder-7B-Instruct-Q5_K_M.gguf
+(remaining models in progress at time of writing)
+
+STILL OPEN
+----------
+- Windows build-hip cannot relink kraken.exe: CMake's self-regeneration fails on
+  compiler detection, so kraken.exe is stale relative to src. kraken-tests and
+  kraken-bench are current and green.
+- probe_decode.hip and the other standalone probes are stale against current
+  kernel signatures. They sit behind KRK_BUILD_PROBES=OFF, the project default;
+  maclin's cache had them ON.
+- The coherence sweep above was stopped mid-run at the time of writing; this file
+  records only what had actually reported.
