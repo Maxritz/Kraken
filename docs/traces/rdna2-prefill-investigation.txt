@@ -137,3 +137,47 @@ packed for the same shape). On gfx1031 the packed form is already selected.
   sh scripts/build_linux.sh gfx1031   build rc=0, 0 "error:" lines
   ./build-hip/kraken-tests            2154/2154 checks passed, rc=0
   Qwen3-8B device == llama.cpp HIP, byte for byte, on the same card
+--------------------------------------------------------------------------------
+8. The int8 default checked against the models it could have broken
+--------------------------------------------------------------------------------
+Commit fc51584 made the int8 DP4A rung the default, on the argument that
+dp4a_ok's kDp4aMinK=2048 keeps small-K models off it. That argument was
+asserted, not measured, so it was measured: the two models on maclin that sit
+either side of the gate.
+
+  smolcode-coder-cpp-1.5b-q4_k_m   n_embd 1536  (every GEMM has n_in < 2048)
+    KRK_GEMM_INT8=0   814.7 / 773.9 tok/s
+    KRK_GEMM_INT8=1   811.2 / 806.2 tok/s
+    generated text    IDENTICAL
+    -> no regression. The gate holds: the rung never engages below K=2048.
+
+  Llama-3.2-1B-Instruct-Q8_0       n_embd 2048  (n_in == 2048, at the gate)
+    KRK_GEMM_INT8=0   1513.4 / 1442.2 tok/s
+    KRK_GEMM_INT8=1   1992.2 / 1989.8 tok/s      1.32x
+    generated text    IDENTICAL
+    -> the win case reproduces on hardware, and with byte-identical output.
+
+Instrument defect, recorded because it nearly made this look like a null
+result: a helper counted "gemm(dp4a)" rows in a profile window with
+KRK_PROFILE_STEPS=1, which is a DECODE step. Prefill GEMMs happen before the
+decode steps, so the count was 0 for both models regardless of what the rung
+did -- while Llama-3.2-1B was visibly 1.32x faster in the same run. A count of
+zero from a window that cannot contain the thing being counted is a fact about
+the window.
+
+--------------------------------------------------------------------------------
+9. Where the ceiling actually is on this card
+--------------------------------------------------------------------------------
+  RX 6700 XT, gfx1031, 40 CU, wave32, 12.0 GiB
+    40 CU x 64 FP32 lanes x 2 FLOP x 2.41 GHz  = 12.3 TFLOP/s fp32
+    v_dot2_f32_f16 (4 FLOP/instruction)        = 24.6 TFLOP/s packed fp16
+
+  Qwen3-8B is 8.19e9 parameters, so 16.4 GFLOP/token of GEMM. At the packed
+  fp16 ceiling that is 24.6e12 / 16.4e9 = 1,500 tok/s. A prefill figure in the
+  thousands for an 8B model is not reachable on this card by any kernel; the
+  number to beat is 1,500, and llama.cpp measures 831, i.e. 55% of it.
+
+  Measured so far: 203.7 baseline -> 232.3 with the int8 default -> 265.5 with
+  int8 and the query-tiled attention, i.e. 18% of the ceiling. The remaining
+  3.13x to llama.cpp is 654 ms of Q6_K GEMMs running at 1.08 TFLOP/s plus the
+  SIMT tile at 3.78 TFLOP/s (15% of the packed ceiling).
