@@ -209,3 +209,59 @@ thing standing. What the measurements above say is left, in order:
 
 The kernel is still at roughly 24-30 TFLOP/s where the card can do ~163, so
 there is a great deal of headroom above what is recorded here.
+
+8. PREFILL GETS WORSE AS THE PROMPT GROWS, AND IT IS NOT THE GEMM
+--------------------------------------------------------------------------------
+Everything in section 6 was measured with --bench's 55-token prefill. That
+batch is small enough to be latency-dominated, so it is not the number that
+answers the question the whole exercise is about. Measuring the actual
+scaling (greedy, --max-tokens 1, chunk=256, 2 reps each, very repeatable):
+
+    21 tok    507.9 / 512.2 tok/s
+    81 tok    829.0 / 824.5 tok/s
+   321 tok    720.6 / 719.0 tok/s
+   961 tok    395.7 / 394.7 tok/s
+
+Throughput peaks near 81 tokens and then FALLS. A GEMM-bound kernel gets
+faster as the batch grows; this one gets slower, so the bound is elsewhere.
+
+Chunk size is not the cause -- 256/512/1024/2048 give 395.5/386.3/379.1/
+375.1 tok/s at 961 tokens, flat to slightly worse.
+
+The profile settles it. Two prompt lengths, same binary, NET device ms net
+of the recorder floor:
+
+    op            81 tok                    961 tok
+    upload        399 calls   998.68 ms     399 calls  1061.24 ms
+    gemm(wmma)    252 calls    60.40 ms    1008 calls   555.03 ms
+    attention      36 calls    15.32 ms     144 calls  1855.97 ms
+
+Two things fall out of that table.
+
+upload does not scale with the prompt at all -- 399 calls and about one
+second at both 81 and 961 tokens. It is the fixed weight load, showing up in
+the window because the profile spans load as well as prefill. It is
+host-bound (host 1053 ms vs device 999 ms) and carries 677 ms of GPU idle
+waiting on it. It is a real cost and it is worth attacking, but it is not
+per-token prefill work and it is not what makes long prompts slow.
+
+attention is what makes long prompts slow. At 961 tokens it is 1856 ms of
+the 2471 ms prefill -- 75% -- against 555 ms for every GEMM in the model
+put together. 144 calls is 36 layers x 4 chunks of 256, at 12.9 ms each.
+
+So the shape of the gap is not "kraken's GEMM is slow". It is:
+
+  * at short prompt lengths the fixed host-bound weight upload dominates,
+    and the section 6 staging fix is worth its 1.33x;
+  * at long prompt lengths attention dominates at 75%, the GEMMs are a
+    minority slice, and no amount of further GEMM work moves the headline.
+
+This is where the remaining ~10x to the reported llama.cpp figure lives, and
+it is a different problem from the one section 6 solved. The next thing to
+measure is the attention kernel at prefill shapes, not the GEMM tile.
+
+Caveat on these numbers: the profile reports 758 of 2068 ops at or below the
+18.99 us recorder floor, so rows sitting on the floor are not individually
+resolvable. The three rows quoted here (upload, gemm(wmma), attention) are
+all far above the floor and their counts and byte totals are exact, but the
+tail is bounded rather than measured.
