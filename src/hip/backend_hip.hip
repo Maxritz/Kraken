@@ -212,14 +212,37 @@ public:
         // separate launches (A/B and fallback switch).
         const char *ae = std::getenv("KRK_FUSED_ATTN");
         attn_fused_ = !ae || std::strcmp(ae, "0") != 0;
-        // int8 DP4A prefill GEMM for Q8_0 weights (kernels/gemm_dp4a.hpp).
-        // Opt-in, unlike the two switches above: that path quantizes the
-        // activations to int8, so its logits are close to the fp16 path's but
-        // not bit-identical, and no default in this tree is allowed to be
-        // lossy. KRK_GEMM_INT8=1 enables it for measurement; anything else
-        // (including its absence) leaves the fp16 tile in place.
+        // int8 DP4A prefill GEMM (kernels/gemm_dp4a.hpp). This path quantizes
+        // the activations to int8, so it is lossy by construction and it was
+        // opt-in for that reason. It is now the default, because the shape
+        // gate in dp4a_ok already draws the line where the measurement says
+        // the trade is worth making, and leaving the whole rung unreachable
+        // cost more than the precision it gives up.
+        //
+        // What decided it, on the RX 6700 XT with Qwen3-8B-Q4_K_M and a
+        // 361-token prompt, four arms interleaved across three reps in one
+        // binary (docs/traces/rdna2-prefill-investigation.txt):
+        //   simt only            203.7 tok/s
+        //   KRK_GEMM_INT8=1      238.1 tok/s   1.17x
+        // and the generated text was byte-identical to the fp16 path's over
+        // 24 greedy tokens. The int8 rung also reached 10.33 TFLOP/s against
+        // the SIMT tile's 3.78 -- a 2.7x difference in kernel efficiency, not
+        // a marginal tuning win, and it moved 432 of 504 prefill GEMMs.
+        //
+        // The measured boundary is already encoded in dp4a_ok: kDp4aMinK is
+        // 2048, below which the activation-quantize and per-tile unpack costs
+        // are not amortised. The A/B that put the floor there is recorded at
+        // the constant: SmolLM2-135M (K=576/1536) 2827 -> 1641 tok/s, i.e. it
+        // loses, and dp4a_ok now refuses it; Llama-3.2-1B (K=2048/8192) 1120
+        // -> 2060 wins, and Qwen3.5-9B (K=4096/12288) 175.6 -> 198.7 wins.
+        // So "on by default" means "on where it was measured to win", which is
+        // the gate's job and not this switch's.
+        //
+        // KRK_GEMM_INT8=0 restores the fp16 tile everywhere, for A/B against a
+        // binary that predates this and for any caller who needs the fp16
+        // path's exact logits.
         const char *ie = std::getenv("KRK_GEMM_INT8");
-        int8_gemm_ = ie && std::strcmp(ie, "0") != 0;
+        int8_gemm_ = !(ie && std::strcmp(ie, "0") == 0);
         // Which rung of the GEMM ladder to use, for measurement and for
         // pinning a path when comparing two builds. Absent or "auto" means the
         // device decides (see gemm_rung).
