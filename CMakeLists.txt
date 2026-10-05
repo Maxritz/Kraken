@@ -161,6 +161,13 @@ endif()
 add_executable(kraken-inspect tools/inspect_gguf.cpp)
 target_link_libraries(kraken-inspect PRIVATE krk_core)
 
+# Sizes the CPU expert fallback (spec section 22 / Fiddler) before it is
+# built: how fast can host threads compute one cold expert from its WARM
+# copy, against the measured cost of moving it. CPU-only, links krk_core
+# alone, so it can be run without the GPU being busy.
+add_executable(kraken-cpu-expert-ceiling tools/cpu_expert_ceiling.cpp)
+target_link_libraries(kraken-cpu-expert-ceiling PRIVATE krk_core)
+
 if(KRK_HIP_AVAILABLE)
     add_executable(kraken-oracle tools/oracle_probe.cpp)
     target_link_libraries(kraken-oracle PRIVATE krk_core krk_hip)

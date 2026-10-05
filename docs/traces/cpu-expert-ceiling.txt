@@ -1,0 +1,108 @@
+CPU expert ceiling — is the Fiddler fallback worth building?
+===========================================================
+Measured 2026-10-05 with tools/cpu_expert_ceiling.cpp
+(`kraken-cpu-expert-ceiling`), on laguna-xs2-Q4_K_M.gguf, layer 3,
+routed = 312 experts/token, 2 interleaved reps, nothing else running.
+
+The geometry, from the file:
+    n_in 2048, n_ff 512, 256 experts/layer
+    Q4_K, 2,039,808 bytes per expert (1.945 MiB, 3 slices), 2.10 M params
+
+The measurement is one expert for one activation row, row-wise exactly as
+gemv_kernel does it (dequantize one row, dot it, move on), using the real
+dequantiser from src/quant.cpp, on a pageable host copy of the slice --
+which is byte-for-byte what ExpertCache's WARM tier holds. No GPU is
+involved and none is needed.
+
+
+RESULT
+------
+thr  ms/expert  experts/s  cold/tok ms  tok/s overlap  tok/s serial
+ 1      2.448      408.5       274.97          3.3          3.1
+ 2      2.477      807.5       139.09          6.0          5.3
+ 4      2.608     1533.9        73.23         10.1          8.2
+ 8      2.693     2971.0        37.81         15.6         11.5
+12      2.996     4005.4        28.04         18.4         13.0
+16      3.393     4715.4        23.82         20.0         13.8
+24      3.209     7480.0        15.02         24.3         15.7
+32      4.625     6918.6        16.23         23.6         15.4
+32      5.153     6209.7        18.09         22.6         15.0
+(rep 2, 24 threads: cold/tok 14.66 ms, overlap 24.5, serial 15.8 -- within 3%)
+
+Baseline being beaten, measured the same week on the same machine:
+    current decode                    13.2-13.3 tok/s  (75.1-75.7 ms/tok)
+    of which read + H2D                48.8 ms/tok
+    of which everything else           26.2 ms/tok
+
+Scaling is 18.3x on 24 threads and then REVERSES -- 32 threads is slower
+than 24 (15.0-16.2 vs 14.7-15.0 ms/tok) because the machine reports 32
+hardware threads and the dequantiser is already memory-bound at that
+point. 24 is the setting.
+
+
+THE ANSWER, AND IT CORRECTS SOMETHING I SAID
+--------------------------------------------
+I claimed in an earlier turn that the CPU expert fallback is "exactly the
+6-10x lever". **That is wrong for this model on this machine.**
+
+    best overlap case   13.2 -> 24.3 tok/s   = 1.84x
+    best serial case    13.2 -> 15.8 tok/s   = 1.20x
+
+The arithmetic that says why, and it is not a measurement caveat:
+
+  * 112 cold experts/token x 1.945 MiB = 218 MiB/token of weight, but
+  * that weight is only 2.10 M params. At 24 threads the machine retires
+    one 2.10 M-param dequant+matvec in 3.2 ms, i.e. 6.9 GFLOP/s/thread
+    x 24 = ~165 GFLOP/s against 15.0 GB/s of weight traffic.
+
+  The GPU does the same 218 MiB in 4.2 ms (143.9 GB/s measured). So the
+  CPU is ~3.6x slower than the GPU on this workload and cannot hide that
+  completely. The 250:1 operand-to-weight argument that justifies running
+  the expert on the CPU at all is still right -- it is why the CPU path
+  wins at all, instead of losing to read+xfer by 5x -- but "wins" is
+  48.8 -> 15.0 ms, not 48.8 -> ~0.
+
+WHAT THIS CHANGES ABOUT THE PRIORITY ORDER
+------------------------------------------
+The decode budget stops being "move weights" and becomes "the rest":
+
+    read + H2D        48.8 ms   -> CPU fallback replaces this with 15.0 ms
+    resident GPU work 26.2 ms   -> UNTOUCHED by the CPU fallback
+
+Once the fallback lands, 26.2 ms is 64% of the token and the ceiling is
+26.2 + 15.0 = 41.2 ms = 24.3 tok/s no matter how good the expert path gets.
+So the next lever is the 26.2 ms -- 3,700 launches per token, 40 blocking
+512-byte router downloads, 0.151 ms per barrier -- not a better expert
+cache. HIP graph capture plus a device-side routing plan attack exactly
+that, and together they are worth more than anything left in the expert
+path.
+
+Also worth recording: llama.cpp CPU-only does 16.3 tok/s on this same file
+doing EVERYTHING on the CPU, and the CPU fallback's serial case is 15.8.
+So the fallback's real, defensible win is that it puts the whole machine on
+the MoE and beats the best CPU-only baseline by ~1.5x, not that it is a
+6-10x decode speedup.
+
+
+WHAT THIS TOOL IS NOT
+---------------------
+A ceiling, not an implementation. It does not model VRAM residency, the
+WARM tier, routing, or the fact that the GPU cannot advance past a layer
+until that layer's cold experts are done (which is why the real answer sits
+between the overlap and serial columns). It also measures one layer; a
+different layer's expert could differ, though all Laguna MoE layers are
+built the same way.
+
+Two bugs in this tool were found and fixed while measuring it, both of
+which made the numbers wrong in opposite directions and are noted in the
+source so they are not reintroduced: aggregate throughput was normalised
+per thread instead of across threads (making 8 threads look slower than
+1), and it was then off by 1000x in the other direction (experts per
+millisecond printed as per second).
+
+
+GATE
+----
+    ninja rc=0, 0 `error:` lines
+    kraken-tests   2154/2154 rc=0
+    kraken-bench --gate rc=0

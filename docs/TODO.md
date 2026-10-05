@@ -839,3 +839,30 @@ So the fix is correct per spec and is a no-op for Laguna XS.2 at 96 GiB. It
 binds for a 48 GiB box running a MoE whose corpus exceeds 12 GiB, and for
 long generations or larger models. Unproven benefit here; do not cite it as
 a speedup.
+
+### Update (2026-10-05): CPU expert fallback — CEILING MEASURED, and it is 1.2-1.85x, not 6-10x
+
+`tools/cpu_expert_ceiling.cpp` (`kraken-cpu-expert-ceiling`) measures one
+Laguna XS.2 expert for one activation row, row-wise, with the real
+dequantiser, on a pageable copy of the slice — byte-for-byte what the WARM
+tier holds. Full numbers in `docs/traces/cpu-expert-ceiling.txt`.
+
+    24 threads   3.209 ms/expert   7480 experts/s   15.02 ms/token of CPU work
+    32 threads   4.625 ms/expert   6918 experts/s   (worse: already memory-bound)
+
+    current decode                    13.2-13.3 tok/s
+    CPU fallback, perfect overlap     24.3 tok/s   = 1.84x
+    CPU fallback, no overlap          15.8 tok/s   = 1.20x
+
+**This corrects the earlier claim in this file that the CPU fallback is
+"exactly the 6-10x lever".** The 250:1 operand-to-weight argument is why
+the CPU path wins at all, but it is not why it wins by 6x: 218 MiB/token of
+cold weight is only 2.10 M params per expert, and the CPU retires it at
+~165 GFLOP/s aggregate against the GPU's 143.9 GB/s of the same bytes. The
+GPU is ~3.6x faster on this workload, so the CPU path replaces 48.8 ms with
+15.0 ms and not with ~0.
+
+Consequence for sequencing: once the fallback lands, the 26.2 ms/token of
+resident GPU work is 64% of the budget and becomes the dominant term.
+Graph capture + the device-side routing plan attack that; nothing left in
+the expert cache does. Re-order the work accordingly.
