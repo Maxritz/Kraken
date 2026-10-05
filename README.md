@@ -262,6 +262,9 @@ skipping only the 3-part Laguna shard set, which is not a loadable model).
 the table. Dense rows are VRAM-bound decode; MoE rows (marked \*) page experts
 through the default budget, so their prefill includes cold-cache paging.
 
+Each sweep row is **one run**; the headline rows above are the only ones with
+ranges. Treat any two sweep rows closer than 2–5% on prefill as noise.
+
 | file | size | arch · layers / embd | prompt tok | prefill tok/s | decode tok/s | load ms |
 |---|---|---|---|---|---|---|
 | SmolLM2-135M-Instruct.IQ4_XS | 0.09 GB | llama · 30 / 576 | 51 | 2301 | 482 | 344 |
@@ -275,7 +278,7 @@ through the default budget, so their prefill includes cold-cache paging.
 | Spark_one.Q6_K | 2.54 GB | qwen2 · 36 / 2048 | 55 | 607 | 122 | 2384 |
 | qwen3.5-4b-nvfp4 | 2.54 GB | qwen35 · 32 / 2560 | 55 | 947 | 128 | 1066 |
 | Samastam-2.5B-Q8_0 | 2.69 GB | llama · 28 / 2048 | 122 | 2546 | 160 | 2407 |
-| VibeThinker-3B.Q8_0 | 3.29 GB | qwen2 · 36 / 2048 | 55 | 1464 | — † | 1925 |
+| VibeThinker-3B.Q8_0 | 3.29 GB | qwen2 · 36 / 2048 | 55 | 1464 | — (no decode; warmup-token artifact on short prompt) | 1925 |
 | Qwen3-4B-Instruct-2507-Q6_K | 3.31 GB | qwen3 · 36 / 2560 | 55 | 459 | 99 | 2113 |
 | qwen2.5-coder-3b-instruct-q8_0 | 3.62 GB | qwen2 · 36 / 2048 | 55 | 1407 | 124 | 2388 |
 | qwen3-1.7b-stem-proof-f16 | 4.07 GB | qwen3 · 28 / 2048 | 55 | 1481 | 132 | 3614 |
@@ -295,7 +298,7 @@ through the default budget, so their prefill includes cold-cache paging.
 | omnicoder-9b-q6_k | 7.36 GB | qwen35 · 32 / 4096 | 55 | 294 | 60 | 4395 |
 | Qwen3.8-9B-Q6_K | 7.56 GB | qwen35 · 32 / 4096 | 55 | 320 | 60 | 8041 |
 | Qwen3-30B-A3B Q2_K \* | 11.26 GB | qwen3moe · 48 / 2048 | 55 | 9 | 21 | 1182 |
-| Qwen2.5-Coder-32B Q4_K_M ‡ | 19.85 GB | qwen2 · 64 / 5120 | 55 | 44 | 1.0 | 17319 |
+| Qwen2.5-Coder-32B Q4_K_M ‡ | 19.85 GB | qwen2 · 64 / 5120 | 55 | 44 | 1.0 (oversubscribed — larger than VRAM; do not use as a score) | 17319 |
 | qwable-v1-mxfp4_moe \* | 20.26 GB | qwen35moe · 40 / 2048 | 55 | 6 | 13 | 4737 |
 | laguna-xs2-Q4_K_M \* | 20.27 GB | laguna · 40 / 2048 | 51 | 4 | 9 | 1871 |
 | Unsloth-Ornith-1.5-35B-A3B Q4_K_XL \* | 22.36 GB | qwen35moe · 40 / 2048 | 55 | 7 | 17 | 2620 |
@@ -303,10 +306,15 @@ through the default budget, so their prefill includes cold-cache paging.
 | Tiel-Coder-35B-A3B-MTP-APEX \* | 26.67 GB | qwen35moe · 40 / 2048 | 55 | 5 | 15 | 3146 |
 | ornith-35b-Q8_0 \* | 36.90 GB | qwen35moe · 40 / 2048 | 55 | 3 | 10 | 2665 |
 
-† VibeThinker emits EOS on the bench prompt, so there is nothing to time: honest
-prefill, no decode. ‡ The 32B dense model is larger than VRAM (18.5 GiB resident
-on a 15.9 GiB card) and runs oversubscribed at 1 tok/s — it proves the loader
-refuses nothing silently, not that this is a configuration anyone should use.
+† The fixed `--bench` prompt tokenizes to 55 tokens here, prefill runs fine (1591
+tok/s), and the GPU backend is fine — `--bench` still emitted 0 decode tokens.
+With a normal prompt (`x` → 1 tok, forced decode) the same model decodes at
+~124 tok/s, so the 0.0 is a prompt-training-format artifact, not a kernel or MoE
+path defect. The row is kept for prefill honesty; treat its decode column as “no
+decode measured”, not a throughput number.
+‡ The 32B dense model is larger than VRAM (18.5 GiB resident on a 15.9 GiB card)
+and runs oversubscribed at 1 tok/s. It stays in the table to show the loader
+refuses nothing silently; it is not a configuration anyone should use.
 
 NVFP4 and MXFP4 dequantize fine (the 4B/9B NVFP4 and the MXFP4 MoE rows above);
 `nemotron-3-nano-4b-NVFP4` below is refused for its Mamba blocks, not its quant.

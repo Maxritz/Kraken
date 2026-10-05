@@ -828,8 +828,8 @@ void Engine::configure_expert_cache() {
     //
     // The rule: plan for 6 GiB of device memory in total, and step up by 2 GiB
     // only when there is both the headroom for it and a model that needs it,
-    // never above 12 GiB. A small model on a large card therefore uses a few
-    // hundred MiB, a large MoE on a 16 GiB card stops at 12 GiB instead of
+    // never above 14 GiB. A small model on a large card therefore uses a few
+    // hundred MiB, a large MoE on a 16 GiB card stops at 14 GiB instead of
     // filling the card, and a model that genuinely needs more than 6 GiB gets
     // it in 2 GiB increments rather than all at once. Everything the run does
     // not plan for -- the KV cache the user asked for, a second application,
@@ -841,14 +841,14 @@ void Engine::configure_expert_cache() {
     const size_t gib = static_cast<size_t>(1) << 30;
     const size_t kCapFirst = 6 * gib;
     const size_t kCapStep = 2 * gib;
-    // The ceiling was 12 GiB, chosen against a 15.9 GiB card for the big MoEs.
-    // Measured against the real files, that ceiling is what keeps a *small* MoE
-    // streaming forever: Laguna XS 2.1 IQ3_XXS carries 11.20 GiB of experts and
-    // 0.86 GiB of dense weights, so its whole routed set needs 12.06 GiB of
-    // budget -- and at the 12 GiB cap it sat at 81.6% resident, re-reading
-    // hundreds of experts from disk on every token even though the card had the
-    // room. A card that can hold the model should hold it: a miss that costs a
-    // file read is only worth its VRAM when the set genuinely does not fit.
+    // The ceiling was raised from 12 GiB to 14 GiB, chosen against a 15.9 GiB
+    // card for the big MoEs. Measured against the real files, the 12 GiB ceiling
+    // is what keeps a *small* MoE streaming forever: Laguna XS 2.1 IQ3_XXS carries
+    // 11.20 GiB of experts and 0.86 GiB of dense weights, so its whole routed set
+    // needs 12.06 GiB of budget -- and at the 12 GiB cap it sat at 81.6% resident,
+    // re-reading hundreds of experts from disk on every token even though the card
+    // had the room. A card that can hold the model should hold it: a miss that costs
+    // a file read is only worth its VRAM when the set genuinely does not fit.
     const size_t kCapMax = 14 * gib;
     const size_t kReserve = 512u * 1024u * 1024u; // driver + fragmentation
     const size_t total_bytes = model_.total_expert_bytes();
@@ -1067,12 +1067,35 @@ void Engine::configure_expert_cache() {
                       " + WARM %.0f MiB pageable%s",
                       static_cast<f64>(warm) / (1024.0 * 1024.0),
                       prefetch ? " (prefetched)" : "");
-    KRK_INFO("expert cache: budget %.1f MiB%s, %d experts x top-%d, %d layers, "
+    KRK_INFO(             "expert cache: budget %.1f MiB%s, %d experts x top-%d, %d layers, "
              "policy LFU+aging (pin at %u hits, decay every %u); cold reads are "
              "read-through",
              static_cast<f64>(budget) / (1024.0 * 1024.0), warm_note, mc.n_expert,
              mc.n_expert_used, mc.n_layer, ExpertCache::kPinThreshold,
              ExpertCache::kPinDecay);
+    if (budget < total_bytes && total_bytes > 0) {
+        if (be_->caps().vram_free == 0) {
+            KRK_WARN("expert cache: the routed set is %.1f GiB and this "
+                     "machine cannot tell the device capacity, so the device "
+                     "budget stays near its host-RAM fallback. %s",
+                     static_cast<f64>(total_bytes) / (1024.0 * 1024.0 * 1024.0),
+                     warm >= total_bytes
+                         ? "the WARM tier holds the full set so every cold read is a promotion"
+                         : "set the --expert-cache-mb / --vram-cap-mb / --expert-warm-mb flags, or the K/V cache size, to cover the routed set on device");
+        } else {
+            const f64 frac = static_cast<f64>(budget) /
+                             static_cast<f64>(total_bytes);
+            KRK_WARN("expert cache: the routed set is %.1f GiB and the device "
+                     "budget is only %.1f GiB (%.0f%%) — the cache is spending its "
+                     "budget churning rather than holding. %s",
+                     static_cast<f64>(total_bytes) / (1024.0 * 1024.0 * 1024.0),
+                     static_cast<f64>(budget) / (1024.0 * 1024.0 * 1024.0),
+                     frac * 100.0,
+                     warm >= total_bytes
+                         ? "the WARM tier still holds the full set, so a device miss promotes from RAM instead of reading the file"
+                         : "raise --expert-cache-mb, lower --ctx / --kv-hot-mb, or use a model whose routed set fits the card");
+        }
+    }
 }
 
 bool Engine::load_dflash(const std::string &path, std::string *err) {

@@ -107,7 +107,7 @@ void usage() {
         "  --vram-cap-mb N       total device memory to plan for, in MiB. 0 uses\n"
         "                        the policy: 6 GiB, then +2 GiB at a time while\n"
         "                        the card has room and the model needs it, up to\n"
-        "                        12 GiB. Anything the run does not plan for -- a\n"
+        "                        14 GiB. Anything the run does not plan for -- a\n"
         "                        long KV context, another application -- is what\n"
         "                        the headroom is for.\n"
         "  --expert-cache-slots N  cap resident (layer, expert) slots (0 = auto)\n"
