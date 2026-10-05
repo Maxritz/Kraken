@@ -1042,3 +1042,39 @@ T23  RDNA2 decode is 1.26x behind (49.1 vs 61.8 tok/s). Much less bad than the
 T24  Length-matched prefill for T22, as above.
 T25  Root-cause G13 with a per-layer dump against the llama.cpp HIP reference,
      not against kraken's own cpu arm.
+
+--------------------------------------------------------------------------------
+Session entry: expert cache reimaging -- baseline measurement
+Evidence: measured on maclin, olmoe-1b-7b-0924-q4_k_m-imat.gguf, gfx1031
+
+G16  The expert cache is not compute-bound and not bandwidth-bound. It is one
+     synchronous blocking read. Per-op profile of a 3-step decode window,
+     3,817 ops, 1,341.0 ms of device time:
+
+       op                calls    dev_ms   ms/call    share
+       warm_read           48    1276.7     26.6     95.2%
+       gemm(gemv)       1323      30.1      0.02      2.2%
+       gather_rows        384       4.5               0.3%
+       scatter_axpy       384       4.4               0.3%
+       silu_mul           384       3.5               0.3%
+
+     warm_read's host_ms (1262.8) is within 1% of its dev_ms, so the device
+     timeline is not the story -- the host is sitting in a blocking read and
+     the GPU has nothing queued. This is the concrete form of "the MoE step is
+     orchestrated on the host", and it is why the same file decodes at 26 tok/s
+     here while a dense model of similar size decodes at 47.
+
+G17  The read path is ~20x slower than its own transfer rate implies. The run
+     moves 353.02 MiB/token off the file at 7.0 GB/s (508.8 us/expert for
+     promotions), which is ~50 ms/token -- against a measured 988.6 ms/step.
+     68.8% of 3,392 acquires are COLD misses, so the volume itself is the other
+     half of it. Both ends need work: the miss rate, and the per-read cost.
+
+T26  Attack G16/G17. The ordered question is which dominates the 988.6 ms:
+     raise the HOT hit rate, or make each read concurrent and overlapped.
+     48 reads at 26.6 ms each is a serialisation signature, so the read path
+     (reader pool, per-file HANDLE serialisation on Windows, device barrier)
+     is the first thing to instrument, not the cache policy.
+T27  Measure the expert corpus against the cache on a fast filesystem before
+     concluding anything about the policy: this baseline is on an ntfs3 mount
+     reading at 0.1-0.3 GB/s, which conflates the filesystem with the cache.
