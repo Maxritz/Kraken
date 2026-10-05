@@ -1,0 +1,211 @@
+RX 9070 XT (gfx1201) — unblocking the Windows build, and the WMMA prefill GEMM
+================================================================================
+
+Host: Windows 11, C:/Users/rr/OneDrive/Desktop/kraken
+GPU:  AMD Radeon RX 9070 XT, gfx1201, RDNA4, 64 CU, wave32
+Tool: ROCm 10 runtime pack at G:/ROCM10RT-gfx1201 (HIP 7.16.26323, SDK
+      7.16.26332), hipcc at lib/llvm/bin/clang++.exe
+
+Everything in this file was measured on the 9070 XT. Earlier session numbers
+came from maclin (6700 XT, gfx1031); the two are never mixed below.
+
+
+1. THE BUILD WAS BROKEN, AND NOTHING ON THIS CARD HAD BEEN VERIFIED
+--------------------------------------------------------------------------------
+The first failure was not the compiler. The device bitcode was unreachable:
+
+    clang++: error: cannot find ROCm device library; provide its path via
+    '--rocm-path' or '--rocm-device-lib-path', or pass '-nogpulib'
+
+ROCm 10 keeps the libraries at <rocm>/lib/llvm/amdgcn/bitcode. The compiler
+searches <rocm>/amdgcn/bitcode, and only finds the ROCm 10 layout when
+ROCM_PATH names the install root. G: is not the default prefix and the pack
+is not on PATH, so every device compile failed.
+
+CMakeLists.txt now derives the root from the HIP compiler CMake actually
+resolved and passes --rocm-device-lib-path explicitly. Two details that
+were needed to make it actually work:
+
+  * The flag must be applied with add_compile_options/add_link_options, not
+    target_compile_options(krk_hip ...). CMake compiles the executable
+    targets' .cpp files with amdclang++ and an injected `-x hip`, so kraken,
+    kraken-bench and kraken-oracle are device compiles too and they failed
+    identically. Link options are needed as well: the device-link step
+    resolves the same libraries.
+
+  * A second tier was required on this host. At 17:16 on 2025-10-05 the
+    directory G:/ROCM10RT-gfx1201/lib/llvm/amdgcn/bitcode was emptied while
+    the tree above it stayed intact, and device compiles started failing
+    again with the same message. The per-arch libraries are not pack
+    specific, so CMake now falls back to a sibling pack sharing the
+    compiler's product prefix (here ROCM10RT-gfx1031), which keeps the ROCm
+    major version matched to the bitcode it has to load. Verified: the
+    gfx1031 pack's oclc_isa_version_1201.bc compiles gfx1201 device code.
+
+Build after the fix:
+
+    ninja -C build-hip kraken kraken-tests kraken-bench kraken-oracle
+      rc=0, 0 lines matching 'error:'
+    kraken-tests        rc=0, 2154/2154 checks passed
+    kraken-bench --gate rc=0
+
+
+2. THE SCORECARD IS THE 9070 XT, CONFIRMED BY MEASUREMENT
+--------------------------------------------------------------------------------
+The reported scorecard (Qwen3-8B 642-697 prefill / 87-88 decode) reproduces
+here. First clean run after the build fix:
+
+    HIP 7.16.26323 | AMD Radeon RX 9070 XT | gfx1201 | 64 CU | 15.9 GiB VRAM
+    prefill  55 tokens in 91.9 ms  (598.8 tok/s)
+    decode   256 tokens in 2869.4 ms over 255 timed steps = 88.9 tok/s
+
+So those numbers were this card's, and the gap being discussed is real and
+reproducible on this host: 598.8 tok/s here against a reported 8528 tok/s for
+llama.cpp on the same card and model — about 14x.
+
+The earlier suggestion that the scorecard was "almost certainly the 9070 XT"
+was a guess presented as fact. It was unnecessary: the build had to be fixed
+and the numbers simply re-run.
+
+
+3. WHICH RUNG IS ACTUALLY RUNNING
+--------------------------------------------------------------------------------
+Interleaved, run-by-run (KRK_GEMM_PATH), 55-token prefill, Qwen3-8B-Q4_K_M:
+
+    rep1 wmma   55 tok in 84.4 ms      rep1 dp4a  55 tok in 226.7 ms
+    rep2 wmma   55 tok in 85.1 ms      rep2 dp4a  55 tok in 228.0 ms
+    rep1 simt   55 tok in 261.9 ms     rep2 simt  55 tok in 260.5 ms
+
+WMMA is already first in the ladder and already 3.1x the SIMT tile. The gap
+to llama.cpp is not a missing rung.
+
+
+4. WHERE THE TIME WENT: 6.5% OF THE TENSOR PEAK
+--------------------------------------------------------------------------------
+Qwen3-8B is 16.4 GFLOP/token. At 598.8 tok/s that is 9.8 TFLOP/s. The
+9070 XT's fp16 tensor path is roughly 163 TFLOP/s, so the kernel was at
+about 6% of what the silicon can do, while llama.cpp sits near 86%.
+
+kraken-bench on the ffn gate/up GEMM [12288 x 4096], rows=55, four dtypes in
+one process:
+
+    q4_k    392.03 us   28.31 MB    72.2 GB/s   14.12 TFLOP/s
+    f16     629.93 us  100.66 MB   159.8 GB/s    8.79 TFLOP/s
+    q6_k   1160.49 us   41.29 MB    35.6 GB/s    4.77 TFLOP/s
+    q8_0    380.48 us   53.48 MB   140.6 GB/s   14.55 TFLOP/s
+
+The f16 row is the informative one. F16 weights change the staging byte
+count by 3.6x and leave the WMMA instruction count untouched. Feeding the
+same kernel more data made it SLOWER. A kernel that is neither compute-
+bound nor dequant-bound, and that loses throughput to wider data, is bound
+by the load path.
+
+
+5. AN INSTRUMENT THAT WAS WRONG, AND WHY IT WAS REMOVED
+--------------------------------------------------------------------------------
+gemm_wmma_kernel already has a MODE parameter (1 = stage only, 2 = compute
+only). Wiring it to an environment variable produced this, 3 reps
+interleaved:
+
+    full        354-398 us
+    staging       5.9-6.6 us
+    tensor        6.3-13.1 us
+
+That is impossible and the arithmetic says why. MODE 2 skips staging, so
+nothing inside the k_tiles loop writes xs or ws, every fragment load is
+loop-invariant, and the compiler legally hoists the whole WMMA loop out.
+MODE 2 timed one round instead of 32 and implied 1015 TFLOP/s — six times
+the hardware peak. MODE 1 is not trustworthy either.
+
+Both the instrument and the fragment-load vectorisation it accompanied were
+measured flat-to-false and have been removed. The vectorised fragment loads
+in particular changed nothing (13.56 vs 14.12 TFLOP/s) because -O3 was
+already merging those scalar loads into vector loads. Neither is in the diff.
+
+
+6. THE FIX: STAGE THE ACTIVATION TILE IN 128-BIT STORES
+--------------------------------------------------------------------------------
+The activation tile is the larger half of the staging traffic. The grid is
+(12288/BN) * (rows/BM) = 192 column blocks, and every one of them re-reads
+the same A rows, so activations move ~98 MB against ~28 MB of weights.
+
+The old loop handed each thread 16 separate 2-byte elements per K tile.
+It now hands each thread 8 consecutive halves, making each store 128 bits
+wide. Same bytes, same values, same order — a store-width change, not a
+reordering — so the tile is bit-identical. The vector path is guarded on
+(n_in % 8 == 0, x 16-byte aligned, k_n % 8 == 0) and falls back to the
+original scalar loop otherwise.
+
+Interleaved before/after, two saved binaries alternating run-by-run,
+5 reps, kraken-bench --iters 30, shape 55/12288/4096, q4_k:
+
+    rep1 before  368.16 us  15.04 TFLOP/s  76.9 GB/s  chk=6.60e-04
+    rep1 after   203.77 us  27.17 TFLOP/s 138.9 GB/s  chk=6.60e-04
+    rep2 before  362.02 us  15.29 TFLOP/s  78.2 GB/s  chk=6.60e-04
+    rep2 after   190.81 us  29.02 TFLOP/s 148.4 GB/s  chk=6.60e-04
+    rep3 before  413.83 us  13.38 TFLOP/s  68.4 GB/s  chk=6.60e-04
+    rep3 after   212.92 us  26.00 TFLOP/s 133.0 GB/s  chk=6.60e-04
+    rep4 before  327.49 us  16.91 TFLOP/s  86.4 GB/s  chk=6.60e-04
+    rep4 after   194.65 us  28.44 TFLOP/s 145.4 GB/s  chk=6.60e-04
+    rep5 before  435.08 us  12.73 TFLOP/s  65.1 GB/s  chk=6.60e-04
+    rep5 after   226.04 us  24.49 TFLOP/s 125.3 GB/s  chk=6.60e-04
+
+Median 368.16 -> 203.77 us, 1.81x. The distributions do not overlap: the
+slowest after-sample (226.04) is faster than the fastest before-sample
+(327.49). chk is identical in all ten runs.
+
+This card has real run-to-run spread — 181 to 291 us was seen on one
+unmodified build — so medians and interleaving are load-bearing here, and
+single samples are not evidence.
+
+End to end, Qwen3-8B-Q4_K_M, 55-token prefill, 4 reps interleaved:
+
+    before  627.5  628.8  606.7  620.7   median 624.1 tok/s
+    after   837.6  833.7  798.4  823.8   median 828.7 tok/s   1.33x
+
+Generated text is unchanged: a 40-token greedy completion of "The capital of
+France is" is byte-identical between the two binaries, the only diff being
+the timing lines in [stats].
+
+Shape sweep (q4_k, --iters 20). No shape regressed; rows=1 is the gemv
+kernel and is untouched, as expected:
+
+    rows/out/in     before      after    speedup
+       1/4096/4096    16.11 us   16.58 us   0.97x  (gemv, noise)
+      55/1024/4096   100.82 us   46.43 us   2.17x
+      55/4096/4096   138.76 us   68.62 us   2.02x
+      55/12288/4096  504.14 us  191.15 us   2.64x
+      55/4096/12288  398.28 us  316.41 us   1.26x
+     256/4096/4096   544.92 us  251.10 us   2.17x
+    2048/4096/4096  3998.47 us 1722.41 us   2.32x
+
+Peak reached 39.90 TFLOP/s at rows=2048, up from 17.19.
+
+Gate after the change: build rc=0 / 0 errors, kraken-tests 2154/2154,
+kraken-bench --gate rc=0.
+
+
+7. WHAT IS STILL MISSING
+--------------------------------------------------------------------------------
+Prefill moved 598.8 -> 828.7 tok/s. The gap to the reported llama.cpp 8528
+tok/s on this card is still about 10x, so the WMMA GEMM is not the last
+thing standing. What the measurements above say is left, in order:
+
+  * No LDS double buffering. The kernel is stage -> sync -> WMMA -> sync per
+    K tile, so the staging chain and the tensor work never overlap. LDS at
+    BK=128 is 26 KB, and gfx1201 gives 64 KB per CU, so a second buffer fits
+    but only at one resident block per CU. Whether that trade pays needs
+    measuring, not assuming — see the MODE instrument problem in section 5
+    for why the obvious way to measure it does not work.
+
+  * A is re-read once per column block (192x for the gate/up shape). Raising
+    BN, or scheduling blocks so a column of the grid keeps its A tile in L2,
+    attacks the same traffic the fix above just halved.
+
+  * The generic staging path (dequant_chunk_dev) is much weaker than the
+    specialised Q4_K pipeline: q6_k costs 1160 us against q4_k's 392 us for
+    similar byte counts. Qwen3-8B-Q4_K_M has Q6_K tensors (attn_v, ffn_down),
+    so that gap is live on this model.
+
+The kernel is still at roughly 24-30 TFLOP/s where the card can do ~163, so
+there is a great deal of headroom above what is recorded here.

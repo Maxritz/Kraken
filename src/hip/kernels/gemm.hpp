@@ -508,13 +508,51 @@ __global__ void __launch_bounds__(CFG::THREADS)
 
         if constexpr (MODE != 2) {
         // ---- stage the activation tile (BM x BK), zero past the row end ----
-        for (int i = tid; i < BM * BK; i += THREADS) {
-            const int r = i / BK;
-            const int c = i % BK;
-            const i64 gr = row_base + r;
-            xs[r][c] = (gr < rows && k0 + c < k_n)
-                           ? x[gr * n_in + k_off + k0 + c]
-                           : static_cast<_Float16>(0.0f);
+        //
+        // MEASURED (9070 XT, gfx1201, Qwen3-8B ffn_up [12288x4096], rows=55):
+        // feeding this kernel F16 weights -- same WMMA count, 3.6x the
+        // staging bytes -- made it SLOWER (8.90 vs 13.56 TFLOP/s), so the
+        // limit is the staging path, not dequant arithmetic and not the
+        // tensor issue rate. The activation tile is the bigger half of
+        // that traffic: the grid is (12288/BN) * (rows/BM) = 192 column
+        // blocks, and every one of them re-reads the same A rows, so the
+        // activation side moves ~98 MB against ~28 MB of weights.
+        //
+        // Each thread used to write 16 separate 2-byte elements per round.
+        // Handing it 8 consecutive halves instead makes each of those 16
+        // stores one 128-bit store, with the same bytes and the same
+        // values -- this is a store-width change, not a reordering, so
+        // the tile contents are bit-identical to the scalar path.
+        constexpr int kAV = 8;                          // halves per store
+        constexpr int kATPR = BK / kAV;                 // threads per row
+        constexpr int kARows = THREADS / kATPR;         // rows per pass
+        static_assert(kAV <= BK && (BK % kAV) == 0, "BK must tile by 8");
+        static_assert((THREADS % kATPR) == 0, "THREADS must tile the row");
+        const bool a_vec = (n_in % kAV) == 0 &&
+                           (reinterpret_cast<uintptr_t>(x) & 15u) == 0 &&
+                           (k_n % kAV) == 0;
+        if (a_vec) {
+            const int c0 = (tid % kATPR) * kAV;
+            for (int r = tid / kATPR; r < BM; r += kARows) {
+                const i64 gr = row_base + r;
+                if (gr < rows && k0 + c0 < k_n)
+                    *reinterpret_cast<v8half *>(&xs[r][c0]) =
+                        *reinterpret_cast<const v8half *>(
+                            &x[gr * n_in + k_off + k0 + c0]);
+                else
+#pragma unroll
+                    for (int e = 0; e < kAV; e++)
+                        xs[r][c0 + e] = static_cast<_Float16>(0.0f);
+            }
+        } else {
+            for (int i = tid; i < BM * BK; i += THREADS) {
+                const int r = i / BK;
+                const int c = i % BK;
+                const i64 gr = row_base + r;
+                xs[r][c] = (gr < rows && k0 + c < k_n)
+                               ? x[gr * n_in + k_off + k0 + c]
+                               : static_cast<_Float16>(0.0f);
+            }
         }
 
         // ---- stage the dequantized weight tile (BN x BK) ----
