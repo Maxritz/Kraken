@@ -1,0 +1,92 @@
+A reference-logits oracle for this machine
+==========================================
+
+Why
+---
+The b11146 binaries in H:/LLAMA-Bins cannot dump logits (`--logits-file`
+exists only in the source), which is why every kraken-vs-llama.cpp
+comparison so far was text against text. The source tree on this machine
+(H:/LLAMA-Bins/llama.cpp, ggml-org master) can be built CPU-only, and its
+llama-perplexity writes all logits when asked. That turns "the sentence
+matches" into "the distribution matches".
+
+How to build it (the two traps)
+-------------------------------
+    CL=G:/ROCM10RT-gfx1201/lib/llvm/bin
+    cmake -B H:/LLAMA-bins/llama.cpp/build-cpu2 -S H:/LLAMA-bins/llama.cpp \
+        -G Ninja -DCMAKE_C_COMPILER=$CL/clang.exe \
+        -DCMAKE_CXX_COMPILER=$CL/amdclang++.exe \
+        -DCMAKE_LINKER=$CL/lld-link.exe \
+        -DGGML_HIP=OFF -DGGML_CUDA=OFF -DGGML_OPENMP=OFF \
+        -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF \
+        -DCMAKE_BUILD_TYPE=Release
+    CMAKE_BUILD_PARALLEL_LEVEL=20 cmake --build \
+        H:/LLAMA-bins/llama.cpp/build-cpu2 --target llama-perplexity
+
+  1. The default configure picks `C:/Strawberry/c/bin/gcc.exe` (an ancient
+     MinGW) and dies on THREAD_POWER_THROTTLING_STATE. Point the three
+     tools at the ROCm LLVM that kraken itself uses.
+  2. OpenMP then resolves to Strawberry's libgomp and the link fails on
+     `__kmpc_*`. `-DGGML_OPENMP=OFF` fixes it; the CPU oracle does not
+     need threads.
+
+How to run it
+-------------
+`--save-all-logits FILE` (same flag as `--kl-divergence-base`), with the
+prompt in a file. Perplexity scores the second half of each context
+window, so with `-c 28` the rows are positions 14..26 and the last row is
+the one that predicts the token after the prompt:
+
+    llama-perplexity.exe -m laguna-xs2-Q4_K_M.gguf -f /tmp/ppl_in.txt \
+        -c 28 --chunks 1 --save-all-logits /tmp/ref.bin
+
+File format (`_logits_` + header + payload):
+    char    "_logits_"[8]
+    int32   n_ctx
+    int32   n_vocab
+    int32   n_chunk
+    int32   tokens[n_chunk * n_ctx]
+    then, per scored position, one row of
+        float32 scale          // (max_logit - min_logit) / 65535
+        float32 min_log_prob   // log-prob at q = 0
+        uint16  q[n_vocab]     // round((logit - min_logit) / scale)
+
+    i.e. the values are quantized logits, not f16: log-prob(i) =
+    min_log_prob + q[i]*scale, monotone in logit. `min_logit` is clamped
+    to `max_logit - 16`, so the row resolves 16 logits in 65535 steps
+    (step 2.4e-4 here).
+
+laguna XS.2, ChatML prompt, 27 tokens
+-------------------------------------
+Reference row for position 26 (predicts the first answer token):
+
+    id      log-prob   gap
+    785     -0.0685     0
+    71070   -2.7973    -2.797
+    33586   -6.7119    -6.712
+    33905   -6.9446    -6.945
+    1686    -7.7034    -7.703
+    53128   -8.2430    -8.243
+
+kraken after the per-layer head fix (`--greedy --debug-topk`, step 0):
+
+    id      log-prob   gap
+    785     -0.0087     0
+    71070   -5.0087    -5.009
+    33586   -6.4932    -6.493
+    1686    -7.7432    -7.743
+    53128   -8.8369    -8.837
+
+Same top-1, same top-3 ids and the same ranking as the reference at
+positions 1-3; 1686 and 53128 sit within 0.04 and 0.6 of the reference
+gaps, and 71070 is 2.2 apart. The reference's own quantization step is
+2.4e-4, so none of that is quantization noise; it is the f16 device path
+(this model is the one docs/TODO.md records as fp16-vs-f32 sensitive)
+against the f32 CPU reference. The decision is what matters and it
+agrees, as does the greedy continuation.
+
+What this replaces
+------------------
+Before the fix the same probe would have shown the failure directly:
+kraken's step-0 order was 33586 first, 785 third at -6.0 — the reference
+has 785 first and 33586 third, i.e. the two swapped.
