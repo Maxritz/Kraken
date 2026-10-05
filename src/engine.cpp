@@ -848,17 +848,45 @@ void Engine::configure_expert_cache() {
     // stays off there; a tier that cannot hold a few experts only adds copies.
     // Host memory policy, the mirror of the device one above and for the same
     // reason: a tier that sizes itself from "whatever is free right now" is a
-    // decision made for the user, and on a 96 GiB box the old rule aimed at 45
-    // GiB of WARM. The budget is a quarter of installed RAM by default, never
-    // more than half of what is actually free, never more than the corpus, and
-    // --host-ram-mb replaces it outright. The mapping, the dense trunk and the
-    // OS live outside it, which is what the reserve is for.
+    // decision made for the user.
+    //
+    // The size comes from the tiering spec's RAM table, which is a SUBTRACTION
+    // and not a fraction:
+    //
+    //     warm = RAM - headroom - pinned_io - free_reserve
+    //
+    //     RAM    headroom  pinned  reserve   warm (spec)
+    //      24      5        2       3        14 GiB
+    //      32      7        2       3        20 GiB
+    //      48     10        3       3        32 GiB
+    //      96     16        6       4        70 GiB
+    //
+    // The old rule was RAM/4. On the 96 GiB class that is 24 GiB against a
+    // routed corpus of 19.4 GiB, which happens to fit only just and leaves the
+    // tier churning at the margin on a long conversation; on the 48 GiB class
+    // it is 12 GiB against a corpus that does not fit at all. The subtraction
+    // reproduces the table to within 5% at every class while staying smooth
+    // between them, and it is the same shape as the device policy above
+    // (reserve the things that are not cache, then spend what is left).
+    //
+    // Everything the run does not plan for -- the mapping, the dense trunk, the
+    // OS -- is what those four terms are.
     const size_t ram_total = host_total_bytes();
     size_t host_budget = 0;
     if (cfg_.host_ram_mb > 0) {
         host_budget = static_cast<size_t>(cfg_.host_ram_mb) * 1024u * 1024u;
     } else if (ram_total > 0) {
-        host_budget = ram_total / 4;
+        const size_t gib2 = static_cast<size_t>(1) << 30;
+        const size_t headroom = ram_total / 5;          // 4.8 / 6.4 / 9.6 / 19.2
+        const size_t pinned = ram_total / 16 < 6 * gib2 ? ram_total / 16 : 6 * gib2;
+        const size_t reserve = ram_total / 24 > 3 * gib2 ? ram_total / 24 : 3 * gib2;
+        const size_t spent = headroom + pinned + reserve;
+        host_budget = ram_total > spent ? ram_total - spent : ram_total / 2;
+        // Real OS pressure still wins over the table: the spec requires the
+        // warm tier to shrink when the machine is actually short, and the
+        // table is a plan for an idle box.
+        const size_t avail = host_available_bytes();
+        if (avail > 0 && host_budget > avail / 2) host_budget = avail / 2;
     }
 
     size_t warm = 0;

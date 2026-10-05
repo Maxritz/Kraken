@@ -817,3 +817,25 @@ Status of each spec item:
   15.9 GiB card this is affordable (KV was 320 MiB at ctx 2048), but on the
   6 GiB class the KV cache is the difference between running and not, and
   it is the reason the 6 GiB profiles in the spec cannot be honoured today.
+
+### Update (2026-10-05): RAM tier sizing — landed, but measured a NO-OP here
+
+`Engine::configure_expert_cache` now sizes the host budget by subtraction
+instead of `ram_total / 4`:
+
+    warm = RAM - headroom(RAM/5) - pinned(min(6 GiB, RAM/16)) - reserve(max(3 GiB, RAM/24))
+
+which reproduces the section 28 table (24->14, 32->20, 48->32, 96->70 GiB)
+to within 5% and stays smooth between the classes.
+
+**It changes nothing on this machine.** The WARM tier is clamped by "never
+cache past the corpus" and `total_expert_bytes()` is 18102 MiB, which both
+the old 24 GiB budget and the new 42.1 GiB budget exceed — so the tier is
+18102 MiB either way. A 256-token generation touches only ~4800 of the 9984
+expert slots (8731 MiB), so even forcing the tier down to 12288 MiB records
+**0 WARM evictions** and the same 24.3-24.6 tok/s decode.
+
+So the fix is correct per spec and is a no-op for Laguna XS.2 at 96 GiB. It
+binds for a 48 GiB box running a MoE whose corpus exceeds 12 GiB, and for
+long generations or larger models. Unproven benefit here; do not cite it as
+a speedup.
