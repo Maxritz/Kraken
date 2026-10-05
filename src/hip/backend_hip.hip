@@ -522,7 +522,12 @@ public:
     // the file path is unavailable, so callers never see an unfilled buffer.
     bool read_host(void *dst, const void *mapped_src, size_t bytes) override {
         if (bytes == 0) return true;
-        KRK_TIME_OP("warm_read");
+        // Distinct from the pool's label on purpose. Both were "warm_read",
+        // which made a profile unable to say whether a slow read was the
+        // single blocking reader or the pooled batch -- and those call for
+        // opposite fixes. A merged label is worse than no label: it reads
+        // like an answer.
+        KRK_TIME_OP("warm_read(single)");
         const u8 *s = static_cast<const u8 *>(mapped_src);
         if (pull_path_.empty() || !pull_map_ || pull_disabled_ || s < pull_map_ ||
             s + bytes > pull_map_ + pull_map_size_) {
@@ -554,7 +559,7 @@ public:
     // ring does: a Windows HANDLE serialises concurrent ReadFile.
     void read_host_batch(const ReadReq *reqs, int n) override {
         if (n <= 0) return;
-        KRK_TIME_OP("warm_read");
+        KRK_TIME_OP("warm_read(pool)");
         const int want = warm_readers_();
         if (n == 1 || want <= 1 || pull_path_.empty() || !pull_map_ ||
             pull_disabled_) {
