@@ -1,0 +1,49 @@
+The models said to be "not on this machine": verified
+=====================================================
+
+Searched for the four names that came up (an ngram sidecar, two Swift
+shards, a reap-288 GGUF, gpt-oss-120b) across every place a model can
+live here:
+
+    find /g -maxdepth 4 -iname "*swift*" -o -iname "*gpt-oss*" \
+                    -o -iname "*ngram*" -o -iname "*reap*"
+      /g/AMD-Ai/AMD-AI-COMPASS/.../RdpCaptureApi.dll      (unrelated dll)
+      /g/More-models/DeepSeek-V4-Flash-0731-K160-REAP-MTP-IQ2XXS-w2Q2K-AttnQ8-SExpQ8-ROCm.gguf
+      /g/TensorRT-LLM-RDNA/examples/ngram                 (example dir, not a model)
+      /g/TensorRT-LLM-RDNA/security_scanning/examples/ngram
+
+    find <kraken repo> <Downloads> -maxdepth 3 \
+         -iname "*swift*" -o -iname "*gpt-oss*" -o -iname "*.ngram" -o -iname "*ngram*"
+      (nothing)
+
+    ls G:/More-models          -> 70 entries, listed in full; no Swift, no
+                                  gpt-oss, no .ngram file, no *288* file
+    ls models/                 -> SmolLM2 x2, Qwen3.5-0.8B, Qwen3-MoE-4x0.6B
+    ls G:/More-models/dllm     -> Dream-v0-Instruct-7B, llada (HF dirs)
+    ls G:/More-models/Edge0-8b-a1b-preview
+                               -> HF safetensors (bailing_moe_v3), not GGUF
+
+Conclusion: none of the four is on this machine.
+
+What each of them is, so the names are not just lost
+----------------------------------------------------
+* **sidecar** is llama.cpp's term for a speculative-draft GGUF shipped
+  next to a target model (MTP / DFlash heads), not a full model. This box
+  has three drafter files already — the two laguna ones and
+  `Qwen3.8-27B-DFlash-bootstrap-Q8_0.gguf` — and several served models
+  that expect one (`Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf`,
+  `Qwen3.5-9B-DeepSeek-V4-Flash-MTP-Q3_K_M.gguf`). An *ngram* sidecar is
+  the same idea with an n-gram table instead of trained heads.
+* **Swift** is a Qwen3.8-Flash-Next derived family (`Swift-1.5-...`,
+  published as two shards plus a separate MTP sidecar on HF).
+* **REAP** is expert pruning (Routing-Expert Activation Pruning); a
+  "reap-288" file keeps 288 experts. The REAP file on this machine is a
+  DeepSeek-V4-Flash that keeps 160 (`K160`), i.e. a different member of
+  the same family.
+* **gpt-oss-120b** is OpenAI's open-weight MoE; the MXFP4 dequant that
+  landed earlier this session (docs/traces/mxfp4-rocmfpx-dequant.txt,
+  ggml type 39) exists in part *because* of that family, but the weights
+  themselves are not here.
+
+If any of them should become work items, they have to be fetched first;
+nothing on this machine can be run or inspected for them.

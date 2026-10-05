@@ -1,0 +1,70 @@
+Laguna-S-2.1 after the per-layer head fix: still garbage
+========================================================
+
+The XS.2 fix (docs/traces/laguna-per-layer-heads.txt) does not carry the
+118B model. Same prompt, same binary, greedy, 3-shard GGUF:
+
+    KRK_ALLOW_BIG=1 KRK_MAX_MB=32768 ./build-hip/kraken.exe \
+      -m G:/More-models/Laguna-S-2.1-UD-Q4_K_M-00001-of-00003.gguf \
+      --chat -p "what is the capital of france?" -n 8 --greedy
+
+    loaded Laguna-S-2.1 (laguna): 48 layers, 3072 embd, 72/8 heads, hd=128,
+        ff=12288, vocab=100352
+    hybrid attention: 3 of every 4 layers attend fully, the rest within
+        512 tokens; rope 128/128 dims at base 10000 on the windowed layers
+    rope: YaRN over 64 of 128 dims, base 500000, factor 32.0,
+        original context 8192, beta_fast/slow 32/1
+    router selection bias found as exp_probs_b.bias (no ffn_ prefix) ...
+    workspaces ready: chunk=256 ctx=4096 KV=768 MiB
+
+    KRAKEN 0.1.0 | AMD Radeon RX 9070 XT (gfx1201, RDNA4, 64 CU, ...)
+    <|UNK|> x8   (token id 0, eight times, end of stream)
+
+    prefill 27 tok in 65531.5 ms = 0.4 tok/s
+    decode  8 tok in 7310.1 ms = 1.1 tok/s (913.8 ms/tok)
+    cache   7236 acquires | HOT 33.0% | WARM 7.4% | COLD 59.6%
+    expert-path read 67980.6 ms (the whole prefill)
+
+Token 0 repeated means the logits are degenerate, not that a plausible
+answer is slightly off: this is a load-or-execute failure, not a
+rounding-level one. The same file produced the same `〈|UNK|〉` in the
+pre-fix baseline (docs/traces/baseline/kraken-laguna-s1.log), so the
+head-count fix is not a regression here — it just is not the (whole)
+cause.
+
+Ruled out so far
+----------------
+* **The weight-pull reader's single-file assumption.** `model.cpp` passes
+  `gguf_.file()` / `data_section_off()`, which are the *metadata* shard's
+  (3.6 MB here), so every tensor in shards 1 and 2 falls outside the
+  mapped range. That is handled: `load_pull_()` returns false and
+  `upload()` takes the direct `hipMemcpy` from the tensor's own mapping,
+  which is correct because `parse_shard()` folds each shard's data offset
+  into `t.data` per shard. The cost is speed (the pull pipeline never
+  applies to split models, hence the 1.0 GB/s upload and the 68 s expert
+  read), not correctness.
+* **The per-layer head count** — fixed, and independently confirmed on
+  XS.2 (same file geometry, 48/64).
+* **The router bias spelling** — the log shows the S-2.1 spelling is found
+  and used.
+* **Geometry parse** — 48 layers, 3072 embd, 12 global / 36 windowed,
+  72/8 heads, dense ff 12288, expert ff 1024, top-10 of 256, and the GGUF's
+  `attention.head_count` array (48,72,72,72 x12) all match the docs and
+  the reference loader.
+
+Still open
+----------
+Nothing has been proven about where the corruption starts. The next
+cheapest split is:
+
+1. Run the reference on the same 3 shards (`-ngl` with enough CPU MoE to
+   fit 73 GiB of host RAM) to separate "the file is bad" from "kraken
+   mis-executes it" — the only oracle that answers it, and now buildable
+   from source (docs/traces/laguna-ref-logits.txt).
+2. If the file is good: dump kraken's first layer's hidden state
+   (`KRK_DUMP`) and compare against the same reference, exact numbers,
+   not text.
+3. Check the expert read path once more, but from the *bytes*: an expert
+   read for S-2.1 goes `read_host` -> false (out of map) -> `memcpy` from
+   the mapping, so a dump of one expert's first row against the file is a
+   two-minute check that closes that path for good.
