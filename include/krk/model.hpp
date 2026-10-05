@@ -15,6 +15,8 @@
 #include "krk/expert_cache.hpp"
 #include "krk/gguf.hpp"
 
+#include <cmath> // std::tanh in apply_logit_softcap, called from every path
+
 namespace krk {
 
 // QuantTensor (a resident weight matrix) is declared in expert_cache.hpp, which

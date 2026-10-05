@@ -932,3 +932,74 @@ mistaken for complete.
 G1/G1a first — it is the largest measured gap, the instrument now works, and
 the localization is down to one variable. Then G10 (put the equivalence test in
 the gate) so a regression cannot hide again. Then G2, then G3, then G4/G5.
+
+---
+
+## TASKS — the complete missing list (2026-10-05, supersedes the register above)
+
+### Two corrections to the register above
+
+- **G5 was overstated.** The expert budget *does* adapt: `hard = total_vram -
+  512 MiB`, starting at 6 GiB and stepping 2 GiB to a 14 GiB cap
+  (`Engine::configure_expert_cache`). What is genuinely missing is the *profile*
+  policy (per-card slot strategy, the spec's 6/8/12/16 GiB tables) and the KV
+  tier — not the expert cap.
+- **G6 is no longer blocked.** RDNA2 is live: `rr@10.0.0.12` (`maclin`), Linux,
+  12 cores, 46 GiB RAM, `/opt/rocm`, `gfx1031` = RX 6700 XT, 43 GGUF files
+  under `/run/media/rr/52CA9D9BCA9D7BC3/x`, and `~/kraken` already builds for
+  gfx1031 (`KRK_GPU_TARGETS:STRING=gfx1031`, Release). Every RDNA2 claim in
+  this repo was previously untested by construction; that ends now.
+
+### T1-T14 measured gaps
+
+| # | Task | State |
+|---|---|---|
+| T1 | 24-model coherence sweep, then decide the QTILE default | **RUNNING** |
+| T2 | Prefill: staged-dequant WMMA at 24 GB/s of 644 GB/s — dequant goes through LDS, and BM=32 re-stages each weight tile once per 32 rows. llama.cpp dequantises into registers feeding the MMA | open |
+| T3 | MoE decode loses to llama.cpp **on CPU** (13.2 vs 16.3 tok/s) | open |
+| T4 | Device-side routing plan: 40 blocking 512-byte router downloads/token, plan+alpha re-uploaded per expert, O(ne*k) host scan per layer | open |
+| T5 | HIP graph capture — blocked on T4 plus fixed expert slots, because a graph bakes in weight pointers that move whenever the cache evicts | blocked |
+| T6 | CPU expert fallback (Fiddler) — measured ceiling 1.84x overlapped / 1.20x serial | open |
+| T7 | Cross-layer expert prediction — nothing exists but the trace instrumentation | open |
+| T8 | Tiered KV cache: VRAM HOT / RAM WARM / NVMe COLD, radix prefix reuse, persistence. Zero implementation | open |
+| T9 | 6/8/12/16 GiB hardware profiles, slot strategy per spec §28-29 | open |
+| T10 | **RDNA2 validation — now actionable on maclin** | open |
+| T11 | Quant: IQ2_XS **device branch missing** (host-only, confirmed: no `dequant_chunk` case); IQ3_XXS, IQ3_S, IQ2_S, Q2_0(42), Q1_0(41) absent; `qwen4exp` has no registry entry | open |
+| T12 | Correctness: laguna greedy output not reproducible run-to-run; DFlash 0%; Spark_one.Q6_K; two ambiguous `device rc=0, cpu rc=1` models | open |
+| T13 | **The gate has no equivalence test for fast paths** — the reason a 41%-wrong kernel shipped and survived | open |
+| T14 | Doc drift: README says a 32x64x64 WMMA tile (code: BK=128) and "weights are never dequantized" (the WMMA prefill path stages fp16 through LDS) | open |
+
+### T15-T20 specified with no code at all
+
+T15 W4/W6/W8 expert-only quantisation · T16 expert compiler + kernel-native
+packed store · T17 expert sensitivity model + precision allocator + calibration ·
+T18 ternary / BITCOS / five-trit with the measured size threshold ·
+T19 KVP1 KV format + journal + TTL · T20 predicted-prefetch autotuner (§29).
+
+### T21 — never assessed
+
+The RDNA2 SIMT tile and `gemm_dp4a.hpp`, the speculative and draft paths beyond
+their entry points, the tokenizer, and the sampler. G6 being closed means the
+first of those is now testable on real hardware for the first time.
+
+### New test material on maclin that targets specific open tasks
+
+- **Q1_0 and Q2_0 for T11**: `Bonsai-27B-Q1_0.gguf` (type 41),
+  `Ternary-Bonsai-27B-Q2_0.gguf` (type 42). These are the only real files seen
+  so far that exercise those two formats, and both are now reachable.
+- **DFlash pairs for T12**: `laguna-xs21-dflash-q4.gguf`,
+  `laguna-s-2.1-DFlash-Q4_K_M.gguf`, `gemma-4-12B-it-DFlash-Q4_K_M.gguf` —
+  drafter *and* target on the same box, which is what the 0% acceptance hunt
+  has been missing.
+- **MoE spread for T3/T4**: `Qwen3-30B-A3B-abliterated.i1-Q2_K`,
+  `Qwen3.5-35B-A3B-UD-Q4_K_XL`, `L3.2-8X3B-MOE-...-Q8_0`, `olmoe-1b-7b`.
+- **`Spark_one.Q6_K.gguf`** for the one open coherence failure with five
+  eliminated hypotheses.
+- `Edge0-8b-a1b-preview` — the engine from the references list the user
+  supplied, now on hardware we can measure against.
+
+### Order of attack
+
+T1 (running) → T13 (make the detector permanent) → T10 (first real RDNA2
+validation, 30 sessions overdue) → T2 (largest measured number) → T11 (unblocks
+four named files and the maclin Q1_0/Q2_0 pair) → T4/T6 → T8/T9.

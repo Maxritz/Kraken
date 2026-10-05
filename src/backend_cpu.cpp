@@ -11,6 +11,7 @@
 #include "par_pool.hpp"
 
 #include <algorithm>
+#include <cfloat> // FLT_MAX bounding the SIMT/CPU rsqrt and the clamp paths
 #include <cmath>
 #include <utility>
 #include <vector>

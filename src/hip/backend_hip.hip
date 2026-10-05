@@ -9,6 +9,7 @@
 #include <hip/hip_version.h>
 
 #include <algorithm>
+#include <atomic> // std::atomic in the paged-read fail counter; MSVC pulls it in
 #include <chrono>
 #include <cstdlib>
 #include <cstring>

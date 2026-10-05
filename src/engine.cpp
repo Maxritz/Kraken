@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <sys/stat.h> // struct stat, for the GGUF file-size probe
 
 namespace krk {
 

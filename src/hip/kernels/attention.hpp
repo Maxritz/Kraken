@@ -227,6 +227,35 @@ __global__ void __launch_bounds__(kAttnBlock)
     }
 }
 
+// LDS for QT queries: scores [QT][tile], q [QT][hd], then the K and V tiles.
+//
+// ONE owner for this arithmetic. The kernel used to place its pointers with a
+// copy of this expression and the host sized the launch with another copy, and
+// the two disagreed by a factor of two -- so the tier that could fit a 64-key
+// tile was launched with a 32-key one on every card, for no reason anyone could
+// see in either site. Both now call these two functions.
+//
+// This must stay ABOVE attention_qtile_kernel: the kernel calls it with an
+// explicit template argument, and a dependent call to a function that is only
+// declared later is not found by argument-dependent lookup. clang rejects that
+// on Linux ("neither visible in the template definition nor found by
+// argument-dependent lookup"); the Windows toolchain's two-phase handling
+// happened to accept it, which is how it passed a green gate here.
+template <int QT>
+__host__ __device__ __forceinline__ size_t attn_qtile_scores_bytes(int tile_k) {
+    const size_t scores = static_cast<size_t>(QT) * static_cast<size_t>(tile_k) *
+                          sizeof(f32);
+    return (scores + 15u) & ~static_cast<size_t>(15u);
+}
+
+template <int QT>
+__host__ __device__ __forceinline__ size_t attn_qtile_smem_bytes(int tile_k, i64 hd) {
+    return attn_qtile_scores_bytes<QT>(tile_k) +
+           sizeof(_Float16) *
+               (static_cast<size_t>(QT) + 2u * static_cast<size_t>(tile_k)) *
+               static_cast<size_t>(hd);
+}
+
 // ---------------------------------------------------------------------------
 // query-tiled flash prefill
 //
@@ -415,28 +444,6 @@ __global__ void __launch_bounds__(kAttnBlock)
                     static_cast<_Float16>(acc[qi][o] * inv);
         }
     }
-}
-
-// LDS for QT queries: scores [QT][tile], q [QT][hd], then the K and V tiles.
-//
-// ONE owner for this arithmetic. The kernel used to place its pointers with a
-// copy of this expression and the host sized the launch with another copy, and
-// the two disagreed by a factor of two -- so the tier that could fit a 64-key
-// tile was launched with a 32-key one on every card, for no reason anyone could
-// see in either site. Both now call these two functions.
-template <int QT>
-__host__ __device__ __forceinline__ size_t attn_qtile_scores_bytes(int tile_k) {
-    const size_t scores = static_cast<size_t>(QT) * static_cast<size_t>(tile_k) *
-                          sizeof(f32);
-    return (scores + 15u) & ~static_cast<size_t>(15u);
-}
-
-template <int QT>
-__host__ __device__ __forceinline__ size_t attn_qtile_smem_bytes(int tile_k, i64 hd) {
-    return attn_qtile_scores_bytes<QT>(tile_k) +
-           sizeof(_Float16) *
-               (static_cast<size_t>(QT) + 2u * static_cast<size_t>(tile_k)) *
-               static_cast<size_t>(hd);
 }
 
 // ---------------------------------------------------------------------------
