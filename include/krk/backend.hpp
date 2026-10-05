@@ -214,6 +214,33 @@ public:
     virtual void download(void *dst, const void *src, size_t bytes, size_t off = 0) = 0;
     virtual void fill0(void *dst, size_t bytes) = 0;
     virtual void sync() = 0;
+
+    // Completion markers, for a resource that is reused before the work
+    // already queued against it has finished.
+    //
+    // Everything in this engine runs on the default stream, so submitting work
+    // is ordered -- but ORDERED SUBMISSION IS NOT COMPLETION. A kernel reading
+    // buffer B can still be executing when the host decides B is free and
+    // hands it to someone else. Writing B then is a race that corrupts GPU
+    // state; on this box it presented as a driver reset, not as wrong numbers.
+    //
+    // Protocol: make_marker() allocates a token, wait_marker() blocks until
+    // the token's previous record has completed, record_marker() marks the
+    // point in the stream AFTER everything submitted so far. So the engine
+    // waits before touching a reused buffer and records once the work that
+    // uses it has been submitted.
+    //
+    // The default is deliberately conservative and correct: a null token, a
+    // no-op record, and a wait that falls back to a full sync(). A backend
+    // that does not implement markers is slower, never wrong.
+    virtual void *make_marker() { return nullptr; }
+    virtual void wait_marker(void *marker) {
+        (void)marker;
+        sync();
+    }
+    virtual void record_marker(void *marker) { (void)marker; }
+    virtual void release_marker(void *marker) { (void)marker; }
+    virtual bool poll_marker(void *marker) { (void)marker; return true; }
     // Copy n activation elements to host f32 (handles F16/F32 conversion).
     virtual void download_f32(f32 *dst, const void *src, i64 n) = 0;
     // Public device name for logging.

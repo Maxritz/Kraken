@@ -49,13 +49,13 @@ if [ "$cpu_only" -eq 1 ]; then
     api="src/json.cpp src/http.cpp src/server.cpp"
     $cxx -std=c++17 -O3 -Wall -Wextra -Iinclude \
         src/common.cpp src/quant.cpp src/gguf.cpp src/tokenizer.cpp \
-        src/sampler.cpp src/model.cpp src/expert_cache.cpp src/engine.cpp \
+        src/sampler.cpp src/model.cpp src/expert_cache.cpp src/kv_tier.cpp src/engine.cpp \
         src/backend_cpu.cpp $api \
         src/hip/hip_stub.cpp src/main_cli.cpp \
         -o build-cpu/kraken
     $cxx -std=c++17 -O3 -Wall -Wextra -Iinclude \
         src/common.cpp src/quant.cpp src/gguf.cpp src/tokenizer.cpp \
-        src/sampler.cpp src/model.cpp src/expert_cache.cpp src/engine.cpp \
+        src/sampler.cpp src/model.cpp src/expert_cache.cpp src/kv_tier.cpp src/engine.cpp \
         src/backend_cpu.cpp $api \
         src/hip/hip_stub.cpp src/main_server.cpp \
         -o build-cpu/kraken-server
@@ -64,7 +64,7 @@ if [ "$cpu_only" -eq 1 ]; then
         -o build-cpu/kraken-inspect
     $cxx -std=c++17 -O3 -Iinclude tests/test_kraken.cpp \
         src/common.cpp src/quant.cpp src/gguf.cpp src/tokenizer.cpp \
-        src/sampler.cpp src/model.cpp src/expert_cache.cpp src/engine.cpp \
+        src/sampler.cpp src/model.cpp src/expert_cache.cpp src/kv_tier.cpp src/engine.cpp \
         src/backend_cpu.cpp $api \
         src/hip/hip_stub.cpp -o build-cpu/kraken-tests
     echo "kraken: build-cpu/{kraken,kraken-server,kraken-inspect,kraken-tests} built"

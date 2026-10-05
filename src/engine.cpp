@@ -273,10 +273,6 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     const i64 C = chunk_;
 
     auto alloc = [&](size_t bytes) { return be_->alloc(bytes); };
-    kcache_ = alloc(static_cast<size_t>(mc.n_layer) * static_cast<size_t>(kv_cap_) *
-                    static_cast<size_t>(kv_dim_) * as);
-    vcache_ = alloc(static_cast<size_t>(mc.n_layer) * static_cast<size_t>(kv_cap_) *
-                    static_cast<size_t>(kv_dim_) * as);
     ws_x_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     ws_xn_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     ws_x2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
@@ -359,10 +355,60 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         alpha_dev_.reserve(static_cast<size_t>(C));
     }
     configure_expert_cache();
-    be_->fill0(kcache_, static_cast<size_t>(mc.n_layer) * static_cast<size_t>(kv_cap_) *
-                            static_cast<size_t>(kv_dim_) * as);
-    be_->fill0(vcache_, static_cast<size_t>(mc.n_layer) * static_cast<size_t>(kv_cap_) *
-                            static_cast<size_t>(kv_dim_) * as);
+    // KV residency -- allocated LAST, after the weights and every workspace.
+    //
+    // That ordering is load-bearing. Reading device_free_bytes() before the
+    // workspaces exist reports nearly all free VRAM, so a budget taken here
+    // over-commits: the slots are allocated, and then ws_x_ and the rest are
+    // allocated on top of them. Subtracting "what the workspaces will take"
+    // is not the same thing as measuring it, and guessing it is how an
+    // over-commit happens. So: take the measurement after the fact.
+    {
+        const size_t layer_bytes = static_cast<size_t>(kv_cap_) *
+                                   static_cast<size_t>(kv_dim_) * as;
+        const size_t kv_total = static_cast<size_t>(mc.n_layer) * layer_bytes * 2u;
+
+        // Leave a reserve so a later allocation cannot wedge the driver. The
+        // device is shared: the desktop compositor and any other app are
+        // already drawing from what is left.
+        const size_t free_vram = be_->device_free_bytes();
+        const size_t reserve = std::max<size_t>(256u * 1048576u, free_vram / 8u);
+
+        size_t hot;
+        if (cfg_.kv_hot_mb > 0) {
+            hot = static_cast<size_t>(cfg_.kv_hot_mb) * 1048576u;
+            // An explicit budget can still be larger than the card. Clamp it
+            // to what is actually there, or init() over-commits on request.
+            const size_t cap = free_vram > reserve ? free_vram - reserve : 0;
+            if (hot > cap) hot = cap;
+        } else {
+            hot = free_vram > reserve ? free_vram - reserve : 0;
+        }
+
+        // WARM is host RAM, so it must not be sized from device memory. With
+        // no host-memory query in the Backend interface, the honest auto is
+        // "enough to hold whatever does not fit HOT" -- bounded by the KV
+        // itself, so it cannot outgrow the machine. Explicit --kv-warm-mb wins.
+        const size_t overflow = kv_total > hot ? kv_total - hot : 0;
+        size_t warm = overflow;
+        if (cfg_.kv_warm_mb >= 0)
+            warm = static_cast<size_t>(cfg_.kv_warm_mb) * 1048576u;
+        else if (warm > kv_total)
+            warm = kv_total;
+
+        // Two planes share both budgets.
+        if (!kvt_k_.init(be_, mc.n_layer, layer_bytes, hot / 2u, warm / 2u,
+                         cfg_.kv_cold_dir, err) ||
+            !kvt_v_.init(be_, mc.n_layer, layer_bytes, hot / 2u, warm / 2u,
+                         cfg_.kv_cold_dir, err)) {
+            model_.unload();
+            be_ = nullptr;
+            return false;
+        }
+        KvTierStats ks;
+        kvt_k_.stats(&ks);
+        kv_tiered_ = ks.tiered;
+    }
     if (model_.is_recurrent()) {
         recurrent_reset();
         const f64 rec_mb = static_cast<f64>(rec_layers_) *
@@ -376,8 +422,20 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     const f64 total_vram_mb =
         static_cast<f64>(mc.n_layer) * static_cast<f64>(kv_cap_) *
         static_cast<f64>(kv_dim_) * static_cast<f64>(as) * 2.0 / (1024.0 * 1024.0);
-    KRK_INFO("workspaces ready: chunk=%d ctx=%lld KV=%.0f MiB (load %.0f ms)", chunk_,
-             static_cast<long long>(kv_cap_), total_vram_mb, load_ms);
+    {
+        KvTierStats ks;
+        kvt_k_.stats(&ks);
+        if (ks.tiered)
+            KRK_INFO("kv tiered: %lld layers, %lld HOT slots of %.0f MiB, "
+                     "layer=%.1f MiB, WARM budget=%lld layers",
+                     (long long)ks.layers, (long long)ks.slots,
+                     static_cast<double>(ks.hot_bytes) / 1048576.0,
+                     static_cast<double>(ks.layer_bytes) / 1048576.0,
+                     (long long)ks.slots);
+        else
+            KRK_INFO("workspaces ready: chunk=%d ctx=%lld KV=%.0f MiB (load %.0f ms)",
+                     chunk_, static_cast<long long>(kv_cap_), total_vram_mb, load_ms);
+    }
 
     if (cfg_.warmup) {
         const i32 t = tok_.bos() >= 0 ? tok_.bos() : 0;
@@ -399,7 +457,7 @@ void Engine::shutdown() {
         return;
     }
     be_->sync();
-    for (void **p : {&kcache_, &vcache_, &ws_x_, &ws_xn_, &ws_x2_, &ws_q_,
+    for (void **p : {&ws_x_, &ws_xn_, &ws_x2_, &ws_q_,
                      &ws_qpack_, &ws_k_,
                      &ws_v_, &ws_attn_, &ws_gate_, &ws_up_, &ws_logits_, &ws_router_,
                      &ws_ffn_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
@@ -410,6 +468,11 @@ void Engine::shutdown() {
             *p = nullptr;
         }
     }
+    // The KV tier caches free in their destructors, which run after this
+    // function has already deleted the backend. Release them here, while
+    // be_ is still valid, or their destructors call into freed memory.
+    kvt_k_.detach();
+    kvt_v_.detach();
     host_free(logits_host_);
     logits_host_ = nullptr;
     model_.unload();
@@ -562,6 +625,29 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                          mc.head_dim, n, mc.rms_eps, mc.qk_norm_wide);
 
         d.layer = l;
+        // Resolve this layer's residency before it is read or written.
+        //
+        // base() ALWAYS returns a pointer to this layer alone -- an offset
+        // into the flat allocation when the cache fits, a slot when it does
+        // not -- so d.layer_stride must be 0 in both cases. Leaving it at
+        // kv_cap*kv_dim makes the kernels compute `base + d.layer*stride`,
+        // which walks l layers PAST the layer we just handed them: out of
+        // bounds on every layer but 0. That faults the GPU rather than
+        // producing wrong numbers, which is how it showed up.
+        //
+        // The alternative -- keep the whole-array base and the stride -- is
+        // incompatible with paging, because a paged layer has no fixed
+        // offset. Hence per-layer bases and a zero stride.
+        void *kbase = kvt_k_.base(l);
+        void *vbase = kvt_v_.base(l);
+        if (!kbase || !vbase) {
+            // Unreachable in practice: take_slot() evicts any slot that does
+            // not already hold this layer, and a layer already hot returns
+            // early above. Fail loudly rather than attend over a null cache.
+            KRK_ERROR("kv: no resident slot for layer %lld", (long long)l);
+            return;
+        }
+        d.layer_stride = 0;
         // RoPE + KV append + attention ride one launch on the decode
         // row (kernels/attention.hpp, attn_fused_decode): the kernel
         // ropes q in registers and k straight into its cache slot, so
@@ -577,16 +663,22 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // Unsupported backends and shapes keep the separate chain.
         if (!(n == 1 && !mc.qk_norm && !packed_gate && d.window == 0 &&
               !mc.attn_gate && !mc.rope_neox &&
-              be_->attn_fused_chain(ws_attn_, ws_q_, kcache_, vcache_,
+              be_->attn_fused_chain(ws_attn_, ws_q_, kbase, vbase,
                                       ws_k_, ws_v_, d,
                                       model_.inv_freq_at(l).data(),
                                       mc.rope_scale, model_.rope_frac_at(l)))) {
             be_->rope(ws_q_, ws_k_, lh, mc.n_head_kv, mc.head_dim,
                       n, pos0, model_.inv_freq_at(l).data(), mc.rope_scale,
                       model_.rope_frac_at(l), mc.rope_neox);
-            be_->kv_append(kcache_, vcache_, ws_k_, ws_v_, d);
-            be_->attention(ws_attn_, ws_q_, kcache_, vcache_, d);
+            be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
+            be_->attention(ws_attn_, ws_q_, kbase, vbase, d);
         }
+        // The layer's KV is now queued. Mark the slot so a later layer that
+        // evicts it waits for these kernels instead of overwriting memory they
+        // are still reading. This has to come AFTER the launches above and
+        // after any fused chain, which is why it is not folded into base().
+        kvt_k_.end_layer(l);
+        kvt_v_.end_layer(l);
         // Where inside the attention layer a single-token step goes wrong:
         // q/k are post-rope here, so a divergence in them is rope or the
         // projection, and agreeing inputs with a wrong "out" is the attention
@@ -718,12 +810,10 @@ bool Engine::kv_rollback(i64 pos) {
 void Engine::kv_rollback_zero(i64 pos) {
     const size_t as = be_->act_size();
     const size_t row = static_cast<size_t>(kv_dim_) * as;
-    const size_t layer_span = static_cast<size_t>(kv_cap_) * row;
     for (i64 l = 0; l < model_.cfg().n_layer; l++) {
-        u8 *kb = static_cast<u8 *>(kcache_) + static_cast<size_t>(l) * layer_span +
-                 static_cast<size_t>(pos) * row;
-        u8 *vb = static_cast<u8 *>(vcache_) + static_cast<size_t>(l) * layer_span +
-                 static_cast<size_t>(pos) * row;
+        u8 *kb = static_cast<u8 *>(kvt_k_.base(l)) + static_cast<size_t>(pos) * row;
+        u8 *vb = static_cast<u8 *>(kvt_v_.base(l)) + static_cast<size_t>(pos) * row;
+        if (!kb || !vb) return;
         be_->fill0(kb, (static_cast<size_t>(kv_pos_) - static_cast<size_t>(pos)) * row);
         be_->fill0(vb, (static_cast<size_t>(kv_pos_) - static_cast<size_t>(pos)) * row);
     }

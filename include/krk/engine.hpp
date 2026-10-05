@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "krk/backend.hpp"
+#include "krk/kv_tier.hpp"
 #include "krk/model.hpp"
 #include "krk/sampler.hpp"
 #include "krk/tokenizer.hpp"
@@ -27,6 +28,19 @@ struct EngineConfig {
     // Residency budget for lazily-loaded MoE expert weights, in MiB. 0 means
     // auto: a share of free VRAM on the GPU, a fixed share on the CPU. Below the
     // cost of one expert the model still runs — it just reloads every step.
+    // KV residency (see kv_tier.hpp). HOT is VRAM, WARM is host RAM, COLD is
+    // a spill directory. 0 = auto for HOT (whatever free VRAM is left after
+    // the weights and workspaces) and for WARM (half of free host RAM); a
+    // negative WARM, or an empty COLD dir, disables that tier.
+    //
+    // When the whole KV fits the budget this is inert: the cache is one flat
+    // allocation and every call site is unchanged. Tiering only engages once
+    // the KV genuinely does not fit, which is what lets a long context run at
+    // all instead of being refused.
+    i32 kv_hot_mb = 0;
+    i32 kv_warm_mb = 0;
+    std::string kv_cold_dir;
+
     i32 expert_cache_mb = 0;
     // Hard cap on resident (layer, expert) slots, regardless of budget. 0 = auto.
     i32 expert_cache_slots = 0;
@@ -280,8 +294,13 @@ private:
     i64 kv_pos_ = 0;
     i32 chunk_ = 1;
 
-    void *kcache_ = nullptr;
-    void *vcache_ = nullptr;
+    // HOT/WARM/COLD KV residency. Two planes (K and V), one layer-sized slot
+    // each. When untiered both hand back a pointer into one flat allocation
+    // and d.layer_stride stays kv_cap * kv_dim, so the call sites below are
+    // identical either way.
+    KvTierCache kvt_k_;
+    KvTierCache kvt_v_;
+    bool kv_tiered_ = false;
     // Gated delta net: f32, one block per recurrent layer, persistent across
     // forwards. conv_state_ is the short conv's last (ksize-1) steps; rec_state_
     // is the delta rule's [n_v_head, d_state, hd] matrix. This is the model's

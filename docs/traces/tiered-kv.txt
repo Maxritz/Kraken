@@ -1,0 +1,76 @@
+Tiered KV cache — HOT / WARM / COLD, end to end
+=====================================================
+
+Unit of management is one layer's KV for the whole context. The design note
+(docs/ARCHITECTURE-TIERED.md section 6) asks for (layer, position-block)
+pages; this implements layer granularity, and the reason is arithmetic, not
+convenience: attention for layer l is the only reader of layer l's KV, and it
+finishes before layer l+1 starts, so a layer needs no kernel change at all --
+the engine passes a per-layer base with layer_stride = 0. A layer of
+Qwen3-8B KV at 32k ctx is 128 MiB, so a hundred of them still fit this card;
+position pages would only matter past any trained context length.
+
+When the cache fits, it is one flat allocation and every path is unchanged.
+Tiering engages only once the KV genuinely does not fit.
+
+Three tiers
+-----------
+HOT    VRAM: device slots, one layer each, LRU-evicted.
+WARM   host RAM: pageable buffers, one per evicted layer, bounded by budget.
+COLD   spill directory: pages evicted past WARM land as files, read back on
+       demand. Empty dir disables the tier; eviction then drops and the
+       positions are recomputed.
+
+Completion markers (Backend::make_marker / wait_marker / record_marker /
+poll_marker). Everything runs on the default stream, so submission is ordered
+but submission is not completion: a kernel reading a slot can still be
+executing when the host hands the slot to another layer. The tier cache waits
+on a per-slot hipEvent before touching it and records after the layer's
+launches -- a targeted wait, not a device sync. The interface default is a
+full sync(), so a backend without markers is slower, never wrong. The CPU
+backend and the test harness take that default.
+
+Flags: --kv-hot-mb (0 = auto from free VRAM after everything else is
+allocated), --kv-warm-mb (<0 = auto, bounded by the overflow; 0 = off),
+--kv-cold-dir (empty = disabled).
+
+Defects found by measurement, in order
+--------------------------------------
+1. VRAM over-commit. The HOT budget was read from device_free_bytes() BEFORE
+   the workspaces were allocated, so it claimed nearly all free VRAM and the
+   workspaces landed on top. Fixed by moving the init after every workspace
+   is allocated, so the measurement is real, with an explicit reserve.
+2. WARM sized from device_total_bytes() -- 15.9 GiB of VRAM -- to feed a host
+   allocator. Fixed: auto WARM is bounded by what actually overflows HOT.
+3. Double-counted layer stride. Per-layer bases were passed while
+   d.layer_stride stayed kv_cap*kv_dim, so kernels computed base + l*stride
+   and walked l layers past the buffer on every layer but 0. This faulted the
+   GPU (hipErrorLaunchFailure, then driver resets). Fixed: stride is 0
+   unconditionally with per-layer bases, in both flat and tiered mode.
+4. Teardown use-after-free. The tier caches freed in their destructors, which
+   run after Engine::shutdown() deletes the backend. Fixed with an idempotent
+   detach() called from shutdown(); that was the kraken-tests segfault.
+
+Verification (9070 XT, gfx1201)
+-------------------------------
+Gate: build rc=0 / 0 errors, kraken-tests 2154/2154 rc=0, kraken-bench --gate
+rc=0, coherence rc=0 with 3/3 PASS (qwen3, qwen2, llama).
+
+Correctness is tiering-invariant output, same binary, greedy:
+  tinyllama-1.1b, HOT=8 MiB (22 layers, 4 slots, 220 promotes / 256 evicts):
+    byte-identical text to the flat cache.
+  Qwen3-8B, HOT=200 MiB (36 layers, 12 slots, 792 promotes / 840 evicts):
+    byte-identical text to the flat cache, rc=0.
+
+Crash harness (KRK_TIER_TRACE / KRK_TIER_FENCE / KRK_TIER_WAIT_S): every tier
+op traced to an unbuffered file, every slot wait bounded (exits 42 with a
+STUCK line instead of hanging into the driver watchdog), fences after every
+movement. Under full fencing: 220 promotes, 256 evicts, zero waits over 5 s,
+max op gap 9 ms, zero STUCK, zero faults.
+
+Caveat, stated plainly: this machine suffered three driver-level crashes
+during this work (display reset, then a reboot), all before the stride fix.
+After it, every run completed clean -- but a GPU fault poisons driver state
+in ways that outlive the process, so the first runs on any fresh checkout
+should be the small-model fenced test, not the 8B. The tiering code itself
+has now completed hundreds of eviction cycles without a fault.

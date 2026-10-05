@@ -48,6 +48,7 @@ set(KRK_CORE_SOURCES
     src/model.cpp
     src/dflash.cpp
     src/expert_cache.cpp
+    src/kv_tier.cpp
     src/engine.cpp
     src/backend_cpu.cpp
     src/json.cpp

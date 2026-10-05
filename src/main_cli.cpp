@@ -32,6 +32,9 @@ struct Args {
     int host_ram_mb = 0;        // host memory to plan for (MiB), 0 = policy
     int expert_cache_slots = 0; // MoE resident (layer, expert) slot cap, 0 = auto
     int expert_warm_mb = -1;     // MoE WARM tier in pageable host RAM (MiB): <0 auto, 0 off
+    int kv_hot_mb = 0;           // KV HOT (VRAM) budget, MiB: 0 auto
+    int kv_warm_mb = -1;         // KV WARM (host RAM) budget, MiB: <0 auto, 0 off
+    std::string kv_cold_dir;     // KV COLD spill directory: empty disables
     bool expert_warm_prefetch = false; // fill WARM at load instead of on demand
     int draft_tokens = 4;       // speculative decoding window
     bool cpu = false;
@@ -88,6 +91,19 @@ void usage() {
         "                        quarter of installed RAM. Bounds every host\n"
         "                        tier inside the process; the model mapping and\n"
         "                        the dense trunk sit outside it.\n"
+        "  --kv-hot-mb N          KV HOT tier in VRAM, in MiB. 0 (default) takes\n"
+        "                        whatever VRAM the weights and workspaces leave\n"
+        "                        free. The KV is split into layer-granular slots;\n"
+        "                        if the whole cache fits, this is inert and the\n"
+        "                        cache is one flat allocation as before. Lower it\n"
+        "                        to make a long context run by paging the\n"
+        "                        overflow through WARM instead of refusing it.\n"
+        "  --kv-warm-mb N         KV WARM tier in pageable host RAM, in MiB.\n"
+        "                        <0 (default) sizes it from the machine, 0 turns\n"
+        "                        it off so every miss re-reads from COLD.\n"
+        "  --kv-cold-dir DIR      KV COLD tier: spill directory for pages evicted\n"
+        "                        past WARM. Unset (default) keeps them in RAM and\n"
+        "                        recomputes instead of writing.\n"
         "  --vram-cap-mb N       total device memory to plan for, in MiB. 0 uses\n"
         "                        the policy: 6 GiB, then +2 GiB at a time while\n"
         "                        the card has room and the model needs it, up to\n"
@@ -162,6 +178,12 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--threads") a->threads = std::atoi(next("--threads"));
         else if (f == "--host-ram-mb")
             a->host_ram_mb = std::atoi(next("--host-ram-mb"));
+        else if (f == "--kv-hot-mb")
+            a->kv_hot_mb = std::atoi(next("--kv-hot-mb"));
+        else if (f == "--kv-warm-mb")
+            a->kv_warm_mb = std::atoi(next("--kv-warm-mb"));
+        else if (f == "--kv-cold-dir")
+            a->kv_cold_dir = next("--kv-cold-dir");
         else if (f == "--vram-cap-mb")
             a->vram_cap_mb = std::atoi(next("--vram-cap-mb"));
         else if (f == "--expert-cache-mb")
@@ -518,6 +540,9 @@ int main(int argc, char **argv) {
     cfg.host_ram_mb = a.host_ram_mb;
     cfg.expert_cache_slots = a.expert_cache_slots;
     cfg.expert_warm_mb = a.expert_warm_mb;
+    cfg.kv_hot_mb = a.kv_hot_mb;
+    cfg.kv_warm_mb = a.kv_warm_mb;
+    cfg.kv_cold_dir = a.kv_cold_dir;
     cfg.expert_warm_prefetch = a.expert_warm_prefetch;
 
     ph.mark("backend create");

@@ -1105,6 +1105,41 @@ public:
     }
     void sync() override { KRK_HIP(hipDeviceSynchronize()); }
 
+    // Completion markers. hipEvent on the NULL stream, which is the stream
+    // every kernel here runs on, so a record lands after everything submitted
+    // so far on that stream. Waiting is a targeted wait on one event, not the
+    // device-wide sync the default would use -- that is the whole point: a
+    // reused KV slot needs its OWN previous occupant finished, and blocking
+    // the whole device between every layer of every token would cost more than
+    // the tiering saves.
+    void *make_marker() override {
+        hipEvent_t ev = nullptr;
+        if (hipEventCreateWithFlags(&ev, hipEventDisableTiming) != hipSuccess)
+            return nullptr;
+        return static_cast<void *>(ev);
+    }
+    void wait_marker(void *marker) override {
+        if (!marker) {
+            sync();
+            return;
+        }
+        KRK_HIP(hipEventSynchronize(static_cast<hipEvent_t>(marker)));
+    }
+    void record_marker(void *marker) override {
+        if (!marker) return;
+        // Stream 0: the legacy default stream, which is where every kernel in
+        // this engine runs. hipEventRecord on any other stream would NOT be
+        // ordered against them.
+        KRK_HIP(hipEventRecord(static_cast<hipEvent_t>(marker), nullptr));
+    }
+    void release_marker(void *marker) override {
+        if (marker) hipEventDestroy(static_cast<hipEvent_t>(marker));
+    }
+    bool poll_marker(void *marker) override {
+        if (!marker) return true;
+        return hipEventQuery(static_cast<hipEvent_t>(marker)) == hipSuccess;
+    }
+
     // Out of device memory. The bare hipErrorOutOfMemory tells the user
     // nothing they can act on, and the amount that failed to allocate is
     // usually only one slice of a much larger budget: report what the
