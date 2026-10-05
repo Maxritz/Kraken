@@ -262,8 +262,8 @@ __global__ void __launch_bounds__(kAttnBlock)
     constexpr int kWaves = kAttnBlock / kWaveSize;
     constexpr int kQPW = QT / kWaves; // queries per wave
     extern __shared__ u8 smem[];
-    f32 *s_sh = reinterpret_cast<f32 *>(smem); // [QT][tile_k]
-    const size_t sbytes = (static_cast<size_t>(QT) * tile_k * sizeof(f32) + 15u) & ~static_cast<size_t>(15u);
+    f32 *s_sh = reinterpret_cast<f32 *>(smem); // [QT][tile_k], read-only after staging
+    const size_t sbytes = attn_qtile_scores_bytes<QT>(tile_k);
     _Float16 *q_sh = reinterpret_cast<_Float16 *>(smem + sbytes); // [QT][hd]
     _Float16 *k_sh = q_sh + static_cast<i64>(QT) * hd;           // [tile_k][hd]
     _Float16 *v_sh = k_sh + static_cast<i64>(tile_k) * hd;
@@ -371,13 +371,18 @@ __global__ void __launch_bounds__(kAttnBlock)
             }
             const f32 mnew = fmaxf(mq[qi], tmax);
             const f32 alpha = __expf(mq[qi] - mnew);
+            // The weights are NOT written back. The score row is shared: every
+            // thread in the block reads it, so a thread that ran ahead of its
+            // neighbours replaced the raw scores before they had read them, and
+            // those neighbours then took max and exp over values that had
+            // already been exponentiated once. The row stays read-only from the
+            // staging pass on, and the accumulation loop below recomputes exp
+            // from it -- the same value, from a source nobody can invalidate.
             f32 rowsum = 0.0f;
             for (int j = 0; j < tile; j++) {
                 const i64 kk = k0 + j;
                 if (causal && kk > my) break;
-                const f32 e = __expf(s_sh[static_cast<i64>(qi) * tile_k + j] - mnew);
-                s_sh[static_cast<i64>(qi) * tile_k + j] = e;
-                rowsum += e;
+                rowsum += __expf(s_sh[static_cast<i64>(qi) * tile_k + j] - mnew);
             }
             lq[qi] = lq[qi] * alpha + rowsum;
             mq[qi] = mnew;
@@ -389,7 +394,7 @@ __global__ void __launch_bounds__(kAttnBlock)
                 for (int j = 0; j < tile; j++) {
                     const i64 kk = k0 + j;
                     if (causal && kk > my) break;
-                    a += s_sh[static_cast<i64>(qi) * tile_k + j] *
+                    a += __expf(s_sh[static_cast<i64>(qi) * tile_k + j] - mnew) *
                          static_cast<f32>(v_sh[static_cast<i64>(j) * hd + d]);
                 }
                 acc[qi][o] = acc[qi][o] * alpha + a;
@@ -413,13 +418,25 @@ __global__ void __launch_bounds__(kAttnBlock)
 }
 
 // LDS for QT queries: scores [QT][tile], q [QT][hd], then the K and V tiles.
+//
+// ONE owner for this arithmetic. The kernel used to place its pointers with a
+// copy of this expression and the host sized the launch with another copy, and
+// the two disagreed by a factor of two -- so the tier that could fit a 64-key
+// tile was launched with a 32-key one on every card, for no reason anyone could
+// see in either site. Both now call these two functions.
 template <int QT>
-inline size_t attn_qtile_smem_bytes(int tile_k, i64 hd) {
-    const size_t scores = static_cast<size_t>(QT) * static_cast<size_t>(tile_k) * sizeof(f32);
-    const size_t aligned = (scores + 15u) & ~static_cast<size_t>(15u);
-    return aligned + sizeof(_Float16) *
-                         (static_cast<size_t>(QT) + 2u * static_cast<size_t>(tile_k)) *
-                         static_cast<size_t>(hd) * 2u;
+__host__ __device__ __forceinline__ size_t attn_qtile_scores_bytes(int tile_k) {
+    const size_t scores = static_cast<size_t>(QT) * static_cast<size_t>(tile_k) *
+                          sizeof(f32);
+    return (scores + 15u) & ~static_cast<size_t>(15u);
+}
+
+template <int QT>
+__host__ __device__ __forceinline__ size_t attn_qtile_smem_bytes(int tile_k, i64 hd) {
+    return attn_qtile_scores_bytes<QT>(tile_k) +
+           sizeof(_Float16) *
+               (static_cast<size_t>(QT) + 2u * static_cast<size_t>(tile_k)) *
+               static_cast<size_t>(hd);
 }
 
 // ---------------------------------------------------------------------------

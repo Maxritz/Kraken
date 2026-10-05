@@ -866,3 +866,69 @@ Consequence for sequencing: once the fallback lands, the 26.2 ms/token of
 resident GPU work is 64% of the budget and becomes the dominant term.
 Graph capture + the device-side routing plan attack that; nothing left in
 the expert cache does. Re-order the work accordingly.
+
+---
+
+## Mandatory requirements vs. goals — gap register (2026-10-05)
+
+### The requirements, as stated
+
+1. **Works on every model in the collection**, not one model and not one
+   family. A fix that only helps Laguna is not a fix.
+2. **Six hardware profiles must run efficiently**: 6 GiB VRAM / 24 GiB RAM,
+   8 / 32, 12 / 48, 16 / 64. Today the engine sizes itself for the 16 GiB
+   card it is developed on.
+3. **Both GPU targets**: RDNA2 (`gfx1031`) *and* RDNA4 (`gfx1201`).
+   `docs/HARDWARE.md` makes gfx1031 the **primary** target.
+4. **Only hot MoE experts resident in VRAM and RAM**; cold experts computed
+   where they sit rather than shuttled across PCIe.
+5. **Tiered KV cache** (the Huawei-inspired spec): VRAM HOT / RAM WARM /
+   NVMe COLD, radix prefix reuse, async migration, persistence across restarts.
+6. **Correctness proven**, not assumed — coherence vs the CPU oracle, and
+   no fast path may ship without an equivalence test.
+7. **Must not silently run on CPU.** The GPU is the point; any CPU path is a
+   deliberate, measured choice for cold experts only.
+8. **Beat the reference.** llama.cpp is the bar, and the projects in the
+   references list are the bar above it.
+9. House rules: kill every kraken process before a run; one run at a time;
+   measure, never guess; fix defects rather than dismissing them; commit with
+   evidence traces under `docs/traces/`.
+
+### Gaps, ranked by measured cost
+
+| # | Gap | Evidence | Status |
+|---|---|---|---|
+| G1 | **Prefill is 17.1x slower than llama.cpp** (499 vs 8528 tok/s, same file, same GPU). Attention-bound: 1123 ms attention vs 321 ms GEMM. The fast path (`attention_qtile_kernel`) is numerically wrong. | this session | open |
+| G1a | qtile divergence tracks `pos0`: non-zero `pos0` cases are 104-139% wrong, `pos0=0` cases 4-6%. Both are defects. | `probe_attn_qtile` | open |
+| G1b | `attn_qtile_smem_bytes` double `*2` over-reserves LDS, forcing `qtile_k=32` instead of 64. | `attention.hpp:417` | open |
+| G2 | **No CPU expert fallback.** Cold experts cost a full NVMe read + DMA + GPU compute on the critical path. | gap audit below | open |
+| G3 | **No expert prediction.** Only `KRK_TRACE_EXPERTS` instrumentation exists; no cross-layer predictor. | grep | open |
+| G4 | **Tiered KV cache absent entirely.** One flat `alloc(n_layer * kv_cap * kv_dim)` in VRAM. No RAM tier, no NVMe tier, no paging, no radix prefix reuse. | `engine.cpp:275` | open |
+| G5 | **No 6/8 GiB profile.** Expert budget is a flat byte cap; KV is flat VRAM. Neither adapts to a small card. | `configure_expert_cache` | open |
+| G6 | **RDNA2 unvalidated.** gfx1031 is the primary target and there is no machine; every RDNA2 claim is untested by construction. | — | blocked |
+| G7 | **Missing quant types block four named files**: IQ3_XXS, IQ3_S, IQ2_S, Q2_0 (42), Q1_0 (41); `qwen4exp` arch has no registry entry at all. | prior session | open |
+| G8 | **MoE decode loses to llama.cpp running on CPU only** (13.2 vs 16.3 tok/s). | this session | open |
+| G9 | **DFlash acceptance 0%** in kraken; the reference also reports 0.000% on the official pair. | prior session | open |
+| G10 | **The gate has no equivalence test for fast paths.** `probe_attn_qtile` was a *broken build target* for an unknown number of sessions, which is why G1a survived. | this session | open |
+| G11 | **Doc drift**: README claims a 32x64x64 WMMA tile (code: BK=128) and "weights are never dequantized" (the WMMA prefill path stages fp16 through LDS). | README vs code | open |
+
+### Code assessment — what was actually inspected
+
+Assessed with evidence: `moe_ffn` and the per-expert loop (`engine.cpp:1252`),
+`ExpertCache` acquire/promote/evict/decay (`expert_cache.cpp`, 745 lines read),
+the GEMM rung dispatch and split-K cost model (`backend_hip.hip:1305-1434`),
+`wmma_cfg` (BM 32 / BN 64 / BK 128, 256 threads) and the staged dequant,
+both attention kernels (`attention.hpp` 109-419), the prefill dispatch, the
+model load path (`upload` 398 calls = 398 tensors, **not** prefill cost), and
+the coherence script's invocation contract.
+
+**Not assessed**: the RDNA2 SIMT tile and `gemm_dp4a.hpp`; the speculative and
+draft paths beyond their entry points; the tokenizer; `main_cli.cpp` beyond the
+bench and help paths; the sampler. These are named so the assessment is not
+mistaken for complete.
+
+### Sequencing
+
+G1/G1a first — it is the largest measured gap, the instrument now works, and
+the localization is down to one variable. Then G10 (put the equivalence test in
+the gate) so a regression cannot hide again. Then G2, then G3, then G4/G5.
