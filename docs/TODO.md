@@ -756,3 +756,64 @@ parameters) and per-token prefill cost (~35 ms) is close to decode (~47 ms).
 An earlier suspicion that prefill was pathological was wrong. The remaining
 decode headroom is the usual one: 5.3 GB of weights against a ~384 GB/s bus
 implies a ~72 tok/s roofline, so decode sits ~3.4x off bandwidth-bound.
+---
+
+## Gap audit against the two tiering specs (2026-10-05)
+
+Evidence: `docs/traces/decode-dissection.txt`. Measured on the RX 9070 XT;
+a Laguna XS.2 Q4_K_M decode token is **75.1-75.7 ms**, of which **60% of the
+generation phase is expert weight movement** and 0% is expert arithmetic.
+The whole routed expert set is 19.43 GiB against a 12,425 MiB VRAM budget
+(64% resident), so ~160 MiB per token comes off NVMe and is DMA'd to VRAM,
+every token, forever. There is no steady state to prefetch *into*, which is
+why prefetch/async/prediction cannot rescue this on their own.
+
+Status of each spec item:
+
+* **Spec section 22, CPU Expert Fallback (Fiddler) — NOT IMPLEMENTED.**
+  The single biggest missing piece and exactly the 6-10x lever. Zero hits for
+  any CPU expert path in the tree. The arithmetic that settles it: for a
+  one-row activation the operand is ~8 KB of f32 and the weight is
+  1.9455 MiB, so moving the weight costs ~250x more than moving the operand.
+  A cold expert must be *computed*, not moved. This is also what Strata
+  ("your processor works on the rest at the same time"), what
+  `lna-lab/flash-next-8gb` does with `-mcl 64`, and what ExLlamaV3's
+  `--moe_cpu_offload` does. Highest priority item on this list.
+
+* **Spec sections 16/17/28, RAM tier — IMPLEMENTED BUT MIS-SIZED.**
+  `ExpertCache`'s WARM tier *is* this section, but the default budget is
+  `ram_total / 4` (src/engine.cpp:861): 24 GiB of 96, giving WARM 18102 MiB
+  against a 19,860 MiB routed corpus. The spec table says 96 GiB -> 70 GiB
+  warm; we run 18 GiB, a 3.9x shortfall, and a tier that cannot hold the
+  corpus churns at the margin. Fix the default to the spec's table and make
+  it a function of (RAM, corpus), not of RAM alone.
+
+* **Spec section 20/38, expert prediction — NOT IMPLEMENTED.**
+  Only `KRK_TRACE_EXPERTS` instrumentation and LFU+aging exist; there is no
+  predictor. This is the part of the "revolutionary expert cache" that is
+  actually missing: ExpertFlow / MoE-Infinity Level 3, cross-layer
+  prediction. Note that prediction is worth much less before the CPU
+  fallback exists — predicting correctly still leaves you moving the bytes.
+
+* **Spec section 29, GPU profiles (6/12/16 GiB) — PARTIALLY IMPLEMENTED.**
+  The budget does adapt to the card (`hard = total_vram - 512 MiB`, so a
+  6 GiB card gets 5.5 GiB), so the "flat kCapMax regardless of card" worry
+  is unfounded. What is missing is the per-class *slot* policy (8/16/32
+  slots per active sparse layer). At 39 sparse layers that is 312/624/1248
+  slots; our flat byte budget gives a similar count by accident for the
+  current geometry, but it is not the stated policy and will not hold for
+  a model with different expert size.
+
+* **Spec section 35, logical page != physical transfer — IMPLEMENTED.**
+  `ExpertCache::prefetch_layer` plus the offset-sorted contiguous-per-worker
+  batch dispatch in `HipBackend::read_host_batch`. This is the one that is
+  done, and it is why the NVMe read rate went 593 -> 1446 MiB/s.
+
+* **KV tier spec — NOT IMPLEMENTED AT ALL.**
+  `Engine::configure` does one flat
+  `alloc(n_layer * kv_cap_ * kv_dim_)` for K and the same for V, entirely in
+  VRAM (src/engine.cpp:275-278). No dtype switch, no paging, no RAM or NVMe
+  tier, no radix prefix cache, no async H2D/D2H, no residency states. On a
+  15.9 GiB card this is affordable (KV was 320 MiB at ctx 2048), but on the
+  6 GiB class the KV cache is the difference between running and not, and
+  it is the reason the 6 GiB profiles in the spec cannot be honoured today.

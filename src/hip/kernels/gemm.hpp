@@ -83,6 +83,64 @@ __global__ void __launch_bounds__(THREADS)
     if (lane == 0) out[row] = static_cast<_Float16>(part);
 }
 
+// ------------------------------------------------------------------ gemv_m --
+//
+// A shape ladder, not a GEMM. `rows == 1` was a GEMV and `rows > 1` was the
+// WMMA tile, which is a 32-row tile (BM=32): a 4-row expert group paid for 32
+// rows of compute and 32 rows of LDS, and the block still had to be launched,
+// staged and drained. The same trap the ROCm engine documented for gfx1151 --
+// "hipBLAS 128x128 tiles are ~25x slower on thin F16 weights at 4-8 columns",
+// where the fix was to let the fast mat-vec kernel keep the job up to 8
+// columns (guevae2/paoai-qwen38fn-rocm-engine, mmvf.cu).
+//
+// Here the rows are MoE expert groups and speculative-verify columns, so both
+// ends of the ladder are live shapes rather than hypotheticals: a 512-token
+// prefill chunk routes 4096 (token, slot) pairs over 256 experts, which is 16
+// rows per expert on average with a long cold tail, and a DFlash verify pass
+// is exactly 4-8 columns by construction.
+//
+// Structurally identical to gemv_kernel -- one warp per output row, lane l
+// walks chunks l, l+32, ..., one warp reduction at the end -- with M partial
+// sums instead of one. The weight row is still streamed exactly once for all M
+// activations, which is the whole point: M separate GEMV launches would read
+// the same M MiB M times, and this reads it once. The per-chunk dot product is
+// the SAME dot_chunks() call in the SAME order, so the result is bit-identical
+// to M gemv launches and the coherence check stays a check, not a coin flip.
+template <int THREADS, int M>
+__global__ void __launch_bounds__(THREADS)
+    gemv_m_kernel(const u8 *__restrict__ w, int wt, i64 n_out, i64 n_in,
+                  size_t w_row_bytes, const _Float16 *__restrict__ x,
+                  _Float16 *__restrict__ out) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const i64 row = static_cast<i64>(blockIdx.x) * (THREADS / 32) +
+                    static_cast<i64>(threadIdx.x >> 5);
+    if (row >= n_out) return;
+
+    const int nch = static_cast<int>(n_in / 32);
+    const u8 *wrow = w + static_cast<size_t>(row) * w_row_bytes;
+
+    f32 part[M];
+#pragma unroll
+    for (int t = 0; t < M; t++) part[t] = 0.0f;
+
+    for (int c = lane; c < nch; c += 32) {
+#pragma unroll
+        for (int t = 0; t < M; t++)
+            part[t] += dot_chunks(wt, wrow, x + static_cast<i64>(t) * n_in, c, c + 1);
+    }
+
+#pragma unroll
+    for (int t = 0; t < M; t++) {
+        part[t] = d_wave_reduce_sum(part[t]);
+        if (lane == 0)
+            out[static_cast<i64>(t) * n_out + row] = static_cast<_Float16>(part[t]);
+    }
+}
+
+// The widest group that still belongs on the mat-vec ladder. Above it the
+// WMMA tile's reuse of a staged weight tile finally pays for itself.
+constexpr int kGemvMRowsMax = 8;
+
 // ---------------------------------------------------------------------------
 // WMMA GEMM — prefill on gfx11 / gfx12
 //

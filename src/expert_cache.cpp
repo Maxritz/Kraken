@@ -725,7 +725,20 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
         host_bytes_ += one;
         warm_admissions_++;
         total += one;
+        // The batch above was a real read out of the model file, so it is a
+        // COLD miss and has to be counted as one. Without this the report
+        // printed "COLD misses 0 (0.0%)" and "0 MiB read from the file" on a
+        // run that had just pulled ten gigabytes off the disk, because the
+        // prefetch path never touched loads_/bytes_loaded_ -- only the
+        // acquire() path did, and acquire() sees a warm hit. The counters then
+        // sum correctly against acquires() (a prefetched expert is charged one
+        // load here and one promotion there, which is exactly the two events
+        // that happened), and the residency report can no longer be used to
+        // conclude that a model fits.
+        loads_++;
+        bytes_loaded_ += one;
     }
+    bytes_staged_ += total;
     return total;
 }
 

@@ -1,0 +1,156 @@
+Decode dissection — where a Laguna decode token actually goes
+=============================================================
+Measured 2026-10-05 on the RX 9070 XT (gfx1201, 64 CU, 15.9 GiB VRAM),
+Ryzen host, 95.9 GiB RAM, NVMe on G:. Build: ninja -C build-hip, rc=0,
+0 `error:` lines. Every run below is a single process, nothing else on the
+box, arms interleaved run-by-run.
+
+
+0. The headline
+---------------
+kraken GPU, laguna-xs2-Q4_K_M.gguf, greedy, ctx 2048, 32 tokens:
+    13.2 / 13.3 tok/s  (75.1-75.7 ms/tok)        [2 reps, interleaved]
+llama.cpp CPU-only, the SAME file, 16 threads, poolside fork b270115c:
+    16.3 t/s generation, 41.3 t/s prompt
+
+The CPU wins. Both emit "The capital of France is Paris." This is not a
+misconfiguration: kraken loads 1.16 GiB of dense weights and 7.66 GiB of
+expert weights, and the HIP device is live for the whole run.
+
+
+1. Decode token budget, host wall clock
+---------------------------------------
+`--stats` expert-path split, whole run (6 prefill + 32 decode = 38 tokens,
+2421.7 ms decode + 1000.5 ms prefill):
+
+    read   1013.9 ms      <- NVMe -> pageable WARM
+    room      0.1 ms
+    alloc   200.1 ms      <- alloc_pooled
+    xfer    839.6 ms      <- pageable -> pinned ring -> VRAM
+    ---------------------
+    total  2053.7 ms  of a 3422 ms generation phase = 60%
+
+Resident/expert geometry for this file (measured, not estimated):
+    40 layers, 39 MoE + 1 dense, 256 experts/layer, top-8
+    1.9455 MiB per expert (three slices)
+    routed set   39 x 256 x 1.9455 MiB = 19.43 GiB = 19,860 MiB
+    VRAM budget  12,425 MiB (14 GiB cap - 1.9 GiB already in use)
+    capacity     6,387 slots of 9,984 = 64% resident
+    per token    312 routed experts = 607 MiB of weight
+    cold/token   ~82 experts = ~160 MiB, read from NVMe AND DMA'd to VRAM
+
+So 36% of every routed expert is cold, every token, forever. The card
+cannot hold 19.43 GiB. There is no steady state to prefetch INTO — which
+is the single most important fact in this file and the reason prefetch,
+prediction and async all fail to save it on their own.
+
+
+2. Drain cost, measured by scaling the number of barriers
+---------------------------------------------------------
+`KRK_SYNC_EXPERT=1` adds one hipDeviceSynchronize after each of the ~320
+expert acquires per token (8 per layer x 40 layers), on top of the 40 the
+router already takes. Interleaved, 2 reps:
+
+    off   75.7 / 75.1 ms/tok
+    on   119.4 / 128.3 ms/tok
+
+    marginal cost = (119.4-75.7) + (128.3-75.1) = 96.9 ms over 640 extra
+    barriers = 0.151 ms per hipDeviceSynchronize.
+
+`KRK_ROUTER_SYNC=1` adds one extra drain per layer (40/token):
+    off 80.1 / 85.5   on 110.8 / 90.2   -> 0.062 ms per drain.
+
+0.15 ms is ~10x what a device barrier should cost. These 40 drains/token
+(`download_f32` of 512 router bytes, a BLOCKING hipMemcpy on the default
+stream) cost ~6 ms/tok of pure overhead, and each one also forces every
+layer's queued work to land before the next layer can be routed, which is
+what serialises the whole pipeline. Removing the router round-trip is
+worth ~8% on its own; its real value is that it unblocks overlap.
+
+
+3. Where the device actually is
+-------------------------------
+--profile perturbs (it inserts an event pair per op). Treat its op table as
+ratios only. Its absolute numbers were used to locate cost, never to size
+a win.
+
+Per-token arithmetic, undistorted: 607 MiB of expert weights per token.
+Measured gemv throughput 143.9 GB/s. Pure-VRAM floor = 4.2 ms/tok, i.e.
+~240 tok/s. We are at 75 ms/tok. We are 18x off the memory floor of the
+model we already have in RAM terms, because the bytes are coming off an
+NVMe drive instead of VRAM.
+
+
+4. The two changes landed with this trace
+-----------------------------------------
+(a) REPORTING. `ExpertCache::prefetch_layer` read real bytes off the model
+    file and never touched loads_/bytes_loaded_ — only acquire() did, and
+    acquire() sees a warm hit. So a run that pulled 10,268 MiB printed:
+
+        [stats ] cache  ... COLD misses 0 (0.0%)
+        [stats ] transfer ... 0 MiB read from the file (0.00 MiB/tok)
+
+    Both false. A previous session used that line to conclude "file reads
+    7529 MiB -> 0 bytes" and that the expert read path was solved. It was
+    not; it was unmeasured. Fixed in src/expert_cache.cpp phase 3; the
+    same run now prints `COLD misses 5647 (52.8%)`.
+
+(b) THIN-GEMM LADDER. `gemm_rung` sent every `rows > 1` to the WMMA tile,
+    which is BM=32. A 4-row MoE expert group paid for 32 rows of compute
+    and 32 rows of LDS. Added `gemv_m_kernel<THREADS, M>` (M=2..8): one
+    warp per output row as in gemv_kernel, with M partial sums instead of
+    one, so the weight row is still streamed once for all M activations.
+    This is the same correction the ROCm engine made for gfx1151
+    (ggml_cuda_should_use_mmvf: ne11 <= 8, because 128x128 hipBLAS tiles
+    are ~25x slower on thin F16 weights at 4-8 columns). `KRK_GEMV_M=0`
+    restores the old path.
+
+    MEASURED NEUTRAL, not a win:
+        chunk 512:  old 120.2 / 120.6   new 121.8 / 118.9 tok/s
+        chunk 64:   old  95.4 /  92.7   new  93.7 /  92.0 tok/s
+    Within run-to-run noise in both directions. The thin-GEMM trap that
+    cost the reference 25x is not what costs us: at 256 experts/layer the
+    average group is 16 rows at chunk 512 and 2 rows at chunk 64, and
+    either way the layer is bound by moving weights, not by the tile.
+    Kept as groundwork for the DFlash verify pass (m=4..8 by construction)
+    and because it completes the ladder, but it is NOT claimed as a
+    speedup and it is not the answer to anything below.
+
+    Bit-identity could not be checked from generated text: greedy output
+    for this file+prompt is not reproducible run-to-run (control: two runs
+    of the SAME arm differ). The arithmetic is identical by construction —
+    same dot_chunks() calls, same lane mapping, same warp reduction — but
+    that is a claim about the code, not a measurement.
+
+
+5. Gate
+-------
+    ninja rc=0, 0 `error:` lines
+    kraken-tests   2154/2154 rc=0
+    kraken-bench --gate rc=0
+
+
+6. What the references actually do differently
+---------------------------------------------
+guevae2/paoai-qwen38fn-rocm-engine (RX 9070-class numbers come from
+Strata, measured on this exact card):
+    * GGML_HIP_GRAPHS=ON + "retained-PM4 graph path" — the whole decode step
+      captured once. Collapses the 3,700 launches/token and the 40 drains.
+    * GGML_HIP_ENABLE_UNIFIED_MEMORY=1 — "let the GPU use system memory".
+    * --fit off --lazy-mode on-direct — load nothing, pull on demand.
+    * thin-F16 columns must stay on the mat-vec kernel (above).
+
+Niko1221/Strata, README "How it works":
+    "Your graphics card keeps the few thousand experts that are used most
+     often. Your RAM holds all of them, and your processor works on the
+     rest at the same time. Your SSD holds a big lookup table."
+    52-60 tok/s on a 9070 XT with a Ryzen 9 3900X.
+
+lna-lab/flash-next-8gb, 177B on an 8 GB card:
+    "-mcl 64 — routed experts on the CPU. This is the flag that makes it
+     fit." Dense path only in VRAM. 34-35 tok/s on a 64-core Threadripper.
+
+All three converge on the same answer, and it is Fiddler (§5.9) from our
+own spec: for a one-row activation the operand is ~8 KB of f32 and the
+weight is 1.95 MiB. Moving the weight costs 250x more than moving the
+operand. So a cold expert must be COMPUTED, not moved.

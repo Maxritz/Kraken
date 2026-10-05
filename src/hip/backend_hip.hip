@@ -1119,6 +1119,18 @@ public:
     // and a rung that is not present must fall THROUGH to the next one instead
     // of launching nothing, which is what the previous shape of this code did
     // whenever the device had WMMA but the kernel had not been compiled in.
+    // KRK_GEMV_M=0 puts rows 2..8 back on the WMMA tile, i.e. the path this
+    // build replaced. It exists so the two arms can be interleaved in separate
+    // processes: measured in sequence, the second arm reads a warm page cache
+    // and looks like a win no matter which one it is.
+    static bool gemv_m_enabled() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_GEMV_M");
+            return !(e && e[0] == '0');
+        }();
+        return v;
+    }
+
     GemmRung gemm_rung(DType wt, i64 rows, i64 n_out, i64 n_in) const {
         const bool wmma_present = caps_.has_wmma
 #if defined(KRK_WMMA_COMPILED)
@@ -1313,6 +1325,28 @@ public:
             gemv_kernel<256><<<static_cast<unsigned>((n_out + 7) / 8),
                                 256>>>(
                 wh, static_cast<int>(wt), n_out, n_in, row_bytes, xh, oh);
+        } else if (rows <= kGemvMRowsMax && gemv_m_enabled()) {
+            // Thin groups stay on the mat-vec ladder. BM=32 in the WMMA tile
+            // means a 4-row MoE expert group was paying for 32 rows of compute
+            // and 32 rows of LDS; this is the same correction the ROCm engine
+            // made for gfx1151, where handing 4-8 columns to the big-tile
+            // routine cost ~25x. Keyed on ROW COUNT and not on format, so it
+            // is the same decision the reference makes (ne11 <= 8).
+            const unsigned gm = static_cast<unsigned>((n_out + 7) / 8);
+#define KRK_GEMV_M(N)                                                        \
+    gemv_m_kernel<256, N><<<gm, 256>>>(wh, static_cast<int>(wt), n_out,     \
+                                       n_in, row_bytes, xh, oh)
+            switch (static_cast<int>(rows)) {
+                case 2: KRK_GEMV_M(2); break;
+                case 3: KRK_GEMV_M(3); break;
+                case 4: KRK_GEMV_M(4); break;
+                case 5: KRK_GEMV_M(5); break;
+                case 6: KRK_GEMV_M(6); break;
+                case 7: KRK_GEMV_M(7); break;
+                default: KRK_GEMV_M(8); break;
+            }
+#undef KRK_GEMV_M
+            krk_op_scope.retag("gemm(gemv_m)");
         } else if (rung == GemmRung::kWmma) {
 #if defined(KRK_GFX11) || defined(KRK_GFX12)
             const unsigned bx = static_cast<unsigned>(
