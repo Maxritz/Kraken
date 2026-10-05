@@ -205,9 +205,19 @@ public:
     }
 
     void qk_norm(void *q, void *k, const f32 *wq, const f32 *wk, i64 n_head,
-                 i64 n_kv, i64 hd, i64 n_tok, f32 eps) override {
-        if (wq) head_norm(static_cast<f32 *>(q), wq, n_head, hd, n_tok, eps);
-        if (wk) head_norm(static_cast<f32 *>(k), wk, n_kv, hd, n_tok, eps);
+                 i64 n_kv, i64 hd, i64 n_tok, f32 eps, bool wide) override {
+        if (wq) {
+            if (wide)
+                row_norm(static_cast<f32 *>(q), wq, n_tok, n_head * hd, eps);
+            else
+                head_norm(static_cast<f32 *>(q), wq, n_head, hd, n_tok, eps);
+        }
+        if (wk) {
+            if (wide)
+                row_norm(static_cast<f32 *>(k), wk, n_tok, n_kv * hd, eps);
+            else
+                head_norm(static_cast<f32 *>(k), wk, n_kv, hd, n_tok, eps);
+        }
     }
 
     void kv_append(void *kcache, void *vcache, const void *k, const void *v,
@@ -665,6 +675,22 @@ private:
                             hx[ia] = a * c - bb * sn;
                             hx[ib] = a * sn + bb * c;
                         }
+                    }
+                });
+    }
+
+    // OLMoE's convention: one RMS over the whole projected row (n = n_head *
+    // hd), the weight spanning that row. One row per token, so the unit of
+    // parallelism is the token, not the (token, head) pair.
+    static void row_norm(f32 *x, const f32 *w, i64 n_rows, i64 n, f32 eps) {
+        par_for(n_rows, 1, 4.0 * static_cast<f64>(n_rows) * n,
+                [&](i64 b, i64 e) {
+                    for (i64 r = b; r < e; r++) {
+                        f32 *xr = x + r * n;
+                        f32 ss = 0;
+                        for (i64 i = 0; i < n; i++) ss += xr[i] * xr[i];
+                        const f32 inv = 1.0f / std::sqrt(ss / static_cast<f32>(n) + eps);
+                        for (i64 i = 0; i < n; i++) xr[i] = xr[i] * inv * w[i];
                     }
                 });
     }

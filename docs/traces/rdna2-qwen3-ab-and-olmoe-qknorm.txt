@@ -1,0 +1,208 @@
+RDNA2 (gfx1031) head-to-head, and the OLMoE QK-norm root cause
+================================================================================
+Host: rr@10.0.0.12 (maclin), Linux 7.0, 12 cores, 46 GB RAM.
+Card: AMD Radeon RX 6700 XT, gfx1031, RDNA2, 40 CU, 12.0 GiB VRAM, wave32.
+     llama.cpp reports "no WMMA - falling back to packed-math kernels".
+Toolchain: /opt/rocm 7.17, hipcc 7.15.26333 (ROCm dropped official gfx1031
+     support but still ships oclc_isa_version_1031.bc, so an explicit
+     --offload-arch=gfx1031 compiles and runs).
+Model: Qwen3-8B-Q4_K_M.gguf (4.68 GiB), /run/media/rr/52CA9D9BCA9D7BC3/x (ntfs3).
+
+--------------------------------------------------------------------------------
+1. The reference had to be HIP, not Vulkan
+--------------------------------------------------------------------------------
+The only llama.cpp on the box that saw a GPU was a Vulkan build, which is the
+wrong comparison for a HIP engine. A native HIP build was configured:
+
+  cmake -B build-hip1031 -S . -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1031 \
+        -DCMAKE_HIP_ARCHITECTURES=gfx1031 -DLLAMA_CURL=OFF
+  cmake --build build-hip1031 -j12 --target llama-bench llama-cli llama-server
+
+  configure rc=0, build rc=0
+  $ llama-cli --list-devices
+    ROCm0: AMD Radeon RX 6700 XT (12272 MiB, 12248 MiB free)
+  $ llama-bench --list-devices
+    ggml_cuda_init: found 1 ROCm devices (Total VRAM: 12272 MiB):
+      Device 0: AMD Radeon RX 6700 XT, gfx1031 (0x1031), VMM: no, Wave Size: 32
+
+Two traps on this box, both of which make a run look like something it is not:
+  - libhipblas.so.3 is not on the default loader path; without
+    LD_LIBRARY_PATH=/opt/rocm/lib the binary refuses to start at all.
+  - llama-bench from build-vulkan is a CPU-backend binary even though the tree
+    is a Vulkan build. It reports backend "CPU" and 30.92 tok/s pp512.
+
+--------------------------------------------------------------------------------
+2. Qwen3-8B-Q4_K_M: kraken vs llama.cpp, both native HIP, same card
+--------------------------------------------------------------------------------
+Interleaved run-by-run, 3 reps, because sequential arms warm the page cache and
+the ordering alone is worth several GB/s here.
+
+  rep 1  kraken   prefill 55 tok 253.2 ms = 217.2 tok/s | decode 64 tok 1306.2 ms = 49.0
+         llama    pp512 911.42 tok/s                     | tg128 61.86 tok/s
+  rep 2  kraken   prefill 55 tok 253.3 ms = 217.1 tok/s | decode 64 tok 1300.4 ms = 49.2
+         llama    pp512 913.14 tok/s                     | tg128 61.87 tok/s
+  rep 3  kraken   prefill 55 tok 253.6 ms = 216.9 tok/s | decode 64 tok 1303.1 ms = 49.1
+         llama    pp512 912.65 tok/s                     | tg128 61.80 tok/s
+
+  decode   49.1 vs 61.8 tok/s  ->  1.26x behind
+  prefill  217  vs 912  tok/s  ->  4.20x behind
+
+Two corrections to the numbers this investigation started from:
+  - The previously recorded "173.0 prefill / 51.0 decode" does not reproduce;
+    the current build measures 217.2 / 49.1.
+  - The prompt lengths are not matched: kraken's --bench prompt is 55 tokens,
+    llama.cpp's pp512 is 512. Prefill tok/s is length-dependent, so the 4.20x
+    is indicative, not a like-for-like ratio. Measuring kraken at 512 is the
+    obvious next step and has not been done.
+
+Read against the 9070 XT (RDNA4), where the same comparison was 12.7x on
+prefill, RDNA2's 4.2x is a much smaller gap. Decode being 1.26x off a tuned
+reference is not the failure it was assumed to be.
+
+--------------------------------------------------------------------------------
+3. OLMoE: the QK-norm convention was wrong on every backend
+--------------------------------------------------------------------------------
+olmoe-1b-7b-0924-q4_k_m-imat.gguf produced degenerate text on the device *and*
+on --cpu, and the two agreed with each other. Two arms agreeing while both are
+wrong means the defect is on a shared path, not in a kernel.
+
+llama.cpp's own OLMoE graph (src/models/olmoe.cpp) does:
+
+    Qcur = build_norm(Qcur, attn_q_norm, NULL, LLM_NORM_RMS, il);   // [n_embd]
+    Kcur = build_norm(Kcur, attn_k_norm, NULL, LLM_NORM_RMS, il);   // [n_embd]
+    Qcur = ggml_reshape_3d(Qcur, n_embd_head, n_head, n_tokens);
+
+i.e. ONE RMS across the whole projected row, applied *before* the head split.
+Qwen3/Gemma3 do the opposite: reshape first, then one norm per head. Kraken had
+only the per-head op (head_norm_kernel<128>), so it read a 2048-wide weight as
+16 heads of 128 and discarded 15/16 of it -- on both backends, which share the
+op. Hence fluency-shaped garbage that device and cpu both agree on.
+
+The stored tensor width is the discriminator, and it is unambiguous:
+
+    Qwen3-8B-Q4_K_M   blk.0.attn_q_norm.weight  [128]    = head_dim   -> per head
+    olmoe-1b-7b       blk.0.attn_q_norm.weight  [2048]   = n_embd     -> whole row
+
+Fix: ModelConfig::qk_norm_wide, decided once at load from that width, refused
+when the width is neither; Backend::qk_norm grows a `wide` argument; new
+row_norm (scalar) and row_norm_kernel<256> (device) reduce across the row with
+one block per token.
+
+Effect on the OLMoE output (greedy, "The capital of France is"):
+    before  " a new is (nical)\nwit, the it is the it"
+    after   " a mann, and the or so-malltend, in-1, ort, and thethe"
+The text changed, so the wide path is live. It is still wrong: this is one of
+(at least) two defects in this model. See section 5.
+
+--------------------------------------------------------------------------------
+4. What was ruled out for OLMoE, by measurement
+--------------------------------------------------------------------------------
+  tokenizer   kraken --tokenize  -> [510, 5347, 273, 6181, 310]
+              llama.cpp /tokenize -> [510, 5347, 273, 6181, 310]
+              identical. The model is reading the right tokens.
+  rope        OLMoE is in llama.cpp's LLAMA_ROPE_TYPE_NORM list
+              (llama-model.cpp ~2955), i.e. adjacent-channel pairing. The
+              llama-family fallback in kraken's arch table already does that.
+  MoE shape   blk.N.ffn_{gate,up}_exps [2048,1024,64], ffn_down_exps [1024,2048,64];
+              kraken's per-expert gemms are (ff_exp=1024, n_embd=2048) and
+              (n_embd, ff_exp), which matches.
+  routing     llama.cpp hardcodes LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX for
+              OLMoE with no expert_weights_scale; kraken's softmax path plus
+              renormalize over the k selected matches.
+  numerics    kraken --debug-topk 6 at step 0: nan=0 inf=0, top logit 8.9375,
+              spread ~2.7 nats. Plausible-but-wrong, not blown up.
+
+Ground truth, same card, same file, llama.cpp HIP, raw /completion:
+    " Paris.\n\nThe capital of the United States is Washington, D.C.\n\nThe capital of the United"
+The file is good. llama.cpp's first token is id 7785 " Paris" at prob 1.0;
+kraken's top candidates are 247/253/417/275/187/271. So the remaining defect
+is in the forward pass, upstream of the logits, and it is not the QK-norm.
+
+--------------------------------------------------------------------------------
+5. Still open
+--------------------------------------------------------------------------------
+  - olmoe-1b-7b remains wrong on both arms after the QK-norm fix. One more
+    shared-path defect is unaccounted for. Coherence-style device-vs-cpu
+    checking cannot find it, because both arms carry it.
+  - kraken has no `olmoe` entry in the arch table, so it reads against llama
+    defaults and says so on every load. Geometry happens to match here; that is
+    luck, not verification.
+  - Prefill on RDNA2 is 4.2x behind (indicative, length-mismatched) and has not
+    been worked on. The earlier profile of the causes (gemm(simt) at 11.4 GB/s
+    against gemv at 132.5 GB/s, download_f32 host stall, ntfs3 warm_read) is
+    from before this build and should be retaken.
+  - Qwen3-8B prefill at a 512-token prompt, for a length-matched ratio.
+  - Laguna greedy output is still not reproducible run-to-run.
+
+--------------------------------------------------------------------------------
+6. Build repairs this session (scripts/build_linux.sh could not link at all)
+--------------------------------------------------------------------------------
+  a. The object list omitted arch.cpp, verdict.cpp and dflash.cpp, all of which
+     engine.cpp and model.cpp reference. The link failed with undefined symbols
+     for assess_model, arch_spec, DflashDraft::*.
+  b. kraken-tests was compiled by handing hipcc the .cpp and the .o files in one
+     invocation. hipcc injects `-x hip`, which applies to every following
+     argument, so the object files were read as source:
+     "common.o:1:87: error: source file is not valid UTF-8".
+     Compiled to an object first, then linked.
+  c. -ffast-math was applied to the scalar/core TUs as well as the device ones.
+     The scalar reference is the oracle every coherence check is measured
+     against; CMake deliberately builds krk_core with -O3 -Wall and
+     -march=native and no fast-math. Now split into core_flags and flags.
+  d. kraken-tests now links krk_core only, no backend_hip.o, matching
+     CMakeLists.txt:339 (`target_link_libraries(kraken-tests PRIVATE krk_core)`).
+
+On (d): with the HIP backend linked into the test process the same quant.cpp
+fails 2 of 2154 checks that pass without it:
+
+    linked with backend_hip.o   2152/2154, rc=1
+      FAIL tests/test_kraken.cpp:529  MXFP4 denormal exponent is a positive finite scale
+    linked krk_core only         2154/2154, rc=0
+
+Proven pre-existing: the unmodified tree, stashed and rebuilt, reproduces
+2152/2154 with the same two failures. The mechanism is NOT flush-to-zero:
+after hipFree(nullptr), MXCSR still reads FTZ=0 DAZ=0 and 1.0f * 2^-128 stays
+2^-128, and the real dequant_row linked with hipcc alone returns 0x1p-128 > 0.
+So linking the HIP backend into the process changes host scalar behaviour by a
+mechanism not yet identified. That matters beyond the test suite: the MoE
+routing plan is built on the host, in the same process, so any such change
+would move the reference that coherence is judged against. Left as a known
+unknown rather than papered over; the script now links what CMake links.
+
+--------------------------------------------------------------------------------
+7. Gate on the primary target after these changes
+--------------------------------------------------------------------------------
+  sh scripts/build_linux.sh gfx1031      build rc=0, 0 "error:" lines
+  ./build-hip/kraken-tests               2154/2154 checks passed, rc=0
+  Qwen3-8B device vs --cpu               byte-for-byte identical, fluent text
+
+And against the reference, same card, same file, greedy, 20 tokens from
+"The history of computing is a history of abstraction":
+
+  kraken device   ". From the earliest mechanical devices to the sophisticated
+                    systems of today, each advancement has been driven by the"
+  kraken --cpu    (identical to the device arm)
+  llama.cpp HIP   ". From the earliest mechanical devices to the sophisticated
+                    systems of today, each advancement has been driven by the"
+
+  -> byte-for-byte agreement with llama.cpp on the device, so the per-head
+     QK-norm path used by every previously working model is unchanged.
+
+Note on getting that reference: /health answers before the weights are loaded,
+so a poll on /health followed by one /completion returns 503 "Loading model".
+Poll /completion itself until it carries a "content" key.
+
+--------------------------------------------------------------------------------
+8. A tooling bug worth recording
+--------------------------------------------------------------------------------
+The sync script ran the tar on maclin: `cd ~/kraken && tar czf - . | ssh ...
+tar xzf -`, which re-streams maclin's own copy of the tree. That is a no-op
+sync that silently builds the previous session's sources, and it reported
+"build rc=0, 0 error lines" twice for code that had never been staged. The tar
+now originates on the Windows checkout and asserts the patch is present in the
+files being sent before it sends them:
+
+    grep -c "qk_norm_wide" src/engine.cpp || { echo "FATAL: patch absent locally"; exit 1; }
+
+Also: `--exclude='build*'` is unanchored and matches scripts/build_linux.sh as
+well as the build directories, so it must be `--exclude='./build*'`.

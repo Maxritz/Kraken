@@ -1003,3 +1003,42 @@ first of those is now testable on real hardware for the first time.
 T1 (running) → T13 (make the detector permanent) → T10 (first real RDNA2
 validation, 30 sessions overdue) → T2 (largest measured number) → T11 (unblocks
 four named files and the maclin Q1_0/Q2_0 pair) → T4/T6 → T8/T9.
+
+--------------------------------------------------------------------------------
+Session entry: RDNA2 head-to-head (HIP reference) + the OLMoE QK-norm
+Evidence: docs/traces/rdna2-qwen3-ab-and-olmoe-qknorm.txt
+
+G12  OLMoE QK-norm convention was wrong on every backend. One RMS across the
+     whole projected [n_embd] row before the head split, not a per-head norm.
+     FIXED (qk_norm_wide + row_norm/row_norm_kernel), gated by the stored
+     weight width and refused when the width is neither head_dim nor n_embd.
+
+G13  olmoe-1b-7b is STILL wrong after G12, on both arms, and the two arms
+     agree with each other -- so the remaining defect is on a shared path and
+     device-vs-cpu checking cannot find it. Ruled out by measurement:
+     tokenizer (identical ids), rope pairing (NORM, matches the fallback),
+     MoE gemm shapes (match the GGUF), routing (matches build_moe_ffn
+     softmax), numerics (nan=0 inf=0, plausible-but-wrong). Needs a reference
+     the arms are compared against that is not kraken itself.
+
+G14  Linking the HIP backend into the same process as the scalar reference
+     changes host floating-point behaviour. Same quant.cpp: 2152/2154 with
+     backend_hip.o linked, 2154/2154 without it. NOT flush-to-zero -- MXCSR
+     still reads FTZ=0 DAZ=0 after hipFree(nullptr) and the isolated
+     dequant_row returns 2^-128 > 0. Mechanism unknown. This matters because
+     the MoE routing plan is built on the host in that same process, so it can
+     move the reference coherence is judged against. Proved pre-existing.
+
+G15  kraken has no `olmoe` entry in the arch table; it reads llama defaults
+     and warns on every load. Geometry matches for this file by luck, not by
+     verification. qwen3moe/qwen35moe/laguna are listed; olmoe is not.
+
+T22  RDNA2 prefill is 4.20x behind llama.cpp HIP (217 vs 912 tok/s). Indicative
+     only: kraken's --bench prompt is 55 tokens and pp512 is 512. Re-measure
+     at 512 before quoting the ratio, then re-take the per-op profile on the
+     current build (the existing one predates it).
+T23  RDNA2 decode is 1.26x behind (49.1 vs 61.8 tok/s). Much less bad than the
+     "MoE loses to llama.cpp CPU-only" reading, which compared across cards.
+T24  Length-matched prefill for T22, as above.
+T25  Root-cause G13 with a per-layer dump against the llama.cpp HIP reference,
+     not against kraken's own cpu arm.

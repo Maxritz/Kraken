@@ -1516,17 +1516,33 @@ public:
     }
 
     void qk_norm(void *q, void *k, const f32 *wq, const f32 *wk, i64 n_head,
-                 i64 n_kv, i64 hd, i64 n_tok, f32 eps) override {
+                 i64 n_kv, i64 hd, i64 n_tok, f32 eps, bool wide) override {
         KRK_TIME_OP("qk_norm");
+        // `wide` is OLMoE: one RMS across the whole projected row, one block
+        // per token. Otherwise the Qwen3/Gemma3 per-head norm.
         if (wq) {
-            head_norm_kernel<128>
-                <<<dim3(static_cast<unsigned>(n_head), static_cast<unsigned>(n_tok)),
-                   128>>>(static_cast<_Float16 *>(q), wq, n_head, hd, eps);
+            if (wide) {
+                row_norm_kernel<256>
+                    <<<dim3(static_cast<unsigned>(n_tok)), 256>>>(
+                        static_cast<_Float16 *>(q), wq, n_head * hd, eps);
+            } else {
+                head_norm_kernel<128>
+                    <<<dim3(static_cast<unsigned>(n_head),
+                            static_cast<unsigned>(n_tok)),
+                       128>>>(static_cast<_Float16 *>(q), wq, n_head, hd, eps);
+            }
         }
         if (wk) {
-            head_norm_kernel<128>
-                <<<dim3(static_cast<unsigned>(n_kv), static_cast<unsigned>(n_tok)),
-                   128>>>(static_cast<_Float16 *>(k), wk, n_kv, hd, eps);
+            if (wide) {
+                row_norm_kernel<256>
+                    <<<dim3(static_cast<unsigned>(n_tok)), 256>>>(
+                        static_cast<_Float16 *>(k), wk, n_kv * hd, eps);
+            } else {
+                head_norm_kernel<128>
+                    <<<dim3(static_cast<unsigned>(n_kv),
+                            static_cast<unsigned>(n_tok)),
+                       128>>>(static_cast<_Float16 *>(k), wk, n_kv, hd, eps);
+            }
         }
     }
 

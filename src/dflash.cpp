@@ -736,7 +736,10 @@ bool DflashDraft::commit(i32 pos0, i32 n) {
         // half of rope() is handed the scratch buffer, which is rotated and
         // discarded. Passing a null there would have to be a special case in two
         // backends for an op that costs a fraction of the projections.
-        be_->qk_norm(nullptr, ws_k_, nullptr, L.k_norm, 0, nkv, hd, n, cfg_.rms_eps);
+        // The drafter is the qwen3-dflash family, whose QK-norm is head_dim
+        // wide and per head, so the OLMoE whole-row convention never applies.
+        be_->qk_norm(nullptr, ws_k_, nullptr, L.k_norm, 0, nkv, hd, n,
+                     cfg_.rms_eps, false);
         be_->rope(ws_q_, ws_k_, nh, nkv, hd, n, pos0, inv_freq_.data(),
                   cfg_.rope_scale, cfg_.rope_frac, cfg_.rope_neox);
         d.layer = l;
@@ -803,7 +806,8 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
             be_->gemm(ws_k_, ws_xn_, L.wk.data, L.wk.type, kv_dim, E, nt);
             be_->gemm(ws_v_, ws_xn_, L.wv.data, L.wv.type, kv_dim, E, nt);
         }
-        be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, nh, nkv, hd, nt, cfg_.rms_eps);
+        be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, nh, nkv, hd, nt,
+                     cfg_.rms_eps, false);
         be_->rope(ws_q_, ws_k_, nh, nkv, hd, nt, blk_pos, inv_freq_.data(),
                   cfg_.rope_scale, cfg_.rope_frac, cfg_.rope_neox);
         d.layer = l;

@@ -554,9 +554,12 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, kv_dim_, n);
         if (L.v_bias) be_->add_bias_rows(ws_v_, L.v_bias, kv_dim_, n);
 
+        // qk_norm_wide is OLMoE's whole-row convention; false is the per-head
+        // one Qwen3 and Gemma3 use. Decided once at load from the stored
+        // weight width -- see ModelConfig::qk_norm_wide.
         if (mc.qk_norm)
             be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, lh, mc.n_head_kv,
-                         mc.head_dim, n, mc.rms_eps);
+                         mc.head_dim, n, mc.rms_eps, mc.qk_norm_wide);
 
         d.layer = l;
         // RoPE + KV append + attention ride one launch on the decode

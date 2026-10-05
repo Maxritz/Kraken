@@ -284,10 +284,14 @@ public:
                       bool neox) = 0;
 
     // Per-head RMSNorm on q/k (Qwen3, Gemma3). No-op when w == nullptr.
+    // `wide` selects OLMoE's convention: one RMS over the whole projected row
+    // (n_head * hd), the weight spanning the row. False is the Qwen3/Gemma3
+    // per-head convention, the weight spanning hd.
     virtual void qk_norm(void *q, void *k, const f32 *wq, const f32 *wk,
-                         i64 n_head, i64 n_kv, i64 hd, i64 n_tok, f32 eps) {
+                         i64 n_head, i64 n_kv, i64 hd, i64 n_tok, f32 eps,
+                         bool wide = false) {
         (void)q; (void)k; (void)wq; (void)wk; (void)n_head; (void)n_kv;
-        (void)hd; (void)n_tok; (void)eps;
+        (void)hd; (void)n_tok; (void)eps; (void)wide;
     }
 
     // Append activations to the KV cache at positions pos0..pos0+n_tok-1.

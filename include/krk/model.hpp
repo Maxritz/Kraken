@@ -116,6 +116,14 @@ struct ModelConfig {
     bool tied_embeddings = false;
     bool has_bias = false;
     bool qk_norm = false;
+    // OLMoE and its relatives normalize Q/K *before* the head split: one RMS
+    // over the whole projected [n_embd] row, weight width n_embd. Qwen3 and
+    // Gemma3 normalize per head, weight width head_dim. The two are not
+    // interchangeable and the difference is silent -- both backends share this
+    // one op, so reading a 2048-wide weight as 16 heads of 128 throws away
+    // 15/16 of it and yields a fluent-but-wrong model on *every* path. The
+    // stored tensor width is what tells them apart (see model.cpp).
+    bool qk_norm_wide = false;
 
     // ---- hybrid full / sliding-window attention (laguna) ------------------
     // Some archs alternate layer kinds. Every layer whose index is not a

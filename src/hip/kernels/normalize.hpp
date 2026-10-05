@@ -95,6 +95,38 @@ __global__ void __launch_bounds__(THREADS)
 }
 
 // ---------------------------------------------------------------------------
+// Whole-row RMSNorm (OLMoE QK-norm). grid.x = tokens; one block per row.
+//
+// The per-head kernel above reduces over head_dim within one head and leaves
+// every head with its own scale. OLMoE instead normalizes the [n_embd]
+// projection *before* the head split, so there is one scale for the whole row
+// and the weight vector spans all n = n_head * head_dim channels. Reducing per
+// head there is the difference between the reference and a wrong answer.
+// ---------------------------------------------------------------------------
+
+template <int THREADS>
+__global__ void __launch_bounds__(THREADS)
+    row_norm_kernel(_Float16 *__restrict__ x, const f32 *__restrict__ w,
+                    i64 n, f32 eps) {
+    const i64 t = blockIdx.x;
+    _Float16 *xr = x + t * n;
+
+    f32 ss = 0.0f;
+    for (i64 i = threadIdx.x; i < n; i += THREADS)
+        ss += static_cast<f32>(xr[i]) * static_cast<f32>(xr[i]);
+    ss = block_reduce_sum<THREADS>(ss);
+
+    __shared__ f32 scale_sh;
+    if (threadIdx.x == 0)
+        scale_sh = rsqrtf(ss / static_cast<f32>(n) + eps);
+    __syncthreads();
+    const f32 scale = scale_sh;
+
+    for (i64 i = threadIdx.x; i < n; i += THREADS)
+        xr[i] = static_cast<_Float16>(static_cast<f32>(xr[i]) * scale * w[i]);
+}
+
+// ---------------------------------------------------------------------------
 // RoPE (interleaved convention, original LLaMA / llama.cpp).
 // grid.x = heads, grid.y = tokens. Pairs adjacent channels (2i, 2i+1),
 // matching the layout the HF exporter writes into GGUF q/k tensors.

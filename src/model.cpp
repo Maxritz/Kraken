@@ -800,6 +800,38 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         L.q_norm = upload_f32(blk_key("blk.%d.attn_q_norm.weight", l));
         L.k_norm = upload_f32(blk_key("blk.%d.attn_k_norm.weight", l));
         if (L.q_norm || L.k_norm) cfg_.qk_norm = true;
+        // Qwen3/Gemma3 store the QK-norm weight as one head (head_dim wide);
+        // OLMoE stores it across the whole projected row (n_embd wide) because
+        // its reference applies the norm before splitting into heads. Nothing
+        // in the schema says which, and the mistake is invisible in the output:
+        // the model still loads, still answers, just wrongly -- and wrongly on
+        // the CPU reference too, because both backends call the same op. So
+        // decide from the stored width, and refuse a width that is neither
+        // rather than reading it as whichever happened to fit.
+        if (cfg_.qk_norm && cfg_.n_embd > 0 && cfg_.head_dim > 0 &&
+            cfg_.n_embd != cfg_.head_dim) {
+            const i64 wide = cfg_.n_embd, per_head = cfg_.head_dim;
+            cfg_.qk_norm_wide = false;
+            for (int i = 0; i < 2; i++) {
+                const char *nm = i == 0 ? "blk.%d.attn_q_norm.weight"
+                                        : "blk.%d.attn_k_norm.weight";
+                const std::string name = blk_key(nm, l);
+                const GgufTensor *t = gguf_.tensor(name);
+                if (!t) continue;
+                const i64 w = t->n_elements;
+                if (w == wide) cfg_.qk_norm_wide = true;
+                else if (w != per_head) {
+                    if (err)
+                        *err = format("%s is %lld wide, which is neither "
+                                      "head_dim (%lld) nor the full row (%lld); "
+                                      "this engine does not know how to apply it",
+                                      name.c_str(), static_cast<long long>(w),
+                                      static_cast<long long>(per_head),
+                                      static_cast<long long>(wide));
+                    return false;
+                }
+            }
+        }
     }
 
     lp.mark("per-layer loop (all weights)");

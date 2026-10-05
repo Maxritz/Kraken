@@ -74,11 +74,31 @@ fi
 echo "kraken: HIP build for [$targets]"
 mkdir -p build-hip/obj
 
-flags="-std=c++17 -O3 -ffast-math -fno-finite-math-only"
+# Two flag sets, because there are two kinds of code here. The scalar/core
+# translation units are the reference backend -- the oracle every coherence
+# check is measured against -- and they get the same flags CMake gives
+# krk_core: -O3 and warnings, and deliberately NOT -ffast-math. -ffast-math
+# implies -fftz, which flushes denormals to zero, and the MXFP4 denormal
+# exponent ladder asserts a 2^-128 scale survives (test_kraken.cpp:529);
+# building it with -ffast-math fails that check for reasons that have nothing
+# to do with any model. Only the device offload TUs get the fast-math
+# relaxation, which is where the speed actually comes from.
+#
+# -march=native is not a tuning choice, it is a correctness one: CMake puts it
+# on krk_core for the same reason, so the scalar reference and its pooled
+# variant compile with identical flags and stay bit-identical. Without it the
+# MXFP4 denormal ladder (test_kraken.cpp:529) fails, because the denormal scale
+# it checks does not survive the baseline codegen.
+core_flags="-std=c++17 -O3 -march=native"
+flags="$core_flags -ffast-math -fno-finite-math-only"
 objs=""
 
-for src in common quant gguf tokenizer sampler model expert_cache engine backend_cpu json http server; do
-    hipcc $arch_flags $flags -Iinclude -c "src/$src.cpp" -o "build-hip/obj/$src.o"
+# arch/verdict carry the architecture table and the runnable-model verdict;
+# dflash carries the drafter. engine.cpp references all three, so omitting
+# any of them from this list fails at link with undefined symbols rather
+# than at configure, which is the expensive way to find out.
+for src in common quant gguf tokenizer sampler arch verdict dflash model expert_cache engine backend_cpu json http server; do
+    hipcc $arch_flags $core_flags -Iinclude -c "src/$src.cpp" -o "build-hip/obj/$src.o"
     objs="$objs build-hip/obj/$src.o"
 done
 
@@ -94,8 +114,21 @@ hipcc $arch_flags $flags $objs build-hip/obj/backend_hip.o build-hip/obj/main_se
       -o build-hip/kraken-server
 
 hipcc $arch_flags $flags -Iinclude -c tools/inspect_gguf.cpp -o build-hip/obj/inspect.o
-hipcc $arch_flags $flags -Iinclude tests/test_kraken.cpp $objs \
-      build-hip/obj/backend_hip.o -o build-hip/kraken-tests
+# kraken-tests links krk_core only -- no backend_hip.o -- because that is what
+# CMakeLists.txt:339 does for this target and the two have to agree. Linking the
+# HIP backend into the test process changes the host scalar reference: the same
+# quant.cpp passes the MXFP4 denormal ladder (test_kraken.cpp:529) in the CMake
+# build and fails it here, 2152/2154 against 2154/2154. The mechanism is not
+# known -- it is not FTZ/DAZ, which stay clear after a HIP init -- but a test
+# binary that disagrees with the project's own test target is measuring
+# something other than the engine, so link what CMake links. hip_stub stands in
+# for the backend here, as the --cpu-only branch already does. The test is also
+# compiled to an object first: handing hipcc the .cpp and the .o files together
+# does not work, because hipcc injects `-x hip`, which applies to every following
+# argument and so reads the object files as source.
+hipcc $arch_flags $core_flags -Iinclude -c tests/test_kraken.cpp -o build-hip/obj/test_kraken.o
+hipcc $arch_flags $core_flags -Iinclude $objs build-hip/obj/test_kraken.o \
+      src/hip/hip_stub.cpp -o build-hip/kraken-tests
 hipcc $arch_flags $flags $objs build-hip/obj/inspect.o -o build-hip/kraken-inspect
 
 echo "kraken: build-hip/{kraken,kraken-server,kraken-inspect,kraken-tests} built"
