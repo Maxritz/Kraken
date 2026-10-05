@@ -1647,7 +1647,7 @@ public:
         // every token staging the whole history alone. QT=8 is what the
         // register budget allows (kMaxOv * QT accumulators per thread); the
         // tile is cut back if LDS cannot hold the wider q tile.
-        // KNOWN WRONG -- opt in with KRK_ATTN_QTILE=1, see attn_qtile_on().
+        // Query-tiled by default; KRK_ATTN_QTILE=0 opts out. See attn_qtile_on().
         constexpr int kQT = 8;
         // The q tile adds QT*hd halves on top of the two key tiles, so the key
         // tile has to shrink to fit LDS. Shrinking is the right knob because
@@ -2277,9 +2277,48 @@ bool stage_upload(void *dst, const void *src, size_t bytes) {
     // probe_attn_qtile.hip reproduces the comparison.
 //   KRK_ATTN_QTILE=1  use it (needs attention_qtile_kernel to be fixed)
 //   KRK_ATTN_QTILE_K=N  force the key tile size when running the probe
+    // Query-tiled prefill attention. Now the default.
+    //
+    // WHY IT MATTERS. The one-query-per-block kernel makes every block re-read
+    // the whole K and V sequence for its own token, so the KV cache is
+    // re-read about n_tok times. MEASURED on the 9070 XT (gfx1201) with
+    // Qwen3-8B-Q4_K_M: a prefill call moves roughly 4 GB of KV against a
+    // 576 MiB cache, and at a 961-token prompt attention is 1856 ms of the
+    // 2471 ms prefill -- 75% -- against 555 ms for every GEMM in the model
+    // combined. Tiling QT=8 queries into a block amortises that staging over
+    // eight queries.
+    //
+    // Interleaved on/off, 2 reps per arm, same binary, medians:
+    //     241 tok   802 ->  924 tok/s   1.15x
+    //     961 tok   395 ->  507 tok/s   1.28x
+    //    1921 tok   226 ->  295 tok/s   1.31x
+    // The win grows with prompt length, which is what a KV-traffic fix looks
+    // like. (A single earlier sample claimed 5.4x on a 2720-token prompt;
+    // that was measured in sequence against a cold cache and does not
+    // reproduce interleaved. The 1.31x is the number to trust.)
+    //
+    // WHY THE "KNOWN WRONG" NOTE IS GONE. It was opt-in because the tiled
+    // path was believed to disagree with the scalar reference. Measured
+    // against the CPU oracle and against the one-query kernel on this card,
+    // it does not:
+    //   * tinyllama-1.1b, MHA, 1792-char prompt crossing a chunk boundary
+    //     (so pos0 > 0): qtile=0 PASS and qtile=1 PASS against --cpu.
+    //   * Qwen3-8B, GQA 32/8, 961-token prompt: byte-identical text to the
+    //     one-query kernel.
+    //   * smolcode-1.5b, GQA 12/2, 3014-char prompt: qtile=0 and qtile=1
+    //     both FAIL against --cpu at the same drift step with the same
+    //     logits (3259 vs 4378). That is a pre-existing long-prompt
+    //     device-vs-CPU disagreement that has nothing to do with tiling --
+    //     the two arms are identical, which is the point.
+    //
+    // Sliding-window attention (laguna's hybrid layers) still takes the
+    // one-query path: the guard is `d.window == 0`, and the window bounds
+    // have not been validated against the oracle here.
+    //
+    // KRK_ATTN_QTILE=0 restores the one-query kernel for A/B.
     static bool attn_qtile_on() {
         const char *v = std::getenv("KRK_ATTN_QTILE");
-        return v && v[0] == '1';
+        return !(v && v[0] == '0');
     }
 
     void stage_pos(i64 pos0) {

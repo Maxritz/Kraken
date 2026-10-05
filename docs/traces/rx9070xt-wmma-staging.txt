@@ -265,3 +265,59 @@ Caveat on these numbers: the profile reports 758 of 2068 ops at or below the
 resolvable. The three rows quoted here (upload, gemm(wmma), attention) are
 all far above the floor and their counts and byte totals are exact, but the
 tail is bounded rather than measured.
+
+9. ATTENTION: TILE THE QUERIES, AND STOP CALLING THE TILED PATH BROKEN
+--------------------------------------------------------------------------------
+Section 8 says where the long-prompt time goes. The fix follows from the same
+arithmetic.
+
+The production kernel launches grid(n_head, n_tok) -- one block per (head,
+token) -- so every block re-reads the entire K and V sequence for its own
+single query. Per prefill call on Qwen3-8B that is about 4 GB of KV traffic
+against a 576 MiB cache: the cache is re-read roughly n_tok times. Tiling
+QT=8 queries per block amortises the staging over eight of them.
+
+An earlier session had recorded this kernel as "fast (~5.4x on a 2720-token
+prompt) but numerically wrong" and left it opt-in. On this card that does not
+reproduce. Measured against the scalar CPU oracle and against the one-query
+kernel:
+
+  * tinyllama-1.1b, MHA, 1792-char prompt crossing a chunk boundary so
+    pos0 > 0: qtile=0 PASS and qtile=1 PASS against --cpu.
+  * Qwen3-8B, GQA 32/8, 961-token prompt: text byte-identical to the
+    one-query kernel.
+  * smolcode-1.5b, GQA 12/2, 3014-char prompt: BOTH arms FAIL against
+    --cpu, at the same drift step with the same logits (3259 vs 4378).
+    That is a pre-existing long-prompt device-vs-CPU disagreement, not a
+    tiling defect -- the arms are identical, which is the whole point. It
+    is a separate open item.
+
+Interleaved on/off, 2 reps per arm, same binary, medians:
+
+    prompt    qtile=0    qtile=1
+     241 tok    802        924     1.15x
+     961 tok    395        507     1.28x
+    1921 tok    226        295     1.31x
+
+The win grows with prompt length, which is what a KV-traffic fix looks like
+and not what a tuning artefact looks like. The old 5.4x figure does not
+reproduce interleaved and should not be believed.
+
+Now the default, so end to end on Qwen3-8B-Q4_K_M (2 reps each, no env var):
+
+     241 tok   966.0 / 978.2 tok/s
+     961 tok   534.9 / 535.5 tok/s   (was 395.1 / 395.3)
+    1921 tok   319.4 / 320.0 tok/s   (was 226.5 / 226.4)
+
+Gate with tiling as the default: build rc=0 / 0 errors, kraken-tests
+2154/2154, kraken-bench --gate rc=0, coherence rc=0 with 3/3 PASS across
+qwen3, qwen2 and llama architectures.
+
+Two things deliberately NOT changed. Sliding-window attention still takes
+the one-query path -- the guard is d.window == 0, because the window bounds
+have not been checked against the oracle here, and laguna uses them. And
+KRK_ATTN_QTILE=0 still restores the one-query kernel for A/B.
+
+Attention is still the largest single prefill cost after this. The re-read
+is amortised 8x, not eliminated; QT is capped at 8 by the LDS budget, and
+raising it trades LDS for traffic again.
