@@ -110,6 +110,14 @@ struct GenerateResult {
     i32 generated = 0;
     f64 prefill_ms = 0;
     f64 decode_ms = 0;
+    // How many decode steps decode_ms actually covers. It is NOT `generated`:
+    // the first generated token comes out of the prefill pass's last-position
+    // logits, so the timer starts after prefill and times one step fewer than
+    // the number of tokens emitted. Dividing by `generated` understated the
+    // per-token cost and printed 2304 tok/s for --max-tokens 1, which is not a
+    // speed any machine can produce: one step still reads every weight.
+    // Counted rather than inferred, so it stays right if the loop changes.
+    i64 decode_steps = 0;
     f64 load_ms = 0;
 };
 
@@ -233,13 +241,13 @@ private:
     // Greedy speculative step; false when the draft cannot help.
     bool generate_speculative(const GenerateParams &p, GenerateResult *res,
                               const std::vector<i32> &ids, f64 *prefill_ms,
-                              f64 *decode_ms);
+                              f64 *decode_ms, i64 *decode_steps);
     // The DFlash variant: the drafter is a head set, not an engine, so the
     // proposals come from a masked block instead of a second model's decode
     // loop, and the target's captured activations are what feed it.
     bool generate_speculative_dflash(const GenerateParams &p, GenerateResult *res,
                                      const std::vector<i32> &ids, f64 *prefill_ms,
-                                     f64 *decode_ms);
+                                     f64 *decode_ms, i64 *decode_steps);
     // Copies the residual stream entering `layer` (or, for mc.n_layer, the
     // pre-final-norm state) into the DFlash drafter's capture buffer. Inert when
     // no drafter is loaded, which is every run that does not ask for one.

@@ -250,7 +250,15 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     const Model &m = engine.model();
     const ModelConfig &mc = m.cfg();
     const f64 ptps = r.prefill_ms > 0 ? r.prompt_tokens / (r.prefill_ms / 1000.0) : 0.0;
-    const f64 dtps = r.decode_ms > 0 ? r.generated / (r.decode_ms / 1000.0) : 0.0;
+    // Over decode_steps, not over r.generated. The first generated token comes
+    // out of the prefill pass, so the decode timer covers one step fewer than
+    // the tokens emitted; dividing by `generated` understated the per-token
+    // cost, and at --max-tokens 1 it printed 2304 tok/s, which no machine can
+    // do -- one decode step still has to read every weight from VRAM.
+    const f64 dtps = r.decode_steps > 0
+                         ? r.decode_steps / (r.decode_ms / 1000.0)
+                         : 0.0;
+    const f64 dper = r.decode_steps > 0 ? r.decode_ms / r.decode_steps : 0.0;
     std::fprintf(out, "\n[stats ] load      %.0f ms", load_ms);
     if (m.upload_bytes() > 0) {
         const f64 gb = static_cast<f64>(m.upload_bytes()) / 1073741824.0;
@@ -261,9 +269,14 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     }
     std::fprintf(out, "\n[stats ] prefill   %d tok in %.1f ms = %.1f tok/s\n",
                  r.prompt_tokens, r.prefill_ms, ptps);
-    std::fprintf(out, "[stats ] decode    %d tok in %.1f ms = %.1f tok/s (%.1f ms/tok)\n",
-                 r.generated, r.decode_ms, dtps,
-                 r.generated > 0 ? r.decode_ms / r.generated : 0.0);
+    // "n tok in T ms" counts every emitted token; the rate is over the steps
+    // that were actually timed, and the step count is printed so the two can
+    // never be confused again.
+    std::fprintf(out,
+                 "[stats ] decode    %d tok in %.1f ms over %lld timed steps "
+                 "= %.1f tok/s (%.1f ms/step)\n",
+                 r.generated, r.decode_ms,
+                 static_cast<long long>(r.decode_steps), dtps, dper);
     if (dev_total > 0)
         std::fprintf(out,
                      "[stats ] device    %.2f GiB in use of %.2f GiB (%.2f GiB free)\n",
@@ -366,7 +379,9 @@ int run_bench(Engine &engine, const Args &a, f64 load_ms, f64 start_ms) {
     }
     usage.stop();
     const f64 prefill_tps = r.prompt_tokens > 0 ? r.prompt_tokens / (r.prefill_ms / 1000.0) : 0;
-    const f64 decode_tps = r.generated > 0 ? r.generated / (r.decode_ms / 1000.0) : 0;
+    const f64 decode_tps = r.decode_steps > 0
+                               ? r.decode_steps / (r.decode_ms / 1000.0)
+                               : 0;
     std::printf("\n");
     std::printf("model          %s\n", engine.model().cfg().name.c_str());
     std::printf("device         %s\n", engine.device().name.c_str());

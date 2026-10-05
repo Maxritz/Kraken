@@ -1521,7 +1521,7 @@ bool Engine::topk_argmax(i32 *out) {
 
 bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
                                   const std::vector<i32> &ids, f64 *prefill_ms,
-                                  f64 *decode_ms) {
+                                  f64 *decode_ms, i64 *decode_steps) {
     Engine &draft = *draft_;
     const i32 k = draft_tokens_;
 
@@ -1549,9 +1549,11 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
     TokenEmitter emit(p, tok_, sampler, res, ids);
 
     const Timer decode_timer;
+    i64 timed_decode_steps = 0;
     auto finish_run = [&](Finish f) {
         res->finish = f;
         *decode_ms = decode_timer.ms();
+        *decode_steps = timed_decode_steps;
         emit.finish(f == FinishStop);
     };
 
@@ -1735,7 +1737,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
 // exactly the tokens the target kept. Nothing is recomputed.
 bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult *res,
                                          const std::vector<i32> &ids, f64 *prefill_ms,
-                                         f64 *decode_ms) {
+                                         f64 *decode_ms, i64 *decode_steps) {
     // Block size caps the window: the block is id_last plus one mask per
     // candidate, and the reference clamps to block_size - 1 for that reason.
     const i32 k = std::max<i32>(1, std::min<i32>(draft_tokens_,
@@ -1762,9 +1764,11 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
     TokenEmitter emit(p, tok_, sampler, res, ids);
 
     const Timer decode_timer;
+    i64 timed_decode_steps = 0;
     auto finish_run = [&](Finish f) {
         res->finish = f;
         *decode_ms = decode_timer.ms();
+        *decode_steps = timed_decode_steps;
         emit.finish(f == FinishStop);
     };
 
@@ -1962,13 +1966,15 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     // there is nothing to choose between them — take the faster one.
     if ((draft_ || dflash_) && p.sampler.greedy && !model_.is_recurrent()) {
         f64 prefill_ms = 0, decode_ms = 0;
+        i64 decode_steps = 0;
         const bool ok = dflash_
                             ? generate_speculative_dflash(p, res, ids, &prefill_ms,
-                                                          &decode_ms)
+                                                          &decode_ms, &decode_steps)
                             : generate_speculative(p, res, ids, &prefill_ms,
-                                                   &decode_ms);
+                                                   &decode_ms, &decode_steps);
         res->prefill_ms = prefill_ms;
         res->decode_ms = decode_ms;
+        res->decode_steps = decode_steps;
         return ok;
     }
     if ((draft_ || dflash_) && !p.sampler.greedy) {
@@ -2000,6 +2006,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
 
     i64 pos = static_cast<i64>(ids.size());
     const Timer decode_timer;
+    i64 timed_decode_steps = 0;
 
     for (i32 gen = 0; gen < p.max_tokens; gen++) {
         if (p.debug_topk > 0)
@@ -2032,6 +2039,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         auto t1 = std::chrono::steady_clock::now();
         pos++;
         fetch_logits(device_topk);
+        timed_decode_steps++;
         if (split) {
             const auto t2 = std::chrono::steady_clock::now();
             g_split_fwd_us +=
@@ -2047,6 +2055,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     emit.finish(res->finish == FinishStop);
 
     res->decode_ms = decode_timer.ms();
+    res->decode_steps = timed_decode_steps;
     if (g_split_steps > 0) {
         const double n = static_cast<double>(g_split_steps);
         std::fprintf(stderr,

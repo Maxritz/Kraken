@@ -467,8 +467,9 @@ static const char *component_of(const char *op) {
                      e - b, host_wall, dev, pc(dev), gap, pc(gap), outside,
                      pc(outside));
         std::fprintf(stderr,
-                     "     %5s %-22s %10s %9s %9s %9s %8s %8s\n", "#", "op",
-                     "t+ us", "dev us", "idle us", "host us", "MB", "GB/s");
+                     "     %5s %-22s %10s %9s %9s %9s %8s %8s %8s\n", "#", "op",
+                     "t+ us", "dev us", "idle us", "host us", "MB", "GB/s",
+                     "TFLOP/s");
         // `t+` is the cumulative device position, chained from dev+idle. It
         // needs no reference event: the two numbers partition the device
         // timeline exactly, so the running sum IS the position, and it makes
@@ -480,11 +481,22 @@ static const char *component_of(const char *op) {
             const double gbs = r.bytes > 0 && r.dev > 0.0
                                    ? static_cast<double>(r.bytes) / (r.dev * 1e6)
                                    : 0.0;
+            // TFLOP/s is what says whether a kernel is inefficient or
+            // whether the shape is small. It was being recorded and never
+            // printed, so the only way to answer that was to re-derive the
+            // arithmetic by hand for every op -- and a hand-derived rate is
+            // exactly the kind of number that gets quoted without checking
+            // the roofline it is being compared against.
+            // r.dev is milliseconds, so flops / (dev_ms * 1e9) is TFLOP/s.
+            const double tflops = r.dev > 0.0 && r.flops > 0
+                                       ? static_cast<double>(r.flops) /
+                                             (r.dev * 1e9)
+                                       : 0.0;
             std::fprintf(stderr,
-                         "     %5zu %-22s %10.2f %9.2f %9.2f %9.2f %8.2f %8.1f\n",
+                         "     %5zu %-22s %10.2f %9.2f %9.2f %9.2f %8.2f %8.1f %8.2f\n",
                          i - b, r.name, t * 1000.0, r.dev * 1000.0,
                          r.gap * 1000.0, r.host * 1000.0,
-                         static_cast<double>(r.bytes) / 1e6, gbs);
+                         static_cast<double>(r.bytes) / 1e6, gbs, tflops);
             t += r.dev + r.gap;
         }
         // Same window, rolled up: the "which op is it" answer to the
