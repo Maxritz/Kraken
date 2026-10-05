@@ -100,6 +100,62 @@ if(KRK_ENABLE_HIP)
                             "builtins require amdclang++")
         endif()
 
+        # ROCm device bitcode location. The compiler only searches
+        # <rocm>/amdgcn/bitcode when ROCM_PATH (or --rocm-path) names the
+        # install root. A relocated runtime pack on neither the default
+        # prefix nor PATH fails every device compile with
+        #   "cannot find ROCm device library; ... '-nogpulib'"
+        # which is a hard error, not a warning.
+        #
+        # This must be applied globally, not just to krk_hip: CMake
+        # compiles the executable targets' .cpp files with amdclang++ and
+        # an injected `-x hip`, so they are device compiles too and they
+        # fail identically. Compile *and* link options are needed because
+        # the device-link step resolves the same libraries.
+        set(_krk_devlib "")
+        get_filename_component(_hip_bin "${CMAKE_HIP_COMPILER}" DIRECTORY)
+        get_filename_component(_llvm_root "${_hip_bin}" DIRECTORY)   # .../lib/llvm
+        get_filename_component(_rocm_root "${_llvm_root}" DIRECTORY) # .../lib
+        foreach(_cand "${_rocm_root}/llvm/amdgcn/bitcode"
+                    "${_llvm_root}/amdgcn/bitcode"
+                    "${_rocm_root}/amdgcn/bitcode")
+            if(EXISTS "${_cand}/oclc_abi_version_600.bc")
+                set(_krk_devlib "${_cand}")
+                break()
+            endif()
+        endforeach()
+        # Second tier: the compiler's own pack can be present but hollow.
+        # MEASURED on this host: G:/ROCM10RT-gfx1201/lib/llvm/amdgcn/bitcode
+        # was emptied at 17:16 on 2025-10-05 while the tree above it stayed
+        # intact, and every device compile then failed. The arch libraries
+        # are not per-pack -- oclc_isa_version_1201.bc is identical in every
+        # ROCm 10 pack -- so a sibling pack of the same product line is a
+        # valid source. Prefer the same product prefix (everything up to the
+        # first '-'), which also keeps the compiler's ROCm major version
+        # matched to the bitcode it has to load.
+        if(NOT _krk_devlib)
+            get_filename_component(_pack_dir "${_rocm_root}" DIRECTORY)
+            get_filename_component(_pack_base "${_pack_dir}" NAME)
+            string(REGEX REPLACE "-.*$" "" _pack_prefix "${_pack_base}")
+            file(GLOB _siblings "${_pack_dir}/../${_pack_prefix}*/lib/llvm/amdgcn/bitcode")
+            foreach(_cand IN LISTS _siblings)
+                if(EXISTS "${_cand}/oclc_isa_version_600.bc")
+                    set(_krk_devlib "${_cand}")
+                    message(WARNING "kraken: ${_pack_dir} has no device "
+                                    "bitcode; using sibling pack ${_cand}")
+                    break()
+                endif()
+            endforeach()
+        endif()
+        if(_krk_devlib)
+            add_compile_options(--rocm-device-lib-path=${_krk_devlib})
+            add_link_options(--rocm-device-lib-path=${_krk_devlib})
+            message(STATUS "kraken: ROCm device bitcode = ${_krk_devlib}")
+        else()
+            message(WARNING "kraken: ROCm device bitcode not found next to "
+                            "${CMAKE_HIP_COMPILER}; device compiles may fail")
+        endif()
+
         add_library(krk_hip STATIC src/hip/backend_hip.hip)
         target_include_directories(krk_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                   ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -119,12 +175,7 @@ if(KRK_ENABLE_HIP)
         endforeach()
         target_compile_options(krk_hip PRIVATE -O3 -ffast-math
                                                -fno-finite-math-only)
-        if(hip_FOUND AND TARGET hip::device)
-            target_link_libraries(krk_hip PUBLIC hip::device)
-        elseif(HIP_FOUND)
-            target_include_directories(krk_hip PUBLIC ${HIP_INCLUDE_DIRS})
-            target_link_libraries(krk_hip PUBLIC ${HIP_LIBRARIES})
-        endif()
+
         message(STATUS "kraken: HIP backend enabled, targets = ${KRK_GPU_TARGETS}")
     else()
         message(STATUS "kraken: HIP SDK not found — building the CPU backend only")
