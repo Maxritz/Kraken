@@ -178,9 +178,16 @@ for m in "${models[@]}"; do
         verdict="PASS"
     else
         why=$(first_diff "$m")
+        # "same picks" means first_diff walked every step and found NO step
+        # where the two backends chose different tokens -- they agreed on the
+        # whole generation, and the text can only differ in whitespace or line
+        # wrapping. That is coherence, and the case fell through to FAIL
+        # because it matched neither branch. It has to be PASS: a checker that
+        # reports FAIL when the engines agreed turns the gate into noise and
+        # hides the drift cases it exists to catch.
         case "$why" in
-            tie*) verdict="PASS ($why)" ;;
-            *)     verdict="FAIL ($why)" ;;
+            tie*|"same picks") verdict="PASS ($why)" ;;
+            *)                 verdict="FAIL ($why)" ;;
         esac
     fi
     if ! text_ok "$gpu"; then verdict="FAIL (text: $(echo "$gpu" | tr '\n' ' ' | cut -c1-70))"; fi
