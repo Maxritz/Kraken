@@ -1,0 +1,139 @@
+RDNA2 (gfx1031) prefill investigation — measured bottleneck ranking
+================================================================================
+Host: rr@10.0.0.12 (maclin). Card: RX 6700 XT, gfx1031, RDNA2, 40 CU, wave32,
+12.0 GiB VRAM. No WMMA (both engines print this).
+Model: Qwen3-8B-Q4_K_M.gguf (4.68 GiB), ntfs3 mount.
+Reference: llama.cpp built natively for HIP on the same box and the same card
+(build-hip1031, ROCm0: AMD Radeon RX 6700 XT). Same file, same card.
+
+--------------------------------------------------------------------------------
+1. Baseline, length-matched
+--------------------------------------------------------------------------------
+The earlier 4.2x figure compared a 55-token kraken prompt against llama.cpp's
+pp512, which is not the same work. The prompt is now verified with kraken's own
+--tokenize (361 tokens) and llama.cpp is run at exactly pp361.
+
+  rep 1  kraken  361 tok in 1771.8 ms = 203.8    llama.cpp pp361 = 830.50
+  rep 2  kraken  361 tok in 1809.9 ms = 199.5    llama.cpp pp361 = 830.76
+  rep 3  kraken  361 tok in 1799.2 ms = 200.6    llama.cpp pp361 = 831.39
+
+  kraken mean 201.0 tok/s vs llama.cpp 830.9 tok/s  ->  4.13x
+
+--------------------------------------------------------------------------------
+2. Decomposition of the 1784.7 ms prefill
+--------------------------------------------------------------------------------
+1,157 ops, 1,778.8 ms device time against a 1,784.7 ms wall clock: the GPU is
+essentially never idle, so this is not a launch-overhead or bubble problem.
+
+  op            calls    dev_ms    share
+  gemm(simt)      504   1319.8     74.2%
+  attention        72    437.9     24.6%
+  rmsnorm         145      3.0      0.2%
+  qk_norm          72      2.6      0.1%
+  silu_mul         72      2.6      0.1%
+  rope             72      1.9      0.1%
+  embed             2      4.7      0.3%
+
+Three quarters of prefill is one kernel. Everything else is noise.
+
+--------------------------------------------------------------------------------
+3. Achieved throughput against the gfx1031 roofline
+--------------------------------------------------------------------------------
+The profile recorded FLOPs per op and never printed them, so this column was
+added first (commit 8ac35a7). Roofline for this part:
+
+  40 CU x 64 FP32 lanes x 2 FLOP x 2.41 GHz  = 12.3 TFLOP/s fp32
+  v_dot2_f32_f16 is 4 FLOP/instruction       = 24.6 TFLOP/s packed fp16
+
+A rate above 12.3 can only have come from the packed form, so the measurement
+also says which instruction path the kernel took.
+
+  arm base                          arm both (int8 + qtile)
+  gemm(simt)   504  3.78 TFLOP/s    gemm(simt)    72  1.08 TFLOP/s
+                   = 31% fp32           =  9% fp32
+                   = 15% packed         =  4% packed
+                                    gemm(dp4a)  432 10.33 TFLOP/s
+                                             = 84% fp32
+                                             = 42% packed
+  attention     72  438.2 ms        attention     72  273.7 ms
+
+--------------------------------------------------------------------------------
+4. The two causes, both measured
+--------------------------------------------------------------------------------
+(a) The int8/DP4A rung is OFF BY DEFAULT ON EVERY CARD.
+
+    backend_hip.hip:222
+      const char *ie = std::getenv("KRK_GEMM_INT8");
+      int8_gemm_ = ie && std::strcmp(ie, "0") != 0;
+
+    The comment above it says it is lossy and "no default in this tree is
+    allowed to be lossy". The dispatch trace confirms it never runs: base shows
+    504 gemm(simt) and zero gemm(dp4a). Enabling it moved 432 of 504 GEMMs off
+    the SIMT tile, and those 432 reach 10.33 TFLOP/s against the SIMT tile's
+    3.78 — a 2.7x difference in kernel efficiency, not a marginal tuning win.
+
+    The file also records the measured boundary (gemm_dp4a.hpp, kDp4aMinK=2048):
+      SmolLM2-135M  K=576/1536   2827 -> 1641 tok/s   0.58x  LOSES
+      Llama-3.2-1B  K=2048/8192  1120 -> 2060 tok/s   1.84x  wins
+      Qwen3.5-9B    K=4096/12288  175.6 -> 198.7      1.13x  wins
+    Qwen3-8B has K=4096/12288, the same regime as the 1.13x winner.
+
+(b) Q6_K is excluded from DP4A, and those tensors are now the bottleneck.
+
+    gemm_dp4a.hpp:563   constexpr bool kDp4aEnableQ6K = false;
+
+    Qwen3-8B-Q4_K_M is a mixed quant. Per layer, from the file's own tensors:
+      attn_q, attn_k, attn_o, ffn_gate, ffn_up   Q4_K (type 12)  -> dp4a OK
+      attn_v, ffn_down                             Q6_K (type 14)  -> blocked
+
+    With DP4A on, 72 of 504 GEMMs stay on SIMT and those 72 now cost 654 ms at
+    1.08 TFLOP/s — the worst rate in the whole profile, and roughly half the
+    arm's total time for one seventh of the GEMMs. The comment says the Q6_K
+    kernel lost on register pressure (245 ms over 32 dispatches, 327 ms of GEMM
+    against the fp16 tile's 256 ms) but "stays compiled and is covered by
+    tools/gemm_i8k_verify.cpp so that a register budget can re-enable it".
+
+--------------------------------------------------------------------------------
+5. Result: four interleaved arms, 3 reps, one binary
+--------------------------------------------------------------------------------
+Both switches already exist, so the arms are one environment apart — same
+compiler, same binary, and per AGENTS.md the arms were interleaved run by run.
+
+  arm                             rep1     rep2     rep3     mean    ratio
+  A  simt, no qtile              204.6    203.6    203.0    203.7    1.00x
+  B  KRK_GEMM_INT8=1              237.7    238.2    238.5    238.1    1.17x
+  C  KRK_ATTN_QTILE=1             224.5    224.1    224.7    224.4    1.10x
+  D  both                         265.3    265.7    265.4    265.5    1.30x
+
+Correctness: all four arms produce BYTE-IDENTICAL generated text over 24 greedy
+tokens. Arm B is lossy by construction, so this was checked explicitly rather
+than assumed.
+
+  203.7 -> 265.5 tok/s is 1.30x. Still 3.13x behind llama.cpp's 830.9.
+
+--------------------------------------------------------------------------------
+6. What is left, ranked
+--------------------------------------------------------------------------------
+1. Q6_K GEMMs: 72 calls, 654 ms at 1.08 TFLOP/s. Fixing the register budget
+   behind kDp4aEnableQ6K is the single largest remaining item and the work is
+   already scoped by the file and covered by tools/gemm_i8k_verify.cpp.
+2. The SIMT tile at 3.78 TFLOP/s = 15% of the packed-fp16 ceiling. llama.cpp
+   implies ~13.6 TFLOP/s on the same work (55% of packed). This is a tiling /
+   occupancy problem in gemm.hpp, not an instruction-selection problem.
+3. Attention: 438 -> 274 ms already captured by qtile; flash attention would
+   attack the rest.
+4. Whether KRK_GEMM_INT8 should become the default at all is a precision
+   policy call, not a performance one. It is lossy by construction; it measured
+   byte-identical on this model at this length, which is evidence and not proof.
+
+Note on an earlier wrong turn: the hypothesis that this was an fp32-vs-fp16
+precision problem was wrong. KRK_SIMT_USE_DOT2 excludes gfx12 on purpose, and
+gemm.hpp documents the measurement behind it (gfx1201: 68 us scalar vs 195 us
+packed for the same shape). On gfx1031 the packed form is already selected.
+
+--------------------------------------------------------------------------------
+7. Gate
+--------------------------------------------------------------------------------
+  sh scripts/build_linux.sh gfx1031   build rc=0, 0 "error:" lines
+  ./build-hip/kraken-tests            2154/2154 checks passed, rc=0
+  Qwen3-8B device == llama.cpp HIP, byte for byte, on the same card
