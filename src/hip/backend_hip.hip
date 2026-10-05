@@ -1648,38 +1648,77 @@ public:
         // register budget allows (kMaxOv * QT accumulators per thread); the
         // tile is cut back if LDS cannot hold the wider q tile.
         // Query-tiled by default; KRK_ATTN_QTILE=0 opts out. See attn_qtile_on().
-        constexpr int kQT = 8;
-        // The q tile adds QT*hd halves on top of the two key tiles, so the key
-        // tile has to shrink to fit LDS. Shrinking is the right knob because
-        // the sharing factor (QT) is what buys the win, while tile_k only
-        // controls barrier count -- 16 keys already keeps every lane of the
-        // staging loops busy at kAttnBlock = 128.
-        int qtile_k = tile_k;
-        while (qtile_k > 8 &&
-               attn_qtile_smem_bytes<kQT>(qtile_k, d.hd) > caps_.lds_bytes)
-            qtile_k /= 2;
-        if (const char *fk = std::getenv("KRK_ATTN_QTILE_K")) {
-            const int want = std::atoi(fk);
-            if (want > 0 &&
-                attn_qtile_smem_bytes<kQT>(want, d.hd) <= caps_.lds_bytes)
-                qtile_k = want;
+        // QT is a template parameter, so the three candidates are instantiated
+        // and picked at runtime. That is deliberate: the A/B then runs
+        // interleaved inside ONE binary, which is the only way these numbers
+        // mean anything on this card. Across rebuilds the second arm reads a
+        // warm cache and wins for reasons that have nothing to do with the
+        // kernel.
+        //
+        // The constraint is registers, not LDS. For hd=128, tile_k=64 the LDS
+        // cost is 36 KB at QT=8, 40 KB at QT=16 and 48 KB at QT=32, all inside
+        // this card's 64 KB. The accumulators are kMaxOv * QT floats per
+        // thread -- 16 at QT=8, 32 at QT=16, 64 at QT=32 -- and that is what
+        // decides where it stops paying.
+        //
+        // KRK_ATTN_QTILE_QT selects. The default is 16, measured on the
+        // 9070 XT with Qwen3-8B-Q4_K_M at a 961-token prompt, 3 reps
+        // interleaved inside one binary:
+        //
+        //     QT=8    506.8 / 509.9 / 510.9 tok/s   median 509.9
+        //     QT=16   527.1 / 525.9 / 525.4 tok/s   median 525.9   1.03x
+        //     QT=32   437.7 / 437.8 / 436.3 tok/s   median 437.7   0.86x
+        //
+        // QT=32 losing 14% is the register budget, not LDS: every candidate
+        // fits LDS comfortably (36/40/48 KB against 64 KB), but the
+        // accumulators are kMaxOv * QT floats per thread and 64 of them
+        // spill. That is also why this was measured rather than assumed --
+        // "bigger tile, less traffic" would have picked 32 and lost.
+        //
+        // KRK_ATTN_QTILE_K still overrides the key tile.
+        // Query-tiled by default; KRK_ATTN_QTILE=0 opts out. See attn_qtile_on().
+#define KRK_ATTN_QTILE_DISPATCH(QTV)                                          \
+    do {                                                                     \
+        int kk = tile_k;                                                     \
+        while (kk > 8 &&                                                     \
+               attn_qtile_smem_bytes<QTV>(kk, d.hd) > caps_.lds_bytes)        \
+            kk /= 2;                                                         \
+        if (const char *fk = std::getenv("KRK_ATTN_QTILE_K")) {               \
+            const int want = std::atoi(fk);                                   \
+            if (want > 0 &&                                                   \
+                attn_qtile_smem_bytes<QTV>(want, d.hd) <= caps_.lds_bytes)    \
+                kk = want;                                                    \
+        }                                                                    \
+        if (attn_qtile_on() && d.window == 0 &&                               \
+            attn_qtile_smem_bytes<QTV>(kk, d.hd) <= caps_.lds_bytes) {        \
+            const size_t qs = attn_qtile_smem_bytes<QTV>(kk, d.hd);           \
+            const dim3 g(static_cast<unsigned>(d.n_head),                     \
+                         static_cast<unsigned>((d.n_tok + (QTV) - 1) / (QTV))); \
+            KRK_HIP(hipFuncSetAttribute(                                      \
+                reinterpret_cast<const void *>(&attention_qtile_kernel<QTV>), \
+                hipFuncAttributeMaxDynamicSharedMemorySize,                   \
+                static_cast<int>(qs + 512)));                                 \
+            attention_qtile_kernel<QTV><<<g, kAttnBlock, qs>>>(               \
+                static_cast<_Float16 *>(out),                                \
+                static_cast<const _Float16 *>(q),                            \
+                static_cast<const _Float16 *>(kc),                           \
+                static_cast<const _Float16 *>(vc), d.n_head, d.n_kv, d.hd,   \
+                d.n_tok, d.pos0, d.pos_stride, d.causal ? 1 : 0, d.scale, kk);\
+            return;                                                          \
+        }                                                                    \
+    } while (0)
+
+        {
+            const char *fq = std::getenv("KRK_ATTN_QTILE_QT");
+            const int want = fq ? std::atoi(fq) : 16;
+            if (want >= 32)
+                KRK_ATTN_QTILE_DISPATCH(32);
+            else if (want >= 16)
+                KRK_ATTN_QTILE_DISPATCH(16);
+            else
+                KRK_ATTN_QTILE_DISPATCH(8);
         }
-        if (attn_qtile_on() && d.window == 0 &&
-            attn_qtile_smem_bytes<kQT>(qtile_k, d.hd) <= caps_.lds_bytes) {
-            const size_t qsmem = attn_qtile_smem_bytes<kQT>(qtile_k, d.hd);
-            const dim3 grid(static_cast<unsigned>(d.n_head),
-                            static_cast<unsigned>((d.n_tok + kQT - 1) / kQT));
-            KRK_HIP(hipFuncSetAttribute(
-                reinterpret_cast<const void *>(&attention_qtile_kernel<kQT>),
-                hipFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(qsmem + 512)));
-            attention_qtile_kernel<kQT><<<grid, kAttnBlock, qsmem>>>(
-                static_cast<_Float16 *>(out), static_cast<const _Float16 *>(q),
-                static_cast<const _Float16 *>(kc), static_cast<const _Float16 *>(vc),
-                d.n_head, d.n_kv, d.hd, d.n_tok, d.pos0, d.pos_stride,
-                d.causal ? 1 : 0, d.scale, qtile_k);
-            return;
-        }
+#undef KRK_ATTN_QTILE_DISPATCH
 
         if (smem > caps_.lds_bytes) {
             KRK_ERROR("attention: %zu bytes of LDS requested, device has %d", smem,

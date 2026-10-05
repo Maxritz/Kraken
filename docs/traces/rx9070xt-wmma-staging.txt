@@ -321,3 +321,59 @@ KRK_ATTN_QTILE=0 still restores the one-query kernel for A/B.
 Attention is still the largest single prefill cost after this. The re-read
 is amortised 8x, not eliminated; QT is capped at 8 by the LDS budget, and
 raising it trades LDS for traffic again.
+
+10. TWO RESULTS THAT CHANGED WHAT I BELIEVED
+--------------------------------------------------------------------------------
+(a) The coherence checker had a false-failure path of its own.
+
+first_diff() prints "same picks" when it walks every generated step and finds
+NO step where the two backends chose different tokens. The verdict case was
+
+    tie*)  verdict="PASS ($why)" ;;
+    *)     verdict="FAIL ($why)" ;;
+
+so identical picks matched neither branch and were reported as FAIL with a
+non-zero exit. Identical picks means the engines agreed on the whole
+generation and the text can only differ in whitespace or line wrapping.
+Reproduced and fixed: the same model, prompt and settings that returned
+"FAIL (same picks) rc=1" return "PASS rc=0". A checker that cries wolf here
+hides the drift cases it exists to catch.
+
+(b) With that fixed, the smolcode long-prompt failure is NOT systematic.
+
+Prompt-length sweep, smolcode-coder-1.5b, tiling off, 16 tokens:
+
+    822 chars   PASS
+   1644 chars   PASS   (was "FAIL (same picks)" -- checker bug, above)
+   3288 chars   PASS
+
+The earlier "FAIL (drift step 21, 3259 vs 4378)" was a single step out of 24
+on one prompt length, at long context, and it does not reproduce on a longer
+prompt with the same model. Both attention arms produced identical logits at
+that step. So the accurate description is an intermittent near-tie divergence
+between the fp16 device path and the fp32 scalar reference at long context,
+not a systematic device bug -- and it is not fixed, only bounded and
+characterised. The checker has a tie tolerance for exactly this; tol=0.05
+judged that instance a drift, so the gap at that step was real, just not
+reproducible.
+
+(c) Query tile 16 beats 8, and 32 loses.
+
+QT is a template parameter, so all three are instantiated and selected at
+runtime (KRK_ATTN_QTILE_QT) -- the A/B then interleaves inside ONE binary,
+which is the only way the numbers mean anything here. Qwen3-8B-Q4_K_M, 961
+tokens, 3 reps:
+
+    QT=8    506.8 / 509.9 / 510.9 tok/s   median 509.9
+    QT=16   527.1 / 525.9 / 525.4 tok/s   median 525.9   1.03x
+    QT=32   437.7 / 437.8 / 436.3 tok/s   median 437.7   0.86x
+
+QT=32 losing 14% is registers, not LDS: all three fit LDS comfortably
+(36/40/48 KB against this card's 64 KB), but the accumulators are
+kMaxOv * QT floats per thread and 64 of them spill. "Bigger tile, less
+traffic" would have picked 32 and lost -- this is why it was measured.
+
+Default is now 16. End to end at 961 tokens: 535 -> 545 tok/s.
+
+Gate: build rc=0 / 0 errors, kraken-tests 2154/2154, --gate rc=0, coherence
+rc=0 with 3/3 PASS.
