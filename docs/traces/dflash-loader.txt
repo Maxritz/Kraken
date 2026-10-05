@@ -1,0 +1,88 @@
+# DFlash draft loader: contract, both spellings, and 0% acceptance
+
+A Laguna target can now load Poolside's draft heads and run the full DFlash path
+(feature-fusion encoder, KV injection, masked block decode) through `--draft`.
+
+## 1. What the two local head sets are
+
+| file | arch | blocks | embd | heads | ff | block_size | capture |
+|---|---|---|---|---|---|---|---|
+| `laguna-s-2.1-DFlash-Q4_K_M.gguf` | `dflash` | 6 | 3072 | 72/8 | 12288 | 16 | `[2,11,20,30,39,48]` |
+| `laguna-xs21-dflash-q8.gguf` | `qwen35-dflash-draft` | 5 | 2048 | 64/8 | 8192 | 16 | `[1,13,25,33,39]` |
+
+Both were verified to be **draft heads, not models**: `kraken-inspect` reports
+"draft file (not a model)".
+
+`laguna-xs21-dflash-q8.gguf` is a third-party export (Lucebox quant of
+`poolside/Laguna-XS-2.1-DFlash`). It names its tensors under a `dflash.` prefix
+and carries no tokenizer; llama.cpp cannot load it at all ("unknown model
+architecture: 'qwen35-dflash-draft'"). The rewrite that makes it native is
+`dflash.target_layers = [id + 1 for id in target_layer_ids]`, `fc.weight`,
+`enc.output_norm.weight`, stacked `enc.aux_norm.weight`, and the tokenizer
+copied from the target.
+
+## 2. The contract, and where the flags come from
+
+The authoritative statement is Lucebox's own engine (`server/src/draft/draft_graph.cpp`,
+`server/src/luce/…`), which produced the file:
+
+* **injection is normed**: `tf_kv = rms_norm(tf); tf_kv *= L.attn_norm` when
+  `context_kv_layer_norm`. The loader sets that flag from the metadata **or**
+  from the tensors: `n_gate_layers > 0 || !aux_hidden_norms.empty()`.
+* **the noise block is per layer**: `SWA = causal, full = non-causal`
+  (`draft_graph.cpp:298`). llama.cpp's Laguna decoder instead flips one global
+  switch, and the official converter derives it from the tensors
+  (`attn_gate` present ⇒ `decoder_arch = laguna` ⇒ causal).
+
+kraken derives both from the tensors now, so a third-party head set gets the
+contract of the engine it was exported for:
+
+```
+[info ] dflash contract: normed injection, causal block (5/5 layers causal),
+        aux norms stacked, rope 128/128 base 500000, decoder from tensors
+```
+
+Capture ids are per slot and unsorted (the aux-norm weights pair by slot); the
+mask id comes from `dflash.mask_token_id` → `tokenizer.ggml.mask_token_id` →
+`tokenizer.ggml.unknown_token_id` (all three files: id 12 = `〈|MASK|〉`).
+
+## 3. Acceptance is zero — and so is the reference's
+
+| target | drafter | kraken | llama.cpp reference |
+|---|---|---|---|
+| `laguna-xs2-Q4_K_M` (XS.**2**) | `laguna-xs21-dflash-q8` (XS **2.1**) | 0/96 | **0/200 (0.000%)** |
+| `Laguna-XS-2.1-IQ3_XXS` | `laguna-xs21-dflash-q8` | — (IQ3 not loadable) | 3/184 (1.63%) |
+| `Laguna-S-2.1` (official shards) | `laguna-s-2.1-DFlash-Q4_K_M` | — | **0/200 (0.000%)** |
+
+Poolside's own card claims mean acceptance lengths of 3.55–4.57 tokens for this
+drafter. The reference implementation, built from `poolsideai/llama.cpp` branch
+`laguna` (`/tmp/poolside-llama/build-cpu3`, `llama-speculative-simple`), reports
+0.000% on the official S-2.1 pair — so the zero is **not** a kraken defect on
+that pair, and the `xs2` pairing is additionally a generation mismatch (XS.2 vs
+XS 2.1 drafter).
+
+Two notes on the reference run, because they matter for reproducing it:
+* `examples/speculative-simple` never sets `cparams.ctx_other = ctx_tgt`, which
+  a DFlash context requires; the run above uses a one-line patch that does.
+* the official S-2.1 pair takes 2 minutes to load and 59 s for 235 tokens on
+  CPU, so it is a slow experiment.
+
+## 4. What is verified
+
+* Both spellings load, build a drafter, and run the encoder + injection + block.
+* The target's greedy output is **byte-identical** with and without `--draft`
+  (speculation cannot change a verified output).
+* `kraken` and `kraken-tests` build rc=0 with 0 `error:` lines; `kraken-tests`
+  2154/2154; `kraken-bench --gate` rc=0.
+
+## 5. What is not
+
+* Acceptance is 0 in every arm measured; the loader is structurally correct
+  (capture points, `fc` orientation, geometry, rope type all checked against
+  both sources) but nothing here demonstrates the draft head is *useful*.
+* The encoder output is RMS-normalised (`enc_out rms ≈ 1.0` measured) and the
+  block logits are plausible (row max ≈ 5.9, not saturated, not NaN) yet rank
+  completely differently from the target's (`--debug-topk 12` at pos 27:
+  target `785=29.77`, drafter `18073=5.90`). A drafter whose features never
+  reached it and one that is merely displaced look identical from here.
+* The reference comparison on S-2.1 is one run, on CPU, with a patched example.

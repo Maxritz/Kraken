@@ -1,0 +1,99 @@
+# Low-bit quant types: what the four requested files actually need
+
+Investigation prompted by four files that kraken could not load. Three distinct
+blockers, plus one file that is not a model.
+
+## 1. What each file is
+
+| file | arch | tensors | size | verdict |
+|---|---|---|---|---|
+| `Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf` | qwen35 | 851 | 7.83 GiB | needs IQ2_XS, IQ2_S, IQ3_S, IQ3_XXS |
+| `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-0000{1,2}-of-00002` | — | — | 39.8 + 28.4 GB | needs **GGML type 42** |
+| `Qwen3.8-Flash-Next-ngram-embeddings-Q4_0.gguf` | qwen4exp | **2** | 27.45 GiB | **not a model**: it is the `00002-of-00002` shard |
+
+The embeddings file has exactly two tensors — one 26.8 GiB Q4_0 table and one
+644 MiB Q8_0 — because it is the token + n-gram embedding shard of
+`Qwen3.8-Flash-Next`, loaded alongside the main weights. Its own model card
+(`pfeifferj/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`) documents the layout: the runtime
+gets the main `-00001` shard and this as `-00002`, with both embedding matrices
+pinned to CPU and `--load-mode mmap`.
+
+## 2. Type id 42 is Q2_0
+
+From the runtime the model card pins (`ggml-org/llama.cpp` @ `f3f1a8f`):
+
+```
+GGML_TYPE_NVFP4 = 40,
+GGML_TYPE_Q1_0  = 41,
+GGML_TYPE_Q2_0  = 42,     <-- the unknown id
+GGML_TYPE_COUNT = 43,
+```
+
+| type | block | values | bytes | layout |
+|---|---|---|---|---|
+| Q1_0 | 18 | 128 | 18 | fp16 d + 16 bytes of 1-bit codes |
+| Q2_0 | 18 | 64 | 18 | fp16 d + 16 bytes of 2-bit codes |
+
+`gguf-py` cannot even name type 42, which is why the Swift shards failed to read
+at all. The model card's "Gate/up candidates Q2_0/Q2_K/Q3_K/Q4_K; down
+candidates Q2_0/Q4_0" confirms the expert projections are where it appears.
+
+## 3. IQ2_XS — implemented and verified
+
+kraken had IQ2_XXS (66-byte blocks) but not IQ2_XS (74-byte blocks). The layouts
+differ in more than the grid:
+
+```
+block_iq2_xs:  fp16 d | uint16 qs[32] | uint8 scales[8]
+   bits 0..8 of qs[k]  = grid index (0..511)
+   bits 9..15          = sign code
+   scales[ib32] low nibble = first 16 values of the group, high nibble = second
+   db = d * (0.5f + scale) * 0.25f
+```
+
+The first attempt at this was wrong in three ways at once — 84-byte blocks, the
+scale bytes at the wrong offset, and a 364-entry grid copied by hand — and every
+one of those produces plausible output rather than a crash. The corrected version
+takes all three tables from `ggml-common.h` and validates:
+
+```
+tensor blk.1.ffn_down.weight  shape=(17408, 5120)  bytes=25763840
+blocks 348160 (74 bytes, 110.6M values)
+all finite      : True
+range           : [-0.0314, 0.0307]
+rms             : 0.00933
+first block values outside the IQ2_XS codebook: 0 of 256
+iq2xs vs iq2xxs first 256 entries identical: False
+```
+
+Every dequantized value lies exactly on `d*(0.5+k)/4*{8,25,43}`, which a wrong
+grid, a wrong scale offset or a wrong sign table cannot satisfy. The grid was
+also checked to be genuinely different from IQ2_XXS's (it is not a copy) and all
+512 entries decode into the {8, 25, 43} byte set.
+
+Added: `DType::IQ2_XS = 17`, `deq_iq2_xs`, `kIq2xsGrid[512]`, the `KRK_QTRAIT`
+entry (8 chunks/block), and the device block size (74). **The device-side
+dequant kernel body still needs its IQ2_XS branch** — the traits are declared but
+`dequant_chunk<DType::IQ2_XS>` has no case yet, so a GPU run would not use it.
+
+## 4. Still missing
+
+| type | id | bytes | status |
+|---|---|---|---|
+| IQ2_XS | 17 | 74 | host oracle done + verified; device branch TODO |
+| IQ3_XXS | 18 | 98 | not implemented |
+| IQ3_S | 21 | 110 | not implemented |
+| IQ2_S | 22 | 82 | not implemented |
+| Q2_0 | 42 | 18 | not implemented |
+| Q1_0 | 41 | 18 | not implemented |
+
+`Qwen3.8-27B-GSQ-RCO-IQ2_XS` is a mixed-precision file: IQ2_XXS 14.8%, IQ2_S
+15.1%, IQ2_XS 11.7%, Q2_K 13.0%, IQ3_S 10.2%, IQ3_XXS 9.2%. Loading it needs all
+four of the missing IQ types, not just IQ2_XS.
+
+Reference for scale, same file on the same box (llama.cpp b11146, ROCm, `-ngl -1`):
+
+```
+| qwen35 27B IQ2_XXS - 2.0625 bpw | 7.83 GiB | 26.90 B | ROCm | -1 | pp512 | 304.62 t/s |
+| qwen35 27B IQ2_XXS - 2.0625 bpw | 7.83 GiB | 26.90 B | ROCm | -1 | tg128 |  38.65 t/s |
+```

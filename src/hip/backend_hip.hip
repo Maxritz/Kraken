@@ -517,6 +517,74 @@ public:
         std::memcpy(dst, mapped_src, bytes); // read failed: never hand back garbage
         return true;
     }
+
+    // A batch of expert-sized reads, spread over a small pool of handles
+    // (KRK_WARM_READERS, default 4). One expert miss is three slices and one
+    // layer's routed set is dozens to hundreds of them, so the shape is a set of
+    // ~0.5-2 MiB reads issued one at a time through the single warm_reader_
+    // above -- queue depth 1 on one HANDLE. Measured on this machine (NVMe,
+    // 1.82 MiB reads): 593 MiB/s at one reader, 1175 MiB/s at two, 1446 MiB/s
+    // at four, 3400 MiB/s sequential; 593 MiB/s is exactly what the expert path
+    // reported while a decode token spent most of its wall time waiting for the
+    // file. Each worker opens its own FileReader for the same reason the pull
+    // ring does: a Windows HANDLE serialises concurrent ReadFile.
+    void read_host_batch(const ReadReq *reqs, int n) override {
+        if (n <= 0) return;
+        KRK_TIME_OP("warm_read");
+        const int want = warm_readers_();
+        if (n == 1 || want <= 1 || pull_path_.empty() || !pull_map_ ||
+            pull_disabled_) {
+            for (int i = 0; i < n; i++)
+                if (reqs[i].bytes)
+                    read_host(reqs[i].dst, reqs[i].mapped_src, reqs[i].bytes);
+            return;
+        }
+        const int nthread = n < want ? n : want;
+        for (int i = 0; i < nthread; i++) {
+            if (!warm_pool_[i].ok() && !warm_pool_[i].open(pull_path_)) {
+                for (int j = 0; j < n; j++)
+                    if (reqs[j].bytes)
+                        read_host(reqs[j].dst, reqs[j].mapped_src, reqs[j].bytes);
+                return;
+            }
+        }
+        // A layer's routed experts are scattered through the file but their
+        // order in the batch is arbitrary, and dispatching round-robin over it
+        // hands every worker a STRIDED sequence: each read lands megabytes away
+        // from the last, so the drive sees 4 interleaved random streams instead
+        // of 4 sequential ones. Sorting by offset and giving each worker one
+        // contiguous slice instead makes each worker scan forward -- measured on
+        // this machine, 4 strided streams ran at 912 MiB/s where a single
+        // sequential stream runs at 3400 MiB/s, and the expert path was spending
+        // 134 of a token's 146 ms waiting on it.
+        std::vector<int> order;
+        order.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n; i++)
+            if (reqs[i].bytes) order.push_back(i);
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            return reqs[a].mapped_src < reqs[b].mapped_src;
+        });
+        const int total = static_cast<int>(order.size());
+        if (total == 0) return;
+        const int per = (total + nthread - 1) / nthread;
+        auto body = [&](int tid) {
+            const int beg = tid * per;
+            const int end = beg + per < total ? beg + per : total;
+            for (int oi = beg; oi < end; oi++) {
+                const ReadReq &r = reqs[order[static_cast<size_t>(oi)]];
+                const u8 *s = static_cast<const u8 *>(r.mapped_src);
+                if (s < pull_map_ || s + r.bytes > pull_map_ + pull_map_size_ ||
+                    !warm_pool_[tid].at(static_cast<size_t>(s - pull_map_),
+                                        r.dst, r.bytes))
+                    std::memcpy(r.dst, s, r.bytes);
+            }
+        };
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(nthread - 1));
+        for (int i = 1; i < nthread; i++) workers.emplace_back(body, i);
+        body(0);
+        for (auto &w : workers) w.join();
+    }
     // WARM -> HOT. A pageable hipMemcpy works but performs the whole transfer
     // inside the driver's bounce buffer; this stages the copy through the small
     // bounded pinned ring instead, double-buffered, so the DMA overlaps the
@@ -1920,6 +1988,20 @@ private:
     // serialises concurrent ReadFile, so sharing one with the pull ring would
     // put cold-expert reads and weight pulls in each other's way.
     FileReader warm_reader_;
+    // Reader pool for batched expert reads; sized by KRK_WARM_READERS. Each
+    // entry is one HANDLE, opened lazily on first batch use.
+    static constexpr int kWarmReadersMax = 16;
+    static int warm_readers_() {
+        static const int n = [] {
+            const char *e = std::getenv("KRK_WARM_READERS");
+            int v = e ? std::atoi(e) : 4;
+            if (v < 1) v = 1;
+            if (v > kWarmReadersMax) v = kWarmReadersMax;
+            return v;
+        }();
+        return n;
+    }
+    FileReader warm_pool_[kWarmReadersMax];
     // Bounded pinned staging ring for WARM -> HOT promotions (upload_paged).
     // Small on purpose: it is the DMA's in-flight pipeline, not a cache, and
     // nothing in it outlives the copy. Total pinned bytes is kPagedBufs *

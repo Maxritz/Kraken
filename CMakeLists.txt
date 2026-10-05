@@ -46,6 +46,7 @@ set(KRK_CORE_SOURCES
     src/tokenizer.cpp
     src/sampler.cpp
     src/model.cpp
+    src/dflash.cpp
     src/expert_cache.cpp
     src/engine.cpp
     src/backend_cpu.cpp

@@ -168,6 +168,7 @@ KRK_QTRAIT(DType::Q8_0, 1);
 KRK_QTRAIT(DType::Q8_1, 1);
 KRK_QTRAIT(DType::IQ4_NL, 1);
 KRK_QTRAIT(DType::IQ2_XXS, 8);
+KRK_QTRAIT(DType::IQ2_XS, 8);
 KRK_QTRAIT(DType::IQ4_XS, 8);
 KRK_QTRAIT(DType::NVFP4, 2);
 KRK_QTRAIT(DType::MXFP4, 1);
@@ -198,6 +199,7 @@ __device__ __forceinline__ int dtype_block_bytes_dev(int t) {
         case static_cast<int>(DType::Q8_1): return 36;
         case static_cast<int>(DType::IQ4_NL): return 18;
         case static_cast<int>(DType::IQ2_XXS): return 66;
+        case static_cast<int>(DType::IQ2_XS): return 74;
         case static_cast<int>(DType::IQ4_XS): return 136;
         case static_cast<int>(DType::NVFP4): return 36;
         case static_cast<int>(DType::MXFP4): return 17;
@@ -223,6 +225,7 @@ __device__ __forceinline__ int dtype_chunks_per_block_dev(int t) {
         case static_cast<int>(DType::Q4_K):
         case static_cast<int>(DType::Q5_K):
         case static_cast<int>(DType::Q6_K):
+        case static_cast<int>(DType::IQ2_XS):
         case static_cast<int>(DType::IQ2_XXS):
         case static_cast<int>(DType::IQ4_XS):
         case static_cast<int>(DType::Q8_K): return 8;

@@ -14,6 +14,8 @@
 
 namespace krk {
 
+class DflashDraft;
+
 struct EngineConfig {
     std::string model_path;
     i32 n_ctx = 4096;        // KV capacity (tokens)
@@ -131,9 +133,21 @@ public:
     bool load_draft(const std::string &path, std::string *err);
     void unload_draft();
     void set_draft_window(i32 n) { draft_tokens_ = n > 0 ? n : 1; }
-    bool has_draft() const { return draft_ != nullptr; }
+    bool has_draft() const { return draft_ != nullptr || dflash_ != nullptr; }
     const Model &draft_model() const { return draft_->model(); }
     i32 draft_window() const { return draft_tokens_; }
+
+    // ---- DFlash drafter ---------------------------------------------------
+    // `--draft` takes either a full model of the target's family (the path
+    // above) or a Poolside DFlash head set, which is not a model at all: it has
+    // no embedding and no head, reads the *hidden states* of a few target layers
+    // through a fusion encoder, injects their K/V into a cache of its own, and
+    // drafts a masked block against it. Which one a path names is read off the
+    // file's architecture, so the caller does not have to know.
+    bool load_dflash(const std::string &path, std::string *err);
+    void unload_dflash();
+    bool has_dflash() const { return dflash_ != nullptr; }
+    const DflashDraft *dflash() const { return dflash_; }
 
     // ---- KV cache introspection -------------------------------------------
     // Positions [0, kv_pos()) hold keys/values; kv_pos() is also the position
@@ -220,6 +234,16 @@ private:
     bool generate_speculative(const GenerateParams &p, GenerateResult *res,
                               const std::vector<i32> &ids, f64 *prefill_ms,
                               f64 *decode_ms);
+    // The DFlash variant: the drafter is a head set, not an engine, so the
+    // proposals come from a masked block instead of a second model's decode
+    // loop, and the target's captured activations are what feed it.
+    bool generate_speculative_dflash(const GenerateParams &p, GenerateResult *res,
+                                     const std::vector<i32> &ids, f64 *prefill_ms,
+                                     f64 *decode_ms);
+    // Copies the residual stream entering `layer` (or, for mc.n_layer, the
+    // pre-final-norm state) into the DFlash drafter's capture buffer. Inert when
+    // no drafter is loaded, which is every run that does not ask for one.
+    void dflash_capture(i32 layer, i32 n);
 
     Backend *be_ = nullptr;
     Model model_;
@@ -230,6 +254,9 @@ private:
     // The draft engine owns its own Model and KV cache but shares this
     // backend, so the two models can interleave kernels without copies.
     Engine *draft_ = nullptr;
+    // The DFlash head set, if `--draft` named one. Shares this engine's backend
+    // and this engine's activations; owns its own KV cache and workspaces.
+    DflashDraft *dflash_ = nullptr;
     i32 draft_tokens_ = 0;
     u64 draft_proposed_ = 0;
     u64 draft_accepted_ = 0;
@@ -308,6 +335,9 @@ private:
     bool topk_valid_ = false;
     // Host-side router scratch, sized [chunk, n_expert]
     std::vector<f32> router_host_;
+    // Scratch for the layer-wide expert prefetch: the routed ids, deduped.
+    std::vector<i32> prefetch_ids_;
+    std::vector<u8> prefetch_seen_;
     // KRK_DUMP destination (see Engine::init): empty means the per-stage dump
     // hook in forward_core is inert.
     std::string dump_path_;

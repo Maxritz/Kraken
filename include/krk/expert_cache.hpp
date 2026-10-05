@@ -141,6 +141,23 @@ public:
     // One expert, so the caller can choose the order: expert-major across
     // layers when the tier is smaller than the corpus.
     size_t preload_one(const ExpertSource &src, i32 layer, i32 expert);
+    // Warms WARM for one layer's whole routed set in a SINGLE batched read.
+    //
+    // This is the fix for the shape of an expert miss. A layer routes k experts
+    // and each is three slices, so the real request is a set of 0.5-2 MiB reads
+    // -- but the tier issued them one at a time through one file handle, which
+    // is queue depth 1. Measured on this machine (NVMe, 1.82 MiB reads): 593
+    // MiB/s at one outstanding read, 1175 at two, 1446 at four, 3400 sequential,
+    // and 593 MiB/s is exactly what the expert path reported while most of a
+    // decode token's wall time was spent waiting for the file.
+    //
+    // Advisory by contract: a slot already in WARM is skipped, a slot that does
+    // not fit the tier is counted and skipped, and a failed read leaves the
+    // expert cold. It never blocks or fails a run -- acquire() still loads
+    // whatever this did not warm.
+    // Returns bytes read.
+    size_t prefetch_layer(const ExpertSource &src, i32 layer, const i32 *experts,
+                          int n);
     u64 bytes_staged() const { return bytes_staged_; }
     // Wall time spent copying promotions into VRAM, so the report can print
     // the one number that decides whether promotion is fast enough to hide

@@ -139,6 +139,25 @@ public:
         std::memcpy(dst, mapped_src, bytes);
         return true;
     }
+    // One file read: `dst` gets `bytes` from the mapping-relative pointer.
+    struct ReadReq {
+        void *dst;
+        const void *mapped_src;
+        size_t bytes;
+    };
+    // A batch of reads issued together, so a backend that owns more than one
+    // reader can overlap them. The shape of an expert miss is a *set* of
+    // 0.5-2 MiB reads — one expert's three slices, or every expert a layer
+    // routed — and reading them one at a time is queue depth 1 on a single
+    // file handle: measured on this machine (RX 9070 XT host, NVMe) 593 MiB/s
+    // for 1.82 MiB reads, against 1175 MiB/s with two readers, 1446 MiB/s with
+    // four, and 3400 MiB/s sequential. Backends that do not override this read
+    // one request at a time.
+    virtual void read_host_batch(const ReadReq *reqs, int n) {
+        for (int i = 0; i < n; i++)
+            if (reqs[i].bytes)
+                read_host(reqs[i].dst, reqs[i].mapped_src, reqs[i].bytes);
+    }
     // Host->device copy whose source is pageable host memory: the WARM -> HOT
     // promotion path. HIP routes it through a small, bounded pinned staging
     // ring so the transfer is a real DMA rather than the driver's internal

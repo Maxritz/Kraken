@@ -133,9 +133,12 @@ ModelVerdict assess_model(const Gguf &g) {
         if (v.spec->role == ArchRole::Draft) {
             // A head set is refused as a model, and the reason says what it is
             // for instead, because "not supported" alone would read as a bug.
-            add_unique(v.blockers, std::string(v.spec->why) +
-                                       "; kraken's speculation drafts with "
-                                       "--draft, a full model of the family");
+            add_unique(v.blockers,
+                       std::string(v.spec->why && v.spec->why[0]
+                                       ? v.spec->why
+                                       : "a speculative head set, not a model") +
+                           "; it runs only through --draft, beside the target "
+                           "whose hidden states it reads");
         } else if (v.spec->support == ArchSupport::No) {
             add_unique(v.blockers, v.spec->why);
         } else if (v.spec->support == ArchSupport::Partial) {

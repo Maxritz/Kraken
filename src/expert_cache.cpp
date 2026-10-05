@@ -619,4 +619,114 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     return &ins.first->second.m;
 }
 
+size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
+                                   const i32 *experts, int n) {
+    if (!be_ || host_budget_ == 0 || !src.present() || n <= 0) return 0;
+    const GgufTensor *ts[3] = {src.gate, src.up, src.down};
+    size_t slice[3] = {0, 0, 0};
+    for (int i = 0; i < 3; i++)
+        if (ts[i]) slice[i] = src.per_expert(ts[i]);
+    const size_t one = slice[0] + slice[1] + slice[2];
+    if (one == 0) return 0;
+
+    // ---- phase 1: make room and reserve a host buffer per expert -----------
+    // Keys, not Slot pointers, are carried across phases: make_warm_room below
+    // can erase a slot, and a dangling Slot is exactly the kind of aliasing the
+    // rest of this file re-establishes references to avoid.
+    struct Job {
+        u64 key;
+        i32 expert;
+        void *dst[3];
+    };
+    std::vector<Job> jobs;
+    jobs.reserve(static_cast<size_t>(n));
+    for (int j = 0; j < n; j++) {
+        const i32 e = experts[j];
+        if (e < 0 || e >= src.n_expert) continue;
+        const u64 key = slot_key(layer, e);
+        auto it = slots_.find(key);
+        if (it != slots_.end() && it->second.in_host()) continue; // already warm
+        make_warm_room(one);
+        // Same rule as warm_admit: an expert that cannot fit the whole tier is
+        // skipped rather than evicting everything for a copy that still fails.
+        if (host_bytes_ + one > host_budget_) {
+            warm_rejects_++;
+            continue;
+        }
+        if (it == slots_.end()) {
+            Slot s;
+            s.layer = layer;
+            s.expert = e;
+            for (int i = 0; i < 3; i++) s.slice[i] = slice[i];
+            s.bytes = one;
+            s.count = 0; // staged, not earned: first out of the tier
+            s.seq = seq_++;
+            it = slots_.emplace(key, std::move(s)).first;
+        }
+        Job job{key, e, {nullptr, nullptr, nullptr}};
+        bool ok = true;
+        for (int i = 0; i < 3; i++) {
+            if (!slice[i]) continue;
+            job.dst[i] = be_->alloc_host_pageable(slice[i]);
+            if (!job.dst[i]) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            for (int i = 0; i < 3; i++)
+                if (job.dst[i]) be_->release_host_pageable(job.dst[i]);
+            warm_rejects_++;
+            forget_if_dead(it);
+            continue;
+        }
+        jobs.push_back(job);
+    }
+    if (jobs.empty()) return 0;
+
+    // ---- phase 2: one batched read for the whole set ----------------------
+    // 3k requests are handed to the backend at once so its reader pool can keep
+    // several in flight. This is the entire point of the method.
+    std::vector<Backend::ReadReq> reqs;
+    reqs.reserve(jobs.size() * 3);
+    for (const Job &jb : jobs) {
+        for (int i = 0; i < 3; i++) {
+            if (!slice[i]) continue;
+            reqs.push_back(Backend::ReadReq{
+                jb.dst[i],
+                ts[i]->data + static_cast<size_t>(jb.expert) * slice[i],
+                slice[i]});
+        }
+    }
+    {
+        MsTimer t(&read_ms_);
+        be_->read_host_batch(reqs.data(), static_cast<int>(reqs.size()));
+    }
+
+    // ---- phase 3: commit --------------------------------------------------
+    size_t total = 0;
+    for (Job &jb : jobs) {
+        auto it = slots_.find(jb.key);
+        if (it == slots_.end()) { // evicted while the batch was in flight
+            for (int i = 0; i < 3; i++)
+                if (jb.dst[i]) be_->release_host_pageable(jb.dst[i]);
+            continue;
+        }
+        Slot &s = it->second;
+        QuantTensor *h[3] = {&s.h.gate, &s.h.up, &s.h.down};
+        for (int i = 0; i < 3; i++) {
+            if (!slice[i]) continue;
+            h[i]->data = jb.dst[i];
+            h[i]->type = ts[i]->type;
+            h[i]->n_in = static_cast<i64>(ts[i]->ne[0]);
+            h[i]->n_out = ts[i]->n_dims >= 2 ? static_cast<i64>(ts[i]->ne[1]) : 1;
+        }
+        s.host_bytes = one;
+        host_bytes_ += one;
+        warm_admissions_++;
+        total += one;
+    }
+    return total;
+}
+
 } // namespace krk

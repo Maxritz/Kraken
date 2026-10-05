@@ -2,6 +2,7 @@
 // contiguous KV cache, streaming output and stop-string handling.
 #include "krk/engine.hpp"
 #include "krk/arch.hpp"
+#include "krk/dflash.hpp"
 #include "par_pool.hpp"
 
 #include <algorithm>
@@ -390,6 +391,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
 void Engine::shutdown() {
     // The draft shares the backend; it must release its allocations before
     // this engine tears the backend's other buffers down.
+    unload_dflash();
     unload_draft();
     if (!be_) {
         model_.unload();
@@ -478,6 +480,11 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // query width, the head count handed to rope/qk_norm/attention, and
         // the rotation fraction are the layer's own. q_dim_/n_head remain the
         // maximum, which is what the shared workspaces are sized against.
+        // DFlash feed: the residual stream *entering* this layer is one of the
+        // drafter's feature blocks, so it is copied out here, before the
+        // layer's own attn_norm consumes it. One activation copy per captured
+        // layer, and nothing at all unless a head set is loaded.
+        dflash_capture(l, n);
         const i64 lh = model_.n_head_at(l);
         const i64 lq = model_.q_dim_at(l);
         const i64 lq_proj = packed_gate ? 2 * lq : lq;
@@ -620,6 +627,10 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         }
         dump_stage("attn", l);
     }
+    // The pre-final-norm state, which a capture list names with the id
+    // `mc.n_layer`: the input of the block that does not exist. It is what the
+    // drafter's last feature block reads.
+    dflash_capture(mc.n_layer, n);
     dump_stage("final", mc.n_layer);
 
     // Vocab projection: the expensive part of the head, so it runs on as few
@@ -639,6 +650,16 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
 // wasted launch on the 0.8B, which is 18 of the step's 541 ops — pure op-count
 // tax, since the two matrices read the same activation and have no dependency
 // between them, exactly the condition gemm_group exists for.
+void Engine::dflash_capture(i32 layer, i32 n) {
+    if (!dflash_ || n <= 0) return;
+    const std::vector<i32> &tl = dflash_->target_layers();
+    for (size_t a = 0; a < tl.size(); a++) {
+        if (tl[a] != layer) continue;
+        be_->copy_act(dflash_->capture_slot(static_cast<i32>(a)), ws_x_,
+                      static_cast<i64>(n) * n_embd_);
+    }
+}
+
 void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
     // gate/up share the FFN-norm output: one fused launch on the decode row.
     if (L.wgate.type == L.wup.type) {
@@ -726,7 +747,15 @@ void Engine::configure_expert_cache() {
     const size_t gib = static_cast<size_t>(1) << 30;
     const size_t kCapFirst = 6 * gib;
     const size_t kCapStep = 2 * gib;
-    const size_t kCapMax = 12 * gib;
+    // The ceiling was 12 GiB, chosen against a 15.9 GiB card for the big MoEs.
+    // Measured against the real files, that ceiling is what keeps a *small* MoE
+    // streaming forever: Laguna XS 2.1 IQ3_XXS carries 11.20 GiB of experts and
+    // 0.86 GiB of dense weights, so its whole routed set needs 12.06 GiB of
+    // budget -- and at the 12 GiB cap it sat at 81.6% resident, re-reading
+    // hundreds of experts from disk on every token even though the card had the
+    // room. A card that can hold the model should hold it: a miss that costs a
+    // file read is only worth its VRAM when the set genuinely does not fit.
+    const size_t kCapMax = 14 * gib;
     const size_t kReserve = 512u * 1024u * 1024u; // driver + fragmentation
     const size_t total_bytes = model_.total_expert_bytes();
     const size_t total_vram = be_->device_total_bytes();
@@ -924,6 +953,45 @@ void Engine::configure_expert_cache() {
              ExpertCache::kPinDecay);
 }
 
+bool Engine::load_dflash(const std::string &path, std::string *err) {
+    if (!be_) {
+        if (err) *err = "the engine must be initialised before the drafter";
+        return false;
+    }
+    if (dflash_) return true;
+    const ModelConfig &tc = model_.cfg();
+    DflashDraft *d = new DflashDraft();
+    if (!d->load(*be_, path, chunk_, kv_cap_, tc.n_embd, tc.n_layer, err)) {
+        delete d;
+        return false;
+    }
+    // The mask token has to be a real id in the *target's* vocabulary: the block
+    // embeds it with the target's token embedding table, so an id past the end
+    // would read a neighbour row and draft against noise.
+    if (d->mask_id() < 0 || d->mask_id() >= n_vocab_) {
+        if (err)
+            *err = format("DFlash mask token %d is outside the target's vocabulary "
+                          "(%d) — this head set is for a different target",
+                          d->mask_id(), n_vocab_);
+        delete d;
+        return false;
+    }
+    dflash_ = d;
+    if (draft_tokens_ <= 0) draft_tokens_ = 4;
+    KRK_INFO("dflash drafter loaded: %s — %d captured layers, block size %d, "
+             "speculative window %d",
+             d->name().c_str(), d->n_aux(), d->block_size(),
+             std::min<i32>(draft_tokens_, d->block_size() - 1));
+    return true;
+}
+
+void Engine::unload_dflash() {
+    if (!dflash_) return;
+    dflash_->unload();
+    delete dflash_;
+    dflash_ = nullptr;
+}
+
 bool Engine::load_draft(const std::string &path, std::string *err) {
     if (model_.is_recurrent()) {
         // Speculation verifies a block and then rewinds to the accepted
@@ -939,7 +1007,20 @@ bool Engine::load_draft(const std::string &path, std::string *err) {
         if (err) *err = "the engine must be initialised before the draft model";
         return false;
     }
-    if (draft_) return true; // already loaded
+    if (draft_ || dflash_) return true; // already loaded
+
+    // A DFlash head set and a full draft model arrive the same way, through
+    // --draft, and nothing about the path says which one it is. The file does,
+    // so the probe is a metadata read of a few kilobytes against a load that
+    // costs the whole model. The mapping is dropped before returning, because on
+    // Windows it would otherwise hold the file open for the rest of the run.
+    {
+        Gguf probe;
+        std::string perr;
+        if (probe.load(path, &perr) &&
+            dflash_arch(probe.get_str("general.architecture", "")))
+            return load_dflash(path, err);
+    }
 
     // The draft shares this engine's backend: one device, interleaved kernels,
     // no staging copies. Its Model owns its own weights and its own KV cache.
@@ -1260,6 +1341,32 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // statistics are collected; only the layer's own expert contribution to
         // the residual is missing, which is what makes the list approximate.
         if (expert_stub_) expert_stubbed_ran_ = true;
+
+        // One batched WARM read for the whole routed set before the per-expert
+        // loop starts. Each acquire() below otherwise issues its three slices
+        // one at a time through a single file handle -- queue depth 1, which on
+        // this machine is 593 MiB/s against 1446 MiB/s at four outstanding
+        // reads and 3400 MiB/s sequential. The set is deduped because two
+        // tokens selecting one expert must not read it twice.
+        if (!expert_stub_ && k > 0) {
+            prefetch_seen_.assign(static_cast<size_t>(ne), 0);
+            prefetch_ids_.clear();
+            for (i32 t = 0; t < n; t++) {
+                const i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
+                for (i32 s = 0; s < k; s++) {
+                    const i32 e = sel[s];
+                    if (e < 0 || e >= ne || prefetch_seen_[static_cast<size_t>(e)])
+                        continue;
+                    prefetch_seen_[static_cast<size_t>(e)] = 1;
+                    prefetch_ids_.push_back(e);
+                }
+            }
+            if (prefetch_ids_.size() > 1)
+                model_.experts().prefetch_layer(
+                    L.experts, layer, prefetch_ids_.data(),
+                    static_cast<int>(prefetch_ids_.size()));
+        }
+
         for (i32 e = 0; !expert_stub_ && e < ne; e++) {
             group_rows_.clear();
             group_wt_.clear();
@@ -1579,6 +1686,215 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
     return true;
 }
 
+// The DFlash round. Same shape as generate_speculative -- greedy-only, one
+// batched verification per round, longest matching prefix kept -- with the
+// proposal side replaced. A DFlash drafter cannot be asked "what comes next":
+// it has no embedding and no head, and its context is a cache of fused target
+// features rather than its own tokens. So a round is
+//
+//   * one masked block over [id_last, MASK x n_draft], read at the target's
+//     positions, giving a candidate per row;
+//   * the same batched verification the model-draft path uses; and
+//   * an injection of the *accepted* rows' features, which is what keeps the
+//     drafter's cache in step with the target after a partial accept.
+//
+// The capture that feeds the last step is taken inside forward_core, so the
+// features a round injects are the ones the verification pass computed for
+// exactly the tokens the target kept. Nothing is recomputed.
+bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult *res,
+                                         const std::vector<i32> &ids, f64 *prefill_ms,
+                                         f64 *decode_ms) {
+    // Block size caps the window: the block is id_last plus one mask per
+    // candidate, and the reference clamps to block_size - 1 for that reason.
+    const i32 k = std::max<i32>(1, std::min<i32>(draft_tokens_,
+                                                 dflash_->block_size() - 1));
+
+    // ---- prefill ---------------------------------------------------------
+    // The target and its drafter advance together, chunk by chunk: forward()
+    // captures the residual streams the fusion below reads, and commit() injects
+    // them before the next chunk overwrites the capture buffer.
+    const Timer prefill_timer;
+    for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        const i32 n = static_cast<i32>(
+            std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
+        const bool last = (i + n) == static_cast<i64>(ids.size());
+        forward(ids.data() + i, n, static_cast<i32>(i), last);
+        if (!dflash_->commit(static_cast<i32>(i), n)) return false;
+    }
+    fetch_logits();
+    *prefill_ms = prefill_timer.ms();
+
+    Sampler sampler;
+    sampler.reset(p.sampler);
+    sampler.accept(ids.data(), static_cast<int>(ids.size()));
+    TokenEmitter emit(p, tok_, sampler, res, ids);
+
+    const Timer decode_timer;
+    auto finish_run = [&](Finish f) {
+        res->finish = f;
+        *decode_ms = decode_timer.ms();
+        emit.finish(f == FinishStop);
+    };
+
+    i64 pos = static_cast<i64>(ids.size());
+    std::vector<i32> prop(static_cast<size_t>(k));
+    std::vector<f32> rows(static_cast<size_t>(k) * static_cast<size_t>(n_vocab_));
+    std::vector<f32> dlogits(static_cast<size_t>(k) *
+                             static_cast<size_t>(n_vocab_));
+    const QuantTensor &embd = model_.tok_embd();
+    const QuantTensor &head = model_.out_head();
+
+    // Invariant at the top of every round, identical to the model-draft path:
+    // the target's KV holds [0, pos) and logits_host_ predicts pos.
+    while (res->generated < p.max_tokens && pos < kv_cap_) {
+        if (p.debug_topk > 0)
+            dump_topk(p.debug_topk, res->generated, pos, logits_host_, n_vocab_);
+        const i32 first = argmax_of(logits_host_, n_vocab_);
+        // The block opens with the last committed token: the prompt's last token
+        // after the prefill, and the last emitted one afterwards.
+        const i32 id_last = res->tokens.empty() ? ids.back() : res->tokens.back();
+
+        // ---- propose a block ---------------------------------------------
+        const i64 room = std::min<i64>(kv_cap_, dflash_->kv_capacity()) - pos;
+        i32 d = static_cast<i32>(std::max<i64>(1, std::min<i64>(k, room)));
+        const i32 nrows = dflash_->draft_block(embd, head, n_vocab_, id_last, d,
+                                               static_cast<i32>(pos), dlogits.data());
+        if (nrows <= 0 || pos <= 0) {
+            // Nothing to draft against (an empty context, or a drafter that
+            // refused the block). Fall back to the plain step, which keeps the
+            // two paths identical in output rather than merely similar.
+            if (first == tok_.eos()) {
+                finish_run(FinishEos);
+                return true;
+            }
+            emit.accept(first);
+            if (pos + 1 >= kv_cap_) {
+                finish_run(FinishContext);
+                return true;
+            }
+            forward(&first, 1, static_cast<i32>(pos), true);
+            dflash_->commit(static_cast<i32>(pos), 1);
+            pos++;
+            fetch_logits();
+            continue;
+        }
+        d = nrows;
+        for (i32 j = 0; j < d; j++)
+            prop[static_cast<size_t>(j)] =
+                argmax_of(dlogits.data() + static_cast<size_t>(j) *
+                                               static_cast<size_t>(n_vocab_),
+                          n_vocab_);
+        draft_proposed_ += static_cast<u64>(d);
+        spec_steps_++;
+
+        // ---- the same pre-check plain decode performs ---------------------
+        // On disagreement the round costs exactly one plain step and the block
+        // is never verified.
+        if (first != prop[0]) {
+            if (first == tok_.eos()) {
+                finish_run(FinishEos);
+                return true;
+            }
+            emit.accept(first);
+            if (pos + 1 >= kv_cap_) {
+                finish_run(FinishContext);
+                return true;
+            }
+            forward(&first, 1, static_cast<i32>(pos), true);
+            dflash_->commit(static_cast<i32>(pos), 1);
+            pos++;
+            fetch_logits();
+            continue;
+        }
+
+        // ---- verify: one batched forward of the d proposals ---------------
+        i32 d_eff = d;
+        while (d_eff > 0 && pos + d_eff > kv_cap_) d_eff--;
+        if (d_eff <= 0) {
+            finish_run(FinishContext);
+            return true;
+        }
+        forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone);
+        kv_pos_ = pos + d_eff;
+        for (i32 j = 0; j < d_eff; j++) {
+            head_compute(j);
+            be_->sync();
+            be_->download_f32(rows.data() + static_cast<size_t>(j) * n_vocab_,
+                              ws_logits_, n_vocab_);
+        }
+        auto row_pred = [&](i32 j) {
+            return argmax_of(rows.data() + static_cast<size_t>(j - 1) *
+                                               static_cast<size_t>(n_vocab_),
+                             n_vocab_);
+        };
+
+        i32 a = 1;
+        while (a < d_eff && row_pred(a) == prop[static_cast<size_t>(a)]) a++;
+        const bool full = (a == d_eff);
+
+        // The drafter's cache takes the features of the rows that were actually
+        // kept. The verification pass captured them at exactly pos .. pos+a-1,
+        // so this is the target's own view of the accepted tokens.
+        if (!dflash_->commit(static_cast<i32>(pos), a)) return false;
+
+        bool stop_hit = false;
+        i32 emitted = 0;
+        for (i32 j = 0; j < a; j++) {
+            if (res->generated >= p.max_tokens) break;
+            const i32 t = prop[static_cast<size_t>(j)];
+            draft_accepted_++;
+            stop_hit = emit.accept(t);
+            emitted++;
+            if (stop_hit) break;
+        }
+        if (stop_hit) {
+            kv_rollback(pos + emitted);
+            finish_run(FinishStop);
+            return true;
+        }
+        if (full && res->generated < p.max_tokens) {
+            const i32 bonus = row_pred(d_eff);
+            if (bonus == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
+            emit.accept(bonus);
+            emitted++;
+            if (pos + emitted < kv_cap_ && res->generated < p.max_tokens) {
+                const i32 b = res->tokens.back();
+                forward(&b, 1, static_cast<i32>(pos + emitted - 1), true);
+                dflash_->commit(static_cast<i32>(pos + emitted - 1), 1);
+                fetch_logits();
+            }
+        }
+        if (full && res->generated >= p.max_tokens)
+            kv_rollback(pos + emitted);
+        if (!full) kv_rollback(pos + emitted);
+        pos += emitted;
+
+        if (res->generated >= p.max_tokens) {
+            finish_run(FinishLength);
+            return true;
+        }
+        if (pos + 1 >= kv_cap_) {
+            finish_run(FinishContext);
+            return true;
+        }
+        // The target's logits must predict pos. After a full match they came
+        // from the bonus forward above; after a partial match the answer is
+        // block row `emitted` (1-based), already downloaded into rows[].
+        if (!full)
+            std::memcpy(logits_host_,
+                        rows.data() + static_cast<size_t>(emitted - 1) *
+                                          static_cast<size_t>(n_vocab_),
+                        static_cast<size_t>(n_vocab_) * sizeof(f32));
+    }
+
+    finish_run(res->generated >= p.max_tokens ? FinishLength : FinishContext);
+    return true;
+}
+
 bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     if (!be_ || n_vocab_ <= 0) return false;
     *res = GenerateResult{};
@@ -1612,15 +1928,18 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     // Greedy-only fast path: with a draft loaded and argmax sampling requested,
     // speculative decoding produces bit-identical output to the plain loop, so
     // there is nothing to choose between them — take the faster one.
-    if (draft_ && p.sampler.greedy && !model_.is_recurrent()) {
+    if ((draft_ || dflash_) && p.sampler.greedy && !model_.is_recurrent()) {
         f64 prefill_ms = 0, decode_ms = 0;
-        const bool ok =
-            generate_speculative(p, res, ids, &prefill_ms, &decode_ms);
+        const bool ok = dflash_
+                            ? generate_speculative_dflash(p, res, ids, &prefill_ms,
+                                                          &decode_ms)
+                            : generate_speculative(p, res, ids, &prefill_ms,
+                                                   &decode_ms);
         res->prefill_ms = prefill_ms;
         res->decode_ms = decode_ms;
         return ok;
     }
-    if (draft_ && !p.sampler.greedy) {
+    if ((draft_ || dflash_) && !p.sampler.greedy) {
         KRK_WARN("speculative decoding is greedy-only; sampling runs without "
                  "the draft for this request");
     }

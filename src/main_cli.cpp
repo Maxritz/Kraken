@@ -666,6 +666,25 @@ int main(int argc, char **argv) {
         if (!engine.generate(p, &r)) return false;
         print_run_stats(stderr, engine, r, load_ms,
                         be->device_free_bytes(), be->device_total_bytes());
+        // Speculation telemetry. It lived only in run_bench, which meant the one
+        // run a user actually does -- start the CLI, ask a question, read the
+        // answer -- could not say whether the draft earned its keep. The number
+        // that matters is the accept rate: a drafter that proposes four tokens
+        // and lands one is still a win, and one that lands none is pure cost.
+        if (engine.has_draft() && engine.spec_steps() > 0) {
+            const f64 rate =
+                engine.draft_proposed() > 0
+                    ? 100.0 * static_cast<f64>(engine.draft_accepted()) /
+                          static_cast<f64>(engine.draft_proposed())
+                    : 0.0;
+            std::fprintf(stderr,
+                         "[stats ] speculation %llu rounds, %llu/%llu draft "
+                         "tokens accepted (%.1f%%)\n",
+                         static_cast<unsigned long long>(engine.spec_steps()),
+                         static_cast<unsigned long long>(engine.draft_accepted()),
+                         static_cast<unsigned long long>(engine.draft_proposed()),
+                         rate);
+        }
         return true;
     };
 

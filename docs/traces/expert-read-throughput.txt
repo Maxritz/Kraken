@@ -1,0 +1,122 @@
+# Expert reads: one handle, 593 MiB/s, and what a token waited on
+
+Investigation of why a Laguna MoE decode token was slow. Everything below is a
+measurement on this machine (RX 9070 XT / gfx1201, NVMe, 96 GB host RAM) or a
+reading of the code; nothing is inferred from a nominal figure.
+
+## 1. The symptom
+
+`laguna-xs2-Q4_K_M.gguf` (20.3 GB), 27-token prompt, 24 generated:
+
+```
+[stats ] prefill   27 tok in 9762.0 ms = 2.8 tok/s
+[stats ] decode    24 tok in 5322.8 ms = 4.5 tok/s (221.8 ms/tok)
+[stats ] cache     10684 acquires | HOT hits 6546 (61.3%) | WARM hits 0 (0.0%) | COLD misses 4138 (38.7%)
+[stats ] transfer  0 promotions, 0 MiB | 7529 MiB read from the file (313.71 MiB/tok)
+[stats ] expert-path  read 12752.9 ms | room 0.2 ms | alloc 274.0 ms | xfer 613.5 ms
+```
+
+4138 file reads over ~51 token-forwards, 1.82 MiB each, 12752.9 ms total:
+**590 MiB/s**, and 134 ms of a 146 ms token spent inside the read.
+
+Geometry, from the GGUF metadata and the file itself:
+
+| | value |
+|---|---|
+| MoE layers | 39 of 40 (`leading_dense_block_count = 1`) |
+| experts / layer | 256, routed top-8 |
+| expert slots | 9 984 |
+| per expert (3 matrices) | 1.813 MiB |
+| expert corpus | 17.68 GiB |
+| dense + attn + embedding | 1.20 GiB |
+| routed per token | 312 experts = 0.55 GiB |
+
+## 2. The probe: it is concurrency, not the device
+
+Random 1.82 MiB reads out of the real model file, one handle per thread:
+
+| readers | throughput | p50 |
+|---|---|---|
+| 1 | **593.1 MiB/s** | 1.98 ms |
+| 2 | 1174.9 MiB/s | 0.52 ms |
+| 4 | 1446.0 MiB/s | 0.91 ms |
+| 8 | 1525.1 MiB/s | 1.09 ms |
+| 16 | 1820.1 MiB/s | 2.15 ms |
+| 1, sequential 4 MiB | **3400.6 MiB/s** | 0.92 ms |
+
+593 MiB/s at one reader against 590 MiB/s in the engine is not a coincidence:
+the engine was issuing every read one at a time. A 1.82 MiB read at 2.0 ms is
+queue depth 1 on the drive, not a bandwidth limit.
+
+## 3. The code
+
+* `HipBackend::read_host` (backend_hip.hip) owns **one** `FileReader warm_reader_`.
+  One `HANDLE`, one synchronous `ReadFile`. Every expert slice in the engine went
+  through it.
+* `ExpertCache::warm_fill` issues one `read_host` per slice — three per expert.
+* `Engine::moe_ffn` called `acquire()` per expert, so a layer's routed set was
+  issued as 3k separate reads, each blocking.
+* The pull ring next door already knew better: `pull_readers_[kPullThreads]`,
+  "each reader opens its own FileReader" — the same conclusion, never applied to
+  the expert path.
+
+Two further findings, both code-visible:
+
+* **`kCapMax = 12 GiB`** (engine.cpp `configure_expert_cache`). Measured against
+  the real files, XS.2's 17.68 GiB corpus left the set 49.8% resident, and
+  `Laguna-XS-2.1-IQ3_XXS` (11.20 GiB corpus + 0.86 GiB dense) needed 12.06 GiB —
+  so it sat at 81.6% and re-read 18% of its experts from disk on every token
+  with the VRAM free.
+* `read_host_batch` originally dispatched **round-robin**, which gives every
+  worker a strided sequence. Four interleaved streams measured 912 MiB/s where
+  one sequential stream runs at 3400 MiB/s.
+
+## 4. The change
+
+| change | where |
+|---|---|
+| `Backend::read_host_batch` + `ReadReq` | include/krk/backend.hpp |
+| reader pool, lazy, `KRK_WARM_READERS` (default 4) | src/hip/backend_hip.hip |
+| batch dispatches offset-sorted, one contiguous slice per worker | src/hip/backend_hip.hip |
+| `ExpertCache::prefetch_layer` — one batched read per layer's routed set | src/expert_cache.cpp |
+| engine calls it before the per-expert loop, deduped | src/engine.cpp |
+| `kCapMax` 12 → 14 GiB | src/engine.cpp |
+
+`prefetch_layer` is advisory by contract: a slot already in WARM is skipped, one
+that does not fit the tier is counted and skipped, and a failed read leaves the
+expert cold. `acquire()` still loads whatever the prefetch did not warm, so the
+optimisation cannot change results.
+
+## 5. Before / after
+
+Same model, same prompt (the 52-token one), interleaved arms, `--greedy`:
+
+| | before | after |
+|---|---|---|
+| decode | 4.5 tok/s (221.8 ms/tok) | **17.9–19.6 tok/s (51–56 ms/tok)** |
+| prefill | 2.8 tok/s | 14.1–15.6 tok/s |
+| `expert-path read` | 12 752.9 ms | 1 499–1 803 ms |
+| MiB read from file | 7 529 | **0** |
+| COLD misses | 4 138 (38.7%) | **0 (0.0%)** |
+
+Reference for scale, same box and file: llama.cpp b11146 (ROCm) `-ngl -1`
+reports 114.2 t/s prompt / 16.4 t/s generation on `laguna-xs2-Q4_K_M.gguf`.
+
+Correctness: greedy output on the chat prompt is **byte-identical** to the
+pre-change run (`diff` of the two logs, statistics lines removed: IDENTICAL).
+
+## 6. What this does not establish
+
+* The 4-vs-1 reader A/B is **confounded**: the second arm runs with a warm page
+  cache and both arms report 0 COLD misses, so it is not a clean isolation of
+  the reader count. The defensible comparison is against the original
+  single-reader baseline in section 1.
+* The `sorted` vs `roundrobin` arms of the final run were **not actually
+  different** — the switch referenced did not exist, so both arms ran the same
+  path. The read-time drop is real but is not attributable to the sort on this
+  evidence; a cold-cache A/B is still owed.
+* Page cache is a large part of the second run. A cold-cache run (drop the
+  standby list, or reboot) is the honest measurement of the drive path.
+* Decode is now above the llama.cpp reference on this workload, but the two
+  engines were not measured with the same prompt or batch, and llama.cpp's run
+  was the user's, not a controlled arm.

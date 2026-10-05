@@ -119,19 +119,35 @@ constexpr ArchSpec kTable[] = {
      "Mamba-2 blocks (ssm_*) are not the gated delta net this engine "
      "implements",
      false, false, false, false},
-    // Speculative head sets, each with its own arch string. kraken's speculation
-    // drafts with a second full model of the target's family (--draft); it does
-    // not consume these, which want the target's hidden states as input.
-    {"dflash", ArchShape::Dense, ArchSupport::No, ArchRole::Draft, "qwen35",
-     "dflash speculative head set (dflash.*, 5-6 blocks) rather than a model",
-     false, false, false, false},
+    // ---- speculative head sets -------------------------------------------
+    // A head set is not a model: no token embedding, no output head, nothing to
+    // continue a prompt with. `--draft` accepts one anyway, because a DFlash
+    // drafter is the *cheaper* half of the same feature — the head set is 0.5-1
+    // GiB against a full model of the target's family, and it reads the target's
+    // hidden states through the encoder in src/dflash.cpp rather than starting
+    // from tokens.
+    //
+    // The drafting-relevant flags are the ones the DFlash stack shares with
+    // laguna, whose schema it was trained against: per-head QK-norm, the
+    // separate softplus output gate (`attn_gate.weight`, per-head or
+    // per-element), and the NeoX rope pairing. On a draft entry they also say
+    // "the gate tensor is served", which is what keeps them out of the gap map.
+    {"dflash", ArchShape::Dense, ArchSupport::Yes, ArchRole::Draft, "dflash", "",
+     true, false, false, false, true, true},
+    // The same object under the name an older converter gave it: `dflash.*`
+    // tensor names, the per-aux norms stored one per layer instead of stacked,
+    // and the behavioural switches spelled out as flags rather than implied by
+    // `decoder_arch`. src/dflash.cpp reads both; this is the entry that makes the
+    // older one recognizable.
+    {"qwen35-dflash-draft", ArchShape::Dense, ArchSupport::Yes, ArchRole::Draft,
+     "dflash", "",
+     true, false, false, false, true, true},
+    // DSpark is a different head family (Markov/diffusion heads over the
+    // target's nextn state) that nothing here reads yet, so it stays refused
+    // rather than being claimed by the DFlash loader.
     {"dspark", ArchShape::Dense, ArchSupport::No, ArchRole::Draft, "qwen35",
      "dspark speculative head set (dspark.*, 6 blocks) rather than a model",
      false, false, false, false},
-    {"qwen35-dflash-draft", ArchShape::Recurrent, ArchSupport::No, ArchRole::Draft,
-     "qwen35",
-     "qwen3.5 draft head set (dflash.*) rather than a model",
-     false, true, false, false},
     // Laguna (poolside): MoE with a sigmoid router, a per-expert selection
     // bias added to the probabilities before the top-k, a per-head softplus
     // gate on the attention output, and a hybrid full/sliding-window stack

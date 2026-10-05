@@ -30,6 +30,10 @@ enum class DType : i32 {
     Q6_K = 14,
     Q8_K = 15,
     IQ2_XXS = 16,
+    // IQ2_XS (id 17): the same 256-value block as IQ2_XXS (66 bytes) but
+    // with a 16-bit scale per 32 values and 9-bit grid indices, so 84
+    // bytes a block. Used by the GSQ-RCO exports.
+    IQ2_XS = 17,
     IQ4_NL = 20,
     IQ4_XS = 23,
     BF16 = 30,
