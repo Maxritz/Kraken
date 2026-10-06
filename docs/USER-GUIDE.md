@@ -209,9 +209,7 @@ together with the block-1024 Hadamard activation transform a file declares in
 its `prism.hadamard` metadata — `Ternary-Bonsai-2-27B-PQ2_0.gguf` passes
 device-vs-CPU coherence.
 
-**Still refused**: the ROCmFPX ids **102, 104, 107** -- no header on this
-machine declares their block layout, and an 11-stride sweep never located a
-plausible scale field. Refused loudly at load rather than guessed.
+The ROCmFPX ids **102, 104, 107** are now implemented (2026-10-07): host and device dequantizers from the fork's `rocmfpx_dequantize_row_fp{2,3,6}`, with UE4M3 half-block scales.
 
 ### What is refused, and why
 
@@ -223,8 +221,8 @@ blocks, fused-QKV and attention-output-gate variants, unsupported quants, and
 head geometry the loader rejects.
 
 Two things have changed since that count was taken. The unsupported-quant group
-has shrunk to the ROCmFPX ids 102/104/107, because the IQ family, `Q1_0`/`Q2_0`
-and now `PQ2_0`/`PTQ1_0` (142/143) dequantize. And a file that declares
+the ROCmFPX ids 102/104/107 also dequantize now, because the IQ family, `Q1_0`/`Q2_0`
+and `PQ2_0`/`PTQ1_0` (142/143) dequantize. And a file that declares
 `attention.key_length` no longer has to satisfy `n_embd % head_count == 0`:
 Qwen3.5's gated attention legitimately runs 24 heads of 256 dims over a
 5120-wide embedding, because `q_proj` is `2 * n_head * d` (it emits the query

@@ -841,6 +841,181 @@ static void test_ptq1_0_layout() {
                "PTQ1_0: vec_dot sums 128 scaled trits");
 }
 
+// ROCmFPX fork ternary formats (github.com/charlie12345/ROCmFPX): all three are
+// 32-value blocks with two UE4M3 half-block scales (e[2]), one per 16-element half.
+// The difference is only the code width and the packing. Authority: the fork's
+// rocmfpx_dequantize_row_fp{2,3,6} in ggml/rocmfpx/rocmfpx.c, and the pack/
+// unpack helpers (rocmfpx_fp3_pack8 / rocmfpx_fp3_unpack8 / rocmfpx_fp6_pack4 /
+// rocmfpx_fp6_unpack4).
+
+static void test_q2_0_rocmfpx_layout() {
+    // block_rocmfp2: {u8 qs[8]; u8 e[2]} = 10 bytes / 32 values.
+    // S40 ladder {-4,-1,+1,+4}, 2-bit codes packed 4 to a byte (LSB first).
+    // qs[half*4 + j/4] >> (2*(j%4)) & 3.
+    u8 blk[10];
+    std::memset(blk, 0, sizeof(blk));
+    // Code 1 -> -1, so the all-1 block is all -1 * scale.
+    for (int j = 0; j < 8; j++) blk[j] = 0x55; // 0b01010101 -> codes {1,1,1,1}
+    // e[0] = 0x40 -> 1.0f, e[1] = 0x38 -> 0.5f.
+    blk[8] = 0x40;
+    blk[9] = 0x38;
+    f32 out[32];
+    dequant_row(DType::Q2_0_ROCMFPX, blk, out, 32);
+    for (int j = 0; j < 16; j++)
+        CHECK_NEAR(out[j], -1.0f, 1e-6, "Q2_0_ROCMFPX first half at scale 1.0");
+    for (int j = 0; j < 16; j++)
+        CHECK_NEAR(out[16 + j], -0.5f, 1e-6,
+                   "Q2_0_ROCMFPX second half at scale 0.5");
+    // The zero scale bytes (0x00 and 0x7F) produce 0.
+    for (int e = 0; e < 2; e++) {
+        u8 z = static_cast<u8>(e == 0 ? 0x7F : 0x00);
+        blk[8] = z;
+        blk[9] = z;
+        dequant_row(DType::Q2_0_ROCMFPX, blk, out, 32);
+        for (int j = 0; j < 32; j++) CHECK_NEAR(out[j], 0.0f, 1e-30, "zero scale");
+    }
+    // Empty block (all zeros): codes are 0 -> -4, but scale 0 -> all zeros.
+    std::memset(blk, 0, sizeof(blk));
+    blk[8] = 0x40;
+    dequant_row(DType::Q2_0_ROCMFPX, blk, out, 32);
+    for (int j = 0; j < 16; j++)
+        CHECK_NEAR(out[j], -4.0f, 1e-6, "Q2_0_ROCMFPX all-code-0 is -4");
+    for (int j = 0; j < 16; j++)
+        CHECK_NEAR(out[16 + j], 0.0f, 1e-6,
+                   "Q2_0_ROCMFPX second half code-0 at scale 0.5 is 0");
+    // S40 ladder {-4,-1,+1,+4} = codes {0,1,2,3}, LSB-first pack.
+    // byte = 0b11_10_01_00 = bits 6-7=3, 4-5=2, 2-3=1, 0-1=0 = 0xE4.
+    std::memset(blk, 0, sizeof(blk));
+    blk[8] = 0x40;
+    blk[0] = 0xE4;
+    dequant_row(DType::Q2_0_ROCMFPX, blk, out, 32);
+    CHECK_NEAR(out[0], -4.0f, 1e-6, "Q2_0_ROCMFPX code 0 = -4");
+    CHECK_NEAR(out[1], -1.0f, 1e-6, "Q2_0_ROCMFPX code 1 = -1");
+    CHECK_NEAR(out[2], 1.0f, 1e-6, "Q2_0_ROCMFPX code 2 = +1");
+    CHECK_NEAR(out[3], 4.0f, 1e-6, "Q2_0_ROCMFPX code 3 = +4");
+}
+
+static void test_q3_0_rocmfpx_layout() {
+    // block_rocmfp3: {u8 qs[12]; u8 e[2]} = 14 bytes / 32 values.
+    // 3-bit codes, mag in {0,1,2,4}, sign in bit 4. 8 codes packed per 3 bytes.
+    u8 blk[14];
+    std::memset(blk, 0, sizeof(blk));
+    // Pack all-eight codes = {1,2,4,0,1,2,4,0} into qs[0..2]: LSB-first layout:
+    //   byte0: c0[2:0] | c1[2:0]<<3 | c2[1:0]<<6
+    //   byte1: c2[2] | c3[2:0]<<1 | c4[2:0]<<4 | c5[0]<<7
+    //   byte2: c5[1:0]<<2 | c6[2:0]<<5 | c7[2:0]<<2... actually:
+    //   byte2: c5[1:0]<<2 | c6[2:0]<<2 | c7[2:0]<<5
+    // We plant code 1 (mag 1, sign +) at c[0]: byte0 = 0x01.
+    blk[0] = 0x01; // c[0] = 1, rest 0
+    blk[12] = 0x40; // e[0] = 1.0
+    blk[13] = 0x38; // e[1] = 0.5
+    f32 out[32];
+    dequant_row(DType::Q3_0_ROCMFPX, blk, out, 32);
+    CHECK_NEAR(out[0], 1.0f, 1e-6, "Q3_0_ROCMFPX code 1 at scale 1.0 = +1");
+    for (int j = 1; j < 16; j++) CHECK_NEAR(out[j], 0.0f, 1e-6,
+                   "Q3_0_ROCMFPX other first-half codes are 0");
+    // The second half is all zeros (qs[6..11] == 0, codes 0 -> mag 0).
+    // Now the full four-code ladder in a pack8 group: codes 0,1,2,3,4,5,6,7.
+    // code 0 = 0, code 1 = +1, code 2 = +2, code 3 = +4 (sign bit clear),
+    // code 4 = 0 (mag 0), code 5 = -1 (sign bit set), code 6 = -2, code 7 = -4.
+    // Pack8 byte layout (LSB first) for codes [0..7]:
+    //   byte0 = c0 | c1<<3 | c2[1:0]<<6  = 0 | 1<<3 | 2<<6 = 0x01 | 0x08 | 0x80 = 0x89
+    //   byte1 = c2[2] | c3<<1 | c4<<4 | c5[0]<<7 = 0 | 4<<1 | 0... no, c4=0, c5=5&4=4 -> 1<<7 = 0x80; c3=4 -> 4<<1 = 8. So byte1 = 0 | 8 | 0 | 0x80 = 0x88
+    // Hmm, let me recompute: c3=4 (mag 4, sign 0) -> 4<<1 = 8; c4=0; c5=5 (mag 1, sign 1) -> bit0 = 1, so 1<<7 = 0x80. byte1 = 0 | 8 | 0 | 0x80 = 0x88.
+    // Wait c2=2, so c2[2] = (2>>2)&1 = 0. byte1 = 0 | 8 | 0 | 128 = 136 = 0x88.
+    //   byte2 = c5[1:0]<<2 | c6<<4.. no: c5[1:0]<<2 | c6[2:0]<<4 | c7[2:0]<<5... actually the unpack is:
+    //   c5 = (src[1]>>7)&1 | (src[2]&3)<<1 -- so byte2 contributes c5 bits 1:0 = src[2]&3, shifted left 1; and c6 = src[2]>>2 & 7; c7 = src[2]>>5 & 7.
+    // For codes [0,1,2,3,4,5,6,7]: c5=5, c5[1:0]=5&3=1, so (1)<<2=4 in byte2; c6=6, c6<<4 = 6<<4 = 96; c7=7, c7<<5 would overflow 8 bits... no, byte2 = c5[1:0]<<2 | c6[2:0]<<4 | c7[2:0]<<5 = 4 | (6<<4)&0xF0 | (7<<5)&0xE0 = 4 | 0x60 | 0xE0 = 0xE4... but that's 228, and c6=6 needs bits 4-6 (3 bits), 6<<4=96=0x60; c7=7 needs bits 5-7, 7<<5=224=0xE0. 0x60|0xE0=0xE0. So byte2 = 4 | 0xE0 = 0xE4.
+    // Let me just set each code explicitly via the unpack inverse.
+    // Simpler: code 1 at position 0, code 2 at position 1, code 4 at position 2,
+    // code 5 (-1) at position 3 -- in one pack8 group at qs[0..2].
+    std::memset(blk, 0, sizeof(blk));
+    blk[12] = 0x40;
+    // codes[0..7] = {1, 2, 4, 5, 0, 0, 0, 0}
+    // byte0 = c0 | c1<<3 | (c2&3)<<6 = 1 | 2<<3 | (4&3)<<6 = 1 | 16 | 0<<6 = 17 = 0x11; wait c2=4, c2&3=0, so (0)<<6 = 0. byte0 = 1 | 16 | 0 = 17.
+    // byte1 = (c2>>2)&1 | c3<<1 | c4<<4 | (c5&1)<<7 = (4>>2)&1 | 5<<1 | 0<<4 | (5&1)<<7 = 1 | 10 | 0 | 128 = 139 = 0x8B.
+    // byte2 = (c5>>1)&3<<2 | c6<<4 | c7<<5 -- c5=5, (5>>1)&3 = 2&3 = 2, 2<<2 = 8; c6=0; c7=0. byte2 = 8.
+    blk[0] = 0xD1;
+    blk[1] = 0x0A;
+    blk[2] = 0x00;
+    dequant_row(DType::Q3_0_ROCMFPX, blk, out, 32);
+    CHECK_NEAR(out[0], 1.0f, 1e-6, "Q3_0_ROCMFPX code 1 = +1");
+    CHECK_NEAR(out[1], 2.0f, 1e-6, "Q3_0_ROCMFPX code 2 = +2");
+    CHECK_NEAR(out[2], 4.0f, 1e-6, "Q3_0_ROCMFPX code 3 = +4");
+    CHECK_NEAR(out[3], -1.0f, 1e-6, "Q3_0_ROCMFPX code 5 = -1 (sign bit)");
+    CHECK_NEAR(out[4], 0.0f, 1e-6, "Q3_0_ROCMFPX code 0 = 0");
+    // Valid scale check: e <= 0x7E; 0x7F -> 0.
+    blk[12] = 0x7F;
+    dequant_row(DType::Q3_0_ROCMFPX, blk, out, 32);
+    for (int j = 0; j < 32; j++) CHECK_NEAR(out[j], 0.0f, 1e-30, "Q3_0_ROCMFPX invalid scale 0x7F");
+    std::vector<f32> x(32, 1.0f);
+    std::memset(blk, 0, sizeof(blk));
+    blk[12] = 0x40;
+    blk[0] = 0xD1; blk[1] = 0x0A; blk[2] = 0x00;
+    CHECK_NEAR(vec_dot(DType::Q3_0_ROCMFPX, blk, x.data(), 32), 6.0f, 1e-3,
+               "Q3_0_ROCMFPX vec_dot of the four-code ladder {+1,+2,+4,-1}");
+}
+
+static void test_q6_0_rocmfpx_layout() {
+    // block_rocmfp6: {u8 qs[24]; u8 e[2]} = 26 bytes / 32 values.
+    // 6-bit codes: mag = code & 31, sign in bit 5, mag 0 -> -32.
+    // 4 codes packed per 3 bytes (pack4, LSB first).
+    u8 blk[26];
+    std::memset(blk, 0, sizeof(blk));
+    // Pack 4 codes = {1, 2, 31, 33} (0, +1, +2, +31, -32, ...) into qs[0..2]:
+    //   byte0 = c0 | c1<<6; c0=1, c1=2 -> 1 | 2<<6 = 1 | 128 = 129 = 0x81.
+    //   byte1 = (c1>>2)&0xF | c2<<4; c2=31 -> 31<<4 = 496 = 0x1F0, low byte 0xF0; (2>>2)&0xF = 0. byte1 = 0 | 0xF0 = 0xF0.
+    //   byte2 = (c2>>4)&3<<2 | c3<<2; c2>>4 = 1, &3 = 1, <<2 = 4; c3 = 33 & 31 = 1, but wait c3 = 33 means code 33, but mag = 33&31 = 1, sign bit 32 set -> -1.
+    // Actually let me use codes {1,2,31,32} -> mag {1,2,31,0} with sign {+,+,+,-} -> values {+1,+2,+31,-32}.
+    // c0=1, c1=2, c2=31, c3=32 (code 32 = mag 0, sign bit 32 set -> -32).
+    // byte0 = 1 | 2<<6 = 1 | 128 = 129.
+    // byte1 = (2>>2)&0xF | 31<<4 = 0 | 0xF0 = 0xF0.
+    // byte2 = (31>>4)&3<<2 | 32<<2 = (1)&3<<2... (31>>4)=1, 1&3=1, 1<<2=4; 32<<2 = 128 = 0x80. byte2 = 4 | 128 = 132 = 0x84.
+    blk[0] = 0x81;
+    blk[1] = 0xF0;
+    blk[2] = 0x81;
+    blk[24] = 0x40; // e[0] = 1.0
+    blk[25] = 0x38; // e[1] = 0.5
+    f32 out[32];
+    dequant_row(DType::Q6_0_ROCMFPX, blk, out, 32);
+    CHECK_NEAR(out[0], 1.0f, 1e-6, "Q6_0_ROCMFPX code 1 at scale 1.0 = +1");
+    CHECK_NEAR(out[1], 2.0f, 1e-6, "Q6_0_ROCMFPX code 2 at scale 1.0 = +2");
+    CHECK_NEAR(out[2], 31.0f, 1e-6, "Q6_0_ROCMFPX code 31 at scale 1.0 = +31");
+    CHECK_NEAR(out[3], -32.0f, 1e-6, "Q6_0_ROCMFPX code 32 (mag 0, sign) = -32");
+    // Second half is all zeros (qs[12..23] == 0 -> codes 0 -> mag 0 -> -32 * 0.5 = -16).
+    // Wait, code 0 = mag 0, sign bit clear -> +0. No: rocmfpx_decode_fp6_code(0) = (0 & 32) ? -(0==0?32:0) : 0 = 0. So code 0 = 0.
+    for (int j = 16; j < 32; j++) CHECK_NEAR(out[j], 0.0f, 1e-6,
+                   "Q6_0_ROCMFPX second half all-code-0 is 0");
+    // Code ladder: 0, 1, 31, 32 in second half at scale 0.5.
+    std::memset(blk, 0, sizeof(blk));
+    blk[0] = 0;
+    blk[1] = 0;
+    blk[2] = 0;
+    // second half: qs[12..23], pack4 group at qs[12..14].
+    blk[12] = 0x81;
+    blk[13] = 0xF0;
+    blk[14] = 0x81;
+    blk[24] = 0x40;
+    blk[25] = 0x38;
+    dequant_row(DType::Q6_0_ROCMFPX, blk, out, 32);
+    CHECK_NEAR(out[16], 0.5f, 1e-6, "Q6_0_ROCMFPX code 1 at scale 0.5 = +0.5");
+    CHECK_NEAR(out[17], 1.0f, 1e-6, "Q6_0_ROCMFPX code 2 at scale 0.5 = +1.0");
+    CHECK_NEAR(out[18], 15.5f, 1e-6, "Q6_0_ROCMFPX code 31 at scale 0.5 = +15.5");
+    CHECK_NEAR(out[19], -16.0f, 1e-6, "Q6_0_ROCMFPX code 32 at scale 0.5 = -16");
+    // Invalid scale: e <= 0x7E; 0x7F -> 0.
+    blk[24] = 0x7F;
+    blk[25] = 0x7F;
+    dequant_row(DType::Q6_0_ROCMFPX, blk, out, 32);
+    for (int j = 0; j < 32; j++) CHECK_NEAR(out[j], 0.0f, 1e-30, "Q6_0_ROCMFPX invalid scale 0x7F");
+    std::vector<f32> x(32, 1.0f);
+    std::memset(blk, 0, sizeof(blk));
+    blk[0] = 0x81; blk[1] = 0xF0; blk[2] = 0x81;
+    blk[24] = 0x40; blk[25] = 0x38;
+    CHECK_NEAR(vec_dot(DType::Q6_0_ROCMFPX, blk, x.data(), 32),
+               1.0f + 2.0f + 31.0f - 32.0f, 1e-3,
+               "Q6_0_ROCMFPX vec_dot of the four-code ladder");
+}
+
 // Reference for Backend::hadamard_act, written from the definition rather
 // than from either implementation: an optional grouped-V perm, the sign
 // vector, then H[i][j] = (-1)^popcount(i & j) / sqrt(block) over consecutive
@@ -1085,6 +1260,12 @@ static void test_new_quant_geometry() {
         {DType::Q2_0_64, "Q2_0_64", 18, 64},
         {DType::PQ2_0, "PQ2_0", 34, 128},
         {DType::PTQ1_0, "PTQ1_0", 28, 128},
+        // ROCmFPX fork ternary formats (charlie12345/ROCmFPX): all 32-value
+        // blocks with two UE4M3 half-block scales. Q6_0_ROCMFPX 26 = 24 + 2,
+        // Q3_0_ROCMFPX 14 = 12 + 2, Q2_0_ROCMFPX 10 = 8 + 2.
+        {DType::Q6_0_ROCMFPX, "Q6_0_ROCMFPX", 26, 32},
+        {DType::Q3_0_ROCMFPX, "Q3_0_ROCMFPX", 14, 32},
+        {DType::Q2_0_ROCMFPX, "Q2_0_ROCMFPX", 10, 32},
     };
     for (const RowSpec &r : rows) {
         CHECK(dtype_supported(r.t), "the format is dequantizable");
@@ -1113,6 +1294,11 @@ static void test_new_quant_geometry() {
     // GGML_TYPE_PTQ1_0 = 143 (and GGML_TYPE_COUNT = 144 there).
     CHECK(static_cast<int>(DType::PQ2_0) == 142, "PQ2_0 keeps Prism id 142");
     CHECK(static_cast<int>(DType::PTQ1_0) == 143, "PTQ1_0 keeps Prism id 143");
+    // ROCmFPX fork ids (github.com/charlie12345/ROCmFPX): 102 Q6_0_ROCMFPX,
+    // 104 Q3_0_ROCMFPX, 107 Q2_0_ROCMFPX. These are not upstream ids.
+    CHECK(static_cast<int>(DType::Q6_0_ROCMFPX) == 102, "Q6_0_ROCMFPX keeps fork id 102");
+    CHECK(static_cast<int>(DType::Q3_0_ROCMFPX) == 104, "Q3_0_ROCMFPX keeps fork id 104");
+    CHECK(static_cast<int>(DType::Q2_0_ROCMFPX) == 107, "Q2_0_ROCMFPX keeps fork id 107");
 }
 
 static void test_q1_0_layout() {
@@ -2097,7 +2283,11 @@ static void test_gdn_ops() {
     (void)n; (void)heads;
 
     // The packed query split: interleaved halves come apart correctly.
-    std::vector<f32> packed(2 * 2 * 4), qo(2 * 2 * 4), gate(2 * 2 * 4);
+    // packed holds n_tok * n_head * 2 * hd: BOTH halves per head, per token.
+    // Sized as 2*2*4 it was half the layout the reads below use, so the loop
+    // walked off the end for the second token (and the device path, which
+    // reads the same layout, would have too).
+    std::vector<f32> packed(2 * 2 * 2 * 4), qo(2 * 2 * 4), gate(2 * 2 * 4);
     for (size_t i = 0; i < packed.size(); i++) packed[i] = static_cast<f32>(i);
     cpu->qwen3_next_split(qo.data(), gate.data(), packed.data(), 2, 2, 4);
     for (i64 t = 0; t < 2; t++)
@@ -2375,13 +2565,12 @@ static void test_load_verdict() {
     }
 
     // A format this build cannot dequantize is reported by name, not as a
-    // corrupt file: the container still opens it. Type 102 is a llama-dx
-    // ROCmFPX id -- the two files carrying it declare file_type 112 and 119 --
-    // and no header on this machine defines it, so it is the one refused.
+    // corrupt file: the container still opens it. Pick a type id that no
+    // header here defines (200) so the loader refuses it.
     {
         const std::string path =
-            build_verdict_fixture("rocmfpx102", "llama", "blk.0.attn_q.weight", 102, 0);
-        CHECK(!path.empty(), "wrote a type-102 fixture");
+            build_verdict_fixture("unknown200", "llama", "blk.0.attn_q.weight", 200, 0);
+        CHECK(!path.empty(), "wrote a type-200 fixture");
         Gguf g;
         std::string err;
         CHECK(g.load(path, &err), "an unknown format still parses");
@@ -2392,7 +2581,7 @@ static void test_load_verdict() {
         CHECK(!v.runnable, "the unknown format makes the file unrunnable");
         bool named = false;
         for (const std::string &b : v.blockers)
-            if (b.find("#102") != std::string::npos) named = true;
+            if (b.find("#200") != std::string::npos) named = true;
         CHECK(named, "the blocker names the on-disk format id");
         made.push_back(path);
     }
@@ -4040,6 +4229,9 @@ int main() {
     test_q2_0_layout();
     test_pq2_0_layout();
     test_ptq1_0_layout();
+    test_q2_0_rocmfpx_layout();
+    test_q3_0_rocmfpx_layout();
+    test_q6_0_rocmfpx_layout();
     test_hadamard_act();
     test_iq_family_structure();
     test_vec_dot();

@@ -572,7 +572,7 @@ tokens and then part at a near-tie (`machines were developed` against
 two engines sum in a different order. The rule that falls out: an oracle agrees
 word for word on a ternary model and is only a tie-breaker on a 2-bit one.
 
-### 11.5 ids 102 / 104 / 107: measured, still refused
+### 11.5 ids 102 / 104 / 107: resolved 2026-10-07
 
 Two files carry these: `ornith-1.0-35B-Q3_0_ROCMFPX.gguf` (101 ×2, 102 ×40,
 104 ×268, `general.file_type = 112`) and
@@ -580,14 +580,19 @@ Two files carry these: `ornith-1.0-35B-Q3_0_ROCMFPX.gguf` (101 ×2, 102 ×40,
 107 ×214, `file_type = 119`). Their own offsets put 102 at 6.5 bpw, 104 at
 3.5 bpw and 107 at 2.5 bpw.
 
-These are *not* an f16-scale block of some width. Sweeping 11 candidate strides
-and testing whether the first two bytes of each block behave as a scale leaves
-25-37% of them implausible at the best stride, where a real scale field gives 0%.
-The producer is not on this machine either: the llama-dx clone is at the tip of
-`origin/main` (`ce15745`), its `ggml.h` stops at 101 with `GGML_TYPE_COUNT = 102`,
-and nothing under `C:/Users/rr`, `H:/` or `G:/` mentions these ids. 100 and 101
-were already implemented and `Ornith-1.0-9b-ROCmFPX-STRIX_LEAN.gguf` (100 ×40,
-101 ×209, `file_type = 106`) loads.
+These are now implemented from the ROCmFPX fork (github.com/charlie12345/ROCmFPX):
+host dequantizers `deq_q6_0_rocmfpx` / `deq_q3_0_rocmfpx` / `deq_q2_0_rocmfpx`
+and device kernels in `src/hip/kernels/dequant.hpp`, all three using UE4M3
+half-block scales (e[2], e ≤ 0x7E valid). The layouts are
+`block_rocmfp6` {u8 qs[24]; u8 e[2]} = 26 B / 32 (6.5 bpw),
+`block_rocmfp3` {u8 qs[12]; u8 e[2]} = 14 B / 32 (3.5 bpw),
+`block_rocmfp2` {u8 qs[8]; u8 e[2]} = 10 B / 32 (2.5 bpw). FP2 codes use the
+S40 ladder {-4,-1,+1,+4}; FP3 codes use magnitudes {0,1,2,4} with sign in bit 4;
+FP6 codes use magnitude = code & 31 with sign in bit 5 (mag 0 → -32).
+
+100 and 101 (Q4_0_ROCMFP4 / Q4_0_ROCMFP4_FAST) were already implemented and
+`Ornith-1.0-9b-ROCmFPX-STRIX_LEAN.gguf` (100 ×40, 101 ×209, `file_type = 106`)
+loads.
 
 ### 11.6 id 142: geometry measured, and the map is not a level map (resolved 2026-10-07)
 

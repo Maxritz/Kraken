@@ -644,6 +644,121 @@ void deq_rocmfp4_fast(const u8 *b, f32 *y, i64 nblk) {
 }
 
 // ---------------------------------------------------------------------------
+// ROCmFPX fork ternary formats (github.com/charlie12345/ROCmFPX).
+//
+// All three are 32-value blocks with TWO UE4M3 half-block scales (e[2]),
+// one per 16-element half. The difference is only the code width and packing.
+// Authority: rocmfpx_dequantize_row_fp{2,3,6} in that fork's rocmfpx.c.
+//
+// UE4M3: exp = e >> 3, mant = e & 7; if e <= 0x7E:
+//   exp == 0 -> mant * 2^-10 ; else (8 + mant) * 2^(exp - 11).
+// Already shared via ue4m3_to_fp32().
+//
+// FP2 (S40): mag in {-4,-1,+1,+4} (frozen MORD order).
+//   code & 3 selects the magnitude, e[half] scales it.
+//   qs[half*4 + j/4] >> (2*(j%4)) & 3  ->  code
+//
+// FP3: mag in {0,1,2,4}, sign in bit 4.
+//   8 codes packed into 3 bytes (pack8, LSB-first).
+//   Half 0 -> qs[0..5] (2 groups), Half 1 -> qs[6..11] (2 groups).
+//
+// FP6: mag = code & 31, sign in bit 5; mag==0 -> -32 (not 0).
+//   4 codes packed into 3 bytes (pack6, LSB-first).
+//   Half 0 -> qs[0..11] (4 groups), Half 1 -> qs[12..23] (4 groups).
+// ---------------------------------------------------------------------------
+
+// FP2 code -> signed magnitude (S40, frozen MORD order {-4,-1,+1,+4}).
+inline int rocmfpx_code_fp2(int c) {
+    static const int m[] = {-4, -1, 1, 4};
+    return m[c & 3];
+}
+
+// FP3 code -> signed magnitude (mag in {0,1,2,4}, sign in bit 4).
+inline int rocmfpx_code_fp3(int c) {
+    static const int m[] = {0, 1, 2, 4};
+    const int v = m[c & 3];
+    return (c & 4) ? -v : v;
+}
+
+// FP6 code -> signed magnitude (mag = code & 31, sign in bit 5,
+// mag 0 -> -32).
+inline int rocmfpx_code_fp6(int c) {
+    const int mag = c & 31;
+    return (c & 32) ? -(mag == 0 ? 32 : mag) : mag;
+}
+
+void deq_q2_0_rocmfpx(const u8 *b, f32 *y, i64 nblk) {
+    // block_rocmfp2: {u8 qs[8]; u8 e[2]} = 10 bytes / 32 values.
+    for (i64 i = 0; i < nblk; i++, b += 10, y += 32) {
+        const f32 d0 = ue4m3_to_fp32(b[8]);
+        const f32 d1 = ue4m3_to_fp32(b[9]);
+        for (int j = 0; j < 16; j++) {
+            const int c = (b[j / 4] >> (2 * (j % 4))) & 3;
+            y[j] = static_cast<f32>(rocmfpx_code_fp2(c)) * d0;
+        }
+        for (int j = 0; j < 16; j++) {
+            const int c = (b[4 + j / 4] >> (2 * (j % 4))) & 3;
+            y[16 + j] = static_cast<f32>(rocmfpx_code_fp2(c)) * d1;
+        }
+    }
+}
+
+void deq_q3_0_rocmfpx(const u8 *b, f32 *y, i64 nblk) {
+    // block_rocmfp3: {u8 qs[12]; u8 e[2]} = 14 bytes / 32 values.
+    // 8 codes packed into 3 bytes (pack8).
+    for (i64 i = 0; i < nblk; i++, b += 14, y += 32) {
+        const f32 d0 = ue4m3_to_fp32(b[12]);
+        const f32 d1 = ue4m3_to_fp32(b[13]);
+        // Unpack all 32 codes (4 groups of 8).
+        // Group 0: qs[0..2], Group 1: qs[3..5], Group 2: qs[6..8], Group 3: qs[9..11].
+        for (int g = 0; g < 4; g++) {
+            const u8 *src = b + g * 3;
+            const u8 c0 = src[0] & 7;
+            const u8 c1 = (src[0] >> 3) & 7;
+            const u8 c2 = ((src[0] >> 6) & 3) | ((src[1] & 1) << 2);
+            const u8 c3 = (src[1] >> 1) & 7;
+            const u8 c4 = (src[1] >> 4) & 7;
+            const u8 c5 = ((src[1] >> 7) & 1) | ((src[2] & 3) << 1);
+            const u8 c6 = (src[2] >> 2) & 7;
+            const u8 c7 = (src[2] >> 5) & 7;
+            const f32 d = (g < 2) ? d0 : d1;
+            const int base = g * 8;
+            y[base + 0] = static_cast<f32>(rocmfpx_code_fp3(c0)) * d;
+            y[base + 1] = static_cast<f32>(rocmfpx_code_fp3(c1)) * d;
+            y[base + 2] = static_cast<f32>(rocmfpx_code_fp3(c2)) * d;
+            y[base + 3] = static_cast<f32>(rocmfpx_code_fp3(c3)) * d;
+            y[base + 4] = static_cast<f32>(rocmfpx_code_fp3(c4)) * d;
+            y[base + 5] = static_cast<f32>(rocmfpx_code_fp3(c5)) * d;
+            y[base + 6] = static_cast<f32>(rocmfpx_code_fp3(c6)) * d;
+            y[base + 7] = static_cast<f32>(rocmfpx_code_fp3(c7)) * d;
+        }
+    }
+}
+
+void deq_q6_0_rocmfpx(const u8 *b, f32 *y, i64 nblk) {
+    // block_rocmfp6: {u8 qs[24]; u8 e[2]} = 26 bytes / 32 values.
+    // 4 codes packed into 3 bytes (pack4).
+    for (i64 i = 0; i < nblk; i++, b += 26, y += 32) {
+        const f32 d0 = ue4m3_to_fp32(b[24]);
+        const f32 d1 = ue4m3_to_fp32(b[25]);
+        // Unpack all 32 codes (8 groups of 4).
+        for (int g = 0; g < 8; g++) {
+            const u8 *src = b + g * 3;
+            const u8 c0 = src[0] & 0x3F;
+            const u8 c1 = ((src[0] >> 6) & 3) | ((src[1] & 0xF) << 2);
+            const u8 c2 = ((src[1] >> 4) & 0xF) | ((src[2] & 3) << 4);
+            const u8 c3 = (src[2] >> 2) & 0x3F;
+            const f32 d = (g < 4) ? d0 : d1;
+            const int base = g * 4;
+            y[base + 0] = static_cast<f32>(rocmfpx_code_fp6(c0)) * d;
+            y[base + 1] = static_cast<f32>(rocmfpx_code_fp6(c1)) * d;
+            y[base + 2] = static_cast<f32>(rocmfpx_code_fp6(c2)) * d;
+            y[base + 3] = static_cast<f32>(rocmfpx_code_fp6(c3)) * d;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ternary (BitNet) formats
 //
 // Both store {-1, 0, +1} codes with one fp16 scale per 256-value super-block.
@@ -801,6 +916,9 @@ void dequant_block(DType t, const u8 *p, f32 *buf) {
         case DType::Q2_0_64: deq_q2_0_64(p, buf, 1); break;
         case DType::PQ2_0: deq_pq2_0(p, buf, 1); break;
         case DType::PTQ1_0: deq_ptq1_0(p, buf, 1); break;
+        case DType::Q6_0_ROCMFPX: deq_q6_0_rocmfpx(p, buf, 1); break;
+        case DType::Q3_0_ROCMFPX: deq_q3_0_rocmfpx(p, buf, 1); break;
+        case DType::Q2_0_ROCMFPX: deq_q2_0_rocmfpx(p, buf, 1); break;
         default: break;
     }
 }
@@ -846,6 +964,9 @@ const char *dtype_name(DType t) {
         case DType::TQ2_0: return "TQ2_0";
         case DType::PQ2_0: return "PQ2_0";
         case DType::PTQ1_0: return "PTQ1_0";
+        case DType::Q6_0_ROCMFPX: return "Q6_0_ROCMFPX";
+        case DType::Q3_0_ROCMFPX: return "Q3_0_ROCMFPX";
+        case DType::Q2_0_ROCMFPX: return "Q2_0_ROCMFPX";
         default: return "UNKNOWN";
     }
 }
@@ -887,6 +1008,9 @@ bool dtype_supported(DType t) {
         case DType::Q2_0_64:
         case DType::PQ2_0:
         case DType::PTQ1_0:
+        case DType::Q6_0_ROCMFPX:
+        case DType::Q3_0_ROCMFPX:
+        case DType::Q2_0_ROCMFPX:
             return true;
         default:
             return false;
@@ -920,6 +1044,9 @@ int dtype_block_size(DType t) {
         case DType::PTQ1_0: return 128;
         case DType::Q2_0_64: return 64;
         case DType::NVFP4: return 64;
+        case DType::Q6_0_ROCMFPX: return 32;
+        case DType::Q3_0_ROCMFPX: return 32;
+        case DType::Q2_0_ROCMFPX: return 32;
         default: return 32;
     }
 }
@@ -965,6 +1092,9 @@ int dtype_block_bytes(DType t) {
         case DType::TQ2_0: return 66;
         case DType::PQ2_0: return 34;   // 2 + 128/4, block_pq2_0 (Prism)
         case DType::PTQ1_0: return 28;  // 24 + 2 + 2, block_ptq1_0 (Prism)
+        case DType::Q6_0_ROCMFPX: return 26;  // 24 + 2, block_rocmfp6 (ROCmFPX)
+        case DType::Q3_0_ROCMFPX: return 14;  // 12 + 2, block_rocmfp3 (ROCmFPX)
+        case DType::Q2_0_ROCMFPX: return 10;  //  8 + 2, block_rocmfp2 (ROCmFPX)
         default: return 0;
     }
 }

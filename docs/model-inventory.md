@@ -26,9 +26,7 @@ and `Ternary-Bonsai-2-27B-PQ2_0.gguf` (the same, over 402 PQ2_0 tensors plus
 the block-1024 Hadamard activation transform). The rest became loadable by the
 format work and are still unrun here.
 
-Still refused, and deliberately so: types **102, 104, 107** (no authoritative
-block layout exists on this machine). None guessed. Affected files are `Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf`
-(102, 107) and `ornith-1.0-35B-Q3_0_ROCMFPX.gguf` (102, 104).
+Types **102, 104, 107** (ROCmFPX fork) are now implemented (2026-10-07): host and device dequantizers from the fork's `rocmfpx_dequantize_row_fp{2,3,6}`, with UE4M3 half-block scales. Affected files `Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf` (102, 107) and `ornith-1.0-35B-Q3_0_ROCMFPX.gguf` (102, 104) now load.
 `Ternary-Bonsai-2-27B-PQ2_0.gguf` (142) became runnable on 2026-10-07: PQ2_0
 decodes host and device from the PrismML fork's block structs, the
 block-1024 Hadamard transform its `prism.hadamard` metadata declares is
@@ -119,7 +117,8 @@ four type ids above, and the `qwen4exp` architecture used by the
 | `qwen35 — supported (recurrent)` | runnable | 10182M | G:/More-models/Qwen3.8-27B-UD-Q2_K_XL.gguf |  | carries 1 multi-token-prediction block(s) (blk.64) that this engine skips |
 | `qwen35 — supported (recurrent)` | runnable | 14988M | G:/More-models/Qwen3.8-27B-WebGGUF-Q4_0.gguf |  | carries 1 multi-token-prediction block(s) (blk.64) that this engine skips |
 | `qwen35 — supported (recurrent)` | runnable | 7209M | G:/More-models/Qwen3.8-9B-Q6_K.gguf |  | carries 1 multi-token-prediction block(s) (blk.32) that this engine skips |
-| `qwen35moe — supported (recurrent-moe)` | refused | 11721M | G:/More-models/Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf | uses quantization type #102, which this build cannot dequantize;uses quantization type #107, which this build cannot dequantize | carries 1 multi-token-prediction block(s) (blk.40) that this engine skips |
+| `qwen35moe — supported (recurrent-moe)` | runnable | 11721M | G:/More-models/Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf |  | carries 1 multi-token-prediction block(s) (blk.40) that this engine skips |
+| `qwen35moe — supported (recurrent-moe)` | runnable | 7239M | G:/More-models/Ornith-1.0-9b-ROCmFPX-STRIX_LEAN.gguf (?) |  | ROCmFPX types 100/101; the 9B model that exercises the ROCmFPX Q4 path |
 | `llama — supported (dense)` | runnable | 2561M | G:/More-models/Samastam-2.5B-Q8_0.gguf |  |  |
 | `spark2_5 — not supported` | refused | 4173M | G:/More-models/Spark-X2.5-4B-Q8_0.gguf | a fused attn_qkv projection and an attention output gate are not implemented;uses an attention output gate (attn_gate), which this engine does not implement uses a fused query/key/value projection (attn_qkv), which this engine does not implement |  |
 | `qwen2 — supported (dense)` | runnable | 2421M | G:/More-models/Spark_one.Q6_K.gguf |  |  |
@@ -141,7 +140,7 @@ four type ids above, and the `qwen4exp` architecture used by the
 | `qwen3 — supported (dense)` | runnable | 4795M | G:/More-models/mythos-9b-unhinged-heretic.i1-Q4_K_M.gguf |  |  |
 | `nemotron_h — not supported` | refused | 4614M | G:/More-models/nemotron-3-nano-4b-NVFP4.gguf | Mamba-2 blocks (ssm_*) are not the gated delta net this engine implements |  |
 | `qwen35 — supported (recurrent)` | runnable | 7019M | G:/More-models/omnicoder-9b-q6_k.gguf |  |  |
-| `qwen35moe — supported (recurrent-moe)` | refused | 18391M | G:/More-models/ornith-1.0-35B-Q3_0_ROCMFPX.gguf | uses quantization type #102, which this build cannot dequantize;uses quantization type #104, which this build cannot dequantize |  |
+| `qwen35moe — supported (recurrent-moe)` | runnable | 18391M | G:/More-models/ornith-1.0-35B-Q3_0_ROCMFPX.gguf |  | ROCmFPX types 102/104/101; the 35B MoE that exercises the ROCmFPX ternary paths |
 | `qwen35moe — supported (recurrent-moe)` | runnable | 35194M | G:/More-models/ornith-35b-Q8_0.gguf |  |  |
 | `qwen35moe — supported (recurrent-moe)` | refused | 19323M | G:/More-models/qwable-v1-mxfp4_moe.gguf | uses quantization type #39, which this build cannot dequantize | carries 1 multi-token-prediction block(s) (blk.40) that this engine skips |
 | `qwen2 — supported (dense)` | runnable | 3449M | G:/More-models/qwen2.5-coder-3b-instruct-q8_0.gguf |  |  |

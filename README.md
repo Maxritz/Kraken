@@ -357,7 +357,6 @@ when the head width has to be inferred from the embedding.
 | Fused QKV / attention output gate (spark2_5) | Spark-X2.5-4B-Q8_0 |
 | Routed attention values (k2-horizon) | K2-Horizon-MoVA-36B-A4B-Q4_K_M |
 | Attention output gate (muse-glimmer) | Muse-Glimmer-30B-UD-Q8_K_XL |
-| Quant type this build cannot dequantize | Qwen3.8-Distill-35B-Q2KXL (#102/#107), ornith-1.0-35B-Q3_0 (#104/#102) |
 | Head geometry the loader rejects (`n_embd` not divisible by head count, and no `attention.key_length` in the file to override it) | qwen3.8-flash-next-Q4, Qwen3.8-27B-WebGGUF-Q4_0 |
 
 ### Short-context decode
@@ -637,10 +636,11 @@ decoder mirrors its `dequantize_row_*`, on both the host reference path and the
 GPU kernels, so the `GSQ-RCO`, `IQ3_XXS` and `Bonsai` exports load and decode,
 and `Ternary-Bonsai-2-27B-PQ2_0.gguf` passes device-vs-CPU coherence.
 
-**Still refused, and rejected loudly at load rather than mis-decoded**: the
-ROCmFPX ids **102, 104, 107**, whose block layout no header on this machine
-declares (an 11-stride sweep never even found a plausible scale field).
 `IQ4_NL` and `IQ4_XS` dequantize as before;
+the ROCmFPX ids **102, 104, 107** are now implemented (2026-10-07) from the
+fork's `rocmfpx_dequantize_row_fp{2,3,6}` with UE4M3 half-block scales;
+`kraken-inspect model.gguf --quant` tells you which formats a file actually
+uses before you try to run it.
 `kraken-inspect model.gguf --quant` tells you which formats a file actually
 uses before you try to run it.
 

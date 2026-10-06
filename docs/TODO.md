@@ -710,7 +710,7 @@ the suspect. Fix = take dequant off the critical path: double-buffered LDS, a
   draft head and wire them into the existing speculative loop.
 - **Architecture pass over every file in the model folders** — the inventory is
   at 44 runnable of 87; the refused ones need either a named dequantizer
-  (quant type #102/#104/#107 -- #100, #101, #142 and #143 are implemented) or a
+  (quant type #100/#101/#102/#104/#107/#142/#143 are all implemented) or a
   documented reason, and the runnable set
   needs a load-and-generate smoke test each.
 - **Paper backlog** — all 12 summarized with what each would change here in
@@ -1012,7 +1012,7 @@ docs/test-results.md §9.
 | G4 | **Tiered KV cache absent entirely.** One flat `alloc(n_layer * kv_cap * kv_dim)` in VRAM. No RAM tier, no NVMe tier, no paging, no radix prefix reuse. | `engine.cpp:275` | open |
 | G5 | **No 6/8 GiB profile.** Expert budget is a flat byte cap; KV is flat VRAM. Neither adapts to a small card. | `configure_expert_cache` | open |
 | G6 | **RDNA2 unvalidated.** gfx1031 is the primary target and there is no machine; every RDNA2 claim is untested by construction. | — | blocked |
-| G7 | **Missing quant types blocked four named files.** IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ1_M and BitNet's Q1_0 (41) / Q2_0 (42) are now decoded on **host and device**, with every codebook machine-diffed against ggml-common.h (see the dequant session entry at the end of this file). **`qwen4exp` still has no registry entry** (the Qwen3.8-Flash item), and ids 102/104/107 still have no authoritative layout (142/143 landed 2026-10-07). | prior session + this session | **`qwen4exp` and ids 102/104/107 open; 142/143 closed** |
+| G7 | **Missing quant types blocked four named files.** IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ1_M and BitNet's Q1_0 (41) / Q2_0 (42) are now decoded on **host and device**, with every codebook machine-diffed against ggml-common.h (see the dequant session entry at the end of this file). **`qwen4exp` still has no registry entry** (the Qwen3.8-Flash item). Ids 102/104/107 are now implemented from the ROCmFPX fork (2026-10-07); 142/143 landed 2026-10-07. | prior session + this session | **`qwen4exp` still open; all quant ids 100..143 done except the arch-gated ones** |
 | G8 | **MoE decode loses to llama.cpp running on CPU only** (13.2 vs 16.3 tok/s). | this session | open |
 | G9 | **DFlash acceptance 0%** in kraken; the reference also reports 0.000% on the official pair. | prior session | open |
 | G10 | **The gate has no equivalence test for fast paths.** `probe_attn_qtile` was a *broken build target* for an unknown number of sessions, which is why G1a survived. | this session | open |
@@ -1070,7 +1070,7 @@ the gate) so a regression cannot hide again. Then G2, then G3, then G4/G5.
 | T8 | Tiered KV cache: VRAM HOT / RAM WARM / NVMe COLD, radix prefix reuse, persistence. Zero implementation | open |
 | T9 | 6/8/12/16 GiB hardware profiles, slot strategy per spec §28-29 | open |
 | T10 | **RDNA2 validation — now actionable on maclin** | open |
-| T11 | Quant: **every listed format is now implemented on both host and device**, IQ2_XS's missing `dequant_chunk` branch included -- see the dequant session entry at the end of this file. **`qwen4exp` still has no registry entry** (this is the Qwen3.8-Flash item, and it is why `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS` is refused on the arch rather than the quant). Ids 102/104/107 remain refusals: no reference layout exists on this machine, so they must not be guessed (142/143 resolved from the PrismML fork header, 2026-10-07) | **`qwen4exp` + ids 102/104/107 open; 142/143 done** |
+| T11 | Quant: **every listed format is now implemented on both host and device**, IQ2_XS's missing `dequant_chunk` branch included -- see the dequant session entry at the end of this file. **`qwen4exp` still has no registry entry** (this is the Qwen3.8-Flash item, and it is why `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS` is refused on the arch rather than the quant). Ids 102/104/107 are now implemented from the ROCmFPX fork (2026-10-07); 142/143 resolved from the PrismML fork header, 2026-10-07 | **`qwen4exp` still open; all quant ids 100..143 done except the arch-gated ones** |
 | T12 | Correctness: laguna greedy output not reproducible run-to-run — **the decode-attention split-K race responsible is identified and fixed** (see the entry above); DFlash 0%; Spark_one.Q6_K; two ambiguous `device rc=0, cpu rc=1` models | needs re-verification |
 | T13 | **The gate has no equivalence test for fast paths** — the reason a 41%-wrong kernel shipped and survived | open |
 | T14 | Doc drift: README says a 32x64x64 WMMA tile (code: BK=128) and "weights are never dequantized" (the WMMA prefill path stages fp16 through LDS) | open |
@@ -1124,8 +1124,8 @@ validation, 30 sessions overdue) → T2 (largest measured number) → T4/T6 → 
 of the Q1_0/Q2_0 files that were waiting on them run; the Q2_0 block geometry
 turned out to be the llama-dx fork's 128-value one, so the earlier "malformed
 file" reading was wrong and is withdrawn. Details in section 11 of
-[docs/test-results.md](test-results.md). Still refused, and needing a newer fork
-revision rather than more engine work: ids 102, 104 and 107.
+[docs/test-results.md](test-results.md). Ids 102, 104 and 107 are now implemented
+from the ROCmFPX fork (2026-10-07).
 
 --------------------------------------------------------------------------------
 Session entry: RDNA2 head-to-head (HIP reference) + the OLMoE QK-norm
@@ -1254,25 +1254,18 @@ sizes and load.
 
 **Still refused, and it is not a decoder gap:**
 
-- ids **102, 104, 107** have no authoritative block layout on this machine,
-  so they must not be guessed. **142** is a different case and is closed: its
-  decoder came from the PrismML fork header, and what every end-to-end attempt
-  lacked was the block-1024 Hadamard activation transform (resolution note on
-  its entry below).
-  `H:/llamadx/llama.cpp/.llama-dx-reference` is a clone of Maxritz/LLAMA-DX at
-  the tip of `origin/main` (ce15745) and its `ggml.h` stops at 101 with
-  `GGML_TYPE_COUNT = 102`, so these ids come from a newer revision of that fork
-  which is not on this box; nothing under `C:/Users/rr`, `H:/` or `G:/`
-  mentions any of them.
+- `qwen4exp` (Qwen3.8-Flash) has no registry entry; that is why
+  `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS` is refused on architecture, not quant.
+- The ROCmFPX ids 102/104/107, and the PrismML ids 142/143, are now implemented
+  (2026-10-07). 102/104/107 from the ROCmFPX fork's `rocmfpx_dequantize_row_fp{2,3,6}`
+  with UE4M3 half-block scales; 142/143 from the PrismML fork's block structs plus
+  the block-1024 Hadamard activation transform.
 - **102 is 6.5 bpw, 104 is 3.5 bpw and 107 is 2.5 bpw**, measured from their own
   tensor offsets. Files:
   `G:/More-models/ornith-1.0-35B-Q3_0_ROCMFPX.gguf` (101 x2, 102 x40, 104 x268,
   `general.file_type` 112) and
   `G:/More-models/Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf`
-  (102 x229, 107 x214, `file_type` 119). A sweep of 11 candidate byte strides
-  found none at which the first two bytes of every block behave as a scale (the
-  best still left 25-37% of them implausible), so none of them is an f16-scale
-  block of any width -- the layout is something else and stays unguessed.
+  (102 x229, 107 x214, `file_type` 119). Both now load.
 - **142**, in `G:/More-models/Ternary-Bonsai-2-27B-PQ2_0.gguf` (402 tensors,
   `file_type` 141, `general.name` "Hf", basename "folded"). Its geometry *is*
   measured: 34 bytes per 128 values (2.125 bpw), an f16 scale at the head of

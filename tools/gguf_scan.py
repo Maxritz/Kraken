@@ -18,7 +18,9 @@ DT = {0:'F32',1:'F16',2:'Q4_0',3:'Q4_1',6:'Q5_0',7:'Q5_1',8:'Q8_0',9:'Q8_1',
       21:'IQ3_S',22:'IQ2_S',23:'IQ4_XS',24:'I8',25:'I16',26:'I32',27:'I64',
       28:'F64',29:'IQ1_M',30:'BF16',34:'TQ1_0',35:'TQ2_0',39:'MXFP4',40:'NVFP4',
       41:'Q1_0',42:'Q2_0',48:'Q2_0_64',50:'F8_E4M3FN',
-      100:'Q4_0_ROCMFP4',101:'Q4_0_ROCMFP4_FAST',142:'PQ2_0',143:'PTQ1_0'}
+      100:'Q4_0_ROCMFP4',101:'Q4_0_ROCMFP4_FAST',
+      102:'Q6_0_ROCMFPX',104:'Q3_0_ROCMFPX',107:'Q2_0_ROCMFPX',
+      142:'PQ2_0',143:'PTQ1_0'}
 
 # Type ids with a known block geometry, measured by --audit. 42 is the one
 # whose meaning is not fixed by the id alone: upstream llama.cpp's Q2_0 is a
@@ -29,6 +31,9 @@ DT = {0:'F32',1:'F16',2:'Q4_0',3:'Q4_1',6:'Q5_0',7:'Q5_1',8:'Q8_0',9:'Q8_1',
 # the audit prints their geometry string -- their ids are unambiguous.
 BLOCK_GEOMETRY = {   # type id -> (block_bytes, block_values), id-only cases
     42: [(34, 128), (18, 64)],
+    102: [(26, 32)],
+    104: [(14, 32)],
+    107: [(10, 32)],
     142: [(34, 128)],
     143: [(28, 128)],
 }

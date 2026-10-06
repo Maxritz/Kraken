@@ -57,6 +57,17 @@ __device__ static const i8 kDevValuesFp4[16] = {
 __device__ static const i8 kDevValuesRocmFp4[16] = {
     0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10,
 };
+
+// ROCmFPX fork fp2 code ladder (S40, frozen MORD order {-4,-1,+1,+4}).
+__device__ static const i8 kDevRocmFp2Mag[4] = {-4, -1, 1, 4};
+
+// ROCmFPX fork fp3 code magnitudes {0,1,2,4}.
+__device__ static const i8 kDevRocmFp3Mag[4] = {0, 1, 2, 4};
+
+// ROCmFPX fork fp6 code magnitudes: mag = code & 31.
+// (no table needed; decoded inline as code & 31, sign in bit 5,
+// mag 0 -> -32.)
+
 __device__ static const i8 kDevIq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
@@ -180,6 +191,9 @@ KRK_QTRAIT(DType::Q2_0, 4);
 KRK_QTRAIT(DType::Q2_0_64, 2);
 KRK_QTRAIT(DType::PQ2_0, 4);
 KRK_QTRAIT(DType::PTQ1_0, 4);
+KRK_QTRAIT(DType::Q6_0_ROCMFPX, 1);
+KRK_QTRAIT(DType::Q3_0_ROCMFPX, 1);
+KRK_QTRAIT(DType::Q2_0_ROCMFPX, 1);
 KRK_QTRAIT(DType::NVFP4, 2);
 KRK_QTRAIT(DType::MXFP4, 1);
 KRK_QTRAIT(DType::ROCMFP4, 1);
@@ -223,6 +237,9 @@ __device__ __forceinline__ int dtype_block_bytes_dev(int t) {
         case static_cast<int>(DType::Q2_0_64): return 18;
         case static_cast<int>(DType::PQ2_0): return 34;   // block_pq2_0 (Prism)
         case static_cast<int>(DType::PTQ1_0): return 28;  // block_ptq1_0 (Prism)
+        case static_cast<int>(DType::Q6_0_ROCMFPX): return 26;  // block_rocmfp6 (ROCmFPX)
+        case static_cast<int>(DType::Q3_0_ROCMFPX): return 14;  // block_rocmfp3 (ROCmFPX)
+        case static_cast<int>(DType::Q2_0_ROCMFPX): return 10;  // block_rocmfp2 (ROCmFPX)
         case static_cast<int>(DType::IQ4_XS): return 136;
         case static_cast<int>(DType::NVFP4): return 36;
         case static_cast<int>(DType::MXFP4): return 17;
@@ -265,6 +282,9 @@ __device__ __forceinline__ int dtype_chunks_per_block_dev(int t) {
         case static_cast<int>(DType::Q2_0_64): return 2;
         case static_cast<int>(DType::PQ2_0): return 4;
         case static_cast<int>(DType::PTQ1_0): return 4;
+        case static_cast<int>(DType::Q6_0_ROCMFPX): return 1;
+        case static_cast<int>(DType::Q3_0_ROCMFPX): return 1;
+        case static_cast<int>(DType::Q2_0_ROCMFPX): return 1;
         default: return 1;
     }
 }
@@ -337,6 +357,54 @@ __device__ __forceinline__ bool tq2_0_block_is_zero(const u8 *b) {
         if (v != ones) return false;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// ROCmFPX fork ternary format device helpers (github.com/charlie12345/ROCmFPX).
+//
+// FP2 (S40): mag in {-4,-1,+1,+4}, code in {0,1,2,3}.
+// FP3: mag in {0,1,2,4}, sign in bit 4.
+// FP6: mag = code & 31, sign in bit 5, mag 0 -> -32.
+// All three use two UE4M3 half-block scales e[0] and e[1].
+// ---------------------------------------------------------------------------
+
+// FP2 code -> signed magnitude (S40).
+__device__ __forceinline__ int rocmfpx_code_fp2_dev(int c) {
+    return kDevRocmFp2Mag[c & 3];
+}
+
+// FP3 code -> signed magnitude.
+__device__ __forceinline__ int rocmfpx_code_fp3_dev(int c) {
+    const int v = kDevRocmFp3Mag[c & 3];
+    return (c & 4) ? -v : v;
+}
+
+// FP6 code -> signed magnitude (mag = code & 31, sign in bit 5, mag 0 -> -32).
+__device__ __forceinline__ int rocmfpx_code_fp6_dev(int c) {
+    const int mag = c & 31;
+    return (c & 32) ? -(mag == 0 ? 32 : mag) : mag;
+}
+
+// Unpack 8 fp3 codes from 3 bytes (pack8, LSB-first).
+// Matches rocmfpx_fp3_unpack8 in rocmfpx.c.
+__device__ __forceinline__ void rocmfpx_fp3_unpack8(const u8 *src, u8 *c) {
+    c[0] =  src[0]        & 7u;
+    c[1] = (src[0] >> 3)  & 7u;
+    c[2] = ((src[0] >> 6) & 3u) | ((src[1] & 1u) << 2);
+    c[3] = (src[1] >> 1)  & 7u;
+    c[4] = (src[1] >> 4)  & 7u;
+    c[5] = ((src[1] >> 7) & 1u) | ((src[2] & 3u) << 1);
+    c[6] = (src[2] >> 2)  & 7u;
+    c[7] = (src[2] >> 5)  & 7u;
+}
+
+// Unpack 4 fp6 codes from 3 bytes (pack4, LSB-first).
+// Matches rocmfpx_fp6_unpack4 in rocmfpx.c.
+__device__ __forceinline__ void rocmfpx_fp6_unpack4(const u8 *src, u8 *c) {
+    c[0] =  src[0]         & 0x3Fu;
+    c[1] = ((src[0] >> 6)  & 0x03u) | ((src[1] & 0x0Fu) << 2);
+    c[2] = ((src[1] >> 4)  & 0x0Fu) | ((src[2] & 0x03u) << 4);
+    c[3] =  (src[2] >> 2)  & 0x3Fu;
 }
 
 // ---------------------------------------------------------------------------
@@ -681,6 +749,52 @@ __device__ __forceinline__ void dequant_chunk(const u8 *b, int chunk, _Float16 *
         for (int m = 0; m < 32; m++)
             y[m] = static_cast<_Float16>(
                 d * static_cast<f32>(ptq1_trit_at_dev(b, chunk * 32 + m)));
+    } else if constexpr (T == DType::Q2_0_ROCMFPX) {
+        // block_rocmfp2: {u8 qs[8]; u8 e[2]} = 10 B / 32.
+        const f32 d0 = ue4m3_to_fp32_dev(b[8]);
+        const f32 d1 = ue4m3_to_fp32_dev(b[9]);
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            const int c = (b[j / 4] >> (2 * (j % 4))) & 3;
+            y[j] = static_cast<_Float16>(static_cast<f32>(rocmfpx_code_fp2_dev(c)) * d0);
+        }
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            const int c = (b[4 + j / 4] >> (2 * (j % 4))) & 3;
+            y[16 + j] = static_cast<_Float16>(static_cast<f32>(rocmfpx_code_fp2_dev(c)) * d1);
+        }
+    } else if constexpr (T == DType::Q3_0_ROCMFPX) {
+        // block_rocmfp3: {u8 qs[12]; u8 e[2]} = 14 B / 32.
+        // 8 fp3 codes packed per 3 bytes (pack8).
+        const f32 d0 = ue4m3_to_fp32_dev(b[12]);
+        const f32 d1 = ue4m3_to_fp32_dev(b[13]);
+        u8 c[8];
+#pragma unroll
+        for (int g = 0; g < 4; g++) {
+            rocmfpx_fp3_unpack8(b + g * 3, c);
+            const f32 d = (g < 2) ? d0 : d1;
+            const int base = g * 8;
+#pragma unroll
+            for (int k = 0; k < 8; k++)
+                y[base + k] = static_cast<_Float16>(
+                    static_cast<f32>(rocmfpx_code_fp3_dev(c[k])) * d);
+        }
+    } else if constexpr (T == DType::Q6_0_ROCMFPX) {
+        // block_rocmfp6: {u8 qs[24]; u8 e[2]} = 26 B / 32.
+        // 4 fp6 codes packed per 3 bytes (pack4).
+        const f32 d0 = ue4m3_to_fp32_dev(b[24]);
+        const f32 d1 = ue4m3_to_fp32_dev(b[25]);
+        u8 c[4];
+#pragma unroll
+        for (int g = 0; g < 8; g++) {
+            rocmfpx_fp6_unpack4(b + g * 3, c);
+            const f32 d = (g < 4) ? d0 : d1;
+            const int base = g * 4;
+#pragma unroll
+            for (int k = 0; k < 4; k++)
+                y[base + k] = static_cast<_Float16>(
+                    static_cast<f32>(rocmfpx_code_fp6_dev(c[k])) * d);
+        }
     } else {
         (void)b;
         (void)chunk;
@@ -728,6 +842,9 @@ __device__ __forceinline__ void dequant_chunk_dev(int t, const u8 *b, int chunk,
         case static_cast<int>(DType::Q2_0_64): dequant_chunk<DType::Q2_0_64>(b, chunk, y); break;
         case static_cast<int>(DType::PQ2_0): dequant_chunk<DType::PQ2_0>(b, chunk, y); break;
         case static_cast<int>(DType::PTQ1_0): dequant_chunk<DType::PTQ1_0>(b, chunk, y); break;
+        case static_cast<int>(DType::Q6_0_ROCMFPX): dequant_chunk<DType::Q6_0_ROCMFPX>(b, chunk, y); break;
+        case static_cast<int>(DType::Q3_0_ROCMFPX): dequant_chunk<DType::Q3_0_ROCMFPX>(b, chunk, y); break;
+        case static_cast<int>(DType::Q2_0_ROCMFPX): dequant_chunk<DType::Q2_0_ROCMFPX>(b, chunk, y); break;
         default:
 #pragma unroll
             for (int i = 0; i < 32; i++) y[i] = static_cast<_Float16>(0.0f);
@@ -954,6 +1071,9 @@ __device__ __forceinline__ f32 dot_chunks(int t, const u8 *wrow, const _Float16 
         case static_cast<int>(DType::Q2_0_64): return dot_chunks_t<DType::Q2_0_64>(wrow, x, c0, c1);
         case static_cast<int>(DType::PQ2_0): return dot_chunks_t<DType::PQ2_0>(wrow, x, c0, c1);
         case static_cast<int>(DType::PTQ1_0): return dot_chunks_t<DType::PTQ1_0>(wrow, x, c0, c1);
+        case static_cast<int>(DType::Q6_0_ROCMFPX): return dot_chunks_t<DType::Q6_0_ROCMFPX>(wrow, x, c0, c1);
+        case static_cast<int>(DType::Q3_0_ROCMFPX): return dot_chunks_t<DType::Q3_0_ROCMFPX>(wrow, x, c0, c1);
+        case static_cast<int>(DType::Q2_0_ROCMFPX): return dot_chunks_t<DType::Q2_0_ROCMFPX>(wrow, x, c0, c1);
         default: return 0.0f;
     }
 }
@@ -1010,6 +1130,9 @@ __device__ __forceinline__ void dequant_row_dev(int t, const u8 *src, _Float16 *
         case static_cast<int>(DType::Q2_0_64): dequant_row_t<DType::Q2_0_64>(src, dst, n); break;
         case static_cast<int>(DType::PQ2_0): dequant_row_t<DType::PQ2_0>(src, dst, n); break;
         case static_cast<int>(DType::PTQ1_0): dequant_row_t<DType::PTQ1_0>(src, dst, n); break;
+        case static_cast<int>(DType::Q6_0_ROCMFPX): dequant_row_t<DType::Q6_0_ROCMFPX>(src, dst, n); break;
+        case static_cast<int>(DType::Q3_0_ROCMFPX): dequant_row_t<DType::Q3_0_ROCMFPX>(src, dst, n); break;
+        case static_cast<int>(DType::Q2_0_ROCMFPX): dequant_row_t<DType::Q2_0_ROCMFPX>(src, dst, n); break;
         default: break;
     }
 }

@@ -101,6 +101,26 @@ enum class DType : i32 {
     // loader/engine's concern, not this enum's.
     PQ2_0 = 142,
     PTQ1_0 = 143,
+    // ROCmFPX fork ternary formats (github.com/charlie12345/ROCmFPX).
+    // All three are 32-value blocks of packed fp codes behind TWO UE4M3
+    // half-block scales (e[2]); the difference is only the code width and
+    // the packing. Authority: block_rocmfp{2,3,6} in that fork's
+    // ggml/rocmfpx/rocmfpx.h, dequantize_row_fp{2,3,6} in rocmfpx.c, and
+    // the fork's ggml_ue4m3_to_fp32 / rocmfpx_scale_is_valid.
+    //
+    //   Q6_0_ROCMFPX (id 102): {u8 qs[24]; u8 e[2]} = 26 B / 32 values,
+    //     6-bit signed codes, mag = code & 31, sign in bit 5, mag 0 negates
+    //     to -32. Codes packed 4 to a 3-byte group (pack4).
+    //   Q3_0_ROCMFPX (id 104): {u8 qs[12]; u8 e[2]} = 14 B / 32 values,
+    //     3-bit codes, mag in {0,1,2,4}, sign in bit 4. Codes packed
+    //     8 to a 3-byte group (pack8).
+    //   Q2_0_ROCMFPX (id 107): {u8 qs[8]; u8 e[2]} = 10 B / 32 values,
+    //     2-bit codes from the S40 ladder {-4,-1,+1,+4}, packed 4 to a byte
+    //     (LSB first, shifts 0/2/4/6).
+    // Scale bytes: UE4M3, e <= 0x7E valid, e == 0 or 0x7F -> 0.
+    Q6_0_ROCMFPX = 102,
+    Q3_0_ROCMFPX = 104,
+    Q2_0_ROCMFPX = 107,
 };
 
 const char *dtype_name(DType t);
