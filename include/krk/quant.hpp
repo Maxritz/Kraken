@@ -31,11 +31,24 @@ enum class DType : i32 {
     Q8_K = 15,
     IQ2_XXS = 16,
     // IQ2_XS (id 17): the same 256-value block as IQ2_XXS (66 bytes) but
-    // with a 16-bit scale per 32 values and 9-bit grid indices, so 84
+    // with a 16-bit scale per 32 values and 9-bit grid indices, so 74
     // bytes a block. Used by the GSQ-RCO exports.
     IQ2_XS = 17,
+    // The remaining IQ family. Same 256-value block shape as IQ2_XXS and the
+    // same grid-plus-signs construction, so each is 8 chunks of 32; what
+    // differs is the grid table, the scale layout and how many index bits each
+    // value gets. Byte sizes below are the reference's own static_assert
+    // (sizeof(block_*) in ggml-common.h), not a recomputation.
+    IQ3_XXS = 18, // 98 bytes: 3*QK_K/8 of packed grid indices + d
+    IQ1_S = 19,   // 50 bytes: QK_K/8 indices + QK_K/16 of high bits + d
     IQ4_NL = 20,
+    IQ3_S = 21,   // 110 bytes: qs + qh + signs + 4 scale bytes + d
+    IQ2_S = 22,   //  82 bytes: qs + qh + 16 scale bytes + d
     IQ4_XS = 23,
+    // IQ1_M (id 29): 56 bytes and NO f16 delta field at all -- the four block
+    // scales and the 3-bit group scales share one packed word, which is why
+    // this one is not a variant of IQ1_S but its own layout.
+    IQ1_M = 29,
     BF16 = 30,
     // BitNet-style ternary: 1.6875 bpw and 2.0625 bpw. Both pack
     // {-1, 0, +1} codes, so a third of the weights are exactly zero --
@@ -48,6 +61,26 @@ enum class DType : i32 {
     // half strength (ggml_e8m0_to_fp32_half).
     MXFP4 = 39,
     NVFP4 = 40,
+    // BitNet's own 1-bit and 2-bit ternary formats (ids 41/42), distinct from
+    // TQ1_0/TQ2_0 above: 128-value blocks with a plain f16 delta and no trit
+    // packing trick, so the codes are {0, 1} for Q1_0 and {-1, 0, +1, +2} for
+    // Q2_0 rather than the 5-value TQ ladder. Q1_0 is 1.125 bpw; used by the
+    // Bonsai ternary exports.
+    //
+    // Q2_0 is the one id with two live geometries in the wild, and the file's
+    // own tensor offsets -- not the id -- are what say which one a tensor is:
+    //   id 42: 128 values / 34 bytes = 2.125 bpw. ggml-common.h in the
+    //          llama-dx fork (Maxritz/LLAMA-DX) has QK2_0 = 128 there, so its
+    //          block_q2_0 is {f16 d; u8 qs[32]}. The Ternary-Bonsai Q2_0
+    //          exports are this variant and measure exactly 2.125 bpw.
+    //   id 48: 64 values / 18 bytes = 2.25 bpw, that fork's own Q2_0_64, and
+    //          byte-identical to upstream llama.cpp's Q2_0. A file made by
+    //          upstream declares 42 but measures 2.25 bpw (the Swift
+    //          Qwen3.8-Flash shards do).
+    // Both are decoded here; Model::load picks between them per file.
+    Q1_0 = 41,
+    Q2_0 = 42,
+    Q2_0_64 = 48,
     // ROCmFPX fork formats (github.com/charlie12345/ROCmFPX). These ids
     // are not upstream: 100 is Q4_0_ROCMFP4 (dual UE4M3 half-block
     // scales) and 101 is Q4_0_ROCMFP4_FAST (one scale per 32 values).

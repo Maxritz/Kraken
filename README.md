@@ -258,8 +258,10 @@ can look slow next to a dense model far above its weight.
 
 66 `.gguf` files were tried (everything in `models/` plus `G:/More-models/`,
 skipping only the 3-part Laguna shard set, which is not a loadable model).
-38 ran; 28 were refused loudly at load — the refusal reasons are grouped below
-the table. Dense rows are VRAM-bound decode; MoE rows (marked \*) page experts
+38 ran and 28 were refused loudly at load on the build that produced this sweep
+— the refusal reasons are grouped below the table, and several of the quant-type
+refusals in it have since been lifted (see the note under the table).
+Dense rows are VRAM-bound decode; MoE rows (marked \*) page experts
 through the default budget, so their prefill includes cold-cache paging.
 
 Each sweep row is **one run**; the headline rows above are the only ones with
@@ -319,7 +321,32 @@ refuses nothing silently; it is not a configuration anyone should use.
 NVFP4 and MXFP4 dequantize fine (the 4B/9B NVFP4 and the MXFP4 MoE rows above);
 `nemotron-3-nano-4b-NVFP4` below is refused for its Mamba blocks, not its quant.
 
-### Refused at load (28 files, each with its reason)
+The IQ-family and BitNet quant refusals in this table are gone: `IQ2_XS`,
+`IQ2_XXS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M` and `Q1_0`/`Q2_0` now
+dequantize on both the host reference path and the GPU kernels. Six files the
+old table rejected now load, each inspected `runnable` on this build:
+Bonsai-27B-Q1_0, Laguna-XS-2.1-IQ3_XXS, Qwen3.8-27B-GSQ-RCO-IQ2_XS,
+Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp, Qwen3.8-27B-UD-Q2_K_XL and
+Qwen3.8-27B-Opus-Distill-IQ2_XXS. (Ternary-Bonsai-27B-dspark-Q4_1 is not among
+them: it is a dspark speculative-head shard, refused on architecture no matter
+how its quant decodes.)
+
+One entry in the old table is a second geometry for the same id rather than a
+bad file: `Ternary-Bonsai-27B-Q2_0` declares tensor offsets that imply exactly
+**2.125 bits per element**, which is **34 bytes per 128 values**. That is the
+llama-dx fork's `Q2_0` (`#define QK2_0 128`, `block_q2_0` = `ggml_half` +
+`QK2_0/4`), and it is the block its ternary exports are written with. Upstream
+llama.cpp spells `Q2_0` as the 64-value / 18-byte block instead, so the two
+conventions cannot share a decoder: id 42 here is the fork's 128-value block and
+upstream's is id 48, `Q2_0_64`. Both decode, and the file was never malformed.
+
+A file that declares `attention.key_length` no longer has to satisfy
+`n_embd % head_count == 0`: Qwen3.5's gated attention legitimately runs 24 heads
+of 256 dims over a 5120-wide embedding, because `q_proj` is `2 * n_head * d`
+(it emits the query gate alongside the query). That identity is checked only
+when the head width has to be inferred from the embedding.
+
+### Refused at load (on the sweep build; each with its reason)
 
 | reason | files |
 |---|---|
@@ -330,8 +357,8 @@ NVFP4 and MXFP4 dequantize fine (the 4B/9B NVFP4 and the MXFP4 MoE rows above);
 | Fused QKV / attention output gate (spark2_5) | Spark-X2.5-4B-Q8_0 |
 | Routed attention values (k2-horizon) | K2-Horizon-MoVA-36B-A4B-Q4_K_M |
 | Attention output gate (muse-glimmer) | Muse-Glimmer-30B-UD-Q8_K_XL |
-| Quant type this build cannot dequantize | Bonsai-27B-Q1_0 (#41), Ternary-Bonsai-2-27B-PQ2_0 (#142), Qwen3.8-27B-UD-Q2_K_XL (#18/#29/#21), Qwen3.8-27B-GSQ-RCO-IQ3_S (#22 + IQ2_XS), Qwen3.8-Distill-35B-Q2KXL (#102/#107), Laguna-XS-2.1-IQ3_XXS (#21/#18/#22), ornith-1.0-35B-Q3_0 (#104/#102) |
-| Head geometry the loader rejects | Qwen3.8-27B-Opus-Distill-IQ2_XXS, qwen3.8-flash-next-Q4 (`n_embd` not divisible by head count), Qwen3.8-27B-WebGGUF-Q4_0 (same) |
+| Quant type this build cannot dequantize | Ternary-Bonsai-2-27B-PQ2_0 (#142), Qwen3.8-Distill-35B-Q2KXL (#102/#107), ornith-1.0-35B-Q3_0 (#104/#102) |
+| Head geometry the loader rejects (`n_embd` not divisible by head count, and no `attention.key_length` in the file to override it) | qwen3.8-flash-next-Q4, Qwen3.8-27B-WebGGUF-Q4_0 |
 
 ### Short-context decode
 
@@ -500,16 +527,30 @@ The first differing line names the stage and the layer.
 ### Gates
 
 ```sh
-ninja -C build-hip kraken kraken-tests kraken-bench
+ninja -C build-hip kraken kraken-tests kraken-bench kraken-inspect
 ninja -C build-hip gate                       # numeric tolerances + logits_topk differential
-./build-hip/kraken-tests                      # 1847 checks
+./build-hip/kraken-tests                      # 2329 checks
 KRK_N=16 KRK_CHAT=1 bash scripts/coherence_check.sh models/*.gguf
 ```
 
 `gate` exits non-zero on a NaN, an inf, an out-of-tolerance value or a
 `logits_topk` mismatch, so it fails the build rather than printing a
-reassuring number. Run all three after any kernel change — a fast wrong kernel
-is the failure mode a code review does not catch.
+reassuring number. Run all of these after any kernel change — a fast wrong
+kernel is the failure mode a code review does not catch.
+
+`build_check.sh` checks the build rather than the engine: that the binaries are
+current with the sources, that the configure actually produced the
+configuration it claims (Release, HIP backed in, the requested offload arch,
+and the arch of the card in the machine). It exits non-zero on a stale or
+mis-detected build, which the test suite cannot see: a Debug build and a
+CPU-only binary both pass every test in this repository.
+
+`coherence_check.sh` runs each model twice -- on the device and on the `--cpu`
+scalar reference -- so half the engine runs you see in its output are the
+reference arm by design. It fails a model whose *device* arm never reached a
+device as well: the CLI warns on stderr and continues on the CPU backend when
+HIP creation fails, and a checker that discards stderr would compare CPU
+against CPU and call it coherence (`FAIL (cpu)`).
 
 ---
 
@@ -584,9 +625,24 @@ f32 CPU path reproduces llama.cpp token for token. **The GPU path is not yet
 reproducible** — see [docs/TODO.md](docs/TODO.md) for what has been ruled out
 and what is next.
 
-**Not supported in v0.1**, and rejected loudly at load rather than mis-decoded:
-the IQ* (`IQ2_XXS`, `IQ3_*`, `IQ4_XS`, ...) formats. `kraken-inspect model.gguf
---quant` tells you which formats a file actually uses before you try to run it.
+**Now dequantizing**: the whole IQ family — `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
+`IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M` — plus BitNet's `Q1_0` and `Q2_0` in both
+geometries (id 42's 128-value block and upstream's 64-value `Q2_0_64`, id 48)
+and the ROCmFPX ids 100/101. Every codebook is a byte-for-byte transcription of
+llama.cpp's `ggml-common.h`, diffed entry by entry, and every decoder mirrors
+its `dequantize_row_*`, on both the host reference path and the GPU kernels, so
+the `GSQ-RCO`, `IQ3_XXS` and `Bonsai` exports load and decode.
+
+**Still refused, and rejected loudly at load rather than mis-decoded**: the
+ROCmFPX ids **102, 104, 107**, whose block layout no header on this machine
+declares (an 11-stride sweep never even found a plausible scale field), and the
+ternary id **142 (PQ2_0)**. 142's geometry *is* measured -- 34 bytes per 128
+values, an f16 scale leading the block -- but its codes are not a per-code
+level map: four candidate maps each decoded to non-words, the signature of a
+rotated (WHT / Lloyd-Max) block rather than an additive one. Neither was
+guessed at. `IQ4_NL` and `IQ4_XS` dequantize as before;
+`kraken-inspect model.gguf --quant` tells you which formats a file actually
+uses before you try to run it.
 
 ### Mixture-of-Experts and lazy expert residency
 
@@ -639,7 +695,9 @@ and the shared expert stays resident because there is only one.
 ### Formats
 
 `F32` `F16` `BF16` `Q4_0` `Q4_1` `Q5_0` `Q5_1` `Q8_0` `Q8_1` `Q2_K` `Q3_K`
-`Q4_K` `Q5_K` `Q6_K` `Q8_K` `IQ4_NL`
+`Q4_K` `Q5_K` `Q6_K` `Q8_K` `IQ4_NL` `IQ4_XS` `IQ2_XXS` `IQ2_XS` `IQ2_S`
+`IQ3_XXS` `IQ3_S` `IQ1_S` `IQ1_M` `MXFP4` `NVFP4` `Q4_0_ROCMFP4`
+`Q4_0_ROCMFP4_FAST` `TQ1_0` `TQ2_0` `Q1_0` `Q2_0` `Q2_0_64`
 
 ---
 
@@ -671,8 +729,9 @@ behaviour, and `docs/RESEARCH.md` for the sources this was built from.
 ## A note on verification
 
 The host pipeline (GGUF reader, quantizers, tokenizers, sampler, model loader,
-forward pass, CPU backend) is compiled and tested in this repository: 479 checks
-pass. That includes MoE: a synthetic `qwen2moe` model is built in a temporary
+forward pass, CPU backend) is compiled and tested in this repository: 2329 checks
+pass (read the count off the run -- it grows when coverage does). That includes
+MoE: a synthetic `qwen2moe` model is built in a temporary
 file, run with a one-slot expert cache, and checked to produce byte-identical
 tokens to the same model with the entire expert set resident — a single-expert
 MoE layer is checked to reproduce its dense twin exactly, and grouped prefill

@@ -169,7 +169,15 @@ KRK_QTRAIT(DType::Q8_1, 1);
 KRK_QTRAIT(DType::IQ4_NL, 1);
 KRK_QTRAIT(DType::IQ2_XXS, 8);
 KRK_QTRAIT(DType::IQ2_XS, 8);
+KRK_QTRAIT(DType::IQ3_XXS, 8);
+KRK_QTRAIT(DType::IQ1_S, 8);
+KRK_QTRAIT(DType::IQ3_S, 8);
+KRK_QTRAIT(DType::IQ2_S, 8);
+KRK_QTRAIT(DType::IQ1_M, 8);
 KRK_QTRAIT(DType::IQ4_XS, 8);
+KRK_QTRAIT(DType::Q1_0, 4);
+KRK_QTRAIT(DType::Q2_0, 4);
+KRK_QTRAIT(DType::Q2_0_64, 2);
 KRK_QTRAIT(DType::NVFP4, 2);
 KRK_QTRAIT(DType::MXFP4, 1);
 KRK_QTRAIT(DType::ROCMFP4, 1);
@@ -200,6 +208,17 @@ __device__ __forceinline__ int dtype_block_bytes_dev(int t) {
         case static_cast<int>(DType::IQ4_NL): return 18;
         case static_cast<int>(DType::IQ2_XXS): return 66;
         case static_cast<int>(DType::IQ2_XS): return 74;
+        // sizeof(block_*) in ggml-common.h, which pins each with its own
+        // static_assert. Q1_0, Q2_0 and Q2_0_64 are not QK_K blocks: 128, 128
+        // and 64 values respectively, so their byte strides are 18, 34 and 18.
+        case static_cast<int>(DType::IQ3_XXS): return 98;
+        case static_cast<int>(DType::IQ1_S): return 50;
+        case static_cast<int>(DType::IQ3_S): return 110;
+        case static_cast<int>(DType::IQ2_S): return 82;
+        case static_cast<int>(DType::IQ1_M): return 56;
+        case static_cast<int>(DType::Q1_0): return 18;
+        case static_cast<int>(DType::Q2_0): return 34;
+        case static_cast<int>(DType::Q2_0_64): return 18;
         case static_cast<int>(DType::IQ4_XS): return 136;
         case static_cast<int>(DType::NVFP4): return 36;
         case static_cast<int>(DType::MXFP4): return 17;
@@ -229,9 +248,17 @@ __device__ __forceinline__ int dtype_chunks_per_block_dev(int t) {
         case static_cast<int>(DType::IQ2_XXS):
         case static_cast<int>(DType::IQ4_XS):
         case static_cast<int>(DType::Q8_K): return 8;
+        case static_cast<int>(DType::IQ3_XXS):
+        case static_cast<int>(DType::IQ1_S):
+        case static_cast<int>(DType::IQ3_S):
+        case static_cast<int>(DType::IQ2_S):
+        case static_cast<int>(DType::IQ1_M):
         case static_cast<int>(DType::TQ1_0): return 8;
         case static_cast<int>(DType::TQ2_0): return 8;
+        case static_cast<int>(DType::Q1_0): return 4;
         case static_cast<int>(DType::NVFP4): return 2;
+        case static_cast<int>(DType::Q2_0): return 4;
+        case static_cast<int>(DType::Q2_0_64): return 2;
         default: return 1;
     }
 }
@@ -293,6 +320,18 @@ __device__ __forceinline__ bool tq2_0_block_is_zero(const u8 *b) {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Dequantizers for the IQ family added for the GSQ-RCO and Bonsai exports:
+// IQ2_XS (17), IQ2_S (22), IQ3_XXS (18), IQ1_S (19), IQ3_S (21), IQ1_M (29)
+// and BitNet's Q1_0 (41) / Q2_0 (42). Each writes exactly the 32 values of
+// one chunk, matching its host twin in src/quant_fmt_*.inc value for value
+// (the host side is the oracle the tests compare against). Included here --
+// after the shared tables and helpers and before the ladder that calls them.
+// ---------------------------------------------------------------------------
+#include "dequant_fmt_a.inc"
+#include "dequant_fmt_b.inc"
+#include "dequant_fmt_c.inc"
+
 // dequant_chunk — 32 values of one block into registers
 // ---------------------------------------------------------------------------
 
@@ -594,6 +633,24 @@ __device__ __forceinline__ void dequant_chunk(const u8 *b, int chunk, _Float16 *
         for (int m = 0; m < 32; m++)
             y[m] = static_cast<_Float16>(
                 d * static_cast<f32>(tq1_trit_at_dev(b, chunk * 32 + m)));
+    } else if constexpr (T == DType::IQ2_S) {
+        dequant_chunk_iq2_s(b, chunk, y);
+    } else if constexpr (T == DType::IQ2_XS) {
+        dequant_chunk_iq2_xs(b, chunk, y);
+    } else if constexpr (T == DType::IQ3_XXS) {
+        dequant_chunk_iq3_xxs(b, chunk, y);
+    } else if constexpr (T == DType::IQ1_S) {
+        dequant_chunk_iq1_s(b, chunk, y);
+    } else if constexpr (T == DType::IQ3_S) {
+        dequant_chunk_iq3_s(b, chunk, y);
+    } else if constexpr (T == DType::IQ1_M) {
+        dequant_chunk_iq1_m(b, chunk, y);
+    } else if constexpr (T == DType::Q1_0) {
+        dequant_chunk_q1_0(b, chunk, y);
+    } else if constexpr (T == DType::Q2_0) {
+        dequant_chunk_q2_0(b, chunk, y);
+    } else if constexpr (T == DType::Q2_0_64) {
+        dequant_chunk_q2_0_64(b, chunk, y);
     } else {
         (void)b;
         (void)chunk;
@@ -630,6 +687,15 @@ __device__ __forceinline__ void dequant_chunk_dev(int t, const u8 *b, int chunk,
         case static_cast<int>(DType::Q8_K): dequant_chunk<DType::Q8_K>(b, chunk, y); break;
         case static_cast<int>(DType::TQ1_0): dequant_chunk<DType::TQ1_0>(b, chunk, y); break;
         case static_cast<int>(DType::TQ2_0): dequant_chunk<DType::TQ2_0>(b, chunk, y); break;
+        case static_cast<int>(DType::IQ2_XS): dequant_chunk<DType::IQ2_XS>(b, chunk, y); break;
+        case static_cast<int>(DType::IQ2_S): dequant_chunk<DType::IQ2_S>(b, chunk, y); break;
+        case static_cast<int>(DType::IQ3_XXS): dequant_chunk<DType::IQ3_XXS>(b, chunk, y); break;
+        case static_cast<int>(DType::IQ1_S): dequant_chunk<DType::IQ1_S>(b, chunk, y); break;
+        case static_cast<int>(DType::IQ3_S): dequant_chunk<DType::IQ3_S>(b, chunk, y); break;
+        case static_cast<int>(DType::IQ1_M): dequant_chunk<DType::IQ1_M>(b, chunk, y); break;
+        case static_cast<int>(DType::Q1_0): dequant_chunk<DType::Q1_0>(b, chunk, y); break;
+        case static_cast<int>(DType::Q2_0): dequant_chunk<DType::Q2_0>(b, chunk, y); break;
+        case static_cast<int>(DType::Q2_0_64): dequant_chunk<DType::Q2_0_64>(b, chunk, y); break;
         default:
 #pragma unroll
             for (int i = 0; i < 32; i++) y[i] = static_cast<_Float16>(0.0f);
@@ -845,6 +911,15 @@ __device__ __forceinline__ f32 dot_chunks(int t, const u8 *wrow, const _Float16 
         case static_cast<int>(DType::Q8_K): return dot_chunks_t<DType::Q8_K>(wrow, x, c0, c1);
         case static_cast<int>(DType::TQ1_0): return dot_chunks_t<DType::TQ1_0>(wrow, x, c0, c1);
         case static_cast<int>(DType::TQ2_0): return dot_chunks_t<DType::TQ2_0>(wrow, x, c0, c1);
+        case static_cast<int>(DType::IQ2_XS): return dot_chunks_t<DType::IQ2_XS>(wrow, x, c0, c1);
+        case static_cast<int>(DType::IQ2_S): return dot_chunks_t<DType::IQ2_S>(wrow, x, c0, c1);
+        case static_cast<int>(DType::IQ3_XXS): return dot_chunks_t<DType::IQ3_XXS>(wrow, x, c0, c1);
+        case static_cast<int>(DType::IQ1_S): return dot_chunks_t<DType::IQ1_S>(wrow, x, c0, c1);
+        case static_cast<int>(DType::IQ3_S): return dot_chunks_t<DType::IQ3_S>(wrow, x, c0, c1);
+        case static_cast<int>(DType::IQ1_M): return dot_chunks_t<DType::IQ1_M>(wrow, x, c0, c1);
+        case static_cast<int>(DType::Q1_0): return dot_chunks_t<DType::Q1_0>(wrow, x, c0, c1);
+        case static_cast<int>(DType::Q2_0): return dot_chunks_t<DType::Q2_0>(wrow, x, c0, c1);
+        case static_cast<int>(DType::Q2_0_64): return dot_chunks_t<DType::Q2_0_64>(wrow, x, c0, c1);
         default: return 0.0f;
     }
 }
@@ -890,6 +965,15 @@ __device__ __forceinline__ void dequant_row_dev(int t, const u8 *src, _Float16 *
         case static_cast<int>(DType::Q8_K): dequant_row_t<DType::Q8_K>(src, dst, n); break;
         case static_cast<int>(DType::TQ1_0): dequant_row_t<DType::TQ1_0>(src, dst, n); break;
         case static_cast<int>(DType::TQ2_0): dequant_row_t<DType::TQ2_0>(src, dst, n); break;
+        case static_cast<int>(DType::IQ2_XS): dequant_row_t<DType::IQ2_XS>(src, dst, n); break;
+        case static_cast<int>(DType::IQ2_S): dequant_row_t<DType::IQ2_S>(src, dst, n); break;
+        case static_cast<int>(DType::IQ3_XXS): dequant_row_t<DType::IQ3_XXS>(src, dst, n); break;
+        case static_cast<int>(DType::IQ1_S): dequant_row_t<DType::IQ1_S>(src, dst, n); break;
+        case static_cast<int>(DType::IQ3_S): dequant_row_t<DType::IQ3_S>(src, dst, n); break;
+        case static_cast<int>(DType::IQ1_M): dequant_row_t<DType::IQ1_M>(src, dst, n); break;
+        case static_cast<int>(DType::Q1_0): dequant_row_t<DType::Q1_0>(src, dst, n); break;
+        case static_cast<int>(DType::Q2_0): dequant_row_t<DType::Q2_0>(src, dst, n); break;
+        case static_cast<int>(DType::Q2_0_64): dequant_row_t<DType::Q2_0_64>(src, dst, n); break;
         default: break;
     }
 }

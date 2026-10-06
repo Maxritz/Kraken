@@ -284,8 +284,18 @@ behind one mutex, every request re-prefills from position 0 (no prefix cache),
 and there is no cancellation. No streaming continuation across calls, no beam
 search, no concurrent batching.
 
-**Quantization:** the IQ* (`IQ2/IQ3/IQ4_XS`) family and YaRN's NTK-aware
-frequency warp are rejected or approximated; see the model notes.
+**Quantization:** every dequantizer this engine lists in `docs/USER-GUIDE.md` —
+the IQ family (`IQ2_XXS`/`IQ2_XS`/`IQ2_S`, `IQ3_XXS`/`IQ3_S`, `IQ1_S`/`IQ1_M`),
+`IQ4_NL`/`IQ4_XS`, `MXFP4`/`NVFP4`, the ROCmFPX ids 100/101, BitNet's
+`Q1_0`/`Q2_0`/`Q2_0_64` and `TQ1_0`/`TQ2_0` — runs on both the host reference
+path and the GPU kernels. Still refused at load: the ROCmFPX ids **102**, **104**
+and **107**, which no header on this machine defines, and the ternary id
+**142** (`PQ2_0`), whose geometry is measured (34 B per 128) but whose code
+map is not a level map -- four candidate maps decoded to non-words, the
+signature of a rotated block. One id needs care because two producers spell
+it: id 42 is the llama-dx fork's 128-value / 34-byte `Q2_0`, not upstream's
+64-value block, which is id 48 here. YaRN's NTK-aware frequency warp remains
+approximated; see the model notes.
 
 Performance gaps on the device are in `docs/HARDWARE.md` (split-K attention,
 device-side sampling, prefill tile size). MoE-specific candidates (device-side

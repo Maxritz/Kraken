@@ -172,13 +172,26 @@ passes.
 
 | Hypothesis | Test | Result |
 |---|---|---|
-| Race / nondeterminism | GPU x3, CPU x2, md5 of text | Byte-identical every run — deterministic, so not a race |
+| Race / nondeterminism | GPU x3, CPU x2, md5 of text | Byte-identical every run — deterministic, so not a race. **SUPERSEDED, see below.** The build this ran on carried a decode-attention split-K race that makes a >=128-key decode nondeterministic; the probe above ran short of that, so "deterministic" is a claim to re-run, not a fact |
 | GEMM bug | `KRK_GEMM_PATH=wmma` / `simt` / `dp4a` | **All three bit-identical**, same drift step. Three independent GEMM implementations agreeing exactly rules out the GEMM |
 | Prefill attention rewrite | `KRK_ATTN_QTILE` unset / `0` / `1` | Identical |
-| Decode key-range split | `KRK_ATTN_SPLIT=0` | No-op here — `attention_decode_splits` keeps `n_split == 1` until 128 keys |
+| Decode key-range split | `KRK_ATTN_SPLIT=0` | No-op here — `attention_decode_splits` keeps `n_split == 1` until 128 keys, so it is not a bisect for probes this short. At >=128 keys it is the clean one: see the supersession note below |
 | KV cache stride | `--ctx 256` / `512` / `1024` / `2048` | Drift stays at step 12, so not `pos_stride` |
 | Fixed absolute position | prompt lengths 9 / 14 / 15 / 18 / 26 | Drift **moves with prompt length** (plen 15 -> step 12 = pos 27; plen 26 -> step 2 = pos 28), so not a fixed position |
 | Model-specific kernel bug | 5 prompts on the same model | **3 PASS** (`Hello`, `Write a Python function that reverses a list.`, `The quick brown fox jumps over`), 2 drift. Anything model-blind would fail on all five |
+
+**Superseded 2026-10-06: do not lean on the "deterministic" row above.** A
+decode-attention race was found and fixed after this table was written. The
+split-K decode kernel (`attention_decode_split_kernel`, engaged only when
+`attention_decode_splits()` returns > 1, i.e. from ~128 keys) let all eight
+warp-leader threads store the block's partial denominator to the same address,
+each seeded with its own warp's term, so the last writer won and a head's output
+depended on warp scheduling. Every probe in this table ran at a short enough
+context that `n_split` stayed 1 and the kernel was never launched, so none of
+them could have observed it. The five-run md5 check is therefore a statement
+about a build that had the race in it, and **it has NOT been re-run**. Re-run it
+before using "not a race" as a reason to look elsewhere; the split-K entry
+below records the before/after evidence.
 
 What the stage dump shows: the per-forward end-of-model error is flat in the
 **2e-3 – 1.3e-2** band for prefill and the first 11 decode steps — the normal
@@ -202,7 +215,63 @@ discriminate is a device-vs-host Q6_K dequant comparison over a real tensor
 suite only checks Q6_K dequant on a synthetic block, so whole-tensor agreement
 is currently unverified.
 
+### Decode-attention split-K race — FIXED 2026-10-06
+
+**This is the sharpest correctness finding in this file: decode was
+nondeterministic whenever the context crossed ~128 keys, on every model, and one
+kernel's epilogue was the whole reason.**
+
+`attention_decode_split_kernel` (`src/hip/kernels/attention.hpp`) is taken when
+`attention_decode_splits()` returns > 1, which it starts to do at ~128 keys. Its
+per-block epilogue reduced the block's warps by keeping each warp's raw `(m, l)`
+and re-deriving the exponential per warp:
+
+```cpp
+if (lane == 0) lt = s_l[warp] * aw;            // eight leaders, eight values
+...
+for (int w = 0; w < kAttnDecWarps; w++) lt += s_l[w] * __expf(s_m[w] - mstar);
+...
+if (lane == 0) { p[0] = mstar; p[1] = lt; }    // ...all storing to p[1]
+```
+
+Every one of the eight lane-0 threads seeded `lt` with its own warp's term, and
+all eight then stored to the same `p[1]`. Last writer won, so a head's
+normalizing denominator — and therefore the head's output — depended on warp
+scheduling. The single-block kernel never had this shape: it scales
+`sh_l[warp] = l * aw` once, after the barrier, and then sums `lt += sh_l[w]`.
+
+The fix is exactly that: scale `s_l` in place, and let warp 0 do the partial
+write — the other seven warps were storing identical `lt` and `ot` values, so
+the redundancy bought nothing.
+
+| build | md5 of stdout, six identical runs of one command | distinct |
+|---|---|---|
+| before the fix | `fc30f6c8cf1d`, `d8448e90a0a3`, `7ee2e7dec3aa`, `7ee2e7dec3aa`, `fc30f6c8cf1d`, `fc30f6c8cf1d` | **3** |
+| after the fix | `7ee2e7dec3aa` (10 of 10 runs) | 1 |
+
+Command: `Qwen3-8B-Q4_K_M.gguf`, prompt "The history of computing is a history
+of abstraction, from relays to vacuum tubes", `-n 128 --greedy --ctx 512
+--chunk 256`. The fixed split path is now bit-identical to `KRK_ATTN_SPLIT=0`,
+which is what that knob was documented to demonstrate and never did.
+
+**Why it stayed hidden.** Below 128 keys `attention_decode_splits` keeps
+`n_split == 1`, so a short-context probe never launches the kernel at all. That
+is why the symptom kept looking model-specific (Spark_one, laguna, qwen35) and
+shape-specific: only the corner where the split engages could show it, and the
+"byte-identical every run" checks that closed several of those tickets were all
+run in the region where it cannot appear.
+
+Gate after the fix: ninja rc=0 with 0 `error:` lines, `kraken-tests` 2154/2154
+at the time (2329/2329 now), `kraken-bench --gate` rc=0.
+
 ### The qwen35 GPU path is not reproducible (FIXED 2026-10-03 on gfx1201; gfx1031 confirmation outstanding)
+
+**A second, unrelated root cause was found later (2026-10-06): a decode-attention
+split-K race.** The packed-query in-place unpack below is the qwen35-specific
+cause. The split-K partial race is model-blind and reaches any decode whose key
+count crosses ~128, so part of what was attributed to "qwen35 being
+unreproducible" was never qwen35-specific. It is fixed; the before/after md5
+evidence is under the T-table.
 
 **Root cause: the packed-query split raced its own source.** Qwen3.5 packs a
 per-head output gate behind the query, and the engine unpacked it in place —
@@ -641,7 +710,8 @@ the suspect. Fix = take dequant off the critical path: double-buffered LDS, a
   draft head and wire them into the existing speculative loop.
 - **Architecture pass over every file in the model folders** — the inventory is
   at 44 runnable of 87; the refused ones need either a named dequantizer
-  (quant type #100/#101/#102/#107) or a documented reason, and the runnable set
+  (quant type #102/#104/#107/#142 -- #100 and #101 are implemented) or a
+  documented reason, and the runnable set
   needs a load-and-generate smoke test each.
 - **Paper backlog** — all 12 summarized with what each would change here in
   [docs/implementing-papers.md](implementing-papers.md); Tail-Replay first
@@ -686,7 +756,7 @@ the suspect. Fix = take dequant off the critical path: double-buffered LDS, a
 
 ## P4 — known limits carried forward from STATUS.md §6
 
-- IQ\* formats except IQ4_NL are rejected at load by design.
+- IQ\* formats except IQ4_NL **were** rejected at load by design. As of 2026-10-06 IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S and IQ1_M are decoded on host and device, as are BitNet's Q1_0 (41) and Q2_0 (42). The only remaining quant refusals are ids **102, 104, 107 and 142**, which have no authoritative block layout here.
 - Serving is serialized: no prefix cache, no cancellation, no concurrent
   batching, no beam search.
 - Speculative decoding is greedy-only; no MTP, tree attention, or n-gram
@@ -867,6 +937,42 @@ resident GPU work is 64% of the budget and becomes the dominant term.
 Graph capture + the device-side routing plan attack that; nothing left in
 the expert cache does. Re-order the work accordingly.
 
+### Update (2026-10-06): the fallback was built, and the overlap it assumed does not materialise
+
+The fallback now exists: `CpuExpertPool` (`include/krk/expert_cpu.hpp`,
+`src/expert_cpu.cpp`), wired into `Engine::moe_ffn` behind
+`--hybrid-experts 1`. It reads one weight row at a time out of the mapping,
+dequantises it, dots it and discards it, mirroring the device's four ops at the
+same rounding points, so nothing is ever materialised in f32 and no expert needs
+a resident copy in either tier.
+
+**It needed a policy fix on the way, and measurement is what found it.** The
+host arm has to take only the OVERFLOW (`!in_vram(layer, e) &&
+full_for(source)`). Taking every miss instead means an expert is never promoted,
+so it never becomes resident: the 610 MiB auto budget, which holds the whole
+routed set, ran at 6.4 tok/s with the cache stuck at 55/104 slots. Checked
+before promoting, not after.
+
+Measured on Qwen3-MoE-4x0.6B-2.4B-Q4_K_M (`-n 32 --greedy --ctx 512 --chunk
+256`, 3 interleaved repetitions per arm):
+
+    auto, 610 MiB     off  94.7 / 104.4 / 105.7 tok/s
+                      on  109.0 / 107.0 / 105.7 tok/s    0 experts on the host -- inert
+    16 MiB (2 slots)  off   16.8 / 17.3 / 17.5 tok/s
+                      on    5.5 /  5.5 /  5.5 tok/s    922 experts on the host -- 3.1x loss
+
+The host arm ran the whole routed set at 5.392 ms/expert on 8 threads; roughly
+2.0 ms/expert of effective read + promote is what it had to beat. **The ceiling
+above assumed the CPU work hides completely behind the device. It cannot.** The
+host arm is merged per layer, so the device waits for it, and no amount of
+thread tuning changes a barrier. Generated text was identical in every arm, so
+the arithmetic is right — the loss is entirely structural.
+
+Treat the fallback as a **memory** feature, not a decode accelerator on this
+hardware: a host-computed expert costs no VRAM slot and no WARM buffer, and that
+is memory the KV cache can have. It is opt-in and off by default. See
+docs/test-results.md §9.
+
 ---
 
 ## Mandatory requirements vs. goals — gap register (2026-10-05)
@@ -901,12 +1007,12 @@ the expert cache does. Re-order the work accordingly.
 | G1 | **Prefill is 17.1x slower than llama.cpp** (499 vs 8528 tok/s, same file, same GPU). Attention-bound: 1123 ms attention vs 321 ms GEMM. The fast path (`attention_qtile_kernel`) is numerically wrong. | this session | open |
 | G1a | qtile divergence tracks `pos0`: non-zero `pos0` cases are 104-139% wrong, `pos0=0` cases 4-6%. Both are defects. | `probe_attn_qtile` | open |
 | G1b | `attn_qtile_smem_bytes` double `*2` over-reserves LDS, forcing `qtile_k=32` instead of 64. | `attention.hpp:417` | open |
-| G2 | **No CPU expert fallback.** Cold experts cost a full NVMe read + DMA + GPU compute on the critical path. | gap audit below | open |
+| G2 | **No CPU expert fallback.** Cold experts cost a full NVMe read + DMA + GPU compute on the critical path. | gap audit below | **BUILT 2026-10-06, and it LOSES 3.1x** — see the second update under the ceiling measurement below, and docs/test-results.md §9 |
 | G3 | **No expert prediction.** Only `KRK_TRACE_EXPERTS` instrumentation exists; no cross-layer predictor. | grep | open |
 | G4 | **Tiered KV cache absent entirely.** One flat `alloc(n_layer * kv_cap * kv_dim)` in VRAM. No RAM tier, no NVMe tier, no paging, no radix prefix reuse. | `engine.cpp:275` | open |
 | G5 | **No 6/8 GiB profile.** Expert budget is a flat byte cap; KV is flat VRAM. Neither adapts to a small card. | `configure_expert_cache` | open |
 | G6 | **RDNA2 unvalidated.** gfx1031 is the primary target and there is no machine; every RDNA2 claim is untested by construction. | — | blocked |
-| G7 | **Missing quant types block four named files**: IQ3_XXS, IQ3_S, IQ2_S, Q2_0 (42), Q1_0 (41); `qwen4exp` arch has no registry entry at all. | prior session | open |
+| G7 | **Missing quant types blocked four named files.** IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ1_M and BitNet's Q1_0 (41) / Q2_0 (42) are now decoded on **host and device**, with every codebook machine-diffed against ggml-common.h (see the dequant session entry at the end of this file). **`qwen4exp` still has no registry entry** (the Qwen3.8-Flash item), and ids 102/104/107/142 still have no authoritative layout. | prior session + this session | **formats CLOSED; `qwen4exp` and ids 102/104/107/142 open** |
 | G8 | **MoE decode loses to llama.cpp running on CPU only** (13.2 vs 16.3 tok/s). | this session | open |
 | G9 | **DFlash acceptance 0%** in kraken; the reference also reports 0.000% on the official pair. | prior session | open |
 | G10 | **The gate has no equivalence test for fast paths.** `probe_attn_qtile` was a *broken build target* for an unknown number of sessions, which is why G1a survived. | this session | open |
@@ -959,13 +1065,13 @@ the gate) so a regression cannot hide again. Then G2, then G3, then G4/G5.
 | T3 | MoE decode loses to llama.cpp **on CPU** (13.2 vs 16.3 tok/s) | open |
 | T4 | Device-side routing plan: 40 blocking 512-byte router downloads/token, plan+alpha re-uploaded per expert, O(ne*k) host scan per layer | open |
 | T5 | HIP graph capture — blocked on T4 plus fixed expert slots, because a graph bakes in weight pointers that move whenever the cache evicts | blocked |
-| T6 | CPU expert fallback (Fiddler) — measured ceiling 1.84x overlapped / 1.20x serial | open |
+| T6 | CPU expert fallback (Fiddler) — measured ceiling 1.84x overlapped / 1.20x serial | **built; measured 3.1x LOSS at a 16 MiB expert budget (5.5 vs 17.2 tok/s), and inert when the budget holds the routed set. Opt-in, default off. The ceiling's "perfect overlap" assumption is what failed.** |
 | T7 | Cross-layer expert prediction — nothing exists but the trace instrumentation | open |
 | T8 | Tiered KV cache: VRAM HOT / RAM WARM / NVMe COLD, radix prefix reuse, persistence. Zero implementation | open |
 | T9 | 6/8/12/16 GiB hardware profiles, slot strategy per spec §28-29 | open |
 | T10 | **RDNA2 validation — now actionable on maclin** | open |
-| T11 | Quant: IQ2_XS **device branch missing** (host-only, confirmed: no `dequant_chunk` case); IQ3_XXS, IQ3_S, IQ2_S, Q2_0(42), Q1_0(41) absent; `qwen4exp` has no registry entry | open |
-| T12 | Correctness: laguna greedy output not reproducible run-to-run; DFlash 0%; Spark_one.Q6_K; two ambiguous `device rc=0, cpu rc=1` models | open |
+| T11 | Quant: **every listed format is now implemented on both host and device**, IQ2_XS's missing `dequant_chunk` branch included -- see the dequant session entry at the end of this file. **`qwen4exp` still has no registry entry** (this is the Qwen3.8-Flash item, and it is why `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS` is refused on the arch rather than the quant). Ids 102/104/107/142 remain refusals: no reference layout exists on this machine, so they must not be guessed | **formats done; `qwen4exp` + ids 102/104/107/142 open** |
+| T12 | Correctness: laguna greedy output not reproducible run-to-run — **the decode-attention split-K race responsible is identified and fixed** (see the entry above); DFlash 0%; Spark_one.Q6_K; two ambiguous `device rc=0, cpu rc=1` models | needs re-verification |
 | T13 | **The gate has no equivalence test for fast paths** — the reason a 41%-wrong kernel shipped and survived | open |
 | T14 | Doc drift: README says a 32x64x64 WMMA tile (code: BK=128) and "weights are never dequantized" (the WMMA prefill path stages fp16 through LDS) | open |
 
@@ -986,7 +1092,18 @@ first of those is now testable on real hardware for the first time.
 
 - **Q1_0 and Q2_0 for T11**: `Bonsai-27B-Q1_0.gguf` (type 41),
   `Ternary-Bonsai-27B-Q2_0.gguf` (type 42). These are the only real files seen
-  so far that exercise those two formats, and both are now reachable.
+  so far that exercise those two formats, and the copies measured are local
+  (`G:/More-models/Bonsai-27B-Q1_0.gguf`,
+  `H:/OLLAMA-Models/GGUF/Ternary-Bonsai-27B-Q2_0.gguf`), not maclin-only.
+  **Both run now.** Q1_0 is coherent text and device-vs-CPU identical under
+  `coherence_check.sh`. The **Q2_0 geometry was settled on 2026-10-06 and the
+  older "malformed file" note is withdrawn**: id 42 has two live layouts, a
+  llama-dx fork block of 34 bytes per 128 values (2.125 bpw, which is what this
+  file and the other Ternary-Bonsai Q2_0 exports carry) and upstream's 18 bytes
+  per 64 (2.25 bpw, which the fork names `Q2_0_64` and gives id 48). The file's
+  own tensor offsets say which one it is, and this one says 2.125 -- so the
+  18-byte reader was the wrong one, not the file. See section 11 of
+  [docs/test-results.md](test-results.md).
 - **DFlash pairs for T12**: `laguna-xs21-dflash-q4.gguf`,
   `laguna-s-2.1-DFlash-Q4_K_M.gguf`, `gemma-4-12B-it-DFlash-Q4_K_M.gguf` —
   drafter *and* target on the same box, which is what the 0% acceptance hunt
@@ -1001,8 +1118,14 @@ first of those is now testable on real hardware for the first time.
 ### Order of attack
 
 T1 (running) → T13 (make the detector permanent) → T10 (first real RDNA2
-validation, 30 sessions overdue) → T2 (largest measured number) → T11 (unblocks
-four named files and the maclin Q1_0/Q2_0 pair) → T4/T6 → T8/T9.
+validation, 30 sessions overdue) → T2 (largest measured number) → T4/T6 → T8/T9.
+
+**T11 is closed (2026-10-06).** The seven IQ/Q1/Q2 dequantizers landed and both
+of the Q1_0/Q2_0 files that were waiting on them run; the Q2_0 block geometry
+turned out to be the llama-dx fork's 128-value one, so the earlier "malformed
+file" reading was wrong and is withdrawn. Details in section 11 of
+[docs/test-results.md](test-results.md). Still refused, and needing a newer fork
+revision rather than more engine work: ids 102, 104, 107 and 142.
 
 --------------------------------------------------------------------------------
 Session entry: RDNA2 head-to-head (HIP reference) + the OLMoE QK-norm
@@ -1023,7 +1146,8 @@ G13  olmoe-1b-7b is STILL wrong after G12, on both arms, and the two arms
 
 G14  Linking the HIP backend into the same process as the scalar reference
      changes host floating-point behaviour. Same quant.cpp: 2152/2154 with
-     backend_hip.o linked, 2154/2154 without it. NOT flush-to-zero -- MXCSR
+     backend_hip.o linked, 2154/2154 without it (both as of this investigation
+     -- the suite is 2329 checks now). NOT flush-to-zero -- MXCSR
      still reads FTZ=0 DAZ=0 after hipFree(nullptr) and the isolated
      dequant_row returns 2^-128 > 0. Mechanism unknown. This matters because
      the MoE routing plan is built on the host in that same process, so it can
@@ -1078,3 +1202,107 @@ T26  Attack G16/G17. The ordered question is which dominates the 988.6 ms:
 T27  Measure the expert corpus against the cache on a fast filesystem before
      concluding anything about the policy: this baseline is on an ntfs3 mount
      reading at 0.1-0.3 GB/s, which conflates the filesystem with the cache.
+
+--------------------------------------------------------------------------------
+Session entry: the missing GGUF dequantizers
+Evidence: docs/test-results.md (new section); measured on the RX 9070 XT, gfx1201
+
+The formats that made four named files unloadable are implemented on host and
+device, and every codebook was diffed mechanically against ggml-common.h rather
+than eyeballed.
+
+**Implemented** -- host in `src/quant_fmt_a.inc`, `src/quant_fmt_b.inc`,
+`src/quant_fmt_c.inc` and `src/quant_fmt_c_tables.inc` (included inside the
+anonymous namespace of `src/quant.cpp`); device in
+`src/hip/kernels/dequant_fmt_a.inc`, `dequant_fmt_b.inc` and
+`dequant_fmt_c.inc` (included inside `namespace krk` in
+`src/hip/kernels/dequant.hpp`):
+
+    IQ3_XXS (18)  IQ1_S (19)  IQ3_S (21)  IQ2_S (22)  IQ1_M (29)
+    Q1_0 (41)     Q2_0 (42)                -- IQ2_XS (17) already existed
+
+Dispatch is wired in `dequant_block` on the host and in the `dequant_chunk`
+ladder, `dequant_chunk_dev`, `dot_chunks`, `dequant_row_dev` and
+`dtype_chunks_per_block_dev` on the device, so decode, prefill, the embedding
+gather and the CPU reference all reach them.
+
+**Table diffs, entry for entry against ggml-common.h:** `iq3xxs_grid` 256/256,
+`iq2xs_grid` 512/512, `iq2s_grid` 1024/1024, `iq3s_grid` 512/512, `iq1s_grid`
+2048/2048, plus `kmask_iq2xs`, `ksigns_iq2xs`, `kvalues_iq4nl` and
+`kvalues_fp4` -- all PASS. The five grid formats deliberately share one
+transcription between host and device: a hand-copied second table has one
+chance per entry to be wrong, and a divergence would surface as "the GPU and the
+CPU reference disagree" with nothing pointing at the table.
+
+**Tests 2214 -> 2316, then 2316 -> 2329**: the first step added exact
+hand-written value tests for Q1_0 and Q2_0 (the two whose codes are short enough
+to type out), geometry/id/name checks for all seven, and a structural
+group-mapping probe per grid format -- a change confined to one group's
+high-index byte must move exactly that group's decoded values, which is what
+catches a chunk landing at the wrong offset. The second step is the Q2_0
+geometry change: 128 values per 34-byte block for id 42, the 64-value 18-byte
+twin promoted to its own id 48, and a wider layout test that pins the last plane
+byte of the 128-value block.
+
+**Runs, not just tests.** `Bonsai-27B-Q1_0.gguf` (Q1_0 x498) generates coherent
+text and `coherence_check.sh` reports device and CPU byte-identical.
+`Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf` does the same and exercises IQ1_S, IQ2_S,
+IQ3_S, IQ3_XXS, IQ2_XS, IQ2_XXS, IQ1_M and IQ4_XS in a single model.
+`Laguna-XS-2.1-IQ3_XXS`, `Qwen3.8-27B-UD-Q2_K_XL` and
+`Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp` are geometrically consistent with the new
+sizes and load.
+
+**Still refused, and it is not a decoder gap:**
+
+- ids **102, 104, 107** have no authoritative block layout on this machine,
+  so they must not be guessed. **142** is a different case: its layout *is*
+  measured (below); what is missing there is the code map, and that one was
+  tried and failed.
+  `H:/llamadx/llama.cpp/.llama-dx-reference` is a clone of Maxritz/LLAMA-DX at
+  the tip of `origin/main` (ce15745) and its `ggml.h` stops at 101 with
+  `GGML_TYPE_COUNT = 102`, so these ids come from a newer revision of that fork
+  which is not on this box; nothing under `C:/Users/rr`, `H:/` or `G:/`
+  mentions any of them.
+- **102 is 6.5 bpw, 104 is 3.5 bpw and 107 is 2.5 bpw**, measured from their own
+  tensor offsets. Files:
+  `G:/More-models/ornith-1.0-35B-Q3_0_ROCMFPX.gguf` (101 x2, 102 x40, 104 x268,
+  `general.file_type` 112) and
+  `G:/More-models/Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf`
+  (102 x229, 107 x214, `file_type` 119). A sweep of 11 candidate byte strides
+  found none at which the first two bytes of every block behave as a scale (the
+  best still left 25-37% of them implausible), so none of them is an f16-scale
+  block of any width -- the layout is something else and stays unguessed.
+- **142**, in `G:/More-models/Ternary-Bonsai-2-27B-PQ2_0.gguf` (402 tensors,
+  `file_type` 141, `general.name` "Hf", basename "folded"). Its geometry *is*
+  measured: 34 bytes per 128 values (2.125 bpw), an f16 scale at the head of
+  every block (0 of 823296 sampled scales implausible, where 18, 26 and 36-byte
+  strides each leave about a quarter of them on code bytes), and codes 0/1/2 at
+  33.6/32.8/33.6% with code 3 unused. What is unknown is the code map, and it is
+  **not** a plain per-code level: `(q - 1)` and three other candidate maps were
+  each run end to end and produced non-words. Recorded as a negative result so
+  nobody repeats it. The likely reason is visible in the same fork's newer
+  types -- `GGML_TYPE_TQ3_1S`/`TQ4_1S` are described as WHT-rotated Lloyd-Max --
+  and a rotated block cannot be decoded by a level map at all, which is also
+  what the "folded" basename suggests.
+- the older entry saying the `*-Q2_0.gguf` files are **malformed** is wrong and
+  is withdrawn here. They are a valid 128-value-block Q2_0 from the llama-dx
+  fork and the engine loads them: coherence PASS against `--cpu`, and the
+  sibling `Bonsai-27B-Q1_0.gguf` matches upstream llama.cpp token for token on
+  ROCm (24 of 24 greedy tokens). What the engine computed was the size of the
+  *other* fork's Q2_0 block, so the mismatch was ours to explain, not the
+  file's.
+
+Also fixed on the way: `Model::load` no longer requires `n_embd % n_head == 0`
+when the file declares `attention.key_length`. Qwen3.5's gated attention runs 24
+heads of 256 dims over a 5120-wide embedding (`q_proj` is `2*n_head*head_dim`),
+so the identity is not a promise the file makes. Without the fix
+`Bonsai-27B-Q1_0.gguf` was refused at load on a dtype that was already fine.
+
+**NOT STARTED -- none of the above is progress on these three:**
+
+- **Qwen3.8-Flash / the `qwen4exp` architecture.** Still no registry entry, so
+  `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS` is refused on the architecture, not
+  on the quantisation. G7/T11 stay open for exactly this.
+- **The 99%-hot-expert accuracy target.** Nothing measured against it this
+  session; the expert-cache work below is a separate, earlier thread.
+- **The prefill speedup.** T2 / G1 remain untouched.

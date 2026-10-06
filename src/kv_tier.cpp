@@ -125,6 +125,33 @@ bool KvTierCache::init(Backend *be, i64 n_layer, size_t layer_bytes,
     if (n_slots_ < 1) n_slots_ = 1;
     if (n_slots_ > n_layer_) n_slots_ = static_cast<int>(n_layer_);
 
+    // The resident set cannot hold one full pass over the model, so every
+    // layer is evicted before it is next needed and each decode step migrates
+    // every layer -- one migration per (layer, plane) per token, with no
+    // locality for the policy to exploit. MEASURED on SmolLM2-135M, --ctx 4096
+    // --kv-warm-mb 64: 2.3 tok/s at 1 slot of 30 layers and 10.8 tok/s at 2,
+    // against 474.5 tok/s when the cache fit flat -- 206x and 44x, with 33 GB
+    // migrated in a 256-token run. The shape was printed at load and nothing
+    // said what it costs, so the only symptom was a mysteriously slow run.
+    //
+    // Warn once, here, and change no policy: silently second-guessing the
+    // caller would invalidate the A/B that produced those numbers. Note this
+    // is not always the caller's fault -- it also fires when the context
+    // genuinely does not fit, where tiering is the only way to run at all --
+    // so the message gives the remedy for each case rather than assuming one.
+    if (n_slots_ < n_layer_) {
+        KRK_WARN("kv: HOT tier holds %d slot(s) for %lld layer(s), so the "
+                 "resident set cannot hold one full pass over the model. "
+                 "Expect one migration per layer per decode step with no "
+                 "reuse (measured up to 206x slower than fitting flat). If the "
+                 "card can hold the whole cache, raise --kv-hot-mb to at least "
+                 "%.1f MiB and this disappears; if it cannot, the run is "
+                 "memory-bound by construction and only --ctx or a smaller "
+                 "model changes it.",
+                 n_slots_, static_cast<long long>(n_layer_),
+                 static_cast<double>(total) / 1048576.0);
+    }
+
     const size_t n = static_cast<size_t>(n_layer_);
     slot_mem_.assign(static_cast<size_t>(n_slots_), nullptr);
     slot_marker_.assign(static_cast<size_t>(n_slots_), nullptr);

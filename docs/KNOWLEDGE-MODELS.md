@@ -80,8 +80,8 @@ Head width is the thing that decides which kernel runs.
 | Path | Accepts | Notes |
 |---|---|---|
 | `attention_decode` (split-K) | hd 64, 128, 256 | `attention_decode_splits()` scales splits with `cu_count` |
-| `attention_qtile` | **BROKEN — opt-in only** | `KRK_ATTN_QTILE=1`; wrong output, see PERF-PLAN B6 |
-| `attention_kernel` (tiled) | anything | the safe fallback, and the current prefill default |
+| `attention_qtile` | prefill, `window == 0`, smem fits | the prefill default; `KRK_ATTN_QTILE=0` opts out, `KRK_ATTN_QTILE_K` forces the key tile |
+| `attention_kernel` (tiled) | anything | one query per block; the `KRK_ATTN_QTILE=0` fallback |
 | `attn_fused_chain` | hd 64, 128 | hd=256 models cannot use the fused decode chain |
 
 Adding a model with a **new head width** is the most likely way to land on a

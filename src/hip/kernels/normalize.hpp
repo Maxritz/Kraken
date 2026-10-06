@@ -68,6 +68,48 @@ __global__ void __launch_bounds__(THREADS)
 }
 
 // ---------------------------------------------------------------------------
+// Residual add folded into RMSNorm: out[r][i] = rmsnorm(x[r] + res[r]) * w[i],
+// with x[r] left holding the sum.
+//
+// Bit-identical to add_inplace_kernel() followed by rmsnorm_kernel(): the sum
+// is rounded to the activation type before it is squared, exactly as the two
+// kernels do, so the norm views the same values it would have read back from
+// memory. That matters more than the launch it saves -- a fused kernel that is
+// merely close turns a greedy decoder into a different decoder, and no unit
+// test in this repo would say so.
+// ---------------------------------------------------------------------------
+
+template <int THREADS>
+__global__ void __launch_bounds__(THREADS)
+    rmsnorm_add_kernel(_Float16 *__restrict__ out, _Float16 *__restrict__ x,
+                       const _Float16 *__restrict__ res,
+                       const f32 *__restrict__ w, i64 n, f32 eps) {
+    const i64 r = blockIdx.x;
+    _Float16 *xr = x + r * n;
+    const _Float16 *rr = res + r * n;
+    _Float16 *orow = out + r * n;
+
+    f32 ss = 0.0f;
+    for (i64 i = threadIdx.x; i < n; i += THREADS) {
+        const _Float16 h = static_cast<_Float16>(static_cast<f32>(xr[i]) +
+                                                 static_cast<f32>(rr[i]));
+        xr[i] = h;
+        const f32 hv = static_cast<f32>(h);
+        ss += hv * hv;
+    }
+    ss = block_reduce_sum<THREADS>(ss);
+
+    __shared__ f32 scale_sh;
+    if (threadIdx.x == 0)
+        scale_sh = rsqrtf(ss / static_cast<f32>(n) + eps);
+    __syncthreads();
+    const f32 scale = scale_sh;
+
+    for (i64 i = threadIdx.x; i < n; i += THREADS)
+        orow[i] = static_cast<_Float16>(static_cast<f32>(xr[i]) * scale * w[i]);
+}
+
+// ---------------------------------------------------------------------------
 // Per-head RMSNorm (Qwen3 / Gemma3 QK-norm). grid.x = heads, grid.y = tokens.
 // ---------------------------------------------------------------------------
 

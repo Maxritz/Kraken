@@ -18,6 +18,18 @@
 #  default target list is ordered accordingly.
 # ============================================================================
 cmake_minimum_required(VERSION 3.21)
+
+# Release, and it has to be decided before project(). CMake's Windows platform
+# modules (Windows-Clang, Windows-MSVC) put Debug into CMAKE_BUILD_TYPE while
+# project()/enable_language() are running, so the guard further down cannot tell
+# that injected Debug from a deliberate -DCMAKE_BUILD_TYPE=Debug, leaves it alone,
+# and a bare `cmake -Bbuild` silently produces an -O0 build. Naming it here means
+# the cache already holds Release when the platform module looks.
+if(NOT DEFINED CMAKE_BUILD_TYPE AND
+   NOT CMAKE_GENERATOR MATCHES "Multi-Config|Visual Studio")
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type: Release (default), Debug, RelWithDebInfo, MinSizeRel" FORCE)
+endif()
 project(kraken VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -48,6 +60,7 @@ set(KRK_CORE_SOURCES
     src/model.cpp
     src/dflash.cpp
     src/expert_cache.cpp
+    src/expert_cpu.cpp
     src/kv_tier.cpp
     src/engine.cpp
     src/backend_cpu.cpp
@@ -85,103 +98,308 @@ endif()
 
 set(KRK_HIP_AVAILABLE OFF)
 if(KRK_ENABLE_HIP)
+    # -----------------------------------------------------------------------
+    # HIP pre-flight, part 1: find the SDK root BEFORE find_package.
+    #
+    # Everything below depends on knowing which install is being used, and the
+    # SDK usually advertises itself: ROCM_PATH / HIP_PATH are set by the HIP
+    # SDK on Windows, and hipconfig answers when they are not. Locating it here
+    # means a plain `cmake -Bbuild` needs no path flags, and it means the
+    # backslash in $ENV{HIP_PATH} (G:\ROCM10RT-gfx1201 on this host) is
+    # normalised once, at the boundary, instead of reaching a generated .cmake
+    # file where it is an invalid escape sequence.
+    # -----------------------------------------------------------------------
+    set(KRK_ROCM_ROOT "" CACHE PATH "ROCm/HIP SDK root. Empty auto-detects it.")
+
+    macro(_krk_resolve_rocm_root)
+        set(_krk_rocm_root "")
+        foreach(_krk_r IN LISTS _krk_roots)
+            file(TO_CMAKE_PATH "${_krk_r}" _krk_r)
+            string(STRIP "${_krk_r}" _krk_r)
+            if(EXISTS "${_krk_r}/lib/llvm/bin/clang++.exe" OR
+               EXISTS "${_krk_r}/lib/llvm/bin/clang++")
+                set(_krk_rocm_root "${_krk_r}")
+                break()
+            endif()
+        endforeach()
+    endmacro()
+
+    set(_krk_roots "")
+    if(KRK_ROCM_ROOT)
+        list(APPEND _krk_roots "${KRK_ROCM_ROOT}")
+    endif()
+    foreach(_krk_env ROCM_PATH HIP_PATH HIP_ROOT)
+        if(DEFINED ENV{${_krk_env}})
+            list(APPEND _krk_roots "$ENV{${_krk_env}}")
+        endif()
+    endforeach()
+    if(CMAKE_PREFIX_PATH)
+        list(APPEND _krk_roots ${CMAKE_PREFIX_PATH})
+    endif()
+    _krk_resolve_rocm_root()
+
+    if(NOT _krk_rocm_root)
+        # hipconfig reports the root with backslashes on Windows, and CMake's
+        # own fallback in CMakeDetermineHIPCompiler.cmake consumes that string
+        # without normalising it. Normalise it here.
+        find_program(_krk_hipconfig NAMES hipconfig hipconfig.exe)
+        if(_krk_hipconfig)
+            execute_process(COMMAND "${_krk_hipconfig}" --rocmpath
+                            OUTPUT_VARIABLE _krk_hipcfg
+                            OUTPUT_STRIP_TRAILING_WHITESPACE
+                            ERROR_QUIET)
+            if(_krk_hipcfg)
+                set(_krk_roots "${_krk_hipcfg}")
+                _krk_resolve_rocm_root()
+                if(_krk_rocm_root)
+                    message(STATUS "kraken: ROCm root from hipconfig = ${_krk_rocm_root}")
+                endif()
+            endif()
+        endif()
+    endif()
+
+    if(_krk_rocm_root)
+        message(STATUS "kraken: ROCm SDK root = ${_krk_rocm_root}")
+        # Prime both search paths so find_package(hip) finds this install
+        # without the caller repeating the path on the command line.
+        if(NOT _krk_rocm_root IN_LIST CMAKE_PREFIX_PATH)
+            list(PREPEND CMAKE_PREFIX_PATH "${_krk_rocm_root}")
+        endif()
+        if(NOT EXISTS "${_krk_rocm_root}/cmake" OR
+           NOT "${_krk_rocm_root}/cmake" IN_LIST CMAKE_MODULE_PATH)
+            if(EXISTS "${_krk_rocm_root}/cmake")
+                list(PREPEND CMAKE_MODULE_PATH "${_krk_rocm_root}/cmake")
+            endif()
+        endif()
+        # Pre-seeding these makes CMakeDetermineHIPCompiler skip BOTH of its
+        # root-detection paths, including the backslash one.
+        set(CMAKE_HIP_COMPILER_ROCM_ROOT "${_krk_rocm_root}" CACHE PATH
+            "ROCm root used by the HIP compiler detection" FORCE)
+        set(CMAKE_HIP_COMPILER_ROCM_LIB "${_krk_rocm_root}/lib" CACHE PATH
+            "ROCm library root used by the HIP compiler detection" FORCE)
+    endif()
+
     find_package(hip QUIET CONFIG)
     if(NOT hip_FOUND)
         find_package(HIP QUIET)
     endif()
 
-    if(hip_FOUND OR HIP_FOUND)
-        set(KRK_HIP_AVAILABLE ON)
-        enable_language(HIP)
-
-        # Normalize the target list into the form CMake wants.
-        set(CMAKE_HIP_ARCHITECTURES "${KRK_GPU_TARGETS}")
-        if(NOT CMAKE_HIP_COMPILER_ID MATCHES "Clang")
-            message(WARNING "HIP compiler is ${CMAKE_HIP_COMPILER_ID}; the WMMA "
-                            "builtins require amdclang++")
+    # Pre-flight, part 2: if nothing advertised a root but the package was
+    # found anyway (a cache hit, or a hip_DIR from the caller), work back from
+    # what it told us.
+    if(NOT _krk_rocm_root AND hip_DIR)
+        set(_krk_roots "${hip_DIR}/../../..")
+        _krk_resolve_rocm_root()
+        if(_krk_rocm_root)
+            message(STATUS "kraken: ROCm SDK root = ${_krk_rocm_root} (from hip_DIR)")
         endif()
+    endif()
 
-        # ROCm device bitcode location. The compiler only searches
-        # <rocm>/amdgcn/bitcode when ROCM_PATH (or --rocm-path) names the
-        # install root. A relocated runtime pack on neither the default
-        # prefix nor PATH fails every device compile with
-        #   "cannot find ROCm device library; ... '-nogpulib'"
-        # which is a hard error, not a warning.
-        #
-        # This must be applied globally, not just to krk_hip: CMake
-        # compiles the executable targets' .cpp files with amdclang++ and
-        # an injected `-x hip`, so they are device compiles too and they
-        # fail identically. Compile *and* link options are needed because
-        # the device-link step resolves the same libraries.
-        set(_krk_devlib "")
+    if(NOT (hip_FOUND OR HIP_FOUND))
+        # A missing SDK used to print a status line and build the scalar backend
+        # anyway, so a "successful" configure could produce a binary with no GPU
+        # path in it, and the only symptom was a missing device line at run time.
+        # KRK_ENABLE_HIP means the caller asked for HIP, so say so loudly;
+        # -DKRK_ENABLE_HIP=OFF is how you ask for the CPU reference build.
+        message(FATAL_ERROR
+            "kraken: KRK_ENABLE_HIP=ON but no HIP/ROCm SDK was found.\n"
+            "  Looked at KRK_ROCM_ROOT, ROCM_PATH, HIP_PATH, HIP_ROOT, the HIP SDK's\n"
+            "  hipconfig, and CMAKE_PREFIX_PATH = '${CMAKE_PREFIX_PATH}'.\n"
+            "  Name the install (forward slashes; a backslash reaches a generated\n"
+            "  .cmake file and is an invalid escape sequence there):\n"
+            "      -DKRK_ROCM_ROOT=<rocm-root>\n"
+            "  To build the CPU reference backend on purpose:\n"
+            "      -DKRK_ENABLE_HIP=OFF\n"
+            "  docs/USER-GUIDE.md section 2 has the full recipe.")
+    endif()
+
+    set(KRK_HIP_AVAILABLE ON)
+
+    # -----------------------------------------------------------------------
+    # HIP pre-flight, part 3: everything here has to happen BEFORE
+    # enable_language(HIP).
+    #
+    # enable_language(HIP) runs CMakeDetermineHIPCompiler, whose first act is a
+    # probe compile of CMakeHIPCompilerId.hip. That probe needs the ROCm device
+    # library, which clang finds only via ROCM_PATH or --rocm-device-lib-path.
+    # When the probe fails CMake does not warn: the compiler ID stays "unknown"
+    # and the configure dies several steps later, one file away from the cause,
+    # with either
+    #     CMakeDetermineHIPCompiler.cmake:332  Failed to find a default HIP
+    #     architecture
+    # or -- if CMAKE_HIP_ARCHITECTURES is already in the cache -- a
+    # CMakeHIPCompiler.cmake whose ROCm root came from the backslash-returning
+    # `hipconfig --rocmpath` fallback, which then cannot be parsed:
+    #     CMakeHIPCompiler.cmake:22  Invalid character escape '\R'
+    #
+    # The compiler, the device bitcode and the arch are all knowable here, so
+    # settle them here and neither failure can happen.
+    # See docs/USER-GUIDE.md section 6.
+    # -----------------------------------------------------------------------
+
+    # CMake's HIP module prefers hip_HIPCC_EXECUTABLE on the amd platform and
+    # then cannot identify hipcc, leaving CMAKE_HIP_COMPILER_ID unknown. Give it
+    # the SDK's clang++ explicitly when the caller did not.
+    if(NOT CMAKE_HIP_COMPILER AND _krk_rocm_root)
+        if(EXISTS "${_krk_rocm_root}/lib/llvm/bin/clang++.exe")
+            set(_krk_hipcxx "${_krk_rocm_root}/lib/llvm/bin/clang++.exe")
+        else()
+            set(_krk_hipcxx "${_krk_rocm_root}/lib/llvm/bin/clang++")
+        endif()
+        if(EXISTS "${_krk_hipcxx}")
+            set(CMAKE_HIP_COMPILER "${_krk_hipcxx}" CACHE FILEPATH
+                "HIP compiler" FORCE)
+            message(STATUS "kraken: HIP compiler auto-detected = ${CMAKE_HIP_COMPILER}")
+        endif()
+    endif()
+
+    # ROCm device bitcode location. The compiler only searches
+    # <rocm>/amdgcn/bitcode when ROCM_PATH (or --rocm-path) names the install
+    # root. A relocated runtime pack on neither the default prefix nor PATH
+    # fails every device compile with
+    #   "cannot find ROCm device library; ... '-nogpulib'"
+    # which is a hard error, not a warning.
+    #
+    # This must be applied globally, not just to krk_hip: CMake compiles the
+    # executable targets' .cpp files with amdclang++ and an injected `-x hip`,
+    # so they are device compiles too and they fail identically. Compile *and*
+    # link options are needed because the device-link step resolves the same
+    # libraries.
+    #
+    # It also goes into CMAKE_HIP_FLAGS, which add_compile_options() cannot
+    # reach: the compiler-ID probe runs before any of that takes effect, and a
+    # probe that fails is what leaves the compiler unidentified.
+    set(_krk_devlib "")
+    if(CMAKE_HIP_COMPILER)
         get_filename_component(_hip_bin "${CMAKE_HIP_COMPILER}" DIRECTORY)
         get_filename_component(_llvm_root "${_hip_bin}" DIRECTORY)   # .../lib/llvm
         get_filename_component(_rocm_root "${_llvm_root}" DIRECTORY) # .../lib
         foreach(_cand "${_rocm_root}/llvm/amdgcn/bitcode"
-                    "${_llvm_root}/amdgcn/bitcode"
-                    "${_rocm_root}/amdgcn/bitcode")
+                      "${_llvm_root}/amdgcn/bitcode"
+                      "${_rocm_root}/amdgcn/bitcode")
             if(EXISTS "${_cand}/oclc_abi_version_600.bc")
                 set(_krk_devlib "${_cand}")
                 break()
             endif()
         endforeach()
-        # Second tier: the compiler's own pack can be present but hollow.
-        # MEASURED on this host: G:/ROCM10RT-gfx1201/lib/llvm/amdgcn/bitcode
-        # was emptied at 17:16 on 2025-10-05 while the tree above it stayed
-        # intact, and every device compile then failed. The arch libraries
-        # are not per-pack -- oclc_isa_version_1201.bc is identical in every
-        # ROCm 10 pack -- so a sibling pack of the same product line is a
-        # valid source. Prefer the same product prefix (everything up to the
-        # first '-'), which also keeps the compiler's ROCm major version
-        # matched to the bitcode it has to load.
-        if(NOT _krk_devlib)
-            get_filename_component(_pack_dir "${_rocm_root}" DIRECTORY)
-            get_filename_component(_pack_base "${_pack_dir}" NAME)
-            string(REGEX REPLACE "-.*$" "" _pack_prefix "${_pack_base}")
-            file(GLOB _siblings "${_pack_dir}/../${_pack_prefix}*/lib/llvm/amdgcn/bitcode")
-            foreach(_cand IN LISTS _siblings)
-                if(EXISTS "${_cand}/oclc_isa_version_600.bc")
-                    set(_krk_devlib "${_cand}")
-                    message(WARNING "kraken: ${_pack_dir} has no device "
-                                    "bitcode; using sibling pack ${_cand}")
-                    break()
-                endif()
-            endforeach()
-        endif()
-        if(_krk_devlib)
-            add_compile_options(--rocm-device-lib-path=${_krk_devlib})
-            add_link_options(--rocm-device-lib-path=${_krk_devlib})
-            message(STATUS "kraken: ROCm device bitcode = ${_krk_devlib}")
-        else()
-            message(WARNING "kraken: ROCm device bitcode not found next to "
-                            "${CMAKE_HIP_COMPILER}; device compiles may fail")
-        endif()
-
-        add_library(krk_hip STATIC src/hip/backend_hip.hip)
-        target_include_directories(krk_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-                                                  ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(krk_hip PUBLIC krk_core)
-        target_compile_definitions(krk_hip PUBLIC KRK_ENABLE_HIP=1)
-
-        # amdclang defines the __gfx*__ macros only in the device pass
-        # of an offload compile. The host pass must still compile the
-        # kernel launch sites — a kernel that is #if'ed out of the host
-        # pass never enters the fat binary, and launching it silently
-        # does nothing. Mirror every target into a -DKRK_OFFLOAD_GFX*
-        # definition so both passes make the same arch decision.
-        foreach(tgt IN LISTS CMAKE_HIP_ARCHITECTURES)
-            string(TOUPPER "${tgt}" tgt_uc)
-            target_compile_definitions(krk_hip PRIVATE
-                                       "KRK_OFFLOAD_${tgt_uc}=1")
-        endforeach()
-        target_compile_options(krk_hip PRIVATE -O3 -ffast-math
-                                               -fno-finite-math-only)
-
-        message(STATUS "kraken: HIP backend enabled, targets = ${KRK_GPU_TARGETS}")
-    else()
-        message(STATUS "kraken: HIP SDK not found — building the CPU backend only")
     endif()
+    # Second tier: the compiler's own pack can be present but hollow.
+    # MEASURED on this host: G:/ROCM10RT-gfx1201/lib/llvm/amdgcn/bitcode
+    # was emptied at 17:16 on 2025-10-05 while the tree above it stayed
+    # intact, and every device compile then failed. The arch libraries
+    # are not per-pack -- oclc_isa_version_1201.bc is identical in every
+    # ROCm 10 pack -- so a sibling pack of the same product line is a
+    # valid source. Prefer the same product prefix (everything up to the
+    # first '-'), which also keeps the compiler's ROCm major version
+    # matched to the bitcode it has to load.
+    if(NOT _krk_devlib AND CMAKE_HIP_COMPILER)
+        get_filename_component(_pack_dir "${_rocm_root}" DIRECTORY)
+        get_filename_component(_pack_base "${_pack_dir}" NAME)
+        string(REGEX REPLACE "-.*$" "" _pack_prefix "${_pack_base}")
+        file(GLOB _siblings "${_pack_dir}/../${_pack_prefix}*/lib/llvm/amdgcn/bitcode")
+        foreach(_cand IN LISTS _siblings)
+            if(EXISTS "${_cand}/oclc_isa_version_600.bc")
+                set(_krk_devlib "${_cand}")
+                message(WARNING "kraken: ${_pack_dir} has no device "
+                                "bitcode; using sibling pack ${_cand}")
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(_krk_devlib AND NOT CMAKE_HIP_FLAGS MATCHES "--rocm-device-lib-path")
+        set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --rocm-device-lib-path=${_krk_devlib}"
+            CACHE STRING "Flags used by the HIP compiler during all build types." FORCE)
+        message(STATUS "kraken: HIP compiler-identification flags += "
+                       "--rocm-device-lib-path=${_krk_devlib}")
+    endif()
+
+    # Without this the module tries to read a default arch out of the probe
+    # output and dies at CMakeDetermineHIPCompiler.cmake:332 when the probe
+    # produced nothing. Naming the arch up front skips that guess entirely, and
+    # stops a stale gfx906 from the probe's default landing in the cache.
+    if(NOT KRK_GPU_TARGETS)
+        message(FATAL_ERROR
+            "kraken: KRK_GPU_TARGETS is empty, so the build would have no device "
+            "target.\n  Pass one or more, semicolon-separated:\n"
+            "      -DKRK_GPU_TARGETS=gfx1201\n"
+            "      -DKRK_GPU_TARGETS=\"gfx1031;gfx1201\"")
+    endif()
+    set(CMAKE_HIP_ARCHITECTURES "${KRK_GPU_TARGETS}" CACHE STRING
+        "HIP architectures" FORCE)
+
+    # Refuse a mixed toolchain before enable_language(HIP), not after. CMake
+    # notices this itself, but one level down and without saying what to do:
+    # Platform/Windows-Clang.cmake:177 aborts with "mixes Clang and MSVC or some
+    # other CL compatible compiler tool". With KRK_ENABLE_HIP=ON every
+    # translation unit is compiled with device flags, including
+    # --rocm-device-lib-path, which a host compiler picked up from PATH cannot
+    # consume.
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR
+            "kraken: the C++ compiler identified as '${CMAKE_CXX_COMPILER_ID}' "
+            "(${CMAKE_CXX_COMPILER}), not Clang.\n"
+            "  With KRK_ENABLE_HIP=ON every translation unit is compiled with device\n"
+            "  flags, including --rocm-device-lib-path, which a host compiler picked up\n"
+            "  from PATH cannot consume. Use the SDK's amdclang++ (and delete\n"
+            "  CMakeCache.txt first -- the C++ compiler is fixed at project() time):\n"
+            "      -DCMAKE_CXX_COMPILER=${_krk_rocm_root}/lib/llvm/bin/amdclang++.exe")
+    endif()
+
+    enable_language(HIP)
+
+    # Now that the language is up, refuse to continue on a mis-detected
+    # toolchain. Each of these used to be a warning at best and produced a
+    # binary that was wrong in a way only a benchmark run would reveal.
+    if(NOT CMAKE_HIP_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR
+            "kraken: the HIP compiler identified as '${CMAKE_HIP_COMPILER_ID}', not Clang.\n"
+            "  CMake's HIP module takes hipcc on the amd platform and cannot identify it.\n"
+            "  Pass the SDK's HIP compiler (and delete CMakeCache.txt first):\n"
+            "      -DCMAKE_HIP_COMPILER=${_krk_rocm_root}/lib/llvm/bin/clang++.exe")
+    endif()
+    if(NOT _krk_devlib)
+        message(FATAL_ERROR
+            "kraken: no usable ROCm device bitcode was found for "
+            "${CMAKE_HIP_COMPILER}.\n"
+            "  Looked next to the compiler and in a sibling ROCm pack for\n"
+            "  oclc_abi_version_600.bc. Every device compile fails without it with\n"
+            "  'cannot find ROCm device library'.\n"
+            "  Point at a directory that has it:\n"
+            "      -DCMAKE_HIP_FLAGS=--rocm-device-lib-path=<dir-with-oclc_abi_version_600.bc>")
+    endif()
+
+    set(CMAKE_HIP_ARCHITECTURES "${KRK_GPU_TARGETS}")
+
+    add_compile_options(--rocm-device-lib-path=${_krk_devlib})
+    add_link_options(--rocm-device-lib-path=${_krk_devlib})
+    message(STATUS "kraken: ROCm device bitcode = ${_krk_devlib}")
+
+    add_library(krk_hip STATIC src/hip/backend_hip.hip)
+    target_include_directories(krk_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                              ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(krk_hip PUBLIC krk_core)
+    target_compile_definitions(krk_hip PUBLIC KRK_ENABLE_HIP=1)
+
+    # amdclang defines the __gfx*__ macros only in the device pass
+    # of an offload compile. The host pass must still compile the
+    # kernel launch sites — a kernel that is #if'ed out of the host
+    # pass never enters the fat binary, and launching it silently
+    # does nothing. Mirror every target into a -DKRK_OFFLOAD_GFX*
+    # definition so both passes make the same arch decision.
+    foreach(tgt IN LISTS CMAKE_HIP_ARCHITECTURES)
+        string(TOUPPER "${tgt}" tgt_uc)
+        target_compile_definitions(krk_hip PRIVATE
+                                   "KRK_OFFLOAD_${tgt_uc}=1")
+    endforeach()
+    target_compile_options(krk_hip PRIVATE -O3 -ffast-math
+                                           -fno-finite-math-only)
+
+    # One line that cannot be mistaken for the CPU-only build's line.
+    message(STATUS "kraken: HIP backend enabled, targets = ${KRK_GPU_TARGETS} "
+                   "(HIP compiler ${CMAKE_HIP_COMPILER_ID} "
+                   "${CMAKE_HIP_COMPILER_VERSION}, CXX ${CMAKE_CXX_COMPILER_ID})")
 endif()
+
 
 if(NOT KRK_HIP_AVAILABLE)
     target_sources(krk_core PRIVATE src/hip/hip_stub.cpp)

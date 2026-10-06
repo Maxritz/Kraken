@@ -26,7 +26,7 @@ WMMA**).
 
 | item | state |
 |---|---|
-| **HTTP server mode (OpenAI-compatible)** | **Done and tested.** New `kraken-server` binary: `/health`, `/v1/models`, `/v1/completions`, `/v1/chat/completions`, buffered and SSE. 78 new checks in the suite, now **479/479**. |
+| **HTTP server mode (OpenAI-compatible)** | **Done and tested.** New `kraken-server` binary: `/health`, `/v1/models`, `/v1/completions`, `/v1/chat/completions`, buffered and SSE. 78 new checks in the suite, **479/479** at the time (2329/2329 now). |
 | **Fetch a real MoE GGUF model** | **Done and verified.** Qwen3-MoE-4x0.6B-2.4B (Q4_K_M, 965 MB) downloaded, loads with correct geometry, and completes a real forward pass on the CPU oracle. `scripts/fetch_moe_model.sh` reproduces it. |
 | **GPU bring-up checklist** | **Done.** `docs/GPU_BRINGUP.md`: build per target, `--info` conformance, CPU-oracle vs GPU token-for-token diff with a per-op bisect table, MoE residency invariants, VRAM sizing, known-unverified kernels, report template. |
 
@@ -158,7 +158,7 @@ is byte-identical to the earlier session's output.
 
 ```sh
 sh ./scripts/build_linux.sh --cpu-only        # CPU oracle build
-build-cpu/kraken-tests                         # expect 479/479
+build-cpu/kraken-tests                         # expect 2329/2329 (current watermark)
 
 sh ./scripts/fetch_moe_model.sh                # ~965 MB real MoE GGUF
 build-cpu/kraken --model ../Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf --cpu --info

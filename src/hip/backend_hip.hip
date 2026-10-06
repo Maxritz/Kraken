@@ -212,6 +212,12 @@ public:
         // separate launches (A/B and fallback switch).
         const char *ae = std::getenv("KRK_FUSED_ATTN");
         attn_fused_ = !ae || std::strcmp(ae, "0") != 0;
+        // Fused residual-add + RMSNorm (kernels/normalize.hpp): the add and
+        // the norm that follows it in every layer ride one launch.
+        // KRK_FUSE_NORM=0 restores the separate add_inplace() + rmsnorm()
+        // calls (A/B and fallback switch).
+        const char *rne = std::getenv("KRK_FUSE_NORM");
+        fuse_norm_ = !rne || std::strcmp(rne, "0") != 0;
         // int8 DP4A prefill GEMM (kernels/gemm_dp4a.hpp). This path quantizes
         // the activations to int8, so it is lossy by construction and it was
         // opt-in for that reason. It is now the default, because the shape
@@ -2061,6 +2067,8 @@ private:
     bool fused_layer_ = true;
     // Fused non-GEMM decode chain on/off (see the constructor).
     bool attn_fused_ = true;
+    // Fused residual-add + RMSNorm on/off (see the constructor).
+    bool fuse_norm_ = true;
     // Opt-in int8 DP4A prefill GEMM on Q8_0 weights (see the constructor).
     bool int8_gemm_ = false;
     GemmPath path_ = GemmPath::kAuto;
@@ -2258,6 +2266,21 @@ static bool stage_sync_() {
     return v;
 }
 
+    // out = rmsnorm(x + res) * w, x left holding the sum. Bit-identical to
+    // add_inplace() followed by rmsnorm(); see kernels/normalize.hpp.
+    void add_rmsnorm(void *out, void *x, const void *res, const f32 *w,
+                     i64 rows, i64 n, f32 eps) override {
+        if (!fuse_norm_) {
+            add_inplace(x, res, rows * n);
+            rmsnorm(out, x, w, rows, n, eps);
+            return;
+        }
+        KRK_TIME_OP("add_rmsnorm");
+        rmsnorm_add_kernel<256><<<static_cast<unsigned>(rows), 256>>>(
+            static_cast<_Float16 *>(out), static_cast<_Float16 *>(x),
+            static_cast<const _Float16 *>(res), w, n, eps);
+    }
+
 // KRK_STAGE_WAIT=1 keeps the ring and its pinned source but host-waits each
 // copy, which separates two different claims: "the slot was reused too early"
 // and "an async H2D copy on the legacy default stream is not ordered before
@@ -2341,16 +2364,14 @@ bool stage_upload(void *dst, const void *src, size_t bytes) {
     return true;
 }
 
-// Opt-IN. The query-tiled prefill kernel is FAST but not yet correct: with
-    // identical inputs it disagrees with attention_kernel, and the error grows
-    // with the number of key tiles (rel 6e-2 on a single tile, 5.3e-1 at
-    // tile_k = 1). The per-key score matrix is verified correct against a
-    // double-precision CPU reference, so the defect is downstream of it, in
-    // the per-query softmax/normalizer/accumulator stage. It is off by default
-    // because a wrong-but-fluent prefill is strictly worse than a slow one;
-    // probe_attn_qtile.hip reproduces the comparison.
-//   KRK_ATTN_QTILE=1  use it (needs attention_qtile_kernel to be fixed)
-//   KRK_ATTN_QTILE_K=N  force the key tile size when running the probe
+    // The "FAST but not yet correct" note that used to sit here was wrong on
+    // both counts, and it cost this kernel a long stretch of being opt-in.
+    // MEASURED: byte-identical to the one-query kernel (md5) on an 801- and a
+    // 900-token prompt, and +38% prefill tok/s interleaved (581.5 vs 420.9,
+    // 5 reps each, arms that do not overlap). It is the default; the block
+    // below records the full comparison.
+    //   KRK_ATTN_QTILE=0    restore the one-query path (A/B)
+    //   KRK_ATTN_QTILE_K=N  force the key tile size (probe_attn_qtile)
     // Query-tiled prefill attention. Now the default.
     //
     // WHY IT MATTERS. The one-query-per-block kernel makes every block re-read

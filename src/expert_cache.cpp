@@ -156,6 +156,29 @@ u32 ExpertCache::touch_count(i32 layer, i32 expert) const {
     return it == slots_.end() ? 0u : it->second.count;
 }
 
+// Read-only residency probes. Deliberately not touch(): a caller that is
+// deciding whether to *avoid* a promotion must be able to ask without changing
+// the LFU counters or the load order that the eviction policy ranks on.
+bool ExpertCache::in_vram(i32 layer, i32 expert) const {
+    const auto it = slots_.find(slot_key(layer, expert));
+    return it != slots_.end() && it->second.in_vram();
+}
+
+bool ExpertCache::in_host(i32 layer, i32 expert) const {
+    const auto it = slots_.find(slot_key(layer, expert));
+    return it != slots_.end() && it->second.in_host();
+}
+
+bool ExpertCache::full_for(const ExpertSource &src) const {
+    const size_t need = src.expert_bytes();
+    // A source with no bytes to promote is not "full", it is unusable: report
+    // false so the caller takes the ordinary path and the acquire() below it
+    // fails the same way it always did, rather than handing the host arm an
+    // expert it also cannot compute.
+    if (need == 0) return false;
+    return bytes_ + need > budget_;
+}
+
 size_t ExpertCache::pinned_slots() const {
     size_t n = 0;
     for (const auto &kv : slots_)

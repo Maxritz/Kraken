@@ -8,6 +8,7 @@
 #include "engine_usage.hpp"
 #include "krk/backend.hpp"
 #include "krk/engine.hpp"
+#include "krk/host_time.hpp"
 
 #if !defined(_WIN32)
 #include <unistd.h>
@@ -36,6 +37,13 @@ struct Args {
     int kv_warm_mb = -1;         // KV WARM (host RAM) budget, MiB: <0 auto, 0 off
     std::string kv_cold_dir;     // KV COLD spill directory: empty disables
     bool expert_warm_prefetch = false; // fill WARM at load instead of on demand
+    // Hybrid CPU + GPU expert compute: experts that are not VRAM-resident are
+    // computed on the host out of the mapping while the device runs the
+    // resident ones (see EngineConfig::hybrid_experts).
+    bool hybrid_experts = false;
+    int hybrid_threads = 0;     // host worker threads, 0 = min(hardware, 8)
+    int hybrid_max_rows = 8;    // rows the host arm runs at, 0 = unbounded
+    double hybrid_frac = 1.0;   // share of RESIDENT experts forced to the host
     int draft_tokens = 4;       // speculative decoding window
     bool cpu = false;
     bool greedy = false;
@@ -119,6 +127,24 @@ void usage() {
         "                        --expert-l2-mb is the old spelling of this flag.\n"
         "  --expert-warm-prefetch  fill WARM at load instead of on demand (costs\n"
         "                        RAM and time before the first token)\n"
+        "  --hybrid-experts 1    compute the experts the device tier cannot hold\n"
+        "                        on the host, out of the weight mapping, while the\n"
+        "                        device runs the resident ones. The experts it\n"
+        "                        takes cost no VRAM and no WARM RAM, so it frees\n"
+        "                        memory for the KV cache. Inert when the budget\n"
+        "                        already holds the routed set.\n"
+        "                        MEASURED, Qwen3-MoE-4x0.6B Q4_K_M, 16 MiB expert\n"
+        "                        budget: this LOSES -- 5.5 tok/s against 17.2 for\n"
+        "                        promoting instead, at 5.4 ms of host time per\n"
+        "                        expert against ~2.0 ms of read+promote. The host\n"
+        "                        arm is a per-layer barrier the device waits on, so\n"
+        "                        the split only pays when the file is slower than\n"
+        "                        the CPU. See docs/test-results.md section 9.\n"
+        "  --hybrid-threads N    host threads for that split (0 = min(hw, 8))\n"
+        "  --hybrid-max-rows N   widest row count the host arm runs at (default 8;\n"
+        "                        0 = unbounded. It is a decode optimization.)\n"
+        "  --hybrid-frac F       share (0..1) of the RESIDENT experts forced to the\n"
+        "                        host anyway; the knob that sweeps the split\n"
         "  --draft MODEL         draft model for greedy speculative decoding\n"
         "  --draft-tokens N      speculation window (default 4)\n"
         "  --info                print model and device info, then exit\n"
@@ -194,6 +220,14 @@ bool parse(int argc, char **argv, Args *a) {
             a->expert_warm_mb = std::atoi(next("--expert-warm-mb"));
         else if (f == "--expert-warm-prefetch")
             a->expert_warm_prefetch = std::atoi(next("--expert-warm-prefetch")) != 0;
+        else if (f == "--hybrid-experts")
+            a->hybrid_experts = std::atoi(next("--hybrid-experts")) != 0;
+        else if (f == "--hybrid-threads")
+            a->hybrid_threads = std::atoi(next("--hybrid-threads"));
+        else if (f == "--hybrid-max-rows")
+            a->hybrid_max_rows = std::atoi(next("--hybrid-max-rows"));
+        else if (f == "--hybrid-frac")
+            a->hybrid_frac = std::atof(next("--hybrid-frac"));
         else if (f == "--greedy") a->greedy = true;
         else if (f == "--tokenize") a->tokenize = true;
         else if (f == "--chat") a->chat = true;
@@ -294,18 +328,74 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     // "n tok in T ms" counts every emitted token; the rate is over the steps
     // that were actually timed, and the step count is printed so the two can
     // never be confused again.
-    std::fprintf(out,
-                 "[stats ] decode    %d tok in %.1f ms over %lld timed steps "
-                 "= %.1f tok/s (%.1f ms/step)\n",
-                 r.generated, r.decode_ms,
-                 static_cast<long long>(r.decode_steps), dtps, dper);
+    // A speculative run's unit of work is a round, not a step, and one round
+    // emits several tokens. Reporting rounds/decode_ms as "tok/s" understated
+    // the rate by the accept rate; reporting tokens/decode_ms against a step
+    // count that was never incremented printed 0.0 tok/s. The two are printed
+    // as what they are.
+    const bool spec_run = engine.has_draft() && engine.spec_steps() > 0;
+    if (spec_run) {
+        const f64 spec_tps = r.decode_ms > 0 ? 1000.0 * r.generated / r.decode_ms : 0.0;
+        const f64 ms_round = r.decode_steps > 0
+                                 ? r.decode_ms / static_cast<f64>(r.decode_steps)
+                                 : 0.0;
+        std::fprintf(out,
+                     "[stats ] decode    %d tok in %.1f ms over %lld speculation "
+                     "rounds = %.1f tok/s (%.2f ms/round)\n",
+                     r.generated, r.decode_ms,
+                     static_cast<long long>(r.decode_steps), spec_tps, ms_round);
+    } else {
+        std::fprintf(out,
+                     "[stats ] decode    %d tok in %.1f ms over %lld timed steps "
+                     "= %.1f tok/s (%.1f ms/step)\n",
+                     r.generated, r.decode_ms,
+                     static_cast<long long>(r.decode_steps), dtps, dper);
+    }
     if (dev_total > 0)
         std::fprintf(out,
                      "[stats ] device    %.2f GiB in use of %.2f GiB (%.2f GiB free)\n",
                      static_cast<f64>(dev_total - dev_free) / 1073741824.0,
                      static_cast<f64>(dev_total) / 1073741824.0,
                      static_cast<f64>(dev_free) / 1073741824.0);
-    if (!mc.is_moe) return;
+
+    // KV tier traffic. These counters live in KvTierCache and were collected
+    // from the start, but the only thing that ever read them was the load-time
+    // one-liner, so a run that paged the whole cache through WARM and out to
+    // COLD reported nothing. It is printed for every model -- a dense model
+    // tiers too -- and printed before the MoE-only block below, which used to
+    // return first and hide it for everything that is not an MoE.
+    {
+        KvTierStats ks;
+        engine.kv_tier_stats(&ks);
+        if (ks.tiered) {
+            const f64 mig_mib = static_cast<f64>(ks.migrate_bytes) / 1048576.0;
+            const f64 layer_mib = static_cast<f64>(ks.layer_bytes) / 1048576.0;
+            std::fprintf(out,
+                         "[stats ] kv        tiered: %lld layers x %.2f MiB, "
+                         "%lld HOT slots (%.0f MiB) | promoted WARM->HOT %lld, "
+                         "COLD->HOT %lld | evicted HOT->WARM %lld, ->COLD %lld | "
+                         "%.1f MiB migrated\n",
+                         static_cast<long long>(ks.layers), layer_mib,
+                         static_cast<long long>(ks.slots),
+                         static_cast<f64>(ks.hot_bytes) / 1048576.0,
+                         static_cast<long long>(ks.promotions_from_warm),
+                         static_cast<long long>(ks.promotions_from_cold),
+                         static_cast<long long>(ks.evictions_to_warm),
+                         static_cast<long long>(ks.evictions_to_cold), mig_mib);
+        } else {
+            std::fprintf(out,
+                         "[stats ] kv        flat: whole cache resident in VRAM "
+                         "(no tiering traffic)\n");
+        }
+    }
+
+    // Host-phase table goes before the MoE-only block so a dense model gets it
+    // too: --profile used to print the device op table and then nothing about
+    // the host, and the host is where a launch-bound step's time actually goes.
+    if (!mc.is_moe) {
+        krk::HostTime::get().report(out);
+        return;
+    }
     const ExpertCache &ec = m.experts();
     const u64 acq = ec.acquires();
     const f64 token_div = r.generated > 0 ? static_cast<f64>(r.generated) : 1.0;
@@ -355,6 +445,22 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                  "alloc %8.1f ms | xfer %8.1f ms | (promote total %8.1f ms)\n",
                  ec.read_ms(), ec.room_ms(), ec.alloc_ms(), ec.xfer_ms(),
                  prom_ms);
+    // The hybrid split, when it was on. Printed even when the host arm ran
+    // nothing, because "the split bought nothing here" is a result too, and the
+    // only way to see it is for the line to appear anyway.
+    if (engine.hybrid_enabled()) {
+        HybridStats hs;
+        engine.hybrid_stats(&hs);
+        std::fprintf(out,
+                     "[stats ] hybrid    %llu expert(s) on the host over %llu row(s) "
+                     "in %.1f ms (%.3f ms/expert, %d thread(s)) | device took %llu\n",
+                     static_cast<unsigned long long>(hs.cpu_experts),
+                     static_cast<unsigned long long>(hs.cpu_rows), hs.cpu_ms,
+                     hs.cpu_experts ? hs.cpu_ms / static_cast<f64>(hs.cpu_experts)
+                                    : 0.0,
+                     hs.threads,
+                     static_cast<unsigned long long>(hs.gpu_experts));
+    }
     std::fprintf(out,
                  "[stats ] warm      %.0f MiB capacity, %.1f%% in use | %llu admissions, "
                  "%llu evictions, %llu rejects | %llu device evictions, %llu decay events\n",
@@ -368,6 +474,7 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                  static_cast<unsigned long long>(ec.warm_rejects()),
                  static_cast<unsigned long long>(ec.evictions()),
                  static_cast<unsigned long long>(ec.decay_events()));
+    krk::HostTime::get().report(out);
 }
 
 int run_bench(Engine &engine, const Args &a, f64 load_ms, f64 start_ms) {
@@ -461,6 +568,22 @@ int run_bench(Engine &engine, const Args &a, f64 load_ms, f64 start_ms) {
                         static_cast<unsigned long long>(ec.warm_evictions()),
                         static_cast<unsigned long long>(ec.warm_rejects()));
     }
+    // The hybrid split, when it ran. Printed unconditionally once enabled: a
+    // split that moved nothing is exactly as informative as one that moved
+    // everything, and the point of the line is to say which experts went where
+    // without a second run to find out.
+    if (engine.hybrid_enabled()) {
+        HybridStats hs;
+        engine.hybrid_stats(&hs);
+        std::printf("hybrid experts host %llu expert(s) over %llu row(s) in %.1f ms "
+                    "(%.3f ms/expert) on %d thread(s); device took %llu\n",
+                    static_cast<unsigned long long>(hs.cpu_experts),
+                    static_cast<unsigned long long>(hs.cpu_rows), hs.cpu_ms,
+                    hs.cpu_experts ? hs.cpu_ms / static_cast<f64>(hs.cpu_experts)
+                                   : 0.0,
+                    hs.threads,
+                    static_cast<unsigned long long>(hs.gpu_experts));
+    }
     return 0;
 }
 
@@ -544,6 +667,10 @@ int main(int argc, char **argv) {
     cfg.kv_warm_mb = a.kv_warm_mb;
     cfg.kv_cold_dir = a.kv_cold_dir;
     cfg.expert_warm_prefetch = a.expert_warm_prefetch;
+    cfg.hybrid_experts = a.hybrid_experts;
+    cfg.hybrid_threads = a.hybrid_threads;
+    cfg.hybrid_max_rows = a.hybrid_max_rows;
+    cfg.hybrid_frac = static_cast<f32>(a.hybrid_frac);
 
     ph.mark("backend create");
     Engine engine;

@@ -29,6 +29,13 @@ struct Args {
     int expert_cache_mb = 0;
     int expert_cache_slots = 0;
     int expert_warm_mb = -1; // WARM expert cache (MiB): <0 auto, 0 off
+    // Hybrid CPU + GPU expert compute: non-resident experts run on the host out
+    // of the mapping while the device runs the resident ones (see
+    // EngineConfig::hybrid_experts). Same split the CLI exposes.
+    bool hybrid_experts = false;
+    int hybrid_threads = 0;
+    int hybrid_max_rows = 8;
+    double hybrid_frac = 1.0;
     std::string draft;
     int draft_tokens = 4;
     bool cpu = false;
@@ -50,6 +57,11 @@ void usage() {
         "  --expert-cache-slots N  cap resident (layer, expert) slots\n"
         "  --expert-warm-mb N     WARM expert cache in pageable host RAM (MiB;\n"
         "                        <0 auto, 0 off); --expert-l2-mb also accepted\n"
+        "  --hybrid-experts 1    compute non-resident experts on the host while the\n"
+        "                        device runs the resident ones (frees VRAM and RAM)\n"
+        "  --hybrid-threads N     host threads for that split (0 = min(hw, 8))\n"
+        "  --hybrid-max-rows N    widest row count the host arm runs at (default 8)\n"
+        "  --hybrid-frac F        share (0..1) of the resident set forced to the host\n"
         "  --draft MODEL         draft model for greedy speculative decoding\n"
         "  --draft-tokens N      speculation window (default 4)\n"
         "  --cpu                 use the scalar reference backend\n"
@@ -81,6 +93,14 @@ bool parse(int argc, char **argv, Args *a) {
             a->expert_cache_slots = std::atoi(next("--expert-cache-slots"));
         else if (f == "--expert-warm-mb" || f == "--expert-l2-mb")
             a->expert_warm_mb = std::atoi(next("--expert-warm-mb"));
+        else if (f == "--hybrid-experts")
+            a->hybrid_experts = std::atoi(next("--hybrid-experts")) != 0;
+        else if (f == "--hybrid-threads")
+            a->hybrid_threads = std::atoi(next("--hybrid-threads"));
+        else if (f == "--hybrid-max-rows")
+            a->hybrid_max_rows = std::atoi(next("--hybrid-max-rows"));
+        else if (f == "--hybrid-frac")
+            a->hybrid_frac = std::atof(next("--hybrid-frac"));
         else if (f == "--draft") a->draft = next("--draft");
         else if (f == "--draft-tokens") a->draft_tokens = std::atoi(next("--draft-tokens"));
         else if (f == "--cpu") a->cpu = true;
@@ -126,6 +146,10 @@ int main(int argc, char **argv) {
     cfg.expert_cache_mb = a.expert_cache_mb;
     cfg.expert_cache_slots = a.expert_cache_slots;
     cfg.expert_warm_mb = a.expert_warm_mb;
+    cfg.hybrid_experts = a.hybrid_experts;
+    cfg.hybrid_threads = a.hybrid_threads;
+    cfg.hybrid_max_rows = a.hybrid_max_rows;
+    cfg.hybrid_frac = static_cast<f32>(a.hybrid_frac);
 
     Engine engine;
     if (!engine.init(be, cfg, &err)) {

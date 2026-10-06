@@ -116,6 +116,13 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.n_ctx_train =
         static_cast<i32>(gguf_.get_i64(key(".context_length"), 2048));
     cfg_.head_dim = static_cast<i32>(gguf_.get_i64(key(".attention.key_length"), 0));
+    // Whether the file states the head width itself or has to be inferred
+    // from the embedding. A file that states it need not satisfy the
+    // n_embd/n_head identity at all: Qwen3.5's gated attention runs 24 heads
+    // of 256 dims over a 5120-wide embedding, because q_proj is 2*n_head*d
+    // (12288) -- it emits the query gate alongside the query. The identity is
+    // only a model promise in the inferred case, so only that case is checked.
+    const bool head_dim_declared = cfg_.head_dim > 0;
     if (cfg_.head_dim == 0 && cfg_.n_head > 0)
         cfg_.head_dim = cfg_.n_embd / cfg_.n_head;
     cfg_.rms_eps =
@@ -290,7 +297,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // which is not a whole number of heads' worth of embedding at all. head_dim
     // is declared in the file (`attention.key_length`) and is what the loader
     // and the kernels actually use, so only check the identity when there is a
-    // single head count for it to hold for.
+    // single head count for it to hold for, and it is not a promise a file
+    // that declares `attention.key_length` makes either.
     // Both of these are integer divisions on values that come straight from the
     // file, so a zero has to be refused rather than divided by: the kernel took
     // SIGFPE here, core dumped, before reading a single tensor, on any model
@@ -300,7 +308,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         if (err) *err = "model declares no attention head count";
         return false;
     }
-    if (cfg_.n_head_layer.empty() && cfg_.n_embd % cfg_.n_head != 0) {
+    if (cfg_.n_head_layer.empty() && !head_dim_declared &&
+        cfg_.n_embd % cfg_.n_head != 0) {
         if (err) *err = "n_embd is not divisible by head count";
         return false;
     }

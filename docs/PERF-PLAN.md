@@ -289,11 +289,18 @@ n_split == 1 at its context, as intended).
 The lane layout was already correct and needed no work: lanes cover channels,
 so a warp's KV read is contiguous.
 
-### B6 — Prefill is 95% attention — OPEN, kernel written but NOT correct
+### B6 — Prefill is 95% attention — FIXED by query tiling, shipped
 
-**Status: blocked.** The diagnosis is solid; the kernel that fixes it is fast but
-wrong, so it is **opt-in only** (`KRK_ATTN_QTILE=1`) and the shipped prefill is
-still the per-token tiled kernel.
+**Status: closed.** The tiled kernel is the prefill default. The text here used
+to call it "fast but wrong" and keep it opt-in; that was measured wrong.
+The bug is fixed: the old default kernel had a shared-memory race (one f32 score
+row per query overwritten with exp(x) before neighbours had read it), now
+corrected — the probe sweep reports 0 bad elements everywhere, worst residual
+1.2e-4 from fp16 summation order. It is byte-identical to the one-query kernel
+(md5 match) at an 801-token and a 900-token prompt on Qwen3-8B, and
+interleaved on/off over 5 reps each: **581.5 vs 420.9 tok/s prefill, +38%**,
+the two arms not overlapping.
+`KRK_ATTN_QTILE=0` restores the per-token path for A/B.
 
 Diagnosis (`--profile`, 0.8B, 2048-token chunk): 577,373 us across 6 `attention`
 calls = 96.2 ms/call, vs 18.1 ms for 186 `gemm(wmma)` calls. The score math is

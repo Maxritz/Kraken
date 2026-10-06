@@ -2,7 +2,7 @@
 
 Everything here is about the **device** half of KRAKEN. The host half (GGUF
 reader, quantizers, tokenizer, sampler, model loader, forward pass, CPU
-backend) is already proven: `kraken-tests` is 479/479, and the CPU backend is
+backend) is already proven: `kraken-tests` is 2329/2329, and the CPU backend is
 the **oracle** every device build is checked against. Work top to bottom. Each
 step is "done" when its pass criterion is met — not when it compiles.
 

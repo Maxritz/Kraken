@@ -225,6 +225,24 @@ public:
     // threshold proves the slot is unpinned.
     u32 touch_count(i32 layer, i32 expert) const;
 
+    // Residency queries, for a caller that has to decide what to do with an
+    // expert BEFORE acquire() runs. acquire() promotes, and the hybrid
+    // CPU+GPU expert path exists precisely to not promote the experts the host
+    // is about to compute, so asking after the fact is asking too late.
+    // Neither call changes residency, touches a counter or moves a byte.
+    bool in_vram(i32 layer, i32 expert) const;
+    bool in_host(i32 layer, i32 expert) const;
+
+    // True when promoting one more expert of `src` would have to evict
+    // something, i.e. the device tier is already full. The hybrid CPU+GPU path
+    // uses it to take the OVERFLOW only: with a budget that holds the whole
+    // routed set every expert keeps arriving through the normal path and the
+    // host arm stays idle, which is the intent. Measured the other way first --
+    // hybrid taking every miss -- and it read 6.4 tok/s against 99.3, because
+    // an expert that is never promoted never becomes resident, so a budget that
+    // could hold the entire set stayed cold forever.
+    bool full_for(const ExpertSource &src) const;
+
 private:
     struct Slot {
         i32 layer = -1;

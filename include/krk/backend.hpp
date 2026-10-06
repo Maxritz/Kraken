@@ -361,6 +361,21 @@ public:
     // a += b  (activation elementwise)
     virtual void add_inplace(void *a, const void *b, i64 n) = 0;
 
+    // out[rows, n] = rmsnorm(x[rows, n] + res[rows, n]) * w[n], leaving x
+    // holding the sum.
+    //
+    // A layer ends each sub-block with a residual add and begins the next
+    // by normalizing the result, so the add writes a buffer the norm reads
+    // straight back. One launch instead of two. The default below is
+    // exactly those two calls in order, so a backend that does not
+    // override it behaves identically to one that never had the fused
+    // path at all.
+    virtual void add_rmsnorm(void *out, void *x, const void *res,
+                             const f32 *w, i64 rows, i64 n, f32 eps) {
+        add_inplace(x, res, rows * n);
+        rmsnorm(out, x, w, rows, n, eps);
+    }
+
     // dst <- src, n activation elements
     virtual void copy_act(void *dst, const void *src, i64 n) = 0;
 

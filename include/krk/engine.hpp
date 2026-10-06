@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "krk/backend.hpp"
+#include "krk/expert_cpu.hpp"
 #include "krk/kv_tier.hpp"
 #include "krk/model.hpp"
 #include "krk/sampler.hpp"
@@ -69,6 +70,46 @@ struct EngineConfig {
     // every host tier inside the process. The mapping and the dense trunk sit
     // outside it, which is what the reserve is for.
     i32 host_ram_mb = 0;
+
+    // ---- hybrid CPU + GPU expert compute --------------------------------
+    //
+    // In an MoE the expert weights, not the activations, are what has to move:
+    // one decode token routes k experts per layer, one activation row is 8 KiB,
+    // and one expert's three slices are ~1.95 MiB on a model like laguna. So an
+    // expert that is NOT resident in VRAM is far cheaper to compute where its
+    // bytes already are -- the mapping -- than to read in and promote. When this
+    // is on, an expert that would have been a miss is computed on the host by
+    // CpuExpertPool while the device runs the experts that ARE resident, and the
+    // two partial sums are merged.
+    //
+    // It is a decode optimization and it is deliberately bounded to a small row
+    // count: the merge is two [n, n_embd] transfers per layer, the host cost
+    // scales with the rows an expert carries, and at prefill widths the second
+    // of those dominates whatever the split saved. Combined with a small
+    // --expert-cache-mb it is also the lever that frees VRAM and host RAM: the
+    // experts the host computes need no resident copy in either tier.
+    bool hybrid_experts = false;
+    // Host worker threads for that split. 0 = min(hardware, 8).
+    i32 hybrid_threads = 0;
+    // Widest row count the host arm runs at. 0 disables the row bound.
+    i32 hybrid_max_rows = 8;
+    // Fraction (0..1) of the RESIDENT experts to force onto the host anyway.
+    // 1.0 (the default) leaves every resident expert on the device, which is
+    // the policy; anything less is the A/B knob that sweeps the CPU/GPU balance
+    // at a fixed cache size.
+    f32 hybrid_frac = 1.0f;
+};
+
+// Hybrid CPU+GPU expert-compute telemetry. The split is only interesting if you
+// can see how it landed: how many experts each arm took, how many rows the host
+// carried, and the wall time the host arm cost. Read by the end-of-run [stats]
+// line and by --profile (which also gets it as the "moe.cpu_experts" host span).
+struct HybridStats {
+    i32 threads = 0;
+    u64 cpu_experts = 0;
+    u64 gpu_experts = 0;
+    u64 cpu_rows = 0;
+    f64 cpu_ms = 0.0;
 };
 
 struct StreamSink {
@@ -189,6 +230,39 @@ public:
     u64 draft_proposed() const { return draft_proposed_; }
     u64 draft_accepted() const { return draft_accepted_; }
     u64 spec_steps() const { return spec_steps_; }
+
+    // KV tier telemetry, summed over the K and V planes. The counters existed
+    // in KvTierCache but nothing read them after startup, so a run could page
+    // the whole cache through WARM and COLD and report nothing about it. This
+    // is what the end-of-run [stats] line is built from.
+    void kv_tier_stats(KvTierStats *out) const {
+        KvTierStats a, b;
+        kvt_k_.stats(&a);
+        kvt_v_.stats(&b);
+        out->tiered = a.tiered || b.tiered;
+        out->layers = a.layers;
+        out->hot = a.hot;
+        out->warm = a.warm;
+        out->cold = a.cold;
+        out->slots = a.slots;
+        out->hot_bytes = a.hot_bytes;
+        out->layer_bytes = a.layer_bytes;
+        out->promotions_from_warm = a.promotions_from_warm + b.promotions_from_warm;
+        out->promotions_from_cold = a.promotions_from_cold + b.promotions_from_cold;
+        out->evictions_to_warm = a.evictions_to_warm + b.evictions_to_warm;
+        out->evictions_to_cold = a.evictions_to_cold + b.evictions_to_cold;
+        out->migrate_bytes = a.migrate_bytes + b.migrate_bytes;
+    }
+
+    // Hybrid CPU + GPU expert compute (see EngineConfig::hybrid_experts).
+    bool hybrid_enabled() const { return hybrid_on_; }
+    void hybrid_stats(HybridStats *out) const {
+        out->threads = hybrid_threads_live_;
+        out->cpu_experts = hy_cpu_experts_;
+        out->gpu_experts = hy_gpu_experts_;
+        out->cpu_rows = hy_cpu_rows_;
+        out->cpu_ms = hy_cpu_ms_;
+    }
 
     const Model &model() const { return model_; }
     const Tokenizer &tokenizer() const { return tok_; }
@@ -374,6 +448,39 @@ private:
     std::vector<f32> moe_wt_;     // [chunk, k] renormalized gate weight
     std::vector<i32> group_rows_; // [<=chunk] token ids in the current group
     std::vector<f32> group_wt_;   // [<=chunk] their gate weights
+
+    // ---- hybrid CPU + GPU expert compute (EngineConfig::hybrid_experts) --
+    //
+    // All host-side. hy_xn_ is the activation the host arm reads (downloaded
+    // from ws_xn_ exactly once per layer), hy_out_ is what CpuExpertPool
+    // accumulates into, and hy_ffn_/hy_f16_ are the merge scratch: the device's
+    // ws_ffn_ comes down, the host contribution is added, and the result goes
+    // back up as f16. No device buffer is added, so turning this on cannot cost
+    // VRAM -- which is the whole point, since the VRAM it frees has to go to the
+    // KV cache.
+    //
+    // hy_job_rows_/hy_job_wt_ are the flattened per-expert row lists a Job
+    // points into. They are RESERVED to n * k before anything is written into
+    // them: every (token, slot) pair contributes at most one row per expert, so
+    // that reserve is an upper bound and no push_back can reallocate a buffer a
+    // Job already holds a pointer to.
+    bool hybrid_on_ = false;
+    i32 hybrid_threads_ = 0;
+    i32 hybrid_max_rows_ = 8;
+    i32 hybrid_frac_permille_ = 1000;
+    i32 hybrid_threads_live_ = 0;
+    u64 hy_cpu_experts_ = 0;
+    u64 hy_gpu_experts_ = 0;
+    u64 hy_cpu_rows_ = 0;
+    f64 hy_cpu_ms_ = 0.0;
+    std::vector<u8> hy_take_;                 // [n_expert] 1 => host computes it
+    std::vector<CpuExpertPool::Job> hy_jobs_; // the host arm's work list
+    std::vector<i32> hy_job_rows_;
+    std::vector<f32> hy_job_wt_;
+    std::vector<f32> hy_xn_;
+    std::vector<f32> hy_out_;
+    std::vector<f32> hy_ffn_;
+    std::vector<u16> hy_f16_;
 
     // ---- expert routing scan (--expert-scan) ----------------------------
     //

@@ -3,6 +3,7 @@
 #include "krk/engine.hpp"
 #include "krk/arch.hpp"
 #include "krk/dflash.hpp"
+#include "krk/host_time.hpp"
 #include "par_pool.hpp"
 
 #include <algorithm>
@@ -354,6 +355,31 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         plan_dev_.reserve(static_cast<size_t>(C));
         alpha_dev_.reserve(static_cast<size_t>(C));
     }
+
+    // Hybrid CPU + GPU expert compute. Resolved once, here, so the per-layer
+    // path is a bool test and the worker team is created before the first
+    // forward pass instead of on the first decode step.
+    //
+    // HIP only, and MoE only: on the CPU backend there is no second processor to
+    // split with, and on a dense model there are no expert tensors to split.
+    hybrid_on_ = cfg_.hybrid_experts && mc.is_moe && mc.n_expert > 0 &&
+                 be_->kind() == BackendKind::HIP;
+    if (hybrid_on_) {
+        hybrid_threads_ = cfg_.hybrid_threads;
+        // 0 means "no row bound"; storing a sentinel keeps the per-layer test a
+        // plain comparison instead of a branch on the configuration.
+        hybrid_max_rows_ = cfg_.hybrid_max_rows > 0 ? cfg_.hybrid_max_rows : (1 << 20);
+        f32 frac = cfg_.hybrid_frac;
+        if (!(frac >= 0.0f)) frac = 1.0f; // also catches NaN
+        if (frac > 1.0f) frac = 1.0f;
+        hybrid_frac_permille_ = static_cast<i32>(frac * 1000.0f + 0.5f);
+        CpuExpertPool &pool = CpuExpertPool::get();
+        pool.set_threads(cfg_.hybrid_threads);
+        hybrid_threads_live_ = pool.threads();
+        KRK_INFO("hybrid experts: host arm on %d thread(s), rows <= %d, "
+                 "%d/1000 of the resident set forced to the host",
+                 hybrid_threads_live_, hybrid_max_rows_, hybrid_frac_permille_);
+    }
     configure_expert_cache();
     // KV residency -- allocated LAST, after the weights and every workspace.
     //
@@ -374,8 +400,19 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         const size_t free_vram = be_->device_free_bytes();
         const size_t reserve = std::max<size_t>(256u * 1048576u, free_vram / 8u);
 
+        // The CPU backend has no device/host split -- every byte is the same
+        // host RAM -- so a tier budget is meaningless there, and a 0-byte HOT
+        // budget is worse than meaningless: it pages the whole cache through
+        // WARM once per layer per step and prints a warning telling the user to
+        // raise --kv-hot-mb, which cannot help. Measured on the 27B Bonsai,
+        // 64 layers: 4951 ms/step tiered against 27 ms for the same model on
+        // the device. Handing the "device" budget the whole cache makes the
+        // tier inert and the cache one flat allocation, which is what a run
+        // whose cache fits does on the GPU too.
         size_t hot;
-        if (cfg_.kv_hot_mb > 0) {
+        if (be_->kind() == BackendKind::CPU) {
+            hot = kv_total;
+        } else if (cfg_.kv_hot_mb > 0) {
             hot = static_cast<size_t>(cfg_.kv_hot_mb) * 1048576u;
             // An explicit budget can still be larger than the card. Clamp it
             // to what is actually there, or init() over-commits on request.
@@ -711,10 +748,15 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
 
         be_->gemm(ws_x2_, ws_attn_, L.wo.data, L.wo.type, n_embd_, lq, n);
         dump_row("attn.proj", l, ws_x2_, n_embd_, n);
-        be_->add_inplace(ws_x_, ws_x2_, n * n_embd_);
+        // The attention residual and the FFN norm are one kernel: the sum is
+        // what the norm's sum-of-squares pass reads, so a second launch
+        // round-trips the activation row for nothing. The dump still sees the
+        // post-add state, because the fused kernel writes x before it
+        // normalizes.
+        be_->add_rmsnorm(ws_xn_, ws_x_, ws_x2_, L.ffn_norm, n, n_embd_,
+                         mc.rms_eps);
         dump_row("attn.res", l, ws_x_, n_embd_, n);
 
-        be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps);
         dump_row("attn.ffnn", l, ws_xn_, n_embd_, n);
         if (L.moe) {
             moe_ffn(L, l, n);
@@ -1487,6 +1529,74 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // the residual is missing, which is what makes the list approximate.
         if (expert_stub_) expert_stubbed_ran_ = true;
 
+        // ---- hybrid CPU + GPU expert compute: who computes what ------------
+        //
+        // The split is decided per (layer, expert), from residency, BEFORE any
+        // acquire() runs. acquire() promotes, and the entire point is not to
+        // promote the experts the host is about to compute: a resident expert
+        // stays on the device because its bytes are already there, and an expert
+        // that would have been a read + a promotion is computed where its bytes
+        // already are instead -- the mapping. For one decode row that trades a
+        // ~1.95 MiB weight move for an 8 KiB activation move, and it costs no
+        // VRAM and no WARM RAM for the experts it takes, which is what frees
+        // room for the KV cache.
+        //
+        // The shape gate mirrors CpuExpertPool::run's own rejection: a bank the
+        // host cannot walk must not be classified for the host, because the
+        // alternative to computing an expert is not losing it silently.
+        const bool hybrid =
+            hybrid_on_ && !expert_stub_ && k > 0 && n <= hybrid_max_rows_ &&
+            L.experts.present() && L.experts.n_expert == ne &&
+            L.experts.n_embd == n_embd_ && L.experts.n_ff_exp > 0 &&
+            L.experts.gate->n_dims == 3 && L.experts.up->n_dims == 3 &&
+            L.experts.down->n_dims == 3 &&
+            L.experts.up->type == L.experts.gate->type &&
+            L.experts.down->type == L.experts.gate->type &&
+            static_cast<i64>(L.experts.gate->ne[0]) == n_embd_ &&
+            static_cast<i64>(L.experts.gate->ne[1]) == L.experts.n_ff_exp &&
+            static_cast<i64>(L.experts.down->ne[0]) == L.experts.n_ff_exp &&
+            static_cast<i64>(L.experts.down->ne[1]) == n_embd_ &&
+            dtype_row_aligned(L.experts.gate->type, n_embd_) &&
+            dtype_row_aligned(L.experts.gate->type, L.experts.n_ff_exp);
+        i32 n_cpu_experts = 0;
+        if (hybrid) {
+            hy_take_.assign(static_cast<size_t>(ne), 0);
+            const ExpertCache &ec = model_.experts();
+            for (i32 e = 0; e < ne; e++) {
+                bool routed = false;
+                for (i32 t = 0; t < n && !routed; t++) {
+                    const i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
+                    for (i32 s = 0; s < k; s++)
+                        if (sel[s] == e) { routed = true; break; }
+                }
+                if (!routed) continue;
+                // The host arm takes the OVERFLOW, not every miss: a miss the
+                // device tier can still afford is promoted exactly as it always
+                // was, so a budget large enough for the routed set keeps every
+                // expert resident and the host arm never runs. Taking every
+                // miss instead is a livelock the first measurement showed -- an
+                // expert that is never promoted never becomes resident, so the
+                // cache stayed at 55/104 of a budget that could have held all of
+                // it and decode fell from 99.3 to 6.4 tok/s.
+                bool cpu = !ec.in_vram(layer, e) && ec.full_for(L.experts);
+                // A deterministic share of the resident set can be forced to
+                // the host as well, which is how the two arms are swept against
+                // each other at a fixed cache size (--hybrid-frac). The hash is
+                // over (layer, expert) and not a counter, so the same experts
+                // move together layer after layer.
+                if (!cpu && hybrid_frac_permille_ < 1000) {
+                    const u32 hsh = static_cast<u32>(layer) * 2654435761u +
+                                    static_cast<u32>(e) * 40503u;
+                    if (static_cast<int>(hsh % 1000u) < hybrid_frac_permille_)
+                        cpu = true;
+                }
+                if (cpu) {
+                    hy_take_[static_cast<size_t>(e)] = 1;
+                    n_cpu_experts++;
+                }
+            }
+        }
+
         // One batched WARM read for the whole routed set before the per-expert
         // loop starts. Each acquire() below otherwise issues its three slices
         // one at a time through a single file handle -- queue depth 1, which on
@@ -1502,6 +1612,12 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                     const i32 e = sel[s];
                     if (e < 0 || e >= ne || prefetch_seen_[static_cast<size_t>(e)])
                         continue;
+                    // An expert the host arm owns is read out of the mapping by
+                    // the host, so staging it into WARM would be a second read
+                    // of the same bytes AND a resident buffer for something that
+                    // already has a home. Leaving it out is half of the RAM this
+                    // feature gives back.
+                    if (hybrid && hy_take_[static_cast<size_t>(e)]) continue;
                     prefetch_seen_[static_cast<size_t>(e)] = 1;
                     prefetch_ids_.push_back(e);
                 }
@@ -1513,6 +1629,9 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         }
 
         for (i32 e = 0; !expert_stub_ && e < ne; e++) {
+            // The host arm owns this expert on this layer. Skipping it here is
+            // what leaves its weights absent from both tiers.
+            if (hybrid && hy_take_[static_cast<size_t>(e)]) continue;
             group_rows_.clear();
             group_wt_.clear();
             for (i32 t = 0; t < n; t++) {
@@ -1532,6 +1651,7 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             const ResidentExpert *re = model_.experts().acquire(L.experts, layer, e);
             if (!re) continue;
             if (sync_expert()) be_->sync();
+            if (hybrid) hy_gpu_experts_++;
 
             const i64 m = static_cast<i64>(group_rows_.size());
             plan_dev_.assign(group_rows_.begin(), group_rows_.end());
@@ -1553,6 +1673,92 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // Scatter back to the original rows, weighted by the gate.
             be_->scatter_axpy_rows(ws_ffn_, ws_x2_, static_cast<const i32 *>(ws_plan_),
                                    static_cast<const f32 *>(ws_alpha_), m, n_embd_);
+        }
+
+        // ---- the host arm --------------------------------------------------
+        //
+        // Issued AFTER the device loop, and that is the overlap, not a miss:
+        // every gemm and scatter above only *queued* work, so the device is
+        // already running when this block starts. The host pool then works while
+        // the device works, and the sync at the merge is nearly free precisely
+        // because the host cost is what the device would otherwise have spent
+        // its time waiting out. Nothing on the host arm is issued with an
+        // acquire(), so no expert here is promoted and no WARM copy is made.
+        if (hybrid && n_cpu_experts > 0) {
+            const size_t cells =
+                static_cast<size_t>(n) * static_cast<size_t>(n_embd_);
+            hy_xn_.resize(cells);
+            hy_out_.assign(cells, 0.0f);
+            // The activation the host arm reads, widened from the f16 the device
+            // holds: download_f32 converts without changing the values, so the
+            // host computes against exactly the numbers the device would have.
+            be_->download_f32(hy_xn_.data(), ws_xn_, static_cast<i64>(cells));
+
+            hy_jobs_.clear();
+            hy_job_rows_.clear();
+            hy_job_wt_.clear();
+            // Reserve the upper bound before taking any pointer into these: each
+            // (token, slot) pair yields at most one row for one expert, so n * k
+            // covers the whole routed set and no push_back below can reallocate
+            // a buffer a Job already points into.
+            const size_t pairs = static_cast<size_t>(n) * static_cast<size_t>(k);
+            hy_job_rows_.reserve(pairs);
+            hy_job_wt_.reserve(pairs);
+            hy_jobs_.reserve(static_cast<size_t>(n_cpu_experts));
+            for (i32 e = 0; e < ne; e++) {
+                if (!hy_take_[static_cast<size_t>(e)]) continue;
+                const size_t first = hy_job_rows_.size();
+                for (i32 t = 0; t < n; t++) {
+                    const i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
+                    const f32 *wt = moe_wt_.data() + static_cast<size_t>(t) * k;
+                    for (i32 s = 0; s < k; s++) {
+                        if (sel[s] != e) continue;
+                        hy_job_rows_.push_back(t);
+                        hy_job_wt_.push_back(wt[s]);
+                    }
+                }
+                if (hy_job_rows_.size() == first) continue;
+                CpuExpertPool::Job job;
+                job.expert = e;
+                job.rows = hy_job_rows_.data() + first;
+                job.alpha = hy_job_wt_.data() + first;
+                job.m = static_cast<i32>(hy_job_rows_.size() - first);
+                hy_jobs_.push_back(job);
+            }
+
+            if (!hy_jobs_.empty()) {
+                CpuExpertPool &pool = CpuExpertPool::get();
+                i32 done = 0;
+                {
+                    KRK_TIME_HOST("moe.cpu_experts");
+                    done = pool.run(L.experts, layer, hy_jobs_.data(),
+                                    static_cast<i32>(hy_jobs_.size()),
+                                    hy_xn_.data(), n, n_embd_, hy_out_.data());
+                }
+                if (done != static_cast<i32>(hy_jobs_.size())) {
+                    // A dropped expert is a wrong answer, not a slow one. Say so
+                    // rather than merging a partial sum as if it were complete.
+                    KRK_WARN("hybrid experts: host arm computed %d of %d expert(s) "
+                             "on layer %d",
+                             done, static_cast<i32>(hy_jobs_.size()), layer);
+                }
+                hy_cpu_experts_ += static_cast<u64>(done > 0 ? done : 0);
+                hy_cpu_rows_ += static_cast<u64>(hy_job_rows_.size());
+                hy_cpu_ms_ += pool.last_ms();
+
+                // Merge. ws_ffn_ already holds the device experts' contribution;
+                // the host contribution is added to it and the sum goes back as
+                // f16, which is the accumulator's own type. No device buffer is
+                // added, so this costs no VRAM -- which matters, because the
+                // VRAM this feature gives back is the point.
+                be_->sync();
+                hy_ffn_.resize(cells);
+                hy_f16_.resize(cells);
+                be_->download_f32(hy_ffn_.data(), ws_ffn_, static_cast<i64>(cells));
+                for (size_t i = 0; i < cells; i++)
+                    hy_f16_[i] = fp32_to_fp16(hy_ffn_[i] + hy_out_[i]);
+                be_->upload(ws_ffn_, hy_f16_.data(), cells * sizeof(u16));
+            }
         }
     }
 
@@ -1611,7 +1817,12 @@ bool Engine::topk_argmax(i32 *out) {
     // replacing. Only the device path can win, and it wins by not moving data.
     if (!be_ || be_->kind() == BackendKind::CPU || topk_scratch_ == nullptr)
         return false;
-    be_->sync();
+    // No leading sync. This used to drain the whole device before the launch,
+    // which is a stall the stream already prevents: ws_logits_ was written by
+    // the head's gemm and logits_topk reads it, both on the default stream, so
+    // ordering is guaranteed without stopping the queue. It cost a full device
+    // idle per token -- 8.5% of an 11.3 ms step on the 8B -- and it is
+    // invisible in the output.
     char *zone = static_cast<char *>(topk_out_);
     be_->logits_topk(ws_logits_, n_vocab_, kTopK, nullptr, 1.0f,
                      model_.cfg().logit_softcap, 1.0f,
@@ -1653,7 +1864,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         draft.forward(ids.data() + i, n, static_cast<i32>(i), last);
     }
     fetch_logits();
-    draft.fetch_logits();
+    draft.fetch_logits(true);
     *prefill_ms = prefill_timer.ms();
 
     Sampler sampler;
@@ -1678,6 +1889,10 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
     //   target KV holds [0, pos), logits_host_ predicts position pos
     //   draft  KV holds [0, pos), draft logits predict position pos
     while (res->generated < p.max_tokens && pos < kv_cap_) {
+        // One speculation round, wall to wall: propose, pre-check, verify,
+        // emit. The device op table cannot delimit this because a round is
+        // several ops plus host work between them.
+        KRK_TIME_HOST("spec.round");
         if (p.debug_topk > 0)
             dump_topk(p.debug_topk, res->generated, pos, logits_host_, n_vocab_);
         const i32 first = argmax_of(logits_host_, n_vocab_);
@@ -1687,7 +1902,12 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         // argmax would read stale values and the chain would repeat one token.
         i32 d = 0;
         while (d < k) {
-            const i32 t = argmax_of(draft.logits_host_, n_vocab_);
+            // Prefer the draft's own device top-k. The host row is a fallback
+            // for the CPU backend and for a truncated cut, and reading it was
+            // never free: fetch_logits(false) moves the whole row, which at
+            // 151936 vocab is 993 kB per proposal, k times a round.
+            const i32 t = draft.topk_valid_ ? draft.topk_id_
+                                            : argmax_of(draft.logits_host_, n_vocab_);
             if (t == tok_.eos()) break; // the target confirms EOS itself
             prop[static_cast<size_t>(d)] = t;
             d++;
@@ -1698,9 +1918,14 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
             if (d >= k || pos + d >= kv_cap_ || pos + d >= draft.kv_capacity())
                 break;
             draft.forward(&t, 1, static_cast<i32>(pos + d - 1), true);
-            draft.fetch_logits();
+            draft.fetch_logits(true);
         }
         spec_steps_++;
+        // One speculation round is this loop's unit of work, and it is the
+        // only thing decode_ms covers here. Without this the timer was
+        // reported against zero steps and every speculative run printed
+        // "0.0 tok/s" no matter how fast it was.
+        timed_decode_steps++;
 
         // ---- pre-check: does the target agree with the first proposal? ----
         // This is the same test plain decode performs; on failure the round
@@ -1722,7 +1947,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
             // feed the accepted token AT pos-1 (its natural KV slot).
             draft.kv_rollback(pos - 1);
             draft.forward(&first, 1, static_cast<i32>(pos - 1), true);
-            draft.fetch_logits();
+            draft.fetch_logits(true);
             continue;
         }
 
@@ -1741,16 +1966,27 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         // each row is downloaded before the next overwrites it. (Sizing
         // ws_logits_ for the whole block would also work; per-row keeps the
         // workspace independent of the speculation window.)
+        // One argmax per verified row, taken on the device. Downloading each row
+        // to argmax it on the host moved d_eff * n_vocab floats per round --
+        // 993 kB per proposal at 151936 vocab -- for one integer. The device
+        // top-k returns that integer in 16 bytes. row_ids[j-1] is row_pred(j),
+        // which is 1-based like every call site below.
+        std::vector<i32> row_ids(static_cast<size_t>(d_eff), 0);
         for (i32 j = 0; j < d_eff; j++) {
             head_compute(j);
-            be_->sync();
-            be_->download_f32(rows.data() + static_cast<size_t>(j) * n_vocab_,
-                              ws_logits_, n_vocab_);
+            i32 id = 0;
+            if (!topk_argmax(&id)) {
+                // CPU backend, or a cut too wide to trust: fall back to the row.
+                be_->sync();
+                be_->download_f32(rows.data() + static_cast<size_t>(j) * n_vocab_,
+                                  ws_logits_, n_vocab_);
+                id = argmax_of(rows.data() + static_cast<size_t>(j) * n_vocab_,
+                               n_vocab_);
+            }
+            row_ids[static_cast<size_t>(j)] = id;
         }
         auto row_pred = [&](i32 j) { // argmax of block row j (1-based)
-            return argmax_of(rows.data() + static_cast<size_t>(j - 1) *
-                                                      static_cast<size_t>(n_vocab_),
-                             n_vocab_);
+            return row_ids[static_cast<size_t>(j - 1)];
         };
 
         // ---- accept the longest greedy-matching prefix ---------------------
@@ -1819,13 +2055,19 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         draft.forward(&last_tok, 1, static_cast<i32>(pos), true);
         draft.fetch_logits();
         // The target's logits must predict pos. After a full match they came
-        // from the bonus forward above; after a partial match the answer is
-        // block row `emitted` (1-based), already downloaded into rows[].
-        if (!full) {
-            std::memcpy(logits_host_,
-                        rows.data() + static_cast<size_t>(emitted - 1) *
-                                          static_cast<size_t>(n_vocab_),
-                        static_cast<size_t>(n_vocab_) * sizeof(f32));
+        // from the bonus forward above. After a partial match they are block row
+        // `emitted` (1-based), and that row is NO LONGER sitting in rows[]: its
+        // argmax is now taken on the device, so nothing downloads the whole
+        // block any more. Recompute and download that single row instead. The
+        // block's activations are still in ws_x_ on the partial path -- the
+        // bonus forward that would overwrite them runs only when `full` -- so
+        // this is one head gemm and one download where there used to be d_eff
+        // downloads of 993 kB each. Downloaded raw, exactly as the memcpy it
+        // replaces did: the softcap is monotone, so it cannot move an argmax.
+        if (!full && emitted >= 1) {
+            head_compute(emitted - 1);
+            be_->sync();
+            be_->download_f32(logits_host_, ws_logits_, n_vocab_);
         }
     }
 
@@ -1896,6 +2138,10 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
     // Invariant at the top of every round, identical to the model-draft path:
     // the target's KV holds [0, pos) and logits_host_ predicts pos.
     while (res->generated < p.max_tokens && pos < kv_cap_) {
+        // One speculation round, wall to wall: propose, pre-check, verify,
+        // emit. The device op table cannot delimit this because a round is
+        // several ops plus host work between them.
+        KRK_TIME_HOST("spec.round");
         if (p.debug_topk > 0)
             dump_topk(p.debug_topk, res->generated, pos, logits_host_, n_vocab_);
         const i32 first = argmax_of(logits_host_, n_vocab_);
@@ -1935,6 +2181,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
                           n_vocab_);
         draft_proposed_ += static_cast<u64>(d);
         spec_steps_++;
+        timed_decode_steps++;   // a speculation round is this loop's unit of work
 
         // ---- the same pre-check plain decode performs ---------------------
         // On disagreement the round costs exactly one plain step and the block
@@ -1965,16 +2212,23 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
         }
         forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone);
         kv_pos_ = pos + d_eff;
+        // Device argmax per verified row; see generate_speculative for why the
+        // full-row download was the cost.
+        std::vector<i32> row_ids(static_cast<size_t>(d_eff), 0);
         for (i32 j = 0; j < d_eff; j++) {
             head_compute(j);
-            be_->sync();
-            be_->download_f32(rows.data() + static_cast<size_t>(j) * n_vocab_,
-                              ws_logits_, n_vocab_);
+            i32 id = 0;
+            if (!topk_argmax(&id)) {
+                be_->sync();
+                be_->download_f32(rows.data() + static_cast<size_t>(j) * n_vocab_,
+                                  ws_logits_, n_vocab_);
+                id = argmax_of(rows.data() + static_cast<size_t>(j) * n_vocab_,
+                               n_vocab_);
+            }
+            row_ids[static_cast<size_t>(j)] = id;
         }
         auto row_pred = [&](i32 j) {
-            return argmax_of(rows.data() + static_cast<size_t>(j - 1) *
-                                               static_cast<size_t>(n_vocab_),
-                             n_vocab_);
+            return row_ids[static_cast<size_t>(j - 1)];
         };
 
         i32 a = 1;
@@ -2030,14 +2284,13 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             finish_run(FinishContext);
             return true;
         }
-        // The target's logits must predict pos. After a full match they came
-        // from the bonus forward above; after a partial match the answer is
-        // block row `emitted` (1-based), already downloaded into rows[].
-        if (!full)
-            std::memcpy(logits_host_,
-                        rows.data() + static_cast<size_t>(emitted - 1) *
-                                          static_cast<size_t>(n_vocab_),
-                        static_cast<size_t>(n_vocab_) * sizeof(f32));
+        // Row `emitted` (1-based) predicts pos; see generate_speculative for
+        // why it is recomputed rather than copied out of rows[].
+        if (!full && emitted >= 1) {
+            head_compute(emitted - 1);
+            be_->sync();
+            be_->download_f32(logits_host_, ws_logits_, n_vocab_);
+        }
     }
 
     finish_run(res->generated >= p.max_tokens ? FinishLength : FinishContext);
@@ -2106,6 +2359,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
+        KRK_TIME_HOST("prefill.chunk");
         forward(ids.data() + i, n, static_cast<i32>(i), last);
     }
     fetch_logits(device_topk);
@@ -2122,6 +2376,10 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     i64 timed_decode_steps = 0;
 
     for (i32 gen = 0; gen < p.max_tokens; gen++) {
+        // The whole step: host sampling, the forward, and the logits fetch.
+        // Under --profile this is where "the CPU is busy and the GPU is idle"
+        // is either visible or not.
+        KRK_TIME_HOST("decode.step");
         if (p.debug_topk > 0)
             dump_topk(p.debug_topk, gen, pos, logits_host_, n_vocab_);
         // The fast path hands back the argmax the device already computed.
@@ -2148,10 +2406,20 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         }
         const bool split = split_timing_enabled();
         auto t0 = std::chrono::steady_clock::now();
-        forward(&token, 1, static_cast<i32>(pos), true);
+        {
+            // Split so the host/device question has an answer under --profile:
+            // a step whose forward is small but whose decode.step is large is
+            // host-bound, and the gap between the two rows is host-side work
+            // the device table does not see.
+            KRK_TIME_HOST_N("decode.forward", hs_fwd);
+            forward(&token, 1, static_cast<i32>(pos), true);
+        }
         auto t1 = std::chrono::steady_clock::now();
         pos++;
-        fetch_logits(device_topk);
+        {
+            KRK_TIME_HOST_N("decode.fetch", hs_fetch);
+            fetch_logits(device_topk);
+        }
         timed_decode_steps++;
         if (split) {
             const auto t2 = std::chrono::steady_clock::now();

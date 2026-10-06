@@ -39,6 +39,7 @@
 #include "krk/arch.hpp"
 #include "krk/backend.hpp"
 #include "krk/engine.hpp"
+#include "krk/expert_cpu.hpp"
 #include "krk/gguf.hpp"
 #include "krk/http.hpp"
 #include "krk/json.hpp"
@@ -689,6 +690,244 @@ static void test_tq1_0_layout() {
     for (int i = 0; i < 256; i++)
         if (out[i] == 0.0f) exactly_zero++;
     CHECK(exactly_zero == 256, "TQ1_0 zero block is exactly zero, not merely small");
+}
+
+// ---------------------------------------------------------------------------
+// The IQ family and BitNet's Q1_0 / Q2_0 / Q2_0_64 (ggml ids
+// 17/18/19/21/22/29/41/42/48).
+// ---------------------------------------------------------------------------
+// Three separate things can be silently wrong in a new dequantizer, and each
+// gets its own check:
+//   * THE GEOMETRY. A wrong byte stride reads the *next* block and decodes
+//     fluent garbage, so values-per-block, bytes-per-block and row alignment
+//     are asserted against the reference's own sizeof(block_*) values.
+//   * THE VALUE MAPPING, for the two formats whose codes are short enough to
+//     write out by hand. Q1_0 is one bit (set -> +d, clear -> -d, and there is
+//     NO zero code) and Q2_0 is two bits (00 -> -d, 01 -> 0, 10 -> +d,
+//     11 -> +2d, the last step being +2 rather than a clamp). The expectations
+//     below are typed out, not produced by the decoder under test.
+//   * THE GROUP/INDEX MAPPING of the five grid formats. Their codebooks cannot
+//     be duplicated here without re-introducing the very transcription risk the
+//     shared tables exist to remove, so the mapping is pinned structurally: a
+//     change confined to one group's high-index byte must move exactly that
+//     group's decoded values and nothing outside them. That is what catches a
+//     chunk decoded at the wrong offset.
+// The codebooks themselves are diffed entry-by-entry against ggml-common.h
+// with a separate extractor (see docs/test-results.md); what lives here is the
+// wiring, and the device kernels are checked against these host decoders by the
+// model-level coherence run.
+
+struct QuantDiff {
+    int lo = -1;
+    int hi = -1;
+    int n = 0;
+};
+
+static QuantDiff diff_indices(const f32 *a, const f32 *b, int n) {
+    QuantDiff d;
+    for (int i = 0; i < n; i++) {
+        if (a[i] != b[i]) {
+            if (d.lo < 0) d.lo = i;
+            d.hi = i;
+            d.n++;
+        }
+    }
+    return d;
+}
+
+// Deterministic bytes, with the first two overwritten by d = 1.0 so the decoded
+// values are the codebooks themselves and a probe that changes a scale cannot
+// be masked by a zero delta.
+static void fill_probe_block(u8 *blk, size_t n, u32 seed) {
+    u32 s = seed;
+    for (size_t i = 0; i < n; i++) {
+        s = s * 1664525u + 1013904223u;
+        blk[i] = static_cast<u8>(s >> 24);
+    }
+    const u16 one = fp32_to_fp16(1.0f);
+    blk[0] = static_cast<u8>(one & 0xFF);
+    blk[1] = static_cast<u8>(one >> 8);
+}
+
+static void test_new_quant_geometry() {
+    struct RowSpec {
+        DType t;
+        const char *name;
+        int bytes;
+        int block;
+    };
+    // IQ3_XXS 98 = 2 + 3*256/8; IQ1_S 50 = 2 + 32 + 16; IQ3_S 110 =
+    // 2 + 64 + 8 + 32 + 4; IQ2_S 82 = 2 + 64 + 8 + 8; IQ1_M 56 = 32 + 16 + 8
+    // and has NO f16 d field at all; Q1_0 18 = 2 + 128/8; Q2_0 34 = 2 + 128/4;
+    // Q2_0_64 18 = 2 + 64/4. Q2_0 and Q2_0_64 share a code map, not a block.
+    const RowSpec rows[] = {
+        {DType::IQ3_XXS, "IQ3_XXS", 98, 256},
+        {DType::IQ1_S, "IQ1_S", 50, 256},
+        {DType::IQ3_S, "IQ3_S", 110, 256},
+        {DType::IQ2_S, "IQ2_S", 82, 256},
+        {DType::IQ1_M, "IQ1_M", 56, 256},
+        {DType::Q1_0, "Q1_0", 18, 128},
+        {DType::Q2_0, "Q2_0", 34, 128},
+        {DType::Q2_0_64, "Q2_0_64", 18, 64},
+    };
+    for (const RowSpec &r : rows) {
+        CHECK(dtype_supported(r.t), "the format is dequantizable");
+        CHECK(std::strcmp(dtype_name(r.t), r.name) == 0, "the format keeps its name");
+        CHECK(dtype_block_size(r.t) == r.block, "values per block");
+        CHECK(dtype_block_bytes(r.t) == r.bytes, "bytes per block");
+        CHECK(dtype_row_bytes(r.t, r.block) == static_cast<size_t>(r.bytes),
+              "one block is one row of that length");
+        CHECK(dtype_row_bytes(r.t, 3 * r.block) == static_cast<size_t>(3 * r.bytes),
+              "three blocks are three block strides");
+        CHECK(dtype_row_aligned(r.t, r.block), "a whole block is aligned");
+        CHECK(!dtype_row_aligned(r.t, 1), "a partial block is refused");
+    }
+    // The ids are ggml's on-disk values and must not move: the tensor type in
+    // the container is the only thing that says how to read the bytes.
+    CHECK(static_cast<int>(DType::IQ2_XS) == 17, "IQ2_XS keeps ggml id 17");
+    CHECK(static_cast<int>(DType::IQ3_XXS) == 18, "IQ3_XXS keeps ggml id 18");
+    CHECK(static_cast<int>(DType::IQ1_S) == 19, "IQ1_S keeps ggml id 19");
+    CHECK(static_cast<int>(DType::IQ3_S) == 21, "IQ3_S keeps ggml id 21");
+    CHECK(static_cast<int>(DType::IQ2_S) == 22, "IQ2_S keeps ggml id 22");
+    CHECK(static_cast<int>(DType::IQ1_M) == 29, "IQ1_M keeps ggml id 29");
+    CHECK(static_cast<int>(DType::Q1_0) == 41, "Q1_0 keeps ggml id 41");
+    CHECK(static_cast<int>(DType::Q2_0) == 42, "Q2_0 keeps ggml id 42");
+    CHECK(static_cast<int>(DType::Q2_0_64) == 48, "Q2_0_64 keeps fork id 48");
+}
+
+static void test_q1_0_layout() {
+    u8 blk[18];
+    const u16 one = fp32_to_fp16(1.0f);
+    blk[0] = static_cast<u8>(one & 0xFF);
+    blk[1] = static_cast<u8>(one >> 8);
+    for (int i = 0; i < 16; i++) blk[2 + i] = 0;
+    blk[2] = 0x01;   // value 0 is +d
+    blk[3] = 0x80;   // bit 7 of the second plane byte is value 15
+    f32 out[128];
+    dequant_row(DType::Q1_0, blk, out, 128);
+    CHECK_NEAR(out[0], 1.0f, 1e-6, "Q1_0: a set bit is +d");
+    CHECK_NEAR(out[1], -1.0f, 1e-6, "Q1_0: a clear bit is -d, not zero");
+    CHECK_NEAR(out[15], 1.0f, 1e-6, "Q1_0: bit 7 of plane byte 1 is value 15");
+    CHECK_NEAR(out[16], -1.0f, 1e-6, "Q1_0: plane byte 2 starts at value 16");
+    CHECK_NEAR(out[127], -1.0f, 1e-6, "Q1_0: 128 values come from one block");
+    int plus = 0;
+    for (int i = 0; i < 128; i++) if (out[i] > 0) plus++;
+    CHECK(plus == 2, "Q1_0: exactly the two set bits are +d");
+    const u16 neg = fp32_to_fp16(-1.0f);
+    blk[0] = static_cast<u8>(neg & 0xFF);
+    blk[1] = static_cast<u8>(neg >> 8);
+    dequant_row(DType::Q1_0, blk, out, 128);
+    CHECK_NEAR(out[0], -1.0f, 1e-6, "Q1_0: a negative delta carries through");
+}
+
+static void test_q2_0_layout() {
+    // Q2_0 is the 128-value / 34-byte block: one f16 delta, then a 32-byte
+    // plane holding four codes per byte, low pair first.
+    u8 blk[34];
+    const u16 one = fp32_to_fp16(1.0f);
+    blk[0] = static_cast<u8>(one & 0xFF);
+    blk[1] = static_cast<u8>(one >> 8);
+    for (int i = 0; i < 32; i++) blk[2 + i] = 0;
+    // One byte carries four codes, low pair first: 00 01 10 11.
+    blk[2] = static_cast<u8>(0x00 | (1 << 2) | (2 << 4) | (3 << 6));
+    f32 out[128];
+    dequant_row(DType::Q2_0, blk, out, 128);
+    CHECK_NEAR(out[0], -1.0f, 1e-6, "Q2_0: code 0 is -d");
+    CHECK_NEAR(out[1], 0.0f, 1e-6, "Q2_0: code 1 is 0");
+    CHECK_NEAR(out[2], 1.0f, 1e-6, "Q2_0: code 2 is +d");
+    CHECK_NEAR(out[3], 2.0f, 1e-6, "Q2_0: code 3 is +2d, not clamped");
+    CHECK_NEAR(out[4], -1.0f, 1e-6, "Q2_0: the next byte starts at value 4");
+    CHECK_NEAR(out[127], -1.0f, 1e-6, "Q2_0: 128 values come from one block");
+    // The last plane byte is bytes 2+31, i.e. values 124..127.
+    blk[33] = static_cast<u8>(0x03);
+    dequant_row(DType::Q2_0, blk, out, 128);
+    CHECK_NEAR(out[124], 2.0f, 1e-6, "Q2_0: plane byte 31 is value 124");
+    const u16 neg = fp32_to_fp16(-1.0f);
+    blk[0] = static_cast<u8>(neg & 0xFF);
+    blk[1] = static_cast<u8>(neg >> 8);
+    dequant_row(DType::Q2_0, blk, out, 128);
+    CHECK_NEAR(out[3], -2.0f, 1e-6, "Q2_0: a negative delta carries through");
+
+    // Q2_0_64 is the same code map over half the block: 18 bytes, 64 values.
+    // That is upstream llama.cpp's own Q2_0 geometry, which the llama-dx fork
+    // separates out as id 48 so its 128-value Q2_0 can keep id 42.
+    u8 blk64[18];
+    blk64[0] = static_cast<u8>(one & 0xFF);
+    blk64[1] = static_cast<u8>(one >> 8);
+    for (int i = 0; i < 16; i++) blk64[2 + i] = 0;
+    blk64[2] = static_cast<u8>(0x00 | (1 << 2) | (2 << 4) | (3 << 6));
+    f32 out64[64];
+    dequant_row(DType::Q2_0_64, blk64, out64, 64);
+    CHECK_NEAR(out64[0], -1.0f, 1e-6, "Q2_0_64: code 0 is -d");
+    CHECK_NEAR(out64[3], 2.0f, 1e-6, "Q2_0_64: code 3 is +2d");
+    CHECK_NEAR(out64[63], -1.0f, 1e-6, "Q2_0_64: 64 values come from one block");
+    // The two widths must agree value for value wherever they overlap, which is
+    // the check that keeps the 34-byte and 18-byte readers from drifting apart.
+    for (int i = 0; i < 16; i++) blk64[2 + i] = blk[2 + i];
+    blk64[0] = blk[0];
+    blk64[1] = blk[1];
+    dequant_row(DType::Q2_0, blk, out, 128);
+    dequant_row(DType::Q2_0_64, blk64, out64, 64);
+    int mismatched = 0;
+    for (int i = 0; i < 64; i++) if (out[i] != out64[i]) mismatched++;
+
+}
+
+
+static void test_iq_family_structure() {
+    // One probe per format: the byte to perturb, and the half-open range of
+    // decoded values that byte is allowed to reach. Every offset comes from the
+    // reference's own field layout, not from the decoder being tested.
+    struct Probe {
+        DType t;
+        int bytes;
+        int at;
+        int lo;
+        int hi;
+        const char *what;
+    };
+    const Probe probes[] = {
+        // IQ3_XXS: the 4-byte scale-and-sign word for group g is sas+4g; its
+        // top nibble (byte 3, bits 4..6 of which are the low scale bits) is
+        // that group's scale, and the word covers only its own 32 values.
+        {DType::IQ3_XXS, 98, 66 + 4 * 3 + 3, 96, 128, "IQ3_XXS: group scale stays in its group"},
+        // IQ3_XXS grid bytes: 8 per group, so qs[8g+i] owns group g.
+        {DType::IQ3_XXS, 98, 2 + 8 * 2, 64, 96, "IQ3_XXS: a grid byte stays in its group"},
+        // IQ1_S: qh is eight LE u16, one per 32-value chunk; bits 12..14 of
+        // chunk 3's word are its scale.
+        {DType::IQ1_S, 50, 34 + 2 * 3 + 1, 96, 128, "IQ1_S: chunk scale stays in its chunk"},
+        // IQ3_S: qh carries the 9th index bit, one byte per 32-value group.
+        {DType::IQ3_S, 110, 66 + 3, 96, 128, "IQ3_S: high index byte stays in its group"},
+        // IQ3_S scales: one byte per 64-value pair, low nibble then high.
+        {DType::IQ3_S, 110, 106 + 2, 128, 192, "IQ3_S: a scale byte owns its 64-value pair"},
+        // IQ2_S: qh carries the top two index bits, one byte per group.
+        {DType::IQ2_S, 82, 66 + 3, 96, 128, "IQ2_S: high index byte stays in its group"},
+        // IQ2_S scales: one nibble per 16-value sub-group, so a byte owns a
+        // whole 32-value group.
+        {DType::IQ2_S, 82, 74 + 3, 96, 128, "IQ2_S: a scale byte owns its group"},
+        // IQ1_M: two qh bytes per chunk, so byte 0 of chunk 3 reaches only the
+        // first 16 of its values (l = 0 and 1).
+        {DType::IQ1_M, 56, 32 + 2 * 3, 96, 112, "IQ1_M: a qh byte reaches only its own halves"},
+    };
+    u32 seed = 0x9E3779B9u;
+    for (const Probe &p : probes) {
+        std::vector<u8> b0(static_cast<size_t>(p.bytes));
+        fill_probe_block(b0.data(), b0.size(), seed);
+        seed += 0x7F4A7C15u;
+        std::vector<f32> y0(256), y1(256);
+        dequant_row(p.t, b0.data(), y0.data(), 256);
+        int finite = 0;
+        for (int i = 0; i < 256; i++)
+            if (std::isfinite(y0[i])) finite++;
+        CHECK(finite == 256, "a new IQ block decodes to finite values only");
+        std::vector<u8> b1 = b0;
+        b1[static_cast<size_t>(p.at)] =
+            static_cast<u8>(b1[static_cast<size_t>(p.at)] ^ 0x70);
+        dequant_row(p.t, b1.data(), y1.data(), 256);
+        const QuantDiff d = diff_indices(y0.data(), y1.data(), 256);
+        CHECK(d.n > 0, "the probed byte reaches the decoded values");
+        CHECK(d.lo >= p.lo && d.hi < p.hi, p.what);
+    }
 }
 
 static void test_vec_dot() {
@@ -1816,11 +2055,13 @@ static void test_load_verdict() {
     }
 
     // A format this build cannot dequantize is reported by name, not as a
-    // corrupt file: the container still opens it.
+    // corrupt file: the container still opens it. Type 102 is a llama-dx
+    // ROCmFPX id -- the two files carrying it declare file_type 112 and 119 --
+    // and no header on this machine defines it, so it is the one refused.
     {
         const std::string path =
-            build_verdict_fixture("q1_0", "llama", "blk.0.attn_q.weight", 41, 0);
-        CHECK(!path.empty(), "wrote a Q1_0 fixture");
+            build_verdict_fixture("rocmfpx102", "llama", "blk.0.attn_q.weight", 102, 0);
+        CHECK(!path.empty(), "wrote a type-102 fixture");
         Gguf g;
         std::string err;
         CHECK(g.load(path, &err), "an unknown format still parses");
@@ -1831,7 +2072,7 @@ static void test_load_verdict() {
         CHECK(!v.runnable, "the unknown format makes the file unrunnable");
         bool named = false;
         for (const std::string &b : v.blockers)
-            if (b.find("#41") != std::string::npos) named = true;
+            if (b.find("#102") != std::string::npos) named = true;
         CHECK(named, "the blocker names the on-disk format id");
         made.push_back(path);
     }
@@ -2436,6 +2677,277 @@ static void test_expert_cache_warm_tier() {
 
     cache.clear();
     std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// CpuExpertPool: the CPU half of the hybrid expert path
+// ---------------------------------------------------------------------------
+//
+// The pool computes a routed expert out of the weight mapping on host threads
+// while the GPU runs the resident ones. What has to be pinned down is not that
+// it is fast -- that is a measurement, and it is in docs/test-results.md -- but
+// that it is exact about the thing that makes it usable at all: the four ops of
+// one expert, at the same f16 rounding points the device kernels use, with
+// several rows and several experts in flight at once and the per-worker
+// accumulators summed correctly. Two experts sharing a row is the case those
+// private accumulators exist for, and a missing reduction there is invisible on
+// a single-threaded test.
+
+// An expert's three slices decoded to f32 on the host, laid out as the kernels
+// read them: gate/up are [n_ff][n_in], down is [n_in][n_ff].
+struct RefExpert {
+    i64 n_in = 0;
+    i64 n_ff = 0;
+    std::vector<f32> gate, up, down;
+};
+
+static void decode_expert(const GgufTensor &t, i32 n_expert, i64 expert, i64 row_len,
+                          i64 n_rows, std::vector<f32> &out) {
+    const size_t per_bytes = t.n_bytes / static_cast<size_t>(n_expert);
+    const size_t row_bytes = dtype_row_bytes(t.type, row_len);
+    const u8 *base = t.data + static_cast<size_t>(expert) * per_bytes;
+    out.assign(static_cast<size_t>(row_len) * static_cast<size_t>(n_rows), 0.0f);
+    for (i64 r = 0; r < n_rows; r++)
+        dequant_row(t.type, base + static_cast<size_t>(r) * row_bytes,
+                    out.data() + static_cast<size_t>(r * row_len), row_len);
+}
+
+// The reference for one expert on one activation row: the same four ops the
+// device runs, rounded to f16 where the device rounds. silu_mul reads its inputs
+// from f16 buffers and writes f16, the down GEMM writes f16, and the scatter
+// accumulates f16 -- so g, u, h, y and the running sum are all rounded here.
+static void ref_expert(const RefExpert &e, const f32 *x, f32 alpha, f32 *out_row) {
+    std::vector<f32> h(static_cast<size_t>(e.n_ff));
+    for (i64 j = 0; j < e.n_ff; j++) {
+        f32 g = 0.0f, u = 0.0f;
+        const size_t base = static_cast<size_t>(j * e.n_in);
+        for (i64 i = 0; i < e.n_in; i++) {
+            g += e.gate[base + static_cast<size_t>(i)] * x[i];
+            u += e.up[base + static_cast<size_t>(i)] * x[i];
+        }
+        const f32 g16 = fp16_to_fp32(fp32_to_fp16(g));
+        const f32 u16 = fp16_to_fp32(fp32_to_fp16(u));
+        h[static_cast<size_t>(j)] =
+            fp16_to_fp32(fp32_to_fp16((g16 / (1.0f + std::exp(-g16))) * u16));
+    }
+    for (i64 i = 0; i < e.n_in; i++) {
+        f32 s = 0.0f;
+        const size_t base = static_cast<size_t>(i * e.n_ff);
+        for (i64 j = 0; j < e.n_ff; j++)
+            s += e.down[base + static_cast<size_t>(j)] * h[static_cast<size_t>(j)];
+        const f32 y16 = fp16_to_fp32(fp32_to_fp16(s));
+        out_row[i] = fp16_to_fp32(fp32_to_fp16(out_row[i] + alpha * y16));
+    }
+}
+
+// A deterministic fill for one slice of a synthetic expert set. Written through
+// the quantized bytes, so the reference decodes exactly what the pool decodes.
+static void fill_synth_slice(std::vector<u8> &buf, DType t, i64 row_len, i64 n_rows,
+                             i32 n_expert, i32 salt) {
+    const size_t row_bytes = dtype_row_bytes(t, row_len);
+    buf.assign(row_bytes * static_cast<size_t>(n_rows) * static_cast<size_t>(n_expert),
+               0);
+    size_t off = 0;
+    for (i64 r = 0; r < n_rows * n_expert; r++) {
+        if (t == DType::F32) {
+            for (i64 i = 0; i < row_len; i++) {
+                const f32 v = 0.01f * static_cast<f32>(
+                    static_cast<int>((r * 7 + i * 3 + salt) % 19) - 9);
+                std::memcpy(buf.data() + off + static_cast<size_t>(i) * 4, &v, 4);
+            }
+        } else {
+            // Q8_0: an f16 scale then 32 signed bytes, 34 B per 32-value block.
+            size_t bo = off;
+            for (i64 b = 0; b < row_len / 32; b++) {
+                const u16 d =
+                    fp32_to_fp16(0.02f * static_cast<f32>(1 + ((r + b + salt) % 5)));
+                std::memcpy(buf.data() + bo, &d, 2);
+                for (int k = 0; k < 32; k++) {
+                    const int q = static_cast<int>(
+                        (r * 5 + b * 3 + static_cast<i64>(k) + salt) % 13) - 6;
+                    buf[bo + 2 + static_cast<size_t>(k)] = static_cast<u8>(q & 0xFF);
+                }
+                bo += 34;
+            }
+        }
+        off += row_bytes;
+    }
+}
+
+static void test_cpu_expert_pool() {
+    const i64 kIn = 64, kFf = 32;
+    const i32 kNe = 4, kRows = 4;
+
+    // F32 makes the reference exact; Q8_0 exercises the dequantizer the hybrid
+    // path actually meets on a real MoE (block size 32, 34 B per block).
+    struct Case {
+        DType type;
+        const char *name;
+    };
+    const Case cases[2] = {{DType::F32, "F32"}, {DType::Q8_0, "Q8_0"}};
+
+    CpuExpertPool &pool = CpuExpertPool::get();
+    const i32 threads_before = pool.threads();
+
+    for (int ci = 0; ci < 2; ci++) {
+        const DType dt = cases[ci].type;
+        std::vector<u8> gate_bytes, up_bytes, down_bytes;
+        fill_synth_slice(gate_bytes, dt, kIn, kFf, kNe, 1);
+        fill_synth_slice(up_bytes, dt, kIn, kFf, kNe, 5);
+        fill_synth_slice(down_bytes, dt, kFf, kIn, kNe, 11);
+
+        // gate/up are [n_in, n_ff, n_expert], down is [n_ff, n_in, n_expert].
+        GgufTensor tg, tu, td;
+        const auto shape = [&](GgufTensor &t, std::vector<u8> &buf, i64 a, i64 b) {
+            t.name = "synth_exps.weight";
+            t.type = dt;
+            t.dtype_known = true;
+            t.n_dims = 3;
+            t.ne[0] = static_cast<u64>(a);
+            t.ne[1] = static_cast<u64>(b);
+            t.ne[2] = static_cast<u64>(kNe);
+            t.n_elements = static_cast<i64>(a * b) * kNe;
+            t.n_bytes = buf.size();
+            t.data = buf.data();
+        };
+        shape(tg, gate_bytes, kIn, kFf);
+        shape(tu, up_bytes, kIn, kFf);
+        shape(td, down_bytes, kFf, kIn);
+
+        ExpertSource src;
+        src.gate = &tg;
+        src.up = &tu;
+        src.down = &td;
+        src.n_expert = kNe;
+        src.n_embd = kIn;
+        src.n_ff_exp = kFf;
+        CHECK(src.present(), "synthetic expert source is complete");
+
+        std::vector<RefExpert> ref(static_cast<size_t>(kNe));
+        for (i32 e = 0; e < kNe; e++) {
+            RefExpert &r = ref[static_cast<size_t>(e)];
+            r.n_in = kIn;
+            r.n_ff = kFf;
+            decode_expert(tg, kNe, e, kIn, kFf, r.gate);
+            decode_expert(tu, kNe, e, kIn, kFf, r.up);
+            decode_expert(td, kNe, e, kFf, kIn, r.down);
+        }
+
+        std::vector<f32> xn(static_cast<size_t>(kRows * kIn));
+        for (size_t i = 0; i < xn.size(); i++)
+            xn[i] = 0.1f * static_cast<f32>(static_cast<int>(i % 11) - 5);
+
+        // Three jobs. Row 0 is selected by two of them, which is the shape a
+        // real layer has (top-k over one token) and the one that needs the
+        // per-worker accumulators unified. Row 3 is selected by nothing.
+        const i32 rows_a[2] = {0, 1};
+        const f32 alpha_a[2] = {0.5f, 0.25f};
+        const i32 rows_b[1] = {0};
+        const f32 alpha_b[1] = {0.75f};
+        const i32 rows_c[1] = {2};
+        const f32 alpha_c[1] = {1.5f};
+        CpuExpertPool::Job jobs[3];
+        jobs[0] = CpuExpertPool::Job{0, rows_a, alpha_a, 2};
+        jobs[1] = CpuExpertPool::Job{2, rows_b, alpha_b, 1};
+        jobs[2] = CpuExpertPool::Job{3, rows_c, alpha_c, 1};
+
+        std::vector<f32> want(static_cast<size_t>(kRows * kIn), 0.0f);
+        for (int j = 0; j < 3; j++) {
+            const RefExpert &re = ref[static_cast<size_t>(jobs[j].expert)];
+            for (i32 r = 0; r < jobs[j].m; r++)
+                ref_expert(re, xn.data() + static_cast<size_t>(jobs[j].rows[r]) * kIn,
+                           jobs[j].alpha[r],
+                           want.data() + static_cast<size_t>(jobs[j].rows[r]) * kIn);
+        }
+
+        f32 worst = 0.0f, peak = 0.0f;
+        for (int arm = 0; arm < 2; arm++) {
+            pool.set_threads(arm == 0 ? 1 : 4);
+            CHECK(pool.threads() >= 1, "the pool reports a live team");
+
+            std::vector<f32> out(static_cast<size_t>(kRows * kIn), 0.0f);
+            pool.reset_counters();
+            const i32 done = pool.run(src, 0, jobs, 3, xn.data(), kRows, kIn, out.data());
+            CHECK(done == 3, "run() reports the three experts it computed");
+            CHECK(pool.experts_done() == 3, "and the lifetime counter agrees");
+            CHECK(pool.rows_done() >= 3, "and the row counter moved with it");
+
+            worst = 0.0f;
+            peak = 0.0f;
+            for (size_t i = 0; i < want.size(); i++) {
+                worst = std::max(worst, std::fabs(out[i] - want[i]));
+                peak = std::max(peak, std::fabs(want[i]));
+            }
+            CHECK(peak > 1e-3f, "the reference is not all zeros");
+            CHECK_NEAR(worst, 0.0, static_cast<double>(peak) * 2e-3 + 1e-4,
+                       "the pool matches the f16-rounded reference");
+
+            bool row3_zero = true;
+            for (i32 i = 0; i < kIn; i++)
+                if (out[static_cast<size_t>(3 * kIn + i)] != 0.0f) row3_zero = false;
+            CHECK(row3_zero, "a row no job selected is left exactly zero");
+
+            bool row0_both = true;
+            for (i32 i = 0; i < kIn; i++)
+                if (out[static_cast<size_t>(i)] == 0.0f) row0_both = false;
+            CHECK(row0_both, "a row two experts share carries both contributions");
+        }
+
+        // The two arms must agree with each other, not just each with the
+        // reference: that is what proves the worker accumulators are unified.
+        //
+        // The budget is RELATIVE to this case's peak, and that is deliberate.
+        // Splitting a row's two contributions across two workers changes the
+        // order the f16 roundings happen in, so the arms are entitled to differ
+        // by a few ulps of the values themselves: measured 8.5e-4 against a
+        // peak of 2.047 on the Q8_0 case (0.04%), and under 1e-6 against the
+        // F32 case's 0.004 peak. The difference SCALES with the magnitude,
+        // which is what rounding-order noise does and what a missed or
+        // double-counted contribution does not. An absolute cap here would
+        // have passed this test whatever the pool did to the tiny F32 case.
+        f32 peak1 = 0.0f;
+        for (size_t i = 0; i < want.size(); i++) peak1 = std::max(peak1, std::fabs(want[i]));
+        const double tol = static_cast<double>(peak1) * 2e-3 + 1e-4;
+
+        std::vector<f32> one(static_cast<size_t>(kRows * kIn), 0.0f);
+        pool.set_threads(1);
+        pool.run(src, 0, jobs, 3, xn.data(), kRows, kIn, one.data());
+
+        // Five multi-threaded repetitions: jobs are claimed from an atomic
+        // counter, so which worker owns which contribution to a shared row is
+        // whatever order the claims land in. Every repetition still has to land
+        // on the reference, and the gap against the single-threaded arm has to
+        // stay inside the same relative budget.
+        f32 spread = 0.0f;
+        pool.set_threads(4);
+        for (int rep = 0; rep < 5; rep++) {
+            std::vector<f32> many(static_cast<size_t>(kRows * kIn), 0.0f);
+            CHECK(pool.run(src, 0, jobs, 3, xn.data(), kRows, kIn, many.data()) == 3,
+                  "the multi-threaded arm computes all three experts");
+            f32 worst_many = 0.0f;
+            for (size_t i = 0; i < want.size(); i++) {
+                worst_many = std::max(worst_many, std::fabs(many[i] - want[i]));
+                spread = std::max(spread, std::fabs(many[i] - one[i]));
+            }
+            CHECK_NEAR(worst_many, 0.0, tol,
+                       "the 4-thread arm matches the reference whatever order it claims in");
+        }
+        CHECK_NEAR(spread, 0.0, tol, "1 thread and 4 threads agree within the rounding budget");
+
+        // No jobs, no work, no writes.
+        std::vector<f32> untouched(static_cast<size_t>(kRows * kIn), 42.0f);
+        CHECK(pool.run(src, 0, jobs, 0, xn.data(), kRows, kIn, untouched.data()) == 0,
+              "an empty job list computes nothing");
+        bool clean = true;
+        for (size_t i = 0; i < untouched.size(); i++)
+            if (untouched[i] != 42.0f) clean = false;
+        CHECK(clean, "and writes nothing at all");
+
+        std::fprintf(stderr, "  (%s expert case: worst %.3e of peak %.3f)\n",
+                     cases[ci].name, static_cast<double>(worst), static_cast<double>(peak));
+    }
+
+    pool.set_threads(threads_before > 0 ? threads_before : 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -3203,6 +3715,10 @@ int main() {
     test_rocmfp4_layout();
     test_tq2_0_layout();
     test_tq1_0_layout();
+    test_new_quant_geometry();
+    test_q1_0_layout();
+    test_q2_0_layout();
+    test_iq_family_structure();
     test_vec_dot();
     test_arch_table();
     test_arch_tensor_maps();
@@ -3218,6 +3734,7 @@ int main() {
     test_moe_grouped_prefill_matches_tokenwise();
     test_expert_cache_policy();
     test_expert_cache_warm_tier();
+    test_cpu_expert_pool();
     test_gdn_ops();
     test_gdn_model_loads();
     test_gdn_generation();

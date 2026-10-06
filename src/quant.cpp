@@ -715,6 +715,18 @@ void deq_tq2_0(const u8 *b, f32 *y, i64 nblk) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The IQ family added for the GSQ-RCO and Bonsai exports: IQ2_S (22),
+// IQ3_XXS (18), IQ1_S (19), IQ3_S (21), IQ1_M (29) and BitNet's Q1_0 (41) /
+// Q2_0 (42). Each .inc mirrors one ggml reference decoder and carries its own
+// codebook, so there is exactly one copy of every table to diff against
+// ggml-common.h. Included inside this anonymous namespace, after the helpers
+// they use and before the dispatcher that calls them.
+// ---------------------------------------------------------------------------
+#include "quant_fmt_a.inc"
+#include "quant_fmt_b.inc"
+#include "quant_fmt_c.inc"
+
 // One whole block of `t` decoded into buf (>= block_size floats).
 void dequant_block(DType t, const u8 *p, f32 *buf) {
     switch (t) {
@@ -746,6 +758,14 @@ void dequant_block(DType t, const u8 *p, f32 *buf) {
         case DType::ROCMFP4_FAST: deq_rocmfp4_fast(p, buf, 1); break;
         case DType::TQ1_0: deq_tq1_0(p, buf, 1); break;
         case DType::TQ2_0: deq_tq2_0(p, buf, 1); break;
+        case DType::IQ2_S: deq_iq2_s(p, buf, 1); break;
+        case DType::IQ3_XXS: deq_iq3_xxs(p, buf, 1); break;
+        case DType::IQ1_S: deq_iq1_s(p, buf, 1); break;
+        case DType::IQ3_S: deq_iq3_s(p, buf, 1); break;
+        case DType::IQ1_M: deq_iq1_m(p, buf, 1); break;
+        case DType::Q1_0: deq_q1_0(p, buf, 1); break;
+        case DType::Q2_0: deq_q2_0(p, buf, 1); break;
+        case DType::Q2_0_64: deq_q2_0_64(p, buf, 1); break;
         default: break;
     }
 }
@@ -774,7 +794,15 @@ const char *dtype_name(DType t) {
         case DType::IQ4_NL: return "IQ4_NL";
         case DType::IQ2_XXS: return "IQ2_XXS";
         case DType::IQ2_XS: return "IQ2_XS";
+        case DType::IQ3_XXS: return "IQ3_XXS";
+        case DType::IQ1_S: return "IQ1_S";
+        case DType::IQ3_S: return "IQ3_S";
+        case DType::IQ2_S: return "IQ2_S";
+        case DType::IQ1_M: return "IQ1_M";
         case DType::IQ4_XS: return "IQ4_XS";
+        case DType::Q1_0: return "Q1_0";
+        case DType::Q2_0: return "Q2_0";
+        case DType::Q2_0_64: return "Q2_0_64";
         case DType::MXFP4: return "MXFP4";
         case DType::NVFP4: return "NVFP4";
         case DType::ROCMFP4: return "Q4_0_ROCMFP4";
@@ -804,6 +832,12 @@ bool dtype_supported(DType t) {
         case DType::Q8_K:
         case DType::IQ4_NL:
         case DType::IQ2_XXS:
+        case DType::IQ2_XS:
+        case DType::IQ3_XXS:
+        case DType::IQ1_S:
+        case DType::IQ3_S:
+        case DType::IQ2_S:
+        case DType::IQ1_M:
         case DType::IQ4_XS:
         case DType::NVFP4:
         case DType::MXFP4:
@@ -811,6 +845,9 @@ bool dtype_supported(DType t) {
         case DType::ROCMFP4_FAST:
         case DType::TQ1_0:
         case DType::TQ2_0:
+        case DType::Q1_0:
+        case DType::Q2_0:
+        case DType::Q2_0_64:
             return true;
         default:
             return false;
@@ -829,9 +866,18 @@ int dtype_block_size(DType t) {
         case DType::Q6_K:
         case DType::Q8_K:
         case DType::IQ2_XXS:
+        case DType::IQ2_XS:
+        case DType::IQ3_XXS:
+        case DType::IQ1_S:
+        case DType::IQ3_S:
+        case DType::IQ2_S:
+        case DType::IQ1_M:
         case DType::IQ4_XS:
         case DType::TQ1_0:
         case DType::TQ2_0: return 256;
+        case DType::Q1_0: return 128;
+        case DType::Q2_0: return 128;
+        case DType::Q2_0_64: return 64;
         case DType::NVFP4: return 64;
         default: return 32;
     }
@@ -856,6 +902,19 @@ int dtype_block_bytes(DType t) {
         case DType::Q8_K: return 292;
         case DType::IQ4_NL: return 18;
         case DType::IQ2_XXS: return 66;
+        // Each of these is the reference's sizeof(block_*), which ggml-common.h
+        // pins with its own static_assert; the number here is what maps a chunk
+        // index onto the block that contains it, so a wrong one reads the wrong
+        // block and produces fluent garbage.
+        case DType::IQ2_XS: return 74;   // 2 + QK_K/4 + QK_K/32
+        case DType::IQ3_XXS: return 98;  // 2 + 3*QK_K/8
+        case DType::IQ1_S: return 50;    // 2 + QK_K/8 + QK_K/16
+        case DType::IQ3_S: return 110;   // 2 + 13*(QK_K/32) + QK_K/64
+        case DType::IQ2_S: return 82;    // 2 + QK_K/4 + QK_K/16
+        case DType::IQ1_M: return 56;    // QK_K/8 + QK_K/16 + QK_K/32
+        case DType::Q1_0: return 18;     // 2 + QK1_0/8, QK1_0 = 128
+        case DType::Q2_0: return 34;     // 2 + QK2_0/4, QK2_0 = 128 (llama-dx)
+        case DType::Q2_0_64: return 18;  // 2 + 64/4, upstream's own Q2_0
         case DType::IQ4_XS: return 136;
         case DType::NVFP4: return 36;
         case DType::MXFP4: return 17;

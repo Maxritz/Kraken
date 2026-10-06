@@ -4,7 +4,9 @@
 // shared mutex; connections are handled concurrently, generation is not.
 // Each request rolls the KV cache back to 0 so no state leaks between calls.
 #include "krk/server.hpp"
+#include "krk/host_time.hpp"
 
+#include <cstdio>
 #include <ctime>
 
 namespace krk {
@@ -160,6 +162,21 @@ void stream_cb(void *user, const char *text, i32 token, bool done) {
     const JsonValue ev =
         chunk_event(st, std::move(delta), JsonValue(nullptr));
     if (!http_sse_event(*st->conn, ev.dump())) st->failed = true;
+}
+
+// Per-request timing. The server printed none at all before this, so a slow
+// request could not be attributed from its own logs. It is opt-in with the same
+// switch as the CLI (--profile / KRK_PROFILE), and the host-phase table is
+// cumulative across requests, which is what a server wants: one request tells
+// you little, the shape of a hundred is the number to act on.
+void report_request_time(const GenerateResult &r) {
+    if (!HostTime::get().on()) return;
+    std::fprintf(stderr,
+                 "[stats ] request   prefill %d tok in %.1f ms | decode %d tok "
+                 "in %.1f ms over %lld steps\n",
+                 r.prompt_tokens, r.prefill_ms, r.generated, r.decode_ms,
+                 static_cast<long long>(r.decode_steps));
+    HostTime::get().report(stderr);
 }
 
 } // namespace
@@ -328,6 +345,7 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
         }
         res.status = ok ? 200 : 500;
         res.content_type = "text/event-stream";
+        report_request_time(r);
         return true;
     }
 
@@ -336,6 +354,7 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
         res = json_response(500, error_body("generation failed", "internal_error"));
         return true;
     }
+    report_request_time(r);
 
     JsonValue root = JsonValue::object();
     root.set("id", id);

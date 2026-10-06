@@ -15,6 +15,12 @@
 #                 inside KRK_TIMEOUT. An empty run is a failure, not a skip: the
 #                 acceptance criterion for this script is "a human can read the
 #                 answer", and no answer is not an answer.
+#   FAIL (cpu)    the device arm fell back to the CPU backend: the CLI warns on
+#                 stderr when HIP backend creation fails and CONTINUES on the
+#                 scalar reference, this script discards stderr, and then both
+#                 arms are CPU and their agreement is meaningless. Checked
+#                 against the run's own stdout banner, which names the backend
+#                 that produced the text.
 #
 # Exit status is non-zero when anything failed *or* when a model the caller
 # named was not tested because it is over the cap — an untested model must not
@@ -58,6 +64,13 @@ CHAT=${KRK_CHAT:-1}
 
 [ -x "$BIN" ] || { echo "no $BIN — build kraken first"; exit 2; }
 
+# The most recent gen() run's stdout banner, transported through a file: gen is
+# invoked inside $(...), a subshell, where a plain variable assignment dies with
+# the subshell and the caller would read an empty string forever (the guard
+# below then fires as FAIL (cpu) on every model, GPU or not).
+BANNER_F=$(mktemp) || exit 2
+trap 'rm -f "$BANNER_F"' EXIT
+
 # Generated text only: the banner and the [info ]/[warn ] chatter are not part
 # of the answer. stdout carries exactly the continuation.
 # Runs the engine once and echoes the generated text. Returns the engine's own
@@ -70,6 +83,13 @@ gen() {
     timeout "$TIMEOUT" "$BIN" -m "$1" ${2:-} $CHAT_ARG -p "$PROMPT" \
         -n "$N" --greedy --ctx "$CTX" --chunk "$CHUNK" >"$f" 2>/dev/null
     rc=$?
+    # stdout's first line is the run's own statement of which backend it used:
+    # the GPU banner carries the gfx arch ("gfx1201"), the CPU one says
+    # "CPU (scalar reference)". The fallback warning lives on stderr, which is
+    # discarded above, so this line is the only durable evidence left. It goes
+    # to BANNER_F, not a variable: gen runs inside $(...), a subshell whose
+    # assignments never reach the caller. The compared text below is unchanged.
+    head -n 1 "$f" > "$BANNER_F"
     grep -v '^KRAKEN 0.1.0' "$f" | sed 's/[[:space:]]*$//'
     rm -f "$f"
     return $rc
@@ -153,11 +173,18 @@ CHAT_ARG=""
 
 echo "prompt: $PROMPT   n=$N   ctx=$CTX   chunk=$CHUNK   chat=$CHAT   tie tol=$TOL"
 echo "per-run timeout ${TIMEOUT}s"
+# Say up front why half the runs you are about to watch are CPU: they are the
+# reference arm, deliberately. Without this line a reader sees engine runs that
+# name the CPU in their banner and reasonably asks why the check is on CPU.
+echo "each model runs twice: device arm (stdout banner must name a gfx arch)"
+echo "and --cpu scalar reference arm; PASS = the two produced identical text"
 pass=0
 fail=0
 for m in "${models[@]}"; do
     name=$(basename "$m")
+    : > "$BANNER_F"
     gpu=$(gen "$m" ""); grc=$?
+    gpu_banner=$(cat "$BANNER_F")
     cpu=$(gen "$m" "--cpu"); crc=$?
     if [ "$grc" -ne 0 ] || [ "$crc" -ne 0 ]; then
         why="device rc=$grc, cpu rc=$crc"
@@ -167,6 +194,19 @@ for m in "${models[@]}"; do
         printf '%-22s %-42s %s\n' "FAIL" "$name" "$why"
         continue
     fi
+    # The device arm must have run on a device. A HIP failure at backend
+    # creation does not abort: main_cli.cpp warns on stderr and continues on
+    # the CPU reference, stderr is discarded above, and cpu == cpu then reads
+    # as PASS -- a silent fallback reporting itself as coherence. The banner
+    # decides; an rc=0 run whose banner names no gfx arch is this verdict.
+    case "$gpu_banner" in
+        *gfx[0-9]*) ;;
+        *)
+            fail=$((fail + 1))
+            printf '%-22s %-42s %s\n' "FAIL (cpu)" "$name" \
+                "device arm ran the CPU backend: ${gpu_banner:-no banner}"
+            continue ;;
+    esac
     if [ -z "$gpu" ] || [ -z "$cpu" ]; then
         which="$([ -z "$gpu" ] && echo device || echo cpu)"
         [ -z "$gpu" ] && [ -z "$cpu" ] && which="both"

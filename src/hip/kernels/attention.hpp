@@ -679,8 +679,22 @@ __global__ void __launch_bounds__(kAttnDecThreads)
         m = mnew;
     }
 
-    // Reduce the warps of this block first, so one thread per split writes the
-    // partial rather than all 256 threads writing the same address.
+    // Reduce the warps of this block, exactly as the single-block epilogue
+    // does: scale each warp's (m, l, O) by exp(m - mstar) into shared memory
+    // and then sum. Doing it the other way (keeping raw l and re-deriving
+    // exp(m_w - mstar) per warp) is where the block's denominator used to be
+    // written by EIGHT threads at once with eight different values: `lt`
+    // started at `s_l[warp] * aw`, so every lane-0 thread seeded the sum with
+    // its own warp's term, and all eight store to p[1]. The store that landed
+    // last won, so a head's output depended on warp scheduling -- a decode at
+    // >= 128 keys (attention_decode_splits() starts splitting there) was
+    // nondeterministic run to run, while the same model at 64 keys, where
+    // n_split stays 1, was bit-stable. Measured: 4 GPU runs of the same
+    // 128-token prompt gave one md5 once and another md5 three times.
+    //
+    // Scaling s_l in place (as the single-block kernel does) makes every
+    // thread compute the same `lt` and `ot`, and restricting the write to
+    // warp 0 removes the redundant global stores as well.
     __shared__ f32 s_m[kAttnDecWarps];
     __shared__ f32 s_l[kAttnDecWarps];
     __shared__ f32 s_o[kAttnDecWarps * kWaveSize * VPT];
@@ -693,14 +707,14 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     f32 *slot = s_o + (warp * kWaveSize + lane) * VPT;
 #pragma unroll
     for (int e = 0; e < VPT; e++) slot[e] = acc[e] * aw;
+    if (lane == 0) s_l[warp] = l * aw;
     __syncthreads();
     f32 lt = 0.0f, ot[VPT];
 #pragma unroll
     for (int e = 0; e < VPT; e++) ot[e] = 0.0f;
-    if (lane == 0) lt = s_l[warp] * aw;
 #pragma unroll
     for (int w = 0; w < kAttnDecWarps; w++) {
-        lt += s_l[w] * __expf(s_m[w] - mstar);
+        lt += s_l[w];
         const f32 *s2 = s_o + (w * kWaveSize + lane) * VPT;
 #pragma unroll
         for (int e = 0; e < VPT; e++) ot[e] += s2[e];
@@ -708,14 +722,18 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     // Write this block's partial in the same lane-major shape the single-block
     // epilogue uses: lane L owns output channels [L*VPT, (L+1)*VPT), so the
     // merge kernel can be the same reduction with one extra loop over splits.
-    f32 *p = part + (h * n_split + sp) * (2 + kWaveSize * VPT);
-    if (lane == 0) {
-        p[0] = mstar;
-        p[1] = lt;
-    }
-    f32 *pa = p + 2 + lane * VPT;
+    // One warp writes: `lt` and `ot` are functions of (lane, w) and not of
+    // `warp`, so the other seven warps would store identical values.
+    if (warp == 0) {
+        f32 *p = part + (h * n_split + sp) * (2 + kWaveSize * VPT);
+        if (lane == 0) {
+            p[0] = mstar;
+            p[1] = lt;
+        }
+        f32 *pa = p + 2 + lane * VPT;
 #pragma unroll
-    for (int e = 0; e < VPT; e++) pa[e] = ot[e];
+        for (int e = 0; e < VPT; e++) pa[e] = ot[e];
+    }
 }
 
 template <int VPT>

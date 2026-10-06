@@ -15,8 +15,20 @@ GT = {0:'U8',1:'I8',2:'U16',3:'I16',4:'U32',5:'I32',6:'F32',7:'Bool',
 DT = {0:'F32',1:'F16',2:'Q4_0',3:'Q4_1',6:'Q5_0',7:'Q5_1',8:'Q8_0',9:'Q8_1',
       10:'Q2_K',11:'Q3_K',12:'Q4_K',13:'Q5_K',14:'Q6_K',15:'Q8_K',
       16:'IQ2_XXS',17:'IQ2_XS',18:'IQ3_XXS',19:'IQ1_S',20:'IQ4_NL',
-      21:'IQ3_S',22:'IQ2_S',23:'IQ4_XS',24:'IQ1_M',25:'BF16',30:'BF16',
-      40:'NVFP4'}
+      21:'IQ3_S',22:'IQ2_S',23:'IQ4_XS',24:'I8',25:'I16',26:'I32',27:'I64',
+      28:'F64',29:'IQ1_M',30:'BF16',34:'TQ1_0',35:'TQ2_0',39:'MXFP4',40:'NVFP4',
+      41:'Q1_0',42:'Q2_0',48:'Q2_0_64',50:'F8_E4M3FN',
+      100:'Q4_0_ROCMFP4',101:'Q4_0_ROCMFP4_FAST'}
+
+# Type ids whose meaning is not fixed by the id alone. 42 is the important one:
+# upstream llama.cpp's Q2_0 is a 64-value block (18 bytes, 2.25 bpw) while the
+# llama-dx fork's is a 128-value block (34 bytes, 2.125 bpw). Both spell the id
+# 42, so only the file's own tensor offsets say which one a file carries; the
+# --audit mode below measures that and names the variant.
+BLOCK_GEOMETRY = {   # type id -> (block_bytes, block_values), id-only cases
+    42: [(34, 128), (18, 64)],
+}
+NAME_BY_GEOMETRY = {(34, 128): 'Q2_0', (18, 64): 'Q2_0_64'}
 
 def rd_str(f):
     n = struct.unpack('<Q', f.read(8))[0]
@@ -120,6 +132,90 @@ def scan(path):
         out['error'] = '%s: %s' % (type(e).__name__, e)
     return out
 
+def audit(path, verbose=False):
+    """Measure the file's own tensor spans and report bits per element.
+
+    This is the diagnostic that identifies a mis-sized block: read the tensor
+    infos, sort them by their own offset, and compare `next_offset - offset`
+    against the computed span for that tensor's type. It is the only way to
+    tell a 128-value Q2_0 from a 64-value one, because they share an id, and it
+    also catches a tensor table that simply does not tile the file. Row padding
+    shows up as a single alignment mismatch at the end of a shard, so the report
+    counts them instead of failing on them.
+    """
+    with open(path, 'rb') as f:
+        if f.read(4) != b'GGUF':
+            return {'file': os.path.basename(path), 'error': 'not a GGUF file'}
+        struct.unpack('<IQQ', f.read(20))
+        out = {'file': os.path.basename(path)}
+        # Re-walk only far enough to reach the tensor table.
+    import struct as _s
+    with open(path, 'rb') as f:
+        f.read(4)
+        _, tc, mc = _s.unpack('<IQQ', f.read(20))
+        for _ in range(mc):
+            rd_str(f)
+            t = _s.unpack('<I', f.read(4))[0]
+            _skip_val(f, t)
+        tensors = []
+        for _ in range(tc):
+            name = rd_str(f)
+            nd = _s.unpack('<I', f.read(4))[0]
+            dims = _s.unpack('<' + 'Q' * nd, f.read(8 * nd))
+            tt = _s.unpack('<I', f.read(4))[0]
+            off = _s.unpack('<Q', f.read(8))[0]
+            tensors.append((name, tt, dims, off))
+        end = _s.unpack('<Q', __import__('os').path.getsize(path))[0] if False else None
+    ordered = sorted(tensors, key=lambda t: t[3])
+    counts = {}
+    for i, (name, tt, dims, off) in enumerate(ordered):
+        n = 1
+        for d in dims:
+            n *= d
+        if n == 0 or i + 1 >= len(ordered):
+            continue
+        span = ordered[i + 1][3] - off
+        bpw = round(span * 8.0 / n, 5)
+        key = (tt, bpw)
+        counts.setdefault(key, []).append(name)
+    out['geometry'] = []
+    for (tt, bpw), names in sorted(counts.items(), key=lambda kv: -len(kv[1])):
+        entry = {'type': tt, 'name': DT.get(tt, 'T%d' % tt), 'bits_per_element': bpw,
+                 'tensors': len(names)}
+        for cand in BLOCK_GEOMETRY.get(tt, []):
+            bb, bv = cand
+            if abs(bpw - bb * 8.0 / bv) < 1e-4:
+                entry['geometry'] = '%d bytes / %d values' % (bb, bv)
+                entry['name'] = NAME_BY_GEOMETRY.get(cand, entry['name'])
+                break
+        if verbose:
+            entry['sample'] = names[:4]
+        out['geometry'].append(entry)
+    return out
+
+
+def _skip_val(f, t, keep=0):
+    if t == 8:
+        rd_str(f)
+        return None
+    if t == 9:
+        et = struct.unpack('<I', f.read(4))[0]
+        n = struct.unpack('<Q', f.read(8))[0]
+        for _ in range(n):
+            _skip_val(f, et)
+        return None
+    size = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}[t]
+    f.read(size)
+    return None
+
+
 if __name__ == '__main__':
-    for path in sys.argv[1:]:
-        print(json.dumps(scan(path)))
+    args = sys.argv[1:]
+    mode = 'scan'
+    if args and args[0] in ('--audit', '--audit-verbose'):
+        mode = args.pop(0)
+    for path in args:
+        if mode == 'scan':
+            print(json.dumps(scan(path)))
+        else:
+            print(json.dumps(audit(path, verbose=(mode == '--audit-verbose'))))
