@@ -12,6 +12,7 @@
 #ifndef KRK_BACKEND_HPP
 #define KRK_BACKEND_HPP
 
+#include <cstdlib> // std::abort in hadamard_act's default body
 #include <cstring>
 #include <functional>
 #include "krk/common.hpp"
@@ -382,6 +383,51 @@ public:
     // dst[i] += alpha * src[i]. The MoE path accumulates routed-expert outputs
     // with their softmax gate weight through this.
     virtual void axpy(void *dst, const void *src, f32 alpha, i64 n) = 0;
+
+    // ---- prism.hadamard activation transform (PrismML's llama.cpp fork) --
+    //
+    // That fork stores a handful of matmul weights in a rotated basis: each
+    // weight's INPUT dimension was multiplied by a per-width +-1 sign vector
+    // and then by a normalized Sylvester Walsh-Hadamard over consecutive
+    // blocks of `block` elements (matrix entries +-1/sqrt(block), so the
+    // transform is its own inverse). The runtime therefore transforms the
+    // ACTIVATION the same way immediately before such a matmul -- and, for
+    // the one table stored rotated (`token_embd.weight`), once after the
+    // lookup.
+    //
+    // The residual stream stays in the primal basis: only a folded matmul's
+    // own input is transformed, and it goes into a scratch buffer, because
+    // the same activation also feeds weights that are NOT folded (a Qwen3.5
+    // delta-net layer's attention-norm output feeds ssm_alpha/ssm_beta
+    // untouched, and a MoE router reads it too).
+    //
+    // The two orders are not the same operation: the fold is signs-then-FWHT,
+    // the inverse after a lookup is FWHT-then-signs. `signs_first` picks one.
+    struct HadDesc {
+        i64 n = 0;                  // row width in elements; n % block == 0
+        i64 block = 1024;           // FWHT block size, a power of two
+        const f32 *signs = nullptr; // n values of +-1, backend address space
+        bool signs_first = true;    // true: fold; false: inverse-after-lookup
+        // ssm_out's grouped-V feature perm, applied first of all:
+        //   out[i + j*hd + k*hd*rep] = in[i + k*hd + j*hd*nk]
+        // for i in [0,hd), j in [0,rep), k in [0,nk). All zero disables it.
+        i64 perm_hd = 0;
+        i64 perm_nk = 0;
+        i64 perm_rep = 0;
+    };
+    // out[r, 0..n) <- transform(in[r, 0..n)) for r in [0, rows). `out` may
+    // alias `in`: rows never interact, and each stage reads an element before
+    // it writes it.
+    virtual void hadamard_act(void *out, const void *in, i64 rows,
+                              const HadDesc &d) {
+        (void)out;
+        (void)in;
+        (void)rows;
+        (void)d;
+        KRK_ERROR("hadamard_act: this backend does not implement the "
+                  "prism.hadamard activation transform");
+        std::abort(); // silently not transforming would decode fluent garbage
+    }
 
     // ---- MoE batching helpers --------------------------------------------
     //

@@ -87,6 +87,20 @@ enum class DType : i32 {
     // Both pack an E2M1-derived codebook whose top level is 10, not 12.
     ROCMFP4 = 100,
     ROCMFP4_FAST = 101,
+    // Prism-ML llama.cpp fork formats (PrismML-Eng/llama.cpp, branch prism),
+    // the Ternary-Bonsai-2 group-128 ternary family. The ids and block layouts
+    // come from that fork's ggml.h / ggml-common.h:
+    //   GGML_TYPE_PQ2_0  = 142: {f16 d; u8 qs[32]} = 34 B per 128 values,
+    //     same 2-bit codec as Q2_0 group-64 (byte-major, shifts 0/2/4/6,
+    //     value = (q - 1) * d). Confirmed against the fork's
+    //     ggml_vec_dot_pq2_0_q8_0_generic and Prism's published
+    //     pq2_dequant reference script.
+    //   GGML_TYPE_PTQ1_0 = 143: {u8 qs[24]; u8 qh[2]; f16 d} = 28 B per 128
+    //     values, TQ1_0's base-3 trit packing at group 128 (256 -> 128).
+    // Both files also carry prism.hadamard.* metadata; that transform is the
+    // loader/engine's concern, not this enum's.
+    PQ2_0 = 142,
+    PTQ1_0 = 143,
 };
 
 const char *dtype_name(DType t);

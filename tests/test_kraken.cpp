@@ -693,6 +693,318 @@ static void test_tq1_0_layout() {
 }
 
 // ---------------------------------------------------------------------------
+// Prism-ML's group-128 ternary family (PrismML-Eng/llama.cpp branch prism,
+// ggml ids 142 PQ2_0 and 143 PTQ1_0), and the prism.hadamard activation
+// transform that those checkpoints also require.
+// ---------------------------------------------------------------------------
+
+static void test_pq2_0_layout() {
+    // {f16 d; u8 qs[32]} = 34 bytes / 128 values. The codec is Q2_0's at
+    // group 128: four codes per byte, low pair first, 00 -> -1, 01 -> 0,
+    // 10 -> +1, 11 -> +2, value = (code - 1) * d. Authority: block_pq2_0 and
+    // dequantize_row_pq2_0 in that fork's ggml-common.h / ggml-quants.c.
+    u8 blk[34];
+    const u16 one = fp32_to_fp16(1.0f);
+    blk[0] = static_cast<u8>(one & 0xFF);
+    blk[1] = static_cast<u8>(one >> 8);
+    std::memset(blk + 2, 0x55, 32); // every code 1 -> value 0
+    blk[2] = 0xE4;                  // 11 10 01 00 -> codes at shifts 6/4/2/0
+    f32 out[128];
+    dequant_row(DType::PQ2_0, blk, out, 128);
+    CHECK_NEAR(out[0], -1.0f, 1e-6, "PQ2_0: code 00 is -d");
+    CHECK_NEAR(out[1], 0.0f, 1e-6, "PQ2_0: code 01 is 0, not -d");
+    CHECK_NEAR(out[2], 1.0f, 1e-6, "PQ2_0: code 10 is +d");
+    CHECK_NEAR(out[3], 2.0f, 1e-6, "PQ2_0: code 11 is +2d, not clamped");
+    CHECK_NEAR(out[4], 0.0f, 1e-6, "PQ2_0: byte 1 starts at value 4");
+    CHECK_NEAR(out[127], 0.0f, 1e-6, "PQ2_0: 128 values come from one 34-byte block");
+    int nz = 0;
+    for (int i = 0; i < 128; i++)
+        if (out[i] != 0.0f) nz++;
+    CHECK(nz == 3, "PQ2_0: exactly byte 0's three non-zero codes decoded");
+
+    // d carries through, including the +2d step.
+    const u16 half = fp32_to_fp16(0.5f);
+    blk[0] = static_cast<u8>(half & 0xFF);
+    blk[1] = static_cast<u8>(half >> 8);
+    dequant_row(DType::PQ2_0, blk, out, 128);
+    CHECK_NEAR(out[0], -0.5f, 1e-6, "PQ2_0: d scales every code");
+    CHECK_NEAR(out[3], 1.0f, 1e-6, "PQ2_0: +2d with d = 0.5");
+
+    // Two blocks must be walked at a 34-byte stride: 32 reads the second
+    // block nine bytes early (fluent garbage), 64 skips half of them.
+    u8 two[68];
+    std::memset(two, 0, sizeof(two));
+    two[0] = static_cast<u8>(one & 0xFF);
+    two[1] = static_cast<u8>(one >> 8);
+    two[2] = 0xE4;
+    two[34] = static_cast<u8>(one & 0xFF);
+    two[35] = static_cast<u8>(one >> 8);
+    two[36] = 0xE4;
+    f32 out2[256];
+    dequant_row(DType::PQ2_0, two, out2, 256);
+    CHECK_NEAR(out2[3], 2.0f, 1e-6, "PQ2_0: block 0 fills 0..127");
+    CHECK_NEAR(out2[127], -1.0f, 1e-6, "PQ2_0: block 0 ends at 127");
+    CHECK_NEAR(out2[128], -1.0f, 1e-6, "PQ2_0: block 1 starts at 128");
+    CHECK_NEAR(out2[131], 2.0f, 1e-6, "PQ2_0: block 1's codes read at +128");
+
+    std::vector<f32> x(128, 1.0f);
+    CHECK_NEAR(vec_dot(DType::PQ2_0, blk, x.data(), 128), 1.0f, 1e-3,
+               "PQ2_0: vec_dot sums the scaled codes (-0.5 + 0 + 0.5 + 1)");
+}
+
+static void test_ptq1_0_layout() {
+    // {u8 qs[24]; u8 qh[2]; f16 d} = 28 bytes / 128 values: TQ1_0's base-3
+    // trit packing at group 128, scale LAST (bytes 26..27). Authority:
+    // block_ptq1_0 and dequantize_row_ptq1_0 in that fork. The traversal is
+    // stage windows {32, 16, 8} over qs -- the 32-wide window never fits in
+    // 24 bytes -- five trit planes per window, then four planes over qh:
+    //   idx [0, 80):   qs[idx % 16],  plane idx / 16
+    //   idx [80, 120): qs[16 + t % 8], plane t / 8      (t = idx - 80)
+    //   idx [120,128): qh[t % 2],      plane t / 2      (t = idx - 120)
+    u8 blk[28];
+    const u16 one = fp32_to_fp16(1.0f);
+
+    // The all-zero block. A trit of 0 has base-3 code 1, which lands on 128
+    // in the qs planes and 127 in qh (one place further, 4 planes vs 5).
+    std::memset(blk, 128, 24);
+    std::memset(blk + 24, 127, 2);
+    blk[26] = static_cast<u8>(one & 0xFF);
+    blk[27] = static_cast<u8>(one >> 8);
+    f32 out[128];
+    dequant_row(DType::PTQ1_0, blk, out, 128);
+    int zero = 0;
+    for (int i = 0; i < 128; i++)
+        if (out[i] == 0.0f) zero++;
+    CHECK(zero == 128, "PTQ1_0: the zero block decodes to 128 zeros");
+
+    // The all-+1 block: every plane of 255 lands on +1.
+    std::memset(blk, 255, 26);
+    blk[26] = static_cast<u8>(one & 0xFF);
+    blk[27] = static_cast<u8>(one >> 8);
+    dequant_row(DType::PTQ1_0, blk, out, 128);
+    int wrong = 0;
+    for (int i = 0; i < 128; i++)
+        if (std::fabs(out[i] - 1.0f) > 1e-6f) wrong++;
+    CHECK(wrong == 0, "PTQ1_0: the all-plus-1 block decodes to 128 +1s");
+    CHECK_NEAR(out[127], 1.0f, 1e-6, "PTQ1_0: the last value comes from qh");
+
+    // Traversal, first stage. Byte 17 decodes to -1, -1, 0, +1, 0 across its
+    // five planes (17*1 -> 0, 17*3 -> 0, 17*9 -> 1, 17*27 -> 2, 17*81 -> 1
+    // after the (byte * 3^n) * 3 >> 8 step), so planting it at qs[0] puts
+    // exactly those at output indices 0, 16, 32, 48, 64 -- one per plane.
+    static const f32 want5[5] = {-1.0f, -1.0f, 0.0f, 1.0f, 0.0f};
+    std::memset(blk, 128, 26);
+    blk[0] = 17;
+    dequant_row(DType::PTQ1_0, blk, out, 128);
+    for (int p = 0; p < 5; p++)
+        CHECK_NEAR(out[p * 16], want5[p], 1e-6,
+                   "PTQ1_0: qs[0] feeds one index per plane");
+    int nz = 0;
+    for (int i = 0; i < 80; i++)
+        if (out[i] != 0.0f) nz++;
+    CHECK(nz == 3, "PTQ1_0: nothing outside qs[0]'s five indices decoded");
+
+    // Second stage: the 8-wide window over qs[16..23] starts at index 80.
+    std::memset(blk, 128, 26);
+    blk[16] = 17;
+    dequant_row(DType::PTQ1_0, blk, out, 128);
+    for (int p = 0; p < 5; p++)
+        CHECK_NEAR(out[80 + p * 8], want5[p], 1e-6,
+                   "PTQ1_0: the 8-wide stage starts at index 80");
+    nz = 0;
+    for (int i = 0; i < 120; i++)
+        if (out[i] != 0.0f) nz++;
+    CHECK(nz == 3, "PTQ1_0: the 8-wide stage reads qs[16] and nothing else");
+
+    // qh: four planes of two bytes, the last eight values.
+    std::memset(blk, 128, 26);
+    blk[24] = 17;
+    dequant_row(DType::PTQ1_0, blk, out, 128);
+    static const f32 want4[4] = {-1.0f, -1.0f, 0.0f, 1.0f};
+    for (int p = 0; p < 4; p++) {
+        CHECK_NEAR(out[120 + p * 2], want4[p], 1e-6,
+                   "PTQ1_0: qh[0] feeds one index per plane");
+        CHECK_NEAR(out[121 + p * 2], 0.0f, 1e-6,
+                   "PTQ1_0: qh[1] is untouched and stays 0");
+    }
+
+    // d sits at bytes 26..27 and scales every stage, qh included.
+    std::memset(blk, 255, 26);
+    const u16 half = fp32_to_fp16(0.5f);
+    blk[26] = static_cast<u8>(half & 0xFF);
+    blk[27] = static_cast<u8>(half >> 8);
+    dequant_row(DType::PTQ1_0, blk, out, 128);
+    CHECK_NEAR(out[0], 0.5f, 1e-6, "PTQ1_0: d scales the qs trits");
+    CHECK_NEAR(out[127], 0.5f, 1e-6, "PTQ1_0: d scales the qh tail");
+    std::vector<f32> x(128, 1.0f);
+    CHECK_NEAR(vec_dot(DType::PTQ1_0, blk, x.data(), 128), 64.0f, 1e-3,
+               "PTQ1_0: vec_dot sums 128 scaled trits");
+}
+
+// Reference for Backend::hadamard_act, written from the definition rather
+// than from either implementation: an optional grouped-V perm, the sign
+// vector, then H[i][j] = (-1)^popcount(i & j) / sqrt(block) over consecutive
+// blocks. The CPU butterfly and the HIP kernels are both checked against it,
+// and the two orders are checked against each other (fold then inverse must
+// be the identity, which is the property the latent embedding lookup is).
+static void had_ref(const f32 *in, f32 *out, i64 rows, i64 n, i64 block,
+                    const f32 *signs, bool signs_first, i64 hd, i64 nk,
+                    i64 rep) {
+    std::vector<f32> w(static_cast<size_t>(n));
+    std::vector<f32> tmp(static_cast<size_t>(block));
+    const f32 scale = 1.0f / std::sqrt(static_cast<f32>(block));
+    for (i64 r = 0; r < rows; r++) {
+        if (hd > 0) {
+            for (i64 j = 0; j < rep; j++)
+                for (i64 k = 0; k < nk; k++)
+                    for (i64 i = 0; i < hd; i++)
+                        w[static_cast<size_t>(i + j * hd + k * hd * rep)] =
+                            in[static_cast<size_t>(r * n + i + k * hd +
+                                                   j * hd * nk)];
+        } else {
+            for (i64 i = 0; i < n; i++)
+                w[static_cast<size_t>(i)] = in[static_cast<size_t>(r * n + i)];
+        }
+        if (signs_first && signs)
+            for (i64 i = 0; i < n; i++) w[static_cast<size_t>(i)] *= signs[i];
+        for (i64 off = 0; off < n; off += block) {
+            for (i64 i = 0; i < block; i++) {
+                f32 acc = 0.0f;
+                for (i64 j = 0; j < block; j++) {
+                    i64 p = i & j;
+                    int parity = 0;
+                    for (int b = 0; b < 62; b++)
+                        parity ^= static_cast<int>((p >> b) & 1);
+                    acc += parity ? -w[static_cast<size_t>(off + j)]
+                                  : w[static_cast<size_t>(off + j)];
+                }
+                tmp[static_cast<size_t>(i)] = acc * scale;
+            }
+            for (i64 i = 0; i < block; i++)
+                w[static_cast<size_t>(off + i)] = tmp[static_cast<size_t>(i)];
+        }
+        if (!signs_first && signs)
+            for (i64 i = 0; i < n; i++) w[static_cast<size_t>(i)] *= signs[i];
+        for (i64 i = 0; i < n; i++)
+            out[static_cast<size_t>(r * n + i)] = w[static_cast<size_t>(i)];
+    }
+}
+
+static f32 had_worst(const std::vector<f32> &a, const std::vector<f32> &b) {
+    f32 worst = 0.0f;
+    for (size_t i = 0; i < a.size(); i++) {
+        const f32 d = std::fabs(a[i] - b[i]);
+        if (d > worst) worst = d;
+    }
+    return worst;
+}
+
+static void test_hadamard_act() {
+    Backend *cpu = make_cpu_backend();
+
+    // 1. The FWHT alone, against the popcount definition, two blocks a row.
+    {
+        const i64 block = 64;
+        const i64 rows = 3;
+        const i64 n = block * 2;
+        std::vector<f32> in(static_cast<size_t>(rows * n));
+        for (size_t i = 0; i < in.size(); i++)
+            in[i] = 0.001f * static_cast<f32>(i % 97) - 0.3f;
+        std::vector<f32> ref(in.size()), got(in.size());
+        had_ref(in.data(), ref.data(), rows, n, block, nullptr, true, 0, 0, 0);
+        Backend::HadDesc d;
+        d.n = n;
+        d.block = block;
+        d.signs = nullptr;
+        d.signs_first = true;
+        cpu->hadamard_act(got.data(), in.data(), rows, d);
+        CHECK(had_worst(got, ref) < 1e-5f,
+              "hadamard_act's FWHT matches the popcount definition");
+        // H . H = I with the 1/sqrt(block) scale: applying it twice is the
+        // identity, which is what lets one routine be fold AND inverse.
+        std::vector<f32> back(got.size());
+        cpu->hadamard_act(back.data(), got.data(), rows, d);
+        CHECK(had_worst(back, in) < 1e-5f,
+              "the normalized FWHT is its own inverse");
+    }
+
+    // 2. Signs, in both orders, and in place.
+    {
+        const i64 block = 32;
+        const i64 rows = 2;
+        const i64 n = 96;
+        std::vector<f32> in(static_cast<size_t>(rows * n));
+        for (size_t i = 0; i < in.size(); i++)
+            in[i] = 0.05f * static_cast<f32>(static_cast<int>(i % 23) - 11);
+        std::vector<f32> signs(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; i++)
+            signs[static_cast<size_t>(i)] =
+                (i % 3 == 0 || i % 7 == 0) ? -1.0f : 1.0f;
+        std::vector<f32> ref(in.size()), got(in.size());
+        had_ref(in.data(), ref.data(), rows, n, block, signs.data(), true, 0,
+                0, 0);
+        Backend::HadDesc d;
+        d.n = n;
+        d.block = block;
+        d.signs = signs.data();
+        d.signs_first = true;
+        cpu->hadamard_act(got.data(), in.data(), rows, d);
+        CHECK(had_worst(got, ref) < 1e-5f,
+              "hadamard_act applies signs before the FWHT (the fold)");
+
+        // out == in has to be legal: every site in the engine runs in place
+        // on the embedding row, and the prefill paths rely on it.
+        std::vector<f32> inplace = in;
+        cpu->hadamard_act(inplace.data(), inplace.data(), rows, d);
+        CHECK(had_worst(inplace, ref) < 1e-5f,
+              "hadamard_act transforms in place when out == in");
+
+        // The inverse order -- FWHT then signs -- must undo the fold. This is
+        // the property the latent token embedding's inverse-after-lookup uses.
+        std::vector<f32> back(in.size());
+        d.signs_first = false;
+        cpu->hadamard_act(back.data(), got.data(), rows, d);
+        CHECK(had_worst(back, in) < 1e-4f,
+              "fold then inverse restores the input exactly");
+        std::vector<f32> ref_inv(in.size());
+        had_ref(in.data(), ref_inv.data(), rows, n, block, signs.data(), false,
+                0, 0, 0);
+        std::vector<f32> got_inv(in.size());
+        cpu->hadamard_act(got_inv.data(), in.data(), rows, d);
+        CHECK(had_worst(got_inv, ref_inv) < 1e-5f,
+              "hadamard_act applies signs after the FWHT (the inverse)");
+    }
+
+    // 3. The grouped-V permutation ssm_out's input carries: [hd, nk, rep] ->
+    // [hd, rep, nk], ahead of everything else.
+    {
+        const i64 hd = 4, nk = 3, rep = 2;
+        const i64 n = hd * nk * rep; // 24
+        const i64 block = 8;
+        const i64 rows = 2;
+        std::vector<f32> in(static_cast<size_t>(rows * n));
+        for (size_t i = 0; i < in.size(); i++)
+            in[i] = static_cast<f32>(static_cast<int>(i % 17) - 8);
+        std::vector<f32> ref(in.size()), got(in.size());
+        had_ref(in.data(), ref.data(), rows, n, block, nullptr, true, hd, nk,
+                rep);
+        Backend::HadDesc d;
+        d.n = n;
+        d.block = block;
+        d.signs = nullptr;
+        d.signs_first = true;
+        d.perm_hd = hd;
+        d.perm_nk = nk;
+        d.perm_rep = rep;
+        cpu->hadamard_act(got.data(), in.data(), rows, d);
+        CHECK(had_worst(got, ref) < 1e-5f,
+              "hadamard_act permutes ssm_out's grouped-V feature order");
+    }
+
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
 // The IQ family and BitNet's Q1_0 / Q2_0 / Q2_0_64 (ggml ids
 // 17/18/19/21/22/29/41/42/48).
 // ---------------------------------------------------------------------------
@@ -760,6 +1072,8 @@ static void test_new_quant_geometry() {
     // 2 + 64 + 8 + 32 + 4; IQ2_S 82 = 2 + 64 + 8 + 8; IQ1_M 56 = 32 + 16 + 8
     // and has NO f16 d field at all; Q1_0 18 = 2 + 128/8; Q2_0 34 = 2 + 128/4;
     // Q2_0_64 18 = 2 + 64/4. Q2_0 and Q2_0_64 share a code map, not a block.
+    // PQ2_0 34 = 2 + 128/4 (the Q2_0 codec at group 128); PTQ1_0 28 =
+    // 24 + 2 + 2 (TQ1_0's base-3 packing at group 128, scale last).
     const RowSpec rows[] = {
         {DType::IQ3_XXS, "IQ3_XXS", 98, 256},
         {DType::IQ1_S, "IQ1_S", 50, 256},
@@ -769,6 +1083,8 @@ static void test_new_quant_geometry() {
         {DType::Q1_0, "Q1_0", 18, 128},
         {DType::Q2_0, "Q2_0", 34, 128},
         {DType::Q2_0_64, "Q2_0_64", 18, 64},
+        {DType::PQ2_0, "PQ2_0", 34, 128},
+        {DType::PTQ1_0, "PTQ1_0", 28, 128},
     };
     for (const RowSpec &r : rows) {
         CHECK(dtype_supported(r.t), "the format is dequantizable");
@@ -793,6 +1109,10 @@ static void test_new_quant_geometry() {
     CHECK(static_cast<int>(DType::Q1_0) == 41, "Q1_0 keeps ggml id 41");
     CHECK(static_cast<int>(DType::Q2_0) == 42, "Q2_0 keeps ggml id 42");
     CHECK(static_cast<int>(DType::Q2_0_64) == 48, "Q2_0_64 keeps fork id 48");
+    // PrismML's ids, from that fork's ggml.h: GGML_TYPE_PQ2_0 = 142,
+    // GGML_TYPE_PTQ1_0 = 143 (and GGML_TYPE_COUNT = 144 there).
+    CHECK(static_cast<int>(DType::PQ2_0) == 142, "PQ2_0 keeps Prism id 142");
+    CHECK(static_cast<int>(DType::PTQ1_0) == 143, "PTQ1_0 keeps Prism id 143");
 }
 
 static void test_q1_0_layout() {
@@ -3718,6 +4038,9 @@ int main() {
     test_new_quant_geometry();
     test_q1_0_layout();
     test_q2_0_layout();
+    test_pq2_0_layout();
+    test_ptq1_0_layout();
+    test_hadamard_act();
     test_iq_family_structure();
     test_vec_dot();
     test_arch_table();

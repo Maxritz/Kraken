@@ -24,6 +24,7 @@
 #include "kernels/gemm.hpp"
 #include "kernels/gemm_dp4a.hpp"
 #include "kernels/gdn.hpp"
+#include "kernels/hadamard.hpp"
 #include "op_time.hpp"
 
 // Declared here rather than at their definitions (below the class) so the
@@ -1903,6 +1904,52 @@ public:
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         gdn_mul_act_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(a),
                                             static_cast<const _Float16 *>(b), n);
+    }
+
+    // ---- prism.hadamard activation transform (Backend::hadamard_act) ----
+    //
+    // gather -> fwht -> (gather), with the stages the descriptor asks for.
+    // The first gather also covers plain copy (out != in, no perm, no signs),
+    // so the middle stage never has to care which buffer it found.
+    void hadamard_act(void *out, const void *in, i64 rows,
+                      const Backend::HadDesc &d) override {
+        KRK_TIME_OP("hadamard_act");
+        if (rows <= 0 || d.n <= 0) return;
+        const i64 block = d.block;
+        if (block <= 0 || (block & (block - 1)) != 0 || d.n % block != 0) {
+            KRK_ERROR("hadamard_act: width %lld is not a whole number of "
+                      "%lld-element blocks", (long long)d.n, (long long)block);
+            std::abort();
+        }
+        _Float16 *o = static_cast<_Float16 *>(out);
+        const _Float16 *x = static_cast<const _Float16 *>(in);
+        const i64 total = rows * d.n;
+
+        const bool gather = d.perm_hd > 0 || (d.signs_first && d.signs) ||
+                            out != in;
+        if (gather) {
+            const unsigned threads = 256;
+            const unsigned blocks =
+                static_cast<unsigned>((total + threads - 1) / threads);
+            hadamard_gather_kernel<<<blocks, threads>>>(
+                o, x, total, d.n, d.signs_first ? d.signs : nullptr, d.perm_hd,
+                d.perm_nk, d.perm_rep);
+        }
+        {
+            const unsigned threads =
+                static_cast<unsigned>(std::min<i64>(block, 256));
+            const i64 cells = rows * (d.n / block);
+            hadamard_fwht_kernel<<<static_cast<unsigned>(cells), threads,
+                                   static_cast<size_t>(block) * sizeof(f32)>>>(
+                o, total, block);
+        }
+        if (!d.signs_first && d.signs) {
+            const unsigned threads = 256;
+            const unsigned blocks =
+                static_cast<unsigned>((total + threads - 1) / threads);
+            hadamard_gather_kernel<<<blocks, threads>>>(o, o, total, d.n,
+                                                        d.signs, 0, 0, 0);
+        }
     }
 
     // Laguna's per-head output gate: x[t, h, :] *= g[t, h].

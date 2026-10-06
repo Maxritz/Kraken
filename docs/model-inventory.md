@@ -19,16 +19,20 @@ supported and rows that named them as blockers were stale for the same reason.
 
 The verdict column is the loader's *static* decision — supported architecture,
 playable role, all formats dequantizable — not a claim that the file was run.
-End-to-end runs were made for two files: `Bonsai-27B-Q1_0.gguf` (GPU text
-identical to the scalar CPU reference) and `Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf`
-(the same, over IQ3_S/IQ3_XXS/IQ2_S/IQ2_XS/IQ2_XXS/IQ1_S/IQ1_M/IQ4_XS at once).
-The rest became loadable by the format work and are still unrun here.
+End-to-end runs were made for three files: `Bonsai-27B-Q1_0.gguf` (GPU text
+identical to the scalar CPU reference), `Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf`
+(the same, over IQ3_S/IQ3_XXS/IQ2_S/IQ2_XS/IQ2_XXS/IQ1_S/IQ1_M/IQ4_XS at once)
+and `Ternary-Bonsai-2-27B-PQ2_0.gguf` (the same, over 402 PQ2_0 tensors plus
+the block-1024 Hadamard activation transform). The rest became loadable by the
+format work and are still unrun here.
 
 Still refused, and deliberately so: types **102, 104, 107** (no authoritative
-block layout exists on this machine) and **142** (layout measured, code map is
-not a level map -- four candidates failed; see docs/TODO.md). None guessed. Affected files are `Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf`
-(102, 107), `ornith-1.0-35B-Q3_0_ROCMFPX.gguf` (102, 104) and
-`Ternary-Bonsai-2-27B-PQ2_0.gguf` (142).
+block layout exists on this machine). None guessed. Affected files are `Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf`
+(102, 107) and `ornith-1.0-35B-Q3_0_ROCMFPX.gguf` (102, 104).
+`Ternary-Bonsai-2-27B-PQ2_0.gguf` (142) became runnable on 2026-10-07: PQ2_0
+decodes host and device from the PrismML fork's block structs, the
+block-1024 Hadamard transform its `prism.hadamard` metadata declares is
+implemented, and the run passes device-vs-CPU coherence.
 
 Two files are **broken rather than unsupported**, and must not be read as a
 missing dequantizer: `Ternary-Bonsai-27B-Q2_0.gguf` and the Q2_0 shard of
@@ -119,7 +123,7 @@ four type ids above, and the `qwen4exp` architecture used by the
 | `llama — supported (dense)` | runnable | 2561M | G:/More-models/Samastam-2.5B-Q8_0.gguf |  |  |
 | `spark2_5 — not supported` | refused | 4173M | G:/More-models/Spark-X2.5-4B-Q8_0.gguf | a fused attn_qkv projection and an attention output gate are not implemented;uses an attention output gate (attn_gate), which this engine does not implement uses a fused query/key/value projection (attn_qkv), which this engine does not implement |  |
 | `qwen2 — supported (dense)` | runnable | 2421M | G:/More-models/Spark_one.Q6_K.gguf |  |  |
-| `qwen35 — supported (recurrent)` | refused | 6873M | G:/More-models/Ternary-Bonsai-2-27B-PQ2_0.gguf | uses quantization type #142, which this build cannot dequantize |  |
+| `qwen35 — supported (recurrent)` | runnable | 6873M | G:/More-models/Ternary-Bonsai-2-27B-PQ2_0.gguf |  |  |
 | `dspark — draft file (not a model)` | refused | 1857M | G:/More-models/Ternary-Bonsai-27B-dspark-Q4_1.gguf | dspark speculative head set (dspark.*, 6 blocks) rather than a model; kraken's speculation drafts with --draft, a full model of the family;its Q2_0 tensor is laid out at 17 bytes per 64 values, so the file is internally inconsistent and unreadable | carries dspark speculative head tensors, which this engine does not use |
 | `qwen35moe — supported (recurrent-moe)` | runnable | 25432M | G:/More-models/Tiel-Coder-35B-A3B-MTP-APEX.gguf |  | carries 1 multi-token-prediction block(s) (blk.40) that this engine skips |
 | `qwen35moe — supported (recurrent-moe)` | runnable | 25361M | G:/More-models/Tiel-Coder-35B-A3B-UD-Q5_K_XL.gguf |  |  |

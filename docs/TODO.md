@@ -710,7 +710,7 @@ the suspect. Fix = take dequant off the critical path: double-buffered LDS, a
   draft head and wire them into the existing speculative loop.
 - **Architecture pass over every file in the model folders** — the inventory is
   at 44 runnable of 87; the refused ones need either a named dequantizer
-  (quant type #102/#104/#107/#142 -- #100 and #101 are implemented) or a
+  (quant type #102/#104/#107 -- #100, #101, #142 and #143 are implemented) or a
   documented reason, and the runnable set
   needs a load-and-generate smoke test each.
 - **Paper backlog** — all 12 summarized with what each would change here in
@@ -756,7 +756,7 @@ the suspect. Fix = take dequant off the critical path: double-buffered LDS, a
 
 ## P4 — known limits carried forward from STATUS.md §6
 
-- IQ\* formats except IQ4_NL **were** rejected at load by design. As of 2026-10-06 IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S and IQ1_M are decoded on host and device, as are BitNet's Q1_0 (41) and Q2_0 (42). The only remaining quant refusals are ids **102, 104, 107 and 142**, which have no authoritative block layout here.
+- IQ\* formats except IQ4_NL **were** rejected at load by design. As of 2026-10-06 IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S and IQ1_M are decoded on host and device, as are BitNet's Q1_0 (41) and Q2_0 (42). The only remaining quant refusals are ids **102, 104 and 107**, which have no authoritative block layout here; 142 (PQ2_0) and 143 (PTQ1_0) landed 2026-10-07 host and device, block-1024 Hadamard activation transform included.
 - Serving is serialized: no prefix cache, no cancellation, no concurrent
   batching, no beam search.
 - Speculative decoding is greedy-only; no MTP, tree attention, or n-gram
@@ -1012,7 +1012,7 @@ docs/test-results.md §9.
 | G4 | **Tiered KV cache absent entirely.** One flat `alloc(n_layer * kv_cap * kv_dim)` in VRAM. No RAM tier, no NVMe tier, no paging, no radix prefix reuse. | `engine.cpp:275` | open |
 | G5 | **No 6/8 GiB profile.** Expert budget is a flat byte cap; KV is flat VRAM. Neither adapts to a small card. | `configure_expert_cache` | open |
 | G6 | **RDNA2 unvalidated.** gfx1031 is the primary target and there is no machine; every RDNA2 claim is untested by construction. | — | blocked |
-| G7 | **Missing quant types blocked four named files.** IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ1_M and BitNet's Q1_0 (41) / Q2_0 (42) are now decoded on **host and device**, with every codebook machine-diffed against ggml-common.h (see the dequant session entry at the end of this file). **`qwen4exp` still has no registry entry** (the Qwen3.8-Flash item), and ids 102/104/107/142 still have no authoritative layout. | prior session + this session | **formats CLOSED; `qwen4exp` and ids 102/104/107/142 open** |
+| G7 | **Missing quant types blocked four named files.** IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ1_M and BitNet's Q1_0 (41) / Q2_0 (42) are now decoded on **host and device**, with every codebook machine-diffed against ggml-common.h (see the dequant session entry at the end of this file). **`qwen4exp` still has no registry entry** (the Qwen3.8-Flash item), and ids 102/104/107 still have no authoritative layout (142/143 landed 2026-10-07). | prior session + this session | **`qwen4exp` and ids 102/104/107 open; 142/143 closed** |
 | G8 | **MoE decode loses to llama.cpp running on CPU only** (13.2 vs 16.3 tok/s). | this session | open |
 | G9 | **DFlash acceptance 0%** in kraken; the reference also reports 0.000% on the official pair. | prior session | open |
 | G10 | **The gate has no equivalence test for fast paths.** `probe_attn_qtile` was a *broken build target* for an unknown number of sessions, which is why G1a survived. | this session | open |
@@ -1070,7 +1070,7 @@ the gate) so a regression cannot hide again. Then G2, then G3, then G4/G5.
 | T8 | Tiered KV cache: VRAM HOT / RAM WARM / NVMe COLD, radix prefix reuse, persistence. Zero implementation | open |
 | T9 | 6/8/12/16 GiB hardware profiles, slot strategy per spec §28-29 | open |
 | T10 | **RDNA2 validation — now actionable on maclin** | open |
-| T11 | Quant: **every listed format is now implemented on both host and device**, IQ2_XS's missing `dequant_chunk` branch included -- see the dequant session entry at the end of this file. **`qwen4exp` still has no registry entry** (this is the Qwen3.8-Flash item, and it is why `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS` is refused on the arch rather than the quant). Ids 102/104/107/142 remain refusals: no reference layout exists on this machine, so they must not be guessed | **formats done; `qwen4exp` + ids 102/104/107/142 open** |
+| T11 | Quant: **every listed format is now implemented on both host and device**, IQ2_XS's missing `dequant_chunk` branch included -- see the dequant session entry at the end of this file. **`qwen4exp` still has no registry entry** (this is the Qwen3.8-Flash item, and it is why `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS` is refused on the arch rather than the quant). Ids 102/104/107 remain refusals: no reference layout exists on this machine, so they must not be guessed (142/143 resolved from the PrismML fork header, 2026-10-07) | **`qwen4exp` + ids 102/104/107 open; 142/143 done** |
 | T12 | Correctness: laguna greedy output not reproducible run-to-run — **the decode-attention split-K race responsible is identified and fixed** (see the entry above); DFlash 0%; Spark_one.Q6_K; two ambiguous `device rc=0, cpu rc=1` models | needs re-verification |
 | T13 | **The gate has no equivalence test for fast paths** — the reason a 41%-wrong kernel shipped and survived | open |
 | T14 | Doc drift: README says a 32x64x64 WMMA tile (code: BK=128) and "weights are never dequantized" (the WMMA prefill path stages fp16 through LDS) | open |
@@ -1125,7 +1125,7 @@ of the Q1_0/Q2_0 files that were waiting on them run; the Q2_0 block geometry
 turned out to be the llama-dx fork's 128-value one, so the earlier "malformed
 file" reading was wrong and is withdrawn. Details in section 11 of
 [docs/test-results.md](test-results.md). Still refused, and needing a newer fork
-revision rather than more engine work: ids 102, 104, 107 and 142.
+revision rather than more engine work: ids 102, 104 and 107.
 
 --------------------------------------------------------------------------------
 Session entry: RDNA2 head-to-head (HIP reference) + the OLMoE QK-norm
@@ -1255,9 +1255,10 @@ sizes and load.
 **Still refused, and it is not a decoder gap:**
 
 - ids **102, 104, 107** have no authoritative block layout on this machine,
-  so they must not be guessed. **142** is a different case: its layout *is*
-  measured (below); what is missing there is the code map, and that one was
-  tried and failed.
+  so they must not be guessed. **142** is a different case and is closed: its
+  decoder came from the PrismML fork header, and what every end-to-end attempt
+  lacked was the block-1024 Hadamard activation transform (resolution note on
+  its entry below).
   `H:/llamadx/llama.cpp/.llama-dx-reference` is a clone of Maxritz/LLAMA-DX at
   the tip of `origin/main` (ce15745) and its `ggml.h` stops at 101 with
   `GGML_TYPE_COUNT = 102`, so these ids come from a newer revision of that fork
@@ -1284,6 +1285,11 @@ sizes and load.
   types -- `GGML_TYPE_TQ3_1S`/`TQ4_1S` are described as WHT-rotated Lloyd-Max --
   and a rotated block cannot be decoded by a level map at all, which is also
   what the "folded" basename suggests.
+  **Resolved 2026-10-07:** the level map was in the PrismML fork header all
+  along (`dequantize_row_pq2_0`), and what every attempt lacked was the file's
+  block-1024 Hadamard activation transform declared in `prism.hadamard`
+  metadata. Both are implemented host+device now; the file passes
+  device-vs-CPU coherence, and PTQ1_0 (143) landed with it.
 - the older entry saying the `*-Q2_0.gguf` files are **malformed** is wrong and
   is withdrawn here. They are a valid 128-value-block Q2_0 from the llama-dx
   fork and the engine loads them: coherence PASS against `--cpu`, and the

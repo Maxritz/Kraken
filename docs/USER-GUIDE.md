@@ -192,7 +192,7 @@ the plain loop.
 `F32` `F16` `BF16` `Q4_0` `Q4_1` `Q5_0` `Q5_1` `Q8_0` `Q8_1` `Q2_K` `Q3_K`
 `Q4_K` `Q5_K` `Q6_K` `Q8_K` `IQ4_NL` `IQ4_XS` `IQ2_XXS` `IQ2_XS` `IQ2_S`
 `IQ3_XXS` `IQ3_S` `IQ1_S` `IQ1_M` `MXFP4` `NVFP4` `Q4_0_ROCMFP4`
-`Q4_0_ROCMFP4_FAST` `TQ1_0` `TQ2_0` `Q1_0` `Q2_0` `Q2_0_64`
+`Q4_0_ROCMFP4_FAST` `TQ1_0` `TQ2_0` `Q1_0` `Q2_0` `Q2_0_64` `PQ2_0` `PTQ1_0`
 
 `IQ4_NL` and `IQ4_XS` both dequantize — `SmolLM2-135M-Instruct.IQ4_XS` loads,
 inspects as runnable, and decodes at ~599 tok/s here. The whole IQ family now
@@ -203,14 +203,15 @@ ternary exports are written with, and upstream's 64-value block is id 48,
 byte-for-byte transcription of llama.cpp's `ggml-common.h`, diffed entry by
 entry, and each decoder mirrors its `dequantize_row_*`, on both the host
 reference path and the GPU kernels — so the `GSQ-RCO`, `IQ3_XXS` and `Bonsai`
-exports load and decode. NVFP4 and MXFP4 dequantize fine too.
+exports load and decode. NVFP4 and MXFP4 dequantize fine too. The PrismML
+ternary pair `PQ2_0`/`PTQ1_0` (ids 142/143) decodes on both paths as well,
+together with the block-1024 Hadamard activation transform a file declares in
+its `prism.hadamard` metadata — `Ternary-Bonsai-2-27B-PQ2_0.gguf` passes
+device-vs-CPU coherence.
 
 **Still refused**: the ROCmFPX ids **102, 104, 107** -- no header on this
 machine declares their block layout, and an 11-stride sweep never located a
-plausible scale field -- and the ternary id **142 (PQ2_0)**, whose geometry is
-measured (34 B per 128, f16 scale leading the block) but whose codes are not a
-per-code level map: four candidate maps decoded to non-words, the signature of
-a rotated (WHT/Lloyd-Max) block. Refused loudly at load rather than guessed.
+plausible scale field. Refused loudly at load rather than guessed.
 
 ### What is refused, and why
 
@@ -222,17 +223,18 @@ blocks, fused-QKV and attention-output-gate variants, unsupported quants, and
 head geometry the loader rejects.
 
 Two things have changed since that count was taken. The unsupported-quant group
-has shrunk to the ROCmFPX ids 102/104/107 and the ternary id 142, because the IQ
-family and `Q1_0`/`Q2_0` now dequantize. And a file that declares
+has shrunk to the ROCmFPX ids 102/104/107, because the IQ family, `Q1_0`/`Q2_0`
+and now `PQ2_0`/`PTQ1_0` (142/143) dequantize. And a file that declares
 `attention.key_length` no longer has to satisfy `n_embd % head_count == 0`:
 Qwen3.5's gated attention legitimately runs 24 heads of 256 dims over a
 5120-wide embedding, because `q_proj` is `2 * n_head * d` (it emits the query
 gate alongside the query).
 
-Separately, `Ternary-Bonsai-27B-Q2_0` is a bad *file*, not a missing format: its
-tensor offsets imply 17 bytes per 64 values where ggml's `Q2_0` is 18
-(`#define QK2_0 64`), and upstream llama.cpp rejects it for the same reason, so
-no decoder can read it correctly.
+Separately, `Ternary-Bonsai-27B-Q2_0` is *not* a bad file — this was claimed
+earlier and is withdrawn. Its tensors carry id 42 spelled as the llama-dx
+fork's 128-value / 34-byte `Q2_0`, where upstream computes 18 bytes per 64 and
+therefore rejects it; Kraken decodes the file's own layout, and it passes
+coherence against the scalar reference.
 
 When a model matters to you, ask the loader instead of guessing:
 

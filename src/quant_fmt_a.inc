@@ -116,6 +116,18 @@ void deq_q2_0_64(const u8 *b, f32 *y, i64 nblk) {
     }
 }
 
+// PQ2_0 (Prism fork type 142): 128 values in 34 bytes -- an f16 delta over a
+// 32-byte 2-bit plane, byte-identical codec to deq_q2_0 above (4 codes per
+// byte, low pair first, value = (q - 1) * d). Authority: block_pq2_0 in
+// PrismML-Eng/llama.cpp ggml-common.h ("Same 2-bit codec as Q2_0 (group 64)
+// but one fp16 scale per 128 weights"), cross-checked against that fork's
+// ggml_vec_dot_pq2_0_q8_0_generic (shifts 0/2/4/6, ((byte>>s)&3)-1) and
+// Prism's published pq2_dequant script (shifts [0,2,4,6], qs.astype(int8)-1).
+// The whole-block decode is the same computation, so it shares the body.
+void deq_pq2_0(const u8 *b, f32 *y, i64 nblk) {
+    deq_q2_0(b, y, nblk);
+}
+
 // IQ3_XXS: 3.0625 bpw. 98 bytes = fp16 d, 64 bytes of grid indices (8 per
 // 32-value group) and 32 bytes of "scale and signs" (4 per group). For each
 // group the top nibble of the little-endian uint32 is a 4-bit group scale and

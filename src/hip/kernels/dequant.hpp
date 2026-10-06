@@ -178,6 +178,8 @@ KRK_QTRAIT(DType::IQ4_XS, 8);
 KRK_QTRAIT(DType::Q1_0, 4);
 KRK_QTRAIT(DType::Q2_0, 4);
 KRK_QTRAIT(DType::Q2_0_64, 2);
+KRK_QTRAIT(DType::PQ2_0, 4);
+KRK_QTRAIT(DType::PTQ1_0, 4);
 KRK_QTRAIT(DType::NVFP4, 2);
 KRK_QTRAIT(DType::MXFP4, 1);
 KRK_QTRAIT(DType::ROCMFP4, 1);
@@ -219,6 +221,8 @@ __device__ __forceinline__ int dtype_block_bytes_dev(int t) {
         case static_cast<int>(DType::Q1_0): return 18;
         case static_cast<int>(DType::Q2_0): return 34;
         case static_cast<int>(DType::Q2_0_64): return 18;
+        case static_cast<int>(DType::PQ2_0): return 34;   // block_pq2_0 (Prism)
+        case static_cast<int>(DType::PTQ1_0): return 28;  // block_ptq1_0 (Prism)
         case static_cast<int>(DType::IQ4_XS): return 136;
         case static_cast<int>(DType::NVFP4): return 36;
         case static_cast<int>(DType::MXFP4): return 17;
@@ -259,6 +263,8 @@ __device__ __forceinline__ int dtype_chunks_per_block_dev(int t) {
         case static_cast<int>(DType::NVFP4): return 2;
         case static_cast<int>(DType::Q2_0): return 4;
         case static_cast<int>(DType::Q2_0_64): return 2;
+        case static_cast<int>(DType::PQ2_0): return 4;
+        case static_cast<int>(DType::PTQ1_0): return 4;
         default: return 1;
     }
 }
@@ -302,6 +308,20 @@ __device__ __forceinline__ int tq1_trit_at_dev(const u8 *b, int idx) {
     // qh is emitted plane-major: byte index t % 4, trit plane t / 4.
     const int t = idx - 240;
     return tq1_trit_of_dev(b[48 + (t % 4)], t / 4);
+}
+
+// Element `idx` (0..127) of a PTQ1_0 block (Prism type 143): TQ1_0's packing
+// halved to group 128 -- qs[0..15] in 5 planes, qs[16..23] in 5 planes, qh in
+// 4 planes. Same traversal as the host's ptq1_trit_at and as the fork's
+// ggml_vec_dot_ptq1_0_q8_0_generic.
+__device__ __forceinline__ int ptq1_trit_at_dev(const u8 *b, int idx) {
+    if (idx < 80) return tq1_trit_of_dev(b[idx % 16], idx / 16);
+    if (idx < 120) {
+        const int t = idx - 80;
+        return tq1_trit_of_dev(b[16 + (t % 8)], t / 8);
+    }
+    const int t = idx - 120;
+    return tq1_trit_of_dev(b[24 + (t % 2)], t / 2);
 }
 
 // True when every code in a TQ2_0 block decodes to exactly 0. TQ2_0 stores
@@ -651,6 +671,16 @@ __device__ __forceinline__ void dequant_chunk(const u8 *b, int chunk, _Float16 *
         dequant_chunk_q2_0(b, chunk, y);
     } else if constexpr (T == DType::Q2_0_64) {
         dequant_chunk_q2_0_64(b, chunk, y);
+    } else if constexpr (T == DType::PQ2_0) {
+        // Same geometry and codec as Q2_0 (34 B / 128, chunk = quarter).
+        dequant_chunk_q2_0(b, chunk, y);
+    } else if constexpr (T == DType::PTQ1_0) {
+        // {u8 qs[24]; u8 qh[2]; f16 d} = 28 B / 128; d at bytes 26..27.
+        const f32 d = d_h2f(static_cast<u16>(b[26] | (b[27] << 8)));
+#pragma unroll
+        for (int m = 0; m < 32; m++)
+            y[m] = static_cast<_Float16>(
+                d * static_cast<f32>(ptq1_trit_at_dev(b, chunk * 32 + m)));
     } else {
         (void)b;
         (void)chunk;
@@ -696,6 +726,8 @@ __device__ __forceinline__ void dequant_chunk_dev(int t, const u8 *b, int chunk,
         case static_cast<int>(DType::Q1_0): dequant_chunk<DType::Q1_0>(b, chunk, y); break;
         case static_cast<int>(DType::Q2_0): dequant_chunk<DType::Q2_0>(b, chunk, y); break;
         case static_cast<int>(DType::Q2_0_64): dequant_chunk<DType::Q2_0_64>(b, chunk, y); break;
+        case static_cast<int>(DType::PQ2_0): dequant_chunk<DType::PQ2_0>(b, chunk, y); break;
+        case static_cast<int>(DType::PTQ1_0): dequant_chunk<DType::PTQ1_0>(b, chunk, y); break;
         default:
 #pragma unroll
             for (int i = 0; i < 32; i++) y[i] = static_cast<_Float16>(0.0f);
@@ -920,6 +952,8 @@ __device__ __forceinline__ f32 dot_chunks(int t, const u8 *wrow, const _Float16 
         case static_cast<int>(DType::Q1_0): return dot_chunks_t<DType::Q1_0>(wrow, x, c0, c1);
         case static_cast<int>(DType::Q2_0): return dot_chunks_t<DType::Q2_0>(wrow, x, c0, c1);
         case static_cast<int>(DType::Q2_0_64): return dot_chunks_t<DType::Q2_0_64>(wrow, x, c0, c1);
+        case static_cast<int>(DType::PQ2_0): return dot_chunks_t<DType::PQ2_0>(wrow, x, c0, c1);
+        case static_cast<int>(DType::PTQ1_0): return dot_chunks_t<DType::PTQ1_0>(wrow, x, c0, c1);
         default: return 0.0f;
     }
 }
@@ -974,6 +1008,8 @@ __device__ __forceinline__ void dequant_row_dev(int t, const u8 *src, _Float16 *
         case static_cast<int>(DType::Q1_0): dequant_row_t<DType::Q1_0>(src, dst, n); break;
         case static_cast<int>(DType::Q2_0): dequant_row_t<DType::Q2_0>(src, dst, n); break;
         case static_cast<int>(DType::Q2_0_64): dequant_row_t<DType::Q2_0_64>(src, dst, n); break;
+        case static_cast<int>(DType::PQ2_0): dequant_row_t<DType::PQ2_0>(src, dst, n); break;
+        case static_cast<int>(DType::PTQ1_0): dequant_row_t<DType::PTQ1_0>(src, dst, n); break;
         default: break;
     }
 }

@@ -357,7 +357,7 @@ when the head width has to be inferred from the embedding.
 | Fused QKV / attention output gate (spark2_5) | Spark-X2.5-4B-Q8_0 |
 | Routed attention values (k2-horizon) | K2-Horizon-MoVA-36B-A4B-Q4_K_M |
 | Attention output gate (muse-glimmer) | Muse-Glimmer-30B-UD-Q8_K_XL |
-| Quant type this build cannot dequantize | Ternary-Bonsai-2-27B-PQ2_0 (#142), Qwen3.8-Distill-35B-Q2KXL (#102/#107), ornith-1.0-35B-Q3_0 (#104/#102) |
+| Quant type this build cannot dequantize | Qwen3.8-Distill-35B-Q2KXL (#102/#107), ornith-1.0-35B-Q3_0 (#104/#102) |
 | Head geometry the loader rejects (`n_embd` not divisible by head count, and no `attention.key_length` in the file to override it) | qwen3.8-flash-next-Q4, Qwen3.8-27B-WebGGUF-Q4_0 |
 
 ### Short-context decode
@@ -627,20 +627,20 @@ and what is next.
 
 **Now dequantizing**: the whole IQ family — `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
 `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M` — plus BitNet's `Q1_0` and `Q2_0` in both
-geometries (id 42's 128-value block and upstream's 64-value `Q2_0_64`, id 48)
-and the ROCmFPX ids 100/101. Every codebook is a byte-for-byte transcription of
-llama.cpp's `ggml-common.h`, diffed entry by entry, and every decoder mirrors
-its `dequantize_row_*`, on both the host reference path and the GPU kernels, so
-the `GSQ-RCO`, `IQ3_XXS` and `Bonsai` exports load and decode.
+geometries (id 42's 128-value block and upstream's 64-value `Q2_0_64`, id 48),
+the ROCmFPX ids 100/101, and PrismML's ternary pair `PQ2_0`/`PTQ1_0` (ids
+142/143) together with the block-1024 Hadamard activation transform their
+`prism.hadamard` metadata declares. Every codebook is a byte-for-byte
+transcription of its producer's header — llama.cpp's `ggml-common.h`, or the
+PrismML fork's `ggml-quants.c` for 142/143 — diffed entry by entry, and every
+decoder mirrors its `dequantize_row_*`, on both the host reference path and the
+GPU kernels, so the `GSQ-RCO`, `IQ3_XXS` and `Bonsai` exports load and decode,
+and `Ternary-Bonsai-2-27B-PQ2_0.gguf` passes device-vs-CPU coherence.
 
 **Still refused, and rejected loudly at load rather than mis-decoded**: the
 ROCmFPX ids **102, 104, 107**, whose block layout no header on this machine
-declares (an 11-stride sweep never even found a plausible scale field), and the
-ternary id **142 (PQ2_0)**. 142's geometry *is* measured -- 34 bytes per 128
-values, an f16 scale leading the block -- but its codes are not a per-code
-level map: four candidate maps each decoded to non-words, the signature of a
-rotated (WHT / Lloyd-Max) block rather than an additive one. Neither was
-guessed at. `IQ4_NL` and `IQ4_XS` dequantize as before;
+declares (an 11-stride sweep never even found a plausible scale field).
+`IQ4_NL` and `IQ4_XS` dequantize as before;
 `kraken-inspect model.gguf --quant` tells you which formats a file actually
 uses before you try to run it.
 
@@ -697,7 +697,7 @@ and the shared expert stays resident because there is only one.
 `F32` `F16` `BF16` `Q4_0` `Q4_1` `Q5_0` `Q5_1` `Q8_0` `Q8_1` `Q2_K` `Q3_K`
 `Q4_K` `Q5_K` `Q6_K` `Q8_K` `IQ4_NL` `IQ4_XS` `IQ2_XXS` `IQ2_XS` `IQ2_S`
 `IQ3_XXS` `IQ3_S` `IQ1_S` `IQ1_M` `MXFP4` `NVFP4` `Q4_0_ROCMFP4`
-`Q4_0_ROCMFP4_FAST` `TQ1_0` `TQ2_0` `Q1_0` `Q2_0` `Q2_0_64`
+`Q4_0_ROCMFP4_FAST` `TQ1_0` `TQ2_0` `Q1_0` `Q2_0` `Q2_0_64` `PQ2_0` `PTQ1_0`
 
 ---
 

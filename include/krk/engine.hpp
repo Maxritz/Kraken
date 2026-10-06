@@ -288,6 +288,11 @@ private:
     void forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode);
     // Runs the output head on one row of ws_x_ into ws_logits_.
     void head_compute(i32 row);
+    // prism.hadamard fold: dst <- transform(src), see Backend::hadamard_act.
+    // `inverse` picks the order used right after a latent embedding lookup,
+    // `gdn_perm` adds ssm_out's grouped-V permutation ahead of both.
+    void had_xform(void *dst, const void *src, i64 rows, i64 width,
+                   bool inverse, bool gdn_perm);
 
     // KRK_DUMP: append the last row of `buf` (width x rows elements, f32 host
     // or f16 device) to the dump file, one text line per call. A CPU run and a
@@ -399,6 +404,10 @@ private:
     void *ws_attn_ = nullptr; // [chunk, q_dim]
     void *ws_gate_ = nullptr; // [chunk, max(n_ff, n_ff_exp, n_ff_shexp)]
     void *ws_up_ = nullptr;   // [chunk, same]
+    // prism.hadamard scratch: the transformed copy of a folded matmul's
+    // input, widest folded input wide. One buffer, reused at every site --
+    // no two of them are live at the same time. Null unless the file folds.
+    void *ws_had_ = nullptr;  // [chunk, widest folded input]
     void *ws_logits_ = nullptr;
     // Gated delta net workspaces (null unless the model is recurrent)
     void *ws_qkv_ = nullptr;      // [chunk, conv_dim] fused q|k|v, post-conv

@@ -715,6 +715,39 @@ void deq_tq2_0(const u8 *b, f32 *y, i64 nblk) {
     }
 }
 
+// PTQ1_0 (Prism fork type 143): TQ1_0's base-3 trit packing at group 128, so
+// the block is {u8 qs[24]; u8 qh[2]; f16 d} = 28 bytes / 128 values (1.75 bpw).
+// Authority: block_ptq1_0 in PrismML-Eng/llama.cpp ggml-common.h, and that
+// fork's ggml_vec_dot_ptq1_0_q8_0_generic, which decodes "using the same
+// traversal as dequantize_row_ptq1_0": stages {32, 16, 8} over qs with five
+// trit planes per stage-window, then four planes over qh. At 24 bytes of qs
+// the stage-32 window never fits, stage 16 takes qs[0..15] once (16+16 > 24)
+// and stage 8 takes qs[16..23] once, giving:
+//   idx [0, 80):    qs[idx % 16], plane idx / 16
+//   idx [80, 120):  qs[16 + t % 8], plane t / 8   (t = idx - 80)
+//   idx [120, 128): qh[t % 2], plane t / 2        (t = idx - 120)
+// 80 + 40 + 8 = 128. The trit decode itself is tq1_trit_of, unchanged.
+// Element `idx` (0..127) of a PTQ1_0 block, as a trit in {-1, 0, 1}. The
+// traversal is the fork's dequantize_row_ptq1_0 order; see deq_ptq1_0 below.
+inline int ptq1_trit_at(const u8 *b, int idx) {
+    if (idx < 80)
+        return tq1_trit_of(b[idx % 16], idx / 16);
+    if (idx < 120) {
+        const int t = idx - 80;
+        return tq1_trit_of(b[16 + (t % 8)], t / 8);
+    }
+    const int t = idx - 120;
+    return tq1_trit_of(b[24 + (t % 2)], t / 2);
+}
+
+void deq_ptq1_0(const u8 *b, f32 *y, i64 nblk) {
+    for (i64 i = 0; i < nblk; i++, b += 28, y += 128) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(b[26] | (b[27] << 8)));
+        for (int v = 0; v < 128; v++)
+            y[v] = d * static_cast<f32>(ptq1_trit_at(b, v));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The IQ family added for the GSQ-RCO and Bonsai exports: IQ2_S (22),
 // IQ3_XXS (18), IQ1_S (19), IQ3_S (21), IQ1_M (29) and BitNet's Q1_0 (41) /
@@ -766,6 +799,8 @@ void dequant_block(DType t, const u8 *p, f32 *buf) {
         case DType::Q1_0: deq_q1_0(p, buf, 1); break;
         case DType::Q2_0: deq_q2_0(p, buf, 1); break;
         case DType::Q2_0_64: deq_q2_0_64(p, buf, 1); break;
+        case DType::PQ2_0: deq_pq2_0(p, buf, 1); break;
+        case DType::PTQ1_0: deq_ptq1_0(p, buf, 1); break;
         default: break;
     }
 }
@@ -809,6 +844,8 @@ const char *dtype_name(DType t) {
         case DType::ROCMFP4_FAST: return "Q4_0_ROCMFP4_FAST";
         case DType::TQ1_0: return "TQ1_0";
         case DType::TQ2_0: return "TQ2_0";
+        case DType::PQ2_0: return "PQ2_0";
+        case DType::PTQ1_0: return "PTQ1_0";
         default: return "UNKNOWN";
     }
 }
@@ -848,6 +885,8 @@ bool dtype_supported(DType t) {
         case DType::Q1_0:
         case DType::Q2_0:
         case DType::Q2_0_64:
+        case DType::PQ2_0:
+        case DType::PTQ1_0:
             return true;
         default:
             return false;
@@ -877,6 +916,8 @@ int dtype_block_size(DType t) {
         case DType::TQ2_0: return 256;
         case DType::Q1_0: return 128;
         case DType::Q2_0: return 128;
+        case DType::PQ2_0: return 128;
+        case DType::PTQ1_0: return 128;
         case DType::Q2_0_64: return 64;
         case DType::NVFP4: return 64;
         default: return 32;
@@ -922,6 +963,8 @@ int dtype_block_bytes(DType t) {
         case DType::ROCMFP4_FAST: return 17;
         case DType::TQ1_0: return 54;
         case DType::TQ2_0: return 66;
+        case DType::PQ2_0: return 34;   // 2 + 128/4, block_pq2_0 (Prism)
+        case DType::PTQ1_0: return 28;  // 24 + 2 + 2, block_ptq1_0 (Prism)
         default: return 0;
     }
 }

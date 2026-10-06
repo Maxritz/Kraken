@@ -194,6 +194,7 @@ row in its quantized form and dequantizes on the fly.
 | `src/hip/kernels/gemm.hpp` | `gemv_kernel`, `gemm_wmma` (RDNA3 + RDNA4 layouts), `gemm_simt` |
 | `src/hip/kernels/normalize.hpp` | block reduction, RMSNorm, per-head norm, RoPE, silu-mul, bias add, elementwise, MoE row gather/scatter |
 | `src/hip/kernels/attention.hpp` | embedding gather, KV append, tiled online-softmax attention |
+| `src/hip/kernels/hadamard.hpp` | permutation/sign gather + FWHT butterfly for the block-1024 activation transform |
 | `src/hip/backend_hip.hip` | `HipBackend`: memory, op launch wrappers, capability probing, factory |
 
 ## Decisions worth defending
@@ -288,13 +289,14 @@ search, no concurrent batching.
 the IQ family (`IQ2_XXS`/`IQ2_XS`/`IQ2_S`, `IQ3_XXS`/`IQ3_S`, `IQ1_S`/`IQ1_M`),
 `IQ4_NL`/`IQ4_XS`, `MXFP4`/`NVFP4`, the ROCmFPX ids 100/101, BitNet's
 `Q1_0`/`Q2_0`/`Q2_0_64` and `TQ1_0`/`TQ2_0` — runs on both the host reference
-path and the GPU kernels. Still refused at load: the ROCmFPX ids **102**, **104**
-and **107**, which no header on this machine defines, and the ternary id
-**142** (`PQ2_0`), whose geometry is measured (34 B per 128) but whose code
-map is not a level map -- four candidate maps decoded to non-words, the
-signature of a rotated block. One id needs care because two producers spell
-it: id 42 is the llama-dx fork's 128-value / 34-byte `Q2_0`, not upstream's
-64-value block, which is id 48 here. YaRN's NTK-aware frequency warp remains
+path and the GPU kernels, as are PrismML's ternary pair **142** (`PQ2_0`) and
+**143** (`PTQ1_0`) with the block-1024 Hadamard activation transform (permutation,
+sign vectors, FWHT butterfly; applied per weight site, host reference and HIP
+kernels alike) that files describe in `prism.hadamard` metadata. Still refused
+at load: the ROCmFPX ids **102**, **104** and **107**, which no header on this
+machine defines. One id needs care because two producers spell it: id 42 is the
+llama-dx fork's 128-value / 34-byte `Q2_0`, not upstream's 64-value block,
+which is id 48 here. YaRN's NTK-aware frequency warp remains
 approximated; see the model notes.
 
 Performance gaps on the device are in `docs/HARDWARE.md` (split-K attention,

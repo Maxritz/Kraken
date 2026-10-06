@@ -298,6 +298,8 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     const i64 ff_ws = model_.n_ff_ws();
     ws_gate_ = alloc(static_cast<size_t>(C * ff_ws) * as);
     ws_up_ = alloc(static_cast<size_t>(C * ff_ws) * as);
+    if (model_.had().active)
+        ws_had_ = alloc(static_cast<size_t>(C * model_.had().max_width) * as);
     ws_logits_ = alloc(static_cast<size_t>(n_vocab_) * as);
     if (model_.is_recurrent()) {
         rec_layers_ = model_.recurrent_layers();
@@ -496,7 +498,8 @@ void Engine::shutdown() {
     be_->sync();
     for (void **p : {&ws_x_, &ws_xn_, &ws_x2_, &ws_q_,
                      &ws_qpack_, &ws_k_,
-                     &ws_v_, &ws_attn_, &ws_gate_, &ws_up_, &ws_logits_, &ws_router_,
+                     &ws_v_, &ws_attn_, &ws_gate_, &ws_up_, &ws_had_, &ws_logits_,
+                     &ws_router_,
                      &ws_ffn_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
                      &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
                      &conv_state_, &rec_state_, &topk_scratch_, &topk_out_}) {
@@ -534,13 +537,46 @@ void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
     std::fclose(f);
 }
 
+// prism.hadamard (Backend::hadamard_act): dst <- the transform of src.
+// Called only when the plan folded the site, so dst is always ws_had_ except
+// for the in-place inverse right after the embedding lookup.
+void Engine::had_xform(void *dst, const void *src, i64 rows, i64 width,
+                       bool inverse, bool gdn_perm) {
+    const HadamardPlan &hp = model_.had();
+    Backend::HadDesc d;
+    d.n = width;
+    d.block = hp.block;
+    d.signs = model_.had_signs(width);
+    d.signs_first = !inverse;
+    if (gdn_perm && hp.gdn_v_grouped) {
+        const ModelConfig &mc = model_.cfg();
+        const i64 nv = mc.ssm_dt_rank;
+        const i64 nk = mc.ssm_n_group;
+        // [hd, nk, rep] -> [hd, rep, nk] over the delta-rule output's value
+        // heads; hd = width / n_v, rep = n_v / n_k. Checked rather than
+        // assumed so a file whose geometry disagrees skips the perm loudly
+        // (the load-time check refuses that file anyway).
+        if (nv > 0 && nk > 0 && nv % nk == 0 && width % nv == 0) {
+            d.perm_hd = width / nv;
+            d.perm_nk = nk;
+            d.perm_rep = nv / nk;
+        }
+    }
+    be_->hadamard_act(dst, src, rows, d);
+}
+
 void Engine::head_compute(i32 row) {
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
     const void *src = act_at(ws_x_, as, static_cast<i64>(row) * n_embd_);
     be_->rmsnorm(ws_xn_, src, model_.out_norm(), 1, n_embd_, mc.rms_eps);
     const QuantTensor &head = model_.out_head();
-    be_->gemm(ws_logits_, ws_xn_, head.data, head.type, n_vocab_, n_embd_, 1);
+    const void *xn = ws_xn_;
+    if (model_.had().head_folded) {
+        had_xform(ws_had_, ws_xn_, 1, n_embd_, false, false);
+        xn = ws_had_;
+    }
+    be_->gemm(ws_logits_, xn, head.data, head.type, n_vocab_, n_embd_, 1);
 }
 
 void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
@@ -553,6 +589,12 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     const bool packed_gate = q_proj_ != q_dim_;
 
     be_->embed(ws_x_, embd.data, embd.type, mc.n_vocab, mc.n_embd, toks, n);
+
+    // A latent token embedding stores ROTATED rows: un-rotate them here, once,
+    // and the whole residual stream above this point is in the primal basis
+    // that every norm, every non-folded matmul and every dump expects.
+    if (model_.had().embd_inverse)
+        had_xform(ws_x_, ws_x_, n, n_embd_, /*inverse=*/true, /*gdn_perm=*/false);
 
     AttnDesc d;
     d.n_head = mc.n_head;
@@ -625,17 +667,28 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // dependency between them, so they ride one fused launch
         // on the decode row (backend falls back per-matrix for
         // prefill rows or a dtype mix).
+        // Folded projections read a TRANSFORMED copy of the attention-norm
+        // output (prism.hadamard). ws_xn_ itself stays primal for whatever
+        // else reads it -- laguna's output gate when only the projections are
+        // folded, and the delta-net layer's ssm_alpha/ssm_beta, which no file
+        // folds because they are not matmul sites in the fork either.
+        const void *xn_att = ws_xn_;
+        if (L.h_attn_in || L.h_attn_gate) {
+            had_xform(ws_had_, ws_xn_, n, n_embd_, false, false);
+            xn_att = ws_had_;
+        }
+        const void *xn_proj = L.h_attn_in ? xn_att : ws_xn_;
         void *q_out = packed_gate ? ws_qpack_ : ws_q_;
         if (L.wq.type == L.wk.type && L.wk.type == L.wv.type) {
             void *qkv[3] = {q_out, ws_k_, ws_v_};
             const void *wqkv[3] = {L.wq.data, L.wk.data, L.wv.data};
             const i64 nqkv[3] = {lq_proj, kv_dim_, kv_dim_};
-            be_->gemm_group(qkv, ws_xn_, wqkv, L.wq.type,
+            be_->gemm_group(qkv, xn_proj, wqkv, L.wq.type,
                             nqkv, n_embd_, 3, n);
         } else {
-            be_->gemm(q_out, ws_xn_, L.wq.data, L.wq.type, lq_proj, n_embd_, n);
-            be_->gemm(ws_k_, ws_xn_, L.wk.data, L.wk.type, kv_dim_, n_embd_, n);
-            be_->gemm(ws_v_, ws_xn_, L.wv.data, L.wv.type, kv_dim_, n_embd_, n);
+            be_->gemm(q_out, xn_proj, L.wq.data, L.wq.type, lq_proj, n_embd_, n);
+            be_->gemm(ws_k_, xn_proj, L.wk.data, L.wk.type, kv_dim_, n_embd_, n);
+            be_->gemm(ws_v_, xn_proj, L.wv.data, L.wv.type, kv_dim_, n_embd_, n);
         }
 
         // Qwen3.5 interleaves each head's output gate into the query
@@ -730,8 +783,8 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // is what makes it a gate on the attention result rather than on the
         // residual.
         if (mc.attn_gate && L.wattn_gate.present()) {
-            be_->gemm(ws_agate_, ws_xn_, L.wattn_gate.data, L.wattn_gate.type, lh,
-                      n_embd_, n);
+            be_->gemm(ws_agate_, L.h_attn_gate ? xn_att : ws_xn_,
+                      L.wattn_gate.data, L.wattn_gate.type, lh, n_embd_, n);
             be_->softplus_act(ws_agate_, static_cast<i64>(n) * lh);
             dump_row("attn.gate", l, ws_agate_, lh, n);
             be_->mul_head_broadcast(ws_attn_, ws_agate_, n, lh, mc.head_dim);
@@ -746,7 +799,16 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             dump_row("attn.gated", l, ws_attn_, lq, n);
         }
 
-        be_->gemm(ws_x2_, ws_attn_, L.wo.data, L.wo.type, n_embd_, lq, n);
+        // The attention result is the input of a folded projection too, and
+        // it is a different buffer with a different width (q_dim), so it gets
+        // its own transform -- after the gate above has finished reading
+        // ws_had_.
+        const void *attn_in = ws_attn_;
+        if (L.h_attn_out) {
+            had_xform(ws_had_, ws_attn_, n, lq, false, false);
+            attn_in = ws_had_;
+        }
+        be_->gemm(ws_x2_, attn_in, L.wo.data, L.wo.type, n_embd_, lq, n);
         dump_row("attn.proj", l, ws_x2_, n_embd_, n);
         // The attention residual and the FFN norm are one kernel: the sum is
         // what the norm's sum-of-squares pass reads, so a second launch
@@ -800,18 +862,34 @@ void Engine::dflash_capture(i32 layer, i32 n) {
 
 void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
     // gate/up share the FFN-norm output: one fused launch on the decode row.
+    // A folded gate/up reads the transformed copy instead; the router of a
+    // mixed dense/MoE model reads the primal ws_xn_, which is why the copy
+    // exists rather than an in-place transform.
+    const void *xn = ws_xn_;
+    if (L.h_ffn_in) {
+        had_xform(ws_had_, ws_xn_, n, n_embd_, false, false);
+        xn = ws_had_;
+    }
     if (L.wgate.type == L.wup.type) {
         void *gu[2] = {ws_gate_, ws_up_};
         const void *wgu[2] = {L.wgate.data, L.wup.data};
         const i64 ngu[2] = {n_ff_, n_ff_};
-        be_->gemm_group(gu, ws_xn_, wgu, L.wgate.type, ngu, n_embd_, 2, n);
+        be_->gemm_group(gu, xn, wgu, L.wgate.type, ngu, n_embd_, 2, n);
     } else {
-        be_->gemm(ws_gate_, ws_xn_, L.wgate.data, L.wgate.type, n_ff_, n_embd_, n);
-        be_->gemm(ws_up_, ws_xn_, L.wup.data, L.wup.type, n_ff_, n_embd_, n);
+        be_->gemm(ws_gate_, xn, L.wgate.data, L.wgate.type, n_ff_, n_embd_, n);
+        be_->gemm(ws_up_, xn, L.wup.data, L.wup.type, n_ff_, n_embd_, n);
     }
     be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_);
     dump_row("attn.ffng", l, ws_gate_, n_ff_, n);
-    be_->gemm(ws_x2_, ws_gate_, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n);
+    // The intermediate is a folded input as well (its width is n_ff, wider
+    // than anything above), which is safe to put over ws_had_ because the
+    // gate/up gemms have already consumed their copy.
+    const void *gn = ws_gate_;
+    if (L.h_ffn_down) {
+        had_xform(ws_had_, ws_gate_, n, n_ff_, false, false);
+        gn = ws_had_;
+    }
+    be_->gemm(ws_x2_, gn, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n);
     dump_row("attn.down", l, ws_x2_, n_embd_, n);
     be_->add_inplace(ws_x_, ws_x2_, n * n_embd_);
 }
@@ -1272,9 +1350,18 @@ void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
     const i32 ri = model_.recurrent_index(l);
 
     // 1. One projection for [q | k | v] and one for the z gate. Both read the
-    //    same attention-norm output, so they are independent.
-    be_->gemm(ws_qkv_, ws_xn_, L.wqkv.data, L.wqkv.type, cdim, n_embd_, n);
-    be_->gemm(ws_z_, ws_xn_, L.wqkv_gate.data, L.wqkv_gate.type, vdim, n_embd_, n);
+    //    same attention-norm output, so they are independent. Folded ones read
+    //    the transformed copy; ssm_alpha/ssm_beta further down read ws_xn_
+    //    primal, which is exactly why the copy is a copy.
+    const void *xn = ws_xn_;
+    if (L.h_attn_in || L.h_attn_gate) {
+        had_xform(ws_had_, ws_xn_, n, n_embd_, false, false);
+        xn = ws_had_;
+    }
+    be_->gemm(ws_qkv_, L.h_attn_in ? xn : ws_xn_, L.wqkv.data, L.wqkv.type,
+              cdim, n_embd_, n);
+    be_->gemm(ws_z_, L.h_attn_gate ? xn : ws_xn_, L.wqkv_gate.data,
+              L.wqkv_gate.type, vdim, n_embd_, n);
 
     // 2. The causal short convolution, carrying the previous ksize-1 steps, and
     //    the SiLU that follows it. After this ws_qkv_ is the post-conv block.
@@ -1322,8 +1409,17 @@ void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
                  mc.ssm_d_state, mc.rms_eps);
     be_->silu_mul(ws_h_, ws_z_, ws_h_, static_cast<i64>(n) * vdim);
 
-    // 7. Output projection and the residual.
-    be_->gemm(ws_x2_, ws_h_, L.ssm_out.data, L.ssm_out.type, n_embd_, vdim, n);
+    // 7. Output projection and the residual. ssm_out is folded, and its input
+    //    carries the grouped-V permutation ahead of the signs -- the delta-rule
+    //    output is [hd, nk, rep] over the value heads and the stored weight
+    //    expects [hd, rep, nk]. ws_had_ is free here: the projections in step
+    //    1 have long consumed their copy.
+    const void *h_in = ws_h_;
+    if (L.h_ssm_out) {
+        had_xform(ws_had_, ws_h_, n, vdim, false, /*gdn_perm=*/true);
+        h_in = ws_had_;
+    }
+    be_->gemm(ws_x2_, h_in, L.ssm_out.data, L.ssm_out.type, n_embd_, vdim, n);
     be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
 }
 

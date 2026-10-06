@@ -491,6 +491,247 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     };
 
     lp.mark("arch + metadata resolve");
+
+    // ---- prism.hadamard activation transform -----------------------------
+    // PrismML's llama.cpp fork folds a normalized block-1024 Sylvester
+    // Walsh-Hadamard plus a per-width +-1 sign vector into a handful of
+    // matmul WEIGHTS, so the engine has to transform those matmuls'
+    // ACTIVATIONS (and un-rotate the one table stored latent). Every check
+    // that fork's loader makes, this makes too, and anything it cannot
+    // express here is refused rather than loaded and decoded as fluent
+    // garbage -- which is exactly the failure a missing transform produces:
+    // every block read from the right place, every number wrong.
+    //
+    // `had_layer` carries the per-layer result forward to the weight loop.
+    std::vector<u8> had_layer;
+    {
+        auto fail = [&](const std::string &m) {
+            if (err) *err = m;
+            return false;
+        };
+        const bool has_ver = gguf_.find("prism.hadamard.version") != nullptr;
+        const bool has_any =
+            gguf_.find("prism.hadamard.weight_names") != nullptr;
+        if (has_any && !has_ver)
+            return fail("prism.hadamard.weight_names is present but "
+                        "prism.hadamard.version is not");
+        if (has_ver) {
+            HadamardPlan plan;
+            const i64 ver = gguf_.get_i64("prism.hadamard.version", 0);
+            // Version 2 is the tied-output variant (the head reads the
+            // rotated embedding table); version 1 requires output.weight to
+            // be present and forbids tying.
+            if (ver != 1)
+                return fail("prism.hadamard.version " + std::to_string(ver) +
+                            " is not implemented (this engine folds version 1;"
+                            " version 2 is the tied-output variant)");
+            if (gguf_.get_bool("prism.hadamard.tied_output", false))
+                return fail("prism.hadamard.tied_output is not implemented");
+            const i64 block = gguf_.get_i64("prism.hadamard.block_size", 0);
+            if (block < 64 || block > 4096 || (block & (block - 1)) != 0)
+                return fail("prism.hadamard.block_size " +
+                            std::to_string(block) +
+                            " is not a power of two in [64, 4096]");
+            const std::string transform =
+                gguf_.get_str("prism.hadamard.transform");
+            if (transform != "normalized-sylvester-walsh-hadamard")
+                return fail("prism.hadamard transform '" + transform +
+                            "' is not implemented (only the normalized "
+                            "Sylvester Walsh-Hadamard is)");
+            const std::string axis = gguf_.get_str("prism.hadamard.axis");
+            if (axis != "input-last-dimension")
+                return fail("prism.hadamard axis '" + axis +
+                            "' is not implemented (only input-last-dimension)");
+            const std::string sign_mode =
+                gguf_.get_str("prism.hadamard.sign_mode");
+            if (sign_mode != "identity" && sign_mode != "explicit")
+                return fail("prism.hadamard sign_mode '" + sign_mode +
+                            "' is not implemented (identity or explicit)");
+            const std::vector<std::string> *names =
+                gguf_.get_str_array("prism.hadamard.weight_names");
+            if (!names || names->empty())
+                return fail("prism.hadamard.weight_names is missing or empty");
+
+            // Classify one folded weight: which layer it belongs to (-1 for
+            // the untiered output head) and which transform site of that
+            // layer it feeds. A name no site answers to is refused -- an
+            // expert tensor, a shared expert, a bias, anything this engine
+            // would read without transforming.
+            auto classify = [](const std::string &nm, i32 *layer,
+                               int *bit) -> bool {
+                *layer = -1;
+                if (nm == "output.weight") {
+                    *bit = 64;
+                    return true;
+                }
+                if (nm.compare(0, 4, "blk.") != 0) return false;
+                size_t q = 4;
+                i32 lay = 0;
+                bool digit = false;
+                while (q < nm.size() && nm[q] >= '0' && nm[q] <= '9') {
+                    lay = lay * 10 + (nm[q] - '0');
+                    digit = true;
+                    q++;
+                }
+                if (!digit || q >= nm.size() || nm[q] != '.') return false;
+                const std::string rest = nm.substr(q + 1);
+                int b = -1;
+                if (rest == "attn_q.weight" || rest == "attn_k.weight" ||
+                    rest == "attn_v.weight" || rest == "attn_qkv.weight")
+                    b = 1;
+                else if (rest == "attn_gate.weight")
+                    b = 2;
+                else if (rest == "attn_output.weight")
+                    b = 4;
+                else if (rest == "ffn_gate.weight" || rest == "ffn_up.weight")
+                    b = 8;
+                else if (rest == "ffn_down.weight")
+                    b = 16;
+                else if (rest == "ssm_out.weight")
+                    b = 32;
+                else
+                    return false;
+                *layer = lay;
+                *bit = b;
+                return true;
+            };
+
+            had_layer.assign(static_cast<size_t>(std::max<i32>(cfg_.n_layer, 0)),
+                             0);
+            std::vector<i64> widths; // distinct folded input widths
+            for (const std::string &nm : *names) {
+                i32 lay = -1;
+                int bit = -1;
+                if (!classify(nm, &lay, &bit))
+                    return fail("prism.hadamard: weight '" + nm +
+                                "' is on no activation-transform site this "
+                                "engine implements");
+                if (bit == 64) {
+                    plan.head_folded = true;
+                } else if (lay >= cfg_.n_layer) {
+                    // An MTP block: a prediction head this engine does not
+                    // run at all, so there is no activation to transform.
+                } else if (lay >= 0) {
+                    had_layer[static_cast<size_t>(lay)] |=
+                        static_cast<u8>(bit);
+                } else {
+                    return fail("prism.hadamard: weight '" + nm +
+                                "' names a negative layer");
+                }
+                const GgufTensor *t = gguf_.tensor(nm);
+                if (!t)
+                    return fail("prism.hadamard names weight '" + nm +
+                                "' but the file has no such tensor");
+                const i64 n_in = static_cast<i64>(t->ne[0]);
+                if (n_in <= 0 || n_in % block != 0)
+                    return fail("prism.hadamard: block " +
+                                std::to_string(block) +
+                                " does not divide input width " +
+                                std::to_string(n_in) + " of '" + nm + "'");
+                if (n_in > plan.max_width) plan.max_width = n_in;
+                if (std::find(widths.begin(), widths.end(), n_in) ==
+                    widths.end())
+                    widths.push_back(n_in);
+            }
+
+            // The inverse side: one table, looked up by row, stored rotated.
+            // The engine applies the transform right after the lookup, so any
+            // other name here would load and stay silently rotated.
+            if (const std::vector<std::string> *inv =
+                    gguf_.get_str_array("prism.hadamard.inverse_weight_names")) {
+                for (const std::string &nm : *inv) {
+                    if (nm != "token_embd.weight")
+                        return fail("prism.hadamard: inverse table '" + nm +
+                                    "' is not a site this engine implements "
+                                    "(only token_embd.weight)");
+                    plan.embd_inverse = true;
+                }
+            }
+            if (plan.embd_inverse && cfg_.tied_embeddings)
+                return fail("a latent token embedding on a TIED output needs "
+                            "prism.hadamard version 2, which is not "
+                            "implemented");
+
+            // Sign vectors: parsed and validated against the host copy first,
+            // uploaded only once nothing below can still fail.
+            std::vector<std::pair<i32, std::vector<f32>>> host_signs;
+            if (sign_mode == "explicit") {
+                const std::vector<i32> *sw =
+                    gguf_.get_i32_array("prism.hadamard.sign_widths");
+                const std::vector<i32> *sv =
+                    gguf_.get_i32_array("prism.hadamard.sign_values");
+                if (!sw || sw->empty() || !sv)
+                    return fail("prism.hadamard sign_mode is explicit but "
+                                "sign_widths/sign_values are missing");
+                size_t off = 0;
+                for (const i32 w : *sw) {
+                    if (w <= 0 || (w % block) != 0 ||
+                        off + static_cast<size_t>(w) > sv->size())
+                        return fail("prism.hadamard sign width " +
+                                    std::to_string(w) + " is invalid");
+                    std::vector<f32> host(static_cast<size_t>(w));
+                    for (i32 i = 0; i < w; i++) {
+                        const i32 v = (*sv)[off + static_cast<size_t>(i)];
+                        if (v != 1 && v != -1)
+                            return fail("prism.hadamard sign values must be "
+                                        "+-1, not " + std::to_string(v));
+                        host[static_cast<size_t>(i)] = static_cast<f32>(v);
+                    }
+                    host_signs.emplace_back(w, std::move(host));
+                    off += static_cast<size_t>(w);
+                }
+                if (off != sv->size())
+                    return fail("prism.hadamard sign_values holds " +
+                                std::to_string(sv->size()) +
+                                " values but the widths account for " +
+                                std::to_string(off));
+                for (const i64 w : widths) {
+                    bool found = false;
+                    for (const auto &hs : host_signs)
+                        if (static_cast<i64>(hs.first) == w) found = true;
+                    if (!found)
+                        return fail("prism.hadamard has no sign vector for "
+                                    "input width " + std::to_string(w));
+                }
+            }
+
+            // ssm_out carries an extra grouped-V permutation ahead of the
+            // signs when the converter says so; it needs the delta net's head
+            // geometry to express it.
+            plan.gdn_v_grouped =
+                gguf_.get_bool("prism.hadamard.gdn_v_grouped", false);
+            bool any_ssm = false;
+            for (const u8 f : had_layer)
+                if (f & 32) any_ssm = true;
+            if (any_ssm && !cfg_.recurrent)
+                return fail("prism.hadamard folds ssm_out but this model has "
+                            "no gated-delta-net layers");
+            if (any_ssm && plan.gdn_v_grouped &&
+                (cfg_.ssm_dt_rank <= 0 || cfg_.ssm_n_group <= 0 ||
+                 cfg_.ssm_value_dim % cfg_.ssm_dt_rank != 0 ||
+                 cfg_.ssm_dt_rank % cfg_.ssm_n_group != 0))
+                return fail("prism.hadamard gdn_v_grouped does not divide this "
+                            "model's delta-net head geometry");
+
+            plan.active = true;
+            plan.block = static_cast<i32>(block);
+            had_ = plan;
+            for (const auto &hs : host_signs) {
+                f32 *dev = static_cast<f32 *>(
+                    be.alloc(static_cast<size_t>(hs.first) * 4));
+                upload_timed(dev, hs.second.data(),
+                             static_cast<size_t>(hs.first) * 4);
+                had_signs_.emplace_back(hs.first, dev);
+            }
+            KRK_INFO("prism.hadamard: %zu folded weight(s)%s, block %d, "
+                     "%zu sign vector(s), widest input %lld",
+                     names->size(),
+                     plan.embd_inverse ? " + latent token embedding" : "",
+                     plan.block, had_signs_.size(),
+                     static_cast<long long>(plan.max_width));
+        }
+    }
+
     // ---- token embedding + head ------------------------------------------
     {
         std::string e;
@@ -541,6 +782,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         LayerWeights &L = layers_[static_cast<size_t>(l)];
         if (l == 1) lp.mark("  layer 0 only");
         std::string e;
+        if (!had_layer.empty()) {
+            const u8 f = had_layer[static_cast<size_t>(l)];
+            L.h_attn_in = (f & 1) != 0;
+            L.h_attn_gate = (f & 2) != 0;
+            L.h_attn_out = (f & 4) != 0;
+            L.h_ffn_in = (f & 8) != 0;
+            L.h_ffn_down = (f & 16) != 0;
+            L.h_ssm_out = (f & 32) != 0;
+        }
 
         auto need = [&](const std::string &n) -> QuantTensor {
             QuantTensor q = upload_weight(n, false, &e);
@@ -1008,6 +1258,10 @@ void Model::unload() {
             if (q->present()) be_->release(q->data);
     }
     layers_.clear();
+    for (auto &sg : had_signs_)
+        if (sg.second) be_->release(sg.second);
+    had_signs_.clear();
+    had_ = HadamardPlan{};
     if (tok_embd_.present()) be_->release(tok_embd_.data);
     if (!cfg_.tied_embeddings && out_head_.present()) be_->release(out_head_.data);
     if (out_norm_) be_->release(out_norm_);

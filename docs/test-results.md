@@ -589,7 +589,7 @@ and nothing under `C:/Users/rr`, `H:/` or `G:/` mentions these ids. 100 and 101
 were already implemented and `Ornith-1.0-9b-ROCmFPX-STRIX_LEAN.gguf` (100 ×40,
 101 ×209, `file_type = 106`) loads.
 
-### 11.6 id 142: geometry measured, and the map is not a level map
+### 11.6 id 142: geometry measured, and the map is not a level map (resolved 2026-10-07)
 
 `Ternary-Bonsai-2-27B-PQ2_0.gguf` (402 tensors, `file_type = 141`,
 `general.name = Hf`, `general.basename = folded`) has the same *block shape* as
@@ -607,9 +607,24 @@ implemented and run end to end, and **every one produced non-words**. A rotated
 container explains that: the same fork's newer weight types are described as
 WHT-rotated (`GGML_TYPE_TQ3_1S`, `TQ4_1S` — "WHT-rotated … Lloyd-Max"), and a
 block that has been transformed cannot be recovered by any per-code level map,
-which is also consistent with the flat three-way code histogram. So 142 stays a
-refusal, now with its geometry on record and with four failed maps documented
-instead of an unstated guess.
+which is also consistent with the flat three-way code histogram.
+
+**Resolved 2026-10-07.** The negative result above was real; its conclusion was
+wrong. The PrismML fork's header (`H:/llamadx/prism-llama`, `GGML_TYPE_PQ2_0 =
+142`, `GGML_TYPE_PTQ1_0 = 143`) defines the blocks outright — `block_pq2_0 { f16
+d; u8 qs[32] }` = 34 B per 128, `block_ptq1_0 { u8 qs[24]; u8 qh[2]; f16 d }` =
+28 B per 128 — and the piece every end-to-end attempt lacked was the file's
+**block-1024 Hadamard activation transform** (`prism.hadamard` metadata: per
+weight-site flags, sign vectors, the inverse-folded token embedding). Correct
+weight codes are not enough when the activation space is wrong, so every level
+map produced non-words end to end. With the fork's `dequantize_row_pq2_0`
+transcribed byte for byte (diffed against real tensor bytes of
+`blk.0.ffn_down`, `ffn_up`, `output.weight` and `blk.3.attn_q`: 4 cases, 0
+mismatches) and the transform implemented on host and device,
+`Ternary-Bonsai-2-27B-PQ2_0.gguf` passes device-vs-CPU coherence.
+`PTQ1_0` (143) landed alongside it, though no file on this machine carries
+that id. The four failed maps stay on record: they are why "rotated, so no
+level map can work" looked like the only explanation.
 
 ### 11.7 Where host RAM goes, and a real `--cpu` defect
 

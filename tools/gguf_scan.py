@@ -18,17 +18,24 @@ DT = {0:'F32',1:'F16',2:'Q4_0',3:'Q4_1',6:'Q5_0',7:'Q5_1',8:'Q8_0',9:'Q8_1',
       21:'IQ3_S',22:'IQ2_S',23:'IQ4_XS',24:'I8',25:'I16',26:'I32',27:'I64',
       28:'F64',29:'IQ1_M',30:'BF16',34:'TQ1_0',35:'TQ2_0',39:'MXFP4',40:'NVFP4',
       41:'Q1_0',42:'Q2_0',48:'Q2_0_64',50:'F8_E4M3FN',
-      100:'Q4_0_ROCMFP4',101:'Q4_0_ROCMFP4_FAST'}
+      100:'Q4_0_ROCMFP4',101:'Q4_0_ROCMFP4_FAST',142:'PQ2_0',143:'PTQ1_0'}
 
-# Type ids whose meaning is not fixed by the id alone. 42 is the important one:
-# upstream llama.cpp's Q2_0 is a 64-value block (18 bytes, 2.25 bpw) while the
-# llama-dx fork's is a 128-value block (34 bytes, 2.125 bpw). Both spell the id
-# 42, so only the file's own tensor offsets say which one a file carries; the
-# --audit mode below measures that and names the variant.
+# Type ids with a known block geometry, measured by --audit. 42 is the one
+# whose meaning is not fixed by the id alone: upstream llama.cpp's Q2_0 is a
+# 64-value block (18 bytes, 2.25 bpw) while the llama-dx fork's is a 128-value
+# block (34 bytes, 2.125 bpw). Both spell the id 42, so only the file's own
+# tensor offsets say which one a file carries; the --audit mode below measures
+# that and names the variant. 142 (PQ2_0) and 143 (PTQ1_0) are listed only so
+# the audit prints their geometry string -- their ids are unambiguous.
 BLOCK_GEOMETRY = {   # type id -> (block_bytes, block_values), id-only cases
     42: [(34, 128), (18, 64)],
+    142: [(34, 128)],
+    143: [(28, 128)],
 }
-NAME_BY_GEOMETRY = {(34, 128): 'Q2_0', (18, 64): 'Q2_0_64'}
+# Keyed by (id, geometry): only id 42 needs an override, because its id alone
+# cannot say which layout a file carries. 142/143 keep their DT names, so a
+# (34, 128) geometry under id 142 stays PQ2_0 and is never renamed Q2_0.
+NAME_BY_GEOMETRY = {(42, (34, 128)): 'Q2_0', (42, (18, 64)): 'Q2_0_64'}
 
 def rd_str(f):
     n = struct.unpack('<Q', f.read(8))[0]
@@ -186,7 +193,7 @@ def audit(path, verbose=False):
             bb, bv = cand
             if abs(bpw - bb * 8.0 / bv) < 1e-4:
                 entry['geometry'] = '%d bytes / %d values' % (bb, bv)
-                entry['name'] = NAME_BY_GEOMETRY.get(cand, entry['name'])
+                entry['name'] = NAME_BY_GEOMETRY.get((tt, cand), entry['name'])
                 break
         if verbose:
             entry['sample'] = names[:4]

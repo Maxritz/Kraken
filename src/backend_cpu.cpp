@@ -352,6 +352,75 @@ public:
         std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(i32));
     }
 
+    // ---- prism.hadamard activation transform (Backend::hadamard_act) ----
+    //
+    // The reference definition, and deliberately the plain one: per row, an
+    // optional grouped-V perm, an optional +-1 sign multiply, then a
+    // normalized Sylvester FWHT over consecutive blocks of `block`. The FWHT
+    // is the textbook butterfly (H[ i ][ j ] = (-1)^popcount(i & j)), scaled
+    // by 1/sqrt(block) at the end so H . H = I -- which is what makes the
+    // same routine both the fold before a rotated matmul and the inverse
+    // after a rotated embedding lookup; only the sign order differs.
+    // Everything stays in f32, exactly like the fork's graph tensors.
+    void hadamard_act(void *out, const void *in, i64 rows,
+                      const Backend::HadDesc &d) override {
+        if (rows <= 0 || d.n <= 0) return;
+        const i64 n = d.n;
+        const i64 block = d.block;
+        if (block <= 0 || (block & (block - 1)) != 0 || n % block != 0) {
+            KRK_ERROR("hadamard_act: width %lld is not a whole number of "
+                      "%lld-element blocks", (long long)n, (long long)block);
+            std::abort();
+        }
+        const bool perm = d.perm_hd > 0;
+        const f32 *signs = d.signs;
+        const f32 scale = 1.0f / std::sqrt(static_cast<f32>(block));
+        f32 *o = static_cast<f32 *>(out);
+        const f32 *x = static_cast<const f32 *>(in);
+        // A row is transformed into a scratch row before anything is written
+        // back, so out == in is safe: the whole input row is read first.
+        par_for(rows, 1, 8.0 * static_cast<f64>(rows) * static_cast<f64>(n),
+                [&](i64 b, i64 e) {
+                    std::vector<f32> cur(static_cast<size_t>(n));
+                    std::vector<f32> tmp(static_cast<size_t>(n));
+                    for (i64 r = b; r < e; r++) {
+                        f32 *a = cur.data();
+                        const f32 *src = x + r * n;
+                        for (i64 i = 0; i < n; i++) a[i] = src[i];
+                        if (perm) {
+                            const i64 H = d.perm_hd;
+                            const i64 Nk = d.perm_nk;
+                            const i64 R = d.perm_rep;
+                            f32 *b2 = tmp.data();
+                            for (i64 j = 0; j < R; j++)
+                                for (i64 k = 0; k < Nk; k++)
+                                    for (i64 i = 0; i < H; i++)
+                                        b2[i + j * H + k * H * R] =
+                                            a[i + k * H + j * H * Nk];
+                            a = b2;
+                        }
+                        if (d.signs_first && signs)
+                            for (i64 i = 0; i < n; i++) a[i] *= signs[i];
+                        for (i64 off = 0; off < n; off += block) {
+                            f32 *y = a + off;
+                            for (i64 len = 1; len < block; len <<= 1)
+                                for (i64 g = 0; g < block; g += 2 * len)
+                                    for (i64 j = 0; j < len; j++) {
+                                        const f32 u = y[g + j];
+                                        const f32 v = y[g + len + j];
+                                        y[g + j] = u + v;
+                                        y[g + len + j] = u - v;
+                                    }
+                            for (i64 i = 0; i < block; i++) y[i] *= scale;
+                        }
+                        if (!d.signs_first && signs)
+                            for (i64 i = 0; i < n; i++) a[i] *= signs[i];
+                        f32 *dst = o + r * n;
+                        for (i64 i = 0; i < n; i++) dst[i] = a[i];
+                    }
+                });
+    }
+
     // ---- gated delta net (the reference oracle) -------------------------
     bool gdn_supported() const override { return true; }
 

@@ -22,6 +22,25 @@ namespace krk {
 // QuantTensor (a resident weight matrix) is declared in expert_cache.hpp, which
 // this header includes; the same descriptor covers eager and lazy weights.
 
+// The prism.hadamard activation transform (PrismML's llama.cpp fork, the
+// Ternary-Bonsai-2 exports). A few matmul weights are stored with their
+// INPUT dimension rotated: multiplied by a per-width +-1 sign vector and
+// then by a normalized Sylvester Walsh-Hadamard over consecutive blocks of
+// `block` elements. Nothing has to be done to the weights -- the engine
+// transforms the matching ACTIVATION before each such matmul (and, for the
+// one table stored rotated, once after the embedding lookup).
+//
+// Inactive for every file that does not carry the keys, so the plan costs a
+// bool test per site and nothing else.
+struct HadamardPlan {
+    bool active = false;
+    i32 block = 1024;           // FWHT block size, a power of two
+    bool embd_inverse = false;  // token_embd.weight stores rotated rows
+    bool head_folded = false;   // output.weight's input is transformed
+    bool gdn_v_grouped = false; // ssm_out's input carries the grouped-V perm
+    i64 max_width = 0;          // widest folded input; sizes the scratch
+};
+
 struct LayerWeights {
     f32 *attn_norm = nullptr; // f32 [n_embd]
     QuantTensor wq, wk, wv, wo;
@@ -79,6 +98,22 @@ struct LayerWeights {
     // the model EXCEPT this one, so it is uploaded verbatim, not via the
     // zero-centred path.
     f32 *ssm_norm = nullptr;
+
+    // ---- prism.hadamard folded inputs (false on every other model) -------
+    // Which of this layer's matmuls read a ROTATED weight, so their input has
+    // to be transformed first (Backend::hadamard_act, plan above). They are
+    // per site rather than one flag because the same buffer feeds weights that
+    // are NOT folded: the attention-norm output also feeds ssm_alpha/ssm_beta
+    // and a MoE router untouched, so the transformed copy goes to a scratch
+    // buffer and only the folded matmul reads it.
+    bool h_attn_in = false;   // attn-norm out -> attn_q / attn_k / attn_v /
+                              //                 attn_qkv
+    bool h_attn_gate = false; // attn-norm out -> attn_gate (Qwen3.5's packed
+                              //                 gate, laguna's separate one)
+    bool h_attn_out = false;  // attention result -> attn_output
+    bool h_ffn_in = false;    // ffn-norm out -> ffn_gate / ffn_up
+    bool h_ffn_down = false;  // silu(gate)*up -> ffn_down
+    bool h_ssm_out = false;   // delta-rule out -> ssm_out (grouped-V perm)
 };
 
 // The final-logit bound some archs declare (`final_logit_softcapping`). A free
@@ -291,6 +326,17 @@ public:
     const std::vector<f32> &inv_freq() const { return inv_freq_; }
     i64 weight_bytes() const { return weight_bytes_; }
     const Gguf &gguf() const { return gguf_; }
+    // The prism.hadamard plan for this file (inactive for everything else).
+    const HadamardPlan &had() const { return had_; }
+    // The +-1 sign vector for a folded input `width` wide, in the backend's
+    // address space (device memory on the GPU); null when the file declares
+    // sign_mode=identity, and never null for a width the plan folded -- the
+    // loader refuses that case.
+    const f32 *had_signs(i64 width) const {
+        for (const auto &sg : had_signs_)
+            if (static_cast<i64>(sg.first) == width) return sg.second;
+        return nullptr;
+    }
 
     // Lazily-loaded routed experts. Override the residency budget after load to
     // trade reload traffic against memory.
@@ -345,6 +391,10 @@ private:
     f32 *out_norm_ = nullptr;
     std::vector<f32> inv_freq_;
     std::vector<f32> inv_freq_swa_;
+    // prism.hadamard. The sign vectors are uploaded once at load and released
+    // in unload(); the plan itself is read through had()/had_signs().
+    HadamardPlan had_;
+    std::vector<std::pair<i32, f32 *>> had_signs_; // (width, device f32[width])
     i64 weight_bytes_ = 0;
     ExpertCache experts_;
     size_t upload_bytes_ = 0;
