@@ -6,8 +6,8 @@ code, the README, or `docs/`.
 
 ## Build and gates
 
-- Build: `ninja -C build-hip kraken kraken-tests kraken-bench kraken-inspect`
-  and `kraken-oracle`.
+- Build: `ninja -C build-hip kraken kraken-tests kraken-bench kraken-server`
+  `kraken-inspect` and `kraken-oracle`.
   **Always capture the exit status explicitly** (`> /tmp/b.log 2>&1; echo rc=$?`).
   Piping into `grep`/`head` masks a ninja failure, and `grep -c` exits 1 on zero
   matches — that is not a build failure.
@@ -19,8 +19,14 @@ code, the README, or `docs/`.
   reason.
 - The gate suite is five things, not one: `sh scripts/build_check.sh`, ninja
   rc=0 with 0 `error:` lines, `kraken-tests` 2329/2329, `kraken-bench --gate`
-  rc=0, and a coherence spot check on three models (SmolLM2-135M,
-  Qwen3.5-0.8B, Qwen3-MoE-4x0.6B).
+  rc=0, and a coherence spot check on the three small models, run as:
+  `bash scripts/coherence_check.sh models/SmolLM2-135M-Instruct.Q4_K_M.gguf
+  models/Qwen3.5-0.8B.Q4_K_M.gguf models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf`
+  (all three live in the repo's `models/`; expect rc=0 and
+  `3 coherent, 0 not`). Each model runs twice -- device arm and `--cpu`
+  scalar reference -- and a device arm that silently fell back to the CPU
+  backend fails as `FAIL (cpu)`, so a green run is proof the GPU produced
+  the text.
 - That 2329 is a watermark, not a constant: the suite grew 2214 -> 2316 when the
   missing dequantizers landed, and 2316 -> 2329 when Q2_0's geometry changed.
   Read the count off the run (`2329/2329 checks passed`) rather than trusting the

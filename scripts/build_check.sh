@@ -36,9 +36,10 @@
 #   KRK_TARGETS="kraken" scripts/build_check.sh build-cpu
 #
 # Which binaries are required to be current: KRK_TARGETS, or by default
-# `kraken`, `kraken-inspect` and `kraken-tests` plus `kraken-bench` if this
-# configuration builds it (it links krk_hip, so a CPU-only tree has no such
-# target, and demanding one would be a false alarm). kraken-inspect is in the
+# `kraken`, `kraken-inspect` and `kraken-tests` plus `kraken-bench` and
+# `kraken-server` if this configuration builds them (the first two link
+# krk_hip, so a CPU-only tree has no such targets, and demanding one would be
+# a false alarm). kraken-inspect is in the
 # list because it answers loader verdicts from the same tables the loader
 # uses: one built before a new dequantizer landed refused formats the engine
 # could already run. A target named explicitly must exist.
@@ -100,6 +101,7 @@ if [ -n "${KRK_TARGETS:-}" ]; then
 else
     TARGETS="kraken kraken-tests"
     has_target kraken-inspect && TARGETS="$TARGETS kraken-inspect"
+    has_target kraken-server && TARGETS="$TARGETS kraken-server"
     has_target kraken-bench && TARGETS="$TARGETS kraken-bench"
 fi
 
