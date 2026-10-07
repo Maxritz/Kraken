@@ -6,7 +6,7 @@ A GGUF inference engine in C++17, built directly on the ROCm HIP SDK, tuned for
 AMD RDNA GPUs on Windows 11 and Linux.
 
 No PyTorch. No Python in the hot path. No hipBLAS, no MIOpen, no rocBLAS: every
-kernel here is written against the ISA — dense WMMA on RDNA3/RDNA4, packed-math
+kernel here is written against the ISA - dense WMMA on RDNA3/RDNA4, packed-math
 `v_dot2_f32_f16` on RDNA2.
 
 Targets: **Radeon RX 6700 XT** (`gfx1031`, RDNA2) and **Radeon RX 9070 XT**
@@ -26,7 +26,7 @@ fp16 copy of the model. A 7B Q4_K_M model occupies 4.4 GB, not 14 GB.
 
 **One chunking model for every format.** `dequant_chunk<T>(block, chunk, out)`
 materializes exactly 32 values of a block. Every GGUF format is a whole number
-of 32-value chunks — one for Q4_0/Q8_0, eight for the 256-value K-quants, one
+of 32-value chunks - one for Q4_0/Q8_0, eight for the 256-value K-quants, one
 for raw f16/bf16/f32. Because of that, the GEMM, the GEMV and the embedding
 gather share one inner loop and one tiling rule: *K tiles are multiples of 32*.
 
@@ -43,17 +43,17 @@ prompt does not pay for 4000 vocab-sized projections.
 
 **Attention is a real online-softmax kernel.** The KV cache is walked in tiles,
 the running max and normalizer are maintained per block, and the output
-accumulator is rescaled — the score vector is never materialized. Shared memory
+accumulator is rescaled - the score vector is never materialized. Shared memory
 stays under ~33 KiB regardless of context length.
 
-**MoE experts are never loaded up front — and the cache is frequency-aware.**
+**MoE experts are never loaded up front - and the cache is frequency-aware.**
 A `qwen3moe`/`qwen2moe` checkpoint carries one FFN per expert per layer; a
 235B-A22B model touches ~22B of them per token. KRAKEN keeps the whole expert
 set in the file mapping and pages in only the experts the router selects, into
 a byte-budgeted residency set. The policy is **LFU with aging**, not LRU:
 expert popularity is skewed and sticky, so every hit earns a counter, a hot
 expert gets **pinned** against eviction, and periodic decay makes pins lapse
-when traffic moves on — a favourite of the first thousand tokens cannot squat
+when traffic moves on - a favourite of the first thousand tokens cannot squat
 on its slot forever. Give it a second tier with `--expert-warm-mb` (the old
 spelling `--expert-l2-mb` is still accepted) and an evicted
 expert is demoted into page-locked host RAM instead of being dropped, so coming
@@ -62,29 +62,29 @@ same expert are permuted into
 one contiguous block (`gather_rows`), so each expert runs **three GEMMs per
 layer regardless of how many tokens chose it**, and results fold back through a
 fused weighted scatter. A machine with far less memory than the model still
-decodes — it just reloads more. Results are identical at any cache size and
+decodes - it just reloads more. Results are identical at any cache size and
 any chunk size.
 
 ---
 
-## Target hardware — in priority order
+## Target hardware - in priority order
 
-1. **CPU** — the scalar reference backend. It is the oracle: the host
+1. **CPU** - the scalar reference backend. It is the oracle: the host
    dequantizers, the MoE routing and residency policy, the tokenizer and the
    sampling chain are all developed and proven here first, because it runs
    everywhere and its output is the ground truth the device kernels are checked
    against.
-2. **RX 6700 XT** (`gfx1031`, RDNA2, 12 GB) — the primary GPU target. No WMMA,
+2. **RX 6700 XT** (`gfx1031`, RDNA2, 12 GB) - the primary GPU target. No WMMA,
    so it runs the packed-math path (`v_dot2_f32_f16`, f32 accumulation) plus
    the GEMV decode kernel. Correctness and bandwidth-bound decode performance
    are judged on this card first.
-3. **RX 9070 XT** (`gfx1201`, RDNA4, 16 GB) — the secondary target. WMMA with
+3. **RX 9070 XT** (`gfx1201`, RDNA4, 16 GB) - the secondary target. WMMA with
    the `_gfx12` K-split layout, fp8/bf8 support, no `v_dot2`. It inherits every
    host-side feature from the CPU oracle and every RDNA2-validated decision
    before its own paths are exercised.
 
 Everything host-side must work on (1) before it is considered done; anything
-device-side is validated in (2) → (3) order. `HSA_OVERRIDE_GFX_VERSION` is not
+device-side is validated in (2) -> (3) order. `HSA_OVERRIDE_GFX_VERSION` is not
 needed on either card; both are natively supported by the Windows HIP SDK.
 
 ---
@@ -189,8 +189,8 @@ kraken --model <MODEL> --bench
 ```
 
 `--bench` is self-contained and needs no flags: it feeds a fixed prompt (which
-tokenizes to **51–125 tokens depending on the model's tokenizer** — 51 for
-SmolLM2, 55 for most Qwen-family files, 122–125 for a few others), generates
+tokenizes to **51-125 tokens depending on the model's tokenizer** - 51 for
+SmolLM2, 55 for most Qwen-family files, 122-125 for a few others), generates
 **256 tokens**, and reports the *whole* process budget, not just the two phases
 it owns. Defaults in force for every row: greedy sampling, `--ctx 4096`,
 `--chunk 256`. The per-model prompt length is listed in the sweep table below.
@@ -203,44 +203,44 @@ load           1410.5 ms  (32% of start-to-end)
 total          4399.0 ms  (startup + load + prefill + decode)
 ```
 
-- **prefill** — prompt tokens / time to process them. Throughput, so higher is
+- **prefill** - prompt tokens / time to process them. Throughput, so higher is
   better and it scales with batch size.
-- **decode** — generated tokens / time to generate them. The context grows
+- **decode** - generated tokens / time to generate them. The context grows
   during the run, so this is the *average* over 256 tokens ending at ~300
   tokens of context, not a short-context number.
-- **load** — reading the weights into VRAM. It is **32–40% of start-to-end** on
+- **load** - reading the weights into VRAM. It is **32-40% of start-to-end** on
   every model here, which is why it is printed: a report covering only prefill
   and decode invites optimising two thirds of the process.
 
 Configuration: **AMD Radeon RX 9070 XT** (gfx1201, RDNA4, wave32, WMMA gfx12,
 64 CU, 15.9 GiB VRAM), HIP 7.16.26323, clang 23.0.0, ROCm 10.1, host Windows 11.
 
-### Results (3 runs each, range = min–max)
+### Results (3 runs each, range = min-max)
 
 | model | layers / embd | prefill tok/s | decode tok/s | load ms |
 |---|---|---|---|---|
-| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 2184–2890 | 511–512 | 399–445 |
-| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 2435–2673 | 336–347 | 710–789 |
-| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 28 / 1024 | 152–173 | 104–111 | 515–582 |
-| Qwen3-8B Q4_K_M | 36 / 4096 | 787–825 | 88–89 | 1678–1843 |
+| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 2674-2822 | 454-470 | 408-417 |
+| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 2490-2756 | 245-271 | 631-637 |
+| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 28 / 1024 | 115-180 | 95-100 | 481-553 |
+| Qwen3-8B Q4_K_M | 36 / 4096 | 776-812 | 83-85 | 1715-1845 |
 
 These four get three runs each on this build. The MoE prefill band is now narrow
 because this model's expert working set fits the default budget (610 MiB), so run
 1 is already cache-warm and does not page experts cold the way the older sweep did;
-see the residency section. The 8B load band here is also narrow (1.68–1.84 s) — all
+see the residency section. The 8B load band here is also narrow (1.68-1.84 s) - all
 three runs were warm file cache; the older wider band came from one cold-file-cache
 run and is not reproduced here, so it is not a speedup claim.
 
 ### How close is this to the hardware?
 
 The card's real read bandwidth is **585 GB/s**, not the 644 GB/s on the spec
-sheet — measured with a 4096 MiB streaming read (584.9 GB/s). An 8B Q4_K_M
+sheet - measured with a 4096 MiB streaming read (584.9 GB/s). An 8B Q4_K_M
 token has to read **5.02 GB** of weights, so the absolute floor is **8.58 ms =
-117 tok/s**. Kraken does **87–89 tok/s, ~76% of that ceiling**.
+117 tok/s**. Kraken does **87-89 tok/s, ~76% of that ceiling**.
 
 The gap is not bandwidth: **3.78 ms of the 11.27 ms token (34%)** is five
 elementwise ops (`rmsnorm`, `rope`, `qk_norm`, `kv_append`, `add_inplace`) that
-move 8–16 KB each, 253 launches per token. `rmsnorm` alone is 1165x off its own
+move 8-16 KB each, 253 launches per token. `rmsnorm` alone is 1165x off its own
 memory floor. Fusing that chain is the next large win.
 
 To reproduce, substituting your own path:
@@ -252,7 +252,7 @@ kraken --model models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf         --bench
 kraken --model "G:/More-models/Qwen3-8B-Q4_K_M.gguf"            --bench
 ```
 
-Run-to-run spread is 2–5% on prefill and under 2% on decode, so treat
+Run-to-run spread is 2-5% on prefill and under 2% on decode, so treat
 differences smaller than that as noise. MoE rows depend on a tunable: they
 assume the default expert budget (40% of free VRAM), which is why a small MoE
 can look slow next to a dense model far above its weight.
@@ -262,61 +262,61 @@ can look slow next to a dense model far above its weight.
 66 `.gguf` files were tried (everything in `models/` plus `G:/More-models/`,
 skipping only the 3-part Laguna shard set, which is not a loadable model).
 38 ran and 28 were refused loudly at load on the build that produced this sweep
-— the refusal reasons are grouped below the table, and several of the quant-type
+ -  the refusal reasons are grouped below the table, and several of the quant-type
 refusals in it have since been lifted (see the note under the table).
 Dense rows are VRAM-bound decode; MoE rows (marked \*) page experts
 through the default budget, so their prefill includes cold-cache paging.
 
 Each sweep row is **one run**; the headline rows above are the only ones with
-ranges. Treat any two sweep rows closer than 2–5% on prefill as noise.
+ranges. Treat any two sweep rows closer than 2-5% on prefill as noise.
 
-| file | size | arch · layers / embd | prompt tok | prefill tok/s | decode tok/s | load ms |
+| file | size | arch - layers / embd | prompt tok | prefill tok/s | decode tok/s | load ms |
 |---|---|---|---|---|---|---|
-| SmolLM2-135M-Instruct.IQ4_XS | 0.09 GB | llama · 30 / 576 | 51 | 2301 | 482 | 344 |
-| SmolLM2-135M-Instruct.Q4_K_M | 0.11 GB | llama · 30 / 576 | 51 | 2271 | 472 | 342 |
-| Qwen3.5-0.8B.Q4_K_M | 0.53 GB | qwen35 · 24 / 1024 | 55 | 2365 | 339 | 549 |
-| Qwen3-MOE-4x0.6B-2.4B-Q4_K_M \* | 0.96 GB | qwen3moe · 28 / 1024 | 55 | 123 | 109 | 587 |
-| smolcode-coder-cpp-1.5b-q4_k_m | 1.12 GB | qwen2 · 28 / 1536 | 55 | 1808 | 235 | 649 |
-| smolcode-coder-cpp-3b-q4_k_m | 2.10 GB | qwen2 · 36 / 2048 | 55 | 1308 | 160 | 879 |
-| Phi-3.5-mini Q4_K_M | 2.32 GB | llama · 32 / 3072 | 125 | 1354 | 95 | 1653 |
-| qwen3vl-4b-q4_k_m | 2.50 GB | qwen3vl · 36 / 2560 | 55 | 971 | 130 | 2188 |
-| Spark_one.Q6_K | 2.54 GB | qwen2 · 36 / 2048 | 55 | 607 | 122 | 2384 |
-| qwen3.5-4b-nvfp4 | 2.54 GB | qwen35 · 32 / 2560 | 55 | 947 | 128 | 1066 |
-| Samastam-2.5B-Q8_0 | 2.69 GB | llama · 28 / 2048 | 122 | 2546 | 160 | 2407 |
-| VibeThinker-3B.Q8_0 | 3.29 GB | qwen2 · 36 / 2048 | 55 | 1464 | — (no decode; warmup-token artifact on short prompt) | 1925 |
-| Qwen3-4B-Instruct-2507-Q6_K | 3.31 GB | qwen3 · 36 / 2560 | 55 | 459 | 99 | 2113 |
-| qwen2.5-coder-3b-instruct-q8_0 | 3.62 GB | qwen2 · 36 / 2048 | 55 | 1407 | 124 | 2388 |
-| qwen3-1.7b-stem-proof-f16 | 4.07 GB | qwen3 · 28 / 2048 | 55 | 1481 | 132 | 3614 |
-| qwen3-1.7b-coder-distilled-sft-f16 | 4.07 GB | qwen3 · 28 / 2048 | 55 | 1313 | 132 | 3674 |
-| Qwen3-4B-Q8_0 | 4.28 GB | qwen3 · 36 / 2560 | 55 | 1247 | 102 | 1377 |
-| Opus4.7 Distill 4B Q8_0 | 4.48 GB | qwen35 · 32 / 2560 | 55 | 1402 | 97 | 1401 |
-| Qwen3.5-9B-DeepSeek-V4-Flash-MTP Q3_K_M | 4.74 GB | qwen35 · 32 / 4096 | 55 | 914 | 77 | 3038 |
-| Ornith-1.0-9b STRIX_LEAN | 4.96 GB | qwen35 · 32 / 4096 | 55 | 897 | 96 | 2661 |
-| Qwen3-8B-Q4_K_M | 5.03 GB | qwen3 · 36 / 4096 | 55 | 784 | 89 | 1450 |
-| mythos-9b-unhinged-heretic.i1-Q4_K_M | 5.03 GB | qwen3 · 36 / 4096 | 55 | 801 | 89 | 1384 |
-| lacuna-v1-Q4_K_M | 5.07 GB | llama · 32 / 4096 | 52 | 751 | 92 | 5026 |
-| qwen3.5-9b-nvfp4 | 5.31 GB | qwen35 · 32 / 4096 | 55 | 1009 | 88 | 3519 |
-| qwen35-9b-instruct-nvfp4 | 5.31 GB | qwen35 · 32 / 4096 | 55 | 930 | 88 | 4653 |
-| Q3.5-9B-GLM-5.1-DA Q4_K_S | 5.35 GB | qwen35 · 32 / 4096 | 55 | 949 | 88 | 4136 |
-| Qwen2.5-Coder-7B Q5_K_M | 5.44 GB | qwen2 · 28 / 3584 | 55 | 687 | 85 | 3991 |
-| Qwen3.5-9b-Sushi-Coder-RL Q4_K_M | 5.63 GB | qwen35 · 32 / 4096 | 55 | 726 | 82 | 3671 |
-| omnicoder-9b-q6_k | 7.36 GB | qwen35 · 32 / 4096 | 55 | 294 | 60 | 4395 |
-| Qwen3.8-9B-Q6_K | 7.56 GB | qwen35 · 32 / 4096 | 55 | 320 | 60 | 8041 |
-| Qwen3-30B-A3B Q2_K \* | 11.26 GB | qwen3moe · 48 / 2048 | 55 | 9 | 21 | 1182 |
-| Qwen2.5-Coder-32B Q4_K_M ‡ | 19.85 GB | qwen2 · 64 / 5120 | 55 | 44 | 1.0 (oversubscribed — larger than VRAM; do not use as a score) | 17319 |
-| qwable-v1-mxfp4_moe \* | 20.26 GB | qwen35moe · 40 / 2048 | 55 | 6 | 13 | 4737 |
-| laguna-xs2-Q4_K_M \* | 20.27 GB | laguna · 40 / 2048 | 51 | 4 | 9 | 1871 |
-| Unsloth-Ornith-1.5-35B-A3B Q4_K_XL \* | 22.36 GB | qwen35moe · 40 / 2048 | 55 | 7 | 17 | 2620 |
-| Tiel-Coder-35B-A3B Q5_K_XL \* | 26.59 GB | qwen35moe · 40 / 2048 | 55 | 5 | 9 | 2411 |
-| Tiel-Coder-35B-A3B-MTP-APEX \* | 26.67 GB | qwen35moe · 40 / 2048 | 55 | 5 | 15 | 3146 |
-| ornith-35b-Q8_0 \* | 36.90 GB | qwen35moe · 40 / 2048 | 55 | 3 | 10 | 2665 |
+| SmolLM2-135M-Instruct.IQ4_XS | 0.09 GB | llama - 30 / 576 | 51 | 2301 | 482 | 344 |
+| SmolLM2-135M-Instruct.Q4_K_M | 0.11 GB | llama - 30 / 576 | 51 | 2271 | 472 | 342 |
+| Qwen3.5-0.8B.Q4_K_M | 0.53 GB | qwen35 - 24 / 1024 | 55 | 2365 | 339 | 549 |
+| Qwen3-MOE-4x0.6B-2.4B-Q4_K_M \* | 0.96 GB | qwen3moe - 28 / 1024 | 55 | 123 | 109 | 587 |
+| smolcode-coder-cpp-1.5b-q4_k_m | 1.12 GB | qwen2 - 28 / 1536 | 55 | 1808 | 235 | 649 |
+| smolcode-coder-cpp-3b-q4_k_m | 2.10 GB | qwen2 - 36 / 2048 | 55 | 1308 | 160 | 879 |
+| Phi-3.5-mini Q4_K_M | 2.32 GB | llama - 32 / 3072 | 125 | 1354 | 95 | 1653 |
+| qwen3vl-4b-q4_k_m | 2.50 GB | qwen3vl - 36 / 2560 | 55 | 971 | 130 | 2188 |
+| Spark_one.Q6_K | 2.54 GB | qwen2 - 36 / 2048 | 55 | 607 | 122 | 2384 |
+| qwen3.5-4b-nvfp4 | 2.54 GB | qwen35 - 32 / 2560 | 55 | 947 | 128 | 1066 |
+| Samastam-2.5B-Q8_0 | 2.69 GB | llama - 28 / 2048 | 122 | 2546 | 160 | 2407 |
+| VibeThinker-3B.Q8_0 | 3.29 GB | qwen2 - 36 / 2048 | 55 | 1464 | - (no decode; warmup-token artifact on short prompt) | 1925 |
+| Qwen3-4B-Instruct-2507-Q6_K | 3.31 GB | qwen3 - 36 / 2560 | 55 | 459 | 99 | 2113 |
+| qwen2.5-coder-3b-instruct-q8_0 | 3.62 GB | qwen2 - 36 / 2048 | 55 | 1407 | 124 | 2388 |
+| qwen3-1.7b-stem-proof-f16 | 4.07 GB | qwen3 - 28 / 2048 | 55 | 1481 | 132 | 3614 |
+| qwen3-1.7b-coder-distilled-sft-f16 | 4.07 GB | qwen3 - 28 / 2048 | 55 | 1313 | 132 | 3674 |
+| Qwen3-4B-Q8_0 | 4.28 GB | qwen3 - 36 / 2560 | 55 | 1247 | 102 | 1377 |
+| Opus4.7 Distill 4B Q8_0 | 4.48 GB | qwen35 - 32 / 2560 | 55 | 1402 | 97 | 1401 |
+| Qwen3.5-9B-DeepSeek-V4-Flash-MTP Q3_K_M | 4.74 GB | qwen35 - 32 / 4096 | 55 | 914 | 77 | 3038 |
+| Ornith-1.0-9b STRIX_LEAN | 4.96 GB | qwen35 - 32 / 4096 | 55 | 897 | 96 | 2661 |
+| Qwen3-8B-Q4_K_M | 5.03 GB | qwen3 - 36 / 4096 | 55 | 784 | 89 | 1450 |
+| mythos-9b-unhinged-heretic.i1-Q4_K_M | 5.03 GB | qwen3 - 36 / 4096 | 55 | 801 | 89 | 1384 |
+| lacuna-v1-Q4_K_M | 5.07 GB | llama - 32 / 4096 | 52 | 751 | 92 | 5026 |
+| qwen3.5-9b-nvfp4 | 5.31 GB | qwen35 - 32 / 4096 | 55 | 1009 | 88 | 3519 |
+| qwen35-9b-instruct-nvfp4 | 5.31 GB | qwen35 - 32 / 4096 | 55 | 930 | 88 | 4653 |
+| Q3.5-9B-GLM-5.1-DA Q4_K_S | 5.35 GB | qwen35 - 32 / 4096 | 55 | 949 | 88 | 4136 |
+| Qwen2.5-Coder-7B Q5_K_M | 5.44 GB | qwen2 - 28 / 3584 | 55 | 687 | 85 | 3991 |
+| Qwen3.5-9b-Sushi-Coder-RL Q4_K_M | 5.63 GB | qwen35 - 32 / 4096 | 55 | 726 | 82 | 3671 |
+| omnicoder-9b-q6_k | 7.36 GB | qwen35 - 32 / 4096 | 55 | 294 | 60 | 4395 |
+| Qwen3.8-9B-Q6_K | 7.56 GB | qwen35 - 32 / 4096 | 55 | 320 | 60 | 8041 |
+| Qwen3-30B-A3B Q2_K \* | 11.26 GB | qwen3moe - 48 / 2048 | 55 | 9 | 21 | 1182 |
+| Qwen2.5-Coder-32B Q4_K_M ‡ | 19.85 GB | qwen2 - 64 / 5120 | 55 | 44 | 1.0 (oversubscribed - larger than VRAM; do not use as a score) | 17319 |
+| qwable-v1-mxfp4_moe \* | 20.26 GB | qwen35moe - 40 / 2048 | 55 | 6 | 13 | 4737 |
+| laguna-xs2-Q4_K_M \* | 20.27 GB | laguna - 40 / 2048 | 51 | 4 | 9 | 1871 |
+| Unsloth-Ornith-1.5-35B-A3B Q4_K_XL \* | 22.36 GB | qwen35moe - 40 / 2048 | 55 | 7 | 17 | 2620 |
+| Tiel-Coder-35B-A3B Q5_K_XL \* | 26.59 GB | qwen35moe - 40 / 2048 | 55 | 5 | 9 | 2411 |
+| Tiel-Coder-35B-A3B-MTP-APEX \* | 26.67 GB | qwen35moe - 40 / 2048 | 55 | 5 | 15 | 3146 |
+| ornith-35b-Q8_0 \* | 36.90 GB | qwen35moe - 40 / 2048 | 55 | 3 | 10 | 2665 |
 
 † The fixed `--bench` prompt tokenizes to 55 tokens here, prefill runs fine (1591
-tok/s), and the GPU backend is fine — `--bench` still emitted 0 decode tokens.
-With a normal prompt (`x` → 1 tok, forced decode) the same model decodes at
+tok/s), and the GPU backend is fine - `--bench` still emitted 0 decode tokens.
+With a normal prompt (`x` -> 1 tok, forced decode) the same model decodes at
 ~124 tok/s, so the 0.0 is a prompt-training-format artifact, not a kernel or MoE
-path defect. The row is kept for prefill honesty; treat its decode column as “no
-decode measured”, not a throughput number.
+path defect. The row is kept for prefill honesty; treat its decode column as "no
+decode measured", not a throughput number.
 ‡ The 32B dense model is larger than VRAM (18.5 GiB resident on a 15.9 GiB card)
 and runs oversubscribed at 1 tok/s. It stays in the table to show the loader
 refuses nothing silently; it is not a configuration anyone should use.
@@ -399,7 +399,7 @@ vocab 49152. Qwen3.5-0.8B: 24 layers (18 recurrent), 1024 embd, FF 3584,
 vocab 248320. Kernel-level probes put the 9070 XT decode step at 727 tok/s
 launched and 741 tok/s under a HIP graph (wall-clock). The decode-bandwidth
 campaign, fusion A/B and graph timing methodology are in
-[docs/STATUS.md](docs/STATUS.md) (§8–§11); the current bottleneck analysis is
+[docs/STATUS.md](docs/STATUS.md) (§8-§11); the current bottleneck analysis is
 in [docs/PERF-PLAN.md](docs/PERF-PLAN.md).
 
 ### MoE: the residency budget, not the kernels
@@ -412,11 +412,11 @@ a larger expert cache**, and nothing else:
 | decode, 16 tok | 16.0 tok/s | 15.6 tok/s | **77.5 tok/s** | 78.7 tok/s |
 
 The default budget (152.6 MiB) holds ~28 of the layer's 112 expert rows while a
-token routes through 56 of them per step, so the hit rate is **0.0%** — 951
+token routes through 56 of them per step, so the hit rate is **0.0%** - 951
 loads and 925 evictions across 16 tokens, every expert weight re-fetched from
 host memory every step. Raising the budget past the ~600 MiB working set makes
 the paging disappear entirely, and 4096 MiB buys nothing further. The card has
-15.9 GiB free, so the budget was never the binding constraint — the default
+15.9 GiB free, so the budget was never the binding constraint - the default
 was.
 
 ### MoE warm startup (this build, this file)
@@ -425,7 +425,7 @@ The MoE residency feature from the prior section has a startup mode too: at load
 before the first token, the engine can warm both expert tiers from a routing ranking
 so the first decode steps do not pay a cold-cache page storm. Two switches drive it:
 
-- `--expert-warmup N` — bounded warm startup. `-1` (the default) runs it only when the
+- `--expert-warmup N` - bounded warm startup. `-1` (the default) runs it only when the
   routed expert set exceeds the device budget; `0` disables it; a positive `N` forces it.
   `--expert-warmup-ms N` caps that phase's wall time in ms (default 20000 = 20 s, `0` = no
   cap). The phase prints a single verbose line: the order it used, the number of rounds, the
@@ -433,7 +433,7 @@ so the first decode steps do not pay a cold-cache page storm. Two switches drive
   the wall time. When a `.krakenexperts.json` ranking is present next to the GGUF it is read;
   without one the tiers are filled in even (layer) order instead.
 
-- `--ram-tier N` — **a RAM class, not a MiB cap.** It accepts 16, 24, 32, 48, 64 or 96 (GiB) and
+- `--ram-tier N` - **a RAM class, not a MiB cap.** It accepts 16, 24, 32, 48, 64 or 96 (GiB) and
   plans the host WARM tier from the free-RAM budget that class implies, rather than from the
   box's actual free RAM or from `N` literally. On this 95.9 GiB machine `--ram-tier 16`
   resolved to a ~9011 MiB WARM tier and `--ram-tier 24` to ~9600 MiB; a small `N` is not a
@@ -455,7 +455,7 @@ That warmup is well inside the 20 s ceiling. A full `--bench` (greedy, `--ctx 40
     prefill        55 tokens in 1251.8 ms  (43.9 tok/s)
     decode         256 tokens in 10948.8 ms  (23.3 tok/s)
 
-and the cache was quiet after warmup — `HOT 96.6% / WARM 3.4% / COLD 3.3%`, 1027 of 6553 slots
+and the cache was quiet after warmup - `HOT 96.6% / WARM 3.4% / COLD 3.3%`, 1027 of 6553 slots
 pinned, 2818 loads and 2862 evictions across the whole 256-token run. The log on that run also
 warns that the `.json` was measured with the experts stubbed (`--expert-stub`), so the ranking is
 an approximation; treat the 23.3 tok/s as one data point, not a benchmark.
@@ -478,14 +478,14 @@ single configuration / single machine / single file / single prompt numbers, not
 
 A `--ram-tier 16` class run on this box resolved to a 9011 MiB WARM tier (the class budgets the tier
 from this machine's free RAM, so `16` is not a 16 GiB cap) and, stopped after one decode token with
-`-n 1 --ctx 256`, staged 1358 MiB of the routed set into WARM in about 547 ms — that is the shape of
+`-n 1 --ctx 256`, staged 1358 MiB of the routed set into WARM in about 547 ms - that is the shape of
 the low-end class engaging, not a throughput number (a one-token run has no timed decode steps).
 
 A note on the community speed figures for this model family: the published ~120 tok/s numbers for
 "Qwen3.8-35B-A3B-Distill" are from a **different GGUF file** (empero-ai's distill, Q6_K) run through a
 **different tool** (Unsloth Studio) on a **different card** (RX 7900 XTX). This engine's file is
-`Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf` — Q2_K_XL, ff 512, 256 experts/layer
-top-8 — and this build's warmed decode on it is in the tens of tok/s, not the hundreds. The quant, the
+`Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf` - Q2_K_XL, ff 512, 256 experts/layer
+top-8 - and this build's warmed decode on it is in the tens of tok/s, not the hundreds. The quant, the
 active-FFN width, the expert count, the toolchain and the card all differ; the two numbers are not the same
 measurement and should not be compared directly.
 
@@ -498,7 +498,7 @@ Use `--ctx 256/512` for MoE runs on small machines.
 `kraken --help` lists every switch. These are the ones that change what you
 see rather than what the model does.
 
-### `--profile` — where a decode token goes
+### `--profile` - where a decode token goes
 
 Prints a per-op timeline for the last complete decode step: every op in issue
 order, its cumulative position on the device clock, the **device-idle gap
@@ -538,7 +538,7 @@ Tune the window with `KRK_PROFILE_STEPS=N` (last N steps, default 1),
 `KRK_PROFILE_FROM=S` (count back from the last), `KRK_PROFILE_OPS=N` (fallback
 window when there is no `embed` marker to split on).
 
-### `--expert-cache-mb` / `--expert-cache-slots` — MoE residency
+### `--expert-cache-mb` / `--expert-cache-slots` - MoE residency
 
 The auto budget already covers the whole routed expert set when it fits, so
 these are only needed to *pin it down* or to cap it deliberately.
@@ -554,10 +554,10 @@ kraken -m /g/More-models/Laguna-S-2.1-UD-Q4_K_M.gguf --expert-cache-slots 256
 kraken -m models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf --info | grep -E 'expert|moe'
 ```
 
-A **hit rate near 0%** means the working set does not fit — raise the budget.
+A **hit rate near 0%** means the working set does not fit - raise the budget.
 `loads` plateauing early and `evictions` staying flat is the healthy shape.
 
-### `--bench` — throughput and the honest wall clock
+### `--bench` - throughput and the honest wall clock
 
 ```sh
 kraken -m models/Qwen3.5-0.8B.Q4_K_M.gguf --bench -n 64 --greedy
@@ -566,7 +566,7 @@ kraken -m models/Qwen3.5-0.8B.Q4_K_M.gguf --bench -n 64 --greedy
 Prefill and decode are timed separately. `--greedy` matters: the sampled path
 does the full host-side cut and is a different measurement.
 
-### `--expert-warm-mb` — pinned host tier for evicted experts (`--expert-l2-mb` is the old spelling, still accepted)
+### `--expert-warm-mb` - pinned host tier for evicted experts (`--expert-l2-mb` is the old spelling, still accepted)
 
 ```sh
 kraken -m /g/More-models/GLM-4.7-Flash-Q4_K_M.gguf --expert-cache-mb 2048 --expert-warm-mb 8192
@@ -576,7 +576,7 @@ Evicted experts demote to a page-locked host tier instead of going back to the
 GGUF mapping, so a re-promotion is a DMA rather than a file read. Costs host
 RAM; reports `promotions`/`demoted` in `--info`.
 
-### `--draft` / `--draft-tokens` — greedy speculative decoding
+### `--draft` / `--draft-tokens` - greedy speculative decoding
 
 ```sh
 kraken -m /g/More-models/Qwen3-8B-Q4_K_M.gguf --draft models/Qwen3.5-0.8B.Q4_K_M.gguf \
@@ -607,7 +607,7 @@ KRK_N=16 KRK_CHAT=1 bash scripts/coherence_check.sh models/*.gguf
 
 `gate` exits non-zero on a NaN, an inf, an out-of-tolerance value or a
 `logits_topk` mismatch, so it fails the build rather than printing a
-reassuring number. Run all of these after any kernel change — a fast wrong
+reassuring number. Run all of these after any kernel change - a fast wrong
 kernel is the failure mode a code review does not catch.
 
 `build_check.sh` checks the build rather than the engine: that the binaries are
@@ -692,19 +692,19 @@ plain greedy output (proven by the test suite); sampling requests fall back to
 the plain loop. `--bench` prints the acceptance rate.
 
 **Gated delta net (hybrid recurrent/attention)**: `qwen35` and `qwen35moe`
-(Qwen3.5 — conv + gated delta rule in place of attention on most layers). The
+(Qwen3.5 - conv + gated delta rule in place of attention on most layers). The
 f32 CPU path reproduces llama.cpp token for token. **The GPU path is not yet
-reproducible** — see [docs/TODO.md](docs/TODO.md) for what has been ruled out
+reproducible** - see [docs/TODO.md](docs/TODO.md) for what has been ruled out
 and what is next.
 
-**Now dequantizing**: the whole IQ family — `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
-`IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M` — plus BitNet's `Q1_0` and `Q2_0` in both
+**Now dequantizing**: the whole IQ family - `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
+`IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M` - plus BitNet's `Q1_0` and `Q2_0` in both
 geometries (id 42's 128-value block and upstream's 64-value `Q2_0_64`, id 48),
 the ROCmFPX ids 100/101, and PrismML's ternary pair `PQ2_0`/`PTQ1_0` (ids
 142/143) together with the block-1024 Hadamard activation transform their
 `prism.hadamard` metadata declares. Every codebook is a byte-for-byte
-transcription of its producer's header — llama.cpp's `ggml-common.h`, or the
-PrismML fork's `ggml-quants.c` for 142/143 — diffed entry by entry, and every
+transcription of its producer's header - llama.cpp's `ggml-common.h`, or the
+PrismML fork's `ggml-quants.c` for 142/143 - diffed entry by entry, and every
 decoder mirrors its `dequantize_row_*`, on both the host reference path and the
 GPU kernels, so the `GSQ-RCO`, `IQ3_XXS` and `Bonsai` exports load and decode,
 and `Ternary-Bonsai-2-27B-PQ2_0.gguf` passes device-vs-CPU coherence.
@@ -731,7 +731,7 @@ traffic moves on. Without a pin an expert goes to least-frequent, then oldest.
 Evicted experts are *demoted*, not thrown away, when you give the cache a second
 tier: `--expert-warm-mb N` (old spelling `--expert-l2-mb`) reserves N MiB of page-locked host memory that holds
 experts evicted from VRAM. Their next request becomes a DMA instead of a re-read
-of the file — a fault storm on a mapping thousands of times larger than the
+of the file - a fault storm on a mapping thousands of times larger than the
 weights themselves. The LFU counter, the pin and the load order all survive the
 round trip, so a demoted expert is still the same expert when it comes back, and
 the two tiers are budgeted independently: VRAM holds what is about to be used,
@@ -760,7 +760,7 @@ kraken --model ../Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf --cpu --info
 ```
 
 With no flag the budget is auto: 40% of free VRAM on the GPU, a fixed share of
-host memory on the CPU backend. The budget is a *soft* cap — at least one expert
+host memory on the CPU backend. The budget is a *soft* cap - at least one expert
 is always allowed, so even a 1-slot cache decodes correctly, just with a reload
 per step. Routing itself runs on the host (the logits are `[n_tok, n_expert]`),
 and the shared expert stays resident because there is only one.
@@ -777,7 +777,7 @@ and the shared expert stays resident because there is only one.
 ## Layout
 
 ```
-include/krk/         public headers — the engine is usable as a library
+include/krk/         public headers - the engine is usable as a library
 src/                 host implementation (portable C++17, no HIP)
 src/hip/             HIP backend, compiled one pass per --offload-arch
 src/hip/kernels/     the device kernels, one header per concern
@@ -790,7 +790,7 @@ scripts/             build_linux.sh, build_windows.ps1
 ```
 
 The host half of the engine has no HIP dependency at all, which is why it
-compiles and runs — and is tested — without a GPU. `Backend` is the seam: the
+compiles and runs - and is tested - without a GPU. `Backend` is the seam: the
 HIP backend and the scalar reference backend are interchangeable, and the
 reference backend is the oracle the device kernels are checked against.
 
@@ -802,13 +802,13 @@ behaviour, and `docs/RESEARCH.md` for the sources this was built from.
 ## A note on verification
 The host pipeline (GGUF reader, quantizers, tokenizers, sampler, model loader,
 forward pass, CPU backend) is compiled and tested in this repository: checks pass
-(read the count off the run — it grows when coverage does).
+(read the count off the run - it grows when coverage does).
 
 That includes
 
 MoE: a synthetic `qwen2moe` model is built in a temporary
 file, run with a one-slot expert cache, and checked to produce byte-identical
-tokens to the same model with the entire expert set resident — a single-expert
+tokens to the same model with the entire expert set resident - a single-expert
 MoE layer is checked to reproduce its dense twin exactly, and grouped prefill
 (several tokens routed to one expert in a single chunk) is checked to match
 one-token-at-a-time routing.
