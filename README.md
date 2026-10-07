@@ -54,7 +54,8 @@ a byte-budgeted residency set. The policy is **LFU with aging**, not LRU:
 expert popularity is skewed and sticky, so every hit earns a counter, a hot
 expert gets **pinned** against eviction, and periodic decay makes pins lapse
 when traffic moves on — a favourite of the first thousand tokens cannot squat
-on its slot forever. Give it a second tier with `--expert-l2-mb` and an evicted
+on its slot forever. Give it a second tier with `--expert-warm-mb` (the old
+spelling `--expert-l2-mb` is still accepted) and an evicted
 expert is demoted into page-locked host RAM instead of being dropped, so coming
 back is a DMA rather than a re-read of the mapping. The tokens that picked the
 same expert are permuted into
@@ -218,15 +219,17 @@ Configuration: **AMD Radeon RX 9070 XT** (gfx1201, RDNA4, wave32, WMMA gfx12,
 
 | model | layers / embd | prefill tok/s | decode tok/s | load ms |
 |---|---|---|---|---|
-| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 2271–2643 | 472–483 | 342–459 |
-| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 2365–2443 | 339–340 | 517–651 |
-| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 28 / 1024 | 123–218 | 109–117 | 421–587 |
-| Qwen3-8B Q4_K_M | 36 / 4096 | 784–853 | 87–89 | 1384–3461 |
+| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 2184–2890 | 511–512 | 399–445 |
+| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 2435–2673 | 336–347 | 710–789 |
+| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 28 / 1024 | 152–173 | 104–111 | 515–582 |
+| Qwen3-8B Q4_K_M | 36 / 4096 | 787–825 | 88–89 | 1678–1843 |
 
-These four get three runs each; the MoE prefill band is wide because the first
-run pages experts in cold (see the residency section below). The 8B load band
-is wide for the opposite reason: one run hit a cold file cache (~3.4 s) while
-the other two read at 1.6–5.0 GB/s.
+These four get three runs each on this build. The MoE prefill band is now narrow
+because this model's expert working set fits the default budget (610 MiB), so run
+1 is already cache-warm and does not page experts cold the way the older sweep did;
+see the residency section. The 8B load band here is also narrow (1.68–1.84 s) — all
+three runs were warm file cache; the older wider band came from one cold-file-cache
+run and is not reproduced here, so it is not a speedup claim.
 
 ### How close is this to the hardware?
 
@@ -430,7 +433,7 @@ so the first decode steps do not pay a cold-cache page storm. Two switches drive
   the wall time. When a `.krakenexperts.json` ranking is present next to the GGUF it is read;
   without one the tiers are filled in even (layer) order instead.
 
-- `--ram-tier N` — **a RAM class, not a MiB cap.** It accepts 16, 24, 32, 48 or 64 (GiB) and
+- `--ram-tier N` — **a RAM class, not a MiB cap.** It accepts 16, 24, 32, 48, 64 or 96 (GiB) and
   plans the host WARM tier from the free-RAM budget that class implies, rather than from the
   box's actual free RAM or from `N` literally. On this 95.9 GiB machine `--ram-tier 16`
   resolved to a ~9011 MiB WARM tier and `--ram-tier 24` to ~9600 MiB; a small `N` is not a
@@ -563,10 +566,10 @@ kraken -m models/Qwen3.5-0.8B.Q4_K_M.gguf --bench -n 64 --greedy
 Prefill and decode are timed separately. `--greedy` matters: the sampled path
 does the full host-side cut and is a different measurement.
 
-### `--expert-l2-mb` — pinned host tier for evicted experts
+### `--expert-warm-mb` — pinned host tier for evicted experts (`--expert-l2-mb` is the old spelling, still accepted)
 
 ```sh
-kraken -m /g/More-models/GLM-4.7-Flash-Q4_K_M.gguf --expert-cache-mb 2048 --expert-l2-mb 8192
+kraken -m /g/More-models/GLM-4.7-Flash-Q4_K_M.gguf --expert-cache-mb 2048 --expert-warm-mb 8192
 ```
 
 Evicted experts demote to a page-locked host tier instead of going back to the
@@ -598,7 +601,7 @@ The first differing line names the stage and the layer.
 ```sh
 ninja -C build-hip kraken kraken-tests kraken-bench kraken-inspect
 ninja -C build-hip gate                       # numeric tolerances + logits_topk differential
-./build-hip/kraken-tests                      # 2329 checks
+./build-hip/kraken-tests                      # checks (count grows; read it off the run)
 KRK_N=16 KRK_CHAT=1 bash scripts/coherence_check.sh models/*.gguf
 ```
 
@@ -726,7 +729,7 @@ counter pins the slot against eviction, and periodic decay releases pins when
 traffic moves on. Without a pin an expert goes to least-frequent, then oldest.
 
 Evicted experts are *demoted*, not thrown away, when you give the cache a second
-tier: `--expert-l2-mb N` reserves N MiB of page-locked host memory that holds
+tier: `--expert-warm-mb N` (old spelling `--expert-l2-mb`) reserves N MiB of page-locked host memory that holds
 experts evicted from VRAM. Their next request becomes a DMA instead of a re-read
 of the file — a fault storm on a mapping thousands of times larger than the
 weights themselves. The LFU counter, the pin and the load order all survive the
@@ -742,7 +745,7 @@ kraken --model Qwen3-235B-A22B-Q4_K_M.gguf --expert-cache-mb 8000 --prompt "Hi"
 kraken --model model.gguf --expert-cache-slots 48 --prompt "Hi"
 
 # keep evicted experts in page-locked host RAM instead of dropping them
-kraken --model model.gguf --expert-cache-mb 4096 --expert-l2-mb 16384 --prompt "Hi"
+kraken --model model.gguf --expert-cache-mb 4096 --expert-warm-mb 16384 --prompt "Hi"
 
 # see the geometry and the active budget
 kraken --model model.gguf --info
@@ -797,10 +800,12 @@ behaviour, and `docs/RESEARCH.md` for the sources this was built from.
 ---
 
 ## A note on verification
-
 The host pipeline (GGUF reader, quantizers, tokenizers, sampler, model loader,
-forward pass, CPU backend) is compiled and tested in this repository: 2329 checks
-pass (read the count off the run -- it grows when coverage does). That includes
+forward pass, CPU backend) is compiled and tested in this repository: checks pass
+(read the count off the run — it grows when coverage does).
+
+That includes
+
 MoE: a synthetic `qwen2moe` model is built in a temporary
 file, run with a one-slot expert cache, and checked to produce byte-identical
 tokens to the same model with the entire expert set resident — a single-expert
