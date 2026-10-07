@@ -678,3 +678,133 @@ The CPU path is still slow — it is a 24B-parameter model computed scalars — 
 it no longer pays for paging and no longer advises a fix that does not exist.
 
 ---
+
+## 12. Expert warmup: a ranked two-tier startup
+
+The question behind this section: the 35B MoE that does *not* fit VRAM
+(`Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf`, 40 MoE layers,
+256 experts, top-8, a 9600 MiB expert corpus) spent its first tokens paying
+compulsory file reads and its decode steps chasing a working set larger than the
+device budget. Read-through and the WARM tier already convert *re-reads* into
+RAM reads, but they cannot help the reads that have not happened yet, and they
+fill both tiers in whatever order the prompt happened to touch. `--expert-warmup`
+adds a bounded startup phase that fills WARM from a *ranking* and then promotes
+the top of that order into VRAM, so the first tokens land in a hot tier and a
+tier smaller than the routed set holds what routing actually wants.
+
+The ranking comes from `--expert-scan`, which writes
+`<model>.krakenexperts.json`: each layer's experts sorted by summed routing
+probability mass, plus the source file's size and mtime so a loader can refuse a
+ranking measured on different weights. A missing or stale index is not an error
+-- the warmup falls back to an even order (every layer's expert 0, then expert 1,
+...) and says so.
+
+### 12.1 The headline: at the auto budget the warmup is pure preload
+
+Interleaved 3-rep A/B on the 35B, `-n 256`, auto budgets (VRAM 9600 MiB / WARM
+9600 MiB), one environment variable apart (`KRK_EXPERT_WARMUP=0/1`):
+
+| 35B, auto budgets, `-n 256` | warmup off | warmup on |
+|---|---|---|
+| prefill | 2049/2032/2060 ms = 26.8 tok/s | **354/359/356 ms = 155.4 tok/s (5.8x)** |
+| decode | 24.3 / 25.1 / 25.1 tok/s | **31.6 / 32.5 / 32.7 tok/s (+30%)** |
+| COLD misses | 6434 (7.5%) | **0** |
+| bytes read during the run | 6032 MiB (23.56 MiB/tok) | **0 MiB** |
+| HOT hit rate | ~92% | **100%** |
+| warmup wall time | -- | 4823 / 4886 / 5029 ms |
+
+At this budget the whole corpus (256 x 40 experts) fits, so the warmup is a pure
+preload: it moves 9600 MiB of compulsory read-through to the front, where it
+costs 4.8 s once, instead of charging it to the first tokens and the early decode
+steps. Decode rises to 31.6-32.7 tok/s because every expert a token routes to is
+already resident.
+
+**It is a first-token-latency feature, not a throughput feature at long
+horizons.** At `-n 512` the two arms are a wash start-to-end (off 21956/22049 ms
+vs on 22251/21810 ms) because the ~4.8 s warmup is exactly the decode saving the
+extra 256 tokens would have collected. The right default is therefore the one
+shipped: on when the routed set exceeds the device budget, off when it fits, and
+a `--expert-warmup-ms` ceiling (20 s by default) that spends the time hottest
+first so being cut short costs coverage, never the top of the list.
+
+### 12.2 Where the ranking matters: a tier smaller than the routed set
+
+With `--expert-cache-mb 6144 --expert-warm-mb 6144` and a 502-position
+full-forward index, the three arms differ only in the order the two tiers are
+filled:
+
+| 35B, 6144/6144 MiB, `-n 448` (2 reps) | decode | COLD misses | bytes read |
+|---|---|---|---|
+| warmup off (read-through) | 25.4 / 25.3 tok/s | 6434 (7.5%) | 6032 MiB (23.56 MiB/tok) |
+| warmup, even order | 22.9 / 23.5 tok/s | 3260 (3.8%) | 3056 MiB (11.94 MiB/tok) |
+| warmup, **ranked** order | 25.0 / 24.1 tok/s | **2862 (3.4%)** | **2683 MiB (10.48 MiB/tok)** |
+
+The ranked warmup matches the off arm's decode while reading **2.3x less from the
+file**; the even order is strictly worse. Two honest caveats: within each
+repetition the three arms ran in sequence (off -> even -> ranked), so an ordering
+effect is not fully excluded even though the repetitions were interleaved; and at
+tiers that hold the entire corpus the ranking cannot matter, which is exactly
+what the auto-budget test showed (ranked 29.6/27.0 vs even 31.3/32.5 tok/s --
+both meaningless, both tiers are full). A decisive ranked-vs-even measurement
+needs a tier below the routed set *and* an interleaved three-way schedule; that
+is still outstanding.
+
+The index is worth a sanity read. For layer 0, the top-8 experts by mass are
+243, 64, 49, 161, 85, 213, 245, 112 (masses 7.93 down to 5.65), the bottom four
+are 113, 25, 205, 252 (0.157 down to 0.049), and **the top 64 of 256 experts
+carry 51.4% of the layer's mass**. Mass is comparable *within* a layer and every
+layer runs on every token, so the warmup reads the ranking round-major (every
+layer's r-th hottest expert) rather than sorting globally: a global sort would
+spend the whole tier on the few layers whose experts happen to carry the most
+probability and leave the rest with nothing.
+
+### 12.3 A real defect found while measuring: `--expert-scan --bench` wrote nothing
+
+The bench branch of `src/main_cli.cpp` returned before `write_expert_index`, so
+`--expert-scan --bench` -- the exact combination the usage text advertises, and
+the one that removes tokenisation and sampling from the scan -- produced no
+`.krakenexperts.json` at all. A silent no-op that looked like "the scan found
+nothing". Fixed by writing the index before `engine.shutdown()` in the bench
+branch; the same command now writes a 441991-byte file where it previously wrote
+nothing.
+
+### 12.4 `--ram-tier`: the spec's table applied to an intended machine
+
+`--ram-tier 16|24|32|48|64|96` plans the host tier for that RAM class instead of
+the installed 96 GiB. The clamp is `ram_total = min(tier, installed)`, and the
+`ram policy:` line marks the run as planned. Measured sweep on the 35B (`-n 8`,
+warmup off):
+
+| `--ram-tier` | host budget | WARM |
+|---|---|---|
+| 0 (installed 95.9 GiB) | 36.6 GiB | 9600 MiB |
+| 16 | 8.8 GiB | 9011 MiB |
+| 24 | 14.7 GiB | 9600 MiB |
+| 32 | 20.6 GiB | 9600 MiB |
+| 48 | 32.4 GiB | 9600 MiB |
+| 64 / 96 | 36.4 GiB | 9600 MiB |
+
+Only the 16 GiB class actually shrinks WARM here, because the WARM want is
+`min(host_budget, total_expert_bytes())` and this model's expert corpus is only
+9600 MiB -- the same "correct per spec, a no-op for this model" shape the Laguna
+note records. It binds for a corpus larger than the class's budget. The VRAM
+side is unchanged by the tier.
+
+### 12.5 The contract, and how it is tested
+
+`test_expert_warmup()` (`tests/test_kraken.cpp`) pins the three properties the
+measurement depends on, on the synthetic 4-expert MoE: a matching index stages
+*exactly* the experts it names (2, not 4); a stale index (`n_expert 99`) is
+refused and falls back to the even order (4); a missing index does the same; and
+`--expert-warmup 0` stages nothing. It also asserts that the warmup's own
+loads/promotions/hits are zeroed by `ExpertCache::reset_counters()` before the
+run's report -- otherwise the HOT/WARM/COLD split that decides the next
+experiment is partly a measurement of the phase that was supposed to improve it.
+
+Suite count went 2664 -> **2675/2675** with those 11 checks. Full gate suite for
+this commit: `scripts/build_check.sh` 0 failed / 0 warnings, the ninja six-target
+line rc=0 with 0 `error:` lines, `kraken-tests` 2675/2675, `kraken-bench --gate`
+rc=0, and `coherence_check.sh` on SmolLM2-135M / Qwen3.5-0.8B /
+Qwen3-MoE-4x0.6B => "3 coherent, 0 not".
+
+---

@@ -18,6 +18,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <fstream>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -3189,6 +3190,116 @@ static void test_expert_cache_warm_tier() {
 }
 
 // ---------------------------------------------------------------------------
+// Expert warmup: the ranked startup phase that fills the two tiers in order
+// ---------------------------------------------------------------------------
+//
+// The measurement that justifies this feature is in docs/perf_trace_report.md
+// (5.8x prefill, +30% decode on the 35B MoE at the auto budget). What has to be
+// pinned down in a unit test is the contract that measurement depends on: the
+// warmup stages the RANKED set and stops, a stale index is REFUSED rather than
+// trusted, and the traffic the warmup earned is reset so the run's own report
+// describes the run. A warmup that quietly staged the whole corpus, or accepted
+// a ranking measured on other weights, would make the headline number mean
+// something else entirely.
+struct WarmupRun {
+    bool ok = false;
+    size_t warm_slots = 0;
+    u64 loads = 0, promotions = 0, hits = 0;
+};
+
+static void test_expert_warmup() {
+    MoeSpec vs;
+    vs.dense = false;
+    vs.n_expert = 4;
+    vs.n_expert_used = 2;
+    vs.shared = true;
+    vs.varied = true;
+    CHECK(build_tiny_moe_model(kMoeTestPath, vs), "wrote the warmup-test MoE GGUF");
+    const std::string idx = std::string(kMoeTestPath) + ".krakenexperts.json";
+
+    i64 src_size = 0;
+    {
+        std::ifstream f(kMoeTestPath, std::ios::binary | std::ios::ate);
+        src_size = static_cast<i64>(f.tellg());
+    }
+    CHECK(src_size > 0, "the warmup-test model has a size the index must match");
+
+    // Writes an index whose layer-0 ranking names exactly two of the four
+    // experts. n_expert is a parameter so the caller can also write a STALE one.
+    const auto write_index = [&](int n_expert) {
+        std::ofstream f(idx, std::ios::binary);
+        f << "{\n  \"version\": 1,\n  \"kind\": \"kraken-expert-index\",\n"
+          << "  \"mode\": \"full-forward\",\n  \"source_size\": " << src_size
+          << ",\n  \"n_layer\": 1,\n  \"n_expert\": " << n_expert
+          << ",\n  \"positions_scanned\": 64,\n  \"layers\": [\n"
+          << "    {\"layer\": 0, \"experts\": [{\"e\": 2}, {\"e\": 0}]}\n"
+          << "  ]\n}\n";
+    };
+
+    const auto warm = [&](i32 warmup) {
+        WarmupRun r;
+        Backend *cpu = make_cpu_backend();
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = kMoeTestPath;
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        cfg.expert_cache_mb = 1;
+        cfg.expert_warm_mb = 64;
+        cfg.expert_warmup = warmup;
+        std::string err;
+        r.ok = engine.init(cpu, cfg, &err);
+        if (r.ok) {
+            const ExpertCache &ec = engine.model().experts();
+            r.warm_slots = ec.warm_slots();
+            r.loads = ec.loads();
+            r.promotions = ec.promotions();
+            r.hits = ec.hits();
+            engine.shutdown();
+        }
+        delete cpu;
+        return r;
+    };
+
+    // 1. A matching index is a PREFIX, not a corpus sweep: the warmup stages the
+    //    two experts it names and leaves the other two to read-through.
+    write_index(4);
+    {
+        const WarmupRun r = warm(1);
+        CHECK(r.ok, "a forced warmup initialises");
+        CHECK(r.warm_slots == 2, "the warmup stages exactly the ranked experts");
+        CHECK(r.loads == 0 && r.promotions == 0 && r.hits == 0,
+              "the warmup's own traffic is reset before the run's report");
+    }
+
+    // 2. An index measured on a different model must be refused, not trusted:
+    //    accepted, it would order the tiers by another model's routing. The
+    //    fallback is the even order, which stages the whole corpus.
+    write_index(99);
+    {
+        const WarmupRun r = warm(1);
+        CHECK(r.ok, "a mismatched index still initialises");
+        CHECK(r.warm_slots == 4, "a refused index falls back to the even order");
+    }
+
+    // 3. No index at all is the same fallback, and the message says so.
+    std::remove(idx.c_str());
+    {
+        const WarmupRun r = warm(1);
+        CHECK(r.ok, "no index still initialises");
+        CHECK(r.warm_slots == 4, "no index falls back to the even order");
+    }
+
+    // 4. --expert-warmup 0 stages nothing: the opt-out has to be total.
+    {
+        const WarmupRun r = warm(0);
+        CHECK(r.ok, "a disabled warmup initialises");
+        CHECK(r.warm_slots == 0, "a disabled warmup stages nothing");
+    }
+    std::remove(idx.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // CpuExpertPool: the CPU half of the hybrid expert path
 // ---------------------------------------------------------------------------
 //
@@ -4249,6 +4360,7 @@ int main() {
     test_moe_grouped_prefill_matches_tokenwise();
     test_expert_cache_policy();
     test_expert_cache_warm_tier();
+    test_expert_warmup();
     test_cpu_expert_pool();
     test_gdn_ops();
     test_gdn_model_loads();

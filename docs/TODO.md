@@ -1305,3 +1305,28 @@ so the identity is not a promise the file makes. Without the fix
 - **The 99%-hot-expert accuracy target.** Nothing measured against it this
   session; the expert-cache work below is a separate, earlier thread.
 - **The prefill speedup.** T2 / G1 remain untouched.
+
+### Update (2026-10-07): expert warmup LANDED -- and `--expert-scan --bench` was a silent no-op
+
+`--expert-warmup` (default: on when the routed set exceeds the device budget),
+`--expert-warmup-ms` (20 s ceiling) and `--ram-tier` are in, on both the CLI and
+the server. The phase reads a ranking written by `--expert-scan`, fills WARM
+hottest-first one batched read per layer, and promotes the top of that order
+into VRAM, then resets its own traffic counters so the run's report describes the
+run. On the 35B MoE at the auto budget that is **155.4 tok/s prefill against 26.8
+(5.8x)** and **+30% decode**, with zero COLD misses and zero bytes read during
+the run; at `-n 512` it is a wash start-to-end, so it is a first-token-latency
+feature rather than a throughput one. Numbers, caveats and the `--ram-tier`
+table are in docs/test-results.md section 12 and docs/perf_trace_report.md.
+
+The defect found on the way: the bench branch of `src/main_cli.cpp` returned
+*before* `write_expert_index`, so `--expert-scan --bench` -- the combination the
+usage text advertises -- wrote no index at all. Fixed; the same command now
+writes the file.
+
+**Still open from this thread:** a decisive ranked-vs-even measurement (needs a
+tier below the routed set and an interleaved three-way schedule); the per-layer
+blocking router D2H in `Engine::moe_ffn`; the 4-op-per-expert chain and the
+O(n_expert) host scan per layer; and the prefill item below, which this does not
+touch -- 155 tok/s on the 35B is still the 55-token fixed prompt, not a real
+long-prompt prefill number.

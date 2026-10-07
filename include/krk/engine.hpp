@@ -5,6 +5,7 @@
 #define KRK_ENGINE_HPP
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "krk/backend.hpp"
@@ -59,6 +60,28 @@ struct EngineConfig {
     // sweep costs the whole corpus in wall time and RAM before the first token,
     // and read-through already admits every expert the run touches.
     bool expert_warm_prefetch = false;
+    // Expert warmup: a bounded startup phase that stages the RANKED expert set
+    // into WARM and then promotes the top of that order into VRAM, so the first
+    // tokens are not paying compulsory file reads and a tier smaller than the
+    // routed set holds what routing wants rather than what happened to be
+    // touched first. -1 (the default) turns it on when it can help -- a WARM
+    // tier exists and the routed set is larger than the device budget, which is
+    // exactly the case where the ORDER of the two tiers decides the miss rate.
+    // 1 forces it, 0 disables it; KRK_EXPERT_WARMUP=0/1 overrides both, so the
+    // A/B is one environment variable away.
+    i32 expert_warmup = -1;
+    // Wall-time ceiling for that phase, in ms. The default is inside the
+    // 15-30 s a cold start can afford; a phase that has not filled the tiers by
+    // then stops where it is, having spent the time on the hottest experts
+    // first. 0 removes the ceiling (fill the tiers however long it takes).
+    i32 expert_warmup_ms = 20000;
+    // The RAM class to plan the host tier for, in GiB: 16, 24, 32, 48, 64 or
+    // 96, i.e. the machine the run should behave as if it were on. 0 (the
+    // default) is the installed RAM. This is the spec's tiering table applied
+    // to a class instead of to the box, so a deployment can be measured and
+    // tuned on a 96 GiB workstation for a 32 GiB target without pretending the
+    // extra RAM away by hand.
+    i32 ram_tier_gb = 0;
     // Total device memory this run is allowed to plan for, in MiB. 0 (the
     // default) is the stepped policy in Engine::configure_expert_cache: 6 GiB
     // to begin with, +2 GiB at a time while the card has the headroom and the
@@ -313,6 +336,24 @@ private:
     void dense_ffn(const LayerWeights &L, i32 l, i64 n);
     // Chooses the expert residency budget from cfg_ and the device.
     void configure_expert_cache();
+    // Fills the two residency tiers ahead of the run, hottest-first: WARM from
+    // the ranked expert list, then the top of that order onto the device. The
+    // point is the ORDER, not the volume -- a tier smaller than the routed set
+    // holds what routing actually wants instead of whatever the first few
+    // tokens happened to touch -- and the wall-time ceiling is what keeps the
+    // phase inside a cold start. See EngineConfig::expert_warmup.
+    void warm_experts();
+    // `<model>.krakenexperts.json` (see write_expert_index) as a hottest-first
+    // (layer, expert) list. Empty when the file is missing or does not describe
+    // this exact model: a ranking measured on other weights is worse than no
+    // ranking, so a stale index is refused rather than trusted.
+    std::vector<std::pair<i32, i32>> load_expert_index() const;
+    // Whether the ranked warmup should run for this configuration: false for a
+    // routing scan, a dense model, or a run with no WARM tier, and otherwise
+    // cfg_.expert_warmup with the default (-1) resolved against whether the
+    // routed set actually exceeds the device budget. KRK_EXPERT_WARMUP=0/1
+    // overrides all of it, which is what makes the A/B one variable wide.
+    bool expert_warmup_wanted() const;
     // One gated-delta-net (recurrent) layer: the fused [q|k|v] projection, the
     // causal short conv, the per-head gate/forget, the delta rule, and the
     // gated output projection. Advances the layer's recurrent state.

@@ -151,6 +151,35 @@ void ExpertCache::clear() {
     warm_rejects_ = 0;
 }
 
+void ExpertCache::reset_counters() {
+    // Deliberately NOT clear(): residency is the warmup's product and has to
+    // survive. Only the traffic it generated is discarded, so the report that
+    // follows describes the run. clear() also leaves the byte and millisecond
+    // accumulators alone (they cover the whole process), which is why they are
+    // reset here by hand rather than inherited.
+    loads_ = 0;
+    evictions_ = 0;
+    hits_ = 0;
+    host_hits_ = 0;
+    demotions_ = 0;
+    promotions_ = 0;
+    decays_ = 0;
+    acquires_ = 0;
+    total_acquires_ = 0;
+    warm_admissions_ = 0;
+    warm_evictions_ = 0;
+    warm_rejects_ = 0;
+    bytes_loaded_ = 0;
+    bytes_demoted_ = 0;
+    bytes_promoted_ = 0;
+    bytes_staged_ = 0;
+    promote_ms_ = 0.0;
+    read_ms_ = 0.0;
+    room_ms_ = 0.0;
+    alloc_ms_ = 0.0;
+    xfer_ms_ = 0.0;
+}
+
 u32 ExpertCache::touch_count(i32 layer, i32 expert) const {
     const auto it = slots_.find(slot_key(layer, expert));
     return it == slots_.end() ? 0u : it->second.count;

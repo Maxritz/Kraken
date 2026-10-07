@@ -174,6 +174,15 @@ public:
     f64 alloc_ms() const { return alloc_ms_; } // alloc_pooled: pool wait or malloc
     f64 xfer_ms() const { return xfer_ms_; }   // upload_paged_batch, host wait in
 
+    // Zeroes the traffic counters and the stage timers WITHOUT touching
+    // residency: the slots stay where they are, and so do their LFU counts.
+    // The startup warmup earns promotions and file reads that belong to the
+    // warmup, and a run's report has to describe the run -- otherwise the
+    // 92.7%/7.3%/7.3% HOT/WARM/COLD split that decides the next experiment is
+    // partly a measurement of the phase that was supposed to improve it. The
+    // warmup prints its own bytes and milliseconds; nothing is hidden by this.
+    void reset_counters();
+
     size_t budget_bytes() const { return budget_; }
     size_t resident_bytes() const { return bytes_; }
     // Device-resident slots, i.e. the ones whose weights are in VRAM right now.

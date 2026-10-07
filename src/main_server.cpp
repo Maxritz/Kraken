@@ -29,6 +29,9 @@ struct Args {
     int expert_cache_mb = 0;
     int expert_cache_slots = 0;
     int expert_warm_mb = -1; // WARM expert cache (MiB): <0 auto, 0 off
+    int expert_warmup = -1;  // ranked WARM+VRAM warmup at load: <0 auto, 0 off
+    int expert_warmup_ms = 20000; // wall-time ceiling for that phase, 0 = none
+    int ram_tier_gb = 0;     // plan the host tiers for this RAM class (GiB)
     // Hybrid CPU + GPU expert compute: non-resident experts run on the host out
     // of the mapping while the device runs the resident ones (see
     // EngineConfig::hybrid_experts). Same split the CLI exposes.
@@ -57,6 +60,12 @@ void usage() {
         "  --expert-cache-slots N  cap resident (layer, expert) slots\n"
         "  --expert-warm-mb N     WARM expert cache in pageable host RAM (MiB;\n"
         "                        <0 auto, 0 off); --expert-l2-mb also accepted\n"
+        "  --expert-warmup N      ranked expert warmup at load: -1 auto, 1 force,\n"
+        "                        0 off. Stages the hot experts into WARM and\n"
+        "                        promotes the top of that order into VRAM.\n"
+        "  --expert-warmup-ms N   wall-time ceiling for that phase in ms (0 = none)\n"
+        "  --ram-tier N           plan the host tiers for a 16/24/32/48/64/96 GiB\n"
+        "                        class of machine (0 = installed RAM)\n"
         "  --hybrid-experts 1    compute non-resident experts on the host while the\n"
         "                        device runs the resident ones (frees VRAM and RAM)\n"
         "  --hybrid-threads N     host threads for that split (0 = min(hw, 8))\n"
@@ -93,6 +102,12 @@ bool parse(int argc, char **argv, Args *a) {
             a->expert_cache_slots = std::atoi(next("--expert-cache-slots"));
         else if (f == "--expert-warm-mb" || f == "--expert-l2-mb")
             a->expert_warm_mb = std::atoi(next("--expert-warm-mb"));
+        else if (f == "--expert-warmup")
+            a->expert_warmup = std::atoi(next("--expert-warmup"));
+        else if (f == "--expert-warmup-ms")
+            a->expert_warmup_ms = std::atoi(next("--expert-warmup-ms"));
+        else if (f == "--ram-tier" || f == "--ram-tier-gb")
+            a->ram_tier_gb = std::atoi(next("--ram-tier"));
         else if (f == "--hybrid-experts")
             a->hybrid_experts = std::atoi(next("--hybrid-experts")) != 0;
         else if (f == "--hybrid-threads")
@@ -146,6 +161,9 @@ int main(int argc, char **argv) {
     cfg.expert_cache_mb = a.expert_cache_mb;
     cfg.expert_cache_slots = a.expert_cache_slots;
     cfg.expert_warm_mb = a.expert_warm_mb;
+    cfg.expert_warmup = a.expert_warmup;
+    cfg.expert_warmup_ms = a.expert_warmup_ms;
+    cfg.ram_tier_gb = a.ram_tier_gb;
     cfg.hybrid_experts = a.hybrid_experts;
     cfg.hybrid_threads = a.hybrid_threads;
     cfg.hybrid_max_rows = a.hybrid_max_rows;

@@ -358,6 +358,9 @@ materializes exactly those matrices under a byte budget, LFU with aging.
 | `--expert-cache-slots N` | cap resident `(layer, expert)` slots instead of bytes (`0` = auto) |
 | `--expert-warm-mb N` | WARM tier in pageable host RAM for evicted experts; `<0` auto, `0` off (`--expert-l2-mb` is the old spelling) |
 | `--expert-warm-prefetch` | fill WARM at load instead of on demand |
+| `--expert-warmup 0/1` | ranked startup phase: stage the ranked expert set into WARM, then promote the top of that order into VRAM. `<0` auto (on when the routed set exceeds the device budget), `0` off, `1` forced; `KRK_EXPERT_WARMUP=0/1` overrides |
+| `--expert-warmup-ms N` | wall-time ceiling for that phase in ms (default `20000`); `0` removes it. Being cut short costs coverage, never the hottest experts |
+| `--ram-tier N` | plan the host tier for the `N` GiB RAM class (16/24/32/48/64/96) instead of the installed RAM; `0` = installed. Aliased `--ram-tier-gb` |
 
 The auto budget already covers the whole routed expert set when it fits, so
 these flags pin it down or cap it deliberately. **A partial budget below the

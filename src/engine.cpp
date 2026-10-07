@@ -4,6 +4,7 @@
 #include "krk/arch.hpp"
 #include "krk/dflash.hpp"
 #include "krk/host_time.hpp"
+#include "krk/json.hpp" // the expert index reader (warm_experts)
 #include "par_pool.hpp"
 
 #include <algorithm>
@@ -475,6 +476,13 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             KRK_INFO("workspaces ready: chunk=%d ctx=%lld KV=%.0f MiB (load %.0f ms)",
                      chunk_, static_cast<long long>(kv_cap_), total_vram_mb, load_ms);
     }
+
+    // Fill the residency tiers before the first token. This runs after
+    // configure_expert_cache (which decides the budgets and, when the warmup is
+    // on, deliberately leaves WARM to this phase) and before the 1-token
+    // weights pass, so that pass is itself a warm-tier run rather than a cold
+    // one. See EngineConfig::expert_warmup for when it engages.
+    if (expert_warmup_wanted()) warm_experts();
 
     if (cfg_.warmup) {
         const i32 t = tok_.bos() >= 0 ? tok_.bos() : 0;
@@ -1085,7 +1093,20 @@ void Engine::configure_expert_cache() {
     //
     // Everything the run does not plan for -- the mapping, the dense trunk, the
     // OS -- is what those four terms are.
-    const size_t ram_total = host_total_bytes();
+    const size_t ram_installed = host_total_bytes();
+    // --ram-tier applies the spec's tiering table to a CLASS rather than to
+    // this box: plan for 16/24/32/48/64/96 GiB so a deployment can be measured
+    // and tuned on a 96 GiB workstation for a 32 GiB target without pretending
+    // the extra RAM away by hand. 0 (the default) is the installed size. A tier
+    // larger than the machine is clamped back to the machine, and the
+    // availability clamp below still applies to whatever is free right now, so
+    // a tier is a budget rather than a claim on memory that is not there.
+    size_t ram_total = ram_installed;
+    if (cfg_.ram_tier_gb > 0) {
+        const size_t tier = static_cast<size_t>(cfg_.ram_tier_gb) << 30;
+        ram_total =
+            ram_installed > 0 && tier > ram_installed ? ram_installed : tier;
+    }
     size_t host_budget = 0;
     if (cfg_.host_ram_mb > 0) {
         host_budget = static_cast<size_t>(cfg_.host_ram_mb) * 1024u * 1024u;
@@ -1127,11 +1148,12 @@ void Engine::configure_expert_cache() {
     }
     if (host_budget > 0 || cfg_.host_ram_mb > 0)
         KRK_INFO("ram policy: %.1f GiB budget (%.1f GiB installed, %.1f GiB "
-                 "free) -> WARM tier %.0f MiB%s",
+                 "free) -> WARM tier %.0f MiB%s%s",
                  static_cast<f64>(host_budget) / static_cast<f64>(gib),
-                 static_cast<f64>(ram_total) / static_cast<f64>(gib),
+                 static_cast<f64>(ram_installed) / static_cast<f64>(gib),
                  static_cast<f64>(host_available_bytes()) / static_cast<f64>(gib),
                  static_cast<f64>(warm) / (1024.0 * 1024.0),
+                 cfg_.ram_tier_gb > 0 ? " [planned for the --ram-tier class]" : "",
                  cfg_.expert_warm_mb == 0 ? " (disabled by --expert-warm-mb 0)"
                                           : "");
 
@@ -1144,12 +1166,19 @@ void Engine::configure_expert_cache() {
     // against ~1.9 s of decode it then improved). --expert-warm-prefetch, or
     // KRK_EXPERT_PRELOAD=1, turns it on; KRK_EXPERT_PRELOAD=0 forces it off, so
     // the A/B is one environment variable away.
+    //
+    // Mutually exclusive with the warmup: that phase fills WARM in ranked order
+    // and this sweep fills it evenly, so running both would spend the first
+    // half of the tier on the wrong order and then have no room for the right
+    // one. The warmup is the ranked, ranked-by-traffic version of this sweep,
+    // so it wins when it is on.
     const char *pre_env = std::getenv("KRK_EXPERT_PRELOAD");
     const bool prefetch = pre_env && pre_env[0] == '0'
                               ? false
                               : (cfg_.expert_warm_prefetch ||
                                  (pre_env && pre_env[0] == '1'));
-    if (warm > 0 && be_->caps().vram_free > 0 && prefetch) {
+    if (warm > 0 && be_->caps().vram_free > 0 && prefetch &&
+        !expert_warmup_wanted()) {
         const std::chrono::steady_clock::time_point t0 =
             std::chrono::steady_clock::now();
         const size_t ram_before = host_available_bytes();
@@ -1186,7 +1215,7 @@ void Engine::configure_expert_cache() {
         std::snprintf(warm_note, sizeof(warm_note),
                       " + WARM %.0f MiB pageable%s",
                       static_cast<f64>(warm) / (1024.0 * 1024.0),
-                      prefetch ? " (prefetched)" : "");
+                      prefetch && !expert_warmup_wanted() ? " (prefetched)" : "");
     KRK_INFO(             "expert cache: budget %.1f MiB%s, %d experts x top-%d, %d layers, "
              "policy LFU+aging (pin at %u hits, decay every %u); cold reads are "
              "read-through",
@@ -1502,6 +1531,280 @@ void Engine::write_expert_index(const std::string &path) const {
     KRK_INFO("expert scan: wrote %s (%lld positions, %s)", path.c_str(),
              static_cast<long long>(expert_scan_tokens_),
              expert_stub_ ? "routers only, experts stubbed" : "full forward");
+}
+
+// True when the ranked warmup should run. Split out from warm_experts()
+// because configure_expert_cache has to know whether to leave WARM alone: the
+// two phases fill the same tier in different orders and cannot both run.
+bool Engine::expert_warmup_wanted() const {
+    // A routing scan is a measurement pass, not a deployment, and its experts
+    // are skipped in the cheap mode -- warming tiers it will not read is 20 s
+    // of cold start spent on nothing.
+    if (expert_scan_) return false;
+    const ModelConfig &mc = model_.cfg();
+    if (!mc.is_moe || mc.n_expert <= 0) return false;
+    const ExpertCache &ec = model_.experts();
+    if (ec.warm_capacity_bytes() == 0) return false; // no second tier to fill
+    bool on = cfg_.expert_warmup > 0;
+    if (cfg_.expert_warmup < 0) {
+        // Default: on exactly when the ORDER of the two tiers can change the
+        // answer, which is when the routed set does not fit the device. When it
+        // fits, every expert is resident anyway and staging is pure wall time.
+        on = model_.total_expert_bytes() > ec.budget_bytes();
+    }
+    const char *env = std::getenv("KRK_EXPERT_WARMUP");
+    if (env && (env[0] == '0' || env[0] == '1')) on = env[0] == '1';
+    return on;
+}
+
+// Reads the ranking write_expert_index produced and returns it as (layer,
+// expert) pairs hottest-first, round-major across layers.
+//
+// The round-major interleave is the one design decision this function makes.
+// The file stores each layer's experts sorted by mass, so a per-layer prefix is
+// that layer's hot set -- but mass is comparable WITHIN a layer and every layer
+// runs on every token. Sorting globally would spend a tier that holds 80% of
+// the routed set on the few layers whose experts happen to carry the most
+// probability mass and leave the rest with nothing, which is strictly worse
+// than giving every layer its own top 80%. So the rank is read one expert deep
+// at a time: round r is every layer's r-th hottest expert.
+std::vector<std::pair<i32, i32>> Engine::load_expert_index() const {
+    std::vector<std::pair<i32, i32>> out;
+    const ModelConfig &mc = model_.cfg();
+    if (!mc.is_moe || mc.n_expert <= 0 || mc.n_layer <= 0) return out;
+    const std::string path = cfg_.model_path + ".krakenexperts.json";
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return out; // no ranking: warm_experts falls back to an even order
+    std::string text;
+    {
+        char buf[1 << 16];
+        size_t n = 0;
+        while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+    }
+    std::fclose(f);
+    JsonValue root;
+    std::string err;
+    if (!json_parse(text, &root, &err) || !root.is_object()) {
+        KRK_WARN("expert warmup: %s is not readable JSON (%s) -- ignoring it",
+                 path.c_str(), err.c_str());
+        return out;
+    }
+    std::string kind;
+    root.get_string("kind", &kind);
+    if (kind != "kraken-expert-index" || root.get_int("version", 0) != 1 ||
+        root.get_int("n_layer", -1) != mc.n_layer ||
+        root.get_int("n_expert", -1) != mc.n_expert) {
+        KRK_WARN("expert warmup: %s does not describe this model (kind '%s', "
+                 "version %lld, %lld layers x %lld experts; expected %d x %d) "
+                 "-- ignoring it",
+                 path.c_str(), kind.c_str(),
+                 static_cast<long long>(root.get_int("version", 0)),
+                 static_cast<long long>(root.get_int("n_layer", -1)),
+                 static_cast<long long>(root.get_int("n_expert", -1)),
+                 mc.n_layer, mc.n_expert);
+        return out;
+    }
+    // The ranking has to belong to these weights. Size is the cheap part of
+    // that check and it catches the common mistake -- an index file copied next
+    // to a different quantization of the same model.
+    struct stat st;
+    if (::stat(cfg_.model_path.c_str(), &st) == 0) {
+        const i64 isz = root.get_int("source_size", -1);
+        if (isz >= 0 && static_cast<unsigned long long>(isz) !=
+                            static_cast<unsigned long long>(st.st_size)) {
+            KRK_WARN("expert warmup: %s was measured on a %.1f GiB file and this "
+                     "one is %.1f GiB -- ignoring it (a ranking from other "
+                     "weights orders the tiers by another model's routing)",
+                     path.c_str(),
+                     static_cast<f64>(isz) / (1024.0 * 1024.0 * 1024.0),
+                     static_cast<f64>(st.st_size) / (1024.0 * 1024.0 * 1024.0));
+            return out;
+        }
+    }
+    std::string mode;
+    root.get_string("mode", &mode);
+    if (mode == "routers-only")
+        KRK_WARN("expert warmup: %s was measured with the experts stubbed "
+                 "(--expert-stub); the ranking is an approximation",
+                 path.c_str());
+
+    const JsonValue *layers = root.find("layers");
+    if (!layers || !layers->is_array()) return out;
+    std::vector<std::vector<i32>> per_layer(static_cast<size_t>(mc.n_layer));
+    for (const JsonValue &lv : layers->items()) {
+        if (!lv.is_object()) continue;
+        const i64 l = lv.get_int("layer", -1);
+        if (l < 0 || l >= mc.n_layer) continue;
+        const JsonValue *ex = lv.find("experts");
+        if (!ex || !ex->is_array()) continue;
+        for (const JsonValue &ev : ex->items()) {
+            const i64 e = ev.get_int("e", -1);
+            if (e >= 0 && e < mc.n_expert)
+                per_layer[static_cast<size_t>(l)].push_back(static_cast<i32>(e));
+        }
+    }
+    size_t depth = 0;
+    for (const auto &v : per_layer) depth = std::max(depth, v.size());
+    if (depth == 0) return out;
+    out.reserve(depth * static_cast<size_t>(mc.n_layer));
+    for (size_t r = 0; r < depth; r++)
+        for (i32 l = 0; l < mc.n_layer; l++) {
+            const std::vector<i32> &v = per_layer[static_cast<size_t>(l)];
+            if (r < v.size()) out.emplace_back(l, v[r]);
+        }
+    KRK_INFO("expert warmup: using %s (%lld positions, %s, %zu ranked pairs)",
+             path.c_str(), static_cast<long long>(root.get_int("positions_scanned", -1)),
+             mode.empty() ? "mode unknown" : mode.c_str(), out.size());
+    return out;
+}
+
+// Fills WARM and then VRAM in the ranking's order, under a wall-time ceiling.
+//
+// The order is the whole point. Read-through already admits every expert a run
+// touches, so a tier bigger than the routed set does not need this at all. What
+// it fixes is the tier that is SMALLER: without a ranking the first tokens
+// decide what stays, and the first tokens are a prompt, not a distribution over
+// the conversation. Staging hottest-first puts what routing actually wants into
+// the fast tiers before the prompt is read, and promoting the top of that order
+// means the first decode steps hit VRAM instead of paying a promotion apiece.
+//
+// Nothing here is required for correctness: acquire() still loads whatever this
+// did not warm, and every expert it stages is also in WARM, which is where a
+// VRAM eviction falls back to anyway. It is a startup cost, bounded in
+// milliseconds on purpose -- the hottest experts are staged first, so being cut
+// short costs coverage, never the top of the list.
+void Engine::warm_experts() {
+    if (!be_) return;
+    const ModelConfig &mc = model_.cfg();
+    if (!mc.is_moe || mc.n_expert <= 0) return;
+    ExpertCache &ec = model_.experts();
+    const size_t one = model_.max_expert_bytes();
+    if (one == 0 || ec.warm_capacity_bytes() == 0) return;
+
+    const std::chrono::steady_clock::time_point t0 =
+        std::chrono::steady_clock::now();
+    auto elapsed_ms = [&t0]() {
+        return std::chrono::duration<f64, std::milli>(
+                   std::chrono::steady_clock::now() - t0)
+            .count();
+    };
+    const i64 ceiling = cfg_.expert_warmup_ms;
+    auto out_of_time = [&]() {
+        return ceiling > 0 && elapsed_ms() >= static_cast<f64>(ceiling);
+    };
+
+    std::vector<std::pair<i32, i32>> rank = load_expert_index();
+    const bool ranked = !rank.empty();
+    if (!ranked) {
+        // No prior measurement: every layer's expert 0, then expert 1, and so
+        // on -- the same even order the eager sweep uses. It is the best a run
+        // can do without knowing which experts are hot, and it still converts
+        // compulsory file reads on the first tokens into later promotions.
+        for (i32 e = 0; e < mc.n_expert; e++)
+            for (i32 l = 0; l < mc.n_layer; l++)
+                if (model_.layers()[static_cast<size_t>(l)].experts.present())
+                    rank.emplace_back(l, e);
+        KRK_INFO("expert warmup: no %s.krakenexperts.json -- filling the tiers "
+                 "evenly; run --expert-scan to rank them",
+                 cfg_.model_path.c_str());
+    }
+    // Per-layer view of the rank, so a round can be issued as ONE batched read
+    // per layer instead of one read per expert: the file's queue depth is what
+    // makes the difference (593 MiB/s at depth 1 against 3400 sequential).
+    std::vector<std::vector<i32>> ids(static_cast<size_t>(mc.n_layer));
+    for (const auto &pr : rank)
+        ids[static_cast<size_t>(pr.first)].push_back(pr.second);
+    size_t depth = 0;
+    i32 moe_layers = 0;
+    for (const auto &v : ids) {
+        if (v.size() > depth) depth = v.size();
+        if (!v.empty()) moe_layers++;
+    }
+    if (depth == 0 || moe_layers == 0) return;
+
+    // ---- WARM: the ranked set, hottest-first, one batched read per layer ----
+    const size_t warm_cap = ec.warm_capacity_bytes();
+    size_t staged = 0;
+    size_t from = 0;
+    i32 rounds = 0;
+    while (from < depth) {
+        if (out_of_time()) break;
+        const size_t used = ec.warm_used_bytes();
+        const size_t left = warm_cap > used ? (warm_cap - used) / one : 0;
+        if (left == 0) break; // tier full
+        // Round width: what the remaining tier holds across every layer at
+        // once. Without the division a tier that filled mid-round would leave
+        // the layers it had not reached yet with nothing, which is the exact
+        // failure this phase exists to avoid.
+        size_t width = left / static_cast<size_t>(moe_layers);
+        if (width == 0) width = 1;
+        if (width > depth - from) width = depth - from;
+        const size_t before = staged;
+        for (i32 l = 0; l < mc.n_layer; l++) {
+            if (out_of_time()) break;
+            const std::vector<i32> &lst = ids[static_cast<size_t>(l)];
+            if (from >= lst.size()) continue;
+            const LayerWeights &L = model_.layers()[static_cast<size_t>(l)];
+            if (!L.experts.present()) continue;
+            const size_t n = std::min(width, lst.size() - from);
+            staged += ec.prefetch_layer(L.experts, l, lst.data() + from,
+                                        static_cast<int>(n));
+        }
+        from += width;
+        rounds++;
+        // Nothing fitted this round even though the tier reports room:
+        // per-expert sizes differ, so the tier can be full while the byte
+        // arithmetic says otherwise. Stop rather than spinning over rounds that
+        // cannot stage anything.
+        if (staged == before) break;
+    }
+
+    // ---- VRAM: the top of the same order ----------------------------------
+    // Only experts already in WARM are promoted. Promoting a cold one would
+    // read the file here and then leave a HOT slot whose eviction has nowhere
+    // to fall back to; keeping HOT a subset of WARM is what makes every VRAM
+    // eviction free.
+    size_t promoted = 0;
+    size_t promoted_bytes = 0;
+    if (be_->caps().vram_free > 0) {
+        for (size_t r = 0; r < depth; r++) {
+            if (out_of_time()) break;
+            bool room = false;
+            for (i32 l = 0; l < mc.n_layer; l++) {
+                const std::vector<i32> &lst = ids[static_cast<size_t>(l)];
+                if (r >= lst.size()) continue;
+                const LayerWeights &L = model_.layers()[static_cast<size_t>(l)];
+                if (!L.experts.present()) continue;
+                if (ec.full_for(L.experts)) continue;
+                room = true;
+                const i32 e = lst[r];
+                if (!ec.in_host(l, e)) continue; // staging did not reach it
+                const size_t had = ec.resident_slots();
+                if (ec.acquire(L.experts, l, e) && ec.resident_slots() > had) {
+                    promoted++;
+                    promoted_bytes += L.experts.expert_bytes();
+                }
+            }
+            if (!room) break; // every layer's device tier is full
+        }
+    }
+    be_->sync();
+
+    const f64 ms = elapsed_ms();
+    const bool cut = out_of_time();
+    KRK_INFO("expert warmup: %s order, %d rounds, %zu experts/layer deep; WARM "
+             "%.0f MiB of %.0f MiB in %zu slots (%.0f MiB read), VRAM +%zu "
+             "experts (%.0f MiB, %zu slots); %.0f ms%s",
+             ranked ? "ranked" : "even", rounds, depth,
+             static_cast<f64>(ec.warm_used_bytes()) / 1048576.0,
+             static_cast<f64>(warm_cap) / 1048576.0, ec.warm_slots(),
+             static_cast<f64>(staged) / 1048576.0, promoted,
+             static_cast<f64>(promoted_bytes) / 1048576.0, ec.resident_slots(),
+             ms, cut ? " (stopped at the --expert-warmup-ms ceiling)" : "");
+    // The warmup's traffic is not the run's. Reset the counters it earned so
+    // the residency report describes what the run did with the tiers it was
+    // handed; the line above is the warmup's own record of what it spent.
+    ec.reset_counters();
 }
 
 void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {

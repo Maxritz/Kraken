@@ -37,6 +37,9 @@ struct Args {
     int kv_warm_mb = -1;         // KV WARM (host RAM) budget, MiB: <0 auto, 0 off
     std::string kv_cold_dir;     // KV COLD spill directory: empty disables
     bool expert_warm_prefetch = false; // fill WARM at load instead of on demand
+    int expert_warmup = -1;      // ranked WARM+VRAM warmup at load: <0 auto, 0 off
+    int expert_warmup_ms = 20000; // wall-time ceiling for that phase, 0 = none
+    int ram_tier_gb = 0;         // plan the host tier for this RAM class (GiB)
     // Hybrid CPU + GPU expert compute: experts that are not VRAM-resident are
     // computed on the host out of the mapping while the device runs the
     // resident ones (see EngineConfig::hybrid_experts).
@@ -127,6 +130,22 @@ void usage() {
         "                        --expert-l2-mb is the old spelling of this flag.\n"
         "  --expert-warm-prefetch  fill WARM at load instead of on demand (costs\n"
         "                        RAM and time before the first token)\n"
+        "  --expert-warmup N      ranked expert warmup at load: -1 (default) runs\n"
+        "                        it when the routed expert set exceeds VRAM, 1\n"
+        "                        forces it, 0 disables it. Stages the hot experts\n"
+        "                        into WARM and promotes the top of that order into\n"
+        "                        VRAM before the first token, so a tier smaller\n"
+        "                        than the routed set holds what routing wants.\n"
+        "                        Needs <model>.krakenexperts.json to rank by;\n"
+        "                        without it the tiers fill in an even order.\n"
+        "  --expert-warmup-ms N   wall-time ceiling for that phase, in ms (0 =\n"
+        "                        none). Default 20000; the hottest experts go in\n"
+        "                        first, so running out costs coverage, not the top.\n"
+        "  --ram-tier N           plan the host RAM tiers for this class of\n"
+        "                        machine, in GiB: 16, 24, 32, 48, 64 or 96. 0 (the\n"
+        "                        default) is the installed RAM. Clamped to what is\n"
+        "                        actually installed, so a 32 GiB tier is the same\n"
+        "                        run on a 32 GiB box and a smaller one here.\n"
         "  --hybrid-experts 1    compute the experts the device tier cannot hold\n"
         "                        on the host, out of the weight mapping, while the\n"
         "                        device runs the resident ones. The experts it\n"
@@ -220,6 +239,12 @@ bool parse(int argc, char **argv, Args *a) {
             a->expert_warm_mb = std::atoi(next("--expert-warm-mb"));
         else if (f == "--expert-warm-prefetch")
             a->expert_warm_prefetch = std::atoi(next("--expert-warm-prefetch")) != 0;
+        else if (f == "--expert-warmup")
+            a->expert_warmup = std::atoi(next("--expert-warmup"));
+        else if (f == "--expert-warmup-ms")
+            a->expert_warmup_ms = std::atoi(next("--expert-warmup-ms"));
+        else if (f == "--ram-tier" || f == "--ram-tier-gb")
+            a->ram_tier_gb = std::atoi(next("--ram-tier"));
         else if (f == "--hybrid-experts")
             a->hybrid_experts = std::atoi(next("--hybrid-experts")) != 0;
         else if (f == "--hybrid-threads")
@@ -667,6 +692,9 @@ int main(int argc, char **argv) {
     cfg.kv_warm_mb = a.kv_warm_mb;
     cfg.kv_cold_dir = a.kv_cold_dir;
     cfg.expert_warm_prefetch = a.expert_warm_prefetch;
+    cfg.expert_warmup = a.expert_warmup;
+    cfg.expert_warmup_ms = a.expert_warmup_ms;
+    cfg.ram_tier_gb = a.ram_tier_gb;
     cfg.hybrid_experts = a.hybrid_experts;
     cfg.hybrid_threads = a.hybrid_threads;
     cfg.hybrid_max_rows = a.hybrid_max_rows;
@@ -781,6 +809,13 @@ int main(int argc, char **argv) {
     if (a.bench) {
         const int rc = run_bench(engine, a, bench_load_ms, bench_start_ms);
         ph.mark("run_bench (prefill+decode)");
+        // The bench arm used to return here, which silently dropped the index
+        // for `--expert-scan --bench` -- the very combination the argument
+        // validation above advertises as the way to scan without a prompt. The
+        // scan's positions came from the bench's own prefill and decode, so
+        // this is the same index a --prompt run would have written, just never
+        // written. `--expert-scan --bench` was a no-op that looked like a pass.
+        if (a.expert_scan) engine.write_expert_index(a.model + ".krakenexperts.json");
         engine.shutdown();
         ph.mark("engine.shutdown");
         delete be;
