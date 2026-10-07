@@ -416,6 +416,76 @@ the paging disappear entirely, and 4096 MiB buys nothing further. The card has
 15.9 GiB free, so the budget was never the binding constraint — the default
 was.
 
+### MoE warm startup (this build, this file)
+
+The MoE residency feature from the prior section has a startup mode too: at load,
+before the first token, the engine can warm both expert tiers from a routing ranking
+so the first decode steps do not pay a cold-cache page storm. Two switches drive it:
+
+- `--expert-warmup N` — bounded warm startup. `-1` (the default) runs it only when the
+  routed expert set exceeds the device budget; `0` disables it; a positive `N` forces it.
+  `--expert-warmup-ms N` caps that phase's wall time in ms (default 20000 = 20 s, `0` = no
+  cap). The phase prints a single verbose line: the order it used, the number of rounds, the
+  experts-per-layer depth, how much WARM it filled, how much VRAM it added, bytes read, and
+  the wall time. When a `.krakenexperts.json` ranking is present next to the GGUF it is read;
+  without one the tiers are filled in even (layer) order instead.
+
+- `--ram-tier N` — **a RAM class, not a MiB cap.** It accepts 16, 24, 32, 48 or 64 (GiB) and
+  plans the host WARM tier from the free-RAM budget that class implies, rather than from the
+  box's actual free RAM or from `N` literally. On this 95.9 GiB machine `--ram-tier 16`
+  resolved to a ~9011 MiB WARM tier and `--ram-tier 24` to ~9600 MiB; a small `N` is not a
+  small cap, and a literal MiB restriction is `--expert-warm-mb` / `--expert-cache-mb`.
+
+One file on this box exercises it end to end: `G:/More-models/Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf`
+(`qwen35moe`, 40 layers, 2048 embd, ff 512, 256 experts/layer top-8, Q2_K_XL, ~11.7 GB).
+Its companion `*.krakenexperts.json` is the ranking the warmup reads when present.
+
+With the ranking read and `--ram-tier 6144` (6144 MiB VRAM budget + 6144 MiB WARM):
+
+    [info ] expert warmup: using ...Qk2xl.gguf.krakenexperts.json (182 positions, routers-only, 10240 ranked pairs)
+    [info ] expert warmup: ranked order, 2 rounds, 256 experts/layer deep; WARM 6143 MiB of 6144 MiB in 6553 slots
+            (6150 MiB read), VRAM +6553 experts (6143 MiB, 6553 slots); 3126 ms
+
+That warmup is well inside the 20 s ceiling. A full `--bench` (greedy, `--ctx 4096`, `--chunk 256`,
+256 decode tokens) on that warmed run then reported:
+
+    prefill        55 tokens in 1251.8 ms  (43.9 tok/s)
+    decode         256 tokens in 10948.8 ms  (23.3 tok/s)
+
+and the cache was quiet after warmup — `HOT 96.6% / WARM 3.4% / COLD 3.3%`, 1027 of 6553 slots
+pinned, 2818 loads and 2862 evictions across the whole 256-token run. The log on that run also
+warns that the `.json` was measured with the experts stubbed (`--expert-stub`), so the ranking is
+an approximation; treat the 23.3 tok/s as one data point, not a benchmark.
+
+With the same file and `--ram-tier 9600` but no ranking file (even fill, 1 round):
+
+    [info ] expert warmup: even order, 1 rounds, 256 experts/layer deep; WARM 9600 MiB of 9600 MiB in 10240 slots
+            (9600 MiB read), VRAM +10240 experts (9600 MiB, 10240 slots); 4823 ms
+
+after which the routed set fits the tier and the cache produces no further traffic:
+
+    prefill        55 tokens in 353.9 ms  (155.4 tok/s)
+    decode         256 tokens in 8067.6 ms  (31.6 tok/s)
+    experts        0 loads, 0 evictions, 100.0% hit rate, 1042/10240 pinned
+
+That 31.6 tok/s decode is the cleaner "warmed, cache-quiet" number for this file on this build;
+the 23.3 tok/s ranked run is the more interesting one because it is the case the ranking is meant
+to help (a tier too small to hold the routed set, where ordering actually matters), but both are
+single configuration / single machine / single file / single prompt numbers, not a score table entry.
+
+A `--ram-tier 16` class run on this box resolved to a 9011 MiB WARM tier (the class budgets the tier
+from this machine's free RAM, so `16` is not a 16 GiB cap) and, stopped after one decode token with
+`-n 1 --ctx 256`, staged 1358 MiB of the routed set into WARM in about 547 ms — that is the shape of
+the low-end class engaging, not a throughput number (a one-token run has no timed decode steps).
+
+A note on the community speed figures for this model family: the published ~120 tok/s numbers for
+"Qwen3.8-35B-A3B-Distill" are from a **different GGUF file** (empero-ai's distill, Q6_K) run through a
+**different tool** (Unsloth Studio) on a **different card** (RX 7900 XTX). This engine's file is
+`Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf` — Q2_K_XL, ff 512, 256 experts/layer
+top-8 — and this build's warmed decode on it is in the tens of tok/s, not the hundreds. The quant, the
+active-FFN width, the expert count, the toolchain and the card all differ; the two numbers are not the same
+measurement and should not be compared directly.
+
 Use `--ctx 256/512` for MoE runs on small machines.
 
 ---
