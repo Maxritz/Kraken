@@ -18,6 +18,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <filesystem>
 #include <fstream>
 
 #if defined(_WIN32)
@@ -1744,25 +1745,42 @@ static void test_kv_tier_per_layer_widths() {
     CHECK(m.kv_dim_at(3) == 16, "layer 3 KV dim is 2 heads * 8 = 16");
     CHECK(max_kv_dim == 16, "the widest KV layer is 16");
 
-    // 3. kv_tier_stats reports the geometry the tier was sized to, and the
-    //    tier covers exactly the 2 KV-carrying layers -- not all 4.
+    // 3. kv_tier_stats reports the geometry the tier is sized FROM -- the layer
+    //    count and the widest layer -- and it covers exactly the 2 KV-carrying
+    //    layers, not all 4. The slot geometry it reports here is deliberately
+    //    the FLAT one, so the honest reading is "not tiered, no slots": a cache
+    //    that fits is a single flat allocation (kv_tier.hpp), and the CPU
+    //    backend hands the whole cache as the device budget for a measured
+    //    reason -- a CPU tier pages every layer per step through host buffers
+    //    that ARE the device, 4951 ms/step against 27 ms on a 64-layer model
+    //    (src/engine.cpp).
+    //
+    //    Neither can it be otherwise. n_slots_ is min(hot_budget/slot_bytes,
+    //    n_kv_layers), and the flat path is taken while hot_budget >= total_;
+    //    since total_ <= n_kv_layers * slot_bytes, a budget that engages the
+    //    tier gives n_slots_ <= n_kv_layers - 1. "One HOT slot per KV-carrying
+    //    layer" therefore IS the flat case, and no flag combination can produce
+    //    it tiered. The slot arithmetic itself is proved on the cache, where a
+    //    budget below the cache does engage it -- see test_kv_tier_drop_vs_spill.
     KvTierStats ks;
     engine.kv_tier_stats(&ks);
     CHECK(ks.layers == 2, "the tier knows about 2 KV layers, not 4");
-    CHECK(ks.slots == 2, "one HOT slot per KV-carrying layer (largest layer)");
     CHECK(ks.layer_bytes == slot_bytes,
           "a HOT slot holds the largest layer one plane");
-    CHECK(ks.hot_bytes == slot_bytes * 2,
-          "two HOT slots hold both planes of both layers");
-    CHECK(ks.tiered,
-          "the tier is engaged even though this is a CPU run (geometry is real)");
-    CHECK(ks.hot == 2, "both KV-carrying layers are resident in HOT at init");
+    CHECK(!ks.tiered, "a cache that fits runs flat, not tiered");
+    CHECK(ks.slots == 0, "a flat cache holds no HOT slots");
+    CHECK(ks.hot == 0 && ks.hot_bytes == 0,
+          "and nothing is resident in a HOT tier it does not have");
 
-    // 4. The flat init path's own arithmetic: total KV bytes == the KV the
-    //    model actually has, and NOT n_layer * widest_layer. This is what used
-    //    to be 8.67x the KV that exists (208 MiB for 24 MiB on nemotron).
-    CHECK(ks.hot_bytes == static_cast<size_t>(total_kv),
-          "the flat cache holds exactly the KV the model has");
+    // 4. The flat allocation's own arithmetic: one plane holds the KV the model
+    //    actually has -- sum over the KV-carrying layers, NOT n_layer times the
+    //    widest layer. This is the number that used to be 8.67x the KV that
+    //    exists (208 MiB reserved and reported for 24 MiB on nemotron).
+    CHECK(engine.kvt_k().plane_bytes() == static_cast<size_t>(plane_bytes),
+          "the K plane holds exactly the KV the model has");
+    CHECK(engine.kvt_k().plane_bytes() + engine.kvt_v().plane_bytes() ==
+              static_cast<size_t>(total_kv),
+          "both planes together hold exactly that and nothing more");
 
     // 5. Re-deriving the KV dimension from the model's own per-layer dims is
     //    the cross-check: sum(kv_dim_at(l) for l where layer_has_kv(l)).
@@ -1794,8 +1812,16 @@ static void test_kv_tier_no_kv_layers() {
     engine.kv_tier_stats(&ks);
 
     CHECK(ks.layers == 2, "only the 2 KV-carrying layers are counted");
-    CHECK(ks.slots == 2, "one slot per KV-carrying layer");
-    CHECK(ks.hot == 2, "those 2 layers are the ones resident in HOT");
+    // The no-KV layers get no slot and no charge. The cache is flat here (see
+    // test_kv_tier_per_layer_widths for why it cannot be anything else on this
+    // machine), so what the report has to show is the flat geometry, and the
+    // two layers it counted are exactly the ones the packed plane holds.
+    CHECK(!ks.tiered && ks.slots == 0,
+          "a flat cache gives no layer a HOT slot");
+    CHECK(ks.hot == 0 && ks.hot_bytes == 0,
+          "and holds nothing in a HOT tier it does not have");
+    CHECK(engine.kvt_k().plane_bytes() == engine.kvt_v().plane_bytes(),
+          "both planes pack the same KV-carrying bytes");
 
     const Model &m = engine.model();
     CHECK(m.kv_layer_count() == 2, "Model::kv_layer_count agrees");
@@ -1823,75 +1849,112 @@ static void test_kv_tier_no_kv_layers() {
 }
 
 static void test_kv_tier_drop_vs_spill() {
-    // The COLD counter and the DROPPED counter are not the same event and never
-    // have been. A 1-slot HOT + no WARM + a real cold dir on the CPU means every
-    // eviction that cannot reach WARM is DROPPED (the page goes nowhere), and
-    // only a promotion that actually writes the file is a COLD spill. This test
-    // makes both visible and checks they are separate.
-    const std::string path = "kraken-sparse-kv-test.gguf";
-    CHECK(build_sparse_kv_model(path), "wrote the sparse-KV fixture");
-
-    Backend *cpu = make_cpu_backend();
-    Engine engine;
-    std::string err;
-    CHECK(set_kv_tiered_budget(engine, cpu, path, 0, 0, "kraken-drop-vs-spill-dir", &err),
-          "engine initialises with a cold dir");
-    if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
-
-    // The COLD directory is real and writable on this box (we own the root).
-    std::string cold_dir = "kraken-drop-vs-spill-dir";
-    std::FILE *probe = std::fopen((cold_dir + "/.krk_kv_probe_test").c_str(), "wb");
-    CHECK(probe, "the cold dir is writable");
-    std::fclose(probe);
-    std::remove((cold_dir + "/.krk_kv_probe_test").c_str());
-
-    // 2 HOT slots for 2 KV-carrying layers at ctx=16. Each decode step promotes
-    // the next layer into HOT and evicts the previous one; without WARM the
-    // evicted page has no home, so it is DROPPED rather than spilled.
-    KvTierStats before;
-    engine.kv_tier_stats(&before);
-    CHECK(before.slots == 2, "2 HOT slots for the 2 KV layers");
-    CHECK(before.layers == 2, "2 KV-carrying layers");
-
-    // Force evictions by stepping past the cache.
-    GenerateParams p;
-    p.prompt = "the";
-    p.max_tokens = 10;
-    p.sampler.greedy = true;
-    p.sampler.temp = 0.0f;
-    GenerateResult r;
-    CHECK(engine.generate(p, &r), "sparse-KV model generates with a cold dir");
-    CHECK(!r.tokens.empty(), "it produced tokens");
-
-    KvTierStats after;
-    engine.kv_tier_stats(&after);
-
-    const i64 drops = after.evictions_dropped - before.evictions_dropped;
-    const i64 spills = after.evictions_to_cold - before.evictions_to_cold;
-    const i64 prom_warm = after.promotions_from_warm - before.promotions_from_warm;
-    const i64 prom_cold = after.promotions_from_cold - before.promotions_from_cold;
-
-    CHECK(drops > 0,
-          "with no WARM, evictions DROP the page rather than spill it");
-    CHECK(spills >= 0, "spills are counted separately and are non-negative");
-    CHECK(prom_cold >= 0, "promotions-from-cold are counted separately");
-
-    // The two counters are independent: a page is either dropped (goes nowhere)
-    // or spilled (lands on disk), never both, and a dropped page is the one that
-    // says the run is wrong.
-    CHECK(drops > 0 || spills > 0 || prom_cold > 0,
-          "the tier moved pages (one of drops/spills/prom-cold is non-zero)");
-
-    // Cleanup: remove the spill files so the next run of this test starts clean.
-    for (int i = 0; i < 2; i++) {
-        std::remove((cold_dir + "/kv_k_layer_" + std::to_string(i) + ".bin").c_str());
-        std::remove((cold_dir + "/kv_v_layer_" + std::to_string(i) + ".bin").c_str());
+    // The COLD counter and the DROPPED counter are not the same event. A page
+    // evicted from HOT with nowhere to go is DROPPED -- its KV is gone and the
+    // layer is zero-filled next time -- while the same page with a cold dir is
+    // SPILLED to disk and comes back on promotion. They shared one counter
+    // once, which let a run that lost a page every step report a working disk
+    // tier while printing fluent text.
+    //
+    // Driven on the cache rather than through Engine, for two reasons. A CPU
+    // engine run never evicts (its cache is flat, see
+    // test_kv_tier_per_layer_widths), so neither counter could move. And the
+    // tiered slot geometry -- which Engine cannot show on this machine -- is
+    // provable here, where a budget below the cache really does engage the tier.
+    //
+    // What it proves is what the design guarantees. With no cold dir, WARM's
+    // capacity comes from the geometry and not from the budget, so a 1-slot HOT
+    // still loses nothing even when --kv-warm-mb asks for no WARM at all: the
+    // DROPPED counter is the safety net for a configuration the geometry floor
+    // makes unreachable. With a cold dir the budget IS obeyed, and the same
+    // eviction spills instead.
+    const std::string cold_dir = "kraken-drop-vs-spill-dir";
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(cold_dir, ec);
+        std::filesystem::create_directories(cold_dir, ec);
+        CHECK(!ec, "the cold dir was created");
     }
 
-    engine.shutdown();
-    delete cpu;
-    std::remove(path.c_str());
-    std::system(("cmd /c rd /s /q " + cold_dir).c_str());
+    // One plane's bytes for the sparse-KV geometry: 2 heads x 8 dims x ctx 16,
+    // f32 activations, 2 of the 4 layers carrying KV.
+    const size_t plane = static_cast<size_t>(16) * 16 * sizeof(f32);
+    std::vector<size_t> len(4, 0);
+    len[0] = plane;
+    len[3] = plane;
+
+    // Arm A: one HOT slot for two KV-carrying layers, no WARM budget and no
+    // cold dir. Stepping over the layers evicts; nothing is lost.
+    {
+        Backend *cpu = make_cpu_backend();
+        KvTierCache c;
+        std::string err;
+        CHECK(c.init(cpu, 4, len, plane, 0, "", "k", &err),
+              "the cache initialises with a 1-slot HOT and no disk tier");
+        CHECK(c.tiered(), "a budget below the cache engages the tier");
+        CHECK(c.kv_layers() == 2, "two KV-carrying layers, not four");
+        CHECK(c.hot_slots() == 1, "one HOT slot, sized by the largest layer");
+        CHECK(c.slot_bytes() == plane, "a slot holds one plane of that layer");
+        CHECK(c.plane_bytes() == plane * 2,
+              "the flat plane packs the two KV-carrying layers, not four");
+        CHECK(c.warm_from_geometry() && c.warm_slots() == 2,
+              "WARM's capacity comes from the geometry, not from the budget");
+
+        for (i64 l = 0; l < 4; l++) {
+            if (len[static_cast<size_t>(l)] == 0) continue;
+            c.base(l);
+            c.end_layer(l);
+        }
+        c.base(0);
+        c.end_layer(0);
+
+        KvTierStats s;
+        c.stats(&s);
+        CHECK(s.layers == 2 && s.slots == 1 && s.tiered,
+              "stats report the tiered geometry: 2 layers, 1 slot");
+        CHECK(s.evictions_to_warm > 0,
+              "an evicted page reaches WARM even though it asked for none");
+        CHECK(s.evictions_dropped == 0,
+              "and nothing is dropped, because the geometry floor covered it");
+        CHECK(s.evictions_to_cold == 0, "no disk tier, so nothing was spilled");
+        c.detach();
+        delete cpu;
+    }
+
+    // Arm B: the same cache and the same budget, with a writable cold dir. The
+    // budget is obeyed now (a spill has a home), so the same eviction spills --
+    // and a spill is still not a drop.
+    {
+        Backend *cpu = make_cpu_backend();
+        KvTierCache c;
+        std::string err;
+        CHECK(c.init(cpu, 4, len, plane, 0, cold_dir, "k", &err),
+              "the cache initialises with a 1-slot HOT and a cold dir");
+        CHECK(!c.cold_dir_rejected(), "the cold dir is accepted");
+        CHECK(!c.warm_from_geometry() && c.warm_slots() == 0,
+              "with a disk tier the WARM budget is obeyed");
+
+        for (i64 l = 0; l < 4; l++) {
+            if (len[static_cast<size_t>(l)] == 0) continue;
+            c.base(l);
+            c.end_layer(l);
+        }
+        c.base(0);
+        c.end_layer(0);
+
+        KvTierStats s;
+        c.stats(&s);
+        CHECK(s.evictions_to_cold > 0,
+              "the same eviction spills to disk instead of being dropped");
+        CHECK(s.evictions_dropped == 0, "and a spill is never counted as a drop");
+        c.detach();
+        delete cpu;
+    }
+
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(cold_dir, ec);
+    }
 }
 
 static void test_kv_tier_per_plane_cold_files() {
