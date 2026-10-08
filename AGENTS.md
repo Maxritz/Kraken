@@ -18,7 +18,7 @@ code, the README, or `docs/`.
   contradicting the README. `build_check.sh` requires it current for the same
   reason.
 - The gate suite is five things, not one: `sh scripts/build_check.sh`, ninja
-  rc=0 with 0 `error:` lines, `kraken-tests` 2329/2329, `kraken-bench --gate`
+  rc=0 with 0 `error:` lines, `kraken-tests` 2751/2751, `kraken-bench --gate`
   rc=0, and a coherence spot check on the three small models, run as:
   `bash scripts/coherence_check.sh models/SmolLM2-135M-Instruct.Q4_K_M.gguf
   models/Qwen3.5-0.8B.Q4_K_M.gguf models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf`
@@ -27,10 +27,23 @@ code, the README, or `docs/`.
   scalar reference -- and a device arm that silently fell back to the CPU
   backend fails as `FAIL (cpu)`, so a green run is proof the GPU produced
   the text.
-- That 2329 is a watermark, not a constant: the suite grew 2214 -> 2316 when the
-  missing dequantizers landed, and 2316 -> 2329 when Q2_0's geometry changed.
-  Read the count off the run (`2329/2329 checks passed`) rather than trusting the
-  number written here, which is only the last one seen.
+- That 2751 is a watermark, not a constant: the suite grew 2214 -> 2316 when the
+  missing dequantizers landed, 2316 -> 2329 when Q2_0's geometry changed, and
+  2329 -> 2751 when the KV-tier per-layer geometry and the sparse-KV fixture
+  tests landed. Read the count off the run (`2751/2751 checks passed`) rather
+  than trusting the number written here, which is only the last one seen.
+- **`kraken-tests` runs each of its 53 groups in its own child process.** A
+  fastfail, an access violation or an abort inside one group used to end the run
+  before the `%d/%d checks passed` line, which is how a single `std::fclose(NULL)`
+  in a KV-tier test hid eight real failures for a whole session. The parent
+  prints a line per group, names a group that died (`CRASHED 0xC0000409`) along
+  with the number of checks that had run, and still prints the summary; the exit
+  status is 1 if any group crashed or failed. `KRK_TEST_INPROC=1` is the old
+  single-process run -- a debugger's view, and the A/B in which both runners
+  must report the same count. `scripts/kraken_tests_isolation_check.sh` drives
+  `KRK_TEST_INJECT_CRASH`, `KRK_TEST_INJECT_CRASH_AT` and `KRK_TEST_INJECT_FAIL`
+  to prove the reporting itself, so run it after touching the harness; it also
+  uses `--run-group <index|name>` to run one group by hand.
 - **A build failure leaves the old `.exe` in place.** A "run" after `ninja rc=1`
   silently executes the previous binary and can look like a pass or a new bug.
   `scripts/build_check.sh` is that check, automated: it asks `ninja -n` whether

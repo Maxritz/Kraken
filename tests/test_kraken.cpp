@@ -58,26 +58,57 @@ using namespace krk;
 
 static int g_run = 0, g_passed = 0;
 
+// In child mode (--run-group) these hold the running counts, the group's name
+// and the file the parent reads them back from. A group is one function call,
+// so a crash inside it costs this process and nothing else -- but it must not
+// cost the parent the numbers either, which is what the partially rewritten
+// file is for.
+static std::FILE *g_progress = nullptr;
+static const char *g_group = "";
+static int g_group_index = -1;
+
+// Defined with the runner at the end of this file. They are declared here
+// because the CHECK macros below are the second half of the injection
+// switches: a run with neither switch set pays one cached compare per check.
+static bool checks_should_pass();
+static void maybe_inject_crash();
+
+static void note_progress() {
+    if (g_progress) {
+        // Rewrite in place and flush: the point of the file is to be correct at
+        // the instant a fastfail takes the process away, so nothing may be
+        // buffered.
+        std::fseek(g_progress, 0, SEEK_SET);
+        std::fprintf(g_progress, "%d %d\n", g_passed, g_run);
+        std::fflush(g_progress);
+    }
+    // Written first, so the file carries the count as of this check even when
+    // the next line is the one that dies (KRK_TEST_INJECT_CRASH_AT).
+    maybe_inject_crash();
+}
+
 #define CHECK(cond, msg)                                                            \
     do {                                                                            \
         g_run++;                                                                    \
-        if (cond) {                                                                 \
+        if ((cond) && checks_should_pass()) {                                       \
             g_passed++;                                                             \
         } else {                                                                    \
             std::fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, msg);      \
         }                                                                           \
+        note_progress();                                                            \
     } while (0)
 
 #define CHECK_NEAR(a, b, tol, msg)                                                  \
     do {                                                                            \
         g_run++;                                                                    \
         const double _a = (a), _b = (b);                                            \
-        if (std::fabs(_a - _b) <= (tol)) {                                          \
+        if (std::fabs(_a - _b) <= (tol) && checks_should_pass()) {                  \
             g_passed++;                                                             \
         } else {                                                                    \
             std::fprintf(stderr, "FAIL %s:%d  %s (%g vs %g)\n", __FILE__, __LINE__, \
                          msg, _a, _b);                                              \
         }                                                                           \
+        note_progress();                                                            \
     } while (0)
 
 // ---------------------------------------------------------------------------
@@ -4857,68 +4888,498 @@ static void test_par_pool_covers_every_block() {
 
 // ---------------------------------------------------------------------------
 
-int main() {
-    std::fprintf(stderr, "kraken test suite\n");
-    test_quant_geometry();
-    test_q4_0_layout();
-    test_q8_0_layout();
-    test_q5_0_high_bit_layout();
-    test_kquant_roundtrip_shape();
-    test_q2_k_plane_layout();
-    test_q6_k_group_stride();
-    test_iq2_xxs_layout();
-    test_iq4_xs_layout();
-    test_nvfp4_layout();
-    test_mxfp4_layout();
-    test_rocmfp4_layout();
-    test_tq2_0_layout();
-    test_tq1_0_layout();
-    test_new_quant_geometry();
-    test_q1_0_layout();
-    test_q2_0_layout();
-    test_pq2_0_layout();
-    test_ptq1_0_layout();
-    test_q2_0_rocmfpx_layout();
-    test_q3_0_rocmfpx_layout();
-    test_q6_0_rocmfpx_layout();
-    test_hadamard_act();
-    test_iq_family_structure();
-    test_vec_dot();
-    test_arch_table();
-    test_arch_tensor_maps();
-    test_load_verdict();
-    test_gguf_roundtrip();
-    test_tokenizer_spm_and_bpe();
-    test_sampler_determinism();
-    test_logit_softcap();
-    test_rope_pair_convention();
-    test_end_to_end_cpu();
-    test_moe_schema_and_laziness();
-    test_moe_matches_dense_twin();
-    test_moe_grouped_prefill_matches_tokenwise();
-    test_expert_cache_policy();
-    test_expert_cache_byte_budget();
-    test_expert_cache_warm_tier();
-    test_expert_warmup();
-    test_cpu_expert_pool();
-    test_gdn_ops();
-    test_gdn_model_loads();
-    test_gdn_generation();
-    test_speculative_decoding();
-    test_json();
-    test_http_server();
-    test_par_pool_covers_every_block();
-    test_kv_tier_per_layer_widths();
-    test_kv_tier_no_kv_layers();
-    test_kv_tier_drop_vs_spill();
-    test_kv_tier_per_plane_cold_files();
+// ---------------------------------------------------------------------------
+//  Group isolation: one child process per group.
+//
+//  This suite is a single process running 53 groups in a row, and a crash
+//  anywhere used to end it: one bad CHECK could take the summary with it, so
+//  the run printed no "%d/%d checks passed" line at all and the failures
+//  behind it stayed invisible. test_kv_tier_drop_vs_spill did exactly that --
+//  it called std::fclose(NULL), and the CRT's invalid-parameter handler
+//  answers that with __fastfail, which SEH cannot catch and which no handler
+//  in this process can survive.
+//
+//  So the suite re-runs itself: main() owns a table of groups, and each group
+//  runs in its own child process (this executable, --run-group N). The child
+//  rewrites its counts to a progress file as it goes, the parent reads them
+//  back when the child exits, and a group that dies is reported by NAME with
+//  the number of checks that had run -- and the summary still prints.
+//
+//  KRK_TEST_INPROC=1 restores the single-process run for a debugger. It is
+//  also the A/B: both modes must report the same count and the same FAIL
+//  lines, which is how the isolation itself is shown to change nothing.
+//
+//  KRK_TEST_INJECT_CRASH=<index|name> kills one group on purpose, and
+//  scripts/kraken_tests_isolation_check.sh is that check run for real: a
+//  harness that cannot fail proves nothing.
+// ---------------------------------------------------------------------------
+
+static const char *kSuiteUsage =
+    "kraken-tests -- deterministic, self-contained test suite\n"
+    "\n"
+    "  (no arguments)            run every group, one child process each\n"
+    "  --run-group <index|name>  run one group in THIS process and exit\n"
+    "  --progress <path>         where that group writes its running counts\n"
+    "  --list-groups             print the group table and exit\n"
+    "  --help                    this text\n"
+    "\n"
+    "Environment:\n"
+    "  KRK_TEST_INPROC=1            run every group in this process instead\n"
+    "                               (a debugger's view: a crash still ends it)\n"
+    "  KRK_TEST_INJECT_CRASH=<grp>  make one group die on purpose, to show the\n"
+    "                               isolation reporting it by name\n"
+    "  KRK_TEST_INJECT_CRASH_AT=<n> die after check n of that group (0 = before\n"
+    "                               its first check), to show the partial count\n"
+    "  KRK_TEST_INJECT_FAIL=<grp>   make every check in one group fail\n";
+
+struct TestGroup {
+    const char *name;
+    void (*fn)();
+};
+
+#define TEST_GROUP(fn) {#fn, fn},
+
+static const TestGroup kGroups[] = {
+    TEST_GROUP(test_quant_geometry)
+    TEST_GROUP(test_q4_0_layout)
+    TEST_GROUP(test_q8_0_layout)
+    TEST_GROUP(test_q5_0_high_bit_layout)
+    TEST_GROUP(test_kquant_roundtrip_shape)
+    TEST_GROUP(test_q2_k_plane_layout)
+    TEST_GROUP(test_q6_k_group_stride)
+    TEST_GROUP(test_iq2_xxs_layout)
+    TEST_GROUP(test_iq4_xs_layout)
+    TEST_GROUP(test_nvfp4_layout)
+    TEST_GROUP(test_mxfp4_layout)
+    TEST_GROUP(test_rocmfp4_layout)
+    TEST_GROUP(test_tq2_0_layout)
+    TEST_GROUP(test_tq1_0_layout)
+    TEST_GROUP(test_new_quant_geometry)
+    TEST_GROUP(test_q1_0_layout)
+    TEST_GROUP(test_q2_0_layout)
+    TEST_GROUP(test_pq2_0_layout)
+    TEST_GROUP(test_ptq1_0_layout)
+    TEST_GROUP(test_q2_0_rocmfpx_layout)
+    TEST_GROUP(test_q3_0_rocmfpx_layout)
+    TEST_GROUP(test_q6_0_rocmfpx_layout)
+    TEST_GROUP(test_hadamard_act)
+    TEST_GROUP(test_iq_family_structure)
+    TEST_GROUP(test_vec_dot)
+    TEST_GROUP(test_arch_table)
+    TEST_GROUP(test_arch_tensor_maps)
+    TEST_GROUP(test_load_verdict)
+    TEST_GROUP(test_gguf_roundtrip)
+    TEST_GROUP(test_tokenizer_spm_and_bpe)
+    TEST_GROUP(test_sampler_determinism)
+    TEST_GROUP(test_logit_softcap)
+    TEST_GROUP(test_rope_pair_convention)
+    TEST_GROUP(test_end_to_end_cpu)
+    TEST_GROUP(test_moe_schema_and_laziness)
+    TEST_GROUP(test_moe_matches_dense_twin)
+    TEST_GROUP(test_moe_grouped_prefill_matches_tokenwise)
+    TEST_GROUP(test_expert_cache_policy)
+    TEST_GROUP(test_expert_cache_byte_budget)
+    TEST_GROUP(test_expert_cache_warm_tier)
+    TEST_GROUP(test_expert_warmup)
+    TEST_GROUP(test_cpu_expert_pool)
+    TEST_GROUP(test_gdn_ops)
+    TEST_GROUP(test_gdn_model_loads)
+    TEST_GROUP(test_gdn_generation)
+    TEST_GROUP(test_speculative_decoding)
+    TEST_GROUP(test_json)
+    TEST_GROUP(test_http_server)
+    TEST_GROUP(test_par_pool_covers_every_block)
+    TEST_GROUP(test_kv_tier_per_layer_widths)
+    TEST_GROUP(test_kv_tier_no_kv_layers)
+    TEST_GROUP(test_kv_tier_drop_vs_spill)
+    TEST_GROUP(test_kv_tier_per_plane_cold_files)
+};
+
+#undef TEST_GROUP
+
+static const int kGroupCount = static_cast<int>(sizeof(kGroups) / sizeof(kGroups[0]));
+
+static std::string g_argv0;
+
+static bool env_flag(const char *name) {
+    const char *v = std::getenv(name);
+    return v && *v && std::strcmp(v, "0") != 0;
+}
+
+// The parent re-invokes the binary it is already running, so the path has to be
+// the executable's own and not argv[0] (which is relative to the caller's cwd).
+static std::string self_path() {
+#ifdef _WIN32
+    char buf[4096];
+    const DWORD n = GetModuleFileNameA(nullptr, buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf)) return std::string(buf, n);
+#else
+    char buf[4096];
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        return std::string(buf);
+    }
+#endif
+    return g_argv0;
+}
+
+// The progress files are scratch, so they go where scratch goes -- and putting
+// them there keeps them off the model directory's sync path.
+static std::string progress_dir() {
+    const char *t = std::getenv("TEMP");
+    if (!t || !*t) t = std::getenv("TMPDIR");
+    if (!t || !*t) t = ".";
+    std::string d(t);
+    while (d.size() > 1 && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+    return d;
+}
+
+static std::string progress_path(int index, const char *override_path) {
+    if (override_path && *override_path) return std::string(override_path);
+    return progress_dir() + "/krk-tests-group-" + std::to_string(index) + ".progress";
+}
+
+static void read_progress(const std::string &path, int *passed, int *run) {
+    *passed = 0;
+    *run = 0;
+    std::FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return;
+    int p = 0, r = 0;
+    // A torn read is rejected rather than trusted: p > r cannot be a real pair.
+    if (std::fscanf(f, "%d %d", &p, &r) == 2 && p >= 0 && r >= p) {
+        *passed = p;
+        *run = r;
+    }
+    std::fclose(f);
+}
+
+struct ChildExit {
+    bool started = false;
+    bool crashed = false;
+    unsigned long code = 0;
+};
+
+#ifdef _WIN32
+static ChildExit spawn_child(const std::vector<std::string> &args) {
+    ChildExit ce;
+    std::string cmd;
+    for (size_t i = 0; i < args.size(); i++) {
+        if (i) cmd += ' ';
+        cmd += '"';
+        for (char c : args[i]) {
+            if (c == '"') cmd += '\\';
+            cmd += c;
+        }
+        cmd += '"';
+    }
+    std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+    mutable_cmd.push_back('\0');
+
+    // Hand the child this process's stdio, made inheritable first: a group that
+    // crashes must still have left its FAIL lines in the parent's log, and the
+    // parent's stdout may be a redirected file rather than a console.
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    if (out && out != INVALID_HANDLE_VALUE)
+        SetHandleInformation(out, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    if (err && err != INVALID_HANDLE_VALUE)
+        SetHandleInformation(err, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+
+    STARTUPINFOA si;
+    std::memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = out;
+    si.hStdError = err;
+    PROCESS_INFORMATION pi;
+    std::memset(&pi, 0, sizeof(pi));
+
+    const std::string exe = self_path();
+    if (exe.empty() ||
+        !CreateProcessA(exe.c_str(), mutable_cmd.data(), nullptr, nullptr, TRUE, 0,
+                        nullptr, nullptr, &si, &pi)) {
+        return ce;
+    }
+    ce.started = true;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    ce.code = static_cast<unsigned long>(code);
+    // The child's contract is 0 (its checks all passed) or 1 (some failed).
+    // Anything else is a death: a __fastfail (0xC0000409), an access violation
+    // (0xC0000005), a missing import (0xC0000135). None of these are exit
+    // codes a correct child can produce.
+    ce.crashed = (ce.code != 0 && ce.code != 1);
+    return ce;
+}
+#else
+#include <spawn.h>
+#include <sys/wait.h>
+
+extern char **environ;
+
+static ChildExit spawn_child(const std::vector<std::string> &args) {
+    ChildExit ce;
+    std::vector<std::string> storage = args;
+    std::vector<char *> argv;
+    for (std::string &s : storage) argv.push_back(s.data());
+    argv.push_back(nullptr);
+
+    pid_t pid = 0;
+    if (posix_spawn(&pid, storage[0].c_str(), nullptr, nullptr, argv.data(), environ) != 0)
+        return ce;
+    ce.started = true;
+
+    int st = 0;
+    if (waitpid(pid, &st, 0) < 0) {
+        ce.crashed = true;
+        return ce;
+    }
+    if (WIFSIGNALED(st)) {
+        ce.crashed = true;
+        ce.code = static_cast<unsigned long>(128 + WTERMSIG(st));
+    } else {
+        ce.code = static_cast<unsigned long>(WEXITSTATUS(st));
+        ce.crashed = (ce.code != 0 && ce.code != 1);
+    }
+    return ce;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+//  Deliberate failure, so the reporting can be shown to work instead of
+//  asserted. Both switches are inert unless set: unset, checks_should_pass() is
+//  one compare against -1 and maybe_inject_crash() returns on a cached -1.
+// ---------------------------------------------------------------------------
+
+static int selected_group(const char *env_name) {
+    const char *want = std::getenv(env_name);
+    if (!want || !*want) return -1;
+    const std::string w(want);
+    for (int k = 0; k < kGroupCount; k++)
+        if (w == std::to_string(k) || w == kGroups[k].name) return k;
+    return -1;
+}
+
+struct CrashPlan {
+    int index = -1;
+    int at = 0;
+};
+
+static const CrashPlan &crash_plan() {
+    static const CrashPlan plan = [] {
+        CrashPlan p;
+        p.index = selected_group("KRK_TEST_INJECT_CRASH");
+        if (p.index >= 0) {
+            const char *at = std::getenv("KRK_TEST_INJECT_CRASH_AT");
+            p.at = (at && *at) ? std::atoi(at) : 0;
+        }
+        return p;
+    }();
+    return plan;
+}
+
+static int fail_group() {
+    static const int idx = selected_group("KRK_TEST_INJECT_FAIL");
+    return idx;
+}
+
+// Every CHECK asks this one question. Unset, it is a compare against -1.
+static bool checks_should_pass() { return g_group_index != fail_group(); }
+
+// Die on purpose, in the way this suite already died once. std::fclose(NULL)
+// goes through the CRT's invalid-parameter handler, which answers with
+// __fastfail -- not an exception SEH can catch, not a signal, and the reason
+// none of the process survived it. The null goes through a volatile so the
+// compiler cannot see it and elide the call. On POSIX this line is a SIGSEGV.
+static void maybe_inject_crash() {
+    const CrashPlan &p = crash_plan();
+    if (p.index < 0 || p.index != g_group_index || g_run < p.at) return;
+    std::fprintf(stderr, "  INJECT: %s dies here on purpose, after %d check(s)\n",
+                 kGroups[p.index].name, g_run);
+    std::fflush(stderr);
+    static std::FILE *volatile null_file = nullptr;
+    std::fclose(null_file);
+    std::abort(); // unreachable while the CRT behaves as it does today
+}
+
+static void report_injection() {
+    const CrashPlan &cp = crash_plan();
+    const char *want = std::getenv("KRK_TEST_INJECT_CRASH");
+    if (cp.index >= 0)
+        std::fprintf(stderr, "crash injection: %s dies at check %d\n",
+                     kGroups[cp.index].name, cp.at);
+    else if (want && *want)
+        std::fprintf(stderr, "crash injection: '%s' matches no group, nothing injected\n", want);
+
+    const int fi = fail_group();
+    const char *fwant = std::getenv("KRK_TEST_INJECT_FAIL");
+    if (fi >= 0)
+        std::fprintf(stderr, "fail injection: every check in %s (%d of %d groups) fails\n",
+                     kGroups[fi].name, fi, kGroupCount);
+    else if (fwant && *fwant)
+        std::fprintf(stderr, "fail injection: '%s' matches no group, nothing injected\n", fwant);
+}
+
+static void cleanup_fixtures() {
     std::remove(kTestModelPath);
     std::remove(kMoeTestPath);
     std::remove(kMoeDenseTwinPath);
     std::remove("kraken-l2-test.gguf");
     std::remove("kraken-policy-test.gguf");
     std::remove(kGdnTestPath);
+}
 
+// Child mode. The group announces itself BEFORE running so that a log of a
+// crashed run still says which group was in flight, and the progress file is
+// opened (and zeroed) before that for the same reason.
+static int run_one_group(int index, const char *progress) {
+    g_group = kGroups[index].name;
+    g_group_index = index;
+    const std::string pp = progress_path(index, progress);
+    // The file exists for the parent's benefit. A hand-run group is its own
+    // caller, so it cleans up after itself -- and a group that dies leaves the
+    // file behind holding the counts as of the moment it died, which is the
+    // version worth keeping.
+    const bool own_progress = !(progress && *progress);
+    g_progress = std::fopen(pp.c_str(), "wb");
+    if (!g_progress)
+        std::fprintf(stderr, "  (no progress file at %s: a crash here reports no count)\n",
+                     pp.c_str());
+    // Announce before running, so a log of a killed group still names it even
+    // if this process never gets to its result line.
+    std::fprintf(stderr, "[group %d/%d] %s\n", index + 1, kGroupCount, g_group);
+    std::fflush(stderr);
+
+    maybe_inject_crash();
+    note_progress();
+    kGroups[index].fn();
+
+    note_progress();
+    if (g_progress) {
+        std::fclose(g_progress);
+        g_progress = nullptr;
+    }
+    std::fprintf(stderr, "[group %s] %d/%d checks\n", g_group, g_passed, g_run);
+    if (own_progress) std::remove(pp.c_str());
+    return g_passed == g_run ? 0 : 1;
+}
+
+// The old behaviour, kept as an escape hatch for a debugger and as the A/B that
+// shows the child-process run reports the same numbers.
+static int run_all_inproc() {
+    std::fprintf(stderr, "kraken test suite: %d groups, all in this process (KRK_TEST_INPROC)\n",
+                 kGroupCount);
+    report_injection();
+    for (int i = 0; i < kGroupCount; i++) {
+        g_group = kGroups[i].name;
+        g_group_index = i;
+        std::fprintf(stderr, "  [%2d/%d] %s\n", i + 1, kGroupCount, kGroups[i].name);
+        std::fflush(stderr);
+        maybe_inject_crash();
+        kGroups[i].fn();
+    }
+    cleanup_fixtures();
     std::fprintf(stderr, "\n%d/%d checks passed\n", g_passed, g_run);
     return g_passed == g_run ? 0 : 1;
+}
+
+static int run_all_groups() {
+    std::fprintf(stderr, "kraken test suite: %d groups, each in its own process\n", kGroupCount);
+    report_injection();
+
+    int run = 0, passed = 0, failed_groups = 0, crashed_groups = 0;
+    std::vector<std::string> bad;
+    for (int i = 0; i < kGroupCount; i++) {
+        const std::string pp = progress_path(i, nullptr);
+        std::remove(pp.c_str());
+        const std::vector<std::string> args{self_path(), "--run-group", std::to_string(i),
+                                            "--progress", pp};
+        const ChildExit ce = spawn_child(args);
+
+        int cp = 0, cr = 0;
+        read_progress(pp, &cp, &cr);
+        std::remove(pp.c_str());
+        run += cr;
+        passed += cp;
+
+        char note[64];
+        note[0] = '\0';
+        const char *status = "";
+        if (!ce.started) {
+            crashed_groups++;
+            bad.push_back(kGroups[i].name);
+            status = "  COULD NOT START";
+        } else if (ce.crashed) {
+            crashed_groups++;
+            bad.push_back(kGroups[i].name);
+            std::snprintf(note, sizeof(note), "  CRASHED 0x%08lX", ce.code);
+            status = note;
+        } else if (ce.code != 0 || cp != cr) {
+            failed_groups++;
+            bad.push_back(kGroups[i].name);
+            status = "  FAILED";
+        }
+        std::fprintf(stderr, "  [%2d/%d] %-44s %5d/%-5d%s\n", i + 1, kGroupCount,
+                     kGroups[i].name, cp, cr, status);
+        std::fflush(stderr);
+    }
+
+    cleanup_fixtures();
+
+    std::fprintf(stderr, "\n%d/%d checks passed", passed, run);
+    if (crashed_groups) std::fprintf(stderr, "; %d group(s) CRASHED", crashed_groups);
+    if (failed_groups) std::fprintf(stderr, "; %d group(s) failed", failed_groups);
+    std::fprintf(stderr, "\n");
+    if (!bad.empty()) {
+        std::fprintf(stderr, "groups needing attention:");
+        for (const std::string &n : bad) std::fprintf(stderr, " %s", n.c_str());
+        std::fprintf(stderr, "\n");
+    }
+    return (crashed_groups == 0 && failed_groups == 0 && passed == run) ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
+    g_argv0 = (argc > 0 && argv[0]) ? argv[0] : "";
+
+    int group = -1;
+    const char *progress = nullptr;
+    for (int i = 1; i < argc; i++) {
+        const std::string a = argv[i] ? argv[i] : "";
+        if (a == "--run-group" && i + 1 < argc) {
+            const char *wa = argv[++i];
+            const std::string want = wa ? wa : "";
+            if (!want.empty() && want[0] >= '0' && want[0] <= '9') {
+                group = std::atoi(want.c_str());
+                if (group < 0 || group >= kGroupCount) group = -1;
+            } else {
+                for (int k = 0; k < kGroupCount; k++)
+                    if (want == kGroups[k].name) group = k;
+            }
+            if (group < 0) {
+                std::fprintf(stderr, "kraken-tests: no group named '%s' (--list-groups)\n",
+                             want.c_str());
+                return 2;
+            }
+        } else if (a == "--progress" && i + 1 < argc) {
+            progress = argv[++i];
+        } else if (a == "--list-groups") {
+            for (int k = 0; k < kGroupCount; k++) std::printf("%2d  %s\n", k, kGroups[k].name);
+            return 0;
+        } else if (a == "--help" || a == "-h") {
+            std::fputs(kSuiteUsage, stderr);
+            return 0;
+        } else {
+            std::fprintf(stderr, "kraken-tests: unknown argument '%s' (--help)\n", a.c_str());
+            return 2;
+        }
+    }
+
+    if (group >= 0) return run_one_group(group, progress);
+    if (env_flag("KRK_TEST_INPROC")) return run_all_inproc();
+    return run_all_groups();
 }
