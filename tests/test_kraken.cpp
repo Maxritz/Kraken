@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -2402,12 +2403,15 @@ static void test_gdn_model_loads() {
 }
 
 static void test_gdn_generation() {
-    std::FILE *probe = std::fopen(kGdnTestPath, "rb");
-    if (!probe) {
-        std::fprintf(stderr, "  (gdn model missing, skipping)\n");
+    // Self-contained, and never a silent skip. This group used to return with
+    // 0/0 checks when the fixture was missing -- which the runner counted as a
+    // pass -- and it only ever had the file because test_gdn_model_loads ran
+    // before it. It builds its own copy now (same arguments as that group, so
+    // the bytes are the same either way).
+    if (!build_tiny_gdn_model(kGdnTestPath, 4, 4)) {
+        CHECK(false, "wrote the qwen35moe fixture this group decodes through");
         return;
     }
-    std::fclose(probe);
 
     // A recurrent model must decode, and it must be deterministic: the state
     // advances token by token, so any drift in the ops shows up immediately.
@@ -3078,6 +3082,14 @@ static void test_gguf_roundtrip() {
 // ---------------------------------------------------------------------------
 
 static void test_tokenizer_spm_and_bpe() {
+    // Self-contained: this group reads the tiny LLaMA fixture, so it builds it
+    // rather than relying on whichever group ran before it. A group that needs
+    // a file another group wrote cannot run in its own directory, and every
+    // group runs in its own directory now.
+    if (!build_tiny_model(kTestModelPath, false)) {
+        CHECK(false, "wrote the tiny GGUF the tokenizer tests read");
+        return;
+    }
     {
         Gguf g;
         std::string err;
@@ -4299,6 +4311,21 @@ static void test_speculative_decoding() {
 }
 
 static void test_moe_grouped_prefill_matches_tokenwise() {
+    // Self-contained: it builds the MoE fixture it then compares against
+    // itself, because it used to load whatever the last MoE group happened to
+    // leave behind -- so its weights were a function of the schedule, not of
+    // this file.
+    MoeSpec vs;
+    vs.dense = false;
+    vs.n_expert = 4;
+    vs.n_expert_used = 2;
+    vs.shared = true;
+    vs.varied = true;
+    if (!build_tiny_moe_model(kMoeTestPath, vs)) {
+        CHECK(false, "wrote the MoE fixture this group compares against itself");
+        return;
+    }
+
     // --- the batched path must survive grouped prefill -------------------
     // Several prompt tokens in one chunk means several tokens can pick the
     // same expert, which is exactly the case the permutation covers. Compare
@@ -4444,6 +4471,12 @@ static void test_rope_pair_convention() {
 }
 
 static void test_end_to_end_cpu() {
+    // Self-contained (see test_tokenizer_spm_and_bpe): the tiny model is this
+    // group's own fixture.
+    if (!build_tiny_model(kTestModelPath, false)) {
+        CHECK(false, "wrote the tiny GGUF this group decodes through");
+        return;
+    }
     Backend *cpu = make_cpu_backend();
     Engine engine;
     EngineConfig cfg;
@@ -4918,26 +4951,46 @@ static const char *kSuiteUsage =
     "kraken-tests -- deterministic, self-contained test suite\n"
     "\n"
     "  (no arguments)            run every group, one child process each\n"
+    "  --workers <n>             how many of those children run at once\n"
     "  --run-group <index|name>  run one group in THIS process and exit\n"
     "  --progress <path>         where that group writes its running counts\n"
+    "  --log <path>              where that group's own output goes\n"
+    "  --scratch <dir>           the working directory that group runs in\n"
     "  --list-groups             print the group table and exit\n"
     "  --help                    this text\n"
     "\n"
+    "Every group is self-contained: it builds every fixture it reads. In child\n"
+    "mode it also gets its own working directory, so two groups in flight cannot\n"
+    "see each other's files -- that is what makes --workers safe to raise.\n"
+    "\n"
     "Environment:\n"
+    "  KRK_TEST_WORKERS=<n>         same as --workers (the flag wins)\n"
     "  KRK_TEST_INPROC=1            run every group in this process instead\n"
     "                               (a debugger's view: a crash still ends it)\n"
     "  KRK_TEST_INJECT_CRASH=<grp>  make one group die on purpose, to show the\n"
     "                               isolation reporting it by name\n"
     "  KRK_TEST_INJECT_CRASH_AT=<n> die after check n of that group (0 = before\n"
     "                               its first check), to show the partial count\n"
-    "  KRK_TEST_INJECT_FAIL=<grp>   make every check in one group fail\n";
+    "  KRK_TEST_INJECT_FAIL=<grp>   make every check in one group fail\n"
+    "  KRK_TEST_INJECT_EMPTY=<grp>  make one group run NO checks, to show the\n"
+    "                               runner refusing to call that a pass\n"
+    "  KRK_TEST_SERIAL_OVERRIDE=<grp>  run one group in the serial lane for one\n"
+    "                               run, so that lane is exercised, not assumed\n";
 
 struct TestGroup {
     const char *name;
     void (*fn)();
+    // Why this group may not share the machine with another, or nullptr when it
+    // may. Nothing needs this today: each child gets its own working directory,
+    // the suite never opens the device, the HTTP group binds an ephemeral port
+    // and no group reads a clock for a verdict. A group that does any of those
+    // must say so here, and the runner then holds every other worker at the
+    // door while it runs.
+    const char *serial;
 };
 
-#define TEST_GROUP(fn) {#fn, fn},
+#define TEST_GROUP(fn) {#fn, fn, nullptr},
+#define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
 static const TestGroup kGroups[] = {
     TEST_GROUP(test_quant_geometry)
@@ -4996,6 +5049,7 @@ static const TestGroup kGroups[] = {
 };
 
 #undef TEST_GROUP
+#undef TEST_GROUP_SERIAL
 
 static const int kGroupCount = static_cast<int>(sizeof(kGroups) / sizeof(kGroups[0]));
 
@@ -5035,9 +5089,42 @@ static std::string progress_dir() {
     return d;
 }
 
+// A child gets its own named files under one scratch area, because the whole
+// runner is a function of what each group is allowed to touch: the file it
+// writes its running counts to, the file its own output goes to, and the
+// working directory it runs in. The area is scratch, so it lives in TEMP --
+// which also keeps it off the model directory's sync path.
+static std::string group_path(int index, const char *suffix) {
+    return progress_dir() + "/krk-tests/krk-tests-group-" + std::to_string(index) + suffix;
+}
+
 static std::string progress_path(int index, const char *override_path) {
     if (override_path && *override_path) return std::string(override_path);
-    return progress_dir() + "/krk-tests-group-" + std::to_string(index) + ".progress";
+    return group_path(index, ".progress");
+}
+
+static std::string log_path(int index) { return group_path(index, ".log"); }
+static std::string scratch_dir(int index) { return group_path(index, ".dir"); }
+
+// Absolute, because a child changes its working directory: a relative progress
+// or log path would then point somewhere else, or nowhere.
+static std::string absolute_path(const std::string &p) {
+    std::error_code ec;
+    const std::filesystem::path a = std::filesystem::absolute(p, ec);
+    return ec ? p : a.string();
+}
+
+// Wall time, for the report only: no verdict in this file reads it, and it is
+// the project's own monotonic clock (QPC on Windows, CLOCK_MONOTONIC elsewhere)
+// so the runner and the engine cannot disagree about what a millisecond is.
+
+static void read_text_file(const std::string &path, std::string *out) {
+    std::FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return;
+    char buf[8192];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out->append(buf, n);
+    std::fclose(f);
 }
 
 static void read_progress(const std::string &path, int *passed, int *run) {
@@ -5188,6 +5275,16 @@ static int fail_group() {
     return idx;
 }
 
+// A group can also pass by doing nothing at all: test_gdn_generation used to
+// return before its first check when its fixture was missing and report 0/0,
+// which the runner counted as a group that passed. This switch makes one group
+// run nothing, so that the runner reporting it -- rather than accepting it -- is
+// a check and not a promise.
+static int empty_group() {
+    static const int idx = selected_group("KRK_TEST_INJECT_EMPTY");
+    return idx;
+}
+
 // Every CHECK asks this one question. Unset, it is a compare against -1.
 static bool checks_should_pass() { return g_group_index != fail_group(); }
 
@@ -5223,6 +5320,13 @@ static void report_injection() {
                      kGroups[fi].name, fi, kGroupCount);
     else if (fwant && *fwant)
         std::fprintf(stderr, "fail injection: '%s' matches no group, nothing injected\n", fwant);
+
+    const int ei = empty_group();
+    const char *ewant = std::getenv("KRK_TEST_INJECT_EMPTY");
+    if (ei >= 0)
+        std::fprintf(stderr, "empty injection: %s runs no checks at all\n", kGroups[ei].name);
+    else if (ewant && *ewant)
+        std::fprintf(stderr, "empty injection: '%s' matches no group, nothing injected\n", ewant);
 }
 
 static void cleanup_fixtures() {
@@ -5237,9 +5341,39 @@ static void cleanup_fixtures() {
 // Child mode. The group announces itself BEFORE running so that a log of a
 // crashed run still says which group was in flight, and the progress file is
 // opened (and zeroed) before that for the same reason.
-static int run_one_group(int index, const char *progress) {
+static int run_one_group(int index, const char *progress, const char *log, const char *scratch) {
     g_group = kGroups[index].name;
     g_group_index = index;
+
+    // Child mode runs in its own working directory. Every fixture in this file
+    // is a relative path, so one directory per group is the whole reason
+    // --workers is safe: without it two groups write the same kraken-*.gguf and
+    // whichever loses the race reads the other's bytes. A group that cannot
+    // take its directory is not run at all -- the parent says so, because a
+    // group's count is only worth reading when the group was isolated.
+    if (scratch && *scratch) {
+        std::error_code ec;
+        std::filesystem::current_path(scratch, ec);
+        if (ec) {
+            std::fprintf(stderr, "kraken-tests: scratch dir '%s' is unusable (%s)\n",
+                         scratch, ec.message().c_str());
+            return 2; // the harness could not run this group; that is not a check
+        }
+    }
+
+    // This group's output goes to its own file, so groups running at once do
+    // not interleave into one log. stderr stays unbuffered afterwards on
+    // purpose: a __fastfail takes the process away with nothing flushed, and
+    // the FAIL line just before it is the whole reason the file exists.
+    if (log && *log) {
+        const bool got_err = std::freopen(log, "wb", stderr) != nullptr;
+        const bool got_out = std::freopen(log, "ab", stdout) != nullptr;
+        std::setvbuf(stderr, nullptr, _IONBF, 0);
+        if (!got_err || !got_out)
+            std::fprintf(stderr, "  (could not redirect all of this group's output to %s)\n",
+                         log);
+    }
+
     const std::string pp = progress_path(index, progress);
     // The file exists for the parent's benefit. A hand-run group is its own
     // caller, so it cleans up after itself -- and a group that dies leaves the
@@ -5257,7 +5391,7 @@ static int run_one_group(int index, const char *progress) {
 
     maybe_inject_crash();
     note_progress();
-    kGroups[index].fn();
+    if (index != empty_group()) kGroups[index].fn();
 
     note_progress();
     if (g_progress) {
@@ -5274,73 +5408,285 @@ static int run_one_group(int index, const char *progress) {
 static int run_all_inproc() {
     std::fprintf(stderr, "kraken test suite: %d groups, all in this process (KRK_TEST_INPROC)\n",
                  kGroupCount);
+    int empty_groups = 0;
     report_injection();
     for (int i = 0; i < kGroupCount; i++) {
         g_group = kGroups[i].name;
         g_group_index = i;
-        std::fprintf(stderr, "  [%2d/%d] %s\n", i + 1, kGroupCount, kGroups[i].name);
-        std::fflush(stderr);
         maybe_inject_crash();
-        kGroups[i].fn();
+        const int was_run = g_run, was_passed = g_passed;
+        if (i != empty_group()) kGroups[i].fn();
+        if (g_run == was_run) empty_groups++;
+        // The same line the child runner prints, so the two can be compared
+        // group by group and not only in total -- which is the A/B this mode
+        // exists for.
+        std::fprintf(stderr, "  [%2d/%d] %-44s %5d/%-5d\n", i + 1, kGroupCount,
+                     kGroups[i].name, g_passed - was_passed, g_run - was_run);
+        std::fflush(stderr);
     }
     cleanup_fixtures();
-    std::fprintf(stderr, "\n%d/%d checks passed\n", g_passed, g_run);
-    return g_passed == g_run ? 0 : 1;
+    std::fprintf(stderr, "\n%d/%d checks passed", g_passed, g_run);
+    if (empty_groups) std::fprintf(stderr, "; %d group(s) ran no checks", empty_groups);
+    std::fprintf(stderr, "\n");
+    return (g_passed == g_run && empty_groups == 0) ? 0 : 1;
 }
 
-static int run_all_groups() {
-    std::fprintf(stderr, "kraken test suite: %d groups, each in its own process\n", kGroupCount);
-    report_injection();
+// ---------------------------------------------------------------------------
+//  The scheduler: up to `workers` groups in flight, plus a lane for a group
+//  that has declared it needs the machine to itself.
+// ---------------------------------------------------------------------------
 
-    int run = 0, passed = 0, failed_groups = 0, crashed_groups = 0;
-    std::vector<std::string> bad;
+static const char *serial_override() {
+    static const std::string want = [] {
+        const char *env = std::getenv("KRK_TEST_SERIAL_OVERRIDE");
+        return std::string(env ? env : "");
+    }();
+    return want.empty() ? nullptr : want.c_str();
+}
+
+// The declared reason, or the one the override forces for this single run. The
+// override exists so the lane below is exercised by a test instead of being
+// taken on faith; it names one group, by index or by name.
+static const char *serial_reason(int index) {
+    const char *want = serial_override();
+    if (want) {
+        const std::string w(want);
+        if (w == std::to_string(index) || w == kGroups[index].name)
+            return "KRK_TEST_SERIAL_OVERRIDE";
+        return nullptr;
+    }
+    return kGroups[index].serial;
+}
+
+static bool is_serial(int index) { return serial_reason(index) != nullptr; }
+
+static void print_serial_set() {
+    std::string line;
     for (int i = 0; i < kGroupCount; i++) {
-        const std::string pp = progress_path(i, nullptr);
-        std::remove(pp.c_str());
-        const std::vector<std::string> args{self_path(), "--run-group", std::to_string(i),
-                                            "--progress", pp};
+        const char *why = serial_reason(i);
+        if (!why) continue;
+        line += " ";
+        line += kGroups[i].name;
+        line += " (";
+        line += why;
+        line += ")";
+    }
+    if (line.empty())
+        std::fprintf(stderr,
+                     "serial groups: none (every group builds the fixtures it reads, in a\n"
+                     "               scratch directory of its own, and none holds a shared\n"
+                     "               resource or reads a clock)\n");
+    else
+        std::fprintf(stderr, "serial groups:%s\n", line.c_str());
+}
+
+struct RunOutcome {
+    std::string name;
+    int passed = 0;
+    int run = 0;
+    // "" | FAILED | NO CHECKS | CRASHED 0x.. | COULD NOT START | NO SCRATCH
+    std::string status;
+    std::string log;    // whatever the group printed, replayed under its own line
+    std::string kept;   // where the evidence is, when it was kept
+    bool bad = false;   // counts among the "groups needing attention"
+    bool failed = false; // a check failed (as opposed to the group dying)
+    i64 ms = 0;
+};
+
+// One group, one child, one scratch directory, one log file. This runs on a
+// worker thread, so the only thing it shares with its neighbours is the print
+// lock.
+static RunOutcome run_group_child(int index, std::mutex *print_mu) {
+    RunOutcome o;
+    o.name = kGroups[index].name;
+    const std::string pp = absolute_path(progress_path(index, nullptr));
+    const std::string lp = absolute_path(log_path(index));
+    const std::string sd = absolute_path(scratch_dir(index));
+
+    std::remove(pp.c_str());
+    std::remove(lp.c_str());
+    std::error_code ec;
+    std::filesystem::remove_all(sd, ec);
+    std::filesystem::create_directories(sd, ec);
+
+    const i64 t0 = now_ms();
+    if (ec) {
+        // No private directory means no isolation, and every fixture here is a
+        // relative path: running the group anyway would let it write over a
+        // neighbour's fixture. Leave it out and fail the run -- a group that
+        // did not run must never read as a group that passed.
+        o.status = "  NO SCRATCH";
+        o.bad = true;
+    } else {
+        const std::vector<std::string> args{self_path(),  "--run-group", std::to_string(index),
+                                            "--progress", pp, "--log",     lp,
+                                            "--scratch",  sd};
         const ChildExit ce = spawn_child(args);
-
-        int cp = 0, cr = 0;
-        read_progress(pp, &cp, &cr);
-        std::remove(pp.c_str());
-        run += cr;
-        passed += cp;
-
-        char note[64];
-        note[0] = '\0';
-        const char *status = "";
+        read_progress(pp, &o.passed, &o.run);
+        read_text_file(lp, &o.log);
         if (!ce.started) {
-            crashed_groups++;
-            bad.push_back(kGroups[i].name);
-            status = "  COULD NOT START";
+            o.status = "  COULD NOT START";
+            o.bad = true;
+        } else if (ce.code == 2) {
+            o.status = "  NO SCRATCH"; // the child could not take its directory
+            o.bad = true;
         } else if (ce.crashed) {
-            crashed_groups++;
-            bad.push_back(kGroups[i].name);
+            char note[64];
             std::snprintf(note, sizeof(note), "  CRASHED 0x%08lX", ce.code);
-            status = note;
-        } else if (ce.code != 0 || cp != cr) {
-            failed_groups++;
-            bad.push_back(kGroups[i].name);
-            status = "  FAILED";
+            o.status = note;
+            o.bad = true;
+        } else if (o.run == 0) {
+            // Zero checks is the shape of a silent skip, and a silent skip that
+            // reads as a pass is the exact defect this runner exists to stop.
+            o.status = "  NO CHECKS";
+            o.bad = true;
+        } else if (ce.code != 0 || o.passed != o.run) {
+            o.status = "  FAILED";
+            o.bad = true;
+            o.failed = true;
         }
-        std::fprintf(stderr, "  [%2d/%d] %-44s %5d/%-5d%s\n", i + 1, kGroupCount,
-                     kGroups[i].name, cp, cr, status);
+    }
+    o.ms = now_ms() - t0;
+
+    // The line and the group's own output print as one block, under the lock:
+    // with several groups in flight a reader still has to be able to tell whose
+    // FAIL that was.
+    {
+        std::lock_guard<std::mutex> lock(*print_mu);
+        std::fprintf(stderr, "  [%2d/%d] %-44s %5d/%-5d %5lldms%s\n", index + 1, kGroupCount,
+                     o.name.c_str(), o.passed, o.run, static_cast<long long>(o.ms),
+                     o.status.c_str());
+        if (!o.log.empty()) {
+            std::fputs(o.log.c_str(), stderr);
+            if (o.log.back() != '\n') std::fputc('\n', stderr);
+        }
         std::fflush(stderr);
     }
 
+    // A group that finished is done with its scratch: counts read, output
+    // printed, directory gone so the next run starts clean. A group that died
+    // keeps the fixture it died holding and its log -- that is the evidence.
+    if (o.bad) {
+        o.kept = sd + ", " + lp;
+    } else {
+        std::remove(lp.c_str());
+        std::error_code rm;
+        std::filesystem::remove_all(sd, rm);
+    }
+    std::remove(pp.c_str());
+    return o;
+}
+
+static int run_all_groups(int workers) {
+    std::fprintf(stderr, "kraken test suite: %d groups, %d at a time, each in its own process\n",
+                 kGroupCount, workers);
+    report_injection();
+    print_serial_set();
+
+    const i64 t0 = now_ms();
+    std::vector<RunOutcome> done(static_cast<size_t>(kGroupCount));
+    std::mutex q_mu, print_mu;
+    std::condition_variable q_cv;
+    int next = 0, in_flight = 0;
+    bool serial_claimed = false;
+
+    const auto worker = [&]() {
+        for (;;) {
+            int index = -1;
+            {
+                std::unique_lock<std::mutex> lk(q_mu);
+                for (;;) {
+                    if (next >= kGroupCount) return;
+                    if (is_serial(next)) {
+                        // The serial lane: wait for the groups already running
+                        // to finish, then hold every other worker at the door
+                        // until this one is done with the machine.
+                        if (in_flight > 0 || serial_claimed) {
+                            q_cv.wait(lk);
+                            continue;
+                        }
+                        serial_claimed = true;
+                    } else if (serial_claimed) {
+                        q_cv.wait(lk);
+                        continue;
+                    }
+                    index = next++;
+                    in_flight++;
+                    break;
+                }
+            }
+            done[static_cast<size_t>(index)] = run_group_child(index, &print_mu);
+            {
+                std::lock_guard<std::mutex> lk(q_mu);
+                in_flight--;
+                if (is_serial(index)) serial_claimed = false;
+                q_cv.notify_all();
+            }
+        }
+    };
+
+    std::vector<std::thread> pool;
+    for (int w = 0; w < workers; w++) pool.emplace_back(worker);
+    for (std::thread &t : pool) t.join();
+
+    const i64 wall = now_ms() - t0;
     cleanup_fixtures();
+
+    int run = 0, passed = 0, failed_groups = 0, crashed_groups = 0;
+    int empty_groups = 0;
+    i64 sum = 0;
+    std::vector<std::string> bad, kept;
+    for (const RunOutcome &o : done) {
+        run += o.run;
+        passed += o.passed;
+        sum += o.ms;
+        if (!o.kept.empty()) kept.push_back(o.kept);
+        if (!o.bad) continue;
+        bad.push_back(o.name);
+        if (o.status == "  NO CHECKS") empty_groups++;
+        else if (o.failed) failed_groups++;
+        else crashed_groups++;
+    }
 
     std::fprintf(stderr, "\n%d/%d checks passed", passed, run);
     if (crashed_groups) std::fprintf(stderr, "; %d group(s) CRASHED", crashed_groups);
     if (failed_groups) std::fprintf(stderr, "; %d group(s) failed", failed_groups);
+    if (empty_groups) std::fprintf(stderr, "; %d group(s) ran no checks", empty_groups);
     std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "%d worker(s), %lld ms wall, %lld ms of group time\n", workers,
+                 static_cast<long long>(wall), static_cast<long long>(sum));
     if (!bad.empty()) {
         std::fprintf(stderr, "groups needing attention:");
         for (const std::string &n : bad) std::fprintf(stderr, " %s", n.c_str());
         std::fprintf(stderr, "\n");
     }
-    return (crashed_groups == 0 && failed_groups == 0 && passed == run) ? 0 : 1;
+    for (const std::string &k : kept) std::fprintf(stderr, "evidence kept: %s\n", k.c_str());
+    return (crashed_groups == 0 && failed_groups == 0 && empty_groups == 0 && passed == run)
+               ? 0
+               : 1;
+}
+
+// How many groups run at once. Eight, or the machine's core count when that is
+// smaller -- the groups are small and CPU-bound, and the win is real but
+// flattens early: seven interleaved repetitions on this 96-thread box gave
+// medians of 1554 ms at one worker, 956 ms at four and 783 ms at eight, and
+// the eight-worker arm beat the four-worker one in six of those seven pairs.
+// The flag beats the environment, and a value that is not a positive number is
+// clamped rather than refused -- this is a test runner, not a gate on flags.
+static int default_workers() {
+    const unsigned hw = std::thread::hardware_concurrency();
+    int n = 8;
+    if (hw > 0 && static_cast<unsigned>(n) > hw) n = static_cast<int>(hw);
+    return n;
+}
+
+static int worker_count(const char *flag_value) {
+    const char *env = std::getenv("KRK_TEST_WORKERS");
+    const char *v = (flag_value && *flag_value) ? flag_value : ((env && *env) ? env : nullptr);
+    int n = (v && *v) ? std::atoi(v) : default_workers();
+    if (n < 1) n = 1;
+    if (n > kGroupCount) n = kGroupCount;
+    return n;
 }
 
 int main(int argc, char **argv) {
@@ -5348,6 +5694,9 @@ int main(int argc, char **argv) {
 
     int group = -1;
     const char *progress = nullptr;
+    const char *log = nullptr;
+    const char *scratch = nullptr;
+    const char *workers_flag = nullptr;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i] ? argv[i] : "";
         if (a == "--run-group" && i + 1 < argc) {
@@ -5367,6 +5716,12 @@ int main(int argc, char **argv) {
             }
         } else if (a == "--progress" && i + 1 < argc) {
             progress = argv[++i];
+        } else if (a == "--log" && i + 1 < argc) {
+            log = argv[++i];
+        } else if (a == "--scratch" && i + 1 < argc) {
+            scratch = argv[++i];
+        } else if (a == "--workers" && i + 1 < argc) {
+            workers_flag = argv[++i];
         } else if (a == "--list-groups") {
             for (int k = 0; k < kGroupCount; k++) std::printf("%2d  %s\n", k, kGroups[k].name);
             return 0;
@@ -5379,7 +5734,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (group >= 0) return run_one_group(group, progress);
+    if (group >= 0) return run_one_group(group, progress, log, scratch);
     if (env_flag("KRK_TEST_INPROC")) return run_all_inproc();
-    return run_all_groups();
+    return run_all_groups(worker_count(workers_flag));
 }

@@ -32,18 +32,42 @@ code, the README, or `docs/`.
   2329 -> 2751 when the KV-tier per-layer geometry and the sparse-KV fixture
   tests landed. Read the count off the run (`2751/2751 checks passed`) rather
   than trusting the number written here, which is only the last one seen.
-- **`kraken-tests` runs each of its 53 groups in its own child process.** A
-  fastfail, an access violation or an abort inside one group used to end the run
-  before the `%d/%d checks passed` line, which is how a single `std::fclose(NULL)`
-  in a KV-tier test hid eight real failures for a whole session. The parent
-  prints a line per group, names a group that died (`CRASHED 0xC0000409`) along
-  with the number of checks that had run, and still prints the summary; the exit
-  status is 1 if any group crashed or failed. `KRK_TEST_INPROC=1` is the old
-  single-process run -- a debugger's view, and the A/B in which both runners
-  must report the same count. `scripts/kraken_tests_isolation_check.sh` drives
-  `KRK_TEST_INJECT_CRASH`, `KRK_TEST_INJECT_CRASH_AT` and `KRK_TEST_INJECT_FAIL`
-  to prove the reporting itself, so run it after touching the harness; it also
-  uses `--run-group <index|name>` to run one group by hand.
+- **`kraken-tests` runs each of its 53 groups in its own child process, several
+  at a time.** A fastfail, an access violation or an abort inside one group used
+  to end the run before the `%d/%d checks passed` line, which is how a single
+  `std::fclose(NULL)` in a KV-tier test hid eight real failures for a whole
+  session. The parent prints a line per group, names a group that died
+  (`CRASHED 0xC0000409`) along with the number of checks that had run, and still
+  prints the summary; the exit status is 1 if any group crashed, failed, or ran
+  no checks. `KRK_TEST_INPROC=1` is the old single-process run -- a debugger's
+  view, and the A/B: both runners print the same per-group table, and
+  `scripts/kraken_tests_isolation_check.sh` diffs all 53 lines rather than just
+  the total. That script drives `KRK_TEST_INJECT_CRASH`, `KRK_TEST_INJECT_CRASH_AT`,
+  `KRK_TEST_INJECT_FAIL` and `KRK_TEST_INJECT_EMPTY` to prove the reporting
+  itself, so run it after touching the harness; `KRK_ISOLATION_FULL=1` adds the
+  sweep that runs every group alone in an empty private directory.
+- **Concurrency is only safe because every group is self-contained, and the
+  runner now enforces both halves of that.** Each child gets its own working
+  directory (`%TEMP%/krk-tests/krk-tests-group-N.dir`) -- every fixture path in
+  `tests/test_kraken.cpp` is relative, so this is what keeps two groups off each
+  other's `kraken-*.gguf` -- plus its own log, printed under the group's line so
+  FAIL lines still reach the parent's log, and its own progress file holding the
+  partial count. A group that dies keeps its scratch and log and the summary says
+  `evidence kept:`; those go on the next run of that group, so read them before
+  re-running. `--workers n` / `KRK_TEST_WORKERS` sets the count, default
+  `min(8, cores)` (interleaved medians here: 1554 ms at 1 worker, 956 at 4, 783 at
+  8, and 8 beat 4 in 6 of those 7 pairs), and a silly value clamps rather than
+  refusing. A group may declare a serial reason in the group table and
+  `KRK_TEST_SERIAL_OVERRIDE=<grp>` forces one for a run so the lane is exercised,
+  but **nothing needs it today** and the run says so: no group opens the device,
+  binds a fixed port, or reads a clock. Two defects had to be fixed first --
+  tokenizer, end-to-end, grouped-prefill and gdn-generation read fixtures an
+  earlier group had written, so they passed or failed according to the schedule
+  (`--run-group <n>` on a fresh checkout failed for exactly those four), and
+  `test_gdn_generation` reported **0/0 and a pass** when its file was missing.
+  The runner now reports `NO CHECKS` for a group that ran nothing and fails the
+  run, which is what `KRK_TEST_INJECT_EMPTY` constructs. A side effect worth
+  knowing: a crashed run no longer leaves `kraken-*.gguf` in the repo root.
 - **A build failure leaves the old `.exe` in place.** A "run" after `ninja rc=1`
   silently executes the previous binary and can look like a pass or a new bug.
   `scripts/build_check.sh` is that check, automated: it asks `ninja -n` whether
