@@ -92,7 +92,14 @@ code, the README, or `docs/`.
   `test_gdn_generation` reported **0/0 and a pass** when its file was missing.
   The runner now reports `NO CHECKS` for a group that ran nothing and fails the
   run, which is what `KRK_TEST_INJECT_EMPTY` constructs. A side effect worth
-  knowing: a crashed run no longer leaves `kraken-*.gguf` in the repo root.
+  knowing: a crashed run no longer leaves `kraken-*.gguf` in the repo root, and
+  neither runner leaves its fixtures in the directory it was started in -- the
+  cleanup works by SHAPE (`kraken-*.gguf`, `kraken-*.krakenexperts.json`, a
+  `kraken-*-dir` spill area) rather than by a list of names, because the list it
+  replaced named six of the thirteen fixtures the groups leave. Both halves of
+  that rule are pinned by the isolation check: an empty directory comes back
+  empty, and a look-alike that is not a fixture shape (`kraken.exe`,
+  `kraken-notes.md`) is left alone.
 - **A build failure leaves the old `.exe` in place.** A "run" after `ninja rc=1`
   silently executes the previous binary and can look like a pass or a new bug.
   `scripts/build_check.sh` is that check, automated: it asks `ninja -n` whether

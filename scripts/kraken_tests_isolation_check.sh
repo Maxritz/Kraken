@@ -263,7 +263,54 @@ else
     bad "bad-args" "unknown group rc=$rc1 (want 2), unknown flag rc=$rc2 (want 2)"
 fi
 
-# --- 10. opt-in: every group is self-sufficient ------------------------------
+# --- 10. a run started in a directory leaves that directory as it found it ----
+# The in-proc runner works in the caller's directory, so whatever it writes it has
+# to take away again: it used to clean six of the thirteen names the suite can
+# create and left the rest for the next run -- or the next reader -- to trip over.
+# The child runner gives each group a scratch directory, so the same promise holds
+# there for a different reason, and both are checked.
+LEAVES=$(mktemp -d)
+for mode in inproc child; do
+    d="$LEAVES/$mode"
+    mkdir -p "$d"
+    if [ "$mode" = inproc ]; then
+        ( cd "$d" && KRK_TEST_INPROC=1 "$BIN" > run.log 2>&1 )
+    else
+        ( cd "$d" && "$BIN" > run.log 2>&1 )
+    fi
+    left=$(cd "$d" && ls | grep -v '^run.log$' | tr '
+' ' ')
+    if [ -z "$left" ]; then
+        ok "leaves-nothing" "$mode: an empty directory came back empty"
+    else
+        bad "leaves-nothing" "$mode left behind: $left"
+    fi
+done
+rm -rf "$LEAVES"
+
+# The rule has a boundary, and the boundary is the point: it removes the shapes
+# the suite writes and refuses everything else -- including names that merely
+# start with kraken-. A cleanup that is one wildcard too wide deletes a caller's
+# binary, which is why this arm exists rather than a comment saying it is careful.
+BOUND=$(mktemp -d)
+mkdir -p "$BOUND/kraken-decoy-cold-dir"
+for f in kraken-decoy.gguf kraken-decoy.krakenexperts.json kraken-decoy-cold-dir/data.bin; do
+    echo x > "$BOUND/$f"
+done
+for f in keep-me.txt kraken-notes.md kraken.exe; do
+    echo keep > "$BOUND/$f"
+done
+( cd "$BOUND" && KRK_TEST_INPROC=1 "$BIN" > run.log 2>&1 )
+left=$(cd "$BOUND" && ls | sort | tr '
+' ' ')
+if [ "$left" = "keep-me.txt kraken-notes.md kraken.exe run.log " ]; then
+    ok "fixture-boundary" "the suite's shapes went, the look-alikes stayed"
+else
+    bad "fixture-boundary" "want only keep-me.txt, kraken-notes.md, kraken.exe, run.log; got: $left"
+fi
+rm -rf "$BOUND"
+
+# --- 11. opt-in: every group is self-sufficient ------------------------------
 # The strong version of what makes --workers safe. Each group runs alone, in an
 # empty directory of its own, and must report the count it reports in the full
 # run: a group that reads another group's fixture fails here, because in this

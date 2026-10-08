@@ -5331,13 +5331,57 @@ static void report_injection() {
         std::fprintf(stderr, "empty injection: '%s' matches no group, nothing injected\n", ewant);
 }
 
+// Everything this suite writes into the working directory is named the same way:
+// a model is a kraken-*.gguf, the expert index beside one is a
+// kraken-*.krakenexperts.json, and a KV tier's spill area is a kraken-*-dir.
+// Nothing else in the caller's directory is the suite's to delete, and matching
+// the SHAPES rather than a list of names is the point: the list this replaced
+// named six of the thirteen fixtures the groups actually leave, so a
+// debugger-view run quietly scattered the other eight across the caller's
+// directory, and a fixture added tomorrow would have needed the list edited by
+// whoever remembered it existed.
+static bool is_suite_fixture(const std::string &name) {
+    if (name.rfind("kraken-", 0) != 0) return false;
+    static const char *kModel = ".gguf";
+    static const char *kIndex = ".krakenexperts.json";
+    const size_t m = std::strlen(kModel), ix = std::strlen(kIndex);
+    if (name.size() > m && name.compare(name.size() - m, m, kModel) == 0) return true;
+    if (name.size() > ix && name.compare(name.size() - ix, ix, kIndex) == 0) return true;
+    return false;
+}
+
+static bool is_suite_fixture_dir(const std::string &name) {
+    if (name.rfind("kraken-", 0) != 0) return false;
+    static const char *kSuffix = "-dir";
+    const size_t n = std::strlen(kSuffix);
+    return name.size() > n && name.compare(name.size() - n, n, kSuffix) == 0;
+}
+
 static void cleanup_fixtures() {
-    std::remove(kTestModelPath);
-    std::remove(kMoeTestPath);
-    std::remove(kMoeDenseTwinPath);
-    std::remove("kraken-l2-test.gguf");
-    std::remove("kraken-policy-test.gguf");
-    std::remove(kGdnTestPath);
+    std::error_code ec;
+    std::filesystem::directory_iterator it(".", ec), end;
+    if (ec) {
+        std::fprintf(stderr, "  (cleanup: cannot list the working directory: %s)\n",
+                     ec.message().c_str());
+        return;
+    }
+    int removed = 0;
+    for (; it != end; it.increment(ec)) {
+        if (ec) break;
+        const std::filesystem::path &p = it->path();
+        const std::string name = p.filename().string();
+        std::error_code kind_ec;
+        const bool dir = it->is_directory(kind_ec);
+        if (!is_suite_fixture(name) && !(dir && is_suite_fixture_dir(name))) continue;
+        std::error_code rm;
+        std::filesystem::remove_all(p, rm);
+        if (!rm) removed++;
+    }
+    // Silent when there was nothing to do -- which is the usual case in child
+    // mode, where each group worked in a scratch directory of its own.
+    if (removed)
+        std::fprintf(stderr, "cleanup: removed %d fixture(s) from the working directory\n",
+                     removed);
 }
 
 struct RunOutcome {
