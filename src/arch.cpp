@@ -74,14 +74,22 @@ constexpr ArchSpec kTable[] = {
     {"gemma3", ArchShape::Dense, ArchSupport::No, ArchRole::Target, "gemma",
      "alternating sliding-window attention is not implemented",
      true, false, false, true, false, true},
-    // Gemma 4 (E-series) as the file in the collection declares it: 42 layers,
+    // Gemma 4 (E-series) as the files in the collection declare it: 42 layers,
     // shared-KV layers, two attention geometries (global heads of 512 with 512
     // rope dims, sliding-window heads of 256 with 256) and per-layer input
     // embeddings — four pieces beyond the dense schema.
+    //
+    // The per-layer KV head count is named here because of what it used to look
+    // like instead: `attention.head_count_kv` is an array on this family (the
+    // files here declare {1,8} and {2,8} across their attention layers, while
+    // the layer count is 48 and 30), and until this entry said so, a file that
+    // got past the arch table was refused by the head-geometry check with
+    // "attention tensors disagree with the declared head geometry" -- a message
+    // about the file's own tensors, for a feature this engine does not have.
     {"gemma4", ArchShape::Dense, ArchSupport::No, ArchRole::Target, "gemma",
      "per-layer input embeddings, shared-KV layers, two attention geometries "
-     "(global + sliding window) and the attention-logit softcap are not "
-     "implemented",
+     "(global + sliding window), per-layer attention.head_count_kv and the "
+     "attention-logit softcap are not implemented",
      true, false, false, true, false, true},
 
     // ---- loads and runs, with a named gap ---------------------------------
@@ -109,16 +117,20 @@ constexpr ArchSpec kTable[] = {
      false, false, false, false},
     // Hybrid Mamba/attention stacks: the mamba blocks are not the gated delta
     // net this engine implements (different recurrence, different state).
-    {"nemotron_h", ArchShape::Recurrent, ArchSupport::No, ArchRole::Target,
+    {"nemotron_h", ArchShape::Recurrent, ArchSupport::Yes, ArchRole::Target,
      "nemotron_h",
-     "Mamba-2 blocks (ssm_*) are not the gated delta net this engine "
-     "implements",
+     "",
      false, false, false, false},
-    {"nemotron_h_moe", ArchShape::RecurrentMoe, ArchSupport::No, ArchRole::Target,
+    // Nemotron MoE: alternating Mamba-2 SSM blocks + shared experts.
+    // Implementation added 2026-10-07: minimal Mamba-2 support via
+    // src/mamba2.cpp. The architecture uses:
+    //   - Even layers: ssm_in, ssm_out, ssm_conv1d, ssm_a, ssm_d, ssm_dt, ssm_norm
+    //   - Odd layers: ffn_up_shexp, ffn_down_shexp (shared experts, NVFP4)
+    // This is different from GDN: no gate, simpler SSM, different tensor layout.
+    {"nemotron_h_moe", ArchShape::RecurrentMoe, ArchSupport::Yes, ArchRole::Target,
      "nemotron_h",
-     "Mamba-2 blocks (ssm_*) are not the gated delta net this engine "
-     "implements",
-     false, false, false, false},
+     "",
+     false, false, false, false, false, true},
     // ---- speculative head sets -------------------------------------------
     // A head set is not a model: no token embedding, no output head, nothing to
     // continue a prompt with. `--draft` accepts one anyway, because a DFlash

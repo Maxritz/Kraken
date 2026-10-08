@@ -181,6 +181,34 @@ u16 fp32_to_bf16(f32 f) {
 }
 
 // ---------------------------------------------------------------------------
+// file size
+// ---------------------------------------------------------------------------
+
+bool file_size(const std::string &path, u64 *out) {
+    if (!out) return false;
+#if defined(_WIN32)
+    HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER li;
+    const bool ok = GetFileSizeEx(fh, &li) != 0 && li.QuadPart > 0;
+    CloseHandle(fh);
+    if (!ok) return false;
+    *out = static_cast<u64>(li.QuadPart);
+    return true;
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st;
+    const bool ok = fstat(fd, &st) == 0 && st.st_size > 0;
+    ::close(fd);
+    if (!ok) return false;
+    *out = static_cast<u64>(st.st_size);
+    return true;
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // MappedFile
 // ---------------------------------------------------------------------------
 

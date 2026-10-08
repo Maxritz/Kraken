@@ -477,9 +477,36 @@ public:
         (void)eps;
     }
 
+    // Per-group RMS normalization, the Mamba-2 checkpoints' ssm_norm:
+    //   o[t, g, i] = x[t, g, i] * rsqrt(mean_j x[t, g, j]^2 + eps) * w[g, i]
+    // The weight is NOT shared by the rows. The checkpoint stores one vector
+    // per group at `w + g * width` (ssm_norm is [width, n_group]), so the row's
+    // group selects its own weight, and the reduction spans `width` channels --
+    // the group's block, not one head's. Rows are the (token, group) pairs in
+    // the order the scan's output already carries them: row r is group
+    // r % n_group of token r / n_group, and `stride` is the element distance
+    // between tokens (the group blocks of one token are contiguous). o and x
+    // may be the same pointer.
+    //
+    // Plain rmsnorm() cannot express this: it applies ONE weight vector to all
+    // `rows`, and the row's required vector changes every n_group rows.
+    virtual void rmsnorm_grouped(void *o, const void *x, const f32 *w, i64 n_tok,
+                                 i64 n_group, i64 width, i64 stride, f32 eps) {
+        (void)o; (void)x; (void)w; (void)n_tok; (void)n_group; (void)width;
+        (void)stride; (void)eps;
+    }
+
     // x <- sigmoid(x), and x <- softplus(x) = log1p(exp(x)). Both in place.
     virtual void sigmoid_act(void *x, i64 n) { (void)x; (void)n; }
     virtual void softplus_act(void *x, i64 n) { (void)x; (void)n; }
+    // x <- max(x, 0)^2, in place: squared ReLU, the activation nemotron_h_moe
+    // builds every expert and shared-expert MLP with (the reference's
+    // LLM_FFN_RELU_SQR). It is not the gated SiLU and not close to it -- silu
+    // keeps the sign of the input and saturates, relu^2 zeroes every negative
+    // pre-activation and squares the rest -- and this family's files carry no
+    // expert gate for a SiLU to ride, so without it the routed bank is a
+    // plausible-looking, wrong function of the same weights.
+    virtual void relu_sqr_act(void *x, i64 n) { (void)x; (void)n; }
 
     // x <- alpha * x over n_tok rows of `width` elements spaced `stride` apart,
     // and the elementwise product a[i] *= b[i] (both dense).
@@ -537,9 +564,9 @@ public:
     // continue the same sequence. ksize <= 16.
     virtual void conv1d_silu(void *out, const void *in, void *state,
                              const void *kern, DType wt, i64 n_tok, i64 chan,
-                             i64 ksize) {
+                             i64 ksize, const void *bias = nullptr) {
         (void)out; (void)in; (void)state; (void)kern; (void)wt;
-        (void)n_tok; (void)chan; (void)ksize;
+        (void)n_tok; (void)chan; (void)ksize; (void)bias;
     }
 
     // The delta rule, run over n_tok consecutive tokens of one sequence:
@@ -558,6 +585,49 @@ public:
         (void)out; (void)state; (void)q; (void)k; (void)v; (void)g;
         (void)beta; (void)n_tok; (void)n_k_head; (void)n_v_head;
         (void)d_state; (void)hd; (void)row_stride;
+    }
+
+    // The Mamba-2 SSD scan (nemotron_h / nemotron_h_moe mamba blocks), over
+    // n_tok consecutive tokens of one sequence. The engine supplies the
+    // post-conv post-SiLU xBC row and a separate dense dt head, so every
+    // per-head gate lives INSIDE this op:
+    //   xbc   [n_tok, inner + 2*n_group*d_state] rows (activation-typed):
+    //         u   j*head_dim + p                       the inner block
+    //         B   inner + g*d_state + s                g = h*n_group/n_head
+    //         C   inner + (n_group + g)*d_state + s
+    //   dt    [n_tok, n_head] the raw dt head, dense (activation-typed) —
+    //         separate because the conv consumes a row exactly inner+b_len
+    //         wide and the dt head must not ride through it
+    //   a     ssm_a [n_head] f32 device values: the raw per-head A (the file
+    //         stores -exp(A_log), so decay = exp(a_h * softplus(...)))
+    //   db    ssm_dt.bias [n_head] f32 device values
+    //   dp    ssm_d [n_head] f32 device values, or null when the file has none
+    //   state f32 [n_head, head_dim, d_state] — persists across calls, layout
+    //         [head][p][s] at (h*head_dim + p)*d_state + s (NOT the GDN
+    //         [head][s][p] order; the scan never reads it any other way)
+    //   out   [n_tok, inner] per pair (y + D*u), activation-typed; the silu(z)
+    //         gate and the grouped RMSNorm stay outside, in engine acts — the
+    //         same split the GDN path draws between delta_rule and
+    //         silu_mul/rmsnorm.
+    // Per slot (h, p, s), with dt = softplus(dt[t,h] + db[h]) the step size:
+    //   h' = exp(a[h] * dt) * h + dt * u[t,h,p] * B[t,g,s]
+    //   y[t,h,p] = sum_s C[t,g,s] * h'[p,s]  (+ dp[p] * u[t,h,p] when has_d)
+    // The DECAY takes A and the input term does not -- dt scales the input
+    // alone, which is ggml's recurrence (dA = expf(dt_soft_plus*A[h]);
+    // x_dt = x[ii]*dt_soft_plus). Scaling the input by a[h]*dt too is the
+    // plausible-looking variant: it is a per-head constant, so device and CPU
+    // agree perfectly while both are wrong.
+    // The scan runs in one pass over the token loop, reading only inputs — the
+    // state carried is the slot's own register/stack cell. The scalar CPU
+    // backend is the reference oracle.
+    virtual void ssd_scan(void *out, void *state, const void *xbc,
+                          const void *dt, const void *a, const void *db,
+                          const void *dp, i64 n_tok, i64 n_head, i64 head_dim,
+                          i64 d_state, i64 n_group, i64 inner, i64 conv_dim,
+                          bool has_d) {
+        (void)out; (void)state; (void)xbc; (void)dt; (void)a; (void)db;
+        (void)dp; (void)n_tok; (void)n_head; (void)head_dim; (void)d_state;
+        (void)n_group; (void)inner; (void)conv_dim; (void)has_d;
     }
 };
 

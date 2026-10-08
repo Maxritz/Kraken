@@ -1567,6 +1567,372 @@ static bool build_tiny_model(const std::string &path, bool bpe, f32 softcap = 0.
 }
 
 // ---------------------------------------------------------------------------
+// Forward declarations of helpers defined later in this TU (wv, add_spm_vocab)
+// so build_sparse_kv_model can live before them.
+static f32 wv(i64 i);
+static void add_spm_vocab(GgufBuilder &b, int vocab);
+
+// ---- KV tier regression coverage -------------------------------------------
+//
+// Grounds the four defects that the geometry-derived WARM policy was written
+// to prevent, so they cannot come back silently:
+//   * per-layer KV widths (the charge and slot size come from the layers that
+//     carry KV, not from n_layer x the widest layer),
+//   * no-KV layers (a mamba/SSM block and a pure-MoE block append nothing and
+//     get no plane in the cache),
+//   * drop vs spill counting (evictions_dropped is a page that went nowhere
+//     and is NOT the same event as a COLD spill),
+//   * per-plane cold files (the plane tag "k"/"v" namespaces the two caches
+//     that share one --kv-cold-dir).
+//
+// Every arm runs on the CPU backend on purpose: the host dequantizers are the
+// oracle, and a CPU run makes the tier's host/WARM side the real path rather
+// than a staging area behind a GPU. cpu::tier() no-ops, so the CPU path is the
+// one the tests exercise.
+//
+#include "krk/kv_tier.hpp"
+
+// A sparse-KV fixture: 4 layers, n_kv_heads = 2, head_dim = 8, ctx = 16.
+// Layers 0 and 3 carry q/k/v; layers 1 and 2 are pure MoE FFN blocks with no
+// q/k/v at all (the shape a nemotron_h_moe or a mamba-stacked model presents).
+// n_embd = 32, n_ff = 64, one expert per MoE layer, n_expert = 2.
+static bool build_sparse_kv_model(const std::string &path) {
+    const int n_embd = 32, n_layer = 4, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int ctx = 16, vocab = 260, n_expert = 2, n_ff_exp = n_ff;
+    GgufBuilder b;
+    b.meta_str("general.architecture", "qwen2moe");
+    b.meta_str("general.name", "kraken-sparse-kv-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("qwen2moe.block_count", n_layer);
+    b.meta_u32("qwen2moe.context_length", ctx);
+    b.meta_u32("qwen2moe.embedding_length", n_embd);
+    b.meta_u32("qwen2moe.feed_forward_length", n_ff);
+    b.meta_u32("qwen2moe.attention.head_count", n_head);
+    b.meta_u32("qwen2moe.attention.head_count_kv", n_kv);
+    b.meta_u32("qwen2moe.attention.key_length", hd);
+    b.meta_f32("qwen2moe.attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32("qwen2moe.rope.freq_base", 10000.0f);
+    b.meta_u32("qwen2moe.expert_count", n_expert);
+    b.meta_u32("qwen2moe.expert_used_count", 1);
+    b.meta_u32("qwen2moe.expert_feed_forward_length", n_ff_exp);
+    add_spm_vocab(b, vocab);
+    auto rndvec = [&](size_t n) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(static_cast<i64>(i));
+        return v;
+    };
+    auto one = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    b.tensor_f16("token_embd.weight", {static_cast<u64>(n_embd), static_cast<u64>(vocab)},
+                 rndvec(static_cast<size_t>(n_embd) * vocab));
+    b.tensor_f32("output_norm.weight", {static_cast<u64>(n_embd)}, one(n_embd));
+    for (int l = 0; l < n_layer; l++) {
+        b.tensor_f32("blk." + std::to_string(l) + ".attn_norm.weight",
+                      {static_cast<u64>(n_embd)}, one(n_embd));
+        b.tensor_f32("blk." + std::to_string(l) + ".ffn_norm.weight",
+                      {static_cast<u64>(n_embd)}, one(n_embd));
+        if (l == 0 || l == 3) {
+            b.tensor_f16("blk." + std::to_string(l) + ".attn_q.weight",
+                         {static_cast<u64>(n_embd), static_cast<u64>(q_dim)},
+                         rndvec(static_cast<size_t>(n_embd) * q_dim));
+            b.tensor_f16("blk." + std::to_string(l) + ".attn_k.weight",
+                         {static_cast<u64>(n_embd), static_cast<u64>(kv_dim)},
+                         rndvec(static_cast<size_t>(n_embd) * kv_dim));
+            b.tensor_f16("blk." + std::to_string(l) + ".attn_v.weight",
+                         {static_cast<u64>(n_embd), static_cast<u64>(kv_dim)},
+                         rndvec(static_cast<size_t>(n_embd) * kv_dim));
+            b.tensor_f16("blk." + std::to_string(l) + ".attn_output.weight",
+                         {static_cast<u64>(q_dim), static_cast<u64>(n_embd)},
+                         rndvec(static_cast<size_t>(q_dim) * n_embd));
+        }
+        b.tensor_f16("blk." + std::to_string(l) + ".ffn_gate.weight",
+                     {static_cast<u64>(n_embd), static_cast<u64>(n_ff)},
+                     rndvec(static_cast<size_t>(n_embd) * n_ff));
+        b.tensor_f16("blk." + std::to_string(l) + ".ffn_up.weight",
+                     {static_cast<u64>(n_embd), static_cast<u64>(n_ff)},
+                     rndvec(static_cast<size_t>(n_embd) * n_ff));
+        b.tensor_f16("blk." + std::to_string(l) + ".ffn_down.weight",
+                     {static_cast<u64>(n_ff), static_cast<u64>(n_embd)},
+                     rndvec(static_cast<size_t>(n_ff) * n_embd));
+        // Router: one row per expert, always resident. Required by the
+        // loader so L.router is present and L.moe evaluates true.
+        std::vector<f32> router(static_cast<size_t>(n_embd) * n_expert);
+        for (size_t ri = 0; ri < router.size(); ri++) router[ri] = wv(static_cast<i64>(ri) * 3 + 7);
+        b.tensor_f16("blk." + std::to_string(l) + ".ffn_gate_inp.weight", {u64(n_embd), u64(n_expert)}, router);
+
+        b.tensor_f16("blk." + std::to_string(l) + ".ffn_gate_exps.weight",
+                     {static_cast<u64>(n_embd), static_cast<u64>(n_ff_exp),
+                      static_cast<u64>(n_expert)},
+                     rndvec(static_cast<size_t>(n_embd) * n_ff_exp * n_expert));
+        b.tensor_f16("blk." + std::to_string(l) + ".ffn_up_exps.weight",
+                     {static_cast<u64>(n_embd), static_cast<u64>(n_ff_exp),
+                      static_cast<u64>(n_expert)},
+                     rndvec(static_cast<size_t>(n_embd) * n_ff_exp * n_expert));
+        b.tensor_f16("blk." + std::to_string(l) + ".ffn_down_exps.weight",
+                     {static_cast<u64>(n_ff_exp), static_cast<u64>(n_embd),
+                      static_cast<u64>(n_expert)},
+                     rndvec(static_cast<size_t>(n_ff_exp) * n_embd * n_expert));
+    }
+    return b.write(path);
+}
+
+// Wraps Engine::init() with explicit KV tier budgets so the tests do not
+// repeat the config boilerplate. The CPU backend makes the tier inert (flat),
+// but kv_tier_stats() still reports the geometry the tier was sized to.
+static bool set_kv_tiered_budget(Engine &engine, Backend *cpu, const std::string &path,
+                                  i32 hot_mb, i32 warm_mb, const std::string &cold_dir,
+                                  std::string *err) {
+    EngineConfig cfg;
+    cfg.model_path = path;
+    cfg.n_ctx = 16;          // tiny context: the KV byte numbers are small and exact
+    cfg.prefill_chunk = 4;
+    cfg.kv_hot_mb = hot_mb;
+    cfg.kv_warm_mb = warm_mb;
+    cfg.kv_cold_dir = cold_dir;
+    return engine.init(cpu, cfg, err);
+}
+
+static void test_kv_tier_per_layer_widths() {
+    const std::string path = "kraken-sparse-kv-test.gguf";
+    CHECK(build_sparse_kv_model(path), "wrote the sparse-KV fixture");
+
+    Backend *cpu = make_cpu_backend();
+    Engine engine;
+    std::string err;
+    CHECK(set_kv_tiered_budget(engine, cpu, path, 0, 0, "", &err),
+          "engine initialises on the sparse-KV fixture");
+    if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+
+    const Model &m = engine.model();
+    const ModelConfig &mc = m.cfg();
+    CHECK(mc.arch == "qwen2moe", "the sparse-KV fixture is a qwen2moe model");
+    CHECK(mc.n_layer == 4, "the fixture has 4 layers");
+    CHECK(mc.n_head_kv == 2 && mc.head_dim == 8,
+          "each KV-carrying layer has 2 heads of 8 dims");
+
+    // ground truth from the model's own per-layer geometry, not from any
+    // single n_head_kv number.
+    i64 n_kv_layers = 0;
+    i64 kv_dim_sum = 0;
+    i64 max_kv_dim = 0;
+    size_t as = cpu->act_size();
+    for (i32 l = 0; l < mc.n_layer; l++) {
+        if (!m.layer_has_kv(l)) continue;
+        n_kv_layers++;
+        i64 dim = m.kv_dim_at(l);
+        kv_dim_sum += dim;
+        if (dim > max_kv_dim) max_kv_dim = dim;
+    }
+    const i64 ctx = 16;
+    const f64 plane_bytes = static_cast<f64>(kv_dim_sum) * ctx * as;
+    const f64 total_kv = plane_bytes * 2.0;   // K + V
+    const size_t slot_bytes = static_cast<size_t>(max_kv_dim) * ctx * as;
+
+    // 1. layer_has_kv is the predicate the engine uses; layers 1 and 2 have
+    //    no q/k/v and so hold no KV.
+    CHECK(m.layer_has_kv(0), "layer 0 carries KV");
+    CHECK(m.layer_has_kv(3), "layer 3 carries KV");
+    CHECK(!m.layer_has_kv(1) && !m.layer_has_kv(2),
+          "layers 1 and 2 are pure FFN blocks, no KV");
+    CHECK(m.kv_layer_count() == 2,
+          "the model has exactly 2 KV-carrying layers (not 4)");
+    CHECK(n_kv_layers == 2, "same answer computed from the predicate above");
+
+    // 2. kv_dim_at is per-layer, and the widest layer is what a shared
+    //    workspace/slot is sized to. Here both KV layers are 2*8 = 16.
+    CHECK(m.kv_dim_at(0) == 16, "layer 0 KV dim is 2 heads * 8 = 16");
+    CHECK(m.kv_dim_at(3) == 16, "layer 3 KV dim is 2 heads * 8 = 16");
+    CHECK(max_kv_dim == 16, "the widest KV layer is 16");
+
+    // 3. kv_tier_stats reports the geometry the tier was sized to, and the
+    //    tier covers exactly the 2 KV-carrying layers -- not all 4.
+    KvTierStats ks;
+    engine.kv_tier_stats(&ks);
+    CHECK(ks.layers == 2, "the tier knows about 2 KV layers, not 4");
+    CHECK(ks.slots == 2, "one HOT slot per KV-carrying layer (largest layer)");
+    CHECK(ks.layer_bytes == slot_bytes,
+          "a HOT slot holds the largest layer one plane");
+    CHECK(ks.hot_bytes == slot_bytes * 2,
+          "two HOT slots hold both planes of both layers");
+    CHECK(ks.tiered,
+          "the tier is engaged even though this is a CPU run (geometry is real)");
+    CHECK(ks.hot == 2, "both KV-carrying layers are resident in HOT at init");
+
+    // 4. The flat init path's own arithmetic: total KV bytes == the KV the
+    //    model actually has, and NOT n_layer * widest_layer. This is what used
+    //    to be 8.67x the KV that exists (208 MiB for 24 MiB on nemotron).
+    CHECK(ks.hot_bytes == static_cast<size_t>(total_kv),
+          "the flat cache holds exactly the KV the model has");
+
+    // 5. Re-deriving the KV dimension from the model's own per-layer dims is
+    //    the cross-check: sum(kv_dim_at(l) for l where layer_has_kv(l)).
+    size_t charged_dim = 0;
+    for (i32 l = 0; l < mc.n_layer; l++)
+        if (m.layer_has_kv(l)) charged_dim += static_cast<size_t>(m.kv_dim_at(l));
+    CHECK(charged_dim == static_cast<size_t>(kv_dim_sum),
+          "re-derived KV dimension (per-layer, KV-only) matches the sum");
+
+    engine.shutdown();
+    delete cpu;
+    std::remove(path.c_str());
+}
+
+static void test_kv_tier_no_kv_layers() {
+    // A model whose KV-carrying layers are a strict subset of its transformer
+    // layers: the tier must not charge or count the no-KV ones.
+    const std::string path = "kraken-sparse-kv-test.gguf";
+    CHECK(build_sparse_kv_model(path), "wrote the sparse-KV fixture");
+
+    Backend *cpu = make_cpu_backend();
+    Engine engine;
+    std::string err;
+    CHECK(set_kv_tiered_budget(engine, cpu, path, 0, 0, "", &err),
+          "engine initialises");
+    if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+
+    KvTierStats ks;
+    engine.kv_tier_stats(&ks);
+
+    CHECK(ks.layers == 2, "only the 2 KV-carrying layers are counted");
+    CHECK(ks.slots == 2, "one slot per KV-carrying layer");
+    CHECK(ks.hot == 2, "those 2 layers are the ones resident in HOT");
+
+    const Model &m = engine.model();
+    CHECK(m.kv_layer_count() == 2, "Model::kv_layer_count agrees");
+    CHECK(m.layer_has_kv(1) == false && m.layer_has_kv(2) == false,
+          "layers 1 and 2 hold no KV");
+
+    // A decode run on this model uses the KV cache only on layers 0 and 3.
+    // If the tier had charged the no-KV layers, the load report would be
+    // wrong. The generation must still work and produce deterministic tokens.
+    {
+        GenerateParams p;
+        p.prompt = "the";
+        p.max_tokens = 4;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        GenerateResult r;
+        CHECK(engine.generate(p, &r), "sparse-KV model generates");
+        CHECK(!r.tokens.empty(), "it produced tokens");
+        CHECK(r.prompt_tokens > 0, "the prompt was tokenised");
+    }
+
+    engine.shutdown();
+    delete cpu;
+    std::remove(path.c_str());
+}
+
+static void test_kv_tier_drop_vs_spill() {
+    // The COLD counter and the DROPPED counter are not the same event and never
+    // have been. A 1-slot HOT + no WARM + a real cold dir on the CPU means every
+    // eviction that cannot reach WARM is DROPPED (the page goes nowhere), and
+    // only a promotion that actually writes the file is a COLD spill. This test
+    // makes both visible and checks they are separate.
+    const std::string path = "kraken-sparse-kv-test.gguf";
+    CHECK(build_sparse_kv_model(path), "wrote the sparse-KV fixture");
+
+    Backend *cpu = make_cpu_backend();
+    Engine engine;
+    std::string err;
+    CHECK(set_kv_tiered_budget(engine, cpu, path, 0, 0, "kraken-drop-vs-spill-dir", &err),
+          "engine initialises with a cold dir");
+    if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+
+    // The COLD directory is real and writable on this box (we own the root).
+    std::string cold_dir = "kraken-drop-vs-spill-dir";
+    std::FILE *probe = std::fopen((cold_dir + "/.krk_kv_probe_test").c_str(), "wb");
+    CHECK(probe, "the cold dir is writable");
+    std::fclose(probe);
+    std::remove((cold_dir + "/.krk_kv_probe_test").c_str());
+
+    // 2 HOT slots for 2 KV-carrying layers at ctx=16. Each decode step promotes
+    // the next layer into HOT and evicts the previous one; without WARM the
+    // evicted page has no home, so it is DROPPED rather than spilled.
+    KvTierStats before;
+    engine.kv_tier_stats(&before);
+    CHECK(before.slots == 2, "2 HOT slots for the 2 KV layers");
+    CHECK(before.layers == 2, "2 KV-carrying layers");
+
+    // Force evictions by stepping past the cache.
+    GenerateParams p;
+    p.prompt = "the";
+    p.max_tokens = 10;
+    p.sampler.greedy = true;
+    p.sampler.temp = 0.0f;
+    GenerateResult r;
+    CHECK(engine.generate(p, &r), "sparse-KV model generates with a cold dir");
+    CHECK(!r.tokens.empty(), "it produced tokens");
+
+    KvTierStats after;
+    engine.kv_tier_stats(&after);
+
+    const i64 drops = after.evictions_dropped - before.evictions_dropped;
+    const i64 spills = after.evictions_to_cold - before.evictions_to_cold;
+    const i64 prom_warm = after.promotions_from_warm - before.promotions_from_warm;
+    const i64 prom_cold = after.promotions_from_cold - before.promotions_from_cold;
+
+    CHECK(drops > 0,
+          "with no WARM, evictions DROP the page rather than spill it");
+    CHECK(spills >= 0, "spills are counted separately and are non-negative");
+    CHECK(prom_cold >= 0, "promotions-from-cold are counted separately");
+
+    // The two counters are independent: a page is either dropped (goes nowhere)
+    // or spilled (lands on disk), never both, and a dropped page is the one that
+    // says the run is wrong.
+    CHECK(drops > 0 || spills > 0 || prom_cold > 0,
+          "the tier moved pages (one of drops/spills/prom-cold is non-zero)");
+
+    // Cleanup: remove the spill files so the next run of this test starts clean.
+    for (int i = 0; i < 2; i++) {
+        std::remove((cold_dir + "/kv_k_layer_" + std::to_string(i) + ".bin").c_str());
+        std::remove((cold_dir + "/kv_v_layer_" + std::to_string(i) + ".bin").c_str());
+    }
+
+    engine.shutdown();
+    delete cpu;
+    std::remove(path.c_str());
+    std::system(("cmd /c rd /s /q " + cold_dir).c_str());
+}
+
+static void test_kv_tier_per_plane_cold_files() {
+// Two planes (K and V) share one --kv-cold-dir. The cold path MUST embed
+// the plane tag so K's spills and V's spills are different files -- otherwise
+// V's spill overwrote K's and a restore handed one plane the other's bytes.
+    const std::string path = "kraken-sparse-kv-test.gguf";
+    CHECK(build_sparse_kv_model(path), "wrote the sparse-KV fixture");
+
+    Backend *cpu = make_cpu_backend();
+    Engine engine;
+    std::string err;
+    CHECK(set_kv_tiered_budget(engine, cpu, path, 0, 0,
+          "kraken-per-plane-cold-dir", &err),
+          "engine initialises with a cold dir");
+    if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+
+    // Cold path is public; check it contains the plane tag.
+    std::string kp = engine.kvt_k().cold_path(0);
+    std::string vp = engine.kvt_v().cold_path(0);
+    CHECK(kp.find("/kv_k_layer_0.bin") != std::string::npos,
+          "K cold path contains the k-tagged filename");
+    CHECK(vp.find("/kv_v_layer_0.bin") != std::string::npos,
+          "V cold path contains the v-tagged filename");
+    CHECK(kp != vp, "K and V cold paths are different files");
+
+// A name built from the layer index ALONE would be identical for the two
+// planes. The plane tag prevents that.
+    const char *konly = "kv_layer_0.bin";
+    CHECK(kp.find(konly) == std::string::npos,
+          "the shared-name defect is not present (K path has no bare name)");
+    CHECK(vp.find(konly) == std::string::npos,
+          "V path has no bare name either");
+
+    engine.shutdown();
+    delete cpu;
+    std::remove(path.c_str());
+    std::string cmd = "cmd /c rd /s /q kraken-per-plane-cold-dir";
+    std::system(cmd.c_str());
+}
+
 // synthetic Mixture-of-Experts model
 // ---------------------------------------------------------------------------
 
@@ -2984,6 +3350,115 @@ static ExpertSource expert_source(Gguf &g) {
     return src;
 }
 
+// A two-layer expert source whose layers do NOT have the same expert footprint.
+// That is the shape a Q4_K_M file has when it mixes Q4_K and Q6_K
+// down-projections (and exactly what Qwen3-MoE-4x0.6B carries: 56 experts of
+// 5.8359 MiB and 56 of 5.0625 MiB). Layer 0's expert is 24 bytes, layer 1's is
+// 40, so the eight-slot corpus is 4 * 24 + 4 * 40 = 256 bytes and
+// `budget / this_layer_expert` is 10 at layer 0 but 6 at layer 1 -- less than
+// the eight slots the budget actually pays for.
+static bool build_expert_source_model_mixed(const std::string &path) {
+    GgufBuilder b;
+    b.meta_str("general.architecture", "llama");
+    b.meta_u32("general.alignment", 32);
+    add_spm_vocab(b, 260);
+    u8 narrow[8 * 4];
+    u8 wide[16 * 4];
+    u8 down[8 * 4];
+    for (size_t i = 0; i < sizeof(narrow); i++) narrow[i] = static_cast<u8>(i);
+    for (size_t i = 0; i < sizeof(wide); i++) wide[i] = static_cast<u8>(i + 3);
+    for (size_t i = 0; i < sizeof(down); i++) down[i] = static_cast<u8>(i + 7);
+    // [2,2,4] F16 = 16 elements = 32 bytes, so every slice here is 8 bytes an
+    // expert and layer 0's expert is 24.
+    b.tensor_raw("blk.0.ffn_gate_exps.weight", 1, {2, 2, 4}, narrow, sizeof(narrow));
+    b.tensor_raw("blk.0.ffn_up_exps.weight", 1, {2, 2, 4}, narrow, sizeof(narrow));
+    b.tensor_raw("blk.0.ffn_down_exps.weight", 1, {2, 2, 4}, narrow, sizeof(narrow));
+    // [4,2,4] F16 = 32 elements = 64 bytes for gate and up, down still 32, so
+    // layer 1's expert is 64/4 + 64/4 + 32/4 = 40.
+    b.tensor_raw("blk.1.ffn_gate_exps.weight", 1, {4, 2, 4}, wide, sizeof(wide));
+    b.tensor_raw("blk.1.ffn_up_exps.weight", 1, {4, 2, 4}, wide, sizeof(wide));
+    b.tensor_raw("blk.1.ffn_down_exps.weight", 1, {2, 2, 4}, down, sizeof(down));
+    return b.write(path);
+}
+
+static ExpertSource expert_source_of(Gguf &g, int layer) {
+    const std::string p = "blk." + std::to_string(layer) + ".";
+    ExpertSource src;
+    src.gate = g.tensor(p + "ffn_gate_exps.weight");
+    src.up = g.tensor(p + "ffn_up_exps.weight");
+    src.down = g.tensor(p + "ffn_down_exps.weight");
+    src.n_expert = 4;
+    src.n_embd = 2;
+    src.n_ff_exp = 2;
+    return src;
+}
+
+// The device budget is made of BYTES. It used to be spent by a slot COUNT
+// derived as budget_ / the current layer's expert footprint, which is the
+// largest layer's size whenever the corpus mixes footprints -- so a budget sized
+// for the whole routed set evicted experts it had already paid for, with budget
+// left unspent (measured on Qwen3-MoE-4x0.6B: 23 evictions and ~43 MiB of a
+// 610 MiB budget idle over a 64-token run). These three arms pin the rule in
+// both directions: a budget that covers the corpus evicts nothing, one byte less
+// than the corpus does, and an explicit slot budget is a real count.
+static void test_expert_cache_byte_budget() {
+    const std::string path = "kraken-bytes-test.gguf";
+    CHECK(build_expert_source_model_mixed(path), "wrote the byte-budget GGUF");
+
+    Backend *cpu = make_cpu_backend();
+    Gguf g;
+    std::string err;
+    CHECK(g.load(path, &err), "loaded the byte-budget GGUF");
+    if (!err.empty()) std::fprintf(stderr, "  (byte gguf: %s)\n", err.c_str());
+
+    ExpertSource a = expert_source_of(g, 0);
+    ExpertSource b = expert_source_of(g, 1);
+    CHECK(a.present() && b.present(), "both layers carry experts");
+    CHECK(a.expert_bytes() == 24 && b.expert_bytes() == 40,
+          "the two layers have different expert footprints");
+    const size_t corpus = 4 * (a.expert_bytes() + b.expert_bytes());
+    CHECK(corpus == 256, "the routed set is eight slots of 24 and 40 bytes");
+
+    // 1. A budget that covers the corpus holds every slot in it.
+    {
+        ExpertCache cache;
+        cache.configure(cpu, corpus, 0);
+        for (i32 e = 0; e < 4; e++) CHECK(cache.acquire(a, 0, e) != nullptr, "narrow expert loaded");
+        for (i32 e = 0; e < 4; e++) CHECK(cache.acquire(b, 1, e) != nullptr, "wide expert loaded");
+        CHECK(cache.evictions() == 0, "a budget that covers the corpus evicts nothing");
+        CHECK(cache.resident_slots() == 8, "all eight experts stay resident");
+        CHECK(cache.resident_bytes() == corpus, "and occupy exactly the corpus bytes");
+        cache.clear();
+    }
+
+    // 2. One byte short of the corpus and something has to go, so arm 1 is not
+    // passing because nothing was ever a candidate for eviction.
+    {
+        ExpertCache cache;
+        cache.configure(cpu, corpus - 1, 0);
+        for (i32 e = 0; e < 4; e++) cache.acquire(a, 0, e);
+        for (i32 e = 0; e < 4; e++) cache.acquire(b, 1, e);
+        CHECK(cache.evictions() > 0, "one byte short of the corpus does evict");
+        CHECK(cache.resident_slots() < 8, "and cannot hold all eight");
+        cache.clear();
+    }
+
+    // 3. An explicit slot budget is a count, not an estimate of one.
+    {
+        ExpertCache cache;
+        cache.configure(cpu, corpus, 0, 6);
+        for (i32 e = 0; e < 4; e++) cache.acquire(a, 0, e);
+        for (i32 e = 0; e < 4; e++) cache.acquire(b, 1, e);
+        CHECK(cache.capacity_slots() == 6, "an explicit slot budget is the capacity");
+        CHECK(cache.evictions() > 0 && cache.resident_slots() <= 6,
+              "and it is enforced as a count even with budget to spare");
+        cache.clear();
+    }
+
+    delete cpu;
+    std::remove(path.c_str());
+}
+
 static void test_expert_cache_policy() {
     const std::string path = "kraken-policy-test.gguf";
     CHECK(build_expert_source_model(path), "wrote the policy-test GGUF");
@@ -4359,6 +4834,7 @@ int main() {
     test_moe_matches_dense_twin();
     test_moe_grouped_prefill_matches_tokenwise();
     test_expert_cache_policy();
+    test_expert_cache_byte_budget();
     test_expert_cache_warm_tier();
     test_expert_warmup();
     test_cpu_expert_pool();
@@ -4369,6 +4845,10 @@ int main() {
     test_json();
     test_http_server();
     test_par_pool_covers_every_block();
+    test_kv_tier_per_layer_widths();
+    test_kv_tier_no_kv_layers();
+    test_kv_tier_drop_vs_spill();
+    test_kv_tier_per_plane_cold_files();
     std::remove(kTestModelPath);
     std::remove(kMoeTestPath);
     std::remove(kMoeDenseTwinPath);

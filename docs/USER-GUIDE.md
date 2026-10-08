@@ -341,6 +341,7 @@ or what fits in memory.
 | `--ctx N` | KV capacity in tokens (default 4096). Use 256/512 for MoE runs on small machines |
 | `--chunk N` | prefill batch size (default 256) |
 | `--vram-cap-mb N` | total device memory to plan for. `0` uses the policy: 6 GiB, then +2 GiB at a time while the card has room and the model needs it, up to **14 GiB** |
+| `--vram-tier N` | **a VRAM class, not a MiB cap.** The GiB this run may plan for, clamped to what the card has: `--vram-tier 8` on a 12 GB card plans 8 GiB, and the same command line on an 8 GB card plans 8 GiB there too. One line for several machines; a literal MiB restriction is `--vram-cap-mb`, which wins if both are given |
 | `--host-ram-mb N` | host memory to plan for; `0` uses a quarter of installed RAM. Bounds every host tier; the model mapping and dense trunk sit outside it |
 
 Anything a run does not plan for — a long KV context, another application — is

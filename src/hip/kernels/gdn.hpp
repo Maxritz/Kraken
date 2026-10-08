@@ -120,6 +120,15 @@ __global__ void gdn_softplus_kernel(_Float16 *__restrict__ x, i64 n) {
     x[i] = static_cast<_Float16>(d_softplus(static_cast<f32>(x[i])));
 }
 
+// Squared ReLU: nemotron_h_moe's expert activation (LLM_FFN_RELU_SQR).
+__global__ void gdn_relu_sqr_kernel(_Float16 *__restrict__ x, i64 n) {
+    const i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const f32 v = static_cast<f32>(x[i]);
+    const f32 r = v > 0.0f ? v : 0.0f;
+    x[i] = static_cast<_Float16>(r * r);
+}
+
 // x[t, i] *= alpha over `width` elements spaced `stride` apart. The token
 // index is the grid's y dimension instead of a division by width, and the
 // grid is capped at 65535 blocks in y with a stride loop, so a long prefill
@@ -261,10 +270,11 @@ __global__ void __launch_bounds__(THREADS)
                            const _Float16 *__restrict__ in,
                            f32 *__restrict__ state,
                            const _Float16 *__restrict__ kern, i64 n_tok,
-                           i64 chan) {
+                           i64 chan, const f32 *__restrict__ bias) {
     constexpr int kKeep = KS - 1;
     const i64 c = static_cast<i64>(blockIdx.x) * THREADS + threadIdx.x;
     if (c >= chan) return;
+    const f32 b = bias ? bias[c] : 0.0f;
 
     // The taps are constant for the whole call, so they are read once and kept
     // in registers: every token of the loop reuses them out of a register file
@@ -283,7 +293,7 @@ __global__ void __launch_bounds__(THREADS)
 
     for (i64 t = 0; t < n_tok; t++) {
         // X(t + j) == win[kKeep - j], newest tap last.
-        f32 acc = 0.0f;
+        f32 acc = b;
 #pragma unroll
         for (int j = 0; j < KS; j++) acc += tap[j] * win[kKeep - j];
         out[t * chan + c] = static_cast<_Float16>(d_silu(acc));
@@ -309,9 +319,11 @@ __global__ void gdn_conv1d_silu_generic_kernel(_Float16 *__restrict__ out,
                                                f32 *__restrict__ state,
                                                const _Float16 *__restrict__ kern,
                                                i64 n_tok, i64 chan,
-                                               i64 ksize) {
+                                               i64 ksize,
+                                               const f32 *__restrict__ bias) {
     const i64 c = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c >= chan) return;
+    const f32 b = bias ? bias[c] : 0.0f;
     const i64 keep = ksize - 1;
     // Same sliding window as the register kernel, in local memory: the call is
     // in place, so a row cannot be re-read once an earlier output has landed
@@ -320,7 +332,7 @@ __global__ void gdn_conv1d_silu_generic_kernel(_Float16 *__restrict__ out,
     for (i64 i = 1; i < ksize; i++) win[i] = state[(ksize - 1 - i) * chan + c];
     win[0] = static_cast<f32>(in[c]);
     for (i64 t = 0; t < n_tok; t++) {
-        f32 acc = 0.0f;
+        f32 acc = b;
         for (i64 j = 0; j < ksize; j++)
             acc += static_cast<f32>(kern[j * chan + c]) * win[keep - j];
         out[t * chan + c] = static_cast<_Float16>(d_silu(acc));
@@ -416,14 +428,15 @@ __global__ void __launch_bounds__(1024)
 
 inline void gdn_conv1d_silu_launch(_Float16 *out, const _Float16 *in, f32 *state,
                                    const _Float16 *kern, i64 n_tok, i64 chan,
-                                   i64 ksize) {
+                                   i64 ksize, const f32 *bias = nullptr) {
     if (n_tok <= 0 || chan <= 0 || ksize <= 0 || ksize > 16) return;
     constexpr int kThreads = 64;
     const unsigned grid =
         static_cast<unsigned>((chan + kThreads - 1) / kThreads);
 #define KRK_GDN_CONV(KS)                                                         \
     gdn_conv1d_silu_kernel<KS, kThreads><<<grid, kThreads>>>(out, in, state,    \
-                                                              kern, n_tok, chan)
+                                                              kern, n_tok,     \
+                                                              chan, bias)
     switch (ksize) {
         case 1: KRK_GDN_CONV(1); break;
         case 2: KRK_GDN_CONV(2); break;
@@ -431,7 +444,7 @@ inline void gdn_conv1d_silu_launch(_Float16 *out, const _Float16 *in, f32 *state
         case 4: KRK_GDN_CONV(4); break;
         default:
             gdn_conv1d_silu_generic_kernel<<<grid, kThreads>>>(
-                out, in, state, kern, n_tok, chan, ksize);
+                out, in, state, kern, n_tok, chan, ksize, bias);
             break;
     }
 #undef KRK_GDN_CONV
@@ -482,6 +495,84 @@ inline void gdn_delta_rule_launch(_Float16 *out, f32 *state, const _Float16 *q,
         default: KRK_GDN_DELTA(1); break;
     }
 #undef KRK_GDN_DELTA
+}
+
+// ---------------------------------------------------------------------------
+// mamba2_ssd_scan: the Mamba-2 SSD recurrence, one block per head. The slot
+// layout is [head][p][s] — a block owns head h's whole state (head_dim *
+// d_state cells) and a thread owns the s-column of one p; the token loop is
+// the only sequential part, exactly as in the delta rule above, but the
+// recurrence has no cross-thread coupling at all (no per-token reduction), so
+// there is no LDS and no __syncthreads after the initial state load.
+//
+//   dt     = softplus(dt_raw + db[h])                the step size
+//   h'     = exp(a[h] * dt) * h + dt * u * B[g, s]   decay exp(A*dt), input dt
+//   y[t,p] = sum_s h'[s] * C[g, s] (+ D[h] * u)
+//
+// dt is computed per token inside the kernel: dt_raw rides the fused xBC
+// row's tail (offset dt_off), db/a are per-head device vectors.
+// d_softplus's tail behaviour matches the CPU reference exactly.
+//
+// The input term is scaled by dt ALONE. Using a[h]*dt there as well -- which
+// reads naturally from "dtA" and is what both backends did -- keeps the
+// magnitudes plausible whenever |A| is O(1), so it survives shape checks and a
+// device-vs-CPU comparison (both had it). ggml's recurrence is the reference:
+//   dA = expf(dt_soft_plus * A[h]);  x_dt = x[ii] * dt_soft_plus;
+//   s = s*dA + B*x_dt;               y += s*C;
+// ---------------------------------------------------------------------------
+
+__global__ void mamba2_ssd_kernel(_Float16 *__restrict__ out,
+                                  f32 *__restrict__ state,
+                                  const _Float16 *__restrict__ xbc,
+                                  const _Float16 *__restrict__ dt,
+                                  const f32 *__restrict__ a,
+                                  const f32 *__restrict__ db,
+                                  const f32 *__restrict__ dp, i64 n_tok,
+                                  i64 n_head, i64 head_dim, i64 d_state,
+                                  i64 n_group, i64 inner, i64 conv_dim,
+                                  int has_d) {
+    const i64 h = blockIdx.x;
+    const int p = static_cast<int>(threadIdx.x); // one row of the head's state
+    if (h >= n_head || p >= head_dim) return;
+    const i64 g = h * n_group / n_head;          // grouped state
+    f32 *Sh = state + (h * head_dim + p) * d_state;
+    const i64 u_off = h * head_dim + p;
+    // D is per HEAD (the reference adds ggml_mul(x, ssm_d) with x shaped
+    // [head_dim, n_head] and ssm_d [1, n_head]), broadcast down the head's
+    // channels -- NOT per position. n_head == head_dim on the 30B file.
+    const f32 dpv = (has_d && dp) ? dp[h] : 0.0f;
+
+    for (i64 t = 0; t < n_tok; t++) {
+        const f32 x = static_cast<f32>(dt[t * n_head + h]) + db[h];
+        const f32 sp = d_softplus(x);
+        const f32 decay = __expf(a[h] * sp);
+        const f32 u = static_cast<f32>(xbc[t * conv_dim + u_off]);
+        const _Float16 *Bt = xbc + t * conv_dim + inner + g * d_state;
+        const _Float16 *Ct = Bt + n_group * d_state;
+        f32 acc = 0.0f;
+        for (i64 s = 0; s < d_state; s++) {
+            const f32 b = static_cast<f32>(Bt[s]);
+            const f32 c = static_cast<f32>(Ct[s]);
+            f32 cell = Sh[s] * decay + sp * u * b;
+            Sh[s] = cell;
+            acc += cell * c;
+        }
+        out[(t * n_head + h) * head_dim + p] =
+            static_cast<_Float16>(acc + dpv * u);
+    }
+}
+
+inline void mamba2_ssd_launch(_Float16 *out, f32 *state, const _Float16 *xbc,
+                              const _Float16 *dt, const f32 *a, const f32 *db,
+                              const f32 *dp, i64 n_tok, i64 n_head,
+                              i64 head_dim, i64 d_state, i64 n_group,
+                              i64 inner, i64 conv_dim, bool has_d) {
+    if (n_tok <= 0 || n_head <= 0 || head_dim <= 0 || d_state <= 0) return;
+    const unsigned grid = static_cast<unsigned>(n_head);
+    const unsigned threads = static_cast<unsigned>(head_dim);
+    mamba2_ssd_kernel<<<grid, threads>>>(
+        out, state, xbc, dt, a, db, dp, n_tok, n_head, head_dim, d_state,
+        n_group, inner, conv_dim, has_d ? 1 : 0);
 }
 
 } // namespace krk

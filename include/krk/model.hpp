@@ -74,6 +74,9 @@ struct LayerWeights {
     // pre-attention hidden state.
     QuantTensor wattn_gate;                       // attn_gate.weight [n_embd, n_head]
     QuantTensor shexp_gate, shexp_up, shexp_down; // shared expert, if any
+    // The shared expert's NVFP4 global scales (see ExpertSource). 1.0 when the
+    // file carries no sidecar, which is every format that is not NVFP4.
+    f32 shexp_gate_scale = 1.0f, shexp_up_scale = 1.0f, shexp_down_scale = 1.0f;
     QuantTensor shexp_inp_gate;                   // [n_embd] per-token gate
     ExpertSource experts;                         // lazily-loaded routed experts
 
@@ -87,9 +90,18 @@ struct LayerWeights {
     QuantTensor wqkv;        // [n_embd, conv_dim]  -> [q | k | v]
     QuantTensor wqkv_gate;   // [n_embd, value_dim]  the z gate
     QuantTensor ssm_conv1d;  // [ksize, conv_dim]    depthwise
+    // The mamba-2 checkpoint carries a conv bias; the gated delta net's does
+    // not, so this is null there and the op adds nothing. HOST-loaded f32.
+    f32 *ssm_conv_bias = nullptr; // [conv_dim]
     QuantTensor ssm_out;     // [value_dim, n_embd]
     f32 *ssm_dt = nullptr;   // [n_v_head]  timestep bias (no .weight suffix)
     f32 *ssm_a = nullptr;    // [n_v_head]  stored as -exp(A_log)
+    // ---- Nemotron Mamba-2 SSM layer (optional) ---------------------------
+    // nemotron_h_moe uses Mamba-2 blocks which have different tensors than GDN:
+    // ssm_in (input projection), ssm_d (optional D parameter), no ssm_alpha/beta.
+    bool nemotron_ssm = false;  // This layer is a Mamba-2 SSM block (not GDN)
+    QuantTensor ssm_in;         // [inner_size, n_embd] - Mamba-2 input projection
+    f32 *ssm_d = nullptr;       // [dt_rank] - Mamba-2 D parameter (optional)
     // Projected per head, so these are matmul weights like any other (the
     // loader downcasts an F32 checkpoint tensor to F16).
     QuantTensor ssm_alpha;  // [n_embd, n_v_head]
@@ -98,7 +110,6 @@ struct LayerWeights {
     // the model EXCEPT this one, so it is uploaded verbatim, not via the
     // zero-centred path.
     f32 *ssm_norm = nullptr;
-
     // ---- prism.hadamard folded inputs (false on every other model) -------
     // Which of this layer's matmuls read a ROTATED weight, so their input has
     // to be transformed first (Backend::hadamard_act, plan above). They are
@@ -177,6 +188,11 @@ struct ModelConfig {
     // vector is kept here, and `n_head` is its maximum — which is what the
     // workspaces size to, since the query projection is the widest one.
     std::vector<i32> n_head_layer;
+    // Same idea for the KV side: a per-layer array (nemotron_h_moe: 2 on its
+    // six attention layers, 0 on the 46 that have none, gemma4: {1,8}) with
+    // n_head_kv holding the maximum, which is what a shared workspace and one
+    // KV slot are measured against.
+    std::vector<i32> n_head_kv_layer;
     // Per-head softplus output gate (laguna `attn_gate.weight`): one scalar per
     // query head, projected from the *same* hidden state q/k/v read, then
     // softplus'd and multiplied into the attention result before wo. Distinct
@@ -196,6 +212,11 @@ struct ModelConfig {
     // sum-normalized (`expert_w_norm`) and scaled (`expert_w_scale`).
     bool router_bias = false;
     bool router_sigmoid = false;
+    // The FFN's activation is squared ReLU rather than a gated SiLU
+    // (nemotron_h/nemotron_h_moe: the reference builds every FFN of the family
+    // with LLM_FFN_RELU_SQR, and its files carry no ffn_gate for the gate-less
+    // expert/shared-expert shapes to multiply against).
+    bool ffn_relu_sqr = false;
     // Whether the rope table was built with YaRN's frequency correction, i.e.
     // whether `rope_scale` has already been folded into `inv_freq` and must be
     // left at 1.0 for the rotation op.
@@ -231,6 +252,12 @@ struct ModelConfig {
     i32 ssm_key_dim = 0;             // ssm_n_group * ssm_d_state
     i32 ssm_value_dim = 0;           // ssm_dt_rank * ssm_d_state
     i32 ssm_conv_dim = 0;            // ssm_key_dim*2 + ssm_value_dim
+    // ---- nemotron_h_moe (Mamba-2 + MoE) -----------------------------------
+    // nemotron_h_moe uses Mamba-2 blocks (different from GDN) alternating with
+    // MoE expert layers. Even layers are Mamba-2 SSM, odd layers are experts.
+    bool nemotron_moe = false;        // This is a nemotron_h_moe model
+    bool has_d_param = false;         // ssm_d parameter present (Mamba-2 specific)
+    i32 ssm_inner_size = 0;           // Mamba-2 inner projection dimension
     // Rotated width when it is narrower than head_dim (partial RoPE). 0 means
     // the whole head is rotated.
     i32 rope_dim = 0;
@@ -268,6 +295,33 @@ public:
     }
     i64 q_dim_at(i32 layer) const {
         return static_cast<i64>(n_head_at(layer)) * cfg_.head_dim;
+    }
+
+    // ---- per-layer KV geometry --------------------------------------------
+    // Wide as the widest layer (workspace and KV-slot sizing); the width one
+    // layer actually reads and writes is kv_dim_at().
+    i32 n_head_kv_at(i32 layer) const {
+        if (cfg_.n_head_kv_layer.empty()) return cfg_.n_head_kv;
+        if (layer < 0 || layer >= static_cast<i32>(cfg_.n_head_kv_layer.size()))
+            return cfg_.n_head_kv;
+        return cfg_.n_head_kv_layer[static_cast<size_t>(layer)];
+    }
+    i64 kv_dim_at(i32 layer) const {
+        return static_cast<i64>(n_head_kv_at(layer)) * cfg_.head_dim;
+    }
+    // True when this layer reads and writes KV: the ones carrying q/k/v. A
+    // mamba/SSM block and a pure-MoE block append nothing, so they hold no KV,
+    // are charged for none, and get no plane in the cache. This is the same
+    // predicate the engine's attention branch uses.
+    bool layer_has_kv(i32 layer) const {
+        return layer >= 0 && layer < static_cast<i32>(layers_.size()) &&
+               layers_[static_cast<size_t>(layer)].wq.present();
+    }
+    size_t kv_layer_count() const {
+        size_t n = 0;
+        for (size_t l = 0; l < layers_.size(); l++)
+            if (layer_has_kv(static_cast<i32>(l))) n++;
+        return n;
     }
     // True when this layer attends a bounded window instead of the whole past.
     bool is_swa(i32 layer) const {
@@ -344,9 +398,23 @@ public:
     const ExpertCache &experts() const { return experts_; }
     // host_bytes sizes the cache's second tier in page-locked host memory; 0
     // disables it and evicted experts go back to the GGUF mapping.
-    void set_expert_budget(size_t bytes, size_t host_bytes = 0) {
-        experts_.configure(be_, bytes, host_bytes);
+    void set_expert_budget(size_t bytes, size_t host_bytes = 0, size_t slot_budget = 0) {
+        experts_.configure(be_, bytes, host_bytes, slot_budget);
     }
+    // How many (layer, expert) slots the routed set has (0 when dense). The
+    // counterpart of total_expert_bytes() for the residency report: the device
+    // budget is sized to cover the whole set, and this is how many slots that
+    // is, so the cache can report the set rather than an estimate of it.
+    size_t expert_slot_count() const {
+        size_t n = 0;
+        for (const LayerWeights &L : layers_) {
+            if (!L.moe) continue;
+            const i64 ne = L.experts.n_expert > 0 ? L.experts.n_expert : 1;
+            n += static_cast<size_t>(ne);
+        }
+        return n;
+    }
+
     // Largest single-expert footprint across the MoE layers (0 when dense).
     // What the load phase copied to the device and how long it took. The
     // per-size breakdown stays behind KRK_PHASE; this is the total the run

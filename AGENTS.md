@@ -37,6 +37,22 @@ code, the README, or `docs/`.
   work is still pending instead of reading the log, and it also fails on a Debug
   build type, a CPU-only binary in a HIP configuration, and an offload arch that
   does not match the card in the machine.
+- **A Release build can have assertions live, and only `build_check.sh` sees it.**
+  `CMAKE_CXX_FLAGS_RELEASE` is filled in by CMake's per-compiler platform module,
+  so it is exactly as good as the compiler's *identity*: `build-hip` is
+  configured with `CXX=hipcc` (a wrapper CMake cannot classify), so the cache said
+  `Release` while `CMAKE_CXX_FLAGS_RELEASE` came out **empty**, the project's own
+  `-O3` still applied, and all 90 host `.cpp` TUs compiled with `NDEBUG`
+  undefined. `CMakeLists.txt` now states it explicitly
+  (`add_compile_options($<$<NOT:$<CONFIG:Debug>>:-DNDEBUG>)`), so it holds for any
+  compiler; section 2 of `scripts/build_check.sh` counts `-DNDEBUG` per
+  translation unit and is the only check that catches this.
+- **`build_check.sh` section 6 flags any rebuild, by design.** The artifact
+  hashes are re-recorded only when ninja has no pending work, so after a
+  legitimate rebuild the next run reports those binaries as "NOT produced by this
+  build". Section 1 (`ninja -n`) is what proves the binary matches the source;
+  re-record deliberately with `KRK_REFRESH_FINGERPRINT=1`, then run it once more
+  plainly to show the hashes match.
 
 ## Line endings (this bites constantly)
 
@@ -69,6 +85,15 @@ code, the README, or `docs/`.
 - Anything touching HIP must go through `hipcc` — keep HIP headers out of
   plain-C++ TUs. `src/main_cli.cpp` bridges via environment variables instead.
 - Machine: 96 GB host RAM, 15.9 GiB VRAM, models also under `G:/More-models/`.
+- **Stopping a model sweep needs a TREE kill, or the next link fails.** A
+  script that walks many models spawns `timeout` -> `kraken.exe` children;
+  killing the shell leaves them running (they keep loading, and hold the
+  binary), and ninja then dies with `lld-link: error: failed to write output
+  'kraken.exe': permission denied` followed by `clang++: error: unable to
+  remove file`, which reads as a toolchain problem and is not one.
+  `taskkill //T //F //PID <shell pid>` kills the tree; `tasklist //FI
+  "IMAGENAME eq kraken.exe"` (or `ps -W`) shows the strays, and `ps -W | grep`
+  alone can miss them, so confirm with tasklist before blaming the linker.
 - **Host memory: read the number, do not infer a leak.** A GPU run of a 27B model
   peaks at ~0.35 GB private / ~0.37 GB working set; the ~267 GB "virtual" figure
   Task Manager shows for it is the HIP runtime's address-space reservation under
@@ -184,6 +209,78 @@ code, the README, or `docs/`.
 
 ## Known open items
 
+- **The KV cache is packed per KV-carrying layer, and the tier must cover it.**
+  This replaces two earlier open items (the 8.67x padded charge and per-layer KV
+  widths). `Engine` now builds a per-layer `len[]` from `Model::layer_has_kv(l)`
+  and `Model::kv_dim_at(l)` and charges `sum(len) * 2` -- measured on
+  `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-noMTP.gguf` (52 layers, KV heads
+  `0 x46 / 2 x6`), `KV=24 MiB` at `--ctx 4096` where it printed and reserved
+  `208 MiB` before. `KvTierCache` packs the same per-layer lengths, sizes a HOT
+  slot by the **largest** layer (`slot_bytes_ = max(len_)`), and its flat
+  allocation is the KV that exists -- so one width per layer is no longer a
+  layout requirement, and a model with mixed KV widths loads.
+  The invariant is a **correctness** one, and it is enforced by the layout
+  rather than by the caller: HOT + WARM must hold one pass over the KV-carrying
+  layers, and a layer in neither tier is zero-filled on its next step
+  (`ensure_hot`'s `fill0` branch) with nothing recomputing it -- not a slow run,
+  a WRONG one that still prints fluent text. **WARM's capacity is derived from
+  the geometry, not from its budget.** With no `--kv-cold-dir` it is pinned at
+  the KV-layer count, which is the number that makes an admission failure
+  impossible: at any admission the layer being promoted is still counted in
+  WARM and HOT holds at least the page being evicted, so `|WARM| <= layers - 1`
+  and one more admission needs `layers`. A `--kv-warm-mb` below that is raised
+  and the deviation is reported (asked MiB, applied slots, why, and the two ways
+  out); the budget is obeyed only where a spill directory exists, and a
+  `--kv-cold-dir` that cannot be written is ignored and reported rather than
+  turning every eviction into a drop. The end-of-run line counts `DROPPED` pages
+  apart from `->COLD` spills; they shared one counter before, which made a
+  corrupt run report a working disk tier.
+  `scripts/kv_tier_geometry_check.sh` is the proof, and it needs the machine's
+  models to mean anything: three load arms per model (auto WARM; a budget with
+  nowhere to spill, which must be raised and say so; the same budget with a cold
+  dir, which must NOT be raised), each judged against the model file's own
+  header by `tools/kv_tier_geometry.py`, plus a decode arm on every small model
+  whose stdout must equal the flat cache's byte for byte. That checker has its
+  own selftest (13 cases, four of them constructed failures) because a harness
+  that cannot fail proves nothing. The sweep is bounded by `KRK_MAX_MB` (a model
+  above it is reported `NOT COVERED`, not left out), `KRK_MIN_MB` (resume where a
+  killed sweep stopped) and `KRK_ARMS` (`B` is one load per model instead of
+  three, which is how the large ones get covered). A refused file is a `SKIP`: a
+  refusal is a fact about the header, so `kraken-inspect` settles it for the cost
+  of one process instead of three weight loads.
+  Measured on this box: **49 models up to 8 GiB pass arm B, 0 failed**, and 18 of
+  them carry KV on only some of their layers -- the per-layer geometry the tier
+  has to respect -- while a full three-arm pass over every model <= 1.2 GiB also
+  ends 0 failed with 7 decode arms byte-identical to the flat cache. Above 8 GiB
+  the file is tens of GB and the KV tier is no longer the question being asked.
+  Verified: SmolLM2-135M `--ctx 512 -n 32 --greedy`, 30 KV layers, 2 HOT slots
+  -- flat, `--kv-hot-mb 1`, `--kv-warm-mb 64`, `--kv-warm-mb 0` (raised to 30
+  WARM slots, reported) and `--kv-warm-mb 0 --kv-cold-dir DIR` (1916 pages
+  spilled) all give stdout md5 `2456dfa5ba9e`.
+  See `docs/AUDIT-residency-byte-budgets.md` (F2-F4, F6).
+- **Two planes must not share a namespace.** `KvTierCache::cold_path` built a
+  filename from the layer index alone, and both planes of the engine share one
+  `--kv-cold-dir`, so K and V wrote the **same 30 files** and a restore handed
+  one plane the other's bytes: 1916 `->COLD`, 1860 back, 0 dropped, and the text
+  silently diverged from the flat cache (`a2e087cbeada` against `2456dfa5ba9e`).
+  Fixed with a `plane_tag` ("k"/"v") in the name -- 60 files, md5 equal to flat.
+  Same shape as the `hot / 2` split and the shared `kv_dim_` (F5), which are
+  still fine only because MLA is `ArchSupport::No`; treat "two instances, one
+  namespace or one number" as a defect pattern rather than a latent note. The
+  per-plane warning duplication was the third instance: every KV warning printed
+  twice until the engine took over printing it once.
+  See `docs/AUDIT-residency-byte-budgets.md` (F5, F7).
+- **The published `cf0408eb02` text hash does not reproduce -- use
+  `a56e02b731fd`.** `docs/test-results.md` section 10 recorded the MoE
+  acceptance run's text md5 as `cf0408eb02`; it matches neither the current build
+  nor the archived pre-refactor `dist/kraken/kraken.exe` for that command, so it
+  was measured under a protocol the doc did not state. The protocol that
+  reproduces is **stdout only** (banner + generated text, stderr separated), and
+  both builds give `a56e02b731fd`: `--model models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+  -p "The history of computing is a history of abstraction" -n 64 --temp 0
+  --greedy --ctx 512`. Two builds agreeing bit-for-bit is the useful fact: it is
+  how you prove a layout change moved no numbers. Treat any stored hash without
+  its exact protocol as a claim to re-run, not a fact.
 - **Decode attention was nondeterministic at ≥128 keys and is now fixed.**
   `attention_decode_split_kernel` (`src/hip/kernels/attention.hpp`) had every
   warp-leader thread store the block's partial denominator to the same address,

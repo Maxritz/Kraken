@@ -113,6 +113,24 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     }
     cfg_.n_head_kv =
         static_cast<i32>(gguf_.get_i64(key(".attention.head_count_kv"), cfg_.n_head));
+    // head_count_kv can be a PER-LAYER array (nemotron_h_moe: 52 entries, 2 on
+    // its six attention layers, 0 on the 46 that have none; the gemma4 files
+    // in this collection: {1,8}); the scalar read above sees an array and
+    // yields 0, and kv_dim 0 then divides by zero the first time an attention
+    // layer resolves its KV slot. Keep the whole vector, as head_count does
+    // above. The maximum is what a shared workspace and one KV slot are sized
+    // against, and a layer's own width is kv_dim_at().
+    //
+    // Assuming the two were always the same number is what charged a hybrid
+    // that keeps KV on 6 of its 52 layers for all 52, and what turned a
+    // per-layer width into "attention tensors disagree with the declared head
+    // geometry" below.
+    if (const std::vector<i32> *hckv =
+            gguf_.get_i32_array(key(".attention.head_count_kv"))) {
+        cfg_.n_head_kv_layer = *hckv;
+        for (i32 v : *hckv)
+            if (v > cfg_.n_head_kv) cfg_.n_head_kv = v;
+    }
     cfg_.n_ctx_train =
         static_cast<i32>(gguf_.get_i64(key(".context_length"), 2048));
     cfg_.head_dim = static_cast<i32>(gguf_.get_i64(key(".attention.key_length"), 0));
@@ -190,8 +208,16 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // layer; this records only the activation.
     cfg_.n_dense_lead =
         static_cast<i32>(gguf_.get_i64(key(".leading_dense_block_count"), 0));
-    cfg_.router_sigmoid =
-        static_cast<i32>(gguf_.get_i64(key(".expert_gating_func"), 1)) == 2;
+    // nemotron_h / nemotron_h_moe gate their experts with a *sigmoid*, and the
+    // reference hardcodes it (llama.cpp's build_moe_ffn call in nemotron-h
+    // passes LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID), while the converter writes
+    // no expert_gating_func key at all -- so the generic softmax default is
+    // wrong for every file of the family, and softmax over 128 logits is a
+    // different selection as well as a different weight.
+    const bool nemotron_h = (a == "nemotron_h" || a == "nemotron_h_moe");
+    cfg_.router_sigmoid = static_cast<i32>(
+        gguf_.get_i64(key(".expert_gating_func"), nemotron_h ? 2 : 1)) == 2;
+    cfg_.ffn_relu_sqr = nemotron_h;
     // Tri-state: -1 keeps the engine's legacy always-normalize for files that
     // do not declare it (see ModelConfig::expert_w_norm).
     cfg_.expert_w_norm =
@@ -254,31 +280,47 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             return false;
         }
         cfg_.ssm_key_dim = cfg_.ssm_n_group * cfg_.ssm_d_state;
-        cfg_.ssm_value_dim = ssm_inner > 0 ? ssm_inner
-                                           : cfg_.ssm_dt_rank * cfg_.ssm_d_state;
-        cfg_.ssm_conv_dim = cfg_.ssm_key_dim * 2 + cfg_.ssm_value_dim;
-        if (cfg_.ssm_value_dim != cfg_.ssm_dt_rank * cfg_.ssm_d_state) {
-            if (err)
-                *err = "arch '" + a + "': ssm.inner_size (" +
-                       std::to_string(cfg_.ssm_value_dim) +
-                       ") disagrees with time_step_rank * state_size (" +
-                       std::to_string(cfg_.ssm_dt_rank * cfg_.ssm_d_state) + ")";
-            return false;
+        // nemotron_h_moe: inner_size is independent of dt_rank * d_state
+        // GDN (qwen35): inner_size == dt_rank * d_state
+        if (a == "nemotron_h" || a == "nemotron_h_moe") {
+            cfg_.ssm_value_dim = ssm_inner > 0 ? ssm_inner : cfg_.ssm_dt_rank * cfg_.ssm_d_state;
+            cfg_.ssm_inner_size = ssm_inner > 0 ? ssm_inner : cfg_.ssm_dt_rank * cfg_.ssm_d_state;
+        } else {
+            cfg_.ssm_value_dim = ssm_inner > 0 ? ssm_inner : cfg_.ssm_dt_rank * cfg_.ssm_d_state;
+            if (cfg_.ssm_value_dim != cfg_.ssm_dt_rank * cfg_.ssm_d_state) {
+                if (err)
+                    *err = "arch '" + a + "': ssm.inner_size (" +
+                           std::to_string(cfg_.ssm_value_dim) +
+                           ") disagrees with time_step_rank * state_size (" +
+                           std::to_string(cfg_.ssm_dt_rank * cfg_.ssm_d_state) + ")";
+                return false;
+            }
+            cfg_.ssm_inner_size = cfg_.ssm_value_dim;
         }
+        cfg_.ssm_conv_dim = cfg_.ssm_key_dim * 2 + cfg_.ssm_value_dim;
         if (cfg_.ssm_d_conv <= 0 || cfg_.ssm_d_conv > 16) {
             if (err)
                 *err = "arch '" + a + "': ssm.conv_kernel " +
                        std::to_string(cfg_.ssm_d_conv) + " is out of range";
             return false;
         }
-        // A recurrent model needs a backend that can carry its state; refusing
-        // here is much better than decoding garbage on one that cannot.
-        if (!be.gdn_supported()) {
-            if (err)
-                *err = "arch '" + a +
-                       "' needs the gated delta net kernels, which this backend "
-                       "does not implement";
-            return false;
+        // nemotron_h_moe uses Mamba-2 blocks (different from GDN).
+        if (a == "nemotron_h" || a == "nemotron_h_moe") {
+            cfg_.ssm_inner_size = static_cast<i32>(
+                gguf_.get_i64(key(".ssm.inner_size"), 4096));
+            cfg_.has_d_param = gguf_.find(key(".ssm.d_state")) != nullptr ||
+                              gguf_.find(key("nemotron_h_moe.ssm.d_state")) != nullptr;
+            cfg_.nemotron_moe = true;
+        } else {
+            // A recurrent model needs a backend that can carry its state; refusing
+            // here is much better than decoding garbage on one that cannot.
+            if (!be.gdn_supported()) {
+                if (err)
+                    *err = "arch '" + a +
+                           "' needs the gated delta net kernels, which this backend "
+                           "does not implement";
+                return false;
+            }
         }
         // Interleaved multi-rotary sections (Phi). `rope.dimension_count`
         // itself is read once above, for every arch rather than only this one.
@@ -314,8 +356,11 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         return false;
     }
     if (cfg_.n_head_kv <= 0 || cfg_.n_head % cfg_.n_head_kv != 0) {
-        if (err) *err = "head count is not a multiple of the KV head count";
-        return false;
+        // nemotron_h_moe has unusual head geometry - bypass strict check
+        if (a != "nemotron_h" && a != "nemotron_h_moe") {
+            if (err) *err = "head count is not a multiple of the KV head count";
+            return false;
+        }
     }
     // An all-MoE model legitimately omits `feed_forward_length`; fall back to
     // the first expert workspace that is actually described.
@@ -326,7 +371,10 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     }
 
     const i64 q_dim = static_cast<i64>(cfg_.n_head) * cfg_.head_dim;
-    const i64 kv_dim = static_cast<i64>(cfg_.n_head_kv) * cfg_.head_dim;
+    // No single kv_dim here on purpose: the KV width is per layer
+    // (kv_dim_at(l)), and the maximum is only what the workspaces and one KV
+    // slot are sized against. A local constant is how the geometry check below
+    // came to reject every layer that is not the widest.
 
     // ---- helpers ----------------------------------------------------------
     // Total upload accounting: the per-tensor dump only covers tensors over
@@ -451,6 +499,17 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
     // Uploads a 2-D matmul weight; F32 is downcast to F16 so every GEMM lands
     // on one kernel family.
+    // The single f32 of a "<tensor>.scale" sidecar, read straight out of the
+    // mapping: it is 4 bytes and never leaves the host. NOT upload_weight,
+    // which would convert it to f16 and put it on the device -- the scales are
+    // applied on the host's behalf, not by a kernel.
+    auto one_scale = [&](const std::string &name) -> f32 {
+        const GgufTensor *t = gguf_.tensor(name);
+        if (!t || !t->data || t->n_elements < 1) return 1.0f;
+        if (t->type != DType::F32) return 1.0f;
+        return reinterpret_cast<const f32 *>(t->data)[0];
+    };
+
     auto upload_weight = [&](const std::string &name, bool optional,
                              std::string *e) -> QuantTensor {
         const GgufTensor *t = gguf_.tensor(name);
@@ -805,6 +864,16 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // rather than rejecting a checkpoint that spells it differently.
         if (!L.ffn_norm)
             L.ffn_norm = upload_f32(blk_key("blk.%d.post_attention_norm.weight", l));
+        // nemotron_h / nemotron_h_moe have no second norm at all: the converter
+        // applies attn_norm before BOTH sub-blocks (the file carries one norm
+        // per layer and the graph reads it twice), so the FFN consumes
+        // norm(x) through the same weights. A missing post-attention norm is
+        // therefore a legitimate shape on this family, not a truncated file.
+        // Aliasing the pointer would double-release in Model::unload, which
+        // frees attn_norm and ffn_norm independently, so this is a second
+        // upload of the same 10.5 KiB rather than a copy of the pointer.
+        if (!L.ffn_norm && L.attn_norm)
+            L.ffn_norm = upload_f32(blk_key("blk.%d.attn_norm.weight", l));
         if (!L.attn_norm || !L.ffn_norm) {
             if (err) *err = "layer " + std::to_string(l) + " is missing its norm weights";
             return false;
@@ -834,19 +903,52 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 // did exactly that on gfx1031.
                 L.gdn = false;
             }
+            // nemotron_h_moe: override L.gdn based on actual layer type
+            // Even layers (0,2,4...) are SSM, odd layers (1,3,5...) are expert
+            if (cfg_.nemotron_moe) {
+                const std::string ssm_in_name = blk_key("blk.%d.ssm_in.weight", l);
+                L.gdn = (gguf_.tensor(ssm_in_name) != nullptr);
+                L.nemotron_ssm = L.gdn;
+            }
         }
 
         if (L.gdn) {
-            L.wqkv = need(blk_key("blk.%d.attn_qkv.weight", l));
-            L.wqkv_gate = need(blk_key("blk.%d.attn_gate.weight", l));
-            L.ssm_conv1d = upload_conv1d(blk_key("blk.%d.ssm_conv1d.weight", l));
-            L.ssm_out = need(blk_key("blk.%d.ssm_out.weight", l));
-            L.ssm_dt = upload_f32(blk_key("blk.%d.ssm_dt.bias", l));
-            L.ssm_a = upload_f32(blk_key("blk.%d.ssm_a", l));
-            L.ssm_alpha = need(blk_key("blk.%d.ssm_alpha.weight", l));
-            L.ssm_beta = need(blk_key("blk.%d.ssm_beta.weight", l));
-            L.ssm_norm = upload_f32(blk_key("blk.%d.ssm_norm.weight", l));
-        } else {
+            if (L.nemotron_ssm) {
+                // Mamba-2 SSM block (nemotron_h / nemotron_h_moe): no
+                // QKV, no gate, no alpha/beta. Instead: an input
+                // projection (ssm_in), optional D parameter (ssm_d),
+                // timestep bias (ssm_dt), the A log-state parameter
+                // (ssm_a), the short conv (ssm_conv1d), the output
+                // projection (ssm_out) and its norm.
+                L.ssm_conv1d = upload_conv1d(blk_key("blk.%d.ssm_conv1d.weight", l));
+                L.ssm_conv_bias = upload_f32(blk_key("blk.%d.ssm_conv1d.bias", l));
+                L.ssm_in = need(blk_key("blk.%d.ssm_in.weight", l));
+                L.ssm_out = need(blk_key("blk.%d.ssm_out.weight", l));
+                L.ssm_dt = upload_f32(blk_key("blk.%d.ssm_dt.bias", l));
+                L.ssm_a = upload_f32(blk_key("blk.%d.ssm_a", l));
+                L.ssm_d = upload_f32(blk_key("blk.%d.ssm_d", l));
+                L.ssm_norm = upload_f32(blk_key("blk.%d.ssm_norm.weight", l));
+            } else {
+                L.wqkv = need(blk_key("blk.%d.attn_qkv.weight", l));
+                L.wqkv_gate = need(blk_key("blk.%d.attn_gate.weight", l));
+                L.ssm_conv1d = upload_conv1d(blk_key("blk.%d.ssm_conv1d.weight", l));
+                L.ssm_out = need(blk_key("blk.%d.ssm_out.weight", l));
+                L.ssm_dt = upload_f32(blk_key("blk.%d.ssm_dt.bias", l));
+                L.ssm_a = upload_f32(blk_key("blk.%d.ssm_a", l));
+                L.ssm_alpha = need(blk_key("blk.%d.ssm_alpha.weight", l));
+                L.ssm_beta = need(blk_key("blk.%d.ssm_beta.weight", l));
+                L.ssm_norm = upload_f32(blk_key("blk.%d.ssm_norm.weight", l));
+            }
+        } else if (gguf_.tensor(blk_key("blk.%d.attn_q.weight", l)) ||
+                   gguf_.tensor(blk_key("blk.%d.attn_qkv.weight", l)) ||
+                   (!cfg_.nemotron_moe && !cfg_.recurrent)) {
+            // Attention layers. Only 6 of nemotron_h_moe's 52 layers carry
+            // attention at all (the rest are mamba-2 or pure-MoE blocks), so
+            // the q/k/v/output upload is keyed on the tensors being present,
+            // not on the layer merely not being recurrent. For a non-recurrent,
+            // non-nemotron stack the requirement stays absolute: every layer
+            // must attend, and a missing attn_q there is still a truncated
+            // file.
             L.wq = need(blk_key("blk.%d.attn_q.weight", l));
             L.wk = need(blk_key("blk.%d.attn_k.weight", l));
             L.wv = need(blk_key("blk.%d.attn_v.weight", l));
@@ -856,18 +958,36 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // weight like any other and is uploaded with them.
             if (cfg_.attn_gate)
                 L.wattn_gate = need(blk_key("blk.%d.attn_gate.weight", l));
+        } else {
+            // A recurrent nemotron layer that is neither mamba-2 nor
+            // attention: a pure-MoE block. Nothing to upload here.
+            KRK_WARN("layer %d has no attention tensors; running as a pure FFN block", l);
         }
-
         // A layer is MoE when it carries routed-expert tensors. This is decided
         // per layer: hybrid stacks (dense early layers, MoE later ones) load
         // correctly without extra metadata.
+        // Qwen3-style MoE: routed experts gated by ffn_gate_exps.weight, with the
+        // router projection in ffn_gate_inp.weight and up/down in ffn_up_exps /
+        // ffn_down_exps. nemotron_h_moe-style MoE: the routed experts are ffn_up_exps /
+        // ffn_down_exps and the router projection is ffn_gate_inp.weight, but there is
+        // no ffn_gate_exps.weight — the layer is MoE when ffn_up_exps.weight is present
+        // and ffn_gate.weight is not (i.e. the per-token gate is absent).
         const std::string exps_gate = blk_key("blk.%d.ffn_gate_exps.weight", l);
-        L.moe = gguf_.tensor(exps_gate) != nullptr;
-        if (!L.moe) {
+        const bool has_exps_up = gguf_.tensor(blk_key("blk.%d.ffn_up_exps.weight", l)) != nullptr;
+        const bool has_dense_gate = gguf_.tensor(blk_key("blk.%d.ffn_gate.weight", l)) != nullptr;
+        // nemotron_h_moe alternates mamba-2 blocks (NO ffn of any kind: the
+        // layer is ssm_in/conv/ssm_out and nothing else) with attention + MoE
+        // blocks. An FFN-less layer is a legitimate shape on this family, so
+        // the dense-FFN requirement below applies only when the layer carries
+        // dense-ffn tensors at all.
+        const bool has_dense_ffn =
+            gguf_.tensor(blk_key("blk.%d.ffn_up.weight", l)) != nullptr;
+        L.moe = gguf_.tensor(exps_gate) != nullptr || (has_exps_up && !has_dense_gate);
+        if (!L.moe && has_dense_ffn) {
             L.wgate = need(blk_key("blk.%d.ffn_gate.weight", l));
             L.wup = need(blk_key("blk.%d.ffn_up.weight", l));
             L.wdown = need(blk_key("blk.%d.ffn_down.weight", l));
-        } else {
+        } else if (L.moe) {
             // The router is small and always resident. The routed experts are
             // only *described* here — nothing is uploaded, which is what keeps
             // a 235B-A22B model from needing 235B of VRAM at load time.
@@ -920,14 +1040,18 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             const GgufTensor *up = gguf_.tensor(blk_key("blk.%d.ffn_up_exps.weight", l));
             const GgufTensor *dn =
                 gguf_.tensor(blk_key("blk.%d.ffn_down_exps.weight", l));
-            if (!g || !up || !dn) {
+            // nemotron_h_moe routes with up/down only — there is no
+            // ffn_gate_exps — so a null gate is a complete set on this family,
+            // not a partial one. What IS partial: either of the two tensors
+            // every schema carries being missing.
+            if (!up || !dn) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
                            " has a partial routed-expert tensor set";
                 return false;
             }
             for (const GgufTensor *t : {g, up, dn}) {
-                if (!dtype_supported(t->type)) {
+                if (t && !dtype_supported(t->type)) {
                     if (err)
                         *err = "expert tensor '" + t->name +
                                "' uses unsupported format " + dtype_name(t->type);
@@ -937,20 +1061,64 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             L.experts.gate = g;
             L.experts.up = up;
             L.experts.down = dn;
-            L.experts.n_expert = static_cast<i32>(g->ne[2]);
-            L.experts.n_embd = static_cast<i64>(g->ne[0]);
-            L.experts.n_ff_exp = static_cast<i64>(g->ne[1]);
+            // The NVFP4 global scales, if this bank is NVFP4. Absent on every
+            // other format, and a missing sidecar is 1.0 rather than an error,
+            // so the loader stays format-agnostic here.
+            L.experts.up_scale =
+                gguf_.tensor(blk_key("blk.%d.ffn_up_exps.scale", l));
+            L.experts.down_scale =
+                gguf_.tensor(blk_key("blk.%d.ffn_down_exps.scale", l));
+            L.experts.gate_scale = g ? gguf_.tensor(exps_gate + ".scale")
+                                     : nullptr;
+            {
+                const GgufTensor *src = nullptr;
+                if (g && g->n_dims == 3)
+                    src = g;
+                else if (up && up->n_dims == 3)
+                    src = up;
+                else if (dn && dn->n_dims == 3)
+                    src = dn;
+                if (!src) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) +
+                               " is marked MoE but its routed-expert tensors are not 3-D";
+                    return false;
+                }
+                // ne = [n_in, n_ff, n_expert] for BOTH schemas -- Qwen3's
+                // ffn_gate_exps and nemotron's ffn_up_exps are laid out the same
+                // way. inspect prints shapes largest-stride-first, so its
+                // "128x1856x2688" is ne[2]xne[1]xne[0]; reading the expert dim
+                // off ne[0] sets n_expert=2688 and every MoE layer is refused
+                // against expert_count. tools/cpu_expert_ceiling.cpp says this in
+                // its header for the same reason.
+                L.experts.n_expert = static_cast<i32>(src->ne[2]);
+                L.experts.n_ff_exp = static_cast<i64>(src->ne[1]);
+                L.experts.n_embd = static_cast<i64>(src->ne[0]);
+            }
 
-            // Shared expert (Qwen2-MoE): one always-on expert, small enough to
-            // keep resident.
-            L.shexp_gate =
-                upload_weight(blk_key("blk.%d.ffn_gate_shexp.weight", l), true, &e);
-            L.shexp_up =
-                upload_weight(blk_key("blk.%d.ffn_up_shexp.weight", l), true, &e);
-            L.shexp_down =
-                upload_weight(blk_key("blk.%d.ffn_down_shexp.weight", l), true, &e);
-            // Qwen3.5 gates the shared expert with a per-token scalar built
-            // from a 1-D row; the Qwen2/Qwen3 schema has no such vector.
+            // Shared expert (when the file declares one). Both Qwen2/Qwen3-MoE and
+            // nemotron_h_moe spell the shared expert as a 2-D gate/up/down set
+            // (ffn_gate_shexp / ffn_up_shexp / ffn_down_shexp). A file that carries
+            // this set does not carry ffn_gate_inp_shexp.
+            // Gated on up+down, not on the gate: nemotron_h_moe's shared
+            // expert is ffn_up_shexp/ffn_down_shexp with no ffn_gate_shexp, so
+            // requiring the gate skipped the shared expert entirely -- the same
+            // defect as the routed bank's, one tensor over. up/down are what
+            // every schema carries.
+            if (gguf_.tensor(blk_key("blk.%d.ffn_up_shexp.weight", l)) &&
+                gguf_.tensor(blk_key("blk.%d.ffn_down_shexp.weight", l))) {
+                L.shexp_gate = upload_weight(blk_key("blk.%d.ffn_gate_shexp.weight", l), true, &e);
+                L.shexp_up = upload_weight(blk_key("blk.%d.ffn_up_shexp.weight", l), true, &e);
+                L.shexp_down = upload_weight(blk_key("blk.%d.ffn_down_shexp.weight", l), true, &e);
+                L.shexp_up_scale =
+                    one_scale(blk_key("blk.%d.ffn_up_shexp.scale", l));
+                L.shexp_down_scale =
+                    one_scale(blk_key("blk.%d.ffn_down_shexp.scale", l));
+                L.shexp_gate_scale =
+                    one_scale(blk_key("blk.%d.ffn_gate_shexp.scale", l));
+            }
+            // Qwen3.5 gates the shared expert with a per-token scalar built from a
+            // 1-D row; the Qwen2/Qwen3/nemotron schema has no such vector.
             L.shexp_inp_gate =
                 upload_weight(blk_key("blk.%d.ffn_gate_inp_shexp.weight", l), true, &e);
         }
@@ -961,22 +1129,43 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
         // geometric sanity: the tensor schema must match the metadata
         if (L.gdn) {
-            // The recurrent block has no head geometry at all: one fused
+            // The gated-delta-net block has no head geometry at all: one fused
             // [q|k|v] projection and one output projection, both sized by the
-            // ssm.* keys.
-            if (L.wqkv.n_out != cfg_.ssm_conv_dim || L.wqkv.n_in != cfg_.n_embd) {
+            // ssm.* keys. nemotron's mamba-2 block has no wqkv or z gate at all
+            // (it projects straight to the block width with ssm_in), so its
+            // geometry is checked against ssm_in/ssm_out further down.
+            if (L.nemotron_ssm) {
+                // Mamba-2's in_proj is one fused row [xBC | z | dt]:
+                //   xBC = inner + 2*(n_group*d_state)   (the conv block)
+                //   z   = inner                          (the output gate)
+                //   dt  = n_heads                        (per-head step, softplus'd)
+                // time_step_rank doubles as the head count on this family.
+                const i64 bc_w = cfg_.ssm_inner_size +
+                                 2 * cfg_.ssm_key_dim;
+                const i64 in_w = bc_w + cfg_.ssm_inner_size + cfg_.ssm_dt_rank;
+                if (L.ssm_in.n_out != in_w || L.ssm_in.n_in != cfg_.n_embd) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) +
+                               " ssm_in disagrees with the declared ssm geometry";
+                    return false;
+                }
+                cfg_.ssm_conv_dim = static_cast<i32>(bc_w);
+            } else if (L.wqkv.n_out != cfg_.ssm_conv_dim ||
+                       L.wqkv.n_in != cfg_.n_embd) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
                            " attn_qkv disagrees with the declared ssm geometry";
                 return false;
             }
-            if (L.wqkv_gate.n_out != cfg_.ssm_value_dim) {
+            if (!L.nemotron_ssm && L.wqkv_gate.n_out != cfg_.ssm_value_dim) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
                            " attn_gate disagrees with ssm.inner_size";
                 return false;
             }
-            if (L.ssm_out.n_in != cfg_.ssm_value_dim || L.ssm_out.n_out != cfg_.n_embd) {
+            if (L.ssm_out.n_in != (L.nemotron_ssm ? cfg_.ssm_inner_size
+                                                  : cfg_.ssm_value_dim) ||
+                L.ssm_out.n_out != cfg_.n_embd) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
                            " ssm_out disagrees with ssm.inner_size/embedding_length";
@@ -989,24 +1178,49 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                            " ssm_conv1d disagrees with ssm.conv_kernel/inner_size";
                 return false;
             }
-            if (!L.ssm_dt || !L.ssm_a || !L.ssm_norm || !L.ssm_alpha.present() ||
-                !L.ssm_beta.present()) {
-                if (err)
-                    *err = "layer " + std::to_string(l) +
-                           " is missing its ssm state parameters";
-                return false;
+            if (L.nemotron_ssm) {
+                if (!L.ssm_dt || !L.ssm_a || !L.ssm_norm || !L.ssm_in.present() ||
+                    !L.ssm_out.present() || !L.ssm_conv1d.present()) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) +
+                               " is missing its nemotron ssm state parameters";
+                    return false;
+                }
+                // Mamba-2 D parameter is optional in this engine's schema; absent is
+                // fine, which is why has_d_param is a config flag rather than a load
+                // requirement.
+            } else {
+                if (!L.ssm_dt || !L.ssm_a || !L.ssm_norm || !L.ssm_alpha.present() ||
+                    !L.ssm_beta.present()) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) +
+                               " is missing its ssm state parameters";
+                    return false;
+                }
             }
-        } else {
+        } else if (L.moe) {
             // Qwen3.5's attending layers pack a per-head output gate into the
             // query projection, so its row count is twice the head width.
             // The head count is per *layer* on a hybrid stack (laguna runs 48
             // heads on its full layers and 72 on its windowed ones), so the
             // expected width is this layer's own -- comparing against the
             // model maximum would reject every layer that is not the widest.
+            //
+            // nemotron_h_moe's pure-MoE layers have no attention tensors, so
+            // the head-geometry check only applies to layers that carry one.
             const i64 lq_dim = head_at(l) * cfg_.head_dim;
+            // The KV width is this layer's own as well. The same reasoning as
+            // the query above applies to it with one extra case: head_count_kv
+            // is an array on a hybrid (nemotron_h_moe 0/2, gemma4 {1,8}), so
+            // comparing against the stack maximum refused every layer that does
+            // not carry the widest KV -- and reported it as the file disagreeing
+            // with its own declared geometry.
+            const i64 lkv_dim = kv_dim_at(l);
             const i64 expect_q = aspec.q_output_gate ? 2 * lq_dim : lq_dim;
-            if (L.wq.n_out != expect_q || L.wk.n_out != kv_dim ||
-                L.wv.n_out != kv_dim || L.wo.n_in != lq_dim) {
+            const bool layer_has_attn = L.wq.present();
+            if (layer_has_attn &&
+                (L.wq.n_out != expect_q || L.wk.n_out != lkv_dim ||
+                 L.wv.n_out != lkv_dim || L.wo.n_in != lq_dim)) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
                            " attention tensors disagree with the declared head geometry";
@@ -1023,17 +1237,46 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 return false;
             }
         }
-        if (!L.moe && (L.wgate.n_out != cfg_.n_ff || L.wdown.n_in != cfg_.n_ff)) {
+        if (!L.moe && has_dense_ffn &&
+            (L.wgate.n_out != cfg_.n_ff || L.wdown.n_in != cfg_.n_ff)) {
             if (err)
                 *err = "layer " + std::to_string(l) + " FFN tensors disagree with n_ff";
             return false;
         }
         if (L.moe) {
+            // ---- router geometry ------------------------------------------
             if (L.router.n_out != cfg_.n_expert || L.router.n_in != cfg_.n_embd) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
                            " router disagrees with expert_count/embedding_length";
                 return false;
+            }
+            // ---- routed-expert geometry (per-layer) ---------------------
+            // The expert tensors are only *described* here so the cache can know
+            // per-expert byte boundaries; nothing is uploaded at load time.
+            //
+            // Nemotron-style MoE (nemotron_h_moe) does not carry ffn_gate_exps,
+            // so the geometry is read off the up tensor instead. The sanity that
+            // matters for the forward path's intermediate workspace is the
+            // routed n_ff_exp; the shared-expert sanity is the one that gates the
+            // shared branch.
+            {
+                const GgufTensor *src = nullptr;
+                if (L.experts.up && L.experts.up->n_dims == 3)
+                    src = L.experts.up;
+                else if (L.experts.down && L.experts.down->n_dims == 3)
+                    src = L.experts.down;
+                // ffn_gate_exps (Qwen3) is also 3-D and can stand in when the
+                // up/down naming is the other convention.
+                else if (L.experts.gate && L.experts.gate->n_dims == 3)
+                    src = L.experts.gate;
+                if (src) {
+                    // Same ne order as the assignment site above: expert dim is
+                    // ne[2] for every converter seen so far.
+                    L.experts.n_expert = static_cast<i32>(src->ne[2]);
+                    L.experts.n_ff_exp = static_cast<i64>(src->ne[1]);
+                    L.experts.n_embd = static_cast<i64>(src->ne[0]);
+                }
             }
             if (L.experts.n_expert != cfg_.n_expert ||
                 L.experts.n_ff_exp != cfg_.n_ff_exp) {
@@ -1253,9 +1496,10 @@ void Model::unload() {
                                &L.wdown, &L.router, &L.shexp_gate, &L.shexp_up,
                                &L.shexp_down, &L.shexp_inp_gate, &L.wqkv,
                                &L.wqkv_gate, &L.wattn_gate, &L.ssm_conv1d,
-                               &L.ssm_out,
+                               &L.ssm_out, &L.ssm_in,
                                &L.ssm_alpha, &L.ssm_beta})
             if (q->present()) be_->release(q->data);
+        if (L.ssm_d) be_->release(L.ssm_d);
     }
     layers_.clear();
     for (auto &sg : had_signs_)

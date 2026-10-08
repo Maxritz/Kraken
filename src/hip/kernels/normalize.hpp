@@ -68,6 +68,41 @@ __global__ void __launch_bounds__(THREADS)
 }
 
 // ---------------------------------------------------------------------------
+// Grouped RMSNorm (Mamba-2's ssm_norm): one block per (token, group) row, whose
+// weight vector is that group's own -- out[r][i] = x[r][i] * rsqrt(mean + eps)
+// * w[(r % n_group) * width + i]. Structurally rmsnorm_kernel above; the only
+// additions are the row's group decomposition and the per-group weight select.
+// ---------------------------------------------------------------------------
+
+template <int THREADS>
+__global__ void __launch_bounds__(THREADS)
+    rmsnorm_grouped_kernel(_Float16 *__restrict__ out,
+                           const _Float16 *__restrict__ x,
+                           const f32 *__restrict__ w, i64 n_group, i64 width,
+                           i64 stride, f32 eps) {
+    const i64 r = blockIdx.x;
+    const i64 g = r % n_group;
+    const i64 base = (r / n_group) * stride + g * width;
+    const _Float16 *xr = x + base;
+    _Float16 *orow = out + base;
+    const f32 *wr = w + g * width;
+
+    f32 ss = 0.0f;
+    for (i64 i = threadIdx.x; i < width; i += THREADS)
+        ss += static_cast<f32>(xr[i]) * static_cast<f32>(xr[i]);
+    ss = block_reduce_sum<THREADS>(ss);
+
+    __shared__ f32 scale_sh;
+    if (threadIdx.x == 0)
+        scale_sh = rsqrtf(ss / static_cast<f32>(width) + eps);
+    __syncthreads();
+    const f32 scale = scale_sh;
+
+    for (i64 i = threadIdx.x; i < width; i += THREADS)
+        orow[i] = static_cast<_Float16>(static_cast<f32>(xr[i]) * scale * wr[i]);
+}
+
+// ---------------------------------------------------------------------------
 // Residual add folded into RMSNorm: out[r][i] = rmsnorm(x[r] + res[r]) * w[i],
 // with x[r] left holding the sum.
 //

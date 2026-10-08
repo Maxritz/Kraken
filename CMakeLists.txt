@@ -40,6 +40,22 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# Assertions off in every configuration that is not Debug, stated here rather
+# than left to CMake's compiler defaults.
+#
+# CMAKE_CXX_FLAGS_RELEASE is filled in by CMake's per-compiler platform module,
+# so it is only as good as the compiler's *identity*. Configure the tree with a
+# wrapper CMake cannot classify - CXX=hipcc, which a build dir of this project
+# has been configured with - and CMAKE_CXX_FLAGS_RELEASE comes out empty while
+# the cache still says Release. The project then sets -O3 by hand (krk_core,
+# krk_hip) and NDEBUG stays undefined: a Release build with assertions live, and
+# every number taken from it describes a different binary than the docs do. That
+# is not hypothetical - it is what build-hip/CMakeCache.txt held - and
+# scripts/build_check.sh section 2 counts -DNDEBUG per translation unit for
+# exactly this failure. Naming the definition means it holds for any compiler,
+# wrapper or not. Debug stays assertion-enabled.
+add_compile_options($<$<NOT:$<CONFIG:Debug>>:-DNDEBUG>)
+
 option(KRK_ENABLE_HIP "Build the HIP/ROCm backend" ON)
 option(KRK_BUILD_TESTS "Build the test suite" ON)
 set(KRK_GPU_TARGETS "gfx1031;gfx1201"

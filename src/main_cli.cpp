@@ -30,6 +30,7 @@ struct Args {
     int threads = 0;
     int expert_cache_mb = 0;    // MoE expert residency budget (MiB), 0 = auto
     int vram_cap_mb = 0;        // total device memory to plan for (MiB), 0 = policy
+    int vram_tier_gb = 0;       // plan for a card of this class (GiB), 0 = off
     int host_ram_mb = 0;        // host memory to plan for (MiB), 0 = policy
     int expert_cache_slots = 0; // MoE resident (layer, expert) slot cap, 0 = auto
     int expert_warm_mb = -1;     // MoE WARM tier in pageable host RAM (MiB): <0 auto, 0 off
@@ -110,11 +111,25 @@ void usage() {
         "                        to make a long context run by paging the\n"
         "                        overflow through WARM instead of refusing it.\n"
         "  --kv-warm-mb N         KV WARM tier in pageable host RAM, in MiB.\n"
-        "                        <0 (default) sizes it from the machine, 0 turns\n"
-        "                        it off so every miss re-reads from COLD.\n"
+        "                        <0 (default) sizes it from the geometry: with no\n"
+        "                        --kv-cold-dir it covers every KV-carrying layer,\n"
+        "                        because a page that fits nowhere is DROPPED, its\n"
+        "                        layer is zero-filled, and the run decodes WRONG\n"
+        "                        text. A smaller N is therefore obeyed only when a\n"
+        "                        spill directory exists; otherwise WARM is raised to\n"
+        "                        cover the cache and the deviation is reported.\n"
+        "                        Buffers are allocated lazily, so a big WARM costs\n"
+        "                        nothing until an eviction lands in it.\n"
         "  --kv-cold-dir DIR      KV COLD tier: spill directory for pages evicted\n"
         "                        past WARM. Unset (default) keeps them in RAM and\n"
-        "                        recomputes instead of writing.\n"
+        "                        recomputes instead of writing; a directory that\n"
+        "                        cannot be written is ignored and reported, since a\n"
+        "                        failed spill is a dropped page.\n"
+        "  --vram-tier N         plan for a card of this class, in GiB (8, 12,\n"
+        "                        16, 24 ...). Clamped to the card that is actually\n"
+        "                        installed, so `--vram-tier 12` on a 16 GiB box\n"
+        "                        behaves as the 12 GiB one does. The class form of\n"
+        "                        --vram-cap-mb, which wins if both are given.\n"
         "  --vram-cap-mb N       total device memory to plan for, in MiB. 0 uses\n"
         "                        the policy: 6 GiB, then +2 GiB at a time while\n"
         "                        the card has room and the model needs it, up to\n"
@@ -231,6 +246,8 @@ bool parse(int argc, char **argv, Args *a) {
             a->kv_cold_dir = next("--kv-cold-dir");
         else if (f == "--vram-cap-mb")
             a->vram_cap_mb = std::atoi(next("--vram-cap-mb"));
+        else if (f == "--vram-tier" || f == "--vram-tier-gb")
+            a->vram_tier_gb = std::atoi(next("--vram-tier"));
         else if (f == "--expert-cache-mb")
             a->expert_cache_mb = std::atoi(next("--expert-cache-mb"));
         else if (f == "--expert-cache-slots")
@@ -396,8 +413,8 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
             const f64 mig_mib = static_cast<f64>(ks.migrate_bytes) / 1048576.0;
             const f64 layer_mib = static_cast<f64>(ks.layer_bytes) / 1048576.0;
             std::fprintf(out,
-                         "[stats ] kv        tiered: %lld layers x %.2f MiB, "
-                         "%lld HOT slots (%.0f MiB) | promoted WARM->HOT %lld, "
+                         "[stats ] kv        tiered: %lld KV layer(s) x %.2f MiB per "
+                         "plane, %lld HOT slots (%.2f MiB VRAM) | promoted WARM->HOT %lld, "
                          "COLD->HOT %lld | evicted HOT->WARM %lld, ->COLD %lld | "
                          "%.1f MiB migrated\n",
                          static_cast<long long>(ks.layers), layer_mib,
@@ -407,6 +424,20 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                          static_cast<long long>(ks.promotions_from_cold),
                          static_cast<long long>(ks.evictions_to_warm),
                          static_cast<long long>(ks.evictions_to_cold), mig_mib);
+            // A dropped page is not a spilled one. `->COLD` above is a page on
+            // disk that comes back; this is a page that went nowhere, so its
+            // layer is zero-filled and the TEXT OF THIS RUN IS NOT
+            // TRUSTWORTHY. Printed last and in full sentences on purpose: the
+            // counter that used to absorb these said "->COLD", so a run that
+            // lost history every step read as a working disk tier.
+            if (ks.evictions_dropped > 0) {
+                std::fprintf(out,
+                             "[stats ] kv        DROPPED %lld page(s) with nowhere "
+                             "to put them: their KV is gone and their layers "
+                             "were zero-filled. THIS RUN'S OUTPUT IS WRONG -- "
+                             "raise --kv-warm-mb or set --kv-cold-dir.\n",
+                             static_cast<long long>(ks.evictions_dropped));
+            }
         } else {
             std::fprintf(out,
                          "[stats ] kv        flat: whole cache resident in VRAM "
@@ -685,6 +716,7 @@ int main(int argc, char **argv) {
     cfg.seed = a.seed;
     cfg.expert_cache_mb = a.expert_cache_mb;
     cfg.vram_cap_mb = a.vram_cap_mb;
+    cfg.vram_tier_gb = a.vram_tier_gb;
     cfg.host_ram_mb = a.host_ram_mb;
     cfg.expert_cache_slots = a.expert_cache_slots;
     cfg.expert_warm_mb = a.expert_warm_mb;

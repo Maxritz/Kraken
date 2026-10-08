@@ -315,10 +315,24 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         conv_state_span_ = static_cast<i64>(mc.ssm_d_conv - 1) * conv_dim_;
         rec_state_span_ = static_cast<i64>(mc.ssm_dt_rank) * mc.ssm_d_state *
                           mc.ssm_d_state;
+        // nemotron's mamba-2 blocks carry their state in the [head][p][s]
+        // layout the SSD scan wants (dt_rank = n_heads, head_dim =
+        // d_inner / n_heads): n_head * head_dim * d_state f32 per layer.
+        if (mc.nemotron_moe)
+            mamba2_state_span_ = static_cast<i64>(mc.ssm_dt_rank) *
+                                 (mc.ssm_inner_size / mc.ssm_dt_rank) *
+                                 mc.ssm_d_state;
+        // The fused [z|xBC|dt] projection row is wider than the conv row the
+        // GDN path sizes ws_qkv_ for (10304 vs 6144 on nemotron-30B).
+        if (mc.nemotron_moe)
+            ws_m2in_ = alloc(static_cast<size_t>(C * (conv_dim_ + value_dim_ +
+                                                      mc.ssm_dt_rank)) * as);
         conv_state_ = alloc(static_cast<size_t>(rec_layers_) *
                             static_cast<size_t>(conv_state_span_) * sizeof(f32));
         rec_state_ = alloc(static_cast<size_t>(rec_layers_) *
-                           static_cast<size_t>(rec_state_span_) * sizeof(f32));
+                           static_cast<size_t>(mamba2_state_span_ > 0
+                               ? mamba2_state_span_ : rec_state_span_) *
+                           sizeof(f32));
     }
     logits_host_ = static_cast<f32 *>(host_alloc(static_cast<size_t>(n_vocab_) * 4));
     tok_scratch_.resize(static_cast<size_t>(C));
@@ -392,10 +406,26 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // allocated on top of them. Subtracting "what the workspaces will take"
     // is not the same thing as measuring it, and guessing it is how an
     // over-commit happens. So: take the measurement after the fact.
+    size_t kv_load_bytes = 0; // both planes, for the load report below
     {
-        const size_t layer_bytes = static_cast<size_t>(kv_cap_) *
-                                   static_cast<size_t>(kv_dim_) * as;
-        const size_t kv_total = static_cast<size_t>(mc.n_layer) * layer_bytes * 2u;
+        // Per-layer KV bytes. Only the layers that carry q/k/v hold KV at all
+        // (nemotron_h_moe: 6 of its 52) and each holds the plane its own width
+        // asks for, so the charge is their sum. `n_layer x the widest layer` is
+        // what this used to be, and on that model it reserved and printed
+        // 208 MiB at --ctx 4096 for the 24 MiB its KV can occupy -- 8.67x. It
+        // is not only a reporting number: it is what the flat-or-tiered test in
+        // KvTierCache::init compares a budget against.
+        std::vector<size_t> kv_len(static_cast<size_t>(mc.n_layer), 0);
+        size_t kv_plane = 0;
+        for (i32 l = 0; l < mc.n_layer; l++) {
+            if (!model_.layer_has_kv(l)) continue;
+            const size_t b = static_cast<size_t>(kv_cap_) *
+                             static_cast<size_t>(model_.kv_dim_at(l)) * as;
+            kv_len[static_cast<size_t>(l)] = b;
+            kv_plane += b;
+        }
+        const size_t kv_total = kv_plane * 2u;
+        kv_load_bytes = kv_total;
 
         // Leave a reserve so a later allocation cannot wedge the driver. The
         // device is shared: the desktop compositor and any other app are
@@ -429,21 +459,110 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // no host-memory query in the Backend interface, the honest auto is
         // "enough to hold whatever does not fit HOT" -- bounded by the KV
         // itself, so it cannot outgrow the machine. Explicit --kv-warm-mb wins.
-        const size_t overflow = kv_total > hot ? kv_total - hot : 0;
-        size_t warm = overflow;
+        //
+        // "Whatever does not fit HOT" is the whole cache, not the cache minus
+        // the HOT bytes: the tiers must JOINTLY cover every KV-carrying layer,
+        // because a layer in neither tier is zero-filled when it is next needed
+        // and its history is lost silently. Sizing WARM to `kv_total - hot`
+        // misses that by the slot rounding -- measured, SmolLM2 --ctx 512 with
+        // --kv-hot-mb 1: 2 HOT + 26 WARM slots for 30 KV layers, 132 dropped
+        // pages in a 32-token run, and text that diverges from the flat cache.
+        // Passing the plane total makes the cache cover every layer (see
+        // KvTierCache::init) and costs host RAM only if the KV is ever paged
+        // out to it, since WARM buffers are allocated lazily.
+        size_t warm = kv_total;
         if (cfg_.kv_warm_mb >= 0)
             warm = static_cast<size_t>(cfg_.kv_warm_mb) * 1048576u;
-        else if (warm > kv_total)
-            warm = kv_total;
 
         // Two planes share both budgets.
-        if (!kvt_k_.init(be_, mc.n_layer, layer_bytes, hot / 2u, warm / 2u,
-                         cfg_.kv_cold_dir, err) ||
-            !kvt_v_.init(be_, mc.n_layer, layer_bytes, hot / 2u, warm / 2u,
-                         cfg_.kv_cold_dir, err)) {
+        // The plane tag is not decoration: both caches share one cold
+        // directory, so without it they spill to the same file name and a
+        // restore returns the other plane's KV.
+        if (!kvt_k_.init(be_, mc.n_layer, kv_len, hot / 2u, warm / 2u,
+                         cfg_.kv_cold_dir, "k", err) ||
+            !kvt_v_.init(be_, mc.n_layer, kv_len, hot / 2u, warm / 2u,
+                         cfg_.kv_cold_dir, "v", err)) {
             model_.unload();
             be_ = nullptr;
             return false;
+        }
+        // Geometry, reported once here rather than by each plane: both planes
+        // have the same numbers, and a per-plane warning printed every line
+        // twice. Neither message changes a policy -- the A/B numbers in
+        // docs/test-results.md were produced by these configurations and a
+        // silent second-guess would invalidate them -- but one of them says the
+        // run cannot be correct, and that must not be left to be inferred from
+        // a slowdown.
+        if (kvt_k_.tiered()) {
+            const i64 holds = kvt_k_.hot_slots();
+            const i64 layers = kvt_k_.kv_layers();
+            const f64 plane_mib =
+                static_cast<f64>(kvt_k_.plane_bytes()) / 1048576.0;
+            if (holds < layers) {
+                KRK_WARN("kv: HOT tier holds %lld slot(s) for %lld KV layer(s), "
+                         "so the resident set cannot hold one full pass over "
+                         "the model. Expect one migration per layer per decode "
+                         "step with no reuse (measured up to 206x slower than "
+                         "fitting flat). If the card can hold the whole cache, "
+                         "raise --kv-hot-mb to at least %.1f MiB and this "
+                         "disappears; if it cannot, the run is memory-bound by "
+                         "construction and only --ctx or a smaller model "
+                         "changes it.",
+                         static_cast<long long>(holds),
+                         static_cast<long long>(layers), plane_mib);
+            }
+            // The WARM capacity is derived from the geometry, so a budget that
+            // is too small for one pass is raised rather than obeyed -- tell
+            // the caller, because it is their flag that changed and it changes
+            // how much host RAM the run may touch.
+            if (kvt_k_.warm_from_geometry()) {
+                const f64 applied_mib =
+                    static_cast<f64>(kvt_k_.warm_slots() *
+                                     kvt_k_.slot_bytes() * 2u) / 1048576.0;
+                const f64 asked_mib = static_cast<f64>(kvt_k_.warm_slots_from_budget() *
+                                                       kvt_k_.slot_bytes() * 2u) /
+                                      1048576.0;
+                KRK_WARN("kv: --kv-warm-mb allows %.1f MiB of WARM for %lld KV "
+                         "layer(s) and one pass needs all of them, and there is "
+                         "no --kv-cold-dir to spill to, so WARM was raised to "
+                         "%lld slot(s) = %.1f MiB. A page that fits nowhere is "
+                         "DROPPED and its layer is zero-filled on its next step, "
+                         "which decodes WRONG text, so the budget is not obeyed "
+                         "unless a spill directory exists. WARM is allocated "
+                         "lazily, so this costs nothing until an eviction "
+                         "actually lands there; raise --kv-hot-mb (%.2f MiB per "
+                         "slot) if it must not page through host memory, or set "
+                         "--kv-cold-dir to keep the smaller WARM.",
+                         asked_mib, static_cast<long long>(layers),
+                         static_cast<long long>(kvt_k_.warm_slots()), applied_mib,
+                         static_cast<f64>(kvt_k_.slot_bytes()) / 1048576.0);
+            }
+            if (kvt_k_.cold_dir_rejected()) {
+                KRK_WARN("kv: --kv-cold-dir '%s' is not writable, so it was "
+                         "ignored and evictions are held in WARM instead. A "
+                         "spill that fails on fopen/fwrite is a DROPPED page, "
+                         "which is a wrong decode, so an unwritable directory "
+                         "is treated as no directory. Create it and re-run to "
+                         "use the disk tier.",
+                         cfg_.kv_cold_dir.c_str());
+            }
+            // Defensive only: with no cold dir, init pins the WARM capacity at
+            // the KV-layer count, so HOT + WARM covers one pass by
+            // construction (see KvTierCache::init). If this ever prints, the
+            // enforcement in init is what broke, not the caller's flags.
+            if (holds + kvt_k_.warm_slots() < layers && cfg_.kv_cold_dir.empty()) {
+                KRK_WARN("kv: HOT %lld + WARM %lld slot(s) for %lld KV layer(s) "
+                         "and no --kv-cold-dir: the tiers cannot hold one pass "
+                         "over the cache, so a page that fits nowhere is "
+                         "DROPPED and its layer is zero-filled on the next step. "
+                         "The run will still produce text and the text will be "
+                         "wrong. Raise --kv-warm-mb to at least %.1f MiB, or set "
+                         "--kv-cold-dir so the overflow has somewhere to spill.",
+                         static_cast<long long>(holds),
+                         static_cast<long long>(kvt_k_.warm_slots()),
+                         static_cast<long long>(layers),
+                         static_cast<f64>(kv_total) / 1048576.0);
+            }
         }
         KvTierStats ks;
         kvt_k_.stats(&ks);
@@ -459,19 +578,27 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     be_->sync();
 
     const f64 load_ms = load_timer.ms();
+    // The KV the model actually has, both planes: the sum over the KV-carrying
+    // layers of their own width, not n_layer x the widest.
     const f64 total_vram_mb =
-        static_cast<f64>(mc.n_layer) * static_cast<f64>(kv_cap_) *
-        static_cast<f64>(kv_dim_) * static_cast<f64>(as) * 2.0 / (1024.0 * 1024.0);
+        static_cast<f64>(kv_load_bytes) / (1024.0 * 1024.0);
     {
         KvTierStats ks;
         kvt_k_.stats(&ks);
+        // Capacity, not occupancy: `ks.warm` is how many layers happen to be
+        // in WARM at the instant of the call, which at load time is always 0
+        // and reads as "WARM holds nothing" on a run that has a full WARM.
+        // What a reader needs is whether the tiers can hold one pass, and that
+        // is the three counts on the left.
         if (ks.tiered)
-            KRK_INFO("kv tiered: %lld layers, %lld HOT slots of %.0f MiB, "
-                     "layer=%.1f MiB, WARM budget=%lld layers",
-                     (long long)ks.layers, (long long)ks.slots,
-                     static_cast<double>(ks.hot_bytes) / 1048576.0,
+            KRK_INFO("kv tiered: %lld KV layer(s) of %.0f MiB, %lld HOT + %lld "
+                     "WARM slot(s) of %.2f MiB (largest layer), %.2f MiB VRAM "
+                     "for HOT",
+                     static_cast<long long>(ks.layers), total_vram_mb,
+                     static_cast<long long>(ks.slots),
+                     static_cast<long long>(kvt_k_.warm_slots()),
                      static_cast<double>(ks.layer_bytes) / 1048576.0,
-                     (long long)ks.slots);
+                     static_cast<double>(ks.hot_bytes) / 1048576.0);
         else
             KRK_INFO("workspaces ready: chunk=%d ctx=%lld KV=%.0f MiB (load %.0f ms)",
                      chunk_, static_cast<long long>(kv_cap_), total_vram_mb, load_ms);
@@ -510,6 +637,7 @@ void Engine::shutdown() {
                      &ws_router_,
                      &ws_ffn_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
                      &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
+                     &ws_m2in_,
                      &conv_state_, &rec_state_, &topk_scratch_, &topk_out_}) {
         if (*p) {
             be_->release(*p);
@@ -531,16 +659,76 @@ void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
                       i64 rows) {
     if (dump_path_.empty() || rows <= 0) return;
     be_->sync();
-    std::vector<f32> row(static_cast<size_t>(width));
-    be_->download_f32(row.data(),
-                      act_at(const_cast<void *>(buf), be_->act_size(),
-                             (rows - 1) * width),
-                      width);
+    // Two shapes of trace, because one row cannot answer every question.
+    //
+    // KRK_DUMP (this mode): the last row, one value per element. A device run
+    // and a --cpu run of the same prompt then walk the same lines in the same
+    // order and the first line that differs names the broken stage.
+    //
+    // KRK_DUMP_FULL=1: a SUMMARY of the whole tensor instead -- how many
+    // elements are non-finite, in how many rows, the peak, and where the first
+    // one is. The single-row trace is structurally blind to a defect that only
+    // touches some rows: attention is the one cross-row op in a layer, so a
+    // NaN in one cached key row poisons every output row while the row the
+    // trace prints stays finite. That is exactly how the nemotron NaN hid --
+    // finite q and k on the printed row, all-NaN attn.out -- and this mode is
+    // what makes the difference visible in one run.
+    static const bool full = [] {
+        const char *e = std::getenv("KRK_DUMP_FULL");
+        return e && e[0] != '0';
+    }();
+    i64 row0 = rows - 1;
+    if (const char *rs = std::getenv("KRK_DUMP_ROW")) {
+        const long long v = std::atoll(rs);
+        if (v >= 0 && v < rows) row0 = v;
+    }
+    const i64 nrow = full ? rows : 1;
+    const i64 off = full ? 0 : row0 * width;
+    std::vector<f32> vals(static_cast<size_t>(nrow) * static_cast<size_t>(width));
+    // One download for the whole span: the activation buffer is [rows, width]
+    // contiguous, which is what lets the offset above be an element count.
+    be_->download_f32(vals.data(),
+                      act_at(const_cast<void *>(buf), be_->act_size(), off),
+                      static_cast<i64>(vals.size()));
     std::FILE *f = std::fopen(dump_path_.c_str(), "a");
     if (!f) return;
+    if (full) {
+        i64 nf = 0, bad_rows = 0, first = -1;
+        f64 peak = 0.0, sumsq = 0.0;
+        for (i64 r = 0; r < nrow; r++) {
+            bool row_bad = false;
+            for (i64 i = 0; i < width; i++) {
+                const f32 v = vals[static_cast<size_t>(r * width + i)];
+                // A NaN fails every comparison, so this is the finite test
+                // without an isfinite() that the device type would not have.
+                if (!(v == v) || v > 3.0e38f || v < -3.0e38f) {
+                    nf++;
+                    row_bad = true;
+                    if (first < 0) first = r * width + i;
+                    continue;
+                }
+                const f64 a = std::fabs(static_cast<f64>(v));
+                if (a > peak) peak = a;
+                sumsq += a * a;
+            }
+            if (row_bad) bad_rows++;
+        }
+        const f64 rms = sumsq > 0.0
+                            ? std::sqrt(sumsq / static_cast<f64>(nrow * width))
+                            : 0.0;
+        std::fprintf(f,
+                     "%s L%02d N=%lld W=%lld nf=%lld badrows=%lld first=%lld "
+                     "peak=%.6g rms=%.6g\n",
+                     what, layer, static_cast<long long>(rows),
+                     static_cast<long long>(width), static_cast<long long>(nf),
+                     static_cast<long long>(bad_rows),
+                     static_cast<long long>(first), peak, rms);
+        std::fclose(f);
+        return;
+    }
     std::fprintf(f, "%s L%02d n=%lld", what, layer, static_cast<long long>(rows));
     for (i64 i = 0; i < width; i++)
-        std::fprintf(f, " %.7g", row[static_cast<size_t>(i)]);
+        std::fprintf(f, " %.7g", vals[static_cast<size_t>(i)]);
     std::fputc('\n', f);
     std::fclose(f);
 }
@@ -610,7 +798,12 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     d.hd = mc.head_dim;
     d.n_tok = n;
     d.pos0 = pos0;
-    d.layer_stride = kv_cap_ * kv_dim_;
+    // Both of these are per layer and are set again inside the loop. The cache
+    // hands out a per-layer base (so the stride is 0, see the residency call
+    // below) and the row stride is the layer's own width, which is not one
+    // number on a stack whose layers hold different amounts of KV. What is
+    // here is the workspace bound, and every use after the loop overwrites it.
+    d.layer_stride = 0;
     d.pos_stride = kv_dim_;
     d.layer = 0;
     d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(mc.head_dim))) *
@@ -639,6 +832,13 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         const i64 lh = model_.n_head_at(l);
         const i64 lq = model_.q_dim_at(l);
         const i64 lq_proj = packed_gate ? 2 * lq : lq;
+        // ... and the KV side is per layer for the same reason: a hybrid keeps
+        // KV on some layers and not others (nemotron_h_moe: 6 of 52), and the
+        // layers that do keep it need not carry the same head count (gemma4
+        // declares {1,8}). kv_dim_/mc.n_head_kv are the stack maximum, which is
+        // what the shared workspaces are sized against and nothing else.
+        const i64 lkv = model_.kv_dim_at(l);
+        const i64 lkvh = model_.n_head_kv_at(l);
         // The attention descriptor carries the layer's own head count, not the
         // stack's maximum. On a hybrid stack (laguna) those differ, and the
         // count is not just a loop bound: the op derives the GQA grouping from
@@ -649,6 +849,8 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // held, which is why the same prompt answered differently at different
         // prefill chunk sizes.
         d.n_head = lh;
+        d.n_kv = lkvh;
+        d.pos_stride = lkv;
         // A sliding-window layer sees only its last `swa_window` keys; the full
         // layers of the same stack see the whole prefix.
         d.window = (mc.swa_window > 0 && model_.is_swa(l)) ? mc.swa_window : 0;
@@ -657,16 +859,36 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, n, n_embd_, mc.rms_eps);
 
         if (L.gdn) {
-            // Recurrent layer: a short conv plus the delta rule replaces
-            // attention entirely, and there is nothing to append to the KV
-            // cache. The residual lands in ws_x_ before the FFN below.
-            gdn_forward(L, l, n);
-            be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps);
-            if (L.moe) {
-                moe_ffn(L, l, n);
+            // nemotron_h_moe Mamba-2 SSM layer
+            if (L.nemotron_ssm) {
+                // nemotron_h_moe Mamba-2 block. NOT the gated delta net: the
+                // file carries no alpha/beta. Its recurrence is the SSD scan
+                // over (xBC, dt, A); the scan performs all per-head prep, the
+                // softmax free out-gate, and the per-group norm that follow it
+                // are ordinary engine ops (see mamba2_forward).
+                mamba2_forward(L, l, n);
             } else {
-                dense_ffn(L, l, n);
+                // Recurrent layer: a short conv plus the delta rule replaces
+                // attention entirely, and there is nothing to append to the KV
+                // cache. The residual lands in ws_x_ before the FFN below.
+                gdn_forward(L, l, n);
             }
+            // nemotron's mamba-2 blocks have no FFN after the block; only
+            // layers that carry FFN weights run one.
+            if (!L.nemotron_ssm || L.moe || L.wgate.present()) {
+                be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps);
+                dump_row("ffn.pre", l, ws_xn_, n_embd_, n);
+                if (L.moe) {
+                    moe_ffn(L, l, n);
+                } else {
+                    dense_ffn(L, l, n);
+                }
+            }
+            // The residual leaving a recurrent (or skipped) block: on a stack
+            // where the recurrent half is stubbed out this is the only place to
+            // see whether the stream is still growing, and it is what localized
+            // the nemotron NaN (layer 15 -> 17).
+            dump_row("rec.post", l, ws_x_, n_embd_, n);
             dump_stage("gdn", l);
             continue;
         }
@@ -680,6 +902,12 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // else reads it -- laguna's output gate when only the projections are
         // folded, and the delta-net layer's ssm_alpha/ssm_beta, which no file
         // folds because they are not matmul sites in the fork either.
+        // nemotron_h_moe runs 6 of its 52 layers with attention; the rest of
+        // its non-mamba layers are pure-MoE blocks with nothing to attend
+        // over. The attention machinery below requires q/k/v/output, so a
+        // layer without them takes the short path: the residual is unchanged,
+        // and the FFN block reads the norm of the same stream.
+        if (L.wq.present()) {
         const void *xn_att = ws_xn_;
         if (L.h_attn_in || L.h_attn_gate) {
             had_xform(ws_had_, ws_xn_, n, n_embd_, false, false);
@@ -690,13 +918,13 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         if (L.wq.type == L.wk.type && L.wk.type == L.wv.type) {
             void *qkv[3] = {q_out, ws_k_, ws_v_};
             const void *wqkv[3] = {L.wq.data, L.wk.data, L.wv.data};
-            const i64 nqkv[3] = {lq_proj, kv_dim_, kv_dim_};
+            const i64 nqkv[3] = {lq_proj, lkv, lkv};
             be_->gemm_group(qkv, xn_proj, wqkv, L.wq.type,
                             nqkv, n_embd_, 3, n);
         } else {
             be_->gemm(q_out, xn_proj, L.wq.data, L.wq.type, lq_proj, n_embd_, n);
-            be_->gemm(ws_k_, xn_proj, L.wk.data, L.wk.type, kv_dim_, n_embd_, n);
-            be_->gemm(ws_v_, xn_proj, L.wv.data, L.wv.type, kv_dim_, n_embd_, n);
+            be_->gemm(ws_k_, xn_proj, L.wk.data, L.wk.type, lkv, n_embd_, n);
+            be_->gemm(ws_v_, xn_proj, L.wv.data, L.wv.type, lkv, n_embd_, n);
         }
 
         // Qwen3.5 interleaves each head's output gate into the query
@@ -712,14 +940,14 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         }
 
         if (L.q_bias) be_->add_bias_rows(ws_q_, L.q_bias, lq, n);
-        if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, kv_dim_, n);
-        if (L.v_bias) be_->add_bias_rows(ws_v_, L.v_bias, kv_dim_, n);
+        if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, lkv, n);
+        if (L.v_bias) be_->add_bias_rows(ws_v_, L.v_bias, lkv, n);
 
         // qk_norm_wide is OLMoE's whole-row convention; false is the per-head
         // one Qwen3 and Gemma3 use. Decided once at load from the stored
         // weight width -- see ModelConfig::qk_norm_wide.
         if (mc.qk_norm)
-            be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, lh, mc.n_head_kv,
+            be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, lh, lkvh,
                          mc.head_dim, n, mc.rms_eps, mc.qk_norm_wide);
 
         d.layer = l;
@@ -765,7 +993,7 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                                       ws_k_, ws_v_, d,
                                       model_.inv_freq_at(l).data(),
                                       mc.rope_scale, model_.rope_frac_at(l)))) {
-            be_->rope(ws_q_, ws_k_, lh, mc.n_head_kv, mc.head_dim,
+            be_->rope(ws_q_, ws_k_, lh, lkvh, mc.head_dim,
                       n, pos0, model_.inv_freq_at(l).data(), mc.rope_scale,
                       model_.rope_frac_at(l), mc.rope_neox);
             be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
@@ -782,7 +1010,11 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // projection, and agreeing inputs with a wrong "out" is the attention
         // kernel itself.
         dump_row("attn.q", l, ws_q_, lq, n);
-        dump_row("attn.k", l, ws_k_, kv_dim_, n);
+        dump_row("attn.k", l, ws_k_, lkv, n);
+        // v is the one buffer between the projections and the output that no
+        // other stage covers: a NaN here and a NaN in the cache produce the
+        // same all-NaN attn.out, and this tells them apart.
+        dump_row("attn.v", l, ws_v_, lkv, n);
         dump_row("attn.out", l, ws_attn_, lq, n);
 
         // laguna's output gate: a separate [n_head] projection of the same
@@ -825,12 +1057,29 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // normalizes.
         be_->add_rmsnorm(ws_xn_, ws_x_, ws_x2_, L.ffn_norm, n, n_embd_,
                          mc.rms_eps);
+        } else {
+            // Pure-MoE block: no attention to fold in, so the FFN input norm
+            // is applied straight to the residual.
+            be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps);
+            dump_row("ffn.pre", l, ws_xn_, n_embd_, n);
+        }
         dump_row("attn.res", l, ws_x_, n_embd_, n);
 
         dump_row("attn.ffnn", l, ws_xn_, n_embd_, n);
+        // A layer runs an FFN only if it carries FFN weights, and this branch
+        // needs the guard as much as the recurrent one below: nemotron_h_moe's
+        // six attention layers (L05/12/19/26/33/42 on the 30B file) are
+        // attention-ONLY -- the checkpoint has attn_q/k/v/output and nothing
+        // else for them, no gate, no up, no down. Running dense_ffn() there
+        // reads a null gate: on the device the unnamed type makes the GEMM
+        // write zero, so the block is inert and the stage dump reads exactly 0;
+        // on the CPU the destination buffers are never written and hold
+        // whatever the previous layer left, which measured 6.2e6 into the gate
+        // and 1.6e11 into the residual at L05 -- the whole reference arm past
+        // that layer, and every token it emits, is that buffer's contents.
         if (L.moe) {
             moe_ffn(L, l, n);
-        } else {
+        } else if (L.wgate.present()) {
             dense_ffn(L, l, n);
         }
         dump_stage("attn", l);
@@ -937,11 +1186,15 @@ bool Engine::kv_rollback(i64 pos) {
 
 void Engine::kv_rollback_zero(i64 pos) {
     const size_t as = be_->act_size();
-    const size_t row = static_cast<size_t>(kv_dim_) * as;
     for (i64 l = 0; l < model_.cfg().n_layer; l++) {
+        // Per layer: only the KV-carrying layers have a plane to zero (a mamba
+        // or pure-MoE block never appended anything, and base() answers nullptr
+        // for them), and the row stride is that layer's own width.
+        if (!model_.layer_has_kv(l)) continue;
+        const size_t row = static_cast<size_t>(model_.kv_dim_at(l)) * as;
         u8 *kb = static_cast<u8 *>(kvt_k_.base(l)) + static_cast<size_t>(pos) * row;
         u8 *vb = static_cast<u8 *>(kvt_v_.base(l)) + static_cast<size_t>(pos) * row;
-        if (!kb || !vb) return;
+        if (!kb || !vb) continue;
         be_->fill0(kb, (static_cast<size_t>(kv_pos_) - static_cast<size_t>(pos)) * row);
         be_->fill0(vb, (static_cast<size_t>(kv_pos_) - static_cast<size_t>(pos)) * row);
     }
@@ -989,10 +1242,22 @@ void Engine::configure_expert_cache() {
     const size_t hard =
         total_vram > kReserve ? total_vram - kReserve : total_vram / 2;
 
-    size_t vram_cap = 0;
+    // An explicit restriction wins over the policy. --vram-cap-mb is the exact
+    // form and --vram-tier is the class form of the same thing, the twin of
+    // --ram-tier: "behave as if the card were this big, in GiB". The tier is
+    // clamped to the card actually installed, so a plan made for the 12 GiB
+    // machine is safe on the 16 GiB one, and both are clamped to the headroom
+    // the policy itself would refuse to plan for.
+    size_t want = 0;
     if (cfg_.vram_cap_mb > 0) {
-        vram_cap = static_cast<size_t>(cfg_.vram_cap_mb) * 1024u * 1024u;
-        if (vram_cap > hard) vram_cap = hard;
+        want = static_cast<size_t>(cfg_.vram_cap_mb) * 1024u * 1024u;
+    } else if (cfg_.vram_tier_gb > 0) {
+        want = static_cast<size_t>(cfg_.vram_tier_gb) << 30;
+        if (total_vram > 0 && want > total_vram) want = total_vram;
+    }
+    size_t vram_cap = 0;
+    if (want > 0) {
+        vram_cap = want > hard ? hard : want;
     } else {
         vram_cap = kCapFirst < hard ? kCapFirst : hard;
         while (vram_cap < kCapMax && vram_cap + kCapStep <= hard &&
@@ -1037,19 +1302,34 @@ void Engine::configure_expert_cache() {
                      static_cast<f64>(budget) / (1024.0 * 1024.0));
         }
     }
-    KRK_INFO("vram policy: %.1f GiB cap (%.1f GiB already in use, %.1f GiB "
+    KRK_INFO("vram policy: %.1f GiB cap%s (%.1f GiB already in use, %.1f GiB "
              "demand, %.1f GiB free of %.1f GiB) -> expert budget %.1f MiB",
              static_cast<f64>(vram_cap) / static_cast<f64>(gib),
+             (cfg_.vram_tier_gb > 0 && cfg_.vram_cap_mb <= 0)
+                 ? " [planned for the --vram-tier class]"
+                 : (cfg_.vram_cap_mb > 0 ? " [--vram-cap-mb]" : ""),
              static_cast<f64>(used_now) / static_cast<f64>(gib),
              static_cast<f64>(demand) / static_cast<f64>(gib),
              static_cast<f64>(free_now) / static_cast<f64>(gib),
              static_cast<f64>(total_vram) / static_cast<f64>(gib),
              static_cast<f64>(budget) / (1024.0 * 1024.0));
 
+    // The number of device slots the budget above is sized for, when this code
+    // knows it exactly rather than estimating it. Two cases do: an explicit
+    // --expert-cache-slots N is a count and is enforced as one, and a budget
+    // that covers the whole routed set is the set. In between, the cache derives
+    // the number from the bytes, because a corpus can mix expert sizes (a
+    // Q4_K_M file mixes Q4_K and Q6_K down-projections) and then no single
+    // per-slot figure is the truth: on Qwen3-MoE-4x0.6B the estimate reads 104
+    // at one layer and 126 at the next while the budget covers all 112.
+    size_t slot_budget = 0;
     if (cfg_.expert_cache_slots > 0) {
         const size_t one = model_.max_expert_bytes();
         if (one > 0)
             budget = one * static_cast<size_t>(cfg_.expert_cache_slots);
+        slot_budget = static_cast<size_t>(cfg_.expert_cache_slots);
+    } else if (total_bytes > 0 && budget >= total_bytes) {
+        slot_budget = model_.expert_slot_count();
     }
 
     // WARM is sized independently of the device budget: VRAM holds what is
@@ -1157,7 +1437,7 @@ void Engine::configure_expert_cache() {
                  cfg_.expert_warm_mb == 0 ? " (disabled by --expert-warm-mb 0)"
                                           : "");
 
-    model_.set_expert_budget(budget, warm);
+    model_.set_expert_budget(budget, warm, slot_budget);
 
     // Prefetch is opt-in. Read-through admits every expert the run actually
     // touches, so an eager sweep of the corpus is only worth its wall time when
@@ -1365,8 +1645,120 @@ void Engine::recurrent_reset() {
     if (!conv_state_ || !rec_state_) return;
     be_->fill0(conv_state_, static_cast<size_t>(rec_layers_) *
                                   static_cast<size_t>(conv_state_span_) * sizeof(f32));
+    // The mamba-2 span and the GDN span are the same allocation site: the
+    // recomputed version says exactly how much the scan owns, and fill0
+    // zeroes the real span whichever layout the model uses.
+    const i64 rs = mamba2_state_span_ > 0 ? mamba2_state_span_ : rec_state_span_;
     be_->fill0(rec_state_, static_cast<size_t>(rec_layers_) *
-                                 static_cast<size_t>(rec_state_span_) * sizeof(f32));
+                                 static_cast<size_t>(rs) * sizeof(f32));
+}
+
+// The Mamba-2 block forward (nemotron_h / nemotron_h_moe). The engine does
+// everything the GDN path does in the same op order — projection, short conv
+// (with this block's bias), scan, gate, norm, out-projection, residual —
+// leaving only the recurrence itself to Backend::ssd_scan, whose scalar
+// implementation is the reference the device kernel is checked against.
+//
+// The fused ssm_in row is [z | xBC | dt]: z first (d_inner), then xBC
+// (d_inner + 2*n_group*d_state, convolved), then dt (n_heads). The row that
+// feeds the scan is the POST-CONV buffer, so ws_qkv_ is rearranged into
+// [xBC | dt] order once after the conv — z is copied out at projection time
+// because the conv would otherwise have to know to skip it.
+void Engine::mamba2_forward(const LayerWeights &L, i32 l, i32 n) {
+    const ModelConfig &mc = model_.cfg();
+    const size_t as = be_->act_size();
+    const i64 inner = value_dim_;   // nemotron: ssm_value_dim == inner_size
+    const i64 cdim = conv_dim_;     // inner + 2*n_group*d_state
+    const i64 n_head = mc.ssm_dt_rank;
+    const i64 hd = inner / n_head;
+    const i32 ksize = mc.ssm_d_conv;
+    const i32 ri = model_.recurrent_index(l);
+    dump_row("m2.enter", l, ws_x_, n_embd_, n);
+
+    // 1. The fused [z | xBC | dt] projection as THREE GEMMs over the weight's
+    //    output-channel regions — the split lands z, xBC and dt exactly in
+    //    their final buffers (dt straight into ws_beta_, where the scan reads
+    //    it), so no activation row is ever touched on the host: activations
+    //    live in device memory, and the only correct split of a fused weight
+    //    is a split of the weight. `ssm_in` is [n_embd, 10304] laid out as
+    //    [z(4096) | xBC(6144) | dt(64)] output channels.
+    //
+    //    THE ROW STRIDE IS THE INPUT WIDTH, NOT THE REGION WIDTH. One output
+    //    channel owns `n_embd` quantized elements, so region r starts at
+    //    `r * dtype_row_bytes(type, n_embd)`. Using dtype_row_bytes(type, r)
+    //    -- the bytes of r *elements* -- lands a fraction of a row in
+    //    (inner/n_embd = 4096/2688 = 1.52 rows for xBC, 10240/2688 = 3.81 for
+    //    dt) and reads every region off a shifted copy of its neighbours' rows.
+    //    The magnitudes stay plausible, so the only way to see it is a dump
+    //    against a reference: measured on the 30B nemotron, that split made z
+    //    correct and xBC/dt read the wrong weight regions entirely, which is
+    //    why every device and --cpu run of this model decoded garbage while
+    //    agreeing with each other to 0.1%.
+    const void *xn = ws_xn_;
+    if (L.h_attn_in) {
+        had_xform(ws_had_, ws_xn_, n, n_embd_, false, false);
+        xn = ws_had_;
+    }
+    {
+        const size_t rw = dtype_row_bytes(L.ssm_in.type, n_embd_);
+        const u8 *w = static_cast<const u8 *>(L.ssm_in.data);
+        be_->gemm(ws_z_, xn, w, L.ssm_in.type, inner, n_embd_, n);
+        be_->gemm(ws_qkv_, xn, w + rw * static_cast<size_t>(inner),
+                  L.ssm_in.type, cdim, n_embd_, n);
+        be_->gemm(ws_beta_, xn, w + rw * static_cast<size_t>(inner + cdim),
+                  L.ssm_in.type, n_head, n_embd_, n);
+        // TEMP PROBE (remove): the three fused regions, before the conv.
+        dump_row("m2.z", l, ws_z_, inner, n);
+        dump_row("m2.xbc", l, ws_qkv_, cdim, n);
+        dump_row("m2.dt_raw", l, ws_beta_, n_head, n);
+    }
+
+    // 3. The causal short convolution with this block's bias, and the SiLU
+    //    that follows it. After this ws_qkv_ holds post-conv xBC only.
+    f32 *cstate = static_cast<f32 *>(conv_state_) +
+                  static_cast<size_t>(ri) * static_cast<size_t>(conv_state_span_);
+    be_->conv1d_silu(ws_qkv_, ws_qkv_, cstate, L.ssm_conv1d.data,
+                     L.ssm_conv1d.type, n, cdim, ksize, L.ssm_conv_bias);
+    dump_row("m2.conv", l, ws_qkv_, cdim, n);
+
+    // 4. The SSD scan. Reads dtA from ws_beta_, A/bias/D from the layer, and
+    //    keeps this layer's [head][p][s] f32 state in the shared arena.
+    f32 *state = static_cast<f32 *>(rec_state_) +
+                 static_cast<size_t>(ri) * static_cast<size_t>(mamba2_state_span_);
+    be_->ssd_scan(ws_h_, state, ws_qkv_, ws_beta_, L.ssm_a, L.ssm_dt, L.ssm_d,
+                  n, n_head, hd, mc.ssm_d_state, mc.ssm_n_group, inner, cdim,
+                  L.ssm_d != nullptr);
+    dump_row("m2.ssd", l, ws_h_, inner, n);
+
+    // 5. The silu(z) output gate, then the GROUPED RMSNorm. ssm_norm is
+    //    [inner / n_group, n_group]: ONE VECTOR PER GROUP, each reduced over
+    //    that group's inner/n_group channels (Mamba-2's RMSNormGated with
+    //    group_size; llama.cpp builds it as an rms_norm over the 4-D reshape
+    //    [inner/n_group, n_group, T, S], so the weight's second axis is
+    //    broadcast over the groups). The scan's [t, h*hd+p] layout already puts
+    //    a group's channels together -- group g owns heads
+    //    [g*n_head/n_group, (g+1)*n_head/n_group), so its block is
+    //    [t*inner + g*(inner/n_group), +(inner/n_group)) -- which is what makes
+    //    this one op over the n_tok * n_group rows instead of a transpose.
+    //    Two ways to get this wrong that a scan-only check cannot see: using
+    //    one shared weight vector for every group (rmsnorm() cannot express the
+    //    per-group select at all), and passing a row count that does not match
+    //    the buffer.
+    be_->silu_mul(ws_h_, ws_z_, ws_h_, static_cast<i64>(n) * inner);
+    be_->rmsnorm_grouped(ws_h_, ws_h_, L.ssm_norm, n, mc.ssm_n_group,
+                         inner / mc.ssm_n_group, inner, mc.rms_eps);
+    dump_row("m2.norm", l, ws_h_, inner, n);
+
+    // 6. Output projection and the residual. ssm_out is [n_embd, inner] like
+    //    every other out-projection on this stack.
+    const void *h_in = ws_h_;
+    if (L.h_ssm_out) {
+        had_xform(ws_had_, ws_h_, n, inner, false, false);
+        h_in = ws_had_;
+    }
+    be_->gemm(ws_x2_, h_in, L.ssm_out.data, L.ssm_out.type, n_embd_, inner, n);
+    be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
+    dump_row("m2.done", l, ws_x_, n_embd_, n);
 }
 
 void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
@@ -1471,13 +1863,19 @@ void Engine::write_expert_index(const std::string &path) const {
     // Size and mtime travel with the index so a loader can refuse a list
     // written for a different build of the same weights. Matching the Laguna
     // edge0-index fields, which the collections already ship.
+    // The size comes from the 64-bit probe, NOT from st_size below. Measured
+    // on the 18.42 GiB nemotron file: ::stat succeeds here but its 32-bit
+    // st_size reports 0, so every index for a model past 2 GiB recorded
+    // "source_size": 0 -- and the loader's own stat failed the same way, so the
+    // comparison ran against nothing. The mtime still comes from stat, where it
+    // is a time_t and fits.
     unsigned long long src_size = 0, src_mtime = 0;
     {
+        u64 sz = 0;
+        if (file_size(cfg_.model_path, &sz)) src_size = sz;
         struct stat st;
-        if (::stat(cfg_.model_path.c_str(), &st) == 0) {
-            src_size = static_cast<unsigned long long>(st.st_size);
+        if (::stat(cfg_.model_path.c_str(), &st) == 0)
             src_mtime = static_cast<unsigned long long>(st.st_mtime);
-        }
     }
 
     FILE *f = std::fopen(path.c_str(), "wb");
@@ -1604,22 +2002,45 @@ std::vector<std::pair<i32, i32>> Engine::load_expert_index() const {
                  mc.n_layer, mc.n_expert);
         return out;
     }
-    // The ranking has to belong to these weights. Size is the cheap part of
-    // that check and it catches the common mistake -- an index file copied next
-    // to a different quantization of the same model.
-    struct stat st;
-    if (::stat(cfg_.model_path.c_str(), &st) == 0) {
-        const i64 isz = root.get_int("source_size", -1);
-        if (isz >= 0 && static_cast<unsigned long long>(isz) !=
-                            static_cast<unsigned long long>(st.st_size)) {
-            KRK_WARN("expert warmup: %s was measured on a %.1f GiB file and this "
-                     "one is %.1f GiB -- ignoring it (a ranking from other "
-                     "weights orders the tiers by another model's routing)",
-                     path.c_str(),
-                     static_cast<f64>(isz) / (1024.0 * 1024.0 * 1024.0),
-                     static_cast<f64>(st.st_size) / (1024.0 * 1024.0 * 1024.0));
-            return out;
-        }
+    // The ranking has to belong to these weights, and the claim is now
+    // REQUIRED rather than checked-when-present. An index that does not say
+    // which file it was measured on is an index nobody can place, and "could
+    // not verify" has to mean "refuse": the failure this guards against is
+    // precisely the one that looks fine, because a ranking from another model's
+    // routing is a perfectly well-formed file that orders the tiers by a
+    // distribution these weights do not have.
+    std::string arch;
+    root.get_string("arch", &arch);
+    if (!arch.empty() && arch != mc.arch) {
+        KRK_WARN("expert warmup: %s was measured on '%s' and this model is "
+                 "'%s' -- ignoring it",
+                 path.c_str(), arch.c_str(), mc.arch.c_str());
+        return out;
+    }
+    const i64 isz = root.get_int("source_size", -1);
+    u64 model_size = 0;
+    if (isz <= 0 || !file_size(cfg_.model_path, &model_size)) {
+        KRK_WARN("expert warmup: %s does not record the size of the file it was "
+                 "measured on (source_size %lld) -- ignoring it (an index whose "
+                 "provenance cannot be checked is not one to warm the tiers "
+                 "from; re-run --expert-scan to write it)",
+                 path.c_str(), static_cast<long long>(isz));
+        return out;
+    }
+    if (static_cast<u64>(isz) != model_size) {
+        // Bytes as well as GiB: two 18.4 GiB files that differ by one byte are
+        // the same two-decimal number, and a diagnostic that prints the same
+        // figure twice reads as a bug in the check rather than a mismatch.
+        KRK_WARN("expert warmup: %s was measured on a %.2f GiB file and this "
+                 "one is %.2f GiB (%llu vs %llu bytes) -- ignoring it (a ranking "
+                 "from other weights orders the tiers by another model's "
+                 "routing)",
+                 path.c_str(),
+                 static_cast<f64>(isz) / (1024.0 * 1024.0 * 1024.0),
+                 static_cast<f64>(model_size) / (1024.0 * 1024.0 * 1024.0),
+                 static_cast<unsigned long long>(isz),
+                 static_cast<unsigned long long>(model_size));
+        return out;
     }
     std::string mode;
     root.get_string("mode", &mode);
@@ -1631,6 +2052,16 @@ std::vector<std::pair<i32, i32>> Engine::load_expert_index() const {
     const JsonValue *layers = root.find("layers");
     if (!layers || !layers->is_array()) return out;
     std::vector<std::vector<i32>> per_layer(static_cast<size_t>(mc.n_layer));
+    // This loader reads the ids IN FILE ORDER and never sorts: the order the
+    // scan wrote IS the payload. A mass that is present and not a number is the
+    // specific signature of a scan whose
+    // forward pass was broken, because the mass accumulates the router's
+    // softmax and a NaN anywhere upstream makes every expert of that layer NaN.
+    // Measured here: the corpus scan of NVIDIA-Nemotron-3.5-Lightning-30B-A3B
+    // NVFP4 wrote -nan(ind) for all 128 experts of 16 layers. That file parsed,
+    // claimed mode "full-forward", and its per-layer order was fiction.
+    bool bad_mass = false;
+    i64 bad_layer = -1;
     for (const JsonValue &lv : layers->items()) {
         if (!lv.is_object()) continue;
         const i64 l = lv.get_int("layer", -1);
@@ -1639,9 +2070,33 @@ std::vector<std::pair<i32, i32>> Engine::load_expert_index() const {
         if (!ex || !ex->is_array()) continue;
         for (const JsonValue &ev : ex->items()) {
             const i64 e = ev.get_int("e", -1);
+            // A mass that is PRESENT has to be finite and non-negative. A mass
+            // that is absent is not an error: this loader consumes the ids in
+            // file order and never sorts, so the order the author wrote is the
+            // ranking whether or not it came with its justification. Demanding
+            // the field rejected hand-written indexes that are perfectly
+            // well-defined, which tests/test_kraken.cpp caught.
+            const JsonValue *mv = ev.find("mass");
+            if (mv) {
+                const f64 m = ev.get_number("mass", -1.0);
+                if (!(m == m) || m < 0.0) {
+                    if (!bad_mass) bad_layer = l;
+                    bad_mass = true;
+                    continue;
+                }
+            }
             if (e >= 0 && e < mc.n_expert)
                 per_layer[static_cast<size_t>(l)].push_back(static_cast<i32>(e));
         }
+    }
+    if (bad_mass) {
+        KRK_WARN("expert warmup: %s carries routing mass that is not a finite "
+                 "non-negative number (first at layer %lld) -- ignoring it. The "
+                 "scan that wrote it measured a broken forward pass, so its "
+                 "per-layer order says nothing about these weights; fix the scan "
+                 "and re-run --expert-scan",
+                 path.c_str(), static_cast<long long>(bad_layer));
+        return out;
     }
     size_t depth = 0;
     for (const auto &v : per_layer) depth = std::max(depth, v.size());
@@ -1807,6 +2262,25 @@ void Engine::warm_experts() {
     ec.reset_counters();
 }
 
+// KRK_DUMP_MOE=1: report, per (layer, expert) group, how many elements of the
+// gathered input, the up projection and the group's output are not finite.
+//
+// This exists because of an arithmetic accident that hid a real defect for a
+// long time: nemotron_h_moe carries no ffn_gate_exps, so the gate leg of the
+// expert MLP is absent (-see the comment on ExpertSource::present), which makes
+// silu(gate) * up evaluate to 0 * up. Almost any corruption of an expert's
+// weights is therefore multiplied away to an exact zero -- but 0 * NaN is NaN,
+// so an expert whose bytes are not a number survives that multiplication as the
+// only visible trace. A per-group non-finite count is what turns "the residual
+// went NaN somewhere in layer 27" into "this expert's weights are not finite".
+static bool moe_probe() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_DUMP_MOE");
+        return e && e[0] != '0';
+    }();
+    return v;
+}
+
 void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
@@ -1945,18 +2419,21 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // alternative to computing an expert is not losing it silently.
         const bool hybrid =
             hybrid_on_ && !expert_stub_ && k > 0 && n <= hybrid_max_rows_ &&
-            L.experts.present() && L.experts.n_expert == ne &&
-            L.experts.n_embd == n_embd_ && L.experts.n_ff_exp > 0 &&
-            L.experts.gate->n_dims == 3 && L.experts.up->n_dims == 3 &&
+            L.experts.present() && L.experts.gate &&
+            L.experts.n_expert == ne &&
+            L.experts.n_embd == n_embd_ &&            L.experts.n_ff_exp > 0 &&
+            L.experts.gate->n_dims == 3 &&
+            L.experts.up->n_dims == 3 &&
             L.experts.down->n_dims == 3 &&
-            L.experts.up->type == L.experts.gate->type &&
-            L.experts.down->type == L.experts.gate->type &&
-            static_cast<i64>(L.experts.gate->ne[0]) == n_embd_ &&
-            static_cast<i64>(L.experts.gate->ne[1]) == L.experts.n_ff_exp &&
+            // nemotron_h_moe has no ffn_gate_exps (gate == null): the geometry
+            // contract lives on up/down alone, which every schema carries.
+            L.experts.up->type == L.experts.down->type &&
+            static_cast<i64>(L.experts.up->ne[0]) == n_embd_ &&
+            static_cast<i64>(L.experts.up->ne[1]) == L.experts.n_ff_exp &&
             static_cast<i64>(L.experts.down->ne[0]) == L.experts.n_ff_exp &&
             static_cast<i64>(L.experts.down->ne[1]) == n_embd_ &&
-            dtype_row_aligned(L.experts.gate->type, n_embd_) &&
-            dtype_row_aligned(L.experts.gate->type, L.experts.n_ff_exp);
+            dtype_row_aligned(L.experts.up->type, n_embd_) &&
+            dtype_row_aligned(L.experts.up->type, L.experts.n_ff_exp);
         i32 n_cpu_experts = 0;
         if (hybrid) {
             hy_take_.assign(static_cast<size_t>(ne), 0);
@@ -2052,6 +2529,11 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             if (sync_expert()) be_->sync();
             if (hybrid) hy_gpu_experts_++;
 
+            // The per-expert global scale each NVFP4 matrix needs.
+            const f32 gs_up = L.experts.scale_of(L.experts.up_scale, e);
+            const f32 gs_dn = L.experts.scale_of(L.experts.down_scale, e);
+            const f32 gs_gt = L.experts.scale_of(L.experts.gate_scale, e);
+
             const i64 m = static_cast<i64>(group_rows_.size());
             plan_dev_.assign(group_rows_.begin(), group_rows_.end());
             alpha_dev_.assign(group_wt_.begin(), group_wt_.end());
@@ -2063,12 +2545,108 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             be_->gather_rows(ws_xg_, ws_xn_, static_cast<const i32 *>(ws_plan_), m,
                              n_embd_);
             // One GEMM per matrix over the whole block.
-            be_->gemm(ws_gateg_, ws_xg_, re->gate.data, re->gate.type, ff_exp,
-                      n_embd_, m);
+            //
+            // The global scale is folded into the INPUT rather than applied to
+            // the result. Both are the same matrix product -- gs * (W x) is
+            // (gs W) x -- but only this one keeps the magnitudes right inside
+            // the kernel: scaling the output leaves the accumulator to sum
+            // 2688 terms of a 10,000x-too-large product first, and llama.cpp
+            // reaches for a bf16 accumulator on NVFP4 for exactly that reason
+            // (build_lora_mm: ggml_prec_set_acc(res, GGML_PREC_BF16)). This
+            // engine's activation buffer is f16, so the scale has to be in
+            // before the first multiply, not after the last add.
+            // Guarded on != 1, not unconditional: every format that is not
+            // NVFP4 carries no sidecar, gs is 1.0, and a pass over the gathered
+            // rows per expert group is a real cost on the models that have no
+            // scale at all.
+            if (gs_up != 1.0f)
+                be_->scale_act(ws_xg_, gs_up, m, n_embd_, n_embd_);
             be_->gemm(ws_upg_, ws_xg_, re->up.data, re->up.type, ff_exp, n_embd_, m);
-            be_->silu_mul(ws_gateg_, ws_gateg_, ws_upg_, m * ff_exp);
+            if (re->gate.present()) {
+                // ws_xg_ is carrying gs_up; leave it carrying gs_gt for the
+                // gate. It is read by nothing else.
+                if (gs_gt != gs_up)
+                    be_->scale_act(ws_xg_, gs_gt / gs_up, m, n_embd_, n_embd_);
+                be_->gemm(ws_gateg_, ws_xg_, re->gate.data, re->gate.type, ff_exp,
+                          n_embd_, m);
+            }
+            if (moe_probe()) {
+                // After the two projections, before anything is multiplied:
+                // the input and the up result are separate facts and the whole
+                // question is which one is not finite.
+                // Same predicate the KRK_DUMP_FULL summary uses, so a count
+                // here and an nf= there are the same measurement.
+                auto count_nf = [&](const void *p, i64 w) {
+                    std::vector<f32> t(static_cast<size_t>(w));
+                    be_->download_f32(t.data(), p, w);
+                    i64 c = 0;
+                    for (f32 v : t)
+                        if (!(v == v) || v > 3.0e38f || v < -3.0e38f) c++;
+                    return c;
+                };
+                const i64 in_nf = count_nf(ws_xg_, m * n_embd_);
+                const i64 up_nf = count_nf(ws_upg_, m * ff_exp);
+                const i64 gt_nf = count_nf(ws_gateg_, m * ff_exp);
+                if (in_nf || up_nf || gt_nf)
+                    std::fprintf(stderr,
+                                 "[moe] L%02d e=%3d m=%3lld in_nf=%lld up_nf=%lld "
+                                 "gate_nf=%lld\n",
+                                 layer, e, static_cast<long long>(m),
+                                 static_cast<long long>(in_nf),
+                                 static_cast<long long>(up_nf),
+                                 static_cast<long long>(gt_nf));
+            }
+            if (re->gate.present()) {
+                be_->silu_mul(ws_gateg_, ws_gateg_, ws_upg_, m * ff_exp);
+            } else if (mc.ffn_relu_sqr) {
+                // Gate-less with squared ReLU (nemotron_h_moe): the activation
+                // is relu^2 of the up projection, which is what the reference
+                // builds (LLM_FFN_RELU_SQR on ffn_up_exps, gate == null). The
+                // silu branch below is the same shape reached the other way
+                // round and is right for a family that actually trains silu
+                // there -- it is the wrong *function* here, not a mis-scaling:
+                // relu^2 zeroes negative pre-activations and squares the rest.
+                be_->relu_sqr_act(ws_upg_, m * ff_exp);
+                be_->copy_act(ws_gateg_, ws_upg_, m * ff_exp);
+            } else {
+                // No ffn_gate_exps: the expert is one projection wide, so its
+                // activation applies to that projection directly instead of to
+                // a gate. silu_mul(out, g, u) is silu(g) * u, and the shape
+                // here is silu(up), which is the same function reached the
+                // other way round (silu(x) = x * sigmoid(x)).
+                //
+                // This is the path the model actually needed: with the gate
+                // absent the old code still issued the gate GEMM, with a null
+                // weight pointer and DType::Unknown. row_bytes() for an unknown
+                // dtype is 0, so every row read the same address, the result
+                // was 0, and silu(0) * up collapsed the whole routed bank to an
+                // exact zero -- 23 layers whose experts contributed nothing at
+                // all, which is the zero `moe.sum` that hid everything else.
+                be_->copy_act(ws_gateg_, ws_upg_, m * ff_exp);
+                be_->sigmoid_act(ws_gateg_, m * ff_exp);
+                be_->mul_act(ws_gateg_, ws_upg_, m * ff_exp);
+            }
+            // The down leg's scale goes into its own input for the same reason
+            // as the gate/up pair above.
+            if (gs_dn != 1.0f)
+                be_->scale_act(ws_gateg_, gs_dn, m, ff_exp, ff_exp);
             be_->gemm(ws_x2_, ws_gateg_, re->down.data, re->down.type, n_embd_,
                       ff_exp, m);
+            if (moe_probe()) {
+                std::vector<f32> t(static_cast<size_t>(m) * static_cast<size_t>(n_embd_));
+                be_->download_f32(t.data(), ws_x2_, static_cast<i64>(t.size()));
+                i64 out_nf = 0, big = 0;
+                for (f32 v : t) {
+                    if (!(v == v) || v > 3.0e38f || v < -3.0e38f) out_nf++;
+                    else if (v > 1.0e6f || v < -1.0e6f) big++;
+                }
+                if (out_nf || big)
+                    std::fprintf(stderr,
+                                 "[moeout] L%02d e=%3d m=%3lld out_nf=%lld big=%lld\n",
+                                 layer, e, static_cast<long long>(m),
+                                 static_cast<long long>(out_nf),
+                                 static_cast<long long>(big));
+            }
             // Scatter back to the original rows, weighted by the gate.
             be_->scatter_axpy_rows(ws_ffn_, ws_x2_, static_cast<const i32 *>(ws_plan_),
                                    static_cast<const f32 *>(ws_alpha_), m, n_embd_);
@@ -2163,10 +2741,44 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
 
     // The shared expert runs on every token (Qwen2-MoE); it is a single expert,
     // so it stays resident.
-    if (!expert_stub_ && ff_sh > 0 && L.shexp_gate.present()) {
-        be_->gemm(ws_gate_, ws_xn_, L.shexp_gate.data, L.shexp_gate.type, ff_sh, n_embd_, n);
-        be_->gemm(ws_up_, ws_xn_, L.shexp_up.data, L.shexp_up.type, ff_sh, n_embd_, n);
-        be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * ff_sh);
+    // Keyed on the up/down pair, not on the gate: a shared expert without
+    // ffn_gate_shexp (nemotron_h_moe) is still a shared expert, and gating this
+    // block on the gate skipped it.
+    if (!expert_stub_ && ff_sh > 0 && L.shexp_up.present() &&
+        L.shexp_down.present()) {
+        // The scale is folded into the gemm's input. ws_xg_ is the expert
+        // group's staging buffer and is free here; ws_xn_ is not, because the
+        // model's own router has already read it and a scaled copy of it must
+        // not be what a later stage sees.
+        const void *sh_in = ws_xn_;
+        if (L.shexp_up_scale != 1.0f || L.shexp_gate_scale != 1.0f) {
+            be_->copy_act(ws_xg_, ws_xn_, n * n_embd_);
+            be_->scale_act(ws_xg_, L.shexp_up_scale, n, n_embd_, n_embd_);
+            sh_in = ws_xg_;
+        }
+        if (L.shexp_gate.present()) {
+            if (L.shexp_gate_scale != L.shexp_up_scale)
+                be_->scale_act(ws_xg_, L.shexp_gate_scale / L.shexp_up_scale, n,
+                               n_embd_, n_embd_);
+            be_->gemm(ws_gate_, sh_in, L.shexp_gate.data, L.shexp_gate.type, ff_sh,
+                      n_embd_, n);
+        }
+        be_->gemm(ws_up_, sh_in, L.shexp_up.data, L.shexp_up.type, ff_sh, n_embd_, n);
+        if (L.shexp_gate.present()) {
+            be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * ff_sh);
+        } else if (mc.ffn_relu_sqr) {
+            // The shared expert is the same MLP shape as a routed one on this
+            // family (ffn_up_shexp / ffn_down_shexp, no gate) and the reference
+            // activates it the same way.
+            be_->relu_sqr_act(ws_up_, n * ff_sh);
+            be_->copy_act(ws_gate_, ws_up_, n * ff_sh);
+        } else {
+            be_->copy_act(ws_gate_, ws_up_, n * ff_sh);
+            be_->sigmoid_act(ws_gate_, n * ff_sh);
+            be_->mul_act(ws_gate_, ws_up_, n * ff_sh);
+        }
+        if (L.shexp_down_scale != 1.0f)
+            be_->scale_act(ws_gate_, L.shexp_down_scale, n, ff_sh, ff_sh);
         be_->gemm(ws_x2_, ws_gate_, L.shexp_down.data, L.shexp_down.type, n_embd_, ff_sh, n);
         // Qwen3.5 scales the shared expert by a per-token sigmoid of a small
         // vector before folding it in; the Qwen2/Qwen3 schema has no such gate.
@@ -2179,7 +2791,9 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         be_->add_inplace(ws_ffn_, ws_x2_, n * n_embd_);
     }
 
+    dump_row("moe.sum", layer, ws_ffn_, n_embd_, n);
     be_->add_inplace(ws_x_, ws_ffn_, n * n_embd_);
+    dump_row("moe.post", layer, ws_x_, n_embd_, n);
 }
 
 void Engine::fetch_logits(bool device_only) {
@@ -2329,6 +2943,10 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         // ---- pre-check: does the target agree with the first proposal? ----
         // This is the same test plain decode performs; on failure the round
         // costs exactly one plain decode step (the block is never run).
+        //
+        // On mismatch the first accepted token is still emitted exactly once:
+        // the mismatch branch emits the fallback token here, and if the round
+        // later emits anything else it does so in the verify/accept loop.
         if (d == 0 || first != prop[0]) {
             if (first == tok_.eos()) {
                 finish_run(FinishEos);
@@ -2601,6 +3219,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             fetch_logits();
             continue;
         }
+        d = nrows;
 
         // ---- verify: one batched forward of the d proposals ---------------
         i32 d_eff = d;

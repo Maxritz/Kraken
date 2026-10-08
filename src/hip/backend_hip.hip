@@ -1273,6 +1273,20 @@ public:
             static_cast<_Float16 *>(out),
             static_cast<const _Float16 *>(x), w, n, eps);
     }
+
+    // One block per (token, group) row of the mamba-2 scan output; see
+    // kernels/normalize.hpp. `stride` is the token stride in elements (the
+    // group blocks inside one token are contiguous).
+    void rmsnorm_grouped(void *o, const void *x, const f32 *w, i64 n_tok,
+                         i64 n_group, i64 width, i64 stride,
+                         f32 eps) override {
+        const i64 rows = n_tok * n_group;
+        if (rows <= 0 || width <= 0 || n_group <= 0) return;
+        KRK_TIME_OP("rmsnorm_grouped");
+        rmsnorm_grouped_kernel<256><<<static_cast<unsigned>(rows), 256>>>(
+            static_cast<_Float16 *>(o), static_cast<const _Float16 *>(x), w,
+            n_group, width, stride, eps);
+    }
     // Top-k of the logits row, entirely on the device (kernels/topk.hpp).
     // Four launches and no readback between them: stage 2 writes the cut and
     // stage 3 reads it back from device memory, so the only transfer at the
@@ -1889,6 +1903,13 @@ public:
         gdn_softplus_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(x), n);
     }
 
+    void relu_sqr_act(void *x, i64 n) override {
+        KRK_TIME_OP("relu_sqr_act");
+        if (n <= 0) return;
+        const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
+        gdn_relu_sqr_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(x), n);
+    }
+
     void scale_act(void *x, f32 alpha, i64 n_tok, i64 width, i64 stride) override {
         KRK_TIME_OP("scale_act");
         if (n_tok <= 0 || width <= 0) return;
@@ -2002,17 +2023,20 @@ public:
     }
 
     void conv1d_silu(void *out, const void *in, void *state, const void *kern,
-                     DType wt, i64 n_tok, i64 chan, i64 ksize) override {
+                     DType wt, i64 n_tok, i64 chan, i64 ksize,
+                     const void *bias = nullptr) override {
         KRK_TIME_OP("conv1d_silu");
         if (n_tok <= 0 || chan <= 0 || ksize <= 0) return;
         // The taps are a constant weight: decode them once per layer, not once
         // per token. This is the only place a quantized buffer is read on the
         // delta net's hot path.
         const _Float16 *taps = stage_gdn_taps(kern, wt, ksize * chan);
+        // The mamba-2 conv bias is an f32 device vector the loader uploaded;
+        // the gated delta net passes null and adds nothing.
         gdn_conv1d_silu_launch(static_cast<_Float16 *>(out),
                                static_cast<const _Float16 *>(in),
                                static_cast<f32 *>(state), taps, n_tok, chan,
-                               ksize);
+                               ksize, static_cast<const f32 *>(bias));
     }
 
     void delta_rule(void *out, void *state, const void *q, const void *k,
@@ -2026,6 +2050,22 @@ public:
             static_cast<const _Float16 *>(v), static_cast<const _Float16 *>(g),
             static_cast<const _Float16 *>(beta), n_tok, n_k_head, n_v_head,
             d_state, hd, row_stride);
+    }
+
+    // The Mamba-2 SSD scan: one block per head, no cross-thread coupling (see
+    // the kernel comment). The dt head rides the fused xBC row, so this is a
+    // single launch per layer per chunk — no per-token host work.
+    void ssd_scan(void *out, void *state, const void *xbc, const void *dt,
+                  const void *a, const void *db, const void *dp, i64 n_tok,
+                  i64 n_head, i64 head_dim, i64 d_state, i64 n_group,
+                  i64 inner, i64 conv_dim, bool has_d) override {
+        KRK_TIME_OP("ssd_scan");
+        mamba2_ssd_launch(
+            static_cast<_Float16 *>(out), static_cast<f32 *>(state),
+            static_cast<const _Float16 *>(xbc),
+            static_cast<const _Float16 *>(dt), static_cast<const f32 *>(a),
+            static_cast<const f32 *>(db), has_d ? static_cast<const f32 *>(dp) : nullptr,
+            n_tok, n_head, head_dim, d_state, n_group, inner, conv_dim, has_d);
     }
 
     void gather_rows(void *dst, const void *src, const i32 *rows, i64 n_rows,

@@ -116,12 +116,16 @@ u64 slot_key(i32 layer, i32 expert) {
 
 } // namespace
 
-void ExpertCache::configure(Backend *be, size_t budget_bytes, size_t host_budget_bytes) {
+void ExpertCache::configure(Backend *be, size_t budget_bytes, size_t host_budget_bytes,
+                            size_t slot_budget) {
     clear();
     be_ = be;
     budget_ = budget_bytes;
     host_budget_ = host_budget_bytes;
-    capacity_ = 0;
+    slot_budget_ = slot_budget;
+    // An explicit slot budget IS the capacity. Without one this stays 0 until
+    // acquire() fills it in from the expert size of the layer it is serving.
+    capacity_ = slot_budget;
 }
 
 void ExpertCache::clear() {
@@ -274,12 +278,22 @@ void ExpertCache::retire(Slot &s) {
     }
 }
 
-void ExpertCache::make_vram_room() {
-    // Evict until this one fits. The scan skips pinned slots; if every resident
-    // slot is pinned and none can be dropped, the policy never gets stuck —
-    // we simply over-reside by one slot and keep going. Correctness first:
-    // the resident set is a performance hint, never an invariant.
-    while (vram_slots_ >= capacity_ && vram_slots_ > 0) {
+void ExpertCache::make_vram_room(size_t need) {
+    // Evict until this one fits, in BYTES. The slot count was the trigger here
+    // and it does not work: experts are not one size. Qwen3-MoE-4x0.6B is 56
+    // experts of 5.8359 MiB (Q6_K down_proj) and 56 of 5.0625 MiB (Q4_K), which
+    // is 610.312 MiB -- and that total is exactly the budget the policy sizes for
+    // it. A count derived as budget_ / need therefore read 104 at a Q6_K layer
+    // and 126 at a Q4_K one, while the budget covers all 112, so the cache
+    // evicted 23 experts per 64-token run with ~43 MiB of its own budget
+    // unspent. bytes_ + need is the actual constraint; capacity_ is an estimate
+    // for the report (see over_budget).
+    //
+    // The scan skips pinned slots; if every resident slot is pinned and none can
+    // be dropped, the policy never gets stuck — we simply over-reside by one slot
+    // and keep going. Correctness first: the resident set is a performance hint,
+    // never an invariant.
+    while (vram_slots_ > 0 && over_budget(need)) {
         u64 victim = 0;
         if (!pick_victim(&victim)) break;
         auto vit = slots_.find(victim);
@@ -373,9 +387,14 @@ bool ExpertCache::promote_to_vram(Slot &s) {
     } clock_out{&promote_ms_, t0};
     if (!be_ || !s.in_host()) return false;
     const u64 key = slot_key(s.layer, s.expert);
+    // Snapshot before the scan: this slot is WARM, so retire() cannot take it
+    // (it only drops device copies), but the reference is re-established below
+    // anyway and reading `s` across a call that evicts is what the rest of this
+    // file goes out of its way to avoid.
+    const size_t need = s.bytes;
     {
         MsTimer t(&room_ms_);
-        make_vram_room();
+        make_vram_room(need);
     }
 
     // Eviction never touches WARM copies (retire keeps them), so the slot's own
@@ -571,8 +590,16 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     const size_t up_b = src.per_expert(src.up);
     const size_t down_b = src.per_expert(src.down);
     const size_t need = gate_b + up_b + down_b;
-    const size_t cap = need > 0 ? (budget_ / need) : 0;
-    capacity_ = cap > 0 ? cap : 1;
+    // capacity_ is what the report says fits, not what the eviction decision is
+    // made on (that is bytes_ + need against budget_, see over_budget). Without
+    // an explicit slot budget it is the byte budget expressed in slots of THIS
+    // layer's expert, which is an estimate and is documented as one: the corpus
+    // can mix expert sizes, and the engine passes an exact slot_budget whenever
+    // it knows one.
+    if (slot_budget_ == 0) {
+        const size_t cap = need > 0 ? (budget_ / need) : 0;
+        capacity_ = cap > 0 ? cap : 1;
+    }
 
     const u64 key = slot_key(layer, expert);
     auto it = slots_.find(key);
@@ -623,7 +650,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
 
     {
         MsTimer t(&room_ms_);
-        make_vram_room();
+        make_vram_room(need);
     }
 
     const i32 e = expert;

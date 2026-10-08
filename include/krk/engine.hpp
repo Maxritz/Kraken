@@ -85,9 +85,17 @@ struct EngineConfig {
     // Total device memory this run is allowed to plan for, in MiB. 0 (the
     // default) is the stepped policy in Engine::configure_expert_cache: 6 GiB
     // to begin with, +2 GiB at a time while the card has the headroom and the
-    // model actually needs more, never above 12 GiB. A positive value is that
+    // model actually needs more, never above 14 GiB. A positive value is that
     // many MiB and skips the policy entirely.
     i32 vram_cap_mb = 0;
+    // The class form of the same restriction, in GiB: behave as if the card
+    // were this big. The twin of ram_tier_gb, and what a plan made for one
+    // machine carries to another -- a 12 GiB card and an 8 GiB card want a
+    // number that is a property of the CARD, not a MiB figure that has to be
+    // recomputed per box. Clamped to the memory actually installed, so the same
+    // command line is safe on the big machine. Ignored when vram_cap_mb is set,
+    // which is the exact figure.
+    i32 vram_tier_gb = 0;
     // Host memory this run is allowed to plan for, in MiB. 0 (the default) is
     // a quarter of installed RAM; a positive value is that many MiB and bounds
     // every host tier inside the process. The mapping and the dense trunk sit
@@ -268,12 +276,19 @@ public:
         out->warm = a.warm;
         out->cold = a.cold;
         out->slots = a.slots;
-        out->hot_bytes = a.hot_bytes;
+        // Both planes, so this is the VRAM the HOT tier actually holds and not
+        // half of it. layer_bytes stays per-plane: it is a slot's size, and a
+        // slot is one plane's copy of one layer.
+        out->hot_bytes = a.hot_bytes + b.hot_bytes;
         out->layer_bytes = a.layer_bytes;
         out->promotions_from_warm = a.promotions_from_warm + b.promotions_from_warm;
         out->promotions_from_cold = a.promotions_from_cold + b.promotions_from_cold;
         out->evictions_to_warm = a.evictions_to_warm + b.evictions_to_warm;
         out->evictions_to_cold = a.evictions_to_cold + b.evictions_to_cold;
+        // Counted per plane, so this is pages, and the same lost layer counts
+        // twice -- once for K and once for V. Reported apart from ->COLD
+        // because it is the one number here that says the run is wrong.
+        out->evictions_dropped = a.evictions_dropped + b.evictions_dropped;
         out->migrate_bytes = a.migrate_bytes + b.migrate_bytes;
     }
 
@@ -287,6 +302,8 @@ public:
         out->cpu_ms = hy_cpu_ms_;
     }
 
+    const KvTierCache &kvt_k() const { return kvt_k_; }
+    const KvTierCache &kvt_v() const { return kvt_v_; }
     const Model &model() const { return model_; }
     const Tokenizer &tokenizer() const { return tok_; }
     // Debug: logits from the most recent forward (n_vocab floats).
@@ -431,6 +448,14 @@ private:
     i32 rec_layers_ = 0;
     i64 conv_state_span_ = 0; // f32 per recurrent layer
     i64 rec_state_span_ = 0;  // f32 per recurrent layer
+    // Mamba-2 layout ([head][p][s] vs GDN's [head][s][p] — same bytes, and the
+    // scan never mixes them) and the per-layer conv bias, loaded only when a
+    // checkpoint actually carries one. ws_m2in_ holds the fused [z|xBC|dt]
+    // projection row, which is WIDER than the conv row (10304 vs 6144 on
+    // nemotron-30B) and so cannot share ws_qkv_ with the GDN path.
+    i64 mamba2_state_span_ = 0; // f32 per nemotron mamba-2 layer
+    void *ws_m2in_ = nullptr;
+    void mamba2_forward(const LayerWeights &L, i32 l, i32 n);
     // workspaces, sized for `chunk_` rows
     void *ws_x_ = nullptr;    // [chunk, n_embd]
     void *ws_xn_ = nullptr;   // [chunk, n_embd]

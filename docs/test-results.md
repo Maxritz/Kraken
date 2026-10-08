@@ -425,7 +425,7 @@ permits.
 | # | change | decode tok/s | HOT hit | promotions | us/expert promoted |
 |---|---|---:|---:|---:|---:|
 | 1 | auto budget, 610 MiB | 100.8 | 96.8% | 117 | 1172.3 |
-| 2 | `--expert-cache-slots 104` (whole routed set, explicit) | 108.9 | 96.8% | 117 | 1083.4 |
+| 2 | `--expert-cache-slots 104` (an explicit 104-slot cap; the set is 112) | 108.9 | 96.8% | 117 | 1083.4 |
 | 3 | `--expert-cache-mb 400` | 62.7 | 81.0% | 692 | 545.8 |
 | 4 | `--expert-cache-mb 200` | 32.7 | 46.5% | 1947 | 507.4 |
 | 5 | `--expert-cache-mb 100` | 25.1 | 19.1% | 2942 | 505.6 |
@@ -474,6 +474,48 @@ only +-1% between reps *within* a pass. Arm 2 was the casualty: an 8% "win" in
 pass 1 that is 1.5% when interleaved. Only arms measured in the same interleaved
 batch may be compared; arm ordering alone is worth more than most of the effects
 in the table above.
+
+### The auto budget now holds the whole routed set (byte trigger, not slot count)
+
+The eviction trigger used to be a slot COUNT: `vram_slots_ >= budget_ / need`,
+where `need` is the expert footprint of whichever layer was being acquired. The
+budget is a byte budget and this model's experts are not one size — 56 are
+5.8359 MiB (Q6_K `down_proj`) and 56 are 5.0625 MiB (Q4_K), **610.312 MiB in
+total, which is exactly what the auto policy hands it**. So the count read
+**104** at a Q6_K layer and **126** at a Q4_K one, and a budget sized for the
+whole set evicted 23 experts per 64-token run with ~43 MiB of itself unspent:
+21 of its 131 promotions were re-promotions of experts the budget had already
+paid for.
+
+Room is made in bytes now (`bytes_ + need > budget_`, the predicate the hybrid
+path already used), `--expert-cache-slots N` is enforced as the count its help
+text has always promised, and the `N/M slots resident` denominator is the
+model's own slot count whenever the budget covers the whole set.
+
+`-p "The history of computing is a history of abstraction" -n 64 --temp 0
+--greedy --ctx 512`, auto budget (610 MiB). The "before" column is the previous
+build, from the session that found this; the "after" column is this one:
+
+| | before (count trigger) | after (byte trigger) |
+|---|---:|---:|
+| slots resident | 108/104 (over-resided on pins) | 110/112 |
+| VRAM evictions | 23 | **0** |
+| promotions | 131 | 110 (compulsory only) |
+| room-making | not recorded | 0.0 ms |
+| device bytes | 610 MiB budget | 599 MiB resident of 610 MiB |
+
+Interleaved, same binary, 3 reps each: auto **108.7 / 110.9 / 106.3** tok/s;
+`--expert-cache-slots 104` (103 evictions, room 0.6-1.2 ms) 105.4 / 102.2 /
+96.2; `--expert-cache-mb 1024` — the old workaround, whose counters are now
+*identical* to auto's (0 evictions, 110 promotions) — 108.7 / 106.3 / 89.7. The
+counters are exact and deterministic; the tok/s spread is the box (an arm that is
+behaviorally identical to auto still ranged 89.7-108.7), so treat the ~5% as
+unresolved on a loaded machine and the 23 -> 0 as the result. Text is
+byte-identical across all three arms and both triggers (md5 `cf0408eb02`).
+
+`kraken-tests` 2695/2695 — the policy now has a regression test that fails on the
+count trigger: a synthetic two-layer corpus of 24- and 40-byte experts, where a
+budget equal to the corpus must evict nothing and one byte less must evict.
 
 ---
 ## 11. The ternary `Q2_0` file, the id-142 file, and where host RAM goes
@@ -808,3 +850,219 @@ rc=0, and `coherence_check.sh` on SmolLM2-135M / Qwen3.5-0.8B /
 Qwen3-MoE-4x0.6B => "3 coherent, 0 not".
 
 ---
+
+---
+## 13. KV residency: packing the layout, and two ways a tier lied
+
+The audit in `docs/AUDIT-residency-byte-budgets.md` found that the KV charge was
+`n_layer x widest` where the model keeps KV on a few layers. The fix is a packed
+per-layer layout, and verifying it turned up two more defects in the same file:
+an eviction that was a DROP counted as a spill, and two planes spilling to the
+same filename.
+
+### 13.1 The charge is now the KV that exists
+
+`Engine` builds `len[l]` from `Model::layer_has_kv(l)` (the layer has a query
+projection) and `Model::kv_dim_at(l)`, and charges `sum(len) * 2`.
+`KvTierCache` packs the same lengths: `off_` is a prefix sum over the
+KV-carrying layers, `total_` is their sum, and a HOT slot is `max(len)` so a
+layer is promoted into a slot big enough for it and writes its own bytes. One
+width per layer is no longer a layout requirement.
+
+Measured, `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-noMTP.gguf` (52 layers,
+`attention.head_count_kv` = 0 on 46 / 2 on 6, six layers with a query
+projection), `--ctx 4096`:
+
+| | before | after |
+|---|---|---|
+| reported and reserved KV | 208 MiB | **24 MiB** |
+| ratio to the KV that can exist | 8.67x | 1.00x |
+
+The same model with the tiers engaged is the load-bearing test for the packing,
+because 46 of its 52 layers hold no KV at all and the tiered path walks every
+layer through `base()`. `--ctx 512 -n 8 --greedy`, 2 HOT slots:
+
+```
+[info ] kv tiered: 6 KV layer(s) of 3 MiB, 2 HOT + 6 WARM slot(s) of 0.25 MiB
+(largest layer), 0.50 MiB VRAM for HOT
+[stats ] kv        tiered: 6 KV layer(s) x 0.25 MiB per plane, 2 HOT slots
+(1.00 MiB VRAM) | promoted WARM->HOT 84, COLD->HOT 0 | evicted HOT->WARM 92,
+->COLD 0 | 44.0 MiB migrated
+```
+
+92 evictions, 0 dropped, and stdout md5 `bccc5ac1c506` -- **identical to the
+flat arm**. A model that keeps KV on 6 of 52 layers is charged for those 6,
+packed into 6 planes across two tiers, and still decodes byte-for-byte what the
+flat cache decodes.
+
+### 13.2 A dropped page and a spilled page were the same counter
+
+`evict_slot` demotes WARM first, then COLD, then nothing. The third branch sets
+`tier_[owner] = kAbsent`, and `ensure_hot` then `fill0`s the plane: the layer's
+history is gone and nothing recomputes it. It incremented the same counter as a
+COLD spill, so a run that lost a page every step reported a working disk tier --
+and kept printing fluent text.
+
+`KvTierStats::evictions_dropped` is now its own counter, and **the WARM capacity
+is derived from the geometry instead of from its budget.** The auto budget was
+`kv_total - hot`, which lost the difference to slot rounding: `--kv-hot-mb 1
+--ctx 512` on SmolLM2-135M (30 KV layers, 0.19 MiB per plane) came out **2 HOT +
+26 WARM = 28 slots for 30 layers**, so two layers could never be resident and
+pages were dropped on every pass.
+
+Fixing that one shortfall was not enough: any `--kv-warm-mb` below the working
+set reproduced it, and the flag is a *budget*, so the policy cannot be "the
+auto value is big enough". With no cold dir, `init` now pins the capacity at
+`n_kv_layers_` -- the count `layer_bytes` implies -- whatever the flag says, and
+that count is not a heuristic: `to_warm` refuses when the live WARM pages reach
+the capacity, and at the moment of an admission the layer being promoted is
+still counted in WARM while HOT holds at least the page being evicted, so
+`|WARM| <= n_kv_layers_ - 1` and one more admission needs `n_kv_layers_`. A
+smaller `--kv-warm-mb` is raised and the deviation is reported; it is obeyed
+where a spill directory exists, because there a page that cannot reach WARM is
+on disk instead of lost. A `--kv-cold-dir` that cannot be *written* is probed
+once at load and treated as absent (and reported), since a failed
+`fopen`/`fwrite` in `to_cold` is a drop.
+
+WARM buffers are allocated lazily, so the floor costs the count and nothing
+else until an eviction actually lands in a slot.
+
+`SmolLM2-135M-Instruct.Q4_K_M`, `-p "The history of computing is a history of
+abstraction, from relays to vacuum tubes" -n 32 --greedy --ctx 512`, 2 HOT
+slots, md5 of stdout:
+
+| arm | evictions | dropped | md5 |
+|---|---:|---:|---|
+| flat (no tier) | -- | -- | `2456dfa5ba9e` |
+| `--kv-hot-mb 1` (auto WARM) | 1916 ->WARM | **0** | `2456dfa5ba9e` |
+| `--kv-hot-mb 1 --kv-warm-mb 64` | 1916 ->WARM | **0** | `2456dfa5ba9e` |
+| `--kv-hot-mb 1 --kv-warm-mb 0 --kv-cold-dir DIR` | 1916 ->COLD (1860 back) | **0** | `2456dfa5ba9e` |
+| `--kv-hot-mb 1 --kv-warm-mb 0` (WARM raised to 30, reported) | 1916 ->WARM | **0** | `2456dfa5ba9e` |
+| `--kv-hot-mb 1 --kv-warm-mb 0 --kv-cold-dir NOT_WRITABLE` | 1916 ->WARM | **0** | `2456dfa5ba9e` |
+
+The auto arm was `94cf3cc56de2` with 132 pages dropped before the fix, and the
+`--kv-warm-mb 0` arm `d6a7b98cc34d` with 1556. Every arm is now byte-identical
+to the flat cache. The flag still means something when it is obeyed, and where
+it cannot be, the run says so:
+
+```
+[warn ] kv: --kv-warm-mb allows 0.0 MiB of WARM for 30 KV layer(s) and one pass
+needs all of them, and there is no --kv-cold-dir to spill to, so WARM was raised
+to 30 slot(s) = 11.2 MiB. A page that fits nowhere is DROPPED and its layer is
+zero-filled on its next step, which decodes WRONG text, so the budget is not
+obeyed unless a spill directory exists. WARM is allocated lazily, so this costs
+nothing until an eviction actually lands there; raise --kv-hot-mb (0.19 MiB per
+slot) if it must not page through host memory, or set --kv-cold-dir to keep the
+smaller WARM.
+[warn ] kv: --kv-cold-dir 'C:/.../no_such_dir' is not writable, so it was
+ignored and evictions are held in WARM instead. A spill that fails on
+fopen/fwrite is a DROPPED page, which is a wrong decode, so an unwritable
+directory is treated as no directory.
+```
+
+Both warnings print once. They used to print **twice**, because each plane
+raised its own; the engine now reports the geometry it owns. The `DROPPED`
+stats line is still there for the cases the policy cannot cover (a spill that
+fails mid-run, host RAM that will not allocate), because those are still wrong
+decodes and still have to be visible rather than inferred.
+
+`scripts/kv_tier_geometry_check.sh` runs this over every model on the machine:
+load arms per model judged against the file's own header by
+`tools/kv_tier_geometry.py`, plus a decode arm on every small model whose stdout
+must equal the flat cache's byte for byte. The arms are
+
+```
+A  --kv-hot-mb 1                                    the auto WARM policy
+B  --kv-hot-mb 1 --kv-warm-mb 0                     a budget with nowhere to spill
+C  --kv-hot-mb 1 --kv-warm-mb 0 --kv-cold-dir DIR   the spill path
+```
+
+and the knobs are `KRK_CTX` (512), `KRK_TOKENS` (8), `KRK_DECODE_MAX_MB`
+(1200), `KRK_TIMEOUT` (420), `KRK_MODEL_DIRS`, `KRK_LOG_DIR`, `KRK_ARMS`
+(`"A B C"`; `KRK_ARMS=B` is one load per model instead of three, which is how
+the large ones get covered), `KRK_MAX_MB` (0 = no cap) and `KRK_MIN_MB`. A model
+above `KRK_MAX_MB` is reported `NOT COVERED` rather than quietly left out. A
+refused file is prefiltered by `kraken-inspect` and reported `SKIP`, because a
+refusal is a fact about the header and costs one process, not three loads --
+the same reasoning that puts `kraken-inspect` in the build line.
+
+Measured on this machine, every arm judged against the file's own header:
+
+```
+KRK_MAX_MB=1200, full matrix (A B C) + decode arms    7 passed, 0 failed, 126 skipped
+KRK_MAX_MB=8000, arm B only (one load per model)     49 passed, 0 failed,  84 skipped
+```
+
+The skips are 11 refusals settled by `kraken-inspect` and the models above the
+cap, each printed rather than silently omitted. Every arm that ran printed the
+raise, and no arm printed a `[stats ] kv DROPPED` line. The warning *prose*
+contains the word `DROPPED` (it explains what happens to such a page), which is
+why the checker requires the `[stats ]` prefix and `page(s)` on the same line
+before it believes a drop happened. All **49** arm-B logs mention `DROPPED` in
+that prose and **0** printed a drop line, so a bare substring match would have
+called every working run corrupt and the checker would have been worthless.
+
+18 of the 49 covered models carry KV on only some of their layers (Bonsai
+16 of 64, Qwen3.5-0.8B 6 of 24, the 9B qwen35 family 8 of 32), which is why a
+single `kv_dim_` per plane is not a layout the tier may assume. The 7 decode
+arms are byte-identical to the flat cache, read from the raw `.flat.out` /
+`.tier.out` files rather than from the script's own report, and include
+`Laguna-S-2.1-UD-Q4_K_M-00001-of-00003.gguf` at 48 KV layers:
+
+```
+SmolLM2-135M-Instruct.Q4_K_M.gguf        flat=5247021e26f1 tier=5247021e26f1
+SmolLM2-135M-Instruct.IQ4_XS.gguf        flat=2acc41a0de04 tier=2acc41a0de04
+Qwen3.5-0.8B.Q4_K_M.gguf                 flat=518bf2b1f607 tier=518bf2b1f607
+Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf        flat=2e5a3f39dfc0 tier=2e5a3f39dfc0
+smolcode-coder-cpp-1.5b-q4_k_m.gguf      flat=659b230ddb25 tier=659b230ddb25
+MiniCPM5-1B-Q8_0.gguf                    flat=776b343b1a38 tier=776b343b1a38
+Laguna-S-2.1-UD-Q4_K_M-00001-of-00003     flat=a464e060f6b6 tier=a464e060f6b6
+```
+
+The remaining models are 8 GiB to 78 GiB; above the cap they are reported
+`NOT COVERED` and a `KRK_ARMS=B` pass is the way to reach them, one load each
+instead of three. What is proven is the invariant (`HOT + WARM >= the KV that
+exists`, for every flag combination) and the decode equality on everything small
+enough to run twice.
+
+### 13.3 Two planes, one filename
+
+`cold_path(layer)` built `"<cold_dir>/kv_layer_<l>.bin"` with no plane in the
+name, and the engine's two caches share `cfg_.kv_cold_dir`. K and V wrote the
+same 30 files, so the second writer won and a restore handed one plane the
+other's bytes -- with counters that look perfect:
+
+```
+before:  1916 ->COLD, 1860 COLD->HOT, 0 dropped, md5 a2e087cbeada   (30 files)
+after:   1916 ->COLD, 1860 COLD->HOT, 0 dropped, md5 2456dfa5ba9e   (60 files)
+flat:                                                               2456dfa5ba9e
+```
+
+Fixed with a `plane_tag` ("k"/"v") in the name. Any `--kv-cold-dir` run before
+this was quietly wrong; the flag is not the default path, which is why it went
+unseen. An old spill directory is orphaned rather than reused, which is the safe
+direction.
+
+### 13.4 No numerics moved
+
+`Qwen3-MOE-4x0.6B-2.4B-Q4_K_M`, `-p "The history of computing is a history of
+abstraction" -n 64 --temp 0 --greedy --ctx 512`, auto budget: **0 VRAM
+evictions**, 110/112 slots resident, room 0.0 ms, stdout md5 `a56e02b731fd` --
+which is also what the archived `dist/kraken/kraken.exe` (Oct 6, before any of
+this work) produces for the identical command. That two builds agree bit-for-bit
+is the evidence that the layout change moved no numbers.
+
+One correction to §10: the text md5 recorded there as `cf0408eb02` does not
+reproduce against the stdout protocol now stated (`banner + generated text`,
+stderr separated) and does not match the pre-refactor binary either, so it was
+measured under a protocol the doc did not record. `a56e02b731fd` is the value
+that reproduces, on both builds.
+
+### 13.5 Gates on the final tree
+
+`scripts/build_check.sh` **0 failed, 0 warning(s)** (`-DNDEBUG` in all 90
+compiled `.cpp` TUs; 5 artifacts hash-matched after a deliberate
+`KRK_REFRESH_FINGERPRINT=1` re-record), the ninja six-target line rc=0 with 0
+`error:` lines, `kraken-tests` **2695/2695**, `kraken-bench --gate` rc=0, and
+`coherence_check.sh` on SmolLM2-135M / Qwen3.5-0.8B / Qwen3-MoE-4x0.6B =>
+"3 coherent, 0 not".

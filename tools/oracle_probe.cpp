@@ -469,6 +469,115 @@ int gdn_suite(Backend *cpu, Backend *gpu) {
     return gdn_bad == 0 ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// mamba-2 SSD: the CPU f32 reference against the HIP f16 kernel, at the real
+// nemotron geometry (n_heads = 64, head_dim = 64, d_state = 128, n_group = 8).
+// The recurrence runs as a SEQUENCE of calls and the carried state is compared
+// too, because a single call cannot tell a correct state update from a
+// plausible one.
+// ---------------------------------------------------------------------------
+// The scan's inputs are regions of ONE fused row, so the layout is part of the
+// contract: x at the head block, then B, then C, with dt as its own row. Two
+// geometries run on purpose -- the shipped 64x64 (n_head x head_dim) and a
+// 16x32 one where the two differ. With n_head == head_dim a per-POSITION read
+// of the per-HEAD D vector hits the element the correct code would also pick,
+// so the mistake cannot fail here; with them different it walks another slot,
+// which is the whole reason this arm exists.
+//
+// Every case runs with a real D (has_d = true) and with dt carried across calls.
+int ssd_suite(Backend *cpu, Backend *gpu) {
+    std::printf("== mamba-2 SSD scan: CPU f32 vs HIP f16 ==\n");
+    struct Geom {
+        i64 n_head, hd, d_state, n_group;
+    };
+    const Geom geoms[] = {{64, 64, 128, 8}, {16, 32, 128, 8}};
+    const i64 steps[] = {1, 7, 48};
+    const f64 kA = 4e-3, kR = 8e-2; // f16 activations, recurrent accumulation
+
+    for (const Geom &G : geoms) {
+        const i64 n_head = G.n_head, hd = G.hd, d_state = G.d_state;
+        const i64 n_group = G.n_group;
+        const i64 inner = n_head * hd;
+        const i64 xw = inner + 2 * n_group * d_state; // xBC only; dt is separate
+        // dt is drawn small-negative through a so the decay stays < 1 (a real
+        // model's A is negative); everything else is bounded noise.
+        std::vector<f32> av(static_cast<size_t>(n_head));
+        std::vector<f32> dbv(static_cast<size_t>(n_head));
+        std::vector<f32> dpv(static_cast<size_t>(n_head));
+        for (i64 h = 0; h < n_head; h++) {
+            av[static_cast<size_t>(h)] = -0.5f - 2.0f * std::fabs(gdn_rand(1.0f));
+            dbv[static_cast<size_t>(h)] = gdn_rand(2.0f);
+            // One distinct magnitude per head, so a read that loses track of
+            // which head it belongs to cannot land on the right value.
+            dpv[static_cast<size_t>(h)] = 0.25f * static_cast<f32>(h + 1);
+        }
+
+        for (int c = 0; c < 3; c++) {
+            const i64 nt = steps[c];
+            ActBuf x(cpu, gpu, nt * xw), out(cpu, gpu, nt * inner);
+            ActBuf dtb(cpu, gpu, nt * n_head);
+            F32Vec a(cpu, gpu, n_head), db(cpu, gpu, n_head), dp(cpu, gpu, n_head);
+            a.set(av);
+            db.set(dbv);
+            dp.set(dpv);
+            x.set(gdn_data(nt * xw, 1.0f));
+            dtb.set(gdn_data(nt * n_head, 1.5f));
+            out.set(std::vector<f32>(static_cast<size_t>(nt * inner), 0.0f));
+            // f32 state, zeroed only on the first call (carried afterwards).
+            f32 *stc = static_cast<f32 *>(
+                cpu->alloc(static_cast<size_t>(n_head * hd * d_state) * 4));
+            void *stg =
+                gpu->alloc(static_cast<size_t>(n_head * hd * d_state) * 4);
+            std::vector<f32> sz(static_cast<size_t>(n_head * hd * d_state), 0.0f);
+            cpu->upload(stc, sz.data(), sz.size() * 4);
+            gpu->upload(stg, sz.data(), sz.size() * 4);
+
+            cpu->ssd_scan(out.c, stc, x.c, dtb.c, a.c, db.c, dp.c, nt, n_head, hd,
+                          d_state, n_group, inner, xw, true);
+            gpu->ssd_scan(out.g, stg, x.g, dtb.g, a.g, db.g, dp.g, nt, n_head, hd,
+                          d_state, n_group, inner, xw, true);
+            char nm[80];
+            std::snprintf(nm, sizeof(nm), "ssd_scan %lldx%lld n=%lld%s",
+                          (long long)n_head, (long long)hd, (long long)nt,
+                          c == 0 ? " (fresh)" : " (carried)");
+            gdn_report(nm, out.ref(), out.got(), kA, kR);
+            if (c == 2) {
+                std::vector<f32> got_st(
+                    static_cast<size_t>(n_head * hd * d_state));
+                gpu->download(got_st.data(), stg, got_st.size() * 4);
+                std::snprintf(nm, sizeof(nm), "  (ssd state %lldx%lld)",
+                              (long long)n_head, (long long)hd);
+                gdn_report(nm, std::vector<f32>(stc, stc + got_st.size()),
+                           got_st, kA, kR);
+            }
+            cpu->release(stc);
+            gpu->release(stg);
+        }
+    }
+
+    // The grouped RMSNorm that closes the block: ssm_norm holds one vector PER
+    // GROUP and the reduction spans that group's width. A merged single-vector
+    // norm, or a row count that does not describe the buffer it is handed,
+    // passes the scan arm above and fails here.
+    {
+        const i64 n_tok = 5, n_group = 8, width = 512;
+        const i64 stride = n_group * width;
+        const i64 wn = n_group * width;
+        ActBuf x(cpu, gpu, n_tok * stride), y(cpu, gpu, n_tok * stride);
+        F32Vec w(cpu, gpu, wn);
+        x.set(gdn_data(n_tok * stride, 2.0f));
+        y.set(std::vector<f32>(static_cast<size_t>(n_tok * stride), 0.0f));
+        w.set(gdn_data(wn, 1.0f)); // distinct per group, so sharing one fails
+        cpu->rmsnorm_grouped(y.c, x.c, w.c, n_tok, n_group, width, stride, 1e-5f);
+        gpu->rmsnorm_grouped(y.g, x.g, w.g, n_tok, n_group, width, stride, 1e-5f);
+        gdn_report("rmsnorm_grouped 8x512", y.ref(), y.got(), 4e-3, 1e-2);
+    }
+
+    std::printf("== %s ==\n", gdn_bad == 0 ? "mamba-2 SSD ops agree"
+                                           : "MAMBA-2 SSD MISMATCH");
+    return gdn_bad == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -489,6 +598,19 @@ int main(int argc, char **argv) {
             return 1;
         }
         const int rc = gdn_suite(c, g);
+        delete g;
+        delete c;
+        return rc;
+    }
+    if (argc > 1 && std::string(argv[1]) == "--ssd") {
+        std::string err;
+        Backend *c = make_cpu_backend();
+        Backend *g = make_hip_backend(0, &err);
+        if (!g) {
+            std::printf("no HIP device: %s\n", err.c_str());
+            return 1;
+        }
+        const int rc = ssd_suite(c, g);
         delete g;
         delete c;
         return rc;

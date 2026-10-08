@@ -86,11 +86,44 @@ struct ExpertSource {
     const GgufTensor *gate = nullptr;
     const GgufTensor *up = nullptr;
     const GgufTensor *down = nullptr;
+
+    // The per-tensor global scale GGUF stores BESIDE an NVFP4 weight, as
+    // "<tensor>.scale". NVFP4 is encoded as a 4-bit code times a per-16-value
+    // UE4M3 micro-scale, and that product is not the weight: the global factor
+    // has to be applied on top. Measured on
+    // NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4, layer 27 ffn_up_exps: the
+    // codes and micro-scales alone give max|w| = 768, rms = 100, where the
+    // global factor (~9e-5 per expert) brings the same matrix to max = 0.06,
+    // rms = 0.0096. The raw magnitude is four orders out and overflows the f16
+    // activation buffer, which is how it showed up: a handful of projection
+    // cells stored as +inf, and then NaN where a second corruption multiplied
+    // them by zero.
+    //
+    // One f32 per expert for a routed bank ([n_expert] long) and a single f32
+    // for a dense one ([1]); scale_of reads whichever the shape says. A file
+    // with no sidecar gets 1.0, which is what every non-NVFP4 expert tensor
+    // means, so nothing changes for the formats that never carried one.
+    const GgufTensor *gate_scale = nullptr;
+    const GgufTensor *up_scale = nullptr;
+    const GgufTensor *down_scale = nullptr;
+
+    f32 scale_of(const GgufTensor *t, i32 e) const {
+        if (!t || !t->data || t->n_elements < 1) return 1.0f;
+        const f32 *s = reinterpret_cast<const f32 *>(t->data);
+        const i64 want = (n_expert > 1 && t->ne[0] == static_cast<u64>(n_expert))
+                             ? static_cast<i64>(e)
+                             : 0;
+        return s[want < t->n_elements ? want : 0];
+    }
     i32 n_expert = 0;
     i64 n_embd = 0;   // inner dimension of the gate/up matrices
     i64 n_ff_exp = 0; // expert hidden width
 
-    bool present() const { return gate != nullptr && up != nullptr && down != nullptr; }
+    // up/down are the two tensors every MoE schema carries; nemotron_h_moe
+    // routes with those alone (no ffn_gate_exps). Requiring the gate here made
+    // every acquire() of a nemotron expert return null before touching a
+    // counter — 0 acquires, 0 traffic, a silently expert-less model.
+    bool present() const { return up != nullptr && down != nullptr; }
     // Bytes of one expert's slice in each of the three tensors.
     size_t per_expert(const GgufTensor *t) const {
         return t && n_expert > 0 ? t->n_bytes / static_cast<size_t>(n_expert) : 0;
@@ -123,7 +156,16 @@ public:
     // slot is always allowed, even if a single expert exceeds the budget.
     // host_budget_bytes caps the second tier; 0 (the default) disables it and
     // evicted experts are dropped to the mapping exactly as before.
-    void configure(Backend *be, size_t budget_bytes, size_t host_budget_bytes = 0);
+    //
+    // slot_budget is how many (layer, expert) slots the byte budget was sized
+    // for, or 0 (the default) to leave that to the bytes. When it is set it is
+    // a hard count cap AND the denominator capacity_slots() reports. It exists
+    // because "how many slots fit in N bytes" has no single answer for a corpus
+    // that mixes expert sizes, and the caller knows the answer exactly in the
+    // two cases that matter: an explicit --expert-cache-slots N, and a budget
+    // that covers the model's whole routed set.
+    void configure(Backend *be, size_t budget_bytes, size_t host_budget_bytes = 0,
+                   size_t slot_budget = 0);
     void clear();
 
     // Returns the resident matrices for (layer, expert), loading on a miss.
@@ -187,7 +229,12 @@ public:
     size_t resident_bytes() const { return bytes_; }
     // Device-resident slots, i.e. the ones whose weights are in VRAM right now.
     size_t resident_slots() const { return vram_slots_; }
+    // How many (layer, expert) slots the device budget is sized for: the exact
+    // count when the caller supplied one (slot_budget), otherwise the byte
+    // budget divided by the expert footprint of the layer being acquired, which
+    // is an estimate for a corpus whose layers differ in size.
     size_t capacity_slots() const { return capacity_; }
+    size_t slot_budget() const { return slot_budget_; }
     // WARM tier (the second tier). The warm_* names are the ones the reports
     // use; the host_* spellings are kept for existing callers.
     size_t warm_capacity_bytes() const { return host_budget_; }
@@ -270,8 +317,17 @@ private:
         // WARM is inclusive: a slot may sit in both tiers at once, and a HOT
         // slot's WARM copy is what makes its eviction free. A slot in neither
         // tier is forgotten (see forget_if_dead).
-        bool in_vram() const { return m.gate.present(); }
-        bool in_host() const { return h.gate.present(); }
+        // Anchored on up/down -- the two tensors every MoE schema carries.
+        // These used to test the *gate* copy, and nemotron_h_moe has no
+        // ffn_gate_exps: every staged slot then reported itself as neither
+        // warm nor resident. Measured on
+        // NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4: "WARM 15758 MiB of
+        // 15758 MiB in 0 slots", the warm evictor found no victims (5492
+        // rejects), every acquire fell through to a cold file read (918
+        // MiB/token) and leaked an untracked VRAM buffer per acquire until
+        // the device reported 15.92 GiB in use with 0 evictions.
+        bool in_vram() const { return m.up.present() && m.down.present(); }
+        bool in_host() const { return h.up.present() && h.down.present(); }
     };
 
     // One acquire on a resident slot: counters earn pins, pins are never free.
@@ -293,9 +349,25 @@ private:
     bool warm_admit(const ExpertSource &src, i32 expert, Slot &s);
     // Host -> device. Makes VRAM room first, so it can evict like any miss.
     bool promote_to_vram(Slot &s);
-    // Evicts until one more device slot fits. Over-resides by one rather than
-    // stalling when every resident slot is pinned.
-    void make_vram_room();
+    // Evicts until one more slot of `need` bytes fits. Bytes are the test, not a
+    // slot count: experts are not all one size, so counting slots against a
+    // per-expert estimate evicts with budget left unspent. Over-resides by one
+    // rather than stalling when every resident slot is pinned.
+    void make_vram_room(size_t need);
+    // True when admitting one more slot of `need` bytes would exceed what this
+    // cache is allowed to hold: the byte budget, or the explicit slot count when
+    // one was configured. The two rules disagree on purpose -- a Q4_K_M corpus
+    // mixes Q4_K and Q6_K down-projections, so one layer's expert footprint is
+    // not the next layer's, and budget_ / one_layer_expert is neither the memory
+    // limit nor a count that holds the whole set.
+    bool over_budget(size_t need) const {
+        // A request with no bytes still takes a slot, so it falls back to the
+        // count rule: unbounded residency for a degenerate source would grow the
+        // slot map without limit.
+        if (need == 0) return capacity_ > 0 && vram_slots_ >= capacity_;
+        return bytes_ + need > budget_ ||
+               (slot_budget_ > 0 && vram_slots_ >= slot_budget_);
+    }
     // Evicts WARM copies until need bytes fit. Pins do not apply here.
     void make_warm_room(size_t need);
     // Drops a slot from the map once it lives in neither tier.
@@ -321,6 +393,7 @@ private:
     size_t budget_ = 0;
     size_t bytes_ = 0;
     size_t capacity_ = 0;
+    size_t slot_budget_ = 0; // exact slot ceiling, 0 = derive from the bytes
     size_t vram_slots_ = 0;
     size_t host_budget_ = 0;
     size_t host_bytes_ = 0;

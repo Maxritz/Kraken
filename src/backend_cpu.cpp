@@ -114,6 +114,35 @@ public:
         rmsnorm_rows(static_cast<f32 *>(out), static_cast<const f32 *>(x), w, rows,
                      n, eps);
     }
+
+    void rmsnorm_grouped(void *o, const void *x, const f32 *w, i64 n_tok,
+                         i64 n_group, i64 width, i64 stride,
+                         f32 eps) override {
+        const f32 *s = static_cast<const f32 *>(x);
+        f32 *d = static_cast<f32 *>(o);
+        // Salient difference from rmsnorm_rows above: the reduction and the
+        // weight both belong to the (token, group) pair, so the weight index is
+        // the row's group, not a row-invariant w[i]. Safe in place: the
+        // reduction completes before the first write to that group's channels,
+        // and no other row touches them.
+        const i64 rows = n_tok * n_group;
+        par_for(rows, 1, 4.0 * static_cast<f64>(rows) * width,
+                [&](i64 b, i64 e) {
+                    for (i64 r = b; r < e; r++) {
+                        const i64 t = r / n_group;
+                        const i64 g = r % n_group;
+                        const f32 *sr = s + t * stride + g * width;
+                        f32 *dr = d + t * stride + g * width;
+                        const f32 *wr = w + g * width;
+                        f32 ss = 0;
+                        for (i64 i = 0; i < width; i++) ss += sr[i] * sr[i];
+                        const f32 inv = 1.0f /
+                            std::sqrt(ss / static_cast<f32>(width) + eps);
+                        for (i64 i = 0; i < width; i++)
+                            dr[i] = sr[i] * inv * wr[i];
+                    }
+                });
+    }
     // The scalar twin of the device radix select (kernels/topk.hpp). Same
     // contract and same order -- transform first, then rank by (value, id)
     // descending -- so the two backends can be compared token for token. This
@@ -453,6 +482,18 @@ public:
                 });
     }
 
+    void relu_sqr_act(void *x, i64 n) override {
+        f32 *p = static_cast<f32 *>(x);
+        par_for(n, 8192, 4.0 * static_cast<f64>(n),
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const f32 v = p[i];
+                        const f32 r = v > 0.0f ? v : 0.0f;
+                        p[i] = r * r;
+                    }
+                });
+    }
+
     void softplus_act(void *x, i64 n) override {
         f32 *p = static_cast<f32 *>(x);
         par_for(n, 8192, 4.0 * static_cast<f64>(n),
@@ -570,7 +611,8 @@ public:
     }
 
     void conv1d_silu(void *out, const void *in, void *state, const void *kern,
-                     DType wt, i64 n_tok, i64 chan, i64 ksize) override {
+                     DType wt, i64 n_tok, i64 chan, i64 ksize,
+                     const void *bias = nullptr) override {
         if (ksize <= 0 || ksize > kMaxConvKernel) return;
         const f32 *xp = static_cast<const f32 *>(in);
         f32 *st = static_cast<f32 *>(state);
@@ -600,8 +642,9 @@ public:
                         for (i64 i = 1; i < ksize; i++)
                             win[i] = st[(ksize - 1 - i) * chan + c];
                         win[0] = xp[c];
+                        const f32 b = bias ? static_cast<const f32 *>(bias)[c] : 0.0f;
                         for (i64 t = 0; t < n_tok; t++) {
-                            f32 acc = 0;
+                            f32 acc = b;
                             for (i64 j = 0; j < ksize; j++)
                                 acc += w[static_cast<size_t>(j * chan + c)] * win[keep - j];
                             o[t * chan + c] = silu_scalar(acc);
@@ -612,6 +655,84 @@ public:
                         // the rows the next call continues from.
                         for (i64 j = 0; j < keep; j++)
                             st[j * chan + c] = win[keep - j];
+                    }
+                });
+    }
+
+    // The scalar Mamba-2 SSD scan — the reference oracle the device kernel is
+    // checked against. One thread-per-slot recurrence per block-methodology
+    // claim in the header above: slot (h, p, s) owns an f32 cell of `state`
+    // (layout [head][p][s]), walks the token loop in order, and writes nothing
+    // but out[t, pair] — so the token sequence is the only sequential part.
+    //
+    // Inputs are regions of one fused post-conv post-SiLU row of conv_dim
+    // elements per token; a/b/dp are per-head vectors; `out` is dense
+    // [n_tok, inner]. The GDN path keeps f32 state at higher precision than
+    // its f16 activations; this path keeps it too, for the same reason.
+    void ssd_scan(void *out, void *state, const void *xbc_v, const void *dt_v,
+                   const void *a_v, const void *db_v, const void *dp_v,
+                   i64 n_tok, i64 n_head, i64 head_dim, i64 d_state,
+                   i64 n_group, i64 inner, i64 conv_dim, bool has_d) override {
+        f32 *o = static_cast<f32 *>(out);
+        f32 *S = static_cast<f32 *>(state);
+        const f32 *xbc = static_cast<const f32 *>(xbc_v);
+        const f32 *dtv = static_cast<const f32 *>(dt_v);
+        const f32 *a = static_cast<const f32 *>(a_v);
+        const f32 *db = static_cast<const f32 *>(db_v);
+        const f32 *dp = has_d ? static_cast<const f32 *>(dp_v) : nullptr;
+
+        // dt = softplus(dt_raw + db[h]), the step size. The recurrence is
+        //   h' = exp(a[h]*dt) * h + dt * u * B[g,s]
+        // -- the DECAY takes A, the input term does NOT. ggml's reference:
+        //   dA = expf(dt_soft_plus * A[h]);
+        //   x_dt = x[ii] * dt_soft_plus;
+        //   s    = s*dA + B*x_dt;
+        // Both backends used to scale the input term by a[h]*dt as well, which
+        // is invisible to a device-vs-CPU test because they shared it.
+        auto dt_step = [&](i64 t, i64 h) {
+            const f32 x = dtv[t * n_head + h] + db[h];
+            // Same tail behaviour as the device d_softplus: above 20 it is v
+            // to f32, below -20 it is exp(v), else the real logarithm.
+            return x > 20.0f ? x : (x < -20.0f ? std::exp(x)
+                                               : std::log1p(std::exp(x)));
+        };
+
+        // Per-slot recurrences. Slots partition over (h, p): one state cell +
+        // its own output accumulator, so the pool can split over heads with
+        // whole-head ownership. The token loop inside a head is sequential.
+        par_for(n_head, 1, 8.0 * static_cast<f64>(n_tok) * n_head * head_dim *
+                               d_state,
+                [&](i64 hb, i64 he) {
+                    std::vector<f32> y(n_tok);
+                    for (i64 h = hb; h < he; h++) {
+                        f32 *Sh = S + static_cast<size_t>(h) * head_dim * d_state;
+                        const i64 g = h * n_group / n_head; // grouped state
+                        for (i64 t = 0; t < n_tok; t++) {
+                            const f32 dtv_ = dt_step(t, h);
+                            const f32 decay = std::exp(a[h] * dtv_);
+                            const f32 *Bt = xbc + t * conv_dim + inner + g * d_state;
+                            const f32 *Ct = Bt + n_group * d_state;
+                            f32 *ot = o + (t * n_head + h) * head_dim;
+                            for (i64 p = 0; p < head_dim; p++) {
+                                const f32 up = xbc[t * conv_dim + h * head_dim + p];
+                                f32 *Sp = Sh + p * d_state;
+                                f32 acc = 0;
+                                for (i64 s = 0; s < d_state; s++) {
+                                    f32 cell = Sp[s] * decay + dtv_ * up * Bt[s];
+                                    Sp[s] = cell;
+                                    acc += cell * Ct[s];
+                                }
+                                // D is per HEAD and broadcast over the
+                                // head's channels: the reference adds
+                                // ggml_mul(x, ssm_d) with x [head_dim, n_head]
+                                // and ssm_d [1, n_head], so the head index
+                                // selects the scalar. n_head == head_dim on the
+                                // 30B file, which is exactly why a per-position
+                                // read here survives every test that uses that
+                                // one shape.
+                                ot[p] = acc + (dp ? dp[h] * up : 0.0f);
+                            }
+                        }
                     }
                 });
     }

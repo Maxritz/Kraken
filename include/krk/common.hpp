@@ -77,6 +77,15 @@ f32 bf16_to_fp32(u16 h);
 u16 fp32_to_bf16(f32 f);
 
 // ---------------------------------------------------------------------------
+// Size of a file in bytes. Correct past 2 GiB, which ::stat is not: MSVC's
+// struct stat carries a 32-bit st_size, so an 18 GiB model reports 0 through it
+// (or fails outright) -- and a source-size guard that compares 0 against the
+// real size is a guard that reads as "mismatch" for every file and therefore
+// gets written to never fire. Uses GetFileSizeEx on Win32 and fstat on POSIX,
+// the same pair MappedFile::open already relies on. False when the file cannot
+// be opened or is empty.
+bool file_size(const std::string &path, u64 *out);
+
 // MappedFile — read-only file view (mmap on POSIX, CreateFileMapping on Win32)
 // ---------------------------------------------------------------------------
 

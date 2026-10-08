@@ -140,6 +140,58 @@ def scan(path):
                             out['out_type'] = DT.get(tt, 'T%d' % tt)
                         break
             out['n_tensors'] = tc
+
+            # KV geometry PER LAYER, which the scalars above cannot express. A
+            # hybrid keeps KV on a subset of its blocks (nemotron_h_moe: 6 of
+            # 52) and a per-layer head count is legal (gemma4 declares
+            # attention.head_count_kv as an array), so neither the charge nor
+            # the number of layers a KV tier must hold is predictable from
+            # `n_layer x n_head_kv`. Two independent statements of it come out
+            # of the file itself:
+            #
+            #   kv_layers_by_tensor  blocks carrying an attn_q tensor, which is
+            #                        the same predicate kraken's layer_has_kv
+            #                        uses. null when the naming convention does
+            #                        not apply to this architecture (a fused
+            #                        attn_qkv, for instance), so a caller can
+            #                        tell "absent" from "zero".
+            #   n_head_kv_by_layer   the array verbatim, when it is an array.
+            hkv = meta.get(p + 'attention.head_count_kv')
+            if isinstance(hkv, list):
+                out['n_head_kv_by_layer'] = [int(v) for v in hkv
+                                             if isinstance(v, (int, float))]
+            out['key_length'] = gi('attention.key_length')
+            out['value_length'] = gi('attention.value_length')
+            # The multi-token-prediction heads are the LAST
+            # `<arch>.nextn_predict_layers` blocks, and the engine loads
+            # block_count minus those (verdict.cpp: mtp_block_count, model.cpp
+            # subtracts it and warns). A KV tier's working set is the LOADED
+            # stack, so an attn_q in the skipped tail is not a layer the engine
+            # will ever charge, tier or attend with. Measured: a qwen35 file
+            # with 33 blocks declares nextn_predict_layers 1, so its ninth
+            # attn_q block (blk.32) is a draft head -- the engine reports 8 KV
+            # layers and this scanner, before it read the key, insisted on 9.
+            blk = out.get('n_layer') or 0
+            nextn = meta.get(p + 'nextn_predict_layers')
+            if isinstance(nextn, list) and nextn:
+                nextn = nextn[0]
+            nextn = int(nextn) if isinstance(nextn, (int, float)) else 0
+            if nextn < 0 or nextn > blk:
+                nextn = 0
+            out['nextn_predict_layers'] = nextn
+            out['n_layer_loaded'] = (blk - nextn) if blk else None
+            kvq = set()
+            for name, tt, dims in tensors:
+                if not name.endswith('attn_q.weight'):
+                    continue
+                parts = name.split('.')
+                if len(parts) >= 2 and parts[0] in ('blk', 'block') \
+                        and parts[1].isdigit():
+                    kvq.add(int(parts[1]))
+            if blk:
+                kvq = {i for i in kvq if i < blk - nextn}
+            out['kv_layers_at'] = sorted(kvq)
+            out['kv_layers_by_tensor'] = len(kvq) if kvq else None
     except Exception as e:
         out['error'] = '%s: %s' % (type(e).__name__, e)
     return out
