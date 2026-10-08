@@ -941,14 +941,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             }
         } else if (gguf_.tensor(blk_key("blk.%d.attn_q.weight", l)) ||
                    gguf_.tensor(blk_key("blk.%d.attn_qkv.weight", l)) ||
-                   (!cfg_.nemotron_moe && !cfg_.recurrent)) {
+                   (!cfg_.nemotron_moe && !cfg_.recurrent &&
+                    !gguf_.tensor(blk_key("blk.%d.ffn_up_exps.weight", l)))) {
             // Attention layers. Only 6 of nemotron_h_moe's 52 layers carry
             // attention at all (the rest are mamba-2 or pure-MoE blocks), so
             // the q/k/v/output upload is keyed on the tensors being present,
-            // not on the layer merely not being recurrent. For a non-recurrent,
-            // non-nemotron stack the requirement stays absolute: every layer
-            // must attend, and a missing attn_q there is still a truncated
-            // file.
+            // not on the layer merely not being recurrent. An ordinary stack
+            // requires every layer to attend EXCEPT a layer that carries routed
+            // experts: that is a pure-MoE block, the same kind this family runs
+            // without attention, and the engine already gives a layer with no
+            // q/k/v/output the short path (the `if (L.wq.present())` branch of
+            // the forward pass: the residual is unchanged and the FFN reads the
+            // norm of the same stream). A layer with neither attention nor
+            // experts is still a truncated file, which is what keeps this from
+            // accepting half a download as a model.
             L.wq = need(blk_key("blk.%d.attn_q.weight", l));
             L.wk = need(blk_key("blk.%d.attn_k.weight", l));
             L.wv = need(blk_key("blk.%d.attn_v.weight", l));

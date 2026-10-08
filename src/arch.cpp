@@ -122,8 +122,10 @@ constexpr ArchSpec kTable[] = {
      "",
      false, false, false, false},
     // Nemotron MoE: alternating Mamba-2 SSM blocks + shared experts.
-    // Implementation added 2026-10-07: minimal Mamba-2 support via
-    // src/mamba2.cpp. The architecture uses:
+    // The SSM blocks are loaded by Model::load - the per-layer ssm_* upload,
+    // keyed on the tensors a layer actually carries - and run by the mamba2_ssd
+    // kernels in src/hip/kernels/gdn.hpp, launched from backend_hip and driven
+    // by Engine::mamba2_forward. The architecture uses:
     //   - Even layers: ssm_in, ssm_out, ssm_conv1d, ssm_a, ssm_d, ssm_dt, ssm_norm
     //   - Odd layers: ffn_up_shexp, ffn_down_shexp (shared experts, NVFP4)
     // This is different from GDN: no gate, simpler SSM, different tensor layout.
