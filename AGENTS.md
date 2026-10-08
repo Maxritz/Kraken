@@ -17,9 +17,11 @@ code, the README, or `docs/`.
   runs -- seen live: it refused #41/#21/#22/#18 the day after they were fixed,
   contradicting the README. `build_check.sh` requires it current for the same
   reason.
-- The gate suite is five things, not one: `sh scripts/build_check.sh`, ninja
-  rc=0 with 0 `error:` lines, `kraken-tests` 2751/2751, `kraken-bench --gate`
-  rc=0, and a coherence spot check on the three small models, run as:
+- The gate suite is six things, not one: `sh scripts/build_check.sh`, ninja
+  rc=0 with 0 `error:` lines, `kraken-tests` 2751/2751, `sh
+  scripts/kraken_tests_baseline_check.sh` (names the groups that newly broke
+  against the recorded baseline), `kraken-bench --gate` rc=0, and a coherence
+  spot check on the three small models, run as:
   `bash scripts/coherence_check.sh models/SmolLM2-135M-Instruct.Q4_K_M.gguf
   models/Qwen3.5-0.8B.Q4_K_M.gguf models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf`
   (all three live in the repo's `models/`; expect rc=0 and
@@ -27,6 +29,29 @@ code, the README, or `docs/`.
   scalar reference -- and a device arm that silently fell back to the CPU
   backend fails as `FAIL (cpu)`, so a green run is proof the GPU produced
   the text.
+- **`kraken-tests --report <path>` writes the machine-readable summary, and
+  `tests/kraken-tests-baseline.json` is the last green run.** One group per line,
+  so a re-recorded baseline diffs readably: name, status (`pass`, `failed`,
+  `no-checks`, `crashed`, `no-scratch`, `could-not-start`), passed/run, and up to
+  40 `FAIL` lines with their `file:line`. `KRK_TEST_INPROC=1` writes the same
+  report from counts alone -- no per-group log to read there, so no FAIL text --
+  and a report that was asked for and could not be written exits 1 even when
+  every check passed, because the artifact the caller needs does not exist.
+  `scripts/kraken_tests_baseline_check.sh` runs the suite for a report, runs
+  `tools/test_report_diff.py --selftest` first so a green verdict means the
+  comparison was shown able to fail, and then compares: the only fatal finding is
+  a group the baseline has as passing that this run does not -- *newly broken*,
+  printed with the failing checks' text and nothing else. A count change while
+  still passing is a note (the watermark moves whenever a check is added), and
+  new or removed groups are a change to the suite's *shape* that fails until the
+  baseline is re-recorded deliberately (`KRK_TEST_BASELINE_RECORD=1`, which
+  refuses a run that is not green unless `KRK_BASELINE_FORCE=1`;
+  `KRK_BASELINE_ALLOW_NEW=1` compares anyway). A run whose own exit is non-zero
+  while every group reads as passing (the report could not be written, say) is
+  reported as unusable rather than compared. `recorded_commit` is HEAD at record
+  time, so it names the parent commit of the commit that adds the baseline. The
+  tool's selftest is 12 constructed pairs -- including a fixed group, a crashed
+  group and a still-broken group -- and mutating the classifier makes it fail.
 - That 2751 is a watermark, not a constant: the suite grew 2214 -> 2316 when the
   missing dequantizers landed, 2316 -> 2329 when Q2_0's geometry changed, and
   2329 -> 2751 when the KV-tier per-layer geometry and the sparse-KV fixture

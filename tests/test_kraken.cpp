@@ -4956,6 +4956,7 @@ static const char *kSuiteUsage =
     "  --progress <path>         where that group writes its running counts\n"
     "  --log <path>              where that group's own output goes\n"
     "  --scratch <dir>           the working directory that group runs in\n"
+    "  --report <path>           write the machine-readable summary here\n"
     "  --list-groups             print the group table and exit\n"
     "  --help                    this text\n"
     "\n"
@@ -4974,6 +4975,7 @@ static const char *kSuiteUsage =
     "  KRK_TEST_INJECT_FAIL=<grp>   make every check in one group fail\n"
     "  KRK_TEST_INJECT_EMPTY=<grp>  make one group run NO checks, to show the\n"
     "                               runner refusing to call that a pass\n"
+    "  KRK_TEST_REPORT=<path>       same as --report (the flag wins)\n"
     "  KRK_TEST_SERIAL_OVERRIDE=<grp>  run one group in the serial lane for one\n"
     "                               run, so that lane is exercised, not assumed\n";
 
@@ -5338,6 +5340,110 @@ static void cleanup_fixtures() {
     std::remove(kGdnTestPath);
 }
 
+struct RunOutcome {
+    int index = 0;
+    std::string name;
+    int passed = 0;
+    int run = 0;
+    // "" | FAILED | NO CHECKS | CRASHED 0x.. | COULD NOT START | NO SCRATCH
+    std::string status;
+    // The same state as one word a program can match on: pass, failed,
+    // no-checks, crashed, no-scratch, could-not-start. --report writes this one.
+    std::string kind;
+    std::string log;    // whatever the group printed, replayed under its own line
+    std::string kept;   // where the evidence is, when it was kept
+    bool bad = false;   // counts among the "groups needing attention"
+    bool failed = false; // a check failed (as opposed to the group dying)
+    i64 ms = 0;
+    std::vector<std::string> fail_lines; // the first few FAIL lines of this group
+};
+
+// ---------------------------------------------------------------------------
+//  The machine-readable summary (--report).
+//
+//  The console table is for a human; a gate that compares this run against the
+//  last recorded green one needs the same facts in a form a program can read,
+//  including the text of the failing checks, so that a regression is named with
+//  its reason and not just counted. One group per line, so a recorded baseline
+//  diffs readably in git.
+// ---------------------------------------------------------------------------
+
+static void json_escape(const std::string &in, std::string *out) {
+    for (unsigned char c : in) {
+        if (c == 0x22) out->append("\x5c\x22");      // a bare quote
+        else if (c == 0x5c) out->append("\x5c\x5c"); // a backslash
+        else if (c == 0x0a) out->append("\x5c" "n");
+        else if (c == 0x0d) continue;                // the report is LF-only
+        else if (c == 0x09) out->append("\x5c" "t");
+        else if (c < 0x20) {
+            char esc[8];
+            std::snprintf(esc, sizeof(esc), "\x5c" "u%04x", c);
+            out->append(esc);
+        } else {
+            out->push_back(static_cast<char>(c));
+        }
+    }
+}
+
+// The first `cap` FAIL lines of a group's log. A group can fail every check it
+// has, and what a gate wants from a regression is a reason, not 348 lines of one.
+static void collect_fail_lines(const std::string &log, size_t cap,
+                               std::vector<std::string> *lines) {
+    size_t pos = 0;
+    while (pos < log.size()) {
+        const size_t nl = log.find('\n', pos);
+        std::string ln = log.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = (nl == std::string::npos) ? log.size() : nl + 1;
+        if (!ln.empty() && ln.back() == '\r') ln.pop_back();
+        if (ln.rfind("FAIL ", 0) == 0 && lines->size() < cap) lines->push_back(ln);
+    }
+}
+
+static bool write_report(const char *path, const std::vector<RunOutcome> &done, int workers,
+                         i64 wall_ms, int exit_code) {
+    if (!path || !*path) return true;
+    std::FILE *f = std::fopen(path, "wb");
+    if (!f) {
+        std::fprintf(stderr, "report: cannot write %s\n", path);
+        return false;
+    }
+    int passed = 0, run = 0, bad = 0;
+    for (const RunOutcome &o : done) {
+        passed += o.passed;
+        run += o.run;
+        if (o.bad) bad++;
+    }
+    std::fprintf(f, "{\n  \"format\": 1,\n  \"suite\": \"kraken-tests\",\n");
+    std::fprintf(f, "  \"workers\": %d,\n  \"wall_ms\": %lld,\n", workers,
+                 static_cast<long long>(wall_ms));
+    std::fprintf(f,
+                 "  \"totals\": {\"groups\": %d, \"passed\": %d, \"run\": %d, "
+                 "\"bad_groups\": %d, \"exit\": %d},\n",
+                 static_cast<int>(done.size()), passed, run, bad, exit_code);
+    std::fprintf(f, "  \"groups\": [\n");
+    for (size_t i = 0; i < done.size(); i++) {
+        const RunOutcome &o = done[i];
+        std::string name, kind;
+        json_escape(o.name, &name);
+        json_escape(o.kind, &kind);
+        std::fprintf(f,
+                     "    {\"index\": %d, \"name\": \"%s\", \"status\": \"%s\", \"passed\": %d, "
+                     "\"run\": %d, \"ms\": %lld, \"fail_lines\": [",
+                     o.index, name.c_str(), kind.c_str(), o.passed, o.run,
+                     static_cast<long long>(o.ms));
+        for (size_t k = 0; k < o.fail_lines.size(); k++) {
+            std::string ln;
+            json_escape(o.fail_lines[k], &ln);
+            std::fprintf(f, "%s\"%s\"", k ? ", " : "", ln.c_str());
+        }
+        std::fprintf(f, "]}%s\n", i + 1 == done.size() ? "" : ",");
+    }
+    std::fprintf(f, "  ]\n}\n");
+    const bool ok = std::ferror(f) == 0;
+    std::fclose(f);
+    return ok;
+}
+
 // Child mode. The group announces itself BEFORE running so that a log of a
 // crashed run still says which group was in flight, and the progress file is
 // opened (and zeroed) before that for the same reason.
@@ -5405,30 +5511,56 @@ static int run_one_group(int index, const char *progress, const char *log, const
 
 // The old behaviour, kept as an escape hatch for a debugger and as the A/B that
 // shows the child-process run reports the same numbers.
-static int run_all_inproc() {
+static int run_all_inproc(const char *report) {
     std::fprintf(stderr, "kraken test suite: %d groups, all in this process (KRK_TEST_INPROC)\n",
                  kGroupCount);
     int empty_groups = 0;
     report_injection();
+    const i64 t0 = now_ms();
+    std::vector<RunOutcome> done(static_cast<size_t>(kGroupCount));
     for (int i = 0; i < kGroupCount; i++) {
         g_group = kGroups[i].name;
         g_group_index = i;
         maybe_inject_crash();
         const int was_run = g_run, was_passed = g_passed;
+        const i64 group_t0 = now_ms();
         if (i != empty_group()) kGroups[i].fn();
-        if (g_run == was_run) empty_groups++;
+        RunOutcome &o = done[static_cast<size_t>(i)];
+        o.index = i;
+        o.name = kGroups[i].name;
+        o.passed = g_passed - was_passed;
+        o.run = g_run - was_run;
+        o.ms = now_ms() - group_t0;
+        if (o.run == 0) {
+            o.kind = "no-checks";
+            o.bad = true;
+            empty_groups++;
+        } else if (o.passed != o.run) {
+            o.kind = "failed";
+            o.bad = true;
+        } else {
+            o.kind = "pass";
+        }
         // The same line the child runner prints, so the two can be compared
         // group by group and not only in total -- which is the A/B this mode
         // exists for.
         std::fprintf(stderr, "  [%2d/%d] %-44s %5d/%-5d\n", i + 1, kGroupCount,
-                     kGroups[i].name, g_passed - was_passed, g_run - was_run);
+                     kGroups[i].name, o.passed, o.run);
         std::fflush(stderr);
     }
     cleanup_fixtures();
     std::fprintf(stderr, "\n%d/%d checks passed", g_passed, g_run);
     if (empty_groups) std::fprintf(stderr, "; %d group(s) ran no checks", empty_groups);
     std::fprintf(stderr, "\n");
-    return (g_passed == g_run && empty_groups == 0) ? 0 : 1;
+    const int exit_code = (g_passed == g_run && empty_groups == 0) ? 0 : 1;
+    // This mode has no per-group log to read, so its report carries the counts
+    // and no FAIL text: the child runner is the one that records *why*.
+    const bool reported = write_report(report, done, 1, now_ms() - t0, exit_code);
+    if (!reported)
+        std::fprintf(stderr, "report: NOT WRITTEN (asked for %s)\n", report ? report : "");
+    else if (report && *report)
+        std::fprintf(stderr, "report: %s\n", report);
+    return (exit_code == 0 && reported) ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -5480,24 +5612,12 @@ static void print_serial_set() {
         std::fprintf(stderr, "serial groups:%s\n", line.c_str());
 }
 
-struct RunOutcome {
-    std::string name;
-    int passed = 0;
-    int run = 0;
-    // "" | FAILED | NO CHECKS | CRASHED 0x.. | COULD NOT START | NO SCRATCH
-    std::string status;
-    std::string log;    // whatever the group printed, replayed under its own line
-    std::string kept;   // where the evidence is, when it was kept
-    bool bad = false;   // counts among the "groups needing attention"
-    bool failed = false; // a check failed (as opposed to the group dying)
-    i64 ms = 0;
-};
-
 // One group, one child, one scratch directory, one log file. This runs on a
 // worker thread, so the only thing it shares with its neighbours is the print
 // lock.
 static RunOutcome run_group_child(int index, std::mutex *print_mu) {
     RunOutcome o;
+    o.index = index;
     o.name = kGroups[index].name;
     const std::string pp = absolute_path(progress_path(index, nullptr));
     const std::string lp = absolute_path(log_path(index));
@@ -5516,6 +5636,7 @@ static RunOutcome run_group_child(int index, std::mutex *print_mu) {
         // neighbour's fixture. Leave it out and fail the run -- a group that
         // did not run must never read as a group that passed.
         o.status = "  NO SCRATCH";
+        o.kind = "no-scratch";
         o.bad = true;
     } else {
         const std::vector<std::string> args{self_path(),  "--run-group", std::to_string(index),
@@ -5524,26 +5645,34 @@ static RunOutcome run_group_child(int index, std::mutex *print_mu) {
         const ChildExit ce = spawn_child(args);
         read_progress(pp, &o.passed, &o.run);
         read_text_file(lp, &o.log);
+        collect_fail_lines(o.log, 40, &o.fail_lines);
         if (!ce.started) {
             o.status = "  COULD NOT START";
+            o.kind = "could-not-start";
             o.bad = true;
         } else if (ce.code == 2) {
             o.status = "  NO SCRATCH"; // the child could not take its directory
+            o.kind = "no-scratch";
             o.bad = true;
         } else if (ce.crashed) {
             char note[64];
             std::snprintf(note, sizeof(note), "  CRASHED 0x%08lX", ce.code);
             o.status = note;
+            o.kind = "crashed";
             o.bad = true;
         } else if (o.run == 0) {
             // Zero checks is the shape of a silent skip, and a silent skip that
             // reads as a pass is the exact defect this runner exists to stop.
             o.status = "  NO CHECKS";
+            o.kind = "no-checks";
             o.bad = true;
         } else if (ce.code != 0 || o.passed != o.run) {
             o.status = "  FAILED";
+            o.kind = "failed";
             o.bad = true;
             o.failed = true;
+        } else {
+            o.kind = "pass";
         }
     }
     o.ms = now_ms() - t0;
@@ -5577,7 +5706,7 @@ static RunOutcome run_group_child(int index, std::mutex *print_mu) {
     return o;
 }
 
-static int run_all_groups(int workers) {
+static int run_all_groups(int workers, const char *report) {
     std::fprintf(stderr, "kraken test suite: %d groups, %d at a time, each in its own process\n",
                  kGroupCount, workers);
     report_injection();
@@ -5661,9 +5790,17 @@ static int run_all_groups(int workers) {
         std::fprintf(stderr, "\n");
     }
     for (const std::string &k : kept) std::fprintf(stderr, "evidence kept: %s\n", k.c_str());
-    return (crashed_groups == 0 && failed_groups == 0 && empty_groups == 0 && passed == run)
-               ? 0
-               : 1;
+
+    const int exit_code =
+        (crashed_groups == 0 && failed_groups == 0 && empty_groups == 0 && passed == run) ? 0 : 1;
+    const bool reported = write_report(report, done, workers, wall, exit_code);
+    if (!reported)
+        std::fprintf(stderr, "report: NOT WRITTEN (asked for %s)\n", report ? report : "");
+    else if (report && *report)
+        std::fprintf(stderr, "report: %s\n", report);
+    // A report that was asked for and not written is a failed request even when
+    // every check passed: the artifact the caller needs does not exist.
+    return (exit_code == 0 && reported) ? 0 : 1;
 }
 
 // How many groups run at once. Eight, or the machine's core count when that is
@@ -5697,6 +5834,7 @@ int main(int argc, char **argv) {
     const char *log = nullptr;
     const char *scratch = nullptr;
     const char *workers_flag = nullptr;
+    const char *report = nullptr;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i] ? argv[i] : "";
         if (a == "--run-group" && i + 1 < argc) {
@@ -5722,6 +5860,8 @@ int main(int argc, char **argv) {
             scratch = argv[++i];
         } else if (a == "--workers" && i + 1 < argc) {
             workers_flag = argv[++i];
+        } else if (a == "--report" && i + 1 < argc) {
+            report = argv[++i];
         } else if (a == "--list-groups") {
             for (int k = 0; k < kGroupCount; k++) std::printf("%2d  %s\n", k, kGroups[k].name);
             return 0;
@@ -5735,6 +5875,10 @@ int main(int argc, char **argv) {
     }
 
     if (group >= 0) return run_one_group(group, progress, log, scratch);
-    if (env_flag("KRK_TEST_INPROC")) return run_all_inproc();
-    return run_all_groups(worker_count(workers_flag));
+    if (!report) {
+        const char *env_report = std::getenv("KRK_TEST_REPORT");
+        if (env_report && *env_report) report = env_report;
+    }
+    if (env_flag("KRK_TEST_INPROC")) return run_all_inproc(report);
+    return run_all_groups(worker_count(workers_flag), report);
 }
