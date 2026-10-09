@@ -266,7 +266,9 @@ drafter's top-3 sit within 0.3 of each other on logits of 4.6–6.2 against a ro
 mean near 0. Both rows go through the *same* head weights (the target's own
 `out_head`), so a flat row is a hidden state near-orthogonal to the head's
 directions — the block's attention is not constraining the mask rows. The rows
-are also self-similar: `84601` is top-1 of rows 2 and 3 of block 6.
+are also self-similar: `84601` is top-1 of rows 2 and 3 of block 6. (The
+single-position table below is superseded by section 9's average over eight
+rounds: 0.230 against the target's 1.732.)
 
 **F13 — the fusion is live and token-dependent, so "the features never arrived"
 is REFUTED.** `KRK_DFLASH_DEBUG=1`: `enc_out` min/max move per position
@@ -406,4 +408,105 @@ TODO src/dflash.cpp:631: [P1] commit() downloads one host copy per captured laye
       skip the round trip for a single row | test: --profile on the commit span
 TODO docs/: [P2] every stored text hash needs its protocol inline (F22): the device
       and CPU banners differ, so a stdout hash never matches across backends
+```
+## 9. Second pass on the two P0s (2026-10-10)
+
+Goal: make `prop[0]` approach the target's own argmax. Four suspects were tested;
+three are refuted by measurement, one number is corrected, and the self-draft's
+disagreement is now measured rather than described.
+
+### The DFlash block DOES read its context — starvation and ignorance are REFUTED
+
+`KRK_DFLASH_KV_ZERO=1` (new: empties the injected features at the end of
+`commit`) moves every row of the block:
+
+| context | row 0 | row 1 |
+|---|---|---|
+| live | 34386(5.289) 12627(5.031) 2447(4.949) | 12627(5.113) 18259(5.090) 4914(4.750) |
+| emptied | 66683(5.191) 34386(4.871) 52957(4.801) | 22083(5.883) 52560(5.664) 82799(5.328) |
+
+The four arms that agreed earlier (`KRK_DFLASH_CAUSAL` 0/1 x `KRK_DFLASH_KVNORM`
+0/1) were a **too-weak perturbation, not evidence**: both injection arms are
+RMS-normalized — one by the layer's `attn_norm`, one by `enc_out_norm` — so the
+injected K row is rms ~1 either way and only its direction moves; and for a
+third-party head set (`qwen35-dflash-draft`) the per-layer causality is derived
+from the window rule, so `KRK_DFLASH_CAUSAL` cannot change it at all. A new
+probe reads the cache directly:
+
+```
+[dfkv] l=0 row1 attn rms 2.25129 | injected K[pos-1] rms 0.999997 | committed 5 blk_pos 5 nt 5
+```
+
+The injection is in the cache, at the right position, with a healthy magnitude,
+and the block's attention output is non-zero: the mask rows see the context.
+
+### Three more suspects are dead
+
+- **Capture order**: `Engine::dflash_capture` (`src/engine.cpp:1298`) maps a layer
+  id through the file's own `target_layers()` order into `capture_slot(a)`, so the
+  concatenation is in the file's order, not a sorted one.
+- **Capture ids**: the target is `laguna.block_count = 40` and the head set
+  captures at 2, 14, 26, 34, 40 — id 40 is the pre-final-norm state, as the
+  contract requires, and every id is in range.
+- **Mask token**: the head set names its own (`qwen35-dflash-draft.dflash.mask_token_id
+  = 12`, `zero_mask_embedding = 0`) and the engine reads it (`mask 12` in the load
+  line), so the mask rows carry the token the drafter was trained on.
+
+### What is left, and it is one number
+
+Averaged over the eight rounds of the traced run, not one position:
+
+| row | top1-top2 | top2-top3 | top-1 magnitude |
+|---|---|---|---|
+| target | **1.732** | 0.655 | 32.0 |
+| drafter row 0 | **0.230** | 0.106 | 5.3 |
+
+The drafter's winner leads by 0.23 logits where the target's leads by 1.73 — 7.5x
+flatter — from a live, context-reading injection. A diffuse row from a live input
+is the signature of an input the drafter does not recognise, so the remaining work
+is the *semantics* of the features (or a norm applied to them), not the plumbing.
+F12's single-position table is superseded by this one; its claim holds, its
+evidence was thin.
+
+### The self-draft's disagreement is material, not precision — CONFIRMED
+
+The `[spec ]` trace now prints the target's top-3 beside the draft's token:
+
+```
+round 3 pos=11  target=81     draft[0]=83     target_top3=[81(35.44) 83(31.97) 372(30.75)]
+round 4 pos=12  target=10208  draft[0]=34415  target_top3=[10208(27.3) 34415(25.22) 18141(25)]
+round 6 pos=18  target=672    draft[0]=2316   target_top3=[672(36) 2316(32.62) 8420(23.55)]
+round 8 pos=20  target=83     draft[0]=81     target_top3=[83(36.81) 1599(30.59) 462(30.36)]
+```
+
+Three of the six dead rounds put the draft on the target's **second** candidate
+with a gap of 2.6-3.5 logits — far outside float noise. Round 8 is worse: the
+draft proposes 81, the target's argmax nine positions earlier, with 81 below the
+target's *third* candidate. Two instances of the same weights, same file, same
+backend, same tokens disagreeing by that much is a **state or path difference**
+between them, not rounding. Acceptance stays 8/32 = 25.0% on the self-draft and
+0/32 on the DFlash pair.
+
+### Not achieved
+
+`prop[0]` does not yet approach the target's argmax for either drafter. What
+changed is what can be ruled out: for the DFlash pair the context, the captures,
+the mask and the placement are each verified, so what is left is the feature
+semantics or the drafter's own weights; for the self-draft it is the difference
+between two instances of one model.
+
+### TODO additions
+
+```
+TODO src/dflash.cpp:631: [P0] the injection is live and read, yet the drafter's
+      winner leads by 0.23 logits against the target's 1.73 | fix: check the
+      feature semantics -- the per-block aux norm weights against the file's
+      enc.aux_norm / aux_hidden_norm, and whether the capture is the residual
+      entering the layer or leaving it | test: the top1-top2 average as the metric
+TODO include/krk/model.hpp: [P1] the draft instance has no KV length accessor, so a
+      rollback that fails to shrink cannot be seen | fix: expose the length and
+      print it in the [spec ] round line | test: draft length == pos every round
+TODO src/dflash.cpp:212: [P2] KRK_DFLASH_CAUSAL cannot change a third-party head
+      set's per-layer masks (the window rule overwrites it), so the knob is inert
+      on exactly the files it is needed for
 ```

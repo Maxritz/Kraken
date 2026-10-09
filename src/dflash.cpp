@@ -683,6 +683,15 @@ bool DflashDraft::commit(i32 pos0, i32 n) {
     // source, not an embedding.
     be_->gemm(ws_x2_, feat_, fc_.data, fc_.type, E, static_cast<i64>(enc), n);
     be_->rmsnorm(enc_out_, ws_x2_, enc_out_norm_, n, E, cfg_.rms_eps);
+    {   // KRK_DFLASH_KV_ZERO=1 empties the injection. The block's rows must
+        // move when the context they read is emptied; if they do not, the block
+        // is not reading the context at all, whatever the cache says.
+        static const bool kz = std::getenv("KRK_DFLASH_KV_ZERO") != nullptr;
+        if (kz) {
+            be_->fill0(enc_out_, static_cast<i64>(n) * E);
+            KRK_INFO("dflash: injection emptied (KRK_DFLASH_KV_ZERO)");
+        }
+    }
     // KRK_DFLASH_DEBUG=1: the fused context, before any projection reads it. Its
     // scale says whether the capture arrived at all: a row of zeros means the
     // feature blocks never made it into the buffer, and a row of 1e6 means the
@@ -769,6 +778,7 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
                              f32 *rows_out) {
     if (!be_ || n_draft <= 0 || n_vocab <= 0) return 0;
     if (n_draft > block_size_ - 1) n_draft = block_size_ - 1;
+    const bool dfdbg_kv = std::getenv("KRK_DFLASH_DEBUG") != nullptr;
     const i32 nt = n_draft + 1; // id_last + n_draft masks
 
     // The block is placed so that mask row k lands on position pos+k: id_last
@@ -830,6 +840,36 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
         d.causal = layer_causal_[static_cast<size_t>(l)] != 0;
         be_->kv_append(kcache_, vcache_, ws_k_, ws_v_, d);
         be_->attention(ws_attn_, ws_q_, kcache_, vcache_, d);
+        if (dfdbg_kv && (l == 0 || l == cfg_.n_layer - 1)) {
+            // Row 1 of the block: what attention actually produced, and the K
+            // row the injection wrote at the last committed position. If the
+            // block ignores its context, either the first is ~0 or the second
+            // is, and which one it is settles where the context is lost.
+            const i64 koff = static_cast<i64>(d.layer) * d.layer_stride +
+                             static_cast<i64>(pos - 1) * d.pos_stride;
+            const i64 kmax = static_cast<i64>(cfg_.n_layer) * d.layer_stride;
+            f64 ar = 0.0, kr = 0.0;
+            be_->download_f32(tmp_host_.data(),
+                              act_at(ws_attn_, as, static_cast<i64>(1) * q_dim),
+                              q_dim);
+            for (i64 i = 0; i < q_dim; i++)
+                ar += static_cast<f64>(tmp_host_[static_cast<size_t>(i)]) *
+                      static_cast<f64>(tmp_host_[static_cast<size_t>(i)]);
+            if (pos >= 1 && koff + kv_dim <= kmax) {
+                be_->download_f32(tmp_host_.data(), act_at(kcache_, as, koff),
+                                  kv_dim);
+                for (i64 i = 0; i < kv_dim; i++)
+                    kr += static_cast<f64>(tmp_host_[static_cast<size_t>(i)]) *
+                          static_cast<f64>(tmp_host_[static_cast<size_t>(i)]);
+            }
+            std::fprintf(stderr,
+                         "[dfkv] l=%d row1 attn rms %.6g | injected K[pos-1] rms "
+                         "%.6g | committed %lld blk_pos %d nt %d",
+                         l, std::sqrt(ar / static_cast<f64>(q_dim)),
+                         std::sqrt(kr / static_cast<f64>(kv_dim)),
+                         static_cast<long long>(committed_), blk_pos, nt);
+            std::fputc(10, stderr);
+        }
 
         if (cfg_.attn_gate && L.wattn_gate.present()) {
             // Softplus output gate off the same hidden state q/k/v read -- the

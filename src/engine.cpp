@@ -2514,6 +2514,29 @@ void Engine::warm_experts() {
 // positions, how long the accepted prefix was, and -- when the round failed
 // before the block ran -- the pre-check's two tokens. The counters report a
 // rate, not which proposal was rejected for what.
+// The target's own top-3 at a position, for the round traces: a drafter whose
+// candidate sits elsewhere on the row and one whose row is flat are told apart
+// in one run, and a near-tie between two instances of the same weights shows up
+// as the draft's token being the target's second or third candidate.
+static void print_target_top3(FILE *f, const f32 *logits, i64 n) {
+    f32 b0 = -1e30f, b1 = -1e30f, b2 = -1e30f;
+    i32 i0 = -1, i1 = -1, i2 = -1;
+    for (i64 v = 0; v < n; v++) {
+        const f32 x = logits[v];
+        if (x > b0) {
+            b2 = b1; i2 = i1; b1 = b0; i1 = i0; b0 = x;
+            i0 = static_cast<i32>(v);
+        } else if (x > b1) {
+            b2 = b1; i2 = i1; b1 = x; i1 = static_cast<i32>(v);
+        } else if (x > b2) {
+            b2 = x; i2 = static_cast<i32>(v);
+        }
+    }
+    std::fprintf(f, "] target_top3=[%d(%.4g) %d(%.4g) %d(%.4g)]", i0,
+                 static_cast<f64>(b0), i1, static_cast<f64>(b1), i2,
+                 static_cast<f64>(b2));
+}
+
 static bool spec_trace() {
     static const bool v = [] {
         const char *e = std::getenv("KRK_SPEC_TRACE");
@@ -3417,6 +3440,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
                              static_cast<unsigned long long>(spec_steps_),
                              static_cast<long long>(pos), first,
                              d > 0 ? prop[0] : -1, d);
+                print_target_top3(stderr, logits_host_, n_vocab_);
                 std::fputc(10, stderr);
             }
             if (first == tok_.eos()) {
