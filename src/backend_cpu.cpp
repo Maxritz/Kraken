@@ -48,17 +48,27 @@ inline void par_for(i64 n, i64 grain, f64 est_flops, F &&body) {
     Pool::get().run(n, grain, std::forward<F>(body));
 }
 
-void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps) {
+void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps,
+                  const i32 *row_exp = nullptr) {
     // Rows are independent and each row keeps its own reduction.
     par_for(rows, 1, 4.0 * static_cast<f64>(rows) * n,
             [&](i64 b, i64 e) {
                 for (i64 r = b; r < e; r++) {
                     const f32 *xr = x + r * n;
                     f32 *orow = out + r * n;
+                    // f32 activations already have the exponent range the
+                    // residual storage contract exists to restore, so this
+                    // backend never raises an exponent and every row it reads is
+                    // true scale. The factor is applied anyway (2^0 == 1) so both
+                    // backends read the same array.
+                    const f32 sc = row_exp ? std::ldexp(1.0f, row_exp[r]) : 1.0f;
                     f32 ss = 0;
-                    for (i64 i = 0; i < n; i++) ss += xr[i] * xr[i];
+                    for (i64 i = 0; i < n; i++) {
+                        const f32 v = xr[i] * sc;
+                        ss += v * v;
+                    }
                     const f32 inv = 1.0f / std::sqrt(ss / static_cast<f32>(n) + eps);
-                    for (i64 i = 0; i < n; i++) orow[i] = xr[i] * inv * w[i];
+                    for (i64 i = 0; i < n; i++) orow[i] = xr[i] * sc * inv * w[i];
                 }
             });
 }
@@ -110,9 +120,9 @@ public:
     }
 
     void rmsnorm(void *out, const void *x, const f32 *w, i64 rows, i64 n,
-                 f32 eps) override {
+                 f32 eps, const i32 *row_exp = nullptr) override {
         rmsnorm_rows(static_cast<f32 *>(out), static_cast<const f32 *>(x), w, rows,
-                     n, eps);
+                     n, eps, row_exp);
     }
 
     void rmsnorm_grouped(void *o, const void *x, const f32 *w, i64 n_tok,
@@ -328,7 +338,8 @@ public:
                 });
     }
 
-    void silu_mul(void *out, const void *gate, const void *up, i64 n) override {
+    void silu_mul(void *out, const void *gate, const void *up, i64 n,
+                  i64 row_len = 0, f32 *row_scale = nullptr) override {
         f32 *o = static_cast<f32 *>(out);
         const f32 *g = static_cast<const f32 *>(gate);
         const f32 *u = static_cast<const f32 *>(up);
@@ -339,6 +350,11 @@ public:
                         o[i] = (x / (1.0f + std::exp(-x))) * u[i];
                     }
                 });
+        // f32 activations already have the exponent range the row scale exists
+        // to restore, so nothing is rescaled here; the caller still gets the
+        // 1.0 per row its contract expects.
+        if (row_scale && row_len > 0 && n % row_len == 0)
+            for (i64 r = 0; r < n / row_len; r++) row_scale[r] = 1.0f;
     }
 
     void add_bias_rows(void *out, const f32 *bias, i64 n, i64 rows) override {
@@ -810,7 +826,13 @@ public:
     }
 
     void scatter_axpy_rows(void *dst, const void *src, const i32 *rows,
-                           const f32 *alpha, i64 n_rows, i64 n) override {
+                           const f32 *alpha, i64 n_rows, i64 n,
+                           const f32 *row_scale = nullptr,
+                           i32 *row_exp = nullptr) override {
+        // The scalar reference works in f32, so no row here ever leaves a
+        // representable range and the storage exponent stays 0: the
+        // contract is answered by leaving the caller's slot alone.
+        (void)row_exp;
         f32 *d = static_cast<f32 *>(dst);
         const f32 *s = static_cast<const f32 *>(src);
         // Each row writes a distinct destination slice.
@@ -819,7 +841,7 @@ public:
                     for (i64 i = b; i < e; i++) {
                         f32 *dr = d + static_cast<i64>(rows[i]) * n;
                         const f32 *sr = s + i * n;
-                        const f32 a = alpha[i];
+                        const f32 a = alpha[i] * (row_scale ? row_scale[i] : 1.0f);
                         if (a == 1.0f) {
                             for (i64 j = 0; j < n; j++) dr[j] += sr[j];
                         } else {

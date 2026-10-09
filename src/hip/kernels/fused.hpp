@@ -47,6 +47,12 @@ namespace krk {
 // engine fuses a group per launch, not the whole layer at once.
 struct FusedLayer {
     int count;
+    // One weight type per matrix. A checkpoint mixes formats across the
+    // projections of a group routinely (Qwen3.5-0.8B: attn_qkv Q5_K, ssm_alpha
+    // and ssm_beta Q4_K), and the weight addressing was always per matrix --
+    // `w_row_bytes[m]` -- so the dequant dispatch tag was the only thing that
+    // had to be shared to keep a mixed group from being expressible.
+    int wt[8];
     const u8 *w[8];
     const _Float16 *in[8];
     _Float16 *out[8];
@@ -64,7 +70,7 @@ struct FusedLayer {
 // budgets — one dispatch for the whole GEMM phase.
 template <int THREADS>
 __global__ void __launch_bounds__(THREADS)
-    fused_layer_gemv_kernel(const FusedLayer fl, int wt) {
+    fused_layer_gemv_kernel(const FusedLayer fl) {
     const int warp_rows = THREADS / 32;
     int base[9];
     base[0] = 0;
@@ -106,7 +112,7 @@ __global__ void __launch_bounds__(THREADS)
     const int nch1 = static_cast<int>(c1 / 32);
     f32 part = 0.0f;
     for (int c = lane + nch0; c < nch1; c += 32)
-        part += dot_chunks(wt, wrow, fl.in[m], c, c + 1);
+        part += dot_chunks(fl.wt[m], wrow, fl.in[m], c, c + 1);
 
     part = d_wave_reduce_sum(part);
     if (lane == 0) {
@@ -116,6 +122,49 @@ __global__ void __launch_bounds__(THREADS)
             fl.part[fl.part_off[m] +
                     static_cast<i64>(kslice) * fl.n_out[m] + row] =
                 part;
+    }
+}
+
+// ----------------------------------------------------------------- gate/up --
+//
+// The FFN's gate and up projections share one activation and are followed by
+// silu_mul, which reads the SAME row index of both. One warp per output row
+// computes both dots, so the activation is applied to registers and the two
+// launches that would produce the operands disappear into the launch that
+// already reads them.
+//
+// Bit-identical to gemm_group() (two gemv rows) + silu_mul_kernel(), and by the
+// same argument the residual epilogue uses: each dot keeps gemv_kernel's
+// lane-strided chunk order and wave reduce, so the f32 partial is the same
+// number; both are rounded to f16 before the activation, which is exactly what
+// the separate silu_mul_kernel reads back from memory; and the activation and
+// the product are computed in f32 and rounded once, as that kernel does.
+template <int THREADS>
+__global__ void __launch_bounds__(THREADS)
+    fused_gate_silu_kernel(const u8 *__restrict__ wg, const u8 *__restrict__ wu,
+                           int wtg, int wtu, i64 n_out, i64 n_in,
+                           size_t w_row_bytes, const _Float16 *__restrict__ x,
+                           _Float16 *__restrict__ out) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const i64 row = static_cast<i64>(blockIdx.x) * (THREADS / 32) +
+                    static_cast<i64>(threadIdx.x >> 5);
+    if (row >= n_out) return;
+
+    const int nch = static_cast<int>(n_in / 32);
+    const u8 *grow = wg + static_cast<size_t>(row) * w_row_bytes;
+    const u8 *urow = wu + static_cast<size_t>(row) * w_row_bytes;
+
+    f32 g = 0.0f, u = 0.0f;
+    for (int c = lane; c < nch; c += 32) {
+        g += dot_chunks(wtg, grow, x, c, c + 1);
+        u += dot_chunks(wtu, urow, x, c, c + 1);
+    }
+    g = d_wave_reduce_sum(g);
+    u = d_wave_reduce_sum(u);
+    if (lane == 0) {
+        const f32 hg = static_cast<f32>(static_cast<_Float16>(g));
+        const f32 hu = static_cast<f32>(static_cast<_Float16>(u));
+        out[row] = d_sat_f16_count(d_silu(hg) * hu, &g_krk_sat_silu);
     }
 }
 
@@ -129,7 +178,11 @@ __global__ void __launch_bounds__(THREADS)
 // `splits_out` receives the per-matrix split decisions for reporting.
 // Partials beyond `part_cap` fall back to row-parallel for that
 // matrix, so the scratch can never be overrun.
-inline void fused_layer_launch(const u8 *const w[],
+// The return value is the SILU answer and nothing else: true when `silu` was
+// asked for and the pair kernel ran (out[0] then holds silu(gate)*up and the
+// caller must NOT issue silu_mul()), false for every other outcome, including
+// the ordinary group launch.
+inline bool fused_layer_launch(const u8 *const w[],
                                const _Float16 *const in[],
                                _Float16 *const out[],
                                const i64 n_out[], const i64 n_in[],
@@ -138,8 +191,9 @@ inline void fused_layer_launch(const u8 *const w[],
                                f32 *part, i64 part_cap,
                                int cu_count, int wt, int blk_target = 0,
                                int splits_out[8] = nullptr,
-                               hipStream_t st = nullptr) {
-    if (n_mat <= 0) return;
+                               hipStream_t st = nullptr, bool silu = false,
+                               const int wts[] = nullptr) {
+    if (n_mat <= 0) return false;
     if (n_mat > 8) n_mat = 8;
     if (blk_target <= 0) blk_target = cu_count;
     FusedLayer fl{};
@@ -147,6 +201,7 @@ inline void fused_layer_launch(const u8 *const w[],
     int total = 0;
     i64 off = 0;
     for (int m = 0; m < n_mat; m++) {
+        fl.wt[m] = wts ? wts[m] : wt;
         fl.w[m] = w[m];
         fl.in[m] = in[m];
         fl.out[m] = out[m];
@@ -184,8 +239,21 @@ inline void fused_layer_launch(const u8 *const w[],
     fl.part = part;
     if (splits_out)
         for (int m = 0; m < n_mat; m++) splits_out[m] = fl.splits[m];
+    // gate/up followed by the activation: both matrices read the same
+    // activation and neither needs split-K, so one warp can compute the same
+    // row of both and apply silu in the epilogue -- one launch where the
+    // separate path runs three (gate, up, silu_mul).
+    if (silu && n_mat == 2 && n_out[0] == n_out[1] &&
+        w_row_bytes[0] == w_row_bytes[1] && in[0] == in[1] &&
+        fl.splits[0] == 1 && fl.splits[1] == 1) {
+        fused_gate_silu_kernel<256><<<static_cast<unsigned>((n_out[0] + 7) / 8),
+                                      256, 0, st>>>(
+            w[0], w[1], fl.wt[0], fl.wt[1], n_out[0], n_in[0],
+            w_row_bytes[0], in[0], out[0]);
+        return true;
+    }
     fused_layer_gemv_kernel<256>
-        <<<static_cast<unsigned>(total), 256, 0, st>>>(fl, wt);
+        <<<static_cast<unsigned>(total), 256, 0, st>>>(fl);
 #if defined(KRK_GFX11) || defined(KRK_GFX12)
     // Split-K tail, identical to gemm_launch's: one small reduce per
     // split matrix, serially summing the fp32 partials to fp16.
@@ -197,6 +265,7 @@ inline void fused_layer_launch(const u8 *const w[],
                 part + fl.part_off[m], fl.splits[m], fl.n_out[m],
                 fl.n_out[m], out[m]);
 #endif
+    return false;
 }
 
 } // namespace krk

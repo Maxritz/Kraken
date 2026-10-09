@@ -116,6 +116,69 @@ __device__ __forceinline__ u16 d_f2h(f32 f) {
 
 __device__ __forceinline__ f32 d_silu(f32 x) { return x / (1.0f + __expf(-x)); }
 
+// Store an f32 activation result into an f16 activation buffer, saturating at
+// the f16 range rather than letting it overflow to inf.
+//
+// An activation is not always a bounded quantity: this engine's activations are
+// f16, so the largest product of two of them is ~65504 * 65504, and the ones
+// that are *products* (silu(gate) * up, the FFN/MoE interleave) reach it on
+// real data -- silu(x) -> x for large positive x, so the product is ~x*x.
+// One inf in an activation buffer is not a local error: every GEMM consuming
+// that row turns it into NaN (inf * 0 and inf - inf), the down projection
+// spreads it to all of its outputs, and three stages later the whole logits row
+// is NaN and the model decodes fluent garbage. Measured on
+// Laguna-XS-2.1-IQ3_XXS.gguf, layer 38 expert 161: one element of the silu
+// product is inf, all 2048 outputs of that expert's down projection are NaN,
+// and the run reads `nan=100352` (the entire vocabulary) at every step.
+//
+// The reference does not need this because a quantized matmul's output is f32
+// there, so the product never lands in a narrow type; on this side the buffer
+// is f16, which makes the bound belong to the store. Saturating loses a few
+// relative percent on the one element that crosses the range (the value is
+// typically just above 65504 -- 6.6e4 for the element measured there), where
+// inf loses the whole row. NaN maps to 0 rather than to a bound, because a NaN
+// here can only come from an upstream defect and a finite 0 is the form that
+// keeps the rest of the row readable while it is being chased.
+__device__ __forceinline__ _Float16 d_sat_f16(f32 v) {
+    if (v != v) return static_cast<_Float16>(0.0f);
+    if (v > 65504.0f) return static_cast<_Float16>(65504.0f);
+    if (v < -65504.0f) return static_cast<_Float16>(-65504.0f);
+    return static_cast<_Float16>(v);
+}
+
+// ---------------------------------------------------------------------------
+// Activation-range counters.
+//
+// Every bound in this file is a *bounded wrong answer*, and until these counters
+// existed it was a silent one too: a run whose activations left f16 -- the whole
+// reason Laguna-XS-2.1 and Laguna-S-2.1 decode nonsense -- printed exactly the
+// same stats as a clean one. One counter per bound, so the end-of-run line says
+// which store left the range and how often. Device globals because three
+// unrelated kernels touch them and threading a counter buffer through every
+// launch would be more surface for no gain; HipBackend reads them back and
+// Engine::init zeroes them, so the numbers describe one run.
+__device__ unsigned g_krk_sat_silu = 0u;  // silu(gate)*up, the FFN/MoE interleave
+__device__ unsigned g_krk_sat_sum = 0u;   // the experts sum into the residual
+__device__ unsigned g_krk_sat_resid = 0u; // the residual row store, once scaled
+__device__ int g_krk_rexp_max = 0;        // largest residual row exponent this run
+
+// d_sat_f16, counting which bound fired. Used at every store that has a bound.
+__device__ __forceinline__ _Float16 d_sat_f16_count(f32 v, unsigned *slot) {
+    if (v != v) {
+        atomicAdd(slot, 1u);
+        return static_cast<_Float16>(0.0f);
+    }
+    if (v > 65504.0f) {
+        atomicAdd(slot, 1u);
+        return static_cast<_Float16>(65504.0f);
+    }
+    if (v < -65504.0f) {
+        atomicAdd(slot, 1u);
+        return static_cast<_Float16>(-65504.0f);
+    }
+    return static_cast<_Float16>(v);
+}
+
 __device__ __forceinline__ f32 d_rsqrt(f32 x) { return rsqrtf(x); }
 
 // ---------------------------------------------------------------------------

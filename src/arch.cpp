@@ -101,6 +101,34 @@ constexpr ArchSpec kTable[] = {
      true, false, false, false, false, true},
 
     // ---- recognized, and refused with the reason --------------------------
+    // qwen4exp: Qwen3.8-Flash-Next and its REAP expert-reduced repacks. Read off
+    // the file's own metadata (1224 tensors, 48 blocks): 2560 embedding, 24 query
+    // heads of 256 dims over 2 KV heads, a Mamba-style SSM block (conv 4, state
+    // 128, 16 groups, dt_rank 48, inner 6144), full attention every 4th layer with
+    // a QSA indexer (4 heads x 128, top_k 2048) and a per-layer `compress_ratios`,
+    // a 288-expert top-10 MoE with a shared expert, a 4-lane 10240-wide
+    // hyper-connection stream mixed through a 320-dim bottleneck, and a
+    // 320,001,536-row PLE n-gram table.
+    //
+    // The shape is Moe and not RecurrentMoe *on purpose*. The gap map keys its
+    // exemptions on shape, and a recurrent shape means "a recurrent schema may
+    // have these": `attn_qkv` is the gated delta net's own projection there, and
+    // `attn_gate`/`ssm_*` are the delta net's, all implemented. Declaring this
+    // family recurrent would exempt exactly the four tensors that are the reason
+    // it cannot run -- the file would be refused by name with no tensor reasons,
+    // and a later "Yes" would load it and decode nonsense. As Moe, each piece is
+    // named: attn_gate, fused attn_qkv, ssm_conv1d, ssm_out.
+    //
+    // The entry's job is the *family* claim: "not in the architecture table" and
+    // "this engine cannot run it" are different statements, and the second is the
+    // true one. docs/AUDIT-qwen4exp-support.md has the per-piece inventory and the
+    // reference engine that runs it.
+    {"qwen4exp", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "qwen4exp",
+     "a hyper-connection stack with a gated attention output, a fused "
+     "query/key/value projection, Mamba-style SSM blocks, a QSA indexer and a PLE "
+     "n-gram table, none of which this engine implements",
+     false, false, false, false},
+
     // Multi-head latent attention: a compressed KV path (attn_kv_a/kv_b and
     // their norms) that the attention kernels have no shape for.
     {"deepseek2", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "deepseek2",
@@ -134,6 +162,23 @@ constexpr ArchSpec kTable[] = {
      "",
      false, false, false, false, false, true},
     // ---- speculative head sets -------------------------------------------
+    // An MTP head set, extracted by tools/mtp_extract.py: the `mtp.*` tensors a
+    // checkpoint ships beside its own weights -- a norm pair, two input
+    // projections and one block with its own attention (packed query gate,
+    // per-head QK-norm, a QSA indexer) and its own 512-expert MoE.
+    //
+    // Refused, and the refusal names what would have to exist first. It is not
+    // a drafter this engine could run even if the block were implemented: its
+    // input is the *target's* hidden state plus the last token's embedding, and
+    // the only targets that carry one are qwen4exp -- which this table already
+    // refuses. Claiming it would mean proposing tokens from a block whose
+    // inputs never arrive.
+    {"qwen4-mtp", ArchShape::Moe, ArchSupport::No, ArchRole::Draft, "qwen4exp",
+     "an MTP head set for a qwen4exp target: one block with gated attention, a "
+     "QSA indexer, hyper-connections and a 512-expert MoE, which this engine "
+     "does not implement",
+     true, true, false, false},
+
     // A head set is not a model: no token embedding, no output head, nothing to
     // continue a prompt with. `--draft` accepts one anyway, because a DFlash
     // drafter is the *cheaper* half of the same feature — the head set is 0.5-1

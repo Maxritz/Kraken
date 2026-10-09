@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <random>
 #include <filesystem>
 #include <fstream>
 
@@ -2550,7 +2551,117 @@ static void test_gdn_generation() {
 
 // The ops behind the recurrent block, checked in isolation so a failure points
 // at the kernel rather than at the model.
+// gemm_group must honour EACH MATRIX's own weight type -- on the fused path and
+// on the per-matrix fallback, which is what a multi-row (prefill) call takes,
+// because the fused kernel expresses the decode row only.
+//
+// This is a regression test for a real defect. The fallback used to pass the
+// group's single `wt` to every matrix. Measured on Qwen3.5-0.8B, whose GDN
+// layers group attn_qkv (Q5_K) with ssm_alpha and ssm_beta (Q4_K): the two Q4_K
+// matrices were decoded as Q5_K during the prompt, KRK_DUMP's gdn.delta read
+// -nan(ind) against -1.66893e-06 from the separate-launch arm, and the op count
+// and the timing looked healthy the whole way.
+//
+// The reference is therefore the SAME backend's per-matrix gemm() with each
+// matrix's own type, never the group against itself -- a group compared with
+// itself agrees with any bug it carries. Three formats with three different
+// geometries (F16 at 2 bytes a value, F32 at 4, Q8_0 at 34 bytes per 32 values)
+// make a misread unambiguous, and the last check proves the misread is visible
+// at all, so the comparison above cannot pass by being blind.
+static void test_gdn_group_matrix_types() {
+    Backend *cpu = make_cpu_backend();
+    const i64 n_in = 64, n_out = 8; // 64 = two Q8_0 blocks per row
+
+    CHECK(dtype_row_bytes(DType::F16, n_in) != dtype_row_bytes(DType::F32, n_in),
+          "F16 and F32 rows are different lengths");
+    CHECK(dtype_row_bytes(DType::F32, n_in) != dtype_row_bytes(DType::Q8_0, n_in),
+          "F32 and Q8_0 rows are different lengths");
+
+    // Every buffer gets slack: the sensitivity check at the end reads one
+    // format's bytes as another's, and that must be wrong WITHOUT running off
+    // the allocation.
+    std::vector<u8> w16(static_cast<size_t>(n_out * n_in * 2) + 512, 0);
+    std::vector<u8> w32(static_cast<size_t>(n_out * n_in * 4) + 512, 0);
+    std::vector<u8> w8(static_cast<size_t>(n_out * (n_in / 32) * 34) + 512, 0);
+    for (i64 r = 0; r < n_out; r++) {
+        for (i64 c = 0; c < n_in; c++) {
+            const f32 v = static_cast<f32>((r * 5 + c * 3) % 29) - 14.0f;
+            const u16 h = fp32_to_fp16(v);
+            std::memcpy(&w16[static_cast<size_t>(r * n_in + c) * 2], &h, 2);
+            std::memcpy(&w32[static_cast<size_t>(r * n_in + c) * 4], &v, 4);
+        }
+        for (i64 b = 0; b < n_in / 32; b++) {
+            u8 *blk = &w8[static_cast<size_t>(r * (n_in / 32) + b) * 34];
+            const u16 h = fp32_to_fp16(0.25f);
+            blk[0] = static_cast<u8>(h & 0xFFu);
+            blk[1] = static_cast<u8>(h >> 8);
+            for (int i = 0; i < 32; i++)
+                blk[2 + i] =
+                    static_cast<u8>(static_cast<i8>((i * 7 + r * 3) % 61 - 30));
+        }
+    }
+
+    const void *w[3] = {w16.data(), w32.data(), w8.data()};
+    const DType types[3] = {DType::F16, DType::F32, DType::Q8_0};
+    const i64 n_out_arr[3] = {n_out, n_out, n_out};
+    const i64 shapes[2] = {4, 1}; // prefill (the fallback) and the decode row
+
+    for (int s = 0; s < 2; s++) {
+        const i64 rows = shapes[s];
+        const size_t n_el = static_cast<size_t>(rows * n_out);
+        std::vector<f32> x(static_cast<size_t>(rows * n_in));
+        for (size_t i = 0; i < x.size(); i++)
+            x[i] = static_cast<f32>(static_cast<int>(i % 19) - 9) * 0.125f;
+
+        std::vector<f32> got[3];
+        void *out[3];
+        for (int m = 0; m < 3; m++) {
+            got[m].assign(n_el, -12345.0f);
+            out[m] = got[m].data();
+        }
+        // The group's own `wt` names the F16 matrix on purpose, so a fallback
+        // that leans on it misreads the other two.
+        cpu->gemm_group(out, x.data(), w, DType::F16, n_out_arr, n_in, 3, rows,
+                        /*silu=*/false, /*silu_fused=*/nullptr,
+                        /*row_parallel_only=*/false, types);
+
+        for (int m = 0; m < 3; m++) {
+            std::vector<f32> ref(n_el, 0.0f);
+            cpu->gemm(ref.data(), x.data(), w[m], types[m], n_out, n_in, rows);
+            int bad = 0;
+            for (size_t i = 0; i < n_el; i++)
+                if (got[m][i] != ref[i]) bad++;
+            CHECK(bad == 0,
+                  rows == 1
+                      ? "gemm_group's decode row matches per-matrix gemm() with "
+                        "each matrix's own type"
+                      : "gemm_group's multi-row fallback matches per-matrix "
+                        "gemm() with each matrix's own type");
+        }
+    }
+
+    // Sensitivity: reading the F32 matrix with the F16 type -- the shape of the
+    // real bug -- has to produce something different, or the checks above would
+    // pass whether or not the fallback honours per-matrix types.
+    {
+        const i64 rows = 4;
+        const size_t n_el = static_cast<size_t>(rows * n_out);
+        std::vector<f32> x(static_cast<size_t>(rows * n_in), 0.25f);
+        std::vector<f32> as_f32(n_el, 0.0f), as_f16(n_el, 0.0f);
+        cpu->gemm(as_f32.data(), x.data(), w32.data(), DType::F32, n_out, n_in,
+                  rows);
+        cpu->gemm(as_f16.data(), x.data(), w32.data(), DType::F16, n_out, n_in,
+                  rows);
+        int diff = 0;
+        for (size_t i = 0; i < n_el; i++)
+            if (as_f32[i] != as_f16[i]) diff++;
+        CHECK(diff > 0,
+              "an F32 matrix read as F16 differs, so a type mix-up is visible");
+    }
+}
+
 static void test_gdn_ops() {
+    test_gdn_group_matrix_types();
     Backend *cpu = make_cpu_backend();
     const i64 hd = 8, heads = 2, n = 3;
 
@@ -2603,6 +2714,41 @@ static void test_gdn_ops() {
     for (size_t i = 0; i < s.size(); i++)
         CHECK(std::fabs(s[i] - 1.0f / (1.0f + std::exp(-a0[i]))) < 1e-6f,
               "sigmoid matches the logistic");
+
+    // The attention output gate, exactly as the engine composes it: one scalar
+    // per (token, head) out of a projection, softplus'd, broadcast over that
+    // head's whole output row BEFORE the output projection. laguna runs through
+    // this path and is a supported arch, and the broadcast op had no test of its
+    // own -- a transposed read (which head's scalar lands on which row) or a
+    // per-element read would corrupt it silently, and the verify pass cannot
+    // catch that because the gate changes the output on purpose.
+    {
+        const i64 nh = 2, hd2 = 4, nt = 2;
+        std::vector<f32> g = {0.0f, -2.0f, 3.0f, 25.0f}; // [token][head]
+        cpu->softplus_act(g.data(), nt * nh);
+        const std::vector<f32> want = {std::log(2.0f),
+                                       std::log1p(std::exp(-2.0f)),
+                                       std::log1p(std::exp(3.0f)), 25.0f};
+        std::vector<f32> x(static_cast<size_t>(nt * nh * hd2), 1.0f);
+        cpu->mul_head_broadcast(x.data(), g.data(), nt, nh, hd2);
+        for (i64 t = 0; t < nt; t++)
+            for (i64 h = 0; h < nh; h++)
+                for (i64 i = 0; i < hd2; i++)
+                    CHECK(std::fabs(x[static_cast<size_t>((t * nh + h) * hd2 + i)] -
+                                    want[static_cast<size_t>(t * nh + h)]) < 1e-5f,
+                          "the gate scales a head's whole row by its own scalar");
+
+        // Distinct scalars per (token, head) over distinguishable rows: every
+        // product is exact in f32, so a wrong lane is a wrong number, not a
+        // rounding difference.
+        std::vector<f32> y = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+        const std::vector<f32> g2 = {2.0f, 3.0f, 5.0f, 7.0f};
+        cpu->mul_head_broadcast(y.data(), g2.data(), 2, 2, 4);
+        CHECK(y[0] == 2.0f && y[3] == 8.0f, "token 0 head 0 scaled by its own 2");
+        CHECK(y[4] == 15.0f && y[7] == 24.0f, "token 0 head 1 scaled by its own 3");
+        CHECK(y[8] == 45.0f && y[11] == 60.0f, "token 1 head 0 scaled by its own 5");
+        CHECK(y[12] == 91.0f && y[15] == 112.0f, "token 1 head 1 scaled by its own 7");
+    }
 
     // The short conv: a two-tap identity kernel must reproduce its input on a
     // fresh state, which pins the tap order (newest last) and the window.
@@ -2792,6 +2938,19 @@ static void test_arch_table() {
     // carrying a reason, and lookup agreeing with the name list.
     CHECK(arch_lookup("llama") != nullptr, "llama is in the table");
     CHECK(arch_lookup("qwen35moe") != nullptr, "qwen35moe is in the table");
+    CHECK(arch_lookup("qwen4-mtp") != nullptr,
+          "the MTP head set tools/mtp_extract.py writes is in the table");
+    CHECK(arch_lookup("qwen4-mtp")->role == ArchRole::Draft,
+          "and it is a draft file rather than a model");
+    CHECK(arch_lookup("qwen4exp") != nullptr, "the qwen4exp family is in the table");
+    CHECK(arch_lookup("qwen4exp")->role == ArchRole::Target &&
+              arch_lookup("qwen4exp")->support == ArchSupport::No,
+          "as a refused target rather than an unlisted arch");
+    // Load-bearing: the gap map exempts attn_qkv/attn_gate/ssm_* for recurrent
+    // shapes (the gated delta net owns those names), so a recurrent declaration
+    // would hide the very pieces that block this family.
+    CHECK(arch_lookup("qwen4exp")->shape == ArchShape::Moe,
+          "declared Moe so its tensor gaps stay reportable");
     CHECK(arch_lookup("") == nullptr, "the empty arch name is not in the table");
     CHECK(arch_lookup("no-such-arch-anywhere") == nullptr,
           "an unlisted arch is not in the table");
@@ -3026,6 +3185,64 @@ static void test_load_verdict() {
         CHECK(said, "and the note says which blocks are skipped");
         // attn_qkv on a recurrent arch is the delta net's own projection.
         CHECK(v.blockers.empty(), "the delta net's attn_qkv is not held against it");
+        made.push_back(path);
+    }
+
+    // qwen4exp: a refused family whose *shape* is load-bearing. Declared
+    // recurrent, the gap map exempts attn_qkv/attn_gate/ssm_* -- the gated delta
+    // net implements those names -- and the file would be refused by name with
+    // nothing said about what is actually missing. As Moe, the family reason and
+    // the tensor reason are both reported, which is the point of the entry.
+    {
+        const std::string path = build_verdict_fixture(
+            "qwen4exp", "qwen4exp", "blk.0.attn_qkv.weight", 0, 0);
+        CHECK(!path.empty(), "wrote a qwen4exp fixture");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "the fixture loads");
+        const ModelVerdict v = assess_model(g);
+        CHECK(v.known && v.arch == "qwen4exp", "qwen4exp is a known family");
+        CHECK(!v.runnable, "and it is refused");
+        CHECK(v.headline().find("not supported") != std::string::npos,
+              "the headline says not supported, not unknown");
+        bool family = false, tensor = false;
+        for (const std::string &b : v.blockers) {
+            if (b.find("hyper-connection") != std::string::npos) family = true;
+            if (b.find("attn_qkv") != std::string::npos) tensor = true;
+        }
+        CHECK(family, "the family reason is reported");
+        CHECK(tensor, "and the fused qkv tensor is a separate, named cause");
+        made.push_back(path);
+    }
+
+    // An MTP head set on its own: the file tools/mtp_extract.py writes out of a
+    // checkpoint's `mtp.*` tensors. Recognized, so it is named rather than read
+    // against llama defaults; refused as a model, with a reason that says both
+    // what it is and what has to exist first -- a qwen4exp target, whose hidden
+    // state is the head's other input.
+    {
+        const std::string path = build_verdict_fixture(
+            "qwen4-mtp", "qwen4-mtp", "mtp.layers.0.self_attn.q_proj.weight", 0, 0);
+        CHECK(!path.empty(), "wrote an MTP head-set fixture");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "the fixture loads");
+        const ModelVerdict v = assess_model(g);
+        CHECK(v.known && v.arch == "qwen4-mtp", "the head set is a known arch");
+        CHECK(!v.runnable && v.spec && v.spec->role == ArchRole::Draft,
+              "a head set is refused as a model and labelled a draft");
+        CHECK(v.headline().find("draft file") != std::string::npos,
+              "the headline calls it a draft file");
+        bool named = false, use_draft = false;
+        for (const std::string &b : v.blockers) {
+            if (b.find("qwen4exp") != std::string::npos &&
+                b.find("hidden state") != std::string::npos)
+                named = true;
+            if (b.find("--draft") != std::string::npos) use_draft = true;
+        }
+        CHECK(named,
+              "the blocker names the target family it belongs to");
+        CHECK(use_draft, "and says what the file is for instead");
         made.push_back(path);
     }
 
@@ -3356,8 +3573,9 @@ public:
                i64 n) override {
         inner_->embed(o, t, tt, v, e, tk, n);
     }
-    void rmsnorm(void *o, const void *x, const f32 *w, i64 r, i64 n, f32 e) override {
-        inner_->rmsnorm(o, x, w, r, n, e);
+    void rmsnorm(void *o, const void *x, const f32 *w, i64 r, i64 n, f32 e,
+                 const i32 *re = nullptr) override {
+        inner_->rmsnorm(o, x, w, r, n, e, re);
     }
     void gemm(void *o, const void *x, const void *w, DType wt, i64 no, i64 ni,
               i64 r) override {
@@ -3381,8 +3599,9 @@ public:
                    const AttnDesc &d) override {
         inner_->attention(o, q, kc, vc, d);
     }
-    void silu_mul(void *o, const void *g, const void *u, i64 n) override {
-        inner_->silu_mul(o, g, u, n);
+    void silu_mul(void *o, const void *g, const void *u, i64 n,
+                  i64 row_len = 0, f32 *row_scale = nullptr) override {
+        inner_->silu_mul(o, g, u, n, row_len, row_scale);
     }
     void add_bias_rows(void *o, const f32 *b, i64 n, i64 r) override {
         inner_->add_bias_rows(o, b, n, r);
@@ -3403,8 +3622,14 @@ public:
         inner_->gather_rows(d, s, r, nr, n);
     }
     void scatter_axpy_rows(void *d, const void *s, const i32 *r, const f32 *a,
-                           i64 nr, i64 n) override {
-        inner_->scatter_axpy_rows(d, s, r, a, nr, n);
+                           i64 nr, i64 n,
+                           const f32 *row_scale = nullptr,
+                           i32 *row_exp = nullptr) override {
+        // The double forwards the storage-exponent slot too: a dropped
+        // parameter here would leave the caller's exponent at whatever the
+        // decorator's own layer zeroed it to, which is a silent difference
+        // between what the suite measures and what the engine runs.
+        inner_->scatter_axpy_rows(d, s, r, a, nr, n, row_scale, row_exp);
     }
 
     u64 releases() const { return releases_; }
@@ -4957,6 +5182,12 @@ static const char *kSuiteUsage =
     "  --log <path>              where that group's own output goes\n"
     "  --scratch <dir>           the working directory that group runs in\n"
     "  --report <path>           write the machine-readable summary here\n"
+    "                            (with --selfcheck: the per-arm verdicts)\n"
+    "  --selfcheck               run every injection arm for every group\n"
+    "  --selfcheck --selftest    check the checker itself, on constructed\n"
+    "                           answers: one case per way an arm can be wrong\n"
+    "  --selfcheck --group <n>   one group's arms only (seconds, not minutes)\n"
+    "  --selfcheck --report <p>  record the arms in the runner's report format\n"
     "  --list-groups             print the group table and exit\n"
     "  --help                    this text\n"
     "\n"
@@ -4968,14 +5199,20 @@ static const char *kSuiteUsage =
     "  KRK_TEST_WORKERS=<n>         same as --workers (the flag wins)\n"
     "  KRK_TEST_INPROC=1            run every group in this process instead\n"
     "                               (a debugger's view: a crash still ends it)\n"
-    "  KRK_TEST_INJECT_CRASH=<grp>  make one group die on purpose, to show the\n"
-    "                               isolation reporting it by name\n"
-    "  KRK_TEST_INJECT_CRASH_AT=<n> die after check n of that group (0 = before\n"
+    "  KRK_TEST_INJECT_CRASH=<grp>[,<grp>]  make one or two groups die on\n"
+    "                               purpose, to show the isolation reporting\n"
+    "                               each by name\n"
+    "  KRK_TEST_INJECT_CRASH_AT=<n>[,<n>]   die after check n of each (0 = before\n"
     "                               its first check), to show the partial count\n"
     "  KRK_TEST_INJECT_FAIL=<grp>   make every check in one group fail\n"
     "  KRK_TEST_INJECT_EMPTY=<grp>  make one group run NO checks, to show the\n"
     "                               runner refusing to call that a pass\n"
     "  KRK_TEST_REPORT=<path>       same as --report (the flag wins)\n"
+    "  KRK_SELFCHECK_SEED=<n>       replay the fuzz arm's drawn aims; the seed\n"
+    "                               a sweep used is printed at its start\n"
+    "  KRK_SELFCHECK_BREAK=counts   make --selfcheck expect one check more than\n"
+    "                               the run has, so a mismatch is constructed and\n"
+    "                               the exit status it produces can be checked\n"
     "  KRK_TEST_SERIAL_OVERRIDE=<grp>  run one group in the serial lane for one\n"
     "                               run, so that lane is exercised, not assumed\n";
 
@@ -5091,13 +5328,45 @@ static std::string progress_dir() {
     return d;
 }
 
+// The scratch area is scoped to ONE run, not to the machine. Two suite runs on
+// this box -- the baseline gate and, beside it, a --selfcheck sweep -- used to
+// share %TEMP%/krk-tests/krk-tests-group-N.dir and write over each other's
+// fixtures, logs and progress files, which is why the reporting proof could only
+// be run when nothing else was. The id defaults to this process's pid, which is
+// unique for as long as the run lives, and the parent exports it so every child
+// agrees on the same area; KRK_TEST_SCRATCH_ID pins it for a caller that wants to
+// find the evidence again afterwards.
+static void set_env_var(const char *name, const std::string &value);
+
+static const char *scratch_run_id() {
+    static const std::string id = [] {
+        const char *want = std::getenv("KRK_TEST_SCRATCH_ID");
+        if (want && *want) return std::string(want);
+        std::string gen;
+#ifdef _WIN32
+        gen = std::to_string(static_cast<unsigned long>(GetCurrentProcessId()));
+#else
+        gen = std::to_string(static_cast<long>(::getpid()));
+#endif
+        // Children inherit it, so a child computing its own paths lands in the
+        // same area as the parent that spawned it.
+        set_env_var("KRK_TEST_SCRATCH_ID", gen);
+        return gen;
+    }();
+    return id.c_str();
+}
+
 // A child gets its own named files under one scratch area, because the whole
 // runner is a function of what each group is allowed to touch: the file it
 // writes its running counts to, the file its own output goes to, and the
 // working directory it runs in. The area is scratch, so it lives in TEMP --
 // which also keeps it off the model directory's sync path.
+static std::string scratch_area() {
+    return progress_dir() + "/krk-tests-" + scratch_run_id();
+}
+
 static std::string group_path(int index, const char *suffix) {
-    return progress_dir() + "/krk-tests/krk-tests-group-" + std::to_string(index) + suffix;
+    return scratch_area() + "/krk-tests-group-" + std::to_string(index) + suffix;
 }
 
 static std::string progress_path(int index, const char *override_path) {
@@ -5240,32 +5509,1187 @@ static ChildExit spawn_child(const std::vector<std::string> &args) {
 #endif
 
 // ---------------------------------------------------------------------------
+//  --selfcheck: the runner proving its own reporting, per group.
+//
+//  The isolation script aims the injection switches at one group chosen by
+//  hand, which leaves the other 52 proved only for whichever case that group
+//  happened to be -- and what a group's report looks like depends on its own
+//  shape: one check, checks conditional on earlier ones, a fixture built late.
+//  This runs six arms for EVERY group and judges each answer against that
+//  group's own count:
+//
+//    crash 0/0          the group dies before its first check
+//    crash 2/2          ... after two checks (after its only check, if tiny)
+//    crash n/n          ... after its OWN last check. passed == run there, so
+//                       the only thing that says the group died is the child's
+//                       exit, and no two groups have the same expected number
+//    every check fails  named FAILED, 0 passed, every FAIL line echoed
+//    no checks at all   named NO CHECKS, never a pass
+//    fuzz               a crash at a RANDOM check, and in one run in four at a
+//                       second group as well -- two groups non-passing at once
+//                       is a shape no fixed arm can produce. The aim is drawn
+//                       from a printed seed, so a mismatch is replayable
+//
+//  An arm is only right when: the group's own line printed with the arm's
+//  status, the report records that status and count, the other 52 groups still
+//  passed with their own counts, the totals equal the clean total minus this
+//  group's count plus what it reached, bad_groups is 1, the exit is 1, the
+//  group is named in 'groups needing attention', the summary still printed,
+//  and the FAIL lines that reached the log are the failing checks. The report
+//  and the printed run are checked against each other because the claim is
+//  about both.
+//
+//  --selfcheck --selftest checks the checker itself on constructed answers:
+//  every way an arm can be wrong has a case that must be rejected, in
+//  milliseconds. A checker that cannot fail proves nothing.
+//
+//  The fuzz arm's seed is printed at the top of a sweep, and
+//  KRK_SELFCHECK_SEED=<that number> draws exactly those aims again -- per group,
+//  so --group N draws what the sweep drew for N. --selfcheck --report writes the
+//  arms' verdicts out in the runner's own report format (kind "selfcheck"), which
+//  is what lets the baseline gate compare the reporting proof itself: an arm
+//  that was ok and is not any more is a regression, named with its problem.
+// ---------------------------------------------------------------------------
+
+static void set_env_var(const char *name, const std::string &value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    ::setenv(name, value.c_str(), 1);
+#endif
+}
+
+static void clear_env_var(const char *name) { set_env_var(name, ""); }
+
+// The arms batch's scratch: one log and one report per group per arm, so a
+// failed arm keeps its evidence and a green run leaves nothing behind.
+// The sweep's own evidence -- the clean run's report, the arms' logs -- lives
+// BESIDE the run areas, not inside one: a green suite run removes its whole area,
+// so evidence a parent still needs must not sit in a child's area. That is not
+// hypothetical: with the selfcheck dir inside the area, the clean-run child
+// (whose own area is that area) deleted its parent's report the moment it went
+// green, and the sweep reported "the clean run is not green (exit 0)".
+static std::string selfcheck_dir() {
+    return progress_dir() + "/krk-tests-selfcheck-" + scratch_run_id();
+}
+
+static std::vector<std::string> split_lines(const std::string &text) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    for (;;) {
+        const size_t nl = text.find('\n', pos);
+        std::string ln = text.substr(pos, (nl == std::string::npos ? text.size() : nl) - pos);
+        if (!ln.empty() && ln.back() == '\r') ln.pop_back();
+        out.push_back(ln);
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    return out;
+}
+
+static std::string trim_copy(const std::string &s) {
+    size_t a = 0, b = s.size();
+    while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r')) a++;
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r')) b--;
+    return s.substr(a, b - a);
+}
+
+static std::string selfcheck_join(const std::vector<std::string> &notes) {
+    std::string out;
+    for (const std::string &n : notes) out += (out.empty() ? "" : "; ") + n;
+    return out;
+}
+
+// A constructed mismatch, so the verdict can be shown to leave a non-zero
+// exit and not only to exist. The expectation is made wrong by one check,
+// which can turn a green run red and never the reverse: it cannot hide a
+// problem, only invent one, which is the safe direction for a switch like
+// this.
+static int selfcheck_break_bump() {
+    const char *v = std::getenv("KRK_SELFCHECK_BREAK");
+    return (v && std::strcmp(v, "counts") == 0) ? 1 : 0;
+}
+// The report's own field syntax, read back: this is the interface the baseline
+// checker reads, so the runner checking it is checking the artifact it ships.
+static bool json_int_at(const std::string &line, const char *key, int *out) {
+    const std::string pat = std::string("\"") + key + "\":";
+    size_t at = line.find(pat);
+    if (at == std::string::npos) return false;
+    at += pat.size();
+    while (at < line.size() && (line[at] == ' ' || line[at] == '\t')) at++;
+    const char *begin = line.c_str() + at;
+    char *end = nullptr;
+    const long v = std::strtol(begin, &end, 10);
+    if (end == begin) return false;
+    *out = static_cast<int>(v);
+    return true;
+}
+
+static bool json_str_at(const std::string &line, const char *key, std::string *out) {
+    const std::string pat = std::string("\"") + key + "\":";
+    size_t at = line.find(pat);
+    if (at == std::string::npos) return false;
+    at += pat.size();
+    while (at < line.size() && (line[at] == ' ' || line[at] == '\t')) at++;
+    if (at >= line.size() || line[at] != '"') return false;
+    at++;
+    std::string v;
+    for (; at < line.size(); at++) {
+        const char c = line[at];
+        if (c == '\\' && at + 1 < line.size()) {
+            v += line[at];
+            v += line[at + 1];
+            at++;
+            continue;
+        }
+        if (c == '"') break;
+        v += c;
+    }
+    *out = v;
+    return true;
+}
+
+struct SelfGroup {
+    int index = -1;
+    std::string name;
+    std::string status;
+    int passed = -1;
+    int run = -1;
+};
+
+struct SelfTotals {
+    int groups = -1;
+    int passed = -1;
+    int run = -1;
+    int bad_groups = -1;
+    int exit_code = -1;
+};
+
+static bool parse_selfcheck_report(const std::string &text, std::vector<SelfGroup> *groups,
+                                   SelfTotals *totals) {
+    if (text.empty()) return false;
+    bool saw_totals = false, saw_group = false;
+    for (const std::string &ln : split_lines(text)) {
+        if (ln.find("\"totals\":") != std::string::npos) {
+            SelfTotals t;
+            if (json_int_at(ln, "groups", &t.groups) && json_int_at(ln, "passed", &t.passed) &&
+                json_int_at(ln, "run", &t.run) && json_int_at(ln, "bad_groups", &t.bad_groups) &&
+                json_int_at(ln, "exit", &t.exit_code)) {
+                *totals = t;
+                saw_totals = true;
+            }
+        } else if (ln.find("\"name\":") != std::string::npos &&
+                   ln.find("\"index\":") != std::string::npos &&
+                   ln.find("\"status\":") != std::string::npos) {
+            SelfGroup g;
+            if (json_int_at(ln, "index", &g.index) && json_str_at(ln, "name", &g.name) &&
+                json_int_at(ln, "passed", &g.passed) && json_int_at(ln, "run", &g.run) &&
+                json_str_at(ln, "status", &g.status))
+                groups->push_back(g), saw_group = true;
+        }
+    }
+    return saw_totals && saw_group;
+}
+
+struct SelfText {
+    bool has_line = false;
+    int passed = -1;
+    int run = -1;
+    std::string status;
+    bool summary = false;
+    int total_passed = -1;
+    int total_run = -1;
+    int fail_lines = 0;
+    bool ran_no_checks = false;
+    bool has_attention = false;
+    std::string attention;
+};
+
+// What the run itself printed: the group's line, the naming line, the summary,
+// and how many FAIL lines made it into this run's log.
+static SelfText parse_selfcheck_text(const std::string &text, int index) {
+    SelfText t;
+    char prefix[64];
+    std::snprintf(prefix, sizeof(prefix), "  [%2d/%d] ", index + 1, kGroupCount);
+    const std::string want(prefix);
+    for (const std::string &ln : split_lines(text)) {
+        if (!t.has_line && ln.rfind(want, 0) == 0) {
+            const std::string rest = ln.substr(want.size());
+            char nm[256];
+            int p = -1, r = -1, consumed = 0;
+            long long ms = 0;
+            if (std::sscanf(rest.c_str(), "%255s %d/%d %lldms%n", nm, &p, &r, &ms, &consumed) == 4) {
+                t.has_line = true;
+                t.passed = p;
+                t.run = r;
+                t.status = trim_copy(rest.substr(static_cast<size_t>(consumed)));
+            }
+        }
+        if (ln.rfind("FAIL ", 0) == 0) t.fail_lines++;
+        if (!t.summary &&
+            std::sscanf(ln.c_str(), "%d/%d checks passed", &t.total_passed, &t.total_run) == 2)
+            t.summary = true;
+        if (!t.has_attention && ln.rfind("groups needing attention:", 0) == 0) {
+            t.attention = ln.substr(std::strlen("groups needing attention:"));
+            t.has_attention = true;
+        }
+        if (ln.find("ran no checks") != std::string::npos) t.ran_no_checks = true;
+    }
+    return t;
+}
+
+static bool names_token(const std::string &line, const std::string &tok) {
+    size_t pos = 0;
+    while (pos < line.size()) {
+        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) pos++;
+        const size_t start = pos;
+        while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') pos++;
+        if (pos > start && line.compare(start, pos - start, tok) == 0) return true;
+    }
+    return false;
+}
+
+// "CRASHED 0x" and eight hex digits: the code itself is the platform's (the
+// CRT's fastfail code here, a signal number elsewhere), so the checker does not
+// hard-code it, it requires one.
+static bool looks_crashed(const std::string &s) {
+    static const char *kPrefix = "CRASHED 0x";
+    const size_t n = std::strlen(kPrefix);
+    if (s.size() != n + 8 || s.rfind(kPrefix, 0) != 0) return false;
+    for (size_t i = n; i < s.size(); i++) {
+        const char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            return false;
+    }
+    return true;
+}
+
+static const char *const kSelfcheckArms[] = {"crash", "crash-2", "crash-last", "fail", "empty",
+                                             "fuzz"};
+static const int kSelfcheckArmCount = 6;
+
+// What an arm has to have aimed at, in the group's own check numbering.
+static int selfcheck_aim(const char *key, int healthy) {
+    if (std::strcmp(key, "crash") == 0) return 0; // before the first check
+    if (std::strcmp(key, "crash-last") == 0) return healthy;
+    if (std::strcmp(key, "crash-2") == 0) return healthy < 2 ? healthy : 2;
+    return 0; // the fuzz arm draws its aim; see run_selfcheck
+}
+
+// What one arm aimed at, in the group's own check numbering: the group the arm
+// is about, the check its crash lands after, and -- for a drawn pair -- a second
+// group that dies in the same run.
+struct SelfArm {
+    const char *key = "";
+    int index = -1;
+    std::string name;
+    int healthy = 0;
+    int at = 0;
+    int second_index = -1;
+    std::string second_name;
+    int second_healthy = 0;
+    int second_at = 0;
+    bool paired() const { return second_index >= 0; }
+};
+
+// The fixed arms' aim, built here so the driver and the selftest build it the
+// same way instead of each writing its own numbers.
+static SelfArm selfcheck_arm_for(const char *key, int index, const std::string &name, int healthy) {
+    SelfArm a;
+    a.key = key;
+    a.index = index;
+    a.name = name;
+    a.healthy = healthy;
+    a.at = selfcheck_aim(key, healthy);
+    return a;
+}
+
+static void selfcheck_set_arm_env(const SelfArm &arm) {
+    clear_env_var("KRK_TEST_INJECT_CRASH");
+    clear_env_var("KRK_TEST_INJECT_CRASH_AT");
+    clear_env_var("KRK_TEST_INJECT_FAIL");
+    clear_env_var("KRK_TEST_INJECT_EMPTY");
+    if (std::strcmp(arm.key, "fail") == 0) {
+        set_env_var("KRK_TEST_INJECT_FAIL", std::to_string(arm.index));
+    } else if (std::strcmp(arm.key, "empty") == 0) {
+        set_env_var("KRK_TEST_INJECT_EMPTY", std::to_string(arm.index));
+    } else {
+        std::string groups = std::to_string(arm.index);
+        std::string ats = std::to_string(arm.at);
+        if (arm.paired()) {
+            groups += "," + std::to_string(arm.second_index);
+            ats += "," + std::to_string(arm.second_at);
+        }
+        set_env_var("KRK_TEST_INJECT_CRASH", groups);
+        set_env_var("KRK_TEST_INJECT_CRASH_AT", ats);
+    }
+}
+
+// One arm's answer, checked. Returns the problems found, joined with "; ";
+// an empty string means the runner reported this arm the way it has to.
+// One arm's answer, checked. Returns the problems found, joined with "; ";
+// an empty string means the runner reported this arm the way it has to.
+static std::string selfcheck_arm_check(const SelfArm &arm, int base_run, int rc,
+                                       const std::string &log, const std::string &report_text) {
+    const bool is_fail = std::strcmp(arm.key, "fail") == 0;
+    const bool is_empty = std::strcmp(arm.key, "empty") == 0;
+    const bool is_crash = !is_fail && !is_empty;
+    const std::string want_kind = is_crash ? "crashed" : (is_empty ? "no-checks" : "failed");
+    const int bump = selfcheck_break_bump();
+
+    std::vector<SelfGroup> groups;
+    SelfTotals totals;
+    if (!parse_selfcheck_report(report_text, &groups, &totals))
+        return "no report was written (exit " + std::to_string(rc) + ")";
+
+    std::vector<std::string> bad;
+    if (totals.groups != kGroupCount)
+        bad.push_back("the report says " + std::to_string(totals.groups) + " groups, want " +
+                      std::to_string(kGroupCount));
+    const SelfGroup *g = nullptr;
+    int seen = 0;
+    for (const SelfGroup &x : groups) {
+        if (x.name != arm.name) continue;
+        seen++;
+        if (!g) g = &x;
+    }
+    if (seen != 1) {
+        bad.push_back("the report lists " + arm.name + " " + std::to_string(seen) + " times");
+        return selfcheck_join(bad);
+    }
+    const SelfGroup *g2 = nullptr;
+    if (arm.paired()) {
+        for (const SelfGroup &x : groups)
+            if (x.name == arm.second_name) g2 = &x;
+        if (!g2) {
+            bad.push_back("the report does not list the paired group " + arm.second_name);
+            return selfcheck_join(bad);
+        }
+    }
+
+    // Every group the arm did not aim at still has to pass, with its own count.
+    std::string others;
+    for (const SelfGroup &x : groups) {
+        if (x.name == arm.name || (g2 && x.name == g2->name)) continue;
+        if (x.status != "pass") others += (others.empty() ? "" : ", ") + x.name;
+    }
+    if (!others.empty()) bad.push_back("another group is not passing: " + others);
+    if (rc != 1) bad.push_back("exit was " + std::to_string(rc) + ", want 1");
+
+    // What the arm aimed at. A failing check can skip the checks after it, so
+    // for that arm the count is whatever the group reached -- but it has to
+    // have reached something.
+    const int reached = is_fail ? g->run : arm.at;
+    if (is_fail) {
+        if (g->run < 1) bad.push_back("ran no checks; a failing group must still count them");
+        if (g->passed != 0)
+            bad.push_back(std::to_string(g->passed) + " checks passed, want 0");
+    } else if (g->passed != arm.at + bump || g->run != arm.at + bump) {
+        bad.push_back("the report records " + std::to_string(g->passed) + "/" +
+                      std::to_string(g->run) + ", want " + std::to_string(arm.at + bump) + "/" +
+                      std::to_string(arm.at + bump));
+    }
+    if (g->status != want_kind)
+        bad.push_back("status " + g->status + ", want " + want_kind);
+    if (g2 && (g2->status != "crashed" || g2->passed != arm.second_at ||
+               g2->run != arm.second_at))
+        bad.push_back("the paired group " + g2->name + " records " + std::to_string(g2->passed) +
+                      "/" + std::to_string(g2->run) + " (" + g2->status + "), want " +
+                      std::to_string(arm.second_at) + "/" + std::to_string(arm.second_at) +
+                      " (crashed)");
+
+    // The run's own output, and the two sources have to agree.
+    const SelfText txt = parse_selfcheck_text(log, arm.index);
+    if (!txt.has_line) {
+        bad.push_back("the group's line did not print");
+    } else {
+        if (txt.passed != g->passed || txt.run != g->run)
+            bad.push_back("the line says " + std::to_string(txt.passed) + "/" +
+                          std::to_string(txt.run) + ", the report says " +
+                          std::to_string(g->passed) + "/" + std::to_string(g->run));
+        if (is_crash) {
+            if (!looks_crashed(txt.status))
+                bad.push_back("the line does not report a crash code: '" + txt.status + "'");
+        } else if (txt.status != (is_empty ? "NO CHECKS" : "FAILED")) {
+            bad.push_back("the line says '" + txt.status + "', want '" +
+                          std::string(is_empty ? "NO CHECKS" : "FAILED") + "'");
+        }
+    }
+    if (g2) {
+        const SelfText t2 = parse_selfcheck_text(log, g2->index);
+        if (!t2.has_line || t2.passed != arm.second_at || t2.run != arm.second_at)
+            bad.push_back("the paired group's line did not report " +
+                          std::to_string(arm.second_at) + "/" + std::to_string(arm.second_at));
+        else if (!looks_crashed(t2.status))
+            bad.push_back("the paired group's line does not report a crash code: '" + t2.status +
+                          "'");
+    }
+    if (!txt.has_attention || !names_token(txt.attention, arm.name))
+        bad.push_back("'groups needing attention' does not name " + arm.name);
+    if (g2 && !names_token(txt.attention, g2->name))
+        bad.push_back("'groups needing attention' does not name the paired group " + g2->name);
+    if (!txt.summary) bad.push_back("the summary line did not print");
+    if (is_empty && !txt.ran_no_checks)
+        bad.push_back("the summary does not report a group that ran no checks");
+    const int want_fail_lines = is_fail ? g->run : 0;
+    if (txt.fail_lines != want_fail_lines)
+        bad.push_back(std::to_string(txt.fail_lines) + " FAIL lines reached the run's log, want " +
+                      std::to_string(want_fail_lines));
+
+    // The totals: every aimed group's count is inside them whatever its status --
+    // a group that died with two checks recorded contributes those two -- and
+    // the groups the arm aimed at are the only ones that did not pass.
+    const int want_total_run = base_run - arm.healthy - (g2 ? arm.second_healthy : 0) + reached +
+                               (g2 ? arm.second_at : 0) + bump;
+    const int want_total_passed = is_fail ? want_total_run - g->run : want_total_run;
+    if (totals.run != want_total_run)
+        bad.push_back("total run " + std::to_string(totals.run) + ", want " +
+                      std::to_string(want_total_run));
+    if (totals.passed != want_total_passed)
+        bad.push_back("total passed " + std::to_string(totals.passed) + ", want " +
+                      std::to_string(want_total_passed));
+    const int want_bad = g2 ? 2 : 1;
+    if (totals.bad_groups != want_bad)
+        bad.push_back("the report says " + std::to_string(totals.bad_groups) +
+                      " bad group(s), want " + std::to_string(want_bad));
+    if (totals.exit_code != 1)
+        bad.push_back("the report's exit is " + std::to_string(totals.exit_code) + ", want 1");
+    return selfcheck_join(bad);
+}
+
+// The runner's output goes to a file of this mode's own, so an arm can be read
+// back whole: its lines, its FAIL text, and its summary from one place.
+#ifdef _WIN32
+static std::string child_command(const std::vector<std::string> &args) {
+    std::string cmd;
+    for (size_t i = 0; i < args.size(); i++) {
+        if (i) cmd += ' ';
+        cmd += '"';
+        for (char c : args[i]) {
+            if (c == '"') cmd += '\\';
+            cmd += c;
+        }
+        cmd += '"';
+    }
+    return cmd;
+}
+
+static ChildExit spawn_child_to(const std::vector<std::string> &args, const std::string &out_path) {
+    ChildExit ce;
+    std::string cmd = child_command(args);
+    std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+    mutable_cmd.push_back('\0');
+
+    SECURITY_ATTRIBUTES sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE h = CreateFileA(out_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return ce;
+
+    STARTUPINFOA si;
+    std::memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = h;
+    si.hStdError = h;
+    PROCESS_INFORMATION pi;
+    std::memset(&pi, 0, sizeof(pi));
+
+    const std::string exe = self_path();
+    const BOOL ok = !exe.empty() && CreateProcessA(exe.c_str(), mutable_cmd.data(), nullptr,
+                                                   nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
+    CloseHandle(h);
+    if (!ok) return ce;
+    ce.started = true;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    ce.code = static_cast<unsigned long>(code);
+    ce.crashed = (ce.code != 0 && ce.code != 1);
+    return ce;
+}
+#else
+#include <fcntl.h>
+
+static ChildExit spawn_child_to(const std::vector<std::string> &args, const std::string &out_path) {
+    ChildExit ce;
+    std::vector<std::string> storage = args;
+    std::vector<char *> argv;
+    for (std::string &s : storage) argv.push_back(s.data());
+    argv.push_back(nullptr);
+
+    const int fd = ::open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return ce;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fd, STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, fd, STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&fa, fd);
+
+    pid_t pid = 0;
+    const int spawned = posix_spawn(&pid, storage[0].c_str(), &fa, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    ::close(fd);
+    if (spawned != 0) return ce;
+    ce.started = true;
+    int st = 0;
+    if (waitpid(pid, &st, 0) < 0) {
+        ce.crashed = true;
+        return ce;
+    }
+    if (WIFSIGNALED(st)) {
+        ce.crashed = true;
+        ce.code = static_cast<unsigned long>(128 + WTERMSIG(st));
+    } else {
+        ce.code = static_cast<unsigned long>(WEXITSTATUS(st));
+        ce.crashed = (ce.code != 0 && ce.code != 1);
+    }
+    return ce;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+//  The fuzz arm's randomness, and the one number that makes it replayable.
+// ---------------------------------------------------------------------------
+
+static u64 splitmix64(u64 x) {
+    x += 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+
+// A generator per group, so --group N draws the aims the sweep drew for N.
+static std::mt19937_64 selfcheck_rng(u64 seed, int index) {
+    return std::mt19937_64(
+        splitmix64(seed + 0x9e3779b97f4a7c15ull * (static_cast<u64>(index) + 1)));
+}
+
+static int selfcheck_draw(std::mt19937_64 &rng, int lo, int hi) {
+    std::uniform_int_distribution<int> d(lo, hi);
+    return d(rng);
+}
+
+static u64 selfcheck_default_seed() {
+    std::random_device rd;
+    u64 x = static_cast<u64>(now_us());
+    for (int i = 0; i < 3; i++) x = splitmix64(x ^ static_cast<u64>(rd()));
+    return x;
+}
+
+// -1 when unset, 0 when set to something that is not a number, 1 when read. A
+// seed that cannot be read is refused rather than replaced: it was set to make a
+// run replayable, and a silent substitution would break exactly that.
+static int selfcheck_seed_env(u64 *out) {
+    const char *v = std::getenv("KRK_SELFCHECK_SEED");
+    if (!v || !*v) return -1;
+    char *end = nullptr;
+    const unsigned long long n = std::strtoull(v, &end, 0);
+    if (end == v || (end && *end != '\0')) return 0;
+    *out = static_cast<u64>(n);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+//  The selfcheck's own report (--selfcheck --report), in the runner's report
+//  format so one comparison tool reads both, with each group's arm verdicts
+//  recorded beside the counts the clean run reported. A group's status is pass
+//  only when every arm was answered the way it has to be, and the arm problems
+//  are that group's fail_lines -- which is how a gate names a broken arm
+//  without knowing anything about arms.
+// ---------------------------------------------------------------------------
+
+struct SelfArmVerdict {
+    std::string key;
+    std::string problem; // empty when the arm was reported the way it has to be
+};
+
+struct SelfGroupVerdict {
+    int index = 0;
+    std::string name;
+    int passed = 0; // the clean run's counts for this group
+    int run = 0;
+    i64 ms = 0;
+    std::vector<SelfArmVerdict> arms;
+    bool ok() const {
+        for (const SelfArmVerdict &a : arms)
+            if (!a.problem.empty()) return false;
+        return true;
+    }
+};
+
+static void json_escape(const std::string &in, std::string *out); // defined with the report
+
+static bool write_selfcheck_report(const char *path, const std::vector<SelfGroupVerdict> &done,
+                                   u64 seed, i64 wall_ms, int exit_code) {
+    if (!path || !*path) return true;
+    std::FILE *f = std::fopen(path, "wb");
+    if (!f) {
+        std::fprintf(stderr, "report: cannot write %s\n", path);
+        return false;
+    }
+    int passed = 0, run = 0, bad = 0;
+    for (const SelfGroupVerdict &v : done) {
+        passed += v.passed;
+        run += v.run;
+        if (!v.ok()) bad++;
+    }
+    std::fprintf(f, "{\n  \"format\": 1,\n  \"suite\": \"kraken-tests\",\n");
+    std::fprintf(f, "  \"kind\": \"selfcheck\",\n  \"arms\": %d,\n  \"seed\": %llu,\n",
+                 kSelfcheckArmCount, static_cast<unsigned long long>(seed));
+    std::fprintf(f, "  \"wall_ms\": %lld,\n", static_cast<long long>(wall_ms));
+    std::fprintf(f,
+                 "  \"totals\": {\"groups\": %d, \"passed\": %d, \"run\": %d, "
+                 "\"bad_groups\": %d, \"exit\": %d},\n",
+                 static_cast<int>(done.size()), passed, run, bad, exit_code);
+    std::fprintf(f, "  \"groups\": [\n");
+    for (size_t i = 0; i < done.size(); i++) {
+        const SelfGroupVerdict &v = done[i];
+        std::string name;
+        json_escape(v.name, &name);
+        std::fprintf(f,
+                     "    {\"index\": %d, \"name\": \"%s\", \"status\": \"%s\", "
+                     "\"passed\": %d, \"run\": %d, \"ms\": %lld, \"fail_lines\": [",
+                     v.index, name.c_str(), v.ok() ? "pass" : "failed", v.passed, v.run,
+                     static_cast<long long>(v.ms));
+        bool first = true;
+        for (const SelfArmVerdict &a : v.arms) {
+            if (a.problem.empty()) continue;
+            std::string ln;
+            json_escape("arm " + a.key + ": " + a.problem, &ln);
+            std::fprintf(f, "%s\"%s\"", first ? "" : ", ", ln.c_str());
+            first = false;
+        }
+        std::fprintf(f, "], \"arms\": {");
+        for (size_t k = 0; k < v.arms.size(); k++) {
+            std::string val;
+            json_escape(v.arms[k].problem.empty() ? std::string("ok") : v.arms[k].problem, &val);
+            std::fprintf(f, "%s\"%s\": \"%s\"", k ? ", " : "", v.arms[k].key.c_str(),
+                         val.c_str());
+        }
+        std::fprintf(f, "}}%s\n", i + 1 == done.size() ? "" : ",");
+    }
+    std::fprintf(f, "  ]\n}\n");
+    const bool ok = std::ferror(f) == 0;
+    std::fclose(f);
+    return ok;
+}
+
+// The arms choose their own switches, so a caller's injection has to be
+// refused rather than merged: it would make the clean run something other than
+// clean, and every count after that would be measured against the wrong base.
+static bool selfcheck_env_conflict() {
+    static const char *const kNames[] = {"KRK_TEST_INJECT_CRASH", "KRK_TEST_INJECT_FAIL",
+                                         "KRK_TEST_INJECT_EMPTY"};
+    for (const char *n : kNames) {
+        const char *v = std::getenv(n);
+        if (v && *v) {
+            std::fprintf(stderr, "kraken-tests: --selfcheck chooses its own injections; unset %s\n",
+                         n);
+            return true;
+        }
+    }
+    return false;
+}
+
+static int run_selfcheck_selftest();
+
+static int run_selfcheck(int workers, const std::string &only_raw, const char *report_flag) {
+    if (selfcheck_env_conflict()) return 2;
+
+    // The report path is the caller's, read before the children's environment is
+    // cleared: --selfcheck records the ARMS, and a child that inherited the same
+    // path would write a run's own report over it.
+    std::string report_path = (report_flag && *report_flag) ? report_flag : "";
+    if (report_path.empty()) {
+        const char *env_report = std::getenv("KRK_TEST_REPORT");
+        if (env_report && *env_report) report_path = env_report;
+    }
+
+    // The fuzz arm's draws have to be replayable from the number printed, so a
+    // seed that cannot be read is refused rather than replaced.
+    u64 seed = 0;
+    const int seed_env = selfcheck_seed_env(&seed);
+    if (seed_env == 0) {
+        std::fprintf(stderr, "kraken-tests: KRK_SELFCHECK_SEED is not a number; the fuzz arm's "
+                             "aims could not be replayed from it\n");
+        return 2;
+    }
+    if (seed_env < 0) seed = selfcheck_default_seed();
+
+    const std::string dir = selfcheck_dir();
+    // Every area this sweep hands to a child, so a green sweep can remove exactly
+    // what it named and nothing else. The children write to areas of their own
+    // (see the arm loop), and an arm is non-passing by construction, which means
+    // it keeps its area as evidence -- so the sweep is the only one left to
+    // dispose of them once the verdict is in.
+    std::vector<std::string> child_areas;
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        std::fprintf(stderr, "kraken-tests: selfcheck cannot use '%s' (%s)\n", dir.c_str(),
+                     ec.message().c_str());
+        return 2;
+    }
+
+    // The children prove the default runner, so the caller's escape hatches and
+    // report path are cleared rather than inherited.
+    clear_env_var("KRK_TEST_INPROC");
+    clear_env_var("KRK_TEST_REPORT");
+    clear_env_var("KRK_TEST_INJECT_CRASH");
+    clear_env_var("KRK_TEST_INJECT_CRASH_AT");
+    clear_env_var("KRK_TEST_INJECT_FAIL");
+    clear_env_var("KRK_TEST_INJECT_EMPTY");
+
+    // The base: one clean run, whose per-group counts every arm is judged
+    // against. It is a child too, so it is the same code path as any other run.
+    const std::string base_log = dir + "/base.log";
+    const std::string base_rep = dir + "/base.json";
+    const std::string clean_id = std::string(scratch_run_id()) + "-clean";
+    set_env_var("KRK_TEST_SCRATCH_ID", clean_id);
+    child_areas.push_back(clean_id);
+    const std::vector<std::string> base_args{self_path(), "--workers", std::to_string(workers),
+                                             "--report", base_rep};
+    const ChildExit bce = spawn_child_to(base_args, base_log);
+    std::string base_text, base_report;
+    read_text_file(base_log, &base_text);
+    read_text_file(base_rep, &base_report);
+    std::vector<SelfGroup> groups;
+    SelfTotals totals;
+    const bool clean = bce.started && !bce.crashed && bce.code == 0 &&
+                       parse_selfcheck_report(base_report, &groups, &totals) &&
+                       totals.groups == kGroupCount && totals.exit_code == 0 &&
+                       totals.bad_groups == 0 && totals.passed == totals.run &&
+                       groups.size() == static_cast<size_t>(kGroupCount);
+    if (!clean) {
+        std::fprintf(stderr, "selfcheck: the clean run is not green (exit %lu), "
+                             "so there is nothing to compare against\n",
+                     bce.code);
+        std::fprintf(stderr, "evidence kept: %s%s\n", dir.c_str(), bce.started ? "" : " (not started)");
+        return 1;
+    }
+
+    int only = -1;
+    if (!only_raw.empty()) {
+        for (const SelfGroup &g : groups)
+            if (only_raw == std::to_string(g.index) || only_raw == g.name) only = g.index;
+        if (only < 0) {
+            std::fprintf(stderr, "selfcheck: no group matches '%s' (--list-groups)\n",
+                         only_raw.c_str());
+            return 2;
+        }
+    }
+
+    std::fprintf(stderr, "selfcheck: %d arms per group, %d group(s), %d worker(s)\n",
+                 kSelfcheckArmCount, kGroupCount, workers);
+    std::fprintf(stderr, "selfcheck: seed %llu (KRK_SELFCHECK_SEED=%llu draws these aims again)\n",
+                 static_cast<unsigned long long>(seed), static_cast<unsigned long long>(seed));
+    std::fprintf(stderr, "clean run: %d/%d checks\n", totals.passed, totals.run);
+
+    const i64 t0 = now_ms();
+    int failed_groups = 0, failed_arms = 0, swept = 0;
+    std::vector<SelfGroupVerdict> verdicts;
+    for (const SelfGroup &g : groups) {
+        if (only >= 0 && g.index != only) continue;
+        swept++;
+        SelfGroupVerdict v;
+        v.index = g.index;
+        v.name = g.name;
+        v.passed = g.passed;
+        v.run = g.run;
+        const i64 group_t0 = now_ms();
+        // A generator per group, so --group N draws what the sweep draws for N.
+        std::mt19937_64 rng = selfcheck_rng(seed, g.index);
+        std::string notes;
+        std::string fuzz_aim;
+        for (int a = 0; a < kSelfcheckArmCount; a++) {
+            const char *key = kSelfcheckArms[a];
+            SelfArm arm = selfcheck_arm_for(key, g.index, g.name, g.run);
+            if (std::strcmp(key, "fuzz") == 0) {
+                arm.at = selfcheck_draw(rng, 0, g.run);
+                char aim[192];
+                std::snprintf(aim, sizeof(aim), "fuzz aim %d/%d", arm.at, g.run);
+                // One run in four dies at a second group as well, drawn from
+                // the groups this arm is not about: two groups non-passing at
+                // once is a shape no single-group arm can construct.
+                if (selfcheck_draw(rng, 0, 3) == 0) {
+                    int q = selfcheck_draw(rng, 0, kGroupCount - 2);
+                    if (q >= g.index) q++;
+                    const SelfGroup *o = nullptr;
+                    for (const SelfGroup &x : groups)
+                        if (x.index == q) o = &x;
+                    if (o) {
+                        arm.second_index = o->index;
+                        arm.second_name = o->name;
+                        arm.second_healthy = o->run;
+                        arm.second_at = selfcheck_draw(rng, 0, o->run);
+                        char pair[192];
+                        std::snprintf(pair, sizeof(pair), " + [%d] %s @%d", o->index,
+                                      o->name.c_str(), arm.second_at);
+                        std::strncat(aim, pair, sizeof(aim) - std::strlen(aim) - 1);
+                    }
+                }
+                fuzz_aim = aim;
+            }
+            const std::string tag = "arm-" + std::to_string(g.index) + "-" + key;
+            const std::string log = dir + "/" + tag + ".log";
+            const std::string rep = dir + "/" + tag + ".json";
+            selfcheck_set_arm_env(arm);
+            // Its own area, so no two arms can share a group's scratch even if
+            // they are ever run side by side, and so a green arm disposes of its
+            // artifacts without touching the sweep's evidence elsewhere in TEMP.
+            const std::string arm_id = std::string(scratch_run_id()) + "-" + tag;
+            set_env_var("KRK_TEST_SCRATCH_ID", arm_id);
+            child_areas.push_back(arm_id);
+            const std::vector<std::string> args{self_path(), "--workers", std::to_string(workers),
+                                                "--report", rep};
+            const ChildExit ce = spawn_child_to(args, log);
+            std::string log_text, rep_text;
+            read_text_file(log, &log_text);
+            read_text_file(rep, &rep_text);
+            std::string problem = selfcheck_arm_check(
+                arm, totals.run, ce.started ? static_cast<int>(ce.code) : -1, log_text, rep_text);
+            if (!ce.started)
+                problem = "the runner could not be started" + (problem.empty() ? "" : "; " + problem);
+            v.arms.push_back(SelfArmVerdict{key, problem});
+            if (problem.empty()) {
+                std::remove(log.c_str());
+                std::remove(rep.c_str());
+            } else {
+                failed_arms++;
+                notes += (notes.empty() ? "" : "; ") + std::string(key) + ": " + problem;
+            }
+        }
+        if (!notes.empty()) failed_groups++;
+        v.ms = now_ms() - group_t0;
+        verdicts.push_back(v);
+        const int mid = g.run < 2 ? g.run : 2;
+        char ok_note[352];
+        std::snprintf(ok_note, sizeof(ok_note),
+                      "crash 0/0, crash %d/%d, crash %d/%d, fail, no-checks, %s", mid, mid, g.run,
+                      g.run, fuzz_aim.c_str());
+        // The drawn aim is printed whether or not the arm was right: a mismatch
+        // is exactly the case where the aim has to be known to be replayed.
+        const std::string tail = notes.empty() ? std::string() : "  (" + fuzz_aim + ")";
+        std::fprintf(stderr, "  %s [%2d/%d] %-44s %4d checks  %s%s\n",
+                     notes.empty() ? "ok  " : "FAIL", g.index + 1, kGroupCount, g.name.c_str(),
+                     g.run, notes.empty() ? ok_note : notes.c_str(), tail.c_str());
+        std::fflush(stderr);
+    }
+    const i64 wall_ms = now_ms() - t0;
+    clear_env_var("KRK_TEST_INJECT_CRASH");
+    clear_env_var("KRK_TEST_INJECT_CRASH_AT");
+    clear_env_var("KRK_TEST_INJECT_FAIL");
+    clear_env_var("KRK_TEST_INJECT_EMPTY");
+
+    // Written whatever the verdict: a gate that could only compare green sweeps
+    // could not name the arm that broke.
+    const bool wrote =
+        write_selfcheck_report(report_path.c_str(), verdicts, seed, wall_ms, failed_groups ? 1 : 0);
+    if (!report_path.empty())
+        std::fprintf(stderr, "report: %s%s\n", report_path.c_str(),
+                     wrote ? "" : " (could not be written)");
+
+    std::fprintf(stderr, "\n%d/%d groups: every injection was reported by name, with the count "
+                         "it had reached\n", swept - failed_groups, swept);
+    if (failed_arms) std::fprintf(stderr, "%d arm(s) mismatched\n", failed_arms);
+    if (failed_groups || !wrote) {
+        std::fprintf(stderr, "evidence kept: %s\n", dir.c_str());
+        return 1;
+    }
+    std::error_code rm;
+    // A green sweep leaves nothing: its evidence directory and each area it named
+    // for a child. The evidence directory is not inside any child's area (a green
+    // suite run removes its own area), so this is the only place either survives.
+    std::filesystem::remove_all(dir, rm);
+    for (const std::string &id : child_areas)
+        std::filesystem::remove_all(progress_dir() + "/krk-tests-" + id, rm);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+//  The checker's own check: constructed answers, one per way an arm can be
+//  wrong. The builders write the runner's formats, so a change to one of those
+//  formats that these do not follow is caught by the real --selfcheck, which
+//  reads the real thing.
+// ---------------------------------------------------------------------------
+
+static std::string selfcheck_fake_report(int index, const std::string &name, const char *status,
+                                         int passed, int run, int totals_passed, int totals_run,
+                                         int exit_code, bool other_bad, int bad_groups = 1,
+                                         int second_index = -1, int second_passed = 0,
+                                         int second_run = 0) {
+    char buf[512];
+    std::string s = "{\n  \"format\": 1,\n  \"suite\": \"kraken-tests\",\n";
+    std::snprintf(buf, sizeof(buf),
+                  "  \"totals\": {\"groups\": %d, \"passed\": %d, \"run\": %d, "
+                  "\"bad_groups\": %d, \"exit\": %d},\n",
+                  kGroupCount, totals_passed, totals_run, bad_groups, exit_code);
+    s += buf;
+    s += "  \"groups\": [\n";
+    const int bad_other = other_bad ? (index + 1) % kGroupCount : -1;
+    for (int i = 0; i < kGroupCount; i++) {
+        if (i == index) {
+            std::snprintf(buf, sizeof(buf),
+                          "    {\"index\": %d, \"name\": \"%s\", \"status\": \"%s\", \"passed\": "
+                          "%d, \"run\": %d, \"ms\": 1, \"fail_lines\": []}%s\n",
+                          i, name.c_str(), status, passed, run,
+                          i + 1 == kGroupCount ? "" : ",");
+        } else if (i == second_index) {
+            std::snprintf(buf, sizeof(buf),
+                          "    {\"index\": %d, \"name\": \"g%d\", \"status\": \"crashed\", "
+                          "\"passed\": %d, \"run\": %d, \"ms\": 1, \"fail_lines\": []}%s\n",
+                          i, i, second_passed, second_run, i + 1 == kGroupCount ? "" : ",");
+        } else if (i == bad_other) {
+            std::snprintf(buf, sizeof(buf),
+                          "    {\"index\": %d, \"name\": \"g%d\", \"status\": \"failed\", "
+                          "\"passed\": 0, \"run\": 5, \"ms\": 1, \"fail_lines\": []}%s\n",
+                          i, i, i + 1 == kGroupCount ? "" : ",");
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                          "    {\"index\": %d, \"name\": \"g%d\", \"status\": \"pass\", "
+                          "\"passed\": 5, \"run\": 5, \"ms\": 1, \"fail_lines\": []}%s\n",
+                          i, i, i + 1 == kGroupCount ? "" : ",");
+        }
+        s += buf;
+    }
+    s += "  ]\n}\n";
+    return s;
+}
+
+static std::string selfcheck_fake_log(int index, const std::string &name, int passed, int run,
+                                      const char *status, int totals_passed, int totals_run,
+                                      int fail_lines, bool line, bool attention, bool summary,
+                                      bool ran_no_checks) {
+    char buf[512];
+    std::string s;
+    if (line) {
+        std::snprintf(buf, sizeof(buf), "  [%2d/%d] %-44s %5d/%-5d %5lldms%s\n", index + 1,
+                      kGroupCount, name.c_str(), passed, run, static_cast<long long>(3), status);
+        s += buf;
+    }
+    for (int i = 0; i < fail_lines; i++) {
+        std::snprintf(buf, sizeof(buf), "FAIL fake.cpp:%d  constructed case\n", 100 + i);
+        s += buf;
+    }
+    if (summary) {
+        std::snprintf(buf, sizeof(buf), "\n%d/%d checks passed%s\n", totals_passed, totals_run,
+                      ran_no_checks ? "; 1 group(s) ran no checks" : "");
+        s += buf;
+    }
+    if (attention) {
+        std::snprintf(buf, sizeof(buf), "groups needing attention: %s\n", name.c_str());
+        s += buf;
+    }
+    return s;
+}
+
+static int run_selfcheck_selftest() {
+    const std::string name = "test_json";
+    const int idx = 4;
+    const int healthy = 41;
+    const int others = (kGroupCount - 1) * 5; // every other group, five checks each
+    const int base = others + healthy;
+    const int mid = healthy < 2 ? healthy : 2;
+
+    struct Case {
+        std::string name;
+        bool want_problems;
+        std::string got;
+    };
+    std::vector<Case> cases;
+    const auto add = [&](const std::string &cname, bool want, const char *arm, int rc,
+                         const std::string &log, const std::string &report) {
+        cases.push_back(Case{cname, want,
+                             selfcheck_arm_check(selfcheck_arm_for(arm, idx, name, healthy), base,
+                                                 rc, log, report)});
+    };
+
+    add("a correct crash arm", false, "crash", 1,
+        selfcheck_fake_log(idx, name, 0, 0, "  CRASHED 0xC0000409", others, others, 0, true, true,
+                           true, false),
+        selfcheck_fake_report(idx, name, "crashed", 0, 0, others, others, 1, false));
+    add("a crash arm that reports 1/1", true, "crash", 1,
+        selfcheck_fake_log(idx, name, 1, 1, "  CRASHED 0xC0000409", others + 1, others + 1, 0, true,
+                           true, true, false),
+        selfcheck_fake_report(idx, name, "crashed", 1, 1, others + 1, others + 1, 1, false));
+    add("a correct partial count", false, "crash-2", 1,
+        selfcheck_fake_log(idx, name, mid, mid, "  CRASHED 0xC0000409", others + mid, others + mid, 0,
+                           true, true, true, false),
+        selfcheck_fake_report(idx, name, "crashed", mid, mid, others + mid, others + mid, 1, false));
+    add("a partial count that does not match", true, "crash-2", 1,
+        selfcheck_fake_log(idx, name, 1, 1, "  CRASHED 0xC0000409", others + 1, others + 1, 0, true,
+                           true, true, false),
+        selfcheck_fake_report(idx, name, "crashed", 1, 1, others + 1, others + 1, 1, false));
+    add("a crash after the group's own last check", false, "crash-last", 1,
+        selfcheck_fake_log(idx, name, healthy, healthy, "  CRASHED 0xC0000409", base, base, 0, true,
+                           true, true, false),
+        selfcheck_fake_report(idx, name, "crashed", healthy, healthy, base, base, 1, false));
+    add("a last-check crash whose counts read as a pass", true, "crash-last", 1,
+        selfcheck_fake_log(idx, name, healthy, healthy, "  CRASHED 0xC0000409", base, base, 0, true,
+                           true, true, false),
+        selfcheck_fake_report(idx, name, "pass", healthy, healthy, base, base, 0, false));
+    add("a crash that was not named", true, "crash", 1,
+        selfcheck_fake_log(idx, name, 0, 0, "  CRASHED 0xC0000409", others, others, 0, true, false,
+                           true, false),
+        selfcheck_fake_report(idx, name, "crashed", 0, 0, others, others, 1, false));
+    add("a correct fail arm", false, "fail", 1,
+        selfcheck_fake_log(idx, name, 0, healthy, "  FAILED", others, base, healthy, true, true,
+                           true, false),
+        selfcheck_fake_report(idx, name, "failed", 0, healthy, others, base, 1, false));
+    add("a fail arm with no FAIL lines in the log", true, "fail", 1,
+        selfcheck_fake_log(idx, name, 0, healthy, "  FAILED", others, others, 0, true, true, true,
+                           false),
+        selfcheck_fake_report(idx, name, "failed", 0, healthy, others, base, 1, false));
+    add("a correct empty arm", false, "empty", 1,
+        selfcheck_fake_log(idx, name, 0, 0, "  NO CHECKS", others, others, 0, true, true, true, true),
+        selfcheck_fake_report(idx, name, "no-checks", 0, 0, others, others, 1, false));
+    add("an empty arm that counted as a pass", true, "empty", 1,
+        selfcheck_fake_log(idx, name, 0, healthy, "  NO CHECKS", base, base, 0, true, true, true,
+                           true),
+        selfcheck_fake_report(idx, name, "pass", 0, healthy, base, base, 0, false));
+    add("a totals line that forgot the group", true, "crash", 1,
+        selfcheck_fake_log(idx, name, 0, 0, "  CRASHED 0xC0000409", others - 1, others - 1, 0, true,
+                           true, true, false),
+        selfcheck_fake_report(idx, name, "crashed", 0, 0, others - 1, others - 1, 1, false));
+    add("another group not passing", true, "crash", 1,
+        selfcheck_fake_log(idx, name, 0, 0, "  CRASHED 0xC0000409", others, others, 0, true, true,
+                           true, false),
+        selfcheck_fake_report(idx, name, "crashed", 0, 0, others, others, 1, true));
+    add("the group's own line missing", true, "crash", 1,
+        selfcheck_fake_log(idx, name, 0, 0, "  CRASHED 0xC0000409", others, others, 0, false, true,
+                           true, false),
+        selfcheck_fake_report(idx, name, "crashed", 0, 0, others, others, 1, false));
+
+    // Two groups non-passing in one run: the fuzz arm's shape, which no other
+    // case can produce. All three aim at the same pair, so a checker that read
+    // only the first group, or that added the second one's checks wrong, fails
+    // one of them.
+    const int si = 21;
+    const std::string sname = "g21";
+    const int shelthy = 5;
+    const int sat = 3;
+    SelfArm pair = selfcheck_arm_for("fuzz", idx, name, healthy);
+    pair.at = 7;
+    pair.second_index = si;
+    pair.second_name = sname;
+    pair.second_healthy = shelthy;
+    pair.second_at = sat;
+    const int pair_total = base - healthy - shelthy + pair.at + sat;
+    const std::string pair_log =
+        selfcheck_fake_log(idx, name, pair.at, pair.at, "  CRASHED 0xC0000409", pair_total,
+                           pair_total, 0, true, false, false, false) +
+        selfcheck_fake_log(si, sname, sat, sat, "  CRASHED 0xC0000409", pair_total, pair_total, 0,
+                           true, false, false, false) +
+        "groups needing attention: " + name + " " + sname + "\n" + std::to_string(pair_total) +
+        "/" + std::to_string(pair_total) + " checks passed\n";
+    cases.push_back(Case{"a correct paired arm", false,
+                         selfcheck_arm_check(pair, base, 1, pair_log,
+                                             selfcheck_fake_report(idx, name, "crashed", pair.at,
+                                                                   pair.at, pair_total, pair_total,
+                                                                   1, false, 2, si, sat, sat))});
+    cases.push_back(Case{"a paired arm whose second group is not reported", true,
+                         selfcheck_arm_check(pair, base, 1, pair_log,
+                                             selfcheck_fake_report(idx, name, "crashed", pair.at,
+                                                                   pair.at, pair_total, pair_total,
+                                                                   1, false, 2, -1, sat, sat))});
+    cases.push_back(Case{"a paired arm whose totals forgot the second group", true,
+                         selfcheck_arm_check(
+                             pair, base, 1, pair_log,
+                             selfcheck_fake_report(idx, name, "crashed", pair.at, pair.at,
+                                                   base - healthy + pair.at,
+                                                   base - healthy + pair.at, 1, false, 2, si, sat,
+                                                   sat))});
+
+    int wrong = 0;
+    for (const Case &c : cases) {
+        const bool ok = (c.got.empty() != c.want_problems);
+        if (!ok) wrong++;
+        const std::string tail =
+            ok ? std::string() : "  -- wanted " + std::string(c.want_problems ? "problems" : "none") +
+                                     ", got [" + c.got + "]";
+        std::fprintf(stderr, "%-4s %s%s\n", ok ? "ok" : "FAIL", c.name.c_str(), tail.c_str());
+    }
+    std::fprintf(stderr, "\n%d/%d selfcheck cases passed\n", static_cast<int>(cases.size()) - wrong,
+                 static_cast<int>(cases.size()));
+    return wrong ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
 //  Deliberate failure, so the reporting can be shown to work instead of
 //  asserted. Both switches are inert unless set: unset, checks_should_pass() is
 //  one compare against -1 and maybe_inject_crash() returns on a cached -1.
 // ---------------------------------------------------------------------------
 
-static int selected_group(const char *env_name) {
-    const char *want = std::getenv(env_name);
-    if (!want || !*want) return -1;
-    const std::string w(want);
+// One group token, resolved the way --run-group and every injection switch take
+// one: an index or a name.
+static int group_index_of(const std::string &want) {
     for (int k = 0; k < kGroupCount; k++)
-        if (w == std::to_string(k) || w == kGroups[k].name) return k;
+        if (want == std::to_string(k) || want == kGroups[k].name) return k;
     return -1;
 }
 
-struct CrashPlan {
+static int selected_group(const char *env_name) {
+    const char *want = std::getenv(env_name);
+    if (!want || !*want) return -1;
+    return group_index_of(want);
+}
+
+// Comma-separated tokens, blanks trimmed. The crash switch takes a LIST because
+// the runner's reporting has to hold when more than one group is non-passing at
+// once, and aiming at two groups in one run is the only way to construct that.
+static std::vector<std::string> split_list(const std::string &s) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    for (;;) {
+        const size_t comma = s.find(',', pos);
+        const size_t end = comma == std::string::npos ? s.size() : comma;
+        size_t a = pos, b = end;
+        while (a < b && (s[a] == ' ' || s[a] == '\t')) a++;
+        while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t')) b--;
+        if (b > a) out.push_back(s.substr(a, b - a));
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return out;
+}
+
+struct CrashTarget {
     int index = -1;
     int at = 0;
 };
 
+struct CrashPlan {
+    std::vector<CrashTarget> targets;
+    std::vector<std::string> unmatched; // tokens that name no group
+};
+
+// KRK_TEST_INJECT_CRASH=<grp>[,<grp>...] with KRK_TEST_INJECT_CRASH_AT=<n>[,<n>...]
+// positionally aligned; an aim with no number dies before the first check.
 static const CrashPlan &crash_plan() {
     static const CrashPlan plan = [] {
         CrashPlan p;
-        p.index = selected_group("KRK_TEST_INJECT_CRASH");
-        if (p.index >= 0) {
-            const char *at = std::getenv("KRK_TEST_INJECT_CRASH_AT");
-            p.at = (at && *at) ? std::atoi(at) : 0;
+        const char *want = std::getenv("KRK_TEST_INJECT_CRASH");
+        if (!want || !*want) return p;
+        const char *at = std::getenv("KRK_TEST_INJECT_CRASH_AT");
+        const std::vector<std::string> names = split_list(want);
+        const std::vector<std::string> ats = split_list(at ? at : "");
+        for (size_t i = 0; i < names.size(); i++) {
+            const int k = group_index_of(names[i]);
+            if (k < 0) {
+                p.unmatched.push_back(names[i]);
+                continue;
+            }
+            CrashTarget t;
+            t.index = k;
+            t.at = (i < ats.size()) ? std::atoi(ats[i].c_str()) : 0;
+            p.targets.push_back(t);
         }
         return p;
     }();
@@ -5297,23 +6721,25 @@ static bool checks_should_pass() { return g_group_index != fail_group(); }
 // compiler cannot see it and elide the call. On POSIX this line is a SIGSEGV.
 static void maybe_inject_crash() {
     const CrashPlan &p = crash_plan();
-    if (p.index < 0 || p.index != g_group_index || g_run < p.at) return;
-    std::fprintf(stderr, "  INJECT: %s dies here on purpose, after %d check(s)\n",
-                 kGroups[p.index].name, g_run);
-    std::fflush(stderr);
-    static std::FILE *volatile null_file = nullptr;
-    std::fclose(null_file);
-    std::abort(); // unreachable while the CRT behaves as it does today
+    for (const CrashTarget &t : p.targets) {
+        if (t.index != g_group_index || g_run < t.at) continue;
+        std::fprintf(stderr, "  INJECT: %s dies here on purpose, after %d check(s)\n",
+                     kGroups[t.index].name, g_run);
+        std::fflush(stderr);
+        static std::FILE *volatile null_file = nullptr;
+        std::fclose(null_file);
+        std::abort(); // unreachable while the CRT behaves as it does today
+    }
 }
 
 static void report_injection() {
     const CrashPlan &cp = crash_plan();
-    const char *want = std::getenv("KRK_TEST_INJECT_CRASH");
-    if (cp.index >= 0)
-        std::fprintf(stderr, "crash injection: %s dies at check %d\n",
-                     kGroups[cp.index].name, cp.at);
-    else if (want && *want)
-        std::fprintf(stderr, "crash injection: '%s' matches no group, nothing injected\n", want);
+    for (const CrashTarget &t : cp.targets)
+        std::fprintf(stderr, "crash injection: %s dies at check %d%s\n", kGroups[t.index].name,
+                     t.at, cp.targets.size() > 1 ? " (one of two)" : "");
+    for (const std::string &tok : cp.unmatched)
+        std::fprintf(stderr, "crash injection: '%s' matches no group, nothing injected\n",
+                     tok.c_str());
 
     const int fi = fail_group();
     const char *fwant = std::getenv("KRK_TEST_INJECT_FAIL");
@@ -5750,6 +7176,28 @@ static RunOutcome run_group_child(int index, std::mutex *print_mu) {
     return o;
 }
 
+// Is `child` under `parent`? Compared by path components rather than by string
+// prefix, because the two strings are built differently -- TEMP carries
+// backslashes, a report path may carry slashes, and Windows does not care about
+// case -- and a prefix test silently answered "no" for a path that was plainly
+// inside, which is how the sweep's own clean-run report got deleted underneath it.
+static bool path_under(const std::string &child, const std::string &parent) {
+    const auto fold = [](std::string v) {
+        for (char &ch : v)
+            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        return v;
+    };
+    std::error_code ec1, ec2;
+    const std::filesystem::path c = std::filesystem::weakly_canonical(child, ec1);
+    const std::filesystem::path p = std::filesystem::weakly_canonical(parent, ec2);
+    auto ci = c.begin();
+    for (auto pi = p.begin(); pi != p.end(); ++pi, ++ci) {
+        if (ci == c.end()) return false;
+        if (fold(ci->string()) != fold(pi->string())) return false;
+    }
+    return true;
+}
+
 static int run_all_groups(int workers, const char *report) {
     std::fprintf(stderr, "kraken test suite: %d groups, %d at a time, each in its own process\n",
                  kGroupCount, workers);
@@ -5842,6 +7290,21 @@ static int run_all_groups(int workers, const char *report) {
         std::fprintf(stderr, "report: NOT WRITTEN (asked for %s)\n", report ? report : "");
     else if (report && *report)
         std::fprintf(stderr, "report: %s\n", report);
+    // The area is scoped to this run, so this run disposes of it: a green run
+    // leaves nothing behind, and a run that kept evidence has already named the
+    // paths above. Two things have to hold for that to be safe. The removal is
+    // skipped when the caller asked for its report UNDER the area -- a sweep runs
+    // the suite as a child with --report <area>/base.json, and a child that
+    // deleted its parent's evidence directory would take the sweep down with it.
+    // And it only ever removes this run's own area, which no other process names.
+    {
+        const std::string area = scratch_area();
+        const std::string rp = report ? std::string(report) : std::string();
+        const bool report_inside = !rp.empty() && path_under(absolute_path(rp), area);
+        std::error_code rm;
+        if (kept.empty() && exit_code == 0 && !report_inside)
+            std::filesystem::remove_all(area, rm);
+    }
     // A report that was asked for and not written is a failed request even when
     // every check passed: the artifact the caller needs does not exist.
     return (exit_code == 0 && reported) ? 0 : 1;
@@ -5879,6 +7342,9 @@ int main(int argc, char **argv) {
     const char *scratch = nullptr;
     const char *workers_flag = nullptr;
     const char *report = nullptr;
+    bool selfcheck = false;
+    std::string selfcheck_group;
+    bool selfcheck_selftest = false;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i] ? argv[i] : "";
         if (a == "--run-group" && i + 1 < argc) {
@@ -5906,6 +7372,12 @@ int main(int argc, char **argv) {
             workers_flag = argv[++i];
         } else if (a == "--report" && i + 1 < argc) {
             report = argv[++i];
+        } else if (a == "--selfcheck") {
+            selfcheck = true;
+        } else if (a == "--selftest") {
+            selfcheck_selftest = true;
+        } else if (a == "--group" && i + 1 < argc) {
+            selfcheck_group = argv[++i];
         } else if (a == "--list-groups") {
             for (int k = 0; k < kGroupCount; k++) std::printf("%2d  %s\n", k, kGroups[k].name);
             return 0;
@@ -5918,7 +7390,23 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (group >= 0 && selfcheck) {
+        std::fprintf(stderr, "kraken-tests: --selfcheck runs the whole suite; use --group <n> for one group\n");
+        return 2;
+    }
     if (group >= 0) return run_one_group(group, progress, log, scratch);
+    if (selfcheck_selftest && !selfcheck) {
+        std::fprintf(stderr, "kraken-tests: --selftest checks the --selfcheck checker; nothing to check without it\n");
+        return 2;
+    }
+    if (!selfcheck_group.empty() && !selfcheck) {
+        std::fprintf(stderr, "kraken-tests: --group picks a group for --selfcheck\n");
+        return 2;
+    }
+    if (selfcheck) {
+        if (selfcheck_selftest) return run_selfcheck_selftest();
+        return run_selfcheck(worker_count(workers_flag), selfcheck_group, report);
+    }
     if (!report) {
         const char *env_report = std::getenv("KRK_TEST_REPORT");
         if (env_report && *env_report) report = env_report;

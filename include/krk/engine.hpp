@@ -351,6 +351,12 @@ private:
     // fused launch, silu, down, residual. Shared because the recurrent path's
     // copy was the stale one and had drifted off the fused group.
     void dense_ffn(const LayerWeights &L, i32 l, i64 n);
+    // dst += x * W^T as ONE launch where the backend can fold the add into the
+    // projection's epilogue (Backend::gemm_accumulate), and as the
+    // gemm()-into-scratch + add_inplace() pair everywhere else -- including
+    // under KRK_DUMP, whose projection stage reads `scratch`.
+    void gemm_residual(void *dst, const void *x, const void *w, DType wt,
+                       i64 n_out, i64 n_in, i64 rows, void *scratch);
     // Chooses the expert residency budget from cfg_ and the device.
     void configure_expert_cache();
     // Fills the two residency tiers ahead of the run, hottest-first: WARM from
@@ -494,6 +500,16 @@ private:
     void *ws_upg_ = nullptr;    // [chunk, n_ff_ws]   gathered up projection
     void *ws_plan_ = nullptr;   // device i32 row ids for the current expert group
     void *ws_alpha_ = nullptr;  // device f32 gate weights for the current group
+    void *ws_scale_ = nullptr;  // device f32 row multipliers from a scaled silu
+    // One i32 per token row: the power of two the residual stream is stored
+    // divided by for that row (Backend::add_residual's contract), zeroed at the
+    // start of every forward pass so it describes this pass's rows only.
+    void *ws_rexp_ = nullptr;
+    // The MoE staging buffer's own exponent, per token row: the routed experts'
+    // sum is accumulated at true scale and a sum of two in-range rows can still
+    // leave f16 when the shared expert is folded in, so that fold renormalizes
+    // through the same contract and `ws_ffn_` carries an exponent too.
+    void *ws_fexp_ = nullptr;
     f32 *logits_host_ = nullptr;
     std::vector<i32> tok_scratch_;
     // Device top-k. The candidate buffer is sized for a degenerate cut; k is

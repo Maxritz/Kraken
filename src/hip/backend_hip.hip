@@ -219,6 +219,19 @@ public:
         // calls (A/B and fallback switch).
         const char *rne = std::getenv("KRK_FUSE_NORM");
         fuse_norm_ = !rne || std::strcmp(rne, "0") != 0;
+        // Fused residual add in the projection's GEMV epilogue
+        // (kernels/gemm.hpp, gemv_kernel<THREADS, ACC>): `dst += W*x` rides one
+        // launch on the decode row instead of a gemm() into a scratch row plus
+        // an add_inplace(). KRK_ACC_GEMM=0 restores the two launches (A/B and
+        // fallback switch).
+        const char *age = std::getenv("KRK_ACC_GEMM");
+        acc_gemm_ = !age || std::strcmp(age, "0") != 0;
+        // Fused gate/up + silu_mul (kernels/fused.hpp, fused_gate_silu_kernel):
+        // the FFN's two projections and the activation between them ride one
+        // launch on the decode row. KRK_FUSED_SILU=0 restores the separate
+        // silu_mul() call (A/B and fallback switch).
+        const char *fse = std::getenv("KRK_FUSED_SILU");
+        fuse_silu_ = !fse || std::strcmp(fse, "0") != 0;
         // int8 DP4A prefill GEMM (kernels/gemm_dp4a.hpp). This path quantizes
         // the activations to int8, so it is lossy by construction and it was
         // opt-in for that reason. It is now the default, because the shape
@@ -1267,11 +1280,11 @@ public:
     }
 
     void rmsnorm(void *out, const void *x, const f32 *w, i64 rows,
-                 i64 n, f32 eps) override {
+                 i64 n, f32 eps, const i32 *row_exp = nullptr) override {
         KRK_TIME_OP("rmsnorm");
         rmsnorm_kernel<256><<<static_cast<unsigned>(rows), 256>>>(
             static_cast<_Float16 *>(out),
-            static_cast<const _Float16 *>(x), w, n, eps);
+            static_cast<const _Float16 *>(x), w, n, eps, row_exp);
     }
 
     // One block per (token, group) row of the mamba-2 scan output; see
@@ -1376,6 +1389,34 @@ public:
     }
 
 
+    // The residual add that follows a projection, folded into that projection's
+    // epilogue: `dst += W*x` as ONE launch on the decode row, instead of the
+    // gemm() + add_inplace() pair (which the CPU reference and the prefill rows
+    // still run, and which is bit-identical -- see gemv_kernel's ACC note and
+    // Backend::gemm_accumulate).
+    //
+    // The decode row only: rows > 1 takes the WMMA/DP4A staging path, whose
+    // epilogue is not this one, and a K that is not chunk-addressed is the same
+    // hard error gemm() raises rather than a silently mis-read row -- so the
+    // fused form declines (false) and the caller does it the long way.
+    bool gemm_accumulate(void *dst, const void *x, const void *w, DType wt,
+                         i64 n_out, i64 n_in, i64 rows,
+                         const i32 *rexp = nullptr) override {
+        if (!acc_gemm_) return false;
+        if (rows != 1 || n_out <= 0 || n_in <= 0) return false;
+        if ((n_in & 31) != 0) return false;
+        if (!x || !w || !dst) return false;
+        KRK_TIME_OP("gemm_acc");
+        krk_op_scope.retag("gemm_acc(gemv)");
+        krk_op_scope.bytes(static_cast<i64>(dtype_row_bytes(wt, n_in)) * n_out);
+        krk_op_scope.flops(2 * n_out * n_in);
+        gemv_kernel<256, true><<<static_cast<unsigned>((n_out + 7) / 8), 256>>>(
+            static_cast<const u8 *>(w), static_cast<int>(wt), n_out, n_in,
+            dtype_row_bytes(wt, n_in), static_cast<const _Float16 *>(x),
+            static_cast<_Float16 *>(dst), rexp);
+        return true;
+    }
+
     void gemm(void *out, const void *x, const void *w, DType wt, i64 n_out,               i64 n_in, i64 rows) override {
         KRK_TIME_OP("gemm");
         if (rows <= 0 || n_out <= 0 || n_in <= 0) return;
@@ -1409,7 +1450,8 @@ public:
             // launching n_out blocks leaves 7/8 of them empty.
             gemv_kernel<256><<<static_cast<unsigned>((n_out + 7) / 8),
                                 256>>>(
-                wh, static_cast<int>(wt), n_out, n_in, row_bytes, xh, oh);
+                wh, static_cast<int>(wt), n_out, n_in, row_bytes, xh, oh,
+                nullptr);
         } else if (rows <= kGemvMRowsMax && gemv_m_enabled()) {
             // Thin groups stay on the mat-vec ladder. BM=32 in the WMMA tile
             // means a 4-row MoE expert group was paying for 32 rows of compute
@@ -1534,16 +1576,24 @@ public:
     bool gemm_group(void *const out[], const void *x,
                     const void *const w[], DType wt,
                     const i64 n_out[], i64 n_in, int n_mat,
-                    i64 rows) override {
+                    i64 rows, bool silu = false,
+                    bool *silu_fused = nullptr,
+                    bool row_parallel_only = false,
+                    const DType *wts = nullptr) override {
         KRK_TIME_OP("gemm_group");
+        if (silu_fused) *silu_fused = false;
         // The fused kernels express the M=1 decode row only
         // (row-parallel over n_out, no M dimension); prefill
         // rows and anything the group cannot express keep the
         // per-matrix gemm() path, which is what the engine ran
         // before the fusion existed.
         if (rows != 1 || n_mat < 1 || n_mat > 8 || !fused_layer_) {
+            // Per-matrix type in the fallback too: the group's `wt` is only the
+            // default, and a fallback that decodes a Q4_K matrix as the group's
+            // Q5_K reads every block from the wrong place -- NaN on the first
+            // prefill pass, not a slow run.
             for (int m = 0; m < n_mat; m++)
-                gemm(out[m], x, w[m], wt, n_out[m], n_in, rows);
+                gemm(out[m], x, w[m], wts ? wts[m] : wt, n_out[m], n_in, rows);
             return false;
         }
         // Same 32-channel addressing rule as gemm().
@@ -1557,13 +1607,15 @@ public:
         _Float16 *op[8];
         i64 nin[8];
         size_t rb[8];
+        int wtm[8];
         i64 need = 0; // worst-case fp32 partials, elements
         for (int m = 0; m < n_mat; m++) {
             wp[m] = static_cast<const u8 *>(w[m]);
             in[m] = static_cast<const _Float16 *>(x);
             op[m] = static_cast<_Float16 *>(out[m]);
             nin[m] = n_in;
-            rb[m] = dtype_row_bytes(wt, n_in);
+            wtm[m] = static_cast<int>(wts ? wts[m] : wt);
+            rb[m] = dtype_row_bytes(static_cast<DType>(wtm[m]), n_in);
             need += 8 * n_out[m]; // the split policy tops out at 8 slices
         }
         // The fused group shares the split-K partials scratch;
@@ -1577,9 +1629,15 @@ public:
             split_dev_ = nullptr;
             KRK_HIP(hipMalloc(&split_dev_, split_cap_));
         }
-        fused_layer_launch(wp, in, op, n_out, nin, rb, n_mat,
-                           split_dev_, split_cap_ / sizeof(f32),
-                           caps_.cu_count, static_cast<int>(wt));
+        // blk_target 1 means "one row-parallel pass per matrix": the split
+        // policy is `row_blocks < blk_target`, and no matrix has fewer than one
+        // row-block.
+        const bool silu_done = fused_layer_launch(
+            wp, in, op, n_out, nin, rb, n_mat, split_dev_,
+            split_cap_ / sizeof(f32), caps_.cu_count, static_cast<int>(wt),
+            row_parallel_only ? 1 : 0, nullptr, nullptr,
+            fuse_silu_ && silu, wts ? wtm : nullptr);
+        if (silu_done && silu_fused) *silu_fused = true;
         return true;
     }
 
@@ -1822,12 +1880,31 @@ public:
         return true;
     }
 
-    void silu_mul(void *out, const void *gate, const void *up, i64 n) override {
+    void silu_mul(void *out, const void *gate, const void *up, i64 n,
+                  i64 row_len = 0, f32 *row_scale = nullptr) override {
         KRK_TIME_OP("silu_mul");
+        // The row-scaled form keeps each thread share of a row in registers,
+        // so it is taken only for rows that fit that budget (2048 = 8 x 256).
+        // Anything wider falls through to the elementwise kernel, and the
+        // caller row-scale contract is then answered with 1.0 per row rather
+        // than with whatever the buffer last held.
+        const bool scaled = row_len > 0 && row_scale && n % row_len == 0;
+        const i64 rows = scaled ? n / row_len : 0;
+        if (rows > 0 && row_len <= 2048) {
+            silu_mul_scaled_kernel<<<static_cast<unsigned>(rows), 256>>>(
+                static_cast<_Float16 *>(out),
+                static_cast<const _Float16 *>(gate),
+                static_cast<const _Float16 *>(up), row_len, row_scale);
+            return;
+        }
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         silu_mul_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(out),
                                          static_cast<const _Float16 *>(gate),
                                          static_cast<const _Float16 *>(up), n);
+        if (rows > 0) {
+            const unsigned fb = static_cast<unsigned>((rows + 255) / 256);
+            fill_f32_kernel<<<fb, 256>>>(row_scale, 1.0f, rows);
+        }
     }
 
     void add_bias_rows(void *out, const f32 *bias, i64 n, i64 rows) override {
@@ -1838,11 +1915,45 @@ public:
                                               total);
     }
 
+    // KRK_RESIDUAL_SCALE=0 restores the pre-scaling behavior exactly: the
+    // residual add is the plain elementwise one, no exponent is ever raised, and
+    // every other piece of the contract -- the norms' `row_exp`, the fold's
+    // divisor -- reads an all-zero array and is a no-op. That is what makes the
+    // A/B one process apart on the same command rather than two builds.
+    // The value is tested as exactly "0": `env A=0,B=0` is ONE variable whose
+    // value is "0,B=0", and a prefix test would read it as on.
+    static bool residual_scale_() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_RESIDUAL_SCALE");
+            return !(e && e[0] == '0' && e[1] == '\0');
+        }();
+        return v;
+    }
+
     void add_inplace(void *a, const void *b, i64 n) override {
         KRK_TIME_OP("add_inplace");
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         add_inplace_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(a),
                                             static_cast<const _Float16 *>(b), n);
+    }
+
+    // The residual stream's storage contract (Backend::add_residual): one block
+    // per token row, so the row's own maximum is known before anything is
+    // stored and the exponent can be raised to fit it. Ons block per row is also
+    // why this op can be exact where a row-parallel writer cannot (the MoE/FFN
+    // residual add is the store that saturates on both laguna files).
+    void add_residual(void *a, const void *b, i64 rows, i64 row_len,
+                      i32 *rexp, const i32 *bexp = nullptr) override {
+        if (rows <= 0) return;
+        if (!residual_scale_() || (!rexp && !bexp) || row_len <= 0) {
+            add_inplace(a, b, rows * (row_len > 0 ? row_len : 1));
+            return;
+        }
+        KRK_TIME_OP("add_residual");
+        krk_op_scope.retag("add_residual");
+        add_residual_kernel<<<static_cast<unsigned>(rows), 256>>>(
+            static_cast<_Float16 *>(a), static_cast<const _Float16 *>(b), rexp,
+            row_len, bexp);
     }
 
     void copy_act(void *dst, const void *src, i64 n) override {
@@ -2079,7 +2190,9 @@ public:
     }
 
     void scatter_axpy_rows(void *dst, const void *src, const i32 *rows,
-                           const f32 *alpha, i64 n_rows, i64 n) override {
+                           const f32 *alpha, i64 n_rows, i64 n,
+                           const f32 *row_scale = nullptr,
+                           i32 *row_exp = nullptr) override {
         KRK_TIME_OP("scatter_axpy");
         krk_op_scope.bytes(n_rows * n * 2);
         if (n_rows <= 0 || n <= 0) return;
@@ -2094,7 +2207,27 @@ public:
         // paid for when it uploaded the same weights.
         scatter_axpy_rows_kernel<<<static_cast<unsigned>(n_rows), 256>>>(
             static_cast<_Float16 *>(dst), static_cast<const _Float16 *>(src),
-            rows, alpha, n);
+            rows, alpha, row_scale, n, row_exp);
+    }
+
+    void activation_saturation(unsigned long long out[3]) const override {
+        unsigned a = 0, b = 0, c = 0;
+        (void)hipMemcpyFromSymbol(&a, g_krk_sat_silu, sizeof(unsigned));
+        (void)hipMemcpyFromSymbol(&b, g_krk_sat_sum, sizeof(unsigned));
+        (void)hipMemcpyFromSymbol(&c, g_krk_sat_resid, sizeof(unsigned));
+        out[0] = a;
+        out[1] = b;
+        out[2] = c;
+    }
+
+    int residual_exponent_max() const override {
+        int m = 0;
+        (void)hipMemcpyFromSymbol(&m, g_krk_rexp_max, sizeof(int));
+        return m;
+    }
+
+    void reset_activation_saturation() override {
+        krk_zero_sat_counters_kernel<<<1, 1>>>();
     }
 
     ~HipBackend() override {
@@ -2156,6 +2289,12 @@ private:
     bool attn_fused_ = true;
     // Fused residual-add + RMSNorm on/off (see the constructor).
     bool fuse_norm_ = true;
+    // Fold the residual add that follows a layer's out-projection into that
+    // projection's epilogue (KRK_ACC_GEMM=0 restores the separate add).
+    bool acc_gemm_ = true;
+    // Fold silu_mul into the gate/up group's epilogue (KRK_FUSED_SILU=0
+    // restores the separate activation launch).
+    bool fuse_silu_ = true;
     // Opt-in int8 DP4A prefill GEMM on Q8_0 weights (see the constructor).
     bool int8_gemm_ = false;
     GemmPath path_ = GemmPath::kAuto;
@@ -2356,16 +2495,21 @@ static bool stage_sync_() {
     // out = rmsnorm(x + res) * w, x left holding the sum. Bit-identical to
     // add_inplace() followed by rmsnorm(); see kernels/normalize.hpp.
     void add_rmsnorm(void *out, void *x, const void *res, const f32 *w,
-                     i64 rows, i64 n, f32 eps) override {
+                     i64 rows, i64 n, f32 eps,
+                     const i32 *row_exp = nullptr) override {
+        const i32 *re = residual_scale_() ? row_exp : nullptr;
         if (!fuse_norm_) {
-            add_inplace(x, res, rows * n);
-            rmsnorm(out, x, w, rows, n, eps);
+            // Same storage contract as the fused kernel below: the residual add
+            // renormalizes the row's exponent and the norm un-scales it.
+            add_residual(x, res, rows, n, const_cast<i32 *>(re));
+            rmsnorm(out, x, w, rows, n, eps, re);
             return;
         }
         KRK_TIME_OP("add_rmsnorm");
         rmsnorm_add_kernel<256><<<static_cast<unsigned>(rows), 256>>>(
             static_cast<_Float16 *>(out), static_cast<_Float16 *>(x),
-            static_cast<const _Float16 *>(res), w, n, eps);
+            static_cast<const _Float16 *>(res), w, n, eps,
+            const_cast<i32 *>(re));
     }
 
 // KRK_STAGE_WAIT=1 keeps the ring and its pinned source but host-waits each

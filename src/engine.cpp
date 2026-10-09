@@ -216,9 +216,147 @@ private:
 
 Engine::~Engine() { shutdown(); }
 
+// KRK_DEQUANT_PROBE=<tensor>[:<expert>][:<row>]
+//
+// Dequantize ONE row of one tensor on the device and on the host, from the same
+// bytes, and report where they disagree. The question it answers is the one a
+// per-stage activation trace cannot: a row whose *values* are finite can still
+// be the wrong row, and "the residual went NaN in layer N" does not say whether
+// the arithmetic or the address is at fault.
+//
+// It reads the file's own tensor table for the row's address and the geometry of
+// this build for its length, so a disagreement between the two shows up as the
+// span line rather than as a wrong answer. The device side goes through
+// Backend::embed -- a device row-dequant with no other caller-side state -- with
+// a one-row table, so the probe needs no new backend entry point; the device's
+// activations are f16, so agreement is judged at 1e-2 relative, not bit-exactly.
+//
+// Every row index is flat: expert e, row r is flat row e*ne[1] + r, which is how
+// a 3-D expert tensor is laid out.
+static void run_dequant_probe(Backend &be, const std::string &model_path) {
+    const char *spec = std::getenv("KRK_DEQUANT_PROBE");
+    if (!spec) return;
+    std::string s(spec);
+    std::vector<std::string> parts;
+    for (size_t p = 0; p <= s.size();) {
+        const size_t c = s.find(':', p);
+        parts.push_back(s.substr(p, c == std::string::npos ? std::string::npos : c - p));
+        if (c == std::string::npos) break;
+        p = c + 1;
+    }
+    if (parts.empty() || parts[0].empty()) {
+        KRK_WARN("KRK_DEQUANT_PROBE needs <tensor>[:<expert>][:<row>]");
+        return;
+    }
+    const std::string name = parts[0];
+    const i64 expert = parts.size() > 1 ? std::atoll(parts[1].c_str()) : 0;
+    const i64 row = parts.size() > 2 ? std::atoll(parts[2].c_str()) : 0;
+
+    Gguf g;
+    std::string gerr;
+    if (!g.load(model_path, &gerr)) {
+        KRK_WARN("dequant probe: cannot reopen %s (%s)", model_path.c_str(), gerr.c_str());
+        return;
+    }
+    const GgufTensor *t = g.tensor(name);
+    if (!t) {
+        KRK_WARN("dequant probe: no tensor '%s' in this file", name.c_str());
+        return;
+    }
+    const i64 width = static_cast<i64>(t->ne[0]);
+    const i64 rows_per_expert = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
+    const i64 n_experts = t->n_dims >= 3 ? static_cast<i64>(t->ne[2]) : 1;
+    if (expert < 0 || expert >= n_experts || row < 0 || row >= rows_per_expert) {
+        KRK_WARN("dequant probe: %s has %lld experts of %lld rows, asked for %lld/%lld",
+                 name.c_str(), static_cast<long long>(n_experts),
+                 static_cast<long long>(rows_per_expert),
+                 static_cast<long long>(expert), static_cast<long long>(row));
+        return;
+    }
+    const size_t row_bytes = dtype_row_bytes(t->type, width);
+    const i64 flat_row = expert * rows_per_expert + row;
+    const size_t total_rows = static_cast<size_t>(n_experts) * static_cast<size_t>(rows_per_expert);
+    const u8 *src = t->data + static_cast<size_t>(flat_row) * row_bytes;
+
+    std::fprintf(stderr,
+                 "[deqprobe] %s type=%s row_width=%lld experts=%lld rows/expert=%lld\n"
+                 "[deqprobe]   flat row %lld (expert %lld row %lld), row_bytes=%zu, "
+                 "computed span=%zu B vs tensor n_bytes=%zu (%s)\n",
+                 name.c_str(), dtype_name(t->type), static_cast<long long>(width),
+                 static_cast<long long>(n_experts), static_cast<long long>(rows_per_expert),
+                 static_cast<long long>(flat_row), static_cast<long long>(expert),
+                 static_cast<long long>(row), row_bytes, total_rows * row_bytes,
+                 t->n_bytes, total_rows * row_bytes == t->n_bytes ? "agrees" : "DISAGREES");
+
+    // A third numeric field is how many rows to walk (default 1), because one
+    // row is not the question when the symptom is an all-NaN output row: a gemv
+    // output element is a dot over one weight row, so a single non-finite row
+    // ANYWHERE in the slab poisons every token that routes to the expert. The
+    // scan is what turns "this row is clean" into "this slab is clean".
+    const i64 n_scan = parts.size() > 3 ? std::max<i64>(1, std::atoll(parts[3].c_str())) : 1;
+    const size_t as = be.act_size();
+    std::vector<f32> host(static_cast<size_t>(width));
+    std::vector<f32> dev(static_cast<size_t>(width));
+    void *dw = be.alloc(row_bytes);
+    void *dout = be.alloc(static_cast<size_t>(width) * as);
+    // `tokens` is HOST memory by the Backend contract -- the device backend
+    // stages the ids into its own scratch -- so this must not be a device
+    // allocation: handing it one has the backend read a VRAM address as a
+    // host pointer and fault.
+    const i32 zero = 0;
+    i64 rows_bad_host = 0, rows_bad_dev = 0, rows_disagree = 0;
+    i64 first_bad_row = -1, first_bad_index = -1;
+    f64 worst = 0.0;
+    for (i64 k = 0; k < n_scan; k++) {
+        const i64 r = row + k;
+        const i64 flat = expert * rows_per_expert + r;
+        if (r >= rows_per_expert) break;
+        const u8 *rsrc = t->data + static_cast<size_t>(flat) * row_bytes;
+        dequant_row(t->type, rsrc, host.data(), width);
+        be.upload(dw, rsrc, row_bytes);
+        be.embed(dout, dw, t->type, 1, width, &zero, 1);
+        be.download_f32(dev.data(), dout, width);
+        bool hbad = false, dbad = false, dis = false;
+        for (i64 i = 0; i < width; i++) {
+            const f32 a = host[static_cast<size_t>(i)], b = dev[static_cast<size_t>(i)];
+            if (!(a == a) || a > 3.0e38f || a < -3.0e38f) hbad = true;
+            if (!(b == b) || b > 3.0e38f || b < -3.0e38f) dbad = true;
+            const f64 rel = std::fabs(static_cast<f64>(b) - a) /
+                            (1.0 + std::fabs(static_cast<f64>(a)));
+            if (rel > worst) worst = rel;
+            if (rel > 1e-2) {
+                dis = true;
+                if (first_bad_index < 0) first_bad_index = i;
+            }
+        }
+        if (hbad) rows_bad_host++;
+        if (dbad) rows_bad_dev++;
+        if (dis) rows_disagree++;
+        if ((hbad || dbad || dis) && first_bad_row < 0) first_bad_row = r;
+        if ((hbad || dbad || dis) && n_scan == 1) {
+            std::fprintf(stderr, "[deqprobe]   row %lld: host %s, device %s\n",
+                         static_cast<long long>(r), hbad ? "NON-FINITE" : "finite",
+                         dbad ? "NON-FINITE" : "finite");
+        }
+    }
+    be.release(dw);
+    be.release(dout);
+
+    std::fprintf(stderr,
+                 "[deqprobe]   scanned %lld row(s): host non-finite %lld, device non-finite "
+                 "%lld, disagree>1e-2 %lld (first bad row %lld, index %lld) | worst rel %.6g\n",
+                 static_cast<long long>(n_scan), static_cast<long long>(rows_bad_host),
+                 static_cast<long long>(rows_bad_dev), static_cast<long long>(rows_disagree),
+                 static_cast<long long>(first_bad_row),
+                 static_cast<long long>(first_bad_index), worst);
+}
+
 bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     be_ = be;
     cfg_ = cfg;
+    // The activation-range counters are process-wide device state; zero them so
+    // the line this run prints describes this run.
+    be_->reset_activation_saturation();
     // KRK_DUMP=<path>: append every stage of the forward pass (the hidden state
     // after embed and after each layer, for the row that decides the next
     // token) as text, so the same prompt can be run on two backends and the
@@ -245,6 +383,10 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         be_ = nullptr;
         return false;
     }
+    // KRK_DEQUANT_PROBE: device-vs-host dequant of one named row, before the
+    // first forward pass, so a wrong row read is visible in one run. Nothing
+    // here runs unless the variable is set.
+    if (std::getenv("KRK_DEQUANT_PROBE")) run_dequant_probe(*be_, cfg.model_path);
     const ModelConfig &mc = model_.cfg();
     n_embd_ = mc.n_embd;
     n_ff_ = mc.n_ff;
@@ -276,6 +418,15 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
 
     auto alloc = [&](size_t bytes) { return be_->alloc(bytes); };
     ws_x_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+    // The residual stream's per-token storage exponents (Backend::add_residual).
+    // Zeroed here and again at the start of every forward pass: an all-zero
+    // array is exactly the old behavior, so a model that never leaves f16 pays
+    // one i32 per row and nothing else.
+    ws_rexp_ = alloc(static_cast<size_t>(C) * sizeof(i32));
+    be_->fill0(ws_rexp_, static_cast<size_t>(C) * sizeof(i32));
+    ws_fexp_ = alloc(static_cast<size_t>(C) * sizeof(i32));
+    be_->fill0(ws_fexp_, static_cast<size_t>(C) * sizeof(i32));
+
     ws_xn_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     ws_x2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     // Qwen3.5 packs a per-head output gate behind the query, so its query
@@ -353,6 +504,10 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         ws_upg_ = alloc(static_cast<size_t>(C * ff_ws) * as);
         ws_plan_ = alloc(static_cast<size_t>(C) * sizeof(i32));
         ws_alpha_ = alloc(static_cast<size_t>(C) * sizeof(f32));
+        // One multiplier per routed row, written by the scaled silu_mul and read
+        // back by the scatter of the same visit. The plan can never exceed chunk
+        // rows, so C entries always suffice.
+        ws_scale_ = alloc(static_cast<size_t>(C) * sizeof(f32));
         router_host_.resize(static_cast<size_t>(C) * static_cast<size_t>(mc.n_expert));
         moe_prob_.resize(static_cast<size_t>(mc.n_expert));
         moe_sel_.resize(static_cast<size_t>(C) * static_cast<size_t>(k));
@@ -631,11 +786,12 @@ void Engine::shutdown() {
         return;
     }
     be_->sync();
-    for (void **p : {&ws_x_, &ws_xn_, &ws_x2_, &ws_q_,
+    for (void **p : {&ws_x_, &ws_rexp_, &ws_fexp_, &ws_xn_, &ws_x2_, &ws_q_,
                      &ws_qpack_, &ws_k_,
                      &ws_v_, &ws_attn_, &ws_gate_, &ws_up_, &ws_had_, &ws_logits_,
                      &ws_router_,
                      &ws_ffn_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
+                     &ws_scale_,
                      &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
                      &ws_m2in_,
                      &conv_state_, &rec_state_, &topk_scratch_, &topk_out_}) {
@@ -765,7 +921,8 @@ void Engine::head_compute(i32 row) {
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
     const void *src = act_at(ws_x_, as, static_cast<i64>(row) * n_embd_);
-    be_->rmsnorm(ws_xn_, src, model_.out_norm(), 1, n_embd_, mc.rms_eps);
+    be_->rmsnorm(ws_xn_, src, model_.out_norm(), 1, n_embd_, mc.rms_eps,
+                 static_cast<const i32 *>(ws_rexp_) + row);
     const QuantTensor &head = model_.out_head();
     const void *xn = ws_xn_;
     if (model_.had().head_folded) {
@@ -784,6 +941,11 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     // arch, the same way Engine::init decided the packed workspace.
     const bool packed_gate = q_proj_ != q_dim_;
 
+    // This is the one writer of the residual that stores at true scale (an
+    // embedding row is small), so it starts the storage contract at exponent 0
+    // for these rows; every later store goes through add_residual or a producer
+    // that re-scales, and the array has to describe THIS pass.
+    be_->fill0(ws_rexp_, static_cast<size_t>(n) * sizeof(i32));
     be_->embed(ws_x_, embd.data, embd.type, mc.n_vocab, mc.n_embd, toks, n);
 
     // A latent token embedding stores ROTATED rows: un-rotate them here, once,
@@ -856,7 +1018,8 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         d.window = (mc.swa_window > 0 && model_.is_swa(l)) ? mc.swa_window : 0;
         dump_stage("enter", l);
 
-        be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, n, n_embd_, mc.rms_eps);
+        be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, n, n_embd_, mc.rms_eps,
+                     static_cast<const i32 *>(ws_rexp_));
 
         if (L.gdn) {
             // nemotron_h_moe Mamba-2 SSM layer
@@ -876,7 +1039,8 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // nemotron's mamba-2 blocks have no FFN after the block; only
             // layers that carry FFN weights run one.
             if (!L.nemotron_ssm || L.moe || L.wgate.present()) {
-                be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps);
+                be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps,
+                             static_cast<const i32 *>(ws_rexp_));
                 dump_row("ffn.pre", l, ws_xn_, n_embd_, n);
                 if (L.moe) {
                     moe_ffn(L, l, n);
@@ -1056,11 +1220,12 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // post-add state, because the fused kernel writes x before it
         // normalizes.
         be_->add_rmsnorm(ws_xn_, ws_x_, ws_x2_, L.ffn_norm, n, n_embd_,
-                         mc.rms_eps);
+                         mc.rms_eps, static_cast<const i32 *>(ws_rexp_));
         } else {
             // Pure-MoE block: no attention to fold in, so the FFN input norm
             // is applied straight to the residual.
-            be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps);
+            be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps,
+                         static_cast<const i32 *>(ws_rexp_));
             dump_row("ffn.pre", l, ws_xn_, n_embd_, n);
         }
         dump_row("attn.res", l, ws_x_, n_embd_, n);
@@ -1100,6 +1265,29 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     for (i32 r = 0; r < n; r++) head_compute(r);
 }
 
+// dst += x * W^T, folded into the projection's epilogue where the backend can
+// (one launch instead of two; see Backend::gemm_accumulate for why the folded
+// store is bit-identical to the pair it replaces).
+//
+// The pair is also what runs whenever this cannot: on the CPU backend, on
+// prefill rows, and under KRK_DUMP -- the stage trace reads the projection
+// buffer, and a folded epilogue never writes it, so a fused attn.down would
+// silently report the previous layer's numbers. The dump is a debugging
+// instrument that has to keep telling the truth, so it wins.
+void Engine::gemm_residual(void *dst, const void *x, const void *w, DType wt,
+                           i64 n_out, i64 n_in, i64 rows, void *scratch) {
+    // `rexp` goes down both paths: `dst` is the residual stream, so the
+    // contribution folded in has to be divided by the row's storage exponent,
+    // and the fallback -- which is what prefill rows and the CPU take -- puts it
+    // through add_residual, so it renormalizes the exponent as well.
+    const i32 *rexp = static_cast<const i32 *>(ws_rexp_);
+    if (dump_path_.empty() && rows > 0 &&
+        be_->gemm_accumulate(dst, x, w, wt, n_out, n_in, rows, rexp))
+        return;
+    be_->gemm(scratch, x, w, wt, n_out, n_in, rows);
+    be_->add_residual(dst, scratch, rows, n_out, const_cast<i32 *>(rexp));
+}
+
 // The dense SwiGLU FFN both layer shapes share: xn -> gate/up -> silu -> down
 // -> residual. It was written out twice, and the GDN copy was the stale one:
 // it still issued gate and up as two separate gemm() calls while the attention
@@ -1127,16 +1315,23 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
         had_xform(ws_had_, ws_xn_, n, n_embd_, false, false);
         xn = ws_had_;
     }
+    // The activation rides the fused launch's epilogue where the backend can
+    // express it (one launch for gate, up and silu instead of three); the flags
+    // say which half happened, so the fallback issues exactly the calls the
+    // folded path skipped. The folded form leaves ws_up_ untouched, and nothing
+    // reads it after this point either way.
+    bool silu_done = false;
     if (L.wgate.type == L.wup.type) {
         void *gu[2] = {ws_gate_, ws_up_};
         const void *wgu[2] = {L.wgate.data, L.wup.data};
         const i64 ngu[2] = {n_ff_, n_ff_};
-        be_->gemm_group(gu, xn, wgu, L.wgate.type, ngu, n_embd_, 2, n);
+        be_->gemm_group(gu, xn, wgu, L.wgate.type, ngu, n_embd_, 2, n, true,
+                        &silu_done);
     } else {
         be_->gemm(ws_gate_, xn, L.wgate.data, L.wgate.type, n_ff_, n_embd_, n);
         be_->gemm(ws_up_, xn, L.wup.data, L.wup.type, n_ff_, n_embd_, n);
     }
-    be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_);
+    if (!silu_done) be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_);
     dump_row("attn.ffng", l, ws_gate_, n_ff_, n);
     // The intermediate is a folded input as well (its width is n_ff, wider
     // than anything above), which is safe to put over ws_had_ because the
@@ -1146,9 +1341,9 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
         had_xform(ws_had_, ws_gate_, n, n_ff_, false, false);
         gn = ws_had_;
     }
-    be_->gemm(ws_x2_, gn, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n);
+    gemm_residual(ws_x_, gn, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n,
+                  ws_x2_);
     dump_row("attn.down", l, ws_x2_, n_embd_, n);
-    be_->add_inplace(ws_x_, ws_x2_, n * n_embd_);
 }
 
 void Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
@@ -1756,8 +1951,8 @@ void Engine::mamba2_forward(const LayerWeights &L, i32 l, i32 n) {
         had_xform(ws_had_, ws_h_, n, inner, false, false);
         h_in = ws_had_;
     }
-    be_->gemm(ws_x2_, h_in, L.ssm_out.data, L.ssm_out.type, n_embd_, inner, n);
-    be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
+    gemm_residual(ws_x_, h_in, L.ssm_out.data, L.ssm_out.type, n_embd_, inner,
+                  n, ws_x2_);
     dump_row("m2.done", l, ws_x_, n_embd_, n);
 }
 
@@ -1770,19 +1965,53 @@ void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
     const i32 ksize = mc.ssm_d_conv;
     const i32 ri = model_.recurrent_index(l);
 
-    // 1. One projection for [q | k | v] and one for the z gate. Both read the
-    //    same attention-norm output, so they are independent. Folded ones read
-    //    the transformed copy; ssm_alpha/ssm_beta further down read ws_xn_
-    //    primal, which is exactly why the copy is a copy.
+    // 1. FOUR projections read the attention-norm output here, not two: the
+    //    [q | k | v] block and the z gate, and (below, in step 4) ssm_alpha and
+    //    ssm_beta. None of them depends on another, and none of them reads
+    //    anything the conv, the L2 norms or the gate chain writes, so they are
+    //    one group launch -- 4 launches per layer become 1, which is 54 of
+    //    Qwen3.5-0.8B's 451 ops in a decode step.
+    //
+    //    Row-parallel only, deliberately: ssm_alpha/ssm_beta are dt_rank rows,
+    //    so the group's usual split-K top-up would fill the device for them and
+    //    pay a reduce launch per split matrix for the privilege -- buying
+    //    parallelism with exactly the launch this removes. With the splits
+    //    pinned at 1 every row keeps gemv_kernel's accumulation order, so the
+    //    group is BIT-IDENTICAL to the four launches it replaces; the stdout
+    //    md5 is the check, because a regrouping would show up as different
+    //    greedy text.
+    //
+    //    A folded q/k/v or z reads the hadamard copy (ws_had_) while alpha and
+    //    beta read ws_xn_ primal, and a group shares one activation, so the
+    //    group covers the unfolded case -- which is also the only case where
+    //    all four read the same buffer. A dtype mix falls back too: the group
+    //    carries one weight type.
     const void *xn = ws_xn_;
     if (L.h_attn_in || L.h_attn_gate) {
         had_xform(ws_had_, ws_xn_, n, n_embd_, false, false);
         xn = ws_had_;
     }
-    be_->gemm(ws_qkv_, L.h_attn_in ? xn : ws_xn_, L.wqkv.data, L.wqkv.type,
-              cdim, n_embd_, n);
-    be_->gemm(ws_z_, L.h_attn_gate ? xn : ws_xn_, L.wqkv_gate.data,
-              L.wqkv_gate.type, vdim, n_embd_, n);
+    static const bool gdn_group_ = [] {
+        const char *e = std::getenv("KRK_GDN_GROUP");
+        return !e || std::strcmp(e, "0") != 0;
+    }();
+    const bool gdn_onelaunch = gdn_group_ && !L.h_attn_in && !L.h_attn_gate;
+    if (gdn_onelaunch) {
+        void *gout[4] = {ws_qkv_, ws_z_, ws_ssm_, ws_beta_};
+        const void *gw[4] = {L.wqkv.data, L.wqkv_gate.data, L.ssm_alpha.data,
+                             L.ssm_beta.data};
+        const DType gtypes[4] = {L.wqkv.type, L.wqkv_gate.type,
+                                 L.ssm_alpha.type, L.ssm_beta.type};
+        const i64 gn_out[4] = {cdim, vdim, mc.ssm_dt_rank, mc.ssm_dt_rank};
+        be_->gemm_group(gout, ws_xn_, gw, L.wqkv.type, gn_out, n_embd_, 4, n,
+                        /*silu=*/false, /*silu_fused=*/nullptr,
+                        /*row_parallel_only=*/true, gtypes);
+    } else {
+        be_->gemm(ws_qkv_, L.h_attn_in ? xn : ws_xn_, L.wqkv.data, L.wqkv.type,
+                  cdim, n_embd_, n);
+        be_->gemm(ws_z_, L.h_attn_gate ? xn : ws_xn_, L.wqkv_gate.data,
+                  L.wqkv_gate.type, vdim, n_embd_, n);
+    }
 
     // 2. The causal short convolution, carrying the previous ksize-1 steps, and
     //    the SiLU that follows it. After this ws_qkv_ is the post-conv block.
@@ -1806,14 +2035,19 @@ void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
 
     // 4. The per-head gate and forget. A_log arrives already as -exp(A_log), so
     //    the decay is exp(-exp(A_log) * softplus(alpha + dt_bias)).
-    be_->gemm(ws_ssm_, ws_xn_, L.ssm_alpha.data, L.ssm_alpha.type, mc.ssm_dt_rank,
-              n_embd_, n);
+    // ssm_alpha came out of the group launch above when it ran.
+    if (!gdn_onelaunch) {
+        be_->gemm(ws_ssm_, ws_xn_, L.ssm_alpha.data, L.ssm_alpha.type,
+                  mc.ssm_dt_rank, n_embd_, n);
+    }
     be_->add_bias_cols(ws_ssm_, L.ssm_dt, n, mc.ssm_dt_rank);
     be_->softplus_act(ws_ssm_, static_cast<i64>(n) * mc.ssm_dt_rank);
     be_->scale_cols(ws_ssm_, L.ssm_a, n, mc.ssm_dt_rank);
 
-    be_->gemm(ws_beta_, ws_xn_, L.ssm_beta.data, L.ssm_beta.type, mc.ssm_dt_rank,
-              n_embd_, n);
+    if (!gdn_onelaunch) {
+        be_->gemm(ws_beta_, ws_xn_, L.ssm_beta.data, L.ssm_beta.type,
+                  mc.ssm_dt_rank, n_embd_, n);
+    }
     be_->sigmoid_act(ws_beta_, static_cast<i64>(n) * mc.ssm_dt_rank);
 
     // 5. The delta rule, in order, carrying this layer's state to the next token.
@@ -1840,8 +2074,8 @@ void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
         had_xform(ws_had_, ws_h_, n, vdim, false, /*gdn_perm=*/true);
         h_in = ws_had_;
     }
-    be_->gemm(ws_x2_, h_in, L.ssm_out.data, L.ssm_out.type, n_embd_, vdim, n);
-    be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
+    gemm_residual(ws_x_, h_in, L.ssm_out.data, L.ssm_out.type, n_embd_, vdim,
+                  n, ws_x2_);
 }
 
 // Writes the routing statistics as `<model>.krakenexperts.json`, beside the
@@ -2273,9 +2507,70 @@ void Engine::warm_experts() {
 // so an expert whose bytes are not a number survives that multiplication as the
 // only visible trace. A per-group non-finite count is what turns "the residual
 // went NaN somewhere in layer 27" into "this expert's weights are not finite".
+// KRK_SPEC_TRACE=1 prints one line per speculative round: what the draft
+// proposed, what the target's verification rows predicted for the same
+// positions, how long the accepted prefix was, and -- when the round failed
+// before the block ran -- the pre-check's two tokens. The counters report a
+// rate, not which proposal was rejected for what.
+static bool spec_trace() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_SPEC_TRACE");
+        return e && e[0] != '0';
+    }();
+    return v;
+}
+
+// The slot the draft is re-fed at, at the end of a round. Both models must end
+// a round in the same state -- KV [0, pos) with logits predicting pos -- and the
+// last emitted token's natural slot is pos-1, which is the convention the
+// pre-check's mismatch branch below has always used. This realign used `pos`
+// instead, so the draft took the last token one row too high, a row below it
+// stayed stale, and its logits then predicted pos+1 where the target predicted
+// pos. Both speculative rounds carry the same code, so both carry the same
+// choice. KRK_SPEC_REALIGN=0 restores the off-by-one for the A/B.
+static bool spec_realign_at_natural_slot() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_SPEC_REALIGN");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
 static bool moe_probe() {
     static const bool v = [] {
         const char *e = std::getenv("KRK_DUMP_MOE");
+        return e && e[0] != '0';
+    }();
+    return v;
+}
+
+// KRK_MOE_GROUP=0 restores the separate up/gate gemms plus the standalone
+// silu_mul for a routed expert. Default ON, because the pair shares one
+// activation and the activation reads the same row of both projections, so the
+// three launches collapse into one -- the same fold the dense FFN has had since
+// fused_gate_silu_kernel landed (measured there: 30 launches and +6.135% decode
+// on SmolLM2-135M, text byte-identical).
+static bool moe_group() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_MOE_GROUP");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+// KRK_MOE_SILU_FUSED=1 puts the activation back inside the gate/up group.
+// It is OFF because that kernel has no row maximum to take: a row whose
+// silu(gate)*up exceeds f16's range is stored clipped, and the clip is not
+// something a later un-scale can undo (measured on Laguna-XS-2.1: ONE
+// saturated element in the product row put 16 non-finite elements in the
+// down projection's output and 1020 clipped elements in the experts' sum).
+// The row-scaled silu_mul the group's fallback already runs does have one --
+// it is one block per row with the whole row's maximum in shared memory --
+// so the pair is grouped (two launches, not three) and the activation is
+// then scaled per row, which is the contract the scatter already folds back
+// in. The switch exists so the fuse's cost is measurable one process apart.
+static bool moe_silu_fused() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_MOE_SILU_FUSED");
         return e && e[0] != '0';
     }();
     return v;
@@ -2290,6 +2585,11 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     const i64 ff_sh = mc.n_ff_shexp;
 
     be_->fill0(ws_ffn_, static_cast<size_t>(n) * static_cast<size_t>(n_embd_) * as);
+    // ... and the routed sum's storage exponents, zeroed once per layer, before
+    // the first expert visit. `ws_fexp_` is where scatter_axpy_rows records the
+    // power of two a row was stored under, and both folds below read it as that
+    // row's exponent -- the same contract the residual stream's `ws_rexp_` has.
+    be_->fill0(ws_fexp_, static_cast<size_t>(n) * sizeof(i32));
 
     if (L.router.present() && k > 0 && ne > 0) {
         // Routing runs on the host: the logits are tiny ([n, n_expert]) and the
@@ -2544,8 +2844,6 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // x̃ = xn[group_rows] — the permuted activation block.
             be_->gather_rows(ws_xg_, ws_xn_, static_cast<const i32 *>(ws_plan_), m,
                              n_embd_);
-            // One GEMM per matrix over the whole block.
-            //
             // The global scale is folded into the INPUT rather than applied to
             // the result. Both are the same matrix product -- gs * (W x) is
             // (gs W) x -- but only this one keeps the magnitudes right inside
@@ -2561,14 +2859,52 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // scale at all.
             if (gs_up != 1.0f)
                 be_->scale_act(ws_xg_, gs_up, m, n_embd_, n_embd_);
-            be_->gemm(ws_upg_, ws_xg_, re->up.data, re->up.type, ff_exp, n_embd_, m);
-            if (re->gate.present()) {
-                // ws_xg_ is carrying gs_up; leave it carrying gs_gt for the
-                // gate. It is read by nothing else.
-                if (gs_gt != gs_up)
-                    be_->scale_act(ws_xg_, gs_gt / gs_up, m, n_embd_, n_embd_);
-                be_->gemm(ws_gateg_, ws_xg_, re->gate.data, re->gate.type, ff_exp,
+            // One launch for the pair where the shapes allow it. Up and gate
+            // share one activation, and the activation that follows reads the
+            // SAME output row of both, so one warp computes both dots and
+            // applies silu in the epilogue -- fused_gate_silu_kernel, the fold
+            // the dense FFN already uses. Per-matrix types travel with it
+            // (`gwts`): a checkpoint picks each expert tensor's format on its
+            // own, and the kernel has taken one type per matrix since the GDN
+            // group landed.
+            //
+            // Two conditions, both correctness rather than taste:
+            //  - gs_gt == gs_up. With differing sidecar scales the old path
+            //    rescaled ws_xg_ BETWEEN the two gemms, which a one-input group
+            //    cannot express.
+            //  - not KRK_DUMP_MOE. The probe's whole point is to read the up and
+            //    gate results back as separate facts, and the fused kernel
+            //    writes only silu(gate)*up, so a probe run takes the old path.
+            // Everything the kernel cannot express (rows != 1, row bytes that
+            // differ between the two, split-K) is the backend's call:
+            // `pair_fused` comes back false and the silu_mul below still runs,
+            // which is why the return value alone is not the answer.
+            bool pair_fused = false;
+            // Set only when the silu produced a row scale. The fused kernel and
+            // the other activation shapes have no row maximum to take, so their
+            // rows reach the scatter unscaled (those paths keep the saturating
+            // f16 store as their bound).
+            const f32 *scatter_scale = nullptr;
+            if (re->gate.present() && moe_group() && !moe_probe() &&
+                gs_gt == gs_up) {
+                void *gout[2] = {ws_gateg_, ws_upg_};
+                const void *gw[2] = {re->gate.data, re->up.data};
+                const i64 gno[2] = {ff_exp, ff_exp};
+                const DType gwts[2] = {re->gate.type, re->up.type};
+                be_->gemm_group(gout, ws_xg_, gw, re->gate.type, gno, n_embd_, 2,
+                                m, moe_silu_fused(), &pair_fused, false, gwts);
+            } else {
+                be_->gemm(ws_upg_, ws_xg_, re->up.data, re->up.type, ff_exp,
                           n_embd_, m);
+                if (re->gate.present()) {
+                    // ws_xg_ is carrying gs_up; leave it carrying gs_gt for the
+                    // gate. It is read by nothing else.
+                    if (gs_gt != gs_up)
+                        be_->scale_act(ws_xg_, gs_gt / gs_up, m, n_embd_,
+                                       n_embd_);
+                    be_->gemm(ws_gateg_, ws_xg_, re->gate.data, re->gate.type,
+                              ff_exp, n_embd_, m);
+                }
             }
             if (moe_probe()) {
                 // After the two projections, before anything is multiplied:
@@ -2576,28 +2912,46 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 // question is which one is not finite.
                 // Same predicate the KRK_DUMP_FULL summary uses, so a count
                 // here and an nf= there are the same measurement.
-                auto count_nf = [&](const void *p, i64 w) {
+                auto scan = [&](const void *p, i64 w, i64 &nf, f32 &peak) {
                     std::vector<f32> t(static_cast<size_t>(w));
                     be_->download_f32(t.data(), p, w);
-                    i64 c = 0;
-                    for (f32 v : t)
-                        if (!(v == v) || v > 3.0e38f || v < -3.0e38f) c++;
-                    return c;
+                    nf = 0;
+                    peak = 0.0f;
+                    for (f32 v : t) {
+                        if (!(v == v) || v > 3.0e38f || v < -3.0e38f) nf++;
+                        else if (std::fabs(v) > peak) peak = std::fabs(v);
+                    }
                 };
-                const i64 in_nf = count_nf(ws_xg_, m * n_embd_);
-                const i64 up_nf = count_nf(ws_upg_, m * ff_exp);
-                const i64 gt_nf = count_nf(ws_gateg_, m * ff_exp);
-                if (in_nf || up_nf || gt_nf)
+                i64 in_nf = 0, up_nf = 0, gt_nf = 0;
+                f32 in_pk = 0, up_pk = 0, gt_pk = 0;
+                scan(ws_xg_, m * n_embd_, in_nf, in_pk);
+                scan(ws_upg_, m * ff_exp, up_nf, up_pk);
+                scan(ws_gateg_, m * ff_exp, gt_nf, gt_pk);
+                // The count says which leg is not finite; the peak says which
+                // leg is AT the ceiling, and the leg that overflows the silu
+                // product is the one whose peak is at 65504 rather than the
+                // one the product was blamed on.
+                if (in_nf || up_nf || gt_nf || up_pk > 60000.0f || gt_pk > 60000.0f)
                     std::fprintf(stderr,
-                                 "[moe] L%02d e=%3d m=%3lld in_nf=%lld up_nf=%lld "
-                                 "gate_nf=%lld\n",
+                                 "[moe] L%02d e=%3d m=%3lld in_nf=%lld/%g "
+                                 "up_nf=%lld/%g gate_nf=%lld/%g\n",
                                  layer, e, static_cast<long long>(m),
-                                 static_cast<long long>(in_nf),
-                                 static_cast<long long>(up_nf),
-                                 static_cast<long long>(gt_nf));
+                                 static_cast<long long>(in_nf), static_cast<f64>(in_pk),
+                                 static_cast<long long>(up_nf), static_cast<f64>(up_pk),
+                                 static_cast<long long>(gt_nf), static_cast<f64>(gt_pk));
             }
             if (re->gate.present()) {
-                be_->silu_mul(ws_gateg_, ws_gateg_, ws_upg_, m * ff_exp);
+                // The fused kernel already left silu(gate)*up in ws_gateg_;
+                // everything else reaches here with both operands written.
+                if (!pair_fused) {
+                    // Row-scaled: a row here is one token ff_exp-wide expert
+                    // activation, which is the dimension the down projection
+                    // reduces over, so the scatter undoes the scale with the
+                    // per-row weight it already applies.
+                    be_->silu_mul(ws_gateg_, ws_gateg_, ws_upg_, m * ff_exp, ff_exp,
+                                  static_cast<f32 *>(ws_scale_));
+                    scatter_scale = static_cast<const f32 *>(ws_scale_);
+                }
             } else if (mc.ffn_relu_sqr) {
                 // Gate-less with squared ReLU (nemotron_h_moe): the activation
                 // is relu^2 of the up projection, which is what the reference
@@ -2630,6 +2984,23 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // as the gate/up pair above.
             if (gs_dn != 1.0f)
                 be_->scale_act(ws_gateg_, gs_dn, m, ff_exp, ff_exp);
+            if (moe_probe()) {
+                // The probe above counts the GATE projection, which is what the
+                // silu reads; the down GEMM's input is what the silu WROTE, and
+                // a fused silu that overflowed f16 would only show up here.
+                std::vector<f32> t2(static_cast<size_t>(m) * static_cast<size_t>(ff_exp));
+                be_->download_f32(t2.data(), ws_gateg_, static_cast<i64>(t2.size()));
+                i64 act_nf = 0;
+                f32 act_peak = 0.0f;
+                for (f32 v : t2) {
+                    if (!(v == v) || v > 3.0e38f || v < -3.0e38f) act_nf++;
+                    else if (std::fabs(v) > act_peak) act_peak = std::fabs(v);
+                }
+                std::fprintf(stderr,
+                             "[moeact] L%02d e=%3d m=%3lld act_nf=%lld act_peak=%.6g\n",
+                             layer, e, static_cast<long long>(m),
+                             static_cast<long long>(act_nf), static_cast<f64>(act_peak));
+            }
             be_->gemm(ws_x2_, ws_gateg_, re->down.data, re->down.type, n_embd_,
                       ff_exp, m);
             if (moe_probe()) {
@@ -2648,8 +3019,16 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                                  static_cast<long long>(big));
             }
             // Scatter back to the original rows, weighted by the gate.
+            // The routed sum is the one row in this chain whose every
+            // producer can be in range and still not fit: ten experts' worth
+            // of contributions add up past f16 where none of them alone does
+            // (measured on Laguna-XS-2.1: 1020 clipped elements in the prefill
+            // chunk, none in decode). The row carries a storage exponent like
+            // the residual's, and the folds below un-scale it.
             be_->scatter_axpy_rows(ws_ffn_, ws_x2_, static_cast<const i32 *>(ws_plan_),
-                                   static_cast<const f32 *>(ws_alpha_), m, n_embd_);
+                                   static_cast<const f32 *>(ws_alpha_), m, n_embd_,
+                                   scatter_scale,
+                                   static_cast<i32 *>(ws_fexp_));
         }
 
         // ---- the host arm --------------------------------------------------
@@ -2731,10 +3110,45 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 be_->sync();
                 hy_ffn_.resize(cells);
                 hy_f16_.resize(cells);
+                std::vector<i32> hy_exp(static_cast<size_t>(n));
                 be_->download_f32(hy_ffn_.data(), ws_ffn_, static_cast<i64>(cells));
-                for (size_t i = 0; i < cells; i++)
-                    hy_f16_[i] = fp32_to_fp16(hy_ffn_[i] + hy_out_[i]);
+                be_->download(hy_exp.data(), ws_fexp_,
+                              static_cast<size_t>(n) * sizeof(i32), 0);
+                // ws_ffn_ is stored under a per-token storage exponent whenever
+                // the routed sum left f16 (the contract scatter_axpy_rows
+                // writes), so the merge un-scales the device part, adds the host
+                // contribution at true scale, and picks the row's exponent again.
+                // At exponent 0 this is the flat `f16(f32(dev) + host)` it was.
+                for (i32 t = 0; t < n; t++) {
+                    const size_t base = static_cast<size_t>(t) *
+                                        static_cast<size_t>(n_embd_);
+                    const f64 sc =
+                        std::exp2(static_cast<f64>(hy_exp[static_cast<size_t>(t)]));
+                    f64 mx = 0.0;
+                    for (i64 j = 0; j < n_embd_; j++) {
+                        const size_t k = base + static_cast<size_t>(j);
+                        const f64 v = static_cast<f64>(hy_ffn_[k]) * sc +
+                                      static_cast<f64>(hy_out_[k]);
+                        const f64 av = std::fabs(v);
+                        if (av > mx) mx = av;
+                    }
+                    i32 e2 = hy_exp[static_cast<size_t>(t)];
+                    while (mx > 65504.0 && e2 < 60) {
+                        mx *= 0.5;
+                        e2++;
+                    }
+                    const f64 inv = std::exp2(-static_cast<f64>(e2));
+                    for (i64 j = 0; j < n_embd_; j++) {
+                        const size_t k = base + static_cast<size_t>(j);
+                        const f64 v = static_cast<f64>(hy_ffn_[k]) * sc +
+                                      static_cast<f64>(hy_out_[k]);
+                        hy_f16_[k] = fp32_to_fp16(static_cast<f32>(v * inv));
+                    }
+                    hy_exp[static_cast<size_t>(t)] = e2;
+                }
                 be_->upload(ws_ffn_, hy_f16_.data(), cells * sizeof(u16));
+                be_->upload(ws_fexp_, hy_exp.data(),
+                            static_cast<size_t>(n) * sizeof(i32), 0);
             }
         }
     }
@@ -2780,6 +3194,32 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         if (L.shexp_down_scale != 1.0f)
             be_->scale_act(ws_gate_, L.shexp_down_scale, n, ff_sh, ff_sh);
         be_->gemm(ws_x2_, ws_gate_, L.shexp_down.data, L.shexp_down.type, n_embd_, ff_sh, n);
+        if (moe_probe()) {
+            // The shared expert is the third writer of moe.sum and the one the
+            // other probes do not cover: its activation is a silu of an f16
+            // pair (so the saturating store can hide an overflow) and its down
+            // projection is a full n_embd-wide gemm whose f16 output can exceed
+            // the ceiling on its own. `routedsum` is ws_ffn_ BEFORE this leg is
+            // folded in, which is what separates "the routed experts did it"
+            // from "the shared expert did it".
+            auto scan_sh = [&](const void *p, i64 w, const char *tag) {
+                std::vector<f32> t(static_cast<size_t>(w));
+                be_->download_f32(t.data(), p, w);
+                i64 nf = 0;
+                f32 pk = 0.0f;
+                for (f32 v : t) {
+                    if (!(v == v) || v > 3.0e38f || v < -3.0e38f) nf++;
+                    else if (std::fabs(v) > pk) pk = std::fabs(v);
+                }
+                if (nf || pk > 60000.0f)
+                    std::fprintf(stderr, "[shexp] L%02d %s nf=%lld peak=%g\n",
+                                 layer, tag, static_cast<long long>(nf),
+                                 static_cast<f64>(pk));
+            };
+            scan_sh(ws_ffn_, n * n_embd_, "routedsum");
+            scan_sh(ws_gate_, n * ff_sh, "act");
+            scan_sh(ws_x2_, n * n_embd_, "out");
+        }
         // Qwen3.5 scales the shared expert by a per-token sigmoid of a small
         // vector before folding it in; the Qwen2/Qwen3 schema has no such gate.
         if (L.shexp_inp_gate.present()) {
@@ -2788,11 +3228,31 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             be_->sigmoid_act(ws_ssm_, n);
             be_->scale_rows(ws_x2_, ws_ssm_, n, n_embd_);
         }
-        be_->add_inplace(ws_ffn_, ws_x2_, n * n_embd_);
+        // The fold is the one place a sum of two in-range rows leaves f16 on
+        // its own -- measured on Laguna-S-2.1: the routed sum saturated at 65504
+        // with the shared expert's own output finite, and their f16 sum went to
+        // `inf`, which then drove the residual's exponent to its clamp (15 rows,
+        // max exponent 60). Summed in f32 through the same storage contract as
+        // the residual: the staging row carries its own exponent from here on and
+        // the residual add below reads it. At exponent 0 this is
+        // `f16(f32(a) + f32(b))`, which is `add_inplace_kernel`'s arithmetic.
+        // The exponents are already in place: the routed scatter wrote each
+        // row's own as it summed the experts, and this fold only ever raises
+        // one (add_residual reads a's exponent and writes back the row's).
+        be_->add_residual(ws_ffn_, ws_x2_, n, n_embd_,
+                          static_cast<i32 *>(ws_fexp_));
     }
 
     dump_row("moe.sum", layer, ws_ffn_, n_embd_, n);
-    be_->add_inplace(ws_x_, ws_ffn_, n * n_embd_);
+    // The residual add that ends the MoE/FFN block, and the one store on this
+    // path with no bound at all: its row is the hidden state, which no row-local
+    // scale can bring back into f16 (a saturated hidden state is wrong by a
+    // factor and poisons every later layer). It goes through the storage
+    // contract instead -- summed in f32, stored at a per-token power-of-two
+    // exponent, un-scaled by the next norm.
+    be_->add_residual(ws_x_, ws_ffn_, n, n_embd_,
+                      static_cast<i32 *>(ws_rexp_),
+                      static_cast<const i32 *>(ws_fexp_));
     dump_row("moe.post", layer, ws_x_, n_embd_, n);
 }
 
@@ -2948,6 +3408,15 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         // the mismatch branch emits the fallback token here, and if the round
         // later emits anything else it does so in the verify/accept loop.
         if (d == 0 || first != prop[0]) {
+            if (spec_trace()) {
+                std::fprintf(stderr,
+                             "[spec ] round %llu pos=%lld pre-check FAILED: "
+                             "target=%d draft[0]=%d (d=%d) -- the block never runs",
+                             static_cast<unsigned long long>(spec_steps_),
+                             static_cast<long long>(pos), first,
+                             d > 0 ? prop[0] : -1, d);
+                std::fputc(10, stderr);
+            }
             if (first == tok_.eos()) {
                 finish_run(FinishEos);
                 return true;
@@ -3009,6 +3478,25 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         // ---- accept the longest greedy-matching prefix ---------------------
         i32 a = 1; // T[1] passed the pre-check
         while (a < d_eff && row_pred(a) == prop[static_cast<size_t>(a)]) a++;
+        if (spec_trace()) {
+            const bool tr_full = (a == d_eff);
+            std::fprintf(stderr, "[spec ] round %llu pos=%lld d=%d first=%d prop=[",
+                         static_cast<unsigned long long>(spec_steps_),
+                         static_cast<long long>(pos), d_eff, first);
+            for (i32 j = 0; j < d_eff; j++)
+                std::fprintf(stderr, "%s%d", j ? "," : "",
+                             prop[static_cast<size_t>(j)]);
+            std::fprintf(stderr, "] row=[");
+            for (i32 j = 0; j < d_eff; j++)
+                std::fprintf(stderr, "%s%d", j ? "," : "",
+                             row_ids[static_cast<size_t>(j)]);
+            std::fprintf(stderr, "] accept=%d full=%d", a, tr_full ? 1 : 0);
+            if (!tr_full)
+                std::fprintf(stderr, " REJECTED row %d predicted %d against "
+                             "prop[%d]=%d", a + 1, row_pred(a + 1), a + 1,
+                             prop[static_cast<size_t>(a)]);
+            std::fputc(10, stderr);
+        }
         const bool full = (a == d_eff);
 
         // Emit the accepted proposals, respecting max_tokens.
@@ -3068,8 +3556,12 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         // logits predicting pos. Re-feeding the last emitted token regenerates
         // the draft's distribution exactly.
         const i32 last_tok = res->tokens.back();
-        draft.kv_rollback(pos);
-        draft.forward(&last_tok, 1, static_cast<i32>(pos), true);
+        // The last emitted token's slot in the target's cache is pos-1, and
+        // the draft has to be given it there -- see
+        // spec_realign_at_natural_slot above.
+        const i32 rslot = spec_realign_at_natural_slot() ? pos - 1 : pos;
+        draft.kv_rollback(rslot);
+        draft.forward(&last_tok, 1, static_cast<i32>(rslot), true);
         draft.fetch_logits();
         // The target's logits must predict pos. After a full match they came
         // from the bonus forward above. After a partial match they are block row
@@ -3203,6 +3695,18 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
         // ---- the same pre-check plain decode performs ---------------------
         // On disagreement the round costs exactly one plain step and the block
         // is never verified.
+        if (spec_trace()) {
+            std::fprintf(stderr,
+                         "[dflash] round %llu pos=%lld PRE-CHECK FAILED d=%d "
+                         "first(target)=%d prop[0](draft)=%d prop=[",
+                         static_cast<unsigned long long>(spec_steps_),
+                         static_cast<long long>(pos), d, first, prop[0]);
+            for (i32 j = 0; j < d; j++)
+                std::fprintf(stderr, "%s%d", j ? "," : "",
+                             prop[static_cast<size_t>(j)]);
+            std::fputc(93, stderr);
+            std::fputc(10, stderr);
+        }
         if (first != prop[0]) {
             if (first == tok_.eos()) {
                 finish_run(FinishEos);
@@ -3251,6 +3755,25 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
 
         i32 a = 1;
         while (a < d_eff && row_pred(a) == prop[static_cast<size_t>(a)]) a++;
+        if (spec_trace()) {
+            const bool tr_full = (a == d_eff);
+            std::fprintf(stderr, "[dflash] round %llu pos=%lld d=%d first=%d prop=[",
+                         static_cast<unsigned long long>(spec_steps_),
+                         static_cast<long long>(pos), d_eff, first);
+            for (i32 j = 0; j < d_eff; j++)
+                std::fprintf(stderr, "%s%d", j ? "," : "",
+                             prop[static_cast<size_t>(j)]);
+            std::fprintf(stderr, "] row=[");
+            for (i32 j = 0; j < d_eff; j++)
+                std::fprintf(stderr, "%s%d", j ? "," : "",
+                             row_ids[static_cast<size_t>(j)]);
+            std::fprintf(stderr, "] accept=%d full=%d", a, tr_full ? 1 : 0);
+            if (!tr_full)
+                std::fprintf(stderr, " REJECTED row %d predicted %d against "
+                             "prop[%d]=%d", a + 1, row_pred(a + 1), a + 1,
+                             prop[static_cast<size_t>(a)]);
+            std::fputc(10, stderr);
+        }
         const bool full = (a == d_eff);
 
         // The drafter's cache takes the features of the rows that were actually

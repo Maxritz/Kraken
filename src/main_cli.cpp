@@ -343,8 +343,63 @@ void sink_cb(void *user, const char *text, i32 token, bool done) {
 // the expert cache did. Every number here already existed as a counter — a
 // paging policy nobody can read back is not a measurement. Goes to stderr so
 // stdout stays exactly the generated text (the coherence check depends on it).
+// The activation-range readout as an invariant, not a report.
+//
+// Two counters and one exponent are the whole answer to "did this run compute
+// the model's own numbers". `silu`, `experts-sum` and `residual` count stores
+// that left f16 and were clipped -- each one a value the f32 reference carries
+// exactly and this engine does not -- and an exponent at the clamp means the
+// storage scale itself hit its cap, which is only reachable when the value is
+// beyond anything an exponent can cover (an `inf` in the row) or when the scale
+// climbed on its own (the ratchet that made Laguna-XS-2.1 report 2^-30 for a
+// value that needed 2^-5, and S-2.1 2^-60 beside `residual 0`).
+//
+// A run that trips this is not a run whose text can be trusted, so it does not
+// get to exit 0 with the fact buried in the log: the verdict is printed as an
+// error and the process exit status carries it. `KRK_RANGE_STRICT=0` demotes it
+// back to a log line, for the probes that read a clipped model on purpose.
+static constexpr int kRexClamp = 60;
+
+// Set by a run whose activation range was violated in strict mode; the
+// CLI's generate path returns bool, so the verdict reaches the exit
+// status through here rather than through its own return value.
+static int g_range_exit = 0;
+
+static bool range_violated(unsigned long long silu, unsigned long long sum,
+                           unsigned long long resid, int rexp_max) {
+    return silu != 0 || sum != 0 || resid != 0 || rexp_max >= kRexClamp;
+}
+
+static bool range_strict() {
+    const char *env = std::getenv("KRK_RANGE_STRICT");
+    return !(env && env[0] == '0');
+}
+
+static void range_verdict(FILE *out, unsigned long long silu,
+                          unsigned long long sum, unsigned long long resid,
+                          int rexp_max, const char *where) {
+    if (!range_violated(silu, sum, resid, rexp_max)) return;
+    std::fprintf(out,
+                 "[%s ] range     %s: %llu silu, %llu experts-sum and %llu "
+                 "residual store(s) left f16 and were clipped%s; compare "
+                 "against the --cpu arm before trusting this output\n",
+                 range_strict() ? "error" : "warn", where,
+                 silu, sum, resid,
+                 rexp_max >= kRexClamp
+                     ? ", and the storage exponent reached the clamp"
+                     : "");
+}
+
+static int range_exit_code(unsigned long long silu, unsigned long long sum,
+                           unsigned long long resid, int rexp_max) {
+    if (!range_strict()) return 0;
+    return range_violated(silu, sum, resid, rexp_max) ? 2 : 0;
+}
+
 static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
-                            f64 load_ms, size_t dev_free, size_t dev_total) {
+                            f64 load_ms, size_t dev_free, size_t dev_total,
+                            unsigned long long sat_silu, unsigned long long sat_sum,
+                            unsigned long long sat_resid, int rexp_max) {
     const Model &m = engine.model();
     const ModelConfig &mc = m.cfg();
     const f64 ptps = r.prefill_ms > 0 ? r.prompt_tokens / (r.prefill_ms / 1000.0) : 0.0;
@@ -399,6 +454,31 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                      static_cast<f64>(dev_total - dev_free) / 1073741824.0,
                      static_cast<f64>(dev_total) / 1073741824.0,
                      static_cast<f64>(dev_free) / 1073741824.0);
+
+    // Activation range. Every bound in the f16 activation path is a bounded
+    // wrong answer, and printing nothing about it is how two laguna files read as
+    // "runnable" while decoding nonsense. Printed for every run, dense models
+    // included, so zeros are a stated fact rather than a silence.
+    std::fprintf(out,
+                 "[stats ] range     f16 activation bounds fired: silu %llu, "
+                 "experts-sum %llu, residual %llu%s\n",
+                 sat_silu, sat_sum, sat_resid,
+                 (sat_silu || sat_sum || sat_resid)
+                     ? "  (a value left f16 and was clipped; the f32 reference "
+                       "carries it exactly)"
+                     : "");
+    // The residual stream's own answer to the same question, printed with equal
+    // regularity: a non-zero exponent means the hidden state left f16 and is
+    // being carried by the storage scaling instead of clipped. It is the one
+    // response to the range problem that is a fix rather than a bound, so a run
+    // says whether it is in play instead of leaving it to be inferred.
+    std::fprintf(out,
+                 "[stats ] range     residual rows stored scaled: max exponent %d%s\n",
+                 rexp_max,
+                 rexp_max > 0
+                     ? "  (the hidden state left f16 and rides a power-of-two "
+                       "storage scale; every norm puts it back exactly)"
+                     : "");
 
     // KV tier traffic. These counters live in KvTierCache and were collected
     // from the start, but the only thing that ever read them was the load-time
@@ -533,7 +613,8 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     krk::HostTime::get().report(out);
 }
 
-int run_bench(Engine &engine, const Args &a, f64 load_ms, f64 start_ms) {
+int run_bench(Engine &engine, Backend *be, const Args &a, f64 load_ms,
+              f64 start_ms) {
     GenerateParams p;
     p.prompt =
         "The history of computing is a history of abstraction: from relays to "
@@ -590,7 +671,15 @@ int run_bench(Engine &engine, const Args &a, f64 load_ms, f64 start_ms) {
         std::printf("total          %.1f ms  (startup + load + prefill + decode)\n", total_ms);
     }
     usage.report(stdout);
-    print_run_stats(stdout, engine, r, load_ms, 0, 0);
+    // The bench report says nothing about device memory, but it must not claim
+    // zero saturated stores just because it does not print them either: the
+    // counters are read wherever the line is printed.
+    unsigned long long sat[3] = {0, 0, 0};
+    if (be) be->activation_saturation(sat);
+    const int rexp_max_bench = be ? be->residual_exponent_max() : 0;
+    print_run_stats(stdout, engine, r, load_ms, 0, 0, sat[0], sat[1], sat[2],
+                    rexp_max_bench);
+    range_verdict(stdout, sat[0], sat[1], sat[2], rexp_max_bench, "bench");
     if (engine.has_draft() && engine.spec_steps() > 0) {
         const f64 rate =
             engine.draft_proposed() > 0
@@ -640,7 +729,9 @@ int run_bench(Engine &engine, const Args &a, f64 load_ms, f64 start_ms) {
                     hs.threads,
                     static_cast<unsigned long long>(hs.gpu_experts));
     }
-    return 0;
+    // A benchmark whose numbers came from clipped stores is measuring a
+    // different model, so the gate sees it in the status too.
+    return range_exit_code(sat[0], sat[1], sat[2], rexp_max_bench);
 }
 
 } // namespace
@@ -839,7 +930,7 @@ int main(int argc, char **argv) {
 
     ph.mark("banner + draft");
     if (a.bench) {
-        const int rc = run_bench(engine, a, bench_load_ms, bench_start_ms);
+        const int rc = run_bench(engine, be, a, bench_load_ms, bench_start_ms);
         ph.mark("run_bench (prefill+decode)");
         // The bench arm used to return here, which silently dropped the index
         // for `--expert-scan --bench` -- the very combination the argument
@@ -898,8 +989,19 @@ int main(int argc, char **argv) {
 
         GenerateResult r;
         if (!engine.generate(p, &r)) return false;
+        unsigned long long sat[3] = {0, 0, 0};
+        be->activation_saturation(sat);
+        const int rexp_max_run = be->residual_exponent_max();
         print_run_stats(stderr, engine, r, load_ms,
-                        be->device_free_bytes(), be->device_total_bytes());
+                        be->device_free_bytes(), be->device_total_bytes(),
+                        sat[0], sat[1], sat[2], rexp_max_run);
+        range_verdict(stderr, sat[0], sat[1], sat[2], rexp_max_run,
+                      "generate");
+        // The status the caller gets, not just a line in the log: exit 2 is
+        // reserved for exactly this, so a script that pipes the text cannot
+        // mistake a clipped run for a clean one.
+        if (range_exit_code(sat[0], sat[1], sat[2], rexp_max_run) != 0)
+            g_range_exit = 2;
         // Speculation telemetry. It lived only in run_bench, which meant the one
         // run a user actually does -- start the CLI, ask a question, read the
         // answer -- could not say whether the draft earned its keep. The number
@@ -955,5 +1057,5 @@ int main(int argc, char **argv) {
 
     engine.shutdown();
     delete be;
-    return rc;
+    return rc != 0 ? rc : g_range_exit;
 }

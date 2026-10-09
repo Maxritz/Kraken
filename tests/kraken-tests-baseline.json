@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-08T10:49:38Z",
-  "recorded_commit": "3329840",
-  "totals": {"groups": 53, "passed": 2751, "run": 2751, "exit": 0},
+  "recorded_utc": "2026-10-09T11:08:01Z",
+  "recorded_commit": "7ca23ac",
+  "totals": {"groups": 53, "passed": 2760, "run": 2760, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -47,7 +47,7 @@
     {"name": "test_expert_cache_warm_tier", "status": "pass", "passed": 34, "run": 34},
     {"name": "test_expert_warmup", "status": "pass", "passed": 11, "run": 11},
     {"name": "test_cpu_expert_pool", "status": "pass", "passed": 60, "run": 60},
-    {"name": "test_gdn_ops", "status": "pass", "passed": 129, "run": 129},
+    {"name": "test_gdn_ops", "status": "pass", "passed": 138, "run": 138},
     {"name": "test_gdn_model_loads", "status": "pass", "passed": 23, "run": 23},
     {"name": "test_gdn_generation", "status": "pass", "passed": 21, "run": 21},
     {"name": "test_speculative_decoding", "status": "pass", "passed": 18, "run": 18},

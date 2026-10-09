@@ -184,7 +184,7 @@ wheel spun by exactly one slot: 23 evictions, 131 promotions, +5% decode once
 the budget covers the corpus. An evicted expert keeps its WARM copy (WARM is
 inclusive), so the cost of the spin is a ~1 ms DMA, never a file read.
 
-**F8 — speculation is currently a 3.6x loss, and the fingerprint says why.**
+**F8 — speculation is currently a 3.6x loss, and the fingerprint says why. (Reproduced 2026-10-09: still a loss, now 4.0x — 20/72 accepted = 27.8%, the same 5/18 per round, 171.4/172.7 tok/s against 669.1/707.0 plain, text identical. See docs/MTP-DRAFTER.md §3.)**
 Same model as target and draft, `--draft-tokens 4`: 36 rounds, **40/144
 accepted (27.8%)**, 64 tokens in 2005.9 ms = 31.9 tok/s against 113.6 tok/s
 plain. A self-draft must propose its own argmax, so acceptance should be ~100%

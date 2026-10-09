@@ -27,12 +27,31 @@ Everything else is reported but not necessarily fatal:
 A run whose own exit status is non-zero while every group reads as passing is a
 failure of the runner itself (a report that could not be written, say), and it is
 reported as such rather than compared.
+
+A --selfcheck report (kind "selfcheck") carries each group's arm verdicts beside
+its counts. The group comparison above still applies -- a group whose arm broke is
+not passing -- and the arms are compared arm by arm, so a regression names the arm
+and the problem it reported, even in a report where the group status did not move.
+An arm the baseline has as ok and this run does not is a regression; an arm added
+or removed is a shape change, re-recorded deliberately like a new group.
 """
 import json
 import subprocess
 import sys
 
 PASS = "pass"
+OK = "ok"
+
+
+def kind(report):
+    """'run' for a normal suite report, 'selfcheck' for an arm sweep."""
+    return report.get("kind", "run")
+
+
+def arm_map(group):
+    """The group's arm verdicts, keyed by arm name; {} when it has none."""
+    arms = group.get("arms")
+    return arms if isinstance(arms, dict) else {}
 
 
 def load(path):
@@ -51,7 +70,8 @@ def classify(base, cur):
     """Returns the findings, keyed by kind, each a list of group dicts."""
     b, c = by_name(base), by_name(cur)
     out = {k: [] for k in ("newly_broken", "still_broken", "fixed", "changed",
-                           "new", "removed")}
+                           "new", "removed", "newly_broken_arms", "still_broken_arms",
+                           "fixed_arms", "new_arms", "removed_arms")}
     for name in [g["name"] for g in cur["groups"]]:
         if name not in b:
             out["new"].append(c[name])
@@ -65,6 +85,23 @@ def classify(base, cur):
             out["still_broken"].append(now)
         elif (was["passed"], was["run"]) != (now["passed"], now["run"]):
             out["changed"].append(now)
+        # A selfcheck report's groups also carry arm verdicts. The group status
+        # already moves when an arm breaks, so this is what names the arm -- and
+        # it holds in a report where the status did NOT move.
+        was_arms, now_arms = arm_map(was), arm_map(now)
+        if was_arms or now_arms:
+            for arm in now_arms:
+                if arm not in was_arms:
+                    out["new_arms"].append((name, arm))
+                elif was_arms[arm] == OK and now_arms[arm] != OK:
+                    out["newly_broken_arms"].append((name, arm, now_arms[arm]))
+                elif was_arms[arm] != OK and now_arms[arm] != OK:
+                    out["still_broken_arms"].append((name, arm))
+                elif was_arms[arm] != OK and now_arms[arm] == OK:
+                    out["fixed_arms"].append((name, arm))
+            for arm in was_arms:
+                if arm not in now_arms:
+                    out["removed_arms"].append((name, arm))
     for name in [g["name"] for g in base["groups"]]:
         if name not in c:
             out["removed"].append(b[name])
@@ -117,13 +154,51 @@ def render(base, cur, findings, fail_lines_shown=5):
     section("new groups", findings["new"])
     section("removed groups", findings["removed"])
 
+    def arm_section(title, arms):
+        if not arms:
+            return
+        lines.append("%s (%d):" % (title, len(arms)))
+        for entry in arms:
+            name, arm = entry[0], entry[1]
+            if len(entry) > 2:
+                lines.append("  %-44s arm %s: %s" % (name, arm, entry[2]))
+            else:
+                lines.append("  %-44s arm %s" % (name, arm))
+
+    arm_section("newly broken arms", findings["newly_broken_arms"])
+    arm_section("still broken arms", findings["still_broken_arms"])
+    arm_section("fixed arms", findings["fixed_arms"])
+    arm_section("new arms", findings["new_arms"])
+    arm_section("removed arms", findings["removed_arms"])
+
     n = len(findings["newly_broken"])
-    shape = len(findings["new"]) + len(findings["removed"])
-    verdict = "no regression" if n == 0 else "%d newly broken" % n
-    lines.append("verdict: %s, %d fixed, %d changed, %d new, %d removed"
+    na = len(findings["newly_broken_arms"])
+    if n == 0 and na == 0:
+        verdict = "no regression"
+    elif na == 0:
+        verdict = "%d newly broken" % n
+    elif n == 0:
+        verdict = "%d newly broken arm(s)" % na
+    else:
+        verdict = "%d newly broken, %d arm(s)" % (n, na)
+    lines.append("verdict: %s, %d fixed, %d changed, %d new, %d removed, "
+                 "%d arm(s) newly broken, %d arm(s) fixed, %d arm(s) new, "
+                 "%d arm(s) removed"
                  % (verdict, len(findings["fixed"]), len(findings["changed"]),
-                    len(findings["new"]), len(findings["removed"])))
+                    len(findings["new"]), len(findings["removed"]), na,
+                    len(findings["fixed_arms"]), len(findings["new_arms"]),
+                    len(findings["removed_arms"])))
     return lines
+
+
+def fatal(findings, allow_new=False):
+    """Whether these findings make the comparison fail. One predicate, so the
+    selftest exercises the same rule main() decides with."""
+    if findings["newly_broken"] or findings["newly_broken_arms"]:
+        return True
+    shape = (findings["new"] or findings["removed"] or findings["new_arms"] or
+             findings["removed_arms"])
+    return bool(shape) and not allow_new
 
 
 def runner_failed_without_a_failing_group(cur):
@@ -153,8 +228,10 @@ def record(base_path, cur, force=False):
         pass
     utc = subprocess.run(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"],
                          capture_output=True, text=True).stdout.strip()
-    out = ["{", '  "format": 1,', '  "suite": "kraken-tests",',
-           '  "recorded_utc": "%s",' % utc,
+    out = ["{", '  "format": 1,', '  "suite": "kraken-tests",']
+    if cur.get("kind"):
+        out.append('  "kind": "%s",' % cur["kind"])
+    out += ['  "recorded_utc": "%s",' % utc,
            '  "recorded_commit": "%s",' % commit,
            '  "totals": %s,' % json.dumps({"groups": len(cur["groups"]),
                                            "passed": t.get("passed"), "run": t.get("run"),
@@ -162,8 +239,13 @@ def record(base_path, cur, force=False):
            '  "groups": [']
     groups = []
     for g in cur["groups"]:
-        groups.append("    " + json.dumps({"name": g["name"], "status": g["status"],
-                                           "passed": g["passed"], "run": g["run"]}))
+        entry = {"name": g["name"], "status": g["status"], "passed": g["passed"],
+                 "run": g["run"]}
+        # A selfcheck baseline records the arm verdicts as well: they are what the
+        # comparison names when the reporting proof breaks.
+        if arm_map(g):
+            entry["arms"] = dict(arm_map(g))
+        groups.append("    " + json.dumps(entry))
     out.append(",\n".join(groups))
     out += ["  ]", "}"]
     with open(base_path, "w", encoding="utf-8", newline="\n") as f:
@@ -195,15 +277,16 @@ def selftest():
         f = classify(base, cur)
         got = {k: len(v) for k, v in f.items()}
         ok = all(got.get(k, 0) == v for k, v in want_findings.items())
-        exit_code = 1 if (f["newly_broken"] or
-                          ((f["new"] or f["removed"]) and not allow_new)) else 0
+        exit_code = 1 if fatal(f, allow_new) else 0
         cases.append((name, ok and exit_code == want_exit,
                       "%s exit=%d want %s exit=%d" % (got, exit_code, want_findings, want_exit)))
         return f
 
     green = report([group("a", PASS, 5, 5), group("b", PASS, 3, 3)])
     f = case("identical green run", green, green, {}, 0)
-    assert render(green, green, f)[-1].endswith("no regression, 0 fixed, 0 changed, 0 new, 0 removed")
+    assert render(green, green, f)[-1].endswith(
+        "no regression, 0 fixed, 0 changed, 0 new, 0 removed, "
+        "0 arm(s) newly broken, 0 arm(s) fixed, 0 arm(s) new, 0 arm(s) removed")
 
     red = report([group("a", PASS, 5, 5), group("b", "failed", 0, 3,
                                                 ["FAIL x.cpp:1  b broke"])], exit_code=1)
@@ -237,6 +320,47 @@ def selftest():
                   "want the run's own non-zero exit to be seen"))
     cases.append(("green run is not 'runner failed'",
                   not runner_failed_without_a_failing_group(green), ""))
+
+    # A --selfcheck report: the arm verdicts are the reporting proof, so a broken
+    # arm is a regression whose reason names the arm and what it missed.
+    def sc_group(name, status, passed, run, arms):
+        g = group(name, status, passed, run)
+        g["arms"] = arms
+        return g
+
+    def sc_report(groups, exit_code=0):
+        return {"format": 1, "suite": "kraken-tests", "kind": "selfcheck", "arms": 6,
+                "totals": {"groups": len(groups),
+                           "passed": sum(g["passed"] for g in groups),
+                           "run": sum(g["run"] for g in groups),
+                           "bad_groups": sum(1 for g in groups if g["status"] != PASS),
+                           "exit": exit_code},
+                "groups": groups}
+
+    arms_ok = {"crash": OK, "fuzz": OK}
+    sc_green = sc_report([sc_group("a", PASS, 5, 5, arms_ok),
+                          sc_group("b", PASS, 3, 3, arms_ok)])
+    sc_broken = sc_report([sc_group("a", PASS, 5, 5, arms_ok),
+                           sc_group("b", "failed", 3, 3,
+                                    {"crash": OK,
+                                     "fuzz": "the report records 1/1, want 2/2"})],
+                          exit_code=1)
+    f = case("a selfcheck arm newly broke", sc_green, sc_broken,
+             {"newly_broken": 1, "newly_broken_arms": 1}, 1)
+    named = [l for l in render(sc_green, sc_broken, f)
+             if "arm fuzz: the report records 1/1" in l]
+    cases.append(("the render names the broken arm and its problem", bool(named),
+                  "want the arm and its problem in the findings, got %r"
+                  % render(sc_green, sc_broken, f)))
+    case("an arm broken with the group status unmoved", sc_green,
+         sc_report([sc_group("a", PASS, 5, 5, arms_ok),
+                    sc_group("b", PASS, 3, 3, {"crash": OK, "fuzz": "broke"})]),
+         {"newly_broken_arms": 1}, 1)
+    sc_nofuzz = sc_report([sc_group("a", PASS, 5, 5, {"crash": OK}),
+                           sc_group("b", PASS, 3, 3, {"crash": OK})])
+    case("an arm added is a shape change", sc_nofuzz, sc_green, {"new_arms": 2}, 1)
+    case("an arm added, allowed", sc_nofuzz, sc_green, {"new_arms": 2}, 0, True)
+    case("an arm fixed", sc_broken, sc_green, {"fixed_arms": 1, "fixed": 1}, 0)
 
     bad = [c for c in cases if not c[1]]
     for name, ok, detail in cases:
@@ -285,9 +409,10 @@ def main(argv):
     findings = classify(base, cur)
     for line in render(base, cur, findings):
         print(line)
-    if findings["newly_broken"]:
+    if findings["newly_broken"] or findings["newly_broken_arms"]:
         return 1
-    if (findings["new"] or findings["removed"]) and not allow_new:
+    if (findings["new"] or findings["removed"] or findings["new_arms"] or
+            findings["removed_arms"]) and not allow_new:
         print("the suite's shape changed: re-record the baseline deliberately "
               "(KRK_TEST_BASELINE_RECORD=1), or --allow-new to compare anyway")
         return 1

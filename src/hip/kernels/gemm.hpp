@@ -62,11 +62,23 @@ __device__ __forceinline__ f32 simt_dot2(const _Float16 *a, const _Float16 *b, f
 // reduction for every single row.
 // ---------------------------------------------------------------------------
 
-template <int THREADS>
+// ACC folds the residual add that follows a projection into this epilogue:
+// out[row] += the row's dot product, so `out` is both the addend and the
+// destination (one lane owns this row and nothing else writes out[row], so the
+// read-before-write is safe). The default, false, is the plain projection and
+// every existing caller keeps it.
+//
+// The folded store is bit-identical to gemv_kernel<> + add_inplace_kernel(),
+// not merely close: the two-launch form rounds the projection to the
+// activation type and stores it, then adds, and a sum of two f16 values is
+// exact in f32 -- so rounding the product first, adding, and rounding once
+// gives the same number.
+template <int THREADS, bool ACC = false>
 __global__ void __launch_bounds__(THREADS)
     gemv_kernel(const u8 *__restrict__ w, int wt, i64 n_out, i64 n_in,
                 size_t w_row_bytes, const _Float16 *__restrict__ x,
-                _Float16 *__restrict__ out) {
+                _Float16 *__restrict__ out,
+                const i32 *__restrict__ rexp = nullptr) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const i64 row = static_cast<i64>(blockIdx.x) * (THREADS / 32) +
                     static_cast<i64>(threadIdx.x >> 5);
@@ -80,7 +92,24 @@ __global__ void __launch_bounds__(THREADS)
         part += dot_chunks(wt, wrow, x, c, c + 1);
 
     part = d_wave_reduce_sum(part);
-    if (lane == 0) out[row] = static_cast<_Float16>(part);
+    if (lane == 0) {
+        if (ACC) {
+            // The folded destination is the residual stream, which may be
+            // stored divided by a per-token power of two (add_residual). The
+            // contribution is at true scale, so it is divided by the row's
+            // exponent first; the divisor is a power of two (exact) and 1.0
+            // when the array is null or the row never left f16, which is what
+            // keeps this store bit-identical to gemm + add_inplace in range.
+            // The decode row only (rows == 1), so the whole destination is
+            // token 0's row and rexp[0] is its exponent.
+            const f32 inv = rexp ? exp2f(-static_cast<f32>(rexp[0])) : 1.0f;
+            out[row] = d_sat_f16_count(
+                static_cast<f32>(out[row]) +
+                    static_cast<f32>(static_cast<_Float16>(part)) * inv,
+                &g_krk_sat_resid);
+        } else
+            out[row] = static_cast<_Float16>(part);
+    }
 }
 
 // ------------------------------------------------------------------ gemv_m --

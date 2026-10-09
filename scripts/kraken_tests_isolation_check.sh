@@ -34,14 +34,19 @@
 # runs a group and says so; the worker count clamps instead of refusing; a group
 # that ran no checks is refused rather than counted as passing; an injection that
 # matches no group is inert; a bad argument is an error and not a silent clean
-# run. Logs are kept when something fails and removed when not.
+# run; and two suite runs and a group sweep started TOGETHER are all green and
+# leave no scratch area behind, because every run names its own. Logs are kept
+# when something fails and removed when not.
 #
 # Environment: KRK_TEST_BIN (default build-hip/kraken-tests.exe), KRK_CRASH_GROUP
 # (default test_kv_tier_drop_vs_spill -- the group whose fclose(NULL) started
 # this), KRK_CRASH_AT (default 5), KRK_FAIL_GROUP (default test_json),
 # KRK_SERIAL_GROUP (default test_http_server), KRK_ISOLATION_FULL=1 to add the
 # per-group sweep (53 more runs, ~20 s: every group alone in an empty directory
-# must report the count it reports in the full run).
+# must report the count it reports in the full run), KRK_ISOLATION_INJECTIONS=1
+# to add the per-group selfcheck (318 more suite runs, minutes: kraken-tests
+# --selfcheck runs six arms for every group -- five fixed and one fuzzed -- and
+# judges each answer against that group's own count).
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -329,6 +334,129 @@ if [ "${KRK_ISOLATION_FULL:-0}" = "1" ]; then
         bad "self-contained" "groups that differ when run alone: $(diff "$SWEEP/table" "$LOG/table.child" | head -6 | tr '\n' ' ')"
     fi
     rm -rf "$SWEEP"
+fi
+
+# --- 12. the reporting is proved per group, by the runner itself ------------
+# Sections 3-6 aim the injections at one group chosen by hand, which leaves the
+# other 52 proved only for whichever case that group happened to be -- and what a
+# group's report looks like depends on its own shape: one check, checks conditional
+# on earlier ones, a fixture built late. kraken-tests --selfcheck runs six arms for
+# every group and judges each answer against that group's own count: crash before
+# the first check, crash after two, crash after the group's OWN last check (where
+# passed == run, so only the child's exit says it died), every check failing, no
+# checks at all, and a fuzz arm that dies at a random check -- sometimes at a second
+# group as well, so a run with two groups non-passing at once is constructed rather
+# than assumed.
+#
+# The checker's own check runs every time: 17 constructed answers, one per way an
+# arm can be wrong, in milliseconds. A checker that cannot fail proves nothing.
+sc_out=$("$BIN" --selfcheck --selftest 2>&1)
+sc_rc=$?
+if [ "$sc_rc" -eq 0 ] && printf '%s\n' "$sc_out" | grep -qE '^17/17 selfcheck cases passed$'; then
+    ok "selfcheck-cases" "$(printf '%s\n' "$sc_out" | grep 'selfcheck cases passed' | tail -1)"
+else
+    bad "selfcheck-cases" "rc=$sc_rc, want 17/17 cases: $(printf '%s\n' "$sc_out" | tail -1)"
+fi
+
+#
+# The cases above prove the checker rejects a wrong answer; this proves the
+# verdict leaves the process non-zero, which is the part a caller sees. The
+# switch only makes the expectation wrong by one check, so it can turn a green
+# run red and never the reverse.
+KRK_SELFCHECK_BREAK=counts "$BIN" --selfcheck --group "$CRASH_GROUP" \
+    > "$LOG/selfbreak.log" 2>&1
+rc=$?
+if [ "$rc" -eq 1 ] && grep -q '^  FAIL' "$LOG/selfbreak.log" \
+        && grep -q '0/1 groups' "$LOG/selfbreak.log" \
+        && grep -q '6 arm(s) mismatched' "$LOG/selfbreak.log"; then
+    ok "selfcheck-break" "rc=1, a wrong expectation is a named mismatch"
+else
+    bad "selfcheck-break" "rc=$rc, want 1 plus a FAIL line naming the arm"
+fi
+# The report is the artifact the baseline gate reads, so its shape is checked
+# here rather than only where it is produced: one group's arms recorded in the
+# runner's own report format, kind "selfcheck", each arm's verdict beside it.
+"$BIN" --selfcheck --group "$CRASH_GROUP" --report "$LOG/self.json" \
+    > "$LOG/selfreport.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && grep -q '"kind": "selfcheck"' "$LOG/self.json" \
+        && [ "$(grep -c '"arms": {' "$LOG/self.json")" -eq 1 ] \
+        && grep -q '"fuzz": "ok"' "$LOG/self.json"; then
+    ok "selfcheck-report" "the arms' verdicts written in the runner's report format"
+else
+    bad "selfcheck-report" "rc=$rc, want rc=0 and a kind:selfcheck report with the arm verdicts"
+fi
+
+# The fuzz arm draws where it aims, so the draws have to be a function of the seed
+# alone: two runs with the same seed must say the same thing, or a mismatch named
+# in one log could never be replayed from the other. A seed that cannot be read is
+# refused rather than replaced, for the same reason.
+KRK_SELFCHECK_SEED=7 "$BIN" --selfcheck --group "$CRASH_GROUP" > "$LOG/seed7a.log" 2>&1
+ra=$?
+KRK_SELFCHECK_SEED=7 "$BIN" --selfcheck --group "$CRASH_GROUP" > "$LOG/seed7b.log" 2>&1
+rb=$?
+KRK_SELFCHECK_SEED=abc "$BIN" --selfcheck --group "$CRASH_GROUP" > /dev/null 2>&1
+badseed=$?
+if [ "$ra" -eq 0 ] && [ "$rb" -eq 0 ] && cmp -s "$LOG/seed7a.log" "$LOG/seed7b.log" \
+        && grep -q 'fuzz aim' "$LOG/seed7a.log" && [ "$badseed" -eq 2 ]; then
+    ok "selfcheck-replay" "the same seed draws the same aims twice; a bad seed is refused"
+else
+    bad "selfcheck-replay" "rc=$ra/$rb, bad-seed rc=$badseed, want 0/0, the same draws and 2"
+fi
+
+# --- 13. two suite runs and a sweep, at once, each under its own area ---------
+# Every run names its own scratch area (krk-tests-<pid> beside TEMP) and removes
+# it when it is green. Before that the area was one fixed path per machine, so two
+# runs -- a suite run and a --selfcheck sweep, say -- wrote over each other's
+# fixtures, logs and progress files, and the reporting proof was a thing to run
+# when nothing else was running. The claim is constructed here rather than
+# asserted: three runs are started together and must all be green, with no new
+# area left in TEMP afterwards.
+scratch_areas() {
+    for d in "${TEMP:-}" "${TMPDIR:-}" "."; do
+        [ -n "$d" ] || continue
+        ls -d "${d%/}"/krk-tests-* 2>/dev/null
+    done | sort -u
+}
+before_areas=$(scratch_areas | tr '\n' ' ')
+
+"$BIN" --report "$LOG/conc-a.json" > "$LOG/conc-a.log" 2>&1 &
+conc_a=$!
+"$BIN" --report "$LOG/conc-b.json" > "$LOG/conc-b.log" 2>&1 &
+conc_b=$!
+"$BIN" --selfcheck --group "$CRASH_GROUP" > "$LOG/conc-sweep.log" 2>&1 &
+conc_s=$!
+wait $conc_a
+conc_ra=$?
+wait $conc_b
+conc_rb=$?
+wait $conc_s
+conc_rs=$?
+
+after_areas=$(scratch_areas | tr '\n' ' ')
+leftovers=""
+for a in $after_areas; do
+    case " $before_areas " in
+        *" $a "*) ;;
+        *) leftovers="$leftovers $a" ;;
+    esac
+done
+
+if [ "$conc_ra" -eq 0 ] && [ "$conc_rb" -eq 0 ] && [ "$conc_rs" -eq 0 ] \
+        && [ "$(summary_of "$LOG/conc-a.log")" = "$(summary_of "$LOG/conc-b.log")" ] \
+        && [ -n "$(summary_of "$LOG/conc-a.log")" ] && [ -z "$leftovers" ]; then
+    ok "concurrent-runs" "two suite runs + a group sweep overlapped green, $(summary_of "$LOG/conc-a.log"), no area left"
+else
+    bad "concurrent-runs" "rc=$conc_ra/$conc_rb/$conc_rs, leftovers=[$leftovers] -- want 0/0/0 and none"
+fi
+
+# The sweep is 318 suite runs -- minutes, not seconds -- so it is opt-in.
+if [ "${KRK_ISOLATION_INJECTIONS:-0}" = "1" ]; then
+    if "$BIN" --selfcheck; then
+        ok "selfcheck-arms" "all 53 groups: every injection named, with the count it had reached"
+    else
+        bad "selfcheck-arms" "the per-group selfcheck reported a mismatch (its own output is above)"
+    fi
 fi
 
 echo

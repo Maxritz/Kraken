@@ -254,12 +254,50 @@ public:
                        i64 n_embd, const i32 *tokens, i64 n_tok) = 0;
 
     // out[rows, n] = rmsnorm(x[rows, n]) * w[n], computed in f32.
+    //
+    // `row_exp` (nullable) is the per-row power-of-two exponent the residual
+    // stream is stored under (see add_residual): row r holds x * 2^-row_exp[r],
+    // and this multiplies it back before squaring, which is exact and is a
+    // no-op when the array is null or every exponent is zero. It is not a
+    // linearity trick but a storage one -- the norm is where a nonlinear block
+    // gets true-scale input again.
     virtual void rmsnorm(void *out, const void *x, const f32 *w, i64 rows, i64 n,
-                         f32 eps) = 0;
+                         f32 eps, const i32 *row_exp = nullptr) = 0;
 
     // out[rows, n_out] = x[rows, n_in] * W[n_out, n_in]^T ; W is quantized.
     virtual void gemm(void *out, const void *x, const void *w, DType wt,
                       i64 n_out, i64 n_in, i64 rows) = 0;
+
+    // dst[rows, n_out] += x[rows, n_in] * W[n_out, n_in]^T : the residual add
+    // that ends a layer's projection, folded into that projection's epilogue
+    // so the layer pays one launch instead of two. `dst` is both the addend and
+    // the destination, so a caller whose `x` is `dst` must not use this.
+    //
+    // Returns true when the fused form ran, and the caller must then issue
+    // neither the projection nor the add. False means "do it the long way",
+    // which is what every backend that does not override this gets, and the
+    // caller's fallback is gemm() into a scratch row followed by
+    // add_inplace() -- exactly the two calls this exists to remove, so a
+    // backend without the fused path behaves as if it never had one.
+    //
+    // The fused store is bit-identical to that pair, and not by luck: both
+    // forms round the projection to the activation type BEFORE summing, and a
+    // sum of two activation-typed values is exact in f32, so the f16 result is
+    // the same number. A backend that accumulates in a wider type must round
+    // the product before the add to keep that promise.
+    // `rexp` (nullable) is the residual stream's per-row storage exponent when
+    // `dst` is that stream (see add_residual): the contribution this folds in
+    // arrives at true scale, so it is divided by 2^rexp[0] -- the decode row's
+    // own exponent -- before it is summed. Null, or a zero exponent, leaves the
+    // fused store bit-identical to the pair, and a backend that ignores the
+    // array keeps the f32 CPU reference's exact behavior.
+    virtual bool gemm_accumulate(void *dst, const void *x, const void *w,
+                                 DType wt, i64 n_out, i64 n_in, i64 rows,
+                                 const i32 *rexp = nullptr) {
+        (void)dst; (void)x; (void)w; (void)wt; (void)n_out; (void)n_in;
+        (void)rows; (void)rexp;
+        return false;
+    }
 
     // Top-k of one logits row, on the device, so the row never has to be
     // downloaded. `logits` is the output head's buffer, which means it is in
@@ -289,12 +327,38 @@ public:
     // is fused; any backend, dtype mix or prefill shape falls back to
     // one gemm() per matrix. All matrices must share `wt`. Returns
     // true when the fused path ran.
+    // `silu` asks for silu_mul() of matrices 0 and 1 to be folded into the
+    // group's epilogue: out[0] then receives silu(out[0]) * out[1] and the
+    // caller must not issue that activation itself. *silu_fused reports whether
+    // that happened -- the group can still have fused without it (a shape or a
+    // split-K decision it cannot express), which is why the return value alone
+    // is not the answer. The default does the per-matrix gemms and leaves the
+    // activation to the caller, so a backend without the folded form behaves
+    // exactly as one that never had it.
+    // `row_parallel_only` pins every matrix in the group to one row-parallel
+    // pass (no split-K top-up). A caller that groups matrices too small to fill
+    // the device -- a recurrent layer's dt_rank-wide projections, say -- wants
+    // the launch count down, and the top-up would spend a reduce launch per
+    // split matrix to buy parallelism it does not need; it also regroups the
+    // fp32 partials, so a group with splits at 1 is bit-identical to the
+    // separate launches while a split one is not.
+    // `wts` gives each matrix its own weight type, for a group whose
+    // projections are not all quantised the same way (a real checkpoint will
+    // have attn_qkv at one format and ssm_alpha/ssm_beta at another). Null
+    // means every matrix uses `wt`.
     virtual bool gemm_group(void *const out[], const void *x,
                             const void *const w[], DType wt,
                             const i64 n_out[], i64 n_in, int n_mat,
-                            i64 rows) {
+                            i64 rows, bool silu = false,
+                            bool *silu_fused = nullptr,
+                            bool row_parallel_only = false,
+                            const DType *wts = nullptr) {
+        (void)silu;
+        (void)row_parallel_only;
+        (void)wts;
+        if (silu_fused) *silu_fused = false;
         for (int m = 0; m < n_mat; m++)
-            gemm(out[m], x, w[m], wt, n_out[m], n_in, rows);
+            gemm(out[m], x, w[m], wts ? wts[m] : wt, n_out[m], n_in, rows);
         return false;
     }
 
@@ -354,13 +418,60 @@ public:
     }
 
     // out = silu(gate) * up
-    virtual void silu_mul(void *out, const void *gate, const void *up, i64 n) = 0;
+    //
+    // `row_len` > 0 with `row_scale` non-null takes the row-scaled form: `n`
+    // is `n / row_len` rows of `row_len` elements (one token expert
+    // activation, which is the dimension the down projection reduces over),
+    // the products are stored divided by one power of two per row so each row
+    // fits the f16 activation buffer, and the multiplier 2^k is written to
+    // row_scale[row] for the caller to fold back into whatever consumes that
+    // row (the MoE scatter alpha). A power-of-two divide is exact in f16, so
+    // this buys exponent range and spends no precision, and it is
+    // bit-identical to the plain form whenever the row is already in range.
+    // A backend whose activations are wider than f16 needs no scale: it stores
+    // exactly and fills row_scale with 1.0, so the caller contract holds
+    // either way.
+    virtual void silu_mul(void *out, const void *gate, const void *up, i64 n,
+                          i64 row_len = 0, f32 *row_scale = nullptr) = 0;
 
     // out += bias  for each of `rows` output rows of width n (Qwen2/Phi QKV biases)
     virtual void add_bias_rows(void *out, const f32 *bias, i64 n, i64 rows) = 0;
 
     // a += b  (activation elementwise)
     virtual void add_inplace(void *a, const void *b, i64 n) = 0;
+
+    // a += b, where `a` is the residual stream and its rows may be stored
+    // scaled: row r holds X * 2^-rexp[r] and `b` is the layer's contribution at
+    // true scale, so the sum is formed in f32, the smallest exponent that keeps
+    // the row inside the activation range is chosen, the row is stored divided
+    // by it and rexp[r] is updated for every later reader (the norms un-scale on
+    // the way in; see rmsnorm's `row_exp`).
+    //
+    // This is a STORAGE contract, not a factor that rides the arithmetic. A
+    // per-token power of two does not survive the nonlinearities: silu(2^-e g)
+    // is not 2^-e silu(g), and q and k both carrying 2^-e put 2^-2e in the
+    // attention scores, which softmax reads as a temperature change. So every
+    // block keeps computing in true scale and only the buffer's storage moves.
+    //
+    // `rexp` null or `row_len` <= 0 is the plain add_inplace, and the default
+    // below is that plain add -- correct for a backend whose activation type
+    // has the range to need no exponent at all (the f32 CPU reference, which
+    // leaves every exponent at zero, so its residual stream is bit-identical to
+    // what it always was).
+    // `bexp` (nullable) is b's own storage exponent when the contribution is
+    // already carried scaled: the MoE staging fold adds the shared expert into a
+    // buffer the routed experts have been accumulating (and a sum of two in-range
+    // rows can leave the range on its own), so that fold has an exponent of its
+    // own and this renormalizes it as well. Both sides are un-scaled to true
+    // scale first, so the sum is the same number either way.
+    virtual void add_residual(void *a, const void *b, i64 rows, i64 row_len,
+                              i32 *rexp, const i32 *bexp = nullptr) {
+        (void)rows;
+        (void)row_len;
+        (void)rexp;
+        (void)bexp;
+        add_inplace(a, b, rows * row_len);
+    }
 
     // out[rows, n] = rmsnorm(x[rows, n] + res[rows, n]) * w[n], leaving x
     // holding the sum.
@@ -372,9 +483,10 @@ public:
     // override it behaves identically to one that never had the fused
     // path at all.
     virtual void add_rmsnorm(void *out, void *x, const void *res,
-                             const f32 *w, i64 rows, i64 n, f32 eps) {
+                             const f32 *w, i64 rows, i64 n, f32 eps,
+                             const i32 *row_exp = nullptr) {
         add_inplace(x, res, rows * n);
-        rmsnorm(out, x, w, rows, n, eps);
+        rmsnorm(out, x, w, rows, n, eps, row_exp);
     }
 
     // dst <- src, n activation elements
@@ -448,8 +560,46 @@ public:
     // dst and src: a device backend is handed buffers its caller allocated
     // through alloc(), so a host copy of either is neither made nor expected.
     // Every expert writes distinct rows of dst, so no atomics are needed.
+    // `row_scale` (nullable) is the row scale a prior silu_mul wrote for these
+    // same rows: it multiplies alpha[i] before the add.
+    //
+    // `row_exp` (nullable) is the destination row's storage exponent, and this
+    // is the one place in the MoE chain where a row can leave f16 without any
+    // single producer being at fault: the sum of ten experts that are each in
+    // range can still be out of it. The row is summed in f32, stored divided by
+    // the smallest power of two that keeps its own maximum inside f16, and the
+    // exponent is written back for the fold that un-scales it -- the same
+    // contract add_residual carries, which is why the destination's exponent
+    // slot is passed in and out rather than created here.
     virtual void scatter_axpy_rows(void *dst, const void *src, const i32 *rows,
-                                   const f32 *alpha, i64 n_rows, i64 n) = 0;
+                                   const f32 *alpha, i64 n_rows, i64 n,
+                                   const f32 *row_scale = nullptr,
+                                   i32 *row_exp = nullptr) = 0;
+
+    // How many f16 activation stores saturated, in the order [silu product,
+    // experts sum, residual row]. A backend whose activations are f32 (the CPU
+    // reference) has nothing to saturate and answers zeros, and so does a run
+    // that stayed in range -- which is the point of printing it every run:
+    // silence was the only other report, and a model that decodes nonsense while
+    // a bound fires is exactly the case a stats line should not leave to
+    // inference. The residual row is the one store the exponent exists to keep
+    // out of: a non-zero count there means a single row's contribution left f16
+    // even after its exponent was raised, which no bound can answer.
+    virtual void activation_saturation(unsigned long long out[3]) const {
+        out[0] = 0;
+        out[1] = 0;
+        out[2] = 0;
+    }
+
+    // The largest residual-row exponent this run needed: 0 for every model
+    // whose hidden state fits the activation type, and > 0 exactly when the
+    // storage scaling of add_residual did something. Reported so a run carrying
+    // a scaled residual stream announces it instead of being inferred.
+    virtual int residual_exponent_max() const { return 0; }
+
+    // Zeroes those counters; called once per engine so the numbers describe one
+    // run rather than everything the process has done.
+    virtual void reset_activation_saturation() {}
 
     // Stages n i32 values to device memory. The batched path builds its row
     // plan on the host and ships it through this; a no-op on the CPU backend.
