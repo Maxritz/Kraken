@@ -343,6 +343,15 @@ bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
                 layer_window_[static_cast<size_t>(l)] > 0 ? 1 : 0;
     }
 
+    // KRK_DFLASH_WINDOW forces one sliding-window value on every drafter layer.
+    // It is placed here, after the window block derived the per-layer masks, so
+    // the window and the causality of the block are testable apart: 0 selects
+    // the query-tiled attention path, which a windowed layer never takes.
+    if (const char *env = std::getenv("KRK_DFLASH_WINDOW")) {
+        const i32 w = std::atoi(env);
+        for (i32 &v : layer_window_) v = w;
+        cfg_.swa_window = w;
+    }
     // ---- capacity --------------------------------------------------------
     // Counted for the contract line above: per-layer masks outvote the global
     // flag, and a mis-derived one is invisible in the tensor checks.

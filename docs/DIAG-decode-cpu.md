@@ -510,3 +510,25 @@ TODO src/dflash.cpp:212: [P2] KRK_DFLASH_CAUSAL cannot change a third-party head
       set's per-layer masks (the window rule overwrites it), so the knob is inert
       on exactly the files it is needed for
 ```
+### The window flag, tested apart from causality — not the cause
+
+`KRK_DFLASH_WINDOW=<w>` forces one window on every drafter layer, and it is
+placed *after* the window rule derives `layer_causal_`, so the two are separable:
+`0` selects the query-tiled attention kernel (which a windowed layer never takes)
+and `512` is the file's own value. Same eight rounds, same command:
+
+| window | row-0 top1-top2 mean | row 0, block 1 | accepted |
+|---|---|---|---|
+| 0 (query-tiled) | 0.229 | 34386(5.28906) 12627(5.03125) 2447(4.94531) | 0/32 |
+| 512 (file) | 0.230 | 34386(5.28906) 12627(5.03125) 2447(4.94922) | 0/32 |
+
+The two kernel paths agree to three or four decimals and the flat row is
+unchanged, so neither the window nor the kernel it selects is the cause. The
+agreement is worth keeping as a cross-check: the query-tiled and the plain
+multi-row kernel produce the same row on one input, which is what the tiled path
+was added on the assumption of.
+
+With that, every structural suspect for the drafter's diffuse row is measured and
+eliminated — context delivery, capture order, capture ids, mask token, block
+placement, per-layer causality, window and kernel path — leaving the feature
+semantics (§9) and the drafter's own weights.
