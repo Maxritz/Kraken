@@ -1751,6 +1751,8 @@ bool Engine::load_dflash(const std::string &path, std::string *err) {
              "speculative window %d",
              d->name().c_str(), d->n_aux(), d->block_size(),
              std::min<i32>(draft_tokens_, d->block_size() - 1));
+    KRK_INFO("dflash block placement base %d row(s) (KRK_DFLASH_BLOCK_POS)",
+             d->block_base());
     return true;
 }
 
@@ -3704,6 +3706,29 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             for (i32 j = 0; j < d; j++)
                 std::fprintf(stderr, "%s%d", j ? "," : "",
                              prop[static_cast<size_t>(j)]);
+            // The target's own row for this position, in the same line. The
+            // comparison used to take a second tool and a grep of an untagged
+            // dump; a drafter whose candidates are simply elsewhere on the row
+            // and one whose row is flat need to be told apart in one run.
+            std::fprintf(stderr, "] target_top3=[");
+            {
+                f32 b0 = -1e30f, b1 = -1e30f, b2 = -1e30f;
+                i32 i0 = -1, i1 = -1, i2 = -1;
+                for (i64 v = 0; v < n_vocab_; v++) {
+                    const f32 x = logits_host_[v];
+                    if (x > b0) {
+                        b2 = b1; i2 = i1; b1 = b0; i1 = i0; b0 = x;
+                        i0 = static_cast<i32>(v);
+                    } else if (x > b1) {
+                        b2 = b1; i2 = i1; b1 = x; i1 = static_cast<i32>(v);
+                    } else if (x > b2) {
+                        b2 = x; i2 = static_cast<i32>(v);
+                    }
+                }
+                std::fprintf(stderr, "%d(%.4g) %d(%.4g) %d(%.4g)",
+                             i0, static_cast<f64>(b0), i1,
+                             static_cast<f64>(b1), i2, static_cast<f64>(b2));
+            }
             std::fputc(93, stderr);
             std::fputc(10, stderr);
         }

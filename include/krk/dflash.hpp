@@ -91,6 +91,10 @@ public:
     i32 n_aux() const { return static_cast<i32>(target_layers_.size()); }
     i32 block_size() const { return block_size_; }
     i32 mask_id() const { return mask_id_; }
+    // Where block row 0 sits relative to the next free position: the knob a
+    // run has to report, because it decides which position each draft row is
+    // a candidate for.
+    i32 block_base() const { return block_base_; }
     i32 n_embd() const { return cfg_.n_embd; }
     i32 n_embd_enc() const { return n_embd_enc_; }
     i32 n_layer() const { return cfg_.n_layer; }

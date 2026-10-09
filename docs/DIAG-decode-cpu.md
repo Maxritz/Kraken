@@ -226,3 +226,184 @@ TODO src/expert_cache.cpp: [P1] auto VRAM policy under-sizes a MoE whose corpus
       card's 15.3 GiB free | fix: floor the expert budget at the corpus size
       when it fits | test: 0 VRAM evictions and >=112 promotions over 64 tok
 ```
+
+## 8. Findings F9-F28 — the DFlash drafter and speculative cost (2026-10-10)
+
+Continues the numbering in §5. Everything below was measured on the current
+tree; the two drafter files are `laguna-xs21-dflash-q8.gguf` (head set) against
+`laguna-xs2-Q4_K_M.gguf` (target), command
+`-p "The history of computing" -n 8 --greedy --ctx 512 --chunk 256 --expert-warmup 1`
+unless a line says otherwise.
+
+**F9 — the DFlash round never reaches its block, so 0/64 is not a verdict on the
+drafter — CONFIRMED.** With a trace inside `generate_speculative_dflash`, all
+16 rounds of a `-n 16` run die at the pre-check: `first(target)=395` against
+`prop[0](draft)=34386`, `330` vs `16815`, `16708` vs `15356`, and so on. The
+verify block is never entered, so the counters report the proposer's *first*
+token 64 times and nothing about the rows. Status: the block's own quality has
+not been measured once on this pair.
+
+**F10 — the block's position is not the cause — CONFIRMED by measurement.**
+`KRK_DFLASH_BLOCK_POS` sets `block_base_`; `-1`, `0` and `+1` each accept
+**0/32**, with byte-identical stdout (`2255aa8533c5`, `-n 8`).
+
+**F11 — the code and its own comment disagree about the block's contract —
+CONFIRMED by code.** `dflash.cpp` says mask row *k* is "the candidate for
+pos+k-1" (which needs `block_base_ = -1`); the default is `0`, i.e. the candidate
+for `pos+k`. The knob takes any integer, and **no run reported which value it
+used** (fixed: the load line now prints `dflash block placement base N row(s)`).
+
+**F12 — the drafter's rows are flat, and that is the defect — CONFIRMED.**
+Same round, same position:
+
+| pos | target row (top-3, logit) | draft row 0 (top-3, logit) |
+|---|---|---|
+| 5 | 395(29.297) 372(29.172) 95(28.922) | 34386(5.289) 12627(5.031) 2447(4.949) |
+| 6 | 330(30.609) 11114(30.25) 10208(29.45) | 16815(5.105) 34855(4.910) 18876(4.848) |
+
+The target separates its top-3 by 0.13–3.8 logits on logits of 29–36; the
+drafter's top-3 sit within 0.3 of each other on logits of 4.6–6.2 against a row
+mean near 0. Both rows go through the *same* head weights (the target's own
+`out_head`), so a flat row is a hidden state near-orthogonal to the head's
+directions — the block's attention is not constraining the mask rows. The rows
+are also self-similar: `84601` is top-1 of rows 2 and 3 of block 6.
+
+**F13 — the fusion is live and token-dependent, so "the features never arrived"
+is REFUTED.** `KRK_DFLASH_DEBUG=1`: `enc_out` min/max move per position
+(`-3.91..4.15` at prefill, `-2.87..3.62` five tokens later) and the new
+`row0 moved` field — row 0 against the previous commit — reads 1.285, 0.837,
+0.942. The capture pipeline is not the failure.
+
+**F14 — `feat rms` in the commit probe is a constant by construction —
+CONFIRMED.** It printed `0.139751` at every commit: each aux block is RMS-normed
+*before* it is scaled by its own weight, so the assembled RMS cannot vary. The
+probe could not distinguish "arrived" from "constant". Fixed (F13's field).
+
+**F15 — the target's row was invisible in the trace — CONFIRMED.** `--debug-topk`
+prints an untagged `step N pos P nan=.. inf=.. top3:` line, so a `topk` grep finds
+nothing and the comparison needed a second run. The `[dflash]` line now carries
+`target_top3=[395(29.3) 372(29.17) 95(28.92)]` next to `prop=[...]`.
+
+**F16 — the realign fix works where it applies — CONFIRMED.** Self-draft on the
+same file (`--draft laguna-xs2`): 8/32 = **25.0%**, and *both* rounds that pass
+the pre-check verify **fully** — `accept=4 full=1`, `row=[330,16708,12906,1388]`
+matching `prop=[395,330,16708,12906]` position for position — with the trace's
+`accept` equal to the engine's own 8 = 2 x 4.
+
+**F17 — the residual loss is two single-row forwards of the same weights
+disagreeing at the argmax — CONFIRMED.** The six dead rounds are near-misses:
+`target=81 draft[0]=83`, `83` vs `81`, `882` vs `1030`, `672` vs `2316`,
+`10208` vs `34415`, `32440` vs `58754`. Same file, same tokens, same backend: a
+one-or-two-token disagreement, not an alignment one. This is F8's real remaining
+cause and it caps *any* drafter, so it is P0.
+
+**F18 — speculation is a loss on this pair too, and now it says so —
+CONFIRMED.** `-n 16`: plain **19.6 tok/s**, self-draft 1.8 (10.9x), DFlash 2.2
+(8.9x). A run that accepts nothing now prints
+`[stats ] speculation accepted no draft tokens in N round(s): the drafter is pure
+cost at this rate`; before it exited 0 silently.
+
+**F19 — a round costs what the expert tier costs, not what the drafter costs —
+CONFIRMED, and it explains a 5.7x swing.** One `-n 8` arm read 74.66 ms/round;
+four later interleaved readings (2 pairs, base `0` vs `-1`) read 536.8 / 518.1
+against 502.4 / 479.6 ms/round — base `-1` is ~5% cheaper, not 5.7x. The
+`[stats] expert-path` line from a 6-token DFlash run shows why the per-round
+figure moves: `room 158.7 | alloc 1081.7 | xfer 96.7 | promote total 1337.3 ms`.
+Round cost tracks promotion state; no speculation cost may be quoted without the
+expert-path line beside it.
+
+**F20 — `kraken-bench --gate` has no speculation arm — CONFIRMED by inspection.**
+An 8.9x speculative regression is invisible to the gate suite. The repo's own
+models make this testable without a new artifact: `--draft <the same file>` is a
+self-draft, so a gate arm can assert "accepted > 0 and text identical to plain".
+
+**F21 — the two placement knobs were invisible in every report — CONFIRMED.**
+`KRK_DFLASH_BLOCK_POS` and `KRK_DFLASH_LAYER_OFFSET` are the only way to reach
+these behaviours and appeared in no `--help`, no `[info]` line and no report.
+Fixed for the placement (F11); the layer offset stays env-only by design.
+
+**F22 — a stored text hash without its protocol is not a fact, measured twice —
+CONFIRMED.** Device and `--cpu` stdout differ only in the banner line
+(`AMD Radeon RX 9070 XT ...` against `CPU (scalar reference), cpu`), so a hash
+that includes stdout can never match across backends. Today's device-arm md5 at
+the recorded protocol is `6b14f62c128e`, not the recorded `dc9c47cfa1bd`.
+
+**F23 — laguna decodes, and now matches the scalar reference exactly —
+CONFIRMED.** `Laguna-XS-2.1-IQ3_XXS.gguf` (the file that decoded all-NaN),
+`-p "The history of computing" -n 16 --greedy --ctx 512`: device text
+`" is a story of human ingenuity overcoming physical limitations. From Charles
+Babbage"` is **byte-identical** to the `--cpu` f32 arm (`cmp` rc=0), with
+`silu 0, experts-sum 0, residual 0` bounds fired and `residual rows stored
+scaled: max exponent 5`. The residual storage scale is doing the work and no
+store is being clipped at this protocol.
+
+**F24 — the recorded `experts-sum 1020` for that file does not reproduce at this
+protocol — CONFIRMED.** The same file at the same flags reads `experts-sum 0`.
+The earlier figure came from a different prompt/protocol; both numbers are real
+and neither is a property of the file alone.
+
+**F25 — the device/CPU gap on that file is 12.6x — CONFIRMED.** 5.1 tok/s
+(195.7 ms/step) against 0.4 tok/s (2475 ms/step) for a 12.95 GB IQ3_XXS.
+
+**F26 — `build_check.sh` section 6 flags any legitimate rebuild — CONFIRMED by
+design.** It read `the binary on disk was NOT produced by this build` after the
+session's rebuilds. Re-recorded (`KRK_REFRESH_FINGERPRINT=1`) and re-run plainly:
+`ok fingerprint — all 5 artifact(s) match the recorded build (sha256)`, rc=0,
+with one residual warning that is the environment's `amdhip64_*.dll`, not the
+build.
+
+**F27 — the block is computed every round and thrown away on pre-check failure —
+CONFIRMED.** Six rounds of a DFlash run propose 24 tokens and verify none, and
+the drafter's whole masked block is paid for each one. The counters cannot tell
+"block never verified" from "block verified and rejected"; the trace can, and now
+does. A `[stats]` split is the durable fix.
+**F28 — `commit()` is host work inside the target's decode step — CONFIRMED by
+code.** Per committed token it does one device->host download *per captured
+layer* (5 here), a host-side RMS norm per block, one upload, the `fc` GEMM and an
+RMS norm, then, per drafter layer, a K/V GEMM, head-norm, rope and a KV append —
+all serialized against the target's next step. Its cost is inside every
+speculation round, including the rounds whose block is discarded.
+
+### Fixes applied in this pass
+
+- `src/engine.cpp`: the `[dflash]` pre-check trace prints the target's own top-3
+  (`logits_host_`) beside the proposal rows (F15); both accept traces moved after
+  their accept loop, where `accept`/`full` were pre-loop values and the `REJECTED`
+  line quoted the wrong pair before (F16).
+- `src/engine.cpp`: the drafter load line reports the block placement in effect
+  (F11, F21) — verified: `[info ] dflash block placement base 0 row(s)`.
+- `include/krk/dflash.hpp`, `src/dflash.cpp`: a `block_base()` accessor, and the
+  commit probe's constant `feat rms` replaced by `row0 moved` — row 0 against the
+  previous commit — which reads 1.285, 0.837, 0.942 and so is able to fail (F13, F14).
+- `src/main_cli.cpp`: a run whose speculation accepts nothing says so, on both the
+  CLI and bench paths (F18) — verified in a 6-round DFlash run.
+- `docs/DIAG-decode-cpu.md`: this section; `tools/_patch_*.py` are scratch and stay
+  out of the tree.
+
+### TODO (F9-F28 pass)
+
+```
+TODO src/engine.cpp:3687: [P0] the DFlash block's mask rows come out flat (top-3
+      within 0.3 of each other on a logit scale of ~5, against the target's 29-36)
+      while the fusion is live and moves | fix: test the block's per-layer
+      causality/window (layer_causal_/layer_window_, decoder_laguna) and the
+      injected K/V; a wrong causal flag leaves every mask row seeing only id_last
+      | test: KRK_SPEC_TRACE=1, prop[0] should approach first(target)
+TODO src/engine.cpp:3319: [P0] a self-draft accepts 25% where it must be ~100%: the
+      pre-check compares two single-row forwards of the same weights and they
+      disagree by one or two tokens (81 vs 83), and that caps every drafter
+      | fix: find the op the two instances differ in (KV layout/dtype, attention
+      split threshold) | test: dump both instances' logits at one position
+TODO src/engine.cpp:3764: [P1] a DFlash round pays the whole drafter block even
+      when the pre-check discards it, and the counters cannot say so
+      | fix: count proposed/verified/never-verified separately | test: -n 16 pair,
+      expect 64 proposed, 0 verified, 64 never-verified
+TODO scripts/: [P1] kraken-bench --gate has no speculation arm, so an 8.9x
+      speculative loss is invisible to the gate | fix: a self-draft arm on a repo
+      model asserting acceptance > 0 and identical text | test: --gate rc
+TODO src/dflash.cpp:631: [P1] commit() downloads one host copy per captured layer
+      per token and uploads again | fix: fuse the per-aux norm on the device and
+      skip the round trip for a single row | test: --profile on the commit span
+TODO docs/: [P2] every stored text hash needs its protocol inline (F22): the device
+      and CPU banners differ, so a stdout hash never matches across backends
+```

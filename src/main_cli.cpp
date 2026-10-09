@@ -680,6 +680,13 @@ int run_bench(Engine &engine, Backend *be, const Args &a, f64 load_ms,
     print_run_stats(stdout, engine, r, load_ms, 0, 0, sat[0], sat[1], sat[2],
                     rexp_max_bench);
     range_verdict(stdout, sat[0], sat[1], sat[2], rexp_max_bench, "bench");
+    if (engine.has_draft() && engine.spec_steps() > 0 &&
+        engine.draft_accepted() == 0) {
+        std::fprintf(stderr,
+                     "[stats ] speculation accepted no draft tokens in %llu "
+                     "round(s): the drafter is pure cost at this rate\n",
+                     static_cast<unsigned long long>(engine.spec_steps()));
+    }
     if (engine.has_draft() && engine.spec_steps() > 0) {
         const f64 rate =
             engine.draft_proposed() > 0
@@ -1007,6 +1014,13 @@ int main(int argc, char **argv) {
         // answer -- could not say whether the draft earned its keep. The number
         // that matters is the accept rate: a drafter that proposes four tokens
         // and lands one is still a win, and one that lands none is pure cost.
+        if (engine.has_draft() && engine.spec_steps() > 0 &&
+            engine.draft_accepted() == 0) {
+            std::fprintf(stderr,
+                         "[stats ] speculation accepted no draft tokens in %llu "
+                         "round(s): the drafter is pure cost at this rate\n",
+                         static_cast<unsigned long long>(engine.spec_steps()));
+        }
         if (engine.has_draft() && engine.spec_steps() > 0) {
             const f64 rate =
                 engine.draft_proposed() > 0

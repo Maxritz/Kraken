@@ -699,13 +699,28 @@ bool DflashDraft::commit(i32 pos0, i32 n) {
         }
         std::fprintf(stderr,
                      "[dfdbg] commit pos=%d n=%d enc_out min %.6g max %.6g rms "
-                     "%.6g | feat rms %.6g\n",
+                     "%.6g | row0 moved %.6g\n",
                      pos0, n, static_cast<f64>(lo), static_cast<f64>(hi),
                      std::sqrt(ss / (static_cast<f64>(n) * E)),
                      [&] {
-                         f64 f = 0.0;
-                         for (f32 v : feat_host_) f += static_cast<f64>(v) * v;
-                         return std::sqrt(f / std::max<size_t>(1, feat_host_.size()));
+                         // feat rms is a constant by construction (each aux
+                         // block is RMS-normed before it is scaled by its own
+                         // weight), so it cannot say whether the context moved.
+                         // Row 0 against the previous commit can.
+                         static std::vector<f32> prev;
+                         const f32 *cur = tmp_host_.data();
+                         f64 d = -1.0;
+                         if (prev.size() == static_cast<size_t>(E)) {
+                             d = 0.0;
+                             for (i64 i = 0; i < E; i++) {
+                                 const f64 dv = static_cast<f64>(cur[i]) -
+                                                static_cast<f64>(prev[static_cast<size_t>(i)]);
+                                 d += dv * dv;
+                             }
+                             d = std::sqrt(d / static_cast<f64>(E));
+                         }
+                         prev.assign(cur, cur + static_cast<size_t>(E));
+                         return d;
                      }());
         std::fflush(stderr);
     }
