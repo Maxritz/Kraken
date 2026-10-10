@@ -365,7 +365,22 @@ packing bugs the round-trip probe caught.
 
 ---
 
-## P0 — correctness
+### The fused attention chain diverges at NeoX + qk_norm — OPEN, gated at load
+
+The fused rope + kv-append + attention decode kernel (`KRK_FUSED_ATTN=0` restores
+the separate chain) carries the per-head QK-norm and both rope pairings. It is
+exact for every adjacent-pair shape measured (SmolLM2-135M, Qwen3-MoE-4x0.6B
+byte-identical to their recorded hashes) but Qwen3-8B (NeoX rope, freq_base 1e6)
+differs from the separate chain by 1-6 f16 ULP in ONE head's attention output
+(L07 head 9 seen live), first in `attn.out`, with the per-step KV cache row
+proven bit-identical by the `attn.kc` dump row. All of the kernel's norm, rope
+and merge code reads as line-for-line identical to the separate kernels, so the
+gap has resisted three read-throughs and is recorded so it is not re-derived:
+the engine gates `!(mc.rope_neox && mc.qk_norm)` shapes back onto the separate
+chain, and the backend additionally refuses partial-rope NeoX (`rot != half`)
+and whole-row qk-norm (OLMoE) shapes. The 8B model decodes byte-identical to
+its pre-fusion behavior as a result (c70cb85baa1fc).
+
 
 ### Spark_one.Q6_K: one prompt of five diverges from the CPU reference — NO DEFECT FOUND
 

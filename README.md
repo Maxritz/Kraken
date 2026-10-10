@@ -246,11 +246,11 @@ averaged over the 256 generated tokens above - and decode is flat in context
 
 The gap is not bandwidth. Five elementwise ops (`rmsnorm`, `rope`, `qk_norm`,
 `kv_append`, and the residual add) that each move 8-16 KB used to cost **253
-launches per token and 34% of the step** (docs/PERF-PLAN.md B0a); the two
-default-on folds - the GEMV residual epilogue and `add_rmsnorm` - cut the chain
-to **181 launches per token**, and a profiled run on this build ranks it at ~12%
-of device time. Fusing the rest of that chain (rope, qk_norm and kv_append into
-the attention kernels that already read those buffers) is the next move.
+launches per token and 34% of the step** (docs/PERF-PLAN.md B0a); the default-on
+folds cut the chain along the way - the GEMV residual epilogue, `add_rmsnorm`,
+then this build's rope + kv-append + attention chain (one launch, below) - and
+a profiled run on this build ranks the remaining elementwise group at ~12% of
+device time.
 
 To reproduce, substituting your own path:
 
@@ -411,6 +411,27 @@ launched and 741 tok/s under a HIP graph (wall-clock). The decode-bandwidth
 campaign, fusion A/B and graph timing methodology are in
 [docs/STATUS.md](docs/STATUS.md) (§8-§11); the current bottleneck analysis is
 in [docs/PERF-PLAN.md](docs/PERF-PLAN.md).
+
+### The attention chain is one launch
+
+RoPE, the KV append and attention ride one kernel on the single-token decode
+row (`KRK_FUSED_ATTN=0` restores the separate chain): the kernel ropes q in
+registers and k straight into its cache slot, so the k/v rows never round-trip
+through global memory between three launches. On SmolLM2-135M (30 layers, the
+shape every fused kernel is sized for) that removes three launches per layer:
+
+| | launches/step | ms/step | decode tok/s | text md5 |
+|---|---|---|---|---|
+| separate rope+append+attention | 333 | 18.1 | 50.8 | d6e2b2b3b00b3 |
+| fused chain | **243** | 13.0 | 64.0 | d6e2b2b3b00b3 |
+
+Throughput is an interleaved order-balanced A/B (9 pairs): **+10.2% median**, B
+faster in 8/9 pairs, MAD 4.7%, text identical. The chain carries the per-head
+QK-norm and both rope pairings; it is gated to adjacent-pair qk_norm shapes -
+the Qwen3-8B shape (NeoX, freq_base 1e6) still diverges from the separate
+chain by 1-6 f16 ULP in one head's attention output with the cache row proven
+bit-identical, so that shape keeps the fallback (see docs/TODO.md). A
+shape the chain cannot express keeps the separate three launches.
 
 ### MoE: the residency budget, not the kernels
 
