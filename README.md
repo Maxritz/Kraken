@@ -790,7 +790,7 @@ outstanding. See [docs/TODO.md](docs/TODO.md) for the full record.
 **Now dequantizing**: the whole IQ family - `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
 `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M` - plus BitNet's `Q1_0` and `Q2_0` in both
 geometries (id 42's 128-value block and upstream's 64-value `Q2_0_64`, id 48),
-the ROCmFPX ids 100/101, and PrismML's ternary pair `PQ2_0`/`PTQ1_0` (ids
+the four ROCmFPX ids 100/101 and 102/104/107, and PrismML's ternary pair `PQ2_0`/`PTQ1_0` (ids
 142/143) together with the block-1024 Hadamard activation transform their
 `prism.hadamard` metadata declares. Every codebook is a byte-for-byte
 transcription of its producer's header - llama.cpp's `ggml-common.h`, or the
@@ -858,7 +858,9 @@ and the shared expert stays resident because there is only one.
 `F32` `F16` `BF16` `Q4_0` `Q4_1` `Q5_0` `Q5_1` `Q8_0` `Q8_1` `Q2_K` `Q3_K`
 `Q4_K` `Q5_K` `Q6_K` `Q8_K` `IQ4_NL` `IQ4_XS` `IQ2_XXS` `IQ2_XS` `IQ2_S`
 `IQ3_XXS` `IQ3_S` `IQ1_S` `IQ1_M` `MXFP4` `NVFP4` `Q4_0_ROCMFP4`
-`Q4_0_ROCMFP4_FAST` `TQ1_0` `TQ2_0` `Q1_0` `Q2_0` `Q2_0_64` `PQ2_0` `PTQ1_0`
+`Q4_0_ROCMFP4_FAST` `TQ1_0` `TQ2_0` `Q1_0` `Q2_0` `Q2_0_64` `PQ2_0` `PTQ1_0`,
+plus the ROCmFPX ids `Q6_0_ROCMFPX` (102), `Q3_0_ROCMFPX` (104) and
+`Q2_0_ROCMFPX` (107)
 
 ---
 
