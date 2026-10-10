@@ -2574,7 +2574,11 @@ void Engine::warm_experts() {
 // candidate sits elsewhere on the row and one whose row is flat are told apart
 // in one run, and a near-tie between two instances of the same weights shows up
 // as the draft's token being the target's second or third candidate.
-static void print_target_top3(FILE *f, const f32 *logits, i64 n) {
+// The top-3 scan itself, with no framing: every trace that prints a row
+// (target_top3, the dflash block_row0, the pre-check's target row) walks the
+// vocab the same way and formats it the same way, so the scan lives here once
+// and each caller prints its own prefix.
+static void print_row_top3(FILE *f, const f32 *logits, i64 n) {
     f32 b0 = -1e30f, b1 = -1e30f, b2 = -1e30f;
     i32 i0 = -1, i1 = -1, i2 = -1;
     for (i64 v = 0; v < n; v++) {
@@ -2588,9 +2592,14 @@ static void print_target_top3(FILE *f, const f32 *logits, i64 n) {
             b2 = x; i2 = static_cast<i32>(v);
         }
     }
-    std::fprintf(f, "] target_top3=[%d(%.4g) %d(%.4g) %d(%.4g)]", i0,
-                 static_cast<f64>(b0), i1, static_cast<f64>(b1), i2,
-                 static_cast<f64>(b2));
+    std::fprintf(f, "%d(%.4g) %d(%.4g) %d(%.4g)", i0, static_cast<f64>(b0),
+                 i1, static_cast<f64>(b1), i2, static_cast<f64>(b2));
+}
+
+static void print_target_top3(FILE *f, const f32 *logits, i64 n) {
+    std::fprintf(f, "] target_top3=[");
+    print_row_top3(f, logits, n);
+    std::fputc(']', f);
 }
 
 static bool spec_trace() {
@@ -3790,26 +3799,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             std::fprintf(stderr,
                          "[dfkv] block_row0 pos=%lld top=[",
                          static_cast<long long>(pos));
-            {
-                f32 b0 = -1e30f, b1 = -1e30f, b2 = -1e30f;
-                i32 i0 = -1, i1 = -1, i2 = -1;
-                const f32 *__restrict__ dp = dlogits.data();
-                for (i64 v = 0; v < n_vocab_; v++) {
-                    const f32 x = dp[v];
-                    if (x > b0) {
-                        b2 = b1; i2 = i1; b1 = b0; i1 = i0; b0 = x;
-                        i0 = static_cast<i32>(v);
-                    } else if (x > b1) {
-                        b2 = b1; i2 = i1; b1 = x; i1 = static_cast<i32>(v);
-                    } else if (x > b2) {
-                        b2 = x; i2 = static_cast<i32>(v);
-                    }
-                }
-                std::fprintf(stderr,
-                             "%d(%.4g) %d(%.4g) %d(%.4g)",
-                             i0, static_cast<f64>(b0), i1,
-                             static_cast<f64>(b1), i2, static_cast<f64>(b2));
-            }
+            print_row_top3(stderr, dlogits.data(), n_vocab_);
             std::fputc(10, stderr);
         }
 
@@ -3830,24 +3820,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             // dump; a drafter whose candidates are simply elsewhere on the row
             // and one whose row is flat need to be told apart in one run.
             std::fprintf(stderr, "] target_top3=[");
-            {
-                f32 b0 = -1e30f, b1 = -1e30f, b2 = -1e30f;
-                i32 i0 = -1, i1 = -1, i2 = -1;
-                for (i64 v = 0; v < n_vocab_; v++) {
-                    const f32 x = logits_host_[v];
-                    if (x > b0) {
-                        b2 = b1; i2 = i1; b1 = b0; i1 = i0; b0 = x;
-                        i0 = static_cast<i32>(v);
-                    } else if (x > b1) {
-                        b2 = b1; i2 = i1; b1 = x; i1 = static_cast<i32>(v);
-                    } else if (x > b2) {
-                        b2 = x; i2 = static_cast<i32>(v);
-                    }
-                }
-                std::fprintf(stderr, "%d(%.4g) %d(%.4g) %d(%.4g)",
-                             i0, static_cast<f64>(b0), i1,
-                             static_cast<f64>(b1), i2, static_cast<f64>(b2));
-            }
+            print_row_top3(stderr, logits_host_, n_vocab_);
             std::fputc(93, stderr);
             {
                 // How far the target's token sits on the draft's own row 0:
