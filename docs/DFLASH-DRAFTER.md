@@ -392,24 +392,50 @@ checks now pin the contract, and one refuses it at load:
     call on the same drafter state is bit-for-bit — verified 14/14 green runs
     after the fix (2901/2901 checks).
 
+## Same-generation pair measured: 12.5% greedy; the 0%-vs-claim gap is the verifier (2026-10-10)
+
+The ranked next action is measured — kraken on the pair whose generations
+match:
+
+```
+KRK_SPEC_TRACE=1 kraken --model G:/More-models/Laguna-XS-2.1-IQ3_XXS.gguf \
+  --draft G:/More-models/laguna-xs21-dflash-q8.gguf \
+  -p "The history of computing is a history of abstraction" \
+  -n 64 --greedy --ctx 512 --debug-topk 12
+[stats ] speculation 54 rounds, 27/216 draft tokens accepted (12.5%)
+```
+
+vs the llama.cpp reference's 3/184 (1.63%) on the same files (its own
+prompt, CPU, same greedy rule) — same direction, ~7.7x the reference, and
+the generated text is coherent. The `xs2` pair stays 0% everywhere because
+its generations disagree (XS.2 target, XS-2.1 drafter); that was never a
+kraken defect.
+
+On the matched pair `[dfkv]` now reads `rank(first)` = 0-12 (usually 0-2):
+the drafter's row *contains* the target's token near its top, and rounds
+fail on top-1 near-ties (round 3: target 33525(18.17), the block proposed
+1253(17.5) = the target's third). That is exactly where the two
+verification rules diverge — greedy match (kraken, llama-spec-simple)
+rejects every top-1 difference, while Poolside's numbers are sampled:
+vLLM/SGLang verify with rejection sampling at temperature 1.0 / top-k 20 /
+top-p 0.95-1.0 over 15 proposals (`num_speculative_tokens = 15`; z-lab's
+own benchmark command pins `--temperature 1 --top-p 0.95 --top-k 20`). A
+drafter that ranks the target's token 1-2 with high probability is
+accepted by that rule most of the time, so 3.55-4.57 mean acceptance
+length under sampling and 12.5% per-proposal greedy agreement are
+consistent, not contradictory — greedy agreement is the lower bound of
+sampled acceptance. The official S-2.1 pair's 0/200 llama.cpp reading is
+the same mismatch: a greedy measurement read against a sampling claim.
+
 ## Next actions, ranked
 
-1. **Cause 2 is still open** (`0/64 = 0.0%` on the runnable pair, and the
-   loop itself is now ~100% when it is the only problem — see the F8 sweep
-   just above). The block gets past the target's pre-check only when
-   `first == prop[0]`, and nothing about a mismatched run looks wrong other
-   than the pre-check — so the next probe is *inside* the block, not another
-   flag. The `[dfkv]` hook is the place: extend it to the per-layer attention
-   output and the residual after each of the five layers, and find the layer
-   where the target's confidence stops being carried (the trace in §9 did not
-   reach that layer).
-2. **Then the block's arithmetic, from inside it.** §7 has closed every contract
-   question this pair can raise — metadata, geometry, rope, mask id, causality,
-   window, injection, capture ids, sinks — so the next run must instrument the
-   block's own stages rather than compare another flag. The `[dfkv]` hook is the
-   place: extend it to the per-layer attention output and the residual after each
-   of the five layers, and find the layer where the target's confidence stops
-   being carried.
-3. **Independently, the IQ3_XXS NaN.** A file the loader calls runnable and that
-   decodes all-NaN is a correctness hole, and it is one `--debug-topk` away from
-   being reproduced.
+1. **Rejection-sampling acceptance accounting.** A `--draft` run should
+   also be able to verify a round by `min(1, p_target/p_draft)` and report
+   a sampled acceptance length, so kraken's numbers become directly
+   comparable to a Poolside card instead of a lower bound of one.
+2. **DFlash2 (z-lab) heads on the models this box runs.** The official
+   collection covers Qwen3.8-27B and the Qwen3.5/3.6 MoE families — all
+   loadable here — so a `--draft` run against a DFlash2 head is the
+   cheapest end-to-end trial of the newer drafter generation.
+3. ~~IQ3_XXS NaN~~ **closed** (residual storage scaling): the same file
+   above decodes coherent text and carries this measurement.
