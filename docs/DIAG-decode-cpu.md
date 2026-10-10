@@ -184,17 +184,27 @@ wheel spun by exactly one slot: 23 evictions, 131 promotions, +5% decode once
 the budget covers the corpus. An evicted expert keeps its WARM copy (WARM is
 inclusive), so the cost of the spin is a ~1 ms DMA, never a file read.
 
-**F8 — speculation is currently a 3.6x loss, and the fingerprint says why. (Reproduced 2026-10-09: still a loss, now 4.0x — 20/72 accepted = 27.8%, the same 5/18 per round, 171.4/172.7 tok/s against 669.1/707.0 plain, text identical. See docs/MTP-DRAFTER.md §3.)**
+F8 — speculation was a 3.6x loss, the fingerprint said why, and that defect is now fixed. (Reproduced 2026-10-09: still a loss, now 4.0x — 20/72 accepted = 27.8%, the same 5/18 per round, 171.4/172.7 tok/s against 669.1/707.0 plain, text identical. See docs/MTP-DRAFTER.md §3.)
 Same model as target and draft, `--draft-tokens 4`: 36 rounds, **40/144
 accepted (27.8%)**, 64 tokens in 2005.9 ms = 31.9 tok/s against 113.6 tok/s
 plain. A self-draft must propose its own argmax, so acceptance should be ~100%
 (4 + bonus per round, exactly what the test suite asserts bit-identically).
 Output still matched plain greedy byte-for-byte, so the verify/accept machinery
-is correct and the loss is proposal alignment, not acceptance semantics.
-`PROBE NEEDED`: `--debug-topk 1` at pos and pos-1 to see whether the draft's row
-being argmaxed is one position stale. Embedded speculative heads (MTP/`nextn`,
-dspark) are counted at load and never used; DFlash head sets ARE used
-(`--draft`, `src/dflash.cpp`); `dspark` is refused by the arch table.
+is correct and the loss was proposal alignment, not acceptance semantics.
+PROBE NEEDED at the time: `--debug-topk 1` at pos and pos-1 to see whether the
+draft's row being argmaxed was one position stale. **That probe is done and the
+defect is fixed on the current build** (src/engine.cpp:3745-3800). F8 is
+resolved across families on this box: the same target+draft reaches ~100% when the
+accept/rewind path holds — laguna-xs2-Q4_K_M self-draft 52/52 = 100% at -n 64
+(13 full-accept rounds, no pre-check failures, no partials, no
+KV-invariant failures) and 77/80 = 96.2% at -n 96 (20 rounds, all full
+accept, trailing 3 the 128-context cap cutting the last round); SmolLM2-135M
+self-draft is the same shape (96.2% at 96 tokens, all rounds full). The earlier
+27.8% / 34.4% records were stale and predate the fix; they are corrected here.
+
+Embedded speculative heads (MTP/nextn, dspark) are counted at load and never
+used; DFlash head sets ARE used (--draft, src/dflash.cpp); dspark is refused
+by the arch table.
 
 ## 6. Fixes applied this session
 
@@ -391,18 +401,27 @@ TODO src/engine.cpp:3687: [P0] the DFlash block's mask rows come out flat (top-3
       causality/window (layer_causal_/layer_window_, decoder_laguna) and the
       injected K/V; a wrong causal flag leaves every mask row seeing only id_last
       | test: KRK_SPEC_TRACE=1, prop[0] should approach first(target)
-TODO src/engine.cpp:3319: [P0] a self-draft accepts 25% where it must be ~100%: the
-      pre-check compares two single-row forwards of the same weights and they
-      disagree by one or two tokens (81 vs 83), and that caps every drafter
-      | fix: find the op the two instances differ in (KV layout/dtype, attention
-      split threshold) | test: dump both instances' logits at one position
+TODO docs/DIAG-decode-cpu.md: [CLOSED] self-draft divergence was stale/mis-slotted
+      draft KV after full accept (failed rollback ignored; bonus overwrote the
+      unforwarded final proposal) | fix: full accept replays final proposal +
+      bonus in order, partial accept rebuilds from last kept slot | test: 52/52
+      accepted at -n 64 and KV invariant after partial accept at -n 96
+TODO src/dflash.cpp:631: [P0] DFlash rows remain diffuse despite verified context/KV and
+      window path: row-0 top1-top2 mean 0.230 vs target 1.732, 0/32 accepted
+      | fix: check feature semantics (aux-norms, capture entering/leaving) and
+      head checkpoint | test: improve measured mean-gap and acceptance on this pair
 TODO src/engine.cpp:3764: [P1] a DFlash round pays the whole drafter block even
       when the pre-check discards it, and the counters cannot say so
       | fix: count proposed/verified/never-verified separately | test: -n 16 pair,
       expect 64 proposed, 0 verified, 64 never-verified
-TODO scripts/: [P1] kraken-bench --gate has no speculation arm, so an 8.9x
-      speculative loss is invisible to the gate | fix: a self-draft arm on a repo
-      model asserting acceptance > 0 and identical text | test: --gate rc
+TODO scripts/: [CLOSED 2026-10-10] speculation coverage lives in the suite, not
+      the bench gate: test_speculative_decoding's self-draft arm asserts text
+      identity, proposed > 0, accepted + window >= proposed (the final round is
+      cut by max_tokens, so its un-emitted tail counts as proposed-but-unaccepted
+      without any rejection), and a bitwise KV-prefix check (self_draft_kv_parity:
+      the draft's flat KV equals the target's row for row over the emitted prefix,
+      with end overshoot bounded by one window) | test: group 22/22, baseline
+      re-recorded at 2905
 TODO src/dflash.cpp:631: [P1] commit() downloads one host copy per captured layer
       per token and uploads again | fix: fuse the per-aux norm on the device and
       skip the round trip for a single row | test: --profile on the commit span
@@ -482,10 +501,29 @@ round 8 pos=20  target=83     draft[0]=81     target_top3=[83(36.81) 1599(30.59)
 Three of the six dead rounds put the draft on the target's **second** candidate
 with a gap of 2.6-3.5 logits — far outside float noise. Round 8 is worse: the
 draft proposes 81, the target's argmax nine positions earlier, with 81 below the
-target's *third* candidate. Two instances of the same weights, same file, same
-backend, same tokens disagreeing by that much is a **state or path difference**
-between them, not rounding. Acceptance stays 8/32 = 25.0% on the self-draft and
-0/32 on the DFlash pair.
+target's *third* candidate. That apparent same-weights divergence came from
+cache state, not the model's arithmetic. The full-accept path in
+`generate_speculative` had only forwarded the first `d-1` proposal tokens into the
+draft KV. It then called `kv_rollback(pos-1)`, which failed because that cursor
+was ahead of the draft's KV length; the return was ignored, and the target's
+bonus token was written into the missing final-proposal slot. The round therefore
+ended with a logically short / semantically mis-slotted draft cache, changing
+the following single-row logits. Fixed by checking rollback and replaying the
+unforwarded final proposal plus bonus in order after full accept; after partial
+accept it rewinds to the last kept token's natural slot and recomputes logits.
+Both paths now assert target and draft KV lengths agree at each round boundary.
+
+Measured on `laguna-xs2-Q4_K_M.gguf`, self-draft, prompt `The history of
+computing`, `--draft-tokens 4 --greedy --seed 7 --ctx 512`: **before**, 8/32 =
+25.0% (the 2.6-3.5-logit mismatches above); **after**, all 52/52 proposals
+accepted over 13 rounds at `-n 64` (100%), with every trace boundary showing
+`target_kv == draft_kv`. A 96-token trace deliberately reaches the partial path:
+77/84 = 91.7%, one partial accept (`accept=1 full=0`) and the next state is
+`pos=81 target_kv=81 draft_kv=81`; no invariant failures. The target output from
+the self-draft arm matches the plain greedy output in repeated stdout hashes.
+
+The separate DFlash pair remains unresolved at 0/32; the section below's
+context, capture, mask, causality and window probes still stand.
 
 ### Not achieved
 
@@ -503,14 +541,25 @@ TODO src/dflash.cpp:631: [P0] the injection is live and read, yet the drafter's
       feature semantics -- the per-block aux norm weights against the file's
       enc.aux_norm / aux_hidden_norm, and whether the capture is the residual
       entering the layer or leaving it | test: the top1-top2 average as the metric
-TODO include/krk/model.hpp: [P1] the draft instance has no KV length accessor, so a
-      rollback that fails to shrink cannot be seen | fix: expose the length and
-      print it in the [spec ] round line | test: draft length == pos every round
-TODO src/dflash.cpp:212: [P2] KRK_DFLASH_CAUSAL cannot change a third-party head
-      set's per-layer masks (the window rule overwrites it), so the knob is inert
-      on exactly the files it is needed for
+TODO src/engine.cpp: [P1] add an acceptance/full/partial regression test for
+      same-model drafts that constructs all three suffix shapes; the hardware
+      self-draft trace catches full and partial, while suite fixtures cover the
+      CPU path only | test: target output == plain + draft KV cursor invariant
+      after first mismatch, partial acceptance and full acceptance
+TODO docs/DFLASH-DRAFTER.md: [CLOSED] KRK_DFLASH_CAUSAL was inert on a
+      third-party head set (the window rule overwrote it), so the one experiment
+      that separates a causal block from a block-visible one could not be run
+      | fix: the explicit override is now applied after the per-layer rule
+      | test: contract line reads 5/5 causal against 0/5 by the switch -- and the
+      answer is NO: both arms accept 0/128 (0.0%), so block causality is refuted
 ```
 ### The window flag, tested apart from causality — not the cause
+
+Full DFlash metrics are unchanged by this self-draft fix: the two are separate
+paths. DFlash still has 0/32 acceptance; its block gets past the target's
+pre-check only when `first == prop[0]`, and no self-draft KV replay changes the
+DFlash head's row construction.
+
 
 `KRK_DFLASH_WINDOW=<w>` forces one window on every drafter layer, and it is
 placed *after* the window rule derives `layer_causal_`, so the two are separable:

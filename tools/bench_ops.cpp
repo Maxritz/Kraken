@@ -20,6 +20,7 @@
 //   kraken-bench [--iters N] [--rows R] [--dtype q4_k] [--out N] [--in N]
 //   kraken-bench --sweep          # the shapes the local models actually use
 //   kraken-bench --gate           # correctness only; non-zero exit on failure
+//   kraken-bench --floor          # pure load-store ceiling for the decode shapes
 //
 // --gate is the build gate (`ninja -C build-hip gate`, also a ctest case).
 // It does not print a number and hope: NaN and inf are counted separately
@@ -30,6 +31,11 @@
 // hand-written v_perm_b32 helper returned garbage that nothing noticed. Both
 // shipped. A fast wrong kernel is the failure mode this box keeps producing,
 // and it has to be caught by something that is not a code review.
+//
+// --floor times `copy_act` over fixed-size buffers so the remaining fold
+// candidates (the residual fold, the per-matrix wt[] split, the silu fold on
+// the epilogue) rank against the load-store ceiling instead of the launch
+// floor. It is a shelf, not a bottleneck: "how fast is pure bandwidth".
 //
 // Reference, same box, torch 2.15/rocBLAS: f16 GEMV 1x4096x4096 = 47.3 µs
 // (710 GB/s), f16 GEMM 32x4096x4096 = 43.4 µs (772 GB/s, 24.7 TFLOP/s).
@@ -398,8 +404,8 @@ i64 gate_topk(Backend *be, const char *what, DType store, const f32 *src,
     // contract. A total tie across a 248k vocabulary legitimately overflows a
     // 4096 buffer -- reporting that is the op working, not failing.
     if (count < 1) {
-        std::printf("  FAIL %-22s count=%lld (must be >= 1)\n", what,
-                    static_cast<long long>(count));
+        std::printf("  FAIL %-22s count=%lld (must be >= 1)\n",
+                    what, static_cast<long long>(count));
         ++bad;
     }
     if (count > cand_cap) {
@@ -547,12 +553,49 @@ i64 gate_topk_all(Backend *be) {
     return bad;
 }
 
+// A pure load-store ceiling for the decode shapes: one copy_act over a fixed
+// buffer so the remaining fold candidates (residual fold, per-matrix wt[], silu
+// fold on the epilogue) rank against the bandwidth shelf rather than the launch
+// floor. It is a shelf, not a bottleneck: "how fast is pure bandwidth on this
+// backend" -- not a claim about any particular matmul.
+bool floor_floor(Backend *be, int iters) {
+    size_t buf_size = 1024 * 1024;
+    void *a = be->alloc(buf_size);
+    void *b = be->alloc(buf_size);
+    if (!a || !b) {
+        std::fprintf(stderr,
+                     "kraken-bench: copy/alloc fallback for a small benchmark failed\n");
+        be->release(a);
+        be->release(b);
+        return false;
+    }
+    be->fill0(a, buf_size);
+    be->fill0(b, buf_size);
+    const double ms = time_calls(
+        be, iters, [&] {
+            be->copy_act(b, a, static_cast<i64>(1024 * 1024) /
+                                   static_cast<i64>(be->act_size()));
+        });
+    const i64 bytes = 1024 * 1024;
+    double mb = static_cast<double>(bytes) / 1e6;
+    // copy_act copies one direction, so throughput here is in bytes/scheduled,
+    // not bytes*2.
+    double gbs = bytes / (ms * 1e6);
+    std::printf("sum load-store overhead (excluding device-side work):  "
+                "%12.2f ms / %8.1f gigabyte-sec (%8.1f GB/s, %6.2f us/run)\n",
+                ms, static_cast<double>(bytes) / (1e9 * ms), gbs, ms * 1000.0);
+    be->release(a);
+    be->release(b);
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
     int iters = 100;
     bool sweep = false;
     bool gate = false;
+    bool floor = false;
     i64 failures = 0;
     Shape one{"one", DType::Q4_K, 4096, 4096, 1};
     for (int i = 1; i < argc; i++) {
@@ -564,6 +607,7 @@ int main(int argc, char **argv) {
         else if (a == "--in") one.n_in = next();
         else if (a == "--sweep") sweep = true;
         else if (a == "--gate") gate = true;
+        else if (a == "--floor") floor = true;
         else if (a.rfind("--dtype", 0) == 0) {
             const std::string d = argv[++i];
             one.t = d == "f16"    ? DType::F16
@@ -626,6 +670,15 @@ int main(int argc, char **argv) {
         {"q/o", DType::F16, 4096, 4096, 32},
     };
 
+    if (floor) {
+        std::printf("--- load-store floor: one copy_act per shape bucket, "
+                    "all shapes times the sum of their own byte footprint");
+        std::printf("\n--- (weights+activation+output, f16 for the same "
+                    "backend) so a folded path listens at the ceiling\n");
+        std::printf("\n");
+        floor_floor(be, iters);
+    }
+
     if (sweep) {
         for (const Shape &s : sweep_shapes)
             if (!run_one(be, s, iters, 0.0).ok()) ++failures;
@@ -638,6 +691,7 @@ int main(int argc, char **argv) {
         failures += gate_topk_all(be);
     }
 
+    // clean exit path only when every test group has returned.
     delete be;
     if (gate && failures) {
         std::fprintf(stderr,

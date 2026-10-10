@@ -124,10 +124,19 @@ struct EngineConfig {
     i32 hybrid_threads = 0;
     // Widest row count the host arm runs at. 0 disables the row bound.
     i32 hybrid_max_rows = 8;
-    // Fraction (0..1) of the RESIDENT experts to force onto the host anyway.
-    // 1.0 (the default) leaves every resident expert on the device, which is
-    // the policy; anything less is the A/B knob that sweeps the CPU/GPU balance
-    // at a fixed cache size.
+    // Fraction (0..1) of the device tier's OVERFLOW -- the experts it could not
+    // hold -- that the host arm takes. 1.0 (the default) takes all of it, which
+    // is the policy: an expert that would have been a read plus a promotion is
+    // computed where its bytes already are. Anything less sends that share of
+    // the overflow back to the device to be promoted as it always was, which is
+    // the A/B knob that sweeps the CPU/GPU balance at a fixed cache size.
+    //
+    // It cannot reach a RESIDENT expert. That was the old semantics ("share of
+    // the resident set forced to the host") and it is the one thing the policy
+    // forbids: an expert whose weights are already in VRAM has nothing to save
+    // by moving its one decode row to the host, and pulling it off the device
+    // would make the [stats] hybrid policy line untrue. Residency decides this,
+    // not a fraction.
     f32 hybrid_frac = 1.0f;
 };
 
@@ -141,6 +150,16 @@ struct HybridStats {
     u64 gpu_experts = 0;
     u64 cpu_rows = 0;
     f64 cpu_ms = 0.0;
+    // Experts classified for the host while they were still VRAM-resident. The
+    // policy says this cannot happen -- `cpu` is only ever set from the
+    // overflow, which requires !in_vram -- so a non-zero value here is a defect
+    // in the classification rather than a tuning outcome, and the report prints
+    // it beside the policy it invalidates. Counted instead of asserted because
+    // it is one read-only residency probe on an expert that was just probed,
+    // and because the suite has no group that opens the device to reach the
+    // real path (AGENTS.md): a counter is what makes "hot experts run on the
+    // GPU" checkable in a run instead of argued from a comment.
+    u64 policy_violations = 0;
 };
 
 struct StreamSink {
@@ -228,7 +247,14 @@ public:
     void unload_draft();
     void set_draft_window(i32 n) { draft_tokens_ = n > 0 ? n : 1; }
     bool has_draft() const { return draft_ != nullptr || dflash_ != nullptr; }
+    // Whether the draft is a full MODEL (as opposed to a DFlash head set, which
+    // has no Model of its own). draft_model() dereferences draft_, so this is
+    // the guard for reading it: has_draft() is true for both kinds.
+    bool has_draft_model() const { return draft_ != nullptr; }
     const Model &draft_model() const { return draft_->model(); }
+    // The draft engine itself, so a test can compare its KV against the
+    // target's while both are still alive (see self_draft_kv_parity).
+    const Engine *draft_engine() const { return draft_; }
     i32 draft_window() const { return draft_tokens_; }
 
     // ---- DFlash drafter ---------------------------------------------------
@@ -242,6 +268,18 @@ public:
     void unload_dflash();
     bool has_dflash() const { return dflash_ != nullptr; }
     const DflashDraft *dflash() const { return dflash_; }
+
+    // Test/diagnostic access to one draft_block call: exactly the speculative
+    // loop's block, wrapped so a caller outside the engine (the suite, a probe
+    // tool) can read the rows without a full generation. `rows.data` is one f32
+    // candidate-logits row per proposer, row k answering position pos+k.
+    struct DflashRows {
+        std::vector<f32> data;
+    };
+    i32 dflash_block_size() const;
+    i32 draft_block_rows(const QuantTensor &tok_embd, const QuantTensor &lm_head,
+                         i32 n_vocab, i32 id_last, i32 n_draft, i32 pos,
+                         DflashRows &out);
 
     // ---- KV cache introspection -------------------------------------------
     // Positions [0, kv_pos()) hold keys/values; kv_pos() is also the position
@@ -300,6 +338,7 @@ public:
         out->gpu_experts = hy_gpu_experts_;
         out->cpu_rows = hy_cpu_rows_;
         out->cpu_ms = hy_cpu_ms_;
+        out->policy_violations = hy_policy_violations_;
     }
 
     const KvTierCache &kvt_k() const { return kvt_k_; }
@@ -562,6 +601,7 @@ private:
     i32 hybrid_threads_live_ = 0;
     u64 hy_cpu_experts_ = 0;
     u64 hy_gpu_experts_ = 0;
+    u64 hy_policy_violations_ = 0;
     u64 hy_cpu_rows_ = 0;
     f64 hy_cpu_ms_ = 0.0;
     std::vector<u8> hy_take_;                 // [n_expert] 1 => host computes it

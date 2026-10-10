@@ -202,6 +202,16 @@ bool ExpertCache::in_host(i32 layer, i32 expert) const {
     return it != slots_.end() && it->second.in_host();
 }
 
+void ExpertCache::seed_count(i32 layer, i32 expert, u32 count) {
+    const auto it = slots_.find(slot_key(layer, expert));
+    if (it == slots_.end()) return;
+    // Clamped below the pin threshold on purpose: see the header. A seed tells
+    // the eviction ranking what the warmup measured, it does not promise VRAM.
+    if (count >= kPinThreshold) count = kPinThreshold - 1;
+    Slot &s = it->second;
+    if (s.count < count) s.count = count;
+}
+
 bool ExpertCache::full_for(const ExpertSource &src) const {
     const size_t need = src.expert_bytes();
     // A source with no bytes to promote is not "full", it is unusable: report

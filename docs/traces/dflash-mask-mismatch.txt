@@ -1,0 +1,52 @@
+# The forced mask-id mismatch run (2026-10-10): 32 rows, 0 top-1 agreements
+# laguna-xs2 + patched laguna-xs21 (12->13), --draft-tokens 4, -n 8 --greedy --ctx 512, KRK_DFLASH_DEBUG=1
+# A = matched (12), B = forced (13). Every row differs => the mask embedding flows into the block.
+[warn ] dflash: CRACKED PAIR by override — head set mask token 13 is not the target's mask token (12). Proposals from this run are drafted against an embedding row the drafter was never trained on; diagnostic use only
+[dfdbg] commit pos=0 n=5 enc_out min -3.90625 max 4.14844 rms 1 | row0 moved -1
+[dfdbg] blk=1 pos=5 row=0 -> 428(5.4375) 4116(5.01953) 34386(4.93359) | mean 0.129958
+[dfdbg] blk=1 pos=5 row=1 -> 116(4.83203) 544(4.71875) 804(4.66406) | mean -0.0460229
+[dfdbg] blk=1 pos=5 row=2 -> 544(4.66797) 6256(4.61719) 51759(4.42188) | mean 0.0877264
+[dfdbg] blk=1 pos=5 row=3 -> 60530(4.70312) 52930(4.48438) 4748(4.35156) | mean 0.210733
+[warn ] dflash: CRACKED PAIR by override — head set mask token 13 is not the target's mask token (12). Proposals from this run are drafted against an embedding row the drafter was never trained on; diagnostic use only
+[dfdbg] blk=1 pos=5 row=0 -> 428(5.4375) 4116(5.01953) 34386(4.93359) | mean 0.129958
+[dfdbg] blk=1 pos=5 row=1 -> 116(4.83203) 544(4.71875) 804(4.66406) | mean -0.0460229
+[dfdbg] blk=1 pos=5 row=2 -> 544(4.66797) 6256(4.61719) 51759(4.42188) | mean 0.0877264
+[dfdbg] blk=1 pos=5 row=3 -> 60530(4.70312) 52930(4.48438) 4748(4.35156) | mean 0.210733
+[dfdbg] blk=2 pos=6 row=0 -> 52593(4.85547) 6645(4.34766) 29014(4.31641) | mean -0.0500681
+[dfdbg] blk=2 pos=6 row=1 -> 16851(4.33594) 95175(4.32031) 37674(4.22656) | mean -0.0590631
+[dfdbg] blk=2 pos=6 row=2 -> 70550(4.75781) 95175(4.57422) 23609(4.47656) | mean 0.088829
+[dfdbg] blk=2 pos=6 row=3 -> 437(5.13672) 4904(4.60547) 804(4.5625) | mean 0.1203
+[dfdbg] blk=3 pos=7 row=0 -> 52593(5.28906) 10208(5.25391) 52811(5.08203) | mean 0.0733641
+[dfdbg] blk=3 pos=7 row=1 -> 27229(4.48438) 5289(4.34766) 26447(4.30078) | mean -0.183497
+[dfdbg] blk=3 pos=7 row=2 -> 2653(4.52344) 27997(4.37891) 812(4.37109) | mean -0.0223799
+[warn ] dflash: CRACKED PAIR by override — head set mask token 13 is not the target's mask token (12). Proposals from this run are drafted against an embedding row the drafter was never trained on; diagnostic use only
+[dfdbg] blk=1 pos=5 row=0 -> 428(5.4375) 4116(5.01953) 34386(4.93359) | mean 0.129958
+[dfdbg] blk=1 pos=5 row=1 -> 116(4.83203) 544(4.71875) 804(4.66406) | mean -0.0460229
+[dfdbg] blk=1 pos=5 row=2 -> 544(4.66797) 6256(4.61719) 51759(4.42188) | mean 0.0877264
+[dfdbg] blk=1 pos=5 row=3 -> 60530(4.70312) 52930(4.48438) 4748(4.35156) | mean 0.210733
+[dfdbg] blk=2 pos=6 row=0 -> 52593(4.85547) 6645(4.34766) 29014(4.31641) | mean -0.0500681
+[dfdbg] blk=2 pos=6 row=1 -> 16851(4.33594) 95175(4.32031) 37674(4.22656) | mean -0.0590631
+[dfdbg] blk=2 pos=6 row=2 -> 70550(4.75781) 95175(4.57422) 23609(4.47656) | mean 0.088829
+[dfdbg] blk=2 pos=6 row=3 -> 437(5.13672) 4904(4.60547) 804(4.5625) | mean 0.1203
+[dfdbg] blk=3 pos=7 row=0 -> 52593(5.28906) 10208(5.25391) 52811(5.08203) | mean 0.0733641
+[dfdbg] blk=3 pos=7 row=1 -> 27229(4.48438) 5289(4.34766) 26447(4.30078) | mean -0.183497
+[dfdbg] blk=3 pos=7 row=2 -> 2653(4.52344) 27997(4.37891) 812(4.37109) | mean -0.0223799
+[dfdbg] blk=3 pos=7 row=3 -> 27997(5.74219) 34855(4.48438) 36864(4.27734) | mean -0.00572222
+[dfdbg] blk=4 pos=8 row=0 -> 25580(5.54688) 15802(5.50781) 3863(5.29688) | mean 0.714683
+--- baseline (id 12) ---
+[dfdbg] blk=1 pos=5 row=0 -> 34386(5.28906) 12627(5.03125) 2447(4.94922) | mean -0.162197
+[dfdbg] blk=1 pos=5 row=1 -> 12627(5.11328) 18259(5.08984) 4914(4.75) | mean 0.174136
+[dfdbg] blk=1 pos=5 row=2 -> 4289(5.85156) 8150(5.72656) 18022(5.27344) | mean 0.611227
+[dfdbg] blk=1 pos=5 row=3 -> 6519(4.66016) 25960(4.13281) 154(4.09375) | mean -0.172643
+[dfdbg] blk=2 pos=6 row=0 -> 16815(5.10547) 34855(4.91016) 18876(4.84766) | mean 0.184015
+[dfdbg] blk=2 pos=6 row=1 -> 12409(5.95312) 4914(5.36719) 18497(5.04688) | mean 0.42515
+[dfdbg] blk=2 pos=6 row=2 -> 65611(4.90234) 4289(4.72266) 14709(4.65234) | mean 0.272209
+[dfdbg] blk=2 pos=6 row=3 -> 41193(4.64844) 59674(4.625) 25790(4.61328) | mean 0.160976
+[dfdbg] blk=1 pos=5 row=0 -> 34386(5.28906) 12627(5.03125) 2447(4.94922) | mean -0.162197
+[dfdbg] blk=1 pos=5 row=1 -> 12627(5.11328) 18259(5.08984) 4914(4.75) | mean 0.174136
+[dfdbg] blk=1 pos=5 row=2 -> 4289(5.85156) 8150(5.72656) 18022(5.27344) | mean 0.611227
+[dfdbg] blk=1 pos=5 row=3 -> 6519(4.66016) 25960(4.13281) 154(4.09375) | mean -0.172643
+[dfdbg] blk=2 pos=6 row=0 -> 16815(5.10547) 34855(4.91016) 18876(4.84766) | mean 0.184015
+[dfdbg] blk=2 pos=6 row=1 -> 12409(5.95312) 4914(5.36719) 18497(5.04688) | mean 0.42515
+[dfdbg] blk=2 pos=6 row=2 -> 65611(4.90234) 4289(4.72266) 14709(4.65234) | mean 0.272209
+[dfdbg] blk=2 pos=6 row=3 -> 41193(4.64844) 59674(4.625) 25790(4.61328) | mean 0.160976

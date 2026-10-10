@@ -105,10 +105,220 @@ a draft file is not a target.
   is inactive there (STATUS.md §10a) and every tensor falls back to a cold
   mapping. Until the per-shard pull table exists, Laguna-S is the worst case
   for the paging work below, not a test of it.
-- The expert tier has no host half yet: `--expert-l2-mb` defaults to 0, so a
-  miss re-reads from the file instead of a pinned host copy.
+- **Laguna XS.2's MoE routing index has to be refreshed after the scan fix.**
+  The shipped `*.krakenexperts.json` recorded `source_size: 0`, so Kraken rejected
+  it and auto warmup staged experts in even-id order, not by measured hotness.
+  A fresh 68-position full-forward scan now records the real 20,274,296,256-byte
+  source size. At 12.7 GiB HOT + 18.1 GiB WARM, ranked warmup fills WARM (all
+  9,984 slots), promotes 7,029 experts to VRAM, yields 95.3% HOT acquires, 0 cold
+  reads, and 21.3 tok/s median vs 10.1 with warmup disabled (four order-balanced
+  A/B pairs, same output hash). Preserve this index beside the model; rerun
+  `--expert-scan` when the weights or representative routing workload changes.
+- **Laguna XS.2 still trails llama.cpp with all layers on the same GPU.**
+  Verified the ROCm oracle sees RX 9070 XT `ROCm0` and loads all 41/41 layers in
+  ROCm0 (19,221 MiB reported model buffer); at the same prompt, greedy, ctx=512,
+  64 tokens, it decodes 31.0-31.9 tok/s vs Kraken ranked warmup 20.4-22.1 tok/s
+  (median 21.3). Kraken's fourfold-greater expert-reload-path time before the
+  corrected index was warmup-order trouble, but even after ranked warmup the
+  remaining 31% gap is open: profile by substage/launch scheduling against the
+  exact same topology before attributing it to weight loading or kernels.
+- **Laguna-S is a 3-shard 68 GiB set, not residentable in this card's 16 GiB VRAM.**
+  Kraken's expert policy already keeps the routed hot subset in VRAM and the
+  remainder in pageable WARM RAM, falling back to disk only on WARM misses;
+  ranked warmup is therefore the right path, not loading all experts onto the
+  GPU. For Laguna-S, verify per-shard weight loading and matching hot-set
+  residency at a suitably budgeted VRAM/RAM tier; do not demand all experts be
+  GPU-resident.
+- A self-draft's stale-cache explanation is measured/fixed in
+  [docs/DIAG-decode-cpu.md](DIAG-decode-cpu.md) §9; the DFlash proposer remains
+  diffuse after context/capture/mask/window probes, so its feature semantics /
+  head weights are still an open P0.
+- **Router bias warning is stale.** `src/model.cpp` now accepts Laguna's
+  `blk.N.exp_probs_b.bias` spelling and `moe_ffn` uses sigmoid gating, selection
+  bias and the declared sum/scale contract; don't treat the old warning as
+  evidence Kraken ignored it. Capture a fresh stderr run to confirm the rebuilt
+  executable no longer warns.
+
+---
+
+## MoE residency: the consolidated open list (2026-10-10)
+
+Everything below was gathered in one sherlock pass over Laguna's MoE loading,
+on this box, with the commands named. Ranked by measured size, not by taste.
+
+### What is now settled, so it is not re-derived
+
+**The hot experts do run on the GPU, and this is a line in the report rather
+than an inference.** `laguna-xs2-Q4_K_M`, `--greedy -n 64 --ctx 512 --expert-warmup 1`:
+**20,004 of 21,014 acquires (95.2%) are HOT hits**, 1,010 are WARM promotions, **0
+are COLD misses**, and **0 MiB is read from the model file during decode**. The
+classification is what guarantees it: `cpu = !ec.in_vram(layer, e) &&
+ec.full_for(...)` in `Engine::moe_ffn`, so only an expert that is *not* resident
+is ever a candidate for the host, `--hybrid-experts` is off by default, and the
+new `[stats] hybrid policy:` line states the invariant whenever the split is on.
+That line used to be missing, and the one counter that spoke to it
+(`hy_gpu_experts_`) was keyed on the per-layer shape gate instead of the
+feature, so a prefill chunk (rows > `--hybrid-max-rows`) reported "device took 0"
+while the device arm did all of the work. Both are fixed.
+
+**The 68-position scan index is the right artifact and must be kept beside the
+model.** The shipped one recorded `source_size: 0`, was refused, and the run fell
+back to even-order warmup. With the fresh index, ranked warmup stages all 9,984
+slots into WARM, promotes 7,029 into VRAM, and the run is 2.1x the warmup-off arm
+at identical output. A stale index is not a neutral fallback.
+
+### The drafter's second expert tier — the 1.6 tok/s run
+
+`--draft <the same file>` on `laguna-xs2-Q4_K_M`, `-n 16 --greedy --ctx 512
+--expert-warmup 1`: **0.8-1.7 tok/s, 2298-5148 ms/round, at 81.2-87.5%
+acceptance.** The acceptance is the point: the accept/rewind loop is working, and
+the round still costs seconds.
+
+Attributed, and now printed by the run itself:
+
+```
+[stats ] draft     8 MiB VRAM budget, 4/4 slots resident | 6974 acquires | HOT 0 (0.0%)
+                   | WARM 6974 | COLD 0 | 6974 promotions at 1069.6-1353.4 us/expert
+                   <- the drafter's tier cannot hold its routed set; every expert is a
+                      promotion, so a round costs the tier and not the drafter
+[stats ] transfer  502 promotions ... (2292.0 ms)        <- the TARGET's tier, healthy
+```
+
+**6,974 promotions at ~1.1-1.4 ms is 7.5-8.0 s of a 9.2-20.6 s decode**, at a 0.0%
+HOT rate, because the draft engine is a second `Engine` whose
+`configure_expert_cache()` derives its budget from the free VRAM **left after the
+target has taken 12.7 GiB** -- it floors at 7.8 MiB, which is 4 experts out of
+9,984. `--expert-cache-mb` cannot fix it: the draft is handed the target's value
+(`dcfg.expert_cache_mb = cfg_.expert_cache_mb`) and then re-derives from the
+card. The refusal-to-warn text already in the tree ("weights, KV and workspaces
+already fill the 14.0 GiB cap; expert budget floored at 7.8 MiB") is aimed at
+`--ctx`, which is the wrong advice for this case. Also wasted: the drafter's
+warmup reads **18,102 MiB (5.9-8.0 s of load) to promote 4 experts**.
+
+**But the tier is not the reason a self-draft cannot win, and fixing the tier is
+not the fix.** A drafter proposes its `d` tokens **autoregressively** -- proposal
+`k+1` needs proposal `k` as input -- so a round costs `d` drafter forwards plus
+one `(d+1)`-row target verify: `d*C + 1.2*C` for `d+1` emitted tokens against
+`(d+1)*C` for plain decoding. With the drafter being the target's own forward,
+that is break-even at best whatever the acceptance rate. Measured where no expert
+tier can complicate it, SmolLM2-135M: **272.8 tok/s self-drafted against 581.0
+plain at 97.5% acceptance** (17.60 ms/round for ~4.8 tokens = 2.1x the plain cost
+of the same tokens). So:
+
+- **A drafter has to be cheaper per forward than the target.** That means a head
+  set (DFlash is 330 MiB and stays resident) or a smaller same-family model --
+  not a self-draft. A load-time warning now says exactly this when `--draft`
+  names the same file as `-m`, with both numbers, because a self-draft is still
+  the only cheap way to exercise the accept/rewind path on an arbitrary model.
+- **If a same-file draft is ever wanted for speed, the fix is to share ONE expert
+  cache.** Same file means identical expert tensors, so the target's 12.7 GiB /
+  95% HOT tier would serve both and the 6,974 promotions would collapse to the
+  target's ~500. Gate it on identical path *and* identical per-layer geometry
+  (n_expert, n_embd, n_ff, dtype per layer), because a shared cache keyed on
+  (layer, expert) would otherwise hand one file's bytes out as another's -- the
+  fluent-garbage failure this repo treats as the worst kind. Lifetime: `draft_`
+  is owned by the target and destroyed first, so the cache outlives it. **Not
+  built**, deliberately: the configuration it optimises is break-even at best.
+- **The drafter's WARM fill should be skipped when its VRAM budget cannot promote
+  a useful set.** 18 GiB read / ~6 s of load to land 4 experts in VRAM, measured.
+  Cheap guard, higher value now that the case is named.
+
+### The one item that is 28% of a decode
+
+**1,010 WARM->VRAM promotions over 63 steps cost ~710 ms of a ~2,550 ms decode.**
+Each is a ~1.86 MiB DMA at ~700 us, and it is *serialized against that layer's
+GEMMs* -- `expert-path read 0.0 | room 264 | alloc 263 | xfer 184 ms`. These are
+not CPU-computed experts and they are not cold file reads; they are experts that
+were evicted and are being brought back. The budget is 12.7 GiB of a 17.7 GiB
+routed set (70%), so the tier *cannot* hold it and the policy is evicting by
+construction (1.48 GiB free of 15.9 GiB VRAM, so raising it is not available).
+The levers left, in order of expected size:
+
+- **Overlap the promotion.** It is currently issued inside the per-expert loop
+  on the default stream, so the device waits. A prefetch of the *next* layer's
+  routed set, or of the remaining members of the current one, is the untried
+  shape; `ExpertCache::prefetch_layer` already batches a layer's reads into one
+  call for exactly this reason, and it is a VRAM promotion that needs the same.
+- **Route-ahead prediction** (`docs/PERF-ANALYSIS.md` §10.8 item 2) says ~14% and
+  no more for the file-read case. The same previous-token routing is available
+  here and predicts this model's own x8-per-layer selection.
+- **Do not re-attempt ranked seeding.** Measured, see Closed / negative results.
+
+### The cross-engine gap is still open
+
+llama.cpp ROCm on the same card loads **41/41 layers onto ROCm0** (19,221 MiB
+model buffer) and decodes **31.0-31.9 tok/s** at this protocol against Kraken's
+**24.4 tok/s** (seed-off arm, two runs, 20004 HOT hits each). The caveat is real
+and must travel with the number: llama's repack is default-on, so that is a
+user-visible same-GPU comparison, not an isolated kernel A/B. The next step is a
+substage/launch profile against the exact same topology **before** attributing
+the gap to weight loading or to kernels -- the counters above say the storage
+path is no longer the suspect.
+
+### Missing outright
+
+- **Laguna-S 2.1 is a 3-shard set and the pull path is inactive for it.**
+  `read()`-based weight loading needs a per-shard table, so every tensor falls
+  back to a cold mapping. It is 68 GiB and cannot be residented in 16 GiB, so the
+  intended shape is ranked warmup + hot subset in VRAM + WARM in RAM -- which is
+  exactly the path that now works for XS.2 and has never been exercised on a
+  shard set. Until the per-shard pull table exists, Laguna-S is the worst case
+  for the paging work above, not a test of it.
+- **Closed — F8 (a self-draft accepting 27.8% where it must be ~100%) is fixed
+  on the current build and resolved across families.** `laguna-xs2-Q4_K_M` self-draft
+  reaches 52/52 = 100% at -n 64 (13 full-accept rounds, no pre-check failures,
+  no partials, no KV-invariant failures) and 77/80 = 96.2% at -n 96 (20 rounds,
+  all full accept, trailing 3 the 128-context cap cutting the last round); SmolLM2-135M
+  self-draft is the same shape (96.2% at 96 tokens, all rounds full). The earlier
+  27.8% / 34.4% records were stale and predate the fix; they are corrected in
+  MTP-DRAFTER.md §3, DFLASH-DRAFTER.md §3 and DIAG-decode-cpu.md F8. The MTP/DFlash
+  losses were taken before this fix and ought to be re-quoted, but the loop that
+  capped every drafter is now ~100% when it is the only problem.
+- **`kraken-bench --gate` still has no speculation arm** (DIAG-decode-cpu.md F20),
+  so an 8.9x speculative regression remains invisible to the gate suite. The
+  repo's own models make the arm cheap: `--draft <same file>` is a self-draft, so
+  the gate can assert accepted > 0 and text identical to plain.
+- **The router-bias warning text is now misleading.** `src/model.cpp` accepts
+  laguna's `blk.N.exp_probs_b.bias` spelling and uses it; the warning says the
+  engine "expected the prefixed spelling", which reads in a fresh log as a live
+  defect. It fires once per model by design -- reword it to say the file uses the
+  unprefixed spelling and that it was applied.
+- **A prefill `[stats]` line does not exist for the expert path.** The 28% figure
+  above is a decode figure; prefill's promotion cost is not separately reported,
+  and on a 256-row chunk it is the same DMA with 256x the rows behind it.
 
 ## Closed / negative results
+
+### Seeding the warmup's ranking into the eviction counters — MEASURED, HURTS
+
+The hypothesis was concrete and looked airtight. The ranked warmup promotes
+experts hottest-first, but every warmed slot lands on the same LFU counter (1),
+so victim selection falls through to its tie-break -- *oldest load first* -- and
+the first expert evicted is the one the warmup ranked **hottest**, because it was
+promoted first. The eviction order would then run exactly against the measured
+one. `ExpertCache::seed_count` / `warmup_rank_seed` stamp the rank into the
+counter (linear from `kPinThreshold-1` at rank 0 down to 1, never at the
+threshold, so a seed cannot pin), and the unit test proves the mechanism: on
+identical traffic an unseeded cache evicts the older slot, a seeded one evicts
+the other.
+
+It makes the real model worse, reproducibly:
+
+| arm | decode | promotions | HOT hits | stdout |
+|---|---:|---:|---:|---|
+| seed on | 21.5 / 21.0 tok/s | 1391 | 93.4% | `e033f46650e8` |
+| seed off | **24.2 / 24.7 tok/s** | **1010** | **95.2%** | `e033f46650e8` |
+
+A B B A interleaved, 64 greedy tokens, ranked warmup, four runs, identical
+stdout: **+38% promotions and -13% throughput (4/4)**. The mechanism is sound and
+the *ranking* is not. With 65% of the routed set resident, freezing a
+68-position offline scan into counters that would otherwise accumulate the run's
+own reuse protects the wrong slot: the tail of the offline order is a worse
+predictor of the next acquire than one hit of run-time traffic, and freezing it
+displaces the policy that was already holding 95.2% of acquires HOT. **Left in
+place as `KRK_EXPERT_SEED=1` and off by default**, because the comparison is one
+process apart and this is the arm. A future predictor has to beat run-time LFU,
+not the tie-break.
 
 ### Block-level zero skipping for MoE expert paging — MEASURED, NO YIELD
 

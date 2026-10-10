@@ -177,8 +177,11 @@ void usage() {
         "  --hybrid-threads N    host threads for that split (0 = min(hw, 8))\n"
         "  --hybrid-max-rows N   widest row count the host arm runs at (default 8;\n"
         "                        0 = unbounded. It is a decode optimization.)\n"
-        "  --hybrid-frac F       share (0..1) of the RESIDENT experts forced to the\n"
-        "                        host anyway; the knob that sweeps the split\n"
+        "  --hybrid-frac F       share (0..1) of the device tier's OVERFLOW the\n"
+        "                        host arm takes (default 1.0 = all of it). It\n"
+        "                        cannot move a VRAM-resident expert to the host:\n"
+        "                        residency decides placement. The knob that sweeps\n"
+        "                        the split at a fixed cache size.\n"
         "  --draft MODEL         draft model for greedy speculative decoding\n"
         "  --draft-tokens N      speculation window (default 4)\n"
         "  --info                print model and device info, then exit\n"
@@ -581,6 +584,45 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                  "alloc %8.1f ms | xfer %8.1f ms | (promote total %8.1f ms)\n",
                  ec.read_ms(), ec.room_ms(), ec.alloc_ms(), ec.xfer_ms(),
                  prom_ms);
+    // The draft engine owns its OWN expert tier, and its budget is derived from
+    // the free VRAM left after the target has already taken its share. On a
+    // model whose routed set is bigger than the card that can come out at a
+    // handful of slots, and every drafter forward pass then thrashes -- while
+    // this report read the target's cache only and showed a healthy 95% HOT.
+    // Measured on laguna-xs2 as a self-draft: the drafter's tier holds 4 of 9984
+    // slots, promotes at 4566 us/expert against 700 us healthy, and turns one
+    // round into 4.6 s at 81% acceptance. Without this line the only number a
+    // caller sees is "1.6 tok/s", with nothing in the log to attribute it to.
+    if (engine.has_draft_model()) {
+        const ExpertCache &dec = engine.draft_model().experts();
+        const u64 dacq = dec.acquires();
+        const f64 dshare = dacq > 0 ? 100.0 / static_cast<f64>(dacq) : 0.0;
+        std::fprintf(out,
+                     "[stats ] draft     %.0f MiB VRAM budget, %zu/%zu slots "
+                     "resident | %llu acquires | HOT %llu (%.1f%%) | WARM %llu | "
+                     "COLD %llu | %llu promotions at %.1f us/expert%s\n",
+                     static_cast<f64>(dec.budget_bytes()) / 1048576.0,
+                     dec.resident_slots(), dec.capacity_slots(),
+                     static_cast<unsigned long long>(dacq),
+                     static_cast<unsigned long long>(dec.hits()),
+                     dshare * static_cast<f64>(dec.hits()),
+                     static_cast<unsigned long long>(dec.host_hits()),
+                     static_cast<unsigned long long>(dec.loads()),
+                     static_cast<unsigned long long>(dec.promotions()),
+                     dec.promotions() > 0
+                         ? dec.promote_ms() * 1000.0 / static_cast<f64>(dec.promotions())
+                         : 0.0,
+                     // The signature that matters is the HIT RATE, not the
+                     // per-expert time: a tier holding 4 of 9984 slots cannot
+                     // serve any reuse at all, so it reads 0% HOT while a
+                     // starved allocator makes each promotion 1-5 ms. Gated on
+                     // a real acquire count so a two-token probe is not accused.
+                     (dacq >= 1000 && dshare * static_cast<f64>(dec.hits()) < 50.0)
+                         ? "  <- the drafter's tier cannot hold its routed set; "
+                           "every expert is a promotion, so a round costs the "
+                           "tier and not the drafter"
+                         : "");
+    }
     // The hybrid split, when it was on. Printed even when the host arm ran
     // nothing, because "the split bought nothing here" is a result too, and the
     // only way to see it is for the line to appear anyway.
@@ -596,6 +638,28 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                                     : 0.0,
                      hs.threads,
                      static_cast<unsigned long long>(hs.gpu_experts));
+        // The policy, stated where the split is reported. It is a property of
+        // the classification, not a measurement: `cpu` is only ever set on an
+        // expert that is NOT VRAM-resident, so a resident expert is never sent
+        // to the host whatever the fractions say. A run that cannot say this
+        // has to have it inferred from the cache counters, which is how "the
+        // hot experts run on the GPU" stayed a claim instead of a line.
+        std::fprintf(out,
+                     "[stats ] hybrid    policy: only experts the device tier could "
+                     "not hold were candidates for the host; every VRAM-resident "
+                     "expert ran on the device%s | %llu violation(s)\n",
+                     hs.cpu_experts == 0 ? " (the host arm ran nothing)" : "",
+                     static_cast<unsigned long long>(hs.policy_violations));
+        if (hs.policy_violations > 0) {
+            // Not a tuning outcome. Say it in full, next to the line it
+            // contradicts, because the alternative is a placement nobody can
+            // see from the cache counters.
+            std::fprintf(out,
+                         "[stats ] hybrid    %llu expert(s) were sent to the host "
+                         "while VRAM-resident, which the policy forbids: the "
+                         "placement above is NOT what this run did.\n",
+                         static_cast<unsigned long long>(hs.policy_violations));
+        }
     }
     std::fprintf(out,
                  "[stats ] warm      %.0f MiB capacity, %.1f%% in use | %llu admissions, "

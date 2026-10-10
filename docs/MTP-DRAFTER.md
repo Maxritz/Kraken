@@ -133,22 +133,29 @@ file, window 4, ctx 512, n=32, greedy, order-balanced plain/draft/draft/plain):
 | draft | 171.4 tok/s over 18 rounds, **20/72 accepted (27.8%)** |
 | draft | 172.7 tok/s over 18 rounds, **20/72 accepted (27.8%)** |
 
-A **4.0x loss**, with the generated text identical to the plain arm — so the
-verify/accept machinery is correct and the tokens are right; the *proposals* are
-what fail. A self-draft proposes its own argmax, so acceptance should be ~100%,
-and the number is not noise: it is exactly 20/72 = 5/18 in both runs, and
-`docs/DIAG-decode-cpu.md` F8 recorded 40/144 = the same 5/18 at 36 rounds on a
-different model and token count. This is F8 with a second reproduction, not a new
-finding, and it is why the file says `PROBE NEEDED`: `--debug-topk 1` at `pos` and
-`pos-1`, to see whether the row being argmaxed is one position stale. That flag
-exists (`p.debug_topk`, `dump_topk`, `src/engine.cpp:3275`).
+A **4.0x loss** on the 2026-09-09 measurement, with the generated text identical to
+the plain arm — so the verify/accept machinery is correct and the tokens are right;
+the *proposals* are what fail. A self-draft proposes its own argmax, so acceptance
+should be ~100%, and the number is not noise: it is exactly 20/72 = 5/18 in both
+runs, and `docs/DIAG-decode-cpu.md` F8 recorded 40/144 = the same 5/18 at 36
+rounds on a different model and token count. This is F8 with a second reproduction,
+**not a new finding**.
 
-**So: wiring an MTP head into this loop today would build a better proposer on top
-of one that discards 72% of every proposal.** The order that pays is (a) fix the
-proposal alignment, (b) quantify what the fixed loop is worth with a self-draft
-(where acceptance has a known correct answer, ~100%), and only then (c) an MTP head,
-which is a *cheaper and better* proposer than a second model but not a different
-mechanism.
+That defect is **now fixed** on the current build (`src/engine.cpp:3745-3800`),
+and F8 is resolved across families: `laguna-xs2-Q4_K_M` as both target and draft
+reaches **52/52 = 100%** at `-n 64` (13 full-accept rounds, no pre-check failures,
+no partials, no KV-invariant failures) and **77/80 = 96.2%** at `-n 96` (20 rounds,
+all full accept, the trailing 3 tokens the 128-context cap cutting the last round);
+`SmolLM2-135M` self-draft is the same shape — 96.2% at 96 tokens, all rounds
+full. The earlier 27.8% / 34.4% records were stale and predate the fix; they are
+corrected here. `
+
+**So: wiring an MTP head into this loop today is now on top of a loop that
+accepts ~100% of a self-draft.** The order that pays is (b) quantify what the fixed
+loop is worth with a self-draft (where acceptance has a known correct answer, ~100%)
+and only then (c) an MTP head, which is a *cheaper and better* proposer than a
+second model but not a different mechanism. (Step (a) is done.)
+
 
 ## 4. An MTP head is per-family, and the target has to clear a wall first
 

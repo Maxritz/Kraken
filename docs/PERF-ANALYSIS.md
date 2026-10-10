@@ -9,6 +9,45 @@ prompt `"what is the capital of france?"`, `-n 24 --temp 0`, ChatML.
 
 ## 1. Headline
 
+**Update (2026-10-10): Laguna XS.2 MoE tiering, a self-draft cache fix and an
+oracle comparison.** This live probe fixes the prompt and generation length at
+`The history of computing`, 64 greedy tokens, `--ctx 512`, RX 9070 XT. Kraken's
+fresh expert scan (68 positions, full forward) replaced a stale index whose
+`source_size` was 0; the loader had correctly refused that index and fallen back
+to even-order warmup. Four order-balanced pairs compare the default verified
+ranked warmup with warmup disabled, preserving each arm's order slots:
+
+| arm | median decode | cache per acquire | file bytes/run | stdout SHA-256 |
+|---|---:|---|---:|---|
+| ranked warmup | **21.3 tok/s** (47.0 ms/step) | 95.3% HOT, 4.7% WARM | **0 MiB** | `4703c315…` |
+| warmup off / even first touches | 10.1 tok/s (99.0 ms/step) | 78.0% HOT, 22.0% WARM | 8,337 MiB (130.27 MiB/token) | `4703c315…` |
+
+Each paired run improved 104–119%, and all eight outputs hash identically. The
+run did not read the model file with warmup enabled because the 18,102 MiB
+pageable WARM tier already held every routed slot and top experts were promoted
+into the 12,745 MiB VRAM budget. It still paid ~0.6–0.8 seconds in WARM-to-VRAM
+promotions/allocator work over 64 tokens; these are transfers of experts that
+are not HOT, not CPU-computed experts. The engine has no CPU expert arm enabled
+here.
+
+**Cross-engine check:** llama.cpp's ROCm `ROCm0` list identifies this same RX
+9070 XT, and verbose loading says `offloaded 41/41 layers to GPU`, model buffer
+19,221 MiB. Three identical-shape runs report **31.01–31.85 tok/s decode**
+(median 31.04) at the same context/prompt/token count; Kraken after corrected
+warmup is still **1.46x slower**, so tiering fixed the stale-ranking penalty but
+is not the whole remaining engine gap. Caveat: llama's repack is default-on
+(`REPACK=1` in system info), while Kraken keeps the original GGUF layouts; this
+is a representative user-visible same-GPU comparison, not an isolated kernel
+A/B. The earlier body of this document records older, conflicting model status
+and performance experiments; treat this update as the newer run for this exact
+command, not as a global model-family claim.
+
+`Laguna-S` is a 68 GiB three-shard model, so all weights cannot fit in this
+16 GiB GPU; the intended policy is deliberately hot experts on GPU, a pageable
+WARM working set in host RAM, and only a cold tail on storage. Its shard path,
+source-specific index and measured residency remain follow-up work.
+
+
 | | llama.cpp ROCm | Kraken | ratio |
 |---|---:|---:|---:|
 | prompt tok/s (`--no-repack`) | 25.2 | 7.9 | 0.31x |

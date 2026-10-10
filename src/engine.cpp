@@ -1745,6 +1745,35 @@ bool Engine::load_dflash(const std::string &path, std::string *err) {
         delete d;
         return false;
     }
+    // ... and it has to be the target's OWN mask id: the head set was trained
+    // to treat one mask row as noise, and embedding a different row drafts
+    // against a token the heads never saw masked. Targets without the key
+    // predate the convention and keep the range check above as their gate.
+    // KRK_DFLASH_ALLOW_BAD_MASK=1 loads the mismatched pair anyway, for
+    // diagnosing a head set whose key is wrong rather than its weights.
+    {
+        const i32 tmask = static_cast<i32>(
+            model_.gguf().get_i64("tokenizer.ggml.mask_token_id", -1));
+        const char *allow = std::getenv("KRK_DFLASH_ALLOW_BAD_MASK");
+        const bool override =
+            allow != nullptr && allow[0] != '\0' && allow[0] != '0';
+        if (tmask >= 0 && d->mask_id() != tmask && !override) {
+            if (err)
+                *err = format(
+                    "DFlash mask token %d is not the target's mask token (%d): "
+                    "the block's mask rows are embedded with the target's "
+                    "table, so this head set would draft against a row it was "
+                    "never trained on",
+                    d->mask_id(), tmask);
+            delete d;
+            return false;
+        }
+        if (tmask >= 0 && d->mask_id() != tmask)
+            KRK_WARN("CRACKED PAIR by override: DFlash mask token %d against "
+                      "the target's mask token (%d) — numbers from this run "
+                      "are not to be believed",
+                      d->mask_id(), tmask);
+    }
     dflash_ = d;
     if (draft_tokens_ <= 0) draft_tokens_ = 4;
     KRK_INFO("dflash drafter loaded: %s — %d captured layers, block size %d, "
@@ -1761,6 +1790,33 @@ void Engine::unload_dflash() {
     dflash_->unload();
     delete dflash_;
     dflash_ = nullptr;
+}
+
+i32 Engine::dflash_block_size() const {
+    return dflash_ ? dflash_->block_size() : 0;
+}
+
+// One draft_block call, wrapped for callers outside the generate loop (the
+// suite, probe tools): the same call generate_speculative_dflash makes, with
+// the same clamping (draft_block itself clamps n_draft to block_size-1, so
+// the host copy is sized by the same rule the write uses -- sizing it by the
+// caller's n_draft instead is the same overflow the loader's vocab check
+// exists to prevent, just on the row count instead of the row width).
+i32 Engine::draft_block_rows(const QuantTensor &tok_embd, const QuantTensor &lm_head,
+                             i32 n_vocab, i32 id_last, i32 n_draft, i32 pos,
+                             DflashRows &out) {
+    if (!dflash_ || n_draft <= 0 || n_vocab <= 0) {
+        out.data.clear();
+        return 0;
+    }
+    const i32 want = std::min<i32>(n_draft, dflash_->block_size() - 1);
+    out.data.assign(static_cast<size_t>(want) * static_cast<size_t>(n_vocab),
+                    0.0f);
+    const i32 got = dflash_->draft_block(tok_embd, lm_head, n_vocab, id_last,
+                                         n_draft, pos, out.data.data());
+    out.data.resize(static_cast<size_t>(std::max<i32>(got, 0)) *
+                    static_cast<size_t>(n_vocab));
+    return got;
 }
 
 bool Engine::load_draft(const std::string &path, std::string *err) {
@@ -3407,14 +3463,20 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
             const i32 t = draft.topk_valid_ ? draft.topk_id_
                                             : argmax_of(draft.logits_host_, n_vocab_);
             if (t == tok_.eos()) break; // the target confirms EOS itself
+            // Room check BEFORE storing: proposal d lives at slot pos+d, so
+            // without room the chain stops here. Storing first and breaking
+            // later left the last proposal unfed, and the full-accept
+            // realign then failed its rollback past that gap (silently) and
+            // wrote the bonus beyond it -- a permanent hole of stale KV rows
+            // that poisoned every later draft prediction (measured: self-draft
+            // at 27.8% instead of ~100%). Every stored proposal is fed, so the
+            // draft cache stays contiguous [0, kv_pos_) by construction.
+            if (pos + d >= kv_cap_ || pos + d >= draft.kv_capacity()) break;
             prop[static_cast<size_t>(d)] = t;
             d++;
             draft_proposed_++;
             // The d-th proposal belongs at position pos+d-1 (the first extends
-            // the prompt, whose rows end at pos-1). No need to feed the final
-            // one — its continuation lies beyond the window.
-            if (d >= k || pos + d >= kv_cap_ || pos + d >= draft.kv_capacity())
-                break;
+            // the prompt, whose rows end at pos-1).
             draft.forward(&t, 1, static_cast<i32>(pos + d - 1), true);
             draft.fetch_logits(true);
         }
@@ -3718,6 +3780,39 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
         spec_steps_++;
         timed_decode_steps++;   // a speculation round is this loop's unit of work
 
+        if (p.debug_topk > 0 && d > 0) {
+            // After the block's proposals, dump the block's own row 0 top-3 next
+            // to the target's top-3 at this position, so a drafter whose
+            // candidates are merely elsewhere on the row and one whose row is flat
+            // read differently in one run, and so the layer-level attention/injection
+            // dump in dflash.cpp can be read against them to find whether the
+            // block's own hidden state is the problem.
+            std::fprintf(stderr,
+                         "[dfkv] block_row0 pos=%lld top=[",
+                         static_cast<long long>(pos));
+            {
+                f32 b0 = -1e30f, b1 = -1e30f, b2 = -1e30f;
+                i32 i0 = -1, i1 = -1, i2 = -1;
+                const f32 *__restrict__ dp = dlogits.data();
+                for (i64 v = 0; v < n_vocab_; v++) {
+                    const f32 x = dp[v];
+                    if (x > b0) {
+                        b2 = b1; i2 = i1; b1 = b0; i1 = i0; b0 = x;
+                        i0 = static_cast<i32>(v);
+                    } else if (x > b1) {
+                        b2 = b1; i2 = i1; b1 = x; i1 = static_cast<i32>(v);
+                    } else if (x > b2) {
+                        b2 = x; i2 = static_cast<i32>(v);
+                    }
+                }
+                std::fprintf(stderr,
+                             "%d(%.4g) %d(%.4g) %d(%.4g)",
+                             i0, static_cast<f64>(b0), i1,
+                             static_cast<f64>(b1), i2, static_cast<f64>(b2));
+            }
+            std::fputc(10, stderr);
+        }
+
         // ---- the same pre-check plain decode performs ---------------------
         // On disagreement the round costs exactly one plain step and the block
         // is never verified.
@@ -3754,6 +3849,28 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
                              static_cast<f64>(b1), i2, static_cast<f64>(b2));
             }
             std::fputc(93, stderr);
+            {
+                // How far the target's token sits on the draft's own row 0:
+                // rank 3 means the answer is present but outranked, a rank in
+                // the thousands means the row never encoded it at all.
+                const f32 fv = dlogits[static_cast<size_t>(first)];
+                i64 rk = 0;
+                f64 ms = 0.0;
+                f32 mx = -1e30f;
+                for (i64 v = 0; v < n_vocab_; v++) {
+                    const f32 x = dlogits[static_cast<size_t>(v)];
+                    if (x > fv) rk++;
+                    ms += x;
+                    if (x > mx) mx = x;
+                }
+                std::fprintf(stderr,
+                             " draft_row0: rank(first)=%lld/%lld max=%.4g "
+                             "mean=%.4g",
+                             static_cast<long long>(rk),
+                             static_cast<long long>(n_vocab_),
+                             static_cast<f64>(mx),
+                             ms / static_cast<f64>(n_vocab_));
+            }
             std::fputc(10, stderr);
         }
         if (first != prop[0]) {

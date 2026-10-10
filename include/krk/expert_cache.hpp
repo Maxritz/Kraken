@@ -289,6 +289,44 @@ public:
     bool in_vram(i32 layer, i32 expert) const;
     bool in_host(i32 layer, i32 expert) const;
 
+    // Seeds one resident slot's LFU counter from outside. The caller is the
+    // ranked warmup, which measured which experts are hot BEFORE the run
+    // started; that counter is the only thing eviction ranks on, so stamping the
+    // offline order into it is how the two rankings are kept in agreement.
+    //
+    // Measured, and the reason this is OFF by default wherever it is called
+    // (src/engine.cpp gates it on KRK_EXPERT_SEED=1): doing it HURTS. laguna-xs2,
+    // 64 greedy tokens, ranked warmup, A B B A interleaved, stdout identical:
+    // 1010 -> 1391 promotions (+38%) and 24.4 -> 21.3 tok/s (-13%, 4/4). The
+    // mechanism ranks correctly (see test_expert_cache_policy, which pins a
+    // seeded slot outliving an unseeded one on identical traffic); the ordering
+    // it imposes does not. With 65% of the routed set resident, a frozen
+    // 68-position scan is a worse predictor of the next acquire than the
+    // run-time reuse the counters would otherwise accumulate, and freezing it
+    // displaces the policy that was already holding 95.2% of acquires HOT.
+    //
+    // The value only ever rises, and it is clamped below kPinThreshold: a pin is
+    // a promise VRAM traffic has to earn, so a seed cannot grant one. A slot
+    // that is not resident is left alone -- a seed is not residency.
+    void seed_count(i32 layer, i32 expert, u32 count);
+
+    // The counter a ranked-warmup promotion seeds its slot with: linear from
+    // kPinThreshold-1 at rank 0 down to 1 at the bottom of the warmed order, and
+    // never at the threshold, so a seed ranks a slot without pinning it. Public
+    // because the contract is testable on its own -- monotone in rank, always
+    // inside [1, kPinThreshold) -- and because it is the one place the warmup's
+    // measured order is translated into the policy's own units.
+    static u32 warmup_rank_seed(size_t rank, size_t depth) {
+        const i32 top = static_cast<i32>(kPinThreshold) - 1;
+        if (depth <= 1) return static_cast<u32>(top);
+        const i64 r = static_cast<i64>(rank);
+        const i64 d = static_cast<i64>(depth) - 1;
+        if (r > d) return 1u;
+        i32 v = top - static_cast<i32>(r * (top - 1) / d);
+        if (v < 1) v = 1;
+        return static_cast<u32>(v);
+    }
+
     // True when promoting one more expert of `src` would have to evict
     // something, i.e. the device tier is already full. The hybrid CPU+GPU path
     // uses it to take the OVERFLOW only: with a budget that holds the whole

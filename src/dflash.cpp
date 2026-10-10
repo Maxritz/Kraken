@@ -284,8 +284,20 @@ bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
                       gguf_->get_bool(key(".context_kv_layer_norm"), false);
     kv_norm_ = decoder_laguna_;
     causal_ = decoder_laguna_;
-    if (const char *env = std::getenv("KRK_DFLASH_CAUSAL"))
-        causal_ = env[0] == '1';
+    // An EXPLICIT KRK_DFLASH_CAUSAL is authoritative and is applied again below,
+    // after the per-layer rule. It used to be read here into `causal_` only, and
+    // the third-party branch further down then derived every layer's answer from
+    // the window pattern and discarded the override -- so the knob was inert on
+    // exactly the files it exists for. Measured on `laguna-xs21-dflash-q8.gguf`
+    // (a third-party head set): the contract line reads
+    // `causal block (5/5 layers causal)` whichever way the knob is set, which
+    // makes the one experiment that tells a causal block from a block-visible
+    // one impossible to run -- and that distinction is the whole question, since
+    // llama.cpp's own draft-block mask allows every block row to see every
+    // other row (see the note on block visibility in the header).
+    const char *env_causal = std::getenv("KRK_DFLASH_CAUSAL");
+    const bool causal_explicit = env_causal != nullptr;
+    if (causal_explicit) causal_ = env_causal[0] == '1';
     if (const char *env = std::getenv("KRK_DFLASH_KVNORM"))
         kv_norm_ = env[0] == '1';
 
@@ -298,6 +310,12 @@ bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
     cfg_.rope_frac = static_cast<f32>(n_rot) / static_cast<f32>(cfg_.head_dim);
     cfg_.rope_scale = 1.0f;
     cfg_.rope_neox = arch_spec(cfg_.arch).rope_neox;
+    // KRK_DFLASH_ROPE_NEOX=0/1 overrides the arch table's RoPE pairing. The
+    // file carries no pairing key, so the table's answer is analogy (the fork
+    // agrees, but it never ran this arch string either); a flip that moves
+    // acceptance is the only measurement that can settle it.
+    if (const char *env = std::getenv("KRK_DFLASH_ROPE_NEOX"))
+        cfg_.rope_neox = env[0] == '1';
     cfg_.attn_gate = arch_spec(cfg_.arch).attn_gate;
     cfg_.qk_norm = true;
     build_inv_freq(inv_freq_, n_rot, cfg_.rope_base);
@@ -341,6 +359,15 @@ bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
         for (i32 l = 0; l < cfg_.n_layer; l++)
             layer_causal_[static_cast<size_t>(l)] =
                 layer_window_[static_cast<size_t>(l)] > 0 ? 1 : 0;
+    }
+    // ... and the explicit override wins over both, which is what makes the
+    // block's causality a measurable variable rather than a property of the
+    // file. Default behaviour is untouched: nothing is set unless the caller
+    // asked for it.
+    if (causal_explicit) {
+        const i32 v = causal_ ? 1 : 0;
+        for (i32 l = 0; l < cfg_.n_layer; l++)
+            layer_causal_[static_cast<size_t>(l)] = v;
     }
 
     // KRK_DFLASH_WINDOW forces one sliding-window value on every drafter layer.
@@ -398,13 +425,36 @@ bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
         ws_agate_ = be.alloc(static_cast<size_t>(C * q_dim) * as);
     // One row per candidate, so the whole block's readback is a single transfer
     // instead of one sync per row. block_size-1 is the most the block can ask
-    // for, and it is the same ceiling the driver clamps the window to.
+    // for, and it is the same ceiling the driver clamps the window to. The row
+    // WIDTH is the caller's n_vocab (the target's, everywhere: the block is
+    // read out through the target's head), so sizing by the head set's own
+    // declared vocab would overflow whenever the two differ -- latent on a real
+    // pair (a converter writes both as 100352) and a hard crash on any fixture
+    // that declares a small drafter vocab beside a big target. The row width is
+    // passed in at call time, so the workspace top must be the widest a caller
+    // can name; the loader's equality check below is the actual guard.
     ws_logits_ = be.alloc(static_cast<size_t>(block_size_ - 1) *
                           static_cast<size_t>(cfg_.n_vocab) * as);
     kcache_ = be.alloc(static_cast<size_t>(cfg_.n_layer * kv_cap_ * kv_dim) * as);
     vcache_ = be.alloc(static_cast<size_t>(cfg_.n_layer * kv_cap_ * kv_dim) * as);
+    // Every workspace starts zeroed. The attention reads cache slots the
+    // caller never committed (positions between the prompt and the block),
+    // and a half-processed buffer that happens to hold f16 garbage from a
+    // previous allocation produces a draft that is non-deterministically
+    // non-finite -- measured in the fixture suite (1 in 8 runs, the same check
+    // failing or a heap corruption 2 checks later). fill0 on the caches is
+    // the load-time rule; extending it to the activation workspaces costs one
+    // pass at load and removes the whole class.
     be.fill0(kcache_, static_cast<size_t>(cfg_.n_layer * kv_cap_ * kv_dim) * as);
     be.fill0(vcache_, static_cast<size_t>(cfg_.n_layer * kv_cap_ * kv_dim) * as);
+    be.fill0(ws_x_, static_cast<size_t>(C * cfg_.n_embd) * as);
+    be.fill0(ws_xn_, static_cast<size_t>(C * cfg_.n_embd) * as);
+    be.fill0(ws_x2_, static_cast<size_t>(C * cfg_.n_embd) * as);
+    be.fill0(ws_attn_, static_cast<size_t>(C * q_dim) * as);
+    be.fill0(ws_logits_,
+             static_cast<size_t>(block_size_ - 1) * static_cast<size_t>(cfg_.n_vocab) * as);
+    if (cfg_.attn_gate)
+        be.fill0(ws_agate_, static_cast<size_t>(C * q_dim) * as);
 
     feat_host_.resize(static_cast<size_t>(C) * static_cast<size_t>(n_embd_enc_));
     tmp_host_.resize(static_cast<size_t>(C) * static_cast<size_t>(cfg_.n_embd));
@@ -420,11 +470,12 @@ bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
         KRK_INFO("dflash capture:   %d%s", target_layers_[i],
                  i + 1 < target_layers_.size() ? "," : "]");
     KRK_INFO("dflash contract: %s injection, %s block (%d/%d layers causal), "
-             "aux norms %s, rope %d/%d base %.0f, decoder from %s%s",
+             "aux norms %s, rope %d/%d base %.0f %s, decoder from %s%s",
              kv_norm_ ? "normed" : "raw", causal_ ? "causal" : "non-causal",
              n_causal_layers_, static_cast<i32>(cfg_.n_layer),
              aux_norm_ ? "stacked" : "absent", static_cast<i32>(n_rot),
              cfg_.head_dim, static_cast<f64>(cfg_.rope_base),
+             cfg_.rope_neox ? "neox" : "norm",
              decoder_arch.empty() ? "tensors" : "metadata",
              zero_mask_embed_ ? ", mask embedding zeroed" : "");
     return true;
@@ -827,10 +878,63 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
     d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(hd)));
     d.causal = causal_;
 
+    // KRK_DFLASH_PROBE=1: the candidate row's readout AFTER EVERY LAYER -- the
+    // same out_norm + head the final readout uses, applied to row 1's
+    // intermediate residual. RES_TRACE says how big the numbers are; this says
+    // what the row WANTS at that depth, so the layer where the target's token
+    // leaves the top-3 (or where the row freezes onto its attractor) is named
+    // instead of inferred. l=-1 is the embedding-only baseline: if it already
+    // reads the final prop[0], the block contributes nothing to the candidate.
+    // Cost: one single-row head gemm per layer, probe runs only.
+    const bool dfprobe = std::getenv("KRK_DFLASH_PROBE") != nullptr;
+    auto probe_row = [&](const char *stage, i32 layer) {
+        if (!dfprobe) return;
+        const i64 r1 = E;   // row 1 = the first candidate row
+        be_->rmsnorm(ws_xn_, act_at(ws_x_, as, r1), out_norm_, 1, E,
+                     cfg_.rms_eps);
+        be_->gemm(act_at(ws_logits_, as, 0), ws_xn_, lm_head.data,
+                  lm_head.type, n_vocab, E, 1);
+        be_->download_f32(tmp_host_.data(), act_at(ws_logits_, as, 0), n_vocab);
+        f32 b[3] = {-1e30f, -1e30f, -1e30f};
+        i32 bi[3] = {-1, -1, -1};
+        f64 mean = 0.0;
+        for (i32 v = 0; v < n_vocab; v++) {
+            const f32 x = tmp_host_[static_cast<size_t>(v)];
+            mean += x;
+            for (i32 c = 0; c < 3; c++) {
+                if (x > b[c]) {
+                    for (i32 s = 2; s > c; s--) {
+                        b[s] = b[s - 1];
+                        bi[s] = bi[s - 1];
+                    }
+                    b[c] = x;
+                    bi[c] = v;
+                    break;
+                }
+            }
+        }
+        mean /= n_vocab;
+        std::fprintf(stderr,
+                     "[dfpr] %s l=%d row1 top=[%d(%.6g) %d(%.6g) %d(%.6g)] "
+                     "gap %.6g mean %.6g\n",
+                     stage, layer, bi[0], static_cast<f64>(b[0]),
+                     bi[1], static_cast<f64>(b[1]), bi[2],
+                     static_cast<f64>(b[2]),
+                     static_cast<f64>(b[0] - b[1]), mean);
+        std::fflush(stderr);
+    };
+    probe_row("embed", -1);
+
     for (i32 l = 0; l < cfg_.n_layer; l++) {
         const LayerWeights &L = layers_[static_cast<size_t>(l)];
         be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, nt, E, cfg_.rms_eps);
-        if (L.wq.type == L.wk.type && L.wk.type == L.wv.type) {
+        // KRK_DFLASH_QKV_GROUP=0 forces three separate projections: the
+        // grouped path is the one unverified link between the hidden state
+        // and the (xchecked) attention math, and the all-Q8_0 drafter always
+        // takes it while a mixed-dtype target often does not.
+        const bool qkv_group = std::getenv("KRK_DFLASH_QKV_GROUP") == nullptr ||
+                               std::getenv("KRK_DFLASH_QKV_GROUP")[0] != '0';
+        if (qkv_group && L.wq.type == L.wk.type && L.wk.type == L.wv.type) {
             void *qkv[3] = {ws_q_, ws_k_, ws_v_};
             const void *wqkv[3] = {L.wq.data, L.wk.data, L.wv.data};
             const i64 nqkv[3] = {q_dim, kv_dim, kv_dim};
@@ -849,7 +953,7 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
         d.causal = layer_causal_[static_cast<size_t>(l)] != 0;
         be_->kv_append(kcache_, vcache_, ws_k_, ws_v_, d);
         be_->attention(ws_attn_, ws_q_, kcache_, vcache_, d);
-        if (dfdbg_kv && (l == 0 || l == cfg_.n_layer - 1)) {
+        if (dfdbg_kv) {
             // Row 1 of the block: what attention actually produced, and the K
             // row the injection wrote at the last committed position. If the
             // block ignores its context, either the first is ~0 or the second
@@ -878,9 +982,241 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
                          std::sqrt(kr / static_cast<f64>(kv_dim)),
                          static_cast<long long>(committed_), blk_pos, nt);
             std::fputc(10, stderr);
+
+            // Host-side replica of row 1's score vector: where the candidate
+            // row actually LOOKS, per layer. Flat scores across keys means the
+            // QK alignment itself is broken (rope/scale/norm); mass parked on
+            // the block's own rows means the context is ignored; mass on the
+            // recent context with the answer still missing means the injected
+            // features carry no signal. Weights are exact: same scale, same
+            // GQA grouping, same causal + window bounds as the kernel above.
+            {
+                // The kernel's own answer for this row, saved before the
+                // scratch buffer is reused: the cross-check below recomputes
+                // it host-side from the downloaded Q/K/V plus the score
+                // weights. A mismatch here is a kernel bug on this exact
+                // geometry, not a model bug.
+                std::vector<f32> attn1(static_cast<size_t>(q_dim));
+                be_->download_f32(attn1.data(),
+                                  act_at(ws_attn_, as, q_dim), q_dim);
+                std::vector<f32> qrow(static_cast<size_t>(q_dim));
+                be_->download_f32(qrow.data(), act_at(ws_q_, as, nh * hd),
+                                  q_dim);
+                const i64 n_rep = nh / nkv;
+                const i64 pos1 = static_cast<i64>(blk_pos) + 1;
+                const i64 n_keys = d.causal
+                                       ? pos1 + 1
+                                       : static_cast<i64>(blk_pos) + nt;
+                const i64 k_lo =
+                    d.window > 0 && d.window < n_keys ? n_keys - d.window : 0;
+                // Per-head scores: the kernel runs one block per head with
+                // its own online softmax, so weights live per head. (Summing
+                // scores across heads before one global softmax fabricates a
+                // one-hot out of 64 weak preferences -- that mistake is what
+                // the first version of this probe printed.)
+                std::vector<f32> sc(static_cast<size_t>(nh) * n_keys, -1e30f);
+                std::vector<char> valid(static_cast<size_t>(n_keys), 0);
+                for (i64 j = 0; j < n_keys; j++) {
+                    // Out of window, or a gap between context and block (only
+                    // reachable with a non-zero block base): not a key.
+                    if (j < k_lo ||
+                        (j >= committed_ &&
+                         j < static_cast<i64>(blk_pos)))
+                        continue;
+                    valid[static_cast<size_t>(j)] = 1;
+                    be_->download_f32(tmp_host_.data(),
+                                      act_at(kcache_, as, static_cast<i64>(d.layer) * d.layer_stride + j * d.pos_stride),
+                                      kv_dim);
+                    for (i64 h = 0; h < nh; h++) {
+                        const f32 *qh =
+                            qrow.data() + static_cast<size_t>(h) * hd;
+                        const f32 *kh = tmp_host_.data() +
+                                        static_cast<size_t>(h / n_rep) * hd;
+                        f64 s = 0.0;
+                        for (i64 i = 0; i < hd; i++)
+                            s += static_cast<f64>(qh[i]) * kh[i];
+                        sc[static_cast<size_t>(h) * n_keys + j] =
+                            static_cast<f32>(s * d.scale);
+                    }
+                }
+                // Cache the valid V rows once for the expected-output pass.
+                std::vector<f32> vall(static_cast<size_t>(n_keys) * kv_dim,
+                                      0.0f);
+                for (i64 j = 0; j < n_keys; j++) {
+                    if (!valid[static_cast<size_t>(j)]) continue;
+                    be_->download_f32(vall.data() +
+                                          static_cast<size_t>(j) * kv_dim,
+                                      act_at(vcache_, as, static_cast<i64>(d.layer) * d.layer_stride + j * d.pos_stride),
+                                      kv_dim);
+                }
+                // Per-head softmax, expected output, and routing stats.
+                std::vector<f64> avgw(static_cast<size_t>(n_keys), 0.0);
+                std::vector<f64> expa(static_cast<size_t>(q_dim), 0.0);
+                f64 peak = 0.0;   // mean over heads of each head's max weight
+                f64 spread = 0.0; // mean over heads of (max-min) score
+                for (i64 h = 0; h < nh; h++) {
+                    const f32 *sr =
+                        sc.data() + static_cast<size_t>(h) * n_keys;
+                    f32 smax = -1e30f, smin = 1e30f;
+                    for (i64 j = 0; j < n_keys; j++) {
+                        if (!valid[static_cast<size_t>(j)]) continue;
+                        if (sr[j] > smax) smax = sr[j];
+                        if (sr[j] < smin) smin = sr[j];
+                    }
+                    f64 z = 0.0;
+                    for (i64 j = 0; j < n_keys; j++) {
+                        if (!valid[static_cast<size_t>(j)]) continue;
+                        z += std::exp(static_cast<f64>(sr[j] - smax));
+                    }
+                    f64 hmax = 0.0;
+                    for (i64 j = 0; j < n_keys; j++) {
+                        if (!valid[static_cast<size_t>(j)]) continue;
+                        const f64 w =
+                            std::exp(static_cast<f64>(sr[j] - smax)) / z;
+                        avgw[static_cast<size_t>(j)] +=
+                            w / static_cast<f64>(nh);
+                        if (w > hmax) hmax = w;
+                        const f32 *vv = vall.data() +
+                                        static_cast<size_t>(j) * kv_dim +
+                                        static_cast<size_t>(h / n_rep) * hd;
+                        f64 *ee = expa.data() + static_cast<size_t>(h) * hd;
+                        for (i64 i = 0; i < hd; i++)
+                            ee[i] += w * vv[i];
+                    }
+                    peak += hmax / static_cast<f64>(nh);
+                    spread += static_cast<f64>(smax - smin) /
+                              static_cast<f64>(nh);
+                }
+                {
+                    f64 dmax = 0.0, ra = 0.0, re = 0.0;
+                    for (size_t i = 0; i < expa.size(); i++) {
+                        const f64 a = attn1[i];
+                        const f64 df = a - expa[i];
+                        if (std::fabs(df) > dmax) dmax = std::fabs(df);
+                        ra += a * a;
+                        re += expa[i] * expa[i];
+                    }
+                    ra = std::sqrt(ra / static_cast<f64>(expa.size()));
+                    re = std::sqrt(re / static_cast<f64>(expa.size()));
+                    std::fprintf(stderr,
+                                 "[dfkv] l=%d xcheck: attn_rms %.4f exp_rms "
+                                 "%.4f maxabsdiff %.4g",
+                                 l, ra, re, dmax);
+                    std::fputc(10, stderr);
+                }
+                {
+                    // Routing readout: mean weight per key across heads.
+                    // peak ~= 1/nkeys is flat, peak -> 1 is one-hot.
+                    i32 t0 = -1, t1 = -1, t2 = -1;
+                    f64 w0 = -1.0, w1 = -1.0, w2 = -1.0;
+                    f64 m_ctx = 0.0, m_blk = 0.0;
+                    for (i64 j = 0; j < n_keys; j++) {
+                        if (!valid[static_cast<size_t>(j)]) continue;
+                        const f64 w = avgw[static_cast<size_t>(j)];
+                        if (j < committed_)
+                            m_ctx += w;
+                        else
+                            m_blk += w;
+                        if (w > w0) {
+                            w2 = w1; t2 = t1; w1 = w0; t1 = t0; w0 = w;
+                            t0 = static_cast<i32>(j);
+                        } else if (w > w1) {
+                            w2 = w1; t2 = t1; w1 = w; t1 = static_cast<i32>(j);
+                        } else if (w > w2) {
+                            w2 = w; t2 = static_cast<i32>(j);
+                        }
+                    }
+                    std::fprintf(stderr,
+                                 "[dfkv] l=%d row1 route: ctx %.4f blk %.4f "
+                                 "peak %.4f spread %.4f top=[%d:%.4f %d:%.4f "
+                                 "%d:%.4f] nvis %lld",
+                                 l, m_ctx, m_blk, peak, spread, t0, w0, t1,
+                                 w1, t2, w2, static_cast<long long>(n_keys));
+                    std::fputc(10, stderr);
+                }
+                // Magnitude-vs-alignment discriminator: if one key row has a
+                // wildly different norm the one-hot is a magnitude artifact
+                // (a skipped norm), not learned routing. qk_norm holds both
+                // sides at rms ~1 per head, so every number here should be
+                // O(1); a row at 10+ names the skipped norm.
+                {
+                    f64 qn = 0.0;
+                    for (size_t i = 0; i < qrow.size(); i++)
+                        qn += static_cast<f64>(qrow[i]) * qrow[i];
+                    qn = std::sqrt(qn / static_cast<f64>(qrow.size()));
+                    auto k_rms = [&](i64 j) -> f64 {
+                        if (j < 0 || j >= n_keys) return -1.0;
+                        be_->download_f32(tmp_host_.data(),
+                                          act_at(kcache_, as, static_cast<i64>(d.layer) * d.layer_stride + j * d.pos_stride),
+                                          kv_dim);
+                        f64 s = 0.0;
+                        for (i64 i = 0; i < kv_dim; i++)
+                            s += static_cast<f64>(tmp_host_[static_cast<size_t>(i)]) * tmp_host_[static_cast<size_t>(i)];
+                        return std::sqrt(s / static_cast<f64>(kv_dim));
+                    };
+                    const f64 k0 = k_rms(0);
+                    const f64 kl = k_rms(committed_ - 1);
+                    const f64 kb = k_rms(static_cast<i64>(blk_pos));
+                    // V is never normed: a pathological token-0 V row would
+                    // dominate the attention output no matter what the
+                    // weights do, so its norm is the other half of the
+                    // magnitude question (same layout as K).
+                    auto v_rms = [&](i64 j) -> f64 {
+                        if (j < 0 || j >= n_keys) return -1.0;
+                        be_->download_f32(tmp_host_.data(),
+                                          act_at(vcache_, as, static_cast<i64>(d.layer) * d.layer_stride + j * d.pos_stride),
+                                          kv_dim);
+                        f64 s = 0.0;
+                        for (i64 i = 0; i < kv_dim; i++)
+                            s += static_cast<f64>(tmp_host_[static_cast<size_t>(i)]) * tmp_host_[static_cast<size_t>(i)];
+                        return std::sqrt(s / static_cast<f64>(kv_dim));
+                    };
+                    const f64 v0 = v_rms(0);
+                    const f64 vl = v_rms(committed_ - 1);
+                    const f64 vb = v_rms(static_cast<i64>(blk_pos));
+                    std::fprintf(stderr,
+                                 "[dfkv] l=%d norms: q1 %.4f k0 %.4f k_lastctx "
+                                 "%.4f k_blk0 %.4f v0 %.4f vlast %.4f vblk %.4f",
+                                 l, qn, k0, kl, kb, v0, vl, vb);
+                    std::fputc(10, stderr);
+                    // Token-distinctness of the injected keys: if every
+                    // context K row is the same vector the injection carries
+                    // no token information at all (capture/append stride
+                    // collapse) and no routing can recover the answer.
+                    // Distinct rms-1 rows sit at ~1.41 apart.
+                    {
+                        const i64 layer_base = static_cast<i64>(d.layer) *
+                                               d.layer_stride;
+                        std::vector<f32> k0b(static_cast<size_t>(kv_dim));
+                        be_->download_f32(k0b.data(),
+                                          act_at(kcache_, as, layer_base),
+                                          kv_dim);
+                        be_->download_f32(tmp_host_.data(),
+                                          act_at(kcache_, as, layer_base +
+                                                              d.pos_stride),
+                                          kv_dim);
+                        f64 kd = 0.0;
+                        for (i64 i = 0; i < kv_dim; i++) {
+                            const f64 df =
+                                static_cast<f64>(k0b[static_cast<size_t>(i)]) -
+                                tmp_host_[static_cast<size_t>(i)];
+                            kd += df * df;
+                        }
+                        kd = std::sqrt(kd / static_cast<f64>(kv_dim));
+                        std::fprintf(stderr, "[dfkv] l=%d kdist01 %.4f",
+                                     l, kd);
+                        std::fputc(10, stderr);
+                    }
+                }
+            }
         }
 
-        if (cfg_.attn_gate && L.wattn_gate.present()) {
+        // KRK_DFLASH_GATE=0 neutralizes the softplus output gate (treats it
+        // as 1): if the gate path is the poison, the rows must move toward
+        // the target when it is off.
+        const bool gate_on = std::getenv("KRK_DFLASH_GATE") == nullptr ||
+                             std::getenv("KRK_DFLASH_GATE")[0] != '0';
+        if (gate_on && cfg_.attn_gate && L.wattn_gate.present()) {
             // Softplus output gate off the same hidden state q/k/v read -- the
             // laguna drafter's own gate, per-head or per-element by width.
             const i64 g_out = static_cast<i64>(L.wattn_gate.n_out);
@@ -891,12 +1227,57 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
                 be_->mul_head_broadcast(ws_attn_, ws_agate_, nt, nh, hd);
             else
                 be_->mul_act(ws_attn_, ws_agate_, static_cast<i64>(nt) * q_dim);
+            // Gate audit: a squashed gate (mean << 0.69) chokes the attention
+            // path no matter how well it routes, leaving the row dominated
+            // by the residual stream -- the attractor pattern. softplus(0) =
+            // 0.69 is the neutral point.
+            if (dfdbg_kv) {
+                be_->download_f32(tmp_host_.data(), ws_agate_,
+                                  static_cast<i64>(nt) * g_out);
+                // Per-row means: row 0 is id_last, rows 1+ are the masks.
+                // A squashed mask-row gate (<< 0.69) chokes exactly the
+                // candidate rows' attention path however well it routes.
+                std::fprintf(stderr, "[dfkv] l=%d gate rows:", l);
+                for (i32 r = 0; r < nt; r++) {
+                    f64 gs = 0.0;
+                    for (i64 i = 0; i < g_out; i++)
+                        gs += tmp_host_[static_cast<size_t>(r) * g_out + i];
+                    std::fprintf(stderr, " r%d=%.4f", r,
+                                 gs / static_cast<f64>(g_out));
+                }
+                std::fputc(10, stderr);
+            }
         }
         be_->gemm(ws_x2_, ws_attn_, L.wo.data, L.wo.type, E, q_dim, nt);
         be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(nt) * E);
 
+        // KRK_DFLASH_RES_TRACE must read the attention sublayer's contribution
+        // BEFORE the FFN overwrites ws_x2_, so it is captured into rpeak-bound
+        // arm locals here and printed after the FFN below.
+        static const bool res_trace =
+            std::getenv("KRK_DFLASH_RES_TRACE") != nullptr;
+        f64 trace_attn_rms = 0.0;
+        f32 trace_x_peak = 0.0f;
+        if (res_trace) {
+            const i64 r1 = E;   // row 1 = the first candidate row
+            be_->download_f32(tmp_host_.data(), act_at(ws_x2_, as, r1), E);
+            f64 s = 0.0;
+            f32 pk = 0.0f;
+            for (i64 i = 0; i < E; i++) {
+                s += static_cast<f64>(tmp_host_[static_cast<size_t>(i)]) *
+                     tmp_host_[static_cast<size_t>(i)];
+                pk = std::max(pk, std::fabs(tmp_host_[static_cast<size_t>(i)]));
+            }
+            trace_attn_rms = std::sqrt(s / static_cast<f64>(E));
+            trace_x_peak = pk;   // |x|.max of the residual BEFORE the FFN's own delta
+        }
+
         be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, nt, E, cfg_.rms_eps);
-        if (L.wgate.type == L.wup.type) {
+        // KRK_DFLASH_FFN_GROUP=0 forces separate gate/up projections, the
+        // same unverified-fusion question as the QKV group above.
+        const bool ffn_group = std::getenv("KRK_DFLASH_FFN_GROUP") == nullptr ||
+                               std::getenv("KRK_DFLASH_FFN_GROUP")[0] != '0';
+        if (ffn_group && L.wgate.type == L.wup.type) {
             void *gu[2] = {ws_gate_, ws_up_};
             const void *wgu[2] = {L.wgate.data, L.wup.data};
             const i64 ngu[2] = {cfg_.n_ff, cfg_.n_ff};
@@ -908,6 +1289,33 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
         be_->silu_mul(ws_gate_, ws_gate_, ws_up_, static_cast<i64>(nt) * cfg_.n_ff);
         be_->gemm(ws_x2_, ws_gate_, L.wdown.data, L.wdown.type, E, cfg_.n_ff, nt);
         be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(nt) * E);
+
+        // Same row, three numbers: the residual's own scale (carried intact to
+        // the next layer), the attention sublayer's contribution, and the FFN's.
+        // Together they say WHERE the residual leaves the scale a real
+        // transformer keeps: a loss that grows layer by layer is owned by the
+        // sublayer whose contribution is the size of the residual itself.
+        if (res_trace) {
+            const i64 r1 = E;
+            const auto rms_of = [&](void *buf) {
+                be_->download_f32(tmp_host_.data(), act_at(buf, as, r1), E);
+                f64 s = 0.0;
+                for (i64 i = 0; i < E; i++)
+                    s += static_cast<f64>(tmp_host_[static_cast<size_t>(i)]) *
+                         tmp_host_[static_cast<size_t>(i)];
+                return std::sqrt(s / static_cast<f64>(E));
+            };
+            std::fprintf(stderr,
+                         "[dfres] l=%d row1 |x|.max %.6g x.rms %.6g "
+                         "attn.d.rms %.6g ffn.d.rms %.6g\n",
+                         l, static_cast<f64>(trace_x_peak), rms_of(ws_x_),
+                         trace_attn_rms, rms_of(ws_x2_));
+        }
+        {
+            char stage[16];
+            std::snprintf(stage, sizeof(stage), "post-l%d", l);
+            probe_row(stage, l);
+        }
     }
 
     // Mask rows only: row 0 carries id_last, whose token is already known, so
