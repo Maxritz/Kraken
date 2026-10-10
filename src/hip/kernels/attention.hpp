@@ -869,6 +869,8 @@ __global__ void __launch_bounds__(kAttnDecThreads)
                              _Float16 *__restrict__ vcache,
                              const _Float16 *__restrict__ k,
                              const _Float16 *__restrict__ v,
+                             const f32 *__restrict__ wq,
+                             const f32 *__restrict__ wk, f32 eps, bool neox,
                              i64 n_head, i64 n_kv, i64 hd,
                              const i64 *__restrict__ pos0,
                              i64 pos_stride, const f32 *__restrict__ inv_freq,
@@ -879,8 +881,9 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     const i64 p0 = *pos0;
     const i64 n_keys = p0 + 1; // decode: causal and non-causal agree
 
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
     const i64 half = hd / 2;
     const i64 rot = static_cast<i64>(static_cast<f32>(half) * frac);
     // rope_scale divides the position (LLaMA-style RoPE scaling):
@@ -888,6 +891,62 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     // computes it, so the chain is bit-exact for every model.
     const f32 pf =
         static_cast<f32>(p0) / (rope_scale > 0.0f ? rope_scale : 1.0f);
+
+    // (0) QK-norm scales, bit-identical to head_norm_kernel<128>: threads
+    // 0..hd-1 contribute one element's square in channel order, the reduce
+    // is the same block_reduce_sum<128> the separate kernel calls (from
+    // this 256-thread block wave 0's window is red[0..3], which is exactly
+    // that tree), and thread 0 computes the same rsqrtf(ss/hd + eps). The
+    // normed operands are formed in the loads below with the same f32
+    // expression the separate kernel stores f16 with, so the rotation sees
+    // the same f16 values the separate chain feeds it.
+    __shared__ f32 qscale, kscale;
+    __shared__ f32 qred[4], kred[4];
+    const auto nv = [](_Float16 x, f32 s, f32 wi) -> _Float16 {
+        return static_cast<_Float16>(static_cast<f32>(x) * s * wi);
+    };
+    // block_reduce_sum<128> cannot be called from this 256-thread block:
+    // its red[wave] write would run to red[4..7] and smash `total` (an
+    // out-of-bounds shared write that showed up as a wrong md5, not a
+    // crash). The tree is reproduced by hand instead, in the same order the
+    // separate kernel's reduce walks: per-wave lane reduce, red[] in wave
+    // order, wave 0's window over red[0..3] with exact zeros after -- so
+    // the total, and therefore the f16-rounded normed values, are
+    // bit-identical to head_norm_kernel<128>.
+    if (wq) {
+        f32 v = 0.0f;
+        if (tid < hd) {
+            const f32 x = static_cast<f32>(q[h * hd + tid]);
+            v = x * x;
+        }
+        v = d_wave_reduce_sum(v);
+        if (lane == 0 && warp < 4) qred[warp] = v;
+        __syncthreads();
+        if (warp == 0) {
+            const f32 t = lane < 4 ? qred[lane] : 0.0f;
+            const f32 tot = d_wave_reduce_sum(t);
+            if (lane == 0)
+                qscale = rsqrtf(tot / static_cast<f32>(hd) + eps);
+        }
+        __syncthreads();
+    }
+    if (wk) {
+        f32 v = 0.0f;
+        if (tid < hd) {
+            const f32 x = static_cast<f32>(k[hkv * hd + tid]);
+            v = x * x;
+        }
+        v = d_wave_reduce_sum(v);
+        if (lane == 0 && warp < 4) kred[warp] = v;
+        __syncthreads();
+        if (warp == 0) {
+            const f32 t = lane < 4 ? kred[lane] : 0.0f;
+            const f32 tot = d_wave_reduce_sum(t);
+            if (lane == 0)
+                kscale = rsqrtf(tot / static_cast<f32>(hd) + eps);
+        }
+        __syncthreads();
+    }
 
     // (1) RoPE on q, in registers. Lane L owns head elements
     // [L*VPT, (L+1)*VPT), i.e. VPT/2 consecutive rotation pairs
@@ -897,46 +956,130 @@ __global__ void __launch_bounds__(kAttnDecThreads)
         _Float16 h[2];
     };
     u32 qp[VPT / 2];
+    if (!neox) {
 #pragma unroll
-    for (int e = 0; e < VPT / 2; e++) {
-        Pair p;
-        p.u = *reinterpret_cast<const u32 *>(
-            q + h * hd + lane * VPT + 2 * e);
-        const i64 pr = static_cast<i64>(lane) * (VPT / 2) + e;
-        if (pr < rot) {
-            const f32 theta = pf * inv_freq[pr];
-            f32 sn, cs;
-            __sincosf(theta, &sn, &cs);
-            const f32 a = static_cast<f32>(p.h[0]);
-            const f32 b = static_cast<f32>(p.h[1]);
-            p.h[0] = static_cast<_Float16>(a * cs - b * sn);
-            p.h[1] = static_cast<_Float16>(a * sn + b * cs);
+        for (int e = 0; e < VPT / 2; e++) {
+            f32 a, b;
+            if (wq) {
+                const i64 ja = static_cast<i64>(lane) * VPT + 2 * e;
+                a = static_cast<f32>(nv(q[h * hd + ja], qscale, wq[ja]));
+                b = static_cast<f32>(
+                    nv(q[h * hd + ja + 1], qscale, wq[ja + 1]));
+            } else {
+                Pair p;
+                p.u = *reinterpret_cast<const u32 *>(
+                    q + h * hd + lane * VPT + 2 * e);
+                a = static_cast<f32>(p.h[0]);
+                b = static_cast<f32>(p.h[1]);
+            }
+            const i64 pr = static_cast<i64>(lane) * (VPT / 2) + e;
+            if (pr < rot) {
+                const f32 theta = pf * inv_freq[pr];
+                f32 sn, cs;
+                __sincosf(theta, &sn, &cs);
+                const f32 ra = a * cs - b * sn;
+                const f32 rb = a * sn + b * cs;
+                a = ra;
+                b = rb;
+            }
+            Pair o;
+            o.h[0] = static_cast<_Float16>(a);
+            o.h[1] = static_cast<_Float16>(b);
+            qp[e] = o.u;
         }
-        qp[e] = p.u;
+    } else {
+        // NeoX pairing: channel j rotates with j + rot (rope_kernel's neox
+        // arm, ia = i / ib = i + rot). The engine takes this arm only when
+        // rot == half, where the partner of j is j ^ half and sits in the
+        // same element slot of the lane half/VPT = 16 away, so one wave
+        // shuffle fetches it; pair index pj names the theta for both
+        // halves, exactly as the separate kernel indexes inv_freq.
+        const int poff = static_cast<int>(half / VPT);
+        _Float16 xv[VPT];
+#pragma unroll
+        for (int e = 0; e < VPT; e++) {
+            const i64 j = static_cast<i64>(lane) * VPT + e;
+            f32 x;
+            if (wq)
+                x = static_cast<f32>(nv(q[h * hd + j], qscale, wq[j]));
+            else
+                x = static_cast<f32>(q[h * hd + j]);
+            const f32 y = __shfl_xor(x, poff);
+            const i64 pj = j < half ? j : j - half;
+            f32 o = x;
+            if (pj < rot) {
+                const f32 theta = pf * inv_freq[pj];
+                f32 sn, cs;
+                __sincosf(theta, &sn, &cs);
+                o = j < half ? x * cs - y * sn : y * sn + x * cs;
+            }
+            xv[e] = static_cast<_Float16>(o);
+        }
+#pragma unroll
+        for (int e = 0; e < VPT / 2; e++) {
+            Pair o;
+            o.h[0] = xv[2 * e];
+            o.h[1] = xv[2 * e + 1];
+            qp[e] = o.u;
+        }
     }
 
-    // (2) rope k into the cache and copy v beside it. One thread per
-    // rotation pair (a pair is the unit rope touches); v is a plain
+    // (2) QK-norm + rope k into the cache and copy v beside it. One thread
+    // per rotation pair (a pair is the unit rope touches); v is a plain
     // elementwise copy. Only the first hd/2 / hd threads of the block
-    // have work; the rest idle through this phase.
+    // have work; the rest idle through this phase. The cache row keeps
+    // channel order under both pairings, so the append writes exactly
+    // where kv_append_kernel would have.
     const i64 koff = p0 * pos_stride + hkv * hd;
-    for (i64 i = threadIdx.x; i < half; i += blockDim.x) {
-        Pair p;
-        p.h[0] = k[hkv * hd + 2 * i];
-        p.h[1] = k[hkv * hd + 2 * i + 1];
-        if (i < rot) {
-            const f32 theta = pf * inv_freq[i];
-            f32 sn, cs;
-            __sincosf(theta, &sn, &cs);
-            const f32 a = static_cast<f32>(p.h[0]);
-            const f32 b = static_cast<f32>(p.h[1]);
-            p.h[0] = static_cast<_Float16>(a * cs - b * sn);
-            p.h[1] = static_cast<_Float16>(a * sn + b * cs);
+    if (!neox) {
+        for (i64 i = tid; i < half; i += blockDim.x) {
+            f32 a, b;
+            if (wk) {
+                a = static_cast<f32>(
+                    nv(k[hkv * hd + 2 * i], kscale, wk[2 * i]));
+                b = static_cast<f32>(
+                    nv(k[hkv * hd + 2 * i + 1], kscale, wk[2 * i + 1]));
+            } else {
+                a = static_cast<f32>(k[hkv * hd + 2 * i]);
+                b = static_cast<f32>(k[hkv * hd + 2 * i + 1]);
+            }
+            if (i < rot) {
+                const f32 theta = pf * inv_freq[i];
+                f32 sn, cs;
+                __sincosf(theta, &sn, &cs);
+                const f32 ra = a * cs - b * sn;
+                const f32 rb = a * sn + b * cs;
+                a = ra;
+                b = rb;
+            }
+            kcache[koff + 2 * i] = static_cast<_Float16>(a);
+            kcache[koff + 2 * i + 1] = static_cast<_Float16>(b);
         }
-        kcache[koff + 2 * i] = p.h[0];
-        kcache[koff + 2 * i + 1] = p.h[1];
+    } else {
+        for (i64 i = tid; i < half; i += blockDim.x) {
+            const i64 ia = i, ib = i + half;
+            f32 a, b;
+            if (wk) {
+                a = static_cast<f32>(nv(k[hkv * hd + ia], kscale, wk[ia]));
+                b = static_cast<f32>(nv(k[hkv * hd + ib], kscale, wk[ib]));
+            } else {
+                a = static_cast<f32>(k[hkv * hd + ia]);
+                b = static_cast<f32>(k[hkv * hd + ib]);
+            }
+            if (i < rot) {
+                const f32 theta = pf * inv_freq[i];
+                f32 sn, cs;
+                __sincosf(theta, &sn, &cs);
+                const f32 ra = a * cs - b * sn;
+                const f32 rb = a * sn + b * cs;
+                a = ra;
+                b = rb;
+            }
+            kcache[koff + ia] = static_cast<_Float16>(a);
+            kcache[koff + ib] = static_cast<_Float16>(b);
+        }
     }
-    for (i64 i = threadIdx.x; i < hd; i += blockDim.x)
+    for (i64 i = tid; i < hd; i += blockDim.x)
         vcache[koff + i] = v[hkv * hd + i];
     __syncthreads();
 
@@ -1008,7 +1151,8 @@ template <int VPT>
 inline void attn_fused_decode_launch(void *out, const void *q,
                                      void *kcache, void *vcache,
                                      const void *k, const void *v,
-                                     i64 n_head, i64 n_kv, i64 hd,
+                                     const f32 *wq, const f32 *wk, f32 eps,
+                                     bool neox, i64 n_head, i64 n_kv, i64 hd,
                                      const i64 *pos0, i64 pos_stride,
                                      const f32 *inv_freq, f32 rope_scale,
                                      f32 scale, f32 frac,
@@ -1018,31 +1162,29 @@ inline void attn_fused_decode_launch(void *out, const void *q,
         static_cast<_Float16 *>(out), static_cast<const _Float16 *>(q),
         static_cast<_Float16 *>(kcache), static_cast<_Float16 *>(vcache),
         static_cast<const _Float16 *>(k), static_cast<const _Float16 *>(v),
-        n_head, n_kv, hd, pos0, pos_stride, inv_freq, rope_scale, scale,
-        frac);
+        wq, wk, eps, neox, n_head, n_kv, hd, pos0, pos_stride, inv_freq,
+        rope_scale, scale, frac);
 }
 
 // Head widths the packed lane slice covers (same rule as the decode
 // attention path).
 inline bool attn_fused_decode_supported(i64 hd) {
     return hd == 64 || hd == 128;
-}
-
-inline void attn_fused_decode(void *out, const void *q, void *kcache,
+}inline void attn_fused_decode(void *out, const void *q, void *kcache,
                               void *vcache, const void *k, const void *v,
+                              const f32 *wq, const f32 *wk, f32 eps, bool neox,
                               i64 n_head, i64 n_kv, i64 hd,
                               const i64 *pos0, i64 pos_stride,
-                              const f32 *inv_freq, f32 rope_scale,
-                              f32 scale, f32 frac,
-                              hipStream_t stream = nullptr) {
+                              const f32 *inv_freq, f32 rope_scale, f32 scale,
+                              f32 frac, hipStream_t stream = nullptr) {
     if (hd == 64)
-        attn_fused_decode_launch<2>(out, q, kcache, vcache, k, v, n_head,
-                                     n_kv, hd, pos0, pos_stride, inv_freq,
-                                     rope_scale, scale, frac, stream);
+        attn_fused_decode_launch<2>(out, q, kcache, vcache, k, v, wq, wk, eps,
+                                    neox, n_head, n_kv, hd, pos0, pos_stride,
+                                    inv_freq, rope_scale, scale, frac, stream);
     else if (hd == 128)
-        attn_fused_decode_launch<4>(out, q, kcache, vcache, k, v, n_head,
-                                     n_kv, hd, pos0, pos_stride, inv_freq,
-                                     rope_scale, scale, frac, stream);
+        attn_fused_decode_launch<4>(out, q, kcache, vcache, k, v, wq, wk, eps,
+                                    neox, n_head, n_kv, hd, pos0, pos_stride,
+                                    inv_freq, rope_scale, scale, frac, stream);
 }
 
 } // namespace krk

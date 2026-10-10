@@ -1854,19 +1854,36 @@ public:
     bool attn_fused_chain(void *out, void *q, void *kcache, void *vcache,
                             const void *k, const void *v, const AttnDesc &d,
                             const f32 *inv_freq, f32 rope_scale,
-                            f32 rope_frac) override {
+                            f32 rope_frac, const f32 *wq, const f32 *wk,
+                            f32 eps, bool wide, bool neox) override {
         KRK_TIME_OP("attn_fused");
         // The fused kernel expresses the single-query-token decode row
         // only, and only the head widths its packed lane slice covers
-        // (the same rule as the decode attention path above). Anything
-        // else keeps the separate rope() + kv_append() + attention()
-        // chain the engine runs as the fallback. The kernel rotates
-        // adjacent channel pairs, which is the llama-family layout, so a
-        // NeoX-pairing model (ModelConfig::rope_neox) stays on that
-        // fallback until the packed lane slice can express the pair.
+        // (the same rule as the decode attention path above). It now
+        // carries the per-head QK-norm between the projections and the
+        // rotation (bit-identical to head_norm_kernel), and both rope
+        // pairings -- adjacent channels and the NeoX half-split -- so the
+        // Qwen3-family shapes that used to keep the separate chain take
+        // it too. Anything else keeps the separate rope() + kv_append() +
+        // attention() chain the engine runs as the fallback.
         if (d.n_tok != 1 || !attn_fused_decode_supported(d.hd) ||
             !attn_fused_ || d.window > 0)
             return false;
+        // OLMoE's whole-row qk-norm reduces across head boundaries; the
+        // fused norm is per head, so that shape stays on the fallback.
+        if ((wq || wk) && wide)
+            return false;
+        // The NeoX arm fetches each rotated partner from the lane half/VPT
+        // away, which is the half-split pairing at rot == half. Partial
+        // rope puts the partner elsewhere, so that shape stays on the
+        // fallback (rope_kernel's neox arm pairs i with i + rot).
+        if (neox) {
+            const i64 half = d.hd / 2;
+            const i64 rot =
+                static_cast<i64>(static_cast<f32>(half) * rope_frac);
+            if (rot != half)
+                return false;
+        }
         const f32 *fd = stage_freq(inv_freq, d.hd);
         stage_pos(d.pos0);
         attn_fused_decode(out, q,
@@ -1874,8 +1891,8 @@ public:
                               d.layer * d.layer_stride,
                           static_cast<_Float16 *>(vcache) +
                               d.layer * d.layer_stride,
-                          k, v, d.n_head, d.n_kv, d.hd, pos_dev_,
-                          d.pos_stride, fd, rope_scale, d.scale,
+                          k, v, wq, wk, eps, neox, d.n_head, d.n_kv, d.hd,
+                          pos_dev_, d.pos_stride, fd, rope_scale, d.scale,
                           rope_frac);
         return true;
     }

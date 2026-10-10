@@ -406,14 +406,23 @@ public:
     // (multi-token rows, head widths the packed lane slice cannot
     // cover, a NeoX rope pairing) falls back to the separate rope() +
     // kv_append() + attention() calls the engine then runs instead.
+    // `wq`/`wk` (nullable, device-side, per-head width) and `eps` carry the
+    // QK-norm the chain folds between the projections and the rotation;
+    // `wide` names OLMoE's whole-row convention, which the chain refuses,
+    // and `neox` selects the half-split rope pairing (refused when the rope
+    // fraction makes it partial). A backend that implements none of this
+    // returns false and the engine runs the separate chain.
     virtual bool attn_fused_chain(void *out, void *q, void *kcache,
                                     void *vcache, const void *k,
                                     const void *v, const AttnDesc &d,
                                     const f32 *inv_freq,
-                                    f32 rope_scale, f32 rope_frac) {
+                                    f32 rope_scale, f32 rope_frac,
+                                    const f32 *wq, const f32 *wk, f32 eps,
+                                    bool wide, bool neox) {
         (void)out; (void)q; (void)kcache; (void)vcache; (void)k;
         (void)v; (void)d; (void)inv_freq; (void)rope_scale;
-        (void)rope_frac;
+        (void)rope_frac; (void)wq; (void)wk; (void)eps; (void)wide;
+        (void)neox;
         return false;
     }
 

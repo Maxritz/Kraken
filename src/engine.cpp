@@ -1107,13 +1107,6 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, lkv, n);
         if (L.v_bias) be_->add_bias_rows(ws_v_, L.v_bias, lkv, n);
 
-        // qk_norm_wide is OLMoE's whole-row convention; false is the per-head
-        // one Qwen3 and Gemma3 use. Decided once at load from the stored
-        // weight width -- see ModelConfig::qk_norm_wide.
-        if (mc.qk_norm)
-            be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, lh, lkvh,
-                         mc.head_dim, n, mc.rms_eps, mc.qk_norm_wide);
-
         d.layer = l;
         // Resolve this layer's residency before it is read or written.
         //
@@ -1142,21 +1135,47 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // row (kernels/attention.hpp, attn_fused_decode): the kernel
         // ropes q in registers and k straight into its cache slot, so
         // the k/v rows never round-trip through global memory between
-        // three launches. Gated on what the fused kernel cannot
-        // express: qk_norm (which must run between the projections
-        // and the rotation), multi-token rows (prefill), a packed
-        // output gate (which must multiply the result afterwards), a
-        // sliding window (the fused kernel has no bound) and a NeoX rope
-        // pairing (the fused kernel rotates adjacent channels only, and the
-        // two conventions rotate different channels, so it would silently
-        // disagree with the CPU reference and with the fallback below).
+        // three launches. The chain now also carries the per-head QK-norm
+        // (bit-identical to head_norm_kernel) and both rope pairings, so
+        // the Qwen3-family shapes that used to keep the separate chain
+        // take it too. What the engine still gates here: multi-token rows
+        // (prefill), a packed output gate (which must multiply the result
+        // afterwards), a sliding window (the fused kernel has no bound)
+        // and a separate attention gate. Whole-row qk-norm (OLMoE) and
+        // partial-rope NeoX the BACKEND refuses, one call deeper.
         // Unsupported backends and shapes keep the separate chain.
-        if (!(n == 1 && !mc.qk_norm && !packed_gate && d.window == 0 &&
-              !mc.attn_gate && !mc.rope_neox &&
+        // The QK-norm folds into the chain only for the ADJACENT rope
+        // pairing: Qwen3.5-0.8B (qk_norm + adjacent) is md5-identical
+        // fused vs separate (08afb598d17b0, both arms), but
+        // Qwen3-8B (qk_norm + NeoX, freq_base 1e6) is not -- KRK_DUMP
+        // localizes the first difference to one head of one layer's
+        // attention output at 1-6 f16 ULP, with the appended KV cache
+        // row (dump row attn.kc) proven bit-identical, so the gap is
+        // inside the fused NeoX q arm and is an open item, not a
+        // licence to diverge. NeoX shapes keep the separate chain.
+        if (!(n == 1 && !packed_gate && d.window == 0 && !mc.attn_gate &&
+              !(mc.rope_neox && mc.qk_norm) &&
               be_->attn_fused_chain(ws_attn_, ws_q_, kbase, vbase,
                                       ws_k_, ws_v_, d,
                                       model_.inv_freq_at(l).data(),
-                                      mc.rope_scale, model_.rope_frac_at(l)))) {
+                                      mc.rope_scale, model_.rope_frac_at(l),
+                                      mc.qk_norm ? L.q_norm : nullptr,
+                                      mc.qk_norm ? L.k_norm : nullptr,
+                                      mc.rms_eps, mc.qk_norm_wide,
+                                      mc.rope_neox))) {
+            // The fused chain carries the QK-norm itself; the separate
+            // chain runs it here, before rope, exactly as before. Running
+            // it unconditionally would norm twice on the fused arm -- a
+            // wrong-answer bug the md5 A/B caught, not a crash.
+            // qk_norm_wide is OLMoE's whole-row convention; false is the
+            // per-head one Qwen3 and Gemma3 use.
+            if (mc.qk_norm)
+                be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, lh, lkvh,
+                             mc.head_dim, n, mc.rms_eps, mc.qk_norm_wide);
+            // Post-norm, pre-rope: the row the rotation consumes. The
+            // fused arm's copy of it lives in registers and never lands
+            // in this buffer, so this row covers the separate chain only.
+            dump_row("attn.qk", l, ws_q_, lq, n);
             be_->rope(ws_q_, ws_k_, lh, lkvh, mc.head_dim,
                       n, pos0, model_.inv_freq_at(l).data(), mc.rope_scale,
                       model_.rope_frac_at(l), mc.rope_neox);
@@ -1180,6 +1199,14 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // same all-NaN attn.out, and this tells them apart.
         dump_row("attn.v", l, ws_v_, lkv, n);
         dump_row("attn.out", l, ws_attn_, lq, n);
+        // The cache row this step appended: the one input to the
+        // attention that no activation buffer covers, and the row a
+        // fused chain writes from inside its own kernel. Width is the
+        // whole KV row (n_kv heads), rows = 1 at this step's position.
+        dump_row("attn.kc", l,
+                 static_cast<const u8 *>(kbase) +
+                     pos0 * d.pos_stride * be_->act_size(),
+                 lkv, 1);
 
         // laguna's output gate: a separate [n_head] projection of the same
         // attention-norm output q/k/v read, softplus'd, and applied as one
