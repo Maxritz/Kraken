@@ -438,9 +438,17 @@ the same mismatch: a greedy measurement read against a sampling claim.
    full-block verifier's (kraken never scores positions 1..d-1 of a
    pre-check miss). Text is bit-identical with the accounting on (stdout
    md5 `7f0c8046fb93` before and after); `KRK_SPEC_SAMPLED_ACC=0` restores
-   the device-argmax fast path. The follow-on -- an actual
-   rejection-sampling *verify* (sampled proposals, resample-on-reject) for
-   temp>0 runs, which today bypass the draft entirely -- is the next step.
+   the device-argmax fast path. The follow-on landed the same day:
+   `KRK_SPEC_RS=1` is the actual rejection-sampling *verify* -- proposals
+   sampled through the run's sampler chain, each accepted by min(1, p/q)
+   against the target's row of the same position, resampled on rejection
+   from the corrected distribution (p-q)+ -- so temp>0 runs keep using
+   `--draft` instead of bypassing it and the emitted stream stays
+   distributed as the target alone would produce it. Measured on the
+   matched pair at `--temp 0.8`: 14/72 = 19.4% accepted (against 12.5%
+   greedy at temp 0), 18 rounds, fluent text, one `[dflash] rs round
+   pos=.. a=.. rej=.. rtoken=..` line per round; the greedy arm is
+   bit-identical through the change (stdout md5 `7f0c8046fb93`).
 2. **DFlash2 (z-lab) heads on the models this box runs.** The official
    collection covers Qwen3.8-27B and the Qwen3.5/3.6 MoE families — all
    loadable here — so a `--draft` run against a DFlash2 head is the

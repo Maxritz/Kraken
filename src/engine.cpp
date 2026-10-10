@@ -2670,6 +2670,138 @@ static bool sampled_acc_on() {
     return v;
 }
 
+// KRK_SPEC_RS=1 turns on rejection-sampling verification for temperature>0
+// runs: proposals are SAMPLED from the draft's rows through the run's sampler
+// chain, each is accepted with min(1, p/q) against the target's row of the
+// same position, and a rejection resamples that position from the corrected
+// distribution (p-q)+ -- the exact speculative-sampling algorithm, so the
+// emitted stream stays distributed as the target alone would produce it.
+// Default off: every existing arm and every test is greedy, whose argmax-match
+// rule is this algorithm's temp-0 specialization. The repetition penalty is
+// not part of the verify math on either side (it is a decode-time heuristic,
+// not a distribution).
+static bool spec_rs_on() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_SPEC_RS");
+        return e && e[0] != '\0' && e[0] != '0';
+    }();
+    return v;
+}
+
+// The sampler's filtered distribution over one row, mirroring
+// Sampler::sample's chain (temperature, top-k, top-p, min-p, renormalized),
+// sorted by probability and ready for a CDF draw.
+static void sampler_support(const f32 *logits, const SampleParams &sp,
+                            i32 n_vocab, std::vector<i32> &ids,
+                            std::vector<f64> &ps) {
+    ids.clear();
+    ps.clear();
+    if (n_vocab <= 0) return;
+    if (sp.greedy || sp.temp <= 0.0f) {
+        i32 best = 0;
+        for (i32 i = 1; i < n_vocab; i++)
+            if (logits[i] > logits[best]) best = i;
+        ids.push_back(best);
+        ps.push_back(1.0);
+        return;
+    }
+    thread_local std::vector<i32> idx;
+    idx.resize(static_cast<size_t>(n_vocab));
+    for (i32 i = 0; i < n_vocab; i++) idx[static_cast<size_t>(i)] = i;
+    i32 keep = n_vocab;
+    if (sp.top_k > 0 && sp.top_k < keep) keep = sp.top_k;
+    const auto better = [&logits](i32 a, i32 b) { return logits[a] > logits[b]; };
+    if (keep < n_vocab)
+        std::partial_sort(idx.begin(), idx.begin() + keep, idx.end(), better);
+    else
+        std::sort(idx.begin(), idx.end(), better);
+    const f32 inv_temp = 1.0f / sp.temp;
+    const f32 mx = logits[static_cast<size_t>(idx[0])];
+    f32 sum = 0;
+    ps.resize(static_cast<size_t>(keep));
+    for (i32 i = 0; i < keep; i++) {
+        const f32 e = std::exp(
+            (logits[static_cast<size_t>(idx[static_cast<size_t>(i)])] - mx) *
+            inv_temp);
+        ps[static_cast<size_t>(i)] = static_cast<f64>(e);
+        sum += e;
+    }
+    if (sum <= 0) {
+        ps.assign(static_cast<size_t>(keep), 1.0 / keep);
+    } else {
+        for (auto &q : ps) q /= sum;
+    }
+    ids.resize(static_cast<size_t>(keep));
+    for (i32 i = 0; i < keep; i++)
+        ids[static_cast<size_t>(i)] = idx[static_cast<size_t>(i)];
+    i32 cut = keep;
+    if (sp.top_p < 1.0f && sp.top_p > 0.0f) {
+        f64 c = 0;
+        for (i32 i = 0; i < keep; i++) {
+            c += ps[static_cast<size_t>(i)];
+            if (c >= sp.top_p) { cut = i + 1; break; }
+        }
+    }
+    if (sp.min_p > 0.0f) {
+        const f64 thr = static_cast<f64>(sp.min_p) * ps[0];
+        i32 c = 0;
+        while (c < cut && ps[static_cast<size_t>(c)] >= thr) c++;
+        if (c > 0) cut = c;
+    }
+    ids.resize(static_cast<size_t>(cut));
+    ps.resize(static_cast<size_t>(cut));
+    f64 z = 0;
+    for (auto q : ps) z += q;
+    if (z > 0)
+        for (auto &q : ps) q /= z;
+}
+
+// The probability a sampler-filtered support assigns one token.
+static f64 support_prob(const std::vector<i32> &ids, const std::vector<f64> &ps,
+                        i32 token) {
+    for (size_t i = 0; i < ids.size(); i++)
+        if (ids[i] == token) return ps[i];
+    return 0.0;
+}
+
+// A draw from a filtered support (inverse-CDF).
+static i32 support_draw(const std::vector<i32> &ids,
+                        const std::vector<f64> &ps, Rng &rng) {
+    if (ids.empty()) return 0;
+    const f64 u = static_cast<f64>(rng.next_f32());
+    f64 c = 0;
+    for (size_t i = 0; i < ids.size(); i++) {
+        c += ps[i];
+        if (u <= c) return ids[i];
+    }
+    return ids.back();
+}
+
+// A draw from the corrected distribution max(0, p - q) over the target's
+// support -- the resample-on-reject step of speculative sampling.
+static i32 corrected_draw(const std::vector<i32> &pids,
+                          const std::vector<f64> &pps,
+                          const std::vector<i32> &qids,
+                          const std::vector<f64> &qps, Rng &rng) {
+    std::vector<f64> c(pps.size());
+    f64 z = 0;
+    for (size_t i = 0; i < pps.size(); i++) {
+        c[i] = std::max(0.0, pps[i] - support_prob(qids, qps, pids[i]));
+        z += c[i];
+    }
+    if (z <= 0) { // p's support sits inside q's; fall back to p itself
+        c = pps;
+        z = 1.0;
+    }
+    const f64 u = static_cast<f64>(rng.next_f32()) * z;
+    f64 acc = 0;
+    for (size_t i = 0; i < c.size(); i++) {
+        acc += c[i];
+        if (u <= acc) return pids[i];
+    }
+    return pids.back();
+}
+
 // The slot the draft is re-fed at, at the end of a round. Both models must end
 // a round in the same state -- KV [0, pos) with logits predicting pos -- and the
 // last emitted token's natural slot is pos-1, which is the convention the
@@ -3798,6 +3930,13 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
     std::vector<f32> rows(static_cast<size_t>(k) * static_cast<size_t>(n_vocab_));
     std::vector<f32> dlogits(static_cast<size_t>(k) *
                              static_cast<size_t>(n_vocab_));
+    // KRK_SPEC_RS state: the run's sampler chain applied per row, and the
+    // uniforms of the accept/resample draws.
+    const bool rs = spec_rs_on() && !p.sampler.greedy && p.sampler.temp > 0.0f;
+    Rng rsrng;
+    rsrng.seed(p.sampler.seed ^ 0xD1CEC0FFEEull);
+    std::vector<i32> sids;
+    std::vector<f64> sps;
     const QuantTensor &embd = model_.tok_embd();
     const QuantTensor &head = model_.out_head();
 
@@ -3840,11 +3979,17 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             continue;
         }
         d = nrows;
-        for (i32 j = 0; j < d; j++)
-            prop[static_cast<size_t>(j)] =
-                argmax_of(dlogits.data() + static_cast<size_t>(j) *
-                                               static_cast<size_t>(n_vocab_),
-                          n_vocab_);
+        for (i32 j = 0; j < d; j++) {
+            const f32 *drow = dlogits.data() +
+                              static_cast<size_t>(j) *
+                                  static_cast<size_t>(n_vocab_);
+            if (rs) {
+                sampler_support(drow, p.sampler, n_vocab_, sids, sps);
+                prop[static_cast<size_t>(j)] = support_draw(sids, sps, rsrng);
+            } else {
+                prop[static_cast<size_t>(j)] = argmax_of(drow, n_vocab_);
+            }
+        }
         draft_proposed_ += static_cast<u64>(d);
         spec_steps_++;
         timed_decode_steps++;   // a speculation round is this loop's unit of work
@@ -3866,7 +4011,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
         // ---- the same pre-check plain decode performs ---------------------
         // On disagreement the round costs exactly one plain step and the block
         // is never verified.
-        if (spec_trace()) {
+        if (!rs && spec_trace()) {
             std::fprintf(stderr,
                          "[dflash] round %llu pos=%lld PRE-CHECK FAILED d=%d "
                          "first(target)=%d prop[0](draft)=%d prop=[",
@@ -3918,7 +4063,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
                 logits_host_, dlogits.data(), static_cast<i64>(n_vocab_));
             draft_sampled_n_ += 1;
         }
-        if (first != prop[0]) {
+        if (!rs && first != prop[0]) {
             if (first == tok_.eos()) {
                 finish_run(FinishEos);
                 return true;
@@ -3980,10 +4125,110 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
                                   static_cast<size_t>(j) * n_vocab_;
                 draft_sampled_e_ += sampled_accept_prob(
                     trow, drow, static_cast<i64>(n_vocab_));
-            }
-            draft_sampled_n_ += static_cast<u64>(d_eff - 1);
+            }            draft_sampled_n_ += static_cast<u64>(d_eff - 1);
         }
-
+        if (rs) {
+            // Rejection-sampling verification: no pre-check, no argmax match.
+            // Each proposal is tested against the target's row of the same
+            // position by probability ratio; a rejection resamples that
+            // position from the corrected distribution and ends the round.
+            i32 ra = 0;       // accepted proposals
+            i32 rtoken = -1;  // resampled replacement on rejection
+            i32 rej = -1;     // rejection position, -1 = none
+            std::vector<i32> pids, qids;
+            std::vector<f64> pps, qps;
+            for (i32 j = 0; j < d_eff; j++) {
+                const f32 *prow = j == 0
+                                      ? logits_host_
+                                      : rows.data() + static_cast<size_t>(j - 1) *
+                                                          n_vocab_;
+                const f32 *qrow = dlogits.data() +
+                                  static_cast<size_t>(j) * n_vocab_;
+                sampler_support(prow, p.sampler, n_vocab_, pids, pps);
+                sampler_support(qrow, p.sampler, n_vocab_, qids, qps);
+                const i32 pt = prop[static_cast<size_t>(j)];
+                const f64 pp = support_prob(pids, pps, pt);
+                const f64 qq = support_prob(qids, qps, pt);
+                const f64 u = static_cast<f64>(rsrng.next_f32());
+                if (pp >= qq || (qq > 0.0 && u <= pp / qq)) {
+                    ra++;
+                    continue;
+                }
+                rej = j;
+                rtoken = corrected_draw(pids, pps, qids, qps, rsrng);
+                break;
+            }
+            if (spec_trace()) {
+                std::fprintf(stderr,
+                             "[dflash] rs round %llu pos=%lld a=%d rej=%d "
+                             "rtoken=%d prop0=%d\n",
+                             static_cast<unsigned long long>(spec_steps_),
+                             static_cast<long long>(pos), ra, rej, rtoken,
+                             prop[0]);
+            }
+            // Emit the accepted prefix, then the resampled token or the
+            // bonus -- the same bookkeeping as the greedy round below.
+            bool stop_hit = false;
+            i32 emitted = 0;
+            for (i32 j = 0; j < ra; j++) {
+                if (res->generated >= p.max_tokens) break;
+                const i32 t = prop[static_cast<size_t>(j)];
+                draft_accepted_++;
+                stop_hit = emit.accept(t);
+                emitted++;
+                if (stop_hit) break;
+            }
+            if (ra > 0 && !dflash_->commit(static_cast<i32>(pos), ra))
+                return false;
+            if (stop_hit) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishStop);
+                return true;
+            }
+            i32 tail = -1;
+            if (rej >= 0) {
+                tail = rtoken;
+            } else if (res->generated < p.max_tokens) {
+                // All proposals accepted: the bonus is the target's own draw
+                // after the last one.
+                const f32 *brow = rows.data() +
+                                  static_cast<size_t>(d_eff - 1) * n_vocab_;
+                sampler_support(brow, p.sampler, n_vocab_, pids, pps);
+                tail = support_draw(pids, pps, rsrng);
+            }
+            if (tail >= 0 && res->generated < p.max_tokens) {
+                if (tail == tok_.eos()) {
+                    kv_rollback(pos + emitted);
+                    finish_run(FinishEos);
+                    return true;
+                }
+                emit.accept(tail);
+                emitted++;
+                // The accepted rows' KV is kept by the verify pass; a
+                // rejected position's was written for the wrong token, so
+                // rewind to the accepted prefix and feed the replacement --
+                // which also restores the round invariant (logits predict
+                // pos + emitted).
+                kv_rollback(pos + ra);
+                forward(&tail, 1, static_cast<i32>(pos + ra), true);
+                dflash_->commit(static_cast<i32>(pos + ra), 1);
+                fetch_logits();
+            } else if (res->generated >= p.max_tokens) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishLength);
+                return true;
+            }
+            pos += emitted;
+            if (res->generated >= p.max_tokens) {
+                finish_run(FinishLength);
+                return true;
+            }
+            if (pos + 1 >= kv_cap_) {
+                finish_run(FinishContext);
+                return true;
+            }
+            continue;
+        }
         i32 a = 1;
         while (a < d_eff && row_pred(a) == prop[static_cast<size_t>(a)]) a++;
         if (spec_trace()) {
@@ -4110,6 +4355,19 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
                                                           &decode_ms, &decode_steps)
                             : generate_speculative(p, res, ids, &prefill_ms,
                                                    &decode_ms, &decode_steps);
+        res->prefill_ms = prefill_ms;
+        res->decode_ms = decode_ms;
+        res->decode_steps = decode_steps;
+        return ok;
+    }
+    if (dflash_ && !p.sampler.greedy && p.sampler.temp > 0.0f && spec_rs_on()) {
+        // KRK_SPEC_RS=1: the dflash loop's rejection-sampling verifier takes
+        // sampling runs too -- proposals sampled, verified by probability
+        // ratio, resampled on rejection.
+        f64 prefill_ms = 0, decode_ms = 0;
+        i64 decode_steps = 0;
+        const bool ok = generate_speculative_dflash(p, res, ids, &prefill_ms,
+                                                    &decode_ms, &decode_steps);
         res->prefill_ms = prefill_ms;
         res->decode_ms = decode_ms;
         res->decode_steps = decode_steps;

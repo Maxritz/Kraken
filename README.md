@@ -593,8 +593,13 @@ kraken -m /g/More-models/Qwen3-8B-Q4_K_M.gguf --draft models/Qwen3.5-0.8B.Q4_K_M
        --draft-tokens 4 --greedy -p "explain quicksort" -n 128
 ```
 
-Several target tokens per host round-trip. Greedy-only; sampling runs without
-the draft and says so. A run with `--draft` reports
+Several target tokens per host round-trip. Greedy by default; sampling runs
+without the draft and says so, unless `KRK_SPEC_RS=1` enables the
+rejection-sampling verifier -- proposals are sampled through the run's
+sampler chain, accepted by probability ratio min(1, p/q) against the
+target's row, and resampled from the corrected distribution on rejection,
+so the emitted stream stays distributed as the target alone would produce
+it. A run with `--draft` reports
 `[stats ] speculation N rounds, A/P draft tokens accepted (x%)`, and warns
 explicitly when a drafter accepted nothing (pure cost at that rate). It also
 reports `sampled-accept x% of N scored proposals (temp1 topk20,
