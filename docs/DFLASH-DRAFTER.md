@@ -429,6 +429,34 @@ the same mismatch: a greedy measurement read against a sampling claim.
 
 ## Next actions, ranked
 
+### DFlash2 head: artifact on disk, tensor inventory taken (2026-10-10)
+
+`z-lab/Qwen3.8-27B-DFlash2` is downloaded complete to
+`G:/More-models/dflash2/` (safetensors 3,848,817,896 B + config). It is a
+new design, not a re-skin, and the header says exactly what a loader
+would need: **81 tensors** -- per layer, `self_attn` (q/k/v + q_norm/
+k_norm, 128-dim), `mlp` (gate/up/down), and TWO conv1d blocks
+(`attention_conv.base_kernel [2,2,5120]` + `kernel_projection [1280,
+5120]`, and the same pair as `mlp_conv`) that DFlash-1 had none of;
+plus `candidate_selector` = `hidden_projection [256,5120]` and
+`predecessor_codebook` / `successor_codebook` each `[248320, 256]`
+(vocab-sized token-pair codebooks, ~254 MB of the file), `fc` (the
+fusion projection over 5 captured layers), `hidden_norm`, `norm`.
+Block size 8, mask id 248070, target layers [5,19,33,47,61] of
+Qwen3.8-27B. Running it is the loader+block feature project described
+above; the GGUF repack follows mechanically once the loader exists.
+
+### Local target for the MTP path: Underdog-Saluki-27B
+
+`G:/More-models/Underdog-Saluki-27B-1.0-IQ2-mix-MTP-abliterated.gguf`
+(7.77 GiB, 866 tensors, arch `qwen35`, verdict runnable) carries its own
+MTP block (`blk.64`, reported by kraken-inspect as skipped). It is the
+natural target+drafter pair for the model-draft `--draft` path -- but
+the target is RECURRENT (qwen35), and `Engine::load_draft` refuses
+speculation on a recurrent target because the rewind cannot reconstruct
+delta-rule states. Self-drafting it needs the rewind question answered
+first (a re-prefill-based rewind?), not a loader change.
+
 1. ~~Rejection-sampling acceptance accounting~~ **done (2026-10-10):**
    every `--draft` run now reports `sampled-accept` -- per-proposal
    `sum min(p_t, p_d)` over both rows at temp 1.0 / top-k 20 (the card's
