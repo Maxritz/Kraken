@@ -298,6 +298,12 @@ public:
     // Speculation telemetry (valid after a run with a draft loaded).
     u64 draft_proposed() const { return draft_proposed_; }
     u64 draft_accepted() const { return draft_accepted_; }
+    // Mean acceptance a rejection-sampling verifier would report, summed over
+    // proposals under the served regime (temp 1.0, top-k 20): the number a
+    // model card's acceptance length is measured with, against the greedy
+    // match rate above it.
+    f64 draft_sampled_expected() const { return draft_sampled_e_; }
+    u64 draft_sampled_n() const { return draft_sampled_n_; }
     u64 spec_steps() const { return spec_steps_; }
 
     // KV tier telemetry, summed over the K and V planes. The counters existed
@@ -464,6 +470,8 @@ private:
     i32 draft_tokens_ = 0;
     u64 draft_proposed_ = 0;
     u64 draft_accepted_ = 0;
+    f64 draft_sampled_e_ = 0.0;
+    u64 draft_sampled_n_ = 0;
     u64 spec_steps_ = 0;
 
     i64 q_dim_ = 0, kv_dim_ = 0, n_embd_ = 0, n_ff_ = 0, n_vocab_ = 0;

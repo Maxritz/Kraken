@@ -762,6 +762,13 @@ int run_bench(Engine &engine, Backend *be, const Args &a, f64 load_ms,
                     static_cast<unsigned long long>(engine.spec_steps()),
                     static_cast<unsigned long long>(engine.draft_accepted()),
                     static_cast<unsigned long long>(engine.draft_proposed()), rate);
+        if (engine.draft_sampled_n() > 0)
+            std::printf(
+                "sampled-accept %.1f%% of %llu scored proposals (temp1 "
+                "topk20, rejection-sampling verifier)\n",
+                100.0 * engine.draft_sampled_expected() /
+                    static_cast<f64>(engine.draft_sampled_n()),
+                static_cast<unsigned long long>(engine.draft_sampled_n()));
     }
     if (engine.model().cfg().is_moe) {
         const ExpertCache &ec = engine.model().experts();
@@ -1098,6 +1105,15 @@ int main(int argc, char **argv) {
                          static_cast<unsigned long long>(engine.draft_accepted()),
                          static_cast<unsigned long long>(engine.draft_proposed()),
                          rate);
+            if (engine.draft_sampled_n() > 0)
+                std::fprintf(
+                    stderr,
+                    "[stats ] speculation sampled-accept %.1f%% of %llu "
+                    "scored proposals (temp1 topk20, rejection-sampling "
+                    "verifier)\n",
+                    100.0 * engine.draft_sampled_expected() /
+                        static_cast<f64>(engine.draft_sampled_n()),
+                    static_cast<unsigned long long>(engine.draft_sampled_n()));
         }
         return true;
     };

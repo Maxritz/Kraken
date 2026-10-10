@@ -596,7 +596,12 @@ kraken -m /g/More-models/Qwen3-8B-Q4_K_M.gguf --draft models/Qwen3.5-0.8B.Q4_K_M
 Several target tokens per host round-trip. Greedy-only; sampling runs without
 the draft and says so. A run with `--draft` reports
 `[stats ] speculation N rounds, A/P draft tokens accepted (x%)`, and warns
-explicitly when a drafter accepted nothing (pure cost at that rate).
+explicitly when a drafter accepted nothing (pure cost at that rate). It also
+reports `sampled-accept x% of N scored proposals (temp1 topk20,
+rejection-sampling verifier)` -- the acceptance a serving stack's rejection
+sampling would see at Poolside's served settings, so a drafter's quality is
+comparable to a model card's acceptance length and not only to its greedy
+floor (Laguna XS-2.1 pair: 12.5% greedy against 30.7% sampled).
 
 ### `--kv-hot-mb` / `--kv-warm-mb` / `--kv-cold-dir` - a tiered KV cache
 

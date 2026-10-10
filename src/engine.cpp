@@ -1891,6 +1891,8 @@ void Engine::unload_draft() {
     draft_ = nullptr;
     draft_proposed_ = 0;
     draft_accepted_ = 0;
+    draft_sampled_e_ = 0.0;
+    draft_sampled_n_ = 0;
     spec_steps_ = 0;
 }
 
@@ -2606,6 +2608,64 @@ static bool spec_trace() {
     static const bool v = [] {
         const char *e = std::getenv("KRK_SPEC_TRACE");
         return e && e[0] != '0';
+    }();
+    return v;
+}
+
+// The acceptance probability a rejection-sampling verifier would give one
+// proposal position, computed the way a serving stack measures acceptance
+// length: both rows at temperature 1.0, top-k 20 truncated and renormalized
+// (Poolside's card settings; top-p is 1.0 there, so top-k is the whole
+// regime). E = sum over the union of both top-k sets of min(p_t, p_d).
+// Rows that agree exactly give 1.0 and disjoint rows give ~0, so this is the
+// per-proposal version of the number a model card reports per step.
+static f64 sampled_accept_prob(const f32 *trow, const f32 *drow, i64 n) {
+    constexpr i32 kTopMax = 20;
+    const i32 k = std::min<i32>(kTopMax, static_cast<i32>(n));
+    struct Pick {
+        f32 p;
+        i32 id;
+    };
+    Pick pt[20], pd[20];
+    thread_local std::vector<i32> idx;
+    idx.resize(static_cast<size_t>(n));
+    for (i32 side = 0; side < 2; side++) {
+        const f32 *row = side ? drow : trow;
+        Pick *out = side ? pd : pt;
+        for (i64 v = 0; v < n; v++) idx[static_cast<size_t>(v)] = static_cast<i32>(v);
+        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                          [&](i32 a, i32 b) { return row[a] > row[b]; });
+        const f32 mx = row[static_cast<size_t>(idx[0])];
+        f64 z = 0.0;
+        for (i32 i = 0; i < k; i++) {
+            out[i].id = idx[static_cast<size_t>(i)];
+            z += std::exp(static_cast<f64>(row[static_cast<size_t>(out[i].id)] - mx));
+        }
+        for (i32 i = 0; i < k; i++) {
+            out[i].p = static_cast<f32>(
+                std::exp(static_cast<f64>(row[static_cast<size_t>(out[i].id)] - mx)) /
+                z);
+        }
+    }
+    f64 acc = 0.0;
+    for (i32 i = 0; i < k; i++) {
+        f64 pdv = 0.0;
+        for (i32 j = 0; j < k; j++)
+            if (pd[j].id == pt[i].id) {
+                pdv = static_cast<f64>(pd[j].p);
+                break;
+            }
+        acc += std::min(static_cast<f64>(pt[i].p), pdv);
+    }
+    return acc;
+}
+
+// The sampled-accept accounting is on by default; KRK_SPEC_SAMPLED_ACC=0
+// restores the device-argmax fast path for a pure timing run.
+static bool sampled_acc_on() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_SPEC_SAMPLED_ACC");
+        return !(e && e[0] == '0');
     }();
     return v;
 }
@@ -3846,6 +3906,18 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             }
             std::fputc(10, stderr);
         }
+        // Position 0 is scored on BOTH paths -- the pre-check compares it --
+        // so the sampled-accept accounting takes it here, before the mismatch
+        // branch can bail; the verify path below adds positions 1..d_eff-1 on
+        // the rounds that get that far. kraken skips the rest of the block on
+        // a pre-check miss, so those rows never exist to score: the reported
+        // number is a lower bound of a full-block verifier's, same as greedy
+        // agreement is of sampled acceptance.
+        if (sampled_acc_on() && d > 0) {
+            draft_sampled_e_ += sampled_accept_prob(
+                logits_host_, dlogits.data(), static_cast<i64>(n_vocab_));
+            draft_sampled_n_ += 1;
+        }
         if (first != prop[0]) {
             if (first == tok_.eos()) {
                 finish_run(FinishEos);
@@ -3874,12 +3946,18 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
         forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone);
         kv_pos_ = pos + d_eff;
         // Device argmax per verified row; see generate_speculative for why the
-        // full-row download was the cost.
+        // full-row download was the cost. With the sampled-accept accounting
+        // on (the default) each row is downloaded once anyway and carries the
+        // argmax and the accounting on the same bytes -- a device argmax and a
+        // host argmax of one f32 row agree, so the generated text is
+        // bit-identical either way (KRK_SPEC_SAMPLED_ACC=0 keeps the fast
+        // path for a pure timing run).
+        const bool acc_on = sampled_acc_on();
         std::vector<i32> row_ids(static_cast<size_t>(d_eff), 0);
         for (i32 j = 0; j < d_eff; j++) {
             head_compute(j);
             i32 id = 0;
-            if (!topk_argmax(&id)) {
+            if (acc_on || !topk_argmax(&id)) {
                 be_->sync();
                 be_->download_f32(rows.data() + static_cast<size_t>(j) * n_vocab_,
                                   ws_logits_, n_vocab_);
@@ -3891,6 +3969,20 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
         auto row_pred = [&](i32 j) {
             return row_ids[static_cast<size_t>(j - 1)];
         };
+        if (acc_on && d_eff > 1) {
+            // Positions 1..d_eff-1 of this round; position 0 was accounted
+            // before the pre-check. The target's row verifying prop[j] is
+            // rows[j-1]; draft row j predicts prop[j].
+            for (i32 j = 1; j < d_eff; j++) {
+                const f32 *trow = rows.data() +
+                                  static_cast<size_t>(j - 1) * n_vocab_;
+                const f32 *drow = dlogits.data() +
+                                  static_cast<size_t>(j) * n_vocab_;
+                draft_sampled_e_ += sampled_accept_prob(
+                    trow, drow, static_cast<i64>(n_vocab_));
+            }
+            draft_sampled_n_ += static_cast<u64>(d_eff - 1);
+        }
 
         i32 a = 1;
         while (a < d_eff && row_pred(a) == prop[static_cast<size_t>(a)]) a++;

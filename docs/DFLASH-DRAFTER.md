@@ -429,10 +429,18 @@ the same mismatch: a greedy measurement read against a sampling claim.
 
 ## Next actions, ranked
 
-1. **Rejection-sampling acceptance accounting.** A `--draft` run should
-   also be able to verify a round by `min(1, p_target/p_draft)` and report
-   a sampled acceptance length, so kraken's numbers become directly
-   comparable to a Poolside card instead of a lower bound of one.
+1. ~~Rejection-sampling acceptance accounting~~ **done (2026-10-10):**
+   every `--draft` run now reports `sampled-accept` -- per-proposal
+   `sum min(p_t, p_d)` over both rows at temp 1.0 / top-k 20 (the card's
+   regime), scored on position 0 every round plus positions 1..d-1 on the
+   rounds that reach verify. Measured on the matched pair: **30.7% of 108
+   scored proposals against 12.5% greedy** -- 2.5x, and a lower bound of a
+   full-block verifier's (kraken never scores positions 1..d-1 of a
+   pre-check miss). Text is bit-identical with the accounting on (stdout
+   md5 `7f0c8046fb93` before and after); `KRK_SPEC_SAMPLED_ACC=0` restores
+   the device-argmax fast path. The follow-on -- an actual
+   rejection-sampling *verify* (sampled proposals, resample-on-reject) for
+   temp>0 runs, which today bypass the draft entirely -- is the next step.
 2. **DFlash2 (z-lab) heads on the models this box runs.** The official
    collection covers Qwen3.8-27B and the Qwen3.5/3.6 MoE families — all
    loadable here — so a `--draft` run against a DFlash2 head is the
