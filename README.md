@@ -174,7 +174,11 @@ build/kraken-tests
 
 The suite builds a complete miniature LLaMA-family GGUF in a temporary file and
 generates through it, so the container parser, the model loader, the forward
-pass, the sampler and both tokenizer families are all covered end to end.
+pass, the sampler and both tokenizer families are all covered end to end. Each
+of its 54 groups runs in its own worker process (read the count off the run -
+it grows when coverage does: 2905 checks on this build), and
+`scripts/kraken_tests_baseline_check.sh` fails the run if a group that was
+passing in the recorded baseline stops passing.
 
 ---
 
@@ -219,29 +223,34 @@ Configuration: **AMD Radeon RX 9070 XT** (gfx1201, RDNA4, wave32, WMMA gfx12,
 
 | model | layers / embd | prefill tok/s | decode tok/s | load ms |
 |---|---|---|---|---|
-| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 2674-2822 | 454-470 | 408-417 |
-| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 2490-2756 | 245-271 | 631-637 |
-| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 28 / 1024 | 115-180 | 95-100 | 481-553 |
-| Qwen3-8B Q4_K_M | 36 / 4096 | 776-812 | 83-85 | 1715-1845 |
+| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 4860-5031 | 440-457 | 400-405 |
+| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 4247-4287 | 245-247 | 628-648 |
+| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 28 / 1024 | 182-204 | 90-93 | 465-498 |
+| Qwen3-8B Q4_K_M | 36 / 4096 | 919-946 | 80-81 | 1693-1792 |
 
-These four get three runs each on this build. The MoE prefill band is now narrow
-because this model's expert working set fits the default budget (610 MiB), so run
-1 is already cache-warm and does not page experts cold the way the older sweep did;
-see the residency section. The 8B load band here is also narrow (1.68-1.84 s) - all
-three runs were warm file cache; the older wider band came from one cold-file-cache
-run and is not reproduced here, so it is not a speedup claim.
+These four get three runs each on this build with the bare `--bench` commands
+below (measured 2026-10-10). The MoE prefill band is the widest (182-204,
+~12%) because the resident-expert budget depends on what else ran first; see
+the residency section. The 8B load band is narrow (1.69-1.79 s) because all
+three runs had a warm file cache - one cold-cache run of the same file measured
+4.9 s, so the narrow band is a cache state, not a speedup claim.
 
 ### How close is this to the hardware?
 
 The card's real read bandwidth is **585 GB/s**, not the 644 GB/s on the spec
 sheet - measured with a 4096 MiB streaming read (584.9 GB/s). An 8B Q4_K_M
 token has to read **5.02 GB** of weights, so the absolute floor is **8.58 ms =
-117 tok/s**. Kraken does **87-89 tok/s, ~76% of that ceiling**.
+117 tok/s**. Kraken does **80-81 tok/s (12.4 ms/token), ~69% of that ceiling**,
+averaged over the 256 generated tokens above - and decode is flat in context
+(docs/PERF-PLAN.md B0), so the short-context number is the same within noise.
 
-The gap is not bandwidth: **3.78 ms of the 11.27 ms token (34%)** is five
-elementwise ops (`rmsnorm`, `rope`, `qk_norm`, `kv_append`, `add_inplace`) that
-move 8-16 KB each, 253 launches per token. `rmsnorm` alone is 1165x off its own
-memory floor. Fusing that chain is the next large win.
+The gap is not bandwidth. Five elementwise ops (`rmsnorm`, `rope`, `qk_norm`,
+`kv_append`, and the residual add) that each move 8-16 KB used to cost **253
+launches per token and 34% of the step** (docs/PERF-PLAN.md B0a); the two
+default-on folds - the GEMV residual epilogue and `add_rmsnorm` - cut the chain
+to **181 launches per token**, and a profiled run on this build ranks it at ~12%
+of device time. Fusing the rest of that chain (rope, qk_norm and kv_append into
+the attention kernels that already read those buffers) is the next move.
 
 To reproduce, substituting your own path:
 
@@ -252,8 +261,9 @@ kraken --model models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf         --bench
 kraken --model "G:/More-models/Qwen3-8B-Q4_K_M.gguf"            --bench
 ```
 
-Run-to-run spread is 2-5% on prefill and under 2% on decode, so treat
-differences smaller than that as noise. MoE rows depend on a tunable: they
+Run-to-run spread here was within 4% on prefill for the dense models (the MoE
+runs wider, ~12%) and within 4% on decode, so treat differences smaller than
+that as noise. MoE rows depend on a tunable: they
 assume the default expert budget (40% of free VRAM), which is why a small MoE
 can look slow next to a dense model far above its weight.
 
@@ -584,7 +594,45 @@ kraken -m /g/More-models/Qwen3-8B-Q4_K_M.gguf --draft models/Qwen3.5-0.8B.Q4_K_M
 ```
 
 Several target tokens per host round-trip. Greedy-only; sampling runs without
-the draft and says so.
+the draft and says so. A run with `--draft` reports
+`[stats ] speculation N rounds, A/P draft tokens accepted (x%)`, and warns
+explicitly when a drafter accepted nothing (pure cost at that rate).
+
+### `--kv-hot-mb` / `--kv-warm-mb` / `--kv-cold-dir` - a tiered KV cache
+
+The KV cache pages like the expert cache does: HOT slots in VRAM, WARM in host
+RAM, and an optional COLD spill directory past that.
+
+```sh
+# long context on a small card: let the overflow page instead of refusing
+kraken -m model.gguf --ctx 8192 --kv-hot-mb 512 --kv-warm-mb 4096
+
+# spill evicted pages to disk instead of recomputing them
+kraken -m model.gguf --ctx 8192 --kv-cold-dir /kvcache
+```
+
+Defaults are geometry-derived: `--kv-hot-mb 0` (default) takes the VRAM the
+weights leave free, and the WARM tier sizes itself to cover every KV-carrying
+layer unless a `--kv-cold-dir` exists to spill into - a page with nowhere to
+go would be DROPPED and its layer silently zero-filled (wrong text, not slow
+text), so the budget is only obeyed where a spill target exists. The cache is
+packed per layer, so a model with mixed KV widths loads, and it is inert when
+the whole cache fits: one flat allocation, exactly as before. Every run ends
+with `kv tiered: ... promoted ... evicted ... DROPPED pages` so a tiering
+configuration is never silent. `scripts/kv_tier_geometry_check.sh` checks the
+reservation against each model file's own header.
+
+### `--hybrid-experts 1` - overflow experts on the host
+
+The device tier computes the experts it holds; with `--hybrid-experts 1` the
+host computes the ones it could not hold, out of the weight mapping, so those
+experts cost no VRAM and no WARM RAM. Inert when the budget already covers the
+routed set. **It trades memory for speed, and loses on speed**: measured on
+Qwen3-MoE-4x0.6B with a 16 MiB expert budget, 5.5 tok/s against 17.2 tok/s for
+promoting instead - the host arm is a per-layer barrier the device waits on
+(`--hybrid-frac F` sets what share of the overflow the host takes; a
+VRAM-resident expert is never sent to the host, and the run prints that policy
+next to the split's numbers).
 
 ### Finding a divergence between the two backends
 
@@ -602,6 +650,7 @@ The first differing line names the stage and the layer.
 ninja -C build-hip kraken kraken-tests kraken-bench kraken-inspect
 ninja -C build-hip gate                       # numeric tolerances + logits_topk differential
 ./build-hip/kraken-tests                      # checks (count grows; read it off the run)
+sh scripts/kraken_tests_baseline_check.sh     # + comparison against the recorded baseline
 KRK_N=16 KRK_CHAT=1 bash scripts/coherence_check.sh models/*.gguf
 ```
 
@@ -687,15 +736,25 @@ Grouped-query attention, per-head QK RMSNorm, QKV biases, tied embeddings and
 partial RoPE are all handled.
 
 **Greedy speculative decoding**: `--draft small.gguf` runs a second model as a
-proposer. Verified in one batched forward, accepted tokens are bit-identical to
-plain greedy output (proven by the test suite); sampling requests fall back to
-the plain loop. `--bench` prints the acceptance rate.
+proposer - or a DFlash block-diffusion head set when the file names one (the
+file's architecture decides; the head set carries no embedding or head of its
+own and drafts from fused target features injected into its own KV). Verified
+in one batched forward, accepted tokens are bit-identical to plain greedy
+output (proven by the test suite, including a bitwise self-draft KV-parity
+check); sampling requests fall back to the plain loop. Every run reports the
+acceptance rate, and a pair whose mask ids disagree is refused at load
+(`KRK_DFLASH_ALLOW_BAD_MASK=1` loads it anyway for diagnosis, with a warning).
+The local DFlash pair still accepts 0% - the loop is not the cause any more
+(self-drafts accept ~100%), and [docs/DFLASH-DRAFTER.md](docs/DFLASH-DRAFTER.md)
+tracks what has been ruled out.
 
 **Gated delta net (hybrid recurrent/attention)**: `qwen35` and `qwen35moe`
 (Qwen3.5 - conv + gated delta rule in place of attention on most layers). The
-f32 CPU path reproduces llama.cpp token for token. **The GPU path is not yet
-reproducible** - see [docs/TODO.md](docs/TODO.md) for what has been ruled out
-and what is next.
+f32 CPU path reproduces llama.cpp token for token; the GPU path is
+reproducible on `gfx1201` as of 2026-10-03 (two causes were found and fixed -
+a packed-query in-place unpack race and a model-blind decode-attention split-K
+race, each with before/after md5 evidence); `gfx1031` confirmation is still
+outstanding. See [docs/TODO.md](docs/TODO.md) for the full record.
 
 **Now dequantizing**: the whole IQ family - `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
 `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M` - plus BitNet's `Q1_0` and `Q2_0` in both
@@ -712,8 +771,6 @@ and `Ternary-Bonsai-2-27B-PQ2_0.gguf` passes device-vs-CPU coherence.
 `IQ4_NL` and `IQ4_XS` dequantize as before;
 the ROCmFPX ids **102, 104, 107** are now implemented (2026-10-07) from the
 fork's `rocmfpx_dequantize_row_fp{2,3,6}` with UE4M3 half-block scales;
-`kraken-inspect model.gguf --quant` tells you which formats a file actually
-uses before you try to run it.
 `kraken-inspect model.gguf --quant` tells you which formats a file actually
 uses before you try to run it.
 

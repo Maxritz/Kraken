@@ -172,6 +172,15 @@ The plan is to fold the per-layer chain — `rmsnorm` + `add_inplace` + `silu_mu
 on the FFN side, `rope` + `qk_norm` + `kv_append` on the attention side — into
 the kernels that already read those buffers, rather than 253 separate launches.
 
+**2026-10-10 update (this build):** the two default-on folds landed — the GEMV
+residual epilogue (`dst += W*x`) removed the 72 `add_inplace` calls, and
+`add_rmsnorm` merged the remaining add+norm pairs — so the five-op chain is now
+**181 launches per token** (rmsnorm 37, add_rmsnorm 36, rope 36, qk_norm 36,
+kv_append 36; counted exactly from a `--profile` run on Qwen3-8B Q4_K_M), and
+its KRK_TIME device-NET sum is ~1.45 ms of a 12.4 ms token (~12%; profiled
+magnitudes, read as a share not a wall time). The remaining rope/qk_norm/
+kv_append chain is the fusing target this section predicted.
+
 ### B1 (historical note) — the launch floor was 2.65 us, now 0.98
 
 The B1 text below quotes a 2.65 us launch floor. Re-measured after the pinned
