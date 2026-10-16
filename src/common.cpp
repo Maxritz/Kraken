@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
 #include <unistd.h>
 #endif
 
@@ -79,6 +80,28 @@ size_t host_available_bytes() {
     if (GlobalMemoryStatusEx(&st)) return static_cast<size_t>(st.ullAvailPhys);
     return 0;
 #else
+#if defined(__linux__)
+    // Linux MemAvailable includes reclaimable page cache and estimates how
+    // much memory can be allocated without swapping. `freeram` excludes
+    // that cache, so it makes healthy Linux hosts appear reserve-starved.
+    FILE *f = std::fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), f)) {
+            unsigned long long kib = 0;
+            if (std::sscanf(line, "MemAvailable: %llu kB", &kib) == 1) {
+                std::fclose(f);
+                const unsigned long long max_value =
+                    static_cast<unsigned long long>(-1);
+                if (kib > max_value / 1024u) return static_cast<size_t>(-1);
+                return static_cast<size_t>(kib * 1024u);
+            }
+        }
+        std::fclose(f);
+    }
+    // Older Linux/proc setups may not publish MemAvailable. Fall through to
+    // sysconf, but never claim `freeram` is allocatable headroom.
+#endif
     const long pages = sysconf(_SC_AVPHYS_PAGES);
     const long page = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page <= 0) return 0;

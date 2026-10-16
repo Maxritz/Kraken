@@ -40,6 +40,7 @@
 // Reference, same box, torch 2.15/rocBLAS: f16 GEMV 1x4096x4096 = 47.3 µs
 // (710 GB/s), f16 GEMM 32x4096x4096 = 43.4 µs (772 GB/s, 24.7 TFLOP/s).
 #include <krk/backend.hpp>
+#include <krk/expert_cache.hpp>
 #include <krk/quant.hpp>
 
 #include <algorithm>
@@ -305,6 +306,594 @@ Check run_one(Backend *be, const Shape &s, int iters, double launch_us) {
     be->release(xd);
     be->release(od);
     return c;
+}
+
+// The promotion path's per-call bookkeeping, measured the same way the
+// kernels are: N back-to-back calls minus one, so the number is one more
+// call in a saturated queue rather than a cold first call.
+//
+// This exists because the engine's own `alloc` row in the expert-path split
+// cannot say what it is made of. `alloc_ms_` wraps alloc_pooled, which is a
+// free-list lookup, a reuse guard and possibly a wait for the device -- three
+// different fixes for one number. The three arms below separate them:
+//
+//   event create+destroy   what a pool that allocates a guard per release pays
+//   record / query / wait  the per-release and per-reuse halves of that guard
+//   pool round trip x2     the real pair, with a reader already complete
+//                          (pure bookkeeping) and with a reader queued on the
+//                          default stream (the wait the guard exists for)
+//
+// The last arm is the one the decode loop actually pays; the first three say
+// whether its cost is the guard or the queue.
+// One block of `chunk` calls timed on a queue that already holds `depth`
+// copies: the state a decode step is always in, and the only state in which a
+// host-side enqueue can be timed on its own. `tail_us` is what the sync AFTER
+// the block still had to drain -- the witness that the queue was busy when the
+// host returned, which is what makes the reading a queue measurement rather
+// than a wall-clock coincidence.
+// Every call in this engine has two costs and a table that quotes one number
+// per call is quoting half a call:
+//   host_us    what the enqueue costs the thread that is issuing the step
+//   device_us  what the call costs the DEVICE once it gets there, which is the
+//              time the sync after the block still has to drain (the tail)
+// `time_calls` cannot see any of this: it subtracts one-call-plus-one-sync from
+// many-calls-plus-one-sync, so its quotient is whichever of the two halves
+// dominates the queue -- for a legacy-stream record that is the device side
+// (~27 us per marker), and for a launch it is the launch itself.
+// `depth` copies are pre-issued first, so the block can be timed on a queue
+// that is provably still draining when the host returns.
+struct QueueArm {
+    double host_us = 0.0;   // enqueue, per call
+    double device_us = 0.0; // device time left after the block, per call
+    double tail_us = 0.0;   // ... and in total
+    double host_block_us = 0.0;
+};
+
+// kind=false times `copy_act`, kind=true times `record_marker`; the pre-issue is
+// always copies, so both arms start from the same queue.
+static QueueArm measure_queue_arm(Backend *be, int depth, int chunk, int reps,
+                                  bool records) {
+    QueueArm r;
+    void *a = be->alloc(4096);
+    void *b = be->alloc(4096);
+    void *m = be->make_marker();
+    if (!a || !b || !m) {
+        if (a) be->release(a);
+        if (b) be->release(b);
+        if (m) be->release_marker(m);
+        return r;
+    }
+    be->fill0(a, 4096);
+    be->fill0(b, 4096);
+    // The pre-issue is the instrument's own red construction: with it skipped,
+    // "busy" and "empty" are the same state and the gate's queue checks fail.
+    const char *skip = std::getenv("KRK_TEST_QUEUE_NOPREISSUE");
+    const bool no_preissue = skip && *skip && std::string(skip) != "0";
+    std::vector<double> host(reps, 0.0), tl(reps, 0.0);
+    for (int i = 0; i < reps; i++) {
+        for (int k = 0; k < depth && !no_preissue; k++) be->copy_act(a, b, 32);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int k = 0; k < chunk; k++) {
+            if (records) be->record_marker(m);
+            else be->copy_act(a, b, 32);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        be->sync();
+        const auto t2 = std::chrono::steady_clock::now();
+        host[i] = std::chrono::duration<double, std::micro>(t1 - t0).count() / chunk;
+        tl[i] = std::chrono::duration<double, std::micro>(t2 - t1).count();
+    }
+    std::sort(host.begin(), host.end());
+    std::sort(tl.begin(), tl.end());
+    r.host_us = host[reps / 2];
+    r.tail_us = tl[reps / 2];
+    r.device_us = r.tail_us / chunk;
+    r.host_block_us = r.host_us * chunk;
+    be->release_marker(m);
+    be->release(a);
+    be->release(b);
+    return r;
+}
+
+void bench_pool_primitives(Backend *be, int iters, int depth, double launch_ms) {
+    const int n = std::max(50, iters);
+    const double create_ms = time_calls(be, n, [&] {
+        void *m = be->make_marker();
+        be->release_marker(m);
+    });
+    void *tok = be->make_marker();
+    be->record_marker(tok);
+    const double record_ms = time_calls(be, n, [&] { be->record_marker(tok); });
+    const double query_ms = time_calls(be, n, [&] { be->poll_marker(tok); });
+    // Recorded and drained, so the wait is a completed event: this is the
+    // cheap case, and the difference against the pool round trip below is the
+    // part that is a real wait for the device.
+    be->wait_marker(tok);
+    const double wait_ms = time_calls(be, n, [&] { be->wait_marker(tok); });
+    // The arm the old pool paid on every reuse: ask the device whether the
+    // reader has retired. The record makes the query land on a PENDING event
+    // every time, which is the state a saturated pool is always in; the
+    // difference against the record-only arm above is what the question costs.
+    const double recq_ms = time_calls(be, n, [&] {
+        be->record_marker(tok);
+        be->poll_marker(tok);
+    });
+    be->release_marker(tok);
+
+    // The pool as the cache drives it: a handful of cells, cycled. KEYS cells
+    // of 256 KiB inside a 2 MiB budget -- the same shape as an expert's three
+    // slices at a constrained --expert-cache-mb, scaled down so the number is
+    // bookkeeping and not bus bandwidth.
+    constexpr size_t kCell = 256 * 1024;
+    constexpr int kCells = 8;
+    be->set_expert_pool_budget(kCell * kCells);
+    void *cells[kCells];
+    void *src = be->alloc(kCell), *sink = be->alloc(kCell);
+    be->fill0(src, kCell);
+    for (int i = 0; i < kCells; i++) {
+        cells[i] = be->alloc_pooled(kCell);
+        be->fill0(cells[i], kCell);
+    }
+    int slot = 0;
+    const double ready_ms = time_calls(be, n, [&] {
+        be->release_pooled(cells[slot], kCell);
+        cells[slot] = be->alloc_pooled(kCell);
+        slot = (slot + 1) % kCells;
+    });
+    // Same pair, but the cell is released only after a reader has been queued
+    // into it on the default stream: reuse must now wait for that reader, and
+    // that wait is what the engine's `alloc` row is mostly made of.
+    const double reader_ms = time_calls(be, n, [&] {
+        be->copy_act(sink, cells[slot], 64);
+        be->release_pooled(cells[slot], kCell);
+        cells[slot] = be->alloc_pooled(kCell);
+        slot = (slot + 1) % kCells;
+    });
+    // The shape the engine actually drives at a constrained budget: an eviction
+    // returns an expert's THREE slices in one call. Both arms below hand back the
+    // same three cells with a reader queued on the default stream, so they are
+    // one call apart, and the counters say how many records each issued -- the
+    // mechanism, not just a time.
+    constexpr int kBurst = 3;
+    size_t blen[kBurst];
+    for (int i = 0; i < kBurst; i++) blen[i] = kCell;
+    void *bc[kBurst];
+    be->set_expert_pool_budget(kCell * (kCells + kBurst));
+    for (int i = 0; i < kBurst; i++) {
+        bc[i] = be->alloc_pooled(kCell);
+        be->fill0(bc[i], kCell);
+    }
+    const auto marks0 = be->expert_pool_stats();
+    const double burst_ms = time_calls(be, n, [&] {
+        be->copy_act(sink, bc[0], 64);
+        be->release_pooled_batch(bc, blen, kBurst);
+        for (int i = 0; i < kBurst; i++) bc[i] = be->alloc_pooled(kCell);
+    });
+    const auto burst_st = be->expert_pool_stats();
+    const double sep_ms = time_calls(be, n, [&] {
+        be->copy_act(sink, bc[0], 64);
+        for (int i = 0; i < kBurst; i++) be->release_pooled(bc[i], kCell);
+        for (int i = 0; i < kBurst; i++) bc[i] = be->alloc_pooled(kCell);
+    });
+    const auto sep_st = be->expert_pool_stats();
+    for (int i = 0; i < kBurst; i++) be->release_pooled(bc[i], kCell);
+
+    for (int i = 0; i < kCells; i++) be->release_pooled(cells[i], kCell);
+    be->release(src);
+    be->release(sink);
+    const auto st = be->expert_pool_stats();
+    std::printf(
+        "pool primitives: event create+destroy %.2f us | record %.2f us | "
+        "query %.2f us | wait %.2f us | record+query a pending event %.2f us\n",
+        create_ms * 1000.0, record_ms * 1000.0, query_ms * 1000.0,
+        wait_ms * 1000.0, (recq_ms - record_ms) * 1000.0);
+    std::printf(
+        "pool round trip (%d cells of %d KiB, budget %d KiB): %.2f us ready | "
+        "%.2f us with a queued reader | alloc %llu reuse %llu trim %llu\n",
+        kCells, static_cast<int>(kCell / 1024),
+        static_cast<int>(kCell * kCells / 1024), ready_ms * 1000.0,
+        reader_ms * 1000.0, static_cast<unsigned long long>(st.allocations),
+        static_cast<unsigned long long>(st.reuses),
+        static_cast<unsigned long long>(st.trims));
+    // Sequenced, so this ranks the two arms and does not time the machine: the
+    // verdict on the engine comes from the interleaved A/B, and the counter
+    // ratio below is the part that is a fact either way.
+    std::printf(
+        "pool burst (%d slices of %d KiB, a queued reader): %.2f us one mark | "
+        "%.2f us one record per slice | %llu vs %llu mark(s) for %llu slice(s)\n",
+        kBurst, static_cast<int>(kCell / 1024), burst_ms * 1000.0,
+        sep_ms * 1000.0,
+        static_cast<unsigned long long>(burst_st.release_marks -
+                                        marks0.release_marks),
+        static_cast<unsigned long long>(sep_st.release_marks -
+                                        burst_st.release_marks),
+        static_cast<unsigned long long>(sep_st.release_slices -
+                                        marks0.release_slices));
+    // Quiet queue vs BUSY queue, host side -- and the busy queue is the only state
+    // a decode step is ever in (303 ops in flight on the 135M, 2965 on the 35B).
+    // The arms above measure each call with nothing else in flight, and for a
+    // legacy-stream record that measures the FLUSH (29.5 us here) rather than the
+    // enqueue a step pays (2.56 us: 7252 records removed bought 18.6 ms of the
+    // step on Qwen3-MOE-4x0.6B at 16/32 MiB). This arm feeds the queue with real
+    // device work and times `chunk` calls issued while it drains, which is why
+    // the two figures differ and by how much. It cannot be done with time_calls:
+    // that helper subtracts one cold call from a batch mean, and for a host-side
+    // enqueue the cold call is the expensive one -- it printed a NEGATIVE
+    // marginal record cost (-12.82 us) before this arm replaced it.
+    if (depth > 0) {
+        constexpr int kChunk = 64; // calls timed per phase
+        constexpr int kReps = 8;   // median of these, per state
+        const QueueArm bcopy = measure_queue_arm(be, depth, kChunk, kReps, false);
+        const QueueArm ecopy = measure_queue_arm(be, 0, kChunk, kReps, false);
+        const QueueArm brec = measure_queue_arm(be, depth, kChunk, kReps, true);
+        const QueueArm erec = measure_queue_arm(be, 0, kChunk, kReps, true);
+        // Both halves of each call, by one method, in both queue states. The
+        // time_calls arms above quote whichever half dominates its own loop, so
+        // they are printed for reference and never as "the cost".
+        std::printf(
+            "queue state (%d x copy_act n=32 pre-issued): device left to drain "
+            "%.0f us vs %.0f us empty (a launch: %.0f vs %.0f us)\n",
+            depth, brec.tail_us, erec.tail_us, bcopy.tail_us, ecopy.tail_us);
+        std::printf(
+            "primitives, host enqueue per call: record %.2f us | copy %.2f us, "
+            "median of %d (empty queue: record %.2f | copy %.2f)\n",
+            brec.host_us, bcopy.host_us, kReps, erec.host_us, ecopy.host_us);
+        std::printf(
+            "primitives, device cost per call: record %.1f us | copy %.1f us "
+            "(empty queue: record %.1f | copy %.1f)  [time_calls arms, which "
+            "see only the dominant half: record %.2f | copy %.2f]\n",
+            brec.device_us, bcopy.device_us, erec.device_us, ecopy.device_us,
+            record_ms * 1000.0, launch_ms * 1000.0);
+    }
+    be->set_expert_pool_budget(0);
+}
+
+// The busy-queue arm's own gate. It is a check on the INSTRUMENT, not on the
+// engine: the correction the quiet-vs-busy audit rests on says a quiet-queue
+// primitive is not the in-step cost, and that claim is worth nothing unless the
+// arm can tell a busy queue from an idle one. So the gate constructs both
+// states AND the boundary between them, with no environment switch in play:
+//   - 512 copies pre-issued: the queue is still draining when the host block
+//     returns (witnessed by the tail the following sync has to wait for), and
+//     both calls are cheaper than with an empty queue -- measured 88x for the
+//     record and ~3x for the copy.
+//   - 1 copy pre-issued: nothing is left to drain, and the same block must
+//     read like the empty-queue figure. An arm that reported the busy figure
+//     here would be reporting a constant, not a queue state -- which is the
+//     defect this check exists to catch.
+// It runs even when --depth 0 was passed, because `--depth` skips the printed
+// arm and a gate check is not optional.
+i64 gate_busy_queue(Backend *be, int depth) {
+    i64 bad = 0;
+    const auto check = [&](bool ok, const char *what) {
+        std::printf("  %s busy-queue %s\n", ok ? "ok  " : "FAIL", what);
+        if (!ok) ++bad;
+    };
+    constexpr int kChunk = 64;
+    constexpr int kReps = 8;
+    const int deep = depth > 1 ? depth : 512;
+    const QueueArm bcopy = measure_queue_arm(be, deep, kChunk, kReps, false);
+    const QueueArm ecopy = measure_queue_arm(be, 0, kChunk, kReps, false);
+    const QueueArm brec = measure_queue_arm(be, deep, kChunk, kReps, true);
+    const QueueArm erec = measure_queue_arm(be, 0, kChunk, kReps, true);
+    std::printf("    device left to drain: %.0f us deep vs %.0f us empty "
+                "(launch %.0f vs %.0f us = %.2fx, needs >2.0x)\n",
+                brec.tail_us, erec.tail_us, bcopy.tail_us, ecopy.tail_us,
+                ecopy.tail_us > 0 ? bcopy.tail_us / ecopy.tail_us : 0.0);
+    std::printf("    host enqueue/call: record %.2f us | copy %.2f us\n",
+                brec.host_us, bcopy.host_us);
+    std::printf("    device cost/call:  record %.1f us | copy %.1f us\n",
+                brec.device_us, bcopy.device_us);
+    // The construction the whole arm exists for: with `deep` copies in front of
+    // them, the block's own work cannot have been retired by the time the host
+    // returns, so the tail must carry it. Launch-only, because a record's own
+    // ~24 us device marker swamps the pre-issue's leftovers in the same tail.
+    // 2.0x, not 3.0x: measured ratios run 2.9x on a busy machine to 3.7x on a
+    // quiet one, while a queue that is NOT fuller reports 1.0x, so 2.0
+    // discriminates without flapping with the machine's load. The ratios are
+    // printed so the margin is visible in the gate's own output.
+    const double tail_ratio = ecopy.tail_us > 0 ? bcopy.tail_us / ecopy.tail_us : 0.0;
+    const double dev_ratio = ecopy.device_us > 0 ? bcopy.device_us / ecopy.device_us : 0.0;
+    check(tail_ratio > 2.0,
+          "a queue holding `depth` calls is measurably fuller than an empty one "
+          "(device left to drain: launch arm)");
+    check(dev_ratio > 2.0, "and the same difference is visible per call");
+    // The defect the arm was built to stop: quoting one half of a call as the
+    // call. A legacy-stream record is ~0.3 us of host enqueue and ~28 us of
+    // device marker; a table that measures 28 us by T(N)-T(1) has measured the
+    // device half and called it the record.
+    check(brec.device_us > 4.0 * brec.host_us,
+          "a record's device half is >=4x its host half (so the two figures a "
+          "table might quote are not the same number)");
+    // And the claim this run DISPROVED, inverted into the one it supports: the
+    // queue state does not move the host enqueue. The arm used to print a
+    // "busy" record of 0.32 us beside a "quiet" 28.2 us from a different
+    // method and read the ratio as queue state; both states enqueue in 0.28 us,
+    // and the 28.2 was the device half. A future change that really does make
+    // the enqueue queue-dependent owes this check an edit.
+    check(brec.host_us < 2.0 * erec.host_us && erec.host_us < 2.0 * brec.host_us,
+          "the host enqueue is the same in both queue states (the queue changes "
+          "what the device has left, not what the enqueue costs)");
+    check(ecopy.device_us * 4.0 < erec.device_us,
+          "the instrument resolves the device cost per op (an empty queue: a "
+          "launch vs a record, >=4x apart)");
+    return bad;
+}
+
+i64 gate_expert_pool(Backend *be) {
+    i64 bad = 0;
+    const auto check = [&](bool ok, const char *what) {
+        std::printf("  %s expert-pool %s\n", ok ? "ok  " : "FAIL", what);
+        if (!ok) ++bad;
+    };
+    be->set_expert_pool_budget(4096);
+    for (size_t bytes : {size_t(257), size_t(769), size_t(1281), size_t(257)}) {
+        void *p = be->alloc_pooled(bytes);
+        be->fill0(p, bytes);
+        be->release_pooled(p, bytes);
+        const auto s = be->expert_pool_stats();
+        check(s.live == 0 && s.committed == s.reusable && s.committed <= 4096,
+              "release accounting and physical bound");
+    }
+    void *source = be->alloc(1024), *output = be->alloc(1024);
+    std::vector<u16> input(512, fp32_to_fp16(1.0f)), got(512);
+    be->upload(source, input.data(), 1024);
+    for (int i = 0; i < 16; ++i) {
+        void *p = be->alloc_pooled(1024);
+        be->copy_act(p, source, 512);
+        be->copy_act(output, p, 512);
+        be->release_pooled(p, 1024);
+        void *q = be->alloc_pooled(1024);
+        be->fill0(q, 1024);
+        be->download(got.data(), output, 1024);
+        check(got == input, "queued reader finishes before reuse");
+        be->release_pooled(q, 1024);
+    }
+    {   // The burst's shared mark has to be honored by EVERY writer that reuses
+        // one of its cells, not only the first one handed out. Three cells are
+        // read on the default stream, released in ONE call, then each handed back
+        // out and zeroed before those reads can have completed: every reader must
+        // still see its own bytes. This is the burst form of the single-cell check
+        // above, and the counter check is the sharing the whole change is for.
+        void *bc[3] = {}, *bo[3] = {};
+        size_t bl[3] = {1024, 1024, 1024};
+        std::vector<u16> bgot[3] = {std::vector<u16>(512), std::vector<u16>(512),
+                                    std::vector<u16>(512)};
+        for (int i = 0; i < 3; i++) {
+            bc[i] = be->alloc_pooled(1024);
+            bo[i] = be->alloc(1024);
+            be->copy_act(bc[i], source, 512);
+            be->copy_act(bo[i], bc[i], 512);
+        }
+        const auto b0 = be->expert_pool_stats();
+        be->release_pooled_batch(bc, bl, 3);
+        const auto b1 = be->expert_pool_stats();
+        check(b1.release_marks - b0.release_marks == 1 &&
+                  b1.release_slices - b0.release_slices == 3,
+              "a three-slice burst shares one release mark");
+        bool reused[3] = {false, false, false};
+        for (int i = 0; i < 3; i++) {
+            void *q = be->alloc_pooled(1024);
+            for (int j = 0; j < 3; j++)
+                if (q == bc[j]) reused[j] = true;
+            be->fill0(q, 1024);
+            be->release_pooled(q, 1024);
+        }
+        check(reused[0] && reused[1] && reused[2],
+              "every cell of a burst is handed back out");
+        for (int i = 0; i < 3; i++) be->download(bgot[i].data(), bo[i], 1024);
+        be->sync();
+        for (int i = 0; i < 3; i++) be->release(bo[i]);
+        check(bgot[0] == input && bgot[1] == input && bgot[2] == input,
+              "every cell of a burst keeps its mark: no reader is overwritten");
+    }
+    void *staged = be->alloc_pooled(1024);
+    void *dst[] = {staged};
+    const void *src[] = {input.data()};
+    const size_t lengths[] = {1024};
+    void *ticket = be->upload_expert_staged(dst, src, lengths, 1);
+    be->wait_marker(ticket);
+    be->release_marker(ticket);
+    be->download(got.data(), staged, 1024);
+    check(got == input, "staged ticket publishes exact bytes");
+    be->release_pooled(staged, 1024);
+    be->release(source); be->release(output);
+    be->set_expert_pool_budget(0);
+    auto s = be->expert_pool_stats();
+    check(s.live == 0 && s.reusable == 0 && s.committed == 0, "shrink trims every free cell");
+    const int owner_a = 0, owner_b = 0;
+    be->set_expert_pool_owner(&owner_a, 1024);
+    be->set_expert_pool_owner(&owner_b, 2048);
+    check(be->expert_pool_stats().budget == 3072, "target and draft budgets compose");
+    be->set_expert_pool_owner(&owner_a, 0);
+    be->set_expert_pool_owner(&owner_b, 0);
+    be->set_expert_pool_budget(4096);
+    void *live = be->alloc_pooled(512);
+    be->fill0(live, 512);
+    be->set_expert_pool_budget(256);
+    check(be->expert_pool_stats().live == 512, "shrink never frees a live cell");
+    be->release_pooled(live, 512);
+    check(be->expert_pool_stats().committed == 0, "released over-budget cell is reclaimed");
+    be->set_expert_pool_budget(0);
+    return bad;
+}
+
+// ---------------------------------------------------------------------------
+// expert-lease gate: the slot lease, proven on the device
+// ---------------------------------------------------------------------------
+//
+// `test_expert_cache_warm_tier` covers the same invariant against the CPU stub
+// backend, where "the current expert's bytes are still there" is a host memcmp
+// on a buffer nobody else can touch. The device half is the one the lease
+// exists for: a staged promotion allocates from the SAME pool the current expert
+// is sitting in, so an ignored lease lets `pick_victim` release the current
+// expert's cells, `alloc_pooled` hand those exact addresses to the next expert,
+// and the current expert's weights quietly become the next expert's. There is no
+// crash and no NaN -- just a plausible number from the wrong matrix -- so the
+// check has to be the device bytes: after a concurrent staged promotion, the
+// current expert's three slices are downloaded and compared byte for byte with
+// the source they were promoted from.
+//
+// The pool's physical limit is what makes this a real test rather than a
+// formality: the cache is configured with a two-slot budget, so the staged
+// promotion CANNOT get cells without evicting something, and the only reason it
+// does not take the current expert's is the lease.
+i64 gate_expert_lease(Backend *be) {
+    i64 bad = 0;
+    const auto check = [&](bool ok, const char *what) {
+        std::printf("  %s expert-lease %s\n", ok ? "ok  " : "FAIL", what);
+        if (!ok) ++bad;
+    };
+    // One expert is three 1 KiB slices, so a cell is 1 KiB and a two-slot
+    // budget is 6144 bytes -- small enough to be a gate, sized so every cell is
+    // one aligned cell and every copy is a real DMA.
+    constexpr i64 kPer = 1024;      // bytes per slice, per expert
+    constexpr i32 kExperts = 4;
+    std::vector<u8> gate_buf(static_cast<size_t>(kPer) * kExperts);
+    std::vector<u8> up_buf(gate_buf.size());
+    std::vector<u8> down_buf(gate_buf.size());
+    for (i32 e = 0; e < kExperts; e++) {
+        for (i64 j = 0; j < kPer; j++) {
+            gate_buf[static_cast<size_t>(e) * kPer + static_cast<size_t>(j)] =
+                static_cast<u8>((e * 0x40 + j) & 0xff);
+            up_buf[static_cast<size_t>(e) * kPer + static_cast<size_t>(j)] =
+                static_cast<u8>((e * 0x40 + j + 0x10) & 0xff);
+            down_buf[static_cast<size_t>(e) * kPer + static_cast<size_t>(j)] =
+                static_cast<u8>((e * 0x40 + j + 0x20) & 0xff);
+        }
+    }
+    const auto tensor = [&](std::vector<u8> &buf) {
+        GgufTensor t;
+        t.type = DType::F16;
+        t.dtype_known = true;
+        t.n_dims = 2;
+        t.ne[0] = static_cast<u64>(kPer / 2);
+        t.ne[1] = 1;
+        t.n_elements = kPer / 2;
+        t.n_bytes = buf.size();
+        t.data = buf.data();
+        return t;
+    };
+    const GgufTensor tg = tensor(gate_buf), tu = tensor(up_buf), td = tensor(down_buf);
+    ExpertSource src;
+    src.gate = &tg;
+    src.up = &tu;
+    src.down = &td;
+    src.n_expert = kExperts;
+    src.n_embd = kPer / 2;
+    src.n_ff_exp = kPer / 2;
+
+    const auto slice_matches = [&](const QuantTensor &t, const std::vector<u8> &buf,
+                                   i32 e, const char *what) {
+        std::vector<u8> got(static_cast<size_t>(kPer));
+        be->sync();
+        be->download(got.data(), t.data, got.size());
+        const u8 *want = buf.data() + static_cast<size_t>(e) * kPer;
+        const bool ok = std::memcmp(got.data(), want, got.size()) == 0;
+        if (!ok)
+            std::printf("       lease mismatch: %s slice of expert %d\n", what,
+                        static_cast<int>(e));
+        return ok;
+    };
+
+    {   // A budget of 2.33 slots, so the staged promotion MUST evict to fit.
+        //
+        // The budget is the whole test. With room for both experts the
+        // promotion never contends for anything, the byte checks below pass for
+        // the trivial reason that nothing was reused, and ignoring the lease
+        // changes nothing (measured: the first version of this gate passed with
+        // `pick_victim`'s lease check deleted). The budget is between two and
+        // three slots (7 cells for three 3-cell experts): two experts are
+        // resident, the staged third needs a slot, so an eviction is mandatory
+        // -- and the tie in victim ranking (equal LFU counts, so oldest load
+        // order wins) makes the LEASED expert the one a lease-less eviction
+        // would take. Exactly three slots would fit and evict nothing.
+        ExpertCache cache;
+        cache.configure(be, 7 * kPer, 8 * 3 * kPer);
+        const ResidentExpert *cur = cache.acquire(src, 0, 0);
+        check(cur && cache.in_vram(0, 0), "the current expert is resident");
+        // SNAPSHOT of the three device addresses. Holding `cur` is not enough:
+        // it points into the cache's own slot, so after a re-promotion it reads
+        // the NEW pointers and any comparison against it is a tautology -- and a
+        // lease violation is exactly a re-promotion, which restores the right
+        // bytes through the wrong addresses. The addresses are what must be
+        // checked, and reading a stolen address is safe (it was handed to
+        // another expert, not freed).
+        const QuantTensor cur_gate = cur->gate, cur_up = cur->up,
+                          cur_down = cur->down;
+        check(cur && slice_matches(cur_gate, gate_buf, 0, "gate") &&
+                  slice_matches(cur_up, up_buf, 0, "up") &&
+                  slice_matches(cur_down, down_buf, 0, "down"),
+              "its device bytes match the source it was promoted from");
+        check(cache.acquire(src, 0, 1) != nullptr && cache.resident_slots() == 2,
+              "a second expert is resident beside it");
+        const i32 next_ids[] = {2, 3};
+        cache.prefetch_layer(src, 0, next_ids, 2);
+        check(cache.stage_next(src, 0, 2, 0), "the next routed expert stages concurrently");
+        // Non-vacuous: the promotion needed room, so something WAS evicted, and
+        // the only reason it was not the current expert is the lease.
+        check(cache.evictions() > 0,
+              "the staged promotion had to evict a slot to fit");
+        check(cache.active_staged() == 1, "the staged promotion is counted");
+        // The assertion this gate exists for: the SNAPSHOT addresses, read
+        // without re-acquiring, still hold the current expert's bytes. No
+        // re-promotion can launder this -- if the promotion had taken those
+        // cells, they hold the staged expert's bytes right now.
+        check(cache.in_vram(0, 0), "the leased expert is still resident");
+        check(slice_matches(cur_gate, gate_buf, 0, "gate") &&
+                  slice_matches(cur_up, up_buf, 0, "up") &&
+                  slice_matches(cur_down, down_buf, 0, "down"),
+              "a concurrent staged promotion did not overwrite the cells the leased expert is using");
+        // And the staged expert is the one whose bytes landed, not a copy of the
+        // current one: an aliased promotion that wrote the staged expert's cells
+        // into the leased expert's addresses would pass the check above only by
+        // luck.
+        const ResidentExpert *staged = cache.acquire(src, 0, 2);
+        check(staged && slice_matches(staged->gate, gate_buf, 2, "gate") &&
+                  slice_matches(staged->up, up_buf, 2, "up") &&
+                  slice_matches(staged->down, down_buf, 2, "down"),
+              "the staged expert's device bytes are its own, not the incumbent's");
+        check(cache.active_used() >= 1, "the staged copy was consumed once");
+        // The pool never exceeded the cache's own budget while all this ran.
+        const auto st = be->expert_pool_stats();
+        check(st.live <= 7 * static_cast<size_t>(kPer),
+              "physical commitment stayed inside the configured budget");
+        cache.clear();
+    }
+    {   // One slot: staging cannot fit beside the current expert, so it refuses
+        // rather than evicting the reader's weights.
+        ExpertCache cache;
+        cache.configure(be, 3 * kPer, 8 * 3 * kPer);
+        const ResidentExpert *cur = cache.acquire(src, 0, 0);
+        const i32 next_ids[] = {2};
+        cache.prefetch_layer(src, 0, next_ids, 1);
+        check(!cache.stage_next(src, 0, 2, 0), "a one-slot budget refuses to stage");
+        check(cache.in_vram(0, 0), "and the current consumer keeps its slot");
+        const ResidentExpert *after = cache.acquire(src, 0, 0);
+        check(after && cur && after->gate.data == cur->gate.data &&
+                  slice_matches(after->gate, gate_buf, 0, "gate"),
+              "its device bytes survive the refused promotion");
+        const ResidentExpert *nxt = cache.acquire(src, 0, 2);
+        check(nxt && slice_matches(nxt->gate, gate_buf, 2, "gate"),
+              "the refusal falls back to an exact demand load");
+        cache.clear();
+    }
+    // The one-slot block is where cells are provably REUSED (its second acquire
+    // evicts the first expert, which returns three cells to the free list), so
+    // it is where the guard's mechanism can be asserted rather than the bytes
+    // alone: those three cells were handed out carrying their release marks and
+    // the promotion ordered itself against them on the device.
+    const auto st = be->expert_pool_stats();
+    std::printf("       lease reuse guards: device %llu, host %llu, implicit %llu\n",
+                static_cast<unsigned long long>(st.order_device),
+                static_cast<unsigned long long>(st.order_host),
+                static_cast<unsigned long long>(st.order_implicit));
+    check(st.order_device > 0, "a reused cell's guard was honored on the device");
+    check(st.order_host == 0,
+          "the promotion path never fell back to stopping the host for a guard");
+    check(st.live == 0, "clearing both caches released every live cell");
+    be->set_expert_pool_budget(0);
+    return bad;
 }
 
 // ---------------------------------------------------------------------------
@@ -593,6 +1182,8 @@ bool floor_floor(Backend *be, int iters) {
 
 int main(int argc, char **argv) {
     int iters = 100;
+    int depth = 512; // calls pre-issued for the busy-queue arm (0 skips it)
+    double launch_ms = 0.0;
     bool sweep = false;
     bool gate = false;
     bool floor = false;
@@ -602,6 +1193,7 @@ int main(int argc, char **argv) {
         const std::string a = argv[i];
         auto next = [&]() { return std::atoll(argv[++i]); };
         if (a == "--iters") iters = static_cast<int>(next());
+        else if (a == "--depth") depth = static_cast<int>(next());
         else if (a == "--rows") one.rows = next();
         else if (a == "--out") one.n_out = next();
         else if (a == "--in") one.n_in = next();
@@ -641,10 +1233,27 @@ int main(int argc, char **argv) {
         void *b = be->alloc(1024);
         const double ms = time_calls(be, iters,
                                      [&] { be->copy_act(a, b, 32); });
-        std::printf("launch floor (copy_act n=32): %.2f us per call\n\n",
-                    ms * 1000.0);
+        // time_calls subtracts one cold call from the mean, which cannot resolve
+        // anything when the switch is 2 -- the gate's setting -- and has printed
+        // "-24.00 us per call" there. Quote only what was measured.
+        if (ms > 0.0)
+            std::printf("launch floor (copy_act n=32): %.2f us per call\n\n",
+                        ms * 1000.0);
+        else
+            std::printf("launch floor (copy_act n=32): unresolvable at "
+                        "iters=%d (the per-call subtraction needs a deeper "
+                        "switch)\n\n",
+                        iters);
+        launch_ms = ms;
         be->release(a);
         be->release(b);
+    }
+
+    // The promotion path's own bookkeeping, beside the launch floor: both are
+    // fixed per-call costs a decode step pays hundreds of times.
+    if (!gate) {
+        bench_pool_primitives(be, iters, depth, launch_ms);
+        std::printf("\n");
     }
 
     const Shape sweep_shapes[] = {
@@ -687,8 +1296,13 @@ int main(int argc, char **argv) {
     }
 
     if (gate || sweep) {
+        std::printf("\nexpert-lease (device):\n");
+        failures += gate_expert_lease(be);
         std::printf("\nlogits_topk:\n");
         failures += gate_topk_all(be);
+        failures += gate_expert_pool(be);
+        std::printf("\nbusy-queue arm (device) -- the instrument's own control:\n");
+        failures += gate_busy_queue(be, depth);
     }
 
     // clean exit path only when every test group has returned.

@@ -1,7 +1,10 @@
 # KRAKEN — pending work and open issues
 
 Live list of what is unfinished, what is broken, and what is blocked. Ordered
-by severity, not by age. Last updated after commit `7337f3b`.
+by severity, not by age. Current pass: 2026-10-11, C1 fixed, Spark rechecked,
+bounded expert prefetch repaired. [Current pending index](AUDIT-pending-index.md)
+and [expert-cache plan](AUDIT-expert-cache-next.md) distinguish open work from
+the historical entries below.
 
 Status of each area is in [docs/STATUS.md](STATUS.md); this file is the
 "what still needs doing" view of the same project.
@@ -143,10 +146,69 @@ a draft file is not a target.
 
 ## MoE residency: the consolidated open list (2026-10-10)
 
+**2026-10-11 cache audit:** batched WARM prefetch now accounts for pending
+reservation bytes, deduplicates expert IDs, and reacquires iterators after
+eviction. Seven assertions fail before the fix; the WARM group passes 45/45
+after it. The trace analyzer now distinguishes inter-access distance from
+LRU distinct-key distance and reports per-layer active sets; no routing changes.
+The next ranked steps, Edge0/Strata concept comparison, physical-arena risks,
+and model-specific gates are in [AUDIT-expert-cache-next.md](AUDIT-expert-cache-next.md).
+This is a resource/correctness improvement, not a measured throughput claim.
+
+**2026-10-11 arena and staging pass:** the expert VRAM arena no longer grows in
+256 MiB chunks regardless of the configured budget. Cells are individually owned
+and 256-byte aligned, `committed = live + reusable`, a shrink trims free cells
+only, a reused cell waits on its release event, and the target plus draft caches
+register their budgets against one shared physical limit (the sum). The two risks
+this file previously listed -- a suspected unsigned underflow in `alloc_pooled`
+and an `hipFree` on an arena interior pointer -- are both fixed and pinned by a
+device gate in `kraken-bench --gate` plus the WARM-tier group (56/56).
+Active-expert staging is implemented and **default off** (`KRK_ACTIVE_STAGE=1`):
+output-identical, but a measured loss at constrained budgets rather than a win,
+because at those budgets the step is 75% promotion and the copy (0.69-0.74 ms) is
+twice the reader window it would hide behind (0.32-0.34 ms). Details, the overlap
+probe and all six A/B runs: [AUDIT-active-expert-staging.md](AUDIT-active-expert-staging.md),
+raw evidence in [traces/active-expert-staging-2026-10-11.txt](traces/active-expert-staging-2026-10-11.txt).
+
+**2026-10-11 promotion-path allocator pass (a WIN, unlike the staging arm):** the
+481.8-618.4 ms `alloc` row at `--expert-cache-mb 16` was not the allocator at all.
+`kraken-bench` now prints the pool's marginal primitives, and they say the cost was
+a *readiness query on a pending event* (46.9 us) once per cell reuse: 5560 cells x
+87 us = 484 ms, which is the row to the millisecond. The guard is now deferred to
+the device -- the reused cell carries its release mark and the next writer issues
+`hipStreamWaitEvent` -- and no query is issued. `alloc` 618.4 -> 182.5 ms, decode
+**+11.279% at 16 MiB and +8.569% at 32 MiB** (9/9 pairs each, order-balanced,
+text md5 unchanged), with the resident control at NO DIFFERENCE. `KRK_POOL_HOST_WAIT=1`
+restores the old path for the A/B. The slot lease also has a device-side gate now
+(`kraken-bench --gate`'s `expert-lease`, 18 checks: a concurrent staged promotion
+provably cannot evict or alias the leased expert's device bytes). Evidence:
+[traces/expert-pool-allocator-2026-10-11.txt](traces/expert-pool-allocator-2026-10-11.txt).
+The release mark is now shared per eviction burst (`release_pooled_batch`), so a
+burst of three slices issues ONE record: marks 10740 -> 3580 for the same 10740
+slices. The `room` row (where the release is) fell **-31.23% / -31.28%,
+order-balanced, 9/9 pairs** at `--expert-cache-mb` 16 and 32 on
+Qwen3-MOE-4x0.6B, n=64; the decode verdict is NO DIFFERENCE (+1.287% / +2.133%),
+because the row is ~18 ms of a ~3.2 s run. **The "~128 ms" that was recorded here
+was a quiet-queue estimate and is 10x too big**: a record costs ~29-31 us in
+`kraken-bench`'s primitives and ~2.5 us marginal in a decode step (7252 records
+removed = 18 ms). Evidence:
+[traces/expert-pool-burst-marks-2026-10-11.txt](traces/expert-pool-burst-marks-2026-10-11.txt).
+
 Everything below was gathered in one sherlock pass over Laguna's MoE loading,
 on this box, with the commands named. Ranked by measured size, not by taste.
 
 ### What is now settled, so it is not re-derived
+
+**No per-op constant from `kraken-bench` is the in-step cost, and the factor is
+not one number.** `docs/AUDIT-quiet-vs-busy-primitives.md` measures each one three
+ways (quiet queue, busy-queue host enqueue, in-step by switch A/B): the record is
+**11-12x over** (28-31 us quiet, 2.56 us in-step -- it sized the ~128 ms item this
+list used to rank first), a trivial launch is ~1x if the call carries a memory
+pass and ~3.3x over for a pure enqueue, a **device drain is ~129 us** where the
+bench's wait arm says 0.07 us, and the pending-event query was already calibrated
+at 1.0x (484 ms predicted, 481.8 measured). `kraken-bench` now prints a
+busy-queue line beside the quiet one, and `--depth 0` skips it. Rule: rank a fold
+by running the fold in one session; constants size a plan to ~2x.
 
 **The hot experts do run on the GPU, and this is a line in the report rather
 than an inference.** `laguna-xs2-Q4_K_M`, `--greedy -n 64 --ctx 512 --expert-warmup 1`:
@@ -365,24 +427,51 @@ packing bugs the round-trip probe caught.
 
 ---
 
-### The fused attention chain diverges at NeoX + qk_norm — OPEN, gated at load
+### The fused attention chain at NeoX + qk_norm — FIXED 2026-10-11
 
-The fused rope + kv-append + attention decode kernel (`KRK_FUSED_ATTN=0` restores
-the separate chain) carries the per-head QK-norm and both rope pairings. It is
-exact for every adjacent-pair shape measured (SmolLM2-135M, Qwen3-MoE-4x0.6B
-byte-identical to their recorded hashes) but Qwen3-8B (NeoX rope, freq_base 1e6)
-differs from the separate chain by 1-6 f16 ULP in ONE head's attention output
-(L07 head 9 seen live), first in `attn.out`, with the per-step KV cache row
-proven bit-identical by the `attn.kc` dump row. All of the kernel's norm, rope
-and merge code reads as line-for-line identical to the separate kernels, so the
-gap has resisted three read-throughs and is recorded so it is not re-derived:
-the engine gates `!(mc.rope_neox && mc.qk_norm)` shapes back onto the separate
-chain, and the backend additionally refuses partial-rope NeoX (`rot != half`)
-and whole-row qk-norm (OLMoE) shapes. The 8B model decodes byte-identical to
-its pre-fusion behavior as a result (c70cb85baa1fc).
+The defect was localized with [probe_attn_fused.hip](../tools/probe_attn_fused.hip):
+identical source query and KV bytes, separate norm/rope/append/decode versus
+fused decode, hd 64/128, both pairings, norm on/off. The old NeoX per-channel
+rotation differed even with norm OFF; the earlier extra-f16-cast edit was
+redundant because the norm helper already returns f16. Query differences occur
+at f16 rounding boundaries; KV remains exact. Compiler contraction is a
+mechanism hypothesis, not an inspected-ISA finding.
+
+Full NeoX now gives one thread both outputs of a rotation pair, writes a tiny
+f16 shared-memory row, then repacks the attention lanes. Probe: 1280/1280 exact
+cases including query bytes, both caches, diagnostic and production kernels.
+The full-NeoX QK-norm gate is enabled by default; `KRK_FUSED_ATTN_NEOX=0`
+restores the old gate and `KRK_FUSED_ATTN=0` restores the entire separate chain.
+Partial NeoX (`rot != half`), whole-row norm, and unsupported shapes remain refused.
+
+The three stdout hashes reproduce at raw prompt `The history of computing is
+a history of abstraction`, `-n 64 --greedy --ctx 512`, stderr separate:
+SmolLM2 `d6e2b2b3b00b397dd3fa89722790218e`, Qwen3-MoE
+`995c6b60e743e20139cd6e95c23fceb3`, Qwen3-8B
+`c70cb85baa1fc2542bea514d86cbc04f`. Nine interleaved 8B pairs keep the last
+hash in every arm. Timing verdict **NO DIFFERENCE** (balanced +10.675%, MAD
+11.368%); shared-machine noise and a HIP runtime/SDK mismatch warning forbid
+a speed claim. Full tests 2916/2916, baseline/bench/build gates pass,
+three-model coherence 3/3. Evidence: [todo-processing-2026-10-11.txt](traces/todo-processing-2026-10-11.txt).
 
 
-### Spark_one.Q6_K: one prompt of five diverges from the CPU reference — NO DEFECT FOUND
+### Spark_one.Q6_K drift — NOT REPRODUCED on 2026-10-11; historical record below
+
+Current-build raw prompts at `-n 32 --ctx 512 --chunk 32`, `KRK_CHAT=0`:
+`Hello`, `Write a Python function that reverses a list.`, `The quick brown fox
+jumps over`, and both computing prompts (short and extended with `, from
+relays to vacuum tubes`) all give identical CPU/device text: **5/5 PASS**.
+The old table below is retained as history, not a live failure verdict.
+
+At raw short computing prompt `-n 160 --ctx 1024 --chunk 32`, five default
+GPU runs have stdout md5 `88dd81768ea632248157f5f6e8b238de`. The fused chain
+bypasses split dispatch, so the meaningful race recheck also sets
+`KRK_FUSED_ATTN=0`: five split-enabled runs and `KRK_ATTN_SPLIT=0` all have
+that same hash, reaching position 168 (split threshold is 128 keys).
+The scalar 160-token arm **timed out at 120 s (rc=124)** after 133 picks,
+all matching the GPU through position 141. This is partial evidence only;
+full long CPU coherence is not claimed. No new Q6_K defect was established.
+See [durable evidence](traces/todo-processing-2026-10-11.txt).
 
 `FAIL (drift step 12 (474 vs 11694))` in the full sweep; it is the only
 failure of 31 runnable models. **This entry records five dead ends so they are
@@ -969,9 +1058,8 @@ the suspect. Fix = take dequant off the critical path: double-buffered LDS, a
 
 ## P3 — documentation
 
-- **`qwen35` / `qwen35moe` are missing from the supported-models list** in
-  [README.md](../README.md) even though both load and run. Add them once the
-  GPU path is reproducible.
+- **Closed:** `qwen35` / `qwen35moe` are in the README supported-models list
+  (hybrid recurrent/attention subsection). The old missing-entry claim is stale.
 - The README benchmark table has no 9B / gated-delta-net row, because there is
   no trustworthy number to put there yet.
 - `--debug-topk` is documented in `--help` only; it belongs in the README's
@@ -979,15 +1067,15 @@ the suspect. Fix = take dequant off the critical path: double-buffered LDS, a
 
 ---
 
-## P4 — known limits carried forward from STATUS.md §6
-
-- IQ\* formats except IQ4_NL **were** rejected at load by design. As of 2026-10-06 IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S and IQ1_M are decoded on host and device, as are BitNet's Q1_0 (41) and Q2_0 (42). The only remaining quant refusals are ids **102, 104 and 107**, which have no authoritative block layout here; 142 (PQ2_0) and 143 (PTQ1_0) landed 2026-10-07 host and device, block-1024 Hadamard activation transform included.
+## P4 — known limits carried forward from STATUS.md §6- The listed IQ, Q1/Q2, ROCmFPX 102/104/107 and PrismML 142/143 formats
+  now have host/device decoders. Architecture refusals remain distinct from
+  quant support; this is not a claim that every file using those formats runs.
 - Serving is serialized: no prefix cache, no cancellation, no concurrent
   batching, no beam search.
 - Speculative decoding is greedy-only; no MTP, tree attention, or n-gram
   speculation.
-- Attention decode launches one block per head (no split-K); sampling is on
-  the host.
+- Attention decode has a split-key path (race fixed); the fused chain is
+  one block per head. Sampling is host-driven with device candidate support.
 - The fused decode-layer GEMM phase
   ([src/hip/kernels/fused.hpp](../../src/hip/kernels/fused.hpp)) is a measured
   prototype — `backend_hip.hip` still launches the gemvs separately, so its
@@ -1292,13 +1380,13 @@ the gate) so a regression cannot hide again. Then G2, then G3, then G4/G5.
 | T5 | HIP graph capture — blocked on T4 plus fixed expert slots, because a graph bakes in weight pointers that move whenever the cache evicts | blocked |
 | T6 | CPU expert fallback (Fiddler) — measured ceiling 1.84x overlapped / 1.20x serial | **built; measured 3.1x LOSS at a 16 MiB expert budget (5.5 vs 17.2 tok/s), and inert when the budget holds the routed set. Opt-in, default off. The ceiling's "perfect overlap" assumption is what failed.** |
 | T7 | Cross-layer expert prediction — nothing exists but the trace instrumentation | open |
-| T8 | Tiered KV cache: VRAM HOT / RAM WARM / NVMe COLD, radix prefix reuse, persistence. Zero implementation | open |
+| T8 | Tiered KV cache HOT/WARM/COLD and packed per-layer geometry | **implemented and geometry-gated**; radix prefix reuse and persistence remain open |
 | T9 | 6/8/12/16 GiB hardware profiles, slot strategy per spec §28-29 | open |
 | T10 | **RDNA2 validation — now actionable on maclin** | open |
-| T11 | Quant: **every listed format is now implemented on both host and device**, IQ2_XS's missing `dequant_chunk` branch included -- see the dequant session entry at the end of this file. **`qwen4exp` still has no registry entry** (this is the Qwen3.8-Flash item, and it is why `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS` is refused on the arch rather than the quant). Ids 102/104/107 are now implemented from the ROCmFPX fork (2026-10-07); 142/143 resolved from the PrismML fork header, 2026-10-07 | **`qwen4exp` still open; all quant ids 100..143 done except the arch-gated ones** |
+| T11 | Listed quant formats have host/device implementations; `qwen4exp` has a named registry refusal | **quant work closed**; qwen4exp's attention/SSM/QSA/hyperconnection/PLE execution remains open, not its table entry |
 | T12 | Correctness: laguna greedy output not reproducible run-to-run — **the decode-attention split-K race responsible is identified and fixed** (see the entry above); DFlash 0%; Spark_one.Q6_K; two ambiguous `device rc=0, cpu rc=1` models | needs re-verification |
 | T13 | **The gate has no equivalence test for fast paths** — the reason a 41%-wrong kernel shipped and survived | open |
-| T14 | Doc drift: README says a 32x64x64 WMMA tile (code: BK=128) and "weights are never dequantized" (the WMMA prefill path stages fp16 through LDS) | open |
+| T14 | README WMMA tile and quantized-residency wording | **fixed 2026-10-11:** 32x64x128; explicit transient f16/LDS staging, no full f16 weight copy |
 
 ### T15-T20 specified with no code at all
 
@@ -1479,8 +1567,8 @@ sizes and load.
 
 **Still refused, and it is not a decoder gap:**
 
-- `qwen4exp` (Qwen3.8-Flash) has no registry entry; that is why
-  `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS` is refused on architecture, not quant.
+- `qwen4exp` (Qwen3.8-Flash) now has a named registry refusal; its execution
+  features, not a missing table entry or decoder, keep these files refused.
 - The ROCmFPX ids 102/104/107, and the PrismML ids 142/143, are now implemented
   (2026-10-07). 102/104/107 from the ROCmFPX fork's `rocmfpx_dequantize_row_fp{2,3,6}`
   with UE4M3 half-block scales; 142/143 from the PrismML fork's block structs plus
@@ -1524,9 +1612,9 @@ so the identity is not a promise the file makes. Without the fix
 
 **NOT STARTED -- none of the above is progress on these three:**
 
-- **Qwen3.8-Flash / the `qwen4exp` architecture.** Still no registry entry, so
-  `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS` is refused on the architecture, not
-  on the quantisation. G7/T11 stay open for exactly this.
+- **Qwen3.8-Flash / `qwen4exp` execution.** A registry entry exists and refuses
+  with named gated-attention/SSM/QSA/hyperconnection/PLE gaps. Those execution
+  features remain open; the table entry and listed quant decoders are done.
 - **The 99%-hot-expert accuracy target.** Nothing measured against it this
   session; the expert-cache work below is a separate, earlier thread.
 - **The prefill speedup.** T2 / G1 remain untouched.

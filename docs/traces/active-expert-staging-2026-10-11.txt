@@ -1,0 +1,360 @@
+Active-expert staging: raw evidence, 2026-10-11
+machine: AMD Radeon RX 9070 XT (gfx1201), 15.9 GiB VRAM, 96 GB host RAM
+binary: build-hip/kraken.exe (build5, rc=0, 0 error: lines; fingerprint re-recorded)
+model : models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+prompt: The history of computing is a history of abstraction, ctx 512, n 32, --greedy
+
+############ 1. overlap probe, 16 MiB budget, KRK_STAGE_TIMING=1 ############
+--- command ---
+KRK_ACTIVE_STAGE=<arm> KRK_STAGE_TIMING=1 build-hip/kraken.exe --model models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf \
+  --expert-cache-mb 16 --expert-warm-mb 768 --expert-warmup 0 -p "<prompt>" -n 32 --greedy --ctx 512
+
+--- arm B: KRK_ACTIVE_STAGE=1 (staged) ---
+[stats ] active-stage issued 868, consumed 868, demand wait 424.745 ms
+[stats ] stage-timing 868 staged copies: 598.237 ms copy, 296.280 ms reader window, 290.557 ms overlapped, hidden 467/868
+[stats ] expert-pool budget 16777216 committed 15777792 live 12238848 reusable 3538944 bytes; alloc 1012 reuse 4526 trim 1004 guard-fallback 0
+[stats ] experts   16 MiB VRAM budget, 2/2 slots resident, 0 pinned | WARM 768 MiB pageable, 110 held (599 MiB, 599 MiB prefetched)
+[stats ] cache     1846 acquires | HOT hits 0 (0.0%) | WARM hits 1846 (100.0%) | COLD misses 110 (6.0%)
+[stats ] transfer  1846 promotions, 10059 MiB in 1525.3 ms = 6.4 GB/s (826.3 us/expert) | 1844 VRAM evictions kept in WARM, 10048 MiB | 599 MiB read from the file (18.73 MiB/tok)
+[stats ] expert-path  read     75.6 ms | room     34.9 ms | alloc    608.0 ms | xfer    881.8 ms | (promote total   1525.3 ms)
+
+--- arm A: KRK_ACTIVE_STAGE=0 (demand) ---
+[stats ] active-stage issued 0, consumed 0, demand wait 0.000 ms
+[stats ] expert-pool budget 16777216 committed 15777792 live 12238848 reusable 3538944 bytes; alloc 666 reuse 4872 trim 658 guard-fallback 0
+[stats ] experts   16 MiB VRAM budget, 2/2 slots resident, 0 pinned | WARM 768 MiB pageable, 110 held (599 MiB, 599 MiB prefetched)
+[stats ] cache     1846 acquires | HOT hits 0 (0.0%) | WARM hits 1846 (100.0%) | COLD misses 110 (6.0%)
+[stats ] transfer  1846 promotions, 10059 MiB in 1573.0 ms = 6.2 GB/s (852.1 us/expert) | 1844 VRAM evictions kept in WARM, 10048 MiB | 599 MiB read from the file (18.73 MiB/tok)
+[stats ] expert-path  read     76.0 ms | room     36.8 ms | alloc    599.6 ms | xfer    935.9 ms | (promote total   1573.0 ms)
+
+--- stdout md5 (both arms) ---
+28fa19c3733a5cab9dc53611de71600c */tmp/krk-active-staging/probe2-0.out
+28fa19c3733a5cab9dc53611de71600c */tmp/krk-active-staging/probe2-1.out
+
+############ 2. interleaved order-balanced A/B, final binary ############
+=== final-16.log ===
+sherlock A/B: hybrid kernel swap behind KRK_TIME_OP, interleaved
+  binary   : /c/Users/rr/OneDrive/Desktop/kraken/build-hip/kraken.exe
+  model    : models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+  prompt   : The history of computing is a history of abstraction
+  ctx=512 n=32 reps=9
+  common CLI: --expert-cache-mb 16 --expert-warm-mb 768 --expert-warmup 0
+  arm A    : env KRK_ACTIVE_STAGE=0
+  arm B    : env KRK_ACTIVE_STAGE=1
+
+  rep  order   arm  decode tok/s   ms/step   prefill tok/s   md5        rc
+  1    A B     A    14.8            67.8      32.5            28fa19c373 0
+  1    A B     B    15.0            66.6      34.4            28fa19c373 0
+  2    B A     B    14.3            70.0      32.4            28fa19c373 0
+  2    B A     A    12.9            77.7      29.7            28fa19c373 0
+  3    A B     A    15.2            65.7      30.6            28fa19c373 0
+  3    A B     B    14.8            67.7      35.3            28fa19c373 0
+  4    B A     B    14.7            67.9      33.6            28fa19c373 0
+  4    B A     A    16.0            62.4      35.1            28fa19c373 0
+  5    A B     A    15.3            65.2      35.9            28fa19c373 0
+  5    A B     B    14.4            69.7      32.5            28fa19c373 0
+  6    B A     B    13.7            73.1      32.6            28fa19c373 0
+  6    B A     A    15.2            66.0      32.1            28fa19c373 0
+  7    A B     A    15.0            66.7      32.1            28fa19c373 0
+  7    A B     B    14.4            69.3      33.3            28fa19c373 0
+  8    B A     B    14.5            68.8      32.3            28fa19c373 0
+  8    B A     A    15.0            66.5      33.5            28fa19c373 0
+  9    A B     A    15.1            66.1      35.5            28fa19c373 0
+  9    A B     B    13.8            72.7      32.3            28fa19c373 0
+
+paired deltas (B vs A, %): 1.351 10.853 -2.632 -8.125 -5.882 -9.868 -4.000 -3.333 -8.609 
+median -4.000%   MAD 4.125%   B faster in 2/9 pairs
+order split: A-first median -4.000% (5 pair(s))   B-first median -5.729% (4 pair(s))
+order-balanced median -4.864%  <- the figure the verdict uses
+
+verdict: NO DIFFERENCE -- the order-balanced median paired delta (-4.864%) does not clear
+         the spread of the pairs (MAD 4.125%), so this run does not
+         support a win. That is the honest answer for an inert switch,
+         and the reason a single pair is not evidence.
+
+=== final-32.log ===
+sherlock A/B: hybrid kernel swap behind KRK_TIME_OP, interleaved
+  binary   : /c/Users/rr/OneDrive/Desktop/kraken/build-hip/kraken.exe
+  model    : models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+  prompt   : The history of computing is a history of abstraction
+  ctx=512 n=32 reps=9
+  common CLI: --expert-cache-mb 32 --expert-warm-mb 768 --expert-warmup 0
+  arm A    : env KRK_ACTIVE_STAGE=0
+  arm B    : env KRK_ACTIVE_STAGE=1
+
+  rep  order   arm  decode tok/s   ms/step   prefill tok/s   md5        rc
+  1    A B     A    15.5            64.4      34.9            28fa19c373 0
+  1    A B     B    14.4            69.5      32.7            28fa19c373 0
+  2    B A     B    15.0            66.5      35.5            28fa19c373 0
+  2    B A     A    16.1            62.1      34.8            28fa19c373 0
+  3    A B     A    15.9            62.9      35.1            28fa19c373 0
+  3    A B     B    14.2            70.6      33.2            28fa19c373 0
+  4    B A     B    14.6            68.5      32.9            28fa19c373 0
+  4    B A     A    15.2            65.9      32.9            28fa19c373 0
+  5    A B     A    16.0            62.3      33.6            28fa19c373 0
+  5    A B     B    15.4            65.0      36.1            28fa19c373 0
+  6    B A     B    15.1            66.1      36.1            28fa19c373 0
+  6    B A     A    15.7            63.8      34.1            28fa19c373 0
+  7    A B     A    16.3            61.3      35.0            28fa19c373 0
+  7    A B     B    15.5            64.3      36.0            28fa19c373 0
+  8    B A     B    15.5            64.7      35.6            28fa19c373 0
+  8    B A     A    15.1            66.4      33.0            28fa19c373 0
+  9    A B     A    14.6            68.5      30.3            28fa19c373 0
+  9    A B     B    13.5            73.8      32.0            28fa19c373 0
+
+paired deltas (B vs A, %): -7.097 -6.832 -10.692 -3.947 -3.750 -3.822 -4.908 2.649 -7.534 
+median -4.908%   MAD 1.924%   B faster in 1/9 pairs
+order split: A-first median -7.097% (5 pair(s))   B-first median -3.8845% (4 pair(s))
+order-balanced median -5.491%  <- the figure the verdict uses
+
+verdict: REGRESSION -- B is slower by an order-balanced median -5.491% (raw -4.908%, MAD 1.924%).
+
+=== final-resident.log ===
+sherlock A/B: hybrid kernel swap behind KRK_TIME_OP, interleaved
+  binary   : /c/Users/rr/OneDrive/Desktop/kraken/build-hip/kraken.exe
+  model    : models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+  prompt   : The history of computing is a history of abstraction
+  ctx=512 n=32 reps=9
+  common CLI: (none)
+  arm A    : env KRK_ACTIVE_STAGE=0
+  arm B    : env KRK_ACTIVE_STAGE=1
+
+  rep  order   arm  decode tok/s   ms/step   prefill tok/s   md5        rc
+  1    A B     A    108.9           9.2       36.2            28fa19c373 0
+  1    A B     B    108.0           9.3       33.3            28fa19c373 0
+  2    B A     B    109.5           9.1       34.9            28fa19c373 0
+  2    B A     A    109.3           9.1       37.1            28fa19c373 0
+  3    A B     A    108.8           9.2       33.8            28fa19c373 0
+  3    A B     B    116.4           8.6       35.7            28fa19c373 0
+  4    B A     B    121.1           8.3       36.5            28fa19c373 0
+  4    B A     A    114.4           8.7       36.4            28fa19c373 0
+  5    A B     A    108.7           9.2       35.9            28fa19c373 0
+  5    A B     B    104.5           9.6       34.9            28fa19c373 0
+  6    B A     B    101.6           9.8       28.4            28fa19c373 0
+  6    B A     A    103.9           9.6       27.3            28fa19c373 0
+  7    A B     A    110.6           9.0       37.0            28fa19c373 0
+  7    A B     B    109.4           9.1       36.8            28fa19c373 0
+  8    B A     B    112.7           8.9       37.7            28fa19c373 0
+  8    B A     A    109.9           9.1       35.5            28fa19c373 0
+  9    A B     A    114.4           8.7       37.5            28fa19c373 0
+  9    A B     B    108.4           9.2       37.8            28fa19c373 0
+
+paired deltas (B vs A, %): -0.826 0.183 6.985 5.857 -3.864 -2.214 -1.085 2.548 -5.245 
+median -0.826%   MAD 3.038%   B faster in 4/9 pairs
+order split: A-first median -1.085% (5 pair(s))   B-first median 1.3655% (4 pair(s))
+order-balanced median 0.140%  <- the figure the verdict uses
+
+verdict: NO DIFFERENCE -- the order-balanced median paired delta (0.140%) does not clear
+         the spread of the pairs (MAD 3.038%), so this run does not
+         support a win. That is the honest answer for an inert switch,
+         and the reason a single pair is not evidence.
+
+
+############ 3. earlier binary (before the timing probe landed) ############
+=== constrained-16-ab.log ===
+sherlock A/B: hybrid kernel swap behind KRK_TIME_OP, interleaved
+  binary   : /c/Users/rr/OneDrive/Desktop/kraken/build-hip/kraken.exe
+  model    : models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+  prompt   : The history of computing is a history of abstraction
+  ctx=512 n=32 reps=9
+  common CLI: --expert-cache-mb 16 --expert-warm-mb 768 --expert-warmup 0
+  arm A    : env KRK_ACTIVE_STAGE=0
+  arm B    : env KRK_ACTIVE_STAGE=1
+
+  rep  order   arm  decode tok/s   ms/step   prefill tok/s   md5        rc
+  1    A B     A    16.0            62.4      34.9            28fa19c373 0
+  1    A B     B    15.3            65.4      37.1            28fa19c373 0
+  2    B A     B    15.7            63.5      35.3            28fa19c373 0
+  2    B A     A    16.3            61.3      35.0            28fa19c373 0
+  3    A B     A    16.4            60.9      36.1            28fa19c373 0
+  3    A B     B    15.4            65.1      35.6            28fa19c373 0
+  4    B A     B    15.5            64.6      35.8            28fa19c373 0
+  4    B A     A    15.9            62.8      35.5            28fa19c373 0
+  5    A B     A    16.1            62.2      35.8            28fa19c373 0
+  5    A B     B    15.3            65.4      35.6            28fa19c373 0
+  6    B A     B    14.6            68.6      32.6            28fa19c373 0
+  6    B A     A    16.2            61.6      35.9            28fa19c373 0
+  7    A B     A    16.1            62.2      36.2            28fa19c373 0
+  7    A B     B    15.3            65.4      36.3            28fa19c373 0
+  8    B A     B    15.2            65.7      35.9            28fa19c373 0
+  8    B A     A    15.6            63.9      34.1            28fa19c373 0
+  9    A B     A    15.8            63.3      34.5            28fa19c373 0
+  9    A B     B    15.2            65.6      35.6            28fa19c373 0
+
+paired deltas (B vs A, %): -4.375 -3.681 -6.098 -2.516 -4.969 -9.877 -4.969 -2.564 -3.797 
+median -4.375%   MAD 0.694%   B faster in 0/9 pairs
+order split: A-first median -4.969% (5 pair(s))   B-first median -3.1225% (4 pair(s))
+order-balanced median -4.046%  <- the figure the verdict uses
+
+verdict: REGRESSION -- B is slower by an order-balanced median -4.046% (raw -4.375%, MAD 0.694%).
+
+run dir kept at /tmp/tmp.NWcZEw2UPO
+=== constrained-32-ab.log ===
+sherlock A/B: hybrid kernel swap behind KRK_TIME_OP, interleaved
+  binary   : /c/Users/rr/OneDrive/Desktop/kraken/build-hip/kraken.exe
+  model    : models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+  prompt   : The history of computing is a history of abstraction
+  ctx=512 n=32 reps=9
+  common CLI: --expert-cache-mb 32 --expert-warm-mb 768 --expert-warmup 0
+  arm A    : env KRK_ACTIVE_STAGE=0
+  arm B    : env KRK_ACTIVE_STAGE=1
+
+  rep  order   arm  decode tok/s   ms/step   prefill tok/s   md5        rc
+  1    A B     A    16.6            60.3      34.9            28fa19c373 0
+  1    A B     B    15.0            66.7      35.3            28fa19c373 0
+  2    B A     B    15.3            65.5      36.4            28fa19c373 0
+  2    B A     A    16.2            61.8      34.5            28fa19c373 0
+  3    A B     A    16.4            61.1      36.5            28fa19c373 0
+  3    A B     B    14.6            68.4      35.4            28fa19c373 0
+  4    B A     B    14.4            69.4      35.5            28fa19c373 0
+  4    B A     A    16.3            61.5      35.0            28fa19c373 0
+  5    A B     A    16.1            62.1      35.7            28fa19c373 0
+  5    A B     B    15.4            64.9      36.2            28fa19c373 0
+  6    B A     B    14.6            68.3      34.4            28fa19c373 0
+  6    B A     A    15.4            64.9      33.5            28fa19c373 0
+  7    A B     A    16.1            62.0      35.2            28fa19c373 0
+  7    A B     B    15.3            65.3      35.1            28fa19c373 0
+  8    B A     B    15.3            65.4      35.4            28fa19c373 0
+  8    B A     A    16.0            62.4      35.5            28fa19c373 0
+  9    A B     A    16.1            62.0      35.2            28fa19c373 0
+  9    A B     B    14.6            68.3      33.9            28fa19c373 0
+
+paired deltas (B vs A, %): -9.639 -5.556 -10.976 -11.656 -4.348 -5.195 -4.969 -4.375 -9.317 
+median -5.556%   MAD 1.208%   B faster in 0/9 pairs
+order split: A-first median -9.317% (5 pair(s))   B-first median -5.3755% (4 pair(s))
+order-balanced median -7.346%  <- the figure the verdict uses
+
+verdict: REGRESSION -- B is slower by an order-balanced median -7.346% (raw -5.556%, MAD 1.208%).
+
+run dir kept at /tmp/tmp.IzhtWd71VI
+=== resident-ab.log ===
+sherlock A/B: hybrid kernel swap behind KRK_TIME_OP, interleaved
+  binary   : /c/Users/rr/OneDrive/Desktop/kraken/build-hip/kraken.exe
+  model    : models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+  prompt   : The history of computing is a history of abstraction
+  ctx=512 n=32 reps=9
+  arm A    : env KRK_ACTIVE_STAGE=0
+  arm B    : env KRK_ACTIVE_STAGE=1
+
+  rep  order   arm  decode tok/s   ms/step   prefill tok/s   md5        rc
+  1    A B     A    112.5           8.9       35.3            28fa19c373 0
+  1    A B     B    111.7           9.0       37.9            28fa19c373 0
+  2    B A     B    107.3           9.3       36.8            28fa19c373 0
+  2    B A     A    109.7           9.1       36.6            28fa19c373 0
+  3    A B     A    106.4           9.4       37.3            28fa19c373 0
+  3    A B     B    108.9           9.2       36.7            28fa19c373 0
+  4    B A     B    111.3           9.0       36.9            28fa19c373 0
+  4    B A     A    107.2           9.3       35.8            28fa19c373 0
+  5    A B     A    109.4           9.1       34.2            28fa19c373 0
+  5    A B     B    106.1           9.4       36.8            28fa19c373 0
+  6    B A     B    117.5           8.5       35.8            28fa19c373 0
+  6    B A     A    111.9           8.9       33.9            28fa19c373 0
+  7    A B     A    108.8           9.2       34.2            28fa19c373 0
+  7    A B     B    107.9           9.3       37.9            28fa19c373 0
+  8    B A     B    106.7           9.4       36.5            28fa19c373 0
+  8    B A     A    109.9           9.1       37.3            28fa19c373 0
+  9    A B     A    109.3           9.1       37.6            28fa19c373 0
+  9    A B     B    109.8           9.1       37.5            28fa19c373 0
+
+paired deltas (B vs A, %): -0.711 -2.188 2.350 3.825 -3.016 5.004 -0.827 -2.912 0.457 
+median -0.711%   MAD 2.201%   B faster in 4/9 pairs
+order split: A-first median -0.711% (5 pair(s))   B-first median 0.8185% (4 pair(s))
+order-balanced median 0.054%  <- the figure the verdict uses
+
+verdict: NO DIFFERENCE -- the order-balanced median paired delta (0.054%) does not clear
+         the spread of the pairs (MAD 2.201%), so this run does not
+         support a win. That is the honest answer for an inert switch,
+         and the reason a single pair is not evidence.
+
+run dir kept at /tmp/tmp.w48BC6AnPK
+
+############ 4. gates on the final binary ############
+=== scripts/build_check.sh (after KRK_REFRESH_FINGERPRINT=1, plain rerun) ===
+build dir: /c/Users/rr/OneDrive/Desktop/kraken/build-hip
+targets  : kraken kraken-tests kraken-inspect kraken-server kraken-bench
+
+ok    up-to-date   ninja has no pending work for: kraken kraken-tests kraken-inspect kraken-server kraken-bench
+ok    build-type   Release, -DNDEBUG in all 90 compiled .cpp TU(s), no -O0
+ok    hip-backend  KRK_ENABLE_HIP=ON, HIP enabled, kraken.exe links
+          amdhip64 and its build rule is HIP_EXECUTABLE_LINKER
+ok    gpu-target   KRK_GPU_TARGETS=gfx1201
+ok    device       AMD Radeon RX 9070 XT (gfx1201) is in KRK_GPU_TARGETS
+WARN  runtime      running a different HIP runtime than this build was linked to:
+          [warn ] the loaded HIP runtime is not the SDK this binary was built against; stage the SDK's amdhip64_*.dll next to the binary to pin the runtime
+          Stage the SDK's amdhip64_*.dll, amd_comgr.dll and rocm_kpack.dll
+          next to the binary to pin it. Measurement made under a different
+          runtime is not a measurement of this build.
+ok    fingerprint  all 5 artifact(s) match the recorded build (sha256)
+
+0 failed, 1 warning(s)
+
+=== build_check.sh sections after rebuild ===
+build dir: /c/Users/rr/OneDrive/Desktop/kraken/build-hip
+targets  : kraken kraken-tests kraken-inspect kraken-server kraken-bench
+
+ok    up-to-date   ninja has no pending work for: kraken kraken-tests kraken-inspect kraken-server kraken-bench
+ok    build-type   Release, -DNDEBUG in all 90 compiled .cpp TU(s), no -O0
+ok    hip-backend  KRK_ENABLE_HIP=ON, HIP enabled, kraken.exe links
+          amdhip64 and its build rule is HIP_EXECUTABLE_LINKER
+ok    gpu-target   KRK_GPU_TARGETS=gfx1201
+
+=== kraken_tests_baseline_check.sh ===
+kraken-tests baseline gate
+  binary   : /c/Users/rr/OneDrive/Desktop/kraken/build-hip/kraken-tests.exe
+  baseline : /c/Users/rr/OneDrive/Desktop/kraken/tests/kraken-tests-baseline.json
+
+run        rc=0, 2927/2927 checks passed
+           report: C:/Users/rr/AppData/Local/Temp/tmp.MEn3qW1dNm/report.json
+
+tool       18/18 selftest cases passed
+
+proof      17/17 selfcheck cases passed
+           group 0: 1/1 groups: every injection was reported by name, with the count it had reached
+
+baseline   recorded 2026-10-10T11:04:54Z at 9fb2be6, 54 groups
+current    54 groups, 2927/2927 checks, exit 0
+count changed (1):
+  test_expert_cache_warm_tier                  56/56 (pass)   was 34/34 (pass)
+verdict: no regression, 0 fixed, 1 changed, 0 new, 0 removed, 0 arm(s) newly broken, 0 arm(s) fixed, 0 arm(s) new, 0 arm(s) removed
+
+ok: nothing newly broke against the baseline
+
+=== kraken-bench --gate (expert-pool section) ===
+  ok   small vocab k=8        n=1000    k=8   matches host rule
+  (rows stored as f16, the backend's activation type)
+  ok   expert-pool release accounting and physical bound
+  ok   expert-pool release accounting and physical bound
+  ok   expert-pool release accounting and physical bound
+  ok   expert-pool release accounting and physical bound
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool queued reader finishes before reuse
+  ok   expert-pool staged ticket publishes exact bytes
+  ok   expert-pool shrink trims every free cell
+  ok   expert-pool target and draft budgets compose
+  ok   expert-pool shrink never frees a live cell
+  ok   expert-pool released over-budget cell is reclaimed
+  ok   expert-pool shrink never frees a live cell
+  ok   expert-pool released over-budget cell is reclaimed
+
+=== scripts/coherence_check.sh ===
+prompt: What is the capital of France?   n=32   ctx=512   chunk=32   chat=1   tie tol=0.05
+per-run timeout 120s
+each model runs twice: device arm (stdout banner must name a gfx arch)
+and --cpu scalar reference arm; PASS = the two produced identical text
+PASS                   SmolLM2-135M-Instruct.Q4_K_M.gguf          The capital of France is Paris. It is located in the northern part of the country, in th
+PASS                   Qwen3.5-0.8B.Q4_K_M.gguf                   <think>  </think>  The capital of France is **Paris**.  It is the largest city in France
+PASS                   Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf          <think> Okay, so I need to figure out the capital of France. Let me start by recalling w
+3 coherent, 0 not

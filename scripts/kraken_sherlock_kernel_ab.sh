@@ -73,6 +73,8 @@ A_SWITCH=${KRK_AB_A_SWITCH:-}
 # that are the same arm.
 SWITCH=${SWITCH//,/ }
 A_SWITCH=${A_SWITCH//,/ }
+# Common CLI arguments, split as words (not eval), for constrained-cache A/B.
+read -r -a COMMON_ARGS <<< "${KRK_AB_ARGS:-}"
 
 [ -x "$BIN" ] || { echo "FAIL: no binary at $BIN" >&2; exit 2; }
 [ -f "$MODEL" ] || { echo "FAIL: no model at $MODEL" >&2; exit 2; }
@@ -88,6 +90,7 @@ echo "  binary   : $BIN"
 echo "  model    : $MODEL"
 echo "  prompt   : $PROMPT"
 echo "  ctx=$CTX n=$N reps=$REPS"
+echo "  common CLI: ${COMMON_ARGS[*]:-(none)}"
 echo "  arm A    : env ${A_SWITCH:-(stock)}"
 echo "  arm B    : env $SWITCH"
 echo
@@ -97,7 +100,7 @@ run_arm() {
     local tag="$1" extra="$2"
     local log="$WORK/$tag.err"
     # shellcheck disable=SC2086
-    env $extra "$BIN" -m "$MODEL" -p "$PROMPT" -n "$N" --ctx "$CTX" --greedy \
+    env $extra "$BIN" -m "$MODEL" -p "$PROMPT" -n "$N" --ctx "$CTX" --greedy "${COMMON_ARGS[@]}" \
         > "$WORK/$tag.out" 2> "$log"
     echo $? > "$WORK/$tag.rc"
     md5sum "$WORK/$tag.out" | cut -d' ' -f1 > "$WORK/$tag.md5"

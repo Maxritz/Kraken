@@ -4,6 +4,7 @@
 #include "krk/arch.hpp"
 #include "krk/dflash.hpp"
 #include "krk/host_time.hpp"
+#include "krk/vram_guard.hpp"
 #include "krk/json.hpp" // the expert index reader (warm_experts)
 #include "par_pool.hpp"
 
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <sys/stat.h> // struct stat, for the GGUF file-size probe
 
 namespace krk {
@@ -60,6 +62,57 @@ bool sync_expert() {
     static const bool on = [] {
         const char *v = std::getenv("KRK_SYNC_EXPERT");
         return v && *v && std::string(v) != "0";
+    }();
+    return on;
+}
+
+// KRK_TOPK_SYNC restores the explicit hipDeviceSynchronize topk_argmax used to
+// issue between its launch and its 16-byte readback. `download` is a BLOCKING
+// hipMemcpy on the same stream, so it already orders itself behind that launch
+// -- the same argument the router readback above makes -- and the drain is a
+// second, redundant wait that a decode token pays once. Off by default; the
+// switch is the A/B arm the cost is measured against.
+bool topk_sync() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_TOPK_SYNC");
+        return v && *v && std::string(v) != "0";
+    }();
+    return on;
+}
+
+// KRK_LOGITS_SYNC=0 removes the drain in front of a full logits row readback.
+// It sits on the fallback path (a row is only downloaded when the device-side
+// argmax is unavailable), so it is off the plain decode path on a GPU -- but it
+// is the same pattern as topk_argmax's, and a switch is what makes that a
+// measurement rather than a claim. Default is the drain present, as shipped.
+bool logits_sync() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_LOGITS_SYNC");
+        return !(v && *v && std::string(v) == "0");
+    }();
+    return on;
+}
+
+// KRK_SPEC_ROW_SYNC=0 removes the per-round drain in front of the speculative
+// loop's single-row logits recompute. Reachable only with a drafter, where the
+// row is recomputed once per speculation round; default is the drain present.
+bool spec_row_sync() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_SPEC_ROW_SYNC");
+        return !(v && *v && std::string(v) == "0");
+    }();
+    return on;
+}
+
+// KRK_MOE_PLAN=0 restores one plan upload PAIR per expert visit. The default
+// builds the layer's whole routing plan once and uploads it with two copies, so
+// a visit reads its segment of the device buffer instead of issuing its own
+// pair -- on a 256-expert layer at top-8 that is 16 launches per layer of the
+// decode step down to 2.
+bool moe_plan_grouped() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_MOE_PLAN");
+        return !(v && *v && std::string(v) == "0");
     }();
     return on;
 }
@@ -417,50 +470,85 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     const i64 C = chunk_;
 
     auto alloc = [&](size_t bytes) { return be_->alloc(bytes); };
+    auto fail_alloc = [&](const char *name) {
+        if (err)
+            *err = std::string("backend allocation failed for ") + name +
+                   "; lower --ctx/--chunk or reduce model size";
+        shutdown();
+        return false;
+    };
+    auto check_alloc = [&](void *p, const char *name) {
+        if (p) return true;
+        fail_alloc(name);
+        return false;
+    };
     ws_x_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+    if (!check_alloc(ws_x_, "ws_x")) return false;
     // The residual stream's per-token storage exponents (Backend::add_residual).
     // Zeroed here and again at the start of every forward pass: an all-zero
     // array is exactly the old behavior, so a model that never leaves f16 pays
     // one i32 per row and nothing else.
     ws_rexp_ = alloc(static_cast<size_t>(C) * sizeof(i32));
+    if (!check_alloc(ws_rexp_, "ws_rexp")) return false;
     be_->fill0(ws_rexp_, static_cast<size_t>(C) * sizeof(i32));
     ws_fexp_ = alloc(static_cast<size_t>(C) * sizeof(i32));
+    if (!check_alloc(ws_fexp_, "ws_fexp")) return false;
     be_->fill0(ws_fexp_, static_cast<size_t>(C) * sizeof(i32));
 
     ws_xn_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+    if (!check_alloc(ws_xn_, "ws_xn")) return false;
     ws_x2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+    if (!check_alloc(ws_x2_, "ws_x2")) return false;
     // Qwen3.5 packs a per-head output gate behind the query, so its query
     // projection is twice the query width and the split has to gather out of
     // it. The split reads a wider row than it writes, which means an in-place
     // call has head `h` writing over rows that other heads have not read yet:
     // block order decides the result. Keep the projection in its own buffer.
     ws_q_ = alloc(static_cast<size_t>(C * q_dim_) * as);
-    if (q_proj_ != q_dim_)
+    if (!check_alloc(ws_q_, "ws_q")) return false;
+    if (q_proj_ != q_dim_) {
         ws_qpack_ = alloc(static_cast<size_t>(C * q_proj_) * as);
+        if (!check_alloc(ws_qpack_, "ws_qpack")) return false;
+    }
     ws_k_ = alloc(static_cast<size_t>(C * kv_dim_) * as);
+    if (!check_alloc(ws_k_, "ws_k")) return false;
     ws_v_ = alloc(static_cast<size_t>(C * kv_dim_) * as);
+    if (!check_alloc(ws_v_, "ws_v")) return false;
     ws_attn_ = alloc(static_cast<size_t>(C * q_dim_) * as);
+    if (!check_alloc(ws_attn_, "ws_attn")) return false;
     // Two arches carry an attention output gate and they hold it differently:
     // Qwen3.5 packs it behind the query projection (only for its recurrent
     // stack), laguna projects it separately. Both need the buffer, and this is
     // the only place it is allocated.
-    if (model_.is_recurrent() || mc.attn_gate)
+    if (model_.is_recurrent() || mc.attn_gate) {
         ws_agate_ = alloc(static_cast<size_t>(C * q_dim_) * as);
+        if (!check_alloc(ws_agate_, "ws_agate")) return false;
+    }
     // The widest FFN a layer can ask for: dense, routed expert, or shared expert.
     const i64 ff_ws = model_.n_ff_ws();
     ws_gate_ = alloc(static_cast<size_t>(C * ff_ws) * as);
+    if (!check_alloc(ws_gate_, "ws_gate")) return false;
     ws_up_ = alloc(static_cast<size_t>(C * ff_ws) * as);
-    if (model_.had().active)
+    if (!check_alloc(ws_up_, "ws_up")) return false;
+    if (model_.had().active) {
         ws_had_ = alloc(static_cast<size_t>(C * model_.had().max_width) * as);
+        if (!check_alloc(ws_had_, "ws_had")) return false;
+    }
     ws_logits_ = alloc(static_cast<size_t>(n_vocab_) * as);
+    if (!check_alloc(ws_logits_, "ws_logits")) return false;
     if (model_.is_recurrent()) {
         rec_layers_ = model_.recurrent_layers();
         ws_qkv_ = alloc(static_cast<size_t>(C * conv_dim_) * as);
+        if (!check_alloc(ws_qkv_, "ws_qkv")) return false;
         ws_z_ = alloc(static_cast<size_t>(C * value_dim_) * as);
+        if (!check_alloc(ws_z_, "ws_z")) return false;
         ws_h_ = alloc(static_cast<size_t>(C * value_dim_) * as);
+        if (!check_alloc(ws_h_, "ws_h")) return false;
         // One scalar pair per value head: tiny next to the projections.
         ws_ssm_ = alloc(static_cast<size_t>(C * mc.ssm_dt_rank) * as);
+        if (!check_alloc(ws_ssm_, "ws_ssm")) return false;
         ws_beta_ = alloc(static_cast<size_t>(C * mc.ssm_dt_rank) * as);
+        if (!check_alloc(ws_beta_, "ws_beta")) return false;
         // f32, not activation-typed: the state outlives the forward and is
         // accumulated at higher precision than the activations it is fed.
         conv_state_span_ = static_cast<i64>(mc.ssm_d_conv - 1) * conv_dim_;
@@ -475,15 +563,19 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                                  mc.ssm_d_state;
         // The fused [z|xBC|dt] projection row is wider than the conv row the
         // GDN path sizes ws_qkv_ for (10304 vs 6144 on nemotron-30B).
-        if (mc.nemotron_moe)
+        if (mc.nemotron_moe) {
             ws_m2in_ = alloc(static_cast<size_t>(C * (conv_dim_ + value_dim_ +
                                                       mc.ssm_dt_rank)) * as);
+            if (!check_alloc(ws_m2in_, "ws_m2in")) return false;
+        }
         conv_state_ = alloc(static_cast<size_t>(rec_layers_) *
                             static_cast<size_t>(conv_state_span_) * sizeof(f32));
+        if (!check_alloc(conv_state_, "conv_state")) return false;
         rec_state_ = alloc(static_cast<size_t>(rec_layers_) *
                            static_cast<size_t>(mamba2_state_span_ > 0
                                ? mamba2_state_span_ : rec_state_span_) *
                            sizeof(f32));
+        if (!check_alloc(rec_state_, "rec_state")) return false;
     }
     logits_host_ = static_cast<f32 *>(host_alloc(static_cast<size_t>(n_vocab_) * 4));
     tok_scratch_.resize(static_cast<size_t>(C));
@@ -491,23 +583,38 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // backend so that "can we use the fast path" is a runtime check and not a
     // different code path with a null to forget.
     topk_scratch_ = alloc(4096 + static_cast<size_t>(kTopKCap) * 8);
+    if (!check_alloc(topk_scratch_, "topk_scratch")) return false;
     topk_out_ = alloc(16);
+    if (!check_alloc(topk_out_, "topk_out")) return false;
+    if (!logits_host_) return fail_alloc("host logits");
 
     if (mc.is_moe && mc.n_expert > 0) {
         const i32 k = std::max<i32>(1, mc.n_expert_used);
         ws_router_ = alloc(static_cast<size_t>(C * mc.n_expert) * as);
+        if (!check_alloc(ws_router_, "ws_router")) return false;
         ws_ffn_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+        if (!check_alloc(ws_ffn_, "ws_ffn")) return false;
         // Batched-expert staging: the plan can never exceed chunk rows because
         // each (token, expert) pair consumes exactly one slot.
         ws_xg_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+        if (!check_alloc(ws_xg_, "ws_xg")) return false;
         ws_gateg_ = alloc(static_cast<size_t>(C * ff_ws) * as);
+        if (!check_alloc(ws_gateg_, "ws_gateg")) return false;
         ws_upg_ = alloc(static_cast<size_t>(C * ff_ws) * as);
-        ws_plan_ = alloc(static_cast<size_t>(C) * sizeof(i32));
-        ws_alpha_ = alloc(static_cast<size_t>(C) * sizeof(f32));
+        if (!check_alloc(ws_upg_, "ws_upg")) return false;
+        // The whole layer's plan lives in one buffer: at most one (token,
+        // expert) pair per selection slot, so C * k entries is the bound, and a
+        // visit reads [off(e), off(e+1)) of it. It was C entries when each visit
+        // uploaded its own segment.
+        ws_plan_ = alloc(static_cast<size_t>(C) * k * sizeof(i32));
+        if (!check_alloc(ws_plan_, "ws_plan")) return false;
+        ws_alpha_ = alloc(static_cast<size_t>(C) * k * sizeof(f32));
+        if (!check_alloc(ws_alpha_, "ws_alpha")) return false;
         // One multiplier per routed row, written by the scaled silu_mul and read
         // back by the scatter of the same visit. The plan can never exceed chunk
         // rows, so C entries always suffice.
         ws_scale_ = alloc(static_cast<size_t>(C) * sizeof(f32));
+        if (!check_alloc(ws_scale_, "ws_scale")) return false;
         router_host_.resize(static_cast<size_t>(C) * static_cast<size_t>(mc.n_expert));
         moe_prob_.resize(static_cast<size_t>(mc.n_expert));
         moe_sel_.resize(static_cast<size_t>(C) * static_cast<size_t>(k));
@@ -527,6 +634,35 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         plan_dev_.reserve(static_cast<size_t>(C));
         alpha_dev_.reserve(static_cast<size_t>(C));
     }
+
+    // Fail before the first forward can read or write a missing workspace.
+    // Optional workspaces are required only by the architecture/path that
+    // requested them; all fixed-size workspaces are checked unconditionally.
+    const auto require_alloc = [&](const void *p, const char *name) {
+        return p != nullptr || fail_alloc(name);
+    };
+    if (!require_alloc(ws_x_, "ws_x") || !require_alloc(ws_xn_, "ws_xn") ||
+        !require_alloc(ws_x2_, "ws_x2") || !require_alloc(ws_q_, "ws_q") ||
+        !require_alloc(ws_k_, "ws_k") || !require_alloc(ws_v_, "ws_v") ||
+        !require_alloc(ws_attn_, "ws_attn") || !require_alloc(ws_gate_, "ws_gate") ||
+        !require_alloc(ws_up_, "ws_up") || !require_alloc(ws_logits_, "ws_logits") ||
+        !require_alloc(topk_scratch_, "topk_scratch") || !require_alloc(topk_out_, "topk_out") ||
+        (q_proj_ != q_dim_ && !require_alloc(ws_qpack_, "ws_qpack")) ||
+        ((model_.is_recurrent() || mc.attn_gate) && !require_alloc(ws_agate_, "ws_agate")) ||
+        (model_.had().active && !require_alloc(ws_had_, "ws_had")) ||
+        (model_.is_recurrent() &&
+         (!require_alloc(ws_qkv_, "ws_qkv") || !require_alloc(ws_z_, "ws_z") ||
+          !require_alloc(ws_h_, "ws_h") || !require_alloc(ws_ssm_, "ws_ssm") ||
+          !require_alloc(ws_beta_, "ws_beta") || !require_alloc(conv_state_, "conv_state") ||
+          !require_alloc(rec_state_, "rec_state"))) ||
+        (mc.nemotron_moe && !require_alloc(ws_m2in_, "ws_m2in")) ||
+        (mc.is_moe && mc.n_expert > 0 &&
+         (!require_alloc(ws_router_, "ws_router") || !require_alloc(ws_ffn_, "ws_ffn") ||
+          !require_alloc(ws_xg_, "ws_xg") || !require_alloc(ws_gateg_, "ws_gateg") ||
+          !require_alloc(ws_upg_, "ws_upg") || !require_alloc(ws_plan_, "ws_plan") ||
+          !require_alloc(ws_alpha_, "ws_alpha") || !require_alloc(ws_scale_, "ws_scale"))))
+        return false;
+    if (!logits_host_) return fail_alloc("host logits");
 
     // Hybrid CPU + GPU expert compute. Resolved once, here, so the per-layer
     // path is a bool test and the worker team is created before the first
@@ -552,7 +688,33 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                  "%d/1000 of the resident set forced to the host",
                  hybrid_threads_live_, hybrid_max_rows_, hybrid_frac_permille_);
     }
-    configure_expert_cache();
+    // Every run states its headroom before it starts, dense models included.
+    // The fault this guards against reached 0.00 GiB free, and the only line
+    // that showed it printed at the END of the run -- after the display was
+    // already gone. Reading it in the first lines is what makes a card-filling
+    // configuration visible while it can still be changed.
+    {
+        const size_t vtotal = be_->device_total_bytes();
+        const size_t vfree = be_->device_free_bytes();
+        if (vtotal > 0) {
+            const size_t vrsv = krk::vram_reserve_bytes(vtotal);
+            KRK_INFO("vram headroom: %.2f GiB free of %.2f GiB total, %.2f GiB "
+                     "reserved (KRK_VRAM_RESERVE_MB overrides)",
+                     static_cast<f64>(vfree) / 1073741824.0,
+                     static_cast<f64>(vtotal) / 1073741824.0,
+                     static_cast<f64>(vrsv) / 1073741824.0);
+            if (vfree < vrsv)
+                KRK_WARN("vram headroom: free VRAM is BELOW the %.2f GiB reserve, "
+                         "so an expert tier sized against the plan will be cut "
+                         "short -- lower --ctx / --kv-hot-mb, or lower "
+                         "KRK_VRAM_RESERVE_MB if this card is dedicated",
+                         static_cast<f64>(vrsv) / 1073741824.0);
+        }
+    }
+    if (!configure_expert_cache(err)) {
+        shutdown();
+        return false;
+    }
     // KV residency -- allocated LAST, after the weights and every workspace.
     //
     // That ordering is load-bearing. Reading device_free_bytes() before the
@@ -610,10 +772,12 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             hot = free_vram > reserve ? free_vram - reserve : 0;
         }
 
-        // WARM is host RAM, so it must not be sized from device memory. With
-        // no host-memory query in the Backend interface, the honest auto is
-        // "enough to hold whatever does not fit HOT" -- bounded by the KV
-        // itself, so it cannot outgrow the machine. Explicit --kv-warm-mb wins.
+        // WARM is host RAM, so it must not be sized from device memory. A
+        // pageable allocation is admitted lazily only after a live availability
+        // check; if the OS cannot report that number, every WARM/COLD staging
+        // allocation is refused and a retained KV page makes the forward fail.
+        // Explicit --kv-warm-mb remains a capacity ceiling, not permission to
+        // cross the live host reserve.
         //
         // "Whatever does not fit HOT" is the whole cache, not the cache minus
         // the HOT bytes: the tiers must JOINTLY cover every KV-carrying layer,
@@ -628,17 +792,28 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         size_t warm = kv_total;
         if (cfg_.kv_warm_mb >= 0)
             warm = static_cast<size_t>(cfg_.kv_warm_mb) * 1048576u;
+        const size_t host_avail = be_->host_available_bytes();
+        const size_t host_reserve = krk::host_reserve_bytes(be_->host_total_bytes());
+        const size_t host_stage_room = host_avail > host_reserve
+                                           ? host_avail - host_reserve : 0;
+        const size_t already_budgeted = krk::SharedHostRamBudget::used_bytes();
+        const size_t combined_stage_room = host_stage_room > already_budgeted
+                                               ? host_stage_room - already_budgeted : 0;
+        if (warm > combined_stage_room) warm = combined_stage_room;
+        if (host_avail == 0) warm = 0; // unknown => no pageable staging
 
         // Two planes share both budgets.
         // The plane tag is not decoration: both caches share one cold
         // directory, so without it they spill to the same file name and a
         // restore returns the other plane's KV.
         if (!kvt_k_.init(be_, mc.n_layer, kv_len, hot / 2u, warm / 2u,
-                         cfg_.kv_cold_dir, "k", err) ||
-            !kvt_v_.init(be_, mc.n_layer, kv_len, hot / 2u, warm / 2u,
+                         cfg_.kv_cold_dir, "k", err)) {
+            shutdown();
+            return false;
+        }
+        if (!kvt_v_.init(be_, mc.n_layer, kv_len, hot / 2u, warm / 2u,
                          cfg_.kv_cold_dir, "v", err)) {
-            model_.unload();
-            be_ = nullptr;
+            shutdown();
             return false;
         }
         // Geometry, reported once here rather than by each plane: both planes
@@ -670,6 +845,11 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             // is too small for one pass is raised rather than obeyed -- tell
             // the caller, because it is their flag that changed and it changes
             // how much host RAM the run may touch.
+            if (kvt_k_.host_query_unknown()) {
+                KRK_WARN("kv: host-memory availability is unknown; WARM capacity "
+                         "is zero, and a retained page that cannot be spilled "
+                         "will stop inference rather than lose KV history");
+            }
             if (kvt_k_.warm_from_geometry()) {
                 const f64 applied_mib =
                     static_cast<f64>(kvt_k_.warm_slots() *
@@ -769,7 +949,11 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     if (cfg_.warmup) {
         const i32 t = tok_.bos() >= 0 ? tok_.bos() : 0;
         const Timer w;
-        forward(&t, 1, 0, true);
+        if (!forward(&t, 1, 0, true)) {
+            if (err) *err = "KV promotion refused during the engine warmup";
+            shutdown();
+            return false;
+        }
         be_->sync();
         KRK_INFO("warmup pass: %.1f ms", w.ms());
     }
@@ -932,7 +1116,7 @@ void Engine::head_compute(i32 row) {
     be_->gemm(ws_logits_, xn, head.data, head.type, n_vocab_, n_embd_, 1);
 }
 
-void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
+bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     const ModelConfig &mc = model_.cfg();
     const auto &layers = model_.layers();
     const QuantTensor &embd = model_.tok_embd();
@@ -1123,12 +1307,19 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // offset. Hence per-layer bases and a zero stride.
         void *kbase = kvt_k_.base(l);
         void *vbase = kvt_v_.base(l);
-        if (!kbase || !vbase) {
-            // Unreachable in practice: take_slot() evicts any slot that does
-            // not already hold this layer, and a layer already hot returns
-            // early above. Fail loudly rather than attend over a null cache.
-            KRK_ERROR("kv: no resident slot for layer %lld", (long long)l);
-            return;
+        // A model may have no KV on this layer; only a missing pointer for a
+        // KV-carrying layer is a resource refusal. Do not turn a valid null pair
+        // on recurrent/pure-FFN blocks into a request failure.
+        if (model_.layer_has_kv(l) && (!kbase || !vbase)) {
+            KRK_ERROR("kv: no resident slot for layer %lld (host reserve %lld MiB "
+                      "refused %lld KV promotion(s)); refusing the forward rather "
+                      "than replacing retained cache history with zeros",
+                      static_cast<long long>(l),
+                      static_cast<long long>(krk::host_reserve_bytes(be_->host_total_bytes()) /
+                                             1048576u),
+                      static_cast<long long>(kvt_k_.promotion_refused() +
+                                             kvt_v_.promotion_refused()));
+            return false;
         }
         d.layer_stride = 0;
         // RoPE + KV append + attention ride one launch on the decode
@@ -1144,17 +1335,14 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // and a separate attention gate. Whole-row qk-norm (OLMoE) and
         // partial-rope NeoX the BACKEND refuses, one call deeper.
         // Unsupported backends and shapes keep the separate chain.
-        // The QK-norm folds into the chain only for the ADJACENT rope
-        // pairing: Qwen3.5-0.8B (qk_norm + adjacent) is md5-identical
-        // fused vs separate (08afb598d17b0, both arms), but
-        // Qwen3-8B (qk_norm + NeoX, freq_base 1e6) is not -- KRK_DUMP
-        // localizes the first difference to one head of one layer's
-        // attention output at 1-6 f16 ULP, with the appended KV cache
-        // row (dump row attn.kc) proven bit-identical, so the gap is
-        // inside the fused NeoX q arm and is an open item, not a
-        // licence to diverge. NeoX shapes keep the separate chain.
+        // Full NeoX QK-norm now uses pair-owned rotation and f16 LDS
+        // storage, matching the separate chain. Keep its old gate as an A/B.
+        static const bool fused_neox = [] {
+            const char *e = std::getenv("KRK_FUSED_ATTN_NEOX");
+            return !(e && e[0] == '0');
+        }();
         if (!(n == 1 && !packed_gate && d.window == 0 && !mc.attn_gate &&
-              !(mc.rope_neox && mc.qk_norm) &&
+              (fused_neox || !(mc.rope_neox && mc.qk_norm)) &&
               be_->attn_fused_chain(ws_attn_, ws_q_, kbase, vbase,
                                       ws_k_, ws_v_, d,
                                       model_.inv_freq_at(l).data(),
@@ -1205,6 +1393,10 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // whole KV row (n_kv heads), rows = 1 at this step's position.
         dump_row("attn.kc", l,
                  static_cast<const u8 *>(kbase) +
+                     pos0 * d.pos_stride * be_->act_size(),
+                 lkv, 1);
+        dump_row("attn.vc", l,
+                 static_cast<const u8 *>(vbase) +
                      pos0 * d.pos_stride * be_->act_size(),
                  lkv, 1);
 
@@ -1284,12 +1476,13 @@ void Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
 
     // Vocab projection: the expensive part of the head, so it runs on as few
     // rows as the caller asked for. Prefill chunks skip it entirely.
-    if (mode == LogitsNone) return;
+    if (mode == LogitsNone) return true;
     if (mode == LogitsLast) {
         head_compute(n - 1);
-        return;
+        return true;
     }
     for (i32 r = 0; r < n; r++) head_compute(r);
+    return true;
 }
 
 // dst += x * W^T, folded into the projection's epilogue where the backend can
@@ -1373,9 +1566,11 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
     dump_row("attn.down", l, ws_x2_, n_embd_, n);
 }
 
-void Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
-    forward_core(toks, n, pos0, want_logits ? LogitsLast : LogitsNone);
+bool Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
+    if (!forward_core(toks, n, pos0, want_logits ? LogitsLast : LogitsNone))
+        return false;
     kv_pos_ = std::max<i64>(kv_pos_, static_cast<i64>(pos0) + n);
+    return true;
 }
 
 bool Engine::kv_rollback(i64 pos) {
@@ -1401,30 +1596,47 @@ bool Engine::kv_rollback(i64 pos) {
     // hot path) is pure pointer arithmetic. Every forward fully overwrites
     // the rows it touches and attention never reads past kv_pos_, so in both
     // cases the cache is logically exact afterwards.
-    if (kv_pos_ - pos > 64) kv_rollback_zero(pos);
+    if (kv_pos_ - pos > 64 && !kv_rollback_zero(pos)) {
+        KRK_WARN("KV rollback refused: retained history could not be staged within "
+                 "the host RAM reserve");
+        return false;
+    }
     kv_pos_ = pos;
     return true;
 }
 
-void Engine::kv_rollback_zero(i64 pos) {
+bool Engine::kv_rollback_zero(i64 pos) {
     const size_t as = be_->act_size();
+    // Resolve every layer in both planes before mutating any retained bytes.
+    // Otherwise K can be zeroed successfully and V can then refuse promotion,
+    // leaving the cache half-rolled-back while kv_pos_ still advertises the
+    // original history. The pointers remain valid through the fill pass: no
+    // tier admission occurs between this preflight and its corresponding fill.
+    std::vector<void *> kbase(static_cast<size_t>(model_.cfg().n_layer), nullptr);
+    std::vector<void *> vbase(static_cast<size_t>(model_.cfg().n_layer), nullptr);
     for (i64 l = 0; l < model_.cfg().n_layer; l++) {
-        // Per layer: only the KV-carrying layers have a plane to zero (a mamba
-        // or pure-MoE block never appended anything, and base() answers nullptr
-        // for them), and the row stride is that layer's own width.
+        if (!model_.layer_has_kv(l)) continue;
+        kbase[static_cast<size_t>(l)] = kvt_k_.base(l);
+        vbase[static_cast<size_t>(l)] = kvt_v_.base(l);
+        if (!kbase[static_cast<size_t>(l)] || !vbase[static_cast<size_t>(l)])
+            return false;
+    }
+    for (i64 l = 0; l < model_.cfg().n_layer; l++) {
         if (!model_.layer_has_kv(l)) continue;
         const size_t row = static_cast<size_t>(model_.kv_dim_at(l)) * as;
-        u8 *kb = static_cast<u8 *>(kvt_k_.base(l)) + static_cast<size_t>(pos) * row;
-        u8 *vb = static_cast<u8 *>(kvt_v_.base(l)) + static_cast<size_t>(pos) * row;
-        if (!kb || !vb) continue;
+        u8 *kb = static_cast<u8 *>(kbase[static_cast<size_t>(l)]) +
+                 static_cast<size_t>(pos) * row;
+        u8 *vb = static_cast<u8 *>(vbase[static_cast<size_t>(l)]) +
+                 static_cast<size_t>(pos) * row;
         be_->fill0(kb, (static_cast<size_t>(kv_pos_) - static_cast<size_t>(pos)) * row);
         be_->fill0(vb, (static_cast<size_t>(kv_pos_) - static_cast<size_t>(pos)) * row);
     }
+    return true;
 }
 
-void Engine::configure_expert_cache() {
+bool Engine::configure_expert_cache(std::string *err) {
     const ModelConfig &mc = model_.cfg();
-    if (!mc.is_moe || mc.n_expert <= 0) return;
+    if (!mc.is_moe || mc.n_expert <= 0) return true;
 
     // Device memory policy, in one place, because it decides how much of the
     // card the user is left with.
@@ -1487,11 +1699,28 @@ void Engine::configure_expert_cache() {
             vram_cap += kCapStep;
     }
 
+    // What the card can actually be asked for, with the reserve held back.
+    const size_t vram_reserve = krk::vram_reserve_bytes(total_vram);
+    const size_t room_now = free_now > vram_reserve ? free_now - vram_reserve : 0;
+
     size_t budget = 0;
     if (cfg_.expert_cache_mb > 0) {
         // An explicit restriction wins over the policy: the user has said how
         // much they want to spend, in expert bytes alone.
         budget = static_cast<size_t>(cfg_.expert_cache_mb) * 1024u * 1024u;
+        // ... but not over the card. A budget the machine cannot hold is
+        // refused rather than trimmed: silently keeping less than the user
+        // asked for turns their experiment into a different one, and the run
+        // would report a residency they did not choose. Name the largest
+        // budget that does fit, so the fix is one flag away.
+        // The decision itself lives in krk/vram_guard.hpp so the test suite can
+        // drive it: this refusal is the one path where being wrong either
+        // changes the user's experiment quietly (a trim) or leaves a card with
+        // nothing free (no refusal).
+        size_t largest_fits = 0;
+        if (!krk::expert_budget_fits(budget, total_vram, used_now, vram_reserve,
+                                     &largest_fits, err))
+            return false;
     } else if (be_->caps().vram_free == 0) {
         // CPU backend, or a driver that cannot say: no device memory to
         // divide, so a generous fixed share of host RAM instead.
@@ -1524,8 +1753,14 @@ void Engine::configure_expert_cache() {
                      static_cast<f64>(budget) / (1024.0 * 1024.0));
         }
     }
+    // The plan cannot see the workspaces and the KV tier, which are allocated
+    // after it, so it is clamped to the free memory measured HERE minus the
+    // reserve, and the warm-up enforces the same reserve again at promotion
+    // time. Both numbers are reported: they are the plan and the floor.
+    if (total_vram > 0 && budget > room_now) budget = room_now;
     KRK_INFO("vram policy: %.1f GiB cap%s (%.1f GiB already in use, %.1f GiB "
-             "demand, %.1f GiB free of %.1f GiB) -> expert budget %.1f MiB",
+             "demand, %.1f GiB free of %.1f GiB, %.1f GiB reserved) -> expert "
+             "budget %.1f MiB",
              static_cast<f64>(vram_cap) / static_cast<f64>(gib),
              (cfg_.vram_tier_gb > 0 && cfg_.vram_cap_mb <= 0)
                  ? " [planned for the --vram-tier class]"
@@ -1534,6 +1769,7 @@ void Engine::configure_expert_cache() {
              static_cast<f64>(demand) / static_cast<f64>(gib),
              static_cast<f64>(free_now) / static_cast<f64>(gib),
              static_cast<f64>(total_vram) / static_cast<f64>(gib),
+             static_cast<f64>(vram_reserve) / static_cast<f64>(gib),
              static_cast<f64>(budget) / (1024.0 * 1024.0));
 
     // The number of device slots the budget above is sized for, when this code
@@ -1595,7 +1831,7 @@ void Engine::configure_expert_cache() {
     //
     // Everything the run does not plan for -- the mapping, the dense trunk, the
     // OS -- is what those four terms are.
-    const size_t ram_installed = host_total_bytes();
+    const size_t ram_installed = be_->host_total_bytes();
     // --ram-tier applies the spec's tiering table to a CLASS rather than to
     // this box: plan for 16/24/32/48/64/96 GiB so a deployment can be measured
     // and tuned on a 96 GiB workstation for a 32 GiB target without pretending
@@ -1610,6 +1846,13 @@ void Engine::configure_expert_cache() {
             ram_installed > 0 && tier > ram_installed ? ram_installed : tier;
     }
     size_t host_budget = 0;
+    const size_t live_host_avail = be_->host_available_bytes();
+    const size_t host_reserve = krk::host_reserve_bytes(ram_installed);
+    const size_t host_stage_room = live_host_avail > host_reserve
+                                       ? live_host_avail - host_reserve : 0;
+    const size_t host_already_budgeted = krk::SharedHostRamBudget::used_bytes();
+    const size_t host_shared_room = host_stage_room > host_already_budgeted
+                                        ? host_stage_room - host_already_budgeted : 0;
     if (cfg_.host_ram_mb > 0) {
         host_budget = static_cast<size_t>(cfg_.host_ram_mb) * 1024u * 1024u;
     } else if (ram_total > 0) {
@@ -1622,13 +1865,17 @@ void Engine::configure_expert_cache() {
         // Real OS pressure still wins over the table: the spec requires the
         // warm tier to shrink when the machine is actually short, and the
         // table is a plan for an idle box.
-        const size_t avail = host_available_bytes();
-        if (avail > 0 && host_budget > avail / 2) host_budget = avail / 2;
+        if (live_host_avail > 0 && host_budget > live_host_avail / 2)
+            host_budget = live_host_avail / 2;
     }
+    if (host_budget > host_shared_room) host_budget = host_shared_room;
+    if (live_host_avail == 0) host_budget = 0; // unknown => no pageable staging
 
     size_t warm = 0;
     if (cfg_.expert_warm_mb > 0) {
         warm = static_cast<size_t>(cfg_.expert_warm_mb) * 1024u * 1024u;
+        if (live_host_avail == 0) warm = 0;
+        else if (warm > host_shared_room) warm = host_shared_room;
         // An explicit tier can still exceed the budget the user set for the
         // process; the budget is the outer limit, the tier is a request inside
         // it. Say so rather than silently taking the larger number.
@@ -1640,9 +1887,9 @@ void Engine::configure_expert_cache() {
             warm = host_budget;
         }
     } else if (cfg_.expert_warm_mb < 0 && be_->caps().vram_free > 0) {
-        const size_t avail = host_available_bytes();
         size_t want = host_budget;
-        if (avail > 0 && want > (avail / 2)) want = avail / 2;
+        if (host_shared_room > 0 && want > (host_shared_room / 2))
+            want = host_shared_room / 2;
         const size_t total = model_.total_expert_bytes();
         if (total > 0 && total < want) want = total; // never cache past the corpus
         const size_t floor_bytes = model_.max_expert_bytes() * 4;
@@ -1653,7 +1900,7 @@ void Engine::configure_expert_cache() {
                  "free) -> WARM tier %.0f MiB%s%s",
                  static_cast<f64>(host_budget) / static_cast<f64>(gib),
                  static_cast<f64>(ram_installed) / static_cast<f64>(gib),
-                 static_cast<f64>(host_available_bytes()) / static_cast<f64>(gib),
+                 static_cast<f64>(be_->host_available_bytes()) / static_cast<f64>(gib),
                  static_cast<f64>(warm) / (1024.0 * 1024.0),
                  cfg_.ram_tier_gb > 0 ? " [planned for the --ram-tier class]" : "",
                  cfg_.expert_warm_mb == 0 ? " (disabled by --expert-warm-mb 0)"
@@ -1683,7 +1930,7 @@ void Engine::configure_expert_cache() {
         !expert_warmup_wanted()) {
         const std::chrono::steady_clock::time_point t0 =
             std::chrono::steady_clock::now();
-        const size_t ram_before = host_available_bytes();
+        const size_t ram_before = be_->host_available_bytes();
         // Expert-major, layer-minor: with a bounded tier this fills every
         // layer's expert 0 before any layer's expert 1, so a tier smaller
         // than the corpus is shared out evenly instead of being spent on the
@@ -1691,26 +1938,44 @@ void Engine::configure_expert_cache() {
         // carries a .krakenexperts.json; this is the order that needs no
         // prior run and does not concentrate the hot set in one place.
         size_t staged = 0;
-        for (i32 e = 0; e < mc.n_expert; e++) {
+        const size_t host_reserve = krk::host_reserve_bytes(be_->host_total_bytes());
+        bool hit_host_reserve = false;
+        for (i32 e = 0; e < mc.n_expert && !hit_host_reserve; e++) {
             for (i32 l = 0; l < mc.n_layer; l++) {
                 const LayerWeights &L = model_.layers()[static_cast<size_t>(l)];
                 if (!L.experts.present()) continue;
-                staged += model_.experts().preload_one(L.experts, l, e);
+                const size_t added =
+                    model_.experts().preload_one(L.experts, l, e);
+                staged += added;
+                if (added == 0) {
+                    if (!krk::host_staging_fits(0, be_->host_available_bytes(),
+                                                host_reserve))
+                        hit_host_reserve = true;
+                    if (hit_host_reserve ||
+                        model_.experts().warm_used_bytes() >=
+                            model_.experts().warm_capacity_bytes())
+                        break;
+                }
             }
         }
+        if (hit_host_reserve)
+            KRK_INFO("expert WARM prefetch stopped at the host RAM reserve: %.0f MiB "
+                     "kept free",
+                     static_cast<f64>(host_reserve) / 1048576.0);
         const f64 stage_ms = std::chrono::duration<f64, std::milli>(
                                  std::chrono::steady_clock::now() - t0)
                                  .count();
         // Both sides of the cost: the pageable tier is what it holds, and
         // the drop in free RAM is what it actually took, mapping pages
         // included. The two differ by the size of the staged ranges.
-        const size_t ram_after = host_available_bytes();
+        const size_t ram_after = be_->host_available_bytes();
         const f64 ram_mib = ram_before > ram_after
                                 ? static_cast<f64>(ram_before - ram_after) / 1048576.0
                                 : 0.0;
         KRK_INFO("expert WARM: prefetched %.1f MiB in %.0f ms, host RAM in use "
-                 "up %.1f MiB (a VRAM miss is a promotion now, not a file read)",
-                 static_cast<f64>(staged) / 1048576.0, stage_ms, ram_mib);
+                 "up %.1f MiB (a VRAM miss is a promotion now, not a file read)%s",
+                 static_cast<f64>(staged) / 1048576.0, stage_ms, ram_mib,
+                 hit_host_reserve ? " (stopped at the host RAM reserve)" : "");
     }
     char warm_note[80] = "";
     if (warm > 0)
@@ -1747,6 +2012,11 @@ void Engine::configure_expert_cache() {
                          : "raise --expert-cache-mb, lower --ctx / --kv-hot-mb, or use a model whose routed set fits the card");
         }
     }
+    // Every path above either refused (return false) or configured the cache.
+    // This function grew a return value for the refusal; the fall-through case
+    // is the common one and needs its `true` spelled out, or the caller reads
+    // whatever was in the return register.
+    return true;
 }
 
 bool Engine::load_dflash(const std::string &path, std::string *err) {
@@ -2503,8 +2773,18 @@ void Engine::warm_experts() {
     size_t staged = 0;
     size_t from = 0;
     i32 rounds = 0;
+    // The host twin of the VRAM reserve, and for the same reason: the ram policy
+    // above plans a 20% headroom once, before the KV tier, the workspaces and
+    // the model's own buffers exist, and staging is what spends it. Ask the
+    // machine every round instead of trusting that plan.
+    const size_t host_reserve = krk::host_reserve_bytes(be_->host_total_bytes());
+    bool hit_host_reserve = false;
     while (from < depth) {
         if (out_of_time()) break;
+        if (!krk::host_staging_fits(0, be_->host_available_bytes(), host_reserve)) {
+            hit_host_reserve = true;
+            break;
+        }
         const size_t used = ec.warm_used_bytes();
         const size_t left = warm_cap > used ? (warm_cap - used) / one : 0;
         if (left == 0) break; // tier full
@@ -2523,9 +2803,20 @@ void Engine::warm_experts() {
             const LayerWeights &L = model_.layers()[static_cast<size_t>(l)];
             if (!L.experts.present()) continue;
             const size_t n = std::min(width, lst.size() - from);
+            // prefetch_layer reserves each unique expert against the live host
+            // headroom as it allocates the batch, including bytes already
+            // reserved by earlier jobs. Probe here only to stop subsequent
+            // layers after a previous layer used the remaining safe headroom;
+            // reserving n*per here would overestimate existing WARM hits and
+            // duplicate the batch's own exact accounting.
+            if (!krk::host_staging_fits(0, be_->host_available_bytes(), host_reserve)) {
+                hit_host_reserve = true;
+                break;
+            }
             staged += ec.prefetch_layer(L.experts, l, lst.data() + from,
                                         static_cast<int>(n));
         }
+        if (hit_host_reserve) break;
         from += width;
         rounds++;
         // Nothing fitted this round even though the tier reports room:
@@ -2542,9 +2833,20 @@ void Engine::warm_experts() {
     // eviction free.
     size_t promoted = 0;
     size_t promoted_bytes = 0;
+    // Stop promoting while this much VRAM is still free. Checked per round,
+    // against the driver's own count: the tier's budget came from a plan made
+    // before the workspaces and the KV tier existed, so only the driver can
+    // say what is actually left. A partly warm tier is a slow run; a card with
+    // nothing free is a machine that has to be recovered by hand.
+    const size_t vram_reserve = krk::vram_reserve_bytes(be_->device_total_bytes());
+    bool hit_reserve = false;
     if (be_->caps().vram_free > 0) {
         for (size_t r = 0; r < depth; r++) {
             if (out_of_time()) break;
+            if (be_->device_free_bytes() <= vram_reserve) {
+                hit_reserve = true;
+                break;
+            }
             bool room = false;
             for (i32 l = 0; l < mc.n_layer; l++) {
                 const std::vector<i32> &lst = ids[static_cast<size_t>(l)];
@@ -2568,6 +2870,27 @@ void Engine::warm_experts() {
 
     const f64 ms = elapsed_ms();
     const bool cut = out_of_time();
+    std::string why;
+    if (cut) why = " (stopped at the --expert-warmup-ms ceiling)";
+    else if (hit_reserve) {
+        char b[112];
+        // The total is in GiB, as the headroom line states it. Printing a GiB
+        // figure as MiB read "16000 MiB kept free of 16 MiB total" on a 15.92
+        // GiB card -- which says the card is nearly empty, the opposite of the
+        // condition the guard stopped on.
+        std::snprintf(b, sizeof(b),
+                      " (stopped at the VRAM reserve: %.0f MiB kept free of "
+                      "%.2f GiB total)",
+                      static_cast<f64>(vram_reserve) / 1048576.0,
+                      static_cast<f64>(be_->device_total_bytes()) / 1073741824.0);
+        why = b;
+    } else if (hit_host_reserve) {
+        char b[112];
+        std::snprintf(b, sizeof(b),
+                      " (stopped at the host RAM reserve: %.0f MiB kept free)",
+                      static_cast<f64>(host_reserve) / 1048576.0);
+        why = b;
+    }
     KRK_INFO("expert warmup: %s order, %d rounds, %zu experts/layer deep; WARM "
              "%.0f MiB of %.0f MiB in %zu slots (%.0f MiB read), VRAM +%zu "
              "experts (%.0f MiB, %zu slots); %.0f ms%s",
@@ -2576,7 +2899,7 @@ void Engine::warm_experts() {
              static_cast<f64>(warm_cap) / 1048576.0, ec.warm_slots(),
              static_cast<f64>(staged) / 1048576.0, promoted,
              static_cast<f64>(promoted_bytes) / 1048576.0, ec.resident_slots(),
-             ms, cut ? " (stopped at the --expert-warmup-ms ceiling)" : "");
+             ms, why.c_str());
     // The warmup's traffic is not the run's. Reset the counters it earned so
     // the residency report describes what the run did with the tiers it was
     // handed; the line above is the warmup's own record of what it spent.
@@ -3113,6 +3436,49 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                     static_cast<int>(prefetch_ids_.size()));
         }
 
+        // ---- one routing plan for the whole layer ---------------------------
+        // The (token, slot) pairs are bucketed by expert once per layer, so a
+        // visit reads [off(e), off(e+1)) of a plan that cost TWO copies instead
+        // of two per expert. The row order is what the per-expert rescan below
+        // collected -- tokens ascending, then slots ascending -- and the
+        // bucketing is the same O(n*k) walk with a prefix sum, not the
+        // O(n_expert * n * k) rescan it replaces. `KRK_MOE_PLAN=0` takes the
+        // old path and is the arm the fold is measured against.
+        const bool plan_grouped = moe_plan_grouped() && !expert_stub_;
+        if (plan_grouped) {
+            plan_off_.assign(static_cast<size_t>(ne) + 1, 0);
+            for (i32 t = 0; t < n; t++) {
+                const i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
+                for (i32 s = 0; s < k; s++) {
+                    const i32 e = sel[s];
+                    if (e >= 0 && e < ne) plan_off_[static_cast<size_t>(e) + 1]++;
+                }
+            }
+            for (i32 e = 0; e < ne; e++)
+                plan_off_[static_cast<size_t>(e) + 1] +=
+                    plan_off_[static_cast<size_t>(e)];
+            plan_dev_.resize(static_cast<size_t>(plan_off_[static_cast<size_t>(ne)]));
+            alpha_dev_.resize(plan_dev_.size());
+            plan_cur_.assign(plan_off_.begin(), plan_off_.end() - 1);
+            for (i32 t = 0; t < n; t++) {
+                const i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
+                const f32 *wt = moe_wt_.data() + static_cast<size_t>(t) * k;
+                for (i32 s = 0; s < k; s++) {
+                    const i32 e = sel[s];
+                    if (e < 0 || e >= ne) continue;
+                    const i32 at = plan_cur_[static_cast<size_t>(e)]++;
+                    plan_dev_[static_cast<size_t>(at)] = t;
+                    alpha_dev_[static_cast<size_t>(at)] = wt[s];
+                }
+            }
+            if (!plan_dev_.empty()) {
+                be_->upload_i32(static_cast<i32 *>(ws_plan_), plan_dev_.data(),
+                                static_cast<i64>(plan_dev_.size()));
+                be_->upload(static_cast<f32 *>(ws_alpha_), alpha_dev_.data(),
+                            plan_dev_.size() * sizeof(f32));
+            }
+        }
+
         for (i32 e = 0; !expert_stub_ && e < ne; e++) {
             // The host arm owns this expert on this layer. Skipping it here is
             // what leaves its weights absent from both tiers.
@@ -3144,15 +3510,25 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             const f32 gs_gt = L.experts.scale_of(L.experts.gate_scale, e);
 
             const i64 m = static_cast<i64>(group_rows_.size());
-            plan_dev_.assign(group_rows_.begin(), group_rows_.end());
-            alpha_dev_.assign(group_wt_.begin(), group_wt_.end());
-            be_->upload_i32(static_cast<i32 *>(ws_plan_), plan_dev_.data(), m);
-            be_->upload(static_cast<f32 *>(ws_alpha_), alpha_dev_.data(),
-                        static_cast<size_t>(m) * sizeof(f32));
+            const i32 *plan_i = nullptr;
+            const f32 *plan_f = nullptr;
+            if (plan_grouped) {
+                // This expert's segment of the layer plan, already on the
+                // device: no copy is issued here at all.
+                plan_i = static_cast<const i32 *>(ws_plan_) + plan_off_[e];
+                plan_f = static_cast<const f32 *>(ws_alpha_) + plan_off_[e];
+            } else {
+                plan_dev_.assign(group_rows_.begin(), group_rows_.end());
+                alpha_dev_.assign(group_wt_.begin(), group_wt_.end());
+                be_->upload_i32(static_cast<i32 *>(ws_plan_), plan_dev_.data(), m);
+                be_->upload(static_cast<f32 *>(ws_alpha_), alpha_dev_.data(),
+                            static_cast<size_t>(m) * sizeof(f32));
+                plan_i = static_cast<const i32 *>(ws_plan_);
+                plan_f = static_cast<const f32 *>(ws_alpha_);
+            }
 
             // x̃ = xn[group_rows] — the permuted activation block.
-            be_->gather_rows(ws_xg_, ws_xn_, static_cast<const i32 *>(ws_plan_), m,
-                             n_embd_);
+            be_->gather_rows(ws_xg_, ws_xn_, plan_i, m, n_embd_);
             // The global scale is folded into the INPUT rather than applied to
             // the result. Both are the same matrix product -- gs * (W x) is
             // (gs W) x -- but only this one keeps the magnitudes right inside
@@ -3334,10 +3710,17 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // (measured on Laguna-XS-2.1: 1020 clipped elements in the prefill
             // chunk, none in decode). The row carries a storage exponent like
             // the residual's, and the folds below un-scale it.
-            be_->scatter_axpy_rows(ws_ffn_, ws_x2_, static_cast<const i32 *>(ws_plan_),
-                                   static_cast<const f32 *>(ws_alpha_), m, n_embd_,
+            be_->scatter_axpy_rows(ws_ffn_, ws_x2_, plan_i, plan_f, m, n_embd_,
                                    scatter_scale,
                                    static_cast<i32 *>(ws_fexp_));
+            // Exact next expert in the existing ascending execution order.
+            // Submit its copy only after this expert's weight readers are queued.
+            const char *stage = std::getenv("KRK_ACTIVE_STAGE");
+            if (n == 1 && be_->kind() == BackendKind::HIP && stage && stage[0] == '1') {
+                i32 next = ne;
+                for (i32 id : prefetch_ids_) if (id > e && id < next) next = id;
+                if (next < ne) model_.experts().stage_next(L.experts, layer, next, e);
+            }
         }
 
         // ---- the host arm --------------------------------------------------
@@ -3581,7 +3964,7 @@ void Engine::fetch_logits(bool device_only) {
     // a boolean is invisible until you measure the thing it controls.
     if (device_only && topk_argmax(&topk_id_)) return;
     topk_valid_ = false;
-    be_->sync();
+    if (logits_sync()) be_->sync();
     be_->download_f32(logits_host_, ws_logits_, n_vocab_);
     // Gemma 2/3/4 cap the *final* logits. This is the one place logits become
     // host-visible, so every path (plain, speculative, draft) gets the bound for
@@ -3611,7 +3994,7 @@ bool Engine::topk_argmax(i32 *out) {
                      reinterpret_cast<i32 *>(zone), reinterpret_cast<f32 *>(zone + 4),
                      nullptr, topk_scratch_, kTopKCap,
                      reinterpret_cast<i64 *>(zone + 8));
-    be_->sync();
+    if (topk_sync()) be_->sync();
     // 16 bytes: the answer and the proof that it was not truncated. The old
     // path moved 993 kB and then compared 248320 of them on the host.
     be_->download(topk_out_h_, topk_out_, sizeof(topk_out_h_), 0);
@@ -3637,13 +4020,22 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
-        forward(ids.data() + i, n, static_cast<i32>(i), last);
+        if (!forward(ids.data() + i, n, static_cast<i32>(i), last)) {
+            res->error = kv_resource_error();
+            res->finish = FinishError;
+            return false;
+        }
     }
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
-        draft.forward(ids.data() + i, n, static_cast<i32>(i), last);
+        if (!draft.forward(ids.data() + i, n, static_cast<i32>(i), last)) {
+            res->error = "draft KV promotion refused by the host-memory reserve or "
+                         "an unavailable WARM/COLD page";
+            res->finish = FinishError;
+            return false;
+        }
     }
     fetch_logits();
     draft.fetch_logits(true);
@@ -3705,7 +4097,12 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
             draft_proposed_++;
             // The d-th proposal belongs at position pos+d-1 (the first extends
             // the prompt, whose rows end at pos-1).
-            draft.forward(&t, 1, static_cast<i32>(pos + d - 1), true);
+            if (!draft.forward(&t, 1, static_cast<i32>(pos + d - 1), true)) {
+                res->error = "draft KV promotion refused by the host-memory reserve or "
+                             "an unavailable WARM/COLD page";
+                finish_run(FinishError);
+                return false;
+            }
             draft.fetch_logits(true);
         }
         spec_steps_++;
@@ -3742,13 +4139,27 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
                 finish_run(FinishContext);
                 return true;
             }
-            forward(&first, 1, static_cast<i32>(pos), true);
+            if (!forward(&first, 1, static_cast<i32>(pos), true)) {
+                res->error = kv_resource_error();
+                finish_run(FinishError);
+                return false;
+            }
             pos++;
             fetch_logits();
             // Keep the draft aligned: same position convention as below —
             // feed the accepted token AT pos-1 (its natural KV slot).
-            draft.kv_rollback(pos - 1);
-            draft.forward(&first, 1, static_cast<i32>(pos - 1), true);
+            if (!draft.kv_rollback(pos - 1)) {
+                res->error = "draft KV rollback refused while realigning the "
+                             "accepted prefix";
+                finish_run(FinishError);
+                return false;
+            }
+            if (!draft.forward(&first, 1, static_cast<i32>(pos - 1), true)) {
+                res->error = "draft KV promotion refused by the host-memory reserve or "
+                             "an unavailable WARM/COLD page";
+                finish_run(FinishError);
+                return false;
+            }
             draft.fetch_logits(true);
             continue;
         }
@@ -3762,7 +4173,11 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
             finish_run(FinishContext);
             return true;
         }
-        forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone);
+        if (!forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone)) {
+            res->error = kv_resource_error();
+            finish_run(FinishError);
+            return false;
+        }
         kv_pos_ = pos + d_eff;
         // The head runs once per row into the single-row logits buffer, and
         // each row is downloaded before the next overwrites it. (Sizing
@@ -3845,7 +4260,11 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
             emitted++;
             if (pos + emitted < kv_cap_ && res->generated < p.max_tokens) {
                 const i32 b = res->tokens.back();
-                forward(&b, 1, static_cast<i32>(pos + emitted - 1), true);
+                if (!forward(&b, 1, static_cast<i32>(pos + emitted - 1), true)) {
+                    res->error = kv_resource_error();
+                    finish_run(FinishError);
+                    return false;
+                }
                 fetch_logits();
             }
         }
@@ -3876,8 +4295,18 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         // the draft has to be given it there -- see
         // spec_realign_at_natural_slot above.
         const i32 rslot = spec_realign_at_natural_slot() ? pos - 1 : pos;
-        draft.kv_rollback(rslot);
-        draft.forward(&last_tok, 1, static_cast<i32>(rslot), true);
+        if (!draft.kv_rollback(rslot)) {
+            res->error = "draft KV rollback refused while realigning the "
+                         "accepted prefix";
+                finish_run(FinishError);
+                return false;
+            }
+        if (!draft.forward(&last_tok, 1, static_cast<i32>(rslot), true)) {
+            res->error = "draft KV promotion refused by the host-memory reserve or "
+                         "an unavailable WARM/COLD page";
+            finish_run(FinishError);
+            return false;
+        }
         draft.fetch_logits();
         // The target's logits must predict pos. After a full match they came
         // from the bonus forward above. After a partial match they are block row
@@ -3891,7 +4320,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         // replaces did: the softcap is monotone, so it cannot move an argmax.
         if (!full && emitted >= 1) {
             head_compute(emitted - 1);
-            be_->sync();
+            if (spec_row_sync()) be_->sync();
             be_->download_f32(logits_host_, ws_logits_, n_vocab_);
         }
     }
@@ -3932,7 +4361,11 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
-        forward(ids.data() + i, n, static_cast<i32>(i), last);
+        if (!forward(ids.data() + i, n, static_cast<i32>(i), last)) {
+            res->error = kv_resource_error();
+            res->finish = FinishError;
+            return false;
+        }
         if (!dflash_->commit(static_cast<i32>(i), n)) return false;
     }
     fetch_logits();
@@ -3999,7 +4432,11 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
                 finish_run(FinishContext);
                 return true;
             }
-            forward(&first, 1, static_cast<i32>(pos), true);
+            if (!forward(&first, 1, static_cast<i32>(pos), true)) {
+                res->error = kv_resource_error();
+                finish_run(FinishError);
+                return false;
+            }
             dflash_->commit(static_cast<i32>(pos), 1);
             pos++;
             fetch_logits();
@@ -4100,7 +4537,11 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
                 finish_run(FinishContext);
                 return true;
             }
-            forward(&first, 1, static_cast<i32>(pos), true);
+            if (!forward(&first, 1, static_cast<i32>(pos), true)) {
+                res->error = kv_resource_error();
+                finish_run(FinishError);
+                return false;
+            }
             dflash_->commit(static_cast<i32>(pos), 1);
             pos++;
             fetch_logits();
@@ -4115,7 +4556,11 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             finish_run(FinishContext);
             return true;
         }
-        forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone);
+        if (!forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone)) {
+            res->error = kv_resource_error();
+            finish_run(FinishError);
+            return false;
+        }
         kv_pos_ = pos + d_eff;
         // Device argmax per verified row; see generate_speculative for why the
         // full-row download was the cost. With the sampled-accept accounting
@@ -4237,7 +4682,11 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
                 // which also restores the round invariant (logits predict
                 // pos + emitted).
                 kv_rollback(pos + ra);
-                forward(&tail, 1, static_cast<i32>(pos + ra), true);
+                if (!forward(&tail, 1, static_cast<i32>(pos + ra), true)) {
+                    res->error = kv_resource_error();
+                    finish_run(FinishError);
+                    return false;
+                }
                 dflash_->commit(static_cast<i32>(pos + ra), 1);
                 fetch_logits();
             } else if (res->generated >= p.max_tokens) {
@@ -4310,7 +4759,11 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             emitted++;
             if (pos + emitted < kv_cap_ && res->generated < p.max_tokens) {
                 const i32 b = res->tokens.back();
-                forward(&b, 1, static_cast<i32>(pos + emitted - 1), true);
+                if (!forward(&b, 1, static_cast<i32>(pos + emitted - 1), true)) {
+                    res->error = kv_resource_error();
+                    finish_run(FinishError);
+                    return false;
+                }
                 dflash_->commit(static_cast<i32>(pos + emitted - 1), 1);
                 fetch_logits();
             }
@@ -4332,13 +4785,19 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
         // why it is recomputed rather than copied out of rows[].
         if (!full && emitted >= 1) {
             head_compute(emitted - 1);
-            be_->sync();
+            if (spec_row_sync()) be_->sync();
             be_->download_f32(logits_host_, ws_logits_, n_vocab_);
         }
     }
 
     finish_run(res->generated >= p.max_tokens ? FinishLength : FinishContext);
     return true;
+}
+
+std::string Engine::kv_resource_error() const {
+    return "KV promotion refused by the shared host-memory reserve or an "
+           "unavailable WARM/COLD page; reduce --ctx, raise --kv-hot-mb, free "
+           "host RAM, or configure a writable --kv-cold-dir";
 }
 
 bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
@@ -4417,7 +4876,11 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
         KRK_TIME_HOST("prefill.chunk");
-        forward(ids.data() + i, n, static_cast<i32>(i), last);
+        if (!forward(ids.data() + i, n, static_cast<i32>(i), last)) {
+            res->error = kv_resource_error();
+            res->finish = FinishError;
+            return false;
+        }
     }
     fetch_logits(device_topk);
     if (expert_scan_) expert_scan_tokens_ += static_cast<i64>(ids.size());
@@ -4469,7 +4932,11 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
             // host-bound, and the gap between the two rows is host-side work
             // the device table does not see.
             KRK_TIME_HOST_N("decode.forward", hs_fwd);
-            forward(&token, 1, static_cast<i32>(pos), true);
+            if (!forward(&token, 1, static_cast<i32>(pos), true)) {
+                res->error = kv_resource_error();
+                res->finish = FinishError;
+                return false;
+            }
         }
         auto t1 = std::chrono::steady_clock::now();
         pos++;

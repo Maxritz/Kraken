@@ -8,6 +8,7 @@
 // here, which is why the engine asks the backend for its activation
 // type instead of assuming f16.
 #include "krk/backend.hpp"
+#include "krk/vram_guard.hpp"
 #include "par_pool.hpp"
 
 #include <algorithm>
@@ -100,6 +101,24 @@ public:
     std::string describe() const override {
         return format("CPU (scalar reference), %s", caps_.gfx.c_str());
     }
+    // No card here, so the memory policy has nothing to measure and would take
+    // its "cannot say" path for every run. `KRK_VRAM_TOTAL_MB` says "behave as if
+    // the card were N MiB", which is what lets the expert-budget refusal be
+    // driven end to end from the test suite without opening a device: the suite
+    // builds an MoE fixture, asks for a budget larger than the simulated card,
+    // and requires Engine::init to RETURN false. It is consulted only while this
+    // backend has no capacity of its own to report, and caps() deliberately
+    // stays 0, so the branches that key off "cannot report capacity" are
+    // untouched -- a real backend's number always wins over this, and a CPU run
+    // that does not set the variable reports 0 exactly as it did before.
+    size_t device_total_bytes() const override {
+        return krk::simulated_total_bytes();
+    }
+    size_t device_free_bytes() const override {
+        return krk::simulated_total_bytes();
+    }
+    size_t host_available_bytes() const override { return krk::host_available_bytes(); }
+    size_t host_total_bytes() const override { return krk::host_total_bytes(); }
 
     void embed(void *out, const void *tok_embd, DType tt, i64 n_vocab, i64 n_embd,
                const i32 *tokens, i64 n_tok) override {

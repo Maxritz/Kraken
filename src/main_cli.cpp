@@ -536,6 +536,34 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
         return;
     }
     const ExpertCache &ec = m.experts();
+    const auto pool = engine.expert_pool_stats();
+    std::fprintf(out, "[stats ] active-stage issued %llu, consumed %llu, demand wait %.3f ms\n",
+                 static_cast<unsigned long long>(ec.active_staged()),
+                 static_cast<unsigned long long>(ec.active_used()), ec.active_wait_ms());
+    // The overlap probe (KRK_STAGE_TIMING=1) answers the only question the
+    // staging switch turns on: did the copies actually run beside the reader
+    // kernels, or did the step merely gain a stream? Without it the A/B
+    // result is a number with no mechanism behind it.
+    if (pool.staged_measured) {
+        std::fprintf(out,
+                     "[stats ] stage-timing %llu staged copies: %.3f ms copy, "
+                     "%.3f ms reader window, %.3f ms overlapped, hidden %llu/%llu\n",
+                     static_cast<unsigned long long>(pool.staged_measured),
+                     pool.staged_copy_ms, pool.staged_reader_ms,
+                     pool.staged_overlap_ms,
+                     static_cast<unsigned long long>(pool.staged_hidden),
+                     static_cast<unsigned long long>(pool.staged_measured));
+    }
+    std::fprintf(out, "[stats ] expert-pool budget %zu committed %zu live %zu reusable %zu bytes; "
+                     "alloc %llu reuse %llu trim %llu guard-fallback %llu | "
+                     "release %llu mark(s) for %llu slice(s)\n",
+                 pool.budget, pool.committed, pool.live, pool.reusable,
+                 static_cast<unsigned long long>(pool.allocations),
+                 static_cast<unsigned long long>(pool.reuses),
+                 static_cast<unsigned long long>(pool.trims),
+                 static_cast<unsigned long long>(pool.guard_fallbacks),
+                 static_cast<unsigned long long>(pool.release_marks),
+                 static_cast<unsigned long long>(pool.release_slices));
     const u64 acq = ec.acquires();
     const f64 token_div = r.generated > 0 ? static_cast<f64>(r.generated) : 1.0;
     std::fprintf(out,
@@ -907,8 +935,12 @@ int main(int argc, char **argv) {
     const f64 load_t0 = PhaseClock::now();
     if (!engine.init(be, cfg, &err)) {
         std::fprintf(stderr, "kraken: %s\n", err.c_str());
-        delete be;
-        return 1;
+        // A refused startup must not free the backend: the engine holds
+        // pointers into the backend's buffers and its own destructor releases
+        // them through that pointer, so deleting the backend here freed it and
+        // then unwound past the engine -- SIGSEGV (exit 139) on a path whose
+        // whole job is to print one line and stop. `exit` skips that unwind.
+        std::exit(1);
     }
     // Wall time of the load, and this process's uptime at the same moment: the
     // benchmark reports both so start-to-end is a number it prints rather than

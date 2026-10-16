@@ -173,8 +173,12 @@ int main(int argc, char **argv) {
     Engine engine;
     if (!engine.init(be, cfg, &err)) {
         std::fprintf(stderr, "kraken-server: %s\n", err.c_str());
-        delete be;
-        return 1;
+        // A refused startup must not free the backend: the engine holds
+        // pointers into the backend's buffers and its own destructor
+        // releases them through that pointer, so deleting the backend here
+        // freed it and then unwound past the engine -- SIGSEGV on a path
+        // whose whole job is to print one line and stop. `exit` skips it.
+        std::exit(1);
     }
     if (!a.draft.empty()) {
         engine.set_draft_window(a.draft_tokens);

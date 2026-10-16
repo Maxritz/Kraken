@@ -200,6 +200,12 @@ public:
     // Returns bytes read.
     size_t prefetch_layer(const ExpertSource &src, i32 layer, const i32 *experts,
                           int n);
+    // One-step exact lookahead: only an already WARM next routed expert.
+    // The current expert is leased during admission; too-small budgets skip it.
+    bool stage_next(const ExpertSource &src, i32 layer, i32 expert, i32 current);
+    u64 active_staged() const { return active_staged_; }
+    u64 active_used() const { return active_used_; }
+    f64 active_wait_ms() const { return active_wait_ms_; }
     u64 bytes_staged() const { return bytes_staged_; }
     // Wall time spent copying promotions into VRAM, so the report can print
     // the one number that decides whether promotion is fast enough to hide
@@ -352,6 +358,9 @@ private:
         u32 count = 0;      // LFU counter, decayed
         u64 seq = 0;        // load order, the tie-break for victims
         bool pinned = false;
+        bool leased = false;
+        bool staged = false;
+        void *ready = nullptr;
         // WARM is inclusive: a slot may sit in both tiers at once, and a HOT
         // slot's WARM copy is what makes its eviction free. A slot in neither
         // tier is forgotten (see forget_if_dead).
@@ -386,11 +395,12 @@ private:
     // except for an expert that cannot fit the entire tier.
     bool warm_admit(const ExpertSource &src, i32 expert, Slot &s);
     // Host -> device. Makes VRAM room first, so it can evict like any miss.
-    bool promote_to_vram(Slot &s);
+    bool promote_to_vram(Slot &s, bool staged = false);
+    void finish_stage(Slot &s);
     // Evicts until one more slot of `need` bytes fits. Bytes are the test, not a
     // slot count: experts are not all one size, so counting slots against a
-    // per-expert estimate evicts with budget left unspent. Over-resides by one
-    // rather than stalling when every resident slot is pinned.
+    // per-expert estimate evicts with budget left unspent. Pins cannot override
+    // the limit; only a single oversize expert gets the explicit minimum.
     void make_vram_room(size_t need);
     // True when admitting one more slot of `need` bytes would exceed what this
     // cache is allowed to hold: the byte budget, or the explicit slot count when
@@ -454,6 +464,8 @@ private:
     f64 room_ms_ = 0;        // wall time making VRAM room
     f64 alloc_ms_ = 0;       // wall time in alloc_pooled
     f64 xfer_ms_ = 0;        // wall time in the pageable -> VRAM batch copy
+    u64 active_staged_ = 0, active_used_ = 0;
+    f64 active_wait_ms_ = 0;
     u64 promotions_ = 0;
     u64 decays_ = 0;
     u64 seq_ = 0;

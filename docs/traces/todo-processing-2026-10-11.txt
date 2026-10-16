@@ -1,0 +1,405 @@
+TODO processing evidence, 2026-10-11; gfx1201 RX 9070 XT
+Scope: no commit/push; source fixes + backlog/Edge0/Strata concepts audit.
+Build: ninja -C build-hip -j2 kraken kraken-tests kraken-bench kraken-server kraken-inspect kraken-oracle; rc=0; error lines=0.
+Runtime warning: loaded HIP 7.16.26332 versus SDK 7.16.26331; no accepted speedup.
+
+=== C1 micro-probe red (old query path) ===
+hd=64 neox=0 norm=0 output_diff=0 key_diff=0 value_diff=0
+hd=64 neox=0 norm=1 output_diff=0 key_diff=0 value_diff=0
+hd=64 neox=1 norm=0 output_diff=0 key_diff=0 value_diff=0
+hd=64 neox=1 norm=1 output_diff=0 key_diff=0 value_diff=0
+hd=128 neox=0 norm=0 output_diff=0 key_diff=0 value_diff=0
+hd=128 neox=0 norm=1 output_diff=0 key_diff=0 value_diff=0
+hd=128 neox=1 norm=0 output_diff=11 key_diff=0 value_diff=0
+hd=128 neox=1 norm=1 output_diff=11 key_diff=0 value_diff=0
+1276/1280 cases exact
+
+=== C1 final probe: production and debug query/cache comparison ===
+hd=64 neox=0 norm=0 output_diff=0 key_diff=0 value_diff=0
+hd=64 neox=0 norm=1 output_diff=0 key_diff=0 value_diff=0
+hd=64 neox=1 norm=0 output_diff=0 key_diff=0 value_diff=0
+hd=64 neox=1 norm=1 output_diff=0 key_diff=0 value_diff=0
+hd=128 neox=0 norm=0 output_diff=0 key_diff=0 value_diff=0
+hd=128 neox=0 norm=1 output_diff=0 key_diff=0 value_diff=0
+hd=128 neox=1 norm=0 output_diff=0 key_diff=0 value_diff=0
+hd=128 neox=1 norm=1 output_diff=0 key_diff=0 value_diff=0
+1280/1280 cases exact
+Compile: hipcc -O3 -ffast-math -fno-finite-math-only --offload-arch=gfx1201 --rocm-device-lib-path=G:/ROCM10RT-gfx1201/lib/llvm/amdgcn/bitcode -I include -I src tools/probe_attn_fused.hip -o build-hip/probe_attn_fused.exe; rc=0
+
+=== WARM prefetch regression: before ===
+  (no progress file at C:\Users\rr\AppData\Local\Temp/krk-tests-9852/krk-tests-group-39.progress: a crash here reports no count)
+[group 40/54] test_expert_cache_warm_tier
+FAIL C:/Users/rr/OneDrive/Desktop/kraken/tests/test_kraken.cpp:4068  prefetch reserves no more than two experts in a two-expert WARM tier
+FAIL C:/Users/rr/OneDrive/Desktop/kraken/tests/test_kraken.cpp:4070  pending reservations count against the WARM budget
+FAIL C:/Users/rr/OneDrive/Desktop/kraken/tests/test_kraken.cpp:4072  prefetch rejects the tail that cannot fit beside pending reads
+FAIL C:/Users/rr/OneDrive/Desktop/kraken/tests/test_kraken.cpp:4077  demand after a partial prefetch remains within budget
+FAIL C:/Users/rr/OneDrive/Desktop/kraken/tests/test_kraken.cpp:4084  prefetch deduplicates valid IDs and ignores invalid IDs
+FAIL C:/Users/rr/OneDrive/Desktop/kraken/tests/test_kraken.cpp:4086  duplicate IDs cannot overwrite or double-count staged buffers
+FAIL C:/Users/rr/OneDrive/Desktop/kraken/tests/test_kraken.cpp:4088  one three-slice host allocation per unique expert
+[group test_expert_cache_warm_tier] 38/45 checks
+
+=== WARM prefetch regression: after ===
+  (no progress file at C:\Users\rr\AppData\Local\Temp/krk-tests-13324/krk-tests-group-39.progress: a crash here reports no count)
+[group 40/54] test_expert_cache_warm_tier
+[group test_expert_cache_warm_tier] 45/45 checks
+
+=== Hash contracts, stdout banner+text; stderr separate ===
+SmolLM2-135M-Instruct.Q4_K_M arm=0 rc=0
+d6e2b2b3b00b397dd3fa89722790218e */tmp/krk-hash-SmolLM2-135M-Instruct.Q4_K_M-0.out
+SmolLM2-135M-Instruct.Q4_K_M arm=1 rc=0
+d6e2b2b3b00b397dd3fa89722790218e */tmp/krk-hash-SmolLM2-135M-Instruct.Q4_K_M-1.out
+Qwen3-MOE-4x0.6B-2.4B-Q4_K_M arm=0 rc=0
+995c6b60e743e20139cd6e95c23fceb3 */tmp/krk-hash-Qwen3-MOE-4x0.6B-2.4B-Q4_K_M-0.out
+Qwen3-MOE-4x0.6B-2.4B-Q4_K_M arm=1 rc=0
+995c6b60e743e20139cd6e95c23fceb3 */tmp/krk-hash-Qwen3-MOE-4x0.6B-2.4B-Q4_K_M-1.out
+Qwen3-8B raw computing prompt n=64 greedy ctx=512: c70cb85baa1fc2542bea514d86cbc04f in both arms.
+
+=== C1 repeated interleaved A/B ===
+sherlock A/B: hybrid kernel swap behind KRK_TIME_OP, interleaved
+  binary   : /c/Users/rr/OneDrive/Desktop/kraken/build-hip/kraken.exe
+  model    : G:/More-models/Qwen3-8B-Q4_K_M.gguf
+  prompt   : The history of computing is a history of abstraction
+  ctx=512 n=64 reps=9
+  arm A    : env KRK_FUSED_ATTN_NEOX=0
+  arm B    : env KRK_FUSED_ATTN_NEOX=1
+
+  rep  order   arm  decode tok/s   ms/step   prefill tok/s   md5        rc
+  1    A B     A    88.4            11.3      259.6           c70cb85baa 0
+  1    A B     B    90.2            11.1      254.9           c70cb85baa 0
+  2    B A     B    90.8            11.0      262.4           c70cb85baa 0
+  2    B A     A    69.1            14.5      255.0           c70cb85baa 0
+  3    A B     A    70.4            14.2      247.6           c70cb85baa 0
+  3    A B     B    82.3            12.1      252.1           c70cb85baa 0
+  4    B A     B    87.3            11.5      257.4           c70cb85baa 0
+  4    B A     A    41.5            24.1      190.0           c70cb85baa 0
+  5    A B     A    27.8            36.0      81.6            c70cb85baa 0
+  5    A B     B    55.3            18.1      198.9           c70cb85baa 0
+  6    B A     B    18.2            55.0      77.8            c70cb85baa 0
+  6    B A     A    44.5            22.5      192.9           c70cb85baa 0
+  7    A B     A    83.1            12.0      248.6           c70cb85baa 0
+  7    A B     B    87.7            11.4      279.1           c70cb85baa 0
+  8    B A     B    88.0            11.4      259.1           c70cb85baa 0
+  8    B A     A    87.8            11.4      262.7           c70cb85baa 0
+  9    A B     A    88.5            11.3      264.8           c70cb85baa 0
+  9    A B     B    90.2            11.1      263.2           c70cb85baa 0
+
+paired deltas (B vs A, %): 2.036 31.404 16.903 110.361 98.921 -59.101 5.535 0.228 1.921 
+median 5.535%   MAD 11.368%   B faster in 8/9 pairs
+order split: A-first median 5.535% (5 pair(s))   B-first median 15.816% (4 pair(s))
+order-balanced median 10.675%  <- the figure the verdict uses
+
+verdict: NO DIFFERENCE -- the order-balanced median paired delta (10.675%) does not clear
+         the spread of the pairs (MAD 11.368%), so this run does not
+         support a win. That is the honest answer for an inert switch,
+         and the reason a single pair is not evidence.
+
+run dir kept at /tmp/tmp.bjdyPiEChq
+
+=== Suite ===
+[group test_par_pool_covers_every_block] 1/1 checks
+
+2916/2916 checks passed
+8 worker(s), 1010 ms wall, 3312 ms of group time
+report: C:/Users/rr/AppData/Local/Temp/krk-final-tests.json
+
+=== Baseline ===
+
+tool       18/18 selftest cases passed
+
+proof      17/17 selfcheck cases passed
+           group 0: 1/1 groups: every injection was reported by name, with the count it had reached
+
+baseline   recorded 2026-10-10T11:04:54Z at 9fb2be6, 54 groups
+current    54 groups, 2916/2916 checks, exit 0
+count changed (1):
+  test_expert_cache_warm_tier                  45/45 (pass)   was 34/34 (pass)
+verdict: no regression, 0 fixed, 1 changed, 0 new, 0 removed, 0 arm(s) newly broken, 0 arm(s) fixed, 0 arm(s) new, 0 arm(s) removed
+
+ok: nothing newly broke against the baseline
+
+=== Bench gate ===
+rc=0
+  ok   softcap shelf k=8      n=248320  k=8   reports truncation (count=35475 > cap=4096): ids undefined, as documented
+  ok   repetition penalty k=8 n=248320  k=8   reports truncation (count=24499 > cap=4096): ids undefined, as documented
+  ok   penalty+tie k=8        n=248320  k=8   matches host rule
+  ok   small vocab k=8        n=1000    k=8   matches host rule
+  (rows stored as f16, the backend's activation type)
+
+=== Coherence ===
+prompt: What is the capital of France?   n=32   ctx=512   chunk=32   chat=1   tie tol=0.05
+per-run timeout 120s
+each model runs twice: device arm (stdout banner must name a gfx arch)
+and --cpu scalar reference arm; PASS = the two produced identical text
+PASS                   SmolLM2-135M-Instruct.Q4_K_M.gguf          The capital of France is Paris. It is located in the northern part of the country, in th
+PASS                   Qwen3.5-0.8B.Q4_K_M.gguf                   <think>  </think>  The capital of France is **Paris**.  It is the largest city in France
+PASS                   Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf          <think> Okay, so I need to figure out the capital of France. Let me start by recalling w
+3 coherent, 0 not
+
+=== Build check ===
+build dir: /c/Users/rr/OneDrive/Desktop/kraken/build-hip
+targets  : kraken kraken-tests kraken-inspect kraken-server kraken-bench
+
+ok    up-to-date   ninja has no pending work for: kraken kraken-tests kraken-inspect kraken-server kraken-bench
+ok    build-type   Release, -DNDEBUG in all 90 compiled .cpp TU(s), no -O0
+ok    hip-backend  KRK_ENABLE_HIP=ON, HIP enabled, kraken.exe links
+          amdhip64 and its build rule is HIP_EXECUTABLE_LINKER
+ok    gpu-target   KRK_GPU_TARGETS=gfx1201
+ok    device       AMD Radeon RX 9070 XT (gfx1201) is in KRK_GPU_TARGETS
+WARN  runtime      running a different HIP runtime than this build was linked to:
+          [warn ] the loaded HIP runtime is not the SDK this binary was built against; stage the SDK's amdhip64_*.dll next to the binary to pin the runtime
+          Stage the SDK's amdhip64_*.dll, amd_comgr.dll and rocm_kpack.dll
+          next to the binary to pin it. Measurement made under a different
+          runtime is not a measurement of this build.
+ok    fingerprint  all 5 artifact(s) match the recorded build (sha256)
+
+0 failed, 1 warning(s)
+
+=== Spark recheck ===
+Spark current build raw-prompt table: n=32 ctx=512 chunk=32 chat=0
+
+Prompt: Hello
+prompt: Hello   n=32   ctx=512   chunk=32   chat=0   tie tol=0.05
+per-run timeout 120s
+each model runs twice: device arm (stdout banner must name a gfx arch)
+and --cpu scalar reference arm; PASS = the two produced identical text
+PASS                   Spark_one.Q6_K.gguf                        , I am trying to create a program that can calculate the sum of all the numbers in a giv
+1 coherent, 0 not
+rc=0
+
+Prompt: Write a Python function that reverses a list.
+prompt: Write a Python function that reverses a list.   n=32   ctx=512   chunk=32   chat=0   tie tol=0.05
+per-run timeout 120s
+each model runs twice: device arm (stdout banner must name a gfx arch)
+and --cpu scalar reference arm; PASS = the two produced identical text
+PASS                   Spark_one.Q6_K.gguf                         def reverse_list(lst):     return lst[::-1]<|endoftext|>Human: Can you provide an examp
+1 coherent, 0 not
+rc=0
+
+Prompt: The quick brown fox jumps over
+prompt: The quick brown fox jumps over   n=32   ctx=512   chunk=32   chat=0   tie tol=0.05
+per-run timeout 120s
+each model runs twice: device arm (stdout banner must name a gfx arch)
+and --cpu scalar reference arm; PASS = the two produced identical text
+PASS                   Spark_one.Q6_K.gguf                         the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps ov
+1 coherent, 0 not
+rc=0
+
+Prompt: The history of computing is a history of abstraction
+prompt: The history of computing is a history of abstraction   n=32   ctx=512   chunk=32   chat=0   tie tol=0.05
+per-run timeout 120s
+each model runs twice: device arm (stdout banner must name a gfx arch)
+and --cpu scalar reference arm; PASS = the two produced identical text
+PASS                   Spark_one.Q6_K.gguf                        . The first computers were mechanical, and their abstractions were limited to the physic
+1 coherent, 0 not
+rc=0
+
+Prompt: The history of computing is a history of abstraction, from relays to vacuum tubes
+prompt: The history of computing is a history of abstraction, from relays to vacuum tubes   n=32   ctx=512   chunk=32   chat=0   tie tol=0.05
+per-run timeout 120s
+each model runs twice: device arm (stdout banner must name a gfx arch)
+and --cpu scalar reference arm; PASS = the two produced identical text
+PASS                   Spark_one.Q6_K.gguf                         to transistors to integrated circuits to microprocessors to the cloud. The history of c
+1 coherent, 0 not
+rc=0
+
+Split-threshold probe: raw computing prompt n=160 ctx=1024 chunk=32
+GPU repeat=1 rc=0
+88dd81768ea632248157f5f6e8b238de */tmp/krk-spark-long-1.out
+GPU repeat=2 rc=0
+88dd81768ea632248157f5f6e8b238de */tmp/krk-spark-long-2.out
+GPU repeat=3 rc=0
+88dd81768ea632248157f5f6e8b238de */tmp/krk-spark-long-3.out
+GPU repeat=4 rc=0
+88dd81768ea632248157f5f6e8b238de */tmp/krk-spark-long-4.out
+GPU repeat=5 rc=0
+88dd81768ea632248157f5f6e8b238de */tmp/krk-spark-long-5.out
+GPU unsplit rc=0
+88dd81768ea632248157f5f6e8b238de */tmp/krk-spark-long-unsplit.out
+CPU long rc=124
+172a5d3f06d1599aecfd894a1ad52ba3 */tmp/krk-spark-long-cpu.out
+
+Actual split-kernel probe: KRK_FUSED_ATTN=0 (fused chain bypasses split dispatch), n=160 ctx=1024 chunk=32
+split GPU repeat=1 rc=0
+88dd81768ea632248157f5f6e8b238de */tmp/krk-spark-split-1.out
+split GPU repeat=2 rc=0
+88dd81768ea632248157f5f6e8b238de */tmp/krk-spark-split-2.out
+split GPU repeat=3 rc=0
+88dd81768ea632248157f5f6e8b238de */tmp/krk-spark-split-3.out
+split GPU repeat=4 rc=0
+88dd81768ea632248157f5f6e8b238de */tmp/krk-spark-split-4.out
+split GPU repeat=5 rc=0
+88dd81768ea632248157f5f6e8b238de */tmp/krk-spark-split-5.out
+unsplit separate-chain rc=0
+88dd81768ea632248157f5f6e8b238de */tmp/krk-spark-split-off.out
+CPU timed-out arm: 133/160 picks collected, zero differing top-1 IDs vs GPU; final collected pos=141. Not a full pass.
+
+=== New constrained MoE smoke / trace ===
+Raw short computing prompt n=16 greedy ctx=512; 16 MiB HOT, 64 MiB WARM, warmup=0; rc=0; stdout equals auto-cache arm byte-for-byte.
+[info ] expert cache: budget 16.0 MiB + WARM 64 MiB pageable, 4 experts x top-2, 28 layers, policy LFU+aging (pin at 24 hits, decay every 64); cold reads are read-through
+[warn ] expert cache: the routed set is 0.6 GiB and the device budget is only 0.0 GiB (3%) — the cache is spending its budget churning rather than holding. raise --expert-cache-mb, lower --ctx / --kv-hot-mb, or use a model whose routed set fits the card
+[stats ] kv        flat: whole cache resident in VRAM (no tiering traffic)
+[stats ] experts   16 MiB VRAM budget, 2/2 slots resident, 0 pinned | WARM 64 MiB pageable, 11 held (63 MiB, 5177 MiB prefetched)
+[stats ] cache     950 acquires | HOT hits 0 (0.0%) | WARM hits 950 (100.0%) | COLD misses 950 (100.0%)
+[stats ] expert-path  read    801.2 ms | room      6.6 ms | alloc    287.0 ms | xfer    677.0 ms | (promote total    970.9 ms)
+[stats ] warm      64 MiB capacity, 99.1% in use | 950 admissions, 939 evictions, 0 rejects | 948 device evictions, 7 decay events
+acquires 950; distinct (layer,expert) 110
+  observed HOT         0 (  0.0%)
+  observed WARM      950 (100.0%)
+  observed COLD        0 (  0.0%)
+
+inter-access distance (all accesses since previous use)
+  p10       56
+  p25       56
+  p50       56
+  p75      112
+  p90      168
+  p99      448
+  max      890; mean 93.2
+
+LRU stack distance (distinct other keys since previous use)
+  p10       55
+  p25       55
+  p50       55
+  p75       73
+  p90       87
+  p99      106
+  max      109; mean 63.8
+
+Empty equal-slot LRU replay: HOT=2, inclusive WARM=12
+Not the live LFU/byte-budget policy; includes compulsory first touches.
+  replay HOT         0 (  0.0%)
+  replay WARM        0 (  0.0%)
+  replay COLD      950 (100.0%)
+
+Per-layer active set (ranking is descriptive, not a pin recommendation)
+layer accesses unique HOT WARM COLD top-share top-experts(id:accesses)
+    0       34      4      0     34      0    100.0% 1:12 3:8 0:7 2:7
+    1       34      4      0     34      0    100.0% 0:11 1:8 2:8 3:7
+    2       34      4      0     34      0    100.0% 3:16 2:11 1:5 0:2
+    3       34      4      0     34      0    100.0% 2:16 3:16 0:1 1:1
+    4       34      4      0     34      0    100.0% 2:16 3:15 1:2 0:1
+    5       34      4      0     34      0    100.0% 0:11 3:11 1:9 2:3
+    6       34      4      0     34      0    100.0% 0:16 3:9 2:6 1:3
+    7       33      3      0     33      0    100.0% 0:16 2:16 1:1
+    8       34      4      0     34      0    100.0% 0:14 1:11 2:5 3:4
+    9       34      4      0     34      0    100.0% 2:15 3:9 0:6 1:4
+   10       34      4      0     34      0    100.0% 3:15 2:10 1:8 0:1
+   11       34      4      0     34      0    100.0% 0:10 2:10 3:9 1:5
+   12       34      4      0     34      0    100.0% 0:16 2:10 3:7 1:1
+   13       34      4      0     34      0    100.0% 0:16 1:14 3:3 2:1
+   14       34      4      0     34      0    100.0% 2:15 3:10 1:8 0:1
+   15       34      4      0     34      0    100.0% 0:13 3:9 2:8 1:4
+   16       34      4      0     34      0    100.0% 0:16 2:15 1:2 3:1
+   17       34      4      0     34      0    100.0% 1:15 3:9 0:8 2:2
+   18       34      4      0     34      0    100.0% 2:16 1:8 3:6 0:4
+   19       34      4      0     34      0    100.0% 2:10 0:9 1:8 3:7
+   20       34      4      0     34      0    100.0% 2:16 1:15 3:2 0:1
+   21       34      4      0     34      0    100.0% 0:14 1:12 3:5 2:3
+   22       34      4      0     34      0    100.0% 0:14 2:9 1:7 3:4
+   23       34      4      0     34      0    100.0% 2:13 1:11 0:6 3:4
+   24       34      4      0     34      0    100.0% 1:15 0:11 3:7 2:1
+   25       34      4      0     34      0    100.0% 0:13 1:10 3:8 2:3
+   26       34      4      0     34      0    100.0% 3:13 1:11 2:7 0:3
+   27       33      3      0     33      0    100.0% 1:16 0:9 3:8
+
+Trace lacks request/engine IDs and tensor bytes: do not combine targets/drafters
+or infer byte budgets, per-request pins, prefill/decode cost, or disk bandwidth.
+
+=== Existing trace reanalysis (no identity / geometry provenance claim) ===
+acquires 8918; distinct (layer,expert) 2793
+  observed HOT      6125 ( 68.7%)
+  observed WARM     2793 ( 31.3%)
+  observed COLD        0 (  0.0%)
+
+inter-access distance (all accesses since previous use)
+  p10      319
+  p25      320
+  p50      641
+  p75     1919
+  p90     2561
+  p99     5593
+  max     8034; mean 1248.7
+
+LRU stack distance (distinct other keys since previous use)
+  p10      318
+  p25      319
+  p50      542
+  p75     1137
+  p90     1452
+  p99     2156
+  max     2654; mean 765.1
+
+Empty equal-slot LRU replay: HOT=640, inclusive WARM=10240
+Not the live LFU/byte-budget policy; includes compulsory first touches.
+  replay HOT      3180 ( 35.7%)
+  replay WARM     2945 ( 33.0%)
+  replay COLD     2793 ( 31.3%)
+
+Per-layer active set (ranking is descriptive, not a pin recommendation)
+layer accesses unique HOT WARM COLD top-share top-experts(id:accesses)
+    0      236     97    139     97      0     19.1% 62:9 213:9 222:8 28:7 112:7 2:5
+    1      233    103    130    103      0     17.6% 33:9 200:9 205:7 236:6 43:5 207:5
+    2      232     96    136     96      0     28.9% 19:17 104:17 6:9 42:9 218:9 216:6
+    3      224     77    147     77      0     27.7% 39:14 163:13 10:9 19:9 24:9 251:8
+    4      223     87    136     87      0     20.2% 207:10 175:8 67:7 122:7 206:7 4:6
+    5      217     75    142     75      0     24.4% 203:14 62:10 64:8 122:8 137:7 10:6
+    6      221     64    157     64      0     36.7% 246:18 2:15 102:15 100:12 201:11 62:10
+    7      214     62    152     62      0     34.6% 121:17 219:14 199:13 166:11 30:10 182:9
+    8      216     54    162     54      0     44.4% 150:24 50:19 123:15 171:14 172:14 224:10
+    9      213     54    159     54      0     44.6% 61:21 58:20 0:16 134:14 65:13 108:11
+   10      227     78    149     78      0     31.3% 127:19 162:13 205:12 141:11 48:8 97:8
+   11      228     82    146     82      0     22.4% 76:11 17:9 56:9 92:8 74:7 107:7
+   12      223     71    152     71      0     30.5% 189:20 150:13 139:9 192:9 200:9 56:8
+   13      220     72    148     72      0     30.5% 110:15 40:13 159:10 194:10 219:10 124:9
+   14      219     66    153     66      0     37.0% 138:23 168:20 17:11 235:10 105:9 67:8
+   15      216     58    158     58      0     46.8% 100:24 245:20 230:16 80:15 206:14 157:12
+   16      216     62    154     62      0     44.4% 224:22 248:17 162:16 31:15 66:15 233:11
+   17      219     68    151     68      0     36.1% 99:17 144:15 220:14 199:13 187:12 101:8
+   18      216     58    158     58      0     46.3% 17:23 30:21 193:18 40:15 195:14 220:9
+   19      220     62    158     62      0     35.9% 137:20 170:14 196:12 239:12 14:11 114:10
+   20      223     67    156     67      0     35.4% 171:19 206:16 172:14 150:11 126:10 216:9
+   21      216     61    155     61      0     46.3% 108:19 134:19 95:16 250:16 61:15 65:15
+   22      232     81    151     81      0     34.5% 205:18 66:17 97:15 127:12 146:9 228:9
+   23      228     86    142     86      0     25.9% 56:13 240:13 17:12 133:8 248:7 37:6
+   24      221     71    150     71      0     33.0% 139:14 7:13 150:13 1:12 155:11 189:10
+   25      221     68    153     68      0     38.0% 124:18 40:17 219:15 110:13 166:12 213:9
+   26      222     64    158     64      0     40.5% 168:21 138:20 67:16 218:14 111:10 238:9
+   27      213     52    161     52      0     41.8% 245:23 80:20 100:17 64:10 230:10 30:9
+   28      224     71    153     71      0     29.9% 224:23 129:12 31:9 137:8 212:8 45:7
+   29      221     72    149     72      0     28.1% 199:20 101:12 220:9 117:7 137:7 178:7
+   30      219     63    156     63      0     39.3% 17:22 198:22 106:13 40:12 109:9 11:8
+   31      219     64    155     64      0     39.7% 137:22 196:19 14:14 33:12 120:10 162:10
+   32      229     77    152     77      0     28.4% 80:23 245:13 50:8 254:8 102:7 22:6
+   33      227     75    152     75      0     27.8% 81:19 154:12 28:8 205:8 224:8 245:8
+   34      228     67    161     67      0     33.3% 59:18 181:18 173:17 34:8 67:8 48:7
+   35      229     58    171     58      0     45.9% 89:23 1:22 62:22 254:20 210:9 230:9
+   36      225     58    167     58      0     42.7% 131:23 10:22 223:19 155:13 177:12 24:7
+   37      234     70    164     70      0     36.8% 11:23 200:16 235:16 210:15 14:9 50:7
+   38      225     62    163     62      0     36.4% 94:20 209:19 127:13 86:11 205:10 79:9
+   39      229     60    169     60      0     32.3% 89:24 30:12 183:11 34:10 62:9 92:8
+
+Trace lacks request/engine IDs and tensor bytes: do not combine targets/drafters
+or infer byte budgets, per-request pins, prefill/decode cost, or disk bandwidth.
+
+=== GLM file loader verdict (inspect only, no weights loaded) ===
+file       G:/More-models/GLM-4.7-Flash-Q4_K_M.gguf
+version    GGUF v3
+alignment  32
+tensors    844
+payload    16.88 GiB
+arch       deepseek2 — not supported
+verdict    refused
+           - multi-head latent attention (attn_kv_a/attn_kv_b) is not implemented
+
+=== Final checks after restoring test-file CRLF ===
+ninja kraken-tests rc=0; final suite 2916/2916 rc=0; baseline rc=0.
+  test_expert_cache_warm_tier                  45/45 (pass)   was 34/34 (pass)
+verdict: no regression, 0 fixed, 1 changed, 0 new, 0 removed, 0 arm(s) newly broken, 0 arm(s) fixed, 0 arm(s) new, 0 arm(s) removed
+
+ok: nothing newly broke against the baseline
+          next to the binary to pin it. Measurement made under a different
+          runtime is not a measurement of this build.
+ok    fingerprint  all 5 artifact(s) match the recorded build (sha256)
+
+0 failed, 1 warning(s)
+Python compile/selftest rc=0; invalid trace rc=1 as required; git diff --check clean.

@@ -15,6 +15,7 @@
 // generation is dominated by *first* touches, and those are a miss the policy
 // above can never turn into a hit.
 #include "krk/expert_cache.hpp"
+#include "krk/vram_guard.hpp"
 
 #include <chrono>
 
@@ -102,8 +103,10 @@ inline void xtrace(i32 layer, i32 expert, u8 tier) {
 
 }  // namespace
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <unordered_set>
 
 namespace krk {
 
@@ -126,6 +129,7 @@ void ExpertCache::configure(Backend *be, size_t budget_bytes, size_t host_budget
     // An explicit slot budget IS the capacity. Without one this stays 0 until
     // acquire() fills it in from the expert size of the layer it is serving.
     capacity_ = slot_budget;
+    if (be_) be_->set_expert_pool_owner(this, budget_);
 }
 
 void ExpertCache::clear() {
@@ -134,6 +138,7 @@ void ExpertCache::clear() {
         drop_host(kv.second);
     }
     slots_.clear();
+    if (be_) be_->set_expert_pool_owner(this, 0);
     bytes_ = 0;
     vram_slots_ = 0;
     host_bytes_ = 0;
@@ -153,6 +158,8 @@ void ExpertCache::clear() {
     warm_admissions_ = 0;
     warm_evictions_ = 0;
     warm_rejects_ = 0;
+    active_staged_ = active_used_ = 0;
+    active_wait_ms_ = 0;
 }
 
 void ExpertCache::reset_counters() {
@@ -182,6 +189,8 @@ void ExpertCache::reset_counters() {
     room_ms_ = 0.0;
     alloc_ms_ = 0.0;
     xfer_ms_ = 0.0;
+    active_staged_ = active_used_ = 0;
+    active_wait_ms_ = 0;
 }
 
 u32 ExpertCache::touch_count(i32 layer, i32 expert) const {
@@ -241,15 +250,36 @@ void ExpertCache::touch(Slot &s) {
     if (!s.pinned && s.count >= kPinThreshold) s.pinned = true;
 }
 
+void ExpertCache::finish_stage(Slot &s) {
+    if (!s.staged) return;
+    MsTimer t(&active_wait_ms_);
+    be_->wait_marker(s.ready);
+    be_->release_marker(s.ready);
+    s.ready = nullptr;
+    s.staged = false;
+}
+
 void ExpertCache::drop(Slot &s) {
     if (!be_) return;
+    finish_stage(s);
+    // An expert's three slices go back in ONE call so the pool issues one
+    // release mark for the three instead of one per slice. An eviction is the
+    // one place the decode loop pays this, once per promotion at a constrained
+    // budget, and the three releases are the same default-stream point.
+    void *cells[3] = {};
+    size_t lens[3] = {};
     QuantTensor *q[3] = {&s.m.gate, &s.m.up, &s.m.down};
+    int n = 0;
     for (int i = 0; i < 3; i++) {
-        if (q[i]->present() && q[i]->data)
-            be_->release_pooled(q[i]->data, s.slice[i]);
+        if (q[i]->present() && q[i]->data) {
+            cells[n] = q[i]->data;
+            lens[n] = s.slice[i];
+            n++;
+        }
         *q[i] = {};
     }
     s.m = {};
+    if (n) be_->release_pooled_batch(cells, lens, n);
 }
 
 void ExpertCache::drop_host(Slot &s) {
@@ -257,7 +287,7 @@ void ExpertCache::drop_host(Slot &s) {
     for (QuantTensor *q : {&s.h.gate, &s.h.up, &s.h.down}) {
         // Deferred: a promotion copy of this expert may still be in flight on a
         // side stream, and freeing the source under it is a use-after-free.
-        if (q->present() && q->data) be_->release_host_deferred(q->data);
+        if (q->present() && q->data) be_->release_host_deferred_budgeted(q->data);
         *q = {};
     }
     s.h = {};
@@ -299,20 +329,17 @@ void ExpertCache::make_vram_room(size_t need) {
     // unspent. bytes_ + need is the actual constraint; capacity_ is an estimate
     // for the report (see over_budget).
     //
-    // The scan skips pinned slots; if every resident slot is pinned and none can
-    // be dropped, the policy never gets stuck — we simply over-reside by one slot
-    // and keep going. Correctness first: the resident set is a performance hint,
-    // never an invariant.
+    // Pins rank victims but never override the physical limit. A staging
+    // lease protects only the current consumer; stage_next verifies that both
+    // current and next fit before taking that lease.
     while (vram_slots_ > 0 && over_budget(need)) {
         u64 victim = 0;
         if (!pick_victim(&victim)) break;
         auto vit = slots_.find(victim);
         if (vit == slots_.end()) break;
-        const bool all_pinned = vit->second.pinned;
         retire(vit->second);
         forget_if_dead(vit);
         evictions_++;
-        if (all_pinned) break; // nothing unpinned existed; stop, do not pin-sweep
     }
 }
 
@@ -341,7 +368,9 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
         const GgufTensor *t = from[i];
         const size_t per = s.slice[i];
         if (!t || per == 0) continue;
-        void *p = be_->alloc_host_pageable(per);
+        // Each slice reserves against the process-wide host ledger atomically;
+        // earlier slices and every other cache are already accounted for there.
+        void *p = be_->alloc_host_pageable_budgeted(per);
         if (!p) return false; // partial copies are dropped by the caller
         // A read() out of the page cache, not a memcpy of the mapping: the
         // mapping faults one 4 KiB page at a time and would leave a resident
@@ -349,9 +378,12 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
         // on top of itself. read_host falls back to the mapping when the file
         // path is unavailable.
         const void *mapped = t->data + static_cast<size_t>(expert) * per;
-        {
+        try {
             MsTimer t(&read_ms_);
             if (!be_->read_host(p, mapped, per)) std::memcpy(p, mapped, per);
+        } catch (...) {
+            be_->release_host_pageable_budgeted(p);
+            return false;
         }
         to[i]->data = p;
         to[i]->type = t->type;
@@ -364,12 +396,22 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
 }
 
 bool ExpertCache::warm_admit(const ExpertSource &src, i32 expert, Slot &s) {
-    if (!be_ || host_budget_ == 0 || s.bytes == 0) return false;
-    make_warm_room(s.bytes);
+    const size_t host_need = s.slice[0] + s.slice[1] + s.slice[2];
+    if (!be_ || host_budget_ == 0 || host_need == 0) return false;
+    make_warm_room(host_need);
     // An expert larger than the whole tier never fits: the alternative would be
     // evicting the entire tier for one copy that still does not fit. That, and
     // a failed allocation, are the only two rejects under always-admit.
-    if (host_bytes_ + s.bytes > host_budget_) {
+    if (host_bytes_ + host_need > host_budget_) {
+        warm_rejects_++;
+        return false;
+    }
+    // Read-through admissions happen during inference too, not only in the two
+    // startup sweeps. Preflight against the same ledger as KV, then reserve each
+    // slice atomically in warm_fill(); a rejected admission falls back to a
+    // cold direct load without retaining a partial host copy.
+    if (!SharedHostRamBudget::can_admit(host_need, be_->host_available_bytes(),
+                                         be_->host_total_bytes())) {
         warm_rejects_++;
         return false;
     }
@@ -383,7 +425,7 @@ bool ExpertCache::warm_admit(const ExpertSource &src, i32 expert, Slot &s) {
     return true;
 }
 
-bool ExpertCache::promote_to_vram(Slot &s) {
+bool ExpertCache::promote_to_vram(Slot &s, bool staged) {
     const std::chrono::steady_clock::time_point t0 =
         std::chrono::steady_clock::now();
     struct ClockOut {
@@ -396,6 +438,10 @@ bool ExpertCache::promote_to_vram(Slot &s) {
         }
     } clock_out{&promote_ms_, t0};
     if (!be_ || !s.in_host()) return false;
+    size_t physical = 0;
+    for (size_t slice : s.slice) if (slice) physical += be_->pooled_size(slice);
+    s.bytes = physical;
+    be_->set_expert_pool_owner(this, std::max(budget_, physical));
     const u64 key = slot_key(s.layer, s.expert);
     // Snapshot before the scan: this slot is WARM, so retire() cannot take it
     // (it only drops device copies), but the reference is re-established below
@@ -435,9 +481,18 @@ bool ExpertCache::promote_to_vram(Slot &s) {
             p = be_->alloc_pooled(s.slice[i]);
         }
         if (!p) {
+            // Same burst shape as drop(): the half-promoted slices go back at
+            // one stream point, so they share one release mark.
+            void *cells[3] = {};
+            size_t lens[3] = {};
+            int n = 0;
             for (int j = 0; j < 3; j++)
-                if (to[j]->present() && to[j]->data)
-                    be_->release_pooled(to[j]->data, s.slice[j]);
+                if (to[j]->present() && to[j]->data) {
+                    cells[n] = to[j]->data;
+                    lens[n] = s.slice[j];
+                    n++;
+                }
+            if (n) be_->release_pooled_batch(cells, lens, n);
             return false;
         }
         *to[i] = *from[i];
@@ -449,7 +504,12 @@ bool ExpertCache::promote_to_vram(Slot &s) {
     }
     {
         MsTimer t(&xfer_ms_);
-        be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
+        if (staged) {
+            s.ready = be_->upload_expert_staged(batch_dst, batch_src, batch_len, nb);
+            s.staged = true;
+        } else {
+            be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
+        }
     }
     s.m = m;
     vram_slots_++;
@@ -481,7 +541,7 @@ bool ExpertCache::pick_victim(u64 *out) {
     bool have = false;
     for (const auto &kv : slots_) {
         const Slot &s = kv.second;
-        if (!s.in_vram()) continue; // a host copy is not occupying VRAM
+        if (!s.in_vram() || s.leased) continue; // never evict a current consumer
         if (!have) {
             best = kv.first;
             have = true;
@@ -599,7 +659,11 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     const size_t gate_b = src.per_expert(src.gate);
     const size_t up_b = src.per_expert(src.up);
     const size_t down_b = src.per_expert(src.down);
-    const size_t need = gate_b + up_b + down_b;
+    const size_t need = (gate_b ? be_->pooled_size(gate_b) : 0) +
+                        (up_b ? be_->pooled_size(up_b) : 0) +
+                        (down_b ? be_->pooled_size(down_b) : 0);
+    // Preserve the documented minimum: one complete aligned expert can run.
+    be_->set_expert_pool_owner(this, std::max(budget_, need));
     // capacity_ is what the report says fits, not what the eviction decision is
     // made on (that is bytes_ + need against budget_, see over_budget). Without
     // an explicit slot budget it is the byte budget expressed in slots of THIS
@@ -616,6 +680,15 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     if (it != slots_.end()) {
         Slot &s = it->second;
         if (s.in_vram()) {
+            if (s.staged) {
+                finish_stage(s);
+                ++active_used_;
+                touch(s);
+                ++host_hits_;
+                xtrace(layer, expert, 1);
+                if (++acquires_ >= decay_period()) decay();
+                return &s.m;
+            }
             // Hit: the traffic that makes an expert hot happens here.
             touch(s);
             hits_++;
@@ -708,6 +781,25 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     return &ins.first->second.m;
 }
 
+bool ExpertCache::stage_next(const ExpertSource &src, i32 layer, i32 expert,
+                             i32 current) {
+    if (!be_ || !src.present() || expert == current) return false;
+    auto next = slots_.find(slot_key(layer, expert));
+    auto cur = slots_.find(slot_key(layer, current));
+    if (next == slots_.end() || cur == slots_.end() ||
+        next->second.in_vram() || !next->second.in_host() || !cur->second.in_vram())
+        return false;
+    size_t need = 0;
+    for (size_t slice : next->second.slice) if (slice) need += be_->pooled_size(slice);
+    if (need > budget_ || cur->second.bytes > budget_ - need ||
+        (slot_budget_ && slot_budget_ < 2)) return false;
+    cur->second.leased = true;
+    const bool ok = promote_to_vram(next->second, true);
+    cur->second.leased = false;
+    if (ok) ++active_staged_;
+    return ok;
+}
+
 size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
                                    const i32 *experts, int n) {
     if (!be_ || host_budget_ == 0 || !src.present() || n <= 0) return 0;
@@ -729,19 +821,38 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
     };
     std::vector<Job> jobs;
     jobs.reserve(static_cast<size_t>(n));
+    std::unordered_set<u64> seen;
+    size_t reserved = 0;
+    bool host_reserve_hit = false;
     for (int j = 0; j < n; j++) {
         const i32 e = experts[j];
         if (e < 0 || e >= src.n_expert) continue;
         const u64 key = slot_key(layer, e);
+        if (!seen.insert(key).second) continue;
         auto it = slots_.find(key);
         if (it != slots_.end() && it->second.in_host()) continue; // already warm
-        make_warm_room(one);
-        // Same rule as warm_admit: an expert that cannot fit the whole tier is
-        // skipped rather than evicting everything for a copy that still fails.
-        if (host_bytes_ + one > host_budget_) {
+        // Pending reads own RAM too, but are not committed or evictable yet.
+        if (one > host_budget_ - reserved) {
             warm_rejects_++;
             continue;
         }
+        make_warm_room(one + reserved);
+        // Preflight this expert against the process-wide ledger. The actual
+        // per-slice reservations below are atomic and account for all earlier
+        // jobs plus any concurrent KV or expert staging.
+        if (!SharedHostRamBudget::can_admit(one, be_->host_available_bytes(),
+                                            be_->host_total_bytes())) {
+            warm_rejects_++;
+            host_reserve_hit = true;
+            break; // every following expert costs at least this much RAM
+        }
+        if (reserved > host_budget_ || one > host_budget_ - reserved ||
+            host_bytes_ > host_budget_ - reserved - one) {
+            warm_rejects_++;
+            continue;
+        }
+        // Room-making may erase entries; never carry its old iterator across it.
+        it = slots_.find(key);
         if (it == slots_.end()) {
             Slot s;
             s.layer = layer;
@@ -754,22 +865,28 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
         }
         Job job{key, e, {nullptr, nullptr, nullptr}};
         bool ok = true;
+        size_t job_reserved = 0;
         for (int i = 0; i < 3; i++) {
             if (!slice[i]) continue;
-            job.dst[i] = be_->alloc_host_pageable(slice[i]);
+            job.dst[i] = be_->alloc_host_pageable_budgeted(slice[i]);
             if (!job.dst[i]) {
                 ok = false;
+                host_reserve_hit = !SharedHostRamBudget::can_admit(
+                    slice[i], be_->host_available_bytes(), be_->host_total_bytes());
                 break;
             }
+            if (job.dst[i]) job_reserved += slice[i];
         }
         if (!ok) {
             for (int i = 0; i < 3; i++)
-                if (job.dst[i]) be_->release_host_pageable(job.dst[i]);
+                if (job.dst[i]) be_->release_host_pageable_budgeted(job.dst[i]);
             warm_rejects_++;
             forget_if_dead(it);
+            if (host_reserve_hit) break;
             continue;
         }
         jobs.push_back(job);
+        reserved += job_reserved;
     }
     if (jobs.empty()) return 0;
 
@@ -789,7 +906,14 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
     }
     {
         MsTimer t(&read_ms_);
-        be_->read_host_batch(reqs.data(), static_cast<int>(reqs.size()));
+        try {
+            be_->read_host_batch(reqs.data(), static_cast<int>(reqs.size()));
+        } catch (...) {
+            for (Job &job : jobs)
+                for (void *p : job.dst)
+                    if (p) be_->release_host_pageable_budgeted(p);
+            return 0;
+        }
     }
 
     // ---- phase 3: commit --------------------------------------------------
@@ -798,7 +922,7 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
         auto it = slots_.find(jb.key);
         if (it == slots_.end()) { // evicted while the batch was in flight
             for (int i = 0; i < 3; i++)
-                if (jb.dst[i]) be_->release_host_pageable(jb.dst[i]);
+                if (jb.dst[i]) be_->release_host_pageable_budgeted(jb.dst[i]);
             continue;
         }
         Slot &s = it->second;

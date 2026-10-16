@@ -52,6 +52,7 @@ struct KvTierStats {
     // tier -- and kept printing fluent text.
     i64 evictions_to_cold = 0;
     i64 evictions_dropped = 0;
+    i64 promotion_refused = 0; // no RAM/disk staging capacity for retained history
     i64 migrate_bytes = 0;
     size_t hot_bytes = 0;
     size_t layer_bytes = 0; // the largest layer's plane (a HOT slot's size)
@@ -152,6 +153,8 @@ public:
     void detach();
 
     void stats(KvTierStats *out) const;
+    i64 promotion_refused() const { return promotion_refused_; }
+    bool host_query_unknown() const { return host_query_unknown_; }
 
     // Geometry, so the engine can report it once instead of each plane
     // printing its own identical warning.
@@ -181,7 +184,7 @@ private:
     bool wait_slot(int slot, const char *why, i64 layer);
     void fence_if_on(const char *op);
     int take_slot(i64 keep); // evict LRU if every slot is resident
-    void evict_slot(int slot, i64 keep);
+    bool evict_slot(int slot, i64 keep);
     bool to_warm(i64 layer, int slot);
     bool to_cold(i64 layer, int slot);
     bool from_warm(i64 layer, int slot);
@@ -223,6 +226,8 @@ private:
     i64 warm_budget_slots_ = 0;       // what warm_budget_ alone allowed
     bool warm_from_geometry_ = false; // the geometry floor raised it
     bool cold_dir_rejected_ = false;  // --kv-cold-dir is not writable
+    bool host_query_unknown_ = false;
+    i64 promotion_refused_ = 0;
 
     KvTierStats st_;
 };

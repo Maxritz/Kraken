@@ -1,5 +1,6 @@
 // kv_tier.cpp — HOT / WARM / COLD residency for the KV cache
 #include "krk/kv_tier.hpp"
+#include "krk/vram_guard.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -87,7 +88,7 @@ void KvTierCache::detach() {
     for (void *m : slot_marker_)
         if (m) be_->release_marker(m);
     for (void *p : warm_mem_)
-        if (p) be_->release_host_pageable(p);
+        if (p) be_->release_host_pageable_budgeted(p);
     if (flat_) be_->release(flat_);
     // Clear everything so a second call -- from the destructor after the
     // engine has already called this -- is a no-op rather than a double free.
@@ -154,6 +155,27 @@ bool KvTierCache::init(Backend *be, i64 n_layer,
     st_.layer_bytes = slot_bytes_;
 
     if (!be_ || n_layer_ <= 0 || total_ == 0) return true;
+    host_query_unknown_ = be_->host_available_bytes() == 0;
+
+    const bool needs_tiers = hot_budget_ < total_ && n_kv_layers_ > 1;
+    if (needs_tiers && host_query_unknown_) {
+        if (err)
+            *err = "kv: host memory availability is unknown; refusing a tier that "
+                   "cannot preserve retained KV history";
+        detach();
+        return false;
+    }
+    if (needs_tiers && !cold_dir_.empty() &&
+        !krk::SharedHostRamBudget::can_admit(slot_bytes_,
+                                              be_->host_available_bytes(),
+                                              be_->host_total_bytes())) {
+        if (err)
+            *err = "kv: shared host-memory budget has no room for a KV staging "
+                   "page after the safety reserve and other pageable tiers; "
+                   "refusing a tier that cannot preserve retained KV history";
+        detach();
+        return false;
+    }
 
     // Everything fits: one flat allocation over the KV-carrying layers only,
     // byte-identical to the untiered engine for a model that keeps KV on every
@@ -163,7 +185,7 @@ bool KvTierCache::init(Backend *be, i64 n_layer,
         flat_ = be_->alloc(total_);
         if (!flat_) {
             if (err) *err = "kv: device allocation failed";
-            be_ = nullptr;
+            detach();
             return false;
         }
         return true;
@@ -192,12 +214,16 @@ bool KvTierCache::init(Backend *be, i64 n_layer,
 
     for (int i = 0; i < n_slots_; i++) {
         slot_mem_[static_cast<size_t>(i)] = be_->alloc(slot_bytes_);
-        slot_marker_[static_cast<size_t>(i)] = be_->make_marker();
-        if (!slot_mem_[static_cast<size_t>(i)]) {
+        if (slot_mem_[static_cast<size_t>(i)])
+            slot_marker_[static_cast<size_t>(i)] = be_->make_marker();
+        if (!slot_mem_[static_cast<size_t>(i)] ||
+            (be_->requires_markers() && !slot_marker_[static_cast<size_t>(i)])) {
             if (err)
-                *err = "kv: could not allocate a HOT slot; lower the KV VRAM "
-                       "budget or the context";
-            be_ = nullptr;
+                *err = !slot_mem_[static_cast<size_t>(i)]
+                           ? "kv: could not allocate a HOT slot; lower the KV VRAM "
+                             "budget or the context"
+                           : "kv: could not allocate a HOT completion marker";
+            detach();
             return false;
         }
     }
@@ -229,12 +255,28 @@ bool KvTierCache::init(Backend *be, i64 n_layer,
     //
     // Only when there is nowhere to spill: with a COLD dir the budget is a real
     // budget, and a page that cannot reach WARM is on disk instead of lost.
+    const bool host_query_known = !host_query_unknown_;
+    const bool has_host_stage_room = host_query_known &&
+        krk::SharedHostRamBudget::can_admit(slot_bytes_,
+                                             be_->host_available_bytes(),
+                                             be_->host_total_bytes());
     const i64 slots_needed = cold_dir_.empty() ? n_kv_layers_ : 0;
     n_warm_slots_ = warm_budget_slots_ > slots_needed ? warm_budget_slots_
                                                       : slots_needed;
     if (n_warm_slots_ > n_kv_layers_) n_warm_slots_ = n_kv_layers_;
     if (n_warm_slots_ < 0) n_warm_slots_ = 0;
     warm_from_geometry_ = n_warm_slots_ > warm_budget_slots_;
+    if (!has_host_stage_room) {
+        if (err)
+            *err = host_query_unknown_
+                       ? "kv: host memory availability is unknown; refusing a "
+                         "tier that cannot preserve retained KV history"
+                       : "kv: shared host-memory budget has no room for a KV staging "
+                         "page after the safety reserve and other pageable tiers; "
+                         "refusing a tier that cannot preserve retained KV history";
+        detach();
+        return false;
+    }
 
     tiered_ = true;
     st_.tiered = true;
@@ -298,20 +340,15 @@ bool KvTierCache::wait_slot(int slot, const char *why, i64 layer) {
     return true;
 }
 
-void KvTierCache::evict_slot(int slot, i64 keep) {
+bool KvTierCache::evict_slot(int slot, i64 keep) {
     const i64 owner = slot_layer_[static_cast<size_t>(slot)];
-    if (owner < 0 || owner == keep) return;
+    if (owner < 0 || owner == keep) return true;
     wait_slot(slot, "evict", owner);
-    if (to_warm(owner, slot)) return;
-    if (to_cold(owner, slot)) return;
-    tier_[static_cast<size_t>(owner)] = KvTier::kAbsent;
-    layer_slot_[static_cast<size_t>(owner)] = -1;
-    slot_layer_[static_cast<size_t>(slot)] = -1;
-    // Counted apart from a COLD spill: this page's KV is GONE. Nothing
-    // recomputes it -- ensure_hot() zero-fills the plane, and the model then
-    // attends over a history that is not its own. The engine reports this
-    // number and says what it means; a run with a non-zero value is wrong.
-    st_.evictions_dropped++;
+    if (to_warm(owner, slot)) return true;
+    if (to_cold(owner, slot)) return true;
+    // Never evict valid history into an absent state: the later fill0 would
+    // silently turn a resource-pressure event into wrong model output.
+    return false;
 }
 
 bool KvTierCache::to_warm(i64 layer, int slot) {
@@ -323,9 +360,18 @@ bool KvTierCache::to_warm(i64 layer, int slot) {
         if (t == KvTier::kWarm) live++;
     if (live >= n_warm_slots_) return false;
 
-    void *host = be_->alloc_host_pageable(len);
+    // A KV page cannot be dropped safely: it is history, not a cacheable
+    // expert. If the shared host-memory reservation refuses WARM, try COLD;
+    // if neither destination works, inference must fail rather than zero-fill.
+    // the request rather than zero-fill KV history.
+    void *host = be_->alloc_host_pageable_budgeted(len);
     if (!host) return false;
-    be_->download(host, slot_mem_[static_cast<size_t>(slot)], len);
+    try {
+        be_->download(host, slot_mem_[static_cast<size_t>(slot)], len);
+    } catch (...) {
+        be_->release_host_pageable_budgeted(host);
+        return false;
+    }
     fence_if_on("download");
     warm_mem_[static_cast<size_t>(layer)] = host;
     tier_[static_cast<size_t>(layer)] = KvTier::kWarm;
@@ -341,18 +387,25 @@ bool KvTierCache::to_cold(i64 layer, int slot) {
     if (cold_dir_.empty()) return false;
     const size_t len = len_[static_cast<size_t>(layer)];
     if (len == 0) return false;
-    void *host = be_->alloc_host_pageable(len);
+    // The transient staging buffer shares the same process-wide host ledger as
+    // durable WARM expert and KV pages.
+    void *host = be_->alloc_host_pageable_budgeted(len);
     if (!host) return false;
-    be_->download(host, slot_mem_[static_cast<size_t>(slot)], len);
+    try {
+        be_->download(host, slot_mem_[static_cast<size_t>(slot)], len);
+    } catch (...) {
+        be_->release_host_pageable_budgeted(host);
+        return false;
+    }
     fence_if_on("download");
     std::FILE *f = std::fopen(cold_path(layer).c_str(), "wb");
     if (!f) {
-        be_->release_host_pageable(host);
+        be_->release_host_pageable_budgeted(host);
         return false;
     }
     const size_t w = std::fwrite(host, 1, len, f);
     std::fclose(f);
-    be_->release_host_pageable(host);
+    be_->release_host_pageable_budgeted(host);
     if (w != len) return false;
     tier_[static_cast<size_t>(layer)] = KvTier::kCold;
     layer_slot_[static_cast<size_t>(layer)] = -1;
@@ -368,9 +421,15 @@ bool KvTierCache::from_warm(i64 layer, int slot) {
     if (!host) return false;
     const size_t len = len_[static_cast<size_t>(layer)];
     if (len == 0) return false;
-    be_->upload(slot_mem_[static_cast<size_t>(slot)], host, len);
+    try {
+        be_->upload(slot_mem_[static_cast<size_t>(slot)], host, len);
+    } catch (...) {
+        // This is the only surviving copy of the layer's KV. Preserve both its
+        // bytes and tier metadata so a later promotion can retry safely.
+        return false;
+    }
     fence_if_on("upload");
-    be_->release_host_pageable(host);
+    be_->release_host_pageable_budgeted(host);
     warm_mem_[static_cast<size_t>(layer)] = nullptr;
     tier_[static_cast<size_t>(layer)] = KvTier::kHot;
     layer_slot_[static_cast<size_t>(layer)] = slot;
@@ -391,7 +450,7 @@ bool KvTierCache::from_cold(i64 layer, int slot) {
         std::fclose(f);
         return false;
     }
-    void *host = be_->alloc_host_pageable(len);
+    void *host = be_->alloc_host_pageable_budgeted(len);
     if (!host) {
         std::fclose(f);
         return false;
@@ -399,12 +458,17 @@ bool KvTierCache::from_cold(i64 layer, int slot) {
     const size_t r = std::fread(host, 1, len, f);
     std::fclose(f);
     if (r != len) {
-        be_->release_host_pageable(host);
+        be_->release_host_pageable_budgeted(host);
         return false;
     }
-    be_->upload(slot_mem_[static_cast<size_t>(slot)], host, len);
+    try {
+        be_->upload(slot_mem_[static_cast<size_t>(slot)], host, len);
+    } catch (...) {
+        be_->release_host_pageable_budgeted(host);
+        return false;
+    }
     fence_if_on("upload");
-    be_->release_host_pageable(host);
+    be_->release_host_pageable_budgeted(host);
     tier_[static_cast<size_t>(layer)] = KvTier::kHot;
     layer_slot_[static_cast<size_t>(layer)] = slot;
     slot_layer_[static_cast<size_t>(slot)] = layer;
@@ -431,7 +495,7 @@ int KvTierCache::take_slot(i64 keep) {
         }
     }
     if (victim < 0) return -1; // every slot holds the layer we want
-    evict_slot(victim, keep);
+    if (!evict_slot(victim, keep)) return -1;
     return victim;
 }
 
@@ -450,17 +514,31 @@ int KvTierCache::ensure_hot(i64 layer) {
     }
 
     const int slot = take_slot(layer);
-    if (slot < 0) return -1;
+    if (slot < 0) {
+        promotion_refused_++;
+        return -1;
+    }
 
     wait_slot(slot, "promote", layer);
 
     const KvTier from = tier_[static_cast<size_t>(layer)];
     if (from == KvTier::kWarm && from_warm(layer, slot)) return slot;
     if (from == KvTier::kCold && from_cold(layer, slot)) return slot;
+    if (from == KvTier::kWarm || from == KvTier::kCold) {
+        // A WARM/COLD page contains prior tokens. Replacing it with zeros is a
+        // silent correctness failure, so leave the slot unowned and make the
+        // caller fail this forward. Only kAbsent represents genuinely new KV.
+        // A failed restore may already have queued a partial upload into the
+        // free HOT slot, so fence it before another layer can claim that slot.
+        wait_slot(slot, "refused-promotion", layer);
+        trace_line("promotion-refused", layer, slot, "resource-reserve-or-io");
+        slot_layer_[static_cast<size_t>(slot)] = -1;
+        promotion_refused_++;
+        return -1;
+    }
 
-    // Absent, or a tier we could not read back. The engine writes this layer
-    // on the step that reads it, but only for the positions of that step, so
-    // the rest must not be left as whatever the previous occupant staged.
+    // This layer has no retained history. Initialising a newly occupied slot is
+    // safe because its cache history is necessarily empty.
     trace_line("fill0", layer, slot, "");
     be_->fill0(slot_mem_[static_cast<size_t>(slot)],
                len_[static_cast<size_t>(layer)]);
@@ -502,6 +580,7 @@ void KvTierCache::end_layer(i64 layer) {
 void KvTierCache::stats(KvTierStats *out) const {
     if (!out) return;
     *out = st_;
+    out->promotion_refused = promotion_refused_;
     out->hot = out->warm = out->cold = 0;
     for (size_t l = 0; l < tier_.size(); l++) {
         const KvTier t = tier_[l];

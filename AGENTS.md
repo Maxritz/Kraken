@@ -178,6 +178,34 @@ code, the README, or `docs/`.
   proof failed for group 99 (rc=2)`. The 318-run sweep and its arm-by-arm
   comparison against `tests/kraken-tests-selfcheck-baseline.json` stay behind
   `KRK_BASELINE_SELFCHECK=1` for cost.
+- **A missing `return` cannot land any more: `-Werror=return-type` is fatal for every
+  translation unit.** That defect class is compiler-visible -- `-Wall` already
+  contained `-Wreturn-type`, so the diagnostic was there to read every time and
+  nobody read it -- and `CMakeLists.txt` now makes it an error (skipped on MSVC),
+  which covers all 90 host TUs and the HIP ones rather than the one function that
+  failed. Proved by red construction: a `static bool` that falls off its end appended
+  to a clean `src/json.cpp` fails the build with
+  `error: non-void function does not return a value in all control paths
+  [-Werror,-Wreturn-type]` and ninja rc=1; reverting the file is green again.
+- **Changing a `void` helper to `bool` to add a refusal is a two-part edit, and
+  only the first part is visible.** `Engine::configure_expert_cache` gained a
+  `false` return for a budget that cannot fit; the fall-through exit kept no
+  `return` statement, which is UB, and it compiled with **0 errors** while
+  `build_check.sh` stayed green. The symptom was not a crash at a source line:
+  dense models were fine (they return early), every MoE died with **rc=3 and
+  empty stdout**, and `kraken-tests` went 2927/2927 -> rc=1 with four groups
+  dead. Two things made it slow to find: the process printed its policy lines
+  and then exited *after* them with no message, and the failing path was the
+  one path the compiler would only have mentioned in a warning nobody greps for.
+  When a signature gains a return value, grep the function's own end for the
+  missing `return`.
+  The same edit's *refusal* path had a second defect of the same family -- it
+  had never been reachable, so nobody had run it: both CLIs answered a failed
+  `init` with `delete be; return 1;`, which frees the backend and then unwinds
+  past the engine, whose destructor releases buffers through that pointer. The
+  refusal printed its line and then died with **SIGSEGV (rc=139)**. It is
+  `std::exit(1)` now, in `main_cli.cpp` and `main_server.cpp` both. A new
+  early-return path is a new path: run it.
 - **A build failure leaves the old `.exe` in place.** A "run" after `ninja rc=1`
   silently executes the previous binary and can look like a pass or a new bug.
   `scripts/build_check.sh` is that check, automated: it asks `ninja -n` whether
@@ -332,11 +360,17 @@ code, the README, or `docs/`.
   (ctx 512, n 64, greedy, 5 interleaved pairs per run, text identical): residual
   fold **+2.867%** (5/5), silu fold **+6.135%** (5/5), both **+8.347%** (5/5);
   the op table goes **303 -> 243 ops/step**, the `residual` and `ffn-activate`
-  component rows disappearing (60 = 2 per layer x 30 layers). **The marginal
-  launch costs ~1.5 us, not the 3.64 us `kraken-bench` floor** -- 46 us for 30
-  launches -- so sizing a fold from the bench floor overstates it ~2.4x; that
-  floor is the price of adding a call to a quiet queue, not of holding one in a
-  busy step.
+  component rows disappearing (60 = 2 per layer x 30 layers). **Sizing a fold
+  from a per-op constant is good to ~2x and nothing better; run the fold.** Re-measured
+  on the current build (2026-10-11, 9 interleaved order-balanced pairs each, 0/9
+  pairs, md5 identical): `KRK_ACC_GEMM=0` (the residual fold, +30 launches) costs
+  **-5.219%** and `KRK_FUSED_SILU=0` (also +30) costs **-4.591%**, i.e. **2.4-2.8 us
+  per added call** -- which includes that fold's extra memory pass -- where the
+  "1.5 us" this bullet used to quote came from the same fold on an older build and
+  reproduces at neither end now. `kraken-bench`'s floor is **2.85-3.05 us** for a
+  trivial call in a quiet queue and **0.92 us** for the host-side enqueue of the
+  same call into a busy one, so the floor is within ~10% of a call that carries a
+  pass and overstates a pure enqueue ~3x.
 - **A fused group's fallback runs on PREFILL, and it must use each matrix's own
   metadata.** `gemm_group`'s fused path is decode-only (rows == 1), so a prefill
   pass takes the per-matrix fallback -- and a fallback that decodes a Q4_K
@@ -405,8 +439,10 @@ code, the README, or `docs/`.
   ranking, shares), never for how long: even its floor-removed NET column reports
   8.1 us of gemv device time per call where an entire step is 5.3 us per op. A decode
   step is **launch-bound**: 303 ops at 5.3 us and 517 ops at 5.4 us on two models whose
-  weight traffic differs 6.7x, against a `kraken-bench` launch floor of 3.64 us per
-  call, so ~69% of the step is the floor. Time a comparison WITHOUT `--profile`
+  weight traffic differs 6.7x, and the per-op cost is 0.9-2.8 us depending on
+  whether the call carries a memory pass, so **17-53% of the step is launch cost**
+  (the "~69% at 3.64 us" this used to say is the top of that band, not the middle).
+  Time a comparison WITHOUT `--profile`
   (`scripts/kraken_sherlock_kernel_ab.sh` does: interleaved reps, and a verdict that
   needs an ORDER-BALANCED median paired gain above the pairs' own MAD in at least
   reps-1 pairs). Balanced because the slot a run occupies inside a pair is worth
@@ -686,13 +722,283 @@ code, the README, or `docs/`.
   **49.3%** (48 tokens, 26838 acquires, all 10240 pairs touched) -- so a small
   budget pins that core and streams the tail, and a big one just holds the
   corpus.
+- **At a constrained expert budget the step IS the promotion, so a staged copy
+  has nothing to hide behind -- and one expert of lookahead is worth nothing.**
+  `Qwen3-MOE-4x0.6B-2.4B-Q4_K_M` (qwen3moe, 4 experts x top-2, 5.45 MiB per
+  expert), prompt "The history of computing is a history of abstraction", ctx 512,
+  n 32, `--greedy`: at `--expert-cache-mb 16` (2 slots) decode is **17.2 tok/s,
+  58.1 ms/step, 1846 promotions of 10059 MiB in 1391.6 ms = 77% of the decode
+  wall time**, at **0.0% HOT**; at 32 MiB (5 slots) it is 19.2 tok/s with 1.6%
+  HOT and 74% promotion. Staging the next routed expert (`KRK_ACTIVE_STAGE=1`,
+  off by default) copies on a nonblocking stream and publishes it with an event,
+  and the probe (`KRK_STAGE_TIMING=1`, `[stats ] stage-timing`) measures the copy
+  at **0.69-0.74 ms against a 0.32-0.34 ms reader window** -- 49-54% of 868 copies
+  fully hidden, reproduced on two builds. The copy is twice the work it would
+  hide behind and its bytes move either way; six interleaved order-balanced A/Bs
+  (9 pairs each) found **no win at all** -- staging was faster in 0/9 and 0/9
+  pairs at 16/32 MiB on the build before the probe landed and 2/9 and 1/9 after
+  it, with NO DIFFERENCE at the resident budget where there is nothing to stage --
+  and stdout md5 `28fa19c37` unchanged in every arm.
+  Two traps worth keeping: an overlap probe must timestamp the *reader stream*
+  at submit time (an event recorded after the copy only says the copy happened),
+  and "the copy is on a side stream" is not evidence of overlap -- the window has
+  to be measured, because here it does not exist.
+- **The expert VRAM pool is physical and owned, and the target and draft share one
+  limit.** `alloc_pooled`/`release_pooled` are individually owned size-class cells
+  (256-byte aligned), not chunks of a fixed arena: every run prints
+  `[stats ] expert-pool budget/committed/live/reusable bytes` with `committed =
+  live + reusable`, a lowered budget trims free cells only, a live cell is never
+  freed by a shrink, a reused cell waits on its release event (`guard-fallback`
+  counts the times the event could not be created), and `set_expert_pool_owner`
+  sums the target's and the draft's budgets so neither can claim the whole card.
+  A single expert too large for the budget is still admissible -- explicitly, via
+  `max(budget, one_expert)` -- because the engine cannot run without it. The
+  device half is unreachable from `kraken-tests` (no group opens the device): it
+  is pinned by `kraken-bench --gate`'s expert-pool gate, including a constructed
+  event-creation failure (`KRK_TEST_POOL_NO_EVENT=1`), not by the unit suite.
+- **A pool's reuse guard belongs on the device, and *asking* whether the reader
+  retired is the whole cost.** At `--expert-cache-mb 16` on
+  `Qwen3-MOE-4x0.6B-2.4B-Q4_K_M` the expert-path split read `alloc 481.8-618.4 ms`
+  of a ~1.8 s decode, and the obvious reading (hipMalloc, or the free list) is
+  wrong. `kraken-bench` now prints the pool's marginal primitives and closes it:
+  event create+destroy **0.13 us**, record on the default stream **22.7-30.6 us**,
+  query a *completed* event **0.03 us**, wait on a completed event **0.08 us** --
+  but **record then query it while pending is +46.9 us over the record**, and the
+  real alloc+release pair cost **86.97 us**. 5560 cells x 87 us = 484 ms, the row
+  to the millisecond. **The record's own quiet figure is the one that is wrong:
+  in-step it costs 2.56 us, not 22-31 -- see the audit bullet below.** On a budget
+  that forces a promotion per expert visit the answer is always "not yet", so the
+  query is a full host round trip per cell.
+  The fix is to stop asking: the released cell carries the mark it was released
+  under, `alloc_pooled` hands it out with that mark, and the next writer
+  (`upload_paged_batch`, `upload_expert_staged`) issues `hipStreamWaitEvent` on
+  the copy stream -- a wait on an already-complete event retires immediately, so
+  the device cannot get slower. `alloc` **618.4 -> 182.5 ms**, decode
+  **+11.279% at 16 MiB and +8.569% at 32 MiB** (9/9 interleaved order-balanced
+  pairs each, md5 `28fa19c37` unchanged), resident budget NO DIFFERENCE (nothing
+  is reused there, which is the null control). `KRK_POOL_HOST_WAIT=1` restores
+  query-and-wait. **The "~128 ms of release records" this bullet used to leave
+  as the next term was a quiet-queue estimate and is 10x too big; the next
+  bullet has the measurement.**
+- **A primitive measured on a quiet queue is not the in-step cost, and the
+  factor is not a constant.** `kraken-bench` measures one call with an idle queue;
+  a decode step issues 243-2965 of them with hundreds already queued, and the two
+  figures differ in BOTH directions. Measured (2026-10-11, one session; full table
+  and raw transcripts in `docs/AUDIT-quiet-vs-busy-primitives.md` and
+  `docs/traces/quiet-vs-busy-primitives-2026-10-11.txt`):
+
+  | primitive | quiet (bench) | host enqueue, busy queue | in-step (switch A/B) | factor |
+  |---|---|---|---|---|
+  | record on the default stream | 28.2-30.6 us -- **the DEVICE half** | 0.33 us, the same empty or busy | **2.56 us** | quiet overstates **11-12x** |
+  | trivial launch (`copy_act n=32`) | 2.85-3.05 us | 0.92 us | 2.4-2.8 us per added call *with a pass* | ~1.1x with a pass, ~3.3x for an enqueue |
+  | record + query a *pending* event | 24.7-46.9 us | -- | 46.9 us | **1.0x -- the calibrated one** |
+  | a *device drain* (`hipDeviceSynchronize`) | not measured | -- | **~129 us** | the 0.07 us wait arm is 1000x off |
+  | pool round trip (256 KiB cells) | 18.8-33.7 us | -- | 16.5 us | <=1.6x, either way |
+  | `--floor` 1 MiB `copy_act` | 240.9 GB/s | -- | in-step `xfer` is H2D at 12.9 GB/s | wrong shelf: its ceiling is the reader's 15.9 GB/s |
+
+  **The arm measures a call's two halves apart, and that is what the table above
+  was actually comparing.** The queue is fed 512 x `copy_act n=32` of real device
+  work and 64 calls are timed inside it (median of 8 blocks); `--depth N` sets the
+  pre-issued count and `--depth 0` skips the printed arm. It cannot use
+  `time_calls`: that helper subtracts one-call-plus-one-sync from
+  many-calls-plus-one-sync, so its quotient is whichever half dominates the queue
+  -- and for a record that is the DEVICE half. Measured 2026-10-11 (plain run,
+  medians of 8, and the gate's own arms): a record enqueues in **0.33-0.34 us in
+  BOTH queue states** and leaves **27-32 us of device time** behind it; a launch
+  enqueues in 0.75-0.97 us and leaves 2.8 us. What the queue state changes is the
+  **tail** (177 -> 583 us on the launch arm), never the enqueue. So the 28.2-30.6
+  us this table used to call "quiet" was never a queue-state effect: it is the
+  device half, which is the right figure only for a call that cannot overlap. The
+  **in-step** column stands on its own switch A/B and is the number to rank with
+  (2.56 us for the record, because in a step the markers overlap hundreds of
+  queued launches); the "0.32 us busy enqueue" this table once called the
+  alternative was the same 0.33 us as the empty arm, mislabelled as a state.
+  **The arm is in the gate now and proves itself there** -- it asserts the queue
+  really is fuller (launch-arm tail >2x, measured 2.9-3.7x), that a record's device half is >=4x
+  its host half, that the enqueue does NOT move between states, and that the
+  instrument resolves the device cost per op. `KRK_TEST_QUEUE_NOPREISSUE=1` skips
+  the pre-issue and fails exactly the two fullness checks (rc=1), which is the
+  red construction. The gate's floor line says `unresolvable at iters=2` instead
+  of printing `-24.00 us per call` (the gate sets iters=2, where the subtraction
+  is the difference of two single measurements).
+  **Rules:** rank a fold by running the fold (one session, interleaved,
+  order-balanced) and treat any constant-times-count estimate as good to ~2x;
+  never compare a host-to-device row against `--floor`; and remember that a
+  *drain* is 1000x a wait.
+- **A small `upload` is a blocking copy, not a launch -- the per-expert plan pair
+  cost ~15 us, not ~2 launches, and folding it was worth +10%.** `Engine::moe_ffn`
+  used to upload each visit's row ids and gate weights with an `upload_i32` +
+  `upload` pair; both are BLOCKING `hipMemcpy` calls (`src/hip/backend_hip.hip`),
+  so 56 of them per step are worth ~10% of an 8.5 ms step, not the ~1.6% a
+  2.4-2.8 us launch-fold estimate predicts. The plan for the whole layer is now
+  bucketed once (one O(n*k) pass with a prefix sum, replacing an O(n_expert*n*k)
+  rescan per layer) and uploaded with **two** calls per layer; a visit reads
+  `[off(e), off(e+1))` of it and issues no copy at all. `ws_plan_`/`ws_alpha_` are
+  `C * k` entries now (`C` is the chunk; the layer's pair count is bounded by
+  n*k). `KRK_MOE_PLAN=0` restores the per-visit pair. Measured on
+  Qwen3-MoE-4x0.6B (28 layers, top-2): ops/step **705 -> 649** (56 = 2 x
+  (visits-1) per layer, the "on" arm closing the count exactly), A/B **+10.027%
+  order-balanced, 5/5 pairs, MAD 2.870%**, stdout md5 `995c6b60e7` identical --
+  and on Qwen3.8-Distill-35B-A3B (256 experts, 40 layers) `upload_i32` goes from
+  one per expert visit to **one per layer** (320 over 8 tokens = 40/step, down
+  from ~320/step). Ranking a blocking micro-copy as a launch is the same error
+  class as the record row above.
+- **The per-token drain in front of the topk readback was redundant, and removing
+  it is worth ~4-5%.** `Engine::topk_argmax` issued an explicit `hipDeviceSynchronize`
+  between its `logits_topk` launch and the 16-byte `download` -- but `download` is
+  a blocking `hipMemcpy` on the same stream, so it already orders itself behind
+  that launch. That is the same argument `Engine::moe_ffn` records for the router
+  readback, and it is now the same switch pattern: `KRK_TOPK_SYNC=1` restores the
+  drain (default off). Measured: SmolLM2-135M **+5.170%** and Qwen3.5-0.8B
+  **+4.412%** decode (5/5 interleaved order-balanced pairs each, MAD 2.076% and
+  0.631%, text identical). The remaining drains in the decode path now each have
+  a switch too: the router readback (`KRK_ROUTER_SYNC=1`, ~129 us/layer),
+  the expert request after a promotion (`KRK_SYNC_EXPERT=1`), the logits row
+  readback on the fallback path (`KRK_LOGITS_SYNC=0`) and the speculative
+  single-row recompute (`KRK_SPEC_ROW_SYNC=0`). The last two are not measurable
+  on a GPU run today -- the fallback is unreachable while `logits_topk` works,
+  and the speculative one needs a drafter (F8: self-draft acceptance 27.8%) --
+  which is why they are switches and not rows.
+- **An eviction's three slices share ONE release mark, and the row moved by a
+  third -- which is still only ~0.5% of the step.** `Backend::release_pooled_batch`
+  releases a burst under one mark: the releases in a burst are consecutive with
+  nothing submitted to the default stream between them, so their positions are
+  the same point, and the record is the whole cost of a mark. `HipBackend::PoolMark`
+  is refcounted -- every cell released under it holds a reference, and so does a
+  hand-out whose writer has not consumed the dependency -- and at zero it goes
+  back to a free list with its event. `KRK_POOL_BURST=0` restores one record per
+  slice, and the engine prints `release %llu mark(s) for %llu slice(s)`.
+  Measured on Qwen3-MOE-4x0.6B at `--expert-cache-mb 16` and `32`, n=64, 9
+  interleaved order-balanced pairs each: the `room` row (where the release
+  happens, inside `make_vram_room`) **58.5 -> 39.7 ms at 16 MiB and 59.0 -> 40.6
+  at 32 MiB, -31.23% and -31.28%, 9/9 pairs at both budgets**, with marks
+  10740 -> 3580 for the same 10740
+  slices, i.e. **1.00 -> 3.00 slices per mark**, and stdout md5 unchanged. The
+  end-to-end decode verdict is **NO DIFFERENCE** (+1.287% and +2.133%, MAD
+  1.6-2.1%): the row is ~18 ms of a ~3.2 s run, and no amount of sharing here
+  can be worth more than ~0.5%.
+  Two traps, both measured. **A record's cost is queue-dependent**: ~29-31 us on
+  the quiet queue `kraken-bench` measures primitives on against ~2.5 us marginal
+  in a decode step (7252 records removed = 18 ms), so the old "23 us x 5560 =
+  128 ms" was a 10x overstatement -- the same quiet-vs-busy gap as the launch
+  floor above, and it is why the whole row is ~13 ms and not ~128. **And the
+  sharing must not go past a burst**: `paged_publish_` makes the DEFAULT stream
+  wait on the copy stream (`hipStreamWaitEvent(0, paged_ev_[s])`) while the copy
+  stream waits on these marks, so a mark re-recorded -- or recycled on a ring --
+  while a wait on it is still in flight can land after such a wait and cycle
+  with the writer that takes it. One mark per burst, held open while referenced.
+  Opening a mark TAKES a reference (`refs = 1`) and `pool_mark_unref_` aborts on
+  underflow: without that the same mark reaches two bursts and the destructor
+  deletes it twice, which is STATUS_HEAP_CORRUPTION (0xC0000374) with the
+  process's buffered stdout lost -- it reads as "prints its banner, exits 127",
+  and the raw exit code (python subprocess -> 3221226356) is what names it.
+  `kraken-bench --gate`'s three new `expert-pool` checks are the proof, and
+  `KRK_POOL_BURST=0 kraken-bench --gate` fails exactly the sharing one (rc=1),
+  on a gate whose other two burst checks still pass.
+- **The slot lease has a device-side gate, and it is the bytes that prove it.**
+  `kraken-bench --gate`'s `expert-lease` (18 checks) configures a budget that
+  cannot hold the live expert and the staged one together -- strictly between
+  two and three slots, because a plain two-slot budget has room for both and
+  then nothing is reused, and exactly three lands on `over_budget`'s boundary --
+  so a staged promotion provably *must* evict, then downloads the leased expert's
+  three slices and compares them with the source it was promoted from, plus the
+  staged expert's own bytes so an aliased promotion cannot pass by luck, plus a
+  one-slot arm that must refuse to stage. It also asserts the mechanism, not just
+  the data: the reused cells' guards were honored on the device. No group in
+  `kraken-tests` opens the device, so this is the only place the invariant is
+  checked against real device copies. **It took three versions, and the proof is
+  the red run.** The first two passed with the lease DELETED from `pick_victim`:
+  a budget with room for both experts (or exactly three slots, where the
+  arithmetic lands on the boundary) never makes the promotion contend, so the
+  byte checks pass because nothing is reused; and comparing against the pointer
+  the first `acquire` returned is a tautology, because it points into the cache's
+  own slot and reads the NEW pointers after re-promotion -- a lease violation IS
+  a re-promotion, which restores the right bytes through the wrong addresses.
+  The gate now snapshots the three device addresses, asserts non-vacuity
+  (`the staged promotion had to evict a slot to fit`), and goes red (rc=1, a
+  diagnostic naming `gate slice of expert 0`) when the lease is removed.
 - **After the storage path, this model's decode is launch count.** With the
   warm-up on, one step is **2965 ops** for 40 layers: `gemm(gemv)` 531,
   `gemm_group` 360, and **320 each** of `upload_i32`, `upload`, `gather_rows`,
   `scatter_axpy` -- the per-expert machinery is **6 launches per expert visit,
   1920 of the 2965**, plus 40 router `download_f32` drains (one per layer). That
   is where the next folds are: the scatter into the down-projection epilogue, and
-  the per-expert `upload_i32`+`upload` pair becoming one per-layer plan upload.
+  the per-expert `upload_i32`+`upload` pair -- **which is now folded into one plan
+  per layer (2026-10-11): `upload_i32` is 40/step here, one per layer, and the
+  per-visit pair it replaced was two BLOCKING copies, not two launches, so the
+  fold was worth +10.0% on the 28-layer MoE rather than the ~1.6% a launch
+  estimate gives.** What is left of this bullet is the launch-count question
+  itself: the **launch floor on this 2965-op step is still measured only by
+  construction.** The A/B (`KRK_MOE_GROUP=0` against the default, which adds 2
+  launches per expert visit) needs ~10 runs of a 13 s load + 16 s warm-up, and the
+  **and on this box that configuration HANGS THE DISPLAY, twice, so do not run
+  it.** The unprofiled baseline was obtained (ctx 256, `-n 8`, warm-up on): load
+  34629 ms, **decode 12.2 tok/s = 81.7 ms/step**, `expert-path read 0.0 | room 0.0
+  | alloc 64.8 | xfer 67.7 ms` over all 7 steps, HOT 96.4%, 0 COLD, 0 MiB read
+  from the file -- so the "allocation-bound" reading this bullet used to carry is
+  **falsified**: promotion is ~9 ms of an 81.7 ms step. What the run also printed
+  is the thing that matters: **`[stats ] device 15.92 GiB in use of 15.92 GiB
+  (0.00 GiB free)`**. `--expert-warmup` promoted `VRAM +9480 experts (8888 MiB,
+  9480 slots)` in 33328 ms until the card was full to zero, and VRAM pressure that
+  total is what took the machine down -- both times, with the run already bounded
+  (`timeout 300`, `-n 8`) and the profiler OFF. **Rule: never enable the expert
+  warm-up when the tier would fill the card; read the `[stats ] device` line, and
+  keep headroom.** A 12.2 tok/s on a card with 0.00 GiB free is not a clean
+  **The engine enforces it now.** `Engine::configure_expert_cache` holds back
+  a VRAM reserve (`max(1 GiB, total/16)`, or `KRK_VRAM_RESERVE_MB`), clamps the
+  *auto* budget to what is left of it, and **refuses** an explicit
+  `--expert-cache-mb` that cannot fit, naming the largest budget the card can
+  hold. The warm-up then re-checks that reserve every round against
+  `device_free_bytes()` -- the plan-time arithmetic cannot see the workspaces
+  and the KV tier, which are allocated after the budget is chosen -- and stops
+  with `stopped at the VRAM reserve: N MiB kept free of M MiB total`. Measured
+  on Qwen3-MoE-4x0.6B: a normal run does not trigger it (text byte-identical),
+  `KRK_VRAM_RESERVE_MB=16000` promotes **0** experts and prints the report, and
+  `--expert-cache-mb 20000` on this 15.9 GiB card exits **rc=1** with
+  `does not fit: 16304 MiB of VRAM, 599 MiB already in use, 1024 MiB reserved
+  -> the largest budget this card can hold is 14681 MiB`.
+  **The host twin, the headroom line, and the test.** The same rule now covers
+  host RAM: `krk::host_reserve_bytes` is `max(2 GiB, installed/8)` (or
+  `KRK_RAM_RESERVE_MB`), and the WARM staging loop re-checks it every round
+  against `host_available_bytes()`. The ram policy already plans a 20% headroom,
+  but it plans it once, before the KV tier and the workspaces exist, and staging
+  is what spends it. Forced with `KRK_RAM_RESERVE_MB=200000` on
+  Qwen3-MoE-4x0.6B: `0 rounds, 4 experts/layer deep; WARM 0 MiB ... 0 MiB read,
+  VRAM +0 experts; 0 ms (stopped at the host RAM reserve: 200000 MiB kept free)`;
+  unforced, the same command completes (`2 rounds, WARM 610 MiB, 112 experts,
+  649 ms`). Every run now prints its headroom in its first lines, dense models
+  included -- `[info ] vram headroom: 15.57 GiB free of 15.92 GiB total, 1.00 GiB
+  reserved` -- because the fault this guards against reached `0.00 GiB free` and
+  the only line that showed it printed at the END of the run.
+  The decision itself is `include/krk/vram_guard.hpp`: pure arithmetic, no
+  device, no state, so `test_expert_cache_byte_budget` drives both halves of it
+  (13 checks: the exact-fit boundary, the refusal naming the largest budget in
+  MiB, a card with only the reserve left, and the backend that cannot report
+  capacity). **The first version of those checks was written in bytes against a
+  message formatted in MiB and the suite failed it** -- which is what they are
+  for. **The refused startup is driven END TO END too.** The suite now builds an
+  MoE fixture, tells the CPU backend to report a 4 GiB card (`KRK_VRAM_TOTAL_MB`),
+  asks for a 4096 MiB budget against 3072 MiB of room, requires `Engine::init` to
+  RETURN false with a refusal naming 3072, and then destroys the engine -- the
+  unwinding that used to walk a freed backend. Its first check is a CONTROL: the
+  same fixture at 1024 MiB must initialize, or a fixture that cannot init at all
+  would make the refusal pass for the wrong reason.
+  `scripts/vram_refusal_check.sh` is that path through the real CLIs, device-free,
+  and it is the only proof of the `std::exit(1)` fix: put `delete be; return 1;`
+  back in `main_cli.cpp` and it prints `CRASHED (rc=139)` and exits 1. Its other
+  red construction is `KRK_CARD_MB=65536`, where the refusal arm correctly FAILs
+  (rc=0, no message) while the generous-card arm still passes -- that pair is what
+  stops an unconditional refusal from reading as a pass. It also takes the budget
+  the refusal names and RUNS it: a refusal whose advice is not a working command is
+  worse than a trim, because the user has no way back. 2944/2944.
+  `KRK_VRAM_TOTAL_MB` is read by the CPU backend alone and only while it has no
+  capacity of its own to report, so no GPU run can be affected by it; everything
+  else in the run (the headroom line, the warm-up reserve, `[stats ] device`) then
+  reports the simulated card, because that is the number every decision used.
+  baseline either, so treat this figure as taken under the fault, not as the
+  model's speed. The 35.0 tok/s this file records above is not reproduced by the
+  run above (even-order fill -- the shipped 68-position index is refused for
+  `source_size 0`, so that 35.0 came from the ranked one).
   Instruction-wise the kernels already use `wmma` (prefill), `sdot4`/dp4a and
   `sdot2` (the per-32-channel dot), `v_perm` and wave shuffles; **rows=1 cannot
   use a cross-row instruction**, which is why WMMA is prefill-only -- the lever is

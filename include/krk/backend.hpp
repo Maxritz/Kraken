@@ -17,6 +17,7 @@
 #include <functional>
 #include "krk/common.hpp"
 #include "krk/quant.hpp"
+#include "krk/vram_guard.hpp"
 
 namespace krk {
 
@@ -110,6 +111,11 @@ public:
     // card something else is already using.
     virtual size_t device_free_bytes() const { return caps().vram_free; }
     virtual size_t device_total_bytes() const { return caps().vram_total; }
+    // Live host-memory availability for safe pageable staging. Zero means the
+    // backend cannot obtain a trustworthy reading; callers that allocate RAM
+    // tiers fail closed in that case.
+    virtual size_t host_available_bytes() const { return 0; }
+    virtual size_t host_total_bytes() const { return 0; }
 
     virtual void release_host(void *p) { host_free(p); }
 
@@ -125,12 +131,44 @@ public:
         return alloc_host(bytes ? bytes : 1);
     }
     virtual void release_host_pageable(void *p) { release_host(p); }
+
+    // Shared admission for every pageable staging allocation, regardless of
+    // whether it belongs to the expert WARM tier or a KV WARM/COLD move.
+    // Individual tier budgets remain upper bounds; this process-wide ledger is
+    // the common physical-host-memory ceiling they jointly spend.
+    void *alloc_host_pageable_budgeted(size_t bytes) {
+        if (bytes == 0) bytes = 1;
+        if (!SharedHostRamBudget::reserve(bytes, host_available_bytes(),
+                                          host_total_bytes()))
+            return nullptr;
+        void *p = alloc_host_pageable(bytes);
+        if (!p) {
+            SharedHostRamBudget::cancel(bytes);
+            return nullptr;
+        }
+        if (!SharedHostRamBudget::commit(p, bytes)) {
+            release_host_pageable(p);
+            SharedHostRamBudget::cancel(bytes);
+            return nullptr;
+        }
+        return p;
+    }
+    void release_host_pageable_budgeted(void *p) {
+        SharedHostRamBudget::release_and_free(
+            p, [this](void *owned) { release_host_pageable(owned); });
+    }
     // Releases host memory an asynchronous copy may still be reading. The
     // default frees it immediately; a backend that stages copies keeps the
     // pointer until the copy has landed, because freeing the source of an
     // in-flight DMA is a use-after-free, and with a greedy decode it shows up
     // as text that is plausible but different from run to run.
-    virtual void release_host_deferred(void *p) { release_host_pageable(p); }
+    virtual void release_host_deferred(void *p) {
+        SharedHostRamBudget::release_and_free(
+            p, [this](void *owned) { release_host_pageable(owned); });
+    }
+    void release_host_deferred_budgeted(void *p) {
+        if (p) release_host_deferred(p);
+    }
     // Fills `dst` (pageable host memory) with `bytes` taken from `mapped_src`,
     // a pointer into the weight mapping. A backend that can read the file
     // directly (see set_weight_pull) does so, because a cold expert should cost
@@ -176,6 +214,14 @@ public:
             if (dst[i] && src[i] && bytes[i]) upload_paged(dst[i], src[i], bytes[i]);
     }
 
+    // Opt-in promotion ticket. Source bytes must be copied/staged before return;
+    // wait_marker(ticket) makes the copy visible before its first consumer.
+    virtual void *upload_expert_staged(void *const dst[], const void *const src[],
+                                       const size_t bytes[], int n) {
+        upload_paged_batch(dst, src, bytes, n);
+        return nullptr;
+    }
+
     // Small-object device allocations, pooled by the expert cache. A
     // promotion is a handful of ~1-2 MiB slices and the default
     // alloc/release pair is hipMalloc/hipFree, which are
@@ -183,10 +229,52 @@ public:
     // expert cache issued 13198 uploads and 2594 ms of device time went into
     // them against 1330 ms of device idle. Backends without a pool just
     // forward to alloc/release.
+    struct ExpertPoolStats {
+        size_t budget = 0, committed = 0, live = 0, reusable = 0;
+        u64 allocations = 0, reuses = 0, trims = 0, guard_fallbacks = 0;
+        f64 staged_copy_ms = 0, staged_reader_ms = 0, staged_overlap_ms = 0;
+        u64 staged_measured = 0, staged_hidden = 0;
+        // How a reused cell's guard was honored: on the device (the writer's
+        // stream waits on the mark), or by waiting on the host for a path with
+        // no single stream to order. The first is the cheap one; the ratio is
+        // what says whether the reuse path was actually taken.
+        u64 order_device = 0, order_host = 0, order_implicit = 0;
+        // Release marks: how many hipEventRecords the pool issued, and how many
+        // slices those records covered. A burst release is ONE mark for its
+        // whole burst, so release_slices / release_marks is the sharing factor
+        // and a ratio of 1.0 means the burst path was not taken.
+        u64 release_marks = 0, release_slices = 0;
+    };
+    // Physical bytes, including alignment. One oversize expert is explicitly
+    // allowed by the cache; free cells are trimmed before changing the limit.
+    virtual size_t pooled_size(size_t bytes) const { return bytes; }
+    virtual void set_expert_pool_budget(size_t bytes) { (void)bytes; }
+    virtual void set_expert_pool_owner(const void *owner, size_t bytes) {
+        (void)owner; (void)bytes;
+    }
+    virtual ExpertPoolStats expert_pool_stats() const { return {}; }
     virtual void *alloc_pooled(size_t bytes) { return alloc(bytes); }
     virtual void release_pooled(void *p, size_t bytes) {
         (void)bytes;
         if (p) release(p);
+    }
+    // Release several cells that are going back at the SAME stream point --
+    // an expert's three slices, which is what an eviction returns. The mark a
+    // reused cell needs is "the default-stream position its readers are
+    // ordered before", and cells released together share that position, so a
+    // backend that can express it records one mark for the burst instead of one
+    // per cell. It is not an approximation: nothing is submitted between the
+    // releases in a burst, so their positions are the same point.
+    //
+    // Sharing must not go further than a burst. A backend that re-records a
+    // mark while a wait on it is still in flight (a rotating pool of marks,
+    // say) can put the recorded position after the default stream's
+    // `hipStreamWaitEvent(0, paged_ev)` -- the default stream waits on the copy
+    // stream there while the copy stream waits on these marks -- and a mark
+    // recorded after such a wait, then handed to a copy-stream writer, is a
+    // dependency cycle. See HipBackend::PoolMark.
+    virtual void release_pooled_batch(void *const ps[], const size_t bytes[], int n) {
+        for (int i = 0; i < n; i++) release_pooled(ps[i], bytes[i]);
     }
     virtual void upload(void *dst, const void *src, size_t bytes, size_t off = 0) = 0;
     // Direct copy with no staging side effects. The HIP backend's read()-based
@@ -235,6 +323,10 @@ public:
     // no-op record, and a wait that falls back to a full sync(). A backend
     // that does not implement markers is slower, never wrong.
     virtual void *make_marker() { return nullptr; }
+    // Some backends provide a null/no-op marker and implement waits as a full
+    // sync (the conservative fallback above); others require real markers to
+    // safely reuse a device slot. A failed required marker is an init error.
+    virtual bool requires_markers() const { return false; }
     virtual void wait_marker(void *marker) {
         (void)marker;
         sync();

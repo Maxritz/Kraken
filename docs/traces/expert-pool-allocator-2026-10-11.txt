@@ -1,0 +1,307 @@
+Expert promotion path: allocator decomposition and the device-ordered reuse guard
+2026-10-11. Machine: AMD Radeon RX 9070 XT (gfx1201), 15.9 GiB VRAM, 96 GB RAM.
+Model: models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf (qwen3moe, 28 layers, 4 experts x top-2, 5.45 MiB/expert)
+Prompt: The history of computing is a history of abstraction   ctx=512 n=32 --greedy
+
+############ 1. the trap: kraken-bench marginal pool timing ############
+--- BEFORE (build5, host wait + readiness query on every reuse) ---
+pool primitives: event create+destroy 0.13 us | record 30.61 us | query 0.03 us | wait 0.08 us
+pool round trip (8 cells of 256 KiB, budget 2048 KiB): 86.97 us ready | 79.47 us with a queued reader | alloc 8 reuse 404 trim 0
+
+--- AFTER: the same binary, the two arms interleaved (KRK_POOL_HOST_WAIT=1 restores the old path) ---
+rep1 sw=1 87.48 us ready | 88.42 us with a queued reader | alloc 8 reuse 604 trim 0
+rep1 sw=0 20.66 us ready | 22.92 us with a queued reader | alloc 8 reuse 604 trim 0
+rep2 sw=1 89.17 us ready | 115.43 us with a queued reader | alloc 8 reuse 604 trim 0
+rep2 sw=0 24.37 us ready | 33.69 us with a queued reader | alloc 8 reuse 604 trim 0
+rep3 sw=1 85.63 us ready | 80.79 us with a queued reader | alloc 8 reuse 604 trim 0
+rep3 sw=0 25.56 us ready | 36.00 us with a queued reader | alloc 8 reuse 604 trim 0
+
+--- the query that was the cost, measured on a PENDING event ---
+pool primitives: event create+destroy 0.13 us | record 27.05 us | query 0.03 us | wait 0.08 us | record+query a pending event 53.87 us
+pool primitives: event create+destroy 0.15 us | record 21.79 us | query 0.03 us | wait 0.08 us | record+query a pending event 62.65 us
+  (query on an ALREADY COMPLETE event is 0.03 us; the 'record+query a pending event'
+   column is the delta the pool paid on every reuse of a saturated budget.)
+
+############ 2. the engine's own rows, one switch apart ############
+--- KRK_POOL_HOST_WAIT=1 (old: query + host wait) ---
+[stats ] decode    32 tok in 2054.6 ms over 31 timed steps = 15.1 tok/s (66.3 ms/step)
+[stats ] expert-pool budget 16777216 committed 15777792 live 12238848 reusable 3538944 bytes; alloc 666 reuse 4872 trim 658 guard-fallback 0
+[stats ] transfer  1846 promotions, 10059 MiB in 1627.2 ms = 6.0 GB/s (881.5 us/expert) | 1844 VRAM evictions kept in WARM, 10048 MiB | 599 MiB read from the file (18.73 MiB/tok)
+[stats ] expert-path  read     79.9 ms | room     37.9 ms | alloc    618.4 ms | xfer    970.3 ms | (promote total   1627.2 ms)
+28fa19c3733a5cab9dc53611de71600c */tmp/krk-active-staging/row-1.out
+--- KRK_POOL_HOST_WAIT=0 (new: device-ordered guard) ---
+[stats ] decode    32 tok in 1869.0 ms over 31 timed steps = 16.6 tok/s (60.3 ms/step)
+[stats ] expert-pool budget 16777216 committed 15777792 live 12238848 reusable 3538944 bytes; alloc 666 reuse 4872 trim 658 guard-fallback 0
+[stats ] transfer  1846 promotions, 10059 MiB in 1231.1 ms = 8.0 GB/s (666.9 us/expert) | 1844 VRAM evictions kept in WARM, 10048 MiB | 599 MiB read from the file (18.73 MiB/tok)
+[stats ] expert-path  read     81.7 ms | room     37.5 ms | alloc    182.5 ms | xfer   1010.5 ms | (promote total   1231.1 ms)
+28fa19c3733a5cab9dc53611de71600c */tmp/krk-active-staging/row-0.out
+
+############ 3. interleaved order-balanced A/B, 9 pairs each ############
+=== pool-16.log ===
+sherlock A/B: hybrid kernel swap behind KRK_TIME_OP, interleaved
+  binary   : /c/Users/rr/OneDrive/Desktop/kraken/build-hip/kraken.exe
+  model    : models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+  prompt   : The history of computing is a history of abstraction
+  ctx=512 n=32 reps=9
+  common CLI: --expert-cache-mb 16 --expert-warm-mb 768 --expert-warmup 0
+  arm A    : env KRK_POOL_HOST_WAIT=1
+  arm B    : env KRK_POOL_HOST_WAIT=0
+
+  rep  order   arm  decode tok/s   ms/step   prefill tok/s   md5        rc
+  1    A B     A    15.9            62.9      33.8            28fa19c373 0
+  1    A B     B    17.3            58.0      37.0            28fa19c373 0
+  2    B A     B    17.4            57.4      36.8            28fa19c373 0
+  2    B A     A    14.8            67.6      34.4            28fa19c373 0
+  3    A B     A    15.9            63.0      34.7            28fa19c373 0
+  3    A B     B    17.4            57.3      37.9            28fa19c373 0
+  4    B A     B    16.9            59.3      37.3            28fa19c373 0
+  4    B A     A    15.7            63.5      35.3            28fa19c373 0
+  5    A B     A    13.8            72.5      32.7            28fa19c373 0
+  5    A B     B    17.2            58.1      36.6            28fa19c373 0
+  6    B A     B    17.6            57.0      36.8            28fa19c373 0
+  6    B A     A    15.2            65.7      36.3            28fa19c373 0
+  7    A B     A    15.8            63.5      34.8            28fa19c373 0
+  7    A B     B    17.5            57.2      37.0            28fa19c373 0
+  8    B A     B    16.9            59.2      35.7            28fa19c373 0
+  8    B A     A    15.3            65.4      34.9            28fa19c373 0
+  9    A B     A    16.5            60.8      34.6            28fa19c373 0
+  9    A B     B    17.0            59.0      35.0            28fa19c373 0
+
+paired deltas (B vs A, %): 8.805 17.568 9.434 7.643 24.638 15.789 10.759 10.458 3.030 
+median 10.458%   MAD 2.815%   B faster in 9/9 pairs
+order split: A-first median 9.434% (5 pair(s))   B-first median 13.1235% (4 pair(s))
+order-balanced median 11.279%  <- the figure the verdict uses
+
+verdict: WIN -- B is faster in 9/9 pairs by an order-balanced
+         median 11.279% (raw 10.458%), which exceeds the spread of those
+         pairs (MAD 2.815%). Text identical.
+
+=== pool-32.log ===
+sherlock A/B: hybrid kernel swap behind KRK_TIME_OP, interleaved
+  binary   : /c/Users/rr/OneDrive/Desktop/kraken/build-hip/kraken.exe
+  model    : models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+  prompt   : The history of computing is a history of abstraction
+  ctx=512 n=32 reps=9
+  common CLI: --expert-cache-mb 32 --expert-warm-mb 768 --expert-warmup 0
+  arm A    : env KRK_POOL_HOST_WAIT=1
+  arm B    : env KRK_POOL_HOST_WAIT=0
+
+  rep  order   arm  decode tok/s   ms/step   prefill tok/s   md5        rc
+  1    A B     A    13.6            73.7      31.5            28fa19c373 0
+  1    A B     B    15.6            64.2      32.3            28fa19c373 0
+  2    B A     B    17.5            57.1      35.5            28fa19c373 0
+  2    B A     A    16.1            62.1      33.7            28fa19c373 0
+  3    A B     A    15.3            65.3      33.7            28fa19c373 0
+  3    A B     B    16.2            61.7      34.1            28fa19c373 0
+  4    B A     B    17.3            57.7      35.6            28fa19c373 0
+  4    B A     A    15.2            65.7      34.0            28fa19c373 0
+  5    A B     A    15.5            64.5      33.5            28fa19c373 0
+  5    A B     B    15.9            63.0      32.4            28fa19c373 0
+  6    B A     B    17.9            55.8      32.3            28fa19c373 0
+  6    B A     A    16.5            60.7      35.8            28fa19c373 0
+  7    A B     A    15.8            63.3      36.2            28fa19c373 0
+  7    A B     B    17.8            56.2      36.4            28fa19c373 0
+  8    B A     B    18.6            53.7      37.1            28fa19c373 0
+  8    B A     A    15.7            63.5      35.7            28fa19c373 0
+  9    A B     A    15.9            62.9      35.5            28fa19c373 0
+  9    A B     B    16.3            61.3      31.6            28fa19c373 0
+
+paired deltas (B vs A, %): 14.706 8.696 5.882 13.816 2.581 8.485 12.658 18.471 2.516 
+median 8.696%   MAD 5.120%   B faster in 9/9 pairs
+order split: A-first median 5.882% (5 pair(s))   B-first median 11.256% (4 pair(s))
+order-balanced median 8.569%  <- the figure the verdict uses
+
+verdict: WIN -- B is faster in 9/9 pairs by an order-balanced
+         median 8.569% (raw 8.696%), which exceeds the spread of those
+         pairs (MAD 5.120%). Text identical.
+
+=== pool-resident.log ===
+sherlock A/B: hybrid kernel swap behind KRK_TIME_OP, interleaved
+  binary   : /c/Users/rr/OneDrive/Desktop/kraken/build-hip/kraken.exe
+  model    : models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+  prompt   : The history of computing is a history of abstraction
+  ctx=512 n=32 reps=9
+  common CLI: (none)
+  arm A    : env KRK_POOL_HOST_WAIT=1
+  arm B    : env KRK_POOL_HOST_WAIT=0
+
+  rep  order   arm  decode tok/s   ms/step   prefill tok/s   md5        rc
+  1    A B     A    117.2           8.5       37.0            28fa19c373 0
+  1    A B     B    114.5           8.7       37.5            28fa19c373 0
+  2    B A     B    117.7           8.5       37.4            28fa19c373 0
+  2    B A     A    118.3           8.5       37.2            28fa19c373 0
+  3    A B     A    120.1           8.3       36.9            28fa19c373 0
+  3    A B     B    117.3           8.5       36.8            28fa19c373 0
+  4    B A     B    119.0           8.4       35.7            28fa19c373 0
+  4    B A     A    117.5           8.5       35.2            28fa19c373 0
+  5    A B     A    117.9           8.5       37.8            28fa19c373 0
+  5    A B     B    81.1            12.3      26.3            28fa19c373 0
+  6    B A     B    79.3            12.6      27.4            28fa19c373 0
+  6    B A     A    75.7            13.2      26.0            28fa19c373 0
+  7    A B     A    89.4            11.2      27.7            28fa19c373 0
+  7    A B     B    103.9           9.6       30.3            28fa19c373 0
+  8    B A     B    107.9           9.3       32.0            28fa19c373 0
+  8    B A     A    106.0           9.4       35.9            28fa19c373 0
+  9    A B     A    109.3           9.1       36.2            28fa19c373 0
+  9    A B     B    108.7           9.2       35.5            28fa19c373 0
+
+paired deltas (B vs A, %): -2.304 -0.507 -2.331 1.277 -31.213 4.756 16.219 1.792 -0.549 
+median -0.507%   MAD 1.824%   B faster in 4/9 pairs
+order split: A-first median -2.304% (5 pair(s))   B-first median 1.5345% (4 pair(s))
+order-balanced median -0.385%  <- the figure the verdict uses
+
+verdict: NO DIFFERENCE -- the order-balanced median paired delta (-0.385%) does not clear
+         the spread of the pairs (MAD 1.824%), so this run does not
+         support a win. That is the honest answer for an inert switch,
+         and the reason a single pair is not evidence.
+
+
+############ 4. the device-side lease gate (final build9) ############
+(this is the shape the gate has once the non-vacuity check and the
+address snapshot are in: 18 lease checks of the gate's 53)
+expert-lease (device):
+  ok   expert-lease the current expert is resident
+  ok   expert-lease its device bytes match the source it was promoted from
+  ok   expert-lease a second expert is resident beside it
+  ok   expert-lease the next routed expert stages concurrently
+  ok   expert-lease the staged promotion had to evict a slot to fit
+  ok   expert-lease the staged promotion is counted
+  ok   expert-lease the leased expert is still resident
+  ok   expert-lease a concurrent staged promotion did not overwrite the cells the leased expert is using
+  ok   expert-lease the staged expert's device bytes are its own, not the incumbent's
+  ok   expert-lease the staged copy was consumed once
+  ok   expert-lease physical commitment stayed inside the configured budget
+  ok   expert-lease a one-slot budget refuses to stage
+  ok   expert-lease and the current consumer keeps its slot
+  ok   expert-lease its device bytes survive the refused promotion
+  ok   expert-lease the refusal falls back to an exact demand load
+       lease reuse guards: device 6, host 0, implicit 0
+  ok   expert-lease a reused cell's guard was honored on the device
+  ok   expert-lease the promotion path never fell back to stopping the host for a guard
+  ok   expert-lease clearing both caches released every live cell
+
+logits_topk:
+  ok   plain k=1              n=248320  k=1   matches host rule
+  ok   plain k=8              n=248320  k=8   reports truncation (count=24721 > cap=4096): ids undefined, as documented
+  ok   total tie k=1          n=248320  k=1   matches host rule
+  ok   total tie k=8          n=248320  k=8   reports truncation (count=248320 > cap=4096): ids undefined, as documented
+  ok   top tie k=8            n=248320  k=8   matches host rule
+  ok   softcap shelf k=1      n=248320  k=1   matches host rule
+  ok   softcap shelf k=8      n=248320  k=8   reports truncation (count=35475 > cap=4096): ids undefined, as documented
+  ok   repetition penalty k=8 n=248320  k=8   reports truncation (count=24499 > cap=4096): ids undefined, as documented
+  ok   penalty+tie k=8        n=248320  k=8   matches host rule
+  ok   small vocab k=8        n=1000    k=8   matches host rule
+  (rows stored as f16, the backend's activation type)
+  ok   expert-pool release accounting and physical bound
+gate rc=0 (last verification pass, /tmp/final-gate.txt; 53 ok/FAIL lines, 0 FAIL;
+        18 of them the expert-lease group)
+
+############ 5. gates on the final binary ############
+=== scripts/build_check.sh (plain rerun after KRK_REFRESH_FINGERPRINT=1) ===
+build dir: /c/Users/rr/OneDrive/Desktop/kraken/build-hip
+targets  : kraken kraken-tests kraken-inspect kraken-server kraken-bench
+
+ok    up-to-date   ninja has no pending work for: kraken kraken-tests kraken-inspect kraken-server kraken-bench
+ok    build-type   Release, -DNDEBUG in all 90 compiled .cpp TU(s), no -O0
+ok    hip-backend  KRK_ENABLE_HIP=ON, HIP enabled, kraken.exe links
+          amdhip64 and its build rule is HIP_EXECUTABLE_LINKER
+ok    gpu-target   KRK_GPU_TARGETS=gfx1201
+ok    device       AMD Radeon RX 9070 XT (gfx1201) is in KRK_GPU_TARGETS
+WARN  runtime      running a different HIP runtime than this build was linked to:
+          [warn ] the loaded HIP runtime is not the SDK this binary was built against; stage the SDK's amdhip64_*.dll next to the binary to pin the runtime
+          Stage the SDK's amdhip64_*.dll, amd_comgr.dll and rocm_kpack.dll
+          next to the binary to pin it. Measurement made under a different
+          runtime is not a measurement of this build.
+ok    fingerprint  all 5 artifact(s) match the recorded build (sha256)
+
+0 failed, 1 warning(s)
+=== scripts/kraken_tests_baseline_check.sh ===
+kraken-tests baseline gate
+  binary   : /c/Users/rr/OneDrive/Desktop/kraken/build-hip/kraken-tests.exe
+  baseline : /c/Users/rr/OneDrive/Desktop/kraken/tests/kraken-tests-baseline.json
+
+run        rc=0, 2927/2927 checks passed
+           report: C:/Users/rr/AppData/Local/Temp/tmp.mm7Jn5nJuL/report.json
+
+tool       18/18 selftest cases passed
+
+proof      17/17 selfcheck cases passed
+           group 0: 1/1 groups: every injection was reported by name, with the count it had reached
+
+=== scripts/coherence_check.sh ===
+prompt: What is the capital of France?   n=32   ctx=512   chunk=32   chat=1   tie tol=0.05
+per-run timeout 120s
+each model runs twice: device arm (stdout banner must name a gfx arch)
+and --cpu scalar reference arm; PASS = the two produced identical text
+PASS                   SmolLM2-135M-Instruct.Q4_K_M.gguf          The capital of France is Paris. It is located in the northern part of the country, in th
+PASS                   Qwen3.5-0.8B.Q4_K_M.gguf                   <think>  </think>  The capital of France is **Paris**.  It is the largest city in France
+PASS                   Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf          <think> Okay, so I need to figure out the capital of France. Let me start by recalling w
+3 coherent, 0 not
+
+############ 6. falsifiability: the lease gate with the lease deleted ############
+The patch, applied to src/expert_cache.cpp, built and reverted in one script:
+  pick_victim(): 'if (!s.in_vram() || s.leased) continue;'  ->  'if (!s.in_vram()) continue;'
+Script: /tmp/krk-lease-falsify/run.sh. rc values captured explicitly, one per step
+(ninja rc=0, gate red rc=1, ninja restore rc=0, gate green rc=0, ninja -n rc=0).
+
+--- attempt 1: two-slot budget (both experts fit, so nothing contends) ---
+gate rc=0 -- the gate could not fail: no cell was reused at all, so the byte
+checks compared two residency records that happened to agree.
+[observed in-session; that log was superseded by the next attempt and is not
+archived here]
+
+--- attempt 2: exactly three slots (the arithmetic lands on the boundary) ---
+  FAIL expert-lease the staged promotion had to evict a slot to fit
+GATE FAILED: 1 check(s) ...
+gate rc=1, but on the non-vacuity check only -- still not the lease.
+[trace: gate-broken2.log]
+
+--- attempt 3: a budget strictly between two and three slots + address snapshot ---
+expert-lease (device):
+  ok   expert-lease the current expert is resident
+  ok   expert-lease its device bytes match the source it was promoted from
+  ok   expert-lease a second expert is resident beside it
+  ok   expert-lease the next routed expert stages concurrently
+  ok   expert-lease the staged promotion had to evict a slot to fit
+  ok   expert-lease the staged promotion is counted
+  FAIL expert-lease the leased expert is still resident
+       lease mismatch: gate slice of expert 0
+  FAIL expert-lease a concurrent staged promotion did not overwrite the cells the leased expert is using
+  ok   expert-lease the staged expert's device bytes are its own, not the incumbent's
+  ok   expert-lease the staged copy was consumed once
+  ok   expert-lease physical commitment stayed inside the configured budget
+  ok   expert-lease a one-slot budget refuses to stage
+  ok   expert-lease and the current consumer keeps its slot
+  ok   expert-lease its device bytes survive the refused promotion
+  ok   expert-lease the refusal falls back to an exact demand load
+       lease reuse guards: device 6, host 0, implicit 0
+  ok   expert-lease a reused cell's guard was honored on the device
+  ok   expert-lease the promotion path never fell back to stopping the host for a guard
+  ok   expert-lease clearing both caches released every live cell
+GATE FAILED: 2 check(s) outside tolerance, or NaN/inf, or a logits_topk mismatch
+gate rc=1 -- the non-vacuity check PASSES in this arm (the budget really does
+force contention), so the two FAILs are the lease itself: the eviction took the
+cells out from under the live consumer and the diagnostic names which slice.
+[trace: gate-broken4.log]
+
+--- the same gate with the lease restored, rebuilt (final binary, build9) ---
+build_restore_rc=0   gate_green_rc=0   pending_rc=0 (ninja -n: no work to do)
+53 ok/FAIL lines, 0 FAIL; lease reuse guards: device 6, host 0, implicit 0
+bench rc=0
+[trace: /tmp/krk-lease-falsify/gate-green.log]
+
+############ 7. gates on the final binary (build9) ############
+=== g3-bcheck ===
+bcheck rc=0
+=== g3-baseline ===
+baseline rc=0
+=== g3-coherence ===
+coherence rc=0
+run        rc=0, 2927/2927 checks passed
+tool       18/18 selftest cases passed
+proof      17/17 selfcheck cases passed
+PASS                   Qwen3.5-0.8B.Q4_K_M.gguf                   <think>  </think>  The capital of France is **Paris**.  It is the largest city in France
+PASS                   Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf          <think> Okay, so I need to figure out the capital of France. Let me start by recalling w
+3 coherent, 0 not
+
+0 failed, 1 warning(s)

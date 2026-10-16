@@ -5,6 +5,10 @@ analysis pass over it — every open item inventoried, its measured evidence
 named, and the cheapest concrete fix path (files, switches, falsifier)
 written down so the next session starts executing instead of re-deriving.
 Prepared 2026-10-11 after the fused-attention-chain commit (`b36af97`).
+Execution update: [current pending index](AUDIT-pending-index.md),
+[cache audit](AUDIT-expert-cache-next.md), and
+[verification evidence](traces/todo-processing-2026-10-11.txt). C1 is fixed;
+C2's short drift does not reproduce, but its long scalar run timed out.
 
 ---
 
@@ -41,8 +45,18 @@ move" claim was replaced on `e611575` with the landed one-launch chain
 
 ## 1. P0 — correctness (the open ones)
 
-### C1. Fused attention chain diverges at NeoX + qk_norm — OPEN, gated
+### C1. Fused attention chain at NeoX + qk_norm — FIXED 2026-10-11
 
+**Resolution:** pair-owned NeoX rotation through an f16 LDS row passes the
+new HIP probe 1280/1280 exactly, including norm OFF (which also reproduced
+the old defect). Extra casts did not fix it: the norm helper already returns
+f16. The full-NeoX norm gate is default-on with `KRK_FUSED_ATTN_NEOX=0`
+restoring the old gate. Three hash contracts and nine interleaved 8B pairs
+are byte-identical. Timing is NO DIFFERENCE (+10.675% balanced, 11.368% MAD);
+no speed claim. See [TODO.md](TODO.md) and the durable
+[evidence log](traces/todo-processing-2026-10-11.txt).
+
+The following is the pre-fix investigation record, not the next execution plan.
 Recorded 2026-10-11 in TODO. Evidence on disk:
 `/tmp/de0.txt` (separate arm), `/tmp/de1.txt` (fused arm), `/tmp/dk0.txt`,
 `/tmp/dk1.txt` (with the `attn.kc` cache-row dump rows). Shape: Qwen3-8B
@@ -78,7 +92,14 @@ Cost: small. Value: unlocks the fused chain for every NeoX qk_norm model
 (Qwen3 family of 4B/8B/30B shapes) — that is the majority of the
 collection's dense models.
 
-### C2. Spark_one.Q6_K drift — revisit AFTER three stale assumptions re-run
+### C2. Spark_one.Q6_K drift — rechecked 2026-10-11, not reproduced
+
+Five stated raw prompts pass current CPU/device coherence. Five 160-token
+GPU repeats plus five actual split-enabled repeats (`KRK_FUSED_ATTN=0`)
+and the unsplit arm match `88dd81768ea632248157f5f6e8b238de` through position
+168. The long scalar arm times out at 120 seconds (rc=124), after 133 picks
+all matching the device. Full long scalar coherence is therefore incomplete;
+no Q6_K arithmetic fix was inferred or applied. The historical plan follows.
 
 The table in TODO documents five eliminated hypotheses, but the entry
 itself flags the fatal one: the "deterministic ⇒ not a race" row ran on a
@@ -162,6 +183,14 @@ candidate selector) is the separate capability item below.
 ---
 
 ## 3. Performance — ranked by measured size, with fix paths
+
+**2026-10-11 revision:** [AUDIT-expert-cache-next.md](AUDIT-expert-cache-next.md)
+is the current cache-specific sequence. Kraken already has an event-guarded
+VRAM arena and active LFU pins; neither plain LRU nor historical seed counts
+is an assumed improvement. Fix pending WARM reservation accounting first
+(done, regression-proven), then trace identity/byte cost and physical arena
+ownership/budget, then exact active-set staging and measured overlap. Route-ahead
+is a hint with an independent pollution budget, never authoritative routing.
 
 ### M0. The 28%-of-decode promotion stall — the direct (Strata-shaped) fix
 
@@ -261,11 +290,11 @@ output (open); `KRK_I8K_DEBUG=1` exists for it.
 
 | Gap | Unlocks | Fix path (concrete) |
 |---|---|---|
-| **`qwen4exp` arch entry** | The 288-expert REAP GGUF + the whole Qwen3.8-Flash family; needs `attn_gate`, fused `attn_qkv`, `ssm_conv1d`, `ssm_out` — i.e. MTP-drafter work too | Table row + the four named classes; `docs/AUDIT-plan-vs-code.md` is the per-piece inventory |
+| **`qwen4exp` execution (named registry entry exists)** | The 288-expert REAP GGUF + the whole Qwen3.8-Flash family; needs `attn_gate`, fused `attn_qkv`, `ssm_conv1d`, `ssm_out` — i.e. MTP-drafter work too | Table row + the four named classes; `docs/AUDIT-plan-vs-code.md` is the per-piece inventory |
 | **MLA (deepseek2/deepseek4)** | GLM-4.7-Flash, DeepSeek-V4-Flash-files refused today | See §5 — this is the paper path |
 | **Sliding-window attention** | gemma2/gemma3-4B/30B-A4B files | `AttnDesc::window` exists (laguna uses it); what is missing is per-layer window patterns and the four HIP kernels' bound in the OWN kernels at decode — C1's chain gate interacts |
 | **gemma4 geometry** | gemma-4-E4B-it, gemma4-coding | Per-layer input embeddings + shared-KV 18-layer shape |
-| **MTP / dflash / dspark draft-head loading** | Speculative on every model that ships a head set | The MTP artifact exists (`C:\Strata-HIP-data\mtp\mtp-qwen4-mtp-bf16.gguf`); loader/extractor + `--draft` verify loop is the gap (AGENTS.md F8 note) — NOW actionable since F8 is fixed |
+| **MTP / DFlash2 / DSpark execution** | Speculative on models shipping compatible head sets | MTP extraction and generic verify loop exist; qwen4exp-dependent MTP forward and DFlash2/DSpark semantics remain. DFlash execution exists but the measured proposer is unverified; F8's self-draft floor is fixed |
 | **Radix prefix cache**, concurrent batching | server throughput | RadixAttention; needs Tokenizer trie + recurrent rollback (Tail-Replay paper is the named first read) |
 | **LLaDA loader** | diffusion model files | Schema already sketched in docs/LLaDA.md |
 | **Architecture pass 44/87** | named dequantizers for the rest | Each refusal needs a named reason or a quant path |
@@ -388,9 +417,8 @@ Strata is ahead, and it is the plan in §3 M0–M1.
 
 1. **C2's re-runs** (Spark_one on the current build, split-threshold
    probe) — an hour, closes the stalest correctness claim.
-2. **C1 micro-probe** (fused NeoX ULP source) — unlocks the fused chain
-   for the Qwen3 dense family; the repo now has the dump rows to verify
-   with.
+2. **C1 closed:** the micro-probe and real-model hashes pass. Preserve the
+   device regression probe; do not repeat the rejected extra-cast hypothesis.
 3. **M0 route-ahead prefetch (Strata-shaped)** — the top measured
    performance item, two building blocks already exist, falsifier is one
    switch apart (`KRK_ROUTE_AHEAD`).

@@ -311,151 +311,376 @@ public:
         if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) return caps_.vram_free;
         return free_b;
     }
-    // Free lists keyed by exact rounded size. The expert cache allocates and
-    // releases the same few slice sizes thousands of times per chunk, and
-    // hipMalloc/hipFree synchronise the device, so the pool is the difference
-    // between overlapping the promotion copies and waiting on the allocator.
-    // Bounded twice over, because a pool that only grows is a leak with extra
-    // steps: blocks over 4 MiB are never kept (a workspace-sized block is a
-    // resident workspace), and the whole pool holds at most 256 MiB of free
-    // blocks. The first version kept up to 512 blocks per size with no total
-    // cap and pushed the card into its own allocations on a 1.2 GiB model.
-    // A pooled block remembers the moment it became reusable. An expert
-    // evicted on the host side may still be read by kernels already queued on
-    // the default stream, and the pool is exactly what would hand that block to
-    // the next expert before they are done: measured on a 3 GiB VRAM budget the
-    // engine emitted different text on every run until this event existed.
+    size_t host_available_bytes() const override { return krk::host_available_bytes(); }
+    size_t host_total_bytes() const override { return krk::host_total_bytes(); }
+    // Individually owned size-class cells: physical commitment follows the
+    // configured expert budget, including free cells and 256-byte alignment.
+    // Every reused cell is guarded by an event recorded on the default stream
+    // at release; the guard is honored on the DEVICE, not by waiting here.
+    //
+    // The index measured all three claims and inverted the obvious one. On
+    // gfx1201 (`kraken-bench`, 8 cells of 256 KiB) an event create+destroy is
+    // 0.13 us, a query 0.03 us, a wait on a completed event 0.08 us, and a
+    // record 30.61 us -- but the real alloc+release pair is 86.97 us, and it is
+    // 79.47 us with a reader queued. The 56 us that is neither the record nor
+    // the bookkeeping is one host round trip, and that is the whole content of
+    // the engine's `alloc` row at a constrained expert budget: 5560 cells x
+    // 87 us = 484 ms against a measured `alloc 481.8 ms` at
+    // `--expert-cache-mb 16`. The cell does not need the host to have observed
+    // the reader finish -- it needs its next WRITER ordered after the reader,
+    // and `hipStreamWaitEvent` expresses that on the copy stream for the price
+    // of an enqueue.
+    // A release mark: "the default-stream position this cell's readers are
+    // ordered before". It is JOINTLY owned -- every cell released under it holds
+    // a reference, and so does a hand-out whose writer has not consumed the
+    // dependency yet -- and the object and its event are recycled when the last
+    // holder lets go. That refcount is what makes one record per BURST exact
+    // instead of approximate: the slices in a burst are released consecutively
+    // with nothing submitted between them, so their stream positions are the
+    // same point, and the mark cannot be re-recorded while any wait on it is
+    // still outstanding.
+    struct PoolMark {
+        hipEvent_t ev = nullptr;
+        int refs = 0;
+    };
     struct PoolBlock {
         void *p = nullptr;
-        hipEvent_t ev = nullptr; // recorded on the default stream at release
+        PoolMark *m = nullptr; // the cell's mark, null before its first release
     };
-    void *alloc_pooled(size_t bytes) override {
-        const size_t rounded = (bytes + 255u) & ~static_cast<size_t>(255u);
-        auto it = pool_.find(rounded);
-        if (it != pool_.end() && !it->second.empty()) {
-            std::vector<PoolBlock> &v = it->second;
-            // Prefer a block the device is already done with; the events are
-            // in release order, so the first ready one is also the oldest.
-            size_t pick = 0;
-            for (size_t i = 0; i < v.size(); i++) {
-                if (!v[i].ev || hipEventQuery(v[i].ev) == hipSuccess) {
-                    pick = i;
-                    break;
-                }
-                static_cast<void>(hipGetLastError()); // hipErrorNotReady is not
-                                                      // a sticky failure
-            }
-            PoolBlock b = v[pick];
-            v.erase(v.begin() + pick);
-            if (b.ev) {
-                // Nothing was ready: wait for that block's reuse point rather
-                // than allocating new VRAM. The wait is bounded by the queue
-                // the device had already been given.
-                KRK_HIP(hipEventSynchronize(b.ev));
-                (void)hipEventDestroy(b.ev);
-            }
-            pool_bytes_ -= rounded;
-            return b.p;
-        }
-        if (expert_arena()) return arena_take_(rounded);
-        return alloc(rounded);
+    struct LiveCell {
+        size_t rounded = 0;
+        PoolMark *m = nullptr; // null until the cell's first release
+    };
+    static constexpr int kPoolBurstMax = 8;
+    size_t pooled_size(size_t bytes) const override {
+        return ((bytes ? bytes : 1) + 255u) & ~static_cast<size_t>(255u);
     }
-
-    // ---------------------------------------------------------------------
-    // Expert arena
-    //
-    // The expert cache asks for the same three slice sizes thousands of times
-    // per token and hands each one back on eviction. Measured on laguna-xs2:
-    // 13,770 alloc_pooled calls in one 24-token run, of which 777 came from
-    // the free pool, so ~12,900 went to hipMalloc -- and the releases that
-    // overflowed the 256 MiB pool cap went to hipFree, which synchronises the
-    // device just as hard. Together that is the `alloc` line of the
-    // expert-path split: ~1,130 ms of a 6,300 ms run, ~82 us a call.
-    //
-    // The arena removes the allocator from the hot path: one hipMalloc per
-    // size class per 256 MiB, carved into fixed cells, and the existing pool
-    // (with the event guard that makes reuse safe) does the recycling. Nothing
-    // about the lifetime changes -- an arena cell is only ever handed out by
-    // alloc_pooled and only ever returned by release_pooled -- so the use-after
-    // -free the guard exists to prevent is still prevented.
-    void *arena_take_(size_t rounded) {
-        auto &v = arena_[rounded];
-        for (auto &c : v) {
-            if (c.next + c.stride <= c.bytes) {
-                void *p = static_cast<char *>(c.base) + c.next;
-                c.next += c.stride;
-                return p;
+    ExpertPoolStats expert_pool_stats() const override { return expert_pool_; }
+    // Marks with no holders, kept so the next burst reuses the event:
+    // create+destroy is 0.13 us against a 29-31 us record on a quiet queue, so
+    // the pool exists to keep the event object, not to avoid a syscall.
+    // (In a decode step the record's marginal cost is ~2.5 us, not 29 -- see
+    // release_pooled_batch below.)
+    std::vector<PoolMark *> pool_free_marks_;
+    // Returns a mark holding ONE reference, the caller's: a free-list entry is
+    // only ever reachable at refs == 0, so the opener's reference is what keeps
+    // the mark out of the free list while its burst is in flight. It is handed
+    // back with pool_mark_unref_() once the released cells have taken theirs.
+    PoolMark *pool_mark_open_() {
+        while (!pool_free_marks_.empty()) {
+            PoolMark *m = pool_free_marks_.back();
+            pool_free_marks_.pop_back();
+            if (m->ev) {
+                m->refs = 1;
+                return m;
+            }
+            delete m;
+        }
+        auto *m = new PoolMark;
+        if (hipEventCreateWithFlags(&m->ev, hipEventDisableTiming) != hipSuccess) {
+            delete m;
+            return nullptr;
+        }
+        m->refs = 1;
+        return m;
+    }
+    // A mark whose record failed is unusable and is not recycled.
+    static void pool_mark_close_(PoolMark *m) {
+        if (!m) return;
+        if (m->ev) (void)hipEventDestroy(m->ev);
+        delete m;
+    }
+    static void pool_mark_ref_(PoolMark *m) {
+        if (m) ++m->refs;
+    }
+    void pool_mark_unref_(PoolMark *m) {
+        if (!m || --m->refs > 0) return;
+        // Back to the free list at zero. Never below: a double unref would push
+        // the same mark twice and the destructor would delete it twice, which
+        // is a heap corruption rather than a wrong answer -- measured as
+        // STATUS_HEAP_CORRUPTION (0xC0000374) here when it was wrong.
+        if (m->refs < 0) {
+            KRK_ERROR("expert pool release mark refcount underflow");
+            std::abort();
+        }
+        pool_free_marks_.push_back(m);
+    }
+    // A reused cell whose previous reader may still be queued. Keyed by cell
+    // address, consumed by the next write into that cell. The entry holds a
+    // reference, so the mark survives until the writer has waited on it.
+    std::unordered_map<void *, PoolMark *> pool_pending_;
+    // Takes the dependency, so a caller with several streams to order can issue
+    // the wait on each of them. The entry's reference moves to the caller, which
+    // must hand it back with pool_dep_done_() once the wait is enqueued.
+    PoolMark *pool_take_dep_(void *dst) {
+        const auto it = pool_pending_.find(dst);
+        if (it == pool_pending_.end()) return nullptr;
+        PoolMark *m = it->second;
+        pool_pending_.erase(it);
+        return m;
+    }
+    void pool_dep_done_(PoolMark *m) { pool_mark_unref_(m); }
+    // Drops an outstanding hand-out for a cell that is going back to the free
+    // list without ever having been written. The mark is superseded by the one
+    // the new release records, which is at a later point and therefore covers
+    // everything this one did.
+    void pool_drop_pending_(void *dst) {
+        const auto it = pool_pending_.find(dst);
+        if (it == pool_pending_.end()) return;
+        PoolMark *m = it->second;
+        pool_pending_.erase(it);
+        pool_mark_unref_(m);
+    }
+    // A writer on a non-null stream: the stream waits for the mark, so the copy
+    // cannot overwrite bytes the reader is still reading, and the host does not
+    // stop to find out. This is the promotion path.
+    void pool_honor_(void *dst, hipStream_t s) {
+        PoolMark *m = pool_take_dep_(dst);
+        if (!m) return;
+        if (m->ev) KRK_HIP(hipStreamWaitEvent(s, m->ev, 0));
+        pool_dep_done_(m);
+        ++expert_pool_.order_device;
+    }
+    // A writer with no single stream to order (the cold path may end in a
+    // null-stream copy or in the pull ring's own streams), or on the null
+    // stream itself, where the mark was recorded and plain stream order already
+    // covers it. Waiting is the correct answer here and this path is 6% of
+    // acquires in the constrained measurements.
+    void pool_honor_host_(void *dst) {
+        PoolMark *m = pool_take_dep_(dst);
+        if (!m) return;
+        if (m->ev) KRK_HIP(hipEventSynchronize(m->ev));
+        pool_dep_done_(m);
+        ++expert_pool_.order_host;
+    }
+    // A writer that runs on the default stream (a kernel or a null-stream
+    // copy): the mark was recorded there, so stream order already puts it after
+    // the reader and only the bookkeeping is left.
+    void pool_honor_implicit_(void *dst) {
+        PoolMark *m = pool_take_dep_(dst);
+        if (!m) return;
+        pool_dep_done_(m);
+        ++expert_pool_.order_implicit;
+    }
+    // Frees a cell for good, releasing its mark reference. Any dependency still
+    // naming it is dropped first, and the mark is synchronized before the free
+    // so a queued reader cannot be reading freed memory.
+    void pool_kill_(PoolBlock &b) {
+        pool_drop_pending_(b.p);
+        if (b.m) {
+            // The memory is about to be freed: whatever the mark covers has to
+            // be done, or a queued reader is reading freed memory.
+            if (b.m->ev) KRK_HIP(hipEventSynchronize(b.m->ev));
+            pool_mark_unref_(b.m);
+            b.m = nullptr;
+        }
+        KRK_HIP(hipFree(b.p));
+    }
+    void pool_trim_(size_t need) {
+        for (auto &entry : pool_) {
+            auto &cells = entry.second;
+            while (!cells.empty() &&
+                   (need > expert_pool_.budget ||
+                    expert_pool_.committed > expert_pool_.budget - need)) {
+                PoolBlock b = cells.back();
+                cells.pop_back();
+                pool_kill_(b);
+                expert_pool_.committed -= entry.first;
+                expert_pool_.reusable -= entry.first;
+                ++expert_pool_.trims;
             }
         }
-        const size_t cells = kArenaGrowBytes / rounded ? kArenaGrowBytes / rounded
-                                                       : 1;
-        void *base = alloc(cells * rounded);
-        if (!base) return nullptr;
-        ArenaChunk c;
-        c.base = base;
-        c.bytes = cells * rounded;
-        c.stride = rounded;
-        c.next = rounded; // cell 0 is this call's
-        v.push_back(c);
-        arena_bytes_ += c.bytes;
-        return base;
     }
-    // True when p is a cell of one of this size class's arenas. Only called on
-    // release, which is a few hundred times a run, and there are one or two
-    // chunks per class.
-    bool arena_owns_(size_t rounded, const void *p) {
-        auto it = arena_.find(rounded);
-        if (it == arena_.end()) return false;
-        for (const auto &c : it->second) {
-            const char *b = static_cast<const char *>(c.base);
-            if (p >= b && p < b + c.bytes) return true;
+    void set_expert_pool_budget(size_t bytes) override {
+        expert_pool_.budget = bytes;
+        if (expert_pool_.committed > bytes) pool_trim_(0);
+    }
+    void set_expert_pool_owner(const void *owner, size_t bytes) override {
+        if (bytes) pool_owners_[owner] = bytes;
+        else pool_owners_.erase(owner);
+        size_t total = 0;
+        for (const auto &entry : pool_owners_) {
+            if (entry.second > static_cast<size_t>(-1) - total) std::abort();
+            total += entry.second;
         }
-        return false;
+        set_expert_pool_budget(total);
     }
-    // KRK_EXPERT_ARENA=0 restores one hipMalloc per miss, which is the A/B arm
-    // the arena's cost is measured against.
-    static bool expert_arena() {
+    std::unordered_map<const void *, size_t> pool_owners_;
+    // KRK_POOL_HOST_WAIT=1 restores the pre-2026-10-11 hand-out: look for a
+    // cell whose reader has retired and stop the host until it has. It is the
+    // arm every number below is measured against, so the comparison is one
+    // process apart.
+    // KRK_POOL_BURST=0 restores the release path this replaces: one
+    // hipEventRecord per slice instead of one per burst. It is the A/B arm, so
+    // the comparison is one process apart.
+    static bool pool_burst_off_() {
         static const bool v = [] {
-            const char *e = std::getenv("KRK_EXPERT_ARENA");
-            return !(e && (e[0] == '0'));
+            const char *e = std::getenv("KRK_POOL_BURST");
+            return e && e[0] == '0';
         }();
         return v;
     }
-    void release_pooled(void *p, size_t bytes) override {
-        if (!p) return;
-        const size_t rounded = (bytes + 255u) & ~static_cast<size_t>(255u);
-        // An arena cell is already ours, so it is always recyclable and never
-        // counted against the cap -- the cap exists to stop the pool growing
-        // without limit, and an arena cannot grow past what it allocated.
-        if (arena_owns_(rounded, p) ||
-            (rounded <= (4u << 20) && pool_bytes_ + rounded <= kPoolCapBytes)) {
-            hipEvent_t ev = nullptr;
-            if (hipEventCreateWithFlags(&ev, hipEventDisableTiming) != hipSuccess) {
-                static_cast<void>(hipGetLastError());
-                hipFree(p); // no guard to be had: take the synchronising free
-                return;
+    static bool pool_host_wait_() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_POOL_HOST_WAIT");
+            return e && e[0] == '1';
+        }();
+        return v;
+    }
+    void *alloc_pooled(size_t bytes) override {
+        const size_t rounded = pooled_size(bytes);
+        const auto found = pool_.find(rounded);
+        if (found != pool_.end() && !found->second.empty()) {
+            auto &cells = found->second;
+            size_t pick = 0;
+            bool ready = false;
+            if (pool_host_wait_()) {
+                for (size_t i = 0; i < cells.size(); ++i) {
+                    const hipError_t rc = cells[i].m
+                                              ? hipEventQuery(cells[i].m->ev)
+                                              : hipSuccess;
+                    if (rc == hipSuccess) { pick = i; ready = true; break; }
+                    if (rc != hipErrorNotReady) KRK_HIP(rc);
+                }
             }
-            (void)hipEventRecord(ev, 0);
-            const bool owned = arena_owns_(rounded, p);
-            pool_[rounded].push_back(PoolBlock{p, ev});
-            if (!owned) pool_bytes_ += rounded;
+            PoolBlock b = cells[pick];
+            cells.erase(cells.begin() + pick);
+            if (b.m) {
+                if (pool_host_wait_()) {
+                    if (!ready) {
+                        KRK_HIP(hipEventSynchronize(b.m->ev));
+                        ++expert_pool_.order_host;
+                    }
+                } else {
+                    // No readiness query, on purpose. Asking the device whether
+                    // the reader has retired IS the round trip (measured below
+                    // in this build as ~55 us on a pending event), and the
+                    // answer is not needed: the cell is handed out carrying the
+                    // mark it was released under, and the next writer waits for
+                    // it on the device. A wait on an already-complete event
+                    // retires immediately, so the no-query path is never
+                    // slower on the device -- only cheaper on the host.
+                    // The hand-out takes its own reference: the mark must
+                    // outlive the cell's own reference if the cell is released
+                    // again before a writer consumes this dependency.
+                    pool_mark_ref_(b.m);
+                    pool_pending_[b.p] = b.m;
+                }
+            }
+            expert_pool_.reusable -= rounded;
+            expert_pool_.live += rounded;
+            ++expert_pool_.reuses;
+            // The cell's own reference moves from the free list to the cell.
+            pool_live_.emplace(b.p, LiveCell{rounded, b.m});
+            return b.p;
+        }
+        pool_trim_(rounded);
+        if (rounded > expert_pool_.budget ||
+            expert_pool_.committed > expert_pool_.budget - rounded) {
+            KRK_ERROR("expert pool physical budget exhausted: live=%zu need=%zu budget=%zu",
+                      expert_pool_.live, rounded, expert_pool_.budget);
+            std::abort();
+        }
+        void *p = alloc(rounded);
+        pool_live_.emplace(p, LiveCell{rounded, nullptr});
+        expert_pool_.committed += rounded;
+        expert_pool_.live += rounded;
+        ++expert_pool_.allocations;
+        return p;
+    }
+    static bool expert_arena() {
+        const char *e = std::getenv("KRK_EXPERT_ARENA");
+        return !(e && e[0] == '0');
+    }
+    void release_pooled(void *p, size_t bytes) override {
+        void *ps[1] = {p};
+        const size_t bs[1] = {bytes};
+        release_batch_(ps, bs, 1);
+    }
+    // An expert is THREE slices and an eviction returns all three at once, so
+    // this is the shape the decode loop pays at a constrained budget: on
+    // Qwen3-MOE-4x0.6B at 16/32 MiB that is 10878 slices and 10878 records, of
+    // which 7252 are gone here. Measured, the `room` row falls -31.2% (9/9
+    // interleaved order-balanced pairs at both budgets) and decode is NO
+    // DIFFERENCE, because `room` is ~18 ms of a ~3.2 s run. A record costs
+    // 29-31 us on the quiet queue the bench's primitives measure on and ~2.5 us
+    // marginal in a busy step, so the "23 us x 5560 = 128 ms" this comment used
+    // to carry was 10x too big.
+    // `KRK_POOL_BURST=0` restores the per-slice path.
+    void release_pooled_batch(void *const ps[], const size_t bytes[],
+                              int n) override {
+        if (n <= 1 || n > kPoolBurstMax || pool_burst_off_()) {
+            for (int i = 0; i < n; i++) {
+                void *q = ps[i];
+                const size_t b = bytes[i];
+                release_batch_(&q, &b, 1);
+            }
             return;
         }
-        hipFree(p);
+        release_batch_(ps, bytes, n);
     }
-    static constexpr size_t kPoolCapBytes = 256u << 20;
+    // The one release path, for a single cell and for a burst. All `n` cells are
+    // released under ONE mark recorded at one default-stream position.
+    void release_batch_(void *const ps[], const size_t bytes[], int n) {
+        if (n <= 0) return;
+        size_t rounded[kPoolBurstMax] = {};
+        for (int i = 0; i < n; i++) {
+            if (!ps[i]) continue;
+            const size_t r = pooled_size(bytes[i]);
+            const auto it = pool_live_.find(ps[i]);
+            if (it == pool_live_.end() || it->second.rounded != r) {
+                KRK_ERROR("invalid expert cell release (pointer, size or ownership)");
+                std::abort();
+            }
+            rounded[i] = r;
+        }
+        // The mark is the release point on the default stream: every reader
+        // queued for any cell in this burst so far is ordered before this
+        // record, which is exactly what one record per slice expressed.
+        PoolMark *m = pool_mark_open_();
+        if (m) {
+            const char *inject = std::getenv("KRK_TEST_POOL_NO_EVENT");
+            hipError_t rc = inject && inject[0] == '1' ? hipErrorOutOfMemory
+                                                       : hipSuccess;
+            if (rc == hipSuccess) rc = hipEventRecord(m->ev, 0);
+            if (rc != hipSuccess) {
+                pool_mark_close_(m);
+                m = nullptr;
+            }
+        }
+        if (m) {
+            ++expert_pool_.release_marks;
+        } else {
+            // Recover lifetime, not ownership: only base allocations live here.
+            // The sync stands in for the mark -- after it no reader of any cell
+            // in the burst is outstanding, so the cells may go back unmarked.
+            KRK_HIP(hipDeviceSynchronize());
+            ++expert_pool_.guard_fallbacks;
+        }
+        for (int i = 0; i < n; i++) {
+            if (!ps[i]) continue;
+            const size_t r = rounded[i];
+            const auto it = pool_live_.find(ps[i]);
+            pool_mark_unref_(it->second.m); // the cell's previous mark
+            pool_live_.erase(it);
+            expert_pool_.live -= r;
+            pool_drop_pending_(ps[i]);
+            if (!expert_arena() || expert_pool_.committed > expert_pool_.budget) {
+                if (m && m->ev) KRK_HIP(hipEventSynchronize(m->ev));
+                KRK_HIP(hipFree(ps[i]));
+                expert_pool_.committed -= r;
+            } else {
+                pool_mark_ref_(m); // the cell's own reference to the new mark
+                pool_[r].push_back(PoolBlock{ps[i], m});
+                expert_pool_.reusable += r;
+            }
+            ++expert_pool_.release_slices;
+        }
+        pool_mark_unref_(m); // the burst's reference
+    }
     std::unordered_map<size_t, std::vector<PoolBlock>> pool_;
-    size_t pool_bytes_ = 0;
-    struct ArenaChunk {
-        void *base = nullptr;
-        size_t bytes = 0;
-        size_t stride = 0;
-        size_t next = 0;
-    };
-    // One hipMalloc per (size class, 256 MiB). Carved, never freed.
-    static constexpr size_t kArenaGrowBytes = 256u << 20;
-    std::unordered_map<size_t, std::vector<ArenaChunk>> arena_;
-    size_t arena_bytes_ = 0;
+    std::unordered_map<void *, LiveCell> pool_live_;
+    ExpertPoolStats expert_pool_{static_cast<size_t>(-1)};
     // The expert cache's L2 tier. Page-locked so demote (device->host) and
     // promote (host->device) are straight DMAs; unpinned staging would spend
     // more time in the driver's bounce buffer than on the copy. Pinned memory
@@ -507,7 +732,8 @@ public:
         hipEvent_t ev = nullptr;
         if (hipEventCreateWithFlags(&ev, hipEventDisableTiming) != hipSuccess) {
             static_cast<void>(hipGetLastError());
-            release_host_pageable(p); // no guard available: free it the safe way
+            SharedHostRamBudget::release_and_free(
+                p, [this](void *owned) { release_host_pageable(owned); });
             return;
         }
         (void)hipEventRecord(ev, 0);
@@ -530,7 +756,8 @@ public:
                 continue;
             }
             if (d.ev) (void)hipEventDestroy(d.ev);
-            release_host_pageable(d.p);
+            SharedHostRamBudget::release_and_free(
+                d.p, [this](void *owned) { release_host_pageable(owned); });
         }
         host_pending_.resize(keep);
     }
@@ -651,6 +878,9 @@ public:
     void upload_paged(void *dst, const void *src, size_t bytes) override {
         if (bytes == 0) return;
         KRK_TIME_OP("upload_paged");
+        // This shape has no single stream to order (a ring slot, a hot-path
+        // staging slot, or the blocking copy), so the guard is honored here.
+        pool_honor_host_(dst);
         if (!host_pending_.empty()) host_deferred_flush_(false);
         if (paged_blocking_()) {
             // A/B switch: the blocking pageable copy, ordered behind everything
@@ -671,12 +901,21 @@ public:
         int nused = 0;
         const char *s = static_cast<const char *>(src);
         char *d = static_cast<char *>(dst);
+        // Reused cell: every stream that writes into it waits for the mark its
+        // previous reader was released under, so the copy cannot land on bytes
+        // still being read. A blocking copy below runs on the default stream
+        // and is covered by stream order instead.
+        PoolMark *dep = pool_take_dep_(d);
         for (size_t off = 0; off < bytes; off += paged_chunk_) {
             const size_t len = std::min(paged_chunk_, bytes - off);
             const int slot = paged_take_();
             if (slot < 0) { // ring unusable: fall back to the blocking copy
                 KRK_HIP(hipMemcpy(d + off, s + off, len, hipMemcpyHostToDevice));
                 continue;
+            }
+            if (dep) {
+                KRK_HIP(hipStreamWaitEvent(paged_stream_[slot], dep->ev, 0));
+                ++expert_pool_.order_device;
             }
             std::memcpy(paged_buf_[slot], s + off, len);
             KRK_HIP(hipMemcpyAsync(d + off, paged_buf_[slot], len,
@@ -685,6 +924,7 @@ public:
             paged_used_[slot] = true;
             if (nused < kPagedBufs) used[nused++] = slot;
         }
+        pool_dep_done_(dep);
         paged_publish_(used, nused);
     }
     // One expert is three slices, and three separate calls serialise: each one
@@ -697,9 +937,13 @@ public:
         i64 batch_bytes = 0;
         if (!host_pending_.empty()) host_deferred_flush_(false);
         if (paged_blocking_()) {
-            for (int i = 0; i < n; i++)
-                if (dst[i] && src[i] && bytes[i])
-                    KRK_HIP(hipMemcpy(dst[i], src[i], bytes[i], hipMemcpyHostToDevice));
+            for (int i = 0; i < n; i++) {
+                if (!dst[i] || !src[i] || !bytes[i]) continue;
+                // A blocking copy runs on the default stream, where the reuse
+                // mark was recorded: stream order covers it.
+                pool_honor_implicit_(dst[i]);
+                KRK_HIP(hipMemcpy(dst[i], src[i], bytes[i], hipMemcpyHostToDevice));
+            }
             return;
         }
         if (!paged_ready_()) {
@@ -714,6 +958,7 @@ public:
             // leaves one host wait for the batch instead of one per slice.
             for (int i = 0; i < n; i++) {
                 if (!dst[i] || !src[i] || !bytes[i]) continue;
+                pool_honor_(dst[i], paged_stream_[0]);
                 KRK_HIP(hipMemcpyAsync(dst[i], src[i], bytes[i],
                                        hipMemcpyHostToDevice, paged_stream_[0]));
                 batch_bytes += static_cast<i64>(bytes[i]);
@@ -728,12 +973,17 @@ public:
             if (!dst[i] || !src[i] || !bytes[i]) continue;
             char *d = static_cast<char *>(dst[i]);
             const char *s = static_cast<const char *>(src[i]);
+            PoolMark *dep = pool_take_dep_(d);
             for (size_t off = 0; off < bytes[i]; off += paged_chunk_) {
                 const size_t len = std::min(paged_chunk_, bytes[i] - off);
                 const int slot = paged_take_();
                 if (slot < 0) {
                     KRK_HIP(hipMemcpy(d + off, s + off, len, hipMemcpyHostToDevice));
                     continue;
+                }
+                if (dep) {
+                    KRK_HIP(hipStreamWaitEvent(paged_stream_[slot], dep->ev, 0));
+                    ++expert_pool_.order_device;
                 }
                 std::memcpy(paged_buf_[slot], s + off, len);
                 KRK_HIP(hipMemcpyAsync(d + off, paged_buf_[slot], len,
@@ -743,10 +993,65 @@ public:
                 paged_used_[slot] = true;
                 if (nused < kPagedBufs) used[nused++] = slot;
             }
+            pool_dep_done_(dep);
         }
         krk_op_scope.bytes(batch_bytes);
         paged_publish_(used, nused);
     }
+    void *upload_expert_staged(void *const dst[], const void *const src[],
+                               const size_t bytes[], int n) override {
+        if (paged_blocking_() || paged_direct_() || !paged_ready_()) {
+            upload_paged_batch(dst, src, bytes, n);
+            return nullptr;
+        }
+        const char *probe = std::getenv("KRK_STAGE_TIMING");
+        const bool timed = probe && probe[0] == '1';
+        hipEvent_t done = nullptr;
+        if (hipEventCreateWithFlags(&done, timed ? hipEventDefault : hipEventDisableTiming) != hipSuccess) {
+            upload_paged_batch(dst, src, bytes, n);
+            return nullptr;
+        }
+        // One dedicated nonblocking stream carries the complete promotion.
+        // Ring reuse waits only for prior DMA, never for an unrelated kernel.
+        if (!expert_copy_stream_)
+            KRK_HIP(hipStreamCreateWithFlags(&expert_copy_stream_, hipStreamNonBlocking));
+        if (timed) {
+            StageProbe p;
+            KRK_HIP(hipEventCreate(&p.start));
+            KRK_HIP(hipEventCreate(&p.reader_end));
+            KRK_HIP(hipEventRecord(p.reader_end, 0));
+            KRK_HIP(hipEventRecord(p.start, expert_copy_stream_));
+            stage_probes_.emplace(done, p);
+        }
+        for (int i = 0; i < n; ++i) {
+            // Whole promotion rides one stream, so one wait per slice covers
+            // every chunk of it.
+            pool_honor_(dst[i], expert_copy_stream_);
+            for (size_t off = 0; off < bytes[i]; off += paged_chunk_) {
+                const size_t len = std::min(paged_chunk_, bytes[i] - off);
+                const int slot = paged_take_();
+                if (slot < 0) {
+                    KRK_HIP(hipStreamSynchronize(expert_copy_stream_));
+                    KRK_HIP(hipMemcpy(static_cast<char *>(dst[i]) + off,
+                                      static_cast<const char *>(src[i]) + off,
+                                      len, hipMemcpyHostToDevice));
+                    continue;
+                }
+                std::memcpy(paged_buf_[slot], static_cast<const char *>(src[i]) + off, len);
+                KRK_HIP(hipMemcpyAsync(static_cast<char *>(dst[i]) + off,
+                                       paged_buf_[slot], len, hipMemcpyHostToDevice,
+                                       expert_copy_stream_));
+                KRK_HIP(hipEventRecord(paged_ev_[slot], expert_copy_stream_));
+                paged_used_[slot] = true;
+            }
+        }
+        KRK_HIP(hipEventRecord(done, expert_copy_stream_));
+        return static_cast<void *>(done);
+    }
+    hipStream_t expert_copy_stream_ = nullptr;
+    struct StageProbe { hipEvent_t start = nullptr, reader_end = nullptr; };
+    std::unordered_map<hipEvent_t, StageProbe> stage_probes_;
+
     // Closes a batch of side-stream copies. The host waits for the copies --
     // not for the kernel queue: each copy runs on its own stream, beside the
     // kernels, and the wait is only for that stream. When this returns, the
@@ -908,6 +1213,9 @@ public:
 
     void upload(void *dst, const void *src, size_t bytes, size_t off) override {
         KRK_TIME_OP("upload");
+        // The cold path: a reused cell here may be reached by the pull ring's
+        // own streams, so the guard is honored on the host. 6% of acquires.
+        pool_honor_host_(dst);
         if (stage_upload(static_cast<char *>(dst) + off, src, bytes)) return;
         // A hipMemcpy whose source is a cold file mapping faults one 4 KiB page
         // at a time: measured 1208.8 ms to get the 8B into RAM that way
@@ -1121,6 +1429,9 @@ public:
     }
     void fill0(void *dst, size_t bytes) override {
         KRK_TIME_OP("fill0");
+        // hipMemset runs on the default stream, where the mark was recorded,
+        // so a reused cell needs no wait -- only the dependency cleared.
+        pool_honor_implicit_(dst);
         KRK_HIP(hipMemset(dst, 0, bytes));
     }
     void sync() override { KRK_HIP(hipDeviceSynchronize()); }
@@ -1132,6 +1443,7 @@ public:
     // reused KV slot needs its OWN previous occupant finished, and blocking
     // the whole device between every layer of every token would cost more than
     // the tiering saves.
+    bool requires_markers() const override { return true; }
     void *make_marker() override {
         hipEvent_t ev = nullptr;
         if (hipEventCreateWithFlags(&ev, hipEventDisableTiming) != hipSuccess)
@@ -1143,7 +1455,29 @@ public:
             sync();
             return;
         }
-        KRK_HIP(hipEventSynchronize(static_cast<hipEvent_t>(marker)));
+        const hipEvent_t event = static_cast<hipEvent_t>(marker);
+        KRK_HIP(hipEventSynchronize(event));
+        const auto probe = stage_probes_.find(event);
+        if (probe != stage_probes_.end()) {
+            KRK_HIP(hipEventSynchronize(probe->second.reader_end));
+            // `start` is recorded on the copy stream at submit time and
+            // `reader_end` on the default stream at the same moment, so the
+            // two deltas say how long the copy itself took and how much
+            // reader work was still queued ahead of it. A negative second
+            // delta means the readers had already drained when the copy
+            // began: no window existed to hide in, so it counts as 0.
+            float copy = 0, reader = 0;
+            if (hipEventElapsedTime(&copy, probe->second.start, event) == hipSuccess &&
+                hipEventElapsedTime(&reader, probe->second.start,
+                                    probe->second.reader_end) == hipSuccess) {
+                if (reader < 0.0f) reader = 0.0f;
+                expert_pool_.staged_copy_ms += copy;
+                expert_pool_.staged_reader_ms += reader;
+                expert_pool_.staged_overlap_ms += std::min(copy, reader);
+                if (copy <= reader) ++expert_pool_.staged_hidden;
+                ++expert_pool_.staged_measured;
+            }
+        }
     }
     void record_marker(void *marker) override {
         if (!marker) return;
@@ -1153,7 +1487,14 @@ public:
         KRK_HIP(hipEventRecord(static_cast<hipEvent_t>(marker), nullptr));
     }
     void release_marker(void *marker) override {
-        if (marker) hipEventDestroy(static_cast<hipEvent_t>(marker));
+        const hipEvent_t event = static_cast<hipEvent_t>(marker);
+        const auto probe = stage_probes_.find(event);
+        if (probe != stage_probes_.end()) {
+            KRK_HIP(hipEventDestroy(probe->second.start));
+            KRK_HIP(hipEventDestroy(probe->second.reader_end));
+            stage_probes_.erase(probe);
+        }
+        if (marker) KRK_HIP(hipEventDestroy(event));
     }
     bool poll_marker(void *marker) override {
         if (!marker) return true;
@@ -1975,6 +2316,10 @@ public:
 
     void copy_act(void *dst, const void *src, i64 n) override {
         KRK_TIME_OP("copy_act");
+        // A kernel on the default stream is ordered after the mark already; the
+        // `empty()` guard keeps this out of the hot path's way (it is false
+        // unless the expert pool is mid-reuse).
+        if (!pool_pending_.empty()) pool_honor_implicit_(dst);
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         copy_h2h_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(dst),
                                          static_cast<const _Float16 *>(src), n);
@@ -1988,6 +2333,7 @@ public:
     }
 
     void upload_i32(i32 *dst, const i32 *src, i64 n) override {
+        pool_honor_host_(dst);
         KRK_TIME_OP("upload_i32");
         const size_t bytes = static_cast<size_t>(n) * sizeof(i32);
         if (stage_upload(dst, src, bytes)) return;
@@ -2248,6 +2594,32 @@ public:
     }
 
     ~HipBackend() override {
+        KRK_HIP(hipDeviceSynchronize());
+        if (expert_copy_stream_) KRK_HIP(hipStreamDestroy(expert_copy_stream_));
+        // Free cells release their mark reference with the cell; live cells are
+        // released (with theirs) by their owner's clear() before this. The marks
+        // that come back land on pool_free_marks_, which is drained below.
+        for (auto &entry : pool_) for (PoolBlock &b : entry.second) {
+            if (b.m) {
+                if (b.m->ev) (void)hipEventSynchronize(b.m->ev);
+                pool_mark_unref_(b.m);
+                b.m = nullptr;
+            }
+            KRK_HIP(hipFree(b.p));
+        }
+        for (const auto &entry : pool_live_) {
+            pool_mark_unref_(entry.second.m);
+            KRK_HIP(hipFree(entry.first));
+        }
+        for (const auto &entry : pool_pending_) pool_mark_unref_(entry.second);
+        pool_pending_.clear();
+        for (PoolMark *m : pool_free_marks_) {
+            if (m->ev) (void)hipEventDestroy(m->ev);
+            delete m;
+        }
+        pool_free_marks_.clear();
+        pool_.clear();
+        pool_live_.clear();
         pull_release_();
         paged_release_();
         for (int i = 0; i < kStageSlots; i++) {

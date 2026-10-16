@@ -1,0 +1,179 @@
+One release mark per eviction burst: the shared, refcounted pool mark
+==============================================================================
+2026-10-11. Binary build9 + this change (see section 8). Model
+models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf, prompt "The history of computing is a
+history of abstraction", ctx 512, --greedy. Card RX 9070 XT (gfx1201).
+
+########## 1. what changed ##########
+
+`HipBackend::release_pooled` recorded one `hipEventRecord` on the default stream
+per released cell. An eviction returns an expert's THREE slices in one call
+(`ExpertCache::drop` -> `retire` -> `make_vram_room`), so three records were
+issued at one stream point: nothing is submitted to the default stream between
+them, so their positions ARE the same point and one record expresses all three.
+
+  * `Backend::release_pooled_batch(ps, bytes, n)` (default: loop) and a HIP
+    override that shares one mark for the whole call.
+  * A mark is jointly owned and refcounted (`HipBackend::PoolMark`): each cell
+    released under it holds a reference, a hand-out whose writer has not
+    consumed the dependency holds one, and the opener holds one. At zero the
+    mark (with its event) goes back to `pool_free_marks_` for the next burst.
+  * `PoolBlock`/`LiveCell`/`pool_pending_` carry `PoolMark *` instead of
+    `hipEvent_t`; the three honor paths wait on `m->ev` exactly as before.
+  * `KRK_POOL_BURST=0` restores one record per slice: the A/B arm, one process
+    apart. New counters `release_marks` / `release_slices` are printed in the
+    engine's `[stats ] expert-pool` line and checked by the bench gate.
+
+########## 2. the instrument (kraken-bench, marginal primitives) ##########
+
+Two runs of the same binary, plain (no --gate):
+
+  run 1: record 28.96 us | burst 22.98 us one mark | 77.19 us per slice | 102 vs 306 marks for 612 slices
+  run 2: record 30.63 us | burst 26.92 us one mark | 66.99 us per slice | 102 vs 306 marks for 612 slices
+
+The counters are the fact: 204 bursts -> 102 and 306 marks respectively, i.e.
+1.00 and 3.00 slices per mark, and the same 612 slices in both arms. The times
+are a QUIET queue and are quoted as magnitudes; section 6 is what the same
+record costs in a saturated decode step.
+
+########## 3. the gate, and the gate falsified ##########
+
+gate_expert_pool gained three checks (56 ok/FAIL lines total now, 0 FAIL):
+
+  ok   expert-pool a three-slice burst shares one release mark
+  ok   expert-pool every cell of a burst is handed back out
+  ok   expert-pool every cell of a burst keeps its mark: no reader is overwritten
+
+The second and third are the correctness half: three cells are read on the
+default stream, released in ONE call, then each handed back out and zeroed
+before those reads can have completed -- every reader still sees its own bytes.
+
+Falsified, by the switch rather than by a code edit:
+
+  $ KRK_POOL_BURST=0 ./build-hip/kraken-bench.exe --gate ; echo rc=$?
+  rc=1
+  GATE FAILED: 1 check(s) outside tolerance, or NaN/inf, or a logits_topk mismatch
+    FAIL expert-pool a three-slice burst shares one release mark
+
+The other two checks pass in that arm, which is the point: the per-slice path is
+also correct, it just issues three records. The gate separates the mechanism
+(sharing) from the correctness.
+
+########## 4. the engine at a constrained budget ##########
+
+  --expert-cache-mb 16 -n 32, one run per arm:
+
+  KRK_POOL_BURST=1 (default)  release 1836 mark(s) for 5508 slice(s) = 3.00
+                              room  22.3 ms | alloc  92.3 ms | xfer 925.7 ms | promote 1040.9 ms
+                              decode 18.1 tok/s (55.3 ms/step)   md5 28fa19c3733a
+  KRK_POOL_BURST=0            release 5508 mark(s) for 5508 slice(s) = 1.00
+                              room  31.2 ms | alloc 101.7 ms | xfer 927.6 ms | promote 1061.0 ms
+                              decode 17.6 tok/s (56.7 ms/step)   md5 28fa19c3733a
+
+Identical text (the repo's recorded MoE acceptance md5), identical promotion
+count; the only difference is the number of records. The row the records are
+issued from is `room` (the release happens inside `make_vram_room` ->
+`retire` -> `drop`), and it is the only row that moves by more than its own
+noise.
+
+Release counts are budget-INSENSITIVE, so this is not a 16 MiB quirk:
+
+  --expert-cache-mb   8 -> 5535 slices / 1845 marks, room 23.9 ms
+  --expert-cache-mb  16 -> 5508 slices / 1836 marks, room 27.9 ms
+  --expert-cache-mb  32 -> 5445 slices / 1815 marks, room 23.1 ms
+  --expert-cache-mb  64 -> 5211 slices / 1737 marks, room 22.1 ms
+
+What the budget changes is the WARM hit rate and `xfer`, not the eviction count.
+
+########## 5. interleaved A/B, 9 pairs, both budgets ##########
+
+Harness: scripts/kraken_sherlock_kernel_ab.sh, A = KRK_POOL_BURST=0,
+B = KRK_POOL_BURST=1, n=64, order-balanced verdict.
+
+decode tok/s (B vs A):
+
+  16 MiB: +1.287% order-balanced (MAD 1.596%, 6/9 pairs) -> NO DIFFERENCE
+  32 MiB: +2.133% order-balanced (MAD 1.655%, 7/9 pairs) -> NO DIFFERENCE
+
+Both signs are the right way but neither clears the spread, so the honest
+end-to-end verdict is NO DIFFERENCE: the row this change cuts is ~0.5% of the
+run, which is below the harness's floor on this workload.
+
+The `room` row out of the same kept run dirs, paired and split by order the way
+the harness splits its deltas (this measures the thing that changed instead of
+diluting it through the whole step):
+
+  16 MiB, rooms (A -> B, ms): 59.2->52.8  70.6->49.6  68.8->39.7  58.5->40.6
+                              54.5->37.0  55.5->38.8  56.4->40.2  58.7->37.4
+                              57.1->38.3
+    raw median -30.60%, MAD 1.87%, B faster 9/9
+    A-first -32.11% | B-first -30.34% -> order-balanced -31.23%
+
+  32 MiB, rooms (A -> B, ms): 66.4->40.3  58.5->42.4  59.0->40.0  60.7->41.3
+                              55.4->39.9  57.0->40.6  56.6->40.7  59.7->39.3
+                              60.8->40.7
+    raw median -31.96%, MAD 3.19%, B faster 9/9
+    A-first -32.20% | B-first -30.37% -> order-balanced -31.28%
+
+9/9 pairs at both budgets, MAD under 3.2%, so the row really did move by a
+third. Every run's release counters confirm the arms: A printed 10740/10740
+marks/slices, B printed 3580/10740 (3.00) in all 18 runs of the 32 MiB sweep.
+
+########## 6. what the "~128 ms" estimate actually was ##########
+
+The row was recorded in AGENTS.md / TODO.md / AUDIT-active-expert-staging.md as
+"one hipEventRecord per release, ~23 us x 5560 ~= 128 ms". Measured now:
+
+  records removed   10878 - 3626 = 7252 per run (n=64)
+  room row saved    median 58.5 -> 39.7 at 16 MiB (18.8 ms),
+                    59.0 -> 40.6 at 32 MiB (18.4 ms)
+  -> 18.6 ms / 7252 = 2.56 us per record, NOT 23 us
+
+`kraken-bench` measures the record at 28.96 / 30.63 us on a QUIET queue, and the
+decode step is a busy one: this is the same trap AGENTS.md already records for
+launches ("the marginal launch costs ~1.5 us, not the 3.64 us floor"), and it
+matters here because it is a 10x overstatement. The whole release-mark row at a
+constrained budget is ~13 ms of a ~1.7 s run, not ~128 ms, so no amount of
+sharing in this row can be worth more than ~0.5%. The change is still right --
+fewer stream operations for the same behaviour, 3.00 -> 1.00 mark per slice,
+and the row is a third smaller -- but it is a cleanup, not a win.
+
+########## 7. the defects this pass produced ##########
+
+* **The first version crashed the machine with STATUS_HEAP_CORRUPTION
+  (0xC0000374), and stdout was lost with it.** `pool_mark_open_` returned a
+  mark at refs == 0 while the burst then unref'd the reference it had "taken",
+  so a mark went to the free list while a cell still held it, the same object
+  was handed to two bursts, and the destructor deleted it twice. The fix is
+  that opening a mark is taking a reference (refs = 1), and `pool_mark_unref_`
+  aborts on an underflow instead of pushing a mark below zero. Both paths out
+  of the pool (the plain bench and the gate) died before printing anything,
+  which is why the first visible symptom was "the binary prints its banner and
+  exits 127"; the diagnostic that found it was the raw Windows exit code
+  (python subprocess -> 3221226356), not the shell's mapping of it.
+* **A bubble of the sharing rule: the mark must be exact, and a rotating pool
+  of marks is not.** `paged_publish_` makes the DEFAULT stream wait on the copy
+  stream (`hipStreamWaitEvent(0, paged_ev_[s])`) while the copy stream waits on
+  these marks, so the graph is not one-way. A mark re-recorded while a wait on
+  it is still in flight, or recycled to a later burst on a ring, can put its
+  recorded position after such a wait -- and a mark recorded after it, handed
+  to a copy-stream writer, is a dependency cycle. Hence: one mark per burst,
+  held open for as long as any cell or pending hand-out references it, and
+  never re-recorded while referenced.
+
+########## 8. gates on the final binary ##########
+
+  ninja, six targets            rc=0, 0 error: lines, ninja -n no pending work
+  kraken-bench --gate           rc=0, 56 checks, 0 FAIL (3 new)
+  kraken-bench --gate (BURST=0) rc=1, exactly the sharing check (falsified)
+  kraken-tests                  2927/2927, rc=0
+  kraken_tests_baseline_check   rc=0, no regression, 18/18 tool, 17/17 selfcheck
+  build_check.sh                rc=0, 0 failed; fingerprints re-recorded then
+                                passed plainly; 1 standing WARN (loaded HIP
+                                runtime is not the build SDK)
+  coherence_check.sh (3 models) rc=0, 3 coherent, 0 not
+
+Limitations: one model, one card, one prompt; the tok/s verdict at both budgets
+is NO DIFFERENCE, so the *end-to-end* effect is not established, only the row's
+-31%. The room-row extraction is a per-run counter read from a kept run dir, not
+a repeat-inside-one-process measurement. Nothing here is committed.

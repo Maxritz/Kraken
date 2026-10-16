@@ -40,6 +40,7 @@
 #include <unistd.h>
 #endif
 
+#include "krk/vram_guard.hpp"
 #include "krk/arch.hpp"
 #include "krk/backend.hpp"
 #include "krk/engine.hpp"
@@ -1634,10 +1635,10 @@ static void clear_env_var(const char *name);
 // Layers 0 and 3 carry q/k/v; layers 1 and 2 are pure MoE FFN blocks with no
 // q/k/v at all (the shape a nemotron_h_moe or a mamba-stacked model presents).
 // n_embd = 32, n_ff = 64, one expert per MoE layer, n_expert = 2.
-static bool build_sparse_kv_model(const std::string &path) {
+static bool build_sparse_kv_model(const std::string &path, int ctx = 16) {
     const int n_embd = 32, n_layer = 4, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
-    const int ctx = 16, vocab = 260, n_expert = 2, n_ff_exp = n_ff;
+    const int vocab = 260, n_expert = 2, n_ff_exp = n_ff;
     GgufBuilder b;
     b.meta_str("general.architecture", "qwen2moe");
     b.meta_str("general.name", "kraken-sparse-kv-test");
@@ -1993,6 +1994,9 @@ static void test_kv_tier_drop_vs_spill() {
         std::filesystem::remove_all(cold_dir, ec);
     }
 }
+
+// CountingBackend is declared below with the expert-cache fixture helpers.
+static void test_kv_tier_host_reserve_refusal();
 
 static void test_kv_tier_per_plane_cold_files() {
 // Two planes (K and V) share one --kv-cold-dir. The cold path MUST embed
@@ -3544,11 +3548,53 @@ public:
     explicit CountingBackend(Backend *inner) : inner_(inner) {}
     ~CountingBackend() override { delete inner_; }
 
-    BackendKind kind() const override { return inner_->kind(); }
-    const DeviceCaps &caps() const override { return inner_->caps(); }
+    BackendKind kind() const override { return fake_hip_ ? BackendKind::HIP : inner_->kind(); }
+    const DeviceCaps &caps() const override { return fake_hip_ ? fake_caps_ : inner_->caps(); }
+    size_t device_free_bytes() const override {
+        return fake_device_memory_ ? fake_device_free_ : inner_->device_free_bytes();
+    }
+    size_t device_total_bytes() const override {
+        return fake_device_memory_ ? fake_device_total_ : inner_->device_total_bytes();
+    }
+    size_t host_available_bytes() const override {
+        return fake_host_memory_ ? fake_host_available_ : inner_->host_available_bytes();
+    }
+    size_t host_total_bytes() const override {
+        return fake_host_memory_ ? fake_host_total_ : inner_->host_total_bytes();
+    }
+    void set_test_resources(size_t device_total, size_t device_free,
+                            size_t host_total, size_t host_available) {
+        fake_hip_ = true;
+        fake_device_memory_ = true;
+        fake_host_memory_ = true;
+        fake_device_total_ = device_total;
+        fake_device_free_ = device_free;
+        fake_host_total_ = host_total;
+        fake_host_available_ = host_available;
+        fake_caps_ = inner_->caps();
+        fake_caps_.vram_total = device_total;
+        fake_caps_.vram_free = device_free;
+    }
+    void set_test_host_available(size_t bytes) { fake_host_available_ = bytes; }
+    void set_test_host_memory(size_t total, size_t available) {
+        fake_host_memory_ = true;
+        fake_host_total_ = total;
+        fake_host_available_ = available;
+    }
+    void set_fail_allocation_after(i64 successful_allocations) {
+        fail_allocation_after_ = successful_allocations;
+    }
+    void set_fail_markers(bool fail) { fail_markers_ = fail; }
+    void set_require_markers(bool required) { require_markers_ = required; }
     DType act_type() const override { return inner_->act_type(); }
     size_t act_size() const override { return inner_->act_size(); }
-    void *alloc(size_t bytes) override { return inner_->alloc(bytes); }
+    void *alloc(size_t bytes) override {
+        if (fail_allocation_after_ == 0) return nullptr;
+        if (fail_allocation_after_ > 0) --fail_allocation_after_;
+        void *p = inner_->alloc(bytes);
+        if (p) allocations_++;
+        return p;
+    }
     void release(void *p) override {
         if (p) releases_++;
         inner_->release(p);
@@ -3572,6 +3618,12 @@ public:
     }
     void fill0(void *d, size_t b) override { inner_->fill0(d, b); }
     void sync() override { inner_->sync(); }
+    bool requires_markers() const override { return require_markers_; }
+    void *make_marker() override { return fail_markers_ ? nullptr : inner_->make_marker(); }
+    void release_marker(void *m) override { inner_->release_marker(m); }
+    void record_marker(void *m) override { inner_->record_marker(m); }
+    bool poll_marker(void *m) override { return inner_->poll_marker(m); }
+    void wait_marker(void *m) override { inner_->wait_marker(m); }
     void download_f32(f32 *d, const void *s, i64 n) override {
         inner_->download_f32(d, s, n);
     }
@@ -3640,12 +3692,25 @@ public:
     }
 
     u64 releases() const { return releases_; }
+    u64 allocations() const { return allocations_; }
     u64 host_allocs() const { return host_allocs_; }
     u64 host_releases() const { return host_releases_; }
 
 private:
     Backend *inner_;
+    DeviceCaps fake_caps_;
+    bool fake_hip_ = false;
+    bool fake_device_memory_ = false;
+    bool fake_host_memory_ = false;
+    size_t fake_device_total_ = 0;
+    size_t fake_device_free_ = 0;
+    size_t fake_host_total_ = 0;
+    size_t fake_host_available_ = 0;
     u64 releases_ = 0;
+    u64 allocations_ = 0;
+    i64 fail_allocation_after_ = -1;
+    bool fail_markers_ = false;
+    bool require_markers_ = false;
     u64 host_allocs_ = 0;
     u64 host_releases_ = 0;
 };
@@ -3739,6 +3804,202 @@ static ExpertSource expert_source_of(Gguf &g, int layer) {
 // 610 MiB budget idle over a 64-token run). These three arms pin the rule in
 // both directions: a budget that covers the corpus evicts nothing, one byte less
 // than the corpus does, and an explicit slot budget is a real count.
+
+static void test_kv_tier_host_reserve_refusal() {
+
+    // Both memory tiers reserve through one process-wide ledger. Even when
+    // their individual probes see the same 100-byte free sample, they cannot
+    // each spend it independently.
+    {
+        set_env_var("KRK_RAM_RESERVE_MB", "0");
+        int *owned = static_cast<int *>(host_alloc(60));
+        const bool first_reservation = SharedHostRamBudget::reserve(60, 100, 100);
+        CHECK(first_reservation,
+              "the shared host budget reserves the first tier's bytes");
+        if (first_reservation) SharedHostRamBudget::commit(owned, 60);
+        else host_free(owned);
+        CHECK(!SharedHostRamBudget::can_admit(41, 100, 100),
+              "the second tier cannot spend headroom already owned by the first");
+        CHECK(!SharedHostRamBudget::reserve(41, 100, 100),
+              "a concurrent-style second reservation is refused atomically");
+        if (first_reservation)
+            SharedHostRamBudget::release_and_free(owned, [](void *p) { host_free(p); });
+        CHECK(SharedHostRamBudget::can_admit(41, 100, 100),
+              "releasing a tier's buffers returns the bytes to the shared budget");
+        set_env_var("KRK_RAM_RESERVE_MB", "");
+    }
+
+    // Exercise the actual independent cache owners: expert WARM consumes 24 B,
+    // so a KV tier asking to guarantee an 80 B staging page must not treat the
+    // same 100 B host sample as entirely free. Once the expert tier releases,
+    // KV admission succeeds and can migrate a retained page into WARM.
+    {
+        set_env_var("KRK_RAM_RESERVE_MB", "0");
+        const std::string expert_path = "kraken-shared-host-budget.gguf";
+        const bool expert_fixture = build_expert_source_model(expert_path);
+        CHECK(expert_fixture,
+              "wrote the expert fixture for cross-tier RAM accounting");
+        Gguf gg;
+        std::string load_err;
+        const bool expert_loaded = expert_fixture && gg.load(expert_path, &load_err);
+        CHECK(expert_loaded,
+              "loaded the expert fixture for cross-tier RAM accounting");
+        if (!expert_loaded) {
+            std::fprintf(stderr, "  (shared host fixture: %s)\n", load_err.c_str());
+            std::remove(expert_path.c_str());
+            set_env_var("KRK_RAM_RESERVE_MB", "");
+        } else {
+            CountingBackend be(make_cpu_backend());
+            be.set_test_host_memory(4 * (static_cast<size_t>(1) << 30), 100);
+            ExpertCache experts;
+            experts.configure(&be, 48, 24);
+            const ResidentExpert *resident = experts.acquire(expert_source(gg), 0, 0);
+            CHECK(resident && experts.warm_used_bytes() == 24,
+                  "expert WARM holds its 24-byte admitted copy");
+            const std::vector<size_t> layer_bytes = {80, 80};
+            KvTierCache kv;
+            std::string kv_err;
+            CHECK(!kv.init(&be, 2, layer_bytes, 80, 160, "", "k", &kv_err),
+                  "KV cannot reserve 80 bytes on top of the expert's 24 in a 100-byte pool");
+            CHECK(kv_err.find("shared host-memory budget") != std::string::npos,
+                  "KV initialization identifies combined host-tier pressure");
+            experts.clear();
+            CHECK(SharedHostRamBudget::used_bytes() == 0,
+                  "clearing the expert cache releases its ledgered pageable bytes");
+            CHECK(kv.init(&be, 2, layer_bytes, 80, 160, "", "k", &kv_err),
+                  "KV tier initializes after expert WARM releases shared capacity");
+            CHECK(kv.base(0) != nullptr, "first layer becomes HOT");
+            kv.end_layer(0);
+            CHECK(kv.base(1) != nullptr, "second layer promotes after a WARM migration");
+            CHECK(SharedHostRamBudget::used_bytes() == 80,
+                  "the KV WARM migration is charged to the same shared ledger");
+            kv.detach();
+            CHECK(SharedHostRamBudget::used_bytes() == 0,
+                  "detaching KV releases its shared pageable allocation");
+        }
+        std::remove(expert_path.c_str());
+        set_env_var("KRK_RAM_RESERVE_MB", "");
+    }
+
+    const size_t gib = static_cast<size_t>(1) << 30;
+    const std::vector<size_t> tiny_lengths = {16, 16, 16};
+    // Failure halfway through HOT allocation must release the already allocated
+    // slot instead of detaching the backend pointer and leaking it.
+    {
+        CountingBackend be(make_cpu_backend());
+        be.set_test_resources(16 * gib, 8 * gib, 16 * gib, 8 * gib);
+        be.set_fail_allocation_after(1);
+        KvTierCache cache;
+        std::string err;
+        CHECK(!cache.init(&be, 3, tiny_lengths, 32, 48, "", "k", &err),
+              "a failed second HOT allocation refuses cache initialization");
+        CHECK(be.allocations() == 1 && be.releases() == 1,
+              "partial HOT initialization releases its first allocation");
+    }
+    // HIP must have real event markers for safe slot reuse. A simulated marker
+    // failure after one successful slot allocation likewise rolls everything
+    // back; the test backend opts into the HIP requirement explicitly.
+    {
+        CountingBackend be(make_cpu_backend());
+        be.set_test_resources(16 * gib, 8 * gib, 16 * gib, 8 * gib);
+        be.set_fail_markers(true);
+        be.set_require_markers(true);
+        KvTierCache cache;
+        std::string err;
+        CHECK(!cache.init(&be, 3, tiny_lengths, 32, 48, "", "k", &err),
+              "a required marker failure refuses cache initialization");
+        CHECK(be.allocations() == 1 && be.releases() == 1,
+              "marker failure releases the partially built HOT tier");
+    }
+
+    const std::string path = "kraken-kv-reserve-test.gguf";
+    CHECK(build_sparse_kv_model(path, 8192), "wrote a large-context sparse-KV fixture");
+
+    auto *be = new CountingBackend(make_cpu_backend());
+    be->set_test_resources(16 * gib, 8 * gib, 16 * gib, 8 * gib);
+    EngineConfig cfg;
+    cfg.model_path = path;
+    cfg.n_ctx = 8192;
+    cfg.prefill_chunk = 4;
+    cfg.kv_hot_mb = 1; // each plane gets 0.5 MiB: less than its 1 MiB cache
+    cfg.kv_warm_mb = 1;
+    Engine engine;
+    std::string err;
+    CHECK(engine.init(be, cfg, &err), "tiered sparse-KV engine initializes with headroom");
+    if (!err.empty()) std::fprintf(stderr, "  (KV reserve init: %s)\n", err.c_str());
+    if (!err.empty()) {
+        engine.shutdown();
+        delete be;
+        std::remove(path.c_str());
+        return;
+    }
+    KvTierStats stats;
+    engine.kv_tier_stats(&stats);
+    CHECK(stats.tiered && stats.layers == 2,
+          "one-slot HOT tier is active for both KV-carrying layers");
+
+    // A direct cache arm proves the victim remains owned and byte-exact when
+    // neither WARM nor COLD can be staged. `base(3)` forces eviction of layer 0;
+    // admission must refuse before it clears ownership or fills zeros.
+    {
+        const size_t plane = 16u * 8192u * sizeof(f32);
+        std::vector<size_t> lengths(4, 0);
+        lengths[0] = lengths[3] = plane;
+        KvTierCache cache;
+        CHECK(cache.init(be, 4, lengths, plane, plane, "", "k", &err),
+              "cache fixture initialized before pressure is introduced");
+        void *first = cache.base(0);
+        CHECK(first != nullptr, "first layer is resident");
+        if (first) std::memset(first, 0x5a, plane);
+        cache.end_layer(0);
+        be->set_test_host_available(2 * gib); // equal to the default reserve
+        CHECK(cache.base(3) == nullptr,
+              "KV promotion refuses when live headroom reaches the reserve");
+        CHECK(cache.base(0) == first,
+              "refused eviction keeps the original HOT layer owned");
+        if (first) {
+            const u8 *bytes = static_cast<const u8 *>(first);
+            CHECK(bytes[0] == 0x5a && bytes[plane - 1] == 0x5a,
+                  "refused eviction preserves the retained KV bytes");
+        }
+        KvTierStats refused;
+        cache.stats(&refused);
+        CHECK(refused.evictions_dropped == 0 && refused.promotion_refused > 0,
+              "host-pressure refusal is distinct from dropping KV history");
+        cache.detach();
+    }
+
+    // Reinitialize with headroom, then lower it only after load. This exercises
+    // the Engine::forward -> GenerateResult error propagation, not just the
+    // cache's null return. The prompt visits layer 0 then layer 3, forcing an
+    // eviction at the first actual forward.
+    be->set_test_host_available(8 * gib);
+    Engine run_engine;
+    err.clear();
+    CHECK(run_engine.init(be, cfg, &err), "generation engine initialized with host headroom");
+    if (!err.empty()) std::fprintf(stderr, "  (generation init: %s)\n", err.c_str());
+    if (err.empty()) {
+        be->set_test_host_available(2 * gib);
+        GenerateParams p;
+        p.prompt = "the";
+        p.max_tokens = 1;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        GenerateResult result;
+        CHECK(!run_engine.generate(p, &result),
+              "generation returns failure rather than emitting text with lost KV");
+        CHECK(result.finish == FinishError &&
+                  result.error.find("KV promotion refused") != std::string::npos,
+              "generation exposes the memory refusal in its result");
+    }
+    run_engine.shutdown();
+    engine.shutdown();
+    delete be;
+    std::remove(path.c_str());
+
+}
+
+
 static void test_expert_cache_byte_budget() {
     const std::string path = "kraken-bytes-test.gguf";
     CHECK(build_expert_source_model_mixed(path), "wrote the byte-budget GGUF");
@@ -3756,6 +4017,161 @@ static void test_expert_cache_byte_budget() {
           "the two layers have different expert footprints");
     const size_t corpus = 4 * (a.expert_bytes() + b.expert_bytes());
     CHECK(corpus == 256, "the routed set is eight slots of 24 and 40 bytes");
+
+    // The budget guard. It exists because `--expert-warmup` once filled a
+    // 15.92 GiB card to 0.00 GiB free and took the display with it, and its
+    // decision is pure arithmetic, so it is driven here with no device: an
+    // explicit budget that cannot fit is refused, and the refusal names the
+    // largest that does.
+    {
+#ifdef _WIN32
+        _putenv_s("KRK_VRAM_RESERVE_MB", "");
+        _putenv_s("KRK_RAM_RESERVE_MB", "");
+#else
+        unsetenv("KRK_VRAM_RESERVE_MB");
+        unsetenv("KRK_RAM_RESERVE_MB");
+#endif
+        size_t largest = 0;
+        std::string why;
+        // MiB-scale on purpose: this is the shape of the real card (16304 MiB of
+        // VRAM, 599 MiB in use, 1024 MiB reserved) and the refusal message is
+        // written in MiB, so a test in bytes would compare a number against a
+        // rounded one -- which is how the first version of these checks failed.
+        const size_t mib = 1024u * 1024u;
+        CHECK(krk::expert_budget_room(16304 * mib, 599 * mib, 1024 * mib) ==
+                  14681 * mib,
+              "room is total minus what is used minus the reserve");
+        CHECK(krk::expert_budget_fits(14681 * mib, 16304 * mib, 599 * mib,
+                                      1024 * mib, &largest, &why),
+              "a budget exactly at the room fits");
+        CHECK(largest == 14681 * mib, "and reports that room as the largest");
+        CHECK(!krk::expert_budget_fits(14682 * mib, 16304 * mib, 599 * mib,
+                                       1024 * mib, &largest, &why),
+              "one MiB more is refused");
+        CHECK(why.find("14681") != std::string::npos &&
+                  why.find("does not fit") != std::string::npos,
+              "and the refusal names the largest budget that fits, in MiB");
+        CHECK(!krk::expert_budget_fits(1, 16304 * mib, 16303 * mib, 1024 * mib,
+                                       &largest, &why),
+              "a card with only the reserve left refuses even one byte");
+        CHECK(largest == 0, "and names zero as the largest");
+        CHECK(krk::expert_budget_fits(1024, 0, 0, 0, &largest, &why),
+              "a backend that cannot report capacity does not refuse");
+        const size_t gib = static_cast<size_t>(1) << 30;
+        CHECK(krk::vram_reserve_bytes(16 * gib) == gib,
+              "a 16 GiB card reserves 1 GiB");
+        CHECK(krk::vram_reserve_bytes(8 * gib) == gib,
+              "a smaller card keeps the 1 GiB floor");
+        CHECK(krk::vram_reserve_bytes(64 * gib) == 4 * gib,
+              "a large card reserves a sixteenth");
+        CHECK(krk::host_reserve_bytes(96 * gib) == 12 * gib,
+              "96 GiB of host RAM reserves 12 GiB");
+        CHECK(krk::host_reserve_bytes(4 * gib) == 2 * gib,
+              "and the host reserve never drops below 2 GiB");
+        CHECK(!krk::host_staging_fits(1, 12 * gib, 12 * gib),
+              "host staging stops at the exact reserve");
+        CHECK(krk::host_staging_fits(1, 12 * gib + 1, 12 * gib),
+              "one byte above the reserve can stage one byte");
+        CHECK(!krk::host_staging_fits(2, 12 * gib + 1, 12 * gib),
+              "staging cannot cross the reserve by one byte");
+        CHECK(krk::host_staging_fits(1, 12 * gib + 3, 12 * gib, 2),
+              "pending batch allocations count against remaining headroom");
+        CHECK(!krk::host_staging_fits(2, 12 * gib + 3, 12 * gib, 2),
+              "pending bytes cannot make a batch overrun the reserve");
+        CHECK(!krk::host_staging_fits(1, 0, 0),
+              "unknown available RAM fails closed");
+    }
+
+    // Drive the WARM admission itself with a reserve that exceeds live free RAM.
+    // The cache must still serve the expert correctly, but must not retain a
+    // pageable copy; this pins the ordinary COLD -> WARM read-through path, not
+    // just the explicit warm-up sweep above it.
+    {
+        set_env_var("KRK_RAM_RESERVE_MB", "200000");
+        ExpertCache cache;
+        cache.configure(cpu, corpus, corpus);
+        const ResidentExpert *resident = cache.acquire(a, 0, 0);
+        CHECK(resident != nullptr,
+              "a host reserve refusal still loads the expert from the source");
+        CHECK(cache.warm_used_bytes() == 0,
+              "a cold read-through does not stage when it would cross the reserve");
+        cache.clear();
+        clear_env_var("KRK_RAM_RESERVE_MB");
+    }
+
+    // The batched COLD -> WARM prefetch used by the active MoE path has its own
+    // reservation phase, so drive that entry point directly too. No member of
+    // the batch may be allocated when even its first expert would cross reserve.
+    {
+        set_env_var("KRK_RAM_RESERVE_MB", "200000");
+        ExpertCache cache;
+        cache.configure(cpu, corpus, corpus);
+        const i32 ids[] = {0, 1};
+        CHECK(cache.prefetch_layer(a, 0, ids, 2) == 0,
+              "a WARM batch is declined at the host RAM reserve");
+        CHECK(cache.warm_used_bytes() == 0,
+              "a declined batch has no pending or committed host buffers");
+        cache.clear();
+        clear_env_var("KRK_RAM_RESERVE_MB");
+    }
+
+    // The refused startup, driven END TO END through Engine::init -- not through
+    // the guard functions alone. This is the path that rotted once: a `false`
+    // return was added to Engine::configure_expert_cache and its normal exit was
+    // left without a `return` statement. That is UB, and it compiled with 0
+    // errors while build_check.sh stayed green and dense models ran (they return
+    // early); every MoE died at rc=3 with empty stdout, and this suite went from
+    // green to rc=1 with four groups dead. Checks on the decision could not see
+    // it, because not one of them called init -- and nothing could see the defect
+    // on the other side of it either: both CLIs answered a failed init with
+    // `delete be; return 1;`, freeing the backend and then unwinding past the
+    // engine, whose destructor releases buffers through that pointer (SIGSEGV).
+    // So: a card too small for the requested budget must come back as a FALSE
+    // RETURN, followed by the destruction of the engine that refused.
+    {
+        const std::string moe_path = "kraken-refusal-test.gguf";
+        CHECK(build_sparse_kv_model(moe_path),
+              "wrote the MoE fixture for the refusal arm");
+        // A device-free run has no card, so the CPU backend is told to report one
+        // (KRK_VRAM_TOTAL_MB). It reads that only when it has no capacity of its
+        // own, so no GPU run can be affected: 4 GiB with a 1 GiB reserve leaves
+        // 3072 MiB for an expert budget.
+        set_env_var("KRK_VRAM_TOTAL_MB", "4096");
+        EngineConfig cfg;
+        cfg.model_path = moe_path;
+        cfg.n_ctx = 16;
+        cfg.prefill_chunk = 4;
+        cfg.expert_cache_mb = 1024; // inside the 3072 MiB of room
+        std::string rerr;
+        {
+            // The control FIRST: without it, a fixture that cannot initialize at
+            // all would make the refusal below pass for the wrong reason.
+            Engine engine;
+            const bool ok = engine.init(cpu, cfg, &rerr);
+            CHECK(ok, "a budget the simulated card can hold does initialize");
+            if (!ok)
+                std::fprintf(stderr, "  (refusal control: %s)\n", rerr.c_str());
+        }
+        cfg.expert_cache_mb = 4096; // more than the card can hold
+        rerr.clear();
+        {
+            Engine engine;
+            CHECK(!engine.init(cpu, cfg, &rerr),
+                  "a budget larger than the card is refused, not trimmed");
+            CHECK(rerr.find("does not fit") != std::string::npos &&
+                      rerr.find("3072") != std::string::npos,
+                  "and names the largest budget that does fit, in MiB");
+            // The text is the evidence: it can only come from the guard, so the
+            // arm cannot be passing because the fixture failed for some other
+            // reason (the control above is what makes that claim testable).
+            if (!rerr.empty())
+                std::fprintf(stderr, "  (refused: %s)\n", rerr.c_str());
+            // Destruction follows the refusal, which is the unwinding that used
+            // to run through a backend the caller had already freed.
+        }
+        clear_env_var("KRK_VRAM_TOTAL_MB");
+        std::remove(moe_path.c_str());
+    }
 
     // 1. A budget that covers the corpus holds every slot in it.
     {
@@ -4060,6 +4476,63 @@ static void test_expert_cache_warm_tier() {
     CHECK(cache.touch_count(0, 0) == 0,
           "an evicted expert without a tier is gone, history and all");
 
+    // Batched reservations must obey the same byte budget as demand loads.
+    cache.clear();
+    cache.configure(&be, 48, 48);
+    const i32 all[] = {0, 1, 2, 3};
+    CHECK(cache.prefetch_layer(src, 0, all, 4) == 48,
+          "prefetch reserves no more than two experts in a two-expert WARM tier");
+    CHECK(cache.warm_used_bytes() == 48 && cache.warm_slots() == 2,
+          "pending reservations count against the WARM budget");
+    CHECK(cache.warm_rejects() == 2,
+          "prefetch rejects the tail that cannot fit beside pending reads");
+    CHECK(cache.acquires() == 0 && cache.pinned_slots() == 0,
+          "speculative staging neither counts as demand nor earns pins");
+    CHECK(touch(0) && touch(3), "demand still loads both staged and rejected experts");
+    CHECK(cache.warm_used_bytes() <= cache.warm_capacity_bytes(),
+          "demand after a partial prefetch remains within budget");
+
+    cache.clear();
+    cache.configure(&be, 48, 96);
+    const i32 duplicates[] = {0, 0, -1, 4, 1, 1};
+    const u64 before_batch_allocs = be.host_allocs();
+    CHECK(cache.prefetch_layer(src, 0, duplicates, 6) == 48,
+          "prefetch deduplicates valid IDs and ignores invalid IDs");
+    CHECK(cache.warm_used_bytes() == 48 && cache.warm_slots() == 2,
+          "duplicate IDs cannot overwrite or double-count staged buffers");
+    CHECK(be.host_allocs() == before_batch_allocs + 6,
+          "one three-slice host allocation per unique expert");
+    CHECK(cache.prefetch_layer(src, 0, duplicates, 6) == 0,
+          "already WARM experts are not read again");
+    const ResidentExpert *staged = cache.acquire(src, 0, 1);
+    CHECK(staged && std::memcmp(staged->gate.data, src.gate->data + 8, 8) == 0 &&
+              std::memcmp(staged->up.data, src.up->data + 8, 8) == 0 &&
+              std::memcmp(staged->down.data, src.down->data + 8, 8) == 0,
+          "staging and promotion preserve every source slice byte for byte");
+
+    cache.clear();
+    cache.configure(&be, 48, 96);
+    CHECK(touch(0), "current expert for staged promotion");
+    const i32 next_ids[] = {1, 2};
+    cache.prefetch_layer(src, 0, next_ids, 2);
+    const u64 before_stage_acquires = cache.acquires();
+    const u32 before_stage_count = cache.touch_count(0, 1);
+    CHECK(cache.stage_next(src, 0, 1, 0), "next WARM expert stages beside current");
+    CHECK(cache.in_vram(0, 0) && cache.in_vram(0, 1), "current leased during admission");
+    CHECK(cache.acquires() == before_stage_acquires &&
+              cache.touch_count(0, 1) == before_stage_count,
+          "staging earns neither demand traffic nor popularity");
+    CHECK(touch(1) && cache.active_used() == 1, "demand consumes staged weights once");
+    CHECK(cache.stage_next(src, 0, 2, 1), "second staged expert exercises eviction");
+    CHECK(cache.in_vram(0, 1), "staging cannot evict the current consumer");
+    CHECK(touch(2) && cache.active_staged() == 2 && cache.active_used() == 2,
+          "both staged promotions count separately from HOT hits");
+    cache.clear();
+    cache.configure(&be, 24, 96);
+    CHECK(touch(0), "one-slot current expert");
+    cache.prefetch_layer(src, 0, next_ids, 2);
+    CHECK(!cache.stage_next(src, 0, 1, 0), "one-slot budget skips speculative admission");
+    CHECK(touch(1), "skipped staging falls back to exact demand loading");
     cache.clear();
     std::remove(path.c_str());
 }
@@ -5381,6 +5854,34 @@ static void test_http_server() {
 
     std::mutex gen_mu;
     OpenAiService svc(&engine, 0.8f, &gen_mu);
+    const std::string resource_model_path = "kraken-http-resource-test.gguf";
+    const bool resource_model_built = build_sparse_kv_model(resource_model_path, 8192);
+    CHECK(resource_model_built,
+          "http test: built a multi-KV-layer model that requires tier promotion");
+    CountingBackend *resource_backend = new CountingBackend(make_cpu_backend());
+    resource_backend->set_test_resources(16 * (static_cast<size_t>(1) << 30),
+                                         8 * (static_cast<size_t>(1) << 30),
+                                         16 * (static_cast<size_t>(1) << 30),
+                                         8 * (static_cast<size_t>(1) << 30));
+    Engine resource_engine;
+    EngineConfig resource_cfg = cfg;
+    resource_cfg.model_path = resource_model_path;
+    resource_cfg.n_ctx = 8192;
+    resource_cfg.prefill_chunk = 4;
+    resource_cfg.kv_hot_mb = 1;
+    resource_cfg.kv_warm_mb = 1;
+    std::string resource_err;
+    const bool resource_inited = resource_engine.init(resource_backend, resource_cfg,
+                                                       &resource_err);
+    CHECK(resource_inited,
+          "http test: resource-pressure engine initializes before pressure changes");
+    if (!resource_inited) {
+        std::fprintf(stderr, "  (HTTP resource fixture: %s)\n", resource_err.c_str());
+        delete resource_backend;
+    }
+    std::mutex resource_mu;
+    OpenAiService *resource_svc = resource_inited
+        ? new OpenAiService(&resource_engine, 0.8f, &resource_mu) : nullptr;
     HttpServer server;
     CHECK(server.listen("127.0.0.1", 0, &err), "http test: listener on ephemeral port");
     const int port = server.port();
@@ -5559,6 +6060,65 @@ static void test_http_server() {
               "http: no state leaks between requests");
     }
 
+    // Host-memory refusal reaches API clients as 503/resource_exhausted with
+    // the engine's remediation detail, never as a successful partial answer.
+    if (resource_svc) {
+        HttpServer resource_server;
+        CHECK(resource_server.listen("127.0.0.1", 0, &err),
+              "http resource test: listener on ephemeral port");
+        const int resource_port = resource_server.port();
+        std::thread resource_thread([&resource_server, resource_svc]() {
+            resource_server.run([resource_svc](const HttpRequest &request,
+                                               HttpResponse &response,
+                                               HttpConn &connection) {
+                return resource_svc->handle(request, response, connection);
+            });
+        });
+        resource_backend->set_test_host_available(2 * (static_cast<size_t>(1) << 30));
+        const std::string resource_request =
+            "{\"prompt\":\"one two three four five six seven eight nine ten "
+            "eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen "
+            "nineteen twenty twenty-one\",\"max_tokens\":1,\"temperature\":0}";
+        CHECK(http_request(resource_port, "POST", "/v1/completions",
+                           resource_request, &status, &body) && status == 503,
+              "http: host-memory refusal returns Service Unavailable");
+        const size_t resource_hdr = body.find("\r\n\r\n");
+        JsonValue resource_json;
+        std::string resource_parse_error;
+        CHECK(resource_hdr != std::string::npos &&
+                  json_parse(body.substr(resource_hdr + 4), &resource_json,
+                             &resource_parse_error),
+              "http: resource refusal body is valid JSON");
+        const JsonValue *resource_error = resource_json.find("error");
+        std::string resource_type, resource_message;
+        CHECK(resource_error && resource_error->get_string("type", &resource_type) &&
+                  resource_type == "resource_exhausted",
+              "http: resource refusal has the resource_exhausted error type");
+        CHECK(resource_error && resource_error->get_string("message", &resource_message) &&
+                  resource_message.find("KV promotion refused") != std::string::npos &&
+                  resource_message.find("--ctx") != std::string::npos,
+              "http: resource refusal explains the cause and a remediation");
+        // The streaming path sends the same actionable refusal inside its SSE
+        // error event; its HTTP status remains fixed by the already-open stream.
+        const std::string stream_request =
+            "{\"prompt\":\"one two three four five six seven eight nine ten "
+            "eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen "
+            "nineteen twenty twenty-one\",\"max_tokens\":1,\"temperature\":0,"
+            "\"stream\":true}";
+        CHECK(http_request(resource_port, "POST", "/v1/completions", stream_request,
+                           &status, &body), "http: streamed resource request completes");
+        CHECK(body.find("resource_exhausted") != std::string::npos &&
+                  body.find("KV promotion refused") != std::string::npos &&
+                  body.find("--ctx") != std::string::npos,
+              "http: stream exposes the resource type, cause and remediation");
+        resource_server.stop();
+        resource_thread.join();
+        delete resource_svc;
+        resource_engine.shutdown();
+        delete resource_backend;
+        std::remove(resource_model_path.c_str());
+    }
+
     // errors
     CHECK(http_request(port, "GET", "/nope", "", &status, &body) && status == 404,
           "http: unknown path is 404");
@@ -5573,6 +6133,7 @@ static void test_http_server() {
     accept_thread.join();
     engine.shutdown();
     delete cpu;
+    if (!resource_svc) std::remove(resource_model_path.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -5757,6 +6318,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_kv_tier_per_layer_widths)
     TEST_GROUP(test_kv_tier_no_kv_layers)
     TEST_GROUP(test_kv_tier_drop_vs_spill)
+    TEST_GROUP(test_kv_tier_host_reserve_refusal)
     TEST_GROUP(test_kv_tier_per_plane_cold_files)
 };
 

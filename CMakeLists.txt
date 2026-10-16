@@ -56,6 +56,17 @@ endif()
 # wrapper or not. Debug stays assertion-enabled.
 add_compile_options($<$<NOT:$<CONFIG:Debug>>:-DNDEBUG>)
 
+# A `bool` function that falls off its end is UB, and its diagnostic is one warning
+# inside a wall of them. Engine::configure_expert_cache gained a `return false`
+# failure path and kept no `return` at its normal exit: 0 compiler errors,
+# build_check.sh green, dense models fine (they return early), and every MoE run
+# dead at rc=3 with empty stdout. -Wall already contained -Wreturn-type, so the
+# warning was there to read. Making it fatal means the class cannot land at all, in
+# any translation unit, whatever wrapper compiler is configured.
+if(NOT MSVC)
+    add_compile_options(-Werror=return-type)
+endif()
+
 option(KRK_ENABLE_HIP "Build the HIP/ROCm backend" ON)
 option(KRK_BUILD_TESTS "Build the test suite" ON)
 set(KRK_GPU_TARGETS "gfx1031;gfx1201"

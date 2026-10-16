@@ -199,6 +199,7 @@ enum Finish : int {
     FinishStop = 1,
     FinishEos = 2,
     FinishContext = 3,
+    FinishError = 4,
 };
 
 enum LogitMode : int {
@@ -224,6 +225,10 @@ struct GenerateResult {
     // Counted rather than inferred, so it stays right if the loop changes.
     i64 decode_steps = 0;
     f64 load_ms = 0;
+    // Non-empty when inference stopped before the requested token count. Kept
+    // on the result so API callers can distinguish resource refusal from a
+    // normal context/stop-token finish.
+    std::string error;
 };
 
 class Engine {
@@ -232,6 +237,9 @@ public:
     ~Engine();
 
     bool init(Backend *be, const EngineConfig &cfg, std::string *err);
+    Backend::ExpertPoolStats expert_pool_stats() const {
+        return be_ ? be_->expert_pool_stats() : Backend::ExpertPoolStats{};
+    }
     void shutdown();
 
     bool generate(const GenerateParams &p, GenerateResult *res);
@@ -329,6 +337,7 @@ public:
         out->promotions_from_cold = a.promotions_from_cold + b.promotions_from_cold;
         out->evictions_to_warm = a.evictions_to_warm + b.evictions_to_warm;
         out->evictions_to_cold = a.evictions_to_cold + b.evictions_to_cold;
+        out->promotion_refused = a.promotion_refused + b.promotion_refused;
         // Counted per plane, so this is pages, and the same lost layer counts
         // twice -- once for K and once for V. Reported apart from ->COLD
         // because it is the one number here that says the run is wrong.
@@ -366,11 +375,12 @@ public:
     void write_expert_index(const std::string &path) const;
 
 private:
+    std::string kv_resource_error() const;
     // One batched forward over n tokens starting at pos0. LogitMode picks how
     // much of the output head runs: none (mid-prefill), the last row (plain
     // decode), or every row (speculative verification).
-    void forward(const i32 *toks, i32 n, i32 pos0, bool want_logits);
-    void forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode);
+    bool forward(const i32 *toks, i32 n, i32 pos0, bool want_logits);
+    bool forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode);
     // Runs the output head on one row of ws_x_ into ws_logits_.
     void head_compute(i32 row);
     // prism.hadamard fold: dst <- transform(src), see Backend::hadamard_act.
@@ -385,7 +395,7 @@ private:
     void dump_row(const char *what, i32 layer, const void *buf, i64 width, i64 rows);
     // Zero-fill rollback for the (rare) shrink-a-lot path; the common small
     // rollback in speculative decoding is pure pointer arithmetic.
-    void kv_rollback_zero(i64 pos);
+    bool kv_rollback_zero(i64 pos);
     // Routed-expert FFN for one layer: router -> top-k -> grouped per-expert
     // FFN -> optional shared expert. Tokens that picked the same expert are
     // permuted into one block, so each expert runs three batched GEMMs
@@ -403,7 +413,10 @@ private:
     void gemm_residual(void *dst, const void *x, const void *w, DType wt,
                        i64 n_out, i64 n_in, i64 rows, void *scratch);
     // Chooses the expert residency budget from cfg_ and the device.
-    void configure_expert_cache();
+    // Chooses the device-side expert budget. Returns false with *err set when
+    // an explicit --expert-cache-mb cannot fit the card, which is a refusal
+    // rather than a trim: see the reserve rule in the definition.
+    bool configure_expert_cache(std::string *err);
     // Fills the two residency tiers ahead of the run, hottest-first: WARM from
     // the ranked expert list, then the top of that order onto the device. The
     // point is the ORDER, not the volume -- a tier smaller than the routed set
@@ -645,6 +658,11 @@ private:
 
     std::vector<i32> plan_dev_;   // staging mirror for ws_plan_
     std::vector<f32> alpha_dev_;  // staging mirror for ws_alpha_
+    // The layer plan's segmentation: off(e) is expert e's first slot in
+    // plan_dev_/alpha_dev_, and plan_cur_ is the bucket cursor the fill pass
+    // walks. Both are members so a layer does not allocate.
+    std::vector<i32> plan_off_;
+    std::vector<i32> plan_cur_;
 };
 
 } // namespace krk

@@ -19,10 +19,10 @@ Targets: **Radeon RX 6700 XT** (`gfx1031`, RDNA2) and **Radeon RX 9070 XT**
 Most "AMD inference engines" are a GEMM library plus a graph. KRAKEN is the
 opposite: the kernels are the product.
 
-**Weights are never dequantized.** A Q4_K_M row stays Q4_K in VRAM for the whole
-run. Every matmul dequantizes inside the inner loop, into registers, at the rate
-the ALUs can consume it. There is no "load, decompress, run" pass; there is no
-fp16 copy of the model. A 7B Q4_K_M model occupies 4.4 GB, not 14 GB.
+**Weights stay quantized in VRAM.** A Q4_K_M row stays Q4_K for the whole run.
+Decode dequantizes chunks into registers; WMMA prefill stages dequantized f16
+tiles through shared memory. Neither path keeps a full f16 copy of the model.
+A 7B Q4_K_M model occupies 4.4 GB, not 14 GB.
 
 **One chunking model for every format.** `dequant_chunk<T>(block, chunk, out)`
 materializes exactly 32 values of a block. Every GGUF format is a whole number
@@ -35,7 +35,7 @@ gather share one inner loop and one tiling rule: *K tiles are multiples of 32*.
 | path | when | primitive |
 |---|---|---|
 | `gemv_kernel` | decode, M == 1 | fused dequant + dot into registers, one block per channel |
-| `gemm_wmma` | prefill, gfx11/gfx12 | `v_wmma_f32_16x16x16_f16` with a 32x64x64 block tile |
+| `gemm_wmma` | prefill, gfx11/gfx12 | `v_wmma_f32_16x16x16_f16` with a 32x64x128 block tile |
 | `gemm_simt` | gfx10, or a non-WMMA target | 64x64 tile, `v_dot2_f32_f16` inner product |
 
 **Prefill skips the output head entirely** except for the final row, so a 4k-token
@@ -46,24 +46,24 @@ the running max and normalizer are maintained per block, and the output
 accumulator is rescaled - the score vector is never materialized. Shared memory
 stays under ~33 KiB regardless of context length.
 
-**MoE experts are never loaded up front - and the cache is frequency-aware.**
-A `qwen3moe`/`qwen2moe` checkpoint carries one FFN per expert per layer; a
-235B-A22B model touches ~22B of them per token. KRAKEN keeps the whole expert
-set in the file mapping and pages in only the experts the router selects, into
-a byte-budgeted residency set. The policy is **LFU with aging**, not LRU:
+**MoE experts are lazy-loaded - and the cache is frequency-aware.** A
+`qwen3moe`/`qwen2moe` checkpoint carries one FFN per expert per layer; a
+235B-A22B model touches ~22B of them per token. KRAKEN maps the source file and
+pages in only the experts the router selects into a byte-budgeted residency
+set. The policy is **LFU with aging**, not LRU:
 expert popularity is skewed and sticky, so every hit earns a counter, a hot
 expert gets **pinned** against eviction, and periodic decay makes pins lapse
 when traffic moves on - a favourite of the first thousand tokens cannot squat
 on its slot forever. Give it a second tier with `--expert-warm-mb` (the old
-spelling `--expert-l2-mb` is still accepted) and an evicted
-expert is demoted into page-locked host RAM instead of being dropped, so coming
-back is a DMA rather than a re-read of the mapping. The tokens that picked the
-same expert are permuted into
-one contiguous block (`gather_rows`), so each expert runs **three GEMMs per
-layer regardless of how many tokens chose it**, and results fold back through a
-fused weighted scatter. A machine with far less memory than the model still
-decodes - it just reloads more. Results are identical at any cache size and
-any chunk size.
+spelling `--expert-l2-mb` is still accepted): WARM is pageable host RAM, shared
+with the KV tier's WARM and COLD staging through one process-wide admission
+ledger. The tokens that picked the same expert are permuted into one contiguous
+block (`gather_rows`); compatible gate/up projections are grouped, followed by
+the down projection, and results fold back through a fused weighted scatter.
+The file mapping remains the immutable cold source, while promotion uses a
+bounded pinned staging ring. A machine with less memory than the model still
+decodes when each required tier can be admitted; if retained KV cannot be
+preserved safely, inference refuses rather than returning corrupted text.
 
 ---
 
@@ -174,11 +174,12 @@ build/kraken-tests
 
 The suite builds a complete miniature LLaMA-family GGUF in a temporary file and
 generates through it, so the container parser, the model loader, the forward
-pass, the sampler and both tokenizer families are all covered end to end. Each
-of its 54 groups runs in its own worker process (read the count off the run -
-it grows when coverage does: 2905 checks on this build), and
-`scripts/kraken_tests_baseline_check.sh` fails the run if a group that was
-passing in the recorded baseline stops passing.
+pass, the sampler and both tokenizer families are covered end to end. Groups
+run in isolated worker processes; read the current group/check counts off the
+run because they grow with coverage. `scripts/kraken_tests_baseline_check.sh`
+fails when a group that passed in the recorded baseline stops passing. For this
+checkout, build from the repo root with `ninja -C build-hip kraken kraken-tests
+kraken-bench kraken-inspect` and run `build-hip/kraken-tests.exe`.
 
 ---
 
@@ -186,63 +187,112 @@ passing in the recorded baseline stops passing.
 
 ### The command
 
-Every number below comes from one command (headline rows: three runs per model; full sweep: one run each):
+The headline table below was re-measured on the current tree on 2026-10-11:
+three `--bench --greedy` runs per model, same machine and command shape. The
+large-model first load was cold; subsequent loads used the warm file cache. The
+full sweep later in this section is a historical one-run snapshot, not a
+measurement of every row on the current tree.
 
 ```
-kraken --model <MODEL> --bench
+kraken --model <MODEL> --bench --greedy
 ```
 
 `--bench` is self-contained and needs no flags: it feeds a fixed prompt (which
 tokenizes to **51-125 tokens depending on the model's tokenizer** - 51 for
 SmolLM2, 55 for most Qwen-family files, 122-125 for a few others), generates
-**256 tokens**, and reports the *whole* process budget, not just the two phases
-it owns. Defaults in force for every row: greedy sampling, `--ctx 4096`,
-`--chunk 256`. The per-model prompt length is listed in the sweep table below.
+up to **256 tokens** (generation stops at `--ctx`), and reports the *whole*
+process budget, not just the two phases it owns. Defaults in force for every
+row: greedy sampling, `--ctx 4096`, `--chunk 256`. Generation stops at the
+context limit, so rows with a short `--ctx` can produce fewer than 256 tokens.
+The per-model prompt length is listed in the sweep table below.
+
+
 
 ```
-prefill        55 tokens in 83.9 ms  (655.2 tok/s)
-decode         256 tokens in 2896.3 ms  (88.4 tok/s)
-startup        8.3 ms  (arg parse + backend create)
-load           1410.5 ms  (32% of start-to-end)
-total          4399.0 ms  (startup + load + prefill + decode)
+# Qwen3-8B, current-tree sample (run 1; cold file cache)
+prefill        55 tokens in 56.1 ms  (980.4 tok/s)
+decode         256 tokens in 2885.8 ms  (88.4 tok/s)
+startup        15.0 ms  (arg parse + backend create)
+load           5607.5 ms  (65% of start-to-end)
+total          8564.4 ms  (startup + load + prefill + decode)
 ```
+
+The cold-load row is intentionally kept as an example of why cache state is
+recorded; the two warm-cache loads were 1902.2 and 1934.8 ms. See the dated
+context check below for a same-build context comparison.
 
 - **prefill** - prompt tokens / time to process them. Throughput, so higher is
   better and it scales with batch size.
 - **decode** - generated tokens / time to generate them. The context grows
   during the run, so this is the *average* over 256 tokens ending at ~300
   tokens of context, not a short-context number.
-- **load** - reading the weights into VRAM. It is **32-40% of start-to-end** on
-  every model here, which is why it is printed: a report covering only prefill
-  and decode invites optimising two thirds of the process.
+- **load** - reading weights into the selected backend. It is 44-48% of
+  start-to-end on the small models here and 39-65% on the 8B, depending on file
+  cache state; it is printed rather than assumed.
 
 Configuration: **AMD Radeon RX 9070 XT** (gfx1201, RDNA4, wave32, WMMA gfx12,
-64 CU, 15.9 GiB VRAM), HIP 7.16.26323, clang 23.0.0, ROCm 10.1, host Windows 11.
+64 CU, 15.9 GiB VRAM), Windows 11, ROCm 10.1, clang 23.0.0. The binary
+reported HIP 7.16.26332 (SDK 7.16.26331); see the runtime warning and limitation
+below.
 
-### Results (3 runs each, range = min-max)
+### Results (current tree, 3 runs each; range shown)
 
 | model | layers / embd | prefill tok/s | decode tok/s | load ms |
-|---|---|---|---|---|
-| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 4860-5031 | 440-457 | 400-405 |
-| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 4247-4287 | 245-247 | 628-648 |
-| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 28 / 1024 | 182-204 | 90-93 | 465-498 |
-| Qwen3-8B Q4_K_M | 36 / 4096 | 919-946 | 80-81 | 1693-1792 |
+|---|---|---:|---:|---:|
+| SmolLM2-135M-Instruct Q4_K_M | 30 / 576 | 5518-5788 | 553-564 | 373-432 |
+| Qwen3.5-0.8B Q4_K_M (GDN hybrid) | 24 / 1024 | 5157-5233 | 378-387 | 597-632 |
+| Qwen3-MoE-4x0.6B-2.4B Q4_K_M | 28 / 1024 | 180-185 | 115-119 | 445-456 |
+| Qwen3-8B Q4_K_M | 36 / 4096 | 976-980 | 88.4-88.7 | 1902-5608 |
 
-These four get three runs each on this build with the bare `--bench` commands
-below (measured 2026-10-10). The MoE prefill band is the widest (182-204,
-~12%) because the resident-expert budget depends on what else ran first; see
-the residency section. The 8B load band is narrow (1.69-1.79 s) because all
-three runs had a warm file cache - one cold-cache run of the same file measured
-4.9 s, so the narrow band is a cache state, not a speedup claim.
+Three sequential runs per model used the fixed `--bench` prompt, 256 greedy
+output tokens, `--ctx 4096`, `--chunk 256`; the ranges are run-to-run, not
+confidence intervals. The MoE's live policy selected a 610 MiB device expert
+budget and a 610 MiB pageable WARM tier on this 15.9 GiB GPU / 95.9 GiB host.
+The 8B's first load (5.61 s) had a cold file cache; the next two (1.90-1.93 s)
+were warm-cache loads. Throughput is the more stable comparison here; do not
+compare load times across those cache states.
+
+Build/runtime note: the binary reported HIP 7.16.26332 (SDK 7.16.26331) and
+warned that the loaded HIP runtime did not match the SDK it was built against.
+Each run also reported RX 9070 XT / gfx1201 and process-specific GPU engine
+activity, corroborating GPU use; no separate kernel-dispatch trace was captured.
+The warning limits software-version reproducibility, but is not evidence of CPU
+fallback. Stage the matching SDK runtime and record its file version before
+using these as a clean release baseline.
+
+Current-tree context check (three runs per arm):
+
+| `--ctx` | generated tokens/run | decode tok/s range | median |
+|---:|---:|---:|---:|
+| 64 | 56 | 377.2-382.1 | 378.8 |
+| 256 | 248 | 378.1-380.1 | 378.7 |
+
+These rates average over different numbers of generated tokens because the
+context limit stops generation before `-n 256` is reached. They corroborate
+flat decode over these short contexts on this build; the full `--bench` result
+above averages 256 tokens while context grows to roughly 300.
+
+The older context-scaling table below records a before/after kernel fix from a
+prior build; use the dated current-tree check above for current absolute rates.
+
+AMD distinguishes build-time HIP version macros from runtime version queries,
+and defines `hipRuntimeGetVersion()` as an approximate runtime version; it does
+not identify the loaded DLL's exact path or file version. See the [HIP version
+API](https://rocm.docs.amd.com/projects/HIP/en/latest/reference/hip_runtime_api/modules/initialization_and_version.html)
+and [rocprofv3 kernel tracing
+docs](https://rocm.docs.amd.com/projects/rocprofiler-sdk/en/latest/how-to/using-rocprofv3.html) for runtime provenance and stronger dispatch evidence.
+
 
 ### How close is this to the hardware?
 
 The card's real read bandwidth is **585 GB/s**, not the 644 GB/s on the spec
 sheet - measured with a 4096 MiB streaming read (584.9 GB/s). An 8B Q4_K_M
 token has to read **5.02 GB** of weights, so the absolute floor is **8.58 ms =
-117 tok/s**. Kraken does **80-81 tok/s (12.4 ms/token), ~69% of that ceiling**,
-averaged over the 256 generated tokens above - and decode is flat in context
-(docs/PERF-PLAN.md B0), so the short-context number is the same within noise.
+117 tok/s**. The current-tree 8B result is **88.4 tok/s (11.3 ms/token), ~76% of
+that ceiling**, averaged over the 256 generated tokens above - and decode is
+flat in context (docs/PERF-PLAN.md B0), so the short-context number is the same
+within noise. The historical context table below compares pre-fix and fixed
+paths; its absolute rates are not current-tree measurements.
 
 The gap is not bandwidth. Five elementwise ops (`rmsnorm`, `rope`, `qk_norm`,
 `kv_append`, and the residual add) that each move 8-16 KB used to cost **253
@@ -252,22 +302,64 @@ then this build's rope + kv-append + attention chain (one launch, below) - and
 a profiled run on this build ranks the remaining elementwise group at ~12% of
 device time.
 
-To reproduce, substituting your own path:
+To reproduce the current headline measurements (three sequential runs each):
 
 ```
-kraken --model models/SmolLM2-135M-Instruct.Q4_K_M.gguf          --bench
-kraken --model models/Qwen3.5-0.8B.Q4_K_M.gguf                 --bench
-kraken --model models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf         --bench
-kraken --model "G:/More-models/Qwen3-8B-Q4_K_M.gguf"            --bench
+kraken --model models/SmolLM2-135M-Instruct.Q4_K_M.gguf --bench --greedy
+kraken --model models/Qwen3.5-0.8B.Q4_K_M.gguf --bench --greedy
+kraken --model models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf --bench --greedy
+kraken --model "G:/More-models/Qwen3-8B-Q4_K_M.gguf" --bench --greedy
 ```
 
-Run-to-run spread here was within 4% on prefill for the dense models (the MoE
-runs wider, ~12%) and within 4% on decode, so treat differences smaller than
-that as noise. MoE rows depend on a tunable: they
-assume the default expert budget (40% of free VRAM), which is why a small MoE
-can look slow next to a dense model far above its weight.
+Across these sequential repetitions, decode varied by about 2.1% (SmolLM2),
+2.4% (Qwen3.5-0.8B), 2.9% (the MoE), and 0.3% (Qwen3-8B); these are observed
+ranges, not confidence intervals. The small-model prefill ranges are wider
+because the prompts are short. The MoE result uses the current adaptive policy,
+not the old fixed fraction: the planner sizes the expert pool to model demand
+and a selected VRAM cap (6 GiB by default, raised in 2 GiB steps to at most
+14 GiB), then clamps it against live free memory minus a reserve (default 1 GiB
+or 1/16 of total card capacity, whichever is larger). Explicit `--vram-cap-mb` and
+`--vram-tier` options also constrain that plan. `KRK_VRAM_RESERVE_MB` overrides
+the reserve. Explicit `--expert-cache-mb` values that exceed live free VRAM
+after reserve are refused with the largest fitting value, rather than silently
+trimmed.
 
-### Full sweep: every loadable file on the box, one run each
+The host WARM tiers also share one process-local byte ledger: expert WARM,
+KV WARM, and temporary KV COLD read/write staging cannot independently spend
+the same sampled headroom. The default host reserve is 2 GiB or one eighth of
+installed RAM, whichever is larger; `KRK_RAM_RESERVE_MB` overrides it (setting
+it to `0` disables the reserve). A zero or unavailable host-memory reading
+refuses new pageable staging. If a KV page cannot be preserved in WARM or COLD,
+inference stops with an actionable error. Non-streaming HTTP requests receive
+503 `resource_exhausted` with remediation in JSON. If rollback fails before a
+stream opens, the response is a normal JSON 503; a later generation failure
+emits the resource error in an SSE event after the response opens (its HTTP
+status can no longer change).
+The ledger serializes KRAKEN's own admissions and lowers its admission ceiling
+under external pressure, but it is not an OS reservation: another process may
+consume memory between the last sample and allocation.
+
+### Measured decode changes (2026-10-11)
+
+These are separate one-switch A/Bs on the RX 9070 XT (gfx1201), Release build;
+all use interleaved, order-balanced pairs and unchanged output. Percentages are
+not additive because the experiments use different models and isolated arms.
+
+| Change | Workload and verification | Result |
+|---|---|---|
+| Defer the expert-pool reuse guard to the copy stream instead of querying a pending event on the host | Qwen3-MoE-4x0.6B, `--ctx 512 -n 64 --greedy`, 9 pairs; same stdout md5 | **+11.279%** at 16 MiB and **+8.569%** at 32 MiB; resident-budget null control: no difference |
+| Upload the whole MoE routing plan per layer instead of per expert visit | Qwen3-MoE-4x0.6B, 5 pairs; plan uploads 705 → 649 ops/step; same stdout md5 | **+10.027%**, 5/5 pairs, MAD 2.870% |
+| Remove the redundant device drain before greedy top-k readback | SmolLM2-135M and Qwen3.5-0.8B, 5 pairs each; same output | **+5.170%** and **+4.412%**, respectively |
+
+The measurements and raw setup are recorded in
+[docs/AUDIT-quiet-vs-busy-primitives.md](docs/AUDIT-quiet-vs-busy-primitives.md),
+[docs/traces/launch-floor-and-drains-2026-10-11.txt](docs/traces/launch-floor-and-drains-2026-10-11.txt),
+and [docs/AUDIT-active-expert-staging.md](docs/AUDIT-active-expert-staging.md).
+The shared host-RAM guard documented above is a correctness/resource-safety
+change; no throughput gain is claimed for that ledger itself.
+
+### Historical full sweep: every loadable file on the box (2026-10-10, one run each)
+
 
 66 `.gguf` files were tried (everything in `models/` plus `G:/More-models/`,
 skipping only the 3-part Laguna shard set, which is not a loadable model).
@@ -384,15 +476,20 @@ kraken --model models/Qwen3.5-0.8B.Q4_K_M.gguf --ctx 256 -n 256 --greedy -v
 ```
 
 `-v` prints `[N prompt / N generated | prefill X ms | decode Y tok/s]` after the
-answer. The same model reads **368 tok/s** at ctx 64 and **279 tok/s** over the
-256-token `--bench` run; that gap is context cost, not a regression.
+answer. On the current tree, three runs at ctx 64 measured 377.2-382.1 tok/s
+(56 generated tokens before reaching the context limit); three at ctx 256
+measured 378.1-380.1 tok/s (248 generated). This is consistent with flat decode
+across these short contexts. The 256-token `--bench` average is also similar,
+but is a distinct run whose context grows during generation. The older table
+below records the before/after kernel fix from a prior build; use the dated
+current-tree measurements above for current absolute rates.
 
-### Decode rate is now flat in context
+### Historical context-scaling comparison
 
-The 0.8B used to lose 90% of its decode rate as the context grew, because its
-decode attention never reached the decode kernel at all (head width 256 was
-not in the supported set) and ran on 8 blocks of a 64-CU card. With that fixed
-and the key range split across blocks, context costs almost nothing:
+The 0.8B previously lost decode rate as context grew because its decode
+attention never reached the decode kernel (head width 256 was unsupported) and
+ran on 8 blocks of a 64-CU card. The table compares that pre-fix build to the
+fixed path; those absolute rates are historical, not current-tree results.
 
 | prompt ctx | decode, before | decode, after |
 |---|---|---|
@@ -433,22 +530,24 @@ chain by 1-6 f16 ULP in one head's attention output with the cache row proven
 bit-identical, so that shape keeps the fallback (see docs/TODO.md). A
 shape the chain cannot express keeps the separate three launches.
 
-### MoE: the residency budget, not the kernels
+### MoE: the residency budget, not the kernels (historical cache-size A/B)
 
-`Qwen3-MoE-4x0.6B-2.4B` (Q4_K_M, 4 experts/layer, top-2) is **4.8x faster with
-a larger expert cache**, and nothing else:
+The following 16-token cache-size experiment records the earlier policy and is
+kept as a historical comparison; its 152.6 MiB automatic budget is not the
+current policy. On the current tree, the three-run `--bench` table above uses
+610 MiB for this file. In the older experiment, `Qwen3-MoE-4x0.6B-2.4B`
+(Q4_K_M, 4 experts/layer, top-2) was **4.8x faster with a larger expert cache**:
 
 | `--expert-cache-mb` | auto (152.6 MiB) | 256 | 1024 | 4096 |
 |---|---|---|---|---|
 | decode, 16 tok | 16.0 tok/s | 15.6 tok/s | **77.5 tok/s** | 78.7 tok/s |
 
-The default budget (152.6 MiB) holds ~28 of the layer's 112 expert rows while a
-token routes through 56 of them per step, so the hit rate is **0.0%** - 951
-loads and 925 evictions across 16 tokens, every expert weight re-fetched from
-host memory every step. Raising the budget past the ~600 MiB working set makes
-the paging disappear entirely, and 4096 MiB buys nothing further. The card has
-15.9 GiB free, so the budget was never the binding constraint - the default
-was.
+In that historical run the default budget held ~28 of the layer's 112 expert
+rows while a token routed through 56 of them per step, so the hit rate was
+**0.0%** - 951 loads and 925 evictions across 16 tokens. Raising the budget
+past the ~600 MiB working set made paging disappear there, and 4096 MiB bought
+nothing further. Current auto sizing is adaptive and the dated headline table
+above records what it selected on the present build.
 
 ### MoE warm startup (this build, this file)
 
@@ -474,6 +573,11 @@ One file on this box exercises it end to end: `G:/More-models/Qwen3.8-Distill-35
 (`qwen35moe`, 40 layers, 2048 embd, ff 512, 256 experts/layer top-8, Q2_K_XL, ~11.7 GB).
 Its companion `*.krakenexperts.json` is the ranking the warmup reads when present.
 
+This warmup record predates the shared host-memory ledger below and describes
+a deliberately requested capacity. Pageable buffers are now admitted lazily
+against the live reserve and shared ledger, so the planned WARM capacity is not
+an allocation guarantee.
+
 With the ranking read and `--ram-tier 6144` (6144 MiB VRAM budget + 6144 MiB WARM):
 
     [info ] expert warmup: using ...Qk2xl.gguf.krakenexperts.json (182 positions, routers-only, 10240 ranked pairs)
@@ -481,7 +585,7 @@ With the ranking read and `--ram-tier 6144` (6144 MiB VRAM budget + 6144 MiB WAR
             (6150 MiB read), VRAM +6553 experts (6143 MiB, 6553 slots); 3126 ms
 
 That warmup is well inside the 20 s ceiling. A full `--bench` (greedy, `--ctx 4096`, `--chunk 256`,
-256 decode tokens) on that warmed run then reported:
+up to 256 decode tokens) on that warmed run then reported:
 
     prefill        55 tokens in 1251.8 ms  (43.9 tok/s)
     decode         256 tokens in 10948.8 ms  (23.3 tok/s)
@@ -571,8 +675,16 @@ window when there is no `embed` marker to split on).
 
 ### `--expert-cache-mb` / `--expert-cache-slots` - MoE residency
 
-The auto budget already covers the whole routed expert set when it fits, so
-these are only needed to *pin it down* or to cap it deliberately.
+The auto budget covers the routed expert set when it fits in the live plan;
+these options let you set the byte budget or cap the resident slot count.
+Explicit budgets beyond free VRAM after reserve are refused with an actionable
+largest-fitting value. `--vram-cap-mb` and `--vram-tier` also bound the overall
+GPU memory plan; `--host-ram-mb` and `--ram-tier` constrain host-tier planning.
+The automatic GPU budget is planned from a 6 GiB cap, stepped up in 2 GiB
+increments when routed demand needs it, up to 14 GiB, then bounded by the live
+free-VRAM reading minus reserve. On the current Qwen3-MoE headline run the
+planner reported a 6 GiB cap and a 610.3 MiB expert pool because the routed set
+was smaller than the cap.
 
 ```sh
 # cap residency for a model whose experts exceed VRAM
@@ -585,8 +697,54 @@ kraken -m /g/More-models/Laguna-S-2.1-UD-Q4_K_M.gguf --expert-cache-slots 256
 kraken -m models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf --info | grep -E 'expert|moe'
 ```
 
-A **hit rate near 0%** means the working set does not fit - raise the budget.
-`loads` plateauing early and `evictions` staying flat is the healthy shape.
+A **hit rate near 0%** means the active working set does not fit - raise the
+budget if free VRAM permits. `loads` plateauing early and `evictions` staying
+flat is the healthy shape.
+
+The bytes the expert pool physically holds are printed too, and they are not
+the same number as logical resident bytes: `[stats ] expert-pool budget <b>
+committed <c> live <l> reusable <r> bytes; alloc <a> reuse <u> trim <t>
+guard-fallback <g> | release <m> mark(s) for <s> slice(s)`.
+`committed` is `live + reusable` in 256-byte-aligned device bytes, individual
+size-class cells rather than chunks of a fixed-size arena, so a `--expert-cache-mb`
+change really does move the physical commitment and a shrink trims free cells
+without touching one a kernel is still reading. `guard-fallback` counts the times
+a release mark could not be created and the pool fell back to draining the device
+before reuse - it should stay 0. The `release` tail is the release marks and the
+slices they covered: an eviction returns an expert's three slices in one call and
+issues **one** record for the burst, so a resident budget reads `3` slices per
+mark and `1` means `KRK_POOL_BURST=0` (the per-slice path, kept as the A/B arm).
+
+A reused cell is *ordered*, not waited for. Its previous reader is marked with an
+event recorded on the default stream at release, and the next write into that cell
+makes its copy stream `hipStreamWaitEvent` on that mark, so the copy cannot land on
+bytes still being read. This replaced a hand-out that asked the device whether the
+reader had retired: on a budget that forces a promotion per expert visit the answer
+is always "not yet", and the question cost a round trip - measured 46.9 us per cell,
+5560 cells, i.e. the whole of the `alloc` line in the expert-path split. Deferring
+it took `alloc` from 618.4 to 182.5 ms and decode up 11.3% at `--expert-cache-mb 16`
+(9/9 interleaved pairs, identical text). `KRK_POOL_HOST_WAIT=1` restores the old
+query-and-wait behaviour, which is the arm to compare against.
+
+The three slices of one eviction are released at the same stream point, so they
+share a single mark: measured on Qwen3-MOE-4x0.6B at 16 and 32 MiB, the `room` row
+(the release happens inside `make_vram_room`) falls **31% (9/9 interleaved
+order-balanced pairs at both budgets)** and the marks go from one per slice to one
+per burst. Decode is **NO DIFFERENCE** there - the row is ~18 ms of a ~3.2 s run -
+and a record costs ~2.5 us marginal in a busy step against the 29-31 us
+`kraken-bench` measures on a quiet queue, so this is a cleanup and not a win. The
+sharing is exact, not approximate: the releases in a burst are consecutive with
+nothing submitted between them. It must not go further than a burst, because
+`paged_publish_` makes the default stream wait on the copy stream while the copy
+stream waits on these marks.
+
+Active-expert staging (copy the next routed expert on a side stream while the
+current one's kernels run) is implemented and **off by default**; `KRK_ACTIVE_STAGE=1`
+turns it on, `KRK_STAGE_TIMING=1` adds the `[stats ] stage-timing` overlap line.
+It is output-identical, but on this box it does not pay: at a budget that forces a
+promotion per expert visit the step is ~75% promotion, and the copy (0.69-0.74 ms)
+is about twice the reader window it would hide behind (0.32-0.34 ms). Measured,
+with the A/B runs: [docs/AUDIT-active-expert-staging.md](docs/AUDIT-active-expert-staging.md).
 
 ### `--bench` - throughput and the honest wall clock
 
@@ -597,15 +755,18 @@ kraken -m models/Qwen3.5-0.8B.Q4_K_M.gguf --bench -n 64 --greedy
 Prefill and decode are timed separately. `--greedy` matters: the sampled path
 does the full host-side cut and is a different measurement.
 
-### `--expert-warm-mb` - pinned host tier for evicted experts (`--expert-l2-mb` is the old spelling, still accepted)
+### `--expert-warm-mb` - pageable host tier for experts (`--expert-l2-mb` is the old spelling, still accepted)
 
 ```sh
 kraken -m /g/More-models/GLM-4.7-Flash-Q4_K_M.gguf --expert-cache-mb 2048 --expert-warm-mb 8192
 ```
 
-Evicted experts demote to a page-locked host tier instead of going back to the
-GGUF mapping, so a re-promotion is a DMA rather than a file read. Costs host
-RAM; reports `promotions`/`demoted` in `--info`.
+WARM is pageable host RAM, not pinned memory. Cold read-throughs may be kept
+there, and a WARM expert promotes through a bounded pinned staging ring; ordinary
+VRAM eviction preserves an existing WARM copy without downloading it. Expert
+WARM shares live host-memory admission with KV WARM/COLD staging. The `--info`
+report shows WARM capacity/admissions, while the end-of-run report shows expert
+pool physical commitment separately from logical residency.
 
 ### `--draft` / `--draft-tokens` - greedy speculative decoding
 
@@ -635,7 +796,7 @@ The KV cache pages like the expert cache does: HOT slots in VRAM, WARM in host
 RAM, and an optional COLD spill directory past that.
 
 ```sh
-# long context on a small card: let the overflow page instead of refusing
+# long context on a small card: allow tier migration; insufficient staging fails safely
 kraken -m model.gguf --ctx 8192 --kv-hot-mb 512 --kv-warm-mb 4096
 
 # spill evicted pages to disk instead of recomputing them
@@ -643,15 +804,30 @@ kraken -m model.gguf --ctx 8192 --kv-cold-dir /kvcache
 ```
 
 Defaults are geometry-derived: `--kv-hot-mb 0` (default) takes the VRAM the
-weights leave free, and the WARM tier sizes itself to cover every KV-carrying
-layer unless a `--kv-cold-dir` exists to spill into - a page with nowhere to
-go would be DROPPED and its layer silently zero-filled (wrong text, not slow
-text), so the budget is only obeyed where a spill target exists. The cache is
-packed per layer, so a model with mixed KV widths loads, and it is inert when
-the whole cache fits: one flat allocation, exactly as before. Every run ends
-with `kv tiered: ... promoted ... evicted ... DROPPED pages` so a tiering
-configuration is never silent. `scripts/kv_tier_geometry_check.sh` checks the
-reservation against each model file's own header.
+weights leave free, and without a `--kv-cold-dir` WARM capacity is raised to
+cover every KV-carrying layer. The buffers are still allocated lazily and each
+one must pass the shared host-memory admission guard before use. If host memory
+is unavailable or a WARM/COLD restore cannot be read, KRAKEN refuses the
+forward and preserves retained KV bytes instead of zero-filling them. The
+OpenAI-compatible HTTP API reports this as HTTP 503 `resource_exhausted` with
+remediation in JSON or an SSE error event. A stream's HTTP status is fixed once
+the response opens. The cache is packed per layer, so mixed
+KV widths work, and it is inert when the whole cache fits: one flat allocation,
+exactly as before. Every run ends with `kv tiered: ... promoted ... evicted ...`
+statistics. At init the geometry may raise `--kv-warm-mb` so HOT + WARM can
+cover one pass when disk spill is unavailable; this is a slot capacity floor,
+not an eager allocation or a bypass of the live host-memory reserve. If even
+one staging page cannot be admitted, init or the later promotion fails safely.
+`scripts/kv_tier_geometry_check.sh` checks the reservation against each model
+file's own header.
+
+On generation failure due to KV resource refusal, the CLI exits as an error;
+the HTTP endpoints return status 503 with error type `resource_exhausted` and
+include the cause plus next steps (free host RAM, raise `--kv-hot-mb`, reduce
+`--ctx`, or configure a writable `--kv-cold-dir`). If the initial rollback
+fails before a stream opens, the server returns a JSON 503; if generation fails
+after opening the stream, it sends the resource error in an SSE event (the HTTP
+status can no longer change).
 
 ### `--hybrid-experts 1` - overflow experts on the host
 
@@ -816,14 +992,16 @@ byte budget. The policy is **LFU with aging**: every hit earns a counter, a hot
 counter pins the slot against eviction, and periodic decay releases pins when
 traffic moves on. Without a pin an expert goes to least-frequent, then oldest.
 
-Evicted experts are *demoted*, not thrown away, when you give the cache a second
-tier: `--expert-warm-mb N` (old spelling `--expert-l2-mb`) reserves N MiB of page-locked host memory that holds
-experts evicted from VRAM. Their next request becomes a DMA instead of a re-read
-of the file - a fault storm on a mapping thousands of times larger than the
-weights themselves. The LFU counter, the pin and the load order all survive the
-round trip, so a demoted expert is still the same expert when it comes back, and
-the two tiers are budgeted independently: VRAM holds what is about to be used,
-RAM holds what was just used.
+The second tier is inclusive **pageable host RAM**: `--expert-warm-mb N`
+(old spelling `--expert-l2-mb`) sets its per-tier capacity limit. Cold reads may
+land there before promotion, and VRAM eviction keeps any existing WARM copy
+without downloading it. A later demand promotes through a bounded pinned
+staging ring. This tier shares process-wide live host-memory admission with KV
+WARM and COLD staging; its configured size remains an upper bound, not a
+separate claim on all free RAM. Popularity history survives, but a pin promises
+VRAM residency and is released on eviction. Batched prefetch counts pending
+reservation bytes and never earns demand pins. The file remains the immutable
+COLD source.
 
 ```sh
 # cap resident expert memory (a 235B-A22B model on a 12 GB card)
@@ -832,7 +1010,7 @@ kraken --model Qwen3-235B-A22B-Q4_K_M.gguf --expert-cache-mb 8000 --prompt "Hi"
 # or bound it by slot count instead: one expert resident per layer
 kraken --model model.gguf --expert-cache-slots 48 --prompt "Hi"
 
-# keep evicted experts in page-locked host RAM instead of dropping them
+# keep read-through expert copies in pageable RAM; DMA uses bounded pinned staging
 kraken --model model.gguf --expert-cache-mb 4096 --expert-warm-mb 16384 --prompt "Hi"
 
 # see the geometry and the active budget
@@ -847,10 +1025,13 @@ sh ./scripts/fetch_moe_model.sh
 kraken --model ../Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf --cpu --info
 ```
 
-With no flag the budget is auto: 40% of free VRAM on the GPU, a fixed share of
-host memory on the CPU backend. The budget is a *soft* cap - at least one expert
-is always allowed, so even a 1-slot cache decodes correctly, just with a reload
-per step. Routing itself runs on the host (the logits are `[n_tok, n_expert]`),
+With no flag, the GPU expert budget follows the live VRAM policy and is bounded
+by model demand, the planned cap, and free VRAM after the reserve; it cannot
+claim VRAM already used by another process. The CPU backend uses a host-RAM
+fallback. A single required expert may exceed the pool's nominal limit so an
+inference step can run, but explicit `--expert-cache-mb` budgets that exceed
+live available room after reserve are refused at startup. `--expert-cache-slots`
+is a slot-count limit. Routing runs on the host (`[n_tok, n_expert]` logits),
 and the shared expert stays resident because there is only one.
 
 ### Formats

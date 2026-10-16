@@ -1,116 +1,171 @@
 #!/usr/bin/env python3
-"""expert_trace.py -- what the expert cache counters cannot tell you.
+"""Analyze KRK_TRACE_EXPERTS TSV without changing model routing.
 
-Reads the KRK_TRACE_EXPERTS dump (seq, layer, expert, tier) and reports the
-reuse-distance distribution: for every repeat use of an expert, how many
-acquires ago it was last used.
+Inter-access distance counts ALL intervening accesses. LRU stack distance
+counts DISTINCT other (layer, expert) keys; only the latter predicts an
+empty, equal-sized LRU cache. Neither predicts Kraken's LFU+aging policy.
+HOT and WARM replay below are independent inclusive equal-slot LRU tiers,
+not a simulation of byte budgets, model warmup, or the live replacement policy.
 
-That distance is the number the tier sizes hinge on.
-
-  distance <= HOT slots   -> the request is served by HOT, WARM never sees it
-  HOT slots < d <= HOT+WARM-> the request is served by WARM, NVMe is skipped
-  distance > both         -> the request is a COLD miss whatever we do
-
-So a workload whose distances all sit below the HOT capacity will report
-WARM hits near zero no matter how the WARM tier is tuned, and enlarging WARM
-cannot change that. The fix there is a bigger HOT tier, not a better WARM
-policy.
-
-Usage:  python3 tools/expert_trace.py expert_trace.tsv [--hot N] [--warm N]
+Usage: python3 tools/expert_trace.py trace.tsv --hot 64 --warm 256
+       python3 tools/expert_trace.py --selftest
 """
 import argparse
 import collections
 import sys
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("trace")
-    ap.add_argument("--hot", type=int, default=0,
-                    help="HOT slot count, for the served/missed split")
-    ap.add_argument("--warm", type=int, default=0,
-                    help="WARM expert count, for the served/missed split")
-    a = ap.parse_args()
-
-    layer, expert, tier = [], [], []
-    with open(a.trace) as f:
-        next(f, None)  # header
-        for line in f:
-            p = line.split()
-            if len(p) < 4:
+def load_trace(path):
+    records = []
+    with open(path, encoding="utf-8") as stream:
+        if stream.readline().strip().split("\t") != ["seq", "layer", "expert", "tier"]:
+            raise ValueError("expected TSV header: seq, layer, expert, tier")
+        for line_number, line in enumerate(stream, 2):
+            if not line.strip():
                 continue
-            layer.append(int(p[1]))
-            expert.append(int(p[2]))
-            tier.append(int(p[3]))
+            fields = line.split()
+            if len(fields) != 4:
+                raise ValueError("line %d: expected four integers" % line_number)
+            seq, layer, expert, tier = map(int, fields)
+            if seq != len(records) or layer < 0 or expert < 0 or tier not in (0, 1, 2):
+                raise ValueError("line %d: invalid sequence, key or tier" % line_number)
+            records.append((layer, expert, tier))
+    return records
 
-    n = len(layer)
-    if not n:
-        print("empty trace")
-        return 1
 
-    print("acquires      %d" % n)
-    tc = collections.Counter(tier)
-    print("  HOT  %6d (%.1f%%)" % (tc[0], 100.0 * tc[0] / n))
-    print("  WARM %6d (%.1f%%)" % (tc[1], 100.0 * tc[1] / n))
-    print("  COLD %6d (%.1f%%)" % (tc[2], 100.0 * tc[2] / n))
+def distances(keys):
+    """O(n log n) exact distinct-key stack distances via last-use Fenwick tree."""
+    tree = [0] * (len(keys) + 1)
 
-    # Reuse distance over the (layer, expert) key space the cache is keyed by.
-    last = {}
-    dist = []
-    for i in range(n):
-        k = (layer[i], expert[i])
-        p = last.get(k)
-        if p is not None:
-            dist.append(i - p)
-        last[k] = i
+    def add(index, delta):
+        index += 1
+        while index < len(tree):
+            tree[index] += delta
+            index += index & -index
 
-    print("\ndistinct (layer,expert) touched : %d" % len(last))
-    print("repeat uses                    : %d" % len(dist))
-    if not dist:
-        print("no reuse in this run -- every acquire is a first touch")
+    def prefix(index):
+        total = 0
+        while index:
+            total += tree[index]
+            index -= index & -index
+        return total
+
+    last, access, stack = {}, [], []
+    for index, key in enumerate(keys):
+        previous = last.get(key)
+        if previous is not None:
+            access.append(index - previous)
+            stack.append(len(last) - prefix(previous + 1))
+            add(previous, -1)
+        add(index, 1)
+        last[key] = index
+    return access, stack
+
+
+def replay_lru(keys, hot, warm):
+    """Independent inclusive tiers; every demand access touches both."""
+    h, w = collections.OrderedDict(), collections.OrderedDict()
+    counts = [0, 0, 0]
+    for key in keys:
+        tier = 0 if key in h else 1 if key in w else 2
+        counts[tier] += 1
+        for cache, capacity in ((h, hot), (w, warm)):
+            if not capacity:
+                continue
+            cache[key] = None
+            cache.move_to_end(key)
+            if len(cache) > capacity:
+                cache.popitem(last=False)
+    return counts
+
+
+def selftest():
+    cases = [([], 1, 2), (list("AAAA"), 1, 1), (list("ABA"), 1, 2),
+             (list("ABCABC"), 2, 3), (list("ABBBA"), 2, 0),
+             (list("ABCABC"), 3, 1), (list("ABAB"), 0, 0)]
+    for keys, hot, warm in cases:
+        access, stack = distances(keys)
+        naive = []
+        last = {}
+        for index, key in enumerate(keys):
+            if key in last:
+                naive.append(len(set(keys[last[key] + 1:index])))
+            last[key] = index
+        assert stack == naive, (keys, stack, naive)
+        expected = [0, 0, len(set(keys))]
+        for distance in stack:
+            expected[0 if distance < hot else 1 if distance < warm else 2] += 1
+        assert replay_lru(keys, hot, warm) == expected
+    assert distances(list("ABBBA")) == ([1, 1, 4], [0, 0, 1])
+    assert replay_lru(list("ABBBA"), 2, 0) == [3, 0, 2]
+    assert distances([(0, 1), (1, 1), (0, 1)])[1] == [1]
+    print("expert trace selftest: 10 cases passed (distance and replay)")
+
+
+def distribution(label, values):
+    if not values:
+        return
+    ordered = sorted(values)
+    print("\n%s" % label)
+    for p in (10, 25, 50, 75, 90, 99):
+        print("  p%-2d %8d" % (p, ordered[min(len(ordered) - 1, p * len(ordered) // 100)]))
+    print("  max %8d; mean %.1f" % (ordered[-1], sum(ordered) / len(ordered)))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("trace", nargs="?")
+    parser.add_argument("--hot", type=int, default=0, help="equal-sized HOT LRU slots")
+    parser.add_argument("--warm", type=int, default=0, help="independent inclusive WARM LRU slots")
+    parser.add_argument("--top", type=int, default=6, help="top active experts shown per layer")
+    parser.add_argument("--selftest", action="store_true")
+    args = parser.parse_args()
+    if args.selftest:
+        selftest()
         return 0
-
-    dist.sort()
-    def pct(p):
-        return dist[min(len(dist) - 1, int(p / 100.0 * len(dist)))]
-
-    print("\nreuse distance (acquires since last use of the same expert)")
-    print("  p10 %8d" % pct(10))
-    print("  p25 %8d" % pct(25))
-    print("  p50 %8d" % pct(50))
-    print("  p75 %8d" % pct(75))
-    print("  p90 %8d" % pct(90))
-    print("  p99 %8d" % pct(99))
-    print("  max %8d" % dist[-1])
-    print("  mean %8.1f" % (sum(dist) / float(len(dist))))
-
-    if a.hot:
-        print("\nserved-by split at HOT=%d, WARM=%d slots" % (a.hot, a.warm))
-        h = sum(1 for d in dist if d <= a.hot)
-        w = sum(1 for d in dist if a.hot < d <= a.hot + a.warm)
-        c = len(dist) - h - w
-        tot = float(len(dist))
-        print("  served by HOT  %6d (%5.1f%%)" % (h, 100.0 * h / tot))
-        print("  served by WARM %6d (%5.1f%%)" % (w, 100.0 * w / tot))
-        print("  COLD miss      %6d (%5.1f%%)" % (c, 100.0 * c / tot))
-        cap = a.hot + a.warm
-        within = sum(1 for d in dist if d <= cap)
-        print("  working set at that capacity: %.1f%% of repeats fit"
-              % (100.0 * within / tot))
-
-    # Per-layer cost, so a single expensive layer is visible.
-    per = collections.Counter(layer)
-    print("\nacquires per layer (top 10)")
-    for l, c in per.most_common(10):
-        print("  layer %-4d %6d" % (l, c))
-    cold = collections.Counter()
-    for i in range(n):
-        if tier[i] == 2:
-            cold[layer[i]] += 1
-    if cold:
-        print("\nCOLD misses per layer (top 10)")
-        for l, c in cold.most_common(10):
-            print("  layer %-4d %6d" % (l, c))
+    if not args.trace:
+        parser.error("a trace is required unless --selftest is used")
+    if min(args.hot, args.warm, args.top) < 0:
+        parser.error("capacities and --top must be nonnegative")
+    try:
+        records = load_trace(args.trace)
+    except (OSError, ValueError) as error:
+        print("invalid trace: %s" % error, file=sys.stderr)
+        return 1
+    if not records:
+        print("empty trace", file=sys.stderr)
+        return 1
+    keys = [(layer, expert) for layer, expert, _ in records]
+    tiers = collections.Counter(tier for _, _, tier in records)
+    print("acquires %d; distinct (layer,expert) %d" % (len(keys), len(set(keys))))
+    for tier, name in enumerate(("HOT", "WARM", "COLD")):
+        print("  observed %-4s %8d (%5.1f%%)" % (name, tiers[tier], 100 * tiers[tier] / len(keys)))
+    access, stack = distances(keys)
+    distribution("inter-access distance (all accesses since previous use)", access)
+    distribution("LRU stack distance (distinct other keys since previous use)", stack)
+    if args.hot or args.warm:
+        predicted = replay_lru(keys, args.hot, args.warm)
+        print("\nEmpty equal-slot LRU replay: HOT=%d, inclusive WARM=%d" % (args.hot, args.warm))
+        print("Not the live LFU/byte-budget policy; includes compulsory first touches.")
+        for name, count in zip(("HOT", "WARM", "COLD"), predicted):
+            print("  replay %-4s %8d (%5.1f%%)" % (name, count, 100 * count / len(keys)))
+    layers = collections.defaultdict(collections.Counter)
+    misses = collections.defaultdict(collections.Counter)
+    for layer, expert, tier in records:
+        layers[layer][expert] += 1
+        misses[layer][tier] += 1
+    print("\nPer-layer active set (ranking is descriptive, not a pin recommendation)")
+    print("layer accesses unique HOT WARM COLD top-share top-experts(id:accesses)")
+    for layer in sorted(layers):
+        counter = layers[layer]
+        top = sorted(counter.items(), key=lambda item: (-item[1], item[0]))[:args.top]
+        total = sum(counter.values())
+        print("%5d %8d %6d %6d %6d %6d %8.1f%% %s" % (
+            layer, total, len(counter), misses[layer][0], misses[layer][1], misses[layer][2],
+            100 * sum(count for _, count in top) / total,
+            " ".join("%d:%d" % pair for pair in top)))
+    print("\nTrace lacks request/engine IDs and tensor bytes: do not combine targets/drafters")
+    print("or infer byte budgets, per-request pins, prefill/decode cost, or disk bandwidth.")
     return 0
 
 

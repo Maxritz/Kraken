@@ -78,13 +78,18 @@ dtype is the whole question.
 
 | model | launches/step saved | share of ops | est. decode gain |
 |---|---|---|---|
-| SmolLM2-135M Q4_K_M | 28 of 243 | 11.5% | ~2.6% at 1.5 us/launch, ~5.4% at 3.1 |
+| SmolLM2-135M Q4_K_M | 28 of 243 | 11.5% | ~4.6% at 2.4 us/launch, ~6.0% at 3.1 |
 | Qwen3-MoE-4x0.6B Q4_K_M | 28 of 817 | 3.4% | ~0.4-1.0% |
 | Qwen3.5-0.8B Q4_K_M | 8 of 397 | 2.0% | ~0.4-0.9% |
 
-The band is this repo's measured marginal launch cost -- 1.5 us from SmolLM2's own
-residual fold (30 launches, +2.867%) up to 3.1 us from the GDN fold (54 launches,
-+6.084%) -- applied to a count, so treat it as a ranking, not a result. SmolLM2
+The band is this repo's measured marginal launch cost -- **re-measured 2026-10-11
+on the current build at 2.4-2.8 us** (SmolLM2's residual fold, 30 launches,
+-5.219% and its silu fold, 30 launches, -4.591%, 0/9 interleaved pairs each; the
+1.5 us lower end this table used to quote came from the same fold on an older
+build) up to 3.1 us from the GDN fold (54 launches, +6.084%) -- applied to a count,
+so treat it as a ranking, not a result. See
+`docs/AUDIT-quiet-vs-busy-primitives.md` for why the constant moved and which
+per-op figures are trustworthy. SmolLM2
 Q4_K_M is the one worth doing first: it is the largest share of a step and the
 band's lower end comes from that same model.
 

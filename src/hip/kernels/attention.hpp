@@ -861,7 +861,7 @@ inline void attention_decode(void *out, const void *q, const void *kcache,
 // separately — §2i checks exactly that.
 // ---------------------------------------------------------------------------
 
-template <int VPT>
+template <int VPT, bool DumpQ = false>
 __global__ void __launch_bounds__(kAttnDecThreads)
     attn_fused_decode_kernel(_Float16 *__restrict__ out,
                              const _Float16 *__restrict__ q,
@@ -874,7 +874,8 @@ __global__ void __launch_bounds__(kAttnDecThreads)
                              i64 n_head, i64 n_kv, i64 hd,
                              const i64 *__restrict__ pos0,
                              i64 pos_stride, const f32 *__restrict__ inv_freq,
-                             f32 rope_scale, f32 scale, f32 frac) {
+                             f32 rope_scale, f32 scale, f32 frac,
+                             _Float16 *qdebug = nullptr) {
     const i64 h = blockIdx.x;
     const i64 n_rep = n_kv > 0 ? n_head / n_kv : 1;
     const i64 hkv = n_rep > 0 ? h / n_rep : 0;
@@ -988,40 +989,38 @@ __global__ void __launch_bounds__(kAttnDecThreads)
             qp[e] = o.u;
         }
     } else {
-        // NeoX pairing: channel j rotates with j + rot (rope_kernel's neox
-        // arm, ia = i / ib = i + rot). The engine takes this arm only when
-        // rot == half, where the partner of j is j ^ half and sits in the
-        // same element slot of the lane half/VPT = 16 away, so one wave
-        // shuffle fetches it; pair index pj names the theta for both
-        // halves, exactly as the separate kernel indexes inv_freq.
-        const int poff = static_cast<int>(half / VPT);
-        _Float16 xv[VPT];
-#pragma unroll
-        for (int e = 0; e < VPT; e++) {
-            const i64 j = static_cast<i64>(lane) * VPT + e;
-            f32 x;
-            if (wq)
-                x = static_cast<f32>(nv(q[h * hd + j], qscale, wq[j]));
-            else
-                x = static_cast<f32>(q[h * hd + j]);
-            const f32 y = __shfl_xor(x, poff);
-            const i64 pj = j < half ? j : j - half;
-            f32 o = x;
-            if (pj < rot) {
-                const f32 theta = pf * inv_freq[pj];
-                f32 sn, cs;
-                __sincosf(theta, &sn, &cs);
-                o = j < half ? x * cs - y * sn : y * sn + x * cs;
+        // Full NeoX pairing: i with i + half. The backend refuses partial
+        // rotation because its partner index is i + rot, not i + half.
+        // One thread owns both outputs of a rotation pair, as in rope_kernel.
+        // Materialize the f16 row in LDS before repacking the attention lanes.
+        __shared__ _Float16 qr[128];
+        for (i64 i = tid; i < half; i += blockDim.x) {
+            f32 a = static_cast<f32>(q[h * hd + i]);
+            f32 b = static_cast<f32>(q[h * hd + i + half]);
+            if (wq) {
+                a = static_cast<f32>(nv(q[h * hd + i], qscale, wq[i]));
+                b = static_cast<f32>(nv(q[h * hd + i + half], qscale, wq[i + half]));
             }
-            xv[e] = static_cast<_Float16>(o);
+            const f32 theta = pf * inv_freq[i];
+            f32 sn, cs;
+            __sincosf(theta, &sn, &cs);
+            qr[i] = static_cast<_Float16>(a * cs - b * sn);
+            qr[i + half] = static_cast<_Float16>(a * sn + b * cs);
         }
+        __syncthreads();
 #pragma unroll
         for (int e = 0; e < VPT / 2; e++) {
             Pair o;
-            o.h[0] = xv[2 * e];
-            o.h[1] = xv[2 * e + 1];
+            o.h[0] = qr[lane * VPT + 2 * e];
+            o.h[1] = qr[lane * VPT + 2 * e + 1];
             qp[e] = o.u;
         }
+    }
+
+    if (DumpQ && warp == 0) {
+#pragma unroll
+        for (int e = 0; e < VPT / 2; ++e)
+            *reinterpret_cast<u32 *>(qdebug + h * hd + lane * VPT + 2 * e) = qp[e];
     }
 
     // (2) QK-norm + rope k into the cache and copy v beside it. One thread

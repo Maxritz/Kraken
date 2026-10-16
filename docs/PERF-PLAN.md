@@ -41,6 +41,14 @@ Every GB/s below is judged against 576-640, not against 710.
 
 ## 0c. Harness table (`kraken-bench --sweep`, marginal cost, launch floor 2.65 µs)
 
+> **2026-10-11: the launch floor is a band, not a constant, and this constant is
+> stale.** Re-measured on the current build: 2.85-3.05 us for `copy_act n=32` in a
+> quiet queue, **0.92 us** for the host-side enqueue of the same call into a busy
+> one, and **2.4-2.8 us** in-step for a call that also carries a memory pass (the
+> fold A/Bs on SmolLM2, 0/9 pairs each). The table below is raw kernel time and is
+> unaffected; only the normalization constant moved.
+> `docs/AUDIT-quiet-vs-busy-primitives.md` has the table and the method.
+
 These are per-shape raw kernel numbers with the launch and drain amortized out,
 and a host dot-product check on the first rows (`chk`), so a fast wrong answer
 cannot pass.

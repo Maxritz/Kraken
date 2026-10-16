@@ -1,0 +1,142 @@
+Quiet queue vs in-step: kraken-bench's per-op primitives, measured three ways
+=============================================================================
+2026-10-11. RX 9070 XT (gfx1201), HIP 7.16.26332. One session for every A/B in
+this file (the audit's own limitation: the quiet arms drift 20-30% between
+sessions and the alloc row halved since the previous one).
+
+########## 1. what the tool prints (build with the busy-queue arm) ##########
+
+$ ./build-hip/kraken-bench.exe
+device: AMD Radeon RX 9070 XT (gfx1201, RDNA4, 64 CU, wave32, WMMA gfx12)
+
+launch floor (copy_act n=32): 2.88 us per call
+
+pool primitives: event create+destroy 0.12 us | record 28.16 us | query 0.03 us |
+                 wait 0.07 us | record+query a pending event 39.54 us
+pool round trip (8 cells of 256 KiB, budget 2048 KiB): 18.75 us ready |
+                 24.14 us with a queued reader | alloc 11 reuse 816 trim 0
+pool burst (3 slices of 256 KiB, a queued reader): 24.53 us one mark |
+            68.41 us one record per slice | 102 vs 306 mark(s) for 612 slice(s)
+primitives, busy queue (host side, 512 x copy_act n=32 already issued):
+            record 0.32 us | copy 0.92 us per call, median of 8
+            [empty queue: record 28.16 | copy 2.88]
+
+A second plain run of the same binary, to show the drift on the quiet arms:
+  launch floor 2.85 | record 29.52 | query 0.03 | wait 0.07 | record+query 24.68
+  round trip 22.73 ready / 33.71 queued | burst 21.57 one mark / 74.10 per slice
+
+$ ./build-hip/kraken-bench.exe --gate
+launch floor (copy_act n=32): unresolvable at iters=2 (the per-call subtraction
+                              needs a deeper switch)
+[...] rc=0, 56 checks, 0 FAIL
+
+Before this build the gate printed `launch floor (copy_act n=32): -24.00 us per
+call` (and -21.50 us in an earlier one): with the switch at 2 the per-call
+subtraction is the difference of two single measurements and can come out
+negative, which the tool printed as a cost.
+
+########## 2. the busy-queue arm, and the version that did not work ##########
+
+First attempt, using time_calls like the other arms (a batch mean minus a cold
+call), depth 64:
+
+  primitives, queued (64 x copy_act n=32 ahead of every call):
+    record -12.82 us marginal | copy 1.55 us marginal [empty queue: record 29.52 | copy 2.88]
+
+A NEGATIVE marginal cost for a real operation. time_calls subtracts one cold call
+from the mean, and for a host-side enqueue the cold call is the expensive one, so
+the subtraction removes more than the quantity. The copy arm is fine because a
+kernel's cost scales with the queue; the record's does not. The arm was replaced
+with the direct one in section 1: fill the queue with 512 copies, time 64 calls,
+one drain per block, median of 8 blocks.
+
+########## 3. in-step, by switch A/B ##########
+
+Harness: scripts/kraken_sherlock_kernel_ab.sh, 9 interleaved pairs, order-balanced
+verdict, stdout md5 checked across arms.
+
+(a) launch count, SmolLM2-135M, ctx 512, n=64, prompt "The history of computing
+    is a history of abstraction" (md5 d6e2b2b3b0 in every run of both):
+
+  A = stock, B = KRK_FUSED_SILU=0   (op table: 243 -> 273 ops/step, +30 launches)
+    A 626-643 tok/s (1.6 ms/step) | B 589-612 tok/s (1.6-1.7 ms/step)
+    median -4.600%  MAD 1.025%  B faster 0/9
+    order-balanced -4.591%  -> REGRESSION, i.e. 30 extra launches cost 4.591%
+    of a 1.587 ms step = 72.9 us = 2.43 us per added call (which also carries a
+    memory pass: the fold removes the separate silu_mul kernel)
+
+  A = stock, B = KRK_ACC_GEMM=0     (op table: 243 -> 273 ops/step, +30 launches)
+    median -5.134%  MAD 0.914%  B faster 0/9
+    order-balanced -5.219%  -> 82.8 us / 30 = 2.76 us per added call (which also
+    carries the add_inplace pass)
+
+  Op counts are from `KRK_PROFILE=1` runs of the same commands (counts are exact;
+  the profiled ms are not usable and are not used):
+    stock                on each of the 243 ops
+    KRK_FUSED_SILU=0     on each of the 273 ops
+    KRK_ACC_GEMM=0       on each of the 273 ops
+
+(b) an explicit device drain per layer, Qwen3-MoE-4x0.6B (28 layers), default
+    expert budget, md5 995c6b60e7 in every run:
+
+  A = stock, B = KRK_ROUTER_SYNC=1  (hipDeviceSynchronize before each router read)
+    A 119.3-123.9 tok/s (8.1-8.4 ms/step) | B 83.3-84.6 tok/s (11.8-12.0 ms/step)
+    median -31.485%  MAD 1.283%  B faster 0/9
+    order-balanced -30.293%  -> 3.6 ms of an 8.4 ms step over 28 drains
+    = ~129 us per hipDeviceSynchronize
+
+(c) the release record, Qwen3-MOE-4x0.6B at --expert-cache-mb 16 and 32, n=64,
+    9 pairs each (from the burst-marks pass; full transcript in
+    traces/expert-pool-burst-marks-2026-10-11.txt):
+
+  A = KRK_POOL_BURST=0 (one record per slice), B = stock (one per burst)
+    7252 records removed (10878 -> 3626)
+    room row: 58.5 -> 39.7 ms (16 MiB), 59.0 -> 40.6 ms (32 MiB), 9/9 pairs
+    -> 18.6 ms / 7252 = 2.56 us per record in-step, against 28-31 us quiet
+
+########## 4. the engine rows the constants are supposed to explain ##########
+
+$ ./build-hip/kraken.exe -m models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf \
+    -p "The history of computing is a history of abstraction" -n 32 \
+    --ctx 512 --greedy --expert-cache-mb 16
+
+[info ] loaded Qwen3 MOE 4x0.6B 2.4B Writing Thunder (qwen3moe): 28 layers,
+         1024 embd, 16/8 heads, hd=128, ff=3072, vocab=151936
+[info ] expert cache: budget 16.0 MiB + WARM 610 MiB pageable, 4 experts x top-2
+[stats ] decode    32 tok in 1685.8 ms over 31 timed steps = 18.4 tok/s (54.4 ms/step)
+[stats ] expert-pool budget 16777216 committed 15777792 live 12238848 reusable
+         3538944 bytes; alloc 490 reuse 5024 trim 482 guard-fallback 0 |
+         release 1836 mark(s) for 5508 slice(s)
+[stats ] expert-path  read      0.0 ms | room     21.3 ms | alloc     91.1 ms |
+         xfer    872.0 ms | (promote total    985.0 ms)
+
+  alloc per cell      91.1 ms / (490 + 5024) = 16.5 us   [quiet round trip 18.8-33.7]
+  release per slice   21.3 ms / 5508 = 3.9 us (includes victim selection)
+  xfer bandwidth      1836 promotions x 5.8359 MiB (Q4_K gate/up + Q6_K down)
+                      = 11.24 GB / 0.872 s = 12.9 GB/s
+                      = 81% of the 15.9 GB/s the separate-handle reader measures,
+                      and 5% of the 240.9 GB/s the --floor arm reports (which is
+                      device-to-device and is not this row's ceiling)
+
+$ ./build-hip/kraken-bench.exe --floor --iters 50
+sum load-store overhead (excluding device-side work):  0.00 ms / 0.2 gigabyte-sec
+                                                        (240.9 GB/s, 4.35 us/run)
+
+########## 5. the log, so the next session does not re-derive it ##########
+
+  primitive                       quiet      busy(host)  in-step    factor
+  record on the default stream    28.2-30.6  0.32        2.56       11-12x over
+  launch, trivial copy_act n=32   2.85-3.05  0.92        2.43-2.76  1.0-1.2x for a
+                                                           call w/ a pass;
+                                                           ~3.3x over for an enqueue
+  record + query a pending event  24.7-46.9  -           46.9       1.0x (the one
+                                                           that was calibrated)
+  device drain                    not measured -         129        the wait arm
+                                                           (0.07 us) is 1000x off
+  pool round trip, 256 KiB cells  18.8-33.7  -           16.5       <=1.6x, either
+                                                           direction
+  --floor 1 MiB copy_act          240.9 GB/s -           n/a (D2D shelf, not H2D)
+  xfer in-step, H2D               -          -           12.9 GB/s  81% of 15.9
+
+  Rule: rank a fold by running the fold (one session, interleaved, order-balanced);
+  constants are for sizing a plan and are good to ~2x.

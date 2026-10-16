@@ -1,0 +1,335 @@
+# 2026-10-11 -- the launch floor on the step the expert path pays, the busy-queue
+# arm's self-proof, the per-layer plan fold, and the decode-path drains.
+#
+# All runs on the RX 9070 XT (gfx1201), Release build, one session, this box.
+
+================================================================================
+1. kraken-bench --gate -- the busy-queue arm now runs in the gate and proves itself
+================================================================================
+$ ./build-hip/kraken-bench.exe --gate          # rc=0, 0 FAIL
+
+busy-queue arm (device) -- the instrument's own control:
+    device left to drain: 1877 us deep vs 1684 us empty (launch 660 vs 177 us)
+    host enqueue/call: record 0.30 us | copy 0.97 us
+    device cost/call:  record 29.3 us | copy 10.3 us
+  ok   busy-queue a queue holding `depth` calls is measurably fuller than an empty one (device left to drain: launch arm)
+  ok   busy-queue and the same difference is visible per call
+  ok   busy-queue a record's device half is >=4x its host half (so the two figures a table might quote are not the same number)
+  ok   busy-queue the host enqueue is the same in both queue states (the queue changes what the device has left, not what the enqueue costs)
+  ok   busy-queue the instrument resolves the device cost per op (an empty queue: a launch vs a record, >=4x apart)
+
+# The arm was `if (!gate)` before this -- the correction it carries never ran in
+# the gate. It now runs there, and asserts the two things it can prove.
+
+$ KRK_TEST_QUEUE_NOPREISSUE=1 ./build-hip/kraken-bench.exe --gate   # rc=1
+busy-queue arm (device) -- the instrument's own control:
+    device left to drain: 1347 us deep vs 2067 us empty (launch 191 vs 188 us)
+    host enqueue/call: record 0.35 us | copy 0.71 us
+    device cost/call:  record 21.0 us | copy 3.0 us
+  FAIL busy-queue a queue holding `depth` calls is measurably fuller than an empty one (device left to drain: launch arm)
+  FAIL busy-queue and the same difference is visible per call
+  ok   busy-queue a record's device half is >=4x its host half ...
+  ok   busy-queue the host enqueue is the same in both queue states ...
+  ok   busy-queue the instrument resolves the device cost per op ...
+# exactly the two fullness checks, nothing else -- the red construction.
+
+================================================================================
+2. kraken-bench (plain, --depth 512) -- the arm's two halves, printed apart
+================================================================================
+$ ./build-hip/kraken-bench.exe --depth 512      # rc=0
+
+launch floor (copy_act n=32): 3.29 us per call                        <- time_calls
+queue state (512 x copy_act n=32 pre-issued): device left to drain 2042 us vs 1734 us empty (a launch: 583 vs 177 us)
+primitives, host enqueue per call: record 0.34 us | copy 0.90 us, median of 8 (empty queue: record 0.33 | copy 0.75)
+primitives, device cost per call: record 31.9 us | copy 9.1 us (empty queue: record 27.1 | copy 2.8)  [time_calls arms, which see only the dominant half: record 33.09 | copy 3.29]
+
+# What this says, and what it corrects:
+#   * the host enqueue of a record is 0.33-0.34 us in BOTH queue states, so the
+#     28.2-30.6 us the old "quiet" arm quoted was never a queue-state effect --
+#     time_calls' T(N)-T(1) lands on the DEVICE half (~27-32 us per marker),
+#     which is what it reports.
+#   * a launch's device half (2.8 us empty) is what time_calls reports for it
+#     (3.29 us), so one number was good enough for a launch and was not for the
+#     record.
+#   * the queue state moves the TAIL (177 -> 583 us on the launch arm), not the
+#     enqueue.
+
+================================================================================
+3. #3 per-layer MoE plan fold -- op counts (Qwen3-MoE-4x0.6B, 28 layers, top-2)
+================================================================================
+$ ./build-hip/kraken.exe --model models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf \
+    -p "The history of computing is a history of abstraction" -n 32 \
+    --temp 0 --greedy --ctx 512 --profile
+
+  arm on  (KRK_MOE_PLAN default): 649 ops/step   upload_i32 896   upload 1151   TOTAL 21665
+  arm off (KRK_MOE_PLAN=0):       705 ops/step   upload_i32 1846  upload 2101   TOTAL 23565
+  delta: 56 ops/step = 2 x (visits-1) per layer x 28 layers = 2 x 1 x 28
+  stdout md5 identical in both arms: 28fa19c3733a5cab9dc53611de71600c
+  (and equal to the acceptance hash AGENTS.md already records for this model)
+
+================================================================================
+3b. the fold's timing A/B (order-balanced, interleaved, no profiler)
+================================================================================
+$ KRK_AB_A_SWITCH="KRK_MOE_PLAN=0" KRK_AB_SWITCH="KRK_MOE_PLAN=1" KRK_AB_REPS=5 \
+  bash scripts/kraken_sherlock_kernel_ab.sh \
+    models/Qwen3-MoE-4x0.6B-2.4B-Q4_K_M.gguf "The history of computing..." 512 64
+
+  rep  order   arm  decode tok/s   ms/step   md5
+  1    A B     A    122.6           8.2       995c6b60e7
+  1    A B     B    131.0           7.6       995c6b60e7
+  2    B A     B    126.4           7.9       995c6b60e7
+  2    B A     A    115.2           8.7       995c6b60e7
+  3    A B     A    107.8           9.3       995c6b60e7
+  3    A B     B    121.2           8.2       995c6b60e7
+  4    B A     B    118.4           8.4       995c6b60e7
+  4    B A     A    112.2           8.9       995c6b60e7
+  5    A B     A    108.0           9.3       995c6b60e7
+  5    A B     B    128.0           7.8       995c6b60e7
+
+  paired deltas (B vs A, %): 6.852 9.722 12.430 5.526 18.519
+  median 9.722%   MAD 2.870%   B faster in 5/5 pairs
+  order split: A-first median 12.430% (3 pair(s))   B-first median 7.624% (2 pair(s))
+  order-balanced median 10.027%   <- the figure the verdict uses
+
+  verdict: WIN -- B is faster in 5/5 pairs by an order-balanced median
+           10.027% (raw 9.722%), which exceeds the spread of those pairs
+           (MAD 2.870%). Text identical.
+
+# 56 removed calls per step against ~8.5 ms/step is 1.6% if each call costs the
+# 2.4-2.8 us a launch fold costs. It measured 10.03%. The removed calls are not
+# launches: `upload`/`upload_i32` of a small host buffer are BLOCKING hipMemcpy
+# calls (src/hip/backend_hip.hip), so each visit's pair costs ~15 us of step, not
+# ~2 launches. That is the ranking error this run corrects.
+
+================================================================================
+4. #4 the per-token drain before the topk readback
+================================================================================
+$ KRK_AB_A_SWITCH="KRK_TOPK_SYNC=1" KRK_AB_SWITCH="KRK_TOPK_SYNC=0" KRK_AB_REPS=5 ...
+
+  SmolLM2-135M-Instruct.Q4_K_M.gguf
+    paired deltas (B vs A, %): 3.152 3.003 6.124 5.429 7.505
+    median 5.429%   MAD 2.076%   B faster in 5/5 pairs
+    order-balanced median 5.170%
+    verdict: WIN. Text identical.
+
+  Qwen3.5-0.8B.Q4_K_M.gguf
+    paired deltas (B vs A, %): 4.354 3.629 4.260 5.499 1.337
+    median 4.260%   MAD 0.631%   B faster in 5/5 pairs
+    order-balanced median 4.412%
+    verdict: WIN. Text identical.
+
+# KRK_TOPK_SYNC=1 is the OLD behaviour. The default now omits the drain, because
+# `download` is a blocking hipMemcpy on the same stream and already orders itself
+# behind the launch it is reading -- the same argument engine.cpp already records
+# for the router readback.
+
+================================================================================
+5. the 35B step (Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX, 256 experts)
+================================================================================
+$ ./build-hip/kraken.exe --model /g/More-models/Qwen3.8-Distill-35B-A3B-Coder-\
+    Abliterated-Q2KXL_ROCMFPX.gguf -p "..." -n 8 --greedy --ctx 512 \
+    --expert-warmup 1 --profile          # rc=0, 46 s wall (load 35.9 s)
+
+  decode    8 tok in 2299.8 ms over 7 timed steps = 3.0 tok/s (328.5 ms/step)
+  cache     3797 acquires | HOT hits 3661 (96.4%) | WARM hits 136 (3.6%) | COLD misses 0
+  expert-path  read 0.0 ms | room 0.0 ms | alloc 2242.4 ms | xfer 43.9 ms
+  last step: 2769 ops | host wall 214.508 ms | device spans 151.519 (70.6%)
+  upload_i32 320 over 8 tokens = 40/step over 40 layers = ONE PER LAYER   <- the fold
+  upload 933, gather_rows 3797, scatter_axpy 3797, gemm_group 3416
+
+# Under the profiler every number here is the recorder: 28848 pool allocations x
+# 2 records x ~27 us = ~1.5 s of the 2.24 s `alloc` row, and 328 ms/step is the
+# 10x the profiler costs a step (AGENTS.md). The op COUNT is the exact part, and
+# it carries the fold's signature: one upload_i32 per layer, where it used to be
+# one per expert visit (320/step).
+
+# The launch-floor A/B itself (A=KRK_MOE_GROUP=0, B=default) was NOT run: the
+# user stopped the unprofiled baseline run because the model thrashes the GPU
+# (the 11 GiB corpus against a 9.4 GiB expert budget makes the step
+# allocation-bound, ~10 runs x (13 s load + 16 s warm-up) is what hung). So the
+# 2965-op launch floor is still measured only by construction -- see AGENTS.md.
+
+================================================================================
+5b. the bounded unprofiled baseline of that step -- obtained, and the hang it caused
+================================================================================
+$ timeout 300 ./build-hip/kraken.exe     --model /g/More-models/Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf     -p "The history of computing is a history of abstraction" -n 8 --greedy     --ctx 256 --expert-warmup 1                      # rc=0, unprofiled, ran in background
+
+[info ] expert cache: budget 9600.0 MiB + WARM 9600 MiB pageable, 256 experts x top-8, 40 layers
+[warn ] expert warmup: ...krakenexperts.json does not record the size of the file it was
+         measured on (source_size 0) -- ignoring it
+[info ] expert warmup: even order, 1 rounds, 256 experts/layer deep; WARM 9600 MiB of 9600 MiB
+         in 10240 slots (9600 MiB read), VRAM +9480 experts (8888 MiB, 9480 slots);
+         33328 ms (stopped at the --expert-warmup-ms ceiling)
+[stats ] load      34629 ms, 1.76 GiB uploaded of 1.76 GiB weights in 729 ms = 2.4 GB/s
+[stats ] prefill   9 tok in 307.4 ms = 29.3 tok/s
+[stats ] decode    8 tok in 572.1 ms over 7 timed steps = 12.2 tok/s (81.7 ms/step)
+[stats ] device    15.92 GiB in use of 15.92 GiB (0.00 GiB free)      <-- the hang
+[stats ] expert-pool ... alloc 28848 reuse 0 trim 0 ...
+[stats ] experts   9600 MiB VRAM budget, 9616/10240 slots resident, 0 pinned | WARM 9600 MiB
+[stats ] cache     3797 acquires | HOT hits 3661 (96.4%) | WARM hits 136 (3.6%) | COLD misses 0
+[stats ] transfer  136 promotions, 128 MiB in 132.6 ms = 0.9 GB/s (975.1 us/expert) | ... 0 MiB read from the file
+[stats ] expert-path  read      0.0 ms | room      0.0 ms | alloc     64.8 ms | xfer     67.7 ms
+[stats ] warm      9600 MiB capacity, 100.0% in use | 0 admissions, 0 evictions, 0 rejects
+
+# The machine's display went down during this run (second occurrence; the user had
+# to recover it by hand). The card is left at 0.00 GiB free by the warm-up, so the
+# fault is the VRAM total, not the run length -- bounding it (timeout 300, -n 8)
+# and turning the profiler off did not prevent it.
+#
+# Consequences recorded in AGENTS.md and the audit:
+#   * "the step is allocation-bound" is FALSIFIED: promotion is ~9 ms of 81.7 ms.
+#   * 12.2 tok/s was taken on a card with 0.00 GiB free, so it is not a clean
+#     baseline for the model either.
+#   * the launch-floor A/B on this step is off the table on this box until the
+#     expert tier leaves VRAM headroom. Do not repeat this command.
+================================================================================
+6. the two guards, and the paths they are on
+================================================================================
+# A. a normal run must not trigger the reserve, and must not move a byte
+$ ./build-hip/kraken.exe --model models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf \
+    -p "The history of computing is a history of abstraction" -n 32 --temp 0 \
+    --greedy --ctx 512 --expert-warmup 1
+  rc=0   stdout md5 = 28fa19c3733a5cab9dc53611de71600c    (the recorded hash)
+  [info ] vram policy: 6.0 GiB cap (0.6 GiB already in use, 1.2 GiB demand,
+          15.3 GiB free of 15.9 GiB, 1.0 GiB reserved) -> expert budget 610.3 MiB
+  [info ] expert warmup: even order, 2 rounds, 4 experts/layer deep; WARM 610 MiB
+          of 610 MiB in 112 slots (610 MiB read), VRAM +112 experts (610 MiB, 112
+          slots); 481 ms                     <- no reserve stop, warm-up complete
+
+# B. the guard, forced (a reserve above what is free)
+$ KRK_VRAM_RESERVE_MB=16000 ./build-hip/kraken.exe ... --expert-warmup 1
+  rc=0   stdout md5 = 28fa19c3733a5cab9dc53611de71600c    (text unchanged)
+  [info ] expert warmup: ... VRAM +0 experts (0 MiB, 0 slots); 155 ms
+          (stopped at the VRAM reserve: 16000 MiB kept free of 16 MiB total)
+  [stats ] device    0.77 GiB in use of 15.92 GiB (15.16 GiB free)
+
+# C. the refusal, an explicit budget larger than the card
+$ ./build-hip/kraken.exe --model models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf \
+    -p x -n 4 --greedy --ctx 512 --expert-cache-mb 20000
+  rc=1
+  kraken: expert budget 20000 MiB does not fit: 16304 MiB of VRAM, 599 MiB
+  already in use, 1024 MiB reserved -> the largest budget this card can hold is
+  14681 MiB (--expert-cache-mb 14681)
+$ ./build-hip/kraken-server.exe --model ... --expert-cache-mb 20000
+  rc=1   kraken-server: expert budget 20000 MiB does not fit: ... 14681 MiB
+
+# Three defects surfaced while building these guards. Each one was a path that
+# had never been executed before this session.
+#   1. configure_expert_cache went from void to bool to carry the refusal, and
+#      its fall-through exit kept no `return` -- UB. The compiler reported 0
+#      errors, build_check.sh stayed green, dense models were FINE (they return
+#      early), every MoE run died with rc=3 and EMPTY stdout, and kraken-tests
+#      went 2927/2927 -> rc=1 with four groups dead. Fixed with the explicit
+#      `return true;` at the function's end (engine.cpp).
+#   2. the refusal path itself: `delete be; return 1;` freed the backend and then
+#      unwound past the engine, whose destructor releases buffers through that
+#      pointer -- SIGSEGV, rc=139, for a run whose whole job is to print one line.
+#      Both CLIs are `std::exit(1)` now.
+#   3. the intended one: the warm-up filled the tier to a budget chosen before the
+#      workspaces and the KV tier existed, ending at 0.00 GiB free. The reserve
+#      bounds it at promotion time, by asking the driver.
+
+# Final gates on the fixed binary: ninja no work to do; kraken-tests 2927/2927
+# rc=0; the tests-baseline check "no regression"; kraken-bench --gate rc=0 with 0
+# FAIL; coherence 3 coherent / 0 not; build_check.sh rc=0 (1 standing WARN).
+
+================================================================================
+7. the host-RAM twin, the headroom line, and the guard's own test
+================================================================================
+# The headroom line, on a DENSE model -- which sizes no expert tier at all, so
+# before this change it printed nothing about VRAM:
+$ ./build-hip/kraken.exe --model models/SmolLM2-135M-Instruct.Q4_K_M.gguf \
+    -p "The history of computing is a history of abstraction" -n 4 --greedy --ctx 256
+  rc=0
+  [info ] vram headroom: 15.57 GiB free of 15.92 GiB total, 1.00 GiB reserved
+          (KRK_VRAM_RESERVE_MB overrides)
+
+# The host-RAM staging guard, forced:
+$ KRK_RAM_RESERVE_MB=200000 ./build-hip/kraken.exe --model \
+    models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf -p "..." -n 8 --greedy --ctx 512 \
+    --expert-warmup 1
+  rc=0
+  [info ] expert warmup: even order, 0 rounds, 4 experts/layer deep; WARM 0 MiB of
+          610 MiB in 0 slots (0 MiB read), VRAM +0 experts (0 MiB, 0 slots);
+          0 ms (stopped at the host RAM reserve: 200000 MiB kept free)
+
+# ... and unforced, the same command must still fill the tier:
+  [info ] expert warmup: even order, 2 rounds, 4 experts/layer deep; WARM 610 MiB
+          of 610 MiB in 112 slots (610 MiB read), VRAM +112 experts (610 MiB, 112
+          slots); 649 ms
+
+# The guard decision is now testable without a device: include/krk/vram_guard.hpp
+# holds the reserves and the fit decision as pure arithmetic, and
+# test_expert_cache_byte_budget drives it.
+  [39/54] test_expert_cache_byte_budget                 33/33      48ms
+  2940/2940 checks passed        (was 2927/2927; the group went 20 -> 33 checks)
+# Its first version checked a message formatted in MiB with byte-scale inputs and
+# the suite failed it -- 32/33, the group FAILED -- which is the check earning its
+# keep rather than being decorative.
+
+# The busy-queue arm's fullness bound was also too tight: measured 583/177 = 3.3x
+# and 660/177 = 3.7x on a quiet machine, but 518/178 = 2.9x on a loaded one
+# against a 3.0x bound, so the gate flapped once. Now 2.0x with the ratio printed
+# (a queue that is not fuller reports 1.0x), and the red construction still fails
+# exactly the two fullness checks.
+
+================================================================================
+8. the refused startup, end to end -- and the check proved able to fail
+================================================================================
+# The class, made unlandable. A `static bool` falling off its end appended to a
+# clean src/json.cpp:
+$ ninja -C build-hip krk_core ; echo rc=$?
+  ...hipcc.exe ... -DNDEBUG -Werror=return-type -O3 -Wall -Wextra -Wshadow ...
+  C:/.../src/json.cpp:407:1: error: non-void function does not return a value in all
+  control paths [-Werror,-Wreturn-type]
+  rc=1
+# (file reverted; the next build is rc=0 with 0 error lines)
+
+# The suite's own arm, through the real Engine::init on the CPU backend, with the
+# card simulated -- the control first, so the refusal cannot pass vacuously:
+$ ./build-hip/kraken-tests --run-group 38
+  [info ] vram headroom: 4.00 GiB free of 4.00 GiB total, 1.00 GiB reserved
+  [info ] vram policy: 3.5 GiB cap (... 4.0 GiB free of 4.0 GiB, 1.0 GiB reserved)
+          -> expert budget 1024.0 MiB          <- the CONTROL initialized
+  (refused: expert budget 4096 MiB does not fit: 4096 MiB of VRAM, 0 MiB already in
+   use, 1024 MiB reserved -> the largest budget this card can hold is 3072 MiB
+   (--expert-cache-mb 3072))
+  [group test_expert_cache_byte_budget] 37/37 checks
+  rc=0
+
+# The same path through the CLIs, device-free (--cpu + the simulated card):
+$ bash scripts/vram_refusal_check.sh ; echo rc=$?
+  simulated card 2048 MiB, requested budget 2048 MiB
+  PASS   refused (kraken)                               rc=1, names the largest that fits
+  PASS   the refusal names a usable budget              1024 MiB
+  PASS   and that budget runs                           rc=0
+  PASS   the same budget on a large card runs           rc=0
+  PASS   refused (kraken-server)                        rc=1, names the largest that fits
+
+  4 arms, 0 failed
+  rc=0
+
+# Red construction 1: a card the budget fits. The refusal arm must fail, and the
+# generous-card arm must still pass -- otherwise the arm is just "rc=1 anywhere".
+$ KRK_CARD_MB=65536 bash scripts/vram_refusal_check.sh ; echo rc=$?
+  FAIL   refused (kraken)                               rc=0, expected rc=1 with a 'does not fit' refusal
+  FAIL   the refusal names a usable budget              no --expert-cache-mb <MiB> in the message
+  PASS   the same budget on a large card runs           rc=0
+  rc=1
+
+# Red construction 2: the segfault this check exists for. `std::exit(1)` in
+# main_cli.cpp replaced by the old `delete be; return 1;`:
+$ bash scripts/vram_refusal_check.sh ; echo rc=$?
+  FAIL   refused (kraken)                               CRASHED (rc=139), expected rc=1 with a 'does not fit' refusal
+       | kraken: expert budget 2048 MiB does not fit: 2048 MiB of VRAM, 0 MiB already
+       | in use, 1024 MiB reserved -> the largest budget this card can hold is 1024 MiB
+  rc=1
+# The refusal line printed and then the process died -- exactly the shape that made
+# this path invisible before, since a correct refusal and a fatal one print the same
+# thing. The fix was restored and the check is green again.
+
+# Note for the next patch: main_cli.cpp is CRLF (1187 lines), so a multi-line
+# anchor written with \n matches nothing and the patch no-ops silently. The red
+# construction above failed to apply the first time for exactly that reason, and the
+# "RED 2" run that followed was of an unpatched binary -- which read as a pass.
+

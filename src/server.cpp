@@ -319,7 +319,11 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
     GenerateResult r;
     std::lock_guard<std::mutex> lock(*mu_);
     if (!engine_->kv_rollback(0)) {
-        res = json_response(500, error_body("context rollback failed", "internal_error"));
+        res = json_response(
+            503, error_body("context rollback could not preserve KV history within the "
+                            "host-memory reserve; free host RAM, raise --kv-hot-mb, "
+                            "reduce --ctx, or configure a writable --kv-cold-dir",
+                            "resource_exhausted"));
         return true;
     }
 
@@ -339,11 +343,15 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
                     chunk_event(&st, JsonValue::object(), JsonValue(finish_name(r.finish)));
                 http_sse_event(conn, ev.dump());
             } else {
-                http_sse_event(conn, error_body("generation failed", "internal_error").dump());
+                const bool resource_error = r.finish == FinishError;
+                const std::string message = r.error.empty() ? "generation failed" : r.error;
+                http_sse_event(conn,
+                               error_body(message, resource_error ? "resource_exhausted"
+                                                                 : "internal_error").dump());
             }
             http_sse_end(conn);
         }
-        res.status = ok ? 200 : 500;
+        res.status = ok ? 200 : (r.finish == FinishError ? 503 : 500);
         res.content_type = "text/event-stream";
         report_request_time(r);
         return true;
@@ -351,7 +359,11 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
 
     const bool ok = engine_->generate(p, &r);
     if (!ok) {
-        res = json_response(500, error_body("generation failed", "internal_error"));
+        const bool resource_error = r.finish == FinishError;
+        const std::string message = r.error.empty() ? "generation failed" : r.error;
+        res = json_response(resource_error ? 503 : 500,
+                            error_body(message, resource_error ? "resource_exhausted"
+                                                               : "internal_error"));
         return true;
     }
     report_request_time(r);
