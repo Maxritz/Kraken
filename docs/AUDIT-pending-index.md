@@ -113,9 +113,13 @@ No commits, pushes, deployments or sibling-project edits were performed.
   by `kraken-bench --gate`'s expert-pool gate and the WARM-tier group (56/56).
 - README 9B/recurrent benchmark and verification workflow coverage, remaining
   stale historical tables/counts/line numbers and inventory updates.
-- Loaded HIP runtime 7.16.26332 differs from build SDK 7.16.26331. Build check
-  passes with warning; exact runtime pinning and quiet-machine performance
-  reruns remain prerequisites to claiming speed improvements.
+- ~~Loaded HIP runtime 7.16.26332 differs from build SDK 7.16.26331~~ **pinned
+  2026-10-17**: the SDK's own `amdhip64_7.dll`/`amd_comgr.dll`/`rocm_kpack.dll`
+  from `G:/ROCM10RT-gfx1201/bin` now sit beside the binaries in `build-hip/`
+  (the Oct 6 copies were a newer runtime staged over them), the CLI header
+  reads `HIP 7.16.26331` with no warning, and `build_check.sh` reports
+  **0 failed, 0 warnings**. Quiet-machine performance reruns remain a
+  prerequisite to claiming speed improvements.
 
 ## Excluded negatives
 
