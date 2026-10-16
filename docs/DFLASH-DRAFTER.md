@@ -483,3 +483,61 @@ first (a re-prefill-based rewind?), not a loader change.
    cheapest end-to-end trial of the newer drafter generation.
 3. ~~IQ3_XXS NaN~~ **closed** (residual storage scaling): the same file
    above decodes coherent text and carries this measurement.
+
+## 11. The starved decoder, localized: flat at every depth, plumbing healthy (2026-10-17)
+
+Same pairing and protocol as §2 (pinned runtime this time, `HIP 7.16.26331`),
+`-n 16 --greedy --ctx 512 --chunk 256 --expert-warmup 1`, prompt "The history
+of computing is a history of". Baseline reproduced exactly: **0/64 accepted,
+16 rounds, sampled-accept 0.0% of 16 scored proposals.**
+
+**`KRK_DFLASH_DEBUG=1` — every row of every block is a different scattered id
+at near-flat confidence.** Top-1 scores sit at 5.0-5.9 against a row mean of
+0.3-1.0 over the 100352-vocab: that is a nearly-uniform distribution with a
+small random wobble, not a prediction. The ids never repeat across rows or
+blocks (5685, 38754, 26706, 14860, 37941, 15147, ...), so this is neither §6's
+mask-id failure nor a *displaced* row -- a displaced row is SHARP on the
+neighbour position's token and would show top-1 gaps of 10+. One soft
+attractor exists (`26946` reappears across layers of consecutive blocks) but
+never dominates.
+
+**`KRK_DFLASH_PROBE=1` — no layer sharpens, and none is the culprit.** Row 1's
+readout through the same out_norm + head the final readout uses:
+
+```
+embed l=-1  top=[46837(4.68) 1389(4.50) 20524(4.46)] gap 0.19   <- mask row, no context yet
+post-l0     top=[84848(5.05) 20427(3.95) 26946(3.68)] gap 1.11
+post-l1     top=[26946(3.83) 30041(3.63)  4536(3.62)] gap 0.19
+post-l2     top=[26946(4.21)  6095(4.20)   957(3.89)] gap 0.02
+post-l3     top=[62894(4.27) 56783(4.21) 10816(4.11)] gap 0.06
+post-l4     top=[ 5685(5.59) 15934(5.29)  1916(5.16)] gap 0.30   <- final, as flat as embed
+```
+
+Every layer *reshuffles* the flat row into another flat row (gaps 0.02-1.1 at
+every depth); the 5-layer decoder contributes no usable mapping at any stage.
+The l=-1 row is byte-identical across blocks and positions -- expected for an
+embedding-only mask row, and it confirms the probe is not accidentally reading
+a context-carrying row.
+
+**The plumbing is healthy and stays excluded.** Capture `enc_out` rms is
+exactly 1 with range [-3.9, 4.1] every commit (contract scale works), the
+injected K is rms 1.00001, the KV self-check reports `maxabsdiff 0.0038`, the
+attention route puts 72.6% of its mass on context and 27.4% on block rows with
+sane K/V norms (v 3.25-3.69), and the gate rows print r0=1.0087,
+r1-r4=0.3999 (a uniform candidate-row gate -- recorded as an observation, not
+yet a defect).
+
+**Verdict.** The flatness is a property of the decoder's mapping, not of one
+layer and not of the capture/KV/mask/position plumbing (which §7 already
+excluded and this run re-excludes with fresh numbers). This is the
+checkpoint-pairing/basis-mismatch branch of C5: the drafter's weights do not
+align with this target's hidden-state basis, so a healthy input is mapped to
+noise. The cheapest next discriminator is the item already ranked second
+below: a DFlash2 head on its own Qwen3.8 pairing, to show the engine's dflash
+path produces sharp rows when the pairing is right -- then upstream reference
+logits for one block on THIS pairing decide the file.
+
+**Side note, recorded not diagnosed:** the first attempt of this protocol died
+at load with `[error] hipErrorLaunchFailure` inside the paging H2D
+`hipMemcpyAsync`, rc=127 with buffered stdout lost; a plain rerun and a
+debug rerun both completed rc=0. One occurrence, non-reproducing.

@@ -24,10 +24,17 @@ No commits, pushes, deployments or sibling-project edits were performed.
   alone cannot settle it. Need the exact model and bounded oracle run.
 - **C4 / G14:** host floating-point behavior changes when HIP is linked;
   reproduce current counts and bisect compiler/runtime/link initialization.
-- **C5 / F9-F28 DFlash:** proposer rows remain diffuse/zero acceptance;
-  inspect exact checkpoint pairing, feature norms/capture semantics, masks,
-  positions and upstream reference logits. Count proposed/verified/never-verified
-  work and remove feature download/upload round trips only after equivalence.
+- **C5 / F9-F28 DFlash:** proposer rows remain diffuse/zero acceptance, and
+  2026-10-17 localized WHERE: the 5-layer decoder never sharpens the mask row
+  at any depth (gaps 0.02-1.1 from embed through post-l4, flat final), while
+  capture scale, KV norms, the KV self-check, the attention route and the mask
+  id are all healthy -- so the plumbing stays excluded and the
+  checkpoint-pairing/basis-mismatch branch is what is left. Full probe data:
+  DFLASH-DRAFTER.md §11. Next discriminator: a DFlash2 head on its own Qwen3.8
+  pairing (proves the engine path can produce sharp rows at all), then upstream
+  reference logits for one block on this pairing. Count proposed/verified/
+  never-verified work and remove feature download/upload round trips only after
+  equivalence.
 - **Long Spark CPU coherence:** 160-token scalar arm timed out (120s).
   All 133 observed picks matched; no full long CPU pass asserted.
 - **TSAN:** listen descriptor race, reported GDN test lifetime/UAF, stale
