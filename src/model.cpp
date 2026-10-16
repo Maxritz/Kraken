@@ -1033,10 +1033,12 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     if (strcmp(fmt, spellings[0]) == 0 && !warned_bias) {
                         warned_bias = true;
                         KRK_WARN("router selection bias found as "
-                                 "exp_probs_b.bias (no ffn_ prefix); the engine "
-                                 "expected the prefixed spelling, so builds "
-                                 "before this one ran this model's expert "
-                                 "selection un-biased");
+                                 "exp_probs_b.bias (no ffn_ prefix) and APPLIED: "
+                                 "it shifts selection, not the mixing weights. "
+                                 "Builds before this loader accepted only the "
+                                 "prefixed ffn_exp_probs_b.bias spelling and "
+                                 "silently ran such a model's expert selection "
+                                 "un-biased");
                     }
                     break;
                 }

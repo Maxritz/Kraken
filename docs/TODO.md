@@ -336,18 +336,27 @@ path is no longer the suspect.
   MTP-DRAFTER.md §3, DFLASH-DRAFTER.md §3 and DIAG-decode-cpu.md F8. The MTP/DFlash
   losses were taken before this fix and ought to be re-quoted, but the loop that
   capped every drafter is now ~100% when it is the only problem.
-- **`kraken-bench --gate` still has no speculation arm** (DIAG-decode-cpu.md F20),
-  so an 8.9x speculative regression remains invisible to the gate suite. The
-  repo's own models make the arm cheap: `--draft <same file>` is a self-draft, so
-  the gate can assert accepted > 0 and text identical to plain.
-- **The router-bias warning text is now misleading.** `src/model.cpp` accepts
-  laguna's `blk.N.exp_probs_b.bias` spelling and uses it; the warning says the
-  engine "expected the prefixed spelling", which reads in a fresh log as a live
-  defect. It fires once per model by design -- reword it to say the file uses the
-  unprefixed spelling and that it was applied.
-- **A prefill `[stats]` line does not exist for the expert path.** The 28% figure
-  above is a decode figure; prefill's promotion cost is not separately reported,
-  and on a 256-row chunk it is the same DMA with 256x the rows behind it.
+- **`kraken-bench --gate` has a speculation arm now -- CLOSED 2026-10-17.** The
+  arm (F20) spawns the CLI twice on SmolLM2-135M (plain and `--draft` the same
+  file), reads stdout for the text and stderr for `[stats ] speculation N
+  rounds, A/B draft tokens accepted`, and asserts accepted > 0 and text
+  identical to plain. Measured: 7/8 accepted, gate rc=0. On Windows the spawn
+  must go through `call `: cmd /c strips the first and last quote of a command
+  that starts with one, which left the last redirect target unterminated --
+  rc=1 with both files empty and no error anywhere. A missing model or CLI is a
+  FAIL, not a skip, same as the gate's existing hard requirement on a device.
+- **The router-bias warning text -- CLOSED 2026-10-17.** It now says the file's
+  unprefixed `exp_probs_b.bias` spelling was found and APPLIED (shifting
+  selection, not the mixing weights), with the old silently-unbiased behaviour
+  named as historical context instead of reading as a live defect.
+- **A prefill `[stats]` line for the expert path -- CLOSED 2026-10-17.**
+  `ExpertCache` stage timers now accumulate per phase (prefill / decode /
+  neither), the engine marks the phase around every prefill and decode loop
+  (plain and both speculative generators, target and draft tiers together), and
+  the CLI prints `expert-path split  prefill: ... | decode: ...` under the
+  merged row. Measured on Qwen3-MoE-4x0.6B at `--expert-cache-mb 16`: prefill
+  70.7 ms + decode 896.9 ms = 967.6 ms, exactly the merged promote total, stdout
+  md5 `28fa19c37` unchanged (stats-only change).
 
 ## Closed / negative results
 

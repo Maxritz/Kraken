@@ -4015,6 +4015,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
     const i32 k = draft_tokens_;
 
     // ---- prompt prefill on both models ------------------------------------
+    expert_phase(ExpertCache::PhasePrefill);
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
         const i32 n = static_cast<i32>(
@@ -4040,6 +4041,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
     fetch_logits();
     draft.fetch_logits(true);
     *prefill_ms = prefill_timer.ms();
+    expert_phase(ExpertCache::PhaseDecode);
 
     Sampler sampler;
     sampler.reset(p.sampler);
@@ -4356,6 +4358,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
     // The target and its drafter advance together, chunk by chunk: forward()
     // captures the residual streams the fusion below reads, and commit() injects
     // them before the next chunk overwrites the capture buffer.
+    expert_phase(ExpertCache::PhasePrefill);
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
         const i32 n = static_cast<i32>(
@@ -4370,6 +4373,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
     }
     fetch_logits();
     *prefill_ms = prefill_timer.ms();
+    expert_phase(ExpertCache::PhaseDecode);
 
     Sampler sampler;
     sampler.reset(p.sampler);
@@ -4800,6 +4804,16 @@ std::string Engine::kv_resource_error() const {
            "host RAM, or configure a writable --kv-cold-dir";
 }
 
+// Attributes the expert tier's stage timers to the phase running now. The
+// report splits prefill from decode because the same promotion DMA behind a
+// 256-row prefill chunk is not the same cost as one behind a single decode
+// row, and the merged row cannot say which side a fix belongs on. The draft
+// engine's tier moves with the target's, so both are attributed together.
+void Engine::expert_phase(ExpertCache::Phase p) {
+    model_.experts().set_phase(p);
+    if (draft_) draft_->model_.experts().set_phase(p);
+}
+
 bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     if (!be_ || n_vocab_ <= 0) return false;
     *res = GenerateResult{};
@@ -4870,6 +4884,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     // that row, so it asks for the host copy and stays a faithful diff tool.
     const bool device_topk = p.sampler.greedy && p.debug_topk <= 0 &&
                             !p.sample_host;
+    expert_phase(ExpertCache::PhasePrefill);
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
         const i32 n = static_cast<i32>(
@@ -4885,6 +4900,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     fetch_logits(device_topk);
     if (expert_scan_) expert_scan_tokens_ += static_cast<i64>(ids.size());
     res->prefill_ms = prefill_timer.ms();
+    expert_phase(ExpertCache::PhaseDecode);
 
     Sampler sampler;
     sampler.reset(p.sampler);

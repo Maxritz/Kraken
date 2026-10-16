@@ -47,10 +47,16 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 using namespace krk;
 
@@ -1178,6 +1184,193 @@ bool floor_floor(Backend *be, int iters) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// speculation gate: a self-draft must accept tokens AND emit plain's text
+// ---------------------------------------------------------------------------
+//
+// DIAG-decode-cpu.md F20: an 8.9x speculative regression was invisible to the
+// gate suite because no arm ever ran `--draft`. The repo's own smallest model
+// makes the arm free of new artifacts: `--draft <the same file>` is a
+// self-draft, and the assertion a serving stack cares about is exactly two
+// facts -- accepted > 0 (the accept/rewind loop works) and the text identical
+// to plain (the verify loop changed nothing; at greedy the verifier pursues
+// argmax branches, so accepted tokens are bit-identical by construction).
+//
+// The arm spawns the CLI twice and reads stdout, which carries only the
+// banner and the generated text -- every [info]/[stats] line, including the
+// acceptance figure (`[stats ] speculation N rounds, A/B draft tokens
+// accepted`), is on stderr. A missing binary or model is a FAIL, not a skip:
+// this gate already refuses to run without a HIP device, and an arm that
+// never ran proves nothing on a box whose model corpus exists.
+
+// std::system encodes the child's status differently per platform: Windows
+// hands back the exit code, POSIX a wait status. Read both the same way.
+static int sys_exit(int rc) {
+#ifdef _WIN32
+    return rc;
+#else
+    if (rc == -1) return -1;
+    if (WIFEXITED(rc)) return WEXITSTATUS(rc);
+    return 128 + (WIFSIGNALED(rc) ? WTERMSIG(rc) : 0);
+#endif
+}
+
+static std::string slurp_file(const std::string &path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return {};
+    return std::string(std::istreambuf_iterator<char>(f),
+                       std::istreambuf_iterator<char>());
+}
+
+// stdout is the banner line plus the generated text. Drop the banner (both
+// arms name the same device, but the comparison should be about the answer)
+// and the CRs a Windows pipe leaves behind, so what remains is exactly the
+// text a coherence check would compare.
+static std::string spec_text_of(std::string s) {
+    if (s.rfind("KRAKEN", 0) == 0) {
+        const size_t nl = s.find_first_of("\r\n");
+        s = nl == std::string::npos ? std::string() : s.substr(nl + 1);
+        if (!s.empty() && s[0] == '\n') s.erase(0, 1);
+    }
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+        if (c != '\r') out.push_back(c);
+    return out;
+}
+
+static i64 gate_speculation(const char *self) {
+    const auto check = [](bool ok, const char *what) {
+        std::printf("  %s spec %s\n", ok ? "ok  " : "FAIL", what);
+        return ok ? 0 : 1;
+    };
+    const auto exists = [](const std::string &p) {
+        std::ifstream f(p, std::ios::binary);
+        return f.good();
+    };
+    const auto dir_of = [](const std::string &p) {
+        const size_t s = p.find_last_of("/\\");
+        return s == std::string::npos ? std::string(".") : p.substr(0, s);
+    };
+    const auto pick = [&](const std::vector<std::string> &c) {
+        for (const std::string &p : c)
+            if (exists(p)) return p;
+        return std::string();
+    };
+
+    const std::string sd = dir_of(self && *self ? self : "kraken-bench");
+    const std::string bin = pick({sd + "/kraken.exe", sd + "/kraken",
+                                  "build-hip/kraken.exe", "build-hip/kraken"});
+    const char *rel = "models/SmolLM2-135M-Instruct.Q4_K_M.gguf";
+    const std::string model = pick({rel, std::string("../") + rel,
+                                    std::string("../../") + rel,
+                                    sd + "/../" + rel, sd + "/../../" + rel});
+    if (bin.empty()) {
+        std::printf("  FAIL spec the kraken CLI is not beside the bench binary "
+                    "(searched kraken[.exe] in %s)\n", sd.c_str());
+        return 1;
+    }
+    if (model.empty()) {
+        std::printf("  FAIL spec %s not found: the arm cannot run, and an "
+                    "untested path is not a passing one\n", rel);
+        return 1;
+    }
+
+    const std::string tmp = [] {
+        const char *e = std::getenv("TMPDIR");
+        if (!e || !*e) e = std::getenv("TEMP");
+        if (!e || !*e) e = std::getenv("TMP");
+        return std::string(e && *e ? e : ".");
+    }();
+    const std::string stamp = std::to_string(static_cast<long long>(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    const auto run = [&](bool draft, std::string *out, std::string *err) {
+        const std::string o = tmp + "/kraken-spec-" + stamp +
+                              (draft ? "-d.out" : "-p.out");
+        const std::string e = tmp + "/kraken-spec-" + stamp +
+                              (draft ? "-d.err" : "-p.err");
+        std::string cmd = "\"" + bin + "\" -m \"" + model +
+                          "\" -p \"The capital of France\" -n 8 --greedy "
+                          "--ctx 512";
+        if (draft) cmd += " --draft \"" + model + "\"";
+        cmd += " > \"" + o + "\" 2> \"" + e + "\"";
+#ifdef _WIN32
+        // cmd /c strips the FIRST and LAST quote of a command line that
+        // starts with one, which would leave the last redirect target
+        // unterminated -- a parse error with both files empty and rc=1.
+        // `call` makes the line start with a word instead of a quote.
+        const std::string full = "call " + cmd;
+#else
+        const std::string full = cmd;
+#endif
+        const int rc = sys_exit(std::system(full.c_str()));
+        *out = slurp_file(o);
+        *err = slurp_file(e);
+        if (rc != 0) {
+            std::printf("       spawn rc=%d cmd: %s\n", rc, cmd.c_str());
+            if (err->empty()) {
+                std::printf("       stderr empty, stdout %zu byte(s)\n",
+                            out->size());
+            } else {
+                const size_t n = err->size() < 300 ? err->size() : 300;
+                std::printf("       stderr: %.*s\n", static_cast<int>(n),
+                            err->c_str());
+            }
+            return rc; // keep the files: they are the only evidence
+        }
+        std::remove(o.c_str());
+        std::remove(e.c_str());
+        return rc;
+    };
+    // `[stats ] speculation N rounds, A/B draft tokens accepted (x%)` -- read
+    // the A out of the A/B immediately before the phrase, so the check does
+    // not depend on the surrounding wording.
+    const auto acceptance = [](const std::string &err, i64 *acc, i64 *prop) {
+        const size_t at = err.find("draft tokens accepted");
+        if (at == std::string::npos) return false;
+        const size_t slash = err.rfind('/', at);
+        if (slash == std::string::npos || slash == 0) return false;
+        size_t b = slash;
+        while (b > 0 && err[b - 1] >= '0' && err[b - 1] <= '9') --b;
+        size_t a = slash + 1;
+        while (a < err.size() && err[a] >= '0' && err[a] <= '9') ++a;
+        if (b == slash || a == slash + 1) return false;
+        *acc = std::atoll(err.substr(b, slash - b).c_str());
+        *prop = std::atoll(err.substr(slash + 1, a - slash - 1).c_str());
+        return true;
+    };
+
+    std::string po, pe, so, se;
+    const int prc = run(false, &po, &pe);
+    const int src = run(true, &so, &se);
+    i64 bad = 0;
+    bad += check(prc == 0, "the plain run exits 0");
+    bad += check(src == 0, "the self-draft run exits 0");
+    const std::string plain = spec_text_of(po), drafted = spec_text_of(so);
+    bad += check(!plain.empty() && !drafted.empty(), "both runs produced text");
+    i64 acc = 0, prop = 0;
+    if (acceptance(se, &acc, &prop)) {
+        char what[160];
+        std::snprintf(what, sizeof what, "reports acceptance (%lld/%lld)",
+                      static_cast<long long>(acc), static_cast<long long>(prop));
+        bad += check(acc > 0, what);
+    } else {
+        bad += check(false, "the draft run reports its acceptance figure");
+    }
+    if (!plain.empty() && !drafted.empty()) {
+        bad += check(plain == drafted,
+                     plain == drafted
+                         ? "self-draft text is identical to plain"
+                         : "self-draft text differs from plain");
+    }
+    if (plain != drafted && !plain.empty() && !drafted.empty()) {
+        std::printf("       plain: %.70s\n", plain.c_str());
+        std::printf("       draft: %.70s\n", drafted.c_str());
+    }
+    return bad;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1303,6 +1496,8 @@ int main(int argc, char **argv) {
         failures += gate_expert_pool(be);
         std::printf("\nbusy-queue arm (device) -- the instrument's own control:\n");
         failures += gate_busy_queue(be, depth);
+        std::printf("\nspeculation arm (CLI self-draft):\n");
+        failures += gate_speculation(argv[0]);
     }
 
     // clean exit path only when every test group has returned.

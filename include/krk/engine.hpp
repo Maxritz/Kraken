@@ -381,6 +381,12 @@ private:
     // decode), or every row (speculative verification).
     bool forward(const i32 *toks, i32 n, i32 pos0, bool want_logits);
     bool forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode);
+    // Attributes the expert tier's stage timers to the phase the engine is
+    // running. Prefill and decode promotions are the same DMA behind different
+    // row counts, and the end-of-run report splits them apart
+    // (ExpertCache::set_phase). The draft engine's tier moves with the
+    // target's, so it is attributed to the same phase.
+    void expert_phase(ExpertCache::Phase p);
     // Runs the output head on one row of ws_x_ into ws_logits_.
     void head_compute(i32 row);
     // prism.hadamard fold: dst <- transform(src), see Backend::hadamard_act.

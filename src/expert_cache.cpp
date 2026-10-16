@@ -41,18 +41,24 @@ using krk::u8;
 
 // Adds the time it was alive to *acc. Four of these carve the expert path into
 // the parts that cost, so "promotion is 1.8 GB/s" can be answered with "the
-// copy is 7 GB/s and the room-making is the rest".
+// copy is 7 GB/s and the room-making is the rest". The optional second
+// accumulator is the prefill/decode phase twin: a stage inside prefill counts
+// into the merged row AND into the phase row, so the three phases sum to the
+// merged figure exactly.
 struct MsTimer {
     krk::f64 *acc;
+    krk::f64 *acc2;
     std::chrono::steady_clock::time_point t0;
-    explicit MsTimer(krk::f64 *a)
-        : acc(a), t0(std::chrono::steady_clock::now()) {}
+    explicit MsTimer(krk::f64 *a, krk::f64 *b = nullptr)
+        : acc(a), acc2(b), t0(std::chrono::steady_clock::now()) {}
     MsTimer(const MsTimer &) = delete;
     MsTimer &operator=(const MsTimer &) = delete;
     ~MsTimer() {
-        *acc += std::chrono::duration<krk::f64, std::milli>(
-                    std::chrono::steady_clock::now() - t0)
-                    .count();
+        const krk::f64 ms = std::chrono::duration<krk::f64, std::milli>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+        *acc += ms;
+        if (acc2) *acc2 += ms;
     }
 };
 
@@ -189,6 +195,8 @@ void ExpertCache::reset_counters() {
     room_ms_ = 0.0;
     alloc_ms_ = 0.0;
     xfer_ms_ = 0.0;
+    pf_promote_ms_ = pf_read_ms_ = pf_room_ms_ = pf_alloc_ms_ = pf_xfer_ms_ = 0.0;
+    dc_promote_ms_ = dc_read_ms_ = dc_room_ms_ = dc_alloc_ms_ = dc_xfer_ms_ = 0.0;
     active_staged_ = active_used_ = 0;
     active_wait_ms_ = 0;
 }
@@ -379,7 +387,7 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
         // path is unavailable.
         const void *mapped = t->data + static_cast<size_t>(expert) * per;
         try {
-            MsTimer t(&read_ms_);
+            MsTimer t(&read_ms_, phase_sink(&pf_read_ms_, &dc_read_ms_));
             if (!be_->read_host(p, mapped, per)) std::memcpy(p, mapped, per);
         } catch (...) {
             be_->release_host_pageable_budgeted(p);
@@ -430,13 +438,17 @@ bool ExpertCache::promote_to_vram(Slot &s, bool staged) {
         std::chrono::steady_clock::now();
     struct ClockOut {
         f64 *ms;
+        f64 *ms2; // prefill/decode phase twin, or null outside both
         std::chrono::steady_clock::time_point t;
         ~ClockOut() {
-            *ms += std::chrono::duration<f64, std::milli>(
-                       std::chrono::steady_clock::now() - t)
-                       .count();
+            const f64 took = std::chrono::duration<f64, std::milli>(
+                                 std::chrono::steady_clock::now() - t)
+                                 .count();
+            *ms += took;
+            if (ms2) *ms2 += took;
         }
-    } clock_out{&promote_ms_, t0};
+    } clock_out{&promote_ms_, phase_sink(&pf_promote_ms_, &dc_promote_ms_),
+                t0};
     if (!be_ || !s.in_host()) return false;
     size_t physical = 0;
     for (size_t slice : s.slice) if (slice) physical += be_->pooled_size(slice);
@@ -449,7 +461,7 @@ bool ExpertCache::promote_to_vram(Slot &s, bool staged) {
     // file goes out of its way to avoid.
     const size_t need = s.bytes;
     {
-        MsTimer t(&room_ms_);
+        MsTimer t(&room_ms_, phase_sink(&pf_room_ms_, &dc_room_ms_));
         make_vram_room(need);
     }
 
@@ -477,7 +489,7 @@ bool ExpertCache::promote_to_vram(Slot &s, bool staged) {
         if (!from[i]->present()) continue;
         void *p = nullptr;
         {
-            MsTimer t(&alloc_ms_);
+            MsTimer t(&alloc_ms_, phase_sink(&pf_alloc_ms_, &dc_alloc_ms_));
             p = be_->alloc_pooled(s.slice[i]);
         }
         if (!p) {
@@ -503,7 +515,7 @@ bool ExpertCache::promote_to_vram(Slot &s, bool staged) {
         nb++;
     }
     {
-        MsTimer t(&xfer_ms_);
+        MsTimer t(&xfer_ms_, phase_sink(&pf_xfer_ms_, &dc_xfer_ms_));
         if (staged) {
             s.ready = be_->upload_expert_staged(batch_dst, batch_src, batch_len, nb);
             s.staged = true;
@@ -732,7 +744,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     xtrace(layer, expert, 2);
 
     {
-        MsTimer t(&room_ms_);
+        MsTimer t(&room_ms_, phase_sink(&pf_room_ms_, &dc_room_ms_));
         make_vram_room(need);
     }
 
@@ -750,7 +762,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
         const size_t per = lens[i];
         if (!t || per == 0) continue;
         {
-            MsTimer tm(&alloc_ms_);
+            MsTimer tm(&alloc_ms_, phase_sink(&pf_alloc_ms_, &dc_alloc_ms_));
             dsts[i]->data = be_->alloc_pooled(per);
         }
         dsts[i]->type = t->type;
@@ -768,7 +780,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
         }
     }
     {
-        MsTimer t(&xfer_ms_);
+        MsTimer t(&xfer_ms_, phase_sink(&pf_xfer_ms_, &dc_xfer_ms_));
         be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
     }
 
@@ -905,7 +917,7 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
         }
     }
     {
-        MsTimer t(&read_ms_);
+        MsTimer t(&read_ms_, phase_sink(&pf_read_ms_, &dc_read_ms_));
         try {
             be_->read_host_batch(reqs.data(), static_cast<int>(reqs.size()));
         } catch (...) {

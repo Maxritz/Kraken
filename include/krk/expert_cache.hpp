@@ -222,6 +222,24 @@ public:
     f64 alloc_ms() const { return alloc_ms_; } // alloc_pooled: pool wait or malloc
     f64 xfer_ms() const { return xfer_ms_; }   // upload_paged_batch, host wait in
 
+    // The end-of-run split: how much of each stage ran inside PREFILL and how
+    // much inside DECODE. The merged rows above cannot say which side a fix
+    // belongs on, and the same DMA behind a 256-row prefill chunk is not the
+    // same cost as one behind a single decode row. `PhaseOther` is load-time
+    // warmup and prefetch, which is neither, so the three never double-count.
+    enum Phase { PhaseOther = 0, PhasePrefill = 1, PhaseDecode = 2 };
+    void set_phase(Phase p) { phase_ = p; }
+    f64 prefill_promote_ms() const { return pf_promote_ms_; }
+    f64 prefill_read_ms() const { return pf_read_ms_; }
+    f64 prefill_room_ms() const { return pf_room_ms_; }
+    f64 prefill_alloc_ms() const { return pf_alloc_ms_; }
+    f64 prefill_xfer_ms() const { return pf_xfer_ms_; }
+    f64 decode_promote_ms() const { return dc_promote_ms_; }
+    f64 decode_read_ms() const { return dc_read_ms_; }
+    f64 decode_room_ms() const { return dc_room_ms_; }
+    f64 decode_alloc_ms() const { return dc_alloc_ms_; }
+    f64 decode_xfer_ms() const { return dc_xfer_ms_; }
+
     // Zeroes the traffic counters and the stage timers WITHOUT touching
     // residency: the slots stay where they are, and so do their LFU counts.
     // The startup warmup earns promotions and file reads that belong to the
@@ -464,6 +482,20 @@ private:
     f64 room_ms_ = 0;        // wall time making VRAM room
     f64 alloc_ms_ = 0;       // wall time in alloc_pooled
     f64 xfer_ms_ = 0;        // wall time in the pageable -> VRAM batch copy
+    // Per-phase twins of the five timers above. Only PhasePrefill and
+    // PhaseDecode accumulate; PhaseOther (warmup, prefetch) touches neither.
+    f64 pf_promote_ms_ = 0, pf_read_ms_ = 0, pf_room_ms_ = 0,
+        pf_alloc_ms_ = 0, pf_xfer_ms_ = 0;
+    f64 dc_promote_ms_ = 0, dc_read_ms_ = 0, dc_room_ms_ = 0,
+        dc_alloc_ms_ = 0, dc_xfer_ms_ = 0;
+    Phase phase_ = PhaseOther;
+    // The phase bucket for a stage counter, or null outside prefill/decode so
+    // warmup time is not silently attributed to whichever phase ran next.
+    f64 *phase_sink(f64 *pf, f64 *dc) {
+        return phase_ == PhasePrefill ? pf
+             : phase_ == PhaseDecode  ? dc
+                                      : nullptr;
+    }
     u64 active_staged_ = 0, active_used_ = 0;
     f64 active_wait_ms_ = 0;
     u64 promotions_ = 0;

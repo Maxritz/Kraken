@@ -612,6 +612,29 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                  "alloc %8.1f ms | xfer %8.1f ms | (promote total %8.1f ms)\n",
                  ec.read_ms(), ec.room_ms(), ec.alloc_ms(), ec.xfer_ms(),
                  prom_ms);
+    // The same four stages split by phase. The merged row above cannot say
+    // which side a fix belongs on: a promotion inside a prefill chunk is the
+    // same DMA behind up to `--chunk` rows, a decode promotion is behind one,
+    // and load-time warmup is neither. Printed only when a phase ran, so a
+    // run with no promotion in one of them does not grow a line of zeros.
+    const f64 pf_prom = ec.prefill_promote_ms(), dc_prom = ec.decode_promote_ms();
+    if (pf_prom > 0.0 || dc_prom > 0.0) {
+        std::fprintf(out,
+                     "[stats ] expert-path split  prefill: read %7.1f | room %7.1f | "
+                     "alloc %7.1f | xfer %7.1f | promote %7.1f ms\n"
+                     "[stats ]                     decode: read %7.1f | room %7.1f | "
+                     "alloc %7.1f | xfer %7.1f | promote %7.1f ms\n",
+                     ec.prefill_read_ms(), ec.prefill_room_ms(),
+                     ec.prefill_alloc_ms(), ec.prefill_xfer_ms(), pf_prom,
+                     ec.decode_read_ms(), ec.decode_room_ms(),
+                     ec.decode_alloc_ms(), ec.decode_xfer_ms(), dc_prom);
+        const f64 other = prom_ms - pf_prom - dc_prom;
+        if (other > 0.5)
+            std::fprintf(out,
+                         "[stats ]                     other: %.0f ms of promote "
+                         "time outside both phases (load-time warmup/prefetch)\n",
+                         other);
+    }
     // The draft engine owns its OWN expert tier, and its budget is derived from
     // the free VRAM left after the target has already taken its share. On a
     // model whose routed set is bigger than the card that can come out at a
