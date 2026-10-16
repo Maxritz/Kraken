@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-11T02:45:22Z",
-  "recorded_commit": "b5bacae",
-  "totals": {"groups": 55, "passed": 2970, "run": 2970, "exit": 0},
+  "recorded_utc": "2026-10-16T18:32:17Z",
+  "recorded_commit": "ab6395a",
+  "totals": {"groups": 55, "passed": 2994, "run": 2994, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -53,12 +53,12 @@
     {"name": "test_speculative_decoding", "status": "pass", "passed": 22, "run": 22},
     {"name": "test_dflash_mask_guard", "status": "pass", "passed": 22, "run": 22},
     {"name": "test_json", "status": "pass", "passed": 41, "run": 41},
-    {"name": "test_http_server", "status": "pass", "passed": 37, "run": 37},
+    {"name": "test_http_server", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_par_pool_covers_every_block", "status": "pass", "passed": 1, "run": 1},
     {"name": "test_kv_tier_per_layer_widths", "status": "pass", "passed": 21, "run": 21},
     {"name": "test_kv_tier_no_kv_layers", "status": "pass", "passed": 11, "run": 11},
     {"name": "test_kv_tier_drop_vs_spill", "status": "pass", "passed": 17, "run": 17},
-    {"name": "test_kv_tier_host_reserve_refusal", "status": "pass", "passed": 16, "run": 16},
+    {"name": "test_kv_tier_host_reserve_refusal", "status": "pass", "passed": 31, "run": 31},
     {"name": "test_kv_tier_per_plane_cold_files", "status": "pass", "passed": 7, "run": 7}
   ]
 }
