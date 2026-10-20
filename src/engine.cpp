@@ -420,6 +420,18 @@ static void run_dequant_probe(Backend &be, const std::string &model_path) {
 bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     be_ = be;
     cfg_ = cfg;
+    // qwen4exp's loader reads its tensors (KRK_ARCH_ALLOW_EXPERIMENTAL=1), but
+    // the forward pass still runs a plain `x + f(norm(x))` residual: generating
+    // from that would decode fluent text that is not this model. Refuse until
+    // the hyper-connection mixer is wired, and say which stage it is.
+    if (model_.cfg().hc) {
+        if (err)
+            *err = "this file ('" + model_.cfg().arch +
+                   "') uses hyper-connections, which are loaded but not run yet "
+                   "(see docs/AUDIT-qwen4exp-support.md); generation is refused "
+                   "rather than run on a plain residual";
+        return false;
+    }
     // The activation-range counters are process-wide device state; zero them so
     // the line this run prints describes this run.
     be_->reset_activation_saturation();

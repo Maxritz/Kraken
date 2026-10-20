@@ -52,6 +52,8 @@
 #include "krk/engine.hpp"
 #include "krk/expert_cpu.hpp"
 #include "krk/gguf.hpp"
+#include "krk/hc.hpp"
+#include "krk/ple.hpp"
 #include "krk/http.hpp"
 #include "krk/json.hpp"
 #include "krk/quant.hpp"
@@ -7727,6 +7729,614 @@ static void test_expert_index_adapt() {
     }
 }
 
+static void test_hc_lanes() {
+    // 8-wide lanes so a hand computation fits in a comment. The real stack is
+    // 2560 x 4 (Qwen3.8-Flash-Next) through a 320 bottleneck; the arithmetic is
+    // the same at every width.
+    HcGeometry g;
+    g.n_embd = 8;
+    g.hc = 4;
+    g.low_rank = 3;
+    CHECK(g.lane_width() == 32,
+          "the wide residual is hc lanes of n_embd, not one of hc*n_embd");
+    CHECK(g.valid(), "four lanes through a 320-wide bottleneck is a valid stack");
+    HcGeometry one;
+    one.n_embd = 8;
+    one.hc = 1;
+    one.low_rank = 3;
+    CHECK(!one.valid(),
+          "hc == 1 is refused: the reference raises on it (nothing to mix)");
+    HcGeometry norank;
+    norank.n_embd = 8;
+    norank.hc = 4;
+    norank.low_rank = 0;
+    CHECK(!norank.valid(), "a zero low rank has no mixer");
+
+    // The centring rule. 2*sigmoid(0) is exactly 1.0f in f32 (0.5f is exact and
+    // 2*0.5f is exact), so an un-injected block is the identity on every lane.
+    // This is the difference between "residual + f(x)" and "half of it".
+    CHECK(hc_lane_weight(0.0f, 4) == 1.0f,
+          "injection 0 weights every lane at exactly 1");
+    bool in_range = true, rising = true;
+    f32 prev = hc_lane_weight(-20.0f, 4);
+    for (f32 v = -20.0f; v <= 20.0f; v += 1.0f) {
+        const f32 w = hc_lane_weight(v, 4);
+        if (!(w > 0.0f && w < 2.0f)) in_range = false;
+        if (w < prev) rising = false;
+        prev = w;
+    }
+    CHECK(in_range, "every lane weight stays inside (0, 2)");
+    CHECK(rising, "... and is monotone in the injection");
+    CHECK(hc_lane_weight(0.0f, 0) == 1.0f,
+          "an empty stack still reports the identity weight rather than NaN");
+
+    const i32 n = 3;
+    const size_t wide = static_cast<size_t>(n) * static_cast<size_t>(g.hc) *
+                        static_cast<size_t>(g.n_embd);
+    const size_t flat = static_cast<size_t>(n) * static_cast<size_t>(g.n_embd);
+    std::vector<f32> xn(wide), gate(wide), mixed(flat);
+
+    // ---- the identical-lane case, which is where the reference starts ------
+    // Every lane holds the same vector (hc copies of the embedding) and the
+    // gate is the same on every lane. Then the mix must be the scalar lane mean
+    // applied to that one vector -- not a lane 0 pass-through, not a sum.
+    for (i32 t = 0; t < n; t++) {
+        for (i32 c = 0; c < g.hc; c++) {
+            for (i32 e = 0; e < g.n_embd; e++) {
+                const size_t i = (static_cast<size_t>(t) * g.hc + c) *
+                                     static_cast<size_t>(g.n_embd) +
+                                 static_cast<size_t>(e);
+                xn[i] = 0.5f * static_cast<f32>(e + 1);
+                gate[i] = 0.25f * static_cast<f32>(e + 1);
+            }
+        }
+    }
+    hc_mix(mixed.data(), xn.data(), gate.data(), n, g);
+    f64 worst_equal = 0.0;
+    for (i32 t = 0; t < n; t++) {
+        for (i32 e = 0; e < g.n_embd; e++) {
+            const f32 sg = 1.0f / (1.0f + std::exp(-gate[static_cast<size_t>(t) *
+                                                            g.hc *
+                                                            g.n_embd +
+                                                        static_cast<size_t>(e)]));
+            const f32 want = xn[static_cast<size_t>(t) * g.n_embd +
+                                static_cast<size_t>(e)] * sg;
+            const f32 got = mixed[static_cast<size_t>(t) * g.n_embd +
+                                  static_cast<size_t>(e)];
+            worst_equal = std::max<f64>(worst_equal, std::fabs(got - want));
+        }
+    }
+    CHECK(worst_equal <= 2e-7,
+          "identical lanes mix to xn*sigmoid(gate) -- the mean of hc copies");
+
+    // ---- lane stride: only lane 0 carrying a value must give 1/hc of it ----
+    std::fill(xn.begin(), xn.end(), 0.0f);
+    std::fill(gate.begin(), gate.end(), 0.0f);
+    for (i32 t = 0; t < n; t++)
+        for (i32 e = 0; e < g.n_embd; e++)
+            xn[(static_cast<size_t>(t) * g.hc) * g.n_embd +
+               static_cast<size_t>(e)] = 4.0f;
+    hc_mix(mixed.data(), xn.data(), gate.data(), n, g);
+    // sigmoid(0) = 0.5, one lane of four holds 4 -> 4*0.5/4 = 0.5.
+    bool stride_ok = true;
+    for (i32 t = 0; t < n; t++)
+        for (i32 e = 0; e < g.n_embd; e++)
+            if (std::fabs(mixed[static_cast<size_t>(t) * g.n_embd +
+                                static_cast<size_t>(e)] - 0.5f) > 1e-7f)
+                stride_ok = false;
+    CHECK(stride_ok,
+          "a value in lane 0 only contributes 1/hc of itself, so the lane stride "
+          "is the mix's, not the flat row's");
+
+    // ---- combine: still identical before the first block output -----------
+    std::vector<f32> res(wide, 1.0f);
+    std::vector<f32> inject(static_cast<size_t>(n) * g.hc, 0.0f);
+    std::vector<f32> zeros(flat, 0.0f);
+    hc_combine(res.data(), zeros.data(), inject.data(), n, g);
+    bool untouched = true;
+    for (i32 t = 0; t < n; t++)
+        for (i32 c = 0; c < g.hc; c++)
+            for (i32 e = 0; e < g.n_embd; e++)
+                if (res[(static_cast<size_t>(t) * g.hc + c) * g.n_embd +
+                        static_cast<size_t>(e)] != 1.0f)
+                    untouched = false;
+    CHECK(untouched, "a zero block output leaves every lane exactly as it was");
+
+    hc_combine(res.data(), nullptr, inject.data(), n, g);
+    untouched = true;
+    for (f32 v : res)
+        if (v != 1.0f) untouched = false;
+    CHECK(untouched, "... and so does a null block output");
+
+    // Same lanes, a real block output, and an injection of 0: the weight is 1,
+    // so every lane moves by the same amount and they are STILL identical. This
+    // is the invariant the stack depends on: lanes only diverge when something
+    // lane-specific happens, and the first lane-specific thing is the injection.
+    std::vector<f32> out(flat);
+    for (size_t i = 0; i < flat; i++) out[i] = 0.25f * static_cast<f32>(i + 1);
+    hc_combine(res.data(), out.data(), inject.data(), n, g);
+    bool still_equal = true;
+    f64 div = 0.0;
+    for (i32 t = 0; t < n; t++) {
+        for (i32 e = 0; e < g.n_embd; e++) {
+            const f32 base = res[(static_cast<size_t>(t) * g.hc) * g.n_embd +
+                                static_cast<size_t>(e)];
+            for (i32 c = 0; c < g.hc; c++) {
+                const f32 v = res[(static_cast<size_t>(t) * g.hc + c) * g.n_embd +
+                                  static_cast<size_t>(e)];
+                div = std::max<f64>(div, std::fabs(v - base));
+                if (v != base) still_equal = false;
+            }
+        }
+    }
+    CHECK(still_equal, "with injection 0 the lanes stay bit-equal after a combine");
+    CHECK(div == 0.0, "... to the last bit, not just approximately");
+
+    // A lane-specific injection is what splits them, and the split is the
+    // weight the reference centres on 1.
+    std::vector<f32> res2(wide, 0.0f);
+    std::vector<f32> inj2(static_cast<size_t>(n) * g.hc);
+    for (size_t i = 0; i < inj2.size(); i++)
+        inj2[i] = static_cast<f32>(i % g.hc) * 4.0f; // 0, 4, 8, 12
+    hc_combine(res2.data(), out.data(), inj2.data(), n, g);
+    bool split = false;
+    for (i32 e = 0; e < g.n_embd; e++) {
+        const f32 a = res2[static_cast<size_t>(e)];
+        const f32 b = res2[static_cast<size_t>(g.n_embd) + static_cast<size_t>(e)];
+        if (a != b) split = true;
+    }
+    CHECK(split, "a lane-specific injection is what makes the lanes differ");
+    // And the same lane's two contributions obey the weight exactly.
+    const f32 w1 = hc_lane_weight(4.0f, g.hc);
+    CHECK(std::fabs(res2[static_cast<size_t>(g.n_embd)] -
+                    out[0] * w1) < 1e-6f,
+          "a lane's step is block_out * 2*sigmoid(inject/hc)");
+
+    // ---- per-lane norm ----------------------------------------------------
+    // gamma is [hc, n_embd]: lane 0 doubles its elements, lane 1 leaves them,
+    // lane 2 halves them, lane 3 zeroes them. The norm itself is within a lane,
+    // so a constant lane normalizes to 1.0 before the gamma.
+    std::vector<f32> gamma(static_cast<size_t>(g.hc) * g.n_embd);
+    for (i32 c = 0; c < g.hc; c++)
+        for (i32 e = 0; e < g.n_embd; e++)
+            gamma[static_cast<size_t>(c) * g.n_embd + static_cast<size_t>(e)] =
+                c == 0 ? 2.0f : (c == 1 ? 1.0f : (c == 2 ? 0.5f : 0.0f));
+    std::vector<f32> xn2(wide, 3.0f), normed(wide);
+    hc_norm_lanes(normed.data(), xn2.data(), gamma.data(), n, g, 1e-6f);
+    CHECK(std::fabs(normed[0] - 2.0f) < 1e-5f,
+          "a constant lane normalizes to 1 and then takes its own gamma (2x)");
+    CHECK(std::fabs(normed[static_cast<size_t>(g.n_embd)] - 1.0f) < 1e-5f,
+          "lane 1's gamma is 1");
+    CHECK(std::fabs(normed[2 * static_cast<size_t>(g.n_embd)] - 0.5f) < 1e-5f,
+          "lane 2's gamma is 0.5");
+    CHECK(normed[3 * static_cast<size_t>(g.n_embd)] == 0.0f,
+          "a zero gamma silences its lane rather than dividing by it");
+    // A gamma of all ones must leave a unit-RMS lane alone: this is the check
+    // that catches a lane stride read off the flat row.
+    std::vector<f32> ones(static_cast<size_t>(g.hc) * g.n_embd, 1.0f);
+    hc_norm_lanes(normed.data(), xn2.data(), ones.data(), n, g, 1e-6f);
+    CHECK(std::fabs(normed[3 * static_cast<size_t>(g.n_embd)] - 1.0f) < 1e-5f,
+          "with gamma 1 every lane normalizes the same way");
+}
+
+static void test_ple_hash() {
+    // A fixture where the hash is computable by hand: multipliers of 1 turn
+    // `mixed` into an xor of the window's token ids, and offsets of 0 leave the
+    // row as `mixed % vocab`. The real file's multipliers are large odd
+    // constants and its ranges are 20M-row slices of a 320M-row table.
+    PleConfig c;
+    c.ngram = 3;
+    c.heads_per_ngram = 8;
+    c.head_dim = 160;
+    c.conv_kernel = 4;
+    c.eos_token = 99;
+    c.multipliers = {1, 1, 1};
+    c.head_offsets.assign(16, 0);
+    c.head_vocab_sizes.assign(16, 1000000);
+    CHECK(c.valid(), "a 3-gram, 8-head-per-gram config is valid");
+    CHECK(c.n_heads() == 16,
+          "a 3-gram file has (3-1)*8 heads: one set per n-gram length");
+    PleConfig one = c;
+    one.ngram = 1;
+    CHECK(!one.valid(), "a 1-gram has no predecessor to hash with and is refused");
+    PleConfig short_offsets = c;
+    short_offsets.head_offsets.resize(8);
+    CHECK(!short_offsets.valid(),
+          "fewer head ranges than heads is refused, not read past");
+
+    // window is oldest-first: {10, 11, 12} means the current token is 12.
+    const i64 win[3] = {10, 11, 12};
+    i64 rows[16] = {0};
+    ple_rows(c, win, 3, rows);
+    // heads 0..7 hash the 2-gram (12, 11): 12 ^ 11 = 7
+    CHECK(rows[0] == (12 ^ 11), "the first head set hashes the 2-gram");
+    CHECK(rows[7] == (12 ^ 11), "... for every head in that set");
+    // heads 8..15 hash the 3-gram (12, 11, 10): 12 ^ 11 ^ 10 = 13
+    CHECK(rows[8] == (12 ^ 11 ^ 10), "the second head set adds the third token");
+    CHECK(rows[15] == (12 ^ 11 ^ 10), "... for every head in that set");
+    CHECK(rows[0] != rows[8],
+          "the two n-gram lengths land on different rows, so the sets are not "
+          "duplicates of each other");
+
+    // Per-head ranges are per HEAD, not one range for the table: give head 8 a
+    // vocab of 5 and an offset of 1000 and the row must move with it.
+    PleConfig ranged = c;
+    ranged.head_vocab_sizes[8] = 5;
+    ranged.head_offsets[8] = 1000;
+    ple_rows(ranged, win, 3, rows);
+    CHECK(rows[8] == 1000 + (13 % 5),
+          "a head's own vocab and offset decide its row (13 % 5 + 1000)");
+    CHECK(rows[9] == 13, "and its neighbours are unaffected");
+    bool in_range = true;
+    for (i32 h = 0; h < 16; h++) {
+        const i64 lo = ranged.head_offsets[static_cast<size_t>(h)];
+        const i64 hi = lo + ranged.head_vocab_sizes[static_cast<size_t>(h)];
+        if (rows[h] < lo || rows[h] >= hi) in_range = false;
+    }
+    CHECK(in_range, "every row lands inside its own head's range");
+
+    // An EOS predecessor cuts the window: nothing at or before it is read.
+    const i64 cut[3] = {10, 99, 12};
+    ple_rows(c, cut, 3, rows);
+    CHECK(rows[0] == (12 ^ 99), "a 2-gram over an EOS predecessor uses the EOS");
+    CHECK(rows[8] == (12 ^ 99 ^ 99),
+          "and the 3-gram pins everything older to EOS as well, so a sequence "
+          "never hashes across a boundary");
+
+    // A window shorter than the n-gram (the start of a sequence) reads EOS.
+    const i64 first[1] = {12};
+    ple_rows(c, first, 1, rows);
+    CHECK(rows[0] == (12 ^ 99), "before the sequence start the predecessor is EOS");
+    CHECK(rows[8] == (12 ^ 99 ^ 99), "... and so is the one before it");
+
+    // Determinism and sensitivity: same window, same rows; a different current
+    // token moves every head.
+    i64 again[16] = {0};
+    i64 base_rows[16] = {0};
+    ple_rows(c, win, 3, base_rows);
+    ple_rows(c, win, 3, again);
+    bool deterministic = true;
+    for (i32 h = 0; h < 16; h++)
+        if (again[h] != base_rows[h]) deterministic = false;
+    CHECK(deterministic, "the hash is a pure function of the window");
+    const i64 win2[3] = {10, 11, 13};
+    i64 moved[16];
+    ple_rows(c, win2, 3, moved);
+    bool all_moved = true;
+    for (i32 h = 0; h < 16; h++)
+        if (moved[h] == base_rows[h]) all_moved = false;
+    CHECK(all_moved, "a different current token moves every head's row");
+
+    // The real file's shape, from its own metadata: 3-gram, 8 per gram, 160
+    // wide, 16 heads, and 20,000,003-row slices.
+    PleConfig real;
+    real.ngram = 3;
+    real.heads_per_ngram = 8;
+    real.head_dim = 160;
+    real.conv_kernel = 4;
+    real.eos_token = 248044;
+    real.multipliers = {23703573157769LL, 20109073645365LL, 8052911324071LL};
+    real.head_offsets = {0, 20000003, 40000026, 60000059,
+                         80000106, 100000165, 120000228, 140000297,
+                         160000372, 180000453, 200000540, 220000633,
+                         240000732, 260000837, 280000948, 300001065};
+    real.head_vocab_sizes = {20000003, 20000023, 20000033, 20000047,
+                             20000059, 20000063, 20000069, 20000077,
+                             20000083, 20000091, 20000099, 20000107,
+                             20000113, 20000119, 20000131, 20000139};
+    CHECK(real.valid(), "the REAP-288 file's own PLE metadata is a valid config");
+    CHECK(real.n_heads() == 16, "... with its 16 heads");
+    i64 real_rows[16];
+    const i64 real_win[3] = {9707, 11, 220};
+    ple_rows(real, real_win, 3, real_rows);
+    bool real_in_range = true;
+    bool real_distinct = true;
+    for (i32 h = 0; h < 16; h++) {
+        const i64 lo = real.head_offsets[static_cast<size_t>(h)];
+        const i64 hi = lo + real.head_vocab_sizes[static_cast<size_t>(h)];
+        if (real_rows[h] < lo || real_rows[h] >= hi) real_in_range = false;
+        if (h > 0 && real_rows[h] == real_rows[h - 1]) real_distinct = false;
+    }
+    CHECK(real_in_range, "the real config's rows stay inside the 320M-row table");
+    CHECK(real_distinct, "... and the 16 heads gather 16 different rows");
+}
+
+// ---------------------------------------------------------------------------
+// qwen4exp (Qwen3.8-Flash-Next): the hyper-connection schema
+// ---------------------------------------------------------------------------
+
+static const char *kQ4TestPath = "kraken-q4-test.gguf";
+
+// A miniature qwen4exp: 2 layers, 4 hyper-connection lanes, every 2nd layer a
+// full-attention layer with a QSA indexer, a PLE module on layer 0 and a 288-
+// expert MoE shrunk to 4. Structurally the REAP-288 file's schema at 1/320 the
+// width, so the loader's geometry checks and the lane arithmetic are exercised
+// without 78 GiB of weights.
+static bool build_tiny_q4_model(const std::string &path, int hc_down_rows) {
+    const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
+    const int d_state = 8, n_k_head = 2, n_v_head = 4, conv_k = 4;
+    const int rope_dim = 4;
+    const int key_dim = n_k_head * d_state;      // 16
+    const int value_dim = n_v_head * d_state;    // 32
+    const int conv_dim = key_dim * 2 + value_dim; // 64
+    const int hc = 4, low_rank = 8;
+    const int wide = n_embd * hc;                 // 128
+    const int interval = 2;
+    const int n_layer = 2;
+    const int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32, n_expert = 4, vocab = 260,
+              ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int idx_h = 2, idx_dim = 4;
+    const int ple_dim = 4, ple_heads = 1, ple_rows = 8, ple_conv = 2;
+    const std::string arch = "qwen4exp";
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-q4-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_u32(arch + ".attention.value_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".rope.dimension_count", static_cast<u32>(rope_dim));
+    b.meta_i32_array(arch + ".rope.dimension_sections", {rope_dim / 2, 1, 1, 0});
+    b.meta_u32(arch + ".ssm.conv_kernel", static_cast<u32>(conv_k));
+    b.meta_u32(arch + ".ssm.state_size", static_cast<u32>(d_state));
+    b.meta_u32(arch + ".ssm.time_step_rank", static_cast<u32>(n_v_head));
+    b.meta_u32(arch + ".ssm.group_count", static_cast<u32>(n_k_head));
+    b.meta_u32(arch + ".ssm.inner_size", static_cast<u32>(value_dim));
+    b.meta_u32(arch + ".full_attention_interval", static_cast<u32>(interval));
+    b.meta_u32(arch + ".expert_count", static_cast<u32>(n_expert));
+    b.meta_u32(arch + ".expert_used_count", 2);
+    b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
+    b.meta_u32(arch + ".expert_shared_feed_forward_length", static_cast<u32>(n_ff_sh));
+    // The three pieces that make this family what it is.
+    b.meta_u32(arch + ".hyper_connection.count", static_cast<u32>(hc));
+    b.meta_u32(arch + ".hyper_connection.low_rank", static_cast<u32>(low_rank));
+    b.meta_u32(arch + ".attention.indexer.head_count", static_cast<u32>(idx_h));
+    b.meta_u32(arch + ".attention.indexer.key_length", static_cast<u32>(idx_dim));
+    b.meta_u32(arch + ".attention.indexer.top_k", 16);
+    b.meta_i32_array(arch + ".attention.compress_ratios", {0, 2});
+    b.meta_i32_array(arch + ".ple.layers", {0});
+    b.meta_u32(arch + ".ple.ngram_size", 2);
+    b.meta_u32(arch + ".ple.heads_per_ngram", static_cast<u32>(ple_heads));
+    b.meta_u32(arch + ".ple.conv_kernel", static_cast<u32>(ple_conv));
+    b.meta_u32(arch + ".ple.eos_token_id", 258);
+    b.meta_u32(arch + ".embedding_length_per_layer_input", static_cast<u32>(ple_dim));
+    b.meta_i32_array(arch + ".ple.layer_multipliers", {1, 1});
+    b.meta_i32_array(arch + ".ple.head_offsets", {0});
+    b.meta_i32_array(arch + ".ple.head_vocab_sizes", {ple_rows});
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 3000));
+    // No output_norm: the head mixer carries it.
+    b.tensor_f32("hc_head_norm.weight", {u64(wide)}, ones(wide));
+    b.tensor_f16("hc_head_down.weight", {u64(wide), u64(low_rank)},
+                 vec(static_cast<size_t>(wide) * low_rank, 4100));
+    b.tensor_f16("hc_head_up.weight", {u64(low_rank), u64(wide)},
+                 vec(static_cast<size_t>(low_rank) * wide, 4300));
+
+    // The PLE table is [ple_dim, rows]: small here, tens of GB in the real file.
+    b.tensor_f32("per_layer_token_embd.weight", {u64(ple_dim), u64(ple_rows)},
+                 vec(static_cast<size_t>(ple_dim) * ple_rows, 4500));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        // Two hyper-connection mixers: before the token mixer and the FFN.
+        for (const char *which : {"hc_attn", "hc_ffn"}) {
+            const std::string q = p + which + "_";
+            b.tensor_f32(q + "norm.weight", {u64(wide)}, ones(wide));
+            // The bad arm narrows layer 0's attention mixer, so the refusal is
+            // reached with the right tensors in place -- a second tensor of the
+            // same name would leave the loader reading the first one.
+            const int down_in = (l == 0 && hc_down_rows > 0) ? hc_down_rows : wide;
+            b.tensor_f16(q + "down.weight", {u64(static_cast<u64>(down_in)),
+                                             u64(low_rank)},
+                         vec(static_cast<size_t>(down_in) * low_rank, 4700 + l * 100));
+            b.tensor_f16(q + "up.weight", {u64(low_rank), u64(wide)},
+                         vec(static_cast<size_t>(low_rank) * wide, 4900 + l * 100));
+            b.tensor_f16(q + "inject.weight", {u64(wide), u64(hc)},
+                         vec(static_cast<size_t>(wide) * hc, 5100 + l * 100));
+        }
+
+        if (((l + 1) % interval) != 0) {
+            b.tensor_f16(p + "attn_qkv.weight", {u64(n_embd), u64(conv_dim)},
+                         vec(static_cast<size_t>(n_embd) * conv_dim, 100));
+            b.tensor_f16(p + "attn_gate.weight", {u64(n_embd), u64(value_dim)},
+                         vec(static_cast<size_t>(n_embd) * value_dim, 200));
+            std::vector<f32> kern(static_cast<size_t>(conv_k) * conv_dim);
+            for (i64 c = 0; c < conv_dim; c++)
+                for (i64 j = 0; j < conv_k; j++)
+                    kern[static_cast<size_t>(c * conv_k + j)] =
+                        static_cast<f32>(1 + j * 10 + c * 100);
+            b.tensor_f32(p + "ssm_conv1d.weight", {u64(conv_k), u64(conv_dim)}, kern);
+            b.tensor_f32(p + "ssm_dt.bias", {u64(n_v_head)},
+                         vec(static_cast<size_t>(n_v_head), 400));
+            std::vector<f32> a(static_cast<size_t>(n_v_head));
+            for (int h = 0; h < n_v_head; h++)
+                a[static_cast<size_t>(h)] = -0.5f - 0.1f * h;
+            b.tensor_f32(p + "ssm_a", {u64(n_v_head)}, a);
+            b.tensor_f16(p + "ssm_alpha.weight", {u64(n_embd), u64(n_v_head)},
+                         vec(static_cast<size_t>(n_embd) * n_v_head, 500));
+            b.tensor_f16(p + "ssm_beta.weight", {u64(n_embd), u64(n_v_head)},
+                         vec(static_cast<size_t>(n_embd) * n_v_head, 600));
+            b.tensor_f32(p + "ssm_norm.weight", {u64(d_state)}, ones(d_state));
+            b.tensor_f16(p + "ssm_out.weight", {u64(value_dim), u64(n_embd)},
+                         vec(static_cast<size_t>(value_dim) * n_embd, 700));
+        } else {
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(2 * q_dim)},
+                         vec(static_cast<size_t>(n_embd) * 2 * q_dim, 100));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, 200));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, 300));
+            b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                         vec(static_cast<size_t>(q_dim) * n_embd, 400));
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+            b.tensor_f16(p + "indexer.q_proj.weight", {u64(n_embd), u64(idx_h * idx_dim)},
+                         vec(static_cast<size_t>(n_embd) * idx_h * idx_dim, 800));
+            b.tensor_f16(p + "indexer.k_proj.weight", {u64(n_embd), u64(idx_dim)},
+                         vec(static_cast<size_t>(n_embd) * idx_dim, 900));
+            b.tensor_f32(p + "indexer.q_norm.weight", {u64(idx_dim)}, ones(idx_dim));
+            b.tensor_f32(p + "indexer.k_norm.weight", {u64(idx_dim)}, ones(idx_dim));
+        }
+
+        if (l == 0) {
+            b.tensor_f16(p + "ple_key.weight", {u64(n_embd), u64(wide)},
+                         vec(static_cast<size_t>(n_embd) * wide, 5300));
+            b.tensor_f16(p + "ple_value.weight", {u64(n_embd), u64(n_embd)},
+                         vec(static_cast<size_t>(n_embd) * n_embd, 5500));
+            std::vector<f32> pk(static_cast<size_t>(ple_conv) * wide);
+            for (size_t i = 0; i < pk.size(); i++) pk[i] = 0.25f;
+            b.tensor_f32(p + "ple_conv1d.weight", {u64(ple_conv), u64(wide)}, pk);
+            b.tensor_f32(p + "ple_norm_key.weight", {u64(wide)}, ones(wide));
+            b.tensor_f32(p + "ple_norm_query.weight", {u64(wide)}, ones(wide));
+            b.tensor_f32(p + "ple_norm_conv.weight", {u64(wide)}, ones(wide));
+        }
+
+        // ---- MoE FFN, shared by both layer kinds ----
+        std::vector<f32> router(static_cast<size_t>(n_embd) * n_expert);
+        for (size_t i = 0; i < router.size(); i++)
+            router[i] = wv(static_cast<i64>(i) * 3 + 7);
+        b.tensor_f16(p + "ffn_gate_inp.weight", {u64(n_embd), u64(n_expert)}, router);
+        const size_t gsz = static_cast<size_t>(n_embd) * n_ff_exp;
+        const size_t dsz = static_cast<size_t>(n_ff_exp) * n_embd;
+        const size_t ne = static_cast<size_t>(n_expert);
+        std::vector<f32> gate(gsz * ne), up(gsz * ne), down(dsz * ne);
+        for (size_t e = 0; e < ne; e++) {
+            const i64 bump = static_cast<i64>(e) * 7919;
+            for (size_t k = 0; k < gsz; k++) {
+                gate[e * gsz + k] = wv(500 + static_cast<i64>(k) + bump);
+                up[e * gsz + k] = wv(900 + static_cast<i64>(k) + bump);
+            }
+            for (size_t k = 0; k < dsz; k++)
+                down[e * dsz + k] = wv(1300 + static_cast<i64>(k) + bump);
+        }
+        b.tensor_f16(p + "ffn_gate_exps.weight",
+                     {u64(n_embd), u64(n_ff_exp), u64(ne)}, gate);
+        b.tensor_f16(p + "ffn_up_exps.weight",
+                     {u64(n_embd), u64(n_ff_exp), u64(ne)}, up);
+        b.tensor_f16(p + "ffn_down_exps.weight",
+                     {u64(n_ff_exp), u64(n_embd), u64(ne)}, down);
+        b.tensor_f16(p + "ffn_gate_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                     vec(static_cast<size_t>(n_embd) * n_ff_sh, 1700));
+        b.tensor_f16(p + "ffn_up_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                     vec(static_cast<size_t>(n_embd) * n_ff_sh, 2100));
+        b.tensor_f16(p + "ffn_down_shexp.weight", {u64(n_ff_sh), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff_sh) * n_embd, 2500));
+        b.tensor_f32(p + "ffn_gate_inp_shexp.weight", {u64(n_embd)},
+                     vec(static_cast<size_t>(n_embd), 2700));
+    }
+    return b.write(path);
+}
+
+static void test_qwen4exp_schema() {
+    const std::string path = kQ4TestPath;
+    CHECK(build_tiny_q4_model(path, 0),
+          "a miniature qwen4exp writes: 4 lanes, PLE, QSA and a 4-expert MoE");
+    // The loader is reachable through a development switch only: the schema is
+    // refused for generation (Engine::init) until the mixer runs, and this test
+    // is about the tensors the loader reads.
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+    {
+        Backend *cpu = make_cpu_backend();
+        Model model;
+        std::string err;
+        const bool ok = model.load(*cpu, path, &err);
+        CHECK(ok, "the schema loads");
+        if (!ok) std::fprintf(stderr, "  (load: %s)\n", err.c_str());
+        if (ok) {
+            const ModelConfig &mc = model.cfg();
+            CHECK(mc.hc && mc.hc_n == 4 && mc.hc_low_rank == 8,
+                  "the hyper-connection geometry is read from the file");
+            CHECK(mc.no_out_norm,
+                  "qwen4exp declares no output norm (the head mixer carries it)");
+            CHECK(mc.gdn_gate_sigmoid,
+                  "its recurrent block gates with sigmoid, not silu");
+            CHECK(mc.ple && mc.ple_ngram == 2 && mc.ple_head_dim == 4,
+                  "the PLE geometry is read");
+            CHECK(mc.ple_layers.size() == 1 && mc.ple_layers[0] == 0,
+                  "... including which layer carries the module");
+            CHECK(mc.qsa && mc.qsa_ratio.size() == 2 && mc.qsa_ratio[1] == 2,
+                  "the per-layer compress ratio is read (layer 1 indexes at 2)");
+            CHECK(model.ple_table() != nullptr && model.ple_row_bytes() > 0,
+                  "the PLE table is a pointer into the mapping, not an upload");
+            CHECK(model.hc_head_down().present() && model.hc_head_up().present(),
+                  "the head mixer's bottleneck is loaded");
+
+            const LayerWeights &L0 = model.layers()[0];
+            const LayerWeights &L1 = model.layers()[1];
+            CHECK(L0.gdn && L1.gdn == false,
+                  "every (interval+1)th layer attends, the rest are delta net");
+            const i64 wide = static_cast<i64>(mc.n_embd) * mc.hc_n;
+            CHECK(L0.hc_attn_down.n_in == wide && L0.hc_attn_down.n_out == 8 &&
+                      L0.hc_attn_up.n_in == 8 && L0.hc_attn_up.n_out == wide &&
+                      L0.hc_attn_inject.n_out == mc.hc_n,
+                  "the attention mixer is [hc*n_embd -> low_rank -> hc*n_embd] and "
+                  "one injection weight per lane");
+            CHECK(L0.hc_ffn_down.n_in == wide && L0.hc_ffn_inject.n_out == mc.hc_n,
+                  "... and so is the FFN mixer");
+            CHECK(L0.hc_attn_norm != nullptr && L0.hc_ffn_norm != nullptr,
+                  "both mixers carry their grouped norm");
+            CHECK(!L0.attn_norm && !L0.ffn_norm,
+                  "there is no plain attn_norm/ffn_norm on this family");
+            CHECK(L0.ple && L0.ple_key.n_in == mc.n_embd && L0.ple_key.n_out == wide,
+                  "the PLE module is on layer 0, keyed at the wide stream");
+            CHECK(L1.qsa_ratio == 2 && L1.idx_q_proj.present() &&
+                      L1.idx_k_proj.present() && L1.idx_q_norm && L1.idx_k_norm,
+                  "the attention layer carries its QSA indexer");
+            CHECK(L0.qsa_ratio == 0 && !L0.idx_q_proj.present(),
+                  "and a recurrent layer carries none");
+        }
+        model.unload();
+        delete cpu;
+    }
+
+    // A hyper-connection matrix whose input width is not hc*n_embd must be
+    // refused with the geometry, not loaded and run.
+    {
+        const std::string bad = "kraken-q4-bad.gguf";
+        CHECK(build_tiny_q4_model(bad, 96), "a fixture with a short mixer writes");
+        Backend *cpu = make_cpu_backend();
+        Model model;
+        std::string err;
+        const bool ok = model.load(*cpu, bad, &err);
+        CHECK(!ok, "a mixer whose width disagrees with hc*n_embd is refused");
+        CHECK(err.find("hyper-connection") != std::string::npos,
+              "... and the error names the hyper-connection geometry");
+        model.unload();
+        delete cpu;
+        std::remove(bad.c_str());
+    }
+    std::remove(path.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
 #define TEST_GROUP(fn) {#fn, fn, nullptr},
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
@@ -7779,6 +8389,9 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_mtp_sidecar)
     TEST_GROUP(test_expert_warmup)
     TEST_GROUP(test_expert_index_adapt)
+    TEST_GROUP(test_hc_lanes)
+    TEST_GROUP(test_ple_hash)
+    TEST_GROUP(test_qwen4exp_schema)
     TEST_GROUP(test_cpu_expert_pool)
     TEST_GROUP(test_gdn_ops)
     TEST_GROUP(test_gdn_model_loads)
