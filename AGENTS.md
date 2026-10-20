@@ -442,6 +442,36 @@ code, the README, or `docs/`.
   loader now takes `qsa` from the file's own metadata** (`indexer.head_count` or
   `compress_ratios`), because a file without one otherwise cannot be refused or
   run -- it cannot even load. A half-declared indexer is still refused.
+- **The PLE block RUNS too, and it cost two wrong answers worth keeping.**
+  `ple_block` (src/engine.cpp) runs on the layers `ple.layers` names, BEFORE that
+  layer's mixer: host 64-bit hash (`ple_rows_for`) -> rows gathered straight out
+  of the mapping (`ple_gather`, never uploaded) -> key/value -> per-lane gate
+  (`ple_gate`) -> value broadcast (`lane_bcast_mul`) -> lane-normed -> dilated
+  depthwise conv (`conv1d_dw`, dilation = the n-gram size) -> `res_hc += gated +
+  silu(conv)`. The conv's window is the last `(kern-1)*ngram` rows that layer
+  produced, one per layer in `ple_state_`, which is what makes a chunked prefill
+  and a token-at-a-time decode agree.
+  (1) **The gathered row is `n_embd` wide, NOT `hc * n_embd`.** `ple_key`
+  [n_embd, hc*n_embd] widens it to the lane stack; `ple_value` [n_embd, n_embd]
+  does not. On the REAP file both are 2560 = 16 heads of 160, against streams of
+  10240, so the mistake looks plausible: the value gemm then reads 128 columns
+  out of a 32-wide matrix and its output is inf, which the lane norm turns into
+  NaN. That is the shape of it -- a wrong width is an out-of-bounds weight read,
+  not a crash.
+  (2) **A new Backend virtual with a no-op default is a silent wrong answer
+  unless the CPU reference implements it.** `lane_bcast_mul` shipped HIP-only;
+  the CPU run then used whatever the allocator left in the destination, which
+  read as a **flaky** test -- 12/12 with `KRK_THREADS=1`, ~1 run in 3 failing
+  with the pool live, because only then is the heap reused. A result that
+  changes with `KRK_THREADS` is a missing implementation, not a race.
+  Device half: `kraken-bench --hc` is **10 of 10**, with `conv-history` (a
+  3-token call against three 1-token calls carrying the sliced windows)
+  BIT-identical -- the chunk invariance of the convolution, on device.
+  `test_qwen4exp_ple` is 12/12: it recomputes the rows from the tokenized
+  prompt in the test (`(t ^ t-1) % 8` with the fixture's multipliers of 1) and
+  requires the engine's gathered rows to match, which fails 11/12 when the
+  window drops its predecessor; chunk 8 and chunk 1 must also decode the same
+  six tokens.
 
 ## Line endings (this bites constantly)
 

@@ -11,6 +11,7 @@
 
 #include "krk/backend.hpp"
 #include "krk/hc.hpp"
+#include "krk/ple.hpp"
 #include "krk/expert_cpu.hpp"
 #include "krk/kv_tier.hpp"
 #include "krk/draft_head.hpp"
@@ -496,6 +497,11 @@ public:
     // suite pins the identical-lane invariant through the REAL forward path
     // with this -- hc.cpp proves the arithmetic, this proves the wiring.
     const f32 *hc_debug_lanes(i32 *hc_out, i64 *width_out) const;
+    // Test hook, qwen4exp only: the PLE table rows the LAST forward pass hashed,
+    // as [n_tok, n_heads] (head fastest), or nullptr when the file carries no
+    // PLE block. The hash is host work on both backends, so this is a plain
+    // pointer into the engine's own staging buffer.
+    const i64 *ple_debug_rows(i32 *n_tok, i32 *n_heads) const;
     // Hash of every dumped activation stage of the LAST prefill, folded
     // per (stage, layer) in sorted-key order. Bit-exact: two prefills of
     // the same prompt at different --chunk values must return the same
@@ -596,6 +602,13 @@ private:
     // this mixer IS the final norm on this family.
     void hc_head_mix(i32 row, const f32 *norm_w, const QuantTensor &down,
                      const QuantTensor &up);
+    // ---- qwen4exp per-layer embedding (PLE) ------------------------------
+    // The n-gram block that runs on the layers `ple.layers` names, BEFORE that
+    // layer's hyper-connection mixer: hash -> mmap'd table rows -> key/value ->
+    // per-lane gate -> dilated depthwise conv -> residual into the lane stack.
+    // It is the only place this engine reads a weight straight out of the file
+    // mapping on the hot path, which is why the rows are computed on the host.
+    void ple_block(const LayerWeights &L, i32 l, i32 n, i64 pos0);
     // Chooses the expert residency budget from cfg_ and the device.
     // Chooses the device-side expert budget. Returns false with *err set when
     // an explicit --expert-cache-mb cannot fit the card, which is a refusal
@@ -838,6 +851,26 @@ private:
     void *ws_hc_lo_ = nullptr;  // [chunk, low_rank]
     void *ws_hc_inj_ = nullptr; // [chunk, hc]
     void *ws_hc_mix_ = nullptr; // [chunk, n_embd] the mixed row + its negation
+    // PLE workspaces. Null unless the file carries the block; `ple_state_` is
+    // the conv history, one [(kern-1)*dil, hc*n_embd] window per layer, which is
+    // what makes a chunked prefill and a token-at-a-time decode agree.
+    bool ple_active_ = false;
+    PleConfig ple_;
+    i64 ple_hist_ = 0;          // (kern - 1) * ngram rows of history
+    std::vector<i64> ple_seq_;  // the sequence's tokens, position-indexed
+    std::vector<i64> ple_rows_; // [chunk * n_heads] this pass's rows
+    i32 ple_rows_n_ = 0;        // how many tokens the last pass hashed
+    std::vector<f32> ple_emb_;  // host staging for the gather
+    std::vector<u16> ple_emb16_;
+    void *ws_ple_emb_ = nullptr;   // [chunk, n_heads*head_dim] gathered rows
+    void *ws_ple_key_ = nullptr;   // [chunk, hc*n_embd] key + its norm
+    void *ws_ple_qry_ = nullptr;   // [chunk, hc*n_embd] lane-normed query
+    void *ws_ple_gate_ = nullptr;  // [hc, chunk] per-lane gates (lane-major)
+    void *ws_ple_val_ = nullptr;   // [chunk, n_embd] value
+    void *ws_ple_gated_ = nullptr; // [chunk, hc*n_embd] value broadcast x gate
+    void *ws_ple_pad_ = nullptr;   // [hist + chunk, hc*n_embd] conv window
+    void *ws_ple_conv_ = nullptr;  // [chunk, hc*n_embd] conv output
+    void *ple_state_ = nullptr;    // [n_layer, hist, hc*n_embd] history
     void *ws_q_ = nullptr;    // [chunk, q_dim]
     // [chunk, q_proj] the raw query projection: Qwen3.5 packs a per-head
     // output gate behind the query, so its projection is twice as wide as the

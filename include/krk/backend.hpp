@@ -880,6 +880,54 @@ public:
     // the x factor).
     virtual void silu_act(void *x, i64 n) { (void)x; (void)n; }
 
+    // ---- per-layer embedding (PLE), qwen4exp ------------------------------
+    //
+    // The n-gram block on the layers `ple.layers` names. Its two pieces a plain
+    // elementwise op cannot express are the per-LANE dot product and the dilated
+    // depthwise convolution along the token axis.
+
+    // Per-lane gate:
+    //   s[t,c]       = (sum_e key[t,c,e] * qry[t,c,e]) / sqrt(ne)
+    //   out[c*n + t] = sigmoid(sign(s) * sqrt(max(|s|, 1e-6)))
+    // `key` and `qry` are token-major [n_tok, hc, ne] and both per-lane normed
+    // before they arrive. `out` is LANE-major [hc, n_tok] on purpose: a lane's
+    // column is then contiguous, which is what the gated value broadcast below
+    // reads one lane at a time.
+    //
+    // The signed square root is the reference's: it keeps the sign of the dot
+    // product while compressing its magnitude, so a near-orthogonal pair lands
+    // near 0.5 and an aligned one saturates the sigmoid.
+    virtual void ple_gate(void *out, const void *key, const void *qry,
+                          i64 n_tok, i64 hc, i64 ne) {
+        (void)out; (void)key; (void)qry; (void)n_tok; (void)hc; (void)ne;
+    }
+
+    // Depthwise causal convolution along the TOKEN axis:
+    //   out[t, c] = sum_k w[k*ch + c] * x[t + (kern-1-k)*dil, c]
+    // `x` is [(kern-1)*dil + n_tok, ch] -- the previous tokens' rows in front of
+    // this pass's -- and `out` is [n_tok, ch]. `w` is f32 [kern, ch], tap-major
+    // (Model::upload_conv1d already produces exactly that layout). `dil` is the
+    // n-gram size: the reference dilates by it so tap k looks k n-grams back.
+    //
+    // The history is the caller's: a chunked prefill and a token-at-a-time
+    // decode must see the same window, which is why this op takes the window
+    // rather than a ring.
+    virtual void conv1d_dw(void *out, const void *x, const void *w,
+                           i64 n_tok, i64 ch, i64 kern, i64 dil) {
+        (void)out; (void)x; (void)w; (void)n_tok; (void)ch; (void)kern; (void)dil;
+    }
+
+    // The gated value broadcast: one value row per token (shared by every lane)
+    // times that LANE's gate.
+    //   out[t,c,e] = value[t,e] * g[c*n_tok + t]
+    // `value` is token-major [n_tok, ne], `g` is lane-major [hc, n_tok] -- the
+    // layout ple_gate produces -- and `out` is token-major [n_tok, hc, ne], which
+    // is the layout the lane norm and the convolution both read.
+    virtual void lane_bcast_mul(void *out, const void *value, const void *g,
+                                i64 n_tok, i64 hc, i64 ne) {
+        (void)out; (void)value; (void)g; (void)n_tok; (void)hc; (void)ne;
+    }
+
     // Per-head broadcast product (laguna's attention output gate):
     //   x[t, h, i] *= g[t, h]     for i in [0, hd)
     // `x` is [n_tok, n_head*hd] and `g` is a dense [n_tok, n_head] row-major

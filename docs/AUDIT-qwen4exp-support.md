@@ -261,7 +261,12 @@ as `residual_lane += block_out * 2*sigmoid(inject_lane / 4)`. There is **no
    out of the mmap (the table is 320,001,536 x 160, i.e. tens of GB and must
    never be uploaded), then key/value projections, per-lane dot gate, and a
    dilated depthwise conv with per-layer history. Verified by a fixture whose
-   hashes and rows are computable in the test.
+   hashes and rows are computable in the test. **DONE and wired.** The row is
+   `n_embd` wide (`ple_key` widens it to hc*n_embd, `ple_value` keeps it narrow),
+   the conv's window is per-layer state, and `test_qwen4exp_ple` recomputes the
+   rows independently from the tokenized prompt and requires chunk 8 and chunk 1
+   to decode the same tokens. `kraken-bench --hc` proves the three device pieces
+   (10 of 10, with the convolution's chunk invariance bit-identical).
 4. **Recurrent block**: `gdn_forward` plus the `sigmoid` gate switch.
 5. **Full-attention block**: packed `[q|gate]`, per-head norms, and *dense*
    causal attention first (a superset of the QSA selection, so text is coherent),

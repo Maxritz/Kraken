@@ -587,6 +587,77 @@ public:
                         static_cast<const f32 *>(inject), static_cast<i32>(n_tok), g);
     }
 
+    // ---- per-layer embedding (PLE), qwen4exp ------------------------------
+    void ple_gate(void *out, const void *key, const void *qry, i64 n_tok,
+                  i64 hc, i64 ne) override {
+        f32 *o = static_cast<f32 *>(out);
+        const f32 *kf = static_cast<const f32 *>(key);
+        const f32 *qf = static_cast<const f32 *>(qry);
+        if (!o || !kf || !qf || n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        const f32 inv = 1.0f / std::sqrt(static_cast<f32>(ne));
+        par_for(n_tok * hc, 1, 4.0 * static_cast<f64>(n_tok * hc) * ne,
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const i64 t = i / hc;
+                        const i64 c = i % hc;
+                        const i64 base = (t * hc + c) * ne;
+                        f32 s = 0.0f;
+                        for (i64 j = 0; j < ne; j++) s += kf[base + j] * qf[base + j];
+                        s *= inv;
+                        const f32 mag =
+                            std::sqrt(std::fmax(std::fabs(s), 1e-6f));
+                        o[c * n_tok + t] =
+                            1.0f / (1.0f + std::exp(s < 0.0f ? mag : -mag));
+                    }
+                });
+    }
+
+    // out[t,c,e] = value[t,e] * g[c*n_tok + t]: one scalar per LANE broadcast
+    // across that lane's whole row. The CPU body is the reference the device
+    // kernel is checked against, and it has to exist: the base class body is a
+    // no-op, so a missing implementation leaves the destination holding
+    // whatever the allocator last put there -- measured as a test that passed
+    // single-threaded and failed 1 run in 3 with the pool live, because only
+    // then is the heap reused.
+    void lane_bcast_mul(void *out, const void *value, const void *g, i64 n_tok,
+                        i64 hc, i64 ne) override {
+        f32 *o = static_cast<f32 *>(out);
+        const f32 *vf = static_cast<const f32 *>(value);
+        const f32 *gf = static_cast<const f32 *>(g);
+        if (!o || !vf || !gf || n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        par_for(n_tok * hc, 1, 2.0 * static_cast<f64>(n_tok * hc) * ne,
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const i64 t = i / hc;
+                        const i64 c = i % hc;
+                        const f32 *src = vf + t * ne;
+                        f32 *dst = o + i * ne;
+                        const f32 w = gf[c * n_tok + t];
+                        for (i64 j = 0; j < ne; j++) dst[j] = src[j] * w;
+                    }
+                });
+    }
+
+    void conv1d_dw(void *out, const void *x, const void *w, i64 n_tok, i64 ch,
+                   i64 kern, i64 dil) override {
+        f32 *o = static_cast<f32 *>(out);
+        const f32 *xf = static_cast<const f32 *>(x);
+        const f32 *wf = static_cast<const f32 *>(w);
+        if (!o || !xf || !wf || n_tok <= 0 || ch <= 0 || kern <= 0) return;
+        par_for(n_tok * ch, 8192, 2.0 * static_cast<f64>(n_tok * ch) * kern,
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const i64 t = i / ch;
+                        const i64 c = i % ch;
+                        f32 acc = 0.0f;
+                        for (i64 k = 0; k < kern; k++)
+                            acc += xf[(t + (kern - 1 - k) * dil) * ch + c] *
+                                   wf[k * ch + c];
+                        o[i] = acc;
+                    }
+                });
+    }
+
     void silu_act(void *x, i64 n) override {
         f32 *p = static_cast<f32 *>(x);
         par_for(n, 8192, 4.0 * static_cast<f64>(n),

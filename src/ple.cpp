@@ -55,4 +55,34 @@ void ple_rows(const PleConfig &cfg, const i64 *window, i32 n_window, i64 *out) {
     }
 }
 
+void ple_rows_for(const PleConfig &cfg, const i64 *seq, i64 pos0, i32 n,
+                  i64 *out) {
+    const i32 nh = cfg.n_heads();
+    if (!cfg.valid() || !seq || !out || nh <= 0 || n <= 0) return;
+    const i32 ng = cfg.ngram > 16 ? 16 : cfg.ngram;
+    for (i32 i = 0; i < n; i++) {
+        const i64 pos = pos0 + i;
+        if (pos < 0) continue;
+        // The window ends at this token and is shorter at the start of the
+        // sequence; ple_rows reads a short window as EOS, which is what the
+        // reference's missing KV cells hash as.
+        const i32 nw = (pos + 1 < static_cast<i64>(ng))
+                           ? static_cast<i32>(pos + 1)
+                           : ng;
+        ple_rows(cfg, seq + (pos - nw + 1), nw, out + static_cast<i64>(i) * nh);
+    }
+}
+
+void ple_gather(f32 *dst, const u8 *table, DType type, u64 row_bytes,
+                i32 head_dim, i32 n_heads, const i64 *rows) {
+    if (!dst || !table || !rows || head_dim <= 0 || n_heads <= 0 || !row_bytes)
+        return;
+    for (i32 h = 0; h < n_heads; h++) {
+        const i64 row = rows[h];
+        if (row < 0) continue;
+        const u8 *src = table + static_cast<u64>(row) * row_bytes;
+        dequant_row(type, src, dst + static_cast<i64>(h) * head_dim, head_dim);
+    }
+}
+
 } // namespace krk

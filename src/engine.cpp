@@ -532,13 +532,57 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                        ", n_embd " + std::to_string(hcc.n_embd) + ")";
             return false;
         }
+        // The per-layer embedding block. It writes into the lane stack, so it
+        // only makes sense on this family, and its gathered row has to be as
+        // wide as the stream its key projection reads.
         if (hcc.ple) {
-            if (err)
-                *err = "arch '" + hcc.arch +
-                       "': per-layer token embeddings (PLE) are loaded but not "
-                       "run yet; generation is refused rather than run without "
-                       "its n-gram block";
-            return false;
+            ple_ = PleConfig{};
+            ple_.ngram = hcc.ple_ngram;
+            ple_.heads_per_ngram = hcc.ple_heads_per_ngram;
+            ple_.head_dim = hcc.ple_head_dim;
+            ple_.conv_kernel = hcc.ple_conv_kernel;
+            ple_.eos_token = hcc.ple_eos_token;
+            ple_.head_offsets = hcc.ple_head_offsets;
+            ple_.head_vocab_sizes = hcc.ple_head_vocab_sizes;
+            ple_.multipliers = hcc.ple_multipliers;
+            if (!ple_.valid()) {
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': the per-layer embedding geometry is incomplete "
+                           "(needs ngram>=2, heads_per_ngram, head_dim, "
+                           "conv_kernel and one offset/vocab per head)";
+                return false;
+            }
+            // The gathered row is n_heads * head_dim wide, and that is
+            // n_embd -- NOT the lane stack. `ple_key` widens it to hc*n_embd
+            // and `ple_value` keeps it narrow, exactly as the reference's two
+            // projections do: 16 heads of 160 is 2560 on the REAP file, the
+            // embedding width, while the streams it feeds are 10240.
+            if (ple_.row_width() != hcc.n_embd) {
+                if (err)
+                    *err = "arch '" + hcc.arch + "': the PLE rows are " +
+                           std::to_string(ple_.row_width()) + " wide (" +
+                           std::to_string(ple_.n_heads()) + " heads of " +
+                           std::to_string(ple_.head_dim) +
+                           ") but the embedding is " +
+                           std::to_string(hcc.n_embd) +
+                           " wide; the key projection cannot read that";
+                return false;
+            }
+            if (!model_.ple_table() || model_.ple_row_bytes() == 0) {
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': PLE is declared but per_layer_token_embd is not "
+                           "in the file";
+                return false;
+            }
+            ple_hist_ = static_cast<i64>(ple_.conv_kernel - 1) * ple_.ngram;
+            ple_active_ = true;
+            KRK_INFO("per-layer embedding: %d head(s) of %d, %d-gram window, "
+                     "conv %d dilated by %d (%lld row(s) of history)",
+                     ple_.n_heads(), ple_.head_dim, ple_.ngram,
+                     ple_.conv_kernel, ple_.ngram,
+                     static_cast<long long>(ple_hist_));
         }
         if (hcc.qsa) {
             if (err)
@@ -639,6 +683,47 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         if (!halloc(ws_hc_mix_, static_cast<size_t>(C * n_embd_) * as,
                     "ws_hc_mix"))
             return false;
+        // The PLE block's buffers, allocated here too because they are only
+        // reachable when the lane stack is.
+        if (ple_active_) {
+            const i64 hc = hc_.hc;
+            if (!halloc(ws_ple_emb_, static_cast<size_t>(C * n_embd_) * as,
+                        "ws_ple_emb"))
+                return false;
+            if (!halloc(ws_ple_key_, static_cast<size_t>(C * wide) * as,
+                        "ws_ple_key"))
+                return false;
+            if (!halloc(ws_ple_qry_, static_cast<size_t>(C * wide) * as,
+                        "ws_ple_qry"))
+                return false;
+            if (!halloc(ws_ple_gated_, static_cast<size_t>(C * wide) * as,
+                        "ws_ple_gated"))
+                return false;
+            if (!halloc(ws_ple_val_, static_cast<size_t>(C * n_embd_) * as,
+                        "ws_ple_val"))
+                return false;
+            if (!halloc(ws_ple_gate_, static_cast<size_t>(C * hc) * as,
+                        "ws_ple_gate"))
+                return false;
+            if (!halloc(ws_ple_pad_,
+                        static_cast<size_t>((ple_hist_ + C) * wide) * as,
+                        "ws_ple_pad"))
+                return false;
+            if (!halloc(ws_ple_conv_, static_cast<size_t>(C * wide) * as,
+                        "ws_ple_conv"))
+                return false;
+            // One conv history per layer, even on the layers that do not run
+            // PLE: indexing by layer is worth the (small) waste.
+            const i64 hist_bytes =
+                static_cast<i64>(mc.n_layer) * ple_hist_ * wide * as;
+            if (hist_bytes > 0) {
+                ple_state_ = alloc(static_cast<size_t>(hist_bytes));
+                if (!check_alloc(ple_state_, "ple_state")) return false;
+                be_->fill0(ple_state_, static_cast<size_t>(hist_bytes));
+            }
+            ple_rows_.assign(static_cast<size_t>(C) * ple_.n_heads(), 0);
+            ple_emb_.assign(static_cast<size_t>(C) * n_embd_, 0.0f);
+        }
     }
     // Qwen3.5 packs a per-head output gate behind the query, so its query
     // projection is twice the query width and the split has to gather out of
@@ -1564,6 +1649,110 @@ const f32 *Engine::hc_debug_lanes(i32 *hc_out, i64 *width_out) const {
     return static_cast<const f32 *>(ws_hc_);
 }
 
+// ---- qwen4exp per-layer embedding (PLE) ----------------------------------
+//
+// Runs on the layers `ple.layers` names, before that layer's hyper-connection
+// mixer, and writes straight into the lane stack:
+//
+//   rows  = hash(token n-gram window)               (host, 64-bit)
+//   emb   = table[rows]                             (mmap'd, never uploaded)
+//   key   = ple_key * emb,  value = ple_value * emb
+//   gate  = sigmoid(sign(s) * sqrt(|s|)),  s = key.query / sqrt(n_embd)
+//   x     = value broadcast over lanes, times gate, lane-normed
+//   conv  = depthwise, kernel K, dilated by the n-gram size, over the TOKENS
+//   res_hc += x + silu(conv)
+//
+// The conv is where a chunked prefill and a token-at-a-time decode have to
+// agree: its window is the last (K-1)*ngram rows this layer produced, kept per
+// layer in ple_state_, so the history is state and not a function of the chunk.
+void Engine::ple_block(const LayerWeights &L, i32 l, i32 n, i64 pos0) {
+    const i64 ne = n_embd_;
+    const i64 hc = hc_.hc;
+    const i64 wide = hc * ne;
+    const i32 nh = ple_.n_heads();
+    const size_t as = be_->act_size();
+    const f32 eps = model_.cfg().rms_eps;
+
+    // The rows: 64-bit hash on the host. No kernel in this engine carries a
+    // 64-bit integer, and the table is not in VRAM to be indexed by one anyway.
+    ple_rows_for(ple_, ple_seq_.data(), pos0, n, ple_rows_.data());
+    ple_rows_n_ = n;
+
+    // Gather straight out of the mapping, head-slowest inside a token, and
+    // stage one pass of embeddings. This is the only weight on the hot path
+    // that is read from the file rather than from the backend.
+    for (i32 i = 0; i < n; i++) {
+        ple_gather(ple_emb_.data() + static_cast<i64>(i) * ne,
+                   model_.ple_table(), model_.ple_table_type(),
+                   model_.ple_row_bytes(), ple_.head_dim, nh,
+                   ple_rows_.data() + static_cast<i64>(i) * nh);
+    }
+    if (as == 2) {
+        ple_emb16_.resize(ple_emb_.size());
+        for (size_t i = 0; i < ple_emb_.size(); i++)
+            ple_emb16_[i] = fp32_to_fp16(ple_emb_[i]);
+        be_->upload(ws_ple_emb_, ple_emb16_.data(),
+                    ple_emb_.size() * sizeof(u16));
+    } else {
+        be_->upload(ws_ple_emb_, ple_emb_.data(),
+                    ple_emb_.size() * sizeof(f32));
+    }
+
+    // Two projections off the same row: the key widens it to the lane stack,
+    // the value keeps the embedding width (the reference's ple_key/ple_value).
+    be_->gemm(ws_ple_key_, ws_ple_emb_, L.ple_key.data, L.ple_key.type, wide,
+              ne, n);
+    be_->gemm(ws_ple_val_, ws_ple_emb_, L.ple_value.data, L.ple_value.type, ne,
+              ne, n);
+    // Both norms group over one lane, with a [n_embd, hc] weight: the key is
+    // normed on its own, the query is the lane stack normed in place of a copy.
+    be_->rmsnorm_grouped(ws_ple_key_, ws_ple_key_, L.ple_norm_key, n, hc, ne,
+                         wide, eps);
+    be_->rmsnorm_grouped(ws_ple_qry_, ws_hc_, L.ple_norm_query, n, hc, ne, wide,
+                         eps);
+    dump_row("ple.emb", l, ws_ple_emb_, wide, n);
+    dump_row("ple.key", l, ws_ple_key_, wide, n);
+    dump_row("ple.qry", l, ws_ple_qry_, wide, n);
+    be_->ple_gate(ws_ple_gate_, ws_ple_key_, ws_ple_qry_, n, hc, ne);
+    dump_row("ple.gate", l, ws_ple_gate_, hc, 1);
+    // The value is lane-independent: one scalar per lane broadcasts it across
+    // that lane's whole row, which is what makes the gate per-lane rather than
+    // per-element.
+    be_->lane_bcast_mul(ws_ple_gated_, ws_ple_val_, ws_ple_gate_, n, hc, ne);
+    be_->rmsnorm_grouped(ws_ple_gated_, ws_ple_gated_, L.ple_norm_conv, n, hc,
+                         ne, wide, eps);
+
+    // The conv window: this layer's history, then this pass's rows.
+    if (ple_hist_ > 0) {
+        void *state = act_at(ple_state_, as, static_cast<i64>(l) * ple_hist_ * wide);
+        be_->copy_act(ws_ple_pad_, state, ple_hist_ * wide);
+        be_->copy_act(act_at(ws_ple_pad_, as, ple_hist_ * wide), ws_ple_gated_,
+                      static_cast<i64>(n) * wide);
+        // The tail of the window is this layer's history for the next pass.
+        be_->copy_act(state, act_at(ws_ple_pad_, as, static_cast<i64>(n) * wide),
+                      ple_hist_ * wide);
+    } else {
+        be_->copy_act(ws_ple_pad_, ws_ple_gated_, static_cast<i64>(n) * wide);
+    }
+    dump_row("ple.gated", l, ws_ple_gated_, wide, n);
+    be_->conv1d_dw(ws_ple_conv_, ws_ple_pad_, L.ple_conv1d.data, n, wide,
+                   ple_.conv_kernel, ple_.ngram);
+    be_->silu_act(ws_ple_conv_, static_cast<i64>(n) * wide);
+    // The reference returns hidden + gated + conv_out; the lane stack is
+    // `hidden`, and this block is the only writer of it before the mixer.
+    be_->add_inplace(ws_hc_, ws_ple_gated_, static_cast<i64>(n) * wide);
+    be_->add_inplace(ws_hc_, ws_ple_conv_, static_cast<i64>(n) * wide);
+}
+
+const i64 *Engine::ple_debug_rows(i32 *n_tok, i32 *n_heads) const {
+    if (n_tok) *n_tok = 0;
+    if (n_heads) *n_heads = 0;
+    if (!ple_active_ || ple_rows_.empty()) return nullptr;
+    if (n_heads) *n_heads = ple_.n_heads();
+    if (n_tok) *n_tok = ple_rows_n_;
+    return ple_rows_.data();
+}
+
 void Engine::head_compute(i32 row) {
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
@@ -1645,6 +1834,30 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     };
     dump_stage("embed", -1);
 
+    // PLE needs the tokens BEFORE this pass as well as its own, so the sequence
+    // is kept here rather than re-derived from the KV cache: position p holds
+    // the token at p, and the n-gram window at p reads p-1, p-2, ...
+    if (ple_active_) {
+        if (pos0 == 0) {
+            // A new sequence. The conv history belongs to the sequence it was
+            // built from, so it starts empty, and the window before the first
+            // token reads as EOS.
+            ple_seq_.clear();
+            if (ple_state_ && ple_hist_ > 0) {
+                be_->fill0(ple_state_,
+                           static_cast<size_t>(mc.n_layer) * ple_hist_ *
+                               hc_.lane_width() * be_->act_size());
+            }
+            ple_rows_.assign(ple_rows_.size(), 0);
+        }
+        const i64 need = static_cast<i64>(pos0) + n;
+        if (static_cast<i64>(ple_seq_.size()) < need) {
+            const i64 fill = ple_.eos_token >= 0 ? ple_.eos_token : 0;
+            ple_seq_.resize(static_cast<size_t>(need), fill);
+        }
+        for (i32 i = 0; i < n; i++) ple_seq_[pos0 + i] = toks[i];
+    }
+
     for (i32 l = 0; l < mc.n_layer; l++) {
         // Refill the streaming ring for this layer when it is not resident.
         // A resident layer is a no-op, and the copy is ordered on the default
@@ -1697,6 +1910,10 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // which is a few extra launches on a sink model and nothing else.
         d.sinks = L.sinks;
         dump_stage("enter", l);
+
+        // The PLE block writes into the lane stack, so it runs before the
+        // layer's mixer reads it -- the reference's build_ple, then build_hc_mix.
+        if (ple_active_ && L.ple) ple_block(L, l, n, pos0);
 
         if (hc_active_) {
             // No plain pre-norm on this family: the mixer is the block's input,

@@ -2054,6 +2054,171 @@ i64 arm_hc(Backend *be) {
         }
     }
 
+    // (7) ple_gate: the PLE block's per-lane gate, one launch for the whole
+    // block. The output layout is LANE-major on purpose (a lane's column is
+    // contiguous), which is what the gated-value broadcast reads next, so the
+    // oracle writes it that way too. Inputs are scaled down: with full-scale
+    // values the dot product saturates the sigmoid and a kernel that read the
+    // wrong lane would still pass.
+    {
+        const i64 nq = nt * hc * ne;
+        std::vector<f32> key(static_cast<size_t>(nq));
+        std::vector<f32> qry(static_cast<size_t>(nq));
+        const auto r16 = [](f64 v) {
+            return fp16_to_fp32(fp32_to_fp16(static_cast<f32>(v)));
+        };
+        for (i64 i = 0; i < nq; i++)
+            key[static_cast<size_t>(i)] = r16(std::sin(0.011 * i) * 0.1);
+        for (i64 i = 0; i < nq; i++)
+            qry[static_cast<size_t>(i)] = r16(std::cos(0.017 * i) * 0.1);
+        const std::vector<u16> kh = up(key), qh = up(qry);
+        void *kd = be->alloc(static_cast<size_t>(nq) * 2);
+        void *qd = be->alloc(static_cast<size_t>(nq) * 2);
+        void *pgd = be->alloc(static_cast<size_t>(nt * hc) * 2);
+        be->upload(kd, kh.data(), kh.size() * 2, 0);
+        be->upload(qd, qh.data(), qh.size() * 2, 0);
+        be->ple_gate(pgd, kd, qd, nt, hc, ne);
+        const std::vector<u16> got = fetch(pgd, nt * hc);
+        std::vector<f32> want(static_cast<size_t>(nt * hc));
+        const f32 inv = 1.0f / std::sqrt(static_cast<f32>(ne));
+        for (i64 c = 0; c < hc; c++) {
+            for (i64 t = 0; t < nt; t++) {
+                f32 s = 0.0f;
+                for (i64 e = 0; e < ne; e++) {
+                    const i64 k = (t * hc + c) * ne + e;
+                    s += key[static_cast<size_t>(k)] *
+                         qry[static_cast<size_t>(k)];
+                }
+                const f32 sc = s * inv;
+                const f32 mag =
+                    std::sqrt(std::fmax(std::fabs(sc), 1e-6f));
+                const f32 sg = sc > 0.0f ? 1.0f : (sc < 0.0f ? -1.0f : 0.0f);
+                want[static_cast<size_t>(c * nt + t)] =
+                    1.0f / (1.0f + std::exp(-(sg * mag)));
+            }
+        }
+        const HcCmp r = cmp_hc_f32(got, want, false, 2e-3);
+        print_hc("ple_gate", "signed-sqrt sigmoid", r);
+        if (!r.ok()) failed++;
+        be->release(kd);
+        be->release(qd);
+        be->release(pgd);
+    }
+
+    // (8) conv1d_dw: the PLE block's dilated depthwise convolution along the
+    // token axis. `x` carries the history rows in front of this pass's, which
+    // is the whole reason the window is the caller's rather than a ring inside
+    // the kernel.
+    {
+        const i64 ch = 1024, kern = 4, dil = 2;
+        const i64 hist = (kern - 1) * dil; // 6
+        const i64 rows = hist + nt;        // 9
+        const auto r16 = [](f64 v) {
+            return fp16_to_fp32(fp32_to_fp16(static_cast<f32>(v)));
+        };
+        std::vector<f32> xw(static_cast<size_t>(rows * ch));
+        std::vector<f32> w(static_cast<size_t>(kern * ch));
+        for (i64 i = 0; i < rows * ch; i++)
+            xw[static_cast<size_t>(i)] = r16(std::sin(0.0007 * i) * 1.5);
+        for (i64 i = 0; i < kern * ch; i++)
+            w[static_cast<size_t>(i)] = static_cast<f32>(std::cos(0.003 * i) * 0.4);
+        const std::vector<u16> xwh = up(xw);
+        void *xwd = be->alloc(static_cast<size_t>(rows * ch) * 2);
+        void *wdev = be->alloc(static_cast<size_t>(kern * ch) * sizeof(f32));
+        void *cvd = be->alloc(static_cast<size_t>(nt * ch) * 2);
+        be->upload(xwd, xwh.data(), xwh.size() * 2, 0);
+        be->upload(wdev, w.data(), w.size() * sizeof(f32), 0);
+        be->conv1d_dw(cvd, xwd, wdev, nt, ch, kern, dil);
+        const std::vector<u16> got = fetch(cvd, nt * ch);
+        std::vector<f32> want(static_cast<size_t>(nt * ch), 0.0f);
+        for (i64 t = 0; t < nt; t++) {
+            for (i64 c = 0; c < ch; c++) {
+                f32 acc = 0.0f;
+                for (i64 k = 0; k < kern; k++) {
+                    const i64 rr = t + (kern - 1 - k) * dil;
+                    acc += w[static_cast<size_t>(k * ch + c)] *
+                           xw[static_cast<size_t>(rr * ch + c)];
+                }
+                want[static_cast<size_t>(t * ch + c)] = acc;
+            }
+        }
+        const HcCmp r = cmp_hc_f32(got, want, false, 2e-3);
+        print_hc("conv1d_dw", "dilated depthwise", r);
+        if (!r.ok()) failed++;
+
+        // (9) conv-history: the property the op exists for, on device. Three
+        // one-token calls, each handed the six history rows the previous one
+        // would have produced (a slice of the same buffer, so the values are
+        // the f16 ones), must concatenate to the three-token call BIT-for-bit.
+        // That is the chunk invariance of the convolution: a chunked prefill
+        // and a token-at-a-time decode see the same window.
+        void *oned = be->alloc(static_cast<size_t>(ch) * 2);
+        std::vector<u16> joined;
+        joined.reserve(static_cast<size_t>(nt * ch));
+        for (i64 t = 0; t < nt; t++) {
+            const void *slice =
+                reinterpret_cast<const u8 *>(xwd) + static_cast<size_t>(t * ch) * 2;
+            be->conv1d_dw(oned, slice, wdev, 1, ch, kern, dil);
+            const std::vector<u16> one = fetch(oned, ch);
+            joined.insert(joined.end(), one.begin(), one.end());
+        }
+        i64 differ = 0;
+        for (i64 i = 0; i < nt * ch; i++)
+            if (joined[static_cast<size_t>(i)] != got[static_cast<size_t>(i)])
+                differ++;
+        std::printf("  %-11s %-22s %s", "conv-history", "3x1 == 3 rows",
+                    differ == 0 ? "BIT-IDENTICAL" : "FAIL");
+        if (differ == 0) {
+            std::printf(" (%lld values)\n", static_cast<long long>(nt * ch));
+        } else {
+            std::printf("  %lld/%lld differ\n", static_cast<long long>(differ),
+                        static_cast<long long>(nt * ch));
+            failed++;
+        }
+        be->release(xwd);
+        be->release(wdev);
+        be->release(cvd);
+        be->release(oned);
+    }
+
+    // (10) lane_bcast_mul: value[t,e] * g[c*n_tok + t]. The gate is LANE-major
+    // (ple_gate's output layout) and the result is token-major, so a kernel that
+    // read the gate token-major would pass a symmetric input and fail this one:
+    // the two layouts agree only at n_tok == hc.
+    {
+        const i64 nv = nt * ne;
+        const auto r16 = [](f64 v) {
+            return fp16_to_fp32(fp32_to_fp16(static_cast<f32>(v)));
+        };
+        std::vector<f32> val(static_cast<size_t>(nv));
+        std::vector<f32> gatev(static_cast<size_t>(nt * hc));
+        for (i64 i = 0; i < nv; i++)
+            val[static_cast<size_t>(i)] = r16(std::sin(0.009 * i) * 1.5);
+        for (i64 i = 0; i < nt * hc; i++)
+            gatev[static_cast<size_t>(i)] = r16(std::cos(0.03 * i));
+        const std::vector<u16> vh = up(val), gvh = up(gatev);
+        void *lbv = be->alloc(static_cast<size_t>(nv) * 2);
+        void *lbg = be->alloc(static_cast<size_t>(nt * hc) * 2);
+        void *lbo = be->alloc(static_cast<size_t>(nv * hc) * 2);
+        be->upload(lbv, vh.data(), vh.size() * 2, 0);
+        be->upload(lbg, gvh.data(), gvh.size() * 2, 0);
+        be->lane_bcast_mul(lbo, lbv, lbg, nt, hc, ne);
+        const std::vector<u16> got = fetch(lbo, nv * hc);
+        std::vector<f32> want(static_cast<size_t>(nv * hc), 0.0f);
+        for (i64 t = 0; t < nt; t++)
+            for (i64 c = 0; c < hc; c++)
+                for (i64 e = 0; e < ne; e++)
+                    want[static_cast<size_t>((t * hc + c) * ne + e)] =
+                        val[static_cast<size_t>(t * ne + e)] *
+                        gatev[static_cast<size_t>(c * nt + t)];
+        const HcCmp r = cmp_hc_f32(got, want, false, 2e-3);
+        print_hc("lane_bcast", "value[t,e]*g[c,t]", r);
+        if (!r.ok()) failed++;
+        be->release(lbv);
+        be->release(lbg);
+        be->release(lbo);
+    }
+
     be->release(xd);
     be->release(xnd);
     be->release(gd);
@@ -2062,7 +2227,7 @@ i64 arm_hc(Backend *be) {
     be->release(lanes);
     be->release(mixd);
     be->release(res);
-    std::printf("  hc: %lld of 6 cases%s\n", static_cast<long long>(6 - failed),
+    std::printf("  hc: %lld of 10 cases%s\n", static_cast<long long>(10 - failed),
                 failed == 0 ? " identical" : " failed");
     return failed;
 }

@@ -26,6 +26,7 @@
 #include "kernels/gdn.hpp"
 #include "kernels/hadamard.hpp"
 #include "kernels/hc.hpp"
+#include "kernels/ple.hpp"
 #include "op_time.hpp"
 
 // Declared here rather than at their definitions (below the class) so the
@@ -2475,6 +2476,44 @@ public:
         if (n <= 0) return;
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         silu_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(x), n);
+    }
+
+    // ---- per-layer embedding (qwen4exp) ---------------------------------
+    // The PLE block's two non-matmul pieces: a reduction over ONE lane's
+    // channels (rmsnorm sums the row, which on this family would fold the four
+    // lanes together) and a dilated depthwise convolution along the token axis.
+    void ple_gate(void *out, const void *key, const void *qry, i64 n_tok,
+                  i64 hc, i64 ne) override {
+        KRK_TIME_OP("ple_gate");
+        if (n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        const unsigned blocks = static_cast<unsigned>(n_tok * hc);
+        ple_gate_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(out),
+                                              static_cast<const _Float16 *>(key),
+                                              static_cast<const _Float16 *>(qry),
+                                              n_tok, hc, ne);
+    }
+
+    void conv1d_dw(void *out, const void *x, const void *w, i64 n_tok, i64 ch,
+                   i64 kern, i64 dil) override {
+        KRK_TIME_OP("conv1d_dw");
+        if (n_tok <= 0 || ch <= 0 || kern <= 0 || dil <= 0) return;
+        const i64 total = n_tok * ch;
+        const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
+        conv1d_dw_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(out),
+                                              static_cast<const _Float16 *>(x),
+                                              static_cast<const f32 *>(w), n_tok,
+                                              ch, kern, dil);
+    }
+
+    void lane_bcast_mul(void *out, const void *value, const void *g,
+                        i64 n_tok, i64 hc, i64 ne) override {
+        KRK_TIME_OP("lane_bcast_mul");
+        if (n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        const i64 total = n_tok * hc * ne;
+        const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
+        lane_bcast_mul_kernel<256><<<blocks, 256>>>(
+            static_cast<_Float16 *>(out), static_cast<const _Float16 *>(value),
+            static_cast<const _Float16 *>(g), n_tok, hc, ne);
     }
 
     void add_bias_rows(void *out, const f32 *bias, i64 n, i64 rows) override {

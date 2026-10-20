@@ -8077,7 +8077,8 @@ static const char *kQ4TestPath = "kraken-q4-test.gguf";
 static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
                                 int n_embd_arg = 0, int low_rank_arg = 0,
                                 bool extras = true,
-                                bool identical_inject = false) {
+                                bool identical_inject = false,
+                                bool qsa = true) {
     // The two numbers the forward test scales up to the real file's shape: four
     // lanes of 2560, mixed through a 32-wide bottleneck (the REAP-288 file
     // mixes through 320; 32 keeps the fixture a few MB instead of 100).
@@ -8096,7 +8097,10 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
               ctx = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
     const int idx_h = 2, idx_dim = 4;
-    const int ple_dim = 4, ple_heads = 1, ple_rows = 8, ple_conv = 2;
+    // The gathered row is one head_dim per head, and the key projection reads
+    // the whole wide stream: those numbers have to meet, which is why the
+    // fixture's head_dim is the lane width and not a small stand-in.
+    const int ple_dim = n_embd, ple_heads = 1, ple_rows = 8, ple_conv = 2;
     const std::string arch = "qwen4exp";
 
     GgufBuilder b;
@@ -8131,11 +8135,13 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
     // The indexer and the PLE module are the two pieces the forward pass does
     // not run yet, and Engine::init refuses a file that carries either. The
     // fixture can leave them out so the residual stack is what is under test.
-    if (extras) {
+    if (extras && qsa) {
         b.meta_u32(arch + ".attention.indexer.head_count", static_cast<u32>(idx_h));
         b.meta_u32(arch + ".attention.indexer.key_length", static_cast<u32>(idx_dim));
         b.meta_u32(arch + ".attention.indexer.top_k", 16);
         b.meta_i32_array(arch + ".attention.compress_ratios", {0, 2});
+    }
+    if (extras) {
         b.meta_i32_array(arch + ".ple.layers", {0});
         b.meta_u32(arch + ".ple.ngram_size", 2);
         b.meta_u32(arch + ".ple.heads_per_ngram", static_cast<u32>(ple_heads));
@@ -8234,7 +8240,7 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
                          vec(static_cast<size_t>(q_dim) * n_embd, 400));
             b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
             b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
-            if (extras) {
+            if (extras && qsa) {
                 b.tensor_f16(p + "indexer.q_proj.weight",
                              {u64(n_embd), u64(idx_h * idx_dim)},
                              vec(static_cast<size_t>(n_embd) * idx_h * idx_dim, 800));
@@ -8321,8 +8327,8 @@ static void test_qwen4exp_schema() {
                   "qwen4exp declares no output norm (the head mixer carries it)");
             CHECK(mc.gdn_gate_sigmoid,
                   "its recurrent block gates with sigmoid, not silu");
-            CHECK(mc.ple && mc.ple_ngram == 2 && mc.ple_head_dim == 4,
-                  "the PLE geometry is read");
+            CHECK(mc.ple && mc.ple_ngram == 2 && mc.ple_head_dim == mc.n_embd,
+                  "the PLE geometry is read (one row per token is n_embd wide)");
             CHECK(mc.ple_layers.size() == 1 && mc.ple_layers[0] == 0,
                   "... including which layer carries the module");
             CHECK(mc.qsa && mc.qsa_ratio.size() == 2 && mc.qsa_ratio[1] == 2,
@@ -8375,6 +8381,136 @@ static void test_qwen4exp_schema() {
         model.unload();
         delete cpu;
         std::remove(bad.c_str());
+    }
+    std::remove(path.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
+// The n-gram block that runs on this family's recurrent layers, end to end.
+//
+// The hash itself is pinned by test_ple_hash with hand-computed constants; what
+// this group pins is the WIRING: which rows the engine gathers for a known
+// prompt (computed here from the tokens, independently of ple.cpp), that the
+// dilated conv's window survives both a chunked prefill and a token-at-a-time
+// decode, and that the block leaves the lane stack finite and deterministic.
+static void test_qwen4exp_ple() {
+    const std::string path = "kraken-q4ple.gguf";
+    // PLE on, indexer off: the block under test is the n-gram one.
+    CHECK(build_tiny_q4_model(path, 0, 0, 0, true, false, false),
+          "a four-lane file with the PLE block writes (no indexer)");
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+    {
+        Backend *cpu = make_cpu_backend();
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = path;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            std::string err;
+            const bool ok = engine.init(cpu, cfg, &err);
+            CHECK(ok, "a file carrying the PLE block initialises");
+            if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+            if (ok) {
+                const std::string prompt = "the the the the the the";
+                std::vector<i32> ids;
+                engine.tokenizer().encode(prompt, ids, true);
+                CHECK(ids.size() >= 4, "the prompt tokenises");
+
+                // A prefill-only run: the LAST forward is then the whole
+                // prompt in one chunk, so the rows cover every prompt token.
+                GenerateParams p;
+                p.prompt = prompt;
+                p.max_tokens = 0;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                CHECK(engine.generate(p, &r), "the prompt prefills through the block");
+
+                i32 nt = 0, nh = 0;
+                const i64 *rows = engine.ple_debug_rows(&nt, &nh);
+                CHECK(rows != nullptr && nh == 1,
+                      "the PLE block hashed one head per token");
+                if (rows && nh == 1) {
+                    CHECK(nt == static_cast<i32>(ids.size()),
+                          "one row set per prompt token");
+                    // The fixture's multipliers are {1,1} and its head has 8
+                    // rows at offset 0, so a 2-gram is `t ^ t-1` and the row
+                    // is that modulo 8. The first position has no predecessor
+                    // and reads as EOS (258), which is what the reference's
+                    // missing KV cell hashes as.
+                    i64 bad = 0;
+                    for (i32 i = 0; i < nt && i < static_cast<i32>(ids.size()); i++) {
+                        const i64 cur = ids[static_cast<size_t>(i)];
+                        const i64 prev =
+                            i >= 1 ? ids[static_cast<size_t>(i - 1)] : 258;
+                        const i64 expect = (cur ^ prev) % 8;
+                        if (rows[static_cast<i64>(i) * nh] != expect) bad++;
+                    }
+                    CHECK(bad == 0,
+                          "every gathered row is the hash of that token's window");
+                }
+
+                // The conv is the stateful half: the same prompt has to decode
+                // to the same tokens whether it arrived in 8-token chunks or
+                // one at a time, which only holds if the (K-1)*ngram rows of
+                // history are carried correctly.
+                GenerateParams g;
+                g.prompt = prompt;
+                g.max_tokens = 6;
+                g.sampler.greedy = true;
+                g.sampler.seed = 5;
+                GenerateResult a, b;
+                CHECK(engine.generate(g, &a), "the block generates");
+                CHECK(engine.generate(g, &b) && a.tokens == b.tokens,
+                      "... deterministically");
+
+                EngineConfig cfg1 = cfg;
+                cfg1.prefill_chunk = 1;
+                Engine one;
+                std::string e2;
+                if (one.init(cpu, cfg1, &e2)) {
+                    GenerateResult c;
+                    CHECK(one.generate(g, &c), "and with a one-token prefill");
+                    if (c.tokens != a.tokens) {
+                        size_t at = 0;
+                        while (at < a.tokens.size() && at < c.tokens.size() &&
+                               a.tokens[at] == c.tokens[at]) at++;
+                        std::fprintf(stderr,
+                                     "  (chunking differs at token " 
+                                     "%zu of %zu/%zu: %d vs %d)\n",
+                                     at, a.tokens.size(), c.tokens.size(),
+                                     at < a.tokens.size() ? a.tokens[at] : -1,
+                                     at < c.tokens.size() ? c.tokens[at] : -1);
+                    }
+                    CHECK(c.tokens == a.tokens,
+                          "the conv window makes the chunking invisible");
+                } else {
+                    CHECK(false, "engine initialises with chunk=1");
+                    if (!e2.empty()) std::fprintf(stderr, "  (%s)\n", e2.c_str());
+                }
+
+                i32 hc = 0;
+                i64 ne = 0;
+                const f32 *lanes = engine.hc_debug_lanes(&hc, &ne);
+                bool finite = lanes != nullptr;
+                if (lanes) {
+                    for (i64 i = 0; i < static_cast<i64>(hc) * ne && finite; i++) {
+                        const f32 v = lanes[i];
+                        if (!(v == v) || v > 1e6f || v < -1e6f) finite = false;
+                    }
+                }
+                CHECK(finite, "and the lane stack it wrote into stays finite");
+            }
+        }
+        delete cpu;
     }
     std::remove(path.c_str());
 #ifdef _WIN32
@@ -8611,6 +8747,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_ple_hash)
     TEST_GROUP(test_qwen4exp_schema)
     TEST_GROUP(test_qwen4exp_forward)
+    TEST_GROUP(test_qwen4exp_ple)
     TEST_GROUP(test_cpu_expert_pool)
     TEST_GROUP(test_gdn_ops)
     TEST_GROUP(test_gdn_model_loads)

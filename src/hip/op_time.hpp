@@ -355,6 +355,12 @@ static const char *component_of(const char *op) {
         {"hc_init", "hyper"},
         {"hc_mix", "hyper"},
         {"hc_combine", "hyper"},
+        // qwen4exp's per-layer embedding block: its own bucket, because on a
+        // file that carries it, it is the difference between a recurrent
+        // layer's cost and a comparable layer's on a model without one.
+        {"ple_gate", "ple"},
+        {"conv1d_dw", "ple"},
+        {"lane_bcast_mul", "ple"},
         {"add_inplace", "residual"},
         {"add_bias_rows", "bias"},
         {"add_bias_cols", "bias"},

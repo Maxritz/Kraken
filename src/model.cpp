@@ -1050,7 +1050,14 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             return false;
         }
         ple_table_ = t->data;
-        ple_row_bytes_ = static_cast<u64>(t->n_elements / (t->ne[1] ? t->ne[1] : 1));
+        ple_table_type_ = t->type;
+        // BYTES for one row, in the file's own type: the gather reads the row
+        // straight out of the mapping, so an f16 or quantized table moves
+        // half (or a quarter) as many bytes as an f32 one and the stride has
+        // to follow. (This used to be elements per row, which is the same
+        // number only for an 8-bit type.)
+        ple_row_bytes_ =
+            static_cast<u64>(dtype_row_bytes(t->type, cfg_.ple_head_dim));
         KRK_INFO("ple: %llu rows of %d read from the mapping (%llu B/row), "
                  "%d head(s) per token",
                  static_cast<unsigned long long>(n_rows), cfg_.ple_head_dim,

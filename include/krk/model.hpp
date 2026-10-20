@@ -603,7 +603,11 @@ public:
     // qwen4exp's PLE table is a pointer into the mapping, not an upload: the
     // accessors exist so a test can assert the loader found it and sized one row.
     const u8 *ple_table() const { return ple_table_; }
+    // The file's own type for one row of the table: the gather dequantizes one
+    // row at a time out of the mapping, so the stride and the type travel
+    // together.
     u64 ple_row_bytes() const { return ple_row_bytes_; }
+    DType ple_table_type() const { return ple_table_type_; }
     const QuantTensor &hc_head_down() const { return hc_head_down_; }
     const QuantTensor &hc_head_up() const { return hc_head_up_; }
     // NeoX inverse frequencies, length head_dim/2, host-resident (tiny).
@@ -763,6 +767,7 @@ private:
     QuantTensor hc_head_down_, hc_head_up_;
     const u8 *ple_table_ = nullptr;
     u64 ple_row_bytes_ = 0;
+    DType ple_table_type_ = DType::F32;
     std::vector<f32> inv_freq_;
     std::vector<f32> inv_freq_swa_;
     // prism.hadamard. The sign vectors are uploaded once at load and released
