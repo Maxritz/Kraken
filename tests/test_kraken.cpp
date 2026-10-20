@@ -2965,11 +2965,16 @@ static void test_arch_table() {
     CHECK(arch_lookup("qwen4exp")->role == ArchRole::Target &&
               arch_lookup("qwen4exp")->support == ArchSupport::No,
           "as a refused target rather than an unlisted arch");
-    // Load-bearing: the gap map exempts attn_qkv/attn_gate/ssm_* for recurrent
-    // shapes (the gated delta net owns those names), so a recurrent declaration
-    // would hide the very pieces that block this family.
-    CHECK(arch_lookup("qwen4exp")->shape == ArchShape::Moe,
-          "declared Moe so its tensor gaps stay reportable");
+    // RecurrentMoe, and that is now the honest shape: the delta net's tensors
+    // ARE this engine's (attn_qkv is [q|k|v] of 2048/2048/6144, attn_gate is the
+    // z gate, ssm_* are the same names gdn_forward reads), so the refusal is the
+    // hyper-connection/PLE/QSA graph and not a tensor class. Declaring Moe here
+    // would make the gap map refuse the family for a computation it has.
+    CHECK(arch_lookup("qwen4exp")->shape == ArchShape::RecurrentMoe,
+          "declared recurrent-moe: the delta-net tensor set is implemented");
+    CHECK(arch_lookup("qwen4exp")->hyper_connection &&
+              arch_lookup("qwen4exp")->ple && arch_lookup("qwen4exp")->qsa,
+          "and the schema flags record the three pieces still missing");
     CHECK(arch_lookup("") == nullptr, "the empty arch name is not in the table");
     CHECK(arch_lookup("no-such-arch-anywhere") == nullptr,
           "an unlisted arch is not in the table");
@@ -3224,13 +3229,13 @@ static void test_load_verdict() {
         CHECK(!v.runnable, "and it is refused");
         CHECK(v.headline().find("not supported") != std::string::npos,
               "the headline says not supported, not unknown");
-        bool family = false, tensor = false;
+        bool family = false, graph = false;
         for (const std::string &b : v.blockers) {
             if (b.find("hyper-connection") != std::string::npos) family = true;
-            if (b.find("attn_qkv") != std::string::npos) tensor = true;
+            if (b.find("QSA") != std::string::npos) graph = true;
         }
         CHECK(family, "the family reason is reported");
-        CHECK(tensor, "and the fused qkv tensor is a separate, named cause");
+        CHECK(graph, "and the graph pieces still missing are named beside it");
         made.push_back(path);
     }
 

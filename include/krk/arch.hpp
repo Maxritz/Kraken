@@ -123,6 +123,17 @@ struct ArchSpec {
     int expert_w_norm = -1;
     // The expert FFN activation is gpt-oss's SwiGLU-OAI rather than silu*up.
     bool swiglu_oai = false;
+    // ---- qwen4exp (Qwen3.8-Flash-Next) -----------------------------------
+    // A four-lane hyper-connection residual instead of `x + f(norm(x))`, a PLE
+    // n-gram hash embedding table read per token, and a QSA indexer that
+    // restricts a full-attention layer to whole blocks of `compress_ratio`
+    // tokens. The gate tensor on those layers is per *element* (n_head*hd),
+    // not per head, and there is no output norm: the final hc_head mixer is it.
+    bool hyper_connection = false;
+    bool ple = false;
+    bool qsa = false;
+    bool attn_gate_elem = false;
+    bool no_out_norm = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.
