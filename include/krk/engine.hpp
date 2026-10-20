@@ -293,6 +293,34 @@ struct GenerateResult {
     std::string error;
 };
 
+// ---- the expert index file -----------------------------------------------
+// A parsed `<model>.krakenexperts.json`, layer-major. `valid` is false when the
+// text does not describe the model it was asked about: a ranking measured on
+// other weights is worse than no ranking, so every reader refuses it.
+struct ExpertIndexRows {
+    std::vector<double> mass; // [n_layer * n_expert] summed P(expert)
+    std::vector<u64> hits;    // [n_layer * n_expert] times selected
+    i64 tokens = 0;           // token positions the file was measured over
+    bool valid = false;
+};
+
+// Reads the format write_expert_index produces. `src_size` is the model file's
+// size when known; 0 skips that check, which only a fixture wants.
+ExpertIndexRows expert_index_parse(const std::string &text, i32 n_layer,
+                                   i32 n_expert, const std::string &arch,
+                                   unsigned long long src_size);
+
+// p' = retain * p_old + (1 - retain) * p_run, per layer, each input normalised
+// to a distribution first so a long run cannot outvote a short one by its token
+// count. Hits add, and the stored mass keeps its meaning ("summed probability
+// over N positions") by being scaled to the larger of the two counts. `old` is
+// overwritten with the blend; a layer the run never routed through keeps its
+// stored row.
+void expert_index_blend(ExpertIndexRows *old, i32 n_expert,
+                        const std::vector<double> &run_mass,
+                        const std::vector<u64> &run_hits, i64 run_tokens,
+                        double retain);
+
 class Engine {
 public:
     Engine() = default;
@@ -478,6 +506,18 @@ public:
     }
     // Writes <path> with each expert's routing mass, sorted hottest-first.
     void write_expert_index(const std::string &path) const;
+    // Counts routing during a NORMAL run -- no stub, no index write -- so the
+    // run can feed what it actually routed back into the index. Must be set
+    // before init(): the counters are sized there.
+    void set_expert_track(bool on) { expert_track_ = on; }
+    // Folds this run's observed routing into <path>. The next load then ranks
+    // the tiers by what the workload ran rather than by the measurement prompt
+    // alone, so a repeated workload converges on its own hot set instead of on
+    // the scan's generic one. `retain` is the weight the existing file keeps
+    // (0.5 = half); the run contributes the rest. Refuses, and leaves the file
+    // alone, when it describes a different model; writes a fresh one when there
+    // is no file yet.
+    void merge_expert_index(const std::string &path, double retain) const;
     // Routing residency preference, for the end-of-run report: was it on, at
     // what margin, and how many picks it moved.
     bool router_pref() const { return router_pref_; }
@@ -558,6 +598,12 @@ private:
     // routed set actually exceeds the device budget. KRK_EXPERT_WARMUP=0/1
     // overrides all of it, which is what makes the A/B one variable wide.
     bool expert_warmup_wanted() const;
+    // The one index writer: the scan and the adaptation pass fill the same
+    // arrays, so they must not produce two formats -- the loader reads both.
+    void write_expert_index_rows(const std::string &path,
+                                 const std::vector<double> &mass,
+                                 const std::vector<u64> &hits, i64 tokens,
+                                 const char *mode) const;
     // One gated-delta-net (recurrent) layer: the fused [q|k|v] projection, the
     // causal short conv, the per-head gate/forget, the delta rule, and the
     // gated output projection. Advances the layer's recurrent state.
@@ -909,6 +955,7 @@ private:
     i64 expert_scan_tokens_ = 0;       // token positions folded in so far
     bool expert_scan_ = false;         // accumulate
     bool expert_stub_ = false;         // skip the expert GEMMs while scanning
+    bool expert_track_ = false;        // count routing on a normal run (adapt)
     bool expert_stubbed_ran_ = false;  // stub was requested and did run
 
     std::vector<i32> plan_dev_;   // staging mirror for ws_plan_

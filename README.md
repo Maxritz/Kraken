@@ -900,6 +900,23 @@ kraken -m Tiel-Coder-35B-A3B-MTP-APEX.gguf --expert-scan -p "some text" -n 8
 # "expert warmup: using ... (16 positions, full-forward, 10240 ranked pairs)"
 ```
 
+**Then let the workload re-rank it.** A scan is a measurement on one prompt; a
+server or an agent sees different traffic every day. `--expert-adapt` counts the
+routing of a *normal* run and merges it into the index when the run ends, so the
+next load's warm fill and promotion order follow what was actually used:
+
+```sh
+kraken -m Tiel-Coder-35B-A3B-MTP-APEX.gguf --expert-adapt -p "the workload" -n 64
+# "expert adapt: merged 64 observed positions into ..."
+```
+
+The merge is `p' = retain * p_file + (1 - retain) * p_run` per layer, with
+`KRK_EXPERT_RETAIN` (default 0.5) the weight the existing file keeps. Per layer
+because mass is comparable within a layer and not across them; a layer the run
+never routed through keeps its row; a file that describes another model is
+refused rather than merged. `retain=1` keeps the file exactly, which is the A/B
+arm. No `--expert-scan` is needed, and the two can be combined.
+
 A larger device budget is *not* the lever: at a 2 GiB floor the same model reads
 20.6 tok/s and at 1 GiB floor 17.6, because a wider resident set reaches into
 colder experts and leaves the allocator no headroom. The floor is a fifth of the card (`max(reserve + 1 GiB, total/5)`;

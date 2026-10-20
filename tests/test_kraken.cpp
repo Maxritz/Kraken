@@ -7637,6 +7637,91 @@ struct TestGroup {
     const char *serial;
 };
 
+static void test_expert_index_adapt() {
+    // A two-layer, four-expert index in the exact shape write_expert_index
+    // produces. Layer 0 was measured hot on expert 0, layer 1 on expert 2.
+    const std::string text =
+        "{\"version\": 1, \"kind\": \"kraken-expert-index\", "
+        "\"mode\": \"full-forward\", \"arch\": \"qwen35moe\", "
+        "\"source_size\": 4096, \"n_layer\": 2, \"n_expert\": 4, "
+        "\"positions_scanned\": 100, \"layers\": ["
+        "{\"layer\": 0, \"experts\": ["
+        "{\"e\": 0, \"mass\": 90.0, \"hits\": 90}, "
+        "{\"e\": 1, \"mass\": 8.0, \"hits\": 8}, "
+        "{\"e\": 2, \"mass\": 1.0, \"hits\": 1}, "
+        "{\"e\": 3, \"mass\": 1.0, \"hits\": 1}]}, "
+        "{\"layer\": 1, \"experts\": ["
+        "{\"e\": 0, \"mass\": 1.0, \"hits\": 1}, "
+        "{\"e\": 1, \"mass\": 1.0, \"hits\": 1}, "
+        "{\"e\": 2, \"mass\": 90.0, \"hits\": 90}, "
+        "{\"e\": 3, \"mass\": 8.0, \"hits\": 8}]}]}";
+
+    ExpertIndexRows rows = expert_index_parse(text, 2, 4, "qwen35moe", 4096);
+    CHECK(rows.valid, "a well-formed index for this model parses");
+    CHECK(rows.tokens == 100,
+          "... and reports the positions it was measured over");
+    CHECK(rows.mass.size() == 8 && rows.hits.size() == 8,
+          "... one cell per layer x expert");
+    CHECK(rows.mass[3] == 1.0 && rows.hits[6] == 90,
+          "... mass and hits land on the right cell");
+
+    // The refusals are the loader's, and they are the reason a merge cannot
+    // silently apply another model's distribution to these weights.
+    CHECK(!expert_index_parse(text, 2, 8, "qwen35moe", 4096).valid,
+          "a different expert count is refused");
+    CHECK(!expert_index_parse(text, 3, 4, "qwen35moe", 4096).valid,
+          "a different layer count is refused");
+    CHECK(!expert_index_parse(text, 2, 4, "qwen3", 4096).valid,
+          "an index measured on another architecture is refused");
+    CHECK(!expert_index_parse(text, 2, 4, "qwen35moe", 8192).valid,
+          "an index for another build of the weights is refused");
+    CHECK(!expert_index_parse("not json", 2, 4, "qwen35moe", 0).valid,
+          "a file that is not JSON is refused");
+
+    // The run routed layer 0 to expert 3, and layer 1 not at all -- so layer 1
+    // must keep the file's row while layer 0 follows the traffic.
+    std::vector<double> run_mass(8, 0.0);
+    std::vector<u64> run_hits(8, 0);
+    run_mass[3] = 900.0;
+    run_hits[3] = 300;
+    {
+        ExpertIndexRows b = expert_index_parse(text, 2, 4, "qwen35moe", 4096);
+        expert_index_blend(&b, 4, run_mass, run_hits, 300, 0.5);
+        CHECK(b.mass[3] > b.mass[0],
+              "half-way blending makes the run's hot expert the top of the "
+              "ranking");
+        CHECK(b.hits[3] == 1 + 300, "hits accumulate instead of replacing");
+        CHECK(b.tokens == 400, "the position counts add");
+        CHECK(b.mass[4] == 1.0 && b.mass[6] == 90.0,
+              "a layer the run never routed through keeps the file's row");
+        // The stored number keeps its meaning: summed probability over the
+        // larger of the two position counts.
+        f64 l0 = 0;
+        for (int e = 0; e < 4; e++) l0 += b.mass[static_cast<size_t>(e)];
+        CHECK(std::fabs(l0 - 300.0) < 1e-6,
+              "the blended mass is still a sum over positions, not a ratio");
+    }
+
+    // retain = 1 is the A/B arm that proves the blend is doing the work: with
+    // it the file's own order survives a run that routed somewhere else.
+    {
+        ExpertIndexRows arm = expert_index_parse(text, 2, 4, "qwen35moe", 4096);
+        expert_index_blend(&arm, 4, run_mass, run_hits, 300, 1.0);
+        CHECK(arm.mass[0] > arm.mass[3],
+              "retain 1.0 leaves the measured order exactly as it was");
+    }
+
+    // Geometry guards: a run sized for another model must change nothing.
+    {
+        ExpertIndexRows bad = expert_index_parse(text, 2, 4, "qwen35moe", 4096);
+        std::vector<double> short_mass(4, 1.0);
+        std::vector<u64> short_hits(4, 1);
+        expert_index_blend(&bad, 4, short_mass, short_hits, 300, 0.5);
+        CHECK(bad.mass[3] == 1.0 && bad.tokens == 100,
+              "a run sized for another model changes nothing");
+    }
+}
+
 #define TEST_GROUP(fn) {#fn, fn, nullptr},
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
@@ -7688,6 +7773,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_draft_head)
     TEST_GROUP(test_mtp_sidecar)
     TEST_GROUP(test_expert_warmup)
+    TEST_GROUP(test_expert_index_adapt)
     TEST_GROUP(test_cpu_expert_pool)
     TEST_GROUP(test_gdn_ops)
     TEST_GROUP(test_gdn_model_loads)
