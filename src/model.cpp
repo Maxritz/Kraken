@@ -403,7 +403,18 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         }
         cfg_.no_out_norm = aspec.no_out_norm;
         cfg_.gdn_gate_sigmoid = aspec.hyper_connection;
-        cfg_.qsa = aspec.qsa;
+        // `aspec.qsa` says the SCHEMA can index; whether THIS FILE does is
+        // proved by its own metadata. A qwen4exp file without an indexer (a
+        // development fixture, or a checkpoint exported before the indexer
+        // landed) carries no compress ratios and no head geometry, and
+        // demanding them would refuse the residual stack it does have. When the
+        // keys ARE there the completeness check below is unchanged, so a
+        // half-declared indexer is still refused rather than run as if it had
+        // none -- that is the direction that decodes wrong text.
+        const bool has_indexer =
+            gguf_.find(key(".attention.indexer.head_count")) != nullptr ||
+            gguf_.find(key(".attention.compress_ratios")) != nullptr;
+        cfg_.qsa = aspec.qsa && has_indexer;
         if (cfg_.qsa) {
             cfg_.idx_n_head =
                 static_cast<i32>(gguf_.get_i64(key(".attention.indexer.head_count"), 0));

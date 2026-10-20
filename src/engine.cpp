@@ -420,18 +420,6 @@ static void run_dequant_probe(Backend &be, const std::string &model_path) {
 bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     be_ = be;
     cfg_ = cfg;
-    // qwen4exp's loader reads its tensors (KRK_ARCH_ALLOW_EXPERIMENTAL=1), but
-    // the forward pass still runs a plain `x + f(norm(x))` residual: generating
-    // from that would decode fluent text that is not this model. Refuse until
-    // the hyper-connection mixer is wired, and say which stage it is.
-    if (model_.cfg().hc) {
-        if (err)
-            *err = "this file ('" + model_.cfg().arch +
-                   "') uses hyper-connections, which are loaded but not run yet "
-                   "(see docs/AUDIT-qwen4exp-support.md); generation is refused "
-                   "rather than run on a plain residual";
-        return false;
-    }
     // The activation-range counters are process-wide device state; zero them so
     // the line this run prints describes this run.
     be_->reset_activation_saturation();
@@ -514,6 +502,56 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         be_ = nullptr;
         return false;
     }
+
+    // This has to happen AFTER the load, and that is not a style choice: the
+    // geometry it reads is the loader's, and the same block sitting above the
+    // load saw an empty ModelConfig -- `model_.cfg().hc` was false on every
+    // file, so the refusal this position replaced was dead code that said
+    // "generation is refused" while generation ran.
+    // qwen4exp's residual is `hc` lanes, not one vector, and the stack below
+    // runs it: every sub-block mixes the lanes in and scatters its output back
+    // (hc_enter / hc_leave). What is still missing on this family is everything
+    // AROUND the residual -- the PLE n-gram module and the QSA indexer -- and a
+    // file carrying either would decode fluent text that is not this model, so
+    // it is refused by name rather than run without the block it declares.
+    if (model_.cfg().hc) {
+        const ModelConfig &hcc = model_.cfg();
+        if (!be_->hc_supported()) {
+            if (err)
+                *err = "arch '" + hcc.arch +
+                       "': this backend has no hyper-connection mix/combine "
+                       "kernels, so the lane stack cannot be run on it";
+            return false;
+        }
+        hc_ = HcGeometry{hcc.n_embd, hcc.hc_n, hcc.hc_low_rank};
+        if (!hc_.valid()) {
+            if (err)
+                *err = "arch '" + hcc.arch + "': hyper-connection geometry is "
+                       "incomplete (count " + std::to_string(hcc.hc_n) +
+                       ", low_rank " + std::to_string(hcc.hc_low_rank) +
+                       ", n_embd " + std::to_string(hcc.n_embd) + ")";
+            return false;
+        }
+        if (hcc.ple) {
+            if (err)
+                *err = "arch '" + hcc.arch +
+                       "': per-layer token embeddings (PLE) are loaded but not "
+                       "run yet; generation is refused rather than run without "
+                       "its n-gram block";
+            return false;
+        }
+        if (hcc.qsa) {
+            if (err)
+                *err = "arch '" + hcc.arch +
+                       "': the QSA indexer (compressed-key attention) is loaded "
+                       "but not run yet; generation is refused rather than run "
+                       "with full attention over the same keys";
+            return false;
+        }
+        hc_active_ = true;
+        KRK_INFO("hyper-connections: %d lane(s) of %d through %d, residual %d wide",
+                 hc_.hc, hc_.n_embd, hc_.low_rank, hc_.hc * hc_.n_embd);
+    }
     // KRK_DEQUANT_PROBE: device-vs-host dequant of one named row, before the
     // first forward pass, so a wrong row read is visible in one run. Nothing
     // here runs unless the variable is set.
@@ -577,6 +615,31 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     if (!check_alloc(ws_xn_, "ws_xn")) return false;
     ws_x2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     if (!check_alloc(ws_x2_, "ws_x2")) return false;
+    // qwen4exp's lane stack: the wide residual, the normed copy, the mixer's up
+    // projection, its bottleneck, its per-lane injection, and the mixed row.
+    // Null on every other family, so nothing is paid for them.
+    if (hc_active_) {
+        const i64 wide = hc_.lane_width();
+        auto halloc = [&](void *&p, size_t bytes, const char *name) {
+            p = alloc(bytes);
+            return check_alloc(p, name);
+        };
+        if (!halloc(ws_hc_, static_cast<size_t>(C * wide) * as, "ws_hc"))
+            return false;
+        if (!halloc(ws_hc_n_, static_cast<size_t>(C * wide) * as, "ws_hc_n"))
+            return false;
+        if (!halloc(ws_hc_g_, static_cast<size_t>(C * wide) * as, "ws_hc_g"))
+            return false;
+        if (!halloc(ws_hc_lo_, static_cast<size_t>(C * hc_.low_rank) * as,
+                    "ws_hc_lo"))
+            return false;
+        if (!halloc(ws_hc_inj_, static_cast<size_t>(C * hc_.hc) * as,
+                    "ws_hc_inj"))
+            return false;
+        if (!halloc(ws_hc_mix_, static_cast<size_t>(C * n_embd_) * as,
+                    "ws_hc_mix"))
+            return false;
+    }
     // Qwen3.5 packs a per-head output gate behind the query, so its query
     // projection is twice the query width and the split has to gather out of
     // it. The split reads a wider row than it writes, which means an in-place
@@ -1426,12 +1489,96 @@ void Engine::had_xform(void *dst, const void *src, i64 rows, i64 width,
     be_->hadamard_act(dst, src, rows, d);
 }
 
+// ---- qwen4exp hyper-connections: the two ends of every sub-block ----------
+//
+// The narrow path hands a block one vector and takes `x += f(x)` back. Here the
+// residual is a LANE STACK in ws_hc_, and the block is handed a mixed row and
+// nothing else -- so the block's own output is that row minus the mix, and it
+// is scattered into every lane weighted by the injection. See hc.hpp.
+void Engine::hc_enter(const f32 *norm_w, const QuantTensor &down,
+                      const QuantTensor &up, const QuantTensor &inject, i32 n) {
+    const i64 ne = n_embd_;
+    const i64 hc = hc_.hc;
+    const i64 wide = hc * ne;
+    const f32 eps = model_.cfg().rms_eps;
+    // Per-lane RMSNorm: rmsnorm_grouped() already means exactly this shape (one
+    // weight vector per group, rows of `width` inside a token's block), which
+    // is why the lane stack needs no norm kernel of its own.
+    be_->rmsnorm_grouped(ws_hc_n_, ws_hc_, norm_w, n, hc, ne, wide, eps);
+    // The reference scales the down-projection's INPUT by 1/hc, before the
+    // silu: at lane width the bottleneck would otherwise be read hc times too
+    // hard, and the sigmoid after it makes that a different function, not a
+    // scaled one.
+    be_->scale_act(ws_hc_n_, 1.0f / static_cast<f32>(hc), n, wide, wide);
+    be_->gemm(ws_hc_lo_, ws_hc_n_, down.data, down.type, hc_.low_rank, wide, n);
+    be_->silu_act(ws_hc_lo_, static_cast<i64>(n) * hc_.low_rank);
+    be_->gemm(ws_hc_g_, ws_hc_lo_, up.data, up.type, wide, hc_.low_rank, n);
+    be_->gemm(ws_hc_inj_, ws_hc_n_, inject.data, inject.type, hc, wide, n);
+    be_->hc_mix(ws_hc_mix_, ws_hc_n_, ws_hc_g_, n, hc, ne);
+    // The block reads the mixed row (ws_xn_, which every projection below
+    // consumes) and accumulates onto a copy of it in ws_x_.
+    be_->copy_act(ws_xn_, ws_hc_mix_, static_cast<i64>(n) * ne);
+    be_->copy_act(ws_x_, ws_hc_mix_, static_cast<i64>(n) * ne);
+}
+
+void Engine::hc_leave(i32 n) {
+    const i64 ne = n_embd_;
+    const i64 hc = hc_.hc;
+    // ws_x_ is `mixed + block_out`, so negating the saved mix and adding it
+    // leaves the block's own contribution -- exact, and it never mixes a
+    // residual sum into the weights the combine applies.
+    be_->scale_act(ws_hc_mix_, -1.0f, n, ne, ne);
+    be_->add_inplace(ws_x_, ws_hc_mix_, static_cast<i64>(n) * ne);
+    // ws_hc_inj_, NOT a weight tensor: the injection is the mixer's per-lane
+    // output, written by hc_enter() into an activation buffer of the backend's
+    // own type. Passing the [wide, hc] WEIGHT through here instead read f16
+    // bytes as f32 lanes, which is the kind of wrong that still runs.
+    be_->hc_combine(ws_hc_, ws_x_, ws_hc_inj_, n, hc, ne);
+}
+
+void Engine::hc_head_mix(i32 row, const f32 *norm_w, const QuantTensor &down,
+                         const QuantTensor &up) {
+    const size_t as = be_->act_size();
+    const i64 ne = n_embd_;
+    const i64 hc = hc_.hc;
+    const i64 wide = hc * ne;
+    const void *lanes = act_at(ws_hc_, as, static_cast<i64>(row) * wide);
+    be_->rmsnorm_grouped(ws_hc_n_, lanes, norm_w, 1, hc, ne, wide,
+                         model_.cfg().rms_eps);
+    be_->scale_act(ws_hc_n_, 1.0f / static_cast<f32>(hc), 1, wide, wide);
+    be_->gemm(ws_hc_lo_, ws_hc_n_, down.data, down.type, hc_.low_rank, wide, 1);
+    be_->silu_act(ws_hc_lo_, hc_.low_rank);
+    be_->gemm(ws_hc_g_, ws_hc_lo_, up.data, up.type, wide, hc_.low_rank, 1);
+    be_->hc_mix(ws_xn_, ws_hc_n_, ws_hc_g_, 1, hc, ne);
+}
+
+const f32 *Engine::hc_debug_lanes(i32 *hc_out, i64 *width_out) const {
+    if (hc_out) *hc_out = 0;
+    if (width_out) *width_out = 0;
+    // Host-visible only: the lane stack lives in device memory on a GPU backend
+    // and a pointer into VRAM would read as garbage. The suite runs on the CPU
+    // backend, which is where this hook is used.
+    if (!hc_active_ || !ws_hc_ || be_->act_size() != sizeof(f32)) return nullptr;
+    if (hc_out) *hc_out = hc_.hc;
+    if (width_out) *width_out = n_embd_;
+    return static_cast<const f32 *>(ws_hc_);
+}
+
 void Engine::head_compute(i32 row) {
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
-    const void *src = act_at(ws_x_, as, static_cast<i64>(row) * n_embd_);
-    be_->rmsnorm(ws_xn_, src, model_.out_norm(), 1, n_embd_, mc.rms_eps,
-                 static_cast<const i32 *>(ws_rexp_) + row);
+    if (hc_active_) {
+        // This family's final mixer IS its output norm -- there is no
+        // output_norm.weight in the file -- so the wide row is mixed through
+        // the head bottleneck instead of normalized, and the result lands in
+        // ws_xn_ at row 0 (one row is mixed at a time).
+        hc_head_mix(row, model_.hc_head_norm(), model_.hc_head_down(),
+                    model_.hc_head_up());
+    } else {
+        const void *src = act_at(ws_x_, as, static_cast<i64>(row) * n_embd_);
+        be_->rmsnorm(ws_xn_, src, model_.out_norm(), 1, n_embd_, mc.rms_eps,
+                     static_cast<const i32 *>(ws_rexp_) + row);
+    }
     const QuantTensor &head = model_.out_head();
     const void *xn = ws_xn_;
     if (model_.had().head_folded) {
@@ -1462,6 +1609,12 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     // that every norm, every non-folded matmul and every dump expects.
     if (model_.had().embd_inverse)
         had_xform(ws_x_, ws_x_, n, n_embd_, /*inverse=*/true, /*gdn_perm=*/false);
+
+    // qwen4exp: the wide residual starts as hc identical copies of the
+    // embedding row. That is the invariant everything downstream is checked
+    // against -- with every lane equal in and a zero injection, the mix is
+    // exactly `xn * sigmoid(gate)` and the lanes stay bit-equal out.
+    if (hc_active_) be_->hc_init(ws_hc_, ws_x_, n, hc_.hc, n_embd_);
 
     AttnDesc d;
     d.n_head = mc.n_head;
@@ -1545,8 +1698,15 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         d.sinks = L.sinks;
         dump_stage("enter", l);
 
-        be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, n, n_embd_, mc.rms_eps,
-                     static_cast<const i32 *>(ws_rexp_));
+        if (hc_active_) {
+            // No plain pre-norm on this family: the mixer is the block's input,
+            // and the injection it also produces is what weights the combine.
+            hc_enter(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
+                     L.hc_attn_inject, n);
+        } else {
+            be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, n, n_embd_, mc.rms_eps,
+                         static_cast<const i32 *>(ws_rexp_));
+        }
 
         if (L.gdn) {
             // nemotron_h_moe Mamba-2 SSM layer
@@ -1565,15 +1725,26 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             }
             // nemotron's mamba-2 blocks have no FFN after the block; only
             // layers that carry FFN weights run one.
+            // The recurrent block has landed in ws_x_ (as the mixed row plus
+            // its output): promote it onto the lanes before the FFN mixes them
+            // again. Unconditional -- a layer that skips its FFN still has to
+            // scatter the block output it did produce.
+            if (hc_active_) hc_leave(n);
             if (!L.nemotron_ssm || L.moe || L.wgate.present()) {
-                be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps,
-                             static_cast<const i32 *>(ws_rexp_));
+                if (hc_active_) {
+                    hc_enter(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
+                             L.hc_ffn_inject, n);
+                } else {
+                    be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_,
+                                 mc.rms_eps, static_cast<const i32 *>(ws_rexp_));
+                }
                 dump_row("ffn.pre", l, ws_xn_, n_embd_, n);
                 if (L.moe) {
                     moe_ffn(L, l, n);
                 } else {
                     dense_ffn(L, l, n);
                 }
+                if (hc_active_) hc_leave(n);
             }
             // The residual leaving a recurrent (or skipped) block: on a stack
             // where the recurrent half is stubbed out this is the only place to
@@ -1791,13 +1962,30 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // round-trips the activation row for nothing. The dump still sees the
         // post-add state, because the fused kernel writes x before it
         // normalizes.
-        be_->add_rmsnorm(ws_xn_, ws_x_, ws_x2_, L.ffn_norm, n, n_embd_,
-                         mc.rms_eps, static_cast<const i32 *>(ws_rexp_));
+        if (hc_active_) {
+            // The fused add_rmsnorm() is the one seam this family cannot use:
+            // the attention output has to reach the LANE STACK before the FFN's
+            // input is mixed from it, and the two are different streams. So the
+            // sum happens on its own, the combine scatters, and the FFN gets a
+            // fresh mix -- three launches where the narrow path pays one.
+            be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
+            hc_leave(n);
+            hc_enter(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
+                     L.hc_ffn_inject, n);
+        } else {
+            be_->add_rmsnorm(ws_xn_, ws_x_, ws_x2_, L.ffn_norm, n, n_embd_,
+                             mc.rms_eps, static_cast<const i32 *>(ws_rexp_));
+        }
         } else {
             // Pure-MoE block: no attention to fold in, so the FFN input norm
             // is applied straight to the residual.
-            be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps,
-                         static_cast<const i32 *>(ws_rexp_));
+            if (hc_active_) {
+                hc_enter(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
+                         L.hc_ffn_inject, n);
+            } else {
+                be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps,
+                             static_cast<const i32 *>(ws_rexp_));
+            }
             dump_row("ffn.pre", l, ws_xn_, n_embd_, n);
         }
         dump_row("attn.res", l, ws_x_, n_embd_, n);
@@ -1819,6 +2007,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         } else if (L.wgate.present()) {
             dense_ffn(L, l, n);
         }
+        if (hc_active_) hc_leave(n);
         dump_stage("attn", l);
     }
     // The MTP probe's feature rows: the same pre-final-norm state DFlash

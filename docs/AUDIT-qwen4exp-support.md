@@ -235,7 +235,28 @@ as `residual_lane += block_out * 2*sigmoid(inject_lane / 4)`. There is **no
    (`mean_lanes`, `lane_scatter`) plus the existing gemms/norms. Verified by a
    CPU fixture whose lanes start identical (the reference starts them as `hc`
    copies of the embedding, so lane 0..3 must stay equal until the first
-   combine, which the test pins).
+   combine, which the test pins). **DONE, and wired into `forward_core`:** the
+   lane stack is `ws_hc_` (`[n, hc, n_embd]`, 10240 wide on this file), each
+   sub-block is bracketed by `hc_enter` / `hc_leave`, and `hc_head_mix` replaces
+   the final norm. The per-lane norm is the existing `rmsnorm_grouped` (the
+   Mamba-2 op is exactly "one weight vector per group"), and the only new
+   backend ops are `hc_init`, `hc_mix`, `hc_combine` and `silu_act`.
+   Two things are worth keeping from building it:
+   (a) the block is handed the MIXED row and adds its own output onto it, so
+   `hc_leave` recovers the block output by subtracting the saved mix -- the
+   residual sum must never enter the weights the combine applies;
+   (b) `hc_leave` scatters with the mixer's per-lane `inject` OUTPUT
+   (`ws_hc_inj_`), not with the `[wide, hc]` weight tensor. Passing the weight
+   read f16 bytes as f32 lanes: it ran, produced finite text, and kept the four
+   lanes equal -- the lane-invariance check is what caught it.
+   Evidence: `test_hc_lanes` 24/24 (arithmetic at 4 x 2560 through 320),
+   `test_qwen4exp_forward` 17/17 (a real 4-lane-of-2560 file through
+   `Engine::init` and `generate`, the lane stack read back at 10240 wide, a
+   lane-varying injection that must separate the lanes and a lane-symmetric one
+   whose lanes must stay **bit-equal**, plus the PLE/QSA refusal), and
+   `kraken-bench --hc` **6 of 6** on the device against the host oracle in
+   `src/hc.cpp`. Removing the scatter from `hc_leave` fails the separation
+   check (16/17), so the invariant is shown able to fail.
 3. **PLE**: host-side n-gram hash -> 16 row indices per token, gathered straight
    out of the mmap (the table is 320,001,536 x 160, i.e. tens of GB and must
    never be uploaded), then key/value projections, per-lane dot gate, and a

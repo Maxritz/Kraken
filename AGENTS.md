@@ -411,6 +411,37 @@ code, the README, or `docs/`.
   does report ROCm0) — a correctness reference, not a speed one.
   `docs/AUDIT-qwen4exp-support.md` has the measured per-piece inventory and the
   CPU-oracle gate each stage must pass before it is enabled.
+- **The hyper-connection stack RUNS now (`hc_*`), and two traps came with it.**
+  The residual is a lane stack (`ws_hc_`, `[n, hc, n_embd]` = 10240 wide on the
+  REAP-288 file); each sub-block is bracketed by `hc_enter`/`hc_leave`, and
+  `hc_head_mix` is the final norm (this family ships no `output_norm`).
+  (1) **A refusal placed above `model_.load()` is dead code, and it reads as a
+  live check.** `Engine::init`'s old hyper-connection refusal sat at the top,
+  where `model_.cfg()` is still empty, so `cfg().hc` was false on every file and
+  generation from a qwen4exp file ran the plain residual while the comment said
+  it was refused. Anything that reads the loader's verdict belongs AFTER the
+  load; the block now sits there, and a `PLE`/`QSA` file is refused by name.
+  (2) **The combine scatters with the mixer's `inject` OUTPUT, not its weight.**
+  `hc_leave` first passed `L.hc_*_inject.data` -- the `[wide, hc]` weight -- to
+  `hc_combine`, which reads f16 *weights* as f32 *lane values*: it ran, it
+  produced finite text, and it left the four lanes equal, so the only thing that
+  caught it was the lane-invariance check.
+  The device half is `src/hip/kernels/hc.hpp` (`hc_init`, `hc_mix`,
+  `hc_combine`, `silu_act`) and `kraken-bench --hc` proves it against the host
+  oracle in `src/hc.cpp` at the real geometry (4 x 2560, 3 tokens): **6 of 6**,
+  with `hc_init` and `lanes-equal` required to be BIT-identical and the rest at
+  an f16-storage tolerance. The suite cannot open the device, so that arm is the
+  only proof the kernels match. `Engine::init` refuses a backend whose
+  `hc_supported()` is false rather than running no-op mixes that leave the stack
+  at its initial value.
+  `test_qwen4exp_forward` drives a real 4-lane-of-2560 file end to end (init,
+  generate, the lane stack read back, a lane-varying injection that must
+  separate the lanes, a lane-symmetric one whose lanes must stay bit-equal, and
+  the PLE/QSA refusal); removing the scatter fails it 16/17. Its fixture keeps
+  `extras=false`: **the arch table says a qwen4exp file has an indexer, so the
+  loader now takes `qsa` from the file's own metadata** (`indexer.head_count` or
+  `compress_ratios`), because a file without one otherwise cannot be refused or
+  run -- it cannot even load. A half-declared indexer is still refused.
 
 ## Line endings (this bites constantly)
 

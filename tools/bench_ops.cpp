@@ -41,6 +41,7 @@
 // (710 GB/s), f16 GEMM 32x4096x4096 = 43.4 µs (772 GB/s, 24.7 TFLOP/s).
 #include <krk/backend.hpp>
 #include <krk/expert_cache.hpp>
+#include <krk/hc.hpp>
 #include <krk/quant.hpp>
 
 #include <algorithm>
@@ -1772,6 +1773,300 @@ int h2d_bench(Backend *be, int iters) {
     return 0;
 }
 
+// ---- hyper-connections (qwen4exp): the device kernels against the host ------
+//
+// The lane-stack ops the qwen4exp forward runs (Backend::hc_init, hc_mix,
+// hc_combine, silu_act). `tests/test_kraken.cpp` pins the HOST arithmetic and
+// the identical-lane invariant on the CPU backend; this arm is the only thing
+// that says the DEVICE kernels implement the same functions, and it exists
+// because the default bodies of those ops write nothing at all: a backend with
+// no implementation leaves the lane stack at its initial value and the model
+// then decodes fluent text that is not this model. No test group opens the
+// device, so nothing in the suite can see that.
+//
+// The oracle is not re-typed here -- it is krk::hc_mix / krk::hc_combine /
+// krk::hc_lane_weight, the same library functions the CPU backend answers
+// with. Geometry is the REAP-288 file's: four lanes of 2560, three tokens.
+// Every input is rounded to f16 before the upload, so both arms see the same
+// numbers and the only difference left is the kernel's arithmetic.
+struct HcCmp {
+    i64 n = 0;
+    i64 differ = 0;
+    i64 max_ulp = 0;
+    f64 max_abs = 0.0;
+    f64 scale = 0.0;
+    f64 tol = 0.0;
+    bool exact = false;
+    bool ok() const { return differ == 0; }
+};
+
+// f32 oracle against an f16 device result. `exact` demands bit equality, which
+// is the only honest bar for a copy and for the identical-lane invariant.
+HcCmp cmp_hc_f32(const std::vector<u16> &got, const std::vector<f32> &want,
+                 bool exact, f64 tol) {
+    HcCmp r;
+    r.n = static_cast<i64>(want.size());
+    r.exact = exact;
+    r.tol = tol;
+    // The tolerance is measured against the oracle's own magnitude, so the
+    // scale is gathered before anything is judged: a running maximum would let
+    // an early small value decide a later large one.
+    for (size_t i = 0; i < want.size(); i++) {
+        const f64 aw = std::fabs(static_cast<f64>(want[i]));
+        if (aw > r.scale) r.scale = aw;
+    }
+    const f64 limit = tol * std::max(1.0, r.scale);
+    for (size_t i = 0; i < want.size(); i++) {
+        const f32 g = fp16_to_fp32(got[i]);
+        const f64 d = std::fabs(static_cast<f64>(g) - static_cast<f64>(want[i]));
+        if (d > r.max_abs) r.max_abs = d;
+        if (exact) {
+            if (got[i] != fp32_to_fp16(want[i])) r.differ++;
+        } else if (d > limit) {
+            r.differ++;
+        }
+    }
+    return r;
+}
+
+void print_hc(const char *what, const char *detail, const HcCmp &r) {
+    if (r.ok()) {
+        std::printf("  %-11s %-22s %s (%lld values)", what, detail,
+                    r.exact ? "BIT-IDENTICAL" : "PASS",
+                    static_cast<long long>(r.n));
+        if (!r.exact)
+            std::printf("  max|d|=%.4g tol=%.3g", r.max_abs, r.tol);
+        std::printf("\n");
+    } else {
+        std::printf("  %-11s %-22s FAIL %lld/%lld  max|d|=%.6g  max %lld ulp"
+                    "  tol=%.3g\n",
+                    what, detail, static_cast<long long>(r.differ),
+                    static_cast<long long>(r.n), r.max_abs,
+                    static_cast<long long>(r.max_ulp), r.tol);
+    }
+}
+
+// Returns how many cases failed. Every case is a device call whose answer the
+// host oracle already knows, so "passed" here means the kernel agreed with the
+// arithmetic the suite pins, not that the call did not crash.
+i64 arm_hc(Backend *be) {
+    std::printf("\nhyper-connections (4 lanes of 2560, 3 tokens):\n");
+    if (!be->hc_supported()) {
+        std::printf("  this backend does not implement the lane-stack ops "
+                    "(hc_supported() is false) -- the qwen4exp forward refuses "
+                    "to run on it\n");
+        return 1;
+    }
+    const i64 ne = 2560, hc = 4, nt = 3;
+    const i64 nl = nt * hc * ne; // one lane stack [nt, hc, ne]
+    const i64 nmix = nt * ne;    // one single-lane stream [nt, ne]
+    const i64 ninj = nt * hc;    // one injection matrix [nt, hc]
+    HcGeometry g;
+    g.n_embd = static_cast<i32>(ne);
+    g.hc = static_cast<i32>(hc);
+    g.low_rank = 320;
+
+    auto q = [](f64 i) {
+        return fp16_to_fp32(
+            fp32_to_fp16(static_cast<f32>(std::sin(0.013 * i) * 2.0)));
+    };
+    std::vector<f32> x(static_cast<size_t>(nmix));
+    std::vector<f32> xn(static_cast<size_t>(nl));
+    std::vector<f32> gate(static_cast<size_t>(nl));
+    std::vector<f32> block(static_cast<size_t>(nmix));
+    std::vector<f32> inject(static_cast<size_t>(ninj));
+    for (i64 i = 0; i < nmix; i++) x[static_cast<size_t>(i)] = q(i + 1);
+    for (i64 i = 0; i < nmix; i++) block[static_cast<size_t>(i)] = q(5 * i + 17);
+    for (i64 i = 0; i < nl; i++) xn[static_cast<size_t>(i)] = q(i + 7);
+    for (i64 i = 0; i < nl; i++) gate[static_cast<size_t>(i)] = q(3 * i + 11);
+    for (i64 i = 0; i < ninj; i++) inject[static_cast<size_t>(i)] = q(9 * i + 23);
+
+    auto up = [](const std::vector<f32> &v) {
+        std::vector<u16> h(v.size());
+        for (size_t i = 0; i < v.size(); i++) h[i] = fp32_to_fp16(v[i]);
+        return h;
+    };
+    const std::vector<u16> xh = up(x), xnh = up(xn), gh = up(gate),
+                           bh = up(block), ih = up(inject);
+
+    void *xd = be->alloc(static_cast<size_t>(nmix) * 2);
+    void *xnd = be->alloc(static_cast<size_t>(nl) * 2);
+    void *gd = be->alloc(static_cast<size_t>(nl) * 2);
+    void *bd = be->alloc(static_cast<size_t>(nmix) * 2);
+    void *id = be->alloc(static_cast<size_t>(ninj) * 2);
+    void *lanes = be->alloc(static_cast<size_t>(nl) * 2);
+    void *mixd = be->alloc(static_cast<size_t>(nmix) * 2);
+    void *res = be->alloc(static_cast<size_t>(nl) * 2);
+    be->upload(xd, xh.data(), xh.size() * 2, 0);
+    be->upload(xnd, xnh.data(), xnh.size() * 2, 0);
+    be->upload(gd, gh.data(), gh.size() * 2, 0);
+    be->upload(bd, bh.data(), bh.size() * 2, 0);
+    be->upload(id, ih.data(), ih.size() * 2, 0);
+
+    auto fetch = [&](const void *src, i64 n) {
+        std::vector<u16> h(static_cast<size_t>(n));
+        be->download(h.data(), src, h.size() * 2);
+        return h;
+    };
+    i64 failed = 0;
+
+    // (1) hc_init: all hc lanes start as copies of the embedding row. A copy,
+    // so bit equality is the bar.
+    {
+        be->hc_init(lanes, xd, nt, hc, ne);
+        const std::vector<u16> got = fetch(lanes, nl);
+        std::vector<f32> want(static_cast<size_t>(nl));
+        for (i64 t = 0; t < nt; t++)
+            for (i64 c = 0; c < hc; c++)
+                for (i64 e = 0; e < ne; e++)
+                    want[static_cast<size_t>((t * hc + c) * ne + e)] =
+                        x[static_cast<size_t>(t * ne + e)];
+        const HcCmp r = cmp_hc_f32(got, want, true, 0.0);
+        print_hc("hc_init", "lanes <- embedding", r);
+        if (!r.ok()) failed++;
+    }
+
+    // (2) hc_mix: mean over lanes of xn * sigmoid(gate). The oracle is
+    // krk::hc_mix, the same function the CPU backend answers with.
+    {
+        be->hc_mix(mixd, xnd, gd, nt, hc, ne);
+        const std::vector<u16> got = fetch(mixd, nmix);
+        std::vector<f32> want(static_cast<size_t>(nmix), 0.0f);
+        krk::hc_mix(want.data(), xn.data(), gate.data(), static_cast<i32>(nt), g);
+        const HcCmp r = cmp_hc_f32(got, want, false, 2e-3);
+        print_hc("hc_mix", "mean(xn*sigmoid(gate))", r);
+        if (!r.ok()) failed++;
+    }
+
+    // (3) hc_combine: res_lane += block_out * 2*sigmoid(inject/hc). The lane
+    // weights are the shared centred rule, so a plain sigmoid here would show.
+    {
+        be->hc_init(res, xd, nt, hc, ne);
+        be->hc_combine(res, bd, id, nt, hc, ne);
+        const std::vector<u16> got = fetch(res, nl);
+        std::vector<f32> want(static_cast<size_t>(nl), 0.0f);
+        for (i64 t = 0; t < nt; t++)
+            for (i64 c = 0; c < hc; c++)
+                for (i64 e = 0; e < ne; e++)
+                    want[static_cast<size_t>((t * hc + c) * ne + e)] =
+                        x[static_cast<size_t>(t * ne + e)];
+        krk::hc_combine(want.data(), block.data(), inject.data(),
+                        static_cast<i32>(nt), g);
+        const HcCmp r = cmp_hc_f32(got, want, false, 2e-3);
+        print_hc("hc_combine", "res += out*2*sigmoid(inj/hc)", r);
+        // The lane weight itself, on the same values: 2*sigmoid(0) is exactly
+        // 1, so an un-injected lane gets the block output once and only once.
+        // Part of this case, not a case of its own.
+        const f32 w0 = krk::hc_lane_weight(0.0f, static_cast<i32>(hc));
+        if (!(w0 == 1.0f)) {
+            std::printf("  %-11s %-22s FAIL w(0) = %.9g, not exactly 1\n",
+                        "hc_combine", "zero injection is identity",
+                        static_cast<f64>(w0));
+        }
+        if (!r.ok() || !(w0 == 1.0f)) failed++;
+    }
+
+    // (4) silu_act: x <- x * sigmoid(x), the mixer's low-rank nonlinearity.
+    {
+        void *sd = be->alloc(static_cast<size_t>(nl) * 2);
+        be->upload(sd, gh.data(), gh.size() * 2, 0);
+        be->silu_act(sd, nl);
+        const std::vector<u16> got = fetch(sd, nl);
+        std::vector<f32> want(static_cast<size_t>(nl));
+        for (i64 i = 0; i < nl; i++) {
+            const f32 v = gate[static_cast<size_t>(i)];
+            want[static_cast<size_t>(i)] = v / (1.0f + std::exp(-v));
+        }
+        const HcCmp r = cmp_hc_f32(got, want, false, 2e-3);
+        print_hc("silu_act", "x*sigmoid(x)", r);
+        if (!r.ok()) failed++;
+        be->release(sd);
+    }
+
+    // (5) The identical-lane invariant, on the device. All hc lanes equal and
+    // the injection exactly zero: every lane weight is 1, so the lanes stay
+    // BIT-identical through a combine, and the mix collapses to
+    // xn * sigmoid(gate) on one lane. This is the property the CPU fixture
+    // pins; a kernel that summed lanes with the wrong stride, or that read the
+    // gate of lane 0 for every lane, fails here and not in the suite.
+    {
+        std::vector<f32> eq_xn(static_cast<size_t>(nl));
+        std::vector<f32> eq_gate(static_cast<size_t>(nl));
+        for (i64 t = 0; t < nt; t++)
+            for (i64 c = 0; c < hc; c++)
+                for (i64 e = 0; e < ne; e++) {
+                    eq_xn[static_cast<size_t>((t * hc + c) * ne + e)] =
+                        xn[static_cast<size_t>(t * ne + e)];
+                    eq_gate[static_cast<size_t>((t * hc + c) * ne + e)] =
+                        gate[static_cast<size_t>(t * ne + e)];
+                }
+        const std::vector<u16> exnh = up(eq_xn), egh = up(eq_gate);
+        std::vector<u16> zero_h(static_cast<size_t>(ninj), 0);
+        be->upload(xnd, exnh.data(), exnh.size() * 2, 0);
+        be->upload(gd, egh.data(), egh.size() * 2, 0);
+        be->upload(id, zero_h.data(), zero_h.size() * 2, 0);
+        be->hc_init(res, xd, nt, hc, ne);
+        be->hc_combine(res, bd, id, nt, hc, ne);
+        const std::vector<u16> got = fetch(res, nl);
+        i64 differ = 0;
+        for (i64 t = 0; t < nt; t++)
+            for (i64 c = 1; c < hc; c++)
+                for (i64 e = 0; e < ne; e++) {
+                    const i64 a = (t * hc) * ne + e;
+                    const i64 b = (t * hc + c) * ne + e;
+                    if (got[static_cast<size_t>(a)] != got[static_cast<size_t>(b)])
+                        differ++;
+                }
+        std::printf("  %-11s %-22s %s", "lanes-equal", "inject 0 keeps lanes",
+                    differ == 0 ? "BIT-IDENTICAL" : "FAIL");
+        if (differ == 0) {
+            std::printf(" (%lld values)\n",
+                        static_cast<long long>(nt * (hc - 1) * ne));
+        } else {
+            std::printf("  %lld/%lld lanes differ\n",
+                        static_cast<long long>(differ),
+                        static_cast<long long>(nt * (hc - 1) * ne));
+            failed++;
+        }
+
+        be->hc_mix(mixd, xnd, gd, nt, hc, ne);
+        const std::vector<u16> mg = fetch(mixd, nmix);
+        std::vector<f32> want(static_cast<size_t>(nmix), 0.0f);
+        krk::hc_mix(want.data(), eq_xn.data(), eq_gate.data(),
+                    static_cast<i32>(nt), g);
+        // One ulp: the kernel sums hc equal terms and divides once, the oracle
+        // does the same, so only the f16 output rounding may differ.
+        std::vector<u16> want_h(want.size());
+        for (size_t i = 0; i < want.size(); i++) want_h[i] = fp32_to_fp16(want[i]);
+        const BitExact r = cmp_half(mg, want_h, nmix);
+        std::printf("  %-11s %-22s %s", "lanes-mix", "collapse == one lane",
+                    r.max_ulp <= 1 ? (r.differ == 0 ? "BIT-IDENTICAL" : "PASS")
+                                   : "FAIL");
+        if (r.max_ulp <= 1)
+            std::printf(" (%lld values, max %lld ulp)\n",
+                        static_cast<long long>(r.n),
+                        static_cast<long long>(r.max_ulp));
+        else {
+            std::printf("  max %lld ulp, %lld values differ\n",
+                        static_cast<long long>(r.max_ulp),
+                        static_cast<long long>(r.differ));
+            failed++;
+        }
+    }
+
+    be->release(xd);
+    be->release(xnd);
+    be->release(gd);
+    be->release(bd);
+    be->release(id);
+    be->release(lanes);
+    be->release(mixd);
+    be->release(res);
+    std::printf("  hc: %lld of 6 cases%s\n", static_cast<long long>(6 - failed),
+                failed == 0 ? " identical" : " failed");
+    return failed;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1781,6 +2076,7 @@ int main(int argc, char **argv) {
     bool sweep = false;
     bool gate = false;
     bool bitexact = false;
+    bool hc_test = false;
     bool floor = false;
     bool h2d = false;
     i64 failures = 0;
@@ -1796,6 +2092,7 @@ int main(int argc, char **argv) {
         else if (a == "--sweep") sweep = true;
         else if (a == "--gate") gate = true;
         else if (a == "--bitexact") bitexact = true;
+        else if (a == "--hc") hc_test = true;
         else if (a == "--floor") floor = true;
         else if (a == "--h2d") h2d = true;
         else if (a.rfind("--dtype", 0) == 0) {
@@ -1895,6 +2192,10 @@ int main(int argc, char **argv) {
     }
 
     if (bitexact) failures += arm_rows_bitexact(be);
+
+    // Device-only, so it is its own flag rather than part of --gate: the gate
+    // must stay runnable on a box where the device is busy.
+    if (hc_test) failures += arm_hc(be);
 
     if (gate || sweep) {
         std::printf("\nexpert-lease (device):\n");

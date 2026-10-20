@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "krk/backend.hpp"
+#include "krk/hc.hpp"
 #include "krk/expert_cpu.hpp"
 #include "krk/kv_tier.hpp"
 #include "krk/draft_head.hpp"
@@ -489,6 +490,12 @@ public:
     const Tokenizer &tokenizer() const { return tok_; }
     // Debug: logits from the most recent forward (n_vocab floats).
     const f32 *last_logits() const { return logits_host_; }
+    // Test hook, qwen4exp only: the hyper-connection lane stack after the last
+    // forward pass, as f32 host rows [n_tok, hc, n_embd], or nullptr when the
+    // file carries no lane stack (or the backend keeps it on device only). The
+    // suite pins the identical-lane invariant through the REAL forward path
+    // with this -- hc.cpp proves the arithmetic, this proves the wiring.
+    const f32 *hc_debug_lanes(i32 *hc_out, i64 *width_out) const;
     // Hash of every dumped activation stage of the LAST prefill, folded
     // per (stage, layer) in sorted-key order. Bit-exact: two prefills of
     // the same prompt at different --chunk values must return the same
@@ -575,6 +582,20 @@ private:
     // under KRK_DUMP, whose projection stage reads `scratch`.
     void gemm_residual(void *dst, const void *x, const void *w, DType wt,
                        i64 n_out, i64 n_in, i64 rows, void *scratch);
+    // ---- qwen4exp hyper-connections --------------------------------------
+    // The lane stack replaces the single residual stream: each sub-block is
+    // bracketed by a mix (lanes -> one row, left in ws_xn_ AND ws_x_) and a
+    // combine (the block's output -> every lane). `hc_enter` also saves the
+    // mixed row, because the block adds its output onto the row it was handed
+    // and the combine needs the block output alone.
+    void hc_enter(const f32 *norm_w, const QuantTensor &down,
+                  const QuantTensor &up, const QuantTensor &inject, i32 n);
+    void hc_leave(i32 n);
+    // The head's mixer: row `row` of the lane stack -> one f32 row in ws_xn_.
+    // There is no injection (nothing is scattered back) and no output_norm --
+    // this mixer IS the final norm on this family.
+    void hc_head_mix(i32 row, const f32 *norm_w, const QuantTensor &down,
+                     const QuantTensor &up);
     // Chooses the expert residency budget from cfg_ and the device.
     // Chooses the device-side expert budget. Returns false with *err set when
     // an explicit --expert-cache-mb cannot fit the card, which is a refusal
@@ -806,6 +827,17 @@ private:
     void *ws_x_ = nullptr;    // [chunk, n_embd]
     void *ws_xn_ = nullptr;   // [chunk, n_embd]
     void *ws_x2_ = nullptr;   // [chunk, n_embd]
+    // qwen4exp's lane stack and its mixer workspaces. All null unless the file
+    // declares hyper_connection.count > 1; `hc_active_` is the single switch
+    // the forward pass tests, so every other family runs the code it ran.
+    bool hc_active_ = false;
+    HcGeometry hc_;
+    void *ws_hc_ = nullptr;     // [chunk, hc*n_embd] the lanes
+    void *ws_hc_n_ = nullptr;   // [chunk, hc*n_embd] normed lanes
+    void *ws_hc_g_ = nullptr;   // [chunk, hc*n_embd] mixer up-projection
+    void *ws_hc_lo_ = nullptr;  // [chunk, low_rank]
+    void *ws_hc_inj_ = nullptr; // [chunk, hc]
+    void *ws_hc_mix_ = nullptr; // [chunk, n_embd] the mixed row + its negation
     void *ws_q_ = nullptr;    // [chunk, q_dim]
     // [chunk, q_proj] the raw query projection: Qwen3.5 packs a per-head
     // output gate behind the query, so its projection is twice as wide as the

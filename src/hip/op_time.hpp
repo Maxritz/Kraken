@@ -348,6 +348,13 @@ static const char *component_of(const char *op) {
         {"gemm_group", "projections"},
         {"gemm_simt", "projections"},
         {"silu_mul", "ffn-activate"},
+        {"silu_act", "ffn-activate"},
+        // qwen4exp hyper-connections: the lane stack's own ops, which are
+        // neither a row norm nor a residual add. Kept in their own bucket so a
+        // mixed profile still says how much of the step the mixer is worth.
+        {"hc_init", "hyper"},
+        {"hc_mix", "hyper"},
+        {"hc_combine", "hyper"},
         {"add_inplace", "residual"},
         {"add_bias_rows", "bias"},
         {"add_bias_cols", "bias"},

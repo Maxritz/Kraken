@@ -25,6 +25,7 @@
 #include "kernels/gemm_dp4a.hpp"
 #include "kernels/gdn.hpp"
 #include "kernels/hadamard.hpp"
+#include "kernels/hc.hpp"
 #include "op_time.hpp"
 
 // Declared here rather than at their definitions (below the class) so the
@@ -2424,6 +2425,56 @@ public:
             const unsigned fb = static_cast<unsigned>((rows + 255) / 256);
             fill_f32_kernel<<<fb, 256>>>(row_scale, 1.0f, rows);
         }
+    }
+
+    // ---- hyper-connections (qwen4exp) -----------------------------------
+    // The lane axis sits INSIDE a token's row, so none of the ops above can
+    // express these: rmsnorm reduces a row, add_bias_cols broadcasts a column,
+    // and the mean here is over hc blocks of the same row. kernels/hc.hpp has
+    // the arithmetic; the CPU backend's krk::hc_mix/hc_combine are the oracle
+    // `kraken-bench --hc` compares these kernels against, and the accumulation
+    // order (lanes in c order, one divide at the end) is that oracle's.
+    bool hc_supported() const override { return true; }
+
+    void hc_init(void *lanes, const void *x, i64 n_tok, i64 hc, i64 ne) override {
+        KRK_TIME_OP("hc_init");
+        if (n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        const i64 total = n_tok * hc * ne;
+        const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
+        hc_init_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(lanes),
+                                             static_cast<const _Float16 *>(x),
+                                             n_tok, hc, ne);
+    }
+
+    void hc_mix(void *mixed, const void *xn, const void *gate, i64 n_tok,
+                i64 hc, i64 ne) override {
+        KRK_TIME_OP("hc_mix");
+        if (n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        const i64 total = n_tok * ne;
+        const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
+        hc_mix_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(mixed),
+                                            static_cast<const _Float16 *>(xn),
+                                            static_cast<const _Float16 *>(gate),
+                                            n_tok, hc, ne);
+    }
+
+    void hc_combine(void *res, const void *block_out, const void *inject,
+                    i64 n_tok, i64 hc, i64 ne) override {
+        KRK_TIME_OP("hc_combine");
+        if (n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        const i64 total = n_tok * ne;
+        const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
+        hc_combine_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(res),
+                                                static_cast<const _Float16 *>(block_out),
+                                                static_cast<const _Float16 *>(inject),
+                                                n_tok, hc, ne);
+    }
+
+    void silu_act(void *x, i64 n) override {
+        KRK_TIME_OP("silu_act");
+        if (n <= 0) return;
+        const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
+        silu_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(x), n);
     }
 
     void add_bias_rows(void *out, const f32 *bias, i64 n, i64 rows) override {

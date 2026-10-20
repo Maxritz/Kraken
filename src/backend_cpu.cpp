@@ -8,6 +8,7 @@
 // here, which is why the engine asks the backend for its activation
 // type instead of assuming f16.
 #include "krk/backend.hpp"
+#include "krk/hc.hpp"
 #include "krk/vram_guard.hpp"
 #include "par_pool.hpp"
 
@@ -534,6 +535,65 @@ public:
                             const f32 inv = 1.0f / std::sqrt(ss + eps);
                             for (i64 i = 0; i < hd; i++) dh[i] = sh[i] * inv;
                         }
+                    }
+                });
+    }
+
+    // ---- hyper-connections (qwen4exp) ------------------------------------
+    //
+    // The CPU backend is the reference arm for the qwen4exp stack, so these
+    // delegate to the host maths in hc.cpp rather than repeating it: the suite
+    // pins hc.cpp's arithmetic, and a second copy here would be a second thing
+    // to keep in step.
+    bool hc_supported() const override { return true; }
+
+    void hc_init(void *lanes, const void *x, i64 n_tok, i64 hc, i64 ne) override {
+        f32 *o = static_cast<f32 *>(lanes);
+        const f32 *s = static_cast<const f32 *>(x);
+        if (!o || !s || n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        // One thread per embedding element, writing its hc copies: the lanes of
+        // one token are a contiguous block, so this is hc stores per element
+        // and no second pass.
+        par_for(n_tok * ne, 4096, static_cast<f64>(n_tok * ne) * hc,
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const i64 t = i / ne;
+                        const i64 r = i % ne;
+                        const f32 v = s[i];
+                        for (i64 c = 0; c < hc; c++) o[(t * hc + c) * ne + r] = v;
+                    }
+                });
+    }
+
+    void hc_mix(void *mixed, const void *xn, const void *gate, i64 n_tok,
+                i64 hc, i64 ne) override {
+        HcGeometry g;
+        g.n_embd = static_cast<i32>(ne);
+        g.hc = static_cast<i32>(hc);
+        g.low_rank = 1; // not a mixer geometry; only the lane count is read
+        // Qualified: the member name is the op, the free function is the maths.
+        krk::hc_mix(static_cast<f32 *>(mixed), static_cast<const f32 *>(xn),
+                    static_cast<const f32 *>(gate), static_cast<i32>(n_tok), g);
+    }
+
+    void hc_combine(void *res, const void *block_out, const void *inject,
+                    i64 n_tok, i64 hc, i64 ne) override {
+        HcGeometry g;
+        g.n_embd = static_cast<i32>(ne);
+        g.hc = static_cast<i32>(hc);
+        g.low_rank = 1;
+        krk::hc_combine(static_cast<f32 *>(res),
+                        static_cast<const f32 *>(block_out),
+                        static_cast<const f32 *>(inject), static_cast<i32>(n_tok), g);
+    }
+
+    void silu_act(void *x, i64 n) override {
+        f32 *p = static_cast<f32 *>(x);
+        par_for(n, 8192, 4.0 * static_cast<f64>(n),
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const f32 v = p[i];
+                        p[i] = v / (1.0f + std::exp(-v));
                     }
                 });
     }

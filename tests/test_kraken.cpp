@@ -8074,14 +8074,21 @@ static const char *kQ4TestPath = "kraken-q4-test.gguf";
 // expert MoE shrunk to 4. Structurally the REAP-288 file's schema at 1/320 the
 // width, so the loader's geometry checks and the lane arithmetic are exercised
 // without 78 GiB of weights.
-static bool build_tiny_q4_model(const std::string &path, int hc_down_rows) {
-    const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
+static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
+                                int n_embd_arg = 0, int low_rank_arg = 0,
+                                bool extras = true,
+                                bool identical_inject = false) {
+    // The two numbers the forward test scales up to the real file's shape: four
+    // lanes of 2560, mixed through a 32-wide bottleneck (the REAP-288 file
+    // mixes through 320; 32 keeps the fixture a few MB instead of 100).
+    const int n_embd = n_embd_arg > 0 ? n_embd_arg : 32;
+    const int n_head = 4, n_kv = 2, hd = 8;
     const int d_state = 8, n_k_head = 2, n_v_head = 4, conv_k = 4;
     const int rope_dim = 4;
     const int key_dim = n_k_head * d_state;      // 16
     const int value_dim = n_v_head * d_state;    // 32
     const int conv_dim = key_dim * 2 + value_dim; // 64
-    const int hc = 4, low_rank = 8;
+    const int hc = 4, low_rank = low_rank_arg > 0 ? low_rank_arg : 8;
     const int wide = n_embd * hc;                 // 128
     const int interval = 2;
     const int n_layer = 2;
@@ -8121,19 +8128,24 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows) {
     // The three pieces that make this family what it is.
     b.meta_u32(arch + ".hyper_connection.count", static_cast<u32>(hc));
     b.meta_u32(arch + ".hyper_connection.low_rank", static_cast<u32>(low_rank));
-    b.meta_u32(arch + ".attention.indexer.head_count", static_cast<u32>(idx_h));
-    b.meta_u32(arch + ".attention.indexer.key_length", static_cast<u32>(idx_dim));
-    b.meta_u32(arch + ".attention.indexer.top_k", 16);
-    b.meta_i32_array(arch + ".attention.compress_ratios", {0, 2});
-    b.meta_i32_array(arch + ".ple.layers", {0});
-    b.meta_u32(arch + ".ple.ngram_size", 2);
-    b.meta_u32(arch + ".ple.heads_per_ngram", static_cast<u32>(ple_heads));
-    b.meta_u32(arch + ".ple.conv_kernel", static_cast<u32>(ple_conv));
-    b.meta_u32(arch + ".ple.eos_token_id", 258);
-    b.meta_u32(arch + ".embedding_length_per_layer_input", static_cast<u32>(ple_dim));
-    b.meta_i32_array(arch + ".ple.layer_multipliers", {1, 1});
-    b.meta_i32_array(arch + ".ple.head_offsets", {0});
-    b.meta_i32_array(arch + ".ple.head_vocab_sizes", {ple_rows});
+    // The indexer and the PLE module are the two pieces the forward pass does
+    // not run yet, and Engine::init refuses a file that carries either. The
+    // fixture can leave them out so the residual stack is what is under test.
+    if (extras) {
+        b.meta_u32(arch + ".attention.indexer.head_count", static_cast<u32>(idx_h));
+        b.meta_u32(arch + ".attention.indexer.key_length", static_cast<u32>(idx_dim));
+        b.meta_u32(arch + ".attention.indexer.top_k", 16);
+        b.meta_i32_array(arch + ".attention.compress_ratios", {0, 2});
+        b.meta_i32_array(arch + ".ple.layers", {0});
+        b.meta_u32(arch + ".ple.ngram_size", 2);
+        b.meta_u32(arch + ".ple.heads_per_ngram", static_cast<u32>(ple_heads));
+        b.meta_u32(arch + ".ple.conv_kernel", static_cast<u32>(ple_conv));
+        b.meta_u32(arch + ".ple.eos_token_id", 258);
+        b.meta_u32(arch + ".embedding_length_per_layer_input", static_cast<u32>(ple_dim));
+        b.meta_i32_array(arch + ".ple.layer_multipliers", {1, 1});
+        b.meta_i32_array(arch + ".ple.head_offsets", {0});
+        b.meta_i32_array(arch + ".ple.head_vocab_sizes", {ple_rows});
+    }
     add_spm_vocab(b, vocab);
 
     auto vec = [](size_t n, i64 base) {
@@ -8173,8 +8185,18 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows) {
                          vec(static_cast<size_t>(down_in) * low_rank, 4700 + l * 100));
             b.tensor_f16(q + "up.weight", {u64(low_rank), u64(wide)},
                          vec(static_cast<size_t>(low_rank) * wide, 4900 + l * 100));
-            b.tensor_f16(q + "inject.weight", {u64(wide), u64(hc)},
-                         vec(static_cast<size_t>(wide) * hc, 5100 + l * 100));
+            // The injection is the ONLY thing that can separate the lanes:
+            // every other mixer tensor is lane-symmetric, and the stack starts
+            // as hc copies of one embedding row. `identical_inject` writes the
+            // same column for every lane, which is the arm whose lanes must
+            // stay bit-equal through the whole stack.
+            std::vector<f32> inj(static_cast<size_t>(wide) * hc);
+            for (size_t i = 0; i < inj.size(); i++) {
+                const i64 e = static_cast<i64>(i % static_cast<size_t>(wide));
+                inj[i] = wv(5100 + l * 100 + (identical_inject ? e
+                                                              : static_cast<i64>(i)));
+            }
+            b.tensor_f16(q + "inject.weight", {u64(wide), u64(hc)}, inj);
         }
 
         if (((l + 1) % interval) != 0) {
@@ -8212,15 +8234,18 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows) {
                          vec(static_cast<size_t>(q_dim) * n_embd, 400));
             b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
             b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
-            b.tensor_f16(p + "indexer.q_proj.weight", {u64(n_embd), u64(idx_h * idx_dim)},
-                         vec(static_cast<size_t>(n_embd) * idx_h * idx_dim, 800));
-            b.tensor_f16(p + "indexer.k_proj.weight", {u64(n_embd), u64(idx_dim)},
-                         vec(static_cast<size_t>(n_embd) * idx_dim, 900));
-            b.tensor_f32(p + "indexer.q_norm.weight", {u64(idx_dim)}, ones(idx_dim));
-            b.tensor_f32(p + "indexer.k_norm.weight", {u64(idx_dim)}, ones(idx_dim));
+            if (extras) {
+                b.tensor_f16(p + "indexer.q_proj.weight",
+                             {u64(n_embd), u64(idx_h * idx_dim)},
+                             vec(static_cast<size_t>(n_embd) * idx_h * idx_dim, 800));
+                b.tensor_f16(p + "indexer.k_proj.weight", {u64(n_embd), u64(idx_dim)},
+                             vec(static_cast<size_t>(n_embd) * idx_dim, 900));
+                b.tensor_f32(p + "indexer.q_norm.weight", {u64(idx_dim)}, ones(idx_dim));
+                b.tensor_f32(p + "indexer.k_norm.weight", {u64(idx_dim)}, ones(idx_dim));
+            }
         }
 
-        if (l == 0) {
+        if (extras && l == 0) {
             b.tensor_f16(p + "ple_key.weight", {u64(n_embd), u64(wide)},
                          vec(static_cast<size_t>(n_embd) * wide, 5300));
             b.tensor_f16(p + "ple_value.weight", {u64(n_embd), u64(n_embd)},
@@ -8359,6 +8384,177 @@ static void test_qwen4exp_schema() {
 #endif
 }
 
+// The residual stack this family runs, end to end on the reference backend.
+//
+// The loader test above proves the tensors are read; hc.cpp proves the lane
+// arithmetic; this proves the two are wired to each other -- a four-lane file
+// initialises, generates, and keeps the lane invariant the arithmetic promises,
+// through the real forward pass. The pieces the forward does not run yet (PLE,
+// the QSA indexer) are left out of the fixture, so a pass here is the stack.
+static void test_qwen4exp_forward() {
+    const std::string wide_path = "kraken-q4fwd.gguf";
+    const std::string same_path = "kraken-q4same.gguf";
+    const std::string full_path = "kraken-q4full.gguf";
+    CHECK(build_tiny_q4_model(wide_path, 0, 2560, 32, false, false),
+          "a four-lane-of-2560 file writes (no PLE, no indexer)");
+    CHECK(build_tiny_q4_model(same_path, 0, 0, 0, false, true),
+          "and a lane-symmetric one (one injection column for all four lanes)");
+    CHECK(build_tiny_q4_model(full_path, 0, 0, 0, true, false),
+          "and the full-schema file the refusal is checked on");
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+
+    // ---- the real lane width: four lanes of 2560 ------------------------
+    {
+        Backend *cpu = make_cpu_backend();
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = wide_path;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            std::string err;
+            const bool ok = engine.init(cpu, cfg, &err);
+            CHECK(ok, "the hyper-connection stack initialises (this was refused)");
+            if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+            if (ok) {
+                GenerateParams p;
+                p.prompt = "the";
+                p.max_tokens = 4;
+                p.sampler.greedy = true;
+                GenerateResult r1, r2;
+                CHECK(engine.generate(p, &r1), "a four-lane model generates");
+                // This fixture's output matrix is synthetic, so its argmax is
+                // a special token about as often as any other id: the run is
+                // allowed to stop on EOS at token 0. What it may NOT do is fail,
+                // and the lane check below is the proof the stack ran (the
+                // prompt's own forward is what writes the lane stack).
+                CHECK(r1.finish != FinishError, "... and finishes without an error");
+                CHECK(r1.prompt_tokens >= 1, "... after tokenising the prompt");
+                CHECK(engine.generate(p, &r2) && r1.tokens == r2.tokens,
+                      "... and does it deterministically");
+
+                i32 hc = 0;
+                i64 ne = 0;
+                const f32 *lanes = engine.hc_debug_lanes(&hc, &ne);
+                CHECK(lanes != nullptr && hc == 4 && ne == 2560,
+                      "the lane stack is four lanes of 2560");
+                if (lanes) {
+                    // Every other mixer tensor is lane-symmetric, so the
+                    // injection is what separates the lanes -- and it must, or
+                    // the combine never read it.
+                    bool diverged = false;
+                    for (i32 c = 1; c < hc && !diverged; c++) {
+                        for (i64 e = 0; e < ne; e++) {
+                            if (lanes[static_cast<i64>(c) * ne + e] != lanes[e]) {
+                                diverged = true;
+                                break;
+                            }
+                        }
+                    }
+                    CHECK(diverged, "a lane-varying injection separates the lanes");
+                    bool finite = true;
+                    for (i64 i = 0; i < static_cast<i64>(hc) * ne && finite; i++) {
+                        const f32 v = lanes[i];
+                        if (!(v == v) || v > 1e6f || v < -1e6f) finite = false;
+                    }
+                    CHECK(finite, "and the lane values stay finite");
+                }
+            }
+        }
+        delete cpu;
+    }
+
+    // ---- the invariant: lane-symmetric injection keeps the lanes equal ----
+    {
+        Backend *cpu = make_cpu_backend();
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = same_path;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            std::string err;
+            const bool ok = engine.init(cpu, cfg, &err);
+            CHECK(ok, "the lane-symmetric file initialises");
+            if (ok) {
+                GenerateParams p;
+                p.prompt = "the";
+                p.max_tokens = 3;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                CHECK(engine.generate(p, &r) && r.generated > 0,
+                      "... and generates");
+                i32 hc = 0;
+                i64 ne = 0;
+                const f32 *lanes = engine.hc_debug_lanes(&hc, &ne);
+                CHECK(lanes != nullptr && hc == 4,
+                      "its lane stack is four lanes");
+                if (lanes) {
+                    // The identical-lane invariant, through the whole stack:
+                    // one weight per lane, so the combine is the identity on
+                    // the lane structure and four copies stay four copies --
+                    // BIT-equal, not approximately.
+                    i64 differ = 0;
+                    f32 worst = 0.0f;
+                    for (i32 c = 1; c < hc; c++) {
+                        for (i64 e = 0; e < ne; e++) {
+                            const f32 a = lanes[e];
+                            const f32 b = lanes[static_cast<i64>(c) * ne + e];
+                            if (a != b) {
+                                differ++;
+                                const f32 d = a > b ? a - b : b - a;
+                                if (d > worst) worst = d;
+                            }
+                        }
+                    }
+                    if (differ) {
+                        std::fprintf(stderr,
+                                     "  (lanes differ in %lld of %lld values, worst %.3g)\n",
+                                     static_cast<long long>(differ),
+                                     static_cast<long long>(3 * ne * hc),
+                                     static_cast<double>(worst));
+                    }
+                    CHECK(differ == 0,
+                          "with one injection column the lanes are still bit-equal");
+                }
+            }
+        }
+        delete cpu;
+    }
+
+    // ---- what is still not run is refused, by name ----------------------
+    {
+        Backend *cpu = make_cpu_backend();
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = full_path;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            std::string err;
+            const bool ok = engine.init(cpu, cfg, &err);
+            CHECK(!ok, "a file carrying PLE or the QSA indexer is refused");
+            CHECK(err.find("per-layer token embeddings") != std::string::npos ||
+                      err.find("indexer") != std::string::npos,
+                  "... and the message names the stage that is missing");
+        }
+        delete cpu;
+    }
+
+    std::remove(wide_path.c_str());
+    std::remove(same_path.c_str());
+    std::remove(full_path.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
 #define TEST_GROUP(fn) {#fn, fn, nullptr},
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
@@ -8414,6 +8610,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_hc_lanes)
     TEST_GROUP(test_ple_hash)
     TEST_GROUP(test_qwen4exp_schema)
+    TEST_GROUP(test_qwen4exp_forward)
     TEST_GROUP(test_cpu_expert_pool)
     TEST_GROUP(test_gdn_ops)
     TEST_GROUP(test_gdn_model_loads)

@@ -841,6 +841,45 @@ public:
     }
     virtual void mul_act(void *a, const void *b, i64 n) { (void)a; (void)b; (void)n; }
 
+    // ---- hyper-connections (qwen4exp) ------------------------------------
+    //
+    // A qwen4exp stack does not carry one residual stream: it carries `hc` of
+    // them (4), all n_embd wide, kept token-major as [n_tok, hc, n_embd]. Every
+    // sub-block reads a MIX of the lanes and writes back into all of them, so
+    // the three operations a plain `x += f(x)` residual cannot express live
+    // here. The algebra and the invariant they keep -- all lanes equal in, all
+    // lanes equal out while the injection is zero -- are in hc.hpp.
+    //
+    // A backend that does not implement them says so through hc_supported()
+    // rather than running a default that writes nothing: a no-op hc_combine
+    // leaves the lane stack at its initial value and the model decodes fluent
+    // text that is not this model, which is the exact failure mode the
+    // capability flag exists to prevent.
+    virtual bool hc_supported() const { return false; }
+
+    // lanes[t, c, e] <- x[t, e]: all hc lanes start as copies of the embedding
+    // row (the reference's repeat_4d).
+    virtual void hc_init(void *lanes, const void *x, i64 n_tok, i64 hc, i64 ne) {
+        (void)lanes; (void)x; (void)n_tok; (void)hc; (void)ne;
+    }
+    // mixed[t, e] <- (1/hc) * sum_c xn[t, c, e] * sigmoid(gate[t, c, e]).
+    // `gate` is pre-sigmoid (the mixer's up-projection output).
+    virtual void hc_mix(void *mixed, const void *xn, const void *gate, i64 n_tok,
+                        i64 hc, i64 ne) {
+        (void)mixed; (void)xn; (void)gate; (void)n_tok; (void)hc; (void)ne;
+    }
+    // res[t, c, e] += block_out[t, e] * (2 * sigmoid(inject[t, c] / hc)).
+    // The 2*sigmoid centring is what makes a zero injection a plain residual
+    // add on every lane; see hc_lane_weight().
+    virtual void hc_combine(void *res, const void *block_out, const void *inject,
+                            i64 n_tok, i64 hc, i64 ne) {
+        (void)res; (void)block_out; (void)inject; (void)n_tok; (void)hc; (void)ne;
+    }
+    // x <- x * sigmoid(x), in place: the mixer's low-rank nonlinearity, and NOT
+    // silu_mul() (which needs a second operand) nor sigmoid_act() (which drops
+    // the x factor).
+    virtual void silu_act(void *x, i64 n) { (void)x; (void)n; }
+
     // Per-head broadcast product (laguna's attention output gate):
     //   x[t, h, i] *= g[t, h]     for i in [0, hd)
     // `x` is [n_tok, n_head*hd] and `g` is a dense [n_tok, n_head] row-major

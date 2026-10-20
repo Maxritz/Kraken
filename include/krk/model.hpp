@@ -597,6 +597,9 @@ public:
     const QuantTensor &tok_embd() const { return tok_embd_; }
     const QuantTensor &out_head() const { return out_head_; }
     const f32 *out_norm() const { return out_norm_; }
+    // qwen4exp has no output_norm: the final hyper-connection mixer carries it,
+    // with its own [n_embd, hc] gamma. Null on every other family.
+    const f32 *hc_head_norm() const { return hc_head_norm_; }
     // qwen4exp's PLE table is a pointer into the mapping, not an upload: the
     // accessors exist so a test can assert the loader found it and sized one row.
     const u8 *ple_table() const { return ple_table_; }

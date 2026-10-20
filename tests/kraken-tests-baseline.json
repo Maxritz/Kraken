@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-20T09:55:41Z",
-  "recorded_commit": "4577ba3",
-  "totals": {"groups": 65, "passed": 3261, "run": 3261, "exit": 0},
+  "recorded_utc": "2026-10-20T10:15:24Z",
+  "recorded_commit": "5ca77ae",
+  "totals": {"groups": 66, "passed": 3278, "run": 3278, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -56,6 +56,7 @@
     {"name": "test_hc_lanes", "status": "pass", "passed": 24, "run": 24},
     {"name": "test_ple_hash", "status": "pass", "passed": 22, "run": 22},
     {"name": "test_qwen4exp_schema", "status": "pass", "passed": 21, "run": 21},
+    {"name": "test_qwen4exp_forward", "status": "pass", "passed": 17, "run": 17},
     {"name": "test_cpu_expert_pool", "status": "pass", "passed": 60, "run": 60},
     {"name": "test_gdn_ops", "status": "pass", "passed": 158, "run": 158},
     {"name": "test_gdn_model_loads", "status": "pass", "passed": 23, "run": 23},
