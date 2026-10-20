@@ -2,6 +2,7 @@
 #include "krk/model.hpp"
 #include "krk/arch.hpp"
 #include "krk/verdict.hpp"
+#include "krk/vram_guard.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -16,6 +17,20 @@ std::string blk_key(const char *fmt, i32 layer) {
     char buf[128];
     std::snprintf(buf, sizeof(buf), fmt, layer);
     return std::string(buf);
+}
+
+// Every QuantTensor a layer owns. One list, because two loops have to agree
+// with LayerWeights: the per-tensor release in unload(), and the binding of a
+// streamed entry to the tensor that a promotion re-points. A field added to
+// LayerWeights and missed here leaks its allocation, or -- worse -- keeps
+// pointing into the ring after the layer was promoted into its own base.
+std::vector<QuantTensor *> qt_fields(LayerWeights &L) {
+    return {&L.wq,         &L.wk,        &L.wv,          &L.wo,
+            &L.wgate,      &L.wup,       &L.wdown,       &L.router,
+            &L.shexp_gate, &L.shexp_up,  &L.shexp_down,  &L.shexp_inp_gate,
+            &L.wqkv,       &L.wqkv_gate, &L.wattn_gate,
+            &L.ssm_conv1d, &L.ssm_out,   &L.ssm_in,
+            &L.ssm_alpha,  &L.ssm_beta};
 }
 
 } // namespace
@@ -45,6 +60,7 @@ struct LoadPhase {
 bool Model::load(Backend &be, const std::string &path, std::string *err) {
     LoadPhase lp;
     be_ = &be;
+    model_path_ = path;
     if (!gguf_.load(path, err)) return false;
     lp.mark("gguf map + metadata");
 
@@ -175,11 +191,27 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // above. laguna-S alternates full / window x3 — period 4 with the full
     // layer first, which is also what llama.cpp's laguna loader hard-codes.
     cfg_.swa_window = 0;
+    // Whether this file gives its windowed layers a rotary table of their own.
+    // A file that declares neither `rope.freq_base_swa` nor
+    // `rope.dimension_count_swa` has ONE table for the whole stack -- gpt-oss
+    // is that shape -- so the windowed layers must rotate with exactly the
+    // full layers' table, YaRN included, rather than a 10000-based
+    // approximation of it.
+    bool swa_own_rope = false;
     if (const i64 win = gguf_.get_i64(key(".attention.sliding_window"), 0); win > 0) {
         cfg_.swa_window = static_cast<i32>(win);
-        cfg_.swa_period = 4;
-        cfg_.rope_base_swa =
-            static_cast<f32>(gguf_.get_f64(key(".rope.freq_base_swa"), 10000.0));
+        // Which layers are windowed is a property of the architecture, not of
+        // the metadata: the GGUF states the window and nothing about where it
+        // applies. laguna (the default) is period 4 with the full layer first;
+        // gpt-oss is period 2 with the windowed layer first, which the arch
+        // table declares.
+        cfg_.swa_period = aspec.swa_period > 0 ? aspec.swa_period : 4;
+        cfg_.swa_phase = aspec.swa_window_first ? 1 : 0;
+        const f64 swa_base = gguf_.get_f64(key(".rope.freq_base_swa"), 0.0);
+        const i64 swa_dim = gguf_.get_i64(key(".rope.dimension_count_swa"), 0);
+        swa_own_rope = swa_base > 0.0 || swa_dim > 0;
+        cfg_.rope_base_swa = swa_base > 0.0 ? static_cast<f32>(swa_base)
+                                           : cfg_.rope_base;
         const i32 rd = static_cast<i32>(
             gguf_.get_i64(key(".rope.dimension_count_swa"), cfg_.rope_dim));
         cfg_.rope_dim_swa =
@@ -224,6 +256,14 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         gguf_.find(key(".expert_weights_norm")) != nullptr
             ? (gguf_.get_bool(key(".expert_weights_norm")) ? 1 : 0)
             : -1;
+    // A file that is silent on it takes its architecture's default, and the two
+    // answers are not close: gpt-oss routes 128 experts and its top four hold
+    // ~13% of the softmax mass, so renormalizing them multiplies each layer's
+    // expert contribution by 7.6 and the residual stream grows instead of
+    // holding. llama.cpp leaves `expert_weights_norm` false for this arch.
+    if (cfg_.expert_w_norm < 0 && aspec.expert_w_norm >= 0)
+        cfg_.expert_w_norm = aspec.expert_w_norm;
+    cfg_.ffn_swiglu_oai = aspec.swiglu_oai;
     cfg_.expert_w_scale =
         static_cast<f32>(gguf_.get_f64(key(".expert_weights_scale"), 1.0));
 
@@ -429,6 +469,24 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     auto upload_raw = [&](const GgufTensor *t, DType as) -> QuantTensor {
         QuantTensor q;
         const f64 a0 = LoadPhase::now();
+        if (stream_cur_ && ring_) {
+            // Streamed layer: no per-tensor device allocation and no copy at
+            // load. The tensor points into the shared ring, and stage_layer()
+            // refills that ring from this source before the layer runs. 256-byte
+            // alignment keeps every row of every quant block naturally aligned.
+            const size_t aligned = (t->n_bytes + 255u) & ~size_t(255u);
+            q.data = static_cast<u8 *>(ring_) + stream_off_;
+            stream_off_ += aligned;
+            stream_[static_cast<size_t>(stream_layer_index_)].push_back(
+                StreamEntry{t, q.data, t->n_bytes});
+            stream_bytes_total_ += t->n_bytes;
+            q.type = as;
+            q.n_in = static_cast<i64>(t->ne[0]);
+            q.n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
+            if (t->n_dims > 2) q.n_out = t->n_elements / std::max<i64>(1, q.n_in);
+            weight_bytes_ += static_cast<i64>(t->n_bytes);
+            return q;
+        }
         q.data = be.alloc(t->n_bytes);
         const f64 a1 = LoadPhase::now();
         upload_timed(q.data, t->data, t->n_bytes);
@@ -824,6 +882,127 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
     lp.mark("token_embd + output head");
 
+    // ---- dense weight residency -----------------------------------------
+    // Every dense matrix used to be uploaded at load, so a model whose weights
+    // did not fit the card filled VRAM to 0 bytes free and left the KV tier
+    // one slot per plane -- the 15.9 GiB Qwen3.8-27B run measured 0.00 GiB free
+    // and 3.4 tok/s. Here the layers that fit stay resident and the rest are
+    // staged through one ring before their layer runs, so the KV cache is sized
+    // against the memory that is actually left over.
+    //
+    // The layer byte totals are read off the file's own tensor directory (every
+    // tensor under `blk.N.`), which over-counts only the tiny f32 norms and is
+    // therefore a safe upper bound for the ring.
+    std::vector<size_t> layer_bytes(
+        static_cast<size_t>(std::max<i32>(cfg_.n_layer, 0)), 0);
+    for (const GgufTensor &t : gguf_.tensors()) {
+        if (t.name.compare(0, 4, "blk.") != 0) continue;
+        // Routed-expert banks are NOT loaded here -- ExpertCache pages them --
+        // so charging them to a layer's streamed bytes made a 25 GiB MoE look
+        // like dense layers that did not fit and streamed 20 layers that did.
+        // The shared expert (`_shexp`) is an ordinary dense upload and stays.
+        if (t.name.find("_exps") != std::string::npos) continue;
+        size_t q = 4;
+        i64 lay = 0;
+        while (q < t.name.size() && t.name[q] >= '0' && t.name[q] <= '9') {
+            lay = lay * 10 + (t.name[q] - '0');
+            q++;
+        }
+        if (q < t.name.size() && t.name[q] == '.' && lay >= 0 &&
+            lay < static_cast<i64>(layer_bytes.size()))
+            layer_bytes[static_cast<size_t>(lay)] += t.n_bytes;
+    }
+
+    // The CPU backend has no device/host split: streaming there would copy host
+    // memory to host memory and buy nothing. `weight_budget_ == 0` is automatic.
+    const bool can_stream = be.kind() != BackendKind::CPU &&
+                            be.device_total_bytes() > 0;
+    size_t weight_budget = weight_budget_;
+    if (can_stream && weight_budget == 0) {
+        const size_t total = be.device_total_bytes();
+        const size_t freeb = be.device_free_bytes();
+        const size_t reserve = krk::vram_reserve_bytes(total);
+        // Workspaces, the KV slot and the ring itself are allocated after this
+        // point, so leave a gigabyte for them rather than planning to the last
+        // byte the way the old path did.
+        const size_t slack = 1u << 30;
+        weight_budget =
+            freeb > reserve + slack ? freeb - reserve - slack : 0;
+    }
+    i32 first_stream = -1;
+    if (can_stream && weight_budget > 0) {
+        size_t cum = static_cast<size_t>(up_bytes);
+        for (i32 l = 0; l < cfg_.n_layer; l++) {
+            const size_t lb = layer_bytes[static_cast<size_t>(l)];
+            if (cum + lb > weight_budget) {
+                first_stream = l;
+                break;
+            }
+            cum += lb;
+        }
+    }
+    if (first_stream >= 0) {
+        size_t need = 0;
+        for (i32 l = first_stream; l < cfg_.n_layer; l++)
+            need = std::max(need, layer_bytes[static_cast<size_t>(l)]);
+        need = (need + 255u) & ~size_t(255u);
+        ring_ = be.alloc(need);
+        stage_host_ = ring_ ? be.alloc_host(need) : nullptr;
+        // The spare pinned buffer the next layer is read into while this one's
+        // DMA is in flight. Two buffers, alternating; without the second the
+        // read waits for the copy to land. Its absence costs the overlap, not
+        // the run, so a failed allocation just turns the pipeline off.
+        if (const char *pv = std::getenv("KRK_WEIGHT_PREFETCH"))
+            prefetch_enabled_ = std::string(pv) != "0";
+        if (stage_host_ && prefetch_enabled_) {
+            prefetch_host_ = be.alloc_host(need);
+            if (!prefetch_host_) {
+                prefetch_enabled_ = false;
+                KRK_WARN("weight residency: no spare pinned buffer for the read "
+                         "pipeline (%.1f MiB) -- reads will wait for copies",
+                         static_cast<f64>(need) / 1048576.0);
+            }
+        }
+        read_buf_[0] = stage_host_;
+        read_buf_[1] = prefetch_host_;
+        if (!ring_ || !stage_host_) {
+            KRK_WARN("weight residency: could not allocate a %.1f MiB streaming "
+                     "ring; keeping every weight on the device (VRAM pressure "
+                     "will decide the KV tier)",
+                     static_cast<f64>(need) / 1048576.0);
+            if (ring_) be.release(ring_);
+            if (stage_host_) be.release_host(stage_host_);
+            ring_ = nullptr;
+            stage_host_ = nullptr;
+            first_stream = -1;
+        } else {
+            ring_bytes_ = need;
+            layer_streamed_.assign(static_cast<size_t>(cfg_.n_layer), 0);
+            stream_.assign(static_cast<size_t>(cfg_.n_layer), std::vector<StreamEntry>());
+            for (i32 l = first_stream; l < cfg_.n_layer; l++)
+                layer_streamed_[static_cast<size_t>(l)] = 1;
+            streamed_layers_ = static_cast<size_t>(cfg_.n_layer - first_stream);
+            KRK_INFO("weight residency: %.2f GiB device budget, layer(s) %d..%d "
+                     "streamed from the file through a %.1f MiB ring; the rest "
+                     "stays resident",
+                     static_cast<f64>(weight_budget) / 1073741824.0,
+                     first_stream, cfg_.n_layer - 1,
+                     static_cast<f64>(need) / 1048576.0);
+        }
+    } else if (can_stream) {
+        size_t total_model = static_cast<size_t>(up_bytes);
+        for (size_t b : layer_bytes) total_model += b;
+        if (weight_budget >= (size_t(1) << 60))
+            KRK_INFO("weight residency: streaming disabled; all %.2f GiB of "
+                     "weights resident",
+                     static_cast<f64>(total_model) / 1073741824.0);
+        else
+            KRK_INFO("weight residency: all %.2f GiB of weights resident "
+                     "(%.2f GiB budget)",
+                     static_cast<f64>(total_model) / 1073741824.0,
+                     static_cast<f64>(weight_budget) / 1073741824.0);
+    }
+
     // ---- per-layer weights ------------------------------------------------
     // A layer's own head count. The model maximum (`cfg_.n_head`) is only what
     // the shared query workspace is sized against; every per-layer check below
@@ -839,6 +1018,9 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     layers_.resize(static_cast<size_t>(cfg_.n_layer));
     for (i32 l = 0; l < cfg_.n_layer; l++) {
         LayerWeights &L = layers_[static_cast<size_t>(l)];
+        stream_cur_ = layer_streamed(l);
+        stream_off_ = 0;
+        stream_layer_index_ = l;
         if (l == 1) lp.mark("  layer 0 only");
         std::string e;
         if (!had_layer.empty()) {
@@ -878,6 +1060,12 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (err) *err = "layer " + std::to_string(l) + " is missing its norm weights";
             return false;
         }
+
+        // Attention sinks (deepseek4, gpt-oss): one fp32 scalar per query
+        // head, uploaded like every other 1-D weight. Absent is not an
+        // error -- it is the whole rest of the model set, and the kernels
+        // only add the term when the pointer is present.
+        L.sinks = upload_f32(blk_key("blk.%d.attn_sinks.weight", l));
 
         // ---- which kind of layer is this? ---------------------------------
         if (cfg_.recurrent) {
@@ -959,6 +1147,12 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             L.wk = need(blk_key("blk.%d.attn_k.weight", l));
             L.wv = need(blk_key("blk.%d.attn_v.weight", l));
             L.wo = need(blk_key("blk.%d.attn_output.weight", l));
+            // Attention-output bias (gpt-oss). One f32 per output channel,
+            // added to the projection's result before the residual. Absent on
+            // every other family in the collection, and a missing bias and a
+            // model without one look the same from here -- which is why it was
+            // never noticed that this tensor existed and was ignored.
+            L.wo_bias = upload_f32(blk_key("blk.%d.attn_output.bias", l));
             // laguna's per-head output gate is a projection of its own off the
             // same hidden state q/k/v read — not a slice of attn_q — so it is a
             // weight like any other and is uploaded with them.
@@ -1044,6 +1238,35 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 }
                 if (L.router_bias) cfg_.router_bias = true;
             }
+            // llama.cpp's spelling of the same idea, and a different
+            // arithmetic: `ffn_gate_inp.bias` is added to the router's LOGITS,
+            // before the softmax (`build_moe_ffn`: the bias is folded into
+            // `logits`, and the SOFTMAX_WEIGHT gating func then does
+            // `probs = logits`). Adding it after the softmax instead -- the
+            // laguna reading -- selects different experts and mixes them with
+            // different weights, with nothing in either shape to show for it.
+            // gpt-oss is the family that carries this one.
+            if (!L.router_bias) {
+                if (const GgufTensor *bt =
+                        gguf_.tensor(blk_key("blk.%d.ffn_gate_inp.bias", l))) {
+                    const i64 n = bt->n_elements;
+                    f32 *host = static_cast<f32 *>(
+                        host_alloc(static_cast<size_t>(n) * sizeof(f32)));
+                    dequant_row(bt->type, bt->data, host, n);
+                    L.router_bias = host;
+                    if (!warned_bias) {
+                        warned_bias = true;
+                        KRK_INFO("router bias: ffn_gate_inp.bias, added to the "
+                                 "logits before the softmax (llama.cpp's "
+                                 "convention), %lld experts",
+                                 static_cast<long long>(n));
+                    }
+                }
+                if (L.router_bias) {
+                    cfg_.router_bias = true;
+                    cfg_.router_bias_pre = true;
+                }
+            }
             const GgufTensor *g = gguf_.tensor(exps_gate);
             const GgufTensor *up = gguf_.tensor(blk_key("blk.%d.ffn_up_exps.weight", l));
             const GgufTensor *dn =
@@ -1069,6 +1292,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             L.experts.gate = g;
             L.experts.up = up;
             L.experts.down = dn;
+            // Per-expert FFN biases (gpt-oss): [n_expert, n_ff] on gate and up,
+            // [n_expert, n_embd] on down. They belong to the expert, not to the
+            // token, so the expert group's rows all get the same vector -- the
+            // shape `add_bias_cols` already has. Device-resident and loaded up
+            // front: the routed path touches them on every token, and a
+            // per-expert fetch would put a host round trip inside the group.
+            L.exp_gate_bias = upload_f32(blk_key("blk.%d.ffn_gate_exps.bias", l));
+            L.exp_up_bias = upload_f32(blk_key("blk.%d.ffn_up_exps.bias", l));
+            L.exp_down_bias = upload_f32(blk_key("blk.%d.ffn_down_exps.bias", l));
+            if (L.exp_gate_bias || L.exp_up_bias || L.exp_down_bias)
+                KRK_INFO("layer %d: per-expert FFN biases loaded (gate=%d up=%d "
+                         "down=%d)",
+                         l, L.exp_gate_bias != nullptr, L.exp_up_bias != nullptr,
+                         L.exp_down_bias != nullptr);
             // The NVFP4 global scales, if this bank is NVFP4. Absent on every
             // other format, and a missing sidecar is 1.0 rather than an error,
             // so the loader stays format-agnostic here.
@@ -1346,6 +1583,52 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
     lp.mark("per-layer loop (all weights)");
 
+    // ---- bind streamed entries, and size their promotion -------------------
+    // A streamed tensor's QuantTensor already points into the ring, so the
+    // engine can use it before this runs; what the binding adds is the way
+    // BACK from the entry to the tensor, which a promotion needs to re-point,
+    // and the layer's aligned footprint, which is the size of the allocation
+    // that replaces the ring for it. Both are facts about the layer the upload
+    // could not see (the QuantTensor is returned by value).
+    layer_stream_bytes_.assign(static_cast<size_t>(cfg_.n_layer), 0);
+    // stream_ is only sized when some layer actually streams; a model that fits
+    // entirely leaves it empty, and indexing it here is a crash on every run
+    // that needs no streaming at all (measured: all three qwen35moe 35B files).
+    for (i32 l = 0; l < cfg_.n_layer && l < static_cast<i32>(stream_.size()); l++) {
+        std::vector<StreamEntry> &es = stream_[static_cast<size_t>(l)];
+        if (es.empty()) continue;
+        std::vector<QuantTensor *> qs = qt_fields(layers_[static_cast<size_t>(l)]);
+        size_t bytes = 0;
+        for (StreamEntry &e : es) {
+            bytes += (e.bytes + 255u) & ~size_t(255u);
+            for (QuantTensor *q : qs) {
+                if (q->present() && q->data == e.dst) {
+                    e.q = q;
+                    break;
+                }
+            }
+            if (!e.q)
+                KRK_WARN("weight residency: layer %d has a streamed tensor that "
+                         "no layer field owns -- it can never be promoted, so it "
+                         "will be staged every step", l);
+        }
+        layer_stream_bytes_[static_cast<size_t>(l)] = bytes;
+    }
+    // KRK_WEIGHT_PROMOTE=0 restores a fixed resident prefix: every layer past
+    // the load-time budget is then staged on every step, whatever VRAM is left.
+    if (const char *v = std::getenv("KRK_WEIGHT_PROMOTE"))
+        promote_enabled_ = std::string(v) != "0";
+
+    // The nextn/MTP block, when the file carries one and the caller asked for
+    // it. Not an error if it is absent: most files have none.
+    {
+        std::string merr;
+        if (!load_mtp_block(&merr) && !merr.empty()) {
+            if (err) *err = merr;
+            return false;
+        }
+    }
+
     // ---- rotary inverse frequencies (host) --------------------------------
     // Partial rotary: a layer rotates only the first `rope_dim` dims of each
     // head and leaves the tail untouched, so the table is rope_dim/2 long and
@@ -1432,8 +1715,11 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         build_inv_freq(inv_freq_, cfg_.rope_dim, cfg_.rope_base);
     }
     // The windowed layers of a hybrid stack keep plain RoPE: llama.cpp passes
-    // them an ext_factor of 0, which is the same statement.
-    if (cfg_.swa_window > 0)
+    // them an ext_factor of 0, which is the same statement. A file with no
+    // windowed-table keys of its own (`swa_own_rope` false) has one table for
+    // both layer kinds, so nothing is built here and `inv_freq_at()` returns
+    // the full-layer table -- YaRN included, which is what gpt-oss needs.
+    if (cfg_.swa_window > 0 && swa_own_rope)
         build_inv_freq(inv_freq_swa_, cfg_.rope_dim_swa, cfg_.rope_base_swa);
     if (cfg_.rope_neox)
         KRK_INFO("rope pairing: NeoX half-split (channel j with j + %d)",
@@ -1478,6 +1764,530 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     return true;
 }
 
+// The nextn/MTP block. `n_layer_nextn` blocks sit after the stack and are not
+// transformer layers of the stack, so `Model::load` excludes them from
+// `cfg_.n_layer` and nothing in the main path touches them. This loads one when
+// the caller asks (KRK_MTP_LOAD=1): the block plus the three adapters that fuse
+// the target's hidden state with the last token's embedding. Routed experts are
+// left in the file for ExpertCache to page, since they are 855 MB on a 35B-A3B.
+bool Model::load_mtp_block(std::string *err) {
+    mtp_ = MtpBlock{};
+    // ---- a sidecar nextn file -------------------------------------------
+    // A `-noMTP` trunk has no block of its own (nextn_predict_layers is absent
+    // or 0), so the in-file branch below returns before doing anything. When a
+    // path was given, the block comes from that file instead: same tensor names,
+    // same index convention (the block sits past the stack), and its mapping has
+    // to outlive the block because the routed banks are `const GgufTensor *`
+    // into it.
+    if (!mtp_path_.empty()) {
+        mtp_gguf_.reset(new Gguf());
+        if (!mtp_gguf_->load(mtp_path_, err)) {
+            mtp_gguf_.reset();
+            return false;
+        }
+        const std::string side_arch = mtp_gguf_->get_str("general.architecture", "");
+        if (!side_arch.empty() && side_arch != cfg_.arch) {
+            if (err)
+                *err = mtp_path_ + " is a '" + side_arch + "' file and this model "
+                       "is '" + cfg_.arch + "' -- a head from another family "
+                       "proposes tokens this trunk would never accept";
+            mtp_gguf_.reset();
+            return false;
+        }
+        // The block index is the smallest `blk.<n>.` at or past the trunk's own
+        // stack. Reading it from the tensors rather than from block_count keeps
+        // this correct for a sidecar whose header counts only its own blocks.
+        i32 block = -1;
+        for (const GgufTensor &t : mtp_gguf_->tensors()) {
+            if (t.name.rfind("blk.", 0) != 0) continue;
+            const size_t dot = t.name.find('.', 4);
+            if (dot == std::string::npos || dot == 4) continue;
+            i32 k = 0;
+            for (size_t i = 4; i < dot; i++) {
+                if (t.name[i] < '0' || t.name[i] > '9') { k = -1; break; }
+                k = k * 10 + (t.name[i] - '0');
+            }
+            if (k < cfg_.n_layer) continue; // a trunk block, not a head
+            if (block < 0 || k < block) block = k;
+        }
+        if (block < 0) {
+            if (err)
+                *err = mtp_path_ + " carries no blk.<n>.* block past this model's " +
+                       std::to_string(cfg_.n_layer) +
+                       " layers -- it is not a nextn block for this trunk";
+            mtp_gguf_.reset();
+            return false;
+        }
+        const bool ok = load_mtp_block_from(*mtp_gguf_, block, mtp_path_, err);
+        if (!ok) mtp_gguf_.reset();
+        return ok;
+    }
+    if (cfg_.n_layer_nextn <= 0) return true;
+    // Two switches upload the block: KRK_MTP_LOAD for a run that wants it, and
+    // KRK_MTP_PROBE (--mtp-probe), which cannot do anything without it. Keeping
+    // them one gate means the probe never measures a block that is not there.
+    const auto wanted = [](const char *name) {
+        const char *v = std::getenv(name);
+        return v && v[0] != '\0' && v[0] != '0';
+    };
+    if (!mtp_load_ && !wanted("KRK_MTP_LOAD") && !wanted("KRK_MTP_PROBE"))
+        return true;
+    return load_mtp_block_from(gguf_, cfg_.n_layer, model_path_, err);
+}
+
+bool Model::load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
+                                std::string *err) {
+    const auto key = [&](const char *suffix) {
+        return std::string("blk.") + std::to_string(l) + suffix;
+    };
+    const auto tensor = [&](const std::string &name) { return g.tensor(name); };
+
+    const GgufTensor *tq = tensor(key(".attn_q.weight"));
+    const GgufTensor *tk = tensor(key(".attn_k.weight"));
+    const GgufTensor *tv = tensor(key(".attn_v.weight"));
+    const GgufTensor *to = tensor(key(".attn_output.weight"));
+    if (!tq || !tk || !tv || !to) {
+        // A nextn block without attention is a shape this loader does not know.
+        // Refusing here is the honest answer: silently skipping it would make a
+        // drafter that drafts from nothing.
+        if (err)
+            *err = origin + " has no readable " + key(".attn_q.weight") +
+                   " for its nextn block";
+        return false;
+    }
+    for (DType t : {tq->type, tk->type, tv->type, to->type}) {
+        if (!dtype_supported(t)) {
+            if (err)
+                *err = "nextn block " + std::to_string(l) + " uses unsupported "
+                       "format " + dtype_name(t) + " (type id " +
+                       std::to_string(tq->type_id) + ")";
+            return false;
+        }
+    }
+
+    MtpBlock &m = mtp_;
+    m.layer = l;
+    m.n_embd = static_cast<i32>(tq->ne[0]);
+    if (m.n_embd != cfg_.n_embd) {
+        if (err)
+            *err = "nextn block " + std::to_string(l) + " in " + origin +
+                   " is " + std::to_string(m.n_embd) +
+                   " wide and this model is " + std::to_string(cfg_.n_embd) +
+                   " -- the block's workspaces are the trunk's";
+        return false;
+    }
+    // GGUF ne[] is (in, out): attn_q's OUT is query+gate packed on the arches
+    // that pack a gate and plain q on the ones that do not, and attn_k's OUT is
+    // the KV width -- so a shape alone cannot say how many heads there are.
+    //
+    // The counts come from the MODEL config, which is the only place that knows
+    // them: a per-block key does not exist in a real file, and the trunk is the
+    // authority for a block that belongs to it. `<arch>.attention.head_count_kv`
+    // can be an ARRAY with one entry per layer (nemotron_h_moe ships 53 of
+    // them), and the block's own index selects its entry -- reading the scalar
+    // key of such a file gives the first layer's count and a wrong KV width.
+    // Every number is then CHECKED against the tensor shapes below, so a wrong
+    // guess is a refusal with the two numbers rather than a block that runs and
+    // attends over the wrong slice.
+    const std::string ap = cfg_.arch + ".";
+    m.head_dim = static_cast<i32>(g.get_i64(key(".attention.key_length"), 0));
+    if (m.head_dim <= 0)
+        m.head_dim = static_cast<i32>(g.get_i64(ap + "attention.key_length", 0));
+    if (m.head_dim <= 0) m.head_dim = cfg_.head_dim;
+    if (m.head_dim <= 0) {
+        if (const GgufTensor *qn = tensor(key(".attn_q_norm.weight")))
+            m.head_dim = static_cast<i32>(qn->n_elements);
+    }
+    if (m.head_dim <= 0) {
+        if (err) *err = "nextn block " + std::to_string(l) + " in " + origin +
+                        ": nothing says how wide a head is";
+        return false;
+    }
+    i32 n_head = static_cast<i32>(g.get_i64(ap + "attention.head_count", 0));
+    if (n_head <= 0) n_head = cfg_.n_head;
+    i32 n_kv = 0;
+    if (const std::vector<i32> *a = g.get_i32_array(ap + "attention.head_count_kv")) {
+        if (!a->empty())
+            n_kv = (l >= 0 && l < static_cast<i32>(a->size())) ? (*a)[static_cast<size_t>(l)]
+                                                               : a->back();
+    } else {
+        n_kv = static_cast<i32>(g.get_i64(ap + "attention.head_count_kv", 0));
+    }
+    if (n_kv <= 0) n_kv = cfg_.n_head_kv;
+    const i64 qout = static_cast<i64>(tq->ne[1]);
+    const i64 kout = static_cast<i64>(tk->ne[1]);
+    if (n_head <= 0) n_head = static_cast<i32>(qout / (2 * m.head_dim));
+    if (n_kv <= 0) n_kv = static_cast<i32>(kout / m.head_dim);
+    if (n_head <= 0 || n_kv <= 0) {
+        if (err) *err = "nextn block " + std::to_string(l) + " in " + origin +
+                        " has no usable attention geometry";
+        return false;
+    }
+    if (qout != static_cast<i64>(n_head) * m.head_dim &&
+        qout != 2 * static_cast<i64>(n_head) * m.head_dim) {
+        if (err)
+            *err = "nextn block " + std::to_string(l) + " in " + origin + ": the "
+                   "query projection is " + std::to_string(qout) + " wide, and " +
+                   std::to_string(n_head) + " head(s) x " +
+                   std::to_string(m.head_dim) + " say " +
+                   std::to_string(static_cast<i64>(n_head) * m.head_dim) + " or " +
+                   std::to_string(2 * static_cast<i64>(n_head) * m.head_dim);
+        return false;
+    }
+    if (kout != static_cast<i64>(n_kv) * m.head_dim) {
+        if (err)
+            *err = "nextn block " + std::to_string(l) + " in " + origin + ": the "
+                   "key projection is " + std::to_string(kout) + " wide, and " +
+                   std::to_string(n_kv) + " kv head(s) x " +
+                   std::to_string(m.head_dim) + " say " +
+                   std::to_string(static_cast<i64>(n_kv) * m.head_dim) +
+                   " -- the block and the trunk disagree about its attention";
+        return false;
+    }
+    // The block belongs to this trunk, so it has to use the trunk's head count:
+    // a sidecar that disagrees (a head from a same-family model with a
+    // different attention shape) runs its own rows over a KV plane the engine
+    // sized for the other geometry.
+    if (cfg_.n_head > 0 && n_head != cfg_.n_head) {
+        if (err)
+            *err = "nextn block " + std::to_string(l) + " in " + origin + " has " +
+                   std::to_string(n_head) + " head(s) and this model runs " +
+                   std::to_string(cfg_.n_head) +
+                   " -- a head from another model, not this trunk's";
+        return false;
+    }
+    if (cfg_.n_head_kv > 0 && n_kv != cfg_.n_head_kv) {
+        if (err)
+            *err = "nextn block " + std::to_string(l) + " in " + origin + " has " +
+                   std::to_string(n_kv) + " kv head(s) and this model runs " +
+                   std::to_string(cfg_.n_head_kv);
+        return false;
+    }
+    m.n_head = n_head;
+    m.n_head_kv = n_kv;
+
+    // Verbatim upload for the quantized matrices, dequantized f32 for the norms
+    // and biases. The same shapes the per-layer loader uses; the shared head is
+    // the model's own output.weight, so no head is loaded here.
+    const auto upload_q = [&](const GgufTensor *t, QuantTensor *out) {
+        out->data = be_->alloc(t->n_bytes);
+        if (!out->data) return false;
+        be_->upload(out->data, t->data, t->n_bytes);
+        out->type = t->type;
+        out->n_in = static_cast<i64>(t->ne[0]);
+        out->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
+        m.bytes += static_cast<size_t>(t->n_bytes);
+        return true;
+    };
+    const auto upload_f = [&](const std::string &name) -> f32 * {
+        const GgufTensor *t = tensor(name);
+        if (!t) return nullptr;
+        const i64 n = t->n_elements;
+        f32 *host = static_cast<f32 *>(host_alloc(static_cast<size_t>(n) * 4));
+        dequant_row(t->type, t->data, host, n);
+        f32 *dev = static_cast<f32 *>(be_->alloc(static_cast<size_t>(n) * 4));
+        if (dev) be_->upload(dev, host, static_cast<size_t>(n) * 4);
+        host_free(host);
+        m.bytes += static_cast<size_t>(n) * 4;
+        return dev;
+    };
+
+    bool ok = upload_q(tq, &m.wq) && upload_q(tk, &m.wk) &&
+              upload_q(tv, &m.wv) && upload_q(to, &m.wo);
+    if (ok) {
+        if (const GgufTensor *t = tensor(key(".nextn.eh_proj.weight")))
+            ok = upload_q(t, &m.eh_proj);
+    }
+    if (ok && tensor(key(".ffn_gate_inp.weight")))
+        ok = upload_q(tensor(key(".ffn_gate_inp.weight")), &m.router);
+    {
+        const struct {
+            const char *name;
+            QuantTensor *dst;
+        } sh[4] = {
+            {".ffn_gate_shexp.weight", &m.shexp_gate},
+            {".ffn_up_shexp.weight", &m.shexp_up},
+            {".ffn_down_shexp.weight", &m.shexp_down},
+            {".ffn_gate_inp_shexp.weight", &m.shexp_inp_gate},
+        };
+        for (int i = 0; ok && i < 4; i++)
+            if (const GgufTensor *t = tensor(key(sh[i].name)))
+                ok = upload_q(t, sh[i].dst);
+    }
+    if (ok) {
+        // Dense FFN (`ffn_gate/up/down`, or ungated `ffn_up/down`). Uploaded
+        // like any other dense matrix: the block is one layer, not a bank.
+        if (const GgufTensor *t = tensor(key(".ffn_gate.weight")))
+            ok = upload_q(t, &m.ffn_gate);
+        if (ok) {
+            if (const GgufTensor *t = tensor(key(".ffn_up.weight")))
+                ok = upload_q(t, &m.ffn_up);
+        }
+        if (ok) {
+            if (const GgufTensor *t = tensor(key(".ffn_down.weight")))
+                ok = upload_q(t, &m.ffn_down);
+        }
+        if (ok && m.ffn_gate.present()) m.n_ff = static_cast<i32>(m.ffn_gate.n_out);
+        if (ok && m.n_ff == 0 && m.ffn_up.present())
+            m.n_ff = static_cast<i32>(m.ffn_up.n_out);
+    }
+    if (ok) {
+        m.attn_norm = upload_f(key(".attn_norm.weight"));
+        m.post_attn_norm = upload_f(key(".post_attention_norm.weight"));
+        m.q_norm = upload_f(key(".attn_q_norm.weight"));
+        m.k_norm = upload_f(key(".attn_k_norm.weight"));
+        m.enorm = upload_f(key(".nextn.enorm.weight"));
+        m.hnorm = upload_f(key(".nextn.hnorm.weight"));
+        m.shared_head_norm = upload_f(key(".nextn.shared_head_norm.weight"));
+        if (const GgufTensor *t = tensor(key(".ffn_gate_inp.bias"))) {
+            const i64 n = t->n_elements;
+            m.router_bias = static_cast<f32 *>(host_alloc(static_cast<size_t>(n) * 4));
+            if (m.router_bias)
+                dequant_row(t->type, t->data, m.router_bias, n);
+        }
+        m.exps_gate = tensor(key(".ffn_gate_exps.weight"));
+        m.exps_up = tensor(key(".ffn_up_exps.weight"));
+        m.exps_down = tensor(key(".ffn_down_exps.weight"));
+        // An UNGATED expert bank has no gate tensor at all (nemotron_h_moe's
+        // nextn block is up/down only), so the bank is whatever of the three is
+        // there and the width comes from the tensor that carries it: up/gate put
+        // the FFN width in ne[1], down puts it in ne[0]. Reading n_expert from
+        // the gate alone made this block load as "no experts and no dense FFN"
+        // and the probe refused a block that was right there in the file.
+        const GgufTensor *any_exp =
+            m.exps_gate ? m.exps_gate : (m.exps_up ? m.exps_up : m.exps_down);
+        if (any_exp) m.n_expert = static_cast<i32>(any_exp->ne[2]);
+        if (m.exps_up)
+            m.n_ff_exp = static_cast<i32>(m.exps_up->ne[1]);
+        else if (m.exps_gate)
+            m.n_ff_exp = static_cast<i32>(m.exps_gate->ne[1]);
+        else if (m.exps_down)
+            m.n_ff_exp = static_cast<i32>(m.exps_down->ne[0]);
+        // expert_used_count is a MODEL-level key (qwen35moe.expert_used_count),
+        // not a per-block one, so key() -- which prefixes blk.<n>. -- cannot
+        // reach it. The parsed config already has the number.
+        m.n_expert_used = cfg_.n_expert_used;
+        // The shared expert can be ungated too, and then its width is the up
+        // projection's -- a gate-only reading reported 0 and dropped the whole
+        // shared path out of the block's FFN.
+        if (m.shexp_up.present()) m.n_ff_shexp = static_cast<i32>(m.shexp_up.n_out);
+        else if (m.shexp_gate.present())
+            m.n_ff_shexp = static_cast<i32>(m.shexp_gate.n_out);
+    }
+    if (!ok) {
+        if (err) *err = "nextn block " + std::to_string(l) +
+                        ": a weight upload failed (device allocation refused)";
+        return false;
+    }
+    m.present = true;
+    // One line per shape: an MoE block names its routed bank, a dense block names
+    // its FFN. Printing "0 experts x top-0 of 0-wide FFN" for a dense block made
+    // the report read as a broken block rather than a different one.
+    if (m.n_expert > 0) {
+        KRK_INFO("nextn (MTP) block %d loaded: %d head(s) x %d, %d experts x "
+                 "top-%d of %d-wide FFN%s, eh_proj %lldx%lld, adapters "
+                 "enorm/hnorm/shared_head_norm %s, %.1f MiB resident, experts "
+                 "left in the file",
+                 l, m.n_head, m.head_dim, m.n_expert, m.n_expert_used,
+                 m.n_ff_exp,
+                 m.n_ff_shexp > 0 ? " + shared expert" : "",
+                 static_cast<long long>(m.eh_proj.n_in),
+                 static_cast<long long>(m.eh_proj.n_out),
+                 (m.enorm && m.hnorm && m.shared_head_norm) ? "present"
+                                                           : "MISSING",
+                 static_cast<f64>(m.bytes) / 1048576.0);
+    } else {
+        KRK_INFO("nextn (MTP) block %d loaded: %d head(s) x %d, dense %d-wide "
+                 "%s FFN, eh_proj %lldx%lld, adapters enorm/hnorm/"
+                 "shared_head_norm %s, %.1f MiB resident",
+                 l, m.n_head, m.head_dim, m.n_ff,
+                 m.ffn_gate.present() ? "SwiGLU" : "ungated",
+                 static_cast<long long>(m.eh_proj.n_in),
+                 static_cast<long long>(m.eh_proj.n_out),
+                 (m.enorm && m.hnorm && m.shared_head_norm) ? "present"
+                                                           : "MISSING",
+                 static_cast<f64>(m.bytes) / 1048576.0);
+    }
+    return true;
+}
+
+// A streamed layer that measured free VRAM can hold is kept instead of being
+// re-staged on every step. The load-time budget is a decision made before the
+// KV cache and the workspaces exist, and on this card it left 2 GiB free at the
+// end of a run while 17 layers were being re-read every token -- 100% of the
+// step. Promoting on first use turns that leftover into residency, and the
+// floor is the same reserve the allocator is guarded by, measured rather than
+// predicted, so it cannot over-commit: the check is against bytes that are free
+// right now, after every other allocation has been made.
+bool Model::promote_layer(i32 l) {
+    if (!promote_enabled_ || !be_ || !ring_ || !stage_host_) return false;
+    if (l < 0 || l >= static_cast<i32>(stream_.size())) return false;
+    std::vector<StreamEntry> &es = stream_[static_cast<size_t>(l)];
+    if (es.empty()) return false;
+    const size_t bytes = layer_stream_bytes_[static_cast<size_t>(l)];
+    const size_t total = be_->device_total_bytes();
+    const size_t floor = vram_reserve_bytes(total);
+    const size_t freeb = be_->device_free_bytes();
+    if (bytes == 0 || freeb < bytes + floor) return false;
+    const u64 t0 = now_us();
+    void *base = be_->alloc(bytes);
+    if (!base) return false;
+    // The same read and copy one staging pass does, into memory that is kept.
+    // No drain is needed first: the ring is not touched at all here, and each
+    // batch reads into a region of the pinned buffer the previous batch already
+    // finished with (its upload is ordered on the default stream).
+    size_t off = 0;
+    size_t moved = 0;
+    for (size_t b = 0; b < es.size(); b += 32) {
+        Backend::ReadReq reqs[32];
+        void *dst[32];
+        const void *src[32];
+        size_t len[32];
+        int n = 0;
+        for (size_t i = b; i < es.size() && n < 32; i++) {
+            const StreamEntry &e = es[i];
+            reqs[n].dst = static_cast<u8 *>(stage_host_) + off;
+            reqs[n].mapped_src = e.src->data;
+            reqs[n].bytes = e.bytes;
+            dst[n] = static_cast<u8 *>(base) + off;
+            src[n] = reqs[n].dst;
+            len[n] = e.bytes;
+            off += (e.bytes + 255u) & ~size_t(255u);
+            moved += e.bytes;
+            n++;
+        }
+        be_->read_host_batch(reqs, n);
+        be_->upload_paged_batch(dst, src, len, n);
+    }
+    // Re-point the layer's own tensors. `dst` keeps its ring-relative offset,
+    // so only the address the engine reads through changes.
+    for (const StreamEntry &e : es)
+        if (e.q)
+            e.q->data = static_cast<u8 *>(base) +
+                        (static_cast<const u8 *>(e.dst) -
+                         static_cast<const u8 *>(ring_));
+    promoted_.emplace_back(base, bytes);
+    promoted_bytes_ += moved;
+    promoted_layers_++;
+    layer_streamed_[static_cast<size_t>(l)] = 0;
+    if (streamed_layers_) streamed_layers_--;
+    promote_ms_ += static_cast<f64>(now_us() - t0) / 1000.0;
+    KRK_INFO("weight residency: layer %d promoted resident (%.1f MiB, "
+             "%.0f MiB still free) -- it will not be staged again",
+             l, static_cast<f64>(moved) / 1048576.0,
+             static_cast<f64>(freeb - bytes) / 1048576.0);
+    return true;
+}
+
+void Model::read_layer_to(void *host, const std::vector<StreamEntry> &es,
+                          size_t *bytes) {
+    // Batches of 32: a layer carries far fewer, but a fixed stack array must
+    // not silently drop the tail (a dropped tensor is a wrong answer, not a
+    // slow one).
+    size_t off = 0;
+    for (size_t base = 0; base < es.size(); base += 32) {
+        Backend::ReadReq reqs[32];
+        int n = 0;
+        for (size_t i = base; i < es.size() && n < 32; i++) {
+            const StreamEntry &e = es[i];
+            reqs[n].dst = static_cast<u8 *>(host) + off;
+            reqs[n].mapped_src = e.src->data;
+            reqs[n].bytes = e.bytes;
+            off += (e.bytes + 255u) & ~size_t(255u);
+            if (bytes) *bytes += e.bytes;
+            n++;
+        }
+        be_->read_host_batch(reqs, n);
+    }
+}
+
+void Model::upload_layer_from(const void *host, const std::vector<StreamEntry> &es) {
+    size_t off = 0;
+    for (size_t base = 0; base < es.size(); base += 32) {
+        void *dst[32];
+        const void *src[32];
+        size_t len[32];
+        int n = 0;
+        for (size_t i = base; i < es.size() && n < 32; i++) {
+            const StreamEntry &e = es[i];
+            dst[n] = e.dst;
+            src[n] = static_cast<const u8 *>(host) + off;
+            len[n] = e.bytes;
+            off += (e.bytes + 255u) & ~size_t(255u);
+            n++;
+        }
+        // A pinned source: the backend DMAs straight out of this buffer and the
+        // default stream waits on its event, so this returns as soon as the
+        // copies are queued rather than when they land.
+        be_->upload_pinned_batch(dst, src, len, n);
+    }
+}
+
+i32 Model::next_streamed(i32 after) const {
+    for (i32 l = after + 1; l < static_cast<i32>(stream_.size()); l++)
+        if (layer_streamed(l)) return l;
+    return -1;
+}
+
+void Model::stage_layer(i32 l) {
+    if (!be_ || !ring_ || l < 0 || l >= static_cast<i32>(stream_.size())) return;
+    // A promoted layer is resident now; its entries still exist (unload reads
+    // them) but its tensors no longer point into the ring.
+    if (!layer_streamed(l)) return;
+    if (promote_layer(l)) return;
+    const std::vector<StreamEntry> &es = stream_[static_cast<size_t>(l)];
+    if (es.empty()) return;
+
+    // The ring is reused by the next layer, and the previous layer's kernels
+    // may still be reading it: the copy is published TO the default stream, not
+    // FROM it. Drain once before overwriting, or layer l reads layer l+1's
+    // bytes -- which is fluent-looking garbage, not a crash. It also releases
+    // the pinned buffer this pass is about to write into.
+    const u64 t0 = now_us();
+    be_->sync();
+    const u64 t_sync = now_us();
+
+    // Which pinned buffer holds this layer. The previous staging pass read it
+    // while THIS layer's predecessor was still copying, which is the overlap
+    // this function exists to create; on the first streamed layer there is
+    // nothing to inherit and the read happens here.
+    int slot = -1;
+    if (prefetched_layer_ == l && read_buf_[prefetched_slot_]) slot = prefetched_slot_;
+    size_t bytes = 0;
+    if (slot < 0) {
+        slot = 0;
+        const u64 tr = now_us();
+        read_layer_to(read_buf_[slot], es, &bytes);
+        stage_read_ms_ += static_cast<f64>(now_us() - tr) / 1000.0;
+    } else {
+        for (const StreamEntry &e : es) bytes += e.bytes;
+    }
+    prefetched_layer_ = -1;
+
+    // Publish this layer's copy, then read the NEXT layer into the spare
+    // buffer while those bytes are still moving over PCIe. The copy is a DMA on
+    // a side stream (upload_pinned_batch), so the host thread is free
+    // immediately; the read is the half that used to wait for it.
+    const u64 tx = now_us();
+    upload_layer_from(read_buf_[slot], es);
+    stage_xfer_ms_ += static_cast<f64>(now_us() - tx) / 1000.0;
+
+    const i32 nl = prefetch_enabled_ ? next_streamed(l) : -1;
+    const int nslot = 1 - slot;
+    if (read_buf_[nslot] && nl >= 0) {
+        const u64 tr = now_us();
+        read_layer_to(read_buf_[nslot], stream_[static_cast<size_t>(nl)], nullptr);
+        stage_prefetch_ms_ += static_cast<f64>(now_us() - tr) / 1000.0;
+        prefetched_layer_ = nl;
+        prefetched_slot_ = nslot;
+    }
+
+    stage_sync_ms_ += static_cast<f64>(t_sync - t0) / 1000.0;
+    stage_ms_ += static_cast<f64>(now_us() - t0) / 1000.0;
+    stage_calls_++;
+    stage_bytes_ += bytes;
+}
+
 void Model::unload() {
     if (!be_) return;
     // The expert cache owns backend allocations too; drop them first.
@@ -1490,6 +2300,11 @@ void Model::unload() {
         if (L.v_bias) be_->release(L.v_bias);
         if (L.q_norm) be_->release(L.q_norm);
         if (L.k_norm) be_->release(L.k_norm);
+        if (L.sinks) be_->release(L.sinks);
+        // Device-resident like every other 1-D weight: the wo GEMM and the
+        // expert groups read them on the device.
+        for (f32 *f : {L.wo_bias, L.exp_gate_bias, L.exp_up_bias, L.exp_down_bias})
+            if (f) be_->release(f);
         for (f32 *f : {L.ssm_dt, L.ssm_a, L.ssm_norm})
             if (f) be_->release(f);
         // The router bias is HOST memory (see LayerWeights::router_bias): the
@@ -1500,13 +2315,26 @@ void Model::unload() {
             host_free(L.router_bias);
             L.router_bias = nullptr;
         }
-        for (QuantTensor *q : {&L.wq, &L.wk, &L.wv, &L.wo, &L.wgate, &L.wup,
-                               &L.wdown, &L.router, &L.shexp_gate, &L.shexp_up,
-                               &L.shexp_down, &L.shexp_inp_gate, &L.wqkv,
-                               &L.wqkv_gate, &L.wattn_gate, &L.ssm_conv1d,
-                               &L.ssm_out, &L.ssm_in,
-                               &L.ssm_alpha, &L.ssm_beta})
-            if (q->present()) be_->release(q->data);
+        // A streamed tensor's data points into the shared ring, not into its
+        // own allocation; releasing it would free one interior pointer per
+        // tensor. The ring is released once, below.
+        auto in_ring = [&](const void *p) {
+            return ring_ && p >= ring_ &&
+                   p < static_cast<const u8 *>(ring_) + ring_bytes_;
+        };
+        // A promoted layer's tensors are interior pointers into one base that
+        // is released once below; releasing each of them would free one
+        // interior pointer per tensor.
+        auto in_promoted = [&](const void *p) {
+            for (const auto &b : promoted_) {
+                const u8 *lo = static_cast<const u8 *>(b.first);
+                if (p >= lo && p < lo + b.second) return true;
+            }
+            return false;
+        };
+        for (QuantTensor *q : qt_fields(L))
+            if (q->present() && !in_ring(q->data) && !in_promoted(q->data))
+                be_->release(q->data);
         if (L.ssm_d) be_->release(L.ssm_d);
     }
     layers_.clear();
@@ -1517,6 +2345,41 @@ void Model::unload() {
     if (tok_embd_.present()) be_->release(tok_embd_.data);
     if (!cfg_.tied_embeddings && out_head_.present()) be_->release(out_head_.data);
     if (out_norm_) be_->release(out_norm_);
+    if (prefetch_host_) be_->release_host(prefetch_host_);
+    prefetch_host_ = nullptr;
+    read_buf_[0] = nullptr;
+    read_buf_[1] = nullptr;
+    prefetched_layer_ = -1;
+    for (const auto &b : promoted_) be_->release(b.first);
+    promoted_.clear();
+    promoted_bytes_ = 0;
+    promoted_layers_ = 0;
+    promote_ms_ = 0;
+    layer_stream_bytes_.clear();
+    if (stage_host_) be_->release_host(stage_host_);
+    if (ring_) be_->release(ring_);
+    stage_host_ = nullptr;
+    ring_ = nullptr;
+    ring_bytes_ = 0;
+    stream_.clear();
+    layer_streamed_.clear();
+    // The nextn block is not a layer in `layers_`, so its allocations are not
+    // reached by the loop above and have to be released here. They are owned
+    // device buffers (plus one HOST router bias), never ring or promoted
+    // pointers, so releasing each one is correct: nothing else aliases them.
+    // This runs whether or not the block finished loading, because a failed
+    // upload leaves the allocations it already made behind.
+    for (QuantTensor *q : {&mtp_.wq, &mtp_.wk, &mtp_.wv, &mtp_.wo,
+                           &mtp_.router, &mtp_.shexp_gate, &mtp_.shexp_up,
+                           &mtp_.shexp_down, &mtp_.shexp_inp_gate,
+                           &mtp_.eh_proj})
+        if (q->present()) be_->release(q->data);
+    for (f32 *f : {mtp_.attn_norm, mtp_.post_attn_norm, mtp_.q_norm,
+                   mtp_.k_norm, mtp_.enorm, mtp_.hnorm,
+                   mtp_.shared_head_norm})
+        if (f) be_->release(f);
+    if (mtp_.router_bias) host_free(mtp_.router_bias);
+    mtp_ = MtpBlock{};
     tok_embd_ = {};
     out_head_ = {};
     out_norm_ = nullptr;

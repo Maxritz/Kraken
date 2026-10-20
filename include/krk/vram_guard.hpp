@@ -50,6 +50,29 @@ inline size_t vram_reserve_bytes(size_t total_vram) {
     return share > gib ? share : gib;
 }
 
+// The floor a BUDGET must leave free, as opposed to the reserve above, which is
+// what the driver and the desktop may take. The extra gigabyte is the
+// allocator's own working room, and it is the difference between a full card
+// and a pathological one. Measured on a 15.9 GiB card with a 22.1 GiB routed
+// expert set (Tiel-Coder-35B-A3B Q5, 256 experts, top-8, ctx 4096): with 0.00
+// GiB free a 2.2 MiB pool cell takes 30 ms to allocate and decode is 3.1 tok/s;
+// with 2.27 GiB free the same cell takes 0.29 ms and decode is 15.8 tok/s --
+// same weights, same text. The allocator, not the model.
+// KRK_VRAM_FLOOR_MB overrides both the reserve and the extra gigabyte.
+inline size_t vram_floor_bytes(size_t total_vram) {
+    const long long env = guard_env_mib("KRK_VRAM_FLOOR_MB");
+    if (env >= 0) return guard_mib_to_bytes(env);
+    const size_t gib = static_cast<size_t>(1) << 30;
+    // A fifth of the card, or the reserve plus a gigabyte on a small one. The
+    // reserve alone is ~1 GiB here, and a card with 1 GiB free is one expert
+    // admission away from 0 -- which does not just slow this run down, it
+    // stalls the desktop while Windows pages the compositor out. A fifth is
+    // 3.2 GiB on this 15.9 GiB card.
+    const size_t share = total_vram / 5u;
+    const size_t base = vram_reserve_bytes(total_vram) + gib;
+    return share > base ? share : base;
+}
+
 // The host twin: 2 GiB or an eighth of installed RAM. The ram policy already
 // plans a 20% headroom for the WARM tier, but that plan is made once, before the
 // KV tier, the workspaces and the model's own buffers exist -- and staging is

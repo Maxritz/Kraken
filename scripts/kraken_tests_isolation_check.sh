@@ -2,7 +2,7 @@
 # kraken-tests isolation check: prove the suite survives a group that dies, and
 # that the groups really are independent enough to run at once.
 #
-# kraken-tests runs each of its 53 groups in a child process, several at a time.
+# kraken-tests runs each of its 56 groups in a child process, several at a time.
 # Two claims have to hold for that to be worth anything:
 #
 #   * a group CAN die and the run still says which one, with the count it had
@@ -42,7 +42,7 @@
 # (default test_kv_tier_drop_vs_spill -- the group whose fclose(NULL) started
 # this), KRK_CRASH_AT (default 5), KRK_FAIL_GROUP (default test_json),
 # KRK_SERIAL_GROUP (default test_http_server), KRK_ISOLATION_FULL=1 to add the
-# per-group sweep (53 more runs, ~20 s: every group alone in an empty directory
+# per-group sweep (one more run per group, ~20 s: every group alone in an empty directory
 # must report the count it reports in the full run), KRK_ISOLATION_INJECTIONS=1
 # to add the per-group selfcheck (318 more suite runs, minutes: kraken-tests
 # --selfcheck runs six arms for every group -- five fixed and one fuzzed -- and
@@ -453,7 +453,7 @@ fi
 # The sweep is 318 suite runs -- minutes, not seconds -- so it is opt-in.
 if [ "${KRK_ISOLATION_INJECTIONS:-0}" = "1" ]; then
     if "$BIN" --selfcheck; then
-        ok "selfcheck-arms" "all 53 groups: every injection named, with the count it had reached"
+        ok "selfcheck-arms" "every group: every injection named, with the count it had reached"
     else
         bad "selfcheck-arms" "the per-group selfcheck reported a mismatch (its own output is above)"
     fi

@@ -673,6 +673,194 @@ Tune the window with `KRK_PROFILE_STEPS=N` (last N steps, default 1),
 `KRK_PROFILE_FROM=S` (count back from the last), `KRK_PROFILE_OPS=N` (fallback
 window when there is no `embed` marker to split on).
 
+### `--weight-vram-mb` - dense weight streaming
+
+Every dense matrix used to be uploaded at load. When the model did not fit the
+card, that filled VRAM to **0.00 GiB free** and left the KV tier a single slot
+per plane: on `Qwen3.8-27B-Q4_K_M` (15.9 GiB) it measured 7.9 GiB of KV
+migrations in 16 tokens and **3.1 tok/s**, because the KV working set could
+never stay resident.
+
+The loader now keeps the layers that fit and streams the rest from the GGUF
+through **one reusable ring** before their layer runs. The decision is made
+from the file's own tensor directory before any weight is uploaded, and the
+ring is sized to the largest streamed layer. The policy is:
+
+* `--weight-vram-mb N` - keep at most N MiB of dense weights on the device.
+* `0` (default) - automatic: everything resident while it fits, stream the tail
+  only when it does not. The auto budget is `free VRAM - reserve - 1 GiB`, so
+  the KV cache and workspaces are allocated against real headroom instead of
+  against zero.
+* A negative value, or `KRK_WEIGHT_STREAM=0`, disables streaming (the old
+  upload-everything path). `KRK_WEIGHT_VRAM_MB` is the environment spelling of
+  the positive budget.
+
+Two more policies apply once streaming is active, both of them measured rather
+than guessed:
+
+* **Promotion on first use.** A streamed layer that measured free VRAM can hold
+  is copied into an allocation of its own the first time it runs and never
+  staged again (`KRK_WEIGHT_PROMOTE=0` on the layer's environment restores the
+  fixed resident prefix). The load-time budget is decided before the KV cache and
+  the workspaces exist, so it leaves real room unused: `--info`-style residency
+  lines print each promotion with the MiB it kept free.
+* **A two-buffer read pipeline.** Two pinned host buffers alternate: the copy is
+  issued as a DMA straight out of the pinned buffer on a private stream
+  (published to the default stream by one event), and the next layer is read
+  while those bytes are in flight. `KRK_WEIGHT_PREFETCH=0` and
+  `KRK_WEIGHT_DMA=0` restore the serialized path for an A/B.
+
+Routing experts are unaffected: `_exps` banks are still paged by `ExpertCache`,
+never charged to this budget. The CPU backend never streams -- there is no
+device/host split to page across.
+
+Measured on the RX 9070 XT (gfx1201, 15.9 GiB), greedy, `--ctx 512`:
+
+| model | arm | resident | streamed | free VRAM | decode | output |
+|---|---|---|---|---|---|---|
+| Qwen3-8B-Q4_K_M (4.68 GiB) | `--weight-vram-mb 3072` | 2.94 GiB | 1.74 GiB/token | 12.45 GiB | 2.6 tok/s | **md5 identical** |
+| Qwen3-8B-Q4_K_M | resident (`-1`) | 4.68 GiB | -- | 10.8 GiB | 92.1 tok/s | baseline |
+| Qwen3.8-27B-Q4_K_M (15.9 GiB) | auto, before promotion | 11.84 GiB | 3.76 GiB/token | 3.08 GiB | 1.2 tok/s | **md5 identical** |
+| Qwen3.8-27B-Q4_K_M | auto + promotion | 13.74 GiB | 1.86 GiB/token | 1.17 GiB | **2.3 tok/s** | **md5 identical** |
+| Qwen3.8-27B-Q4_K_M | auto + promotion + read/copy pipeline | 13.74 GiB | 1.86 GiB/token | 1.17 GiB | **3.0 tok/s** | **md5 identical** |
+| Qwen3.8-27B-Q4_K_M | `-1` | 15.61 GiB | -- | 0.00 GiB | 3.1 tok/s | baseline |
+| Qwen3.6-27B-Q5_K_M (18.2 GiB) | auto | 11.83 GiB | 6.07 GiB/token | 3.23 GiB | 0.3 tok/s | coherent |
+| Tiel-Coder-35B-A3B (24.8 GiB MoE) | auto | 1.88 GiB dense | experts page | 0.00 GiB | 3.0 tok/s | coherent |
+
+The staging path runs at **2.1-4.9 GB/s** (`read_host_batch` + `upload_paged_batch`,
+four readers); the per-run line is `[stats ] weight stream: ... GiB from the
+file, ... ms (.. GB/s)`. A model that does not fit cannot be made fast by
+streaming -- every token must move the non-resident bytes over PCIe. What
+streaming buys is a **bounded, predictable** device footprint: the KV cache
+stays flat (`kv flat: whole cache resident in VRAM`) at a 4k context on a model
+larger than the card, instead of thrashing one HOT slot per layer.
+
+### `--mtp-probe` - run the file's own nextn (MTP) block for one step
+
+A model built with a multi-token-prediction block (`qwen35moe.nextn_predict_layers`,
+`blk.<n>.nextn.*`) carries a drafter inside its own file: the block takes the
+target's final hidden state plus the last token's embedding, attends over its
+own KV, and predicts the NEXT token directly. `--mtp-probe` loads that block
+and runs it after prefill, printing the token it would draft beside the target's
+own argmax -- a match is the token a greedy speculative round would accept:
+
+```
+[mtp   ] pos 8: draft 11 "," (22.2812) | target 11 "," (18.7344) | MATCH | 90.8 ms
+```
+
+`KRK_MTP_PROBE_ALL=1` repeats the comparison at every decode step and prints an
+acceptance summary; the block's KV is incremental, so a step costs one block
+forward. Nothing is emitted from the probe and generation is byte-identical to
+a run without it.
+
+Measured on `Tiel-Coder-35B-A3B-MTP-APEX` (256 experts, top-8, 22.1 GiB routed,
+`--ctx 4096`, greedy, 16 tokens): **10 of 16 drafted tokens match the target's
+argmax (62.5%)**, and the swapped concat order (`KRK_MTP_CONCAT=he`) matches
+0 of 19 -- the head is wired correctly and the embedding-first order is the one
+it was trained with.
+
+**A block that ships in its own file is loaded with `--mtp FILE`.** A `-noMTP`
+quant is a model whose MTP was published separately (`mtp-<model>.gguf` beside
+it); that sidecar carries the same `blk.<n>.*` block at the index past the
+trunk's stack, and `--mtp FILE` reads it from there and drives it with exactly
+the same `--mtp-probe` / `--mtp-spec` loop:
+
+```sh
+kraken -m NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-noMTP.gguf \
+       --mtp mtp-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf \
+       --mtp-probe -p "..." -n 32 --greedy
+```
+
+The sidecar is validated like the in-file block: its architecture must be the
+trunk's, it must carry a block at or past the trunk's stack, its width and head
+count must match the trunk (a head from a same-family model with a different
+attention shape is refused with both numbers), and its `head_count_kv` may be a
+per-layer array (nemotron_h_moe ships 53 entries; the block's own index selects
+its entry). Experts of an **ungated** bank (`ffn_up_exps`/`ffn_down_exps` with
+no gate) load and run, which is the shape Nemotron's block has.
+
+Measured on `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-noMTP.gguf` +
+`mtp-…NVFP4.gguf` (ctx 512, greedy): `nextn (MTP) block 52 loaded: 32 head(s) x
+128, 128 experts x top-6 of 1856-wide FFN + shared expert, eh_proj 5376x2688 …
+59.0 MiB resident`, probe `MATCH` on the first step (21.0 ms), and
+`--mtp-spec --draft-tokens 2` running `14 round(s), 6 of 28 proposals kept
+(21.4%), 1.14 token(s)/round`. The suite pins the loader's four refusals in
+`test_mtp_sidecar` (17 checks).
+
+Two block shapes load. A routed block (`ffn_*_exps`, Tiel) pages its experts
+through the model's own `ExpertCache`; a dense block (`ffn_gate/up/down`, the
+qwen35 dense family's nextn heads) runs that FFN instead. On this box **15 of
+the 19 files carrying `nextn_predict_layers` run the probe** -- the other two
+are head-only shards with no base model, and the 57 GB `DeepSeek-V4-Flash` file
+is refused by its architecture (MLA, attention sinks, quant type 26) before MTP
+is reached. Acceptance over 8 greedy steps and two prompts is 50-100% on most:
+`Qwen3.8-27B-Q4_K_M` 8/8 and 6/8, `Qwen3.5-9B-Q4_K_M` 7/8 and 5/8,
+`Tiel-Coder-35B-A3B` 6/8 and 5/8, `Qwen3.8-Distill-35B-A3B` 5/8 and 4/8.
+
+`--mtp-spec` drives that loop as a decoder: the block proposes up to
+`--draft-tokens` tokens (one block forward each, fed the previous proposal),
+**one** batched target forward verifies them, the longest matching prefix is
+kept plus the target's own bonus token from the last verification row, and the
+block's KV is re-fed from the accepted tokens' captured target rows. A hybrid
+target (gated delta net layers) snapshots `rec_state_`/`conv_state_` before the
+verify and, on a partial accept, restores and replays the accepted prefix in one
+batched forward -- the delta rule cannot be rewound.
+
+Measured (greedy, ctx 4096, `--draft-tokens 2`, 64 tokens): **1.45 tokens per
+target forward** on Tiel (44 rounds, 33% of proposals kept), **1.19** on
+`Qwen3.8-Distill-35B-A3B` (54 rounds), **1.78** on `Qwen3.5-9B` at 64 tokens.
+Where the batched forward agrees with single-row decode the text is
+byte-identical to plain greedy; on Tiel it matches a multi-row decode instead,
+because this hybrid is not chunk-invariant (`--chunk 1` and `--chunk 256` are
+`6792671902ca` vs `ac63e6812909` with speculation off).
+
+It is **opt-in, and a throughput loss on this box**: plain decode is 20.1 tok/s
+on Tiel against 9.8 at one proposal and 7.9 at two, because the round pays a
+verify forward plus, after a rejection, a replay of the accepted prefix. The
+propose pass itself is not the bottleneck any more: measured on Tiel (ctx 4096,
+48 tokens, `--draft-tokens 2`) it is 193 ms of a 4.6 s run, 160 ms of which is
+its own expert acquires at an 11% miss rate.
+
+`KRK_MTP_PIN=1` keeps the block's 256 experts resident instead (816 MiB of the
+7594 MiB device budget, pinned so the LRU cannot take them). It does what it
+says: **propose 193 -> 136 ms, refeed 80 -> 33 ms, block acquires 160 -> 0 ms**,
+with the text unchanged. It is **off by default because the trade is a wash**:
+the 816 MiB comes out of the target's expert budget, so the target's own
+promotions cost 105-180 ms more and 5 interleaved order-balanced pairs measure
+8.7 tok/s pinned against 8.9 unpinned. Turn it on where the block's share of the
+run is larger than it is here -- more proposals per round, or a target whose own
+expert set fits anyway.
+
+The exact, useful part is the probe above; the decoder also needs a cheaper
+verify-or-replay round before it can pay. The chunk gap underneath it is now
+closed for this model: the first differing stage between `--chunk 1` and
+`--chunk 2` was `attn.out` on the first full-attention layer at position 1, and
+`attention_bexact_kernel` (the prefill path, on by default) now reproduces the
+decode row's arithmetic -- per-key running max, keys split across its 8 warps,
+the same merge -- so a chunked prefill writes the bytes a decode step would.
+Tiel gives `613eb9b3` at `--chunk 1`, `2` and `8` where `2..8` used to give a
+different hash from `1`, and `kraken-bench --bitexact` reports all 24 attention
+cases bit-identical. It is also **faster than what it replaced**, which is why
+it is now the only prefill formulation: +10.4% prefill at a 170-token prompt
+and +113% at 3400 tokens on Qwen3.5-9B, +80% on Phi-3.5 (hd 96) at 2760
+tokens -- same text in every pair. `KRK_ATTN_BEXACT=0` is the arm that falls
+back to the tiled kernel. The query-tiled kernel and its probe are deleted;
+the tiled kernel survives only for a windowed layer, a non-causal call and a
+head width outside 64..256 in steps of 32. Two other kernels still are not
+chunk-invariant -- the GEMM tile rung from 9 rows up, and the recurrent
+block's conv/scan at rows>1 -- so a hybrid's text can still depend on the
+chunk size away from attention; see `AGENTS.md`, "Chunk invariance was an
+ATTENTION property".
+
+The suite carries that check as a gate now, so a regression fails a run instead
+of a review: `./build-hip/kraken-tests --run-group test_prefill_chunk_bitexact`
+prefills one 64-token prompt at `--chunk 1`, `2` and `8` through
+`kraken.exe --prefill-hash` and requires one hash across them -- and then runs
+the chunk-8 arm again with `KRK_ATTN_BEXACT=0`, where the hash must DIFFER, so
+the gate is shown able to fail. The hash covers every prefill row, not just the
+last: a last-row logits hash is blind here, because the f16 residual absorbs
+the drift before the head.
+
 ### `--expert-cache-mb` / `--expert-cache-slots` - MoE residency
 
 The auto budget covers the routed expert set when it fits in the live plan;
@@ -685,6 +873,38 @@ increments when routed demand needs it, up to 14 GiB, then bounded by the live
 free-VRAM reading minus reserve. On the current Qwen3-MoE headline run the
 planner reported a 6 GiB cap and a 610.3 MiB expert pool because the routed set
 was smaller than the cap.
+
+**That plan is then clamped against reality.** It is made before the KV cache and
+the engine's workspaces exist, so on a card whose routed set exceeds VRAM it can
+leave **0.00 GiB free** - and an allocation on a full card makes the driver evict
+pages, which is why it does not merely run slow, it stalls the desktop:
+
+| 22.1 GiB routed set, ctx 4096, 16 tokens | free VRAM | alloc per 2.2 MiB cell | decode |
+|---|---|---|---|
+| auto (11.95 GiB) | 0.00 GiB | 30 ms | 3.1 tok/s |
+| 10 GiB | 0.00 GiB | 1.2 ms | 6.2 tok/s |
+| clamped (7.7 GiB, 3.3 GiB floor) | 2.95 GiB | 0.25 ms | **16.6-18.7 tok/s** |
+
+After the warm-up, `Engine::init` sets the budget to `resident bytes + what is
+really free beside the floor`, so the pool evicts-and-reuses instead of
+allocating.
+
+**Then rank the fill.** Which experts are resident is worth more than how many:
+with the same 7.68 GiB pool, an even-order fill decodes at 16.6 tok/s and a
+ranked one at **23.9 tok/s** (671 promotions instead of 1850, same text). The
+ranking is one command, and the next run picks it up automatically:
+
+```sh
+kraken -m Tiel-Coder-35B-A3B-MTP-APEX.gguf --expert-scan -p "some text" -n 8
+# writes <model>.krakenexperts.json; every later load prints
+# "expert warmup: using ... (16 positions, full-forward, 10240 ranked pairs)"
+```
+
+A larger device budget is *not* the lever: at a 2 GiB floor the same model reads
+20.6 tok/s and at 1 GiB floor 17.6, because a wider resident set reaches into
+colder experts and leaves the allocator no headroom. The floor is a fifth of the card (`max(reserve + 1 GiB, total/5)`;
+`KRK_VRAM_FLOOR_MB` overrides it) and the clamp prints what it did. The CPU
+backend has no device/host split, so the clamp is skipped there.
 
 ```sh
 # cap residency for a model whose experts exceed VRAM
@@ -761,12 +981,90 @@ does the full host-side cut and is a different measurement.
 kraken -m /g/More-models/GLM-4.7-Flash-Q4_K_M.gguf --expert-cache-mb 2048 --expert-warm-mb 8192
 ```
 
-WARM is pageable host RAM, not pinned memory. Cold read-throughs may be kept
-there, and a WARM expert promotes through a bounded pinned staging ring; ordinary
-VRAM eviction preserves an existing WARM copy without downloading it. Expert
-WARM shares live host-memory admission with KV WARM/COLD staging. The `--info`
-report shows WARM capacity/admissions, while the end-of-run report shows expert
-pool physical commitment separately from logical residency.
+WARM is pageable host RAM by default. Cold read-throughs may be kept there, and
+a WARM expert promotes through a bounded pinned staging ring; ordinary VRAM
+eviction preserves an existing WARM copy without downloading it. Expert WARM
+shares live host-memory admission with KV WARM/COLD staging. The `--info` report
+shows WARM capacity/admissions, while the end-of-run report shows expert pool
+physical commitment separately from logical residency.
+
+### `--expert-pin-mb` - pin the hot prefix of that tier
+
+```sh
+kraken -m gpt-oss-120b-Q8_0.gguf --expert-warm-mb 11000 --expert-pin-mb 8192 --expert-warmup 1
+```
+
+The first `N` MiB of WARM, in admission order -- which is rank order when the
+model has an expert index -- are allocated pinned (`hipHostMalloc`) instead of
+pageable, and a promotion out of them is **one DMA straight out of that buffer**
+instead of a 12.6 MB memcpy into the staging ring followed by that DMA. That
+memcpy was the whole gap between the promotion path and the link:
+
+| arm (gpt-oss-120b Q8_0, ctx 512, 24 tokens, greedy, ranked warmup, 11 GiB WARM) | decode | ms/step |
+|---|---|---|
+| nothing pinned | 16.4 tok/s | 60.9 |
+| `--expert-pin-mb 8192` | **20.5** | **48.8** |
+| `--expert-pin-mb 4096` | 16.3 | 61.5 |
+
+Interleaved, order-balanced pairs, six per arm, text byte-identical throughout:
+**+25.0%** at an 8 GiB pin (6/6 pairs, MAD 2.0%) and **+18.3%** at a 12 GiB pin
+over the 34.5 GiB auto tier (5/5, MAD 6.1%; 20.3 -> 23.9 tok/s).
+
+**Size it to the bytes a run actually promotes, not to a fraction of the tier.**
+4 GiB beat nothing by exactly zero even though it halved the measured copy time:
+at half the working set the other half still pays the memcpy, and that half is
+what the step waits on. 8 GiB covered all 7098 MiB the run promoted and is where
+the gain appears. Pinned pages cannot be swapped, so this stays opt-in.
+
+The end-of-run `[stats ] pinned` line reports the copy-stream rate from events
+recorded on that stream: 22.7 GB/s in the pin-8192 arm, and 6.1-24.9 GB/s across
+arms because a copy shares the device's memory bandwidth with the decode kernels.
+Read it as a diagnostic, not as a bus spec -- and do not read the `transfer`
+line's GB/s for a pinned promotion at all: that timer wraps the *enqueue* of an
+asynchronous copy and once reported 64.6 GB/s on a link that does 27.
+
+### `--router-resident P` - route to the expert that is already there
+
+```sh
+kraken -m gpt-oss-120b-Q8_0.gguf --expert-warm-mb 11000 --expert-pin-mb 8192 \
+       --expert-warmup 1 --router-resident 0.10
+```
+
+The router picks the top-k experts by score, and two experts whose scores are
+within a hair of each other are interchangeable to the model. This makes the
+tier break that tie: a candidate within `P` of the best score (a fraction of it,
+so `0.10` is 10%) is preferred if it is already in VRAM, then if it is in WARM.
+Nothing else changes -- the mix weight is still the unbiased probability, and a
+pick is only moved when a near-equal alternative is resident, which the end-of-run
+`[stats ] router` block counts:
+
+```
+[stats ] router    4032 picks, 460 (11.4%) went to an already-resident expert
+                   over a near-equal one (margin 10.0% of the top score)
+[stats ] router    hot share 3382/3844 picks (88.0%) landed on an expert already in VRAM
+```
+
+A step on a tier smaller than the routed set is paid for in experts it has to
+move, so fewer moves is directly fewer bytes. Measured on gpt-oss-120b Q8_0
+(ctx 512, 24 tokens, greedy, 11 GiB WARM, 8 GiB pin, ranked warmup; interleaved
+order-balanced pairs):
+
+| margin | picks moved | promotions | bytes/token | decode |
+|---|---|---|---|---|
+| off | 0 | 563 | 283.65 MiB | 20.3-21.4 tok/s |
+| 0.02 | 2.6% | 537 | 269.47 MiB (-5.0%) | 21.6 |
+| **0.10** | **11.4%** | **462 (-17.9%)** | **226.92 MiB (-20.0%)** | **23.7-24.9 (+16.7%, 5/5, MAD 0.1%)** |
+| 0.20 | 27.8% | 349 | 168.09 MiB (-40.7%) | 26.7 |
+
+On a model where everything fits (`Qwen3.8-Distill-35B-A3B`, so no file reads at
+all) it still pays, because it cuts promotions between the tiers rather than
+reads: 917 -> 742 promotions and 30.3 -> 32.7 tok/s at 0.10, and **+14.5%**
+(5/5 pairs, MAD 1.6%) at 0.20, with the generated text identical in every arm.
+
+**It changes the route, so it can change the text** -- that is the trade, not a
+bug. The measured arms above happened to print identical text, and that is
+evidence the near-ties really are near, not a guarantee for every prompt. Start
+at 0.10, and check the text on your own workload before going past it.
 
 ### `--draft` / `--draft-tokens` - greedy speculative decoding
 
@@ -789,6 +1087,70 @@ rejection-sampling verifier)` -- the acceptance a serving stack's rejection
 sampling would see at Poolside's served settings, so a drafter's quality is
 comparable to a model card's acceptance length and not only to its greedy
 floor (Laguna XS-2.1 pair: 12.5% greedy against 30.7% sampled).
+
+### `--draft-head` - an external EAGLE-3 head as the drafter
+
+```sh
+python tools/eagle_to_gguf.py head.safetensors -o head.gguf \
+       --target-vocab 201088 --target-arch gpt-oss      # once, offline
+kraken -m gpt-oss-120b.gguf --draft-head head.gguf --draft-tokens 2 --greedy \
+       -p "explain quicksort" -n 128
+```
+
+A published speculator is a *head*, not a model: one block that reads the
+target's own hidden state and the last token's embedding and proposes k tokens
+for the verify loop above. `--draft-head` loads one from a GGUF that
+`tools/eagle_to_gguf.py` converts from the published safetensors; it needs no
+VRAM of its own (the block runs on the host) and no second model beside the
+target. This is a different artifact from the nextn block inside a model's own
+file, which `--mtp-spec` drives.
+
+The loader checks the head against the target before the first token: the
+hidden width and the target vocabulary must match, every `d2t` id must be
+inside that vocabulary, and every weight must be F16. A head from another
+tokenizer proposes ids the verifier can never accept, which reads as a bad
+drafter rather than as a wrong file -- so it is refused, with the number that
+disagrees. A recurrent (gated delta net) target is refused too: the verified
+suffix has to be rewound, and a delta-rule state has no inverse.
+
+`--draft-head-prime N` (default 256) is how many of the most recent positions a
+round primes the head over. The head's fusion projection is
+O(hidden x target_hidden) per position, so priming a 4k prompt in full is
+hundreds of GFLOP of host arithmetic; `0` is the exact whole-prompt form.
+
+**Sampling works too, and it cannot be a prefix match.** A greedy round asks
+"is the target's argmax the proposal"; under a stochastic sampler that test is
+wrong in both directions -- rejecting every non-argmax proposal makes the head
+useless, and accepting every match emits the head's distribution instead of the
+target's. The round therefore verifies with the acceptance rule from
+Leviathan et al. (arXiv:2302.01318): each token is proposed by a DRAW from the
+head's row (softmax at the run's temperature, mapped through `d2t` into target
+space), accepted with probability `min(1, p/q)`, and on rejection replaced by a
+draw from the residual `max(0, p - q)`. `p` is the sampler's own row -- the same
+`Sampler::build_dist` that `sample()` draws from, repetition penalty included,
+with the round's already-accepted tokens pushed into the penalty history -- so
+the emitted stream stays distributed as the target alone would produce it.
+`KRK_SPEC_RS=0` turns the verifier off for this path and runs the plain loop.
+
+The rule is pinned by `test_spec_sampling` (38 checks in the default suite):
+the enumerated identity `sum(min(p,q)) + sum(p-q)+ = p`, the accept ratio, the
+residual's support, the one-hot limit, the histogram of 200k real draws through
+`spec_accept_step` against `p`, and that `build_dist` is the row `sample()` uses.
+An always-accept implementation fails four of them, which is how the group was
+shown able to fail.
+
+Measured (qwen2 1.5B, ctx 512, `--temp 0.9 --seed 7`, 24 tokens, `--draft-tokens
+3`, same random head -- so every proposal is rejected and every round pays the
+worst case): output fluent code, `draft head: 24 round(s), 0 of 72 proposals
+kept (0.0%), 1.00 token(s)/round`, i.e. the rejection path (residual draw,
+re-forward, realign) runs 24 times in a row without drift. Measured (qwen2 1.5B, ctx 512, greedy, 16 tokens, with a randomly-initialised
+head so every proposal is rejected): output byte-identical to plain greedy --
+md5 `f7957feb5610` for both arms -- and the run reports `draft head: 16
+round(s), 0 of 32 proposals kept (0.0%), 1.00 token(s)/round | prime 141 ms |
+propose 1442 ms`. That is the property that matters first: a head can change
+the speed, never the text. The suite pins the parts a random head cannot
+(`test_draft_head`: geometry, vocabulary, the prime/replay/truncate contract,
+50 checks).
 
 ### `--kv-hot-mb` / `--kv-warm-mb` / `--kv-cold-dir` - a tiered KV cache
 

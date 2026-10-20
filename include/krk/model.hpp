@@ -16,6 +16,7 @@
 #include "krk/gguf.hpp"
 
 #include <cmath> // std::tanh in apply_logit_softcap, called from every path
+#include <utility> // std::pair in the promoted-layer table
 
 namespace krk {
 
@@ -49,6 +50,15 @@ struct LayerWeights {
     f32 *v_bias = nullptr; // optional [n_kv*hd]
     f32 *q_norm = nullptr; // optional per-head RMSNorm weight [hd]
     f32 *k_norm = nullptr;
+    // Attention sink logit per query head [n_head], nullable like every other
+    // optional 1-D weight: a file without `blk.N.attn_sinks.weight` is the
+    // normal case and keeps the arithmetic it had (see AttnDesc::sinks).
+    f32 *sinks = nullptr;
+    // Attention-output bias (`attn_output.bias`, gpt-oss): one f32 per output
+    // channel, added to the wo projection's result before the residual. DEVICE
+    // memory -- the GEMM that produces the result runs there, and the add is
+    // one launch with the same shape as `add_bias_cols`.
+    f32 *wo_bias = nullptr;
     f32 *ffn_norm = nullptr; // f32 [n_embd]
     QuantTensor wgate, wup, wdown;
 
@@ -70,6 +80,16 @@ struct LayerWeights {
     // in it unnoticed. n_expert floats is 1 KiB a layer; there is no reason for
     // it to be on the device at all.
     f32 *router_bias = nullptr;  // HOST f32[n_expert], owned; exp_probs_b.bias
+    // Per-expert FFN biases (`ffn_gate_exps.bias` / `ffn_up_exps.bias` /
+    // `ffn_down_exps.bias`, gpt-oss): whole tables [n_expert, n_ff] (or
+    // [n_expert, n_embd] for down), DEVICE memory, indexed by expert rather
+    // than by token. They are applied after each projection and before the
+    // activation, which is where the reference puts them -- so a layer that
+    // carries them cannot take the fused gate/silu pair, whose output is
+    // already post-activation.
+    f32 *exp_gate_bias = nullptr;  // [n_expert * n_ff_exp]
+    f32 *exp_up_bias = nullptr;    // [n_expert * n_ff_exp]
+    f32 *exp_down_bias = nullptr;  // [n_expert * n_embd]
     // Per-head attention output gate: one scalar per query head, off the
     // pre-attention hidden state.
     QuantTensor wattn_gate;                       // attn_gate.weight [n_embd, n_head]
@@ -179,9 +199,18 @@ struct ModelConfig {
     // under YaRN and the windowed ones rotating all 128 under plain RoPE.
     // `swa_period` 0 or 1 means every layer attends fully.
     i32 swa_period = 0;
+    // Phase of the pattern: is_swa(l) == ((l + swa_phase) % swa_period) != 0.
+    // 0 is the historical (full layer first) reading; 1 flips the pair so the
+    // *windowed* layer comes first (gpt-oss).
+    i32 swa_phase = 0;
     i32 swa_window = 0;
     i32 rope_dim_swa = 0;
     f32 rope_frac_swa = 1.0f;
+    // Defaults to the model's own `rope.freq_base`, not to 10000: a file that
+    // declares one rotary base for the whole stack means it for every layer,
+    // and a windowed layer silently rotated at 10000 while its full layers used
+    // 150000 is a wrong answer that no shape check catches (gpt-oss declares
+    // exactly one base, for all 36 layers).
     f32 rope_base_swa = 10000.0f;
     // `n_head` above is the head count of the *full* layers. When a model
     // varies it per layer (`attention.head_count` stored as an array) the whole
@@ -211,12 +240,26 @@ struct ModelConfig {
     // sigmoid over softmax; the selected weights are then optionally
     // sum-normalized (`expert_w_norm`) and scaled (`expert_w_scale`).
     bool router_bias = false;
+    // Where the bias enters. laguna's `exp_probs_b.bias` is added to the
+    // *probabilities* (`false`); llama.cpp's `ffn_gate_inp.bias` convention
+    // (gpt-oss) adds it to the router LOGITS, before the softmax -- so it
+    // changes both the top-k and the weights, and the two are not
+    // interchangeable: a monotone map does not commute with a bias added after
+    // it, so the same tensor applied in the wrong place selects different
+    // experts. Absent means the laguna reading, which is what this engine ran
+    // before the flag existed.
+    bool router_bias_pre = false;
     bool router_sigmoid = false;
     // The FFN's activation is squared ReLU rather than a gated SiLU
     // (nemotron_h/nemotron_h_moe: the reference builds every FFN of the family
     // with LLM_FFN_RELU_SQR, and its files carry no ffn_gate for the gate-less
     // expert/shared-expert shapes to multiply against).
     bool ffn_relu_sqr = false;
+    // gpt-oss's expert activation (SwiGLU-OAI): min(gate, 7) *
+    // sigmoid(1.702 * gate) * (clamp(up, -7, 7) + 1). A different function from
+    // silu(gate) * up, not a different spelling of it -- see the note on
+    // Backend::swiglu_oai.
+    bool ffn_swiglu_oai = false;
     // Whether the rope table was built with YaRN's frequency correction, i.e.
     // whether `rope_scale` has already been folded into `inv_freq` and must be
     // left at 1.0 for the rotation op.
@@ -268,6 +311,73 @@ struct ModelConfig {
     i32 rope_sections[4] = {0, 0, 0, 0};
 };
 
+// A model's next-token-prediction (MTP/nextn) block: the extra block a
+// Qwen3.5-family file appends after the stack, which the engine does NOT run as
+// a layer. It is a full attention + MoE block plus three adapters that fuse the
+// target's hidden state with the last token's embedding:
+//
+//   x = eh_proj( cat( hnorm(hidden), enorm(embed(t)) ) )
+//   x = attn(x) -> moe(x) -> shared_head_norm(x) -> the model's own output head
+//
+// Loaded only when asked for (KRK_MTP_LOAD=1, or a future --mtp-draft): the
+// experts alone are ~855 MB on Tiel-35B-A3B, so a plain run must not pay for
+// them. Nothing in the main stack reads this struct.
+struct MtpBlock {
+    bool present = false;
+    i32 layer = -1;      // the file's block index (blk.<layer>.*)
+    i32 n_embd = 0;
+    i32 n_head = 0;
+    i32 n_head_kv = 0;
+    i32 head_dim = 0;
+    i32 n_expert = 0;
+    i32 n_expert_used = 0;
+    i32 n_ff_exp = 0;
+    i32 n_ff_shexp = 0;
+    i32 n_ff = 0;        // dense FFN width (0 when the block is MoE-only)
+    size_t bytes = 0;    // weights uploaded, for the report
+    // The block itself.
+    QuantTensor wq, wk, wv, wo;
+    QuantTensor router;
+    QuantTensor shexp_gate, shexp_up, shexp_down;
+    // Qwen3.5 scales the shared expert by a sigmoid of a per-token projection
+    // (`ffn_gate_inp_shexp`), the same gate the stack's own layers carry.
+    QuantTensor shexp_inp_gate;
+    // A block whose FFN is dense carries ffn_gate/up/down instead of routed
+    // banks. Both shapes load, and the forward runs the one the file has: the
+    // qwen35 dense family's nextn heads are this shape, and running attention
+    // over a block whose FFN was never loaded is a fluent wrong answer.
+    QuantTensor ffn_gate, ffn_up, ffn_down;
+    f32 *attn_norm = nullptr;
+    f32 *post_attn_norm = nullptr;
+    f32 *q_norm = nullptr;
+    f32 *k_norm = nullptr;
+    f32 *router_bias = nullptr; // HOST, like LayerWeights::router_bias
+    // The nextn adapters and the shared head's norm.
+    QuantTensor eh_proj;        // [2*n_embd, n_embd]
+    f32 *enorm = nullptr;
+    f32 *hnorm = nullptr;
+    f32 *shared_head_norm = nullptr;
+    // Routed experts are NOT uploaded here: they go through ExpertCache like
+    // any other layer's, once the drafter runs (see the mtp plan in docs).
+    const GgufTensor *exps_gate = nullptr;
+    const GgufTensor *exps_up = nullptr;
+    const GgufTensor *exps_down = nullptr;
+};
+
+// One dense tensor that is NOT resident: its source in the GGUF mapping and
+// the address inside the streaming ring it is staged at. A streamed layer's
+// QuantTensors point into that ring, so layer decisions (present(), dtypes,
+// shapes) are unchanged and only the bytes move.
+struct StreamEntry {
+    const GgufTensor *src = nullptr;
+    void *dst = nullptr;
+    size_t bytes = 0;
+    // The layer tensor that points at `dst`, bound after the layer is built.
+    // Promotion re-points it into a permanent allocation, so this is what
+    // moves the layer's own weights rather than the ring's copy of them.
+    QuantTensor *q = nullptr;
+};
+
 class Model {
 public:
     Model() = default;
@@ -277,6 +387,61 @@ public:
 
     bool load(Backend &be, const std::string &path, std::string *err);
     void unload();
+
+    // ---- dense weight residency ------------------------------------------
+    // Budget for dense weights in device memory, in bytes, set BEFORE load().
+    // 0 (the default) is automatic: keep everything resident when it fits and
+    // stream whole layers from the file once it does not, leaving VRAM for KV
+    // and workspaces. A positive value is an explicit ceiling. The CPU backend
+    // never streams (there is no device/host split to page across).
+    void set_weight_budget(size_t bytes) { weight_budget_ = bytes; }
+    // Upload the file's nextn (MTP) block. Set BEFORE load(), like the weight
+    // budget: the block is parsed once, during load, so a caller that asks
+    // afterwards would be asking a loader that has already run. KRK_MTP_LOAD=1
+    // is the environment spelling; --mtp-probe sets this.
+    void set_mtp_load(bool on) { mtp_load_ = on; }
+    // The nextn block can also arrive as its OWN file: a `-noMTP` quant of a
+    // model whose MTP was published separately (Nemotron 3.5 Lightning ships
+    // `mtp-<model>.gguf` beside a `-noMTP` trunk). The sidecar carries the same
+    // `blk.<n>.*` tensors the in-file block does, at the block index past the
+    // trunk's stack, plus its own copy of the config; this loader reads the
+    // block out of it and keeps the mapping alive for the routed banks.
+    // Set BEFORE load(), like set_mtp_load: the block is parsed once.
+    void set_mtp_path(std::string path) { mtp_path_ = std::move(path); }
+    const std::string &mtp_path() const { return mtp_path_; }
+    // Refill the streaming ring with layer l's weights. A no-op for a resident
+    // layer, so the engine's layer loop calls it unconditionally.
+    void stage_layer(i32 l);
+    // The nextn/MTP block, when this file carries one and it was asked for.
+    const MtpBlock &mtp() const { return mtp_; }
+    // A streamed layer is promoted into an allocation of its own the first
+    // time the engine needs it, when measured free VRAM can hold it beside the
+    // reserve. Streaming is then only what genuinely does not fit, which is a
+    // measurement rather than a load-time guess.
+    size_t promoted_layers() const { return promoted_layers_; }
+    size_t promoted_bytes() const { return promoted_bytes_; }
+    f64 promote_ms() const { return promote_ms_; }
+    size_t streamed_bytes() const { return stream_bytes_total_; }
+    size_t streamed_layers() const { return streamed_layers_; }
+    size_t ring_bytes() const { return ring_bytes_; }
+    u64 stage_calls() const { return stage_calls_; }
+    u64 stage_bytes() const { return stage_bytes_; }
+    f64 stage_ms() const { return stage_ms_; }
+    // Where a staged layer's wall time went: the drain that orders ring reuse,
+    // the file read into pinned staging, and the host->device copy. Only useful
+    // as a split -- a combined total cannot say which half to fix.
+    f64 stage_sync_ms() const { return stage_sync_ms_; }
+    f64 stage_read_ms() const { return stage_read_ms_; }
+    f64 stage_xfer_ms() const { return stage_xfer_ms_; }
+    // Read time that was NOT paid inside a staging pass: the next layer was
+    // read into the spare pinned buffer while this one's copy was in flight.
+    // It is wall time the pass would otherwise have spent, so it is reported
+    // beside the split rather than inside it.
+    f64 stage_prefetch_ms() const { return stage_prefetch_ms_; }
+    bool layer_streamed(i32 l) const {
+        return l >= 0 && l < static_cast<i32>(layer_streamed_.size()) &&
+               layer_streamed_[static_cast<size_t>(l)] != 0;
+    }
 
     i64 n_ctx() const { return cfg_.n_ctx_train; }
     i64 kv_dim() const { return static_cast<i64>(cfg_.n_head_kv) * cfg_.head_dim; }
@@ -325,8 +490,14 @@ public:
     }
     // True when this layer attends a bounded window instead of the whole past.
     bool is_swa(i32 layer) const {
+        // The phase decides which end of the pattern is windowed. laguna is
+        // period 4 with the FULL layer first (phase 0); gpt-oss is period 2
+        // with the WINDOWED layer first (phase 1). Reading the pattern off the
+        // wrong end runs a full-attention kernel on layers the checkpoint
+        // trained with a 128-token window and vice versa: the shapes fit, so
+        // nothing complains, and every layer sees the wrong context.
         return cfg_.swa_period > 1 && cfg_.swa_window > 0 &&
-               (layer % cfg_.swa_period) != 0;
+               ((layer + cfg_.swa_phase) % cfg_.swa_period) != 0;
     }
     // Rotary table this layer rotates with: the windowed layers of a hybrid
     // model carry their own (plain RoPE over the full head, where the full
@@ -452,8 +623,75 @@ public:
 
 private:
     Backend *be_ = nullptr;
+    // Dense weight streaming: layers whose weights live in the GGUF mapping and
+    // are copied through one reusable device ring before the layer runs. All
+    // streamed layers share one ring, so a run's VRAM cost is the resident
+    // prefix plus one layer, not the whole model.
+    size_t weight_budget_ = 0;   // bytes, 0 = automatic
+    std::vector<u8> layer_streamed_;
+    std::vector<std::vector<StreamEntry>> stream_;
+    void *ring_ = nullptr;
+    size_t ring_bytes_ = 0;
+    void *stage_host_ = nullptr; // pinned staging buffer, ring-sized
+    // Layers that were streamed once and are now resident in a permanent
+    // allocation of their own (base, bytes). Freed by unload, and skipped by
+    // the per-tensor release because every tensor in them is an interior
+    // pointer into that base.
+    std::vector<std::pair<void *, size_t>> promoted_;
+    // Dense streaming pipeline. Two pinned buffers: the one this layer's copy
+    // reads from, and the one the next layer is read into. alternating them is
+    // what lets the read (8.9 GB/s) and the DMA (a side stream) run at once.
+    void *prefetch_host_ = nullptr;
+    void *read_buf_[2] = {nullptr, nullptr};
+    i32 prefetched_layer_ = -1;
+    int prefetched_slot_ = 0;
+    bool prefetch_enabled_ = true;
+    f64 stage_prefetch_ms_ = 0;
+    // Read layer `l`'s tensors into `host` at the ring's own offsets, and copy
+    // them from there into the ring. Split so the read of the next layer can
+    // happen between the two.
+    void read_layer_to(void *host, const std::vector<StreamEntry> &es,
+                       size_t *bytes);
+    void upload_layer_from(const void *host, const std::vector<StreamEntry> &es);
+    i32 next_streamed(i32 after) const;
+    std::vector<size_t> layer_stream_bytes_; // aligned ring bytes per streamed layer
+    size_t promoted_bytes_ = 0;
+    i32 promoted_layers_ = 0;
+    f64 promote_ms_ = 0;
+    // Promotion is on by default; KRK_WEIGHT_PROMOTE=0 restores the fixed
+    // resident prefix for an A/B of the policy itself.
+    bool promote_enabled_ = true;
+    // Promotion into a permanent allocation, in stage_layer's own order: the
+    // read + copy a staging pass would do anyway, kept. False when this layer
+    // is not streamed, when the switch is off, or when it does not fit.
+    bool promote_layer(i32 l);
+    size_t stream_bytes_total_ = 0;
+    size_t streamed_layers_ = 0;
+    u64 stage_calls_ = 0;
+    u64 stage_bytes_ = 0;
+    f64 stage_ms_ = 0;
+    f64 stage_sync_ms_ = 0;
+    f64 stage_read_ms_ = 0;
+    f64 stage_xfer_ms_ = 0;
+    bool stream_cur_ = false;    // inside a streamed layer at load time
+    size_t stream_off_ = 0;      // ring write offset for the current layer
+    i32 stream_layer_index_ = -1;
     Gguf gguf_;
     ModelConfig cfg_;
+    MtpBlock mtp_;
+    bool mtp_load_ = false;
+    std::string model_path_;            // for messages that name the file
+    std::string mtp_path_;              // sidecar nextn file, empty for in-model
+    std::unique_ptr<Gguf> mtp_gguf_;    // keeps the sidecar's mapping alive
+    // The body both paths share: read block `l` out of `g`. `origin` names the
+    // file in a refusal, so a sidecar that does not fit does not read as the
+    // trunk being broken.
+    bool load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
+                             std::string *err);
+    // Upload the nextn block, if the file has one. Called at the end of load()
+    // and only when KRK_MTP_LOAD is set: it is ~855 MB of experts on a 35B-A3B
+    // and nothing in the main stack reads it.
+    bool load_mtp_block(std::string *err);
     std::vector<LayerWeights> layers_;
     QuantTensor tok_embd_, out_head_;
     f32 *out_norm_ = nullptr;

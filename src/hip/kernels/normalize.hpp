@@ -322,6 +322,35 @@ __global__ void silu_mul_kernel(_Float16 *__restrict__ out,
                                &g_krk_sat_silu);
 }
 
+// gpt-oss's FFN activation (`ggml_swiglu_oai`, GGML_GLU_OP_SWIGLU_OAI):
+//
+//   x = min(gate, 7)                     one-sided clamp -- the gate is a
+//                                        spiking term, not a bounded one
+//   y = clamp(up, -7, 7)
+//   out = x / (1 + exp(-1.702 * x)) * (y + 1)
+//
+// It is NOT silu(gate) * up, and the difference is not a refinement: the
+// sigmoid's slope is 1.702 rather than 1, the gate is clamped above 7, the up
+// operand is clamped on both sides, and the up operand enters as (y + 1)
+// instead of y. Every expert of every layer runs it, so reading it as plain
+// silu products a model that still emits tokens and answers nothing.
+// The constants come from llama.cpp's build_ffn/build_moe_ffn, which pass
+// alpha 1.702 and limit 7.0 for LLM_FFN_SWIGLU_OAI_MOE, and from
+// ggml_compute_forward_swiglu_oai_f32, which is the reference formula above.
+__global__ void swiglu_oai_kernel(_Float16 *__restrict__ out,
+                                  const _Float16 *__restrict__ gate,
+                                  const _Float16 *__restrict__ up, i64 n) {
+    const i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const f32 x = fminf(static_cast<f32>(gate[i]), 7.0f);
+    const f32 y = fminf(fmaxf(static_cast<f32>(up[i]), -7.0f), 7.0f);
+    const f32 g = x / (1.0f + __expf(-1.702f * x));
+    // Bounded by construction (|g| <= 7, |y+1| <= 8), so the store cannot
+    // leave f16 and there is no row scale to take -- which is why the caller
+    // passes no scatter scale for this activation.
+    out[i] = static_cast<_Float16>(g * (y + 1.0f));
+}
+
 // One block per row of a silu product: store silu(gate) * up with the row
 // magnitude kept inside f16 by one power-of-two scale per row.
 //

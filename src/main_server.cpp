@@ -29,6 +29,8 @@ struct Args {
     int expert_cache_mb = 0;
     int expert_cache_slots = 0;
     int expert_warm_mb = -1; // WARM expert cache (MiB): <0 auto, 0 off
+    int expert_pin_mb = -1;  // pinned prefix of that tier (MiB): <0 no override
+    f32 router_resident = -1.0f; // router near-tie margin toward resident experts
     int expert_warmup = -1;  // ranked WARM+VRAM warmup at load: <0 auto, 0 off
     int expert_warmup_ms = 20000; // wall-time ceiling for that phase, 0 = none
     int ram_tier_gb = 0;     // plan the host tiers for this RAM class (GiB)
@@ -60,6 +62,11 @@ void usage() {
         "  --expert-cache-slots N  cap resident (layer, expert) slots\n"
         "  --expert-warm-mb N     WARM expert cache in pageable host RAM (MiB;\n"
         "                        <0 auto, 0 off); --expert-l2-mb also accepted\n"
+        "  --expert-pin-mb N      pin the first N MiB of that tier, in rank\n"
+        "                         order: a promotion out of pinned memory is\n"
+        "                         one DMA with no host memcpy in front of it\n"
+        "                         (off by default; it is RAM that cannot be\n"
+        "                         paged out)\n"
         "  --expert-warmup N      ranked expert warmup at load: -1 auto, 1 force,\n"
         "                        0 off. Stages the hot experts into WARM and\n"
         "                        promotes the top of that order into VRAM.\n"
@@ -103,6 +110,10 @@ bool parse(int argc, char **argv, Args *a) {
             a->expert_cache_slots = std::atoi(next("--expert-cache-slots"));
         else if (f == "--expert-warm-mb" || f == "--expert-l2-mb")
             a->expert_warm_mb = std::atoi(next("--expert-warm-mb"));
+        else if (f == "--expert-pin-mb")
+            a->expert_pin_mb = std::atoi(next("--expert-pin-mb"));
+        else if (f == "--router-resident")
+            a->router_resident = static_cast<f32>(std::atof(next("--router-resident")));
         else if (f == "--expert-warmup")
             a->expert_warmup = std::atoi(next("--expert-warmup"));
         else if (f == "--expert-warmup-ms")
@@ -162,6 +173,8 @@ int main(int argc, char **argv) {
     cfg.expert_cache_mb = a.expert_cache_mb;
     cfg.expert_cache_slots = a.expert_cache_slots;
     cfg.expert_warm_mb = a.expert_warm_mb;
+    cfg.expert_pin_mb = a.expert_pin_mb;
+    cfg.router_tie_margin = a.router_resident;
     cfg.expert_warmup = a.expert_warmup;
     cfg.expert_warmup_ms = a.expert_warmup_ms;
     cfg.ram_tier_gb = a.ram_tier_gb;

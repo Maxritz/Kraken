@@ -80,8 +80,8 @@ Head width is the thing that decides which kernel runs.
 | Path | Accepts | Notes |
 |---|---|---|
 | `attention_decode` (split-K) | hd 64, 128, 256 | `attention_decode_splits()` scales splits with `cu_count` |
-| `attention_qtile` | prefill, `window == 0`, smem fits | the prefill default; `KRK_ATTN_QTILE=0` opts out, `KRK_ATTN_QTILE_K` forces the key tile |
-| `attention_kernel` (tiled) | anything | one query per block; the `KRK_ATTN_QTILE=0` fallback |
+| `attention_bexact` | prefill, `causal`, `window == 0`, hd 64..256 % 32 | the prefill default; decode's arithmetic exactly, `KRK_ATTN_BEXACT=0` opts out |
+| `attention_kernel` (tiled) | anything the exact kernel cannot express | one query per block; the only fallback (windowed layer, non-causal, other head widths) |
 | `attn_fused_chain` | hd 64, 128 | hd=256 models cannot use the fused decode chain |
 
 Adding a model with a **new head width** is the most likely way to land on a
@@ -148,7 +148,7 @@ coherence gate.
 1. **Deterministic?** Run the GPU 3× and the CPU 2× and hash the text. If either
    varies, it is a race — stop and look for one.
 2. **Path-dependent?** Force each rung: `KRK_GEMM_PATH=wmma|simt|dp4a`,
-   `KRK_ATTN_SPLIT=0`, `KRK_ATTN_QTILE=0`. If the failure is bit-identical across
+   `KRK_ATTN_SPLIT=0`, `KRK_ATTN_BEXACT=0`. If the failure is bit-identical across
    three independent GEMM implementations, it is not the GEMM.
 3. **Model-blind?** Try 3–5 different prompts. A kernel or indexing bug fails on
    all of them; fp16-vs-f32 rounding fails on some.

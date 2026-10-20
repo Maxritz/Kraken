@@ -232,6 +232,28 @@ constexpr ArchSpec kTable[] = {
     {"laguna", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "laguna",
      "",
      true, false, false, false, true, true},
+    // gpt-oss (openai-moe): the schema was read off the 120B file here -- 36
+    // layers, 64 query heads of 64 dims over 8 KV heads, a 128-token window on
+    // the *even* layers with full attention on the odd ones, YaRN 32x over a
+    // 4096 original context at base 150000 for every layer, 128 experts top-4,
+    // attention sinks, an attention-output bias, and a bias on all three
+    // expert FFN projections. Each of those was a silent-wrong-answer gap
+    // before the loader read it:
+    //   * the windowed layers rotated at the 10000 default because only
+    //     `rope.freq_base_swa` was consulted, and this file states one base.
+    //   * `attn_output.bias` and `ffn_{gate,up,down}_exps.bias` were never
+    //     uploaded, and the MoE's `ffn_gate_inp.bias` was read as laguna's
+    //     post-softmax selection bias -- the wrong side of the softmax.
+    //   * the window pattern was laguna's (full layer first, period 4).
+    // The shape is Moe; qk_norm and rope_neox are true here because the file
+    // carries per-head q/k norms and rotates with the half-split pairing.
+    {"gpt-oss", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target,
+     "gpt-oss",
+     "the loader reads its whole schema (sinks, attention-output bias, "
+     "per-expert FFN biases, the logit-side router bias, the alternating "
+     "window and the one-base YaRN rope); coherence at depth is not yet "
+     "pinned against a CPU oracle",
+     false, false, false, false, false, true, 2, true, 0, true},
     // MoVA: the attention *values* are a routed expert set of their own, on top
     // of an attention output gate.
     //
@@ -319,7 +341,6 @@ constexpr GapTensor kGapTensors[] = {
     // exists sends the next reader looking for code to write.
     {"ssm_conv1d.weight", "a Mamba-style SSM block (ssm_conv1d)", true},
     {"ssm_out.weight", "a Mamba-style SSM block (ssm_out)", true},
-    {"attn_sinks.weight", "attention sinks (attn_sinks)", false},
     // Expert routing this engine does not implement. The names are the only
     // evidence a file needs: group-limited selection and a routing bias change
     // *which* experts run, so a model carrying them would decode differently

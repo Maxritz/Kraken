@@ -103,6 +103,26 @@ struct ArchSpec {
     // has to be declared here. Absent means norm, which is what every file in
     // this collection used before the flag existed.
     bool rope_neox = false;
+    // Sliding-window layer pattern, when the file alternates layer kinds. 0
+    // keeps the loader's historical default (period 4, the *full* layer first,
+    // which is laguna's stack). gpt-oss alternates every layer the other way
+    // round -- windowed on the even indices, full attention on the odd ones --
+    // so it declares period 2 with the window first. Both numbers travel to
+    // ModelConfig because `is_swa()` is the only reader.
+    int swa_period = 0;
+    bool swa_window_first = false;
+    // Expert weight normalization when the FILE says nothing. llama.cpp's
+    // `expert_weights_norm` defaults to false and its openai-moe loader never
+    // sets it, so gpt-oss's router probabilities are used as they come out of
+    // the softmax over all 128 experts: top four summing to ~0.13, not 1. This
+    // engine normalized unconditionally before the tri-state existed, and on a
+    // 128-expert stack whose top-4 hold 13% of the mass that multiplies every
+    // layer's expert contribution by ~7.6 -- the residual grows ~1.2x per
+    // layer instead of staying flat, and the answer is garbage that looks like
+    // a broken kernel. -1 keeps the file's own key (and the legacy default).
+    int expert_w_norm = -1;
+    // The expert FFN activation is gpt-oss's SwiGLU-OAI rather than silu*up.
+    bool swiglu_oai = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

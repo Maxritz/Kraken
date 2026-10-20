@@ -4,7 +4,7 @@
 # kraken-tests writes a per-group report (--report), and tests/kraken-tests-baseline.json
 # is the last run that was green. Comparing the two turns "the suite is red" into
 # "these groups are red, and these were green an hour ago" -- which is the whole
-# difference between a gate a reader trusts and 53 lines they skim.
+# difference between a gate a reader trusts and a list they skim.
 #
 #   scripts/kraken_tests_baseline_check.sh                 # compare, exit 1 on regression
 #   KRK_TEST_BASELINE_RECORD=1 scripts/...                 # re-record (deliberate)

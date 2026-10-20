@@ -78,6 +78,26 @@ struct AttnDesc {
     // need this: the windowed layers carry a 512-key window while the full
     // layers see everything, so the bound is per layer, not per model.
     i64 window = 0;
+    // Attention sink: one scalar per query head, `n_head` values, in the
+    // backend's own address space (host for the CPU backend, device for HIP) --
+    // the same convention qk_norm's weights use. The sink is a DENOMINATOR-only
+    // softmax term with no value row behind it:
+    //     out = acc / (l + exp(sink[h] - m))
+    // so probability mass can settle on a zero vector instead of being spread
+    // over the window (StreamingLLM; deepseek4 and gpt-oss both carry
+    // `blk.N.attn_sinks.weight` [n_head]). nullptr means no sink, which is the
+    // only path that existed before this field and the one that must stay
+    // bit-identical: every implementation adds the term strictly inside
+    // `if (sinks)`, so a model without the tensor runs the same arithmetic in
+    // the same order it always did. On TOP of that, a sink LOGIT of exactly
+    // 0 is treated as NO sink (`sinks && sinks[h] != 0`), so a zeroed sink
+    // row is BIT-identical to the absent path -- the zeroed-sink arm the
+    // test group pins with `==`. llama.cpp adds exp(0-m) unconditionally;
+    // a checkpoint carrying exact-zero sink logits therefore differs from it
+    // here, deliberately: the zeroed arm must reproduce the pre-feature
+    // arithmetic bit for bit, and exact zeros are the only values for which
+    // that and the formula can both hold.
+    const f32 *sinks = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -166,6 +186,14 @@ public:
         SharedHostRamBudget::release_and_free(
             p, [this](void *owned) { release_host_pageable(owned); });
     }
+    // The same deferral for a source that came from alloc_host() (pinned) and
+    // is therefore freed with release_host(). A backend that stages copies must
+    // keep the pointer until the copy lands, exactly as the pageable arm does;
+    // freeing it early is a use-after-free whose symptom is text that varies
+    // from run to run rather than a crash.
+    virtual void release_host_pinned_deferred(void *p) {
+        if (p) release_host(p);
+    }
     void release_host_deferred_budgeted(void *p) {
         if (p) release_host_deferred(p);
     }
@@ -213,6 +241,25 @@ public:
         for (int i = 0; i < n; i++)
             if (dst[i] && src[i] && bytes[i]) upload_paged(dst[i], src[i], bytes[i]);
     }
+    // The same batch for a source that is ALREADY pinned. A backend that can
+    // DMA straight out of it skips its staging ring entirely, which is the
+    // difference between a copy the host thread pays for and one it only
+    // enqueues -- see Model::stage_layer, where the next layer's file read
+    // happens while this batch is still in flight.
+    virtual void upload_pinned_batch(void *const dst[], const void *const src[],
+                                     const size_t bytes[], int n) {
+        upload_paged_batch(dst, src, bytes, n);
+    }
+
+    // Time and bytes the pinned copy stream spent moving these batches, from
+    // events on that stream. A caller's wall clock around
+    // upload_pinned_batch measures the ENQUEUE and nothing else -- that batch is
+    // still in flight when the call returns -- so a promotion rate computed from
+    // it reads several times the link's real rate (measured 64.6 GB/s on a link
+    // that does 27). Folded lazily: the value lands once the copy completes.
+    virtual double pinned_dma_ms() { return 0.0; }
+    virtual unsigned long long pinned_dma_bytes() const { return 0; }
+    virtual unsigned long long pinned_dma_batches() const { return 0; }
 
     // Opt-in promotion ticket. Source bytes must be copied/staged before return;
     // wait_marker(ticket) makes the copy visible before its first consumer.
@@ -301,6 +348,19 @@ public:
         (void)path; (void)map_base; (void)map_size; (void)data_off;
     }
     virtual void download(void *dst, const void *src, size_t bytes, size_t off = 0) = 0;
+
+    // Device-to-device byte copy. A hybrid model's recurrent state is f32, not
+    // activation-typed, so copy_act cannot move it; speculative decoding needs
+    // a snapshot of it before a verification pass and a restore when the pass
+    // keeps only a prefix. The default stages through the host (correct
+    // everywhere); the device backends override it with one DMA on the default
+    // stream, which is what makes a per-round snapshot affordable.
+    virtual void copy_device(void *dst, const void *src, size_t bytes) {
+        if (!bytes) return;
+        std::vector<u8> stage(bytes);
+        download(stage.data(), src, bytes, 0);
+        upload(dst, stage.data(), bytes);
+    }
     virtual void fill0(void *dst, size_t bytes) = 0;
     virtual void sync() = 0;
 
@@ -486,6 +546,13 @@ public:
     virtual void attention(void *out, const void *q, const void *kcache,
                            const void *vcache, const AttnDesc &d) = 0;
 
+    // One sink logit per query head, entered into the softmax denominator
+    // at the row's running max with no value term (V4 report Eq. 27).
+    // Called between the scores/online-max advance and the accumulation,
+    // i.e. after the newest key row has been applied. An implementation
+    // must be a no-op for a null `sinks`.
+    virtual void attention_sink(void *, const void *, i64, i64, i64, i64) {}
+
     // RoPE + KV append + decode attention as ONE launch (the
     // single-query-token decode row only): rotates q in registers,
     // ropes k straight into its cache slot, copies v beside it and
@@ -534,6 +601,14 @@ public:
     // either way.
     virtual void silu_mul(void *out, const void *gate, const void *up, i64 n,
                           i64 row_len = 0, f32 *row_scale = nullptr) = 0;
+
+    // gpt-oss's expert activation: min(gate, 7) * sigmoid(1.702 * that) *
+    // (clamp(up, -7, 7) + 1). Every operand is clamped, so the result is
+    // bounded by 7 * 8 and no row scale is needed or filled. A backend that
+    // does not implement it leaves the buffer untouched -- which is why this
+    // one has no default: a model asking for it must not silently get silu.
+    virtual void swiglu_oai(void *out, const void *gate, const void *up,
+                            i64 n) = 0;
 
     // out += bias  for each of `rows` output rows of width n (Qwen2/Phi QKV biases)
     virtual void add_bias_rows(void *out, const f32 *bias, i64 n, i64 rows) = 0;

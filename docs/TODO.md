@@ -497,7 +497,7 @@ passes.
 |---|---|---|
 | Race / nondeterminism | GPU x3, CPU x2, md5 of text | Byte-identical every run — deterministic, so not a race. **SUPERSEDED, see below.** The build this ran on carried a decode-attention split-K race that makes a >=128-key decode nondeterministic; the probe above ran short of that, so "deterministic" is a claim to re-run, not a fact |
 | GEMM bug | `KRK_GEMM_PATH=wmma` / `simt` / `dp4a` | **All three bit-identical**, same drift step. Three independent GEMM implementations agreeing exactly rules out the GEMM |
-| Prefill attention rewrite | `KRK_ATTN_QTILE` unset / `0` / `1` | Identical |
+| Prefill attention rewrite | `KRK_ATTN_QTILE` unset / `0` / `1` (switch since deleted with the qtile kernel) | Identical |
 | Decode key-range split | `KRK_ATTN_SPLIT=0` | No-op here — `attention_decode_splits` keeps `n_split == 1` until 128 keys, so it is not a bisect for probes this short. At >=128 keys it is the clean one: see the supersession note below |
 | KV cache stride | `--ctx 256` / `512` / `1024` / `2048` | Drift stays at step 12, so not `pos_stride` |
 | Fixed absolute position | prompt lengths 9 / 14 / 15 / 18 / 26 | Drift **moves with prompt length** (plen 15 -> step 12 = pos 27; plen 26 -> step 2 = pos 28), so not a fixed position |
@@ -1326,9 +1326,9 @@ docs/test-results.md §9.
 
 | # | Gap | Evidence | Status |
 |---|---|---|---|
-| G1 | **Prefill is 17.1x slower than llama.cpp** (499 vs 8528 tok/s, same file, same GPU). Attention-bound: 1123 ms attention vs 321 ms GEMM. The fast path (`attention_qtile_kernel`) is numerically wrong. | this session | open |
-| G1a | qtile divergence tracks `pos0`: non-zero `pos0` cases are 104-139% wrong, `pos0=0` cases 4-6%. Both are defects. | `probe_attn_qtile` | open |
-| G1b | `attn_qtile_smem_bytes` double `*2` over-reserves LDS, forcing `qtile_k=32` instead of 64. | `attention.hpp:417` | open |
+| G1 | **Prefill is 17.1x slower than llama.cpp** (499 vs 8528 tok/s, same file, same GPU). Attention-bound: 1123 ms attention vs 321 ms GEMM. The fast path (`attention_qtile_kernel`) is numerically wrong. | this session | **SUPERSEDED** -- that kernel was deleted; prefill now runs `attention_bexact_kernel`, which is bit-identical to decode and 2.1x the tiled kernel at 3400 tokens (see AGENTS.md) |
+| G1a | qtile divergence tracks `pos0`: non-zero `pos0` cases are 104-139% wrong, `pos0=0` cases 4-6%. Both are defects. | `probe_attn_qtile` (deleted with the kernel) | **closed by deletion**; the replacement is checked by `kraken-bench --bitexact` |
+| G1b | `attn_qtile_smem_bytes` double `*2` over-reserves LDS, forcing `qtile_k=32` instead of 64. | `attention.hpp:417` | **closed by deletion** -- the function no longer exists |
 | G2 | **No CPU expert fallback.** Cold experts cost a full NVMe read + DMA + GPU compute on the critical path. | gap audit below | **BUILT 2026-10-06, and it LOSES 3.1x** — see the second update under the ceiling measurement below, and docs/test-results.md §9 |
 | G3 | **No expert prediction.** Only `KRK_TRACE_EXPERTS` instrumentation exists; no cross-layer predictor. | grep | open |
 | G4 | **Tiered KV cache absent entirely.** One flat `alloc(n_layer * kv_cap * kv_dim)` in VRAM. No RAM tier, no NVMe tier, no paging, no radix prefix reuse. | `engine.cpp:275` | open |
@@ -1337,7 +1337,7 @@ docs/test-results.md §9.
 | G7 | **Missing quant types blocked four named files.** IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ1_M and BitNet's Q1_0 (41) / Q2_0 (42) are now decoded on **host and device**, with every codebook machine-diffed against ggml-common.h (see the dequant session entry at the end of this file). **`qwen4exp` still has no registry entry** (the Qwen3.8-Flash item). Ids 102/104/107 are now implemented from the ROCmFPX fork (2026-10-07); 142/143 landed 2026-10-07. | prior session + this session | **`qwen4exp` still open; all quant ids 100..143 done except the arch-gated ones** |
 | G8 | **MoE decode loses to llama.cpp running on CPU only** (13.2 vs 16.3 tok/s). | this session | open |
 | G9 | **DFlash acceptance 0%** in kraken; the reference also reports 0.000% on the official pair. | prior session | open |
-| G10 | **The gate has no equivalence test for fast paths.** `probe_attn_qtile` was a *broken build target* for an unknown number of sessions, which is why G1a survived. | this session | open |
+| G10 | **The gate has no equivalence test for fast paths.** `probe_attn_qtile` was a *broken build target* for an unknown number of sessions, which is why G1a survived. | this session | **partly closed**: `kraken-bench --bitexact` is now the per-kernel equivalence test (24/24 attention cases, plus the GEMM row ladder) |
 | G11 | **Doc drift**: README claims a 32x64x64 WMMA tile (code: BK=128) and "weights are never dequantized" (the WMMA prefill path stages fp16 through LDS). | README vs code | open |
 
 ### Code assessment — what was actually inspected

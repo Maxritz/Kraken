@@ -4,6 +4,7 @@
 #ifndef KRK_ENGINE_HPP
 #define KRK_ENGINE_HPP
 
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -11,6 +12,7 @@
 #include "krk/backend.hpp"
 #include "krk/expert_cpu.hpp"
 #include "krk/kv_tier.hpp"
+#include "krk/draft_head.hpp"
 #include "krk/model.hpp"
 #include "krk/sampler.hpp"
 #include "krk/tokenizer.hpp"
@@ -23,6 +25,11 @@ struct EngineConfig {
     std::string model_path;
     i32 n_ctx = 4096;        // KV capacity (tokens)
     i32 prefill_chunk = 256; // prompt tokens per batched forward
+    // Diagnostics: fold every stage of every prefill row into one hash
+    // (see Engine::prefill_trace_hash). --prefill-hash sets it; it is the
+    // only observable that sees a one-ulp difference in a row that is
+    // not the prompt's last, which is what chunk invariance is about.
+    bool trace_hash = false;
     i32 threads = 0;         // CPU backend only
     u64 seed = 0;
     bool warmup = false;     // run a 1-token pass at init to page in weights
@@ -43,6 +50,14 @@ struct EngineConfig {
     i32 kv_warm_mb = 0;
     std::string kv_cold_dir;
 
+    // Dense weight budget in MiB. 0 (the default) is automatic: weights stay
+    // resident while they fit, and whole layers are streamed from the file once
+    // they do not, leaving VRAM for KV and workspaces. A positive value caps
+    // the resident set explicitly (--weight-vram-mb); a negative value disables
+    // streaming and keeps the old upload-everything behaviour. KRK_WEIGHT_VRAM_MB
+    // is the environment spelling of the same number.
+    i32 weight_vram_mb = 0;
+
     i32 expert_cache_mb = 0;
     // Hard cap on resident (layer, expert) slots, regardless of budget. 0 = auto.
     i32 expert_cache_slots = 0;
@@ -56,6 +71,12 @@ struct EngineConfig {
     // proportional tier. 0 disables it (HOT only, every miss re-reads the
     // file), and a positive value is that many MiB — the explicit restriction.
     i32 expert_warm_mb = -1;
+    // Pinned prefix of WARM, in MiB. <0 keeps KRK_HOST_PIN_MB's behaviour (off
+    // unless that variable is set); 0 pins nothing; N pins the first N MiB of the
+    // tier in admission -- i.e. rank -- order. Those are the experts promoted
+    // most often, and a promotion out of pinned memory is one DMA with no host
+    // memcpy in front of it: measured 22.7 GB/s against 7.6.
+    i32 expert_pin_mb = -1;
     // Fill WARM ahead of the run rather than on demand. Off by default: an eager
     // sweep costs the whole corpus in wall time and RAM before the first token,
     // and read-through already admits every expert the run touches.
@@ -70,6 +91,15 @@ struct EngineConfig {
     // 1 forces it, 0 disables it; KRK_EXPERT_WARMUP=0/1 overrides both, so the
     // A/B is one environment variable away.
     i32 expert_warmup = -1;
+    // Residency preference in the router: a near-tie between two experts is
+    // given to the one already in VRAM (then to the one in WARM) instead of to
+    // the marginally higher logit. The value is the margin, as a fraction of the
+    // top probability -- 0.05 means "any candidate within 5% of the best score is
+    // near-equal". 0 (the default) is off, and <0 reads KRK_ROUTER_TIE_MARGIN.
+    // It is a real trade: the route changes, so the text can change too. What it
+    // buys is fewer promotions, i.e. fewer bytes per token, which on a tier
+    // smaller than the routed set is the whole cost of a step.
+    f32 router_tie_margin = -1.0f;
     // Wall-time ceiling for that phase, in ms. The default is inside the
     // 15-30 s a cold start can afford; a phase that has not filled the tiers by
     // then stops where it is, having spent the time on the hottest experts
@@ -138,6 +168,38 @@ struct EngineConfig {
     // would make the [stats] hybrid policy line untrue. Residency decides this,
     // not a fraction.
     f32 hybrid_frac = 1.0f;
+
+    // ---- nextn (MTP) probe -------------------------------------------------
+    // Runs the file's own nextn block for one step after prefill and reports
+    // the token it would draft against the target's own argmax at that
+    // position. It is a measurement, not a decoder: nothing is emitted from it,
+    // and it is off unless --mtp-probe / KRK_MTP_PROBE=1 asked for it. The same
+    // switch makes Model::load upload the block, because a probe that runs
+    // against an absent block would report a measurement of nothing.
+    bool mtp_probe = false;
+    // Decode with the file's own nextn block as the drafter: proposals come
+    // from the block's chain (the target's hidden row, then the block's own
+    // output), verification from the target's one batched forward, and the
+    // block's KV is rolled back and re-fed from the accepted tokens' captured
+    // target rows. Greedy only, like every speculative path here. --mtp-spec /
+    // KRK_MTP_SPEC=1; also loads the block.
+    bool mtp_spec = false;
+    // A nextn block in its OWN file, for a trunk that ships without one
+    // (`-noMTP` quants whose MTP was published separately). Same block shape,
+    // same names, read from the sidecar and driven by --mtp-probe/--mtp-spec.
+    std::string mtp_path;
+
+    // ---- external draft head (EAGLE-3) ------------------------------------
+    // Path to a converted head (tools/eagle_to_gguf.py). Empty = none. The
+    // head is loaded after the target, checked against its geometry and its
+    // vocabulary, and then drives the same verify loop --draft-tokens already
+    // controls. Needs no device memory of its own.
+    std::string draft_head;
+    // Positions a round primes the head over, most recent last: 0 = the whole
+    // prompt. A head's fusion projection is O(hidden x target_hidden) per
+    // position, so the window is what keeps a long prompt's prime from being
+    // seconds of host arithmetic.
+    i32 draft_head_prime = 256;
 };
 
 // Hybrid CPU+GPU expert-compute telemetry. The split is only interesting if you
@@ -265,6 +327,19 @@ public:
     const Engine *draft_engine() const { return draft_; }
     i32 draft_window() const { return draft_tokens_; }
 
+    // ---- external draft head (EAGLE-3) -----------------------------------
+    // A head is not a model and not a nextn block inside the target: it is a
+    // small GGUF beside the model that reads the TARGET's hidden state and the
+    // last token's embedding, and proposes `--draft-tokens` continuations for
+    // the same verify loop. Convert one with tools/eagle_to_gguf.py. The head
+    // runs on the HOST (one block, milliseconds), so it competes with the
+    // target's tiers for no VRAM at all. Refused on a recurrent target, whose
+    // delta-rule state cannot be rewound after a rejected suffix.
+    bool load_draft_head(const std::string &path, std::string *err);
+    void unload_draft_head();
+    bool has_draft_head() const { return head_ != nullptr; }
+    const DraftHead *draft_head() const { return head_; }
+
     // ---- DFlash drafter ---------------------------------------------------
     // `--draft` takes either a full model of the target's family (the path
     // above) or a Poolside DFlash head set, which is not a model at all: it has
@@ -288,6 +363,30 @@ public:
     i32 draft_block_rows(const QuantTensor &tok_embd, const QuantTensor &lm_head,
                          i32 n_vocab, i32 id_last, i32 n_draft, i32 pos,
                          DflashRows &out);
+
+    // ---- MTP (nextn) block probe -----------------------------------------
+    // One replay of the file's own nextn block over the prompt just prefilled,
+    // and the comparison that says whether it drafts the target's token:
+    // `draft_id` is the block's argmax for position pos + 1, `target_id` is the
+    // target's own argmax for the same position (read from the prefill's last
+    // logits row BEFORE the block's head overwrites it). Equal ids mean a
+    // speculative round would have accepted that token.
+    struct MtpProbe {
+        bool ok = false;
+        i32 pos = 0;        // position the block attended at
+        i32 draft_id = -1;  // the block's prediction of position pos + 1
+        i32 target_id = -1; // the target's prediction of position pos + 1
+        f32 draft_logit = 0.0f;
+        f32 target_logit = 0.0f;
+        f64 ms = 0.0;
+        std::string note; // why it did not run, when ok is false
+    };
+    MtpProbe mtp_probe_step();
+    bool mtp_probe_enabled() const { return mtp_probe_; }
+    bool mtp_spec_active() const { return mtp_spec_; }
+    // Admits the nextn block's routed set to VRAM once and pins it. Called from
+    // init, after the expert budget has been clamped to what is really free.
+    bool mtp_pin_experts();
 
     // ---- KV cache introspection -------------------------------------------
     // Positions [0, kv_pos()) hold keys/values; kv_pos() is also the position
@@ -362,6 +461,12 @@ public:
     const Tokenizer &tokenizer() const { return tok_; }
     // Debug: logits from the most recent forward (n_vocab floats).
     const f32 *last_logits() const { return logits_host_; }
+    // Hash of every dumped activation stage of the LAST prefill, folded
+    // per (stage, layer) in sorted-key order. Bit-exact: two prefills of
+    // the same prompt at different --chunk values must return the same
+    // number, and the first kernel that stops agreeing shows up here even
+    // when the difference is absorbed before the logits row.
+    u64 prefill_trace_hash() const;
     const DeviceCaps &device() const { return be_ ? be_->caps() : no_caps_; }
 
     // ---- routing scan (public surface; see the members for why) ----------
@@ -373,6 +478,13 @@ public:
     }
     // Writes <path> with each expert's routing mass, sorted hottest-first.
     void write_expert_index(const std::string &path) const;
+    // Routing residency preference, for the end-of-run report: was it on, at
+    // what margin, and how many picks it moved.
+    bool router_pref() const { return router_pref_; }
+    f32 router_tie_margin() const { return router_tie_margin_; }
+    u64 router_picks() const { return router_picks_; }
+    u64 router_subs() const { return router_subs_; }
+    u64 router_hot() const { return router_hot_; }
 
 private:
     std::string kv_resource_error() const;
@@ -399,6 +511,11 @@ private:
     // or f16 device) to the dump file, one text line per call. A CPU run and a
     // HIP run of the same prompt then differ at exactly one line per stage.
     void dump_row(const char *what, i32 layer, const void *buf, i64 width, i64 rows);
+    // Folds every row of `buf` into the prefill trace hash. The row-local
+    // stages a chunk composition must leave unchanged; unlike the text dump it
+    // covers ALL rows and never a stage that only one chain emits.
+    void trace_rows(const char *what, i32 layer, const void *buf, i64 width,
+                    i64 rows);
     // Zero-fill rollback for the (rare) shrink-a-lot path; the common small
     // rollback in speculative decoding is pure pointer arithmetic.
     bool kv_rollback_zero(i64 pos);
@@ -474,6 +591,40 @@ private:
     // no drafter is loaded, which is every run that does not ask for one.
     void dflash_capture(i32 layer, i32 n);
 
+    // ---- nextn (MTP) probe ------------------------------------------------
+    // Copies this pass's pre-final-norm hidden rows and their token ids into
+    // the probe's capture buffer, so the block can be replayed over the whole
+    // prompt rather than over its last row alone.
+    void mtp_capture(const i32 *toks, i32 pos0, i32 n);
+    // One block forward at `pos`: the captured hidden row (hnorm) and the
+    // position's token embedding (enorm) are fused by eh_proj, then the block's
+    // own attention runs against its own KV plane (written at `pos`), and its
+    // routed + shared experts run through the model's ExpertCache. With
+    // want_logits the shared head writes ws_logits_ for position pos + 1.
+    bool mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits);
+    // The block's routed + shared expert FFN. Same residency path as a stack
+    // layer, keyed on the block's own index, so its experts page in and out of
+    // the same budget as everything else.
+    void mtp_ffn(const MtpBlock &m, i32 n);
+    void mtp_dense_ffn(const MtpBlock &m, i32 n, void *acc, i32 *exp);
+    // One token's embedding row into mtp_e_, with the latent-embedding
+    // un-rotation the stack applies at the same point.
+    void mtp_embed(i32 tok);
+    // Feeds every captured position in [mtp_fed_, pos) through the block, with
+    // no head. This is what makes the block's KV describe the same history the
+    // target's does; without it the drafter reads rows it invented.
+    bool mtp_prime(i64 pos);
+    // Greedy speculative decode driven by the nextn block.
+    // The round the external draft head proposes; same verify/accept/realign
+    // shape as the nextn block's, with the proposal side on the host. Added to
+    // the engine's declarations below by load_draft_head's section.
+    bool generate_speculative_head(const GenerateParams &p, GenerateResult *res,
+                                   const std::vector<i32> &ids, f64 *prefill_ms,
+                                   f64 *decode_ms, i64 *decode_steps);
+    bool generate_speculative_mtp(const GenerateParams &p, GenerateResult *res,
+                                  const std::vector<i32> &ids, f64 *prefill_ms,
+                                  f64 *decode_ms, i64 *decode_steps);
+
     Backend *be_ = nullptr;
     Model model_;
     Tokenizer tok_;
@@ -501,7 +652,84 @@ private:
     i64 conv_dim_ = 0, value_dim_ = 0;
     i64 kv_cap_ = 0;
     i64 kv_pos_ = 0;
-    i32 chunk_ = 1;
+    i64 chunk_ = 1;
+
+    // ---- nextn (MTP) probe state (allocated only when asked for) ----------
+    // The block attends over the prompt, so the capture is per position -- one
+    // row is not enough to judge it. Its KV is its own plane pair: sharing the
+    // stack's would mix two different key/value spaces in one cache, which is
+    // the "two instances, one namespace" defect this repo has been burned by.
+    bool mtp_probe_ = false; // the capture, block KV and workspaces exist
+    bool mtp_spec_ = false;  // decode with the block as the drafter
+    // Where a speculative round's wall time goes. Proposals, the verification
+    // pass, the hybrid state snapshot and the block re-feed are the four terms;
+    // a round that loses is a round whose verify is not amortized by the rows
+    // it covers, and these say which of them it actually is.
+    f64 mtp_propose_ms_ = 0.0;
+    f64 mtp_verify_ms_ = 0.0;
+    f64 mtp_snap_ms_ = 0.0;
+    f64 mtp_refeed_ms_ = 0.0;
+    // Where the propose pass's time goes: the block's own expert acquires, in
+    // wall time, and how many of them were a device miss. The propose pass is a
+    // single block forward, so if it is slow the answer is either the acquire
+    // path (promotion) or the kernels, and those want opposite fixes.
+    f64 mtp_acq_ms_ = 0.0;
+    u64 mtp_acq_n_ = 0;
+    u64 mtp_acq_miss_ = 0;
+    // --mtp-probe asked for the per-step comparison. Separate from mtp_probe_,
+    // which only says the buffers exist: a speculation run allocates the same
+    // buffers and must not print probe lines.
+    bool mtp_probe_report_ = false;
+    // A hybrid model's delta-rule state has no inverse, so a rejected
+    // speculative suffix cannot be rewound through kv_rollback. These hold the
+    // pre-verification state (f32, the same size the engine allocated) and the
+    // round restores them before replaying the accepted prefix.
+    void *mtp_rec_snap_ = nullptr;
+    void *mtp_conv_snap_ = nullptr;
+    size_t mtp_rec_snap_bytes_ = 0;
+    size_t mtp_conv_snap_bytes_ = 0;
+    i64 mtp_kv_dim_ = 0;
+    void *mtp_kv_k_ = nullptr;
+    void *mtp_kv_v_ = nullptr;
+    void *mtp_hidden_ = nullptr; // [kv_cap, n_embd] pre-final-norm rows
+    void *mtp_h_ = nullptr;      // one hidden row, the block's hnorm input
+    void *mtp_e_ = nullptr;      // one embedding row, the block's enorm input
+    void *mtp_cat_ = nullptr;    // [2, n_embd] the eh_proj input
+    void *mtp_gate_ = nullptr;   // the packed output gate's half
+    void *mtp_sgate_ = nullptr;  // one f32: the shared expert's sigmoid gate
+    void *mtp_rep_ = nullptr;    // one i32: the block's residual exponent
+    std::vector<i32> mtp_tok_;   // token id per captured position
+    i64 mtp_captured_ = 0;       // positions captured by the last pass
+    // Positions already fed through the block's own KV. The block's attention
+    // is causal over its own plane, so a second probe only has to append the
+    // rows since the last one -- replaying the prompt every step would make the
+    // per-step acceptance measurement quadratic for no new information.
+    i64 mtp_fed_ = 0;
+
+    // ---- external draft head state (allocated only when one is loaded) -----
+    // The capture (one row per position, like the MTP probe's) and the two
+    // host rows it is read into. `head_prime` walks the head over the captured
+    // rows in [head_fed_, pos); `head_embed` puts one token's embedding on the
+    // host, which is the other half of the head's input.
+    void head_capture(const i32 *toks, i32 pos0, i32 n);
+    bool head_embed(i32 tok);
+    bool head_prime(i64 pos, std::string *why);
+    DraftHead *head_ = nullptr;
+    void *head_hidden_ = nullptr; // [kv_cap, n_embd] pre-final-norm rows
+    void *head_e_ = nullptr;      // one embedding row, downloaded to the host
+    std::vector<i32> head_tok_;   // token id per captured position
+    std::vector<f32> head_row_;   // one host row: the captured hidden state
+    std::vector<f32> head_emb_;   // one host row: a token embedding
+    std::vector<f32> head_logits_;
+    i64 head_captured_ = 0; // positions captured by the last forward
+    i64 head_fed_ = 0;      // positions fed through the head's own KV
+    // How many recent positions a round primes the head over. The head's fc is
+    // O(hidden x target_hidden) per position, so a whole 4k prompt is hundreds
+    // of GFLOP of host arithmetic; the window is the knob that keeps a round
+    // cheap, and `0` means the whole prompt (the exact form).
+    i32 head_prime_max_ = 256;
+    f64 head_prime_ms_ = 0.0;
+    f64 head_propose_ms_ = 0.0;
 
     // HOT/WARM/COLD KV residency. Two planes (K and V), one layer-sized slot
     // each. When untiered both hand back a pointer into one flat allocation
@@ -599,7 +827,28 @@ private:
     // KRK_DUMP destination (see Engine::init): empty means the per-stage dump
     // hook in forward_core is inert.
     std::string dump_path_;
+    // KRK_DUMP_ROUTE=1: print each token's top-k routing decision.
+    bool dump_route_ = false;
+    // Residency preference in the router (see EngineConfig::router_tie_margin).
+    // `router_pref_` is false unless a margin was asked for, and the selection
+    // path is then the same arithmetic it has always been -- the switch is one
+    // process apart, which is the only way its cost is measurable.
+    bool router_pref_ = false;
+    f32 router_tie_margin_ = 0.0f;
+    u64 router_picks_ = 0; // (token, slot) picks since the last reset
+    u64 router_subs_ = 0;  // picks where a resident expert beat the top scorer
+    // Picks that landed on an expert already in VRAM, counted in BOTH arms: it is
+    // the number the preference exists to raise, and a counter that only runs
+    // when the switch is on cannot show a control.
+    u64 router_hot_ = 0;
+    bool trace_hash_on_ = false;
+    std::map<std::string, u64> trace_stage_; // key -> running hash
     std::vector<f32> moe_prob_;
+    // Scratch for the routing logits when the file's bias belongs BEFORE the
+    // softmax (gpt-oss): the router row is downloaded as it came out of the
+    // GEMM and this holds the biased copy the top-k and the softmax both read,
+    // so the two never disagree about which experts were picked.
+    std::vector<f32> moe_logit_;
     // The routing plan for the current chunk: which tokens each expert got.
     std::vector<i32> moe_sel_;    // [chunk, k] expert id per (token, slot)
     std::vector<f32> moe_wt_;     // [chunk, k] renormalized gate weight

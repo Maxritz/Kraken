@@ -23,6 +23,11 @@ struct Args {
     std::string prompt;
     std::string system;
     std::string draft;
+    // An EAGLE-3 head (tools/eagle_to_gguf.py): a small GGUF beside the model
+    // that reads the target's own hidden state and proposes for the same verify
+    // loop. Not a model, so it has no engine of its own.
+    std::string draft_head;
+    int draft_head_prime = 256; // positions a round primes the head over
     int max_tokens = 256;
     int ctx = 4096;
     int chunk = 256;
@@ -34,6 +39,9 @@ struct Args {
     int host_ram_mb = 0;        // host memory to plan for (MiB), 0 = policy
     int expert_cache_slots = 0; // MoE resident (layer, expert) slot cap, 0 = auto
     int expert_warm_mb = -1;     // MoE WARM tier in pageable host RAM (MiB): <0 auto, 0 off
+    int expert_pin_mb = -1;      // pinned prefix of that tier (MiB): <0 no override
+    f32 router_resident = -1.0f; // router near-tie margin toward resident experts
+    int weight_vram_mb = 0;      // dense weight VRAM budget, MiB: 0 auto, <0 off
     int kv_hot_mb = 0;           // KV HOT (VRAM) budget, MiB: 0 auto
     int kv_warm_mb = -1;         // KV WARM (host RAM) budget, MiB: <0 auto, 0 off
     std::string kv_cold_dir;     // KV COLD spill directory: empty disables
@@ -45,6 +53,13 @@ struct Args {
     // computed on the host out of the mapping while the device runs the
     // resident ones (see EngineConfig::hybrid_experts).
     bool hybrid_experts = false;
+    // Run the file's own nextn (MTP) block for one step after prefill and print
+    // the token it drafts against the target's argmax. Also makes the loader
+    // upload the block; nothing is emitted from the comparison.
+    bool mtp_probe = false;
+    std::string mtp_path;   // --mtp FILE: a nextn block in a file of its own
+    // Decode with the file's own nextn block as the drafter (greedy only).
+    bool mtp_spec = false;
     int hybrid_threads = 0;     // host worker threads, 0 = min(hardware, 8)
     int hybrid_max_rows = 8;    // rows the host arm runs at, 0 = unbounded
     double hybrid_frac = 1.0;   // share of RESIDENT experts forced to the host
@@ -52,6 +67,9 @@ struct Args {
     bool cpu = false;
     bool greedy = false;
     bool tokenize = false;
+    // Print one hash of the prompt's last-position logits and exit (see
+    // --prefill-hash): the chunk-invariance gate's one observable.
+    bool prefill_hash = false;
     bool chat = false;
     bool info = false;
     bool bench = false;
@@ -94,6 +112,11 @@ void usage() {
         "  --seed N              RNG seed\n"
         "  --greedy              force argmax decoding\n"
         "  --tokenize            print the prompt's token ids and exit\n"
+        "  --prefill-hash         prefill the prompt, print a hash of the\n"
+        "                        last-position logits and exit. Two runs\n"
+        "                        that differ only in --chunk print the same\n"
+        "                        hash iff the multi-row forward is bit-exact\n"
+        "                        (the chunk-invariance gate).\n"
         "  --chat                wrap the prompt in a ChatML template\n"
         "  --system STR          system message for --chat\n"
         "  --cpu                 use the scalar reference backend\n"
@@ -103,6 +126,10 @@ void usage() {
         "                        quarter of installed RAM. Bounds every host\n"
         "                        tier inside the process; the model mapping and\n"
         "                        the dense trunk sit outside it.\n"
+        "  --weight-vram-mb N     dense weights kept in VRAM, in MiB. 0 (default)\n"
+        "                        keeps them resident while they fit and streams\n"
+        "                        whole layers from the file once they do not,\n"
+        "                        which frees VRAM for KV. Negative disables it.\n"
         "  --kv-hot-mb N          KV HOT tier in VRAM, in MiB. 0 (default) takes\n"
         "                        whatever VRAM the weights and workspaces leave\n"
         "                        free. The KV is split into layer-granular slots;\n"
@@ -136,6 +163,17 @@ void usage() {
         "                        14 GiB. Anything the run does not plan for -- a\n"
         "                        long KV context, another application -- is what\n"
         "                        the headroom is for.\n"
+        "  --expert-pin-mb N      Pin the first N MiB of that tier, in rank order.\n"
+        "                         A promotion out of pinned memory is one DMA with\n"
+        "                         no host memcpy in front of it: measured 22.7 GB/s\n"
+        "                         against 7.6 on a 120B MoE, +18-25%% decode. It is\n"
+        "                         RAM that cannot be paged out, so it is off unless\n"
+        "                         asked for; size it to the per-run promotion bytes.\n"
+        "  --router-resident P    Residency preference in the router: a pick within\n"
+        "                        P of the top score (a fraction of it, so 0.05 is\n"
+        "                        5%%) goes to the expert already in VRAM, then to\n"
+        "                        the one in WARM. Fewer promotions per token at the\n"
+        "                        cost of a near-tie; 0 or absent is off.\n"
         "  --expert-cache-slots N  cap resident (layer, expert) slots (0 = auto)\n"
         "  --expert-warm-mb N     WARM expert cache in pageable host RAM. Cold\n"
         "                        reads land here before VRAM, VRAM evictions stay\n"
@@ -161,6 +199,26 @@ void usage() {
         "                        default) is the installed RAM. Clamped to what is\n"
         "                        actually installed, so a 32 GiB tier is the same\n"
         "                        run on a 32 GiB box and a smaller one here.\n"
+        "  --mtp-spec            decode with the file's own nextn (MTP) block as\n"
+        "                        the drafter: its proposals are verified by one\n"
+        "                        batched target forward and the longest matching\n"
+        "                        prefix is kept, so a round emits several tokens\n"
+        "                        per target pass. Greedy only; --draft-tokens\n"
+        "                        sets the proposal window (default 4). Output is\n"
+        "                        bit-identical to plain greedy decoding.\n"
+        "                        KRK_MTP_SPEC=1 is the environment spelling.\n"
+        "  --mtp FILE            nextn (MTP) block in a SEPARATE GGUF, for a\n"
+        "                        trunk that ships without one (-noMTP quants\n"
+        "                        whose MTP was published beside them). Same\n"
+        "                        block, same names: --mtp-probe/--mtp-spec\n"
+        "                        drive it exactly as an in-file block\n"
+        "  --mtp-probe           run the file's own nextn (MTP) block for one\n"
+        "                        step after prefill and print the token it\n"
+        "                        drafts against the target's argmax: a match is\n"
+        "                        the token a speculative round would accept.\n"
+        "                        Measurement only -- generation continues as it\n"
+        "                        would have without it. KRK_MTP_PROBE=1 is the\n"
+        "                        environment spelling.\n"
         "  --hybrid-experts 1    compute the experts the device tier cannot hold\n"
         "                        on the host, out of the weight mapping, while the\n"
         "                        device runs the resident ones. The experts it\n"
@@ -184,6 +242,14 @@ void usage() {
         "                        the split at a fixed cache size.\n"
         "  --draft MODEL         draft model for greedy speculative decoding\n"
         "  --draft-tokens N      speculation window (default 4)\n"
+        "  --draft-head FILE     EAGLE-3 draft head (a GGUF from\n"
+        "                        tools/eagle_to_gguf.py); needs no extra VRAM and\n"
+        "                        no draft model. Greedy is a prefix match; under\n"
+        "                        sampling the round uses the min(1,p/q) rule, so\n"
+        "                        the text stays the target's distribution\n"
+        "  --draft-head-prime N  positions a round primes the head over, most\n"
+        "                        recent last (default 256); 0 = the whole prompt,\n"
+        "                        which is exact and costs O(prompt) host FLOP\n"
         "  --info                print model and device info, then exit\n"
         "  --bench               prefill/decode benchmark on a fixed prompt\n"
         "  --profile             per-op device timeline for the last decode\n"
@@ -228,6 +294,9 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--draft" || f == "-d") a->draft = next("--draft");
         else if (f == "--draft-tokens")
             a->draft_tokens = std::atoi(next("--draft-tokens"));
+        else if (f == "--draft-head") a->draft_head = next("--draft-head");
+        else if (f == "--draft-head-prime")
+            a->draft_head_prime = std::atoi(next("--draft-head-prime"));
         else if (f == "--max-tokens" || f == "-n") a->max_tokens = std::atoi(next("--max-tokens"));
         else if (f == "--ctx" || f == "-c") a->ctx = std::atoi(next("--ctx"));
         else if (f == "--chunk") a->chunk = std::atoi(next("--chunk"));
@@ -241,6 +310,8 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--threads") a->threads = std::atoi(next("--threads"));
         else if (f == "--host-ram-mb")
             a->host_ram_mb = std::atoi(next("--host-ram-mb"));
+        else if (f == "--weight-vram-mb")
+            a->weight_vram_mb = std::atoi(next("--weight-vram-mb"));
         else if (f == "--kv-hot-mb")
             a->kv_hot_mb = std::atoi(next("--kv-hot-mb"));
         else if (f == "--kv-warm-mb")
@@ -257,6 +328,10 @@ bool parse(int argc, char **argv, Args *a) {
             a->expert_cache_slots = std::atoi(next("--expert-cache-slots"));
         else if (f == "--expert-warm-mb" || f == "--expert-l2-mb")
             a->expert_warm_mb = std::atoi(next("--expert-warm-mb"));
+        else if (f == "--expert-pin-mb")
+            a->expert_pin_mb = std::atoi(next("--expert-pin-mb"));
+        else if (f == "--router-resident")
+            a->router_resident = static_cast<f32>(std::atof(next("--router-resident")));
         else if (f == "--expert-warm-prefetch")
             a->expert_warm_prefetch = std::atoi(next("--expert-warm-prefetch")) != 0;
         else if (f == "--expert-warmup")
@@ -265,6 +340,15 @@ bool parse(int argc, char **argv, Args *a) {
             a->expert_warmup_ms = std::atoi(next("--expert-warmup-ms"));
         else if (f == "--ram-tier" || f == "--ram-tier-gb")
             a->ram_tier_gb = std::atoi(next("--ram-tier"));
+        else if (f == "--mtp") {
+            a->mtp_path = next("--mtp");
+            // Asking for the block implies loading it: a sidecar that was named
+            // and then never read would be a flag that does nothing.
+            a->mtp_probe = true;
+        } else if (f == "--mtp-probe")
+            a->mtp_probe = true;
+        else if (f == "--mtp-spec")
+            a->mtp_spec = true;
         else if (f == "--hybrid-experts")
             a->hybrid_experts = std::atoi(next("--hybrid-experts")) != 0;
         else if (f == "--hybrid-threads")
@@ -275,6 +359,7 @@ bool parse(int argc, char **argv, Args *a) {
             a->hybrid_frac = std::atof(next("--hybrid-frac"));
         else if (f == "--greedy") a->greedy = true;
         else if (f == "--tokenize") a->tokenize = true;
+        else if (f == "--prefill-hash") a->prefill_hash = true;
         else if (f == "--chat") a->chat = true;
         else if (f == "--cpu") a->cpu = true;
         else if (f == "--info") a->info = true;
@@ -402,7 +487,8 @@ static int range_exit_code(unsigned long long silu, unsigned long long sum,
 static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                             f64 load_ms, size_t dev_free, size_t dev_total,
                             unsigned long long sat_silu, unsigned long long sat_sum,
-                            unsigned long long sat_resid, int rexp_max) {
+                            unsigned long long sat_resid, int rexp_max,
+                            Backend *be) {
     const Model &m = engine.model();
     const ModelConfig &mc = m.cfg();
     const f64 ptps = r.prefill_ms > 0 ? r.prompt_tokens / (r.prefill_ms / 1000.0) : 0.0;
@@ -589,6 +675,27 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                  share * static_cast<f64>(ec.host_hits()),
                  static_cast<unsigned long long>(ec.loads()),
                  share * static_cast<f64>(ec.loads()));
+    if (engine.router_pref())
+        std::fprintf(out,
+                     "[stats ] router    %llu picks, %llu (%.1f%%) went to an "
+                     "already-resident expert over a near-equal one (margin %.1f%% "
+                     "of the top score)\n",
+                     static_cast<unsigned long long>(engine.router_picks()),
+                     static_cast<unsigned long long>(engine.router_subs()),
+                     engine.router_picks() > 0
+                         ? 100.0 * static_cast<f64>(engine.router_subs()) /
+                               static_cast<f64>(engine.router_picks())
+                         : 0.0,
+                     static_cast<f64>(engine.router_tie_margin()) * 100.0);
+    if (ec.acquires() > 0)
+        std::fprintf(out,
+                     "[stats ] router    hot share %llu/%llu picks (%.1f%%) landed "
+                     "on an expert already in VRAM%s\n",
+                     static_cast<unsigned long long>(engine.router_hot()),
+                     static_cast<unsigned long long>(ec.acquires()),
+                     100.0 * static_cast<f64>(engine.router_hot()) /
+                         static_cast<f64>(ec.acquires()),
+                     engine.router_pref() ? "" : " (preference off)");
     const f64 prom_ms = ec.promote_ms();
     const f64 prom_mib = static_cast<f64>(ec.bytes_promoted()) / 1048576.0;
     std::fprintf(out,
@@ -634,6 +741,23 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                          "[stats ]                     other: %.0f ms of promote "
                          "time outside both phases (load-time warmup/prefetch)\n",
                          other);
+    }
+    // The pinned half of the tier, measured on its OWN stream: the promote
+    // timers above wrap `upload_pinned_batch`, which only ENQUEUES the copy, so
+    // the rate they imply for a pinned promotion is an enqueue rate. Measured
+    // wrong once: 7098 MiB "in 107 ms" = 64.6 GB/s on a link that does 27. This
+    // line is the event-timed truth, printed only when that path carried bytes.
+    if (be && be->pinned_dma_batches() > 0) {
+        const f64 pms = be->pinned_dma_ms();
+        const f64 pmib = static_cast<f64>(be->pinned_dma_bytes()) / 1048576.0;
+        std::fprintf(out,
+                     "[stats ] pinned    %llu batch(es), %.0f MiB on the copy stream "
+                     "in %.1f ms = %.1f GB/s\n"
+                     "[stats ]           the promote timers above wrap the ENQUEUE of a "
+                     "pinned copy, not its flight: read this line for the rate, and the "
+                     "step time for its cost\n",
+                     be->pinned_dma_batches(), pmib, pms,
+                     pms > 0 ? pmib / 1024.0 / (pms / 1000.0) : 0.0);
     }
     // The draft engine owns its OWN expert tier, and its budget is derived from
     // the free VRAM left after the target has already taken its share. On a
@@ -714,7 +838,8 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     }
     std::fprintf(out,
                  "[stats ] warm      %.0f MiB capacity, %.1f%% in use | %llu admissions, "
-                 "%llu evictions, %llu rejects | %llu device evictions, %llu decay events\n",
+                 "%llu evictions, %llu rejects | %llu device evictions, %llu decay events"
+                 " | %llu MiB pinned\n",
                  static_cast<f64>(ec.warm_capacity_bytes()) / 1048576.0,
                  ec.warm_capacity_bytes() > 0
                      ? 100.0 * static_cast<f64>(ec.warm_used_bytes()) /
@@ -724,7 +849,8 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                  static_cast<unsigned long long>(ec.warm_evictions()),
                  static_cast<unsigned long long>(ec.warm_rejects()),
                  static_cast<unsigned long long>(ec.evictions()),
-                 static_cast<unsigned long long>(ec.decay_events()));
+                 static_cast<unsigned long long>(ec.decay_events()),
+                 static_cast<unsigned long long>(ec.warm_pinned_bytes() / 1048576u));
     krk::HostTime::get().report(out);
 }
 
@@ -793,7 +919,7 @@ int run_bench(Engine &engine, Backend *be, const Args &a, f64 load_ms,
     if (be) be->activation_saturation(sat);
     const int rexp_max_bench = be ? be->residual_exponent_max() : 0;
     print_run_stats(stdout, engine, r, load_ms, 0, 0, sat[0], sat[1], sat[2],
-                    rexp_max_bench);
+                    rexp_max_bench, be);
     range_verdict(stdout, sat[0], sat[1], sat[2], rexp_max_bench, "bench");
     if (engine.has_draft() && engine.spec_steps() > 0 &&
         engine.draft_accepted() == 0) {
@@ -802,7 +928,8 @@ int run_bench(Engine &engine, Backend *be, const Args &a, f64 load_ms,
                      "round(s): the drafter is pure cost at this rate\n",
                      static_cast<unsigned long long>(engine.spec_steps()));
     }
-    if (engine.has_draft() && engine.spec_steps() > 0) {
+    if ((engine.has_draft() || engine.mtp_spec_active()) &&
+        engine.spec_steps() > 0) {
         const f64 rate =
             engine.draft_proposed() > 0
                 ? 100.0 * static_cast<f64>(engine.draft_accepted()) /
@@ -932,6 +1059,7 @@ int main(int argc, char **argv) {
     cfg.model_path = a.model;
     cfg.n_ctx = a.ctx;
     cfg.prefill_chunk = a.chunk;
+    cfg.trace_hash = a.prefill_hash;
     cfg.threads = a.threads;
     cfg.seed = a.seed;
     cfg.expert_cache_mb = a.expert_cache_mb;
@@ -940,6 +1068,11 @@ int main(int argc, char **argv) {
     cfg.host_ram_mb = a.host_ram_mb;
     cfg.expert_cache_slots = a.expert_cache_slots;
     cfg.expert_warm_mb = a.expert_warm_mb;
+    cfg.expert_pin_mb = a.expert_pin_mb;
+    cfg.router_tie_margin = a.router_resident;
+    cfg.draft_head = a.draft_head;
+    cfg.draft_head_prime = a.draft_head_prime;
+    cfg.weight_vram_mb = a.weight_vram_mb;
     cfg.kv_hot_mb = a.kv_hot_mb;
     cfg.kv_warm_mb = a.kv_warm_mb;
     cfg.kv_cold_dir = a.kv_cold_dir;
@@ -951,6 +1084,15 @@ int main(int argc, char **argv) {
     cfg.hybrid_threads = a.hybrid_threads;
     cfg.hybrid_max_rows = a.hybrid_max_rows;
     cfg.hybrid_frac = static_cast<f32>(a.hybrid_frac);
+    {
+        const char *env = std::getenv("KRK_MTP_PROBE");
+        cfg.mtp_path = a.mtp_path;
+    cfg.mtp_probe = a.mtp_probe ||
+                        (env && env[0] != '\0' && env[0] != '0');
+        const char *senv = std::getenv("KRK_MTP_SPEC");
+        cfg.mtp_spec = a.mtp_spec ||
+                       (senv && senv[0] != '\0' && senv[0] != '0');
+    }
 
     ph.mark("backend create");
     Engine engine;
@@ -987,10 +1129,24 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    if (!a.draft.empty()) {
+    // The window is the same knob for both drafters: --draft-tokens N is how
+    // many tokens a round may propose, whoever proposes them.
+    if (!a.draft.empty() || cfg.mtp_spec) {
         engine.set_draft_window(a.draft_tokens);
+    }
+    if (!a.draft.empty()) {
         if (!engine.load_draft(a.draft, &err)) {
             std::fprintf(stderr, "kraken: draft model: %s\n", err.c_str());
+            engine.shutdown();
+            delete be;
+            return 1;
+        }
+    }
+    if (!a.draft_head.empty()) {
+        engine.set_draft_window(a.draft_tokens);
+        if (!engine.load_draft_head(a.draft_head, &err)) {
+            // The loader's message already names the head.
+            std::fprintf(stderr, "kraken: %s\n", err.c_str());
             engine.shutdown();
             delete be;
             return 1;
@@ -1099,6 +1255,62 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    // --prefill-hash: one prefill of the prompt, then two hashes, and exit.
+    // Two runs that differ only in --chunk print the same numbers iff the
+    // multi-row forward is bit-identical to the single-row one -- the property
+    // chunk invariance is made of, and what `kraken-tests
+    // test_prefill_chunk_bitexact` gates on.
+    //
+    // The first is `prefill-hash`: the embedding, every layer's attention
+    // output and every layer's hidden state, over ALL prompt rows and folded
+    // per (stage, layer). That is the one that sees a one-ulp change in a row
+    // that is not the prompt's last -- the shape the old tiled kernel's
+    // reduction order produced. The second is `logits`: the last position's
+    // whole logits row, which is what the text depends on. Both cover the
+    // WHOLE row, never the sampled token: hashing the text would let a drift
+    // survive whenever the argmax happened not to move.
+    if (a.prefill_hash) {
+        GenerateParams p;
+        p.prompt = a.prompt_given
+                       ? (a.chat ? chatml(a.system, a.prompt) : a.prompt)
+                       : std::string();
+        p.max_tokens = 1; // the loop stops after the prefill's first token
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        p.sample_host = true;
+        GenerateResult r;
+        if (!engine.generate(p, &r)) {
+            std::fprintf(stderr, "kraken: prefill failed: %s\n",
+                         r.error.empty() ? "generation returned false"
+                                         : r.error.c_str());
+            std::exit(1);
+        }
+        // The MODEL's vocab, not the tokenizer's: they can differ in a
+        // fixture, and the logits row is exactly n_vocab floats long -- reading
+        // one past it hashes whatever buffer the allocator put next, which is
+        // how this gate first reported differences that were its own bug.
+        const i64 n = engine.model().cfg().n_vocab;
+        const f32 *row = engine.last_logits();
+        if (!row || n <= 0) {
+            std::fprintf(stderr, "kraken: no host logits row to hash\n");
+            std::exit(1);
+        }
+        u64 h = 1469598103934665603ull;
+        const unsigned char *b = reinterpret_cast<const unsigned char *>(row);
+        for (i64 i = 0; i < n * 4; i++) {
+            h ^= b[i];
+            h *= 1099511628211ull;
+        }
+        std::printf(
+            "prefill-hash %016llx logits %016llx prompt_tokens=%d first=%d\n",
+            static_cast<unsigned long long>(engine.prefill_trace_hash()),
+            static_cast<unsigned long long>(h), r.prompt_tokens,
+            r.tokens.empty() ? -1 : r.tokens[0]);
+        engine.shutdown();
+        delete be;
+        return 0;
+    }
+
     SinkCtx sink;
     sink.chat = a.chat;
 
@@ -1127,7 +1339,7 @@ int main(int argc, char **argv) {
         const int rexp_max_run = be->residual_exponent_max();
         print_run_stats(stderr, engine, r, load_ms,
                         be->device_free_bytes(), be->device_total_bytes(),
-                        sat[0], sat[1], sat[2], rexp_max_run);
+                        sat[0], sat[1], sat[2], rexp_max_run, be);
         range_verdict(stderr, sat[0], sat[1], sat[2], rexp_max_run,
                       "generate");
         // The status the caller gets, not just a line in the log: exit 2 is
@@ -1147,7 +1359,8 @@ int main(int argc, char **argv) {
                          "round(s): the drafter is pure cost at this rate\n",
                          static_cast<unsigned long long>(engine.spec_steps()));
         }
-        if (engine.has_draft() && engine.spec_steps() > 0) {
+        if ((engine.has_draft() || engine.mtp_spec_active()) &&
+            engine.spec_steps() > 0) {
             const f64 rate =
                 engine.draft_proposed() > 0
                     ? 100.0 * static_cast<f64>(engine.draft_accepted()) /

@@ -18,7 +18,7 @@ code, the README, or `docs/`.
   contradicting the README. `build_check.sh` requires it current for the same
   reason.
 - The gate suite is six things, not one: `sh scripts/build_check.sh`, ninja
-  rc=0 with 0 `error:` lines, `kraken-tests` 2751/2751, `sh
+  rc=0 with 0 `error:` lines, `kraken-tests` 3008/3008, `sh
   scripts/kraken_tests_baseline_check.sh` (names the groups that newly broke
   against the recorded baseline), `kraken-bench --gate` rc=0, and a coherence
   spot check on the three small models, run as:
@@ -29,6 +29,44 @@ code, the README, or `docs/`.
   scalar reference -- and a device arm that silently fell back to the CPU
   backend fails as `FAIL (cpu)`, so a green run is proof the GPU produced
   the text.
+- **The chunk-invariance gate is a test group, and it drives the CLI because the
+  suite cannot open the device.** `./build-hip/kraken-tests --run-group
+  test_prefill_chunk_bitexact` builds a head_dim-64 / 8-head / 4-layer fixture,
+  prefills one 64-token prompt at `--chunk 1`, `2` and `8` through
+  `kraken.exe --prefill-hash`, and requires one hash across them. It runs in
+  the default suite (group 35 of 56, 14 checks) and the baseline carries it.
+  `--prefill-hash` prints two hashes and no text:
+  `prefill-hash <trace> logits <row> prompt_tokens=N first=I`. The trace folds
+  the embedding, every layer's attention output and every layer's hidden state
+  over **all** prompt rows, per (stage, layer); `logits` is the last position's
+  whole row. Re-run the two arms by hand to see it:
+  `kraken.exe -m M -p "..." --chunk 1 --greedy --prefill-hash` against the same
+  line at `--chunk 8`.
+  **The logits hash alone is blind, and that was measured, not assumed.** On the
+  fixture at 64 tokens with `KRK_ATTN_BEXACT=0` (the tiled kernel) the trace
+  differs while the `logits` row is bit-identical, because a one-ulp difference
+  in a non-final row is absorbed by the f16 residual before the head. The gate
+  checks `logits` too, but the trace is the one that fails. Re-measured on real
+  text (`Qwen3-4B-Q8_0`, 27-token prompt, `--prefill-hash`): the default kernel
+  gives `39dcbbdfe43c6e72` / `9a3418eb058b319b` at `--chunk 1`, `2` and `8`,
+  the tiled arm gives `a822a6f82b159f0c` / `ebcf60c3e66a836a`, and **the first
+  token is 576 in all four runs** -- so a gate that compared generated text, or
+  only the sampled token, would have called the regression identical. At other
+  lengths the tiled arm moves both hashes; the trace is not a weaker signal, it
+  is the one that never goes blind.
+  **It carries its own negative control:** the chunk-8 arm runs a second time
+  with `KRK_ATTN_BEXACT=0` and that trace hash must DIFFER from the chunk-1
+  default (measured `bf32bbb3...` for all three default arms against
+  `33048d8c...` for the tiled one). A gate whose bad arm also passes proves
+  nothing.
+  Two of the three defects found building it were in the gate: hashing
+  `tokenizer().n_vocab()` floats past a `model().cfg().n_vocab` row read
+  uninitialized heap (which varied with the chunk size and read as a kernel
+  regression until the fixture's 261-token vocab was matched to its embedding
+  tensor), and a text-level comparison cannot see this drift at all. The third
+  was a rule: a group that writes files must remove them when green, because
+  INPROC mode has no per-group working directory -- the isolation check's
+  `leaves-nothing` arm failed on the group's capture files until it did.
 - **`kraken-tests --report <path>` writes the machine-readable summary, and
   `tests/kraken-tests-baseline.json` is the last green run.** One group per line,
   so a re-recorded baseline diffs readably: name, status (`pass`, `failed`,
@@ -60,13 +98,15 @@ code, the README, or `docs/`.
   and an arm added or removed is a shape change like a new group.
   `tests/kraken-tests-selfcheck-baseline.json` is that record, and the baseline
   gate only runs the six-minute sweep when `KRK_BASELINE_SELFCHECK=1` is set.
-- That 2751 is a watermark, not a constant: the suite grew 2214 -> 2316 when the
+- That 3008 is a watermark, not a constant: the suite grew 2214 -> 2316 when the
   missing dequantizers landed, 2316 -> 2329 when Q2_0's geometry changed,
   2329 -> 2751 when the KV-tier per-layer geometry and the sparse-KV fixture
-  tests landed, and 2751 -> 2760 when the mixed-dtype `gemm_group` case below
-  landed. Read the count off the run (`2760/2760 checks passed`) rather than
-  trusting the number written here, which is only the last one seen.
-- **`kraken-tests` runs each of its 53 groups in its own child process, several
+  tests landed, 2751 -> 2760 when the mixed-dtype `gemm_group` case below
+  landed, 2760 -> 2994 when the attention micro-test and the KV-tier geometry
+  cases landed, and 2994 -> 3008 when the chunk-invariance gate did. Read the
+  count off the run (`3008/3008 checks passed`) rather than trusting the number
+  written here, which is only the last one seen.
+- **`kraken-tests` runs each of its 56 groups in its own child process, several
   at a time.** A fastfail, an access violation or an abort inside one group used
   to end the run before the `%d/%d checks passed` line, which is how a single
   `std::fclose(NULL)` in a KV-tier test hid eight real failures for a whole
@@ -75,7 +115,7 @@ code, the README, or `docs/`.
   prints the summary; the exit status is 1 if any group crashed, failed, or ran
   no checks. `KRK_TEST_INPROC=1` is the old single-process run -- a debugger's
   view, and the A/B: both runners print the same per-group table, and
-  `scripts/kraken_tests_isolation_check.sh` diffs all 53 lines rather than just
+  `scripts/kraken_tests_isolation_check.sh` diffs every group line rather than just
   the total. That script drives `KRK_TEST_INJECT_CRASH`, `KRK_TEST_INJECT_CRASH_AT`,
   `KRK_TEST_INJECT_FAIL` and `KRK_TEST_INJECT_EMPTY` to prove the reporting
   itself, so run it after touching the harness; `KRK_TEST_INJECT_CRASH` takes a
@@ -86,7 +126,7 @@ code, the README, or `docs/`.
   private directory, and `KRK_ISOLATION_INJECTIONS=1` adds the per-group
   selfcheck.
 - **`kraken-tests --selfcheck` is the reporting proof, and it needs no other
-  tool.** It runs six arms for all 53 groups -- crash before the first check,
+  tool.** It runs six arms for every group -- crash before the first check,
   crash after check 2, crash after the group's OWN last check, every check
   failing, no checks at all, and a fuzz arm that dies at a random check and in
   one run in four at a SECOND group as well, so a run with two groups
@@ -121,6 +161,98 @@ code, the README, or `docs/`.
   only the groups swept, so it is evidence, not a baseline). Running it with an
   injection already set is refused (rc=2): the arms choose their own, and a
   caller's would make the clean run something other than clean.
+- **Chunk invariance was an ATTENTION property, and the box was rows==1 vs
+  rows>=2 -- that is now fixed, and the next box is the GEMM tile rung (rows
+  >= 9).** Before the rewrite, on Tiel (12-token prompt,
+  greedy, 32 tokens) `--chunk 1` gave `613eb9b3...` and `--chunk 2`, `3`, `4`
+  and `8` all gave `e1a040e0...`, so the boundary was the single decode row,
+  not a wide prefill; the same run now gives `613eb9b3` at `--chunk 1`, `2`
+  and `8`, and still differs at `256` because a 12-row prefill leaves the
+  GEMM-exact window below.
+  `tools/dump_passes.py`
+  (new; `dump_diff.py` cannot answer this -- it pairs line i with line i, and a
+  `--chunk 1` dump emits one pass per token while `--chunk 2` emits one per two,
+  so it reports every line as different from line 0) splits both dumps at each
+  `embed L-1` pass and compares shared positions: the first divergence is
+  **`attn.out L03` at position 1, rel 3.8e-5**, after three recurrent layers
+  that are bit-identical. Layer 3 is the first full-attention layer, so the
+  divergence is the attention call and nothing before it. The drift is there
+  from the FIRST multi-row forward -- the "~29 greedy steps" this repo kept
+  quoting is how long it takes a 1-ulp difference to flip an argmax, not where
+  the two paths part.
+  **The micro-test pins it, and `attention_bexact_kernel` closes it.** The
+  micro-test (`attn_rows_case` in `tools/bench_ops.cpp`, `kraken-bench
+  --bitexact`) runs one K/V cache through N calls of one row (decode) and one
+  call of N rows (prefill): before the rewrite hd256 / 16 heads / 2 KV (Tiel's
+  geometry) at rows=2 differed in **7 of 8192 values at 1 ulp**, hd128/16 in 3
+  of 4096, hd64/8 agreed at rows 2 and 4 and differed from 8.
+  **The mechanism is the key-space reduction order, so the fix is one
+  formulation.** `attention_decode_kernel` gives each of its 8 warps every 8th
+  key, runs an online max that advances per key (`m = fmaxf(m, s)` inside the
+  loop), and merges the eight `(m, l, acc)` triples at the end.
+  `attention_qtile_kernel` takes the max over the whole key TILE and sums keys
+  sequentially into one accumulator, rescaling per tile -- same terms, different
+  addition order and a different `mnew` at each `exp`. `attention_bexact_kernel`
+  (new, `src/hip/kernels/attention.hpp`) keeps what the tile is FOR -- K/V
+  staged in LDS once and shared by QT query rows -- and reproduces decode's
+  arithmetic exactly: warp w owns keys `j % 8 == w` in increasing order, one
+  (row, key) score is decode's lane dot (`VPT/2` packed `v_dot2` pairs then one
+  32-lane reduce), the softmax advances per key, and the eight triples merge in
+  warp order. QT is 4 at hd 256 and 8 at hd 128/64 (`KRK_ATTN_BEXACT_QT=8`
+  doubles it at hd 256); the dispatch is `n_tok > 1 && causal && window == 0 &&
+  hd in {64,128,256}`, and **`KRK_ATTN_BEXACT=0` restores the tiled kernel** as
+  the A/B arm. `kraken-bench --bitexact` attention is now **24 of 24 cases
+  identical** -- rows 2/4/8/16 x hd 64/128/256 x n_keys 64 and 200 -- with
+  n_keys=200 the case the key-range split would have broken.
+  **It is FASTER, not a cost.** Interleaved order-balanced pairs, identical text
+  in every pair: Qwen3.5-9B at a 170-token prompt **1166.2 against 1056.1 tok/s
+  (+10.4%, 5 pairs)**, at 3400 tokens **866.0 against 406.0 (+113%)**; Phi-3.5
+  (hd 96 -- the odd lane slice -- 2760 tokens) **585.0 against 324.8 (+80%)**,
+  and against the query-tiled kernel that used to run there 585.0 against 393.5
+  (+49%); Tiel 35B-A3B at 600 tokens 94.1 against 81.6 (3 pairs, expert-bound
+  and noisy). It wins for the reason the tile kernel existed, minus the tile's
+  weak parts: K/V is staged once per QT rows instead of once per row, and the
+  per-key `exp` the tile recomputed inside its V loop is gone.
+  **A trap worth keeping: the first version of this A/B reported "no
+  difference" and was measuring two identical arms.** The harness took arms as
+  `label=ENV=VALUE` and split each on the FIRST `=`, so every arm set a variable
+  named after its label; `KRK_ATTN_BEXACT` was never touched and both arms ran
+  the default. A harness bug that makes every arm the same produces exactly the
+  verdict "the change is free", so a null result from a new harness is worth one
+  `env`/`GetEnvironmentVariable` check before it is believed.
+  **Decode's key-range split had to go with it.** A split restarts the online
+  max inside every key range and merges the ranges afterwards, so its fp32
+  accumulation cannot be expressed by a per-row prefill kernel at all (and its
+  ranges start at `j_lo + warp`, which differs per row once a window is
+  involved). With the exact prefill on -- the default -- a decode row therefore
+  runs unsplit, and `KRK_ATTN_SPLIT=1` is the arm that keeps the split and gives
+  up identity from ~128 keys up. That costs decode throughput, and the number is
+  not small at long context: the split is worth **+1.09% at a 240-token
+  context and +13.85% at 3400** (82.6 against 72.5 tok/s, 5 pairs). Identity is
+  still the better default because the prefill win is larger until roughly 750
+  tokens of output at that context (3400-token prompt + 32 tokens: 4.36 s
+  coupled against 5.61 s with the split). The arm
+  shows it: `KRK_ATTN_SPLIT=1 kraken-bench --bitexact` leaves every 64-key
+  case identical and makes every 200-key case differ, while the default
+  reports 24 of 24 identical.
+  **What is left is the GEMM tile rung, from 9 rows up.** On Qwen3.5-9B
+  (240-token prompt, greedy, 24 tokens) `--chunk 1`, `2`, `8`, `16` and `256` all
+  give `ad25ecdf6854`, but that is text-level luck over 24 tokens: the dump
+  comparison from `--chunk 1` against `--chunk 9` (`tools/dump_passes.py`) stops
+  at **`gdn.conv L00`** (rel 1.3e-4), the first stage after that layer's
+  `[q|k|v]` projection -- a rows=9 GEMM, which the micro-test says is not exact.
+  Rows 2..8 are exact end to end: `--chunk 2` and `8` reproduce `--chunk 1` on
+  Tiel and on the 9B, and `--mtp-spec --draft-tokens 2` on Tiel now emits the
+  plain decode text (`6792671902ca`, 17/36 draft tokens accepted) where it used
+  to diverge. The boundary is `gemm`/`gemm_group`: bit-identical at rows 2/4/8
+  and different from **rows 9** (q4_k 22/4096 at rows=9 and 83/4096 at 12;
+  q6_k ~1770/4096; f16 16/4096; the gate/up silu group 1/512), which is exactly
+  where the decode ladder (`gemv_m_kernel`, rows 2..8) hands over to the tile.
+  `KRK_GEMM_SPLIT=0` keeps those differences, so the tile's K walk -- not the
+  split -- is what differs. Running rows>8 through the ladder is not an option:
+  `gemv_m` re-reads the whole matrix per 8-row group, i.e. 32 passes over the
+  weights for a 256-row prefill. A windowed (SWA) layer also stays on the tiled
+  attention kernel by construction, for the `j_lo` reason above.
 - **Concurrency is only safe because every group is self-contained, and the
   runner now enforces both halves of that.** Each child gets its own working
   directory (`<TEMP or TMPDIR>/krk-tests-<pid>/krk-tests-group-N.dir`) -- every fixture path in
@@ -341,6 +473,73 @@ code, the README, or `docs/`.
   at a `> ` prompt, and an unbounded `llama-cli.exe` invocation once spun into its
   REPL and wrote a ~100 MB log.
 
+- **Sampled speculation is a DIFFERENT verification rule, and the head path now
+  runs it.** Greedy verification is a prefix match; under `temp > 0` that rule is
+  wrong in both directions -- accept-every-match emits the draft's distribution,
+  reject-every-miss emits the target's but never keeps a token. The round now
+  verifies with Leviathan et al. (arXiv:2302.01318): the proposal is a DRAW from
+  the head's row (softmax at the run's temperature, `spec_softmax` +
+  `spec_map_dist` through `d2t`), accepted with `min(1, p/q)`, replaced on
+  rejection by a draw from `max(0, p - q)`. `src/spec_sampling.cpp` holds the
+  rule as pure host maths; `SpecStep spec_accept_step()` takes the two uniforms
+  so a round replays from a seed, and `spec_verify_identity()` enumerates the
+  identity `sum(min(p,q)) + sum(p-q)+ = p` per token. **`p` is
+  `Sampler::build_dist`, the row `sample()` itself draws from** -- the sampler
+  was refactored onto it for exactly this reason, and the suite's sampled-text
+  pins still reproduce. Repetition penalty needs the round's already-accepted
+  tokens in the history, which is the `extra` argument (a token accepted for a
+  position being verified is not in `Sampler`'s ring yet).
+  **The group can fail, and that is measured:** `test_spec_sampling` is 38
+  checks, and an always-accept `spec_accept_step` fails four of them -- the
+  accept-ratio pair, the residual-replacement check, the one-hot limit and the
+  200k-draw histogram of the rule's own outputs against `p`. The enumerated
+  identity alone does NOT catch it (it recomputes the algebra instead of calling
+  the rule), which is why the histogram exists.
+  **End-to-end, with a random head every proposal is rejected, so the measured
+  arm is the worst case:** qwen2 1.5B, ctx 512, `--temp 0.9 --seed 7`, 24 tokens,
+  `--draft-tokens 3` gives `24 round(s), 0 of 72 proposals kept (0.0%), 1.00
+  token(s)/round` and fluent text -- 24 consecutive residual draws, re-forwards
+  and realigns. Greedy is unchanged: md5 `f7957feb5610` with and without the
+  head. `KRK_SPEC_RS` keeps its meaning from the draft-model/dflash verifiers
+  with the default flipped for this path (they are opt-in, a head under sampling
+  would otherwise have no drafter at all), so `KRK_SPEC_RS=0` is the arm that
+  returns the plain loop.
+  **Two defects that arm exposed, both worth remembering.** (1) On a GREEDY
+  partial accept the round rolled the KV back and continued with `logits_host_`
+  still holding the pre-round row -- the next round then proposed from a position
+  the sequence had left. It now downloads the verifier's row at the rejecting
+  position (`head_compute(a)`), which is exactly the distribution the plain loop
+  would have there. It never showed before because no fixture head ever had a
+  partial accept: the synthetic heads accept 0%. (2) A rejection's replacement
+  must be RE-FORWARDED: the KV row at that position still holds the rejected
+  proposal, so the sample is emitted and then fed back (the same move the full-
+  accept bonus already made), and only then is the round rolled back.
+
+- **A nextn block can arrive in a second file, and three things about it are
+  not guessable from shapes.** `--mtp FILE` (`Model::set_mtp_path`, read in
+  `load_mtp_block`) loads `blk.<n>.*` out of a sidecar: the `-noMTP` quant plus
+  `mtp-<model>.gguf`, which is how Nemotron-3.5-Lightning ships. Measured on
+  `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-noMTP.gguf`: block 52, 32 heads x
+  128, 128 experts x top-6 of 1856 + shared expert, probe **MATCH** on the first
+  step (21.0 ms), `--mtp-spec --draft-tokens 2` at `6 of 28 (21.4%), 1.14
+  token(s)/round`.
+  (1) **The block index** is the smallest `blk.<n>.` at or past the trunk's
+  `n_layer`, read from the tensors -- a sidecar's `block_count` counts only its
+  own blocks, so `block_count - 1` is right for this file by luck and wrong in
+  general. (2) **`<arch>.attention.head_count_kv` can be an ARRAY**, one entry
+  per layer (nemotron_h_moe ships 53); reading the scalar key gives the first
+  layer's count and a KV plane that is the wrong width. The block reads its own
+  entry, and the counts then have to equal the trunk's -- the loader refuses a
+  sidecar with a different head count, because that is a head from another model,
+  not this trunk's. (3) **An UNGATED expert bank has no `ffn_gate_exps` at all**,
+  and reading `n_expert`/`n_ff_exp` from the gate made this block load as "no
+  experts and no dense FFN" (the probe refused a block that was right there).
+  The width comes from whichever of the three tensors exists: up/gate carry it
+  in `ne[1]`, down in `ne[0]`. The same applies to the shared expert.
+  The suite covers all of it in `test_mtp_sidecar` (17 checks: happy path, wrong
+  family, no block past the stack, a disagreeing head count, and a trunk with no
+  path at all).
+
 ## Measuring performance (the expensive lessons)
 
 - **Never trust a probe whose arms ran in sequence.** Page cache and
@@ -411,8 +610,10 @@ code, the README, or `docs/`.
   splits the list into words first. Every harness here that takes switches from
   the environment needs the same check.
 - A/B switches must exist *before* the measurement, not after: `KRK_WEIGHT_PULL=0`
-  and `KRK_ATTN_QTILE=0` both restore the previous path so the comparison is one
-  process apart.
+  and `KRK_ATTN_BEXACT=0` both restore the previous path so the comparison is one
+  process apart. A switch that names a deleted kernel is worse than none --
+  `KRK_ATTN_QTILE` was one until the query-tiled kernel went, and setting it
+  silently left the model on the default.
 - Instrument the wall time of the thing you are changing. Thread-summed
   per-stage timers hid a pipeline that was not actually overlapping — the sums
   looked healthy while throughput was 2.6× below the probe.
@@ -476,6 +677,364 @@ code, the README, or `docs/`.
   when VRAM is tight, and the per-layer barrier is the hybrid-CPU arm's cost (3.1x)
   rather than the device path's. Table in `docs/RESEARCH-REFERENCES.md`.
 
+- **Dense weights stream now, and the ring has two traps.** `Model::load` keeps
+  the layers that fit and stages the rest through one device ring
+  (`--weight-vram-mb`, 0 = auto `free - reserve - 1 GiB`, negative/`KRK_WEIGHT_STREAM=0`
+  = off) before each layer runs. Two things are correctness, not tuning:
+  (1) the staged copy is published TO the default stream, not FROM it, so the
+  ring must be drained (`be_->sync()`) before the next layer is read into it --
+  without that, layer l reads layer l+1's bytes and the output is fluent
+  garbage (measured: `!!!...`, f16 range counters fired); (2) routed `_exps`
+  banks must be excluded from a layer's byte total, or a 25 GiB MoE looks like
+  dense layers that do not fit and streams 20 layers that do. Verified
+  (3) a streamed layer is **promoted into a permanent allocation on first use**
+  (`Model::promote_layer`) once measured free VRAM can hold it beside the floor.
+  The load-time budget is decided before the KV cache and the workspaces exist,
+  so it under-uses the card by ~2 GiB here: on Qwen3.8-27B the auto arm left
+  3.08 GiB free while re-reading 17 layers every token, and promotion kept 9 of
+  them (measured **1.2 -> 2.3 tok/s**, 5/5 interleaved pairs, stdout identical;
+  `KRK_WEIGHT_PROMOTE=0` restores the fixed prefix). Promotion re-points the
+  layer's `QuantTensor`s through a binding pass (`StreamEntry::q`, bound by
+  `qt_fields()`), so `unload()` must skip pointers inside a promoted base as
+  well as inside the ring -- releasing each interior pointer is a double free.
+  (4) staging is a two-buffer pipeline: two pinned host buffers alternate, the
+  copy is `Backend::upload_pinned_batch` (a DMA straight out of the pinned
+  buffer on a private stream, published to the default stream by one event, so
+  the host only enqueues), and the NEXT layer's read runs while those bytes are
+  in flight. Measured on the same 27B: **2.2 -> 3.0 tok/s, +36.4%** (5/5
+  interleaved order-balanced pairs, 0.000% MAD, stdout identical), staging
+  4.42 -> 5.61 GB/s, and the split changes shape from `read 3347 + copy 2710`
+  to `read ~376 + copy ~12` ms of enqueue -- the read of the next layer is the
+  remaining bound. `KRK_WEIGHT_PREFETCH=0` / `KRK_WEIGHT_DMA=0` are the A/B
+  arms. Two traps found here: `stream_` is EMPTY when nothing streams, and
+  indexing it in the binding pass segfaulted every qwen35moe 35B file on load
+  (fixed with a bounds guard); and a "changed md5" between arms was the BANNER
+  -- the device line gained a BAR suffix, so compare stderr-free stdout or
+  strip the first line before concluding a numeric difference.
+  Verified bit-identical on Qwen3-8B (forced 3 GiB budget: resident vs streamed
+  vs promoted all `6b10bb51...`) and on the 27B across the promotion arms.
+  Streaming makes >VRAM models *bounded*, not fast: a token must move the
+  non-resident bytes, so 1.2 -> 3.0 tok/s is what the extra residency and the
+  overlap buy. The CPU backend never streams.
+  Measured loading-mode table (memory / auto / 2 GiB ring with
+  `KRK_WEIGHT_PROMOTE=0`) with commands: `docs/BENCH-LOADING.md`. Headline:
+  Qwen3-8B Q4_K_M 92.3 -> 2.5 tok/s decode when 25 of 36 layers stream; a 27B
+  Q4 that fits at 14.4 GiB is 14.9 resident, 8.6 on the auto 12 GiB budget and
+  0.5 on the ring; a 30B-A3B is unchanged in all three arms because the ring
+  never carries the routed expert banks (0.71 GiB of trunk).
+
+- **An expert budget that fills the card is not slow, it is pathological, and it
+  is the MoE slowness.** `configure_expert_cache` decides the device budget
+  before the KV cache and some of the engine's own workspaces exist, so on a
+  card whose routed set is larger than VRAM it can name every byte free at that
+  moment. The pool then grows to the last byte, `hipMalloc` has to make the
+  driver evict, and every promotion pays for it. Measured on
+  `Tiel-Coder-35B-A3B-UD-Q5_K_XL` / `Tiel-Coder-35B-A3B-MTP-APEX` (256 experts,
+  top-8, 40 layers, 22.1 GiB routed, ctx 4096, 16 tokens, greedy; WARM holds the
+  whole routed set in RAM in every arm, so **no arm reads the file**):
+
+  | pool budget | free VRAM at end | alloc per cell | promotions | decode |
+  |---|---|---|---|---|
+  | 11.95 GiB (auto) | 0.00 GiB | **30 ms** | 1360 | 3.1 tok/s |
+  | 10.0 GiB | 0.00 GiB | 1.2 ms | 1530 | 6.2 tok/s |
+  | 8.56 GiB (2 GiB floor) | 1.77 GiB | 0.27 ms | 1712 | 17.8 tok/s |
+  | 7.68 GiB (3.26 GiB floor) | 2.95 GiB | 0.25 ms | 1850 | 16.6-18.7 tok/s |
+
+  The split says it in one line: `alloc 40426 ms | read 0 | xfer 424` against
+  `alloc 460 ms | read 0 | xfer 372`. The fix is two-part and both parts are
+  measured: the warm-up stops at `vram_floor_bytes()` instead of the 1 GiB
+  reserve, and `Engine::init` **clamps the pool after the warm-up** to
+  `resident_bytes() + max(0, free - floor)` -- the only point where both numbers
+  are facts.
+
+- **The expert index is used, and its path is derived from the model's.** A run
+  with `<model>.krakenexperts.json` beside the weights prints
+  `expert warmup: using <path> (512 positions, full-forward, 2944 ranked pairs)`
+  and fills the tiers hottest-first; the reader validates `kind`, `version`,
+  `n_layer`, `n_expert` and `arch` and REFUSES a mismatch with a warning, so a
+  ranking from another model cannot reorder this one silently. Two ways it looks
+  unused: the warm-up did not engage (the index is read there, not at load), and
+  the `.gguf` was renamed or moved so `<model_path>.krakenexperts.json` no longer
+  resolves -- the index is path-derived, so a copy of the weights needs a copy of
+  the JSON. Measured on Nemotron-3.5-Lightning-30B-A3B NVFP4 (128 experts x top-6,
+  52 layers, 2 GiB warm tier): `ranked order, 2 rounds ... 382 slots (2093 MiB
+  read), VRAM +382 experts (2045 MiB)` in 2709 ms, and 33.3% of router picks
+  landed on a resident expert with the residency preference off.
+- **Batched-MoE look-ahead exists and is a measured LOSS, so it stays off.**
+  `ExpertCache::stage_batch` promotes the WARM experts a batched pass's rows will
+  need before the first row runs it -- the union is known a row early because the
+  router runs on the host -- and `KRK_MOE_LOOKAHEAD=1` turns it on. Measured on
+  the same Nemotron (600-token prompt, `-n 1`, ctx 1024, `--expert-warmup 1
+  --expert-warm-mb 2048`, 3 interleaved pairs): prefill
+  **124.9 / 218.7, 270.9 / 249.3, 275.5 / 242.2 tok/s** for
+  `KRK_MOE_LOOKAHEAD=0` against `=1`. The first pair reads as a 75% win and is
+  cold state (that run paid 4805 ms where the warm ones paid ~2200); the two warm
+  pairs are 8-12% SLOWER. **The decode arm was measured too, because a single
+  row also knows its union before the expert loop** (`n == 1` is the gate now):
+  24.7 / 24.6, 25.5 / 25.9, 25.1 / 25.3 tok/s, promotion count identical
+  (1592), i.e. no difference -- promotions are already overlapped by
+  `upload_pinned_batch`, so batching them earlier buys nothing. Staging moves
+  the same bytes earlier and pays an extra budget check per candidate. Do not
+  re-derive it as a win; the arm worth measuring is a verify pass with a drafter
+  that actually accepts.
+  **And the step it cannot fix is worth more than the staging was:** on this
+  model the warm arm spends 878 ms of its 1214 ms decode in promotion (8521 MiB
+  at 9.5 GB/s, 1592 promotions over 31 steps), because a 6.4 GiB pool holds 18%
+  of a 15.4 GiB routed set and 22% of the 312 expert visits per step miss. The
+  lever is traffic, not scheduling: a bigger pool, more residency preference, or
+  fewer visits -- not a cleverer prefetch.
+
+  **Which experts the fill keeps matters more than how many.** The same model,
+  same pool (7.68 GiB), same floor, differs by 44% on the fill alone: an
+  unranked even-order warm-up gives 16.6-18.7 tok/s, and a **ranked** one --
+  `--expert-scan` writes `<model>.krakenexperts.json`, the next run uses it --
+  gives **23.9 tok/s** (41.8 ms/step) with 671 promotions instead of 1850,
+  same text, 3.02 GiB free. So the ladder on Tiel-Coder-35B-A3B is
+  **3.1 -> 16.6 (floor) -> 23.9 (ranked)**, and the ranking is one command.
+  A *larger* pool is slower here, which is the opposite of the intuition and is
+  reproducible: 3.26 GiB floor 23.9, 2 GiB floor 20.6, 1 GiB floor 17.6 -- a
+  bigger resident set spreads into colder experts (more promotions, and
+  `make_vram_room` scans more slots per eviction) and eats the headroom the
+  allocator needs. Do not widen the pool to win this; rank it. The floor is `max(reserve + 1 GiB, total/5)` = **3.26 GiB** on this
+  card (`KRK_VRAM_FLOOR_MB` overrides), and a card with 0 free is also what
+  stalls the Windows compositor while the desktop is paged out. Two traps: the
+  clamp must be skipped on the CPU backend (no device/host split; it clamped the
+  suite's CPU MoE fixture to a zero-byte cache, 2992/2994), and the growth cap
+  only allows what is really free, so a full cache evicts-and-reuses instead of
+  allocating -- which is the path the pool is built for.
+
+
+- **A promoted expert was paying a memcpy, not a DMA, and pinning the hot prefix
+  fixes it.** `warm_fill` allocates WARM pageable, so every promotion was a
+  12.6 MB host memcpy into the bounded pinned ring (~1.1 ms) PLUS the 0.67 ms DMA
+  -- measured 7.6 GB/s and 1623 us/expert against a `kraken-bench --h2d` floor of
+  19.8-27.2. `--expert-pin-mb N` (`KRK_HOST_PIN_MB`) allocates the first N MiB of
+  the tier with `alloc_host` -- admission order, which is RANK order when the
+  model has an expert index -- and `promote_to_vram` sends it with
+  `upload_pinned_batch`; the COLD-miss path does the same for the buffer the read
+  just filled. `drop_host` must free a pinned slot with
+  `release_host_pinned_deferred` (hipFree on a hipHostMalloc block is a
+  use-after-free that shows up as varying text, not a leak). gpt-oss-120b Q8_0,
+  ctx 512, 24 tokens, greedy, warmup on, interleaved order-balanced pairs, stdout
+  identical in every arm: 16.4 -> **20.5** tok/s at `--expert-warm-mb 11000
+  --expert-pin-mb 8192` (**+25.0%**, 6/6, MAD 2.0%), and 20.3 -> **23.9** with a
+  12 GiB pin over the 34.5 GiB auto tier (+18.3%, 5/5, MAD 6.1%). Three facts to
+  keep: **a pin below the promotion working set is worth exactly zero** (4 GiB
+  halved the copy time, 1020 -> 521 ms, and moved the step by nothing -- the
+  unpinned half is still on the critical path; 8 GiB covered all 7098 MiB the run
+  promoted and that is where the gain is, so size it to promotion BYTES, not to a
+  fraction of RAM); **the `transfer` GB/s is an ENQUEUE rate on the pinned path**
+  (its timer wraps `upload_pinned_batch`, which returns while the copy is in
+  flight -- a fully pinned arm printed 64.6 GB/s on a link that does 27, which is
+  what `[stats ] pinned` now reports honestly from events on the copy stream, and
+  that reads 6.1-24.9 GB/s depending on what else the device is doing, so the
+  step time is the cost and the line is a diagnostic); and **the suite cannot see
+  the deallocator pairing** (on the CPU backend both host frees land in
+  `release_host`, so routing a pinned free through the pageable path still reads
+  72/72 -- measured with the red construction). It stays opt-in: pinned pages
+  cannot be swapped, and on the 24 GB/12 GB target shape the honest number is
+  16.3 -> 20.5 tok/s, with the rest of the gap the 283 MB/token an 11 GiB tier
+  cannot cover.
+
+- **A step on a tier that does not fit is paid for in experts moved, so the
+  router now breaks its own near-ties toward what is resident.**
+  `--router-resident P` (`KRK_ROUTER_TIE_MARGIN`): among candidates whose score
+  is within `P` of the top (a fraction of it), take the one already in VRAM,
+  then the one in WARM. Residency is read LIVE from `ExpertCache::in_vram/
+  in_host` rather than from a stored rank, because the index is what filled the
+  tiers and evictions invalidate a stored rank immediately. The mix weight stays
+  the unbiased probability. Measured on gpt-oss-120b Q8_0 (11 GiB WARM, 8 GiB
+  pin, warmup on, 24 tokens, greedy, order-balanced pairs, text identical):
+  `0.10` moves 11.4% of picks and takes 283.65 -> **226.92 MiB/token (-20.0%)**,
+  563 -> **462 promotions**, 20.3 -> **23.7 tok/s (+16.7%**, 5/5, MAD 0.1%);
+  `0.20` is -40.7% bytes and 26.7 tok/s. On `Qwen3.8-Distill-35B-A3B`, where
+  nothing is COLD at all, 0.20 still measures **+14.5%** (5/5, MAD 1.6%) from
+  promotions between tiers alone. Three things to keep: **the byte counters are
+  exact and repeat** (563 / 283.65 five times), so one run per arm settles the
+  byte claim and repetitions exist only for the rate --
+  `scripts/kraken_router_bytes_ab.sh` is the harness, because the kernel A/B
+  refuses to compare arms that print different text and this change is allowed
+  to; **the switch-off path is bit-identical** (`9f8be8ea52` before and after,
+  which is what "off" has to mean); and **the in-suite unit test can only assert
+  the wiring**, not the substitution, because the CPU-backend fixture derives its
+  expert budget from live free RAM -- under a parallel suite that budget can come
+  out at zero, so a test asserting "a resident pick was taken" passes alone and
+  fails in the suite. That shape is measured end to end instead.
+- **Resizable BAR: the runtime's answer is a hint, the GB/s is the fact.** The
+  device line now ends with `BAR: runtime reports ...` from
+  `hipDeviceAttributeIsLargeBar`. On this box the firmware has ReBAR enabled
+  while the runtime reports a 256 MiB aperture, so do not treat the attribute as
+  the BIOS setting on Windows/WDDM -- read it as "what this runtime will
+  expose". The measurement that matters is the staging rate: 5.6-6.5 GB/s
+  aggregate on a 4-reader staged read from a WARM page cache, and 3.9-4.8 GB/s
+  for expert promotions out of pinned RAM.
+
+- **Tiel-Coder-35B-A3B ships its own MTP head; the block now LOADS, the drafter
+  does not run yet.** `qwen35moe.nextn_predict_layers=1` and `blk.40.*` is the
+  standard Qwen nextn head: `nextn.eh_proj` [4096,2048] (concat of hnorm(hidden)
+  and enorm(embed(last token))), `nextn.enorm/hnorm/shared_head_norm`, a full
+  attention block (16 heads x 256, 2 KV heads, Q8_0), and a 256-expert top-8 MoE
+  (~855 MB of the block's ~897 MB). `Model::load_mtp_block` (KRK_MTP_LOAD=1)
+  uploads the block plus the adapters and reports the geometry; the routed
+  experts stay in the file for ExpertCache. With the switch off, a run is
+  byte-identical (checked on Tiel, stdout md5 unchanged).
+  **The block's forward now runs, and it drafts the target's token.** `--mtp-probe`
+  (KRK_MTP_PROBE=1) captures the target's pre-final-norm hidden row at EVERY
+  position (one activation copy per forward, into `mtp_hidden_`), gives the
+  block its own K/V plane pair (`mtp_kv_k_`/`mtp_kv_v_`, sized
+  `ctx x 2 KV heads x 256`), and replays the prompt through it: eh_proj over
+  `[enorm(embed) | hnorm(hidden)]`, its own attention (packed q+gate, 2 KV
+  heads, per-head QK-norm, the stack's rope table), `post_attention_norm` as the
+  PRE-FFN norm (there is no `ffn_norm` in block 40's tensor set), then its
+  256-expert top-8 MoE through the SAME `ExpertCache` keyed on layer 40, plus
+  the shared expert with Qwen3.5's `ffn_gate_inp_shexp` sigmoid. Then
+  `shared_head_norm` and the target's own lm_head.
+  Measured on Tiel (ctx 4096, greedy, 9-token prompt): one probe at the prompt's
+  last row drafts `","` against the target's `","` -- MATCH, 90.8 ms including
+  the replay. `KRK_MTP_PROBE_ALL=1` probes every decode step and **10 of 16
+  drafted tokens match the target's argmax (62.5%)**; the block's KV is
+  incremental (`mtp_fed_`), so a step costs one block forward (4-22 ms) rather
+  than a replay. stdout md5 is unchanged with the probe on (`360279661e`), so
+  the measurement does not perturb the run.
+  Two facts that are correctness, not taste:
+  - **The concat order is `[embedding | hidden]`.** `KRK_MTP_CONCAT=he` is the
+    swapped arm and it measures **0/19** matches with visibly lower-confidence
+    logits, against 10/16 for `eh`. The GGUF does not state the order, so this
+    is the arm that decides it -- do not "fix" it from a comment.
+  - **The router's `expert_used_count` is a MODEL-level key** (`qwen35moe.`), not
+    `blk.40.`; and GGUF `ne[]` is `(in, out)`, so `attn_q`'s out is query+gate
+    packed (8192) and `attn_k`'s is the KV width (512). Reading either as a head
+    count produced `4096 head(s) x 2048, top-0`.
+  **`--mtp-spec` drives that probe's loop as a real drafter, and on this model it
+  is a measured LOSS -- it is opt-in and must stay that way.** A round proposes
+  up to `--draft-tokens` tokens from the block's chain (position pos-1 uses the
+  captured target row, later proposals feed the block's own previous output),
+  verifies them with one batched target forward, keeps the longest matching
+  prefix, and re-feeds the block from the accepted tokens' captured target rows.
+  Because Tiel is a 30-of-40-layer GDN hybrid, a rejected suffix cannot be
+  rewound: the round snapshots `rec_state_`/`conv_state_` (63 MiB, one
+  `Backend::copy_device` on the default stream) and, on a partial accept,
+  restores and replays the accepted prefix in ONE batched forward.
+  Measured (ctx 4096, greedy, 32 tokens, 2 interleaved reps): plain **20.6-21.8
+  tok/s**; `--draft-tokens 1` **11.0-10.8**, 60% of proposals kept, 1.60
+  tokens/round; `2` **7.7-8.5**, 47%, 1.78; `4` **6.5-6.8**, 20%, 1.33.
+  Re-measured after the dense-block work (ctx 4096, greedy, 64 tokens,
+  `--draft-tokens 2`): Tiel **1.45 tokens/round** (44 rounds, 33% kept);
+  `Qwen3.8-Distill-35B-A3B` **1.19** (54 rounds, 28%); `Qwen3.5-9B` (dense
+  block) **1.78** (36 rounds, 54%). The loop is not the slow part: one round is
+  one block forward per proposal (the block's own routed experts are cold every
+  time, ~20 ms) plus the batched verify, so the propose pass costs what the
+  saved steps cost.
+  **Both block shapes load, and only one of them was wired at first.** A block
+  whose FFN is dense (`blk.N.ffn_gate/up/down`, every qwen35 dense-family nextn
+  head) has no routed banks: the loader found no experts and the probe answered
+  `the block's expert geometry does not fit the MoE workspaces`. 13 of the 15
+  files on this box are that shape. `MtpBlock::n_ff` + `ffn_gate/up/down` are
+  loaded and `mtp_dense_ffn` runs them; both the loader line and the probe line
+  now name the shape ("dense 12288-wide SwiGLU FFN" against "256 experts x
+  top-8 of 512-wide FFN + shared expert"). 15 of the 19 nextn files here run the
+  probe (two are head-only shards, and `DeepSeek-V4-Flash` is refused by arch
+  before MTP). Per-model acceptance, 8 greedy steps x 2 prompts, is 50-100% on
+  most, e.g. `Qwen3.8-27B-Q4_K_M` 8/8 and 6/8, `Qwen3.5-9B` 7/8 and 5/8.
+  **The propose pass is 6% of a round, and pinning its experts is a measured
+  wash -- do not re-derive it as a win.** `--mtp-spec` on Tiel (ctx 4096, 48
+  tokens, `--draft-tokens 2`) spends 193 ms of a 4.6 s run on the block, 160 ms
+  of that in `acquire` for 1040 acquires at an 11% miss rate; the round itself is
+  the target's verify forward plus a replay of the accepted prefix. `ExpertCache::pin_layer`
+  (KRK_MTP_PIN=1, wired from `Engine::mtp_pin_experts`) admits the block's whole
+  routed set and pins it: propose 193 -> 136 ms, refeed 80 -> 33 ms, block
+  acquires 160 -> 0 ms, text identical (`7ff494bbf10e`). But the 816 MiB comes
+  out of the target's 7594 MiB budget, the target's promotions cost 105-180 ms
+  more, and 5 interleaved order-balanced pairs measure **8.7 tok/s pinned against
+  8.9 unpinned** -- so it is off by default and kept for callers whose block
+  share is larger. A pin is only cheap where the budget is not the binding
+  constraint; admit it during planning, not after the warmup has filled the
+  card, if that ever changes.
+
+  **A dense block must not memset an MoE workspace that was never allocated.**
+  `ws_ffn_`/`ws_fexp_` exist only when `mc.is_moe`; `mtp_ffn` memset them, so on a
+  dense model the first probe was `hipMemset(NULL)` -> `hipErrorInvalidValue`
+  right after `workspaces ready`, before a token. The block's FFN now accumulates
+  onto `ws_x_` (with `mtp_rep_` as the exponent) when there is no MoE buffer.
+  Check any new "reuse the engine's workspace" code against `mc.is_moe`.
+  Two separate reasons, and neither is a bug in the loop:
+  1. **A 1-token window cannot amortize.** A round that keeps its proposal also
+     has to forward the bonus token to extend KV, so it pays two target forwards
+     for two tokens -- exactly plain decode -- plus one block forward
+     (propose 20 ms/round on this model: the block's 2048 expert pairs are
+     outside the ranked warm-up and are cold). On Tiel d=1 is the only arm
+     whose text matches plain decode, precisely because its verification is one
+     row; on a dense model d=2 does match (Qwen3.5-9B, 64 tokens,
+     `fef693466284` both arms), so the limit is this hybrid's batched-forward
+     arithmetic rather than the round.
+     The k=2 Tiel text is not wrong: it equals `--chunk 1`'s hash
+     (`6792671902ca`) where plain `--chunk 256` is `ac63e6812909`, i.e. the
+     decoder tracks a multi-row forward exactly, and the divergence to explain
+     is the one below.
+  2. **d>1 changes the text, and the speculation code is not the cause.**
+     Plain decode of the same prompt with `--chunk 1` and `--chunk 256` already
+     produces two different hashes (`6792671902ca` vs `ac63e6812909`): a
+     multi-row forward is not bit-identical to single-row decode steps (dense
+     models are chunk-invariant -- SmolLM2-135M and Qwen3-MoE both hash the same
+     at either chunk). `generate_speculative`'s "bit-identical" claim therefore
+     holds only where the batched path agrees with the decode path.
+     **The old localization here -- `KRK_DUMP` naming `moe.sum L02 rel=1.1e-3`
+     -- was an artifact of `dump_diff.py` pairing line i with line i across
+     different chunk sizes** (chunk 1 dumps row 0 first, chunk 256 dumps row
+     255), which is why it pointed at the MoE and at a 1e-3 error. The
+     pass-aligned comparison (`tools/dump_passes.py`) puts the first divergence
+     at `attn.out` on the first full-attention layer, rel 3.8e-5, i.e. the
+     attention kernel -- see "Chunk invariance is an ATTENTION property" below.
+  So the win would need a bit-identical batched forward (a kernel-arithmetic
+  project), not a better drafter. The probe remains the useful tool: it is
+  exact, costs one block forward per step, and measured 62.5% first-token
+  acceptance across 16 steps.
+
+- **A published EAGLE-3/dFlash speculator is a HEAD, and `--draft-head` runs one
+  with the verify loop that already existed.** `krk::DraftHead`
+  (`include/krk/draft_head.hpp`, `src/draft_head.cpp`) loads a small GGUF
+  (`tools/eagle_to_gguf.py` converts the published safetensors) and runs it on
+  the HOST in f32 over f16 weights: fc(fused target hidden + last token
+  embedding), one decoder block with its own rope attention and SwiGLU MLP, a
+  final norm and a projection to the DRAFT vocabulary, with `d2t` back to target
+  ids. `Engine::generate_speculative_head` is the round: propose up to
+  `--draft-tokens` (proposal 0 from the TARGET's captured row, later ones from
+  the head's OWN previous hidden plus the token it just proposed), verify in one
+  batched target forward, keep the longest matching prefix, rewind.
+  **Two things are correctness, not taste.** (1) The input at position p is
+  (hidden_p, embed(token_p)) and it predicts p+1 -- the same contract
+  `mtp_block_forward` has; feeding the target's row for a later proposal would
+  read a row the target has not computed. (2) After a partial accept the head's
+  KV is truncated to the round's start and re-fed from the target's CAPTURED
+  rows; keeping its own speculative rows is drafting from a different
+  distribution -- fluent, plausible, wrong, and invisible in the text.
+  **Measured end to end** (qwen2-1.5B, ctx 512, greedy, 16 tokens, a
+  randomly-initialised head so every proposal is rejected): stdout md5 identical
+  to plain greedy (`f7957feb5610` both arms), `draft head: 16 round(s), 0 of 32
+  proposals kept, 1.00 token(s)/round | prime 141 ms | propose 1442 ms`. A
+  random head is the right first arm precisely because it cannot be accepted:
+  it proves the loop cannot change the text.
+  **`krk.draft.*` keys are required, not inferred**, and the loader refuses a
+  head whose `hidden`/`target_hidden` disagrees with the model, whose `d2t` id
+  is outside the target vocabulary, or whose weights are not F16. A recurrent
+  target is refused at load for the same reason `load_draft` refuses one.
+  **`d2t` is stored F32, not I32, because the GGUF reader cannot reach an
+  integer payload**: `dtype_block_bytes` knows float and quant types only, so an
+  I32 tensor reads as an unknown type with `n_bytes = 0` and a null `data`
+  pointer. 4 bytes an id is 800 KiB at a 200k vocabulary -- the price of a
+  readable map. Do not "restore" the I32 form without teaching `gguf.cpp` the
+  integer types first.
+  **`--draft-head-prime N` (default 256) is a real trade.** The prime is O(prompt
+  x hidden x target_hidden) of host arithmetic, so a windowed prime attends only
+  the most recent N positions (`drop_before` is what enforces it: a window that
+  merely skipped the work would attend rows it never wrote). `0` is the exact
+  whole-prompt form.
+  **The suite runs the head itself** (`test_draft_head`, 50 checks): the
+  per-tensor geometry, the target/vocabulary refusals, `to_target`, a prime arm
+  against a fully-run arm (bit-identical rows), truncate+replay reproducing its
+  own row, and a window that measurably differs from the full KV. All of it is
+  host arithmetic, so no group opens the device to check it.
+
 ## Weight loading (`Backend::set_weight_pull`)
 
 - Large tensors are read() out of the model file rather than DMA'd from the
@@ -493,6 +1052,79 @@ code, the README, or `docs/`.
   thread opens its own `FileReader`: 7.4 GB/s shared vs 15.9 separate.
 - Every buffer in the pull ring must be drained. A drain loop left over from a
   smaller ring silently leaves the last chunks unwritten.
+
+## Loading-mode benchmark (memory vs disk)
+
+- **`scripts/bench_loading.sh` is the harness, and it measures three arms, not
+  two.** `resident` (`--weight-vram-mb -1`, upload once), `auto` (the default
+  budget: keep what fits, stream the tail, promote on first use) and `disk`
+  (`--weight-vram-mb N` **with `KRK_WEIGHT_PROMOTE=0`**). The env pair is not
+  optional: a streamed layer is promoted into a permanent allocation the first
+  time it runs, so `--weight-vram-mb N` on its own is fully resident within the
+  first token and reports a resident arm under a streamed label. `PATH:n` sets
+  the per-model token count; `KRK_BENCH_REPS` defaults to 2 with the arm order
+  reversed on even reps, and the summary takes the warmest rep per arm.
+- **`--bench` ignores `-p` and runs its own fixed prompt.** That prompt
+  tokenizes to **125 tokens on Phi's tokenizer and 55 on Qwen's**, so a Phi
+  row's prefill tok/s is not comparable with the rest and a `-p` on a `--bench`
+  line is dead text. `-n`, `--ctx`, `--chunk` and the sampling flags are read.
+- **Measured (RX 9070 XT, 15.9 GiB, gfx1201), warm rep of two, `--ctx 512`,
+  `--chunk 256`:** Phi-3.5-mini Q4_K_M (2.16 GiB, n=32) resident **128.4 tok/s**
+  decode / 1861 prefill, auto 128.6 / 1868 (streams nothing), disk 2 GiB
+  26.2 / 1198 with L29..31 streamed; Qwen3-8B Q4_K_M (4.68 GiB, n=32) resident
+  **92.1** / 1037, auto 92.4 / 1045, disk 2 GiB 2.5 / 118 with L11..35;
+  Qwen3-30B-A3B i1-Q2_K (0.71 GiB trunk, 128 experts top-8, n=16) 34.4 / 25.8
+  resident, 34.4 / 26.0 auto, 34.9 / 26.0 disk -- the three agree because the
+  ring never sees routed `_exps` banks; Qwen3.8-27B-WebGGUF Q4_0 (14.40 GiB,
+  n=8) resident **14.9** / 292, auto 12.02 GiB budget 8.6 / 71.9 (L52..63
+  streamed, then promoted), disk 2 GiB 0.5 / 28.8 (L1..63).
+  So re-read cost is linear in streamed layers (3 layers = 4.9x slower decode
+  on Phi, 25 layers = 36.8x on the 8B), prefill amortizes the re-read over the
+  chunk (8.8x against decode's 36.8x on the 8B), and on a model that fits the
+  `-1` arm beats the auto budget (14.9 against 8.6) because the load-time plan
+  is decided before the KV cache and workspaces exist.
+- **A cold page cache is not a slow arm.** The 27B's resident load reads
+  **12.73 s on rep 1 against 3.23 s warm** (1.1 against 4.5 GB/s) and the
+  30B's rep-1 resident run decodes at 20.8 tok/s against 34.4 -- so a
+  sequential probe reports the file system as the policy. Interleave, take the
+  warm rep, and compare decode rather than load: the 27B's disk arm loads in
+  0.65 s because it only reads its 2 GiB resident prefix, and then decodes at
+  0.5 tok/s.
+- **The largest files on this box cannot be benchmarked at all, and that is the
+  capability gap, not a loading result.** `kraken-inspect` refuses
+  `DeepSeek-V4-Flash-...-IQ2XXS-...imatrix.gguf` (53.5 GiB, `deepseek4`: MLA
+  `attn_kv_a`/`attn_kv_b`, `attn_sinks`, 3 `I32` tensors -- the "quantization
+  type #26" line in the verdict), `gpt-oss-120b-Q8_0.gguf` (59.0 GiB:
+  `attn_sinks`, arch not in the table; MXFP4 itself already works),
+  `qwen3.8-flash-next-reap-288-Q4_K_M.gguf` (78.1 GiB, `qwen4exp`: seven
+  classes) and `Muse-Glimmer-30B-UD-Q8_K_XL.gguf` (`muse-glimmer`, no entry).
+  A refused file never reaches a decode step, so no loading arm can measure it.
+  **Read the file's own header before writing code against a guessed shape:**
+  `python3 tools/gguf_meta.py FILE` (`--grep KEY`) dumps every metadata key from
+  the header alone, in milliseconds, including for a 78 GiB file. That is where
+  the real numbers came from -- `deepseek4.attention.compress_ratios =
+  [0,0,4,128,...]`, `key_length = value_length = 512` with `head_count_kv = 1`
+  (one shared K/V vector, rope on its last 64, deroped on the output),
+  `indexer.top_k = 512`, `hash_layer_count = 3`, `hyper_connection.count = 4`
+  with 20 Sinkhorn iterations; and for `qwen4exp`, `full_attention_interval = 4`,
+  `compress_ratios` 4 on the QSA layers, `indexer.top_k = 2048`,
+  `hyper_connection.low_rank = 320`, `ple.layers = [1]` with 8 heads per 3-gram.
+  A paper plus a blog post is a hypothesis; the header is the shape.
+  `docs/AUDIT-supersized-gguf.md` has the per-file piece inventory and the order
+  the work must land in: **`attn_sinks` first** (shared by `gpt-oss` and
+  `deepseek4`, cheapest to verify: CPU oracle plus a zeroed-sink arm that must
+  reproduce today's output bit for bit), then the `gpt-oss` table entry, then
+  `deepseek4` MLA and its `I32` tensors, then `qwen4exp`. Note that for these
+  MoE files the loading mode is *not* the lever: the ring carries the dense
+  trunk only, so a 1.5 GiB trunk reads the same in all three arms (measured
+  14.0 / 13.9 / 14.2 tok/s on `Qwen3.5-35B-A3B-UD-Q4_K_XL`); what makes them
+  fast is the expert tier -- `--expert-scan` ranking, `--expert-warm-mb` and a
+  VRAM floor.
+- Numbers, commands and the reproduction loop: `docs/BENCH-LOADING.md`. The
+  correctness rules for the ring itself are under "Dense weights stream now,
+  and the ring has two traps" -- a drained ring before the next layer, routed
+  banks excluded from a layer's byte total, and no double free of a promoted
+  base in `unload()`.
 
 ## GGUF id 42 is two different formats
 
@@ -528,7 +1160,7 @@ code, the README, or `docs/`.
   disagree; it does not mean the run was CPU-only.
 - A greedy output that is fluent but wrong is the signature of a
   plausible-but-incorrect weight or attention path. Compare against
-  `KRK_WEIGHT_PULL=0` / `KRK_ATTN_QTILE=0` before assuming the model is at fault.
+  `KRK_WEIGHT_PULL=0` / `KRK_ATTN_BEXACT=0` before assuming the model is at fault.
 - `KRK_DUMP` + `tools/dump_diff.py` localizes a divergence to the first
   differing stage; that is the fastest way to tell prefill from decode.
 - **Verify a data path against the real source pointer, not against the mapping
@@ -1056,7 +1688,8 @@ code, the README, or `docs/`.
   indexing as the host `deq_iq3_xxs`), **not the file's bytes** (L38/L39 norms
   clean, expert 161's block scales `max|d|=0.0022` -> implied values <= 4.4, so no
   f16 overflow is even possible), **not the rows>1 path** (`--chunk 1` still NaNs)
-  and **not the query-tiled kernel** (`KRK_ATTN_QTILE=0` still NaNs), and **not
+  and **not the query-tiled kernel** (the then-current `KRK_ATTN_QTILE=0` switch
+  still NaNs; that kernel has since been deleted), and **not
   the weight rows or the device's addressing of them**
   (`KRK_DEQUANT_PROBE=blk.38.ffn_down_exps.weight:161` reads that tensor's rows --
   512 wide = 2 IQ3_XXS blocks -- through the device and the host from the same
@@ -1223,15 +1856,20 @@ code, the README, or `docs/`.
   `topk_argmax`, 16 bytes back). Both now use it. The prose above `fetch_logits`
   asserted that "the speculative and draft paths pass false and get the whole
   row exactly as before" — that was true, and it was the bug.
-- The query-tiled prefill kernel is the prefill default; `KRK_ATTN_QTILE=0` opts
-  out. It was fixed: the old default kernel had a shared-memory race (one f32
-  score row per query overwritten with exp(x) before neighbours had read it),
-  now corrected — the probe sweep reports 0 bad elements everywhere, worst
-  residual 1.2e-4 from fp16 summation order. Byte-identical output (md5) to the
-  one-query path at 801- and 900-token prompts, and +38% prefill tok/s
-  interleaved (581.5 vs 420.9, 5 reps each, arms that do not overlap) is the
-  real, reproducible number; the old 5.4x was a sequential cold-cache probe and
-  does not reproduce.
+- The prefill default is `attention_bexact_kernel` (decode's arithmetic over a
+  tile of query rows), and the query-tiled kernel it replaced is deleted --
+  along with `KRK_ATTN_QTILE`/`_QT`/`_K`, `attn_qtile_on()` and
+  `tools/probe_attn_qtile.hip`. The tiled `attention_kernel` survives only as
+  the fallback for a windowed layer, a non-causal call and a head width outside
+  64..256 in steps of 32. The query-tiled kernel's own history is worth keeping
+  here because it is the reason the tiled form was believed correct at all: its
+  first version had a shared-memory race (one f32 score row per query
+  overwritten with exp(x) before neighbours had read it), fixed to 0 bad
+  elements and a worst residual of 1.2e-4 from fp16 summation order, and it was
+  md5-identical to the one-query path at 801- and 900-token prompts for +38%
+  prefill (581.5 against 420.9, 5 interleaved reps). The exact kernel then beat
+  it by 49% at hd 96 and 33% at 3400 tokens on Qwen3.5-9B, which is what made
+  deleting it the right call rather than a simplification.
 - `maclin` (gfx1031 / RDNA2) is unreachable from here, so nothing is *executed*
   on RDNA2. The target still builds: `-DKRK_GPU_TARGETS="gfx1031;gfx1201"`
   compiles the gfx1031 kernels and the same `kraken-bench --gate` runs over
@@ -1350,3 +1988,38 @@ code, the README, or `docs/`.
   with `1 silu, 62 experts-sum ... and the storage exponent reached the clamp`, and
   the same run with `KRK_RANGE_STRICT=0` exits 0 with the same text at `[warn ]`.
   A gate that cannot fail proves nothing, so the two arms are the proof.
+
+## gpt-oss (openai-moe) and the two rules it taught
+
+- **A 120B file runs on this box in one second as an oracle**, which is cheaper
+  than any amount of reasoning about a wrong answer. llama.cpp mmaps and faults
+  in only the experts a token touches: `gpt-oss-120b-Q8_0.gguf` (59.0 GiB)
+  loaded in **1.0 s** and decoded at **7.6 tok/s** on 16 CPU threads, and
+  `--verbose-prompt` prints the prompt's token ids so the tokenizer can be
+  cleared in the same run. Measured baseline: `The capital of France is` ->
+  ` Paris.` The command is in `docs/AUDIT-gpt-oss.md`.
+- **`expert_weights_norm` defaults to FALSE in llama.cpp and its openai-moe
+  loader never sets it.** A 128-expert stack whose top-4 hold **13%** of the
+  softmax mass is mixed with the raw probabilities, so an engine that
+  renormalizes multiplies every layer's expert contribution by **7.6**. The
+  symptom is not a crash: the residual stream grows ~1.2x per layer (measured
+  rms 2.0 at L00 to 1323 at L35) and the model answers fluent nonsense. The
+  arch now declares the default (`ArchSpec::expert_w_norm`), and gpt-oss's
+  expert activation is `ggml_swiglu_oai` -- `min(gate,7) * sigmoid(1.702*that) *
+  (clamp(up,-7,7) + 1)` -- not `silu(gate)*up`. Both were wrong at once, and
+  either alone is enough to produce garbage that looks like a broken kernel.
+- **A windowed layer DOES NOT WRITE `attn.out` on a multi-row prefill today**,
+  and that is open. The tell is cheap: `KRK_DUMP` row 4 of `attn.out` on an even
+  layer holds 64 non-zero values out of 4096 and the *same bytes* for two
+  different prompts, while the odd (full-attention, exact-prefill) layers are
+  fresh. gpt-oss is the only file here that combines `attn_sinks` with windowed
+  layers, and `KRK_SWA_OFF=1` is the new A/B arm that runs every layer as full
+  attention -- the same computation below the window length -- and makes those
+  layers fresh again. Use it as the workaround for prompts under 128 tokens and
+  as the arm that proves the rest of the model math.
+- **`docs/AUDIT-gpt-oss.md` has the per-defect measurements**, including the
+  layer-0 MoE matching an independent numpy reference to rel-l2 **5e-4** and
+  position-0 attention to **2e-4**, plus the trap that cost an hour: the YaRN
+  ramp is indexed by the **pair** index, not the channel index (`rope_yarn_ramp`
+  divides `i0` by 2), so a reference that uses `2i` reports the engine's correct
+  table as wrong.
