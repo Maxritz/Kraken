@@ -62,6 +62,27 @@ struct LayerWeights {
     f32 *ffn_norm = nullptr; // f32 [n_embd]
     QuantTensor wgate, wup, wdown;
 
+    // ---- qwen4exp: hyper-connections, PLE, indexer (optional) ------------
+    // `hc_*` are the two mixers per layer (before the token mixer and before the
+    // FFN). `hc_attn_norm` is [n_embd, hc] read lane-major; the down/up pair is
+    // the [hc*n_embd -> low_rank -> hc*n_embd] bottleneck and `inject` maps the
+    // wide stream to one weight per lane. `ple_*` is the n-gram module on the
+    // layers `ple.layers` names, and `idx_*` is the QSA indexer on a full
+    // attention layer.
+    f32 *hc_attn_norm = nullptr;
+    QuantTensor hc_attn_down, hc_attn_up, hc_attn_inject;
+    f32 *hc_ffn_norm = nullptr;
+    QuantTensor hc_ffn_down, hc_ffn_up, hc_ffn_inject;
+    bool ple = false;
+    QuantTensor ple_key, ple_value, ple_conv1d;
+    f32 *ple_norm_key = nullptr;
+    f32 *ple_norm_query = nullptr;
+    f32 *ple_norm_conv = nullptr;
+    i32 qsa_ratio = 0; // > 0 when this layer carries the QSA indexer
+    QuantTensor idx_q_proj, idx_k_proj;
+    f32 *idx_q_norm = nullptr;
+    f32 *idx_k_norm = nullptr;
+
     // ---- Mixture-of-Experts (optional) -----------------------------------
     // `moe` selects the routed-expert FFN path. `router` is the small gating
     // matrix [n_expert, n_embd] and is always resident. The routed experts are
@@ -228,6 +249,35 @@ struct ModelConfig {
     // from the packed query gate of Qwen3.5, which is a sigmoid off the query
     // projection rather than a separate tensor.
     bool attn_gate = false;
+    // ---- qwen4exp (Qwen3.8-Flash-Next) -----------------------------------
+    // The residual is `hc` lanes of n_embd, mixed through a low-rank bottleneck
+    // (4 x 2560 through 320 on the REAP-288 file). `ple` is the n-gram hash
+    // embedding table, `qsa_ratio` the per-layer block size of the QSA indexer
+    // (0 on a layer without one), and `no_out_norm` says the final mixer
+    // carries the norm -- there is no output_norm.weight in the file.
+    bool hc = false;
+    i32 hc_n = 0;
+    i32 hc_low_rank = 0;
+    bool ple = false;
+    i32 ple_ngram = 0;
+    i32 ple_heads_per_ngram = 0;
+    i32 ple_head_dim = 0;
+    i32 ple_conv_kernel = 0;
+    i32 ple_eos_token = -1;
+    std::vector<i64> ple_multipliers;   // [ngram]
+    std::vector<i64> ple_head_offsets;  // [n_heads]
+    std::vector<i64> ple_head_vocab_sizes;
+    std::vector<i32> ple_layers;        // layer indices carrying a PLE module
+    bool qsa = false;
+    i32 idx_n_head = 0;
+    i32 idx_head_dim = 0;
+    i32 idx_top_k = 0;
+    std::vector<i32> qsa_ratio;         // per layer, 0 = no indexer
+    bool no_out_norm = false;
+    // The recurrent layer's output gate is `sigmoid(z)` rather than `silu(z)`.
+    // qwen4exp's build_norm_gated is the one numerical difference from Qwen3.5's
+    // gated delta net.
+    bool gdn_gate_sigmoid = false;
     // RoPE pair convention, read off the arch table (ArchSpec::rope_neox): true
     // pairs channel j with j + rope_dim/2 (NeoX half-split), false pairs the
     // adjacent channels (2i, 2i+1). It travels with the model because it is a
@@ -547,6 +597,12 @@ public:
     const QuantTensor &tok_embd() const { return tok_embd_; }
     const QuantTensor &out_head() const { return out_head_; }
     const f32 *out_norm() const { return out_norm_; }
+    // qwen4exp's PLE table is a pointer into the mapping, not an upload: the
+    // accessors exist so a test can assert the loader found it and sized one row.
+    const u8 *ple_table() const { return ple_table_; }
+    u64 ple_row_bytes() const { return ple_row_bytes_; }
+    const QuantTensor &hc_head_down() const { return hc_head_down_; }
+    const QuantTensor &hc_head_up() const { return hc_head_up_; }
     // NeoX inverse frequencies, length head_dim/2, host-resident (tiny).
     const std::vector<f32> &inv_freq() const { return inv_freq_; }
     i64 weight_bytes() const { return weight_bytes_; }
@@ -695,6 +751,15 @@ private:
     std::vector<LayerWeights> layers_;
     QuantTensor tok_embd_, out_head_;
     f32 *out_norm_ = nullptr;
+    // qwen4exp's final mixer *is* the output norm (there is no output_norm):
+    // the same lane-mix read the blocks use, applied once at the top of the
+    // stack. `ple_table_` is the flat n-gram embedding table, kept as a POINTER
+    // INTO THE MAPPING because it is 320,001,536 rows of 160 -- tens of GB that
+    // must never be uploaded. `ple_row_bytes` is one row's stride.
+    f32 *hc_head_norm_ = nullptr;
+    QuantTensor hc_head_down_, hc_head_up_;
+    const u8 *ple_table_ = nullptr;
+    u64 ple_row_bytes_ = 0;
     std::vector<f32> inv_freq_;
     std::vector<f32> inv_freq_swa_;
     // prism.hadamard. The sign vectors are uploaded once at load and released

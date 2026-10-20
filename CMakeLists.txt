@@ -85,6 +85,8 @@ set(KRK_CORE_SOURCES
     src/tokenizer.cpp
     src/sampler.cpp
     src/spec_sampling.cpp
+    src/hc.cpp
+    src/ple.cpp
     src/model.cpp
     src/dflash.cpp
     src/draft_head.cpp

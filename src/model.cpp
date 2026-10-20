@@ -90,7 +90,19 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     for (const std::string &n : verdict.notes)
         KRK_WARN("architecture '%s': %s (known: %s)", a.c_str(), n.c_str(),
                  arch_known_names().c_str());
-    if (!verdict.runnable) {
+    // Development escape hatch, and it is loader-only on purpose:
+    // KRK_ARCH_ALLOW_EXPERIMENTAL=1 lets the tensors of a refused schema be
+    // read, so a half-ported architecture can be checked stage by stage, while
+    // Engine::init still refuses to *generate* from the pieces it cannot run.
+    // Nothing user-facing sets it, and the warning says what it is.
+    const char *allow_exp = std::getenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    const bool experimental_load =
+        allow_exp && allow_exp[0] == '1' && verdict.spec != nullptr;
+    if (!verdict.runnable && experimental_load) {
+        KRK_WARN("architecture '%s': loading an UNSUPPORTED schema for development "
+                 "(KRK_ARCH_ALLOW_EXPERIMENTAL=1); generation will refuse",
+                 verdict.arch.empty() ? "no arch" : verdict.arch.c_str());
+    } else if (!verdict.runnable) {
         if (err) {
             std::string msg = "cannot run this file ('" +
                               (verdict.arch.empty() ? std::string("no arch") : verdict.arch) +
@@ -367,6 +379,103 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         if (const std::vector<i32> *sec = gguf_.get_i32_array(key(".rope.dimension_sections"))) {
             for (size_t i = 0; i < sec->size() && i < 4; i++)
                 cfg_.rope_sections[i] = (*sec)[i];
+        }
+    }
+
+    // ---- qwen4exp: hyper-connections, PLE, QSA ---------------------------
+    // Read only for the schema flags, so a file of another family costs four
+    // pointer tests and nothing else.
+    if (aspec.hyper_connection) {
+        cfg_.hc = true;
+        cfg_.hc_n = static_cast<i32>(gguf_.get_i64(key(".hyper_connection.count"), 0));
+        cfg_.hc_low_rank =
+            static_cast<i32>(gguf_.get_i64(key(".hyper_connection.low_rank"), 0));
+        // A count of 1 has nothing to mix. transformers, vLLM and SGLang all
+        // raise on it, and a silent 1-lane read would make the mixer an
+        // expensive identity.
+        if (cfg_.hc_n <= 1 || cfg_.hc_low_rank <= 0) {
+            if (err)
+                *err = "arch '" + a + "': hyper_connection.count (" +
+                       std::to_string(cfg_.hc_n) + ") x low_rank (" +
+                       std::to_string(cfg_.hc_low_rank) +
+                       ") is not a mixer (count must be > 1, rank > 0)";
+            return false;
+        }
+        cfg_.no_out_norm = aspec.no_out_norm;
+        cfg_.gdn_gate_sigmoid = aspec.hyper_connection;
+        cfg_.qsa = aspec.qsa;
+        if (cfg_.qsa) {
+            cfg_.idx_n_head =
+                static_cast<i32>(gguf_.get_i64(key(".attention.indexer.head_count"), 0));
+            cfg_.idx_head_dim =
+                static_cast<i32>(gguf_.get_i64(key(".attention.indexer.key_length"), 0));
+            cfg_.idx_top_k =
+                static_cast<i32>(gguf_.get_i64(key(".attention.indexer.top_k"), 0));
+            if (cfg_.idx_n_head <= 0 || cfg_.idx_head_dim <= 0 || cfg_.idx_top_k <= 0) {
+                if (err)
+                    *err = "arch '" + a + "': the QSA indexer metadata is incomplete "
+                           "(head_count/key_length/top_k must all be > 0)";
+                return false;
+            }
+            if (const std::vector<i32> *cr =
+                    gguf_.get_i32_array(key(".attention.compress_ratios"))) {
+                cfg_.qsa_ratio = *cr;
+            }
+        }
+    }
+    if (aspec.ple) {
+        const std::vector<i32> *layers = gguf_.get_i32_array(key(".ple.layers"));
+        if (layers && !layers->empty()) {
+            cfg_.ple = true;
+            cfg_.ple_layers = *layers;
+            cfg_.ple_ngram = static_cast<i32>(gguf_.get_i64(key(".ple.ngram_size"), 0));
+            cfg_.ple_heads_per_ngram =
+                static_cast<i32>(gguf_.get_i64(key(".ple.heads_per_ngram"), 0));
+            cfg_.ple_conv_kernel =
+                static_cast<i32>(gguf_.get_i64(key(".ple.conv_kernel"), 0));
+            cfg_.ple_head_dim = static_cast<i32>(
+                gguf_.get_i64(key(".embedding_length_per_layer_input"), 0));
+            cfg_.ple_eos_token =
+                static_cast<i32>(gguf_.get_i64(key(".ple.eos_token_id"), -1));
+            if (const std::vector<i32> *mult =
+                    gguf_.get_i32_array(key(".ple.layer_multipliers"))) {
+                cfg_.ple_multipliers.clear();
+                for (i32 v : *mult) cfg_.ple_multipliers.push_back(v);
+            }
+            // The head ranges are stored as uint64 in the file and reach far
+            // past int32 in principle; the loader keeps them as i64 and refuses
+            // a set that does not cover every head.
+            if (const std::vector<i32> *off =
+                    gguf_.get_i32_array(key(".ple.head_offsets"))) {
+                cfg_.ple_head_offsets.clear();
+                for (i32 v : *off) cfg_.ple_head_offsets.push_back(v);
+            }
+            if (const std::vector<i32> *vo =
+                    gguf_.get_i32_array(key(".ple.head_vocab_sizes"))) {
+                cfg_.ple_head_vocab_sizes.clear();
+                for (i32 v : *vo) cfg_.ple_head_vocab_sizes.push_back(v);
+            }
+            const i32 heads = (cfg_.ple_ngram - 1) * cfg_.ple_heads_per_ngram;
+            if (cfg_.ple_ngram < 2 || cfg_.ple_heads_per_ngram <= 0 ||
+                cfg_.ple_head_dim <= 0 || cfg_.ple_conv_kernel <= 0 ||
+                static_cast<i32>(cfg_.ple_head_offsets.size()) < heads ||
+                static_cast<i32>(cfg_.ple_head_vocab_sizes.size()) < heads ||
+                static_cast<i32>(cfg_.ple_multipliers.size()) < cfg_.ple_ngram) {
+                if (err)
+                    *err = "arch '" + a + "': the PLE metadata is incomplete (needs "
+                           "ngram>=2, heads_per_ngram, embedding_length_per_layer_"
+                           "input, conv_kernel, and one offset/vocab per head)";
+                return false;
+            }
+            for (i32 l : cfg_.ple_layers) {
+                if (l < 0 || l >= cfg_.n_layer) {
+                    if (err)
+                        *err = "arch '" + a + "': PLE layer " + std::to_string(l) +
+                               " is outside the " + std::to_string(cfg_.n_layer) +
+                               "-layer stack";
+                    return false;
+                }
+            }
         }
     }
 
@@ -873,11 +982,69 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         out_head_ = upload_raw(oh, oh->type);
         lp.mark("  output.weight upload");
     }
-    out_norm_ = upload_f32("output_norm.weight");
-    lp.mark("  output_norm upload");
-    if (!out_norm_) {
-        if (err) *err = "output_norm.weight is missing";
-        return false;
+    if (cfg_.no_out_norm) {
+        // The final hyper-connection mixer IS the output norm: the file carries
+        // hc_head_norm/down/up instead of output_norm.weight. The norm weight is
+        // kept here so the final mix has its gamma; the projector and the wide
+        // stream are read by the engine's last mix.
+        hc_head_norm_ = upload_f32("hc_head_norm.weight");
+        std::string he;
+        hc_head_down_ = upload_weight("hc_head_down.weight", false, &he);
+        if (!hc_head_down_.present()) {
+            if (err) *err = "hc_head_down.weight is missing";
+            return false;
+        }
+        hc_head_up_ = upload_weight("hc_head_up.weight", false, &he);
+        if (!hc_head_up_.present()) {
+            if (err) *err = "hc_head_up.weight is missing";
+            return false;
+        }
+        // The engine's final rmsnorm still runs, with the first lane's gamma:
+        // the reference mixes the lanes first, which is the stage that lands
+        // with the hyper-connection forward pass.
+        out_norm_ = hc_head_norm_;
+        if (!out_norm_) {
+            if (err) *err = "hc_head_norm.weight is missing";
+            return false;
+        }
+        lp.mark("  hc_head upload");
+    } else {
+        out_norm_ = upload_f32("output_norm.weight");
+        lp.mark("  output_norm upload");
+        if (!out_norm_) {
+            if (err) *err = "output_norm.weight is missing";
+            return false;
+        }
+    }
+
+    if (cfg_.ple) {
+        const GgufTensor *t = gguf_.tensor("per_layer_token_embd.weight");
+        if (!t) {
+            if (err) *err = "per_layer_token_embd.weight is missing";
+            return false;
+        }
+        // Rows, not bytes: one row is head_dim values of the file's own type and
+        // the gather reads them straight out of the mapping. Uploading this
+        // table would be 30+ GiB of VRAM for rows a token touches sixteen of.
+        const u64 n_rows = static_cast<u64>(t->ne[1]);
+        i64 min_rows = 0;
+        for (size_t h = 0; h < cfg_.ple_head_offsets.size(); h++)
+            min_rows = std::max<i64>(
+                min_rows, cfg_.ple_head_offsets[h] + cfg_.ple_head_vocab_sizes[h]);
+        if (static_cast<i64>(n_rows) < min_rows) {
+            if (err)
+                *err = "per_layer_token_embd has " + std::to_string(n_rows) +
+                       " rows, too few for the PLE head ranges (" +
+                       std::to_string(min_rows) + ")";
+            return false;
+        }
+        ple_table_ = t->data;
+        ple_row_bytes_ = static_cast<u64>(t->n_elements / (t->ne[1] ? t->ne[1] : 1));
+        KRK_INFO("ple: %llu rows of %d read from the mapping (%llu B/row), "
+                 "%d head(s) per token",
+                 static_cast<unsigned long long>(n_rows), cfg_.ple_head_dim,
+                 static_cast<unsigned long long>(ple_row_bytes_),
+                 (cfg_.ple_ngram - 1) * cfg_.ple_heads_per_ngram);
     }
 
     lp.mark("token_embd + output head");
@@ -1056,7 +1223,11 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // upload of the same 10.5 KiB rather than a copy of the pointer.
         if (!L.ffn_norm && L.attn_norm)
             L.ffn_norm = upload_f32(blk_key("blk.%d.attn_norm.weight", l));
-        if (!L.attn_norm || !L.ffn_norm) {
+        // qwen4exp has no plain attn_norm/ffn_norm at all: each sub-block reads
+        // the hyper-connection mixer's own grouped norm instead, and requiring
+        // one here would refuse a file whose norms are all present under the
+        // names the mixer uses.
+        if (!cfg_.hc && (!L.attn_norm || !L.ffn_norm)) {
             if (err) *err = "layer " + std::to_string(l) + " is missing its norm weights";
             return false;
         }
@@ -1162,6 +1333,73 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // A recurrent nemotron layer that is neither mamba-2 nor
             // attention: a pure-MoE block. Nothing to upload here.
             KRK_WARN("layer %d has no attention tensors; running as a pure FFN block", l);
+        }
+
+        // ---- qwen4exp: the two hyper-connection mixers ---------------------
+        if (cfg_.hc) {
+            L.hc_attn_norm = upload_f32(blk_key("blk.%d.hc_attn_norm.weight", l));
+            L.hc_attn_down = need(blk_key("blk.%d.hc_attn_down.weight", l));
+            L.hc_attn_up = need(blk_key("blk.%d.hc_attn_up.weight", l));
+            L.hc_attn_inject = need(blk_key("blk.%d.hc_attn_inject.weight", l));
+            L.hc_ffn_norm = upload_f32(blk_key("blk.%d.hc_ffn_norm.weight", l));
+            L.hc_ffn_down = need(blk_key("blk.%d.hc_ffn_down.weight", l));
+            L.hc_ffn_up = need(blk_key("blk.%d.hc_ffn_up.weight", l));
+            L.hc_ffn_inject = need(blk_key("blk.%d.hc_ffn_inject.weight", l));
+            const i64 wide = static_cast<i64>(cfg_.n_embd) * cfg_.hc_n;
+            if (!L.hc_attn_norm || !L.hc_ffn_norm ||
+                L.hc_attn_down.n_in != wide || L.hc_attn_down.n_out != cfg_.hc_low_rank ||
+                L.hc_attn_up.n_in != cfg_.hc_low_rank || L.hc_attn_up.n_out != wide ||
+                L.hc_attn_inject.n_in != wide || L.hc_attn_inject.n_out != cfg_.hc_n ||
+                L.hc_ffn_down.n_in != wide || L.hc_ffn_down.n_out != cfg_.hc_low_rank ||
+                L.hc_ffn_up.n_in != cfg_.hc_low_rank || L.hc_ffn_up.n_out != wide ||
+                L.hc_ffn_inject.n_in != wide || L.hc_ffn_inject.n_out != cfg_.hc_n) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           ": hyper-connection tensors disagree with " +
+                           std::to_string(wide) + " -> " +
+                           std::to_string(cfg_.hc_low_rank) + " -> " +
+                           std::to_string(wide) + " (" + std::to_string(cfg_.hc_n) +
+                           " lanes)";
+                return false;
+            }
+        }
+        // A layer's QSA indexer is keyed on its own compress ratio.
+        if (cfg_.qsa && l < static_cast<i32>(cfg_.qsa_ratio.size()))
+            L.qsa_ratio = cfg_.qsa_ratio[static_cast<size_t>(l)];
+        if (L.qsa_ratio > 0) {
+            L.idx_q_proj = need(blk_key("blk.%d.indexer.q_proj.weight", l));
+            L.idx_k_proj = need(blk_key("blk.%d.indexer.k_proj.weight", l));
+            L.idx_q_norm = upload_f32(blk_key("blk.%d.indexer.q_norm.weight", l));
+            L.idx_k_norm = upload_f32(blk_key("blk.%d.indexer.k_norm.weight", l));
+            if (!L.idx_q_proj.present() || !L.idx_k_proj.present() ||
+                !L.idx_q_norm || !L.idx_k_norm) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " declares a compress ratio (" +
+                           std::to_string(L.qsa_ratio) +
+                           ") but carries no QSA indexer tensors";
+                return false;
+            }
+        }
+        if (cfg_.ple) {
+            for (i32 pl : cfg_.ple_layers) {
+                if (pl != l) continue;
+                L.ple = true;
+                L.ple_key = need(blk_key("blk.%d.ple_key.weight", l));
+                L.ple_value = need(blk_key("blk.%d.ple_value.weight", l));
+                L.ple_conv1d = upload_conv1d(blk_key("blk.%d.ple_conv1d.weight", l));
+                L.ple_norm_key = upload_f32(blk_key("blk.%d.ple_norm_key.weight", l));
+                L.ple_norm_query = upload_f32(blk_key("blk.%d.ple_norm_query.weight", l));
+                L.ple_norm_conv = upload_f32(blk_key("blk.%d.ple_norm_conv.weight", l));
+                if (!L.ple_key.present() || !L.ple_value.present() ||
+                    !L.ple_conv1d.present() || !L.ple_norm_key ||
+                    !L.ple_norm_query || !L.ple_norm_conv) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) +
+                               " is a PLE layer but is missing one of its tensors";
+                    return false;
+                }
+            }
         }
         // A layer is MoE when it carries routed-expert tensors. This is decided
         // per layer: hybrid stacks (dense early layers, MoE later ones) load

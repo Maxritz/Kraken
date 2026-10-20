@@ -123,11 +123,27 @@ constexpr ArchSpec kTable[] = {
     // "this engine cannot run it" are different statements, and the second is the
     // true one. docs/AUDIT-qwen4exp-support.md has the per-piece inventory and the
     // reference engine that runs it.
-    {"qwen4exp", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "qwen4exp",
-     "a hyper-connection stack with a gated attention output, a fused "
-     "query/key/value projection, Mamba-style SSM blocks, a QSA indexer and a PLE "
-     "n-gram table, none of which this engine implements",
-     false, false, false, false},
+    // Now a runnable schema: the loader reads its hyper-connection, PLE and
+    // indexer tensors, and the delta-net half is the gated delta net this engine
+    // already runs (16 key heads of 128, 48 value heads of 128, conv 4). See
+    // docs/AUDIT-qwen4exp-support.md for the per-stage state and the reference
+    // implementation the shapes were read from.
+    // 
+    // Still refused, and now for the *graph* rather than for the tensors: the
+    // schema below is measured, the reference implementation is on this box
+    // (docs/AUDIT-qwen4exp-support.md), and what is missing is the
+    // hyper-connection residual, the PLE gather and the QSA selection. Declaring
+    // it Partial would claim "loads and runs", which it does not yet.
+    {"qwen4exp", ArchShape::RecurrentMoe, ArchSupport::No, ArchRole::Target,
+     "qwen4exp",
+     "the tensor schema is known (the reference is src/models/qwen4exp.cpp in "
+     "the llama.cpp tree under G:/Strata); the hyper-connection residual, the "
+     "PLE n-gram table and the QSA indexer are not implemented yet",
+     /*qk_norm=*/true, /*q_output_gate=*/true, /*qkv_bias=*/false,
+     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
+     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
+     /*swiglu_oai=*/false, /*hyper_connection=*/true, /*ple=*/true,
+     /*qsa=*/true, /*attn_gate_elem=*/false, /*no_out_norm=*/true},
 
     // Multi-head latent attention: a compressed KV path (attn_kv_a/kv_b and
     // their norms) that the attention kernels have no shape for.

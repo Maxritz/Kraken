@@ -1652,3 +1652,28 @@ blocking router D2H in `Engine::moe_ffn`; the 4-op-per-expert chain and the
 O(n_expert) host scan per layer; and the prefill item below, which this does not
 touch -- 155 tok/s on the 35B is still the 55-token fixed prompt, not a real
 long-prompt prefill number.
+
+## P0 (2026-10-20): run the models the collection actually has
+
+The four files that are refused today and are wanted:
+
+| file | blocker | work |
+|---|---|---|
+| `qwen3.8-flash-next-reap-288-Q4_K_M` (78 GiB), `-REAP-320`, `Swift-...-IQ2_XS` (2 shards) | `qwen4exp`: hyper-connection residual, PLE n-gram table, QSA indexer | stages 2-6 of `docs/AUDIT-qwen4exp-support.md`; the tensor schema and the delta-net half are already this engine's |
+| `DeepSeek-V4-Flash-...-imatrix` (53.5 GiB) | MLA (`attn_kv_a/b`) + compressed-attention tensors + **quant type #26** | `src/models/deepseek4.cpp` in the same reference tree; the quantiser is the first piece (a file cannot even be dequantised without it) |
+| `K2-Horizon-MoVA-36B-A4B` | routed attention values (`attn_v_exps`/`attn_v_gate`) | a third expert bank inside attention; the MoE machinery exists, the attention does not |
+| `Qwen3.8-27B-DFlash*` / `DeepSeek-...-REAP-MTP` | not models (draft-head shards) | they run only beside a target via `--draft`/`--mtp`; nothing to port |
+
+Order (each stage lands with a test before the next starts):
+
+1. arch + loader flags for the qwen4exp schema (done: `hyper_connection`, `ple`,
+   `qsa`, `attn_gate_elem`, `no_out_norm`; shape now `RecurrentMoe`).
+2. hyper-connections: `hc_mix`/`hc_combine` (two small kernels, the rest is
+   gemm/rmsnorm that already exists).
+3. PLE: host n-gram hash -> row indices, gathered straight out of the mmap.
+4. recurrent block: `gdn_forward` with the `sigmoid` z gate (one switch).
+5. full-attention block: packed `[q|gate]` (already the qwen35 shape), then QSA.
+6. end to end against `H:/LLAMA-bins/rocm10/llama-completion.exe`.
+
+Nothing in 2-5 is research: `G:/Strata/build-hip-win/_deps/strata_llamacpp-src/
+src/models/qwen4exp.cpp` is the running reference for every op and every split.
