@@ -185,3 +185,66 @@ which is precisely why stage 1 starts there. The rope (`dimension_sections [4 i3
 `dimension_count 64`) is unread and its convention is unverified. The reference
 engine is used here only as a *loads-and-generates* fact plus its timings; its
 per-stage internals were not inspected.
+
+## The reference implementation, found locally (2026-10-20)
+
+`G:\Stratauild-hip-win\_deps\strata_llamacpp-src` is a full llama.cpp tree
+that **runs this file**, with a dedicated `src/models/qwen4exp.cpp` (1294 lines)
+and `conversion/qwen4exp.py`. The QKV split this document called "not derivable
+from the metadata" is stated there outright, and it is not a guess:
+
+```
+head_k_dim = ssm.state_size        = 128
+n_k_heads  = ssm.group_count       = 16     -> key_dim   = 2048
+n_v_heads  = ssm.time_step_rank    = 48     -> value_dim = 6144
+conv_dim   = key_dim*2 + value_dim = 10240  ==  attn_qkv's output width
+```
+
+so `attn_qkv` is **[q(2048) | k(2048) | v(6144)]**, and `attn_gate` [2560, 6144]
+is the z gate over the value stream. Both are **already the shapes
+`LayerWeights::wqkv` / `wqkv_gate` carry** for the gated delta net, and
+`Engine::gdn_forward` already runs conv -> L2 norm -> softplus/dt -> delta rule ->
+grouped norm -> `ssm_out` for exactly these tensors. Two real differences:
+
+| piece | reference | kraken today |
+|---|---|---|
+| output gate activation | `sigmoid(z)` (`build_norm_gated`) | `silu(z)` (`silu_mul`) |
+| q/k head count vs v | 16 vs 48, q/k repeated 3x | supported by the kernel already |
+
+The full-attention layers (`(il+1) % 4 == 0`, `compress_ratios[il] == 4`) use
+**separate** `attn_q` [2560, 12288] with `[q | gate]` interleaved *per head*,
+`attn_k`/`attn_v` [2560, 512], per-head `attn_q_norm`/`attn_k_norm` [256], a QSA
+indexer (`indexer.q_proj` [2560,512], `.k_proj` [2560,128], q/k norm [128],
+`top_k 2048`, keys pooled over blocks of `compress_ratio`), and a per-element
+sigmoid gate before `attn_output`. That is Qwen3.5's packed-query-gate shape
+(`q_output_gate`) plus an indexer this engine has no code for.
+
+The residual is **not** `x + f(norm(x))`: four hyper-connection lanes
+(`[n_embd, hc=4]`, 10240 wide) are mixed by
+`xn = rms_norm(per lane) * gamma; lo = silu(down*xn / 4); gate = sigmoid(up*lo);
+mix = mean_lane(xn * gate); inject = w_inject*xn`, and the block output returns
+as `residual_lane += block_out * 2*sigmoid(inject_lane / 4)`. There is **no
+`output_norm`**: the final `hc_head_*` mixer is the last norm.
+
+### Order of work, with what each stage can be verified against
+
+1. **Arch + loader** (flags `hc`, `ple`, `qsa`, `attn_gate_elem`, `no_out_norm`;
+   upload `hc_*`, `ple_*`, `indexer_*`, `hc_head_*`; read `compress_ratios`).
+   Verified by `kraken-inspect` naming every tensor it read.
+2. **Hyper-connections** (`hc_mix` / `hc_combine`): two small kernels
+   (`mean_lanes`, `lane_scatter`) plus the existing gemms/norms. Verified by a
+   CPU fixture whose lanes start identical (the reference starts them as `hc`
+   copies of the embedding, so lane 0..3 must stay equal until the first
+   combine, which the test pins).
+3. **PLE**: host-side n-gram hash -> 16 row indices per token, gathered straight
+   out of the mmap (the table is 320,001,536 x 160, i.e. tens of GB and must
+   never be uploaded), then key/value projections, per-lane dot gate, and a
+   dilated depthwise conv with per-layer history. Verified by a fixture whose
+   hashes and rows are computable in the test.
+4. **Recurrent block**: `gdn_forward` plus the `sigmoid` gate switch.
+5. **Full-attention block**: packed `[q|gate]`, per-head norms, and *dense*
+   causal attention first (a superset of the QSA selection, so text is coherent),
+   then the indexer exactly: pooled keys per block of `ratio`, one score per
+   block, top-k over blocks, mask everything else.
+6. **End to end**: greedy text against `H:\LLAMA-binsocm10\llama-completion.exe`
+   on the same prompt, plus a logits comparison on the first token.
