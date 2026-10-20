@@ -688,7 +688,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // Only sized when a scan is actually requested: [n_layer * n_expert]
         // doubles and u64 counters, which is 3584 * 12 B = 43 kB for a
         // 28x128 model and nothing at all otherwise.
-        if (expert_scan_) {
+        if (expert_scan_ || expert_track_) {
             const size_t cells = static_cast<size_t>(mc.n_layer) *
                                  static_cast<size_t>(mc.n_expert);
             expert_mass_.assign(cells, 0.0);
@@ -3824,9 +3824,23 @@ void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
 // A 300B model needs ~70% coverage to fit a 24 GB host tier, where a 30B needs
 // ~10%; the file is the same either way.
 void Engine::write_expert_index(const std::string &path) const {
+    write_expert_index_rows(path, expert_mass_, expert_hits_,
+                            expert_scan_tokens_,
+                            expert_stub_ ? "routers-only" : "full-forward");
+}
+
+void Engine::write_expert_index_rows(const std::string &path,
+                                     const std::vector<double> &mass_in,
+                                     const std::vector<u64> &hits_in, i64 tokens,
+                                     const char *mode) const {
     const ModelConfig &mc = model_.cfg();
     if (!mc.is_moe || mc.n_expert <= 0) return;
     const i32 ne = mc.n_expert;
+    const size_t cells = static_cast<size_t>(mc.n_layer) *
+                         static_cast<size_t>(ne);
+    if (mass_in.size() < cells || hits_in.size() < cells) return;
+    const double *mass_all = mass_in.data();
+    const u64 *hits_all = hits_in.data();
     const size_t one = model_.max_expert_bytes();
     // Size and mtime travel with the index so a loader can refuse a list
     // written for a different build of the same weights. Matching the Laguna
@@ -3864,17 +3878,17 @@ void Engine::write_expert_index(const std::string &path) const {
                  "  \"expert_bytes\": %llu,\n"
                  "  \"positions_scanned\": %lld,\n"
                  "  \"layers\": [\n",
-                 expert_stub_ ? "routers-only" : "full-forward",
+                 mode,
                  cfg_.model_path.c_str(),
                  src_size, src_mtime,
                  mc.arch.c_str(), mc.n_layer, ne, mc.n_expert_used,
                  static_cast<unsigned long long>(one),
-                 static_cast<long long>(expert_scan_tokens_));
+                 static_cast<long long>(tokens));
     for (i32 l = 0; l < mc.n_layer; l++) {
         const LayerWeights &L = model_.layers()[static_cast<size_t>(l)];
         if (!L.moe) continue;
-        const double *mass = expert_mass_.data() + static_cast<size_t>(l) * ne;
-        const u64 *hits = expert_hits_.data() + static_cast<size_t>(l) * ne;
+        const double *mass = mass_all + static_cast<size_t>(l) * ne;
+        const u64 *hits = hits_all + static_cast<size_t>(l) * ne;
         // Highest mass first, so a reader can take a prefix and know it is the
         // hot set without sorting.
         std::vector<i32> ord(static_cast<size_t>(ne));
@@ -3894,9 +3908,154 @@ void Engine::write_expert_index(const std::string &path) const {
     }
     std::fprintf(f, "  ]\n}\n");
     std::fclose(f);
-    KRK_INFO("expert scan: wrote %s (%lld positions, %s)", path.c_str(),
-             static_cast<long long>(expert_scan_tokens_),
-             expert_stub_ ? "routers only, experts stubbed" : "full forward");
+    KRK_INFO("expert index: wrote %s (%lld positions, %s)", path.c_str(),
+             static_cast<long long>(tokens), mode);
+}
+
+// ---- the expert index, read back ------------------------------------------
+// The file is the tier plan for every later load, so the engine reads it as
+// well as writes it. The geometry checks are the loader's, deliberately: a
+// second, looser set of them is how a ranking measured on other weights gets
+// applied to these.
+ExpertIndexRows expert_index_parse(const std::string &text, i32 n_layer,
+                                   i32 n_expert, const std::string &arch,
+                                   unsigned long long src_size) {
+    ExpertIndexRows out;
+    if (n_layer <= 0 || n_expert <= 0) return out;
+    const size_t cells = static_cast<size_t>(n_layer) *
+                         static_cast<size_t>(n_expert);
+    JsonValue root;
+    std::string err;
+    if (!json_parse(text, &root, &err) || !root.is_object()) return out;
+    std::string kind;
+    root.get_string("kind", &kind);
+    if (kind != "kraken-expert-index" || root.get_int("version", 0) != 1)
+        return out;
+    if (root.get_int("n_layer", -1) != n_layer ||
+        root.get_int("n_expert", -1) != n_expert)
+        return out;
+    std::string file_arch;
+    root.get_string("arch", &file_arch);
+    if (!file_arch.empty() && file_arch != arch) return out;
+    const i64 isz = root.get_int("source_size", -1);
+    // A zero on either side means "unknown" rather than "different": the
+    // 64-bit probe is what knows the size, and a fixture has no model file.
+    if (isz > 0 && src_size > 0 &&
+        static_cast<unsigned long long>(isz) != src_size)
+        return out;
+    out.mass.assign(cells, 0.0);
+    out.hits.assign(cells, 0);
+    out.tokens = root.get_int("positions_scanned", 0);
+    const JsonValue *layers = root.find("layers");
+    if (!layers || !layers->is_array()) return out;
+    for (const JsonValue &L : layers->items()) {
+        const i64 l = L.get_int("layer", -1);
+        if (l < 0 || l >= n_layer) continue;
+        const JsonValue *ex = L.find("experts");
+        if (!ex || !ex->is_array()) continue;
+        for (const JsonValue &E : ex->items()) {
+            const i64 e = E.get_int("e", -1);
+            if (e < 0 || e >= n_expert) continue;
+            const size_t cell = static_cast<size_t>(l) *
+                                    static_cast<size_t>(n_expert) +
+                                static_cast<size_t>(e);
+            out.mass[cell] = E.get_number("mass", 0.0);
+            out.hits[cell] = static_cast<u64>(E.get_int("hits", 0));
+        }
+    }
+    out.valid = true;
+    return out;
+}
+
+void expert_index_blend(ExpertIndexRows *old, i32 n_expert,
+                        const std::vector<double> &run_mass,
+                        const std::vector<u64> &run_hits, i64 run_tokens,
+                        double retain) {
+    if (!old || n_expert <= 0) return;
+    const size_t ne = static_cast<size_t>(n_expert);
+    const size_t cells = old->mass.size();
+    if (cells == 0 || cells % ne != 0 || run_mass.size() != cells) return;
+    if (run_hits.size() != cells) return;
+    if (retain < 0.0) retain = 0.0;
+    if (retain > 1.0) retain = 1.0;
+    const i64 old_tokens = old->tokens;
+    // The stored number is "summed probability over N positions". A blend of
+    // two distributions is scaled to the larger count so the field keeps
+    // meaning that, instead of shrinking every run and eventually reading as
+    // zero mass.
+    const i64 eff = std::max<i64>(std::max<i64>(old_tokens, run_tokens), 1);
+    for (size_t base = 0; base < cells; base += ne) {
+        double so = 0, sr = 0;
+        for (size_t e = 0; e < ne; e++) {
+            so += old->mass[base + e];
+            sr += run_mass[base + e];
+        }
+        // A row this run never routed through -- a dense layer, or a prompt
+        // that produced no positions there -- keeps what the file had. Blending
+        // it toward uniform would decay a real measurement for no reason.
+        if (sr <= 0.0) continue;
+        for (size_t e = 0; e < ne; e++) {
+            const double po = so > 0.0
+                                  ? old->mass[base + e] / so
+                                  : 1.0 / static_cast<double>(ne);
+            const double pr = run_mass[base + e] / sr;
+            old->mass[base + e] =
+                (retain * po + (1.0 - retain) * pr) * static_cast<double>(eff);
+            old->hits[base + e] += run_hits[base + e];
+        }
+    }
+    old->tokens = old_tokens + run_tokens;
+}
+
+void Engine::merge_expert_index(const std::string &path, double retain) const {
+    const ModelConfig &mc = model_.cfg();
+    if (!mc.is_moe || mc.n_expert <= 0) return;
+    const size_t cells = static_cast<size_t>(mc.n_layer) *
+                         static_cast<size_t>(mc.n_expert);
+    if (expert_mass_.size() < cells || expert_hits_.size() < cells) return;
+    if (expert_scan_tokens_ <= 0) {
+        KRK_INFO("expert adapt: no positions observed -- %s left alone",
+                 path.c_str());
+        return;
+    }
+    std::string text;
+    {
+        FILE *f = std::fopen(path.c_str(), "rb");
+        if (f) {
+            char buf[1 << 16];
+            size_t n = 0;
+            while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0)
+                text.append(buf, n);
+            std::fclose(f);
+        }
+    }
+    u64 src_size = 0;
+    if (!file_size(cfg_.model_path, &src_size)) src_size = 0;
+    ExpertIndexRows rows;
+    if (text.empty()) {
+        // First adapted run: the file it writes is this run's ranking, with
+        // the same header a scan writes, so the loader cannot tell them apart
+        // -- which is the point.
+        rows.mass.assign(cells, 0.0);
+        rows.hits.assign(cells, 0);
+        KRK_INFO("expert adapt: no index at %s -- writing this run's ranking",
+                 path.c_str());
+    } else {
+        rows = expert_index_parse(text, mc.n_layer, mc.n_expert, mc.arch,
+                                  src_size);
+        if (!rows.valid) {
+            KRK_WARN("expert adapt: %s does not describe this model -- "
+                     "refusing to merge, left alone", path.c_str());
+            return;
+        }
+    }
+    expert_index_blend(&rows, mc.n_expert, expert_mass_, expert_hits_,
+                       expert_scan_tokens_, retain);
+    write_expert_index_rows(path, rows.mass, rows.hits, rows.tokens,
+                            "scan+adapted");
+    KRK_INFO("expert adapt: merged %lld observed positions into %s "
+             "(retain %.2f)",
+             static_cast<long long>(expert_scan_tokens_), path.c_str(), retain);
 }
 
 // True when the ranked warmup should run. Split out from warm_experts()
@@ -4674,7 +4833,7 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // recorded for every expert, not just the k selected, because the
             // question the index answers is "what coverage does the top N buy",
             // and that needs the whole curve.
-            if (expert_scan_) {
+            if (expert_scan_ || expert_track_) {
                 double *mass = expert_mass_.data() +
                                static_cast<size_t>(layer) * static_cast<size_t>(ne);
                 for (i32 e = 0; e < ne; e++)
@@ -4753,7 +4912,7 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 sel[s] = best;
                 // The weight is the probability, never the biased score.
                 wt[s] = best >= 0 ? moe_prob_[static_cast<size_t>(best)] : 0.0f;
-                if (expert_scan_ && best >= 0)
+                if ((expert_scan_ || expert_track_) && best >= 0)
                     expert_hits_[static_cast<size_t>(layer) *
                                      static_cast<size_t>(ne) +
                                  static_cast<size_t>(best)] += 1;
@@ -6794,7 +6953,8 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         }
     }
     fetch_logits(device_topk);
-    if (expert_scan_) expert_scan_tokens_ += static_cast<i64>(ids.size());
+    if (expert_scan_ || expert_track_)
+        expert_scan_tokens_ += static_cast<i64>(ids.size());
     // The MTP probe runs here, on the prompt's last row, and before the decode
     // loop touches anything: it is a measurement of the head, not a decoder,
     // and generation continues exactly as it would have without it.
@@ -6900,7 +7060,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
             g_split_steps++;
         }
         // One token position folded into the routing statistics.
-        if (expert_scan_) expert_scan_tokens_++;
+        if (expert_scan_ || expert_track_) expert_scan_tokens_++;
     }
 
     emit.finish(res->finish == FinishStop);

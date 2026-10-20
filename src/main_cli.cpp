@@ -76,6 +76,7 @@ struct Args {
     bool profile = false;
     bool expert_scan = false;   // measure routing and write an expert index
     bool expert_stub = false;   // run the routers with every expert FFN removed
+    bool expert_adapt = false;  // fold this run's routing into the index
     int debug_topk = 0; // stderr dump of top-k logprobs per token
     // argmax on the host from the downloaded row, not on the device
     bool sample_host = false;
@@ -270,6 +271,13 @@ void usage() {
         "                        approximate; the two modes exist so they can\n"
         "                        be compared. On its own the flag does\n"
         "                        nothing, so it is refused rather than ignored\n"
+        "  --expert-adapt       fold this run's own routing into\n"
+        "                        <model>.krakenexperts.json when it ends, so the\n"
+        "                        next load's tier plan follows what the workload\n"
+        "                        actually ran. Runs overlap the scan and needs no\n"
+        "                        --expert-scan; a workload repeated converges on\n"
+        "                        its own hot set. KRK_EXPERT_RETAIN=<0..1> is the\n"
+        "                        weight the existing file keeps (default 0.5)\n"
         "  -v                    verbose logging\n"
         "  -h, --help            this message\n",
         kEngineName, kEngineVersion);
@@ -367,6 +375,7 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--profile") a->profile = true;
         else if (f == "--expert-scan") a->expert_scan = true;
         else if (f == "--expert-stub") a->expert_stub = true;
+        else if (f == "--expert-adapt") a->expert_adapt = true;
         else if (f == "--debug-topk")
             a->debug_topk = std::atoi(next("--debug-topk"));
         else if (f == "--sample-host")
@@ -1021,6 +1030,23 @@ struct PhaseClock {
     }
 };
 
+// How much of the existing expert index an --expert-adapt run keeps. 0.5 makes
+// two identical runs agree and a changed workload move the ranking within a
+// couple of runs; 1 would ignore the run and 0 would forget every earlier one.
+static double adapt_retain() {
+    const char *e = std::getenv("KRK_EXPERT_RETAIN");
+    if (!e || !e[0]) return 0.5;
+    char *end = nullptr;
+    const double v = std::strtod(e, &end);
+    if (end == e || v < 0.0 || v > 1.0) {
+        std::fprintf(stderr,
+                     "kraken: KRK_EXPERT_RETAIN='%s' is not a weight in "
+                     "[0,1] -- using 0.5\n", e);
+        return 0.5;
+    }
+    return v;
+}
+
 int main(int argc, char **argv) {
     PhaseClock ph;
     ph.mark("process start");
@@ -1097,6 +1123,7 @@ int main(int argc, char **argv) {
     ph.mark("backend create");
     Engine engine;
     engine.set_expert_scan(a.expert_scan, a.expert_stub);
+    if (a.expert_adapt) engine.set_expert_track(true);
     const f64 load_t0 = PhaseClock::now();
     if (!engine.init(be, cfg, &err)) {
         std::fprintf(stderr, "kraken: %s\n", err.c_str());
@@ -1228,6 +1255,9 @@ int main(int argc, char **argv) {
         // this is the same index a --prompt run would have written, just never
         // written. `--expert-scan --bench` was a no-op that looked like a pass.
         if (a.expert_scan) engine.write_expert_index(a.model + ".krakenexperts.json");
+        if (a.expert_adapt)
+            engine.merge_expert_index(a.model + ".krakenexperts.json",
+                                      adapt_retain());
         engine.shutdown();
         ph.mark("engine.shutdown");
         delete be;
@@ -1415,6 +1445,14 @@ int main(int argc, char **argv) {
         // targets) and on the free host tier, so the choice belongs at load
         // time, not here.
         engine.write_expert_index(a.model + ".krakenexperts.json");
+    }
+    if (a.expert_adapt) {
+        // After the run, beside the model: the tier plan this run's traffic
+        // implies, blended with whatever the last measurement wrote. Best
+        // effort -- a failed merge must not turn a good generation into an
+        // error code, and merge_expert_index already says why it refused.
+        engine.merge_expert_index(a.model + ".krakenexperts.json",
+                                  adapt_retain());
     }
 
     engine.shutdown();
