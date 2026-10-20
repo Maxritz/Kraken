@@ -6,6 +6,7 @@
 #include "krk/host_time.hpp"
 #include "krk/vram_guard.hpp"
 #include "krk/json.hpp" // the expert index reader (warm_experts)
+#include "krk/spec_sampling.hpp" // the sampled round's accept/reject rule
 #include "par_pool.hpp"
 
 #include <algorithm>
@@ -50,6 +51,18 @@ namespace {
 // drains that a decode token can pay for. KRK_ROUTER_SYNC restores the explicit
 // hipDeviceSynchronize that moe_ffn used to issue before it pulled the router
 // row (40 per token); KRK_SYNC_EXPERT inserts one after each expert acquire.
+// KRK_SWA_OFF=1 treats every layer as full attention. The A/B arm for the
+// windowed prefill path: below the window length the window and no window are
+// the same computation, so a text difference between the two arms is a defect
+// in that path rather than a policy difference.
+static bool swa_off() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_SWA_OFF");
+        return e && e[0] != '0';
+    }();
+    return v;
+}
+
 bool router_sync() {
     static const bool on = [] {
         const char *v = std::getenv("KRK_ROUTER_SYNC");
@@ -417,6 +430,33 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // the hot path's *shape*, not its math: nothing here is compiled out, it
     // just does nothing unless the variable is set.
     if (const char *dump = std::getenv("KRK_DUMP")) dump_path_ = dump;
+    // KRK_DUMP_ROUTE=1: one line per (layer, token) with the selected
+    // experts and their mix weights -- the router is the half of a MoE
+    // mismatch that moe.sum cannot show.
+    if (const char *r = std::getenv("KRK_DUMP_ROUTE"))
+        dump_route_ = r[0] != '0';
+    // Residency preference in the router: --router-resident <margin>, or
+    // KRK_ROUTER_TIE_MARGIN for the A/B. Off unless a positive margin is asked
+    // for, because it changes the route and therefore the text.
+    router_pref_ = false;
+    router_tie_margin_ = 0.0f;
+    if (const char *e = std::getenv("KRK_ROUTER_TIE_MARGIN")) {
+        const f32 m = static_cast<f32>(std::atof(e));
+        if (m > 0.0f) {
+            router_tie_margin_ = m;
+            router_pref_ = true;
+        }
+    }
+    if (cfg_.router_tie_margin >= 0.0f) {
+        router_tie_margin_ = cfg_.router_tie_margin;
+        router_pref_ = router_tie_margin_ > 0.0f;
+    }
+    if (router_pref_)
+        KRK_INFO("router: a pick within %.1f%% of the top score goes to a resident "
+                 "expert (VRAM, then WARM) instead",
+                 static_cast<f64>(router_tie_margin_) * 100.0);
+    trace_hash_on_ = cfg.trace_hash;
+    trace_stage_.clear();
     // Size the CPU worker pool before the first forward pass.
     // 0 (the default) keeps the pool's own sizing: one worker per
     // hardware thread minus the calling thread.
@@ -431,6 +471,32 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // On failure the caller still owns `be` and will delete it. Release whatever
     // the partial load mapped through the (still valid) backend, then detach both
     // pointers so no later unload touches the freed backend.
+    // Dense-weight residency has to be decided before the first tensor is
+    // uploaded, so the budget travels with the Model rather than the Engine.
+    // 0 is automatic; a negative --weight-vram-mb (or KRK_WEIGHT_STREAM=0)
+    // means "never stream" and is passed as an unreachable budget.
+    {
+        size_t wb = 0;
+        if (cfg_.weight_vram_mb > 0) {
+            wb = static_cast<size_t>(cfg_.weight_vram_mb) << 20;
+        } else {
+            const char *env = std::getenv("KRK_WEIGHT_VRAM_MB");
+            if (env && *env) {
+                const long long v = std::atoll(env);
+                if (v > 0) wb = static_cast<size_t>(v) << 20;
+            }
+        }
+        // A negative flag, or KRK_WEIGHT_STREAM=0, disables streaming: the
+        // budget becomes unreachable rather than 0, because 0 is "auto".
+        const char *off = std::getenv("KRK_WEIGHT_STREAM");
+        if (cfg_.weight_vram_mb < 0 || (off && off[0] == '0'))
+            wb = std::numeric_limits<size_t>::max();
+        model_.set_weight_budget(wb);
+    }
+    // The nextn block is parsed during load, so the request has to travel with
+    // the Model rather than be read afterwards.
+    model_.set_mtp_load(cfg.mtp_probe || cfg.mtp_spec || !cfg.mtp_path.empty());
+    model_.set_mtp_path(cfg.mtp_path);
     if (!model_.load(*be_, cfg.model_path, err)) {
         model_.unload();
         be_ = nullptr;
@@ -617,6 +683,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         if (!check_alloc(ws_scale_, "ws_scale")) return false;
         router_host_.resize(static_cast<size_t>(C) * static_cast<size_t>(mc.n_expert));
         moe_prob_.resize(static_cast<size_t>(mc.n_expert));
+        moe_logit_.resize(static_cast<size_t>(mc.n_expert));
         moe_sel_.resize(static_cast<size_t>(C) * static_cast<size_t>(k));
         // Only sized when a scan is actually requested: [n_layer * n_expert]
         // doubles and u64 counters, which is 3584 * 12 B = 43 kB for a
@@ -633,6 +700,116 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         group_wt_.reserve(static_cast<size_t>(C));
         plan_dev_.reserve(static_cast<size_t>(C));
         alpha_dev_.reserve(static_cast<size_t>(C));
+    }
+
+    // ---- nextn (MTP) probe: its own KV plane and the hidden capture --------
+    // Allocated before the expert cache and the KV tier, which both size
+    // themselves against what is left: a probe that quietly shrinks the tiers
+    // it is measured beside would measure a different machine.
+    mtp_probe_ = false;
+    mtp_spec_ = false;
+    mtp_probe_report_ = cfg_.mtp_probe;
+    if (cfg_.mtp_probe || cfg_.mtp_spec) {
+        const MtpBlock &m = model_.mtp();
+        const i64 bq = static_cast<i64>(m.n_head) * m.head_dim;
+        const i64 bkv = static_cast<i64>(m.n_head_kv) * m.head_dim;
+        const i32 kmain = std::max<i32>(1, mc.n_expert_used);
+        const char *why = nullptr;
+        if (!m.present)
+            why = "the file's nextn block is not loaded";
+        else if (m.wq.n_out != bq && m.wq.n_out != 2 * bq)
+            why = "the query projection is neither q nor 2*q wide";
+        else if (m.wq.n_out == 2 * bq && q_proj_ != 2 * q_dim_)
+            why = "the block packs an output gate and this engine's query "
+                  "workspace does not";
+        else if (bq > q_dim_ || bkv > kv_dim_)
+            why = "the block's head geometry is wider than the stack's "
+                  "workspaces";
+        else if (m.n_expert > 0 &&
+                 (!mc.is_moe || m.n_expert > mc.n_expert ||
+                  m.n_expert_used > chunk_ * kmain))
+            why = "the block's expert geometry does not fit the MoE workspaces";
+        else if (m.n_expert == 0 && m.n_ff == 0)
+            why = "the block has neither routed experts nor a dense FFN";
+        else if (m.n_ff_exp > ff_ws || m.n_ff_shexp > ff_ws || m.n_ff > ff_ws)
+            why = "the block's FFN is wider than the FFN workspaces";
+        if (why) {
+            KRK_WARN("mtp probe: off -- %s", why);
+        } else {
+            mtp_kv_dim_ = bkv;
+            mtp_kv_k_ = alloc(static_cast<size_t>(kv_cap_ * mtp_kv_dim_) * as);
+            mtp_kv_v_ = alloc(static_cast<size_t>(kv_cap_ * mtp_kv_dim_) * as);
+            mtp_hidden_ = alloc(static_cast<size_t>(kv_cap_ * n_embd_) * as);
+            mtp_h_ = alloc(static_cast<size_t>(n_embd_) * as);
+            mtp_e_ = alloc(static_cast<size_t>(n_embd_) * as);
+            mtp_cat_ = alloc(static_cast<size_t>(2 * n_embd_) * as);
+            mtp_gate_ = alloc(static_cast<size_t>(q_dim_) * as);
+            mtp_sgate_ = alloc(as);
+            mtp_rep_ = alloc(sizeof(i32));
+            if (!mtp_kv_k_ || !mtp_kv_v_ || !mtp_hidden_ || !mtp_h_ || !mtp_e_ ||
+                !mtp_cat_ || !mtp_gate_ || !mtp_sgate_ || !mtp_rep_) {
+                for (void **p : {&mtp_kv_k_, &mtp_kv_v_, &mtp_hidden_, &mtp_h_,
+                                 &mtp_e_, &mtp_cat_, &mtp_gate_, &mtp_sgate_,
+                                 &mtp_rep_})
+                    if (*p) {
+                        be_->release(*p);
+                        *p = nullptr;
+                    }
+                KRK_WARN("mtp probe: off -- its %.1f MiB of capture and block KV "
+                         "could not be allocated; the run continues without it",
+                         (static_cast<f64>(kv_cap_ * n_embd_) * as +
+                          static_cast<f64>(2 * kv_cap_ * mtp_kv_dim_) * as) /
+                             1048576.0);
+            } else {
+                be_->fill0(mtp_rep_, sizeof(i32));
+                mtp_tok_.assign(static_cast<size_t>(kv_cap_), -1);
+                mtp_probe_ = true;
+                mtp_spec_ = cfg_.mtp_spec;
+                // A speculative round proposes up to this many tokens; with no
+                // --draft-tokens the same default a draft engine gets applies.
+                if (mtp_spec_ && draft_tokens_ <= 0) draft_tokens_ = 4;
+                // A hybrid target needs its recurrent state snapshotted per
+                // round: the delta rule cannot be rewound, so a rejected
+                // suffix is undone by restoring this and replaying the
+                // accepted prefix. Sized exactly as the state itself.
+                if (mtp_spec_ && model_.is_recurrent() && rec_state_) {
+                    mtp_rec_snap_bytes_ =
+                        static_cast<size_t>(rec_layers_) *
+                        static_cast<size_t>(mamba2_state_span_ > 0
+                            ? mamba2_state_span_ : rec_state_span_) *
+                        sizeof(f32);
+                    mtp_conv_snap_bytes_ =
+                        static_cast<size_t>(rec_layers_) *
+                        static_cast<size_t>(conv_state_span_) * sizeof(f32);
+                    mtp_rec_snap_ = alloc(mtp_rec_snap_bytes_);
+                    mtp_conv_snap_ = alloc(mtp_conv_snap_bytes_);
+                    if (!mtp_rec_snap_ || !mtp_conv_snap_) {
+                        if (mtp_rec_snap_) { be_->release(mtp_rec_snap_); mtp_rec_snap_ = nullptr; }
+                        if (mtp_conv_snap_) { be_->release(mtp_conv_snap_); mtp_conv_snap_ = nullptr; }
+                        mtp_rec_snap_bytes_ = mtp_conv_snap_bytes_ = 0;
+                        KRK_WARN("mtp spec: off -- the %.1f MiB recurrent-state "
+                                 "snapshot could not be allocated",
+                                 (static_cast<f64>(
+                                      static_cast<i64>(rec_layers_) *
+                                      (mamba2_state_span_ > 0 ? mamba2_state_span_
+                                                              : rec_state_span_) +
+                                      static_cast<i64>(rec_layers_) *
+                                          conv_state_span_) * 4.0) / 1048576.0);
+                        mtp_spec_ = false;
+                    }
+                }
+                KRK_INFO("mtp probe: block %d -> %d head(s) x %d + %d kv head(s), "
+                         "%d experts x top-%d, eh_proj %lldx%lld; %.1f MiB hidden "
+                         "capture + %.1f MiB block KV",
+                         m.layer, m.n_head, m.head_dim, m.n_head_kv, m.n_expert,
+                         m.n_expert_used,
+                         static_cast<long long>(m.eh_proj.n_in),
+                         static_cast<long long>(m.eh_proj.n_out),
+                         (static_cast<f64>(kv_cap_ * n_embd_) * as) / 1048576.0,
+                         (static_cast<f64>(2 * kv_cap_ * mtp_kv_dim_) * as) /
+                             1048576.0);
+            }
+        }
     }
 
     // Fail before the first forward can read or write a missing workspace.
@@ -946,6 +1123,73 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // one. See EngineConfig::expert_warmup for when it engages.
     if (expert_warmup_wanted()) warm_experts();
 
+    // ---- the expert pool must not fill the card ---------------------------
+    // Its budget is decided before the KV cache and before this engine's own
+    // workspaces exist, so it can name every byte that was free at that moment
+    // and leave the run with 0.00 GiB free. That is not merely slow, it is
+    // pathological, and it is measured: on Tiel-Coder-35B-A3B (Q5_K_XL, 256
+    // experts, top-8, 22.1 GiB routed, ctx 4096, 16 tokens) a 2.2 MiB pool cell
+    // costs 30 ms to allocate once the card is full (3.1 tok/s) and 0.29 ms
+    // with 2.27 GiB free (15.8 tok/s) -- the allocator, not the model, and the
+    // same weights produce the same text either way. On Windows a full card is
+    // also what stalls the compositor while the driver evicts pages.
+    //
+    // This runs after the warmup has filled the tiers, so `resident_bytes()` is
+    // a fact and so is `device_free_bytes()`. The cap allows growth only into
+    // room that is really free beside the floor: past it the cache evicts and
+    // reuses instead of allocating, which is the path it is built for.
+    // The CPU backend has no device/host split (every byte is host RAM), so a
+    // VRAM floor there is a cap on nothing -- measured: it clamped the suite's
+    // CPU MoE fixtures to a zero-byte expert cache.
+    if (be_->kind() != BackendKind::CPU && be_->device_total_bytes() > 0 &&
+        model_.experts().vram_budget() > 0) {
+        const size_t total = be_->device_total_bytes();
+        const size_t floor = krk::vram_floor_bytes(total);
+        const size_t free_now = be_->device_free_bytes();
+        const size_t live = model_.experts().resident_bytes();
+        const size_t room = free_now > floor ? free_now - floor : 0;
+        const size_t cap = live + room;
+        const size_t before = model_.experts().vram_budget();
+        if (cap < before) {
+            model_.experts().set_vram_budget(cap);
+            KRK_INFO("expert cache: budget clamped %.0f -> %.0f MiB (%.0f MiB "
+                     "resident plus %.0f MiB really free beside a %.0f MiB "
+                     "floor). The budget is planned before the KV cache and the "
+                     "workspaces exist; this one is measured after them.",
+                     static_cast<f64>(before) / 1048576.0,
+                     static_cast<f64>(cap) / 1048576.0,
+                     static_cast<f64>(live) / 1048576.0,
+                     static_cast<f64>(room) / 1048576.0,
+                     static_cast<f64>(floor) / 1048576.0);
+        }
+    }
+
+    // A speculative round runs the block up to `--draft-tokens` times per
+    // target forward, and the block is ONE layer, so its experts fit even when
+    // the stack's routed set does not. Admitting them once and pinning them is
+    // what keeps the propose pass off the promotion path (measured: 11% of the
+    // block's acquires promoted while the stack churned). KRK_MTP_PIN=0 is the
+    // A/B arm; a set that does not fit is reported and left on the normal
+    // policy rather than thrashing a pin it cannot defend.
+    // Only a routed block has anything to pin; a dense block's FFN is loaded
+    // with the rest of the block and never pages.
+    if (mtp_spec_ && model_.mtp().present && model_.mtp().n_expert > 0)
+        mtp_pin_experts();
+
+    // An external draft head named in the config loads here: the KV cache and
+    // the workspaces exist, so its hidden capture can be sized, and the first
+    // forward has not run. A head that was asked for and cannot load is a
+    // refusal -- silently running plainly would answer a different command --
+    // and the CLI's own call after init then finds it already loaded.
+    if (!cfg_.draft_head.empty()) {
+        std::string why;
+        if (!load_draft_head(cfg_.draft_head, &why)) {
+            if (err) *err = why;
+            shutdown();
+            return false;
+        }
+    }
+
     if (cfg_.warmup) {
         const i32 t = tok_.bos() >= 0 ? tok_.bos() : 0;
         const Timer w;
@@ -964,6 +1208,7 @@ void Engine::shutdown() {
     // The draft shares the backend; it must release its allocations before
     // this engine tears the backend's other buffers down.
     unload_dflash();
+    unload_draft_head();
     unload_draft();
     if (!be_) {
         model_.unload();
@@ -978,7 +1223,10 @@ void Engine::shutdown() {
                      &ws_scale_,
                      &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
                      &ws_m2in_,
-                     &conv_state_, &rec_state_, &topk_scratch_, &topk_out_}) {
+                     &conv_state_, &rec_state_, &topk_scratch_, &topk_out_,
+                     &mtp_kv_k_, &mtp_kv_v_, &mtp_hidden_, &mtp_h_, &mtp_e_,
+                     &mtp_cat_, &mtp_gate_, &mtp_sgate_, &mtp_rep_,
+                     &mtp_rec_snap_, &mtp_conv_snap_}) {
         if (*p) {
             be_->release(*p);
             *p = nullptr;
@@ -989,8 +1237,33 @@ void Engine::shutdown() {
     // be_ is still valid, or their destructors call into freed memory.
     kvt_k_.detach();
     kvt_v_.detach();
+    mtp_probe_ = false;
+    mtp_spec_ = false;
+    mtp_probe_report_ = false;
+    mtp_captured_ = 0;
+    mtp_fed_ = 0;
+    mtp_kv_dim_ = 0;
+    mtp_tok_.clear();
     host_free(logits_host_);
     logits_host_ = nullptr;
+    if (model_.promoted_layers())
+        KRK_INFO("weight residency: %llu layer(s) promoted resident on first "
+                 "use (%.2f GiB, %.0f ms of one-off staging) -- only what did "
+                 "not fit stayed streamed",
+                 static_cast<unsigned long long>(model_.promoted_layers()),
+                 static_cast<f64>(model_.promoted_bytes()) / 1073741824.0,
+                 model_.promote_ms());
+    if (model_.stage_calls())
+        KRK_INFO("weight stream: %llu layer staging(s), %.2f GiB from the file, "
+                 "%.0f ms (%.2f GB/s) = drain %.0f + read %.0f + copy %.0f ms",
+                 static_cast<unsigned long long>(model_.stage_calls()),
+                 static_cast<f64>(model_.stage_bytes()) / 1073741824.0,
+                 model_.stage_ms(),
+                 static_cast<f64>(model_.stage_bytes()) /
+                     (model_.stage_ms() > 0.0 ? model_.stage_ms() / 1000.0 : 1.0) /
+                     1073741824.0,
+                 model_.stage_sync_ms(), model_.stage_read_ms(),
+                 model_.stage_xfer_ms());
     model_.unload();
     be_ = nullptr;
 }
@@ -1071,6 +1344,46 @@ void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
         std::fprintf(f, " %.7g", vals[static_cast<size_t>(i)]);
     std::fputc('\n', f);
     std::fclose(f);
+}
+
+void Engine::trace_rows(const char *what, i32 layer, const void *buf,
+                        i64 width, i64 rows) {
+    if (!trace_hash_on_ || rows <= 0 || width <= 0) return;
+    be_->sync();
+    // EVERY row: a chunk of N rows must leave the same bytes as N single-row
+    // calls, and the row that differs is usually not the last one.
+    std::vector<f32> vals(static_cast<size_t>(rows) *
+                          static_cast<size_t>(width));
+    be_->download_f32(vals.data(),
+                      act_at(const_cast<void *>(buf), be_->act_size(), 0),
+                      static_cast<i64>(vals.size()));
+    // Folded per (stage, layer). Within one stage the rows arrive in prompt
+    // order whichever way the chunks grouped them; the stages are combined in
+    // key order by prefill_trace_hash().
+    const std::string key = format("%s L%02d", what, layer);
+    u64 h = trace_stage_[key];
+    for (f32 v : vals) {
+        u32 bits;
+        std::memcpy(&bits, &v, sizeof bits);
+        h ^= bits;
+        h *= 1099511628211ull;
+    }
+    trace_stage_[key] = h;
+}
+
+u64 Engine::prefill_trace_hash() const {
+    u64 h = 1469598103934665603ull;
+    for (const auto &kv : trace_stage_) { // std::map iterates in key order
+        for (char c : kv.first) {
+            h ^= static_cast<unsigned char>(c);
+            h *= 1099511628211ull;
+        }
+        for (int b = 0; b < 8; b++) {
+            h ^= (kv.second >> (b * 8)) & 0xffull;
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
 }
 
 // prism.hadamard (Backend::hadamard_act): dst <- the transform of src.
@@ -1160,10 +1473,18 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     // exactly one line per stage, and the first differing line names the layer.
     auto dump_stage = [&](const char *what, i32 layer) {
         dump_row(what, layer, ws_x_, n_embd_, n);
+        // The same row-local checkpoints feed the bit-exactness trace. A
+        // frozen chunk boundary anywhere above this point shows in `attn` of
+        // this layer even when the f16 residual would have absorbed it.
+        trace_rows(what, layer, ws_x_, n_embd_, n);
     };
     dump_stage("embed", -1);
 
     for (i32 l = 0; l < mc.n_layer; l++) {
+        // Refill the streaming ring for this layer when it is not resident.
+        // A resident layer is a no-op, and the copy is ordered on the default
+        // stream ahead of every kernel that reads the weights.
+        model_.stage_layer(l);
         const LayerWeights &L = layers[static_cast<size_t>(l)];
         // Per-layer geometry. A hybrid stack (laguna) alternates two layer
         // kinds with different head counts and different rotary tables, so the
@@ -1200,6 +1521,16 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // A sliding-window layer sees only its last `swa_window` keys; the full
         // layers of the same stack see the whole prefix.
         d.window = (mc.swa_window > 0 && model_.is_swa(l)) ? mc.swa_window : 0;
+        // KRK_SWA_OFF=1 runs every layer as full attention. It is the A/B arm
+        // for the windowed path and nothing else: for a prompt shorter than
+        // the window the two are the same computation, so a model that answers
+        // differently with it on has a window bug and not a window policy.
+        if (swa_off() && d.window > 0) d.window = 0;
+        // Per-layer sinks: the pointer travels with the descriptor into every
+        // attention arm (decode, split, exact prefill, tiled). The fused
+        // chain refuses it and the engine takes the separate chain instead,
+        // which is a few extra launches on a sink model and nothing else.
+        d.sinks = L.sinks;
         dump_stage("enter", l);
 
         be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, n, n_embd_, mc.rms_eps,
@@ -1426,12 +1757,22 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // it is a different buffer with a different width (q_dim), so it gets
         // its own transform -- after the gate above has finished reading
         // ws_had_.
+        // The raw attention output, before its projection: the stage where a
+        // key-space reduction order shows first, and the one the tiled kernel
+        // used to differ at. Both chains write it, so one call here covers a
+        // 1-row call (the fused chain) and a multi-row one (the separate chain).
+        trace_rows("attn.out", l, ws_attn_, lq, n);
         const void *attn_in = ws_attn_;
         if (L.h_attn_out) {
             had_xform(ws_had_, ws_attn_, n, lq, false, false);
             attn_in = ws_had_;
         }
         be_->gemm(ws_x2_, attn_in, L.wo.data, L.wo.type, n_embd_, lq, n);
+        // gpt-oss biases the attention output: one value per output channel,
+        // applied to the projection's result before it joins the residual. A
+        // broadcast over the rows of the GEMM output, which is exactly the
+        // `add_bias_cols` shape (n rows of n_embd columns).
+        if (L.wo_bias) be_->add_bias_cols(ws_x2_, L.wo_bias, n, n_embd_);
         dump_row("attn.proj", l, ws_x2_, n_embd_, n);
         // The attention residual and the FFN norm are one kernel: the sum is
         // what the norm's sum-of-squares pass reads, so a second launch
@@ -1468,6 +1809,13 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         }
         dump_stage("attn", l);
     }
+    // The MTP probe's feature rows: the same pre-final-norm state DFlash
+    // captures, but for every position of this pass. The block has its own
+    // attention, so it needs the whole prompt -- one row is not enough.
+    mtp_capture(toks, pos0, n);
+    // The external head reads the same row, for every position it may propose
+    // from -- not only the last one.
+    head_capture(toks, pos0, n);
     // The pre-final-norm state, which a capture list names with the id
     // `mc.n_layer`: the input of the block that does not exist. It is what the
     // drafter's last feature block reads.
@@ -1523,6 +1871,488 @@ void Engine::dflash_capture(i32 layer, i32 n) {
         be_->copy_act(dflash_->capture_slot(static_cast<i32>(a)), ws_x_,
                       static_cast<i64>(n) * n_embd_);
     }
+}
+
+// ---- nextn (MTP) probe -----------------------------------------------------
+
+// The probe needs the target's hidden state at EVERY prompt position, not just
+// the last one: the block has its own attention, so it has to walk the prompt
+// and build its own KV plane before it can predict anything from the end of it.
+// Captured at the pre-final-norm point -- the same row DFlash captures for its
+// last feature block -- because that is what a nextn head is trained against.
+void Engine::mtp_capture(const i32 *toks, i32 pos0, i32 n) {
+    if (!mtp_probe_ || !mtp_hidden_ || n <= 0 || toks == nullptr) return;
+    const i64 end = static_cast<i64>(pos0) + n;
+    if (pos0 < 0 || end > kv_cap_) return;
+    const size_t as = be_->act_size();
+    be_->copy_act(act_at(mtp_hidden_, as, static_cast<i64>(pos0) * n_embd_),
+                  ws_x_, static_cast<i64>(n) * n_embd_);
+    for (i32 i = 0; i < n; i++)
+        mtp_tok_[static_cast<size_t>(pos0 + i)] = toks[i];
+    mtp_captured_ = end;
+}
+
+// The block's expert tensors as an ExpertSource: the cache is keyed on
+// (layer, expert) and knows nothing about which struct a layer lives in, so a
+// nextn block pages through the same budget as any stack layer.
+static ExpertSource mtp_source(const MtpBlock &m) {
+    ExpertSource src;
+    src.gate = m.exps_gate;
+    src.up = m.exps_up;
+    src.down = m.exps_down;
+    src.n_expert = m.n_expert;
+    src.n_embd = m.n_embd;
+    src.n_ff_exp = m.n_ff_exp;
+    return src;
+}
+
+// The block's experts through the stack's own policy, or pinned?
+//
+// KRK_MTP_PIN=1 keeps the nextn block's routed set device-resident.
+//
+// A speculative round runs the block up to --draft-tokens times per target
+// forward, and the block's set is ONE layer's worth (256 experts, 816 MiB), so
+// it fits even when the stack's 22 GiB does not. Left to the LRU it is cold
+// often enough to pay a promotion per proposal; pinned, the propose pass and the
+// refeed both become hits.
+//
+// **It is off by default because the A/B says the trade is a wash.** Measured on
+// Tiel (ctx 4096, greedy, 48 tokens, k=2, 5 interleaved order-balanced pairs):
+// propose 186-229 -> 134-135 ms, refeed 81-123 -> 32-34 ms, block acquires
+// 157-256 ms -> 0 -- about 120 ms of block work removed -- but the pin holds 816
+// of the 7594 MiB device budget, so the target's own promotions cost 105-180 ms
+// more and tokens/s is 8.7 against 8.9 (median pair delta -0.2, the one pair
+// that favoured the pin was the slowest unpinned run). Text is identical in all
+// ten runs (`7ff494bbf10e`), so this is a residency trade, not arithmetic.
+// Worth turning on where the block's share of the run is larger than it is here
+// (more proposals per round, a cheaper target): it is a measured 33% cut of the
+// propose pass, and the cost is the target's, not correctness.
+bool Engine::mtp_pin_experts() {
+    static const bool wanted = [] {
+        const char *e = std::getenv("KRK_MTP_PIN");
+        return e && e[0] == '1';
+    }();
+    if (!wanted) return false;
+    const MtpBlock &m = model_.mtp();
+    std::string why;
+    const size_t added = model_.experts().pin_layer(mtp_source(m), m.layer, &why);
+    if (added == 0) {
+        KRK_INFO("mtp spec: the block's %d expert(s) stay on the LRU policy -- "
+                 "%s",
+                 m.n_expert, why.empty() ? "nothing to pin" : why.c_str());
+        return false;
+    }
+    return true;
+}
+
+void Engine::mtp_embed(i32 tok) {
+    const ModelConfig &mc = model_.cfg();
+    const QuantTensor &embd = model_.tok_embd();
+    be_->embed(mtp_e_, embd.data, embd.type, mc.n_vocab, mc.n_embd, &tok, 1);
+    if (model_.had().embd_inverse)
+        had_xform(mtp_e_, mtp_e_, 1, n_embd_, /*inverse=*/true,
+                  /*gdn_perm=*/false);
+}
+
+// Walk the block over the captured positions the target has already computed.
+// A speculative round leaves block rows that were built from the block's own
+// hidden state for tokens the target later rejected, so the accepted prefix is
+// re-fed here from the CAPTURED TARGET rows -- that is the whole "keep the
+// block's KV in step" contract. It returns false when a position has no
+// captured row, which means the caller's position bookkeeping is wrong; the
+// caller refuses rather than drafting from a gap.
+bool Engine::mtp_prime(i64 pos) {
+    const MtpBlock &m = model_.mtp();
+    const i64 end = std::min<i64>(pos, mtp_captured_);
+    if (end < mtp_fed_) return false;
+    const size_t as = be_->act_size();
+    for (i64 p = mtp_fed_; p < end; p++) {
+        const i32 tok = mtp_tok_[static_cast<size_t>(p)];
+        if (tok < 0) return false;
+        mtp_embed(tok);
+        be_->copy_act(mtp_h_, act_at(mtp_hidden_, as, p * n_embd_), n_embd_);
+        if (!mtp_block_forward(m, static_cast<i32>(p), false)) return false;
+    }
+    mtp_fed_ = end;
+    return end == pos;
+}
+
+// The block's own routed + shared expert FFN. It goes through the same
+// ExpertCache as a stack layer, keyed on the block's own index, so its experts
+// page in and out of the same budget. `ws_xn_` is the block's post-attention
+// norm output; the result lands in ws_x_ through the residual contract.
+// The block's dense FFN, for the nextn heads that carry ffn_gate/up/down rather
+// than routed banks (the qwen35 dense family). It reads `ws_xn_` -- the
+// post-attention norm output the stack's own layers read -- and adds its result
+// into `ws_ffn_` at that buffer's exponent, so the caller's single residual add
+// covers this and the shared expert together.
+void Engine::mtp_dense_ffn(const MtpBlock &m, i32 n, void *acc, i32 *exp) {
+    const i64 ff = m.n_ff;
+    if (ff <= 0 || !m.ffn_up.present() || !m.ffn_down.present()) return;
+    if (m.ffn_gate.present()) {
+        bool fused = false;
+        void *gout[2] = {ws_gate_, ws_up_};
+        const void *gw[2] = {m.ffn_gate.data, m.ffn_up.data};
+        const i64 gno[2] = {ff, ff};
+        const DType gwts[2] = {m.ffn_gate.type, m.ffn_up.type};
+        be_->gemm_group(gout, ws_xn_, gw, m.ffn_gate.type, gno, n_embd_, 2, n,
+                        true, &fused, false, gwts);
+        if (!fused) be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * ff);
+    } else {
+        be_->gemm(ws_up_, ws_xn_, m.ffn_up.data, m.ffn_up.type, ff, n_embd_, n);
+        be_->copy_act(ws_gate_, ws_up_, n * ff);
+        be_->sigmoid_act(ws_gate_, n * ff);
+        be_->mul_act(ws_gate_, ws_up_, n * ff);
+    }
+    be_->gemm(ws_x2_, ws_gate_, m.ffn_down.data, m.ffn_down.type, n_embd_, ff, n);
+    be_->add_residual(acc, ws_x2_, n, n_embd_, exp);
+}
+
+void Engine::mtp_ffn(const MtpBlock &m, i32 n) {
+    const ModelConfig &mc = model_.cfg();
+    const size_t as = be_->act_size();
+    const i32 ne = m.n_expert;
+    const i32 k = std::min<i32>(m.n_expert_used > 0 ? m.n_expert_used : ne, ne);
+    const i64 ff = m.n_ff_exp;
+    const i64 ff_sh = m.n_ff_shexp;
+
+    // `ws_ffn_` exists only on a model with routed experts. A dense model has
+    // no MoE workspace, and a block must not memset a buffer that is not there:
+    // on a dense nextn block that was hipMemset(NULL) -> hipErrorInvalidValue
+    // before the first token. With no accumulator the block's FFN adds straight
+    // onto the residual, with the same exponent bookkeeping the attention add
+    // used.
+    void *acc = ws_ffn_ ? ws_ffn_ : ws_x_;
+    i32 *exp = static_cast<i32 *>(ws_ffn_ ? ws_fexp_ : mtp_rep_);
+    if (ws_ffn_) {
+        be_->fill0(ws_ffn_,
+                   static_cast<size_t>(n) * static_cast<size_t>(n_embd_) * as);
+        be_->fill0(ws_fexp_, static_cast<size_t>(n) * sizeof(i32));
+    }
+    // A block with no router is dense (or broken); the dense FFN is what it
+    // contributes, and a block with neither adds nothing rather than a zero
+    // expert set silently standing in for one.
+    const bool routed = m.router.present() && ne > 0 && k > 0 && ff > 0;
+    if (!routed) {
+        mtp_dense_ffn(m, n, acc, exp);
+    } else {
+
+        // Routing runs on the host, exactly as a stack layer's does: the logits are
+        // tiny and the selection is what builds the plan.
+        be_->gemm(ws_router_, ws_xn_, m.router.data, m.router.type, ne, n_embd_, n);
+        be_->sync();
+        be_->download_f32(router_host_.data(), ws_router_, static_cast<i64>(n) * ne);
+
+        std::vector<i32> sel(static_cast<size_t>(n) * static_cast<size_t>(k), -1);
+        std::vector<f32> wt(static_cast<size_t>(n) * static_cast<size_t>(k), 0.0f);
+        std::vector<f32> prob(static_cast<size_t>(ne), 0.0f);
+        for (i32 t = 0; t < n; t++) {
+            const f32 *logits = router_host_.data() + static_cast<i64>(t) * ne;
+            if (mc.router_sigmoid) {
+                for (i32 e = 0; e < ne; e++)
+                    prob[static_cast<size_t>(e)] = 1.0f / (1.0f + std::exp(-logits[e]));
+            } else {
+                f32 mx = logits[0];
+                for (i32 e = 1; e < ne; e++) mx = std::max(mx, logits[e]);
+                f32 sum = 0.0f;
+                for (i32 e = 0; e < ne; e++) {
+                    prob[static_cast<size_t>(e)] = std::exp(logits[e] - mx);
+                    sum += prob[static_cast<size_t>(e)];
+                }
+                const f32 inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                for (i32 e = 0; e < ne; e++) prob[static_cast<size_t>(e)] *= inv;
+            }
+            i32 *tsel = sel.data() + static_cast<size_t>(t) * k;
+            f32 *twt = wt.data() + static_cast<size_t>(t) * k;
+            for (i32 s = 0; s < k; s++) {
+                i32 best = -1;
+                f32 bestp = -1.0f;
+                for (i32 e = 0; e < ne; e++) {
+                    bool taken = false;
+                    for (i32 p = 0; p < s; p++)
+                        if (tsel[p] == e) { taken = true; break; }
+                    if (taken) continue;
+                    const f32 score = prob[static_cast<size_t>(e)] +
+                                      (m.router_bias ? m.router_bias[static_cast<size_t>(e)] : 0.0f);
+                    if (score > bestp) { bestp = score; best = e; }
+                }
+                tsel[s] = best;
+                twt[s] = best >= 0 ? prob[static_cast<size_t>(best)] : 0.0f;
+            }
+            if (mc.expert_w_norm != 0) {
+                f32 ksum = 0.0f;
+                for (i32 s = 0; s < k; s++) ksum += twt[s];
+                const f32 kinv = ksum > 0.0f ? 1.0f / ksum : 0.0f;
+                for (i32 s = 0; s < k; s++) twt[s] *= kinv;
+            }
+            if (mc.expert_w_scale != 0.0f && mc.expert_w_scale != 1.0f)
+                for (i32 s = 0; s < k; s++) twt[s] *= mc.expert_w_scale;
+        }
+
+        // One batched WARM read for the block's routed set. The probe runs once, so
+        // this is the difference between eight sets of three sequential reads and
+        // one queued read, which is what makes the replay affordable at all.
+        {
+            std::vector<i32> ids;
+            std::vector<u8> seen(static_cast<size_t>(ne), 0);
+            for (i32 t = 0; t < n; t++) {
+                const i32 *tsel = sel.data() + static_cast<size_t>(t) * k;
+                for (i32 s = 0; s < k; s++) {
+                    const i32 e = tsel[s];
+                    if (e < 0 || e >= ne || seen[static_cast<size_t>(e)]) continue;
+                    seen[static_cast<size_t>(e)] = 1;
+                    ids.push_back(e);
+                }
+            }
+            if (ids.size() > 1)
+                model_.experts().prefetch_layer(mtp_source(m), m.layer, ids.data(),
+                                                static_cast<int>(ids.size()));
+        }
+
+        for (i32 e = 0; e < ne; e++) {
+            plan_dev_.clear();
+            alpha_dev_.clear();
+            for (i32 t = 0; t < n; t++) {
+                const i32 *tsel = sel.data() + static_cast<size_t>(t) * k;
+                const f32 *twt = wt.data() + static_cast<size_t>(t) * k;
+                for (i32 s = 0; s < k; s++) {
+                    if (tsel[s] != e) continue;
+                    plan_dev_.push_back(t);
+                    alpha_dev_.push_back(twt[s]);
+                }
+            }
+            if (plan_dev_.empty()) continue;
+            const i64 mrows = static_cast<i64>(plan_dev_.size());
+            be_->upload_i32(static_cast<i32 *>(ws_plan_), plan_dev_.data(), mrows);
+            be_->upload(static_cast<f32 *>(ws_alpha_), alpha_dev_.data(),
+                        static_cast<size_t>(mrows) * sizeof(f32));
+            const u64 acq_t0 = now_us();
+            const u64 acq_miss0 = model_.experts().loads() +
+                                 model_.experts().host_hits();
+            const ResidentExpert *re =
+                model_.experts().acquire(mtp_source(m), m.layer, e);
+            mtp_acq_ms_ += static_cast<f64>(now_us() - acq_t0) / 1000.0;
+            mtp_acq_n_++;
+            if (model_.experts().loads() + model_.experts().host_hits() !=
+                acq_miss0)
+                mtp_acq_miss_++;
+            if (!re) continue;
+            be_->gather_rows(ws_xg_, ws_xn_, static_cast<const i32 *>(ws_plan_), mrows,
+                             n_embd_);
+            bool fused = false;
+            if (re->gate.present()) {
+                void *gout[2] = {ws_gateg_, ws_upg_};
+                const void *gw[2] = {re->gate.data, re->up.data};
+                const i64 gno[2] = {ff, ff};
+                const DType gwts[2] = {re->gate.type, re->up.type};
+                be_->gemm_group(gout, ws_xg_, gw, re->gate.type, gno, n_embd_, 2, mrows,
+                                true, &fused, false, gwts);
+            } else {
+                be_->gemm(ws_upg_, ws_xg_, re->up.data, re->up.type, ff, n_embd_, mrows);
+                be_->copy_act(ws_gateg_, ws_upg_, mrows * ff);
+                be_->sigmoid_act(ws_gateg_, mrows * ff);
+                be_->mul_act(ws_gateg_, ws_upg_, mrows * ff);
+                fused = true;
+            }
+            if (!fused) be_->silu_mul(ws_gateg_, ws_gateg_, ws_upg_, mrows * ff);
+            be_->gemm(ws_x2_, ws_gateg_, re->down.data, re->down.type, n_embd_, ff, mrows);
+            be_->scatter_axpy_rows(ws_ffn_, ws_x2_, static_cast<const i32 *>(ws_plan_),
+                                   static_cast<const f32 *>(ws_alpha_), mrows, n_embd_,
+                                   nullptr, static_cast<i32 *>(ws_fexp_));
+        }
+
+        }
+
+    if (ff_sh > 0 && m.shexp_up.present() && m.shexp_down.present()) {
+        if (m.shexp_gate.present())
+            be_->gemm(ws_gate_, ws_xn_, m.shexp_gate.data, m.shexp_gate.type, ff_sh,
+                      n_embd_, n);
+        be_->gemm(ws_up_, ws_xn_, m.shexp_up.data, m.shexp_up.type, ff_sh, n_embd_, n);
+        if (m.shexp_gate.present()) {
+            be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * ff_sh);
+        } else {
+            be_->copy_act(ws_gate_, ws_up_, n * ff_sh);
+            be_->sigmoid_act(ws_gate_, n * ff_sh);
+            be_->mul_act(ws_gate_, ws_up_, n * ff_sh);
+        }
+        be_->gemm(ws_x2_, ws_gate_, m.shexp_down.data, m.shexp_down.type, n_embd_,
+                  ff_sh, n);
+        // Qwen3.5 scales the shared expert by a sigmoid of a per-token
+        // projection -- `ffn_gate_inp_shexp`, which every block 40 in this
+        // family carries. Skipping it scales the shared path by 1 where the
+        // stack uses a learned per-token factor, which is a wrong answer that
+        // still reads as fluent text.
+        if (m.shexp_inp_gate.present()) {
+            be_->gemm(mtp_sgate_, ws_xn_, m.shexp_inp_gate.data,
+                      m.shexp_inp_gate.type, 1, n_embd_, n);
+            be_->sigmoid_act(mtp_sgate_, n);
+            be_->scale_rows(ws_x2_, mtp_sgate_, n, n_embd_);
+        }
+        be_->add_residual(acc, ws_x2_, n, n_embd_, exp);
+    }
+
+    if (acc != ws_x_)
+        be_->add_residual(ws_x_, acc, n, n_embd_, static_cast<i32 *>(mtp_rep_),
+                          static_cast<const i32 *>(ws_fexp_));
+}
+
+bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
+    const ModelConfig &mc = model_.cfg();
+    const size_t as = be_->act_size();
+    const i64 hd = m.head_dim;
+    const i64 nh = m.n_head;
+    const i64 nkv = m.n_head_kv;
+    const i64 q = nh * hd;
+    const i64 kvw = nkv * hd;
+    if (!mtp_h_ || !mtp_e_ || !mtp_cat_ || !mtp_gate_ || !mtp_kv_k_ || !mtp_kv_v_)
+        return false;
+    if (q > q_dim_ || kvw > kv_dim_ || m.n_ff_exp > model_.n_ff_ws() ||
+        m.n_ff > model_.n_ff_ws())
+        return false;
+
+    // DeepSeek's MTP fuses [embedding_norm | hidden_norm]; KRK_MTP_CONCAT=he is
+    // the swapped order, kept as an arm because the concat side is not stated
+    // in the GGUF and an order that is wrong here reads as a mediocre drafter
+    // rather than as an error.
+    static const bool hidden_first = [] {
+        const char *e = std::getenv("KRK_MTP_CONCAT");
+        return e && e[0] == 'h';
+    }();
+    u8 *cat = static_cast<u8 *>(mtp_cat_);
+    const size_t half = static_cast<size_t>(n_embd_) * as;
+    void *cat_h = hidden_first ? static_cast<void *>(cat)
+                               : static_cast<void *>(cat + half);
+    void *cat_e = hidden_first ? static_cast<void *>(cat + half)
+                               : static_cast<void *>(cat);
+    be_->rmsnorm(cat_e, mtp_e_, m.enorm, 1, n_embd_, mc.rms_eps);
+    be_->rmsnorm(cat_h, mtp_h_, m.hnorm, 1, n_embd_, mc.rms_eps);
+    be_->gemm(ws_x_, mtp_cat_, m.eh_proj.data, m.eh_proj.type, n_embd_,
+              2 * n_embd_, 1);
+    be_->fill0(mtp_rep_, sizeof(i32));
+
+    be_->rmsnorm(ws_xn_, ws_x_, m.attn_norm, 1, n_embd_, mc.rms_eps);
+    const bool packed = m.wq.n_out == 2 * q;
+    if (packed && !ws_qpack_) return false;
+    void *qp = packed ? ws_qpack_ : ws_q_;
+    be_->gemm(qp, ws_xn_, m.wq.data, m.wq.type, m.wq.n_out, n_embd_, 1);
+    be_->gemm(ws_k_, ws_xn_, m.wk.data, m.wk.type, kvw, n_embd_, 1);
+    be_->gemm(ws_v_, ws_xn_, m.wv.data, m.wv.type, kvw, n_embd_, 1);
+    if (packed) be_->qwen3_next_split(ws_q_, mtp_gate_, qp, 1, nh, hd);
+    be_->qk_norm(ws_q_, ws_k_, m.q_norm, m.k_norm, nh, nkv, hd, 1, mc.rms_eps,
+                 mc.qk_norm_wide);
+
+    AttnDesc d;
+    d.n_head = nh;
+    d.n_kv = nkv;
+    d.hd = hd;
+    d.n_tok = 1;
+    d.pos0 = pos;
+    d.layer_stride = 0;
+    d.pos_stride = kvw;
+    d.layer = 0;
+    d.window = 0;
+    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(hd))) *
+              mc.rope_attn_scale;
+    // The block shares the stack's rotary table: it is the same width, the same
+    // head count and the same position axis, and block 40's own weights are
+    // trained against the positions the stack writes.
+    be_->rope(ws_q_, ws_k_, nh, nkv, hd, 1, pos, model_.inv_freq_at(0).data(),
+              mc.rope_scale, model_.rope_frac_at(0), mc.rope_neox);
+    be_->kv_append(mtp_kv_k_, mtp_kv_v_, ws_k_, ws_v_, d);
+    be_->attention(ws_attn_, ws_q_, mtp_kv_k_, mtp_kv_v_, d);
+    if (packed) {
+        be_->sigmoid_act(mtp_gate_, q);
+        be_->mul_act(ws_attn_, mtp_gate_, q);
+    }
+    be_->gemm(ws_x2_, ws_attn_, m.wo.data, m.wo.type, n_embd_, q, 1);
+    // post_attention_norm is this family's pre-FFN norm (there is no separate
+    // ffn_norm in block 40's tensor set), so it is applied to the residual, not
+    // fused as an add+norm before the attention.
+    be_->add_residual(ws_x_, ws_x2_, 1, n_embd_, static_cast<i32 *>(mtp_rep_));
+    be_->rmsnorm(ws_xn_, ws_x_, m.post_attn_norm, 1, n_embd_, mc.rms_eps);
+    mtp_ffn(m, 1);
+
+    if (want_logits) {
+        be_->rmsnorm(ws_xn_, ws_x_, m.shared_head_norm, 1, n_embd_, mc.rms_eps);
+        const QuantTensor &head = model_.out_head();
+        be_->gemm(ws_logits_, ws_xn_, head.data, head.type, n_vocab_, n_embd_, 1);
+    }
+    return true;
+}
+
+Engine::MtpProbe Engine::mtp_probe_step() {
+    MtpProbe r;
+    const ModelConfig &mc = model_.cfg();
+    const MtpBlock &m = model_.mtp();
+    if (!mtp_probe_ || !mtp_hidden_) {
+        r.note = "the probe was not allocated for this run";
+        return r;
+    }
+    if (!m.present) {
+        r.note = "this file's nextn block is not loaded";
+        return r;
+    }
+    const i32 P = static_cast<i32>(kv_pos_);
+    if (P <= 0 || mtp_captured_ < P) {
+        r.note = "no captured hidden rows for the prompt";
+        return r;
+    }
+    r.pos = P - 1;
+    const Timer timer;
+    // The host row is deliberate: the probe reports the two logits it compared,
+    // and the device top-k path returns an id with no value.
+    auto read_argmax = [&](f32 *score) {
+        be_->download_f32(logits_host_, ws_logits_, n_vocab_);
+        const f32 cap = mc.logit_softcap;
+        i32 besti = -1;
+        f32 best = 0.0f;
+        for (i32 v = 0; v < n_vocab_; v++) {
+            f32 x = logits_host_[v];
+            if (cap > 0.0f) x = apply_logit_softcap(x, cap);
+            if (besti < 0 || x > best) {
+                best = x;
+                besti = v;
+            }
+        }
+        *score = best;
+        return besti;
+    };
+    // The target's answer for position P, read BEFORE the block writes its own
+    // row into the same buffer. This is the token a speculative round has to
+    // match to be accepted.
+    r.target_id = read_argmax(&r.target_logit);
+
+    const size_t as = be_->act_size();
+    // A probe at a position the block has already passed means the sequence
+    // restarted (every generation starts at position 0): drop the block's own
+    // history rather than attend over tokens this prompt never had.
+    if (mtp_fed_ < 0 || mtp_fed_ > r.pos) {
+        be_->fill0(mtp_kv_k_,
+                   static_cast<size_t>(P) * static_cast<size_t>(mtp_kv_dim_) * as);
+        be_->fill0(mtp_kv_v_,
+                   static_cast<size_t>(P) * static_cast<size_t>(mtp_kv_dim_) * as);
+        mtp_fed_ = 0;
+    }
+    for (i32 p = static_cast<i32>(mtp_fed_); p < P; p++) {
+        const i32 tok = mtp_tok_[static_cast<size_t>(p)];
+        if (tok < 0) {
+            r.note = "a captured position has no token id";
+            return r;
+        }
+        mtp_embed(tok);
+        be_->copy_act(mtp_h_,
+                      act_at(mtp_hidden_, as, static_cast<i64>(p) * n_embd_),
+                      n_embd_);
+        if (!mtp_block_forward(m, p, p == r.pos)) {
+            r.note = "the block's forward was refused (workspace geometry)";
+            return r;
+        }
+    }
+    mtp_fed_ = P;
+    r.draft_id = read_argmax(&r.draft_logit);
+    r.ok = r.draft_id >= 0 && r.target_id >= 0;
+    r.ms = timer.ms();
+    return r;
 }
 
 void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
@@ -1907,6 +2737,11 @@ bool Engine::configure_expert_cache(std::string *err) {
                                           : "");
 
     model_.set_expert_budget(budget, warm, slot_budget);
+    // --expert-pin-mb owns the tier's pinned prefix when it is given; -1 leaves
+    // KRK_HOST_PIN_MB's answer (off by default) alone.
+    if (cfg_.expert_pin_mb >= 0)
+        model_.experts().set_host_pin_budget(
+            static_cast<size_t>(cfg_.expert_pin_mb) * 1024u * 1024u);
 
     // Prefetch is opt-in. Read-through admits every expert the run actually
     // touches, so an eager sweep of the corpus is only worth its wall time when
@@ -2091,6 +2926,548 @@ void Engine::unload_dflash() {
 
 i32 Engine::dflash_block_size() const {
     return dflash_ ? dflash_->block_size() : 0;
+}
+
+// ---- external draft head (EAGLE-3) ---------------------------------------
+//
+// A head is one block that reads the TARGET's own hidden state and the last
+// token's embedding. That makes the round the same three moves every
+// speculative path here makes -- propose, verify in ONE batched forward,
+// realign to the accepted prefix -- with the proposal side on the host.
+//
+// Two things are correctness rather than taste:
+//
+//   * the head's input at position p is (hidden_p, embed(token_p)) and its
+//     output predicts p+1, which is the same contract the nextn block has
+//     (mtp_block_forward). A proposal chain therefore feeds the head's OWN
+//     output hidden for position p and the proposed token at p -- not the
+//     target's row, which does not exist yet.
+//   * after a partial accept the head's KV must be rewound to the round's
+//     start and re-fed from the target's CAPTURED rows. Its speculative rows
+//     were built from the head's hidden, not the target's, and keeping them
+//     would draft from a different distribution -- fluent, plausible, wrong.
+
+bool Engine::load_draft_head(const std::string &path, std::string *err) {
+    if (!be_) {
+        if (err) *err = "the engine must be initialised before the draft head";
+        return false;
+    }
+    if (head_) return true; // already loaded
+    if (model_.is_recurrent()) {
+        // Same reason load_draft refuses one: a delta-rule state has no
+        // inverse, so a rejected suffix cannot be rewound.
+        if (err)
+            *err = "speculative decoding needs a partial KV rewind, which a "
+                   "recurrent (gated delta net) model cannot do";
+        return false;
+    }
+    DraftHead *h = new DraftHead();
+    std::string why;
+    if (!h->load(path, &why)) {
+        delete h;
+        if (err) *err = why;
+        return false;
+    }
+    if (!h->check_target(static_cast<i32>(n_embd_), static_cast<i32>(n_vocab_), &why)) {
+        delete h;
+        if (err) *err = why;
+        return false;
+    }
+    if (h->cfg().n_in != 1) {
+        delete h;
+        if (err)
+            *err = "draft head: it fuses " + std::to_string(h->cfg().n_in) +
+                   " target hidden slot(s); this engine captures the "
+                   "pre-final-norm row, i.e. one";
+        return false;
+    }
+    if (h->cfg().n_layer != 1) {
+        delete h;
+        if (err)
+            *err = "draft head: " + std::to_string(h->cfg().n_layer) +
+                   " layer(s); this engine runs the single-block EAGLE-3 head";
+        return false;
+    }
+    const size_t as = be_->act_size();
+    head_hidden_ = be_->alloc(static_cast<size_t>(kv_cap_ * n_embd_) * as);
+    head_e_ = be_->alloc(static_cast<size_t>(n_embd_) * as);
+    if (!head_hidden_ || !head_e_) {
+        if (head_hidden_) { be_->release(head_hidden_); head_hidden_ = nullptr; }
+        if (head_e_) { be_->release(head_e_); head_e_ = nullptr; }
+        delete h;
+        if (err)
+            *err = "draft head: the " +
+                   std::to_string(static_cast<f64>(kv_cap_ * n_embd_) * as /
+                                  1048576.0) +
+                   " MiB hidden capture could not be allocated";
+        return false;
+    }
+    head_ = h;
+    head_tok_.assign(static_cast<size_t>(kv_cap_), -1);
+    head_row_.assign(static_cast<size_t>(n_embd_), 0.0f);
+    head_emb_.assign(static_cast<size_t>(n_embd_), 0.0f);
+    head_logits_.assign(static_cast<size_t>(h->cfg().draft_vocab), 0.0f);
+    head_captured_ = 0;
+    head_fed_ = 0;
+    head_->reset(static_cast<i32>(std::min<i64>(kv_cap_, 0x7fffffff)));
+    if (draft_tokens_ <= 0) draft_tokens_ = 4;
+    KRK_INFO("draft head: %s -- %dx%d block, %d head(s) x %d, %d kv head(s), "
+             "ff %d, draft vocab %d%s -> target vocab %lld; %.1f MiB host "
+             "weights, %.1f MiB hidden capture, prime window %d",
+             path.c_str(), h->cfg().hidden, h->cfg().n_ff, h->cfg().n_head,
+             h->cfg().head_dim, h->cfg().n_kv, h->cfg().n_ff,
+             h->cfg().draft_vocab, h->cfg().has_d2t ? " (d2t mapped)" : "",
+             static_cast<long long>(n_vocab_),
+             static_cast<f64>(h->weight_bytes()) / 1048576.0,
+             static_cast<f64>(kv_cap_ * n_embd_) * as / 1048576.0,
+             head_prime_max_);
+    return true;
+}
+
+void Engine::unload_draft_head() {
+    if (head_hidden_) { be_->release(head_hidden_); head_hidden_ = nullptr; }
+    if (head_e_) { be_->release(head_e_); head_e_ = nullptr; }
+    if (head_) { delete head_; head_ = nullptr; }
+    head_tok_.clear();
+    head_captured_ = 0;
+    head_fed_ = 0;
+}
+
+// The capture rides every forward pass, like the MTP probe's: the head needs
+// the target's pre-final-norm row for EVERY position it may propose from.
+void Engine::head_capture(const i32 *toks, i32 pos0, i32 n) {
+    if (!head_ || !head_hidden_ || n <= 0 || toks == nullptr) return;
+    const i64 end = static_cast<i64>(pos0) + n;
+    if (pos0 < 0 || end > kv_cap_) return;
+    const size_t as = be_->act_size();
+    be_->copy_act(act_at(head_hidden_, as, static_cast<i64>(pos0) * n_embd_),
+                  ws_x_, static_cast<i64>(n) * n_embd_);
+    for (i32 i = 0; i < n; i++)
+        head_tok_[static_cast<size_t>(pos0 + i)] = toks[i];
+    head_captured_ = end;
+}
+
+// One token's embedding row, on the host. `had_xform` inverts the transform the
+// model applies to its own embedding table, so the head sees the same row the
+// target's first layer does rather than the stored one.
+bool Engine::head_embed(i32 tok) {
+    const ModelConfig &mc = model_.cfg();
+    const QuantTensor &embd = model_.tok_embd();
+    if (!head_e_ || tok < 0 || tok >= n_vocab_) return false;
+    be_->embed(head_e_, embd.data, embd.type, mc.n_vocab, mc.n_embd, &tok, 1);
+    if (model_.had().embd_inverse)
+        had_xform(head_e_, head_e_, 1, n_embd_, /*inverse=*/true,
+                  /*gdn_perm=*/false);
+    be_->download_f32(head_emb_.data(), head_e_, n_embd_);
+    return true;
+}
+
+// Walk the head over the captured target rows in [head_fed_, pos).
+//
+// The window is why this is not quadratic: a head's fusion projection costs
+// O(hidden x target_hidden) per position, so priming a 4k prompt is hundreds of
+// GFLOP of host arithmetic. With prime_max > 0 only the last `prime_max`
+// positions are attended (absolute RoPE positions, a bounded window), which is
+// the trade the flag names. `0` is the exact form.
+bool Engine::head_prime(i64 pos, std::string *why) {
+    if (!head_) { if (why) *why = "no draft head"; return false; }
+    if (pos <= head_fed_) return true;
+    const i64 window = head_prime_max_ > 0 ? head_prime_max_ : 0;
+    i64 start = head_fed_;
+    if (window > 0 && pos - start > window) start = pos - window;
+    if (start < head_fed_) {
+        // Jumping the window forward: the rows before it are not attended any
+        // more, and recomputing them would be the cost the window removes.
+        head_->truncate(static_cast<i32>(pos));
+        head_fed_ = start;
+    }
+    head_->drop_before(static_cast<i32>(start));
+    const size_t as = be_->act_size();
+    const Timer t;
+    for (i64 q = start; q < pos; q++) {
+        if (q >= head_captured_) {
+            head_prime_ms_ += t.ms();
+            if (why) *why = "the target has no captured hidden row for position " +
+                            std::to_string(static_cast<long long>(q));
+            return false;
+        }
+        const i32 tok = head_tok_[static_cast<size_t>(q)];
+        if (tok < 0) {
+            head_prime_ms_ += t.ms();
+            if (why) *why = "a captured position has no token id";
+            return false;
+        }
+        if (!head_embed(tok)) {
+            head_prime_ms_ += t.ms();
+            if (why) *why = "the head's embedding row could not be read";
+            return false;
+        }
+        be_->download_f32(head_row_.data(),
+                          act_at(head_hidden_, as, q * n_embd_), n_embd_);
+        if (!head_->step(head_row_.data(), head_emb_.data(),
+                         static_cast<i32>(q), nullptr, /*want_logits=*/false)) {
+            head_prime_ms_ += t.ms();
+            if (why) *why = "the head refused a prime step (position past its KV)";
+            return false;
+        }
+    }
+    head_fed_ = pos;
+    head_prime_ms_ += t.ms();
+    return true;
+}
+
+bool Engine::generate_speculative_head(const GenerateParams &p, GenerateResult *res,
+                                       const std::vector<i32> &ids, f64 *prefill_ms,
+                                       f64 *decode_ms, i64 *decode_steps) {
+    if (!head_) {
+        res->error = "no draft head is loaded";
+        res->finish = FinishError;
+        return false;
+    }
+    const i32 k = std::max<i32>(1, draft_tokens_);
+    // Two modes, one round. Greedy is a prefix match and stays exactly as it
+    // was. Sampling cannot be: a proposal the target merely found unlikely has
+    // to survive sometimes, or the output is the DRAFT's distribution. The
+    // accept/reject rule (spec_sampling.hpp) is what keeps it the target's,
+    // and it needs both distributions -- the draft's q for the proposal and the
+    // target's p at that position -- as rows rather than as one argmax.
+    // The same name the draft-model and dflash verifiers use, with the opposite
+    // default: those walk back onto existing greedy arms when it is unset, while
+    // a head has no other way to run under sampling at all, so turning it off
+    // (KRK_SPEC_RS=0) is what returns the plain loop.
+    static const bool rs_disabled = [] {
+        const char *e = std::getenv("KRK_SPEC_RS");
+        return e && e[0] == '0' && e[1] == 0;
+    }();
+    const bool sampled = !p.sampler.greedy && p.sampler.temp > 0.0f && !rs_disabled;
+
+    // ---- prompt prefill (the capture rides every forward) -----------------
+    expert_phase(ExpertCache::PhasePrefill);
+    const Timer prefill_timer;
+    for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        const i32 n = static_cast<i32>(
+            std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
+        const bool last = (i + n) == static_cast<i64>(ids.size());
+        if (!forward(ids.data() + i, n, static_cast<i32>(i), last)) {
+            res->error = kv_resource_error();
+            res->finish = FinishError;
+            return false;
+        }
+    }
+    fetch_logits(false);
+    *prefill_ms = prefill_timer.ms();
+    expert_phase(ExpertCache::PhaseDecode);
+
+    i64 pos = static_cast<i64>(ids.size());
+    head_fed_ = 0;
+    head_->reset(static_cast<i32>(std::min<i64>(kv_cap_, 0x7fffffff)));
+    std::string why;
+    if (!head_prime(pos, &why)) {
+        res->error = "the draft head could not be primed over the prompt: " + why;
+        res->finish = FinishError;
+        return false;
+    }
+
+    Sampler sampler;
+    sampler.reset(p.sampler);
+    sampler.accept(ids.data(), static_cast<int>(ids.size()));
+    TokenEmitter emit(p, tok_, sampler, res, ids);
+
+    const Timer decode_timer;
+    i64 timed_decode_steps = 0;
+    auto finish_run = [&](Finish f) {
+        res->finish = f;
+        *decode_ms = decode_timer.ms();
+        *decode_steps = timed_decode_steps;
+        emit.finish(f == FinishStop);
+        if (spec_steps_ > 0) {
+            const f64 rate =
+                draft_proposed_ > 0
+                    ? 100.0 * static_cast<f64>(draft_accepted_) /
+                          static_cast<f64>(draft_proposed_)
+                    : 0.0;
+            KRK_INFO("draft head: %llu round(s), %llu of %llu proposals kept "
+                     "(%.1f%%), %.2f token(s)/round | prime %.0f ms | propose "
+                     "%.0f ms",
+                     static_cast<unsigned long long>(spec_steps_),
+                     static_cast<unsigned long long>(draft_accepted_),
+                     static_cast<unsigned long long>(draft_proposed_), rate,
+                     spec_steps_ > 0 ? static_cast<f64>(res->generated) /
+                                           static_cast<f64>(spec_steps_)
+                                     : 0.0,
+                     head_prime_ms_, head_propose_ms_);
+        }
+    };
+
+    std::vector<i32> prop(static_cast<size_t>(k), -1);
+    std::vector<f32> rows(static_cast<size_t>(k) * static_cast<size_t>(n_vocab_));
+    // Sampling state: q per proposal, p per verified position, and the tokens
+    // this round has already accepted (the repetition penalty has to see them:
+    // the plain loop would have emitted them by the time it builds p).
+    std::vector<std::vector<f32>> qrows(static_cast<size_t>(k));
+    std::vector<f32> draft_prob, p_row;
+    std::vector<i32> round_extra;
+
+    // Invariant at the top of every round: the target's KV holds [0, pos),
+    // logits_host_ predicts pos, and the head's KV holds the same positions,
+    // built from those positions' TARGET hidden rows.
+    while (res->generated < p.max_tokens && pos < kv_cap_) {
+        KRK_TIME_HOST("spec.round");
+        if (p.debug_topk > 0)
+            dump_topk(p.debug_topk, res->generated, pos, logits_host_, n_vocab_);
+        const i32 first = argmax_of(logits_host_, n_vocab_);
+        const i64 round_start = pos;
+
+        // ---- propose ------------------------------------------------------
+        // Proposal d answers position pos+d from input position pos+d-1.
+        // d == 0 uses the TARGET's captured row and the token sitting there;
+        // every later proposal feeds the head's own previous hidden state and
+        // the token it just proposed, which is what lets one head chain k
+        // tokens from one target forward.
+        const Timer propose_timer;
+        i32 d = 0;
+        while (d < k) {
+            const i64 ipos = pos + d - 1;
+            if (ipos < 0) break;
+            const f32 *feat = nullptr;
+            i32 tok = -1;
+            if (d == 0) {
+                if (ipos >= head_captured_) break;
+                be_->download_f32(head_row_.data(),
+                                  act_at(head_hidden_, be_->act_size(),
+                                         ipos * n_embd_),
+                                  n_embd_);
+                feat = head_row_.data();
+                tok = head_tok_[static_cast<size_t>(ipos)];
+            } else {
+                feat = head_->last_hidden();
+                tok = prop[static_cast<size_t>(d - 1)];
+            }
+            if (tok < 0) break;
+            if (pos + d >= kv_cap_) break;
+            if (!head_embed(tok)) break;
+            if (!head_->step(feat, head_emb_.data(), static_cast<i32>(ipos),
+                             &head_logits_))
+                break;
+            i32 t = -1;
+            if (!sampled) {
+                t = head_->to_target(DraftHead::argmax(head_logits_));
+            } else {
+                // A DRAW from q, not its argmax: the rule corrects q against p,
+                // and it can only do that for the distribution the token came
+                // from. The head's rows are over the draft vocabulary, so q is
+                // softmax there and then mapped through d2t into target space.
+                spec_softmax(head_logits_.data(),
+                             static_cast<i32>(head_logits_.size()), p.sampler.temp,
+                             &draft_prob);
+                spec_map_dist(draft_prob.data(), static_cast<i32>(draft_prob.size()),
+                              head_->d2t_data(), n_vocab_, &qrows[d]);
+                t = spec_draw(qrows[static_cast<size_t>(d)], sampler.uniform());
+            }
+            if (t < 0 || t == tok_.eos()) break; // the target confirms EOS itself
+            prop[static_cast<size_t>(d)] = t;
+            d++;
+            draft_proposed_++;
+        }
+        head_propose_ms_ += propose_timer.ms();
+        spec_steps_++;
+        timed_decode_steps++;
+
+        // ---- pre-check: does the target agree with the first proposal? ----
+        // Greedy: the argmax either is the proposal or is not. Sampling: the
+        // proposal survives with probability min(1, p/q), and when it does not,
+        // the round's first token is a draw from the residual -- the correction
+        // that keeps the round's output distribution at p.
+        bool pre_ok = false;
+        i32 next1 = first;
+        if (d > 0 && !sampled) pre_ok = (first == prop[0]);
+        if (d > 0 && sampled) {
+            sampler.build_dist(logits_host_, n_vocab_, &p_row);
+            const SpecStep st = spec_accept_step(p_row, qrows[0], prop[0],
+                                                 sampler.uniform(), sampler.uniform());
+            pre_ok = st.accepted;
+            next1 = st.token;
+        }
+        if (d == 0 || !pre_ok) {
+            if (next1 < 0) next1 = first;
+            if (next1 == tok_.eos()) {
+                finish_run(FinishEos);
+                return true;
+            }
+            emit.accept(next1);
+            if (pos + 1 >= kv_cap_) {
+                finish_run(FinishContext);
+                return true;
+            }
+            if (!forward(&next1, 1, static_cast<i32>(pos), true)) {
+                res->error = kv_resource_error();
+                finish_run(FinishError);
+                return false;
+            }
+            pos++;
+            fetch_logits();
+            head_->truncate(static_cast<i32>(round_start));
+            head_fed_ = round_start;
+            if (!head_prime(pos, &why)) {
+                res->error = "the draft head could not be realigned: " + why;
+                finish_run(FinishError);
+                return false;
+            }
+            continue;
+        }
+
+        // ---- verify: one batched forward of the d proposals --------------
+        // Block row j (input prop[j] at position pos+j) predicts pos+j+1.
+        i32 d_eff = d;
+        while (d_eff > 0 && pos + d_eff > kv_cap_) d_eff--;
+        if (d_eff <= 0) {
+            finish_run(FinishContext);
+            return true;
+        }
+        if (!forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone)) {
+            res->error = kv_resource_error();
+            finish_run(FinishError);
+            return false;
+        }
+        kv_pos_ = pos + d_eff;
+        std::vector<i32> row_ids(static_cast<size_t>(d_eff), 0);
+        for (i32 j = 0; j < d_eff; j++) {
+            head_compute(j);
+            i32 id = 0;
+            // A sampled round compares distributions, not argmaxes, so it needs
+            // every row on the host.
+            if (sampled || !topk_argmax(&id)) {
+                be_->sync();
+                be_->download_f32(rows.data() + static_cast<size_t>(j) * n_vocab_,
+                                  ws_logits_, n_vocab_);
+                id = argmax_of(rows.data() + static_cast<size_t>(j) * n_vocab_,
+                               n_vocab_);
+            }
+            row_ids[static_cast<size_t>(j)] = id;
+        }
+        auto row_pred = [&](i32 j) { return row_ids[static_cast<size_t>(j - 1)]; };
+
+        i32 a = 1; // prop[0] passed the pre-check
+        i32 repl = -1; // sampling only: the residual draw that ends the round
+        bool rejected = false;
+        if (!sampled) {
+            while (a < d_eff && row_pred(a) == prop[static_cast<size_t>(a)]) a++;
+        } else {
+            round_extra.clear();
+            round_extra.push_back(prop[0]);
+            for (i32 j = 0; j + 1 < d_eff; j++) {
+                // Row j predicts pos+j+1, i.e. verifies prop[j+1]. p is built
+                // with the round's accepted prefix in the penalty history --
+                // exactly the history the plain loop would have at this point.
+                sampler.build_dist(rows.data() + static_cast<size_t>(j) * n_vocab_,
+                                   n_vocab_, &p_row, round_extra.data(),
+                                   static_cast<int>(round_extra.size()));
+                const SpecStep st =
+                    spec_accept_step(p_row, qrows[static_cast<size_t>(j + 1)],
+                                     prop[static_cast<size_t>(j + 1)],
+                                     sampler.uniform(), sampler.uniform());
+                if (st.accepted) {
+                    a++;
+                    round_extra.push_back(prop[static_cast<size_t>(j + 1)]);
+                } else {
+                    rejected = true;
+                    repl = st.token;
+                    break;
+                }
+            }
+        }
+        const bool full = (a == d_eff);
+
+        bool stop_hit = false;
+        i32 emitted = 0;
+        for (i32 j = 0; j < a; j++) {
+            if (res->generated >= p.max_tokens) break;
+            const i32 t = prop[static_cast<size_t>(j)];
+            draft_accepted_++;
+            stop_hit = emit.accept(t);
+            emitted++;
+            if (stop_hit) break;
+        }
+        if (stop_hit) {
+            kv_rollback(pos + emitted);
+            finish_run(FinishStop);
+            return true;
+        }
+        // The token that ends the round: the bonus on a full accept, or the
+        // residual replacement on a rejection. Both sit at pos+emitted, and the
+        // KV row there currently holds a proposal the target did not keep, so
+        // both are re-forwarded below.
+        i32 tail = -1;
+        if (!rejected && full && res->generated < p.max_tokens) {
+            i32 bonus = row_pred(d_eff);
+            if (sampled) {
+                sampler.build_dist(rows.data() +
+                                       static_cast<size_t>(d_eff - 1) * n_vocab_,
+                                   n_vocab_, &p_row, round_extra.data(),
+                                   static_cast<int>(round_extra.size()));
+                bonus = spec_draw(p_row, sampler.uniform());
+            }
+            tail = bonus;
+        } else if (rejected && res->generated < p.max_tokens && repl >= 0) {
+            tail = repl;
+        }
+        if (tail >= 0) {
+            if (tail == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
+            stop_hit = emit.accept(tail);
+            emitted++;
+            if (stop_hit) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishStop);
+                return true;
+            }
+        }
+        const bool room = pos + emitted < kv_cap_ && res->generated < p.max_tokens;
+        if (tail >= 0 && room) {
+            if (!forward(&tail, 1, static_cast<i32>(pos + emitted - 1), true)) {
+                res->error = kv_resource_error();
+                finish_run(FinishError);
+                return false;
+            }
+            fetch_logits();
+        } else if (!full && !rejected) {
+            // Greedy partial accept: the verifier already computed the row at
+            // the position that rejected, and it is exactly the distribution the
+            // next round starts from. Downloading it is cheaper than a forward,
+            // but it has to be DOWNLOADED -- leaving logits_host_ holding the
+            // pre-round row makes the next round propose from a position the
+            // sequence has left.
+            head_compute(a);
+            be_->sync();
+            be_->download_f32(logits_host_, ws_logits_, n_vocab_);
+        }
+        if (res->generated >= p.max_tokens || !full) kv_rollback(pos + emitted);
+        pos += emitted;
+
+        if (res->generated >= p.max_tokens) {
+            finish_run(FinishLength);
+            return true;
+        }
+        if (pos + 1 >= kv_cap_) {
+            finish_run(FinishContext);
+            return true;
+        }
+
+        // ---- realign the head with what the target kept -------------------
+        head_->truncate(static_cast<i32>(round_start));
+        head_fed_ = round_start;
+        if (!head_prime(pos, &why)) {
+            res->error = "the draft head could not be realigned: " + why;
+            finish_run(FinishError);
+            return false;
+        }
+    }
+
+    finish_run(res->generated >= p.max_tokens ? FinishLength : FinishContext);
+    return true;
 }
 
 // One draft_block call, wrapped for callers outside the generate loop (the
@@ -2838,7 +4215,10 @@ void Engine::warm_experts() {
     // before the workspaces and the KV tier existed, so only the driver can
     // say what is actually left. A partly warm tier is a slow run; a card with
     // nothing free is a machine that has to be recovered by hand.
-    const size_t vram_reserve = krk::vram_reserve_bytes(be_->device_total_bytes());
+    // The floor, not the reserve: a fill that stops at the reserve leaves the
+    // card one allocation away from full, and on a 15.9 GiB card with a 22 GiB
+    // routed set that is where the desktop starts to stall.
+    const size_t vram_reserve = krk::vram_floor_bytes(be_->device_total_bytes());
     bool hit_reserve = false;
     if (be_->caps().vram_free > 0) {
         for (size_t r = 0; r < depth; r++) {
@@ -3200,6 +4580,18 @@ static bool moe_group() {
 // so the pair is grouped (two launches, not three) and the activation is
 // then scaled per row, which is the contract the scatter already folds back
 // in. The switch exists so the fuse's cost is measurable one process apart.
+// KRK_MOE_LOOKAHEAD=1 stages a batched MoE pass's expert union into VRAM before
+// the first row runs it. Off by default: it is a scheduling change whose win
+// depends on the batch (a speculative verify pass) and on how far the device
+// budget can hold the union, and it must be measured on the model that has one.
+static bool lookahead_stage() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_MOE_LOOKAHEAD");
+        return e && e[0] != '0' && e[0] != 0;
+    }();
+    return v;
+}
+
 static bool moe_silu_fused() {
     static const bool v = [] {
         const char *e = std::getenv("KRK_MOE_SILU_FUSED");
@@ -3242,6 +4634,21 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // over the k selected experts (the Qwen convention).
         for (i32 t = 0; t < n; t++) {
             const f32 *logits = router_host_.data() + static_cast<i64>(t) * ne;
+            // A file whose bias is `ffn_gate_inp.bias` means it in the LOGITS
+            // (llama.cpp folds it into the router row before the gating func),
+            // so the same numbers feed the softmax and the top-k. That is not
+            // laguna's `exp_probs_b.bias`, which is added to the probabilities
+            // below and therefore shifts selection only: adding a bias after a
+            // monotone map is a different function, and with 128 experts on
+            // gpt-oss it picks different experts.
+            const f32 *rb = L.router_bias;
+            const bool pre_bias = mc.router_bias_pre && rb != nullptr;
+            if (pre_bias) {
+                for (i32 e = 0; e < ne; e++)
+                    moe_logit_[static_cast<size_t>(e)] =
+                        logits[e] + rb[static_cast<size_t>(e)];
+                logits = moe_logit_.data();
+            }
             // The probability the selected experts are mixed with. Softmax is
             // the Qwen convention, sigmoid is laguna's (`expert_gating_func`
             // 2); sigmoid probabilities are not renormalized, which is exactly
@@ -3278,26 +4685,69 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // only: the weights stay the unbiased probabilities, which is what
             // the reference means by "leave probs unbiased as it's later used
             // to get expert weights". Adding it to the weights as well is a
-            // plausible-looking and wrong change.
-            const f32 *rb = L.router_bias;
+            // plausible-looking and wrong change -- and so is applying it at
+            // all when it already entered the logits above (`pre_bias`).
             auto sel_score = [&](i32 e) {
                 return moe_prob_[static_cast<size_t>(e)] +
-                       (rb ? rb[static_cast<size_t>(e)] : 0.0f);
+                       ((rb && !pre_bias) ? rb[static_cast<size_t>(e)] : 0.0f);
             };
 
             i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
             f32 *wt = moe_wt_.data() + static_cast<size_t>(t) * k;
+            // Residency of an expert, as the tier sees it right now: 2 in VRAM,
+            // 1 in WARM, 0 nowhere. The expert index is what FILLED those tiers,
+            // so this reads the index's answer live -- and correctly, which a
+            // stored rank cannot be once the tiers have evicted and re-admitted
+            // for a while.
+            auto resident_rank = [&](i32 e) {
+                if (!router_pref_) return 0;
+                if (model_.experts().in_vram(layer, e)) return 2;
+                if (model_.experts().in_host(layer, e)) return 1;
+                return 0;
+            };
             for (i32 s = 0; s < k; s++) {
-                i32 best = -1;
-                f32 bestp = -1.0f;
+                // The top available score first, so "near-equal" has something
+                // to be near. With the preference off this is the only pass and
+                // the arithmetic below reduces to the loop it replaced.
+                f32 top = -1.0f;
                 for (i32 e = 0; e < ne; e++) {
                     bool taken = false;
                     for (i32 p = 0; p < s; p++)
                         if (sel[p] == e) { taken = true; break; }
                     if (taken) continue;
-                    if (sel_score(e) > bestp) {
-                        bestp = sel_score(e);
+                    const f32 sc = sel_score(e);
+                    if (sc > top) top = sc;
+                }
+                const f32 cut = top - (router_pref_ ? router_tie_margin_ * top : 0.0f);
+                i32 best = -1;
+                f32 bestp = -1.0f;
+                int best_rank = -1;
+                for (i32 e = 0; e < ne; e++) {
+                    bool taken = false;
+                    for (i32 p = 0; p < s; p++)
+                        if (sel[p] == e) { taken = true; break; }
+                    if (taken) continue;
+                    const f32 sc = sel_score(e);
+                    if (sc < cut) continue; // not near-equal with the best
+                    const int rank = resident_rank(e);
+                    // Residency decides first, then the score -- and a score tie
+                    // keeps the lower id, which is what the old loop did.
+                    if (rank > best_rank || (rank == best_rank && sc > bestp)) {
+                        best_rank = rank;
+                        bestp = sc;
                         best = e;
+                    }
+                }
+                if (best >= 0) {
+                    // Counted in both arms: the share of picks that hit VRAM is
+                    // what the preference is for, and the control has to be able
+                    // to show it too.
+                    if (model_.experts().in_vram(layer, best)) router_hot_++;
+                    if (router_pref_) {
+                        router_picks_++;
+                        // Exact compare: the top scorer's own score IS `top`, so
+                        // a pick below it was moved by residency and nothing else.
+                        if (bestp < top) router_subs_++;
                     }
                 }
                 sel[s] = best;
@@ -3321,6 +4771,21 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             }
             if (mc.expert_w_scale != 0.0f && mc.expert_w_scale != 1.0f)
                 for (i32 s = 0; s < k; s++) wt[s] *= mc.expert_w_scale;
+            // KRK_DUMP_ROUTE=1: the routing decision itself, which is the only
+            // way to tell a wrong router from a wrong expert read -- the two
+            // look identical in moe.sum and one of them is a five-line fix.
+            if (dump_route_) {
+                std::printf("[route] L%02d t=%d", layer, t);
+                for (i32 s = 0; s < k; s++)
+                    std::printf(" e=%d w=%.6f", sel[s], wt[s]);
+                const f32 *l0 = router_host_.data() + static_cast<i64>(t) * ne;
+                std::printf(" | top logits");
+                for (i32 s = 0; s < k; s++)
+                    std::printf(" %.4f",
+                                (mc.router_bias_pre && rb) ? l0[sel[s]] + rb[sel[s]]
+                                                           : l0[sel[s]]);
+                std::printf("\n");
+            }
         }
 
         // ---- grouped expert GEMMs ----------------------------------------
@@ -3434,6 +4899,17 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 model_.experts().prefetch_layer(
                     L.experts, layer, prefetch_ids_.data(),
                     static_cast<int>(prefetch_ids_.size()));
+            // Look-ahead for a BATCHED pass. The router for all n rows is
+            // already on the host at this point, so a verify pass knows the
+            // union of experts its rows will need one row early: staging it
+            // means rows 1..n-1 hit VRAM instead of promoting serially, and the
+            // promotions overlap the first row's compute. A single row has
+            // nothing ahead of it (stage_next covers ordering inside its own
+            // routing), so this only runs when n > 1.
+            if (n == 1 && lookahead_stage())
+                model_.experts().stage_batch(L.experts, layer,
+                                             prefetch_ids_.data(),
+                                             static_cast<int>(prefetch_ids_.size()));
         }
 
         // ---- one routing plan for the whole layer ---------------------------
@@ -3570,8 +5046,14 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // rows reach the scatter unscaled (those paths keep the saturating
             // f16 store as their bound).
             const f32 *scatter_scale = nullptr;
+            // A layer carrying per-expert FFN biases (gpt-oss) cannot take the
+            // fused pair: that kernel's epilogue has already applied silu by the
+            // time it returns, and the reference adds the bias to BOTH
+            // projections *before* the activation. Going through the two-GEMM
+            // path is the only order that can express it.
             if (re->gate.present() && moe_group() && !moe_probe() &&
-                gs_gt == gs_up) {
+                gs_gt == gs_up && !L.exp_gate_bias && !L.exp_up_bias &&
+                !mc.ffn_swiglu_oai) {
                 void *gout[2] = {ws_gateg_, ws_upg_};
                 const void *gw[2] = {re->gate.data, re->up.data};
                 const i64 gno[2] = {ff_exp, ff_exp};
@@ -3581,6 +5063,11 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             } else {
                 be_->gemm(ws_upg_, ws_xg_, re->up.data, re->up.type, ff_exp,
                           n_embd_, m);
+                // Per-expert bias: this group is ONE expert's rows, so the
+                // table's row `e` is the vector every row of the block gets.
+                if (L.exp_up_bias)
+                    be_->add_bias_cols(ws_upg_, L.exp_up_bias + static_cast<i64>(e) * ff_exp,
+                                       m, ff_exp);
                 if (re->gate.present()) {
                     // ws_xg_ is carrying gs_up; leave it carrying gs_gt for the
                     // gate. It is read by nothing else.
@@ -3589,6 +5076,11 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                                        n_embd_);
                     be_->gemm(ws_gateg_, ws_xg_, re->gate.data, re->gate.type,
                               ff_exp, n_embd_, m);
+                    if (L.exp_gate_bias)
+                        be_->add_bias_cols(
+                            ws_gateg_,
+                            L.exp_gate_bias + static_cast<i64>(e) * ff_exp, m,
+                            ff_exp);
                 }
             }
             if (moe_probe()) {
@@ -3628,14 +5120,24 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             if (re->gate.present()) {
                 // The fused kernel already left silu(gate)*up in ws_gateg_;
                 // everything else reaches here with both operands written.
+                // A swiglu-oai file never takes that kernel: this activation is
+                // a different function of the same two operands.
                 if (!pair_fused) {
-                    // Row-scaled: a row here is one token ff_exp-wide expert
-                    // activation, which is the dimension the down projection
-                    // reduces over, so the scatter undoes the scale with the
-                    // per-row weight it already applies.
-                    be_->silu_mul(ws_gateg_, ws_gateg_, ws_upg_, m * ff_exp, ff_exp,
-                                  static_cast<f32 *>(ws_scale_));
-                    scatter_scale = static_cast<const f32 *>(ws_scale_);
+                    if (mc.ffn_swiglu_oai) {
+                        be_->swiglu_oai(ws_gateg_, ws_gateg_, ws_upg_, m * ff_exp);
+                        // Bounded by construction (|g| <= 7, |y + 1| <= 8), so
+                        // there is no row maximum to store and the scatter sums
+                        // the values as they are.
+                        scatter_scale = nullptr;
+                    } else {
+                        // Row-scaled: a row here is one token ff_exp-wide
+                        // expert activation, which is the dimension the down
+                        // projection reduces over, so the scatter undoes the
+                        // scale with the per-row weight it already applies.
+                        be_->silu_mul(ws_gateg_, ws_gateg_, ws_upg_, m * ff_exp,
+                                      ff_exp, static_cast<f32 *>(ws_scale_));
+                        scatter_scale = static_cast<const f32 *>(ws_scale_);
+                    }
                 }
             } else if (mc.ffn_relu_sqr) {
                 // Gate-less with squared ReLU (nemotron_h_moe): the activation
@@ -3688,6 +5190,11 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             }
             be_->gemm(ws_x2_, ws_gateg_, re->down.data, re->down.type, n_embd_,
                       ff_exp, m);
+            // The down leg's bias is over the OUTPUT width (n_embd), not ff.
+            if (L.exp_down_bias)
+                be_->add_bias_cols(ws_x2_,
+                                   L.exp_down_bias + static_cast<i64>(e) * n_embd_,
+                                   m, n_embd_);
             if (moe_probe()) {
                 std::vector<f32> t(static_cast<size_t>(m) * static_cast<size_t>(n_embd_));
                 be_->download_f32(t.data(), ws_x2_, static_cast<i64>(t.size()));
@@ -4005,6 +5512,350 @@ bool Engine::topk_argmax(i32 *out) {
     if (topk_n_ > kTopKCap || id < 0) return false;
     *out = id;
     topk_valid_ = true;
+    return true;
+}
+
+// The nextn-block round. Same shape as generate_speculative -- greedy only,
+// one batched verification per round, longest matching prefix kept -- with the
+// proposal side replaced by the block that ships in the target's own file.
+//
+// The block is not a model: it has no embedding and no head of its own, and its
+// input at position p is the TARGET's post-stack hidden state (hnorm) fused with
+// that position's token embedding (enorm). So a round is
+//
+//   * prime: every position the target has already computed is fed through the
+//     block once, from the hidden rows captured during the target's forwards
+//   * propose: the block's chain -- position pos-1 uses the captured target row,
+//     every later proposal feeds the block's OWN previous output, which is what
+//     lets one head propose several tokens from one target forward
+//   * verify: one batched forward of the proposals, one argmax per row
+//   * realign: roll the block's KV back to the accepted prefix and re-feed the
+//     accepted tokens' positions from their captured TARGET rows. The block's
+//     speculative rows were built from the block's hidden, not the target's, so
+//     keeping them would silently draft from a different distribution -- the
+//     failure class this file warns about: no crash, just different text.
+bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *res,
+                                      const std::vector<i32> &ids, f64 *prefill_ms,
+                                      f64 *decode_ms, i64 *decode_steps) {
+    const MtpBlock &m = model_.mtp();
+    const i32 k = std::max<i32>(1, draft_tokens_);
+    // A hybrid target (gated delta net layers) has no KV to rewind: its state
+    // is a recurrence. That is why the round snapshots it, and why an accepted
+    // prefix is replayed rather than merely re-pointed.
+    const bool recurrent = model_.is_recurrent();
+    const bool can_snapshot =
+        recurrent && mtp_rec_snap_ != nullptr && mtp_conv_snap_ != nullptr;
+
+    // ---- prompt prefill (the capture rides every forward) -----------------
+    expert_phase(ExpertCache::PhasePrefill);
+    const Timer prefill_timer;
+    for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        const i32 n = static_cast<i32>(
+            std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
+        const bool last = (i + n) == static_cast<i64>(ids.size());
+        if (!forward(ids.data() + i, n, static_cast<i32>(i), last)) {
+            res->error = kv_resource_error();
+            res->finish = FinishError;
+            return false;
+        }
+    }
+    fetch_logits(false);
+    *prefill_ms = prefill_timer.ms();
+    expert_phase(ExpertCache::PhaseDecode);
+
+    i64 pos = static_cast<i64>(ids.size());
+    mtp_fed_ = 0;
+    if (!mtp_prime(pos)) {
+        res->error = "the nextn block could not be primed over the prompt";
+        res->finish = FinishError;
+        return false;
+    }
+
+    Sampler sampler;
+    sampler.reset(p.sampler);
+    sampler.accept(ids.data(), static_cast<int>(ids.size()));
+    TokenEmitter emit(p, tok_, sampler, res, ids);
+
+    const Timer decode_timer;
+    i64 timed_decode_steps = 0;
+    auto finish_run = [&](Finish f) {
+        res->finish = f;
+        *decode_ms = decode_timer.ms();
+        *decode_steps = timed_decode_steps;
+        emit.finish(f == FinishStop);
+        // Reported here, not at the loop's exit: most runs end through one of
+        // the early returns above, and a summary that only prints on the
+        // normal exit is missing from exactly the runs worth reading.
+        if (spec_steps_ > 0) {
+            const f64 rate =
+                draft_proposed_ > 0
+                    ? 100.0 * static_cast<f64>(draft_accepted_) /
+                          static_cast<f64>(draft_proposed_)
+                    : 0.0;
+            KRK_INFO("mtp spec: %llu round(s), %llu of %llu proposals kept "
+                     "(%.1f%%), %.2f token(s)/round | propose %.0f ms | verify "
+                     "%.0f ms | snapshot %.0f ms | refeed %.0f ms | block "
+                     "experts %.0f ms, %llu of %llu promoted",
+                     static_cast<unsigned long long>(spec_steps_),
+                     static_cast<unsigned long long>(draft_accepted_),
+                     static_cast<unsigned long long>(draft_proposed_), rate,
+                     spec_steps_ > 0
+                         ? static_cast<f64>(res->generated) /
+                               static_cast<f64>(spec_steps_)
+                         : 0.0,
+                     mtp_propose_ms_, mtp_verify_ms_, mtp_snap_ms_,
+                     mtp_refeed_ms_, mtp_acq_ms_,
+                     static_cast<unsigned long long>(mtp_acq_miss_),
+                     static_cast<unsigned long long>(mtp_acq_n_));
+        }
+    };
+
+    // Invariant at the top of every round: the target's KV holds [0, pos) and
+    // logits_host_ predicts pos; the block's KV holds the same positions, built
+    // from those positions' target hidden rows.
+    std::vector<i32> prop(static_cast<size_t>(k), -1);
+    // The token at position pos-1, which is what proposal 0 must embed. It is
+    // NOT res->tokens.back() on the first round: the emitter only appends what
+    // it emits, so that vector is empty until the first accepted token, and
+    // reading it there is an out-of-range back() (measured: SIGSEGV on Tiel).
+    auto last_ctx_token = [&]() -> i32 {
+        return res->tokens.empty() ? ids.back() : res->tokens.back();
+    };
+    // Re-feed the block over the accepted prefix. `from` is the position the
+    // round started at: rows [0, from) are known-good target rows.
+    auto realign_block = [&](i64 from) {
+        const u64 t = now_us();
+        mtp_fed_ = from;
+        const bool ok = mtp_prime(pos);
+        mtp_refeed_ms_ += static_cast<f64>(now_us() - t) / 1000.0;
+        return ok;
+    };
+
+    while (res->generated < p.max_tokens && pos < kv_cap_) {
+        KRK_TIME_HOST("spec.round");
+        if (p.debug_topk > 0)
+            dump_topk(p.debug_topk, res->generated, pos, logits_host_, n_vocab_);
+        const i32 first = argmax_of(logits_host_, n_vocab_);
+        const i64 from = pos;
+
+        // ---- propose: the block's own chain -------------------------------
+        const u64 t_prop = now_us();
+        i32 d = 0;
+        for (; d < k; d++) {
+            const i64 fpos = pos - 1 + d;
+            if (fpos < 0 || fpos >= kv_cap_) break;
+            const i32 tok_in =
+                d == 0 ? last_ctx_token() : prop[static_cast<size_t>(d - 1)];
+            if (tok_in == tok_.eos()) break;
+            mtp_embed(tok_in);
+            if (d == 0) {
+                if (fpos >= mtp_captured_) break;
+                be_->copy_act(mtp_h_,
+                              act_at(mtp_hidden_, be_->act_size(), fpos * n_embd_),
+                              n_embd_);
+            } else {
+                // The block's residual from the previous proposal. Copied
+                // before this forward overwrites ws_x_.
+                be_->copy_act(mtp_h_, ws_x_, n_embd_);
+            }
+            if (!mtp_block_forward(m, static_cast<i32>(fpos), true)) break;
+            i32 id = -1;
+            if (!topk_argmax(&id)) {
+                be_->sync();
+                be_->download_f32(logits_host_, ws_logits_, n_vocab_);
+                id = argmax_of(logits_host_, n_vocab_);
+            }
+            if (id < 0) break;
+            prop[static_cast<size_t>(d)] = id;
+            draft_proposed_++;
+        }
+        mtp_propose_ms_ += static_cast<f64>(now_us() - t_prop) / 1000.0;
+        spec_steps_++;
+        timed_decode_steps++;
+
+        // ---- pre-check: the target must agree with proposal 0 -------------
+        if (d == 0 || first != prop[0]) {
+            if (spec_trace())
+                std::fprintf(stderr,
+                             "[mtp-s] round %llu pos=%lld pre-check FAILED: "
+                             "target=%d block=%d (d=%d)\n",
+                             static_cast<unsigned long long>(spec_steps_),
+                             static_cast<long long>(pos), first,
+                             d > 0 ? prop[0] : -1, d);
+            if (first == tok_.eos()) {
+                finish_run(FinishEos);
+                return true;
+            }
+            emit.accept(first);
+            if (pos + 1 >= kv_cap_) {
+                finish_run(FinishContext);
+                return true;
+            }
+            if (!forward(&first, 1, static_cast<i32>(pos), true)) {
+                res->error = kv_resource_error();
+                finish_run(FinishError);
+                return false;
+            }
+            pos++;
+            fetch_logits(false);
+            if (!realign_block(from)) {
+                res->error = "the nextn block's KV could not be re-fed after a "
+                             "pre-check miss";
+                finish_run(FinishError);
+                return false;
+            }
+            continue;
+        }
+
+        // ---- verify: one batched forward of the d proposals --------------
+        i32 d_eff = d;
+        while (d_eff > 0 && pos + d_eff > kv_cap_) d_eff--;
+        if (d_eff <= 0) {
+            finish_run(FinishContext);
+            return true;
+        }
+        // The verification pass advances the target over rows it may not keep.
+        // Nothing in a hybrid's delta-rule state can be undone afterwards, so
+        // the state is copied out before the pass and restored on a rejection.
+        if (can_snapshot) {
+            const u64 t_snap = now_us();
+            be_->copy_device(mtp_rec_snap_, rec_state_, mtp_rec_snap_bytes_);
+            be_->copy_device(mtp_conv_snap_, conv_state_, mtp_conv_snap_bytes_);
+            mtp_snap_ms_ += static_cast<f64>(now_us() - t_snap) / 1000.0;
+        }
+        const u64 t_ver = now_us();
+        if (!forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone)) {
+            res->error = kv_resource_error();
+            finish_run(FinishError);
+            return false;
+        }
+        kv_pos_ = pos + d_eff;
+        std::vector<i32> row_ids(static_cast<size_t>(d_eff), 0);
+        for (i32 j = 0; j < d_eff; j++) {
+            head_compute(j);
+            i32 id = 0;
+            if (!topk_argmax(&id)) {
+                be_->sync();
+                be_->download_f32(logits_host_, ws_logits_, n_vocab_);
+                id = argmax_of(logits_host_, n_vocab_);
+            }
+            row_ids[static_cast<size_t>(j)] = id;
+        }
+        mtp_verify_ms_ += static_cast<f64>(now_us() - t_ver) / 1000.0;
+        auto row_pred = [&](i32 j) { return row_ids[static_cast<size_t>(j - 1)]; };
+
+        // ---- accept the longest greedy-matching prefix --------------------
+        i32 a = 1; // proposal 0 passed the pre-check
+        while (a < d_eff && row_pred(a) == prop[static_cast<size_t>(a)]) a++;
+        const bool full = (a == d_eff);
+        if (spec_trace()) {
+            std::fprintf(stderr, "[mtp-s] round %llu pos=%lld prop=[",
+                         static_cast<unsigned long long>(spec_steps_),
+                         static_cast<long long>(pos));
+            for (i32 j = 0; j < d_eff; j++)
+                std::fprintf(stderr, "%s%d", j ? "," : "",
+                             prop[static_cast<size_t>(j)]);
+            std::fprintf(stderr, "] row=[");
+            for (i32 j = 0; j < d_eff; j++)
+                std::fprintf(stderr, "%s%d", j ? "," : "",
+                             row_ids[static_cast<size_t>(j)]);
+            std::fprintf(stderr, "] accept=%d full=%d\n", a, full ? 1 : 0);
+        }
+
+        bool stop_hit = false;
+        i32 emitted = 0;
+        for (i32 j = 0; j < a; j++) {
+            if (res->generated >= p.max_tokens) break;
+            const i32 t = prop[static_cast<size_t>(j)];
+            draft_accepted_++;
+            stop_hit = emit.accept(t);
+            emitted++;
+            if (stop_hit) break;
+        }
+        if (stop_hit) {
+            // The run ends here, so a hybrid's state is never read again; a
+            // dense target still gives its cache back.
+            if (!recurrent) kv_rollback(pos + emitted);
+            finish_run(FinishStop);
+            return true;
+        }
+        if (full && res->generated < p.max_tokens) {
+            // The row the last proposal wrote predicts position pos+d: the
+            // target's own bonus token, which costs no extra forward to learn.
+            const i32 bonus = row_pred(d_eff);
+            if (bonus == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
+            emit.accept(bonus);
+            emitted++;
+            if (pos + emitted < kv_cap_ && res->generated < p.max_tokens) {
+                const i32 b = res->tokens.back();
+                if (spec_trace())
+                    std::fprintf(stderr, "[mtp-s] BONUS fed %d at %lld\n", b,
+                                 static_cast<long long>(pos + emitted - 1));
+                if (!forward(&b, 1, static_cast<i32>(pos + emitted - 1), true)) {
+                    res->error = kv_resource_error();
+                    finish_run(FinishError);
+                    return false;
+                }
+                fetch_logits(false);
+            }
+        }
+        if (!full) {
+            if (can_snapshot) {
+                // Undo the rejected suffix by restoring the pre-round state and
+                // replaying the accepted prefix in ONE batched forward: the
+                // recurrent scan walks the rows in order, so this is the same
+                // state and the same logits a sequential loop would have left,
+                // for one batched pass instead of `emitted` decode steps.
+                be_->copy_device(rec_state_, mtp_rec_snap_, mtp_rec_snap_bytes_);
+                be_->copy_device(conv_state_, mtp_conv_snap_, mtp_conv_snap_bytes_);
+                if (emitted > 0) {
+                    if (!forward_core(prop.data(), emitted, static_cast<i32>(pos),
+                                      LogitsLast)) {
+                        res->error = kv_resource_error();
+                        finish_run(FinishError);
+                        return false;
+                    }
+                    fetch_logits(false);
+                }
+            } else {
+                // A dense target: drop the rejected rows; the next step's
+                // logits are verification row `emitted` (1-based), still in
+                // ws_x_ because the bonus forward did not run.
+                kv_rollback(pos + emitted);
+                if (emitted > 0) {
+                    head_compute(emitted - 1);
+                    if (spec_row_sync()) be_->sync();
+                    be_->download_f32(logits_host_, ws_logits_, n_vocab_);
+                }
+            }
+        } else if (res->generated >= p.max_tokens && !recurrent) {
+            // A full match whose bonus token was not forwarded (the token
+            // limit ended the run): give the cache back.
+            kv_rollback(pos + emitted);
+        }
+        pos += emitted;
+        if (recurrent) kv_pos_ = pos;
+
+        if (res->generated >= p.max_tokens) {
+            finish_run(FinishLength);
+            return true;
+        }
+        if (pos + 1 >= kv_cap_) {
+            finish_run(FinishContext);
+            return true;
+        }
+        if (!realign_block(from)) {
+            res->error = "the nextn block's KV could not be re-fed after a round";
+            finish_run(FinishError);
+            return false;
+        }
+    }
+
+    finish_run(res->generated >= p.max_tokens ? FinishLength : FinishContext);
     return true;
 }
 
@@ -4828,6 +6679,8 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     // (The server's per-request kv_rollback(0) agrees; this just makes the
     // primitive correct on its own.)
     kv_pos_ = 0;
+    mtp_fed_ = 0;
+    if (trace_hash_on_) trace_stage_.clear();
     if (model_.is_recurrent()) recurrent_reset();
 
     // ---- tokenize ---------------------------------------------------------
@@ -4843,6 +6696,49 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
                  static_cast<long long>(kv_cap_));
     }
     res->prompt_tokens = static_cast<i32>(ids.size());
+
+    // The nextn block is a drafter that ships inside the target's own file, so
+    // it is tried before the external draft engines; --draft and --mtp-spec are
+    // alternatives, and a run with both loaded uses the block.
+    // A hybrid target is allowed when its recurrent state could be snapshotted:
+    // the round restores it and replays the accepted prefix, which is what the
+    // delta rule cannot do through kv_rollback.
+    if (mtp_spec_ && p.sampler.greedy &&
+        (!model_.is_recurrent() || mtp_rec_snap_ != nullptr)) {
+        f64 prefill_ms = 0, decode_ms = 0;
+        i64 decode_steps = 0;
+        const bool ok = generate_speculative_mtp(p, res, ids, &prefill_ms,
+                                                 &decode_ms, &decode_steps);
+        res->prefill_ms = prefill_ms;
+        res->decode_ms = decode_ms;
+        res->decode_steps = decode_steps;
+        return ok;
+    }
+    if (mtp_spec_ && !p.sampler.greedy)
+        KRK_WARN("MTP speculation is greedy-only; sampling runs without the block");
+    else if (mtp_spec_ && model_.is_recurrent() && !mtp_rec_snap_)
+        KRK_WARN("MTP speculation needs a recurrent-state snapshot for this "
+                 "hybrid target and could not allocate one; decoding plainly");
+
+    // The external head is a third drafter and goes first: it needs no draft
+    // model and no block inside the target. It is the one drafter that also
+    // works under sampling -- its round verifies with the distribution-
+    // preserving rule rather than a prefix match.
+    if (head_ && (p.sampler.greedy || p.sampler.temp > 0.0f)) {
+        f64 prefill_ms = 0, decode_ms = 0;
+        i64 decode_steps = 0;
+        const bool ok = generate_speculative_head(p, res, ids, &prefill_ms,
+                                                  &decode_ms, &decode_steps);
+        res->prefill_ms = prefill_ms;
+        res->decode_ms = decode_ms;
+        res->decode_steps = decode_steps;
+        return ok;
+    }
+    if (head_ && !p.sampler.greedy && p.sampler.temp <= 0.0f) {
+        KRK_WARN("the draft head was not used for this request: sampler.temp is "
+                 "not positive, which is the greedy limit, and greedy with a head "
+                 "is taken by the branch above");
+    }
 
     // Greedy-only fast path: with a draft loaded and argmax sampling requested,
     // speculative decoding produces bit-identical output to the plain loop, so
@@ -4899,6 +6795,39 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     }
     fetch_logits(device_topk);
     if (expert_scan_) expert_scan_tokens_ += static_cast<i64>(ids.size());
+    // The MTP probe runs here, on the prompt's last row, and before the decode
+    // loop touches anything: it is a measurement of the head, not a decoder,
+    // and generation continues exactly as it would have without it.
+    // KRK_MTP_PROBE_ALL=1 additionally probes every decode step, which is what
+    // turns one anecdote into an acceptance rate; the block's KV is incremental
+    // (see mtp_probe_step), so a step costs one block forward.
+    const bool mtp_all = mtp_probe_report_ && [] {
+        const char *e = std::getenv("KRK_MTP_PROBE_ALL");
+        return e && e[0] != '\0' && e[0] != '0';
+    }();
+    i32 mtp_steps = 0, mtp_hits = 0;
+    auto run_mtp_probe = [&]() {
+        if (!mtp_probe_report_ || !mtp_probe_enabled()) return;
+        const MtpProbe mp = mtp_probe_step();
+        if (!mp.ok) {
+            KRK_WARN("mtp probe: did not run -- %s", mp.note.c_str());
+            return;
+        }
+        const i32 dids[1] = {mp.draft_id};
+        const i32 tids[1] = {mp.target_id};
+        const std::string dtext = tok_.decode(dids, 1);
+        const std::string ttext = tok_.decode(tids, 1);
+        mtp_steps++;
+        if (mp.draft_id == mp.target_id) mtp_hits++;
+        std::fprintf(stderr,
+                     "[mtp   ] pos %d: draft %d \"%s\" (%.4f) | target %d "
+                     "\"%s\" (%.4f) | %s | %.1f ms\n",
+                     mp.pos, mp.draft_id, dtext.c_str(),
+                     static_cast<f64>(mp.draft_logit), mp.target_id,
+                     ttext.c_str(), static_cast<f64>(mp.target_logit),
+                     mp.draft_id == mp.target_id ? "MATCH" : "miss", mp.ms);
+    };
+    run_mtp_probe();
     res->prefill_ms = prefill_timer.ms();
     expert_phase(ExpertCache::PhaseDecode);
 
@@ -4960,6 +6889,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
             KRK_TIME_HOST_N("decode.fetch", hs_fetch);
             fetch_logits(device_topk);
         }
+        if (mtp_all) run_mtp_probe();
         timed_decode_steps++;
         if (split) {
             const auto t2 = std::chrono::steady_clock::now();
@@ -4975,6 +6905,12 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
 
     emit.finish(res->finish == FinishStop);
 
+    if (mtp_probe_report_ && mtp_steps > 0)
+        KRK_INFO("mtp probe: %d step(s), %d accepted (%.1f%%) -- a greedy round "
+                 "would have taken %d of %d drafted tokens",
+                 mtp_steps, mtp_hits,
+                 100.0 * static_cast<f64>(mtp_hits) / static_cast<f64>(mtp_steps),
+                 mtp_hits, mtp_steps);
     res->decode_ms = decode_timer.ms();
     res->decode_steps = timed_decode_steps;
     if (g_split_steps > 0) {

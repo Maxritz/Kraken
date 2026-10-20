@@ -345,6 +345,16 @@ public:
                             scores[static_cast<size_t>(j)] = ex;
                             sum += ex;
                         }
+                        // The sink enters at this row's running max and
+                        // contributes no value, so `scores` and the output
+                        // sum are untouched. Guarded twice: an absent sink
+                        // keeps the exact arithmetic above, and a ZEROED
+                        // sink logit is treated as no sink, so a zeroed
+                        // sink row is bit-identical to the absent path --
+                        // the A/B arm the test group pins with `==`.
+                        const f32 sink_logit = d.sinks ? d.sinks[h] : 0.0f;
+                        if (sink_logit != 0.0f)
+                            sum += std::exp(sink_logit - mx);
                         const f32 inv = sum > 0 ? 1.0f / sum : 0.0f;
                         f32 *oh = of + t * (d.n_head * d.hd) + h * d.hd;
                         for (i64 i = 0; i < d.hd; i++) oh[i] = 0;
@@ -374,6 +384,25 @@ public:
         // 1.0 per row its contract expects.
         if (row_scale && row_len > 0 && n % row_len == 0)
             for (i64 r = 0; r < n / row_len; r++) row_scale[r] = 1.0f;
+    }
+
+    // gpt-oss's FFN activation, the same formula as the device kernel and as
+    // ggml_compute_forward_swiglu_oai_f32: one-sided clamp on the gate,
+    // two-sided on the up operand, 1.702 in the sigmoid, (y + 1) as the
+    // multiplier. Written out rather than folded so the two arms are
+    // comparable line by line.
+    void swiglu_oai(void *out, const void *gate, const void *up, i64 n) override {
+        f32 *o = static_cast<f32 *>(out);
+        const f32 *g = static_cast<const f32 *>(gate);
+        const f32 *u = static_cast<const f32 *>(up);
+        par_for(n, 8192, 2.0 * static_cast<f64>(n),
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const f32 x = std::fmin(g[i], 7.0f);
+                        const f32 y = std::fmin(std::fmax(u[i], -7.0f), 7.0f);
+                        o[i] = (x / (1.0f + std::exp(-1.702f * x))) * (y + 1.0f);
+                    }
+                });
     }
 
     void add_bias_rows(void *out, const f32 *bias, i64 n, i64 rows) override {

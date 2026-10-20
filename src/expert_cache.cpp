@@ -111,6 +111,7 @@ inline void xtrace(i32 layer, i32 expert, u8 tier) {
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <unordered_set>
 
@@ -132,9 +133,37 @@ void ExpertCache::configure(Backend *be, size_t budget_bytes, size_t host_budget
     budget_ = budget_bytes;
     host_budget_ = host_budget_bytes;
     slot_budget_ = slot_budget;
+    // KRK_HOST_PIN_MB: how much of WARM to admit into pinned host memory. Off by
+    // default, because the arm has to exist before the measurement (and because
+    // pinned pages are a scarce, non-swappable pool on Windows). Clamped to the
+    // tier it decorates: a pin budget larger than WARM would just never bind.
+    host_pin_bytes_ = 0;
+    host_pinned_bytes_ = 0;
+    if (const char *e = std::getenv("KRK_HOST_PIN_MB")) {
+        const long long mib = std::atoll(e);
+        if (mib > 0) {
+            const size_t want = static_cast<size_t>(mib) * 1024u * 1024u;
+            host_pin_bytes_ = host_budget_ ? std::min(want, host_budget_) : want;
+        }
+    }
     // An explicit slot budget IS the capacity. Without one this stays 0 until
     // acquire() fills it in from the expert size of the layer it is serving.
     capacity_ = slot_budget;
+    if (be_) be_->set_expert_pool_owner(this, budget_);
+}
+
+void ExpertCache::set_host_pin_budget(size_t bytes) {
+    host_pin_bytes_ = host_budget_ ? std::min(bytes, host_budget_) : bytes;
+    host_pinned_bytes_ = 0;
+}
+
+void ExpertCache::set_vram_budget(size_t bytes) {
+    if (bytes >= budget_) return;
+    budget_ = bytes;
+    // Without an explicit slot budget the capacity is derived from the byte
+    // budget on the next acquire(); clear it so the report cannot keep quoting
+    // the count the old budget implied.
+    if (slot_budget_ == 0) capacity_ = 0;
     if (be_) be_->set_expert_pool_owner(this, budget_);
 }
 
@@ -295,12 +324,22 @@ void ExpertCache::drop_host(Slot &s) {
     for (QuantTensor *q : {&s.h.gate, &s.h.up, &s.h.down}) {
         // Deferred: a promotion copy of this expert may still be in flight on a
         // side stream, and freeing the source under it is a use-after-free.
-        if (q->present() && q->data) be_->release_host_deferred_budgeted(q->data);
+        // The pinned arm needs its own deallocator -- hipFree on a hipHostMalloc
+        // block is the other half of that same mistake.
+        if (q->present() && q->data) {
+            if (s.host_pinned) be_->release_host_pinned_deferred(q->data);
+            else be_->release_host_deferred_budgeted(q->data);
+        }
         *q = {};
     }
     s.h = {};
     host_bytes_ -= s.host_bytes;
+    if (s.host_pinned) {
+        const size_t drop = std::min(host_pinned_bytes_, s.host_bytes);
+        host_pinned_bytes_ -= drop;
+    }
     s.host_bytes = 0;
+    s.host_pinned = false;
 }
 
 void ExpertCache::forget_if_dead(std::unordered_map<u64, Slot>::iterator it) {
@@ -371,6 +410,14 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
     if (!be_) return false;
     const GgufTensor *from[3] = {src.gate, src.up, src.down};
     QuantTensor *to[3] = {&s.h.gate, &s.h.up, &s.h.down};
+    // Pin whole slots, never individual slices: the promotion hands all three
+    // slices to one batch call, and a batch whose sources differ in kind has no
+    // single copy path. Admission order is rank order when the model carries an
+    // expert index, so this prefix is the hot set.
+    const size_t host_need = s.slice[0] + s.slice[1] + s.slice[2];
+    const bool pin = host_pin_bytes_ > 0 && host_need > 0 &&
+                     host_pinned_bytes_ + host_need <= host_pin_bytes_;
+    s.host_pinned = pin;
     size_t bytes = 0;
     for (int i = 0; i < 3; i++) {
         const GgufTensor *t = from[i];
@@ -378,8 +425,13 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
         if (!t || per == 0) continue;
         // Each slice reserves against the process-wide host ledger atomically;
         // earlier slices and every other cache are already accounted for there.
-        void *p = be_->alloc_host_pageable_budgeted(per);
-        if (!p) return false; // partial copies are dropped by the caller
+        // A pinned slot skips the process-wide pageable ledger on purpose: its
+        // bytes come out of the driver's pin pool, which host_pin_bytes_ bounds
+        // instead, and charging both would double-count the same RAM.
+        void *p = pin ? be_->alloc_host(per) : be_->alloc_host_pageable_budgeted(per);
+        // Partial copies are dropped by the caller, which calls drop_host and
+        // therefore frees whatever landed with the matching deallocator.
+        if (!p) return false;
         // A read() out of the page cache, not a memcpy of the mapping: the
         // mapping faults one 4 KiB page at a time and would leave a resident
         // page per staged byte, so the tier would cost the model's size in RAM
@@ -390,7 +442,8 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
             MsTimer t(&read_ms_, phase_sink(&pf_read_ms_, &dc_read_ms_));
             if (!be_->read_host(p, mapped, per)) std::memcpy(p, mapped, per);
         } catch (...) {
-            be_->release_host_pageable_budgeted(p);
+            if (pin) be_->release_host(p);
+            else be_->release_host_pageable_budgeted(p);
             return false;
         }
         to[i]->data = p;
@@ -400,6 +453,7 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
         bytes += per;
     }
     s.host_bytes = bytes;
+    if (pin) host_pinned_bytes_ += bytes;
     return true;
 }
 
@@ -516,7 +570,14 @@ bool ExpertCache::promote_to_vram(Slot &s, bool staged) {
     }
     {
         MsTimer t(&xfer_ms_, phase_sink(&pf_xfer_ms_, &dc_xfer_ms_));
-        if (staged) {
+        if (s.host_pinned) {
+            // The hot arm: the source is already pinned, so this is the DMA and
+            // nothing else -- no bounded ring, no host memcpy of the expert in
+            // front of it. The backend publishes the copies to the default
+            // stream with one event, which is why no marker travels back: the
+            // consumer's own stream order already covers the bytes.
+            be_->upload_pinned_batch(batch_dst, batch_src, batch_len, nb);
+        } else if (staged) {
             s.ready = be_->upload_expert_staged(batch_dst, batch_src, batch_len, nb);
             s.staged = true;
         } else {
@@ -650,6 +711,71 @@ size_t ExpertCache::preload_one(const ExpertSource &src, i32 layer, i32 expert) 
     return staged;
 }
 
+size_t ExpertCache::pin_layer(const ExpertSource &src, i32 layer,
+                              std::string *why) {
+    if (!be_ || !src.present() || src.n_expert <= 0) return 0;
+    const size_t gate_b = src.per_expert(src.gate);
+    const size_t up_b = src.per_expert(src.up);
+    const size_t down_b = src.per_expert(src.down);
+    const size_t per = be_->pooled_size(gate_b) + be_->pooled_size(up_b) +
+                       be_->pooled_size(down_b);
+    if (per == 0) return 0;
+    // Only what is missing has to fit: a set that is already resident (or
+    // partly resident from the warmup) is admitted for the difference.
+    size_t need = 0;
+    size_t already = 0;
+    for (i32 e = 0; e < src.n_expert; e++) {
+        const auto it = slots_.find(slot_key(layer, e));
+        if (it != slots_.end() && it->second.in_vram())
+            already++;
+        else
+            need += per;
+    }
+    // The test is whether the set can EVER fit, not whether the budget has room
+    // this instant: the warmup fills the tier to its cap, so "no uncommitted
+    // bytes" is the normal state and acquire()'s own make_vram_room is what
+    // turns a full cache into room by evicting unpinned slots (Tiel: 3085
+    // resident, 256 needed). Only a set larger than the whole budget is refused.
+    if (need > budget_) {
+        if (why) {
+            char b[160];
+            std::snprintf(b, sizeof(b),
+                          "%d expert(s) need %.0f MiB and the whole device "
+                          "budget is %.0f MiB",
+                          src.n_expert, static_cast<f64>(need) / 1048576.0,
+                          static_cast<f64>(budget_) / 1048576.0);
+            *why = b;
+        }
+        return 0;
+    }
+    size_t pinned = 0;
+    for (i32 e = 0; e < src.n_expert; e++) {
+        acquire(src, layer, e);
+        const auto it = slots_.find(slot_key(layer, e));
+        if (it == slots_.end() || !it->second.in_vram()) continue;
+        // A pin is the promise: the eviction scan keeps pinned slots last, and
+        // the counter is raised to the threshold so the decay window cannot
+        // drop it (this bank is re-acquired by every proposal, so it re-earns
+        // the count anyway).
+        it->second.pinned = true;
+        if (it->second.count < kPinThreshold) it->second.count = kPinThreshold;
+        pinned++;
+    }
+    // The footprint, not `bytes_` after the fact: admitting the set evicts other
+    // slots, so the resident total can go DOWN while this set goes in. Reporting
+    // the difference of the two totals underflowed to 1.7e13 MiB on the first
+    // measured run.
+    const size_t added = (pinned - already) * per;
+    KRK_INFO("expert cache: pinned layer %d's routed set (%zu of %d expert(s), "
+             "%.0f MiB added, %.0f MiB resident of %.0f MiB; %zu were already "
+             "resident)",
+             layer, pinned, src.n_expert,
+             static_cast<f64>(added) / 1048576.0,
+             static_cast<f64>(bytes_) / 1048576.0,
+             static_cast<f64>(budget_) / 1048576.0, already);
+    return pinned * per;
+}
+
 size_t ExpertCache::preload(const ExpertSource &src, i32 layer) {
     size_t staged = 0;
     for (i32 e = 0; e < src.n_expert; e++) {
@@ -781,7 +907,13 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     }
     {
         MsTimer t(&xfer_ms_, phase_sink(&pf_xfer_ms_, &dc_xfer_ms_));
-        be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
+        // A COLD miss just read those bytes into WARM, and when that copy is
+        // pinned the read left them in a buffer the device can be handed
+        // directly -- so the promotion out of it is the same bare DMA the
+        // warm-hit path pays, not a ring memcpy of bytes that were already
+        // copied once on the way in.
+        if (s.host_pinned) be_->upload_pinned_batch(batch_dst, batch_src, batch_len, nb);
+        else be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
     }
 
     bytes_ += need;
@@ -812,6 +944,36 @@ bool ExpertCache::stage_next(const ExpertSource &src, i32 layer, i32 expert,
     return ok;
 }
 
+size_t ExpertCache::stage_batch(const ExpertSource &src, i32 layer,
+                                const i32 *experts, int n) {
+    if (!be_ || !src.present() || n <= 0 || budget_ == 0) return 0;
+    std::unordered_set<u64> seen;
+    size_t staged = 0;
+    for (int i = 0; i < n; i++) {
+        const i32 e = experts[i];
+        if (e < 0 || e >= src.n_expert) continue;
+        const u64 key = slot_key(layer, e);
+        if (!seen.insert(key).second) continue;
+        auto it = slots_.find(key);
+        // Not WARM yet: this is a miss stage_batch cannot help (acquire will
+        // read it), and staging it here would only serialise the read ahead of
+        // the rows that need it.
+        if (it == slots_.end() || !it->second.in_host() || it->second.in_vram()) continue;
+        // Budget: skip rather than evict-and-refill, because a promotion that
+        // evicts the expert the current row is about to use is a loss, and the
+        // acquire path makes the same call on its own.
+        if (over_budget(it->second.bytes)) {
+            ++lookahead_rejected_;
+            continue;
+        }
+        if (promote_to_vram(it->second, /*staged=*/true)) {
+            ++lookahead_staged_;
+            ++staged;
+        }
+    }
+    return staged;
+}
+
 size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
                                    const i32 *experts, int n) {
     if (!be_ || host_budget_ == 0 || !src.present() || n <= 0) return 0;
@@ -830,11 +992,17 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
         u64 key;
         i32 expert;
         void *dst[3];
+        // Whole slots only: the promotion batches all three slices and a batch
+        // cannot mix a pinned source with a pageable one.
+        bool pinned = false;
     };
     std::vector<Job> jobs;
     jobs.reserve(static_cast<size_t>(n));
     std::unordered_set<u64> seen;
     size_t reserved = 0;
+    // Pinned bytes are spoken for as each job is prepared but only counted once
+    // the slot commits, so the budget has to hold both numbers at once.
+    size_t pending_pin = 0;
     bool host_reserve_hit = false;
     for (int j = 0; j < n; j++) {
         const i32 e = experts[j];
@@ -875,28 +1043,43 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
             s.seq = seq_++;
             it = slots_.emplace(key, std::move(s)).first;
         }
-        Job job{key, e, {nullptr, nullptr, nullptr}};
+        Job job{key, e, {nullptr, nullptr, nullptr}, false};
+        // The ranked prefix of the tier, in admission order: this is the hot set
+        // the decode loop keeps coming back to, and it is the half whose
+        // promotion is a bare DMA instead of a DMA behind a 12.6 MB memcpy.
+        const bool pin = host_pin_bytes_ > 0 &&
+                         host_pinned_bytes_ + pending_pin + one <= host_pin_bytes_;
         bool ok = true;
         size_t job_reserved = 0;
         for (int i = 0; i < 3; i++) {
             if (!slice[i]) continue;
-            job.dst[i] = be_->alloc_host_pageable_budgeted(slice[i]);
+            // A pinned slice is not charged to the pageable LEDGER: it is pin
+            // pool, bounded by host_pin_bytes_, and charging both would count
+            // the same RAM twice. It IS charged to the tier budget below --
+            // a pin decorates WARM, it does not extend it.
+            job.dst[i] = pin ? be_->alloc_host(slice[i])
+                             : be_->alloc_host_pageable_budgeted(slice[i]);
             if (!job.dst[i]) {
                 ok = false;
-                host_reserve_hit = !SharedHostRamBudget::can_admit(
+                host_reserve_hit = !pin && !SharedHostRamBudget::can_admit(
                     slice[i], be_->host_available_bytes(), be_->host_total_bytes());
                 break;
             }
-            if (job.dst[i]) job_reserved += slice[i];
+            job_reserved += slice[i];
         }
         if (!ok) {
             for (int i = 0; i < 3; i++)
-                if (job.dst[i]) be_->release_host_pageable_budgeted(job.dst[i]);
+                if (job.dst[i]) {
+                    if (pin) be_->release_host(job.dst[i]);
+                    else be_->release_host_pageable_budgeted(job.dst[i]);
+                }
             warm_rejects_++;
             forget_if_dead(it);
             if (host_reserve_hit) break;
             continue;
         }
+        job.pinned = pin;
+        if (pin) pending_pin += one;
         jobs.push_back(job);
         reserved += job_reserved;
     }
@@ -923,7 +1106,10 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
         } catch (...) {
             for (Job &job : jobs)
                 for (void *p : job.dst)
-                    if (p) be_->release_host_pageable_budgeted(p);
+                    if (p) {
+                        if (job.pinned) be_->release_host(p);
+                        else be_->release_host_pageable_budgeted(p);
+                    }
             return 0;
         }
     }
@@ -934,7 +1120,10 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
         auto it = slots_.find(jb.key);
         if (it == slots_.end()) { // evicted while the batch was in flight
             for (int i = 0; i < 3; i++)
-                if (jb.dst[i]) be_->release_host_pageable_budgeted(jb.dst[i]);
+                if (jb.dst[i]) {
+                    if (jb.pinned) be_->release_host(jb.dst[i]);
+                    else be_->release_host_pageable_budgeted(jb.dst[i]);
+                }
             continue;
         }
         Slot &s = it->second;
@@ -947,7 +1136,9 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
             h[i]->n_out = ts[i]->n_dims >= 2 ? static_cast<i64>(ts[i]->ne[1]) : 1;
         }
         s.host_bytes = one;
+        s.host_pinned = jb.pinned;
         host_bytes_ += one;
+        if (jb.pinned) host_pinned_bytes_ += one;
         warm_admissions_++;
         total += one;
         // The batch above was a real read out of the model file, so it is a

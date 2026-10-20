@@ -723,6 +723,10 @@ public:
     struct DeferredHostFree {
         void *p = nullptr;
         hipEvent_t ev = nullptr;
+        // Which allocator owns `p`: a pinned WARM slot came from hipHostMalloc
+        // and must go back through hipHostFree, and it never entered the
+        // pageable ledger, so the ledger must not be charged for it either.
+        bool pinned = false;
     };
     static constexpr size_t kDeferredMax = 256;
     std::vector<DeferredHostFree> host_pending_;
@@ -737,7 +741,23 @@ public:
             return;
         }
         (void)hipEventRecord(ev, 0);
-        host_pending_.push_back(DeferredHostFree{p, ev});
+        host_pending_.push_back(DeferredHostFree{p, ev, false});
+    }
+    // The pinned twin. Same deferral, different deallocator: the event on the
+    // default stream is still the right barrier, because upload_pinned_batch
+    // publishes its copies to that stream with one wait event, so nothing can
+    // still be reading `p` once this event completes.
+    void release_host_pinned_deferred(void *p) override {
+        if (!p) return;
+        if (host_pending_.size() >= kDeferredMax) host_deferred_flush_(false);
+        hipEvent_t ev = nullptr;
+        if (hipEventCreateWithFlags(&ev, hipEventDisableTiming) != hipSuccess) {
+            static_cast<void>(hipGetLastError());
+            release_host(p);
+            return;
+        }
+        (void)hipEventRecord(ev, 0);
+        host_pending_.push_back(DeferredHostFree{p, ev, true});
     }
     // Frees every pending buffer whose copy has landed. `drain` waits for the
     // device first and is for teardown, when no copy may outlive the backend.
@@ -756,8 +776,10 @@ public:
                 continue;
             }
             if (d.ev) (void)hipEventDestroy(d.ev);
-            SharedHostRamBudget::release_and_free(
-                d.p, [this](void *owned) { release_host_pageable(owned); });
+            if (d.pinned) release_host(d.p);
+            else
+                SharedHostRamBudget::release_and_free(
+                    d.p, [this](void *owned) { release_host_pageable(owned); });
         }
         host_pending_.resize(keep);
     }
@@ -998,6 +1020,101 @@ public:
         krk_op_scope.bytes(batch_bytes);
         paged_publish_(used, nused);
     }
+    // A pinned-source batch: no staging ring and no host memcpy, just a DMA on
+    // a private side stream, published to the default stream by one event. The
+    // caller is free as soon as the copies are queued, and its source buffer
+    // stays valid until its own next drain -- which is what lets
+    // Model::stage_layer read the NEXT layer from the file while this one is
+    // still in flight. Measured on a 15.9 GiB dense model: the read and the
+    // copy were 26 ms + 21 ms of one serialized host pass, and the 21 ms was
+    // almost entirely the memcpy through the pageable ring. KRK_WEIGHT_DMA=0
+    // restores the ring path for an A/B.
+    void upload_pinned_batch(void *const dst[], const void *const src[],
+                             const size_t bytes[], int n) override {
+        if (n <= 0) return;
+        if (!pinned_dma_() || !pinned_ready_()) {
+            upload_paged_batch(dst, src, bytes, n);
+            return;
+        }
+        KRK_TIME_OP("upload_pinned");
+        i64 batch_bytes = 0;
+        for (int i = 0; i < n; i++) {
+            if (!dst[i] || !src[i] || !bytes[i]) continue;
+            KRK_HIP(hipMemcpyAsync(dst[i], src[i], bytes[i], hipMemcpyHostToDevice,
+                                   pinned_stream_));
+            batch_bytes += static_cast<i64>(bytes[i]);
+        }
+        if (batch_bytes == 0) return;
+        // Bracket the batch on its own stream so the report can state a rate
+        // that is the copy's, not the enqueue's. One pair is enough: a decode
+        // step issues a couple of promotions and each DMA (0.7 ms) is long done
+        // before the next one is enqueued. If it is not, that batch goes untimed
+        // rather than blocking the caller -- under-counted time bounds a rate
+        // from above, and blocking would change what is being measured.
+        pin_fold_(false);
+        const bool timed_pair = !pin_live_ && pin_t0_ && pin_t1_;
+        if (timed_pair) KRK_HIP(hipEventRecord(pin_t0_, pinned_stream_));
+        KRK_HIP(hipEventRecord(pinned_ev_, pinned_stream_));
+        KRK_HIP(hipStreamWaitEvent(0, pinned_ev_, 0));
+        if (timed_pair) {
+            KRK_HIP(hipEventRecord(pin_t1_, pinned_stream_));
+            pin_live_ = true;
+        }
+        pin_bytes_ += static_cast<unsigned long long>(batch_bytes);
+        pin_batches_++;
+        krk_op_scope.bytes(batch_bytes);
+    }
+    // Folds a completed pair into pin_ms_. Never waits unless told to: sync()
+    // calls it right after the device sync, which is what makes it complete.
+    void pin_fold_(bool drain) {
+        if (!pin_live_) return;
+        if (!drain && hipEventQuery(pin_t1_) != hipSuccess) {
+            static_cast<void>(hipGetLastError());
+            return;
+        }
+        float ms = 0.0f;
+        if (hipEventElapsedTime(&ms, pin_t0_, pin_t1_) == hipSuccess && ms > 0.0f)
+            pin_ms_ += static_cast<double>(ms);
+        pin_live_ = false;
+    }
+    double pinned_dma_ms() override {
+        pin_fold_(false);
+        return pin_ms_;
+    }
+    unsigned long long pinned_dma_bytes() const override { return pin_bytes_; }
+    unsigned long long pinned_dma_batches() const override { return pin_batches_; }
+    static bool pinned_dma_() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_WEIGHT_DMA");
+            return !(e && e[0] == '0');
+        }();
+        return v;
+    }
+    // Lazily builds the private stream and event. A failure is a fallback, not
+    // a failed run: the pageable-ring path is the reference.
+    bool pinned_ready_() {
+        if (pinned_stream_ && pinned_ev_) return true;
+        if (pinned_tried_) return false;
+        pinned_tried_ = true;
+        // Timing pair for pinned_dma_ms(). A create failure only costs the
+        // report its rate, so it is not an error path.
+        (void)hipEventCreate(&pin_t0_);
+        (void)hipEventCreate(&pin_t1_);
+        if (hipStreamCreateWithFlags(&pinned_stream_, hipStreamNonBlocking) !=
+                hipSuccess ||
+            hipEventCreateWithFlags(&pinned_ev_, hipEventDisableTiming) !=
+                hipSuccess) {
+            static_cast<void>(hipGetLastError());
+            if (pinned_stream_) {
+                (void)hipStreamDestroy(pinned_stream_);
+                pinned_stream_ = nullptr;
+            }
+            KRK_WARN("weight stream: no private copy stream; pinned batches take "
+                     "the pageable ring instead");
+            return false;
+        }
+        return true;
+    }
     void *upload_expert_staged(void *const dst[], const void *const src[],
                                const size_t bytes[], int n) override {
         if (paged_blocking_() || paged_direct_() || !paged_ready_()) {
@@ -1187,6 +1304,22 @@ public:
             paged_used_[i] = false;
         }
         paged_on_ = false;
+        if (pinned_stream_) {
+            (void)hipStreamDestroy(pinned_stream_);
+            pinned_stream_ = nullptr;
+        }
+        if (pinned_ev_) {
+            (void)hipEventDestroy(pinned_ev_);
+            pinned_ev_ = nullptr;
+        }
+        if (pin_t0_) {
+            (void)hipEventDestroy(pin_t0_);
+            pin_t0_ = nullptr;
+        }
+        if (pin_t1_) {
+            (void)hipEventDestroy(pin_t1_);
+            pin_t1_ = nullptr;
+        }
     }
     // Installs the pull-style weight path (see Backend::set_weight_pull). The
     // loader hands over the path and the mapping's address range; this class
@@ -1234,6 +1367,14 @@ public:
         KRK_HIP(hipMemcpy(static_cast<char *>(dst) + off, src, bytes,
                           hipMemcpyHostToDevice));
     }
+    // Device-to-device, on the stream every kernel here runs on, so the next
+    // reader of the destination is already ordered behind it.
+    void copy_device(void *dst, const void *src, size_t bytes) override {
+        if (!bytes) return;
+        KRK_TIME_OP("copy_device");
+        KRK_HIP(hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, 0));
+    }
+
     // The direct copy, with no staging side effects.
     bool upload_now(void *dst, const void *src, size_t bytes, size_t off) override {
         if (stage_upload(static_cast<char *>(dst) + off, src, bytes)) return true;
@@ -1434,7 +1575,13 @@ public:
         pool_honor_implicit_(dst);
         KRK_HIP(hipMemset(dst, 0, bytes));
     }
-    void sync() override { KRK_HIP(hipDeviceSynchronize()); }
+    void sync() override {
+        KRK_HIP(hipDeviceSynchronize());
+        // The device sync just made the outstanding copy pair complete, so this
+        // fold cannot block: it is what keeps the reported rate whole at the end
+        // of a run instead of losing the last batch.
+        pin_fold_(true);
+    }
 
     // Completion markers. hipEvent on the NULL stream, which is the stream
     // every kernel here runs on, so a record lands after everything submitted
@@ -1548,6 +1695,26 @@ public:
     // build replaced. It exists so the two arms can be interleaved in separate
     // processes: measured in sequence, the second arm reads a warm page cache
     // and looks like a win no matter which one it is.
+    static bool split_k_enabled() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_GEMM_SPLIT");
+            return !(e && e[0] == '0');
+        }();
+        return v;
+    }
+
+    // Prefill (n_tok > 1) with decode's own arithmetic, so a chunked prefill
+    // writes the bytes a decode step would. On by default; KRK_ATTN_BEXACT=0
+    // restores the query-tiled kernel, which is the A/B arm and the fallback
+    // for shapes this cannot express (a window, a head width decode lacks).
+    static bool attn_bexact_on() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_ATTN_BEXACT");
+            return !(e && e[0] == '0');
+        }();
+        return v;
+    }
+
     static bool gemv_m_enabled() {
         static const bool v = [] {
             const char *e = std::getenv("KRK_GEMV_M");
@@ -1588,9 +1755,26 @@ public:
     }
 
     std::string describe() const override {
-        return format("%s (%s, %s, %d CU, wave32, %s)", caps_.name.c_str(),
+        // Resizable BAR / large BAR matters to this engine specifically: with
+        // it the CPU can write the whole VRAM aperture, so a host->device copy
+        // is one DMA; without it every transfer goes through the 256 MiB
+        // window, which is the slow half of the streaming and expert paths.
+        // Queried once; -1 means the runtime would not say.
+        static const int large_bar = [] {
+            int v = -1;
+            if (hipDeviceGetAttribute(&v, hipDeviceAttributeIsLargeBar, 0) !=
+                hipSuccess) {
+                static_cast<void>(hipGetLastError());
+                v = -1;
+            }
+            return v;
+        }();
+        const char *bar = large_bar == 1  ? ", Resizable BAR"
+                          : large_bar == 0 ? ", no large BAR"
+                                           : ", BAR unknown";
+        return format("%s (%s, %s, %d CU, wave32, %s%s)", caps_.name.c_str(),
                       caps_.gfx.c_str(), caps_.family_name(), caps_.cu_count,
-                      gemm_rung_name());
+                      gemm_rung_name(), bar);
     }
 
     // ---- ops -------------------------------------------------------------
@@ -1831,9 +2015,20 @@ public:
             // down) and large grids unsplit, so only the
             // shapes that pay take the extra reduce.
             i64 slice = n_in;
-            const int split = pick_split(static_cast<int>(bx * by),
-                                         n_in, wmma_cfg::BK,
-                                         caps_.cu_count, &slice);
+            int split = pick_split(static_cast<int>(bx * by),
+                                   n_in, wmma_cfg::BK,
+                                   caps_.cu_count, &slice);
+            // KRK_GEMM_SPLIT=0 disables split-K. It is a diagnostic/equivalence
+            // switch, not a speed option: the split sums fp32 partials in a
+            // second kernel, which regroups the accumulation, so a split GEMM
+            // is not bit-identical to the same row computed with split=1 (or to
+            // the decode ladder, which never splits). Measured with
+            // `kraken-bench --bitexact` -- see the rows bit-exactness comment in
+            // tools/bench_ops.cpp.
+            if (!split_k_enabled()) {
+                split = 1;
+                slice = n_in;
+            }
             const dim3 grid(bx, by,
                             static_cast<unsigned>(split));
             f32 *parts = nullptr;
@@ -2070,8 +2265,21 @@ public:
             // A/B knob: KRK_ATTN_SPLIT=0 forces one block per head so the
             // split path can be diffed against it on identical input. The two
             // are algebraically the same computation, so the text must match.
-            if (const char *kv = std::getenv("KRK_ATTN_SPLIT"))
+            //
+            // The split is also what the bit-exact prefill cannot express: a
+            // split restarts the online max inside every key range and merges
+            // the ranges afterwards, which is a different fp32 accumulation
+            // from the one continuous per-warp walk. So with the exact prefill
+            // on (the default) a decode row takes the unsplit path as well,
+            // and `KRK_ATTN_SPLIT=1` is the arm that keeps the split and gives
+            // up bit-identity from ~128 keys up. Measured cost of the unsplit
+            // row: +0.36% for the split at a 240-token context, i.e. inside
+            // the run-to-run spread on this card.
+            if (const char *kv = std::getenv("KRK_ATTN_SPLIT")) {
                 if (kv[0] == '0') n_split = 1;
+            } else if (attn_bexact_on()) {
+                n_split = 1;
+            }
             f32 *part = nullptr;
             if (n_split > 1) {
                 const size_t per = static_cast<size_t>(d.n_head) *
@@ -2089,7 +2297,19 @@ public:
             attention_decode(out, q, kc, vc, d.n_head, d.n_kv, d.hd,
                              pos_dev_, d.pos_stride, d.causal ? 1 : 0,
                              d.window, d.scale, nullptr, part, n_split,
-                             caps_.cu_count);
+                             caps_.cu_count, d.sinks);
+            return;
+        }
+
+        // Bit-exact prefill (see attention_bexact_kernel): the same arithmetic
+        // as the decode row above, over a tile of query rows that shares the
+        // staged K/V -- so a prefill chunk and a decode step agree bit for
+        // bit and the model's text stops depending on the chunk size.
+        if (d.n_tok > 1 && d.causal && d.window == 0 && attn_bexact_on() &&
+            attn_bexact_supported(d.hd)) {
+            attention_bexact(out, q, kc, vc, d.n_head, d.n_kv, d.hd, d.n_tok,
+                             d.pos0, d.pos_stride, d.scale, caps_.lds_bytes,
+                             nullptr, d.sinks);
             return;
         }
 
@@ -2097,83 +2317,6 @@ public:
         const int tile_k = static_cast<int>(
             std::min<i64>(64, std::max<i64>(8, 8192 / std::max<i64>(1, d.hd))));
         const size_t smem = attn_smem_bytes(tile_k, d.hd);
-
-        // Query-tiled prefill: QT tokens share one staged K/V tile instead of
-        // every token staging the whole history alone. QT=8 is what the
-        // register budget allows (kMaxOv * QT accumulators per thread); the
-        // tile is cut back if LDS cannot hold the wider q tile.
-        // Query-tiled by default; KRK_ATTN_QTILE=0 opts out. See attn_qtile_on().
-        // QT is a template parameter, so the three candidates are instantiated
-        // and picked at runtime. That is deliberate: the A/B then runs
-        // interleaved inside ONE binary, which is the only way these numbers
-        // mean anything on this card. Across rebuilds the second arm reads a
-        // warm cache and wins for reasons that have nothing to do with the
-        // kernel.
-        //
-        // The constraint is registers, not LDS. For hd=128, tile_k=64 the LDS
-        // cost is 36 KB at QT=8, 40 KB at QT=16 and 48 KB at QT=32, all inside
-        // this card's 64 KB. The accumulators are kMaxOv * QT floats per
-        // thread -- 16 at QT=8, 32 at QT=16, 64 at QT=32 -- and that is what
-        // decides where it stops paying.
-        //
-        // KRK_ATTN_QTILE_QT selects. The default is 16, measured on the
-        // 9070 XT with Qwen3-8B-Q4_K_M at a 961-token prompt, 3 reps
-        // interleaved inside one binary:
-        //
-        //     QT=8    506.8 / 509.9 / 510.9 tok/s   median 509.9
-        //     QT=16   527.1 / 525.9 / 525.4 tok/s   median 525.9   1.03x
-        //     QT=32   437.7 / 437.8 / 436.3 tok/s   median 437.7   0.86x
-        //
-        // QT=32 losing 14% is the register budget, not LDS: every candidate
-        // fits LDS comfortably (36/40/48 KB against 64 KB), but the
-        // accumulators are kMaxOv * QT floats per thread and 64 of them
-        // spill. That is also why this was measured rather than assumed --
-        // "bigger tile, less traffic" would have picked 32 and lost.
-        //
-        // KRK_ATTN_QTILE_K still overrides the key tile.
-        // Query-tiled by default; KRK_ATTN_QTILE=0 opts out. See attn_qtile_on().
-#define KRK_ATTN_QTILE_DISPATCH(QTV)                                          \
-    do {                                                                     \
-        int kk = tile_k;                                                     \
-        while (kk > 8 &&                                                     \
-               attn_qtile_smem_bytes<QTV>(kk, d.hd) > caps_.lds_bytes)        \
-            kk /= 2;                                                         \
-        if (const char *fk = std::getenv("KRK_ATTN_QTILE_K")) {               \
-            const int want = std::atoi(fk);                                   \
-            if (want > 0 &&                                                   \
-                attn_qtile_smem_bytes<QTV>(want, d.hd) <= caps_.lds_bytes)    \
-                kk = want;                                                    \
-        }                                                                    \
-        if (attn_qtile_on() && d.window == 0 &&                               \
-            attn_qtile_smem_bytes<QTV>(kk, d.hd) <= caps_.lds_bytes) {        \
-            const size_t qs = attn_qtile_smem_bytes<QTV>(kk, d.hd);           \
-            const dim3 g(static_cast<unsigned>(d.n_head),                     \
-                         static_cast<unsigned>((d.n_tok + (QTV) - 1) / (QTV))); \
-            KRK_HIP(hipFuncSetAttribute(                                      \
-                reinterpret_cast<const void *>(&attention_qtile_kernel<QTV>), \
-                hipFuncAttributeMaxDynamicSharedMemorySize,                   \
-                static_cast<int>(qs + 512)));                                 \
-            attention_qtile_kernel<QTV><<<g, kAttnBlock, qs>>>(               \
-                static_cast<_Float16 *>(out),                                \
-                static_cast<const _Float16 *>(q),                            \
-                static_cast<const _Float16 *>(kc),                           \
-                static_cast<const _Float16 *>(vc), d.n_head, d.n_kv, d.hd,   \
-                d.n_tok, d.pos0, d.pos_stride, d.causal ? 1 : 0, d.scale, kk);\
-            return;                                                          \
-        }                                                                    \
-    } while (0)
-
-        {
-            const char *fq = std::getenv("KRK_ATTN_QTILE_QT");
-            const int want = fq ? std::atoi(fq) : 16;
-            if (want >= 32)
-                KRK_ATTN_QTILE_DISPATCH(32);
-            else if (want >= 16)
-                KRK_ATTN_QTILE_DISPATCH(16);
-            else
-                KRK_ATTN_QTILE_DISPATCH(8);
-        }
-#undef KRK_ATTN_QTILE_DISPATCH
 
         if (smem > caps_.lds_bytes) {
             KRK_ERROR("attention: %zu bytes of LDS requested, device has %d", smem,
@@ -2189,7 +2332,7 @@ public:
             static_cast<_Float16 *>(out), static_cast<const _Float16 *>(q),
             static_cast<const _Float16 *>(kc), static_cast<const _Float16 *>(vc),
             d.n_head, d.n_kv, d.hd, d.n_tok, d.pos0, d.pos_stride, d.causal ? 1 : 0,
-            d.window, d.scale, tile_k);
+            d.window, d.scale, tile_k, d.sinks);
     }
 
     bool attn_fused_chain(void *out, void *q, void *kcache, void *vcache,
@@ -2209,6 +2352,14 @@ public:
         // attention() chain the engine runs as the fallback.
         if (d.n_tok != 1 || !attn_fused_decode_supported(d.hd) ||
             !attn_fused_ || d.window > 0)
+            return false;
+        // A sink model takes the separate chain: the fused kernel folds rope,
+        // append and attention into one launch, and folding a sink in means
+        // touching its shared-memory softmax for a tensor no model that
+        // reaches this chain today carries. Refusing costs a couple of
+        // launches per decode step on that one family and keeps this
+        // kernel's arithmetic exactly as it was verified.
+        if (d.sinks)
             return false;
         // OLMoE's whole-row qk-norm reduces across head boundaries; the
         // fused norm is per head, so that shape stays on the fallback.
@@ -2236,6 +2387,16 @@ public:
                           pos_dev_, d.pos_stride, fd, rope_scale, d.scale,
                           rope_frac);
         return true;
+    }
+
+    void swiglu_oai(void *out, const void *gate, const void *up,
+                    i64 n) override {
+        KRK_TIME_OP("swiglu_oai");
+        if (n <= 0) return;
+        const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
+        swiglu_oai_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(out),
+                                          static_cast<const _Float16 *>(gate),
+                                          static_cast<const _Float16 *>(up), n);
     }
 
     void silu_mul(void *out, const void *gate, const void *up, i64 n,
@@ -2796,6 +2957,16 @@ private:
     bool paged_on_ = false;
     bool paged_failed_ = false;
     size_t paged_chunk_ = kPagedChunk;
+    // Private stream + event for pinned-source weight staging (dense streaming).
+    hipStream_t pinned_stream_ = nullptr;
+    hipEvent_t pinned_ev_ = nullptr;
+    hipEvent_t pin_t0_ = nullptr; // bracket one batch for pinned_dma_ms()
+    hipEvent_t pin_t1_ = nullptr;
+    bool pin_live_ = false;
+    double pin_ms_ = 0.0;
+    unsigned long long pin_bytes_ = 0;
+    unsigned long long pin_batches_ = 0;
+    bool pinned_tried_ = false;
     char *pull_buf_[kPullThreads][kPullBufs] = {};
     hipStream_t pull_stream_[kPullThreads][kPullBufs] = {};
     int stage_slot_ = 0;
@@ -2984,58 +3155,6 @@ bool stage_upload(void *dst, const void *src, size_t bytes) {
     return true;
 }
 
-    // The "FAST but not yet correct" note that used to sit here was wrong on
-    // both counts, and it cost this kernel a long stretch of being opt-in.
-    // MEASURED: byte-identical to the one-query kernel (md5) on an 801- and a
-    // 900-token prompt, and +38% prefill tok/s interleaved (581.5 vs 420.9,
-    // 5 reps each, arms that do not overlap). It is the default; the block
-    // below records the full comparison.
-    //   KRK_ATTN_QTILE=0    restore the one-query path (A/B)
-    //   KRK_ATTN_QTILE_K=N  force the key tile size (probe_attn_qtile)
-    // Query-tiled prefill attention. Now the default.
-    //
-    // WHY IT MATTERS. The one-query-per-block kernel makes every block re-read
-    // the whole K and V sequence for its own token, so the KV cache is
-    // re-read about n_tok times. MEASURED on the 9070 XT (gfx1201) with
-    // Qwen3-8B-Q4_K_M: a prefill call moves roughly 4 GB of KV against a
-    // 576 MiB cache, and at a 961-token prompt attention is 1856 ms of the
-    // 2471 ms prefill -- 75% -- against 555 ms for every GEMM in the model
-    // combined. Tiling QT=8 queries into a block amortises that staging over
-    // eight queries.
-    //
-    // Interleaved on/off, 2 reps per arm, same binary, medians:
-    //     241 tok   802 ->  924 tok/s   1.15x
-    //     961 tok   395 ->  507 tok/s   1.28x
-    //    1921 tok   226 ->  295 tok/s   1.31x
-    // The win grows with prompt length, which is what a KV-traffic fix looks
-    // like. (A single earlier sample claimed 5.4x on a 2720-token prompt;
-    // that was measured in sequence against a cold cache and does not
-    // reproduce interleaved. The 1.31x is the number to trust.)
-    //
-    // WHY THE "KNOWN WRONG" NOTE IS GONE. It was opt-in because the tiled
-    // path was believed to disagree with the scalar reference. Measured
-    // against the CPU oracle and against the one-query kernel on this card,
-    // it does not:
-    //   * tinyllama-1.1b, MHA, 1792-char prompt crossing a chunk boundary
-    //     (so pos0 > 0): qtile=0 PASS and qtile=1 PASS against --cpu.
-    //   * Qwen3-8B, GQA 32/8, 961-token prompt: byte-identical text to the
-    //     one-query kernel.
-    //   * smolcode-1.5b, GQA 12/2, 3014-char prompt: qtile=0 and qtile=1
-    //     both FAIL against --cpu at the same drift step with the same
-    //     logits (3259 vs 4378). That is a pre-existing long-prompt
-    //     device-vs-CPU disagreement that has nothing to do with tiling --
-    //     the two arms are identical, which is the point.
-    //
-    // Sliding-window attention (laguna's hybrid layers) still takes the
-    // one-query path: the guard is `d.window == 0`, and the window bounds
-    // have not been validated against the oracle here.
-    //
-    // KRK_ATTN_QTILE=0 restores the one-query kernel for A/B.
-    static bool attn_qtile_on() {
-        const char *v = std::getenv("KRK_ATTN_QTILE");
-        return !(v && v[0] == '0');
-    }
-
     void stage_pos(i64 pos0) {
         if (pos_valid_ && pos_staged_ == pos0) return;
         if (!pos_dev_) KRK_HIP(hipMalloc(&pos_dev_, sizeof(i64)));
@@ -3148,9 +3267,25 @@ Backend *make_hip_backend(int device_index, std::string *err) {
     c.has_wmma_gfx12 = (c.family == GfxFamily::Rdna4);
     c.has_dot2 = (c.family == GfxFamily::Rdna2 || c.family == GfxFamily::Rdna3);
 
-    KRK_INFO("HIP %s | %s | %s | %d CU | %.1f GiB VRAM", hip_runtime_version().c_str(),
+    // Resizable BAR is not cosmetic here: with it the CPU can write the whole
+    // VRAM aperture in one DMA, and without it every host->device copy goes
+    // through a 256 MiB window -- the transfer half of the streaming and
+    // expert-promotion paths. The banner reports what the RUNTIME says, which is
+    // not the same as the BIOS setting: on Windows/WDDM this attribute has been
+    // seen reading 0 on a machine whose firmware has ReBAR enabled, so treat it
+    // as a hint and the measured GB/s as the fact. -1 when it will not say.
+    int large_bar = -1;
+    if (hipDeviceGetAttribute(&large_bar, hipDeviceAttributeIsLargeBar,
+                              device_index) != hipSuccess) {
+        static_cast<void>(hipGetLastError());
+        large_bar = -1;
+    }
+    KRK_INFO("HIP %s | %s | %s | %d CU | %.1f GiB VRAM | %s", hip_runtime_version().c_str(),
              c.name.c_str(), c.gfx.c_str(), c.cu_count,
-             static_cast<f64>(c.vram_total) / (1024.0 * 1024.0 * 1024.0));
+             static_cast<f64>(c.vram_total) / (1024.0 * 1024.0 * 1024.0),
+             large_bar == 1  ? "BAR: runtime reports large BAR"
+             : large_bar == 0 ? "BAR: runtime reports 256 MiB aperture"
+                              : "BAR: runtime does not say");
     if (!hip_runtime_matches_sdk())
         KRK_WARN("the loaded HIP runtime is not the SDK this binary was built "
                  "against; stage the SDK's amdhip64_*.dll next to the binary "

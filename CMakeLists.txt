@@ -84,8 +84,10 @@ set(KRK_CORE_SOURCES
     src/gguf.cpp
     src/tokenizer.cpp
     src/sampler.cpp
+    src/spec_sampling.cpp
     src/model.cpp
     src/dflash.cpp
+    src/draft_head.cpp
     src/expert_cache.cpp
     src/expert_cpu.cpp
     src/kv_tier.cpp
@@ -531,29 +533,6 @@ if(KRK_BUILD_PROBES AND KRK_HIP_AVAILABLE)
         endforeach()
     endforeach()
 
-    # probe_attn_qtile lives in tools/ rather than the repo root because it is
-    # the one probe that has to stay version-controlled: it is the A/B that
-    # reproduces the attention_qtile_kernel correctness question, and .gitignore
-    # drops everything at the root. Built the same way, from a different path.
-    add_executable(probe_attn_qtile
-                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_attn_qtile.hip)
-    target_include_directories(probe_attn_qtile PRIVATE
-                               ${CMAKE_CURRENT_SOURCE_DIR}/include
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/hip)
-    if(TARGET hip::device)
-        target_link_libraries(probe_attn_qtile PRIVATE hip::device)
-    elseif(HIP_FOUND)
-        target_link_libraries(probe_attn_qtile PRIVATE ${HIP_LIBRARIES})
-    endif()
-    target_compile_options(probe_attn_qtile PRIVATE
-                           -O3 -ffast-math -fno-finite-math-only)
-    foreach(tgt IN LISTS CMAKE_HIP_ARCHITECTURES)
-        string(TOUPPER "${tgt}" tgt_uc)
-        target_compile_definitions(probe_attn_qtile PRIVATE
-                                   "KRK_OFFLOAD_${tgt_uc}=1")
-    endforeach()
-
     # probe_gemv answers a question the decode trace cannot: the trace's device
     # span includes launch-to-arrival idle, so 35 GB/s there does not separate
     # "the kernel is slow" from "the op is starved". This runs the same kernel
@@ -634,6 +613,12 @@ if(KRK_BUILD_TESTS)
     enable_testing()
     add_executable(kraken-tests tests/test_kraken.cpp)
     target_link_libraries(kraken-tests PRIVATE krk_core)
+    # The prefill-chunk bit-exactness group spawns the CLI and has to know
+    # whether this build ships device kernels: on one that does, a run that
+    # silently answered from the CPU would make the gate prove nothing.
+    if(TARGET krk_hip)
+        target_compile_definitions(kraken-tests PRIVATE KRK_TEST_HIP_BUILD=1)
+    endif()
     add_test(NAME kraken-tests COMMAND kraken-tests)
 endif()
 

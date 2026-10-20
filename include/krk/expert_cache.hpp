@@ -164,6 +164,9 @@ public:
     // that mixes expert sizes, and the caller knows the answer exactly in the
     // two cases that matter: an explicit --expert-cache-slots N, and a budget
     // that covers the model's whole routed set.
+    // Overrides configure()'s pin budget (which is KRK_HOST_PIN_MB). Called
+    // after it, because configure() resets the tier it decorates.
+    void set_host_pin_budget(size_t bytes);
     void configure(Backend *be, size_t budget_bytes, size_t host_budget_bytes = 0,
                    size_t slot_budget = 0);
     void clear();
@@ -180,6 +183,20 @@ public:
     // 0, so they are the first out of the tier when room is needed. Returns
     // bytes staged.
     size_t preload(const ExpertSource &src, i32 layer);
+    // Makes one layer's WHOLE routed set device-resident and pins it.
+    //
+    // This is for the callers that page through one small, fixed bank rather
+    // than a stack: the nextn (MTP) block is a single layer whose experts a
+    // speculative round re-reads on every proposal, and against the stack's LRU
+    // they are cold often enough to pay a promotion per proposal (measured on
+    // Tiel: 154 of 1384 block acquires promoted, 179 ms of a 4.6 s run). The
+    // set fits (845 MiB for 256 experts), so admit it once and hold it.
+    //
+    // Returns the bytes this layer now holds in the device tier (0 when it could
+    // not be pinned) -- `why`, when given, says why, and the caller keeps the
+    // normal policy instead of thrashing a pin it cannot defend. Pins are never
+    // evicted while the budget holds them.
+    size_t pin_layer(const ExpertSource &src, i32 layer, std::string *why);
     // One expert, so the caller can choose the order: expert-major across
     // layers when the tier is smaller than the corpus.
     size_t preload_one(const ExpertSource &src, i32 layer, i32 expert);
@@ -203,6 +220,25 @@ public:
     // One-step exact lookahead: only an already WARM next routed expert.
     // The current expert is leased during admission; too-small budgets skip it.
     bool stage_next(const ExpertSource &src, i32 layer, i32 expert, i32 current);
+    // Multi-row lookahead: promote every WARM expert in `experts` that is not
+    // resident yet, in one pass, before the rows that need them run.
+    //
+    // This exists for a BATCHED forward -- the verify pass of a speculative
+    // round is the one that produces one. A layer's router is computed for all
+    // d rows on the host before the first expert is acquired, so the union is
+    // known a whole row early: staging it means rows 1..d-1 hit VRAM instead of
+    // each promoting its own experts serially, and the promotions overlap the
+    // first row's compute. A single-row decode has nothing to stage ahead of
+    // (stage_next covers the ordering inside its own routing), so callers use
+    // this only when n > 1.
+    //
+    // Advisory exactly like prefetch_layer: a slot that is not WARM is skipped
+    // (acquire() still loads it), a slot the budget cannot hold is counted in
+    // `lookahead_rejected()` and skipped, and a failed promotion is a miss, not
+    // an error. Returns how many experts this promoted.
+    size_t stage_batch(const ExpertSource &src, i32 layer, const i32 *experts, int n);
+    u64 lookahead_staged() const { return lookahead_staged_; }
+    u64 lookahead_rejected() const { return lookahead_rejected_; }
     u64 active_staged() const { return active_staged_; }
     u64 active_used() const { return active_used_; }
     f64 active_wait_ms() const { return active_wait_ms_; }
@@ -259,9 +295,18 @@ public:
     // is an estimate for a corpus whose layers differ in size.
     size_t capacity_slots() const { return capacity_; }
     size_t slot_budget() const { return slot_budget_; }
+    size_t vram_budget() const { return budget_; }
+    // Lower the device budget once the KV cache and the engine's own workspaces
+    // exist. The loader decides this number BEFORE those allocations, so on a
+    // card that is nearly full it can name every byte that was free at that
+    // moment. Only ever lowers: a raise here would re-commit what the
+    // measurement just said is not there.
+    void set_vram_budget(size_t bytes);
     // WARM tier (the second tier). The warm_* names are the ones the reports
     // use; the host_* spellings are kept for existing callers.
     size_t warm_capacity_bytes() const { return host_budget_; }
+    size_t warm_pinned_bytes() const { return host_pinned_bytes_; }
+    size_t warm_pin_budget_bytes() const { return host_pin_bytes_; }
     size_t warm_used_bytes() const { return host_bytes_; }
     size_t warm_slots() const;
     size_t host_budget_bytes() const { return host_budget_; }
@@ -376,6 +421,11 @@ private:
         u32 count = 0;      // LFU counter, decayed
         u64 seq = 0;        // load order, the tie-break for victims
         bool pinned = false;
+        // The WARM copy of this slot lives in PINNED host memory (see
+        // KRK_HOST_PIN_MB). Distinct from `pinned`, which is the residency
+        // promise the eviction scan honours: this one says which allocator
+        // owns the bytes, so the free and the promotion copy both know.
+        bool host_pinned = false;
         bool leased = false;
         bool staged = false;
         void *ready = nullptr;
@@ -463,6 +513,12 @@ private:
     size_t vram_slots_ = 0;
     size_t host_budget_ = 0;
     size_t host_bytes_ = 0;
+    // The pinned prefix of WARM: at most this many bytes of the tier are
+    // admitted into pinned host memory, in admission order (rank order when the
+    // model carries an expert index), so a promotion out of it is a DMA with no
+    // host memcpy in front of it.
+    size_t host_pin_bytes_ = 0;
+    size_t host_pinned_bytes_ = 0;
     u64 acquires_ = 0;      // since the last decay (drives the window)
     u64 total_acquires_ = 0; // lifetime, for hit-rate reporting
     u64 loads_ = 0;
@@ -477,6 +533,8 @@ private:
     u64 bytes_demoted_ = 0;  // VRAM evicted with a WARM copy already in place
     u64 bytes_promoted_ = 0; // WARM -> VRAM
     u64 bytes_staged_ = 0;   // file -> WARM ahead of the run (prefetch)
+    u64 lookahead_staged_ = 0;   // stage_batch promotions
+    u64 lookahead_rejected_ = 0; // stage_batch candidates the budget could not hold
     f64 promote_ms_ = 0;     // wall time in promote_to_vram
     f64 read_ms_ = 0;        // wall time in the WARM file read
     f64 room_ms_ = 0;        // wall time making VRAM room

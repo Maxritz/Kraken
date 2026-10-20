@@ -47,10 +47,28 @@ public:
     // Draws the next token from logits[n_vocab].
     i32 sample(const f32 *logits, i32 n_vocab);
 
+    // The distribution `sample()` draws from, as a dense row: repetition
+    // penalty, temperature, top-k, top-p and min-p applied, everything outside
+    // the surviving nucleus zeroed, and the survivors renormalised. Speculative
+    // sampling needs it because the accept/reject rule is a statement about the
+    // distribution, not about one draw -- and building it here is what keeps
+    // the two in step: `sample()` is the inverse-CDF draw from this row.
+    //
+    // `extra` marks tokens the caller has ALREADY accepted for the positions
+    // being verified but has not fed to accept() yet (a speculative round
+    // emits its prefix after the fact); the repetition penalty has to see them
+    // or the verified distribution is not the one the plain loop would use.
+    void build_dist(const f32 *logits, i32 n_vocab, std::vector<f32> *prob,
+                    const i32 *extra = nullptr, int n_extra = 0) const;
+
     const SampleParams &params() const { return p_; }
+    // A draw from the sampler's own stream, for callers that must interleave
+    // their own decisions (a speculative round's accept/reject).
+    f32 uniform() { return rng_.next_f32(); }
 
 private:
-    void apply_repetition(std::vector<f32> &logits);
+    void apply_repetition(std::vector<f32> &logits, const i32 *extra = nullptr,
+                          int n_extra = 0) const;
 
     SampleParams p_;
     Rng rng_;

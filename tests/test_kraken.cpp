@@ -1,10 +1,13 @@
 // ============================================================================
 //  test_kraken.cpp — deterministic, self-contained test suite.
 //
-//  Everything here runs on the CPU reference backend on purpose: the host
-//  dequantizers are the oracle the GPU kernels are validated against, so a
-//  regression in src/quant.cpp must fail before it can silently mask a kernel
-//  bug. The suite also builds a complete miniature LLaMA-family GGUF in a
+//  Almost everything here runs on the CPU reference backend on purpose: the
+//  host dequantizers are the oracle the GPU kernels are validated against, so
+//  a regression in src/quant.cpp must fail before it can silently mask a kernel
+//  bug. The exception is test_prefill_chunk_bitexact, which spawns the CLI so
+//  the chunk-invariance property can be gated on the device as well.
+//
+//  The suite also builds a complete miniature LLaMA-family GGUF in a
 //  temporary file and runs real generation through it, which exercises the
 //  container parser, the model loader, the forward pass, the sampler and both
 //  tokenizer families end to end.
@@ -37,11 +40,14 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
 #include "krk/vram_guard.hpp"
 #include "krk/arch.hpp"
+#include "krk/draft_head.hpp"
+#include "krk/spec_sampling.hpp"
 #include "krk/backend.hpp"
 #include "krk/engine.hpp"
 #include "krk/expert_cpu.hpp"
@@ -1610,6 +1616,8 @@ static bool build_sized_model(const std::string &path, int n_embd, int n_ff,
                               int mask_id = -1);
 static void set_env_var(const char *name, const std::string &value);
 static void clear_env_var(const char *name);
+// The prefill-chunk gate drives the CLI that sits beside this binary.
+static std::string self_path();
 
 // ---- KV tier regression coverage -------------------------------------------
 //
@@ -3402,6 +3410,268 @@ static void test_sampler_determinism() {
     CHECK(argmax_ok, "greedy picks the argmax");
 }
 
+
+// ---------------------------------------------------------------------------
+// Speculative sampling: the accept/reject rule
+// ---------------------------------------------------------------------------
+//
+// The rule's whole content is one identity (see krk/spec_sampling.hpp):
+// P(output = x) must equal p(x) for every x. A wrong implementation still
+// generates fluent text -- an always-accept rule generates the DRAFT's
+// distribution and a "replacement from p" rule generates a slightly wrong
+// mixture -- so the checks below test the arithmetic and the sampling
+// frequencies, and one of them is constructed to FAIL if the correction is
+// dropped (the accept mass of a pair p != q is strictly below 1).
+static void test_spec_sampling() {
+    // A target and a draft that disagree in both directions: p favours token 3,
+    // q favours token 0, and token 2 is likelier in the draft.
+    const std::vector<f32> p = {0.10f, 0.20f, 0.05f, 0.65f};
+    const std::vector<f32> q = {0.55f, 0.15f, 0.30f, 0.00f};
+    std::string why;
+    CHECK(spec_verify_identity(p, q, 1e-6, &why),
+          "the accept/reject rule reproduces the target exactly (enumerated)");
+    if (!why.empty()) std::fprintf(stderr, "  (identity: %s)\n", why.c_str());
+
+    // Not the always-accept rule: the mass that survives as proposals is
+    // sum(min(p,q)) = 0.10 + 0.15 + 0.05 + 0 = 0.30, so 70% of positions need
+    // the residual. An implementation that always accepts would report 1.0
+    // here, and this is the check that makes that visible.
+    f64 accepted_mass = 0;
+    for (size_t i = 0; i < p.size(); i++)
+        accepted_mass += p[i] < q[i] ? p[i] : q[i];
+    CHECK(std::fabs(accepted_mass - 0.30) < 1e-6,
+          "the accepted mass is sum(min(p,q)), not 1");
+    CHECK(accepted_mass < 0.999, "a disagreeing draft really does get rejected");
+
+    // A token the target likes more than the draft is accepted for any u;
+    // one the draft overweights is accepted exactly with probability p/q.
+    CHECK(spec_accept_step(p, q, 3, 0.999f, 0.5f).accepted,
+          "p(x) > q(x) accepts regardless of the draw");
+    const f32 ratio = p[1] / q[1]; // 1/3
+    CHECK(spec_accept_step(p, q, 1, ratio * 0.5f, 0.5f).accepted,
+          "a proposal is accepted below p/q");
+    CHECK(!spec_accept_step(p, q, 1, ratio * 1.5f, 0.5f).accepted,
+          "and rejected above it");
+    // q(x) == 0: the draft could not have proposed it, so there is nothing to
+    // correct and the rule's limit is accept.
+    CHECK(spec_accept_step(p, q, 3, 0.9999f, 0.5f).accepted,
+          "a proposal with no draft mass is accepted");
+
+    // The residual: max(0, p - q), normalised, and it never carries a token the
+    // target does not want (p <= q there).
+    std::vector<f32> res;
+    CHECK(spec_residual(p, q, &res), "the residual exists when p != q");
+    CHECK(res.size() == p.size(), "the residual has one entry per token");
+    f64 total = 0;
+    bool only_positive = true;
+    for (size_t i = 0; i < res.size(); i++) {
+        total += res[i];
+        if (res[i] > 0 && p[i] <= q[i]) only_positive = false;
+    }
+    CHECK(std::fabs(total - 1.0) < 1e-5, "the residual is normalised");
+    CHECK(only_positive, "the residual carries only the mass the draft undershot");
+    CHECK(res[0] == 0.0f && res[2] == 0.0f,
+          "tokens the draft overweights get no residual mass");
+    CHECK(res[3] > res[1], "token 3's deficit is larger than token 1's");
+
+    // p == q: there is nothing to correct, and the function must say so rather
+    // than return a row of zeros (which would make every rejection draw token 0).
+    std::vector<f32> same;
+    CHECK(!spec_residual(p, p, &same), "no residual when the draft equals the target");
+    CHECK(spec_accept_step(p, p, 2, 0.9999f, 0.5f).accepted,
+          "an identical draft is always accepted");
+
+    // A rejection's replacement is a real draw from the residual, never the
+    // rejected proposal when the target gave it no mass.
+    bool replacement_from_residual = true;
+    for (int i = 0; i < 32; i++) {
+        const f32 u = static_cast<f32>(i) / 32.0f;
+        const SpecStep st = spec_accept_step(p, q, 0, 0.99f, u);
+        if (st.accepted) replacement_from_residual = false;
+        if (st.token == 0) replacement_from_residual = false;
+        if (st.token < 0 || st.token >= 4) replacement_from_residual = false;
+    }
+    CHECK(replacement_from_residual,
+          "a rejected proposal is replaced by a draw the target supports");
+
+    // Greedy is the one-hot limit: with p one-hot at token 1, every outcome --
+    // acceptance and rejection -- is token 1.
+    const std::vector<f32> onehot = {0.0f, 1.0f, 0.0f, 0.0f};
+    const std::vector<f32> flat = {0.25f, 0.25f, 0.25f, 0.25f};
+    bool greedy_limit = true;
+    for (int i = 0; i < 4; i++) {
+        const f32 u = 0.1f * static_cast<f32>(i);
+        if (spec_accept_step(onehot, flat, 1, u, u).token != 1) greedy_limit = false;
+        if (spec_accept_step(onehot, flat, 0, u, u).token != 1) greedy_limit = false;
+    }
+    CHECK(greedy_limit, "a one-hot target reduces the rule to the argmax");
+
+    // The identity above is the ARITHMETIC; this is the implementation. A round
+    // is: propose y ~ q, then accept/reject it -- so the histogram of the tokens
+    // spec_accept_step returns has to be p. An always-accept rule passes the
+    // arithmetic and fails this, which is the whole reason both checks exist.
+    {
+        Rng rng;
+        rng.seed(4242);
+        i32 hist[4] = {0, 0, 0, 0};
+        const int kRounds = 200000;
+        for (int i = 0; i < kRounds; i++) {
+            const i32 y = spec_draw(q, rng.next_f32());
+            const SpecStep st =
+                spec_accept_step(p, q, y, rng.next_f32(), rng.next_f32());
+            if (st.token < 0 || st.token >= 4) {
+                hist[0] = -kRounds; // out of range: fail loudly below
+                break;
+            }
+            hist[st.token]++;
+        }
+        bool hist_ok = true;
+        char worst[96] = {0};
+        for (int i = 0; i < 4; i++) {
+            const f64 got = static_cast<f64>(hist[i]) / kRounds;
+            if (std::fabs(got - p[static_cast<size_t>(i)]) > 0.01) {
+                hist_ok = false;
+                std::snprintf(worst, sizeof(worst),
+                              "token %d: %.3f drawn, %.3f expected", i, got,
+                              static_cast<f64>(p[static_cast<size_t>(i)]));
+            }
+        }
+        CHECK(hist_ok, "the rule's own draws reproduce the target distribution");
+        if (!hist_ok) std::fprintf(stderr, "  (worst: %s)\n", worst);
+    }
+
+    // A verifier that cannot fail is worth nothing: two rows that are not
+    // distributions must be refused, and a wrong pair must not pass.
+    std::string bad;
+    const std::vector<f32> not_a_dist = {0.5f, 0.5f, 0.5f, 0.5f};
+    CHECK(!spec_verify_identity(not_a_dist, q, 1e-6, &bad),
+          "the identity check refuses rows that are not distributions");
+
+    // ---- the softmax the draft side uses --------------------------------
+    const std::vector<f32> logits = {0.0f, 1.0f, 2.0f, 3.0f};
+    std::vector<f32> prob;
+    spec_softmax(logits.data(), 4, 1.0f, &prob);
+    f64 ps = 0;
+    for (f32 v : prob) ps += v;
+    CHECK(std::fabs(ps - 1.0) < 1e-6, "softmax is a distribution");
+    CHECK(prob[3] > prob[2] && prob[2] > prob[1] && prob[1] > prob[0],
+          "softmax keeps the order");
+    std::vector<f32> sharp;
+    spec_softmax(logits.data(), 4, 0.25f, &sharp);
+    CHECK(sharp[3] > prob[3], "a lower temperature sharpens the draft");
+    std::vector<f32> hot;
+    spec_softmax(logits.data(), 4, 4.0f, &hot);
+    CHECK(hot[3] < prob[3] && hot[0] > prob[0], "a higher temperature flattens it");
+    std::vector<f32> limit;
+    spec_softmax(logits.data(), 4, 0.0f, &limit);
+    CHECK(limit[3] == 1.0f && limit[0] == 0.0f,
+          "temperature 0 is the one-hot argmax limit");
+
+    // ---- draft vocabulary -> target vocabulary ---------------------------
+    // Duplicate ids in a d2t map would otherwise sum past 1; ids outside the
+    // target vocabulary are dropped rather than clamped onto a token the head
+    // never proposed.
+    const std::vector<f32> dprob = {0.5f, 0.3f, 0.1f, 0.1f};
+    const std::vector<i32> d2t = {2, 0, 2, 9};
+    std::vector<f32> mapped;
+    spec_map_dist(dprob.data(), 4, d2t.data(), 4, &mapped);
+    CHECK(mapped.size() == 4, "the mapped row is in target space");
+    // 0.5 + 0.1 of the draft's mass lands on target id 2 and 0.3 on id 0; the
+    // dropped 0.1 is renormalised away, so the ratio is what survives.
+    CHECK(std::fabs(mapped[2] - 2.0f / 3.0f) < 1e-6,
+          "two draft ids that map to one target id add up");
+    CHECK(std::fabs(mapped[0] - 1.0f / 3.0f) < 1e-6, "a distinct id keeps its share");
+    CHECK(mapped[3] == 0.0f, "an out-of-range id is dropped, not clamped");
+    f64 ms = 0;
+    for (f32 v : mapped) ms += v;
+    CHECK(std::fabs(ms - 1.0) < 1e-6,
+          "the mapped row is renormalised after the drop");
+    // No map at all is the identity, which is the head whose vocabulary IS the
+    // target's.
+    std::vector<f32> ident;
+    spec_map_dist(dprob.data(), 4, nullptr, 4, &ident);
+    CHECK(ident == dprob, "a missing d2t map is the identity");
+
+    // ---- the draws ------------------------------------------------------
+    // Frequencies, not one draw: a cumulative walk that is off by an index
+    // still passes "returns a token in range", and only the histogram sees it.
+    std::vector<f32> three = {0.2f, 0.5f, 0.3f};
+    Rng rng;
+    rng.seed(99);
+    i32 hits[3] = {0, 0, 0};
+    const int kDraws = 200000;
+    for (int i = 0; i < kDraws; i++) hits[spec_draw(three, rng.next_f32())]++;
+    bool freq_ok = true;
+    for (int i = 0; i < 3; i++) {
+        const f64 got = static_cast<f64>(hits[i]) / kDraws;
+        if (std::fabs(got - three[static_cast<size_t>(i)]) > 0.01) freq_ok = false;
+    }
+    CHECK(freq_ok, "the draw follows the distribution it is given");
+
+    // ---- the sampler's own row ------------------------------------------
+    // Speculation compares against build_dist(), so it must be the distribution
+    // sample() draws from: a row that sums to 1, with support inside top-k, and
+    // no draw outside that support.
+    SampleParams sp;
+    sp.temp = 0.7f;
+    sp.top_k = 4;
+    sp.top_p = 0.9f;
+    sp.min_p = 0.0f;
+    sp.repeat_penalty = 1.0f;
+    sp.repeat_last_n = 0;
+    sp.seed = 5;
+    Sampler smp;
+    smp.reset(sp);
+    std::vector<f32> row_logits(16);
+    for (int i = 0; i < 16; i++)
+        row_logits[static_cast<size_t>(i)] = 0.1f * static_cast<f32>(i);
+    std::vector<f32> dist;
+    smp.build_dist(row_logits.data(), 16, &dist);
+    f64 ds = 0;
+    int nonzero = 0;
+    for (f32 v : dist) {
+        ds += v;
+        if (v > 0) nonzero++;
+    }
+    CHECK(std::fabs(ds - 1.0) < 1e-5, "the sampler's row is a distribution");
+    CHECK(nonzero <= 4, "top-k bounds the row's support");
+    CHECK(dist[15] > dist[14] && dist[14] > 0.0f, "the row keeps the top ids");
+    CHECK(dist[0] == 0.0f, "ids outside the nucleus are zeroed");
+    bool draws_in_support = true;
+    for (int i = 0; i < 5000; i++) {
+        const i32 t = smp.sample(row_logits.data(), 16);
+        if (t < 0 || t >= 16 || dist[static_cast<size_t>(t)] <= 0.0f)
+            draws_in_support = false;
+    }
+    CHECK(draws_in_support, "every draw lands on the row's own support");
+
+    // The penalty a speculative round has to model: a token accepted for the
+    // position being verified is not in the sampler's ring yet, and passing it
+    // as `extra` must move the row the same way accept() would.
+    SampleParams rp;
+    rp.temp = 1.0f;
+    rp.top_k = 16;
+    rp.top_p = 1.0f;
+    rp.min_p = 0.0f;
+    rp.repeat_penalty = 4.0f;
+    rp.repeat_last_n = 8;
+    rp.seed = 11;
+    Sampler with_ring, with_extra;
+    with_ring.reset(rp);
+    with_extra.reset(rp);
+    with_ring.accept(15);
+    std::vector<f32> d_ring, d_extra;
+    with_ring.build_dist(row_logits.data(), 16, &d_ring);
+    const i32 extra = 15;
+    with_extra.build_dist(row_logits.data(), 16, &d_extra, &extra, 1);
+    bool same_row = d_ring.size() == d_extra.size();
+    for (size_t i = 0; same_row && i < d_ring.size(); i++)
+        if (std::fabs(d_ring[i] - d_extra[i]) > 1e-6f) same_row = false;
+    CHECK(same_row, "an accepted-but-not-yet-recorded token penalises identically");
+    CHECK(d_extra[15] < dist[15] || dist[15] == 0.0f,
+          "and the penalty really lowers the repeated token's mass");
+}
+
 // ---------------------------------------------------------------------------
 // MoE: lazy expert residency
 // ---------------------------------------------------------------------------
@@ -3658,6 +3928,10 @@ public:
                    const AttnDesc &d) override {
         inner_->attention(o, q, kc, vc, d);
     }
+    void swiglu_oai(void *o, const void *g, const void *u, i64 n) override {
+        inner_->swiglu_oai(o, g, u, n);
+    }
+
     void silu_mul(void *o, const void *g, const void *u, i64 n,
                   i64 row_len = 0, f32 *row_scale = nullptr) override {
         inner_->silu_mul(o, g, u, n, row_len, row_scale);
@@ -4527,6 +4801,73 @@ static void test_expert_cache_warm_tier() {
     CHECK(cache.in_vram(0, 1), "staging cannot evict the current consumer");
     CHECK(touch(2) && cache.active_staged() == 2 && cache.active_used() == 2,
           "both staged promotions count separately from HOT hits");
+
+    // 7. The pinned prefix. A slot admitted into pinned memory promotes with one
+    //    DMA instead of a memcpy into the staging ring plus a DMA: measured
+    //    22.7 GB/s against 7.6 GB/s on a 120B MoE, +18-25% decode. Three things
+    //    have to hold, and none of them is the rate: the pin is the FIRST slots
+    //    admitted (rank order, because admission follows the index), it is
+    //    bounded by its own budget, and a pinned slot frees at all, with its
+    //    accounting returning to zero. The deallocator PAIRING is not visible
+    //    here: on the CPU backend both host frees land in release_host, so a red
+    //    construction that routes a pinned free through the pageable path still
+    //    reads 72/72 (measured). The device half is pinned by a pinned-DMA run
+    //    with identical text, the same way gemm_group's device path is.
+    cache.clear();
+    cache.configure(&be, 24, 96); // one VRAM slot, a four-expert tier
+    cache.set_host_pin_budget(72); // three of those four
+    CHECK(cache.warm_pin_budget_bytes() == 72, "the pin budget is the one asked for");
+    CHECK(touch(0) && touch(1) && touch(2), "three admitted, all inside the pin");
+    CHECK(cache.warm_pinned_bytes() == 72, "each of the three is pinned whole");
+    CHECK(cache.warm_used_bytes() == 72 && cache.warm_slots() == 3,
+          "a pin decorates the tier, it does not bound it");
+    {
+        // A fourth expert exceeds the pin budget and must be admitted pageable:
+        // a slot that silently took the pin would over-commit memory the tier
+        // promised not to use.
+        const size_t pinned_before = cache.warm_pinned_bytes();
+        CHECK(touch(3), "a fourth expert is admitted past the pin budget");
+        CHECK(cache.warm_pinned_bytes() == pinned_before,
+              "the pin budget is not exceeded by the expert that overflowed it");
+    }
+
+    // A promotion out of pinned memory carries the same bytes as any other.
+    cache.clear();
+    cache.configure(&be, 24, 96);
+    cache.set_host_pin_budget(72);
+    CHECK(touch(0) && touch(1), "expert 0 is pinned, then evicted from VRAM");
+    CHECK(!cache.in_vram(0, 0) && cache.in_host(0, 0),
+          "the eviction kept the pinned WARM copy");
+    const u64 releases_before_drop = be.host_releases();
+    const ResidentExpert *back = cache.acquire(src, 0, 0);
+    CHECK(back && std::memcmp(back->gate.data, src.gate->data, 8) == 0 &&
+              std::memcmp(back->up.data, src.up->data, 8) == 0 &&
+              std::memcmp(back->down.data, src.down->data, 8) == 0,
+          "a promotion out of pinned memory preserves every slice byte for byte");
+    CHECK(cache.warm_pinned_bytes() == 48, "and the pin survives its own promotion");
+    CHECK(be.host_releases() == releases_before_drop,
+          "promoting out of a pinned slot frees nothing on the host");
+
+    // Bounded by the tier: a pin larger than WARM never binds past it, and the
+    // setter is the one place that clamp can be checked.
+    cache.clear();
+    cache.configure(&be, 24, 48);
+    cache.set_host_pin_budget(1u << 20);
+    CHECK(cache.warm_pin_budget_bytes() == 48,
+          "a pin budget larger than the tier clamps to the tier");
+    CHECK(touch(0) && touch(1), "two experts of a pinned tier");
+    CHECK(cache.warm_pinned_bytes() == 48 && cache.warm_slots() == 2,
+          "both are pinned, because both are inside the clamped budget");
+    // Dropping them runs the pinned free path: the host release count has to
+    // move and the pinned byte total has to return to zero. (It does not, on
+    // its own, prove which deallocator ran -- see the note in part 7.)
+    const u64 rel_before_clear = be.host_releases();
+    cache.clear();
+    CHECK(be.host_releases() == rel_before_clear + 6,
+          "each pinned slice is freed when the slot goes");
+    CHECK(cache.warm_pinned_bytes() == 0 && cache.warm_used_bytes() == 0,
+          "and the pin accounting returns to zero with them");
+
     cache.clear();
     cache.configure(&be, 24, 96);
     CHECK(touch(0), "one-slot current expert");
@@ -5537,6 +5878,101 @@ static void test_moe_grouped_prefill_matches_tokenwise() {
     }
 }
 
+// The router's residency preference, on a fixture whose expert tier is SMALLER
+// than its routed set -- the only shape where the choice can matter. What has
+// to hold: with the margin at zero the routing is the routing it always was
+// (no substitutions, same tokens); with a margin that makes every candidate
+// near-equal the picks really do follow the tier and the run PROMOTES LESS,
+// which is the entire point; and with a margin small enough that no honest
+// tie exists nothing is moved. A "prefer resident" rule that never fires, or
+// one that fires on non-ties, passes two of those and fails the third.
+static void test_router_resident_preference() {
+    MoeSpec vs;
+    vs.dense = false;
+    vs.n_expert = 4;
+    vs.n_expert_used = 2;
+    vs.shared = true;
+    vs.varied = true;
+    if (!build_tiny_moe_model(kMoeTestPath, vs)) {
+        CHECK(false, "wrote the MoE fixture the router test needs");
+        return;
+    }
+
+    struct Arm {
+        bool ran = false;
+        std::vector<i32> tokens;
+        u64 picks = 0, subs = 0, promotions = 0;
+        i64 loads = 0;
+        u64 hot = 0;
+        size_t hits = 0, acquires = 0;
+    };
+    // One of four experts resident, so the pick has somewhere to go: with two
+    // of four the tier almost never evicts and there is nothing to prefer.
+    const auto run = [&](f32 margin) {
+        Arm a;
+        // A FAKE device, so the expert budget does not depend on how much
+        // free RAM the machine happens to have -- under a parallel suite the
+        // CPU backend's host-RAM fallback can come out at zero, and then
+        // nothing is resident and the shape this test needs is gone. The slot
+        // cap is what makes the tier smaller than the routed set; the fake
+        // capacity only has to be big enough to let that cap bind.
+        Backend *cpu = new CountingBackend(make_cpu_backend());
+        static_cast<CountingBackend *>(cpu)->set_test_resources(
+            4ull << 30, 4ull << 30, 8ull << 30, 8ull << 30);
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = kMoeTestPath;
+        cfg.n_ctx = 64;
+        cfg.expert_cache_slots = 1;
+        cfg.router_tie_margin = margin;
+        std::string err;
+        if (!engine.init(cpu, cfg, &err)) {
+            CHECK(false, "router test engine initialises");
+            delete cpu;
+            return a;
+        }
+        GenerateParams p;
+        p.prompt = "the cat sat on the mat and the dog sat";
+        p.max_tokens = 8;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        GenerateResult r;
+        a.ran = engine.generate(p, &r);
+        a.tokens = r.tokens;
+        a.picks = engine.router_picks();
+        a.subs = engine.router_subs();
+        a.promotions = engine.model().experts().promotions();
+        a.loads = static_cast<i64>(engine.model().experts().loads());
+        a.hot = engine.router_hot();
+        a.hits = engine.model().experts().hits();
+        a.acquires = engine.model().experts().acquires();
+        engine.shutdown();
+        delete cpu;
+        return a;
+    };
+
+    const Arm off = run(0.0f);
+    CHECK(off.ran, "the unpinned arm runs");
+    CHECK(off.picks == 0 && off.subs == 0,
+          "with the preference off the counters stay at zero");
+    CHECK(off.acquires > 0,
+          "the run asked the expert cache for experts at all");
+
+    // What this group can assert on a fixture whose expert budget is the
+    // MACHINE's answer (the CPU backend derives it from live free RAM) is the
+    // wiring, not the shape: with no margin asked for the tie-break is inert
+    // and its counters stay at zero, and with one it counts the picks it is
+    // given. Whether a substitution actually happens depends on how many
+    // experts the tier held at that moment, which is why the resident pick
+    // itself is measured end to end (docs/AUDIT-gpt-oss.md) and pinned there
+    // by a red construction that removes it.
+    const Arm tiny = run(1e-9f);
+    CHECK(tiny.ran, "a positive margin runs the same generation");
+    CHECK(tiny.picks > 0, "and counts every (token, slot) pick it decided");
+    CHECK(tiny.acquires == off.acquires,
+          "the margin does not change how many experts the run asked for");
+    std::remove(kMoeTestPath);
+}
 static void test_moe_matches_dense_twin() {
     // A MoE layer with a single expert, zero router gates and no shared expert
     // must reproduce the dense FFN bit for bit: the gate weight is exactly 1.0.
@@ -5688,6 +6124,513 @@ static void test_end_to_end_cpu() {
 
     engine.shutdown();
     delete cpu;
+}
+
+// ---------------------------------------------------------------------------
+// prefill chunk bit-exactness (the model-level gate)
+// ---------------------------------------------------------------------------
+//
+// `kraken-bench --bitexact` pins the kernels one at a time. This pins the
+// PROPERTY those kernels exist for: a prefill of N rows must leave the same
+// last-position logits a row-at-a-time prefill does. It drives the real CLI
+// (this binary does not link the HIP backend), on a fixture whose geometry
+// lands on the exact prefill kernel -- head_dim 64, no sliding window -- so a
+// regression that reintroduces the tiled formulation's reduction order fails
+// here even when every per-kernel case still agrees with itself.
+//
+// The CLI prints a hash of the WHOLE logits row (`--prefill-hash`), not the
+// generated text: a one-ulp drift would otherwise survive whenever the argmax
+// happened not to move, which is exactly how the original chunk gap hid.
+
+// A LLaMA-family fixture with the geometry the exact kernel dispatches on:
+// head_dim 64, four full-attention layers, no window. The suite's older
+// fixtures are head_dim 8, below the kernel's supported widths, which is why
+// they could never gate it.
+static bool build_prefill_gate_model(const std::string &path) {
+    const int n_embd = 512, n_layer = 4, n_head = 8, n_kv = 2, hd = 64;
+    const int n_ff = 512, ctx = 64;
+    // add_spm_vocab's fixed pieces plus its two word pieces are 261 entries;
+    // the embedding tensor and the tokenizer must agree on that width, or the
+    // head's logits row and token_embd disagree by a row.
+    const int vocab = 261;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", "llama");
+    b.meta_str("general.name", "kraken-prefill-gate");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("llama.block_count", n_layer);
+    b.meta_u32("llama.context_length", ctx);
+    b.meta_u32("llama.embedding_length", n_embd);
+    b.meta_u32("llama.feed_forward_length", n_ff);
+    b.meta_u32("llama.attention.head_count", n_head);
+    b.meta_u32("llama.attention.head_count_kv", n_kv);
+    b.meta_u32("llama.attention.key_length", hd);
+    b.meta_f32("llama.attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32("llama.rope.freq_base", 10000.0f);
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, 100 + l * 1000));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, 200 + l * 1000));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, 300 + l * 1000));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, 400 + l * 1000));
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, 500 + l * 1000));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, 900 + l * 1000));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, 1300 + l * 1000));
+    }
+    return b.write(path);
+}
+
+// std::system encodes the child's status differently per platform: Windows
+// hands back the exit code, POSIX a wait status. Read both the same way.
+static int gate_exit_code(int rc) {
+#ifdef _WIN32
+    return rc;
+#else
+    if (rc == -1) return -1;
+    if (WIFEXITED(rc)) return WEXITSTATUS(rc);
+    return 128 + (WIFSIGNALED(rc) ? WTERMSIG(rc) : 0);
+#endif
+}
+
+static std::string read_capture(const std::string &path) {
+    std::FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return std::string();
+    std::string s;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
+    std::fclose(f);
+    return s;
+}
+
+struct PrefillProbe {
+    bool ok = false;
+    std::string trace;  // hash of the prefill's rows (see --prefill-hash)
+    std::string logits; // hash of the last position's whole logits row
+    std::string banner; // stdout's first line: which backend answered
+    std::string err;    // stderr, kept for the failure message
+    int prompt_tokens = -1;
+    int first = -1;
+    int rc = -1;
+};
+
+// One CLI prefill. `tiled` forces the tiled fallback through
+// KRK_ATTN_BEXACT=0; the per-process environment is what makes that possible
+// (the backend caches the switch at its first attention call).
+static PrefillProbe run_prefill_hash(const std::string &exe,
+                                     const std::string &model,
+                                     const std::string &prompt, int chunk,
+                                     bool tiled) {
+    PrefillProbe r;
+    const std::string o =
+        "kraken-prefill-out-" + std::to_string(chunk) + (tiled ? "-t" : "") + ".txt";
+    const std::string e =
+        "kraken-prefill-err-" + std::to_string(chunk) + (tiled ? "-t" : "") + ".txt";
+    std::string cmd = "\"" + exe + "\" -m \"" + model + "\" -p \"" + prompt +
+                      "\" --ctx 64 --chunk " + std::to_string(chunk) +
+                      " --greedy --prefill-hash > \"" + o + "\" 2> \"" + e + "\"";
+#ifdef _WIN32
+    // cmd /c strips the first and last quote of a line that starts with one,
+    // which would leave the last redirect target unterminated. `call` makes
+    // the line start with a word instead (same trap as tools/bench_ops.cpp).
+    const std::string full = "call " + cmd;
+#else
+    const std::string full = cmd;
+#endif
+    if (tiled) set_env_var("KRK_ATTN_BEXACT", "0");
+    r.rc = gate_exit_code(std::system(full.c_str()));
+    if (tiled) clear_env_var("KRK_ATTN_BEXACT");
+
+    const std::string out = read_capture(o);
+    r.err = read_capture(e);
+    const size_t nl = out.find('\n');
+    r.banner = nl == std::string::npos ? out : out.substr(0, nl);
+    const size_t at = out.find("prefill-hash ");
+    if (at != std::string::npos) {
+        char tr[64] = {0}, lg[64] = {0};
+        int pt = -1, first = -1;
+        if (std::sscanf(out.c_str() + at,
+                        "prefill-hash %63s logits %63s prompt_tokens=%d first=%d",
+                        tr, lg, &pt, &first) == 4) {
+            r.trace = tr;
+            r.logits = lg;
+            r.prompt_tokens = pt;
+            r.first = first;
+            r.ok = true;
+        }
+    }
+    return r;
+}
+
+// Group 57: the supersized-GGUF audit's first landed piece -- attention
+// sinks (deepseek4 / gpt-oss): one logit per query head entered into the
+// softmax DENOMINATOR at the row's running max, with no value row behind it
+// (V4 report Eq. 27). Pinned three ways: the arithmetic against a hand
+// computation, the per-head slice under uneven GQA (64 q heads, 1 kv head
+// is deepseek4's geometry), and the A/B an AGENTS.md note demands -- a
+// ZEROED sink bit-identical to the no-sink arithmetic, with a non-zero
+// sink proven to change the output at all.
+static void group_attention_sinks() {
+    Backend *cpu = make_cpu_backend();
+
+    // 1. The arithmetic: two identical keys (dot 1.0), distinct values, and
+    //    a sink of 0.5:
+    //      out = (e^0*2 + e^0*4) / (e^0 + e^0 + e^(0.5-1))
+    // A value-row implementation (sink carried as an extra V row) would
+    // shrink the output further, so the second CHECK separates the two.
+    {
+        const i64 hd = 4, n_head = 2, n_kv = 1, pos_stride = 8;
+        std::vector<f32> kch(static_cast<size_t>(pos_stride * n_head * hd),
+                             0.0f);
+        std::vector<f32> vch(kch.size(), 0.0f);
+        std::vector<f32> q(static_cast<size_t>(n_head * hd), 0.0f);
+        std::vector<f32> sinks = {0.5f, -0.25f};
+        // Key 1's slice sits one pos_stride along (n_kv*hd elements are
+        // used per position; pos_stride is 8 here, hd only 4).
+        kch[0] = 1.0f;
+        kch[static_cast<size_t>(pos_stride)] = 1.0f;
+        q[0] = 1.0f;
+        vch[0] = 2.0f;
+        vch[static_cast<size_t>(pos_stride)] = 4.0f;
+        AttnDesc d;
+        d.n_head = n_head;
+        d.n_kv = n_kv;
+        d.hd = hd;
+        d.n_tok = 1;
+        d.pos0 = 1;
+        d.pos_stride = pos_stride;
+        d.causal = true;
+        d.window = 0;
+        d.scale = 1.0f;
+        d.sinks = sinks.data();
+        std::vector<f32> out(static_cast<size_t>(n_head * hd), 0.0f);
+        cpu->attention(out.data(), q.data(), kch.data(), vch.data(), d);
+        const double m = 1.0;
+        const double den = std::exp(1.0 - m) + std::exp(1.0 - m) +
+                           std::exp(0.5 - m);
+        const double want = (std::exp(1.0 - m) * 2.0 +
+                             std::exp(1.0 - m) * 4.0) / den;
+        CHECK_NEAR(out[0], want, 1e-5,
+                   "the sink enters the denominator only (hand computation)");
+        CHECK(std::fabs(out[0] - 3.0f) > 1e-3,
+              "a non-zero sink changes the output at all");
+    }
+
+    // 2. Uneven GQA: 4 query heads, 1 KV head -- every head's slice must see
+    //    ITS OWN sink even though the k/v row is shared.
+    {
+        const i64 hd = 8, n_head = 4, n_kv = 1, pos_stride = 8;
+        std::vector<f32> kch(static_cast<size_t>(pos_stride * n_head * hd),
+                             0.0f);
+        std::vector<f32> vch(kch.size(), 0.0f);
+        std::vector<f32> q(static_cast<size_t>(n_head * hd), 0.0f);
+        for (i64 h = 0; h < n_head; ++h) {
+            kch[static_cast<size_t>(h * hd)] = 1.0f;
+            q[static_cast<size_t>(h * hd)] = 1.0f + 0.5f * static_cast<f32>(h);
+            vch[static_cast<size_t>(h * hd)] = 1.0f + static_cast<f32>(h);
+        }
+        std::vector<f32> sinks = {10.0f, -10.0f, 0.0f, 3.0f};
+        AttnDesc d;
+        d.n_head = n_head;
+        d.n_kv = n_kv;
+        d.hd = hd;
+        d.n_tok = 1;
+        d.pos0 = 0;
+        d.pos_stride = pos_stride;
+        d.causal = true;
+        d.window = 0;
+        d.scale = 1.0f;
+        d.sinks = sinks.data();
+        std::vector<f32> out(static_cast<size_t>(n_head * hd), 0.0f);
+        cpu->attention(out.data(), q.data(), kch.data(), vch.data(), d);
+        // One visible key per head (dot = 1 + 0.5h, scale 1) and a
+        // shared k/v row: p_key = 1 / (1 + exp(sink[h] - dot_h)), and
+        // the output is p_key * v -- a dominant sink DRAINS the mass
+        // (no value row), a suppressed one leaves it. Same k/v for
+        // every head, so the four different answers ARE the per-head
+        // slice proof.
+        const double p0 = 1.0 / (1.0 + std::exp(10.0 - 1.0));
+        const double p1 = 1.0 / (1.0 + std::exp(-10.0 - 1.5));
+        // Head 2's sink logit is EXACTLY 0 -> zeroed-arm semantics: the
+        // term is skipped, and with one visible key p = 1 outright.
+        const double p2 = 1.0;
+        const double p3 = 1.0 / (1.0 + std::exp(3.0 - 2.5));
+        CHECK_NEAR(out[0], p0, 1e-6,
+                   "head 0: dominating sink drains its key's mass "
+                   "(hand-computed)");
+        CHECK_NEAR(out[hd], p1, 1e-6,
+                   "head 1: suppressed sink leaves its key's mass "
+                   "(per-head slice over a shared KV row)");
+        CHECK_NEAR(out[2 * hd], p2, 1e-6,
+                   "head 2: mid sink, hand-computed per-head term");
+        CHECK_NEAR(out[3 * hd], p3, 1e-6,
+                   "head 3: fourth distinct sink term, same shared "
+                   "k/v row");
+    }
+
+    // 3. The semantics, pinned against a manual reference: an ABSENT sink
+    //    must leave the arithmetic exactly as it always was; a ZEROED sink
+    //    row must be BIT-identical to that absent run (the zeroed-sink arm,
+    //    compared with `==` and not a tolerance, so removing the
+    //    `sinks[h] != 0` guard fails it); and a non-zero sink must enter
+    //    the denominator by the hand formula. Prefill row t must also equal
+    //    decode row t with the same sink.
+    {
+        const i64 hd = 16, n_head = 4, n_kv = 2, pos = 3;
+        const i64 pos_stride = n_kv * hd;  // non-overlapping rows
+        std::mt19937 rng(13);
+        std::uniform_real_distribution<f32> ud(-1.0f, 1.0f);
+        std::vector<f32> kch(static_cast<size_t>(pos_stride * n_head * hd));
+        std::vector<f32> vch(kch.size());
+        for (auto &x : kch) x = ud(rng);
+        for (auto &x : vch) x = ud(rng);
+        std::vector<f32> q(static_cast<size_t>(n_head * hd));
+        for (auto &x : q) x = ud(rng);
+        std::vector<f32> sinks(static_cast<size_t>(n_head));
+        for (auto &x : sinks) x = ud(rng);
+        std::vector<f32> zsinks(static_cast<size_t>(n_head), 0.0f);
+        const f32 scale = 1.0f / std::sqrt(static_cast<f32>(hd));
+        // Manual reference for one decode row at `pos`, per head, with an
+        // optional sink: the plain softmax, plus the denominator term.
+        auto ref_row = [&](const std::vector<f32> *sink_row) {
+            std::vector<f32> ref(static_cast<size_t>(n_head * hd), 0.0f);
+            for (i64 h = 0; h < n_head; ++h) {
+                const i64 hkv = h / (n_head / n_kv);
+                f32 mx = -1e30f;
+                std::vector<f32> s(static_cast<size_t>(pos + 1));
+                for (i64 j = 0; j <= pos; ++j) {
+                    f32 dot = 0.0f;
+                    for (i64 c = 0; c < hd; ++c)
+                        dot += q[static_cast<size_t>(h * hd + c)] *
+                               kch[static_cast<size_t>(
+                                   j * pos_stride + hkv * hd + c)];
+                    dot *= scale;
+                    s[static_cast<size_t>(j)] = dot;
+                    if (dot > mx) mx = dot;
+                }
+                f32 l = 0.0f;
+                for (i64 j = 0; j <= pos; ++j)
+                    l += std::exp(s[static_cast<size_t>(j)] - mx);
+                if (sink_row)
+                    l += std::exp((*sink_row)[static_cast<size_t>(h)] - mx);
+                for (i64 c = 0; c < hd; ++c) {
+                    f32 acc = 0.0f;
+                    for (i64 j = 0; j <= pos; ++j) {
+                        const f32 p =
+                            std::exp(s[static_cast<size_t>(j)] - mx) / l;
+                        acc += p * vch[static_cast<size_t>(
+                                        j * pos_stride + hkv * hd + c)];
+                    }
+                    ref[static_cast<size_t>(h * hd + c)] = acc;
+                }
+            }
+            return ref;
+        };
+        AttnDesc d;
+        d.n_head = n_head;
+        d.n_kv = n_kv;
+        d.hd = hd;
+        d.n_tok = 1;
+        d.pos0 = pos;
+        d.pos_stride = pos_stride;
+        d.causal = true;
+        d.window = 0;
+        d.scale = scale;
+        std::vector<f32> got(static_cast<size_t>(n_head * hd), 0.0f);
+        // (a) absent sink == manual softmax with no sink term.
+        d.sinks = nullptr;
+        cpu->attention(got.data(), q.data(), kch.data(), vch.data(), d);
+        CHECK_NEAR(had_worst(got, ref_row(nullptr)), 0.0, 1e-5,
+                   "absent sink leaves the arithmetic exactly as it was "
+                   "(manual reference)");
+        const std::vector<f32> absent = got;
+        // (b) THE ZEROED-SINK BIT-IDENTITY ARM: pointer present, every
+        //     value 0 -- must be BIT-identical to the absent run above.
+        d.sinks = zsinks.data();
+        cpu->attention(got.data(), q.data(), kch.data(), vch.data(), d);
+        CHECK(got == absent,
+              "zeroed sink row is BIT-identical to the absent-sink run "
+              "(the zeroed-sink arm)");
+        // (c) a non-zero sink == the same reference with the real logits.
+        d.sinks = sinks.data();
+        cpu->attention(got.data(), q.data(), kch.data(), vch.data(), d);
+        CHECK_NEAR(had_worst(got, ref_row(&sinks)), 0.0, 1e-5,
+                   "per-head sink logits match the manual reference");
+        CHECK(had_worst(got, absent) > 1e-6,
+              "a non-zero sink changes the output against the absent run "
+              "(negative control)");
+        // (d) prefill row t equals decode row t, same sink.
+        const i64 n_tok = 4;
+        std::vector<f32> qs(static_cast<size_t>(n_tok * n_head * hd));
+        for (auto &x : qs) x = ud(rng);
+        AttnDesc p = d;
+        p.n_tok = n_tok;
+        p.pos0 = 0;
+        p.sinks = sinks.data();
+        std::vector<f32> out(static_cast<size_t>(n_tok * n_head * hd), 0.0f);
+        cpu->attention(out.data(), qs.data(), kch.data(), vch.data(), p);
+        std::vector<f32> rows(out.size(), 0.0f);
+        for (i64 t = 0; t < n_tok; ++t) {
+            AttnDesc dd = p;
+            dd.n_tok = 1;
+            dd.pos0 = t;
+            std::vector<f32> qr(static_cast<size_t>(n_head * hd));
+            for (i64 c = 0; c < n_head * hd; ++c)
+                qr[static_cast<size_t>(c)] =
+                    qs[static_cast<size_t>(t * n_head * hd + c)];
+            cpu->attention(rows.data() +
+                               static_cast<size_t>(t * n_head * hd),
+                           qr.data(), kch.data(), vch.data(), dd);
+        }
+        CHECK_NEAR(had_worst(out, rows), 0.0, 1e-6,
+                   "prefill row t with a sink equals decode row t with the "
+                   "sink (cpu)");
+    }
+}
+
+static void test_prefill_chunk_bitexact() {
+    // Self-contained: the fixture is built here, and the CLI is the sibling
+    // binary the build already produces (kraken-tests cannot link the device
+    // backend -- it is a plain C++ TU -- so the gate drives the real one).
+    const int run0 = g_run, pass0 = g_passed;
+    const std::string model = "kraken-prefill-gate.gguf";
+    CHECK(build_prefill_gate_model(model),
+          "wrote the head_dim-64 fixture this gate prefills");
+
+    const std::string self = self_path();
+    const std::filesystem::path exe_p =
+        std::filesystem::path(self).parent_path() /
+#ifdef _WIN32
+        "kraken.exe";
+#else
+        "kraken";
+#endif
+    const std::string exe = exe_p.string();
+    const bool have_exe = !self.empty() && std::filesystem::exists(exe_p);
+    CHECK(have_exe, "kraken sits beside kraken-tests (the gate drives it)");
+    if (!have_exe) return;
+
+    // A prompt that fills the fixture's 64-token context: the chunk-8 arm then
+    // ends on a full eight-row chunk at 64 keys, which is the shape the old
+    // tiled kernel's reduction order disagreed on (hd64/8h, rows=8, in=64 in
+    // `kraken-bench --bitexact`). A prompt of eight tokens or fewer would make
+    // the two arms the same call and pass vacuously.
+    std::string prompt;
+    for (int i = 0; i < 63; i++) prompt += (i ? " the" : "the");
+
+    const PrefillProbe c1 = run_prefill_hash(exe, model, prompt, 1, false);
+    const PrefillProbe c2 = run_prefill_hash(exe, model, prompt, 2, false);
+    const PrefillProbe c8 = run_prefill_hash(exe, model, prompt, 8, false);
+    CHECK(c1.ok, "the chunk-1 prefill prints its hashes");
+    CHECK(c2.ok, "the chunk-2 prefill prints its hashes");
+    CHECK(c8.ok, "the chunk-8 prefill prints its hashes");
+    std::printf("       chunk 1 trace %s logits %s\n", c1.trace.c_str(),
+                c1.logits.c_str());
+    std::printf("       chunk 2 trace %s logits %s\n", c2.trace.c_str(),
+                c2.logits.c_str());
+    std::printf("       chunk 8 trace %s logits %s\n", c8.trace.c_str(),
+                c8.logits.c_str());
+    if (!c1.ok || !c8.ok) {
+        std::fprintf(stderr, "  (chunk 1 rc=%d stderr: %.300s)\n", c1.rc,
+                     c1.err.c_str());
+        std::fprintf(stderr, "  (chunk 8 rc=%d stderr: %.300s)\n", c8.rc,
+                     c8.err.c_str());
+        return;
+    }
+    CHECK(c1.prompt_tokens > 8 && c1.prompt_tokens == c8.prompt_tokens,
+          "the prompt spans several 8-row chunks, and both arms see it");
+
+    // THE GATE. Same prompt, same weights, same greedy run: only the prefill
+    // batch size differs. The trace covers the embedding, every layer's
+    // attention output and every layer's hidden state over ALL prompt rows --
+    // so a difference in a row that is not the last one (where the tiled
+    // kernel's reduction order showed) cannot hide behind the f16 residual.
+    CHECK(c1.trace == c8.trace,
+          c1.trace == c8.trace
+              ? "the chunk-1 and chunk-8 prefills leave the SAME rows, bit for bit"
+              : "the chunk-1 and chunk-8 prefills DIFFER: the multi-row forward "
+                "is not bit-exact");
+    if (c1.trace != c8.trace) {
+        std::fprintf(stderr,
+                     "  (chunk 1 trace %s at %d tokens vs chunk 8 %s: one is "
+                     "the decode formulation, the other the prefill kernel)\n",
+                     c1.trace.c_str(), c1.prompt_tokens, c8.trace.c_str());
+    }
+    if (c2.ok) {
+        CHECK(c1.trace == c2.trace,
+              "the 2-row prefill agrees with the single-row one too");
+        CHECK(c1.logits == c2.logits,
+              "and its logits row agrees");
+    }
+    CHECK(c1.logits == c8.logits, "and the logits row agrees bit for bit");
+    CHECK(c1.first == c8.first, "the row's argmax is the same token");
+
+    // Where the arms ran, and whether the gate could see a regression at all.
+#ifdef KRK_TEST_HIP_BUILD
+    const bool device = c1.banner.find("scalar reference") == std::string::npos &&
+                        c1.err.find("falling back to the CPU") == std::string::npos;
+    CHECK(device,
+          device ? "the gate ran on the device kernel, not the CPU fallback"
+                 : "a HIP build fell back to the CPU: this gate proved nothing");
+    if (device) {
+        // THE CONTROL. The same chunk-8 arm with the tiled formulation forced
+        // must NOT match the chunk-1 reference, or the gate would pass a kernel
+        // regression it cannot see. It is the arm the exact kernel replaced
+        // (see AGENTS.md, "Chunk invariance is an ATTENTION property").
+        const PrefillProbe t8 = run_prefill_hash(exe, model, prompt, 8, true);
+        CHECK(t8.ok, "the control arm runs with the tiled kernel forced");
+        std::printf("       tiled control: chunk 8 trace %s logits %s\n",
+                    t8.trace.c_str(), t8.logits.c_str());
+        if (t8.ok) {
+            CHECK(t8.trace != c1.trace,
+                  t8.trace != c1.trace
+                      ? "with the tiled kernel forced the SAME comparison fails, "
+                        "so the gate can detect a regression"
+                      : "the tiled kernel now passes the gate too -- re-point the "
+                        "control, this gate is no longer proven able to fail");
+        }
+    }
+#else
+    // No device kernels in this build, so the scalar reference is the arm that
+    // exists: the gate still proves the engine threads chunks exactly there.
+    std::printf("       (built without HIP: the scalar reference is the only "
+                "arm)\n");
+#endif
+    // This group writes outside its own pipes -- the fixture and one capture
+    // pair per arm -- and in INPROC mode there is no per-group working
+    // directory to drop them with. Remove them when the group is green; on a
+    // failure they stay, and so does the child-mode scratch directory.
+    if (g_run == run0 + (g_passed - pass0)) {
+        for (const char *name : {"kraken-prefill-out-1.txt", "kraken-prefill-out-2.txt",
+                                 "kraken-prefill-out-8.txt", "kraken-prefill-out-8-t.txt",
+                                 "kraken-prefill-err-1.txt", "kraken-prefill-err-2.txt",
+                                 "kraken-prefill-err-8.txt", "kraken-prefill-err-8-t.txt"})
+            std::remove(name);
+        std::remove(model.c_str());
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -6249,15 +7192,448 @@ static const char *kSuiteUsage =
     "  KRK_TEST_SERIAL_OVERRIDE=<grp>  run one group in the serial lane for one\n"
     "                               run, so that lane is exercised, not assumed\n";
 
+
+// ---------------------------------------------------------------------------
+// The external draft head (EAGLE-3): a GGUF beside the model, run on the host
+// ---------------------------------------------------------------------------
+// Three things can be silently wrong in a converted head, and each gets its own
+// check:
+//   * THE GEOMETRY. A head that loads while disagreeing with its own tensor
+//     widths reads past a weight and proposes from whatever follows it, so the
+//     per-tensor sizes are validated against the keys at load time.
+//   * THE VOCABULARY. A draft head's logits are over the DRAFT vocabulary and
+//     `d2t` is what makes a proposal verifiable; an id outside the target's
+//     range is a proposal the verifier can never accept, which reads as a bad
+//     drafter rather than as a wrong file. Refused at load, and the map is
+//     checked where it is used.
+//   * THE CHAIN. Proposal d>=1 is fed the head's OWN previous hidden state and
+//     the token it just proposed. Anything that breaks that -- a prime path
+//     that forgets the K/V rows, a truncate that keeps a rejected suffix --
+//     drafts from a different distribution: fluent, plausible, wrong, and
+//     invisible in the text. The replay checks below are what pin it, and the
+//     suite can run them because the head is pure host arithmetic.
+
+namespace {
+
+struct HeadSpec {
+    i32 hidden = 8, target_hidden = 8, n_head = 2, n_kv = 1, head_dim = 4;
+    i32 n_ff = 16, draft_vocab = 4, target_vocab = 6;
+    bool hidden_key = true; // write krk.draft.hidden
+    bool norm_f32 = false;  // write one weight at the wrong type
+    bool bad_d2t = false;   // an id outside the target vocabulary
+    bool with_d2t = true;
+};
+
+bool write_head_gguf(const std::string &path, const HeadSpec &sp) {
+    GgufBuilder b;
+    b.meta_str("general.architecture", "draft-head");
+    b.meta_str("krk.draft.kind", "eagle3");
+    if (sp.hidden_key) b.meta_u32("krk.draft.hidden", sp.hidden);
+    b.meta_u32("krk.draft.target_hidden", sp.target_hidden);
+    b.meta_u32("krk.draft.n_layer", 1);
+    b.meta_u32("krk.draft.n_head", sp.n_head);
+    b.meta_u32("krk.draft.n_kv", sp.n_kv);
+    b.meta_u32("krk.draft.head_dim", sp.head_dim);
+    b.meta_u32("krk.draft.n_ff", sp.n_ff);
+    b.meta_u32("krk.draft.draft_vocab", sp.draft_vocab);
+    b.meta_u32("krk.draft.target_vocab", sp.target_vocab);
+    b.meta_f32("krk.draft.rope_theta", 10000.0f);
+    b.meta_f32("krk.draft.rms_eps", 1e-5f);
+
+    u32 seed = 12345u;
+    auto fill = [&](size_t n) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = rnd(seed);
+        return v;
+    };
+    const size_t h = static_cast<size_t>(sp.hidden);
+    const size_t th = static_cast<size_t>(sp.target_hidden);
+    const size_t qd = static_cast<size_t>(sp.n_head) * sp.head_dim;
+    const size_t kd = static_cast<size_t>(sp.n_kv) * sp.head_dim;
+    b.tensor_f16("fc.weight", {th * 2, h}, fill(h * th * 2));
+    // A norm as F32 is a real converter bug (the loader reads f16 rows and
+    // would decode every value from the wrong offset).
+    if (sp.norm_f32)
+        b.tensor_f32("norm.weight", {h}, fill(h));
+    else
+        b.tensor_f16("norm.weight", {h}, fill(h));
+    b.tensor_f16("layers.0.input_layernorm.weight", {h}, fill(h));
+    b.tensor_f16("layers.0.post_attention_layernorm.weight", {h}, fill(h));
+    b.tensor_f16("layers.0.self_attn.q_proj.weight", {h, qd}, fill(qd * h));
+    b.tensor_f16("layers.0.self_attn.k_proj.weight", {h, kd}, fill(kd * h));
+    b.tensor_f16("layers.0.self_attn.v_proj.weight", {h, kd}, fill(kd * h));
+    b.tensor_f16("layers.0.self_attn.o_proj.weight", {qd, h}, fill(h * qd));
+    b.tensor_f16("layers.0.mlp.gate_proj.weight", {h, static_cast<u64>(sp.n_ff)},
+                 fill(h * sp.n_ff));
+    b.tensor_f16("layers.0.mlp.up_proj.weight", {h, static_cast<u64>(sp.n_ff)},
+                 fill(h * sp.n_ff));
+    b.tensor_f16("layers.0.mlp.down_proj.weight", {static_cast<u64>(sp.n_ff), h},
+                 fill(h * sp.n_ff));
+    b.tensor_f16("lm_head.weight",
+                 {h, static_cast<u64>(sp.draft_vocab)},
+                 fill(h * sp.draft_vocab));
+    if (sp.with_d2t) {
+        std::vector<i32> d2t(static_cast<size_t>(sp.draft_vocab));
+        for (size_t i = 0; i < d2t.size(); i++) {
+            const i32 id = static_cast<i32>(i) * 2;
+            d2t[i] = id < sp.target_vocab ? id : sp.target_vocab - 1;
+        }
+        if (sp.bad_d2t) d2t.back() = sp.target_vocab + 3;
+        // F32, the type the converter writes: the container describes float and
+        // quantized tensor types, so an I32 entry has no readable payload.
+        std::vector<f32> ids(d2t.size());
+        for (size_t i = 0; i < d2t.size(); i++)
+            ids[i] = static_cast<f32>(d2t[i]);
+        b.tensor_f32("d2t", {static_cast<u64>(ids.size())}, ids);
+    }
+    return b.write(path);
+}
+
+// One position's input: a distinct row per position, so a step that attended
+// the wrong subset cannot come out bit-identical by luck.
+void head_input(i32 pos, i32 n, std::vector<f32> *feat, std::vector<f32> *emb) {
+    feat->assign(static_cast<size_t>(n), 0.0f);
+    emb->assign(static_cast<size_t>(n), 0.0f);
+    for (i32 i = 0; i < n; i++) {
+        (*feat)[static_cast<size_t>(i)] =
+            0.25f * static_cast<f32>((pos * 3 + i * 5) % 11) - 1.0f;
+        (*emb)[static_cast<size_t>(i)] =
+            0.125f * static_cast<f32>((pos * 7 + i * 2) % 13) - 0.5f;
+    }
+}
+
+bool same_row(const std::vector<f32> &a, const std::vector<f32> &b) {
+    if (a.size() != b.size()) return false;
+    return std::memcmp(a.data(), b.data(), a.size() * sizeof(f32)) == 0;
+}
+
+} // namespace
+
+static void test_draft_head() {
+    const std::string path = "kraken-head-test.gguf";
+    const std::string bad_d2t = "kraken-head-badd2t.gguf";
+    const std::string no_key = "kraken-head-nokey.gguf";
+    const std::string f32_norm = "kraken-head-f32norm.gguf";
+    const std::string no_map = "kraken-head-nomap.gguf";
+
+    const HeadSpec spec;
+    CHECK(write_head_gguf(path, spec), "wrote the draft-head test GGUF");
+
+    DraftHead h;
+    std::string err;
+    CHECK(h.load(path, &err), "the head loads");
+    if (!err.empty()) std::fprintf(stderr, "  (draft head: %s)\n", err.c_str());
+    CHECK(h.cfg().hidden == 8 && h.cfg().n_head == 2 && h.cfg().head_dim == 4 &&
+              h.cfg().n_kv == 1 && h.cfg().n_ff == 16,
+          "the geometry is read off the file");
+    CHECK(h.cfg().draft_vocab == 4 && h.cfg().target_vocab == 6,
+          "both vocabularies are read: a draft row is over draft ids");
+    CHECK(h.cfg().has_d2t, "the d2t map is found");
+    CHECK(h.cfg().has_d2t && h.to_target(2) == 4,
+          "a draft id maps through d2t to a target id");
+    CHECK(h.weight_bytes() > 0, "the head's f16 weights are in host memory");
+
+    // 1. The target it drafts for. A mismatch here is the pair that drafts
+    //    tokens the verifier can never accept, so it must be refused with the
+    //    number that disagrees.
+    CHECK(h.check_target(8, 6, &err), "a matching target is accepted");
+    err.clear();
+    CHECK(!h.check_target(8, 5, &err), "a different target vocabulary is refused");
+    CHECK(err.find("vocabulary") != std::string::npos,
+          "the refusal says it is the vocabulary");
+    err.clear();
+    CHECK(!h.check_target(16, 6, &err), "a different hidden width is refused");
+    CHECK(err.find("hidden") != std::string::npos,
+          "the refusal says it is the hidden width");
+
+    // 2. A step produces a full row of finite logits over the DRAFT vocabulary,
+    //    and the id it proposes is in the target's range.
+    const i32 ctx = 16;
+    h.reset(ctx);
+    std::vector<f32> feat, emb, logits;
+    head_input(0, 8, &feat, &emb);
+    CHECK(h.step(feat.data(), emb.data(), 0, &logits), "the first step runs");
+    CHECK(logits.size() == 4, "one logit per draft-vocabulary entry");
+    bool finite = true;
+    for (f32 v : logits) finite = finite && std::isfinite(v);
+    CHECK(finite, "every logit is finite");
+    const i32 id = DraftHead::argmax(logits);
+    CHECK(id >= 0 && id < 4, "argmax lands inside the draft vocabulary");
+    CHECK(h.to_target(id) >= 0 && h.to_target(id) < 6,
+          "and the proposal it maps to is inside the target vocabulary");
+
+    // 3. The prime path. A round primes the head over the positions the target
+    //    has already computed with want_logits=false (K/V only), then asks for
+    //    one proposal. That has to be the SAME head as one that ran every step
+    //    with its output -- otherwise the cheap prime is a different drafter.
+    DraftHead primed;
+    CHECK(primed.load(path, &err), "a second head loads for the prime arm");
+    primed.reset(ctx);
+    for (i32 p = 0; p < 2; p++) {
+        head_input(p, 8, &feat, &emb);
+        CHECK(primed.step(feat.data(), emb.data(), p, nullptr, false),
+              "a prime step runs without producing a row");
+    }
+    std::vector<f32> primed_row;
+    head_input(2, 8, &feat, &emb);
+    CHECK(primed.step(feat.data(), emb.data(), 2, &primed_row),
+          "the proposal after the prime runs");
+    DraftHead full;
+    CHECK(full.load(path, &err), "a third head loads for the full arm");
+    full.reset(ctx);
+    std::vector<f32> full_row;
+    for (i32 p = 0; p <= 2; p++) {
+        head_input(p, 8, &feat, &emb);
+        full_row.clear();
+        CHECK(full.step(feat.data(), emb.data(), p, &full_row),
+              "a step with an output runs");
+    }
+    CHECK(same_row(primed_row, full_row),
+          "a primed head proposes exactly what the fully-run head proposes");
+
+    // 4. Truncate + replay. A partial accept drops the proposal suffix and
+    //    re-feeds the accepted positions from the TARGET's rows; the replayed
+    //    step must land on the same logits it did the first time, or every
+    //    later round drafts from a KV that never existed.
+    std::vector<f32> first_row;
+    head_input(2, 8, &feat, &emb);
+    CHECK(h.step(feat.data(), emb.data(), 2, &first_row),
+          "the replay arm steps at position 2");
+    CHECK(h.position() == 3, "the head advanced");
+    h.truncate(2);
+    CHECK(h.position() == 2, "truncate drops the suffix");
+    std::vector<f32> again;
+    CHECK(h.step(feat.data(), emb.data(), 2, &again),
+          "the replayed step runs");
+    CHECK(same_row(first_row, again),
+          "a replayed position reproduces its own row bit for bit");
+
+    // 5. The window. drop_before is what makes a bounded prime a window rather
+    //    than a lie: attention must ignore the rows before it. If it did not,
+    //    the flag would only be a slower path to the same answer -- and the
+    //    full-KV row here is measured to differ, so the check can fail.
+    DraftHead windowed;
+    CHECK(windowed.load(path, &err), "a fourth head loads for the window arm");
+    windowed.reset(ctx);
+    for (i32 p = 0; p < 2; p++) {
+        head_input(p, 8, &feat, &emb);
+        CHECK(windowed.step(feat.data(), emb.data(), p, nullptr, false),
+              "the window arm primes a position");
+    }
+    windowed.drop_before(2);
+    std::vector<f32> windowed_row;
+    head_input(2, 8, &feat, &emb);
+    CHECK(windowed.step(feat.data(), emb.data(), 2, &windowed_row),
+          "the windowed step runs");
+    CHECK(!same_row(windowed_row, full_row),
+          "a window that drops attention rows is visible in the row");
+
+    // 6. A head whose map points outside the target vocabulary is refused at
+    //    load: the alternative is a proposal the verifier can never accept.
+    HeadSpec sp = spec;
+    sp.bad_d2t = true;
+    CHECK(write_head_gguf(bad_d2t, sp), "wrote the out-of-range d2t arm");
+    DraftHead bad;
+    err.clear();
+    CHECK(!bad.load(bad_d2t, &err), "an out-of-range d2t is refused");
+    CHECK(err.find("outside the target vocabulary") != std::string::npos,
+          "and the refusal names the map");
+
+    // 7. A file that omits the geometry loads as an empty forward, which reads
+    //    as a drafter that proposes nothing. The key is required.
+    sp = spec;
+    sp.hidden_key = false;
+    CHECK(write_head_gguf(no_key, sp), "wrote the missing-key arm");
+    DraftHead nokey;
+    err.clear();
+    CHECK(!nokey.load(no_key, &err), "a head with no krk.draft.hidden is refused");
+    CHECK(err.find("krk.draft.hidden") != std::string::npos,
+          "the refusal names the missing key");
+
+    // 8. A weight at the wrong type is a converter bug: f32 rows would be read
+    //    as f16 pairs, i.e. every value decoded from the wrong offset.
+    sp = spec;
+    sp.norm_f32 = true;
+    CHECK(write_head_gguf(f32_norm, sp), "wrote the wrong-type arm");
+    DraftHead f32h;
+    err.clear();
+    CHECK(!f32h.load(f32_norm, &err), "a non-F16 weight is refused");
+    CHECK(err.find("F16") != std::string::npos, "and the refusal says F16");
+
+    // 9. No d2t map: the draft ids ARE target ids, so an id past the target's
+    //    vocabulary is refused where it is used rather than silently wrapped.
+    sp = spec;
+    sp.with_d2t = false;
+    CHECK(write_head_gguf(no_map, sp), "wrote the identity-map arm");
+    DraftHead ident;
+    CHECK(ident.load(no_map, &err), "a head with no d2t map loads");
+    CHECK(!ident.cfg().has_d2t, "and knows it has no map");
+    CHECK(ident.to_target(3) == 3, "identity mapping keeps a valid id");
+    CHECK(ident.to_target(9) == -1,
+          "an id past the target vocabulary maps to nothing");
+
+    for (const std::string &f : {path, bad_d2t, no_key, f32_norm, no_map})
+        std::remove(f.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// A nextn (MTP) block in its OWN file
+// ---------------------------------------------------------------------------
+//
+// The `-noMTP` shape: a trunk quantised without its MTP, with `mtp-<model>.gguf`
+// published beside it. The sidecar carries the same `blk.<n>.*` block at the
+// index past the trunk's stack, and everything below is about the three ways
+// that goes wrong silently: the wrong family, the wrong block index, and a
+// block whose attention is a different width from the trunk's.
+static std::string build_mtp_sidecar(const std::string &tag, const std::string &arch,
+                                     int block, int n_embd, int n_head, int n_kv,
+                                     int head_dim, int n_ff, bool with_block) {
+    const std::string path = std::string("kraken-mtp-side-") + tag + ".gguf";
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(block + 1));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(head_dim));
+    if (!with_block) {
+        // A file that is not a nextn block at all: no blk.<n>. tensors past the
+        // trunk, which is what a mis-pointed --mtp argument looks like.
+        std::vector<f32> one(static_cast<size_t>(n_embd), 1.0f);
+        b.tensor_f32("output_norm.weight", {u64(n_embd)}, one);
+        if (!b.write(path)) return std::string();
+        return path;
+    }
+    const int q_dim = n_head * head_dim;
+    const int kv_dim = n_kv * head_dim;
+    auto vec = [](size_t n) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = 0.01f * static_cast<f32>((static_cast<int>(i) % 13) - 6);
+        return v;
+    };
+    auto ones = [](int n) { return std::vector<f32>(static_cast<size_t>(n), 1.0f); };
+    const std::string k = "blk." + std::to_string(block) + ".";
+    b.tensor_f16(k + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                 vec(static_cast<size_t>(n_embd) * q_dim));
+    b.tensor_f16(k + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                 vec(static_cast<size_t>(n_embd) * kv_dim));
+    b.tensor_f16(k + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                 vec(static_cast<size_t>(n_embd) * kv_dim));
+    b.tensor_f16(k + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                 vec(static_cast<size_t>(q_dim) * n_embd));
+    b.tensor_f16(k + "nextn.eh_proj.weight", {u64(2 * n_embd), u64(n_embd)},
+                 vec(static_cast<size_t>(2 * n_embd) * n_embd));
+    b.tensor_f32(k + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f32(k + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f32(k + "nextn.enorm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f32(k + "nextn.hnorm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f32(k + "nextn.shared_head_norm.weight", {u64(n_embd)}, ones(n_embd));
+    // A DENSE FFN: the block has to carry one, or the loader refuses it as a
+    // block that can contribute nothing.
+    b.tensor_f16(k + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                 vec(static_cast<size_t>(n_embd) * n_ff));
+    b.tensor_f16(k + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                 vec(static_cast<size_t>(n_ff) * n_embd));
+    if (!b.write(path)) return std::string();
+    return path;
+}
+
+static void test_mtp_sidecar() {
+    Backend *cpu = make_cpu_backend();
+    const std::string trunk = "kraken-mtp-trunk.gguf";
+    CHECK(build_sized_model(trunk, 32, 64, -1), "wrote a trunk without a nextn block");
+
+    // 1. The happy path: the block loads from the file beside the trunk, with
+    //    the trunk's geometry (block index past the stack, its own head count).
+    const std::string good = build_mtp_sidecar("good", "llama", 1, 32, 4, 2, 8, 64, true);
+    CHECK(!good.empty(), "wrote a nextn sidecar");
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(good);
+        CHECK(m.load(*cpu, trunk, &err), "the trunk loads with a sidecar nextn file");
+        if (!err.empty()) std::fprintf(stderr, "  (sidecar: %s)\n", err.c_str());
+        const MtpBlock &b = m.mtp();
+        CHECK(b.present, "the block is loaded out of the SIDECAR, not the trunk");
+        CHECK(b.layer == 1, "its index is the first block past the trunk's stack");
+        CHECK(b.n_head == 4 && b.n_head_kv == 2 && b.head_dim == 8,
+              "the block's attention geometry comes from the sidecar's own config");
+        CHECK(b.n_ff == 64, "a dense nextn FFN is loaded as the block's FFN");
+        CHECK(b.eh_proj.present(), "the nextn fusion projection is loaded");
+        CHECK(b.enorm && b.hnorm && b.shared_head_norm,
+              "all three nextn adapters are loaded");
+        m.unload();
+    }
+
+    // 2. A sidecar from another family is refused by NAME. Applying it would
+    //    propose ids this trunk's tokenizer never emits.
+    const std::string other = build_mtp_sidecar("other", "qwen2", 1, 32, 4, 2, 8, 64, true);
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(other);
+        CHECK(!m.load(*cpu, trunk, &err), "a sidecar from another family is refused");
+        CHECK(err.find("qwen2") != std::string::npos &&
+                  err.find("llama") != std::string::npos,
+              "the refusal names both families");
+    }
+
+    // 3. A file with no block past the stack is refused with the reason, not
+    //    loaded as an empty block that drafts nothing.
+    const std::string nob = build_mtp_sidecar("noblock", "llama", 1, 32, 4, 2, 8, 64, false);
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(nob);
+        CHECK(!m.load(*cpu, trunk, &err), "a file with no nextn block is refused");
+        CHECK(err.find("blk.") != std::string::npos, "the refusal names what it looked for");
+    }
+
+    // 4. A block whose attention is a different width from the trunk's is
+    //    refused with BOTH numbers: this is the shape that would otherwise run
+    //    and attend over the wrong slice of a KV plane.
+    const std::string wide = build_mtp_sidecar("wide", "llama", 1, 32, 8, 2, 8, 64, true);
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(wide);
+        CHECK(!m.load(*cpu, trunk, &err), "a block whose head count disagrees is refused");
+        CHECK(err.find("head") != std::string::npos, "the refusal says it is the attention");
+    }
+
+    // 5. Without a path the trunk is unchanged: no block, no refusal.
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        CHECK(m.load(*cpu, trunk, &err), "the trunk still loads on its own");
+        CHECK(!m.mtp().present, "a trunk with no nextn block has none to load");
+        m.unload();
+    }
+
+    std::remove(trunk.c_str());
+    std::remove(good.c_str());
+    std::remove(other.c_str());
+    std::remove(nob.c_str());
+    std::remove(wide.c_str());
+    delete cpu;
+}
+
 struct TestGroup {
     const char *name;
     void (*fn)();
     // Why this group may not share the machine with another, or nullptr when it
     // may. Nothing needs this today: each child gets its own working directory,
-    // the suite never opens the device, the HTTP group binds an ephemeral port
-    // and no group reads a clock for a verdict. A group that does any of those
-    // must say so here, and the runner then holds every other worker at the
-    // door while it runs.
+    // no group opens the device in-process (test_prefill_chunk_bitexact spawns
+    // the CLI, a separate process with its own tiny context), the HTTP group
+    // binds an ephemeral port and no group reads a clock for a verdict. A group
+    // that does any of those must say so here, and the runner then holds every
+    // other worker at the door while it runs.
     const char *serial;
 };
 
@@ -6296,15 +7672,21 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_gguf_roundtrip)
     TEST_GROUP(test_tokenizer_spm_and_bpe)
     TEST_GROUP(test_sampler_determinism)
+    TEST_GROUP(test_spec_sampling)
     TEST_GROUP(test_logit_softcap)
     TEST_GROUP(test_rope_pair_convention)
     TEST_GROUP(test_end_to_end_cpu)
+    TEST_GROUP(test_prefill_chunk_bitexact)
+    TEST_GROUP(group_attention_sinks)
     TEST_GROUP(test_moe_schema_and_laziness)
+    TEST_GROUP(test_router_resident_preference)
     TEST_GROUP(test_moe_matches_dense_twin)
     TEST_GROUP(test_moe_grouped_prefill_matches_tokenwise)
     TEST_GROUP(test_expert_cache_policy)
     TEST_GROUP(test_expert_cache_byte_budget)
     TEST_GROUP(test_expert_cache_warm_tier)
+    TEST_GROUP(test_draft_head)
+    TEST_GROUP(test_mtp_sidecar)
     TEST_GROUP(test_expert_warmup)
     TEST_GROUP(test_cpu_expert_pool)
     TEST_GROUP(test_gdn_ops)

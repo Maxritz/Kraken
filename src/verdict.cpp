@@ -157,7 +157,9 @@ ModelVerdict assess_model(const Gguf &g) {
             const i32 first = block_count - v.mtp_blocks;
             add_unique(v.notes,
                        format("carries %d multi-token-prediction block(s) "
-                              "(blk.%d%s) that this engine skips",
+                              "(blk.%d%s): loaded behind --mtp-probe (one "
+                              "block forward, compared against the target's "
+                              "argmax) and usable as a drafter with --mtp-spec",
                               v.mtp_blocks, first,
                               v.mtp_blocks > 1 ? ".." : ""));
         }

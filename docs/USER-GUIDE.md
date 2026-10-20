@@ -132,7 +132,8 @@ mode code review does not catch.
 ```sh
 ninja -C build-hip kraken kraken-tests kraken-bench kraken-inspect   # check rc, 0 "error:" lines
 sh scripts/build_check.sh                              # is the binary what it claims?
-./build-hip/kraken-tests                               # 2329/2329 checks
+./build-hip/kraken-tests                               # 3008/3008 checks
+./build-hip/kraken-tests --run-group test_prefill_chunk_bitexact  # chunk 1 vs 8, bit for bit
 ./build-hip/kraken-bench --gate                        # numeric tolerances + logits_topk
 bash scripts/coherence_check.sh models/*.gguf          # device vs scalar CPU, text diff
 ```
@@ -277,6 +278,37 @@ total          4399.0 ms
   every model here, which is why it is printed. A report covering only prefill
   and decode invites optimising two thirds of the process.
 
+### Loading modes: memory vs disk
+
+`--bench` with a budget is how the two loading paths are compared:
+
+```sh
+# memory-resident: upload once, keep it
+kraken.exe -m M --bench --ctx 512 --chunk 256 -n 32 --greedy --weight-vram-mb -1
+
+# disk: 2 GiB resident, everything else re-read from the file before each layer
+KRK_WEIGHT_PROMOTE=0 kraken.exe -m M --bench --ctx 512 --chunk 256 \
+    -n 32 --greedy --weight-vram-mb 2048
+```
+
+`--bench` runs its own fixed prompt and ignores `-p`, so the prompt token
+count depends on the model's tokenizer (125 on Phi, 55 on Qwen): a Phi row's
+prefill tok/s is not comparable with the rest. `scripts/bench_loading.sh`
+runs the three arms interleaved and order-balanced and prints one row per
+arm:
+
+```sh
+sh scripts/bench_loading.sh /g/More-models/Qwen3-8B-Q4_K_M.gguf:32 \n    /g/More-models/Qwen3.8-27B-WebGGUF-Q4_0.gguf:8
+```
+
+Measured on this box, Qwen3-8B Q4_K_M goes **92.1 -> 2.5 tok/s** decode when 25
+of its 36 layers stream (prefill 1037 -> 118), and a 27B Q4 that fits at
+14.4 GiB goes **14.9 tok/s resident, 8.6 with the auto 12 GiB budget, 0.5 with
+the 2 GiB ring**. `--weight-vram-mb N` alone is not a disk arm: a streamed
+layer is promoted resident on first use, so the ring has to be paired with
+`KRK_WEIGHT_PROMOTE=0` to be measured. Full table, MoE caveat and the
+order-balanced loop: [BENCH-LOADING.md](BENCH-LOADING.md).
+
 ### Headline numbers (3 runs each, min–max)
 
 | model | layers / embd | prefill tok/s | decode tok/s | load ms |
@@ -329,6 +361,7 @@ or what fits in memory.
 | `--greedy` | force argmax. Use it for benchmarks — the sampled path does a full host-side cut and is a different measurement |
 | `--profile` | per-op device timeline for the last decode step, with the idle gap before each op |
 | `--tokenize` | print the prompt's token ids and exit |
+| `--prefill-hash` | prefill the prompt, print a hash of every prefill row's stages and of the last logits row, then exit. Two runs that differ only in `--chunk` print the same numbers iff the multi-row forward is bit-exact |
 | `--info` | geometry, device, KV and expert cache budgets, then exit |
 
 `--profile` window: `KRK_PROFILE_STEPS=N` (last N steps), `KRK_PROFILE_FROM=S`,
@@ -358,6 +391,8 @@ materializes exactly those matrices under a byte budget, LFU with aging.
 | `--expert-cache-mb N` | VRAM residency budget in MiB (`0` = auto) |
 | `--expert-cache-slots N` | cap resident `(layer, expert)` slots instead of bytes (`0` = auto) |
 | `--expert-warm-mb N` | WARM tier in pageable host RAM for evicted experts; `<0` auto, `0` off (`--expert-l2-mb` is the old spelling) |
+| `--expert-pin-mb N` | pin the first `N` MiB of that tier, in rank (admission) order: a promotion out of pinned memory is one DMA with no host memcpy in front of it. Measured 22.7 GB/s against 7.6 on a 120B MoE, +18-25% decode. Off by default -- it is RAM that cannot be paged out; `KRK_HOST_PIN_MB` is the same knob |
+| `--router-resident P` | residency preference in the router: a pick within `P` of the top expert score (a fraction of it, `0.10` = 10%) goes to the expert already in VRAM, then to the one in WARM. Measured -20% bytes/token and +16.7% decode on a 120B MoE at `0.10`; it changes the route, so it can change the text. `KRK_ROUTER_TIE_MARGIN` is the same knob; `0`/absent is off |
 | `--expert-warm-prefetch` | fill WARM at load instead of on demand |
 | `--expert-warmup 0/1` | ranked startup phase: stage the ranked expert set into WARM, then promote the top of that order into VRAM. `<0` auto (on when the routed set exceeds the device budget), `0` off, `1` forced; `KRK_EXPERT_WARMUP=0/1` overrides |
 | `--expert-warmup-ms N` | wall-time ceiling for that phase in ms (default `20000`); `0` removes it. Being cut short costs coverage, never the hottest experts |
@@ -372,6 +407,18 @@ that. A hit rate near 0% means the working set does not fit: raise the budget.
 Evicted experts are *demoted*, not dropped, when a WARM tier exists: the next
 request becomes a DMA instead of a re-read of the mapping, and the LFU counter,
 the pin and the load order all survive the round trip.
+
+### A nextn (MTP) block in its own file
+
+| flag | effect |
+|---|---|
+| `--mtp FILE` | load the nextn block from a separate GGUF, for a `-noMTP` trunk whose MTP was published beside it (`mtp-<model>.gguf`). Implies `--mtp-probe` |
+
+The sidecar is validated against the trunk before the first token: same
+architecture, a block at or past the trunk's stack, the same embedding width and
+head count (a same-family head with a different attention shape is refused with
+both numbers), and a per-layer `head_count_kv` array is read at the block's own
+index. `--mtp-spec` then drives it as a drafter exactly as an in-file block.
 
 ### KV tiers
 
@@ -394,6 +441,28 @@ kraken.exe -m big.gguf --draft small.gguf --draft-tokens 4 --greedy -p "..." -n 
 Several target tokens per host round-trip. Greedy only — a sampling request
 runs without the draft and says so.
 
+### An external draft head (EAGLE-3)
+
+```sh
+kraken.exe -m big.gguf --draft-head head.gguf --draft-tokens 2 --greedy -p "..." -n 128
+```
+
+A published speculator converted once with `tools/eagle_to_gguf.py`. It takes no
+VRAM (it runs on the host) and no second model, and under `--greedy` the emitted
+text is identical to plain greedy -- only the speed changes. The loader refuses
+a head whose hidden width or target vocabulary disagrees with the model, and a
+recurrent target (no rewind). `--draft-head-prime N` bounds how many recent
+positions it attends (default 256; `0` = the whole prompt).
+
+Unlike `--draft` and `--mtp-spec`, the head also drafts under sampling: the
+round draws each proposal from the head's distribution, accepts it with
+probability `min(1, p/q)` against the target's row, and on a rejection emits a
+draw from `max(0, p - q)` instead. That is the speculative-sampling rule
+(arXiv:2302.01318), so turning the sampler on does not turn the head's
+distribution into the output. `KRK_SPEC_RS=0` disables it and the request runs
+without the head.
+
+
 ### Finding a divergence
 
 ```sh
@@ -404,6 +473,20 @@ python tools/dump_diff.py a.txt b.txt
 
 The first differing line names the stage and the layer. That is the fastest way
 to tell a prefill bug from a decode bug.
+
+The same question without a dump, and the one the test suite gates on:
+
+```sh
+kraken.exe -m M -p "..." --ctx 64 --chunk 1 --greedy --prefill-hash
+kraken.exe -m M -p "..." --ctx 64 --chunk 8 --greedy --prefill-hash
+```
+
+Both must print the same `prefill-hash` and `logits` values. A different
+`prefill-hash` with equal `logits` is the shape a prefill-kernel regression
+takes -- the drift is real but dies in the f16 residual before the head, which
+is why the trace covers every row. `KRK_ATTN_BEXACT=0` forces the old tiled
+kernel and must change `prefill-hash`; if it does not, the comparison is not
+looking at the kernel.
 
 ---
 
@@ -456,7 +539,7 @@ and `rocm_kpack.dll` next to the binary to pin it (§2).
 
 **A model loads but the text is fluent and wrong.**
 That is the signature of a plausible-but-incorrect weight or attention path.
-Compare against `KRK_WEIGHT_PULL=0` and `KRK_ATTN_QTILE=0` before blaming the
+Compare against `KRK_WEIGHT_PULL=0` and `KRK_ATTN_BEXACT=0` before blaming the
 model, then localise with `KRK_DUMP` + `tools/dump_diff.py`.
 
 **A build "succeeded" but nothing changed.** A failed `ninja` leaves the old
@@ -474,17 +557,15 @@ binary. Capture the exit status explicitly — piping ninja's output into
   this as "not yet reproducible"; that is no longer the case, and the check is
   the way to re-confirm it on any machine:
   `bash scripts/coherence_check.sh models/Qwen3.5-0.8B.Q4_K_M.gguf`.
-- **`KRK_ATTN_QTILE=1`** (query-tiled prefill) is opt-in. The old default kernel
-  had a shared-memory race: one f32 score row per query was overwritten with
-  exp(x) before neighbouring threads had read it, so the error depended on
-  inter-thread timing and looked positional. It is fixed now (0/16384 and
-  0/131072 mismatching elements across the probe sweep, worst residual after
-  the fix 1.2e-4 from fp16 summation order), and it is 1.26–1.46× faster on
-  prefill across two model+geometry pairs (Qwen3-4B-Q8_0 at 761 and 3041
-  prompt tokens; Qwen3-8B-Q4_K_M at 761). It stays opt-in until a clean
-  24-model coherence sweep clears flipping the default, which is one env-var
-  line but changes the summation order on every model. The old ~5.4× number
-  was a sequential cold-cache probe and does not reproduce interleaved.
+- **Prefill attention is `attention_bexact_kernel`** -- decode's arithmetic
+  exactly (per-key running max, keys split across 8 warps, the same merge),
+  over a tile of query rows. It replaced the query-tiled kernel, which is
+  deleted along with `KRK_ATTN_QTILE`: the exact kernel is faster (+10% at 170
+  prompt tokens, +113% at 3400, +49% where the head is 96 wide) and bit-identical
+  to a decode step, so a chunked prompt and token-by-token prefill agree. The
+  tiled kernel remains only as the fallback for a sliding-window layer, a
+  non-causal call, and a head width outside 64..256 in steps of 32;
+  `KRK_ATTN_BEXACT=0` forces it for an A/B.
 - **`Spark_one.Q6_K.gguf`** passes `coherence_check.sh` on this build (device
   text identical to the scalar reference). It was previously recorded as failing
   at drift step 12; re-run to confirm on your machine:

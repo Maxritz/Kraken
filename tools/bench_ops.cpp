@@ -1371,6 +1371,407 @@ static i64 gate_speculation(const char *self) {
     return bad;
 }
 
+
+// ---- rows bit-exactness ---------------------------------------------------
+//
+// A decode step runs every projection with rows == 1 and a prefill (or a
+// speculative verify) runs the same projection with rows > 1. The engine's
+// text is only chunk-invariant if those two produce the SAME bytes for the same
+// input row. This arm answers that per kernel instead of per model: it runs one
+// matrix at rows=1 and at rows=N with the same weights and the same first input
+// row, and compares the f16 outputs bit for bit.
+//
+// It exists because "the text diverges on Tiel after ~29 greedy steps" had no
+// smaller reproduction: the model has 40 layers, 30 of them a recurrence, and
+// any one of the projections could have been the source. A per-kernel verdict is
+// the difference between "a kernel-arithmetic project" and "this kernel".
+struct BitExact {
+    i64 differ = 0;
+    i64 n = 0;
+    i64 max_ulp = 0;
+    f64 max_abs = 0.0;
+};
+
+// f16 as an ordered integer: the ULP distance between two halves is the
+// difference of these, which is what "the last bit" means in this storage type.
+i32 half_ordered(u16 h) {
+    return (h & 0x8000u) ? -static_cast<i32>(h & 0x7fffu)
+                         : static_cast<i32>(h);
+}
+
+BitExact cmp_half(const std::vector<u16> &a, const std::vector<u16> &b, i64 n) {
+    BitExact r;
+    r.n = n;
+    for (i64 i = 0; i < n; i++) {
+        if (a[static_cast<size_t>(i)] == b[static_cast<size_t>(i)]) continue;
+        r.differ++;
+        const i32 ua = half_ordered(a[static_cast<size_t>(i)]);
+        const i32 ub = half_ordered(b[static_cast<size_t>(i)]);
+        const i64 du = std::llabs(static_cast<i64>(ua) - static_cast<i64>(ub));
+        if (du > r.max_ulp) r.max_ulp = du;
+        const f32 fa = fp16_to_fp32(a[static_cast<size_t>(i)]);
+        const f32 fb = fp16_to_fp32(b[static_cast<size_t>(i)]);
+        const f64 d = std::fabs(static_cast<f64>(fa) - static_cast<f64>(fb));
+        if (d > r.max_abs) r.max_abs = d;
+    }
+    return r;
+}
+
+void print_bitexact(const char *what, const char *tag, i64 n_out, i64 n_in,
+                    i64 rows, i64 row, const BitExact &r) {
+    if (r.differ == 0) {
+        std::printf("  %-14s %-5s out=%-6lld in=%-5lld rows=%-3lld row=%-2lld  "
+                    "IDENTICAL (%lld values)\n",
+                    what, tag, static_cast<long long>(n_out),
+                    static_cast<long long>(n_in),
+                    static_cast<long long>(rows),
+                    static_cast<long long>(row),
+                    static_cast<long long>(r.n));
+    } else {
+        std::printf("  %-14s %-5s out=%-6lld in=%-5lld rows=%-3lld row=%-2lld  "
+                    "DIFFERS %lld/%lld  max %lld ulp  max|d|=%.6g\n",
+                    what, tag, static_cast<long long>(n_out),
+                    static_cast<long long>(n_in),
+                    static_cast<long long>(rows),
+                    static_cast<long long>(row),
+                    static_cast<long long>(r.differ),
+                    static_cast<long long>(r.n),
+                    static_cast<long long>(r.max_ulp), r.max_abs);
+    }
+}
+
+// One gemm() at rows=1 and at rows=N, same weights, same input row. `row` is
+// which row of the batch to compare: row 0 uses the same x pointer, a later row
+// uses x + row*n_in so a wrong row-to-output mapping cannot hide in it.
+BitExact gemm_rows_case(Backend *be, DType t, i64 n_out, i64 n_in, i64 rows,
+                        i64 row, std::vector<u16> &x, std::vector<u8> &w) {
+    const size_t row_bytes = dtype_row_bytes(t, n_in);
+    void *wd = be->alloc(w.size());
+    void *xd = be->alloc(x.size() * 2);
+    void *od1 = be->alloc(static_cast<size_t>(n_out) * 2);
+    void *odn = be->alloc(static_cast<size_t>(rows) * static_cast<size_t>(n_out) * 2);
+    be->upload(wd, w.data(), w.size(), 0);
+    be->upload(xd, x.data(), x.size() * 2, 0);
+    const void *xrow = static_cast<const u8 *>(xd) +
+                       static_cast<size_t>(row) * static_cast<size_t>(n_in) * 2;
+    be->gemm(od1, xrow, wd, t, n_out, n_in, 1);
+    be->gemm(odn, xd, wd, t, n_out, n_in, rows);
+    std::vector<u16> a(static_cast<size_t>(n_out)), b(static_cast<size_t>(n_out));
+    be->download(a.data(), od1, a.size() * 2);
+    be->download(b.data(), static_cast<const u8 *>(odn) +
+                             static_cast<size_t>(row) * static_cast<size_t>(n_out) * 2,
+                 b.size() * 2);
+    const BitExact r = cmp_half(a, b, n_out);
+    be->release(wd);
+    be->release(xd);
+    be->release(od1);
+    be->release(odn);
+    (void)row_bytes;
+    return r;
+}
+
+// The gate/up pair the MoE path and every dense FFN run: gemm_group with the
+// silu fold, which is fused at rows==1 and a fallback (two gemms + silu_mul)
+// above it. That is a different expression, so it is the other candidate.
+BitExact group_rows_case(Backend *be, DType t, i64 n_ff, i64 n_in, i64 rows,
+                         i64 row, std::vector<u16> &x, std::vector<u8> &w) {
+    const size_t row_bytes = dtype_row_bytes(t, n_in);
+    void *wd = be->alloc(w.size());
+    void *xd = be->alloc(x.size() * 2);
+    void *g1 = be->alloc(static_cast<size_t>(n_ff) * 2);
+    void *u1 = be->alloc(static_cast<size_t>(n_ff) * 2);
+    void *gn = be->alloc(static_cast<size_t>(rows) * static_cast<size_t>(n_ff) * 2);
+    void *un = be->alloc(static_cast<size_t>(rows) * static_cast<size_t>(n_ff) * 2);
+    be->upload(wd, w.data(), w.size(), 0);
+    be->upload(xd, x.data(), x.size() * 2, 0);
+    const void *xrow = static_cast<const u8 *>(xd) +
+                       static_cast<size_t>(row) * static_cast<size_t>(n_in) * 2;
+
+    void *out1[2] = {g1, u1};
+    const void *gw[2] = {wd, wd};
+    const i64 gno[2] = {n_ff, n_ff};
+    bool fused1 = false;
+    be->gemm_group(out1, xrow, gw, t, gno, n_in, 2, 1, true, &fused1, false);
+    if (!fused1) be->silu_mul(g1, g1, u1, n_ff);
+
+    void *outn[2] = {gn, un};
+    bool fusedn = false;
+    be->gemm_group(outn, xd, gw, t, gno, n_in, 2, rows, true, &fusedn, false);
+    if (!fusedn)
+        be->silu_mul(gn, gn, un, rows * n_ff);
+
+    std::vector<u16> a(static_cast<size_t>(n_ff)), b(static_cast<size_t>(n_ff));
+    be->download(a.data(), g1, a.size() * 2);
+    be->download(b.data(), static_cast<const u8 *>(gn) +
+                             static_cast<size_t>(row) * static_cast<size_t>(n_ff) * 2,
+                 b.size() * 2);
+    const BitExact r = cmp_half(a, b, n_ff);
+    be->release(wd);
+    be->release(xd);
+    be->release(g1);
+    be->release(u1);
+    be->release(gn);
+    be->release(un);
+    (void)row_bytes;
+    return r;
+}
+
+// ---- attention bit-exactness ---------------------------------------------
+//
+// The first divergence on a chunked prefill is NOT a projection. On Tiel
+// (--chunk 1 against --chunk 2, 12-token prompt) the first differing stage is
+// `attn.out L03` at position 1, rel 3.8e-5 -- after three recurrent layers that
+// are bit-identical, and on the first full-attention layer. So the box is the
+// attention kernel: n_tok == 1 takes attention_decode (one block per head,
+// warp-strided keys), n_tok > 1 takes the query-tiled prefill kernel. Same
+// keys, same query row, a different reduction order over the key range.
+//
+// This arm is that verdict per call rather than per model: one K/V cache, the
+// same query rows, once as N calls of one row (what decode does) and once as a
+// single call of N rows (what a prefill chunk does).
+struct AttnCase {
+    i64 hd;
+    i64 n_head;
+    i64 n_kv;
+    const char *what;
+};
+
+BitExact attn_rows_case(Backend *be, const AttnCase &c, i64 n_tok, i64 n_keys) {
+    const size_t qsz = static_cast<size_t>(n_tok) *
+                       static_cast<size_t>(c.n_head) *
+                       static_cast<size_t>(c.hd);
+    const size_t ksz = static_cast<size_t>(n_keys) *
+                       static_cast<size_t>(c.n_kv) *
+                       static_cast<size_t>(c.hd);
+    std::vector<u16> q(qsz), k(ksz), v(ksz);
+    auto fill = [](std::vector<u16> &dst, u32 seed) {
+        u32 rng = seed;
+        for (u16 &h : dst) {
+            rng = rng * 1103515245u + 12345u;
+            const f32 f = static_cast<f32>((rng >> 20) & 0xff) / 255.0f - 0.5f;
+            h = fp32_to_fp16(f * 0.5f);
+        }
+    };
+    fill(q, 7u);
+    fill(k, 11u);
+    fill(v, 13u);
+
+    void *qd = be->alloc(q.size() * 2);
+    void *kd = be->alloc(k.size() * 2);
+    void *vd = be->alloc(v.size() * 2);
+    void *o1 = be->alloc(qsz * 2); // N single-row calls
+    void *on = be->alloc(qsz * 2); // one N-row call
+    be->upload(qd, q.data(), q.size() * 2, 0);
+    be->upload(kd, k.data(), k.size() * 2, 0);
+    be->upload(vd, v.data(), v.size() * 2, 0);
+
+    AttnDesc d;
+    d.n_head = c.n_head;
+    d.n_kv = c.n_kv;
+    d.hd = c.hd;
+    d.layer = 0;
+    d.layer_stride = static_cast<i64>(ksz);
+    d.pos_stride = c.n_kv * c.hd;
+    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(c.hd)));
+    d.causal = true;
+    d.window = 0;
+    const i64 pos0 = n_keys - n_tok;
+    const size_t row_elems = static_cast<size_t>(c.n_head) *
+                             static_cast<size_t>(c.hd);
+    for (i64 r = 0; r < n_tok; r++) {
+        d.n_tok = 1;
+        d.pos0 = pos0 + r;
+        be->attention(static_cast<u8 *>(o1) + static_cast<size_t>(r) * row_elems * 2,
+                      static_cast<const u8 *>(qd) + static_cast<size_t>(r) * row_elems * 2,
+                      kd, vd, d);
+    }
+    d.n_tok = n_tok;
+    d.pos0 = pos0;
+    be->attention(on, qd, kd, vd, d);
+
+    std::vector<u16> a(qsz), b(qsz);
+    be->download(a.data(), o1, a.size() * 2);
+    be->download(b.data(), on, b.size() * 2);
+    const BitExact r = cmp_half(a, b, static_cast<i64>(qsz));
+    be->release(qd);
+    be->release(kd);
+    be->release(vd);
+    be->release(o1);
+    be->release(on);
+    return r;
+}
+
+// Returns how many (kernel, rows) cases differ. It is printed, not enforced:
+// a last-bit difference is a property of the arithmetic, not a broken kernel,
+// and --gate must keep meaning "wrong or NaN", not "not chunk-invariant".
+i64 arm_rows_bitexact(Backend *be) {
+    struct Case {
+        const char *what;
+        DType t;
+        i64 n_out;
+        i64 n_in;
+    };
+    const Case cases[] = {
+        // the shapes a decode step runs, plus the expert pair's FFN width
+        {"gemm", DType::Q4_K, 4096, 4096},
+        {"gemm", DType::Q6_K, 4096, 4096},
+        {"gemm", DType::Q8_0, 4096, 4096},
+        {"gemm", DType::F16, 4096, 4096},
+        {"gemm", DType::Q4_K, 512, 2048},
+        {"group+silu", DType::Q4_K, 512, 2048},
+        {"group+silu", DType::Q8_0, 512, 2048},
+        {"group+silu", DType::F16, 512, 2048},
+    };
+    // 8 is the last row count the decode ladder (`gemv_m_kernel`) covers and 9
+    // is the first the tile rung takes, so the boundary is measured rather than
+    // assumed: a chunk of 9..15 rows is the narrowest prefill that leaves the
+    // exact path.
+    const i64 row_counts[] = {2, 4, 8, 9, 12, 16, 32, 64};
+    std::printf("\nrows bit-exactness (same weights, same input row, rows=1 "
+                "against rows=N):\n");
+    i64 differing = 0;
+    for (const Case &c : cases) {
+        // Size the input for the LARGEST batch, not for one of the entries: a
+        // list whose middle element is not its maximum silently skipped every
+        // larger row count and reported 0 differences, which is the one answer
+        // this arm must never give by accident.
+        i64 rows = 1;
+        for (i64 rc : row_counts) rows = std::max(rows, rc);
+        std::vector<u16> x(static_cast<size_t>(rows) * static_cast<size_t>(c.n_in));
+        u32 rng = 12345u;
+        std::vector<f32> xf(x.size());
+        for (f32 &v : xf) {
+            rng = rng * 1103515245u + 12345u;
+            v = static_cast<f32>((rng >> 20) & 0xff) / 255.0f - 0.5f;
+        }
+        for (size_t i = 0; i < xf.size(); i++) x[i] = fp32_to_fp16(xf[i]);
+        std::vector<u8> w = weights(c.t, dtype_row_bytes(c.t, c.n_in), c.n_out);
+        for (i64 nrows : row_counts) {
+            if (nrows > rows) continue;
+            const i64 cmp_row = nrows - 1;
+            const BitExact r =
+                std::strcmp(c.what, "gemm") == 0
+                    ? gemm_rows_case(be, c.t, c.n_out, c.n_in, nrows, cmp_row, x, w)
+                    : group_rows_case(be, c.t, c.n_out, c.n_in, nrows, cmp_row, x, w);
+            if (r.differ) differing++;
+            print_bitexact(c.what, dtype_tag(c.t), c.n_out, c.n_in, nrows,
+                           cmp_row, r);
+        }
+    }
+    // ---- attention: the kernel the model-level bisect named ---------------
+    //
+    // Same verdict shape as above, one level up the stack: the whole attention
+    // call, decode (one row per call) against prefill (one call of N rows),
+    // over the same cache. `n_keys` is 64 so the decode key-range split stays
+    // at 1 (attention_decode_splits() only cuts in at ~128 keys), i.e. this
+    // compares the two kernels and not the split.
+    const AttnCase attn[] = {
+        {128, 16, 2, "attn"},
+        {256, 16, 2, "attn"},
+        {64, 8, 2, "attn"},
+    };
+    const i64 attn_rows[] = {2, 4, 8, 16};
+    // 64 keys is below attention_decode_splits()' threshold and 200 is above
+    // it, so the second count compares the unified prefill against the decode
+    // path that splits its key range across blocks -- the shape a real decode
+    // step takes from ~128 keys up.
+    const i64 attn_keys[] = {64, 200};
+    std::printf("\nattention bit-exactness (same cache, one row per call "
+                "against one call of N rows):\n");
+    for (const AttnCase &c : attn) {
+        for (i64 n_keys : attn_keys) {
+            for (i64 nrows : attn_rows) {
+                const BitExact r = attn_rows_case(be, c, nrows, n_keys);
+                if (r.differ) differing++;
+                char tag[32];
+                std::snprintf(tag, sizeof tag, "hd%lld/%lldh",
+                              static_cast<long long>(c.hd),
+                              static_cast<long long>(c.n_head));
+                // out is one row's output width, in is keys attended: the
+                // printed pair then reads "one row against N keys".
+                print_bitexact(c.what, tag, c.n_head * c.hd, n_keys, nrows,
+                               nrows - 1, r);
+            }
+        }
+    }
+    std::printf("\n%d of the (kernel, rows) cases are not bit-identical to the "
+                "decode row. A case that differs here is a case where a prefill "
+                "or a speculative verify writes different bytes than a decode "
+                "step for the same input, so the model's text cannot be "
+                "chunk-invariant on top of it.\n",
+                static_cast<int>(differing));
+    return 0; // informational: --gate means wrong/NaN, not "not invariant"
+}
+
+// Host->device copy rate, measured on the shapes the expert path actually
+// issues. The point is not the card's spec sheet: it is whether THIS path (a
+// pageable source, a pinned source, three slices per expert, one big copy)
+// reaches the bus, because a promotion that runs at 7 GB/s on a link that does
+// 25 is the whole decode budget.
+int h2d_bench(Backend *be, int iters) {
+    const size_t kExpert = 13219200;  // one gpt-oss expert: three 2880x2880 mxfp4
+    const size_t kSlice = kExpert / 3;
+    const size_t kBig = 128u << 20;
+    struct Arm {
+        const char *name;
+        void *dst[36];
+        const void *src[36];
+        size_t bytes[36];
+        int n;
+        bool pinned;
+    };
+    void *dev = be->alloc(kBig);
+    void *ph = be->alloc_host(kBig);
+    void *pp = be->alloc_host_pageable(kBig);
+    if (!dev || !ph || !pp) {
+        std::printf("h2d: allocation failed\n");
+        return 1;
+    }
+    std::memset(ph, 1, kBig);
+    std::memset(pp, 1, kBig);
+    auto make = [&](const char *name, int n, size_t bytes, bool pinned,
+                    bool slices) {
+        Arm a{};
+        a.name = name;
+        a.n = n;
+        a.pinned = pinned;
+        for (int i = 0; i < n; i++) {
+            void *base = pinned ? ph : pp;
+            const size_t span = kBig > bytes ? kBig - bytes : 1;
+            a.src[i] = static_cast<const char *>(base) + (slices ? 0 : (i * bytes) % span);
+            a.dst[i] = static_cast<char *>(dev) + (i * bytes) % span;
+            a.bytes[i] = bytes;
+        }
+        return a;
+    };
+    // The three slices of one expert share one 13 MB pinned source, which is
+    // what ExpertCache hands over: a promotion is 3 copies, not 1.
+    Arm arms[5] = {
+        make("pageable  1 x 12.6 MB", 1, kExpert, false, false),
+        make("pinned    1 x 12.6 MB", 1, kExpert, true, false),
+        make("pinned    3 x  4.4 MB", 3, kSlice, true, true),
+        make("pinned    1 x  128 MB", 1, kBig, true, false),
+        make("pinned   36 x  4.4 MB", 36, kSlice, true, true),
+    };
+    std::printf("--- host->device, per call (average of %d)\n", iters);
+    for (Arm &a : arms) {
+        const double ms = time_calls(be, iters, [&] {
+            if (a.pinned)
+                be->upload_pinned_batch(a.dst, a.src, a.bytes, a.n);
+            else
+                be->upload_paged_batch(a.dst, a.src, a.bytes, a.n);
+        });
+        double mb = 0;
+        for (int i = 0; i < a.n; i++) mb += static_cast<double>(a.bytes[i]);
+        std::printf("  %-24s %8.3f ms  %7.2f GB/s\n", a.name, ms,
+                    ms > 0 ? mb / (ms * 1e6) : 0.0);
+    }
+    be->release(dev);
+    be->release_host(ph);
+    be->release_host_pageable(pp);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1379,7 +1780,9 @@ int main(int argc, char **argv) {
     double launch_ms = 0.0;
     bool sweep = false;
     bool gate = false;
+    bool bitexact = false;
     bool floor = false;
+    bool h2d = false;
     i64 failures = 0;
     Shape one{"one", DType::Q4_K, 4096, 4096, 1};
     for (int i = 1; i < argc; i++) {
@@ -1392,7 +1795,9 @@ int main(int argc, char **argv) {
         else if (a == "--in") one.n_in = next();
         else if (a == "--sweep") sweep = true;
         else if (a == "--gate") gate = true;
+        else if (a == "--bitexact") bitexact = true;
         else if (a == "--floor") floor = true;
+        else if (a == "--h2d") h2d = true;
         else if (a.rfind("--dtype", 0) == 0) {
             const std::string d = argv[++i];
             one.t = d == "f16"    ? DType::F16
@@ -1419,6 +1824,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     std::printf("device: %s\n\n", be->describe().c_str());
+    if (h2d) return h2d_bench(be, iters);
 
     // Launch floor: a real kernel with trivial work, same measurement method.
     {
@@ -1487,6 +1893,8 @@ int main(int argc, char **argv) {
     } else {
         if (!run_one(be, one, iters, 0.0).ok()) ++failures;
     }
+
+    if (bitexact) failures += arm_rows_bitexact(be);
 
     if (gate || sweep) {
         std::printf("\nexpert-lease (device):\n");

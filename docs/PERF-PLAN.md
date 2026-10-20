@@ -317,7 +317,9 @@ corrected — the probe sweep reports 0 bad elements everywhere, worst residual
 (md5 match) at an 801-token and a 900-token prompt on Qwen3-8B, and
 interleaved on/off over 5 reps each: **581.5 vs 420.9 tok/s prefill, +38%**,
 the two arms not overlapping.
-`KRK_ATTN_QTILE=0` restores the per-token path for A/B.
+`KRK_ATTN_QTILE=0` restored the per-token path for A/B; that switch and the
+query-tiled kernel it selected have since been deleted (the exact prefill kernel
+replaced them -- see AGENTS.md).
 
 Diagnosis (`--profile`, 0.8B, 2048-token chunk): 577,373 us across 6 `attention`
 calls = 96.2 ms/call, vs 18.1 ms for 186 `gemm(wmma)` calls. The score math is
