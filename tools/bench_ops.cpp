@@ -2234,6 +2234,377 @@ i64 arm_hc(Backend *be) {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// The device dispatch table (KRK_DEV_PTR=1), against the per-expert path.
+//
+// A real model is the wrong instrument for this: the table is only published
+// when the WHOLE routed set is device-resident, which on this box means a model
+// small enough that the cache never has to evict -- so "the arm ran on the 12B"
+// is a fact about one card's free VRAM, not about the kernel. Here the bank is
+// synthetic, its residency is a fact by construction, and the reference is the
+// exact sequence the engine's per-expert loop issues: gemm(gate), gemm(up),
+// silu_mul at the row length with its row scale, gemm(down), and an f16-rounded
+// weighted add per expert in EXPERT-ASCENDING order.
+//
+// Two checks per case, because they fail differently:
+//   * `values` -- every element finite, and within the f16 output tolerance of
+//     the reference. Bits are reported (a case can be IDENTICAL, and the k=1
+//     cases are expected to be), but the gate does not require them: a token
+//     with two experts sums in slot order here and expert order there.
+//   * `indirection` -- the same call with two table entries swapped must CHANGE
+//     the answer. A kernel that ignored the table and read expert 0 three times
+//     would pass `values` on a one-expert case and look perfect; this is the
+//     arm that fails when the indirection is fake.
+struct MoeCase {
+    const char *tag;
+    DType t;
+    i64 n_embd;
+    i64 n_ff;
+    i32 n_expert;
+    i32 k;
+    i64 n_tok;
+    // Every slot selects the SAME expert. Two experts summing is order
+    // sensitive in f16, so a disagreement there says nothing about the
+    // per-slot arithmetic; this case isolates it.
+    bool same = false;
+};
+
+// MoE-case weights: `weights()` with a smaller block scale.
+//
+// The shared helper budgets for a GEMV that stops at one projection (a dot over
+// 4096 terms of 0.02 * 15 * x stays well inside f16). An expert runs TWO
+// projections and a silu product in between, so the up result is ~4 orders
+// larger and the product leaves f16 -- both the kernel and the reference then
+// compute inf, agree bit-for-bit, and the case proves nothing about either.
+// Measured: the q4_k cases came out "diff=0 nan=4096 of 4096", which is a
+// harness that produced no finite number to compare.
+// `salt` matters more than it looks: `weights()` restarts its RNG at a fixed
+// seed every call, so EVERY matrix of the same shape came out identical -- and
+// an indirection control that swaps two identical matrices reports "no change"
+// no matter how correct the kernel is. That is how this arm first reported
+// NOT PROVEN on every case with a kernel that was in fact bit-identical to the
+// reference.
+std::vector<u8> moe_weights(DType t, size_t row_bytes, i64 n_out, u32 salt) {
+    std::vector<u8> w(row_bytes * static_cast<size_t>(n_out));
+    u32 rng = 0x1234567u ^ (salt * 2654435761u);
+    for (u8 &b : w) {
+        rng = rng * 1103515245u + 12345u;
+        b = static_cast<u8>(rng >> 16);
+    }
+    if (t == DType::F16) {
+        for (size_t i = 0; i + 1 < w.size(); i += 2) {
+            const f32 v = static_cast<f32>(static_cast<int>(w[i] & 0x1f)) - 16.0f;
+            const u16 h = fp32_to_fp16(v * 0.001f * static_cast<f32>(1 + (salt & 3)));
+            w[i] = static_cast<u8>(h & 0xff);
+            w[i + 1] = static_cast<u8>(h >> 8);
+        }
+        return w;
+    }
+    const size_t blk = static_cast<size_t>(dtype_block_bytes(t));
+    const i64 blocks = static_cast<i64>(row_bytes / blk);
+    for (i64 r = 0; r < n_out; r++) {
+        u8 *row = w.data() + static_cast<size_t>(r) * row_bytes;
+        for (i64 b = 0; b < blocks; b++) {
+            u8 *p = row + static_cast<size_t>(b) * blk;
+            switch (t) {
+            case DType::Q6_K:
+                // Q6_K's per-block scales are signed int8 (up to 127) against
+                // Q4_K's 6-bit (up to 63), and its dot sums 64 chunks, so the
+                // same header scale leaves the silu product four orders higher
+                // -- measured as equal NaN counts on both sides, which is a
+                // harness with nothing finite to compare.
+                put_half(p + blk - 2, 0.0002f);
+                break;
+            case DType::Q4_K:
+            case DType::Q5_K:
+                put_half(p, 0.003f);
+                put_half(p + 2, 0.0f);
+                break;
+            default:
+                put_half(p, 0.003f);
+                break;
+            }
+        }
+    }
+    return w;
+}
+
+i64 arm_moe_dispatch(Backend *be) {
+    const MoeCase cases[] = {
+        {"k=1 q4_k", DType::Q4_K, 2048, 1024, 4, 1, 2},
+        {"k=2 same", DType::Q4_K, 2048, 1024, 4, 2, 1, true},
+        {"k=2 q4_k", DType::Q4_K, 2048, 1024, 4, 2, 2},
+        {"k=4 q8_0", DType::Q8_0, 2048, 1024, 8, 4, 3},
+        {"k=2 q6_k", DType::Q6_K, 2048, 1024, 3, 2, 1},
+        {"k=2 f16", DType::F16, 1024, 512, 2, 2, 2},
+        // The shape the models actually run: 4096-wide activations and a
+        // 14336-wide expert FFN, which is 45 KiB of shared memory and is the
+        // reason the launch checks that bound instead of assuming it.
+        {"decode q4_k", DType::Q4_K, 4096, 14336, 2, 2, 1},
+    };
+    std::printf("\ndevice expert dispatch (table indirection against the "
+                "per-expert path):\n");
+    i64 failures = 0;
+    for (const MoeCase &c : cases) {
+        const size_t g_row = dtype_row_bytes(c.t, c.n_embd);
+        const size_t d_row = dtype_row_bytes(c.t, c.n_ff);
+        const i64 ne = c.n_expert;
+        std::vector<std::vector<u8>> wg(static_cast<size_t>(ne)),
+            wu(static_cast<size_t>(ne)), wd(static_cast<size_t>(ne));
+        std::vector<void *> pg(static_cast<size_t>(ne)), pu(static_cast<size_t>(ne)),
+            pd(static_cast<size_t>(ne));
+        std::vector<MoeDispatchEntry> table(static_cast<size_t>(ne));
+        for (i64 e = 0; e < ne; e++) {
+            wg[static_cast<size_t>(e)] =
+                moe_weights(c.t, g_row, c.n_ff, static_cast<u32>(e) * 3u + 1u);
+            wu[static_cast<size_t>(e)] =
+                moe_weights(c.t, g_row, c.n_ff, static_cast<u32>(e) * 3u + 2u);
+            wd[static_cast<size_t>(e)] =
+                moe_weights(c.t, d_row, c.n_embd, static_cast<u32>(e) * 3u + 3u);
+            pg[static_cast<size_t>(e)] = be->alloc(wg[static_cast<size_t>(e)].size());
+            pu[static_cast<size_t>(e)] = be->alloc(wu[static_cast<size_t>(e)].size());
+            pd[static_cast<size_t>(e)] = be->alloc(wd[static_cast<size_t>(e)].size());
+            be->upload(pg[static_cast<size_t>(e)], wg[static_cast<size_t>(e)].data(),
+                       wg[static_cast<size_t>(e)].size(), 0);
+            be->upload(pu[static_cast<size_t>(e)], wu[static_cast<size_t>(e)].data(),
+                       wu[static_cast<size_t>(e)].size(), 0);
+            be->upload(pd[static_cast<size_t>(e)], wd[static_cast<size_t>(e)].data(),
+                       wd[static_cast<size_t>(e)].size(), 0);
+            MoeDispatchEntry &d = table[static_cast<size_t>(e)];
+            d.p[kMoeGate] = pg[static_cast<size_t>(e)];
+            d.p[kMoeUp] = pu[static_cast<size_t>(e)];
+            d.p[kMoeDown] = pd[static_cast<size_t>(e)];
+            d.n_out[kMoeGate] = c.n_ff;
+            d.n_out[kMoeUp] = c.n_ff;
+            d.n_out[kMoeDown] = c.n_embd;
+            d.n_in[kMoeGate] = c.n_embd;
+            d.n_in[kMoeUp] = c.n_embd;
+            d.n_in[kMoeDown] = c.n_ff;
+            d.row_bytes[kMoeGate] = static_cast<std::int64_t>(g_row);
+            d.row_bytes[kMoeUp] = static_cast<std::int64_t>(g_row);
+            d.row_bytes[kMoeDown] = static_cast<std::int64_t>(d_row);
+            d.type[kMoeGate] = static_cast<std::int32_t>(c.t);
+            d.type[kMoeUp] = static_cast<std::int32_t>(c.t);
+            d.type[kMoeDown] = static_cast<std::int32_t>(c.t);
+            d.present[kMoeGate] = d.present[kMoeUp] = d.present[kMoeDown] = 1;
+        }
+        void *table_d = be->alloc(table.size() * sizeof(MoeDispatchEntry));
+        be->upload(table_d, table.data(), table.size() * sizeof(MoeDispatchEntry), 0);
+
+        std::vector<u16> x(static_cast<size_t>(c.n_tok) * static_cast<size_t>(c.n_embd));
+        u32 rng = 987654321u;
+        std::vector<f32> xf(x.size());
+        for (f32 &v : xf) {
+            rng = rng * 1103515245u + 12345u;
+            v = (static_cast<f32>((rng >> 20) & 0xff) / 255.0f - 0.5f) * 0.5f;
+        }
+        for (size_t i = 0; i < xf.size(); i++) x[i] = fp32_to_fp16(xf[i]);
+        void *xn_d = be->alloc(x.size() * 2);
+        be->upload(xn_d, x.data(), x.size() * 2, 0);
+
+        std::vector<i32> ids(static_cast<size_t>(c.n_tok) * static_cast<size_t>(c.k));
+        std::vector<f32> wts(ids.size(), 0.0f);
+        for (i64 t = 0; t < c.n_tok; t++)
+            for (i32 s = 0; s < c.k; s++) {
+                ids[static_cast<size_t>(t * c.k + s)] =
+                    c.same ? static_cast<i32>(t % ne)
+                           : static_cast<i32>((t + s) % ne);
+                // Half the weight on the first slot and an even split otherwise,
+                // so a kernel that dropped the weights entirely would show up as
+                // a scale on every element instead of only on a tie.
+                wts[static_cast<size_t>(t * c.k + s)] =
+                    c.k == 1 ? 1.0f : (s == 0 ? 0.6f : 0.4f / static_cast<f32>(c.k - 1));
+            }
+        void *ids_d = be->alloc(ids.size() * sizeof(i32));
+        void *wts_d = be->alloc(wts.size() * sizeof(f32));
+        be->upload(ids_d, ids.data(), ids.size() * sizeof(i32), 0);
+        be->upload(wts_d, wts.data(), wts.size() * sizeof(f32), 0);
+
+        // ---- reference: the per-expert loop's own sequence ------------------
+        void *g_d = be->alloc(static_cast<size_t>(c.n_ff) * 2);
+        void *u_d = be->alloc(static_cast<size_t>(c.n_ff) * 2);
+        void *a_d = be->alloc(static_cast<size_t>(c.n_ff) * 2);
+        void *o_d = be->alloc(static_cast<size_t>(c.n_embd) * 2);
+        void *sc_d = be->alloc(sizeof(f32));
+        std::vector<u16> ref(x.size(), 0);
+        // One download buffer for both ends of the reference: the down
+        // projection's output is n_embd wide and the row scale's copy is n_ff,
+        // so it is sized for the larger. Sizing it n_ff overwrote the heap on
+        // every case where the model is wider than its expert FFN, which is all
+        // of them here.
+        std::vector<u16> gv(static_cast<size_t>(std::max(c.n_ff, c.n_embd)));
+        for (i64 e = 0; e < ne; e++) {
+            for (i64 t = 0; t < c.n_tok; t++) {
+                for (i32 s = 0; s < c.k; s++) {
+                    if (ids[static_cast<size_t>(t * c.k + s)] != e) continue;
+                    const f32 alpha = wts[static_cast<size_t>(t * c.k + s)];
+                    // The kernel's own op order (scale, then alpha, then add),
+                    // so the comparison tests the path and not the compiler's
+                    // freedom to contract a multiply into an add.
+
+                    const void *xrow = static_cast<const u8 *>(xn_d) +
+                                       static_cast<size_t>(t) *
+                                           static_cast<size_t>(c.n_embd) * 2;
+                    be->gemm(g_d, xrow, pg[static_cast<size_t>(e)], c.t, c.n_ff,
+                             c.n_embd, 1);
+                    be->gemm(u_d, xrow, pu[static_cast<size_t>(e)], c.t, c.n_ff,
+                             c.n_embd, 1);
+                    be->silu_mul(a_d, g_d, u_d, c.n_ff, c.n_ff,
+                                 static_cast<f32 *>(sc_d));
+                    be->gemm(o_d, a_d, pd[static_cast<size_t>(e)], c.t, c.n_embd,
+                             c.n_ff, 1);
+                    be->download(gv.data(), o_d, static_cast<size_t>(c.n_embd) * 2);
+                    f32 scale = 1.0f;
+                    be->download(&scale, sc_d, sizeof(f32));
+                    for (i64 j = 0; j < c.n_embd; j++) {
+                        const f32 v = fp16_to_fp32(gv[static_cast<size_t>(j)]);
+                        const f32 vs = v * scale;
+                        const f32 w = alpha * vs;
+                        const f32 cur =
+                            fp16_to_fp32(ref[static_cast<size_t>(t * c.n_embd + j)]);
+                        ref[static_cast<size_t>(t * c.n_embd + j)] =
+                            fp32_to_fp16(cur + w);
+                    }
+                }
+            }
+        }
+
+        // ---- the kernel ----------------------------------------------------
+        void *out_d = be->alloc(x.size() * 2);
+        be->moe_dispatch(table_d, 0, ne, ids_d, wts_d, xn_d, out_d, c.n_tok,
+                         c.n_embd, c.n_ff, c.k);
+        be->sync();
+        std::vector<u16> got(x.size());
+        be->download(got.data(), out_d, got.size() * 2);
+
+        i64 diff = 0, nan = 0, inf = 0, over = 0;
+        i64 nan_k = 0, nan_r = 0;
+        f64 worst = 0.0;
+        i64 first = -1;
+        f64 sum_sq = 0.0;
+        for (size_t i = 0; i < got.size(); i++) {
+            const f32 a = fp16_to_fp32(got[i]);
+            sum_sq += static_cast<f64>(a) * static_cast<f64>(a);
+        }
+        const f64 rms = std::sqrt(sum_sq / static_cast<f64>(got.size()) + 1e-30);
+        for (size_t i = 0; i < got.size(); i++) {
+            const f32 a = fp16_to_fp32(got[i]);
+            const f32 b = fp16_to_fp32(ref[i]);
+            if (!std::isfinite(a) || !std::isfinite(b)) {
+                if (!std::isfinite(a)) nan_k++;
+                if (!std::isfinite(b)) nan_r++;
+                if (!std::isfinite(a) && !std::isfinite(b)) nan++;
+                else inf++;
+                continue;
+            }
+            if (got[i] != ref[i]) {
+                diff++;
+                if (first < 0) first = static_cast<i64>(i);
+            }
+            const f64 rel = std::fabs(static_cast<f64>(a) - static_cast<f64>(b)) / rms;
+            if (rel > worst) worst = rel;
+            if (rel > 4e-3) over++;
+        }
+        const bool values_ok = nan == 0 && inf == 0 && over == 0;
+        if (first >= 0)
+            std::printf("  %-11s first difference at %lld: kernel=%.6g ref=%.6g "
+                        "(nan kernel=%lld ref=%lld)\n",
+                        "", static_cast<long long>(first),
+                        static_cast<f64>(fp16_to_fp32(got[static_cast<size_t>(first)])),
+                        static_cast<f64>(fp16_to_fp32(ref[static_cast<size_t>(first)])),
+                        static_cast<long long>(nan_k), static_cast<long long>(nan_r));
+
+        // ---- the indirection control --------------------------------------
+        // Swap two entries that this case actually selects, re-run, and require
+        // a different answer. Picking them from `ids` is the point: swapping two
+        // unselected experts would prove nothing about what the kernel read.
+        // Swapping a selected expert's GATE and UP pointers is the control that
+        // always exists: silu(gate) * up is not symmetric in its two operands, so
+        // a kernel that ignores the table cannot pass it even with k=1. (The
+        // first version swapped two EXPERTS, which a one-expert selection has no
+        // second of -- it reported NOT PROVEN for every single-expert case, which
+        // is exactly the "control that cannot fail" this box keeps rediscovering.)
+        i64 a_e = ids[0];
+        bool moved = false;
+        {
+            MoeDispatchEntry &a = table[static_cast<size_t>(a_e)];
+            std::swap(a.p[kMoeGate], a.p[kMoeUp]);
+            std::swap(a.type[kMoeGate], a.type[kMoeUp]);
+            std::swap(a.row_bytes[kMoeGate], a.row_bytes[kMoeUp]);
+            be->upload(table_d, table.data(), table.size() * sizeof(MoeDispatchEntry), 0);
+            // Drain before reading it back through the kernel: `upload` may hand
+            // the bytes to the pool's staging path, which publishes on its own
+            // stream. In the engine the table is published once at init and every
+            // use is layers later, so this ordering never bites there; here the
+            // dispatch is the very next launch, and without the drain the control
+            // read the OLD table and reported "indirection NOT PROVEN" for every
+            // case -- a false negative that looks exactly like a dead kernel.
+            be->sync();
+            // A marker the second dispatch must overwrite: without it a dispatch
+            // that silently declined to run leaves the FIRST output in the
+            // buffer, and the control reports "the indirection changed nothing"
+            // when the truth is "nothing ran".
+            be->fill0(out_d, x.size() * 2);
+            be->moe_dispatch(table_d, 0, ne, ids_d, wts_d, xn_d, out_d, c.n_tok,
+                             c.n_embd, c.n_ff, c.k);
+            std::vector<u16> alt(x.size());
+            be->download(alt.data(), out_d, alt.size() * 2);
+            for (size_t i = 0; i < alt.size(); i++)
+                if (alt[i] != got[i]) { moved = true; break; }
+            std::swap(a.p[kMoeGate], a.p[kMoeUp]);
+            std::swap(a.type[kMoeGate], a.type[kMoeUp]);
+            std::swap(a.row_bytes[kMoeGate], a.row_bytes[kMoeUp]);
+        }
+
+        std::printf("  %-11s %-5s embd=%-5lld ff=%-6lld experts=%-2lld k=%d "
+                    "tokens=%lld  %s  worst=%.2e  indirection=%s\n",
+                    c.tag, dtype_tag(c.t), static_cast<long long>(c.n_embd),
+                    static_cast<long long>(c.n_ff), static_cast<long long>(ne),
+                    static_cast<int>(c.k), static_cast<long long>(c.n_tok),
+                    diff == 0 ? "IDENTICAL" : "differs", worst,
+                    moved ? "ok" : "NOT PROVEN");
+        if (diff) {
+            std::printf("  %-11s %lld of %zu element(s) differ from the "
+                        "per-expert path (f16 store rounding, reported not "
+                        "gated)\n",
+                        "", static_cast<long long>(diff), got.size());
+        }
+        if (!values_ok) {
+            std::printf("  %-11s FAIL values: not-finite kernel=%lld ref=%lld "
+                        "over-tolerance=%lld worst=%.3e\n",
+                        "", static_cast<long long>(nan),
+                        static_cast<long long>(inf), static_cast<long long>(over),
+                        worst);
+            ++failures;
+        }
+        if (!moved) {
+            std::printf("  %-11s FAIL indirection: swapping the selected "
+                        "expert's gate and up matrices did not change the output\n",
+                        "");
+            ++failures;
+        }
+
+        be->release(table_d);
+        be->release(xn_d);
+        be->release(ids_d);
+        be->release(wts_d);
+        be->release(out_d);
+        be->release(g_d);
+        be->release(u_d);
+        be->release(a_d);
+        be->release(o_d);
+        be->release(sc_d);
+        for (i64 e = 0; e < ne; e++) {
+            be->release(pg[static_cast<size_t>(e)]);
+            be->release(pu[static_cast<size_t>(e)]);
+            be->release(pd[static_cast<size_t>(e)]);
+        }
+    }
+    std::printf("  %lld of %zu case(s) failed\n", static_cast<long long>(failures),
+                sizeof(cases) / sizeof(cases[0]));
+    return failures;
+}
+
 int main(int argc, char **argv) {
     int iters = 100;
     int depth = 512; // calls pre-issued for the busy-queue arm (0 skips it)
@@ -2242,6 +2613,7 @@ int main(int argc, char **argv) {
     bool gate = false;
     bool bitexact = false;
     bool hc_test = false;
+    bool moe_table_test = false;
     bool floor = false;
     bool h2d = false;
     i64 failures = 0;
@@ -2258,6 +2630,7 @@ int main(int argc, char **argv) {
         else if (a == "--gate") gate = true;
         else if (a == "--bitexact") bitexact = true;
         else if (a == "--hc") hc_test = true;
+        else if (a == "--moe-dispatch") moe_table_test = true;
         else if (a == "--floor") floor = true;
         else if (a == "--h2d") h2d = true;
         else if (a.rfind("--dtype", 0) == 0) {
@@ -2361,6 +2734,10 @@ int main(int argc, char **argv) {
     // Device-only, so it is its own flag rather than part of --gate: the gate
     // must stay runnable on a box where the device is busy.
     if (hc_test) failures += arm_hc(be);
+
+    // The device dispatch table. Its own flag like --hc for the same reason: it
+    // is a device arm, and the gate has to stay runnable on a busy box.
+    if (moe_table_test) failures += arm_moe_dispatch(be);
 
     if (gate || sweep) {
         std::printf("\nexpert-lease (device):\n");

@@ -131,6 +131,17 @@ public:
     // card something else is already using.
     virtual size_t device_free_bytes() const { return caps().vram_free; }
     virtual size_t device_total_bytes() const { return caps().vram_total; }
+    // Bytes this backend has outstanding through alloc()/release(), i.e. the
+    // allocator's own ledger rather than the driver's. `device_free_bytes()` is
+    // a device-wide probe and moves with every other process on the card, so it
+    // cannot say whether a number in this engine's accounting is right; this
+    // one can. Zero means the backend does not track it.
+    virtual size_t device_live_bytes() const { return 0; }
+    // Count and largest single buffer, for the same check: live bytes alone
+    // cannot tell one 7 GiB buffer apart from 1,100 cells of 6.3 MiB, and those
+    // two mean opposite things.
+    virtual size_t device_alloc_count() const { return 0; }
+    virtual size_t device_largest_alloc() const { return 0; }
     // Live host-memory availability for safe pageable staging. Zero means the
     // backend cannot obtain a trustworthy reading; callers that allocate RAM
     // tiers fail closed in that case.
@@ -291,6 +302,13 @@ public:
         // whole burst, so release_slices / release_marks is the sharing factor
         // and a ratio of 1.0 means the burst path was not taken.
         u64 release_marks = 0, release_slices = 0;
+        // Growth refused because it would have taken the card below the VRAM
+        // floor. Not an error: the cache serves those experts from WARM, and
+        // the count is what says the pool hit the real limit rather than its
+        // own plan. It exists because the plan is in requested bytes and the
+        // driver also holds memory the engine does not account for (measured
+        // 7,000 MiB beside 7,430 MiB promoted on Mellum2.1).
+        u64 floor_refusals = 0;
     };
     // Physical bytes, including alignment. One oversize expert is explicitly
     // allowed by the cache; free cells are trimmed before changing the limit.
@@ -473,6 +491,73 @@ public:
                              f32 *mass_out, void *scratch, i32 cand_cap,
                              i64 *count_out) = 0;
 
+    // The MoE router's activation (softmax over n_expert) on the device, from
+    // the router GEMM's row in the activation type into f32 probabilities.
+    //
+    // The engine does this on the host today because the top-k that follows
+    // needs the expert ids there anyway (the cache resolves a pointer from
+    // them). This op exists so the NUMERICS of moving it can be measured
+    // before the dispatch is rewritten: device `expf` plus a tree-reduction
+    // sum is not `std::exp` plus a sequential sum, and `KRK_DEVICE_SOFTMAX=1`
+    // reports the drift in weights and in selected ids against the host answer.
+    virtual bool router_softmax_supported() const { return false; }
+    virtual void router_softmax(void *probs, const void *logits, i64 n_rows,
+                                i32 n_expert) {
+        (void)probs; (void)logits; (void)n_rows; (void)n_expert;
+    }
+
+    // Selection and the layer plan, on the device. Same rule as the host: the
+    // highest probability wins, a tie keeps the lower expert id, and the
+    // weights are the selected probabilities, sum-normalized over the k when
+    // `normalize` is set and multiplied by `scale`.
+    //
+    // `moe_plan_build` turns the ids into the layer's expert-major plan --
+    // `off[n_expert+1]`, `rows[n*k]`, `wt[n*k]` -- in token-then-slot order, so
+    // it is the same plan the host builds and a differential check compares two
+    // orderings that are meant to be identical rather than two that merely
+    // happen to agree.
+    virtual bool router_topk_supported() const { return false; }
+    virtual void router_topk(const void *probs, i64 n_rows, i32 n_expert, i32 k,
+                             void *ids, void *wts, i32 normalize, f32 scale) {
+        (void)probs; (void)n_rows; (void)n_expert; (void)k; (void)ids;
+        (void)wts; (void)normalize; (void)scale;
+    }
+    virtual void moe_plan_build(const void *ids, i64 n_rows, i32 k,
+                                i32 n_expert, void *off, void *rows, void *wt,
+                                const void *wts) {
+        (void)ids; (void)n_rows; (void)k; (void)n_expert; (void)off; (void)rows;
+        (void)wt; (void)wts;
+    }
+
+    // The whole MoE layer from ONE launch: the expert matrices are chosen by
+    // the kernel from `ids` through a device pointer table
+    // (`krk/moe_table.hpp`, published by ExpertCache), so no host pointer per
+    // expert and no `acquire()` sits between the routing and the GEMMs.
+    //
+    // This is the stage the round trip is actually paid for. Device top-k and a
+    // device plan remove the host scan but still need the ids on the host to
+    // learn where the matrices are; with the table they never come back, and
+    // the layer stops waiting for its own GPU work to retire (measured: 0.523
+    // ms/layer on Mellum2.1, of which 0.077 is the copy and the rest is that
+    // wait). What it cannot do is keep the host's bits: the softmax runs on the
+    // device, which is a different `expf`, so this is an opt-in arm and the
+    // drift it costs is measured rather than assumed.
+    //
+    // `table` is `[n_expert * n_layer]` entries indexed `layer * n_expert + e`,
+    // `xn` is the f16 activation block `[n_tok, n_embd]`, and `out` receives the
+    // weighted, f16-rounded sum of the routed experts' down projections
+    // (`[n_tok, n_embd]`) -- the buffer the caller would otherwise have
+    // scattered into per expert.
+    virtual bool moe_dispatch_supported() const { return false; }
+    virtual void moe_dispatch(const void *table, i32 layer, i32 n_expert,
+                              const void *ids, const void *wts, const void *xn,
+                              void *out, i64 n_tok, i64 n_embd, i64 n_ff, i32 k) {
+        (void)table; (void)layer; (void)n_expert; (void)ids; (void)wts;
+        (void)xn; (void)out; (void)n_tok; (void)n_embd; (void)n_ff; (void)k;
+        // No device, no dispatch: moe_dispatch_supported() is false on this
+        // backend, so the engine's host path is the one that runs.
+    }
+
     // A group of n_mat projections that all read the same activation
     // x and have no dependency between them (a decode layer's q/k/v,
     // or its gate/up), issued as one launch. Only the M=1 decode row
@@ -545,6 +630,31 @@ public:
     // out[n_tok, n_head*hd] = softmax(q K^T / sqrt(hd)) V
     virtual void attention(void *out, const void *q, const void *kcache,
                            const void *vcache, const AttnDesc &d) = 0;
+
+    // Compact gather out of a KV cache: dst[r] = src[idx[r]], `row_bytes`
+    // each, for r in [0, n_rows). Pure byte movement, so no element type is
+    // involved and an f16 row and an f32 row gather identically; the index
+    // list is always host-visibility-agnostic because it is small and
+    // per-query-row (see gather_rows_supported).
+    //
+    // This exists for QSA. `attention()` takes no mask, and the QSA indexer
+    // gives every QUERY ROW its own cell list, which neither `window` (one
+    // bound for the whole call) nor `pos0` can express. Compacting the chosen
+    // cells and running the ordinary causal kernel over the compact buffer
+    // (n_tok = 1, pos0 = cells-1) does express it, without a second attention
+    // kernel and without a mask that would have to be carried through every
+    // one of them.
+    //
+    // The default is a NO-OP and gather_rows_supported() is false, which is
+    // how a backend says it cannot: a silent no-op gather leaves the compact
+    // buffer holding whatever was there before, i.e. fluent text that is not
+    // this model (the same shape as the lane_bcast_mul default that shipped
+    // HIP-only and made a test flaky).
+    virtual bool gather_rows_supported() const { return false; }
+    virtual void gather_rows(void *dst, const void *src, const i64 *idx,
+                             i64 n_rows, size_t row_bytes) {
+        (void)dst; (void)src; (void)idx; (void)n_rows; (void)row_bytes;
+    }
 
     // One sink logit per query head, entered into the softmax denominator
     // at the row's running max with no value term (V4 report Eq. 27).

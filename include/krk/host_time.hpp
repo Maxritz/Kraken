@@ -91,8 +91,17 @@ private:
     HostTime() {
         const char *p = std::getenv("KRK_PROFILE");
         const char *t = std::getenv("KRK_TIME");
+        // KRK_TIME_HOST is the host table ON ITS OWN. It exists because the two
+        // profilers share one switch and the device recorder is not a passive
+        // observer: it adds ~22 us per op, so a span that waits on the device
+        // (`moe.route` holds a blocking readback) is inflated several times over
+        // while a span that only enqueues (`moe.experts`) is not. Comparing those
+        // two under `--profile` compares two different multipliers. With this
+        // switch the device work is untouched and the row is the real wall time.
+        const char *h = std::getenv("KRK_TIME_HOST");
         on_ = (p && *p && std::strcmp(p, "0") != 0) ||
-              (t && *t && std::strcmp(t, "0") != 0);
+              (t && *t && std::strcmp(t, "0") != 0) ||
+              (h && *h && std::strcmp(h, "0") != 0);
     }
 
     bool on_ = false;

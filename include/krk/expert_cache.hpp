@@ -59,11 +59,15 @@
 #ifndef KRK_EXPERT_CACHE_HPP
 #define KRK_EXPERT_CACHE_HPP
 
+#include <algorithm>
 #include <list>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "krk/backend.hpp"
 #include "krk/gguf.hpp"
+#include "krk/moe_table.hpp"
 #include "krk/quant.hpp"
 
 namespace krk {
@@ -197,6 +201,45 @@ public:
     // normal policy instead of thrashing a pin it cannot defend. Pins are never
     // evicted while the budget holds them.
     size_t pin_layer(const ExpertSource &src, i32 layer, std::string *why);
+
+    // ---- the PIN RING: the hot set in VRAM, outside the pool's byte budget ---
+    //
+    // A pin already stops eviction, but until now a pinned expert still spent
+    // the pool's budget: `bytes_` counted it, so every pin shrank the LRU
+    // window by its own size. At a budget the routed set does not fit that is
+    // the whole problem -- Tiel-Coder-35B-A3B routes 22.1 GiB and the pool is
+    // 12-13 GiB, so the pinned prefix ends up being most of the pool and the
+    // traffic that is still *earning* residency thrashes in the remainder.
+    //
+    // The second ring is that separation: pinned bytes are charged to
+    // `pin_budget_` and not to `budget_`, so the LRU window keeps its full
+    // size for the experts that traffic still has to prove. It is one physical
+    // card, so `pin_budget_` is a real cap -- admit_hot() stops at it rather
+    // than overcommitting VRAM.
+    // Re-derives the pool's byte budget from a LIVE free-VRAM reading: the
+    // resident unpinned footprint plus whatever is free beside `floor_bytes`.
+    // Only ever lowers, because a budget raised past what init measured is how
+    // the pool grows into the card and turns every alloc into a driver
+    // eviction; growth belongs to the ring, which names what it is for.
+    // Returns the budget in force afterwards, so a caller can log the change.
+    size_t reclamp_vram_budget(size_t free_bytes, size_t floor_bytes);
+    void set_pin_budget(size_t bytes);
+    size_t pin_budget() const { return pin_budget_; }
+    size_t pin_used_bytes() const { return pin_bytes_; }
+    // Admits the ranked prefix of `order` (hottest first) into the ring in one
+    // pass, pinning each expert as it lands. This is the HOT half of a warmup:
+    // WARM costs a file read and holds tens of GiB, VRAM holds the few
+    // hundred MiB/ few GiB that the index says serve most tokens, and only the
+    // ring makes those a guaranteed hit instead of a promotion race with the
+    // rest of the layer's routing.
+    //
+    // Stops at the ring's byte cap, at a source that cannot be read, or after
+    // `max_experts` admissions (0 = no limit). `src_of` maps a layer index to
+    // its expert tensors; a null entry skips that layer (a dense one). Returns
+    // how many experts this newly made resident-and-pinned.
+    size_t admit_hot(const ExpertSource *const *src_of, i32 n_layer,
+                     const std::vector<std::pair<i32, i32>> &order,
+                     size_t max_experts = 0);
     // One expert, so the caller can choose the order: expert-major across
     // layers when the tier is smaller than the corpus.
     size_t preload_one(const ExpertSource &src, i32 layer, i32 expert);
@@ -406,6 +449,35 @@ public:
     // could hold the entire set stayed cold forever.
     bool full_for(const ExpertSource &src) const;
 
+    // ---- the DEVICE DISPATCH TABLE -----------------------------------------
+    //
+    // A dense `[n_layer * n_expert]` array of {three device pointers, their
+    // shapes, their types} on the device, so an expert's GEMMs can be issued
+    // from a kernel that reads the ids itself. Today the host scans the router
+    // probabilities for the top-k and calls acquire() per expert to learn where
+    // the matrices are, which is what puts a host round trip in the middle of
+    // every MoE layer (measured: 0.523 ms/layer, 85% of it waiting for the
+    // layer's own GPU work to retire, on Mellum2.1).
+    //
+    // The table is a promise about RESIDENCY, so it is only published when that
+    // promise can be kept: `whole_set_resident` must hold, i.e. every
+    // (layer, expert) of the corpus is in VRAM. Then no promotion and no
+    // eviction can rewrite a pointer underneath the kernel. Anything else
+    // publishes nothing and the caller keeps the host path -- a half-valid
+    // table would be a wrong answer, not a slow one.
+    bool whole_set_resident(i32 n_layer, i32 n_expert) const;
+    // Builds and uploads the table; nullptr (with `why` filled) when the
+    // residency promise does not hold or the allocator refuses. Re-publishing
+    // releases the previous buffer, and *published_out is the number of entries
+    // that carried all three matrices (a gate-less expert contributes two).
+    void *publish_dispatch_table(i32 n_layer, i32 n_expert, i32 *published_out,
+                                 std::string *why);
+    const void *dispatch_table() const { return table_; }
+    // A promotion or an eviction rewrote a pointer after the publish, so the
+    // callers that already hold a table pointer must stop using it.
+    bool dispatch_table_stale() const { return table_stale_; }
+    void release_dispatch_table();
+
 private:
     struct Slot {
         i32 layer = -1;
@@ -477,12 +549,38 @@ private:
     // not the next layer's, and budget_ / one_layer_expert is neither the memory
     // limit nor a count that holds the whole set.
     bool over_budget(size_t need) const {
+        // The pool's byte test excludes the ring ONLY when a ring is
+        // configured (set_pin_budget). With no ring every pinned expert still
+        // spends the pool's budget, which is the old behaviour the policy tests
+        // pin: a pin ranks victims, it never overrides the physical limit.
+        // (No std::min here: <Windows.h>'s min macro has broken this header's
+        // neighbours before, so the comparison is written out.)
+        size_t held = 0;
+        size_t ring_slots = 0;
+        if (pin_budget_ > 0) {
+            held = pin_bytes_ < bytes_ ? pin_bytes_ : bytes_;
+            ring_slots = pin_slots_ < vram_slots_ ? pin_slots_ : vram_slots_;
+        }
+        const size_t pool = bytes_ - held;
+        const size_t pool_slots = vram_slots_ - ring_slots;
         // A request with no bytes still takes a slot, so it falls back to the
         // count rule: unbounded residency for a degenerate source would grow the
         // slot map without limit.
-        if (need == 0) return capacity_ > 0 && vram_slots_ >= capacity_;
-        return bytes_ + need > budget_ ||
-               (slot_budget_ > 0 && vram_slots_ >= slot_budget_);
+        if (need == 0) return capacity_ > 0 && pool_slots >= capacity_;
+        return pool + need > budget_ ||
+               (slot_budget_ > 0 && pool_slots >= slot_budget_);
+    }
+    // The allocator's physical cap: the LRU pool's budget PLUS the ring's,
+    // because both are device residency this cache owns. Handing the backend
+    // only budget_ made the pool refuse the ring's own bytes -- measured on
+    // Tiel-Coder-35B-A3B: "expert pool physical budget exhausted: live=5583 MB
+    // need=860 KB budget=3396 MB" after the ring admitted 5325 MiB and the
+    // clamp shrank the pool to 3239, and the run died on its first token.
+    size_t owner_bytes(size_t need = 0) const {
+        size_t total = budget_ + pin_budget_;
+        const size_t live = bytes_ + need;
+        if (live > total) total = live;
+        return total;
     }
     // Evicts WARM copies until need bytes fit. Pins do not apply here.
     void make_warm_room(size_t need);
@@ -513,6 +611,14 @@ private:
     size_t vram_slots_ = 0;
     size_t host_budget_ = 0;
     size_t host_bytes_ = 0;
+    // The ring: bytes of pinned device residency that the pool's budget does
+    // not count, and how many slots they are, so over_budget() is O(1).
+    size_t pin_budget_ = 0;
+    size_t pin_bytes_ = 0;
+    size_t pin_slots_ = 0;
+    // The one place that flips `pinned`, so the two counters above can never
+    // disagree with it.
+    void set_pinned(Slot &s, bool on);
     // The pinned prefix of WARM: at most this many bytes of the tier are
     // admitted into pinned host memory, in admission order (rank order when the
     // model carries an expert index), so a promotion out of it is a DMA with no
@@ -560,6 +666,14 @@ private:
     u64 decays_ = 0;
     u64 seq_ = 0;
     std::unordered_map<u64, Slot> slots_;
+    // The published device dispatch table (see publish_dispatch_table) and the
+    // flag that says a residency change invalidated it. `table_stale_` is set by
+    // every write to a slot's device pointers -- drop() and the promotion that
+    // assigns `s.m` -- so a caller holding the pointer re-reads it and falls
+    // back instead of issuing GEMMs against freed addresses.
+    void *table_ = nullptr;
+    size_t table_bytes_ = 0;
+    bool table_stale_ = false;
 };
 
 } // namespace krk

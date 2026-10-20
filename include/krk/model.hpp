@@ -82,6 +82,12 @@ struct LayerWeights {
     QuantTensor idx_q_proj, idx_k_proj;
     f32 *idx_q_norm = nullptr;
     f32 *idx_k_norm = nullptr;
+    // HOST copies of the two indexer norms. The selection runs on the host --
+    // the pooled keys, the scores and the top-k are all host work, because the
+    // block scores have to be turned into a per-row cell list before any
+    // kernel can use them -- so these are read where the selection reads them
+    // rather than downloaded from the device copy once per forward.
+    std::vector<f32> idx_q_norm_h, idx_k_norm_h;
 
     // ---- Mixture-of-Experts (optional) -----------------------------------
     // `moe` selects the routed-expert FFN path. `router` is the small gating

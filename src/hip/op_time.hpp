@@ -361,6 +361,10 @@ static const char *component_of(const char *op) {
         {"ple_gate", "ple"},
         {"conv1d_dw", "ple"},
         {"lane_bcast_mul", "ple"},
+        // QSA: the per-query-row cell gather. Its own bucket, because it only
+        // runs past the selection budget and would otherwise hide inside the
+        // attention rows it exists to shorten.
+        {"gather_rows", "qsa"},
         {"add_inplace", "residual"},
         {"add_bias_rows", "bias"},
         {"add_bias_cols", "bias"},

@@ -18,14 +18,18 @@
 #include <thread>
 
 #include "krk/backend.hpp"
+#include "krk/vram_guard.hpp" // vram_floor_bytes: the floor alloc_pooled enforces
 #include "kernels/attention.hpp"
 #include "kernels/topk.hpp"
+#include "kernels/router.hpp"
+#include "kernels/moe_table.hpp"
 #include "kernels/fused.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/gemm_dp4a.hpp"
 #include "kernels/gdn.hpp"
 #include "kernels/hadamard.hpp"
 #include "kernels/hc.hpp"
+#include "kernels/gather.hpp"
 #include "kernels/ple.hpp"
 #include "op_time.hpp"
 
@@ -303,10 +307,35 @@ public:
             oom(rounded, e);
         }
         allocated_ += rounded;
+        live_bytes_ += rounded;
+        alloc_sizes_[p] = rounded;
         return p;
     }
     void release(void *p) override {
-        if (p) KRK_HIP(hipFree(p));
+        if (!p) return;
+        const auto it = alloc_sizes_.find(p);
+        if (it != alloc_sizes_.end()) {
+            live_bytes_ -= it->second;
+            alloc_sizes_.erase(it);
+        }
+        KRK_HIP(hipFree(p));
+    }
+    // alloc() rounds to 256 bytes and release() is handed the raw pointer, so the
+    // un-rounded size is kept per allocation in a small side table. It exists for
+    // the ledger's self-check (`unaccounted` should equal live minus the terms it
+    // knows), and a probe that only ran under KRK_VRAM_TRACE would be a probe
+    // nobody runs, so it is always on: one unordered_map entry per live buffer.
+    size_t device_live_bytes() const override { return live_bytes_; }
+    size_t device_alloc_count() const override
+    {
+        return alloc_sizes_.size();
+    }
+    size_t device_largest_alloc() const override
+    {
+        size_t big = 0;
+        for (const auto &kv : alloc_sizes_)
+            if (kv.second > big) big = kv.second;
+        return big;
     }
     size_t device_free_bytes() const override {
         size_t free_b = 0, total_b = 0;
@@ -582,6 +611,42 @@ public:
             KRK_ERROR("expert pool physical budget exhausted: live=%zu need=%zu budget=%zu",
                       expert_pool_.live, rounded, expert_pool_.budget);
             std::abort();
+        }
+        // The VRAM floor is an invariant here, not a number the ledger reports
+        // afterwards. A card left with ~850 MiB free does not merely slow this
+        // run down: Windows pages the compositor out and video playback pauses,
+        // which is what a user sees and cannot attribute to a token rate. The
+        // budget check above is in REQUESTED bytes and cannot see the copy
+        // path's own device memory -- measured at 7,000 MiB beside 7,430 MiB
+        // promoted on Mellum2.1 -- so the pool filled its plan and ended below
+        // the floor it was planned around. Asking the driver here is the only
+        // check that includes memory this engine does not account for.
+        //
+        // Growth only happens on a miss with no reusable cell, so this is not a
+        // per-token query, and it is skipped while the pool is below half its
+        // budget -- a run that will never come near the floor pays nothing.
+        if (expert_arena() && expert_pool_.budget > 0 &&
+            expert_pool_.committed >= expert_pool_.budget / 2) {
+            const size_t total = device_total_bytes();
+            const size_t floor = krk::vram_floor_bytes(total);
+            size_t free_b = device_free_bytes();
+            if (total && free_b < rounded + floor) {
+                // Reuse before refusing: the free cells are already paid for.
+                pool_trim_(rounded);
+                free_b = device_free_bytes();
+            }
+            if (total && free_b < rounded + floor) {
+                ++expert_pool_.floor_refusals;
+                if (expert_pool_.floor_refusals == 1)
+                    KRK_WARN("expert pool: holding at %.0f MiB with %.0f MiB free "
+                             "beside a %.0f MiB floor -- further experts stay in "
+                             "WARM instead of taking the card's last memory "
+                             "(KRK_VRAM_FLOOR_MB overrides the floor)",
+                             static_cast<f64>(expert_pool_.committed) / 1048576.0,
+                             static_cast<f64>(free_b) / 1048576.0,
+                             static_cast<f64>(floor) / 1048576.0);
+                return nullptr;
+            }
         }
         void *p = alloc(rounded);
         pool_live_.emplace(p, LiveCell{rounded, nullptr});
@@ -1677,6 +1742,89 @@ public:
         std::abort();
     }
 
+    // The MoE router activation, on the device. See Backend::router_softmax for
+    // why it lives here before the dispatch that uses it: the point is to price
+    // the numerics of moving it, and a price needs the real kernel.
+    bool router_softmax_supported() const override { return true; }
+    void router_softmax(void *probs, const void *logits, i64 n_rows,
+                        i32 n_expert) override {
+        KRK_TIME_OP("router_softmax");
+        if (!probs || !logits || n_rows <= 0 || n_expert <= 0) return;
+        constexpr int kThreads = 128;
+        router_softmax_kernel<kThreads><<<static_cast<unsigned>(n_rows), kThreads>>>(
+            static_cast<const _Float16 *>(logits), static_cast<f32 *>(probs),
+            n_expert);
+    }
+
+    // Selection and the plan, on the device. See Backend::router_topk.
+    bool router_topk_supported() const override { return true; }
+    void router_topk(const void *probs, i64 n_rows, i32 n_expert, i32 k,
+                     void *ids, void *wts, i32 normalize, f32 scale) override {
+        KRK_TIME_OP("router_topk");
+        if (!probs || !ids || !wts || n_rows <= 0 || n_expert <= 0 || k <= 0) return;
+        constexpr int kThreads = 128; // 4 warps: the shared slot table needs one
+        router_topk_kernel<kThreads><<<static_cast<unsigned>(n_rows), kThreads, 0>>>(
+            static_cast<const f32 *>(probs), n_expert, k,
+            static_cast<i32 *>(ids), static_cast<f32 *>(wts));
+        router_weights_kernel<kThreads><<<static_cast<unsigned>(n_rows), kThreads, 0>>>(
+            static_cast<f32 *>(wts), k, normalize, scale);
+    }
+
+    void moe_plan_build(const void *ids, i64 n_rows, i32 k, i32 n_expert,
+                        void *off, void *rows, void *wt, const void *wts) override {
+        KRK_TIME_OP("moe_plan_build");
+        if (!ids || !off || !rows || !wt || n_rows <= 0 || k <= 0 || n_expert <= 0)
+            return;
+        // One thread, by design: the fill order is prescribed (token, then slot)
+        // so the plan is a value and not a function of the schedule.
+        moe_plan_kernel<<<1, 1, 0>>>(static_cast<const i32 *>(ids),
+                                     static_cast<i32>(n_rows), k, n_expert,
+                                     static_cast<i32 *>(off), static_cast<i32 *>(rows),
+                                     static_cast<f32 *>(wt), nullptr,
+                                     static_cast<const f32 *>(wts));
+    }
+
+    // The whole MoE layer from one launch, with the matrices chosen on the
+    // device from ExpertCache's published table. See kernels/moe_table.hpp for
+    // the arithmetic and why it is the same numbers the per-expert path
+    // produces (one warp per row, gemv's lane split, f16 round before the
+    // activation) with one deliberate difference -- the slot order.
+    bool moe_dispatch_supported() const override { return true; }
+
+    void moe_dispatch(const void *table, i32 layer, i32 n_expert, const void *ids,
+                      const void *wts, const void *xn, void *out, i64 n_tok,
+                      i64 n_embd, i64 n_ff, i32 k) override {
+        KRK_TIME_OP("moe_dispatch");
+        if (!table || !ids || !wts || !xn || !out || n_tok <= 0 || k <= 0) return;
+        // The kernels chunk K by 32, and the shared-memory partition below is
+        // one activation row plus one accumulator row. A geometry that breaks
+        // either is a caller that should not have engaged this path, and it
+        // must not leave the layer computing something else quietly.
+        if ((n_embd & 31) || (n_ff & 31)) {
+            KRK_ERROR("moe_dispatch: n_embd=%lld n_ff=%lld must be multiples of 32",
+                      static_cast<long long>(n_embd), static_cast<long long>(n_ff));
+            std::abort();
+        }
+        // One activation row, one accumulator row, and the row-scale reduction
+        // (8 warp partials plus the scale itself), rounded up so the f16 view
+        // stays 16-byte aligned.
+        const size_t smem = static_cast<size_t>(n_ff) * sizeof(_Float16) +
+                            static_cast<size_t>(n_embd) * sizeof(f32) + 64u;
+        if (smem > 48u * 1024u) {
+            KRK_ERROR("moe_dispatch: %.1f KiB of shared memory for n_ff=%lld "
+                      "n_embd=%lld exceeds the block limit",
+                      static_cast<f64>(smem) / 1024.0,
+                      static_cast<long long>(n_ff),
+                      static_cast<long long>(n_embd));
+            std::abort();
+        }
+        moe_table_kernel<256><<<static_cast<unsigned>(n_tok), 256, smem>>>(
+            static_cast<const MoeDispatchEntry *>(table), layer, n_expert,
+            static_cast<const i32 *>(ids), static_cast<const f32 *>(wts),
+            static_cast<const _Float16 *>(xn), static_cast<_Float16 *>(out),
+            static_cast<i32>(n_embd), static_cast<i32>(n_ff), k);
+    }
+
     void download_f32(f32 *dst, const void *src, i64 n) override {
         KRK_TIME_OP("download_f32");
         std::vector<u16> tmp(static_cast<size_t>(n));
@@ -2516,6 +2664,20 @@ public:
             static_cast<const _Float16 *>(g), n_tok, hc, ne);
     }
 
+    // QSA's cell compaction: the indexer hands each query row its own cell
+    // list, and attention() has no mask, so the chosen rows are gathered into
+    // a compact buffer and attended over there.
+    bool gather_rows_supported() const override { return true; }
+
+    void gather_rows(void *dst, const void *src, const i64 *idx, i64 n_rows,
+                     size_t row_bytes) override {
+        KRK_TIME_OP("gather_rows");
+        if (!dst || !src || !idx || n_rows <= 0 || row_bytes == 0) return;
+        gather_rows_kernel<128><<<static_cast<unsigned>(n_rows), 128>>>(
+            static_cast<u8 *>(dst), static_cast<const u8 *>(src), idx,
+            static_cast<i64>(row_bytes));
+    }
+
     void add_bias_rows(void *out, const f32 *bias, i64 n, i64 rows) override {
         KRK_TIME_OP("add_bias_rows");
         const i64 total = n * rows;
@@ -2923,6 +3085,8 @@ private:
     DeviceCaps caps_;
     int index_ = 0;
     size_t allocated_ = 0;
+    size_t live_bytes_ = 0;
+    std::unordered_map<void *, size_t> alloc_sizes_;
     // Decode-layer GEMM fusion on/off (see the constructor).
     bool fused_layer_ = true;
     // Fused non-GEMM decode chain on/off (see the constructor).

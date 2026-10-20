@@ -54,6 +54,7 @@
 #include "krk/gguf.hpp"
 #include "krk/hc.hpp"
 #include "krk/ple.hpp"
+#include "krk/qsa.hpp"
 #include "krk/http.hpp"
 #include "krk/json.hpp"
 #include "krk/quant.hpp"
@@ -4662,7 +4663,137 @@ static void test_expert_cache_policy() {
 }
 
 // ---------------------------------------------------------------------------
-// ExpertCache second tier: VRAM slots over a page-locked host tier
+// The device dispatch table's HOST half
+// ---------------------------------------------------------------------------
+//
+// `ExpertCache::publish_dispatch_table` is the promise a kernel reads experts
+// through: `table[layer * n_expert + e]` holds that expert's three device
+// pointers, their shapes, their types and their row strides, so the routing can
+// stay on the device and no host pointer per expert sits between the top-k and
+// the GEMMs.
+//
+// Two ways that promise can lie are what this group pins: publishing while the
+// set is NOT resident (a pointer a later promotion rewrites under a running
+// kernel), and staying "current" after a slot moved.
+//
+// The kernel that consumes the table cannot run here -- no test group opens the
+// device -- so the device half is pinned by `kraken-bench --moe-dispatch`, which
+// compares the one-launch dispatch against the per-expert path it replaces and
+// requires a gate/up swap in the table to change the answer.
+static void test_expert_dispatch_table() {
+    const std::string path = "kraken-dispatch-table.gguf";
+    // The MIXED fixture: two expert layers with different footprints, which is
+    // what the eviction check below needs (a wider expert has to dislodge a
+    // resident one) and what a real Q4_K_M file looks like.
+    CHECK(build_expert_source_model_mixed(path),
+          "wrote the dispatch-table GGUF");
+
+    Backend *cpu = make_cpu_backend();
+    // The reason the engine's arm cannot engage on this backend: no table
+    // dispatch, so the layer takes the host path unchanged.
+    CHECK(!cpu->moe_dispatch_supported(),
+          "the CPU backend has no table dispatch");
+    CountingBackend be(cpu);
+    Gguf g;
+    std::string err;
+    CHECK(g.load(path, &err), "loaded the dispatch-table GGUF");
+    if (!err.empty()) std::fprintf(stderr, "  (dispatch gguf: %s)\n", err.c_str());
+    const ExpertSource src = expert_source(g);
+    CHECK(src.present(), "the dispatch-table expert source is complete");
+
+    ExpertCache cache;
+    cache.configure(&be, 96); // four experts of 24 bytes
+
+    // 1. A cold cache publishes nothing, and says why. The reason has to name
+    //    the residency, because "off" with no reason is the failure mode that
+    //    took a whole session to find in the hyper-connection refusal.
+    CHECK(!cache.whole_set_resident(1, 4), "an empty cache is not resident");
+    CHECK(cache.publish_dispatch_table(1, 4, nullptr, nullptr) == nullptr,
+          "and publishes no table");
+    std::string why;
+    i32 filled = -1;
+    CHECK(cache.publish_dispatch_table(1, 4, &filled, &why) == nullptr &&
+              filled == 0 && !why.empty(),
+          "a refusal carries a reason and no entries");
+
+    // 2. Fill the set. Every expert resident is what makes the table true.
+    const ResidentExpert *r[4] = {};
+    for (i32 e = 0; e < 3; e++) {
+        r[e] = cache.acquire(src, 0, e);
+        CHECK(r[e] != nullptr, "expert loads");
+    }
+    CHECK(!cache.whole_set_resident(1, 4), "three of four slots is not the set");
+    CHECK(!cache.whole_set_resident(2, 4), "a second layer has no slots at all");
+    r[3] = cache.acquire(src, 0, 3);
+    CHECK(r[3] != nullptr && cache.whole_set_resident(1, 4),
+          "the fourth acquire makes the whole routed set resident");
+
+    // 3. Publish, then read the entries: they must BE the resident matrices, in
+    //    expert-id order, with everything a dot product needs.
+    void *table = cache.publish_dispatch_table(1, 4, &filled, &why);
+    CHECK(table != nullptr && filled == 4, "four entries published");
+    CHECK(cache.dispatch_table() == table,
+          "the cache reports the table it published");
+    CHECK(!cache.dispatch_table_stale(), "and it starts current");
+    if (table) {
+        // Read the entries in place: on the CPU backend the "device" pointer IS
+        // host memory, so the published buffer is a plain array of entries and
+        // these are the same bytes a kernel would read.
+        const MoeDispatchEntry *back =
+            static_cast<const MoeDispatchEntry *>(table);
+        bool ptrs_ok = true, shape_ok = true, present_ok = true;
+        for (i32 e = 0; e < 4; e++) {
+            const MoeDispatchEntry &d = back[e];
+            ptrs_ok = ptrs_ok && d.p[kMoeGate] == r[e]->gate.data &&
+                      d.p[kMoeUp] == r[e]->up.data &&
+                      d.p[kMoeDown] == r[e]->down.data;
+            shape_ok = shape_ok && d.n_in[kMoeGate] == r[e]->gate.n_in &&
+                       d.n_out[kMoeGate] == r[e]->gate.n_out &&
+                       d.n_in[kMoeDown] == r[e]->down.n_in &&
+                       d.row_bytes[kMoeGate] ==
+                           static_cast<i64>(dtype_row_bytes(r[e]->gate.type,
+                                                           r[e]->gate.n_in)) &&
+                       d.type[kMoeGate] == static_cast<i32>(r[e]->gate.type);
+            present_ok = present_ok && d.present[kMoeGate] != 0 &&
+                         d.present[kMoeUp] != 0 && d.present[kMoeDown] != 0;
+        }
+        CHECK(ptrs_ok, "every entry points at that expert's resident matrices");
+        CHECK(shape_ok, "with its own shapes, type and row stride");
+        CHECK(present_ok, "and all three matrices marked present");
+        // Asserted where it differs: a uniform check still passes one entry off.
+        CHECK(back[0].p[kMoeGate] != back[1].p[kMoeGate],
+              "entry 0 and entry 1 are different experts");
+    }
+
+    // 4. A slot that moves invalidates it. Layer 1's experts are wider than the
+    //    four layer-0 slots this budget holds, so the acquisition evicts a
+    //    layer-0 expert -- exactly the event the promise forbids.
+    const ExpertSource src1 = expert_source_of(g, 1);
+    CHECK(src1.present(), "the mixed file has a second expert layer");
+    CHECK(cache.acquire(src1, 1, 0) != nullptr, "a wider expert loads");
+    CHECK(cache.evictions() > 0, "by evicting a resident slot");
+    CHECK(cache.dispatch_table_stale(),
+          "the published table is marked stale by the eviction");
+    CHECK(!cache.whole_set_resident(1, 4), "layer 0 is no longer whole");
+    CHECK(cache.publish_dispatch_table(1, 4, &filled, &why) == nullptr,
+          "so it cannot be republished while the hole is there");
+
+    // 5. Refilling is a republish, not a one-shot: the arm has to be able to
+    //    come back after a run that touched another layer.
+    for (i32 e = 0; e < 4; e++)
+        CHECK(cache.acquire(src, 0, e) != nullptr, "layer 0 refills");
+    CHECK(cache.whole_set_resident(1, 4), "the set is whole again");
+    CHECK(cache.publish_dispatch_table(1, 4, &filled, &why) != nullptr &&
+              filled == 4 && !cache.dispatch_table_stale(),
+          "and republishes, current again");
+
+    // 6. clear() releases the table with the slots it described.
+    cache.clear();
+    CHECK(cache.dispatch_table() == nullptr, "clear() drops the table");
+
+    std::remove(path.c_str());
+}
+
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -8078,7 +8209,8 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
                                 int n_embd_arg = 0, int low_rank_arg = 0,
                                 bool extras = true,
                                 bool identical_inject = false,
-                                bool qsa = true) {
+                                bool qsa = true,
+                                bool half_indexer = false) {
     // The two numbers the forward test scales up to the real file's shape: four
     // lanes of 2560, mixed through a 32-wide bottleneck (the REAP-288 file
     // mixes through 320; 32 keeps the fixture a few MB instead of 100).
@@ -8093,7 +8225,17 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
     const int wide = n_embd * hc;                 // 128
     const int interval = 2;
     const int n_layer = 2;
-    const int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32, n_expert = 4, vocab = 260,
+    // 261, not 260: `add_spm_vocab` always writes 3 specials + 256 byte pieces
+    // + the two whitespace pieces, so its table has 261 entries whatever size
+    // is asked for once the ask is <= 261. A 260-row embedding against a
+    // 261-piece tokenizer read one row past `token_embd.weight` for every space
+    // in the prompt -- the row the tokenizer calls 260 -- and the bytes there
+    // are heap, so the WHOLE forward changed from run to run: the same command
+    // printed a different `--prefill-hash` every time, and the QSA selection it
+    // fed flipped on near-ties. That is the same defect the prefill gate hit
+    // (hashing past `cfg().n_vocab`), and it is a fixture shape error, not a
+    // kernel one: the table has to be as wide as the tokenizer is tall.
+    const int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32, n_expert = 4, vocab = 261,
               ctx = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
     const int idx_h = 2, idx_dim = 4;
@@ -8132,14 +8274,22 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
     // The three pieces that make this family what it is.
     b.meta_u32(arch + ".hyper_connection.count", static_cast<u32>(hc));
     b.meta_u32(arch + ".hyper_connection.low_rank", static_cast<u32>(low_rank));
-    // The indexer and the PLE module are the two pieces the forward pass does
-    // not run yet, and Engine::init refuses a file that carries either. The
-    // fixture can leave them out so the residual stack is what is under test.
+    // The indexer and the PLE module both RUN now -- the forward test below
+    // proves the residual stack with them left out, and test_qwen4exp_ple
+    // proves the n-gram block -- so this fixture can build either shape.
+    // `half_indexer` writes the per-layer ratios and none of the head geometry:
+    // that is the file the loader has to refuse, because running it as if it
+    // had no indexer would attend over every key and decode text that is not
+    // this model's.
     if (extras && qsa) {
-        b.meta_u32(arch + ".attention.indexer.head_count", static_cast<u32>(idx_h));
-        b.meta_u32(arch + ".attention.indexer.key_length", static_cast<u32>(idx_dim));
-        b.meta_u32(arch + ".attention.indexer.top_k", 16);
-        b.meta_i32_array(arch + ".attention.compress_ratios", {0, 2});
+        if (half_indexer) {
+            b.meta_i32_array(arch + ".attention.compress_ratios", {0, 2});
+        } else {
+            b.meta_u32(arch + ".attention.indexer.head_count", static_cast<u32>(idx_h));
+            b.meta_u32(arch + ".attention.indexer.key_length", static_cast<u32>(idx_dim));
+            b.meta_u32(arch + ".attention.indexer.top_k", 16);
+            b.meta_i32_array(arch + ".attention.compress_ratios", {0, 2});
+        }
     }
     if (extras) {
         b.meta_i32_array(arch + ".ple.layers", {0});
@@ -8508,6 +8658,52 @@ static void test_qwen4exp_ple() {
                     }
                 }
                 CHECK(finite, "and the lane stack it wrote into stays finite");
+                // The block's two halves are different rows and the residual
+                // gets the RAW one. The reference is
+                // `hidden + gated + silu(conv(grouped_norm(gated)))`, so one
+                // buffer holding the normalized copy puts a per-lane unit-RMS
+                // row on the residual instead of `value * gate` -- the defect
+                // that made this family decode garbage. Aliasing makes the two
+                // rows identical, so a per-lane RMS comparison fails on it, and
+                // a norm that was never applied fails it the other way.
+                {
+                    f32 *cvin = nullptr, *cvout = nullptr;
+                    i64 rows_n = 0;
+                    const f32 *raw_g =
+                        engine.ple_debug_terms(&cvin, &cvout, &rows_n);
+                    CHECK(raw_g && cvin && cvout,
+                          "the PLE block exposes its three terms");
+                    if (raw_g && cvin && cvout && rows_n > 0) {
+                        CHECK(static_cast<const void *>(raw_g) !=
+                                  static_cast<const void *>(cvin),
+                              "the residual term and the conv input are two buffers");
+                        auto lane_rms = [&](const f32 *v, i64 lane) {
+                            f64 acc = 0.0;
+                            for (i64 i = 0; i < ne; i++) {
+                                const f64 x = v[lane * ne + i];
+                                acc += x * x;
+                            }
+                            return std::sqrt(acc / static_cast<f64>(ne));
+                        };
+                        i64 differ = 0;
+                        f64 total = 0.0;
+                        for (i64 lane = 0; lane < hc; lane++) {
+                            const f64 a_rms = lane_rms(raw_g, lane);
+                            const f64 b_rms = lane_rms(cvin, lane);
+                            total += a_rms;
+                            if (b_rms > 0.0 && std::fabs(a_rms - b_rms) >
+                                                   0.001 * std::max(a_rms, b_rms))
+                                differ++;
+                        }
+                        CHECK(total > 0.0 && differ == hc,
+                              "the conv input is the lane-normed copy, not the raw row");
+                        i64 same = 0;
+                        for (i64 i = 0; i < ne * hc; i++)
+                            if (cvout[i] == cvin[i]) same++;
+                        CHECK(same < ne * hc,
+                              "and the convolution actually ran over it");
+                    }
+                }
             }
         }
         delete cpu;
@@ -8527,6 +8723,242 @@ static void test_qwen4exp_ple() {
 // initialises, generates, and keeps the lane invariant the arithmetic promises,
 // through the real forward pass. The pieces the forward does not run yet (PLE,
 // the QSA indexer) are left out of the fixture, so a pass here is the stack.
+// ---------------------------------------------------------------------------
+// QSA indexer, the host maths first (no engine, no file): pooling over complete
+// blocks only, the per-head relu before the sum, rope at the block's FIRST
+// position, and the selection rule -- budget in CELLS, the still-filling block
+// pinned visible, complete blocks competing on score.
+static void test_qsa_select() {
+    QsaConfig cfg;
+    cfg.n_head = 1;
+    cfg.head_dim = 2;
+    cfg.top_k = 4; // cells, not blocks
+    cfg.ratio = 2;
+    cfg.eps = 1e-6f;
+    cfg.n_rot = 2;
+    static const f32 freq[1] = {1.0f};
+    cfg.inv_freq = freq;
+    cfg.rope_scale = 1.0f;
+    cfg.rope_neox = false;
+
+    // ---- pooling: only COMPLETE blocks have a mean ------------------------
+    {
+        const f32 keys[5 * 2] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        f32 pooled[2 * 2] = {0, 0, 0, 0};
+        const i32 nb = qsa_pool(pooled, keys, 2, 5, 2);
+        CHECK(nb == 2, "five cells in blocks of two leave two complete blocks");
+        CHECK(pooled[0] == 2.0f && pooled[1] == 3.0f,
+              "block 0 pools as the mean of its two cells");
+        CHECK(pooled[2] == 6.0f && pooled[3] == 7.0f,
+              "block 1 pools as the mean of its two cells");
+    }
+
+    // ---- the score: relu per head, THEN the sum --------------------------
+    {
+        const f32 q[2] = {1.0f, 0.0f};
+        const f32 pooled[4 * 2] = {1, 0, -1, 0, 0, 1, 2, 0};
+        f32 score[4] = {0, 0, 0, 0};
+        qsa_scores(score, q, pooled, 1, 1, 4, 2);
+        CHECK(score[0] == 1.0f, "an aligned block scores its dot product");
+        CHECK(score[1] == 0.0f, "a negative dot is rectified to zero");
+        CHECK(score[2] == 0.0f, "an orthogonal block scores zero");
+        CHECK(score[3] == 2.0f, "a longer aligned block scores higher");
+    }
+    {
+        // Head 0 sees +1 on the block; head 1 sees -1, which its own relu
+        // drops. Sum-then-rectify would give relu(1 + -1) = 0, so this check
+        // separates the per-head rule from the whole-row one.
+        const f32 q[2 * 2] = {1, 0, 0, 1}; // head 0 along +d0, head 1 along +d1
+        const f32 pooled[2] = {1, -1};
+        f32 score[1] = {0};
+        qsa_scores(score, q, pooled, 1, 2, 1, 2);
+        CHECK(score[0] == 1.0f,
+              "one head's negative dot does not cancel another head's evidence");
+    }
+
+    // ---- norm + rope at the given position -------------------------------
+    {
+        f32 x[2] = {3.0f, 4.0f};
+        const f32 w[2] = {1.0f, 1.0f};
+        const i64 pos[1] = {2};
+        qsa_norm_rope(x, w, 1, 2, pos, cfg);
+        const f32 inv = 1.0f / std::sqrt(12.5f + 1e-6f);
+        const f32 a = 3.0f * inv, b = 4.0f * inv;
+        const f32 th = 2.0f; // pos * inv_freq[0]
+        const f32 c = std::cos(th), s = std::sin(th);
+        CHECK(std::fabs(x[0] - (a * c - b * s)) < 1e-6f &&
+                  std::fabs(x[1] - (a * s + b * c)) < 1e-6f,
+              "the row is rms-normed then rotated by pos * inv_freq");
+    }
+
+    // ---- selection: budget in CELLS --------------------------------------
+    {
+        // 8 cells, blocks of 2, budget 4 + 2 - 1 = 5 cells, query at 7.
+        const f32 score[4] = {1.0f, 5.0f, 2.0f, 0.0f};
+        std::vector<i64> cells;
+        const i32 n = qsa_select(&cells, score, 4, 8, 7, cfg);
+        CHECK(n == 5 && cells.size() == 5,
+              "the selection fills exactly the cell budget");
+        CHECK(n == 5 && cells[0] == 0 && cells[1] == 2 && cells[2] == 3 &&
+                  cells[3] == 4 && cells[4] == 5,
+              "the best blocks are taken whole and the boundary block is cut at "
+              "the budget");
+    }
+    {
+        // Query at 6: the block it sits in is still filling (cells 6,7 exist
+        // only up to 6), so it is pinned visible whatever it scores.
+        const f32 score[3] = {1.0f, 5.0f, 2.0f};
+        std::vector<i64> cells;
+        const i32 n = qsa_select(&cells, score, 3, 7, 6, cfg);
+        CHECK(n == 5 && !cells.empty() && cells.back() == 6,
+              "the block that is still filling is always visible");
+        CHECK(n == 5 && cells[0] == 2 && cells[1] == 3 && cells[2] == 4 &&
+                  cells[3] == 5,
+              "the scored blocks fill the rest of the budget");
+    }
+    {
+        // Below the budget every visible cell is chosen, in order.
+        const f32 score[2] = {1.0f, 2.0f};
+        std::vector<i64> cells;
+        const i32 n = qsa_select(&cells, score, 2, 4, 3, cfg);
+        CHECK(n == 4 && cells.size() == 4 && cells[0] == 0 && cells[3] == 3,
+              "inside the budget the selection is every visible cell");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QSA indexer through a real file: the fixture declares `compress_ratios {0, 2}`
+// and `top_k 16`, so layer 1 indexes in blocks of two cells and its budget is
+// 17 cells. A prompt longer than that is where the selection engages -- and the
+// property that matters is that the ROW'S CELL LIST DOES NOT DEPEND ON THE
+// CHUNK SIZE, because the pool is over every key the layer ever wrote. It is
+// compared at chunk 1 against chunk 8, i.e. across the exact rows<=8 rung; a
+// wide chunk is checked for shape rather than identity because its projection
+// runs the rows>=9 tile.
+static void test_qwen4exp_qsa() {
+    const std::string path = "kraken-q4qsa.gguf";
+    CHECK(build_tiny_q4_model(path, 0, 0, 0, true, false, true),
+          "a four-lane file with the indexer writes");
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+
+    // One prefill-only run at `chunk`, returning the last row's cell list and
+    // the layer's ratio. Prefill-only (max_tokens 0) makes the LAST forward the
+    // final chunk, so both arms answer for the same position.
+    auto run = [&](i32 chunk, const std::string &prompt, i32 n_out,
+                   std::vector<i64> *cells, i32 *ratio1, i32 *ratio0,
+                   i32 *n_prompt) -> bool {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = path;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = chunk;
+            std::string err;
+            if (!engine.init(cpu, cfg, &err)) {
+                if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+            } else {
+                GenerateParams p;
+                p.prompt = prompt;
+                p.max_tokens = n_out;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(p, &r) && r.finish != FinishError;
+                *cells = engine.qsa_debug_cells(1);
+                if (ratio1) *ratio1 = engine.qsa_debug_ratio(1);
+                if (ratio0) *ratio0 = engine.qsa_debug_ratio(0);
+                if (n_prompt) *n_prompt = r.prompt_tokens;
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    {
+        // Long enough that the last row is past the 17-cell budget.
+        const std::string prompt = "aaaa bbbb cccc dddd eeee ffff gggg";
+        std::vector<i64> wide, narrow;
+        i32 r1 = 0, r0 = -1, n_prompt = 0;
+        CHECK(run(8, prompt, 0, &wide, &r1, &r0, &n_prompt),
+              "the indexer file prefills at chunk 8");
+        CHECK(r1 == 2, "layer 1's compress ratio reaches the engine");
+        CHECK(r0 == 0, "the recurrent layer carries no indexer");
+        CHECK(n_prompt > 18, "the prompt is longer than the cell budget");
+        const i64 q = n_prompt - 1;
+        CHECK(!wide.empty(), "a context past the budget produces a selection");
+        if (!wide.empty()) {
+            CHECK(static_cast<i64>(wide.size()) == 17,
+                  "the selection is exactly the cell budget (16 + 2 - 1)");
+            CHECK(std::is_sorted(wide.begin(), wide.end()),
+                  "the cells come out ascending");
+            CHECK(wide.front() >= 0 && wide.back() <= q,
+                  "every selected cell is a visible one");
+            bool dup = false;
+            for (size_t i = 1; i < wide.size(); i++)
+                dup = dup || wide[i] == wide[i - 1];
+            CHECK(!dup, "a cell is selected at most once");
+            // The block the last query sits in is pinned only while it is still
+            // filling; when it is, the newest cell must be in the list.
+            if ((q / 2) * 2 + 1 > q)
+                CHECK(wide.back() == q,
+                      "the still-filling tail block is always selected");
+        }
+        // The selection reads every key the layer wrote, so it cannot depend on
+        // how the prompt was chunked. The comparison arm is chunk 1 -- 27
+        // single-row forwards against chunk 8's four -- because both sit on the
+        // rows<=8 ladder, which is bit-exact (`kraken-bench --bitexact`). A
+        // wide prefill is the arm that CANNOT be equal yet: a 27-row projection
+        // takes the tiled GEMM, whose rows>=9 accumulation is not identical to
+        // the ladder's, so its scores move by ulps and a near-tied block can
+        // change places. That is the open GEMM rung, not the indexer -- a
+        // comparison that ignored it would be asserting a property the engine
+        // does not have.
+        CHECK(run(1, prompt, 0, &narrow, nullptr, nullptr, nullptr),
+              "the same prompt prefills token by token");
+        if (wide != narrow) {
+            std::fprintf(stderr, "  (cells differ -- chunk 8:");
+            for (i64 c : wide) std::fprintf(stderr, " %lld", (long long)c);
+            std::fprintf(stderr, " / chunk 1:");
+            for (i64 c : narrow) std::fprintf(stderr, " %lld", (long long)c);
+            std::fprintf(stderr, " / q=%lld)" "\n", (long long)q);
+        }
+        CHECK(wide == narrow, "chunk 1 and chunk 8 select the same cells");
+
+        // The wide arm reads the same scores, so it has to pick the same cells.
+        // It is the one that would break if a rows>=9 projection moved a block
+        // score by an ulp; on this fixture it does not -- the prefill hash is
+        // identical at chunks 1, 2, 8 and 32.
+        std::vector<i64> deep;
+        CHECK(run(32, prompt, 0, &deep, nullptr, nullptr, nullptr),
+              "the same prompt prefills at chunk 32");
+        CHECK(static_cast<i64>(deep.size()) == 17,
+              "a wide prefill fills the same cell budget");
+        CHECK(deep == wide, "chunk 32 selects the same cells as chunk 8");
+    }
+    {
+        // Inside the budget nothing is dropped, so there is no selection at all
+        // and the layer runs dense causal attention -- the reference's own
+        // behaviour below `top_k + ratio - 1`.
+        std::vector<i64> cells;
+        CHECK(run(8, "the", 0, &cells, nullptr, nullptr, nullptr),
+              "a short prompt prefills through the indexer layer");
+        CHECK(cells.empty(),
+              "inside the budget the layer is dense and selects nothing");
+    }
+
+    if (!std::getenv("KRK_KEEP_FIXTURE")) std::remove(path.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
 static void test_qwen4exp_forward() {
     const std::string wide_path = "kraken-q4fwd.gguf";
     const std::string same_path = "kraken-q4same.gguf";
@@ -8536,7 +8968,7 @@ static void test_qwen4exp_forward() {
     CHECK(build_tiny_q4_model(same_path, 0, 0, 0, false, true),
           "and a lane-symmetric one (one injection column for all four lanes)");
     CHECK(build_tiny_q4_model(full_path, 0, 0, 0, true, false),
-          "and the full-schema file the refusal is checked on");
+          "and the full-schema file: PLE and the indexer both declared");
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #else
@@ -8662,7 +9094,11 @@ static void test_qwen4exp_forward() {
         delete cpu;
     }
 
-    // ---- what is still not run is refused, by name ----------------------
+    // ---- both surrounding blocks RUN, so the full schema initialises -----
+    // This check used to require the opposite: while the PLE module and the
+    // indexer were unread, a file carrying either was refused by name. Both run
+    // now, so the full-schema file initialising here is what keeps a refusal
+    // from being re-introduced over blocks that work.
     {
         Backend *cpu = make_cpu_backend();
         {
@@ -8673,17 +9109,333 @@ static void test_qwen4exp_forward() {
             cfg.prefill_chunk = 8;
             std::string err;
             const bool ok = engine.init(cpu, cfg, &err);
-            CHECK(!ok, "a file carrying PLE or the QSA indexer is refused");
-            CHECK(err.find("per-layer token embeddings") != std::string::npos ||
-                      err.find("indexer") != std::string::npos,
-                  "... and the message names the stage that is missing");
+            CHECK(ok, "a file carrying both the PLE module and the indexer initialises");
+            if (!ok) std::fprintf(stderr, "  (init: %s)\n", err.c_str());
         }
         delete cpu;
+    }
+
+    // ---- a half-declared indexer is still refused, by name --------------
+    {
+        const std::string half_path = "kraken-q4half.gguf";
+        CHECK(build_tiny_q4_model(half_path, 0, 0, 0, true, false, true, true),
+              "a file with the compress ratios and no head geometry writes");
+        Backend *cpu = make_cpu_backend();
+        Model model;
+        std::string err;
+        const bool ok = model.load(*cpu, half_path, &err);
+        CHECK(!ok, "a half-declared indexer is refused, not run as if it had none");
+        CHECK(err.find("indexer") != std::string::npos,
+              "... and the message names the indexer geometry that is missing");
+        model.unload();
+        delete cpu;
+        std::remove(half_path.c_str());
     }
 
     std::remove(wide_path.c_str());
     std::remove(same_path.c_str());
     std::remove(full_path.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
+// Reads the first "<what> L<layer> ..." line of a KRK_DUMP file: the values are
+// space separated after the n=<rows> token, in the order the engine wrote them.
+// Shared by the qwen4exp groups that observe the graph through a dump rather
+// than through a config flag.
+static bool dump_row_of(const std::string &file, const char *what, i32 layer,
+                        std::vector<double> *out) {
+    std::ifstream in(file.c_str(), std::ios::binary);
+    if (!in) return false;
+    char prefix[64];
+    std::snprintf(prefix, sizeof(prefix), "%s L%02d ", what,
+                  static_cast<int>(layer));
+    const std::string want = prefix;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.size() < want.size() ||
+            line.compare(0, want.size(), want) != 0)
+            continue;
+        const char *p = line.c_str() + want.size();
+        while (*p && *p != ' ') p++; // the n=<rows> token
+        while (*p) {
+            char *end = nullptr;
+            const double v = std::strtod(p, &end);
+            if (end == p) break;
+            out->push_back(v);
+            p = end;
+        }
+        return !out->empty();
+    }
+    return false;
+}
+
+// The gated normalization's ACTIVATION is the one thing about the delta-net
+// block a file cannot tell you: Qwen3.5's `build_norm_gated` gates with
+// silu(z), qwen4exp's with sigmoid(z), and the tensor list is identical either
+// way. `ModelConfig::gdn_gate_sigmoid` carries the family's answer, and
+// test_qwen4exp_schema checks that the loader sets it -- which is not the same
+// claim as the graph USING it, and that gap is where this family decoded
+// nonsense: the config said sigmoid, gdn_forward computed silu, and every
+// check was green because every check read the flag instead of the output.
+//
+// So this group observes the graph. Two runs of the same fixture, one
+// KRK_GDN_GATE=0 apart, and the dumped rows carry the whole argument:
+//   - gdn.delta (the delta rule's raw output) and gdn.norm (after the per-head
+//     RMSNorm) must be BIT-identical, so the arm reaches nothing above the gate;
+//   - gdn.gated must differ, so the arm reaches the graph at all;
+//   - and with z recovered as silu(z)/sigmoid(z), the default arm's ratio must
+//     satisfy sigmoid(z) == 1/(1+exp(-z)) -- an identity silu-over-sigmoid
+//     obeys and, say, silu-over-tanh does not, so the two rows are not merely
+//     different but related by the right function.
+static void test_qwen4exp_gdn_gate() {
+    const std::string path = "kraken-q4gate.gguf";
+    const std::string sig_dump = "kraken-q4gate-sig.dump";
+    const std::string sil_dump = "kraken-q4gate-sil.dump";
+    CHECK(build_tiny_q4_model(path, 0), "a miniature qwen4exp writes");
+    std::remove(sig_dump.c_str());
+    std::remove(sil_dump.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+
+    // gate == nullptr leaves the family's own answer in place.
+    auto run = [&](const char *gate, const std::string &dump) {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+#ifdef _WIN32
+            _putenv_s("KRK_DUMP", dump.c_str());
+            if (gate) _putenv_s("KRK_GDN_GATE", gate);
+            else _putenv_s("KRK_GDN_GATE", "");
+#else
+            setenv("KRK_DUMP", dump.c_str(), 1);
+            if (gate) setenv("KRK_GDN_GATE", gate, 1);
+            else unsetenv("KRK_GDN_GATE");
+#endif
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = path;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            std::string err;
+            ok = engine.init(cpu, cfg, &err);
+            if (ok) {
+                GenerateParams p;
+                p.prompt = "the";
+                p.max_tokens = 1;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(p, &r) && r.finish != FinishError;
+            }
+        }
+#ifdef _WIN32
+        _putenv_s("KRK_DUMP", "");
+        _putenv_s("KRK_GDN_GATE", "");
+#else
+        unsetenv("KRK_DUMP");
+        unsetenv("KRK_GDN_GATE");
+#endif
+        delete cpu;
+        return ok;
+    };
+
+    CHECK(run(nullptr, sig_dump), "the default arm runs (sigmoid, from the arch)");
+    CHECK(run("0", sil_dump), "and the silu arm runs (KRK_GDN_GATE=0)");
+
+    std::vector<double> sig_norm, sil_norm, sig_gated, sil_gated, sig_delta,
+        sil_delta;
+    CHECK(dump_row_of(sig_dump, "gdn.norm", 0, &sig_norm),
+          "the default dump has gdn.norm");
+    CHECK(dump_row_of(sil_dump, "gdn.norm", 0, &sil_norm),
+          "... and so does the silu one");
+    CHECK(dump_row_of(sig_dump, "gdn.gated", 0, &sig_gated),
+          "the default dump has gdn.gated");
+    CHECK(dump_row_of(sil_dump, "gdn.gated", 0, &sil_gated),
+          "... and so does the silu one");
+    CHECK(dump_row_of(sig_dump, "gdn.delta", 0, &sig_delta),
+          "the default dump has gdn.delta");
+    CHECK(dump_row_of(sil_dump, "gdn.delta", 0, &sil_delta),
+          "... and so does the silu one");
+
+    if (sig_norm.size() && sig_norm.size() == sil_norm.size() &&
+        sig_gated.size() == sil_gated.size() && sig_delta.size() == sil_delta.size() &&
+        sig_gated.size() == sig_norm.size()) {
+        // The arm is the gate and nothing else: the delta rule's output and the
+        // normalize step above it are untouched.
+        bool delta_same = sig_delta == sil_delta;
+        bool norm_same = sig_norm == sil_norm;
+        CHECK(delta_same, "the delta rule's own output is bit-identical across the arm");
+        CHECK(norm_same, "... and so is the per-head norm above the gate");
+
+        // ... while the gate's output is not, or the arm never reached the graph.
+        i64 moved = 0;
+        for (size_t i = 0; i < sig_gated.size(); i++)
+            if (sig_gated[i] != sil_gated[i]) moved++;
+        CHECK(moved > 0, "the gate's output moves, so the arm reaches gdn_forward");
+        if (moved) {
+            std::fprintf(stderr, "  (%lld of %lld gdn.gated values moved)\n",
+                         static_cast<long long>(moved),
+                         static_cast<long long>(sig_gated.size()));
+        }
+
+        // The two ratios are silu(z) and sigmoid(z) of ONE z, which makes them
+        // related: sigmoid(z) == 1/(1+exp(-silu(z)/sigmoid(z))). This is the
+        // check that says the default arm is a sigmoid and not merely some
+        // other second activation.
+        i64 paired = 0, ok_ident = 0;
+        for (size_t i = 0; i < sig_gated.size(); i++) {
+            if (sig_norm[i] == 0.0 || sil_norm[i] == 0.0) continue;
+            const double r_sig = sig_gated[i] / sig_norm[i];
+            const double r_sil = sil_gated[i] / sil_norm[i];
+            if (!(r_sig > 0.0)) continue;   // a gate of 0 says nothing about z
+            const double z = r_sil / r_sig;
+            if (!(z > -80.0 && z < 80.0)) continue;
+            const double pred = 1.0 / (1.0 + std::exp(-z));
+            paired++;
+            const double tol = 1e-5 * std::fabs(pred) + 1e-12;
+            if (std::fabs(pred - r_sig) < tol) ok_ident++;
+            else if (ok_ident + (paired - ok_ident) <= 4)
+                std::fprintf(stderr, "  (i=%zu r_sig=%.9g r_sil=%.9g z=%.6g pred=%.9g)\n",
+                             i, r_sig, r_sil, z, pred);
+        }
+        if (paired == 0) {
+            // Nothing to relate usually means the rows did not parse the way
+            // this test assumes, so say what it did read.
+            std::fprintf(stderr, "  (rows: norm=%zu/%zu gated=%zu/%zu delta=%zu/%zu)\n",
+                         sig_norm.size(), sil_norm.size(), sig_gated.size(),
+                         sil_gated.size(), sig_delta.size(), sil_delta.size());
+            for (size_t i = 0; i < sig_gated.size() && i < 4; i++)
+                std::fprintf(stderr, "  (i=%zu norm=%.9g gated=%.9g sil=%.9g)\n",
+                             i, sig_norm[i], sig_gated[i], sil_gated[i]);
+        }
+        CHECK(paired > 0, "there are elements to relate the two arms on");
+        CHECK(paired > 0 && ok_ident == paired,
+              "and the default arm's ratio is sigmoid(z) of the silu arm's z");
+        if (paired && ok_ident != paired) {
+            std::fprintf(stderr, "  (identity held on %lld of %lld elements)\n",
+                         static_cast<long long>(ok_ident),
+                         static_cast<long long>(paired));
+        }
+    }
+
+    std::remove(path.c_str());
+    std::remove(sig_dump.c_str());
+    std::remove(sil_dump.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
+// The mixed row a hyper-connected sub-block reads is
+//     mean_over_lanes( xn_lane * sigmoid(gate_lane) )
+// with `xn` the per-lane normalized stack and `gate` the up-projection's output
+// -- and xn UNSCALED. The 1/hc in the mixer belongs to the bottleneck
+// (`silu(scale(down @ xn, 1/hc))`), and scaling xn instead is invisible to
+// every check that does not look at the mix itself: a matmul commutes with a
+// constant, so `lo` and `gate` come out identical, the lane structure is
+// untouched, and the only witness is the block's input being 1/hc of the
+// reference's -- which reads as fluent, evenly shrunk text rather than as a
+// fault. This group takes the dumped inputs and recomputes the mix with the
+// host algebra (krk::hc_mix, the same code the CPU backend runs), so it fails
+// on any factor between the two.
+static void test_qwen4exp_hc_mix() {
+    const std::string path = "kraken-q4hcmix.gguf";
+    const std::string dump = "kraken-q4hcmix.dump";
+    CHECK(build_tiny_q4_model(path, 0), "a miniature qwen4exp writes");
+    std::remove(dump.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+    _putenv_s("KRK_DUMP", dump.c_str());
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+    setenv("KRK_DUMP", dump.c_str(), 1);
+#endif
+    i32 hc = 0;
+    i64 ne = 0;
+    {
+        Backend *cpu = make_cpu_backend();
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = path;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            std::string err;
+            const bool ok = engine.init(cpu, cfg, &err);
+            CHECK(ok, "it initialises");
+            if (ok) {
+                GenerateParams p;
+                p.prompt = "the";
+                p.max_tokens = 1;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                CHECK(engine.generate(p, &r) && r.finish != FinishError,
+                      "... and runs a forward");
+                engine.hc_debug_lanes(&hc, &ne);
+            }
+        }
+        delete cpu;
+    }
+#ifdef _WIN32
+    _putenv_s("KRK_DUMP", "");
+#else
+    unsetenv("KRK_DUMP");
+#endif
+
+    std::vector<double> xn, gate, mix;
+    CHECK(dump_row_of(dump, "hc.n", -1, &xn), "the dump has the normed lanes");
+    CHECK(dump_row_of(dump, "hc.g", -1, &gate), "... the gate they are mixed by");
+    CHECK(dump_row_of(dump, "hc.mix", -1, &mix), "... and the mixed row itself");
+    if (hc > 1 && ne > 0 && xn.size() == static_cast<size_t>(hc) * ne &&
+        gate.size() == xn.size() && mix.size() == static_cast<size_t>(ne)) {
+        krk::HcGeometry g;
+        g.n_embd = static_cast<i32>(ne);
+        g.hc = hc;
+        g.low_rank = 1; // the mix reads only the lane count
+        std::vector<f32> xf(xn.begin(), xn.end());
+        std::vector<f32> gf(gate.begin(), gate.end());
+        std::vector<f32> want(static_cast<size_t>(ne), 0.0f);
+        krk::hc_mix(want.data(), xf.data(), gf.data(), 1, g);
+        i64 bad = 0;
+        double worst = 0.0;
+        for (i64 e = 0; e < ne; e++) {
+            const double d = std::fabs(static_cast<double>(want[static_cast<size_t>(e)]) -
+                                       mix[static_cast<size_t>(e)]);
+            const double tol = 1e-6 * std::fmax(1.0, std::fabs(mix[static_cast<size_t>(e)]));
+            if (d > tol) bad++;
+            if (d > worst) worst = d;
+        }
+        if (bad) {
+            // The factor is the whole point: report it, since a 1/hc mix is
+            // the defect this check exists for.
+            double ratio = 0.0;
+            for (i64 e = 0; e < ne; e++) {
+                const double w = want[static_cast<size_t>(e)];
+                if (std::fabs(w) > 1e-3) {
+                    ratio = mix[static_cast<size_t>(e)] / w;
+                    break;
+                }
+            }
+            std::fprintf(stderr,
+                         "  (%lld of %lld mix values differ, worst %.3g, "
+                         "dumped/oracle %.4f)\n",
+                         static_cast<long long>(bad), static_cast<long long>(ne),
+                         worst, ratio);
+        }
+        CHECK(bad == 0,
+              "the mixed row is the lane mean of xn * sigmoid(gate), unscaled xn");
+    }
+
+    std::remove(path.c_str());
+    std::remove(dump.c_str());
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
@@ -8739,6 +9491,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_expert_cache_policy)
     TEST_GROUP(test_expert_cache_byte_budget)
     TEST_GROUP(test_expert_cache_warm_tier)
+    TEST_GROUP(test_expert_dispatch_table)
     TEST_GROUP(test_draft_head)
     TEST_GROUP(test_mtp_sidecar)
     TEST_GROUP(test_expert_warmup)
@@ -8747,7 +9500,11 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_ple_hash)
     TEST_GROUP(test_qwen4exp_schema)
     TEST_GROUP(test_qwen4exp_forward)
+    TEST_GROUP(test_qwen4exp_gdn_gate)
+    TEST_GROUP(test_qwen4exp_hc_mix)
     TEST_GROUP(test_qwen4exp_ple)
+    TEST_GROUP(test_qsa_select)
+    TEST_GROUP(test_qwen4exp_qsa)
     TEST_GROUP(test_cpu_expert_pool)
     TEST_GROUP(test_gdn_ops)
     TEST_GROUP(test_gdn_model_loads)

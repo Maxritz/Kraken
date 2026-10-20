@@ -292,6 +292,17 @@ PreMode pre_mode_from_name(const std::string &pre) {
     // does (token ids compared in docs/traces/laguna-chat-tokenizer.txt).
     if (pre.find("laguna") != std::string::npos) return PreMode::Qwen2;
     if (pre.find("qwen2") != std::string::npos) return PreMode::Qwen2;
+    // Qwen3.5 / Qwen3.8-Flash-Next files declare `tokenizer.ggml.pre = qwen35`
+    // and tokenize with the SAME pattern as qwen2 -- measured against the
+    // reference on the REAP-288 file: `def add(a, b):` is 6 tokens there
+    // (`(a` is one id) and was 7 here, because `qwen35` matched nothing above
+    // and fell through to GPT-2, which cannot group a punctuation prefix with
+    // the letters that follow it. A prompt tokenized one way does not meet a
+    // model trained on the other, and the difference is invisible in the text:
+    // both answer fluently, they just answer different questions.
+    if (pre.find("qwen35") != std::string::npos ||
+        pre.find("qwen4exp") != std::string::npos)
+        return PreMode::Qwen2;
     if (pre.find("llama3") != std::string::npos ||
         pre.find("llama-bpe") != std::string::npos)
         return PreMode::Gpt2;

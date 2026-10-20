@@ -7,6 +7,7 @@
 #include "krk/vram_guard.hpp"
 #include "krk/json.hpp" // the expert index reader (warm_experts)
 #include "krk/spec_sampling.hpp" // the sampled round's accept/reject rule
+#include "krk/qsa.hpp" // the QSA indexer's host maths (pool / score / top-k)
 #include "par_pool.hpp"
 
 #include <algorithm>
@@ -66,6 +67,63 @@ static bool swa_off() {
 bool router_sync() {
     static const bool on = [] {
         const char *v = std::getenv("KRK_ROUTER_SYNC");
+        return v && *v && std::string(v) != "0";
+    }();
+    return on;
+}
+
+// KRK_DEVICE_SOFTMAX=1 runs the MoE router's activation on the device and uses
+// its probabilities for the selection, so the text a device softmax produces is
+// the text that is generated rather than a comparison in a comment. The drift
+// against the host answer is accumulated and printed at teardown. Not a speed
+// arm: it still downloads the logits as well, so it is deliberately slower than
+// either path -- the question it answers is numerics, and the answer has to come
+// from the same greedy rule the repo's gates use.
+bool device_softmax() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_DEVICE_SOFTMAX");
+        return v && *v && std::string(v) != "0";
+    }();
+    return on;
+}
+
+// KRK_DEV_PLAN=1 selects top-k and builds the layer's expert plan on the
+// device, then verifies them against the host result before using them: the ids,
+// the weights and the plan's offsets and row order must agree EXACTLY, or the
+// layer falls back to the host plan and the mismatch is reported. That check is
+// the point -- a plan is bookkeeping, so "the GPU agrees with the reference on
+// every layer of every run" is a property that can be proven rather than argued,
+// and it is what makes it safe for the per-expert loop to consume a plan it did
+// not build.
+bool dev_plan() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_DEV_PLAN");
+        return v && *v && std::string(v) != "0";
+    }();
+    return on;
+}
+
+// KRK_DEV_PTR=1 runs a MoE layer as ONE launch whose experts are chosen on the
+// device from ExpertCache's pointer table: the ids and the weights never come
+// back, so the layer stops waiting for its own GPU work to retire. It engages
+// only when the whole routed set is device-resident (the table's residency
+// promise) and the shape is one the kernel expresses; anything else falls back
+// to the host path and says why once. Opt-in because it keeps no host bits: the
+// router's softmax is the device's `expf`, and the drift it costs is measured in
+// docs/AUDIT-EXPERT-CACHE.md rather than assumed away.
+bool dev_ptr() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_DEV_PTR");
+        return v && *v && std::string(v) != "0";
+    }();
+    return on;
+}
+
+// KRK_ROUTER_2X=1 issues the router readback twice. See the call site: the
+// second copy is the round-trip control for the first one's device wait.
+bool router_fetch2() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_ROUTER_2X");
         return v && *v && std::string(v) != "0";
     }();
     return on;
@@ -435,6 +493,13 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // mismatch that moe.sum cannot show.
     if (const char *r = std::getenv("KRK_DUMP_ROUTE"))
         dump_route_ = r[0] != '0';
+    // KRK_GDN_GATE: the delta-net output gate's A/B arm. -1 = the family's own
+    // answer (qwen3.5 silu, qwen4exp sigmoid), 0 = force silu, 1 = force
+    // sigmoid. Read once per engine, not in a function-static: a suite group
+    // has to be able to run both arms in one process, and a static would
+    // freeze whichever arm ran first -- which is how the first version of the
+    // test read "the arm never reached the graph" for a working arm.
+    if (const char *g = std::getenv("KRK_GDN_GATE")) gdn_gate_ = g[0] == '0' ? 0 : 1;
     // Residency preference in the router: --router-resident <margin>, or
     // KRK_ROUTER_TIE_MARGIN for the A/B. Off unless a positive margin is asked
     // for, because it changes the route and therefore the text.
@@ -455,6 +520,18 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         KRK_INFO("router: a pick within %.1f%% of the top score goes to a resident "
                  "expert (VRAM, then WARM) instead",
                  static_cast<f64>(router_tie_margin_) * 100.0);
+    // Top-k' lookahead. Absolute k' (not a multiplier), because "twice the k a
+    // file declares" is a different concurrency on a top-4 and a top-8 model and
+    // the extra experts are paid for in promotions.
+    expert_lookahead_ = 0;
+    if (const char *e = std::getenv("KRK_EXPERT_LOOKAHEAD")) {
+        const long v = std::atol(e);
+        if (v > 0) expert_lookahead_ = static_cast<i32>(v);
+    }
+    if (expert_lookahead_ > 0)
+        KRK_INFO("expert cache: top-k' lookahead at k'=%d -- the runners-up are "
+                 "staged only when they are already in WARM",
+                 expert_lookahead_);
     trace_hash_on_ = cfg.trace_hash;
     trace_stage_.clear();
     // Size the CPU worker pool before the first forward pass.
@@ -585,12 +662,68 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                      static_cast<long long>(ple_hist_));
         }
         if (hcc.qsa) {
-            if (err)
-                *err = "arch '" + hcc.arch +
-                       "': the QSA indexer (compressed-key attention) is loaded "
-                       "but not run yet; generation is refused rather than run "
-                       "with full attention over the same keys";
-            return false;
+            // The indexer SELECTS: each full-attention layer pools its raw
+            // indexer keys into blocks of `ratio` cells, scores every COMPLETE
+            // block, keeps the best `top_k + ratio - 1` cells and attends
+            // densely over those -- see qsa_select_block(). Below that cell
+            // budget nothing is dropped and the layer runs plain dense causal
+            // attention, which is what the reference does there too; that
+            // shortcut is why a short-context run is unaffected by any of this
+            // and why the tests have to build a context longer than the budget
+            // to exercise the selection at all.
+            i32 n_idx = 0;
+            i32 ratio_max = 0;
+            for (size_t i = 0; i < hcc.qsa_ratio.size(); i++) {
+                if (hcc.qsa_ratio[i] > 0) {
+                    if (hcc.qsa_ratio[i] > ratio_max) ratio_max = hcc.qsa_ratio[i];
+                    n_idx++;
+                }
+            }
+            if (n_idx > 0 &&
+                (hcc.idx_head_dim <= 0 || hcc.idx_n_head <= 0 || hcc.idx_top_k <= 0)) {
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': the indexer geometry is incomplete (head_count " +
+                           std::to_string(hcc.idx_n_head) + ", key_length " +
+                           std::to_string(hcc.idx_head_dim) + ", top_k " +
+                           std::to_string(hcc.idx_top_k) + ")";
+                return false;
+            }
+            // KRK_QSA=0 is the A/B arm: dense over everything, which is a
+            // SUPERSET of the selection and therefore the model's own attention
+            // arithmetic -- the arm says what the block costs and what it
+            // changes, and it is the one a coherence check can run against.
+            static const bool qsa_on = [] {
+                const char *e = std::getenv("KRK_QSA");
+                return !(e && e[0] == '0');
+            }();
+            // The gather is how a per-row cell list is expressed: attention()
+            // has no mask, so the chosen cells are compacted and the ordinary
+            // causal kernel runs over them. A backend without it would run the
+            // default no-op and attend over whatever the compact buffer held.
+            if (n_idx > 0 && qsa_on && !be_->gather_rows_supported()) {
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': the QSA indexer needs a row gather (Backend::"
+                           "gather_rows) and this backend does not implement it";
+                return false;
+            }
+            qsa_active_ = n_idx > 0 && qsa_on;
+            qsa_dim_ = hcc.idx_head_dim;
+            qsa_heads_ = hcc.idx_n_head;
+            qsa_top_k_ = hcc.idx_top_k;
+            qsa_ratio_max_ = ratio_max;
+            qsa_eps_ = hcc.rms_eps;
+            if (n_idx > 0) {
+                KRK_INFO("qsa: %d layer(s) carry an indexer (%d head(s) of %d, "
+                         "ratio %d, top_k %d cells) -- %s",
+                         n_idx, hcc.idx_n_head, hcc.idx_head_dim, ratio_max,
+                         hcc.idx_top_k,
+                         qsa_active_ ? "block selection on"
+                                     : "SELECTION OFF (KRK_QSA=0): dense over "
+                                       "every key, a superset of what the "
+                                       "indexer picks");
+            }
         }
         hc_active_ = true;
         KRK_INFO("hyper-connections: %d lane(s) of %d through %d, residual %d wide",
@@ -628,8 +761,29 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
 
     const size_t as = be_->act_size();
     const i64 C = chunk_;
+    // The ledger's baseline: what the device already had taken before this
+    // engine allocated anything. Without it, `unaccounted` at the end of init is
+    // ambiguous between "a buffer we forgot" and "the desktop and the driver",
+    // and that ambiguity is how an inferred 3 GiB of scratch survived.
+    if (be_->kind() != BackendKind::CPU && be_->device_total_bytes() > 0) {
+        const size_t tot = be_->device_total_bytes();
+        const size_t fr = be_->device_free_bytes();
+        KRK_INFO("vram at start: %.0f MiB total, %.0f MiB free before this engine "
+                 "allocates (%.0f MiB already held by the driver/other processes)",
+                 static_cast<f64>(tot) / 1048576.0,
+                 static_cast<f64>(fr) / 1048576.0,
+                 static_cast<f64>(tot > fr ? tot - fr : 0) / 1048576.0);
+    }
 
-    auto alloc = [&](size_t bytes) { return be_->alloc(bytes); };
+    // Counted, not guessed: every workspace below goes through this lambda, and
+    // the ledger printed at the end of init needs their measured sum (see
+    // ws_bytes_). The alternative -- subtracting weights, KV, experts and free
+    // from the card -- is where the "scratch is ~3 GiB" inference came from.
+    ws_bytes_ = 0;
+    auto alloc = [&](size_t bytes) {
+        ws_bytes_ += bytes;
+        return be_->alloc(bytes);
+    };
     auto fail_alloc = [&](const char *name) {
         if (err)
             *err = std::string("backend allocation failed for ") + name +
@@ -651,6 +805,47 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     ws_rexp_ = alloc(static_cast<size_t>(C) * sizeof(i32));
     if (!check_alloc(ws_rexp_, "ws_rexp")) return false;
     be_->fill0(ws_rexp_, static_cast<size_t>(C) * sizeof(i32));
+    // QSA workspaces. The projections are per-token rows, so they are
+    // chunk-sized; the compact K/V pair is as long as the widest cell budget
+    // (`top_k + ratio - 1` cells) and is only touched past that budget.
+    if (qsa_active_) {
+        const i64 dim = qsa_dim_;
+        const i64 nh = qsa_heads_;
+        ws_qsa_k_ = alloc(static_cast<size_t>(C * dim) * as);
+        if (!check_alloc(ws_qsa_k_, "ws_qsa_k")) return false;
+        ws_qsa_q_ = alloc(static_cast<size_t>(C * nh * dim) * as);
+        if (!check_alloc(ws_qsa_q_, "ws_qsa_q")) return false;
+        i64 ncells = static_cast<i64>(qsa_top_k_) + qsa_ratio_max_ - 1;
+        ncells = std::min<i64>(ncells, kv_cap_);
+        if (ncells <= 0) ncells = 1;
+        ws_qsa_kc_ = alloc(static_cast<size_t>(ncells * kv_dim_) * as);
+        if (!check_alloc(ws_qsa_kc_, "ws_qsa_kc")) return false;
+        ws_qsa_vc_ = alloc(static_cast<size_t>(ncells * kv_dim_) * as);
+        if (!check_alloc(ws_qsa_vc_, "ws_qsa_vc")) return false;
+        qsa_state_.assign(static_cast<size_t>(mc.n_layer), QsaState{});
+        qsa_rows_.assign(static_cast<size_t>(C), std::vector<i64>{});
+        i64 idx_layers = 0;
+        i64 idx_bytes = 0;
+        for (i32 l = 0; l < mc.n_layer; l++) {
+            const auto &L = model_.layers()[static_cast<size_t>(l)];
+            if (L.qsa_ratio <= 0) continue;
+            QsaState &st = qsa_state_[static_cast<size_t>(l)];
+            st.keys.assign(static_cast<size_t>(kv_cap_ * dim), 0.0f);
+            st.pooled.assign(static_cast<size_t>(kv_cap_ / std::max(1, L.qsa_ratio) + 1) * dim,
+                             0.0f);
+            st.score.assign(static_cast<size_t>(C) *
+                                static_cast<size_t>(kv_cap_ / std::max(1, L.qsa_ratio) + 1),
+                            0.0f);
+            idx_layers++;
+            idx_bytes += static_cast<i64>(st.keys.size()) * 4;
+        }
+        if (idx_bytes > 0)
+            KRK_INFO("qsa indexer: %lld layer(s) keep their raw keys on the host "
+                     "(%lld MiB), %lld compact cells per row at the budget",
+                     static_cast<long long>(idx_layers),
+                     static_cast<long long>(idx_bytes >> 20),
+                     static_cast<long long>(ncells));
+    }
     ws_fexp_ = alloc(static_cast<size_t>(C) * sizeof(i32));
     if (!check_alloc(ws_fexp_, "ws_fexp")) return false;
     be_->fill0(ws_fexp_, static_cast<size_t>(C) * sizeof(i32));
@@ -701,6 +896,9 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                 return false;
             if (!halloc(ws_ple_val_, static_cast<size_t>(C * n_embd_) * as,
                         "ws_ple_val"))
+                return false;
+            if (!halloc(ws_ple_norm_, static_cast<size_t>(C * wide) * as,
+                        "ws_ple_norm"))
                 return false;
             if (!halloc(ws_ple_gate_, static_cast<size_t>(C * hc) * as,
                         "ws_ple_gate"))
@@ -812,6 +1010,21 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     if (!check_alloc(topk_scratch_, "topk_scratch")) return false;
     topk_out_ = alloc(16);
     if (!check_alloc(topk_out_, "topk_out")) return false;
+    ws_routerp_ = alloc(static_cast<size_t>(C) * static_cast<size_t>(mc.n_expert) * 4);
+    if (!check_alloc(ws_routerp_, "ws_routerp")) return false;
+    // The device selection and its plan. Allocated for every backend, exactly
+    // like ws_routerp_: "is this available" is a runtime question, and a
+    // separate allocation path with a null to forget is how a null gets used.
+    if (mc.is_moe && mc.n_expert > 0) {
+        const i32 kcap = std::min<i32>(mc.n_expert,
+                                      mc.n_expert_used > 0 ? mc.n_expert_used : 1);
+        ws_ids_ = alloc(static_cast<size_t>(C) * static_cast<size_t>(kcap) * 4);
+        if (!check_alloc(ws_ids_, "ws_ids")) return false;
+        ws_wts_ = alloc(static_cast<size_t>(C) * static_cast<size_t>(kcap) * 4);
+        if (!check_alloc(ws_wts_, "ws_wts")) return false;
+        ws_off_ = alloc((static_cast<size_t>(mc.n_expert) + 1) * 4);
+        if (!check_alloc(ws_off_, "ws_off")) return false;
+    }
     if (!logits_host_) return fail_alloc("host logits");
 
     if (mc.is_moe && mc.n_expert > 0) {
@@ -984,6 +1197,10 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         !require_alloc(ws_attn_, "ws_attn") || !require_alloc(ws_gate_, "ws_gate") ||
         !require_alloc(ws_up_, "ws_up") || !require_alloc(ws_logits_, "ws_logits") ||
         !require_alloc(topk_scratch_, "topk_scratch") || !require_alloc(topk_out_, "topk_out") ||
+        !require_alloc(ws_routerp_, "ws_routerp") ||
+        (mc.is_moe && (!require_alloc(ws_ids_, "ws_ids") ||
+                       !require_alloc(ws_wts_, "ws_wts") ||
+                       !require_alloc(ws_off_, "ws_off"))) ||
         (q_proj_ != q_dim_ && !require_alloc(ws_qpack_, "ws_qpack")) ||
         ((model_.is_recurrent() || mc.attn_gate) && !require_alloc(ws_agate_, "ws_agate")) ||
         (model_.had().active && !require_alloc(ws_had_, "ws_had")) ||
@@ -1080,6 +1297,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         }
         const size_t kv_total = kv_plane * 2u;
         kv_load_bytes = kv_total;
+        kv_bytes_ = kv_total;
 
         // Leave a reserve so a later allocation cannot wedge the driver. The
         // device is shared: the desktop compositor and any other app are
@@ -1283,6 +1501,17 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // one. See EngineConfig::expert_warmup for when it engages.
     if (expert_warmup_wanted()) warm_experts();
 
+    // ---- the hot ring, before the pool clamp below -------------------------
+    // The warmup fills WARM and lets traffic earn VRAM residency. That policy
+    // is right while the routed set fits and wrong when it does not: Tiel's
+    // 256 experts x 40 layers is 22.1 GiB against a 12-13 GiB pool, so the
+    // eviction scan never has a stable core -- a token promotes experts the
+    // next token's routing evicts. The ring is that core, pinned and charged
+    // to a budget the LRU window does not see. Running it BEFORE the clamp is
+    // what keeps the arithmetic honest: the clamp then sizes the pool from the
+    // bytes that are free once the ring has taken its own.
+    pin_hot_experts();
+
     // ---- the expert pool must not fill the card ---------------------------
     // Its budget is decided before the KV cache and before this engine's own
     // workspaces exist, so it can name every byte that was free at that moment
@@ -1306,7 +1535,11 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         const size_t total = be_->device_total_bytes();
         const size_t floor = krk::vram_floor_bytes(total);
         const size_t free_now = be_->device_free_bytes();
-        const size_t live = model_.experts().resident_bytes();
+        // Unpinned bytes only: the ring is already charged to pin_budget_, and
+        // counting it here would hand the pool room the pins are holding.
+        const size_t held = model_.experts().resident_bytes();
+        const size_t ring = model_.experts().pin_used_bytes();
+        const size_t live = held > ring ? held - ring : 0;
         const size_t room = free_now > floor ? free_now - floor : 0;
         const size_t cap = live + room;
         const size_t before = model_.experts().vram_budget();
@@ -1323,6 +1556,8 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                      static_cast<f64>(floor) / 1048576.0);
         }
     }
+
+    log_vram_ledger("after init");
 
     // A speculative round runs the block up to `--draft-tokens` times per
     // target forward, and the block is ONE layer, so its experts fit even when
@@ -1361,10 +1596,20 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         be_->sync();
         KRK_INFO("warmup pass: %.1f ms", w.ms());
     }
+
+    // LAST, and deliberately so: the warmup pass above promotes experts, and a
+    // promotion rewrites a slot's device pointers. A table published before it
+    // would name addresses the cache has already released.
+    publish_expert_table();
     return true;
 }
 
 void Engine::shutdown() {
+    // Before anything is released: the other half of the ledger. A workspace
+    // taken after init (a per-forward scratch, a promoted dense layer) moves
+    // `workspaces` or `unaccounted` here, which is what makes the two prints a
+    // measurement rather than a snapshot.
+    log_vram_ledger("at teardown");
     // The draft shares the backend; it must release its allocations before
     // this engine tears the backend's other buffers down.
     unload_dflash();
@@ -1375,10 +1620,40 @@ void Engine::shutdown() {
         return;
     }
     be_->sync();
+    // The device-softmax drift, if that arm ran: rows compared, elements that
+    // differ, and the largest probability difference. `--greedy` text is the
+    // real verdict, but a nonzero element count with identical text says the
+    // drift is below the decoder's resolution, which is a different (and much
+    // cheaper) answer than "it changed the model".
+    if (dp_rows_) {
+        KRK_INFO("device plan (KRK_DEV_PLAN=1): %llu layer(s) compared, "
+                 "%llu id(s) and %llu weight(s) differ from the host "
+                 "(%llu at one ulp), %llu layer(s) ran the device plan",
+                 static_cast<unsigned long long>(dp_rows_),
+                 static_cast<unsigned long long>(dp_sel_diff_),
+                 static_cast<unsigned long long>(dp_wt_diff_),
+                 static_cast<unsigned long long>(dp_wt_1ulp_),
+                 static_cast<unsigned long long>(dp_used_));
+    }
+    if (dp_launch_layers_) {
+        KRK_INFO("device dispatch (KRK_DEV_PTR=1): %llu layer(s) ran as one "
+                 "launch through the expert table, %llu fell back",
+                 static_cast<unsigned long long>(dp_launch_layers_),
+                 static_cast<unsigned long long>(dp_launch_skips_));
+    }
+    if (ds_rows_) {
+        KRK_INFO("router softmax drift (KRK_DEVICE_SOFTMAX=1): %llu row(s), "
+                 "%llu/%.0f element(s) differ, max |dP| %.3e",
+                 static_cast<unsigned long long>(ds_rows_),
+                 static_cast<unsigned long long>(ds_diff_),
+                 static_cast<f64>(ds_rows_) * static_cast<f64>(
+                     model_.cfg().n_expert),
+                 ds_max_);
+    }
     for (void **p : {&ws_x_, &ws_rexp_, &ws_fexp_, &ws_xn_, &ws_x2_, &ws_q_,
                      &ws_qpack_, &ws_k_,
                      &ws_v_, &ws_attn_, &ws_gate_, &ws_up_, &ws_had_, &ws_logits_,
-                     &ws_router_,
+                     &ws_router_, &ws_routerp_, &ws_ids_, &ws_wts_, &ws_off_,
                      &ws_ffn_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
                      &ws_scale_,
                      &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
@@ -1590,16 +1865,27 @@ void Engine::hc_enter(const f32 *norm_w, const QuantTensor &down,
     // weight vector per group, rows of `width` inside a token's block), which
     // is why the lane stack needs no norm kernel of its own.
     be_->rmsnorm_grouped(ws_hc_n_, ws_hc_, norm_w, n, hc, ne, wide, eps);
-    // The reference scales the down-projection's INPUT by 1/hc, before the
-    // silu: at lane width the bottleneck would otherwise be read hc times too
-    // hard, and the sigmoid after it makes that a different function, not a
-    // scaled one.
-    be_->scale_act(ws_hc_n_, 1.0f / static_cast<f32>(hc), n, wide, wide);
+    dump_row("hc.n", -1, ws_hc_n_, wide, n);
     be_->gemm(ws_hc_lo_, ws_hc_n_, down.data, down.type, hc_.low_rank, wide, n);
+    // The 1/hc scale belongs to the BOTTLENECK (the reference is
+    // `silu(scale(w_down @ xn, 1/hc))`), NOT to xn. Scaling xn instead is
+    // equivalent for lo -- a matmul is linear, so the factor commutes -- and
+    // wrong for the three other things xn feeds: the injection projection
+    // (`w_inject @ xn`, then divided by hc again in the combine), the mean
+    // inside hc_mix (which divides by hc itself), and so the whole block input.
+    // Every sub-block of every layer then ran on a 1/hc-scaled mix, which is
+    // the fault that survived the delta-net gate fix: fluent, evenly scaled
+    // garbage rather than a crash, and invisible to the lane-invariance test
+    // (a uniform factor keeps identical lanes identical).
+    be_->scale_act(ws_hc_lo_, 1.0f / static_cast<f32>(hc), n, hc_.low_rank,
+                   hc_.low_rank);
     be_->silu_act(ws_hc_lo_, static_cast<i64>(n) * hc_.low_rank);
     be_->gemm(ws_hc_g_, ws_hc_lo_, up.data, up.type, wide, hc_.low_rank, n);
+    dump_row("hc.g", -1, ws_hc_g_, wide, n);
     be_->gemm(ws_hc_inj_, ws_hc_n_, inject.data, inject.type, hc, wide, n);
+    dump_row("hc.inj", -1, ws_hc_inj_, hc, n);
     be_->hc_mix(ws_hc_mix_, ws_hc_n_, ws_hc_g_, n, hc, ne);
+    dump_row("hc.mix", -1, ws_hc_mix_, ne, n);
     // The block reads the mixed row (ws_xn_, which every projection below
     // consumes) and accumulates onto a copy of it in ws_x_.
     be_->copy_act(ws_xn_, ws_hc_mix_, static_cast<i64>(n) * ne);
@@ -1630,8 +1916,12 @@ void Engine::hc_head_mix(i32 row, const f32 *norm_w, const QuantTensor &down,
     const void *lanes = act_at(ws_hc_, as, static_cast<i64>(row) * wide);
     be_->rmsnorm_grouped(ws_hc_n_, lanes, norm_w, 1, hc, ne, wide,
                          model_.cfg().rms_eps);
-    be_->scale_act(ws_hc_n_, 1.0f / static_cast<f32>(hc), 1, wide, wide);
     be_->gemm(ws_hc_lo_, ws_hc_n_, down.data, down.type, hc_.low_rank, wide, 1);
+    // Same rule as hc_enter: the 1/hc belongs to the bottleneck. The head mixer
+    // has no injection, so only the mix's own mean is at stake here -- it is
+    // still a factor of hc on the row the output head reads.
+    be_->scale_act(ws_hc_lo_, 1.0f / static_cast<f32>(hc), 1, hc_.low_rank,
+                   hc_.low_rank);
     be_->silu_act(ws_hc_lo_, hc_.low_rank);
     be_->gemm(ws_hc_g_, ws_hc_lo_, up.data, up.type, wide, hc_.low_rank, 1);
     be_->hc_mix(ws_xn_, ws_hc_n_, ws_hc_g_, 1, hc, ne);
@@ -1710,7 +2000,11 @@ void Engine::ple_block(const LayerWeights &L, i32 l, i32 n, i64 pos0) {
                          wide, eps);
     be_->rmsnorm_grouped(ws_ple_qry_, ws_hc_, L.ple_norm_query, n, hc, ne, wide,
                          eps);
-    dump_row("ple.emb", l, ws_ple_emb_, wide, n);
+    // `ne`, not `wide`: the gathered embedding is ONE lane wide (ple_key widens
+    // it), and dumping it at `wide` read 4x past the buffer -- garbage in the
+    // trace, and with --chunk 1 an out-of-bounds download that failed the
+    // hipMemcpy (hipErrorInvalidValue) on the first PLE layer.
+    dump_row("ple.emb", l, ws_ple_emb_, ne, n);
     dump_row("ple.key", l, ws_ple_key_, wide, n);
     dump_row("ple.qry", l, ws_ple_qry_, wide, n);
     be_->ple_gate(ws_ple_gate_, ws_ple_key_, ws_ple_qry_, n, hc, ne);
@@ -1719,22 +2013,31 @@ void Engine::ple_block(const LayerWeights &L, i32 l, i32 n, i64 pos0) {
     // that lane's whole row, which is what makes the gate per-lane rather than
     // per-element.
     be_->lane_bcast_mul(ws_ple_gated_, ws_ple_val_, ws_ple_gate_, n, hc, ne);
-    be_->rmsnorm_grouped(ws_ple_gated_, ws_ple_gated_, L.ple_norm_conv, n, hc,
+    // The lane norm feeds the CONV and nothing else: the reference is
+    // `hidden + gated + silu(conv(grouped_norm(gated)))`, where `gated` is the
+    // raw `value * gate` and a separate tensor carries the normalized copy.
+    // Normalizing in place put a per-lane unit-RMS row on the residual instead
+    // of `value * gate`, which is the FIRST divergence measured against
+    // src/models/qwen4exp.cpp on the REAP-288 file: at layer 1, token 0, the
+    // reference lane stack (normalized through hc_attn_norm) scores corr 0.373
+    // against the old dump and 0.9999 recomputed with this split.
+    be_->rmsnorm_grouped(ws_ple_norm_, ws_ple_gated_, L.ple_norm_conv, n, hc,
                          ne, wide, eps);
 
     // The conv window: this layer's history, then this pass's rows.
     if (ple_hist_ > 0) {
         void *state = act_at(ple_state_, as, static_cast<i64>(l) * ple_hist_ * wide);
         be_->copy_act(ws_ple_pad_, state, ple_hist_ * wide);
-        be_->copy_act(act_at(ws_ple_pad_, as, ple_hist_ * wide), ws_ple_gated_,
+        be_->copy_act(act_at(ws_ple_pad_, as, ple_hist_ * wide), ws_ple_norm_,
                       static_cast<i64>(n) * wide);
         // The tail of the window is this layer's history for the next pass.
         be_->copy_act(state, act_at(ws_ple_pad_, as, static_cast<i64>(n) * wide),
                       ple_hist_ * wide);
     } else {
-        be_->copy_act(ws_ple_pad_, ws_ple_gated_, static_cast<i64>(n) * wide);
+        be_->copy_act(ws_ple_pad_, ws_ple_norm_, static_cast<i64>(n) * wide);
     }
     dump_row("ple.gated", l, ws_ple_gated_, wide, n);
+    dump_row("ple.convin", l, ws_ple_norm_, wide, n);
     be_->conv1d_dw(ws_ple_conv_, ws_ple_pad_, L.ple_conv1d.data, n, wide,
                    ple_.conv_kernel, ple_.ngram);
     be_->silu_act(ws_ple_conv_, static_cast<i64>(n) * wide);
@@ -1744,6 +2047,151 @@ void Engine::ple_block(const LayerWeights &L, i32 l, i32 n, i64 pos0) {
     be_->add_inplace(ws_hc_, ws_ple_conv_, static_cast<i64>(n) * wide);
 }
 
+// ---------------------------------------------------------------------------
+// qwen4exp QSA indexer
+// ---------------------------------------------------------------------------
+
+bool Engine::qsa_select_block(const LayerWeights &L, i32 l, i32 n, i64 pos0,
+                              const void *xn) {
+    if (!qsa_active_ || L.qsa_ratio <= 0 || !xn) return false;
+    if (l < 0 || l >= static_cast<i32>(qsa_state_.size())) return false;
+    // `qsa_rows_` is this PASS's cell list per ROW, so the bound is the row
+    // count and not the layer index. Testing `l` here read as a live check and
+    // was one at the default chunk only by luck: at `--chunk 1` the buffer holds
+    // one row, so layer 1 refused and the indexer never ran -- the layer fell
+    // back to dense attention over the whole cache, silently, which is exactly
+    // the cost the indexer exists to avoid.
+    if (n > static_cast<i32>(qsa_rows_.size())) return false;
+    const ModelConfig &mc = model_.cfg();
+    QsaState &st = qsa_state_[static_cast<size_t>(l)];
+    const i32 dim = qsa_dim_;
+    const i32 nh = qsa_heads_;
+    const i32 r = L.qsa_ratio;
+    const i64 n_kv = pos0 + n;
+    if (dim <= 0 || nh <= 0 || n <= 0) return false;
+    if (n_kv * dim > static_cast<i64>(st.keys.size())) return false;
+    if (L.idx_q_norm_h.empty() || L.idx_k_norm_h.empty()) return false;
+
+    // The indexer's own projections, off the same normed input q/k/v read. They
+    // are independent of q/k/v (no dependency between the three), so this is a
+    // group of five where the backend can express it and five launches where it
+    // cannot.
+    be_->gemm(ws_qsa_k_, xn, L.idx_k_proj.data, L.idx_k_proj.type, dim, n_embd_, n);
+    be_->gemm(ws_qsa_q_, xn, L.idx_q_proj.data, L.idx_q_proj.type,
+              static_cast<i64>(nh) * dim, n_embd_, n);
+    // RAW keys onto the host: pooling precedes norm and rotation on this
+    // family, so the raw projection output is what has to be kept per position.
+    qsa_k_.resize(static_cast<size_t>(n) * dim);
+    be_->download_f32(qsa_k_.data(), ws_qsa_k_, static_cast<i64>(n) * dim);
+    std::memcpy(st.keys.data() + pos0 * dim, qsa_k_.data(),
+                sizeof(f32) * static_cast<size_t>(n) * dim);
+
+    // Past this point nothing is dropped, so the whole selection can be skipped:
+    // every visible cell fits in the budget and the layer runs dense causal
+    // attention, exactly as the reference does below `top_k + ratio - 1`.
+    const i64 budget = static_cast<i64>(qsa_top_k_) + r - 1;
+    if (n_kv <= budget) {
+        qsa_last_.clear();
+        return false;
+    }
+
+    QsaConfig cfg;
+    cfg.n_head = nh;
+    cfg.head_dim = dim;
+    cfg.top_k = qsa_top_k_;
+    cfg.ratio = r;
+    cfg.eps = qsa_eps_;
+    cfg.n_rot = mc.rope_dim > 0 ? mc.rope_dim : 0;
+    cfg.inv_freq = model_.inv_freq_at(l).empty() ? nullptr
+                                                : model_.inv_freq_at(l).data();
+    cfg.rope_scale = mc.rope_scale;
+    cfg.rope_neox = mc.rope_neox;
+
+    const i32 n_blocks =
+        qsa_pool(st.pooled.data(), st.keys.data(), dim, static_cast<i32>(n_kv), r);
+    if (n_blocks > 0) {
+        // A block is rotated at its FIRST position: pooling averages cells that
+        // sit at different positions, and the reference rotates the pooled row
+        // once, at the block's start.
+        std::vector<i64> bpos(static_cast<size_t>(n_blocks));
+        for (i32 b = 0; b < n_blocks; b++) bpos[static_cast<size_t>(b)] = static_cast<i64>(b) * r;
+        qsa_norm_rope(st.pooled.data(), L.idx_k_norm_h.data(), n_blocks, dim,
+                      bpos.data(), cfg);
+    }
+    qsa_q_.resize(static_cast<size_t>(n) * nh * dim);
+    be_->download_f32(qsa_q_.data(), ws_qsa_q_, static_cast<i64>(n) * nh * dim);
+    {
+        std::vector<i64> qpos(static_cast<size_t>(n) * nh);
+        for (i32 t = 0; t < n; t++)
+            for (i32 h = 0; h < nh; h++)
+                qpos[static_cast<size_t>(t) * nh + h] = pos0 + t;
+        qsa_norm_rope(qsa_q_.data(), L.idx_q_norm_h.data(), n * nh, dim,
+                      qpos.data(), cfg);
+    }
+    if (n_blocks > 0)
+        qsa_scores(st.score.data(), qsa_q_.data(), st.pooled.data(), n, nh,
+                   n_blocks, dim);
+
+    bool any_sel = false;
+    for (i32 t = 0; t < n; t++) {
+        const i64 q = pos0 + t;
+        qsa_select(&qsa_rows_[static_cast<size_t>(t)],
+                   n_blocks > 0 ? st.score.data() + static_cast<i64>(t) * n_blocks
+                                : nullptr,
+                   n_blocks, static_cast<i32>(n_kv), q, cfg);
+        if (static_cast<i64>(qsa_rows_[static_cast<size_t>(t)].size()) < q + 1)
+            any_sel = true;
+    }
+    qsa_last_ = qsa_rows_[static_cast<size_t>(n - 1)];
+    return any_sel;
+}
+
+void Engine::qsa_attention(i32 l, i32 n, const AttnDesc &d) {
+    const size_t as = be_->act_size();
+    const size_t row_bytes = static_cast<size_t>(kv_dim_) * as;
+    const void *kbase = kvt_k_.base(l);
+    const void *vbase = kvt_v_.base(l);
+    if (!kbase || !vbase || !ws_qsa_kc_) return;
+    // One call per query row over that row's own compact cells. `causal` with
+    // pos0 = cells-1 makes the kernel read exactly that many keys and no window,
+    // and every gathered cell is at or before the query's position, so the
+    // dense causal kernel over the compact list IS the masked attention the
+    // reference builds -- without a mask to carry through the kernel.
+    AttnDesc d1 = d;
+    d1.n_tok = 1;
+    d1.causal = true;
+    d1.window = 0;
+    d1.layer = 0;
+    d1.layer_stride = 0;
+    for (i32 t = 0; t < n; t++) {
+        const std::vector<i64> &cells = qsa_rows_[static_cast<size_t>(t)];
+        if (cells.empty()) continue;
+        be_->gather_rows(ws_qsa_kc_, kbase, cells.data(),
+                         static_cast<i64>(cells.size()), row_bytes);
+        be_->gather_rows(ws_qsa_vc_, vbase, cells.data(),
+                         static_cast<i64>(cells.size()), row_bytes);
+        d1.pos0 = static_cast<i64>(cells.size()) - 1;
+        be_->attention(act_at(ws_attn_, as, static_cast<i64>(t) * q_dim_),
+                       act_at(ws_q_, as, static_cast<i64>(t) * q_dim_),
+                       ws_qsa_kc_, ws_qsa_vc_, d1);
+    }
+}
+
+const std::vector<i64> &Engine::qsa_debug_cells(i32 layer) const {
+    static const std::vector<i64> none;
+    if (!qsa_active_ || layer < 0) return none;
+    const auto &L = model_.layers();
+    if (layer >= static_cast<i32>(L.size())) return none;
+    if (L[static_cast<size_t>(layer)].qsa_ratio <= 0) return none;
+    return qsa_last_;
+}
+
+i32 Engine::qsa_debug_ratio(i32 layer) const {
+    const auto &L = model_.layers();
+    if (layer < 0 || layer >= static_cast<i32>(L.size())) return 0;
+    return L[static_cast<size_t>(layer)].qsa_ratio;
+}
+
 const i64 *Engine::ple_debug_rows(i32 *n_tok, i32 *n_heads) const {
     if (n_tok) *n_tok = 0;
     if (n_heads) *n_heads = 0;
@@ -1751,6 +2199,20 @@ const i64 *Engine::ple_debug_rows(i32 *n_tok, i32 *n_heads) const {
     if (n_heads) *n_heads = ple_.n_heads();
     if (n_tok) *n_tok = ple_rows_n_;
     return ple_rows_.data();
+}
+
+const f32 *Engine::ple_debug_terms(f32 **conv_in, f32 **conv_out,
+                                  i64 *n_tok) const {
+    if (conv_in) *conv_in = nullptr;
+    if (conv_out) *conv_out = nullptr;
+    if (n_tok) *n_tok = 0;
+    // Same reason as hc_debug_lanes: these live in device memory on a GPU.
+    if (!ple_active_ || !ws_ple_gated_ || be_->act_size() != sizeof(f32))
+        return nullptr;
+    if (conv_in) *conv_in = static_cast<f32 *>(ws_ple_norm_);
+    if (conv_out) *conv_out = static_cast<f32 *>(ws_ple_conv_);
+    if (n_tok) *n_tok = ple_rows_n_;
+    return static_cast<const f32 *>(ws_ple_gated_);
 }
 
 void Engine::head_compute(i32 row) {
@@ -1778,6 +2240,16 @@ void Engine::head_compute(i32 row) {
 }
 
 bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
+    {
+        // See the KRK_VRAM_TRACE block at the end of this function: entry and
+        // exit readings bracket the forward, which is what tells a bound inside
+        // it apart from one the caller took before calling.
+        static const bool trace_vram = [] {
+            const char *e = std::getenv("KRK_VRAM_TRACE");
+            return e && *e && e[0] != '0';
+        }();
+        if (trace_vram && n > 1) log_vram_ledger("before prefill");
+    }
     const ModelConfig &mc = model_.cfg();
     const auto &layers = model_.layers();
     const QuantTensor &embd = model_.tok_embd();
@@ -2021,6 +2493,14 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         if (L.q_bias) be_->add_bias_rows(ws_q_, L.q_bias, lq, n);
         if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, lkv, n);
         if (L.v_bias) be_->add_bias_rows(ws_v_, L.v_bias, lkv, n);
+        // QSA: the indexer's own projections and its block selection, computed
+        // from the same normed input q/k/v read and BEFORE rope touches
+        // anything (the indexer rotates pooled keys and its own queries, not
+        // these). True means some visible cell was dropped and this layer must
+        // attend over the selection instead of the whole cache.
+        const bool qsa_sel =
+            qsa_active_ && L.qsa_ratio > 0 &&
+            qsa_select_block(L, l, n, pos0, xn_proj);
 
         d.layer = l;
         // Resolve this layer's residency before it is read or written.
@@ -2073,6 +2553,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             return !(e && e[0] == '0');
         }();
         if (!(n == 1 && !packed_gate && d.window == 0 && !mc.attn_gate &&
+              !qsa_sel &&
               (fused_neox || !(mc.rope_neox && mc.qk_norm)) &&
               be_->attn_fused_chain(ws_attn_, ws_q_, kbase, vbase,
                                       ws_k_, ws_v_, d,
@@ -2099,7 +2580,10 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                       n, pos0, model_.inv_freq_at(l).data(), mc.rope_scale,
                       model_.rope_frac_at(l), mc.rope_neox);
             be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
-            be_->attention(ws_attn_, ws_q_, kbase, vbase, d);
+            if (qsa_sel)
+                qsa_attention(l, n, d);
+            else
+                be_->attention(ws_attn_, ws_q_, kbase, vbase, d);
         }
         // The layer's KV is now queued. Mark the slot so a later layer that
         // evicts it waits for these kernels instead of overwriting memory they
@@ -2818,6 +3302,25 @@ bool Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
     if (!forward_core(toks, n, pos0, want_logits ? LogitsLast : LogitsNone))
         return false;
     kv_pos_ = std::max<i64>(kv_pos_, static_cast<i64>(pos0) + n);
+    // The KV tier promotes rows as the context grows, so the pool's budget is
+    // re-derived from a live reading: every prefill, and every 16 decode rows
+    // (a hipMemGetInfo is a query; sampling it 40 times a token would be a
+    // different thing). See reclamp_expert_budget.
+    if (n > 1 || (++reclamp_tick_ % 16u) == 0)
+        reclamp_expert_budget(n > 1 ? "prefill" : "decode");
+    // KRK_VRAM_TRACE=1 prints the ledger after every forward with more than one
+    // row. The re-clamp above can only fire on a live reading, so when it does
+    // fire the question is always "which allocation took the bytes between the
+    // init ledger and here", and one print per forward answers it without a
+    // profiler. Off by default: two hipMemGetInfo calls per step is exactly the
+    // kind of query that must not sit in a decode loop.
+    {
+        static const bool trace_vram = [] {
+            const char *e = std::getenv("KRK_VRAM_TRACE");
+            return e && *e && e[0] != '0';
+        }();
+        if (trace_vram && n > 1) log_vram_ledger("after prefill");
+    }
     return true;
 }
 
@@ -4211,10 +4714,29 @@ void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
     dump_row("gdn.delta", l, ws_h_, vdim, n);
 
     // 6. Gated normalization: a plain RMSNorm per head (its weight is stored
-    //    verbatim, not zero-centred) then the silu(z) gate.
+    //    verbatim, not zero-centred) then the output gate.
+    //
+    //    THE GATE IS NOT THE SAME FUNCTION IN BOTH FAMILIES. Qwen3.5's
+    //    `build_norm_gated` is `norm(x) * silu(z)`; qwen4exp's is
+    //    `norm(x) * sigmoid(z)` -- llama.cpp's qwen4exp graph says so in one
+    //    line ("the one numerical difference from Qwen3.5's GDN: sigmoid output
+    //    gate, not silu"). The tensor list is identical, so nothing in the file
+    //    distinguishes them: `ModelConfig::gdn_gate_sigmoid` carries the
+    //    family's answer from the arch table, and KRK_GDN_GATE is the A/B arm
+    //    (0 restores silu) that proves this line is what the graph reads.
     be_->rmsnorm(ws_h_, ws_h_, L.ssm_norm, static_cast<i64>(n) * mc.ssm_dt_rank,
                  mc.ssm_d_state, mc.rms_eps);
-    be_->silu_mul(ws_h_, ws_z_, ws_h_, static_cast<i64>(n) * vdim);
+    dump_row("gdn.norm", l, ws_h_, vdim, n);
+    //    gdn_gate_ is -1 unless KRK_GDN_GATE forced an arm (read in init), so
+    //    the family's answer is the default and the A/B is one variable away.
+    const bool sigmoid_gate = gdn_gate_ >= 0 ? gdn_gate_ == 1 : mc.gdn_gate_sigmoid;
+    if (sigmoid_gate) {
+        be_->sigmoid_act(ws_z_, static_cast<i64>(n) * vdim);
+        be_->mul_act(ws_h_, ws_z_, static_cast<i64>(n) * vdim);
+    } else {
+        be_->silu_mul(ws_h_, ws_z_, ws_h_, static_cast<i64>(n) * vdim);
+    }
+    dump_row("gdn.gated", l, ws_h_, vdim, n);
 
     // 7. Output projection and the residual. ssm_out is folded, and its input
     //    carries the grouped-V permutation ahead of the signs -- the delta-rule
@@ -4511,6 +5033,264 @@ bool Engine::expert_warmup_wanted() const {
 // probability mass and leave the rest with nothing, which is strictly worse
 // than giving every layer its own top 80%. So the rank is read one expert deep
 // at a time: round r is every layer's r-th hottest expert.
+// ---- the hot ring ----------------------------------------------------------
+//
+// WARM is pageable host RAM and holds tens of GiB; VRAM holds the few hundred
+// MiB to few GiB that routing asks for most often. Without a ring those bytes
+// are won and lost by the LRU scan every token, because the routed set is
+// larger than the pool: on Tiel-Coder-35B-A3B (256 experts, top-8, 40 layers,
+// 22.1 GiB routed) the pool is 12-13 GiB, so the pinned prefix that traffic
+// earns ends up being most of the pool and everything else churns in the rest.
+// The ring makes the index's ranked prefix a guaranteed hit and hands the
+// pool's whole budget back to the experts that still have to earn it.
+//
+// The size is measured, not planned: it runs after the warmup (so VRAM traffic
+// is a fact) and before the pool clamp (so the clamp can subtract it). Half of
+// the room beside the floor is the default, because the other half is the
+// pool's growth room and a pool with none is the measured pathological arm
+// (alloc 30 ms per 2.2 MiB cell, 3.1 tok/s on the same file).
+void Engine::pin_hot_experts() {
+    if (!be_ || be_->kind() == BackendKind::CPU) return;
+    const ModelConfig &mc = model_.cfg();
+    if (!mc.is_moe || mc.n_expert <= 0 || mc.n_layer <= 0) return;
+    ExpertCache &ec = model_.experts();
+    if (ec.vram_budget() == 0) return; // no device tier: nothing to protect
+    // OFF by default, and that is a correctness decision, not a tuning one.
+    // With a ring the pool sits exactly at its budget and every promotion
+    // evicts, which drives the pooled allocator's async order hard enough to
+    // hit a real defect: a 1024-token decode on Tiel-Coder-35B-A3B dies at
+    // token ~48 with `HIP call failed (hipErrorLaunchFailure):
+    // hipMemcpyAsync(d + off, paged_buf_[slot], ...)` -- with a 2174 MiB ring
+    // and with a 512 MiB one, clean with the ring off, clean when the engine is
+    // serialized (AMD_SERIALIZE_KERNEL=3, which also hides it), and still
+    // failing with KRK_PROMOTE_WAIT=host, so it is not the publish wait. The
+    // ring's prefill win (+10.8%) is not worth a crash, so it is opt-in until
+    // the pool's release/reuse path is fixed: KRK_EXPERT_PIN_MB=<n> (or
+    // KRK_EXPERT_PIN=1 for the default size) turns it on.
+    const char *on = std::getenv("KRK_EXPERT_PIN");
+    const char *mb = std::getenv("KRK_EXPERT_PIN_MB");
+    const bool forced = on && on[0] == '1' && on[1] == '\0';
+    const bool sized = mb && std::atoll(mb) > 0;
+    if (!forced && !sized) {
+        KRK_INFO("expert cache: hot ring off (opt-in: KRK_EXPERT_PIN_MB=<n>, "
+                 "or KRK_EXPERT_PIN=1) -- it measured +10.8%% prefill but "
+                 "crashes a long decode in the pool's async reuse path");
+        return;
+    }
+    const size_t total = be_->device_total_bytes();
+    if (total == 0) return;
+    // A share of the CARD, not of whatever is free this instant: the warmup has
+    // just filled VRAM to its reserve, so "free beside the floor" is routinely
+    // zero by the time this runs (measured: the same command admitted a 5325 MiB
+    // ring on one run and skipped it on the next, depending on whether the
+    // warmup reached its VRAM stage or its time ceiling). The ring's target is
+    // a property of the machine and the pool, and admit_hot() makes the room by
+    // evicting unpinned slots -- those experts are in WARM, so the move is a
+    // promotion, never a file read.
+    const size_t floor = krk::vram_floor_bytes(total);
+    const size_t usable = total > floor ? total - floor : 0;
+    // Measured on Tiel-Coder-35B-A3B (256 experts, 40 layers, routed 22.1 GiB,
+    // 7682 MiB of device expert memory, --bench -n 64, interleaved pairs):
+    // a 4350 MiB ring (1/3 of the usable card) bought +5.5% prefill and COST
+    // 7.8% decode, 5/5 pairs -- the pin displaced pool slots the LFU order
+    // ranked better. A 2048 MiB ring measured +5.5% prefill and -0.6% decode
+    // (inside noise), so 1/6 is the size the evidence supports; the pool keeps
+    // the rest, which is what the decode side lives on.
+    size_t want = usable / 6;
+    // Never more than the pool it is meant to sit beside: a ring larger than
+    // the traffic's own budget is pins the run has no evidence for.
+    if (want > ec.vram_budget()) want = ec.vram_budget();
+    if (sized) {
+        const long long v = std::atoll(mb);
+        if (v > 0) {
+            const size_t req = static_cast<size_t>(v) * 1048576ULL;
+            want = req < usable ? req : usable;
+        }
+    }
+    std::vector<std::pair<i32, i32>> order = load_expert_index();
+    if (order.empty()) {
+        // An even order is not a hot set: pinning expert 0 of every layer is
+        // the same guess the unranked warmup makes, and a wrong pin cannot be
+        // evicted. The ring is for a measured ranking or nothing.
+        KRK_INFO("expert cache: hot ring skipped: no usable "
+                 "<model>.krakenexperts.json -- run --expert-scan to rank the "
+                 "experts first");
+        return;
+    }
+    std::vector<const ExpertSource *> srcs(static_cast<size_t>(mc.n_layer),
+                                           nullptr);
+    i32 moe_layers = 0;
+    for (i32 l = 0; l < mc.n_layer; l++) {
+        const LayerWeights &L = model_.layers()[static_cast<size_t>(l)];
+        if (!L.experts.present()) continue;
+        srcs[static_cast<size_t>(l)] = &L.experts;
+        moe_layers++;
+    }
+    if (moe_layers == 0) return;
+    ec.set_pin_budget(want);
+    const size_t got = ec.admit_hot(srcs.data(), mc.n_layer, order, 0);
+    if (got == 0) {
+        ec.set_pin_budget(0);
+        KRK_INFO("expert cache: hot ring admitted nothing of a %.0f MiB ring "
+                 "-- leaving every pin on the pool's budget",
+                 static_cast<f64>(want) / 1048576.0);
+    }
+}
+
+// ---- the VRAM ledger ----------------------------------------------------
+// total = weights + kv + experts + workspaces + free + unaccounted, every term
+// measured. `unaccounted` is the check on the ledger: a buffer taken outside
+// init's `alloc` lambda (or held by the driver and other processes) lands there
+// instead of being folded into `free`, and it is the only number that can say
+// so. It replaced an INFERENCE -- "scratch is ~3.0 GiB" by subtracting four
+// numbers from the card -- that was wrong by more than 30x: the measured
+// workspace total on this build is 88 MiB at ctx 4096.
+void Engine::log_vram_ledger(const char *when) {
+    if (!be_ || be_->kind() == BackendKind::CPU ||
+        be_->device_total_bytes() == 0)
+        return;
+    const size_t weights = model_.upload_bytes();
+    const Backend::ExpertPoolStats ps = be_->expert_pool_stats();
+    const size_t ring = model_.experts().pin_used_bytes();
+    const size_t total = be_->device_total_bytes();
+    const size_t free_now = be_->device_free_bytes();
+    // ps.budget is a PLAN, and with no expert pool configured the backend
+    // leaves it at its sentinel -- printed verbatim that read "budget
+    // 17592186044416" (2^44) on a dense model, which is a number no reader can
+    // use. Anything larger than the card is "no pool".
+    const size_t pool_budget = ps.budget <= total ? ps.budget : 0;
+    const size_t known = weights + kv_bytes_ + ps.committed + ws_bytes_;
+    const size_t used = known < total ? total - known : 0;
+    const size_t unaccounted = used > free_now ? used - free_now : 0;
+    // The allocator's own total, which is the only number here that does not
+    // come from a device-wide probe. `live_alloc` above the ledger's `known`
+    // means this engine is holding bytes the ledger does not name -- a buffer
+    // taken outside init's `alloc` lambda, or a pool cell counted under the
+    // wrong owner -- and live_alloc BELOW it means something is counted twice.
+    // Both used to land silently in `unaccounted`, which read as "the driver is
+    // holding 7 GiB" when the truth was an allocation nobody tracked.
+    const size_t live_alloc = be_->device_live_bytes();
+    KRK_INFO("vram ledger (%s): %.0f MiB total = weights %.0f + kv %.0f + "
+             "experts %.0f (pool %.0f + ring %.0f; live %.0f, reusable %.0f, "
+             "budget %.0f) + workspaces %.0f + free %.0f + unaccounted %.0f "
+             "[allocator live %.0f in %.0f buffers, largest %.0f]",
+             when, static_cast<f64>(total) / 1048576.0,
+             static_cast<f64>(weights) / 1048576.0,
+             static_cast<f64>(kv_bytes_) / 1048576.0,
+             static_cast<f64>(ps.committed) / 1048576.0,
+             static_cast<f64>(ps.committed > ring ? ps.committed - ring : 0) /
+                 1048576.0,
+             static_cast<f64>(ring) / 1048576.0,
+             static_cast<f64>(ps.live) / 1048576.0,
+             static_cast<f64>(ps.reusable) / 1048576.0,
+             static_cast<f64>(pool_budget) / 1048576.0,
+             static_cast<f64>(ws_bytes_) / 1048576.0,
+             static_cast<f64>(free_now) / 1048576.0,
+             static_cast<f64>(unaccounted) / 1048576.0,
+             static_cast<f64>(live_alloc) / 1048576.0,
+             static_cast<f64>(be_->device_alloc_count()),
+             static_cast<f64>(be_->device_largest_alloc()) / 1048576.0);
+}
+
+// ---- the device dispatch table ---------------------------------------------
+//
+// Published once, at the end of init, and only when the cache can keep the
+// promise the table makes: every (layer, expert) of the routed set is in VRAM,
+// so no promotion or eviction can rewrite a device pointer while a kernel is
+// reading it. Anything short of that publishes nothing and says so -- the arm
+// then never engages, which is a slower run, not a different model.
+void Engine::publish_expert_table() {
+    dev_table_ = nullptr;
+    if (!dev_ptr()) return;
+    const ModelConfig &mc = model_.cfg();
+    if (!mc.is_moe || mc.n_expert <= 0 || mc.n_layer <= 0) return;
+    if (!be_->moe_dispatch_supported()) {
+        KRK_INFO("device dispatch: off -- this backend has no table dispatch");
+        return;
+    }
+    i32 filled = 0;
+    std::string why;
+    void *t = model_.experts().publish_dispatch_table(mc.n_layer, mc.n_expert,
+                                                      &filled, &why);
+    if (!t) {
+        // Once, not once per attempt: this is retried from moe_ffn while the
+        // cache fills, and a line per layer would drown the log.
+        if (!table_why_logged_) {
+            table_why_logged_ = true;
+            KRK_INFO("device dispatch: not yet -- %s (retrying while the tiers "
+                     "fill)",
+                     why.c_str());
+        }
+        return;
+    }
+    dev_table_ = t;
+    KRK_INFO("device dispatch: table published (%d entries x 3 matrices, %.1f "
+             "MiB): KRK_DEV_PTR=1 routes without a host pointer per expert",
+             filled, static_cast<f64>(filled) *
+                          static_cast<f64>(sizeof(MoeDispatchEntry)) / 1048576.0);
+}
+
+// ---- re-clamp: the budget follows the VRAM that is actually free -------------
+//
+// The init-time clamp is one measurement, taken before the run. Two things then
+// take VRAM away from it: the KV tier promotes COLD->HOT rows as the context
+// grows (the report prints `kv tiered: promoted WARM->HOT n`), and the workspaces
+// a long prefill touches are not the ones a decode step touches. A budget named
+// from the init measurement therefore describes a card that no longer exists --
+// the pathological arm AGENTS.md measured is exactly this, at 30 ms per pool
+// cell and 3.1 tok/s. This is the same arithmetic, re-run against a live
+// reading, and it only ever lowers: growth has to go through the ring, which
+// names what it is for.
+void Engine::reclamp_expert_budget(const char *why) {
+    if (!be_ || be_->kind() == BackendKind::CPU) return;
+    // KRK_RECLAMP=0 is the A/B arm. It exists because this clamp is the one
+    // place a run's residency can be cut on a measurement taken while the pool
+    // itself was growing, and a budget cut cannot be undone (`reclamp_` only
+    // lowers): a wrong verdict here costs the whole run, and it cannot be told
+    // apart from a right one without an arm that turns it off.
+    {
+        static const bool on = [] {
+            const char *e = std::getenv("KRK_RECLAMP");
+            return !(e && e[0] == '0');
+        }();
+        if (!on) return;
+    }
+    ExpertCache &ec = model_.experts();
+    if (ec.vram_budget() == 0 || ec.resident_bytes() == 0) return;
+    const size_t total = be_->device_total_bytes();
+    if (total == 0) return;
+    // Shrink only on a real shrink: a driver query's value moves by a few MiB
+    // on its own, and a budget that chases it re-plans the cache every step.
+    const size_t floor = krk::vram_floor_bytes(total);
+    const size_t free_now = be_->device_free_bytes();
+    const size_t before = ec.vram_budget();
+    {
+        const char *e = std::getenv("KRK_VRAM_TRACE");
+        if (e && *e && e[0] != '0') {
+            KRK_INFO("vram trace (%s): free %.0f MiB, floor %.0f MiB, budget "
+                     "%.0f MiB, resident %.0f MiB, unallocated allowance %.0f MiB",
+                     why ? why : "a forward",
+                     static_cast<f64>(free_now) / 1048576.0,
+                     static_cast<f64>(floor) / 1048576.0,
+                     static_cast<f64>(before) / 1048576.0,
+                     static_cast<f64>(ec.resident_bytes()) / 1048576.0,
+                     static_cast<f64>(before > ec.resident_bytes()
+                                          ? before - ec.resident_bytes()
+                                          : 0) / 1048576.0);
+        }
+    }
+    const size_t after = ec.reclamp_vram_budget(free_now, floor);
+    if (after >= before) return; // the arithmetic lives in ExpertCache, so the
+                                 // suite can drive it without a device
+    KRK_INFO("expert cache: re-clamped %.0f -> %.0f MiB at %s (%.0f MiB free "
+             "beside a %.0f MiB floor) -- the budget planned at init names bytes "
+             "the KV tier has since taken",
+             static_cast<f64>(before) / 1048576.0,
+             static_cast<f64>(after) / 1048576.0, why ? why : "a forward",
+             static_cast<f64>(free_now) / 1048576.0,
+             static_cast<f64>(floor) / 1048576.0);
+}
+
 std::vector<std::pair<i32, i32>> Engine::load_expert_index() const {
     std::vector<std::pair<i32, i32>> out;
     const ModelConfig &mc = model_.cfg();
@@ -5164,7 +5944,17 @@ static bool moe_group() {
 static bool lookahead_stage() {
     static const bool v = [] {
         const char *e = std::getenv("KRK_MOE_LOOKAHEAD");
-        return e && e[0] != '0' && e[0] != 0;
+        // Opt-in, because on the shape it was written for it measured a small
+        // LOSS and no hit-rate change: Tiel 35B-A3B, 7682 MiB of device expert
+        // memory, 64 tokens, pairs 19.5/19.9 tok/s without against 19.0/19.1
+        // with (4137 against 4144 promotions). The reason is the one the audit
+        // names: a promotion is ~570 us/expert and the H2D link on this box
+        // runs at 3.4-4.4 GB/s (the load line says the same), so 17% of a token
+        // is bytes and the copies cannot hide behind compute that is shorter
+        // than they are. It stays as the arm for a batched verify pass, where
+        // the union is known a whole row early -- and `n > 1` is now what it
+        // actually gates, which the old condition had inverted.
+        return e && e[0] == '1';
     }();
     return v;
 }
@@ -5193,9 +5983,17 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     be_->fill0(ws_fexp_, static_cast<size_t>(n) * sizeof(i32));
 
     if (L.router.present() && k > 0 && ne > 0) {
+        // KRK_TIME_HOST: the router GEMM, the blocking readback, the host softmax
+        // and the plan build, as one number per layer. It is the span whose
+        // removal is the point of moving routing to the device, so it has to be
+        // measurable on its own rather than inferred from a step's wall time.
+        KRK_TIME_HOST_N(n == 1 ? "moe.route" : "moe.route.batch", hs_route);
         // Routing runs on the host: the logits are tiny ([n, n_expert]) and the
         // selection is what builds the plan.
+        {
+        KRK_TIME_HOST_N(n == 1 ? "moe.route.gemm" : "moe.route.gemm.batch", hs_rg);
         be_->gemm(ws_router_, ws_xn_, L.router.data, L.router.type, ne, n_embd_, n);
+        }
         // The blocking device-to-host copy below already orders itself behind
         // every kernel queued on the default stream, so the explicit
         // hipDeviceSynchronize this used to issue first was redundant. Forty of
@@ -5204,7 +6002,111 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // KRK_ROUTER_SYNC=1 puts the explicit drain back, which is the arm the
         // cost of removing it is measured against.
         if (router_sync()) be_->sync();
+        {
+        // The fetch is its own span because it is the only blocking point in the
+        // layer: inside it sits both the copy and the device work it waits for,
+        // and the split between those two is what says whether the answer is a
+        // smaller readback or a pipeline that stops draining.
+        KRK_TIME_HOST_N(n == 1 ? "moe.route.fetch" : "moe.route.fetch.batch", hs_rf);
         be_->download_f32(router_host_.data(), ws_router_, static_cast<i64>(n) * ne);
+        // KRK_ROUTER_2X: the same readback a second time. It is the control that
+        // separates the two things inside `moe.route.fetch`: the copy's own round
+        // trip (which this one pays in full) and the device work the first one
+        // waits for (which is already retired by now). Without that split, "the
+        // readback is 60% of the step" cannot say whether to shrink the copy or
+        // to stop syncing -- those are different projects.
+        if (router_fetch2()) {
+            KRK_TIME_HOST_N(n == 1 ? "moe.route.fetch2" : "moe.route.fetch2.batch",
+                            hs_rf2);
+            be_->download_f32(router_host_.data(), ws_router_,
+                              static_cast<i64>(n) * ne);
+        }
+        }
+        // ---- the one-launch dispatch (KRK_DEV_PTR=1) --------------------
+        // Decided before the plan arm because it is a STRONGER claim: the plan
+        // arm still downloads the ids to verify them, and this one never asks
+        // the host anything. Everything it needs is checkable here:
+        //   * the cache published a table, which it only does when the whole
+        //     routed set is device-resident -- so no promotion or eviction can
+        //     move a pointer while the kernel is running;
+        //   * no sidecar global scale (NVFP4): the kernel folds no `gs`, so a
+        //     file that carries one keeps the per-expert path;
+        //   * no per-expert FFN biases, no swiglu-oai, no relu^2 -- the kernel
+        //     implements the plain silu(gate) * up MLP and nothing else;
+        //   * the shape the launch can express: K a multiple of 32 (the dot
+        //     chunking) and one activation row plus one accumulator row inside
+        //     the block's 48 KiB of shared memory.
+        const bool gs_free = !L.experts.gate_scale && !L.experts.up_scale &&
+                             !L.experts.down_scale;
+        // `dispatch_cap` is the capability half; the hybrid exclusion is added
+        // after `hybrid` is decided from residency, further down.
+        // The table can only be published once the whole routed set is in VRAM,
+        // and on a cold cache that is never true at the end of init -- the
+        // experts load lazily as routing reaches them. So the publish is
+        // retried here, bounded: a model whose routed set does not fit pays a
+        // few whole-set scans and then stops asking, instead of one per layer
+        // for the rest of the run.
+        if (dev_ptr() && !dev_table_ && table_attempts_ < kTableAttempts) {
+            ++table_attempts_;
+            publish_expert_table();
+        }
+        const bool dispatch_cap = dev_ptr() && be_->moe_dispatch_supported() &&
+                                  dev_table_ != nullptr &&
+                                  model_.experts().dispatch_table() == dev_table_ &&
+                                  !model_.experts().dispatch_table_stale() &&
+                                  !expert_stub_ && !moe_probe() &&
+                                  !mc.router_sigmoid &&
+                                  !(mc.router_bias_pre && L.router_bias) &&
+                                  !mc.ffn_swiglu_oai && !mc.ffn_relu_sqr &&
+                                  !L.exp_gate_bias && !L.exp_up_bias &&
+                                  !L.exp_down_bias && gs_free &&
+                                  (n_embd_ & 31) == 0 && (ff_exp & 31) == 0 &&
+                                  static_cast<size_t>(ff_exp) * 2u +
+                                          static_cast<size_t>(n_embd_) * 4u + 64u <=
+                                      48u * 1024u;
+
+        // The device selection needs the device probabilities, so the plan arm
+        // implies the softmax arm. Both are restricted to the plain softmax case
+        // (no sigmoid, no pre-bias): a file with either keeps the host path until
+        // the dispatch covers them.
+        // `hybrid` is decided later (from residency), so the hybrid exclusion is
+        // applied at the device-plan block instead of here -- this flag is only
+        // the device capabilities and the file's routing shape.
+        const bool dplan = dev_plan() && be_->router_softmax_supported() &&
+                           be_->router_topk_supported() &&
+                           !expert_stub_ && ne <= 256 && k <= 64 &&
+                           !mc.router_sigmoid &&
+                           !(mc.router_bias_pre && L.router_bias);
+        // The device activation, for the numerics measurement. The host softmax
+        // below still runs -- it is the reference the drift is measured against
+        // -- and the device result replaces it before selection. Restricted to
+        // the plain softmax case because a pre-bias enters the logits and a
+        // sigmoid is a different function; those keep the host path and are the
+        // next thing the dispatch has to cover, not something to guess at here.
+        // The plan arm needs the device probabilities, so it implies this one.
+        const bool ds = (device_softmax() || dev_plan()) &&
+                        be_->router_softmax_supported() &&
+                        !mc.router_sigmoid &&
+                        !(mc.router_bias_pre && L.router_bias);
+        if (ds) {
+            be_->router_softmax(ws_routerp_, ws_router_, n, ne);
+            // The one-launch dispatch keeps the probabilities on the device: a
+            // full-row download for a drift report is the cost it exists to
+            // remove, so `dispatch_cap` skips it (and the drift line is then
+            // the device-plan arm's, not this one's).
+            if (!dispatch_cap) {
+                dev_probs_.resize(static_cast<size_t>(n) * static_cast<size_t>(ne));
+                be_->download(dev_probs_.data(), ws_routerp_,
+                              dev_probs_.size() * sizeof(f32));
+            }
+        }
+        // Everything after the fetch: host top-k, the plan, the prefetch orders,
+        // the per-expert loop and the host arm. It is the PARENT of
+        // `moe.experts`, so the top-k+plan cost is this row minus that one -- a
+        // span that ended where the plan ends would have to close the router
+        // block early, and getting that wrong silently moves the expert loop's
+        // time into a row called "plan".
+        KRK_TIME_HOST_N(n == 1 ? "moe.route.rest" : "moe.route.rest.batch", hs_rp);
 
         // ---- build the routing plan -------------------------------------
         // moe_sel_/moe_wt_ are [token, slot]; the gate weights are renormalized
@@ -5245,6 +6147,26 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 const f32 inv = sum > 0 ? 1.0f / sum : 0.0f;
                 for (i32 e = 0; e < ne; e++)
                     moe_prob_[static_cast<size_t>(e)] *= inv;
+            }
+            if (ds && !dispatch_cap) {
+                // The drift number, then the substitution: the selection below
+                // must run on the DEVICE probabilities, or the text is the
+                // host's and the measurement says nothing about a device path.
+                const f32 *dp = dev_probs_.data() + static_cast<i64>(t) * ne;
+                f64 worst = 0.0;
+                u64 bits = 0;
+                for (i32 e = 0; e < ne; e++) {
+                    const f32 a = moe_prob_[static_cast<size_t>(e)];
+                    const f32 b = dp[e];
+                    const f64 d = std::fabs(static_cast<f64>(a) - static_cast<f64>(b));
+                    if (d > worst) worst = d;
+                    if (a != b) bits++;
+                }
+                ds_rows_++;
+                ds_diff_ += bits;
+                if (worst > ds_max_) ds_max_ = worst;
+                for (i32 e = 0; e < ne; e++)
+                    moe_prob_[static_cast<size_t>(e)] = dp[e];
             }
 
             // Fold this token's routing distribution into the scan. Mass is
@@ -5408,6 +6330,11 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             static_cast<i64>(L.experts.down->ne[1]) == n_embd_ &&
             dtype_row_aligned(L.experts.up->type, n_embd_) &&
             dtype_row_aligned(L.experts.up->type, L.experts.n_ff_exp);
+        const bool dispatch_dev = dispatch_cap && !hybrid;
+        // Counted, not silently dropped: a layer that asked for the dispatch and
+        // did not get it is the one thing a "the arm was on and the numbers did
+        // not move" report has to be able to rule out.
+        if (dev_table_ && !dispatch_dev) ++dp_launch_skips_;
         i32 n_cpu_experts = 0;
         if (hybrid) {
             hy_take_.assign(static_cast<size_t>(ne), 0);
@@ -5453,7 +6380,10 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // this machine is 593 MiB/s against 1446 MiB/s at four outstanding
         // reads and 3400 MiB/s sequential. The set is deduped because two
         // tokens selecting one expert must not read it twice.
-        if (!expert_stub_ && k > 0) {
+        // The one-launch dispatch keeps the ids on the device, so there is no
+        // routed set here to prefetch from; a hybrid run that also asked for
+        // the dispatch simply has no host selection to order.
+        if (!expert_stub_ && k > 0 && !dispatch_cap) {
             prefetch_seen_.assign(static_cast<size_t>(ne), 0);
             prefetch_ids_.clear();
             for (i32 t = 0; t < n; t++) {
@@ -5472,21 +6402,140 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                     prefetch_ids_.push_back(e);
                 }
             }
+            // ---- top-k' lookahead ------------------------------------------
+            // The router's whole row is on the host (`moe_prob_`, plus the same
+            // selection bias the top-k used), so the experts ranked k+1..k' cost
+            // nothing to read. They are staged only if WARM already holds them
+            // (stage_batch skips a cold one), so this pays a copy for a guess
+            // and never a file read. Single row only: with n > 1 `moe_prob_`
+            // holds the LAST token's row, and deriving a batch's runners-up from
+            // one token's distribution is a different, unmeasured rule.
+            if (expert_lookahead_ > k && n == 1) {
+                const f32 *rb2 = L.router_bias;
+                const bool post_bias = rb2 != nullptr && !mc.router_bias_pre;
+                const i32 want = expert_lookahead_ < ne ? expert_lookahead_ : ne;
+                for (i32 pick = k; pick < want; pick++) {
+                    i32 best = -1;
+                    f32 bestp = -1.0f;
+                    for (i32 e = 0; e < ne; e++) {
+                        if (prefetch_seen_[static_cast<size_t>(e)]) continue;
+                        const f32 sc =
+                            moe_prob_[static_cast<size_t>(e)] +
+                            (post_bias ? rb2[static_cast<size_t>(e)] : 0.0f);
+                        if (sc > bestp) {
+                            bestp = sc;
+                            best = e;
+                        }
+                    }
+                    if (best < 0) break;
+                    // Marked before the host-arm test: an expert the CPU owns
+                    // must not be picked again by the next runner-up pass.
+                    prefetch_seen_[static_cast<size_t>(best)] = 1;
+                    if (hybrid && hy_take_[static_cast<size_t>(best)]) continue;
+                    prefetch_ids_.push_back(best);
+                }
+            }
             if (prefetch_ids_.size() > 1)
                 model_.experts().prefetch_layer(
                     L.experts, layer, prefetch_ids_.data(),
                     static_cast<int>(prefetch_ids_.size()));
-            // Look-ahead for a BATCHED pass. The router for all n rows is
-            // already on the host at this point, so a verify pass knows the
-            // union of experts its rows will need one row early: staging it
-            // means rows 1..n-1 hit VRAM instead of promoting serially, and the
-            // promotions overlap the first row's compute. A single row has
-            // nothing ahead of it (stage_next covers ordering inside its own
-            // routing), so this only runs when n > 1.
-            if (n == 1 && lookahead_stage())
+            // ---- promote the plan in ONE pass, before the per-expert loop ----
+            // Without this every routed expert that is not resident is promoted
+            // INSIDE the loop, between two GEMMs: alloc, room walk and H2D each
+            // serial with compute. Staging first enqueues them all, so the copies
+            // overlap the first expert's work and the rest are already in flight
+            // when the loop reaches them. It is the same bytes in the same order
+            // per expert, so the arithmetic does not move -- only the schedule.
+            //
+            // Bounded on purpose: a 256-row prefill has a union of hundreds of
+            // experts, and promoting all of them would evict the very ones its
+            // own first rows need. KRK_MOE_LOOKAHEAD=0 is the A/B arm.
+            const size_t stage_max = static_cast<size_t>(k) * 4 + 8;
+            if (lookahead_stage() && !prefetch_ids_.empty() && n <= 4 &&
+                prefetch_ids_.size() <= stage_max)
                 model_.experts().stage_batch(L.experts, layer,
                                              prefetch_ids_.data(),
                                              static_cast<int>(prefetch_ids_.size()));
+        }
+
+        // ---- the same selection and plan, on the device ---------------------
+        // Verified against what the host just computed, and only used when every
+        // id, every weight and every plan offset agrees exactly. A mismatch
+        // leaves the layer on the host plan and is counted for the report, so a
+        // device bug degrades into a slower run rather than a different model.
+        bool dev_plan_ok = false;
+        if (dispatch_dev) {
+            // Selection and the plan, entirely on the device. NOTHING is read
+            // back: no ids, no weights, no offsets. That is the difference from
+            // the arm below, which downloads both to verify them -- and the
+            // verification is exactly the host dependency this removes, so it
+            // cannot be kept here. What replaces it is the table's residency
+            // promise (no pointer can move) plus the kernel's arithmetic, which
+            // is the per-expert path's own dot order (see kernels/moe_table.hpp).
+            const i32 norm = mc.expert_w_norm != 0 ? 1 : 0;
+            be_->router_topk(ws_routerp_, n, ne, k, ws_ids_, ws_wts_, norm,
+                             mc.expert_w_scale);
+            be_->moe_plan_build(ws_ids_, n, k, ne, ws_off_, ws_plan_, ws_alpha_,
+                                ws_wts_);
+        } else if (dplan && !hybrid) {
+            const size_t nk = static_cast<size_t>(n) * static_cast<size_t>(k);
+            const i32 norm = mc.expert_w_norm != 0 ? 1 : 0;
+            be_->router_topk(ws_routerp_, n, ne, k, ws_ids_, ws_wts_, norm,
+                             mc.expert_w_scale);
+            dev_ids_.resize(nk);
+            dev_wts_.resize(nk);
+            be_->download(dev_ids_.data(), ws_ids_, nk * sizeof(i32));
+            be_->download(dev_wts_.data(), ws_wts_, nk * sizeof(f32));
+            bool same = true;
+            for (size_t i = 0; i < nk; i++) {
+                if (dev_ids_[i] != moe_sel_[i]) {
+                    ++dp_sel_diff_;
+                    same = false;
+                }
+                // STRICT: bit-exact, and the reason is measured. The k-sum is
+                // the same sequential f32 sum on both sides, so the only
+                // difference available is `1/ksum`, which the device computes
+                // with an approximate reciprocal. On Mellum2.1 that is 2-4 ulp
+                // on ~10% of slots -- and at 48 greedy tokens it changed the
+                // text. So a tolerance here would be a gate that passes a
+                // different model; the arm falls back instead, and the fix is
+                // to normalize the k weights on the host (they are eight
+                // numbers) rather than to widen the comparison.
+                i32 dvi = 0, hvi = 0;
+                std::memcpy(&dvi, &dev_wts_[i], sizeof(dvi));
+                std::memcpy(&hvi, &moe_wt_[i], sizeof(hvi));
+                const i32 ulp = dvi > hvi ? dvi - hvi : hvi - dvi;
+                if (ulp > 0) {
+                    ++dp_wt_diff_;
+                    same = false;
+                    // One line, the first time: which layer shape and how the two
+                    // numbers differ (hex, so it is the bits and not a rounding
+                    // of the print). A count alone cannot tell a normalization
+                    // rule from a wrong probability.
+                    static bool printed = false;
+                    if (!printed && ulp > 1) {
+                        printed = true;
+                        KRK_INFO("device plan: first weight mismatch L%02d n=%d i=%zu "
+                                 "dev=%.9g(%a) host=%.9g(%a)",
+                                 layer, n, i, static_cast<f64>(dev_wts_[i]),
+                                 static_cast<f64>(dev_wts_[i]),
+                                 static_cast<f64>(moe_wt_[i]),
+                                 static_cast<f64>(moe_wt_[i]));
+                    }
+                } else if (ulp == 1) {
+                    ++dp_wt_1ulp_;
+                }
+            }
+            ++dp_rows_;
+            if (same) {
+                be_->moe_plan_build(ws_ids_, n, k, ne, ws_off_, ws_plan_,
+                                    ws_alpha_, ws_wts_);
+                plan_off_.assign(static_cast<size_t>(ne) + 1, 0);
+                be_->download(plan_off_.data(), ws_off_,
+                              (static_cast<size_t>(ne) + 1) * sizeof(i32));
+                dev_plan_ok = true;
+                ++dp_used_;
+            }
         }
 
         // ---- one routing plan for the whole layer ---------------------------
@@ -5497,8 +6546,13 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // bucketing is the same O(n*k) walk with a prefix sum, not the
         // O(n_expert * n * k) rescan it replaces. `KRK_MOE_PLAN=0` takes the
         // old path and is the arm the fold is measured against.
-        const bool plan_grouped = moe_plan_grouped() && !expert_stub_;
-        if (plan_grouped) {
+        // `dispatch_dev` builds no host plan at all -- the kernel reads the ids
+        // and the weights itself -- so the host plan is the fallback's, and the
+        // per-expert loop below is skipped entirely when it engaged.
+        const bool plan_grouped = ((moe_plan_grouped() && !dispatch_dev) ||
+                                   dev_plan_ok) &&
+                                  !expert_stub_;
+        if (plan_grouped && !dev_plan_ok) {
             plan_off_.assign(static_cast<size_t>(ne) + 1, 0);
             for (i32 t = 0; t < n; t++) {
                 const i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
@@ -5532,7 +6586,25 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             }
         }
 
-        for (i32 e = 0; !expert_stub_ && e < ne; e++) {
+        // ---- the whole routed layer from ONE launch (KRK_DEV_PTR=1) ---------
+        // No acquire(), no per-expert plan slice, no host selection: the kernel
+        // walks this token's k slots and reads each expert's three matrices out
+        // of the table. The routed sum lands in ws_ffn_, which is exactly what
+        // the per-expert scatter would have built, so the residual add after
+        // this function needs no knowledge of which path ran.
+        if (dispatch_dev) {
+            KRK_TIME_HOST_N(n == 1 ? "moe.dispatch" : "moe.dispatch.batch", hs_disp);
+            be_->moe_dispatch(dev_table_, layer, ne, ws_ids_, ws_wts_, ws_xn_,
+                              ws_ffn_, n, n_embd_, ff_exp, k);
+            ++dp_launch_layers_;
+        }
+
+        // The per-expert loop, timed as its own span: with 8 experts of 6 launches
+        // this is where the launch fan-out and the per-expert acquire() live, and
+        // a step that is launch-bound shows up here and nowhere else.
+        {
+        KRK_TIME_HOST_N(n == 1 ? "moe.experts" : "moe.experts.batch", hs_moe);
+        for (i32 e = 0; !expert_stub_ && !dispatch_dev && e < ne; e++) {
             // The host arm owns this expert on this layer. Skipping it here is
             // what leaves its weights absent from both tiers.
             if (hybrid && hy_take_[static_cast<size_t>(e)]) continue;
@@ -5805,6 +6877,7 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 for (i32 id : prefetch_ids_) if (id > e && id < next) next = id;
                 if (next < ne) model_.experts().stage_next(L.experts, layer, next, e);
             }
+        }
         }
 
         // ---- the host arm --------------------------------------------------

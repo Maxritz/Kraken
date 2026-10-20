@@ -87,6 +87,7 @@ set(KRK_CORE_SOURCES
     src/spec_sampling.cpp
     src/hc.cpp
     src/ple.cpp
+    src/qsa.cpp
     src/model.cpp
     src/dflash.cpp
     src/draft_head.cpp

@@ -298,6 +298,27 @@ public:
                 });
     }
 
+    bool gather_rows_supported() const override { return true; }
+
+    void gather_rows(void *dst, const void *src, const i64 *idx, i64 n_rows,
+                     size_t row_bytes) override {
+        if (!dst || !src || !idx || n_rows <= 0 || row_bytes == 0) return;
+        u8 *o = static_cast<u8 *>(dst);
+        const u8 *s = static_cast<const u8 *>(src);
+        // Rows are disjoint destination ranges, so the pool may split them.
+        par_for(n_rows, 4,
+                2.0 * static_cast<f64>(n_rows) * static_cast<f64>(row_bytes),
+                [&](i64 b, i64 e) {
+                    for (i64 r = b; r < e; r++) {
+                        const i64 cell = idx[r];
+                        if (cell < 0) continue;
+                        std::memcpy(o + static_cast<size_t>(r) * row_bytes,
+                                    s + static_cast<size_t>(cell) * row_bytes,
+                                    row_bytes);
+                    }
+                });
+    }
+
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {
         const i64 n_rep = d.n_kv > 0 ? d.n_head / d.n_kv : 1;

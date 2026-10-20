@@ -92,15 +92,18 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                  arch_known_names().c_str());
     // Development escape hatch, and it is loader-only on purpose:
     // KRK_ARCH_ALLOW_EXPERIMENTAL=1 lets the tensors of a refused schema be
-    // read, so a half-ported architecture can be checked stage by stage, while
-    // Engine::init still refuses to *generate* from the pieces it cannot run.
-    // Nothing user-facing sets it, and the warning says what it is.
+    // read, so a half-ported architecture can be checked stage by stage.
+    // Nothing user-facing sets it, and the warning says what it is -- the
+    // "generation will refuse" this used to promise was not true: Engine::init
+    // has no verdict check, so a file the hatch let through generated whatever
+    // the engine's own blocks could produce, blockers or not.
     const char *allow_exp = std::getenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
     const bool experimental_load =
         allow_exp && allow_exp[0] == '1' && verdict.spec != nullptr;
     if (!verdict.runnable && experimental_load) {
         KRK_WARN("architecture '%s': loading an UNSUPPORTED schema for development "
-                 "(KRK_ARCH_ALLOW_EXPERIMENTAL=1); generation will refuse",
+                 "(KRK_ARCH_ALLOW_EXPERIMENTAL=1); the loader's blockers are not "
+                 "enforced for this run",
                  verdict.arch.empty() ? "no arch" : verdict.arch.c_str());
     } else if (!verdict.runnable) {
         if (err) {
@@ -448,24 +451,22 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 gguf_.get_i64(key(".embedding_length_per_layer_input"), 0));
             cfg_.ple_eos_token =
                 static_cast<i32>(gguf_.get_i64(key(".ple.eos_token_id"), -1));
-            if (const std::vector<i32> *mult =
-                    gguf_.get_i32_array(key(".ple.layer_multipliers"))) {
+            // All three of these are 64-bit arrays in the REAP file, and two of
+            // them genuinely need the width: the offsets reach 300,001,275 and
+            // the multipliers are 2^45-scale constants. Reading them through
+            // get_i32_array() found nothing and refused a file that declares
+            // every one of these keys -- see Gguf::get_i64_array.
+            if (!gguf_.get_i64_array(key(".ple.layer_multipliers"),
+                                     &cfg_.ple_multipliers))
                 cfg_.ple_multipliers.clear();
-                for (i32 v : *mult) cfg_.ple_multipliers.push_back(v);
-            }
-            // The head ranges are stored as uint64 in the file and reach far
-            // past int32 in principle; the loader keeps them as i64 and refuses
-            // a set that does not cover every head.
-            if (const std::vector<i32> *off =
-                    gguf_.get_i32_array(key(".ple.head_offsets"))) {
+            // The head ranges are stored as uint64 in the file; the loader keeps
+            // them as i64 and refuses a set that does not cover every head.
+            if (!gguf_.get_i64_array(key(".ple.head_offsets"),
+                                     &cfg_.ple_head_offsets))
                 cfg_.ple_head_offsets.clear();
-                for (i32 v : *off) cfg_.ple_head_offsets.push_back(v);
-            }
-            if (const std::vector<i32> *vo =
-                    gguf_.get_i32_array(key(".ple.head_vocab_sizes"))) {
+            if (!gguf_.get_i64_array(key(".ple.head_vocab_sizes"),
+                                     &cfg_.ple_head_vocab_sizes))
                 cfg_.ple_head_vocab_sizes.clear();
-                for (i32 v : *vo) cfg_.ple_head_vocab_sizes.push_back(v);
-            }
             const i32 heads = (cfg_.ple_ngram - 1) * cfg_.ple_heads_per_ngram;
             if (cfg_.ple_ngram < 2 || cfg_.ple_heads_per_ngram <= 0 ||
                 cfg_.ple_head_dim <= 0 || cfg_.ple_conv_kernel <= 0 ||
@@ -998,16 +999,32 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // hc_head_norm/down/up instead of output_norm.weight. The norm weight is
         // kept here so the final mix has its gamma; the projector and the wide
         // stream are read by the engine's last mix.
-        hc_head_norm_ = upload_f32("hc_head_norm.weight");
+        //
+        // Two spellings are in the wild for the same three tensors: the
+        // REAP-288 export writes `output_hc_{norm,down,up}`, while the fixtures
+        // (and the first file this ran on) use `hc_head_*`. Both are tried in
+        // the file's own order -- hc_head first, so nothing that loaded before
+        // changes -- and the shape check below decides whether what was found is
+        // a mixer at all.
+        auto head_name = [&](const char *a, const char *b) {
+            return gguf_.tensor(a) ? std::string(a) : std::string(b);
+        };
+        const std::string hc_norm = head_name("hc_head_norm.weight",
+                                              "output_hc_norm.weight");
+        const std::string hc_down = head_name("hc_head_down.weight",
+                                              "output_hc_down.weight");
+        const std::string hc_up = head_name("hc_head_up.weight",
+                                            "output_hc_up.weight");
+        hc_head_norm_ = upload_f32(hc_norm);
         std::string he;
-        hc_head_down_ = upload_weight("hc_head_down.weight", false, &he);
+        hc_head_down_ = upload_weight(hc_down, false, &he);
         if (!hc_head_down_.present()) {
-            if (err) *err = "hc_head_down.weight is missing";
+            if (err) *err = hc_down + " is missing";
             return false;
         }
-        hc_head_up_ = upload_weight("hc_head_up.weight", false, &he);
+        hc_head_up_ = upload_weight(hc_up, false, &he);
         if (!hc_head_up_.present()) {
-            if (err) *err = "hc_head_up.weight is missing";
+            if (err) *err = hc_up + " is missing";
             return false;
         }
         // The engine's final rmsnorm still runs, with the first lane's gamma:
@@ -1015,7 +1032,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // with the hyper-connection forward pass.
         out_norm_ = hc_head_norm_;
         if (!out_norm_) {
-            if (err) *err = "hc_head_norm.weight is missing";
+            if (err) *err = hc_norm + " is missing";
             return false;
         }
         lp.mark("  hc_head upload");
@@ -1389,6 +1406,18 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             L.idx_k_proj = need(blk_key("blk.%d.indexer.k_proj.weight", l));
             L.idx_q_norm = upload_f32(blk_key("blk.%d.indexer.q_norm.weight", l));
             L.idx_k_norm = upload_f32(blk_key("blk.%d.indexer.k_norm.weight", l));
+            // Host copies for the selection, which norms the pooled keys and
+            // the indexer queries itself (dequant_row into a vector: the same
+            // move the router's own host-side bias makes).
+            for (int kk = 0; kk < 2; kk++) {
+                const GgufTensor *nt = gguf_.tensor(
+                    blk_key(kk == 0 ? "blk.%d.indexer.q_norm.weight"
+                                    : "blk.%d.indexer.k_norm.weight", l));
+                if (!nt) continue;
+                std::vector<f32> &dst = kk == 0 ? L.idx_q_norm_h : L.idx_k_norm_h;
+                dst.assign(static_cast<size_t>(nt->n_elements), 0.0f);
+                dequant_row(nt->type, nt->data, dst.data(), nt->n_elements);
+            }
             if (!L.idx_q_proj.present() || !L.idx_k_proj.present() ||
                 !L.idx_q_norm || !L.idx_k_norm) {
                 if (err)

@@ -83,6 +83,9 @@ bool read_value(Cursor &c, GgufValue &v) {
     } else if (et == GgufType::I32 || et == GgufType::U32) {
         v.i32s.resize(static_cast<size_t>(count));
         std::memcpy(v.i32s.data(), base, static_cast<size_t>(count) * 4);
+        // A u32 array is kept verbatim as well: i32s sign-extends it, which
+        // loses the top half of an offset that legitimately reaches 300M.
+        if (et == GgufType::U32) v.raw.assign(base, base + total);
     } else {
         v.raw.assign(base, base + total);
     }
@@ -404,6 +407,49 @@ const std::vector<i32> *Gguf::get_i32_array(const std::string &key) const {
     const GgufValue *v = find(key);
     if (!v || v->type != GgufType::Array || v->i32s.empty()) return nullptr;
     return &v->i32s;
+}
+
+bool Gguf::get_i64_array(const std::string &key, std::vector<i64> *out) const {
+    if (!out) return false;
+    const GgufValue *v = find(key);
+    if (!v || v->type != GgufType::Array) return false;
+    // The i32/u32 case is decoded at parse time into i32s. Nothing else is,
+    // so every other integral width arrives as `raw` bytes and is widened here
+    // from the declared element type -- reading `raw` as the wrong width is
+    // exactly the silent wrong-answer shape this function exists to avoid.
+    if (v->elem == GgufType::I32 ||
+        (v->elem == GgufType::U32 && v->raw.empty())) {
+        out->assign(v->i32s.begin(), v->i32s.end());
+        return true;
+    }
+    const int esz = scalar_size(v->elem);
+    if (esz <= 0 || v->raw.empty()) {
+        if (!v->i32s.empty()) {
+            out->assign(v->i32s.begin(), v->i32s.end());
+            return true;
+        }
+        return false;
+    }
+    const size_t n = v->raw.size() / static_cast<size_t>(esz);
+    out->resize(n);
+    for (size_t i = 0; i < n; i++) {
+        const u8 *p = v->raw.data() + i * static_cast<size_t>(esz);
+        i64 x = 0;
+        switch (v->elem) {
+            case GgufType::U8: x = p[0]; break;
+            case GgufType::I8: x = static_cast<i8>(p[0]); break;
+            case GgufType::U16: { u16 t; std::memcpy(&t, p, 2); x = t; break; }
+            case GgufType::I16: { i16 t; std::memcpy(&t, p, 2); x = t; break; }
+            case GgufType::U32: { u32 t; std::memcpy(&t, p, 4); x = t; break; }
+            case GgufType::I32: { i32 t; std::memcpy(&t, p, 4); x = t; break; }
+            case GgufType::Bool: x = p[0] != 0; break;
+            case GgufType::U64: { u64 t; std::memcpy(&t, p, 8); x = static_cast<i64>(t); break; }
+            case GgufType::I64: { std::memcpy(&x, p, 8); break; }
+            default: return false;
+        }
+        (*out)[i] = x;
+    }
+    return true;
 }
 
 const std::vector<std::string> *Gguf::get_str_array(const std::string &key) const {

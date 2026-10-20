@@ -113,6 +113,7 @@ inline void xtrace(i32 layer, i32 expert, u8 tier) {
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <unordered_set>
 
 namespace krk {
@@ -149,7 +150,7 @@ void ExpertCache::configure(Backend *be, size_t budget_bytes, size_t host_budget
     // An explicit slot budget IS the capacity. Without one this stays 0 until
     // acquire() fills it in from the expert size of the layer it is serving.
     capacity_ = slot_budget;
-    if (be_) be_->set_expert_pool_owner(this, budget_);
+    if (be_) be_->set_expert_pool_owner(this, owner_bytes());
 }
 
 void ExpertCache::set_host_pin_budget(size_t bytes) {
@@ -164,10 +165,12 @@ void ExpertCache::set_vram_budget(size_t bytes) {
     // budget on the next acquire(); clear it so the report cannot keep quoting
     // the count the old budget implied.
     if (slot_budget_ == 0) capacity_ = 0;
-    if (be_) be_->set_expert_pool_owner(this, budget_);
+    if (be_) be_->set_expert_pool_owner(this, owner_bytes());
 }
 
 void ExpertCache::clear() {
+    // The published table points at slots this call is about to release.
+    release_dispatch_table();
     for (auto &kv : slots_) {
         drop(kv.second);
         drop_host(kv.second);
@@ -176,6 +179,8 @@ void ExpertCache::clear() {
     if (be_) be_->set_expert_pool_owner(this, 0);
     bytes_ = 0;
     vram_slots_ = 0;
+    pin_bytes_ = 0;
+    pin_slots_ = 0;
     host_bytes_ = 0;
     capacity_ = 0;
     acquires_ = 0;
@@ -268,6 +273,107 @@ bool ExpertCache::full_for(const ExpertSource &src) const {
     return bytes_ + need > budget_;
 }
 
+// ---------------------------------------------------------------------------
+// The device dispatch table (see the header). Two facts make it publishable:
+// every (layer, expert) of the corpus is in VRAM, and nothing in the run will
+// move one. The first is checkable and the second follows from it -- a slot
+// that is resident is only rewritten by a promotion or an eviction, and a
+// corpus the budget already holds has neither. A budget that does not hold the
+// set answers false and the caller keeps the host path.
+// ---------------------------------------------------------------------------
+
+bool ExpertCache::whole_set_resident(i32 n_layer, i32 n_expert) const {
+    if (!be_ || n_layer <= 0 || n_expert <= 0) return false;
+    for (i32 l = 0; l < n_layer; l++) {
+        for (i32 e = 0; e < n_expert; e++) {
+            auto it = slots_.find(slot_key(l, e));
+            if (it == slots_.end() || !it->second.in_vram()) return false;
+        }
+    }
+    return true;
+}
+
+void ExpertCache::release_dispatch_table() {
+    if (table_ && be_) be_->release(table_);
+    table_ = nullptr;
+    table_bytes_ = 0;
+    table_stale_ = false;
+}
+
+void *ExpertCache::publish_dispatch_table(i32 n_layer, i32 n_expert,
+                                          i32 *published_out, std::string *why) {
+    if (published_out) *published_out = 0;
+    if (!be_) {
+        if (why) *why = "no backend";
+        return nullptr;
+    }
+    if (n_layer <= 0 || n_expert <= 0) {
+        if (why) *why = "no expert geometry";
+        return nullptr;
+    }
+    if (!whole_set_resident(n_layer, n_expert)) {
+        if (why) {
+            *why = "the routed set is not wholly device-resident (";
+            *why += std::to_string(vram_slots_);
+            *why += " of ";
+            *why += std::to_string(static_cast<long long>(n_layer) * n_expert);
+            *why += " slots)";
+        }
+        return nullptr;
+    }
+
+    const size_t cells = static_cast<size_t>(n_layer) * static_cast<size_t>(n_expert);
+    std::vector<MoeDispatchEntry> host(cells);
+    i32 filled = 0;
+    for (i32 l = 0; l < n_layer; l++) {
+        for (i32 e = 0; e < n_expert; e++) {
+            auto it = slots_.find(slot_key(l, e));
+            if (it == slots_.end()) continue;
+            const ResidentExpert &m = it->second.m;
+            const QuantTensor *q[3] = {&m.gate, &m.up, &m.down};
+            MoeDispatchEntry &d = host[static_cast<size_t>(l) *
+                                       static_cast<size_t>(n_expert) +
+                                       static_cast<size_t>(e)];
+            bool all = true;
+            for (int i = 0; i < 3; i++) {
+                if (!q[i]->present()) continue;
+                d.p[i] = q[i]->data;
+                d.n_out[i] = q[i]->n_out;
+                d.n_in[i] = q[i]->n_in;
+                d.row_bytes[i] = static_cast<std::int64_t>(
+                    dtype_row_bytes(q[i]->type, q[i]->n_in));
+                d.type[i] = static_cast<std::int32_t>(q[i]->type);
+                d.present[i] = 1;
+            }
+            // gate + up + down is the shape the dispatch needs. An expert with
+            // only two of them is a different FFN and belongs to the host path.
+            all = d.present[kMoeGate] && d.present[kMoeUp] && d.present[kMoeDown];
+            if (all) filled++;
+        }
+    }
+    if (filled != static_cast<i32>(cells)) {
+        if (why) {
+            *why = "only " + std::to_string(filled) + " of " +
+                   std::to_string(static_cast<long long>(cells)) +
+                   " experts carry all three matrices";
+        }
+        return nullptr;
+    }
+
+    release_dispatch_table();
+    const size_t bytes = cells * sizeof(MoeDispatchEntry);
+    table_ = be_->alloc(bytes);
+    if (!table_) {
+        if (why) *why = "the table allocator refused " + std::to_string(bytes) + " bytes";
+        return nullptr;
+    }
+    table_bytes_ = bytes;
+    be_->upload(table_, host.data(), bytes);
+    table_stale_ = false;
+    if (published_out) *published_out = filled;
+    return table_;
+}
+
 size_t ExpertCache::pinned_slots() const {
     size_t n = 0;
     for (const auto &kv : slots_)
@@ -282,9 +388,47 @@ size_t ExpertCache::warm_slots() const {
     return n;
 }
 
+void ExpertCache::set_pinned(Slot &s, bool on) {
+    if (s.pinned == on) return;
+    s.pinned = on;
+    if (on) {
+        pin_bytes_ += s.bytes;
+        pin_slots_++;
+    } else {
+        const size_t drop = std::min(pin_bytes_, s.bytes);
+        pin_bytes_ -= drop;
+        if (pin_slots_) pin_slots_--;
+    }
+}
+
+size_t ExpertCache::reclamp_vram_budget(size_t free_bytes, size_t floor_bytes) {
+    if (budget_ == 0 || bytes_ == 0) return budget_;
+    const size_t room = free_bytes > floor_bytes ? free_bytes - floor_bytes : 0;
+    const size_t live = bytes_ > pin_bytes_ ? bytes_ - pin_bytes_ : 0;
+    const size_t cap = live + room;
+    // A driver reading moves by a few MiB on its own; a budget that chases it
+    // re-plans the cache every step for nothing. The tolerance is a FRACTION of
+    // the budget (1/64, 86 MiB on a 5.5 GiB pool) rather than an absolute 32 MiB,
+    // so the rule is testable at a fixture's 96 bytes instead of being dominated
+    // by a constant that is larger than the whole test cache.
+    const size_t margin = budget_ / 64;
+    if (cap + margin >= budget_) return budget_;
+    set_vram_budget(cap);
+    return budget_;
+}
+
+void ExpertCache::set_pin_budget(size_t bytes) {
+    pin_budget_ = bytes;
+    if (be_) be_->set_expert_pool_owner(this, owner_bytes());
+    // A ring smaller than what it already holds is not retroactively evicted:
+    // admit_hot() refuses to grow it, and what is there was admitted against a
+    // budget that was true when it was measured. Tightening it further is the
+    // caller's business (clear() and a re-admit).
+}
+
 void ExpertCache::touch(Slot &s) {
     s.count++;
-    if (!s.pinned && s.count >= kPinThreshold) s.pinned = true;
+    if (!s.pinned && s.count >= kPinThreshold) set_pinned(s, true);
 }
 
 void ExpertCache::finish_stage(Slot &s) {
@@ -316,6 +460,7 @@ void ExpertCache::drop(Slot &s) {
         *q[i] = {};
     }
     s.m = {};
+    table_stale_ = true;
     if (n) be_->release_pooled_batch(cells, lens, n);
 }
 
@@ -349,7 +494,15 @@ void ExpertCache::forget_if_dead(std::unordered_map<u64, Slot>::iterator it) {
 
 void ExpertCache::retire(Slot &s) {
     vram_slots_--;
-    bytes_ -= s.bytes;
+    if (s.bytes <= bytes_) {
+        bytes_ -= s.bytes;
+    } else {
+        bytes_ = 0;
+    }
+    // The ring's own accounting has to let go with the residency, or a
+    // pin_bytes_ that outlives its bytes makes over_budget() believe the pool
+    // has room it does not have.
+    if (s.pinned) set_pinned(s, false);
     drop(s);
     // The device copy is gone. A WARM copy is exactly the destination the
     // lifecycle asks for, and it costs nothing: the bytes are already resident,
@@ -507,7 +660,7 @@ bool ExpertCache::promote_to_vram(Slot &s, bool staged) {
     size_t physical = 0;
     for (size_t slice : s.slice) if (slice) physical += be_->pooled_size(slice);
     s.bytes = physical;
-    be_->set_expert_pool_owner(this, std::max(budget_, physical));
+    be_->set_expert_pool_owner(this, owner_bytes(physical));
     const u64 key = slot_key(s.layer, s.expert);
     // Snapshot before the scan: this slot is WARM, so retire() cannot take it
     // (it only drops device copies), but the reference is re-established below
@@ -585,8 +738,16 @@ bool ExpertCache::promote_to_vram(Slot &s, bool staged) {
         }
     }
     s.m = m;
+    table_stale_ = true;
     vram_slots_++;
     bytes_ += s.bytes;
+    // A slot that was pinned while WARM (pin_layer, admit_hot) enters the
+    // device tier straight into the ring: the bytes are charged to
+    // pin_budget_, not to the pool's budget_.
+    if (s.pinned) {
+        pin_bytes_ += s.bytes;
+        pin_slots_++;
+    }
     // The WARM copy stays — WARM is inclusive. It is what makes the next VRAM
     // eviction of this expert free, and it costs only the RAM the tier has
     // already budgeted for.
@@ -603,7 +764,7 @@ void ExpertCache::decay() {
         } else {
             s.count = s.count > kPinDecayStep / 4 ? s.count - kPinDecayStep / 4 : 0;
         }
-        if (s.pinned && s.count < kPinThreshold) s.pinned = false;
+        if (s.pinned && s.count < kPinThreshold) set_pinned(s, false);
     }
     acquires_ = 0;
     decays_++;
@@ -757,7 +918,7 @@ size_t ExpertCache::pin_layer(const ExpertSource &src, i32 layer,
         // the counter is raised to the threshold so the decay window cannot
         // drop it (this bank is re-acquired by every proposal, so it re-earns
         // the count anyway).
-        it->second.pinned = true;
+        set_pinned(it->second, true);
         if (it->second.count < kPinThreshold) it->second.count = kPinThreshold;
         pinned++;
     }
@@ -774,6 +935,67 @@ size_t ExpertCache::pin_layer(const ExpertSource &src, i32 layer,
              static_cast<f64>(bytes_) / 1048576.0,
              static_cast<f64>(budget_) / 1048576.0, already);
     return pinned * per;
+}
+
+size_t ExpertCache::admit_hot(const ExpertSource *const *src_of, i32 n_layer,
+                              const std::vector<std::pair<i32, i32>> &order,
+                              size_t max_experts) {
+    if (!be_ || pin_budget_ == 0 || order.empty()) return 0;
+    size_t pinned = 0;
+    size_t refused = 0;
+    const std::chrono::steady_clock::time_point t0 =
+        std::chrono::steady_clock::now();
+    for (const auto &pr : order) {
+        if (max_experts && pinned >= max_experts) break;
+        if (pin_bytes_ >= pin_budget_) break;
+        const i32 l = pr.first;
+        const i32 e = pr.second;
+        if (!src_of || l < 0 || l >= n_layer) continue;
+        const ExpertSource &src = *src_of[l];
+        if (!src.present() || e < 0 || e >= src.n_expert) continue;
+        // Already resident: a pin it earns now is free, and counting it keeps
+        // the report's "admitted" number honest about the ring's contents.
+        auto it = slots_.find(slot_key(l, e));
+        if (it != slots_.end() && it->second.in_vram()) {
+            if (!it->second.pinned) {
+                set_pinned(it->second, true);
+                pinned++;
+            }
+            continue;
+        }
+        // What the expert costs on the device, so the ring's cap is tested in
+        // the allocator's bytes (pooled cells are aligned, not the raw slice).
+        const size_t per = (src.gate ? be_->pooled_size(src.per_expert(src.gate)) : 0) +
+                           be_->pooled_size(src.per_expert(src.up)) +
+                           be_->pooled_size(src.per_expert(src.down));
+        if (per == 0) continue;
+        if (pin_bytes_ + per > pin_budget_) break; // the ring is full
+        if (!acquire(src, l, e)) {
+            refused++;
+            continue;
+        }
+        auto pit = slots_.find(slot_key(l, e));
+        if (pit == slots_.end() || !pit->second.in_vram()) {
+            // acquire() may evict rather than admit when every other slot is
+            // pinned; that is a refusal, not a pin.
+            refused++;
+            continue;
+        }
+        // Set AFTER the promotion: promote_to_vram counts a slot pinned before
+        // it, and this path's charge is this call.
+        set_pinned(pit->second, true);
+        pinned++;
+    }
+    const f64 took = std::chrono::duration<f64, std::milli>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count();
+    KRK_INFO("expert cache: hot ring admitted %zu expert(s) (%.0f MiB of a "
+             "%.0f MiB ring, %zu refused) in %.0f ms; the pool's %.0f MiB "
+             "budget no longer counts them",
+             pinned, static_cast<f64>(pin_bytes_) / 1048576.0,
+             static_cast<f64>(pin_budget_) / 1048576.0, refused, took,
+             static_cast<f64>(budget_) / 1048576.0);
+    return pinned;
 }
 
 size_t ExpertCache::preload(const ExpertSource &src, i32 layer) {
@@ -801,7 +1023,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
                         (up_b ? be_->pooled_size(up_b) : 0) +
                         (down_b ? be_->pooled_size(down_b) : 0);
     // Preserve the documented minimum: one complete aligned expert can run.
-    be_->set_expert_pool_owner(this, std::max(budget_, need));
+    be_->set_expert_pool_owner(this, owner_bytes(need));
     // capacity_ is what the report says fits, not what the eviction decision is
     // made on (that is bytes_ + need against budget_, see over_budget). Without
     // an explicit slot budget it is the byte budget expressed in slots of THIS
