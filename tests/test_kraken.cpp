@@ -7917,6 +7917,28 @@ static void test_hc_lanes() {
     hc_norm_lanes(normed.data(), xn2.data(), ones.data(), n, g, 1e-6f);
     CHECK(std::fabs(normed[3 * static_cast<size_t>(g.n_embd)] - 1.0f) < 1e-5f,
           "with gamma 1 every lane normalizes the same way");
+
+    // ---- the real geometry: four lanes of 2560 through a 320 bottleneck ----
+    // Qwen3.8-Flash-Next's own numbers, so the width the loader validates and
+    // the width this arithmetic is proved at are the same width.
+    HcGeometry real_hc;
+    real_hc.n_embd = 2560;
+    real_hc.hc = 4;
+    real_hc.low_rank = 320;
+    CHECK(real_hc.valid() && real_hc.lane_width() == 10240,
+          "four lanes of 2560 ARE the 10240-wide residual attn_qkv feeds");
+    std::vector<f32> wxn(static_cast<size_t>(real_hc.lane_width()), 1.0f);
+    std::vector<f32> wgate(static_cast<size_t>(real_hc.lane_width()), 0.0f);
+    std::vector<f32> wmixed(static_cast<size_t>(real_hc.n_embd), 0.0f);
+    std::vector<f32> wres(static_cast<size_t>(real_hc.lane_width()), 2.0f);
+    std::vector<f32> winj(static_cast<size_t>(real_hc.hc), 0.0f);
+    hc_mix(wmixed.data(), wxn.data(), wgate.data(), 1, real_hc);
+    CHECK(std::fabs(wmixed[0] - 0.5f) < 1e-7f &&
+              std::fabs(wmixed[real_hc.n_embd - 1] - 0.5f) < 1e-7f,
+          "at 2560x4 the mix still averages the lanes (four 1s, sigmoid 0.5)");
+    hc_combine(wres.data(), nullptr, winj.data(), 1, real_hc);
+    CHECK(wres[0] == 2.0f && wres[real_hc.lane_width() - 1] == 2.0f,
+          "and a null block output still leaves all 10240 values alone");
 }
 
 static void test_ple_hash() {
