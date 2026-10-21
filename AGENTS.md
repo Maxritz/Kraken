@@ -710,6 +710,23 @@ code, the README, or `docs/`.
   trivial call in a quiet queue and **0.92 us** for the host-side enqueue of the
   same call into a busy one, so the floor is within ~10% of a call that carries a
   pass and overstates a pure enqueue ~3x.
+- **The prefill GEMM's tile shape is not its lever, and that is now measured.**
+  `gemm_wmma_kernel` stages both operands into LDS as **f16**, so a block stages
+  `BN` rows of weight at 2 B/value and `BM` rows of activation; per output FLOP
+  that is `2/BM` bytes of weight against `2/BN` of activation, and the weight
+  side is re-staged once per M tile (`row_base = blockIdx.y * BM`), i.e. 15x at
+  a 466-row prompt with `BM=32`. The obvious fix is a wider tile, and it fails:
+  **BN 64 -> 128 measured 46% SLOWER** on `kraken-bench --rows 466` (Q4_K
+  4096x4096: 1105 -> 1613 us, 14.15 -> 9.69 TFLOP/s) and destroyed the small
+  shape (rows=22: 18.1 -> 1.16 TFLOP/s, because 4096/128 = 32 blocks cannot fill
+  64 CUs). BN=128 needs 43.5 kB of LDS, which drops a block per CU from two to
+  one -- the staged bytes are not the binding constraint, the staging CHAIN is
+  latency-bound and occupancy is what hides it. `BM=128` buys the same byte cut
+  by spending the same occupancy, so it is predicted to lose the same way and
+  was not shipped. What does work is staging **fewer bytes per chain**: the
+  quantized bytes (0.5 B/value) unpacked in registers at MMA time, which is the
+  int8/MMQ rewrite, not a tile tweak. Baseline to beat: 1105-1138 us /
+  13.7-14.2 TFLOP/s at rows=466, 340 us at rows=22.
 - **A fused group's fallback runs on PREFILL, and it must use each matrix's own
   metadata.** `gemm_group`'s fused path is decode-only (rows == 1), so a prefill
   pass takes the per-matrix fallback -- and a fallback that decodes a Q4_K

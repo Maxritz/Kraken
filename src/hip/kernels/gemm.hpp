@@ -182,6 +182,17 @@ constexpr int kGemvMRowsMax = 8;
 
 struct wmma_cfg {
     static constexpr int BM = 32;
+    // BN=128 was tried and REJECTED on measurement, and the reason is the one
+    // a tile-shape change cannot fix. Per output FLOP a block stages
+    // 2/BN bytes of activation against 0.25/BM of weight, so BN=128 halves the
+    // bytes -- and made the kernel 46% SLOWER (4096x4096x466 Q4_K: 1105 ->
+    // 1613 us, 14.15 -> 9.69 TFLOP/s; rows=22: 18.1 -> 1.16 TFLOP/s, because
+    // 4096/128 = 32 blocks cannot fill 64 CUs). The staged bytes are not the
+    // binding constraint: the staging CHAIN is latency-bound, and BN=128 costs
+    // 43.5 kB of LDS, which drops a block per CU from two to one. Widening the
+    // tile buys bytes back by spending the occupancy that hides the latency.
+    // The lever that does work is staging fewer bytes per chain -- quantized
+    // staging with the unpack done in registers -- not a wider tile.
     static constexpr int BN = 64;
 // BK sets how much weight staging one serial round covers. §2c measured the
 // staged dequant as the dominant prefill cost and showed the cost is per
