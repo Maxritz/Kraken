@@ -583,6 +583,46 @@ inline bool dp4a_ok(int wt, i64 rows, i64 n_out, i64 n_in) {
     return true;
 }
 
+// Occupancy of the tile kernel, asked of the runtime rather than inferred.
+//
+// The one number that decides whether any inner-loop work can pay: with 64 int
+// accumulators live at TM=8, the register file -- not the LDS budget -- is what
+// limits waves per CU, and a kernel at one wave cannot hide a global load's
+// latency no matter how the loop is written. KRK_KERNEL_INFO=1 prints it once.
+// RDNA's register file is 512 VGPRs per SIMD (x4 SIMDs per CU) and the
+// allocator hands them out in groups of 8 for wave32, so the wave count is
+// 512 / roundup8(numRegs), capped by the LDS budget (64 kB per CU) and by the
+// hardware's 32-wave limit.
+inline void dp4a_log_kernel_info() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const char *e = std::getenv("KRK_KERNEL_INFO");
+    if (e == nullptr || e[0] == '0') return;
+    auto one = [](const void *fn, const char *name, int threads) {
+        hipFuncAttributes at{};
+        if (hipFuncGetAttributes(&at, fn) != hipSuccess) {
+            KRK_WARN("kernel info: %s did not answer", name);
+            return;
+        }
+        const int regs = at.numRegs;
+        const int per_wave = ((regs + 7) / 8) * 8;
+        const int waves_simd = per_wave > 0 ? 512 / per_wave : 16;
+        const int lds = static_cast<int>(at.sharedSizeBytes);
+        const int blocks_lds = lds > 0 ? (64 * 1024) / lds : 99;
+        const int blocks_reg = (waves_simd * 4 * 32) / threads;
+        KRK_INFO("kernel %s: numRegs %d (scratch %zu B), LDS %d B/block, "
+                 "%d threads -> %d waves/SIMD, %d blocks/CU by regs, "
+                 "%d by LDS",
+                 name, regs, at.localSizeBytes, lds, threads, waves_simd,
+                 blocks_reg, blocks_lds);
+    };
+    one(reinterpret_cast<const void *>(&gemm_dp4a_kernel<kDp4aWq4>),
+        "gemm_dp4a_q4k", dp4a_cfg::THREADS);
+    one(reinterpret_cast<const void *>(&quantize_act_kernel), "quantize_act",
+        256);
+}
+
 // Quantize then tile. `codes` is [rows, n_in] int8 and `scales` is
 // [rows, n_in/32] f32 — both owned by the caller (the backend keeps them
 // across calls) so nothing allocates on this path.
@@ -590,6 +630,7 @@ template <int WQ>
 inline void gemm_dp4a_launch(const u8 *w, i64 n_out, i64 n_in, size_t w_row_bytes,
                              const _Float16 *x, i64 rows, _Float16 *out,
                              i8 *codes, f32 *scales) {
+    dp4a_log_kernel_info();
     const i64 pairs = rows * (n_in / dp4a_cfg::BK);
     const unsigned qblocks = static_cast<unsigned>((pairs + 7) / 8);
     quantize_act_kernel<<<qblocks, 256>>>(x, codes, scales, rows, n_in);
