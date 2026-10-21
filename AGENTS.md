@@ -710,7 +710,40 @@ code, the README, or `docs/`.
   trivial call in a quiet queue and **0.92 us** for the host-side enqueue of the
   same call into a busy one, so the floor is within ~10% of a call that carries a
   pass and overstates a pure enqueue ~3x.
-- **The prefill GEMM's tile shape is not its lever, and that is now measured.**
+- **On gfx1201 the prefill GEMM that RUNS is `gemm(dp4a)`, not the WMMA tile, and
+  it was emulating its dot products until this was fixed.** The profiler's own
+  tag is the witness: `--profile` rows read `gemm(dp4a)`, while
+  `KRK_GEMM_PATH=wmma` is 2x SLOWER on the same shape (4096x4096x466 Q4_K:
+  ~1.55 ms against ~3.1 ms), so the auto rung is right to prefer int8. Two
+  defects made that path cost far more than it should:
+  (1) `KRK_HAS_DOT4` was guarded to gfx10/gfx11, so on gfx12 `d_dot4` compiled to
+  the **16-op scalar emulation** (8 shifts, 4 multiplies, 4 adds) instead of one
+  `v_dot4_i32_i8`. The guard existed because clang refuses
+  `__builtin_amdgcn_sdot4` for gfx1201 ("needs target feature dot1-insts").
+  **Do not fix that by enabling the feature:**
+  `-Xclang -target-feature -Xclang +dot1-insts` appends the feature to the
+  target ID embedded in the code object, the fat binary then no longer matches
+  the runtime's gfx1201, and every launch dies with `Cannot find Symbol ...
+  copy_h2h_kernel` (measured; build rc=0, binary broken). Inline asm
+  `v_dot4_i32_i8 %0, %1, %2, %3` assembles for gfx1201 with no flag and changes
+  no target ID -- that is what ships, and it is worth **1.50x** on the GEMM by
+  itself (466 rows: 1470.6 -> 979.9 us, 3/3 pairs).
+  (2) `dp4a_cfg::TM` was 4, i.e. 12 LDS loads per 32 dots. **TM=8** makes it 16
+  loads per 64 dots and is worth **1.57x** end to end on the GEMM (1536.6 ->
+  979.9 us at 466 rows; 8315 -> 6894 us at 4096 rows, both interleaved 3 pairs,
+  order balanced), with the harness check unchanged (`chk=1.06e-02/1e-02`).
+  Together, on **Qwen3-8B Q4_K_M at a 470-token prompt: 566.5 -> 633.2 tok/s
+  prefill (+11.8%, 3/3 pairs, no overlap)** against the recorded 561 baseline.
+  End-to-end is smaller than the GEMM's 1.57x because the projections are ~80%
+  of device time and attention is the next 13% (`--profile` component table),
+  so the remaining headroom is inside the same kernel: 15-20 TFLOP/s against
+  llama.cpp's ~68 on the same model means the tile is still ~4x off, and the
+  lever there is more MACs per LDS load (register tile / `global_load_lds`),
+  not instruction selection.
+  `kraken-i8k` does not build on this box (it is compiled as plain CXX and its
+  `#include <hip/hip_runtime.h>` has no include path); the suite's int8 groups
+  (3583/3583) are the guard for the dot path.
+- **The WMMA tile's shape is not its lever, and that is now measured.**
   `gemm_wmma_kernel` stages both operands into LDS as **f16**, so a block stages
   `BN` rows of weight at 2 B/value and `BM` rows of activation; per output FLOP
   that is `2/BM` bytes of weight against `2/BN` of activation, and the weight

@@ -2076,6 +2076,22 @@ public:
     // build replaced. It exists so the two arms can be interleaved in separate
     // processes: measured in sequence, the second arm reads a warm page cache
     // and looks like a win no matter which one it is.
+    // Diagnostic arms for the staging-vs-MMA split (see the launch site).
+    static bool gemm_stage_only() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_GEMM_STAGE_ONLY");
+            return e && e[0] == '1';
+        }();
+        return v;
+    }
+    static bool gemm_mma_only() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_GEMM_MMA_ONLY");
+            return e && e[0] == '1';
+        }();
+        return v;
+    }
+
     static bool split_k_enabled() {
         static const bool v = [] {
             const char *e = std::getenv("KRK_GEMM_SPLIT");
@@ -2384,8 +2400,11 @@ public:
 #if defined(KRK_WMMA_COMPILED)
             const unsigned bx = static_cast<unsigned>(
                 (n_out + wmma_cfg::BN - 1) / wmma_cfg::BN);
+            // One block walks wmma_cfg::MB M tiles, so the grid's row
+            // dimension counts groups of MB*BM rows.
             const unsigned by = static_cast<unsigned>(
-                (rows + wmma_cfg::BM - 1) / wmma_cfg::BM);
+                (rows + wmma_cfg::BM * wmma_cfg::MB - 1) /
+                (wmma_cfg::BM * wmma_cfg::MB));
             // Split-K: a short prefill GEMM runs only a
             // handful of blocks, and §2b showed its cost is
             // the per-block staging chain, not CU occupancy.
@@ -2431,13 +2450,44 @@ public:
             }
             // Q4_K takes the compile-time-specialized staging
             // pipeline; every other dtype keeps the runtime path.
-            if (wt == DType::Q4_K)
-                gemm_wmma_kernel<wmma_cfg, 0,
-                                 static_cast<int>(DType::Q4_K)><<<grid, wmma_cfg::THREADS>>>(
-                    wh, static_cast<int>(wt), n_out, n_in,
-                    row_bytes, xh, rows, oh, split, slice,
-                    parts, pstride);
-            else
+            // The staging-vs-MMA split is measurable from outside the kernel:
+            // MODE 1 keeps every staging loop and barrier and skips the WMMA,
+            // MODE 2 keeps the fragment loads and WMMA and skips the staging.
+            // Both produce a wrong answer by construction, so they are
+            // diagnostic arms only -- `kraken-bench` under the env switch.
+            if (wt == DType::Q4_K) {
+                if ((gemm_stage_only() || gemm_mma_only()) &&
+                    !getenv("KRK_GEMM_ARM_QUIET")) {
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        std::fprintf(stderr, "[gemm] diagnostic arm: %s\n",
+                                     gemm_stage_only() ? "stage-only"
+                                                       : "mma-only");
+                    }
+                }
+                if (gemm_stage_only())
+                    gemm_wmma_kernel<wmma_cfg, 1,
+                                     static_cast<int>(DType::Q4_K)>
+                        <<<grid, wmma_cfg::THREADS>>>(
+                            wh, static_cast<int>(wt), n_out, n_in,
+                            row_bytes, xh, rows, oh, split, slice,
+                            parts, pstride);
+                else if (gemm_mma_only())
+                    gemm_wmma_kernel<wmma_cfg, 2,
+                                     static_cast<int>(DType::Q4_K)>
+                        <<<grid, wmma_cfg::THREADS>>>(
+                            wh, static_cast<int>(wt), n_out, n_in,
+                            row_bytes, xh, rows, oh, split, slice,
+                            parts, pstride);
+                else
+                    gemm_wmma_kernel<wmma_cfg, 0,
+                                     static_cast<int>(DType::Q4_K)>
+                        <<<grid, wmma_cfg::THREADS>>>(
+                            wh, static_cast<int>(wt), n_out, n_in,
+                            row_bytes, xh, rows, oh, split, slice,
+                            parts, pstride);
+            } else
                 gemm_wmma_kernel<wmma_cfg, 0, -1><<<grid, wmma_cfg::THREADS>>>(
                     wh, static_cast<int>(wt), n_out, n_in,
                     row_bytes, xh, rows, oh, split, slice,

@@ -256,6 +256,27 @@ __device__ __forceinline__ f32 d_dot2(const _Float16 *a, const _Float16 *b, f32 
 // behind the wider guard made the whole HIP target fail to compile on the
 // gfx1201 machine after the int8 port landed -- nothing here had compiled that
 // path for gfx12, so the break went unnoticed until it was built there.
+// gfx12 has the instruction, and the guard that stopped at gfx11 was a
+// compiler limitation mistaken for a hardware one: clang refuses
+// __builtin_amdgcn_sdot4 for gfx1201 ("needs target feature dot1-insts") and
+// --offload-arch=gfx1201 does not enable that feature. The workaround of
+// passing -Xclang -target-feature -Xclang +dot1-insts was tried and REVERTED:
+// the feature is appended to the target ID clang embeds in the code object, so
+// the fat binary's device image stops matching the runtime's gfx1201 and every
+// launch dies with "Cannot find Symbol ... copy_h2h_kernel".
+//
+// Inline asm reaches the same instruction without touching the target ID, and
+// `v_dot4_i32_i8` assembles for gfx1201 as-is. It is the same signed x signed,
+// no-clamp form the builtin produces on gfx10/11, so results are unchanged
+// bit-for-bit -- which is what the 8-bit GEMM harness (tools/gemm_i8k_verify)
+// and the suite's int8 groups re-check.
+//
+// Measured: with the emulation the prefill GEMM ran at 14.6 TFLOP/s at
+// 4096 rows; the instruction is what makes it 4x cheaper per MAC.
+#if defined(KRK_GFX12) && defined(__HIP_DEVICE_COMPILE__)
+#define KRK_DOT4_ASM 1
+#endif
+
 #if defined(KRK_GFX10) || defined(KRK_GFX11)
 #define KRK_HAS_DOT4 1
 #endif
@@ -263,6 +284,14 @@ __device__ __forceinline__ f32 d_dot2(const _Float16 *a, const _Float16 *b, f32 
 #if defined(KRK_HAS_DOT4)
 __device__ __forceinline__ i32 d_dot4(i32 a, i32 b, i32 c) {
     return __builtin_amdgcn_sdot4(a, b, c, 0);
+}
+#elif defined(KRK_DOT4_ASM)
+__device__ __forceinline__ i32 d_dot4(i32 a, i32 b, i32 c) {
+    i32 r;
+    asm("v_dot4_i32_i8 %0, %1, %2, %3"
+        : "=v"(r)
+        : "v"(a), "v"(b), "v"(c));
+    return r;
 }
 #else
 // Four signed byte products, exact, with the bytes taken by shifting rather

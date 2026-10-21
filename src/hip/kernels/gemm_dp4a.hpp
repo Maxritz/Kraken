@@ -104,7 +104,7 @@ namespace dp4a_cfg {
 constexpr int BM = 64;
 constexpr int BN = 128;
 constexpr int BK = 32; // one 32-value sub-block; see the fold's static_assert
-constexpr int TM = 4;
+constexpr int TM = 8;
 constexpr int TN = 8;
 constexpr int STAGES = 2;
 constexpr int TX = BN / TN; // 16

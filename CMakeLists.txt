@@ -426,6 +426,15 @@ if(KRK_ENABLE_HIP)
     target_compile_options(krk_hip PRIVATE -O3 -ffast-math
                                            -fno-finite-math-only)
 
+    # RDNA4 carries v_dot4_i32_iu8, and the *builtin* is gated behind a target
+    # feature (`-Xclang -target-feature -Xclang +dot1-insts`). That route is
+    # NOT usable here and was measured to break the binary: the feature is
+    # appended to the target ID clang embeds in the code object, so the fat
+    # binary's device image no longer matches the runtime's gfx1201 and every
+    # launch fails with "Cannot find Symbol ... copy_h2h_kernel". The
+    # instruction is reached through inline asm instead (see d_dot4 in
+    # src/hip/krk_hip.hpp, KRK_DOT4_ASM), which changes no target ID.
+
     # One line that cannot be mistaken for the CPU-only build's line.
     message(STATUS "kraken: HIP backend enabled, targets = ${KRK_GPU_TARGETS} "
                    "(HIP compiler ${CMAKE_HIP_COMPILER_ID} "
