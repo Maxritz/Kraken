@@ -508,20 +508,60 @@ public:
         KRK_HIP(hipFree(b.p));
     }
     void pool_trim_(size_t need) {
-        for (auto &entry : pool_) {
-            auto &cells = entry.second;
-            while (!cells.empty() &&
-                   (need > expert_pool_.budget ||
-                    expert_pool_.committed > expert_pool_.budget - need)) {
-                PoolBlock b = cells.back();
-                cells.pop_back();
-                pool_kill_(b);
-                expert_pool_.committed -= entry.first;
-                expert_pool_.reusable -= entry.first;
+        for (;;) {
+            const bool over =
+                need > expert_pool_.budget ||
+                expert_pool_.committed > expert_pool_.budget - need;
+            if (!over) return;
+            bool progress = false;
+            // Arena cells first, at SLAB granularity: a cell has no allocation
+            // header of its own, so handing one back would be half a free. A
+            // slab goes when every cell in it is already on the free list.
+            for (size_t i = 0; i < pool_slabs_.size(); i++) {
+                PoolSlab &sl = pool_slabs_[i];
+                if (!sl.base || sl.live) continue;
+                auto &cells = pool_[sl.cell];
+                for (size_t j = cells.size(); j-- > 0;) {
+                    const auto at = pool_cell_slab_.find(cells[j].p);
+                    if (at == pool_cell_slab_.end() || at->second != i) continue;
+                    if (cells[j].m && cells[j].m->ev)
+                        KRK_HIP(hipEventSynchronize(cells[j].m->ev));
+                    pool_mark_unref_(cells[j].m);
+                    pool_cell_slab_.erase(at);
+                    cells.erase(cells.begin() + static_cast<long>(j));
+                }
+                KRK_HIP(hipFree(sl.base));
+                expert_pool_.committed -= sl.bytes;
+                expert_pool_.reusable = expert_pool_.reusable > sl.bytes
+                                            ? expert_pool_.reusable - sl.bytes
+                                            : 0;
+                sl = PoolSlab{};
                 ++expert_pool_.trims;
+                progress = true;
             }
+            // Cells the arena does not own (KRK_EXPERT_ARENA=0) keep the old
+            // one-at-a-time path.
+            for (auto &entry : pool_) {
+                auto &cells = entry.second;
+                while (!cells.empty()) {
+                    const bool over2 =
+                        need > expert_pool_.budget ||
+                        expert_pool_.committed > expert_pool_.budget - need;
+                    if (!over2) break;
+                    if (pool_cell_slab_.count(cells.back().p)) break;
+                    PoolBlock b = cells.back();
+                    cells.pop_back();
+                    pool_kill_(b);
+                    expert_pool_.committed -= entry.first;
+                    expert_pool_.reusable -= entry.first;
+                    ++expert_pool_.trims;
+                    progress = true;
+                }
+            }
+            if (!progress) return;
         }
     }
+
     void set_expert_pool_budget(size_t bytes) override {
         expert_pool_.budget = bytes;
         if (expert_pool_.committed > bytes) pool_trim_(0);
@@ -601,13 +641,28 @@ public:
             expert_pool_.reusable -= rounded;
             expert_pool_.live += rounded;
             ++expert_pool_.reuses;
+            // A reused cell is handed out again, so its slab must count it as
+            // live -- the slab is only returnable at live == 0, and a reused
+            // cell that was not counted is a slab freed under an in-flight copy
+            // (measured: hipErrorInvalidValue from the ring's hipMemcpyAsync).
+            const auto back = pool_cell_slab_.find(b.p);
+            if (back != pool_cell_slab_.end())
+                ++pool_slabs_[back->second].live;
             // The cell's own reference moves from the free list to the cell.
             pool_live_.emplace(b.p, LiveCell{rounded, b.m});
             return b.p;
         }
         pool_trim_(rounded);
-        if (rounded > expert_pool_.budget ||
-            expert_pool_.committed > expert_pool_.budget - rounded) {
+        // The budget abort is the per-cell allocator's invariant, and with the
+        // arena it stops being one: a slab is rounded up to kSlabCells, so
+        // `committed` legitimately sits a slab's slack (up to ~70 MiB) above the
+        // cells handed out, and a budget that is exactly full is the steady
+        // state of a constrained run -- not evidence of a ledged bug. There the
+        // right answer is the refusal path the cache already handles (evict,
+        // retry, skip), which is what returning nullptr becomes below.
+        if (!expert_arena() &&
+            (rounded > expert_pool_.budget ||
+             expert_pool_.committed > expert_pool_.budget - rounded)) {
             KRK_ERROR("expert pool physical budget exhausted: live=%zu need=%zu budget=%zu",
                       expert_pool_.live, rounded, expert_pool_.budget);
             std::abort();
@@ -648,16 +703,26 @@ public:
                 return nullptr;
             }
         }
-        void *p = alloc(rounded);
+        void *p = expert_arena() ? pool_slab_take_(rounded) : alloc(rounded);
+        if (!p) return nullptr;
         pool_live_.emplace(p, LiveCell{rounded, nullptr});
-        expert_pool_.committed += rounded;
+        if (!expert_arena()) expert_pool_.committed += rounded;
         expert_pool_.live += rounded;
         ++expert_pool_.allocations;
         return p;
     }
+    // Opt-in, and it MEASURED SLOWER on the file it was written for. The slab
+    // does exactly what it was meant to (alloc row 72 -> 28 ms, reuse 0 ->
+    // 11 697 cells) and decode still loses: REAP-320, 16 tokens, 3 interleaved
+    // pairs, identical text -- 117.7 ms/step with one hipMalloc per cell against
+    // 138.0 with the arena. The loss is in `xfer` (894 -> 1486 ms), i.e. the
+    // copies into uniformly spaced cells, not the kernels; a padded stride made
+    // it worse by costing 3% of capacity, which is the cliff this pool sits on.
+    // So the default stays the per-cell allocator and this is the arm to retest
+    // if the address-locality cause is ever understood.
     static bool expert_arena() {
         const char *e = std::getenv("KRK_EXPERT_ARENA");
-        return !(e && e[0] == '0');
+        return e && *e && e[0] != '0';
     }
     void release_pooled(void *p, size_t bytes) override {
         void *ps[1] = {p};
@@ -732,7 +797,21 @@ public:
             pool_live_.erase(it);
             expert_pool_.live -= r;
             pool_drop_pending_(ps[i]);
-            if (!expert_arena() || expert_pool_.committed > expert_pool_.budget) {
+            const auto slab_of = pool_cell_slab_.find(ps[i]);
+            if (slab_of != pool_cell_slab_.end()) {
+                // The slab owns the memory: this is a return, not a free.
+                if (pool_slabs_[slab_of->second].live)
+                    --pool_slabs_[slab_of->second].live;
+                pool_mark_ref_(m);
+                pool_[r].push_back(PoolBlock{ps[i], m});
+                expert_pool_.reusable += r;
+            } else if (expert_pool_.committed > expert_pool_.budget) {
+                // Over the plan (a re-clamp can lower it under live cells):
+                // hand the memory back instead of caching it. The arena switch
+                // is NOT part of this test -- it picks the growth allocator,
+                // and caching a released cell is what the free list is for in
+                // both arms. Conflating them is what made the bench's reuse
+                // checks fail the moment the slab became opt-in.
                 if (m && m->ev) KRK_HIP(hipEventSynchronize(m->ev));
                 KRK_HIP(hipFree(ps[i]));
                 expert_pool_.committed -= r;
@@ -744,6 +823,76 @@ public:
             ++expert_pool_.release_slices;
         }
         pool_mark_unref_(m); // the burst's reference
+    }
+    // ---- the size-class arena ------------------------------------------------
+    // A cell is 256 B-aligned and an expert is two or three of them, so a tier
+    // that fills 7.4 GiB is ~10 000 cells of ONE OR TWO size classes. Growing
+    // that cell by cell meant one hipMalloc each (measured: 10 038 allocations
+    // = 656.7 ms of a 4.5 s run, and 28.8 ms of a 141 ms step even at a 1.5%
+    // miss rate). A slab is kSlabCells cells of one class cut from a single
+    // hipMalloc, so the same tier is ~100 allocations.
+    //
+    // The free list is unchanged and is still consulted first: a slab is only
+    // the growth path. `live` per slab is what makes a whole slab returnable --
+    // trim can hand one back to the driver only when every cell in it is on the
+    // free list, because a cell has no allocation header to free on its own.
+    static constexpr size_t kSlabCells = 32;
+    // No pad: a padded stride (64 KiB) was measured too and it is WORSE, not
+    // better -- 205 ms/step against 137, with `reuse` at 50 190 against 11 697,
+    // because the pad costs 3% of the tier's capacity and this pool sits on a
+    // cliff: 3% is the difference between holding the routed set and evicting
+    // it every token. The measurement is why this stays a knob rather than the
+    // default (see expert_arena below).
+    static constexpr size_t kSlabPad = 0;
+    struct PoolSlab {
+        void *base = nullptr;
+        size_t bytes = 0;   // the hipMalloc this slab owns
+        size_t cell = 0;    // rounded size class
+        size_t stride = 0;  // cell + kSlabPad
+        size_t cells = 0;
+        size_t used = 0;    // bump index
+        size_t live = 0;    // cells currently handed out
+    };
+    std::vector<PoolSlab> pool_slabs_;
+    std::unordered_map<void *, size_t> pool_cell_slab_; // cell -> slab index
+    // One cell out of a slab of the same size class, growing by a slab when the
+    // class has no room left. The slab is capped to what the budget can still
+    // take, so a nearly full pool grows a cell at a time instead of
+    // over-committing.
+    void *pool_slab_take_(size_t rounded) {
+        size_t at = pool_slabs_.size();
+        for (size_t i = 0; i < pool_slabs_.size(); i++) {
+            const PoolSlab &sl = pool_slabs_[i];
+            if (sl.base && sl.cell == rounded && sl.used < sl.cells) {
+                at = i;
+                break;
+            }
+        }
+        if (at == pool_slabs_.size()) {
+            size_t cells = kSlabCells;
+            const size_t room =
+                expert_pool_.budget > expert_pool_.committed
+                    ? expert_pool_.budget - expert_pool_.committed : 0;
+            const size_t stride = rounded + kSlabPad;
+            if (room < stride) return nullptr;
+            if (room / stride < cells) cells = room / stride;
+            void *base = alloc(stride * cells);
+            if (!base) return nullptr;
+            PoolSlab sl;
+            sl.base = base;
+            sl.bytes = stride * cells;
+            sl.cell = rounded;
+            sl.stride = stride;
+            sl.cells = cells;
+            pool_slabs_.push_back(sl);
+            expert_pool_.committed += sl.bytes;
+        }
+        PoolSlab &sl = pool_slabs_[at];
+        void *cell = static_cast<char *>(sl.base) + sl.used * sl.stride;
+        ++sl.used;
+        ++sl.live;
+        pool_cell_slab_[cell] = at;
+        return cell;
     }
     std::unordered_map<size_t, std::vector<PoolBlock>> pool_;
     std::unordered_map<void *, LiveCell> pool_live_;
@@ -979,6 +1128,17 @@ public:
             KRK_HIP(hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice));
             return;
         }
+        if (paged_direct_() && paged_ready_()) {
+            // The single-copy form of the measured direct arm, so a one-off
+            // staging and a promotion never disagree about which mechanism this
+            // machine prefers. One side stream, one host wait.
+            pool_honor_(dst, paged_stream_[0]);
+            KRK_HIP(hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice,
+                                   paged_stream_[0]));
+            KRK_HIP(hipStreamSynchronize(paged_stream_[0]));
+            krk_op_scope.bytes(static_cast<i64>(bytes));
+            return;
+        }
         if (bytes <= kStageMaxBytes && stage_upload(dst, src, bytes)) return;
         if (!paged_ready_()) {
             // Pinned memory is finite and losing the ring must degrade the
@@ -1011,7 +1171,11 @@ public:
                                    hipMemcpyHostToDevice, paged_stream_[slot]));
             KRK_HIP(hipEventRecord(paged_ev_[slot], paged_stream_[slot]));
             paged_used_[slot] = true;
-            if (nused < kPagedBufs) used[nused++] = slot;
+            used[nused++] = slot;
+            if (nused == kPagedBufs) {
+                paged_publish_(used, nused);
+                nused = 0;
+            }
         }
         pool_dep_done_(dep);
         paged_publish_(used, nused);
@@ -1042,9 +1206,10 @@ public:
             return;
         }
         if (paged_direct_() && paged_ready_()) {
-            // KRK_WARM_DMA=2. The driver stages a pageable source into its own
-            // pinned buffer; issuing all three slices on one side stream then
-            // leaves one host wait for the batch instead of one per slice.
+            // The direct arm, chosen at init when the aperture lets the driver
+            // stage a pageable source without the ring's memcpy. Issuing all
+            // three slices on one side stream leaves one host wait for the
+            // batch instead of one per slice.
             for (int i = 0; i < n; i++) {
                 if (!dst[i] || !src[i] || !bytes[i]) continue;
                 pool_honor_(dst[i], paged_stream_[0]);
@@ -1080,7 +1245,19 @@ public:
                 KRK_HIP(hipEventRecord(paged_ev_[slot], paged_stream_[slot]));
                 batch_bytes += static_cast<i64>(len);
                 paged_used_[slot] = true;
-                if (nused < kPagedBufs) used[nused++] = slot;
+                used[nused++] = slot;
+                // Publish in ring-sized groups. `used` holds kPagedBufs slots,
+                // and the first version recorded only the first kPagedBufs --
+                // so a batch with more chunks than that left the rest of its
+                // copies unordered against the default stream (a consumer GEMM
+                // could start before the DMA landed) and the ring then handed
+                // out slots nobody had claimed. Draining here keeps every copy
+                // in the batch ordered while never holding more than the ring
+                // can express.
+                if (nused == kPagedBufs) {
+                    paged_publish_(used, nused);
+                    nused = 0;
+                }
             }
             pool_dep_done_(dep);
         }
@@ -1096,6 +1273,45 @@ public:
     // copy were 26 ms + 21 ms of one serialized host pass, and the 21 ms was
     // almost entirely the memcpy through the pageable ring. KRK_WEIGHT_DMA=0
     // restores the ring path for an A/B.
+    void *upload_expert_prefetch(void *const dst[], const void *const src[],
+                                 const size_t bytes[], int n) override {
+        // Pinned sources only. A pageable source needs a host memcpy into the
+        // ring, which would run HERE, at issue time -- the serial cost this path
+        // exists to remove -- so it takes the staged path instead.
+        if (!pinned_dma_() || !pinned_ready_())
+            return upload_expert_staged(dst, src, bytes, n);
+        hipEvent_t ev = nullptr;
+        if (hipEventCreateWithFlags(&ev, hipEventDisableTiming) != hipSuccess) {
+            static_cast<void>(hipGetLastError());
+            return upload_expert_staged(dst, src, bytes, n);
+        }
+        int queued = 0;
+        for (int i = 0; i < n; i++) {
+            if (!dst[i] || !src[i] || !bytes[i]) continue;
+            // The cell may still be read by the previous owner; the copy stream
+            // waits for that release mark, never the host.
+            pool_honor_(dst[i], pinned_stream_);
+            if (hipMemcpyAsync(dst[i], src[i], bytes[i], hipMemcpyHostToDevice,
+                               pinned_stream_) != hipSuccess) {
+                static_cast<void>(hipGetLastError());
+                (void)hipEventDestroy(ev);
+                return upload_expert_staged(dst, src, bytes, n);
+            }
+            ++queued;
+        }
+        if (!queued || hipEventRecord(ev, pinned_stream_) != hipSuccess) {
+            static_cast<void>(hipGetLastError());
+            (void)hipEventDestroy(ev);
+            return nullptr;
+        }
+        return static_cast<void *>(ev);
+    }
+    bool wait_marker_stream(void *marker) override {
+        if (!marker) return false;
+        return hipStreamWaitEvent(0, static_cast<hipEvent_t>(marker), 0) ==
+               hipSuccess;
+    }
+
     void upload_pinned_batch(void *const dst[], const void *const src[],
                              const size_t bytes[], int n) override {
         if (n <= 0) return;
@@ -1306,10 +1522,9 @@ public:
     // Lazily builds the promotion ring. Chunk size, and with it the pinned
     // footprint (kPagedBufs * chunk), is sweepable with KRK_WARM_STAGE_KIB.
     // KRK_WARM_DMA=0 restores the blocking copy for the WARM -> HOT path, so a
-    // change here can be measured against what it replaced. KRK_WARM_DMA=2
-    // skips the ring and has the runtime stage a pageable source itself, on one
-    // side stream -- the same double copy without the ring bookkeeping, and one
-    // sync per batch instead of one per slice.
+    // change here can be measured against what it replaced. The ring is built
+    // even when the direct path is selected: the direct path borrows one of its
+    // streams, and a staging failure has to fall back somewhere.
     static bool paged_blocking_() {
         static const bool v = [] {
             const char *e = std::getenv("KRK_WARM_DMA");
@@ -1317,13 +1532,29 @@ public:
         }();
         return v;
     }
-    static bool paged_direct_() {
-        static const bool v = [] {
+    // Which pageable path runs is a MEASUREMENT, not a constant: Engine::init
+    // times the ring against the direct DMA at the promotion shape and picks the
+    // faster. That is why this is member state and not a function-static -- the
+    // probe has to flip it between its arms on one backend. KRK_WARM_DMA=1
+    // (ring) / =2 (direct) still forces a path, and it wins over the engine;
+    // =0 is the blocking copy above.
+    bool paged_direct_() const {
+        const int forced = pageable_env_();
+        return forced != 0 ? forced == 2 : pageable_direct_;
+    }
+    // 0 = not set by the environment, 1 = ring, 2 = direct.
+    static int pageable_env_() {
+        static const int v = [] {
             const char *e = std::getenv("KRK_WARM_DMA");
-            return e && e[0] == '2';
+            if (!e) return 0;
+            if (e[0] == '2') return 2;
+            if (e[0] == '1') return 1;
+            return 0;  // '0' is the blocking copy, and no selector at all
         }();
         return v;
     }
+    bool pageable_paths_selectable() const override { return true; }
+    void set_pageable_direct(bool on) override { pageable_direct_ = on; }
     bool paged_ready_() {
         if (paged_on_) return true;
         if (paged_failed_) return false;
@@ -2150,7 +2381,7 @@ public:
 #undef KRK_GEMV_M
             krk_op_scope.retag("gemm(gemv_m)");
         } else if (rung == GemmRung::kWmma) {
-#if defined(KRK_GFX11) || defined(KRK_GFX12)
+#if defined(KRK_WMMA_COMPILED)
             const unsigned bx = static_cast<unsigned>(
                 (n_out + wmma_cfg::BN - 1) / wmma_cfg::BN);
             const unsigned by = static_cast<unsigned>(
@@ -3018,12 +3249,17 @@ public:
                 pool_mark_unref_(b.m);
                 b.m = nullptr;
             }
-            KRK_HIP(hipFree(b.p));
+            // A slab cell's memory belongs to its slab, freed below.
+            if (!pool_cell_slab_.count(b.p)) KRK_HIP(hipFree(b.p));
         }
         for (const auto &entry : pool_live_) {
             pool_mark_unref_(entry.second.m);
-            KRK_HIP(hipFree(entry.first));
+            if (!pool_cell_slab_.count(entry.first)) KRK_HIP(hipFree(entry.first));
         }
+        for (PoolSlab &sl : pool_slabs_)
+            if (sl.base) KRK_HIP(hipFree(sl.base));
+        pool_slabs_.clear();
+        pool_cell_slab_.clear();
         for (const auto &entry : pool_pending_) pool_mark_unref_(entry.second);
         pool_pending_.clear();
         for (PoolMark *m : pool_free_marks_) {
@@ -3210,6 +3446,8 @@ private:
     int paged_next_ = 0;
     bool paged_on_ = false;
     bool paged_failed_ = false;
+    // Set by Engine::init from its own measurement; KRK_WARM_DMA overrides it.
+    bool pageable_direct_ = false;
     size_t paged_chunk_ = kPagedChunk;
     // Private stream + event for pinned-source weight staging (dense streaming).
     hipStream_t pinned_stream_ = nullptr;
@@ -3534,8 +3772,22 @@ Backend *make_hip_backend(int device_index, std::string *err) {
         static_cast<void>(hipGetLastError());
         large_bar = -1;
     }
-    KRK_INFO("HIP %s | %s | %s | %d CU | %.1f GiB VRAM | %s", hip_runtime_version().c_str(),
-             c.name.c_str(), c.gfx.c_str(), c.cu_count,
+    // Published, not just printed: the host policy acts on it (WARM pinning is
+    // the only lever a 256 MiB aperture leaves for the promotion path).
+    c.large_bar = large_bar;
+    // The driver version, for the H2D verdict cache. Deliberately the DRIVER's
+    // and not the HIP runtime's: the driver decides how a pageable source is
+    // staged, which is what a cached copy-path verdict is about, and both are
+    // printed so a cached entry can be traced back to what wrote it.
+    int driver_version = 0;
+    if (hipDriverGetVersion(&driver_version) != hipSuccess) {
+        static_cast<void>(hipGetLastError());
+        driver_version = 0;
+    }
+    c.driver_version = driver_version;
+    KRK_INFO("HIP %s | driver %d | %s | %s | %d CU | %.1f GiB VRAM | %s",
+             hip_runtime_version().c_str(), driver_version, c.name.c_str(),
+             c.gfx.c_str(), c.cu_count,
              static_cast<f64>(c.vram_total) / (1024.0 * 1024.0 * 1024.0),
              large_bar == 1  ? "BAR: runtime reports large BAR"
              : large_bar == 0 ? "BAR: runtime reports 256 MiB aperture"

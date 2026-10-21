@@ -247,7 +247,15 @@ below.
 Three sequential runs per model used the fixed `--bench` prompt, 256 greedy
 output tokens, `--ctx 4096`, `--chunk 256`; the ranges are run-to-run, not
 confidence intervals. The MoE's live policy selected a 610 MiB device expert
-budget and a 610 MiB pageable WARM tier on this 15.9 GiB GPU / 95.9 GiB host.
+budget and a 610 MiB WARM tier on this 15.9 GiB GPU / 95.9 GiB host.
+
+**The MoE row predates the WARM pin policy change (2026-10-21)** and its WARM
+tier was pageable, so its decode figure is a floor for the current build rather
+than a current reading: the same 256 MiB arm on a 40-layer 256-expert file went
+**139.8 -> 67.6 ms/step** when the whole tier became pinned, with identical
+stdout. The three small models were not re-run because none of them is present on
+this box any more (checked both model trees); the pin only changes models with an
+expert tier, and a dense model is unaffected by construction.
 The 8B's first load (5.61 s) had a cold file cache; the next two (1.90-1.93 s)
 were warm-cache loads. Throughput is the more stable comparison here; do not
 compare load times across those cache states.
@@ -1031,7 +1039,131 @@ over the 34.5 GiB auto tier (5/5, MAD 6.1%; 20.3 -> 23.9 tok/s).
 4 GiB beat nothing by exactly zero even though it halved the measured copy time:
 at half the working set the other half still pays the memcpy, and that half is
 what the step waits on. 8 GiB covered all 7098 MiB the run promoted and is where
-the gain appears. Pinned pages cannot be swapped, so this stays opt-in.
+the gain appears.
+
+**This is automatic, and a measurement decides it.** At init the run times a
+16 MiB copy through each path -- pageable (staging memcpy + DMA) against pinned
+(direct DMA) -- and pins when pinned is at least 1.20x faster, which it prints
+along with the decision (`promotion measured 10.1 GB/s pageable against 18.6
+GB/s pinned`). A ratio rather than the runtime's `large_bar` attribute, because
+the aperture is a **firmware** setting: Above 4G decoding + Resizable BAR
+changes it, Windows has reported the attribute as 0 with ReBAR enabled, and the
+pageable path keeps its ring memcpy either way. The prefix is a quarter of
+installed RAM, capped at 16 GiB, and the WARM tier is pinned **whole** inside
+that bound -- it used to keep half of itself pageable, and that half is the one
+every miss lands on: on the 256 MiB expert arm the same run goes **139.8 ->
+65.3 ms/step (7.2 -> 15.3 tok/s)** with byte-identical text when the whole tier
+is pinned, because a pageable promotion measured 469 us against 10 us from
+pinned. `--expert-pin-mb 0` opts out, `KRK_HOST_PIN_MB` sets the number
+explicitly, `KRK_PIN_AUTO=0` is the A/B arm, and `KRK_H2D_PROBE=0` falls back to
+the BAR hint. Measured with a
+16-token greedy
+run, interleaved pairs, identical text: REAP-320 **101.7 -> 88.2 ms/step**
+(+13.3%), a 35B-A3B **35.4 -> 30.1** (+17.4%, xfer 386 -> 193 us/expert), a
+disk-bound 30B-A3B +2% (the copy is 2% of its step), and a dense model 0% (no
+tier to pin) -- so the win is real exactly where promotions are on the critical
+path, and it is not claimed where they are not.
+
+**It also picks the PAGEABLE path, from the same probe.** Two paths exist: the
+staging ring (a host memcpy into a bounded pinned buffer, then a DMA) and a
+direct DMA the driver stages itself on one side stream. Init times both -- plus
+the pinned arm -- interleaved and order-balanced, takes the median, and switches
+to direct at **1.20x**, which is what a wide aperture (Resizable BAR) should
+buy by removing the host copy. This box's 256 MiB aperture lands ON the line
+rather than clearly under it -- the same binary read 8.7 against 10.6 GB/s
+(direct, 1.21x) in one run and 10.9 against 12.3 (ring, 1.13x) in another, both
+at 16 MiB -- so the verdict is cached rather than re-rolled every run: it is
+remembered per (card, driver version, probe size, aperture hint) and reused,
+which also stops the path from flipping between runs. The log line names both the
+age and the driver (`a 16 MiB copy from the cache, measured 18 min ago on driver
+71626331 at 11.6 GB/s ...`), so a cached rate is traceable without opening the
+file. `KRK_H2D_PROBE_RERUN=1` measures again,
+`KRK_H2D_CACHE=0` (or `KRK_H2D_CACHE=<path>` to move the file) disables or
+relocates it, and entries expire after 30 days. The file is pruned on every
+write: expired verdicts and another driver's older than a week go, so a
+driver update does not leave three dead lines behind for good, and the rewrite
+SAYS what it dropped (`H2D cache <path>: dropped 3 dead verdict(s) (1 expired,
+1 from another driver, 0 unreadable, 1 over the cap); 32 kept`) rather than
+quietly shrinking a file the user may be trying to account for. A clean rewrite
+prints nothing, so the line only ever appears when something actually went. The other branch is proved
+rather than inferred: a test-only backend simulates an aperture (real copies
+plus a bandwidth-shaped wait), and the suite's `test_pageable_path_probe` runs
+the whole policy on a wide one and a narrow one, at the real engine -- and then
+from a seeded cache, where the cached verdict must win over what the simulated
+card would measure. The same measurement decides the prefix, so on a wide
+aperture the pin declines on its own: there is no copy left for it to remove,
+and the run stays fast without unswappable RAM. `KRK_WARM_DMA=1|2` forces a
+path. `kraken-bench --h2d` prints the shape table and the balanced verdict, and
+then measures the engine's own probe at all three cached sizes (16/32/64 MiB)
+and WRITES that verdict -- so running it is how a machine refreshes the answer a
+normal run starts from, for example after enabling Resizable BAR in the BIOS.
+`kraken-bench --h2d-cache` is the other half of that: it reads the file back
+without opening a model, one line per entry -- probe size, the three rates, the
+path the engine's own predicate selects, and the age and driver that measured it
+-- and names the reason when a line is one a run would skip (`[expired]`, `[from
+an older cache format]`, `[a failed measurement]`). A live verdict from another
+driver is shown as `[another driver]` rather than as this run's, and a cache that
+is empty, missing or turned off lists as empty instead of failing. That is how
+"why is my run measuring again" is answered without a run.
+
+The probe itself no longer pays a fixed five iterations per size. `iters` is a
+cap and it stops as soon as the medians have settled -- at least three samples,
+median absolute deviation under 10%, and the two newest samples agreeing with
+the median, which is what catches a tight-but-ramping start. One iteration of a
+64 MiB probe is four times the work of a 16 MiB one and needs the fewest samples,
+so this is where the saving is: measured on this card, interleaved
+order-balanced pairs, the 64 MiB probe went **112 ms (forced 5) to 83 ms (3
+iterations), -25.9% in 3 of 3 pairs**, 32 MiB 59 to 43 ms, 16 MiB 31 to 25 ms,
+with the same path and pin chosen in every arm. `kraken-bench --h2d` now prints
+what it ran (`64 MiB (3 of 5 iter, spread 3.9%, 82 ms)`), `kraken-bench
+--h2d-noise <MiB>` prints the per-iteration rates and the spread that the rule is
+fitted to (one size per fresh process -- measuring all three in one process
+charges the cold driver state to whichever ran first), and
+`KRK_H2D_PROBE_ITERS=<n>` runs exactly n iterations, which is the old fixed quota
+and therefore the A/B arm.
+
+Every run that probes also says which it did, in one line at init, with the
+reason when it measured:
+
+```
+[info ] H2D verdict: reused the cached 16 MiB one (from the cache, measured 1 s ago on driver 71626331)
+[info ] H2D verdict: measured the card now (16 MiB, 3 arms x 5 iteration(s)) -- this card's 16 MiB entry is not usable (expired), 1 dead of 1 line(s)
+```
+
+The reason is the useful half: "measured now" on its own reads the same whether
+the cache was empty, held this card's verdict for a probe size this model does
+not bucket to, held it from another driver, or held it and it had expired -- and
+those are fixed differently (nothing to do, run a model that buckets there, wait
+for the next measurement to replace it, or nothing at all). `KRK_H2D_PROBE_RERUN=1`
+names itself as the reason, and a probe that could not allocate its buffers says
+that instead of printing a zero rate. The line is decided after the lookup and before the write, so it describes the cache
+the run found rather than the one it just wrote into.
+
+Whether any of that is worth it is a question about many runs, so the answer is
+kept beside the cache (`<cache>.stats`) and reported at the end of each one:
+
+```
+[stats ] h2d       6 of 8 probed run(s) reused a cached verdict (75%), 2 measured the card at 235.5 ms on average, so the cache has avoided about 1413 ms of probing
+[stats ] h2d          16 MiB: 2 of 3 reused (67%), 1 measured at 71.0 ms -> about 142 ms avoided
+[stats ] h2d          32 MiB: 4 of 5 reused (80%), 1 measured at 400.0 ms -> about 1600 ms avoided
+```
+
+The per-size rows are the honest ones. The probe size is part of the cache key,
+so a 64 MiB verdict is not the one a 16 MiB model asks for, and the measurement
+it replaces costs several times as much: a single blended rate describes no run
+in particular, and a machine whose only warmed model buckets to 64 MiB would read
+as a mediocre cache instead of one that had never been asked. Each row carries
+its own hit rate and its own avoided time, and a size that has avoided nothing
+prints no avoided figure rather than a reassuring `0 ms`.
+
+Only inits that got a verdict are counted -- a run with the probe off (or a dense
+model, which has no promotion path) reused nothing and measured nothing and is
+not part of the rate. The avoided-probe figure is priced at the average
+measurement this machine has actually paid rather than at a constant, and a
+tally with no measurement in it says the time is `not priced` instead of
+inventing a number. The ledger is best effort and last-writer-wins, so a
+concurrent server can round it: it is a tally, not an audit. `KRK_H2D_CACHE=0`
+disables the ledger with the cache it counts.
 
 The end-of-run `[stats ] pinned` line reports the copy-stream rate from events
 recorded on that stream: 22.7 GB/s in the pin-8192 arm, and 6.1-24.9 GB/s across

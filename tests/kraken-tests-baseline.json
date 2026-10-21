@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-20T20:26:13Z",
-  "recorded_commit": "4072855",
-  "totals": {"groups": 72, "passed": 3413, "run": 3413, "exit": 0},
+  "recorded_utc": "2026-10-21T17:29:44Z",
+  "recorded_commit": "72a01eb",
+  "totals": {"groups": 73, "passed": 3583, "run": 3583, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -47,7 +47,7 @@
     {"name": "test_moe_matches_dense_twin", "status": "pass", "passed": 6, "run": 6},
     {"name": "test_moe_grouped_prefill_matches_tokenwise", "status": "pass", "passed": 5, "run": 5},
     {"name": "test_expert_cache_policy", "status": "pass", "passed": 369, "run": 369},
-    {"name": "test_expert_cache_byte_budget", "status": "pass", "passed": 47, "run": 47},
+    {"name": "test_expert_cache_byte_budget", "status": "pass", "passed": 88, "run": 88},
     {"name": "test_expert_cache_warm_tier", "status": "pass", "passed": 72, "run": 72},
     {"name": "test_expert_dispatch_table", "status": "pass", "passed": 33, "run": 33},
     {"name": "test_draft_head", "status": "pass", "passed": 50, "run": 50},
@@ -76,6 +76,7 @@
     {"name": "test_kv_tier_no_kv_layers", "status": "pass", "passed": 11, "run": 11},
     {"name": "test_kv_tier_drop_vs_spill", "status": "pass", "passed": 17, "run": 17},
     {"name": "test_kv_tier_host_reserve_refusal", "status": "pass", "passed": 31, "run": 31},
-    {"name": "test_kv_tier_per_plane_cold_files", "status": "pass", "passed": 7, "run": 7}
+    {"name": "test_kv_tier_per_plane_cold_files", "status": "pass", "passed": 7, "run": 7},
+    {"name": "test_pageable_path_probe", "status": "pass", "passed": 129, "run": 129}
   ]
 }

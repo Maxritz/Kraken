@@ -280,6 +280,21 @@ public:
     // `lookahead_rejected()` and skipped, and a failed promotion is a miss, not
     // an error. Returns how many experts this promoted.
     size_t stage_batch(const ExpertSource &src, i32 layer, const i32 *experts, int n);
+    // The same advisory staging for a WARM set, but the copies are issued as ONE
+    // upload per source kind instead of one call per expert: a batch shares one
+    // staging-ring cursor, so slice N+1 stages while slice N is in flight, and
+    // the default stream is published once instead of 3k times. Room-making and
+    // the cell allocations stay per expert (each slot has its own size class).
+    // Returns the number of experts promoted.
+    size_t promote_batch(const ExpertSource &src, i32 layer, const i32 *experts,
+                         int n);
+    // Stage `experts` of `layer` even when the byte budget is full, by retiring
+    // slots the caller has finished with. Used one layer ahead: the fetch is
+    // issued after this layer's expert loop, so it runs under the next layer's
+    // mixer instead of in front of its own GEMMs. `leased` guards every slot the
+    // pass touches, so the eviction walk cannot take back what it just staged.
+    size_t stage_ahead(const ExpertSource &src, i32 layer, const i32 *experts,
+                       int n);
     u64 lookahead_staged() const { return lookahead_staged_; }
     u64 lookahead_rejected() const { return lookahead_rejected_; }
     u64 active_staged() const { return active_staged_; }
@@ -298,6 +313,17 @@ public:
     // cost instead of a sequence of A/B arms.
     f64 read_ms() const { return read_ms_; }   // read_host / mapping memcpy
     f64 room_ms() const { return room_ms_; }   // make_vram_room: evict + retire
+    // The two halves of the room row: the victim search (a scan of the slot
+    // map) and the release of the cells it picked. They have different fixes,
+    // and on a 14k-slot tier the scan is not obviously the cheap half.
+    f64 scan_ms() const { return scan_ms_; }
+    f64 retire_ms() const { return retire_ms_; }
+    // Victim scans issued and slot visits they cost, so a windowed pick can
+    // be compared against the global one on work done, not only on ms.
+    u64 scans() const { return scans_; }
+    size_t vram_index_keys() const { return vram_keys_.size(); }
+    size_t vram_index_resident() const { return vram_slots_; }
+    u64 scan_visits() const { return scan_visits_; }
     f64 alloc_ms() const { return alloc_ms_; } // alloc_pooled: pool wait or malloc
     f64 xfer_ms() const { return xfer_ms_; }   // upload_paged_batch, host wait in
 
@@ -349,6 +375,7 @@ public:
     // use; the host_* spellings are kept for existing callers.
     size_t warm_capacity_bytes() const { return host_budget_; }
     size_t warm_pinned_bytes() const { return host_pinned_bytes_; }
+    size_t host_pin_budget() const { return host_pin_bytes_; }
     size_t warm_pin_budget_bytes() const { return host_pin_bytes_; }
     size_t warm_used_bytes() const { return host_bytes_; }
     size_t warm_slots() const;
@@ -377,6 +404,10 @@ public:
     u64 cold_misses() const { return loads_; }
     u64 demotions() const { return demotions_; }
     u64 promotions() const { return promotions_; }
+    // Batched-promotion evidence: how many batch calls were issued and
+    // how many experts they carried, so a report can show the shape.
+    u64 promote_batches() const { return promote_batches_; }
+    u64 promote_batch_experts() const { return promote_batch_experts_; }
     // Lifetime acquire count (hits + loads) since the last clear().
     u64 acquires() const { return total_acquires_; }
     // Bytes that crossed a boundary, which is the traffic a residency policy
@@ -515,6 +546,9 @@ private:
         // the device reported 15.92 GiB in use with 0 evictions.
         bool in_vram() const { return m.up.present() && m.down.present(); }
         bool in_host() const { return h.up.present() && h.down.present(); }
+        // Position in vram_keys_, or -1. A resident vector is what keeps the
+        // victim search off the 14k-entry slot map: see pick_victim.
+        i64 vram_idx = -1;
     };
 
     // One acquire on a resident slot: counters earn pins, pins are never free.
@@ -535,7 +569,10 @@ private:
     // except for an expert that cannot fit the entire tier.
     bool warm_admit(const ExpertSource &src, i32 expert, Slot &s);
     // Host -> device. Makes VRAM room first, so it can evict like any miss.
-    bool promote_to_vram(Slot &s, bool staged = false);
+    // `prefetch` takes the pinned DMA ticket and leaves the default stream
+    // unblocked (see Backend::upload_expert_prefetch); `staged` is the ring's
+    // host-copy ticket. Promotion is the same arithmetic either way.
+    bool promote_to_vram(Slot &s, bool staged = false, bool prefetch = false);
     void finish_stage(Slot &s);
     // Evicts until one more slot of `need` bytes fits. Bytes are the test, not a
     // slot count: experts are not all one size, so counting slots against a
@@ -598,10 +635,25 @@ private:
     // Picks the slot to sacrifice from device: unpinned, then rarest, then
     // oldest. Host-tier copies are not candidates — they are not in the way.
     bool pick_victim(u64 *out);
+    // Resident-slot index used by pick_victim: O(1) insert, O(1) swap-remove.
+    void track_vram(const u64 key, Slot &s);
+    void untrack_vram(Slot &s);
     // WARM victim: a copy that is not backing a HOT slot goes first, then the
     // same frequency ordering as the device tier. Pins do not protect a copy
     // here.
     bool pick_warm_victim(u64 *out);
+    // The pool answers nullptr, not an abort, when the card has no room
+    // beside its VRAM floor and it holds no free cell of the requested size
+    // class. That is the steady state on the 16 GiB / 6-12 GiB targets this
+    // engine is built for, so a refused allocation is answered by giving the
+    // pool back cells this cache already owns -- the WARM copy survives, so
+    // the reclaimed expert costs a copy instead of a file read.
+    // False when there is nothing left to give back.
+    // `want` is the slice size the caller needs a cell for: a victim of the
+    // same size class hands its cells straight back (`alloc_pooled` looks
+    // a cell up by rounded size), so it is preferred over a plain LRU
+    // pick. 0 falls back to pick_victim().
+    bool force_reclaim(size_t want = 0);
 
     Backend *be_ = nullptr;
     size_t budget_ = 0;
@@ -609,6 +661,12 @@ private:
     size_t capacity_ = 0;
     size_t slot_budget_ = 0; // exact slot ceiling, 0 = derive from the bytes
     size_t vram_slots_ = 0;
+    // Device allocations the pool refused on a full card, and the evictions
+    // that answered them. Both are per-run evidence: refusals without
+    // reclaims is the state that used to reach hipMemcpy with a null
+    // destination.
+    size_t pool_refusals_ = 0;
+    size_t reclaims_ = 0;
     size_t host_budget_ = 0;
     size_t host_bytes_ = 0;
     // The ring: bytes of pinned device residency that the pool's budget does
@@ -644,6 +702,16 @@ private:
     f64 promote_ms_ = 0;     // wall time in promote_to_vram
     f64 read_ms_ = 0;        // wall time in the WARM file read
     f64 room_ms_ = 0;        // wall time making VRAM room
+    f64 scan_ms_ = 0;        // ... of which the victim search
+    f64 retire_ms_ = 0;      // ... and the cell release
+    u64 scans_ = 0, scan_visits_ = 0;
+    // The resident keys, and the hand the windowed victim search starts from.
+    // A scan of `slots_` is the wrong shape for this: the tier holds ~3.5k
+    // resident entries inside ~14k WARM ones, so a full-map pick walked 3503
+    // entries per eviction (measured: 9.19M visits / 2624 evictions, 505.9 ms
+    // of a 1.7 s decode, 55 ns a visit).
+    std::vector<u64> vram_keys_;
+    size_t victim_cursor_ = 0;
     f64 alloc_ms_ = 0;       // wall time in alloc_pooled
     f64 xfer_ms_ = 0;        // wall time in the pageable -> VRAM batch copy
     // Per-phase twins of the five timers above. Only PhasePrefill and
@@ -663,6 +731,8 @@ private:
     u64 active_staged_ = 0, active_used_ = 0;
     f64 active_wait_ms_ = 0;
     u64 promotions_ = 0;
+    u64 promote_batches_ = 0;
+    u64 promote_batch_experts_ = 0;
     u64 decays_ = 0;
     u64 seq_ = 0;
     std::unordered_map<u64, Slot> slots_;

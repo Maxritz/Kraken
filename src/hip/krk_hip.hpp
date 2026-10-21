@@ -34,8 +34,11 @@
 // macros (one -D per KRK_GPU_TARGETS entry, emitted by CMake for the whole
 // compile command) exist in both. Fold the two sources together so the host
 // and device passes select the same family.
-#if defined(__gfx1200__) || defined(__gfx1201__) || \
-    defined(KRK_OFFLOAD_GFX1200) || defined(KRK_OFFLOAD_GFX1201)
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define KRK_GFX12 1
+#elif defined(KRK_OFFLOAD_GFX1200)
+// gfx1200 target not used in this build — leave KRK_GFX12 off in host pass
+#elif defined(KRK_OFFLOAD_GFX1201)
 #define KRK_GFX12 1
 #elif (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) ||  \
        defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) ||  \
@@ -74,7 +77,10 @@
 // actually runs is chosen at runtime. The offload macros say what code objects
 // the binary carries, so they are what decides this, and the *runtime* device
 // then decides whether to use the rung.
-#if defined(KRK_GFX11) || defined(KRK_GFX12)
+#if defined(KRK_GFX11)
+#define KRK_WMMA_COMPILED 1
+#endif
+#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__))
 #define KRK_WMMA_COMPILED 1
 #endif
 

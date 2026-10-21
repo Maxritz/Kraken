@@ -108,8 +108,8 @@ else
     bad "clean-child" "rc=$rc, summary '${base:-none}'"
 fi
 
-if name_in "$LOG/child.log" "serial groups: none"; then
-    ok "serial-set" "the run reports the serial set: none declared"
+if name_in "$LOG/child.log" "serial groups: test_pageable_path_probe (times host->device"; then
+    ok "serial-set" "the run reports its serial set and why: the rate-measuring group"
 else
     bad "serial-set" "the plan must print the serial set ('serial groups: ...'); got '$(grep -m1 'serial' "$LOG/child.log")'"
 fi

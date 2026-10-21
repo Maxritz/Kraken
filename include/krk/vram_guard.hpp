@@ -16,7 +16,6 @@
 // needs. `KRK_VRAM_RESERVE_MB` / `KRK_RAM_RESERVE_MB` override them; setting
 // either to `0` is the A/B arm that restores the pre-guard behaviour.
 #include <cstddef>
-#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -73,7 +72,29 @@ inline size_t vram_floor_bytes(size_t total_vram) {
     return share > base ? share : base;
 }
 
-// The host twin: 2 GiB or an eighth of installed RAM. The ram policy already
+// The fraction of installed memory a run may plan for -- VRAM and host RAM
+// alike. 0.80 by default. This is a ceiling, not a measurement: two sessions
+// took a desktop down by planning WARM against *free* RAM, and a 79 GB corpus
+// on a 96 GiB box then filled the file cache until the machine paged itself to
+// a stop. The same rule has to hold at the small end, because the deployment
+// targets are 6/8/12 GiB cards with 16/24/32 GiB of RAM: 20% left to the OS is
+// what keeps a 16 GiB machine responsive, and it is 20% here too.
+// KRK_MEM_FRACTION overrides it (0.20..0.98; anything else is ignored).
+inline double mem_fraction() {
+    const char *v = std::getenv("KRK_MEM_FRACTION");
+    if (!v || !*v) return 0.80;
+    const double f = std::atof(v);
+    return (f >= 0.20 && f <= 0.98) ? f : 0.80;
+}
+
+// Bytes this process may plan for, out of `installed`.
+inline size_t mem_ceiling_bytes(size_t installed) {
+    if (installed == 0) return 0;
+    return static_cast<size_t>(static_cast<double>(installed) *
+                               mem_fraction());
+}
+
+// The host twin: 2 GiB or a fifth of installed RAM. The ram policy already
 // plans a 20% headroom for the WARM tier, but that plan is made once, before the
 // KV tier, the workspaces and the model's own buffers exist -- and staging is
 // what spends it, so the staging loop re-checks this floor per round. The
@@ -83,7 +104,10 @@ inline size_t host_reserve_bytes(size_t installed) {
     const long long env = guard_env_mib("KRK_RAM_RESERVE_MB");
     if (env >= 0) return guard_mib_to_bytes(env);
     const size_t gib = static_cast<size_t>(1) << 30;
-    const size_t share = installed / 8u;
+    // 20% at the default fraction, expressed as installed minus ceiling so
+    // the two stay one number. On 16/24/32 GiB that is 3.2/4.8/6.4 GiB.
+    const size_t ceiling = mem_ceiling_bytes(installed);
+    const size_t share = installed > ceiling ? installed - ceiling : installed / 8u;
     return share > 2 * gib ? share : 2 * gib;
 }
 
@@ -99,6 +123,93 @@ inline bool host_staging_fits(size_t need, size_t available, size_t reserve,
     if (available <= reserve) return false;
     const size_t room = available - reserve;
     return pending <= room && need <= room - pending;
+}
+
+// The automatic pinned WARM prefix, in bytes: the part of the host expert tier
+// that is page-locked, so a promotion out of it is one DMA instead of a
+// bounce-buffer copy through a 256 MiB BAR aperture. Measured on this box (RX
+// 9070 XT, 256 MiB aperture, 15.9 GiB): REAP-320 42 GiB routed / 24 GiB WARM
+// 101.7 -> 88.2 ms/step, a 35B-A3B at 9.4 GiB WARM 35.4 -> 30.1 ms/step -- the
+// xfer rate per expert halves, 386 -> 193 us.
+//
+// The rule used to keep HALF the tier pageable ("a small box still has a
+// pageable half") and pin at most an eighth of installed RAM. The half-tier
+// clamp was measured wrong at the shape a promotion actually has, and it is the
+// clamp that mattered: on the 256 MiB expert arm (Qwen3.8-Distill-35B-A3B Q2KXL,
+// 40 layers x 256 experts, WARM 9600 MiB, 24 greedy tokens, identical stdout in
+// every arm) the tier auto-pinned 4800 MiB and decode ran 139.8 ms/step with
+// xfer 2815 ms of 3216 -- 469 us per promotion at 2.0 GB/s. Pinning the whole
+// 9600 MiB took it to 65.3 ms/step, 15.3 tok/s, xfer 27 ms of host enqueue, 10 us
+// per promotion. The pageable half was not a spare copy of anything: it is the
+// half every miss lands on.
+//
+// So the bound is now a share of installed RAM only -- pinned pages cannot be
+// swapped, and this runs on laptops with 16 GiB -- and the tier is pinned WHOLE
+// whenever it fits inside that share. A quarter (24 GiB on a 96 GiB box), capped
+// at 16 GiB so a workstation does not page-lock a third of itself for one model;
+// 0 means pin nothing (no tier, an unknown host, or a tier smaller than a page).
+//
+// What this does NOT claim: that the H2D probe's ratio is the reason. The probe
+// times 16-64 MiB copies, and at the ~1 MiB shape of one expert's promotion the
+// pageable path measured 2.0 GB/s against the 9.9-10.6 GB/s the probe reports --
+// so the probe is a floor on that path's cost, not a model of it.
+inline size_t pinned_warm_prefix_bytes(size_t warm_bytes, size_t ram_installed) {
+    if (warm_bytes == 0 || ram_installed == 0) return 0;
+    if (warm_bytes < 65536) return 0;  // a tier smaller than a page is not an arena
+    const size_t gib = static_cast<size_t>(1) << 30;
+    size_t want = ram_installed / 4u;  // 24 GiB on a 96 GiB box
+    const size_t cap = 16 * gib;       // no run claims more than this
+    if (want > cap) want = cap;
+    if (want > warm_bytes) want = warm_bytes;  // the whole tier when it fits
+    return want;
+}
+
+// Is a pinned prefix worth its non-swappable RAM? Both numbers are MEASURED at
+// init by timing the two promotion paths at the shape a promotion uses:
+// `upload_paged_batch` (stage into the bounded pinned ring, then DMA) against
+// `upload_pinned_batch` (DMA straight out of the caller's buffer). A ratio, not
+// an absolute rate, because the question is only whether the pageable path pays
+// a copy that the pin would remove.
+//
+// Measured on this box: 7.6 against 22.7 GB/s on a 120B MoE's promotion shape,
+// 4.6 against ~9 GB/s on the REAP-320 file -- 2-3x. A card with a large
+// aperture (Resizable BAR, i.e. a FIRMWARE setting rather than a property of
+// the model) can do the pageable DMA without the ring's memcpy, and then the
+// ratio falls towards 1 and the pin buys nothing but unswappable pages.
+//
+// 1.20x, and the asymmetry is deliberate: over-pinning costs RAM that cannot be
+// swapped and nothing else (the measured pin curve is monotone and flat at the
+// top), while under-pinning leaves 10-18% of decode on the table. The line is
+// below every ratio measured here -- 1.60x at 16 MiB on the REAP-320 file,
+// 1.84x on a 35B-A3B, 2-3x on a 120B MoE's promotion shape -- and above what an
+// aperture with no host copy in the pageable path would give (~1.0-1.1x).
+inline bool warm_pin_worthwhile(double pageable_gbs, double pinned_gbs) {
+    if (!(pageable_gbs > 0.0) || !(pinned_gbs > 0.0)) return false;
+    return pinned_gbs >= pageable_gbs * 1.20;
+}
+
+// Does the driver-staged pageable DMA beat the staging ring? Both move a
+// pageable source; they differ in WHOSE copy stages it. The ring does a host
+// memcpy into a bounded pinned buffer per chunk and hands that to the DMA, which
+// is the only way through a narrow aperture. The direct path hands the pageable
+// pointer to the driver, which stages it in a buffer of its own: on a narrow
+// aperture that is one windowed bounce copy and it loses; on a wide one
+// (Resizable BAR -- a FIRMWARE setting) the staging is free, and the caller's
+// memcpy plus the per-chunk bookkeeping are gone.
+//
+// 1.20x, and that line is above a band that was MEASURED to flap. On this box
+// (256 MiB aperture) the same two paths read 9.3 against 10.5 GB/s at 16 MiB
+// (+13%) and 10.88 against 11.00 at 12.6 MB (+1%) -- the size alone moved the
+// answer across a 1.10 line, and a path chosen by that would be chosen by the
+// probe size rather than by the card. A wide aperture does not land in that
+// band: it removes the host copy entirely, which is a 2x-class gap. Below the
+// line the ring stays, because it owns an explicitly bounded buffer and a known
+// fallback while the direct path depends on driver staging this source tree
+// cannot see. Above it, `warm_pin_worthwhile` then declines the pin -- there is
+// no copy left to buy back.
+inline bool pageable_direct_wins(double ring_gbs, double direct_gbs) {
+    if (!(ring_gbs > 0.0) || !(direct_gbs > 0.0)) return false;
+    return direct_gbs >= ring_gbs * 1.20;
 }
 
 // Process-wide pageable-memory admission shared by the expert WARM tier and

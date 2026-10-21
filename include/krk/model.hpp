@@ -690,6 +690,17 @@ public:
         return t;
     }
 
+    // Bytes of file this model has mapped, summed over shards (0 when the
+    // model was not loaded from a mapping). The mapping is the third
+    // residency tier: it is the disk source, and every page it touches is
+    // page cache -- RAM that a WARM copy cannot spend a second time.
+    size_t mapped_bytes() const {
+        size_t n = 0;
+        for (const GgufShard &sh : gguf_.shards())
+            if (sh.file) n += sh.file->size();
+        return n;
+    }
+
 private:
     Backend *be_ = nullptr;
     // Dense weight streaming: layers whose weights live in the GGUF mapping and

@@ -176,12 +176,18 @@ void ExpertCache::clear() {
         drop_host(kv.second);
     }
     slots_.clear();
+    vram_keys_.clear();
+    victim_cursor_ = 0;
     if (be_) be_->set_expert_pool_owner(this, 0);
     bytes_ = 0;
     vram_slots_ = 0;
     pin_bytes_ = 0;
     pin_slots_ = 0;
     host_bytes_ = 0;
+    // Pinned bytes are a live figure like host_bytes_, and they are decremented
+    // per slot in drop_host(): leaving the total behind makes every later
+    // admission believe the pin prefix is already spent.
+    host_pinned_bytes_ = 0;
     capacity_ = 0;
     acquires_ = 0;
     total_acquires_ = 0;
@@ -227,6 +233,16 @@ void ExpertCache::reset_counters() {
     promote_ms_ = 0.0;
     read_ms_ = 0.0;
     room_ms_ = 0.0;
+    scan_ms_ = 0.0;
+    retire_ms_ = 0.0;
+    scans_ = 0;
+    scan_visits_ = 0;
+    // vram_keys_ is NOT touched here. This function deliberately keeps
+    // residency -- the warmup's product -- and an index cleared beside a
+    // resident tier is worse than no index: pick_victim then sees one key for
+    // thousands of resident slots, evicts by a corner of the set, and the
+    // promotions rose 2589 -> 6754 on the REAP-320 file before this line was
+    // removed (2.6x the traffic, xfer 578 -> 3537 ms).
     alloc_ms_ = 0.0;
     xfer_ms_ = 0.0;
     pf_promote_ms_ = pf_read_ms_ = pf_room_ms_ = pf_alloc_ms_ = pf_xfer_ms_ = 0.0;
@@ -434,7 +450,10 @@ void ExpertCache::touch(Slot &s) {
 void ExpertCache::finish_stage(Slot &s) {
     if (!s.staged) return;
     MsTimer t(&active_wait_ms_);
-    be_->wait_marker(s.ready);
+    // A prefetch ticket is ordered on the DEVICE: the default stream waits for
+    // the copy and the host never blocks, which is the whole point of issuing it
+    // a layer early. The ring path has no such event and keeps its host wait.
+    if (!be_->wait_marker_stream(s.ready)) be_->wait_marker(s.ready);
     be_->release_marker(s.ready);
     s.ready = nullptr;
     s.staged = false;
@@ -492,8 +511,35 @@ void ExpertCache::forget_if_dead(std::unordered_map<u64, Slot>::iterator it) {
     if (!it->second.in_vram() && !it->second.in_host()) slots_.erase(it);
 }
 
-void ExpertCache::retire(Slot &s) {
+void ExpertCache::track_vram(const u64 key, Slot &s) {
+    s.vram_idx = static_cast<i64>(vram_keys_.size());
+    vram_keys_.push_back(key);
+    vram_slots_++;
+}
+
+void ExpertCache::untrack_vram(Slot &s) {
+    if (s.vram_idx < 0) {
+        vram_slots_--;
+        return;
+    }
+    const size_t at = static_cast<size_t>(s.vram_idx);
+    if (at < vram_keys_.size()) {
+        const u64 moved = vram_keys_.back();
+        vram_keys_[at] = moved;
+        vram_keys_.pop_back();
+        // The slot that moved into `at` must know where it is now, or a later
+        // untrack would clear somebody else's entry.
+        if (moved != slot_key(s.layer, s.expert)) {
+            auto mit = slots_.find(moved);
+            if (mit != slots_.end()) mit->second.vram_idx = static_cast<i64>(at);
+        }
+    }
+    s.vram_idx = -1;
     vram_slots_--;
+}
+
+void ExpertCache::retire(Slot &s) {
+    untrack_vram(s);
     if (s.bytes <= bytes_) {
         bytes_ -= s.bytes;
     } else {
@@ -534,13 +580,64 @@ void ExpertCache::make_vram_room(size_t need) {
     // current and next fit before taking that lease.
     while (vram_slots_ > 0 && over_budget(need)) {
         u64 victim = 0;
-        if (!pick_victim(&victim)) break;
+        {
+            MsTimer t(&scan_ms_);
+            if (!pick_victim(&victim)) break;
+        }
         auto vit = slots_.find(victim);
         if (vit == slots_.end()) break;
-        retire(vit->second);
-        forget_if_dead(vit);
+        {
+            MsTimer t(&retire_ms_);
+            retire(vit->second);
+            forget_if_dead(vit);
+        }
         evictions_++;
     }
+}
+
+// The answer to a refused device allocation. make_vram_room() decides on the
+// byte budget, and that budget was planned at init -- before the KV cache, the
+// workspaces and this run's own buffers existed -- so on a card whose free
+// memory then shrank it can believe there is room while the pool's floor check
+// says there is none (measured on the REAP-288 file: budget 7624 MiB, 7445 MiB
+// resident, 3202 MiB free beside a 3261 MiB floor, i.e. negative room beside the
+// floor with 179 MiB of "budget" left). The bytes that make the next allocation
+// succeed are already on the device: they are this cache's own cells. Retiring
+// one slot returns three cells to the pool's free list, which is a reuse and not
+// a growth, so the floor is not crossed and the fit is exact rather than
+// estimated. This is also the eviction the budget would have ordered itself had
+// it been measured against the live card.
+bool ExpertCache::force_reclaim(size_t want) {
+    u64 victim = 0;
+    bool found = false;
+    // A victim of the SAME size class is worth more than the LRU: the pool hands
+    // cells out by rounded size, so a released cell of another class does not
+    // satisfy this allocation at all. Unpinned first, then pinned -- the ring's
+    // promise is still weaker than a run that cannot proceed.
+    if (want) {
+        for (int pass = 0; pass < 2 && !found; pass++) {
+            for (const auto &kv : slots_) {
+                const Slot &s = kv.second;
+                if (!s.in_vram() || s.leased) continue;
+                if (pass == 0 && s.pinned) continue;
+                bool match = false;
+                for (size_t slice : s.slice)
+                    if (slice == want) { match = true; break; }
+                if (!match) continue;
+                victim = kv.first;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found && !pick_victim(&victim)) return false;
+    auto vit = slots_.find(victim);
+    if (vit == slots_.end()) return false;
+    retire(vit->second);
+    forget_if_dead(vit);
+    evictions_++;
+    reclaims_++;
+    return true;
 }
 
 void ExpertCache::make_warm_room(size_t need) {
@@ -640,7 +737,7 @@ bool ExpertCache::warm_admit(const ExpertSource &src, i32 expert, Slot &s) {
     return true;
 }
 
-bool ExpertCache::promote_to_vram(Slot &s, bool staged) {
+bool ExpertCache::promote_to_vram(Slot &s, bool staged, bool prefetch) {
     const std::chrono::steady_clock::time_point t0 =
         std::chrono::steady_clock::now();
     struct ClockOut {
@@ -695,11 +792,16 @@ bool ExpertCache::promote_to_vram(Slot &s, bool staged) {
     for (int i = 0; i < 3; i++) {
         if (!from[i]->present()) continue;
         void *p = nullptr;
-        {
-            MsTimer t(&alloc_ms_, phase_sink(&pf_alloc_ms_, &dc_alloc_ms_));
-            p = be_->alloc_pooled(s.slice[i]);
+        for (int tries = 0;; tries++) {
+            {
+                MsTimer t(&alloc_ms_, phase_sink(&pf_alloc_ms_, &dc_alloc_ms_));
+                p = be_->alloc_pooled(s.slice[i]);
+            }
+            if (p) break;
+            if (tries >= 63 || !force_reclaim(s.slice[i])) break;
         }
         if (!p) {
+            ++pool_refusals_;
             // Same burst shape as drop(): the half-promoted slices go back at
             // one stream point, so they share one release mark.
             void *cells[3] = {};
@@ -723,7 +825,14 @@ bool ExpertCache::promote_to_vram(Slot &s, bool staged) {
     }
     {
         MsTimer t(&xfer_ms_, phase_sink(&pf_xfer_ms_, &dc_xfer_ms_));
-        if (s.host_pinned) {
+        if (prefetch) {
+            // One layer early: a DMA on the copy stream with a ticket, and the
+            // default stream is deliberately NOT ordered behind it here. The
+            // consumer (finish_stage, at the next layer's acquire) does that,
+            // which is what lets the copy run under the layer in front of it.
+            s.ready = be_->upload_expert_prefetch(batch_dst, batch_src, batch_len, nb);
+            s.staged = s.ready != nullptr;
+        } else if (s.host_pinned) {
             // The hot arm: the source is already pinned, so this is the DMA and
             // nothing else -- no bounded ring, no host memcpy of the expert in
             // front of it. The backend publishes the copies to the default
@@ -739,7 +848,7 @@ bool ExpertCache::promote_to_vram(Slot &s, bool staged) {
     }
     s.m = m;
     table_stale_ = true;
-    vram_slots_++;
+    track_vram(key, s);
     bytes_ += s.bytes;
     // A slot that was pinned while WARM (pin_layer, admit_hot) enters the
     // device tier straight into the ring: the bytes are charged to
@@ -770,35 +879,116 @@ void ExpertCache::decay() {
     decays_++;
 }
 
+// How many resident slots the victim search looks at per eviction. 0 means the
+// whole set -- the behaviour before vram_keys_ existed, kept as the arm.
+static size_t evict_window() {
+    static const size_t v = [] {
+        const char *e = std::getenv("KRK_EVICT_WINDOW");
+        if (e) {
+            const long k = std::strtol(e, nullptr, 10);
+            if (k >= 0) return static_cast<size_t>(k);
+        }
+        // Measured on the REAP-320 file (16 greedy tokens): 1 -> 103.3 ms/step,
+        // 2 -> 99.4, 4 -> 97.2, 8 -> 96.8, 16 -> 96.6, 32 -> 99.3, 64 -> 108.7,
+        // whole set -> 107.9. Wider is NOT better: a window of 64+ reaches
+        // freshly touched slots and evicts them, while a narrow window evicts
+        // around the hand -- the region nothing has asked for in a while. 8 and
+        // 16 tie; 16 keeps a little more choice for clustered routing.
+        return static_cast<size_t>(16);
+    }();
+    return v;
+}
+
+// The victim search is the room row's expensive half, and it was expensive for a
+// reason that has nothing to do with policy: it walked every slot in the cache
+// (3.5k resident inside 14k WARM) for every eviction -- measured 9.19M visits
+// for 2624 evictions, 505.9 ms of a 1.7 s REAP-320 decode, against 18.1 ms to
+// release the cells it picked. The scan is 96% of the eviction cost and it is
+// O(slots) per byte of room made, where the eviction itself is O(1).
+//
+// So the candidates come from vram_keys_ (resident slots only, O(1) insert and
+// swap-remove) and the search looks at `evict_window()` of them from a moving
+// hand, keeping the order the full scan used: unpinned before pinned, then
+// rarest, then oldest. A window differs only in that it cannot see a lazy slot
+// just outside it, and the hand is what covers that: consecutive evictions start
+// where the last one stopped, so the whole set is swept within n/window
+// evictions. KRK_EVICT_WINDOW=0 restores the global scan.
 bool ExpertCache::pick_victim(u64 *out) {
+    ++scans_;
+    const size_t n = vram_keys_.size();
+    if (n == 0) return false;
+    const size_t window = evict_window();
+    const size_t take = (window == 0 || window > n) ? n : window;
+    if (victim_cursor_ >= n) victim_cursor_ = 0;
     u64 best = 0;
+    size_t best_at = 0;
     bool have = false;
+    for (size_t i = 0; i < take; i++) {
+        const size_t at = (victim_cursor_ + i) % n;
+        auto it = slots_.find(vram_keys_[at]);
+        if (it == slots_.end()) continue;
+        const Slot &s = it->second;
+        ++scan_visits_;
+        if (!s.in_vram() || s.leased) continue; // never evict a current consumer
+        if (!have) {
+            best = it->first;
+            best_at = at;
+            have = true;
+            continue;
+        }
+        const Slot &cur = slots_.at(best);
+        // 1. unpinned beats pinned -- a pin is a promise, keep it
+        if (s.pinned != cur.pinned) {
+            if (cur.pinned) {
+                best = it->first;
+                best_at = at;
+            }
+            continue;
+        }
+        // 2. the rarest expert goes first
+        if (s.count < cur.count) {
+            best = it->first;
+            best_at = at;
+            continue;
+        }
+        // 3. equal counts: the older load goes first
+        if (s.count == cur.count && s.seq < cur.seq) {
+            best = it->first;
+            best_at = at;
+        }
+    }
+    if (have) {
+        // Start the next search after the slot just taken: the window then
+        // sweeps the tier instead of re-reading the same 64 entries.
+        victim_cursor_ = (best_at + 1) % n;
+        *out = best;
+        return true;
+    }
+    // Every slot in the window is leased. Rare, and refusing here is worse than
+    // a wide search -- a lease belongs to a consumer that is nearly done, while
+    // the room is needed now -- so fall back to the whole map once.
     for (const auto &kv : slots_) {
         const Slot &s = kv.second;
-        if (!s.in_vram() || s.leased) continue; // never evict a current consumer
+        ++scan_visits_;
+        if (!s.in_vram() || s.leased) continue;
         if (!have) {
             best = kv.first;
             have = true;
             continue;
         }
         const Slot &cur = slots_.at(best);
-        // 1. unpinned beats pinned — a pin is a promise, keep it
         if (s.pinned != cur.pinned) {
-            if (cur.pinned) {
-                best = kv.first;
-                continue;
-            }
+            if (cur.pinned) best = kv.first;
             continue;
         }
-        // 2. the rarest expert goes first
         if (s.count < cur.count) {
             best = kv.first;
             continue;
         }
-        // 3. equal counts: the older load goes first
         if (s.count == cur.count && s.seq < cur.seq) best = kv.first;
     }
     if (!have) return false;
+    victim_cursor_ = (victim_cursor_ + take) % n;
     *out = best;
     return true;
 }
@@ -1066,8 +1256,18 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
             if (++acquires_ >= decay_period()) decay();
             return &s.m;
         }
-        // No promotion (device allocation failed). Fall through and reload from
-        // the mapping; the host copy survives, so the next request is cheaper.
+        // No promotion (device allocation failed). The cold path below rebuilds
+        // this expert, and the slot MUST NOT survive into it: emplace() on an
+        // existing key is a no-op, so the insert at the end of this function
+        // would return the old entry -- whose ResidentExpert was never created,
+        // because the promotion is exactly what failed. That hands the caller
+        // null gate/up/down pointers to GEMM against, and leaks every cell the
+        // cold path just allocated. Reachable whenever the pool refuses a DMA,
+        // which is the ordinary state of a constrained card. The WARM bytes go
+        // back with drop_host(); the cold path re-reads only if the tier can
+        // take them again.
+        drop_host(s);
+        forget_if_dead(it);
     }
 
     Slot s;
@@ -1105,14 +1305,58 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     const void *batch_src[3] = {};
     size_t batch_len[3] = {};
     int nb = 0;
-    for (int i = 0; i < 3; i++) {
+    bool loaded = true;
+    for (int i = 0; i < 3 && loaded; i++) {
         const GgufTensor *t = srcs[i];
         const size_t per = lens[i];
         if (!t || per == 0) continue;
-        {
-            MsTimer tm(&alloc_ms_, phase_sink(&pf_alloc_ms_, &dc_alloc_ms_));
-            dsts[i]->data = be_->alloc_pooled(per);
+        // A refused allocation is NOT an error to ignore: alloc_pooled() answers
+        // nullptr when the card has nothing left beside its floor and no free
+        // cell of this size class, and that is the ordinary state of a
+        // constrained run (see force_reclaim). Using the answer as a pointer is
+        // what ended a REAP-288 decode with hipErrorInvalidValue raised by
+        // hipMemcpy(nullptr, ...) five tokens in, reported against the upload
+        // line rather than this one. Retry against the cache's own LRU, and if
+        // that cannot produce a cell, skip the expert instead of the run.
+        void *cell = nullptr;
+        for (int tries = 0;; tries++) {
+            {
+                MsTimer tm(&alloc_ms_, phase_sink(&pf_alloc_ms_, &dc_alloc_ms_));
+                cell = be_->alloc_pooled(per);
+            }
+            if (cell) break;
+            // 64 is a size-class search, not a room search: experts differ by
+            // layer, and a cell of another class is no use to this slice.
+            if (tries >= 63 || !force_reclaim(per)) break;
         }
+        if (!cell) {
+            // Release the slices already taken for this slot, keep WARM (the
+            // next acquire of this expert is then a promotion, not a file
+            // read), and leave the slot map and the byte ledger untouched.
+            void *cells[3] = {};
+            size_t clens[3] = {};
+            int n = 0;
+            for (int j = 0; j < 3; j++)
+                if (dsts[j]->data && lens[j]) {
+                    cells[n] = dsts[j]->data;
+                    clens[n] = lens[j];
+                    n++;
+                }
+            if (n) be_->release_pooled_batch(cells, clens, n);
+            for (int j = 0; j < 3; j++) dsts[j]->data = nullptr;
+            ++pool_refusals_;
+            if (pool_refusals_ == 1)
+                KRK_WARN("expert cache: the device refused one expert of layer "
+                         "%d (%.0f MiB) and no resident slot could give the cell "
+                         "back; the expert is skipped until one is evicted. "
+                         "Reduce --kv-mb/--ctx or --expert-cache-mb if this "
+                         "repeats, or set KRK_VRAM_FLOOR_MB=0 to let the pool "
+                         "take the card's last memory.",
+                         layer, static_cast<f64>(need) / 1048576.0);
+            loaded = false;
+            break;
+        }
+        dsts[i]->data = cell;
         dsts[i]->type = t->type;
         dsts[i]->n_in = static_cast<i64>(t->ne[0]);
         dsts[i]->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
@@ -1138,11 +1382,44 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
         else be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
     }
 
+    if (!loaded) {
+        // The WARM copy warm_admit() just paid for is KEPT, as the refusal above
+        // promises: the next acquire of this expert is then a promotion instead
+        // of a file read. That promise only holds if the slot is in the map --
+        // `s` is local, so returning here left the tier's host slices allocated
+        // and unreachable, and no later clear() could free them. Measured: the
+        // promotion-failure fixture left exactly one 24-byte expert in
+        // SharedHostRamBudget, which is process-wide, so every later admission
+        // in the same process ran against a ledger that never emptied.
+        if (s.in_host()) {
+            if (slots_.find(key) == slots_.end()) slots_.emplace(key, std::move(s));
+            else drop_host(s); // invariant break: never leak what we cannot store
+        }
+        return nullptr;
+    }
     bytes_ += need;
-    vram_slots_++;
+    track_vram(key, s);
     loads_++;
     bytes_loaded_ += need;
     auto ins = slots_.emplace(key, std::move(s));
+    if (!ins.second) {
+        // Defensive: a key that reappeared between the erase above and here is
+        // an invariant break, not a policy choice. Hand the cells back rather
+        // than returning an entry whose ResortExpert is somebody else's (see
+        // the WARM-hit fall-through).
+        void *cells[3] = {};
+        size_t clens[3] = {};
+        int nc = 0;
+        for (int j = 0; j < 3; j++)
+            if (dsts[j]->data && lens[j]) {
+                cells[nc] = dsts[j]->data;
+                clens[nc] = lens[j];
+                nc++;
+            }
+        if (nc) be_->release_pooled_batch(cells, clens, nc);
+        ++pool_refusals_;
+        return nullptr;
+    }
     if (++acquires_ >= decay_period()) decay();
     return &ins.first->second.m;
 }
@@ -1164,6 +1441,195 @@ bool ExpertCache::stage_next(const ExpertSource &src, i32 layer, i32 expert,
     cur->second.leased = false;
     if (ok) ++active_staged_;
     return ok;
+}
+
+size_t ExpertCache::promote_batch(const ExpertSource &src, i32 layer,
+                                  const i32 *experts, int n) {
+    if (!be_ || !src.present() || n <= 0 || budget_ == 0) return 0;
+    const std::chrono::steady_clock::time_point t0 =
+        std::chrono::steady_clock::now();
+    struct ClockOut {
+        f64 *ms;
+        f64 *ms2;
+        std::chrono::steady_clock::time_point t;
+        ~ClockOut() {
+            const f64 took = std::chrono::duration<f64, std::milli>(
+                                 std::chrono::steady_clock::now() - t)
+                                 .count();
+            *ms += took;
+            if (ms2) *ms2 += took;
+        }
+    } clock_out{&promote_ms_, phase_sink(&pf_promote_ms_, &dc_promote_ms_),
+                t0};
+
+    struct Item {
+        u64 key = 0;
+        ResidentExpert m;
+        size_t bytes = 0;
+        size_t slice[3] = {0, 0, 0};
+        // The WARM sources, captured before any room-making: WARM is inclusive,
+        // so a promotion never takes these away (retire only drops device
+        // copies), and a batch needs them without a second lookup.
+        const void *hsrc[3] = {nullptr, nullptr, nullptr};
+        bool pinned = false;
+    };
+    std::vector<Item> items;
+    items.reserve(static_cast<size_t>(n));
+    std::unordered_set<u64> seen;
+    // Cells taken for this batch are not in bytes_ until the commit below, so
+    // make_vram_room() would think the cache still has their room and stop
+    // evicting -- and the pool's own growth check then aborts at its budget
+    // (measured on the REAP-320 file: "expert pool physical budget exhausted"
+    // on the first batched layer). Carrying the outstanding reservation into the
+    // room request is what keeps the two ledgers agreeing while a batch is in
+    // flight.
+    size_t reserved = 0;
+
+    // ---- phase 1: room and cells, no copy yet ---------------------------
+    // The batch cannot be sized until every cell is known, so allocation stays
+    // per expert. Only the copies are merged, which is where the per-call cost
+    // of a decode step lives.
+    for (int i = 0; i < n; i++) {
+        const i32 e = experts[i];
+        if (e < 0 || e >= src.n_expert) continue;
+        const u64 key = slot_key(layer, e);
+        if (!seen.insert(key).second) continue;
+        auto it = slots_.find(key);
+        if (it == slots_.end() || !it->second.in_host() ||
+            it->second.in_vram())
+            continue;
+        size_t physical = 0;
+        for (size_t sl : it->second.slice)
+            if (sl) physical += be_->pooled_size(sl);
+        if (physical == 0) continue;
+        be_->set_expert_pool_owner(this, owner_bytes(physical));
+        {
+            MsTimer t(&room_ms_, phase_sink(&pf_room_ms_, &dc_room_ms_));
+            make_vram_room(physical + reserved);
+        }
+        // Room-making erases entries, so re-establish this one rather than
+        // reading across the call.
+        it = slots_.find(key);
+        if (it == slots_.end() || !it->second.in_host()) continue;
+        Slot &s = it->second;
+        Item item;
+        item.key = key;
+        item.bytes = physical;
+        item.pinned = s.host_pinned;
+        const QuantTensor *from[3] = {&s.h.gate, &s.h.up, &s.h.down};
+        QuantTensor *to[3] = {&item.m.gate, &item.m.up, &item.m.down};
+        bool ok = true;
+        for (int j = 0; j < 3 && ok; j++) {
+            if (!from[j]->present() || !from[j]->data) continue;
+            void *cell = nullptr;
+            for (int tries = 0;; tries++) {
+                {
+                    MsTimer t(&alloc_ms_, phase_sink(&pf_alloc_ms_, &dc_alloc_ms_));
+                    cell = be_->alloc_pooled(s.slice[j]);
+                }
+                if (cell) break;
+                if (tries >= 63 || !force_reclaim(s.slice[j])) break;
+            }
+            if (!cell) {
+                ok = false;
+                break;
+            }
+            *to[j] = *from[j];
+            to[j]->data = cell;
+            item.slice[j] = s.slice[j];
+            item.hsrc[j] = from[j]->data;
+        }
+        if (!ok) {
+            void *cells[3] = {};
+            size_t clens[3] = {};
+            int nc = 0;
+            for (int j = 0; j < 3; j++)
+                if (to[j]->data && item.slice[j]) {
+                    cells[nc] = to[j]->data;
+                    clens[nc] = item.slice[j];
+                    nc++;
+                }
+            if (nc) be_->release_pooled_batch(cells, clens, nc);
+            ++pool_refusals_;
+            continue;
+        }
+        reserved += physical;
+        items.push_back(std::move(item));
+    }
+    if (items.empty()) return 0;
+
+    // ---- phase 2: one batch per source kind ------------------------------
+    // Two at most, because a batch cannot mix a pinned source with a pageable
+    // one (the copy paths differ, and mixing them makes a copy read the wrong
+    // bytes). Everything else about the layer's routed set is one call.
+    for (int pass = 0; pass < 2; pass++) {
+        const bool want_pinned = pass == 0;
+        std::vector<void *> dst;
+        std::vector<const void *> srcp;
+        std::vector<size_t> len;
+        for (const Item &it2 : items) {
+            if (it2.pinned != want_pinned) continue;
+            const QuantTensor *q[3] = {&it2.m.gate, &it2.m.up, &it2.m.down};
+            for (int j = 0; j < 3; j++) {
+                if (!q[j]->present() || !q[j]->data || it2.slice[j] == 0)
+                    continue;
+                if (!it2.hsrc[j]) continue;
+                dst.push_back(q[j]->data);
+                srcp.push_back(it2.hsrc[j]);
+                len.push_back(it2.slice[j]);
+            }
+        }
+        if (dst.empty()) continue;
+        {
+            MsTimer t(&xfer_ms_, phase_sink(&pf_xfer_ms_, &dc_xfer_ms_));
+            if (want_pinned)
+                be_->upload_pinned_batch(dst.data(), srcp.data(), len.data(),
+                                         static_cast<int>(dst.size()));
+            else
+                be_->upload_paged_batch(dst.data(), srcp.data(), len.data(),
+                                        static_cast<int>(dst.size()));
+        }
+        ++promote_batches_;
+    }
+
+    // ---- phase 3: commit -------------------------------------------------
+    size_t done = 0;
+    for (Item &it2 : items) {
+        auto it = slots_.find(it2.key);
+        if (it == slots_.end() || !it->second.in_host()) {
+            // Evicted between the allocation and the copy: give the cells back
+            // rather than leave them resident with no owner.
+            void *cells[3] = {};
+            size_t clens[3] = {};
+            int nc = 0;
+            QuantTensor *q[3] = {&it2.m.gate, &it2.m.up, &it2.m.down};
+            for (int j = 0; j < 3; j++)
+                if (q[j]->present() && q[j]->data && it2.slice[j]) {
+                    cells[nc] = q[j]->data;
+                    clens[nc] = it2.slice[j];
+                    nc++;
+                }
+            if (nc) be_->release_pooled_batch(cells, clens, nc);
+            continue;
+        }
+        Slot &s = it->second;
+        s.bytes = it2.bytes;
+        s.m = it2.m;
+        table_stale_ = true;
+        track_vram(it2.key, s);
+        bytes_ += s.bytes;
+        if (s.pinned) {
+            pin_bytes_ += s.bytes;
+            pin_slots_++;
+        }
+        // The WARM copy stays: that is what makes the next eviction of this
+        // expert a promotion instead of a file read.
+        bytes_promoted_ += s.bytes;
+        promotions_++;
+        ++done;
+    }
+    promote_batch_experts_ += done;
+    return done;
 }
 
 size_t ExpertCache::stage_batch(const ExpertSource &src, i32 layer,
@@ -1193,6 +1659,72 @@ size_t ExpertCache::stage_batch(const ExpertSource &src, i32 layer,
             ++staged;
         }
     }
+    return staged;
+}
+
+size_t ExpertCache::stage_ahead(const ExpertSource &src, i32 layer,
+                                const i32 *experts, int n) {
+    if (!be_ || !src.present() || n <= 0 || budget_ == 0) return 0;
+    if (host_pin_bytes_ == 0) return 0; // the DMA ticket needs pinned sources
+    // Guard every slot this pass will need or create. `leased` is what
+    // pick_victim already honours, and this pass is a consumer of them exactly
+    // as a running row is: without it the LRU walk would take back the slot it
+    // just staged (a prefetched slot is the FRESHEST thing in the cache, so by
+    // count it is the first victim -- the one way this pass could thrash).
+    std::vector<Slot *> guard;
+    std::vector<std::pair<i32, i32>> want;
+    want.reserve(static_cast<size_t>(n));
+    // Every expert of the TARGET layer that is already resident is protected
+    // too, not just the ones this pass stages. Same-size-class eviction (the
+    // preference force_reclaim uses) would otherwise pick exactly those -- every
+    // expert of one layer shares the layer's size classes -- and this pass would
+    // evict the set it is trying to complete: measured +10-15% step time with
+    // that bug in place, because it doubled the promotions instead of hiding
+    // them.
+    for (auto &kv : slots_) {
+        Slot &g = kv.second;
+        if (g.layer == layer && g.in_vram() && !g.leased) {
+            g.leased = true;
+            guard.push_back(&g);
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        const i32 e = experts[i];
+        if (e < 0 || e >= src.n_expert) continue;
+        want.emplace_back(layer, e);
+        const auto it = slots_.find(slot_key(layer, e));
+        if (it != slots_.end() && it->second.in_vram() && !it->second.leased) {
+            it->second.leased = true;
+            guard.push_back(&it->second);
+        }
+    }
+    size_t staged = 0;
+    for (const auto &pr : want) {
+        auto it = slots_.find(slot_key(pr.first, pr.second));
+        if (it == slots_.end() || !it->second.in_host() ||
+            it->second.in_vram())
+            continue;
+        if (!it->second.host_pinned) continue; // the ticket copies pinned bytes
+        // The budget is full by construction on a constrained card (that is
+        // what makes a miss expensive), so the admission has to retire
+        // something the caller is done with rather than skip.
+        for (int tries = 0; over_budget(it->second.bytes) && tries < 64; tries++)
+            if (!force_reclaim(it->second.slice[0])) break;
+        if (over_budget(it->second.bytes)) {
+            ++lookahead_rejected_;
+            continue;
+        }
+        if (promote_to_vram(it->second, /*staged=*/true, /*prefetch=*/true)) {
+            ++lookahead_staged_;
+            ++staged;
+            auto pit = slots_.find(slot_key(pr.first, pr.second));
+            if (pit != slots_.end() && !pit->second.leased) {
+                pit->second.leased = true;
+                guard.push_back(&pit->second);
+            }
+        }
+    }
+    for (Slot *g : guard) g->leased = false;
     return staged;
 }
 

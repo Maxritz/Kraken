@@ -216,7 +216,7 @@ inline bool fused_layer_launch(const u8 *const w[],
         // row-parallelism alone is topped up with K-slices so more
         // weight loads overlap. Ties and invalid slices stay at 1.
         int sp = 1;
-#if defined(KRK_GFX11) || defined(KRK_GFX12)
+#if defined(KRK_WMMA_COMPILED)
         if (row_blocks < blk_target && n_in[m] >= 2 * 64) {
             sp = (blk_target + row_blocks - 1) / row_blocks;
             if (sp > 8) sp = 8;
@@ -254,7 +254,7 @@ inline bool fused_layer_launch(const u8 *const w[],
     }
     fused_layer_gemv_kernel<256>
         <<<static_cast<unsigned>(total), 256, 0, st>>>(fl);
-#if defined(KRK_GFX11) || defined(KRK_GFX12)
+#if defined(KRK_WMMA_COMPILED)
     // Split-K tail, identical to gemm_launch's: one small reduce per
     // split matrix, serially summing the fp32 partials to fp16.
     for (int m = 0; m < n_mat; m++)

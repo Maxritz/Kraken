@@ -45,6 +45,17 @@ struct DeviceCaps {
     bool has_wmma_gfx12 = false; // gfx12 K-split layout + fp8
     bool has_dot2 = false;      // v_dot2_f32_f16 / packed fp16 rate
     bool unified_mem = false;   // APU (Ryzen AI) — affects tiling choices
+    // hipDeviceAttributeIsLargeBar: 1 yes, 0 no (256 MiB aperture), -1 unknown.
+    // A HINT, not a fact -- WDDM has reported 0 on firmware with ReBAR on --
+    // so the copy path's own GB/s is what any decision should be based on.
+    int large_bar = -1;
+    // hipDriverGetVersion()'s integer; 0 when it cannot be read (the CPU
+    // backend, an old runtime). Carried into the H2D verdict cache's key: the
+    // driver is what stages a pageable source, so a cached copy-path verdict is
+    // a statement about THIS driver, and an update has to invalidate it the way
+    // a firmware change does. The banner already names the HIP *runtime*
+    // version; this is the kernel-mode half underneath it.
+    int driver_version = 0;
 
     const char *family_name() const {
         switch (family) {
@@ -262,6 +273,25 @@ public:
         upload_paged_batch(dst, src, bytes, n);
     }
 
+    // There are two ways to move a PAGEABLE source, and which one is faster is a
+    // property of the card's aperture -- a FIRMWARE setting (Above 4G decoding +
+    // Resizable BAR), not a constant. The ring stages each chunk through a
+    // bounded pinned buffer, which is the only way to reach the bus through a
+    // narrow aperture. `direct` hands the pageable source to the driver on one
+    // side stream: the driver still stages it internally, but a wide aperture
+    // makes that staging free of the windowed bounce copy the ring exists to
+    // avoid, so one sync per batch beats the ring's per-chunk bookkeeping and
+    // the caller's memcpy disappears entirely.
+    //
+    // Engine::init times both at the promotion shape and sets this from the
+    // result; KRK_WARM_DMA=1/2 forces either path. A backend with a single
+    // pageable path says so and ignores the setting -- that is why these are two
+    // calls and not one: `selectable` decides whether the measurement means
+    // anything, and it is false on the CPU backend, where a promotion is a
+    // memcpy either way.
+    virtual bool pageable_paths_selectable() const { return false; }
+    virtual void set_pageable_direct(bool) {}
+
     // Time and bytes the pinned copy stream spent moving these batches, from
     // events on that stream. A caller's wall clock around
     // upload_pinned_batch measures the ENQUEUE and nothing else -- that batch is
@@ -279,6 +309,20 @@ public:
         upload_paged_batch(dst, src, bytes, n);
         return nullptr;
     }
+
+    // Prefetch ticket: the bytes are DMA'd out of PINNED host memory on a
+    // private stream, with no host copy and NO default-stream wait -- the
+    // caller's kernels keep running and the consumer pays only a device-side
+    // ordering when it asks (wait_marker_stream). That is the difference from
+    // upload_expert_staged, whose ring copies through host memory at issue time
+    // and whose ticket is host-synchronised at consumption.
+    virtual void *upload_expert_prefetch(void *const dst[], const void *const src[],
+                                         const size_t bytes[], int n) {
+        return upload_expert_staged(dst, src, bytes, n);
+    }
+    // Orders the default stream behind a prefetch ticket without blocking the
+    // host. False when the backend cannot express that (no event to wait on).
+    virtual bool wait_marker_stream(void *) { return false; }
 
     // Small-object device allocations, pooled by the expert cache. A
     // promotion is a handful of ~1-2 MiB slices and the default

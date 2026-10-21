@@ -178,7 +178,7 @@ constexpr int kGemvMRowsMax = 8;
 // one 16x16 accumulator tile.
 // ---------------------------------------------------------------------------
 
-#if defined(KRK_GFX11) || defined(KRK_GFX12)
+#if defined(KRK_WMMA_COMPILED)
 
 struct wmma_cfg {
     static constexpr int BM = 32;
@@ -212,7 +212,7 @@ static constexpr int LD_PAD = 8; // half-element padding to break LDS bank confl
 
 // RDNA3: 16 fp16 per lane, lanes 0-15 and 16-31 replicated.
 // RDNA4: 8 fp16 per lane, the two lane groups split K in 4-value interleaves.
-#if defined(KRK_GFX12)
+#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__))
 constexpr int kFrag = 8;
 #else
 constexpr int kFrag = 16;
@@ -222,7 +222,7 @@ template <typename CFG>
 __device__ __forceinline__ void wmma_load_a(const _Float16 *xs, int m_off, int k,
                                             int lane, _Float16 (&frag)[kFrag]) {
     const int row = m_off + (lane & 15);
-#if defined(KRK_GFX12)
+#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__))
     const int koff = k + 8 * (lane >> 4);
 #else
     const int koff = k;
@@ -235,7 +235,7 @@ template <typename CFG>
 __device__ __forceinline__ void wmma_load_b(const _Float16 *ws, int n_off, int k,
                                             int lane, _Float16 (&frag)[kFrag]) {
     const int col = n_off + (lane & 15);
-#if defined(KRK_GFX12)
+#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__))
     const int koff = k + 8 * (lane >> 4);
 #else
     const int koff = k;
@@ -246,7 +246,7 @@ __device__ __forceinline__ void wmma_load_b(const _Float16 *ws, int n_off, int k
 
 __device__ __forceinline__ void wmma_mma(v8float &acc, const _Float16 (&a)[kFrag],
                                          const _Float16 (&b)[kFrag]) {
-#if defined(KRK_GFX12)
+#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__))
     const v8half av = {a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]};
     const v8half bv = {b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]};
     acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av, bv, acc);
@@ -258,7 +258,7 @@ __device__ __forceinline__ void wmma_mma(v8float &acc, const _Float16 (&a)[kFrag
 
 // Maps one accumulator slot back to its (row, col) inside the 16x16 tile.
 __device__ __forceinline__ void wmma_slot(int g, int lane, int *i, int *j) {
-#if defined(KRK_GFX12)
+#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__))
     *i = (lane >> 4) * 8 + g; // contiguous 8-row blocks per lane group
     *j = lane & 15;
 #else
@@ -717,7 +717,7 @@ __global__ void __launch_bounds__(THREADS)
     out[idx] = static_cast<_Float16>(acc);
 }
 
-#endif // KRK_GFX11 || KRK_GFX12
+#endif // KRK_WMMA_COMPILED
 
 // ---------------------------------------------------------------------------
 // SIMT GEMM — gfx10 and the portable fallback
@@ -806,7 +806,6 @@ __global__ void __launch_bounds__(simt_cfg::THREADS)
                     *reinterpret_cast<const u32 *>(&tmp[z]);
         }
         __syncthreads();
-
 #if defined(KRK_SIMT_USE_DOT2)
         // Packed pair fetch with the lane-rotated pair index; see the header
         // note above the kernel. q ^ tx keeps the 16 tx lanes on 16 banks and
@@ -816,11 +815,9 @@ __global__ void __launch_bounds__(simt_cfg::THREADS)
             const int qq = (q ^ tx) & (BK / 2 - 1);
             u32 a[TM], b[TN];
 #pragma unroll
-            for (int i = 0; i < TM; i++)
-                a[i] = *reinterpret_cast<const u32 *>(&xs[ty * TM + i][qq * 2]);
+            for (int i = 0; i < TM; i++) a[i] = *reinterpret_cast<const u32 *>(&xs[ty * TM + i][qq * 2]);
 #pragma unroll
-            for (int j = 0; j < TN; j++)
-                b[j] = *reinterpret_cast<const u32 *>(&ws[tx * TN + j][qq * 2]);
+            for (int j = 0; j < TN; j++) b[j] = *reinterpret_cast<const u32 *>(&ws[tx * TN + j][qq * 2]);
 #pragma unroll
             for (int i = 0; i < TM; i++) {
 #pragma unroll
@@ -851,6 +848,7 @@ __global__ void __launch_bounds__(simt_cfg::THREADS)
             }
         }
 #endif
+
         __syncthreads();
     }
 
@@ -863,8 +861,10 @@ __global__ void __launch_bounds__(simt_cfg::THREADS)
             if (gr < rows && gc < n_out) out[gr * n_out + gc] = static_cast<_Float16>(acc[i][j]);
         }
     }
-}
-
-} // namespace krk
+}} // namespace krk
 
 #endif // KRK_KERNEL_GEMM_HPP
+
+
+
+

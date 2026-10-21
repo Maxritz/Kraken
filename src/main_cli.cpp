@@ -552,6 +552,26 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                      static_cast<f64>(dev_total - dev_free) / 1073741824.0,
                      static_cast<f64>(dev_total) / 1073741824.0,
                      static_cast<f64>(dev_free) / 1073741824.0);
+    // The H2D probe's ledger, which only means anything across runs: this init
+    // either reused a cached verdict or paid for a measurement, and the question
+    // "is the cache earning its keep" is answered by how often it has been the
+    // former. Silent when nothing has been counted (a dense model has no
+    // promotion path, so it never probes and must not print zeros every run).
+    {
+        const krk::H2dProbeTally &tally = engine.h2d_tally();
+        const std::string h2d = krk::h2d_tally_text(tally);
+        if (!h2d.empty()) std::fprintf(out, "[stats ] h2d       %s\n", h2d.c_str());
+        // And per probe size, because the sizes are not interchangeable: a 64 MiB
+        // verdict is not the one a 16 MiB model asks for, and its measurement
+        // costs several times as much. The total above is the headline; these are
+        // the rows it is made of, and only the sizes this machine has actually
+        // probed appear.
+        for (size_t i = 0; i < tally.buckets.size(); i++) {
+            const std::string bucket = krk::h2d_tally_bucket_text(tally.buckets[i]);
+            if (!bucket.empty())
+                std::fprintf(out, "[stats ] h2d         %s\n", bucket.c_str());
+        }
+    }
 
     // Activation range. Every bound in the f16 activation path is a bounded
     // wrong answer, and printing nothing about it is how two laguna files read as
@@ -663,11 +683,14 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     const f64 token_div = r.generated > 0 ? static_cast<f64>(r.generated) : 1.0;
     std::fprintf(out,
                  "[stats ] experts   %.0f MiB VRAM budget, %zu/%zu slots resident, "
-                 "%zu pinned | WARM %.0f MiB pageable, %zu held (%.0f MiB, "
-                 "%.0f MiB prefetched)\n",
+                 "%zu pinned | WARM %.0f MiB (%.0f pinned of a %.0f budget), "
+                 "%zu held (%.0f MiB, %.0f MiB prefetched)\n",
                  static_cast<f64>(ec.budget_bytes()) / 1048576.0, ec.resident_slots(),
                  ec.capacity_slots(), ec.pinned_slots(),
-                 static_cast<f64>(ec.warm_capacity_bytes()) / 1048576.0, ec.warm_slots(),
+                 static_cast<f64>(ec.warm_capacity_bytes()) / 1048576.0,
+                 static_cast<f64>(ec.warm_pinned_bytes()) / 1048576.0,
+                 static_cast<f64>(ec.warm_pin_budget_bytes()) / 1048576.0,
+                 ec.warm_slots(),
                  static_cast<f64>(ec.warm_used_bytes()) / 1048576.0,
                  static_cast<f64>(ec.bytes_staged()) / 1048576.0);
     // The three tiers reported apart. A single "hit rate" reads as "the
@@ -707,15 +730,24 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                      engine.router_pref() ? "" : " (preference off)");
     const f64 prom_ms = ec.promote_ms();
     const f64 prom_mib = static_cast<f64>(ec.bytes_promoted()) / 1048576.0;
+    // The batched-promotion arm is off by default, so the clause is only there
+    // when it ran; the us/expert figure is the comparable one either way.
+    char batch_note[64] = "";
+    if (ec.promote_batches() > 0)
+        std::snprintf(batch_note, sizeof batch_note, " in %llu batch%s",
+                      static_cast<unsigned long long>(ec.promote_batches()),
+                      ec.promote_batches() == 1 ? "" : "es");
     std::fprintf(out,
                  "[stats ] transfer  %llu promotions, %.0f MiB in %.1f ms = %.1f GB/s "
-                 "(%.1f us/expert) | %llu VRAM evictions kept in WARM, %.0f MiB | "
+                 "(%.1f us/expert%s) | %llu VRAM evictions kept in WARM, %.0f "
+                 "MiB | "
                  "%.0f MiB read from the file (%.2f MiB/tok)\n",
                  static_cast<unsigned long long>(ec.promotions()), prom_mib, prom_ms,
                  prom_ms > 0 ? prom_mib / 1024.0 / (prom_ms / 1000.0) : 0.0,
                  ec.promotions() > 0
                      ? prom_ms * 1000.0 / static_cast<f64>(ec.promotions())
                      : 0.0,
+                 batch_note,
                  static_cast<unsigned long long>(ec.demotions()),
                  static_cast<f64>(ec.bytes_demoted()) / 1048576.0,
                  static_cast<f64>(ec.bytes_loaded()) / 1048576.0,
@@ -728,6 +760,26 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                  "alloc %8.1f ms | xfer %8.1f ms | (promote total %8.1f ms)\n",
                  ec.read_ms(), ec.room_ms(), ec.alloc_ms(), ec.xfer_ms(),
                  prom_ms);
+    // The room row's two halves. A victim search walks the whole slot map, so on
+    // a tier with 14k WARM entries one eviction is thousands of node visits --
+    // this line is what says whether the scan or the release is the cost.
+    if (ec.scans() > 0)
+        std::fprintf(out,
+                     "[stats ] evict       %llu scan(s), %llu slot visits, "
+                     "%.1f ms scanning + %.1f ms releasing = %.0f ns/visit, "
+                     "%.0f visits/scan | index %zu/%zu keys/resident\n",
+                     static_cast<unsigned long long>(ec.scans()),
+                     static_cast<unsigned long long>(ec.scan_visits()),
+                     ec.scan_ms(), ec.retire_ms(),
+                     ec.scan_visits() > 0
+                         ? ec.scan_ms() * 1e6 /
+                               static_cast<f64>(ec.scan_visits())
+                         : 0.0,
+                     ec.scans() > 0
+                         ? static_cast<f64>(ec.scan_visits()) /
+                               static_cast<f64>(ec.scans())
+                         : 0.0,
+                     ec.vram_index_keys(), ec.vram_index_resident());
     // The same four stages split by phase. The merged row above cannot say
     // which side a fix belongs on: a promotion inside a prefill chunk is the
     // same DMA behind up to `--chunk` rows, a decode promotion is behind one,

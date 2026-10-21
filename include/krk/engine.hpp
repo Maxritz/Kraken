@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "krk/backend.hpp"
+#include "krk/h2d_probe.hpp"
 #include "krk/hc.hpp"
 #include "krk/ple.hpp"
 #include "krk/expert_cpu.hpp"
@@ -488,6 +489,17 @@ public:
     const KvTierCache &kvt_k() const { return kvt_k_; }
     const KvTierCache &kvt_v() const { return kvt_v_; }
     const Model &model() const { return model_; }
+    // The host->device promotion probe this run MEASURED: the three rates, and
+    // with them which pageable path and which pinned prefix it selected. Read
+    // this instead of parsing the log line -- and, in the suite, compare the
+    // engine's actual choice against it: asserting a fixed verdict from a
+    // wall-clock measurement asserts the test machine's scheduler, not the code.
+    const H2dProbe &h2d_probe() const { return h2d_probe_; }
+    // The probe's cross-run ledger as this init left it: how many runs this
+    // machine has probed, how many reused a cached verdict, and how much time
+    // the measurements actually cost. The end of a run prints it -- one run's
+    // verdict is a hit rate of 100% or 0% and says nothing on its own.
+    const H2dProbeTally &h2d_tally() const { return h2d_tally_; }
     const Tokenizer &tokenizer() const { return tok_; }
     // Debug: logits from the most recent forward (n_vocab floats).
     const f32 *last_logits() const { return logits_host_; }
@@ -1020,6 +1032,8 @@ private:
     // through the same contract and `ws_ffn_` carries an exponent too.
     void *ws_fexp_ = nullptr;
     f32 *logits_host_ = nullptr;
+    H2dProbe h2d_probe_;
+    H2dProbeTally h2d_tally_;
     std::vector<i32> tok_scratch_;
     // Device top-k. The candidate buffer is sized for a degenerate cut; k is
     // one today (an argmax) but the buffers allow more without reallocating.
@@ -1073,6 +1087,15 @@ private:
     // Scratch for the layer-wide expert prefetch: the routed ids, deduped.
     std::vector<i32> prefetch_ids_;
     std::vector<u8> prefetch_seen_;
+    // Next-layer expert prefetch. Routing is sticky in time, so the routed set a
+    // layer chose on the PREVIOUS token is the best predictor available for the
+    // same layer on the next one -- and it is the only one that exists before
+    // the row that would produce the real set. Recorded per layer in moe_ffn
+    // and staged by the layer in front of it, so the DMA runs under a mixer
+    // instead of in front of the GEMMs that need the weights.
+    std::vector<std::vector<i32>> moe_hint_;
+    u64 next_prefetch_staged_ = 0;
+    u64 next_prefetch_layers_ = 0;
     // KRK_DUMP destination (see Engine::init): empty means the per-stage dump
     // hook in forward_core is inert.
     std::string dump_path_;

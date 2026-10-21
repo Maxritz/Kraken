@@ -21,6 +21,15 @@
 //   kraken-bench --sweep          # the shapes the local models actually use
 //   kraken-bench --gate           # correctness only; non-zero exit on failure
 //   kraken-bench --floor          # pure load-store ceiling for the decode shapes
+//   kraken-bench --h2d            # pageable/pinned copy rates, and the verdict a
+//                                 # normal run starts from (written to the H2D
+//                                 # cache at 16/32/64 MiB)
+//   kraken-bench --h2d-cache      # no model and no measurement: list what a run
+//                                 # will start from, oldest and dead lines
+//                                 # included, and mark the one this box uses
+//   kraken-bench --h2d-noise      # per-iteration rates at 16/32/64 MiB and how
+//                                 # far the medians move: the evidence the
+//                                 # probe's stop rule is built on
 //
 // --gate is the build gate (`ninja -C build-hip gate`, also a ctest case).
 // It does not print a number and hope: NaN and inf are counted separately
@@ -41,6 +50,7 @@
 // (710 GB/s), f16 GEMM 32x4096x4096 = 43.4 µs (772 GB/s, 24.7 TFLOP/s).
 #include <krk/backend.hpp>
 #include <krk/expert_cache.hpp>
+#include <krk/h2d_probe.hpp>
 #include <krk/hc.hpp>
 #include <krk/quant.hpp>
 
@@ -1719,7 +1729,7 @@ int h2d_bench(Backend *be, int iters) {
         const void *src[36];
         size_t bytes[36];
         int n;
-        bool pinned;
+        int mode;  // 0 = pageable ring, 1 = pageable direct, 2 = pinned source
     };
     void *dev = be->alloc(kBig);
     void *ph = be->alloc_host(kBig);
@@ -1730,14 +1740,14 @@ int h2d_bench(Backend *be, int iters) {
     }
     std::memset(ph, 1, kBig);
     std::memset(pp, 1, kBig);
-    auto make = [&](const char *name, int n, size_t bytes, bool pinned,
+    auto make = [&](const char *name, int n, size_t bytes, int mode,
                     bool slices) {
         Arm a{};
         a.name = name;
         a.n = n;
-        a.pinned = pinned;
+        a.mode = mode;
         for (int i = 0; i < n; i++) {
-            void *base = pinned ? ph : pp;
+            void *base = mode == 2 ? ph : pp;
             const size_t span = kBig > bytes ? kBig - bytes : 1;
             a.src[i] = static_cast<const char *>(base) + (slices ? 0 : (i * bytes) % span);
             a.dst[i] = static_cast<char *>(dev) + (i * bytes) % span;
@@ -1747,29 +1757,287 @@ int h2d_bench(Backend *be, int iters) {
     };
     // The three slices of one expert share one 13 MB pinned source, which is
     // what ExpertCache hands over: a promotion is 3 copies, not 1.
-    Arm arms[5] = {
-        make("pageable  1 x 12.6 MB", 1, kExpert, false, false),
-        make("pinned    1 x 12.6 MB", 1, kExpert, true, false),
-        make("pinned    3 x  4.4 MB", 3, kSlice, true, true),
-        make("pinned    1 x  128 MB", 1, kBig, true, false),
-        make("pinned   36 x  4.4 MB", 36, kSlice, true, true),
+    Arm arms[6] = {
+        make("pageable  1 x 12.6 MB", 1, kExpert, 0, false),
+        make("pageable  1 x 12.6 MB direct", 1, kExpert, 1, false),
+        make("pinned    1 x 12.6 MB", 1, kExpert, 2, false),
+        make("pinned    3 x  4.4 MB", 3, kSlice, 2, true),
+        make("pinned    1 x  128 MB", 1, kBig, 2, false),
+        make("pinned   36 x  4.4 MB", 36, kSlice, 2, true),
     };
-    std::printf("--- host->device, per call (average of %d)\n", iters);
+    // The two pageable arms are the SAME call with the path flipped, which is
+    // how the engine's init probe measures them: this table is the machine's
+    // answer to "does the aperture make the driver-staged copy free?", and the
+    // direct row is what a wide-aperture box is expected to win.
+    std::printf("--- host->device, per call (average of %d)%s\n", iters,
+                be->pageable_paths_selectable()
+                    ? ""
+                    : " [one pageable path: the direct row is the ring again]");
     for (Arm &a : arms) {
         const double ms = time_calls(be, iters, [&] {
-            if (a.pinned)
+            if (a.mode == 2) {
                 be->upload_pinned_batch(a.dst, a.src, a.bytes, a.n);
-            else
+            } else {
+                be->set_pageable_direct(a.mode == 1);
                 be->upload_paged_batch(a.dst, a.src, a.bytes, a.n);
+            }
         });
         double mb = 0;
         for (int i = 0; i < a.n; i++) mb += static_cast<double>(a.bytes[i]);
         std::printf("  %-24s %8.3f ms  %7.2f GB/s\n", a.name, ms,
                     ms > 0 ? mb / (ms * 1e6) : 0.0);
     }
+    // The table above runs its arms in sequence, and that is the one thing this
+    // repo has learned not to trust: the slot a run occupies is worth several
+    // GB/s, and it lands on whichever arm goes second. This is the honest
+    // comparison -- the same 12.6 MB copy, both paths every iteration, order
+    // swapped, median per arm -- and it is the number the engine's init probe
+    // acts on when it picks a pageable path.
+    if (be->pageable_paths_selectable()) {
+        void *dsts[1] = {dev};
+        const void *srcs[1] = {pp};
+        const size_t lens[1] = {kExpert};
+        auto one = [&](bool direct) {
+            be->set_pageable_direct(direct);
+            const std::chrono::steady_clock::time_point t0 =
+                std::chrono::steady_clock::now();
+            be->upload_paged_batch(dsts, srcs, lens, 1);
+            be->sync();
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0)
+                                  .count();
+            return ms > 0.0 ? static_cast<double>(kExpert) / (ms * 1e6) : 0.0;
+        };
+        one(false);
+        one(true);
+        std::vector<double> ring_v, direct_v;
+        const int pairs = iters > 16 ? iters / 8 : 2;
+        for (int i = 0; i < pairs; i++) {
+            if (i & 1) {
+                direct_v.push_back(one(true));
+                ring_v.push_back(one(false));
+            } else {
+                ring_v.push_back(one(false));
+                direct_v.push_back(one(true));
+            }
+        }
+        auto median = [](std::vector<double> &v) {
+            std::sort(v.begin(), v.end());
+            const size_t n = v.size();
+            return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+        };
+        const double ring = median(ring_v), direct = median(direct_v);
+        // The same predicate the engine applies (1.20x, not a separate line for
+        // the tool): a bench that said "direct" at 1.10 while init kept the ring
+        // would be printing a verdict the run does not act on.
+        const bool take_direct = krk::pageable_direct_wins(ring, direct);
+        std::printf("  balanced (%d order-swapped pairs, median): ring %.2f GB/s, "
+                    "direct %.2f GB/s (%.2fx) -> %s\n",
+                    pairs, ring, direct, ring > 0.0 ? direct / ring : 0.0,
+                    take_direct
+                        ? "direct (the aperture pays for the copy)"
+                        : "ring (the windowed staging costs more than the copy)");
+    }
+    // What a normal run will ACT ON, and where it comes from. The engine's probe
+    // buckets its copy to 16/32/64 MiB, so those are the only sizes a cache entry
+    // can be found under -- and the 12.6 MB pair above is deliberately none of
+    // them. Measuring all three here is what makes `--h2d` a REFRESH: after it
+    // runs, a normal init hits the cache instead of re-timing the card, and a
+    // BIOS change is re-measured by running this one command.
+    if (be->pageable_paths_selectable()) {
+        const std::string cache = krk::h2d_probe_cache_path();
+        const krk::DeviceCaps caps = be->caps();
+        krk::H2dCacheKey key;
+        key.name = caps.name + " " + caps.gfx;
+        key.vram_total = caps.vram_total;
+        key.large_bar = caps.large_bar;
+        key.driver_version = caps.driver_version;
+        std::printf("  engine probe (3 arms, up to %d iterations -- it stops when the "
+                    "medians settle, %s):\n",
+                    krk::kH2dProbeMaxIters,
+                    cache.empty() ? "cache off, nothing will be written"
+                                  : "the verdict a run starts from");
+        int written = 0;
+        krk::H2dCachePrune total;
+        for (size_t bytes = krk::kH2dProbeMinBytes;
+             bytes <= krk::kH2dProbeMaxBytes; bytes <<= 1) {
+            // Timed per size, because the early stop's whole point is this
+            // number: 64 MiB is where it saves the most and 16 MiB where it
+            // saves nothing.
+            const std::chrono::steady_clock::time_point t0 =
+                std::chrono::steady_clock::now();
+            const krk::H2dProbe p =
+                krk::probe_h2d_path(be, bytes, krk::kH2dProbeMaxIters);
+            const double probe_ms = std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - t0)
+                                        .count();
+            key.bytes = bytes;
+            if (!p.valid) {
+                std::printf("    %2zu MiB: not measured (an allocation failed)\n",
+                            bytes >> 20);
+                continue;
+            }
+            const bool direct_path =
+                krk::pageable_direct_wins(p.pageable_gbs, p.direct_gbs);
+            const double pageable = direct_path ? p.direct_gbs : p.pageable_gbs;
+            const bool pin = krk::warm_pin_worthwhile(pageable, p.pinned_gbs);
+            std::printf("    %2zu MiB (%d of %d iter, spread %.1f%%, %.0f ms): ring "
+                        "%.2f direct %.2f pinned %.2f GB/s -> %s, %s\n",
+                        bytes >> 20, p.iterations, krk::kH2dProbeMaxIters,
+                        100.0 * p.spread, probe_ms, p.pageable_gbs, p.direct_gbs,
+                        p.pinned_gbs, direct_path ? "direct" : "ring",
+                        pin ? "pin a WARM prefix" : "no pin (nothing to buy back)");
+            if (cache.empty()) continue;
+            krk::H2dCachePrune pruned;
+            if (krk::h2d_probe_cache_write(cache, key, p, krk::h2d_now_sec(),
+                                           &pruned)) {
+                ++written;
+                total.expired += pruned.expired;
+                total.other_driver += pruned.other_driver;
+                total.unreadable += pruned.unreadable;
+                total.evicted += pruned.evicted;
+                total.kept = pruned.kept;
+            } else {
+                std::printf("      (could not write %s)\n", cache.c_str());
+            }
+        }
+        if (cache.empty()) {
+            std::printf("  nothing cached: the cache is off\n");
+        } else {
+            std::printf("  cached %d verdict(s) for %s in %s\n", written,
+                        key.name.c_str(), cache.c_str());
+            const std::string pruned = krk::h2d_prune_text(total);
+            if (!pruned.empty()) std::printf("  cache %s\n", pruned.c_str());
+        }
+    }
+    be->set_pageable_direct(false);  // this is a probe, not a mode change
     be->release(dev);
     be->release_host(ph);
     be->release_host_pageable(pp);
+    return 0;
+}
+
+// ---- H2D probe noise: what the stop rule is built on -----------------------
+// The probe stops early when its medians have settled, and "settled" needs a
+// number. This arm prints, per probe size, the per-iteration rates and how far
+// the medians move as samples are added -- the evidence `kH2dProbeSettleSpread`
+// and `kH2dProbeMinIters` are chosen from, and the way to re-derive them on a
+// card whose noise is not this one's. It decides nothing and writes nothing.
+// `only_mib` restricts the arm to one size, which is the only way to compare
+// sizes honestly: the first size measured in a process pays the cold driver
+// state, and in one process that is always 16 MiB. Measured that way, 16 MiB read
+// 7-14% scattered while 64 MiB -- measured last, warm -- read 2-4%, which is the
+// ORDER, not the size. One size per invocation removes it.
+int h2d_noise(Backend *be, size_t only_mib) {
+    if (!be->pageable_paths_selectable()) {
+        std::printf("  this backend has one pageable path; there is no ratio to "
+                    "settle\n");
+        return 0;
+    }
+    const int cap = 9;
+    std::printf("  per-size iteration noise (%d iterations, %s):\n", cap,
+                "alternating order, as the probe runs them");
+    auto rel = [](const std::vector<double> &v, size_t n) {
+        return krk::h2d_relative_mad(std::vector<double>(v.begin(),
+                                                         v.begin() + static_cast<long>(n)));
+    };
+    for (size_t bytes = krk::kH2dProbeMinBytes;
+         bytes <= krk::kH2dProbeMaxBytes; bytes <<= 1) {
+        if (only_mib && (bytes >> 20) != only_mib) continue;
+        krk::H2dSamples s;
+        // collect_all: this arm prints the series the settle rule was FITTED to,
+        // so it must see all nine even when the rule would have stopped at three.
+        const krk::H2dProbe p = krk::probe_h2d_path(be, bytes, cap, &s, true);
+        if (!p.valid) {
+            std::printf("  %2zu MiB: not measured (an allocation failed)\n",
+                        bytes >> 20);
+            continue;
+        }
+        if (s.ring.size() != static_cast<size_t>(cap)) {
+            std::printf("  %2zu MiB: only %zu of %d samples came back\n",
+                        bytes >> 20, s.ring.size(), cap);
+            continue;
+        }
+        std::printf("  %2zu MiB:\n", bytes >> 20);
+        for (size_t i = 0; i < s.ring.size(); i++)
+            std::printf("    %2zu  ring %6.2f  direct %6.2f  pinned %6.2f GB/s\n", i + 1,
+                        s.ring[i], s.direct[i], s.pinned[i]);
+        std::printf("    n   relative MAD (ring/direct/pinned)\n");
+        for (size_t n = 3; n <= s.ring.size(); n++)
+            std::printf("    %2zu  %5.1f%%  %5.1f%%  %5.1f%%\n", n,
+                        100.0 * rel(s.ring, n), 100.0 * rel(s.direct, n),
+                        100.0 * rel(s.pinned, n));
+    }
+    return 0;
+}
+
+// ---- listing the H2D cache -------------------------------------------------
+// The other half of `--h2d`: it WRITES the verdict a normal run starts from,
+// this READS it back. Both are questions about the card rather than about a
+// model, so neither loads weights -- and the listing in particular is a single
+// file read, which is what makes it usable when a run is behaving differently
+// from the last one and the reason is a stale or missing entry.
+//
+// The device is opened only to learn this box's own key (card, aperture hint,
+// driver). A listing that FAILED because the card could not be opened would be
+// useless exactly when it is being consulted, so a missing device drops the
+// marking and keeps the listing.
+int h2d_cache_list() {
+    const std::string cache = krk::h2d_probe_cache_path();
+    if (cache.empty()) {
+        std::printf("h2d cache: off (KRK_H2D_CACHE=0, or no path this build can name)\n");
+        return 0;
+    }
+    std::printf("h2d cache: %s\n", cache.c_str());
+    std::string err;
+    Backend *be = make_hip_backend(0, &err);
+    krk::H2dCacheKey key;
+    bool have_key = false;
+    if (be) {
+        const krk::DeviceCaps caps = be->caps();
+        key.name = caps.name + " " + caps.gfx;
+        key.vram_total = caps.vram_total;
+        key.large_bar = caps.large_bar;
+        key.driver_version = caps.driver_version;
+        have_key = true;
+    } else {
+        std::printf("  (no device -- %s; entries are listed, this run's key is not)\n",
+                    err.c_str());
+    }
+    const std::vector<krk::H2dCacheEntry> entries = krk::h2d_cache_scan(
+        cache, krk::h2d_now_sec(), have_key ? &key : nullptr);
+    if (entries.empty()) {
+        std::printf("  empty: the next run measures the card (~20 ms) and writes here\n");
+        return 0;
+    }
+    int live = 0, dead = 0, for_card = 0, other_driver = 0;
+    for (size_t i = 0; i < entries.size(); i++) {
+        if (entries[i].live()) live++;
+        else dead++;
+        if (entries[i].matches && entries[i].live()) for_card++;
+        // Live but not this box's: the writer keeps it for the rollback window,
+        // and it must not be mistaken for the verdict this run would use.
+        const bool other = have_key && entries[i].live() &&
+                           entries[i].driver_version != key.driver_version;
+        if (other) other_driver++;
+        std::printf("  %s\n",
+                    krk::h2d_cache_entry_text(entries[i], other).c_str());
+    }
+    std::printf("  %d live", live);
+    if (other_driver) std::printf(" (%d from another driver)", other_driver);
+    std::printf(", %d dead of %zu line(s)", dead, entries.size());
+    // No model was opened, so which BUCKET a run asks for is not known here:
+    // that is why the listing matches on the card and says how many sizes it
+    // covers instead of claiming one of them. `--h2d` is how a size is chosen.
+    if (have_key) {
+        if (for_card)
+            std::printf("; %d verdict(s) for this card, one per probe size -- a run "
+                        "uses the one its model buckets to",
+                        for_card);
+        else
+            std::printf("; no verdict for this card -- a run measures here (~20 ms)");
+    }
+    std::printf("\n");
     return 0;
 }
 
@@ -2616,6 +2884,9 @@ int main(int argc, char **argv) {
     bool moe_table_test = false;
     bool floor = false;
     bool h2d = false;
+    bool h2d_noise_arm = false;
+    size_t h2d_noise_mib = 0;
+    bool h2d_cache = false;
     i64 failures = 0;
     Shape one{"one", DType::Q4_K, 4096, 4096, 1};
     for (int i = 1; i < argc; i++) {
@@ -2633,6 +2904,15 @@ int main(int argc, char **argv) {
         else if (a == "--moe-dispatch") moe_table_test = true;
         else if (a == "--floor") floor = true;
         else if (a == "--h2d") h2d = true;
+        else if (a == "--h2d-noise") {
+            h2d_noise_arm = true;
+            // Optional size in MiB, so each size can be measured in a fresh
+            // process: the cold driver state is otherwise always charged to
+            // whichever size ran first.
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                h2d_noise_mib = static_cast<size_t>(std::atoll(argv[++i]));
+        }
+        else if (a == "--h2d-cache") h2d_cache = true;
         else if (a.rfind("--dtype", 0) == 0) {
             const std::string d = argv[++i];
             one.t = d == "f16"    ? DType::F16
@@ -2652,6 +2932,11 @@ int main(int argc, char **argv) {
     // read the timing at all.
     if (gate) iters = 2;
 
+    // Before the backend the rest of the tool insists on: the cache is a file,
+    // and listing it must work even when the card will not open (that arm opens
+    // its own device, best effort, and says so if it cannot).
+    if (h2d_cache) return h2d_cache_list();
+
     std::string err;
     Backend *be = make_hip_backend(0, &err);
     if (!be) {
@@ -2660,6 +2945,7 @@ int main(int argc, char **argv) {
     }
     std::printf("device: %s\n\n", be->describe().c_str());
     if (h2d) return h2d_bench(be, iters);
+    if (h2d_noise_arm) return h2d_noise(be, h2d_noise_mib);
 
     // Launch floor: a real kernel with trivial work, same measurement method.
     {

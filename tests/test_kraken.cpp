@@ -24,6 +24,7 @@
 #include <vector>
 #include <random>
 #include <filesystem>
+#include <chrono>
 #include <fstream>
 
 #if defined(_WIN32)
@@ -45,6 +46,7 @@
 #endif
 
 #include "krk/vram_guard.hpp"
+#include "krk/h2d_probe.hpp"
 #include "krk/arch.hpp"
 #include "krk/draft_head.hpp"
 #include "krk/spec_sampling.hpp"
@@ -3973,6 +3975,45 @@ public:
         inner_->scatter_axpy_rows(d, s, r, a, nr, n, row_scale, row_exp);
     }
 
+    // --- a simulated aperture (test-only) ---------------------------------
+    // The probe's whole job is to read the card, so the only way to test the
+    // branch where a wide aperture wins is a backend whose two pageable paths
+    // really take different amounts of time. Each arm copies for real and then
+    // pays a bandwidth-shaped wait: `gbs` is the rate that arm should MEASURE on
+    // an idle machine, before the copy's own cost is added. With no aperture
+    // set, both arms are exactly the inner backend's memcpy, so no other group
+    // changes.
+    void set_test_aperture(double ring_gbs, double direct_gbs, double pin_gbs) {
+        aperture_ = true;
+        ring_ns_per_byte_ = ring_gbs > 0.0 ? 1.0 / ring_gbs : 0.0;
+        direct_ns_per_byte_ = direct_gbs > 0.0 ? 1.0 / direct_gbs : 0.0;
+        pin_ns_per_byte_ = pin_gbs > 0.0 ? 1.0 / pin_gbs : 0.0;
+    }
+    bool pageable_paths_selectable() const override { return aperture_; }
+    void set_pageable_direct(bool on) override {
+        direct_ = on;
+        ++path_switches_;
+    }
+    bool direct_enabled() const { return direct_; }
+    int path_switches() const { return path_switches_; }
+    void upload_paged_batch(void *const dst[], const void *const src[],
+                            const size_t bytes[], int n) override {
+        const double cost = direct_ ? direct_ns_per_byte_ : ring_ns_per_byte_;
+        for (int i = 0; i < n; i++) {
+            if (!dst[i] || !src[i] || !bytes[i]) continue;
+            std::memcpy(dst[i], src[i], bytes[i]);
+            sim_wait(cost * static_cast<double>(bytes[i]));
+        }
+    }
+    void upload_pinned_batch(void *const dst[], const void *const src[],
+                             const size_t bytes[], int n) override {
+        for (int i = 0; i < n; i++) {
+            if (!dst[i] || !src[i] || !bytes[i]) continue;
+            std::memcpy(dst[i], src[i], bytes[i]);
+            sim_wait(pin_ns_per_byte_ * static_cast<double>(bytes[i]));
+        }
+    }
+
     u64 releases() const { return releases_; }
     u64 allocations() const { return allocations_; }
     u64 host_allocs() const { return host_allocs_; }
@@ -3995,6 +4036,21 @@ private:
     bool require_markers_ = false;
     u64 host_allocs_ = 0;
     u64 host_releases_ = 0;
+    static void sim_wait(double ns) {
+        if (!(ns > 0.0)) return;
+        const std::chrono::steady_clock::time_point until =
+            std::chrono::steady_clock::now() +
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double, std::nano>(ns));
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    }
+    bool aperture_ = false;
+    bool direct_ = false;
+    int path_switches_ = 0;
+    double ring_ns_per_byte_ = 0.0;
+    double direct_ns_per_byte_ = 0.0;
+    double pin_ns_per_byte_ = 0.0;
 };
 
 // A four-expert source whose slices are 8 bytes each, so a 96-byte budget is
@@ -4282,6 +4338,8 @@ static void test_kv_tier_host_reserve_refusal() {
 }
 
 
+static void test_expert_promotion_failure();
+
 static void test_expert_cache_byte_budget() {
     const std::string path = "kraken-bytes-test.gguf";
     CHECK(build_expert_source_model_mixed(path), "wrote the byte-budget GGUF");
@@ -4346,10 +4404,90 @@ static void test_expert_cache_byte_budget() {
               "a smaller card keeps the 1 GiB floor");
         CHECK(krk::vram_reserve_bytes(64 * gib) == 4 * gib,
               "a large card reserves a sixteenth");
-        CHECK(krk::host_reserve_bytes(96 * gib) == 12 * gib,
-              "96 GiB of host RAM reserves 12 GiB");
+        // The host reserve is the other side of one number: the ceiling a run may
+        // plan for is KRK_MEM_FRACTION (0.80) of installed memory, so the reserve
+        // is the remaining fifth -- 19.2 GiB here, not the old eighth. Two hangs
+        // came from planning WARM against free RAM with no ceiling at all.
+        CHECK(krk::host_reserve_bytes(96 * gib) > 19 * gib &&
+                  krk::host_reserve_bytes(96 * gib) < 20 * gib,
+              "96 GiB of host RAM reserves the shortfall of the 80% ceiling (~19 GiB)");
+        CHECK(krk::mem_ceiling_bytes(96 * gib) >= 76 * gib &&
+                  krk::mem_ceiling_bytes(96 * gib) <= 77 * gib,
+              "the plan ceiling is 80% of installed by default (76.8 GiB of 96)");
+        CHECK(krk::host_reserve_bytes(16 * gib) > 3 * gib &&
+                  krk::host_reserve_bytes(16 * gib) < 4 * gib,
+              "a 16 GiB machine reserves ~3.2 GiB");
         CHECK(krk::host_reserve_bytes(4 * gib) == 2 * gib,
               "and the host reserve never drops below 2 GiB");
+        // The automatic pinned WARM prefix is policy, and the policy changed on a
+        // measurement: the old rule kept HALF the tier pageable, and that half is
+        // the one every miss lands on. On the 256 MiB expert arm (WARM 9600 MiB,
+        // 24 greedy tokens, identical stdout) the auto prefix was 4800 MiB and
+        // decode ran 139.8 ms/step with xfer 2815 ms of 3216; pinning the whole
+        // tier gave 65.3 ms/step, 15.3 tok/s, xfer 27 ms of enqueue. So the bound
+        // is now a quarter of installed RAM (capped at 16 GiB), and the tier is
+        // pinned WHOLE whenever it fits inside it.
+        CHECK(krk::pinned_warm_prefix_bytes(0, 96 * gib) == 0,
+              "no WARM tier means nothing to pin");
+        CHECK(krk::pinned_warm_prefix_bytes(24 * gib, 0) == 0,
+              "an unknown host size pins nothing (fails closed)");
+        CHECK(krk::pinned_warm_prefix_bytes(24 * gib, 96 * gib) == 16 * gib,
+              "96 GiB of RAM pins a quarter, capped at 16 GiB");
+        CHECK(krk::pinned_warm_prefix_bytes(200 * gib, 96 * gib) == 16 * gib,
+              "a larger tier does not raise the pin past that cap");
+        CHECK(krk::pinned_warm_prefix_bytes(64 * gib, 1024 * gib) == 16 * gib,
+              "and the cap holds however big the box");
+        CHECK(krk::pinned_warm_prefix_bytes(4 * gib, 96 * gib) == 4 * gib,
+              "a tier that fits the budget is pinned WHOLE -- the pageable half "
+              "was the half every miss landed on");
+        CHECK(krk::pinned_warm_prefix_bytes(9600 * (size_t(1) << 20), 96 * gib) ==
+                  9600 * (size_t(1) << 20),
+              "the measured 256 MiB arm's 9600 MiB tier auto-pins in full");
+        CHECK(krk::pinned_warm_prefix_bytes(16 * gib, 16 * gib) == 4 * gib,
+              "a 16 GiB laptop with a 16 GiB tier pins 4 GiB, not 8");
+        CHECK(krk::pinned_warm_prefix_bytes(1, 96 * gib) == 0,
+              "a tier smaller than a page pins nothing");
+        // The pin is decided by a MEASUREMENT, not by the runtime's BAR bit: the
+        // aperture is a firmware setting (Above 4G decoding + Resizable BAR),
+        // WDDM has reported 0 with ReBAR on, and a large aperture can still
+        // leave the staging memcpy in the pageable path. Timing both promotion
+        // paths at init is the fact; this is the line it is compared against.
+        CHECK(krk::warm_pin_worthwhile(7.6, 22.7),
+              "a 3x pageable/pinned gap is exactly what the pin is for");
+        CHECK(krk::warm_pin_worthwhile(4.6, 9.0),
+              "a 2x gap on a small aperture is worth it too");
+        CHECK(!krk::warm_pin_worthwhile(24.0, 26.0),
+              "an aperture that already DMAs pageable memory pins nothing");
+        CHECK(!krk::warm_pin_worthwhile(7.0, 7.5),
+              "and a 7% gap does not pay for RAM that cannot be swapped");
+        CHECK(!krk::warm_pin_worthwhile(10.0, 11.5),
+              "a 15% gap is under the line (an aperture with no host copy)");
+        CHECK(krk::warm_pin_worthwhile(10.0, 12.0),
+              "and a 20% gap is the line itself, which pins");
+        CHECK(!krk::warm_pin_worthwhile(0.0, 50.0),
+              "an unmeasurable pageable path is not an argument to pin");
+        // The same probe's other answer: WHICH pageable path runs. A tie keeps
+        // the ring -- it owns a bounded buffer and a fallback -- so the direct
+        // arm has to be clearly ahead to be adopted, because its staging is the
+        // driver's and not this source tree's.
+        CHECK(krk::pageable_direct_wins(10.0, 20.0),
+              "an aperture that removes the host copy is a 2x-class win");
+        CHECK(krk::pageable_direct_wins(10.0, 12.0),
+              "and 20% ahead is the line itself, which takes over");
+        CHECK(!krk::pageable_direct_wins(10.0, 11.3),
+              "the +13% this box reads at 16 MiB is inside the flap band");
+        CHECK(!krk::pageable_direct_wins(10.0, 11.0),
+              "and the +1% it reads at 12.6 MB certainly is");
+        CHECK(!krk::pageable_direct_wins(20.0, 20.5),
+              "a direct path within noise keeps the ring");
+        CHECK(!krk::pageable_direct_wins(0.0, 30.0),
+              "an unmeasurable ring is not a reason to switch");
+        // The interaction that is the point of measuring both: a wide aperture
+        // makes direct the faster pageable path AND leaves nothing for the pin
+        // to remove, so the run is fast without spending unswappable RAM.
+        CHECK(krk::pageable_direct_wins(10.0, 26.0) &&
+                  !krk::warm_pin_worthwhile(26.0, 27.0),
+              "a wide aperture picks direct and drops the pin in one decision");
         CHECK(!krk::host_staging_fits(1, 12 * gib, 12 * gib),
               "host staging stops at the exact reserve");
         CHECK(krk::host_staging_fits(1, 12 * gib + 1, 12 * gib),
@@ -4491,7 +4629,93 @@ static void test_expert_cache_byte_budget() {
         cache.clear();
     }
 
+    // 4. A statistics reset keeps residency, so it has to keep the resident
+    // index that says which slots are resident. reset_counters() cleared the
+    // index beside a tier it deliberately leaves full, and pick_victim then saw
+    // one key for thousands of resident slots -- on the REAP-320 file that cost
+    // 2589 -> 6754 promotions (2.6x the bytes over the link) with no counter
+    // saying anything was wrong. The index is an invariant of residency, not of
+    // the statistics generation, and this is the arm that says so.
+    {
+        ExpertCache cache;
+        cache.configure(cpu, corpus - 1, 0);
+        for (i32 e = 0; e < 4; e++) cache.acquire(a, 0, e);
+        for (i32 e = 0; e < 4; e++) cache.acquire(b, 1, e);
+        const size_t resident = cache.resident_slots();
+        CHECK(resident > 0 && cache.vram_index_keys() == resident,
+              "the resident index covers exactly the resident slots");
+        cache.reset_counters();
+        CHECK(cache.resident_slots() == resident,
+              "a counter reset keeps residency");
+        CHECK(cache.vram_index_keys() == resident,
+              "and keeps the resident index with it");
+        // A key this cache has never held, at a budget one byte short of the
+        // corpus: it can only be served by evicting.
+        CHECK(cache.acquire(a, 7, 0) != nullptr,
+              "a post-reset acquire that needs room is served");
+        CHECK(cache.evictions() > 0, "and it evicted rather than refusing");
+        CHECK(cache.vram_index_keys() == cache.resident_slots(),
+              "index and residency agree after the eviction");
+        cache.clear();
+        CHECK(cache.vram_index_keys() == 0 && cache.resident_slots() == 0,
+              "clear drops the index with the residency");
+    }
+
     delete cpu;
+    test_expert_promotion_failure();
+    std::remove(path.c_str());
+}
+
+// A refused promotion must not hand the caller an expert with no matrices.
+// The WARM-hit path fell through to the cold reload while the WARM slot stayed
+// in the map, and emplace() on an existing key is a no-op -- so acquire()
+// returned the OLD entry, whose ResidentExpert is exactly what the failed
+// promotion never built, and leaked the cells the reload had allocated. This is
+// the constrained-card path (the pool refuses a DMA), so it is not exotic.
+static void test_expert_promotion_failure() {
+    const std::string path = "kraken-promote-fail.gguf";
+    CHECK(build_expert_source_model(path),
+          "wrote the expert fixture for the promotion-failure case");
+    Backend *cpu = make_cpu_backend();
+    CountingBackend be(cpu);
+    Gguf g;
+    std::string err;
+    CHECK(g.load(path, &err), "loaded the promotion-failure fixture");
+    const ExpertSource src = expert_source(g);
+    CHECK(src.present() && src.expert_bytes() == 24,
+          "promotion-failure fixture is one 24-byte expert");
+
+    ExpertCache cache;
+    cache.configure(&be, 24, 96); // exactly one expert in VRAM, four in WARM
+    const ResidentExpert *a = cache.acquire(src, 0, 0);
+    CHECK(a && a->up.present() && a->down.present(),
+          "the first expert is resident with all three matrices");
+    const ResidentExpert *b = cache.acquire(src, 0, 1);
+    CHECK(b && b->up.present(), "a second expert takes the only slot");
+    CHECK(cache.in_vram(0, 0) != cache.in_vram(0, 1),
+          "one slot holds exactly one of the two experts");
+    const i32 warm_e = cache.in_vram(0, 0) ? 1 : 0;
+
+    // Every device allocation now fails: this expert is WARM-only, so its
+    // acquire() takes the promotion path and cannot complete it.
+    be.set_fail_allocation_after(0);
+    const ResidentExpert *refused = cache.acquire(src, 0, warm_e);
+    CHECK(!refused || (refused->up.present() && refused->down.present()),
+          "a refused promotion returns nullptr, never an incomplete expert");
+    be.set_fail_allocation_after(-1);
+    const ResidentExpert *after = cache.acquire(src, 0, warm_e);
+    CHECK(after && after->up.present() && after->gate.present(),
+          "the same expert loads normally once the device can allocate again");
+    cache.clear();
+    // The refused promotion above must leave nothing behind in the process-wide
+    // host ledger. It used to: warm_admit() had already paid for the expert's
+    // WARM copy, and the failed-device-load return dropped the local slot on
+    // the floor, so those host slices stayed allocated and unreachable -- 24
+    // bytes here that no clear() could free, and because the ledger is static
+    // it capped every later admission in the same process (the in-proc runner
+    // failed two KV groups on a budget the child runner gave them fresh).
+    CHECK(SharedHostRamBudget::used_bytes() == 0,
+          "a refused promotion keeps its WARM copy without leaking host bytes");
     std::remove(path.c_str());
 }
 
@@ -7328,7 +7552,12 @@ static const char *kSuiteUsage =
     "                               the run has, so a mismatch is constructed and\n"
     "                               the exit status it produces can be checked\n"
     "  KRK_TEST_SERIAL_OVERRIDE=<grp>  run one group in the serial lane for one\n"
-    "                               run, so that lane is exercised, not assumed\n";
+    "                               run, so that lane is exercised, not assumed\n"
+    "\n"
+    "KRK_H2D_CACHE is forced to 0 unless the caller set it: the measured H2D\n"
+    "verdict lives in the user's cache, and a test run must neither trust this\n"
+    "machine's real measurement nor overwrite it. The group that drives that\n"
+    "cache points it at its own file.\n";
 
 
 // ---------------------------------------------------------------------------
@@ -9443,6 +9672,800 @@ static void test_qwen4exp_hc_mix() {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Which pageable promotion path runs -- decided by the probe, on both apertures
+// ---------------------------------------------------------------------------
+//
+// Both of `Engine::init`'s promotion decisions are measurements, so a test that
+// hands them ratios would only exercise the comparison operators. The backend
+// here grows a simulated APERTURE instead: its two pageable paths really take
+// different amounts of time, the copies are real, and the numbers the probe
+// reports come out of the clock. That is the only way this suite can reach the
+// branch a Resizable-BAR box takes -- the card on this machine reports a 256 MiB
+// aperture and the probe keeps the ring on every run.
+static void test_pageable_path_probe() {
+    const size_t mib = static_cast<size_t>(1) << 20;
+    const size_t gib = static_cast<size_t>(1) << 30;
+
+    auto probe = [&](double ring_gbs, double direct_gbs, double pin_gbs) {
+        CountingBackend be(make_cpu_backend());
+        be.set_test_resources(16 * gib, 8 * gib, 16 * gib, 8 * gib);
+        be.set_test_aperture(ring_gbs, direct_gbs, pin_gbs);
+        return krk::probe_h2d_path(&be, 4 * mib, 3);
+    };
+
+    // A wide aperture: the driver stages a pageable source for free, so direct
+    // clears the ring by a wide margin. The slow arm is 0.4 GB/s on purpose --
+    // ~42 ms for the 16 MiB copy the engine probes at -- because a per-copy
+    // scheduling delay is ADDITIVE: it compresses any ratio towards 1, and a
+    // tight margin would make this group report the test box's load as the
+    // card's aperture. It runs in the serial lane for the same reason.
+    const krk::H2dProbe wide = probe(0.4, 20.0, 20.0);
+    CHECK(wide.valid, "the aperture probe measured all three arms");
+    CHECK(wide.direct_gbs > wide.pageable_gbs * 1.50,
+          "a wide aperture's direct path beats the staging ring");
+    CHECK(krk::pageable_direct_wins(wide.pageable_gbs, wide.direct_gbs),
+          "so the probe's own numbers select the direct path");
+
+    // A narrow aperture: the driver's staging serialises through the window, so
+    // the ring wins and the pin is worth its unswappable RAM.
+    const krk::H2dProbe narrow = probe(6.0, 0.4, 20.0);
+    CHECK(narrow.valid, "the narrow arm measured too");
+    CHECK(narrow.pageable_gbs > narrow.direct_gbs * 1.50,
+          "a windowed aperture keeps the staging ring");
+    CHECK(!krk::pageable_direct_wins(narrow.pageable_gbs, narrow.direct_gbs),
+          "and the probe does not switch paths on it");
+
+    // --- when the probe is allowed to stop -------------------------------
+    // Driven with the rates measured on this box (`--h2d-noise`, one size per
+    // process) rather than with sleeps: the rule is arithmetic, and its two
+    // failure modes are arithmetic too -- a tight ramp, and one noisy arm.
+    CHECK(krk::h2d_samples_settled({11.15, 11.77, 11.98},
+                                   krk::kH2dProbeSettleSpread),
+          "three tight samples settle -- the 64 MiB case the rule exists for");
+    CHECK(!krk::h2d_samples_settled({8.36, 7.86, 10.81},
+                                    krk::kH2dProbeSettleSpread),
+          "a tight RAMP does not: 16 MiB's first samples read below its steady "
+          "state, and the newest two give that away");
+    CHECK(krk::h2d_samples_settled({15.74, 23.02, 20.50, 21.55},
+                                   krk::kH2dProbeSettleSpread),
+          "32 MiB's pinned arm settles at four, after its cold first sample");
+    CHECK(!krk::h2d_samples_settled({9.0, 9.1}, krk::kH2dProbeSettleSpread),
+          "two samples never settle: a median needs three");
+    CHECK(!krk::h2d_samples_settled({0.0, 0.0, 0.0}, krk::kH2dProbeSettleSpread),
+          "a failed copy is not a settled rate");
+    {
+        krk::H2dSamples mixed;
+        mixed.ring = {11.15, 11.77, 11.98};
+        mixed.direct = {10.91, 11.82, 11.78};
+        mixed.pinned = {20.06, 14.0, 24.60};  // one arm still moving
+        CHECK(!krk::h2d_probe_settled(mixed, krk::kH2dProbeSettleSpread),
+              "one unsettled arm keeps the probe running: the pin decision reads it");
+    }
+    {
+        // The loop itself: `iters` is a cap, and the env arm restores the fixed
+        // quota the early stop replaced -- an A/B needs the old behaviour, not a
+        // smaller cap that would still stop early.
+        auto *probe_be = new CountingBackend(make_cpu_backend());
+        probe_be->set_test_resources(16 * gib, 8 * gib, 16 * gib, 8 * gib);
+        probe_be->set_test_aperture(0.4, 20.0, 20.0);
+        krk::H2dSamples auto_s;
+        const krk::H2dProbe auto_p = krk::probe_h2d_path(
+            probe_be, 4 * mib, krk::kH2dProbeMaxIters, &auto_s);
+        CHECK(auto_p.valid && auto_p.iterations >= krk::kH2dProbeMinIters &&
+                  auto_p.iterations <= krk::kH2dProbeMaxIters,
+              "the probe runs between the floor and the cap");
+        CHECK(auto_s.ring.size() == static_cast<size_t>(auto_p.iterations) &&
+                  auto_s.direct.size() == auto_s.ring.size() &&
+                  auto_s.pinned.size() == auto_s.ring.size(),
+              "and reports the samples it actually took, one per arm per iteration");
+        set_env_var("KRK_H2D_PROBE_ITERS", "3");
+        krk::H2dSamples forced_s;
+        const krk::H2dProbe forced_p = krk::probe_h2d_path(
+            probe_be, 4 * mib, krk::kH2dProbeMaxIters, &forced_s);
+        CHECK(forced_p.iterations == 3 && forced_s.ring.size() == 3,
+              "KRK_H2D_PROBE_ITERS runs exactly that many, which is the old "
+              "fixed quota");
+        set_env_var("KRK_H2D_PROBE_ITERS", "1");
+        const krk::H2dProbe floor_p = krk::probe_h2d_path(
+            probe_be, 4 * mib, krk::kH2dProbeMaxIters);
+        CHECK(floor_p.iterations >= krk::kH2dProbeMinIters,
+              "and a value below the floor is refused rather than measured");
+        clear_env_var("KRK_H2D_PROBE_ITERS");
+        // The arm that FITS the rule has to see the whole series, settled or
+        // not: asking for samples is not the same as declining the early stop.
+        krk::H2dSamples all_s;
+        const krk::H2dProbe all_p = krk::probe_h2d_path(
+            probe_be, 4 * mib, krk::kH2dProbeMaxIters, &all_s, true);
+        CHECK(all_p.iterations == krk::kH2dProbeMaxIters &&
+                  all_s.ring.size() == static_cast<size_t>(krk::kH2dProbeMaxIters),
+              "collect_all runs the whole cap, which is what --h2d-noise fits the "
+              "rule to");
+        delete probe_be;
+    }
+
+    // The wiring: Engine::init must APPLY that decision, and the two apertures
+    // must decode the same tokens -- the path is a performance choice, never a
+    // numerical one.
+    const std::string path = "kraken-aperture-path.gguf";
+    MoeSpec spec;
+    CHECK(build_tiny_moe_model(path, spec),
+          "wrote the MoE fixture for the aperture test");
+    auto run = [&](double ring_gbs, double direct_gbs, double pin_gbs,
+                   bool *direct_on, size_t *pin, std::vector<i32> *tokens,
+                   krk::H2dProbe *used) {
+        auto *be = new CountingBackend(make_cpu_backend());
+        be->set_test_resources(16 * gib, 8 * gib, 16 * gib, 8 * gib);
+        be->set_test_aperture(ring_gbs, direct_gbs, pin_gbs);
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        cfg.expert_warm_mb = 64;
+        std::string err;
+        const bool ok = engine.init(be, cfg, &err);
+        if (!ok) std::fprintf(stderr, "  aperture engine init: %s\n", err.c_str());
+        if (ok) {
+            GenerateParams p;
+            p.prompt = "the";
+            p.max_tokens = 2;
+            p.sampler.greedy = true;
+            p.sampler.temp = 0.0f;
+            GenerateResult r;
+            if (!engine.generate(p, &r))
+                std::fprintf(stderr, "  aperture generate failed\n");
+            *tokens = r.tokens;
+            *direct_on = be->direct_enabled();
+            *pin = engine.model().experts().host_pin_budget();
+            *used = engine.h2d_probe();
+        }
+        engine.shutdown();
+        delete be;
+        return ok;
+    };
+
+    bool wide_direct = false, narrow_direct = true;
+    size_t wide_pin = 1, narrow_pin = 0;
+    std::vector<i32> wide_tokens, narrow_tokens;
+    krk::H2dProbe wide_used, narrow_used;
+    const bool wide_ok =
+        run(0.4, 20.0, 20.0, &wide_direct, &wide_pin, &wide_tokens, &wide_used);
+    const bool narrow_ok =
+        run(6.0, 0.4, 20.0, &narrow_direct, &narrow_pin, &narrow_tokens,
+            &narrow_used);
+    CHECK(wide_ok && narrow_ok,
+          "the engine initialises on both simulated apertures");
+    CHECK(wide_direct, "a wide aperture's engine switches to the direct pageable path");
+    CHECK(!narrow_direct, "a windowed aperture's engine keeps the staging ring");
+    CHECK(wide_used.valid && narrow_used.valid,
+          "both runs published the probe they decided on");
+    // The wiring is the contract, and it holds whatever the machine was doing:
+    // the engine applied the rule to the numbers IT measured. Asserting a fixed
+    // verdict for the pin here would assert this box's scheduler -- direct and
+    // pinned are the same copy on a wide aperture, so that gap is a near-tie by
+    // construction.
+    CHECK(wide_direct ==
+              krk::pageable_direct_wins(wide_used.pageable_gbs, wide_used.direct_gbs),
+          "the path the engine set is the one its own measurement selected");
+    CHECK((wide_pin > 0) ==
+              krk::warm_pin_worthwhile(
+                  wide_direct ? wide_used.direct_gbs : wide_used.pageable_gbs,
+                  wide_used.pinned_gbs),
+          "and its pin follows the rate the chosen path will pay");
+    CHECK(narrow_direct ==
+              krk::pageable_direct_wins(narrow_used.pageable_gbs,
+                                        narrow_used.direct_gbs),
+          "the narrow run applied its own verdict too");
+    CHECK((narrow_pin > 0) ==
+              krk::warm_pin_worthwhile(narrow_used.pageable_gbs,
+                                       narrow_used.pinned_gbs),
+          "and its pin is the one its own numbers justified");
+    CHECK(wide_tokens.size() == narrow_tokens.size() && wide_tokens == narrow_tokens,
+          "both apertures decode the same tokens: the path is not numerical");
+
+    // --- the cache init reaches for before it measures -----------------------
+    // The probe measures the CARD, so its answer is stable across runs and is
+    // cached per (card, probe size, aperture hint). These arms drive the file
+    // directly, on a path this group owns, so what is checked is the format and
+    // the invalidation rules rather than this machine's cached verdict.
+    const std::string cache_path = "kraken-h2d-cache.txt";
+    set_env_var("KRK_H2D_CACHE", cache_path.c_str());
+    CHECK(krk::h2d_probe_cache_path() == cache_path,
+          "KRK_H2D_CACHE names the file the measured verdict is cached in");
+
+    krk::H2dCacheKey key;
+    {
+        CountingBackend cap_be(make_cpu_backend());
+        cap_be.set_test_resources(16 * gib, 8 * gib, 16 * gib, 8 * gib);
+        const krk::DeviceCaps caps = cap_be.caps();
+        key.name = caps.name + " " + caps.gfx;
+        key.vram_total = caps.vram_total;
+        key.large_bar = caps.large_bar;
+        key.driver_version = caps.driver_version;
+        key.bytes = 16 * mib; // the engine buckets this fixture's expert up to the floor
+    }
+    // The probe size is BUCKETED, not the model's own footprint: a cache can
+    // only be filled by a tool that knows every size a run can ask about, and
+    // `kraken-bench --h2d` measures exactly these three.
+    CHECK(krk::h2d_probe_size_bytes(1) == 16 * mib,
+          "a tiny expert probes at the 16 MiB floor");
+    CHECK(krk::h2d_probe_size_bytes(20 * mib) == 32 * mib,
+          "20 MiB rounds up to 32, so the bench's three sizes cover every model");
+    CHECK(krk::h2d_probe_size_bytes(40 * mib) == 64 * mib,
+          "40 MiB rounds up to 64");
+    CHECK(krk::h2d_probe_size_bytes(1024 * mib) == 64 * mib,
+          "and nothing is probed past the 64 MiB ceiling");
+    // The log line's provenance, pinned as text: a cached number is only
+    // interpretable with its age AND the driver that measured it, and a backend
+    // that cannot report a driver has to say so rather than print nothing.
+    const std::string fresh_origin = krk::h2d_probe_origin(false, 0, 71626331);
+    CHECK(fresh_origin.find("measured now") != std::string::npos &&
+              fresh_origin.find("71626331") != std::string::npos,
+          "a fresh measurement names the driver that produced it");
+    CHECK(krk::h2d_probe_origin(true, 8, 71626331).find("measured 8 s ago") !=
+              std::string::npos,
+          "a cached verdict says how old it is");
+    CHECK(krk::h2d_probe_origin(true, 7200, 71626331).find("measured 2 h ago") !=
+              std::string::npos,
+          "and switches to hours when the seconds stop being readable");
+    CHECK(krk::h2d_probe_origin(true, 8, 0).find("driver unknown") !=
+              std::string::npos,
+          "a backend that cannot report its driver says so instead of going quiet");
+
+    const long long now = krk::h2d_now_sec();
+    CHECK(krk::h2d_probe_cache_write(cache_path, key, wide, now),
+          "a measured verdict is written to the cache");
+    const krk::H2dCacheLookup back = krk::h2d_probe_cache_read(cache_path, key, now);
+    CHECK(back.hit && std::fabs(back.probe.pageable_gbs - wide.pageable_gbs) < 1e-3 &&
+              std::fabs(back.probe.direct_gbs - wide.direct_gbs) < 1e-3 &&
+              std::fabs(back.probe.pinned_gbs - wide.pinned_gbs) < 1e-3,
+          "it reads back as the same three rates");
+    CHECK(back.hit && back.probe.valid, "... and as a usable verdict, not just numbers");
+
+    // Each invalidation rule is a way a cached answer would be WRONG, so each
+    // one is exercised rather than described.
+    krk::H2dCacheKey other = key;
+    other.bytes += 8 * mib;
+    CHECK(!krk::h2d_probe_cache_read(cache_path, other, now).hit,
+          "a verdict measured at another probe size is not quoted for this one");
+    other = key;
+    other.large_bar = key.large_bar == 1 ? 0 : 1;
+    CHECK(!krk::h2d_probe_cache_read(cache_path, other, now).hit,
+          "a changed aperture hint invalidates the verdict -- the firmware event");
+    other = key;
+    other.vram_total += gib;
+    CHECK(!krk::h2d_probe_cache_read(cache_path, other, now).hit,
+          "and so does a different card reporting a different size");
+    other = key;
+    other.driver_version = key.driver_version + 1;
+    CHECK(!krk::h2d_probe_cache_read(cache_path, other, now).hit,
+          "a driver update invalidates the verdict, like a firmware change");
+    other = key;
+    other.driver_version = key.driver_version;
+    CHECK(krk::h2d_probe_cache_read(cache_path, other, now).hit,
+          "the same driver still finds its own entry");
+    CHECK(!krk::h2d_probe_cache_read(cache_path, key,
+                                     now + krk::kH2dCacheMaxAgeSec + 1)
+               .hit,
+          "an entry older than the cache's lifetime is re-measured");
+
+    // Two entries coexist: a second card (or size) must not evict the first.
+    krk::H2dProbe other_probe = wide;
+    other_probe.pageable_gbs = 3.5;
+    other_probe.direct_gbs = 4.0;
+    CHECK(krk::h2d_probe_cache_write(cache_path, other, other_probe, now),
+          "a second key is cached beside the first");
+    CHECK(krk::h2d_probe_cache_read(cache_path, key, now).hit &&
+              krk::h2d_probe_cache_read(cache_path, other, now).hit,
+          "and neither entry displaced the other");
+
+    // Pruning is a property of the FILE, so the arms below check both sides of
+    // it: the verdict was readable, and the next write removed it.
+    krk::H2dCacheKey old_driver = key;
+    old_driver.driver_version = key.driver_version + 7;
+    const long long rollback = krk::kH2dCacheOtherDriverMaxAgeSec;
+    CHECK(krk::h2d_probe_cache_write(cache_path, old_driver, other_probe,
+                                     now - rollback - 3600),
+          "a verdict from a driver that has not run for a week can be written");
+    CHECK(krk::h2d_probe_cache_read(cache_path, old_driver, now).hit,
+          "it is still inside its 30-day life before any write touches the file");
+    CHECK(krk::h2d_probe_cache_write(cache_path, key, wide, now),
+          "the current driver then writes its own verdict");
+    CHECK(!krk::h2d_probe_cache_read(cache_path, old_driver, now).hit,
+          "and that write pruned the stale driver's verdict");
+
+    // The rollback case the window exists for must survive: a driver that ran
+    // yesterday is one the user may go back to today.
+    krk::H2dCacheKey recent_driver = key;
+    recent_driver.driver_version = key.driver_version + 9;
+    CHECK(krk::h2d_probe_cache_write(cache_path, recent_driver, other_probe,
+                                     now - 3600),
+          "a verdict from yesterday's driver is written");
+    CHECK(krk::h2d_probe_cache_write(cache_path, key, wide, now) &&
+              krk::h2d_probe_cache_read(cache_path, recent_driver, now).hit,
+          "and it survives a write: that is the rollback the window is for");
+
+    {
+        // What a rewrite dropped, by reason. The counts are the only visible
+        // evidence that pruning happened at all: the file is the same size
+        // either way, and a verdict that vanishes silently is indistinguishable
+        // from one that was never written.
+        const std::string reasons_path = "kraken-h2d-cache-reasons.txt";
+        std::FILE *f = std::fopen(reasons_path.c_str(), "wb");
+        CHECK(f != nullptr, "the reasons file is there to seed");
+        if (f) {
+            auto emit = [&](int driver, size_t bytes, long long stamp) {
+                std::fprintf(f, "2\t%s\t%llu\t%d\t%d\t%llu\t0.4\t20\t20\t%lld\n",
+                             key.name.c_str(),
+                             static_cast<unsigned long long>(key.vram_total),
+                             key.large_bar, driver,
+                             static_cast<unsigned long long>(bytes), stamp);
+            };
+            emit(key.driver_version, key.bytes + 4096,
+                 now - krk::kH2dCacheMaxAgeSec - 60);          // expired
+            emit(key.driver_version + 5, key.bytes + 8192,
+                 now - rollback - 60);                          // past the rollback window
+            std::fputs("not a verdict\n", f);             // unreadable
+            std::fclose(f);
+        }
+        krk::H2dCachePrune pruned;
+        CHECK(krk::h2d_probe_cache_write(reasons_path, key, wide, now, &pruned),
+              "a write over dead verdicts succeeds");
+        CHECK(pruned.expired == 1 && pruned.other_driver == 1 && pruned.unreadable == 1,
+              "it reports each dead verdict by the reason it was dropped");
+        CHECK(pruned.dropped() == 3 && pruned.kept == 1,
+              "and says how many lines are left");
+        CHECK(krk::h2d_prune_text(pruned).find("dropped 3 dead verdict(s)") !=
+                  std::string::npos,
+              "the line a caller logs names the count");
+        CHECK(krk::h2d_prune_text(krk::H2dCachePrune()).empty(),
+              "and stays quiet when nothing was dropped");
+        std::remove(reasons_path.c_str());
+    }
+    {
+        // What a run will START FROM, listed without running one. The dead lines
+        // are the point: the live ones are what the user already has, and "why is
+        // my run measuring again" is answered by what was skipped and why -- so a
+        // listing that filtered to the live entries could not answer it at all.
+        const std::string list_path = "kraken-h2d-cache-list.txt";
+        std::FILE *f = std::fopen(list_path.c_str(), "wb");
+        CHECK(f != nullptr, "the listing file is there to seed");
+        if (f) {
+            auto emit = [&](int driver, size_t bytes, long long stamp) {
+                std::fprintf(f, "2\t%s\t%llu\t%d\t%d\t%llu\t0.4\t20\t20\t%lld\n",
+                             key.name.c_str(),
+                             static_cast<unsigned long long>(key.vram_total),
+                             key.large_bar, driver,
+                             static_cast<unsigned long long>(bytes), stamp);
+            };
+            emit(key.driver_version, key.bytes, now);        // live, this run's key
+            emit(key.driver_version, key.bytes + 4096, now); // live, another size
+            emit(key.driver_version, key.bytes + 8192,
+                 now - krk::kH2dCacheMaxAgeSec - 60); // expired
+            std::fputs("not a verdict\n", f);        // unreadable
+            std::fclose(f);
+        }
+        const std::vector<krk::H2dCacheEntry> all =
+            krk::h2d_cache_scan(list_path, now);
+        CHECK(all.size() == 4, "every line is listed, the dead ones included");
+        int live = 0, expired = 0, unreadable = 0;
+        for (const krk::H2dCacheEntry &e : all) {
+            if (e.live()) live++;
+            else if (e.dead == "expired") expired++;
+            else if (e.name.empty()) unreadable++;
+        }
+        CHECK(live == 2 && expired == 1 && unreadable == 1,
+              "and each dead line carries the reason a run would skip it");
+        // Two live entries, one key: only the size this run asks for is marked,
+        // which is the difference between "a verdict exists" and "this run
+        // uses one".
+        const std::vector<krk::H2dCacheEntry> keyed =
+            krk::h2d_cache_scan(list_path, now, &key);
+        int used = 0, matched = 0;
+        for (const krk::H2dCacheEntry &e : keyed) {
+            if (e.used) used++;
+            if (e.matches) matched++;
+        }
+        CHECK(matched == 1 && used == 1,
+              "exactly the entry this box's key asks for is marked as the one it "
+              "starts from");
+        // A listing has no model, so it has no probe size either: `bytes == 0`
+        // asks the card's question ("is there a verdict to start from") and must
+        // match without claiming which of the sizes a run would pick. Getting
+        // this wrong read as "no entry for this card" on a machine whose cache
+        // held three -- the size in the key was 0 and nothing matched.
+        krk::H2dCacheKey card_only = key;
+        card_only.bytes = 0;
+        const std::vector<krk::H2dCacheEntry> card =
+            krk::h2d_cache_scan(list_path, now, &card_only);
+        int card_live = 0, card_used = 0;
+        for (const krk::H2dCacheEntry &e : card) {
+            if (e.matches && e.live()) card_live++;
+            if (e.used) card_used++;
+        }
+        CHECK(card_live == 1 && card_used == 0,
+              "a listing without a model matches the card's bucket sizes and "
+              "claims none of them");
+        // The text IS the listing: the chosen path from the engine's own
+        // predicate, the age and driver of the verdict, and the size measured.
+        std::string live_text, expired_text;
+        for (const krk::H2dCacheEntry &e : keyed) {
+            if (e.used) live_text = krk::h2d_cache_entry_text(e);
+            if (e.dead == "expired") expired_text = krk::h2d_cache_entry_text(e);
+        }
+        CHECK(live_text.find("-> direct") != std::string::npos,
+              "the listing prints the path the engine's own predicate selects");
+        CHECK(live_text.find("measured 0 s ago") != std::string::npos,
+              "with the verdict's age, so a stale one is visible");
+        CHECK(expired_text.find("[expired]") != std::string::npos,
+              "and a dead line says why in place of a path");
+        CHECK(expired_text.find("direct 20.00") != std::string::npos,
+              "an expired line still shows what it measured");
+        CHECK(krk::h2d_cache_entry_text(keyed.front(), true).find(
+                  "[another driver]") != std::string::npos,
+              "a live verdict from another driver can be named as not this run's");
+        // A file that is not there, and a cache that is off, are empty
+        // listings rather than failures: this is a diagnostic, not a step.
+        CHECK(krk::h2d_cache_scan("kraken-no-such-cache.txt", now).empty(),
+              "a missing cache file lists as empty");
+        CHECK(krk::h2d_cache_scan(std::string(), now).empty(),
+              "and a disabled cache lists nothing");
+        std::remove(list_path.c_str());
+    }
+    {
+        // The init line, which is the whole point of the cache being invisible
+        // otherwise: reused or measured, and -- when measured -- WHY nothing was
+        // there to reuse. The three miss reasons below are the three a user can
+        // actually act on, and "measured now" alone reads the same for all of
+        // them.
+        const std::string verdict_cache = "kraken-h2d-cache-verdict.txt";
+        // A real driver number, because the fixture's simulated caps report 0
+        // and "driver unknown" would pass a check for "is anything printed".
+        const std::string reused = krk::h2d_verdict_text(
+            true, 45 * 60, 71626331, key.bytes, std::string());
+        CHECK(reused.find("reused the cached 16 MiB one") != std::string::npos,
+              "a cached run says it reused the verdict, and which size");
+        CHECK(reused.find("measured 45 min ago") != std::string::npos &&
+                  reused.find("71626331") != std::string::npos,
+              "with the age and the driver it came from");
+        CHECK(krk::h2d_verdict_text(false, 0, key.driver_version, key.bytes,
+                                    "nothing at all")
+                      .find("measured the card now") != std::string::npos,
+              "a run that measured says so");
+        CHECK(krk::h2d_cache_miss_text(std::string(), now, key).find("cache is off") !=
+                  std::string::npos,
+              "a miss because the cache is off says that, not \"nothing cached\"");
+        CHECK(krk::h2d_cache_miss_text("kraken-no-such-cache.txt", now, key)
+                      .find("no cache file") != std::string::npos,
+              "and a miss with no file says there is no file yet");
+        {
+            // This card's entry for THIS size, dead: the fix is one more run,
+            // which replaces it -- not a model that buckets elsewhere.
+            std::FILE *f = std::fopen(verdict_cache.c_str(), "wb");
+            CHECK(f != nullptr, "the verdict fixture is there to seed");
+            if (f) {
+                auto emit = [&](int driver, size_t bytes, long long stamp) {
+                    std::fprintf(f, "2\t%s\t%llu\t%d\t%d\t%llu\t0.4\t20\t20\t%lld\n",
+                                 key.name.c_str(),
+                                 static_cast<unsigned long long>(key.vram_total),
+                                 key.large_bar, driver,
+                                 static_cast<unsigned long long>(bytes), stamp);
+                };
+                emit(key.driver_version, key.bytes,
+                     now - krk::kH2dCacheMaxAgeSec - 60);         // expired, exact size
+                emit(key.driver_version, key.bytes + 4096, now);  // live, another size
+                std::fputs("garbage\n", f);                     // dead
+                std::fclose(f);
+            }
+            const std::string miss = krk::h2d_cache_miss_text(verdict_cache, now, key);
+            CHECK(miss.find("this card's 16 MiB entry is not usable (expired)") !=
+                      std::string::npos,
+                  "an expired entry for this exact size is named as the reason");
+            CHECK(miss.find("1 live at other probe sizes") != std::string::npos &&
+                      miss.find("2 dead of 3 line(s)") != std::string::npos,
+                  "and the miss counts what else the file held");
+            CHECK(krk::h2d_verdict_text(false, 0, key.driver_version, key.bytes, miss)
+                          .find("not usable (expired)") != std::string::npos,
+                  "the measured line carries that reason rather than a generic one");
+            std::remove(verdict_cache.c_str());
+        }
+        {
+            // A live verdict from the driver BEFORE an update: the writer keeps
+            // it for the rollback window, the reader refuses it, and a run that
+            // measures because of it must say so -- that is the case where the
+            // file looks populated and nothing is wrong with it.
+            std::FILE *f = std::fopen(verdict_cache.c_str(), "wb");
+            CHECK(f != nullptr, "the rollback fixture is there to seed");
+            if (f) {
+                std::fprintf(f,
+                             "2\t%s\t%llu\t%d\t%d\t%llu\t0.4\t20\t20\t%lld\n",
+                             key.name.c_str(),
+                             static_cast<unsigned long long>(key.vram_total),
+                             key.large_bar, key.driver_version + 1,
+                             static_cast<unsigned long long>(key.bytes), now);
+                std::fclose(f);
+            }
+            const std::string miss = krk::h2d_cache_miss_text(verdict_cache, now, key);
+            CHECK(miss.find("1 live from another driver") != std::string::npos,
+                  "a live entry from another driver is named as the reason, not as a "
+                  "missing entry");
+            std::remove(verdict_cache.c_str());
+        }
+    }
+    {
+        // The end-of-run ledger. One run is a hit rate of 0% or 100%, so what is
+        // checked here is the arithmetic ACROSS runs and the honesty of the
+        // saved-time estimate: priced at an average this machine measured, or not
+        // priced at all. Two SIZES are counted, because the sizes are not
+        // interchangeable -- a 64 MiB verdict is not the one a 16 MiB model asks
+        // for, and its measurement costs several times as much.
+        const std::string tally_cache = "kraken-h2d-tally.txt";
+        const std::string tally_path = krk::h2d_tally_path(tally_cache);
+        CHECK(tally_path == tally_cache + ".stats",
+              "the ledger sits beside the cache it counts, so moving the cache "
+              "moves it");
+        CHECK(krk::h2d_tally_text(krk::h2d_tally_load(tally_path)).empty(),
+              "nothing counted prints nothing, rather than a 0% hit rate");
+        bool wrote = false;
+        krk::H2dProbeTally t =
+            krk::h2d_tally_note(tally_cache, key.bytes, true, 0, &wrote);
+        CHECK(wrote && t.runs == 1 && t.cached == 1 && t.measured == 0,
+              "a hit is counted as a run and a hit");
+        CHECK(krk::h2d_tally_load(tally_path).cached == 1,
+              "and the count outlives the process that made it");
+        CHECK(t.buckets.size() == 1 && t.buckets[0].bytes == key.bytes,
+              "the count lands in the bucket of the size that asked for it");
+        t = krk::h2d_tally_note(tally_cache, key.bytes, false, 240, &wrote);
+        t = krk::h2d_tally_note(tally_cache, key.bytes, true, 0, &wrote);
+        t = krk::h2d_tally_note(tally_cache, key.bytes, true, 0, &wrote);
+        CHECK(t.runs == 4 && t.cached == 3 && t.measured == 1 && t.probe_ms == 240,
+              "three hits and one 240 ms measurement add up");
+        const std::string text = krk::h2d_tally_text(t);
+        CHECK(text.find("3 of 4 probed run(s)") != std::string::npos &&
+                  text.find("(75%)") != std::string::npos,
+              "the line reports the hit rate this cache has actually had");
+        CHECK(text.find("240.0 ms on average") != std::string::npos &&
+                  text.find("720 ms") != std::string::npos,
+              "and prices the avoided probes at the machine's own average");
+        // A second size, with no hits and its own measurement cost. Its rate and
+        // its price must not be blended into the first's.
+        t = krk::h2d_tally_note(tally_cache, key.bytes * 2, false, 300, &wrote);
+        t = krk::h2d_tally_note(tally_cache, key.bytes * 2, false, 100, &wrote);
+        const krk::H2dTallyBucket *small = t.find(key.bytes);
+        const krk::H2dTallyBucket *large = t.find(key.bytes * 2);
+        CHECK(t.buckets.size() == 2 && small && large &&
+                  small->runs == 4 && large->runs == 2,
+              "each probe size keeps its own count, sorted by size");
+        CHECK(small && large && small->hit_rate() == 75.0 &&
+                  large->hit_rate() == 0.0,
+              "and its own hit rate: 4 runs at 16 MiB are not 6 runs across sizes");
+        CHECK(small && large && small->avg_probe_ms() == 240.0 &&
+                  large->avg_probe_ms() == 200.0,
+              "the measurement cost is per size too, not one blended average");
+        CHECK(t.runs == 6 && t.cached == 3 && t.measured == 3 && t.probe_ms == 640 &&
+                  t.hit_rate() == 50.0,
+              "the totals are the buckets summed, so the headline still adds up");
+        {
+            // Guarded: a bucket that is missing is a failed check below, not a
+            // crash that hides the rest of the group.
+            const std::string small_text =
+                small ? krk::h2d_tally_bucket_text(*small) : std::string();
+            const std::string large_text =
+                large ? krk::h2d_tally_bucket_text(*large) : std::string();
+            CHECK(small_text.find("16 MiB: 3 of 4 reused (75%)") !=
+                          std::string::npos &&
+                      small_text.find("1 measured at 240.0 ms") !=
+                          std::string::npos &&
+                      small_text.find("720 ms avoided") != std::string::npos,
+                  "a bucket line names the size, its rate and what it avoided");
+            CHECK(large_text.find("32 MiB: 0 of 2 reused (0%)") !=
+                          std::string::npos &&
+                      large_text.find("2 measured at 200.0 ms") !=
+                          std::string::npos &&
+                      large_text.find("avoided") == std::string::npos,
+                  "and a bucket that has avoided nothing says so by omission, not "
+                  "\"0 ms\"");
+            CHECK(krk::h2d_tally_bucket_text(krk::H2dTallyBucket()).empty(),
+                  "an unasked size prints nothing at all");
+        }
+        CHECK(krk::h2d_tally_load(tally_path).find(key.bytes * 2) != nullptr &&
+                  krk::h2d_tally_load(tally_path).buckets.size() == 2,
+              "both sizes survive the round trip through the file");
+        krk::H2dProbeTally hits_only;
+        hits_only.runs = 5;
+        hits_only.cached = 5;
+        CHECK(krk::h2d_tally_text(hits_only).find("not priced") != std::string::npos,
+              "a tally with no measurement refuses to price what it saved");
+        // A corrupt ledger is no ledger: better that than a rate above 100%.
+        std::FILE *f = std::fopen(tally_path.c_str(), "wb");
+        CHECK(f != nullptr, "the ledger is there to corrupt");
+        if (f) {
+            std::fputs("2\t16777216\t2\t9\t0\t0\n", f);  // more hits than runs
+            std::fclose(f);
+        }
+        CHECK(krk::h2d_tally_load(tally_path).runs == 0,
+              "a ledger whose parts exceed its whole reads as no ledger");
+        // v1 counted all sizes in one line, which is exactly the question the
+        // buckets exist to answer -- so it is not a tally any more.
+        f = std::fopen(tally_path.c_str(), "wb");
+        CHECK(f != nullptr, "the ledger is there to write an old-format line");
+        if (f) {
+            std::fputs("1\t3\t2\t1\t73\n", f);
+            std::fclose(f);
+        }
+        CHECK(krk::h2d_tally_load(tally_path).runs == 0,
+              "a blended v1 tally is not read as a per-size one");
+        CHECK(krk::h2d_tally_path(std::string()).empty(),
+              "a disabled cache has no ledger path");
+        bool off_wrote = true;
+        CHECK(krk::h2d_tally_note(std::string(), key.bytes, true, 0, &off_wrote)
+                          .runs == 0 &&
+                  !off_wrote,
+              "and noting a run against it writes nothing");
+        std::remove(tally_path.c_str());
+        std::remove((tally_path + ".tmp").c_str());
+        std::remove(tally_cache.c_str());  // a tally alone is not a verdict
+    }
+    {
+        // An already-expired line is dropped by the next write, not left to
+        // occupy a slot the reader will never accept.
+        const std::string prune_path = "kraken-h2d-cache-prune.txt";
+        krk::H2dCacheKey expired = key;
+        expired.bytes = key.bytes << 1;
+        CHECK(krk::h2d_probe_cache_write(prune_path, expired, other_probe,
+                                         now - krk::kH2dCacheMaxAgeSec - 60),
+              "an expired verdict can be written (the writer does not refuse a stamp)");
+        CHECK(krk::h2d_probe_cache_write(prune_path, key, wide, now),
+              "then a live one");
+        std::ifstream count_in(prune_path.c_str());
+        size_t lines = 0;
+        std::string l;
+        while (std::getline(count_in, l))
+            if (!l.empty()) lines++;
+        CHECK(lines == 1, "the expired line is pruned, leaving only the live verdict");
+        // Windows refuses to remove a file that is still open.
+        count_in.close();
+        std::remove(prune_path.c_str());
+    }
+    {
+        // Past the cap the NEWEST entries win: the oldest is the one least
+        // likely to be asked for again.
+        const std::string cap_path = "kraken-h2d-cache-cap.txt";
+        const size_t total = krk::kH2dCacheMaxEntries + 6;
+        bool all = true;
+        krk::H2dCachePrune last;
+        for (size_t i = 0; i < total; i++) {
+            krk::H2dCacheKey k = key;
+            k.bytes = key.bytes + (i + 1) * 4096;
+            if (!krk::h2d_probe_cache_write(cap_path, k, other_probe,
+                                            now + static_cast<long long>(i)))
+                all = false;
+        }
+        CHECK(all, "the cache accepts more keys than it keeps");
+        CHECK(krk::h2d_probe_cache_write(cap_path, key, other_probe,
+                                         now + static_cast<long long>(total) + 1,
+                                         &last) &&
+                  last.evicted >= 1 &&
+                  last.kept == static_cast<int>(krk::kH2dCacheMaxEntries),
+              "past the cap the write reports what the cap pushed out");
+        krk::H2dCacheKey oldest = key, newest = key;
+        oldest.bytes = key.bytes + 4096;
+        newest.bytes = key.bytes + total * 4096;
+        CHECK(!krk::h2d_probe_cache_read(cap_path, oldest, now + 1000).hit,
+              "past the cap the oldest entry is the one dropped");
+        CHECK(krk::h2d_probe_cache_read(cap_path, newest, now + 1000).hit,
+              "and the newest survives");
+        std::remove(cap_path.c_str());
+    }
+    {
+        // A line written before the driver version joined the key is a miss:
+        // the verdict is fine, but which driver produced it is not recorded,
+        // and that is the one thing an update changes. A file of its own,
+        // because a valid entry for this key exists in the real one and would
+        // be found first.
+        const std::string old_path = "kraken-h2d-cache-v1.txt";
+        std::FILE *old = std::fopen(old_path.c_str(), "wb");
+        CHECK(old != nullptr, "the cache file is there to write an old-format line");
+        if (old) {
+            std::fprintf(old, "1\t%s\t%llu\t%d\t%llu\t0.4\t20\t20\t%lld\n",
+                         key.name.c_str(),
+                         static_cast<unsigned long long>(key.vram_total),
+                         key.large_bar,
+                         static_cast<unsigned long long>(key.bytes), now);
+            std::fclose(old);
+        }
+        CHECK(!krk::h2d_probe_cache_read(old_path, key, now).hit,
+              "a verdict from before the driver version was in the key is not trusted");
+        std::remove(old_path.c_str());
+    }
+    {
+        // A hand-edited or half-written file is a miss, not a crash, and it
+        // must not stop the next write from producing a readable entry.
+        std::FILE *f = std::fopen(cache_path.c_str(), "ab");
+        CHECK(f != nullptr, "the cache file is there to corrupt");
+        if (f) {
+            std::fputs("1\tgarbage\nnot even close\n", f);
+            std::fclose(f);
+        }
+        CHECK(krk::h2d_probe_cache_read(cache_path, key, now).hit,
+              "a garbage line does not hide the valid entries beside it");
+    }
+    set_env_var("KRK_H2D_CACHE", "0");
+    CHECK(krk::h2d_probe_cache_path().empty(),
+          "KRK_H2D_CACHE=0 turns the cache off entirely");
+    set_env_var("KRK_H2D_CACHE", cache_path.c_str());
+
+    // The wiring, end to end: a cached verdict must DECIDE, not merely be
+    // printed. The aperture below says the ring wins (6.0 against 0.4), so a
+    // direct path can only have come from the cache.
+    krk::H2dProbe cached_wide;
+    cached_wide.valid = true;
+    cached_wide.pageable_gbs = 0.4;
+    cached_wide.direct_gbs = 20.0;
+    cached_wide.pinned_gbs = 20.0;
+    CHECK(krk::h2d_probe_cache_write(cache_path, key, cached_wide,
+                                     krk::h2d_now_sec()),
+          "seeded the cache with a wide-aperture verdict");
+    // The ledger the run-end report reads. Each probing init is one run; a hit
+    // and a measurement are different arms; a run with the probe off is neither,
+    // or the hit rate would describe a cache that run never consulted.
+    const krk::H2dProbeTally tally_before =
+        krk::h2d_tally_load(krk::h2d_tally_path(cache_path));
+    bool cached_direct = false, rerun_direct = true, off_direct = true;
+    size_t cached_pin = 1, rerun_pin = 0, off_pin = 0;
+    std::vector<i32> cached_tokens, rerun_tokens, off_tokens;
+    krk::H2dProbe cached_used, rerun_used, off_used;
+    const bool cached_ok = run(6.0, 0.4, 20.0, &cached_direct, &cached_pin,
+                               &cached_tokens, &cached_used);
+    CHECK(cached_ok, "an engine initialises from a cached verdict");
+    CHECK(cached_direct,
+          "a cached wide-aperture verdict decides the path without re-probing");
+    CHECK(cached_used.valid && std::fabs(cached_used.direct_gbs - 20.0) < 1e-3,
+          "and it publishes the rates it read, not a fresh measurement");
+
+    set_env_var("KRK_H2D_PROBE_RERUN", "1");
+    const bool rerun_ok = run(6.0, 0.4, 20.0, &rerun_direct, &rerun_pin,
+                              &rerun_tokens, &rerun_used);
+    CHECK(rerun_ok, "and one initialises with the measurement forced");
+    CHECK(!rerun_direct,
+          "KRK_H2D_PROBE_RERUN=1 ignores the cache and measures the card");
+    CHECK(rerun_used.valid && rerun_used.pageable_gbs > rerun_used.direct_gbs,
+          "... with the aperture it just measured, not the cached one");
+    clear_env_var("KRK_H2D_PROBE_RERUN");
+
+    // Turning the probe off must turn its cache off too: an operator asking for
+    // the BAR hint is not asking for an old measurement to stand in for it.
+    set_env_var("KRK_H2D_PROBE", "0");
+    const bool off_ok = run(6.0, 0.4, 20.0, &off_direct, &off_pin, &off_tokens,
+                            &off_used);
+    CHECK(off_ok, "and one initialises with the probe switched off");
+    CHECK(!off_direct && !off_used.valid,
+          "KRK_H2D_PROBE=0 skips the cache as well as the probe");
+    clear_env_var("KRK_H2D_PROBE");
+
+    const krk::H2dProbeTally tally_after =
+        krk::h2d_tally_load(krk::h2d_tally_path(cache_path));
+    CHECK(tally_after.runs == tally_before.runs + 2 &&
+              tally_after.cached == tally_before.cached + 1 &&
+              tally_after.measured == tally_before.measured + 1,
+          "the engine records each probing init: one hit, one measurement, and the "
+          "probe-off run not at all");
+    CHECK(tally_after.probe_ms > tally_before.probe_ms,
+          "and the wall time a measurement cost is what a hit is priced at");
+    CHECK(tally_after.find(key.bytes) != nullptr &&
+              tally_after.find(key.bytes)->runs ==
+                  tally_before.runs + 2,
+          "counted at the size this model probes, not blended across sizes");
+
+    set_env_var("KRK_H2D_CACHE", "0");
+    std::remove(cache_path.c_str());
+    std::remove((cache_path + ".tmp").c_str());
+    std::remove(krk::h2d_tally_path(cache_path).c_str());
+    std::remove((krk::h2d_tally_path(cache_path) + ".tmp").c_str());
+    std::remove(path.c_str());
+}
+
 #define TEST_GROUP(fn) {#fn, fn, nullptr},
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
@@ -9519,6 +10542,8 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_kv_tier_drop_vs_spill)
     TEST_GROUP(test_kv_tier_host_reserve_refusal)
     TEST_GROUP(test_kv_tier_per_plane_cold_files)
+    TEST_GROUP_SERIAL(test_pageable_path_probe,
+                      "times host->device copy rates, so it needs the machine")
 };
 
 #undef TEST_GROUP
@@ -11248,8 +12273,9 @@ static int run_all_inproc(const char *report) {
         // The same line the child runner prints, so the two can be compared
         // group by group and not only in total -- which is the A/B this mode
         // exists for.
-        std::fprintf(stderr, "  [%2d/%d] %-44s %5d/%-5d\n", i + 1, kGroupCount,
-                     kGroups[i].name, o.passed, o.run);
+        std::fprintf(stderr, "  [%2d/%d] %-44s %5d/%-5d  ledger=%zu\n", i + 1,
+                     kGroupCount, kGroups[i].name, o.passed, o.run,
+                     SharedHostRamBudget::used_bytes());
         std::fflush(stderr);
     }
     cleanup_fixtures();
@@ -11569,6 +12595,11 @@ static int worker_count(const char *flag_value) {
 
 int main(int argc, char **argv) {
     g_argv0 = (argc > 0 && argv[0]) ? argv[0] : "";
+    // The H2D path cache lives in the user's profile. A test run must not read
+    // the machine's real measurement -- its decisions would then depend on when
+    // the suite last ran -- nor write over it. The group that drives the cache
+    // points KRK_H2D_CACHE at its own scratch file and puts this back.
+    if (!std::getenv("KRK_H2D_CACHE")) set_env_var("KRK_H2D_CACHE", "0");
 
     int group = -1;
     const char *progress = nullptr;

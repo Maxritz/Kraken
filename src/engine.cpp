@@ -4,11 +4,37 @@
 #include "krk/arch.hpp"
 #include "krk/dflash.hpp"
 #include "krk/host_time.hpp"
+#include "krk/h2d_probe.hpp" // the measured promotion path
 #include "krk/vram_guard.hpp"
 #include "krk/json.hpp" // the expert index reader (warm_experts)
 #include "krk/spec_sampling.hpp" // the sampled round's accept/reject rule
 #include "krk/qsa.hpp" // the QSA indexer's host maths (pool / score / top-k)
 #include "par_pool.hpp"
+
+#if defined(_WIN32)
+// A hard ceiling on this process's working set. The host policy plans in bytes,
+// but a plan is not an enforcement: the mapping is read page by page and Windows
+// grows the file cache until something pushes back, which on a 79 GB corpus is
+// the desktop. With a hard maximum the kernel trims OUR pages past the cap
+// instead of the machine's working set, so the corpus streams and the box stays
+// responsive. Declared here rather than through <windows.h>, which would drag a
+// platform header into a file that is otherwise portable.
+extern "C" __declspec(dllimport) void *__stdcall GetCurrentProcess(void);
+extern "C" __declspec(dllimport) int __stdcall SetProcessWorkingSetSizeEx(
+    void *process, size_t min_bytes, size_t max_bytes, unsigned long flags);
+#define KRK_HARDWS_MAX_ENABLE 0x00000004ul
+static bool cap_working_set(size_t max_bytes) {
+    if (max_bytes == 0) return false;
+    // The minimum must be a real number no larger than the maximum: the
+    // (SIZE_T)-1 spelling means "trim now" for the older call and is rejected
+    // by this one, which is how the cap silently failed the first time.
+    const size_t min_bytes = max_bytes / 4;
+    return SetProcessWorkingSetSizeEx(GetCurrentProcess(), min_bytes,
+                                      max_bytes, KRK_HARDWS_MAX_ENABLE) != 0;
+}
+#else
+static bool cap_working_set(size_t) { return false; }
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -56,6 +82,28 @@ namespace {
 // windowed prefill path: below the window length the window and no window are
 // the same computation, so a text difference between the two arms is a defect
 // in that path rather than a policy difference.
+// Next-layer expert prefetch, OPT-IN (KRK_MOE_NEXT_PREFETCH=1). It is a no-op
+// unless the WARM tier has a pinned prefix: the ticket copies pinned bytes by
+// DMA, and a pageable source would put the host memcpy back at issue time.
+//
+// It is off by default because it MEASURED SLOWER on the file it was written
+// for: REAP-320, 16 tokens, pinned WARM, 3 interleaved pairs, same text --
+// 114.4 ms/step predicted against 124.7 ms/step predicted-ahead (mean of
+// 109.3/126.0/107.8 against 121.4/125.6/127.1), i.e. -9%. The promotion traffic
+// on that file is bandwidth-bound, not latency-bound: ~240 experts of ~2.2 MiB
+// enter VRAM per token whatever the ordering, the copy stream already overlaps
+// the kernels queued before it, and a prediction miss adds a promotion that the
+// real routing then does not use. It is kept as the mechanism a better predictor
+// would use (and because the guard it needs -- never evict the target layer's
+// own resident set -- is a real bug it exposed), not as a default.
+static bool next_prefetch_on() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_MOE_NEXT_PREFETCH");
+        return e && *e && e[0] != '0';
+    }();
+    return v;
+}
+
 static bool swa_off() {
     static const bool v = [] {
         const char *e = std::getenv("KRK_SWA_OFF");
@@ -473,6 +521,16 @@ static void run_dequant_probe(Backend &be, const std::string &model_path) {
                  static_cast<long long>(rows_bad_dev), static_cast<long long>(rows_disagree),
                  static_cast<long long>(first_bad_row),
                  static_cast<long long>(first_bad_index), worst);
+}
+
+// KRK_PIN_AUTO=0 is the A/B arm for the automatic pinned WARM prefix; the
+// explicit switches (KRK_HOST_PIN_MB, --expert-pin-mb) win over both.
+static bool pin_auto_on() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_PIN_AUTO");
+        return !(e && e[0] == '0');
+    }();
+    return v;
 }
 
 bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
@@ -3387,6 +3445,27 @@ bool Engine::kv_rollback_zero(i64 pos) {
 
 bool Engine::configure_expert_cache(std::string *err) {
     const ModelConfig &mc = model_.cfg();
+    // The memory ceiling is process-wide and applies to every run, dense
+    // included: a dense model larger than RAM streams its weights, and the same
+    // paging death is available there. Set it before the dense early return, or
+    // the cap exists only for MoE files.
+    {
+        size_t class_ram = be_ ? be_->host_total_bytes() : 0;
+        if (cfg_.ram_tier_gb > 0) {
+            const size_t tier = static_cast<size_t>(cfg_.ram_tier_gb) << 30;
+            if (class_ram == 0 || tier < class_ram) class_ram = tier;
+        }
+        const size_t ceiling = krk::mem_ceiling_bytes(class_ram);
+        if (ceiling > 0) {
+            const size_t gib_ = static_cast<size_t>(1) << 30;
+            KRK_INFO("mem policy: process working set capped at %.1f GiB "
+                     "(%.0f%% of %.1f GiB planned)%s",
+                     static_cast<f64>(ceiling) / static_cast<f64>(gib_),
+                     krk::mem_fraction() * 100.0,
+                     static_cast<f64>(class_ram) / static_cast<f64>(gib_),
+                     cap_working_set(ceiling) ? "" : " -- the cap could NOT be set");
+        }
+    }
     if (!mc.is_moe || mc.n_expert <= 0) return true;
 
     // Device memory policy, in one place, because it decides how much of the
@@ -3597,10 +3676,40 @@ bool Engine::configure_expert_cache(std::string *err) {
             ram_installed > 0 && tier > ram_installed ? ram_installed : tier;
     }
     size_t host_budget = 0;
+    // Hard ceiling for everything this process plans to hold, VRAM and host
+    // alike: 80% of installed by default (KRK_MEM_FRACTION). The host half is
+    // checked again at every staging round through SharedHostRamBudget.
+    // The ceiling follows the machine the run is planned for (--ram-tier), so a
+    // 96 GiB workstation can check the 16/24/32 GiB targets.
+    const size_t host_ceiling = krk::mem_ceiling_bytes(ram_total);
     const size_t live_host_avail = be_->host_available_bytes();
-    const size_t host_reserve = krk::host_reserve_bytes(ram_installed);
-    const size_t host_stage_room = live_host_avail > host_reserve
-                                       ? live_host_avail - host_reserve : 0;
+    const size_t host_reserve = krk::host_reserve_bytes(ram_total);
+    // Three tiers, not two: the file is mapped, so the disk source IS page
+    // cache, and every page it touches is RAM the WARM tier cannot spend
+    // twice. Sizing WARM from live free memory alone handed a 67 GB corpus a
+    // 33 GiB duplicate tier on this 96 GB box (WARM 33062 MiB), and mapping
+    // plus duplicates then exceeded installed RAM: the machine paged itself
+    // to a standstill during warmup. Reserve the mapping's own footprint
+    // first. What is left is what WARM may use, which on a small-RAM machine
+    // is a few experts -- the point of the tier, not a shortfall.
+    const size_t mapped = model_.mapped_bytes();
+    const size_t mapped_share = mapped < ram_total ? mapped : ram_total;
+    // The mapping is NOT subtracted from the staging room any more, and that is
+    // a correctness fix, not a policy tweak. A clean file-mapping page is
+    // reclaimable standby memory: the OS drops it without a writeback and
+    // re-faults it from the page cache, so it is not RAM this process owns and
+    // charging all of it here double-counted a corpus the tier does not hold.
+    // The consequence was not subtle -- for every file bigger than the ceiling
+    // the staging room came out ZERO, which is every model the WARM tier exists
+    // for. Measured on the 67 GB REAP-320 file, 96 GB box, 75.2 GiB free: WARM
+    // 0 MiB, 387 MiB of expert weights re-read per token at 5.0 tok/s, and the
+    // "tier is disabled" warning itself was gated on host_budget>0, so it never
+    // printed. The guard that actually protects the machine is the per-admission
+    // SharedHostRamBudget check (warm_admit -> can_admit), which samples live
+    // available RAM each round and fails closed; a plan made once from the
+    // corpus size cannot see pressure that arrives later.
+    const size_t host_stage_room =
+        live_host_avail > host_reserve ? live_host_avail - host_reserve : 0;
     const size_t host_already_budgeted = krk::SharedHostRamBudget::used_bytes();
     const size_t host_shared_room = host_stage_room > host_already_budgeted
                                         ? host_stage_room - host_already_budgeted : 0;
@@ -3620,6 +3729,36 @@ bool Engine::configure_expert_cache(std::string *err) {
             host_budget = live_host_avail / 2;
     }
     if (host_budget > host_shared_room) host_budget = host_shared_room;
+    // Everything the run holds has to fit under the ceiling TOGETHER: the mapped
+    // corpus is resident (or will be), the reserve belongs to the OS, and WARM is
+    // only what is left. Clamping WARM to the ceiling alone doubled the
+    // footprint -- 11.4 GiB mapping plus 9 GiB WARM against a 12.8 GiB ceiling on
+    // a 16 GiB class, which is the same hang one size down.
+    // The ceiling still applies, but only to memory this process owns. Installed
+    // minus the host reserve is the hard headroom for a process whose file pages
+    // are reclaimable; the corpus is not charged twice.
+    const size_t warm_room =
+        host_ceiling > host_reserve ? host_ceiling - host_reserve : 0;
+    if (host_budget > warm_room) host_budget = warm_room;
+    // A corpus bigger than the ceiling cannot have a host copy of its own:
+    // the mapping's page cache IS the RAM tier, and a WARM duplicate would
+    // push the machine past the ceiling. Stream hot experts from disk and
+    // keep only what the device holds. This is the 16 GiB-RAM case too, just
+    // at a smaller corpus.
+    if (host_ceiling > 0 && warm_room == 0) {
+        // Unconditional: this used to run only when host_budget>0, so the case
+        // that matters -- the budget was already 0 -- was the one case that
+        // said nothing at all.
+        KRK_WARN("ram policy: the mapped corpus (%.1f GiB) is at or past "
+                 "the %.1f GiB ceiling (%.0f%% of installed), so the WARM "
+                 "tier is disabled: hot experts stream from disk and the "
+                 "device holds what fits. KRK_MEM_FRACTION raises the "
+                 "ceiling if this box is dedicated.",
+                 static_cast<f64>(mapped_share) / static_cast<f64>(gib),
+                 static_cast<f64>(host_ceiling) / static_cast<f64>(gib),
+                 krk::mem_fraction() * 100.0);
+        host_budget = 0;
+    }
     if (live_host_avail == 0) host_budget = 0; // unknown => no pageable staging
 
     size_t warm = 0;
@@ -3646,6 +3785,10 @@ bool Engine::configure_expert_cache(std::string *err) {
         const size_t floor_bytes = model_.max_expert_bytes() * 4;
         warm = want >= floor_bytes ? want : 0;
     }
+    if (mapped_share > 0 && (host_budget > 0 || cfg_.host_ram_mb > 0))
+        KRK_INFO("ram policy: %.1f GiB of the host room is the file mapping "
+                 "itself (the disk tier's page cache); WARM gets what is left",
+                 static_cast<f64>(mapped_share) / static_cast<f64>(gib));
     if (host_budget > 0 || cfg_.host_ram_mb > 0)
         KRK_INFO("ram policy: %.1f GiB budget (%.1f GiB installed, %.1f GiB "
                  "free) -> WARM tier %.0f MiB%s%s",
@@ -3658,12 +3801,240 @@ bool Engine::configure_expert_cache(std::string *err) {
                                           : "");
 
     model_.set_expert_budget(budget, warm, slot_budget);
-    // --expert-pin-mb owns the tier's pinned prefix when it is given; -1 leaves
-    // KRK_HOST_PIN_MB's answer (off by default) alone.
-    if (cfg_.expert_pin_mb >= 0)
+    // ---- the pageable path and the pinned WARM prefix ----------------------
+    // A promotion out of pageable WARM is either a bounce-buffer copy through a
+    // narrow aperture or a direct DMA, and WHICH of those it is depends on the
+    // card's aperture -- a firmware setting (Above 4G decoding + Resizable BAR),
+    // not a constant. So neither decision here is a default someone has to tune:
+    // the run measures both. On this box's RX 9070 XT (15.9 GiB, 256 MiB
+    // aperture), 16 greedy tokens, interleaved order-balanced pairs, identical
+    // text in every arm:
+    //   REAP-320 (42 GiB routed, 12.3 GiB WARM pinned)
+    //       114.4/102.0/100.1 -> 96.7/100.8/91.3 ms/step (3/3 pairs)
+    //   35B-A3B Q2KXL (9.4 GiB WARM, pin 4.7 GiB, --expert-warmup 1)
+    //       36.5/35.6 -> 30.9/31.1 ms/step (+15.3/+12.7%), 414 -> 199 us/expert
+    //   Qwen3-30B-A3B i1-Q2_K (tier is disk-bound: 376 MiB read per token)
+    //       93.4/93.5 -> 90.5/92.2/92.5 (+2%, within the pairs' spread)
+    //   Qwen3-4B-Q8_0 (dense: no expert tier at all)
+    //       9.3 -> 9.3 ms/step     (0% -- the control, not a miss)
+    // The gain tracks how much of a step a promotion is, which is exactly why
+    // the last two arms are reported rather than quietly dropped.
+    //
+    // The two decisions are ONE decision. The pin exists to remove the copy the
+    // staging ring pays; if the aperture lets the direct path remove it for free,
+    // the pinned rate stops being ~2x the pageable rate and falls inside the
+    // 1.20x line, so the prefix declines to spend RAM that cannot be swapped.
+    // That is the wide-aperture answer, and it needs no knob: fast AND swappable.
+    //
+    // Bounded by installed RAM only: a quarter of it, capped at 16 GiB, because
+    // pinned pages are not swappable and this runs on laptops too. The tier is
+    // pinned WHOLE inside that bound -- the old rule kept half of it pageable
+    // "so a small box still has a tier", and that half is the one every miss
+    // lands on: the 256 MiB arm paid 469 us per promotion at 2.0 GB/s with 4800
+    // of 9600 MiB pinned (139.8 ms/step) against 10 us and 65.3 ms/step once the
+    // whole tier was pinned, byte-identical stdout (see
+    // krk::pinned_warm_prefix_bytes). KRK_HOST_PIN_MB or --expert-pin-mb
+    // overrides it outright, including with 0 -- that is the opt-out -- and
+    // KRK_PIN_AUTO=0 turns the default off.
+    const bool small_bar = be_->caps().large_bar == 0;
+    const bool pin_explicit =
+        cfg_.expert_pin_mb >= 0 || std::getenv("KRK_HOST_PIN_MB") != nullptr;
+    // The probe runs first and decides both. Its size is this model's expert,
+    // clamped to 16-64 MiB -- and the FLOOR matters more than it looks: on the
+    // REAP-320 file (2.2 MiB experts) the same comparison reads 1.60x at 16 MiB
+    // but 1.41-1.69x across runs at 4 MiB, because there the sync and the launch
+    // are a large part of each arm and compress the difference the pin is worth.
+    // A promotion here is a burst of such copies, so the bandwidth-dominated
+    // size is the honest one. ~30-110 ms at init depending on the bucket, three
+    // arms, up to 5 iterations -- it stops as soon as the medians settle, which
+    // on this box is 3 at 64 MiB and rarely early at 16 MiB.
+    krk::H2dProbe h2d;  // the probe itself lives in krk/h2d_probe.hpp
+    // Clamped AND bucketed (16/32/64 MiB), because that is the set of sizes the
+    // cache holds verdicts for: `kraken-bench --h2d` measures all three, so an
+    // explicit measurement is what a normal run finds, whatever its expert
+    // footprint. See h2d_probe_size_bytes for why the floor exists.
+    const size_t h2d_bytes = krk::h2d_probe_size_bytes(model_.max_expert_bytes());
+    const char *probe_off = std::getenv("KRK_H2D_PROBE");
+    const bool probe_on = warm > 0 && !(probe_off && probe_off[0] == '0');
+    // The verdict comes from the cache when this machine has already measured
+    // the same (card, probe size, aperture hint); KRK_H2D_PROBE_RERUN=1 forces a
+    // fresh measurement. The rates, not just the chosen path, are cached: the
+    // pin decision is taken against them, and re-deriving one number from
+    // another would make a cached verdict mean something the probe never said.
+    bool h2d_cached = false;
+    long long h2d_age_sec = 0;
+    std::string h2d_cache_path;
+    const int h2d_driver = be_->caps().driver_version;
+    krk::H2dCacheKey h2d_key;
+    if (probe_on) {
+        const krk::DeviceCaps caps = be_->caps();
+        h2d_key.name = caps.name + " " + caps.gfx;
+        h2d_key.vram_total = caps.vram_total;
+        h2d_key.large_bar = caps.large_bar;
+        h2d_key.driver_version = caps.driver_version;
+        h2d_key.bytes = h2d_bytes;
+        h2d_cache_path = krk::h2d_probe_cache_path();
+        const char *rerun = std::getenv("KRK_H2D_PROBE_RERUN");
+        const bool force = rerun && rerun[0] == '1';
+        const long long now = krk::h2d_now_sec();
+        if (!h2d_cache_path.empty() && !force) {
+            const krk::H2dCacheLookup hit =
+                krk::h2d_probe_cache_read(h2d_cache_path, h2d_key, now);
+            if (hit.hit) {
+                h2d = hit.probe;
+                h2d_cached = true;
+                h2d_age_sec = hit.age_sec;
+            }
+        }
+        // The reason for a miss has to be read BEFORE this run writes its own
+        // verdict: scanned afterwards the file already holds a live entry for
+        // exactly this key, so the honest "there is no cache file yet" became a
+        // generic "no verdict for this card" -- the first real run of this line
+        // printed that, which is why the order is spelled out here.
+        std::string miss;
+        long long probe_ms = 0;
+        if (!h2d_cached) {
+            miss = force
+                       ? std::string("KRK_H2D_PROBE_RERUN=1 asked for a fresh measurement")
+                       : krk::h2d_cache_miss_text(h2d_cache_path, now, h2d_key);
+            // Timed, because a hit's value IS the measurement it replaced: the
+            // end-of-run tally prices every avoided probe at this machine's own
+            // average rather than at a constant someone guessed.
+            const std::chrono::steady_clock::time_point t0 =
+                std::chrono::steady_clock::now();
+            h2d = krk::probe_h2d_path(be_, h2d_bytes, krk::kH2dProbeMaxIters);
+            probe_ms = static_cast<long long>(
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count());
+            if (h2d.valid && !h2d_cache_path.empty()) {
+                krk::H2dCachePrune pruned;
+                if (krk::h2d_probe_cache_write(h2d_cache_path, h2d_key, h2d, now,
+                                               &pruned)) {
+                    // Only when something went: a clean rewrite is the normal
+                    // case, and "dropped 0" on every first run is noise.
+                    const std::string report = krk::h2d_prune_text(pruned);
+                    if (!report.empty())
+                        KRK_INFO("H2D cache %s: %s", h2d_cache_path.c_str(),
+                                 report.c_str());
+                }
+            }
+        }
+        // Which it was, and -- when it measured -- why there was nothing to
+        // reuse. Without this a cached verdict and a fresh one are 20 ms apart
+        // in the log and identical in text, and "measured now" says the same
+        // thing whether the file was empty, held another card's verdict, or held
+        // this card's entry for a probe size this model does not bucket to.
+        // Those are three different fixes, so the reason is part of the line.
+        if (h2d.valid) {
+            KRK_INFO("%s", krk::h2d_verdict_text(h2d_cached, h2d_age_sec, h2d_driver,
+                                                 h2d_bytes, miss, h2d.iterations)
+                                .c_str());
+        } else {
+            KRK_INFO("H2D verdict: the probe produced no usable rates (an allocation "
+                     "failed), so the pageable path follows the runtime's aperture "
+                     "hint");
+        }
+        // The cross-run ledger, counted only for inits that got a verdict: a run
+        // with the probe off reused nothing and measured nothing, and counting
+        // it would drag the hit rate down without describing any cache.
+        if (h2d.valid)
+            h2d_tally_ =
+                krk::h2d_tally_note(h2d_cache_path, h2d_bytes, h2d_cached, probe_ms);
+    }
+    h2d_probe_ = h2d;  // published for the suite and for a caller's diagnostics
+    // Which pageable path runs. KRK_WARM_DMA=1 (ring) / =2 (direct) pins it, so
+    // either can be compared against the measured default in one env var; =0 is
+    // still the blocking copy, handled in the backend.
+    const char *warm_dma = std::getenv("KRK_WARM_DMA");
+    const bool dma_forced = warm_dma && (warm_dma[0] == '1' || warm_dma[0] == '2');
+    const bool direct_path =
+        dma_forced ? warm_dma[0] == '2'
+                   : (h2d.valid && krk::pageable_direct_wins(h2d.pageable_gbs,
+                                                             h2d.direct_gbs));
+    if (!dma_forced) be_->set_pageable_direct(direct_path);
+    // The rate the pin is compared against is the one this run will actually
+    // pay, not whichever arm happened to run first.
+    double pageable_gbs = h2d.pageable_gbs;
+    if (direct_path && h2d.direct_gbs > 0.0) pageable_gbs = h2d.direct_gbs;
+    const bool pin_wanted =
+        !pin_explicit && pin_auto_on() && warm > 0 &&
+        (h2d.valid ? krk::warm_pin_worthwhile(pageable_gbs, h2d.pinned_gbs)
+                   : small_bar);
+    if (h2d.valid && warm > 0) {
+        // Cached or fresh AND which driver produced it: a reader has to know
+        // whether these rates describe this machine, this driver, now -- or a
+        // month ago on the driver that has since been replaced.
+        const std::string origin =
+            krk::h2d_probe_origin(h2d_cached, h2d_age_sec, h2d_driver);
+        KRK_INFO("host->device path: pageable promotions use %s -- a %.0f MiB "
+                 "copy %s at %.1f GB/s through the staging ring, %.1f GB/s "
+                 "direct, %.1f GB/s from pinned memory. The aperture is a "
+                 "FIRMWARE setting (Above 4G decoding + Resizable BAR), so it is "
+                 "measured rather than assumed, and cached per card: "
+                 "KRK_H2D_PROBE_RERUN=1 re-measures, KRK_H2D_CACHE=0 disables "
+                 "the cache, KRK_WARM_DMA=1|2 forces a path, KRK_H2D_PROBE=0 "
+                 "skips the probe.",
+                 direct_path ? "the driver-staged DMA (no host memcpy)"
+                             : "the staging ring",
+                 static_cast<f64>(h2d_bytes) / (1024.0 * 1024.0), origin.c_str(),
+                 h2d.pageable_gbs, h2d.direct_gbs, h2d.pinned_gbs);
+    }
+    const size_t pin_auto =
+        pin_wanted ? krk::pinned_warm_prefix_bytes(warm, ram_total) : 0;
+    if (cfg_.expert_pin_mb >= 0) {
         model_.experts().set_host_pin_budget(
             static_cast<size_t>(cfg_.expert_pin_mb) * 1024u * 1024u);
-
+    } else if (pin_auto > 0) {
+        model_.experts().set_host_pin_budget(pin_auto);
+        // The rates are part of the message, not a debug line: this decision is
+        // a measurement of THIS machine, and a reader has to be able to see what
+        // it was to know whether it still applies.
+        const double pin_mib = static_cast<f64>(pin_auto) / (1024.0 * 1024.0);
+        const double warm_mib = static_cast<f64>(warm) / (1024.0 * 1024.0);
+        if (h2d.valid)
+            KRK_INFO("expert cache: pinned WARM prefix %.0f MiB of the %.0f MiB "
+                     "tier -- a %.0f MiB promotion measured %.1f GB/s %s "
+                     "against %.1f GB/s pinned (%.2fx), so the pageable path "
+                     "pays a copy this prefix removes. Every rate here was "
+                     "measured on this card; a wide aperture moves them, and "
+                     "then this prefix removes itself. KRK_HOST_PIN_MB or "
+                     "--expert-pin-mb overrides it, KRK_PIN_AUTO=0 disables it.",
+                     pin_mib, warm_mib,
+                     static_cast<f64>(h2d_bytes) / (1024.0 * 1024.0),
+                     pageable_gbs, direct_path ? "direct" : "through the ring",
+                     h2d.pinned_gbs, h2d.pinned_gbs / pageable_gbs);
+        else
+            // No probe (KRK_H2D_PROBE=0, or an allocation it could not get): the
+            // decision fell back to the runtime's BAR attribute. Say so rather
+            // than printing 0.0 GB/s as if it had been measured.
+            KRK_INFO("expert cache: pinned WARM prefix %.0f MiB of the %.0f MiB "
+                     "tier -- the H2D probe did not run, so this follows the "
+                     "runtime's BAR attribute (%s). The aperture is a FIRMWARE "
+                     "setting (Above 4G decoding + Resizable BAR); the probe "
+                     "measures which side of it this machine is on when it is "
+                     "allowed to run. KRK_HOST_PIN_MB or --expert-pin-mb "
+                     "overrides it, KRK_PIN_AUTO=0 disables it.",
+                     pin_mib, warm_mib,
+                     small_bar ? "a 256 MiB aperture" : "large BAR or unknown");
+    } else if (!pin_explicit && warm > 0 && pin_auto_on()) {
+        if (h2d.valid)
+            KRK_INFO("expert cache: no pinned WARM prefix -- a %.0f MiB "
+                     "promotion measured %.1f GB/s %s against %.1f GB/s pinned "
+                     "(%.2fx), which does not buy back RAM that cannot be "
+                     "swapped%s.",
+                     static_cast<f64>(h2d_bytes) / (1024.0 * 1024.0),
+                     pageable_gbs, direct_path ? "direct" : "through the ring",
+                     h2d.pinned_gbs, h2d.pinned_gbs / pageable_gbs,
+                     direct_path ? " (the direct path already carries the copy a "
+                                   "pin would have removed)" : "");
+        else
+            KRK_INFO("host->device path: no H2D probe (%s) and the runtime says "
+                     "%s, so the WARM prefix stays pageable. Set KRK_HOST_PIN_MB "
+                     "or --expert-pin-mb to pin it anyway.",
+                     "KRK_H2D_PROBE=0", small_bar ? "a 256 MiB aperture"
+                                                  : "large BAR or nothing");
+    }
     // Prefetch is opt-in. Read-through admits every expert the run actually
     // touches, so an eager sweep of the corpus is only worth its wall time when
     // the run is short and its routing is broad — and it costs RAM and time
@@ -5959,6 +6330,26 @@ static bool lookahead_stage() {
     return v;
 }
 
+// One upload for a whole layer's routed set (ExpertCache::promote_batch).
+// MEASURED AND OFF BY DEFAULT. The hypothesis was that a promotion's 143
+// us/expert figure was mostly per-call enqueue cost; on the REAP-320 file it is
+// not. A promotion measures ~500-570 us/expert there, the pageable ring's 4 MiB
+// memcpy is most of it, and batching 4 experts into one call changed nothing in
+// either direction: 5 interleaved order-balanced pairs of 16 greedy tokens,
+// 111.8 against 112.9 ms/step median (delta MAD 2.6 ms, 3 of 5 pairs), with the
+// batched arm's `xfer` row consistently HIGHER (366-385 against 249-287 ms over
+// 15 steps) because more chunks than the 4-slot ring holds in one call is more
+// ring handoff, not less. Same text in all ten runs. It is kept as the arm for a
+// deeper ring or a pinned WARM tier, where the per-call cost is not already
+// hidden behind a memcpy. KRK_MOE_BATCH_PROMOTE=1 enables it.
+static bool batch_promote() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_MOE_BATCH_PROMOTE");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
 static bool moe_silu_fused() {
     static const bool v = [] {
         const char *e = std::getenv("KRK_MOE_SILU_FUSED");
@@ -6330,10 +6721,12 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             static_cast<i64>(L.experts.down->ne[1]) == n_embd_ &&
             dtype_row_aligned(L.experts.up->type, n_embd_) &&
             dtype_row_aligned(L.experts.up->type, L.experts.n_ff_exp);
+        // A layer that asked for the dispatch and did not get it is the one thing
+        // a "the arm was on and the numbers did not move" report has to be able
+        // to rule out. dispatch_dev is the path chosen when the device dispatch is
+        // on (KRK_DEV_PTR=1, table published, whole routed set resident, shape
+        // fits the kernel) and the hybrid path is not in use.
         const bool dispatch_dev = dispatch_cap && !hybrid;
-        // Counted, not silently dropped: a layer that asked for the dispatch and
-        // did not get it is the one thing a "the arm was on and the numbers did
-        // not move" report has to be able to rule out.
         if (dev_table_ && !dispatch_dev) ++dp_launch_skips_;
         i32 n_cpu_experts = 0;
         if (hybrid) {
@@ -6439,6 +6832,23 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 model_.experts().prefetch_layer(
                     L.experts, layer, prefetch_ids_.data(),
                     static_cast<int>(prefetch_ids_.size()));
+            // ---- promote the routed set in ONE upload ---------------------
+            // The WARM hits this layer is about to take are known here, before
+            // any of them runs, so they are handed to the cache as one set and
+            // it issues one batch per source kind instead of one call per
+            // expert. Same bytes, same order per expert, same arithmetic: only
+            // the number of enqueues changes.
+            //
+            // Bounded like stage_batch, and for the same reason: with n > 1 the
+            // union of a wider row can be hundreds of experts, and promoting
+            // all of them would evict the ones the first row needs.
+            const size_t batch_max = static_cast<size_t>(k) * 4 + 8;
+            if (batch_promote() && !prefetch_ids_.empty() && n <= 8 &&
+                prefetch_ids_.size() <= batch_max)
+                model_.experts().promote_batch(L.experts, layer,
+                                               prefetch_ids_.data(),
+                                               static_cast<int>(
+                                                   prefetch_ids_.size()));
             // ---- promote the plan in ONE pass, before the per-expert loop ----
             // Without this every routed expert that is not resident is promoted
             // INSIDE the loop, between two GEMMs: alloc, room walk and H2D each
@@ -6458,86 +6868,6 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                                              static_cast<int>(prefetch_ids_.size()));
         }
 
-        // ---- the same selection and plan, on the device ---------------------
-        // Verified against what the host just computed, and only used when every
-        // id, every weight and every plan offset agrees exactly. A mismatch
-        // leaves the layer on the host plan and is counted for the report, so a
-        // device bug degrades into a slower run rather than a different model.
-        bool dev_plan_ok = false;
-        if (dispatch_dev) {
-            // Selection and the plan, entirely on the device. NOTHING is read
-            // back: no ids, no weights, no offsets. That is the difference from
-            // the arm below, which downloads both to verify them -- and the
-            // verification is exactly the host dependency this removes, so it
-            // cannot be kept here. What replaces it is the table's residency
-            // promise (no pointer can move) plus the kernel's arithmetic, which
-            // is the per-expert path's own dot order (see kernels/moe_table.hpp).
-            const i32 norm = mc.expert_w_norm != 0 ? 1 : 0;
-            be_->router_topk(ws_routerp_, n, ne, k, ws_ids_, ws_wts_, norm,
-                             mc.expert_w_scale);
-            be_->moe_plan_build(ws_ids_, n, k, ne, ws_off_, ws_plan_, ws_alpha_,
-                                ws_wts_);
-        } else if (dplan && !hybrid) {
-            const size_t nk = static_cast<size_t>(n) * static_cast<size_t>(k);
-            const i32 norm = mc.expert_w_norm != 0 ? 1 : 0;
-            be_->router_topk(ws_routerp_, n, ne, k, ws_ids_, ws_wts_, norm,
-                             mc.expert_w_scale);
-            dev_ids_.resize(nk);
-            dev_wts_.resize(nk);
-            be_->download(dev_ids_.data(), ws_ids_, nk * sizeof(i32));
-            be_->download(dev_wts_.data(), ws_wts_, nk * sizeof(f32));
-            bool same = true;
-            for (size_t i = 0; i < nk; i++) {
-                if (dev_ids_[i] != moe_sel_[i]) {
-                    ++dp_sel_diff_;
-                    same = false;
-                }
-                // STRICT: bit-exact, and the reason is measured. The k-sum is
-                // the same sequential f32 sum on both sides, so the only
-                // difference available is `1/ksum`, which the device computes
-                // with an approximate reciprocal. On Mellum2.1 that is 2-4 ulp
-                // on ~10% of slots -- and at 48 greedy tokens it changed the
-                // text. So a tolerance here would be a gate that passes a
-                // different model; the arm falls back instead, and the fix is
-                // to normalize the k weights on the host (they are eight
-                // numbers) rather than to widen the comparison.
-                i32 dvi = 0, hvi = 0;
-                std::memcpy(&dvi, &dev_wts_[i], sizeof(dvi));
-                std::memcpy(&hvi, &moe_wt_[i], sizeof(hvi));
-                const i32 ulp = dvi > hvi ? dvi - hvi : hvi - dvi;
-                if (ulp > 0) {
-                    ++dp_wt_diff_;
-                    same = false;
-                    // One line, the first time: which layer shape and how the two
-                    // numbers differ (hex, so it is the bits and not a rounding
-                    // of the print). A count alone cannot tell a normalization
-                    // rule from a wrong probability.
-                    static bool printed = false;
-                    if (!printed && ulp > 1) {
-                        printed = true;
-                        KRK_INFO("device plan: first weight mismatch L%02d n=%d i=%zu "
-                                 "dev=%.9g(%a) host=%.9g(%a)",
-                                 layer, n, i, static_cast<f64>(dev_wts_[i]),
-                                 static_cast<f64>(dev_wts_[i]),
-                                 static_cast<f64>(moe_wt_[i]),
-                                 static_cast<f64>(moe_wt_[i]));
-                    }
-                } else if (ulp == 1) {
-                    ++dp_wt_1ulp_;
-                }
-            }
-            ++dp_rows_;
-            if (same) {
-                be_->moe_plan_build(ws_ids_, n, k, ne, ws_off_, ws_plan_,
-                                    ws_alpha_, ws_wts_);
-                plan_off_.assign(static_cast<size_t>(ne) + 1, 0);
-                be_->download(plan_off_.data(), ws_off_,
-                              (static_cast<size_t>(ne) + 1) * sizeof(i32));
-                dev_plan_ok = true;
-                ++dp_used_;
-            }
-        }
-
         // ---- one routing plan for the whole layer ---------------------------
         // The (token, slot) pairs are bucketed by expert once per layer, so a
         // visit reads [off(e), off(e+1)) of a plan that cost TWO copies instead
@@ -6550,9 +6880,9 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // and the weights itself -- so the host plan is the fallback's, and the
         // per-expert loop below is skipped entirely when it engaged.
         const bool plan_grouped = ((moe_plan_grouped() && !dispatch_dev) ||
-                                   dev_plan_ok) &&
+                                   dp_used_ > 0) &&
                                   !expert_stub_;
-        if (plan_grouped && !dev_plan_ok) {
+        if (plan_grouped && dp_used_ == 0) {
             plan_off_.assign(static_cast<size_t>(ne) + 1, 0);
             for (i32 t = 0; t < n; t++) {
                 const i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
@@ -6592,6 +6922,27 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // of the table. The routed sum lands in ws_ffn_, which is exactly what
         // the per-expert scatter would have built, so the residual add after
         // this function needs no knowledge of which path ran.
+        // ---- the next token's hint for this layer --------------------------
+        // Recorded before the experts run, so a layer that fails to acquire one
+        // still contributes its routing. Decode rows only: with n > 1
+        // moe_sel_ holds a batch, and a single previous-token set would be a
+        // worse predictor than the plan the batch path already stages.
+        const bool next_prefetch = next_prefetch_on() && n == 1 && !expert_stub_;
+        if (next_prefetch) {
+            if (moe_hint_.size() < static_cast<size_t>(mc.n_layer))
+                moe_hint_.resize(static_cast<size_t>(mc.n_layer));
+            std::vector<i32> &hint = moe_hint_[static_cast<size_t>(layer)];
+            hint.clear();
+            for (i32 s = 0; s < k; s++) {
+                const i32 e = moe_sel_[static_cast<size_t>(s)];
+                if (e < 0 || e >= ne) continue;
+                bool dup = false;
+                for (i32 prev : hint)
+                    if (prev == e) { dup = true; break; }
+                if (!dup) hint.push_back(e);
+            }
+        }
+
         if (dispatch_dev) {
             KRK_TIME_HOST_N(n == 1 ? "moe.dispatch" : "moe.dispatch.batch", hs_disp);
             be_->moe_dispatch(dev_table_, layer, ne, ws_ids_, ws_wts_, ws_xn_,
@@ -6599,9 +6950,18 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             ++dp_launch_layers_;
         }
 
+        // ---- per-expert loop on the device too? no - this is the dispatch path ---
+        // When dispatch_dev is true the kernel already did the whole layer; the
+        // per-expert loop below is skipped by `!dispatch_dev` in its header.
+
         // The per-expert loop, timed as its own span: with 8 experts of 6 launches
         // this is where the launch fan-out and the per-expert acquire() live, and
         // a step that is launch-bound shows up here and nowhere else.
+        //
+        // NOTE: dispatch_dev is true only when KRK_DEV_PTR=1 is on AND the table
+        // is published AND the whole routed set is resident AND the shape fits the
+        // kernel; otherwise the per-expert path is used and expertise is resolved
+        // per expert via acquire().
         {
         KRK_TIME_HOST_N(n == 1 ? "moe.experts" : "moe.experts.batch", hs_moe);
         for (i32 e = 0; !expert_stub_ && !dispatch_dev && e < ne; e++) {
@@ -6878,6 +7238,28 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 if (next < ne) model_.experts().stage_next(L.experts, layer, next, e);
             }
         }
+        }
+
+        // ---- prefetch the next MoE layer's predicted set ---------------------
+        // Here, after this layer's expert loop, is the only place the eviction is
+        // free: every slot this layer used is done, so making room for the next
+        // layer costs a copy the WARM tier already holds and nothing else. The
+        // DMA runs under the next layer's norm/attention/hyper-connection work,
+        // which is the window this feature exists to use.
+        if (next_prefetch && model_.experts().host_pin_budget() > 0) {
+            i32 j = layer + 1;
+            while (j < mc.n_layer && !model_.layers()[static_cast<size_t>(j)].moe)
+                j++;
+            if (j < mc.n_layer && static_cast<size_t>(j) < moe_hint_.size()) {
+                const std::vector<i32> &hint = moe_hint_[static_cast<size_t>(j)];
+                if (!hint.empty() &&
+                    model_.layers()[static_cast<size_t>(j)].experts.present()) {
+                    next_prefetch_staged_ += model_.experts().stage_ahead(
+                        model_.layers()[static_cast<size_t>(j)].experts, j,
+                        hint.data(), static_cast<int>(hint.size()));
+                    ++next_prefetch_layers_;
+                }
+            }
         }
 
         // ---- the host arm --------------------------------------------------
