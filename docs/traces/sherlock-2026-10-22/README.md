@@ -19,3 +19,24 @@ Headline findings (full analysis in `docs/DEEP-DIVE-MOE-PREFILL-DECODE-2026-10-2
 - Dense flash: weight streaming (56 stagings, 13 GiB, drain 1036 ms >> read 389 ms >> copy 11 ms).
 - Router readback host-bound (`download_f32` backend 636 ms vs device 35 ms on REAP-288).
 - Distill control proves the engine path: WARM-resident set → promote 38 ms at 60 GB/s.
+
+## Chunk-default validation (2026-10-22, Qwen3-MOE-4x0.6B, `--ctx 8192`)
+
+The `--chunk` default is already 256 in the CLI, the server and
+`EngineConfig::prefill_chunk`, so this sweep validates rather than changes
+it. Same prompt family at four lengths, all arms byte-identical output
+(same md5 across chunks and lengths):
+
+| prompt | chunk 256 | chunk 8 | speedup |
+|---|---|---|---|
+| 131 tok | 399 ms (328 tok/s) | 851 ms (154 tok/s) | 2.1x |
+| 501 tok | 694 ms (722 tok/s) | 2187 ms (229 tok/s) | 3.2x |
+| 2001 tok | 1948 ms (1027 tok/s) | 9366 ms (214 tok/s) | 4.8x |
+| 4001 tok | 4328 ms (924 tok/s) | 23468 ms (171 tok/s) | 5.4x |
+
+Memory is not the constraint: workspaces 12 MiB at chunk 256 vs 1 MiB at
+chunk 8 (4001-token run, KV 896 MiB, weights 304 MiB). Decode is untouched
+(decode runs at n=1 regardless of chunk). Fetch2 control on this model:
+first fetch 6.76 ms/layer vs already-drained copy 0.15 ms — the barrier is
+queue drain, not payload, so chunking (fewer barriers) is the lever and
+shrinking the route payload is not.
