@@ -2183,7 +2183,8 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   medians of 8, and the gate's own arms): a record enqueues in **0.33-0.34 us in
   BOTH queue states** and leaves **27-32 us of device time** behind it; a launch
   enqueues in 0.75-0.97 us and leaves 2.8 us. What the queue state changes is the
-  **tail** (177 -> 583 us on the launch arm), never the enqueue. So the 28.2-30.6
+  **tail** (177 -> 583 us on the launch arm, measured 2026-10-11 at a
+  512-call pre-issue), never the enqueue. So the 28.2-30.6
   us this table used to call "quiet" was never a queue-state effect: it is the
   device half, which is the right figure only for a call that cannot overlap. The
   **in-step** column stands on its own switch A/B and is the number to rank with
@@ -2191,13 +2192,27 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   queued launches); the "0.32 us busy enqueue" this table once called the
   alternative was the same 0.33 us as the empty arm, mislabelled as a state.
   **The arm is in the gate now and proves itself there** -- it asserts the queue
-  really is fuller (launch-arm tail >2x, measured 2.9-3.7x), that a record's device half is >=4x
+  really is fuller (launch-arm tail >2x), that a record's device half is >=4x
   its host half, that the enqueue does NOT move between states, and that the
   instrument resolves the device cost per op. `KRK_TEST_QUEUE_NOPREISSUE=1` skips
   the pre-issue and fails exactly the two fullness checks (rc=1), which is the
   red construction. The gate's floor line says `unresolvable at iters=2` instead
   of printing `-24.00 us per call` (the gate sets iters=2, where the subtraction
   is the difference of two single measurements).
+  **The pre-issue depth is a machine-dependent constant, and 512 stopped being
+  enough.** The ratio the check wants is the deep arm's tail over the empty
+  arm's, and the empty arm's tail is the block's OWN device work (~220-280 us
+  of launches on this box), so the pre-issue has to leave more than that
+  behind. The device drains the pre-issue while the host is still enqueueing
+  it, so the leftovers scale with the depth. Measured 2026-10-22 on the launch
+  arm: 512 pre-issued leaves 411 us against an empty queue's 224-284 -- 1.54x,
+  so the gate FAILED on a tree where nothing had changed; 8192 leaves
+  2105-2206 us (8.3-10.3x over four runs) and 16384 leaves 4710 us (19.2x).
+  The default is 8192 now, the 2.0x threshold is unchanged, and the red
+  construction still reports 1.00x and fails. The lesson is the general one: a
+  ratio measured on one machine is not a constant -- the drain rate is the
+  machine's, so a depth that was enough when the arm was written is not a depth
+  that is enough now, and "the gate is red" is the first evidence to look for.
   **Rules:** rank a fold by running the fold (one session, interleaved,
   order-balanced) and treat any constant-times-count estimate as good to ~2x;
   never compare a host-to-device row against `--floor`; and remember that a
