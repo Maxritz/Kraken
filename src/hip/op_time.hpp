@@ -62,6 +62,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include "krk/trace.hpp"
 #include <utility>
 #include <vector>
 
@@ -283,8 +284,15 @@ private:
     OpTime() {
         const char *v = std::getenv("KRK_TIME");
         const char *p = std::getenv("KRK_PROFILE");
+        const char *t = std::getenv("KRK_TRACE");
         profile_ = p && *p && std::string(p) != "0";
-        on_ = profile_ || (v && *v && std::string(v) != "0");
+        // The sherlock trace needs the same HIP event spans the op table uses:
+        // KRK_TRACE=1 implies event timing for every op (all ops, like
+        // --profile), so the device lane is populated without asking for the
+        // text table. Cost note: this carries the same ~20 us/op recorder
+        // floor as KRK_TIME -- compare untraced wall time for conclusions.
+        const bool trace_ev = t && *t && std::string(t) != "0";
+        on_ = profile_ || (v && *v && std::string(v) != "0") || trace_ev;
         if (on_) {
             const std::string spec = v ? v : "";
             // --profile needs every op to draw the step, so it overrides a
@@ -348,6 +356,23 @@ static const char *component_of(const char *op) {
         {"gemm_group", "projections"},
         {"gemm_simt", "projections"},
         {"silu_mul", "ffn-activate"},
+        {"silu_act", "ffn-activate"},
+        // qwen4exp hyper-connections: the lane stack's own ops, which are
+        // neither a row norm nor a residual add. Kept in their own bucket so a
+        // mixed profile still says how much of the step the mixer is worth.
+        {"hc_init", "hyper"},
+        {"hc_mix", "hyper"},
+        {"hc_combine", "hyper"},
+        // qwen4exp's per-layer embedding block: its own bucket, because on a
+        // file that carries it, it is the difference between a recurrent
+        // layer's cost and a comparable layer's on a model without one.
+        {"ple_gate", "ple"},
+        {"conv1d_dw", "ple"},
+        {"lane_bcast_mul", "ple"},
+        // QSA: the per-query-row cell gather. Its own bucket, because it only
+        // runs past the selection budget and would otherwise hide inside the
+        // attention rows it exists to shorten.
+        {"gather_rows", "qsa"},
         {"add_inplace", "residual"},
         {"add_bias_rows", "bias"},
         {"add_bias_cols", "bias"},
@@ -662,6 +687,26 @@ static const char *component_of(const char *op) {
             if (gap < 0.0f) gap = 0.0f;
         }
         r.gap_ms += gap;
+        // Sherlock device lane: durations are exact (HIP events); placement is
+        // resolve-anchored, so use host/backend spans for ordering and this
+        // lane for per-op cost ranking.
+        if (Trace::get().on() && !calib_) {
+            const double dev_us = static_cast<double>(ms) * 1000.0;
+            const double now = Trace::get().now_us();
+            char args[160];
+            std::snprintf(args, sizeof(args),
+                          "\"gap_ms\":%.3f,\"host_ms\":%.3f,\"bytes\":%lld,\"flops\":%lld",
+                          static_cast<double>(gap), s.host_ms,
+                          static_cast<long long>(s.bytes), static_cast<long long>(s.flops));
+            Trace::get().complete("device", s.name ? s.name : "?",
+                                  now - dev_us, dev_us, args);
+            if (gap > 0.05) {
+                char gargs[96];
+                std::snprintf(gargs, sizeof(gargs), "\"gap_ms\":%.3f", static_cast<double>(gap));
+                Trace::get().complete("wait", "device-idle", now - dev_us - static_cast<double>(gap) * 1000.0,
+                                      static_cast<double>(gap) * 1000.0, gargs);
+            }
+        }
         if (profile_ && !calib_) {
             Rec rec;
             rec.name = s.name ? s.name : "?";
@@ -695,9 +740,17 @@ static const char *component_of(const char *op) {
 };
 
 // RAII guard, one per backend op, so every exit path closes its span.
+// Also emits the sherlock trace timeline: a host-side "backend" span from
+// begin to end (launch + enqueue wall time), plus grid/block/kernel geometry
+// when the op reports it via launch(). The device-side span (event-measured
+// dev/gap) is emitted at resolve() under cat "device" once the HIP events
+// have been read back, anchored to the same host clock.
 class OpScope {
 public:
-    explicit OpScope(const char *name) {
+    explicit OpScope(const char *name) : name_(name) {
+        Trace::get().ensure_on();
+        trace_on_ = Trace::get().on();
+        if (trace_on_) trace_t0_ = Trace::get().now_us();
         if (OpTime::get().wants(name)) {
             OpTime::get().begin(name);
             live_ = true;
@@ -705,19 +758,45 @@ public:
     }
     ~OpScope() {
         if (live_) OpTime::get().end(bytes_);
+        if (trace_on_) {
+            const double dur = Trace::get().now_us() - trace_t0_;
+            char args[192];
+            if (grid_ > 0 || bytes_ > 0) {
+                std::snprintf(args, sizeof(args),
+                              "\"op\":\"%s\",\"grid\":%d,\"block\":%d,\"bytes\":%lld,\"flops\":%lld", name_, grid_, block_,
+                              static_cast<long long>(bytes_), static_cast<long long>(flops_));
+            } else {
+                std::snprintf(args, sizeof(args), "\"op\":\"%s\"", name_);
+            }
+            Trace::get().complete("backend", name_, trace_t0_, dur, args);
+        }
     }
     // Weight bytes read by this op, when they are knowable.
     void bytes(i64 n) { bytes_ = n; }
+    // Dispatch-trap geometry: grid/block of the kernel(s) this op launches.
+    // Call after the launch shape is known; kept for the trace args.
+    void launch(int grid, int block) {
+        grid_ = grid;
+        block_ = block;
+    }
     void retag(const char *nm) {
+        name_ = nm ? nm : name_;
         if (live_) OpTime::get().retag(nm);
     }
     void flops(i64 f) {
+        flops_ = f;
         if (live_) OpTime::get().add_flops(f);
     }
 
 private:
+    const char *name_ = nullptr;
     i64 bytes_ = 0;
+    i64 flops_ = 0;
+    int grid_ = 0;
+    int block_ = 0;
     bool live_ = false;
+    bool trace_on_ = false;
+    double trace_t0_ = 0.0;
 };
 
 // One per scope: every op is its own method body.

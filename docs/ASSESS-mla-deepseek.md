@@ -1,5 +1,11 @@
 # What MLA support would cost in kraken, and what it would buy
 
+> 2026-10-21: DeepSeek open-sourced DeepInfer, a serving runtime for
+> DeepSeek-V4.1-Flash whose design implements exactly this path (absorbed
+> latent KV, sparse indexer, FP4 cache). `docs/AUDIT-deepinfer.md` reads it
+> against this file's estimate and splits what is portable from what is
+> SM100-only.
+
 Assessed 2026-10-10 from the tree, not from the papers. MLA (multi-head
 latent attention, DeepSeek-V2/V3) is refused today by the tensor-gap map:
 `attn_kv_a` / `attn_kv_b` / `attn_kv` name "latent KV compression" in

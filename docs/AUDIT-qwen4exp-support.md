@@ -235,12 +235,38 @@ as `residual_lane += block_out * 2*sigmoid(inject_lane / 4)`. There is **no
    (`mean_lanes`, `lane_scatter`) plus the existing gemms/norms. Verified by a
    CPU fixture whose lanes start identical (the reference starts them as `hc`
    copies of the embedding, so lane 0..3 must stay equal until the first
-   combine, which the test pins).
+   combine, which the test pins). **DONE, and wired into `forward_core`:** the
+   lane stack is `ws_hc_` (`[n, hc, n_embd]`, 10240 wide on this file), each
+   sub-block is bracketed by `hc_enter` / `hc_leave`, and `hc_head_mix` replaces
+   the final norm. The per-lane norm is the existing `rmsnorm_grouped` (the
+   Mamba-2 op is exactly "one weight vector per group"), and the only new
+   backend ops are `hc_init`, `hc_mix`, `hc_combine` and `silu_act`.
+   Two things are worth keeping from building it:
+   (a) the block is handed the MIXED row and adds its own output onto it, so
+   `hc_leave` recovers the block output by subtracting the saved mix -- the
+   residual sum must never enter the weights the combine applies;
+   (b) `hc_leave` scatters with the mixer's per-lane `inject` OUTPUT
+   (`ws_hc_inj_`), not with the `[wide, hc]` weight tensor. Passing the weight
+   read f16 bytes as f32 lanes: it ran, produced finite text, and kept the four
+   lanes equal -- the lane-invariance check is what caught it.
+   Evidence: `test_hc_lanes` 24/24 (arithmetic at 4 x 2560 through 320),
+   `test_qwen4exp_forward` 17/17 (a real 4-lane-of-2560 file through
+   `Engine::init` and `generate`, the lane stack read back at 10240 wide, a
+   lane-varying injection that must separate the lanes and a lane-symmetric one
+   whose lanes must stay **bit-equal**, plus the PLE/QSA refusal), and
+   `kraken-bench --hc` **6 of 6** on the device against the host oracle in
+   `src/hc.cpp`. Removing the scatter from `hc_leave` fails the separation
+   check (16/17), so the invariant is shown able to fail.
 3. **PLE**: host-side n-gram hash -> 16 row indices per token, gathered straight
    out of the mmap (the table is 320,001,536 x 160, i.e. tens of GB and must
    never be uploaded), then key/value projections, per-lane dot gate, and a
    dilated depthwise conv with per-layer history. Verified by a fixture whose
-   hashes and rows are computable in the test.
+   hashes and rows are computable in the test. **DONE and wired.** The row is
+   `n_embd` wide (`ple_key` widens it to hc*n_embd, `ple_value` keeps it narrow),
+   the conv's window is per-layer state, and `test_qwen4exp_ple` recomputes the
+   rows independently from the tokenized prompt and requires chunk 8 and chunk 1
+   to decode the same tokens. `kraken-bench --hc` proves the three device pieces
+   (10 of 10, with the convolution's chunk invariance bit-identical).
 4. **Recurrent block**: `gdn_forward` plus the `sigmoid` gate switch.
 5. **Full-attention block**: packed `[q|gate]`, per-head norms, and *dense*
    causal attention first (a superset of the QSA selection, so text is coherent),
@@ -248,3 +274,53 @@ as `residual_lane += block_out * 2*sigmoid(inject_lane / 4)`. There is **no
    block, top-k over blocks, mask everything else.
 6. **End to end**: greedy text against `H:\LLAMA-binsocm10\llama-completion.exe`
    on the same prompt, plus a logits comparison on the first token.
+
+## Where the graph diverged, measured (2026-10-20)
+
+The whole-graph gate in step 6 is green now, and the divergence was found by
+walking the graph host-side from the first token instead of comparing sentences:
+
+1. **Everything up to layer 1 matched.** Layer 0 of the REAP-288 file, token 4 of
+   `"The capital of France is"`, recomputed from the file's own weights against a
+   `KRK_DUMP` trace: the hyper-connection mixer (`hc_n`, `hc_gate`, `hc_mix`,
+   `hc_inject`) 1.7e-4 median relative, the delta net (`gdn_conv`, `gdn_delta`,
+   `gdn_norm`, `gdn_gated`) 3e-4..7e-4, and the lane scatter after the block
+   reproduced `hc_attn_norm` of the next layer's mix at corr 1.000000. The
+   routed MoE was checked the same way on **all 48 layers**: `moe.sum` equals
+   `sum_k w_k * expert_k(ffn.pre)` plus the gated shared expert at corr 1.0000
+   for layers 0-34, 36-38 and 40-47 and 0.983 for L35/L39, with the routing
+   weights identical to the trace's top-10. Attention was cleared separately:
+   kraken's own dumped q/k/v, put through a dense softmax with the 12:1 GQA
+   grouping, reproduce `attn.out` bit-exactly at position 0 and to 1.7e-4 after
+   it, so the kernel and the KV mapping are right.
+2. **The first disagreement was the PLE residual at layer 1.** The reference
+   (`build_ple`) returns `hidden + gated + silu(conv(grouped_norm(gated)))`:
+   the grouped norm exists to feed the convolution, and the *raw* `value * gate`
+   is what reaches the lane stack. `ple_block` normalized in place and added the
+   same buffer, so the residual received a per-lane unit-RMS row. Measured on
+   token 0 (where the conv's history is one real row, so the whole block is
+   computable from the trace): `ple_gate` matched at 3.5e-4 and the normalized
+   row matched at 4.7e-4, while the resulting lane stack scored **corr 0.373**
+   under the reference's rule against **0.9999** under kraken's. That single
+   term is the difference between `(n,)))` and the reference's answer.
+3. **The rope pairing was the second, smaller one.** `llm_arch_rope` answers
+   `LLAMA_ROPE_TYPE_IMROPE` for this arch, and IMROPE pairs channel j with
+   j + n_rot/2 (the half-split pairing) -- the table said `rope_neox=false`
+   (adjacent channels). The `[11,11,10,0]` section table does not change that
+   for text, because `ggml_mrope_cache_init` advances one theta per pair and only
+   selects the axis position per sector, and all four positions are equal.
+
+With both fixed, `kraken.exe -m <REAP-288> -p "The capital of France is" -n 24
+--greedy` prints the same 24 tokens as `llama-completion.exe` (`-no-cnv
+--no-jinja`, `--temp 0`): "
+<think>
+The user is asking about the capital of
+France. This is a straightforward factual question. The capital of France". The
+8-token arm was not enough to see the rope term: both pairings emit the
+reference text at 8 tokens, and the adjacent pairing only flips at token 20
+(`of France` -> `(city`).
+
+Gates for both: `test_qwen4exp_ple` now 16/16 (it reads the block's three terms
+through `ple_debug_terms` and fails 14/16 when they are re-aliased), and the
+arch stays behind `KRK_ARCH_ALLOW_EXPERIMENTAL` because no suite gate pins a
+whole-graph output -- the blocks are pinned, the sentence is not.

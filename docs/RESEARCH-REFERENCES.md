@@ -12,42 +12,101 @@ the Aug-2026 cs.LG digest, and the RDNA2/RDNA4 ISA PDFs.
 
 ## Expert storage, streaming and residency
 
-### The storage question, measured (this box, 2026-10-09) — which limit binds
+### The storage question, measured (this box, re-measured 2026-10-21) — which limit binds
 
 The three candidates -- file reads, H2D transfers, the per-layer barrier -- were
 separated by varying only the VRAM expert budget on one file
 (`Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL`, 40 layers x 256 experts = 10240
 x 0.937 MiB = a 9600 MiB corpus, RX 9070 XT). The engine prints its own four-way
-split, so no profiler is involved:
+split, so no profiler is involved. **These rows are the current binary's, and two
+of them no longer agree with the 2026-10-09 table this replaces** -- see the note
+under it for what changed and why.
 
-| arm | command (tail) | HOT/WARM/COLD | read | room | alloc | xfer | decode |
+| arm | command (tail) | WARM pinned | read | room | alloc | xfer | decode |
 |---|---|---|---|---|---|---|---|
-| corpus resident | `--ctx 512 --expert-warmup 1 -n 16 --greedy` | 100/0/0 | 0 | 0 | 0 | 0 | **35.8 tok/s** (27.9 ms/step) |
-| corpus resident, no warm-up | same, without `--expert-warmup` | 68.7/31.3/0 | 438.8 | 0.1 | 92.2 | 675.4 | 16.5 tok/s (60.6 ms/step) |
-| tiny VRAM cache, WARM staged | `--expert-cache-mb 256 --expert-warmup 1 --ctx 512 -n 24 --greedy` | 28.2/71.8/**0.0** | **0.0** | 610.6 | **2445.5** | 350.4 | 7.0 tok/s (142.7 ms/step) |
+| corpus resident | `--expert-cache-mb 9600 --expert-warmup 1 --ctx 512 -n 24 --greedy` | 9600/9600 | 0.0 | 4.0 | 0.9 | 4.9 | **38.7 tok/s** (25.8 ms/step) |
+| corpus resident, no warm-up | same, without `--expert-warmup` | 2295 of 9600 used | 442.5 | 0.1 | 238.6 | 24.0 | 16.1 tok/s (62.0 ms/step) |
+| tiny VRAM cache, WARM staged | `--expert-cache-mb 256 --expert-warmup 1 --ctx 512 -n 24 --greedy` | 9600/9600 | **0.0** | 33.2 | **3.5** | 31.3 | 14.8 tok/s (67.6 ms/step) |
+| the same arm with the OLD pin policy | plus `KRK_HOST_PIN_MB=4800` | 4800/9600 | 0.0 | 29.6 | 3.4 | 2815.3 | 7.2 tok/s (139.8 ms/step) |
 
-(The earlier arm this session whose cache budget was not recorded agrees on the
-shape -- 26.3% COLD, read 2690 ms against 733 ms of xfer, 10.2 tok/s -- but it is a
-claim to re-run, not a protocol, so the numeric table above does not use it.)
+(The 2026-10-09 table read 35.8 / 16.5 / **7.0** tok/s with `alloc 2445.5` on the
+last arm. Two things moved: the pool's hand-out learned to express its reuse
+dependency as a stream wait and save the host query -- `alloc` 2445.5 -> 3.4 ms,
+with `alloc 819 reuse 18231` hand-outs -- and `pinned_warm_prefix_bytes` stopped
+keeping half the tier pageable, which is the 7.2 -> 14.8 row. Both changes are
+recorded with their own A/Bs in `docs/AUDIT-gpu-resident-expert-cache.md`; the
+old rows are kept here only as the historical reading.)
 
 So the ranking is *conditional*, and the condition is where the working set sits:
 
-1. **The file binds when WARM is cold.** With the staged warm-up off, that same
-   model read 2690 ms against 733 ms of transfer. The fill path is the slow one:
-   9600 MiB took 16026 ms (0.6 GB/s) in even order, against **1593 ms for the
-   256-slot arm's staged read** and 6.0 GB/s for the 2618 MiB WARM fill on the
-   auto-policy run -- per-transfer overhead, not the bus.
-2. **When WARM holds the corpus but VRAM does not, the allocator binds.** At
-   `--expert-cache-mb 256` every acquire is already served from RAM (COLD **0.0%**,
-   read **0.0 ms**) and the step is dominated by promotion churn: **alloc 2445.5 ms
-   of a 3408.1 ms promote total (72%)**, with **6405 device evictions**, against
-   xfer 350.4 ms and room 610.6 ms. Shrinking HOT by 37x costs 5x the step (35.8 ->
-   7.0 tok/s) and only ~10% of that promote total is the H2D bus. This is the arm
-   where a slot plan that uploads once per layer -- or a pinned hot core -- pays;
-   a packer and a faster file path would not.
+1. **The file binds when WARM is cold.** Without the staged warm-up the same
+   model reads its misses from the mapping as it goes: **read 442.5 ms** against
+   24.0 ms of xfer, and 16.1 tok/s against 38.7 once WARM holds the corpus. The
+   fill path is the slow one — 9600 MiB read in even order took 16.0 s (0.6 GB/s)
+   on the 2026-10-09 protocol, per-transfer overhead rather than the bus.
+2. **When WARM holds the corpus but VRAM does not, the COPY binds — not the
+   allocator, which is what this row said before it was re-measured.** At
+   `--expert-cache-mb 256` every acquire is served from RAM (read **0.0 ms**) and
+   the whole promote total is `xfer` plus a 33.2 ms room row: `alloc 3.5 ms` of
+   69.6 ms, i.e. 0.5 us per hand-out (`alloc 819 reuse 18231`), because the pool
+   hands reused cells out with a stream-side dependency instead of a host query.
+   What remains is the pageable promotion rate, and it is worth **2.14x** on this
+   arm: 139.8 -> 67.6 ms/step once the whole WARM tier is pinned (7.2 -> 14.8
+   tok/s), with `xfer` 2815 -> 31 ms. Shrinking HOT by 37x still costs 2.6x the
+   step (38.7 -> 14.8 tok/s) — that part of the old conclusion holds — but the
+   fix it pointed at was the source's pinning, not a slot plan.
 3. **The per-layer barrier is not in this list.** It is the *hybrid CPU* arm's
    cost (3.1x, `docs/test-results.md` §9): the device-only path never waits on a
    host merge.
+
+### llama.cpp's GPU-resident expert cache (#29887, #30112, #29949) -- decision and copy moved onto the card
+**What it is:** three pieces of upstream work on the same problem this tier solves, and the
+only one of them is about policy. #29887 (merged 2026-10-07, `--moe-cache-mib`) keeps expert
+weights in host memory and caches recently routed ones in a GPU bank, decided on the HOST in
+the scheduler's copy callback. #29949 (branch `lru-upstream-v3`, commit `c81901a`) moves that
+decision and the copies INTO the compute graph -- `LRU_DECIDE` reads the router's top-k on the
+device against a GPU i32 LRU state, `LRU_FILL` copies the misses, and the expert matmul is
+handed slot ids in place of expert ids. **The number that matters is the equal-budget one:** at
+the same ~6.5 GiB pinned-host budget on the same 7900 XTX, #29949 reads **31.2 tok/s at 77.9%
+hit against #29887's 20.1 at 75.0%** -- so the gap is not capacity and not the bus, it is where
+the work runs. Their correctness evidence is the shape to copy: PPL 1.4290 without a pool
+against 1.4292 at every slot count 64..192, and 12/12 greedy runs with one text hash.
+**Measured here:** the dependency they removed is the one this engine still pays --
+`moe.route.fetch` **0.523 ms/layer** on Mellum2.1 (28 layers, 23.7 ms/step) of which only
+0.077 ms is the copy; 14.6 ms of that step is the layer waiting for its own GPU work to retire
+so the host may read the router row. Our device dispatch table exists but is PUBLISHED ONCE
+and only while the whole routed set is resident (`include/krk/moe_table.hpp`), which is never
+true on a model that does not fit -- so the per-expert loop with a host round trip is the
+default exactly where a cache is needed.
+**Open, and the order:** a fixed slot bank first -- but for STABLE ADDRESSES, not for
+alloc time. The audit's `alloc 2445.5 of 3408.1 ms` row was 2026-10-09; on the current
+binary the 256 MiB arm is **alloc 3.4 ms of 2849.9** (819 real allocations against 18231
+reuses). The arm's real cost is the pageable copy at promotion shape, **469 us/expert at
+2.0 GB/s, 7.2 tok/s**, against **15.3 tok/s when all of WARM is pinned with identical
+stdout** -- and making that publish non-blocking changed nothing, so the rate is the DMA.
+Then slot-addressed dispatch, then the in-graph fill, and the LFU port last. Do not take their plain
+LRU (rejected here on measurement), their per-layout-group budgets, or zero-slot substitution
+(every routed expert must run). Full comparison, gates per step and the REAP-288 file's 78.04
+GiB / 65.4 GiB-of-experts shape: `docs/AUDIT-gpu-resident-expert-cache.md`.
+
+### PS5LM-Plus (abhi245y, 2026-10) -- a console appliance, not an engine to borrow from
+**What it is:** a jailbroken-PS5 homebrew app that embeds llama.cpp and runs GGUF on
+the console's RDNA2 iGPU through a PS5-specific RADV (Vulkan) build. The inference is
+upstream's; the project is the title, the downloader, the on-TV dashboard and a
+**context/KV planner** that walks context lengths (131072 down to 4096) against cache
+types (f16, q8_0, q4_0) until a plan fits the console's ~11.4 GiB unified heap. Its
+weights budget is the whole GGUF file size plus a 0.75 GiB reserve and recurrent state.
+**What it does not have:** any host/VRAM tiering, expert residency policy, pinned
+transfer buffers, or read/copy overlap -- MoE is "supported because llama.cpp supports
+it", and expert streaming from SSD is listed under the roadmap's *Later*. The payload
+mode's `-lm mlock` is page-locking for a CPU-only path, not a promotion pipeline.
+**Verdict for this engine:** nothing to port. The one idea worth naming is the
+planner's shape (longest context first, best cache that fits) -- which is what
+`configure_expert_cache` and the KV tier already do against measured free VRAM rather
+than a static heap. Its reported numbers (20.3 tok/s on a 27B UD-Q2_K_XL, 9.2 GiB) are
+console numbers on unified memory and do not compare to a discrete-card arm.
+Sources: <https://github.com/abhi245y/PS5LM-Plus>,
+`docs/RESEARCH.md` and `docs/ROADMAP.md` there, `ps5/app/model_plan.cpp`.
 
 ### SSD-LLaMA (2609.18110) — aligned per-(layer,expert) records, manifest, checksums
 **Measured here:** the tier is already HOT/WARM/COLD with byte budgets, and on

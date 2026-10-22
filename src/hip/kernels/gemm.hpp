@@ -178,10 +178,21 @@ constexpr int kGemvMRowsMax = 8;
 // one 16x16 accumulator tile.
 // ---------------------------------------------------------------------------
 
-#if defined(KRK_GFX11) || defined(KRK_GFX12)
+#if defined(KRK_WMMA_COMPILED)
 
 struct wmma_cfg {
     static constexpr int BM = 32;
+    // BN=128 was tried and REJECTED on measurement, and the reason is the one
+    // a tile-shape change cannot fix. Per output FLOP a block stages
+    // 2/BN bytes of activation against 0.25/BM of weight, so BN=128 halves the
+    // bytes -- and made the kernel 46% SLOWER (4096x4096x466 Q4_K: 1105 ->
+    // 1613 us, 14.15 -> 9.69 TFLOP/s; rows=22: 18.1 -> 1.16 TFLOP/s, because
+    // 4096/128 = 32 blocks cannot fill 64 CUs). The staged bytes are not the
+    // binding constraint: the staging CHAIN is latency-bound, and BN=128 costs
+    // 43.5 kB of LDS, which drops a block per CU from two to one. Widening the
+    // tile buys bytes back by spending the occupancy that hides the latency.
+    // The lever that does work is staging fewer bytes per chain -- quantized
+    // staging with the unpack done in registers -- not a wider tile.
     static constexpr int BN = 64;
 // BK sets how much weight staging one serial round covers. §2c measured the
 // staged dequant as the dominant prefill cost and showed the cost is per
@@ -198,6 +209,23 @@ struct wmma_cfg {
     static constexpr int THREADS = 256;
     static constexpr int WAVES_M = 2;
     static constexpr int WAVES_N = 4;
+    // MB = how many M tiles one block walks on ONE staged weight tile.
+    //
+    // This is the configuration lever the traffic model actually points at.
+    // A block stages BN x BK weights as f16 (2 B/value) and BM x BK
+    // activations, so per output FLOP it moves 1/BM bytes of weight against
+    // 1/BN of activation: at BM=32/BN=64 the weight side is two thirds of the
+    // staged bytes, and it is re-staged by every M tile -- 15 passes over the
+    // matrix at a 466-row prompt. Walking MB M tiles per block divides that
+    // by MB while the LDS budget stays at (BM+BN)*(BK+8)*2 = 26 kB, i.e. two
+    // blocks per CU, which is the occupancy the BN=128 experiment showed is
+    // worth more than the bytes it saves. Barriers do not get worse per unit
+    // of work: MB A stagings mean MB times the work for MB times the syncs.
+    //
+    // Bit-identical by construction: the weight values staged are the same
+    // f16 values, and each accumulator still walks K in the same order. Only
+    // the scheduling changes. MB=1 restores the old mapping exactly.
+    static constexpr int MB = 1;
 static constexpr int LD_PAD = 8; // half-element padding to break LDS bank conflicts
 }; // struct wmma_cfg
 
@@ -212,7 +240,7 @@ static constexpr int LD_PAD = 8; // half-element padding to break LDS bank confl
 
 // RDNA3: 16 fp16 per lane, lanes 0-15 and 16-31 replicated.
 // RDNA4: 8 fp16 per lane, the two lane groups split K in 4-value interleaves.
-#if defined(KRK_GFX12)
+#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__))
 constexpr int kFrag = 8;
 #else
 constexpr int kFrag = 16;
@@ -222,7 +250,7 @@ template <typename CFG>
 __device__ __forceinline__ void wmma_load_a(const _Float16 *xs, int m_off, int k,
                                             int lane, _Float16 (&frag)[kFrag]) {
     const int row = m_off + (lane & 15);
-#if defined(KRK_GFX12)
+#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__))
     const int koff = k + 8 * (lane >> 4);
 #else
     const int koff = k;
@@ -235,7 +263,7 @@ template <typename CFG>
 __device__ __forceinline__ void wmma_load_b(const _Float16 *ws, int n_off, int k,
                                             int lane, _Float16 (&frag)[kFrag]) {
     const int col = n_off + (lane & 15);
-#if defined(KRK_GFX12)
+#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__))
     const int koff = k + 8 * (lane >> 4);
 #else
     const int koff = k;
@@ -246,7 +274,7 @@ __device__ __forceinline__ void wmma_load_b(const _Float16 *ws, int n_off, int k
 
 __device__ __forceinline__ void wmma_mma(v8float &acc, const _Float16 (&a)[kFrag],
                                          const _Float16 (&b)[kFrag]) {
-#if defined(KRK_GFX12)
+#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__))
     const v8half av = {a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]};
     const v8half bv = {b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]};
     acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av, bv, acc);
@@ -258,7 +286,7 @@ __device__ __forceinline__ void wmma_mma(v8float &acc, const _Float16 (&a)[kFrag
 
 // Maps one accumulator slot back to its (row, col) inside the 16x16 tile.
 __device__ __forceinline__ void wmma_slot(int g, int lane, int *i, int *j) {
-#if defined(KRK_GFX12)
+#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__))
     *i = (lane >> 4) * 8 + g; // contiguous 8-row blocks per lane group
     *j = lane & 15;
 #else
@@ -463,6 +491,7 @@ __global__ void __launch_bounds__(CFG::THREADS)
     constexpr int WAVES_M = CFG::WAVES_M;
     constexpr int WAVES_N = CFG::WAVES_N;
     constexpr int LD_PAD = CFG::LD_PAD;
+    constexpr int MB = CFG::MB;
     __shared__ _Float16 xs[BM][BK + LD_PAD];
     __shared__ _Float16 ws[BN][BK + LD_PAD];
 
@@ -475,7 +504,9 @@ __global__ void __launch_bounds__(CFG::THREADS)
                         : n_in - k_off;
     const i64 part_off = static_cast<i64>(blockIdx.z) * part_stride;
 
-    const i64 row_base = static_cast<i64>(blockIdx.y) * BM;
+    // One block owns MB consecutive M tiles and keeps MB accumulators, so the
+    // staged weight tile is amortised over MB*BM rows of output.
+    const i64 row_base = static_cast<i64>(blockIdx.y) * (BM * MB);
     const i64 col_base = static_cast<i64>(blockIdx.x) * BN;
 
     const int tid = static_cast<int>(threadIdx.x);
@@ -494,7 +525,9 @@ __global__ void __launch_bounds__(CFG::THREADS)
     const bool vec_w = (reinterpret_cast<uintptr_t>(w) & 15u) == 0 &&
                        (w_row_bytes & 15u) == 0;
 
-    v8float acc = v8float{};
+    v8float acc[MB];
+#pragma unroll
+    for (int q = 0; q < MB; q++) acc[q] = v8float{};
     _Float16 af[kFrag];
     _Float16 bf[kFrag];
     _Float16 tmp[32];
@@ -535,6 +568,11 @@ __global__ void __launch_bounds__(CFG::THREADS)
     for (i64 kt = 0; kt < k_tiles; kt++) {
         const i64 k0 = kt * BK;
 
+        // ---- MB M tiles per staged weight tile -------------------------
+        // W is staged on the first pass only; each pass re-stages just the
+        // activation tile, which is the tile that changes with M.
+        for (int mi = 0; mi < MB; mi++) {
+        const i64 m_row = row_base + static_cast<i64>(mi) * BM;
         if constexpr (MODE != 2) {
         // ---- stage the activation tile (BM x BK), zero past the row end ----
         //
@@ -563,7 +601,7 @@ __global__ void __launch_bounds__(CFG::THREADS)
         if (a_vec) {
             const int c0 = (tid % kATPR) * kAV;
             for (int r = tid / kATPR; r < BM; r += kARows) {
-                const i64 gr = row_base + r;
+                const i64 gr = m_row + r;
                 if (gr < rows && k0 + c0 < k_n)
                     *reinterpret_cast<v8half *>(&xs[r][c0]) =
                         *reinterpret_cast<const v8half *>(
@@ -577,13 +615,14 @@ __global__ void __launch_bounds__(CFG::THREADS)
             for (int i = tid; i < BM * BK; i += THREADS) {
                 const int r = i / BK;
                 const int c = i % BK;
-                const i64 gr = row_base + r;
+                const i64 gr = m_row + r;
                 xs[r][c] = (gr < rows && k0 + c < k_n)
                                ? x[gr * n_in + k_off + k0 + c]
                                : static_cast<_Float16>(0.0f);
             }
         }
 
+        if (mi == 0) {
         // ---- stage the dequantized weight tile (BN x BK) ----
         if constexpr (DT == static_cast<int>(DType::Q4_K)) {
             // Software-pipelined Q4_K staging: cur's decode is pure ALU
@@ -661,41 +700,46 @@ __global__ void __launch_bounds__(CFG::THREADS)
                     *reinterpret_cast<const u32 *>(&tmp[z]);
         }
         } // DT generic
+        } // mi == 0
         } // MODE != 2
         __syncthreads();
 
         if constexpr (MODE == 1) {
             // Staging-only timing: touch the tiles so nothing above can be
             // eliminated, but skip the fragment loads and the WMMA itself.
-            acc[0] += static_cast<f32>(xs[tid & (BM - 1)][0]) +
-                      static_cast<f32>(ws[tid & (BN - 1)][0]);
+            acc[mi] += static_cast<f32>(xs[tid & (BM - 1)][0]) +
+                       static_cast<f32>(ws[tid & (BN - 1)][0]);
         } else {
             // ---- WMMA over the K tile ----
 #pragma unroll 1
             for (int k = 0; k < BK; k += 16) {
                 wmma_load_a<CFG>(&xs[0][0], wave_m, k, lane, af);
                 wmma_load_b<CFG>(&ws[0][0], wave_n, k, lane, bf);
-                wmma_mma(acc, af, bf);
+                wmma_mma(acc[mi], af, bf);
             }
         }
         __syncthreads();
+        } // mi
     }
 
     // ---- scatter the accumulator ----
 #pragma unroll
+    for (int mi = 0; mi < MB; mi++) {
+#pragma unroll
     for (int g = 0; g < 8; g++) {
         int i, j;
         wmma_slot(g, lane, &i, &j);
-        const i64 gr = row_base + wave_m + i;
+        const i64 gr = row_base + static_cast<i64>(mi) * BM + wave_m + i;
         const i64 gc = col_base + wave_n + j;
         if (gr < rows && gc < n_out) {
             if constexpr (MODE == 0) {
                 if (partials)
-                    partials[part_off + gr * n_out + gc] = acc[g];
+                    partials[part_off + gr * n_out + gc] = acc[mi][g];
                 else
-                    out[gr * n_out + gc] = static_cast<_Float16>(acc[g]);
+                    out[gr * n_out + gc] = static_cast<_Float16>(acc[mi][g]);
             }
         }
+    }
     }
 }
 
@@ -717,7 +761,7 @@ __global__ void __launch_bounds__(THREADS)
     out[idx] = static_cast<_Float16>(acc);
 }
 
-#endif // KRK_GFX11 || KRK_GFX12
+#endif // KRK_WMMA_COMPILED
 
 // ---------------------------------------------------------------------------
 // SIMT GEMM — gfx10 and the portable fallback
@@ -806,7 +850,6 @@ __global__ void __launch_bounds__(simt_cfg::THREADS)
                     *reinterpret_cast<const u32 *>(&tmp[z]);
         }
         __syncthreads();
-
 #if defined(KRK_SIMT_USE_DOT2)
         // Packed pair fetch with the lane-rotated pair index; see the header
         // note above the kernel. q ^ tx keeps the 16 tx lanes on 16 banks and
@@ -816,11 +859,9 @@ __global__ void __launch_bounds__(simt_cfg::THREADS)
             const int qq = (q ^ tx) & (BK / 2 - 1);
             u32 a[TM], b[TN];
 #pragma unroll
-            for (int i = 0; i < TM; i++)
-                a[i] = *reinterpret_cast<const u32 *>(&xs[ty * TM + i][qq * 2]);
+            for (int i = 0; i < TM; i++) a[i] = *reinterpret_cast<const u32 *>(&xs[ty * TM + i][qq * 2]);
 #pragma unroll
-            for (int j = 0; j < TN; j++)
-                b[j] = *reinterpret_cast<const u32 *>(&ws[tx * TN + j][qq * 2]);
+            for (int j = 0; j < TN; j++) b[j] = *reinterpret_cast<const u32 *>(&ws[tx * TN + j][qq * 2]);
 #pragma unroll
             for (int i = 0; i < TM; i++) {
 #pragma unroll
@@ -851,6 +892,7 @@ __global__ void __launch_bounds__(simt_cfg::THREADS)
             }
         }
 #endif
+
         __syncthreads();
     }
 
@@ -863,8 +905,10 @@ __global__ void __launch_bounds__(simt_cfg::THREADS)
             if (gr < rows && gc < n_out) out[gr * n_out + gc] = static_cast<_Float16>(acc[i][j]);
         }
     }
-}
-
-} // namespace krk
+}} // namespace krk
 
 #endif // KRK_KERNEL_GEMM_HPP
+
+
+
+

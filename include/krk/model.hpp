@@ -82,6 +82,12 @@ struct LayerWeights {
     QuantTensor idx_q_proj, idx_k_proj;
     f32 *idx_q_norm = nullptr;
     f32 *idx_k_norm = nullptr;
+    // HOST copies of the two indexer norms. The selection runs on the host --
+    // the pooled keys, the scores and the top-k are all host work, because the
+    // block scores have to be turned into a per-row cell list before any
+    // kernel can use them -- so these are read where the selection reads them
+    // rather than downloaded from the device copy once per forward.
+    std::vector<f32> idx_q_norm_h, idx_k_norm_h;
 
     // ---- Mixture-of-Experts (optional) -----------------------------------
     // `moe` selects the routed-expert FFN path. `router` is the small gating
@@ -597,10 +603,17 @@ public:
     const QuantTensor &tok_embd() const { return tok_embd_; }
     const QuantTensor &out_head() const { return out_head_; }
     const f32 *out_norm() const { return out_norm_; }
+    // qwen4exp has no output_norm: the final hyper-connection mixer carries it,
+    // with its own [n_embd, hc] gamma. Null on every other family.
+    const f32 *hc_head_norm() const { return hc_head_norm_; }
     // qwen4exp's PLE table is a pointer into the mapping, not an upload: the
     // accessors exist so a test can assert the loader found it and sized one row.
     const u8 *ple_table() const { return ple_table_; }
+    // The file's own type for one row of the table: the gather dequantizes one
+    // row at a time out of the mapping, so the stride and the type travel
+    // together.
     u64 ple_row_bytes() const { return ple_row_bytes_; }
+    DType ple_table_type() const { return ple_table_type_; }
     const QuantTensor &hc_head_down() const { return hc_head_down_; }
     const QuantTensor &hc_head_up() const { return hc_head_up_; }
     // NeoX inverse frequencies, length head_dim/2, host-resident (tiny).
@@ -675,6 +688,17 @@ public:
             t += L.experts.expert_bytes() * static_cast<size_t>(ne);
         }
         return t;
+    }
+
+    // Bytes of file this model has mapped, summed over shards (0 when the
+    // model was not loaded from a mapping). The mapping is the third
+    // residency tier: it is the disk source, and every page it touches is
+    // page cache -- RAM that a WARM copy cannot spend a second time.
+    size_t mapped_bytes() const {
+        size_t n = 0;
+        for (const GgufShard &sh : gguf_.shards())
+            if (sh.file) n += sh.file->size();
+        return n;
     }
 
 private:
@@ -760,6 +784,7 @@ private:
     QuantTensor hc_head_down_, hc_head_up_;
     const u8 *ple_table_ = nullptr;
     u64 ple_row_bytes_ = 0;
+    DType ple_table_type_ = DType::F32;
     std::vector<f32> inv_freq_;
     std::vector<f32> inv_freq_swa_;
     // prism.hadamard. The sign vectors are uploaded once at load and released

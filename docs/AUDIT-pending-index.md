@@ -64,6 +64,11 @@ No commits, pushes, deployments or sibling-project edits were performed.
   [AUDIT-expert-cache-next.md](AUDIT-expert-cache-next.md).
 - **M1 / T4 / T5:** device routing plan and fewer per-expert upload/gather/
   scatter launches; graph replay needs stable slots and dynamic-plan safety.
+  llama.cpp's merged host-side cache (#29887/#30112) and its in-graph
+  `LRU_DECIDE`/`LRU_FILL` branch (#29949) are the reference for the rest of it:
+  at an equal ~6.5 GiB pinned budget the in-graph arm reads 31.2 against 20.1
+  tok/s, which is the M1 argument in one number. Order, gates and what not to
+  take: [AUDIT-gpu-resident-expert-cache.md](AUDIT-gpu-resident-expert-cache.md).
 - **M2:** remaining projection/elementwise folds, preserving per-matrix dtype,
   sidecar scales and f16 rounding. C1 is closed; generic launch-tax work is not.
 - **M3:** candidate sampling and logits-copy paths need current measurement:

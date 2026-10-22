@@ -38,6 +38,7 @@ or removed is a shape change, re-recorded deliberately like a new group.
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 PASS = "pass"
 OK = "ok"
@@ -62,7 +63,13 @@ def load(path):
     return d
 
 
+
 def by_name(report):
+    return {g["name"]: g for g in report["groups"]}
+
+
+
+
     return {g["name"]: g for g in report["groups"]}
 
 
@@ -105,6 +112,20 @@ def classify(base, cur):
     for name in [g["name"] for g in base["groups"]]:
         if name not in c:
             out["removed"].append(b[name])
+    # A group the baseline has that the current run does not is more often a
+    # reverted test file than a feature that landed elsewhere -- and
+    # re-recording is the wrong told-to there, because it keeps the baseline
+    # acting as if the test still ran. So the comparator names the checkout the
+    # moment it can: a group present in baseline and absent in current was
+    # dropped by a checkout, and it names the specific groups. This is not the
+    # first finding -- a group can be dropped and still pass in every other
+    # path (the suite agrees the test is gone) -- so it does not by itself make
+    # the comparison fatal; it is diagnostic with a remedy, and it stays on for
+    # the arms path too.
+    out["dropped_by_checkout"] = [
+        {"name": name, "was": b[name], "hint": _checkout_hint(name)}
+        for name in b
+        if name not in c]
     return out
 
 
@@ -154,6 +175,18 @@ def render(base, cur, findings, fail_lines_shown=5):
     section("new groups", findings["new"])
     section("removed groups", findings["removed"])
 
+    # The dropped-by-checkout finding is the specific call-out for a reverted
+    # test file: it names the groups that were in the baseline and are absent now,
+    # with the one-line remedy. It prints even when nothing else is fatally wrong,
+    # because the reader is meant to see it the moment they scan the diff.
+    if findings["dropped_by_checkout"]:
+        lines.append("")
+        lines.append("the following group(s) were in the baseline and are absent "
+                     "from the current run -- a reverted test file:")
+        for d in findings["dropped_by_checkout"]:
+            lines.append("  " + d["name"] + " (was " +
+                         base_counts(base, cur, d["name"]) + "): " + d["hint"])
+
     def arm_section(title, arms):
         if not arms:
             return
@@ -199,6 +232,18 @@ def fatal(findings, allow_new=False):
     shape = (findings["new"] or findings["removed"] or findings["new_arms"] or
              findings["removed_arms"])
     return bool(shape) and not allow_new
+
+
+def _checkout_hint(name, path=None):
+    """The one-line remedy when a group present in the baseline is absent now."""
+    repo = path or Path(".").resolve().as_posix()
+    return (
+        f"the run is short of this group that the baseline has: {name} "
+        f"-- this is the usual shape of a reverted test file, not a feature "
+        f"that landed elsewhere, so re-recording keeps the wrong picture: "
+        f"restore the test file instead (cd {repo} && git checkout -- tests/test_kraken.cpp); "
+        f"if the test genuinely should not run, then re-record the baseline deliberately"
+    )
 
 
 def runner_failed_without_a_failing_group(cur):

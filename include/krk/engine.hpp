@@ -10,12 +10,16 @@
 #include <vector>
 
 #include "krk/backend.hpp"
+#include "krk/h2d_probe.hpp"
+#include "krk/hc.hpp"
+#include "krk/ple.hpp"
 #include "krk/expert_cpu.hpp"
 #include "krk/kv_tier.hpp"
 #include "krk/draft_head.hpp"
 #include "krk/model.hpp"
 #include "krk/sampler.hpp"
 #include "krk/tokenizer.hpp"
+#include "krk/moe_predictor.hpp"
 
 namespace krk {
 
@@ -327,6 +331,11 @@ public:
     ~Engine();
 
     bool init(Backend *be, const EngineConfig &cfg, std::string *err);
+    bool moe_prediction_enabled() const { return moe_predict_enabled_; }
+    u64 moe_predictions_issued() const { return moe_predictor_.predictions_issued(); }
+    u64 moe_prediction_candidates() const { return moe_predictor_.candidates(); }
+    u64 moe_prediction_hits() const { return moe_predictor_.candidate_hits(); }
+    u64 moe_prediction_staged() const { return moe_predictor_.staged(); }
     Backend::ExpertPoolStats expert_pool_stats() const {
         return be_ ? be_->expert_pool_stats() : Backend::ExpertPoolStats{};
     }
@@ -486,9 +495,52 @@ public:
     const KvTierCache &kvt_k() const { return kvt_k_; }
     const KvTierCache &kvt_v() const { return kvt_v_; }
     const Model &model() const { return model_; }
+    // The host->device promotion probe this run MEASURED: the three rates, and
+    // with them which pageable path and which pinned prefix it selected. Read
+    // this instead of parsing the log line -- and, in the suite, compare the
+    // engine's actual choice against it: asserting a fixed verdict from a
+    // wall-clock measurement asserts the test machine's scheduler, not the code.
+    const H2dProbe &h2d_probe() const { return h2d_probe_; }
+    // The probe's cross-run ledger as this init left it: how many runs this
+    // machine has probed, how many reused a cached verdict, and how much time
+    // the measurements actually cost. The end of a run prints it -- one run's
+    // verdict is a hit rate of 100% or 0% and says nothing on its own.
+    const H2dProbeTally &h2d_tally() const { return h2d_tally_; }
     const Tokenizer &tokenizer() const { return tok_; }
     // Debug: logits from the most recent forward (n_vocab floats).
     const f32 *last_logits() const { return logits_host_; }
+    // Test hook, qwen4exp only: the hyper-connection lane stack after the last
+    // forward pass, as f32 host rows [n_tok, hc, n_embd], or nullptr when the
+    // file carries no lane stack (or the backend keeps it on device only). The
+    // suite pins the identical-lane invariant through the REAL forward path
+    // with this -- hc.cpp proves the arithmetic, this proves the wiring.
+    const f32 *hc_debug_lanes(i32 *hc_out, i64 *width_out) const;
+    // Test hook, qwen4exp only: the PLE table rows the LAST forward pass hashed,
+    // as [n_tok, n_heads] (head fastest), or nullptr when the file carries no
+    // PLE block. The hash is host work on both backends, so this is a plain
+    // pointer into the engine's own staging buffer.
+    const i64 *ple_debug_rows(i32 *n_tok, i32 *n_heads) const;
+    // Test hook, qwen4exp PLE only: the block's three terms from the LAST
+    // forward, each `hc * n_embd` wide and laid out lane-major like the stack
+    // they feed. `gated` is the RAW `value * gate` the residual receives;
+    // `conv_in` is the lane-normed copy the convolution reads; `conv_out` is
+    // that convolution after its silu. The reference (`build_ple` in
+    // src/models/qwen4exp.cpp) adds `gated` to the hidden stack and uses the
+    // normalized copy for the conv only, so these are two different rows: the
+    // one time they shared a buffer the block put a per-lane unit-RMS row on
+    // the residual and the model's text was garbage, which is why the suite
+    // checks the split. Null on a device backend, like hc_debug_lanes.
+    const f32 *ple_debug_terms(f32 **conv_in, f32 **conv_out, i64 *n_tok) const;
+    // Test hook, qwen4exp only: the cells the LAST forward pass's indexer
+    // selected for layer `l`, ascending, and empty when that layer carries no
+    // indexer (or the run was dense, which is every context shorter than the
+    // layer's `top_k + ratio - 1` budget). The selection is host work -- pooled
+    // keys, scores and top-k all run there -- so this reads the engine's own
+    // buffers, and it is what pins the rule against an oracle in the suite.
+    const std::vector<i64> &qsa_debug_cells(i32 layer) const;
+    // That layer's compress ratio (0 when it has no indexer), so a caller can
+    // tell "dense because everything fits" from "no indexer at all".
+    i32 qsa_debug_ratio(i32 layer) const;
     // Hash of every dumped activation stage of the LAST prefill, folded
     // per (stage, layer) in sorted-key order. Bit-exact: two prefills of
     // the same prompt at different --chunk values must return the same
@@ -575,6 +627,40 @@ private:
     // under KRK_DUMP, whose projection stage reads `scratch`.
     void gemm_residual(void *dst, const void *x, const void *w, DType wt,
                        i64 n_out, i64 n_in, i64 rows, void *scratch);
+    // ---- qwen4exp hyper-connections --------------------------------------
+    // The lane stack replaces the single residual stream: each sub-block is
+    // bracketed by a mix (lanes -> one row, left in ws_xn_ AND ws_x_) and a
+    // combine (the block's output -> every lane). `hc_enter` also saves the
+    // mixed row, because the block adds its output onto the row it was handed
+    // and the combine needs the block output alone.
+    void hc_enter(const f32 *norm_w, const QuantTensor &down,
+                  const QuantTensor &up, const QuantTensor &inject, i32 n);
+    void hc_leave(i32 n);
+    // The head's mixer: row `row` of the lane stack -> one f32 row in ws_xn_.
+    // There is no injection (nothing is scattered back) and no output_norm --
+    // this mixer IS the final norm on this family.
+    void hc_head_mix(i32 row, const f32 *norm_w, const QuantTensor &down,
+                     const QuantTensor &up);
+    // ---- qwen4exp per-layer embedding (PLE) ------------------------------
+    // The n-gram block that runs on the layers `ple.layers` names, BEFORE that
+    // layer's hyper-connection mixer: hash -> mmap'd table rows -> key/value ->
+    // per-lane gate -> dilated depthwise conv -> residual into the lane stack.
+    // It is the only place this engine reads a weight straight out of the file
+    // mapping on the hot path, which is why the rows are computed on the host.
+    void ple_block(const LayerWeights &L, i32 l, i32 n, i64 pos0);
+    // ---- qwen4exp QSA indexer --------------------------------------------
+    // Pooled keys per block of `ratio` cells -> one score per block -> top-k
+    // blocks -> the cells of those blocks. Returns true when this row set is a
+    // SELECTION (some visible cell was dropped) and the caller must therefore
+    // attend over the chosen cells instead of the whole cache; false is the
+    // dense case, which is every context inside the layer's budget and is
+    // exactly what the reference does there too.
+    bool qsa_select_block(const LayerWeights &L, i32 l, i32 n, i64 pos0,
+                          const void *xn);
+    // Dense causal attention over each row's selected cells, gathered into a
+    // compact buffer: `attention()` has no mask, and the cell list is per
+    // QUERY row, so the compact form is the one that needs no new kernel.
+    void qsa_attention(i32 l, i32 n, const AttnDesc &d);
     // Chooses the expert residency budget from cfg_ and the device.
     // Chooses the device-side expert budget. Returns false with *err set when
     // an explicit --expert-cache-mb cannot fit the card, which is a refusal
@@ -587,6 +673,47 @@ private:
     // tokens happened to touch -- and the wall-time ceiling is what keeps the
     // phase inside a cold start. See EngineConfig::expert_warmup.
     void warm_experts();
+    // The hot ring: the top of the expert index admitted into VRAM and pinned,
+    // charged to a budget the LRU pool does not see (see ExpertCache's
+    // set_pin_budget / admit_hot). Runs between the warmup and the pool clamp,
+    // so the clamp sizes the pool from the VRAM that is really free after the
+    // ring has taken its bytes. KRK_EXPERT_PIN=0 is the A/B arm;
+    // KRK_EXPERT_PIN_MB=<n> sizes the ring (default: half the measured room
+    // beside the VRAM floor).
+    void pin_hot_experts();
+    // Publishes the device dispatch table (ExpertCache::publish_dispatch_table)
+    // when the whole routed set is device-resident, so a layer can pick its
+    // experts' matrices without a host pointer per expert. Called at the end of
+    // init -- after the warmup and the pins, because both move pointers -- and
+    // silent when the residency promise cannot be made.
+    void publish_expert_table();
+    // Re-derives the expert pool's byte budget from the VRAM that is free NOW.
+    // The init-time clamp runs once, before the run; the KV tier promotes
+    // COLD->HOT as the context grows, so the bytes it named can be gone by the
+    // time decode is deep. Called once per forward from forward() -- a
+    // hipMemGetInfo is a query, not a drain -- and it only ever LOWERS the
+    // budget, because raising it past what init measured is how the pool grows
+    // into the card and turns every alloc into a 30 ms driver eviction.
+    void reclamp_expert_budget(const char *why);
+    // total = weights + kv + experts + workspaces + free + unaccounted, every
+    // term measured. Called at the end of init and at teardown, so a buffer
+    // allocated after init (a per-forward scratch, a promoted layer) shows up as
+    // a change in `unaccounted` instead of being folded into `free`.
+    void log_vram_ledger(const char *when);
+    // Every workspace allocation made through init's `alloc` lambda, in bytes.
+    // It exists so the VRAM ledger can print a measured sum instead of leaving
+    // the remainder of the card to be inferred by subtracting four numbers from
+    // the total -- which is how "scratch = 3.0 GiB" stood without a ledger, and
+    // that number decides whether the 8 GB and 6 GB tiers can run at all.
+    size_t ws_bytes_ = 0;
+    // The KV cache's own bytes, both planes, as allocated at init. A member so
+    // the ledger can be printed at teardown as well as during init.
+    size_t kv_bytes_ = 0;
+    // Top-k' lookahead: how many experts the router ranks (absolute), or 0 for
+    // just the k it selects. KRK_EXPERT_LOOKAHEAD=<k'>. The extras are only
+    // staged when they are already in WARM (a copy, never a read).
+    i32 expert_lookahead_ = 0;
+    u32 reclamp_tick_ = 0;
     // `<model>.krakenexperts.json` (see write_expert_index) as a hottest-first
     // (layer, expert) list. Empty when the file is missing or does not describe
     // this exact model: a ranking measured on other weights is worse than no
@@ -806,6 +933,66 @@ private:
     void *ws_x_ = nullptr;    // [chunk, n_embd]
     void *ws_xn_ = nullptr;   // [chunk, n_embd]
     void *ws_x2_ = nullptr;   // [chunk, n_embd]
+    // qwen4exp's lane stack and its mixer workspaces. All null unless the file
+    // declares hyper_connection.count > 1; `hc_active_` is the single switch
+    // the forward pass tests, so every other family runs the code it ran.
+    bool hc_active_ = false;
+    HcGeometry hc_;
+    void *ws_hc_ = nullptr;     // [chunk, hc*n_embd] the lanes
+    void *ws_hc_n_ = nullptr;   // [chunk, hc*n_embd] normed lanes
+    void *ws_hc_g_ = nullptr;   // [chunk, hc*n_embd] mixer up-projection
+    void *ws_hc_lo_ = nullptr;  // [chunk, low_rank]
+    void *ws_hc_inj_ = nullptr; // [chunk, hc]
+    void *ws_hc_mix_ = nullptr; // [chunk, n_embd] the mixed row + its negation
+    // PLE workspaces. Null unless the file carries the block; `ple_state_` is
+    // the conv history, one [(kern-1)*dil, hc*n_embd] window per layer, which is
+    // what makes a chunked prefill and a token-at-a-time decode agree.
+    bool ple_active_ = false;
+    PleConfig ple_;
+    i64 ple_hist_ = 0;          // (kern - 1) * ngram rows of history
+    std::vector<i64> ple_seq_;  // the sequence's tokens, position-indexed
+    std::vector<i64> ple_rows_; // [chunk * n_heads] this pass's rows
+    i32 ple_rows_n_ = 0;        // how many tokens the last pass hashed
+    std::vector<f32> ple_emb_;  // host staging for the gather
+    std::vector<u16> ple_emb16_;
+    void *ws_ple_emb_ = nullptr;   // [chunk, n_heads*head_dim] gathered rows
+    void *ws_ple_key_ = nullptr;   // [chunk, hc*n_embd] key + its norm
+    void *ws_ple_qry_ = nullptr;   // [chunk, hc*n_embd] lane-normed query
+    void *ws_ple_gate_ = nullptr;  // [hc, chunk] per-lane gates (lane-major)
+    void *ws_ple_val_ = nullptr;   // [chunk, n_embd] value
+    void *ws_ple_gated_ = nullptr; // [chunk, hc*n_embd] value broadcast x gate
+    // The conv's input: the lane-normed copy of the gated value. The residual
+    // adds the RAW gated row (the reference's `gated`), so the two cannot share
+    // a buffer.
+    void *ws_ple_norm_ = nullptr;  // [chunk, hc*n_embd] lane-normed gated
+    void *ws_ple_pad_ = nullptr;   // [hist + chunk, hc*n_embd] conv window
+    void *ws_ple_conv_ = nullptr;  // [chunk, hc*n_embd] conv output
+    void *ple_state_ = nullptr;    // [n_layer, hist, hc*n_embd] history
+    // QSA indexer state. `keys` is the host copy of every RAW indexer key the
+    // layer has produced, position-indexed -- pooling precedes norm and
+    // rotation, so the raw row is what has to be kept. Pooled keys, scores and
+    // the per-row cell lists follow from it each pass; nothing about them is
+    // carried across passes, which is what keeps a rolled-back KV honest.
+    struct QsaState {
+        std::vector<f32> keys;   // [kv_cap, idx_dim]
+        std::vector<f32> pooled; // [blocks, idx_dim]
+        std::vector<f32> score;  // [chunk, blocks]
+    };
+    bool qsa_active_ = false;
+    i32 qsa_dim_ = 0;    // indexer.key_length
+    i32 qsa_heads_ = 0;  // indexer.head_count
+    i32 qsa_top_k_ = 0;  // indexer.top_k, in CELLS
+    i32 qsa_ratio_max_ = 0;
+    f32 qsa_eps_ = 1e-6f;
+    std::vector<QsaState> qsa_state_;      // per layer, empty where no indexer
+    std::vector<f32> qsa_q_;               // host [chunk * heads * idx_dim]
+    std::vector<f32> qsa_k_;               // host [chunk * idx_dim]
+    std::vector<std::vector<i64>> qsa_rows_; // this pass's cell list per row
+    std::vector<i64> qsa_last_;            // last row's cells (debug hook)
+    void *ws_qsa_q_ = nullptr;  // [chunk, heads*idx_dim]
+    void *ws_qsa_k_ = nullptr;  // [chunk, idx_dim]
+    void *ws_qsa_kc_ = nullptr; // compact K [cell budget, kv_dim]
+    void *ws_qsa_vc_ = nullptr; // compact V [cell budget, kv_dim]
     void *ws_q_ = nullptr;    // [chunk, q_dim]
     // [chunk, q_proj] the raw query projection: Qwen3.5 packs a per-head
     // output gate behind the query, so its projection is twice as wide as the
@@ -851,6 +1038,8 @@ private:
     // through the same contract and `ws_ffn_` carries an exponent too.
     void *ws_fexp_ = nullptr;
     f32 *logits_host_ = nullptr;
+    H2dProbe h2d_probe_;
+    H2dProbeTally h2d_tally_;
     std::vector<i32> tok_scratch_;
     // Device top-k. The candidate buffer is sized for a degenerate cut; k is
     // one today (an argmax) but the buffers allow more without reallocating.
@@ -867,12 +1056,58 @@ private:
     bool topk_valid_ = false;
     // Host-side router scratch, sized [chunk, n_expert]
     std::vector<f32> router_host_;
+    // Device-side router probabilities ([chunk, n_expert] f32), written by
+    // Backend::router_softmax. Allocated for every backend and used only when
+    // KRK_DEVICE_SOFTMAX=1, so "is the device path available" stays a runtime
+    // question rather than a different allocation path with a null to forget.
+    void *ws_routerp_ = nullptr;
+    std::vector<f32> dev_probs_; // its host copy, for the drift comparison
+    u64 ds_rows_ = 0;            // rows compared
+    u64 ds_diff_ = 0;            // elements whose f32 bits differ
+    f64 ds_max_ = 0.0;           // largest |device - host| probability
+    // The device selection and plan (KRK_DEV_PLAN=1). `ws_ids_` is [chunk, k]
+    // i32 and `ws_wts_` the same shape in f32; `ws_off_` is the plan's
+    // [n_expert + 1] prefix. The plan itself lands in ws_plan_/ws_alpha_, which
+    // already exist for the host plan, so the per-expert loop needs no change.
+    void *ws_ids_ = nullptr;
+    void *ws_wts_ = nullptr;
+    void *ws_off_ = nullptr;
+    std::vector<i32> dev_ids_;
+    std::vector<f32> dev_wts_;
+    u64 dp_rows_ = 0;            // layers whose device plan was compared
+    u64 dp_sel_diff_ = 0;        // (slot) ids that differ from the host
+    u64 dp_wt_diff_ = 0;         // (slot) weights that differ from the host
+    u64 dp_wt_1ulp_ = 0;         // (slot) weights one ulp from the host
+    u64 dp_used_ = 0;            // layers that ran the device plan
+    // The published device dispatch table (KRK_DEV_PTR=1): the cache's own
+    // pointer, so a promotion that invalidated it is noticed by comparing the
+    // two rather than by trusting a flag that was true at publish time.
+    void *dev_table_ = nullptr;
+    // How many times the publish was retried while the router filled the tiers,
+    // and whether its "not yet" reason has been printed (once is enough).
+    static constexpr i32 kTableAttempts = 8;
+    i32 table_attempts_ = 0;
+    bool table_why_logged_ = false;
+    u64 dp_launch_layers_ = 0;   // layers that ran the one-launch dispatch
+    u64 dp_launch_skips_ = 0;    // layers that found the table stale and fell back
     // Scratch for the layer-wide expert prefetch: the routed ids, deduped.
     std::vector<i32> prefetch_ids_;
     std::vector<u8> prefetch_seen_;
+    // Previous-token route sets retained for the legacy
+    // KRK_MOE_NEXT_PREFETCH experiment. The adaptive predictor has independent
+    // per-layer histories and only proposes cache staging hints.
+    std::vector<std::vector<i32>> moe_hint_;
+    // Architecture-gated online cache predictor. Candidate IDs affect only
+    // stage_ahead(); moe_sel_/moe_wt_ continue to come from the native router.
+    MoeRoutePredictor moe_predictor_;
+    std::vector<i32> moe_predict_ids_;
+    bool moe_predict_enabled_ = false;
     // KRK_DUMP destination (see Engine::init): empty means the per-stage dump
     // hook in forward_core is inert.
     std::string dump_path_;
+    // -1 = the architecture's own delta-net gate (silu on qwen3.5, sigmoid on
+    // qwen4exp), 0 = force silu, 1 = force sigmoid (KRK_GDN_GATE).
+    i32 gdn_gate_ = -1;
     // KRK_DUMP_ROUTE=1: print each token's top-k routing decision.
     bool dump_route_ = false;
     // Residency preference in the router (see EngineConfig::router_tie_margin).

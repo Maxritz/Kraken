@@ -1,0 +1,69 @@
+[info ] HIP 7.16.26331 | driver 71626331 | AMD Radeon RX 9070 XT | gfx1201 | 64 CU | 15.9 GiB VRAM | BAR: runtime reports 256 MiB aperture
+[warn ] architecture 'qwen35': carries 1 multi-token-prediction block(s) (blk.64): loaded behind --mtp-probe (one block forward, compared against the target's argmax) and usable as a drafter with --mtp-spec (known: llama, qwen2, qwen3, qwen3moe, olmoe, qwen35, qwen35moe, gemma, gemma2, gemma3, gemma4, qwen3vl, qwen4exp, deepseek2, deepseek4, deepseek4-dspark, nemotron_h, nemotron_h_moe, qwen4-mtp, dflash, qwen35-dflash-draft, dspark, laguna, gpt-oss, k2-horizon, muse-glimmer, spark2_5, diffuse)
+[info ] weight residency: 12.02 GiB device budget, layer(s) 47..63 streamed from the file through a 245.9 MiB ring; the rest stays resident
+[info ] loaded Qwen3.8-27B (qwen35): 64 layers, 5120 embd, 24/4 heads, hd=256, ff=17408, vocab=248320
+[info ] gated delta net: 48 recurrent layers of 64 (every 4 attends), ssm 16 key x 48 value heads, state 128, conv kernel 4, rope 64/256
+[info ] vram at start: 16304 MiB total, 3638 MiB free before this engine allocates (12666 MiB already held by the driver/other processes)
+[info ] vram headroom: 3.41 GiB free of 15.92 GiB total, 1.00 GiB reserved (KRK_VRAM_RESERVE_MB overrides)
+[info ] mem policy: process working set capped at 76.7 GiB (80% of 95.9 GiB planned)
+[info ] recurrent state: 48 layers, 149.6 MiB f32
+[info ] workspaces ready: chunk=8 ctx=256 KV=16 MiB (load 9873 ms)
+[info ] vram ledger (after init): 16304 MiB total = weights 12125 + kv 16 + experts 0 (pool 0 + ring 0; live 0, reusable 0, budget 0) + workspaces 152 + free 3473 + unaccounted 539 [allocator live 12541 in 771 buffers, largest 995]
+[info ] weight residency: layer 47 promoted resident (199.7 MiB, 3259 MiB still free) -- it will not be staged again
+[info ] weight residency: layer 48 promoted resident (209.1 MiB, 2999 MiB still free) -- it will not be staged again
+[info ] weight residency: layer 49 promoted resident (243.9 MiB, 2755 MiB still free) -- it will not be staged again
+[info ] weight residency: layer 50 promoted resident (209.1 MiB, 2546 MiB still free) -- it will not be staged again
+[info ] weight residency: layer 51 promoted resident (199.7 MiB, 2346 MiB still free) -- it will not be staged again
+[info ] weight residency: layer 52 promoted resident (243.9 MiB, 2102 MiB still free) -- it will not be staged again
+[info ] weight residency: layer 53 promoted resident (209.1 MiB, 1893 MiB still free) -- it will not be staged again
+[info ] weight residency: layer 54 promoted resident (209.1 MiB, 1684 MiB still free) -- it will not be staged again
+[info ] weight residency: layer 55 promoted resident (222.9 MiB, 1461 MiB still free) -- it will not be staged again
+[info ] weight residency: layer 56 promoted resident (243.9 MiB, 1217 MiB still free) -- it will not be staged again
+
+[stats ] load      10035 ms, 11.84 GiB uploaded of 15.61 GiB weights in 8638 ms = 1.4 GB/s
+[stats ] prefill   5 tok in 2759.8 ms = 1.8 tok/s
+[stats ] decode    8 tok in 3064.2 ms over 7 timed steps = 2.3 tok/s (437.7 ms/step)
+[stats ] device    14.75 GiB in use of 15.92 GiB (1.18 GiB free)
+[stats ] range     f16 activation bounds fired: silu 0, experts-sum 0, residual 0
+[stats ] range     residual rows stored scaled: max exponent 0
+[stats ] kv        flat: whole cache resident in VRAM (no tiering traffic)
+[info ] vram ledger (at teardown): 16304 MiB total = weights 12125 + kv 16 + experts 0 (pool 0 + ring 0; live 0, reusable 0, budget 0) + workspaces 152 + free 1204 + unaccounted 2807 [allocator live 14735 in 829 buffers, largest 995]
+[info ] weight residency: 10 layer(s) promoted resident on first use (2.14 GiB, 1758 ms of one-off staging) -- only what did not fit stayed streamed
+[info ] weight stream: 56 layer staging(s), 13.01 GiB from the file, 3877 ms (3.36 GB/s) = drain 1036 + read 389 + copy 11 ms
+
+== KRK_TIME per-op device time, net of a 23.00 us recorder floor (9650 ops)
+op                            calls    raw ms  floor ms    NET ms   idle ms   host ms       MB     GB/s
+upload                          744   8523.26     17.11   8506.15   5651.68   8612.30      0.0      0.0
+warm_read(pool)                  66   2795.36      1.52   2793.85    372.90   3770.91      0.0      0.0
+upload_pinned                    56    781.43      1.29    780.15     15.95      1.51  13968.0     17.9
+gemm(gemv_m)                    496    500.29     11.41    488.89     59.57      2.79  14990.4     30.7
+gemm_group                      840    439.65     19.32    420.33      6.93      4.86      0.0      0.0
+gemm_acc(gemv)                  784    263.96     18.03    245.93     11.73      2.61  34874.3    141.8
+upload_paged                     10    209.58      0.23    209.35      6.99    342.68   2296.5     11.0
+gemm(gemv)                      288     41.37      6.62     34.75     27.51      1.12  12713.2    365.9
+softplus_act                    384     20.66      8.83     11.82     12.52      1.07      0.0      0.0
+delta_rule                      384     18.84      8.83     10.01     11.41      1.36      0.0      0.0
+sigmoid_act                     512     19.37     11.78      7.59     16.47      1.49      0.0      0.0
+scale_cols                      384     13.89      8.83      5.05     12.40      1.13      0.0      0.0
+silu_mul                        448     15.17     10.30      4.86     12.79      1.35      0.0      0.0
+mul_act                         128      4.94      2.94      2.00      3.97      0.42      0.0      0.0
+add_rmsnorm                     128      4.26      2.94      1.31      2.10      0.48      0.0      0.0
+download                          8      1.47      0.18      1.29      0.53    109.36      0.0      0.0
+fill0                            14      0.97      0.32      0.65     88.73      0.14      0.0      0.0
+embed                             8      0.58      0.18      0.39      0.21      0.56      0.0      0.0
+attention                       128      3.34      2.94      0.39      3.24      1.02      0.0      0.0
+logits_topk                       8      0.01      0.18      0.00      0.24      0.14      0.0      0.0  <-at floor
+rope                            128      2.66      2.94      0.00      3.69     30.49      0.0      0.0  <-at floor
+kv_append                       128      2.44      2.94      0.00      3.25      0.45      0.0      0.0  <-at floor
+qk_norm                         128      1.51      2.94      0.00      3.52      0.55      0.0      0.0  <-at floor
+q3_split                        128      1.04      2.94      0.00      1.07      0.49      0.0      0.0  <-at floor
+add_residual                    112      0.18      2.58      0.00      2.44      0.35      0.0      0.0  <-at floor
+add_bias_cols                   384      5.43      8.83      0.00      9.50      1.34      0.0      0.0  <-at floor
+scale_act                       384      4.27      8.83      0.00      7.87      1.08      0.0      0.0  <-at floor
+conv1d_silu                     384      0.82      8.83      0.00      2.74      2.45      0.0      0.0  <-at floor
+rmsnorm                        1288     19.52     29.63      0.00     24.15      5.45      0.0      0.0  <-at floor
+l2norm                          768      2.35     17.67      0.00     13.44      2.28      0.0      0.0  <-at floor
+TOTAL                          9650  13698.64    221.97  13524.77   6389.53  12902.26
+device spans NET of the recorder are 85.1% of 15895.7 ms wall; 6389.5 ms idle between ops (40.2%); -4018.6 ms neither (not ops)
+!! 3840 of 9650 ops (39.8%) sit at or below the 23.00 us floor and are NOT individually resolvable; their true combined cost is bounded above by 88.3 ms. Do not read this table's row order as a cost order for those rows -- use KRK_TIME=<op> for a single op, or an isolated probe, to resolve one.
+[trace ] wrote 23545 events to C:/Users/rr/AppData/Local/Temp/qwen35flash-trace.json (open in Perfetto / chrome://tracing)

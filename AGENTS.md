@@ -18,17 +18,33 @@ code, the README, or `docs/`.
   contradicting the README. `build_check.sh` requires it current for the same
   reason.
 - The gate suite is six things, not one: `sh scripts/build_check.sh`, ninja
-  rc=0 with 0 `error:` lines, `kraken-tests` 3008/3008, `sh
+  rc=0 with 0 `error:` lines, `kraken-tests` 3413/3413, `sh
   scripts/kraken_tests_baseline_check.sh` (names the groups that newly broke
   against the recorded baseline), `kraken-bench --gate` rc=0, and a coherence
-  spot check on the three small models, run as:
-  `bash scripts/coherence_check.sh models/SmolLM2-135M-Instruct.Q4_K_M.gguf
-  models/Qwen3.5-0.8B.Q4_K_M.gguf models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf`
-  (all three live in the repo's `models/`; expect rc=0 and
-  `3 coherent, 0 not`). Each model runs twice -- device arm and `--cpu`
-  scalar reference -- and a device arm that silently fell back to the CPU
-  backend fails as `FAIL (cpu)`, so a green run is proof the GPU produced
-  the text.
+  spot check on three models, one per shape, run as:
+  `bash scripts/coherence_check.sh /g/More-models/Qwen3-4B-Q8_0.gguf
+  /h/OLLAMA-Models/GGUF/Qwen3.5-9B-Q4_K_M.gguf` and
+  `KRK_ALLOW_BIG=1 bash scripts/coherence_check.sh
+  /g/More-models/Qwen3-30B-A3B-abliterated-erotic.i1-Q2_K.gguf`
+  (dense / recurrent / MoE; expect rc=0 and `1 coherent, 0 not` per
+  invocation). **The three names this bullet used to carry --
+  `models/SmolLM2-135M-Instruct.Q4_K_M`, `Qwen3.5-0.8B`, `Qwen3-MOE-4x0.6B` --
+  exist in neither `G:\More-models` nor `H:\OLLAMA-Models\GGUF`**, and this
+  worktree has no `models/` at all, so a session that quotes that line cannot
+  run it: grep the two trees for what is actually there and keep one per shape.
+  Two traps from doing exactly that: `Qwen3-30B-A3B` is over the script's
+  `KRK_MAX_MB=8192` guard and reports `1 not tested` (a FAIL that ran nothing)
+  unless `KRK_ALLOW_BIG=1` is set, and `Qwen3.5-9B`'s `--cpu` arm needs
+  `KRK_TIMEOUT` above the 120 s default. `limite-1b-violetto` is not a
+  candidate: it is refused for quant type #26 and `attn_gate`.
+  `olmoe-1b-7b-0924-q4_k_m-imat` is a real device-vs-CPU divergence, not a
+  candidate either: `FAIL (drift step 5)` reproduces on every run, and the two
+  fold switches (`KRK_FUSED_SILU=0`, `KRK_ACC_GEMM=0`) leave the device text
+  identical -- so it is OLMoE's own path, unresolved, and the 30B MoE above is
+  what makes the MoE arm green.
+  Each model runs twice -- device arm and the `--cpu` scalar reference -- and a
+  device arm that silently fell back to the CPU backend fails as `FAIL (cpu)`,
+  so a green run is proof the GPU produced the text.
 - **The chunk-invariance gate is a test group, and it drives the CLI because the
   suite cannot open the device.** `./build-hip/kraken-tests --run-group
   test_prefill_chunk_bitexact` builds a head_dim-64 / 8-head / 4-layer fixture,
@@ -265,9 +281,11 @@ code, the README, or `docs/`.
   `min(8, cores)` (interleaved medians here: 1554 ms at 1 worker, 956 at 4, 783 at
   8, and 8 beat 4 in 6 of those 7 pairs), and a silly value clamps rather than
   refusing. A group may declare a serial reason in the group table and
-  `KRK_TEST_SERIAL_OVERRIDE=<grp>` forces one for a run so the lane is exercised,
-  but **nothing needs it today** and the run says so: no group opens the device,
-  binds a fixed port, or reads a clock. Two defects had to be fixed first --
+  `KRK_TEST_SERIAL_OVERRIDE=<grp>` forces one for a run so the lane is exercised.
+  **Exactly one group declares one**: `test_pageable_path_probe` times host
+  copies, so a neighbour's traffic would be read as the simulated aperture --
+  the first real user of that lane. Every other group is silent here: none opens
+  the device, binds a fixed port, or reads a clock. Two defects had to be fixed first --
   tokenizer, end-to-end, grouped-prefill and gdn-generation read fixtures an
   earlier group had written, so they passed or failed according to the schedule
   (`--run-group <n>` on a fresh checkout failed for exactly those four), and
@@ -411,6 +429,128 @@ code, the README, or `docs/`.
   does report ROCm0) — a correctness reference, not a speed one.
   `docs/AUDIT-qwen4exp-support.md` has the measured per-piece inventory and the
   CPU-oracle gate each stage must pass before it is enabled.
+- **The hyper-connection stack RUNS now (`hc_*`), and two traps came with it.**
+  The residual is a lane stack (`ws_hc_`, `[n, hc, n_embd]` = 10240 wide on the
+  REAP-288 file); each sub-block is bracketed by `hc_enter`/`hc_leave`, and
+  `hc_head_mix` is the final norm (this family ships no `output_norm`).
+  (1) **A refusal placed above `model_.load()` is dead code, and it reads as a
+  live check.** `Engine::init`'s old hyper-connection refusal sat at the top,
+  where `model_.cfg()` is still empty, so `cfg().hc` was false on every file and
+  generation from a qwen4exp file ran the plain residual while the comment said
+  it was refused. Anything that reads the loader's verdict belongs AFTER the
+  load; the block now sits there, and a `PLE`/`QSA` file is refused by name.
+  (2) **The combine scatters with the mixer's `inject` OUTPUT, not its weight.**
+  `hc_leave` first passed `L.hc_*_inject.data` -- the `[wide, hc]` weight -- to
+  `hc_combine`, which reads f16 *weights* as f32 *lane values*: it ran, it
+  produced finite text, and it left the four lanes equal, so the only thing that
+  caught it was the lane-invariance check.
+  The device half is `src/hip/kernels/hc.hpp` (`hc_init`, `hc_mix`,
+  `hc_combine`, `silu_act`) and `kraken-bench --hc` proves it against the host
+  oracle in `src/hc.cpp` at the real geometry (4 x 2560, 3 tokens): **6 of 6**,
+  with `hc_init` and `lanes-equal` required to be BIT-identical and the rest at
+  an f16-storage tolerance. The suite cannot open the device, so that arm is the
+  only proof the kernels match. `Engine::init` refuses a backend whose
+  `hc_supported()` is false rather than running no-op mixes that leave the stack
+  at its initial value.
+  `test_qwen4exp_forward` drives a real 4-lane-of-2560 file end to end (init,
+  generate, the lane stack read back, a lane-varying injection that must
+  separate the lanes, a lane-symmetric one whose lanes must stay bit-equal, and
+  the full schema -- PLE plus the indexer -- initialising, which is the check
+  that replaced the refusal those two blocks used to get); removing the
+  scatter fails it 16/17. Its fixture keeps
+  `extras=false`: **the arch table says a qwen4exp file has an indexer, so the
+  loader now takes `qsa` from the file's own metadata** (`indexer.head_count` or
+  `compress_ratios`), because a file without one otherwise cannot be refused or
+  run -- it cannot even load. A half-declared indexer is still refused.
+- **The PLE block RUNS too, and it cost two wrong answers worth keeping.**
+  `ple_block` (src/engine.cpp) runs on the layers `ple.layers` names, BEFORE that
+  layer's mixer: host 64-bit hash (`ple_rows_for`) -> rows gathered straight out
+  of the mapping (`ple_gather`, never uploaded) -> key/value -> per-lane gate
+  (`ple_gate`) -> value broadcast (`lane_bcast_mul`) -> lane-normed -> dilated
+  depthwise conv (`conv1d_dw`, dilation = the n-gram size) -> `res_hc += gated +
+  silu(conv)`. The conv's window is the last `(kern-1)*ngram` rows that layer
+  produced, one per layer in `ple_state_`, which is what makes a chunked prefill
+  and a token-at-a-time decode agree.
+  (1) **The gathered row is `n_embd` wide, NOT `hc * n_embd`.** `ple_key`
+  [n_embd, hc*n_embd] widens it to the lane stack; `ple_value` [n_embd, n_embd]
+  does not. On the REAP file both are 2560 = 16 heads of 160, against streams of
+  10240, so the mistake looks plausible: the value gemm then reads 128 columns
+  out of a 32-wide matrix and its output is inf, which the lane norm turns into
+  NaN. That is the shape of it -- a wrong width is an out-of-bounds weight read,
+  not a crash.
+  (2) **A new Backend virtual with a no-op default is a silent wrong answer
+  unless the CPU reference implements it.** `lane_bcast_mul` shipped HIP-only;
+  the CPU run then used whatever the allocator left in the destination, which
+  read as a **flaky** test -- 12/12 with `KRK_THREADS=1`, ~1 run in 3 failing
+  with the pool live, because only then is the heap reused. A result that
+  changes with `KRK_THREADS` is a missing implementation, not a race.
+  Device half: `kraken-bench --hc` is **10 of 10**, with `conv-history` (a
+  3-token call against three 1-token calls carrying the sliced windows)
+  BIT-identical -- the chunk invariance of the convolution, on device.
+  `test_qwen4exp_ple` is 16/16: it recomputes the rows from the tokenized
+  prompt in the test (`(t ^ t-1) % 8` with the fixture's multipliers of 1) and
+  requires the engine's gathered rows to match, which fails 11/12 when the
+  window drops its predecessor; chunk 8 and chunk 1 must also decode the same
+  six tokens; the last four checks are the three terms below.
+  (3) **The residual's term is the RAW `value * gate`, not the lane-normed
+  copy, and that was the divergence that made this family decode garbage.**
+  The reference is `hidden + gated + silu(conv(grouped_norm(gated)))`: the norm
+  produces the CONV's input, and `gated` -- un-normalized -- is what reaches the
+  lane stack. `ple_block` normalized in place and then added the same buffer, so
+  every PLE layer put a per-lane unit-RMS row on the residual instead of
+  `value * gate` (a per-lane scale error of ~1/|gate|, around 20x on the REAP
+  file). It was found by chaining the reference graph host-side, not by a text
+  comparison: at layer 1 of the REAP-288 file, token 0 of "The capital of France
+  is", the lane stack normalized through `hc_attn_norm` scored corr **0.373**
+  against the dump under the reference's rule and **0.9999** under the old one,
+  and every stage before it matched (`ple.gate` corr 1.000000, `ple.gated`
+  1.000000, `hc.n[0..1]` 1.000000, all 48 layers' `moe.sum` == routed + shexp
+  corr 1.0000 from each layer's own `ffn.pre`). With the split, the same prompt
+  and greedy rule reproduce `llama-completion` on that file for **24 of 24
+  tokens** ("... The capital of France"); the old code answered `(n,)))` to the
+  same prompt.
+  `test_qwen4exp_ple` grew to 16/16 for it: `ple_debug_terms` exposes the raw
+  row, the conv's input and the conv's output, the test requires the first two
+  to be different buffers with different per-lane RMS, and re-aliasing them
+  fails **14/16** on exactly those two checks.
+  (4) **The rope pairing follows llama.cpp's rope TYPE, and for this family that
+  type is IMROPE, which pairs channel j with j + n_rot/2.** The table said
+  `rope_neox=false` for qwen4exp while `llm_arch_rope` in the fork answers
+  `LLAMA_ROPE_TYPE_IMROPE` (the same case arm as qwen35 and qwen3vl), and
+  IMROPE's `rotate_pairs(n_dims, n_dims/2, ...)` is the half-split pairing. Its
+  section table (`rope.dimension_sections = [11,11,10,0]`) does NOT change that
+  for text: `ggml_mrope_cache_init` advances one `theta` per pair and only picks
+  the axis POSITION per sector, so equal positions make IMROPE identical to
+  NEOX. With `rope_neox=true` the 24-token continuation matches the reference
+  exactly; with `false` it agrees for 19 tokens and then flips (`of France` ->
+  `(city`). That flag is what the *reference* says, not something a short arm
+  could see: at 8 tokens both pairings emit the reference's text, so an 8-token
+  comparison would have called this row clean. qwen35/qwen35moe sit in the same
+  IMROPE case arm and still default to `rope_neox=false` here.
+- **A reverted test file is invisible to every gate except the baseline's SHAPE
+  comparison, and that is how four groups came back.** `test_qsa_select`,
+  `test_qwen4exp_qsa`, `test_qwen4exp_gdn_gate`, `test_qwen4exp_hc_mix` and four
+  `test_qwen4exp_ple` checks were lost to a `git checkout -- tests/test_kraken.cpp`
+  during an earlier pass, while `tests/kraken-tests-baseline.json` -- recorded
+  from the tree that HAD them -- kept naming all four, so
+  `kraken_tests_baseline_check.sh` said `removed groups (4)` and `docs/`
+  described a 16/16 PLE group the suite ran as 12/12 while `build_check.sh` and
+  `ninja` stayed green. The source was still in the desktop app's message store
+  (`~/.config/freebuff-desktop/projects/<project>/desktop-v2.db`,
+  `messages.parts_json`: the `str_replace` `newString` payloads and one unified
+  diff), re-applied, and the groups came back at **exactly the baseline's
+  counts** -- 14 / 17 / 14 / 7, and 16 for the PLE group -- which is the evidence
+  that this is the same code and not a rewrite. The same revert had dropped the
+  fixture's `vocab = 261` fix, leaving a 260-row embedding against a 261-piece
+  tokenizer: one row past `token_embd.weight` read for every space, so the same
+  command printed a different `--prefill-hash` each run and the QSA selection
+  flipped on near-ties. That is back too. When a test file is reverted, the
+  baseline's `removed groups` line is the only witness -- read it, not just the
+  total.
+  The escape hatch's warning changed with it: `KRK_ARCH_ALLOW_EXPERIMENTAL=1`
+  used to be reported as "generation will refuse", which was never true --
+  `Engine::init` has no verdict check -- so it now says the loader's blockers are
+  not enforced for the run.
 
 ## Line endings (this bites constantly)
 
@@ -570,6 +710,56 @@ code, the README, or `docs/`.
   trivial call in a quiet queue and **0.92 us** for the host-side enqueue of the
   same call into a busy one, so the floor is within ~10% of a call that carries a
   pass and overstates a pure enqueue ~3x.
+- **On gfx1201 the prefill GEMM that RUNS is `gemm(dp4a)`, not the WMMA tile, and
+  it was emulating its dot products until this was fixed.** The profiler's own
+  tag is the witness: `--profile` rows read `gemm(dp4a)`, while
+  `KRK_GEMM_PATH=wmma` is 2x SLOWER on the same shape (4096x4096x466 Q4_K:
+  ~1.55 ms against ~3.1 ms), so the auto rung is right to prefer int8. Two
+  defects made that path cost far more than it should:
+  (1) `KRK_HAS_DOT4` was guarded to gfx10/gfx11, so on gfx12 `d_dot4` compiled to
+  the **16-op scalar emulation** (8 shifts, 4 multiplies, 4 adds) instead of one
+  `v_dot4_i32_i8`. The guard existed because clang refuses
+  `__builtin_amdgcn_sdot4` for gfx1201 ("needs target feature dot1-insts").
+  **Do not fix that by enabling the feature:**
+  `-Xclang -target-feature -Xclang +dot1-insts` appends the feature to the
+  target ID embedded in the code object, the fat binary then no longer matches
+  the runtime's gfx1201, and every launch dies with `Cannot find Symbol ...
+  copy_h2h_kernel` (measured; build rc=0, binary broken). Inline asm
+  `v_dot4_i32_i8 %0, %1, %2, %3` assembles for gfx1201 with no flag and changes
+  no target ID -- that is what ships, and it is worth **1.50x** on the GEMM by
+  itself (466 rows: 1470.6 -> 979.9 us, 3/3 pairs).
+  (2) `dp4a_cfg::TM` was 4, i.e. 12 LDS loads per 32 dots. **TM=8** makes it 16
+  loads per 64 dots and is worth **1.57x** end to end on the GEMM (1536.6 ->
+  979.9 us at 466 rows; 8315 -> 6894 us at 4096 rows, both interleaved 3 pairs,
+  order balanced), with the harness check unchanged (`chk=1.06e-02/1e-02`).
+  Together, on **Qwen3-8B Q4_K_M at a 470-token prompt: 566.5 -> 633.2 tok/s
+  prefill (+11.8%, 3/3 pairs, no overlap)** against the recorded 561 baseline.
+  End-to-end is smaller than the GEMM's 1.57x because the projections are ~80%
+  of device time and attention is the next 13% (`--profile` component table),
+  so the remaining headroom is inside the same kernel: 15-20 TFLOP/s against
+  llama.cpp's ~68 on the same model means the tile is still ~4x off, and the
+  lever there is more MACs per LDS load (register tile / `global_load_lds`),
+  not instruction selection.
+  `kraken-i8k` does not build on this box (it is compiled as plain CXX and its
+  `#include <hip/hip_runtime.h>` has no include path); the suite's int8 groups
+  (3583/3583) are the guard for the dot path.
+- **The WMMA tile's shape is not its lever, and that is now measured.**
+  `gemm_wmma_kernel` stages both operands into LDS as **f16**, so a block stages
+  `BN` rows of weight at 2 B/value and `BM` rows of activation; per output FLOP
+  that is `2/BM` bytes of weight against `2/BN` of activation, and the weight
+  side is re-staged once per M tile (`row_base = blockIdx.y * BM`), i.e. 15x at
+  a 466-row prompt with `BM=32`. The obvious fix is a wider tile, and it fails:
+  **BN 64 -> 128 measured 46% SLOWER** on `kraken-bench --rows 466` (Q4_K
+  4096x4096: 1105 -> 1613 us, 14.15 -> 9.69 TFLOP/s) and destroyed the small
+  shape (rows=22: 18.1 -> 1.16 TFLOP/s, because 4096/128 = 32 blocks cannot fill
+  64 CUs). BN=128 needs 43.5 kB of LDS, which drops a block per CU from two to
+  one -- the staged bytes are not the binding constraint, the staging CHAIN is
+  latency-bound and occupancy is what hides it. `BM=128` buys the same byte cut
+  by spending the same occupancy, so it is predicted to lose the same way and
+  was not shipped. What does work is staging **fewer bytes per chain**: the
+  quantized bytes (0.5 B/value) unpacked in registers at MMA time, which is the
+  int8/MMQ rewrite, not a tile tweak. Baseline to beat: 1105-1138 us /
+  13.7-14.2 TFLOP/s at rows=466, 340 us at rows=22.
 - **A fused group's fallback runs on PREFILL, and it must use each matrix's own
   metadata.** `gemm_group`'s fused path is decode-only (rows == 1), so a prefill
   pass takes the per-matrix fallback -- and a fallback that decodes a Q4_K
@@ -746,6 +936,32 @@ code, the README, or `docs/`.
   reserve, and `Engine::init` **clamps the pool after the warm-up** to
   `resident_bytes() + max(0, free - floor)` -- the only point where both numbers
   are facts.
+
+- **Upstream moved the expert cache's DECISION and its copies onto the card, and
+  that is the gap this tier has.** llama.cpp #29887 (merged, `--moe-cache-mib`)
+  caches host-resident experts in a GPU bank but still decides on the host; #30112
+  extends it to layer-split; #29949 (`lru-upstream-v3`, `c81901a`) is the one to
+  read -- `LRU_DECIDE`/`LRU_FILL` are graph ops, so the matmul takes SLOT ids and
+  nothing is read back. At the same ~6.5 GiB pinned-host budget on one 7900 XTX
+  that is **31.2 tok/s at 77.9% hit against 20.1 at 75.0%**, i.e. the difference
+  is placement, not capacity. Here the device dispatch table exists
+  (`include/krk/moe_table.hpp`) but is published ONCE and only while the whole
+  routed set is resident, so the per-expert loop with a host round trip
+  (`moe.route.fetch` 0.523 ms/layer on Mellum2.1, 0.077 of it the copy) is the
+  default on every model that does not fit -- which is every model this cache
+  exists for. **The bank is for ADDRESS STABILITY, not for alloc time, and the
+  audit first said the opposite from a stale row.** The 256 MiB arm measured
+  `alloc 2445.5 of 3408.1 ms` on 2026-10-09; today it is **`alloc 3.4 ms` of
+  2849.9**, because the pool serves 96% of hand-outs from a free list (`alloc
+  819 reuse 18231` over 6077 promotions, 0.56 us each). What that arm actually
+  pays is the pageable H2D rate at promotion shape: 469 us/expert, 2.0 GB/s,
+  **7.2 tok/s**, and pinning all of WARM takes it to **15.3 tok/s** with
+  byte-identical stdout -- while making the pageable publish non-blocking
+  changed nothing (2961 ms), which is what proves the rate is the DMA, not a
+  host wait. Do not take their plain LRU (rejected here on measurement,
+  `docs/AUDIT-expert-cache-next.md`), their per-layout-group budgets, or
+  zero-slot substitution. Comparison, the arm table and per-step gates:
+  `docs/AUDIT-gpu-resident-expert-cache.md`.
 
 - **The expert index is used, and its path is derived from the model's.** A run
   with `<model>.krakenexperts.json` beside the weights prints
@@ -1035,6 +1251,132 @@ code, the README, or `docs/`.
   own row, and a window that measurably differs from the full KV. All of it is
   host arithmetic, so no group opens the device to check it.
 
+- **`KRK_TIME_HOST` is now the host table ON ITS OWN, and that switch is what makes a
+  route-vs-expert comparison meaningful.** Both profilers used to hang off one
+  switch, and the device recorder adds ~22 us per op -- so `moe.route` (which
+  waits on the device) and `moe.experts` (which only enqueues) were compared under
+  two different multipliers. Re-measured unprofiled on Mellum2.1 (28 layers, ctx
+  512, 32 tokens, 41.0 tok/s = 23.7 ms/step): `moe.route` **0.827 ms/layer**, of
+  which `moe.route.fetch` (the readback) **0.523**, `moe.route.rest` 0.307, and
+  `moe.experts` 0.213 inside it. The router readback is **14.6 ms of a 23.7 ms
+  token** and the router GEMM's enqueue is 0.1 ms.
+- **That readback is a DRAIN, not a copy, and `KRK_ROUTER_2X=1` is the control that
+  proves it.** The arm issues the same readback a second time, right after the
+  first: the queue is retired by then, so it is pure WDDM round trip. Measured
+  **0.077 ms against the first copy's 0.523**. So moving top-k and the plan to the
+  device -- while the cache still needs the ids on the host to resolve an expert's
+  pointer -- is worth those 0.077 ms/layer, **2.2 ms/token, ~+5%**, and the 14.6 ms
+  wait stays. Do not size that rewrite from "the router is 60% of the step": the
+  60% is the layer waiting for its own GPU work. The wait only goes away with a
+  device-resident expert dispatch (device top-k, device plan, weights addressed
+  through a device pointer table -- the `ggml_mul_mat_id` shape), which is a new
+  kernel family and **cannot be bit-identical** because the softmax moves to the
+  device. Expected ceiling is the 8.3 ms of GPU work the step already has (~120
+  tok/s), not a dense model's rate.
+- **A MoE decode step is host-bound at the ROUTER, and no cache policy can fix it.**
+  `moe_ffn` computes the router row on device and then `download_f32`s it back to
+  select top-k, so the blocking D2H orders behind every queued kernel: one
+  pipeline drain per layer, 28 per token on a 28-layer model. Measured on
+  Mellum2.1-12B-A2.5B (1,792 experts, 10.99 GiB routed, Q8_0): **28.6 tok/s decode
+  with the per-process GPU engine sampler at 23.84% average / 72.17% peak**, i.e.
+  35 ms per step of which 8.3 ms is compute -- and prefill 18.0 tok/s, of which
+  1,812 ms of a 2,829 ms pass is promoting 1,184 experts (7.4 GiB read once). So
+  "the card is slow" and "the cache is slow" are both wrong readings of this run:
+  the card is idle. `KRK_ROUTER_SYNC=1` adds an explicit drain and is NOT the
+  cause; the copy is. The fix is device-side top-k and a plan built there (what
+  llama.cpp does, which is why it has no such ceiling) plus a grouped-expert
+  kernel for the 54 launches a layer this currently issues. Those are the next two
+  pieces of work, in that order.
+- **The ledger now checks itself against the allocator, and "unaccounted" is not
+  a synonym for "the driver has it".** `Backend::device_live_bytes()` counts what
+  this process holds through `alloc`/`release`; the ledger prints it as
+  `[allocator live 8454 MiB in 3744 buffers, largest 230]`. On the Mellum run that
+  total equals weights + KV + experts + workspaces **to the megabyte** while the
+  driver reports 7,000 MiB more consumed, and the 7,000 scales with the bytes
+  *promoted* (7,430 MiB), not with the pool, not with WARM (`--expert-warm-mb 1024`
+  and `11246` both give 7,000), and not with `HIP_VMEM_MANAGE_SUPPORT`. It is also
+  not per-allocation rounding: `tools/alloc_probe.hip` allocates 3,465 x 1,972 KiB,
+  fully written, and the driver charges 2,097,152 B each (**239 MiB** of waste, and
+  a 6 MiB request is charged exactly). Before blaming a tier for a number the probe
+  reports, run that probe and read `allocator live` -- the two together split
+  "my accounting is wrong" from "the copy path holds it".
+- **Device softmax for the MoE router is sub-ulp, and `KRK_DEVICE_SOFTMAX=1` is the
+  arm that measures it.** `src/hip/kernels/router.hpp` + `Backend::router_softmax`
+  compute the activation on the device (warp-packed max, `expf`, tree sum) and the
+  arm *uses* those probabilities for the selection, so the text generated is the
+  device path's, while the host answer is still diffed against it. Measured:
+  **Mellum2.1 24 tok — 36,862/50,176 elements differ (73%), max |dP| 1.19e-07,
+  text identical; 64 tok — 89,800/121,856, 1.19e-07, identical; Qwen3-30B-A3B 24
+  tok — 61,553/73,728 (83%), 4.77e-07, identical md5**; and
+  `KRK_DEVICE_SOFTMAX=1 bash scripts/coherence_check.sh <30B MoE>` still reports
+  **1 coherent, 0 not** (the script inherits the environment, so the device arm
+  really ran it).
+  **Short runs lie about this, and that is the useful result.** At 24 and 64
+  tokens both models print byte-identical text; at 512 they do not: Mellum's
+  greedy run first differs at **char 235** (a token shift in a repetition loop,
+  1267 vs 727 bytes), Qwen3-30B-A3B at **char 1464** ("capital of Ethiopia" ->
+  "capital of Yemen"), and with `--temp 0.9 --seed 7` at **char 314** and **char
+  111**. Max |dP| over those runs is 1.49e-07 / 4.77e-07. A fuller matrix (2
+  models x 3 prompts x greedy 256 + sampled 128 at two seeds, 18 arms) puts the
+  **earliest divergence at char 98** (Mellum, sampled, seed 13); 15 of 18 arms
+  diverge and the three that do not simply had not forked yet at that length
+  (Qwen3-30B p1 is identical at 256 and forks at 1,464 in the 512 run). So one
+  ulp of probability changes a greedy token within ~100 characters, the effect is
+  a time-to-fork rather than a per-arm probability, and 88 tokens of agreement
+  was luck. Coherence still passes because it is a coherence gate, not
+  a bit-identity gate. Consequence: device softmax is not a drop-in, and a
+  dispatch that uses it accepts different text (or reproduces the host's `exp`
+  bits, which a GPU cannot). Quote the stress table, never the 24-token arm.
+  The arm engages only on the plain softmax path (`!router_sigmoid`, no
+  pre-bias) and returns to the host otherwise.
+- **`KRK_DEV_PTR=1` is the stage that removes the round trip: a device pointer
+  table, and a whole MoE layer as one launch.** `ExpertCache::publish_dispatch_table`
+  uploads `[n_layer * n_expert]` `MoeDispatchEntry` (`include/krk/moe_table.hpp`:
+  three device pointers, shapes, types, row strides) and `moe_table_kernel`
+  (`src/hip/kernels/moe_table.hpp`) reads the ids and weights from the device,
+  looks each expert up in that table, and writes the weighted routed sum. No
+  ids, no weights, no plan and no `acquire()` reach the host.
+  **It is published only when the promise holds**: `whole_set_resident` must be
+  true (every slot in VRAM), because a promotion or eviction rewrites a slot's
+  pointers; `drop()` and promotion set `table_stale_` and the engine compares
+  pointers every layer. The retry is bounded (8) because a cold cache never has
+  the set at the end of init -- experts load lazily as routing reaches them.
+  On this box no MoE corpus fits: Qwen3-30B-A3B with `--expert-warmup 1` reaches
+  **5,952 of 6,144 slots** and prints exactly that, so the arm stays off and the
+  text is unchanged. The kernel is therefore verified at the real geometry by
+  `kraken-bench --moe-dispatch` (6 cases): **k=1 and k=2-same are bit-identical
+  to the per-expert path, multi-expert is 1-2 f16 ulp, decode 4096x14336
+  (45 KiB shared) identical**, and the run gates on a control that swaps the
+  selected expert's gate/up in the table and requires the output to change.
+  Three traps the arm produced: the down projection must be rounded to the
+  activation type before the weighted add (else 1 f16 ulp on 14% of elements);
+  `acc + alpha*v*scale` gets contracted into an FMA, so the kernel uses
+  `__fmul_rn`/`__fadd_rn`; and a control that swaps two *identical* synthetic
+  matrices (every `weights()` call restarts the same RNG) reports NOT PROVEN for
+  a correct kernel -- salt each matrix.
+- **The VRAM floor is enforced in `alloc_pooled`, and it is worth +87% as well as a
+  usable desktop.** The expert budget is in requested bytes, so a pool can fill its
+  plan and still leave the card below `vram_floor_bytes()` -- measured on Mellum2.1:
+  a 7,248 MiB pool with **850 MiB free** beside a 3,261 MiB floor. A user sees that
+  as paused video, not as a token rate. `alloc_pooled` now asks the driver before
+  growing (only past half the budget, so a run that never nears the floor pays no
+  query), trims reusable cells first, and refuses growth it cannot take -- the
+  cache falls back to WARM, the same bytes from a slower tier. Interleaved, 3/3
+  pairs, text byte-identical: **41.5 tok/s at a 3,261 MiB floor against 22.2 at 512
+  MiB**, ending 3,238 MiB free instead of 850. Near-zero free VRAM makes the
+  allocator the bottleneck, so the polite arm is the fast one -- the same inversion
+  as the 30 ms-per-cell table above. Never size a tier in requested bytes alone.
+- **`KRK_RECLAMP=0` and `KRK_VRAM_TRACE=1` are the arms for any budget cut.** The
+  re-clamp fires on a live reading taken while the pool was growing, can only ever
+  lower, and used to print "the KV tier has since taken" those bytes -- KV was 112
+  MiB of a 4,000 MiB cut. A budget cut cannot be undone, so a wrong verdict costs
+  the whole run; the off-arm is how a cut is shown to be wrong rather than guessed
+  at. `KRK_VRAM_TRACE=1` prints the ledger before and after every multi-row
+  forward and the trace line inside the clamp. Measured on Mellum2.1, turning the
+  clamp OFF is **1.8-3.0 tok/s against 26.5-31.0**: it is the plan that is wrong,
+  not the cut, which is why the floor moved into `alloc_pooled` rather than the
+  clamp being relaxed.
+
 ## Weight loading (`Backend::set_weight_pull`)
 
 - Large tensors are read() out of the model file rather than DMA'd from the
@@ -1125,6 +1467,409 @@ code, the README, or `docs/`.
   and the ring has two traps" -- a drained ring before the next layer, routed
   banks excluded from a layer's byte total, and no double free of a promoted
   base in `unload()`.
+
+## The expert tier on a big file: two traps that made it do nothing
+
+Both were found on the REAP-288/320 files (`qwen4exp`, 67-84 GB) and both are
+recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
+
+- **`alloc_pooled` returns nullptr; using it as a pointer kills the context.**
+  The pool refuses (does not abort) when `free - rounded < vram_floor_bytes`, and
+  `ExpertCache::acquire`'s COLD path passed the answer straight to
+  `upload(dst, ...)`. The result is `hipErrorInvalidValue` reported at
+  `backend_hip.hip`'s `hipMemcpy` line -- which names the uploader, not the
+  refusal -- and the run dies five tokens into a decode that worked for the first
+  four. It is *not* rare on a constrained card: it is the steady state once the
+  KV cache and workspaces have taken the room the budget was planned around
+  (measured: budget 7624 MiB, 7445 resident, 3202 free beside a 3261 floor).
+  The fix is `force_reclaim(want)`: retire this cache's own LRU, preferring a
+  victim of the same size class (`alloc_pooled` matches cells by rounded size), and
+  retry. A refused expert must return nullptr with **no** slot inserted and **no**
+  `bytes_`/`vram_slots_`/`loads_` increment; the ledger used to count bytes for
+  cells that were never allocated, which then justified evicting nothing.
+- **WARM was disabled on every model bigger than RAM, silently.** The host policy
+  subtracted the WHOLE mapped corpus from live free RAM
+  (`live_avail - reserve - min(mapped, ram_total)`) and again from the ceiling.
+  A clean mapping page is reclaimable standby memory, not owned RAM, so this
+  double-counted the corpus and drove the staging room to zero exactly where the
+  tier matters. The "tier is disabled" warning was gated on `host_budget > 0`,
+  which was already 0 -- so the one case it described printed nothing.
+  Measured on the REAP-320 file, 3 interleaved pairs, same text:
+  **WARM off 206.8 ms/step (387 MiB read/token) against WARM on 141.3 ms/step
+  (27 MiB/token) = +46%**, and on the 288 file 630.3 -> 283.0 ms/step (2.2x).
+  The guard that replaces the pre-charge is `SharedHostRamBudget::can_admit`,
+  which samples live available RAM per admission and fails closed.
+- Two measurement notes from the same trace. (1) With WARM off, the COLD path's
+  `upload()` is outside every timer in the expert-path row, so a run that moved
+  387 MiB/token reported `read 0.0 ms | xfer 0.5 ms`; read the
+  `[stats ] transfer ... read from the file` line instead. (2) `alloc_pooled` is
+  `hipMalloc` per 2.2 MiB cell, ~200 us each: 656.7 ms of a 4.5 s constrained run
+  and 28.8 ms of the 1.5%-miss one. An arena is the next win, not a follow-on
+  nicety.
+- **A refused promotion used to hand the caller an expert with null weights.**
+  `acquire()`'s WARM-hit path fell through to the cold reload while the WARM slot
+  stayed in the map; `emplace()` on an existing key is a no-op, so the function
+  returned the OLD entry -- whose `ResidentExpert` is exactly what the failed
+  promotion never built -- and leaked the cells the reload had allocated. Every
+  GEMM then read null pointers, on the constrained-card path, which is the one
+  this engine exists for. The stale slot is dropped before the reload and
+  `!ins.second` is an explicit refusal now. `test_expert_promotion_failure` (9
+  checks, inside `test_expert_cache_byte_budget`) pins the invariant; the
+  end-to-end injection cannot force "promotion fails, cold succeeds" in one
+  call, so the erase plus the refusal are what make it unreachable.
+  **The other half of that path leaked the WARM copy, and only the in-proc
+  runner can see it.** When the device refuses an expert, `warm_admit` has
+  already paid for its pageable bytes; the early return dropped the local
+  `Slot` on the floor, so those host slices stayed allocated and unreachable --
+  no later `clear()` can free what is not in the map. Because
+  `SharedHostRamBudget` is process-wide, the leftover capped every later
+  admission in the same process. Measured: the fixture left exactly **24 bytes**
+  (`ledger=24` from group 43 onward under `KRK_TEST_INPROC=1`), and groups
+  `test_kv_tier_drop_vs_spill` and `test_kv_tier_host_reserve_refusal` then
+  refused KV staging pages with "shared host-memory budget has no room" --
+  3442/3458 in-proc against 3468/3468 in child mode, which is what the
+  isolation check's `clean-inproc` and `per-group-a/b` arms reported. The slot
+  is now inserted (WARM only: no `track_vram`, no byte charge) before the
+  refusal returns, which also keeps the promise the comment above it makes --
+  the next acquire of that expert is a promotion, not another file read.
+  Same pass, same family: `clear()` never reset `host_pinned_bytes_`, so after a
+  clear the pin prefix believed it was spent and no WARM admission was ever
+  pinned again.
+- **The size-class arena is opt-in too, and its numbers are the useful part.**
+  `KRK_EXPERT_ARENA=1` makes the pool grow by 32-cell slabs of one size class
+  from one `hipMalloc`. It does what it says: alloc row **150 -> 25 ms** over 16
+  tokens (5.8x), reuse 0 -> 11 697 cells, trim 0. And decode is **13.8% slower**
+  (114.2 -> 136.1 ms/step, 3 interleaved pairs, identical text), because the loss
+  moves to `xfer` (894 -> 1 486 ms): uniformly spaced destination cells inside a
+  slab are a copy/DRAM-locality problem, not a kernel problem. A 64 KiB pad made
+  it worse (205 ms/step) by costing 3% of the tier, which is the cliff this pool
+  sits on. The lesson that generalises: the alloc row is ~7% of a REAP step, so
+  no allocator front-end can pay for a 20% copy regression -- measure the whole
+  step, not the row you are optimising. `expert_arena()` now selects ONLY the
+  growth allocator; whether released cells are cached is a separate decision and
+  must stay one, or the bench's reuse checks fail the moment the slab is
+  switched off.
+- **Next-layer expert prefetch is opt-in and measured slower (`-9%`), and the
+  reason is the lesson.** `KRK_MOE_NEXT_PREFETCH=1` records each layer's routed
+  set for the next token and stages the next layer's predicted set after the
+  current layer's expert loop, with `upload_expert_prefetch` (pinned DMA ticket
+  on the copy stream, device-side wait at consumption, no default-stream barrier).
+  REAP-320, 16 tokens, pinned WARM, 3 interleaved pairs: 114.4 ms/step off
+  against 124.7 on. Promotion on that file is BANDWIDTH-bound (~240 x 2.2 MiB per
+  token against a 42.2 GiB routed set and a 7.4 GiB device budget); the copy
+  stream already overlaps the kernels queued before it, so issuing earlier only
+  adds the promotions a prediction miss wastes. The build also exposed a real
+  bug: `force_reclaim`'s same-size-class preference evicts the target layer's own
+  experts (one layer, one set of size classes), which is why the first version was
+  -15% -- `stage_ahead` now leases every slot of the layer it is completing.
+  `KRK_VRAM_FLOOR_MB=1200` was measured too: more residency (55.7 -> 59.6% HOT)
+  and slower (137 -> 155 ms/step), so the floor stays.
+- **The pinned WARM prefix is automatic, and what decides it is a MEASUREMENT,
+  not the BAR bit.** `Engine::init` times both promotion paths at the shape a
+  promotion issues -- `max_expert_bytes()` clamped to 16-64 MiB, and the 16 MiB
+  FLOOR is load-bearing: at 4 MiB on the REAP-320 file the same comparison
+  reads 1.41-1.69x against 1.60x at 16, because the sync and the launch are a
+  large share of each arm -- through `upload_paged_batch` (staging-ring memcpy
+  then DMA) against `upload_pinned_batch` (DMA straight out of the caller's
+  buffer), one untimed call per arm then interleaved order-balanced pairs with a
+  MEDIAN per arm (three arms now; the path bullet below is where that form was
+  forced by measurement), each ending in `sync()` because all three return
+  before the copy lands -- and pins when pinned is >= 1.20x pageable
+  (`krk::warm_pin_worthwhile`, `include/krk/vram_guard.hpp`). **The aperture is
+  a FIRMWARE setting, not a card constant**: Above 4G decoding + Resizable BAR
+  changes it, WDDM has been seen reporting the attribute as 0 on a box whose
+  firmware had ReBAR on, and this engine's pageable path keeps its ring's
+  memcpy even on a large aperture. So the runtime bit is only the fallback when
+  no probe can run (`KRK_H2D_PROBE=0`), the log prints both rates
+  (`promotion measured 10.1 GB/s pageable against 18.6 GB/s pinned (1.84x)` on
+  the 35B-A3B here) and, when it pins, says in the same line that this is a
+  firmware setting the user can change. Sizing is
+  `krk::pinned_warm_prefix_bytes(warm, ram_total)`: a quarter of installed RAM
+  (24 GiB on this 96 GiB box), capped at 16 GiB, and the tier is pinned WHOLE
+  inside that bound -- a 16 GiB laptop with a 16 GiB tier pins 4 GiB.
+  **The half-tier clamp was measured wrong and is gone:** it kept 4800 of the
+  256 MiB arm's 9600 MiB pageable, and that half is where every miss lands. Same
+  binary, `KRK_HOST_PIN_MB=4800` against the new auto, 3 order-balanced pairs,
+  stdout identical in all 12 runs: **143.5 -> 67.2 ms/step (2.14x)**, xfer
+  2815 -> 31 ms of enqueue. `--expert-pin-mb` / `KRK_HOST_PIN_MB` override it
+  (including `0`), and `KRK_PIN_AUTO=0` is the A/B arm -- the log then names
+  what was left on the table instead of going quiet.
+  Measured cross-model, 16 greedy tokens,
+  interleaved order-balanced pairs, text identical in every arm:
+  REAP-320, three independent sets, 8/8 pairs favour the pin but the size runs
+  101.7 -> 88.2 (+13.3%, 3/3), 113.3 -> 93.2 (+18.7%, 2/2) and 114.4 -> 96.7
+  (+15.5%, one pair at +1.2%) -- quote the mechanism, not the headline, because
+  the copy halves every time (us/expert 555 -> 400, 468 -> 390);
+  Distill-35B-A3B Q2KXL with `--expert-warmup 1` 36.5/35.6 -> 30.9/31.1
+  (+15.3/+12.7%, xfer 414/470 -> 199 us/expert); Qwen3-30B-A3B i1-Q2_K
+  93.5 -> 91.5 (+2%, inside the spread -- its tier is disk-bound at 376 MiB
+  read/token, so the copy the pin removes is 2% of its step); Qwen3-4B-Q8_0
+  dense 9.3 -> 9.3 (0%, the control). **The gain tracks how much of a step a
+  promotion is**, which is why the disk-bound and dense arms are recorded and
+  not dropped. Both decisions are pure functions in `include/krk/vram_guard.hpp`
+  precisely so `test_expert_cache_byte_budget` can drive them without a device:
+  removing the half-the-tier cap fails 70/72 on exactly the two tier-bounded
+  checks, and the ratio arm pins the 1.20x line (the 3x and 2x gaps measured
+  here, and the near-1 ratios a large aperture would give, which must NOT pin).
+
+- **Which pageable path a promotion takes is the same probe's OTHER answer, and
+  it is measured too.** `Engine::init` times three arms at 16-64 MiB --
+  `upload_paged_batch` with the staging ring, the same call with the driver
+  staging the pageable source (`Backend::set_pageable_direct(true)`), and
+  `upload_pinned_batch` -- and adopts direct only when
+  `krk::pageable_direct_wins(ring, direct)` clears **1.20x**
+  (`include/krk/vram_guard.hpp`). Below the line the ring stays; above it the
+  direct path takes over, and then `warm_pin_worthwhile` sees a pageable rate
+  near the pinned one and **declines the prefix** -- so a wide aperture should
+  get the speed without spending RAM that cannot be swapped. That second half is
+  the one thing this box cannot reach on real hardware (256 MiB aperture, no
+  ReBAR) -- but it is no longer only asserted. The suite's backend decorator
+  grows a simulated APERTURE: `set_test_aperture(ring, direct, pin)` makes each
+  copy real and then pays a bandwidth-shaped wait, so `probe_h2d_path` reads
+  three different rates off the clock and `test_pageable_path_probe` (38 checks)
+  drives the whole policy on two apertures -- 0.4 against 20 GB/s must choose
+  direct, 6.0 against 0.4 must keep the ring -- and then runs a real
+  `Engine::init` on each. The margins are 1.5x, not 1.2x, on purpose: the wait
+  is ADDITIVE to the copy, which compresses any ratio towards 1, so a tight
+  margin would make the group report the test box's load as the aperture.
+  The pin is deliberately NOT a fixed verdict there: on a wide aperture direct
+  and pinned are the same copy, so that gap is a near-tie by construction, and
+  the checks compare what the engine SET against the numbers it published. Both
+  apertures must decode the same tokens -- the path is a performance choice,
+  never a numerical one. `KRK_WARM_DMA=2` is still the hand-forced arm for a
+  real card, but it bypasses this decision rather than standing in for it. `KRK_WARM_DMA=1|2` forces
+  either path (the A/B arm), `=0` is still the blocking copy, and
+  `KRK_H2D_PROBE=0` skips the probe (BAR hint only).
+  **The probe is interleaved and order-balanced, and that was not cosmetic.**
+  Run as three sequential arms on this 256 MiB box, the same pair read 13.9 GB/s
+  (ring) then 10.5 (direct) at 12.6 MB, and 10.9 then 12.8 at 16 MiB in the
+  other order: the ORDER was being read as the path, and it flipped the
+  decision between two runs of the same binary. Now each iteration runs both
+  pageable paths and swaps which goes first (pinned alternates head/tail), and
+  each arm's value is the MEDIAN, not a best-of. One balanced sample read ring
+  10.88 against direct 11.00 (a tie, so the ring stays), and 9.3-10.9 at 16 MiB,
+  which is why the line is 1.20x and not 1.10x: 1.10 sits INSIDE the measured
+  flap band (1.01-1.17x depending on copy size), so a 1.10 line would choose the
+  path with the probe's buffer size rather than with the card.
+  **But this box's 256 MiB aperture is not safely under the line either**, and
+  the same binary read 8.7 against 10.6 GB/s (direct, 1.21x) in one Qwen3-30B-A3B
+  run and 10.9 against 12.3 (ring, 1.13x) minutes later with
+  `KRK_H2D_PROBE_RERUN=1`. So "it is a tie here, the ring stays" was one sample
+  of that band rather than a property of the box, and the verdict is now CACHED
+  instead of re-rolled: `h2d_probe_cache_read/write` (same header) keep it per
+  (card name+gfx, vram_total, the runtime's `large_bar` hint, `driver_version`,
+  probe size) in
+  `%LOCALAPPDATA%\kraken\h2d-probe.cache` (`$XDG_CACHE_HOME` / `$HOME/.cache`
+  elsewhere), 30-day expiry, `kH2dCacheVersion` bumped when the probe's own
+  algorithm changes. **The write is where the file is PRUNED**, and that is
+  not housekeeping: a reader already refuses an expired line, so leaving one
+  on disk only denies a slot in a 32-line cap to a live verdict, and every
+  driver update adds three. A rewrite drops (a) expired lines, (b) lines
+  this build cannot parse, and (c) another driver's verdict once it is older
+  than the 7-day rollback window (`kH2dCacheOtherDriverMaxAgeSec`) -- long
+  enough to go back to the driver you just left, short enough that ten
+  updates do not become thirty dead lines. Past the cap the NEWEST entries
+  win, by stamp, not by position in the file. Measured end to end: three
+  lines seeded at 8 days old under a fake driver were all gone after one
+  run, leaving the current driver's line; a line from "yesterday's driver"
+  survived a forced re-measure, which is the rollback the window exists for.
+  **The rewrite REPORTS what it dropped, because a cache that quietly shrinks
+  is indistinguishable from a corrupt one.** `H2dCachePrune` counts each reason
+  separately (expired / other driver / unreadable / over the cap) plus what was
+  kept, and `h2d_prune_text` renders it: `H2D cache <path>: dropped 3 dead
+  verdict(s) (1 expired, 1 from another driver, 1 unreadable, 0 over the cap);
+  3 kept`. It returns "" when `dropped() == 0` and both callers print only a
+  non-empty string -- a clean rewrite is the NORMAL case (a 27B run rewrites its
+  own line on each re-measure, `kraken-bench --h2d` rewrites all three), so
+  `dropped 0` every time is noise that trains a reader to ignore the line. The
+  counter is a struct filled by the writer, not a log inside the header: the
+  header is included by the suite, which has no log, and a counter is what a
+  test can assert on. Measured on the real file: three dead lines seeded (one
+  40 days old, one under a foreign driver 8 days old, one truncated)
+  `kraken-bench --h2d` printed `dropped 3 dead verdict(s) (1 expired, 1 from
+  another driver, 1 unreadable, 0 over the cap); 3 kept`, and one expired line
+  seeded before an olmoe run with `KRK_H2D_PROBE_RERUN=1` made `kraken.exe`
+  print `H2D cache ...: dropped 1 dead verdict(s) (1 expired, ...); 3 kept`;
+  the immediate rerun, with nothing dead left, printed no such line at all.
+  The group pins all of it (69 checks): the stale line is readable before
+  the write and unreadable after, the recent other-driver line survives, an
+  expired line is counted out of the file, and a 38-key sweep leaves the
+  newest 31 plus its own. Five of them are the reporting: one file seeded with
+  exactly one dead line of each kind must come back as 1/1/1 with three kept,
+  the rendered text must name the count and the reasons, an empty prune must
+  render "", and the cap arm's write must report what the cap pushed out
+  (neutralising one counter fails three of them, 66/69). Every field is a way a cached answer would be wrong: the
+  BAR hint is in the key because a firmware change (Above 4G + ReBAR) is exactly
+  the event that flips the answer; the **driver version** because the driver
+  is what stages a pageable source (an update changes the staging, so it has
+  to invalidate the verdict automatically instead of waiting out 30 days);
+  and the size because the ratio is size-dependent (1.01x at 12.6 MB against
+  1.17x at 16 MiB). `DeviceCaps::driver_version` comes from
+  `hipDriverGetVersion` in `backend_hip.hip`, and the banner prints it (`HIP
+  7.16.26331 | driver 71626331 | ...` -- on the ROCm 10 RT stack on this box
+  the driver API version IS the runtime version, 7.16.26331 on both counts;
+  a stack where they differ is what the separate field is for).
+  `kH2dCacheVersion` is **2** since that field landed: a v1 line records no
+  driver, so it is a miss and the next write replaces it -- a verdict whose
+  driver is unknown is the one an update invalidates. Measured end to end by
+  editing an entry's driver field: the next run said `measured now` and wrote
+  a fresh entry, while a matching driver still read `from the cache, measured
+  1 s ago`. The log line is the whole provenance -- age AND driver -- because a
+  cached rate without its driver is one a reader has to open the file to
+  interpret: `h2d_probe_origin()` formats it (`a 16 MiB copy from the cache,
+  measured 18 min ago on driver 71626331 at 11.6 GB/s ...`, and `measured now on
+  driver 71626331` for a fresh one), the text is pinned by four checks rather
+  than left to an snprintf in the engine, and a backend that cannot answer says
+  `(driver unknown)` instead of going quiet. `KRK_H2D_PROBE_RERUN=1` re-measures,
+  `KRK_H2D_CACHE=0` disables
+  the cache and `KRK_H2D_CACHE=<path>` relocates it. **The suite forces
+  `KRK_H2D_CACHE=0` in `main`**, and the group that drives the cache points it
+  at its own file and puts `0` back: without that, in-proc groups would share
+  one file and a verdict cached for one simulated aperture would decide
+  another's -- the cross-group poisoning the scratch area exists to prevent.
+  The group's last arms are the wiring: a seeded wide-aperture entry on a
+  simulated NARROW aperture must still choose direct (so only the cache can
+  have decided it), `KRK_H2D_PROBE_RERUN=1` on the same seed must keep the ring
+  (measured, not cached), and `KRK_H2D_PROBE=0` must use neither -- turning the
+  probe off is not a request for an old measurement to stand in for it.
+  **The probe size is bucketed, and that is what lets one tool fill the cache.**
+  `h2d_probe_size_bytes` clamps to 16-64 MiB and rounds UP to a power of two, so
+  the sizes a verdict can exist for are exactly {16, 32, 64} MiB. Without that,
+  a model whose expert footprint is 20 MiB would look up an entry no tool ever
+  writes, and `--h2d` could measure all it liked without a normal run finding
+  it. Measured in one sitting on this card: 11.64 against 11.63 GB/s at 16 MiB,
+  10.19 against 11.87 at 32 and 11.63 against 11.32 at 64 -- the answer really
+  does move with the size, which is why the size stays in the key rather than
+  being averaged away.
+  `kraken-bench --h2d` prints the sequential shape table AND the balanced
+  verdict, and is how a ReBAR-enabled box gets checked without loading a model.
+  It never READS the cache -- measuring now is what that tool is for -- and it
+  WRITES it: after the balanced pair it runs `probe_h2d_path` at the three
+  bucket sizes and stores each verdict, printing `cached N verdict(s) for <card>
+  in <path>`. So an explicit measurement is also how a BIOS change is picked up,
+  without waiting for the 30-day expiry or knowing the env var. Its balanced
+  line now uses `pageable_direct_wins` (1.20x) rather than its own 1.10x test:
+  a tool printing "direct" at 1.10 while init kept the ring was reporting a
+  verdict the run does not act on. `KRK_H2D_CACHE=0` makes `--h2d` measure and
+  write nothing, and it says so.
+  **`kraken-bench --h2d-cache` reads the cache back, and it needs no model and
+  no measurement.** Same facts as `--h2d` from the other side: one line per
+  entry with probe size, the three rates, the path `pageable_direct_wins`
+  selects, the pin `warm_pin_worthwhile` would take, and `h2d_probe_origin`'s
+  age+driver -- so a listing cannot disagree with the run it describes. Dead
+  lines are listed WITH their reason rather than filtered out (`[expired]`,
+  `[from an older cache format]`, `[rates unreadable]`, `[a failed measurement]`,
+  `[stamped in the future]`) because "why is my run measuring again" is a
+  question about the skipped lines; the reasons are classified in the same order
+  as the writer's prune, so the listing and the rewrite cannot disagree. A live
+  verdict from ANOTHER driver is kept by the writer for the rollback window and
+  is shown as `[another driver]`, not as this run's. A missing file, an
+  unreadable one and `KRK_H2D_CACHE=0` all list as empty (the tool still exits
+  0), and the device is opened only to learn this box's key -- if it will not
+  open, the listing drops the marking and says so, because a diagnostic that
+  fails when the card is the suspect is useless.
+  **`bytes == 0` in the key means "any probe size", and that is what a listing
+  needs.** A probe size is a property of the model a run has not opened, so the
+  listing asks the card's question (does a verdict exist here) across the three
+  bucket sizes and marks none as used; a full key asks the sharper question and
+  marks exactly the line `h2d_probe_cache_read` would return. Getting this wrong
+  was visible at once: the first version passed the key with `bytes` unset, so
+  every line mismatched on size and a cache holding three live verdicts printed
+  `no live entry for this card at any probe size`. The group now pins both arms
+  (a full key marks 1 of 2 live lines, the card's question marks the buckets and
+  claims none), which is why it is 81 checks.
+  **Every run that probes now states its verdict, and why it had none to
+  reuse.** `H2D verdict: reused the cached 16 MiB one (from the cache, measured
+  1 s ago on driver 71626331)` or `... measured the card now (16 MiB, 3 arms x 5
+  iterations) -- this card's 16 MiB entry is not usable (expired), 1 dead of 1
+  line(s)`. The wording lives in `h2d_verdict_text` / `h2d_cache_miss_text`, not
+  in the engine, for the same reason `h2d_prune_text` does -- and the suite pins
+  it, because "measured now" with no reason is indistinguishable from the run
+  that found an empty cache when it actually found this card's verdict expired.
+  The miss reasons are the ones a user can act on: no file yet / empty, the off
+  switch (`KRK_H2D_CACHE=0`), this card's entry dead (`expired`, `unreadable`,
+  `from an older cache format`, `a failed measurement`), `N live at other probe
+  sizes`, `N live from another driver` (the rollback-window case, where the file
+  looks populated and nothing is wrong with it), `N line(s) for another card`.
+  **Two traps, both found by running it rather than by building it.** (1) The
+  reason must be scanned BEFORE this run writes its own entry: scanned after, the
+  file already holds a live verdict for exactly this key and the specific reason
+  collapses to a generic "no verdict for this card" -- the first real run printed
+  that on a freshly deleted cache. (2) A run whose probe cannot allocate its
+  buffers has no rates at all, so it says `the probe produced no usable rates (an
+  allocation failed)` rather than quoting a 0.0 GB/s measurement it never took.
+  **The cross-run ledger is `<cache>.stats`, counted PER PROBE SIZE, and the
+  end-of-run lines are `[stats ] h2d`.** One run's verdict is a hit rate of 0% or
+  100% and says nothing, so `H2dProbeTally` (a vector of `H2dTallyBucket`, plus
+  their sum in the flat fields) is persisted beside the cache and printed by
+  `print_run_stats`: the total, then one row per size this machine has probed.
+  Measured on olmoe with a seeded 32 MiB bucket beside its own 16 MiB one:
+  `6 of 8 probed run(s) reused a cached verdict (75%), 2 measured the card at
+  235.5 ms on average, so the cache has avoided about 1413 ms of probing` /
+  `16 MiB: 2 of 3 reused (67%), 1 measured at 71.0 ms -> about 142 ms avoided` /
+  `32 MiB: 4 of 5 reused (80%), 1 measured at 400.0 ms -> about 1600 ms avoided`.
+  **Per size is the whole point, not a flourish.** The probe size is in the cache
+  key, a 64 MiB verdict is not the one a 16 MiB model asks for, and the
+  measurement it replaces costs several times as much -- so one blended rate
+  describes no run in particular, and a machine whose only warmed model buckets
+  to 64 MiB read as a mediocre cache instead of a cache never asked. A bucket that
+  has avoided nothing prints no avoided figure (not `0 ms`), and an unasked size
+  prints no row. The stored format is v2, one line per size
+  (`2\t<bytes>\t<runs>\t<cached>\t<measured>\t<probe_ms>`), and a v1 blended line
+  is not read as a per-size tally: the same rule the cache applies to its own v1
+  verdicts, because the old shape literally cannot answer the new question.
+  **The probe's own cost was a fixed 5 iterations per size, and the early stop
+  is what removed the expensive half of it.** `iters` is now a CAP:
+  `h2d_samples_settled` needs at least `kH2dProbeMinIters` (3) samples, relative
+  MAD <= `kH2dProbeSettleSpread` (10%), and the median of the two NEWEST samples
+  within 10% of the whole set's median. The third clause is not decoration:
+  16 MiB's first three ring samples at MAD 6% were still 12% below where the
+  median ended up. Measured with `kraken-bench --h2d-noise <MiB>` (three fresh
+  processes; relative MAD at n=3): 64 MiB 1.8/0.4/3.9%, 32 MiB 1.1/3.2/12.3%
+  (pinned still ramping), 16 MiB 6.0/0.4/6.4%. Cost, interleaved
+  order-balanced pairs, 3/3: **64 MiB 112 -> 83 ms (-25.9%)**, 32 MiB 59 -> 43,
+  16 MiB 31 -> 25, and the same path and pin in every arm. 16 MiB often still
+  runs 5 -- the spread there does not settle, which is correct rather than a
+  failure of the rule.
+  **Two traps, both from doing the measurement.** (1) Measuring the three sizes
+  in ONE process compares 16-cold against 64-warm: the first size pays the cold
+  driver state, so the arm takes a size per invocation. (2) `--h2d`'s forced A/B
+  has to mean EXACTLY n iterations -- forcing only the cap still stops early and
+  measures the change against itself -- so `KRK_H2D_PROBE_ITERS=<n>` sets
+  `no_early_stop` and refuses anything below the floor. The verdict line reports
+  what actually ran (`3 arms x 3 iteration(s)`), not the cap.
+  Three things are load-bearing about the counting:
+  (1) **The store must not be gated on the reporter.** It shipped as
+  `if (wrote) *wrote = h2d_tally_store(...)`, so the engine (which passes no
+  pointer) counted in memory and wrote nothing: the in-memory tally said
+  `runs=1` while no file existed, and the unit checks passed because they always
+  pass `&wrote`. `wrote` is now a report, not a permission -- a reminder that an
+  optional out-parameter must never gate the side effect.
+  (2) **Only inits that got a verdict are counted**: a probe-off run and a dense
+  model (no WARM tier, so `probe_on` is false) reused nothing and measured
+  nothing, and counting them would drag the rate down without describing any
+  cache. The group pins the delta across its three engine runs: +2 runs, +1 hit,
+  +1 measurement, and the `KRK_H2D_PROBE=0` arm not counted at all.
+  (3) **The saved-time figure is priced at this machine's own average**, not a
+  constant: `cached * probe_ms / measured`. With no measurement in the tally
+  there is no price and the line says `not priced` rather than printing a zero it
+  cannot justify. A corrupt or impossible tally (`cached + measured > runs`) reads
+  as no tally -- better than a rate above 100%.
+  The ledger lives beside the cache, so `KRK_H2D_CACHE=0` disables it too, and it
+  is best effort / last-writer-wins: a server's concurrent inits can round it.
+  The probe it prices is **71-73 ms here at 16 MiB** (3 arms x 5 iterations plus
+  the untimed warm-up), not the ~20 ms this file used to quote -- and a 64 MiB
+  measurement is several times that, which is why the size leads each row.
+  End to end on olmoe (the group cannot see stderr, so this is the CLI arm):
+  deleted cache -> `there is no cache file yet, or it is empty`; same cache
+  again -> `reused the cached 16 MiB one (measured 1 s ago ...)`; `RERUN=1` ->
+  `KRK_H2D_PROBE_RERUN=1 asked for a fresh measurement`; a seeded expired 16 MiB
+  line -> `not usable (expired), 1 dead of 1 line(s)`; a live 32 MiB line ->
+  `1 live at other probe sizes`; a live line from driver 71626330 -> `1 live from
+  another driver`. stdout md5 `fb6ef68100e26822` identical on all six runs -- the
+  line is a log, not a behaviour change.
+  Forced-path text is unchanged: auto / `KRK_WARM_DMA=1` / `=2` print the same
+  stdout on the 30B-A3B file.
 
 ## GGUF id 42 is two different formats
 
@@ -2023,3 +2768,162 @@ code, the README, or `docs/`.
   ramp is indexed by the **pair** index, not the channel index (`rope_yarn_ramp`
   divides `i0` by 2), so a reference that uses `2i` reports the engine's correct
   table as wrong.
+- **The expert cache has a hot ring, and the measurement says it is a prefill
+  win, not a decode one.** `ExpertCache::set_pin_budget` + `admit_hot`, driven by
+  `Engine::pin_hot_experts` between the warmup and the pool clamp: pinned bytes
+  are charged to `pin_budget_` instead of the LRU pool's `budget_`, so the pins
+  stop shrinking the window traffic still earns, and the backend's owner budget
+  is `budget_ + pin_budget_` (`owner_bytes()`; handing it only `budget_` makes
+  the pool refuse the ring's own bytes -- measured `live=5583 MB budget=3396 MB`
+  and the run died on its first token). With no ring configured the old
+  arithmetic is exact, which `test_expert_cache_policy` case 4 still requires
+  and cases 10/11 cover the ring.
+  Measured on Tiel-Coder-35B-A3B-MTP-APEX (7682 MiB of device expert memory,
+  `--bench --ctx 512 -n 64`, interleaved order-balanced, identical text
+  `3baee4232881`): a 4350 MiB ring is **+5.5% prefill and -7.8% decode (5/5)**,
+  a 2174 MiB ring is **+10.8% prefill and -2.1% decode (4/5)**, and both arms
+  report the same `HOT hits 66.4% | WARM hits 33.6%` -- the LRU already finds the
+  hot core at this shape, so the ring removes churn and does not remove the
+  promotions. That is why the default is 1/6 of `total - vram_floor`, why
+  `KRK_EXPERT_PIN_MB` exists, and why `KRK_EXPERT_PIN=0` is the A/B arm. The
+  ring is skipped without a `<model>.krakenexperts.json`: an even order is not a
+  hot set and a wrong pin cannot be evicted.
+  Two traps, both paid for: sizing from "free beside the floor" is a coin flip,
+  because the warmup has usually filled VRAM to its reserve by then (the same
+  command admitted 5325 MiB on one run and skipped the ring on the next,
+  depending on whether the warmup finished its VRAM stage or hit its
+  `--expert-warmup-ms` ceiling) -- size it from `total - floor` and let
+  `admit_hot` evict, since those slots are in WARM and the move is a promotion,
+  not a read; and `scripts/ab_pin_ring.sh` is the harness (`RING_MB=<n>` sizes
+  arm B, arm A is `KRK_EXPERT_PIN=0`), printing both rates per run rather than
+  one number.
+- **The expert cache's miss rate is the wrong objective near the card's limit,
+  and that is measured, not argued.** Tiel-Coder-35B-A3B-MTP-APEX, greedy,
+  `--bench --ctx 512 -n 64`, interleaved: with the default `KRK_VRAM_FLOOR_MB`
+  (a fifth of the card, 3261 MiB here) decode is **22.1 / 23.7 / 22.9 tok/s at
+  84.9% HOT hits and 3620 promotions**; at floor 2048 it is **13.7 / 16.3 / 17.2
+  at 87.1% and 3087**; at floor 1024, **11.3 / 13.2 / 13.0 at 88.3% and 2787**.
+  A *better* hit rate with *fewer* promotions is 2x slower, because the pool then
+  has no headroom and every activation/workspace allocation pays the driver's
+  eviction cost -- and the expert-path timers cannot see it
+  (`room 291 | alloc 207 | xfer 324 | promote 823 ms` is **lower** at floor 1024
+  than at 3261). Raising the floor loses too (4096: 20.2 tok/s, 4800: 19.7), so
+  3261 is the top of the curve. Do not "optimise" the hit rate on a routed set
+  that does not fit without checking this table first.
+- **`ExpertCache::reclamp_vram_budget(free, floor)` re-derives the pool budget
+  from a live reading** (unpinned resident + free beside the floor, only ever
+  lower; `Engine::reclamp_expert_budget` runs it once per prefill and every 16
+  decode rows). The init clamp is one measurement taken before the KV tier starts
+  promoting COLD->HOT. The arithmetic lives on the cache so
+  `test_expert_cache_policy` case 12 can drive it with no device (96 -> 48 bytes,
+  a reading with room does not raise it, the next expert evicts instead of
+  growing). On this box at `--ctx 512` it is a no-op because the KV cache is flat
+  resident -- correct, and the guard is for the run where it is not.
+- **Staged promotion and top-k' lookahead exist and are OFF by default, because
+  they measured nothing.** `KRK_MOE_LOOKAHEAD=1` stages the layer's plan before
+  the per-expert loop (one batch instead of a promotion inside the loop) and
+  `KRK_EXPERT_LOOKAHEAD=<k'>` adds the runners-up, staged only when WARM already
+  holds them. Three interleaved passes each: 22.3/21.4/23.4 tok/s baseline,
+  23.0/20.3/23.6 staged, 22.6/22.4/22.3 with k'=16 -- and **84.9% HOT in all
+  three**, 3620/3630/3660 promotions. The switch also had its condition
+  inverted: the comment says the batched lookahead is for `n > 1` (a verify pass
+  knows its union a row early) and the code ran it for `n == 1`; it is `n > 1`
+  now. `--mtp-spec --draft-tokens 2` on the same file is worse still (greedy:
+  **9.2 tok/s**), so "amortise the promotions over verified tokens" does not pay
+  on this shape either. The wall is the link: load reports 1.88 GiB in 553 ms
+  (3.4 GB/s), the promotion path 3.8-4.4 GB/s (~570 us/expert, 68% of a step),
+  and `KRK_HOST_PIN_MB=2048/4096` moves it only to 4.1-4.9 GB/s. The next lever
+  is a smaller resident representation, not another cache policy.
+- **A whole layer's promotions in one upload was measured and does not pay --
+  the enqueue was never the cost.** `ExpertCache::promote_batch` (called from
+  `moe_ffn` right after `prefetch_layer`; `KRK_MOE_BATCH_PROMOTE=1`, off by
+  default) makes room and allocates cells per expert but issues ONE upload per
+  source kind for the routed set. REAP-320, 16 greedy tokens, 5 interleaved
+  order-balanced pairs, identical text in all ten runs: **111.8 against 112.9
+  ms/step median**, deltas failing to clear their own 2.6 ms MAD in 4 of 5
+  pairs, and the batched arm's `xfer` row consistently WORSE (366-385 against
+  249-287 ms over 15 steps). A promotion there is ~500 us/expert, not 143: three
+  0.73 MiB slices through a 4 MiB pinned ring slot is a host memcpy plus a DMA
+  per slice at ~4.6 GB/s, and that is the same byte count however the calls are
+  grouped. The ring is `kPagedBufs = 4` slots, which fits exactly one expert's
+  three slices -- so the per-expert call already has every copy in flight, while
+  a 4-expert batch (12 chunks) recycles slots and `paged_take_` spins on events.
+  Two things came out of it and are kept: the arm, and the bug it exposed --
+  `upload_paged_batch` recorded at most `kPagedBufs` slots in `used[]` and
+  published only those, so a batch with more chunks than the ring left the rest
+  of its copies UNORDERED against the default stream (the consumer GEMM could
+  start before the DMA landed). Both the single and batch paths now publish in
+  ring-sized groups as the array fills. The ranking that does matter on this
+  file: `room` (340 ms) costs more than `xfer` (250 ms) in 15 decode steps.
+- **And `room` was 96% victim SEARCH, which is now an index plus a 16-slot
+  window.** `pick_victim` walked every entry of `slots_` -- the whole tier, ~3.5k
+  resident inside ~14k WARM entries -- per eviction, with a second hash lookup
+  per comparison: measured 9.19M visits / 2624 evictions, **505.9 ms scanning
+  against 18.1 ms releasing** in a 1.7 s REAP-320 decode. `vram_keys_` (resident
+  keys only, `Slot::vram_idx`, O(1) swap-remove, tracked at the three promotion
+  sites and untracked in `retire()`) plus a moving window fixes it:
+  `KRK_EVICT_WINDOW=16` is the default, and the sweep is 1 -> 103.3, 2 -> 99.4,
+  4 -> 97.2, 8 -> 96.8, **16 -> 96.6**, 32 -> 99.3, 64 -> 108.7, whole set ->
+  107.9 ms/step. Wider is worse because a wide window reaches freshly touched
+  experts and evicts them. Five interleaved pairs against `KRK_EVICT_WINDOW=0`
+  (the same index, the old global policy): **96.6 against 107.9**, every pair,
+  with 3-4% FEWER promotions; against the pre-index binary that is **+14.4%
+  decode, 8.8 -> 10.4 tok/s**, scans 505.9 -> 2.2 ms, 16 visits/eviction.
+  REAP-288: 259.8 against 266.8 ms/step. **The trap is the index's lifetime:**
+  the first version cleared `vram_keys_` in `reset_counters()`, which deliberately
+  KEEPS residency -- so `pick_victim` saw one key for 3484 resident slots and the
+  run promoted 2589 -> 6754 experts (2.6x the bytes, xfer 578 -> 3537 ms) with
+  every other line reading normal. The index is an invariant of residency, not of
+  the statistics generation; the `evict ... | index %zu/%zu keys/resident` line
+  is what named it, and `test_expert_cache_byte_budget` arm 4 pins it (61/64 with
+  the clear put back).
+- **The remaining ~87-96 ms of a REAP-320 decode step is a per-layer host round
+  trip, and the kernels are innocent.** `KRK_TIME_HOST=1` (the host table WITHOUT
+  the device recorder -- that is why the switch exists) accounts for all of it:
+  `moe.route` 1.689 ms/layer x 48 = 81 ms of an 85.6 ms forward, split into
+  `moe.route.fetch` 0.868 (**41.7 ms/step**, the blocking router readback) and
+  `moe.route.rest` 0.820 (`moe.experts` 0.703 -> **33.7 ms/step**). Dense GEMV is
+  ~2.8 ms/step: `KRK_TIME=gemm` measures it at **743 GB/s** (2.65 us a call) and
+  the same engine does 464 GB/s on Qwen3-4B-Q8_0, so 2.9 GB in 96 ms is a
+  schedule, not a kernel. `KRK_ROUTER_2X=1` is the proof: a second 320-float
+  readback costs **0.093 ms** against the first's 0.950 -- the copy is 10% of it,
+  the rest is the drain of queued device work the step needed anyway, and the
+  second copy finding an EMPTY queue means the host's plan build then runs with
+  the card idle (0.13 ms/layer, 6.3 ms/step). The ping-pong is device 0.78 then
+  host 0.80 per layer, and they add: that is the measured 1.69. Marginal launch
+  cost is 2.3 us/op (`KRK_MOE_GROUP=0` adds ~1032
+  ops/step for +2.4 ms), so the 5012 ops/step are ~11.5 ms -- the residual.
+  **The pin is no longer a switch: it is the default on a small-BAR card**
+  (87.3 against 99.8 ms/step at the 16 GiB explicit arm, 3/3 interleaved pairs,
+  373 against 455 us/expert; the automatic 12.3 GiB prefix then measured
+  101.7 -> 88.2 and later 113.3 -> 93.2). `KRK_PIN_AUTO=0` is the A/B arm. See
+  the aperture bullet above for the cross-model table; the lever is worth +13 to
+  +18% exactly when promotions are on the critical path and ~2% when the tier is
+  disk-bound. Ranking, unchanged: the readback (41.7) needs device-side routing,
+  blocked on "whole routed set resident"; the host expert loop (33.7) is the
+  batched-DMA item.
+  Prefill is separately odd -- 197 ms/row against a decode row's 96 -- because
+  `gemm(gemv_m)`, the rows 2-8 ladder, measures 29 GB/s against gemv's 743.
+- **The VRAM ledger is a print, not an inference, and the inference it replaced
+  was wrong by >30x.** `Engine::log_vram_ledger` runs at the end of init and at
+  teardown and prints
+  `vram ledger (when): total = weights + kv + experts (pool + ring; live, reusable,
+  budget) + workspaces + free + unaccounted`, with `ws_bytes_` accumulated in
+  init's `alloc` lambda and a `vram at start` line giving the device's free
+  memory before this engine allocates anything. Measured on Tiel 35B-A3B @ctx
+  4096: **workspaces 88 MiB**, kv **80 MiB** (20 KiB/token — the hybrid has only
+  ~20 attention layers of 40, so a dense-transformer KV formula over-counts 2x),
+  dense 1,920 MiB, experts 7,682 MiB. The old "scratch is ~3.0 GiB" figure was a
+  subtraction (`total − dense − KV − experts − free`) and the residue was the
+  driver and other processes: the start line reports **2,251 MiB held on one
+  launch and 4,408 MiB on another**, so `hipMemGetInfo` is device-wide and moves
+  with whatever else is running. Read `unaccounted` as environmental, and never
+  size a tier from a subtraction of driver numbers.
+- **An expert's bytes are per-layer, and the index's `expert_bytes` is layer
+  0's.** `blk.0` on Tiel-Coder-35B-A3B-MTP-APEX is Q6_K gate/up + Q8_0 down =
+  **2.703 MiB** (2,834,432 B — exactly what the JSON records), while the corpus
+  average measured from WARM is **2.26 MiB** because later layers carry Q4_K
+  down-projections. Both numbers are right for different layers; sizing a cache
+  from `expert_bytes` over-provisions every tier by ~20%. Derive the average as
+  `sum(per_expert(gate)+per_expert(up)+per_expert(down)) / n_layer` from the
+  tensor table (`tools/gguf_tensors.py`), not from the layer-0 field.

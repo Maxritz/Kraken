@@ -27,6 +27,8 @@
 #include <string>
 #include <vector>
 
+#include "krk/trace.hpp"
+
 namespace krk {
 
 class HostTime {
@@ -91,8 +93,17 @@ private:
     HostTime() {
         const char *p = std::getenv("KRK_PROFILE");
         const char *t = std::getenv("KRK_TIME");
+        // KRK_TIME_HOST is the host table ON ITS OWN. It exists because the two
+        // profilers share one switch and the device recorder is not a passive
+        // observer: it adds ~22 us per op, so a span that waits on the device
+        // (`moe.route` holds a blocking readback) is inflated several times over
+        // while a span that only enqueues (`moe.experts`) is not. Comparing those
+        // two under `--profile` compares two different multipliers. With this
+        // switch the device work is untouched and the row is the real wall time.
+        const char *h = std::getenv("KRK_TIME_HOST");
         on_ = (p && *p && std::strcmp(p, "0") != 0) ||
-              (t && *t && std::strcmp(t, "0") != 0);
+              (t && *t && std::strcmp(t, "0") != 0) ||
+              (h && *h && std::strcmp(h, "0") != 0);
     }
 
     bool on_ = false;
@@ -105,9 +116,16 @@ private:
 class HostScope {
 public:
     explicit HostScope(const char *name) : name_(name), on_(HostTime::get().on()) {
+        Trace::get().ensure_on();
+        trace_on_ = Trace::get().on();
+        if (trace_on_) trace_t0_ = Trace::get().now_us();
         if (on_) t0_ = std::chrono::steady_clock::now();
     }
     ~HostScope() {
+        if (trace_on_) {
+            const double dur = Trace::get().now_us() - trace_t0_;
+            Trace::get().complete("host", name_, trace_t0_, dur);
+        }
         if (!on_) return;
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - t0_)
@@ -124,6 +142,8 @@ public:
 private:
     const char *name_ = nullptr;
     bool on_ = false;
+    bool trace_on_ = false;
+    double trace_t0_ = 0.0;
     std::chrono::steady_clock::time_point t0_{};
 };
 

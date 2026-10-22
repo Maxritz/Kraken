@@ -1,0 +1,103 @@
+[info ] HIP 7.16.26331 | driver 71626331 | AMD Radeon RX 9070 XT | gfx1201 | 64 CU | 15.9 GiB VRAM | BAR: runtime reports 256 MiB aperture
+[warn ] architecture 'qwen4exp': loading an UNSUPPORTED schema for development (KRK_ARCH_ALLOW_EXPERIMENTAL=1); the loader's blockers are not enforced for this run
+[info ] ple: 320001536 rows of 160 read from the mapping (110 B/row), 16 head(s) per token
+[info ] weight residency: all 3.07 GiB of weights resident (12.84 GiB budget)
+[info ] rope pairing: NeoX half-split (channel j with j + 32)
+[info ] loaded Qwen3.8 Flash Next REAP 288 Bf16 (qwen4exp): 48 layers, 2560 embd, 24/2 heads, hd=256, ff=640, vocab=248320
+[info ] gated delta net: 36 recurrent layers of 48 (every 4 attends), ssm 16 key x 48 value heads, state 128, conv kernel 4, rope 64/256
+[info ] per-layer embedding: 16 head(s) of 160, 3-gram window, conv 4 dilated by 3 (9 row(s) of history)
+[info ] qsa: 12 layer(s) carry an indexer (4 head(s) of 128, ratio 4, top_k 2048 cells) -- block selection on
+[info ] hyper-connections: 4 lane(s) of 2560 through 320, residual 10240 wide
+[info ] vram at start: 16304 MiB total, 12627 MiB free before this engine allocates (3677 MiB already held by the driver/other processes)
+[info ] qsa indexer: 12 layer(s) keep their raw keys on the host (0 MiB), 128 compact cells per row at the budget
+[info ] vram headroom: 12.21 GiB free of 15.92 GiB total, 1.00 GiB reserved (KRK_VRAM_RESERVE_MB overrides)
+[info ] mem policy: process working set capped at 76.7 GiB (80% of 95.9 GiB planned)
+[info ] vram policy: 14.0 GiB cap (3.7 GiB already in use, 45.9 GiB demand, 12.2 GiB free of 15.9 GiB, 1.0 GiB reserved) -> expert budget 256.0 MiB
+[info ] ram policy: 78.1 GiB of the host room is the file mapping itself (the disk tier's page cache); WARM gets what is left
+[info ] ram policy: 40.5 GiB budget (95.9 GiB installed, 81.1 GiB free) -> WARM tier 31685 MiB
+[info ] H2D verdict: reused the cached 16 MiB one (from the cache, measured 8 h ago on driver 71626331)
+[info ] host->device path: pageable promotions use the driver-staged DMA (no host memcpy) -- a 16 MiB copy from the cache, measured 8 h ago on driver 71626331 at 8.3 GB/s through the staging ring, 10.6 GB/s direct, 17.5 GB/s from pinned memory. The aperture is a FIRMWARE setting (Above 4G decoding + Resizable BAR), so it is measured rather than assumed, and cached per card: KRK_H2D_PROBE_RERUN=1 re-measures, KRK_H2D_CACHE=0 disables the cache, KRK_WARM_DMA=1|2 forces a path, KRK_H2D_PROBE=0 skips the probe.
+[info ] expert cache: pinned WARM prefix 16384 MiB of the 31685 MiB tier -- a 16 MiB promotion measured 10.6 GB/s direct against 17.5 GB/s pinned (1.66x), so the pageable path pays a copy this prefix removes. Every rate here was measured on this card; a wide aperture moves them, and then this prefix removes itself. KRK_HOST_PIN_MB or --expert-pin-mb overrides it, KRK_PIN_AUTO=0 disables it.
+[info ] expert cache: budget 256.0 MiB + WARM 31685 MiB pageable, 288 experts x top-10, 48 layers, policy LFU+aging (pin at 24 hits, decay every 64); cold reads are read-through
+[warn ] expert cache: the routed set is 42.2 GiB and the device budget is only 0.2 GiB (1%) — the cache is spending its budget churning rather than holding. raise --expert-cache-mb, lower --ctx / --kv-hot-mb, or use a model whose routed set fits the card
+[info ] recurrent state: 36 layers, 112.2 MiB f32
+[info ] workspaces ready: chunk=8 ctx=128 KV=3 MiB (load 2297 ms)
+[info ] expert warmup: no H:/OLLAMA-Models/GGUF/qwen3.8-flash-next-reap-288-Q4_K_M.gguf.krakenexperts.json -- filling the tiers evenly; run --expert-scan to rank them
+[info ] expert warmup: even order, 2 rounds, 288 experts/layer deep; WARM 29905 MiB of 31685 MiB in 9568 slots (29905 MiB read), VRAM +0 experts (0 MiB, 0 slots); 20002 ms (stopped at the --expert-warmup-ms ceiling)
+[info ] expert cache: hot ring off (opt-in: KRK_EXPERT_PIN_MB=<n>, or KRK_EXPERT_PIN=1) -- it measured +10.8% prefill but crashes a long decode in the pool's async reuse path
+[info ] vram ledger (after init): 16304 MiB total = weights 3074 + kv 3 + experts 0 (pool 0 + ring 0; live 0, reusable 0, budget 256) + workspaces 124 + free 12506 + unaccounted 596 [allocator live 3206 in 1136 buffers, largest 497]
+
+[stats ] load      22470 ms, 3.00 GiB uploaded of 3.00 GiB weights in 1564 ms = 1.9 GB/s
+[stats ] prefill   5 tok in 2918.7 ms = 1.7 tok/s
+[stats ] decode    4 tok in 2192.7 ms over 3 timed steps = 1.4 tok/s (730.9 ms/step)
+[stats ] device    4.10 GiB in use of 15.92 GiB (11.82 GiB free)
+[stats ] h2d       53 of 54 probed run(s) reused a cached verdict (98%), 1 measured the card at 71.0 ms on average, so the cache has avoided about 3763 ms of probing
+[stats ] h2d          16 MiB: 53 of 54 reused (98%), 1 measured at 71.0 ms -> about 3763 ms avoided
+[stats ] range     f16 activation bounds fired: silu 0, experts-sum 0, residual 0
+[stats ] range     residual rows stored scaled: max exponent 0
+[stats ] kv        flat: whole cache resident in VRAM (no tiering traffic)
+[stats ] active-stage issued 0, consumed 0, demand wait 0.000 ms
+[stats ] expert-pool budget 270540800 committed 269209600 live 266956800 reusable 2252800 bytes; alloc 1089 reuse 7896 trim 844 guard-fallback 0 | release 2914 mark(s) for 8742 slice(s)
+[stats ] experts   256 MiB VRAM budget, 81/74 slots resident, 0 pinned | WARM 31685 MiB (16379 pinned of a 16384 budget), 10145 held (31682 MiB, 2027 MiB prefetched)
+[stats ] cache     3020 acquires | HOT hits 25 (0.8%) | WARM hits 2995 (99.2%) | COLD misses 650 (21.5%)
+[stats ] router    hot share 27/3020 picks (0.9%) landed on an expert already in VRAM (preference off)
+[stats ] transfer  2995 promotions, 9371 MiB in 2853.3 ms = 3.2 GB/s (952.7 us/expert) | 2914 VRAM evictions kept in WARM, 9116 MiB | 2027 MiB read from the file (506.79 MiB/tok)
+[stats ] expert-path  read   1002.7 ms | room     29.3 ms | alloc    210.2 ms | xfer   2612.6 ms | (promote total   2853.3 ms)
+[stats ] evict       2914 scan(s), 46624 slot visits, 7.1 ms scanning + 21.9 ms releasing = 151 ns/visit, 16 visits/scan | index 81/81 keys/resident
+[stats ] expert-path split  prefill: read   774.3 | room    15.7 | alloc    83.8 | xfer  1584.1 | promote  1684.2 ms
+[stats ]                     decode: read   228.4 | room    13.6 | alloc   126.4 | xfer  1028.5 | promote  1169.0 ms
+[stats ] pinned    1246 batch(es), 3871 MiB on the copy stream in 267.5 ms = 14.1 GB/s
+[stats ]           the promote timers above wrap the ENQUEUE of a pinned copy, not its flight: read this line for the rate, and the step time for its cost
+[stats ] warm      31685 MiB capacity, 100.0% in use | 650 admissions, 73 evictions, 0 rejects | 2914 device evictions, 0 decay events | 16379 MiB pinned
+[info ] vram ledger (at teardown): 16304 MiB total = weights 3074 + kv 3 + experts 257 (pool 257 + ring 0; live 255, reusable 2, budget 258) + workspaces 124 + free 12108 + unaccounted 737 [allocator live 4541 in 1466 buffers, largest 497]
+
+== KRK_TIME per-op device time, net of a 22.69 us recorder floor (30300 ops)
+op                            calls    raw ms  floor ms    NET ms   idle ms   host ms       MB     GB/s
+warm_read(pool)                 219  12333.51      4.97  12328.54   8764.00  12330.49      0.0      0.0
+upload_paged                   1749   1908.87     39.68   1869.19    110.55   2561.72   5766.5      3.1
+upload                         1275   1499.22     28.93   1470.29   1316.10   1543.19      0.0      0.0
+gemm(gemv_m)                   2159    258.89     48.98    209.90     21.43     13.44   3829.0     18.2
+upload_pinned                  1246    150.77     28.27    122.50    120.97     24.63   4059.5     33.1
+gemm(gemv)                     4325    163.79     98.12     65.67    116.99     22.15   8568.0    130.5
+gemm_group                     2687    124.97     60.96     64.01     69.11     16.19      0.0      0.0
+gather_rows                    3020    118.06     68.51     49.55     93.50     18.82     19.7      0.4
+scatter_axpy                   3020    116.29     68.51     47.78     66.57     16.23     19.7      0.4
+download_f32                    240     34.88      5.44     29.43     17.39    636.03      0.0      0.0
+upload_i32                      192     13.84      4.36      9.48      6.54      3.28      0.0      0.0
+silu_mul                       3212     78.52     72.87      5.65     67.27     15.10      0.0      0.0
+gemm_acc(gemv)                  108      5.91      2.45      3.46      2.49      0.85    955.5    276.3
+add_residual                    420     12.90      9.53      3.37      8.71      2.25      0.0      0.0
+delta_rule                      144      6.14      3.27      2.87      3.34      1.68      0.0      0.0
+rmsnorm_grouped                 400     11.59      9.07      2.52     11.35      2.26      0.0      0.0
+sigmoid_act                     528     14.14     11.98      2.16     14.01      2.78      0.0      0.0
+softplus_act                    144      4.98      3.27      1.71      3.40      0.63      0.0      0.0
+add_inplace                     440     11.31      9.98      1.32     11.19      2.22      0.0      0.0
+rope                             48      2.41      1.09      1.32      1.40      0.55      0.0      0.0
+mul_act                         192      5.63      4.36      1.27      5.49      1.18      0.0      0.0
+hc_combine                      384      9.95      8.71      1.24     11.12      2.15      0.0      0.0
+fill0                           396     10.19      8.98      1.21     98.66      1.93      0.0      0.0
+attention                        48      1.74      1.09      0.65      1.29      0.37      0.0      0.0
+scale_cols                      144      3.86      3.27      0.60      3.64      0.70      0.0      0.0
+silu_act                        392      9.47      8.89      0.58      9.29      1.60      0.0      0.0
+kv_append                        48      1.63      1.09      0.54      1.64      0.25      0.0      0.0
+add_bias_cols                   144      3.77      3.27      0.50      5.24      0.69      0.0      0.0
+scale_rows                      192      4.83      4.36      0.47      4.89      1.69      0.0      0.0
+qk_norm                          48      1.53      1.09      0.44      1.34      0.55      0.0      0.0
+download                          4      0.42      0.09      0.33      0.22     11.40      0.0      0.0
+conv1d_dw                         4      0.22      0.09      0.13      0.11      0.02      0.0      0.0
+hc_init                           4      0.19      0.09      0.10      0.22      0.02      0.0      0.0
+embed                             4      0.17      0.09      0.08      0.11      0.43      0.0      0.0
+rmsnorm                         144      3.25      3.27      0.00      3.02      1.07      0.0      0.0  <-at floor
+ple_gate                          4      0.07      0.09      0.00      0.12      0.02      0.0      0.0  <-at floor
+lane_bcast_mul                    4      0.03      0.09      0.00      0.14      0.02      0.0      0.0  <-at floor
+logits_topk                       4      0.00      0.09      0.00      0.11      0.11      0.0      0.0  <-at floor
+q3_split                         48      0.73      1.09      0.00      0.80      0.26      0.0      0.0  <-at floor
+hc_mix                          388      8.10      8.80      0.00      5.87      2.88      0.0      0.0  <-at floor
+copy_act                        780     16.55     17.70      0.00     18.37      3.25      0.0      0.0  <-at floor
+scale_act                       916     18.85     20.78      0.00     17.48      4.06      0.0      0.0  <-at floor
+conv1d_silu                     144      0.67      3.27      0.00      1.32      1.78      0.0      0.0  <-at floor
+l2norm                          288      3.52      6.53      0.00      5.44      1.25      0.0      0.0  <-at floor
+TOTAL                         30300  16976.35    687.41  16298.87  11022.24  17252.14
+device spans NET of the recorder are 51.2% of 31823.8 ms wall; 11022.2 ms idle between ops (34.6%); 4502.7 ms neither (not ops)
+!! 2720 of 30300 ops (9.0%) sit at or below the 22.69 us floor and are NOT individually resolvable; their true combined cost is bounded above by 61.7 ms. Do not read this table's row order as a cost order for those rows -- use KRK_TIME=<op> for a single op, or an isolated probe, to resolve one.
+[trace ] wrote 71844 events to C:/Users/rr/AppData/Local/Temp/reap288-trace.json (open in Perfetto / chrome://tracing)

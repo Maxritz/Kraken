@@ -8,6 +8,7 @@
 // here, which is why the engine asks the backend for its activation
 // type instead of assuming f16.
 #include "krk/backend.hpp"
+#include "krk/hc.hpp"
 #include "krk/vram_guard.hpp"
 #include "par_pool.hpp"
 
@@ -297,6 +298,27 @@ public:
                 });
     }
 
+    bool gather_rows_supported() const override { return true; }
+
+    void gather_rows(void *dst, const void *src, const i64 *idx, i64 n_rows,
+                     size_t row_bytes) override {
+        if (!dst || !src || !idx || n_rows <= 0 || row_bytes == 0) return;
+        u8 *o = static_cast<u8 *>(dst);
+        const u8 *s = static_cast<const u8 *>(src);
+        // Rows are disjoint destination ranges, so the pool may split them.
+        par_for(n_rows, 4,
+                2.0 * static_cast<f64>(n_rows) * static_cast<f64>(row_bytes),
+                [&](i64 b, i64 e) {
+                    for (i64 r = b; r < e; r++) {
+                        const i64 cell = idx[r];
+                        if (cell < 0) continue;
+                        std::memcpy(o + static_cast<size_t>(r) * row_bytes,
+                                    s + static_cast<size_t>(cell) * row_bytes,
+                                    row_bytes);
+                    }
+                });
+    }
+
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {
         const i64 n_rep = d.n_kv > 0 ? d.n_head / d.n_kv : 1;
@@ -534,6 +556,136 @@ public:
                             const f32 inv = 1.0f / std::sqrt(ss + eps);
                             for (i64 i = 0; i < hd; i++) dh[i] = sh[i] * inv;
                         }
+                    }
+                });
+    }
+
+    // ---- hyper-connections (qwen4exp) ------------------------------------
+    //
+    // The CPU backend is the reference arm for the qwen4exp stack, so these
+    // delegate to the host maths in hc.cpp rather than repeating it: the suite
+    // pins hc.cpp's arithmetic, and a second copy here would be a second thing
+    // to keep in step.
+    bool hc_supported() const override { return true; }
+
+    void hc_init(void *lanes, const void *x, i64 n_tok, i64 hc, i64 ne) override {
+        f32 *o = static_cast<f32 *>(lanes);
+        const f32 *s = static_cast<const f32 *>(x);
+        if (!o || !s || n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        // One thread per embedding element, writing its hc copies: the lanes of
+        // one token are a contiguous block, so this is hc stores per element
+        // and no second pass.
+        par_for(n_tok * ne, 4096, static_cast<f64>(n_tok * ne) * hc,
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const i64 t = i / ne;
+                        const i64 r = i % ne;
+                        const f32 v = s[i];
+                        for (i64 c = 0; c < hc; c++) o[(t * hc + c) * ne + r] = v;
+                    }
+                });
+    }
+
+    void hc_mix(void *mixed, const void *xn, const void *gate, i64 n_tok,
+                i64 hc, i64 ne) override {
+        HcGeometry g;
+        g.n_embd = static_cast<i32>(ne);
+        g.hc = static_cast<i32>(hc);
+        g.low_rank = 1; // not a mixer geometry; only the lane count is read
+        // Qualified: the member name is the op, the free function is the maths.
+        krk::hc_mix(static_cast<f32 *>(mixed), static_cast<const f32 *>(xn),
+                    static_cast<const f32 *>(gate), static_cast<i32>(n_tok), g);
+    }
+
+    void hc_combine(void *res, const void *block_out, const void *inject,
+                    i64 n_tok, i64 hc, i64 ne) override {
+        HcGeometry g;
+        g.n_embd = static_cast<i32>(ne);
+        g.hc = static_cast<i32>(hc);
+        g.low_rank = 1;
+        krk::hc_combine(static_cast<f32 *>(res),
+                        static_cast<const f32 *>(block_out),
+                        static_cast<const f32 *>(inject), static_cast<i32>(n_tok), g);
+    }
+
+    // ---- per-layer embedding (PLE), qwen4exp ------------------------------
+    void ple_gate(void *out, const void *key, const void *qry, i64 n_tok,
+                  i64 hc, i64 ne) override {
+        f32 *o = static_cast<f32 *>(out);
+        const f32 *kf = static_cast<const f32 *>(key);
+        const f32 *qf = static_cast<const f32 *>(qry);
+        if (!o || !kf || !qf || n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        const f32 inv = 1.0f / std::sqrt(static_cast<f32>(ne));
+        par_for(n_tok * hc, 1, 4.0 * static_cast<f64>(n_tok * hc) * ne,
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const i64 t = i / hc;
+                        const i64 c = i % hc;
+                        const i64 base = (t * hc + c) * ne;
+                        f32 s = 0.0f;
+                        for (i64 j = 0; j < ne; j++) s += kf[base + j] * qf[base + j];
+                        s *= inv;
+                        const f32 mag =
+                            std::sqrt(std::fmax(std::fabs(s), 1e-6f));
+                        o[c * n_tok + t] =
+                            1.0f / (1.0f + std::exp(s < 0.0f ? mag : -mag));
+                    }
+                });
+    }
+
+    // out[t,c,e] = value[t,e] * g[c*n_tok + t]: one scalar per LANE broadcast
+    // across that lane's whole row. The CPU body is the reference the device
+    // kernel is checked against, and it has to exist: the base class body is a
+    // no-op, so a missing implementation leaves the destination holding
+    // whatever the allocator last put there -- measured as a test that passed
+    // single-threaded and failed 1 run in 3 with the pool live, because only
+    // then is the heap reused.
+    void lane_bcast_mul(void *out, const void *value, const void *g, i64 n_tok,
+                        i64 hc, i64 ne) override {
+        f32 *o = static_cast<f32 *>(out);
+        const f32 *vf = static_cast<const f32 *>(value);
+        const f32 *gf = static_cast<const f32 *>(g);
+        if (!o || !vf || !gf || n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        par_for(n_tok * hc, 1, 2.0 * static_cast<f64>(n_tok * hc) * ne,
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const i64 t = i / hc;
+                        const i64 c = i % hc;
+                        const f32 *src = vf + t * ne;
+                        f32 *dst = o + i * ne;
+                        const f32 w = gf[c * n_tok + t];
+                        for (i64 j = 0; j < ne; j++) dst[j] = src[j] * w;
+                    }
+                });
+    }
+
+    void conv1d_dw(void *out, const void *x, const void *w, i64 n_tok, i64 ch,
+                   i64 kern, i64 dil) override {
+        f32 *o = static_cast<f32 *>(out);
+        const f32 *xf = static_cast<const f32 *>(x);
+        const f32 *wf = static_cast<const f32 *>(w);
+        if (!o || !xf || !wf || n_tok <= 0 || ch <= 0 || kern <= 0) return;
+        par_for(n_tok * ch, 8192, 2.0 * static_cast<f64>(n_tok * ch) * kern,
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const i64 t = i / ch;
+                        const i64 c = i % ch;
+                        f32 acc = 0.0f;
+                        for (i64 k = 0; k < kern; k++)
+                            acc += xf[(t + (kern - 1 - k) * dil) * ch + c] *
+                                   wf[k * ch + c];
+                        o[i] = acc;
+                    }
+                });
+    }
+
+    void silu_act(void *x, i64 n) override {
+        f32 *p = static_cast<f32 *>(x);
+        par_for(n, 8192, 4.0 * static_cast<f64>(n),
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const f32 v = p[i];
+                        p[i] = v / (1.0f + std::exp(-v));
                     }
                 });
     }

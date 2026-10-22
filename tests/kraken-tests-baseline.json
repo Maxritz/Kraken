@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-20T09:55:41Z",
-  "recorded_commit": "4577ba3",
-  "totals": {"groups": 65, "passed": 3261, "run": 3261, "exit": 0},
+  "recorded_utc": "2026-10-21T17:29:44Z",
+  "recorded_commit": "72a01eb",
+  "totals": {"groups": 73, "passed": 3583, "run": 3583, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -30,7 +30,7 @@
     {"name": "test_hadamard_act", "status": "pass", "passed": 7, "run": 7},
     {"name": "test_iq_family_structure", "status": "pass", "passed": 24, "run": 24},
     {"name": "test_vec_dot", "status": "pass", "passed": 2, "run": 2},
-    {"name": "test_arch_table", "status": "pass", "passed": 500, "run": 500},
+    {"name": "test_arch_table", "status": "pass", "passed": 532, "run": 532},
     {"name": "test_arch_tensor_maps", "status": "pass", "passed": 15, "run": 15},
     {"name": "test_load_verdict", "status": "pass", "passed": 57, "run": 57},
     {"name": "test_gguf_roundtrip", "status": "pass", "passed": 13, "run": 13},
@@ -47,8 +47,9 @@
     {"name": "test_moe_matches_dense_twin", "status": "pass", "passed": 6, "run": 6},
     {"name": "test_moe_grouped_prefill_matches_tokenwise", "status": "pass", "passed": 5, "run": 5},
     {"name": "test_expert_cache_policy", "status": "pass", "passed": 369, "run": 369},
-    {"name": "test_expert_cache_byte_budget", "status": "pass", "passed": 47, "run": 47},
+    {"name": "test_expert_cache_byte_budget", "status": "pass", "passed": 88, "run": 88},
     {"name": "test_expert_cache_warm_tier", "status": "pass", "passed": 72, "run": 72},
+    {"name": "test_expert_dispatch_table", "status": "pass", "passed": 33, "run": 33},
     {"name": "test_draft_head", "status": "pass", "passed": 50, "run": 50},
     {"name": "test_mtp_sidecar", "status": "pass", "passed": 17, "run": 17},
     {"name": "test_expert_warmup", "status": "pass", "passed": 11, "run": 11},
@@ -56,6 +57,12 @@
     {"name": "test_hc_lanes", "status": "pass", "passed": 24, "run": 24},
     {"name": "test_ple_hash", "status": "pass", "passed": 22, "run": 22},
     {"name": "test_qwen4exp_schema", "status": "pass", "passed": 21, "run": 21},
+    {"name": "test_qwen4exp_forward", "status": "pass", "passed": 19, "run": 19},
+    {"name": "test_qwen4exp_gdn_gate", "status": "pass", "passed": 14, "run": 14},
+    {"name": "test_qwen4exp_hc_mix", "status": "pass", "passed": 7, "run": 7},
+    {"name": "test_qwen4exp_ple", "status": "pass", "passed": 16, "run": 16},
+    {"name": "test_qsa_select", "status": "pass", "passed": 14, "run": 14},
+    {"name": "test_qwen4exp_qsa", "status": "pass", "passed": 17, "run": 17},
     {"name": "test_cpu_expert_pool", "status": "pass", "passed": 60, "run": 60},
     {"name": "test_gdn_ops", "status": "pass", "passed": 158, "run": 158},
     {"name": "test_gdn_model_loads", "status": "pass", "passed": 23, "run": 23},
@@ -69,6 +76,7 @@
     {"name": "test_kv_tier_no_kv_layers", "status": "pass", "passed": 11, "run": 11},
     {"name": "test_kv_tier_drop_vs_spill", "status": "pass", "passed": 17, "run": 17},
     {"name": "test_kv_tier_host_reserve_refusal", "status": "pass", "passed": 31, "run": 31},
-    {"name": "test_kv_tier_per_plane_cold_files", "status": "pass", "passed": 7, "run": 7}
+    {"name": "test_kv_tier_per_plane_cold_files", "status": "pass", "passed": 7, "run": 7},
+    {"name": "test_pageable_path_probe", "status": "pass", "passed": 129, "run": 129}
   ]
 }

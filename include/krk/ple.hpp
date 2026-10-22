@@ -23,6 +23,7 @@
 #pragma once
 
 #include "krk/common.hpp"
+#include "krk/quant.hpp"
 
 #include <vector>
 
@@ -42,6 +43,12 @@ struct PleConfig {
     std::vector<i64> multipliers; // [ngram], the 2^61-style odd constants
 
     i32 n_heads() const { return ngram > 0 ? (ngram - 1) * heads_per_ngram : 0; }
+    // The gathered embedding is one `n_heads * head_dim` row per token, and it
+    // feeds a projection whose input is the whole wide stream: those two have
+    // to be the same number or the block cannot run at all.
+    i64 row_width() const {
+        return static_cast<i64>(n_heads()) * head_dim;
+    }
     bool valid() const {
         return ngram >= 2 && heads_per_ngram > 0 && head_dim > 0 &&
                static_cast<i32>(head_offsets.size()) >= n_heads() &&
@@ -58,5 +65,26 @@ struct PleConfig {
 // is how many are valid — a shorter window (the start of a sequence) reads as
 // EOS. `eos_token < 0` disables the cut, which a fixture may want.
 void ple_rows(const PleConfig &cfg, const i64 *window, i32 n_window, i64 *out);
+
+// Every token of one forward pass, hashed in place.
+//
+// `seq` is the sequence so far, position-indexed, and must cover pos0 + n
+// entries: the window before the pass is the same token array the reference
+// reads out of the KV cells, so nothing is re-derived from the KV and nothing
+// is remembered here. The first tokens of a sequence simply have a shorter
+// window, which reads as EOS (see ple_rows). `out` is [n, n_heads), head
+// fastest, matching the reference's `idx[i*n_heads + h]`.
+void ple_rows_for(const PleConfig &cfg, const i64 *seq, i64 pos0, i32 n,
+                  i64 *out);
+
+// Gathers the hashed rows out of the mapping into host f32, head-slowest inside
+// a token:
+//   dst[t * n_heads * head_dim + h * head_dim + d]
+// which is the order the reference's ggml_get_rows produces and the order the
+// key projection expects. Rows are read straight out of the file's bytes
+// (`row_bytes` apart, in the file's own type) — the table is tens of GB and is
+// never uploaded, which is the whole point of computing the hash on the host.
+void ple_gather(f32 *dst, const u8 *table, DType type, u64 row_bytes,
+                i32 head_dim, i32 n_heads, const i64 *rows);
 
 } // namespace krk

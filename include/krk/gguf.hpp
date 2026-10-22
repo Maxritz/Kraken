@@ -120,6 +120,16 @@ public:
     bool get_bool(const std::string &key, bool def = false) const;
     const std::vector<f32> *get_f32_array(const std::string &key) const;
     const std::vector<i32> *get_i32_array(const std::string &key) const;
+    // Any integral array widened to i64: U8/I8/U16/I16/U32/I32/U64/I64 all
+    // arrive through the same vector. A GGUF array's element type is whatever
+    // the exporter wrote, and the same logical field moves between them across
+    // exporters -- qwen4exp's `ple.head_offsets` reaches 300,001,275, which
+    // fits u32 but *not* i32, and its `ple.layer_multipliers` are 2^45-scale
+    // 64-bit odd constants that only u64 can carry. Reading those through
+    // get_i32_array() returned nullptr and the loader reported the metadata as
+    // incomplete on a file that declares every key. Returns false when the key
+    // is absent, is not an array, or holds a non-integral element type.
+    bool get_i64_array(const std::string &key, std::vector<i64> *out) const;
     const std::vector<std::string> *get_str_array(const std::string &key) const;
 
     // The mapping of the metadata shard (the whole file for a single-file

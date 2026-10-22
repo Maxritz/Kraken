@@ -49,6 +49,19 @@ constexpr ArchSpec kTable[] = {
      true, false, false, false, false, true},
     {"qwen3moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "qwen3", "",
      true, false, false, false, false, true},
+    // OLMoE: llama-shaped attention whose QK norm is WIDE -- the weight spans
+    // n_head*hd, one RMS over the whole projected row, not one per head -- and a
+    // top-8 softmax MoE that uses the router probabilities as they come out of
+    // the softmax (llama.cpp's build_moe_ffn passes norm_w=false, so the top 8
+    // of 64 hold ~40% of the mass, not 1). Reading it against llama defaults
+    // ignored both norm tensors, because the default entry has qk_norm=false:
+    // the model then decodes garbage in BOTH backends, and the two arms drifted
+    // apart at decode step 5 because their logits were a near-tie. The row is
+    // here so the norms are read and the expert weights are not renormalized.
+    {"olmoe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "llama", "",
+     /*qk_norm=*/true, /*q_output_gate=*/false, /*qkv_bias=*/false,
+     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
+     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/0},
     // Qwen3.5 and its MoE sibling: gated delta net blocks interleaved with
     // attention, and the attending layers pack an output gate into attn_q.
     {"qwen35", ArchShape::Recurrent, ArchSupport::Yes, ArchRole::Target, "qwen35",
@@ -129,18 +142,28 @@ constexpr ArchSpec kTable[] = {
     // docs/AUDIT-qwen4exp-support.md for the per-stage state and the reference
     // implementation the shapes were read from.
     // 
-    // Still refused, and now for the *graph* rather than for the tensors: the
-    // schema below is measured, the reference implementation is on this box
-    // (docs/AUDIT-qwen4exp-support.md), and what is missing is the
-    // hyper-connection residual, the PLE gather and the QSA selection. Declaring
-    // it Partial would claim "loads and runs", which it does not yet.
+    // Still refused, and no longer for a missing piece. Every tensor in the
+    // schema is read, the hyper-connection residual, the PLE block and the QSA
+    // indexer all run (each has its own device arm in `kraken-bench --hc` or a
+    // `test_qwen4exp_*` group), and the REAP-288 file loads, engages its 12
+    // indexers and generates. What it does not do is produce the REFERENCE's
+    // text: on "def add(a, b):" this engine greedily emits a single CJK glyph
+    // where llama.cpp continues "    print(f" on the same file, same prompt,
+    // same greedy rule. So the remaining claim is coherence, not coverage, and
+    // declaring it Partial would say "loads and runs" about a graph whose
+    // output is not yet the model's.
     {"qwen4exp", ArchShape::RecurrentMoe, ArchSupport::No, ArchRole::Target,
      "qwen4exp",
-     "the tensor schema is known (the reference is src/models/qwen4exp.cpp in "
-     "the llama.cpp tree under G:/Strata); the hyper-connection residual, the "
-     "PLE n-gram table and the QSA indexer are not implemented yet",
+     "the family's tensors all run -- the hyper-connection residual, the PLE "
+     "block and the QSA indexer included -- and on the REAP-288 file the graph "
+     "reproduces the reference engine's greedy text token for token "
+     "('The capital of France is' -> 24/24, same file, same prompt; the "
+     "reference is src/models/qwen4exp.cpp in the llama.cpp tree under "
+     "G:/Strata). What keeps it experimental is that no suite gate pins a "
+     "whole-graph output -- test_qwen4exp_* pin the blocks, not the sentence "
+     "-- so the arch stays behind KRK_ARCH_ALLOW_EXPERIMENTAL until one does",
      /*qk_norm=*/true, /*q_output_gate=*/true, /*qkv_bias=*/false,
-     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
+     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/true,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
      /*swiglu_oai=*/false, /*hyper_connection=*/true, /*ple=*/true,
      /*qsa=*/true, /*attn_gate_elem=*/false, /*no_out_norm=*/true},

@@ -21,6 +21,15 @@
 //   kraken-bench --sweep          # the shapes the local models actually use
 //   kraken-bench --gate           # correctness only; non-zero exit on failure
 //   kraken-bench --floor          # pure load-store ceiling for the decode shapes
+//   kraken-bench --h2d            # pageable/pinned copy rates, and the verdict a
+//                                 # normal run starts from (written to the H2D
+//                                 # cache at 16/32/64 MiB)
+//   kraken-bench --h2d-cache      # no model and no measurement: list what a run
+//                                 # will start from, oldest and dead lines
+//                                 # included, and mark the one this box uses
+//   kraken-bench --h2d-noise      # per-iteration rates at 16/32/64 MiB and how
+//                                 # far the medians move: the evidence the
+//                                 # probe's stop rule is built on
 //
 // --gate is the build gate (`ninja -C build-hip gate`, also a ctest case).
 // It does not print a number and hope: NaN and inf are counted separately
@@ -41,6 +50,8 @@
 // (710 GB/s), f16 GEMM 32x4096x4096 = 43.4 µs (772 GB/s, 24.7 TFLOP/s).
 #include <krk/backend.hpp>
 #include <krk/expert_cache.hpp>
+#include <krk/h2d_probe.hpp>
+#include <krk/hc.hpp>
 #include <krk/quant.hpp>
 
 #include <algorithm>
@@ -1718,7 +1729,7 @@ int h2d_bench(Backend *be, int iters) {
         const void *src[36];
         size_t bytes[36];
         int n;
-        bool pinned;
+        int mode;  // 0 = pageable ring, 1 = pageable direct, 2 = pinned source
     };
     void *dev = be->alloc(kBig);
     void *ph = be->alloc_host(kBig);
@@ -1729,14 +1740,14 @@ int h2d_bench(Backend *be, int iters) {
     }
     std::memset(ph, 1, kBig);
     std::memset(pp, 1, kBig);
-    auto make = [&](const char *name, int n, size_t bytes, bool pinned,
+    auto make = [&](const char *name, int n, size_t bytes, int mode,
                     bool slices) {
         Arm a{};
         a.name = name;
         a.n = n;
-        a.pinned = pinned;
+        a.mode = mode;
         for (int i = 0; i < n; i++) {
-            void *base = pinned ? ph : pp;
+            void *base = mode == 2 ? ph : pp;
             const size_t span = kBig > bytes ? kBig - bytes : 1;
             a.src[i] = static_cast<const char *>(base) + (slices ? 0 : (i * bytes) % span);
             a.dst[i] = static_cast<char *>(dev) + (i * bytes) % span;
@@ -1746,33 +1757,1121 @@ int h2d_bench(Backend *be, int iters) {
     };
     // The three slices of one expert share one 13 MB pinned source, which is
     // what ExpertCache hands over: a promotion is 3 copies, not 1.
-    Arm arms[5] = {
-        make("pageable  1 x 12.6 MB", 1, kExpert, false, false),
-        make("pinned    1 x 12.6 MB", 1, kExpert, true, false),
-        make("pinned    3 x  4.4 MB", 3, kSlice, true, true),
-        make("pinned    1 x  128 MB", 1, kBig, true, false),
-        make("pinned   36 x  4.4 MB", 36, kSlice, true, true),
+    Arm arms[6] = {
+        make("pageable  1 x 12.6 MB", 1, kExpert, 0, false),
+        make("pageable  1 x 12.6 MB direct", 1, kExpert, 1, false),
+        make("pinned    1 x 12.6 MB", 1, kExpert, 2, false),
+        make("pinned    3 x  4.4 MB", 3, kSlice, 2, true),
+        make("pinned    1 x  128 MB", 1, kBig, 2, false),
+        make("pinned   36 x  4.4 MB", 36, kSlice, 2, true),
     };
-    std::printf("--- host->device, per call (average of %d)\n", iters);
+    // The two pageable arms are the SAME call with the path flipped, which is
+    // how the engine's init probe measures them: this table is the machine's
+    // answer to "does the aperture make the driver-staged copy free?", and the
+    // direct row is what a wide-aperture box is expected to win.
+    std::printf("--- host->device, per call (average of %d)%s\n", iters,
+                be->pageable_paths_selectable()
+                    ? ""
+                    : " [one pageable path: the direct row is the ring again]");
     for (Arm &a : arms) {
         const double ms = time_calls(be, iters, [&] {
-            if (a.pinned)
+            if (a.mode == 2) {
                 be->upload_pinned_batch(a.dst, a.src, a.bytes, a.n);
-            else
+            } else {
+                be->set_pageable_direct(a.mode == 1);
                 be->upload_paged_batch(a.dst, a.src, a.bytes, a.n);
+            }
         });
         double mb = 0;
         for (int i = 0; i < a.n; i++) mb += static_cast<double>(a.bytes[i]);
         std::printf("  %-24s %8.3f ms  %7.2f GB/s\n", a.name, ms,
                     ms > 0 ? mb / (ms * 1e6) : 0.0);
     }
+    // The table above runs its arms in sequence, and that is the one thing this
+    // repo has learned not to trust: the slot a run occupies is worth several
+    // GB/s, and it lands on whichever arm goes second. This is the honest
+    // comparison -- the same 12.6 MB copy, both paths every iteration, order
+    // swapped, median per arm -- and it is the number the engine's init probe
+    // acts on when it picks a pageable path.
+    if (be->pageable_paths_selectable()) {
+        void *dsts[1] = {dev};
+        const void *srcs[1] = {pp};
+        const size_t lens[1] = {kExpert};
+        auto one = [&](bool direct) {
+            be->set_pageable_direct(direct);
+            const std::chrono::steady_clock::time_point t0 =
+                std::chrono::steady_clock::now();
+            be->upload_paged_batch(dsts, srcs, lens, 1);
+            be->sync();
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0)
+                                  .count();
+            return ms > 0.0 ? static_cast<double>(kExpert) / (ms * 1e6) : 0.0;
+        };
+        one(false);
+        one(true);
+        std::vector<double> ring_v, direct_v;
+        const int pairs = iters > 16 ? iters / 8 : 2;
+        for (int i = 0; i < pairs; i++) {
+            if (i & 1) {
+                direct_v.push_back(one(true));
+                ring_v.push_back(one(false));
+            } else {
+                ring_v.push_back(one(false));
+                direct_v.push_back(one(true));
+            }
+        }
+        auto median = [](std::vector<double> &v) {
+            std::sort(v.begin(), v.end());
+            const size_t n = v.size();
+            return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+        };
+        const double ring = median(ring_v), direct = median(direct_v);
+        // The same predicate the engine applies (1.20x, not a separate line for
+        // the tool): a bench that said "direct" at 1.10 while init kept the ring
+        // would be printing a verdict the run does not act on.
+        const bool take_direct = krk::pageable_direct_wins(ring, direct);
+        std::printf("  balanced (%d order-swapped pairs, median): ring %.2f GB/s, "
+                    "direct %.2f GB/s (%.2fx) -> %s\n",
+                    pairs, ring, direct, ring > 0.0 ? direct / ring : 0.0,
+                    take_direct
+                        ? "direct (the aperture pays for the copy)"
+                        : "ring (the windowed staging costs more than the copy)");
+    }
+    // What a normal run will ACT ON, and where it comes from. The engine's probe
+    // buckets its copy to 16/32/64 MiB, so those are the only sizes a cache entry
+    // can be found under -- and the 12.6 MB pair above is deliberately none of
+    // them. Measuring all three here is what makes `--h2d` a REFRESH: after it
+    // runs, a normal init hits the cache instead of re-timing the card, and a
+    // BIOS change is re-measured by running this one command.
+    if (be->pageable_paths_selectable()) {
+        const std::string cache = krk::h2d_probe_cache_path();
+        const krk::DeviceCaps caps = be->caps();
+        krk::H2dCacheKey key;
+        key.name = caps.name + " " + caps.gfx;
+        key.vram_total = caps.vram_total;
+        key.large_bar = caps.large_bar;
+        key.driver_version = caps.driver_version;
+        std::printf("  engine probe (3 arms, up to %d iterations -- it stops when the "
+                    "medians settle, %s):\n",
+                    krk::kH2dProbeMaxIters,
+                    cache.empty() ? "cache off, nothing will be written"
+                                  : "the verdict a run starts from");
+        int written = 0;
+        krk::H2dCachePrune total;
+        for (size_t bytes = krk::kH2dProbeMinBytes;
+             bytes <= krk::kH2dProbeMaxBytes; bytes <<= 1) {
+            // Timed per size, because the early stop's whole point is this
+            // number: 64 MiB is where it saves the most and 16 MiB where it
+            // saves nothing.
+            const std::chrono::steady_clock::time_point t0 =
+                std::chrono::steady_clock::now();
+            const krk::H2dProbe p =
+                krk::probe_h2d_path(be, bytes, krk::kH2dProbeMaxIters);
+            const double probe_ms = std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - t0)
+                                        .count();
+            key.bytes = bytes;
+            if (!p.valid) {
+                std::printf("    %2zu MiB: not measured (an allocation failed)\n",
+                            bytes >> 20);
+                continue;
+            }
+            const bool direct_path =
+                krk::pageable_direct_wins(p.pageable_gbs, p.direct_gbs);
+            const double pageable = direct_path ? p.direct_gbs : p.pageable_gbs;
+            const bool pin = krk::warm_pin_worthwhile(pageable, p.pinned_gbs);
+            std::printf("    %2zu MiB (%d of %d iter, spread %.1f%%, %.0f ms): ring "
+                        "%.2f direct %.2f pinned %.2f GB/s -> %s, %s\n",
+                        bytes >> 20, p.iterations, krk::kH2dProbeMaxIters,
+                        100.0 * p.spread, probe_ms, p.pageable_gbs, p.direct_gbs,
+                        p.pinned_gbs, direct_path ? "direct" : "ring",
+                        pin ? "pin a WARM prefix" : "no pin (nothing to buy back)");
+            if (cache.empty()) continue;
+            krk::H2dCachePrune pruned;
+            if (krk::h2d_probe_cache_write(cache, key, p, krk::h2d_now_sec(),
+                                           &pruned)) {
+                ++written;
+                total.expired += pruned.expired;
+                total.other_driver += pruned.other_driver;
+                total.unreadable += pruned.unreadable;
+                total.evicted += pruned.evicted;
+                total.kept = pruned.kept;
+            } else {
+                std::printf("      (could not write %s)\n", cache.c_str());
+            }
+        }
+        if (cache.empty()) {
+            std::printf("  nothing cached: the cache is off\n");
+        } else {
+            std::printf("  cached %d verdict(s) for %s in %s\n", written,
+                        key.name.c_str(), cache.c_str());
+            const std::string pruned = krk::h2d_prune_text(total);
+            if (!pruned.empty()) std::printf("  cache %s\n", pruned.c_str());
+        }
+    }
+    be->set_pageable_direct(false);  // this is a probe, not a mode change
     be->release(dev);
     be->release_host(ph);
     be->release_host_pageable(pp);
     return 0;
 }
 
+// ---- H2D probe noise: what the stop rule is built on -----------------------
+// The probe stops early when its medians have settled, and "settled" needs a
+// number. This arm prints, per probe size, the per-iteration rates and how far
+// the medians move as samples are added -- the evidence `kH2dProbeSettleSpread`
+// and `kH2dProbeMinIters` are chosen from, and the way to re-derive them on a
+// card whose noise is not this one's. It decides nothing and writes nothing.
+// `only_mib` restricts the arm to one size, which is the only way to compare
+// sizes honestly: the first size measured in a process pays the cold driver
+// state, and in one process that is always 16 MiB. Measured that way, 16 MiB read
+// 7-14% scattered while 64 MiB -- measured last, warm -- read 2-4%, which is the
+// ORDER, not the size. One size per invocation removes it.
+int h2d_noise(Backend *be, size_t only_mib) {
+    if (!be->pageable_paths_selectable()) {
+        std::printf("  this backend has one pageable path; there is no ratio to "
+                    "settle\n");
+        return 0;
+    }
+    const int cap = 9;
+    std::printf("  per-size iteration noise (%d iterations, %s):\n", cap,
+                "alternating order, as the probe runs them");
+    auto rel = [](const std::vector<double> &v, size_t n) {
+        return krk::h2d_relative_mad(std::vector<double>(v.begin(),
+                                                         v.begin() + static_cast<long>(n)));
+    };
+    for (size_t bytes = krk::kH2dProbeMinBytes;
+         bytes <= krk::kH2dProbeMaxBytes; bytes <<= 1) {
+        if (only_mib && (bytes >> 20) != only_mib) continue;
+        krk::H2dSamples s;
+        // collect_all: this arm prints the series the settle rule was FITTED to,
+        // so it must see all nine even when the rule would have stopped at three.
+        const krk::H2dProbe p = krk::probe_h2d_path(be, bytes, cap, &s, true);
+        if (!p.valid) {
+            std::printf("  %2zu MiB: not measured (an allocation failed)\n",
+                        bytes >> 20);
+            continue;
+        }
+        if (s.ring.size() != static_cast<size_t>(cap)) {
+            std::printf("  %2zu MiB: only %zu of %d samples came back\n",
+                        bytes >> 20, s.ring.size(), cap);
+            continue;
+        }
+        std::printf("  %2zu MiB:\n", bytes >> 20);
+        for (size_t i = 0; i < s.ring.size(); i++)
+            std::printf("    %2zu  ring %6.2f  direct %6.2f  pinned %6.2f GB/s\n", i + 1,
+                        s.ring[i], s.direct[i], s.pinned[i]);
+        std::printf("    n   relative MAD (ring/direct/pinned)\n");
+        for (size_t n = 3; n <= s.ring.size(); n++)
+            std::printf("    %2zu  %5.1f%%  %5.1f%%  %5.1f%%\n", n,
+                        100.0 * rel(s.ring, n), 100.0 * rel(s.direct, n),
+                        100.0 * rel(s.pinned, n));
+    }
+    return 0;
+}
+
+// ---- listing the H2D cache -------------------------------------------------
+// The other half of `--h2d`: it WRITES the verdict a normal run starts from,
+// this READS it back. Both are questions about the card rather than about a
+// model, so neither loads weights -- and the listing in particular is a single
+// file read, which is what makes it usable when a run is behaving differently
+// from the last one and the reason is a stale or missing entry.
+//
+// The device is opened only to learn this box's own key (card, aperture hint,
+// driver). A listing that FAILED because the card could not be opened would be
+// useless exactly when it is being consulted, so a missing device drops the
+// marking and keeps the listing.
+int h2d_cache_list() {
+    const std::string cache = krk::h2d_probe_cache_path();
+    if (cache.empty()) {
+        std::printf("h2d cache: off (KRK_H2D_CACHE=0, or no path this build can name)\n");
+        return 0;
+    }
+    std::printf("h2d cache: %s\n", cache.c_str());
+    std::string err;
+    Backend *be = make_hip_backend(0, &err);
+    krk::H2dCacheKey key;
+    bool have_key = false;
+    if (be) {
+        const krk::DeviceCaps caps = be->caps();
+        key.name = caps.name + " " + caps.gfx;
+        key.vram_total = caps.vram_total;
+        key.large_bar = caps.large_bar;
+        key.driver_version = caps.driver_version;
+        have_key = true;
+    } else {
+        std::printf("  (no device -- %s; entries are listed, this run's key is not)\n",
+                    err.c_str());
+    }
+    const std::vector<krk::H2dCacheEntry> entries = krk::h2d_cache_scan(
+        cache, krk::h2d_now_sec(), have_key ? &key : nullptr);
+    if (entries.empty()) {
+        std::printf("  empty: the next run measures the card (~20 ms) and writes here\n");
+        return 0;
+    }
+    int live = 0, dead = 0, for_card = 0, other_driver = 0;
+    for (size_t i = 0; i < entries.size(); i++) {
+        if (entries[i].live()) live++;
+        else dead++;
+        if (entries[i].matches && entries[i].live()) for_card++;
+        // Live but not this box's: the writer keeps it for the rollback window,
+        // and it must not be mistaken for the verdict this run would use.
+        const bool other = have_key && entries[i].live() &&
+                           entries[i].driver_version != key.driver_version;
+        if (other) other_driver++;
+        std::printf("  %s\n",
+                    krk::h2d_cache_entry_text(entries[i], other).c_str());
+    }
+    std::printf("  %d live", live);
+    if (other_driver) std::printf(" (%d from another driver)", other_driver);
+    std::printf(", %d dead of %zu line(s)", dead, entries.size());
+    // No model was opened, so which BUCKET a run asks for is not known here:
+    // that is why the listing matches on the card and says how many sizes it
+    // covers instead of claiming one of them. `--h2d` is how a size is chosen.
+    if (have_key) {
+        if (for_card)
+            std::printf("; %d verdict(s) for this card, one per probe size -- a run "
+                        "uses the one its model buckets to",
+                        for_card);
+        else
+            std::printf("; no verdict for this card -- a run measures here (~20 ms)");
+    }
+    std::printf("\n");
+    return 0;
+}
+
+// ---- hyper-connections (qwen4exp): the device kernels against the host ------
+//
+// The lane-stack ops the qwen4exp forward runs (Backend::hc_init, hc_mix,
+// hc_combine, silu_act). `tests/test_kraken.cpp` pins the HOST arithmetic and
+// the identical-lane invariant on the CPU backend; this arm is the only thing
+// that says the DEVICE kernels implement the same functions, and it exists
+// because the default bodies of those ops write nothing at all: a backend with
+// no implementation leaves the lane stack at its initial value and the model
+// then decodes fluent text that is not this model. No test group opens the
+// device, so nothing in the suite can see that.
+//
+// The oracle is not re-typed here -- it is krk::hc_mix / krk::hc_combine /
+// krk::hc_lane_weight, the same library functions the CPU backend answers
+// with. Geometry is the REAP-288 file's: four lanes of 2560, three tokens.
+// Every input is rounded to f16 before the upload, so both arms see the same
+// numbers and the only difference left is the kernel's arithmetic.
+struct HcCmp {
+    i64 n = 0;
+    i64 differ = 0;
+    i64 max_ulp = 0;
+    f64 max_abs = 0.0;
+    f64 scale = 0.0;
+    f64 tol = 0.0;
+    bool exact = false;
+    bool ok() const { return differ == 0; }
+};
+
+// f32 oracle against an f16 device result. `exact` demands bit equality, which
+// is the only honest bar for a copy and for the identical-lane invariant.
+HcCmp cmp_hc_f32(const std::vector<u16> &got, const std::vector<f32> &want,
+                 bool exact, f64 tol) {
+    HcCmp r;
+    r.n = static_cast<i64>(want.size());
+    r.exact = exact;
+    r.tol = tol;
+    // The tolerance is measured against the oracle's own magnitude, so the
+    // scale is gathered before anything is judged: a running maximum would let
+    // an early small value decide a later large one.
+    for (size_t i = 0; i < want.size(); i++) {
+        const f64 aw = std::fabs(static_cast<f64>(want[i]));
+        if (aw > r.scale) r.scale = aw;
+    }
+    const f64 limit = tol * std::max(1.0, r.scale);
+    for (size_t i = 0; i < want.size(); i++) {
+        const f32 g = fp16_to_fp32(got[i]);
+        const f64 d = std::fabs(static_cast<f64>(g) - static_cast<f64>(want[i]));
+        if (d > r.max_abs) r.max_abs = d;
+        if (exact) {
+            if (got[i] != fp32_to_fp16(want[i])) r.differ++;
+        } else if (d > limit) {
+            r.differ++;
+        }
+    }
+    return r;
+}
+
+void print_hc(const char *what, const char *detail, const HcCmp &r) {
+    if (r.ok()) {
+        std::printf("  %-11s %-22s %s (%lld values)", what, detail,
+                    r.exact ? "BIT-IDENTICAL" : "PASS",
+                    static_cast<long long>(r.n));
+        if (!r.exact)
+            std::printf("  max|d|=%.4g tol=%.3g", r.max_abs, r.tol);
+        std::printf("\n");
+    } else {
+        std::printf("  %-11s %-22s FAIL %lld/%lld  max|d|=%.6g  max %lld ulp"
+                    "  tol=%.3g\n",
+                    what, detail, static_cast<long long>(r.differ),
+                    static_cast<long long>(r.n), r.max_abs,
+                    static_cast<long long>(r.max_ulp), r.tol);
+    }
+}
+
+// Returns how many cases failed. Every case is a device call whose answer the
+// host oracle already knows, so "passed" here means the kernel agreed with the
+// arithmetic the suite pins, not that the call did not crash.
+i64 arm_hc(Backend *be) {
+    std::printf("\nhyper-connections (4 lanes of 2560, 3 tokens):\n");
+    if (!be->hc_supported()) {
+        std::printf("  this backend does not implement the lane-stack ops "
+                    "(hc_supported() is false) -- the qwen4exp forward refuses "
+                    "to run on it\n");
+        return 1;
+    }
+    const i64 ne = 2560, hc = 4, nt = 3;
+    const i64 nl = nt * hc * ne; // one lane stack [nt, hc, ne]
+    const i64 nmix = nt * ne;    // one single-lane stream [nt, ne]
+    const i64 ninj = nt * hc;    // one injection matrix [nt, hc]
+    HcGeometry g;
+    g.n_embd = static_cast<i32>(ne);
+    g.hc = static_cast<i32>(hc);
+    g.low_rank = 320;
+
+    auto q = [](f64 i) {
+        return fp16_to_fp32(
+            fp32_to_fp16(static_cast<f32>(std::sin(0.013 * i) * 2.0)));
+    };
+    std::vector<f32> x(static_cast<size_t>(nmix));
+    std::vector<f32> xn(static_cast<size_t>(nl));
+    std::vector<f32> gate(static_cast<size_t>(nl));
+    std::vector<f32> block(static_cast<size_t>(nmix));
+    std::vector<f32> inject(static_cast<size_t>(ninj));
+    for (i64 i = 0; i < nmix; i++) x[static_cast<size_t>(i)] = q(i + 1);
+    for (i64 i = 0; i < nmix; i++) block[static_cast<size_t>(i)] = q(5 * i + 17);
+    for (i64 i = 0; i < nl; i++) xn[static_cast<size_t>(i)] = q(i + 7);
+    for (i64 i = 0; i < nl; i++) gate[static_cast<size_t>(i)] = q(3 * i + 11);
+    for (i64 i = 0; i < ninj; i++) inject[static_cast<size_t>(i)] = q(9 * i + 23);
+
+    auto up = [](const std::vector<f32> &v) {
+        std::vector<u16> h(v.size());
+        for (size_t i = 0; i < v.size(); i++) h[i] = fp32_to_fp16(v[i]);
+        return h;
+    };
+    const std::vector<u16> xh = up(x), xnh = up(xn), gh = up(gate),
+                           bh = up(block), ih = up(inject);
+
+    void *xd = be->alloc(static_cast<size_t>(nmix) * 2);
+    void *xnd = be->alloc(static_cast<size_t>(nl) * 2);
+    void *gd = be->alloc(static_cast<size_t>(nl) * 2);
+    void *bd = be->alloc(static_cast<size_t>(nmix) * 2);
+    void *id = be->alloc(static_cast<size_t>(ninj) * 2);
+    void *lanes = be->alloc(static_cast<size_t>(nl) * 2);
+    void *mixd = be->alloc(static_cast<size_t>(nmix) * 2);
+    void *res = be->alloc(static_cast<size_t>(nl) * 2);
+    be->upload(xd, xh.data(), xh.size() * 2, 0);
+    be->upload(xnd, xnh.data(), xnh.size() * 2, 0);
+    be->upload(gd, gh.data(), gh.size() * 2, 0);
+    be->upload(bd, bh.data(), bh.size() * 2, 0);
+    be->upload(id, ih.data(), ih.size() * 2, 0);
+
+    auto fetch = [&](const void *src, i64 n) {
+        std::vector<u16> h(static_cast<size_t>(n));
+        be->download(h.data(), src, h.size() * 2);
+        return h;
+    };
+    i64 failed = 0;
+
+    // (1) hc_init: all hc lanes start as copies of the embedding row. A copy,
+    // so bit equality is the bar.
+    {
+        be->hc_init(lanes, xd, nt, hc, ne);
+        const std::vector<u16> got = fetch(lanes, nl);
+        std::vector<f32> want(static_cast<size_t>(nl));
+        for (i64 t = 0; t < nt; t++)
+            for (i64 c = 0; c < hc; c++)
+                for (i64 e = 0; e < ne; e++)
+                    want[static_cast<size_t>((t * hc + c) * ne + e)] =
+                        x[static_cast<size_t>(t * ne + e)];
+        const HcCmp r = cmp_hc_f32(got, want, true, 0.0);
+        print_hc("hc_init", "lanes <- embedding", r);
+        if (!r.ok()) failed++;
+    }
+
+    // (2) hc_mix: mean over lanes of xn * sigmoid(gate). The oracle is
+    // krk::hc_mix, the same function the CPU backend answers with.
+    {
+        be->hc_mix(mixd, xnd, gd, nt, hc, ne);
+        const std::vector<u16> got = fetch(mixd, nmix);
+        std::vector<f32> want(static_cast<size_t>(nmix), 0.0f);
+        krk::hc_mix(want.data(), xn.data(), gate.data(), static_cast<i32>(nt), g);
+        const HcCmp r = cmp_hc_f32(got, want, false, 2e-3);
+        print_hc("hc_mix", "mean(xn*sigmoid(gate))", r);
+        if (!r.ok()) failed++;
+    }
+
+    // (3) hc_combine: res_lane += block_out * 2*sigmoid(inject/hc). The lane
+    // weights are the shared centred rule, so a plain sigmoid here would show.
+    {
+        be->hc_init(res, xd, nt, hc, ne);
+        be->hc_combine(res, bd, id, nt, hc, ne);
+        const std::vector<u16> got = fetch(res, nl);
+        std::vector<f32> want(static_cast<size_t>(nl), 0.0f);
+        for (i64 t = 0; t < nt; t++)
+            for (i64 c = 0; c < hc; c++)
+                for (i64 e = 0; e < ne; e++)
+                    want[static_cast<size_t>((t * hc + c) * ne + e)] =
+                        x[static_cast<size_t>(t * ne + e)];
+        krk::hc_combine(want.data(), block.data(), inject.data(),
+                        static_cast<i32>(nt), g);
+        const HcCmp r = cmp_hc_f32(got, want, false, 2e-3);
+        print_hc("hc_combine", "res += out*2*sigmoid(inj/hc)", r);
+        // The lane weight itself, on the same values: 2*sigmoid(0) is exactly
+        // 1, so an un-injected lane gets the block output once and only once.
+        // Part of this case, not a case of its own.
+        const f32 w0 = krk::hc_lane_weight(0.0f, static_cast<i32>(hc));
+        if (!(w0 == 1.0f)) {
+            std::printf("  %-11s %-22s FAIL w(0) = %.9g, not exactly 1\n",
+                        "hc_combine", "zero injection is identity",
+                        static_cast<f64>(w0));
+        }
+        if (!r.ok() || !(w0 == 1.0f)) failed++;
+    }
+
+    // (4) silu_act: x <- x * sigmoid(x), the mixer's low-rank nonlinearity.
+    {
+        void *sd = be->alloc(static_cast<size_t>(nl) * 2);
+        be->upload(sd, gh.data(), gh.size() * 2, 0);
+        be->silu_act(sd, nl);
+        const std::vector<u16> got = fetch(sd, nl);
+        std::vector<f32> want(static_cast<size_t>(nl));
+        for (i64 i = 0; i < nl; i++) {
+            const f32 v = gate[static_cast<size_t>(i)];
+            want[static_cast<size_t>(i)] = v / (1.0f + std::exp(-v));
+        }
+        const HcCmp r = cmp_hc_f32(got, want, false, 2e-3);
+        print_hc("silu_act", "x*sigmoid(x)", r);
+        if (!r.ok()) failed++;
+        be->release(sd);
+    }
+
+    // (5) The identical-lane invariant, on the device. All hc lanes equal and
+    // the injection exactly zero: every lane weight is 1, so the lanes stay
+    // BIT-identical through a combine, and the mix collapses to
+    // xn * sigmoid(gate) on one lane. This is the property the CPU fixture
+    // pins; a kernel that summed lanes with the wrong stride, or that read the
+    // gate of lane 0 for every lane, fails here and not in the suite.
+    {
+        std::vector<f32> eq_xn(static_cast<size_t>(nl));
+        std::vector<f32> eq_gate(static_cast<size_t>(nl));
+        for (i64 t = 0; t < nt; t++)
+            for (i64 c = 0; c < hc; c++)
+                for (i64 e = 0; e < ne; e++) {
+                    eq_xn[static_cast<size_t>((t * hc + c) * ne + e)] =
+                        xn[static_cast<size_t>(t * ne + e)];
+                    eq_gate[static_cast<size_t>((t * hc + c) * ne + e)] =
+                        gate[static_cast<size_t>(t * ne + e)];
+                }
+        const std::vector<u16> exnh = up(eq_xn), egh = up(eq_gate);
+        std::vector<u16> zero_h(static_cast<size_t>(ninj), 0);
+        be->upload(xnd, exnh.data(), exnh.size() * 2, 0);
+        be->upload(gd, egh.data(), egh.size() * 2, 0);
+        be->upload(id, zero_h.data(), zero_h.size() * 2, 0);
+        be->hc_init(res, xd, nt, hc, ne);
+        be->hc_combine(res, bd, id, nt, hc, ne);
+        const std::vector<u16> got = fetch(res, nl);
+        i64 differ = 0;
+        for (i64 t = 0; t < nt; t++)
+            for (i64 c = 1; c < hc; c++)
+                for (i64 e = 0; e < ne; e++) {
+                    const i64 a = (t * hc) * ne + e;
+                    const i64 b = (t * hc + c) * ne + e;
+                    if (got[static_cast<size_t>(a)] != got[static_cast<size_t>(b)])
+                        differ++;
+                }
+        std::printf("  %-11s %-22s %s", "lanes-equal", "inject 0 keeps lanes",
+                    differ == 0 ? "BIT-IDENTICAL" : "FAIL");
+        if (differ == 0) {
+            std::printf(" (%lld values)\n",
+                        static_cast<long long>(nt * (hc - 1) * ne));
+        } else {
+            std::printf("  %lld/%lld lanes differ\n",
+                        static_cast<long long>(differ),
+                        static_cast<long long>(nt * (hc - 1) * ne));
+            failed++;
+        }
+
+        be->hc_mix(mixd, xnd, gd, nt, hc, ne);
+        const std::vector<u16> mg = fetch(mixd, nmix);
+        std::vector<f32> want(static_cast<size_t>(nmix), 0.0f);
+        krk::hc_mix(want.data(), eq_xn.data(), eq_gate.data(),
+                    static_cast<i32>(nt), g);
+        // One ulp: the kernel sums hc equal terms and divides once, the oracle
+        // does the same, so only the f16 output rounding may differ.
+        std::vector<u16> want_h(want.size());
+        for (size_t i = 0; i < want.size(); i++) want_h[i] = fp32_to_fp16(want[i]);
+        const BitExact r = cmp_half(mg, want_h, nmix);
+        std::printf("  %-11s %-22s %s", "lanes-mix", "collapse == one lane",
+                    r.max_ulp <= 1 ? (r.differ == 0 ? "BIT-IDENTICAL" : "PASS")
+                                   : "FAIL");
+        if (r.max_ulp <= 1)
+            std::printf(" (%lld values, max %lld ulp)\n",
+                        static_cast<long long>(r.n),
+                        static_cast<long long>(r.max_ulp));
+        else {
+            std::printf("  max %lld ulp, %lld values differ\n",
+                        static_cast<long long>(r.max_ulp),
+                        static_cast<long long>(r.differ));
+            failed++;
+        }
+    }
+
+    // (7) ple_gate: the PLE block's per-lane gate, one launch for the whole
+    // block. The output layout is LANE-major on purpose (a lane's column is
+    // contiguous), which is what the gated-value broadcast reads next, so the
+    // oracle writes it that way too. Inputs are scaled down: with full-scale
+    // values the dot product saturates the sigmoid and a kernel that read the
+    // wrong lane would still pass.
+    {
+        const i64 nq = nt * hc * ne;
+        std::vector<f32> key(static_cast<size_t>(nq));
+        std::vector<f32> qry(static_cast<size_t>(nq));
+        const auto r16 = [](f64 v) {
+            return fp16_to_fp32(fp32_to_fp16(static_cast<f32>(v)));
+        };
+        for (i64 i = 0; i < nq; i++)
+            key[static_cast<size_t>(i)] = r16(std::sin(0.011 * i) * 0.1);
+        for (i64 i = 0; i < nq; i++)
+            qry[static_cast<size_t>(i)] = r16(std::cos(0.017 * i) * 0.1);
+        const std::vector<u16> kh = up(key), qh = up(qry);
+        void *kd = be->alloc(static_cast<size_t>(nq) * 2);
+        void *qd = be->alloc(static_cast<size_t>(nq) * 2);
+        void *pgd = be->alloc(static_cast<size_t>(nt * hc) * 2);
+        be->upload(kd, kh.data(), kh.size() * 2, 0);
+        be->upload(qd, qh.data(), qh.size() * 2, 0);
+        be->ple_gate(pgd, kd, qd, nt, hc, ne);
+        const std::vector<u16> got = fetch(pgd, nt * hc);
+        std::vector<f32> want(static_cast<size_t>(nt * hc));
+        const f32 inv = 1.0f / std::sqrt(static_cast<f32>(ne));
+        for (i64 c = 0; c < hc; c++) {
+            for (i64 t = 0; t < nt; t++) {
+                f32 s = 0.0f;
+                for (i64 e = 0; e < ne; e++) {
+                    const i64 k = (t * hc + c) * ne + e;
+                    s += key[static_cast<size_t>(k)] *
+                         qry[static_cast<size_t>(k)];
+                }
+                const f32 sc = s * inv;
+                const f32 mag =
+                    std::sqrt(std::fmax(std::fabs(sc), 1e-6f));
+                const f32 sg = sc > 0.0f ? 1.0f : (sc < 0.0f ? -1.0f : 0.0f);
+                want[static_cast<size_t>(c * nt + t)] =
+                    1.0f / (1.0f + std::exp(-(sg * mag)));
+            }
+        }
+        const HcCmp r = cmp_hc_f32(got, want, false, 2e-3);
+        print_hc("ple_gate", "signed-sqrt sigmoid", r);
+        if (!r.ok()) failed++;
+        be->release(kd);
+        be->release(qd);
+        be->release(pgd);
+    }
+
+    // (8) conv1d_dw: the PLE block's dilated depthwise convolution along the
+    // token axis. `x` carries the history rows in front of this pass's, which
+    // is the whole reason the window is the caller's rather than a ring inside
+    // the kernel.
+    {
+        const i64 ch = 1024, kern = 4, dil = 2;
+        const i64 hist = (kern - 1) * dil; // 6
+        const i64 rows = hist + nt;        // 9
+        const auto r16 = [](f64 v) {
+            return fp16_to_fp32(fp32_to_fp16(static_cast<f32>(v)));
+        };
+        std::vector<f32> xw(static_cast<size_t>(rows * ch));
+        std::vector<f32> w(static_cast<size_t>(kern * ch));
+        for (i64 i = 0; i < rows * ch; i++)
+            xw[static_cast<size_t>(i)] = r16(std::sin(0.0007 * i) * 1.5);
+        for (i64 i = 0; i < kern * ch; i++)
+            w[static_cast<size_t>(i)] = static_cast<f32>(std::cos(0.003 * i) * 0.4);
+        const std::vector<u16> xwh = up(xw);
+        void *xwd = be->alloc(static_cast<size_t>(rows * ch) * 2);
+        void *wdev = be->alloc(static_cast<size_t>(kern * ch) * sizeof(f32));
+        void *cvd = be->alloc(static_cast<size_t>(nt * ch) * 2);
+        be->upload(xwd, xwh.data(), xwh.size() * 2, 0);
+        be->upload(wdev, w.data(), w.size() * sizeof(f32), 0);
+        be->conv1d_dw(cvd, xwd, wdev, nt, ch, kern, dil);
+        const std::vector<u16> got = fetch(cvd, nt * ch);
+        std::vector<f32> want(static_cast<size_t>(nt * ch), 0.0f);
+        for (i64 t = 0; t < nt; t++) {
+            for (i64 c = 0; c < ch; c++) {
+                f32 acc = 0.0f;
+                for (i64 k = 0; k < kern; k++) {
+                    const i64 rr = t + (kern - 1 - k) * dil;
+                    acc += w[static_cast<size_t>(k * ch + c)] *
+                           xw[static_cast<size_t>(rr * ch + c)];
+                }
+                want[static_cast<size_t>(t * ch + c)] = acc;
+            }
+        }
+        const HcCmp r = cmp_hc_f32(got, want, false, 2e-3);
+        print_hc("conv1d_dw", "dilated depthwise", r);
+        if (!r.ok()) failed++;
+
+        // (9) conv-history: the property the op exists for, on device. Three
+        // one-token calls, each handed the six history rows the previous one
+        // would have produced (a slice of the same buffer, so the values are
+        // the f16 ones), must concatenate to the three-token call BIT-for-bit.
+        // That is the chunk invariance of the convolution: a chunked prefill
+        // and a token-at-a-time decode see the same window.
+        void *oned = be->alloc(static_cast<size_t>(ch) * 2);
+        std::vector<u16> joined;
+        joined.reserve(static_cast<size_t>(nt * ch));
+        for (i64 t = 0; t < nt; t++) {
+            const void *slice =
+                reinterpret_cast<const u8 *>(xwd) + static_cast<size_t>(t * ch) * 2;
+            be->conv1d_dw(oned, slice, wdev, 1, ch, kern, dil);
+            const std::vector<u16> one = fetch(oned, ch);
+            joined.insert(joined.end(), one.begin(), one.end());
+        }
+        i64 differ = 0;
+        for (i64 i = 0; i < nt * ch; i++)
+            if (joined[static_cast<size_t>(i)] != got[static_cast<size_t>(i)])
+                differ++;
+        std::printf("  %-11s %-22s %s", "conv-history", "3x1 == 3 rows",
+                    differ == 0 ? "BIT-IDENTICAL" : "FAIL");
+        if (differ == 0) {
+            std::printf(" (%lld values)\n", static_cast<long long>(nt * ch));
+        } else {
+            std::printf("  %lld/%lld differ\n", static_cast<long long>(differ),
+                        static_cast<long long>(nt * ch));
+            failed++;
+        }
+        be->release(xwd);
+        be->release(wdev);
+        be->release(cvd);
+        be->release(oned);
+    }
+
+    // (10) lane_bcast_mul: value[t,e] * g[c*n_tok + t]. The gate is LANE-major
+    // (ple_gate's output layout) and the result is token-major, so a kernel that
+    // read the gate token-major would pass a symmetric input and fail this one:
+    // the two layouts agree only at n_tok == hc.
+    {
+        const i64 nv = nt * ne;
+        const auto r16 = [](f64 v) {
+            return fp16_to_fp32(fp32_to_fp16(static_cast<f32>(v)));
+        };
+        std::vector<f32> val(static_cast<size_t>(nv));
+        std::vector<f32> gatev(static_cast<size_t>(nt * hc));
+        for (i64 i = 0; i < nv; i++)
+            val[static_cast<size_t>(i)] = r16(std::sin(0.009 * i) * 1.5);
+        for (i64 i = 0; i < nt * hc; i++)
+            gatev[static_cast<size_t>(i)] = r16(std::cos(0.03 * i));
+        const std::vector<u16> vh = up(val), gvh = up(gatev);
+        void *lbv = be->alloc(static_cast<size_t>(nv) * 2);
+        void *lbg = be->alloc(static_cast<size_t>(nt * hc) * 2);
+        void *lbo = be->alloc(static_cast<size_t>(nv * hc) * 2);
+        be->upload(lbv, vh.data(), vh.size() * 2, 0);
+        be->upload(lbg, gvh.data(), gvh.size() * 2, 0);
+        be->lane_bcast_mul(lbo, lbv, lbg, nt, hc, ne);
+        const std::vector<u16> got = fetch(lbo, nv * hc);
+        std::vector<f32> want(static_cast<size_t>(nv * hc), 0.0f);
+        for (i64 t = 0; t < nt; t++)
+            for (i64 c = 0; c < hc; c++)
+                for (i64 e = 0; e < ne; e++)
+                    want[static_cast<size_t>((t * hc + c) * ne + e)] =
+                        val[static_cast<size_t>(t * ne + e)] *
+                        gatev[static_cast<size_t>(c * nt + t)];
+        const HcCmp r = cmp_hc_f32(got, want, false, 2e-3);
+        print_hc("lane_bcast", "value[t,e]*g[c,t]", r);
+        if (!r.ok()) failed++;
+        be->release(lbv);
+        be->release(lbg);
+        be->release(lbo);
+    }
+
+    be->release(xd);
+    be->release(xnd);
+    be->release(gd);
+    be->release(bd);
+    be->release(id);
+    be->release(lanes);
+    be->release(mixd);
+    be->release(res);
+    std::printf("  hc: %lld of 10 cases%s\n", static_cast<long long>(10 - failed),
+                failed == 0 ? " identical" : " failed");
+    return failed;
+}
+
 } // namespace
+
+// ---------------------------------------------------------------------------
+// The device dispatch table (KRK_DEV_PTR=1), against the per-expert path.
+//
+// A real model is the wrong instrument for this: the table is only published
+// when the WHOLE routed set is device-resident, which on this box means a model
+// small enough that the cache never has to evict -- so "the arm ran on the 12B"
+// is a fact about one card's free VRAM, not about the kernel. Here the bank is
+// synthetic, its residency is a fact by construction, and the reference is the
+// exact sequence the engine's per-expert loop issues: gemm(gate), gemm(up),
+// silu_mul at the row length with its row scale, gemm(down), and an f16-rounded
+// weighted add per expert in EXPERT-ASCENDING order.
+//
+// Two checks per case, because they fail differently:
+//   * `values` -- every element finite, and within the f16 output tolerance of
+//     the reference. Bits are reported (a case can be IDENTICAL, and the k=1
+//     cases are expected to be), but the gate does not require them: a token
+//     with two experts sums in slot order here and expert order there.
+//   * `indirection` -- the same call with two table entries swapped must CHANGE
+//     the answer. A kernel that ignored the table and read expert 0 three times
+//     would pass `values` on a one-expert case and look perfect; this is the
+//     arm that fails when the indirection is fake.
+struct MoeCase {
+    const char *tag;
+    DType t;
+    i64 n_embd;
+    i64 n_ff;
+    i32 n_expert;
+    i32 k;
+    i64 n_tok;
+    // Every slot selects the SAME expert. Two experts summing is order
+    // sensitive in f16, so a disagreement there says nothing about the
+    // per-slot arithmetic; this case isolates it.
+    bool same = false;
+};
+
+// MoE-case weights: `weights()` with a smaller block scale.
+//
+// The shared helper budgets for a GEMV that stops at one projection (a dot over
+// 4096 terms of 0.02 * 15 * x stays well inside f16). An expert runs TWO
+// projections and a silu product in between, so the up result is ~4 orders
+// larger and the product leaves f16 -- both the kernel and the reference then
+// compute inf, agree bit-for-bit, and the case proves nothing about either.
+// Measured: the q4_k cases came out "diff=0 nan=4096 of 4096", which is a
+// harness that produced no finite number to compare.
+// `salt` matters more than it looks: `weights()` restarts its RNG at a fixed
+// seed every call, so EVERY matrix of the same shape came out identical -- and
+// an indirection control that swaps two identical matrices reports "no change"
+// no matter how correct the kernel is. That is how this arm first reported
+// NOT PROVEN on every case with a kernel that was in fact bit-identical to the
+// reference.
+std::vector<u8> moe_weights(DType t, size_t row_bytes, i64 n_out, u32 salt) {
+    std::vector<u8> w(row_bytes * static_cast<size_t>(n_out));
+    u32 rng = 0x1234567u ^ (salt * 2654435761u);
+    for (u8 &b : w) {
+        rng = rng * 1103515245u + 12345u;
+        b = static_cast<u8>(rng >> 16);
+    }
+    if (t == DType::F16) {
+        for (size_t i = 0; i + 1 < w.size(); i += 2) {
+            const f32 v = static_cast<f32>(static_cast<int>(w[i] & 0x1f)) - 16.0f;
+            const u16 h = fp32_to_fp16(v * 0.001f * static_cast<f32>(1 + (salt & 3)));
+            w[i] = static_cast<u8>(h & 0xff);
+            w[i + 1] = static_cast<u8>(h >> 8);
+        }
+        return w;
+    }
+    const size_t blk = static_cast<size_t>(dtype_block_bytes(t));
+    const i64 blocks = static_cast<i64>(row_bytes / blk);
+    for (i64 r = 0; r < n_out; r++) {
+        u8 *row = w.data() + static_cast<size_t>(r) * row_bytes;
+        for (i64 b = 0; b < blocks; b++) {
+            u8 *p = row + static_cast<size_t>(b) * blk;
+            switch (t) {
+            case DType::Q6_K:
+                // Q6_K's per-block scales are signed int8 (up to 127) against
+                // Q4_K's 6-bit (up to 63), and its dot sums 64 chunks, so the
+                // same header scale leaves the silu product four orders higher
+                // -- measured as equal NaN counts on both sides, which is a
+                // harness with nothing finite to compare.
+                put_half(p + blk - 2, 0.0002f);
+                break;
+            case DType::Q4_K:
+            case DType::Q5_K:
+                put_half(p, 0.003f);
+                put_half(p + 2, 0.0f);
+                break;
+            default:
+                put_half(p, 0.003f);
+                break;
+            }
+        }
+    }
+    return w;
+}
+
+i64 arm_moe_dispatch(Backend *be) {
+    const MoeCase cases[] = {
+        {"k=1 q4_k", DType::Q4_K, 2048, 1024, 4, 1, 2},
+        {"k=2 same", DType::Q4_K, 2048, 1024, 4, 2, 1, true},
+        {"k=2 q4_k", DType::Q4_K, 2048, 1024, 4, 2, 2},
+        {"k=4 q8_0", DType::Q8_0, 2048, 1024, 8, 4, 3},
+        {"k=2 q6_k", DType::Q6_K, 2048, 1024, 3, 2, 1},
+        {"k=2 f16", DType::F16, 1024, 512, 2, 2, 2},
+        // The shape the models actually run: 4096-wide activations and a
+        // 14336-wide expert FFN, which is 45 KiB of shared memory and is the
+        // reason the launch checks that bound instead of assuming it.
+        {"decode q4_k", DType::Q4_K, 4096, 14336, 2, 2, 1},
+    };
+    std::printf("\ndevice expert dispatch (table indirection against the "
+                "per-expert path):\n");
+    i64 failures = 0;
+    for (const MoeCase &c : cases) {
+        const size_t g_row = dtype_row_bytes(c.t, c.n_embd);
+        const size_t d_row = dtype_row_bytes(c.t, c.n_ff);
+        const i64 ne = c.n_expert;
+        std::vector<std::vector<u8>> wg(static_cast<size_t>(ne)),
+            wu(static_cast<size_t>(ne)), wd(static_cast<size_t>(ne));
+        std::vector<void *> pg(static_cast<size_t>(ne)), pu(static_cast<size_t>(ne)),
+            pd(static_cast<size_t>(ne));
+        std::vector<MoeDispatchEntry> table(static_cast<size_t>(ne));
+        for (i64 e = 0; e < ne; e++) {
+            wg[static_cast<size_t>(e)] =
+                moe_weights(c.t, g_row, c.n_ff, static_cast<u32>(e) * 3u + 1u);
+            wu[static_cast<size_t>(e)] =
+                moe_weights(c.t, g_row, c.n_ff, static_cast<u32>(e) * 3u + 2u);
+            wd[static_cast<size_t>(e)] =
+                moe_weights(c.t, d_row, c.n_embd, static_cast<u32>(e) * 3u + 3u);
+            pg[static_cast<size_t>(e)] = be->alloc(wg[static_cast<size_t>(e)].size());
+            pu[static_cast<size_t>(e)] = be->alloc(wu[static_cast<size_t>(e)].size());
+            pd[static_cast<size_t>(e)] = be->alloc(wd[static_cast<size_t>(e)].size());
+            be->upload(pg[static_cast<size_t>(e)], wg[static_cast<size_t>(e)].data(),
+                       wg[static_cast<size_t>(e)].size(), 0);
+            be->upload(pu[static_cast<size_t>(e)], wu[static_cast<size_t>(e)].data(),
+                       wu[static_cast<size_t>(e)].size(), 0);
+            be->upload(pd[static_cast<size_t>(e)], wd[static_cast<size_t>(e)].data(),
+                       wd[static_cast<size_t>(e)].size(), 0);
+            MoeDispatchEntry &d = table[static_cast<size_t>(e)];
+            d.p[kMoeGate] = pg[static_cast<size_t>(e)];
+            d.p[kMoeUp] = pu[static_cast<size_t>(e)];
+            d.p[kMoeDown] = pd[static_cast<size_t>(e)];
+            d.n_out[kMoeGate] = c.n_ff;
+            d.n_out[kMoeUp] = c.n_ff;
+            d.n_out[kMoeDown] = c.n_embd;
+            d.n_in[kMoeGate] = c.n_embd;
+            d.n_in[kMoeUp] = c.n_embd;
+            d.n_in[kMoeDown] = c.n_ff;
+            d.row_bytes[kMoeGate] = static_cast<std::int64_t>(g_row);
+            d.row_bytes[kMoeUp] = static_cast<std::int64_t>(g_row);
+            d.row_bytes[kMoeDown] = static_cast<std::int64_t>(d_row);
+            d.type[kMoeGate] = static_cast<std::int32_t>(c.t);
+            d.type[kMoeUp] = static_cast<std::int32_t>(c.t);
+            d.type[kMoeDown] = static_cast<std::int32_t>(c.t);
+            d.present[kMoeGate] = d.present[kMoeUp] = d.present[kMoeDown] = 1;
+        }
+        void *table_d = be->alloc(table.size() * sizeof(MoeDispatchEntry));
+        be->upload(table_d, table.data(), table.size() * sizeof(MoeDispatchEntry), 0);
+
+        std::vector<u16> x(static_cast<size_t>(c.n_tok) * static_cast<size_t>(c.n_embd));
+        u32 rng = 987654321u;
+        std::vector<f32> xf(x.size());
+        for (f32 &v : xf) {
+            rng = rng * 1103515245u + 12345u;
+            v = (static_cast<f32>((rng >> 20) & 0xff) / 255.0f - 0.5f) * 0.5f;
+        }
+        for (size_t i = 0; i < xf.size(); i++) x[i] = fp32_to_fp16(xf[i]);
+        void *xn_d = be->alloc(x.size() * 2);
+        be->upload(xn_d, x.data(), x.size() * 2, 0);
+
+        std::vector<i32> ids(static_cast<size_t>(c.n_tok) * static_cast<size_t>(c.k));
+        std::vector<f32> wts(ids.size(), 0.0f);
+        for (i64 t = 0; t < c.n_tok; t++)
+            for (i32 s = 0; s < c.k; s++) {
+                ids[static_cast<size_t>(t * c.k + s)] =
+                    c.same ? static_cast<i32>(t % ne)
+                           : static_cast<i32>((t + s) % ne);
+                // Half the weight on the first slot and an even split otherwise,
+                // so a kernel that dropped the weights entirely would show up as
+                // a scale on every element instead of only on a tie.
+                wts[static_cast<size_t>(t * c.k + s)] =
+                    c.k == 1 ? 1.0f : (s == 0 ? 0.6f : 0.4f / static_cast<f32>(c.k - 1));
+            }
+        void *ids_d = be->alloc(ids.size() * sizeof(i32));
+        void *wts_d = be->alloc(wts.size() * sizeof(f32));
+        be->upload(ids_d, ids.data(), ids.size() * sizeof(i32), 0);
+        be->upload(wts_d, wts.data(), wts.size() * sizeof(f32), 0);
+
+        // ---- reference: the per-expert loop's own sequence ------------------
+        void *g_d = be->alloc(static_cast<size_t>(c.n_ff) * 2);
+        void *u_d = be->alloc(static_cast<size_t>(c.n_ff) * 2);
+        void *a_d = be->alloc(static_cast<size_t>(c.n_ff) * 2);
+        void *o_d = be->alloc(static_cast<size_t>(c.n_embd) * 2);
+        void *sc_d = be->alloc(sizeof(f32));
+        std::vector<u16> ref(x.size(), 0);
+        // One download buffer for both ends of the reference: the down
+        // projection's output is n_embd wide and the row scale's copy is n_ff,
+        // so it is sized for the larger. Sizing it n_ff overwrote the heap on
+        // every case where the model is wider than its expert FFN, which is all
+        // of them here.
+        std::vector<u16> gv(static_cast<size_t>(std::max(c.n_ff, c.n_embd)));
+        for (i64 e = 0; e < ne; e++) {
+            for (i64 t = 0; t < c.n_tok; t++) {
+                for (i32 s = 0; s < c.k; s++) {
+                    if (ids[static_cast<size_t>(t * c.k + s)] != e) continue;
+                    const f32 alpha = wts[static_cast<size_t>(t * c.k + s)];
+                    // The kernel's own op order (scale, then alpha, then add),
+                    // so the comparison tests the path and not the compiler's
+                    // freedom to contract a multiply into an add.
+
+                    const void *xrow = static_cast<const u8 *>(xn_d) +
+                                       static_cast<size_t>(t) *
+                                           static_cast<size_t>(c.n_embd) * 2;
+                    be->gemm(g_d, xrow, pg[static_cast<size_t>(e)], c.t, c.n_ff,
+                             c.n_embd, 1);
+                    be->gemm(u_d, xrow, pu[static_cast<size_t>(e)], c.t, c.n_ff,
+                             c.n_embd, 1);
+                    be->silu_mul(a_d, g_d, u_d, c.n_ff, c.n_ff,
+                                 static_cast<f32 *>(sc_d));
+                    be->gemm(o_d, a_d, pd[static_cast<size_t>(e)], c.t, c.n_embd,
+                             c.n_ff, 1);
+                    be->download(gv.data(), o_d, static_cast<size_t>(c.n_embd) * 2);
+                    f32 scale = 1.0f;
+                    be->download(&scale, sc_d, sizeof(f32));
+                    for (i64 j = 0; j < c.n_embd; j++) {
+                        const f32 v = fp16_to_fp32(gv[static_cast<size_t>(j)]);
+                        const f32 vs = v * scale;
+                        const f32 w = alpha * vs;
+                        const f32 cur =
+                            fp16_to_fp32(ref[static_cast<size_t>(t * c.n_embd + j)]);
+                        ref[static_cast<size_t>(t * c.n_embd + j)] =
+                            fp32_to_fp16(cur + w);
+                    }
+                }
+            }
+        }
+
+        // ---- the kernel ----------------------------------------------------
+        void *out_d = be->alloc(x.size() * 2);
+        be->moe_dispatch(table_d, 0, ne, ids_d, wts_d, xn_d, out_d, c.n_tok,
+                         c.n_embd, c.n_ff, c.k);
+        be->sync();
+        std::vector<u16> got(x.size());
+        be->download(got.data(), out_d, got.size() * 2);
+
+        i64 diff = 0, nan = 0, inf = 0, over = 0;
+        i64 nan_k = 0, nan_r = 0;
+        f64 worst = 0.0;
+        i64 first = -1;
+        f64 sum_sq = 0.0;
+        for (size_t i = 0; i < got.size(); i++) {
+            const f32 a = fp16_to_fp32(got[i]);
+            sum_sq += static_cast<f64>(a) * static_cast<f64>(a);
+        }
+        const f64 rms = std::sqrt(sum_sq / static_cast<f64>(got.size()) + 1e-30);
+        for (size_t i = 0; i < got.size(); i++) {
+            const f32 a = fp16_to_fp32(got[i]);
+            const f32 b = fp16_to_fp32(ref[i]);
+            if (!std::isfinite(a) || !std::isfinite(b)) {
+                if (!std::isfinite(a)) nan_k++;
+                if (!std::isfinite(b)) nan_r++;
+                if (!std::isfinite(a) && !std::isfinite(b)) nan++;
+                else inf++;
+                continue;
+            }
+            if (got[i] != ref[i]) {
+                diff++;
+                if (first < 0) first = static_cast<i64>(i);
+            }
+            const f64 rel = std::fabs(static_cast<f64>(a) - static_cast<f64>(b)) / rms;
+            if (rel > worst) worst = rel;
+            if (rel > 4e-3) over++;
+        }
+        const bool values_ok = nan == 0 && inf == 0 && over == 0;
+        if (first >= 0)
+            std::printf("  %-11s first difference at %lld: kernel=%.6g ref=%.6g "
+                        "(nan kernel=%lld ref=%lld)\n",
+                        "", static_cast<long long>(first),
+                        static_cast<f64>(fp16_to_fp32(got[static_cast<size_t>(first)])),
+                        static_cast<f64>(fp16_to_fp32(ref[static_cast<size_t>(first)])),
+                        static_cast<long long>(nan_k), static_cast<long long>(nan_r));
+
+        // ---- the indirection control --------------------------------------
+        // Swap two entries that this case actually selects, re-run, and require
+        // a different answer. Picking them from `ids` is the point: swapping two
+        // unselected experts would prove nothing about what the kernel read.
+        // Swapping a selected expert's GATE and UP pointers is the control that
+        // always exists: silu(gate) * up is not symmetric in its two operands, so
+        // a kernel that ignores the table cannot pass it even with k=1. (The
+        // first version swapped two EXPERTS, which a one-expert selection has no
+        // second of -- it reported NOT PROVEN for every single-expert case, which
+        // is exactly the "control that cannot fail" this box keeps rediscovering.)
+        i64 a_e = ids[0];
+        bool moved = false;
+        {
+            MoeDispatchEntry &a = table[static_cast<size_t>(a_e)];
+            std::swap(a.p[kMoeGate], a.p[kMoeUp]);
+            std::swap(a.type[kMoeGate], a.type[kMoeUp]);
+            std::swap(a.row_bytes[kMoeGate], a.row_bytes[kMoeUp]);
+            be->upload(table_d, table.data(), table.size() * sizeof(MoeDispatchEntry), 0);
+            // Drain before reading it back through the kernel: `upload` may hand
+            // the bytes to the pool's staging path, which publishes on its own
+            // stream. In the engine the table is published once at init and every
+            // use is layers later, so this ordering never bites there; here the
+            // dispatch is the very next launch, and without the drain the control
+            // read the OLD table and reported "indirection NOT PROVEN" for every
+            // case -- a false negative that looks exactly like a dead kernel.
+            be->sync();
+            // A marker the second dispatch must overwrite: without it a dispatch
+            // that silently declined to run leaves the FIRST output in the
+            // buffer, and the control reports "the indirection changed nothing"
+            // when the truth is "nothing ran".
+            be->fill0(out_d, x.size() * 2);
+            be->moe_dispatch(table_d, 0, ne, ids_d, wts_d, xn_d, out_d, c.n_tok,
+                             c.n_embd, c.n_ff, c.k);
+            std::vector<u16> alt(x.size());
+            be->download(alt.data(), out_d, alt.size() * 2);
+            for (size_t i = 0; i < alt.size(); i++)
+                if (alt[i] != got[i]) { moved = true; break; }
+            std::swap(a.p[kMoeGate], a.p[kMoeUp]);
+            std::swap(a.type[kMoeGate], a.type[kMoeUp]);
+            std::swap(a.row_bytes[kMoeGate], a.row_bytes[kMoeUp]);
+        }
+
+        std::printf("  %-11s %-5s embd=%-5lld ff=%-6lld experts=%-2lld k=%d "
+                    "tokens=%lld  %s  worst=%.2e  indirection=%s\n",
+                    c.tag, dtype_tag(c.t), static_cast<long long>(c.n_embd),
+                    static_cast<long long>(c.n_ff), static_cast<long long>(ne),
+                    static_cast<int>(c.k), static_cast<long long>(c.n_tok),
+                    diff == 0 ? "IDENTICAL" : "differs", worst,
+                    moved ? "ok" : "NOT PROVEN");
+        if (diff) {
+            std::printf("  %-11s %lld of %zu element(s) differ from the "
+                        "per-expert path (f16 store rounding, reported not "
+                        "gated)\n",
+                        "", static_cast<long long>(diff), got.size());
+        }
+        if (!values_ok) {
+            std::printf("  %-11s FAIL values: not-finite kernel=%lld ref=%lld "
+                        "over-tolerance=%lld worst=%.3e\n",
+                        "", static_cast<long long>(nan),
+                        static_cast<long long>(inf), static_cast<long long>(over),
+                        worst);
+            ++failures;
+        }
+        if (!moved) {
+            std::printf("  %-11s FAIL indirection: swapping the selected "
+                        "expert's gate and up matrices did not change the output\n",
+                        "");
+            ++failures;
+        }
+
+        be->release(table_d);
+        be->release(xn_d);
+        be->release(ids_d);
+        be->release(wts_d);
+        be->release(out_d);
+        be->release(g_d);
+        be->release(u_d);
+        be->release(a_d);
+        be->release(o_d);
+        be->release(sc_d);
+        for (i64 e = 0; e < ne; e++) {
+            be->release(pg[static_cast<size_t>(e)]);
+            be->release(pu[static_cast<size_t>(e)]);
+            be->release(pd[static_cast<size_t>(e)]);
+        }
+    }
+    std::printf("  %lld of %zu case(s) failed\n", static_cast<long long>(failures),
+                sizeof(cases) / sizeof(cases[0]));
+    return failures;
+}
 
 int main(int argc, char **argv) {
     int iters = 100;
@@ -1781,8 +2880,13 @@ int main(int argc, char **argv) {
     bool sweep = false;
     bool gate = false;
     bool bitexact = false;
+    bool hc_test = false;
+    bool moe_table_test = false;
     bool floor = false;
     bool h2d = false;
+    bool h2d_noise_arm = false;
+    size_t h2d_noise_mib = 0;
+    bool h2d_cache = false;
     i64 failures = 0;
     Shape one{"one", DType::Q4_K, 4096, 4096, 1};
     for (int i = 1; i < argc; i++) {
@@ -1796,8 +2900,19 @@ int main(int argc, char **argv) {
         else if (a == "--sweep") sweep = true;
         else if (a == "--gate") gate = true;
         else if (a == "--bitexact") bitexact = true;
+        else if (a == "--hc") hc_test = true;
+        else if (a == "--moe-dispatch") moe_table_test = true;
         else if (a == "--floor") floor = true;
         else if (a == "--h2d") h2d = true;
+        else if (a == "--h2d-noise") {
+            h2d_noise_arm = true;
+            // Optional size in MiB, so each size can be measured in a fresh
+            // process: the cold driver state is otherwise always charged to
+            // whichever size ran first.
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                h2d_noise_mib = static_cast<size_t>(std::atoll(argv[++i]));
+        }
+        else if (a == "--h2d-cache") h2d_cache = true;
         else if (a.rfind("--dtype", 0) == 0) {
             const std::string d = argv[++i];
             one.t = d == "f16"    ? DType::F16
@@ -1817,6 +2932,11 @@ int main(int argc, char **argv) {
     // read the timing at all.
     if (gate) iters = 2;
 
+    // Before the backend the rest of the tool insists on: the cache is a file,
+    // and listing it must work even when the card will not open (that arm opens
+    // its own device, best effort, and says so if it cannot).
+    if (h2d_cache) return h2d_cache_list();
+
     std::string err;
     Backend *be = make_hip_backend(0, &err);
     if (!be) {
@@ -1825,6 +2945,7 @@ int main(int argc, char **argv) {
     }
     std::printf("device: %s\n\n", be->describe().c_str());
     if (h2d) return h2d_bench(be, iters);
+    if (h2d_noise_arm) return h2d_noise(be, h2d_noise_mib);
 
     // Launch floor: a real kernel with trivial work, same measurement method.
     {
@@ -1895,6 +3016,14 @@ int main(int argc, char **argv) {
     }
 
     if (bitexact) failures += arm_rows_bitexact(be);
+
+    // Device-only, so it is its own flag rather than part of --gate: the gate
+    // must stay runnable on a box where the device is busy.
+    if (hc_test) failures += arm_hc(be);
+
+    // The device dispatch table. Its own flag like --hc for the same reason: it
+    // is a device arm, and the gate has to stay runnable on a busy box.
+    if (moe_table_test) failures += arm_moe_dispatch(be);
 
     if (gate || sweep) {
         std::printf("\nexpert-lease (device):\n");

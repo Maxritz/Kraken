@@ -59,11 +59,15 @@
 #ifndef KRK_EXPERT_CACHE_HPP
 #define KRK_EXPERT_CACHE_HPP
 
+#include <algorithm>
 #include <list>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "krk/backend.hpp"
 #include "krk/gguf.hpp"
+#include "krk/moe_table.hpp"
 #include "krk/quant.hpp"
 
 namespace krk {
@@ -197,6 +201,45 @@ public:
     // normal policy instead of thrashing a pin it cannot defend. Pins are never
     // evicted while the budget holds them.
     size_t pin_layer(const ExpertSource &src, i32 layer, std::string *why);
+
+    // ---- the PIN RING: the hot set in VRAM, outside the pool's byte budget ---
+    //
+    // A pin already stops eviction, but until now a pinned expert still spent
+    // the pool's budget: `bytes_` counted it, so every pin shrank the LRU
+    // window by its own size. At a budget the routed set does not fit that is
+    // the whole problem -- Tiel-Coder-35B-A3B routes 22.1 GiB and the pool is
+    // 12-13 GiB, so the pinned prefix ends up being most of the pool and the
+    // traffic that is still *earning* residency thrashes in the remainder.
+    //
+    // The second ring is that separation: pinned bytes are charged to
+    // `pin_budget_` and not to `budget_`, so the LRU window keeps its full
+    // size for the experts that traffic still has to prove. It is one physical
+    // card, so `pin_budget_` is a real cap -- admit_hot() stops at it rather
+    // than overcommitting VRAM.
+    // Re-derives the pool's byte budget from a LIVE free-VRAM reading: the
+    // resident unpinned footprint plus whatever is free beside `floor_bytes`.
+    // Only ever lowers, because a budget raised past what init measured is how
+    // the pool grows into the card and turns every alloc into a driver
+    // eviction; growth belongs to the ring, which names what it is for.
+    // Returns the budget in force afterwards, so a caller can log the change.
+    size_t reclamp_vram_budget(size_t free_bytes, size_t floor_bytes);
+    void set_pin_budget(size_t bytes);
+    size_t pin_budget() const { return pin_budget_; }
+    size_t pin_used_bytes() const { return pin_bytes_; }
+    // Admits the ranked prefix of `order` (hottest first) into the ring in one
+    // pass, pinning each expert as it lands. This is the HOT half of a warmup:
+    // WARM costs a file read and holds tens of GiB, VRAM holds the few
+    // hundred MiB/ few GiB that the index says serve most tokens, and only the
+    // ring makes those a guaranteed hit instead of a promotion race with the
+    // rest of the layer's routing.
+    //
+    // Stops at the ring's byte cap, at a source that cannot be read, or after
+    // `max_experts` admissions (0 = no limit). `src_of` maps a layer index to
+    // its expert tensors; a null entry skips that layer (a dense one). Returns
+    // how many experts this newly made resident-and-pinned.
+    size_t admit_hot(const ExpertSource *const *src_of, i32 n_layer,
+                     const std::vector<std::pair<i32, i32>> &order,
+                     size_t max_experts = 0);
     // One expert, so the caller can choose the order: expert-major across
     // layers when the tier is smaller than the corpus.
     size_t preload_one(const ExpertSource &src, i32 layer, i32 expert);
@@ -237,6 +280,21 @@ public:
     // `lookahead_rejected()` and skipped, and a failed promotion is a miss, not
     // an error. Returns how many experts this promoted.
     size_t stage_batch(const ExpertSource &src, i32 layer, const i32 *experts, int n);
+    // The same advisory staging for a WARM set, but the copies are issued as ONE
+    // upload per source kind instead of one call per expert: a batch shares one
+    // staging-ring cursor, so slice N+1 stages while slice N is in flight, and
+    // the default stream is published once instead of 3k times. Room-making and
+    // the cell allocations stay per expert (each slot has its own size class).
+    // Returns the number of experts promoted.
+    size_t promote_batch(const ExpertSource &src, i32 layer, const i32 *experts,
+                         int n);
+    // Stage `experts` of `layer` even when the byte budget is full, by retiring
+    // slots the caller has finished with. Used one layer ahead: the fetch is
+    // issued after this layer's expert loop, so it runs under the next layer's
+    // mixer instead of in front of its own GEMMs. `leased` guards every slot the
+    // pass touches, so the eviction walk cannot take back what it just staged.
+    size_t stage_ahead(const ExpertSource &src, i32 layer, const i32 *experts,
+                       int n);
     u64 lookahead_staged() const { return lookahead_staged_; }
     u64 lookahead_rejected() const { return lookahead_rejected_; }
     u64 active_staged() const { return active_staged_; }
@@ -255,6 +313,17 @@ public:
     // cost instead of a sequence of A/B arms.
     f64 read_ms() const { return read_ms_; }   // read_host / mapping memcpy
     f64 room_ms() const { return room_ms_; }   // make_vram_room: evict + retire
+    // The two halves of the room row: the victim search (a scan of the slot
+    // map) and the release of the cells it picked. They have different fixes,
+    // and on a 14k-slot tier the scan is not obviously the cheap half.
+    f64 scan_ms() const { return scan_ms_; }
+    f64 retire_ms() const { return retire_ms_; }
+    // Victim scans issued and slot visits they cost, so a windowed pick can
+    // be compared against the global one on work done, not only on ms.
+    u64 scans() const { return scans_; }
+    size_t vram_index_keys() const { return vram_keys_.size(); }
+    size_t vram_index_resident() const { return vram_slots_; }
+    u64 scan_visits() const { return scan_visits_; }
     f64 alloc_ms() const { return alloc_ms_; } // alloc_pooled: pool wait or malloc
     f64 xfer_ms() const { return xfer_ms_; }   // upload_paged_batch, host wait in
 
@@ -306,6 +375,7 @@ public:
     // use; the host_* spellings are kept for existing callers.
     size_t warm_capacity_bytes() const { return host_budget_; }
     size_t warm_pinned_bytes() const { return host_pinned_bytes_; }
+    size_t host_pin_budget() const { return host_pin_bytes_; }
     size_t warm_pin_budget_bytes() const { return host_pin_bytes_; }
     size_t warm_used_bytes() const { return host_bytes_; }
     size_t warm_slots() const;
@@ -334,6 +404,10 @@ public:
     u64 cold_misses() const { return loads_; }
     u64 demotions() const { return demotions_; }
     u64 promotions() const { return promotions_; }
+    // Batched-promotion evidence: how many batch calls were issued and
+    // how many experts they carried, so a report can show the shape.
+    u64 promote_batches() const { return promote_batches_; }
+    u64 promote_batch_experts() const { return promote_batch_experts_; }
     // Lifetime acquire count (hits + loads) since the last clear().
     u64 acquires() const { return total_acquires_; }
     // Bytes that crossed a boundary, which is the traffic a residency policy
@@ -406,6 +480,35 @@ public:
     // could hold the entire set stayed cold forever.
     bool full_for(const ExpertSource &src) const;
 
+    // ---- the DEVICE DISPATCH TABLE -----------------------------------------
+    //
+    // A dense `[n_layer * n_expert]` array of {three device pointers, their
+    // shapes, their types} on the device, so an expert's GEMMs can be issued
+    // from a kernel that reads the ids itself. Today the host scans the router
+    // probabilities for the top-k and calls acquire() per expert to learn where
+    // the matrices are, which is what puts a host round trip in the middle of
+    // every MoE layer (measured: 0.523 ms/layer, 85% of it waiting for the
+    // layer's own GPU work to retire, on Mellum2.1).
+    //
+    // The table is a promise about RESIDENCY, so it is only published when that
+    // promise can be kept: `whole_set_resident` must hold, i.e. every
+    // (layer, expert) of the corpus is in VRAM. Then no promotion and no
+    // eviction can rewrite a pointer underneath the kernel. Anything else
+    // publishes nothing and the caller keeps the host path -- a half-valid
+    // table would be a wrong answer, not a slow one.
+    bool whole_set_resident(i32 n_layer, i32 n_expert) const;
+    // Builds and uploads the table; nullptr (with `why` filled) when the
+    // residency promise does not hold or the allocator refuses. Re-publishing
+    // releases the previous buffer, and *published_out is the number of entries
+    // that carried all three matrices (a gate-less expert contributes two).
+    void *publish_dispatch_table(i32 n_layer, i32 n_expert, i32 *published_out,
+                                 std::string *why);
+    const void *dispatch_table() const { return table_; }
+    // A promotion or an eviction rewrote a pointer after the publish, so the
+    // callers that already hold a table pointer must stop using it.
+    bool dispatch_table_stale() const { return table_stale_; }
+    void release_dispatch_table();
+
 private:
     struct Slot {
         i32 layer = -1;
@@ -443,6 +546,9 @@ private:
         // the device reported 15.92 GiB in use with 0 evictions.
         bool in_vram() const { return m.up.present() && m.down.present(); }
         bool in_host() const { return h.up.present() && h.down.present(); }
+        // Position in vram_keys_, or -1. A resident vector is what keeps the
+        // victim search off the 14k-entry slot map: see pick_victim.
+        i64 vram_idx = -1;
     };
 
     // One acquire on a resident slot: counters earn pins, pins are never free.
@@ -463,7 +569,10 @@ private:
     // except for an expert that cannot fit the entire tier.
     bool warm_admit(const ExpertSource &src, i32 expert, Slot &s);
     // Host -> device. Makes VRAM room first, so it can evict like any miss.
-    bool promote_to_vram(Slot &s, bool staged = false);
+    // `prefetch` takes the pinned DMA ticket and leaves the default stream
+    // unblocked (see Backend::upload_expert_prefetch); `staged` is the ring's
+    // host-copy ticket. Promotion is the same arithmetic either way.
+    bool promote_to_vram(Slot &s, bool staged = false, bool prefetch = false);
     void finish_stage(Slot &s);
     // Evicts until one more slot of `need` bytes fits. Bytes are the test, not a
     // slot count: experts are not all one size, so counting slots against a
@@ -477,12 +586,38 @@ private:
     // not the next layer's, and budget_ / one_layer_expert is neither the memory
     // limit nor a count that holds the whole set.
     bool over_budget(size_t need) const {
+        // The pool's byte test excludes the ring ONLY when a ring is
+        // configured (set_pin_budget). With no ring every pinned expert still
+        // spends the pool's budget, which is the old behaviour the policy tests
+        // pin: a pin ranks victims, it never overrides the physical limit.
+        // (No std::min here: <Windows.h>'s min macro has broken this header's
+        // neighbours before, so the comparison is written out.)
+        size_t held = 0;
+        size_t ring_slots = 0;
+        if (pin_budget_ > 0) {
+            held = pin_bytes_ < bytes_ ? pin_bytes_ : bytes_;
+            ring_slots = pin_slots_ < vram_slots_ ? pin_slots_ : vram_slots_;
+        }
+        const size_t pool = bytes_ - held;
+        const size_t pool_slots = vram_slots_ - ring_slots;
         // A request with no bytes still takes a slot, so it falls back to the
         // count rule: unbounded residency for a degenerate source would grow the
         // slot map without limit.
-        if (need == 0) return capacity_ > 0 && vram_slots_ >= capacity_;
-        return bytes_ + need > budget_ ||
-               (slot_budget_ > 0 && vram_slots_ >= slot_budget_);
+        if (need == 0) return capacity_ > 0 && pool_slots >= capacity_;
+        return pool + need > budget_ ||
+               (slot_budget_ > 0 && pool_slots >= slot_budget_);
+    }
+    // The allocator's physical cap: the LRU pool's budget PLUS the ring's,
+    // because both are device residency this cache owns. Handing the backend
+    // only budget_ made the pool refuse the ring's own bytes -- measured on
+    // Tiel-Coder-35B-A3B: "expert pool physical budget exhausted: live=5583 MB
+    // need=860 KB budget=3396 MB" after the ring admitted 5325 MiB and the
+    // clamp shrank the pool to 3239, and the run died on its first token.
+    size_t owner_bytes(size_t need = 0) const {
+        size_t total = budget_ + pin_budget_;
+        const size_t live = bytes_ + need;
+        if (live > total) total = live;
+        return total;
     }
     // Evicts WARM copies until need bytes fit. Pins do not apply here.
     void make_warm_room(size_t need);
@@ -500,10 +635,25 @@ private:
     // Picks the slot to sacrifice from device: unpinned, then rarest, then
     // oldest. Host-tier copies are not candidates — they are not in the way.
     bool pick_victim(u64 *out);
+    // Resident-slot index used by pick_victim: O(1) insert, O(1) swap-remove.
+    void track_vram(const u64 key, Slot &s);
+    void untrack_vram(Slot &s);
     // WARM victim: a copy that is not backing a HOT slot goes first, then the
     // same frequency ordering as the device tier. Pins do not protect a copy
     // here.
     bool pick_warm_victim(u64 *out);
+    // The pool answers nullptr, not an abort, when the card has no room
+    // beside its VRAM floor and it holds no free cell of the requested size
+    // class. That is the steady state on the 16 GiB / 6-12 GiB targets this
+    // engine is built for, so a refused allocation is answered by giving the
+    // pool back cells this cache already owns -- the WARM copy survives, so
+    // the reclaimed expert costs a copy instead of a file read.
+    // False when there is nothing left to give back.
+    // `want` is the slice size the caller needs a cell for: a victim of the
+    // same size class hands its cells straight back (`alloc_pooled` looks
+    // a cell up by rounded size), so it is preferred over a plain LRU
+    // pick. 0 falls back to pick_victim().
+    bool force_reclaim(size_t want = 0);
 
     Backend *be_ = nullptr;
     size_t budget_ = 0;
@@ -511,8 +661,22 @@ private:
     size_t capacity_ = 0;
     size_t slot_budget_ = 0; // exact slot ceiling, 0 = derive from the bytes
     size_t vram_slots_ = 0;
+    // Device allocations the pool refused on a full card, and the evictions
+    // that answered them. Both are per-run evidence: refusals without
+    // reclaims is the state that used to reach hipMemcpy with a null
+    // destination.
+    size_t pool_refusals_ = 0;
+    size_t reclaims_ = 0;
     size_t host_budget_ = 0;
     size_t host_bytes_ = 0;
+    // The ring: bytes of pinned device residency that the pool's budget does
+    // not count, and how many slots they are, so over_budget() is O(1).
+    size_t pin_budget_ = 0;
+    size_t pin_bytes_ = 0;
+    size_t pin_slots_ = 0;
+    // The one place that flips `pinned`, so the two counters above can never
+    // disagree with it.
+    void set_pinned(Slot &s, bool on);
     // The pinned prefix of WARM: at most this many bytes of the tier are
     // admitted into pinned host memory, in admission order (rank order when the
     // model carries an expert index), so a promotion out of it is a DMA with no
@@ -538,6 +702,16 @@ private:
     f64 promote_ms_ = 0;     // wall time in promote_to_vram
     f64 read_ms_ = 0;        // wall time in the WARM file read
     f64 room_ms_ = 0;        // wall time making VRAM room
+    f64 scan_ms_ = 0;        // ... of which the victim search
+    f64 retire_ms_ = 0;      // ... and the cell release
+    u64 scans_ = 0, scan_visits_ = 0;
+    // The resident keys, and the hand the windowed victim search starts from.
+    // A scan of `slots_` is the wrong shape for this: the tier holds ~3.5k
+    // resident entries inside ~14k WARM ones, so a full-map pick walked 3503
+    // entries per eviction (measured: 9.19M visits / 2624 evictions, 505.9 ms
+    // of a 1.7 s decode, 55 ns a visit).
+    std::vector<u64> vram_keys_;
+    size_t victim_cursor_ = 0;
     f64 alloc_ms_ = 0;       // wall time in alloc_pooled
     f64 xfer_ms_ = 0;        // wall time in the pageable -> VRAM batch copy
     // Per-phase twins of the five timers above. Only PhasePrefill and
@@ -557,9 +731,19 @@ private:
     u64 active_staged_ = 0, active_used_ = 0;
     f64 active_wait_ms_ = 0;
     u64 promotions_ = 0;
+    u64 promote_batches_ = 0;
+    u64 promote_batch_experts_ = 0;
     u64 decays_ = 0;
     u64 seq_ = 0;
     std::unordered_map<u64, Slot> slots_;
+    // The published device dispatch table (see publish_dispatch_table) and the
+    // flag that says a residency change invalidated it. `table_stale_` is set by
+    // every write to a slot's device pointers -- drop() and the promotion that
+    // assigns `s.m` -- so a caller holding the pointer re-reads it and falls
+    // back instead of issuing GEMMs against freed addresses.
+    void *table_ = nullptr;
+    size_t table_bytes_ = 0;
+    bool table_stale_ = false;
 };
 
 } // namespace krk

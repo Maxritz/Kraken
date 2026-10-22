@@ -18,14 +18,22 @@
 #include <thread>
 
 #include "krk/backend.hpp"
+#include "krk/vram_guard.hpp" // vram_floor_bytes: the floor alloc_pooled enforces
 #include "kernels/attention.hpp"
 #include "kernels/topk.hpp"
+#include "kernels/router.hpp"
+#include "kernels/moe_table.hpp"
 #include "kernels/fused.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/gemm_dp4a.hpp"
+#include "kernels/gemm_mmq.hpp"
 #include "kernels/gdn.hpp"
 #include "kernels/hadamard.hpp"
+#include "kernels/hc.hpp"
+#include "kernels/gather.hpp"
+#include "kernels/ple.hpp"
 #include "op_time.hpp"
+#include "krk/trace.hpp"
 
 // Declared here rather than at their definitions (below the class) so the
 // backend's upload path can call them; see the definitions for the measurements.
@@ -293,6 +301,7 @@ public:
 
     // ---- memory ----------------------------------------------------------
     void *alloc(size_t bytes) override {
+        KRK_TRACE_SCOPE("memory", "alloc");
         if (bytes == 0) bytes = 1;
         const size_t rounded = (bytes + 255u) & ~static_cast<size_t>(255u);
         void *p = nullptr;
@@ -301,10 +310,35 @@ public:
             oom(rounded, e);
         }
         allocated_ += rounded;
+        live_bytes_ += rounded;
+        alloc_sizes_[p] = rounded;
         return p;
     }
     void release(void *p) override {
-        if (p) KRK_HIP(hipFree(p));
+        if (!p) return;
+        const auto it = alloc_sizes_.find(p);
+        if (it != alloc_sizes_.end()) {
+            live_bytes_ -= it->second;
+            alloc_sizes_.erase(it);
+        }
+        KRK_HIP(hipFree(p));
+    }
+    // alloc() rounds to 256 bytes and release() is handed the raw pointer, so the
+    // un-rounded size is kept per allocation in a small side table. It exists for
+    // the ledger's self-check (`unaccounted` should equal live minus the terms it
+    // knows), and a probe that only ran under KRK_VRAM_TRACE would be a probe
+    // nobody runs, so it is always on: one unordered_map entry per live buffer.
+    size_t device_live_bytes() const override { return live_bytes_; }
+    size_t device_alloc_count() const override
+    {
+        return alloc_sizes_.size();
+    }
+    size_t device_largest_alloc() const override
+    {
+        size_t big = 0;
+        for (const auto &kv : alloc_sizes_)
+            if (kv.second > big) big = kv.second;
+        return big;
     }
     size_t device_free_bytes() const override {
         size_t free_b = 0, total_b = 0;
@@ -477,20 +511,60 @@ public:
         KRK_HIP(hipFree(b.p));
     }
     void pool_trim_(size_t need) {
-        for (auto &entry : pool_) {
-            auto &cells = entry.second;
-            while (!cells.empty() &&
-                   (need > expert_pool_.budget ||
-                    expert_pool_.committed > expert_pool_.budget - need)) {
-                PoolBlock b = cells.back();
-                cells.pop_back();
-                pool_kill_(b);
-                expert_pool_.committed -= entry.first;
-                expert_pool_.reusable -= entry.first;
+        for (;;) {
+            const bool over =
+                need > expert_pool_.budget ||
+                expert_pool_.committed > expert_pool_.budget - need;
+            if (!over) return;
+            bool progress = false;
+            // Arena cells first, at SLAB granularity: a cell has no allocation
+            // header of its own, so handing one back would be half a free. A
+            // slab goes when every cell in it is already on the free list.
+            for (size_t i = 0; i < pool_slabs_.size(); i++) {
+                PoolSlab &sl = pool_slabs_[i];
+                if (!sl.base || sl.live) continue;
+                auto &cells = pool_[sl.cell];
+                for (size_t j = cells.size(); j-- > 0;) {
+                    const auto at = pool_cell_slab_.find(cells[j].p);
+                    if (at == pool_cell_slab_.end() || at->second != i) continue;
+                    if (cells[j].m && cells[j].m->ev)
+                        KRK_HIP(hipEventSynchronize(cells[j].m->ev));
+                    pool_mark_unref_(cells[j].m);
+                    pool_cell_slab_.erase(at);
+                    cells.erase(cells.begin() + static_cast<long>(j));
+                }
+                KRK_HIP(hipFree(sl.base));
+                expert_pool_.committed -= sl.bytes;
+                expert_pool_.reusable = expert_pool_.reusable > sl.bytes
+                                            ? expert_pool_.reusable - sl.bytes
+                                            : 0;
+                sl = PoolSlab{};
                 ++expert_pool_.trims;
+                progress = true;
             }
+            // Cells the arena does not own (KRK_EXPERT_ARENA=0) keep the old
+            // one-at-a-time path.
+            for (auto &entry : pool_) {
+                auto &cells = entry.second;
+                while (!cells.empty()) {
+                    const bool over2 =
+                        need > expert_pool_.budget ||
+                        expert_pool_.committed > expert_pool_.budget - need;
+                    if (!over2) break;
+                    if (pool_cell_slab_.count(cells.back().p)) break;
+                    PoolBlock b = cells.back();
+                    cells.pop_back();
+                    pool_kill_(b);
+                    expert_pool_.committed -= entry.first;
+                    expert_pool_.reusable -= entry.first;
+                    ++expert_pool_.trims;
+                    progress = true;
+                }
+            }
+            if (!progress) return;
         }
     }
+
     void set_expert_pool_budget(size_t bytes) override {
         expert_pool_.budget = bytes;
         if (expert_pool_.committed > bytes) pool_trim_(0);
@@ -570,27 +644,88 @@ public:
             expert_pool_.reusable -= rounded;
             expert_pool_.live += rounded;
             ++expert_pool_.reuses;
+            // A reused cell is handed out again, so its slab must count it as
+            // live -- the slab is only returnable at live == 0, and a reused
+            // cell that was not counted is a slab freed under an in-flight copy
+            // (measured: hipErrorInvalidValue from the ring's hipMemcpyAsync).
+            const auto back = pool_cell_slab_.find(b.p);
+            if (back != pool_cell_slab_.end())
+                ++pool_slabs_[back->second].live;
             // The cell's own reference moves from the free list to the cell.
             pool_live_.emplace(b.p, LiveCell{rounded, b.m});
             return b.p;
         }
         pool_trim_(rounded);
-        if (rounded > expert_pool_.budget ||
-            expert_pool_.committed > expert_pool_.budget - rounded) {
+        // The budget abort is the per-cell allocator's invariant, and with the
+        // arena it stops being one: a slab is rounded up to kSlabCells, so
+        // `committed` legitimately sits a slab's slack (up to ~70 MiB) above the
+        // cells handed out, and a budget that is exactly full is the steady
+        // state of a constrained run -- not evidence of a ledged bug. There the
+        // right answer is the refusal path the cache already handles (evict,
+        // retry, skip), which is what returning nullptr becomes below.
+        if (!expert_arena() &&
+            (rounded > expert_pool_.budget ||
+             expert_pool_.committed > expert_pool_.budget - rounded)) {
             KRK_ERROR("expert pool physical budget exhausted: live=%zu need=%zu budget=%zu",
                       expert_pool_.live, rounded, expert_pool_.budget);
             std::abort();
         }
-        void *p = alloc(rounded);
+        // The VRAM floor is an invariant here, not a number the ledger reports
+        // afterwards. A card left with ~850 MiB free does not merely slow this
+        // run down: Windows pages the compositor out and video playback pauses,
+        // which is what a user sees and cannot attribute to a token rate. The
+        // budget check above is in REQUESTED bytes and cannot see the copy
+        // path's own device memory -- measured at 7,000 MiB beside 7,430 MiB
+        // promoted on Mellum2.1 -- so the pool filled its plan and ended below
+        // the floor it was planned around. Asking the driver here is the only
+        // check that includes memory this engine does not account for.
+        //
+        // Growth only happens on a miss with no reusable cell, so this is not a
+        // per-token query, and it is skipped while the pool is below half its
+        // budget -- a run that will never come near the floor pays nothing.
+        if (expert_arena() && expert_pool_.budget > 0 &&
+            expert_pool_.committed >= expert_pool_.budget / 2) {
+            const size_t total = device_total_bytes();
+            const size_t floor = krk::vram_floor_bytes(total);
+            size_t free_b = device_free_bytes();
+            if (total && free_b < rounded + floor) {
+                // Reuse before refusing: the free cells are already paid for.
+                pool_trim_(rounded);
+                free_b = device_free_bytes();
+            }
+            if (total && free_b < rounded + floor) {
+                ++expert_pool_.floor_refusals;
+                if (expert_pool_.floor_refusals == 1)
+                    KRK_WARN("expert pool: holding at %.0f MiB with %.0f MiB free "
+                             "beside a %.0f MiB floor -- further experts stay in "
+                             "WARM instead of taking the card's last memory "
+                             "(KRK_VRAM_FLOOR_MB overrides the floor)",
+                             static_cast<f64>(expert_pool_.committed) / 1048576.0,
+                             static_cast<f64>(free_b) / 1048576.0,
+                             static_cast<f64>(floor) / 1048576.0);
+                return nullptr;
+            }
+        }
+        void *p = expert_arena() ? pool_slab_take_(rounded) : alloc(rounded);
+        if (!p) return nullptr;
         pool_live_.emplace(p, LiveCell{rounded, nullptr});
-        expert_pool_.committed += rounded;
+        if (!expert_arena()) expert_pool_.committed += rounded;
         expert_pool_.live += rounded;
         ++expert_pool_.allocations;
         return p;
     }
+    // Opt-in, and it MEASURED SLOWER on the file it was written for. The slab
+    // does exactly what it was meant to (alloc row 72 -> 28 ms, reuse 0 ->
+    // 11 697 cells) and decode still loses: REAP-320, 16 tokens, 3 interleaved
+    // pairs, identical text -- 117.7 ms/step with one hipMalloc per cell against
+    // 138.0 with the arena. The loss is in `xfer` (894 -> 1486 ms), i.e. the
+    // copies into uniformly spaced cells, not the kernels; a padded stride made
+    // it worse by costing 3% of capacity, which is the cliff this pool sits on.
+    // So the default stays the per-cell allocator and this is the arm to retest
+    // if the address-locality cause is ever understood.
     static bool expert_arena() {
         const char *e = std::getenv("KRK_EXPERT_ARENA");
-        return !(e && e[0] == '0');
+        return e && *e && e[0] != '0';
     }
     void release_pooled(void *p, size_t bytes) override {
         void *ps[1] = {p};
@@ -665,7 +800,21 @@ public:
             pool_live_.erase(it);
             expert_pool_.live -= r;
             pool_drop_pending_(ps[i]);
-            if (!expert_arena() || expert_pool_.committed > expert_pool_.budget) {
+            const auto slab_of = pool_cell_slab_.find(ps[i]);
+            if (slab_of != pool_cell_slab_.end()) {
+                // The slab owns the memory: this is a return, not a free.
+                if (pool_slabs_[slab_of->second].live)
+                    --pool_slabs_[slab_of->second].live;
+                pool_mark_ref_(m);
+                pool_[r].push_back(PoolBlock{ps[i], m});
+                expert_pool_.reusable += r;
+            } else if (expert_pool_.committed > expert_pool_.budget) {
+                // Over the plan (a re-clamp can lower it under live cells):
+                // hand the memory back instead of caching it. The arena switch
+                // is NOT part of this test -- it picks the growth allocator,
+                // and caching a released cell is what the free list is for in
+                // both arms. Conflating them is what made the bench's reuse
+                // checks fail the moment the slab became opt-in.
                 if (m && m->ev) KRK_HIP(hipEventSynchronize(m->ev));
                 KRK_HIP(hipFree(ps[i]));
                 expert_pool_.committed -= r;
@@ -677,6 +826,76 @@ public:
             ++expert_pool_.release_slices;
         }
         pool_mark_unref_(m); // the burst's reference
+    }
+    // ---- the size-class arena ------------------------------------------------
+    // A cell is 256 B-aligned and an expert is two or three of them, so a tier
+    // that fills 7.4 GiB is ~10 000 cells of ONE OR TWO size classes. Growing
+    // that cell by cell meant one hipMalloc each (measured: 10 038 allocations
+    // = 656.7 ms of a 4.5 s run, and 28.8 ms of a 141 ms step even at a 1.5%
+    // miss rate). A slab is kSlabCells cells of one class cut from a single
+    // hipMalloc, so the same tier is ~100 allocations.
+    //
+    // The free list is unchanged and is still consulted first: a slab is only
+    // the growth path. `live` per slab is what makes a whole slab returnable --
+    // trim can hand one back to the driver only when every cell in it is on the
+    // free list, because a cell has no allocation header to free on its own.
+    static constexpr size_t kSlabCells = 32;
+    // No pad: a padded stride (64 KiB) was measured too and it is WORSE, not
+    // better -- 205 ms/step against 137, with `reuse` at 50 190 against 11 697,
+    // because the pad costs 3% of the tier's capacity and this pool sits on a
+    // cliff: 3% is the difference between holding the routed set and evicting
+    // it every token. The measurement is why this stays a knob rather than the
+    // default (see expert_arena below).
+    static constexpr size_t kSlabPad = 0;
+    struct PoolSlab {
+        void *base = nullptr;
+        size_t bytes = 0;   // the hipMalloc this slab owns
+        size_t cell = 0;    // rounded size class
+        size_t stride = 0;  // cell + kSlabPad
+        size_t cells = 0;
+        size_t used = 0;    // bump index
+        size_t live = 0;    // cells currently handed out
+    };
+    std::vector<PoolSlab> pool_slabs_;
+    std::unordered_map<void *, size_t> pool_cell_slab_; // cell -> slab index
+    // One cell out of a slab of the same size class, growing by a slab when the
+    // class has no room left. The slab is capped to what the budget can still
+    // take, so a nearly full pool grows a cell at a time instead of
+    // over-committing.
+    void *pool_slab_take_(size_t rounded) {
+        size_t at = pool_slabs_.size();
+        for (size_t i = 0; i < pool_slabs_.size(); i++) {
+            const PoolSlab &sl = pool_slabs_[i];
+            if (sl.base && sl.cell == rounded && sl.used < sl.cells) {
+                at = i;
+                break;
+            }
+        }
+        if (at == pool_slabs_.size()) {
+            size_t cells = kSlabCells;
+            const size_t room =
+                expert_pool_.budget > expert_pool_.committed
+                    ? expert_pool_.budget - expert_pool_.committed : 0;
+            const size_t stride = rounded + kSlabPad;
+            if (room < stride) return nullptr;
+            if (room / stride < cells) cells = room / stride;
+            void *base = alloc(stride * cells);
+            if (!base) return nullptr;
+            PoolSlab sl;
+            sl.base = base;
+            sl.bytes = stride * cells;
+            sl.cell = rounded;
+            sl.stride = stride;
+            sl.cells = cells;
+            pool_slabs_.push_back(sl);
+            expert_pool_.committed += sl.bytes;
+        }
+        PoolSlab &sl = pool_slabs_[at];
+        void *cell = static_cast<char *>(sl.base) + sl.used * sl.stride;
+        ++sl.used;
+        ++sl.live;
+        pool_cell_slab_[cell] = at;
+        return cell;
     }
     std::unordered_map<size_t, std::vector<PoolBlock>> pool_;
     std::unordered_map<void *, LiveCell> pool_live_;
@@ -912,6 +1131,17 @@ public:
             KRK_HIP(hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice));
             return;
         }
+        if (paged_direct_() && paged_ready_()) {
+            // The single-copy form of the measured direct arm, so a one-off
+            // staging and a promotion never disagree about which mechanism this
+            // machine prefers. One side stream, one host wait.
+            pool_honor_(dst, paged_stream_[0]);
+            KRK_HIP(hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice,
+                                   paged_stream_[0]));
+            KRK_HIP(hipStreamSynchronize(paged_stream_[0]));
+            krk_op_scope.bytes(static_cast<i64>(bytes));
+            return;
+        }
         if (bytes <= kStageMaxBytes && stage_upload(dst, src, bytes)) return;
         if (!paged_ready_()) {
             // Pinned memory is finite and losing the ring must degrade the
@@ -944,7 +1174,11 @@ public:
                                    hipMemcpyHostToDevice, paged_stream_[slot]));
             KRK_HIP(hipEventRecord(paged_ev_[slot], paged_stream_[slot]));
             paged_used_[slot] = true;
-            if (nused < kPagedBufs) used[nused++] = slot;
+            used[nused++] = slot;
+            if (nused == kPagedBufs) {
+                paged_publish_(used, nused);
+                nused = 0;
+            }
         }
         pool_dep_done_(dep);
         paged_publish_(used, nused);
@@ -975,9 +1209,10 @@ public:
             return;
         }
         if (paged_direct_() && paged_ready_()) {
-            // KRK_WARM_DMA=2. The driver stages a pageable source into its own
-            // pinned buffer; issuing all three slices on one side stream then
-            // leaves one host wait for the batch instead of one per slice.
+            // The direct arm, chosen at init when the aperture lets the driver
+            // stage a pageable source without the ring's memcpy. Issuing all
+            // three slices on one side stream leaves one host wait for the
+            // batch instead of one per slice.
             for (int i = 0; i < n; i++) {
                 if (!dst[i] || !src[i] || !bytes[i]) continue;
                 pool_honor_(dst[i], paged_stream_[0]);
@@ -1013,7 +1248,19 @@ public:
                 KRK_HIP(hipEventRecord(paged_ev_[slot], paged_stream_[slot]));
                 batch_bytes += static_cast<i64>(len);
                 paged_used_[slot] = true;
-                if (nused < kPagedBufs) used[nused++] = slot;
+                used[nused++] = slot;
+                // Publish in ring-sized groups. `used` holds kPagedBufs slots,
+                // and the first version recorded only the first kPagedBufs --
+                // so a batch with more chunks than that left the rest of its
+                // copies unordered against the default stream (a consumer GEMM
+                // could start before the DMA landed) and the ring then handed
+                // out slots nobody had claimed. Draining here keeps every copy
+                // in the batch ordered while never holding more than the ring
+                // can express.
+                if (nused == kPagedBufs) {
+                    paged_publish_(used, nused);
+                    nused = 0;
+                }
             }
             pool_dep_done_(dep);
         }
@@ -1029,6 +1276,45 @@ public:
     // copy were 26 ms + 21 ms of one serialized host pass, and the 21 ms was
     // almost entirely the memcpy through the pageable ring. KRK_WEIGHT_DMA=0
     // restores the ring path for an A/B.
+    void *upload_expert_prefetch(void *const dst[], const void *const src[],
+                                 const size_t bytes[], int n) override {
+        // Pinned sources only. A pageable source needs a host memcpy into the
+        // ring, which would run HERE, at issue time -- the serial cost this path
+        // exists to remove -- so it takes the staged path instead.
+        if (!pinned_dma_() || !pinned_ready_())
+            return upload_expert_staged(dst, src, bytes, n);
+        hipEvent_t ev = nullptr;
+        if (hipEventCreateWithFlags(&ev, hipEventDisableTiming) != hipSuccess) {
+            static_cast<void>(hipGetLastError());
+            return upload_expert_staged(dst, src, bytes, n);
+        }
+        int queued = 0;
+        for (int i = 0; i < n; i++) {
+            if (!dst[i] || !src[i] || !bytes[i]) continue;
+            // The cell may still be read by the previous owner; the copy stream
+            // waits for that release mark, never the host.
+            pool_honor_(dst[i], pinned_stream_);
+            if (hipMemcpyAsync(dst[i], src[i], bytes[i], hipMemcpyHostToDevice,
+                               pinned_stream_) != hipSuccess) {
+                static_cast<void>(hipGetLastError());
+                (void)hipEventDestroy(ev);
+                return upload_expert_staged(dst, src, bytes, n);
+            }
+            ++queued;
+        }
+        if (!queued || hipEventRecord(ev, pinned_stream_) != hipSuccess) {
+            static_cast<void>(hipGetLastError());
+            (void)hipEventDestroy(ev);
+            return nullptr;
+        }
+        return static_cast<void *>(ev);
+    }
+    bool wait_marker_stream(void *marker) override {
+        if (!marker) return false;
+        return hipStreamWaitEvent(0, static_cast<hipEvent_t>(marker), 0) ==
+               hipSuccess;
+    }
+
     void upload_pinned_batch(void *const dst[], const void *const src[],
                              const size_t bytes[], int n) override {
         if (n <= 0) return;
@@ -1239,10 +1525,9 @@ public:
     // Lazily builds the promotion ring. Chunk size, and with it the pinned
     // footprint (kPagedBufs * chunk), is sweepable with KRK_WARM_STAGE_KIB.
     // KRK_WARM_DMA=0 restores the blocking copy for the WARM -> HOT path, so a
-    // change here can be measured against what it replaced. KRK_WARM_DMA=2
-    // skips the ring and has the runtime stage a pageable source itself, on one
-    // side stream -- the same double copy without the ring bookkeeping, and one
-    // sync per batch instead of one per slice.
+    // change here can be measured against what it replaced. The ring is built
+    // even when the direct path is selected: the direct path borrows one of its
+    // streams, and a staging failure has to fall back somewhere.
     static bool paged_blocking_() {
         static const bool v = [] {
             const char *e = std::getenv("KRK_WARM_DMA");
@@ -1250,13 +1535,29 @@ public:
         }();
         return v;
     }
-    static bool paged_direct_() {
-        static const bool v = [] {
+    // Which pageable path runs is a MEASUREMENT, not a constant: Engine::init
+    // times the ring against the direct DMA at the promotion shape and picks the
+    // faster. That is why this is member state and not a function-static -- the
+    // probe has to flip it between its arms on one backend. KRK_WARM_DMA=1
+    // (ring) / =2 (direct) still forces a path, and it wins over the engine;
+    // =0 is the blocking copy above.
+    bool paged_direct_() const {
+        const int forced = pageable_env_();
+        return forced != 0 ? forced == 2 : pageable_direct_;
+    }
+    // 0 = not set by the environment, 1 = ring, 2 = direct.
+    static int pageable_env_() {
+        static const int v = [] {
             const char *e = std::getenv("KRK_WARM_DMA");
-            return e && e[0] == '2';
+            if (!e) return 0;
+            if (e[0] == '2') return 2;
+            if (e[0] == '1') return 1;
+            return 0;  // '0' is the blocking copy, and no selector at all
         }();
         return v;
     }
+    bool pageable_paths_selectable() const override { return true; }
+    void set_pageable_direct(bool on) override { pageable_direct_ = on; }
     bool paged_ready_() {
         if (paged_on_) return true;
         if (paged_failed_) return false;
@@ -1346,6 +1647,9 @@ public:
 
     void upload(void *dst, const void *src, size_t bytes, size_t off) override {
         KRK_TIME_OP("upload");
+        KRK_TRACE_SCOPE_ARGS("transfer", "upload", nullptr);
+        krk::Trace::get().ensure_on();
+        const double tu0 = krk::Trace::get().on() ? krk::Trace::get().now_us() : 0.0;
         // The cold path: a reused cell here may be reached by the pull ring's
         // own streams, so the guard is honored on the host. 6% of acquires.
         pool_honor_host_(dst);
@@ -1366,6 +1670,11 @@ public:
             return;
         KRK_HIP(hipMemcpy(static_cast<char *>(dst) + off, src, bytes,
                           hipMemcpyHostToDevice));
+        if (krk::Trace::get().on()) {
+            char args[96];
+            std::snprintf(args, sizeof(args), "\"bytes\":%zu,\"dir\":\"H2D\"", bytes);
+            krk::Trace::get().complete("transfer", "upload", tu0, krk::Trace::get().now_us() - tu0, args);
+        }
     }
     // Device-to-device, on the stream every kernel here runs on, so the next
     // reader of the destination is already ordered behind it.
@@ -1565,8 +1874,15 @@ public:
 
     void download(void *dst, const void *src, size_t bytes, size_t off) override {
         KRK_TIME_OP("download");
+        krk::Trace::get().ensure_on();
+        const double td0 = krk::Trace::get().on() ? krk::Trace::get().now_us() : 0.0;
         KRK_HIP(hipMemcpy(dst, static_cast<const char *>(src) + off, bytes,
                           hipMemcpyDeviceToHost));
+        if (krk::Trace::get().on()) {
+            char args[96];
+            std::snprintf(args, sizeof(args), "\"bytes\":%zu,\"dir\":\"D2H\"", bytes);
+            krk::Trace::get().complete("transfer", "download", td0, krk::Trace::get().now_us() - td0, args);
+        }
     }
     void fill0(void *dst, size_t bytes) override {
         KRK_TIME_OP("fill0");
@@ -1576,6 +1892,7 @@ public:
         KRK_HIP(hipMemset(dst, 0, bytes));
     }
     void sync() override {
+        KRK_TRACE_SCOPE("wait", "device-sync");
         KRK_HIP(hipDeviceSynchronize());
         // The device sync just made the outstanding copy pair complete, so this
         // fold cannot block: it is what keeps the reported rate whole at the end
@@ -1602,6 +1919,7 @@ public:
             sync();
             return;
         }
+        KRK_TRACE_SCOPE("wait", "event-sync");
         const hipEvent_t event = static_cast<hipEvent_t>(marker);
         KRK_HIP(hipEventSynchronize(event));
         const auto probe = stage_probes_.find(event);
@@ -1675,6 +1993,89 @@ public:
         std::abort();
     }
 
+    // The MoE router activation, on the device. See Backend::router_softmax for
+    // why it lives here before the dispatch that uses it: the point is to price
+    // the numerics of moving it, and a price needs the real kernel.
+    bool router_softmax_supported() const override { return true; }
+    void router_softmax(void *probs, const void *logits, i64 n_rows,
+                        i32 n_expert) override {
+        KRK_TIME_OP("router_softmax");
+        if (!probs || !logits || n_rows <= 0 || n_expert <= 0) return;
+        constexpr int kThreads = 128;
+        router_softmax_kernel<kThreads><<<static_cast<unsigned>(n_rows), kThreads>>>(
+            static_cast<const _Float16 *>(logits), static_cast<f32 *>(probs),
+            n_expert);
+    }
+
+    // Selection and the plan, on the device. See Backend::router_topk.
+    bool router_topk_supported() const override { return true; }
+    void router_topk(const void *probs, i64 n_rows, i32 n_expert, i32 k,
+                     void *ids, void *wts, i32 normalize, f32 scale) override {
+        KRK_TIME_OP("router_topk");
+        if (!probs || !ids || !wts || n_rows <= 0 || n_expert <= 0 || k <= 0) return;
+        constexpr int kThreads = 128; // 4 warps: the shared slot table needs one
+        router_topk_kernel<kThreads><<<static_cast<unsigned>(n_rows), kThreads, 0>>>(
+            static_cast<const f32 *>(probs), n_expert, k,
+            static_cast<i32 *>(ids), static_cast<f32 *>(wts));
+        router_weights_kernel<kThreads><<<static_cast<unsigned>(n_rows), kThreads, 0>>>(
+            static_cast<f32 *>(wts), k, normalize, scale);
+    }
+
+    void moe_plan_build(const void *ids, i64 n_rows, i32 k, i32 n_expert,
+                        void *off, void *rows, void *wt, const void *wts) override {
+        KRK_TIME_OP("moe_plan_build");
+        if (!ids || !off || !rows || !wt || n_rows <= 0 || k <= 0 || n_expert <= 0)
+            return;
+        // One thread, by design: the fill order is prescribed (token, then slot)
+        // so the plan is a value and not a function of the schedule.
+        moe_plan_kernel<<<1, 1, 0>>>(static_cast<const i32 *>(ids),
+                                     static_cast<i32>(n_rows), k, n_expert,
+                                     static_cast<i32 *>(off), static_cast<i32 *>(rows),
+                                     static_cast<f32 *>(wt), nullptr,
+                                     static_cast<const f32 *>(wts));
+    }
+
+    // The whole MoE layer from one launch, with the matrices chosen on the
+    // device from ExpertCache's published table. See kernels/moe_table.hpp for
+    // the arithmetic and why it is the same numbers the per-expert path
+    // produces (one warp per row, gemv's lane split, f16 round before the
+    // activation) with one deliberate difference -- the slot order.
+    bool moe_dispatch_supported() const override { return true; }
+
+    void moe_dispatch(const void *table, i32 layer, i32 n_expert, const void *ids,
+                      const void *wts, const void *xn, void *out, i64 n_tok,
+                      i64 n_embd, i64 n_ff, i32 k) override {
+        KRK_TIME_OP("moe_dispatch");
+        if (!table || !ids || !wts || !xn || !out || n_tok <= 0 || k <= 0) return;
+        // The kernels chunk K by 32, and the shared-memory partition below is
+        // one activation row plus one accumulator row. A geometry that breaks
+        // either is a caller that should not have engaged this path, and it
+        // must not leave the layer computing something else quietly.
+        if ((n_embd & 31) || (n_ff & 31)) {
+            KRK_ERROR("moe_dispatch: n_embd=%lld n_ff=%lld must be multiples of 32",
+                      static_cast<long long>(n_embd), static_cast<long long>(n_ff));
+            std::abort();
+        }
+        // One activation row, one accumulator row, and the row-scale reduction
+        // (8 warp partials plus the scale itself), rounded up so the f16 view
+        // stays 16-byte aligned.
+        const size_t smem = static_cast<size_t>(n_ff) * sizeof(_Float16) +
+                            static_cast<size_t>(n_embd) * sizeof(f32) + 64u;
+        if (smem > 48u * 1024u) {
+            KRK_ERROR("moe_dispatch: %.1f KiB of shared memory for n_ff=%lld "
+                      "n_embd=%lld exceeds the block limit",
+                      static_cast<f64>(smem) / 1024.0,
+                      static_cast<long long>(n_ff),
+                      static_cast<long long>(n_embd));
+            std::abort();
+        }
+        moe_table_kernel<256><<<static_cast<unsigned>(n_tok), 256, smem>>>(
+            static_cast<const MoeDispatchEntry *>(table), layer, n_expert,
+            static_cast<const i32 *>(ids), static_cast<const f32 *>(wts),
+            static_cast<const _Float16 *>(xn), static_cast<_Float16 *>(out),
+            static_cast<i32>(n_embd), static_cast<i32>(n_ff), k);
+    }
+
     void download_f32(f32 *dst, const void *src, i64 n) override {
         KRK_TIME_OP("download_f32");
         std::vector<u16> tmp(static_cast<size_t>(n));
@@ -1695,6 +2096,22 @@ public:
     // build replaced. It exists so the two arms can be interleaved in separate
     // processes: measured in sequence, the second arm reads a warm page cache
     // and looks like a win no matter which one it is.
+    // Diagnostic arms for the staging-vs-MMA split (see the launch site).
+    static bool gemm_stage_only() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_GEMM_STAGE_ONLY");
+            return e && e[0] == '1';
+        }();
+        return v;
+    }
+    static bool gemm_mma_only() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_GEMM_MMA_ONLY");
+            return e && e[0] == '1';
+        }();
+        return v;
+    }
+
     static bool split_k_enabled() {
         static const bool v = [] {
             const char *e = std::getenv("KRK_GEMM_SPLIT");
@@ -2000,11 +2417,14 @@ public:
 #undef KRK_GEMV_M
             krk_op_scope.retag("gemm(gemv_m)");
         } else if (rung == GemmRung::kWmma) {
-#if defined(KRK_GFX11) || defined(KRK_GFX12)
+#if defined(KRK_WMMA_COMPILED)
             const unsigned bx = static_cast<unsigned>(
                 (n_out + wmma_cfg::BN - 1) / wmma_cfg::BN);
+            // One block walks wmma_cfg::MB M tiles, so the grid's row
+            // dimension counts groups of MB*BM rows.
             const unsigned by = static_cast<unsigned>(
-                (rows + wmma_cfg::BM - 1) / wmma_cfg::BM);
+                (rows + wmma_cfg::BM * wmma_cfg::MB - 1) /
+                (wmma_cfg::BM * wmma_cfg::MB));
             // Split-K: a short prefill GEMM runs only a
             // handful of blocks, and §2b showed its cost is
             // the per-block staging chain, not CU occupancy.
@@ -2050,13 +2470,44 @@ public:
             }
             // Q4_K takes the compile-time-specialized staging
             // pipeline; every other dtype keeps the runtime path.
-            if (wt == DType::Q4_K)
-                gemm_wmma_kernel<wmma_cfg, 0,
-                                 static_cast<int>(DType::Q4_K)><<<grid, wmma_cfg::THREADS>>>(
-                    wh, static_cast<int>(wt), n_out, n_in,
-                    row_bytes, xh, rows, oh, split, slice,
-                    parts, pstride);
-            else
+            // The staging-vs-MMA split is measurable from outside the kernel:
+            // MODE 1 keeps every staging loop and barrier and skips the WMMA,
+            // MODE 2 keeps the fragment loads and WMMA and skips the staging.
+            // Both produce a wrong answer by construction, so they are
+            // diagnostic arms only -- `kraken-bench` under the env switch.
+            if (wt == DType::Q4_K) {
+                if ((gemm_stage_only() || gemm_mma_only()) &&
+                    !getenv("KRK_GEMM_ARM_QUIET")) {
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        std::fprintf(stderr, "[gemm] diagnostic arm: %s\n",
+                                     gemm_stage_only() ? "stage-only"
+                                                       : "mma-only");
+                    }
+                }
+                if (gemm_stage_only())
+                    gemm_wmma_kernel<wmma_cfg, 1,
+                                     static_cast<int>(DType::Q4_K)>
+                        <<<grid, wmma_cfg::THREADS>>>(
+                            wh, static_cast<int>(wt), n_out, n_in,
+                            row_bytes, xh, rows, oh, split, slice,
+                            parts, pstride);
+                else if (gemm_mma_only())
+                    gemm_wmma_kernel<wmma_cfg, 2,
+                                     static_cast<int>(DType::Q4_K)>
+                        <<<grid, wmma_cfg::THREADS>>>(
+                            wh, static_cast<int>(wt), n_out, n_in,
+                            row_bytes, xh, rows, oh, split, slice,
+                            parts, pstride);
+                else
+                    gemm_wmma_kernel<wmma_cfg, 0,
+                                     static_cast<int>(DType::Q4_K)>
+                        <<<grid, wmma_cfg::THREADS>>>(
+                            wh, static_cast<int>(wt), n_out, n_in,
+                            row_bytes, xh, rows, oh, split, slice,
+                            parts, pstride);
+            } else
                 gemm_wmma_kernel<wmma_cfg, 0, -1><<<grid, wmma_cfg::THREADS>>>(
                     wh, static_cast<int>(wt), n_out, n_in,
                     row_bytes, xh, rows, oh, split, slice,
@@ -2098,8 +2549,35 @@ public:
             // The dispatcher picks the kernel for this weight format; every
             // format it stages was checked against the host decoder by
             // tools/gemm_i8k_verify.cpp (built as kraken-i8k).
-            gemm_dp4a_dispatch(static_cast<int>(wt), wh, n_out, n_in, row_bytes, xh,
-                               rows, oh, reinterpret_cast<i8 *>(int8q_), int8s_);
+            // KRK_DP4A_MMQ selects the MMQ-shaped tile (kernels/gemm_mmq.hpp):
+            // 1 is its 4x4 tile on dp4a's int8 staging, 2 adds the packed
+            // nibble staging with v_perm expansion. Unset keeps the dp4a tile,
+            // which is the default and the baseline every number there quotes.
+            const int wt_i = static_cast<int>(wt);
+            if (mmq::mmq_ok(wt_i, rows, n_out, n_in)) {
+                i8 *const qc = reinterpret_cast<i8 *>(int8q_);
+                switch (mmq::mmq_arm()) {
+                    case mmq::MmqArm::kPacked:
+                        mmq::mmq_launch<mmq::cfg::kMmqTM, mmq::cfg::kMmqTN,
+                                        mmq::cfg::kMmqTY, true>(
+                            wh, n_out, n_in, row_bytes, xh, rows, oh, qc, int8s_);
+                        break;
+                    case mmq::MmqArm::kWidePacked:
+                        mmq::mmq_launch<mmq::cfg::kWideTM, mmq::cfg::kWideTN,
+                                        mmq::cfg::kWideTY, true>(
+                            wh, n_out, n_in, row_bytes, xh, rows, oh, qc, int8s_);
+                        break;
+                    case mmq::MmqArm::kInt8:
+                        mmq::mmq_launch<mmq::cfg::kMmqTM, mmq::cfg::kMmqTN,
+                                        mmq::cfg::kMmqTY, false>(
+                            wh, n_out, n_in, row_bytes, xh, rows, oh, qc, int8s_);
+                        break;
+                    default:
+                        break;
+                }
+            } else
+                gemm_dp4a_dispatch(wt_i, wh, n_out, n_in, row_bytes, xh, rows,
+                                   oh, reinterpret_cast<i8 *>(int8q_), int8s_);
         } else {
             const dim3 grid(
                 static_cast<unsigned>((n_out + simt_cfg::BN - 1) / simt_cfg::BN),
@@ -2424,6 +2902,108 @@ public:
             const unsigned fb = static_cast<unsigned>((rows + 255) / 256);
             fill_f32_kernel<<<fb, 256>>>(row_scale, 1.0f, rows);
         }
+    }
+
+    // ---- hyper-connections (qwen4exp) -----------------------------------
+    // The lane axis sits INSIDE a token's row, so none of the ops above can
+    // express these: rmsnorm reduces a row, add_bias_cols broadcasts a column,
+    // and the mean here is over hc blocks of the same row. kernels/hc.hpp has
+    // the arithmetic; the CPU backend's krk::hc_mix/hc_combine are the oracle
+    // `kraken-bench --hc` compares these kernels against, and the accumulation
+    // order (lanes in c order, one divide at the end) is that oracle's.
+    bool hc_supported() const override { return true; }
+
+    void hc_init(void *lanes, const void *x, i64 n_tok, i64 hc, i64 ne) override {
+        KRK_TIME_OP("hc_init");
+        if (n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        const i64 total = n_tok * hc * ne;
+        const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
+        hc_init_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(lanes),
+                                             static_cast<const _Float16 *>(x),
+                                             n_tok, hc, ne);
+    }
+
+    void hc_mix(void *mixed, const void *xn, const void *gate, i64 n_tok,
+                i64 hc, i64 ne) override {
+        KRK_TIME_OP("hc_mix");
+        if (n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        const i64 total = n_tok * ne;
+        const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
+        hc_mix_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(mixed),
+                                            static_cast<const _Float16 *>(xn),
+                                            static_cast<const _Float16 *>(gate),
+                                            n_tok, hc, ne);
+    }
+
+    void hc_combine(void *res, const void *block_out, const void *inject,
+                    i64 n_tok, i64 hc, i64 ne) override {
+        KRK_TIME_OP("hc_combine");
+        if (n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        const i64 total = n_tok * ne;
+        const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
+        hc_combine_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(res),
+                                                static_cast<const _Float16 *>(block_out),
+                                                static_cast<const _Float16 *>(inject),
+                                                n_tok, hc, ne);
+    }
+
+    void silu_act(void *x, i64 n) override {
+        KRK_TIME_OP("silu_act");
+        if (n <= 0) return;
+        const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
+        silu_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(x), n);
+    }
+
+    // ---- per-layer embedding (qwen4exp) ---------------------------------
+    // The PLE block's two non-matmul pieces: a reduction over ONE lane's
+    // channels (rmsnorm sums the row, which on this family would fold the four
+    // lanes together) and a dilated depthwise convolution along the token axis.
+    void ple_gate(void *out, const void *key, const void *qry, i64 n_tok,
+                  i64 hc, i64 ne) override {
+        KRK_TIME_OP("ple_gate");
+        if (n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        const unsigned blocks = static_cast<unsigned>(n_tok * hc);
+        ple_gate_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(out),
+                                              static_cast<const _Float16 *>(key),
+                                              static_cast<const _Float16 *>(qry),
+                                              n_tok, hc, ne);
+    }
+
+    void conv1d_dw(void *out, const void *x, const void *w, i64 n_tok, i64 ch,
+                   i64 kern, i64 dil) override {
+        KRK_TIME_OP("conv1d_dw");
+        if (n_tok <= 0 || ch <= 0 || kern <= 0 || dil <= 0) return;
+        const i64 total = n_tok * ch;
+        const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
+        conv1d_dw_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(out),
+                                              static_cast<const _Float16 *>(x),
+                                              static_cast<const f32 *>(w), n_tok,
+                                              ch, kern, dil);
+    }
+
+    void lane_bcast_mul(void *out, const void *value, const void *g,
+                        i64 n_tok, i64 hc, i64 ne) override {
+        KRK_TIME_OP("lane_bcast_mul");
+        if (n_tok <= 0 || hc <= 0 || ne <= 0) return;
+        const i64 total = n_tok * hc * ne;
+        const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
+        lane_bcast_mul_kernel<256><<<blocks, 256>>>(
+            static_cast<_Float16 *>(out), static_cast<const _Float16 *>(value),
+            static_cast<const _Float16 *>(g), n_tok, hc, ne);
+    }
+
+    // QSA's cell compaction: the indexer hands each query row its own cell
+    // list, and attention() has no mask, so the chosen rows are gathered into
+    // a compact buffer and attended over there.
+    bool gather_rows_supported() const override { return true; }
+
+    void gather_rows(void *dst, const void *src, const i64 *idx, i64 n_rows,
+                     size_t row_bytes) override {
+        KRK_TIME_OP("gather_rows");
+        if (!dst || !src || !idx || n_rows <= 0 || row_bytes == 0) return;
+        gather_rows_kernel<128><<<static_cast<unsigned>(n_rows), 128>>>(
+            static_cast<u8 *>(dst), static_cast<const u8 *>(src), idx,
+            static_cast<i64>(row_bytes));
     }
 
     void add_bias_rows(void *out, const f32 *bias, i64 n, i64 rows) override {
@@ -2766,12 +3346,17 @@ public:
                 pool_mark_unref_(b.m);
                 b.m = nullptr;
             }
-            KRK_HIP(hipFree(b.p));
+            // A slab cell's memory belongs to its slab, freed below.
+            if (!pool_cell_slab_.count(b.p)) KRK_HIP(hipFree(b.p));
         }
         for (const auto &entry : pool_live_) {
             pool_mark_unref_(entry.second.m);
-            KRK_HIP(hipFree(entry.first));
+            if (!pool_cell_slab_.count(entry.first)) KRK_HIP(hipFree(entry.first));
         }
+        for (PoolSlab &sl : pool_slabs_)
+            if (sl.base) KRK_HIP(hipFree(sl.base));
+        pool_slabs_.clear();
+        pool_cell_slab_.clear();
         for (const auto &entry : pool_pending_) pool_mark_unref_(entry.second);
         pool_pending_.clear();
         for (PoolMark *m : pool_free_marks_) {
@@ -2833,6 +3418,8 @@ private:
     DeviceCaps caps_;
     int index_ = 0;
     size_t allocated_ = 0;
+    size_t live_bytes_ = 0;
+    std::unordered_map<void *, size_t> alloc_sizes_;
     // Decode-layer GEMM fusion on/off (see the constructor).
     bool fused_layer_ = true;
     // Fused non-GEMM decode chain on/off (see the constructor).
@@ -2956,6 +3543,8 @@ private:
     int paged_next_ = 0;
     bool paged_on_ = false;
     bool paged_failed_ = false;
+    // Set by Engine::init from its own measurement; KRK_WARM_DMA overrides it.
+    bool pageable_direct_ = false;
     size_t paged_chunk_ = kPagedChunk;
     // Private stream + event for pinned-source weight staging (dense streaming).
     hipStream_t pinned_stream_ = nullptr;
@@ -3280,8 +3869,22 @@ Backend *make_hip_backend(int device_index, std::string *err) {
         static_cast<void>(hipGetLastError());
         large_bar = -1;
     }
-    KRK_INFO("HIP %s | %s | %s | %d CU | %.1f GiB VRAM | %s", hip_runtime_version().c_str(),
-             c.name.c_str(), c.gfx.c_str(), c.cu_count,
+    // Published, not just printed: the host policy acts on it (WARM pinning is
+    // the only lever a 256 MiB aperture leaves for the promotion path).
+    c.large_bar = large_bar;
+    // The driver version, for the H2D verdict cache. Deliberately the DRIVER's
+    // and not the HIP runtime's: the driver decides how a pageable source is
+    // staged, which is what a cached copy-path verdict is about, and both are
+    // printed so a cached entry can be traced back to what wrote it.
+    int driver_version = 0;
+    if (hipDriverGetVersion(&driver_version) != hipSuccess) {
+        static_cast<void>(hipGetLastError());
+        driver_version = 0;
+    }
+    c.driver_version = driver_version;
+    KRK_INFO("HIP %s | driver %d | %s | %s | %d CU | %.1f GiB VRAM | %s",
+             hip_runtime_version().c_str(), driver_version, c.name.c_str(),
+             c.gfx.c_str(), c.cu_count,
              static_cast<f64>(c.vram_total) / (1024.0 * 1024.0 * 1024.0),
              large_bar == 1  ? "BAR: runtime reports large BAR"
              : large_bar == 0 ? "BAR: runtime reports 256 MiB aperture"
