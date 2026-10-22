@@ -268,6 +268,17 @@ public:
         // it loses; Llama-3.2-1B K=2048/8192: 1120 -> 2060 wins).
         const char *ie = std::getenv("KRK_GEMM_INT8");
         int8_gemm_ = ie && std::strcmp(ie, "1") == 0;
+        // An int8 request the ladder cannot honour is a warning, not a
+        // silent no-op: before the exact grid and the rung both knew about
+        // this flag, KRK_GEMM_INT8=1 served the exact grid and measured
+        // identical to the default -- two identical arms. Now the flag
+        // bypasses the exact grid and outranks auto-WMMA wherever dp4a_ok
+        // holds; shapes outside dp4a_ok keep the exact grid, so a run that
+        // sets it should expect chunk/decode divergence (lossy by
+        // construction) on the shapes it takes.
+        if (int8_gemm_)
+            KRK_WARN("KRK_GEMM_INT8=1 engages the lossy int8 rung on dp4a_ok "
+                     "shapes only; other shapes keep the exact grid");
         // Which rung of the GEMM ladder to use, for measurement and for
         // pinning a path when comparing two builds. Absent or "auto" means the
         // device decides (see gemm_rung).
@@ -2184,7 +2195,14 @@ public:
         const bool force_wmma = path_ == GemmPath::kWmma;
         const bool force_dp4a = path_ == GemmPath::kDp4a;
         const bool force_simt = path_ == GemmPath::kSimt;
-        if (!force_dp4a && !force_simt && wmma_present) return GemmRung::kWmma;
+        // An explicit int8 request outranks the auto WMMA pick: without this,
+        // KRK_GEMM_INT8=1 on an auto path silently served WMMA (or the exact
+        // grid above), so the flag measured identical to the default -- two
+        // identical arms reporting "the change is free". A forced WMMA still
+        // wins over the int8 hint; contradictory flags keep the forced rung.
+        if (!force_dp4a && !force_simt && (!int8_gemm_ || force_wmma) &&
+            wmma_present)
+            return GemmRung::kWmma;
         if (!force_simt && !force_wmma && (int8_gemm_ || force_dp4a) &&
             dp4a_ok(static_cast<int>(wt), rows, n_out, n_in))
             return GemmRung::kDp4a;
@@ -2469,19 +2487,32 @@ public:
 #undef KRK_GEMV_M
             krk_op_scope.retag("gemm(gemv_m)");
             }
-        } else if (exact_gemm_enabled() && path_ == GemmPath::kAuto) {
-            // One block per (output row, x-group of 8): the grid position
-            // selects rows, never the accumulation order, so the bytes are
-            // chunk-size invariant by construction. Groups round up; warps
-            // past `rows` in the last group exit before touching memory.
+        } else if (exact_gemm_enabled() && path_ == GemmPath::kAuto &&
+                   !(int8_gemm_ &&
+                     dp4a_ok(static_cast<int>(wt), rows, n_out, n_in))) {
+            // One block per (output row, x-group): the grid position selects
+            // rows, never the accumulation order, so the bytes are chunk-size
+            // invariant by construction. Groups round up; warps past `rows`
+            // in the last group exit before touching memory. KRK_GRID_G sets
+            // the group size (default 32): fewer, larger groups re-read
+            // each weight row fewer times -- measured +12% prefill at 661
+            // rows Q8_0 (272 -> 305 tok/s, interleaved) with byte-identical
+            // hashes at 8/32/128/256. Any value is bit-identical; out of
+            // range clamps to the default rather than refusing.
+            static const int grid_g = [] {
+                const char *e = std::getenv("KRK_GRID_G");
+                if (!e || !*e) return 32;
+                const int v = std::atoi(e);
+                return (v >= 8 && v <= 256) ? v : 32;
+            }();
             const unsigned groups =
-                static_cast<unsigned>((rows + 7) / 8);
+                static_cast<unsigned>((rows + grid_g - 1) / grid_g);
             const unsigned long long total =
                 static_cast<unsigned long long>(
                     static_cast<unsigned>(n_out)) * groups;
             gemv_grid_kernel<<<static_cast<unsigned>(total), 256>>>(
                 wh, static_cast<int>(wt), n_out, n_in, row_bytes, xh, rows,
-                oh);
+                oh, grid_g);
             krk_op_scope.retag("gemm(grid)");
         } else if (rung == GemmRung::kWmma) {
 #if defined(KRK_WMMA_COMPILED)

@@ -218,23 +218,36 @@ __global__ void __launch_bounds__(THREADS)
 // tile -- cannot serve the Q5_K/Q6_K packed pair order from f16 values, so it
 // would fork the association by dtype. Redundant dequant keeps one code path
 // for every format.
-template <int THREADS = 256, int G = 8>
+// `gs` (KRK_GRID_G, default 8) is the x-group a block's warps cover: warp w
+// loops xr = g*gs+w exactly as the G=8 grid did, so any gs leaves
+// bit-identical bytes -- it only changes how many blocks re-read a weight
+// row from HBM (groups = ceil(rows/gs)). Runtime, not templated: the
+// mapping arithmetic is identical for every gs.
+template <int THREADS = 256>
 __global__ void __launch_bounds__(THREADS)
     gemv_grid_kernel(const u8 *__restrict__ w, int wt, i64 n_out, i64 n_in,
                      size_t w_row_bytes, const _Float16 *__restrict__ x,
-                     i64 rows, _Float16 *__restrict__ out) {
+                     i64 rows, _Float16 *__restrict__ out, int gs) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x >> 5);
     const i64 b = static_cast<i64>(blockIdx.x);
     const i64 g = b / n_out;
     const i64 row = b % n_out;
-    if (row >= n_out) return;
-    const i64 xr_row = g * G + warp;
-    if (xr_row >= rows) return;
+    if (row >= n_out || gs <= 0) return;
+    // A block's warps cover [g*gs, (g+1)*gs): with gs > 8 each warp loops
+    // over its strided x-rows. Every (row, xr) pair still runs the identical
+    // per-output sequence (chunk order, order, tree reduce, store), so any
+    // gs is bit-identical -- the loop only changes which warp owns which
+    // pair and how many blocks re-read the weight row.
+    const i64 g_lo = g * static_cast<i64>(gs) + warp;
+    const i64 g_hi =
+        g * static_cast<i64>(gs) + static_cast<i64>(gs) < rows
+            ? g * static_cast<i64>(gs) + static_cast<i64>(gs)
+            : rows;
+    if (g_lo >= rows) return;
 
     const int nch = static_cast<int>(n_in / 32);
     const u8 *wrow = w + static_cast<size_t>(row) * w_row_bytes;
-    const _Float16 *xr = x + xr_row * n_in;
 
     // MEASURED (2026-10-22, gfx1201, rows=1024, L2-resident): a dequant-once
     // LDS tile shared across the block's warps does NOT pay -- q4_k 1122 us
@@ -246,13 +259,16 @@ __global__ void __launch_bounds__(THREADS)
     // zero numerics risk across all formats (including the Q5_K/Q6_K packed
     // pair order, which folds int-pair dots and could not be reproduced from
     // staged f16 anyway).
-    f32 part = 0.0f;
-    for (int c = lane; c < nch; c += 32)
-        part += dot_chunks(wt, wrow, xr, c, c + 1);
+    for (i64 xr_row = g_lo; xr_row < g_hi; xr_row += 8) {
+        const _Float16 *xr = x + xr_row * n_in;
+        f32 part = 0.0f;
+        for (int c = lane; c < nch; c += 32)
+            part += dot_chunks(wt, wrow, xr, c, c + 1);
 
-    part = d_wave_reduce_sum(part);
-    if (lane == 0)
-        out[xr_row * n_out + row] = static_cast<_Float16>(part);
+        part = d_wave_reduce_sum(part);
+        if (lane == 0)
+            out[xr_row * n_out + row] = static_cast<_Float16>(part);
+    }
 }
 
 // The widest group that still belongs on the mat-vec ladder; gemv_grid_kernel
