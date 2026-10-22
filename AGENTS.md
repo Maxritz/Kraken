@@ -2650,6 +2650,39 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   pinpoints a wrong block size in one run -- it is how the 17-vs-18 discrepancy
   was found -- where comparing a decode against the file's mapping cannot see it,
   because only the file's own offsets are authoritative.
+- **MLA is half-loaded, and the metadata KEYS are the trap.** `deepseek2` and
+  `deepseek4` are in the arch table and the loader reads their latent ranks,
+  but the engine still refuses them: there is no latent attention kernel, no
+  576-wide KV cache row and no YaRN-on-the-compressed-rope path. What landed:
+  the schema fields, the metadata parse, the legacy-lite weight load
+  (`attn_q` / `attn_kv_a_mqa` / `attn_kv_a_norm` / `attn_kv_b` /
+  `attn_output`), a host oracle for that layout in two orders
+  (`krk::mla_lite_forward_{unfolded,absorbed}`, pinned by the new
+  `test_mla_lite` group, 57 checks), and V4's own metadata (grouped output,
+  window, hash-route depth, compress_ratios, compressed rope base).
+  **The ranks are `key_length` / `value_length` / `kv_lora_rank` -- NOT
+  `qk_nope_head_dim` / `qk_rope_head_dim` / `v_head_dim`, which no exporter
+  writes and which refused every real file at load.** nope is
+  `key_length - rope.dimension_count`, and the rope width is the WHOLE
+  `dimension_count` for MLA, because the rotation covers the tail of the key.
+  A file with no `kv_lora_rank` (V4) has its latent at `key_length`.
+  `DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf` is the standing fixture, and
+  its geometry is now checked at load: 16 heads, key 192 = 128 nope + 64
+  rope, value 128, kv_lora 512, so `attn_q` is 3072 wide, `attn_kv_a_mqa` is
+  576 (512 latent + 64 decoupled key), `attn_kv_b` is 4096 = 16 x (128+128),
+  `attn_output` is 2048 = 16 x 128, and the cache row is 576 wide. The
+  shared-expert width with no `expert_shared_feed_forward_length` is derived
+  (n_shared x n_ff_exp = 2 x 1408 = 2816) instead of staying 0, which used to
+  refuse the file at the shared-expert check.
+  The V4 file is a different animal: `attn_q_a` / `attn_q_b` / `attn_kv` /
+  `attn_output_a` / `attn_output_b` (the modern split, refused BY NAME until
+  the split branch lands), plus `attn_sinks`, Sinkhorn `hc_*`,
+  `ffn_gate_tid2eid`, per-layer `attn_compressor_*` / `indexer_compressor_*`
+  and a QSA indexer -- and it is quant type #26, which this build cannot
+  dequantize at all, so it cannot load whatever the MLA work does. The next
+  pieces, in order: the modern split load, the latent decode kernel (one wide
+  row per token, not n_kv x head_dim), the 576-wide cache row, YaRN on the
+  compressed rope, then the prefill path.
 - **`n_embd % n_head != 0` is not a defect when the file declares
   `attention.key_length`.** `Model::load` enforces that identity only when
   head_dim is *inferred* from the embedding (`head_dim_declared`,
