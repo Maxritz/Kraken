@@ -201,8 +201,52 @@ __global__ void __launch_bounds__(THREADS)
         out[static_cast<i64>(warp) * n_out + row] = static_cast<_Float16>(part);
 }
 
-// The widest group that still belongs on the mat-vec ladder. Above it the
-// WMMA tile's reuse of a staged weight tile finally pays for itself.
+// ---------------------------------------------------------------- gemv_grid --
+//
+// The exact prefill kernel for rows above the ladder. Same computation as
+// gemv_mw (one warp per (output row, x-row), gemv's chunk order, lane
+// mapping and wave-shuffle tree reduce through the SHARED dot_chunks(),
+// including the Q5_K/Q6_K packed pair order), but the M dimension is a grid:
+// block (g, row) covers x-rows [8g, 8g+8) of output row `row`.
+// Grid position changes which rows a block reads and writes, never a
+// per-output accumulation order, so chunk 8, 64 and 256 leave bit-identical
+// bytes -- the ladder's exactness extended past row 8. No split-K: regrouping
+// partial sums is a different association (((a+b)+(c+d)) vs (((a+b)+c)+d)),
+// so a split exact kernel is a contradiction, not a tuning knob. The weight
+// row is re-read once per group (L2-resident after the first pass, the same
+// argument gemv_mw's comment makes); the alternative -- a dequant-once LDS
+// tile -- cannot serve the Q5_K/Q6_K packed pair order from f16 values, so it
+// would fork the association by dtype. Redundant dequant keeps one code path
+// for every format.
+template <int THREADS = 256, int G = 8>
+__global__ void __launch_bounds__(THREADS)
+    gemv_grid_kernel(const u8 *__restrict__ w, int wt, i64 n_out, i64 n_in,
+                     size_t w_row_bytes, const _Float16 *__restrict__ x,
+                     i64 rows, _Float16 *__restrict__ out) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x >> 5);
+    const i64 b = static_cast<i64>(blockIdx.x);
+    const i64 g = b / n_out;
+    const i64 row = b % n_out;
+    if (row >= n_out) return;
+    const i64 xr_row = g * G + warp;
+    if (xr_row >= rows) return;
+
+    const int nch = static_cast<int>(n_in / 32);
+    const u8 *wrow = w + static_cast<size_t>(row) * w_row_bytes;
+    const _Float16 *xr = x + xr_row * n_in;
+
+    f32 part = 0.0f;
+    for (int c = lane; c < nch; c += 32)
+        part += dot_chunks(wt, wrow, xr, c, c + 1);
+
+    part = d_wave_reduce_sum(part);
+    if (lane == 0)
+        out[xr_row * n_out + row] = static_cast<_Float16>(part);
+}
+
+// The widest group that still belongs on the mat-vec ladder; gemv_grid_kernel
+// above carries the same association to any row count.
 constexpr int kGemvMRowsMax = 8;
 
 // ---------------------------------------------------------------------------

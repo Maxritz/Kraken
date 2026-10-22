@@ -6732,15 +6732,21 @@ struct PrefillProbe {
 // One CLI prefill. `tiled` forces the tiled fallback through
 // KRK_ATTN_BEXACT=0; the per-process environment is what makes that possible
 // (the backend caches the switch at its first attention call).
+// `exact_off` instead forces the rung lottery behind KRK_GEMM_EXACT=0,
+// which is the negative control for the GEMM half of the gate.
 static PrefillProbe run_prefill_hash(const std::string &exe,
                                      const std::string &model,
                                      const std::string &prompt, int chunk,
-                                     bool tiled) {
+                                     bool tiled, bool exact_off = false) {
     PrefillProbe r;
-    const std::string o =
-        "kraken-prefill-out-" + std::to_string(chunk) + (tiled ? "-t" : "") + ".txt";
-    const std::string e =
-        "kraken-prefill-err-" + std::to_string(chunk) + (tiled ? "-t" : "") + ".txt";
+    // Each arm keeps the chunk number and gains a suffix, so two arms never
+    // share a capture path (the prefix has no spaces -- it is a filename).
+    const std::string tag =
+        (tiled ? "-t" : "") + std::string(exact_off ? "-lottery" : "");
+    const std::string o = "kraken-prefill-out-" +
+                          std::to_string(chunk) + tag + ".txt";
+    const std::string e = "kraken-prefill-err-" +
+                          std::to_string(chunk) + tag + ".txt";
     std::string cmd = "\"" + exe + "\" -m \"" + model + "\" -p \"" + prompt +
                       "\" --ctx 64 --chunk " + std::to_string(chunk) +
                       " --greedy --prefill-hash > \"" + o + "\" 2> \"" + e + "\"";
@@ -6753,7 +6759,9 @@ static PrefillProbe run_prefill_hash(const std::string &exe,
     const std::string full = cmd;
 #endif
     if (tiled) set_env_var("KRK_ATTN_BEXACT", "0");
+    if (exact_off) set_env_var("KRK_GEMM_EXACT", "0");
     r.rc = gate_exit_code(std::system(full.c_str()));
+    if (exact_off) clear_env_var("KRK_GEMM_EXACT");
     if (tiled) clear_env_var("KRK_ATTN_BEXACT");
 
     const std::string out = read_capture(o);
@@ -7036,15 +7044,26 @@ static void test_prefill_chunk_bitexact() {
     const PrefillProbe c1 = run_prefill_hash(exe, model, prompt, 1, false);
     const PrefillProbe c2 = run_prefill_hash(exe, model, prompt, 2, false);
     const PrefillProbe c8 = run_prefill_hash(exe, model, prompt, 8, false);
+    // Rows 16 and 32 are the GEMM rung this gate could not see before: the
+    // chunk sizes above 8 leave the mat-vec ladder, so they are the arms that
+    // fail when the prefill GEMM's association differs from decode's.
+    const PrefillProbe c16 = run_prefill_hash(exe, model, prompt, 16, false);
+    const PrefillProbe c32 = run_prefill_hash(exe, model, prompt, 32, false);
     CHECK(c1.ok, "the chunk-1 prefill prints its hashes");
     CHECK(c2.ok, "the chunk-2 prefill prints its hashes");
     CHECK(c8.ok, "the chunk-8 prefill prints its hashes");
-    std::printf("       chunk 1 trace %s logits %s\n", c1.trace.c_str(),
+    CHECK(c16.ok, "the chunk-16 prefill prints its hashes");
+    CHECK(c32.ok, "the chunk-32 prefill prints its hashes");
+    std::printf("       chunk  1 trace %s logits %s\n", c1.trace.c_str(),
                 c1.logits.c_str());
-    std::printf("       chunk 2 trace %s logits %s\n", c2.trace.c_str(),
+    std::printf("       chunk  2 trace %s logits %s\n", c2.trace.c_str(),
                 c2.logits.c_str());
-    std::printf("       chunk 8 trace %s logits %s\n", c8.trace.c_str(),
+    std::printf("       chunk  8 trace %s logits %s\n", c8.trace.c_str(),
                 c8.logits.c_str());
+    std::printf("       chunk 16 trace %s logits %s\n", c16.trace.c_str(),
+                c16.logits.c_str());
+    std::printf("       chunk 32 trace %s logits %s\n", c32.trace.c_str(),
+                c32.logits.c_str());
     if (!c1.ok || !c8.ok) {
         std::fprintf(stderr, "  (chunk 1 rc=%d stderr: %.300s)\n", c1.rc,
                      c1.err.c_str());
@@ -7080,6 +7099,26 @@ static void test_prefill_chunk_bitexact() {
     CHECK(c1.logits == c8.logits, "and the logits row agrees bit for bit");
     CHECK(c1.first == c8.first, "the row's argmax is the same token");
 
+    // The GEMM rung: 16 and 32 rows per call take the prefill GEMM instead of
+    // the ladder, so these two arms are what prove the prefill GEMM writes the
+    // bytes decode would. Their control is below (KRK_GEMM_EXACT=0).
+    if (c16.ok) {
+        CHECK(c1.trace == c16.trace,
+              c1.trace == c16.trace
+                  ? "the 16-row prefill leaves the SAME rows as the 1-row one"
+                  : "the 16-row prefill DIFFERS from the 1-row one: the prefill "
+                    "GEMM does not reproduce decode's association");
+        CHECK(c1.logits == c16.logits, "and its logits row agrees");
+    }
+    if (c32.ok) {
+        CHECK(c1.trace == c32.trace,
+              c1.trace == c32.trace
+                  ? "the 32-row prefill leaves the SAME rows as the 1-row one"
+                  : "the 32-row prefill DIFFERS from the 1-row one: the prefill "
+                    "GEMM does not reproduce decode's association");
+        CHECK(c1.logits == c32.logits, "and its logits row agrees");
+    }
+
     // Where the arms ran, and whether the gate could see a regression at all.
 #ifdef KRK_TEST_HIP_BUILD
     const bool device = c1.banner.find("scalar reference") == std::string::npos &&
@@ -7104,6 +7143,23 @@ static void test_prefill_chunk_bitexact() {
                       : "the tiled kernel now passes the gate too -- re-point the "
                         "control, this gate is no longer proven able to fail");
         }
+        // THE GEMM CONTROL. The same chunk-16 arm with the rung lottery
+        // forced (KRK_GEMM_EXACT=0) must NOT match the chunk-1 reference:
+        // rows above the ladder then run the WMMA association, which is a
+        // different summation order from decode's and must read as one.
+        const PrefillProbe w16 =
+            run_prefill_hash(exe, model, prompt, 16, false, true);
+        CHECK(w16.ok, "the GEMM-lottery control arm runs");
+        std::printf("       lottery control: chunk 16 trace %s logits %s\n",
+                    w16.trace.c_str(), w16.logits.c_str());
+        if (w16.ok && c1.ok) {
+            CHECK(w16.trace != c1.trace,
+                  w16.trace != c1.trace
+                      ? "with the rung lottery forced the 16-row arm differs, "
+                        "so the gate can detect a GEMM regression"
+                      : "the lottery arm matches the reference -- re-point the "
+                        "GEMM control, it no longer proves anything");
+        }
     }
 #else
     // No device kernels in this build, so the scalar reference is the arm that
@@ -7119,7 +7175,11 @@ static void test_prefill_chunk_bitexact() {
         for (const char *name : {"kraken-prefill-out-1.txt", "kraken-prefill-out-2.txt",
                                  "kraken-prefill-out-8.txt", "kraken-prefill-out-8-t.txt",
                                  "kraken-prefill-err-1.txt", "kraken-prefill-err-2.txt",
-                                 "kraken-prefill-err-8.txt", "kraken-prefill-err-8-t.txt"})
+                                 "kraken-prefill-err-8.txt", "kraken-prefill-err-8-t.txt",
+                                 "kraken-prefill-out-16.txt", "kraken-prefill-out-32.txt",
+                                 "kraken-prefill-out-16-lottery.txt",
+                                 "kraken-prefill-err-16.txt", "kraken-prefill-err-32.txt",
+                                 "kraken-prefill-err-16-lottery.txt"})
             std::remove(name);
         std::remove(model.c_str());
     }
