@@ -9343,6 +9343,181 @@ static void test_mla_absorb() {
     CHECK(worst < 1e-4, "absorbed matches unfolded within f32 tolerance");
 }
 
+
+// MLA legacy lite layout (DeepSeek-V2-Lite): direct q, MQA kv, unsplit wkv_b.
+// Two orders, one answer, plus the pins that make the test see the layout: a
+// singleton cache ignores the query entirely (p == 1 exactly), moved write
+// positions move the answer (rope is read, not decorative), a head-permuted
+// wkv_b moves it too (heads are not interchangeable), and the guard row
+// proves a zero-length cache returns instead of crashing.
+static void test_mla_lite() {
+    krk::MlaLiteGeometry g;
+    g.n_embd = 24;
+    g.n_head = 2;
+    g.kv_lora = 8;
+    g.qk = 8;
+    g.qk_rope = 4;
+    g.v_dim = 4;
+    CHECK(g.valid(), "synthetic lite MLA geometry is valid");
+    CHECK(g.nope() == 4, "nope split is qk - rope");
+    CHECK(g.cache_row_width() == 12, "cache row is kv_lora + rope");
+    u32 rng = 0x51f15eedU;
+    auto rnd = [&]() {
+        rng = rng * 1103515245u + 12345u;
+        return static_cast<f32>((rng >> 20) & 0xff) / 255.0f - 0.5f;
+    };
+    const i64 nope = g.nope();
+    const i64 hv = nope + g.v_dim;
+    std::vector<f32> wq(g.n_embd * g.n_head * g.qk),
+        mqa(g.n_embd * (g.kv_lora + g.qk_rope)), wnorm(g.kv_lora),
+        wkvb(g.kv_lora * g.n_head * hv),
+        wo(g.n_head * g.v_dim * g.n_embd);
+    for (f32 &v : wq) v = rnd();
+    for (f32 &v : mqa) v = rnd();
+    for (f32 &v : wnorm) v = 0.9f + 0.2f * rnd();
+    for (f32 &v : wkvb) v = rnd();
+    for (f32 &v : wo) v = rnd();
+    krk::MlaLiteWeights w;
+    w.wq = wq.data();
+    w.wkv_a_mqa = mqa.data();
+    w.wkv_a_norm = wnorm.data();
+    w.wkv_b = wkvb.data();
+    w.wo = wo.data();
+    // Plain base-10000 table over the rope pairs; YaRN variants arrive here
+    // as an adjusted table from the caller, so the oracle never branches.
+    std::vector<f32> invf(g.qk_rope / 2);
+    for (i64 i = 0; i < g.qk_rope / 2; i++)
+        invf[static_cast<size_t>(i)] =
+            1.0f / std::pow(10000.0f,
+                            static_cast<f32>(2 * i) / g.qk_rope);
+    // The write path: project, split, norm the latent, cache the raw key.
+    // Rotation happens on READ (oracle side), at each row's own position.
+    const i64 n_keys = 4;
+    std::vector<f32> cc(n_keys * g.kv_lora), kk(n_keys * g.qk_rope);
+    std::vector<i64> kpos(static_cast<size_t>(n_keys));
+    std::vector<f32> xt(g.n_embd);
+    for (i64 t = 0; t < n_keys; t++) {
+        for (i64 i = 0; i < g.n_embd; i++)
+            xt[static_cast<size_t>(i)] = rnd();
+        f32 *c = cc.data() + t * g.kv_lora;
+        f64 ss = 0.0;
+        std::vector<f32> raw(g.kv_lora);
+        for (i64 k = 0; k < g.kv_lora; k++) {
+            f32 s = 0.0f;
+            for (i64 i = 0; i < g.n_embd; i++)
+                s += mqa[static_cast<size_t>(i) * (g.kv_lora + g.qk_rope) +
+                         k] *
+                     xt[static_cast<size_t>(i)];
+            raw[static_cast<size_t>(k)] = s;
+            ss += static_cast<f64>(s) * s;
+        }
+        const f32 inv =
+            1.0f / std::sqrt(static_cast<f32>(ss / g.kv_lora) + 1e-6f);
+        for (i64 k = 0; k < g.kv_lora; k++)
+            c[k] = raw[static_cast<size_t>(k)] * inv *
+                   wnorm[static_cast<size_t>(k)];
+        f32 *kr = kk.data() + t * g.qk_rope;
+        for (i64 d = 0; d < g.qk_rope; d++) {
+            f32 s = 0.0f;
+            for (i64 i = 0; i < g.n_embd; i++)
+                s += mqa[static_cast<size_t>(i) * (g.kv_lora + g.qk_rope) +
+                         g.kv_lora + d] *
+                     xt[static_cast<size_t>(i)];
+            kr[d] = s;
+        }
+        kpos[static_cast<size_t>(t)] = t;
+    }
+    std::vector<f32> x(g.n_embd);
+    for (f32 &v : x) v = rnd();
+    std::vector<f32> ou(g.n_embd), oa(g.n_embd), oa2(g.n_embd);
+    const f32 sc = 1.0f / std::sqrt(static_cast<f32>(g.qk));
+    krk::mla_lite_forward_unfolded(ou.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), n_keys, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc, 1e-6f);
+    krk::mla_lite_forward_absorbed(oa.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), n_keys, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc, 1e-6f);
+    krk::mla_lite_forward_absorbed(oa2.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), n_keys, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc, 1e-6f);
+    double worst = 0.0;
+    bool finite = true;
+    for (i64 i = 0; i < g.n_embd; i++) {
+        const double d =
+            std::fabs(static_cast<double>(ou[static_cast<size_t>(i)]) -
+                      static_cast<double>(oa[static_cast<size_t>(i)]));
+        if (d > worst) worst = d;
+        if (!std::isfinite(oa[static_cast<size_t>(i)])) finite = false;
+        CHECK(oa[static_cast<size_t>(i)] == oa2[static_cast<size_t>(i)],
+              "lite absorbed forward is deterministic");
+    }
+    CHECK(finite, "lite absorbed output is finite");
+    CHECK(worst < 1e-4, "lite absorbed matches unfolded within f32 tolerance");
+    // Singleton cache: p == 1 whatever the query, so two different queries
+    // must produce bit-identical outputs. Any score-dependence in the
+    // weighting breaks this exactly, not approximately.
+    std::vector<f32> x2(g.n_embd);
+    for (f32 &v : x2) v = rnd();
+    std::vector<f32> o1(g.n_embd), o2(g.n_embd);
+    krk::mla_lite_forward_absorbed(o1.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), 1, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc, 1e-6f);
+    krk::mla_lite_forward_absorbed(o2.data(), x2.data(), cc.data(), kk.data(),
+                                   kpos.data(), 1, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc, 1e-6f);
+    for (i64 i = 0; i < g.n_embd; i++)
+        CHECK(o1[static_cast<size_t>(i)] == o2[static_cast<size_t>(i)],
+              "singleton lite cache ignores the query");
+    // Moved write positions move the answer: the positions are read.
+    std::vector<i64> kpos2(static_cast<size_t>(n_keys));
+    for (i64 t = 0; t < n_keys; t++) kpos2[static_cast<size_t>(t)] = t + 1;
+    std::vector<f32> om(g.n_embd);
+    krk::mla_lite_forward_absorbed(om.data(), x.data(), cc.data(), kk.data(),
+                                   kpos2.data(), n_keys, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc, 1e-6f);
+    double moved = 0.0;
+    for (i64 i = 0; i < g.n_embd; i++)
+        moved = std::max(
+            moved,
+            std::fabs(static_cast<double>(om[static_cast<size_t>(i)]) -
+                      static_cast<double>(oa[static_cast<size_t>(i)])));
+    CHECK(moved > 1e-6, "shifted write positions move the lite answer");
+    // A head-permuted wkv_b moves the answer: heads are distinguished.
+    std::vector<f32> wkvb2 = wkvb;
+    const i64 hb = g.kv_lora * hv;
+    for (i64 i = 0; i < hb; i++)
+        std::swap(wkvb2[static_cast<size_t>(i)],
+                  wkvb2[static_cast<size_t>(hb + i)]);
+    krk::MlaLiteWeights w2 = w;
+    w2.wkv_b = wkvb2.data();
+    std::vector<f32> oh2(g.n_embd);
+    krk::mla_lite_forward_absorbed(oh2.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), n_keys, /*q_pos*/ 4, w2, g,
+                                   invf.data(), sc, 1e-6f);
+    double hdiff = 0.0;
+    for (i64 i = 0; i < g.n_embd; i++)
+        hdiff = std::max(
+            hdiff,
+            std::fabs(static_cast<double>(oh2[static_cast<size_t>(i)]) -
+                      static_cast<double>(oa[static_cast<size_t>(i)])));
+    CHECK(hdiff > 1e-6, "head-permuted wkv_b moves the lite answer");
+    // The scale and the query position both reach the scores.
+    std::vector<f32> os(g.n_embd);
+    krk::mla_lite_forward_absorbed(os.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), n_keys, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc * 0.5f, 1e-6f);
+    CHECK(os[0] != oa[0] || os[1] != oa[1], "scale reaches the lite scores");
+    std::vector<f32> oq(g.n_embd);
+    krk::mla_lite_forward_absorbed(oq.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), n_keys, /*q_pos*/ 5, w, g,
+                                   invf.data(), sc, 1e-6f);
+    CHECK(oq[0] != oa[0] || oq[1] != oa[1], "query position is read");
+    // Zero-length cache returns instead of crashing.
+    krk::mla_lite_forward_absorbed(oq.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), 0, /*q_pos*/ 5, w, g,
+                                   invf.data(), sc, 1e-6f);
+}
+
 // QSA indexer, the host maths first (no engine, no file): pooling over complete
 // blocks only, the per-head relu before the sum, rope at the block's FIRST
 // position, and the selection rule -- budget in CELLS, the still-filling block
@@ -10918,6 +11093,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_qwen4exp_hc_mix)
     TEST_GROUP(test_qwen4exp_ple)
     TEST_GROUP(test_mla_absorb)
+    TEST_GROUP(test_mla_lite)
     TEST_GROUP(test_qsa_select)
     TEST_GROUP(test_qwen4exp_qsa)
     TEST_GROUP(test_cpu_expert_pool)

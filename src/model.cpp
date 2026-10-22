@@ -30,6 +30,7 @@ std::vector<QuantTensor *> qt_fields(LayerWeights &L) {
             &L.shexp_gate, &L.shexp_up,  &L.shexp_down,  &L.shexp_inp_gate,
             &L.wqkv,       &L.wqkv_gate, &L.wattn_gate,
             &L.ssm_conv1d, &L.ssm_out,   &L.ssm_in,
+            &L.wq_direct,    &L.wkv_a_mqa,   &L.wkv_b,
             &L.ssm_alpha,  &L.ssm_beta};
 }
 
@@ -295,6 +296,13 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         gguf_.get_i64(key(".expert_shared_feed_forward_length"), 0));
     cfg_.n_expert_shared = static_cast<i32>(gguf_.get_i64(
         key(".expert_shared_count"), cfg_.n_ff_shexp > 0 ? 1 : 0));
+    // Files without `expert_shared_feed_forward_length` stack n_shared
+    // experts of width n_ff_exp (deepseek2: 2 x 1408 = 2816); the width is
+    // then metadata-derivable, not a default of 0 that refuses the file at
+    // the shared-expert check below.
+    if (cfg_.n_expert > 0 && cfg_.n_ff_shexp <= 0 && cfg_.n_expert_shared > 0 &&
+        cfg_.n_ff_exp > 0)
+        cfg_.n_ff_shexp = cfg_.n_ff_exp * cfg_.n_expert_shared;
     // is_moe is only confirmed once a layer actually exposes expert tensors, so
     // a checkpoint that merely declares expert_count cannot misroute the FFN.
     if (cfg_.n_expert > 0) {
@@ -386,30 +394,74 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     }
 
     // ---- MLA (DeepSeek-V2/V3/V4) ----------------------------------------
-    // Latent ranks off the file's own attention metadata. Read for every
-    // schema that declares it, validated > 0 with the key named: a file
-    // that claims MLA without ranks is a truncated download, not a model
-    // with a default. The engine still refuses the arch (no latent kernels
-    // yet); these fields are what the refusal will stop needing first.
+    // Latent ranks off the file's own attention metadata. The names matter:
+    // exporters write q_lora_rank (missing on lite -- the query is direct),
+    // kv_lora_rank (missing on V4 -- the latent is key_length wide there),
+    // key_length and value_length. There are no qk_nope_head_dim-style keys;
+    // reading those refused every real file (Coder-V2-Lite proved it: it
+    // carries key_length=192/value_length=128/kv_lora_rank=512 and none of
+    // the old names). nope is key_length - rope_dim.
     if (aspec.mla) {
         cfg_.mla = true;
         cfg_.mla_q_lora = static_cast<i32>(
             gguf_.get_i64(key(".attention.q_lora_rank"), 0));
         cfg_.mla_kv_lora = static_cast<i32>(
             gguf_.get_i64(key(".attention.kv_lora_rank"), 0));
-        cfg_.mla_qk_nope = static_cast<i32>(
-            gguf_.get_i64(key(".attention.qk_nope_head_dim"), 0));
-        cfg_.mla_qk_rope = static_cast<i32>(
-            gguf_.get_i64(key(".attention.qk_rope_head_dim"), 0));
-        cfg_.mla_v_dim = static_cast<i32>(
-            gguf_.get_i64(key(".attention.v_head_dim"), 0));
-        if (cfg_.mla_q_lora <= 0 || cfg_.mla_kv_lora <= 0 ||
-            cfg_.mla_qk_nope <= 0 || cfg_.mla_qk_rope <= 0 ||
-            cfg_.mla_v_dim <= 0) {
+        const i64 key_len = gguf_.get_i64(key(".attention.key_length"), 0);
+        const i64 val_len = gguf_.get_i64(key(".attention.value_length"), 0);
+        if (cfg_.mla_kv_lora <= 0) cfg_.mla_kv_lora = static_cast<i32>(key_len);
+        cfg_.mla_qk_rope = cfg_.rope_dim;
+        cfg_.mla_qk_nope = static_cast<i32>(key_len) - cfg_.mla_qk_rope;
+        cfg_.mla_v_dim = static_cast<i32>(val_len);
+        if (cfg_.mla_kv_lora <= 0 || key_len <= 0 || val_len <= 0 ||
+            cfg_.mla_qk_nope <= 0 || cfg_.mla_qk_rope <= 0) {
             if (err)
-                *err = "arch '" + a + "': MLA ranks are incomplete "
-                       "(q_lora_rank/kv_lora_rank/qk_nope_head_dim/" +
-                       "qk_rope_head_dim/v_head_dim must all be > 0)";
+                *err = "arch '" + a + "': MLA ranks are incomplete " +
+                       "(kv_lora_rank/key_length/value_length must be > 0; " +
+                       "nope = key_length - rope.dimension_count)";
+            return false;
+        }
+    }
+
+    // ---- DeepSeek-V4 extras ---------------------------------------------
+    // Grouped output, window, hash-route depth, compressed rope base and the
+    // per-layer ratios. compress_ratios must cover every layer: a short
+    // array is a truncated download, not a default. get_i64_array widens any
+    // integral element width, so the check is on the count, not the type.
+    if (aspec.dsv4) {
+        cfg_.dsv4 = true;
+        cfg_.dsv4_o_groups = static_cast<i32>(
+            gguf_.get_i64(key(".attention.output_group_count"), 0));
+        cfg_.dsv4_o_lora = static_cast<i32>(
+            gguf_.get_i64(key(".attention.output_lora_rank"), 0));
+        cfg_.dsv4_window = static_cast<i32>(
+            gguf_.get_i64(key(".attention.sliding_window"), 0));
+        cfg_.dsv4_hash_layers = static_cast<i32>(
+            gguf_.get_i64(key(".hash_layer_count"), 0));
+        cfg_.dsv4_compress_rope_base = static_cast<f32>(
+            gguf_.get_f64(key(".attention.compress_rope_freq_base"), 0.0));
+        std::vector<i64> ratios;
+        const bool have_ratios =
+            gguf_.get_i64_array(key(".attention.compress_ratios"), &ratios);
+        if (have_ratios) {
+            cfg_.dsv4_ratio.assign(ratios.begin(), ratios.end());
+            for (i64 v : ratios)
+                if (v != 0 && v != 4 && v != 128) {
+                    if (err)
+                        *err = "arch '" + a + "': compress_ratios carries " +
+                               std::to_string(v) + " (want 0, 4 or 128)";
+                    return false;
+                }
+        }
+        if (cfg_.dsv4_o_groups <= 0 || cfg_.dsv4_o_lora <= 0 ||
+            cfg_.dsv4_window <= 0 || cfg_.dsv4_compress_rope_base <= 0.0f ||
+            !have_ratios ||
+            static_cast<i32>(ratios.size()) < cfg_.n_layer) {
+            if (err)
+                *err = "arch '" + a + "': V4 metadata is incomplete " +
+                       "(output_group_count/output_lora_rank/sliding_window/"
+                       "compress_rope_freq_base must be > 0 and "
+                       "compress_ratios must cover every layer)";
             return false;
         }
     }
@@ -1361,6 +1413,84 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 L.ssm_alpha = need(blk_key("blk.%d.ssm_alpha.weight", l));
                 L.ssm_beta = need(blk_key("blk.%d.ssm_beta.weight", l));
                 L.ssm_norm = upload_f32(blk_key("blk.%d.ssm_norm.weight", l));
+            }
+        } else if (cfg_.mla) {
+            // ---- MLA (DeepSeek-V2/V3/V4) --------------------------------
+            // Legacy lite layout: direct attn_q, MQA kv, unsplit wkv_b.
+            // Modern split tensors are refused by name until a file carries
+            // them: falling through to the MHA branch would load attn_q as a
+            // plain query and then fail on the missing attn_k with a message
+            // that names the wrong tensor.
+            if (gguf_.tensor(blk_key("blk.%d.attn_q_a.weight", l)) ||
+                gguf_.tensor(blk_key("blk.%d.attn_kv_a.weight", l))) {
+                e = "layer " + std::to_string(l) +
+                    " carries modern split MLA tensors (attn_q_a/attn_kv_a); "
+                    "this build loads the legacy lite layout "
+                    "(attn_q/attn_kv_a_mqa/attn_kv_b) so far";
+                if (err) *err = e;
+                return false;
+            }
+            L.wq_direct = need(blk_key("blk.%d.attn_q.weight", l));
+            L.wkv_a_mqa = need(blk_key("blk.%d.attn_kv_a_mqa.weight", l));
+            L.wkv_a_norm =
+                upload_f32(blk_key("blk.%d.attn_kv_a_norm.weight", l));
+            L.wkv_b = need(blk_key("blk.%d.attn_kv_b.weight", l));
+            L.wo = need(blk_key("blk.%d.attn_output.weight", l));
+            if (!L.wq_direct.present() || !L.wkv_a_mqa.present() ||
+                !L.wkv_a_norm || !L.wkv_b.present() || !L.wo.present()) {
+                if (e.empty())
+                    e = "layer " + std::to_string(l) +
+                        " has an incomplete MLA attention block";
+                if (err) *err = e;
+                return false;
+            }
+            // Geometric sanity: the tensors must agree with the metadata the
+            // ranks came from. A file whose tensors disagree with its own
+            // keys is corrupt, and the message names the tensor and both
+            // shapes.
+            {
+                const i64 want_q =
+                    static_cast<i64>(cfg_.n_head) *
+                    (cfg_.mla_qk_nope + cfg_.mla_qk_rope);
+                const i64 want_mqa =
+                    static_cast<i64>(cfg_.mla_kv_lora + cfg_.mla_qk_rope);
+                const i64 want_kvb =
+                    static_cast<i64>(cfg_.n_head) *
+                    (cfg_.mla_qk_nope + cfg_.mla_v_dim);
+                const i64 want_wo =
+                    static_cast<i64>(cfg_.n_head) * cfg_.mla_v_dim;
+                const GgufTensor *tn =
+                    gguf_.tensor(blk_key("blk.%d.attn_kv_a_norm.weight", l));
+                auto bad = [&](const char *nm, i64 got_in, i64 want_in,
+                               i64 got_out, i64 want_out) {
+                    if (got_in != want_in || got_out != want_out) {
+                        e = "layer " + std::to_string(l) + " '" + nm +
+                            "' is [" + std::to_string(got_in) + " x " +
+                            std::to_string(got_out) + "], metadata wants [" +
+                            std::to_string(want_in) + " x " +
+                            std::to_string(want_out) + "]";
+                        return true;
+                    }
+                    return false;
+                };
+                if (bad("attn_q", L.wq_direct.n_in, cfg_.n_embd,
+                        L.wq_direct.n_out, want_q) ||
+                    bad("attn_kv_a_mqa", L.wkv_a_mqa.n_in, cfg_.n_embd,
+                        L.wkv_a_mqa.n_out, want_mqa) ||
+                    bad("attn_kv_b", L.wkv_b.n_in, cfg_.mla_kv_lora,
+                        L.wkv_b.n_out, want_kvb) ||
+                    bad("attn_output", L.wo.n_in, want_wo, L.wo.n_out,
+                        cfg_.n_embd) ||
+                    (tn && tn->n_elements != cfg_.mla_kv_lora)) {
+                    if (tn && tn->n_elements != cfg_.mla_kv_lora && e.empty())
+                        e = "layer " + std::to_string(l) +
+                            " 'attn_kv_a_norm' has " +
+                            std::to_string(tn->n_elements) +
+                            " elements, metadata wants " +
+                            std::to_string(cfg_.mla_kv_lora);
+                    if (err) *err = e;
+                    return false;
+                }
             }
         } else if (gguf_.tensor(blk_key("blk.%d.attn_q.weight", l)) ||
                    gguf_.tensor(blk_key("blk.%d.attn_qkv.weight", l)) ||
@@ -2615,6 +2745,7 @@ void Model::unload() {
         if (L.q_norm) be_->release(L.q_norm);
         if (L.k_norm) be_->release(L.k_norm);
         if (L.sinks) be_->release(L.sinks);
+        if (L.wkv_a_norm) be_->release(L.wkv_a_norm);
         // Device-resident like every other 1-D weight: the wo GEMM and the
         // expert groups read them on the device.
         for (f32 *f : {L.wo_bias, L.exp_gate_bias, L.exp_up_bias, L.exp_down_bias})

@@ -43,6 +43,20 @@ void proj_strided(f32 *out, const f32 *a, const f32 *v, i64 rows, i64 cols,
         for (i64 j = 0; j < cols; j++) out[j] += a[i * stride + j] * v[i];
 }
 
+// One softmax over scores[0, n) (no sink on V2). Separate so both lite
+// orders share the exact association order.
+void softmax_inplace(f32 *scores, i64 n) {
+    f32 mx = scores[0];
+    for (i64 t = 1; t < n; t++)
+        if (scores[t] > mx) mx = scores[t];
+    f32 sum = 0.0f;
+    for (i64 t = 0; t < n; t++) {
+        scores[t] = std::exp(scores[t] - mx);
+        sum += scores[t];
+    }
+    for (i64 t = 0; t < n; t++) scores[t] /= sum;
+}
+
 } // namespace
 
 void mla_absorb_q(f32 *wq_abs, const f32 *wq_b, const f32 *wuk,
@@ -187,6 +201,149 @@ void mla_forward_absorbed(f32 *out, const f32 *x, const f32 *c_cache,
             f32 v = 0.0f;
             for (i64 k = 0; k < g.kv_lora; k++)
                 v += cv[static_cast<size_t>(k)] * uv[k * g.v_dim + d];
+            oh[static_cast<size_t>(d)] = v;
+        }
+        for (i64 d = 0; d < g.v_dim; d++) {
+            const f32 *worow =
+                w.wo + (static_cast<i64>(h) * g.v_dim + d) * g.n_embd;
+            for (i64 i = 0; i < g.n_embd; i++)
+                out[i] += oh[static_cast<size_t>(d)] * worow[i];
+        }
+    }
+}
+
+void mla_rope_norm(f32 *v, i64 n, i64 pos, const f32 *inv_freq) {
+    if (!v || !inv_freq || n <= 0) return;
+    for (i64 i = 0; i + 1 < n; i += 2) {
+        const f32 ang = static_cast<f32>(pos) * inv_freq[i / 2];
+        const f32 c = std::cosf(ang), s = std::sinf(ang);
+        const f32 a = v[i], b = v[i + 1];
+        v[i] = a * c - b * s;
+        v[i + 1] = a * s + b * c;
+    }
+}
+
+void mla_lite_forward_unfolded(f32 *out, const f32 *x, const f32 *c_cache,
+                               const f32 *kpe_cache, const i64 *kpe_pos,
+                               i64 n_keys, i64 q_pos, const MlaLiteWeights &w,
+                               const MlaLiteGeometry &g, const f32 *inv_freq,
+                               f32 scale, f32 eps) {
+    if (!out || !x || !c_cache || !kpe_cache || !kpe_pos || !g.valid() ||
+        !inv_freq || n_keys <= 0)
+        return;
+    (void)eps; // the cache arrives normed; the write path owns the norm.
+    const i64 nope = g.nope();
+    const i64 hv = nope + g.v_dim;
+    const i64 qstride = static_cast<i64>(g.n_head) * g.qk;
+    std::vector<f32> qh(g.qk), qpe(g.qk_rope), kpe(g.qk_rope);
+    std::vector<f32> scores(static_cast<size_t>(n_keys));
+    std::vector<f32> oh(g.v_dim);
+    for (i64 i = 0; i < g.n_embd; i++) out[i] = 0.0f;
+    for (i32 h = 0; h < g.n_head; h++) {
+        proj_strided(qh.data(), w.wq + static_cast<i64>(h) * g.qk, x, g.n_embd,
+                     g.qk, qstride);
+        for (i64 d = 0; d < g.qk_rope; d++)
+            qpe[static_cast<size_t>(d)] = qh[static_cast<size_t>(nope + d)];
+        mla_rope_norm(qpe.data(), g.qk_rope, q_pos, inv_freq);
+        const f32 *wb =
+            w.wkv_b + static_cast<i64>(h) * hv * g.kv_lora;
+        for (i64 t = 0; t < n_keys; t++) {
+            const f32 *c = c_cache + t * g.kv_lora;
+            const f32 *kr = kpe_cache + t * g.qk_rope;
+            for (i64 d = 0; d < g.qk_rope; d++)
+                kpe[static_cast<size_t>(d)] = kr[d];
+            mla_rope_norm(kpe.data(), g.qk_rope, kpe_pos[t], inv_freq);
+            f32 s = 0.0f;
+            for (i64 d = 0; d < nope; d++) {
+                f32 k = 0.0f;
+                for (i64 k2 = 0; k2 < g.kv_lora; k2++)
+                    k += c[k2] * wb[k2 * hv + d];
+                s += qh[static_cast<size_t>(d)] * k;
+            }
+            for (i64 d = 0; d < g.qk_rope; d++)
+                s += qpe[static_cast<size_t>(d)] *
+                     kpe[static_cast<size_t>(d)];
+            scores[static_cast<size_t>(t)] = s * scale;
+        }
+        softmax_inplace(scores.data(), n_keys);
+        for (i64 d = 0; d < g.v_dim; d++) oh[static_cast<size_t>(d)] = 0.0f;
+        for (i64 t = 0; t < n_keys; t++) {
+            const f32 p = scores[static_cast<size_t>(t)];
+            const f32 *c = c_cache + t * g.kv_lora;
+            for (i64 d = 0; d < g.v_dim; d++) {
+                f32 v = 0.0f;
+                for (i64 k2 = 0; k2 < g.kv_lora; k2++)
+                    v += c[k2] * wb[k2 * hv + nope + d];
+                oh[static_cast<size_t>(d)] += p * v;
+            }
+        }
+        for (i64 d = 0; d < g.v_dim; d++) {
+            const f32 *worow =
+                w.wo + (static_cast<i64>(h) * g.v_dim + d) * g.n_embd;
+            for (i64 i = 0; i < g.n_embd; i++)
+                out[i] += oh[static_cast<size_t>(d)] * worow[i];
+        }
+    }
+}
+
+void mla_lite_forward_absorbed(f32 *out, const f32 *x, const f32 *c_cache,
+                               const f32 *kpe_cache, const i64 *kpe_pos,
+                               i64 n_keys, i64 q_pos, const MlaLiteWeights &w,
+                               const MlaLiteGeometry &g, const f32 *inv_freq,
+                               f32 scale, f32 eps) {
+    if (!out || !x || !c_cache || !kpe_cache || !kpe_pos || !g.valid() ||
+        !inv_freq || n_keys <= 0)
+        return;
+    (void)eps;
+    const i64 nope = g.nope();
+    const i64 hv = nope + g.v_dim;
+    const i64 qstride = static_cast<i64>(g.n_head) * g.qk;
+    std::vector<f32> qh(g.qk), qpe(g.qk_rope), kpe(g.qk_rope);
+    std::vector<f32> qk(g.kv_lora), cv(g.kv_lora);
+    std::vector<f32> scores(static_cast<size_t>(n_keys));
+    std::vector<f32> oh(g.v_dim);
+    for (i64 i = 0; i < g.n_embd; i++) out[i] = 0.0f;
+    for (i32 h = 0; h < g.n_head; h++) {
+        proj_strided(qh.data(), w.wq + static_cast<i64>(h) * g.qk, x, g.n_embd,
+                     g.qk, qstride);
+        for (i64 d = 0; d < g.qk_rope; d++)
+            qpe[static_cast<size_t>(d)] = qh[static_cast<size_t>(nope + d)];
+        mla_rope_norm(qpe.data(), g.qk_rope, q_pos, inv_freq);
+        const f32 *wb =
+            w.wkv_b + static_cast<i64>(h) * hv * g.kv_lora;
+        // The absorbed query: Wk_h @ q_nope, scored straight against c.
+        for (i64 k = 0; k < g.kv_lora; k++) {
+            f32 s = 0.0f;
+            for (i64 d = 0; d < nope; d++)
+                s += wb[k * hv + d] * qh[static_cast<size_t>(d)];
+            qk[static_cast<size_t>(k)] = s;
+        }
+        for (i64 t = 0; t < n_keys; t++) {
+            const f32 *c = c_cache + t * g.kv_lora;
+            const f32 *kr = kpe_cache + t * g.qk_rope;
+            for (i64 d = 0; d < g.qk_rope; d++)
+                kpe[static_cast<size_t>(d)] = kr[d];
+            mla_rope_norm(kpe.data(), g.qk_rope, kpe_pos[t], inv_freq);
+            f32 s = 0.0f;
+            for (i64 k = 0; k < g.kv_lora; k++)
+                s += qk[static_cast<size_t>(k)] * c[k];
+            for (i64 d = 0; d < g.qk_rope; d++)
+                s += qpe[static_cast<size_t>(d)] *
+                     kpe[static_cast<size_t>(d)];
+            scores[static_cast<size_t>(t)] = s * scale;
+        }
+        softmax_inplace(scores.data(), n_keys);
+        for (i64 k = 0; k < g.kv_lora; k++) cv[static_cast<size_t>(k)] = 0.0f;
+        for (i64 t = 0; t < n_keys; t++) {
+            const f32 p = scores[static_cast<size_t>(t)];
+            const f32 *c = c_cache + t * g.kv_lora;
+            for (i64 k = 0; k < g.kv_lora; k++)
+                cv[static_cast<size_t>(k)] += p * c[k];
+        }
+        for (i64 d = 0; d < g.v_dim; d++) {
+            f32 v = 0.0f;
+            for (i64 k = 0; k < g.kv_lora; k++)
+                v += cv[static_cast<size_t>(k)] * wb[k * hv + nope + d];
             oh[static_cast<size_t>(d)] = v;
         }
         for (i64 d = 0; d < g.v_dim; d++) {

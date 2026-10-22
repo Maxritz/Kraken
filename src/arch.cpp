@@ -178,10 +178,22 @@ constexpr ArchSpec kTable[] = {
      /*swiglu_oai=*/false, /*hyper_connection=*/false, /*ple=*/false,
      /*qsa=*/false, /*attn_gate_elem=*/false, /*no_out_norm=*/false,
      /*mla=*/true},
+    // Shared-latent MLA (one wkv latent, per-head queries, grouped wo_a/wo_b)
+    // plus V4-only extras: compress_ratios, Sinkhorn hyper-connections,
+    // tid2eid hash routing, YaRN-on-compressed-layers rope. The loader reads
+    // the metadata and (for the dense core) the weights; the engine refuses
+    // until each piece runs. qk_norm is false: the file carries no per-head
+    // q/k norms, only the latent q_a/kv norms.
     {"deepseek4", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "deepseek4",
-     "multi-head latent attention plus compressed-attention tensors are not "
-     "implemented",
-     true, false, false, false},
+     "multi-head latent attention (shared latent + grouped output), sinkhorn "
+     "hyper-connections, tid2eid hash routing and compressed attention are "
+     "not implemented",
+     /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
+     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
+     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
+     /*swiglu_oai=*/false, /*hyper_connection=*/false, /*ple=*/false,
+     /*qsa=*/false, /*attn_gate_elem=*/false, /*no_out_norm=*/false,
+     /*mla=*/true, /*dsv4=*/true},
     // The MTP/prediction-head shard of DeepSeek-V4: `mtp.*` tensors, nothing else.
     {"deepseek4-dspark", ArchShape::Moe, ArchSupport::No, ArchRole::Draft,
      "deepseek4",
@@ -356,7 +368,7 @@ struct GapTensor {
     // the same gate tensor and the same existing code path -- was refused for a
     // feature the engine has. A name list cannot fix itself when a second arch
     // shows up.
-    enum class Served : unsigned char { Never, ByAttnGateFlag };
+    enum class Served : unsigned char { Never, ByAttnGateFlag, ByMlaFlag };
     Served served = Served::Never;
 };
 
@@ -373,9 +385,12 @@ constexpr GapTensor kGapTensors[] = {
     {"attn_v_exps.weight", "routed experts on the attention values (attn_v_exps)",
      false},
     {"attn_v_gate.", "a gate on the attention values (attn_v_gate)", false},
-    {"attn_kv_a.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false},
-    {"attn_kv_b.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false},
-    {"attn_kv.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false},
+    {"attn_kv_a.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false,
+     GapTensor::Served::ByMlaFlag},
+    {"attn_kv_b.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false,
+     GapTensor::Served::ByMlaFlag},
+    {"attn_kv.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false,
+     GapTensor::Served::ByMlaFlag},
     // NOT a gap: the router selection bias is loaded and applied. It was a gap
     // only because the loader looked for `ffn_exp_probs_b.bias` while the files
     // that carry it spell it `exp_probs_b.bias` -- so it was loaded for nothing,
@@ -471,6 +486,8 @@ const char *arch_tensor_gap(std::string_view tensor_name, ArchShape shape,
         if (g.dense_only && !dense) continue;
         if (g.served == GapTensor::Served::ByAttnGateFlag &&
             arch_spec(arch).attn_gate)
+            continue;
+        if (g.served == GapTensor::Served::ByMlaFlag && arch_spec(arch).mla)
             continue;
         if (has(tensor_name, g.needle)) return g.gap;
     }

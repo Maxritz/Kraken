@@ -86,4 +86,69 @@ void mla_forward_absorbed(f32 *out, const f32 *x, const f32 *c_cache,
                           const f32 *wq_abs, const MlaGeometry &g, f32 scale,
                           f32 eps);
 
+// ---- legacy lite layout (DeepSeek-V2-Lite: direct q, MQA kv) -------------
+// No q_lora trunk: attn_q projects straight to n_head*(nope+rope), and one
+// attn_kv_a_mqa projection emits [kv_lora + rope] (latent plus decoupled
+// key). The KV cache row is still kv_lora + rope wide. Two orders again:
+// unfolded builds per-head K/V explicitly (the reference recipe in
+// src/models/deepseek2.cpp: the non-absorbed branch), absorbed folds Wk/Wv
+// into the query side and the value accumulation. They must agree the same
+// way the split pair does. V2 carries no attention sinks.
+struct MlaLiteGeometry {
+    i32 n_embd = 0;
+    i32 n_head = 0;
+    i32 kv_lora = 0;
+    i32 qk = 0;      // full per-head K width: nope + rope
+    i32 qk_rope = 0;
+    i32 v_dim = 0;
+
+    i32 nope() const { return qk - qk_rope; }
+    bool valid() const {
+        return n_embd > 0 && n_head > 0 && kv_lora > 0 && qk_rope > 0 &&
+               v_dim > 0 && qk > qk_rope;
+    }
+    // One cache row: the normed latent plus the UNROTATED decoupled key;
+    // the oracle rotates each side at its own position.
+    i64 cache_row_width() const {
+        return static_cast<i64>(kv_lora) + qk_rope;
+    }
+};
+
+// Layer weights, row-major [rows, cols], host f32. wkv_b is the unsplit
+// legacy table: head h owns columns [h*(nope+v), h*(nope+v)+nope+v), K part
+// first, V part last.
+struct MlaLiteWeights {
+    const f32 *wq = nullptr;        // [n_embd, n_head*qk]
+    const f32 *wkv_a_mqa = nullptr; // [n_embd, kv_lora+rope]
+    const f32 *wkv_a_norm = nullptr; // [kv_lora] rms gamma
+    const f32 *wkv_b = nullptr;     // [kv_lora, n_head*(nope+v)]
+    const f32 *wo = nullptr;        // [n_head*v, n_embd]
+};
+
+// Consecutive-pair (NORM) rotation of the trailing rope slice, in place.
+// This is the pairing the deepseek2 arch uses (rope_neox=false); the engine
+// applies the same convention in rope_apply, so a mismatch between the two
+// reads as a dump-vs-oracle failure, not as a silent shift.
+void mla_rope_norm(f32 *v, i64 n, i64 pos, const f32 *inv_freq);
+
+// Reference clarity path: explicit per-head K/V from the normed latent,
+// then scores, softmax, weighted sums, output projection. kpe_cache holds
+// UNROTATED rows with one write position each; q is rotated at q_pos.
+// inv_freq is [rope/2] (plain 10000-based, or YaRN-adjusted by the caller);
+// scale carries any YaRN magnitude factor (mscale^2/sqrt(qk) on the file).
+void mla_lite_forward_unfolded(f32 *out, const f32 *x, const f32 *c_cache,
+                               const f32 *kpe_cache, const i64 *kpe_pos,
+                               i64 n_keys, i64 q_pos, const MlaLiteWeights &w,
+                               const MlaLiteGeometry &g, const f32 *inv_freq,
+                               f32 scale, f32 eps);
+
+// Oracle order: per-head K folded into the query (qk_h = Wk_h @ q_nope) and
+// per-head V folded into the accumulated latent (oh = cv @ Wv_h). Must agree
+// with the unfolded path within f32 tolerance and replay bit-identically.
+void mla_lite_forward_absorbed(f32 *out, const f32 *x, const f32 *c_cache,
+                               const f32 *kpe_cache, const i64 *kpe_pos,
+                               i64 n_keys, i64 q_pos, const MlaLiteWeights &w,
+                               const MlaLiteGeometry &g, const f32 *inv_freq,
+                               f32 scale, f32 eps);
+
 } // namespace krk

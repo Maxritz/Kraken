@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-22T04:01:38Z",
-  "recorded_commit": "ac5bafa",
-  "totals": {"groups": 75, "passed": 3660, "run": 3660, "exit": 0},
+  "recorded_utc": "2026-10-22T04:35:30Z",
+  "recorded_commit": "a4f39a3",
+  "totals": {"groups": 76, "passed": 3717, "run": 3717, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -63,6 +63,7 @@
     {"name": "test_qwen4exp_hc_mix", "status": "pass", "passed": 7, "run": 7},
     {"name": "test_qwen4exp_ple", "status": "pass", "passed": 16, "run": 16},
     {"name": "test_mla_absorb", "status": "pass", "passed": 36, "run": 36},
+    {"name": "test_mla_lite", "status": "pass", "passed": 57, "run": 57},
     {"name": "test_qsa_select", "status": "pass", "passed": 14, "run": 14},
     {"name": "test_qwen4exp_qsa", "status": "pass", "passed": 17, "run": 17},
     {"name": "test_cpu_expert_pool", "status": "pass", "passed": 60, "run": 60},

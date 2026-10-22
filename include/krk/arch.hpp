@@ -141,6 +141,14 @@ struct ArchSpec {
     // absorbed into the output at load. Ranks live in ModelConfig; the flag
     // only says the schema carries them.
     bool mla = false;
+    // ---- DeepSeek-V4 (shared-latent MLA + sparse extras) ------------------
+    // The dense core is still one shared latent (wkv/attn_kv_norm) with
+    // per-head queries and a grouped output (wo_a/wo_b), but the stack adds
+    // compressed-attention layers (compress_ratios), a Sinkhorn
+    // hyper-connection, a tid2eid hash route and YaRN-on-compressed-layers
+    // rope. The flag says the loader reads that metadata; the engine still
+    // refuses until each piece runs.
+    bool dsv4 = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.
