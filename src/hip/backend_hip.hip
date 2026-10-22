@@ -289,6 +289,13 @@ public:
         if (path_ == GemmPath::kWmma && !caps_.has_wmma)
             KRK_WARN("KRK_GEMM_PATH=wmma, but %s has no WMMA; the ladder will "
                      "fall through", caps_.gfx.c_str());
+        // A rung that was asked for and was compiled out is the same silent
+        // fallthrough one level up: the device has it, the binary does not.
+#if !defined(KRK_WMMA_COMPILED)
+        if (path_ == GemmPath::kWmma)
+            KRK_WARN("KRK_GEMM_PATH=wmma, but this binary holds no WMMA rung; "
+                     "the ladder will fall through");
+#endif
         if (path_ == GemmPath::kDp4a && !int8_gemm_)
             KRK_WARN("KRK_GEMM_PATH=dp4a also turns on the int8 activations, "
                      "which are lossy by construction");

@@ -80,7 +80,14 @@
 #if defined(KRK_GFX11)
 #define KRK_WMMA_COMPILED 1
 #endif
-#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__))
+// The __gfx*__ macros exist only in the device pass, so a host-only guard
+// would compile the WMMA rung out of the dispatcher while the kernel itself
+// still lands in the fat binary -- the rung then silently never runs (seen
+// live: every rows>1 GEMM on gfx1201 fell through to the scalar SIMT tile).
+// The OFFLOAD mirror exists in both passes, so it decides here.
+#if defined(KRK_GFX12) && (defined(__gfx1200__) || defined(__gfx1201__) ||     \
+                           defined(KRK_OFFLOAD_GFX1200) ||                      \
+                           defined(KRK_OFFLOAD_GFX1201))
 #define KRK_WMMA_COMPILED 1
 #endif
 
