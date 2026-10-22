@@ -275,6 +275,18 @@ struct ModelConfig {
     std::vector<i64> ple_head_vocab_sizes;
     std::vector<i32> ple_layers;        // layer indices carrying a PLE module
     bool qsa = false;
+    // ---- MLA (DeepSeek-V2/V3/V4) --------------------------------------
+    // The latent geometry, read off the file's own attention metadata: the
+    // compressed query/key/value ranks and the nope/rope split of a query
+    // head. A layer's KV cache row is kv_lora_rank + qk_rope_head_dim wide
+    // (576 floats for V3), not n_kv x head_dim x 2, and there are no per-head
+    // K/V rows at all -- the per-head V projection is absorbed at load.
+    bool mla = false;
+    i32 mla_q_lora = 0;
+    i32 mla_kv_lora = 0;
+    i32 mla_qk_nope = 0;
+    i32 mla_qk_rope = 0;
+    i32 mla_v_dim = 0;
     i32 idx_n_head = 0;
     i32 idx_head_dim = 0;
     i32 idx_top_k = 0;

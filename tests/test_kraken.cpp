@@ -55,6 +55,7 @@
 #include "krk/expert_cpu.hpp"
 #include "krk/gguf.hpp"
 #include "krk/hc.hpp"
+#include "krk/mla.hpp"
 #include "krk/ple.hpp"
 #include "krk/qsa.hpp"
 #include "krk/http.hpp"
@@ -9231,6 +9232,117 @@ static void test_qwen4exp_ple() {
 // through the real forward pass. The pieces the forward does not run yet (PLE,
 // the QSA indexer) are left out of the fixture, so a pass here is the stack.
 // ---------------------------------------------------------------------------
+// MLA, the host maths first (no engine, no file): the absorbed order the
+// oracle will prove kernels against, checked against the unfolded reference.
+// A wrong absorb is fluent text rather than a crash -- the same failure shape
+// as the PLE lane scatter -- so the equivalence, not a sample, is the gate.
+// The double-norm guard is load-bearing too: the cache holds normed rows, so
+// the read path must not norm again, and this group fails if it does (the
+// absorbed norm of an already-normed row shrinks every output ~1/sqrt(n)).
+static void test_mla_absorb() {
+    krk::MlaGeometry g;
+    g.n_embd = 32;
+    g.n_head = 3;
+    g.q_lora = 24;
+    g.kv_lora = 16;
+    g.qk_nope = 8;
+    g.qk_rope = 4;
+    g.v_dim = 8;
+    CHECK(g.valid(), "synthetic MLA geometry is valid");
+    CHECK(g.cache_row_width() == 20, "cache row is kv_lora + qk_rope");
+    // Deterministic fill: the same bytes every run, no fixture file.
+    u32 rng = 0x2f6e2b29u;
+    auto rnd = [&]() {
+        rng = rng * 1103515245u + 12345u;
+        return static_cast<f32>((rng >> 20) & 0xff) / 255.0f - 0.5f;
+    };
+    const i64 qs = static_cast<i64>(g.qk_nope) + g.qk_rope;
+    std::vector<f32> wqa(g.n_embd * g.q_lora), qan(g.q_lora),
+        wqb(g.q_lora * g.n_head * qs), wka(g.n_embd * g.kv_lora),
+        knorm(g.kv_lora), wkr(g.n_embd * g.qk_rope),
+        wuk(g.n_head * g.kv_lora * g.qk_nope),
+        wuv(g.n_head * g.kv_lora * g.v_dim),
+        wo(g.n_head * g.v_dim * g.n_embd);
+    for (f32 &v : wqa) v = rnd();
+    for (f32 &v : qan) v = 0.9f + 0.2f * rnd();
+    for (f32 &v : wqb) v = rnd();
+    for (f32 &v : wka) v = rnd();
+    for (f32 &v : knorm) v = 0.9f + 0.2f * rnd();
+    for (f32 &v : wkr) v = rnd();
+    for (f32 &v : wuk) v = rnd();
+    for (f32 &v : wuv) v = rnd();
+    for (f32 &v : wo) v = rnd();
+    krk::MlaWeights w;
+    w.wq_a = wqa.data();
+    w.wqa_norm = qan.data();
+    w.wq_b = wqb.data();
+    w.wkv_a = wka.data();
+    w.wkv_norm = knorm.data();
+    w.wkr = wkr.data();
+    w.wuk = wuk.data();
+    w.wuv = wuv.data();
+    w.wo = wo.data();
+    // The write path: compress, norm, cache. The test builds cache rows the
+    // way the forward will, through the same rms formula.
+    const i64 n_keys = 5;
+    std::vector<f32> cc(n_keys * g.kv_lora), kk(n_keys * g.qk_rope);
+    std::vector<f32> xt(g.n_embd);
+    for (i64 t = 0; t < n_keys; t++) {
+        f32 *c = cc.data() + t * g.kv_lora;
+        // norm through the engine formula: mean square + eps, gamma row.
+        f64 ss = 0.0;
+        std::vector<f32> raw(g.kv_lora);
+        for (i64 i = 0; i < g.n_embd; i++) xt[static_cast<size_t>(i)] = rnd();
+        for (i64 k = 0; k < g.kv_lora; k++) {
+            f32 s = 0.0f;
+            for (i64 i = 0; i < g.n_embd; i++)
+                s += wka[static_cast<size_t>(i) * g.kv_lora + k] *
+                     xt[static_cast<size_t>(i)];
+            raw[static_cast<size_t>(k)] = s;
+            ss += static_cast<f64>(s) * s;
+        }
+        const f32 inv =
+            1.0f / std::sqrt(static_cast<f32>(ss / g.kv_lora) + 1e-6f);
+        for (i64 k = 0; k < g.kv_lora; k++)
+            c[k] = raw[static_cast<size_t>(k)] * inv *
+                   knorm[static_cast<size_t>(k)];
+        f32 *kr = kk.data() + t * g.qk_rope;
+        for (i64 d = 0; d < g.qk_rope; d++) {
+            f32 s = 0.0f;
+            for (i64 i = 0; i < g.n_embd; i++)
+                s += wkr[static_cast<size_t>(i) * g.qk_rope + d] *
+                     xt[static_cast<size_t>(i)];
+            kr[d] = s;
+        }
+    }
+    std::vector<f32> x(g.n_embd);
+    for (f32 &v : x) v = rnd();
+    std::vector<f32> wq_abs(g.n_head * g.q_lora * g.kv_lora);
+    krk::mla_absorb_q(wq_abs.data(), wqb.data(), wuk.data(), g);
+    std::vector<f32> ou(g.n_embd), oa(g.n_embd), oa2(g.n_embd);
+    const f32 sc = 1.0f / std::sqrt(static_cast<f32>(qs));
+    krk::mla_forward_unfolded(ou.data(), x.data(), cc.data(), kk.data(),
+                              n_keys, w, g, sc, 1e-6f);
+    krk::mla_forward_absorbed(oa.data(), x.data(), cc.data(), kk.data(),
+                              n_keys, w, wq_abs.data(), g, sc, 1e-6f);
+    krk::mla_forward_absorbed(oa2.data(), x.data(), cc.data(), kk.data(),
+                              n_keys, w, wq_abs.data(), g, sc, 1e-6f);
+    double worst = 0.0;
+    bool finite = true;
+    for (i64 i = 0; i < g.n_embd; i++) {
+        const double d =
+            std::fabs(static_cast<double>(ou[static_cast<size_t>(i)]) -
+                      static_cast<double>(oa[static_cast<size_t>(i)]));
+        if (d > worst) worst = d;
+        if (!std::isfinite(oa[static_cast<size_t>(i)])) finite = false;
+        // Determinism: the oracle order replays byte-identically.
+        CHECK(oa[static_cast<size_t>(i)] == oa2[static_cast<size_t>(i)],
+              "absorbed forward is deterministic");
+    }
+    CHECK(finite, "absorbed output is finite");
+    CHECK(worst < 1e-4, "absorbed matches unfolded within f32 tolerance");
+}
+
 // QSA indexer, the host maths first (no engine, no file): pooling over complete
 // blocks only, the per-head relu before the sum, rope at the block's FIRST
 // position, and the selection rule -- budget in CELLS, the still-filling block
@@ -10805,6 +10917,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_qwen4exp_gdn_gate)
     TEST_GROUP(test_qwen4exp_hc_mix)
     TEST_GROUP(test_qwen4exp_ple)
+    TEST_GROUP(test_mla_absorb)
     TEST_GROUP(test_qsa_select)
     TEST_GROUP(test_qwen4exp_qsa)
     TEST_GROUP(test_cpu_expert_pool)

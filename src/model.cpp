@@ -385,6 +385,35 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         }
     }
 
+    // ---- MLA (DeepSeek-V2/V3/V4) ----------------------------------------
+    // Latent ranks off the file's own attention metadata. Read for every
+    // schema that declares it, validated > 0 with the key named: a file
+    // that claims MLA without ranks is a truncated download, not a model
+    // with a default. The engine still refuses the arch (no latent kernels
+    // yet); these fields are what the refusal will stop needing first.
+    if (aspec.mla) {
+        cfg_.mla = true;
+        cfg_.mla_q_lora = static_cast<i32>(
+            gguf_.get_i64(key(".attention.q_lora_rank"), 0));
+        cfg_.mla_kv_lora = static_cast<i32>(
+            gguf_.get_i64(key(".attention.kv_lora_rank"), 0));
+        cfg_.mla_qk_nope = static_cast<i32>(
+            gguf_.get_i64(key(".attention.qk_nope_head_dim"), 0));
+        cfg_.mla_qk_rope = static_cast<i32>(
+            gguf_.get_i64(key(".attention.qk_rope_head_dim"), 0));
+        cfg_.mla_v_dim = static_cast<i32>(
+            gguf_.get_i64(key(".attention.v_head_dim"), 0));
+        if (cfg_.mla_q_lora <= 0 || cfg_.mla_kv_lora <= 0 ||
+            cfg_.mla_qk_nope <= 0 || cfg_.mla_qk_rope <= 0 ||
+            cfg_.mla_v_dim <= 0) {
+            if (err)
+                *err = "arch '" + a + "': MLA ranks are incomplete "
+                       "(q_lora_rank/kv_lora_rank/qk_nope_head_dim/" +
+                       "qk_rope_head_dim/v_head_dim must all be > 0)";
+            return false;
+        }
+    }
+
     // ---- qwen4exp: hyper-connections, PLE, QSA ---------------------------
     // Read only for the schema flags, so a file of another family costs four
     // pointer tests and nothing else.

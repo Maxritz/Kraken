@@ -172,7 +172,12 @@ constexpr ArchSpec kTable[] = {
     // their norms) that the attention kernels have no shape for.
     {"deepseek2", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "deepseek2",
      "multi-head latent attention (attn_kv_a/attn_kv_b) is not implemented",
-     true, false, false, false},
+     /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
+     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
+     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
+     /*swiglu_oai=*/false, /*hyper_connection=*/false, /*ple=*/false,
+     /*qsa=*/false, /*attn_gate_elem=*/false, /*no_out_norm=*/false,
+     /*mla=*/true},
     {"deepseek4", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "deepseek4",
      "multi-head latent attention plus compressed-attention tensors are not "
      "implemented",
