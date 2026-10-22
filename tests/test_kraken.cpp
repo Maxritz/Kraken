@@ -4719,6 +4719,48 @@ static void test_expert_promotion_failure() {
     std::remove(path.c_str());
 }
 
+static void test_moe_route_predictor() {
+    MoeRoutePredictor predictor;
+    predictor.configure(4, 6, 3);
+    const i32 source[] = {0, 1, 1, -1};
+    const i32 target[] = {3, 4};
+    predictor.observe(0, source, 4);
+    predictor.observe(2, target, 2);
+
+    std::vector<i32> candidates;
+    predictor.predict(2, 0, 3, 0.5f, 3, candidates);
+    CHECK(candidates.size() == 3,
+          "combined temporal and adjacent-layer hints obey the candidate budget");
+    CHECK(candidates[0] == 3 && candidates[1] == 4 && candidates[2] == 0,
+          "temporal candidates rank first on an equal-confidence bootstrap");
+    CHECK(predictor.predictions_issued() == 1,
+          "one non-empty hint set is accounted as a prediction");
+
+    // The native route remains the only target signal. Its IDs score the
+    // pending candidates and update each method's confidence independently.
+    const i32 actual_target[] = {3, 0};
+    predictor.observe(2, actual_target, 2);
+    CHECK(predictor.candidates() == 3 && predictor.candidate_hits() == 2,
+          "candidate correctness is measured against the native route");
+    CHECK(std::fabs(predictor.candidate_precision() - (2.0f / 3.0f)) < 1e-6f,
+          "candidate precision reports correct/issued experts");
+
+    // Temporal and cross-layer signals below the minimum confidence stop
+    // producing speculative candidates; caller demand routing remains intact.
+    predictor.predict(2, 0, 3, 0.75f, 3, candidates);
+    CHECK(candidates.empty(), "low-confidence predictions fall back to no prefetch");
+    predictor.predict(2, 0, 2, 0.25f, 2, candidates);
+    CHECK(candidates.size() == 2 && candidates[0] == 0 && candidates[1] == 1,
+          "cross-layer policy uses the source route and stays bounded");
+
+    predictor.reset();
+    CHECK(predictor.predictions_issued() == 0 && predictor.candidates() == 0 &&
+              predictor.staged() == 0,
+          "request reset clears history and telemetry");
+    predictor.predict(2, 0, 3, 0.0f, 3, candidates);
+    CHECK(candidates.empty(), "a fresh request cannot reuse stale route IDs");
+}
+
 static void test_expert_cache_policy() {
     const std::string path = "kraken-policy-test.gguf";
     CHECK(build_expert_source_model(path), "wrote the policy-test GGUF");
@@ -10511,6 +10553,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_router_resident_preference)
     TEST_GROUP(test_moe_matches_dense_twin)
     TEST_GROUP(test_moe_grouped_prefill_matches_tokenwise)
+    TEST_GROUP(test_moe_route_predictor)
     TEST_GROUP(test_expert_cache_policy)
     TEST_GROUP(test_expert_cache_byte_budget)
     TEST_GROUP(test_expert_cache_warm_tier)

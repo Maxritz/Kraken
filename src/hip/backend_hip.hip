@@ -26,12 +26,14 @@
 #include "kernels/fused.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/gemm_dp4a.hpp"
+#include "kernels/gemm_mmq.hpp"
 #include "kernels/gdn.hpp"
 #include "kernels/hadamard.hpp"
 #include "kernels/hc.hpp"
 #include "kernels/gather.hpp"
 #include "kernels/ple.hpp"
 #include "op_time.hpp"
+#include "krk/trace.hpp"
 
 // Declared here rather than at their definitions (below the class) so the
 // backend's upload path can call them; see the definitions for the measurements.
@@ -299,6 +301,7 @@ public:
 
     // ---- memory ----------------------------------------------------------
     void *alloc(size_t bytes) override {
+        KRK_TRACE_SCOPE("memory", "alloc");
         if (bytes == 0) bytes = 1;
         const size_t rounded = (bytes + 255u) & ~static_cast<size_t>(255u);
         void *p = nullptr;
@@ -1644,6 +1647,9 @@ public:
 
     void upload(void *dst, const void *src, size_t bytes, size_t off) override {
         KRK_TIME_OP("upload");
+        KRK_TRACE_SCOPE_ARGS("transfer", "upload", nullptr);
+        krk::Trace::get().ensure_on();
+        const double tu0 = krk::Trace::get().on() ? krk::Trace::get().now_us() : 0.0;
         // The cold path: a reused cell here may be reached by the pull ring's
         // own streams, so the guard is honored on the host. 6% of acquires.
         pool_honor_host_(dst);
@@ -1664,6 +1670,11 @@ public:
             return;
         KRK_HIP(hipMemcpy(static_cast<char *>(dst) + off, src, bytes,
                           hipMemcpyHostToDevice));
+        if (krk::Trace::get().on()) {
+            char args[96];
+            std::snprintf(args, sizeof(args), "\"bytes\":%zu,\"dir\":\"H2D\"", bytes);
+            krk::Trace::get().complete("transfer", "upload", tu0, krk::Trace::get().now_us() - tu0, args);
+        }
     }
     // Device-to-device, on the stream every kernel here runs on, so the next
     // reader of the destination is already ordered behind it.
@@ -1863,8 +1874,15 @@ public:
 
     void download(void *dst, const void *src, size_t bytes, size_t off) override {
         KRK_TIME_OP("download");
+        krk::Trace::get().ensure_on();
+        const double td0 = krk::Trace::get().on() ? krk::Trace::get().now_us() : 0.0;
         KRK_HIP(hipMemcpy(dst, static_cast<const char *>(src) + off, bytes,
                           hipMemcpyDeviceToHost));
+        if (krk::Trace::get().on()) {
+            char args[96];
+            std::snprintf(args, sizeof(args), "\"bytes\":%zu,\"dir\":\"D2H\"", bytes);
+            krk::Trace::get().complete("transfer", "download", td0, krk::Trace::get().now_us() - td0, args);
+        }
     }
     void fill0(void *dst, size_t bytes) override {
         KRK_TIME_OP("fill0");
@@ -1874,6 +1892,7 @@ public:
         KRK_HIP(hipMemset(dst, 0, bytes));
     }
     void sync() override {
+        KRK_TRACE_SCOPE("wait", "device-sync");
         KRK_HIP(hipDeviceSynchronize());
         // The device sync just made the outstanding copy pair complete, so this
         // fold cannot block: it is what keeps the reported rate whole at the end
@@ -1900,6 +1919,7 @@ public:
             sync();
             return;
         }
+        KRK_TRACE_SCOPE("wait", "event-sync");
         const hipEvent_t event = static_cast<hipEvent_t>(marker);
         KRK_HIP(hipEventSynchronize(event));
         const auto probe = stage_probes_.find(event);
@@ -2529,8 +2549,35 @@ public:
             // The dispatcher picks the kernel for this weight format; every
             // format it stages was checked against the host decoder by
             // tools/gemm_i8k_verify.cpp (built as kraken-i8k).
-            gemm_dp4a_dispatch(static_cast<int>(wt), wh, n_out, n_in, row_bytes, xh,
-                               rows, oh, reinterpret_cast<i8 *>(int8q_), int8s_);
+            // KRK_DP4A_MMQ selects the MMQ-shaped tile (kernels/gemm_mmq.hpp):
+            // 1 is its 4x4 tile on dp4a's int8 staging, 2 adds the packed
+            // nibble staging with v_perm expansion. Unset keeps the dp4a tile,
+            // which is the default and the baseline every number there quotes.
+            const int wt_i = static_cast<int>(wt);
+            if (mmq::mmq_ok(wt_i, rows, n_out, n_in)) {
+                i8 *const qc = reinterpret_cast<i8 *>(int8q_);
+                switch (mmq::mmq_arm()) {
+                    case mmq::MmqArm::kPacked:
+                        mmq::mmq_launch<mmq::cfg::kMmqTM, mmq::cfg::kMmqTN,
+                                        mmq::cfg::kMmqTY, true>(
+                            wh, n_out, n_in, row_bytes, xh, rows, oh, qc, int8s_);
+                        break;
+                    case mmq::MmqArm::kWidePacked:
+                        mmq::mmq_launch<mmq::cfg::kWideTM, mmq::cfg::kWideTN,
+                                        mmq::cfg::kWideTY, true>(
+                            wh, n_out, n_in, row_bytes, xh, rows, oh, qc, int8s_);
+                        break;
+                    case mmq::MmqArm::kInt8:
+                        mmq::mmq_launch<mmq::cfg::kMmqTM, mmq::cfg::kMmqTN,
+                                        mmq::cfg::kMmqTY, false>(
+                            wh, n_out, n_in, row_bytes, xh, rows, oh, qc, int8s_);
+                        break;
+                    default:
+                        break;
+                }
+            } else
+                gemm_dp4a_dispatch(wt_i, wh, n_out, n_in, row_bytes, xh, rows,
+                                   oh, reinterpret_cast<i8 *>(int8q_), int8s_);
         } else {
             const dim3 grid(
                 static_cast<unsigned>((n_out + simt_cfg::BN - 1) / simt_cfg::BN),

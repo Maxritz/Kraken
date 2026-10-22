@@ -104,6 +104,73 @@ static bool next_prefetch_on() {
     return v;
 }
 
+static i32 next_moe_layer(const std::vector<LayerWeights> &layers, i32 start,
+                          i32 n_layer) {
+    for (i32 layer = std::max<i32>(0, start);
+         layer < n_layer && layer < static_cast<i32>(layers.size()); ++layer)
+        if (layers[static_cast<size_t>(layer)].moe) return layer;
+    return -1;
+}
+
+// Adaptive next-layer prediction is opt-in and only changes the expert IDs
+// submitted to stage_ahead(); the target layer's native router remains the only
+// authority for executed experts. Temporal and cross-layer signals are evaluated
+// against every subsequent native route and confidence-gated before staging.
+static bool moe_predict_on() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_MOE_PREDICT");
+        return e && *e && e[0] != '0';
+    }();
+    return v;
+}
+
+static i32 moe_predict_history() {
+    static const i32 v = [] {
+        const char *e = std::getenv("KRK_MOE_PREDICT_HISTORY");
+        const long n = e ? std::strtol(e, nullptr, 10) : 4;
+        return n < 2 ? 2 : (n > 16 ? 16 : static_cast<i32>(n));
+    }();
+    return v;
+}
+
+static f32 moe_predict_min_overlap() {
+    static const f32 v = [] {
+        const char *e = std::getenv("KRK_MOE_PREDICT_MIN_OVERLAP");
+        const f32 x = e ? static_cast<f32>(std::atof(e)) : 0.5f;
+        return std::min(1.0f, std::max(0.0f, x));
+    }();
+    return v;
+}
+
+static i32 moe_predict_budget() {
+    static const i32 v = [] {
+        const char *e = std::getenv("KRK_MOE_PREDICT_K");
+        const long n = e ? std::strtol(e, nullptr, 10) : 2;
+        return n < 0 ? 0 : (n > 128 ? 128 : static_cast<i32>(n));
+    }();
+    return v;
+}
+
+static i32 moe_predict_policy() {
+    // 1 = reuse the target layer's previous route (temporal), 2 = previous
+    // MoE layer's previous-token route (cross-layer), 3 = combine both as a
+    // unique candidate set, still bounded by the budget.
+    static const i32 v = [] {
+        const char *e = std::getenv("KRK_MOE_PREDICT_POLICY");
+        const long n = e ? std::strtol(e, nullptr, 10) : 3;
+        return n >= 1 && n <= 3 ? static_cast<i32>(n) : 3;
+    }();
+    return v;
+}
+
+static bool expert_prediction_model_supported(const ModelConfig &mc) {
+    // Cache hints consume only the final native route IDs. That makes learned,
+    // recurrent, HC, and even hash-routed layers safe: the predictor cannot
+    // affect routing or output. Architecture gating is therefore the real
+    // contract -- only models declared MoE can enter this path.
+    return mc.is_moe;
+}
+
 static bool swa_off() {
     static const bool v = [] {
         const char *e = std::getenv("KRK_SWA_OFF");
@@ -590,6 +657,11 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         KRK_INFO("expert cache: top-k' lookahead at k'=%d -- the runners-up are "
                  "staged only when they are already in WARM",
                  expert_lookahead_);
+    // The request is not an enable decision until the loaded architecture and
+    // final pinned-WARM budget have both been checked below.
+    moe_predict_enabled_ = false;
+    moe_predict_ids_.clear();
+    moe_predictor_.configure(0, 0, moe_predict_history());
     trace_hash_on_ = cfg.trace_hash;
     trace_stage_.clear();
     // Size the CPU worker pool before the first forward pass.
@@ -637,6 +709,14 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         be_ = nullptr;
         return false;
     }
+    const ModelConfig &predict_mc = model_.cfg();
+    const bool moe_predict_requested = moe_predict_on();
+    const bool moe_predict_arch_ok = expert_prediction_model_supported(predict_mc);
+    moe_predictor_.configure(predict_mc.n_layer, predict_mc.n_expert,
+                             moe_predict_history());
+    if (moe_predict_requested && !moe_predict_arch_ok)
+        KRK_INFO("expert predictor: disabled for %s (model is not a supported MoE); "
+                 "native routing remains unchanged", predict_mc.arch.c_str());
 
     // This has to happen AFTER the load, and that is not a style choice: the
     // geometry it reads is the loader's, and the same block sitting above the
@@ -1327,6 +1407,20 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         shutdown();
         return false;
     }
+    // configure_expert_cache applies the measured/explicit pin budget. Only
+    // enable prediction if its nonblocking pinned-source contract is true in
+    // the final cache configuration (auto pinning may have been rejected by
+    // the H2D probe, so a pre-configuration guess is not enough).
+    moe_predict_enabled_ = moe_predict_requested && moe_predict_arch_ok &&
+                           model_.experts().host_pin_budget() > 0;
+    if (moe_predict_requested && moe_predict_arch_ok && !moe_predict_enabled_)
+        KRK_INFO("expert predictor: disabled (pinned WARM is off; "
+                 "stage_ahead requires pinned DMA sources)");
+    else if (moe_predict_enabled_)
+        KRK_INFO("expert predictor: online, policy=%d history=%d limit=%d "
+                 "min-precision=%.2f; native routes remain authoritative",
+                 moe_predict_policy(), moe_predict_history(), moe_predict_budget(),
+                 static_cast<f64>(moe_predict_min_overlap()));
     // KV residency -- allocated LAST, after the weights and every workspace.
     //
     // That ordering is load-bearing. Reading device_free_bytes() before the
@@ -1663,6 +1757,19 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
 }
 
 void Engine::shutdown() {
+    if (moe_predict_enabled_) {
+        const u64 candidates = moe_predictor_.candidates();
+        const u64 hits = moe_predictor_.candidate_hits();
+        KRK_INFO("expert predictor: %llu hint set(s), %llu expert(s) staged, "
+                 "%llu/%llu candidate hits (%.1f%% precision); routes unchanged",
+                 static_cast<unsigned long long>(moe_predictor_.predictions_issued()),
+                 static_cast<unsigned long long>(moe_predictor_.staged()),
+                 static_cast<unsigned long long>(hits),
+                 static_cast<unsigned long long>(candidates),
+                 candidates ? 100.0 * static_cast<f64>(hits) /
+                                 static_cast<f64>(candidates)
+                            : 0.0);
+    }
     // Before anything is released: the other half of the ledger. A workspace
     // taken after init (a per-forward scratch, a promoted dense layer) moves
     // `workspaces` or `unaccounted` here, which is what makes the two prints a
@@ -2298,6 +2405,7 @@ void Engine::head_compute(i32 row) {
 }
 
 bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
+    KRK_TRACE_COMP("forward-core");
     {
         // See the KRK_VRAM_TRACE block at the end of this function: entry and
         // exit readings bracket the forward, which is what tells a bound inside
@@ -3316,6 +3424,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
 }
 
 void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
+    KRK_TRACE_COMP("dense-ffn");
     // gate/up share the FFN-norm output: one fused launch on the decode row.
     // A folded gate/up reads the transformed copy instead; the router of a
     // mixed dense/MoE model reads the primal ws_xn_, which is why the copy
@@ -3357,6 +3466,7 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
 }
 
 bool Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
+    KRK_TRACE_COMP(n > 1 ? "prefill-forward" : "decode-forward");
     if (!forward_core(toks, n, pos0, want_logits ? LogitsLast : LogitsNone))
         return false;
     kv_pos_ = std::max<i64>(kv_pos_, static_cast<i64>(pos0) + n);
@@ -4983,6 +5093,7 @@ void Engine::mamba2_forward(const LayerWeights &L, i32 l, i32 n) {
 }
 
 void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
+    KRK_TRACE_COMP("gdn-forward");
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
     const i64 kdim = model_.key_dim();
@@ -6359,6 +6470,7 @@ static bool moe_silu_fused() {
 }
 
 void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
+    KRK_TRACE_COMP("moe-ffn");
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
     const i32 ne = mc.n_expert;
@@ -6927,7 +7039,13 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // still contributes its routing. Decode rows only: with n > 1
         // moe_sel_ holds a batch, and a single previous-token set would be a
         // worse predictor than the plan the batch path already stages.
-        const bool next_prefetch = next_prefetch_on() && n == 1 && !expert_stub_;
+        // Do not run the legacy previous-layer hint alongside the adaptive
+        // predictor: they target the same WARM->HOT slots and duplicate staging
+        // makes the predictor's A/B uninterpretable.
+        const bool next_prefetch = next_prefetch_on() && !moe_predict_enabled_ &&
+                                   n == 1 && !expert_stub_;
+        if (moe_predict_enabled_ && n == 1 && !expert_stub_)
+            moe_predictor_.observe(layer, moe_sel_.data(), k);
         if (next_prefetch) {
             if (moe_hint_.size() < static_cast<size_t>(mc.n_layer))
                 moe_hint_.resize(static_cast<size_t>(mc.n_layer));
@@ -7246,20 +7364,31 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // layer costs a copy the WARM tier already holds and nothing else. The
         // DMA runs under the next layer's norm/attention/hyper-connection work,
         // which is the window this feature exists to use.
-        if (next_prefetch && model_.experts().host_pin_budget() > 0) {
-            i32 j = layer + 1;
-            while (j < mc.n_layer && !model_.layers()[static_cast<size_t>(j)].moe)
-                j++;
-            if (j < mc.n_layer && static_cast<size_t>(j) < moe_hint_.size()) {
-                const std::vector<i32> &hint = moe_hint_[static_cast<size_t>(j)];
-                if (!hint.empty() &&
-                    model_.layers()[static_cast<size_t>(j)].experts.present()) {
-                    next_prefetch_staged_ += model_.experts().stage_ahead(
+        if (moe_predict_enabled_ && n == 1 && !expert_stub_ &&
+            layer + 1 < mc.n_layer) {
+            const i32 j = next_moe_layer(model_.layers(), layer + 1, mc.n_layer);
+            if (j >= 0 && model_.layers()[static_cast<size_t>(j)].experts.present()) {
+                moe_predictor_.predict(j, layer, moe_predict_budget(),
+                                       moe_predict_min_overlap(),
+                                       moe_predict_policy(), moe_predict_ids_);
+                if (!moe_predict_ids_.empty()) {
+                    const size_t staged = model_.experts().stage_ahead(
                         model_.layers()[static_cast<size_t>(j)].experts, j,
-                        hint.data(), static_cast<int>(hint.size()));
-                    ++next_prefetch_layers_;
+                        moe_predict_ids_.data(),
+                        static_cast<int>(moe_predict_ids_.size()));
+                    moe_predictor_.note_staged(staged);
                 }
             }
+        }
+        if (next_prefetch && model_.experts().host_pin_budget() > 0) {
+            const i32 j = next_moe_layer(model_.layers(), layer + 1, mc.n_layer);
+            if (j >= 0 && static_cast<size_t>(j) < moe_hint_.size() &&
+                model_.layers()[static_cast<size_t>(j)].experts.present() &&
+                !moe_hint_[static_cast<size_t>(j)].empty())
+                (void)model_.experts().stage_ahead(
+                    model_.layers()[static_cast<size_t>(j)].experts, j,
+                    moe_hint_[static_cast<size_t>(j)].data(),
+                    static_cast<int>(moe_hint_[static_cast<size_t>(j)].size()));
         }
 
         // ---- the host arm --------------------------------------------------
@@ -7488,6 +7617,7 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
 }
 
 void Engine::fetch_logits(bool device_only) {
+    KRK_TRACE_COMP("fetch-logits");
     // Greedy decode reads exactly one number out of this row. Downloading it
     // first cost 993 kB of PCIe and, on the 8B, 2.7 ms of *device* idle per
     // token: the GPU had finished and sat waiting for the host. The device
@@ -8698,6 +8828,7 @@ void Engine::expert_phase(ExpertCache::Phase p) {
 }
 
 bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
+    KRK_TRACE_COMP("generate");
     if (!be_ || n_vocab_ <= 0) return false;
     *res = GenerateResult{};
 
@@ -8714,6 +8845,8 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     mtp_fed_ = 0;
     if (trace_hash_on_) trace_stage_.clear();
     if (model_.is_recurrent()) recurrent_reset();
+    if (moe_predict_enabled_) moe_predictor_.reset();
+    moe_predict_ids_.clear();
 
     // ---- tokenize ---------------------------------------------------------
     std::vector<i32> ids;

@@ -1,0 +1,47 @@
+[info ] HIP 7.16.26331 | driver 71626331 | AMD Radeon RX 9070 XT | gfx1201 | 64 CU | 15.9 GiB VRAM | BAR: runtime reports 256 MiB aperture
+[warn ] architecture 'qwen35moe': carries 1 multi-token-prediction block(s) (blk.40): loaded behind --mtp-probe (one block forward, compared against the target's argmax) and usable as a drafter with --mtp-spec (known: llama, qwen2, qwen3, qwen3moe, olmoe, qwen35, qwen35moe, gemma, gemma2, gemma3, gemma4, qwen3vl, qwen4exp, deepseek2, deepseek4, deepseek4-dspark, nemotron_h, nemotron_h_moe, qwen4-mtp, dflash, qwen35-dflash-draft, dspark, laguna, gpt-oss, k2-horizon, muse-glimmer, spark2_5, diffuse)
+[info ] weight residency: all 1.80 GiB of weights resident (12.89 GiB budget)
+[info ] loaded Student Merged (qwen35moe): 40 layers, 2048 embd, 16/2 heads, hd=256, ff=512, vocab=248320
+[info ] gated delta net: 30 recurrent layers of 40 (every 4 attends), ssm 16 key x 32 value heads, state 128, conv kernel 4, rope 64/256
+[info ] vram at start: 16304 MiB total, 14214 MiB free before this engine allocates (2090 MiB already held by the driver/other processes)
+[info ] vram headroom: 13.82 GiB free of 15.92 GiB total, 1.00 GiB reserved (KRK_VRAM_RESERVE_MB overrides)
+[info ] mem policy: process working set capped at 76.7 GiB (80% of 95.9 GiB planned)
+[info ] vram policy: 12.0 GiB cap (2.1 GiB already in use, 11.5 GiB demand, 13.8 GiB free of 15.9 GiB, 1.0 GiB reserved) -> expert budget 512.0 MiB
+[info ] ram policy: 11.4 GiB of the host room is the file mapping itself (the disk tier's page cache); WARM gets what is left
+[info ] ram policy: 41.8 GiB budget (95.9 GiB installed, 83.7 GiB free) -> WARM tier 9600 MiB
+[info ] H2D verdict: reused the cached 16 MiB one (from the cache, measured 8 h ago on driver 71626331)
+[info ] host->device path: pageable promotions use the driver-staged DMA (no host memcpy) -- a 16 MiB copy from the cache, measured 8 h ago on driver 71626331 at 8.3 GB/s through the staging ring, 10.6 GB/s direct, 17.5 GB/s from pinned memory. The aperture is a FIRMWARE setting (Above 4G decoding + Resizable BAR), so it is measured rather than assumed, and cached per card: KRK_H2D_PROBE_RERUN=1 re-measures, KRK_H2D_CACHE=0 disables the cache, KRK_WARM_DMA=1|2 forces a path, KRK_H2D_PROBE=0 skips the probe.
+[info ] expert cache: pinned WARM prefix 9600 MiB of the 9600 MiB tier -- a 16 MiB promotion measured 10.6 GB/s direct against 17.5 GB/s pinned (1.66x), so the pageable path pays a copy this prefix removes. Every rate here was measured on this card; a wide aperture moves them, and then this prefix removes itself. KRK_HOST_PIN_MB or --expert-pin-mb overrides it, KRK_PIN_AUTO=0 disables it.
+[info ] expert cache: budget 512.0 MiB + WARM 9600 MiB pageable, 256 experts x top-8, 40 layers, policy LFU+aging (pin at 24 hits, decay every 64); cold reads are read-through
+[warn ] expert cache: the routed set is 9.4 GiB and the device budget is only 0.5 GiB (5%) — the cache is spending its budget churning rather than holding. the WARM tier still holds the full set, so a device miss promotes from RAM instead of reading the file
+[info ] recurrent state: 30 layers, 62.8 MiB f32
+[info ] workspaces ready: chunk=8 ctx=256 KV=5 MiB (load 804 ms)
+[warn ] expert warmup: G:/More-models/Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf.krakenexperts.json does not record the size of the file it was measured on (source_size 0) -- ignoring it (an index whose provenance cannot be checked is not one to warm the tiers from; re-run --expert-scan to write it)
+[info ] expert warmup: no G:/More-models/Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf.krakenexperts.json -- filling the tiers evenly; run --expert-scan to rank them
+[info ] expert warmup: even order, 1 rounds, 256 experts/layer deep; WARM 9600 MiB of 9600 MiB in 10240 slots (9600 MiB read), VRAM +546 experts (512 MiB, 546 slots); 3726 ms
+[info ] expert cache: hot ring off (opt-in: KRK_EXPERT_PIN_MB=<n>, or KRK_EXPERT_PIN=1) -- it measured +10.8% prefill but crashes a long decode in the pool's async reuse path
+[info ] vram ledger (after init): 16304 MiB total = weights 1802 + kv 5 + experts 512 (pool 512 + ring 0; live 512, reusable 0, budget 512) + workspaces 64 + free 13309 + unaccounted 612 [allocator live 2384 in 2288 buffers, largest 394]
+
+[stats ] load      4700 ms, 1.76 GiB uploaded of 1.76 GiB weights in 490 ms = 3.6 GB/s
+[stats ] prefill   5 tok in 332.8 ms = 15.0 tok/s
+[stats ] decode    8 tok in 456.1 ms over 7 timed steps = 15.3 tok/s (65.2 ms/step)
+[stats ] device    2.94 GiB in use of 15.92 GiB (12.98 GiB free)
+[stats ] h2d       56 of 57 probed run(s) reused a cached verdict (98%), 1 measured the card at 71.0 ms on average, so the cache has avoided about 3976 ms of probing
+[stats ] h2d          16 MiB: 56 of 57 reused (98%), 1 measured at 71.0 ms -> about 3976 ms avoided
+[stats ] range     f16 activation bounds fired: silu 0, experts-sum 0, residual 0
+[stats ] range     residual rows stored scaled: max exponent 0
+[stats ] kv        flat: whole cache resident in VRAM (no tiering traffic)
+[stats ] active-stage issued 0, consumed 0, demand wait 0.000 ms
+[stats ] expert-pool budget 537722880 committed 536739840 live 536739840 reusable 0 bytes; alloc 1638 reuse 7533 trim 0 guard-fallback 0 | release 2511 mark(s) for 7533 slice(s)
+[stats ] experts   512 MiB VRAM budget, 546/546 slots resident, 0 pinned | WARM 9600 MiB (9600 pinned of a 9600 budget), 10240 held (9600 MiB, 0 MiB prefetched)
+[stats ] cache     3376 acquires | HOT hits 865 (25.6%) | WARM hits 2511 (74.4%) | COLD misses 0 (0.0%)
+[stats ] router    hot share 877/3376 picks (26.0%) landed on an expert already in VRAM (preference off)
+[stats ] transfer  2511 promotions, 2354 MiB in 29.1 ms = 78.9 GB/s (11.6 us/expert) | 2511 VRAM evictions kept in WARM, 2354 MiB | 0 MiB read from the file (0.00 MiB/tok)
+[stats ] expert-path  read      0.0 ms | room     11.3 ms | alloc      1.5 ms | xfer     15.6 ms | (promote total     29.1 ms)
+[stats ] evict       2511 scan(s), 40176 slot visits, 1.9 ms scanning + 9.3 ms releasing = 46 ns/visit, 16 visits/scan | index 546/546 keys/resident
+[stats ] expert-path split  prefill: read     0.0 | room     4.6 | alloc     0.7 | xfer     6.5 | promote    12.1 ms
+[stats ]                     decode: read     0.0 | room     6.7 | alloc     0.8 | xfer     9.1 | promote    17.0 ms
+[stats ] pinned    3057 batch(es), 2866 MiB on the copy stream in 33.7 ms = 83.1 GB/s
+[stats ]           the promote timers above wrap the ENQUEUE of a pinned copy, not its flight: read this line for the rate, and the step time for its cost
+[stats ] warm      9600 MiB capacity, 100.0% in use | 0 admissions, 0 evictions, 0 rejects | 2511 device evictions, 0 decay events | 9600 MiB pinned
+[info ] vram ledger (at teardown): 16304 MiB total = weights 1802 + kv 5 + experts 512 (pool 512 + ring 0; live 512, reusable 0, budget 513) + workspaces 64 + free 13295 + unaccounted 626 [allocator live 2385 in 2318 buffers, largest 394]

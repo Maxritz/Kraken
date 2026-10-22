@@ -19,6 +19,7 @@
 #include "krk/model.hpp"
 #include "krk/sampler.hpp"
 #include "krk/tokenizer.hpp"
+#include "krk/moe_predictor.hpp"
 
 namespace krk {
 
@@ -330,6 +331,11 @@ public:
     ~Engine();
 
     bool init(Backend *be, const EngineConfig &cfg, std::string *err);
+    bool moe_prediction_enabled() const { return moe_predict_enabled_; }
+    u64 moe_predictions_issued() const { return moe_predictor_.predictions_issued(); }
+    u64 moe_prediction_candidates() const { return moe_predictor_.candidates(); }
+    u64 moe_prediction_hits() const { return moe_predictor_.candidate_hits(); }
+    u64 moe_prediction_staged() const { return moe_predictor_.staged(); }
     Backend::ExpertPoolStats expert_pool_stats() const {
         return be_ ? be_->expert_pool_stats() : Backend::ExpertPoolStats{};
     }
@@ -1087,15 +1093,15 @@ private:
     // Scratch for the layer-wide expert prefetch: the routed ids, deduped.
     std::vector<i32> prefetch_ids_;
     std::vector<u8> prefetch_seen_;
-    // Next-layer expert prefetch. Routing is sticky in time, so the routed set a
-    // layer chose on the PREVIOUS token is the best predictor available for the
-    // same layer on the next one -- and it is the only one that exists before
-    // the row that would produce the real set. Recorded per layer in moe_ffn
-    // and staged by the layer in front of it, so the DMA runs under a mixer
-    // instead of in front of the GEMMs that need the weights.
+    // Previous-token route sets retained for the legacy
+    // KRK_MOE_NEXT_PREFETCH experiment. The adaptive predictor has independent
+    // per-layer histories and only proposes cache staging hints.
     std::vector<std::vector<i32>> moe_hint_;
-    u64 next_prefetch_staged_ = 0;
-    u64 next_prefetch_layers_ = 0;
+    // Architecture-gated online cache predictor. Candidate IDs affect only
+    // stage_ahead(); moe_sel_/moe_wt_ continue to come from the native router.
+    MoeRoutePredictor moe_predictor_;
+    std::vector<i32> moe_predict_ids_;
+    bool moe_predict_enabled_ = false;
     // KRK_DUMP destination (see Engine::init): empty means the per-stage dump
     // hook in forward_core is inert.
     std::string dump_path_;

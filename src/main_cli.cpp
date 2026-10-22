@@ -9,6 +9,7 @@
 #include "krk/backend.hpp"
 #include "krk/engine.hpp"
 #include "krk/host_time.hpp"
+#include "krk/trace.hpp"
 
 #if !defined(_WIN32)
 #include <unistd.h>
@@ -74,6 +75,8 @@ struct Args {
     bool info = false;
     bool bench = false;
     bool profile = false;
+    bool trace = false;
+    std::string trace_path;
     bool expert_scan = false;   // measure routing and write an expert index
     bool expert_stub = false;   // run the routers with every expert FFN removed
     bool expert_adapt = false;  // fold this run's routing into the index
@@ -253,6 +256,11 @@ void usage() {
         "                        which is exact and costs O(prompt) host FLOP\n"
         "  --info                print model and device info, then exit\n"
         "  --bench               prefill/decode benchmark on a fixed prompt\n"
+        "  --trace [PATH]        Chrome-trace timeline (Perfetto/tracing):\n"
+        "                        host functions, backend ops, device spans,\n"
+        "                        transfers, syncs and counters. PATH sets\n"
+        "                        KRK_TRACE_PATH. Bounded window only; compare\n"
+        "                        untraced wall time.\n"
         "  --profile             per-op device timeline for the last decode\n"
         "                        step(s), with the idle gap before each op\n"
         "                        (KRK_PROFILE_STEPS/FROM/OPS tune the window)\n"
@@ -373,6 +381,10 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--info") a->info = true;
         else if (f == "--bench") a->bench = true;
         else if (f == "--profile") a->profile = true;
+        else if (f == "--trace") {
+            a->trace = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') a->trace_path = argv[++i];
+        }
         else if (f == "--expert-scan") a->expert_scan = true;
         else if (f == "--expert-stub") a->expert_stub = true;
         else if (f == "--expert-adapt") a->expert_adapt = true;
@@ -1118,6 +1130,28 @@ int main(int argc, char **argv) {
 #else
         setenv("KRK_PROFILE", "1", 1);
 #endif
+    }
+    // Sherlock trace timeline: Chrome-trace JSON for Perfetto. --trace enables
+    // the recorder; KRK_TRACE=1 does the same without the flag. The path is
+    // --trace's optional value, else KRK_TRACE_PATH, else kraken-trace.json.
+    // finish() is atexit-registered so every exit path (bench, hash, error)
+    // flushes one file; it is idempotent so an explicit call is also safe.
+    if (a.trace) {
+#ifdef _WIN32
+        _putenv_s("KRK_TRACE", "1");
+        if (!a.trace_path.empty()) _putenv_s("KRK_TRACE_PATH", a.trace_path.c_str());
+#else
+        setenv("KRK_TRACE", "1", 1);
+        if (!a.trace_path.empty()) setenv("KRK_TRACE_PATH", a.trace_path.c_str(), 1);
+#endif
+    }
+    {
+        const char *te = std::getenv("KRK_TRACE");
+        if ((te && *te && std::strcmp(te, "0") != 0) || a.trace) {
+            ::krk::Trace::get().force_enable(a.trace_path.c_str());
+            std::atexit([] { ::krk::Trace::get().finish(); });
+            ::krk::Trace::get().instant("config", "trace-start");
+        }
     }
 
     std::string err;

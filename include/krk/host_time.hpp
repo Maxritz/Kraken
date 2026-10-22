@@ -27,6 +27,8 @@
 #include <string>
 #include <vector>
 
+#include "krk/trace.hpp"
+
 namespace krk {
 
 class HostTime {
@@ -114,9 +116,16 @@ private:
 class HostScope {
 public:
     explicit HostScope(const char *name) : name_(name), on_(HostTime::get().on()) {
+        Trace::get().ensure_on();
+        trace_on_ = Trace::get().on();
+        if (trace_on_) trace_t0_ = Trace::get().now_us();
         if (on_) t0_ = std::chrono::steady_clock::now();
     }
     ~HostScope() {
+        if (trace_on_) {
+            const double dur = Trace::get().now_us() - trace_t0_;
+            Trace::get().complete("host", name_, trace_t0_, dur);
+        }
         if (!on_) return;
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - t0_)
@@ -133,6 +142,8 @@ public:
 private:
     const char *name_ = nullptr;
     bool on_ = false;
+    bool trace_on_ = false;
+    double trace_t0_ = 0.0;
     std::chrono::steady_clock::time_point t0_{};
 };
 
