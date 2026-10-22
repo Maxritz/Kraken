@@ -40,3 +40,22 @@ chunk 8 (4001-token run, KV 896 MiB, weights 304 MiB). Decode is untouched
 first fetch 6.76 ms/layer vs already-drained copy 0.15 ms — the barrier is
 queue drain, not payload, so chunking (fewer barriers) is the lever and
 shrinking the route payload is not.
+
+## Phase-3 M-sweep (2026-10-22, Qwen3-MOE-4x0.6B expert shapes, warm, `--iters 20`)
+
+Anomaly reproduced on the current tree, worse than the 29 GB/s note:
+
+| rows | up/gate q4_k 3072x1024 | down q6_k 1024x3072 |
+|---|---|---|
+| 1 (decode GEMV) | 9.9 us, 178 GB/s | 13.2 us, 196 GB/s |
+| 2–8 (`gemv_m` ladder) | 64–87 us, 20–28 GB/s | 63–105 us, 25–41 GB/s |
+| 9–64 (tiled) | 160–224 us, 8–11 GB/s | ~780–855 us flat, ~3 GB/s |
+
+Existing arms change nothing at rows=9 q6_k: `KRK_GEMM_PATH=wmma` 762 us,
+`KRK_GEMM_SPLIT=0` 818 us, both 842 us — same fixed-cost regime (~800 us
+independent of row count). No current kernel wins; the next step is a
+dedicated small-M kernel that loads each expert's weight tile once and
+reuses it across the M rows. Modeled ceiling at rows=1 efficiency
+(~185 GB/s): down 2.58 MiB in ~14 us vs ~800 us today; projected prefill
+at chunk 256 / 161 tok from ~409 ms toward ~210 ms (~2x on top of
+chunking). All bench rows `ok` (chk within tolerance).
