@@ -4339,6 +4339,7 @@ static void test_kv_tier_host_reserve_refusal() {
 
 
 static void test_expert_promotion_failure();
+static void test_moe_grouped_plan_offsets();
 
 static void test_expert_cache_byte_budget() {
     const std::string path = "kraken-bytes-test.gguf";
@@ -4698,10 +4699,17 @@ static void test_expert_promotion_failure() {
 
     // Every device allocation now fails: this expert is WARM-only, so its
     // acquire() takes the promotion path and cannot complete it.
+    const u64 refusals_before = cache.pool_refusals();
     be.set_fail_allocation_after(0);
     const ResidentExpert *refused = cache.acquire(src, 0, warm_e);
-    CHECK(!refused || (refused->up.present() && refused->down.present()),
+    CHECK(!refused,
           "a refused promotion returns nullptr, never an incomplete expert");
+    // P0-1: refusals are countable, so the engine can fail visibly instead
+    // of silently skipping the expert (`if (!re) continue`). Both the WARM
+    // promotion and the cold rebuild refuse here, so this counts at least
+    // one refusal for the single acquire.
+    CHECK(cache.pool_refusals() > refusals_before,
+          "a refused acquire leaves a countable refusal behind");
     be.set_fail_allocation_after(-1);
     const ResidentExpert *after = cache.acquire(src, 0, warm_e);
     CHECK(after && after->up.present() && after->gate.present(),
@@ -4759,6 +4767,87 @@ static void test_moe_route_predictor() {
           "request reset clears history and telemetry");
     predictor.predict(2, 0, 3, 0.0f, 3, candidates);
     CHECK(candidates.empty(), "a fresh request cannot reuse stale route IDs");
+    test_moe_grouped_plan_offsets();
+}
+
+// P0-2: the grouped-plan fast path must agree with the legacy per-expert
+// rescan it replaced. plan_off_ (prefix sums over the whole (token, slot)
+// route) already holds each expert's row count, so the loop skips the
+// O(ne*n*k) rebuild and reads the segment directly. This replays both
+// constructions over several route shapes -- including duplicate experts
+// across rows and experts no row selected -- and requires identical counts,
+// row order and weights per expert.
+static void test_moe_grouped_plan_offsets() {
+    struct Case {
+        i32 ne, n, k;
+        std::vector<i32> sel;
+        std::vector<f32> wt;
+    };
+    std::vector<Case> cases;
+    // n=1 decode row, top-2 over 4 experts.
+    cases.push_back({4, 1, 2, {1, 3}, {0.7f, 0.3f}});
+    // n=8 prefill rows with heavy duplicate picks and one unpicked expert.
+    cases.push_back({4, 8, 2,
+                     {0, 1, 0, 2, 1, 1, 3, 0, 2, 2, 0, 1, 1, 3, 3, 3},
+                     {0.5f, 0.5f, 0.6f, 0.4f, 0.9f, 0.1f, 0.2f, 0.8f,
+                      0.3f, 0.7f, 0.4f, 0.6f, 0.55f, 0.45f, 0.65f, 0.35f}});
+    // n=2, every slot picks the same expert.
+    cases.push_back({4, 2, 2, {2, 2, 2, 2}, {0.25f, 0.25f, 0.5f, 0.5f}});
+    for (size_t c = 0; c < cases.size(); c++) {
+        const Case &cc = cases[c];
+        // Prefix-sum construction, mirroring Engine::moe_ffn's plan build.
+        std::vector<i32> off(static_cast<size_t>(cc.ne) + 1, 0);
+        for (i32 t = 0; t < cc.n; t++) {
+            const i32 *sel = cc.sel.data() + static_cast<size_t>(t) * cc.k;
+            for (i32 s = 0; s < cc.k; s++) {
+                const i32 e = sel[s];
+                if (e >= 0 && e < cc.ne) off[static_cast<size_t>(e) + 1]++;
+            }
+        }
+        for (i32 e = 0; e < cc.ne; e++)
+            off[static_cast<size_t>(e) + 1] += off[static_cast<size_t>(e)];
+        std::vector<i32> dev(static_cast<size_t>(off[static_cast<size_t>(cc.ne)]), -1);
+        std::vector<f32> alpha(dev.size(), 0.0f);
+        std::vector<i32> cur(off.begin(), off.end() - 1);
+        for (i32 t = 0; t < cc.n; t++) {
+            const i32 *sel = cc.sel.data() + static_cast<size_t>(t) * cc.k;
+            const f32 *wt = cc.wt.data() + static_cast<size_t>(t) * cc.k;
+            for (i32 s = 0; s < cc.k; s++) {
+                const i32 e = sel[s];
+                if (e < 0 || e >= cc.ne) continue;
+                const i32 at = cur[static_cast<size_t>(e)]++;
+                dev[static_cast<size_t>(at)] = t;
+                alpha[static_cast<size_t>(at)] = wt[s];
+            }
+        }
+        // Legacy per-expert rescan, mirroring the old loop body.
+        for (i32 e = 0; e < cc.ne; e++) {
+            std::vector<i32> rows;
+            std::vector<f32> wts;
+            for (i32 t = 0; t < cc.n; t++) {
+                const i32 *sel = cc.sel.data() + static_cast<size_t>(t) * cc.k;
+                const f32 *wt = cc.wt.data() + static_cast<size_t>(t) * cc.k;
+                for (i32 s = 0; s < cc.k; s++) {
+                    if (sel[s] == e) {
+                        rows.push_back(t);
+                        wts.push_back(wt[s]);
+                    }
+                }
+            }
+            const i64 m_pre = static_cast<i64>(off[static_cast<size_t>(e) + 1] -
+                                               off[static_cast<size_t>(e)]);
+            CHECK(m_pre == static_cast<i64>(rows.size()),
+                  "plan offsets give the legacy row count for every expert");
+            if (m_pre == 0) continue;
+            bool same = true;
+            for (i64 i = 0; i < m_pre && same; i++) {
+                const size_t at = static_cast<size_t>(off[static_cast<size_t>(e)] + i);
+                same = (dev[at] == rows[static_cast<size_t>(i)] &&
+                        alpha[at] == wts[static_cast<size_t>(i)]);
+            }
+            CHECK(same, "plan segment matches legacy row order and weights");
+        }
+    }
 }
 
 static void test_expert_cache_policy() {

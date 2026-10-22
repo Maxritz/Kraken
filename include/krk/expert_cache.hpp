@@ -386,6 +386,10 @@ public:
     size_t tracked_slots() const { return slots_.size(); }
     u64 loads() const { return loads_; }
     u64 evictions() const { return evictions_; }
+    // Device-pool acquire refusals (P0-1): every one of these skipped the
+    // expert under the old `if (!re) continue` path. The engine now fails
+    // the generation instead; this counter is the test-visible half.
+    u64 pool_refusals() const { return pool_refusals_; }
     u64 hits() const { return hits_; }
     // Acquires served by promoting out of the host tier — a DMA instead of a
     // reload of the mapping. The load itself is not repeated, so this is

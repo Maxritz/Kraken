@@ -2406,6 +2406,7 @@ void Engine::head_compute(i32 row) {
 
 bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     KRK_TRACE_COMP("forward-core");
+    forward_error_.clear();
     {
         // See the KRK_VRAM_TRACE block at the end of this function: entry and
         // exit readings bracket the forward, which is what tells a bound inside
@@ -2595,7 +2596,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                 }
                 dump_row("ffn.pre", l, ws_xn_, n_embd_, n);
                 if (L.moe) {
-                    moe_ffn(L, l, n);
+                    if (!moe_ffn(L, l, n)) return false;
                 } else {
                     dense_ffn(L, l, n);
                 }
@@ -2870,7 +2871,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // and 1.6e11 into the residual at L05 -- the whole reference arm past
         // that layer, and every token it emits, is that buffer's contents.
         if (L.moe) {
-            moe_ffn(L, l, n);
+            if (!moe_ffn(L, l, n)) return false;
         } else if (L.wgate.present()) {
             dense_ffn(L, l, n);
         }
@@ -3076,7 +3077,7 @@ void Engine::mtp_dense_ffn(const MtpBlock &m, i32 n, void *acc, i32 *exp) {
     be_->add_residual(acc, ws_x2_, n, n_embd_, exp);
 }
 
-void Engine::mtp_ffn(const MtpBlock &m, i32 n) {
+bool Engine::mtp_ffn(const MtpBlock &m, i32 n) {
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
     const i32 ne = m.n_expert;
@@ -3204,7 +3205,12 @@ void Engine::mtp_ffn(const MtpBlock &m, i32 n) {
             if (model_.experts().loads() + model_.experts().host_hits() !=
                 acq_miss0)
                 mtp_acq_miss_++;
-            if (!re) continue;
+            if (!re) {
+                forward_error_ = expert_resource_error() + " (mtp block layer " +
+                                 std::to_string(m.layer) + " expert " +
+                                 std::to_string(e) + ")";
+                return false;
+            }
             be_->gather_rows(ws_xg_, ws_xn_, static_cast<const i32 *>(ws_plan_), mrows,
                              n_embd_);
             bool fused = false;
@@ -3262,6 +3268,7 @@ void Engine::mtp_ffn(const MtpBlock &m, i32 n) {
     if (acc != ws_x_)
         be_->add_residual(ws_x_, acc, n, n_embd_, static_cast<i32 *>(mtp_rep_),
                           static_cast<const i32 *>(ws_fexp_));
+    return true;
 }
 
 bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
@@ -3338,7 +3345,7 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
     // fused as an add+norm before the attention.
     be_->add_residual(ws_x_, ws_x2_, 1, n_embd_, static_cast<i32 *>(mtp_rep_));
     be_->rmsnorm(ws_xn_, ws_x_, m.post_attn_norm, 1, n_embd_, mc.rms_eps);
-    mtp_ffn(m, 1);
+    if (!mtp_ffn(m, 1)) return false;
 
     if (want_logits) {
         be_->rmsnorm(ws_xn_, ws_x_, m.shared_head_norm, 1, n_embd_, mc.rms_eps);
@@ -4551,7 +4558,7 @@ bool Engine::generate_speculative_head(const GenerateParams &p, GenerateResult *
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
         if (!forward(ids.data() + i, n, static_cast<i32>(i), last)) {
-            res->error = kv_resource_error();
+            res->error = forward_failure_error();
             res->finish = FinishError;
             return false;
         }
@@ -4702,7 +4709,7 @@ bool Engine::generate_speculative_head(const GenerateParams &p, GenerateResult *
                 return true;
             }
             if (!forward(&next1, 1, static_cast<i32>(pos), true)) {
-                res->error = kv_resource_error();
+                res->error = forward_failure_error();
                 finish_run(FinishError);
                 return false;
             }
@@ -4727,7 +4734,7 @@ bool Engine::generate_speculative_head(const GenerateParams &p, GenerateResult *
             return true;
         }
         if (!forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone)) {
-            res->error = kv_resource_error();
+            res->error = forward_failure_error();
             finish_run(FinishError);
             return false;
         }
@@ -4830,7 +4837,7 @@ bool Engine::generate_speculative_head(const GenerateParams &p, GenerateResult *
         const bool room = pos + emitted < kv_cap_ && res->generated < p.max_tokens;
         if (tail >= 0 && room) {
             if (!forward(&tail, 1, static_cast<i32>(pos + emitted - 1), true)) {
-                res->error = kv_resource_error();
+                res->error = forward_failure_error();
                 finish_run(FinishError);
                 return false;
             }
@@ -6469,7 +6476,7 @@ static bool moe_silu_fused() {
     return v;
 }
 
-void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
+bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     KRK_TRACE_COMP("moe-ffn");
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
@@ -7086,24 +7093,43 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // The host arm owns this expert on this layer. Skipping it here is
             // what leaves its weights absent from both tiers.
             if (hybrid && hy_take_[static_cast<size_t>(e)]) continue;
-            group_rows_.clear();
-            group_wt_.clear();
-            for (i32 t = 0; t < n; t++) {
-                const i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
-                const f32 *wt = moe_wt_.data() + static_cast<size_t>(t) * k;
-                for (i32 s = 0; s < k; s++) {
-                    if (sel[s] == e) {
-                        group_rows_.push_back(t);
-                        group_wt_.push_back(wt[s]);
+            // Grouped-plan fast path (P0-2): plan_off_ already holds this
+            // expert's row count, so skip the O(n*k) host rescan. Only when
+            // the offsets were built for this pass (dp_used_ == 0); the
+            // draft-reuse path keeps the legacy scan.
+            const bool use_plan_off = plan_grouped && dp_used_ == 0;
+            i64 m_pre = 0;
+            if (use_plan_off) {
+                m_pre = static_cast<i64>(plan_off_[static_cast<size_t>(e) + 1] -
+                                         plan_off_[static_cast<size_t>(e)]);
+                if (m_pre == 0) continue;
+            } else {
+                group_rows_.clear();
+                group_wt_.clear();
+                for (i32 t = 0; t < n; t++) {
+                    const i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
+                    const f32 *wt = moe_wt_.data() + static_cast<size_t>(t) * k;
+                    for (i32 s = 0; s < k; s++) {
+                        if (sel[s] == e) {
+                            group_rows_.push_back(t);
+                            group_wt_.push_back(wt[s]);
+                        }
                     }
                 }
+                if (group_rows_.empty()) continue;
             }
-            if (group_rows_.empty()) continue;
 
             // Pages the expert in if it is not resident; identical results
-            // regardless of how small the cache is.
+            // regardless of how small the cache is. A refusal is a visible
+            // generation error (P0-1), never a silent skip: the router
+            // selected this expert and its contribution is required.
             const ResidentExpert *re = model_.experts().acquire(L.experts, layer, e);
-            if (!re) continue;
+            if (!re) {
+                forward_error_ = expert_resource_error() + " (moe layer " +
+                                 std::to_string(layer) + " expert " +
+                                 std::to_string(e) + ")";
+                return false;
+            }
             if (sync_expert()) be_->sync();
             if (hybrid) hy_gpu_experts_++;
 
@@ -7112,10 +7138,10 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             const f32 gs_dn = L.experts.scale_of(L.experts.down_scale, e);
             const f32 gs_gt = L.experts.scale_of(L.experts.gate_scale, e);
 
-            const i64 m = static_cast<i64>(group_rows_.size());
+            const i64 m = use_plan_off ? m_pre : static_cast<i64>(group_rows_.size());
             const i32 *plan_i = nullptr;
             const f32 *plan_f = nullptr;
-            if (plan_grouped) {
+            if (use_plan_off) {
                 // This expert's segment of the layer plan, already on the
                 // device: no copy is issued here at all.
                 plan_i = static_cast<const i32 *>(ws_plan_) + plan_off_[e];
@@ -7614,6 +7640,7 @@ void Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                       static_cast<i32 *>(ws_rexp_),
                       static_cast<const i32 *>(ws_fexp_));
     dump_row("moe.post", layer, ws_x_, n_embd_, n);
+    return true;
 }
 
 void Engine::fetch_logits(bool device_only) {
@@ -7716,7 +7743,7 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
         if (!forward(ids.data() + i, n, static_cast<i32>(i), last)) {
-            res->error = kv_resource_error();
+            res->error = forward_failure_error();
             res->finish = FinishError;
             return false;
         }
@@ -7854,7 +7881,7 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
                 return true;
             }
             if (!forward(&first, 1, static_cast<i32>(pos), true)) {
-                res->error = kv_resource_error();
+                res->error = forward_failure_error();
                 finish_run(FinishError);
                 return false;
             }
@@ -7887,7 +7914,7 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
         }
         const u64 t_ver = now_us();
         if (!forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone)) {
-            res->error = kv_resource_error();
+            res->error = forward_failure_error();
             finish_run(FinishError);
             return false;
         }
@@ -7958,7 +7985,7 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
                     std::fprintf(stderr, "[mtp-s] BONUS fed %d at %lld\n", b,
                                  static_cast<long long>(pos + emitted - 1));
                 if (!forward(&b, 1, static_cast<i32>(pos + emitted - 1), true)) {
-                    res->error = kv_resource_error();
+                    res->error = forward_failure_error();
                     finish_run(FinishError);
                     return false;
                 }
@@ -7977,7 +8004,7 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
                 if (emitted > 0) {
                     if (!forward_core(prop.data(), emitted, static_cast<i32>(pos),
                                       LogitsLast)) {
-                        res->error = kv_resource_error();
+                        res->error = forward_failure_error();
                         finish_run(FinishError);
                         return false;
                     }
@@ -8035,7 +8062,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
         if (!forward(ids.data() + i, n, static_cast<i32>(i), last)) {
-            res->error = kv_resource_error();
+            res->error = forward_failure_error();
             res->finish = FinishError;
             return false;
         }
@@ -8155,7 +8182,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
                 return true;
             }
             if (!forward(&first, 1, static_cast<i32>(pos), true)) {
-                res->error = kv_resource_error();
+                res->error = forward_failure_error();
                 finish_run(FinishError);
                 return false;
             }
@@ -8189,7 +8216,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
             return true;
         }
         if (!forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone)) {
-            res->error = kv_resource_error();
+            res->error = forward_failure_error();
             finish_run(FinishError);
             return false;
         }
@@ -8276,7 +8303,7 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
             if (pos + emitted < kv_cap_ && res->generated < p.max_tokens) {
                 const i32 b = res->tokens.back();
                 if (!forward(&b, 1, static_cast<i32>(pos + emitted - 1), true)) {
-                    res->error = kv_resource_error();
+                    res->error = forward_failure_error();
                     finish_run(FinishError);
                     return false;
                 }
@@ -8378,7 +8405,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
         if (!forward(ids.data() + i, n, static_cast<i32>(i), last)) {
-            res->error = kv_resource_error();
+            res->error = forward_failure_error();
             res->finish = FinishError;
             return false;
         }
@@ -8450,7 +8477,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
                 return true;
             }
             if (!forward(&first, 1, static_cast<i32>(pos), true)) {
-                res->error = kv_resource_error();
+                res->error = forward_failure_error();
                 finish_run(FinishError);
                 return false;
             }
@@ -8555,7 +8582,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
                 return true;
             }
             if (!forward(&first, 1, static_cast<i32>(pos), true)) {
-                res->error = kv_resource_error();
+                res->error = forward_failure_error();
                 finish_run(FinishError);
                 return false;
             }
@@ -8574,7 +8601,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             return true;
         }
         if (!forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone)) {
-            res->error = kv_resource_error();
+            res->error = forward_failure_error();
             finish_run(FinishError);
             return false;
         }
@@ -8700,7 +8727,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
                 // pos + emitted).
                 kv_rollback(pos + ra);
                 if (!forward(&tail, 1, static_cast<i32>(pos + ra), true)) {
-                    res->error = kv_resource_error();
+                    res->error = forward_failure_error();
                     finish_run(FinishError);
                     return false;
                 }
@@ -8777,7 +8804,7 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             if (pos + emitted < kv_cap_ && res->generated < p.max_tokens) {
                 const i32 b = res->tokens.back();
                 if (!forward(&b, 1, static_cast<i32>(pos + emitted - 1), true)) {
-                    res->error = kv_resource_error();
+                    res->error = forward_failure_error();
                     finish_run(FinishError);
                     return false;
                 }
@@ -8815,6 +8842,18 @@ std::string Engine::kv_resource_error() const {
     return "KV promotion refused by the shared host-memory reserve or an "
            "unavailable WARM/COLD page; reduce --ctx, raise --kv-hot-mb, free "
            "host RAM, or configure a writable --kv-cold-dir";
+}
+
+std::string Engine::expert_resource_error() const {
+    return "expert cache refused a routed expert: device pool has no free "
+             "cell beside its floor and no resident slot could be reclaimed; "
+             "reduce --ctx/--kv-mb, raise --expert-cache-mb if headroom exists, "
+             "free VRAM, or set KRK_VRAM_FLOOR_MB=0 to let the pool take the "
+             "card's last memory";
+}
+
+std::string Engine::forward_failure_error() const {
+    return forward_error_.empty() ? kv_resource_error() : forward_error_;
 }
 
 // Attributes the expert tier's stage timers to the phase running now. The
@@ -8953,7 +8992,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         const bool last = (i + n) == static_cast<i64>(ids.size());
         KRK_TIME_HOST("prefill.chunk");
         if (!forward(ids.data() + i, n, static_cast<i32>(i), last)) {
-            res->error = kv_resource_error();
+            res->error = forward_failure_error();
             res->finish = FinishError;
             return false;
         }
@@ -9044,7 +9083,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
             // the device table does not see.
             KRK_TIME_HOST_N("decode.forward", hs_fwd);
             if (!forward(&token, 1, static_cast<i32>(pos), true)) {
-                res->error = kv_resource_error();
+                res->error = forward_failure_error();
                 res->finish = FinishError;
                 return false;
             }
