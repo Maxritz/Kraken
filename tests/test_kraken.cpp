@@ -7011,6 +7011,45 @@ static void group_attention_sinks() {
     }
 }
 
+// One CLI generation. Returns stdout with the bracketed status lines
+// stripped (they carry timings, which differ run to run); what remains is
+// the banner plus the generated text, both deterministic for a fixed
+// build, model, prompt, chunk and seed. Used for the prefill-then-decode
+// promise: chunk-1-then-decode-N must read exactly like chunk-64-then-N,
+// token for token -- the text-level half of chunk invariance.
+static std::string run_generate_text(const std::string &exe,
+                                     const std::string &model,
+                                     const std::string &prompt, int chunk,
+                                     int n, const std::string &tag,
+                                     int &rc_out) {
+    const std::string o = "kraken-prefill-gen-" + std::to_string(chunk) +
+                          tag + ".txt";
+    const std::string e = "kraken-prefill-err-gen-" + std::to_string(chunk) +
+                          tag + ".txt";
+    std::string cmd = "\"" + exe + "\" -m \"" + model + "\" -p \"" + prompt +
+                      "\" --ctx 64 --chunk " + std::to_string(chunk) +
+                      " --greedy -n " + std::to_string(n) + " > \"" + o +
+                      "\" 2> \"" + e + "\"";
+#ifdef _WIN32
+    const std::string full = "call " + cmd;
+#else
+    const std::string full = cmd;
+#endif
+    rc_out = gate_exit_code(std::system(full.c_str()));
+    const std::string out = read_capture(o);
+    std::string kept;
+    size_t pos = 0;
+    while (pos < out.size()) {
+        size_t nl = out.find('\n', pos);
+        std::string line =
+            nl == std::string::npos ? out.substr(pos) : out.substr(pos, nl - pos);
+        if (line.empty() || line[0] != '[') { kept += line; kept += '\n'; }
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    return kept;
+}
+
 static void test_prefill_chunk_bitexact() {
     // Self-contained: the fixture is built here, and the CLI is the sibling
     // binary the build already produces (kraken-tests cannot link the device
@@ -7119,6 +7158,50 @@ static void test_prefill_chunk_bitexact() {
         CHECK(c1.logits == c32.logits, "and its logits row agrees");
     }
 
+    // THE TEXT PROMISE (token gen as well as prefill). A short prompt the
+    // fixture can extend without overflowing its 64-token context, decoded
+    // 8 greedy tokens at chunk 1, 8 and 64: chunk 1 threads every row
+    // through the decode formulation, chunk 8 stays on the ladder, chunk 64
+    // takes the exact grid for its one 20-row call. Same text or the gate
+    // fails -- this is the trajectory-equality endpoint (2609.15504), not a
+    // benchmark score.
+    std::string gprompt;
+    for (int i = 0; i < 19; i++) gprompt += (i ? " the" : "the");
+    int grc = -1;
+    const std::string g1 =
+        run_generate_text(exe, model, gprompt, 1, 8, "", grc);
+    const bool g1ok = grc == 0 && !g1.empty();
+    CHECK(g1ok, "the chunk-1 generation prints text");
+    // Replica floor (2607.28495): the same construction twice must agree
+    // with itself before any cross-chunk comparison means anything.
+    int grc2 = -1;
+    const std::string g1b =
+        run_generate_text(exe, model, gprompt, 1, 8, "b", grc2);
+    if (g1ok && grc2 == 0) {
+        CHECK(g1b == g1,
+              g1b == g1 ? "the chunk-1 generation repeats itself exactly"
+                        : "the same chunk-1 run disagrees with itself: "
+                          "nondeterminism below the gate's floor");
+    }
+    int grc8 = -1;
+    const std::string g8 =
+        run_generate_text(exe, model, gprompt, 8, 8, "", grc8);
+    if (g1ok && grc8 == 0) {
+        CHECK(g8 == g1,
+              g8 == g1 ? "chunk-8 decoded text matches chunk-1, token for token"
+                       : "chunk-8 text DIFFERS from chunk-1: decode path "
+                         "and prefill path disagree");
+    }
+    int grc64 = -1;
+    const std::string g64 =
+        run_generate_text(exe, model, gprompt, 64, 8, "", grc64);
+    if (g1ok && grc64 == 0) {
+        CHECK(g64 == g1,
+              g64 == g1
+                  ? "chunk-64 decoded text matches chunk-1, token for token"
+                  : "chunk-64 text DIFFERS from chunk-1: the exact grid "
+                    "does not reproduce decode's text");
+    }
     // Where the arms ran, and whether the gate could see a regression at all.
 #ifdef KRK_TEST_HIP_BUILD
     const bool device = c1.banner.find("scalar reference") == std::string::npos &&
@@ -7179,7 +7262,11 @@ static void test_prefill_chunk_bitexact() {
                                  "kraken-prefill-out-16.txt", "kraken-prefill-out-32.txt",
                                  "kraken-prefill-out-16-lottery.txt",
                                  "kraken-prefill-err-16.txt", "kraken-prefill-err-32.txt",
-                                 "kraken-prefill-err-16-lottery.txt"})
+                                 "kraken-prefill-err-16-lottery.txt",
+                                 "kraken-prefill-gen-1.txt", "kraken-prefill-gen-1b.txt",
+                                 "kraken-prefill-gen-8.txt", "kraken-prefill-gen-64.txt",
+                                 "kraken-prefill-err-gen-1.txt", "kraken-prefill-err-gen-1b.txt",
+                                 "kraken-prefill-err-gen-8.txt", "kraken-prefill-err-gen-64.txt"})
             std::remove(name);
         std::remove(model.c_str());
     }

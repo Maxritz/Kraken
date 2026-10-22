@@ -236,6 +236,16 @@ __global__ void __launch_bounds__(THREADS)
     const u8 *wrow = w + static_cast<size_t>(row) * w_row_bytes;
     const _Float16 *xr = x + xr_row * n_in;
 
+    // MEASURED (2026-10-22, gfx1201, rows=1024, L2-resident): a dequant-once
+    // LDS tile shared across the block's warps does NOT pay -- q4_k 1122 us
+    // redundant vs 1177 us tiled, f16 655 vs 1330 (pure overhead there: the
+    // coop pass plus the barrier plus LDS reads buy nothing with no dequant
+    // to save). The dots dominate the wall, not the decode, so decoding once
+    // cannot move it. Each warp therefore runs the real dot_chunks() on the
+    // raw row, exactly like gemv_mw: redundant decode, L2-resident weights,
+    // zero numerics risk across all formats (including the Q5_K/Q6_K packed
+    // pair order, which folds int-pair dots and could not be reproduced from
+    // staged f16 anyway).
     f32 part = 0.0f;
     for (int c = lane; c < nch; c += 32)
         part += dot_chunks(wt, wrow, xr, c, c + 1);

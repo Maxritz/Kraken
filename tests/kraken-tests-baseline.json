@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-22T02:36:37Z",
-  "recorded_commit": "2d4b355",
-  "totals": {"groups": 74, "passed": 3620, "run": 3620, "exit": 0},
+  "recorded_utc": "2026-10-22T03:11:02Z",
+  "recorded_commit": "9944a7d",
+  "totals": {"groups": 74, "passed": 3624, "run": 3624, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -40,7 +40,7 @@
     {"name": "test_logit_softcap", "status": "pass", "passed": 9, "run": 9},
     {"name": "test_rope_pair_convention", "status": "pass", "passed": 8, "run": 8},
     {"name": "test_end_to_end_cpu", "status": "pass", "passed": 10, "run": 10},
-    {"name": "test_prefill_chunk_bitexact", "status": "pass", "passed": 22, "run": 22},
+    {"name": "test_prefill_chunk_bitexact", "status": "pass", "passed": 26, "run": 26},
     {"name": "group_attention_sinks", "status": "pass", "passed": 11, "run": 11},
     {"name": "test_moe_schema_and_laziness", "status": "pass", "passed": 32, "run": 32},
     {"name": "test_router_resident_preference", "status": "pass", "passed": 6, "run": 6},
