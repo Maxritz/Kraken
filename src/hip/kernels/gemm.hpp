@@ -166,6 +166,41 @@ __global__ void __launch_bounds__(THREADS)
     }
 }
 
+// ---------------------------------------------------------------- gemv_mw --
+//
+// The spatial twin of gemv_m: instead of one warp carrying M activation
+// rows in M live accumulators (temporal), one warp carries ONE activation
+// row and M warps cover the M rows side by side (spatial). Each warp is
+// gemv_kernel's exact computation -- same chunks, same order, same single
+// rounding -- so the result is bit-identical to M gemv launches, and to
+// gemv_m, by construction. The bet it tests: gemv_m's wall time is issue-
+// bound inside too few resident warps, and spreading the same dots over M
+// times the warps buys back the parallelism even though the weight row is
+// dequantized M times (once per warp, L2-resident after the first).
+// Opt-in rung behind KRK_GEMV_M2=1; the dispatch keeps gemv_m as default.
+template <int THREADS, int M>
+__global__ void __launch_bounds__(THREADS)
+    gemv_mw_kernel(const u8 *__restrict__ w, int wt, i64 n_out, i64 n_in,
+                   size_t w_row_bytes, const _Float16 *__restrict__ x,
+                   _Float16 *__restrict__ out) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x >> 5);
+    const i64 row = static_cast<i64>(blockIdx.x);
+    if (row >= n_out) return;
+
+    const int nch = static_cast<int>(n_in / 32);
+    const u8 *wrow = w + static_cast<size_t>(row) * w_row_bytes;
+    const _Float16 *xr = x + static_cast<i64>(warp) * n_in;
+
+    f32 part = 0.0f;
+    for (int c = lane; c < nch; c += 32)
+        part += dot_chunks(wt, wrow, xr, c, c + 1);
+
+    part = d_wave_reduce_sum(part);
+    if (lane == 0)
+        out[static_cast<i64>(warp) * n_out + row] = static_cast<_Float16>(part);
+}
+
 // The widest group that still belongs on the mat-vec ladder. Above it the
 // WMMA tile's reuse of a staged weight tile finally pays for itself.
 constexpr int kGemvMRowsMax = 8;

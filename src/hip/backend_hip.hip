@@ -2140,6 +2140,19 @@ public:
         return v;
     }
 
+    // Spatial multi-warp ladder rung (kernels/gemm.hpp, gemv_mw_kernel).
+    // Default for rows 2..8: M gemv-equivalent warps instead of gemv_m's
+    // one warp with M accumulators. Measured 1.5-3.8x on the MoE expert
+    // shapes with byte-identical output; KRK_GEMV_MW=0 restores gemv_m
+    // (the A/B arm and the fallback).
+    static bool gemv_mw_enabled() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_GEMV_MW");
+            return !(e && e[0] == '0');
+        }();
+        return v;
+    }
+
     GemmRung gemm_rung(DType wt, i64 rows, i64 n_out, i64 n_in) const {
         const bool wmma_present = caps_.has_wmma
 #if defined(KRK_WMMA_COMPILED)
@@ -2401,6 +2414,27 @@ public:
             // made for gfx1151, where handing 4-8 columns to the big-tile
             // routine cost ~25x. Keyed on ROW COUNT and not on format, so it
             // is the same decision the reference makes (ne11 <= 8).
+            if (gemv_mw_enabled()) {
+                // One block per output row, M warps per block: warp t owns
+                // x row t, so no warp carries more than one accumulator.
+                // THREADS = 32*M (64..256); the grid is n_out blocks.
+#define KRK_GEMV_MW(N)                                                      \
+    gemv_mw_kernel<32 * N, N>                                              \
+        <<<static_cast<unsigned>(n_out), 32 * N>>>(wh, static_cast<int>(wt), \
+                                                  n_out, n_in, row_bytes,  \
+                                                  xh, oh)
+                switch (static_cast<int>(rows)) {
+                    case 2: KRK_GEMV_MW(2); break;
+                    case 3: KRK_GEMV_MW(3); break;
+                    case 4: KRK_GEMV_MW(4); break;
+                    case 5: KRK_GEMV_MW(5); break;
+                    case 6: KRK_GEMV_MW(6); break;
+                    case 7: KRK_GEMV_MW(7); break;
+                    default: KRK_GEMV_MW(8); break;
+                }
+#undef KRK_GEMV_MW
+                krk_op_scope.retag("gemm(gemv_mw)");
+            } else {
             const unsigned gm = static_cast<unsigned>((n_out + 7) / 8);
 #define KRK_GEMV_M(N)                                                        \
     gemv_m_kernel<256, N><<<gm, 256>>>(wh, static_cast<int>(wt), n_out,     \
@@ -2416,6 +2450,7 @@ public:
             }
 #undef KRK_GEMV_M
             krk_op_scope.retag("gemm(gemv_m)");
+            }
         } else if (rung == GemmRung::kWmma) {
 #if defined(KRK_WMMA_COMPILED)
             const unsigned bx = static_cast<unsigned>(
