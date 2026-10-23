@@ -61,6 +61,10 @@ struct Args {
     std::string mtp_path;   // --mtp FILE: a nextn block in a file of its own
     // Decode with the file's own nextn block as the drafter (greedy only).
     bool mtp_spec = false;
+    // --prefill fast: take the rows>1 GEMM to the matrix cores (WMMA) instead of
+    // the exact grid. 5.6x the prompt throughput on a dense Q8_0, and NOT
+    // chunk-invariant from 9 rows up -- docs/PERF-ANALYSIS.md section 12s.
+    bool prefill_fast = false;
     int hybrid_threads = 0;     // host worker threads, 0 = min(hardware, 8)
     int hybrid_max_rows = 8;    // rows the host arm runs at, 0 = unbounded
     double hybrid_frac = 1.0;   // share of RESIDENT experts forced to the host
@@ -179,11 +183,14 @@ void usage() {
         "                        the one in WARM. Fewer promotions per token at the\n"
         "                        cost of a near-tie; 0 or absent is off.\n"
         "  --expert-cache-slots N  cap resident (layer, expert) slots (0 = auto)\n"
-        "  --expert-warm-mb N     WARM expert cache in pageable host RAM. Cold\n"
-        "                        reads land here before VRAM, VRAM evictions stay\n"
-        "                        here, and WARM eviction never writes to the file\n"
-        "                        (MiB; <0 auto = the expert set, capped by half of\n"
-        "                        free RAM after a reserve; 0 off).\n"
+        "  --expert-warm-mb N     WARM expert cache in host RAM. Cold reads land\n"
+        "                        here before VRAM, VRAM evictions stay here, and\n"
+        "                        WARM eviction never writes to the file. MiB;\n"
+        "                        <0 auto = the expert corpus capped by the largest\n"
+        "                        commitment that leaves the OS its reserve: 60%% of\n"
+        "                        installed (9.6 GiB on a 16 GiB machine, 57.6 on a\n"
+        "                        96 GiB one), or free RAM minus that reserve when\n"
+        "                        that is smaller. 0 off.\n"
         "                        --expert-l2-mb is the old spelling of this flag.\n"
         "  --expert-warm-prefetch  fill WARM at load instead of on demand (costs\n"
         "                        RAM and time before the first token)\n"
@@ -216,6 +223,12 @@ void usage() {
         "                        whose MTP was published beside them). Same\n"
         "                        block, same names: --mtp-probe/--mtp-spec\n"
         "                        drive it exactly as an in-file block\n"
+        "  --prefill exact|fast  exact (default) keeps every prompt row's\n"
+        "                        arithmetic independent of --chunk; fast takes\n"
+        "                        the rows>1 GEMM to the RDNA4 matrix cores --\n"
+        "                        measured 5.6x prompt throughput on a dense\n"
+        "                        Q8_0, and the prefill hash then DIFFERS past\n"
+        "                        8 rows per chunk (docs/PERF-ANALYSIS.md 12s)\n"
         "  --mtp-probe           run the file's own nextn (MTP) block for one\n"
         "                        step after prefill and print the token it\n"
         "                        drafts against the target's argmax: a match is\n"
@@ -365,6 +378,17 @@ bool parse(int argc, char **argv, Args *a) {
             a->mtp_probe = true;
         else if (f == "--mtp-spec")
             a->mtp_spec = true;
+        else if (f == "--prefill") {
+            const std::string v = next("--prefill");
+            if (v == "fast") {
+                a->prefill_fast = true;
+            } else if (v == "exact") {
+                a->prefill_fast = false;
+            } else {
+                std::fprintf(stderr, "kraken: --prefill needs exact|fast, got '%s'", v.c_str());
+                return 2;
+            }
+        }
         else if (f == "--hybrid-experts")
             a->hybrid_experts = std::atoi(next("--hybrid-experts")) != 0;
         else if (f == "--hybrid-threads")
@@ -384,6 +408,20 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--trace") {
             a->trace = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') a->trace_path = argv[++i];
+        }
+        else if (f == "--profile-log" || f == "--profile_lib") {
+            // The profiler tables (host phases, components, device ops) go to
+            // this file instead of stderr: a comparison run needs the artifact,
+            // and a table on a console scrolls away. KRK_PROFILE_LOG does the
+            // same thing through the environment.
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+#ifdef _WIN32
+                _putenv_s("KRK_PROFILE_LOG", argv[++i]);
+#else
+                setenv("KRK_PROFILE_LOG", argv[++i], 1);
+#endif
+                a->profile = true;
+            }
         }
         else if (f == "--expert-scan") a->expert_scan = true;
         else if (f == "--expert-stub") a->expert_stub = true;
@@ -683,14 +721,20 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     }
     std::fprintf(out, "[stats ] expert-pool budget %zu committed %zu live %zu reusable %zu bytes; "
                      "alloc %llu reuse %llu trim %llu guard-fallback %llu | "
-                     "release %llu mark(s) for %llu slice(s)\n",
+                     "release %llu mark(s) for %llu slice(s), reader-done %llu | "
+                     "honour device %llu host %llu implicit %llu, host-wait %.3f ms\n",
                  pool.budget, pool.committed, pool.live, pool.reusable,
                  static_cast<unsigned long long>(pool.allocations),
                  static_cast<unsigned long long>(pool.reuses),
                  static_cast<unsigned long long>(pool.trims),
                  static_cast<unsigned long long>(pool.guard_fallbacks),
                  static_cast<unsigned long long>(pool.release_marks),
-                 static_cast<unsigned long long>(pool.release_slices));
+                 static_cast<unsigned long long>(pool.release_slices),
+                 static_cast<unsigned long long>(pool.reader_marks),
+                 static_cast<unsigned long long>(pool.order_device),
+                 static_cast<unsigned long long>(pool.order_host),
+                 static_cast<unsigned long long>(pool.order_implicit),
+                 pool.honor_host_ms);
     const u64 acq = ec.acquires();
     const f64 token_div = r.generated > 0 ? static_cast<f64>(r.generated) : 1.0;
     std::fprintf(out,
@@ -710,15 +754,38 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     // exactly the policy working: the tiers answer different questions and
     // only the last one is the storage path.
     const f64 share = acq > 0 ? 100.0 / static_cast<f64>(acq) : 0.0;
+    // IN PLACE is its own column, not part of WARM hits: it is the acquisitions
+    // that spent neither a copy nor a VRAM slot, which is the whole point of the
+    // tier on a card smaller than the routed set.
     std::fprintf(out,
                  "[stats ] cache     %llu acquires | HOT hits %llu (%.1f%%) | "
-                 "WARM hits %llu (%.1f%%) | COLD misses %llu (%.1f%%)\n",
+                 "WARM hits %llu (%.1f%%) | in place %llu (%.1f%%) | "
+                 "COLD misses %llu (%.1f%%)\n",
                  static_cast<unsigned long long>(acq),
                  static_cast<unsigned long long>(ec.hits()), share * static_cast<f64>(ec.hits()),
                  static_cast<unsigned long long>(ec.host_hits()),
                  share * static_cast<f64>(ec.host_hits()),
+                 static_cast<unsigned long long>(ec.inplace_hits()),
+                 share * static_cast<f64>(ec.inplace_hits()),
                  static_cast<unsigned long long>(ec.loads()),
                  share * static_cast<f64>(ec.loads()));
+    if (ec.prefetch_warm_issued() > 0 || ec.prefetch_warm_taken() > 0)
+        std::fprintf(out,
+                     "[stats ] read-ahead %llu job(s), %llu expert(s) taken "
+                     "(%.0f MiB read on the worker instead of inside a layer)\n",
+                     static_cast<unsigned long long>(ec.prefetch_warm_issued()),
+                     static_cast<unsigned long long>(ec.prefetch_warm_taken()),
+                     static_cast<f64>(ec.prefetch_warm_bytes()) / 1048576.0);
+    // A promote-ahead pass that staged nothing is the most likely reason an arm
+    // "did not move", and the cache's own counters are what tells that apart
+    // from a pass whose copies were simply free.
+    if (ec.lookahead_staged() > 0 || ec.lookahead_rejected() > 0)
+        std::fprintf(out,
+                     "[stats ] lookahead %llu staged, %llu rejected by the budget, "
+                     "%llu consumed\n",
+                     static_cast<unsigned long long>(ec.lookahead_staged()),
+                     static_cast<unsigned long long>(ec.lookahead_rejected()),
+                     static_cast<unsigned long long>(ec.active_used()));
     if (engine.router_pref())
         std::fprintf(out,
                      "[stats ] router    %llu picks, %llu (%.1f%%) went to an "
@@ -1159,6 +1226,22 @@ int main(int argc, char **argv) {
     if (a.cpu) {
         be = make_cpu_backend();
     } else {
+        // --prefill maps onto the backend's own GEMM rung switch, which is read
+        // once at construction: the exact grid is the default because it makes
+        // every prompt row's arithmetic independent of --chunk, and the matrix
+        // cores are 5.6x the prompt throughput on a dense Q8_0 while breaking
+        // that from 9 rows per chunk (docs/PERF-ANALYSIS.md section 12s).
+        if (a.prefill_fast) {
+#ifdef _WIN32
+            _putenv_s("KRK_GEMM_PATH", "wmma");
+#else
+            setenv("KRK_GEMM_PATH", "wmma", 1);
+#endif
+            std::fprintf(stderr,
+                         "kraken: --prefill fast takes the rows>1 GEMM to the "
+                         "matrix cores; the prefill hash is then not "
+                         "chunk-invariant past 8 rows per chunk\n");
+        }
         be = make_hip_backend(a.device, &err);
         if (!be) {
             KRK_WARN("%s", err.c_str());

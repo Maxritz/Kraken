@@ -1,4 +1,5 @@
 // kv_tier.cpp — HOT / WARM / COLD residency for the KV cache
+#include "krk/host_time.hpp"
 #include "krk/kv_tier.hpp"
 #include "krk/vram_guard.hpp"
 
@@ -317,6 +318,7 @@ void KvTierCache::fence_if_on(const char *op) {
 // evidence. This turns it into a named STUCK line and a clean exit 42, with
 // the trace file showing exactly which slot and layer were in flight.
 bool KvTierCache::wait_slot(int slot, const char *why, i64 layer) {
+    KRK_TIME_HOST("kv.wait_slot");
     void *m = slot < 0 || slot >= n_slots_
                   ? nullptr
                   : slot_marker_[static_cast<size_t>(slot)];
@@ -352,6 +354,7 @@ bool KvTierCache::evict_slot(int slot, i64 keep) {
 }
 
 bool KvTierCache::to_warm(i64 layer, int slot) {
+    KRK_TIME_HOST("kv.to_warm");
     trace_line("to-warm", layer, slot, "");
     const size_t len = len_[static_cast<size_t>(layer)];
     if (len == 0) return false; // this layer holds no KV to move
@@ -383,6 +386,7 @@ bool KvTierCache::to_warm(i64 layer, int slot) {
 }
 
 bool KvTierCache::to_cold(i64 layer, int slot) {
+    KRK_TIME_HOST("kv.to_cold");
     trace_line("to-cold", layer, slot, "");
     if (cold_dir_.empty()) return false;
     const size_t len = len_[static_cast<size_t>(layer)];
@@ -416,6 +420,7 @@ bool KvTierCache::to_cold(i64 layer, int slot) {
 }
 
 bool KvTierCache::from_warm(i64 layer, int slot) {
+    KRK_TIME_HOST("kv.from_warm");
     trace_line("from-warm", layer, slot, "");
     void *host = warm_mem_[static_cast<size_t>(layer)];
     if (!host) return false;
@@ -441,6 +446,7 @@ bool KvTierCache::from_warm(i64 layer, int slot) {
 }
 
 bool KvTierCache::from_cold(i64 layer, int slot) {
+    KRK_TIME_HOST("kv.from_cold");
     trace_line("from-cold", layer, slot, "");
     if (cold_dir_.empty()) return false;
     std::FILE *f = std::fopen(cold_path(layer).c_str(), "rb");
@@ -500,6 +506,7 @@ int KvTierCache::take_slot(i64 keep) {
 }
 
 int KvTierCache::ensure_hot(i64 layer) {
+    KRK_TIME_HOST("kv.ensure_hot");
     trace_line("ensure", layer, 0, "");
     if (!tiered_) return 0;
     if (layer < 0 || layer >= n_layer_) return -1;

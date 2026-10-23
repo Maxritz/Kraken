@@ -932,6 +932,7 @@ const char *dtype_name(DType t) {
         case DType::F32: return "F32";
         case DType::F16: return "F16";
         case DType::BF16: return "BF16";
+        case DType::I32: return "I32";
         case DType::Q4_0: return "Q4_0";
         case DType::Q4_1: return "Q4_1";
         case DType::Q5_0: return "Q5_0";
@@ -976,6 +977,7 @@ bool dtype_supported(DType t) {
         case DType::F32:
         case DType::F16:
         case DType::BF16:
+        case DType::I32:
         case DType::Q4_0:
         case DType::Q4_1:
         case DType::Q5_0:
@@ -1021,7 +1023,8 @@ int dtype_block_size(DType t) {
     switch (t) {
         case DType::F32:
         case DType::F16:
-        case DType::BF16: return 1;
+        case DType::BF16:
+        case DType::I32: return 1;
         case DType::Q2_K:
         case DType::Q3_K:
         case DType::Q4_K:
@@ -1056,6 +1059,7 @@ int dtype_block_bytes(DType t) {
         case DType::F32: return 4;
         case DType::F16: return 2;
         case DType::BF16: return 2;
+        case DType::I32: return 4;
         case DType::Q4_0: return 18;
         case DType::Q4_1: return 20;
         case DType::Q5_0: return 22;
@@ -1126,6 +1130,14 @@ void dequant_row(DType t, const void *src, f32 *out, i64 n) {
         for (i64 i = 0; i < n; i++) out[i] = bf16_to_fp32(h[i]);
         return;
     }
+    // I32 (ggml type 26): plain int32, widened. Not a quantization, so there
+    // is no block to walk -- the values ARE the data, and the only question
+    // is the sign and the width.
+    if (t == DType::I32) {
+        const i32 *w = static_cast<const i32 *>(src);
+        for (i64 i = 0; i < n; i++) out[i] = static_cast<f32>(w[i]);
+        return;
+    }
     const int bs = dtype_block_size(t);
     const int bb = dtype_block_bytes(t);
     f32 buf[256];
@@ -1188,6 +1200,20 @@ f32 vec_dot(DType t, const void *src, const f32 *x, i64 n) {
         f32 s = (acc0 + acc1) + (acc2 + acc3);
         for (; i < n; i++)
             s += (bf ? bf16_to_fp32(h[i]) : fp16_to_fp32(h[i])) * x[i];
+        return s;
+    }
+    if (t == DType::I32) {
+        const i32 *w = static_cast<const i32 *>(src);
+        f32 acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+        i64 i = 0;
+        for (; i + 4 <= n; i += 4) {
+            acc0 += static_cast<f32>(w[i]) * x[i];
+            acc1 += static_cast<f32>(w[i + 1]) * x[i + 1];
+            acc2 += static_cast<f32>(w[i + 2]) * x[i + 2];
+            acc3 += static_cast<f32>(w[i + 3]) * x[i + 3];
+        }
+        f32 s = (acc0 + acc1) + (acc2 + acc3);
+        for (; i < n; i++) s += static_cast<f32>(w[i]) * x[i];
         return s;
     }
     const int bs = dtype_block_size(t);

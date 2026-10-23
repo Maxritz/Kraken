@@ -94,6 +94,17 @@ __global__ void __launch_bounds__(THREADS)
     x[i] = d_sat_f16_count(d_silu(static_cast<f32>(x[i])), &g_krk_sat_silu);
 }
 
+// x <- gelu(x) in place (gemma's GeGLU gate). Same shape as silu_kernel above,
+// and it lives here for the same reason: the elementwise activation kernels are
+// one launch per FFN and there is no other header that owns them.
+template <int THREADS>
+__global__ void __launch_bounds__(THREADS)
+    gelu_kernel(_Float16 *__restrict__ x, i64 n) {
+    const i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] = d_sat_f16_count(d_gelu(static_cast<f32>(x[i])), &g_krk_sat_silu);
+}
+
 } // namespace krk
 
 #endif // KRK_KERNEL_HC_HPP

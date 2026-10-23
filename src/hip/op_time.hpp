@@ -62,6 +62,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include "krk/host_time.hpp"
 #include "krk/trace.hpp"
 #include <utility>
 #include <vector>
@@ -77,6 +78,11 @@ public:
         i64 calls = 0;
         i64 bytes = 0;
         i64 flops = 0;
+        // Per-phase split (load / prefill / decode). A kernel family's share of
+        // a run is meaningless without it: the same GEMM is 5% of a token and
+        // 90% of a load.
+        double dev_phase[HostTime::kPhases] = {0.0, 0.0, 0.0};
+        i64 calls_phase[HostTime::kPhases] = {0, 0, 0};
     };
 
     // One op, in issue order. `dev` and `gap` partition the device timeline
@@ -140,6 +146,7 @@ public:
             hipEventCreate(&s.b);
         }
         s.name = name;
+        s.phase = HostTime::phase();
         s.bytes = 0;
         s.flops = 0;
         s.host_ms = 0.0;
@@ -176,6 +183,8 @@ public:
     // from the backend's destructor (before the device goes away).
     void finish() {
         if (!on_) return;
+        // Both lanes' tables go to one sink (KRK_PROFILE_LOG / --profile-log).
+        std::FILE *const out = HostTime::out(stderr);
         // Drain first: with a pool that covers the run, nothing has resolved yet.
         for (Slot &s : pool_) resolve(s);
         if (rows_.empty()) return;
@@ -201,6 +210,33 @@ public:
         // row claims, and it gets its own column so the raw number is corrected
         // rather than hidden.
         const double floor_ms = dev_floor_us_ / 1000.0;
+        // Hand the component totals to the host profiler, which prints ONE
+        // table covering both lanes. The backend is the only place that owns
+        // HIP events, and the host table is the only place a reader looks, so
+        // this is the join: without it the two tables have to be added up by
+        // hand, which is exactly what a "what is slow" question should not
+        // require.
+        {
+            // Per component AND per phase: `load` and `decode` both run GEMMs,
+            // and merging them hides which one is the cost.
+            for (const auto &kv : rows_) {
+                const Row &r = kv.second;
+                const char *c = component_of(kv.first.c_str());
+                for (int p = 0; p < HostTime::kPhases; p++) {
+                    const double fl =
+                        floor_ms * static_cast<double>(r.calls_phase[p]);
+                    const double net = r.dev_phase[p] - fl;
+                    if (r.calls_phase[p] == 0) continue;
+                    HostTime::get().add_device(c, net > 0.0 ? net : 0.0,
+                                               r.calls_phase[p], p);
+                }
+            }
+            // Printed here rather than from the host report: the host tables
+            // are emitted at the end of generation, before this destructor
+            // runs, so the component table printed there had every device
+            // column at zero.
+            HostTime::get().report_components(out);
+        }
         double net_total = 0.0;
         i64 unresolved = 0;
         std::sort(order.begin(), order.end(),
@@ -208,7 +244,7 @@ public:
                       return (a.second->dev_ms - floor_ms * a.second->calls) >
                              (b.second->dev_ms - floor_ms * b.second->calls);
                   });
-        std::fprintf(stderr,
+        std::fprintf(out,
                      "\n== KRK_TIME per-op device time, net of a %.2f us "
                      "recorder floor (%lld ops)\n"
                      "%-26s %8s %9s %9s %9s %9s %9s %8s %8s\n",
@@ -229,14 +265,14 @@ public:
             const double gbs =
                 ok && r.bytes > 0.0 ? static_cast<double>(r.bytes) / (net * 1e6)
                                     : 0.0;
-            std::fprintf(stderr,
+            std::fprintf(out,
                          "%-26s %8lld %9.2f %9.2f %9.2f %9.2f %9.2f %8.1f %8.1f%s\n",
                          e.first->c_str(), static_cast<long long>(r.calls),
                          r.dev_ms, fl, net, r.gap_ms, r.host_ms,
                          static_cast<double>(r.bytes) / 1e6, gbs,
                          ok ? "" : "  <-at floor");
         }
-        std::fprintf(stderr,
+        std::fprintf(out,
                      "%-26s %8lld %9.2f %9.2f %9.2f %9.2f %9.2f\n"
                      "device spans NET of the recorder are %.1f%% of %.1f ms "
                      "wall; %.1f ms idle between ops (%.1f%%); %.1f ms neither "
@@ -248,7 +284,7 @@ public:
                      wall, gap_total, wall > 0.0 ? 100.0 * gap_total / wall : 0.0,
                      wall - net_total - gap_total);
         if (unresolved > 0) {
-            std::fprintf(stderr,
+            std::fprintf(out,
                          "!! %lld of %lld ops (%.1f%%) sit at or below the "
                          "%.2f us floor and are NOT individually resolvable; "
                          "their true combined cost is bounded above by %.1f ms. "
@@ -277,6 +313,7 @@ private:
         size_t prev = 0;
         bool has_prev = false;
         bool used = false;
+        int phase = HostTime::kDecode;
     };
 
     static const size_t kNoPrev = static_cast<size_t>(-1);
@@ -293,6 +330,9 @@ private:
         // floor as KRK_TIME -- compare untraced wall time for conclusions.
         const bool trace_ev = t && *t && std::string(t) != "0";
         on_ = profile_ || (v && *v && std::string(v) != "0") || trace_ev;
+        // Teardown prints the merged component table (the device numbers only
+        // exist then), so the host report must not print a device-less copy.
+        if (on_) HostTime::note_device_pending();
         if (on_) {
             const std::string spec = v ? v : "";
             // --profile needs every op to draw the step, so it overrides a
@@ -389,8 +429,21 @@ static const char *component_of(const char *op) {
         {"attn_fused", "attention"},
         {"logits_topk", "head+sample"},
         {"download", "transfer"},
+        // Prefix match: upload, upload_pinned, upload_paged, upload_i32,
+        // upload_now, upload_expert_staged. `upload_pinned` alone is 5641 ops
+        // and 1212 ms of the 30B-A3B run, and it was landing in `other`.
         {"upload", "transfer"},
-        {"upload_i32", "transfer"},
+        // The disk-tier read: not a kernel and not a device copy, so it had no
+        // bucket until the tier got one.
+        {"warm_read", "expert-tier"},
+        {"fill0", "workspace"},
+        {"copy_act", "workspace"},
+        {"add_residual", "residual"},
+        {"add_rmsnorm", "norms"},
+        {"scatter_axpy", "experts"},
+        {"router_softmax", "routing"},
+        {"router_topk", "routing"},
+        {"moe_plan_build", "routing"},
     };
     // Exact match first, then prefix. A GEMM retags itself to the rung it took
     // ("gemm(gemv)", "gemm(wmma)"), so an exact-match table alone silently
@@ -416,6 +469,7 @@ static const char *component_of(const char *op) {
     // embeds gives the earlier ones.
 
     void print_timeline() {
+        std::FILE *const out = HostTime::out(stderr);
         const char *sev = std::getenv("KRK_PROFILE_STEPS");
         const long steps = sev ? std::atol(sev) : 1;
         const char *fev = std::getenv("KRK_PROFILE_FROM");
@@ -434,7 +488,7 @@ static const char *component_of(const char *op) {
             const long ops = oev ? std::atol(oev) : 700;
             const size_t n = static_cast<size_t>(ops > 0 ? ops : 700);
             const size_t b = tl_.size() > n ? tl_.size() - n : 0;
-            std::fprintf(stderr,
+            std::fprintf(out,
                          "\n== KRK_PROFILE timeline — no `embed` marker, "
                          "showing the last %zu of %zu ops\n",
                          tl_.size() - b, tl_.size());
@@ -449,7 +503,7 @@ static const char *component_of(const char *op) {
         if (first >= static_cast<long>(starts.size())) first =
             static_cast<long>(starts.size()) - 1;
         const long nsteps = first - last + 1;
-        std::fprintf(stderr,
+        std::fprintf(out,
                      "\n== KRK_PROFILE timeline — %ld decode step%s "
                      "(the last of %zu recorded)\n",
                      nsteps, nsteps == 1 ? "" : "s", starts.size());
@@ -458,7 +512,7 @@ static const char *component_of(const char *op) {
             const size_t e = (static_cast<size_t>(s) + 1 < starts.size())
                                  ? starts[static_cast<size_t>(s) + 1]
                                  : tl_.size();
-            std::fprintf(stderr, "-- step %ld/%ld: ops %zu..%zu\n",
+            std::fprintf(out, "-- step %ld/%ld: ops %zu..%zu\n",
                          static_cast<long>(starts.size()) - s,
                          static_cast<long>(starts.size()), b, e - 1);
             print_range(b, e);
@@ -467,6 +521,7 @@ static const char *component_of(const char *op) {
 
     void print_range(size_t b, size_t e) {
         if (e <= b) return;
+        std::FILE *const out = HostTime::out(stderr);
         double dev = 0.0, gap = 0.0, host = 0.0;
         for (size_t i = b; i < e; i++) {
             dev += tl_[i].dev;
@@ -485,13 +540,13 @@ static const char *component_of(const char *op) {
         const auto pc = [&](double v) {
             return host_wall > 0.0 ? 100.0 * v / host_wall : 0.0;
         };
-        std::fprintf(stderr,
+        std::fprintf(out,
                      "   %zu ops | host wall %8.3f ms | device spans %7.3f ms"
                      " (%5.1f%%) | device idle %7.3f ms (%5.1f%%)"
                      " | outside every op %7.3f ms (%5.1f%%)\n",
                      e - b, host_wall, dev, pc(dev), gap, pc(gap), outside,
                      pc(outside));
-        std::fprintf(stderr,
+        std::fprintf(out,
                      "     %5s %-22s %10s %9s %9s %9s %8s %8s %8s\n", "#", "op",
                      "t+ us", "dev us", "idle us", "host us", "MB", "GB/s",
                      "TFLOP/s");
@@ -517,7 +572,7 @@ static const char *component_of(const char *op) {
                                        ? static_cast<double>(r.flops) /
                                              (r.dev * 1e9)
                                        : 0.0;
-            std::fprintf(stderr,
+            std::fprintf(out,
                          "     %5zu %-22s %10.2f %9.2f %9.2f %9.2f %8.2f %8.1f %8.2f\n",
                          i - b, r.name, t * 1000.0, r.dev * 1000.0,
                          r.gap * 1000.0, r.host * 1000.0,
@@ -544,11 +599,11 @@ static const char *component_of(const char *op) {
                      const std::pair<const std::string *, const Row *> &b) {
                       return a.second->dev_ms > b.second->dev_ms;
                   });
-        std::fprintf(stderr,
+        std::fprintf(out,
                      "     %5s %-22s %5s %9s %9s %9s\n", "", "rolled up", "n",
                      "dev us", "idle us", "host us");
         for (const auto &e : ord)
-            std::fprintf(stderr, "     %5s %-22s %5lld %9.2f %9.2f %9.2f\n", "",
+            std::fprintf(out, "     %5s %-22s %5lld %9.2f %9.2f %9.2f\n", "",
                          e.first->c_str(),
                          static_cast<long long>(e.second->calls),
                          e.second->dev_ms * 1000.0, e.second->gap_ms * 1000.0,
@@ -576,11 +631,11 @@ static const char *component_of(const char *op) {
                      const std::pair<const std::string *, const Row *> &bb) {
                       return a.second->dev_ms > bb.second->dev_ms;
                   });
-        std::fprintf(stderr,
+        std::fprintf(out,
                      "     %-16s %6s %6s %11s %11s %11s\n", "component", "ops",
                      "%dev", "dev us", "idle us", "host us");
         for (const auto &c : cord)
-            std::fprintf(stderr, "     %-16s %6lld %5.1f%% %11.2f %11.2f %11.2f\n",
+            std::fprintf(out, "     %-16s %6lld %5.1f%% %11.2f %11.2f %11.2f\n",
                          c.first->c_str(),
                          static_cast<long long>(c.second->calls),
                          dev > 0.0 ? 100.0 * c.second->dev_ms / dev : 0.0,
@@ -588,7 +643,7 @@ static const char *component_of(const char *op) {
                          c.second->host_ms * 1000.0);
         (void)comp_n;
 
-        std::fprintf(stderr,
+        std::fprintf(out,
                      "   instrumentation floor, %d empty ops timed through the "
                      "same begin/end path: %.2f us host, %.2f us device each.\n"
                      "   Every row pays that, so dev and idle are upper bounds "
@@ -670,6 +725,13 @@ static const char *component_of(const char *op) {
         r.dev_ms += ms;
         r.host_ms += s.host_ms;
         r.calls += 1;
+        // A host-side phase may have moved on by the time the event resolves;
+        // the phase is the one the op was ISSUED in, stamped at begin().
+        const int ph = s.phase >= 0 && s.phase < HostTime::kPhases
+                           ? s.phase
+                           : HostTime::kDecode;
+        r.dev_phase[ph] += ms;
+        r.calls_phase[ph] += 1;
         r.bytes += s.bytes;
         r.flops += s.flops;
         // The synchronisation trap: the span above starts when this op's work

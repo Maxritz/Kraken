@@ -12,6 +12,7 @@
 #ifndef KRK_BACKEND_HPP
 #define KRK_BACKEND_HPP
 
+#include <cmath>   // std::tanh in krk_gelu_tanh, called from every FFN path
 #include <cstdlib> // std::abort in hadamard_act's default body
 #include <cstring>
 #include <functional>
@@ -22,6 +23,18 @@
 namespace krk {
 
 enum class BackendKind { CPU, HIP };
+
+// GELU, the tanh approximation (ggml's ggml_gelu):
+//   0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3)))
+// One definition for both backends, because the CPU arm is the reference the
+// device arm is compared against -- two transcriptions of this would differ in
+// the last bits and read as a kernel bug.
+inline f32 krk_gelu_tanh(f32 v) {
+    constexpr f32 kAlpha = 0.7978845608028654f; // sqrt(2/pi)
+    constexpr f32 kBeta = 0.044715f;
+    return 0.5f * v *
+           (1.0f + std::tanh(kAlpha * (v + kBeta * v * v * v)));
+}
 
 // RDNA family generation, used to pick the compute path.
 enum class GfxFamily : int {
@@ -109,6 +122,47 @@ struct AttnDesc {
     // arithmetic bit for bit, and exact zeros are the only values for which
     // that and the formula can both hold.
     const f32 *sinks = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// Multi-head latent attention (DeepSeek-V2/V3/V4), legacy-lite layout.
+//
+// The cache row is NOT n_kv x head_dim. One row per token holds the compressed
+// latent (kv_lora wide, normed at write time) followed by the decoupled RoPE
+// key (qk_rope wide, stored UNROTATED so each row rotates at its own position).
+// Per token and layer that is 512 + 64 on V2-Lite against a GQA row of
+// n_kv*head_dim*2, which is the whole point of MLA.
+//
+// Attention runs ON the latent, with the two per-head projections folded where
+// they cost the least:
+//
+//   qk_h  = Wk_h^T q_nope_h                      the absorb, per call
+//   s_t   = qk_h . c_t + rope(q_pe_h) . rope(k_pe_t)
+//   p     = softmax(s * scale)
+//   cv    = sum_t p_t c_t                        still latent width
+//   out_h = Wv_h^T cv
+//
+// so neither the cache nor the score ever widens to per-head K and V rows.
+// ---------------------------------------------------------------------------
+
+struct MlaDesc {
+    i64 n_head = 0;
+    i64 qk = 0;        // per-head query width: nope + rope
+    i64 nope = 0;
+    i64 rope = 0;
+    i64 kv_lora = 0;
+    i64 v_dim = 0;
+    i64 n_tok = 0;      // query rows in this call
+    i64 pos0 = 0;       // absolute position of row 0
+    i64 pos_stride = 0; // elements between cache positions
+    f32 scale = 1.0f;   // 1/sqrt(qk), times any rope magnitude factor
+    f32 eps = 1e-6f;
+    // Decoupled-rope frequencies, [rope/2], HOST memory (the backend stages
+    // them, exactly as AttnDesc's tables are staged). The pairing is the
+    // adjacent-channel one (rope_neox=false), which is what this family
+    // declares; a file needing the half-split pairing is a different layout
+    // and is refused by the loader today.
+    const f32 *inv_freq = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -219,6 +273,22 @@ public:
     void release_host_deferred_budgeted(void *p) {
         if (p) release_host_deferred(p);
     }
+    // Can a KERNEL read a buffer this backend allocated with alloc_host()?
+    //
+    // `alloc_host` is the pinned tier (hipHostMalloc on HIP), and whether those
+    // bytes are addressable from the device is a property of the runtime and the
+    // driver, not a thing to assume: HIP on this box reports
+    // `unifiedAddressing: 0` and still maps the pinned pool. The answer was
+    // measured (tools/probe_hostread.hip: a kernel read a 4 MiB pinned buffer
+    // back exactly, and a 256 MiB one at 24.3 GiB/s against 485 GiB/s for device
+    // memory), so it is a fact on this machine and false by default everywhere
+    // else until it is measured there too.
+    //
+    // This is what lets an expert be READ IN PLACE out of the host tier instead
+    // of promoted: for a decode row the promotion copies ~1.95 MiB into VRAM to
+    // read it once, and the same bytes out of RAM cost one pass at the same
+    // order of speed with no VRAM slot and no eviction.
+    virtual bool host_load_supported() const { return false; }
     // Fills `dst` (pageable host memory) with `bytes` taken from `mapped_src`,
     // a pointer into the weight mapping. A backend that can read the file
     // directly (see set_weight_pull) does so, because a cold expert should cost
@@ -341,11 +411,22 @@ public:
         // no single stream to order. The first is the cheap one; the ratio is
         // what says whether the reuse path was actually taken.
         u64 order_device = 0, order_host = 0, order_implicit = 0;
+        // Host time actually blocked inside pool_honor_host_ (a
+        // hipEventSynchronize on the mark). order_host counts the calls; this
+        // is what they cost, and the difference between it and the whole
+        // guard's cost (the KRK_POOL_NO_WAIT arm) is time spent on the DEVICE:
+        // a stream waiting for a mark delays the copy, and the default stream
+        // waits for that copy, so the host sees none of it.
+        f64 honor_host_ms = 0;
         // Release marks: how many hipEventRecords the pool issued, and how many
         // slices those records covered. A burst release is ONE mark for its
         // whole burst, so release_slices / release_marks is the sharing factor
         // and a ratio of 1.0 means the burst path was not taken.
         u64 release_marks = 0, release_slices = 0;
+        // Reader-done marks recorded at the end of a slot's use, which a reuse
+        // then waits on instead of the release-time position. Zero means the
+        // slot-mark path never ran (see KRK_POOL_SLOT_MARK).
+        u64 reader_marks = 0;
         // Growth refused because it would have taken the card below the VRAM
         // floor. Not an error: the cache serves those experts from WARM, and
         // the count is what says the pool hit the real limit rather than its
@@ -384,6 +465,22 @@ public:
     // dependency cycle. See HipBackend::PoolMark.
     virtual void release_pooled_batch(void *const ps[], const size_t bytes[], int n) {
         for (int i = 0; i < n; i++) release_pooled(ps[i], bytes[i]);
+    }
+    // "These cells were last READ here" -- the owner records it once its kernels
+    // for them have been enqueued, which is a much tighter point than the
+    // release that comes at eviction time. A release mark is a POSITION on the
+    // default stream, so the mark recorded at release covers every kernel queued
+    // before it, not just these cells' readers: in a decode step the whole token
+    // is queued back to back, so a promotion that reused a just-evicted slot
+    // waited for the layer's own earlier experts and the layer before it
+    // (measured +24% at a saturated budget, docs/PERF-ANALYSIS.md section 12n).
+    // Recorded at the end of the slot's own use, the wait is for that slot's
+    // readers only. The mark is shared by the cells of one expert -- they are
+    // read by the same kernels -- so this is one record per slot use, not per
+    // cell. `KRK_POOL_SLOT_MARK=0` restores the release-time mark.
+    virtual void pool_note_reader_done(void *const cells[], int n) {
+        (void)cells;
+        (void)n;
     }
     virtual void upload(void *dst, const void *src, size_t bytes, size_t off = 0) = 0;
     // Direct copy with no staging side effects. The HIP backend's read()-based
@@ -627,19 +724,25 @@ public:
     // projections are not all quantised the same way (a real checkpoint will
     // have attn_qkv at one format and ssm_alpha/ssm_beta at another). Null
     // means every matrix uses `wt`.
+    // `xs` gives each matrix its own activation source, for a group whose
+    // matrices do NOT share one -- the routed experts' down projections read a
+    // different silu row each. Null, the usual case, means every matrix reads
+    // `x`; `x` is then ignored.
     virtual bool gemm_group(void *const out[], const void *x,
                             const void *const w[], DType wt,
                             const i64 n_out[], i64 n_in, int n_mat,
                             i64 rows, bool silu = false,
                             bool *silu_fused = nullptr,
                             bool row_parallel_only = false,
-                            const DType *wts = nullptr) {
+                            const DType *wts = nullptr,
+                            const void *const xs[] = nullptr) {
         (void)silu;
         (void)row_parallel_only;
         (void)wts;
         if (silu_fused) *silu_fused = false;
         for (int m = 0; m < n_mat; m++)
-            gemm(out[m], x, w[m], wts ? wts[m] : wt, n_out[m], n_in, rows);
+            gemm(out[m], xs ? xs[m] : x, w[m], wts ? wts[m] : wt, n_out[m],
+                 n_in, rows);
         return false;
     }
 
@@ -674,6 +777,30 @@ public:
     // out[n_tok, n_head*hd] = softmax(q K^T / sqrt(hd)) V
     virtual void attention(void *out, const void *q, const void *kcache,
                            const void *vcache, const AttnDesc &d) = 0;
+
+    // ---- multi-head latent attention (see MlaDesc above) ------------------
+    // A backend that cannot run MLA says so, and the engine refuses the file
+    // rather than running a graph with no attention in it at all. The two ops
+    // below are no-ops by default for exactly the reason: a backend that
+    // forgets to implement one and still claims support would leave the
+    // destination buffer holding whatever the allocator did, which is fluent
+    // text that is not the model. The CPU reference implements both, and the
+    // suite drives it, so "supported" has something behind it.
+    virtual bool mla_supported() const { return false; }
+    // cache[pos0 + t] = [ rmsnorm(proj[t][0..kv_lora)) * gamma | proj[t][kv_lora..) ]
+    // from ONE [n_tok, kv_lora+rope] projection: the latent and the decoupled
+    // key come from the same row, and only the latent half is normed.
+    virtual void mla_kv_write(void *cache, const void *proj, const void *gamma,
+                              const MlaDesc &d) {
+        (void)cache; (void)proj; (void)gamma; (void)d;
+    }
+    // out[n_tok, n_head*v_dim] from q [n_tok, n_head*qk] and the cache.
+    // `wkv_b` is the file's unsplit table, f16 [kv_lora, n_head*(nope+v_dim)],
+    // head h at column offset h*(nope+v_dim), K part first.
+    virtual void mla_attention(void *out, const void *q, const void *cache,
+                               const void *wkv_b, const MlaDesc &d) {
+        (void)out; (void)q; (void)cache; (void)wkv_b; (void)d;
+    }
 
     // Compact gather out of a KV cache: dst[r] = src[idx[r]], `row_bytes`
     // each, for r in [0, n_rows). Pure byte movement, so no element type is
@@ -755,6 +882,22 @@ public:
     // either way.
     virtual void silu_mul(void *out, const void *gate, const void *up, i64 n,
                           i64 row_len = 0, f32 *row_scale = nullptr) = 0;
+
+    // silu_mul() for `count` independent ONE-ROW buffers, as a single launch:
+    // row i is out[i] (operands gate[i], up[i]), `row_len` wide, and scale[i]
+    // receives that row's power-of-two scale. This is exactly `count` calls to
+    // silu_mul(out[i], gate[i], up[i], row_len, row_len, scale[i]) and has to
+    // stay bit-identical to them: the MoE decode path batches its routed
+    // experts into one activation launch, and a row that rounded differently
+    // here would change the model's text. The default is those calls, so a
+    // backend that does not batch is correct by construction.
+    virtual void silu_mul_rows(void *const out[], const void *const gate[],
+                               const void *const up[], i64 row_len, int count,
+                               f32 *const scale[]) {
+        for (int i = 0; i < count; i++)
+            silu_mul(out[i], gate[i], up[i], row_len, row_len,
+                     scale ? scale[i] : nullptr);
+    }
 
     // gpt-oss's expert activation: min(gate, 7) * sigmoid(1.702 * that) *
     // (clamp(up, -7, 7) + 1). Every operand is clamped, so the result is
@@ -987,6 +1130,13 @@ public:
     // expert gate for a SiLU to ride, so without it the routed bank is a
     // plausible-looking, wrong function of the same weights.
     virtual void relu_sqr_act(void *x, i64 n) { (void)x; (void)n; }
+
+    // In-place GELU, the tanh approximation ggml's ggml_gelu uses --
+    // 0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3))). gemma's FFN is GeGLU, so
+    // its gate matrix runs through this instead of silu; the two activations
+    // agree near zero and differ in the tail, which is a plausible-text wrong
+    // answer rather than a visible one, so the arch declares which it needs.
+    virtual void gelu_act(void *x, i64 n) { (void)x; (void)n; }
 
     // x <- alpha * x over n_tok rows of `width` elements spaced `stride` apart,
     // and the elementwise product a[i] *= b[i] (both dense).

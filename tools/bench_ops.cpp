@@ -52,6 +52,7 @@
 #include <krk/expert_cache.hpp>
 #include <krk/h2d_probe.hpp>
 #include <krk/hc.hpp>
+#include <krk/mla.hpp>
 #include <krk/quant.hpp>
 
 #include <algorithm>
@@ -724,6 +725,61 @@ i64 gate_expert_pool(Backend *be) {
     be->download(got.data(), staged, 1024);
     check(got == input, "staged ticket publishes exact bytes");
     be->release_pooled(staged, 1024);
+    {   // A cell reused while its old reader is still QUEUED must not be
+        // overwritten under that reader. The pool hands a released cell back out
+        // carrying the mark its readers were released under, and every write path
+        // is supposed to wait for it. The pinned-DMA arm a pinned WARM promotion
+        // takes (`upload_pinned_batch`) issues its copy on a private NON-BLOCKING
+        // stream and did not, so the DMA lands on bytes a queued expert read is
+        // still reading. The reads here are 256 copies of one cell queued BEFORE
+        // its release (so its mark covers them) and then a different pattern is
+        // written into the very same cell.
+        // 64 MiB per read and 16 of them: the device spends ~0.7 ms on the
+        // 1 GiB of reads while the host needs ~60 us to enqueue them, so the
+        // queue is deep when the DMA is issued -- the geometry the first version
+        // of this trap got wrong. At 4 MiB per read the host enqueue outran the
+        // device work, the readers were all but retired by the time the copy was
+        // posted, and the trap passed on code that had the race.
+        constexpr size_t kTrap = 64u << 20;
+        constexpr int kReaders = 16;
+        constexpr int kOuts = 8;
+        const size_t elems = kTrap / 2;      // f16 elements
+        std::vector<u16> pat_a(elems, fp32_to_fp16(1.0f));
+        std::vector<u16> pat_b(elems, fp32_to_fp16(-1.0f));
+        be->set_expert_pool_budget(64u << 20);
+        void *trap_cell = be->alloc_pooled(kTrap);
+        be->upload(trap_cell, pat_a.data(), kTrap);
+        void *outs[kOuts] = {};
+        for (int i = 0; i < kOuts; i++) outs[i] = be->alloc(kTrap);
+        void *pinned = be->alloc_host(kTrap);
+        std::memcpy(pinned, pat_b.data(), kTrap);
+        for (int r = 0; r < kReaders; r++)
+            be->copy_act(outs[r % kOuts], trap_cell, static_cast<i64>(elems));
+        be->release_pooled(trap_cell, kTrap);
+        void *reused = be->alloc_pooled(kTrap);
+        const auto pb0 = be->pinned_dma_batches();
+        void *t_dst[] = {reused};
+        const void *t_src[] = {pinned};
+        const size_t t_len[] = {kTrap};
+        be->upload_pinned_batch(t_dst, t_src, t_len, 1);
+        be->sync();
+        std::vector<u16> tgot(elems);
+        int mixed = 0;
+        for (int i = 0; i < kOuts; i++) {
+            be->download(tgot.data(), outs[i], kTrap);
+            if (tgot != pat_a) ++mixed;
+        }
+        check(reused == trap_cell,
+              "the trap's cell is the one handed back out (a fresh cell tests nothing)");
+        check(be->pinned_dma_batches() == pb0 + 1,
+              "the trap took the pinned DMA arm (a fallback path would pass vacuously)");
+        check(mixed == 0,
+              "a cell reused under a queued reader is not overwritten by the next DMA");
+        for (int i = 0; i < kOuts; i++) be->release(outs[i]);
+        be->release_host(pinned);
+        be->release_pooled(reused, kTrap);
+        be->set_expert_pool_budget(4096);
+    }
     be->release(source); be->release(output);
     be->set_expert_pool_budget(0);
     auto s = be->expert_pool_stats();
@@ -2510,6 +2566,291 @@ i64 arm_hc(Backend *be) {
     return failed;
 }
 
+// ---- multi-head latent attention: the engine's layer against the host oracle
+//
+// One case is one MLA layer's forward at the V2-Lite geometry, run twice: once
+// through the ops the engine composes (the two projections, the cache write,
+// the absorbed attention, the output projection) and once through src/mla.cpp.
+// Every piece it pins is a defect that still produces fluent, plausible text:
+//
+//   the cache row    the norm covers the LATENT only. Norming all 576 shrinks
+//                    the decoupled key by sqrt(576/512) and nothing complains.
+//   the absorb       q_nope folded through the K half of attn_kv_b, per head;
+//                    reading another head's block costs nothing at load time.
+//   the rope         the query's tail rotates at the query's position and each
+//                    cached key's tail at ITS OWN; the cache stores it
+//                    unrotated, which is the only way a row that is written
+//                    once can be read at every position.
+//   the value fold   the accumulated latent through the V half, per head.
+//
+// The oracle takes the table HEAD-major ([n_head][kv_lora][hv]); the file and
+// the kernel store it FEATURE-major ([n_head*hv][kv_lora]). The transpose below
+// is the only place the two conventions meet -- and the last case is what
+// proves the transpose is load-bearing: the same numbers under the other
+// assumption must FAIL, or this arm would pass a kernel with the layout wrong.
+i64 arm_mla(Backend *be) {
+    std::printf("\nmulti-head latent attention (V2-Lite: 16 heads, "
+                "nope 128 + rope 64, kv 512, v 128):\n");
+    if (!be->mla_supported()) {
+        std::printf("  this backend has no MLA ops (mla_supported() is false) -- "
+                    "a deepseek2 file refuses to run on it\n");
+        return 1;
+    }
+    const i32 nh = 16, nope = 128, rope = 64, kv = 512, vd = 128, ne = 2048;
+    const i64 qk = nope + rope, hv = nope + vd, row = kv + rope;
+    const i64 qdim = static_cast<i64>(nh) * qk, odim = static_cast<i64>(nh) * vd;
+    const i64 max_rows = 24;
+
+    u32 seed = 20241022u;
+    auto rnd = [&](f64 amp) {
+        seed = seed * 1664525u + 1013904223u;
+        const f64 u = static_cast<f64>((seed >> 8) & 0xFFFFu) / 32768.0 - 1.0;
+        return static_cast<f32>(u * amp);
+    };
+    // [out][in] row-major, which is the file's orientation: ne[0] is the
+    // contracting axis, so row `o` holds the weights of output o.
+    auto mat = [&](i64 n_out, i64 n_in) {
+        const f64 amp = 1.0 / std::sqrt(static_cast<f64>(n_in));
+        std::vector<f32> m(static_cast<size_t>(n_out * n_in));
+        for (auto &w : m) w = rnd(amp);
+        return m;
+    };
+    const std::vector<f32> wq = mat(qdim, ne);
+    const std::vector<f32> wkva = mat(row, ne);
+    const std::vector<f32> wkb = mat(static_cast<i64>(nh) * hv, kv);
+    const std::vector<f32> wo = mat(ne, odim);
+    // A varying gamma, because a norm that ignores its weight is invisible
+    // against an all-ones vector -- the same trap the PLE lane test names.
+    std::vector<f32> gamma(static_cast<size_t>(kv));
+    for (auto &g : gamma) g = 0.5f + 0.5f * std::fabs(rnd(1.0));
+    std::vector<f32> invf(static_cast<size_t>(rope / 2));
+    for (i64 i = 0; i < rope / 2; i++)
+        invf[static_cast<size_t>(i)] = std::pow(
+            10000.0f, -2.0f * static_cast<f32>(i) / static_cast<f32>(rope));
+    const f32 eps = 1e-6f;
+    const f32 scale = 1.0f / std::sqrt(static_cast<f32>(qk));
+
+    std::vector<f32> xhost(static_cast<size_t>(max_rows * ne));
+    for (auto &x : xhost) x = rnd(1.2f);
+
+    auto up = [](const std::vector<f32> &v) {
+        std::vector<u16> h(v.size());
+        for (size_t i = 0; i < v.size(); i++) h[i] = fp32_to_fp16(v[i]);
+        return h;
+    };
+    auto updev = [&](const std::vector<f32> &v) {
+        void *p = be->alloc(v.size() * 2);
+        const std::vector<u16> h = up(v);
+        be->upload(p, h.data(), h.size() * 2, 0);
+        return p;
+    };
+    void *wq_d = updev(wq);
+    void *wkva_d = updev(wkva);
+    void *wkb_d = updev(wkb);
+    void *wo_d = updev(wo);
+    void *x_d = updev(xhost);
+    void *gamma_d = be->alloc(gamma.size() * sizeof(f32));
+    be->upload(gamma_d, gamma.data(), gamma.size() * sizeof(f32), 0);
+    void *proj_d = be->alloc(static_cast<size_t>(max_rows * row) * 2);
+    void *q_d = be->alloc(static_cast<size_t>(max_rows * qdim) * 2);
+    void *attn_d = be->alloc(static_cast<size_t>(max_rows * odim) * 2);
+    void *out_d = be->alloc(static_cast<size_t>(max_rows * ne) * 2);
+    void *cache_d = be->alloc(static_cast<size_t>(max_rows * row) * 2);
+
+    // The oracle's arrays: the same numbers in ITS convention, which is
+    // [in][out] for the projections (its proj() contracts the slow axis) and
+    // head-major for the unsplit table.
+    auto tr = [](const std::vector<f32> &a, i64 n_out, i64 n_in) {
+        std::vector<f32> t(static_cast<size_t>(n_out * n_in));
+        for (i64 o = 0; o < n_out; o++)
+            for (i64 i = 0; i < n_in; i++)
+                t[static_cast<size_t>(i * n_out + o)] =
+                    a[static_cast<size_t>(o * n_in + i)];
+        return t;
+    };
+    std::vector<f32> owb_head(static_cast<size_t>(nh * kv * hv));
+    std::vector<f32> owb_flat(static_cast<size_t>(nh * kv * hv));
+    for (i32 h = 0; h < nh; h++)
+        for (i64 k = 0; k < kv; k++)
+            for (i64 j = 0; j < hv; j++) {
+                const f32 v = wkb[static_cast<size_t>((h * hv + j) * kv + k)];
+                owb_head[static_cast<size_t>((h * kv + k) * hv + j)] = v;
+                // The wrong reading: feature-major bytes addressed as if they
+                // were head-major, which is what a kernel that copied the
+                // indexing from the oracle would do.
+                owb_flat[static_cast<size_t>(h * kv * hv + k * hv + j)] =
+                    wkb[static_cast<size_t>(h * kv * hv + k * hv + j)];
+            }
+    const std::vector<f32> owq = tr(wq, qdim, ne);
+    const std::vector<f32> owo = tr(wo, ne, odim);
+
+    struct MlaCase {
+        i64 rows, pos0;
+        bool transposed;
+    };
+    const MlaCase cases[] = {{1, 0, false},  {2, 0, false},  {4, 0, false},
+                             {8, 0, false},  {17, 0, false}, {4, 7, false},
+                             {4, 7, true}};
+    const f64 limit = 8e-3;
+    i64 failed = 0, checks = 0;
+
+    for (const MlaCase &c : cases) {
+        const i64 n_keys = c.pos0 + c.rows;
+        MlaDesc d;
+        d.n_head = nh;
+        d.qk = qk;
+        d.nope = nope;
+        d.rope = rope;
+        d.kv_lora = kv;
+        d.v_dim = vd;
+        d.pos_stride = row;
+        d.scale = scale;
+        d.eps = eps;
+        d.inv_freq = invf.data();
+
+        // Both projections, over every key row: the history is written by the
+        // first call and this pass by the second, exactly as the engine splits
+        // a chunked prefill.
+        be->gemm(proj_d, x_d, wkva_d, DType::F16, row, ne, n_keys);
+        if (c.pos0 > 0) {
+            d.pos0 = 0;
+            d.n_tok = c.pos0;
+            be->mla_kv_write(cache_d, proj_d, gamma_d, d);
+        }
+        d.pos0 = c.pos0;
+        d.n_tok = c.rows;
+        be->mla_kv_write(cache_d,
+                         static_cast<u8 *>(proj_d) + c.pos0 * row * 2, gamma_d,
+                         d);
+        be->gemm(q_d, static_cast<u8 *>(x_d) + c.pos0 * ne * 2, wq_d, DType::F16,
+                 qdim, ne, c.rows);
+        be->mla_attention(attn_d, q_d, cache_d, wkb_d, d);
+        be->gemm(out_d, attn_d, wo_d, DType::F16, ne, odim, c.rows);
+        be->sync();
+
+        std::vector<f32> got(static_cast<size_t>(c.rows * ne));
+        be->download_f32(got.data(), out_d, static_cast<i64>(got.size()));
+        std::vector<f32> got_cache(static_cast<size_t>(n_keys * row));
+        be->download_f32(got_cache.data(), cache_d,
+                         static_cast<i64>(got_cache.size()));
+
+        // ---- the host side: the same weights, the same positions ----------
+        std::vector<f32> kvproj(static_cast<size_t>(n_keys * row), 0.0f);
+        std::vector<f32> qproj(static_cast<size_t>(n_keys * qdim), 0.0f);
+        for (i64 t = 0; t < n_keys; t++)
+            for (i64 o = 0; o < row; o++) {
+                f64 s = 0.0;
+                for (i64 i = 0; i < ne; i++)
+                    s += static_cast<f64>(wkva[static_cast<size_t>(o * ne + i)]) *
+                         xhost[static_cast<size_t>(t * ne + i)];
+                kvproj[static_cast<size_t>(t * row + o)] = static_cast<f32>(s);
+            }
+        std::vector<f32> want_cache(static_cast<size_t>(n_keys * row), 0.0f);
+        std::vector<f32> cacc(static_cast<size_t>(n_keys * kv), 0.0f);
+        std::vector<f32> kpe(static_cast<size_t>(n_keys * rope), 0.0f);
+        std::vector<i64> kpos(static_cast<size_t>(n_keys));
+        for (i64 t = 0; t < n_keys; t++) {
+            f64 ss = 0.0;
+            for (i64 k = 0; k < kv; k++) {
+                const f64 v = kvproj[static_cast<size_t>(t * row + k)];
+                ss += v * v;
+            }
+            const f32 inv = 1.0f / std::sqrt(static_cast<f32>(
+                ss / static_cast<f64>(kv)) + eps);
+            for (i64 k = 0; k < kv; k++) {
+                const f32 v =
+                    kvproj[static_cast<size_t>(t * row + k)] * inv * gamma[
+                        static_cast<size_t>(k)];
+                cacc[static_cast<size_t>(t * kv + k)] = v;
+                want_cache[static_cast<size_t>(t * row + k)] = v;
+            }
+            for (i64 j = 0; j < rope; j++) {
+                const f32 v = kvproj[static_cast<size_t>(t * row + kv + j)];
+                kpe[static_cast<size_t>(t * rope + j)] = v;
+                want_cache[static_cast<size_t>(t * row + kv + j)] = v;
+            }
+            kpos[static_cast<size_t>(t)] = t;
+        }
+
+        krk::MlaLiteWeights o;
+        o.wq = owq.data();
+        o.wkv_a_mqa = nullptr; // the cache arrives built: this path takes it
+        o.wkv_a_norm = gamma.data();
+        o.wkv_b = c.transposed ? owb_flat.data() : owb_head.data();
+        o.wo = owo.data();
+        krk::MlaLiteGeometry g;
+        g.n_embd = ne;
+        g.n_head = nh;
+        g.kv_lora = kv;
+        g.qk = static_cast<i32>(qk);
+        g.qk_rope = rope;
+        g.v_dim = vd;
+        std::vector<f32> want(static_cast<size_t>(c.rows * ne), 0.0f);
+        for (i64 r = 0; r < c.rows; r++) {
+            const i64 qpos = c.pos0 + r;
+            krk::mla_lite_forward_absorbed(
+                want.data() + r * ne, xhost.data() + qpos * ne, cacc.data(),
+                kpe.data(), kpos.data(), qpos + 1, qpos, o, g, invf.data(),
+                scale, eps);
+        }
+
+        auto report = [&](const char *what, const std::vector<f32> &ref,
+                          const std::vector<f32> &cmp) {
+            f64 ss = 0.0, worst = 0.0;
+            for (f32 v : ref) ss += static_cast<f64>(v) * v;
+            const f64 rms = std::sqrt(ss / static_cast<f64>(ref.size()) + 1e-30);
+            for (size_t i = 0; i < ref.size(); i++)
+                worst = std::max(worst,
+                                 std::fabs(static_cast<f64>(ref[i]) - cmp[i]) / rms);
+            return worst;
+        };
+        const f64 rc = report("cache", want_cache, got_cache);
+        const f64 rl = report("layer", want, got);
+        char tag[64];
+        std::snprintf(tag, sizeof tag, "rows=%-2lld pos0=%-2lld%s",
+                      static_cast<long long>(c.rows),
+                      static_cast<long long>(c.pos0),
+                      c.transposed ? " TRANSPOSED" : "");
+        if (!c.transposed) {
+            checks += 2;
+            const bool cache_ok = rc < limit;
+            const bool layer_ok = rl < limit;
+            std::printf("  %-24s cache %-4s (rel %.2g)  layer %-4s (rel %.2g)\n",
+                        tag, cache_ok ? "PASS" : "FAIL", rc,
+                        layer_ok ? "PASS" : "FAIL", rl);
+            if (!cache_ok) failed++;
+            if (!layer_ok) failed++;
+        } else {
+            // The negative control: the same numbers under the OTHER layout
+            // assumption must disagree. A gate whose bad arm also passes
+            // proves nothing, which is exactly how this layout bug would ship.
+            checks++;
+            const bool differs = rl > limit * 10.0;
+            std::printf("  %-24s layer differs as required (rel %.2g vs "
+                        "limit %.1g) %s\n",
+                        tag, rl, limit, differs ? "ok" : "-- MATCHED");
+            if (!differs) failed++;
+        }
+    }
+
+    be->release(wq_d);
+    be->release(wkva_d);
+    be->release(wkb_d);
+    be->release(wo_d);
+    be->release(x_d);
+    be->release(gamma_d);
+    be->release(proj_d);
+    be->release(q_d);
+    be->release(attn_d);
+    be->release(out_d);
+    be->release(cache_d);
+    std::printf("  mla: %lld of %lld check(s)%s\n",
+                static_cast<long long>(checks - failed),
+                static_cast<long long>(checks),
+                failed == 0 ? " passed" : " FAILED");
+    return failed;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -2895,7 +3236,9 @@ int main(int argc, char **argv) {
     bool gate = false;
     bool bitexact = false;
     bool hc_test = false;
+    bool mla_test = false;
     bool moe_table_test = false;
+    bool pool_test = false;
     bool floor = false;
     bool h2d = false;
     bool h2d_noise_arm = false;
@@ -2912,9 +3255,11 @@ int main(int argc, char **argv) {
         else if (a == "--out") one.n_out = next();
         else if (a == "--in") one.n_in = next();
         else if (a == "--sweep") sweep = true;
+        else if (a == "--pool") pool_test = true;
         else if (a == "--gate") gate = true;
         else if (a == "--bitexact") bitexact = true;
         else if (a == "--hc") hc_test = true;
+        else if (a == "--mla") mla_test = true;
         else if (a == "--moe-dispatch") moe_table_test = true;
         else if (a == "--floor") floor = true;
         else if (a == "--h2d") h2d = true;
@@ -2960,6 +3305,19 @@ int main(int argc, char **argv) {
     std::printf("device: %s\n\n", be->describe().c_str());
     if (h2d) return h2d_bench(be, iters);
     if (h2d_noise_arm) return h2d_noise(be, h2d_noise_mib);
+    // The expert pool's own traps, runnable alone: the full gate also drives a
+    // CLI speculation arm, which is minutes when all this needs is the device.
+    if (pool_test) {
+        std::printf("\nexpert-pool (device):\n");
+        const i64 bad = gate_expert_pool(be);
+        delete be;
+        if (bad) {
+            std::fprintf(stderr, "\nEXPERT-POOL FAILED: %lld check(s)\n",
+                         static_cast<long long>(bad));
+            return 1;
+        }
+        return 0;
+    }
 
     // Launch floor: a real kernel with trivial work, same measurement method.
     {
@@ -3034,6 +3392,10 @@ int main(int argc, char **argv) {
     // Device-only, so it is its own flag rather than part of --gate: the gate
     // must stay runnable on a box where the device is busy.
     if (hc_test) failures += arm_hc(be);
+
+    // The MLA layer, against the host oracle in src/mla.cpp. Its own flag like
+    // --hc: it is a device arm, and the gate has to stay runnable on a busy box.
+    if (mla_test) failures += arm_mla(be);
 
     // The device dispatch table. Its own flag like --hc for the same reason: it
     // is a device arm, and the gate has to stay runnable on a busy box.

@@ -45,6 +45,16 @@ enum class DType : i32 {
     IQ3_S = 21,   // 110 bytes: qs + qh + signs + 4 scale bytes + d
     IQ2_S = 22,   //  82 bytes: qs + qh + 16 scale bytes + d
     IQ4_XS = 23,
+    // I32 (id 26): ggml's GGML_TYPE_I32 -- a plain int32 tensor, not a
+    // quantization at all. DeepSeek-V4 ships one per hash layer
+    // (`ffn_gate_tid2eid.weight`, [n_expert_used, n_vocab] expert ids), so a
+    // file can carry a format that is DATA rather than a weight: it is read
+    // as integers and looked up, never multiplied. The engine can read it
+    // (dtype_supported is true, and the loader has a reader for it), and it
+    // refuses an int32 tensor as a matmul weight rather than letting the
+    // device's weight decoder read it as zeros -- which is the shape this
+    // failure has: silent zeros, not a crash.
+    I32 = 26,
     // IQ1_M (id 29): 56 bytes and NO f16 delta field at all -- the four block
     // scales and the 3-bit group scales share one packed word, which is why
     // this one is not a variant of IQ1_S but its own layout.

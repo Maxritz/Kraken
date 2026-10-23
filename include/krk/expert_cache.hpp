@@ -60,7 +60,11 @@
 #define KRK_EXPERT_CACHE_HPP
 
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
 #include <list>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -174,11 +178,66 @@ public:
     void configure(Backend *be, size_t budget_bytes, size_t host_budget_bytes = 0,
                    size_t slot_budget = 0);
     void clear();
+    ~ExpertCache();
+    ExpertCache() = default;
 
     // Returns the resident matrices for (layer, expert), loading on a miss.
     // nullptr when the source has no expert tensors or the id is out of range.
     // The returned pointer is valid until the next acquire().
     const ResidentExpert *acquire(const ExpertSource &src, i32 layer, i32 expert);
+
+    // The same matrices WITHOUT a device copy, when they are already in the
+    // pinned host tier and the backend can address that memory from a kernel.
+    //
+    // This is the answer to the shape of a decode row on a card too small for
+    // the routed set: `acquire()` promotes each expert (~1.95 MiB WARM->VRAM)
+    // to read it once, and the promotion both costs a copy and evicts another
+    // expert that the next layer wants back. A three-tier box wants the opposite
+    // order -- the hot set in VRAM, the next set in RAM, everything else on
+    // disk -- so the RAM tier has to be USABLE without being copied first.
+    // Measured (tools/probe_hostread.hip): 24.3 GiB/s for a kernel reading
+    // pinned host memory on this card, against 11 GB/s for the promotion copy.
+    //
+    // nullptr means "use acquire()": the slot is not in WARM, its bytes are
+    // pageable (not addressable from the device), the slot is already resident
+    // in VRAM (faster there), or the source has no expert tensors. Never loads,
+    // never evicts, never allocates -- a miss here costs nothing and the caller
+    // falls through to the normal path.
+    const ResidentExpert *acquire_inplace(const ExpertSource &src, i32 layer,
+                                          i32 expert);
+    // Acquisitions served in place: what the tier saved from being copied. 0
+    // when the backend cannot address host memory or the arm is off.
+    size_t inplace_hits() const { return inplace_hits_; }
+
+    // ---- the NEXT layer's set, read while THIS layer computes ----------------
+    //
+    // A layer's routed set is read out of the mapping on the host thread, and
+    // that read is what the host does while the card sits idle: measured on
+    // REAP-288 at the small-machine shape, 274 MiB/token in 0.80 ms per layer,
+    // serial with the layer's own GPU work. The read does not depend on anything
+    // the current layer computes, so it belongs on a worker thread, one layer
+    // ahead -- which is what "some RAM for the next set" has to mean in practice,
+    // because a tier that is filled only when it is demanded is a tier that
+    // blocks.
+    //
+    // The ids are a PREDICTION (the previous token's routing for that layer, see
+    // Engine's moe_hint_), so this is advisory by contract, exactly like
+    // prefetch_layer: a wrong guess costs a read that is dropped and never a
+    // different answer. `has_warm` lets the caller filter before queueing, so the
+    // worker never touches the slot map.
+    bool has_warm(i32 layer, i32 expert) const;
+    void prefetch_warm_next(const ExpertSource &src, i32 layer, const i32 *ids,
+                            int n);
+    // Installs a completed prefetch as this expert's WARM copy (taking ownership
+    // of the bytes), and returns true when one was waiting. Called on the host
+    // thread, so the slot map stays single-threaded.
+    bool take_prefetched(i32 layer, i32 expert);
+    // Stops the worker and frees anything still queued. Called by the destructor;
+    // safe to call again.
+    void prefetch_warm_join();
+    size_t prefetch_warm_taken() const { return pf_taken_; }
+    size_t prefetch_warm_issued() const { return pf_issued_; }
+    size_t prefetch_warm_bytes() const { return pf_taken_bytes_; }
 
     // Fills WARM from the source ahead of the run: the answer to *compulsory*
     // misses, which is what a short generation is made of. Opt-in, because
@@ -433,7 +492,37 @@ public:
     // CPU+GPU expert path exists precisely to not promote the experts the host
     // is about to compute, so asking after the fact is asking too late.
     // Neither call changes residency, touches a counter or moves a byte.
+    // "This slot's device cells were last read here" -- recorded right after the
+    // kernels that read them are enqueued, so a later reuse of those cells waits
+    // for this read instead of for the release mark an eviction would record a
+    // layer later. See Backend::pool_note_reader_done.
+    //
+    // ONE event is recorded for every n expert uses (default 8, one per layer at
+    // top-k 8) instead of one each: the event covers the whole burst's kernels,
+    // so a reused cell in it waits slightly longer, at 1/n of the record cost.
+    // `KRK_POOL_MARK_BURST=1` restores one per use; the measurement is in
+    // docs/PERF-ANALYSIS.md section 12q.
+    void note_read(i32 layer, i32 expert);
+    // Emits the pending burst's mark. Called when the burst fills, when the
+    // layer changes, and at the end of a layer's expert section, so the last
+    // experts of a layer are stamped at their own position instead of at the
+    // next layer's first read.
+    void flush_read_notes();
     bool in_vram(i32 layer, i32 expert) const;
+
+    // The entry a (layer, expert) is held as RIGHT NOW, or null -- the same
+    // pointer acquire()/acquire_inplace() would hand out for it. A caller that
+    // holds SEVERAL of those pointers at once (the batched decode path resolves
+    // a whole layer's routed set before it launches anything) re-checks them
+    // here before using them: a promotion or eviction between two acquires can
+    // take an earlier one away, and a stale pointer reads another expert's
+    // weights without saying so.
+    const ResidentExpert *peek(i32 layer, i32 expert) const;
+
+    // The function-tracking probe asked about earlier: expose residency state
+    // the batched decode path needs without reading the tier internals directly.
+    // The probe was added by the batch-path work; the question above is a
+    // different ask (per-definition rewrite coverage) and has its own file.
     bool in_host(i32 layer, i32 expert) const;
 
     // Seeds one resident slot's LFU counter from outside. The caller is the
@@ -514,6 +603,44 @@ public:
     void release_dispatch_table();
 
 private:
+    // One expert's bytes, read ahead of the layer that will want them. `src`
+    // lives in the job, not here: a finished entry only has to say what to
+    // install.
+    struct PfEntry {
+        i32 layer = -1;
+        i32 expert = -1;
+        size_t bytes = 0;
+        struct T {
+            void *p = nullptr;
+            size_t len = 0;
+            DType type = DType::Unknown;
+            i64 n_in = 0;
+            i64 n_out = 1;
+        } t[3];
+    };
+    void pf_worker();
+    void pf_free(PfEntry &e);
+    static constexpr size_t kPfDoneMax = 48; // entries waiting to be taken
+    std::thread pf_thread_;
+    std::mutex pf_mu_;
+    std::condition_variable pf_cv_;
+    bool pf_stop_ = false;
+    ExpertSource pf_src_{};
+    i32 pf_layer_ = -1;
+    std::vector<i32> pf_ids_;
+    std::deque<PfEntry> pf_done_;
+    size_t pf_done_bytes_ = 0;
+    size_t pf_taken_ = 0;
+    size_t pf_taken_bytes_ = 0;
+    size_t pf_dropped_ = 0;
+    size_t pf_issued_ = 0;
+    // What the worker is reading RIGHT NOW. `take_prefetched` waits on this one
+    // pair, not on the whole job: the loop asks for experts in ascending id order
+    // and the worker reads them in the same order, so waiting for the expert the
+    // layer has reached lets every earlier one compute while the bytes land.
+    i32 pf_at_layer_ = -1;
+    i32 pf_at_expert_ = -1;
+
     struct Slot {
         i32 layer = -1;
         i32 expert = -1;
@@ -528,6 +655,7 @@ private:
         u32 count = 0;      // LFU counter, decayed
         u64 seq = 0;        // load order, the tie-break for victims
         bool pinned = false;
+
         // The WARM copy of this slot lives in PINNED host memory (see
         // KRK_HOST_PIN_MB). Distinct from `pinned`, which is the residency
         // promise the eviction scan honours: this one says which allocator
@@ -693,6 +821,7 @@ private:
     u64 evictions_ = 0;
     u64 hits_ = 0;
     u64 host_hits_ = 0;
+    u64 inplace_hits_ = 0;
     u64 demotions_ = 0;
     u64 warm_admissions_ = 0;
     u64 warm_evictions_ = 0;
@@ -740,6 +869,11 @@ private:
     u64 decays_ = 0;
     u64 seq_ = 0;
     std::unordered_map<u64, Slot> slots_;
+    // The cells of the expert uses noted since the last reader-done record, and
+    // how many uses that is. One event covers all of them (see note_read).
+    std::vector<void *> rd_pending_;
+    i32 rd_pending_layer_ = -1;
+    u32 rd_pending_experts_ = 0;
     // The published device dispatch table (see publish_dispatch_table) and the
     // flag that says a residency change invalidated it. `table_stale_` is set by
     // every write to a slot's device pointers -- drop() and the promotion that

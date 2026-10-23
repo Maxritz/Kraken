@@ -149,6 +149,51 @@ struct ArchSpec {
     // rope. The flag says the loader reads that metadata; the engine still
     // refuses until each piece runs.
     bool dsv4 = false;
+    // ---- is this arch's ATTENTION implemented? ---------------------------
+    // A separate question from `support`, because the two fail differently.
+    // `support` is the arch table's verdict on the file as a whole; the
+    // loader honours it, and KRK_ARCH_ALLOW_EXPERIMENTAL=1 lets a half-ported
+    // schema's tensors be read anyway.
+    //
+    // This flag is the engine's own guard, and it is NOT lifted by that
+    // hatch: an arch whose attention has no implementation here has no
+    // attention in the graph at all, so a run on it decodes text that is
+    // fluent, plausible and not the model. That is the worst failure this
+    // engine has, so the run is refused instead -- the file still loads (the
+    // loader's job is to read what is there), but nothing generates from it.
+    //
+    // It is about the attention *computation* only. A gap elsewhere (a routed
+    // value set, a softcap, a per-layer head geometry) keeps its own
+    // mechanism: the arch table's `why` and the tensor gap map.
+    bool attention_implemented = true;
+    // ---- per-branch post norms (gemma2/3/4, muse-glimmer) -----------------
+    // The layer does not add the sub-block's raw output to the residual: it
+    // RMS-norms it first, with that branch's own weight, and adds the NORMALIZED
+    // row. `norm(attn_out) + x`, not `norm(attn_out + x)` and not
+    // `norm(x) + attn_out` -- three different graphs, and the weights differ per
+    // branch, so nothing downstream can tell which one ran. That is why the load
+    // is gated on this flag and the order is pinned by a dump test.
+    //
+    // It also costs the projection its folded residual store (`dst += W*x`): the
+    // norm has to read the projection's own output before it joins the residual,
+    // so a layer that carries these runs gemm + norm + add instead.
+    bool post_branch_norm = false;
+    // The eps those norms use, when the family names its own. 0 keeps the
+    // model's rms_eps -- muse-glimmer's are 1e-8 against a 1e-5 body.
+    float post_norm_eps = 0.0f;
+    // The gate activation. The tensor is the same shape on both families
+    // (`attn_gate.weight`, one value per head) but laguna softplus's it and
+    // muse-glimmer sigmoids it, and a softplus where a sigmoid belongs reads as
+    // "a bit too much gate everywhere" rather than as a wrong answer.
+    bool attn_gate_sigmoid = false;
+    // The gated FFN's activation, when it is not SwiGLU: GeGLU, i.e.
+    // gelu(gate) * up. gemma's stack is GeGLU, so its `ffn_gate`/`ffn_up` pair
+    // run through a different activation than every SwiGLU family here.
+    bool gelu_ffn = false;
+    // Rotate only on the sliding-window layers (muse-glimmer: RoPE on the
+    // windowed layers, NoPE on the full ones). The rotation table is still
+    // built per layer; this says the full layers' table is not used.
+    bool rope_swa_only = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

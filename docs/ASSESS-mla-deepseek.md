@@ -1,21 +1,56 @@
 # What MLA support would cost in kraken, and what it would buy
 
-> **Status 2026-10-22 -- stage 1 landed, the engine still refuses.** The
-> loader now reads the ranks the exporters actually write
-> (`key_length` / `value_length` / `kv_lora_rank`, with nope =
+> **Status 2026-10-22 (later) -- the legacy lite layout RUNS.** A 576-wide cache
+> row (kv_lora 512 + the decoupled rope key 64), the absorbed score reduction
+> and the rope-on-the-decoupled-key path are implemented twice: on the device
+> (`src/hip/kernels/mla.hpp`, `Backend::mla_kv_write` / `mla_attention`) and as
+> the scalar reference in `src/backend_cpu.cpp`. `Engine::mla_forward` wires
+> them into the layer loop and `Model::kv_dim_at` / `layer_has_kv` give the KV
+> tier the row it needs. Measured on `DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M`
+> (the local V2-Lite file): loads, and greedy text matches llama.cpp's ROCm
+> build token-for-token over 64 tokens (` calculate_salary(name, salary,
+> bonus):` ... `def k(x`), device and CPU both.
+>
+> Two semantic bugs had to be fixed for that, and neither was in the kernel:
+> `expert_weights_norm` is FALSE for this family (the top-6 of a 64-way softmax
+> sum well under 1, and renormalizing them multiplied every layer's expert
+> contribution by ~2 -- the arch row now says so, like gpt-oss), and the
+> attention scale is plain `1/sqrt(key_length)` on this file even though
+> llama.cpp's deepseek2 reads `mscale^2/sqrt(...)`: with the mscale factor the
+> first greedy token already differed, without it the run agrees to 64 tokens.
+>
+> Gates: `kraken-bench --mla` runs the layer at the V2-Lite geometry against the
+> `src/mla.cpp` oracle (rows 1/2/4/8/17, a nonzero position, and a TRANSPOSED
+> table as the negative control that must fail -- 13 of 13 checks),
+> `test_mla_backend` pins the CPU reference against the same oracle plus head
+> isolation and 1-row-vs-n-row identity (10 checks), and `test_mla_loader`
+> (80) covers the layouts. Still refused BY NAME at `Engine::init`: the split
+> (V3 class) and shared-latent (V4) layouts, whose graphs are different
+> computations -- and `deepseek4` keeps `attention_implemented = false`.
+>
+> **Historical status 2026-10-22 (earlier) -- the loader reads all three
+> layouts, the engine still refused to generate.** The ranks come from the keys the exporters actually
+> write (`key_length` / `value_length` / `kv_lora_rank`, with nope =
 > `key_length - rope.dimension_count`; the `qk_nope_head_dim` names the
-> estimate below implies are written by nobody and refused every real file),
-> loads the legacy-lite attention block, and pins the layout with a host
-> oracle in two orders (new group `test_mla_lite`, 57 checks). V4's metadata
-> is read too. So item 1 of the estimate is done in the shape the file
-> actually has, and items 2-4 (latent decode kernel, latent prefill,
-> coherence fixture) are all still open -- the arch verdict is unchanged and
-> both files are still refused. The V4 file adds more than the estimate
-> knew: the modern split tensors (`attn_q_a` / `attn_q_b` / `attn_kv` /
-> `attn_output_a` / `attn_output_b`), `attn_sinks`, Sinkhorn
-> hyper-connections, the `ffn_gate_tid2eid` hash route, compressed
-> attention layers with their own compressor tensors, a QSA indexer, and a
-> quant type (#26) this build cannot dequantize at all.
+> estimate below implies are written by nobody and refused every real file).
+> The layout is now decided by the TENSORS a layer carries -- `Legacy`
+> (`attn_q` / `attn_kv_a_mqa` / `attn_kv_b`, V2-Lite), `Split`
+> (`attn_q_a` / `attn_q_b` / `attn_kv_a` / `attn_k_b` / `attn_v_b`, the V3
+> class) and `Shared` (`attn_q_a` / `attn_q_b` / `attn_kv` /
+> `attn_output_a` / `attn_output_b`, V4) -- and every layer has to agree on
+> it. Each layout's geometry is checked against the file's own metadata, and
+> V4's metadata (grouped output, window, hash depth, compress_ratios) and
+> hash route are read. `test_mla_loader` (66 checks) pins the three layouts,
+> the mix, the geometry refusals and the engine's refusal; `test_mla_lite`
+> (57) pins the host oracle in two orders. So item 1 of the estimate is done
+> in the shape the files actually have; items 2-4 (latent decode kernel,
+> latent prefill, coherence fixture) are open, and the arch verdict is
+> unchanged: a run is refused AFTER the load by
+> `ArchSpec::attention_implemented`, which `KRK_ARCH_ALLOW_EXPERIMENTAL=1`
+> deliberately does not lift. V4's quant type #26 turned out not to be a
+> blocker at all -- it is I32, and `ffn_gate_tid2eid` is a table of expert
+> ids read as data. What is still unread on V4: `attn_sinks`, Sinkhorn
+> `hc_*`, the per-layer compressor tensors and the QSA indexer.
 
 > 2026-10-21: DeepSeek open-sourced DeepInfer, a serving runtime for
 > DeepSeek-V4.1-Flash whose design implements exactly this path (absorbed

@@ -234,6 +234,51 @@ bool dev_ptr() {
     return on;
 }
 
+// KRK_EXPERT_INPLACE=0 turns OFF reading a WARM expert's weights in place.
+//
+// The three tiers are supposed to hold what each is good at: the hot set in
+// VRAM, some RAM for the next set, the file mapping for everything else. Until
+// this existed the RAM tier could not be USED without being copied into VRAM
+// first, so on a card smaller than the routed set every layer re-copied ~3 MiB
+// per routed expert to read it once and evicted the expert the next layer
+// wanted -- which is why a 6-12 GiB card could only run these models by holding
+// nearly the whole routed set resident (REAP-288 wants 42.2 GiB) or by running
+// at disk speed.
+//
+// A kernel can read the pinned pool directly: tools/probe_hostread.hip measured
+// 24.3 GiB/s for a 256 MiB pinned buffer against 485 GiB/s for the same read out
+// of device memory, with the bytes read back exactly. So the RAM tier is read
+// where it lives, VRAM keeps only the set the tier ranked hot, and the copy
+// disappears. `Backend::host_load_supported()` is the capability half -- a
+// backend that has not measured it reports false and this never engages.
+bool expert_inplace() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_EXPERT_INPLACE");
+        return !(v && *v && std::string(v) == "0");
+    }();
+    return on;
+}
+
+// KRK_WARM_AHEAD=0 turns off reading the NEXT layer's set on a worker thread.
+//
+// The read is 274 MiB/token on REAP-288 at the small-machine shape, and it was
+// done on the host thread inside the layer, serial with that layer's GPU work.
+// Nothing about it depends on what the layer computes, so it belongs one layer
+// ahead, on a thread that is not the one issuing kernels -- which is what "some
+// RAM for the next set" has to mean, or the tier is filled only when it is
+// demanded and every fill is a stall.
+//
+// The ids are the previous token's routing at that layer (Engine's moe_hint_),
+// so this is a PREDICTION: a wrong guess costs a read that is dropped, never a
+// different answer.
+bool warm_ahead() {
+    static const bool on = [] {
+        const char *v = std::getenv("KRK_WARM_AHEAD");
+        return !(v && *v && std::string(v) == "0");
+    }();
+    return on;
+}
+
 // KRK_ROUTER_2X=1 issues the router readback twice. See the call site: the
 // second copy is the round-trip control for the first one's device wait.
 bool router_fetch2() {
@@ -601,6 +646,9 @@ static bool pin_auto_on() {
 }
 
 bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
+    // Everything init does -- map, parse, upload, tokenizer, KV tier, expert
+    // warmup -- is the load phase for both profilers.
+    krk::HostTime::set_phase(krk::HostTime::kLoad);
     be_ = be;
     cfg_ = cfg;
     // The activation-range counters are process-wide device state; zero them so
@@ -704,10 +752,47 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // the Model rather than be read afterwards.
     model_.set_mtp_load(cfg.mtp_probe || cfg.mtp_spec || !cfg.mtp_path.empty());
     model_.set_mtp_path(cfg.mtp_path);
+    // `load.model` is the loader end to end: the mapping, the metadata, every
+    // tensor's upload. It dwarfs a short generation, and until now it existed
+    // only as the `[stats ] load` line main_cli prints from its own timer, so
+    // nothing said which part of it a slow start was spending.
+    {
+    KRK_TIME_HOST("load.model");
     if (!model_.load(*be_, cfg.model_path, err)) {
         model_.unload();
         be_ = nullptr;
         return false;
+    }
+    }
+
+    // The engine's own guard, and it is the one the loader's escape hatch does
+    // NOT lift. KRK_ARCH_ALLOW_EXPERIMENTAL=1 is a LOADER switch: it lets the
+    // tensors of a refused schema be read so a half-ported architecture can be
+    // checked stage by stage. It says nothing about the graph, and for an arch
+    // whose ATTENTION has no implementation here the graph has no attention in
+    // it at all -- so a run would decode text that is fluent, plausible and not
+    // the model. That is the failure this engine must never produce, so the
+    // run is refused here, after the load and before anything is generated.
+    //
+    // It has to be after the load: the arch name comes from the file, and the
+    // table entry is what says whether the attention path exists. The same
+    // position (and the same reason) as the hyper-connection block below.
+    {
+        const std::string &arch = model_.cfg().arch;
+        const ArchSpec *spec = arch_lookup(arch);
+        if (spec && !spec->attention_implemented) {
+            if (err)
+                *err = "arch '" + arch +
+                       "': this engine has no implementation for this "
+                       "architecture's attention path, so a run would decode "
+                       "text that is not this model (" +
+                       (spec->why && spec->why[0] ? spec->why : "no reason given") +
+                       "). The file loaded and its tensors were read; "
+                       "generating from it is refused.";
+            model_.unload();
+            be_ = nullptr;
+            return false;
+        }
     }
     const ModelConfig &predict_mc = model_.cfg();
     const bool moe_predict_requested = moe_predict_on();
@@ -891,6 +976,59 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
 
     chunk_ = std::max<i32>(1, std::min<i32>(cfg_.prefill_chunk, 1024));
 
+    // ---- multi-head latent attention: what this build can actually run ----
+    //
+    // The arch table says the FAMILY has an MLA implementation here (deepseek2);
+    // this says the file's particular LAYOUT does, because MLA ships in three
+    // shapes and they are three different graphs. Only the legacy lite layout
+    // (V2-Lite: attn_q + attn_kv_a_mqa + attn_kv_b) runs today, and the other
+    // two are refused by name -- a file that loaded and then generated fluent
+    // text out of the wrong graph is the failure this engine must not produce.
+    if (mc.mla) {
+        auto refuse_mla = [&](const std::string &m) {
+            if (err) *err = m;
+            model_.unload();
+            be_ = nullptr;
+            return false;
+        };
+        if (mc.mla_layout != MlaLayout::Legacy) {
+            return refuse_mla(
+                std::string("MLA layout '") + mla_layout_name(mc.mla_layout) +
+                "': this engine runs the legacy lite layout "
+                "(attn_q + attn_kv_a_mqa + attn_kv_b) only, so a run would "
+                "decode the wrong graph. The file loaded and its tensors were "
+                "read; generating from it is refused.");
+        }
+        if (!be_->mla_supported()) {
+            return refuse_mla(
+                "the selected backend has no multi-head latent attention, and "
+                "an MLA layer that silently runs no attention decodes text that "
+                "is not this model");
+        }
+        // The kernel stages every row's scores in dynamic shared memory, which
+        // is why the context length is a CAPABILITY here and not a preference:
+        // past 48 KiB a launch needs an explicit opt-in attribute this build
+        // does not set, and a launch that silently truncated the request would
+        // read scores out of whatever follows them.
+        const size_t lds = static_cast<size_t>(2 * mc.mla_kv_lora +
+                                               mc.mla_qk_rope + kv_cap_) *
+                           sizeof(f32);
+        if (lds > 48u * 1024u) {
+            if (err)
+                *err = "MLA needs " + std::to_string(lds / 1024u) +
+                       " KiB of shared memory per block at --ctx " +
+                       std::to_string(static_cast<long long>(kv_cap_)) +
+                       " (the score row plus the latent and the rotated key), "
+                       "and the ceiling without an explicit opt-in is 48 KiB; "
+                       "lower --ctx to 8192 or less";
+            model_.unload();
+            be_ = nullptr;
+            return false;
+        }
+    }
+
+    // Its own row comes from Tokenizer::load ("tokenizer.load"), so every
+    // caller is measured rather than this one path.
     if (!tok_.load(model_.gguf(), err)) {
         model_.unload();
         be_ = nullptr;
@@ -1086,6 +1224,15 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         ws_agate_ = alloc(static_cast<size_t>(C * q_dim_) * as);
         if (!check_alloc(ws_agate_, "ws_agate")) return false;
     }
+    // MLA's compressed projection row (latent + decoupled key). Not ws_k_:
+    // that buffer is n_kv x head_dim wide, which is what an MLA layer does NOT
+    // project, and a shared buffer would be the wrong width on whichever of the
+    // two shapes the stack has fewer of.
+    if (mc.mla) {
+        ws_mla_ = alloc(static_cast<size_t>(C) *
+                        static_cast<size_t>(mc.mla_kv_lora + mc.mla_qk_rope) * as);
+        if (!check_alloc(ws_mla_, "ws_mla")) return false;
+    }
     // The widest FFN a layer can ask for: dense, routed expert, or shared expert.
     const i64 ff_ws = model_.n_ff_ws();
     ws_gate_ = alloc(static_cast<size_t>(C * ff_ws) * as);
@@ -1179,6 +1326,16 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         if (!check_alloc(ws_gateg_, "ws_gateg")) return false;
         ws_upg_ = alloc(static_cast<size_t>(C * ff_ws) * as);
         if (!check_alloc(ws_upg_, "ws_upg")) return false;
+        // The batched-expert path's own buffers: kMoeBatch experts x (gate, up)
+        // and kMoeBatch down rows, plus one f32 scale per expert. Separate from
+        // the buffers above because those are [chunk, ...] and this path is the
+        // one-token case, where every expert needs its OPEN row at once.
+        ws_ebatch_ = alloc(static_cast<size_t>(kMoeBatch * 2 * ff_ws) * as);
+        if (!check_alloc(ws_ebatch_, "ws_ebatch")) return false;
+        ws_edown_ = alloc(static_cast<size_t>(kMoeBatch * n_embd_) * as);
+        if (!check_alloc(ws_edown_, "ws_edown")) return false;
+        ws_ebscale_ = alloc(static_cast<size_t>(kMoeBatch) * sizeof(f32));
+        if (!check_alloc(ws_ebscale_, "ws_ebscale")) return false;
         // The whole layer's plan lives in one buffer: at most one (token,
         // expert) pair per selection slot, so C * k entries is the bound, and a
         // visit reads [off(e), off(e+1)) of it. It was C entries when each visit
@@ -1651,7 +1808,13 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // on, deliberately leaves WARM to this phase) and before the 1-token
     // weights pass, so that pass is itself a warm-tier run rather than a cold
     // one. See EngineConfig::expert_warmup for when it engages.
-    if (expert_warmup_wanted()) warm_experts();
+    if (expert_warmup_wanted()) {
+        // The ranked warmup reads the whole hot set off disk before the first
+        // token; on a big MoE it is seconds, and it is the phase whose result
+        // decides every later read.
+        KRK_TIME_HOST("load.expert_warmup");
+        warm_experts();
+    }
 
     // ---- the hot ring, before the pool clamp below -------------------------
     // The warmup fills WARM and lets traffic earn VRAM residency. That policy
@@ -1720,8 +1883,13 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // policy rather than thrashing a pin it cannot defend.
     // Only a routed block has anything to pin; a dense block's FFN is loaded
     // with the rest of the block and never pages.
-    if (mtp_spec_ && model_.mtp().present && model_.mtp().n_expert > 0)
+    if (mtp_spec_ && model_.mtp().present && model_.mtp().n_expert > 0) {
+        // Pinning the block's experts is a load-time cost that only exists when
+        // speculation is on, so it needs its own row rather than hiding in the
+        // wall clock.
+        KRK_TIME_HOST("load.mtp_pin");
         mtp_pin_experts();
+    }
 
     // An external draft head named in the config loads here: the KV cache and
     // the workspaces exist, so its hidden capture can be sized, and the first
@@ -1729,6 +1897,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // refusal -- silently running plainly would answer a different command --
     // and the CLI's own call after init then finds it already loaded.
     if (!cfg_.draft_head.empty()) {
+        KRK_TIME_HOST("load.draft_head");
         std::string why;
         if (!load_draft_head(cfg_.draft_head, &why)) {
             if (err) *err = why;
@@ -1738,6 +1907,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     }
 
     if (cfg_.warmup) {
+        KRK_TIME_HOST("load.warmup_pass");
         const i32 t = tok_.bos() >= 0 ? tok_.bos() : 0;
         const Timer w;
         if (!forward(&t, 1, 0, true)) {
@@ -1806,6 +1976,16 @@ void Engine::shutdown() {
                  static_cast<unsigned long long>(dp_launch_layers_),
                  static_cast<unsigned long long>(dp_launch_skips_));
     }
+    if (moe_batch_layers_) {
+        // The counter that makes "the batch was on and the numbers did not move"
+        // answerable: engaged layers against layers that fell back to the
+        // per-expert loop (a shape the launches cannot express, or an arm that
+        // measures the loop).
+        KRK_INFO("moe batch: %llu layer(s) ran the batched decode path, %llu "
+                 "kept the per-expert loop",
+                 static_cast<unsigned long long>(moe_batch_layers_),
+                 static_cast<unsigned long long>(moe_batch_skips_));
+    }
     if (ds_rows_) {
         KRK_INFO("router softmax drift (KRK_DEVICE_SOFTMAX=1): %llu row(s), "
                  "%llu/%.0f element(s) differ, max |dP| %.3e",
@@ -1820,7 +2000,7 @@ void Engine::shutdown() {
                      &ws_v_, &ws_attn_, &ws_gate_, &ws_up_, &ws_had_, &ws_logits_,
                      &ws_router_, &ws_routerp_, &ws_ids_, &ws_wts_, &ws_off_,
                      &ws_ffn_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
-                     &ws_scale_,
+                     &ws_scale_, &ws_ebatch_, &ws_edown_, &ws_ebscale_,
                      &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
                      &ws_m2in_,
                      &conv_state_, &rec_state_, &topk_scratch_, &topk_out_,
@@ -2625,7 +2805,15 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // over. The attention machinery below requires q/k/v/output, so a
         // layer without them takes the short path: the residual is unchanged,
         // and the FFN block reads the norm of the same stream.
-        if (L.wq.present()) {
+        // An MLA layer has no per-head q/k/v projection to run: it compresses
+        // the KV into one latent row and attends that, so it takes its own path
+        // and the MHA chain below (and the pure-MoE short path after it) do not
+        // apply. `layer_has_kv()` is true for it for the same reason it is true
+        // for an MHA layer -- it appends to a plane -- which is what makes the
+        // cache budget and the tier geometry come out right.
+        if (L.mla) {
+            if (!mla_forward(L, l, n, pos0)) return false;
+        } else if (L.wq.present()) {
         const void *xn_att = ws_xn_;
         if (L.h_attn_in || L.h_attn_gate) {
             had_xform(ws_had_, ws_xn_, n, n_embd_, false, false);
@@ -2790,7 +2978,14 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         if (mc.attn_gate && L.wattn_gate.present()) {
             be_->gemm(ws_agate_, L.h_attn_gate ? xn_att : ws_xn_,
                       L.wattn_gate.data, L.wattn_gate.type, lh, n_embd_, n);
-            be_->softplus_act(ws_agate_, static_cast<i64>(n) * lh);
+            // Same tensor, two activations: laguna softplus's the gate,
+            // muse-glimmer sigmoids it. Getting this wrong is not a crash --
+            // every head is simply gated a little too hard, and the text stays
+            // fluent -- so the activation is a declared property of the arch.
+            if (mc.attn_gate_sigmoid)
+                be_->sigmoid_act(ws_agate_, static_cast<i64>(n) * lh);
+            else
+                be_->softplus_act(ws_agate_, static_cast<i64>(n) * lh);
             dump_row("attn.gate", l, ws_agate_, lh, n);
             be_->mul_head_broadcast(ws_attn_, ws_agate_, n, lh, mc.head_dim);
             dump_row("attn.gated", l, ws_attn_, lq, n);
@@ -2803,6 +2998,19 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             be_->mul_act(ws_attn_, ws_agate_, static_cast<i64>(n) * lq);
             dump_row("attn.gated", l, ws_attn_, lq, n);
         }
+        }
+
+        // Everything below reads ws_attn_ and writes the residual, so it is
+        // shared by both attention kinds; only a block with NO attention at all
+        // (nemotron's attention-only layers' mirror image) takes the short path.
+        if (L.mla || L.wq.present()) {
+        // The attention result's width is the OUTPUT projection's input width,
+        // not the query width: they are the same number on every family that
+        // projects per-head V, and differ exactly on an MLA layer, whose
+        // attention result is n_head*v_dim wide while its query is
+        // n_head*(nope+rope). Reading `lq` here would run the projection over
+        // 1728 stale columns per row on V2-Lite -- a wrong answer, not a crash.
+        const i64 aw = L.mla ? L.wo.n_in : lq;
 
         // The attention result is the input of a folded projection too, and
         // it is a different buffer with a different width (q_dim), so it gets
@@ -2812,19 +3020,34 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // key-space reduction order shows first, and the one the tiled kernel
         // used to differ at. Both chains write it, so one call here covers a
         // 1-row call (the fused chain) and a multi-row one (the separate chain).
-        trace_rows("attn.out", l, ws_attn_, lq, n);
+        trace_rows("attn.out", l, ws_attn_, aw, n);
         const void *attn_in = ws_attn_;
         if (L.h_attn_out) {
-            had_xform(ws_had_, ws_attn_, n, lq, false, false);
+            had_xform(ws_had_, ws_attn_, n, aw, false, false);
             attn_in = ws_had_;
         }
-        be_->gemm(ws_x2_, attn_in, L.wo.data, L.wo.type, n_embd_, lq, n);
+        be_->gemm(ws_x2_, attn_in, L.wo.data, L.wo.type, n_embd_, aw, n);
         // gpt-oss biases the attention output: one value per output channel,
         // applied to the projection's result before it joins the residual. A
         // broadcast over the rows of the GEMM output, which is exactly the
         // `add_bias_cols` shape (n rows of n_embd columns).
         if (L.wo_bias) be_->add_bias_cols(ws_x2_, L.wo_bias, n, n_embd_);
         dump_row("attn.proj", l, ws_x2_, n_embd_, n);
+        // Branch post norm (gemma2/3/4, muse-glimmer): the projection's own
+        // output is normalized with THIS branch's weight before it joins the
+        // residual -- `x + norm(attn_out)`, not `norm(x + attn_out)` and not
+        // `x + attn_out`. The dump above is the raw row and the one below is
+        // the normalized one, so the order is checkable from a trace.
+        //
+        // No row exponent here: ws_x2_ is a projection buffer, not the residual
+        // stream, so the per-token storage exponent does not apply to it.
+        if (L.attn_post_norm) {
+            const f32 peps =
+                mc.post_norm_eps > 0.0f ? mc.post_norm_eps : mc.rms_eps;
+            be_->rmsnorm(ws_x2_, ws_x2_, L.attn_post_norm, n, n_embd_, peps,
+                         nullptr);
+            dump_row("attn.postnorm", l, ws_x2_, n_embd_, n);
+        }
         // The attention residual and the FFN norm are one kernel: the sum is
         // what the norm's sum-of-squares pass reads, so a second launch
         // round-trips the activation row for nothing. The dump still sees the
@@ -3446,18 +3669,31 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
     // say which half happened, so the fallback issues exactly the calls the
     // folded path skipped. The folded form leaves ws_up_ untouched, and nothing
     // reads it after this point either way.
+    // gemma's stack gates with GeGLU, not SwiGLU: gelu(gate) * up. The fused
+    // group launch's epilogue only knows how to silu, so a GeGLU layer asks it
+    // for the bare pair and applies its own activation -- one extra launch, on
+    // a family whose graph is otherwise a copy of the SwiGLU one.
+    const ModelConfig &dmc = model_.cfg();
+    const bool gelu = dmc.gelu_ffn;
     bool silu_done = false;
     if (L.wgate.type == L.wup.type) {
         void *gu[2] = {ws_gate_, ws_up_};
         const void *wgu[2] = {L.wgate.data, L.wup.data};
         const i64 ngu[2] = {n_ff_, n_ff_};
-        be_->gemm_group(gu, xn, wgu, L.wgate.type, ngu, n_embd_, 2, n, true,
+        be_->gemm_group(gu, xn, wgu, L.wgate.type, ngu, n_embd_, 2, n, !gelu,
                         &silu_done);
     } else {
         be_->gemm(ws_gate_, xn, L.wgate.data, L.wgate.type, n_ff_, n_embd_, n);
         be_->gemm(ws_up_, xn, L.wup.data, L.wup.type, n_ff_, n_embd_, n);
     }
-    if (!silu_done) be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_);
+    if (!silu_done) {
+        if (gelu) {
+            be_->gelu_act(ws_gate_, n * n_ff_);
+            be_->mul_act(ws_gate_, ws_up_, n * n_ff_);
+        } else {
+            be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_);
+        }
+    }
     dump_row("attn.ffng", l, ws_gate_, n_ff_, n);
     // The intermediate is a folded input as well (its width is n_ff, wider
     // than anything above), which is safe to put over ws_had_ because the
@@ -3467,9 +3703,23 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
         had_xform(ws_had_, ws_gate_, n, n_ff_, false, false);
         gn = ws_had_;
     }
-    gemm_residual(ws_x_, gn, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n,
-                  ws_x2_);
-    dump_row("attn.down", l, ws_x2_, n_embd_, n);
+    if (L.ffn_post_norm) {
+        // Branch post norm: the down projection's own output is normalized
+        // with the FFN branch's weight, and only then added. That costs the
+        // folded residual store -- the norm has to read the projection, so the
+        // epilogue cannot write straight into ws_x_ -- which is why this runs
+        // as gemm + norm + add.
+        be_->gemm(ws_x2_, gn, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n);
+        const f32 peps =
+            dmc.post_norm_eps > 0.0f ? dmc.post_norm_eps : dmc.rms_eps;
+        be_->rmsnorm(ws_x2_, ws_x2_, L.ffn_post_norm, n, n_embd_, peps, nullptr);
+        dump_row("attn.down", l, ws_x2_, n_embd_, n);
+        be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
+    } else {
+        gemm_residual(ws_x_, gn, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n,
+                      ws_x2_);
+        dump_row("attn.down", l, ws_x2_, n_embd_, n);
+    }
 }
 
 bool Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
@@ -3833,17 +4083,13 @@ bool Engine::configure_expert_cache(std::string *err) {
     if (cfg_.host_ram_mb > 0) {
         host_budget = static_cast<size_t>(cfg_.host_ram_mb) * 1024u * 1024u;
     } else if (ram_total > 0) {
-        const size_t gib2 = static_cast<size_t>(1) << 30;
-        const size_t headroom = ram_total / 5;          // 4.8 / 6.4 / 9.6 / 19.2
-        const size_t pinned = ram_total / 16 < 6 * gib2 ? ram_total / 16 : 6 * gib2;
-        const size_t reserve = ram_total / 24 > 3 * gib2 ? ram_total / 24 : 3 * gib2;
-        const size_t spent = headroom + pinned + reserve;
-        host_budget = ram_total > spent ? ram_total - spent : ram_total / 2;
-        // Real OS pressure still wins over the table: the spec requires the
-        // warm tier to shrink when the machine is actually short, and the
-        // table is a plan for an idle box.
-        if (live_host_avail > 0 && host_budget > live_host_avail / 2)
-            host_budget = live_host_avail / 2;
+        // One rule, in krk::host_budget_bytes: the largest commitment that
+        // leaves the OS its reserve. The old arithmetic subtracted a
+        // working-set headroom AND a pin allowance AND a 3 GiB floor on top of
+        // the reserve -- and the pin is part of the tier, so the same bytes were
+        // charged twice. Written out for 16/24/32 GiB it left 8.8/11.6/15.6 GiB,
+        // which is the bad side of the measured cliff (PERF-ANALYSIS 12d).
+        host_budget = krk::host_budget_bytes(ram_total, live_host_avail);
     }
     if (host_budget > host_shared_room) host_budget = host_shared_room;
     // Everything the run holds has to fit under the ceiling TOGETHER: the mapped
@@ -3894,13 +4140,47 @@ bool Engine::configure_expert_cache(std::string *err) {
             warm = host_budget;
         }
     } else if (cfg_.expert_warm_mb < 0 && be_->caps().vram_free > 0) {
-        size_t want = host_budget;
-        if (host_shared_room > 0 && want > (host_shared_room / 2))
-            want = host_shared_room / 2;
-        const size_t total = model_.total_expert_bytes();
-        if (total > 0 && total < want) want = total; // never cache past the corpus
-        const size_t floor_bytes = model_.max_expert_bytes() * 4;
-        warm = want >= floor_bytes ? want : 0;
+        // The default: as much of the routed set as the machine can hold while
+        // leaving the OS its reserve. See krk::warm_tier_bytes for the rule and
+        // PERF-ANALYSIS 12d for why the old cautious half-room is not it -- a
+        // tier shorter than the corpus misses on the same experts forever, and
+        // the measured difference at the small end is 23.5 against 29.4 tok/s.
+        warm = krk::warm_tier_bytes(ram_total, live_host_avail,
+                                    model_.total_expert_bytes(),
+                                    model_.max_expert_bytes() * 4);
+        if (host_shared_room > 0 && warm > host_shared_room)
+            warm = host_shared_room;
+        // The auto tier is the largest this host can SPARE, so landing under the
+        // knee is not a misconfiguration -- it is the small-machine case, and it
+        // is the one case where the tier's size is worth a line. Say it once
+        // (this runs once, at init) and name both numbers: the tier, and what
+        // the shortfall is projected to read per layer, because that is the
+        // figure the read-ahead worker has to hide inside a layer's compute. See
+        // krk::warm_miss_mib_per_layer for the measurements behind it.
+        const size_t corpus = model_.total_expert_bytes();
+        const int n_layers = model_.cfg().n_layer;
+        const double miss_mib =
+            krk::warm_miss_mib_per_layer(corpus, warm, n_layers);
+        if (warm > 0 &&
+            krk::warm_tier_under_knee(corpus, warm, n_layers)) {
+            KRK_WARN("ram policy: the auto WARM tier is %.0f MiB for a %.0f MiB "
+                     "routed set (%.0f%%), under the measured knee: from here "
+                     "the read-ahead worker cannot hide what it reads -- "
+                     "projected %.2f MiB of file reads per layer (%.0f MiB per "
+                     "token at %d layers). Measured at that shape, decode is "
+                     "23.5-27.2 tok/s where a tier that covers the set is "
+                     "29-34 (docs/PERF-ANALYSIS.md 12d). This tier is already "
+                     "the largest this host can spare: free RAM, a bigger "
+                     "--ram-tier class, or KRK_MEM_FRACTION raises it; "
+                     "--expert-warm-mb 0 turns the tier off deliberately.",
+                     static_cast<f64>(warm) / (1024.0 * 1024.0),
+                     static_cast<f64>(corpus) / (1024.0 * 1024.0),
+                     100.0 * static_cast<f64>(warm) /
+                         static_cast<f64>(corpus > 0 ? corpus : 1),
+                     miss_mib,
+                     miss_mib * static_cast<f64>(n_layers),
+                     n_layers);
+        }
     }
     if (mapped_share > 0 && (host_budget > 0 || cfg_.host_ram_mb > 0))
         KRK_INFO("ram policy: %.1f GiB of the host room is the file mapping "
@@ -3943,8 +4223,8 @@ bool Engine::configure_expert_cache(std::string *err) {
     // 1.20x line, so the prefix declines to spend RAM that cannot be swapped.
     // That is the wide-aperture answer, and it needs no knob: fast AND swappable.
     //
-    // Bounded by installed RAM only: a quarter of it, capped at 16 GiB, because
-    // pinned pages are not swappable and this runs on laptops too. The tier is
+    // Bounded by installed RAM only: half of it, because pinned pages are not
+    // swappable and this runs on laptops too. The tier is
     // pinned WHOLE inside that bound -- the old rule kept half of it pageable
     // "so a small box still has a tier", and that half is the one every miss
     // lands on: the 256 MiB arm paid 469 us per promotion at 2.0 GB/s with 4800
@@ -5097,6 +5377,112 @@ void Engine::mamba2_forward(const LayerWeights &L, i32 l, i32 n) {
     gemm_residual(ws_x_, h_in, L.ssm_out.data, L.ssm_out.type, n_embd_, inner,
                   n, ws_x2_);
     dump_row("m2.done", l, ws_x_, n_embd_, n);
+}
+
+// Multi-head latent attention, legacy lite layout (DeepSeek-V2-Lite).
+//
+// The whole point of the layer is what the KV cache does NOT hold. Instead of
+// n_kv x head_dim of K and V it holds ONE row per token -- the compressed
+// latent (kv_lora wide, rms-normed at write time) followed by the decoupled
+// RoPE key (qk_rope wide, stored UNROTATED, because a key has to rotate at its
+// own position and this cache row is written once). On V2-Lite that is 576 f16
+// against a GQA row of 3072 x 2.
+//
+// What runs per layer, in order:
+//   1. attn_kv_a_mqa: [n_embd] -> [kv_lora + rope]       (one GEMM, n rows)
+//   2. mla_kv_write:  norm the latent, copy the key, store the row
+//   3. attn_q:        [n_embd] -> [n_head*(nope+rope)]   (direct: lite has no
+//                     q_lora trunk, which is what makes it "lite")
+//   4. mla_attention: absorb the query per head, score the latent + the
+//                     rotated decoupled key, softmax, accumulate the latent,
+//                     fold the value half
+// and the caller's ordinary output projection consumes the result.
+bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
+    KRK_TRACE_COMP("mla-forward");
+    const ModelConfig &mc = model_.cfg();
+    const i64 nh = model_.n_head_at(l);
+    const i64 nope = mc.mla_qk_nope;
+    const i64 rope = mc.mla_qk_rope;
+    const i64 kv_lora = mc.mla_kv_lora;
+    const i64 vdim = mc.mla_v_dim;
+    const i64 qk = nope + rope;
+    const i64 row = kv_lora + rope; // one cache row, in activation elements
+
+    // 1. the compressed projection. Its two halves have different fates -- the
+    // latent is normed and attended, the key is neither -- but they come out of
+    // ONE matmul, which is why the file stores one matrix for both.
+    be_->gemm(ws_mla_, ws_xn_, L.wkv_a_mqa.data, L.wkv_a_mqa.type, row, n_embd_,
+              n);
+    dump_row("mla.kv", l, ws_mla_, row, n);
+
+    // The plane this layer appends to. base() always returns this layer alone
+    // (a slot when the cache is tiered), so pos_stride below is the ROW and not
+    // a layer pitch -- the same contract the MHA chain is handed, and the one
+    // place an MLA layer and an MHA layer can be wired differently by accident.
+    void *kbase = kvt_k_.base(l);
+    if (!kbase) {
+        KRK_ERROR("mla: no resident KV slot for layer %lld",
+                  static_cast<long long>(l));
+        return false;
+    }
+
+    MlaDesc d;
+    d.n_head = nh;
+    d.qk = qk;
+    d.nope = nope;
+    d.rope = rope;
+    d.kv_lora = kv_lora;
+    d.v_dim = vdim;
+    d.n_tok = n;
+    d.pos0 = pos0;
+    d.pos_stride = row;
+    // The reference's kq_scale for this family: mscale^2 / sqrt(key_length),
+    // which is NOT 1/sqrt(v_dim) and not 1/sqrt(rope) -- the score is a dot
+    // over the whole per-head key, nope + rope -- and not plain 1/sqrt(qk)
+    // either on a YaRN file.
+    //
+    // DeepSeek multiplies its query and key by an mscale of its own
+    // (rope.scaling.yarn_log_multiplier), which llama.cpp deepseek2 folds into
+    // the attention scale instead of into the rope (the rope's magnitude is
+    // pre-divided by exactly the same factor, so the rotation stays at unity
+    // and only the score changes -- see TAG_DEEPSEEK2_YARN_LOG_MUL_FIX). On
+    // the V2-Lite file that is mscale = 1.0261 and a scale 5.3% above
+    // 1/sqrt(192): small enough that a short greedy run agrees for a few tokens
+    // and then picks a different word, which is exactly how it showed up.
+    // MEASURED, not derived: with the mscale^2 factor this engine's first
+    // greedy token on the Coder-V2-Lite file differs from llama.cpp's, and with
+    // plain 1/sqrt(key_length) it matches. That is the one number this couldn't
+    // be reasoned out of -- llama.cpp's deepseek2 kq_scale reads
+    // mscale^2/sqrt(key_length), but its mscale is built from
+    // rope.freq_scale, and when that is 1.0 the whole correction is 1.0 too.
+    // The file's factor of 40 is applied to the FREQUENCIES (folded into
+    // inv_freq above), not to this scale, and the text is the witness.
+    d.scale = 1.0f / std::sqrt(static_cast<f32>(qk));
+    d.eps = mc.rms_eps;
+    // The file's own rotary table, YaRN already folded into the frequencies by
+    // the loader. The kernel rotates the q rope half and each cache row's key
+    // half with it, at that row's own position -- which is why the cache keeps
+    // the key UNROTATED.
+    d.inv_freq = model_.inv_freq_at(l).data();
+
+    // 2. the query, directly projected: head h owns columns
+    // [h*(nope+rope), ...), nope first -- the file's own packing, and the same
+    // packing mla_attention reads.
+    be_->gemm(ws_q_, ws_xn_, L.wq_direct.data, L.wq_direct.type, nh * qk,
+              n_embd_, n);
+    dump_row("mla.q", l, ws_q_, nh * qk, n);
+
+    // 3. append this pass's rows. Must precede the attention call: row pos0+0 is
+    // visible to itself, so the write and the read are the same pass.
+    be_->mla_kv_write(kbase, ws_mla_, L.wkv_a_norm, d);
+    // 4. attention over the prefix, written straight into ws_attn_ at
+    // n_head*v_dim columns per row -- the width the output projection reads.
+    be_->mla_attention(ws_attn_, ws_q_, kbase, L.wkv_b16.data, d);
+    // The layer's KV is queued: a later layer that evicts this slot has to wait
+    // for these kernels instead of overwriting memory they still read.
+    kvt_k_.end_layer(l);
+    dump_row("mla.out", l, ws_attn_, nh * vdim, n);
+    return true;
 }
 
 void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
@@ -6415,6 +6801,31 @@ static bool moe_group() {
     }();
     return v;
 }
+// KRK_MOE_BATCH=0 restores one launch group per routed expert on the decode
+// path. ON by default because at one token every routed expert owns exactly one
+// row and they all read the SAME activation, so the layer's work is one group
+// launch per four experts, one activation launch for all of them, and one down
+// launch -- 12 launches where the per-expert loop issued 42. Nothing about the
+// arithmetic changes: same experts, same ascending order, same row-scaled silu,
+// same scatter, which is what the arm is for.
+static bool moe_batch() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_MOE_BATCH");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
+// KRK_ACTIVE_STAGE=1 submits the next expert's DMA as each expert is queued.
+// Read once, not per expert visit: it is an environment variable, not state.
+static bool moe_active_stage() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_ACTIVE_STAGE");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
 // KRK_MOE_SILU_FUSED=1 puts the activation back inside the gate/up group.
 // It is OFF because that kernel has no row maximum to take: a row whose
 // silu(gate)*up exceeds f16's range is stored clipped, and the clip is not
@@ -6468,12 +6879,165 @@ static bool batch_promote() {
     return v;
 }
 
+static i64 profile_snapshot_every() {
+    static const i64 v = [] {
+        const char *e = std::getenv("KRK_PROFILE_SNAPSHOT");
+        return e && *e ? static_cast<i64>(std::atoll(e)) : 0;
+    }();
+    return v;
+}
+
 static bool moe_silu_fused() {
     static const bool v = [] {
         const char *e = std::getenv("KRK_MOE_SILU_FUSED");
         return e && e[0] != '0';
     }();
     return v;
+}
+
+// ---- the batched decode path -----------------------------------------------
+//
+// One token's routed experts, computed by launches that cover ALL of them
+// instead of one launch group per expert. At n == 1 every expert's group is a
+// single row, and every one of those rows is the SAME activation row -- which
+// is what makes the batch possible at all:
+//
+//   * gate/up: eight matrices per launch (four experts, gate then up), all
+//     reading ws_xn_. The gather the per-expert loop issues to build that row
+//     copies row 0, so the batch skips it rather than batching it.
+//   * the activation: one row-scaled launch for every expert's row
+//     (silu_mul_rows), the single-row kernel's own body, one block per row.
+//   * down: one launch, each matrix reading its OWN expert's silu row -- the
+//     per-matrix activation the group takes.
+//   * the scatter stays per expert, ascending, because that is the routed sum's
+//     accumulation order and its storage exponents.
+//
+// It refuses (returns false having launched nothing) for every shape the
+// launches cannot express, and the caller's per-expert loop then runs unchanged.
+// Refusing BEFORE the first launch is load-bearing: a partial batch would add
+// some experts to the sum twice when the loop ran the layer again.
+bool Engine::moe_decode_batch(const LayerWeights &L, i32 layer, i32 k, i32 ne,
+                              i64 ff_exp, bool use_plan_off, bool inplace_ok) {
+    if (!use_plan_off || k <= 0 || ff_exp <= 0) return false;
+    if (!ws_ebatch_ || !ws_edown_ || !ws_ebscale_) return false;
+    const size_t as = be_->act_size();
+    const i64 ffs = model_.n_ff_ws();
+    auto slot = [&](void *base, i64 idx, i64 stride) {
+        return static_cast<void *>(static_cast<char *>(base) +
+                                   static_cast<size_t>(idx) *
+                                       static_cast<size_t>(stride) * as);
+    };
+    auto scale_at = [&](i32 j) {
+        return static_cast<f32 *>(ws_ebscale_) + j;
+    };
+
+    // This layer's routed experts in ASCENDING id order -- the order the
+    // per-expert loop visits them in, and therefore the order the routed sum
+    // accumulates in. The batch changes the launch count and nothing else.
+    batch_ids_.clear();
+    for (i32 e = 0; e < ne; e++)
+        for (i32 s = 0; s < k; s++)
+            if (moe_sel_[static_cast<size_t>(s)] == e) {
+                batch_ids_.push_back(e);
+                break;
+            }
+    if (batch_ids_.empty()) return false;
+
+    // Every expert is resolved BEFORE the first launch, so a refusal here has
+    // issued nothing and the caller can fall back safely.
+    batch_res_.clear();
+    for (i32 e : batch_ids_) {
+        if (inplace_ok) model_.experts().take_prefetched(layer, e);
+        const ResidentExpert *re =
+            inplace_ok ? model_.experts().acquire_inplace(L.experts, layer, e)
+                       : nullptr;
+        if (!re) re = model_.experts().acquire(L.experts, layer, e);
+        if (!re) {
+            forward_error_ = expert_resource_error() + " (moe layer " +
+                             std::to_string(layer) + " expert " +
+                             std::to_string(e) + ")";
+            return false;
+        }
+        batch_res_.push_back(re);
+    }
+
+    for (size_t base = 0; base < batch_ids_.size(); base += kMoeBatch) {
+        const i32 cnt = static_cast<i32>(
+            std::min<size_t>(static_cast<size_t>(kMoeBatch),
+                             batch_ids_.size() - base));
+        // gate/up: four experts at a time (the launch's matrix array holds
+        // eight -- one gate and one up each), all over the same activation.
+        for (i32 c = 0; c < cnt; c += 4) {
+            const i32 g = std::min<i32>(4, cnt - c);
+            void *out[8] = {};
+            const void *w[8] = {};
+            i64 no[8] = {};
+            DType ts[8] = {};
+            DType def = DType::F16;
+            for (i32 j = 0; j < g; j++) {
+                const ResidentExpert *re = batch_res_[base + c + j];
+                out[2 * j] = slot(ws_ebatch_, 2 * (c + j), ffs);
+                out[2 * j + 1] = slot(ws_ebatch_, 2 * (c + j) + 1, ffs);
+                w[2 * j] = re->gate.data;
+                w[2 * j + 1] = re->up.data;
+                no[2 * j] = ff_exp;
+                no[2 * j + 1] = ff_exp;
+                ts[2 * j] = re->gate.type;
+                ts[2 * j + 1] = re->up.type;
+                def = re->up.type;
+            }
+            // Not the silu-fused form: that epilogue takes exactly two
+            // matrices. The activation is the launch below, shared by all of
+            // them.
+            be_->gemm_group(out, ws_xn_, w, def, no, n_embd_, 2 * g, 1, false,
+                            nullptr, false, ts);
+        }
+        {
+            void *aout[8] = {};
+            const void *agate[8] = {};
+            const void *aup[8] = {};
+            f32 *ascale[8] = {};
+            for (i32 j = 0; j < cnt; j++) {
+                aout[j] = slot(ws_ebatch_, 2 * j, ffs);
+                agate[j] = aout[j];
+                aup[j] = slot(ws_ebatch_, 2 * j + 1, ffs);
+                ascale[j] = scale_at(j);
+            }
+            be_->silu_mul_rows(aout, agate, aup, ff_exp, cnt, ascale);
+        }
+        {
+            void *dout[8] = {};
+            const void *dw[8] = {};
+            const void *dx[8] = {};
+            i64 dno[8] = {};
+            DType dts[8] = {};
+            DType def = DType::F16;
+            for (i32 j = 0; j < cnt; j++) {
+                const ResidentExpert *re = batch_res_[base + j];
+                dout[j] = slot(ws_edown_, j, n_embd_);
+                dx[j] = slot(ws_ebatch_, 2 * j, ffs);
+                dw[j] = re->down.data;
+                dno[j] = n_embd_;
+                dts[j] = re->down.type;
+                def = re->down.type;
+            }
+            be_->gemm_group(dout, nullptr, dw, def, dno, ff_exp, cnt, 1, false,
+                            nullptr, false, dts, dx);
+        }
+        // The routed sum, expert by expert in the per-expert loop's order, with
+        // that expert's segment of the device plan (one row, its weight).
+        for (i32 j = 0; j < cnt; j++) {
+            const i32 e = batch_ids_[base + j];
+            const size_t off = static_cast<size_t>(plan_off_[static_cast<size_t>(e)]);
+            be_->scatter_axpy_rows(
+                ws_ffn_, slot(ws_edown_, j, n_embd_),
+                static_cast<const i32 *>(ws_plan_) + off,
+                static_cast<const f32 *>(ws_alpha_) + off, 1, n_embd_,
+                scale_at(j), static_cast<i32 *>(ws_fexp_));
+            model_.experts().note_read(layer, e);
+        }
+    }
+    return true;
 }
 
 bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
@@ -6847,6 +7411,48 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // fits the kernel) and the hybrid path is not in use.
         const bool dispatch_dev = dispatch_cap && !hybrid;
         if (dev_table_ && !dispatch_dev) ++dp_launch_skips_;
+        // Read WARM in place instead of promoting it (ExpertCache::acquire_inplace).
+        // The other two arms answer "where do these bytes live" for themselves:
+        // the hybrid arm computes non-resident experts on the host, and the
+        // one-launch dispatch reads a published table, so neither is overridden
+        // here.
+        const bool inplace_ok = expert_inplace() && be_->host_load_supported() &&
+                                !hybrid && !dispatch_dev && !expert_stub_;
+
+        // ---- start THIS layer's cold reads while its first experts run -------
+        // Not the NEXT layer: the previous token's picks for the next layer are
+        // already in WARM by definition (they were just used), so a read-ahead
+        // fed with them issues zero reads -- measured, `hint=10 ids=0` on every
+        // layer of REAP-288. What blocks is the expert this layer routed that the
+        // tier does NOT hold, and those ids are exact, not predicted: they are on
+        // the host right here, after selection and before the loop that waits for
+        // them.
+        //
+        // So the reads start now, on the worker, and the loop's first experts --
+        // the ones already resident or in place -- compute while the file works.
+        // `take_prefetched` waits for an expert that is still in flight, so the
+        // order of the layer's arithmetic is untouched: same experts, same
+        // ascending order, same scatter. Only the wall clock changes.
+        if (warm_ahead() && inplace_ok && !expert_stub_) {
+            ahead_ids_.clear();
+            for (i32 t2 = 0; t2 < n; t2++) {
+                const i32 *sel2 = moe_sel_.data() + static_cast<size_t>(t2) * k;
+                for (i32 s2 = 0; s2 < k; s2++) {
+                    const i32 e = sel2[s2];
+                    if (e < 0 || e >= ne) continue;
+                    if (model_.experts().has_warm(layer, e)) continue;
+                    if (std::find(ahead_ids_.begin(), ahead_ids_.end(), e) !=
+                        ahead_ids_.end())
+                        continue;
+                    ahead_ids_.push_back(e);
+                }
+            }
+            if (!ahead_ids_.empty())
+                model_.experts().prefetch_warm_next(
+                    L.experts, layer, ahead_ids_.data(),
+                    static_cast<int>(ahead_ids_.size()));
+        }
+
         i32 n_cpu_experts = 0;
         if (hybrid) {
             hy_take_.assign(static_cast<size_t>(ne), 0);
@@ -6947,7 +7553,13 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                     prefetch_ids_.push_back(best);
                 }
             }
-            if (prefetch_ids_.size() > 1)
+            // The read-ahead worker is already reading exactly this set (it was
+            // handed the ids at selection time). Issuing the same reads here as
+            // well is what made the first version SLOWER instead of faster: two
+            // copies of the bytes, the worker's results thrown away as duplicates
+            // because the synchronous pass had already filled WARM.
+            const bool ahead_reading = warm_ahead() && inplace_ok && !expert_stub_;
+            if (prefetch_ids_.size() > 1 && !ahead_reading)
                 model_.experts().prefetch_layer(
                     L.experts, layer, prefetch_ids_.data(),
                     static_cast<int>(prefetch_ids_.size()));
@@ -6962,7 +7574,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // union of a wider row can be hundreds of experts, and promoting
             // all of them would evict the ones the first row needs.
             const size_t batch_max = static_cast<size_t>(k) * 4 + 8;
-            if (batch_promote() && !prefetch_ids_.empty() && n <= 8 &&
+            if (batch_promote() && !inplace_ok && !prefetch_ids_.empty() && n <= 8 &&
                 prefetch_ids_.size() <= batch_max)
                 model_.experts().promote_batch(L.experts, layer,
                                                prefetch_ids_.data(),
@@ -6980,7 +7592,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // experts, and promoting all of them would evict the very ones its
             // own first rows need. KRK_MOE_LOOKAHEAD=0 is the A/B arm.
             const size_t stage_max = static_cast<size_t>(k) * 4 + 8;
-            if (lookahead_stage() && !prefetch_ids_.empty() && n <= 4 &&
+            if (lookahead_stage() && !inplace_ok && !prefetch_ids_.empty() && n <= 4 &&
                 prefetch_ids_.size() <= stage_max)
                 model_.experts().stage_batch(L.experts, layer,
                                              prefetch_ids_.data(),
@@ -7028,6 +7640,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 }
             }
             if (!plan_dev_.empty()) {
+                KRK_TIME_HOST("moe.route.upload");
                 be_->upload_i32(static_cast<i32 *>(ws_plan_), plan_dev_.data(),
                                 static_cast<i64>(plan_dev_.size()));
                 be_->upload(static_cast<f32 *>(ws_alpha_), alpha_dev_.data(),
@@ -7053,6 +7666,12 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                                    n == 1 && !expert_stub_;
         if (moe_predict_enabled_ && n == 1 && !expert_stub_)
             moe_predictor_.observe(layer, moe_sel_.data(), k);
+        // The hint is recorded whenever SOMETHING reads it: the WARM->HOT
+        // staging below, or the read-ahead worker (which uses it to know what to
+        // read for the next layer while this one computes). Recording it only
+        // under `next_prefetch` is how the read-ahead first ran and did nothing
+        // at all -- the vector was never sized, so every layer found no hint and
+        // the blocking read stayed exactly where it was.
         if (next_prefetch) {
             if (moe_hint_.size() < static_cast<size_t>(mc.n_layer))
                 moe_hint_.resize(static_cast<size_t>(mc.n_layer));
@@ -7073,6 +7692,21 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             be_->moe_dispatch(dev_table_, layer, ne, ws_ids_, ws_wts_, ws_xn_,
                               ws_ffn_, n, n_embd_, ff_exp, k);
             ++dp_launch_layers_;
+            // That one launch read every routed expert's cells, and the per-expert
+            // loop below (which does this per use) does not run. Stamp them here
+            // or a reuse would adopt a mark older than this read. Deduped, because
+            // a prefill row set selects the same expert many times.
+            prefetch_seen_.assign(static_cast<size_t>(ne), 0);
+            for (i32 t2 = 0; t2 < n; t2++) {
+                const i32 *sel2 = moe_sel_.data() + static_cast<size_t>(t2) * k;
+                for (i32 s2 = 0; s2 < k; s2++) {
+                    const i32 e2 = sel2[s2];
+                    if (e2 < 0 || e2 >= ne || prefetch_seen_[static_cast<size_t>(e2)])
+                        continue;
+                    prefetch_seen_[static_cast<size_t>(e2)] = 1;
+                    model_.experts().note_read(layer, e2);
+                }
+            }
         }
 
         // ---- per-expert loop on the device too? no - this is the dispatch path ---
@@ -7087,9 +7721,34 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // is published AND the whole routed set is resident AND the shape fits the
         // kernel; otherwise the per-expert path is used and expertise is resolved
         // per expert via acquire().
+        // ---- the whole layer as a batch (decode) ---------------------------
+        // `use_plan_off` is the loop's own test for "this layer's plan is already
+        // on the device", which is what a batch scatters through; a layer that
+        // builds its plan per visit keeps the loop. Everything else here is the
+        // shape the launches can express -- plain silu experts with no per-expert
+        // bias, no sidecar scale, no host arm and no arm that measures a
+        // per-expert ordering (KRK_MOE_BATCH=0 is this path's own arm).
+        const bool use_plan_off0 = plan_grouped && dp_used_ == 0;
+        const bool batch_ok =
+            n == 1 && moe_batch() && use_plan_off0 && !expert_stub_ &&
+            !dispatch_dev && !hybrid && !moe_probe() && !sync_expert() &&
+            !moe_silu_fused() && !moe_active_stage() &&
+            L.experts.gate && gs_free &&
+            !L.exp_gate_bias && !L.exp_up_bias && !L.exp_down_bias &&
+            !mc.ffn_swiglu_oai && !mc.ffn_relu_sqr &&
+            (ff_exp & 31) == 0 && (n_embd_ & 31) == 0;
+        const bool batch_ran =
+            batch_ok && moe_decode_batch(L, layer, k, ne, ff_exp, use_plan_off0,
+                                         inplace_ok);
+        if (n == 1 && moe_batch()) {
+            if (batch_ran) ++moe_batch_layers_;
+            else ++moe_batch_skips_;
+        }
+
         {
         KRK_TIME_HOST_N(n == 1 ? "moe.experts" : "moe.experts.batch", hs_moe);
-        for (i32 e = 0; !expert_stub_ && !dispatch_dev && e < ne; e++) {
+        for (i32 e = 0; !batch_ran && !expert_stub_ && !dispatch_dev && e < ne;
+             e++) {
             // The host arm owns this expert on this layer. Skipping it here is
             // what leaves its weights absent from both tiers.
             if (hybrid && hy_take_[static_cast<size_t>(e)]) continue;
@@ -7123,7 +7782,18 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // regardless of how small the cache is. A refusal is a visible
             // generation error (P0-1), never a silent skip: the router
             // selected this expert and its contribution is required.
-            const ResidentExpert *re = model_.experts().acquire(L.experts, layer, e);
+            // In place first: a WARM expert that has not earned a VRAM slot is
+            // read where it lives, which spends no copy and evicts nothing. That
+            // only works when the slot is pinned host memory -- `acquire_inplace`
+            // answers nullptr for every other case and the promotion path below
+            // runs exactly as before.
+            // A read-ahead that finished is this expert's WARM copy; installing
+            // it here costs a map insert and no I/O. A miss is the normal path.
+            if (inplace_ok) model_.experts().take_prefetched(layer, e);
+            const ResidentExpert *re =
+                inplace_ok ? model_.experts().acquire_inplace(L.experts, layer, e)
+                           : nullptr;
+            if (!re) re = model_.experts().acquire(L.experts, layer, e);
             if (!re) {
                 forward_error_ = expert_resource_error() + " (moe layer " +
                                  std::to_string(layer) + " expert " +
@@ -7373,16 +8043,25 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             be_->scatter_axpy_rows(ws_ffn_, ws_x2_, plan_i, plan_f, m, n_embd_,
                                    scatter_scale,
                                    static_cast<i32 *>(ws_fexp_));
+            // Every kernel that reads this slot's weights is queued by now, and
+            // that point is what a later reuse of its cells has to wait for --
+            // not the eviction, which comes a layer later and whose mark covers
+            // everything queued in between. One record per (layer, expert) use.
+            model_.experts().note_read(layer, e);
             // Exact next expert in the existing ascending execution order.
             // Submit its copy only after this expert's weight readers are queued.
-            const char *stage = std::getenv("KRK_ACTIVE_STAGE");
-            if (n == 1 && be_->kind() == BackendKind::HIP && stage && stage[0] == '1') {
+            if (n == 1 && be_->kind() == BackendKind::HIP && moe_active_stage()) {
                 i32 next = ne;
                 for (i32 id : prefetch_ids_) if (id > e && id < next) next = id;
                 if (next < ne) model_.experts().stage_next(L.experts, layer, next, e);
             }
         }
         }
+
+        // The layer's last expert uses are still pending a reader-done mark:
+        // emit them here, just past this layer's readers and before the prefetch
+        // below can trim or free any of those cells.
+        model_.experts().flush_read_notes();
 
         // ---- prefetch the next MoE layer's predicted set ---------------------
         // Here, after this layer's expert loop, is the only place the eviction is
@@ -7645,6 +8324,11 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
 
 void Engine::fetch_logits(bool device_only) {
     KRK_TRACE_COMP("fetch-logits");
+    // The head's gemm is a device op, but this call also covers the download
+    // that follows it, and on a small model that blocking readback is most of
+    // the token (measured: 60.4 of 92.1 ms on Qwen3-4B-Q8_0). Its own row
+    // separates "the head is slow" from "waiting for the head is slow".
+    KRK_TIME_HOST(device_only ? "decode.logits.dev" : "decode.logits.host");
     // Greedy decode reads exactly one number out of this row. Downloading it
     // first cost 993 kB of PCIe and, on the 8B, 2.7 ms of *device* idle per
     // token: the GPU had finished and sat waiting for the host. The device
@@ -8888,6 +9572,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     moe_predict_ids_.clear();
 
     // ---- tokenize ---------------------------------------------------------
+    // Timed inside Tokenizer::encode, which covers every caller.
     std::vector<i32> ids;
     if (tok_.encode(p.prompt, ids, true) < 0) return false;
     if (ids.empty()) {
@@ -8985,6 +9670,11 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     const bool device_topk = p.sampler.greedy && p.debug_topk <= 0 &&
                             !p.sample_host;
     expert_phase(ExpertCache::PhasePrefill);
+    // Phase stamp: every span and kernel from here to the end of the prompt is
+    // charged to `prefill`, so the component table ranks prefill against
+    // prefill instead of against a load that happened once. Back to decode just
+    // after the logits fetch.
+    krk::HostTime::set_phase(krk::HostTime::kPrefill);
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
         const i32 n = static_cast<i32>(
@@ -8998,6 +9688,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         }
     }
     fetch_logits(device_topk);
+    krk::HostTime::set_phase(krk::HostTime::kDecode);
     if (expert_scan_ || expert_track_)
         expert_scan_tokens_ += static_cast<i64>(ids.size());
     // The MTP probe runs here, on the prompt's last row, and before the decode
@@ -9050,13 +9741,24 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         // Under --profile this is where "the CPU is busy and the GPU is idle"
         // is either visible or not.
         KRK_TIME_HOST("decode.step");
+        // On-demand component snapshot (KRK_PROFILE_SNAPSHOT / --profile-snapshot
+        // N): the tables are printed at teardown, which is useless during an
+        // hour-long server run. This prints them every N decode steps.
+        if (profile_snapshot_every() > 0 && gen > 0 &&
+            gen % profile_snapshot_every() == 0 &&
+            krk::HostTime::get().on())
+            krk::HostTime::get().report_components(stderr);
         if (p.debug_topk > 0)
             dump_topk(p.debug_topk, gen, pos, logits_host_, n_vocab_);
         // The fast path hands back the argmax the device already computed.
         // Greedy skips the repetition penalty by design (Sampler::sample does
         // the same), so this is the identical token, not an approximation.
-        const i32 token = topk_valid_ ? topk_id_
-                                       : sampler.sample(logits_host_, n_vocab_);
+        i32 token = 0;
+        {
+        KRK_TIME_HOST("decode.sample");
+        token = topk_valid_ ? topk_id_
+                            : sampler.sample(logits_host_, n_vocab_);
+        }
         if (token == tok_.eos()) {
             res->finish = FinishEos;
             break;

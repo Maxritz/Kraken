@@ -389,6 +389,144 @@ public:
                 });
     }
 
+    // ---- multi-head latent attention (see MlaDesc) -----------------------
+    //
+    // The reference the HIP kernel is judged against, in the same order the
+    // kernel uses: absorb, score the latent plus the decoupled key, softmax,
+    // accumulate the latent, fold the value half. `wkv_b` is the f16 staging
+    // the loader built from the file's quantized table, so both paths read
+    // the same numbers -- a mismatch between them is arithmetic, never a
+    // different weight.
+    bool mla_supported() const override { return true; }
+
+    void mla_kv_write(void *cache, const void *proj, const void *gamma,
+                      const MlaDesc &d) override {
+        f32 *c = static_cast<f32 *>(cache);
+        const f32 *p = static_cast<const f32 *>(proj);
+        const f32 *g = static_cast<const f32 *>(gamma);
+        const i64 kv = d.kv_lora;
+        const i64 rope = d.rope;
+        const i64 width = kv + rope;
+        const f32 eps = d.eps;
+        par_for(d.n_tok, 1, 4.0 * static_cast<f64>(d.n_tok) * width,
+                [&](i64 b, i64 e) {
+                    for (i64 t = b; t < e; t++) {
+                        const f32 *src = p + t * width;
+                        f32 *dst = c + (d.pos0 + t) * d.pos_stride;
+                        // The norm covers the LATENT alone: the decoupled key
+                        // is not normed, and it is cached UNROTATED.
+                        f64 ss = 0.0;
+                        for (i64 i = 0; i < kv; i++) {
+                            const f64 v = src[i];
+                            ss += v * v;
+                        }
+                        const f32 inv = 1.0f / std::sqrt(
+                            static_cast<f32>(ss / static_cast<f64>(kv)) + eps);
+                        for (i64 i = 0; i < kv; i++)
+                            dst[i] = src[i] * inv * g[i];
+                        for (i64 i = 0; i < rope; i++) dst[kv + i] = src[kv + i];
+                    }
+                });
+    }
+
+    void mla_attention(void *out, const void *q, const void *cache,
+                       const void *wkv_b, const MlaDesc &d) override {
+        const f32 *qf = static_cast<const f32 *>(q);
+        const f32 *cf = static_cast<const f32 *>(cache);
+        const u16 *w = static_cast<const u16 *>(wkv_b);
+        f32 *of = static_cast<f32 *>(out);
+        const i64 nope = d.nope;
+        const i64 rope = d.rope;
+        const i64 kv = d.kv_lora;
+        const i64 vd = d.v_dim;
+        const i64 hv = nope + vd;
+        // (row, head) pairs are independent and own their whole softmax.
+        const i64 units = d.n_tok * d.n_head;
+        par_for(units, 1,
+                8.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * kv,
+                [&](i64 b, i64 e) {
+                    std::vector<f32> qk(static_cast<size_t>(kv));
+                    std::vector<f32> cv(static_cast<size_t>(kv));
+                    std::vector<f32> qpe(static_cast<size_t>(rope));
+                    std::vector<f32> scores;
+                    for (i64 u = b; u < e; u++) {
+                        const i64 r = u / d.n_head;
+                        const i64 h = u - r * d.n_head;
+                        const i64 pos = d.pos0 + r;
+                        const i64 n_keys = pos + 1; // causal
+                        const f32 *qrow =
+                            qf + r * (d.n_head * d.qk) + h * d.qk;
+                        const f32 *qn = qrow;
+                        const f32 *qr = qrow + nope;
+                        for (i64 i = 0; i < rope; i += 2) {
+                            const f32 th = static_cast<f32>(pos) *
+                                           d.inv_freq[i / 2];
+                            const f32 cs = std::cos(th), sn = std::sin(th);
+                            qpe[static_cast<size_t>(i)] =
+                                qr[i] * cs - qr[i + 1] * sn;
+                            qpe[static_cast<size_t>(i + 1)] =
+                                qr[i] * sn + qr[i + 1] * cs;
+                        }
+                        // The absorb: the K half of head h folded into q_nope.
+                        // Feature j = h*hv + dd owns the contiguous row at
+                        // j*kv (the file's own order, staged as f16).
+                        for (i64 k = 0; k < kv; k++) {
+                            f32 s = 0.0f;
+                            for (i64 dd = 0; dd < nope; dd++)
+                                s += fp16_to_fp32(
+                                         w[(h * hv + dd) * kv + k]) * qn[dd];
+                            qk[static_cast<size_t>(k)] = s;
+                        }
+                        scores.assign(static_cast<size_t>(n_keys), 0.0f);
+                        f32 mx = -1e30f;
+                        for (i64 t = 0; t < n_keys; t++) {
+                            const f32 *c = cf + t * d.pos_stride;
+                            f32 s = 0.0f;
+                            for (i64 k = 0; k < kv; k++)
+                                s += qk[static_cast<size_t>(k)] * c[k];
+                            const f32 *kpe = c + kv;
+                            for (i64 i = 0; i < rope; i += 2) {
+                                const f32 th = static_cast<f32>(t) *
+                                               d.inv_freq[i / 2];
+                                const f32 cs = std::cos(th), sn = std::sin(th);
+                                const f32 a = kpe[i], bb = kpe[i + 1];
+                                s += qpe[static_cast<size_t>(i)] *
+                                         (a * cs - bb * sn) +
+                                     qpe[static_cast<size_t>(i + 1)] *
+                                         (a * sn + bb * cs);
+                            }
+                            s *= d.scale;
+                            scores[static_cast<size_t>(t)] = s;
+                            if (s > mx) mx = s;
+                        }
+                        f32 sum = 0.0f;
+                        for (i64 t = 0; t < n_keys; t++) {
+                            const f32 ex =
+                                std::exp(scores[static_cast<size_t>(t)] - mx);
+                            scores[static_cast<size_t>(t)] = ex;
+                            sum += ex;
+                        }
+                        for (i64 k = 0; k < kv; k++) {
+                            f32 a = 0.0f;
+                            for (i64 t = 0; t < n_keys; t++)
+                                a += scores[static_cast<size_t>(t)] *
+                                     cf[t * d.pos_stride + k];
+                            cv[static_cast<size_t>(k)] = a / sum;
+                        }
+                        f32 *oh = of + r * (d.n_head * vd) + h * vd;
+                        for (i64 dd = 0; dd < vd; dd++) {
+                            const u16 *wc =
+                                w + (h * hv + nope + dd) * kv;
+                            f32 a = 0.0f;
+                            for (i64 k = 0; k < kv; k++)
+                                a += cv[static_cast<size_t>(k)] *
+                                     fp16_to_fp32(wc[k]);
+                            oh[dd] = a;
+                        }
+                    }
+                });
+    }
+
     void silu_mul(void *out, const void *gate, const void *up, i64 n,
                   i64 row_len = 0, f32 *row_scale = nullptr) override {
         f32 *o = static_cast<f32 *>(out);
@@ -686,6 +824,17 @@ public:
                     for (i64 i = b; i < e; i++) {
                         const f32 v = p[i];
                         p[i] = v / (1.0f + std::exp(-v));
+                    }
+                });
+    }
+
+    void gelu_act(void *x, i64 n) override {
+        f32 *p = static_cast<f32 *>(x);
+        par_for(n, 8192, 6.0 * static_cast<f64>(n),
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const f32 v = p[i];
+                        p[i] = krk_gelu_tanh(v);
                     }
                 });
     }

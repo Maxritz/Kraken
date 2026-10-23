@@ -1,4 +1,5 @@
 // model.cpp — resolve GGUF metadata + tensor schema into device-resident weights.
+#include "krk/host_time.hpp"
 #include "krk/model.hpp"
 #include "krk/arch.hpp"
 #include "krk/verdict.hpp"
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <memory>
 
 namespace krk {
@@ -30,11 +32,28 @@ std::vector<QuantTensor *> qt_fields(LayerWeights &L) {
             &L.shexp_gate, &L.shexp_up,  &L.shexp_down,  &L.shexp_inp_gate,
             &L.wqkv,       &L.wqkv_gate, &L.wattn_gate,
             &L.ssm_conv1d, &L.ssm_out,   &L.ssm_in,
-            &L.wq_direct,    &L.wkv_a_mqa,   &L.wkv_b,
+            &L.wq_direct,    &L.wkv_a_mqa,   &L.wkv_b,      &L.wkv_b16,
+            // The modern MLA layouts (src/model.cpp: the MLA branch of the
+            // layer loop). A field added to LayerWeights and missed here
+            // leaks its allocation -- or, on the streamed path, keeps
+            // pointing into the ring after the layer was promoted.
+            &L.wq_a,      &L.wq_b,      &L.wkv,
+            &L.wkv_a,     &L.wk_b,      &L.wv_b,
+            &L.wo_a,      &L.wo_b,
             &L.ssm_alpha,  &L.ssm_beta};
 }
 
 } // namespace
+
+const char *mla_layout_name(MlaLayout l) {
+    switch (l) {
+        case MlaLayout::Legacy: return "legacy lite";
+        case MlaLayout::Split:  return "split (per-head K/V)";
+        case MlaLayout::Shared: return "shared-latent";
+        case MlaLayout::None:   break;
+    }
+    return "none";
+}
 
 // Load-phase timeline (KRK_PHASE=1). The engine reports one "load N ms" line,
 // which cannot say whether the time went to the mapping, the metadata, the
@@ -62,7 +81,12 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     LoadPhase lp;
     be_ = &be;
     model_path_ = path;
+    {
+    // Mapping + metadata: on a 74 GiB file this is the parse of every tensor
+    // entry, and it happens before anything else can start.
+    KRK_TIME_HOST("load.map");
     if (!gguf_.load(path, err)) return false;
+    }
     lp.mark("gguf map + metadata");
 
     // Large weights are pulled in with read() rather than DMA'd out of the cold
@@ -242,6 +266,18 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // The attention output gate is a property of the schema, not of a tensor:
     // the loader has to know to look for it before the layer loop starts.
     cfg_.attn_gate = aspec.attn_gate;
+    // muse-glimmer gates with a sigmoid where laguna gates with a softplus.
+    cfg_.attn_gate_sigmoid = aspec.attn_gate_sigmoid;
+    // Per-branch post norms, and the GeGLU FFN that comes with the gemma stack.
+    // `post_norm_eps` 0 means "use the model's rms_eps", which is the gemma case;
+    // muse-glimmer states its own 1e-8 for these two norms.
+    cfg_.post_branch_norm = aspec.post_branch_norm;
+    // Stored as given; 0 means "the model's rms_eps", resolved by the engine at
+    // the call -- the gemma eps override is applied further down, AFTER this
+    // point, so resolving it here would capture the pre-override value.
+    cfg_.post_norm_eps = static_cast<f32>(aspec.post_norm_eps);
+    cfg_.gelu_ffn = aspec.gelu_ffn;
+    cfg_.rope_swa_only = aspec.rope_swa_only;
     // RoPE's pair convention is a property of the export, so it comes from
     // the arch table rather than from the tensors. KRK_ROPE_NEOX=0/1 forces
     // it, for bisecting a file that disagrees with llama.cpp: with the wrong
@@ -757,6 +793,48 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         return dev;
     };
 
+    // Reads an int32 tensor as DATA. The values ARE the data -- an
+    // expert-id table keyed by token id -- so they are read as integers and
+    // kept on the host, where the route is resolved. Never uploaded: a
+    // device copy would be a weight in all but name, which is why
+    // upload_weight refuses the int32 format outright.
+    auto read_i32_table = [&](const std::string &name, std::vector<i32> &out,
+                              i32 &per_token, i32 &n_tokens,
+                              std::string *e) -> bool {
+        const GgufTensor *t = gguf_.tensor(name);
+        if (!t) {
+            if (e) *e = "int32 table '" + name + "' is missing";
+            return false;
+        }
+        if (t->type != DType::I32) {
+            if (e)
+                *e = "table '" + name + "' is " + dtype_name(t->type) +
+                     ", expected an int32 table (ggml type 26)";
+            return false;
+        }
+        if (t->n_dims < 1 || t->n_elements <= 0 || !t->data) {
+            if (e) *e = "table '" + name + "' is empty";
+            return false;
+        }
+        if (t->n_bytes < t->n_elements * 4) {
+            if (e)
+                *e = "table '" + name + "' is truncated (" +
+                     std::to_string(t->n_bytes) + " bytes for " +
+                     std::to_string(t->n_elements) + " int32s)";
+            return false;
+        }
+        // ne[0] is the FASTEST axis in GGUF, so the flat copy is token-major:
+        // `per_token` ids per token, `n_tokens` tokens.
+        per_token = static_cast<i32>(t->ne[0]);
+        n_tokens = t->n_dims >= 2 ? static_cast<i32>(t->ne[1]) : 1;
+        if (t->n_dims > 2)
+            n_tokens = static_cast<i32>(t->n_elements / std::max<i64>(1, per_token));
+        out.resize(static_cast<size_t>(t->n_elements));
+        std::memcpy(out.data(), t->data,
+                    static_cast<size_t>(t->n_elements) * sizeof(i32));
+        return true;
+    };
+
     // Uploads a 2-D matmul weight; F32 is downcast to F16 so every GEMM lands
     // on one kernel family.
     // The single f32 of a "<tensor>.scale" sidecar, read straight out of the
@@ -775,6 +853,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         const GgufTensor *t = gguf_.tensor(name);
         if (!t) {
             if (!optional && e) *e = "required weight '" + name + "' is missing";
+            return {};
+        }
+        // An int32 tensor is DATA, not a weight. DeepSeek-V4 ships one per
+        // hash layer -- `ffn_gate_tid2eid.weight`, [n_expert_used, n_vocab]
+        // expert ids -- and the loader reads it as a table. Letting one
+        // through here would put a table of ids where a coefficient matrix
+        // belongs, and the GEMM would read the ids as numbers: finite,
+        // fluent, and not the model. So the format is refused HERE, at the
+        // one place that knows the difference between data and a weight.
+        if (t->type == DType::I32) {
+            if (e)
+                *e = "weight '" + name +
+                     "' is an int32 table (ggml type 26), not a matmul "
+                     "weight; a data tensor has to be read as data";
             return {};
         }
         if (!dtype_supported(t->type)) {
@@ -1287,6 +1379,9 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     }
 
     // ---- per-layer weights ------------------------------------------------
+    // The tensor upload loop: every dense weight the device keeps resident, one
+    // [stats ] load line used to cover this and the mapping together.
+    KRK_TIME_HOST("load.weights");
     // A layer's own head count. The model maximum (`cfg_.n_head`) is only what
     // the shared query workspace is sized against; every per-layer check below
     // has to use this.
@@ -1324,6 +1419,24 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
         L.attn_norm = upload_f32(blk_key("blk.%d.attn_norm.weight", l));
         L.ffn_norm = upload_f32(blk_key("blk.%d.ffn_norm.weight", l));
+        // The two branch post norms. They are NOT the FFN's input norm under
+        // another name -- the file carries `ffn_norm` beside them (gemma3) --
+        // and the fallback below deliberately does not look at them, because
+        // reading `post_attention_norm` as the pre-FFN norm is exactly what
+        // this family's graph does not do: gemma normalizes the attention
+        // output and THEN adds it, so a loader that aliased the two would run
+        // the layer with the right weights in the wrong place.
+        if (cfg_.post_branch_norm) {
+            L.attn_post_norm = upload_f32(blk_key("blk.%d.post_attention_norm.weight", l));
+            L.ffn_post_norm = upload_f32(blk_key("blk.%d.post_ffw_norm.weight", l));
+            if (!L.attn_post_norm || !L.ffn_post_norm) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " is missing a branch post norm (post_attention_norm / "
+                           "post_ffw_norm), which this architecture's graph runs";
+                return false;
+            }
+        }
         // Qwen3.5 renamed the post-attention norm; when the classic key is
         // absent this is the same role (norm before the FFN), so accept either
         // rather than rejecting a checkpoint that spells it differently.
@@ -1416,42 +1529,179 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             }
         } else if (cfg_.mla) {
             // ---- MLA (DeepSeek-V2/V3/V4) --------------------------------
-            // Legacy lite layout: direct attn_q, MQA kv, unsplit wkv_b.
-            // Modern split tensors are refused by name until a file carries
-            // them: falling through to the MHA branch would load attn_q as a
-            // plain query and then fail on the missing attn_k with a message
-            // that names the wrong tensor.
-            if (gguf_.tensor(blk_key("blk.%d.attn_q_a.weight", l)) ||
-                gguf_.tensor(blk_key("blk.%d.attn_kv_a.weight", l))) {
+            // Three layouts, told apart by the TENSORS a layer carries and
+            // NOT by the arch name: one arch can ship more than one, and a
+            // file is what it carries.
+            //
+            //   Legacy  attn_q + attn_kv_a[_mqa] + attn_kv_b     (V2-Lite)
+            //   Split   attn_q[_a/_b] + attn_kv_a[_mqa] +
+            //           attn_k_b/attn_v_b                          (the V3 class)
+            //   Shared  attn_q_a/attn_q_b + attn_kv +
+            //           attn_output_a/attn_output_b                (DeepSeek-V4)
+            //
+            // They differ in the KV path, which is the whole point of MLA.
+            // Legacy and Split compress the KV into a latent and unfold it
+            // per head at runtime; Shared keeps ONE latent for every head
+            // and folds the head count into a GROUPED output projection
+            // instead (n_head heads in n_groups groups, each group through
+            // its own rank-o_lora matrix, the groups summed).
+            //
+            // The old code refused the modern names outright, which was
+            // honest but said nothing: the message named the legacy layout
+            // for a file that carried neither. Now the layout is read, the
+            // tensors are loaded, and the geometry is checked against the
+            // file's own metadata. The ATTENTION itself is still not
+            // implemented here, and that is refused by the ENGINE
+            // (ArchSpec::attention_implemented), not by the loader: the
+            // loader's job is to read what is there, and a loader that
+            // refuses a file it can read teaches nothing about the file.
+            //
+            // The compressed-latent projection has TWO spellings in the
+            // wild: `attn_kv_a_mqa` (what llama.cpp has called it since the
+            // V3 class arrived, and what the V2-Lite exports carry) and
+            // `attn_kv_a` (the name this engine's gap map uses). Both are
+            // read, and the file says which one it has.
+            const bool has_q_a =
+                gguf_.tensor(blk_key("blk.%d.attn_q_a.weight", l)) != nullptr;
+            const bool has_direct_q =
+                gguf_.tensor(blk_key("blk.%d.attn_q.weight", l)) != nullptr;
+            const bool has_kv =
+                gguf_.tensor(blk_key("blk.%d.attn_kv.weight", l)) != nullptr;
+            const bool has_kv_a_mqa =
+                gguf_.tensor(blk_key("blk.%d.attn_kv_a_mqa.weight", l)) != nullptr;
+            const bool has_kv_a =
+                gguf_.tensor(blk_key("blk.%d.attn_kv_a.weight", l)) != nullptr;
+            const bool has_k_b =
+                gguf_.tensor(blk_key("blk.%d.attn_k_b.weight", l)) != nullptr;
+            const bool has_v_b =
+                gguf_.tensor(blk_key("blk.%d.attn_v_b.weight", l)) != nullptr;
+            const bool has_kv_b =
+                gguf_.tensor(blk_key("blk.%d.attn_kv_b.weight", l)) != nullptr;
+
+            MlaLayout layout = MlaLayout::None;
+            if (has_kv)
+                layout = MlaLayout::Shared;
+            else if (has_k_b || has_v_b)
+                layout = MlaLayout::Split;
+            else if (has_kv_b)
+                layout = MlaLayout::Legacy;
+            if (layout == MlaLayout::None) {
                 e = "layer " + std::to_string(l) +
-                    " carries modern split MLA tensors (attn_q_a/attn_kv_a); "
-                    "this build loads the legacy lite layout "
-                    "(attn_q/attn_kv_a_mqa/attn_kv_b) so far";
+                    " carries no recognisable MLA attention block (expected "
+                    "attn_q/attn_kv_a_mqa/attn_kv_b, attn_q_a/attn_kv_a_mqa/"
+                    "attn_k_b/attn_v_b, or attn_q_a/attn_kv/attn_output_a)";
                 if (err) *err = e;
                 return false;
             }
-            L.wq_direct = need(blk_key("blk.%d.attn_q.weight", l));
-            L.wkv_a_mqa = need(blk_key("blk.%d.attn_kv_a_mqa.weight", l));
-            L.wkv_a_norm =
-                upload_f32(blk_key("blk.%d.attn_kv_a_norm.weight", l));
-            L.wkv_b = need(blk_key("blk.%d.attn_kv_b.weight", l));
-            L.wo = need(blk_key("blk.%d.attn_output.weight", l));
-            if (!L.wq_direct.present() || !L.wkv_a_mqa.present() ||
-                !L.wkv_a_norm || !L.wkv_b.present() || !L.wo.present()) {
-                if (e.empty())
-                    e = "layer " + std::to_string(l) +
-                        " has an incomplete MLA attention block";
+            L.mla = true;
+            // Every layer must agree. A file whose layers disagree is a mix,
+            // not a model, and the layer that differs is exactly where a
+            // wrong answer would come from.
+            if (l == 0) {
+                cfg_.mla_layout = layout;
+            } else if (cfg_.mla_layout != layout) {
+                e = "layer " + std::to_string(l) + " carries the " +
+                    mla_layout_name(layout) + " MLA layout but layer 0 carries "
+                    "the " + mla_layout_name(cfg_.mla_layout) + " one";
                 if (err) *err = e;
                 return false;
             }
-            // Geometric sanity: the tensors must agree with the metadata the
-            // ranks came from. A file whose tensors disagree with its own
-            // keys is corrupt, and the message names the tensor and both
-            // shapes.
-            {
-                const i64 want_q =
-                    static_cast<i64>(cfg_.n_head) *
-                    (cfg_.mla_qk_nope + cfg_.mla_qk_rope);
+
+            // The geometry every layout is checked against, off the file's
+            // own metadata: the query trunk's rank, the compressed latent's
+            // rank, the per-head key width (nope + rope) and the value width.
+            const i64 want_q = static_cast<i64>(cfg_.n_head) *
+                               (cfg_.mla_qk_nope + cfg_.mla_qk_rope);
+            auto bad = [&](const char *nm, i64 got_in, i64 want_in,
+                           i64 got_out, i64 want_out) {
+                if (got_in != want_in || got_out != want_out) {
+                    e = "layer " + std::to_string(l) + " '" + nm + "' is [" +
+                        std::to_string(got_in) + " x " +
+                        std::to_string(got_out) + "], metadata wants [" +
+                        std::to_string(want_in) + " x " +
+                        std::to_string(want_out) + "]";
+                    return true;
+                }
+                return false;
+            };
+            auto bad_norm = [&](const char *nm, const GgufTensor *t,
+                                i64 want) {
+                if (!t || t->n_elements == want) return false;
+                e = "layer " + std::to_string(l) + " '" + nm + "' has " +
+                    std::to_string(t->n_elements) +
+                    " elements, metadata wants " + std::to_string(want);
+                return true;
+            };
+
+            // The query trunk. A file with a q_lora_rank carries attn_q_a
+            // (the low-rank projection), its norm and attn_q_b; a file
+            // without one projects the query directly (attn_q). The V3 class
+            // has both forms -- the query trunk and the KV path are
+            // independent choices -- so this is decided by the file, not by
+            // the layout.
+            if (has_q_a) {
+                L.wq_a = need(blk_key("blk.%d.attn_q_a.weight", l));
+                L.wq_a_norm =
+                    upload_f32(blk_key("blk.%d.attn_q_a_norm.weight", l));
+                L.wq_b = need(blk_key("blk.%d.attn_q_b.weight", l));
+                const GgufTensor *tqn =
+                    gguf_.tensor(blk_key("blk.%d.attn_q_a_norm.weight", l));
+                if (!L.wq_a.present() || !L.wq_a_norm || !L.wq_b.present()) {
+                    if (e.empty())
+                        e = "layer " + std::to_string(l) +
+                            " has an incomplete MLA query trunk";
+                    if (err) *err = e;
+                    return false;
+                }
+                if (bad("attn_q_a", L.wq_a.n_in, cfg_.n_embd,
+                        L.wq_a.n_out, cfg_.mla_q_lora) ||
+                    bad("attn_q_b", L.wq_b.n_in, cfg_.mla_q_lora,
+                        L.wq_b.n_out, want_q) ||
+                    bad_norm("attn_q_a_norm", tqn, cfg_.mla_q_lora)) {
+                    if (err) *err = e;
+                    return false;
+                }
+            } else if (has_direct_q) {
+                L.wq_direct = need(blk_key("blk.%d.attn_q.weight", l));
+                if (!L.wq_direct.present() ||
+                    bad("attn_q", L.wq_direct.n_in, cfg_.n_embd,
+                        L.wq_direct.n_out, want_q)) {
+                    if (e.empty())
+                        e = "layer " + std::to_string(l) +
+                            " has an incomplete MLA attention block";
+                    if (err) *err = e;
+                    return false;
+                }
+            } else {
+                e = "layer " + std::to_string(l) +
+                    " carries no MLA query projection (attn_q or attn_q_a)";
+                if (err) *err = e;
+                return false;
+            }
+
+            if (layout == MlaLayout::Legacy) {
+                // ---- legacy lite: MQA kv, unsplit wkv_b --------------------
+                // The compressed latent and the decoupled rope key ride
+                // BESIDE each other (kv_lora + rope wide), and the per-head
+                // K and V are ONE unsplit table: [kv_lora, n_head*(nope+v)].
+                const std::string kv_a =
+                    has_kv_a_mqa ? blk_key("blk.%d.attn_kv_a_mqa.weight", l)
+                                 : blk_key("blk.%d.attn_kv_a.weight", l);
+                L.wkv_a_mqa = need(kv_a);
+                L.wkv_a_norm =
+                    upload_f32(blk_key("blk.%d.attn_kv_a_norm.weight", l));
+                L.wkv_b = need(blk_key("blk.%d.attn_kv_b.weight", l));
+                L.wo = need(blk_key("blk.%d.attn_output.weight", l));
+                const GgufTensor *tn =
+                    gguf_.tensor(blk_key("blk.%d.attn_kv_a_norm.weight", l));
+                if (!L.wkv_a_mqa.present() || !L.wkv_a_norm ||
+                    !L.wkv_b.present() || !L.wo.present()) {
+                    if (e.empty())
+                        e = "layer " + std::to_string(l) +
+                            " has an incomplete MLA attention block";
+                    if (err) *err = e;
+                    return false;
+                }
                 const i64 want_mqa =
                     static_cast<i64>(cfg_.mla_kv_lora + cfg_.mla_qk_rope);
                 const i64 want_kvb =
@@ -1459,35 +1709,162 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     (cfg_.mla_qk_nope + cfg_.mla_v_dim);
                 const i64 want_wo =
                     static_cast<i64>(cfg_.n_head) * cfg_.mla_v_dim;
-                const GgufTensor *tn =
-                    gguf_.tensor(blk_key("blk.%d.attn_kv_a_norm.weight", l));
-                auto bad = [&](const char *nm, i64 got_in, i64 want_in,
-                               i64 got_out, i64 want_out) {
-                    if (got_in != want_in || got_out != want_out) {
-                        e = "layer " + std::to_string(l) + " '" + nm +
-                            "' is [" + std::to_string(got_in) + " x " +
-                            std::to_string(got_out) + "], metadata wants [" +
-                            std::to_string(want_in) + " x " +
-                            std::to_string(want_out) + "]";
-                        return true;
-                    }
-                    return false;
-                };
-                if (bad("attn_q", L.wq_direct.n_in, cfg_.n_embd,
-                        L.wq_direct.n_out, want_q) ||
-                    bad("attn_kv_a_mqa", L.wkv_a_mqa.n_in, cfg_.n_embd,
+                if (bad("attn_kv_a", L.wkv_a_mqa.n_in, cfg_.n_embd,
                         L.wkv_a_mqa.n_out, want_mqa) ||
                     bad("attn_kv_b", L.wkv_b.n_in, cfg_.mla_kv_lora,
                         L.wkv_b.n_out, want_kvb) ||
                     bad("attn_output", L.wo.n_in, want_wo, L.wo.n_out,
                         cfg_.n_embd) ||
-                    (tn && tn->n_elements != cfg_.mla_kv_lora)) {
-                    if (tn && tn->n_elements != cfg_.mla_kv_lora && e.empty())
+                    bad_norm("attn_kv_a_norm", tn, cfg_.mla_kv_lora)) {
+                    if (err) *err = e;
+                    return false;
+                }
+                // ---- the f16 copy the attention kernel reads ----------------
+                // attn_kv_b is a BLOCKED quantized table, and MLA reads it as
+                // one small [kv_lora, nope+v] matrix per head folded into the
+                // score and the value -- not as the `gemm()` shape a quantized
+                // weight is uploaded for. Dequantizing it once here keeps the
+                // kernel's index arithmetic identical to the file's and the
+                // host oracle's, which is what makes a mismatch arithmetic
+                // rather than a different weight; the block walk is the same
+                // `dequant_row` every other path uses, so there is no second
+                // quantizer to be wrong in a slightly different way.
+                {
+                    const GgufTensor *tb =
+                        gguf_.tensor(blk_key("blk.%d.attn_kv_b.weight", l));
+                    const i64 n_in = cfg_.mla_kv_lora;
+                    const i64 n_out = want_kvb;
+                    const size_t nelem =
+                        static_cast<size_t>(n_in) * static_cast<size_t>(n_out);
+                    const size_t rb = dtype_row_bytes(tb->type, n_in);
+                    std::vector<f32> row(static_cast<size_t>(n_in));
+                    std::vector<u16> half(nelem);
+                    const u8 *src = static_cast<const u8 *>(tb->data);
+                    for (i64 r = 0; r < n_out; r++) {
+                        // The file is row-major over [n_head*(nope+v)] rows of
+                        // kv_lora: `row(m)` is the m-th row of the SAME flat
+                        // array the quantized tensor holds, so the staging
+                        // copies bytes and nothing else.
+                        dequant_row(tb->type, src + static_cast<size_t>(r) * rb,
+                                    row.data(), n_in);
+                        for (i64 k = 0; k < n_in; k++)
+                            half[static_cast<size_t>(r * n_in + k)] =
+                                fp32_to_fp16(row[static_cast<size_t>(k)]);
+                    }
+                    void *dst = be.alloc(nelem * 2);
+                    if (!dst) {
+                        if (err)
+                            *err = "layer " + std::to_string(l) +
+                                   ": could not allocate " +
+                                   std::to_string(nelem * 2 / 1048576u) +
+                                   " MiB for the MLA f16 staging";
+                        return false;
+                    }
+                    upload_timed(dst, half.data(), nelem * 2);
+                    L.wkv_b16.data = dst;
+                    L.wkv_b16.type = DType::F16;
+                    L.wkv_b16.n_in = n_in;
+                    L.wkv_b16.n_out = n_out;
+                }
+            } else if (layout == MlaLayout::Split) {
+                // ---- V3 class: a COMPRESSED latent, and the per-head K and
+                // V as two separate tables ----------------------------------
+                // The latent is compressed (kv_lora wide) and the decoupled
+                // rope key rides BESIDE it, so the projection is
+                // [n_embd, kv_lora + rope] and the norm covers the latent
+                // ALONE. attn_k_b is [nope, kv_lora, n_head] and attn_v_b is
+                // [kv_lora, v_dim, n_head] -- both three-dimensional, one
+                // matrix per head, and in both the contraction index is ne[0]
+                // (the K table folds the query's nope part, the V table folds
+                // the latent).
+                const std::string kv_a =
+                    has_kv_a_mqa ? blk_key("blk.%d.attn_kv_a_mqa.weight", l)
+                                 : blk_key("blk.%d.attn_kv_a.weight", l);
+                L.wkv_a = need(kv_a);
+                L.wkv_norm = upload_f32(blk_key("blk.%d.attn_kv_a_norm.weight", l));
+                L.wk_b = need(blk_key("blk.%d.attn_k_b.weight", l));
+                L.wv_b = need(blk_key("blk.%d.attn_v_b.weight", l));
+                L.wo = need(blk_key("blk.%d.attn_output.weight", l));
+                const GgufTensor *tkn =
+                    gguf_.tensor(blk_key("blk.%d.attn_kv_a_norm.weight", l));
+                if (!L.wkv_a.present() || !L.wkv_norm || !L.wk_b.present() ||
+                    !L.wv_b.present() || !L.wo.present()) {
+                    if (e.empty())
                         e = "layer " + std::to_string(l) +
-                            " 'attn_kv_a_norm' has " +
-                            std::to_string(tn->n_elements) +
-                            " elements, metadata wants " +
-                            std::to_string(cfg_.mla_kv_lora);
+                            " has an incomplete split MLA attention block";
+                    if (err) *err = e;
+                    return false;
+                }
+                const i64 want_kva =
+                    static_cast<i64>(cfg_.mla_kv_lora + cfg_.mla_qk_rope);
+                const i64 want_kb =
+                    static_cast<i64>(cfg_.mla_kv_lora) * cfg_.n_head;
+                const i64 want_vb =
+                    static_cast<i64>(cfg_.mla_v_dim) * cfg_.n_head;
+                const i64 want_wo =
+                    static_cast<i64>(cfg_.n_head) * cfg_.mla_v_dim;
+                if (bad("attn_kv_a", L.wkv_a.n_in, cfg_.n_embd,
+                        L.wkv_a.n_out, want_kva) ||
+                    bad("attn_k_b", L.wk_b.n_in, cfg_.mla_qk_nope,
+                        L.wk_b.n_out, want_kb) ||
+                    bad("attn_v_b", L.wv_b.n_in, cfg_.mla_kv_lora,
+                        L.wv_b.n_out, want_vb) ||
+                    bad("attn_output", L.wo.n_in, want_wo, L.wo.n_out,
+                        cfg_.n_embd) ||
+                    bad_norm("attn_kv_a_norm", tkn, cfg_.mla_kv_lora)) {
+                    if (err) *err = e;
+                    return false;
+                }
+            } else {
+                // ---- V4: ONE shared latent, a GROUPED output projection ----
+                // The latent is not compressed per head: one row of
+                // key_length serves every head, and the rope is its TAIL
+                // (the last rope_dim of it), so the norm covers the whole
+                // latent. The head count is folded into the output
+                // projection instead: attn_output_a is
+                // [n_head*key_length/o_groups, o_lora_rank*o_groups] in the
+                // file and attn_output_b is
+                // [o_lora_rank*o_groups, n_embd] -- the groups are summed on
+                // the way out.
+                if (cfg_.dsv4_o_groups <= 0 || cfg_.dsv4_o_lora <= 0) {
+                    e = "layer " + std::to_string(l) +
+                        ": the shared-latent MLA layout needs "
+                        "attention.output_group_count and "
+                        "attention.output_lora_rank, and the file has none";
+                    if (err) *err = e;
+                    return false;
+                }
+                L.wkv = need(blk_key("blk.%d.attn_kv.weight", l));
+                L.wkv_norm = upload_f32(blk_key("blk.%d.attn_kv_a_norm.weight", l));
+                L.wo_a = need(blk_key("blk.%d.attn_output_a.weight", l));
+                L.wo_b = need(blk_key("blk.%d.attn_output_b.weight", l));
+                const GgufTensor *tkn =
+                    gguf_.tensor(blk_key("blk.%d.attn_kv_a_norm.weight", l));
+                if (!L.wkv.present() || !L.wkv_norm || !L.wo_a.present() ||
+                    !L.wo_b.present()) {
+                    if (e.empty())
+                        e = "layer " + std::to_string(l) +
+                            " has an incomplete shared-latent MLA attention "
+                            "block";
+                    if (err) *err = e;
+                    return false;
+                }
+                // The shared latent is key_length wide: nope + rope, the rope
+                // being the tail.
+                const i64 want_latent =
+                    static_cast<i64>(cfg_.mla_qk_nope + cfg_.mla_qk_rope);
+                const i64 want_woa_in =
+                    static_cast<i64>(cfg_.n_head) * want_latent /
+                    cfg_.dsv4_o_groups;
+                const i64 want_woa_out =
+                    static_cast<i64>(cfg_.dsv4_o_lora) * cfg_.dsv4_o_groups;
+                if (bad("attn_kv", L.wkv.n_in, cfg_.n_embd,
+                        L.wkv.n_out, want_latent) ||
+                    bad("attn_output_a", L.wo_a.n_in, want_woa_in,
+                        L.wo_a.n_out, want_woa_out) ||
+                    bad("attn_output_b", L.wo_b.n_in, want_woa_out,
+                        L.wo_b.n_out, cfg_.n_embd) ||
+                    bad_norm("attn_kv_a_norm", tkn, want_latent)) {
                     if (err) *err = e;
                     return false;
                 }
@@ -1636,6 +2013,40 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // only *described* here — nothing is uploaded, which is what keeps
             // a 235B-A22B model from needing 235B of VRAM at load time.
             L.router = need(blk_key("blk.%d.ffn_gate_inp.weight", l));
+            // DeepSeek-V4's HASH ROUTE: the first `hash_layer_count` layers do
+            // not pick their experts from the router at all. The file carries
+            // a table of expert ids per TOKEN ID, and a token's route is a
+            // lookup in it. The table is an int32 tensor
+            // ([n_expert_used, n_vocab] ids), which is DATA, not a weight: it
+            // is read as integers, on the host, and never multiplied.
+            // Reading it as a weight would be wrong twice over -- the format
+            // is not one the device can dequantize, and the numbers are ids,
+            // not coefficients.
+            if (cfg_.dsv4 && l < cfg_.dsv4_hash_layers) {
+                i32 per_token = 0, n_tokens = 0;
+                std::string te;
+                if (!read_i32_table(blk_key("blk.%d.ffn_gate_tid2eid.weight", l),
+                                    L.tid2eid, per_token, n_tokens, &te)) {
+                    if (err) *err = te;
+                    return false;
+                }
+                L.tid2eid_per_token = per_token;
+                L.tid2eid_n_tokens = n_tokens;
+                // The geometry is the file's own: one id per selected expert,
+                // one column per token id. A table of another shape is another
+                // route, and looking it up anyway would send a token to an
+                // expert the file never named.
+                if (per_token != cfg_.n_expert_used || n_tokens != cfg_.n_vocab) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) +
+                               ": ffn_gate_tid2eid is [" + std::to_string(per_token) +
+                               " x " + std::to_string(n_tokens) +
+                               "], metadata wants [" +
+                               std::to_string(cfg_.n_expert_used) + " x " +
+                               std::to_string(cfg_.n_vocab) + "]";
+                    return false;
+                }
+            }
             // A per-expert selection bias (laguna): added to the router's
             // *probabilities* before the top-k, and deliberately not to the
             // weights the selected experts are mixed with.
@@ -1933,11 +2344,33 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             return false;
         }
         if (L.moe) {
+            // ---- how many experts THIS layer has --------------------------
+            // `expert_count` is the model's count; a REAP export prunes each
+            // layer independently and records what each layer KEPT in
+            // `reap.layer.keep_count` (one entry per block).
+            // `reap.layer.expert_count` is the count BEFORE pruning -- 256 on
+            // the V4 file here, against 160 in every bank -- so reading that
+            // one would trade one wrong expectation for another. Where
+            // keep_count is present it is this layer's truth, and the router
+            // and the routed bank are both checked against it, because the
+            // router is 160 wide to match the 160-expert bank. Without the key
+            // the expert_count check stands: a pruned bank and a corrupt one
+            // look the same from the tensors alone.
+            const std::vector<i32> *reap_kept =
+                gguf_.get_i32_array("reap.layer.keep_count");
+            const i32 want_expert =
+                (reap_kept && l < static_cast<i32>(reap_kept->size()) &&
+                 (*reap_kept)[l] > 0)
+                    ? (*reap_kept)[l]
+                    : cfg_.n_expert;
             // ---- router geometry ------------------------------------------
-            if (L.router.n_out != cfg_.n_expert || L.router.n_in != cfg_.n_embd) {
+            if (L.router.n_out != want_expert || L.router.n_in != cfg_.n_embd) {
                 if (err)
-                    *err = "layer " + std::to_string(l) +
-                           " router disagrees with expert_count/embedding_length";
+                    *err = "layer " + std::to_string(l) + " router is [" +
+                           std::to_string(L.router.n_in) + " x " +
+                           std::to_string(L.router.n_out) +
+                           "], metadata wants [" + std::to_string(cfg_.n_embd) +
+                           " x " + std::to_string(want_expert) + "]";
                 return false;
             }
             // ---- routed-expert geometry (per-layer) ---------------------
@@ -1967,11 +2400,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     L.experts.n_embd = static_cast<i64>(src->ne[0]);
                 }
             }
-            if (L.experts.n_expert != cfg_.n_expert ||
+            if (L.experts.n_expert != want_expert ||
                 L.experts.n_ff_exp != cfg_.n_ff_exp) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
-                           " routed-expert tensors disagree with the metadata";
+                           " routed-expert tensors are [" +
+                           std::to_string(L.experts.n_expert) + " x " +
+                           std::to_string(L.experts.n_ff_exp) +
+                           "], metadata wants [" + std::to_string(want_expert) +
+                           " x " + std::to_string(cfg_.n_ff_exp) + "]";
                 return false;
             }
             if (L.shexp_gate.present() && L.shexp_gate.n_out != cfg_.n_ff_shexp) {
@@ -2141,6 +2578,12 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     };
     if (cfg_.rope_yarn) {
         const f32 factor = cfg_.rope_scale;
+        // Kept for MLA's softmax scale, which the reference builds from these
+        // two numbers (see ModelConfig::rope_yarn_log_mul). The frequency table
+        // above does not need them; the attention scale does.
+        cfg_.rope_yarn_factor = factor;
+        cfg_.rope_yarn_log_mul = static_cast<f32>(
+            gguf_.get_f64(key(".rope.scaling.yarn_log_multiplier"), 0.0));
         const i32 orig = static_cast<i32>(gguf_.get_i64(
             key(".rope.scaling.original_context_length"), cfg_.n_ctx_train));
         const f32 beta_fast = static_cast<f32>(
@@ -2230,6 +2673,32 @@ bool Model::load_mtp_block(std::string *err) {
             return false;
         }
         const std::string side_arch = mtp_gguf_->get_str("general.architecture", "");
+        // A file whose tensors are all `mtp.*` is an MTP head, and that is
+        // decided by its TENSORS, not by its header: the converters disagree on
+        // the spelling ("qwen4exp-mtp" for the q2_0 repack, "qwen4-mtp" for the
+        // BF16 original of the same 31 tensors), and a header comparison refused
+        // one of them as "another family" when it is the same head.
+        i32 hf_tensors = 0;
+        for (const GgufTensor &t : mtp_gguf_->tensors())
+            if (t.name.rfind("mtp.", 0) == 0) ++hf_tensors;
+        if (hf_tensors > 0) {
+            // ... and it is the same head this trunk's own block would be, in HF
+            // names and in a shape this loader does not run: `load_mtp_block_from`
+            // expects `blk.N.attn_*` + `blk.N.ffn_*`, while these blocks carry a
+            // hyper-connection mixer, a QSA indexer's attention and their own
+            // routed MoE. Named here so the gap is the file's own -- refusing it
+            // as "not a nextn block" was both wrong and unhelpful.
+            if (err)
+                *err = mtp_path_ + " carries " + std::to_string(hf_tensors) +
+                       " `mtp.*` tensor(s): the same head this trunk's own block "
+                       "would be, in HF names and in a shape this loader does not "
+                       "run (hyper-connection mixer, QSA indexer attention, its own "
+                       "routed MoE). Reading it needs that forward; the verify loop "
+                       "(--mtp-spec) is already here and unchanged. See "
+                       "docs/AUDIT-mtp-drafter.md.";
+            mtp_gguf_.reset();
+            return false;
+        }
         if (!side_arch.empty() && side_arch != cfg_.arch) {
             if (err)
                 *err = mtp_path_ + " is a '" + side_arch + "' file and this model "
@@ -2738,6 +3207,8 @@ void Model::unload() {
     experts_.clear();
     for (auto &L : layers_) {
         if (L.attn_norm) be_->release(L.attn_norm);
+        if (L.attn_post_norm) be_->release(L.attn_post_norm);
+        if (L.ffn_post_norm) be_->release(L.ffn_post_norm);
         if (L.ffn_norm) be_->release(L.ffn_norm);
         if (L.q_bias) be_->release(L.q_bias);
         if (L.k_bias) be_->release(L.k_bias);
@@ -2746,6 +3217,8 @@ void Model::unload() {
         if (L.k_norm) be_->release(L.k_norm);
         if (L.sinks) be_->release(L.sinks);
         if (L.wkv_a_norm) be_->release(L.wkv_a_norm);
+        if (L.wq_a_norm) be_->release(L.wq_a_norm);
+        if (L.wkv_norm) be_->release(L.wkv_norm);
         // Device-resident like every other 1-D weight: the wo GEMM and the
         // expert groups read them on the device.
         for (f32 *f : {L.wo_bias, L.exp_gate_bias, L.exp_up_bias, L.exp_down_bias})

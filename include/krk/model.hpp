@@ -60,6 +60,11 @@ struct LayerWeights {
     // one launch with the same shape as `add_bias_cols`.
     f32 *wo_bias = nullptr;
     f32 *ffn_norm = nullptr; // f32 [n_embd]
+    // Branch post norms (gemma2/3/4, muse-glimmer): applied to the sub-block's
+    // output BEFORE the residual add, each with its own weight. Null on every
+    // other family, and null is what keeps their graph unchanged.
+    f32 *attn_post_norm = nullptr; // f32 [n_embd]
+    f32 *ffn_post_norm = nullptr;  // f32 [n_embd]
     QuantTensor wgate, wup, wdown;
 
     // ---- qwen4exp: hyper-connections, PLE, indexer (optional) ------------
@@ -131,12 +136,67 @@ struct LayerWeights {
     // attn_kv_a_mqa emits [kv_lora + rope] (latent plus decoupled key);
     // attn_kv_a_norm norms the latent at write; attn_kv_b is the UNSPLIT
     // legacy table [kv_lora, n_head*(nope+v)]. wo is the shared output.
-    // Modern split names (attn_q_a/attn_q_b/attn_kv_a/attn_k_b/attn_v_b) are
-    // refused by name until a file carries them -- see Model::load.
+    // This layer runs multi-head latent attention. Set by the loader from the
+    // tensors the block carries; the geometry that follows from it (a
+    // kv_lora+rope cache row, no per-head K/V) lives on Model, because it is
+    // the same question `layer_has_kv()` asks.
+    bool mla = false;
     QuantTensor wq_direct;    // [n_embd, n_head*(nope+rope)]
     QuantTensor wkv_a_mqa;    // [n_embd, kv_lora + rope]
     f32 *wkv_a_norm = nullptr;  // DEVICE f32[kv_lora], like every norm
     QuantTensor wkv_b;        // [kv_lora, n_head*(nope+v_dim)]
+    // The same table, dequantized to f16 in the FILE's own element order
+    // ([kv_lora, n_head*(nope+v_dim)] row-major: feature j at row j, the latent
+    // k its fastest axis), because MLA reads it as 27 small matrices folded
+    // into score and value -- a shape `gemm()` cannot address, since head h
+    // owns a COLUMN slice of a row-major matrix and the rows interleave the
+    // heads. Staged once at load, so the kernel's indices are the file's
+    // indices and a mismatch is arithmetic rather than a different weight.
+    QuantTensor wkv_b16;
+
+    // ---- MLA modern split (DeepSeek-V3 class / V4) ------------------------
+    // The query trunk: attn_q_a [n_embd, q_lora] -> attn_q_a_norm ->
+    // attn_q_b [q_lora, n_head*(nope+rope)]. The latent KV path is one of two
+    // shapes, told apart by the tensors the layer carries:
+    //
+    //   Split   attn_kv_a [n_embd, kv_lora+rope] with the rms norm over that
+    //           whole row, and the per-head K and V as two separate tables
+    //           attn_k_b [kv_lora, n_head*nope] and attn_v_b
+    //           [kv_lora, n_head*v_dim] (the V3 class);
+    //   Shared  ONE shared latent attn_kv [n_embd, key_length] with the norm
+    //           over it, the rope living in its TAIL rather than beside it
+    //           (V4).
+    //
+    // The output projection follows the same split: a plain attn_output on V3,
+    // a grouped pair attn_output_a [n_embd, o_lora_rank*n_groups] and
+    // attn_output_b [o_lora_rank*n_groups, n_embd] on V4.
+    QuantTensor wq_a;          // [n_embd, q_lora]
+    f32 *wq_a_norm = nullptr;  // DEVICE f32[q_lora], the query trunk's norm
+    QuantTensor wq_b;          // [q_lora, n_head*(nope+rope)]
+    QuantTensor wkv;           // Shared: [n_embd, key_length]
+    f32 *wkv_norm = nullptr;   // the latent's rms gamma
+    QuantTensor wkv_a;         // Split: [n_embd, kv_lora+rope]
+    QuantTensor wk_b;          // Split: [kv_lora, n_head*nope]
+    QuantTensor wv_b;          // Split: [kv_lora, n_head*v_dim]
+    QuantTensor wo_a;          // Shared: [n_embd, o_lora_rank*n_groups]
+    QuantTensor wo_b;          // Shared: [o_lora_rank*n_groups, n_embd]
+
+    // The hash route's expert-id table (DeepSeek-V4): `ffn_gate_tid2eid.weight`
+    // is an INT32 tensor -- ggml type 26 -- holding one row per selected
+    // expert and one column per token id. It is DATA, not a weight: it is
+    // read as integers and looked up, never multiplied. Host memory, because
+    // the route is a host-side lookup (the same reason the router bias is).
+    // Empty on every other family.
+    //
+    // The copy is the file's own flat array, and GGUF's ne[0] is the FASTEST
+    // axis, so the layout is TOKEN-major: `tid2eid[token * tid2eid_per_token
+    // + slot]` is the expert id the file names for that token and that slot.
+    // The two counts are the tensor's ne[0] and ne[1] -- the per-token slot
+    // count and the token count -- and they are what the loader checks the
+    // file's metadata against.
+    std::vector<i32> tid2eid;
+    i32 tid2eid_per_token = 0;
+    i32 tid2eid_n_tokens = 0;
 
     // ---- gated delta net (Qwen3.5 / Qwen3-Next, optional) ---------------
     // A recurrent layer replaces attention with a short depthwise convolution
@@ -192,6 +252,25 @@ inline f32 apply_logit_softcap(f32 x, f32 cap) {
     return cap > 0.0f ? cap * std::tanh(x / cap) : x;
 }
 
+// Which MLA attention layout a file carries. The three are told apart by the
+// TENSORS a layer holds, not by the arch name: an arch can ship more than one
+// and a file is what it carries.
+//
+//   Legacy  attn_q + attn_kv_a_mqa + attn_kv_b          (DeepSeek-V2-Lite)
+//   Split   attn_q_a/attn_q_b + attn_kv_a + attn_k_b/attn_v_b
+//                                                      (the V3 class)
+//   Shared  attn_q_a/attn_q_b + attn_kv + attn_output_a/attn_output_b
+//                                                      (DeepSeek-V4)
+//
+// The difference is the KV path, which is the whole point of MLA. Legacy and
+// Split compress the KV into a latent and unfold it per head at runtime;
+// Shared keeps ONE latent for every head and folds the head count into a
+// GROUPED output projection instead.
+enum class MlaLayout { None, Legacy, Split, Shared };
+
+// The layout's name, for a refusal message. "none" for MlaLayout::None.
+const char *mla_layout_name(MlaLayout l);
+
 struct ModelConfig {
     std::string arch = "llama";
     std::string name;
@@ -228,6 +307,21 @@ struct ModelConfig {
     // 15/16 of it and yields a fluent-but-wrong model on *every* path. The
     // stored tensor width is what tells them apart (see model.cpp).
     bool qk_norm_wide = false;
+
+    // ---- per-branch post norms (gemma2/3/4, muse-glimmer) ------------------
+    // `x + norm(attn_out)` rather than `x + attn_out`: each sub-block's output is
+    // RMS-normed with its OWN weight before it reaches the residual, which also
+    // means the projection cannot fold its residual store into the GEMM epilogue
+    // (the norm has to read the projection first).
+    bool post_branch_norm = false;
+    f32 post_norm_eps = 0.0f; // 0 keeps rms_eps (muse-glimmer's are 1e-8)
+    // The gate activation differs by family while the tensor shape does not:
+    // laguna softplus's `attn_gate`, muse-glimmer sigmoids it.
+    bool attn_gate_sigmoid = false;
+    // gelu(gate) * up instead of silu(gate) * up (gemma).
+    bool gelu_ffn = false;
+    // Rotate only on the windowed layers (muse-glimmer's full layers are NoPE).
+    bool rope_swa_only = false;
 
     // ---- hybrid full / sliding-window attention (laguna) ------------------
     // Some archs alternate layer kinds. Every layer whose index is not a
@@ -303,6 +397,9 @@ struct ModelConfig {
     i32 mla_qk_nope = 0;  // derived: key_length - rope_dim
     i32 mla_qk_rope = 0;  // = rope_dim for MLA (the rotation covers the tail)
     i32 mla_v_dim = 0;    // = value_length
+    // Which of the three layouts this file carries, decided by the loader
+    // from the tensors and required to be the SAME on every layer.
+    MlaLayout mla_layout = MlaLayout::None;
     // ---- DeepSeek-V4 extras -------------------------------------------
     // Dense-core grouping (wo_a/wo_b), the sliding window, the hash-route
     // layer count, the compressed-rope base and the per-layer compression
@@ -360,6 +457,16 @@ struct ModelConfig {
     // whether `rope_scale` has already been folded into `inv_freq` and must be
     // left at 1.0 for the rotation op.
     bool rope_yarn = false;
+    // The file's rope.scaling.factor and rope.scaling.yarn_log_multiplier, kept
+    // because MLA's softmax scale is built from them: DeepSeek's mscale is
+    // 1 + 0.1 * log_mul * ln(factor), and the attention scale is mscale^2 /
+    // sqrt(key_length) (llama.cpp deepseek2, TAG_DEEPSEEK2_YARN_LOG_MUL_FIX).
+    // A 5% scale error here does not look like a bug in any single token -- it
+    // looks like a model that answers in the right voice and picks a different
+    // word a few steps in, which is why it has to be read rather than assumed
+    // to be 1.0. Defaults are the no-YaRN values (1.0 and 0.0).
+    f32 rope_yarn_factor = 1.0f;
+    f32 rope_yarn_log_mul = 0.0f;
     // 1 = sum-normalize the selected expert weights, 0 = keep the raw
     // probabilities, -1 = the file does not declare the key. The engine has
     // always normalized, and every model in the collection that *does* declare
@@ -540,7 +647,15 @@ public:
     }
 
     i64 n_ctx() const { return cfg_.n_ctx_train; }
-    i64 kv_dim() const { return static_cast<i64>(cfg_.n_head_kv) * cfg_.head_dim; }
+    // Widest KV row on the whole stack. An MLA row is latent + decoupled key,
+    // which need not be wider or narrower than n_kv x head_dim (V2-Lite: 576
+    // against 3072), so the maximum is what anything sized off this must hold.
+    i64 kv_dim() const {
+        const i64 head_geom = static_cast<i64>(cfg_.n_head_kv) * cfg_.head_dim;
+        if (cfg_.mla_kv_lora <= 0) return head_geom;
+        const i64 mla = static_cast<i64>(cfg_.mla_kv_lora) + cfg_.mla_qk_rope;
+        return mla > head_geom ? mla : head_geom;
+    }
     // Widest query projection any layer asks for. A model with a per-layer head
     // count (laguna) is smaller on some layers than others, so this is what a
     // shared workspace has to be sized against; the width of one particular
@@ -567,16 +682,29 @@ public:
             return cfg_.n_head_kv;
         return cfg_.n_head_kv_layer[static_cast<size_t>(layer)];
     }
+    // True when this layer runs multi-head latent attention.
+    bool layer_is_mla(i32 layer) const {
+        return layer >= 0 && layer < static_cast<i32>(layers_.size()) &&
+               layers_[static_cast<size_t>(layer)].mla;
+    }
     i64 kv_dim_at(i32 layer) const {
+        // An MLA layer's row is the compressed latent followed by the
+        // decoupled rope key, so it is NOT n_kv x head_dim: header says
+        // n_kv = 16 and the row is 576 (V2-Lite), which is the whole point of
+        // the compression. Reading the head geometry here would size the plane
+        // 5x too wide and the kernel would read every row past its end.
+        if (layer_is_mla(layer))
+            return static_cast<i64>(cfg_.mla_kv_lora) + cfg_.mla_qk_rope;
         return static_cast<i64>(n_head_kv_at(layer)) * cfg_.head_dim;
     }
-    // True when this layer reads and writes KV: the ones carrying q/k/v. A
-    // mamba/SSM block and a pure-MoE block append nothing, so they hold no KV,
-    // are charged for none, and get no plane in the cache. This is the same
-    // predicate the engine's attention branch uses.
+    // True when this layer reads and writes KV: the ones carrying q/k/v or an
+    // MLA latent. A mamba/SSM block and a pure-MoE block append nothing, so
+    // they hold no KV, are charged for none, and get no plane in the cache.
+    // This is the same predicate the engine's attention branch uses.
     bool layer_has_kv(i32 layer) const {
         return layer >= 0 && layer < static_cast<i32>(layers_.size()) &&
-               layers_[static_cast<size_t>(layer)].wq.present();
+               (layers_[static_cast<size_t>(layer)].wq.present() ||
+                layers_[static_cast<size_t>(layer)].mla);
     }
     size_t kv_layer_count() const {
         size_t n = 0;
