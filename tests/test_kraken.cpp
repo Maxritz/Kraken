@@ -3245,8 +3245,8 @@ static void test_arch_table() {
           "and it is a draft file rather than a model");
     CHECK(arch_lookup("qwen4exp") != nullptr, "the qwen4exp family is in the table");
     CHECK(arch_lookup("qwen4exp")->role == ArchRole::Target &&
-              arch_lookup("qwen4exp")->support == ArchSupport::No,
-          "as a refused target rather than an unlisted arch");
+              arch_lookup("qwen4exp")->support == ArchSupport::Yes,
+          "as a supported target rather than an unlisted arch");
     // RecurrentMoe, and that is now the honest shape: the delta net's tensors
     // ARE this engine's (attn_qkv is [q|k|v] of 2048/2048/6144, attn_gate is the
     // z gate, ssm_* are the same names gdn_forward reads), so the refusal is the
@@ -3494,11 +3494,9 @@ static void test_load_verdict() {
         made.push_back(path);
     }
 
-    // qwen4exp: a refused family whose *shape* is load-bearing. Declared
-    // recurrent, the gap map exempts attn_qkv/attn_gate/ssm_* -- the gated delta
-    // net implements those names -- and the file would be refused by name with
-    // nothing said about what is actually missing. As Moe, the family reason and
-    // the tensor reason are both reported, which is the point of the entry.
+    // qwen4exp is a supported recurrent-MoE target. The verdict must accept
+    // its delta-net tensors rather than treating their names as gaps; the full
+    // graph and support claim are pinned by test_qwen4exp_whole_graph.
     {
         const std::string path = build_verdict_fixture(
             "qwen4exp", "qwen4exp", "blk.0.attn_qkv.weight", 0, 0);
@@ -3508,16 +3506,14 @@ static void test_load_verdict() {
         CHECK(g.load(path, &err), "the fixture loads");
         const ModelVerdict v = assess_model(g);
         CHECK(v.known && v.arch == "qwen4exp", "qwen4exp is a known family");
-        CHECK(!v.runnable, "and it is refused");
-        CHECK(v.headline().find("not supported") != std::string::npos,
-              "the headline says not supported, not unknown");
-        bool family = false, graph = false;
-        for (const std::string &b : v.blockers) {
-            if (b.find("hyper-connection") != std::string::npos) family = true;
-            if (b.find("QSA") != std::string::npos) graph = true;
-        }
-        CHECK(family, "the family reason is reported");
-        CHECK(graph, "and the graph pieces still missing are named beside it");
+        CHECK(v.runnable, "and it is supported");
+        CHECK(v.headline().find("supported") != std::string::npos,
+              "the headline says supported, not unknown");
+        bool tensor_gap = false;
+        for (const std::string &b : v.blockers)
+            if (b.find("does not implement") != std::string::npos) tensor_gap = true;
+        CHECK(!tensor_gap, "the recurrent delta-net tensor is not reported as a gap");
+        CHECK(v.blockers.empty(), "the supported qwen4exp schema has no blockers");
         made.push_back(path);
     }
 

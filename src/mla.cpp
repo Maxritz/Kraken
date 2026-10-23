@@ -216,7 +216,7 @@ void mla_rope_norm(f32 *v, i64 n, i64 pos, const f32 *inv_freq) {
     if (!v || !inv_freq || n <= 0) return;
     for (i64 i = 0; i + 1 < n; i += 2) {
         const f32 ang = static_cast<f32>(pos) * inv_freq[i / 2];
-        const f32 c = std::cosf(ang), s = std::sinf(ang);
+        const f32 c = std::cos(ang), s = std::sin(ang);
         const f32 a = v[i], b = v[i + 1];
         v[i] = a * c - b * s;
         v[i + 1] = a * s + b * c;

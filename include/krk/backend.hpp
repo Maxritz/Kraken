@@ -24,6 +24,17 @@ namespace krk {
 
 enum class BackendKind { CPU, HIP };
 
+// A per-shard weight pull source. The loader passes a table of these; the
+// backend turns a source pointer back into a file offset by checking which
+// source's range contains the pointer (integer containment, not pointer
+// comparison across unrelated mappings).
+struct WeightSource {
+    std::string path;
+    const u8 *map_base = nullptr;
+    size_t map_size = 0;
+    size_t data_off = 0; // tensor data section within this shard
+};
+
 // GELU, the tanh approximation (ggml's ggml_gelu):
 //   0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3)))
 // One definition for both backends, because the CPU arm is the reference the
@@ -490,7 +501,7 @@ public:
         upload(dst, src, bytes, off);
         return true;
     }
-    // Optional hook for pull-style weight loading; see HipBackend::set_weight_pull.
+    // Optional hook for pull-style weight loading; see HipBackend::set_weight_sources.
     //
     // Large weights are better read() out of the file than DMA'd straight from
     // the mapping: a cold mapping faults one 4 KiB page at a time (measured
@@ -502,9 +513,20 @@ public:
     // mapping and `data_off` its tensor data section, which together let the
     // backend turn a source pointer back into a file offset. A backend that
     // ignores this keeps the direct copy.
+    //
+    // The shard table lets each tensor's data live in a different shard's mapping.
+    // Each entry is { path, map_base, map_size, data_off } — the backend turns a
+    // source pointer into a file offset by checking which source contains it (integer
+    // range check, not pointer comparison across unrelated mappings).
+    virtual void set_weight_sources(const std::vector<WeightSource> &sources) {
+        (void)sources;
+    }
+    // Legacy wrapper: one source = the old single-shard fast path.
     virtual void set_weight_pull(const std::string &path, const void *map_base,
                                  size_t map_size, size_t data_off) {
-        (void)path; (void)map_base; (void)map_size; (void)data_off;
+        std::vector<WeightSource> sources;
+        sources.push_back({path, static_cast<const u8 *>(map_base), map_size, data_off});
+        set_weight_sources(sources);
     }
     virtual void download(void *dst, const void *src, size_t bytes, size_t off = 0) = 0;
 

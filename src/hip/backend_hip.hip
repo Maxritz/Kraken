@@ -1155,91 +1155,87 @@ public:
         // opposite fixes. A merged label is worse than no label: it reads
         // like an answer.
         KRK_TIME_OP("warm_read(single)");
-        const u8 *s = static_cast<const u8 *>(mapped_src);
-        if (pull_path_.empty() || !pull_map_ || pull_disabled_ || s < pull_map_ ||
-            s + bytes > pull_map_ + pull_map_size_) {
+        size_t file_off = 0;
+        const int source = weight_source_index_(mapped_src, bytes, &file_off);
+        if (pull_disabled_ || source < 0 ||
+            !warm_reader_for_(weight_sources_[static_cast<size_t>(source)].path)) {
             std::memcpy(dst, mapped_src, bytes);
             return true;
         }
-        if (!warm_reader_.ok() && !warm_reader_.open(pull_path_)) {
-            std::memcpy(dst, mapped_src, bytes);
-            return true;
-        }
-        // As in load_pull_: the pointer's distance from the map base IS the
-        // file offset, because the tensor directory already folded the data
-        // section in when it set t.data.
-        const size_t off = static_cast<size_t>(s - pull_map_);
-        if (warm_reader_.at(off, dst, bytes)) return true;
+        if (warm_reader_.at(file_off, dst, bytes)) return true;
         std::memcpy(dst, mapped_src, bytes); // read failed: never hand back garbage
         return true;
     }
 
     // A batch of expert-sized reads, spread over a small pool of handles
-    // (KRK_WARM_READERS, default 4). One expert miss is three slices and one
-    // layer's routed set is dozens to hundreds of them, so the shape is a set of
-    // ~0.5-2 MiB reads issued one at a time through the single warm_reader_
-    // above -- queue depth 1 on one HANDLE. Measured on this machine (NVMe,
-    // 1.82 MiB reads): 593 MiB/s at one reader, 1175 MiB/s at two, 1446 MiB/s
-    // at four, 3400 MiB/s sequential; 593 MiB/s is exactly what the expert path
-    // reported while a decode token spent most of its wall time waiting for the
-    // file. Each worker opens its own FileReader for the same reason the pull
-    // ring does: a Windows HANDLE serialises concurrent ReadFile.
+    // (KRK_WARM_READERS, default 4). Requests are grouped by owning shard and
+    // ordered by file offset, so split GGUF tensors use the right file without
+    // comparing pointers from unrelated mappings.
     void read_host_batch(const ReadReq *reqs, int n) override {
         if (n <= 0) return;
         KRK_TIME_OP("warm_read(pool)");
-        const int want = warm_readers_();
-        if (n == 1 || want <= 1 || pull_path_.empty() || !pull_map_ ||
-            pull_disabled_) {
-            for (int i = 0; i < n; i++)
-                if (reqs[i].bytes)
-                    read_host(reqs[i].dst, reqs[i].mapped_src, reqs[i].bytes);
-            return;
-        }
-        const int nthread = n < want ? n : want;
-        for (int i = 0; i < nthread; i++) {
-            if (!warm_pool_[i].ok() && !warm_pool_[i].open(pull_path_)) {
-                for (int j = 0; j < n; j++)
-                    if (reqs[j].bytes)
-                        read_host(reqs[j].dst, reqs[j].mapped_src, reqs[j].bytes);
-                return;
-            }
-        }
-        // A layer's routed experts are scattered through the file but their
-        // order in the batch is arbitrary, and dispatching round-robin over it
-        // hands every worker a STRIDED sequence: each read lands megabytes away
-        // from the last, so the drive sees 4 interleaved random streams instead
-        // of 4 sequential ones. Sorting by offset and giving each worker one
-        // contiguous slice instead makes each worker scan forward -- measured on
-        // this machine, 4 strided streams ran at 912 MiB/s where a single
-        // sequential stream runs at 3400 MiB/s, and the expert path was spending
-        // 134 of a token's 146 ms waiting on it.
-        std::vector<int> order;
+        struct BatchItem { int request; int source; size_t offset; };
+        std::vector<BatchItem> order;
         order.reserve(static_cast<size_t>(n));
-        for (int i = 0; i < n; i++)
-            if (reqs[i].bytes) order.push_back(i);
-        std::sort(order.begin(), order.end(), [&](int a, int b) {
-            return reqs[a].mapped_src < reqs[b].mapped_src;
-        });
-        const int total = static_cast<int>(order.size());
-        if (total == 0) return;
-        const int per = (total + nthread - 1) / nthread;
-        auto body = [&](int tid) {
-            const int beg = tid * per;
-            const int end = beg + per < total ? beg + per : total;
-            for (int oi = beg; oi < end; oi++) {
-                const ReadReq &r = reqs[order[static_cast<size_t>(oi)]];
-                const u8 *s = static_cast<const u8 *>(r.mapped_src);
-                if (s < pull_map_ || s + r.bytes > pull_map_ + pull_map_size_ ||
-                    !warm_pool_[tid].at(static_cast<size_t>(s - pull_map_),
-                                        r.dst, r.bytes))
-                    std::memcpy(r.dst, s, r.bytes);
+        for (int i = 0; i < n; i++) {
+            if (!reqs[i].bytes) continue;
+            size_t offset = 0;
+            const int source = weight_source_index_(reqs[i].mapped_src,
+                                                   reqs[i].bytes, &offset);
+            if (pull_disabled_ || source < 0) {
+                std::memcpy(reqs[i].dst, reqs[i].mapped_src, reqs[i].bytes);
+                continue;
             }
-        };
-        std::vector<std::thread> workers;
-        workers.reserve(static_cast<size_t>(nthread - 1));
-        for (int i = 1; i < nthread; i++) workers.emplace_back(body, i);
-        body(0);
-        for (auto &w : workers) w.join();
+            order.push_back({i, source, offset});
+        }
+        if (order.empty()) return;
+        std::sort(order.begin(), order.end(), [](const BatchItem &a, const BatchItem &b) {
+            if (a.source != b.source) return a.source < b.source;
+            return a.offset < b.offset;
+        });
+
+        const int want = warm_readers_();
+        size_t group_begin = 0;
+        while (group_begin < order.size()) {
+            size_t group_end = group_begin + 1;
+            const int source = order[group_begin].source;
+            while (group_end < order.size() && order[group_end].source == source)
+                ++group_end;
+            const std::string &path = weight_sources_[static_cast<size_t>(source)].path;
+            const int group_size = static_cast<int>(group_end - group_begin);
+            const int nthread = std::min(want, group_size);
+            if (!warm_pool_for_(path, nthread)) {
+                for (size_t k = group_begin; k < group_end; k++) {
+                    const ReadReq &r = reqs[order[k].request];
+                    std::memcpy(r.dst, r.mapped_src, r.bytes);
+                }
+                group_begin = group_end;
+                continue;
+            }
+
+            // Each worker owns one contiguous range in this shard's sorted
+            // requests. The handles are independent because Windows serialises
+            // concurrent ReadFile calls made through a shared HANDLE.
+            const size_t per = (group_end - group_begin +
+                                static_cast<size_t>(nthread) - 1) /
+                               static_cast<size_t>(nthread);
+            auto body = [&](int tid) {
+                const size_t begin = group_begin + static_cast<size_t>(tid) * per;
+                const size_t end = std::min(group_end, begin + per);
+                for (size_t k = begin; k < end; k++) {
+                    const BatchItem &item = order[k];
+                    const ReadReq &r = reqs[item.request];
+                    if (!warm_pool_[tid].at(item.offset, r.dst, r.bytes))
+                        std::memcpy(r.dst, r.mapped_src, r.bytes);
+                }
+            };
+            std::vector<std::thread> workers;
+            workers.reserve(static_cast<size_t>(nthread - 1));
+            for (int i = 1; i < nthread; i++) workers.emplace_back(body, i);
+            body(0);
+            for (auto &worker : workers) worker.join();
+            group_begin = group_end;
+        }
     }
     // WARM -> HOT. A pageable hipMemcpy works but performs the whole transfer
     // inside the driver's bounce buffer; this stages the copy through the small
@@ -1775,17 +1771,23 @@ public:
             pin_t1_ = nullptr;
         }
     }
-    // Installs the pull-style weight path (see Backend::set_weight_pull). The
-    // loader hands over the path and the mapping's address range; this class
+    // Installs the pull-style weight path (see Backend::set_weight_pull).
+    // The loader hands over the path and the mapping's address range; this class
     // opens its own handles and owns the pinned buffers and the side streams.
     // Without it every upload takes the direct hipMemcpy, which is also the
     // CPU/other-backend behaviour.
+    // Also stores the per-shard weight sources for shard-aware pull/read.
     void set_weight_pull(const std::string &path, const void *map_base,
                          size_t map_size, size_t data_off) override {
         pull_path_ = path;
         pull_map_ = static_cast<const u8 *>(map_base);
         pull_map_size_ = map_size;
         pull_data_off_ = data_off;
+        // Legacy single-shard fast path: one source, for dense or shard-0 models.
+        weight_sources_.clear();
+        weight_sources_.push_back({
+            path, static_cast<const u8 *>(map_base), map_size, data_off
+        });
         // The ring is built on first use (pull_ready_), not here: a run that
         // never pulls a large tensor never pins a buffer or opens a handle.
         pull_on_ = false;
@@ -1796,6 +1798,22 @@ public:
         // alone was worth several GB/s.
         if (const char *v = std::getenv("KRK_WEIGHT_PULL"))
             if (v[0] == '0') pull_disabled_ = true;
+    }
+
+    // Install per-shard sources. The first source remains the legacy base for
+    // code paths that have not opted into shard lookup.
+    void set_weight_sources(const std::vector<WeightSource> &sources) override {
+        weight_sources_ = sources;
+        if (weight_sources_.empty()) {
+            weight_sources_.push_back({
+                pull_path_, pull_map_, pull_map_size_, pull_data_off_
+            });
+        }
+        const WeightSource &first = weight_sources_.front();
+        pull_path_ = first.path;
+        pull_map_ = first.map_base;
+        pull_map_size_ = first.map_size;
+        pull_data_off_ = first.data_off;
     }
 
     void upload(void *dst, const void *src, size_t bytes, size_t off) override {
@@ -1874,16 +1892,14 @@ public:
     // Fallback-safe: if the file side cannot be used, or the range is not in the
     // mapping, this returns false and upload() takes the direct hipMemcpy.
     bool load_pull_(void *dst, size_t dst_off, const void *src, size_t bytes) {
-        const u8 *s = static_cast<const u8 *>(src);
-        if (s < pull_map_ || s + bytes > pull_map_ + pull_map_size_) return false;
-        // `src` is a pointer into the mapping, so its distance from the map base
-        // IS the file offset: the tensor directory already folded the data
-        // section in when it set `t.data = data_base_ + t.offset`. Adding
-        // pull_data_off_ here again reads every tensor from twice the data
-        // section offset -- fast, plausible-looking, and the wrong bytes.
-        const size_t file_off = static_cast<size_t>(s - pull_map_);
-
-        if (!pull_ready_()) return false;
+        size_t file_off = 0;
+        const int source = weight_source_index_(src, bytes, &file_off);
+        if (source < 0) return false;
+        const std::string &path = weight_sources_[static_cast<size_t>(source)].path;
+        // `src` is a pointer into its owning mapping, so its distance from that
+        // shard's map base IS the file offset. GGUF tensor pointers already
+        // include the shard's data-section offset.
+        if (!pull_ready_(path)) return false;
         const size_t chunk = pull_chunk_();
         const size_t nchunk = (bytes + chunk - 1) / chunk;
         const int nthread = static_cast<int>(std::min<size_t>(pull_threads_(), nchunk));
@@ -1924,7 +1940,11 @@ public:
                     fail.store(1);
                     break;
                 }
-                if (!pull_readers_[slot].at(file_off + c_off, buf, c_len)) {
+                // Open/switch each reader on this worker before issuing the
+                // asynchronous transfer; mutable FileReader state is never
+                // shared across workers.
+                if (!pull_reader_for_(slot, path) ||
+                    !pull_readers_[slot].at(file_off + c_off, buf, c_len)) {
                     fail.store(1);
                     break;
                 }
@@ -1981,27 +2001,76 @@ public:
         return v;
     }
 
+    int weight_source_index_(const void *ptr, size_t bytes, size_t *file_off) const {
+        if (!ptr || !file_off) return -1;
+        const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+        for (size_t i = 0; i < weight_sources_.size(); i++) {
+            const WeightSource &source = weight_sources_[i];
+            if (!source.map_base) continue;
+            const uintptr_t base = reinterpret_cast<uintptr_t>(source.map_base);
+            if (address < base) continue;
+            const uintptr_t delta = address - base;
+            if (delta > source.map_size || bytes > source.map_size - delta) continue;
+            *file_off = static_cast<size_t>(delta);
+            return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    bool warm_reader_for_(const std::string &path) {
+        if (warm_reader_.ok() && warm_reader_path_ == path) return true;
+        warm_reader_.close();
+        warm_reader_path_.clear();
+        if (!warm_reader_.open(path)) return false;
+        warm_reader_path_ = path;
+        return true;
+    }
+
+    bool warm_pool_for_(const std::string &path, int count) {
+        for (int i = 0; i < count; i++) {
+            if (warm_pool_[i].ok() && warm_pool_path_[i] == path) continue;
+            warm_pool_[i].close();
+            warm_pool_path_[i].clear();
+            if (!warm_pool_[i].open(path)) return false;
+            warm_pool_path_[i] = path;
+        }
+        return true;
+    }
+
+    bool pull_reader_for_(int index, const std::string &path) {
+        if (index < 0 || index >= kPullThreads || path.empty()) return false;
+        if (pull_readers_[index].ok() && pull_reader_path_[index] == path) return true;
+        pull_readers_[index].close();
+        pull_reader_path_[index].clear();
+        if (!pull_readers_[index].open(path)) return false;
+        pull_reader_path_[index] = path;
+        return true;
+    }
+
     // Lazily builds the ring: per worker, one independent handle (a Windows
-    // HANDLE serialises concurrent ReadFile, so sharing one measured 7.4 GB/s
-    // against 15.9 for separate handles), two pinned buffers and two streams.
-    // Kept for the life of the backend -- a second load (a draft model, say)
-    // reuses it.
-    bool pull_ready_() {
-        if (pull_on_) return true;
-        if (pull_path_.empty() || !pull_map_) return false;
+    // HANDLE serialises concurrent ReadFile), two pinned buffers and streams.
+    // Reopen the worker handles when a tensor belongs to another shard.
+    bool pull_ready_(const std::string &path) {
+        if (path.empty()) return false;
+        if (pull_on_) {
+            for (int i = 0; i < kPullThreads; i++)
+                if (!pull_reader_for_(i, path)) return false;
+            return true;
+        }
         for (int i = 0; i < kPullThreads; i++) {
-            if (!pull_readers_[i].open(pull_path_)) return false;
             for (int j = 0; j < kPullBufs; j++) {
                 void *p = alloc_host(kPullChunk);
-                if (!p) return false;
-                pull_buf_[i][j] = static_cast<char *>(p);
-                // Non-blocking: a plain hipStreamCreate stream has implicit
-                // synchronization with the legacy default stream, which the
-                // engine's kernels run on, so every H2D copy would queue behind
-                // it instead of running concurrently.
-                if (hipStreamCreateWithFlags(&pull_stream_[i][j], hipStreamNonBlocking) !=
-                    hipSuccess)
+                if (!p) {
+                    pull_release_();
                     return false;
+                }
+                pull_buf_[i][j] = static_cast<char *>(p);
+                // Non-blocking streams allow H2D copies to overlap the reads.
+                if (hipStreamCreateWithFlags(&pull_stream_[i][j], hipStreamNonBlocking) !=
+                    hipSuccess) {
+                    pull_release_();
+                    return false;
+                }
             }
         }
         pull_on_ = true;
@@ -2021,6 +2090,7 @@ public:
                 }
             }
             pull_readers_[i].close();
+            pull_reader_path_[i].clear();
         }
         pull_on_ = false;
     }
@@ -3863,6 +3933,8 @@ private:
     size_t pull_data_off_ = 0;
     bool pull_on_ = false;
     bool pull_disabled_ = false;
+    std::vector<WeightSource> weight_sources_;
+    std::string pull_reader_path_[kPullThreads];
     FileReader pull_readers_[kPullThreads];
     // WARM fill path. Its own handle, like every pull reader: a Windows HANDLE
     // serialises concurrent ReadFile, so sharing one with the pull ring would
@@ -3878,6 +3950,7 @@ private:
     hipEvent_t dl_ev_ = nullptr;
 
     FileReader warm_reader_;
+    std::string warm_reader_path_;
     // Reader pool for batched expert reads; sized by KRK_WARM_READERS. Each
     // entry is one HANDLE, opened lazily on first batch use.
     static constexpr int kWarmReadersMax = 16;
@@ -3892,6 +3965,7 @@ private:
         return n;
     }
     FileReader warm_pool_[kWarmReadersMax];
+    std::string warm_pool_path_[kWarmReadersMax];
     // Bounded pinned staging ring for WARM -> HOT promotions (upload_paged).
     // Small on purpose: it is the DMA's in-flight pipeline, not a cache, and
     // nothing in it outlives the copy. Total pinned bytes is kPagedBufs *

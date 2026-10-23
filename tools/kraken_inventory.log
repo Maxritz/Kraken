@@ -1,0 +1,67 @@
+FILE Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+PATH models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf
+SIZE 964653184
+RC ok
+
+{
+  "filename": "Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf",
+  "bytes": 964653184,
+  "paths": [
+    "models/Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf"
+  ],
+  "inspect_sec": 0.02,
+  "loader_headline": "qwen3moe — supported (moe)",
+  "arch_name": "qwen3moe",
+  "family": "qwen3moe",
+  "verdict": "runnable",
+  "general": {
+    "architecture": "qwen3moe"
+  },
+  "arch": {
+    "architecture": "qwen3moe",
+    "block_count": 28
+  },
+  "layers": {
+    "count": 28
+  },
+  "tensor_count": 339,
+  "experts": {
+    "count": 4,
+    "used_count": 2
+  },
+  "shard_count": 1
+}
+
+FILE SmolLM2-135M-Instruct.Q4_K_M.gguf
+PATH models/SmolLM2-135M-Instruct.Q4_K_M.gguf
+SIZE 105454432
+RC ok
+
+{
+  "filename": "SmolLM2-135M-Instruct.Q4_K_M.gguf",
+  "bytes": 105454432,
+  "paths": [
+    "models/SmolLM2-135M-Instruct.Q4_K_M.gguf"
+  ],
+  "inspect_sec": 0.014,
+  "loader_headline": "llama — supported (dense)",
+  "arch_name": "llama",
+  "family": "",
+  "verdict": "runnable",
+  "general": {
+    "architecture": "llama"
+  },
+  "arch": {
+    "architecture": "llama",
+    "block_count": 30
+  },
+  "layers": {
+    "count": 30
+  },
+  "tensor_count": 272,
+  "experts": {
+    "count": 0,
+    "used_count": 0
+  },
+  "shard_count": 1
+}

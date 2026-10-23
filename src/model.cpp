@@ -4,6 +4,7 @@
 #include "krk/arch.hpp"
 #include "krk/verdict.hpp"
 #include "krk/vram_guard.hpp"
+#include "krk/backend.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -96,8 +97,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // the pipeline and overlaps the reads with the copies; it falls back to the
     // direct copy if pinned memory cannot be had, so this is an optimisation,
     // not a requirement. See docs/KNOWLEDGE-MODELS.md.
-    be.set_weight_pull(path, gguf_.file().data(), gguf_.file().size(),
-                       gguf_.data_section_off());
+    // Build the shard table so the backend can turn source pointers into
+    // file offsets for tensors living in any shard.
+    std::vector<WeightSource> sources;
+    sources.reserve(gguf_.shard_count());
+    for (i32 s = 0; s < static_cast<i32>(gguf_.shard_count()); s++) {
+        const GgufShard &shard = gguf_.shards()[s];
+        sources.push_back({
+            shard.file->path(),           // path to the shard file
+            static_cast<const u8 *>(shard.file->data()),  // map base
+            shard.file->size(),           // map size
+            shard.data_off,               // tensor data offset within this shard
+        });
+    }
+    be.set_weight_sources(sources);
 
     // ---- architecture -----------------------------------------------------
     cfg_.arch = gguf_.get_str("general.architecture", "llama");
