@@ -142,48 +142,76 @@ constexpr ArchSpec kTable[] = {
     // docs/AUDIT-qwen4exp-support.md for the per-stage state and the reference
     // implementation the shapes were read from.
     // 
-    // Still refused, and no longer for a missing piece. Every tensor in the
-    // schema is read, the hyper-connection residual, the PLE block and the QSA
-    // indexer all run (each has its own device arm in `kraken-bench --hc` or a
-    // `test_qwen4exp_*` group), and the REAP-288 file loads, engages its 12
-    // indexers and generates. What it does not do is produce the REFERENCE's
-    // text: on "def add(a, b):" this engine greedily emits a single CJK glyph
-    // where llama.cpp continues "    print(f" on the same file, same prompt,
-    // same greedy rule. So the remaining claim is coherence, not coverage, and
-    // declaring it Partial would say "loads and runs" about a graph whose
-    // output is not yet the model's.
-    {"qwen4exp", ArchShape::RecurrentMoe, ArchSupport::No, ArchRole::Target,
-     "qwen4exp",
-     "the family's tensors all run -- the hyper-connection residual, the PLE "
-     "block and the QSA indexer included -- and on the REAP-288 file the graph "
-     "reproduces the reference engine's greedy text token for token "
-     "('The capital of France is' -> 24/24, same file, same prompt; the "
-     "reference is src/models/qwen4exp.cpp in the llama.cpp tree under "
-     "G:/Strata). What keeps it experimental is that no suite gate pins a "
-     "whole-graph output -- test_qwen4exp_* pin the blocks, not the sentence "
-     "-- so the arch stays behind KRK_ARCH_ALLOW_EXPERIMENTAL until one does",
+    // SUPPORTED, and the thing that changed is the gate, not the graph.
+    //
+    // Every tensor in the schema has been read for a while, and the
+    // hyper-connection residual, the PLE block and the QSA indexer all run
+    // (each has a device arm in `kraken-bench --hc` or its own
+    // `test_qwen4exp_*` group). What kept the arch behind
+    // KRK_ARCH_ALLOW_EXPERIMENTAL was that no suite gate pinned the SENTENCE:
+    // the block groups prove the blocks, and a graph can pass every one of them
+    // and still decode nonsense -- which is exactly what the PLE normalisation
+    // bug did before it was found.
+    //
+    // `test_qwen4exp_whole_graph` is that gate: the fixture's greedy sequence is
+    // pinned, and three arms keep the pin from being vacuous (a different prompt
+    // moves it, chunk 1 reproduces it, a shifted PLE table breaks it). Its
+    // provenance is the anchor on real weights -- the REAP-288 file reproduces
+    // llama.cpp's greedy continuation of "The capital of France is" for 24 of
+    // 24 tokens (docs/AUDIT-qwen4exp-support.md) -- so the pin is a regression
+    // claim with an external reference behind it, not a second oracle.
+    //
+    // One piece of honesty for the next reader: this engine's speed on that
+    // file is not the point of the row. 84 GB of REAP-288 with a 42 GiB routed
+    // set decodes at 5.7 tok/s here (expert-tier bound), which is a correct
+    // answer at a slow rate, and correctness is what the verdict states.
+    {"qwen4exp", ArchShape::RecurrentMoe, ArchSupport::Yes, ArchRole::Target,
+     "qwen4exp", "",
      /*qk_norm=*/true, /*q_output_gate=*/true, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/true,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
      /*swiglu_oai=*/false, /*hyper_connection=*/true, /*ple=*/true,
      /*qsa=*/true, /*attn_gate_elem=*/false, /*no_out_norm=*/true},
 
-    // Multi-head latent attention: a compressed KV path (attn_kv_a/kv_b and
-    // their norms) that the attention kernels have no shape for.
-    {"deepseek2", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "deepseek2",
-     "multi-head latent attention (attn_kv_a/attn_kv_b) is not implemented",
+    // Multi-head latent attention, legacy lite layout (DeepSeek-V2 / V2-Lite /
+    // Coder-V2-Lite): direct attn_q, one attn_kv_a_mqa projection emitting the
+    // compressed latent beside the decoupled rope key, one unsplit attn_kv_b
+    // table. It RUNS (src/hip/kernels/mla.hpp, Engine::mla_forward).
+    //
+    // The table's verdict is about the ARCH, and MLA ships in three layouts
+    // that are three different graphs. Only the lite one is implemented, so
+    // the engine checks the FILE's layout at init and refuses the split and
+    // shared ones by name (see the MLA block in Engine::init). That is
+    // deliberate: a loader that refused the family would also refuse the
+    // layout this build runs, and a file that loads and then decodes the wrong
+    // graph is the failure mode this engine exists not to have.
+    //
+    // expert_w_norm = 0 for the reason gpt-oss has it: this family's routed
+    // weights are the TOP-K OF A FULL-VOCAB SOFTMAX, not a softmax over the
+    // selected experts, so they sum to well under 1 -- the top 6 of 64 hold
+    // maybe half the mass -- and renormalizing them multiplies every layer's
+    // expert contribution by about 2. llama.cpp leaves expert_weights_norm
+    // false for a file that does not declare it, and this file does not.
+    // Measured, not assumed: with normalization the same prompt answered in
+    // the right voice for four greedy tokens and then picked a different word;
+    // without it the run follows llama.cpp token for token.
+    {"deepseek2", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "deepseek2",
+     "",
      /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
-     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
+     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/0,
      /*swiglu_oai=*/false, /*hyper_connection=*/false, /*ple=*/false,
      /*qsa=*/false, /*attn_gate_elem=*/false, /*no_out_norm=*/false,
-     /*mla=*/true},
+     /*mla=*/true, /*dsv4=*/false, /*attention_implemented=*/true},
     // Shared-latent MLA (one wkv latent, per-head queries, grouped wo_a/wo_b)
     // plus V4-only extras: compress_ratios, Sinkhorn hyper-connections,
     // tid2eid hash routing, YaRN-on-compressed-layers rope. The loader reads
     // the metadata and (for the dense core) the weights; the engine refuses
     // until each piece runs. qk_norm is false: the file carries no per-head
-    // q/k norms, only the latent q_a/kv norms.
+    // q/k norms, only the latent q_a/kv norms. attention_implemented stays
+    // false: this is the SHARED latent, whose attention is a different graph
+    // from the lite one that runs (the head count lives in a grouped output
+    // projection, not in a per-head K/V unfolded at runtime).
     {"deepseek4", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "deepseek4",
      "multi-head latent attention (shared latent + grouped output), sinkhorn "
      "hyper-connections, tid2eid hash routing and compressed attention are "
@@ -193,7 +221,7 @@ constexpr ArchSpec kTable[] = {
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
      /*swiglu_oai=*/false, /*hyper_connection=*/false, /*ple=*/false,
      /*qsa=*/false, /*attn_gate_elem=*/false, /*no_out_norm=*/false,
-     /*mla=*/true, /*dsv4=*/true},
+     /*mla=*/true, /*dsv4=*/true, /*attention_implemented=*/false},
     // The MTP/prediction-head shard of DeepSeek-V4: `mtp.*` tensors, nothing else.
     {"deepseek4-dspark", ArchShape::Moe, ArchSupport::No, ArchRole::Draft,
      "deepseek4",

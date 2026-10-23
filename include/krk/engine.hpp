@@ -621,6 +621,16 @@ private:
     // regardless of how many tokens chose it. Experts are paged in through the
     // model's cache.
     bool moe_ffn(const LayerWeights &L, i32 layer, i32 n);
+
+    // One decode token's routed experts as BATCHED launches: gate/up for up to
+    // four experts per group launch (they all read the same activation row at
+    // one token), one activation launch for all of them, one launch for their
+    // down projections (each reading its own row), and the scatter per expert
+    // unchanged -- the routed sum's order and its storage exponents are the
+    // per-expert path's. Returns false having issued nothing when the layer
+    // cannot be expressed this way, so the caller's per-expert loop runs.
+    bool moe_decode_batch(const LayerWeights &L, i32 layer, i32 k, i32 ne,
+                          i64 ff_exp, bool use_plan_off, bool inplace_ok);
     // Set when moe_ffn (or the MTP block path) refuses a routed expert:
     // forward_core returns false and the next error surface prefers this
     // over the generic KV message. Cleared at each forward_core entry.
@@ -743,6 +753,13 @@ private:
     // causal short conv, the per-head gate/forget, the delta rule, and the
     // gated output projection. Advances the layer's recurrent state.
     void gdn_forward(const LayerWeights &L, i32 l, i32 n);
+    // One multi-head latent attention layer (DeepSeek-V2/V3/V4, legacy lite
+    // layout): the [kv_lora + rope] projection, the normed latent written to
+    // the KV plane, and the absorbed score/value pass over it. Leaves the
+    // attention result in ws_attn_ at `L.wo.n_in` columns per row, which is
+    // where the ordinary output projection picks it up. False when a geometry
+    // this engine cannot run reaches it -- a refusal, not a wrong answer.
+    bool mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0);
     // Clears the convolution windows and delta-rule states (f32, one set per
     // recurrent layer). Only correct to call at a sequence boundary.
     void recurrent_reset();
@@ -1006,6 +1023,9 @@ private:
     // output gate behind the query, so its projection is twice as wide as the
     // query it has to be split into. Null when the model does not pack one.
     void *ws_qpack_ = nullptr;
+    // MLA's projection row: latent + decoupled key, NOT the MHA q/k/v shape.
+    // Null unless the model runs latent attention; see mla_forward().
+    void *ws_mla_ = nullptr;  // [chunk, kv_lora + rope]
     void *ws_k_ = nullptr;    // [chunk, kv_dim]
     void *ws_v_ = nullptr;    // [chunk, kv_dim]
     void *ws_attn_ = nullptr; // [chunk, q_dim]
@@ -1036,6 +1056,13 @@ private:
     void *ws_plan_ = nullptr;   // device i32 row ids for the current expert group
     void *ws_alpha_ = nullptr;  // device f32 gate weights for the current group
     void *ws_scale_ = nullptr;  // device f32 row multipliers from a scaled silu
+    // The batched-expert path's per-expert buffers: at one decode token every
+    // routed expert owns ONE row, so k of them need k rows of each width. Sized
+    // for kMoeBatch experts (the launch caps a group at that many); a layer with
+    // a wider top-k runs the batch in chunks of that size.
+    void *ws_ebatch_ = nullptr;  // [kMoeBatch][2 * n_ff_ws] gate then up, per expert
+    void *ws_edown_ = nullptr;   // [kMoeBatch][n_embd]     down projection, per expert
+    void *ws_ebscale_ = nullptr; // [kMoeBatch] f32       row scale per expert
     // One i32 per token row: the power of two the residual stream is stored
     // divided by for that row (Backend::add_residual's contract), zeroed at the
     // start of every forward pass so it describes this pass's rows only.
@@ -1094,13 +1121,25 @@ private:
     // How many times the publish was retried while the router filled the tiers,
     // and whether its "not yet" reason has been printed (once is enough).
     static constexpr i32 kTableAttempts = 8;
+
+    // How many experts the batched decode path puts in one launch group. It is
+    // 8 because that is what the backend's group matrix array holds; the
+    // gate/up half of a group is two matrices per expert, so one gate/up launch
+    // covers four experts at a time.
+    static constexpr i32 kMoeBatch = 8;
     i32 table_attempts_ = 0;
     bool table_why_logged_ = false;
     u64 dp_launch_layers_ = 0;   // layers that ran the one-launch dispatch
     u64 dp_launch_skips_ = 0;    // layers that found the table stale and fell back
+    u64 moe_batch_layers_ = 0;   // decode layers the batched path computed
+    u64 moe_batch_skips_ = 0;    // decode layers that kept the per-expert loop
     // Scratch for the layer-wide expert prefetch: the routed ids, deduped.
     std::vector<i32> prefetch_ids_;
     std::vector<u8> prefetch_seen_;
+    // The ids handed to the cache's read-ahead worker (the next MoE layer's
+    // prediction, filtered to what is not in WARM yet). Reused per layer so the
+    // issue site allocates nothing.
+    std::vector<i32> ahead_ids_;
     // Previous-token route sets retained for the legacy
     // KRK_MOE_NEXT_PREFETCH experiment. The adaptive predictor has independent
     // per-layer histories and only proposes cache staging hints.
@@ -1208,6 +1247,12 @@ private:
     // walks. Both are members so a layer does not allocate.
     std::vector<i32> plan_off_;
     std::vector<i32> plan_cur_;
+    // The batched decode path's own staging: the layer's routed experts in
+    // ascending order and the resident pointers their launches read. Both are
+    // resolved before the first launch, so a refusal can leave the layer to the
+    // per-expert loop without a contribution counted twice.
+    std::vector<i32> batch_ids_;          // this layer's routed experts, ascending
+    std::vector<const ResidentExpert *> batch_res_;
 };
 
 } // namespace krk

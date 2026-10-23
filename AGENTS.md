@@ -513,6 +513,28 @@ code, the README, or `docs/`.
   row, the conv's input and the conv's output, the test requires the first two
   to be different buffers with different per-lane RMS, and re-aliasing them
   fails **14/16** on exactly those two checks.
+  **qwen4exp is SUPPORTED now, and the gate is what flipped it, not the graph.**
+  The row sat at `ArchSupport::No` with every tensor read and every block proven
+  because `test_qwen4exp_*` pinned the PLE rows, the lane invariant, the QSA
+  cell list and the delta-net gate -- and none of them pinned the SENTENCE, so a
+  graph that passed all of them could still decode nonsense (which is exactly
+  what the PLE normalisation bug did). `test_qwen4exp_whole_graph` (18 checks)
+  closes it: the last prompt position's **whole logits row** by FNV hash plus
+  its argmax and the greedy sequence, and four arms that keep the pin from being
+  vacuous -- a different prompt moves the row, chunk 1 reproduces it, a shifted
+  PLE table breaks it, and the fixture LOADS with
+  `KRK_ARCH_ALLOW_EXPERIMENTAL` unset (the claim the row makes, checked). The
+  row hash, not the tokens, is the load-bearing part: this fixture's synthetic
+  head argmaxes EOS after one token, and a text-only gate is blind in exactly
+  the way the attention rewrite already demonstrated. Red construction: `if
+  (false)` around `ple_block` fails 5 of the 18 (row, argmax, PLE sensitivity,
+  both text pins). On hard weights the file is
+  `H:/OLLAMA-Models/GGUF/qwen3.8-flash-next-reap-288-Q4_K_M.gguf` -- 78.04 GiB
+  payload, 1224 tensors -- which now inspects as `supported (recurrent-moe)` /
+  `runnable` and, with no hatch, decodes `def add(a, b):` -> `    return a + b`
+  at **5.2 tok/s prefill / 5.8 tok/s decode**. That rate is the expert tier
+  (42.2 GiB of routed set through a 7.2 GiB VRAM budget), not the graph: the
+  verdict is a correctness claim, and the speed is a separate project.
   (4) **The rope pairing follows llama.cpp's rope TYPE, and for this family that
   type is IMROPE, which pairs channel j with j + n_rot/2.** The table said
   `rope_neox=false` for qwen4exp while `llm_arch_rope` in the fork answers
@@ -551,6 +573,236 @@ code, the README, or `docs/`.
   used to be reported as "generation will refuse", which was never true --
   `Engine::init` has no verdict check -- so it now says the loader's blockers are
   not enforced for the run.
+
+- **A kernel READS the pinned host tier on this card, and that is what the
+  three-tier design was missing.** `tools/probe_hostread.hip` (ad hoc: build it
+  with the engine's own clang++ and `--offload-arch=gfx1201`, it is not a CMake
+  target) reads a 4 MiB `hipHostMalloc` buffer back EXACTLY and a 256 MiB one at
+  **24.3 GiB/s** against **485.2 GiB/s** for the same kernel over device memory,
+  while the runtime reports `unifiedAddressing: 0` -- the flag says no and the
+  pool is mapped anyway. So the answer to "can the RAM tier be used without
+  being copied into VRAM" is yes, at a rate in the same class as the promotion
+  copy (11-22.9 GiB/s).
+  That is `Backend::host_load_supported()` (false by default, true on HIP only
+  because of those numbers) plus `ExpertCache::acquire_inplace()`, which returns
+  the WARM matrices with no device copy when the slot is pinned host memory, is
+  not already resident, and has NOT earned residency (`kPinThreshold` touches) --
+  a hot expert still goes to VRAM, where a read is 20x faster. `Engine::moe_ffn`
+  tries it first, falls through to `acquire()` for every other case, and skips
+  the whole-routed-set promote/stage batches when nothing is going to be copied.
+  `KRK_EXPERT_INPLACE=0` is the A/B arm.
+  Measured on REAP-288 at the shape a small machine has (`--expert-cache-mb 8000
+  --expert-warm-mb 20000`), 32 greedy tokens, stdout bit-identical
+  (`da9ba027a3454bba9edfefdb6c049632` both arms): WARM->VRAM copied **18203 MiB
+  -> 58 MiB**, VRAM evictions **5839 -> 23**, alloc **669 -> 1.3 ms**, promote
+  **775 -> 1.9 ms**, expert path **0.79 -> 0.19 ms/layer**. Step time is a WASH
+  on this box (147.0 against 149.3 ms) and that is the honest reading: the bytes
+  drop 300x and the time does not, because on a 96 GiB machine whose page cache
+  already holds the file the copy was never the constraint. What it buys is the
+  VRAM FOOTPRINT -- 7 GiB of experts now serve the same text where the promoting
+  path needed the routed set to stop thrashing.
+  **The probe's first version "proved" the opposite and the bug was in the
+  probe**, which is the part worth keeping: 128 threads summed into a shared
+  `out[tid & 1023]`, so the total came out at exactly 1/128 of the truth and read
+  as "the pinned buffer is not mapped". A correctness check that cannot tell a
+  broken read from a broken check is worth less than no check -- give every
+  thread its own slot.
+  **REAP-288 has a floor near 16 tok/s whatever the tier does**, and the number
+  is arithmetic: one token visits 480 experts of ~3.1 MiB, i.e. ~1.5 GiB of
+  weights, which is 62 ms/token at 24.3 GiB/s before any compute. 20-30 tok/s is
+  an A3B-class target (8 x ~1.5 MiB per layer, ~250 MiB/token) -- what
+  DeepSeek-V4-Flash and Qwen-3.8-Flash route -- not a REAP-288 one. The remaining
+  host cost there was measured at 38 ms/step of BLOCKING file reads (274
+  MiB/token) plus 22 ms of host selection and plan, serial with the GPU.
+- **The routed-set reads now run on a worker thread, and both failed versions
+  are worth keeping.** `ExpertCache::prefetch_warm_next()` + `take_prefetched()`
+  (`KRK_WARM_AHEAD=0` is the arm, default on, requires in-place to be on): the
+  layer's ids are handed to a worker at selection time, the worker copies the
+  missing experts out of the mapping into pinned buffers, and the per-expert
+  loop installs each as the expert's WARM copy when it reaches it -- waiting only
+  for the ONE expert in flight, so the layer's ascending expert order (and every
+  bit of its arithmetic) is untouched. Measured 24 greedy tokens, 4 interleaved
+  order-balanced runs, stdout identical (`c0627e2a...`): 152.4/153.2 ms ->
+  **129.6/128.3 ms per step, 6.5 -> 7.7-7.8 tok/s**, `moe.route.fetch` 63 -> 31.6
+  ms (the GPU backlog halves because the host stops blocking) and 295-330
+  expert reads (937-1042 MiB) taken off the host. At a 4 GiB expert budget
+  167.8 (promote) -> 157.7 (in place) -> **136.2 ms** (7.3 tok/s).
+  (1) **The first version issued ZERO reads**: it was fed the *next* layer's ids
+  from `moe_hint_`, the previous token's routing -- and those experts are already
+  in WARM by definition, because the previous token just used them. The debug
+  line said `hint=10 ids=0` on every layer. What blocks is the expert this layer
+  routed that the tier does NOT hold, and those ids are exact and already on the
+  host after selection.
+  (2) **The second version was 11% SLOWER**: `moe_ffn` already reads the routed
+  set through `prefetch_layer()` before the loop, so the worker read the same
+  bytes a second time and `take_prefetched()` correctly discarded its result.
+  The synchronous pass is skipped when the worker is reading. A "prefetch" that
+  duplicates the read it was meant to hide is slower than no prefetch, and the
+  only visible symptom is a step that got worse for no reason.
+- **In-place must yield to REUSE, and the threshold is `count >= 2`.** The first
+  rule refused in-place only for experts that had earned a pin (24 touches), so
+  on Qwen3-30B-A3B -- routed set ~9.6 GiB, 128 experts top-8, 84.7% of picks
+  repeats -- 45.7% of acquires read 24.3 GiB/s host memory where VRAM already
+  held the expert: **42.9 ms/step against 33.7 for the promoting path, -20%**.
+  The tier's own LFU counter is the signal: one in-place read pays for itself
+  (it is the read the promotion would have copied), the second use is where the
+  card wins by 20x. With `count >= 2` the A3B file is 34.2 ms/step (-2% against
+  promote, 4x fewer COLD misses) and REAP-288 is 127.9-130.2 ms against
+  138.5-139.3 (+7.7%). Measured at the goal shape, 48 greedy tokens:
+  Qwen3-30B-A3B reaches **29.2-29.9 tok/s at a 4000 MiB expert budget with an
+  8000 MiB RAM tier, 31.2 tok/s and 0.0% COLD at 12000 MiB, 31.6 tok/s at
+  6000/8000** -- the 20-30 tok/s target, met on a card budget a 6-8 GiB card
+  has. The promoting path reaches the same band there, because when the routed
+  set FITS a promotion is a one-time cost; the three tiers win on the file whose
+  routed set does not fit (REAP-288) and on the VRAM footprint everywhere.
+  **The page-cache caveat**: a COLD miss on this 96 GiB box is a ~7 GiB/s
+  page-cache read; on a 16-32 GiB machine it reaches the disk. The 12000 MiB row
+  with 0.0% COLD is the configuration where the disk is not in the loop at all.
+  **The knee is between a 6000 and an 8000 MiB RAM tier, and it is a cliff.**
+  Swept on Qwen3-30B-A3B at a 4000 MiB expert budget, 48 greedy tokens
+  (`docs/PERF-ANALYSIS.md` section 12d): 3000 MiB 23.5 tok/s (14.2% COLD, 98.9
+  MiB/token), 4000 23.7 (13.0%, 90.2), 6000 27.2 (4.4%, 30.6), 8000 **29.4**
+  (1.1%, 7.9), 12000 **31.7** (0.0%, 0). The worker hides the read inside a
+  layer's ~0.66 ms of compute, so what matters is bytes per LAYER, not per
+  token: 0.16 MiB/layer is free at any drive rate, 0.64 needs four readers to
+  stay hidden, 1.9 does not hide at all. A 16 GiB machine's 6-8 GiB tier sits on
+  the good side at 8 GiB (disk irrelevant) and on the edge at 6 GiB (17-27 tok/s
+  depending on the drive).
+  **This box cannot measure the disk, and the doc says so**: 40 random 1.5 MiB
+  reads from the 78 GiB REAP file ran at a median 1809 MiB/s because 96 GiB of
+  RAM holds most of it. The projections use the recorded NVMe rates (593 and
+  1446 MiB/s) instead, and are labelled as projections.
+
+- **The pool's reuse guard had exactly one hole, and it is the pinned-DMA arm.**
+  A released cell goes back on the free list carrying the mark its readers were
+  released under, and `alloc_pooled` hands the next owner that same mark. Every
+  write path into a cell waits for it on the stream it writes with --
+  `upload_paged` (ring and direct), `upload_expert_staged`,
+  `upload_expert_prefetch`, `upload_i32`, `fill0`, `copy_act` -- except
+  `upload_pinned_batch`, which copies on a private `hipStreamNonBlocking` stream
+  and never did. A promotion could therefore overwrite a cell a queued expert
+  GEMM was still reading: no crash, a plausible number from the wrong matrix,
+  and under heavy eviction a different sentence. It is one
+  `pool_honor_(dst[i], pinned_stream_)` now.
+  **The trap is `kraken-bench --pool`, and it is in `--gate` too.** 16 copies of
+  one 64 MiB cell queued on the default stream, the cell released, handed back
+  out, and a different pattern DMA'd into it; every reader must still see its own
+  bytes. Red construction: without the guard it FAILs 3 of 3, with it 3 of 3 ok.
+  `--pool` exists because `--gate` also drives a CLI speculation arm.
+  **Depth is the trap, and the first version missed it**: 256 reads of a 4 MiB
+  cell PASSED on the buggy code, because the host enqueue outran the device work
+  and the queue was empty by the time the DMA was posted. A race trap whose
+  reader queue drains before the writer is posted proves nothing and looks
+  exactly like a clean bill of health.
+  **What correctness costs, REAP-288** (`--ctx 512 --chunk 256`, 32 greedy
+  tokens, guard on against off interleaved, text identical in every pair): at the
+  default auto budget (~8.4 GiB here) `reuse 0`, no pending marks, nothing to
+  pay; at `--expert-cache-mb 4000` (~3900-4060 reuses) **147.6 -> 159.4 ms/step,
+  +8.0%, slower in 4 of 4 pairs**; on section 12i's refuse-instead-of-trim arm
+  (~55 000 reuses) **146.4-147.1 -> 219.1-220.7, +50%**. At a saturated budget
+  the cell handed out IS the one the eviction has just released, so the copy
+  waits for the current layer's own GEMMs -- and the overlap that arm was buying
+  was reading garbage. Recovering it honestly is promoting ahead of demand, not
+  dropping the guard.
+  **12i's sentence divergence is this bug**: at 4000 MiB on that arm, 3 runs with
+  the guard removed gave two identical continuations and one different one
+  (`16ab8aff...` against `b3eb4d07...`); 4 of 4 matched with the guard. Numbers
+  and the trap: `docs/PERF-ANALYSIS.md` section 12k.
+  **Promoting ahead does not recover it, and the cache's counters prove the pass
+  had nothing to do**: `KRK_MOE_NEXT_PREFETCH=1` (previous token's routing ->
+  `stage_ahead`) and `KRK_MOE_PREDICT=1` both leave HOT hits at 46.9% and WARM
+  hits flat (2699 -> 2684) with the step at 179.2 against 178.8 ms, and the new
+  `[stats ] lookahead <n> staged, <m> rejected, <k> consumed` line -- printed
+  only when non-zero -- never appears: a hinted expert is either already in VRAM
+  or no longer in WARM a whole token later, so there is no candidate. Details:
+  `docs/PERF-ANALYSIS.md` section 12m.
+  **Ranking the victim instead does not recover it either, and the mark explains
+  why**: ordering `force_reclaim`'s same-class candidates like `pick_victim`
+  (rarest, then oldest load) and ordering them by a new true least-recently-read
+  stamp both leave the step at 180.5/183.1 and 181.9/183.6 against 180.2/181.7
+  ms/step. A release is recorded as a POSITION on the default stream, so a reuse
+  waits for every kernel queued before that point -- the current layer's own
+  earlier experts, not the victim's readers -- and the victim's age is
+  uncorrelated with it. At this shape the guard costs **+24%** (144-150 ->
+  180-183 ms/step), not 8%. Both rankings were reverted; the only direction left
+  is a per-slot reader-done event recorded at the end of that slot's own use.
+  `docs/PERF-ANALYSIS.md` section 12n.
+  **That per-slot mark is implemented and it is worth 13%**: `note_read(layer,
+  expert)` records ONE event for a slot's three cells at the end of that use
+  (`Backend::pool_note_reader_done`), the cell's next release ADOPTS it instead
+  of recording the default-stream position, and a hand-out drops any stale stamp
+  so an unstamped read path falls back to the old mark rather than waiting on too
+  little. REAP-288 at 4000 MiB: **181.3 -> 158.3 ms/step median, faster in 8 of 8
+  interleaved order-balanced pairs**, text identical, which takes the guard from
+  +24% to +8% against the racy arm. ~400 records/token (~1.2 ms), so it is gated
+  on `release_slices > 0`: with the auto budget (`reuse 0`) the first version
+  stamped 410 times a token for nothing and the counter is `reader-done 0` now.
+  `KRK_POOL_SLOT_MARK=0` is the A/B arm; the counter is on the `[stats ]
+  expert-pool` line. `docs/PERF-ANALYSIS.md` section 12o.
+  **Picking a victim whose readers have retired is NEUTRAL, so the last 8% is
+  not the victim choice.** With the mark in place, `force_reclaim` preferring a
+  slot whose reader-done mark predates the latest drain (a counter bumped by each
+  blocking D2H and by `sync()`, so "are this slot's readers done?" is a field
+  compare instead of the ~50 us `hipEventQuery`) gives **157.4 against 157.2
+  ms/step median, faster in 1 of 3 interleaved pairs**, with `reader-done` at
+  12.65-12.73k in both arms: the pick moves which cell is reused and nothing
+  else. Reverted. The reason is 12o's own result: a reused cell now waits for
+  exactly its readers, and a reclaim's candidates are almost always slots whose
+  last read was a token or more ago, so those marks are complete under either
+  rule. What is left is the ~1.2 ms of records plus the slot read inside the
+  current token, which preferring another victim just moves elsewhere.
+  `docs/PERF-ANALYSIS.md` section 12p.
+  **And the arm nearly recorded the opposite for a harness reason**: it was run
+  as `run KRK_EVICT_RETIRED=0` where `run` is a shell function, so `"$@"` put the
+  assignment on kraken's ARGV -- every treatment run died with `unknown option`,
+  all three identically, so their output md5s matched and it read as "same text,
+  safe". A *missing* metric (`ms/step` absent) is the tell; `env VAR=0 cmd` is
+  the form.
+  **One mark per burst of uses is the default now, and a record costs ~0.1 us,
+  not the ~2.5 us 12o assumed.** `note_read` queues the slot's cells and emits one
+  `pool_note_reader_done` per `KRK_POOL_MARK_BURST` uses (default **8** = one per
+  layer at top-k 8; `=1` is 12o's arm): REAP-288 at 4000 MiB **151.9 -> 150.9
+  ms/step median over 7 interleaved pairs, faster in 6**, records 12.7k -> 2.2k
+  over 32 tokens, text identical; Qwen3-30B-A3B is a wash (36.1/34.5 against
+  35.8/35.7) because the guard's wait is a smaller share of a 35 ms step. Three
+  rules make it safe: a later mark on the same stream is conservative (only the
+  waited-for position moves), the burst never spans a layer and is flushed at the
+  end of the expert section before the next-layer prefetch can trim or free a
+  cell, and `drop()` scrubs released cells from the pending set -- otherwise the
+  flush could stamp a pointer that is already back on the free list. The
+  arithmetic that matters: 328 fewer records/token bought ~0.03 ms/token, so the
+  records were never the constraint -- the wait is.
+  `docs/PERF-ANALYSIS.md` section 12q.
+  **The rest of the guard is stream order, not host stall, and the stats line now
+  says so.** `pool_honor_host_` times its `hipEventSynchronize` into
+  `honor_host_ms` and the `[stats ] expert-pool` line prints
+  `honour device/host/implicit ... host-wait <ms>`; on REAP-288 at 4000 MiB that
+  reads **device ~12.5k, host 0, implicit 0, host-wait 0.000 ms**, and the guard
+  measured against `KRK_POOL_NO_WAIT=1` (a deliberately racy measurement-only arm
+  that skips the wait and keeps the bookkeeping) is **152.1 against 149.4 ms/step
+  median, +2.7 ms, slower in 5 of 7 pairs**. The chain is
+  `hipStreamWaitEvent(pinned_stream_, mark)` -> DMA -> `hipStreamWaitEvent(0,
+  pinned_ev_)`, so the cost is the copy starting late, i.e. promotion latency.
+  ~390 honours a token means ~220 ns each: most marks are long complete. The only
+  fix left is supply-side (a reserve of free cells, or promoting ahead, which 12m
+  showed has no candidates) -- refining the wait has now been measured three times
+  (12n victim ranking, 12p retired victims, 12q records) and is exhausted.
+  `docs/PERF-ANALYSIS.md` section 12r.
+  **The prefill gap against Strata is a dispatch trade, and the matrix cores are
+  one flag away.** `exact_gemm_enabled()` routes every rows>1 GEMM to
+  `gemv_grid_kernel` (the chunk-invariant exact grid) BEFORE the WMMA rung, so
+  auto is 13x slower on the GEMM by design (`gemm(grid)` 716.97 device units at
+  5.4 efficiency against `gemm(wmma)` 53.02 at 80.5 on the same 252 calls).
+  `--prefill fast` sets `KRK_GEMM_PATH=wmma`: **307.0 -> 1707.0 tok/s** prefill on
+  Qwen3-4B-Q8_0 (5.56x, 1145 tokens) and **170.8 -> 325.5** on the 30B-A3B (the
+  expert path stays exact, so it gains less), and it is a different-arithmetic
+  mode: the 4-token text changes (`dbc606bb39b8` -> `b9d995daaa3a`) and the
+  prefill hash is identical at `--chunk 1`/`8` (the thin-row ladder agrees with
+  the grid) but differs from `--chunk 16` (`b3222295` -> `a48ba8d6`). Strata's own
+  `STRATA_HIP_WMMA=1` makes the same trade; the difference is the default.
+  `KRK_GRID_G` does not recover it (306.9-309.4 across 32-256). A matrix-core rung
+  whose accumulation order ignores the row count is the one route that keeps the
+  invariant AND the speed. `docs/PERF-ANALYSIS.md` section 12s.
 
 ## Line endings (this bites constantly)
 
@@ -687,6 +939,118 @@ code, the README, or `docs/`.
   Every A/B must be interleaved run-by-run, and a win must hold across
   repetitions. This session produced three separate false conclusions from
   sequential probes before interleaving was introduced.
+- **An expert WARM tier shorter than the routed set is churn, and the auto policy
+  no longer picks one.** Measured on the 78 GiB REAP-288 file (42.2 GiB routed
+  set, 7.2 GiB device budget): the old policy took half the free room (32.5 GiB)
+  for WARM and pinned a quarter of RAM (16 GiB), which gave 41.7% WARM hits,
+  **11.1% COLD (disk) misses and 190 MiB read from the file per token** --
+  6.4 tok/s. Sizing WARM to the corpus (42.4 GiB) and pinning the whole tier
+  gave 124-190 cold misses over 31 steps and **10.0 tok/s**, text unchanged in
+  every arm (2 interleaved order-balanced pairs; old policy forced with
+  `--expert-warm-mb 32571 --expert-pin-mb 16384`). The pin is a PREFIX in rank
+  order, so a partial one buys a partial speedup and the curve is monotone:
+  16 GiB 139.4 ms/step, 24 GiB 121.8, 42.4 GiB 103.1. Both rules are in code
+  (`Engine::init`'s auto WARM and `pinned_warm_prefix_bytes`, cap = half of
+  installed RAM) because flags cannot fix a default.
+  **The default then changed again on the 12d sweep, because the arithmetic
+  double-charged the pin.** `krk::warm_tier_bytes` / `krk::host_budget_bytes`
+  (`include/krk/vram_guard.hpp`) are now the whole policy: the corpus, capped
+  by 60% of installed RAM (the 80% ceiling minus the 20% reserve) or by free
+  RAM minus that reserve when smaller. Written out: 16 GiB installed -> 9.6 GiB
+  of room, 24 -> 14.4, 32 -> 19.2, 96 -> 57.6. The rule it replaced subtracted
+  a working-set headroom (`installed/5`) AND a pin allowance (`installed/16`,
+  capped 6 GiB) AND a 3 GiB floor on top of the reserve -- and the pin is *part
+  of* the tier, so those bytes were charged twice -- then halved the answer
+  again whenever the corpus exceeded the room. On a 16 GiB machine that is
+  8.8 GiB, halved to 4.4: the 3000-4000 MiB row of the sweep, 23.5 tok/s where
+  9.6 GiB of room was sitting there. So `--expert-warm-mb` is now a CAP on a
+  shared box, not a requirement: `--ram-tier 16` on A3B prints `9.6 GiB budget
+  ... -> WARM tier 9830 MiB [planned for the --ram-tier class]`, this box's
+  default is the corpus-limited 10008 MiB, and REAP-288 is unchanged here
+  (43200, its corpus) while `--ram-tier 16` gives it the same 9830. The sample
+  fails closed (`0`, no tier) rather than assuming an unmeasurable host.
+  Defaults against explicit caps, rotation-interleaved (the starting arm moves
+  each run; AGENTS' own rule), texts identical in every arm: A3B at a 4000 MiB
+  device budget, 48 tokens -- auto 10008 **36.0-36.1 tok/s**, 8000 34.9-35.3,
+  6000 33.7-33.9, 4400 **30.2-30.5** (4400 is what the old arithmetic picked, so
+  the default is worth +19.5%). REAP-288, 16 tokens -- auto 43200 **10.5-10.8**,
+  20000 5.7-7.8, 12000 6.8-7.1: **20000 LOSES to 12000**, because a tier between
+  the set and the room misses forever and the larger one pays a bigger pinned
+  fill first. That is why the auto answer is the corpus, not a fraction of it.
+  **It warns when it lands under the knee, once, naming the tier and the
+  projected read.** `krk::warm_miss_mib_per_layer` (vram_guard.hpp) is the 12d
+  sweep as arithmetic, `(corpus-warm)^2/corpus/50` per token over n_layer -- a
+  FIT, good to ~25%, so nothing is planned from it -- and
+  `warm_tier_under_knee` is the 0.5 MiB/layer line between the 6000 arm (0.64,
+  hidden only at the four-reader rate) and the 8000 one (0.16, hidden
+  everywhere). Only the AUTO path warns: an explicit `--expert-warm-mb` is a
+  decision, not a surprise. Measured with 50 GiB held by another process (33.5
+  GiB free of 95.9): REAP planned **14650 MiB instead of 43200**, printed
+  `... 34%, under the measured knee ... projected 7.86 MiB of file reads per
+  layer (377 MiB per token at 48 layers)`, and decoded 2.5 tok/s over 8 cold
+  tokens. So the auto tier DOES under-size on a busy box, by design -- it is
+  free-minus-reserve at that moment, never past it -- and the difference now is
+  that it says so. A3B on an idle 96 GiB box stays corpus-capped (10008) while
+  free RAM is above ~28.8 GiB. **The model file's own page cache does NOT
+  shrink the next run's tier, and that was measured rather than assumed**:
+  reading 32 GiB of the 78 GiB REAP file leaves Windows `ullAvailPhys` at
+  **82.9 GiB against 83.0 before** -- standby (file cache) counts as available --
+  and Linux's `MemAvailable` includes reclaimable page cache by construction.
+  The plan does not subtract the mapping either: `mapped_share` is printed as an
+  info line and appears nowhere else in `configure_expert_cache`. So the
+  43200 -> 14650 MiB shrink measured with 50 GiB held came from genuine
+  committed memory in another process, not from the file's cached pages. A
+  "measure the page cache separately" change would have to invent a correction
+  for a number that is already right, i.e. plan a tier past what is free.
+  **The routing readback is a DEPENDENCY DRAIN, not overhead, and that was
+  measured rather than argued** (2026-10-22, build with in-place + warm-ahead,
+  REAP-288, 48 layers, ctx 512). `KRK_TIME_HOST=1`: a 199 ms/step decode is
+  `moe.experts` 117.8, `moe.route.fetch` 47.8 (0.996 ms x 48), `moe.route.gemm`
+  0.2, and the host top-k + plan **1.8 ms/step** -- the 47.4 ms this bullet used
+  to attribute to "host top-k and plan" does not reproduce; the plan is 1.8.
+  Three numbers pin what the 47.8 IS:
+  (1) `KRK_ROUTER_2X=1`'s second copy, with the queue retired, is **95 us/layer**
+  -- so 0.9 of the 1.0 ms is not the copy;
+  (2) a pinned destination with `hipMemcpyAsync` + a spin on the recorded event
+  (three arms, 4 rotated pairs, text identical) changed `download_f32`'s host
+  time not at all (3264 against 2997 ms over a run) and the step not at all
+  (145.9/129.8/141.0, 139.4/141.0/139.1, 112.1/114.7/114.8, 113.6/113.3/121.6
+  ms/step for pageable-blocking / pinned-blocking / pinned-spin) -- so it is not
+  a driver or scheduler round trip either;
+  (3) A3B reads back in **0.477 ms/layer** at the same 48 layers against REAP's
+  **1.031** -- it scales with the layer's own pre-MoE GPU work.
+  So the host block IS the attention finishing, and the only way to delete it is
+  to take the host out of the routing loop: device selection + device dispatch,
+  which needs the routed set resident (42.2 GiB against a 9.2 GiB budget here).
+  `KRK_DEV_PLAN=1` is gated off by `ne <= 256` (this file has 288) and verifies
+  itself against the host anyway, so lifting the bound alone is not a speedup.
+  Do not re-derive this: docs/PERF-ANALYSIS.md 12g has the table.
+  **What is left on this configuration is the expert path**, not the router, and
+  TWO of the numbers this bullet first quoted were cold-fill artifacts -- do not
+  plan from a 16-token run (PERF-ANALYSIS 12i/12j):
+  (a) `alloc 4302 reuse 0` is NOT a reuse bug. A 16-token run never evicts
+  (`release 0 mark(s) for 0 slice(s)`), so nothing was freed and nothing could be
+  reused; at 128 tokens reuse is 25243. The real churn is the TRIM: at a
+  saturated budget a size-class miss hipFrees free cells of the other class and
+  hipMallocs the wanted one, and an expert is two classes (gate/up, down), so
+  ~100 pairs a step at ~190 us = **15.7 ms/step** (1988 ms over 128 tokens).
+  (b) The in-place read is **0.87 ms/step** in steady state, not 46: the 46 was
+  the cold-fill window. Sweeping the VRAM budget 3000 -> 8000 MiB buys -14.6% on
+  the step (136.7 -> 116.7 ms) and almost none of it is the in-place share
+  (23.8% -> 22.2%) -- extra residency converts WARM hits into HOT hits, i.e. it
+  removes PROMOTIONS (2988-3561 -> 2040-2351 ms).
+  **The trim churn has a principled fix and it was REJECTED: refusing instead of
+  trimming (return nullptr, let `force_reclaim()` evict a victim holding a slice
+  of the WANTED class) drops allocations 6601 -> 4219 and trims 2380 -> 4 and
+  halves the alloc row (1085.8 -> 506.9 ms for 64 tokens) -- and the step is
+  unchanged (103.6 against 103.9 ms median) while **stdout loses determinism**
+  (3 of 4 runs a different sentence at 64 tokens; 4/4 identical before). That is
+  the useful part of the result: under heavy eviction the cache can retire a slot
+  whose cells are still being written, which the trim path masks by never evicting
+  this often. Fix that race before touching the trim policy. Steady state at
+  8000 MiB, 114.4 ms/step: routing 89.2 (fetch 37.1 + expert loop 50.2, of which
+  alloc 15.7 and promote 17.4) and everything else ~25. Full trace: PERF-ANALYSIS
+  11, 12g, 12i and 12j.
 - **A decode step's cost is its op COUNT, and two folds that remove two launches
   per layer are default-on now.** `dst += W*x` in the GEMV epilogue
   (`gemv_kernel<256, true>`, `KRK_ACC_GEMM=0` restores `gemm()` +
@@ -2650,16 +3014,28 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   pinpoints a wrong block size in one run -- it is how the 17-vs-18 discrepancy
   was found -- where comparing a decode against the file's mapping cannot see it,
   because only the file's own offsets are authoritative.
-- **MLA is half-loaded, and the metadata KEYS are the trap.** `deepseek2` and
-  `deepseek4` are in the arch table and the loader reads their latent ranks,
-  but the engine still refuses them: there is no latent attention kernel, no
-  576-wide KV cache row and no YaRN-on-the-compressed-rope path. What landed:
-  the schema fields, the metadata parse, the legacy-lite weight load
-  (`attn_q` / `attn_kv_a_mqa` / `attn_kv_a_norm` / `attn_kv_b` /
-  `attn_output`), a host oracle for that layout in two orders
-  (`krk::mla_lite_forward_{unfolded,absorbed}`, pinned by the new
-  `test_mla_lite` group, 57 checks), and V4's own metadata (grouped output,
-  window, hash-route depth, compress_ratios, compressed rope base).
+- **MLA loads in all three layouts, and the ENGINE is what refuses it; the
+  metadata KEYS are the trap.** `deepseek2` and `deepseek4` are in the arch
+  table and the loader reads their latent ranks and every layout a file can
+  carry. The engine still refuses to GENERATE (no latent attention kernel, no
+  576-wide KV cache row, no YaRN-on-the-compressed-rope path), and that refusal
+  is `ArchSpec::attention_implemented` -- a flag the loader's
+  `KRK_ARCH_ALLOW_EXPERIMENTAL=1` hatch does NOT lift, because the hatch is
+  about reading tensors and the flag is about the graph. What the loader
+  reads is decided by the TENSORS a layer carries (one arch ships more than
+  one layout, and a file is what it carries) and required to be the same on
+  every layer: `Legacy` `attn_q` / `attn_kv_a_mqa` / `attn_kv_a_norm` /
+  `attn_kv_b` / `attn_output`; `Split` `attn_q_a` / `attn_q_a_norm` /
+  `attn_q_b` / `attn_kv_a` / `attn_kv_a_norm` / `attn_k_b` / `attn_v_b` /
+  `attn_output` (the V3 class); `Shared` `attn_q_a` / `attn_q_a_norm` /
+  `attn_q_b` / `attn_kv` / `attn_kv_a_norm` / `attn_output_a` /
+  `attn_output_b` (V4, whose head count is folded into the grouped output
+  instead of the KV). Every one is checked against the file's own metadata,
+  and a disagreement names the tensor and both shapes. `test_mla_loader` (66
+  checks) pins the three layouts, the two-layout mix, a short `attn_k_b`, an
+  int32 weight, the hash table's shape and the engine's refusal; `test_mla_lite`
+  (57) and `test_mla_absorb` pin the host oracle in two orders
+  (`krk::mla_lite_forward_{unfolded,absorbed}`).
   **The ranks are `key_length` / `value_length` / `kv_lora_rank` -- NOT
   `qk_nope_head_dim` / `qk_rope_head_dim` / `v_head_dim`, which no exporter
   writes and which refused every real file at load.** nope is
@@ -2674,14 +3050,16 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   shared-expert width with no `expert_shared_feed_forward_length` is derived
   (n_shared x n_ff_exp = 2 x 1408 = 2816) instead of staying 0, which used to
   refuse the file at the shared-expert check.
-  The V4 file is a different animal: `attn_q_a` / `attn_q_b` / `attn_kv` /
-  `attn_output_a` / `attn_output_b` (the modern split, refused BY NAME until
-  the split branch lands), plus `attn_sinks`, Sinkhorn `hc_*`,
-  `ffn_gate_tid2eid`, per-layer `attn_compressor_*` / `indexer_compressor_*`
-  and a QSA indexer -- and it is quant type #26, which this build cannot
-  dequantize at all, so it cannot load whatever the MLA work does. The next
-  pieces, in order: the modern split load, the latent decode kernel (one wide
-  row per token, not n_kv x head_dim), the 576-wide cache row, YaRN on the
+  What the V4 file still carries that nothing here reads: `attn_sinks`,
+  Sinkhorn `hc_*`, per-layer `attn_compressor_*` / `indexer_compressor_*` and
+  a QSA indexer. Its quant type #26 is NO LONGER a blocker -- that id is
+  ggml's I32, and the file's `ffn_gate_tid2eid` is a TABLE OF EXPERT IDS: read
+  as `i32` data on the host (`read_i32_table`) and never multiplied. The
+  loader refuses an int32 tensor handed to it as a matmul weight, the one
+  place that knows the difference between data and a weight -- letting one
+  through would have the GEMM read ids as coefficients: finite, fluent and not
+  the model. The next pieces, in order: the latent decode kernel (one wide row
+  per token, not n_kv x head_dim), the 576-wide cache row, YaRN on the
   compressed rope, then the prefill path.
 - **`n_embd % n_head != 0` is not a defect when the file declares
   `attention.key_length`.** `Model::load` enforces that identity only when

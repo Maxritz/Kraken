@@ -459,12 +459,23 @@ of 256 dims over a 5120-wide embedding, because `q_proj` is `2 * n_head * d`
 (it emits the query gate alongside the query). That identity is checked only
 when the head width has to be inferred from the embedding.
 
+**qwen4exp is no longer in this table (2026-10-22).** The family's graph, its
+hyper-connection residual, its PLE block and its QSA indexer all ran; what kept
+it refused was that no suite gate pinned the whole graph's output rather than
+one block of it. `test_qwen4exp_whole_graph` now does — the last prompt row's
+entire logits vector by hash, its argmax, the greedy sequence, and four arms
+that keep the pin from being vacuous (a different prompt moves it, chunk 1
+reproduces it, a shifted PLE table breaks it, and the fixture loads with
+`KRK_ARCH_ALLOW_EXPERIMENTAL` unset). With no hatch, the 78 GiB REAP-288 file
+loads as `supported (recurrent-moe)` and decodes `def add(a, b):` ->
+`    return a + b` at 5.2 tok/s prefill / 5.8 tok/s decode, expert-tier bound.
+
 ### Refused at load (on the sweep build; each with its reason)
 
 | reason | files |
 |---|---|
 | Speculative-head shard, not a model (runs only via `--draft`) | laguna-xs21-dflash-q8, laguna-s-2.1-DFlash-Q4_K_M, Qwen3.8-27B-DFlash2-Q2_K, Qwen3.8-27B-DFlash2-Q4_K_M, Qwen3.8-27B-DSpark-Q8_0, Qwen3.8-27B-DFlash-bootstrap-Q8_0, DeepSeek-V4-Flash-REAP-MTP, Ternary-Bonsai-27B-dspark-Q4_1 |
-| MLA / latent KV compression not implemented | GLM-4.7-Flash-Q4_K_M (deepseek2), DeepSeek-V4-Flash-imatrix (deepseek4) |
+| MLA: the legacy lite layout (V2-Lite) RUNS (576-wide latent cache row, absorbed scores, rope on the decoupled key); the split (V3 class) and shared-latent (V4) layouts are different graphs and are refused at init BY NAME | GLM-4.7-Flash-Q4_K_M (deepseek2, split layout), DeepSeek-V4-Flash-imatrix (deepseek4, shared latent) |
 | gemma4 geometry not implemented (shared-KV layers, sliding window, softcap) | gemma-4-E4B-it-Q4_K_M, gemma4-coding-Q6_K |
 | Mamba-2 blocks (nemotron_h) | nemotron-3-nano-4b-NVFP4 |
 | Fused QKV / attention output gate (spark2_5) | Spark-X2.5-4B-Q8_0 |
@@ -570,6 +581,15 @@ so the first decode steps do not pay a cold-cache page storm. Two switches drive
   experts-per-layer depth, how much WARM it filled, how much VRAM it added, bytes read, and
   the wall time. When a `.krakenexperts.json` ranking is present next to the GGUF it is read;
   without one the tiers are filled in even (layer) order instead.
+
+- `--prefill exact|fast` - `exact` (the default) keeps every prompt row's
+  arithmetic independent of `--chunk`: the rows>1 GEMM runs the chunk-invariant
+  exact grid, which is also why prompt throughput is not what the card can do.
+  `fast` takes those GEMMs to the RDNA4 matrix cores -- **307 -> 1707 tok/s** on
+  a 1145-token prompt through Qwen3-4B-Q8_0, 171 -> 326 on the 30B-A3B -- at the
+  price of it being a different-arithmetic mode: the generated text changes and
+  the prefill hash is no longer chunk-invariant past 8 rows per chunk. Numbers
+  and the device split: `docs/PERF-ANALYSIS.md` section 12s.
 
 - `--ram-tier N` - **a RAM class, not a MiB cap.** It accepts 16, 24, 32, 48, 64 or 96 (GiB) and
   plans the host WARM tier from the free-RAM budget that class implies, rather than from the
@@ -800,8 +820,10 @@ through the model's own `ExpertCache`; a dense block (`ffn_gate/up/down`, the
 qwen35 dense family's nextn heads) runs that FFN instead. On this box **15 of
 the 19 files carrying `nextn_predict_layers` run the probe** -- the other two
 are head-only shards with no base model, and the 57 GB `DeepSeek-V4-Flash` file
-is refused by its architecture (MLA, attention sinks, quant type 26) before MTP
-is reached. Acceptance over 8 greedy steps and two prompts is 50-100% on most:
+is refused by its architecture (MLA and attention sinks, neither of which has an
+implementation here) before MTP is reached -- its quant type #26 is not a
+blocker: that id is I32, and the file's `ffn_gate_tid2eid` is a table of expert
+ids, read as data. Acceptance over 8 greedy steps and two prompts is 50-100% on most:
 `Qwen3.8-27B-Q4_K_M` 8/8 and 6/8, `Qwen3.5-9B-Q4_K_M` 7/8 and 5/8,
 `Tiel-Coder-35B-A3B` 6/8 and 5/8, `Qwen3.8-Distill-35B-A3B` 5/8 and 4/8.
 
@@ -1006,12 +1028,21 @@ does the full host-side cut and is a different measurement.
 kraken -m /g/More-models/GLM-4.7-Flash-Q4_K_M.gguf --expert-cache-mb 2048 --expert-warm-mb 8192
 ```
 
-WARM is pageable host RAM by default. Cold read-throughs may be kept there, and
-a WARM expert promotes through a bounded pinned staging ring; ordinary VRAM
-eviction preserves an existing WARM copy without downloading it. Expert WARM
-shares live host-memory admission with KV WARM/COLD staging. The `--info` report
-shows WARM capacity/admissions, while the end-of-run report shows expert pool
-physical commitment separately from logical residency.
+WARM is host RAM by default. Cold read-throughs may be kept there, and a WARM
+expert promotes through a bounded pinned staging ring; ordinary VRAM eviction
+preserves an existing WARM copy without downloading it. Expert WARM shares live
+host-memory admission with KV WARM/COLD staging. The `--info` report shows WARM
+capacity/admissions, while the end-of-run report shows expert pool physical
+commitment separately from logical residency.
+
+**The size is automatic, and it is the largest one that leaves the OS room.**
+With no flag the tier takes the expert corpus capped by 60% of installed RAM
+(the 80% ceiling minus the 20% reserve) or by *free* RAM minus that reserve when
+that is smaller -- 9.6 GiB on a 16 GiB machine, 14.4 on 24, 57.6 on 96. On
+Qwen3-30B-A3B (9.6 GiB routed set) a 16 GiB class therefore gets the whole set,
+which is the tier that reads nothing from the file; a smaller tier on that file
+is the measured cliff (`docs/PERF-ANALYSIS.md` 12d), so `--expert-warm-mb` is
+now only for *capping* it on a box that is also doing something else.
 
 ### `--expert-pin-mb` - pin the hot prefix of that tier
 
@@ -1503,8 +1534,9 @@ byte budget. The policy is **LFU with aging**: every hit earns a counter, a hot
 counter pins the slot against eviction, and periodic decay releases pins when
 traffic moves on. Without a pin an expert goes to least-frequent, then oldest.
 
-The second tier is inclusive **pageable host RAM**: `--expert-warm-mb N`
-(old spelling `--expert-l2-mb`) sets its per-tier capacity limit. Cold reads may
+The second tier is inclusive **host RAM**: `--expert-warm-mb N`
+(old spelling `--expert-l2-mb`) caps its per-tier capacity, and the auto size is
+the largest the machine can spare (see above). Cold reads may
 land there before promotion, and VRAM eviction keeps any existing WARM copy
 without downloading it. A later demand promotes through a bounded pinned
 staging ring. This tier shares process-wide live host-memory admission with KV

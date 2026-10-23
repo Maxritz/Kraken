@@ -15,6 +15,7 @@
 // generation is dominated by *first* touches, and those are a miss the policy
 // above can never turn into a hit.
 #include "krk/expert_cache.hpp"
+#include "krk/host_time.hpp"
 #include "krk/vram_guard.hpp"
 
 #include <chrono>
@@ -59,6 +60,33 @@ struct MsTimer {
                                .count();
         *acc += ms;
         if (acc2) *acc2 += ms;
+    }
+};
+
+// HostTime twin of MsTimer: the tier counters say what the cache spent inside
+// its own phases, but they never appeared in the host table, so a run whose
+// step time was mostly *reading experts off the disk tier* reported that time
+// under "unaccounted" and looked like it was somewhere else entirely. A read is
+// the one host cost on a big MoE that no backend op can see (it is a pread, not
+// a kernel), so it is measured here, in the same table as the phases it sits
+// inside.
+struct HostAdd {
+    const char *name;
+    bool concurrent;
+    std::chrono::steady_clock::time_point t0;
+    explicit HostAdd(const char *n, bool conc = false)
+        : name(n), concurrent(conc), t0(std::chrono::steady_clock::now()) {}
+    HostAdd(const HostAdd &) = delete;
+    HostAdd &operator=(const HostAdd &) = delete;
+    ~HostAdd() {
+        if (!krk::HostTime::get().on()) return;
+        const krk::f64 ms = std::chrono::duration<krk::f64, std::milli>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
+        krk::HostTime::get().add(name, ms, concurrent);
+    }
+    void bytes(krk::i64 n) {
+        if (krk::HostTime::get().on()) krk::HostTime::get().add_bytes(name, n);
     }
 };
 
@@ -169,6 +197,14 @@ void ExpertCache::set_vram_budget(size_t bytes) {
 }
 
 void ExpertCache::clear() {
+    // The read-ahead worker holds buffers that are about to stop being reachable
+    // from the slots below: stop it first, or a completed entry installs itself
+    // into a generation that no longer exists.
+    prefetch_warm_join();
+    {
+        std::lock_guard<std::mutex> lk(pf_mu_);
+        pf_stop_ = false; // a cleared cache may be used again
+    }
     // The published table points at slots this call is about to release.
     release_dispatch_table();
     for (auto &kv : slots_) {
@@ -256,9 +292,50 @@ u32 ExpertCache::touch_count(i32 layer, i32 expert) const {
     return it == slots_.end() ? 0u : it->second.count;
 }
 
+// How many expert uses share one reader-done event. A decoder layer's uses are
+// contiguous on the default stream, so n of them can share a single event at the
+// cost of a slightly later mark -- and the mark is only what a REUSE waits for,
+// which for a cell evicted a layer later is already long past. 8 is one record
+// per layer at top-k 8: 12.7k records become 2.2k over 32 tokens on REAP-288 and
+// the step is 0.7% faster (faster in 6 of 7 interleaved pairs). 1 restores one
+// record per use, which is what section 12o measured.
+// `KRK_POOL_MARK_BURST=<n>` is the arm; docs/PERF-ANALYSIS.md section 12q.
+static u32 read_burst() {
+    static const u32 v = [] {
+        const char *e = std::getenv("KRK_POOL_MARK_BURST");
+        const int n = e && *e ? std::atoi(e) : 8;
+        return static_cast<u32>(n < 1 ? 1 : (n > 512 ? 512 : n));
+    }();
+    return v;
+}
+
 // Read-only residency probes. Deliberately not touch(): a caller that is
 // deciding whether to *avoid* a promotion must be able to ask without changing
 // the LFU counters or the load order that the eviction policy ranks on.
+void ExpertCache::note_read(i32 layer, i32 expert) {
+    if (!be_) return;
+    const auto it = slots_.find(slot_key(layer, expert));
+    if (it == slots_.end()) return;
+    Slot &s = it->second;
+    if (!s.in_vram()) return; // an in-place read touches no pool cell
+    // The pending burst belongs to ONE layer: a mark recorded after the next
+    // layer's first read would still be correct, but it would also cover that
+    // read, and the point of the per-slot mark is to be as tight as possible.
+    if (layer != rd_pending_layer_ && !rd_pending_.empty()) flush_read_notes();
+    rd_pending_layer_ = layer;
+    for (QuantTensor *q : {&s.m.gate, &s.m.up, &s.m.down})
+        if (q->present() && q->data) rd_pending_.push_back(q->data);
+    if (++rd_pending_experts_ >= read_burst()) flush_read_notes();
+}
+
+void ExpertCache::flush_read_notes() {
+    if (!rd_pending_.empty() && be_)
+        be_->pool_note_reader_done(rd_pending_.data(),
+                                   static_cast<int>(rd_pending_.size()));
+    rd_pending_.clear();
+    rd_pending_experts_ = 0;
+}
+
 bool ExpertCache::in_vram(i32 layer, i32 expert) const {
     const auto it = slots_.find(slot_key(layer, expert));
     return it != slots_.end() && it->second.in_vram();
@@ -480,7 +557,48 @@ void ExpertCache::drop(Slot &s) {
     }
     s.m = {};
     table_stale_ = true;
+    // A cell that is on its way back must not stay in the pending burst: the
+    // flush would still record a mark for it, and the release that just happened
+    // owns that slot's lifetime from here. Scrubbing is over at most
+    // 3 * burst entries (the burst is one layer's worth of uses).
+    if (!rd_pending_.empty()) {
+        for (int i = 0; i < n; i++)
+            rd_pending_.erase(std::remove(rd_pending_.begin(), rd_pending_.end(), cells[i]),
+                              rd_pending_.end());
+    }
     if (n) be_->release_pooled_batch(cells, lens, n);
+}
+
+const ResidentExpert *ExpertCache::acquire_inplace(const ExpertSource &src,
+                                                   i32 layer, i32 expert) {
+    if (!be_ || !src.present()) return nullptr;
+    if (expert < 0 || expert >= src.n_expert) return nullptr;
+    auto it = slots_.find(slot_key(layer, expert));
+    if (it == slots_.end()) return nullptr;
+    Slot &s = it->second;
+    // Already on the card: use it there. Device memory reads at 485 GiB/s
+    // against 24.3 GiB/s for pinned host memory on this card, so a resident
+    // expert has nothing to gain from being read from RAM.
+    if (s.in_vram() || s.staged) return nullptr;
+    // Pageable WARM is not addressable from the device (only the pinned pool
+    // is), so those slots keep the promotion path.
+    if (!s.in_host() || !s.host_pinned) return nullptr;
+    // An expert that has been asked for before goes where REUSE is fast. The
+    // counter is the tier's own signal and the threshold is measured, not chosen:
+    // gating on `pinned` (24 touches) instead kept every reused expert out of
+    // VRAM for a whole run, and on Qwen3-30B-A3B -- where the routed set fits and
+    // 84.6% of picks are repeats -- that cost 20% (42.9 ms/step against 33.7)
+    // because 45.7% of acquires read 24.3 GiB/s host memory where a promotion
+    // would have served them from the card forever. ONE in-place read pays for
+    // itself immediately (it is the read the promotion would have copied); the
+    // second use is where device memory wins by 20x, and that is `count >= 2`.
+    if (s.count >= 2) return nullptr;
+    ++total_acquires_;
+    ++inplace_hits_;
+    touch(s);
+    xtrace(layer, expert, 1);
+    if (++acquires_ >= decay_period()) decay();
+    return &s.h;
 }
 
 void ExpertCache::drop_host(Slot &s) {
@@ -614,6 +732,15 @@ bool ExpertCache::force_reclaim(size_t want) {
     // cells out by rounded size, so a released cell of another class does not
     // satisfy this allocation at all. Unpinned first, then pinned -- the ring's
     // promise is still weaker than a run that cannot proceed.
+    //
+    // It takes the first match on purpose, and three refinements of it are
+    // measured: ordering the class like `pick_victim` (rarest, then oldest load),
+    // ordering it by true least-recently-read, and preferring a slot whose
+    // readers are already retired. The first two lose (a full scan per reclaim
+    // costs more than it saves) and the third is neutral -- because the per-slot
+    // reader-done mark already made the reuse wait land on that slot's own
+    // readers, so there is no wait left for the victim choice to remove.
+    // `docs/PERF-ANALYSIS.md` sections 12n and 12p.
     if (want) {
         for (int pass = 0; pass < 2 && !found; pass++) {
             for (const auto &kv : slots_) {
@@ -668,6 +795,26 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
     const bool pin = host_pin_bytes_ > 0 && host_need > 0 &&
                      host_pinned_bytes_ + host_need <= host_pin_bytes_;
     s.host_pinned = pin;
+    // ---- allocate every slice, then read them as ONE batch -----------------
+    //
+    // This used to be three `read_host` calls, i.e. one file HANDLE at queue
+    // depth 1 for the whole fill. Measured with tools/probe_readspeed.cpp on
+    // this box, from the page cache at the 1792 KiB slice size this model uses:
+    // 1 reader 7.37 GB/s, 2 readers 10.96, 4 readers 13.02, 8 no better. The
+    // engine's own row read 3.9 GB/s -- half of what a single reader gets
+    // standalone and a third of the pool -- because the three slices of one
+    // expert are three megabytes apart in the file and were being serialised
+    // through that one handle.
+    //
+    // `read_host_batch` is the backend's reader pool (KRK_WARM_READERS, default
+    // 4), which is what prefetch_layer already uses for a whole layer's routed
+    // set. Handing it the expert's own three slices is the same shape at the
+    // granularity the miss actually arrives at, so a cold expert stops paying
+    // the serial cap. It keeps read_host's fallback (the mapping memcpy) for a
+    // file path that is unavailable.
+    void *dst[3] = {nullptr, nullptr, nullptr};
+    const void *srcp[3] = {nullptr, nullptr, nullptr};
+    int ndst = 0;
     size_t bytes = 0;
     for (int i = 0; i < 3; i++) {
         const GgufTensor *t = from[i];
@@ -679,28 +826,71 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
         // bytes come out of the driver's pin pool, which host_pin_bytes_ bounds
         // instead, and charging both would double-count the same RAM.
         void *p = pin ? be_->alloc_host(per) : be_->alloc_host_pageable_budgeted(per);
-        // Partial copies are dropped by the caller, which calls drop_host and
-        // therefore frees whatever landed with the matching deallocator.
-        if (!p) return false;
+        if (!p) {
+            // Nothing is handed to the slot until the whole fill succeeds, so
+            // the partial allocations are released here rather than left to
+            // drop_host: a slot holding some slices and not others is a state
+            // the promotion path would have to defend against.
+            for (int j = 0; j < ndst; j++) {
+                if (!dst[j]) continue;
+                if (pin) be_->release_host(dst[j]);
+                else be_->release_host_pageable_budgeted(dst[j]);
+            }
+            return false;
+        }
+        dst[ndst] = p;
+        srcp[ndst] = t->data + static_cast<size_t>(expert) * per;
+        ndst++;
+        bytes += per;
+    }
+    if (ndst == 0) return false;
+    {
         // A read() out of the page cache, not a memcpy of the mapping: the
         // mapping faults one 4 KiB page at a time and would leave a resident
         // page per staged byte, so the tier would cost the model's size in RAM
-        // on top of itself. read_host falls back to the mapping when the file
-        // path is unavailable.
-        const void *mapped = t->data + static_cast<size_t>(expert) * per;
+        // on top of itself.
+        // One request per slice. Splitting each slice in half to reach a queue
+        // depth of six was measured and REJECTED: the pool sorts the requests
+        // by offset and gives each worker one contiguous run, so six requests
+        // over four workers still lands as three streams (2+2+2, the fourth
+        // worker idle) -- 6.1 GB/s against 6.3 for three, same text. The pool's
+        // distribution, not the request count, is what shapes the read.
+        Backend::ReadReq reqs[3];
+        int nreq = 0;
+        int k = 0;
+        for (int i = 0; i < 3; i++) {
+            if (!from[i] || s.slice[i] == 0) continue;
+            reqs[nreq].dst = dst[k];
+            reqs[nreq].mapped_src = srcp[k];
+            reqs[nreq].bytes = s.slice[i];
+            nreq++;
+            k++;
+        }
         try {
             MsTimer t(&read_ms_, phase_sink(&pf_read_ms_, &dc_read_ms_));
-            if (!be_->read_host(p, mapped, per)) std::memcpy(p, mapped, per);
+            // `warm.read` is the DISK-TIER read a cold expert pays: a pread
+            // (or a mapping memcpy) on the calling thread, serial with the
+            // layer that wants the expert. On a model whose routed set does not
+            // fit, this row is the step.
+            HostAdd h("expert.warm.read");
+            be_->read_host_batch(reqs, nreq);
+            h.bytes(static_cast<krk::i64>(bytes));
         } catch (...) {
-            if (pin) be_->release_host(p);
-            else be_->release_host_pageable_budgeted(p);
+            for (int j = 0; j < ndst; j++) {
+                if (pin) be_->release_host(dst[j]);
+                else be_->release_host_pageable_budgeted(dst[j]);
+            }
             return false;
         }
-        to[i]->data = p;
+    }
+    for (int i = 0, k = 0; i < 3; i++) {
+        const GgufTensor *t = from[i];
+        const size_t per = s.slice[i];
+        if (!t || per == 0) continue;
+        to[i]->data = dst[k++];
         to[i]->type = t->type;
         to[i]->n_in = static_cast<i64>(t->ne[0]);
         to[i]->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
-        bytes += per;
     }
     s.host_bytes = bytes;
     if (pin) host_pinned_bytes_ += bytes;
@@ -1911,5 +2101,229 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
     bytes_staged_ += total;
     return total;
 }
+
+
+
+// ---- the next layer's set, read while this layer computes -------------------
+//
+// Measured shape this exists for (REAP-288, --expert-cache-mb 8000
+// --expert-warm-mb 20000): 274 MiB/token of file reads, 0.80 ms per layer, all
+// of it on the host thread and serial with the layer's GPU work. The read
+// depends on nothing the current layer computes, so it moves to a worker thread
+// one layer ahead.
+//
+// Two rules keep this safe without locking the whole cache:
+//
+//  * the worker never touches `slots_`. It only allocates pinned buffers and
+//    copies bytes into them, so the slot map, the ledgers and the eviction scan
+//    stay single-threaded; `take_prefetched` (host thread) installs the result.
+//  * the read is a memcpy out of the MAPPING, not Backend::read_host. The
+//    backend's reader owns file handles and reader threads of its own, and a
+//    second thread inside it is a race over those handles. The mapping is
+//    read-only, so a memcpy from it is safe from any thread -- and it is what
+//    the blocking path measured anyway (274 MiB in 38 ms = 7.2 GiB/s, which is
+//    page-cache speed, not device speed).
+bool ExpertCache::has_warm(i32 layer, i32 expert) const {
+    const auto it = slots_.find(slot_key(layer, expert));
+    return it != slots_.end() && it->second.in_host();
+}
+
+void ExpertCache::pf_free(PfEntry &e) {
+    for (int i = 0; i < 3; i++) {
+        if (e.t[i].p && be_) be_->release_host(e.t[i].p);
+        e.t[i].p = nullptr;
+    }
+}
+
+void ExpertCache::pf_worker() {
+    for (;;) {
+        ExpertSource src{};
+        i32 layer = -1;
+        std::vector<i32> ids;
+        {
+            std::unique_lock<std::mutex> lk(pf_mu_);
+            pf_cv_.wait(lk, [this] { return pf_stop_ || !pf_ids_.empty(); });
+            if (pf_stop_) return;
+            src = pf_src_;
+            layer = pf_layer_;
+            ids.swap(pf_ids_);
+        }
+        const GgufTensor *from[3] = {src.gate, src.up, src.down};
+        for (i32 e : ids) {
+            {
+                std::lock_guard<std::mutex> lk(pf_mu_);
+                pf_at_layer_ = layer;
+                pf_at_expert_ = e;
+            }
+            PfEntry ent;
+            ent.layer = layer;
+            ent.expert = e;
+            bool ok = true;
+            for (int i = 0; i < 3 && ok; i++) {
+                const GgufTensor *t = from[i];
+                const size_t per = src.per_expert(t);
+                if (!t || per == 0) continue;
+                void *p = be_ ? be_->alloc_host(per) : nullptr;
+                if (!p) {
+                    ok = false;
+                    break;
+                }
+                const void *mapped = t->data + static_cast<size_t>(e) * per;
+                try {
+                    // Concurrent: this runs while the main thread decodes, so
+                    // the row is marked and is not additive with decode.step.
+                    HostAdd h("expert.ahread", true);
+                    std::memcpy(p, mapped, per);
+                    h.bytes(static_cast<krk::i64>(per));
+                } catch (...) {
+                    be_->release_host(p);
+                    ok = false;
+                    break;
+                }
+                ent.t[i].p = p;
+                ent.t[i].len = per;
+                ent.t[i].type = t->type;
+                ent.t[i].n_in = static_cast<i64>(t->ne[0]);
+                ent.t[i].n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
+                ent.bytes += per;
+            }
+            if (!ok) {
+                pf_free(ent);
+                continue;
+            }
+            std::lock_guard<std::mutex> lk(pf_mu_);
+            if (pf_stop_) {
+                pf_free(ent);
+                return;
+            }
+            if (pf_done_.size() >= kPfDoneMax) {
+                ++pf_dropped_;
+                pf_free(ent);
+                continue;
+            }
+            pf_done_bytes_ += ent.bytes;
+            pf_done_.push_back(std::move(ent));
+            pf_at_layer_ = -1;
+            pf_at_expert_ = -1;
+            pf_cv_.notify_all(); // a waiter may be blocked on exactly this entry
+        }
+        {
+            std::lock_guard<std::mutex> lk(pf_mu_);
+            pf_at_layer_ = -1;
+            pf_at_expert_ = -1;
+        }
+        pf_cv_.notify_all();
+    }
+}
+
+void ExpertCache::prefetch_warm_next(const ExpertSource &src, i32 layer,
+                                     const i32 *ids, int n) {
+    if (!be_ || !src.present() || n <= 0) return;
+    {
+        std::lock_guard<std::mutex> lk(pf_mu_);
+        // One job in flight: a request that arrives while the worker is still
+        // reading the previous layer is already late, and queueing it would only
+        // make the next layer's read start later than it already has.
+        if (!pf_ids_.empty()) return;
+        if (pf_done_.size() >= kPfDoneMax) return;
+        pf_src_ = src;
+        pf_layer_ = layer;
+        pf_ids_.assign(ids, ids + n);
+        ++pf_issued_;
+        if (!pf_thread_.joinable())
+            pf_thread_ = std::thread([this] { pf_worker(); });
+    }
+    pf_cv_.notify_one();
+}
+
+bool ExpertCache::take_prefetched(i32 layer, i32 expert) {
+    PfEntry ent;
+    {
+        std::unique_lock<std::mutex> lk(pf_mu_);
+        // In flight for THIS expert: wait for it rather than read the same bytes
+        // twice. The wait is bounded by one expert's read (~0.1-0.3 ms) and the
+        // GPU is running the earlier experts of the layer throughout.
+        pf_cv_.wait(lk, [&] {
+            return pf_stop_ ||
+                   !(pf_at_layer_ == layer && pf_at_expert_ == expert);
+        });
+        if (pf_stop_ || pf_done_.empty()) return false;
+        auto it = pf_done_.end();
+        for (auto i = pf_done_.begin(); i != pf_done_.end(); ++i)
+            if (i->layer == layer && i->expert == expert) {
+                it = i;
+                break;
+            }
+        if (it == pf_done_.end()) return false;
+        ent = std::move(*it);
+        pf_done_bytes_ -= it->bytes;
+        pf_done_.erase(it);
+    }
+    // The layer got there first, or there is no tier to put it in: the bytes are
+    // a duplicate and go back. Never a different answer, only a wasted read.
+    auto sit = slots_.find(slot_key(layer, expert));
+    if ((sit != slots_.end() && sit->second.in_host()) || !be_ ||
+        host_budget_ == 0) {
+        pf_free(ent);
+        return false;
+    }
+    make_warm_room(ent.bytes);
+    if (host_bytes_ + ent.bytes > host_budget_) {
+        ++warm_rejects_;
+        pf_free(ent);
+        return false;
+    }
+    QuantTensor *to[3] = {nullptr, nullptr, nullptr};
+    Slot s;
+    s.layer = layer;
+    s.expert = expert;
+    to[0] = &s.h.gate;
+    to[1] = &s.h.up;
+    to[2] = &s.h.down;
+    for (int i = 0; i < 3; i++) {
+        if (!ent.t[i].p) continue;
+        s.slice[i] = ent.t[i].len;
+        to[i]->data = ent.t[i].p;
+        to[i]->type = ent.t[i].type;
+        to[i]->n_in = ent.t[i].n_in;
+        to[i]->n_out = ent.t[i].n_out;
+    }
+    s.host_bytes = ent.bytes;
+    s.host_pinned = true; // alloc_host() is the pinned allotator
+    s.count = 1;          // a read-ahead is not a hit: one touch, like a load
+    s.seq = seq_++;
+    host_bytes_ += ent.bytes;
+    host_pinned_bytes_ += ent.bytes;
+    ++warm_admissions_;
+    ++pf_taken_;
+    pf_taken_bytes_ += ent.bytes;
+    if (sit != slots_.end()) {
+        // A VRAM-only slot: attach the WARM copy without disturbing residency.
+        Slot &old = sit->second;
+        old.h = s.h;
+        old.host_bytes = s.host_bytes;
+        old.host_pinned = true;
+        for (int i = 0; i < 3; i++)
+            if (s.slice[i]) old.slice[i] = s.slice[i];
+    } else {
+        slots_.emplace(slot_key(layer, expert), std::move(s));
+    }
+    return true;
+}
+
+void ExpertCache::prefetch_warm_join() {
+    {
+        std::lock_guard<std::mutex> lk(pf_mu_);
+        pf_stop_ = true;
+        pf_ids_.clear();
+    }
+    pf_cv_.notify_all();
+    if (pf_thread_.joinable()) pf_thread_.join();
+    for (auto &e : pf_done_) pf_free(e);
+    pf_done_.clear();
+    pf_done_bytes_ = 0;
+}
+
+ExpertCache::~ExpertCache() { prefetch_warm_join(); }
 
 } // namespace krk

@@ -1,9 +1,39 @@
 # Supporting qwen4exp: the measured inventory, the pieces, and the gates
 
-Status, 2026-10-09. `qwen4exp` (Qwen3.8-Flash-Next and its REAP expert-reduced
-repacks) is now a *named* family in the architecture table — refused, as before, but
-"not in the architecture table; read against llama defaults" is gone, which was the
-wrong claim: the engine cannot run it, and now it says so and lists the pieces.
+**Status 2026-10-22: SUPPORTED.** The family is `ArchSupport::Yes` in the
+architecture table and no longer needs `KRK_ARCH_ALLOW_EXPERIMENTAL`. What
+changed is the GATE, not the graph: every block had its own group and none of
+them pinned the sentence, which is what kept the row at No.
+`test_qwen4exp_whole_graph` is that gate — the last prompt position's **whole
+logits row** is pinned by hash (261 values on the fixture, FNV over the f32 bit
+patterns), `argmax` and the greedy sequence are pinned beside it, and four arms
+keep the pin from being vacuous: a different prompt moves the row, chunk 1
+reproduces it, a shifted PLE table breaks it, and the fixture loads with the
+development hatch **unset**. Proven by red construction: skipping `ple_block`
+entirely fails 5 of its 18 checks (row hash, argmax, the PLE sensitivity arm and
+both text pins), so the gate is not a constant.
+
+The anchor behind the pin is the real file. On
+`H:\OLLAMA-Models\GGUF\qwen3.8-flash-next-reap-288-Q4_K_M.gguf` (1224 tensors,
+78.04 GiB) the graph reproduces llama.cpp's greedy continuation of "The capital
+of France is" for 24 of 24 tokens, and on this build — with no hatch — it loads
+and generates code:
+
+```
+prompt "def add(a, b):"  ->      return a + b
+prefill 5.2 tok/s | decode 5.8 tok/s (171.2 ms/step)
+```
+
+Those numbers are the tier's, not the graph's: 42.2 GiB of routed experts through
+a 7.2 GiB VRAM budget, so the row is a correctness claim at a slow rate.
+
+---
+
+Historical status, 2026-10-09. `qwen4exp` (Qwen3.8-Flash-Next and its REAP
+expert-reduced repacks) became a *named* family in the architecture table —
+refused at the time, but "not in the architecture table; read against llama
+defaults" was gone, which was the wrong claim: the engine could not run it, and
+from then on it said so and listed the pieces.
 
 Everything below comes from the file itself
 (`H:\OLLAMA-Models\GGUF\qwen3.8-flash-next-reap-288-Q4_K_M.gguf`, 1224 tensors,

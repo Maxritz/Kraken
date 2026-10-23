@@ -111,6 +111,101 @@ inline size_t host_reserve_bytes(size_t installed) {
     return share > 2 * gib ? share : 2 * gib;
 }
 
+// The host RAM this run may plan for, in bytes: the largest commitment that
+// leaves the OS its `host_reserve_bytes`.
+//
+// The ceiling is 80% of installed by default and the reserve is the other 20%,
+// so `ceiling - reserve` is 60% -- which looks like it leaves the OS 40% and
+// that is exactly what it does. The WARM tier used to be sized by subtracting
+// three more things on top of the reserve (a working-set headroom of installed/5,
+// a pin allowance of installed/16, and a 3 GiB floor), and because the pin is
+// *part of* the tier that arithmetic charged the same bytes twice: on a 16 GiB
+// machine it held back 7.2 GiB of 16 for a tier of 8.8 GiB, then halved that
+// again to 4.4 GiB because the corpus was bigger than the room. Measured on
+// Qwen3-30B-A3B at a 4000 MiB device budget (`docs/PERF-ANALYSIS.md` 12d), the
+// tiers on that line are 23.5 tok/s at 3000 MiB and 29.4 at 8000: the halving
+// rule was choosing the bad side of a cliff.
+//
+// The live sample is the second half of the same rule: never plan past what is
+// free right now minus the reserve. An unreadable sample fails closed, because
+// an unmeasurable host is not permission to consume it.
+inline size_t host_budget_bytes(size_t installed, size_t live_available) {
+    if (installed == 0 || live_available == 0) return 0;
+    const size_t reserve = host_reserve_bytes(installed);
+    const size_t ceiling = mem_ceiling_bytes(installed);
+    size_t room = ceiling > reserve ? ceiling - reserve : 0;
+    if (live_available > reserve && live_available - reserve < room)
+        room = live_available - reserve;
+    return room;
+}
+
+// The automatic WARM tier, in bytes.
+//
+// The largest host expert tier that leaves the OS its reserve, capped at the
+// corpus (a tier past the corpus is a duplicate of the file) and dropped to 0
+// below `expert_floor_bytes` (a few complete experts -- under that a tier is a
+// round-trip of the same bytes with extra bookkeeping). `corpus_bytes == 0` is a
+// dense model and answers 0: there is no expert tier to size.
+//
+// This is the whole default policy, so the numbers a machine would get are
+// checkable without owning the machine: 16 GiB installed answers 9.6 GiB of room
+// (12.8 ceiling - 3.2 reserve) clamped by live free RAM, 24 GiB answers 14.4,
+// 96 GiB answers 57.6. The corpus then decides: Qwen3-30B-A3B's 9.6 GiB routed
+// set fills a 16 GiB machine's tier exactly, and REAP-288's 42.2 GiB takes its
+// 57.6 GiB cap on a workstation.
+inline size_t warm_tier_bytes(size_t installed, size_t live_available,
+                              size_t corpus_bytes, size_t expert_floor_bytes) {
+    if (corpus_bytes == 0) return 0;  // dense: no expert corpus to cache
+    size_t room = host_budget_bytes(installed, live_available);
+    if (room > corpus_bytes) room = corpus_bytes;
+    return room >= expert_floor_bytes ? room : 0;
+}
+
+// What an under-sized tier costs, in file bytes read per LAYER per token.
+//
+// This is the 12d sweep written as arithmetic, because a warning has to name a
+// number and the alternative -- a hard-coded "the tier is small" line -- would
+// fire on files where a small tier is fine. Measured on Qwen3-30B-A3B (10008 MiB
+// routed set, 48 layers), 4000 MiB device budget, 48 greedy tokens:
+//
+//   tier    coverage   COLD%   file MiB/token   per layer
+//   3000     30%       14.2%        98.9          2.06
+//   4000     40%       13.0%        90.2          1.88
+//   6000     60%        4.4%        30.6          0.64
+//   8000     80%        1.1%         7.9          0.16
+//  12000    100%        0.0%         0            0
+//
+// The read-ahead worker hides a read behind a layer's own compute (~0.66 ms
+// there), so bytes per LAYER is the figure that decides whether the drive is
+// felt: 0.16 stays hidden even at a single-queue 593 MiB/s NVMe, 0.64 needs the
+// 1446 MiB/s four-reader rate, 1.9 hides at no drive rate.
+inline double warm_miss_mib_per_layer(size_t corpus_bytes, size_t warm_bytes,
+                                      int n_layer) {
+    if (corpus_bytes == 0 || n_layer <= 0) return 0.0;
+    if (warm_bytes >= corpus_bytes) return 0.0;  // the whole set cached: no reads
+    // (corpus - warm)^2 / corpus / 50. The form is "missing footprint times the
+    // chance a demanded expert is outside the tier"; the 1/50 is fitted to the
+    // five rows above (8.1/32.4/72.9/99.0 MiB per token against the measured
+    // 7.9/30.6/90.2/98.9, so ~25% at worst, and 0 at full coverage by
+    // construction). It is a fit, not a mechanism: good enough for a warning and
+    // for sizing a projection to a factor of two, and nothing should be planned
+    // from it.
+    const double short_bytes = static_cast<double>(corpus_bytes) -
+                               static_cast<double>(warm_bytes);
+    const double corpus = static_cast<double>(corpus_bytes);
+    const double bytes_per_token = short_bytes * short_bytes / corpus / 50.0;
+    return bytes_per_token / static_cast<double>(n_layer) / (1024.0 * 1024.0);
+}
+
+// Is that tier on the bad side of the measured knee? 0.5 MiB per layer sits
+// between the 6000 MiB arm (0.64, hidden only at the four-reader rate) and the
+// 8000 MiB one (0.16, hidden everywhere): above it a run is drive-dependent, so
+// it is worth one line saying so rather than a silent 4x.
+inline bool warm_tier_under_knee(size_t corpus_bytes, size_t warm_bytes,
+                                 int n_layer) {
+    return warm_miss_mib_per_layer(corpus_bytes, warm_bytes, n_layer) > 0.5;
+}
+
 // Does staging another `need` bytes leave the reserve untouched? `pending` is
 // the set of buffers already allocated for a batch read but not yet reflected
 // in the OS's available-memory measurement (pageable allocations can commit on
@@ -156,11 +251,22 @@ inline bool host_staging_fits(size_t need, size_t available, size_t reserve,
 inline size_t pinned_warm_prefix_bytes(size_t warm_bytes, size_t ram_installed) {
     if (warm_bytes == 0 || ram_installed == 0) return 0;
     if (warm_bytes < 65536) return 0;  // a tier smaller than a page is not an arena
-    const size_t gib = static_cast<size_t>(1) << 30;
-    size_t want = ram_installed / 4u;  // 24 GiB on a 96 GiB box
-    const size_t cap = 16 * gib;       // no run claims more than this
-    if (want > cap) want = cap;
-    if (want > warm_bytes) want = warm_bytes;  // the whole tier when it fits
+    // Pin the whole tier, up to half of installed RAM. The old rule pinned a
+    // quarter (capped at 16 GiB), which is only right if a partial prefix is
+    // worth roughly a partial speedup -- and it is not: the prefix is a PREFIX
+    // in rank order, so every expert past its end still pays the pageable copy.
+    //
+    // Measured on the 42.2 GiB REAP-288 set, device budget 7.2 GiB, warm tier
+    // 42.4 GiB, 16 decode tokens, same run shape throughout:
+    //   pinned 16 GiB   139.4 ms/step  (7.2 tok/s)  8.2 GB/s promotions
+    //   pinned 24 GiB   121.8 ms/step  (8.2 tok/s) 10.9 GB/s
+    //   pinned 42.4 GiB 103.1 ms/step  (9.7 tok/s) 16.3-23.4 GB/s
+    // The ceiling is half of installed RAM (48 GiB here) because a pinned page
+    // cannot be swapped and the tier is already bounded by the host budget, the
+    // ceiling and the corpus -- so what this cap protects is the rest of the
+    // desktop, not the model.
+    const size_t cap = ram_installed / 2u;
+    size_t want = warm_bytes < cap ? warm_bytes : cap;
     return want;
 }
 

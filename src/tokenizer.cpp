@@ -7,6 +7,7 @@
 //   * Bpe  — the GGUF "gpt2" model (Qwen, SmolLM, Granite, ...). Bytes are
 //            mapped through the GPT-2 byte<->unicode permutation, pre-split by
 //            a GPT-2/Qwen2-style scanner, then merged by rank.
+#include "krk/host_time.hpp"
 #include "krk/tokenizer.hpp"
 
 #include <algorithm>
@@ -315,6 +316,10 @@ PreMode pre_mode_from_name(const std::string &pre) {
 // ---------------------------------------------------------------------------
 
 bool Tokenizer::load(const Gguf &g, std::string *err) {
+    // The vocab + merges parse: hundreds of MB of JSON on a big-vocab file, on
+    // the critical path before the first token, and invisible in every table
+    // until now.
+    KRK_TIME_HOST("tokenizer.load");
     const std::string model = g.get_str("tokenizer.ggml.model");
     const std::vector<std::string> *toks = g.get_str_array("tokenizer.ggml.tokens");
     if (!toks || toks->empty()) {
@@ -623,6 +628,7 @@ int Tokenizer::encode_spm(const std::string &text, i32 *out, int max_out) const 
 }
 
 int Tokenizer::encode(const char *text, i32 *out, int max_out, bool add_special) const {
+    KRK_TIME_HOST("tokenizer.encode");
     int n = 0;
     if (add_special && add_bos_ && bos_ >= 0) {
         if (max_out < 1) return -1;
@@ -648,6 +654,10 @@ int Tokenizer::encode(const std::string &text, std::vector<i32> &out,
 }
 
 std::string Tokenizer::decode(const i32 *toks, int n) const {
+    // Once per emitted token. Small on its own, but it is the only per-token
+    // host work that is neither sampling nor the head, so a slow decode loop
+    // (piece assembly, a huge vocab scan) needs a row to show up in.
+    KRK_TIME_HOST("tokenizer.decode");
     std::string out;
     for (int i = 0; i < n; i++) {
         const std::string &p = piece(toks[i]);

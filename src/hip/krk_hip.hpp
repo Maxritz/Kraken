@@ -128,6 +128,15 @@ __device__ __forceinline__ u16 d_f2h(f32 f) {
 }
 
 __device__ __forceinline__ f32 d_silu(f32 x) { return x / (1.0f + __expf(-x)); }
+// GELU, the tanh approximation -- the same formula as krk_gelu_tanh in
+// include/krk/backend.hpp, which is host-only and cannot be called from a
+// kernel. The two are one definition of the arithmetic; if they ever disagree
+// the CPU arm stops being the device's reference.
+__device__ __forceinline__ f32 d_gelu(f32 x) {
+    constexpr f32 kAlpha = 0.7978845608028654f;
+    constexpr f32 kBeta = 0.044715f;
+    return 0.5f * x * (1.0f + tanhf(kAlpha * (x + kBeta * x * x * x)));
+}
 
 // Store an f32 activation result into an f16 activation buffer, saturating at
 // the f16 range rather than letting it overflow to inf.

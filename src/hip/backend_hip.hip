@@ -32,6 +32,7 @@
 #include "kernels/hc.hpp"
 #include "kernels/gather.hpp"
 #include "kernels/ple.hpp"
+#include "kernels/mla.hpp"
 #include "op_time.hpp"
 #include "krk/trace.hpp"
 
@@ -480,13 +481,62 @@ public:
         pool_pending_.erase(it);
         pool_mark_unref_(m);
     }
+    // A cell's OWN "readers are done" mark, recorded at the END of the use that
+    // read it (Backend::pool_note_reader_done) instead of at the release that
+    // comes one eviction later. Consumed by that cell's next release, which
+    // adopts it as the cell's mark. Keyed by cell, and the entry owns one
+    // reference -- so a mark can never be recycled onto another cell while this
+    // one still carries it.
+    std::unordered_map<void *, PoolMark *> pool_reader_done_;
+    // The switch is the A/B arm against the release-time mark, which is what
+    // every number before section 12o of docs/PERF-ANALYSIS.md was measured on.
+    static bool pool_slot_mark_() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_POOL_SLOT_MARK");
+            return !(e && e[0] == '0');
+        }();
+        return v;
+    }
+    void pool_note_reader_done(void *const cells[], int n) override {
+        if (!pool_slot_mark_() || n <= 0) return;
+        // Nothing can be reused before the pool has ever taken a cell back, and
+        // a record costs a device-side marker: a run whose budget holds the
+        // routed set (reuse 0) would pay for stamps on every expert use and
+        // never spend one. Measured exactly that way: 410 stamps/token and a
+        // slower step at the default auto budget, against no change once the
+        // first release is what turns them on.
+        if (expert_pool_.release_slices == 0) return;
+        PoolMark *m = pool_mark_open_();
+        if (!m) return;
+        if (hipEventRecord(m->ev, 0) != hipSuccess) {
+            static_cast<void>(hipGetLastError());
+            pool_mark_close_(m);
+            return;
+        }
+        int kept = 0;
+        for (int i = 0; i < n; i++) {
+            if (!cells[i]) continue;
+            const auto it = pool_reader_done_.find(cells[i]);
+            if (it != pool_reader_done_.end()) {
+                // This use's record is later than the last one, so it supersedes
+                // it: nothing outside this table can be waiting on the old mark.
+                pool_mark_unref_(it->second);
+                pool_reader_done_.erase(it);
+            }
+            pool_mark_ref_(m);
+            pool_reader_done_[cells[i]] = m;
+            ++kept;
+        }
+        pool_mark_unref_(m); // the opener's own reference; the cells hold theirs
+        if (kept) ++expert_pool_.reader_marks;
+    }
     // A writer on a non-null stream: the stream waits for the mark, so the copy
     // cannot overwrite bytes the reader is still reading, and the host does not
     // stop to find out. This is the promotion path.
     void pool_honor_(void *dst, hipStream_t s) {
         PoolMark *m = pool_take_dep_(dst);
         if (!m) return;
-        if (m->ev) KRK_HIP(hipStreamWaitEvent(s, m->ev, 0));
+        if (m->ev && !pool_no_wait_()) KRK_HIP(hipStreamWaitEvent(s, m->ev, 0));
         pool_dep_done_(m);
         ++expert_pool_.order_device;
     }
@@ -498,9 +548,27 @@ public:
     void pool_honor_host_(void *dst) {
         PoolMark *m = pool_take_dep_(dst);
         if (!m) return;
-        if (m->ev) KRK_HIP(hipEventSynchronize(m->ev));
+        if (m->ev && !pool_no_wait_()) {
+            const double t0 = phase_now();
+            KRK_HIP(hipEventSynchronize(m->ev));
+            expert_pool_.honor_host_ms += phase_now() - t0;
+        }
         pool_dep_done_(m);
         ++expert_pool_.order_host;
+    }
+    // MEASUREMENT ONLY, and deliberately racy: the arm that answers "how much
+    // does honouring the mark cost at all?" by not honouring it. Bookkeeping is
+    // unchanged, so the reuse and alloc counters stay comparable; only the wait
+    // goes away, which means a cell can be overwritten while a queued kernel is
+    // still reading it -- output can differ. Used to split the guard's cost into
+    // host-blocked and device-idle parts (docs/PERF-ANALYSIS.md section 12r),
+    // never as a shipping configuration.
+    static bool pool_no_wait_() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_POOL_NO_WAIT");
+            return e && e[0] && e[0] != '0';
+        }();
+        return v;
     }
     // A writer that runs on the default stream (a kernel or a null-stream
     // copy): the mark was recorded there, so stream order already puts it after
@@ -516,6 +584,11 @@ public:
     // so a queued reader cannot be reading freed memory.
     void pool_kill_(PoolBlock &b) {
         pool_drop_pending_(b.p);
+        const auto own = pool_reader_done_.find(b.p);
+        if (own != pool_reader_done_.end()) {
+            pool_mark_unref_(own->second);
+            pool_reader_done_.erase(own);
+        }
         if (b.m) {
             // The memory is about to be freed: whatever the mark covers has to
             // be done, or a queued reader is reading freed memory.
@@ -656,6 +729,15 @@ public:
                     pool_pending_[b.p] = b.m;
                 }
             }
+            // The hand-out starts a new use of this cell: a stamp recorded for its
+            // PREVIOUS use must not outlive it, or a reader that never stamps (an
+            // opt-in path) would leave a mark that is older than the read and the
+            // next writer would wait on too little.
+            const auto stale = pool_reader_done_.find(b.p);
+            if (stale != pool_reader_done_.end()) {
+                pool_mark_unref_(stale->second);
+                pool_reader_done_.erase(stale);
+            }
             expert_pool_.reusable -= rounded;
             expert_pool_.live += rounded;
             ++expert_pool_.reuses;
@@ -723,6 +805,13 @@ public:
         }
         void *p = expert_arena() ? pool_slab_take_(rounded) : alloc(rounded);
         if (!p) return nullptr;
+        {   // Same invariant as the reuse path: a fresh cell carries no stamp.
+            const auto stale = pool_reader_done_.find(p);
+            if (stale != pool_reader_done_.end()) {
+                pool_mark_unref_(stale->second);
+                pool_reader_done_.erase(stale);
+            }
+        }
         pool_live_.emplace(p, LiveCell{rounded, nullptr});
         if (!expert_arena()) expert_pool_.committed += rounded;
         expert_pool_.live += rounded;
@@ -784,10 +873,27 @@ public:
             }
             rounded[i] = r;
         }
+        // A cell whose last use was recorded already carries the mark a reuse
+        // needs, and that mark is a much earlier stream position than anything
+        // recorded here -- which is the whole point of it: the wait is for that
+        // cell's readers, not for every kernel queued since. Only the cells
+        // WITHOUT one need the burst mark, and when none do, none is recorded.
+        PoolMark *own[kPoolBurstMax] = {};
+        bool any_plain = false;
+        for (int i = 0; i < n; i++) {
+            if (!ps[i]) continue;
+            const auto rd = pool_reader_done_.find(ps[i]);
+            if (rd == pool_reader_done_.end()) {
+                any_plain = true;
+                continue;
+            }
+            own[i] = rd->second; // ownership moves from the table to the cell
+            pool_reader_done_.erase(rd);
+        }
         // The mark is the release point on the default stream: every reader
         // queued for any cell in this burst so far is ordered before this
         // record, which is exactly what one record per slice expressed.
-        PoolMark *m = pool_mark_open_();
+        PoolMark *m = any_plain ? pool_mark_open_() : nullptr;
         if (m) {
             const char *inject = std::getenv("KRK_TEST_POOL_NO_EVENT");
             hipError_t rc = inject && inject[0] == '1' ? hipErrorOutOfMemory
@@ -815,13 +921,18 @@ public:
             pool_live_.erase(it);
             expert_pool_.live -= r;
             pool_drop_pending_(ps[i]);
+            PoolMark *use = own[i] ? own[i] : m;
             const auto slab_of = pool_cell_slab_.find(ps[i]);
             if (slab_of != pool_cell_slab_.end()) {
                 // The slab owns the memory: this is a return, not a free.
                 if (pool_slabs_[slab_of->second].live)
                     --pool_slabs_[slab_of->second].live;
-                pool_mark_ref_(m);
-                pool_[r].push_back(PoolBlock{ps[i], m});
+                if (own[i]) { // its reference moves from the table to the block
+                    pool_[r].push_back(PoolBlock{ps[i], own[i]});
+                } else {
+                    pool_mark_ref_(m);
+                    pool_[r].push_back(PoolBlock{ps[i], m});
+                }
                 expert_pool_.reusable += r;
             } else if (expert_pool_.committed > expert_pool_.budget) {
                 // Over the plan (a re-clamp can lower it under live cells):
@@ -830,12 +941,17 @@ public:
                 // and caching a released cell is what the free list is for in
                 // both arms. Conflating them is what made the bench's reuse
                 // checks fail the moment the slab became opt-in.
-                if (m && m->ev) KRK_HIP(hipEventSynchronize(m->ev));
+                if (use && use->ev) KRK_HIP(hipEventSynchronize(use->ev));
+                if (own[i]) pool_mark_unref_(own[i]); // nobody will wait on it
                 KRK_HIP(hipFree(ps[i]));
                 expert_pool_.committed -= r;
             } else {
-                pool_mark_ref_(m); // the cell's own reference to the new mark
-                pool_[r].push_back(PoolBlock{ps[i], m});
+                if (own[i]) {
+                    pool_[r].push_back(PoolBlock{ps[i], own[i]});
+                } else {
+                    pool_mark_ref_(m); // the cell's own reference to the new mark
+                    pool_[r].push_back(PoolBlock{ps[i], m});
+                }
                 expert_pool_.reusable += r;
             }
             ++expert_pool_.release_slices;
@@ -1023,6 +1139,14 @@ public:
     // times that and leaves no mapping page resident, so the tier does not
     // double-count the model in RAM. Falls back to the mapping copy whenever
     // the file path is unavailable, so callers never see an unfilled buffer.
+    // Measured, not assumed: tools/probe_hostread.hip reads a hipHostMalloc
+    // buffer back from a kernel exactly, at 24.3 GiB/s on this card (485 GiB/s
+    // for the same read out of device memory), with the runtime reporting
+    // unifiedAddressing: 0. The two facts sit together on purpose -- the flag is
+    // the reason the engine may hand an expert's WARM bytes to a GEMM instead of
+    // promoting them.
+    bool host_load_supported() const override { return true; }
+
     bool read_host(void *dst, const void *mapped_src, size_t bytes) override {
         if (bytes == 0) return true;
         // Distinct from the pool's label on purpose. Both were "warm_read",
@@ -1341,6 +1465,20 @@ public:
         i64 batch_bytes = 0;
         for (int i = 0; i < n; i++) {
             if (!dst[i] || !src[i] || !bytes[i]) continue;
+            // A reused cell may still be READ by the expert that owned it. The
+            // release mark is recorded on the DEFAULT stream and this copy runs
+            // on a private non-blocking one, so without this wait the DMA lands
+            // on bytes a queued expert read is still reading. Every other write
+            // path honours the mark -- upload_paged (both branches), the two
+            // staged forms, upload_i32, fill0, copy_act -- and this arm, added
+            // later for the pinned DMA, was the one that did not. Measured with
+            // the reuse trap in `kraken-bench --pool` (16 reads of one 64 MiB
+            // cell queued before its release, then the cell handed back out and
+            // overwritten): every reader lost its bytes, 3 of 3 runs. It is what
+            // made a heavy-eviction decode print a different sentence 3 times in
+            // 4, because the trim path it replaced `hipFree`d the cell (which
+            // synchronizes) and never exercised the hand-out.
+            pool_honor_(dst[i], pinned_stream_);
             KRK_HIP(hipMemcpyAsync(dst[i], src[i], bytes[i], hipMemcpyHostToDevice,
                                    pinned_stream_));
             batch_bytes += static_cast<i64>(bytes[i]);
@@ -2093,9 +2231,50 @@ public:
 
     void download_f32(f32 *dst, const void *src, i64 n) override {
         KRK_TIME_OP("download_f32");
+        const size_t bytes = static_cast<size_t>(n) * 2;
+        // KRK_ROUTE_FASTCOPY=0 is the A/B arm: the blocking copy this replaced.
+        static const bool fast = [] {
+            const char *v = std::getenv("KRK_ROUTE_FASTCOPY");
+            return !(v && v[0] == '0');
+        }();
+        if (fast) {
+            if (bytes > dl_pin_cap_) {
+                if (dl_pin_) hipHostFree(dl_pin_);
+                dl_pin_ = nullptr;
+                size_t cap = bytes < (64u << 10) ? (64u << 10) : bytes;
+                if (hipHostMalloc(&dl_pin_, cap, hipHostMallocDefault) ==
+                    hipSuccess) {
+                    dl_pin_cap_ = cap;
+                } else {
+                    static_cast<void>(hipGetLastError());
+                    dl_pin_ = nullptr;
+                    dl_pin_cap_ = 0;
+                }
+            }
+            if (dl_pin_) {
+                if (!dl_ev_) hipEventCreateWithFlags(&dl_ev_, hipEventDisableTiming);
+                hipMemcpyAsync(dl_pin_, src, bytes, hipMemcpyDeviceToHost, 0);
+                if (dl_ev_) hipEventRecord(dl_ev_, 0);
+                if (dl_ev_) {
+                    // Spin, not block: the copy is already in the queue, so
+                    // this waits for the device and nothing else.
+                    while (hipEventQuery(dl_ev_) == hipErrorNotReady) {
+#if defined(_MSC_VER)
+                        _mm_pause();
+#else
+                        __builtin_ia32_pause();
+#endif
+                    }
+                } else {
+                    KRK_HIP(hipStreamSynchronize(0));
+                }
+                const u16 *tmp = static_cast<const u16 *>(dl_pin_);
+                for (i64 i = 0; i < n; i++) dst[i] = fp16_to_fp32(tmp[i]);
+                return;
+            }
+        }
         std::vector<u16> tmp(static_cast<size_t>(n));
-        KRK_HIP(hipMemcpy(tmp.data(), src, static_cast<size_t>(n) * 2,
-                          hipMemcpyDeviceToHost));
+        KRK_HIP(hipMemcpy(tmp.data(), src, bytes, hipMemcpyDeviceToHost));
         for (i64 i = 0; i < n; i++) dst[i] = fp16_to_fp32(tmp[static_cast<size_t>(i)]);
     }
 
@@ -2691,7 +2870,8 @@ public:
                     i64 rows, bool silu = false,
                     bool *silu_fused = nullptr,
                     bool row_parallel_only = false,
-                    const DType *wts = nullptr) override {
+                    const DType *wts = nullptr,
+                    const void *const xs[] = nullptr) override {
         KRK_TIME_OP("gemm_group");
         if (silu_fused) *silu_fused = false;
         // The fused kernels express the M=1 decode row only
@@ -2723,7 +2903,7 @@ public:
         i64 need = 0; // worst-case fp32 partials, elements
         for (int m = 0; m < n_mat; m++) {
             wp[m] = static_cast<const u8 *>(w[m]);
-            in[m] = static_cast<const _Float16 *>(x);
+            in[m] = static_cast<const _Float16 *>(xs ? xs[m] : x);
             op[m] = static_cast<_Float16 *>(out[m]);
             nin[m] = n_in;
             wtm[m] = static_cast<int>(wts ? wts[m] : wt);
@@ -2798,6 +2978,40 @@ public:
                        128>>>(static_cast<_Float16 *>(k), wk, n_kv, hd, eps);
             }
         }
+    }
+
+    // ---- multi-head latent attention (see MlaDesc) -----------------------
+    bool mla_supported() const override { return true; }
+
+    void mla_kv_write(void *cache, const void *proj, const void *gamma,
+                      const MlaDesc &d) override {
+        KRK_TIME_OP("mla_kv_write");
+        if (d.n_tok <= 0) return;
+        mla_kv_write_kernel<256><<<static_cast<unsigned>(d.n_tok), 256>>>(
+            static_cast<_Float16 *>(cache), static_cast<const _Float16 *>(proj),
+            static_cast<const f32 *>(gamma), d.kv_lora, d.rope, d.pos0,
+            d.pos_stride, d.eps);
+    }
+
+    void mla_attention(void *out, const void *q, const void *cache,
+                       const void *wkv_b, const MlaDesc &d) override {
+        KRK_TIME_OP("mla_attention");
+        if (d.n_tok <= 0) return;
+        // `inv_freq` is host memory and the kernel reads it per key; the slot
+        // table stages it (keyed by pointer, width and second entry, so a
+        // second table of the same width is a different slot).
+        const f32 *fd = stage_freq(d.inv_freq, d.rope);
+        const i64 n_keys_max = d.pos0 + d.n_tok;
+        const size_t shmem = static_cast<size_t>(2 * d.kv_lora + d.rope +
+                                                 n_keys_max) * sizeof(f32);
+        const dim3 grid(static_cast<unsigned>(d.n_tok),
+                        static_cast<unsigned>(d.n_head));
+        mla_attention_kernel<256><<<grid, 256, shmem>>>(
+            static_cast<_Float16 *>(out), static_cast<const _Float16 *>(q),
+            static_cast<const _Float16 *>(cache),
+            static_cast<const _Float16 *>(wkv_b), d.n_head, d.qk, d.nope,
+            d.rope, d.kv_lora, d.v_dim, d.pos0, d.pos_stride, d.scale, fd,
+            n_keys_max);
     }
 
     void kv_append(void *kcache, void *vcache, const void *k, const void *v,
@@ -3002,6 +3216,40 @@ public:
         }
     }
 
+    void silu_mul_rows(void *const out[], const void *const gate[],
+                       const void *const up[], i64 row_len, int count,
+                       f32 *const scale[]) override {
+        KRK_TIME_OP("silu_mul_rows");
+        if (count <= 0) return;
+        // The batched form is the single-row kernel's own body, one block per
+        // row (they share `silu_row_scaled`), so a batched row is bit-identical
+        // to the launch it replaces. Anything the single path would not take --
+        // a row too wide for the register budget, no scale buffer -- falls back
+        // to the per-row calls rather than to a different arithmetic.
+        if (count > 8 || row_len <= 0 || row_len > 2048 || !scale) {
+            for (int i = 0; i < count; i++)
+                silu_mul(out[i], gate[i], up[i], row_len, row_len,
+                         scale ? scale[i] : nullptr);
+            return;
+        }
+        for (int i = 0; i < count; i++)
+            if (!scale[i]) {
+                for (int j = 0; j < count; j++)
+                    silu_mul(out[j], gate[j], up[j], row_len, row_len, scale[j]);
+                return;
+            }
+        SiluRows sr{};
+        sr.count = count;
+        for (int i = 0; i < count; i++) {
+            sr.out[i] = static_cast<_Float16 *>(out[i]);
+            sr.gate[i] = static_cast<const _Float16 *>(gate[i]);
+            sr.up[i] = static_cast<const _Float16 *>(up[i]);
+            sr.scale[i] = scale[i];
+        }
+        silu_mul_rows_scaled_kernel<<<static_cast<unsigned>(count), 256>>>(
+            sr, row_len);
+    }
+
     // ---- hyper-connections (qwen4exp) -----------------------------------
     // The lane axis sits INSIDE a token's row, so none of the ops above can
     // express these: rmsnorm reduces a row, add_bias_cols broadcasts a column,
@@ -3050,6 +3298,16 @@ public:
         if (n <= 0) return;
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         silu_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(x), n);
+    }
+
+    // gemma's FFN gates with GeGLU. Separate launch rather than a flag on the
+    // silu kernel: the two live in different graphs and neither is on the hot
+    // path of a family that uses the other.
+    void gelu_act(void *x, i64 n) override {
+        KRK_TIME_OP("gelu_act");
+        if (n <= 0) return;
+        const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
+        gelu_kernel<256><<<blocks, 256>>>(static_cast<_Float16 *>(x), n);
     }
 
     // ---- per-layer embedding (qwen4exp) ---------------------------------
@@ -3609,6 +3867,16 @@ private:
     // WARM fill path. Its own handle, like every pull reader: a Windows HANDLE
     // serialises concurrent ReadFile, so sharing one with the pull ring would
     // put cold-expert reads and weight pulls in each other's way.
+    // The routing readback: a pinned staging buffer and one event, reused. A
+    // blocking hipMemcpy of the router logits costs a driver round trip, and it
+    // is the per-layer cost that dominates decode (measured 0.30 ms x 45 per
+    // token = 14 of a 23 ms step). The copy itself is trivially small; what the
+    // blocking call pays is the hand-off. Async + a spin on one event does not
+    // hand the thread back, and the buffer is allocated once instead of per call.
+    void *dl_pin_ = nullptr;
+    size_t dl_pin_cap_ = 0;
+    hipEvent_t dl_ev_ = nullptr;
+
     FileReader warm_reader_;
     // Reader pool for batched expert reads; sized by KRK_WARM_READERS. Each
     // entry is one HANDLE, opened lazily on first batch use.

@@ -378,13 +378,15 @@ __global__ void swiglu_oai_kernel(_Float16 *__restrict__ out,
 //
 // `out` may alias `gate` (the MoE path passes the same buffer): every read
 // happens before the block-wide barrier and every store after it.
-__global__ void silu_mul_scaled_kernel(_Float16 *__restrict__ out,
-                                       const _Float16 *__restrict__ gate,
-                                       const _Float16 *__restrict__ up,
-                                       i64 row_len, f32 *__restrict__ scale_out) {
+// One row's body, shared by the single-row and the batched launch below so the
+// two cannot drift: `scale_out` is THAT row's scale slot (the caller offsets
+// it), which is the only thing the two callers address differently.
+__device__ __forceinline__ void silu_row_scaled(
+    _Float16 *__restrict__ out, const _Float16 *__restrict__ gate,
+    const _Float16 *__restrict__ up, i64 row_len, f32 *__restrict__ scale_out) {
     constexpr int kMaxVec = 8;       // 8 * 256 threads = 2048-wide rows
     constexpr f32 kCeil = 65504.0f;  // f16 largest finite value
-    const i64 base = static_cast<i64>(blockIdx.x) * row_len;
+    const i64 base = 0;              // the caller's pointer is already the row
     const int t = threadIdx.x;
     f32 v[kMaxVec];
     f32 mx = 0.0f;
@@ -414,7 +416,7 @@ __global__ void silu_mul_scaled_kernel(_Float16 *__restrict__ out,
     }
     __syncthreads();
     const f32 mul = smx[0];
-    if (t == 0) scale_out[blockIdx.x] = mul;
+    if (t == 0) *scale_out = mul;
     for (int j = 0; j < kMaxVec; j++) {
         const i64 i = static_cast<i64>(t) + static_cast<i64>(j) * blockDim.x;
         // Through the bound as well: the row scale is what brings the row into
@@ -423,6 +425,33 @@ __global__ void silu_mul_scaled_kernel(_Float16 *__restrict__ out,
         if (i < row_len)
             out[base + i] = d_sat_f16_count(v[j] / mul, &g_krk_sat_silu);
     }
+}
+
+__global__ void silu_mul_scaled_kernel(_Float16 *__restrict__ out,
+                                       const _Float16 *__restrict__ gate,
+                                       const _Float16 *__restrict__ up,
+                                       i64 row_len, f32 *__restrict__ scale_out) {
+    const i64 base = static_cast<i64>(blockIdx.x) * row_len;
+    silu_row_scaled(out + base, gate + base, up + base, row_len,
+                    scale_out + blockIdx.x);
+}
+
+// `count` independent ONE-ROW buffers in one launch: block i is row i, and its
+// body is the function above. The MoE decode path uses it for its routed
+// experts, which at one token are one row each in their own buffers; the
+// launch it replaces was one per expert.
+struct SiluRows {
+    int count = 0;
+    _Float16 *out[8] = {nullptr};
+    const _Float16 *gate[8] = {nullptr};
+    const _Float16 *up[8] = {nullptr};
+    f32 *scale[8] = {nullptr};
+};
+
+__global__ void silu_mul_rows_scaled_kernel(SiluRows sr, i64 row_len) {
+    const int r = static_cast<int>(blockIdx.x);
+    if (r >= sr.count) return;
+    silu_row_scaled(sr.out[r], sr.gate[r], sr.up[r], row_len, sr.scale[r]);
 }
 
 // ------------------------------------------------- residual stream storage --
