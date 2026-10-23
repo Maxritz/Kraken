@@ -1,0 +1,64 @@
+# 2026-10-22 -- prefill grid: lottery map, INT8 dispatch fix, G=32.
+#
+# Question: Qwen3-4B-Q8_0 prefill at 290 tok/s on the 9070 XT -- rearchitecture
+# or a kernel?
+#
+# 1. Lottery map (661-token prompt, same binary, sequential arms):
+#      default exact grid (gemv_grid, G=8)   290 tok/s
+#      KRK_GEMM_EXACT=0 (auto -> WMMA)      1276 tok/s
+#      KRK_GEMM_PATH=wmma                   1291 tok/s
+#      KRK_GEMM_PATH=dp4a                    994 tok/s
+#      KRK_GEMM_PATH=simt                    569 tok/s
+#    Profiler (default path): gemm(grid) 756 calls, 2075 ms NET, 11.5 GB
+#    declared at 5.6 GB/s effective. Projections 87% of device time.
+#    Roofline: 3 chunks x 4 GB = 11.5 GB mandatory traffic / 640 GB/s = 18 ms
+#    floor. We pay 2075 ms: ~115x off roofline, ~2.75 TFLOP/s vs ~100+ peak.
+#    llama.cpp ~68 TFLOP/s on the same model class: external proof the
+#    hardware has it. Verdict: kernel gap, not architecture gap.
+#
+# 2. INT8=1 was a silent no-op (dispatch gap, now fixed). gemm_rung() returned
+#    WMMA before testing int8_gemm_, and the exact-grid arm served first
+#    anyway (path_ == auto), so KRK_GEMM_INT8=1 measured identical to default
+#    (290.3 vs 290.0) -- two identical arms reporting "the change is free".
+#    Fix (backend_hip.hip): the exact-grid arm now yields where dp4a_ok holds,
+#    int8 outranks auto-WMMA in gemm_rung (a forced PATH=wmma still wins), and
+#    setting the flag prints a startup warn naming what it engages. After:
+#    INT8=1 -> 988 tok/s with warn, default unchanged at 288.
+#    Doctrine note: every future A/B through these switches is untrustworthy
+#    until the switch is shown to engage -- this one wasn't.
+#
+# 3. Re-read hypothesis: falsified as the main cause. KRK_GRID_G (group size,
+#    any value bit-identical by construction -- grid position selects rows,
+#    never accumulation order): hashes identical at 8/32/128/256
+#    (5cff55da65ec78c2 / ecb835fbb5af4e50), timing 272/291/305/292 tok/s
+#    interleaved, then 3/3 pairs G=32 over G=8 (+6.2%, +6.6%, +12.0%) and
+#    +6% at chunk 9. Shipped as default 32 (env override kept, out-of-range
+#    clamps to default). +6-12% is real but small: the wall is the per-warp
+#    serial chain (80-chunk dequant+scalar-dot, one output per warp), i.e.
+#    latency starvation, not passes over weights.
+#
+# 4. MMQ cannot be the exact rung -- decided, not deferred. gemm_mmq.hpp's
+#    header claims bit-identity with dp4a ("any difference is a bug"), which
+#    is exactly the problem: dp4a is int8-lossy by construction (activation
+#    quantize regroups dots), so an MMQ landing buys speed on the LOSSY rung
+#    only. The exact rung must stay f16-domain with gemv's association
+#    (scalar chunk dots + shuffle-tree reduce); packed math (v_dot2) rounds
+#    the pair once where scalar rounds twice -- different bytes, gate fails.
+#    The lever is ILP/occupancy with the same per-element order (multi-output
+#    interleaved warp is the sketched next variant), never tile shape or
+#    instruction selection. Bonus: an f16 exact tile covers every format
+#    (Q8_0/Q6_K/Q4_K/F16 -- dequant happens before dots), so there is no
+#    separate Q8/Q6 project; today's harness already proves all four
+#    byte-identical (kraken-bench --bitexact: 0 differing, incl. G=32).
+#    Q5_K/Q6_K under KRK_HAS_DOT2 dot in int-code domain (dot_chunk_q6k/q5k
+#    via d_dot2_pk), so any LDS-f16 staging must exclude them -- another
+#    reason the dequant-once tile died and the grid decodes redundantly.
+#
+# 5. Attention 67 ms vs 239 ms across two profiles (default-path vs dp4a-path
+#    runs): unexplained variance, NOTED NOT CHASED. Small absolute (3-13% of
+#    device time), attention is not the wall, no mechanism proposed. Revisit
+#    only if a future profile promotes it.
+#
+# Standing numbers after this session (Qwen3-4B-Q8_0, 661 tok):
+#   exact default 290 tok/s (was 272-290 at G=8) | lossy wmma 1291 | dp4a 994.
+#   Gate: 26/26. bitexact: 0 differing. chunk-1 == chunk-64 hashes.

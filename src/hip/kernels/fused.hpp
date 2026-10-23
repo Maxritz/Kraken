@@ -216,7 +216,13 @@ inline bool fused_layer_launch(const u8 *const w[],
         // row-parallelism alone is topped up with K-slices so more
         // weight loads overlap. Ties and invalid slices stay at 1.
         int sp = 1;
-#if defined(KRK_WMMA_COMPILED)
+        // Decode split-K regroups fp32 partials, so a split matrix differs
+        // from its unfused gemv AND from the prefill fallback by association
+        // alone -- it breaks chunk/decode invariance wherever it triggers.
+        // The policy never ran in production (it used to compile out with
+        // the WMMA rung), so sp==1 restores the engine's lifelong behavior;
+        // KRK_FUSED_SPLIT opts back into the top-up for measurement.
+#if defined(KRK_WMMA_COMPILED) && defined(KRK_FUSED_SPLIT)
         if (row_blocks < blk_target && n_in[m] >= 2 * 64) {
             sp = (blk_target + row_blocks - 1) / row_blocks;
             if (sp > 8) sp = 8;

@@ -86,6 +86,7 @@ set(KRK_CORE_SOURCES
     src/sampler.cpp
     src/spec_sampling.cpp
     src/hc.cpp
+    src/mla.cpp
     src/ple.cpp
     src/qsa.cpp
     src/model.cpp

@@ -166,8 +166,113 @@ __global__ void __launch_bounds__(THREADS)
     }
 }
 
-// The widest group that still belongs on the mat-vec ladder. Above it the
-// WMMA tile's reuse of a staged weight tile finally pays for itself.
+// ---------------------------------------------------------------- gemv_mw --
+//
+// The spatial twin of gemv_m: instead of one warp carrying M activation
+// rows in M live accumulators (temporal), one warp carries ONE activation
+// row and M warps cover the M rows side by side (spatial). Each warp is
+// gemv_kernel's exact computation -- same chunks, same order, same single
+// rounding -- so the result is bit-identical to M gemv launches, and to
+// gemv_m, by construction. The bet it tests: gemv_m's wall time is issue-
+// bound inside too few resident warps, and spreading the same dots over M
+// times the warps buys back the parallelism even though the weight row is
+// dequantized M times (once per warp, L2-resident after the first).
+// Opt-in rung behind KRK_GEMV_M2=1; the dispatch keeps gemv_m as default.
+template <int THREADS, int M>
+__global__ void __launch_bounds__(THREADS)
+    gemv_mw_kernel(const u8 *__restrict__ w, int wt, i64 n_out, i64 n_in,
+                   size_t w_row_bytes, const _Float16 *__restrict__ x,
+                   _Float16 *__restrict__ out) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x >> 5);
+    const i64 row = static_cast<i64>(blockIdx.x);
+    if (row >= n_out) return;
+
+    const int nch = static_cast<int>(n_in / 32);
+    const u8 *wrow = w + static_cast<size_t>(row) * w_row_bytes;
+    const _Float16 *xr = x + static_cast<i64>(warp) * n_in;
+
+    f32 part = 0.0f;
+    for (int c = lane; c < nch; c += 32)
+        part += dot_chunks(wt, wrow, xr, c, c + 1);
+
+    part = d_wave_reduce_sum(part);
+    if (lane == 0)
+        out[static_cast<i64>(warp) * n_out + row] = static_cast<_Float16>(part);
+}
+
+// ---------------------------------------------------------------- gemv_grid --
+//
+// The exact prefill kernel for rows above the ladder. Same computation as
+// gemv_mw (one warp per (output row, x-row), gemv's chunk order, lane
+// mapping and wave-shuffle tree reduce through the SHARED dot_chunks(),
+// including the Q5_K/Q6_K packed pair order), but the M dimension is a grid:
+// block (g, row) covers x-rows [8g, 8g+8) of output row `row`.
+// Grid position changes which rows a block reads and writes, never a
+// per-output accumulation order, so chunk 8, 64 and 256 leave bit-identical
+// bytes -- the ladder's exactness extended past row 8. No split-K: regrouping
+// partial sums is a different association (((a+b)+(c+d)) vs (((a+b)+c)+d)),
+// so a split exact kernel is a contradiction, not a tuning knob. The weight
+// row is re-read once per group (L2-resident after the first pass, the same
+// argument gemv_mw's comment makes); the alternative -- a dequant-once LDS
+// tile -- cannot serve the Q5_K/Q6_K packed pair order from f16 values, so it
+// would fork the association by dtype. Redundant dequant keeps one code path
+// for every format.
+// `gs` (KRK_GRID_G, default 8) is the x-group a block's warps cover: warp w
+// loops xr = g*gs+w exactly as the G=8 grid did, so any gs leaves
+// bit-identical bytes -- it only changes how many blocks re-read a weight
+// row from HBM (groups = ceil(rows/gs)). Runtime, not templated: the
+// mapping arithmetic is identical for every gs.
+template <int THREADS = 256>
+__global__ void __launch_bounds__(THREADS)
+    gemv_grid_kernel(const u8 *__restrict__ w, int wt, i64 n_out, i64 n_in,
+                     size_t w_row_bytes, const _Float16 *__restrict__ x,
+                     i64 rows, _Float16 *__restrict__ out, int gs) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x >> 5);
+    const i64 b = static_cast<i64>(blockIdx.x);
+    const i64 g = b / n_out;
+    const i64 row = b % n_out;
+    if (row >= n_out || gs <= 0) return;
+    // A block's warps cover [g*gs, (g+1)*gs): with gs > 8 each warp loops
+    // over its strided x-rows. Every (row, xr) pair still runs the identical
+    // per-output sequence (chunk order, order, tree reduce, store), so any
+    // gs is bit-identical -- the loop only changes which warp owns which
+    // pair and how many blocks re-read the weight row.
+    const i64 g_lo = g * static_cast<i64>(gs) + warp;
+    const i64 g_hi =
+        g * static_cast<i64>(gs) + static_cast<i64>(gs) < rows
+            ? g * static_cast<i64>(gs) + static_cast<i64>(gs)
+            : rows;
+    if (g_lo >= rows) return;
+
+    const int nch = static_cast<int>(n_in / 32);
+    const u8 *wrow = w + static_cast<size_t>(row) * w_row_bytes;
+
+    // MEASURED (2026-10-22, gfx1201, rows=1024, L2-resident): a dequant-once
+    // LDS tile shared across the block's warps does NOT pay -- q4_k 1122 us
+    // redundant vs 1177 us tiled, f16 655 vs 1330 (pure overhead there: the
+    // coop pass plus the barrier plus LDS reads buy nothing with no dequant
+    // to save). The dots dominate the wall, not the decode, so decoding once
+    // cannot move it. Each warp therefore runs the real dot_chunks() on the
+    // raw row, exactly like gemv_mw: redundant decode, L2-resident weights,
+    // zero numerics risk across all formats (including the Q5_K/Q6_K packed
+    // pair order, which folds int-pair dots and could not be reproduced from
+    // staged f16 anyway).
+    for (i64 xr_row = g_lo; xr_row < g_hi; xr_row += 8) {
+        const _Float16 *xr = x + xr_row * n_in;
+        f32 part = 0.0f;
+        for (int c = lane; c < nch; c += 32)
+            part += dot_chunks(wt, wrow, xr, c, c + 1);
+
+        part = d_wave_reduce_sum(part);
+        if (lane == 0)
+            out[xr_row * n_out + row] = static_cast<_Float16>(part);
+    }
+}
+
+// The widest group that still belongs on the mat-vec ladder; gemv_grid_kernel
+// above carries the same association to any row count.
 constexpr int kGemvMRowsMax = 8;
 
 // ---------------------------------------------------------------------------

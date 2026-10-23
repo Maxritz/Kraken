@@ -19,3 +19,43 @@ Headline findings (full analysis in `docs/DEEP-DIVE-MOE-PREFILL-DECODE-2026-10-2
 - Dense flash: weight streaming (56 stagings, 13 GiB, drain 1036 ms >> read 389 ms >> copy 11 ms).
 - Router readback host-bound (`download_f32` backend 636 ms vs device 35 ms on REAP-288).
 - Distill control proves the engine path: WARM-resident set → promote 38 ms at 60 GB/s.
+
+## Chunk-default validation (2026-10-22, Qwen3-MOE-4x0.6B, `--ctx 8192`)
+
+The `--chunk` default is already 256 in the CLI, the server and
+`EngineConfig::prefill_chunk`, so this sweep validates rather than changes
+it. Same prompt family at four lengths, all arms byte-identical output
+(same md5 across chunks and lengths):
+
+| prompt | chunk 256 | chunk 8 | speedup |
+|---|---|---|---|
+| 131 tok | 399 ms (328 tok/s) | 851 ms (154 tok/s) | 2.1x |
+| 501 tok | 694 ms (722 tok/s) | 2187 ms (229 tok/s) | 3.2x |
+| 2001 tok | 1948 ms (1027 tok/s) | 9366 ms (214 tok/s) | 4.8x |
+| 4001 tok | 4328 ms (924 tok/s) | 23468 ms (171 tok/s) | 5.4x |
+
+Memory is not the constraint: workspaces 12 MiB at chunk 256 vs 1 MiB at
+chunk 8 (4001-token run, KV 896 MiB, weights 304 MiB). Decode is untouched
+(decode runs at n=1 regardless of chunk). Fetch2 control on this model:
+first fetch 6.76 ms/layer vs already-drained copy 0.15 ms — the barrier is
+queue drain, not payload, so chunking (fewer barriers) is the lever and
+shrinking the route payload is not.
+
+## Phase-3 M-sweep (2026-10-22, Qwen3-MOE-4x0.6B expert shapes, warm, `--iters 20`)
+
+Anomaly reproduced on the current tree, worse than the 29 GB/s note:
+
+| rows | up/gate q4_k 3072x1024 | down q6_k 1024x3072 |
+|---|---|---|
+| 1 (decode GEMV) | 9.9 us, 178 GB/s | 13.2 us, 196 GB/s |
+| 2–8 (`gemv_m` ladder) | 64–87 us, 20–28 GB/s | 63–105 us, 25–41 GB/s |
+| 9–64 (tiled) | 160–224 us, 8–11 GB/s | ~780–855 us flat, ~3 GB/s |
+
+Existing arms change nothing at rows=9 q6_k: `KRK_GEMM_PATH=wmma` 762 us,
+`KRK_GEMM_SPLIT=0` 818 us, both 842 us — same fixed-cost regime (~800 us
+independent of row count). No current kernel wins; the next step is a
+dedicated small-M kernel that loads each expert's weight tile once and
+reuses it across the M rows. Modeled ceiling at rows=1 efficiency
+(~185 GB/s): down 2.58 MiB in ~14 us vs ~800 us today; projected prefill
+at chunk 256 / 161 tok from ~409 ms toward ~210 ms (~2x on top of
+chunking). All bench rows `ok` (chk within tolerance).

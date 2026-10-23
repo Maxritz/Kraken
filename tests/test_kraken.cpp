@@ -55,6 +55,7 @@
 #include "krk/expert_cpu.hpp"
 #include "krk/gguf.hpp"
 #include "krk/hc.hpp"
+#include "krk/mla.hpp"
 #include "krk/ple.hpp"
 #include "krk/qsa.hpp"
 #include "krk/http.hpp"
@@ -4339,6 +4340,7 @@ static void test_kv_tier_host_reserve_refusal() {
 
 
 static void test_expert_promotion_failure();
+static void test_moe_grouped_plan_offsets();
 
 static void test_expert_cache_byte_budget() {
     const std::string path = "kraken-bytes-test.gguf";
@@ -4698,10 +4700,17 @@ static void test_expert_promotion_failure() {
 
     // Every device allocation now fails: this expert is WARM-only, so its
     // acquire() takes the promotion path and cannot complete it.
+    const u64 refusals_before = cache.pool_refusals();
     be.set_fail_allocation_after(0);
     const ResidentExpert *refused = cache.acquire(src, 0, warm_e);
-    CHECK(!refused || (refused->up.present() && refused->down.present()),
+    CHECK(!refused,
           "a refused promotion returns nullptr, never an incomplete expert");
+    // P0-1: refusals are countable, so the engine can fail visibly instead
+    // of silently skipping the expert (`if (!re) continue`). Both the WARM
+    // promotion and the cold rebuild refuse here, so this counts at least
+    // one refusal for the single acquire.
+    CHECK(cache.pool_refusals() > refusals_before,
+          "a refused acquire leaves a countable refusal behind");
     be.set_fail_allocation_after(-1);
     const ResidentExpert *after = cache.acquire(src, 0, warm_e);
     CHECK(after && after->up.present() && after->gate.present(),
@@ -4759,6 +4768,87 @@ static void test_moe_route_predictor() {
           "request reset clears history and telemetry");
     predictor.predict(2, 0, 3, 0.0f, 3, candidates);
     CHECK(candidates.empty(), "a fresh request cannot reuse stale route IDs");
+    test_moe_grouped_plan_offsets();
+}
+
+// P0-2: the grouped-plan fast path must agree with the legacy per-expert
+// rescan it replaced. plan_off_ (prefix sums over the whole (token, slot)
+// route) already holds each expert's row count, so the loop skips the
+// O(ne*n*k) rebuild and reads the segment directly. This replays both
+// constructions over several route shapes -- including duplicate experts
+// across rows and experts no row selected -- and requires identical counts,
+// row order and weights per expert.
+static void test_moe_grouped_plan_offsets() {
+    struct Case {
+        i32 ne, n, k;
+        std::vector<i32> sel;
+        std::vector<f32> wt;
+    };
+    std::vector<Case> cases;
+    // n=1 decode row, top-2 over 4 experts.
+    cases.push_back({4, 1, 2, {1, 3}, {0.7f, 0.3f}});
+    // n=8 prefill rows with heavy duplicate picks and one unpicked expert.
+    cases.push_back({4, 8, 2,
+                     {0, 1, 0, 2, 1, 1, 3, 0, 2, 2, 0, 1, 1, 3, 3, 3},
+                     {0.5f, 0.5f, 0.6f, 0.4f, 0.9f, 0.1f, 0.2f, 0.8f,
+                      0.3f, 0.7f, 0.4f, 0.6f, 0.55f, 0.45f, 0.65f, 0.35f}});
+    // n=2, every slot picks the same expert.
+    cases.push_back({4, 2, 2, {2, 2, 2, 2}, {0.25f, 0.25f, 0.5f, 0.5f}});
+    for (size_t c = 0; c < cases.size(); c++) {
+        const Case &cc = cases[c];
+        // Prefix-sum construction, mirroring Engine::moe_ffn's plan build.
+        std::vector<i32> off(static_cast<size_t>(cc.ne) + 1, 0);
+        for (i32 t = 0; t < cc.n; t++) {
+            const i32 *sel = cc.sel.data() + static_cast<size_t>(t) * cc.k;
+            for (i32 s = 0; s < cc.k; s++) {
+                const i32 e = sel[s];
+                if (e >= 0 && e < cc.ne) off[static_cast<size_t>(e) + 1]++;
+            }
+        }
+        for (i32 e = 0; e < cc.ne; e++)
+            off[static_cast<size_t>(e) + 1] += off[static_cast<size_t>(e)];
+        std::vector<i32> dev(static_cast<size_t>(off[static_cast<size_t>(cc.ne)]), -1);
+        std::vector<f32> alpha(dev.size(), 0.0f);
+        std::vector<i32> cur(off.begin(), off.end() - 1);
+        for (i32 t = 0; t < cc.n; t++) {
+            const i32 *sel = cc.sel.data() + static_cast<size_t>(t) * cc.k;
+            const f32 *wt = cc.wt.data() + static_cast<size_t>(t) * cc.k;
+            for (i32 s = 0; s < cc.k; s++) {
+                const i32 e = sel[s];
+                if (e < 0 || e >= cc.ne) continue;
+                const i32 at = cur[static_cast<size_t>(e)]++;
+                dev[static_cast<size_t>(at)] = t;
+                alpha[static_cast<size_t>(at)] = wt[s];
+            }
+        }
+        // Legacy per-expert rescan, mirroring the old loop body.
+        for (i32 e = 0; e < cc.ne; e++) {
+            std::vector<i32> rows;
+            std::vector<f32> wts;
+            for (i32 t = 0; t < cc.n; t++) {
+                const i32 *sel = cc.sel.data() + static_cast<size_t>(t) * cc.k;
+                const f32 *wt = cc.wt.data() + static_cast<size_t>(t) * cc.k;
+                for (i32 s = 0; s < cc.k; s++) {
+                    if (sel[s] == e) {
+                        rows.push_back(t);
+                        wts.push_back(wt[s]);
+                    }
+                }
+            }
+            const i64 m_pre = static_cast<i64>(off[static_cast<size_t>(e) + 1] -
+                                               off[static_cast<size_t>(e)]);
+            CHECK(m_pre == static_cast<i64>(rows.size()),
+                  "plan offsets give the legacy row count for every expert");
+            if (m_pre == 0) continue;
+            bool same = true;
+            for (i64 i = 0; i < m_pre && same; i++) {
+                const size_t at = static_cast<size_t>(off[static_cast<size_t>(e)] + i);
+                same = (dev[at] == rows[static_cast<size_t>(i)] &&
+                        alpha[at] == wts[static_cast<size_t>(i)]);
+            }
+            CHECK(same, "plan segment matches legacy row order and weights");
+        }
+    }
 }
 
 static void test_expert_cache_policy() {
@@ -6643,15 +6733,21 @@ struct PrefillProbe {
 // One CLI prefill. `tiled` forces the tiled fallback through
 // KRK_ATTN_BEXACT=0; the per-process environment is what makes that possible
 // (the backend caches the switch at its first attention call).
+// `exact_off` instead forces the rung lottery behind KRK_GEMM_EXACT=0,
+// which is the negative control for the GEMM half of the gate.
 static PrefillProbe run_prefill_hash(const std::string &exe,
                                      const std::string &model,
                                      const std::string &prompt, int chunk,
-                                     bool tiled) {
+                                     bool tiled, bool exact_off = false) {
     PrefillProbe r;
-    const std::string o =
-        "kraken-prefill-out-" + std::to_string(chunk) + (tiled ? "-t" : "") + ".txt";
-    const std::string e =
-        "kraken-prefill-err-" + std::to_string(chunk) + (tiled ? "-t" : "") + ".txt";
+    // Each arm keeps the chunk number and gains a suffix, so two arms never
+    // share a capture path (the prefix has no spaces -- it is a filename).
+    const std::string tag =
+        (tiled ? "-t" : "") + std::string(exact_off ? "-lottery" : "");
+    const std::string o = "kraken-prefill-out-" +
+                          std::to_string(chunk) + tag + ".txt";
+    const std::string e = "kraken-prefill-err-" +
+                          std::to_string(chunk) + tag + ".txt";
     std::string cmd = "\"" + exe + "\" -m \"" + model + "\" -p \"" + prompt +
                       "\" --ctx 64 --chunk " + std::to_string(chunk) +
                       " --greedy --prefill-hash > \"" + o + "\" 2> \"" + e + "\"";
@@ -6664,7 +6760,9 @@ static PrefillProbe run_prefill_hash(const std::string &exe,
     const std::string full = cmd;
 #endif
     if (tiled) set_env_var("KRK_ATTN_BEXACT", "0");
+    if (exact_off) set_env_var("KRK_GEMM_EXACT", "0");
     r.rc = gate_exit_code(std::system(full.c_str()));
+    if (exact_off) clear_env_var("KRK_GEMM_EXACT");
     if (tiled) clear_env_var("KRK_ATTN_BEXACT");
 
     const std::string out = read_capture(o);
@@ -6914,6 +7012,45 @@ static void group_attention_sinks() {
     }
 }
 
+// One CLI generation. Returns stdout with the bracketed status lines
+// stripped (they carry timings, which differ run to run); what remains is
+// the banner plus the generated text, both deterministic for a fixed
+// build, model, prompt, chunk and seed. Used for the prefill-then-decode
+// promise: chunk-1-then-decode-N must read exactly like chunk-64-then-N,
+// token for token -- the text-level half of chunk invariance.
+static std::string run_generate_text(const std::string &exe,
+                                     const std::string &model,
+                                     const std::string &prompt, int chunk,
+                                     int n, const std::string &tag,
+                                     int &rc_out) {
+    const std::string o = "kraken-prefill-gen-" + std::to_string(chunk) +
+                          tag + ".txt";
+    const std::string e = "kraken-prefill-err-gen-" + std::to_string(chunk) +
+                          tag + ".txt";
+    std::string cmd = "\"" + exe + "\" -m \"" + model + "\" -p \"" + prompt +
+                      "\" --ctx 64 --chunk " + std::to_string(chunk) +
+                      " --greedy -n " + std::to_string(n) + " > \"" + o +
+                      "\" 2> \"" + e + "\"";
+#ifdef _WIN32
+    const std::string full = "call " + cmd;
+#else
+    const std::string full = cmd;
+#endif
+    rc_out = gate_exit_code(std::system(full.c_str()));
+    const std::string out = read_capture(o);
+    std::string kept;
+    size_t pos = 0;
+    while (pos < out.size()) {
+        size_t nl = out.find('\n', pos);
+        std::string line =
+            nl == std::string::npos ? out.substr(pos) : out.substr(pos, nl - pos);
+        if (line.empty() || line[0] != '[') { kept += line; kept += '\n'; }
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    return kept;
+}
+
 static void test_prefill_chunk_bitexact() {
     // Self-contained: the fixture is built here, and the CLI is the sibling
     // binary the build already produces (kraken-tests cannot link the device
@@ -6947,15 +7084,26 @@ static void test_prefill_chunk_bitexact() {
     const PrefillProbe c1 = run_prefill_hash(exe, model, prompt, 1, false);
     const PrefillProbe c2 = run_prefill_hash(exe, model, prompt, 2, false);
     const PrefillProbe c8 = run_prefill_hash(exe, model, prompt, 8, false);
+    // Rows 16 and 32 are the GEMM rung this gate could not see before: the
+    // chunk sizes above 8 leave the mat-vec ladder, so they are the arms that
+    // fail when the prefill GEMM's association differs from decode's.
+    const PrefillProbe c16 = run_prefill_hash(exe, model, prompt, 16, false);
+    const PrefillProbe c32 = run_prefill_hash(exe, model, prompt, 32, false);
     CHECK(c1.ok, "the chunk-1 prefill prints its hashes");
     CHECK(c2.ok, "the chunk-2 prefill prints its hashes");
     CHECK(c8.ok, "the chunk-8 prefill prints its hashes");
-    std::printf("       chunk 1 trace %s logits %s\n", c1.trace.c_str(),
+    CHECK(c16.ok, "the chunk-16 prefill prints its hashes");
+    CHECK(c32.ok, "the chunk-32 prefill prints its hashes");
+    std::printf("       chunk  1 trace %s logits %s\n", c1.trace.c_str(),
                 c1.logits.c_str());
-    std::printf("       chunk 2 trace %s logits %s\n", c2.trace.c_str(),
+    std::printf("       chunk  2 trace %s logits %s\n", c2.trace.c_str(),
                 c2.logits.c_str());
-    std::printf("       chunk 8 trace %s logits %s\n", c8.trace.c_str(),
+    std::printf("       chunk  8 trace %s logits %s\n", c8.trace.c_str(),
                 c8.logits.c_str());
+    std::printf("       chunk 16 trace %s logits %s\n", c16.trace.c_str(),
+                c16.logits.c_str());
+    std::printf("       chunk 32 trace %s logits %s\n", c32.trace.c_str(),
+                c32.logits.c_str());
     if (!c1.ok || !c8.ok) {
         std::fprintf(stderr, "  (chunk 1 rc=%d stderr: %.300s)\n", c1.rc,
                      c1.err.c_str());
@@ -6991,6 +7139,70 @@ static void test_prefill_chunk_bitexact() {
     CHECK(c1.logits == c8.logits, "and the logits row agrees bit for bit");
     CHECK(c1.first == c8.first, "the row's argmax is the same token");
 
+    // The GEMM rung: 16 and 32 rows per call take the prefill GEMM instead of
+    // the ladder, so these two arms are what prove the prefill GEMM writes the
+    // bytes decode would. Their control is below (KRK_GEMM_EXACT=0).
+    if (c16.ok) {
+        CHECK(c1.trace == c16.trace,
+              c1.trace == c16.trace
+                  ? "the 16-row prefill leaves the SAME rows as the 1-row one"
+                  : "the 16-row prefill DIFFERS from the 1-row one: the prefill "
+                    "GEMM does not reproduce decode's association");
+        CHECK(c1.logits == c16.logits, "and its logits row agrees");
+    }
+    if (c32.ok) {
+        CHECK(c1.trace == c32.trace,
+              c1.trace == c32.trace
+                  ? "the 32-row prefill leaves the SAME rows as the 1-row one"
+                  : "the 32-row prefill DIFFERS from the 1-row one: the prefill "
+                    "GEMM does not reproduce decode's association");
+        CHECK(c1.logits == c32.logits, "and its logits row agrees");
+    }
+
+    // THE TEXT PROMISE (token gen as well as prefill). A short prompt the
+    // fixture can extend without overflowing its 64-token context, decoded
+    // 8 greedy tokens at chunk 1, 8 and 64: chunk 1 threads every row
+    // through the decode formulation, chunk 8 stays on the ladder, chunk 64
+    // takes the exact grid for its one 20-row call. Same text or the gate
+    // fails -- this is the trajectory-equality endpoint (2609.15504), not a
+    // benchmark score.
+    std::string gprompt;
+    for (int i = 0; i < 19; i++) gprompt += (i ? " the" : "the");
+    int grc = -1;
+    const std::string g1 =
+        run_generate_text(exe, model, gprompt, 1, 8, "", grc);
+    const bool g1ok = grc == 0 && !g1.empty();
+    CHECK(g1ok, "the chunk-1 generation prints text");
+    // Replica floor (2607.28495): the same construction twice must agree
+    // with itself before any cross-chunk comparison means anything.
+    int grc2 = -1;
+    const std::string g1b =
+        run_generate_text(exe, model, gprompt, 1, 8, "b", grc2);
+    if (g1ok && grc2 == 0) {
+        CHECK(g1b == g1,
+              g1b == g1 ? "the chunk-1 generation repeats itself exactly"
+                        : "the same chunk-1 run disagrees with itself: "
+                          "nondeterminism below the gate's floor");
+    }
+    int grc8 = -1;
+    const std::string g8 =
+        run_generate_text(exe, model, gprompt, 8, 8, "", grc8);
+    if (g1ok && grc8 == 0) {
+        CHECK(g8 == g1,
+              g8 == g1 ? "chunk-8 decoded text matches chunk-1, token for token"
+                       : "chunk-8 text DIFFERS from chunk-1: decode path "
+                         "and prefill path disagree");
+    }
+    int grc64 = -1;
+    const std::string g64 =
+        run_generate_text(exe, model, gprompt, 64, 8, "", grc64);
+    if (g1ok && grc64 == 0) {
+        CHECK(g64 == g1,
+              g64 == g1
+                  ? "chunk-64 decoded text matches chunk-1, token for token"
+                  : "chunk-64 text DIFFERS from chunk-1: the exact grid "
+                    "does not reproduce decode's text");
+    }
     // Where the arms ran, and whether the gate could see a regression at all.
 #ifdef KRK_TEST_HIP_BUILD
     const bool device = c1.banner.find("scalar reference") == std::string::npos &&
@@ -7015,6 +7227,23 @@ static void test_prefill_chunk_bitexact() {
                       : "the tiled kernel now passes the gate too -- re-point the "
                         "control, this gate is no longer proven able to fail");
         }
+        // THE GEMM CONTROL. The same chunk-16 arm with the rung lottery
+        // forced (KRK_GEMM_EXACT=0) must NOT match the chunk-1 reference:
+        // rows above the ladder then run the WMMA association, which is a
+        // different summation order from decode's and must read as one.
+        const PrefillProbe w16 =
+            run_prefill_hash(exe, model, prompt, 16, false, true);
+        CHECK(w16.ok, "the GEMM-lottery control arm runs");
+        std::printf("       lottery control: chunk 16 trace %s logits %s\n",
+                    w16.trace.c_str(), w16.logits.c_str());
+        if (w16.ok && c1.ok) {
+            CHECK(w16.trace != c1.trace,
+                  w16.trace != c1.trace
+                      ? "with the rung lottery forced the 16-row arm differs, "
+                        "so the gate can detect a GEMM regression"
+                      : "the lottery arm matches the reference -- re-point the "
+                        "GEMM control, it no longer proves anything");
+        }
     }
 #else
     // No device kernels in this build, so the scalar reference is the arm that
@@ -7030,7 +7259,15 @@ static void test_prefill_chunk_bitexact() {
         for (const char *name : {"kraken-prefill-out-1.txt", "kraken-prefill-out-2.txt",
                                  "kraken-prefill-out-8.txt", "kraken-prefill-out-8-t.txt",
                                  "kraken-prefill-err-1.txt", "kraken-prefill-err-2.txt",
-                                 "kraken-prefill-err-8.txt", "kraken-prefill-err-8-t.txt"})
+                                 "kraken-prefill-err-8.txt", "kraken-prefill-err-8-t.txt",
+                                 "kraken-prefill-out-16.txt", "kraken-prefill-out-32.txt",
+                                 "kraken-prefill-out-16-lottery.txt",
+                                 "kraken-prefill-err-16.txt", "kraken-prefill-err-32.txt",
+                                 "kraken-prefill-err-16-lottery.txt",
+                                 "kraken-prefill-gen-1.txt", "kraken-prefill-gen-1b.txt",
+                                 "kraken-prefill-gen-8.txt", "kraken-prefill-gen-64.txt",
+                                 "kraken-prefill-err-gen-1.txt", "kraken-prefill-err-gen-1b.txt",
+                                 "kraken-prefill-err-gen-8.txt", "kraken-prefill-err-gen-64.txt"})
             std::remove(name);
         std::remove(model.c_str());
     }
@@ -8995,6 +9232,292 @@ static void test_qwen4exp_ple() {
 // through the real forward pass. The pieces the forward does not run yet (PLE,
 // the QSA indexer) are left out of the fixture, so a pass here is the stack.
 // ---------------------------------------------------------------------------
+// MLA, the host maths first (no engine, no file): the absorbed order the
+// oracle will prove kernels against, checked against the unfolded reference.
+// A wrong absorb is fluent text rather than a crash -- the same failure shape
+// as the PLE lane scatter -- so the equivalence, not a sample, is the gate.
+// The double-norm guard is load-bearing too: the cache holds normed rows, so
+// the read path must not norm again, and this group fails if it does (the
+// absorbed norm of an already-normed row shrinks every output ~1/sqrt(n)).
+static void test_mla_absorb() {
+    krk::MlaGeometry g;
+    g.n_embd = 32;
+    g.n_head = 3;
+    g.q_lora = 24;
+    g.kv_lora = 16;
+    g.qk_nope = 8;
+    g.qk_rope = 4;
+    g.v_dim = 8;
+    CHECK(g.valid(), "synthetic MLA geometry is valid");
+    CHECK(g.cache_row_width() == 20, "cache row is kv_lora + qk_rope");
+    // Deterministic fill: the same bytes every run, no fixture file.
+    u32 rng = 0x2f6e2b29u;
+    auto rnd = [&]() {
+        rng = rng * 1103515245u + 12345u;
+        return static_cast<f32>((rng >> 20) & 0xff) / 255.0f - 0.5f;
+    };
+    const i64 qs = static_cast<i64>(g.qk_nope) + g.qk_rope;
+    std::vector<f32> wqa(g.n_embd * g.q_lora), qan(g.q_lora),
+        wqb(g.q_lora * g.n_head * qs), wka(g.n_embd * g.kv_lora),
+        knorm(g.kv_lora), wkr(g.n_embd * g.qk_rope),
+        wuk(g.n_head * g.kv_lora * g.qk_nope),
+        wuv(g.n_head * g.kv_lora * g.v_dim),
+        wo(g.n_head * g.v_dim * g.n_embd);
+    for (f32 &v : wqa) v = rnd();
+    for (f32 &v : qan) v = 0.9f + 0.2f * rnd();
+    for (f32 &v : wqb) v = rnd();
+    for (f32 &v : wka) v = rnd();
+    for (f32 &v : knorm) v = 0.9f + 0.2f * rnd();
+    for (f32 &v : wkr) v = rnd();
+    for (f32 &v : wuk) v = rnd();
+    for (f32 &v : wuv) v = rnd();
+    for (f32 &v : wo) v = rnd();
+    krk::MlaWeights w;
+    w.wq_a = wqa.data();
+    w.wqa_norm = qan.data();
+    w.wq_b = wqb.data();
+    w.wkv_a = wka.data();
+    w.wkv_norm = knorm.data();
+    w.wkr = wkr.data();
+    w.wuk = wuk.data();
+    w.wuv = wuv.data();
+    w.wo = wo.data();
+    // The write path: compress, norm, cache. The test builds cache rows the
+    // way the forward will, through the same rms formula.
+    const i64 n_keys = 5;
+    std::vector<f32> cc(n_keys * g.kv_lora), kk(n_keys * g.qk_rope);
+    std::vector<f32> xt(g.n_embd);
+    for (i64 t = 0; t < n_keys; t++) {
+        f32 *c = cc.data() + t * g.kv_lora;
+        // norm through the engine formula: mean square + eps, gamma row.
+        f64 ss = 0.0;
+        std::vector<f32> raw(g.kv_lora);
+        for (i64 i = 0; i < g.n_embd; i++) xt[static_cast<size_t>(i)] = rnd();
+        for (i64 k = 0; k < g.kv_lora; k++) {
+            f32 s = 0.0f;
+            for (i64 i = 0; i < g.n_embd; i++)
+                s += wka[static_cast<size_t>(i) * g.kv_lora + k] *
+                     xt[static_cast<size_t>(i)];
+            raw[static_cast<size_t>(k)] = s;
+            ss += static_cast<f64>(s) * s;
+        }
+        const f32 inv =
+            1.0f / std::sqrt(static_cast<f32>(ss / g.kv_lora) + 1e-6f);
+        for (i64 k = 0; k < g.kv_lora; k++)
+            c[k] = raw[static_cast<size_t>(k)] * inv *
+                   knorm[static_cast<size_t>(k)];
+        f32 *kr = kk.data() + t * g.qk_rope;
+        for (i64 d = 0; d < g.qk_rope; d++) {
+            f32 s = 0.0f;
+            for (i64 i = 0; i < g.n_embd; i++)
+                s += wkr[static_cast<size_t>(i) * g.qk_rope + d] *
+                     xt[static_cast<size_t>(i)];
+            kr[d] = s;
+        }
+    }
+    std::vector<f32> x(g.n_embd);
+    for (f32 &v : x) v = rnd();
+    std::vector<f32> wq_abs(g.n_head * g.q_lora * g.kv_lora);
+    krk::mla_absorb_q(wq_abs.data(), wqb.data(), wuk.data(), g);
+    std::vector<f32> ou(g.n_embd), oa(g.n_embd), oa2(g.n_embd);
+    const f32 sc = 1.0f / std::sqrt(static_cast<f32>(qs));
+    krk::mla_forward_unfolded(ou.data(), x.data(), cc.data(), kk.data(),
+                              n_keys, w, g, sc, 1e-6f);
+    krk::mla_forward_absorbed(oa.data(), x.data(), cc.data(), kk.data(),
+                              n_keys, w, wq_abs.data(), g, sc, 1e-6f);
+    krk::mla_forward_absorbed(oa2.data(), x.data(), cc.data(), kk.data(),
+                              n_keys, w, wq_abs.data(), g, sc, 1e-6f);
+    double worst = 0.0;
+    bool finite = true;
+    for (i64 i = 0; i < g.n_embd; i++) {
+        const double d =
+            std::fabs(static_cast<double>(ou[static_cast<size_t>(i)]) -
+                      static_cast<double>(oa[static_cast<size_t>(i)]));
+        if (d > worst) worst = d;
+        if (!std::isfinite(oa[static_cast<size_t>(i)])) finite = false;
+        // Determinism: the oracle order replays byte-identically.
+        CHECK(oa[static_cast<size_t>(i)] == oa2[static_cast<size_t>(i)],
+              "absorbed forward is deterministic");
+    }
+    CHECK(finite, "absorbed output is finite");
+    CHECK(worst < 1e-4, "absorbed matches unfolded within f32 tolerance");
+}
+
+
+// MLA legacy lite layout (DeepSeek-V2-Lite): direct q, MQA kv, unsplit wkv_b.
+// Two orders, one answer, plus the pins that make the test see the layout: a
+// singleton cache ignores the query entirely (p == 1 exactly), moved write
+// positions move the answer (rope is read, not decorative), a head-permuted
+// wkv_b moves it too (heads are not interchangeable), and the guard row
+// proves a zero-length cache returns instead of crashing.
+static void test_mla_lite() {
+    krk::MlaLiteGeometry g;
+    g.n_embd = 24;
+    g.n_head = 2;
+    g.kv_lora = 8;
+    g.qk = 8;
+    g.qk_rope = 4;
+    g.v_dim = 4;
+    CHECK(g.valid(), "synthetic lite MLA geometry is valid");
+    CHECK(g.nope() == 4, "nope split is qk - rope");
+    CHECK(g.cache_row_width() == 12, "cache row is kv_lora + rope");
+    u32 rng = 0x51f15eedU;
+    auto rnd = [&]() {
+        rng = rng * 1103515245u + 12345u;
+        return static_cast<f32>((rng >> 20) & 0xff) / 255.0f - 0.5f;
+    };
+    const i64 nope = g.nope();
+    const i64 hv = nope + g.v_dim;
+    std::vector<f32> wq(g.n_embd * g.n_head * g.qk),
+        mqa(g.n_embd * (g.kv_lora + g.qk_rope)), wnorm(g.kv_lora),
+        wkvb(g.kv_lora * g.n_head * hv),
+        wo(g.n_head * g.v_dim * g.n_embd);
+    for (f32 &v : wq) v = rnd();
+    for (f32 &v : mqa) v = rnd();
+    for (f32 &v : wnorm) v = 0.9f + 0.2f * rnd();
+    for (f32 &v : wkvb) v = rnd();
+    for (f32 &v : wo) v = rnd();
+    krk::MlaLiteWeights w;
+    w.wq = wq.data();
+    w.wkv_a_mqa = mqa.data();
+    w.wkv_a_norm = wnorm.data();
+    w.wkv_b = wkvb.data();
+    w.wo = wo.data();
+    // Plain base-10000 table over the rope pairs; YaRN variants arrive here
+    // as an adjusted table from the caller, so the oracle never branches.
+    std::vector<f32> invf(g.qk_rope / 2);
+    for (i64 i = 0; i < g.qk_rope / 2; i++)
+        invf[static_cast<size_t>(i)] =
+            1.0f / std::pow(10000.0f,
+                            static_cast<f32>(2 * i) / g.qk_rope);
+    // The write path: project, split, norm the latent, cache the raw key.
+    // Rotation happens on READ (oracle side), at each row's own position.
+    const i64 n_keys = 4;
+    std::vector<f32> cc(n_keys * g.kv_lora), kk(n_keys * g.qk_rope);
+    std::vector<i64> kpos(static_cast<size_t>(n_keys));
+    std::vector<f32> xt(g.n_embd);
+    for (i64 t = 0; t < n_keys; t++) {
+        for (i64 i = 0; i < g.n_embd; i++)
+            xt[static_cast<size_t>(i)] = rnd();
+        f32 *c = cc.data() + t * g.kv_lora;
+        f64 ss = 0.0;
+        std::vector<f32> raw(g.kv_lora);
+        for (i64 k = 0; k < g.kv_lora; k++) {
+            f32 s = 0.0f;
+            for (i64 i = 0; i < g.n_embd; i++)
+                s += mqa[static_cast<size_t>(i) * (g.kv_lora + g.qk_rope) +
+                         k] *
+                     xt[static_cast<size_t>(i)];
+            raw[static_cast<size_t>(k)] = s;
+            ss += static_cast<f64>(s) * s;
+        }
+        const f32 inv =
+            1.0f / std::sqrt(static_cast<f32>(ss / g.kv_lora) + 1e-6f);
+        for (i64 k = 0; k < g.kv_lora; k++)
+            c[k] = raw[static_cast<size_t>(k)] * inv *
+                   wnorm[static_cast<size_t>(k)];
+        f32 *kr = kk.data() + t * g.qk_rope;
+        for (i64 d = 0; d < g.qk_rope; d++) {
+            f32 s = 0.0f;
+            for (i64 i = 0; i < g.n_embd; i++)
+                s += mqa[static_cast<size_t>(i) * (g.kv_lora + g.qk_rope) +
+                         g.kv_lora + d] *
+                     xt[static_cast<size_t>(i)];
+            kr[d] = s;
+        }
+        kpos[static_cast<size_t>(t)] = t;
+    }
+    std::vector<f32> x(g.n_embd);
+    for (f32 &v : x) v = rnd();
+    std::vector<f32> ou(g.n_embd), oa(g.n_embd), oa2(g.n_embd);
+    const f32 sc = 1.0f / std::sqrt(static_cast<f32>(g.qk));
+    krk::mla_lite_forward_unfolded(ou.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), n_keys, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc, 1e-6f);
+    krk::mla_lite_forward_absorbed(oa.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), n_keys, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc, 1e-6f);
+    krk::mla_lite_forward_absorbed(oa2.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), n_keys, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc, 1e-6f);
+    double worst = 0.0;
+    bool finite = true;
+    for (i64 i = 0; i < g.n_embd; i++) {
+        const double d =
+            std::fabs(static_cast<double>(ou[static_cast<size_t>(i)]) -
+                      static_cast<double>(oa[static_cast<size_t>(i)]));
+        if (d > worst) worst = d;
+        if (!std::isfinite(oa[static_cast<size_t>(i)])) finite = false;
+        CHECK(oa[static_cast<size_t>(i)] == oa2[static_cast<size_t>(i)],
+              "lite absorbed forward is deterministic");
+    }
+    CHECK(finite, "lite absorbed output is finite");
+    CHECK(worst < 1e-4, "lite absorbed matches unfolded within f32 tolerance");
+    // Singleton cache: p == 1 whatever the query, so two different queries
+    // must produce bit-identical outputs. Any score-dependence in the
+    // weighting breaks this exactly, not approximately.
+    std::vector<f32> x2(g.n_embd);
+    for (f32 &v : x2) v = rnd();
+    std::vector<f32> o1(g.n_embd), o2(g.n_embd);
+    krk::mla_lite_forward_absorbed(o1.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), 1, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc, 1e-6f);
+    krk::mla_lite_forward_absorbed(o2.data(), x2.data(), cc.data(), kk.data(),
+                                   kpos.data(), 1, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc, 1e-6f);
+    for (i64 i = 0; i < g.n_embd; i++)
+        CHECK(o1[static_cast<size_t>(i)] == o2[static_cast<size_t>(i)],
+              "singleton lite cache ignores the query");
+    // Moved write positions move the answer: the positions are read.
+    std::vector<i64> kpos2(static_cast<size_t>(n_keys));
+    for (i64 t = 0; t < n_keys; t++) kpos2[static_cast<size_t>(t)] = t + 1;
+    std::vector<f32> om(g.n_embd);
+    krk::mla_lite_forward_absorbed(om.data(), x.data(), cc.data(), kk.data(),
+                                   kpos2.data(), n_keys, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc, 1e-6f);
+    double moved = 0.0;
+    for (i64 i = 0; i < g.n_embd; i++)
+        moved = std::max(
+            moved,
+            std::fabs(static_cast<double>(om[static_cast<size_t>(i)]) -
+                      static_cast<double>(oa[static_cast<size_t>(i)])));
+    CHECK(moved > 1e-6, "shifted write positions move the lite answer");
+    // A head-permuted wkv_b moves the answer: heads are distinguished.
+    std::vector<f32> wkvb2 = wkvb;
+    const i64 hb = g.kv_lora * hv;
+    for (i64 i = 0; i < hb; i++)
+        std::swap(wkvb2[static_cast<size_t>(i)],
+                  wkvb2[static_cast<size_t>(hb + i)]);
+    krk::MlaLiteWeights w2 = w;
+    w2.wkv_b = wkvb2.data();
+    std::vector<f32> oh2(g.n_embd);
+    krk::mla_lite_forward_absorbed(oh2.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), n_keys, /*q_pos*/ 4, w2, g,
+                                   invf.data(), sc, 1e-6f);
+    double hdiff = 0.0;
+    for (i64 i = 0; i < g.n_embd; i++)
+        hdiff = std::max(
+            hdiff,
+            std::fabs(static_cast<double>(oh2[static_cast<size_t>(i)]) -
+                      static_cast<double>(oa[static_cast<size_t>(i)])));
+    CHECK(hdiff > 1e-6, "head-permuted wkv_b moves the lite answer");
+    // The scale and the query position both reach the scores.
+    std::vector<f32> os(g.n_embd);
+    krk::mla_lite_forward_absorbed(os.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), n_keys, /*q_pos*/ 4, w, g,
+                                   invf.data(), sc * 0.5f, 1e-6f);
+    CHECK(os[0] != oa[0] || os[1] != oa[1], "scale reaches the lite scores");
+    std::vector<f32> oq(g.n_embd);
+    krk::mla_lite_forward_absorbed(oq.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), n_keys, /*q_pos*/ 5, w, g,
+                                   invf.data(), sc, 1e-6f);
+    CHECK(oq[0] != oa[0] || oq[1] != oa[1], "query position is read");
+    // Zero-length cache returns instead of crashing.
+    krk::mla_lite_forward_absorbed(oq.data(), x.data(), cc.data(), kk.data(),
+                                   kpos.data(), 0, /*q_pos*/ 5, w, g,
+                                   invf.data(), sc, 1e-6f);
+}
+
 // QSA indexer, the host maths first (no engine, no file): pooling over complete
 // blocks only, the per-head relu before the sum, rope at the block's FIRST
 // position, and the selection rule -- budget in CELLS, the still-filling block
@@ -10569,6 +11092,8 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_qwen4exp_gdn_gate)
     TEST_GROUP(test_qwen4exp_hc_mix)
     TEST_GROUP(test_qwen4exp_ple)
+    TEST_GROUP(test_mla_absorb)
+    TEST_GROUP(test_mla_lite)
     TEST_GROUP(test_qsa_select)
     TEST_GROUP(test_qwen4exp_qsa)
     TEST_GROUP(test_cpu_expert_pool)

@@ -126,6 +126,17 @@ struct LayerWeights {
     f32 shexp_gate_scale = 1.0f, shexp_up_scale = 1.0f, shexp_down_scale = 1.0f;
     QuantTensor shexp_inp_gate;                   // [n_embd] per-token gate
     ExpertSource experts;                         // lazily-loaded routed experts
+    // ---- MLA legacy (DeepSeek-V2-Lite: direct q, MQA kv, unsplit wkv_b) --
+    // attn_q is the direct per-head query (no q_lora trunk on lite);
+    // attn_kv_a_mqa emits [kv_lora + rope] (latent plus decoupled key);
+    // attn_kv_a_norm norms the latent at write; attn_kv_b is the UNSPLIT
+    // legacy table [kv_lora, n_head*(nope+v)]. wo is the shared output.
+    // Modern split names (attn_q_a/attn_q_b/attn_kv_a/attn_k_b/attn_v_b) are
+    // refused by name until a file carries them -- see Model::load.
+    QuantTensor wq_direct;    // [n_embd, n_head*(nope+rope)]
+    QuantTensor wkv_a_mqa;    // [n_embd, kv_lora + rope]
+    f32 *wkv_a_norm = nullptr;  // DEVICE f32[kv_lora], like every norm
+    QuantTensor wkv_b;        // [kv_lora, n_head*(nope+v_dim)]
 
     // ---- gated delta net (Qwen3.5 / Qwen3-Next, optional) ---------------
     // A recurrent layer replaces attention with a short depthwise convolution
@@ -275,6 +286,35 @@ struct ModelConfig {
     std::vector<i64> ple_head_vocab_sizes;
     std::vector<i32> ple_layers;        // layer indices carrying a PLE module
     bool qsa = false;
+    // ---- MLA (DeepSeek-V2/V3/V4) --------------------------------------
+    // The latent geometry, read off the file's own attention metadata. The
+    // real keys are q_lora_rank (absent on lite: the query is a direct
+    // projection), kv_lora_rank (absent on V4: the latent IS key_length),
+    // key_length (full per-head K width: nope + rope) and value_length --
+    // NOT qk_nope_head_dim/qk_rope_head_dim/v_head_dim, which no exporter
+    // writes and which used to refuse every real file at load. The nope
+    // split is key_length - rope.dimension_count. A layer's KV cache row is
+    // kv_lora + rope wide (576 floats on V2-Lite: 512 + 64), not
+    // n_kv x head_dim x 2, and there are no per-head K/V rows at all -- the
+    // per-head projections are absorbed at load.
+    bool mla = false;
+    i32 mla_q_lora = 0;   // 0 on lite: direct attn_q, no q trunk
+    i32 mla_kv_lora = 0;  // kv_lora_rank, or key_length when absent (V4)
+    i32 mla_qk_nope = 0;  // derived: key_length - rope_dim
+    i32 mla_qk_rope = 0;  // = rope_dim for MLA (the rotation covers the tail)
+    i32 mla_v_dim = 0;    // = value_length
+    // ---- DeepSeek-V4 extras -------------------------------------------
+    // Dense-core grouping (wo_a/wo_b), the sliding window, the hash-route
+    // layer count, the compressed-rope base and the per-layer compression
+    // ratios (0 = dense). Read for every dsv4 file; the loader refuses a
+    // file that does not carry them rather than guessing.
+    bool dsv4 = false;
+    i32 dsv4_o_groups = 0;
+    i32 dsv4_o_lora = 0;
+    i32 dsv4_window = 0;
+    i32 dsv4_hash_layers = 0;
+    f32 dsv4_compress_rope_base = 0.0f;
+    std::vector<i32> dsv4_ratio;  // per layer, 0 = dense core
     i32 idx_n_head = 0;
     i32 idx_head_dim = 0;
     i32 idx_top_k = 0;

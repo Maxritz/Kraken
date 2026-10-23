@@ -580,6 +580,10 @@ public:
 
 private:
     std::string kv_resource_error() const;
+    std::string expert_resource_error() const;
+    // Prefers forward_error_ (expert refusal) over the generic KV message.
+    std::string forward_failure_error() const;
+    const std::string &forward_error() const { return forward_error_; }
     // One batched forward over n tokens starting at pos0. LogitMode picks how
     // much of the output head runs: none (mid-prefill), the last row (plain
     // decode), or every row (speculative verification).
@@ -616,7 +620,11 @@ private:
     // permuted into one block, so each expert runs three batched GEMMs
     // regardless of how many tokens chose it. Experts are paged in through the
     // model's cache.
-    void moe_ffn(const LayerWeights &L, i32 layer, i32 n);
+    bool moe_ffn(const LayerWeights &L, i32 layer, i32 n);
+    // Set when moe_ffn (or the MTP block path) refuses a routed expert:
+    // forward_core returns false and the next error surface prefers this
+    // over the generic KV message. Cleared at each forward_core entry.
+    std::string forward_error_;
     // The dense (non-MoE) SwiGLU FFN both layer shapes share: gate/up on one
     // fused launch, silu, down, residual. Shared because the recurrent path's
     // copy was the stale one and had drifted off the fused group.
@@ -778,7 +786,7 @@ private:
     // The block's routed + shared expert FFN. Same residency path as a stack
     // layer, keyed on the block's own index, so its experts page in and out of
     // the same budget as everything else.
-    void mtp_ffn(const MtpBlock &m, i32 n);
+    bool mtp_ffn(const MtpBlock &m, i32 n);
     void mtp_dense_ffn(const MtpBlock &m, i32 n, void *acc, i32 *exp);
     // One token's embedding row into mtp_e_, with the latent-embedding
     // un-rotation the stack applies at the same point.

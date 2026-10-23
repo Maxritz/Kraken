@@ -1,5 +1,22 @@
 # What MLA support would cost in kraken, and what it would buy
 
+> **Status 2026-10-22 -- stage 1 landed, the engine still refuses.** The
+> loader now reads the ranks the exporters actually write
+> (`key_length` / `value_length` / `kv_lora_rank`, with nope =
+> `key_length - rope.dimension_count`; the `qk_nope_head_dim` names the
+> estimate below implies are written by nobody and refused every real file),
+> loads the legacy-lite attention block, and pins the layout with a host
+> oracle in two orders (new group `test_mla_lite`, 57 checks). V4's metadata
+> is read too. So item 1 of the estimate is done in the shape the file
+> actually has, and items 2-4 (latent decode kernel, latent prefill,
+> coherence fixture) are all still open -- the arch verdict is unchanged and
+> both files are still refused. The V4 file adds more than the estimate
+> knew: the modern split tensors (`attn_q_a` / `attn_q_b` / `attn_kv` /
+> `attn_output_a` / `attn_output_b`), `attn_sinks`, Sinkhorn
+> hyper-connections, the `ffn_gate_tid2eid` hash route, compressed
+> attention layers with their own compressor tensors, a QSA indexer, and a
+> quant type (#26) this build cannot dequantize at all.
+
 > 2026-10-21: DeepSeek open-sourced DeepInfer, a serving runtime for
 > DeepSeek-V4.1-Flash whose design implements exactly this path (absorbed
 > latent KV, sparse indexer, FP4 cache). `docs/AUDIT-deepinfer.md` reads it

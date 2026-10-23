@@ -241,14 +241,16 @@ public:
         const char *fse = std::getenv("KRK_FUSED_SILU");
         fuse_silu_ = !fse || std::strcmp(fse, "0") != 0;
         // int8 DP4A prefill GEMM (kernels/gemm_dp4a.hpp). This path quantizes
-        // the activations to int8, so it is lossy by construction and it was
-        // opt-in for that reason. It is now the default, because the shape
-        // gate in dp4a_ok already draws the line where the measurement says
-        // the trade is worth making, and leaving the whole rung unreachable
-        // cost more than the precision it gives up.
+        // the activations to int8, so it is lossy by construction: int8
+        // activations regroup every dot (sums of codes folded with scales
+        // and activation sums, not the decode association), and the last
+        // hundredths of the logits move with it. It is therefore opt-in
+        // (KRK_GEMM_INT8=1); the default prefill path is the exact grid,
+        // whose bytes are chunk-size invariant. KRK_GEMM_PATH=dp4a forces
+        // the rung regardless of this switch, for explicit throughput runs.
         //
-        // What decided it, on the RX 6700 XT with Qwen3-8B-Q4_K_M and a
-        // 361-token prompt, four arms interleaved across three reps in one
+        // The case FOR opting in, on the RX 6700 XT with Qwen3-8B-Q4_K_M and
+        // a 361-token prompt, four arms interleaved across three reps in one
         // binary (docs/traces/rdna2-prefill-investigation.txt):
         //   simt only            203.7 tok/s
         //   KRK_GEMM_INT8=1      238.1 tok/s   1.17x
@@ -256,21 +258,27 @@ public:
         // 24 greedy tokens. The int8 rung also reached 10.33 TFLOP/s against
         // the SIMT tile's 3.78 -- a 2.7x difference in kernel efficiency, not
         // a marginal tuning win, and it moved 432 of 504 prefill GEMMs.
+        // That verdict still stands where the trade is wanted; it is just no
+        // longer the default, because a default-on lossy rung breaks the
+        // invariance the chunk gate proves.
         //
-        // The measured boundary is already encoded in dp4a_ok: kDp4aMinK is
-        // 2048, below which the activation-quantize and per-tile unpack costs
-        // are not amortised. The A/B that put the floor there is recorded at
-        // the constant: SmolLM2-135M (K=576/1536) 2827 -> 1641 tok/s, i.e. it
-        // loses, and dp4a_ok now refuses it; Llama-3.2-1B (K=2048/8192) 1120
-        // -> 2060 wins, and Qwen3.5-9B (K=4096/12288) 175.6 -> 198.7 wins.
-        // So "on by default" means "on where it was measured to win", which is
-        // the gate's job and not this switch's.
-        //
-        // KRK_GEMM_INT8=0 restores the fp16 tile everywhere, for A/B against a
-        // binary that predates this and for any caller who needs the fp16
-        // path's exact logits.
+        // The measured boundary stays encoded in dp4a_ok: kDp4aMinK is 2048,
+        // below which the activation-quantize and per-tile unpack costs are
+        // not amortised (SmolLM2-135M K=576/1536: 2827 -> 1641 tok/s, i.e.
+        // it loses; Llama-3.2-1B K=2048/8192: 1120 -> 2060 wins).
         const char *ie = std::getenv("KRK_GEMM_INT8");
-        int8_gemm_ = !(ie && std::strcmp(ie, "0") == 0);
+        int8_gemm_ = ie && std::strcmp(ie, "1") == 0;
+        // An int8 request the ladder cannot honour is a warning, not a
+        // silent no-op: before the exact grid and the rung both knew about
+        // this flag, KRK_GEMM_INT8=1 served the exact grid and measured
+        // identical to the default -- two identical arms. Now the flag
+        // bypasses the exact grid and outranks auto-WMMA wherever dp4a_ok
+        // holds; shapes outside dp4a_ok keep the exact grid, so a run that
+        // sets it should expect chunk/decode divergence (lossy by
+        // construction) on the shapes it takes.
+        if (int8_gemm_)
+            KRK_WARN("KRK_GEMM_INT8=1 engages the lossy int8 rung on dp4a_ok "
+                     "shapes only; other shapes keep the exact grid");
         // Which rung of the GEMM ladder to use, for measurement and for
         // pinning a path when comparing two builds. Absent or "auto" means the
         // device decides (see gemm_rung).
@@ -289,6 +297,13 @@ public:
         if (path_ == GemmPath::kWmma && !caps_.has_wmma)
             KRK_WARN("KRK_GEMM_PATH=wmma, but %s has no WMMA; the ladder will "
                      "fall through", caps_.gfx.c_str());
+        // A rung that was asked for and was compiled out is the same silent
+        // fallthrough one level up: the device has it, the binary does not.
+#if !defined(KRK_WMMA_COMPILED)
+        if (path_ == GemmPath::kWmma)
+            KRK_WARN("KRK_GEMM_PATH=wmma, but this binary holds no WMMA rung; "
+                     "the ladder will fall through");
+#endif
         if (path_ == GemmPath::kDp4a && !int8_gemm_)
             KRK_WARN("KRK_GEMM_PATH=dp4a also turns on the int8 activations, "
                      "which are lossy by construction");
@@ -2140,6 +2155,33 @@ public:
         return v;
     }
 
+    // Spatial multi-warp ladder rung (kernels/gemm.hpp, gemv_mw_kernel).
+    // Default for rows 2..8: M gemv-equivalent warps instead of gemv_m's
+    // one warp with M accumulators. Measured 1.5-3.8x on the MoE expert
+    // shapes with byte-identical output; KRK_GEMV_MW=0 restores gemv_m
+    // (the A/B arm and the fallback).
+    static bool gemv_mw_enabled() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_GEMV_MW");
+            return !(e && e[0] == '0');
+        }();
+        return v;
+    }
+
+    // Exact prefill grid (kernels/gemm.hpp, gemv_grid_kernel). Default for
+    // rows > 8: gemv's own association (chunk order, lane mapping, tree
+    // reduce, shared dot_chunks) in a (row, x-group) grid, so every chunk
+    // size leaves bit-identical bytes. No split-K, no int8 staging, no tile
+    // regrouping -- the rung lottery (wmma/dp4a/simt) is throughput-first and
+    // regroups by shape. KRK_GEMM_EXACT=0 restores the lottery (the A/B arm).
+    static bool exact_gemm_enabled() {
+        static const bool v = [] {
+            const char *e = std::getenv("KRK_GEMM_EXACT");
+            return !(e && e[0] == '0');
+        }();
+        return v;
+    }
+
     GemmRung gemm_rung(DType wt, i64 rows, i64 n_out, i64 n_in) const {
         const bool wmma_present = caps_.has_wmma
 #if defined(KRK_WMMA_COMPILED)
@@ -2153,7 +2195,14 @@ public:
         const bool force_wmma = path_ == GemmPath::kWmma;
         const bool force_dp4a = path_ == GemmPath::kDp4a;
         const bool force_simt = path_ == GemmPath::kSimt;
-        if (!force_dp4a && !force_simt && wmma_present) return GemmRung::kWmma;
+        // An explicit int8 request outranks the auto WMMA pick: without this,
+        // KRK_GEMM_INT8=1 on an auto path silently served WMMA (or the exact
+        // grid above), so the flag measured identical to the default -- two
+        // identical arms reporting "the change is free". A forced WMMA still
+        // wins over the int8 hint; contradictory flags keep the forced rung.
+        if (!force_dp4a && !force_simt && (!int8_gemm_ || force_wmma) &&
+            wmma_present)
+            return GemmRung::kWmma;
         if (!force_simt && !force_wmma && (int8_gemm_ || force_dp4a) &&
             dp4a_ok(static_cast<int>(wt), rows, n_out, n_in))
             return GemmRung::kDp4a;
@@ -2401,6 +2450,27 @@ public:
             // made for gfx1151, where handing 4-8 columns to the big-tile
             // routine cost ~25x. Keyed on ROW COUNT and not on format, so it
             // is the same decision the reference makes (ne11 <= 8).
+            if (gemv_mw_enabled()) {
+                // One block per output row, M warps per block: warp t owns
+                // x row t, so no warp carries more than one accumulator.
+                // THREADS = 32*M (64..256); the grid is n_out blocks.
+#define KRK_GEMV_MW(N)                                                      \
+    gemv_mw_kernel<32 * N, N>                                              \
+        <<<static_cast<unsigned>(n_out), 32 * N>>>(wh, static_cast<int>(wt), \
+                                                  n_out, n_in, row_bytes,  \
+                                                  xh, oh)
+                switch (static_cast<int>(rows)) {
+                    case 2: KRK_GEMV_MW(2); break;
+                    case 3: KRK_GEMV_MW(3); break;
+                    case 4: KRK_GEMV_MW(4); break;
+                    case 5: KRK_GEMV_MW(5); break;
+                    case 6: KRK_GEMV_MW(6); break;
+                    case 7: KRK_GEMV_MW(7); break;
+                    default: KRK_GEMV_MW(8); break;
+                }
+#undef KRK_GEMV_MW
+                krk_op_scope.retag("gemm(gemv_mw)");
+            } else {
             const unsigned gm = static_cast<unsigned>((n_out + 7) / 8);
 #define KRK_GEMV_M(N)                                                        \
     gemv_m_kernel<256, N><<<gm, 256>>>(wh, static_cast<int>(wt), n_out,     \
@@ -2416,6 +2486,34 @@ public:
             }
 #undef KRK_GEMV_M
             krk_op_scope.retag("gemm(gemv_m)");
+            }
+        } else if (exact_gemm_enabled() && path_ == GemmPath::kAuto &&
+                   !(int8_gemm_ &&
+                     dp4a_ok(static_cast<int>(wt), rows, n_out, n_in))) {
+            // One block per (output row, x-group): the grid position selects
+            // rows, never the accumulation order, so the bytes are chunk-size
+            // invariant by construction. Groups round up; warps past `rows`
+            // in the last group exit before touching memory. KRK_GRID_G sets
+            // the group size (default 32): fewer, larger groups re-read
+            // each weight row fewer times -- measured +12% prefill at 661
+            // rows Q8_0 (272 -> 305 tok/s, interleaved) with byte-identical
+            // hashes at 8/32/128/256. Any value is bit-identical; out of
+            // range clamps to the default rather than refusing.
+            static const int grid_g = [] {
+                const char *e = std::getenv("KRK_GRID_G");
+                if (!e || !*e) return 32;
+                const int v = std::atoi(e);
+                return (v >= 8 && v <= 256) ? v : 32;
+            }();
+            const unsigned groups =
+                static_cast<unsigned>((rows + grid_g - 1) / grid_g);
+            const unsigned long long total =
+                static_cast<unsigned long long>(
+                    static_cast<unsigned>(n_out)) * groups;
+            gemv_grid_kernel<<<static_cast<unsigned>(total), 256>>>(
+                wh, static_cast<int>(wt), n_out, n_in, row_bytes, xh, rows,
+                oh, grid_g);
+            krk_op_scope.retag("gemm(grid)");
         } else if (rung == GemmRung::kWmma) {
 #if defined(KRK_WMMA_COMPILED)
             const unsigned bx = static_cast<unsigned>(

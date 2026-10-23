@@ -570,14 +570,14 @@ void bench_pool_primitives(Backend *be, int iters, int depth, double launch_ms) 
 // primitive is not the in-step cost, and that claim is worth nothing unless the
 // arm can tell a busy queue from an idle one. So the gate constructs both
 // states AND the boundary between them, with no environment switch in play:
-//   - 512 copies pre-issued: the queue is still draining when the host block
-//     returns (witnessed by the tail the following sync has to wait for), and
-//     both calls are cheaper than with an empty queue -- measured 88x for the
-//     record and ~3x for the copy.
-//   - 1 copy pre-issued: nothing is left to drain, and the same block must
-//     read like the empty-queue figure. An arm that reported the busy figure
-//     here would be reporting a constant, not a queue state -- which is the
-//     defect this check exists to catch.
+//   - `deep` copies pre-issued: the queue is still draining when the host
+//     block returns (witnessed by the tail the following sync has to wait for),
+//     and the launch arm's tail must read more than 2x the empty queue's.
+//   - the pre-issue SKIPPED (KRK_TEST_QUEUE_NOPREISSUE=1): "busy" and "empty"
+//     are then the same state, and the two fullness checks must FAIL. That is
+//     the red construction, and it is what makes a green ratio mean something:
+//     an arm that reported the busy figure for a queue that was not fuller
+//     would be reporting a constant, not a queue state.
 // It runs even when --depth 0 was passed, because `--depth` skips the printed
 // arm and a gate check is not optional.
 i64 gate_busy_queue(Backend *be, int depth) {
@@ -588,7 +588,17 @@ i64 gate_busy_queue(Backend *be, int depth) {
     };
     constexpr int kChunk = 64;
     constexpr int kReps = 8;
-    const int deep = depth > 1 ? depth : 512;
+    // 8192, not 512. The pre-issue has to out-weigh the block's OWN device
+    // work by more than the 2.0x this check asks for, and the device drains
+    // the pre-issue while the host is still enqueueing it -- so the leftovers
+    // scale with the depth but the empty baseline does not. Measured on this
+    // box (2026-10-22, launch arm, tail in us): 512 pre-issued leaves 411
+    // against an empty queue's 224-284, which is 1.54x and FAILS the check
+    // even though the queue really is fuller; 8192 leaves 2203 (7.75x) and
+    // 16384 leaves 4710 (19.2x). The 2.0x threshold is unchanged and the red
+    // construction still bites: with the pre-issue skipped both states are the
+    // same state and the ratio is 1.00x.
+    const int deep = depth > 1 ? depth : 8192;
     const QueueArm bcopy = measure_queue_arm(be, deep, kChunk, kReps, false);
     const QueueArm ecopy = measure_queue_arm(be, 0, kChunk, kReps, false);
     const QueueArm brec = measure_queue_arm(be, deep, kChunk, kReps, true);
@@ -2875,7 +2885,11 @@ i64 arm_moe_dispatch(Backend *be) {
 
 int main(int argc, char **argv) {
     int iters = 100;
-    int depth = 512; // calls pre-issued for the busy-queue arm (0 skips it)
+    // Calls pre-issued for the busy-queue arm (0 skips the printed arm). 8192
+    // is the depth the gate's own measurement needs on this box -- see
+    // gate_busy_queue below for why a shallower one no longer separates the
+    // two queue states.
+    int depth = 8192;
     double launch_ms = 0.0;
     bool sweep = false;
     bool gate = false;
