@@ -8823,6 +8823,41 @@ static void test_http_server() {
             // scratch directory to remove these for us.
             std::remove(srv.out_path.c_str());
             std::remove(srv.err_path.c_str());
+        // The GEMM rung is a switch, so the two things a caller can get wrong
+        // without a model file are its refusal and its documentation. Both run
+        // through the binary: a value that is neither exact nor fast must exit 2
+        // and name the values it takes, and --help must document the switch.
+        {
+            const std::string o = "kraken-server-prefill-out.txt";
+            const std::string e = "kraken-server-prefill-err.txt";
+            auto run = [&](const std::string &args) {
+                const std::string cmd = "\"" + exe_p.string() + "\" " + args + " > \"" + o +
+                                        "\" 2> \"" + e + "\"";
+#ifdef _WIN32
+                return gate_exit_code(std::system(("call " + cmd).c_str()));
+#else
+                return gate_exit_code(std::system(cmd.c_str()));
+#endif
+            };
+            // A path that does not exist, deliberately: with the refusal in
+            // place this exits 2 before any load, and if the refusal ever
+            // regresses it exits 1 on the open instead of starting a server
+            // on the default port and blocking this arm forever.
+            const int bad = run("--prefill turbo -m \"kraken-no-such-model.gguf\"");
+            CHECK(bad == 2,
+                  "server bytes: --prefill refuses a value that is neither exact nor fast");
+            const std::string bad_err = read_capture(e);
+            if (bad_err.find("needs exact|fast") == std::string::npos)
+                std::fprintf(stderr, "  (--prefill turbo stderr: %.200s)\n", bad_err.c_str());
+            CHECK(bad_err.find("needs exact|fast") != std::string::npos,
+                  "server bytes: the refusal names the two values it takes");
+            const int help_rc = run("--help");
+            const std::string help_out = read_capture(o);
+            CHECK(help_rc == 0 && help_out.find("--prefill exact|fast") != std::string::npos,
+                  "server bytes: --help documents --prefill exact|fast");
+            std::remove(o.c_str());
+            std::remove(e.c_str());
+        }
         }
     }
 

@@ -652,7 +652,7 @@ code, the README, or `docs/`.
   in the CPU kernel's `mla_shared_attention` (`base = 0`) fails 3 of 21 -- row,
   argmax and sequence -- while `test_mla_shared` STAYS 109/109**, because that
   group compares the oracle and the kernel against each other and both are
-  unchanged by a shared premise. The per-piece gates could not see it; only  the sentence could. Suite total 4102, 85 groups.
+  unchanged by a shared premise. The per-piece gates could not see it; only  the sentence could. Suite total 4105, 85 groups.
   **`test_source_literal_hygiene` (8 checks) exists because one session wrote
   the same defect four times.** A C string sent through a tool path that
   decodes the escape twice turns `
@@ -760,7 +760,7 @@ code, the README, or `docs/`.
   checks in this block alone. **Measured red before each fix**: 8 of the
   Content-Length checks failed (99/107), then 3 of the Transfer-Encoding ones
   (109/112), with the controls (a well-framed request, and the same truncated
-  request sent whole) green throughout; green now 115/115 in the group.
+  request sent whole) green throughout; green now 118/118 in the group.
   **A request-side `Transfer-Encoding` is refused the same way** -- 400
   `unsupported Transfer-Encoding`. This server implements no request coding, so
   a body whose extent is described by one (with a `Content-Length` beside it, or

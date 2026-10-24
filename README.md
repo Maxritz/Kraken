@@ -695,9 +695,12 @@ long-prompt decode column above is a different run (`-` on the 35B rows because
 that prompt's first sampled token was EOS at 32 tokens, so there were no timed
 steps to report).
 
-`kraken-server` does not take `--prefill` yet: it parses `--chunk` and leaves the
-GEMM rung on `exact`, so the 402-421 tok/s arm above is reachable from the CLI
-only. Wire the switch before quoting these numbers for the HTTP path.
+`kraken-server` takes the same switch (`--prefill exact|fast`, default `exact`),
+so the arm is reachable from the HTTP path and the web UI. Measured through the
+API on the 30B-A3B file, same 4081-token prompt, chunk 1024, `--ctx 32768`:
+**22.98 s exact (177.6 tok/s) against 9.89 s fast (412.5 tok/s), 2.3x**. The
+server prints one line at startup when the fast arm is engaged, because a run
+whose output is no longer chunk-invariant should be identifiable from its log.
 
 ### The expert-cache budget ratchet (open, unfixed)
 
@@ -1528,7 +1531,17 @@ curl http://localhost:8090/v1/chat/completions \
 `repeat_last_n`, `seed`, `stop` (string or array) and `stream`. Chat requests
 are rendered through the ChatML template and stop on `<|im_end|>` /
 `<|endoftext|>`; both endpoints report `finish_reason` (`stop`/`length`) and a
-`usage` block. `GET /health` and `GET /v1/models` round out the surface.
+`usage` block. `GET /health` and `GET /v1/models` round out the surface, and
+`GET /` serves the built-in chat page: one HTML document with no external
+assets, streaming over `POST /v1/chat/completions`, with a stop button, per-turn
+sampling and delete/regenerate.
+
+`--prefill exact|fast` (default `exact`) selects the rows>1 GEMM rung for the
+HTTP path too. `fast` takes those GEMMs to the RDNA4 matrix cores and measured
+**412.5 against 177.6 tok/s** on a 4081-token request (chunk 1024, 30B-A3B); it
+is a different-arithmetic mode, so the generated text can differ from `exact`
+and the output is not chunk-invariant past 8 rows per chunk. The server prints
+one startup line when it is engaged.
 
 `stream: true` replies with `text/event-stream`: one `data:` chunk per
 generated token, a final chunk carrying `finish_reason`, then `data: [DONE]`.

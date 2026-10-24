@@ -28,6 +28,7 @@ struct Args {
     bool port_set = false;  // distinguishes the flag from the default
     int ctx = 4096;
     int chunk = 256;
+    bool prefill_fast = false; // --prefill fast: rows>1 GEMM on the matrix cores
     int device = 0;
     int threads = 0;
     int expert_cache_mb = 0;
@@ -60,6 +61,12 @@ void usage() {
         "  --port N              TCP port (default $KRK_PORT, else 8080)\n"
         "  --ctx N               KV capacity in tokens (default 4096)\n"
         "  --chunk N             prefill batch size (default 256)\n"
+        "  --prefill exact|fast  exact (default) keeps every prompt row's\n"
+        "                        arithmetic independent of --chunk; fast takes\n"
+        "                        the rows>1 GEMM to the RDNA4 matrix cores\n"
+        "                        (2.2-2.4x prompt throughput on a long MoE\n"
+        "                        prompt), and the generated text is then not\n"
+        "                        chunk-invariant past 8 rows per chunk\n"
         "  --threads N           CPU backend threads (reserved)\n"
         "  --device N            HIP device index\n"
         "  --expert-cache-mb N   MoE expert residency budget in MiB\n"
@@ -147,6 +154,16 @@ bool parse(int argc, char **argv, Args *a) {
             a->hybrid_max_rows = std::atoi(next("--hybrid-max-rows"));
         else if (f == "--hybrid-frac")
             a->hybrid_frac = std::atof(next("--hybrid-frac"));
+        else if (f == "--prefill") {
+            const std::string v = next("--prefill");
+            if (v == "fast") a->prefill_fast = true;
+            else if (v == "exact") a->prefill_fast = false;
+            else {
+                std::fprintf(stderr, "kraken-server: --prefill needs exact|fast, got '%s'\n",
+                             v.c_str());
+                return false;
+            }
+        }
         else if (f == "--draft") a->draft = next("--draft");
         else if (f == "--draft-tokens") a->draft_tokens = std::atoi(next("--draft-tokens"));
         else if (f == "--cpu") a->cpu = true;
@@ -176,6 +193,19 @@ int main(int argc, char **argv) {
     if (a.cpu) {
         be = make_cpu_backend();
     } else {
+        // Same mapping the CLI uses: the backend reads its GEMM rung switch once
+        // at construction, so the env has to be set before make_hip_backend().
+        if (a.prefill_fast) {
+#ifdef _WIN32
+            _putenv_s("KRK_GEMM_PATH", "wmma");
+#else
+            setenv("KRK_GEMM_PATH", "wmma", 1);
+#endif
+            std::fprintf(stderr,
+                         "kraken-server: --prefill fast takes the rows>1 GEMM to the "
+                         "matrix cores; the prefill hash is then not chunk-invariant "
+                         "past 8 rows per chunk\n");
+        }
         be = make_hip_backend(a.device, &err);
         if (!be) {
             KRK_WARN("%s", err.c_str());
