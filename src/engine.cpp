@@ -43,6 +43,12 @@ static bool cap_working_set(size_t) { return false; }
 #include <limits>
 #include <sys/stat.h> // struct stat, for the GGUF file-size probe
 
+namespace {
+// The configured cache format in the one spelling every call site uses.
+krk::KvQuant kv_quant_of(const krk::EngineConfig &c) {
+    return c.kv_quant == 1 ? krk::KvQuant::Int8 : krk::KvQuant::F16;
+}
+} // namespace
 namespace krk {
 
 namespace {
@@ -824,6 +830,21 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             return false;
         }
         hc_ = HcGeometry{hcc.n_embd, hcc.hc_n, hcc.hc_low_rank};
+        // The bottleneck is the UP-projection's K: [hc*n_embd <- low_rank]
+        // reads low_rank columns per row. A backend that addresses K in
+        // fixed chunks must be asked here, at init, because the alternative
+        // is HIP's gemm aborting two rows into the first prefill -- measured:
+        // the tiny qwen4exp fixture (low_rank 8, a multiple of nothing) died
+        // with 0xC0000409 after printing its error, where `--cpu` ran it.
+        if (!be_->gemm_k_ok(hc_.low_rank)) {
+            if (err)
+                *err = "arch '" + hcc.arch +
+                       "': hyper_connection.low_rank is " +
+                       std::to_string(hcc.hc_low_rank) +
+                       " and this backend's GEMM needs a multiple of 32 "
+                       "there (the bottleneck is that GEMM's contraction)";
+            return false;
+        }
         if (!hc_.valid()) {
             if (err)
                 *err = "arch '" + hcc.arch + "': hyper-connection geometry is "
@@ -991,28 +1012,80 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             be_ = nullptr;
             return false;
         };
-        if (mc.mla_layout != MlaLayout::Legacy) {
+        // TWO layouts run: the legacy lite one (attn_q + attn_kv_a_mqa +
+        // attn_kv_b) and the shared-latent one (attn_q_a/attn_q_b + attn_kv +
+        // attn_output_a/b). The split (V3 class) layout does not, and is refused
+        // by name: three shapes, three graphs, and a file that loaded and then
+        // decoded the wrong one is the failure this refusal exists for.
+        if (mc.mla_layout != MlaLayout::Legacy &&
+            mc.mla_layout != MlaLayout::Shared) {
             return refuse_mla(
                 std::string("MLA layout '") + mla_layout_name(mc.mla_layout) +
                 "': this engine runs the legacy lite layout "
-                "(attn_q + attn_kv_a_mqa + attn_kv_b) only, so a run would "
-                "decode the wrong graph. The file loaded and its tensors were "
-                "read; generating from it is refused.");
+                "(attn_q + attn_kv_a_mqa + attn_kv_b) and the shared-latent one "
+                "(attn_q_a/attn_q_b + attn_kv + attn_output_a/b) only, so a run "
+                "would decode the wrong graph. The file loaded and its tensors "
+                "were read; generating from it is refused.");
         }
-        if (!be_->mla_supported()) {
+        const bool mla_shared = mc.mla_layout == MlaLayout::Shared;
+        if (mla_shared && mc.dsv4_o_groups <= 0)
             return refuse_mla(
-                "the selected backend has no multi-head latent attention, and "
-                "an MLA layer that silently runs no attention decodes text that "
-                "is not this model");
+                "MLA layout 'shared-latent' needs attention.output_group_count, "
+                "and the file carries none -- the grouped output projection is "
+                "not optional on this layout");
+        if (mla_shared && !mc.mla_q_lora)
+            return refuse_mla(
+                "MLA layout 'shared-latent' needs a query trunk "
+                "(attention.q_lora_rank), and this file's is absent");
+        // A sink is a softmax DENOMINATOR term; dropping it silently would leave
+        // every head's distribution unnormalized by exactly that mass, which is
+        // fluent text that is not this model. The ops take it as HOST memory and
+        // the loader uploads it to the device, so until that has a host copy the
+        // honest answer is a refusal rather than a pass-through pointer.
+        // A non-zero compress ratio is a layer whose attention reads the CSA/HCA
+        // compressor's pooled keys, which this build does not implement. Running
+        // the dense core over such a layer would attend the raw prefix instead --
+        // a plausible answer from a graph the file does not describe, which is
+        // the one failure mode this engine refuses rather than approximates.
+        if (mla_shared)
+            for (size_t i = 0; i < mc.dsv4_ratio.size(); i++)
+                if (mc.dsv4_ratio[i] != 0)
+                    return refuse_mla(
+                        "MLA layout 'shared-latent': layer " +
+                        std::to_string(i) + " declares a compress ratio of " +
+                        std::to_string(mc.dsv4_ratio[i]) +
+                        " and the compressed-attention path (attn_compressor_*) "
+                        "is not implemented; a run would attend the raw prefix "
+                        "instead of the pooled one");
+        if (mla_shared)
+            for (const LayerWeights &lw : model_.layers()) {
+                if (!lw.sinks) continue;
+                return refuse_mla(
+                    "MLA layout 'shared-latent': this file carries attn_sinks "
+                    "and the shared-latent path does not feed them to the "
+                    "softmax yet; a run would mix heads unnormalized");
+            }
+        if (mla_shared ? !be_->mla_shared_supported() : !be_->mla_supported()) {
+            return refuse_mla(
+                std::string("the selected backend has no ") +
+                (mla_shared ? "shared-latent" : "legacy") +
+                " multi-head latent attention, and an MLA layer that silently "
+                "runs no attention decodes text that is not this model");
         }
         // The kernel stages every row's scores in dynamic shared memory, which
         // is why the context length is a CAPABILITY here and not a preference:
         // past 48 KiB a launch needs an explicit opt-in attribute this build
         // does not set, and a launch that silently truncated the request would
         // read scores out of whatever follows them.
-        const size_t lds = static_cast<size_t>(2 * mc.mla_kv_lora +
-                                               mc.mla_qk_rope + kv_cap_) *
-                           sizeof(f32);
+        // The LITE kernel stages its score row plus the latent and the rotated
+        // key; the shared-latent kernel stages scores only, so this bound is the
+        // lite layout's. Applying it to a V4 file would refuse a context the
+        // shared path fits in.
+        const size_t lds = mla_shared
+                               ? 0u
+                               : static_cast<size_t>(2 * mc.mla_kv_lora +
+                                                     mc.mla_qk_rope + kv_cap_) *
+                                     sizeof(f32);
         if (lds > 48u * 1024u) {
             if (err)
                 *err = "MLA needs " + std::to_string(lds / 1024u) +
@@ -1232,6 +1305,25 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         ws_mla_ = alloc(static_cast<size_t>(C) *
                         static_cast<size_t>(mc.mla_kv_lora + mc.mla_qk_rope) * as);
         if (!check_alloc(ws_mla_, "ws_mla")) return false;
+        if (mc.mla_layout == MlaLayout::Shared) {
+            // The trunk's intermediate row and the grouped output's f32
+            // accumulator. Sized by the file's own geometry, so a V4 file with
+            // 8 groups of 1024 reserves what it asks for and nothing more.
+            ws_mlaqn_ = alloc(static_cast<size_t>(C) *
+                              static_cast<size_t>(mc.mla_q_lora) * as);
+            if (!check_alloc(ws_mlaqn_, "ws_mlaqn")) return false;
+            // f32, not `as`: see the member's note -- the grouped output reads it
+            // and the host oracle it is compared against keeps f32 there.
+            ws_mlaa_ = alloc(static_cast<size_t>(C) *
+                             static_cast<size_t>(mc.n_head) *
+                             static_cast<size_t>(mc.mla_kv_lora) * sizeof(f32));
+            if (!check_alloc(ws_mlaa_, "ws_mlaa")) return false;
+            const i64 gout = static_cast<i64>(mc.dsv4_o_groups) *
+                             static_cast<i64>(mc.dsv4_o_lora);
+            ws_mlay_ = alloc(static_cast<size_t>(C) *
+                             static_cast<size_t>(gout) * sizeof(f32));
+            if (!check_alloc(ws_mlay_, "ws_mlay")) return false;
+        }
     }
     // The widest FFN a layer can ask for: dense, routed expert, or shared expert.
     const i64 ff_ws = model_.n_ff_ws();
@@ -1586,6 +1678,34 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // allocated on top of them. Subtracting "what the workspaces will take"
     // is not the same thing as measuring it, and guessing it is how an
     // over-commit happens. So: take the measurement after the fact.
+    // Quantized K/V is validated before the cache is sized: a backend that
+    // cannot read the layout must refuse, not run f16 kernels over int8 bytes
+    // (which produces fluent text rather than an error).
+    const KvQuant kvq = cfg_.kv_quant == 1 ? KvQuant::Int8 : KvQuant::F16;
+    if (kvq == KvQuant::Int8) {
+        if (!be_->kv_quant_supported(kvq)) {
+            // The CPU reference and HIP both answer true: the quantising append
+            // plus all four attention readers, with the cache bytes and the
+            // attention output invariant to the chunk size
+            // (`kraken-bench --bitexact`'s int8 block is the device proof). A
+            // backend that answers false is one with no int8 reader at all, so
+            // this refusal names what is missing rather than borrowing a
+            // reason from the layout's history.
+            *err = "kv-quant int8: this backend has no attention kernels for "
+                   "the int8 cache layout (the CPU reference and HIP implement "
+                   "it)";
+            return false;
+        }
+        if (model_.cfg().mla_layout != MlaLayout::None) {
+            *err = "kv-quant int8: the MLA cache layout has no int8 write/read path";
+            return false;
+        }
+        if (cfg_.mtp_spec || cfg_.mtp_probe || !cfg_.draft_head.empty()) {
+            *err = "kv-quant int8: the nextn/draft block keeps its own KV and has "
+                   "no int8 path; run it with kv-quant f16";
+            return false;
+        }
+    }
     size_t kv_load_bytes = 0; // both planes, for the load report below
     {
         // Per-layer KV bytes. Only the layers that carry q/k/v hold KV at all
@@ -1600,7 +1720,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         for (i32 l = 0; l < mc.n_layer; l++) {
             if (!model_.layer_has_kv(l)) continue;
             const size_t b = static_cast<size_t>(kv_cap_) *
-                             static_cast<size_t>(model_.kv_dim_at(l)) * as;
+                             be_->kv_row_bytes(model_.kv_dim_at(l), kvq);
             kv_len[static_cast<size_t>(l)] = b;
             kv_plane += b;
         }
@@ -1997,7 +2117,8 @@ void Engine::shutdown() {
     }
     for (void **p : {&ws_x_, &ws_rexp_, &ws_fexp_, &ws_xn_, &ws_x2_, &ws_q_,
                      &ws_qpack_, &ws_k_,
-                     &ws_v_, &ws_attn_, &ws_gate_, &ws_up_, &ws_had_, &ws_logits_,
+                     &ws_v_, &ws_attn_, &ws_mlaqn_, &ws_mlay_, &ws_mlaa_,
+                     &ws_gate_, &ws_up_, &ws_had_, &ws_logits_,
                      &ws_router_, &ws_routerp_, &ws_ids_, &ws_wts_, &ws_off_,
                      &ws_ffn_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
                      &ws_scale_, &ws_ebatch_, &ws_edown_, &ws_ebscale_,
@@ -2587,6 +2708,10 @@ void Engine::head_compute(i32 row) {
 bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     KRK_TRACE_COMP("forward-core");
     forward_error_.clear();
+    // The hash route needs the vocab id of each row (see fwd_toks_ in the
+    // header); a row index only equals it on a single-token decode.
+    fwd_toks_ = toks;
+    fwd_toks_n_ = n;
     {
         // See the KRK_VRAM_TRACE block at the end of this function: entry and
         // exit readings bracket the forward, which is what tells a bound inside
@@ -2637,6 +2762,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     // here is the workspace bound, and every use after the loop overwrites it.
     d.layer_stride = 0;
     d.pos_stride = kv_dim_;
+    d.kv_int8 = kv_quant_of(cfg_) == KvQuant::Int8;
     d.layer = 0;
     d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(mc.head_dim))) *
               mc.rope_attn_scale;
@@ -2715,6 +2841,12 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         d.n_head = lh;
         d.n_kv = lkvh;
         d.pos_stride = lkv;
+        // The int8 row is kv_dim bytes plus one f32 scale per 32 values, so a
+        // position's stride is the backend's answer for that width, not the
+        // element count. Both the append and the attention read this one number.
+        if (kv_quant_of(cfg_) == KvQuant::Int8)
+            d.pos_stride = static_cast<i64>(be_->kv_row_bytes(lkv, kv_quant_of(cfg_)));
+        d.kv_int8 = kv_quant_of(cfg_) == KvQuant::Int8;
         // A sliding-window layer sees only its last `swa_window` keys; the full
         // layers of the same stack see the whole prefix.
         d.window = (mc.swa_window > 0 && model_.is_swa(l)) ? mc.swa_window : 0;
@@ -3010,7 +3142,15 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // attention result is n_head*v_dim wide while its query is
         // n_head*(nope+rope). Reading `lq` here would run the projection over
         // 1728 stale columns per row on V2-Lite -- a wrong answer, not a crash.
-        const i64 aw = L.mla ? L.wo.n_in : lq;
+        // The shared-latent layout has already run its grouped output
+        // projection (wo_a/wo_b are inside mla_shared_forward), so its result is
+        // n_embd wide and `L.wo` is absent on the layer. Reading L.wo.n_in there
+        // would trace a zero-width row and, worse, run a second projection over
+        // it below.
+        const bool mla_grouped =
+            L.mla && mc.mla_layout == MlaLayout::Shared;
+        const i64 aw = mla_grouped ? (lh * mc.head_dim)
+                                   : (L.mla ? L.wo.n_in : lq);
 
         // The attention result is the input of a folded projection too, and
         // it is a different buffer with a different width (q_dim), so it gets
@@ -3026,7 +3166,8 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             had_xform(ws_had_, ws_attn_, n, aw, false, false);
             attn_in = ws_had_;
         }
-        be_->gemm(ws_x2_, attn_in, L.wo.data, L.wo.type, n_embd_, aw, n);
+        if (!mla_grouped)
+            be_->gemm(ws_x2_, attn_in, L.wo.data, L.wo.type, n_embd_, aw, n);
         // gpt-oss biases the attention output: one value per output channel,
         // applied to the projection's result before it joins the residual. A
         // broadcast over the rows of the GEMM output, which is exactly the
@@ -3799,7 +3940,7 @@ bool Engine::kv_rollback_zero(i64 pos) {
     }
     for (i64 l = 0; l < model_.cfg().n_layer; l++) {
         if (!model_.layer_has_kv(l)) continue;
-        const size_t row = static_cast<size_t>(model_.kv_dim_at(l)) * as;
+        const size_t row = be_->kv_row_bytes(model_.kv_dim_at(l), cfg_.kv_quant == 1 ? KvQuant::Int8 : KvQuant::F16);
         u8 *kb = static_cast<u8 *>(kbase[static_cast<size_t>(l)]) +
                  static_cast<size_t>(pos) * row;
         u8 *vb = static_cast<u8 *>(vbase[static_cast<size_t>(l)]) +
@@ -5398,6 +5539,13 @@ void Engine::mamba2_forward(const LayerWeights &L, i32 l, i32 n) {
 //                     fold the value half
 // and the caller's ordinary output projection consumes the result.
 bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
+    // The two layouts are different graphs, not two shapes of one: the shared
+    // one keeps a SINGLE latent row per token as both K and V and folds the
+    // head count into a grouped output projection, so there is no per-head
+    // table to absorb. Dispatch here so the layer loop and everything after it
+    // (residual add, FFN, dumps) stay one path.
+    if (model_.cfg().mla_layout == MlaLayout::Shared)
+        return mla_shared_forward(L, l, n, pos0);
     KRK_TRACE_COMP("mla-forward");
     const ModelConfig &mc = model_.cfg();
     const i64 nh = model_.n_head_at(l);
@@ -5482,6 +5630,103 @@ bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     // for these kernels instead of overwriting memory they still read.
     kvt_k_.end_layer(l);
     dump_row("mla.out", l, ws_attn_, nh * vdim, n);
+    return true;
+}
+
+// Multi-head latent attention, SHARED-latent layout (DeepSeek-V4).
+//
+// The lite path above stores `[normed latent | decoupled rope key]` and absorbs
+// a per-head table; this one stores a SINGLE row per token and uses it as BOTH
+// K (rotated on read, at the row's own position) and V (as written). The head
+// count comes back in the output instead: `attn_output_a` holds one o_lora-wide
+// column block per group over that group's concatenated heads, and
+// `attn_output_b` collapses the concatenation to n_embd. So this function ends
+// with the layer's FINAL attention output, and the caller must not run the
+// ordinary `attn_output` projection over it a second time (see the layer loop's
+// skip).
+//
+// Arithmetic is the host oracle in src/mla_shared.cpp, whose two orders the
+// suite pins; the kernels reproduce it on the file's own f16 staging, which is
+// why every table below is the `*16` tensor rather than the quantized one.
+bool Engine::mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
+    KRK_TRACE_COMP("mla-shared-forward");
+    const ModelConfig &mc = model_.cfg();
+    const i64 nh = model_.n_head_at(l);
+    const i64 d = mc.mla_kv_lora;  // key_length == value_length == the latent
+    const i64 ql = mc.mla_q_lora;
+    const i64 gout = static_cast<i64>(mc.dsv4_o_groups) *
+                     static_cast<i64>(mc.dsv4_o_lora);
+    // A missing staging tensor is not a slow path, it is a different model: the
+    // grouped output reads wo_a/wo_b unconditionally and the query trunk reads
+    // q_a/q_b, so refuse before a single kernel runs.
+    if (ql <= 0 || d <= 0 || gout <= 0 || !L.wq_a16.present() ||
+        !L.wq_b16.present() || !L.wkv16.present() || !L.wo_a16.present() ||
+        !L.wo_b16.present() || !L.wq_a_norm || !L.wkv_norm) {
+        KRK_ERROR("mla-shared: layer %d is missing its staged tables (q_lora %lld, "
+                  "latent %lld, gout %lld)",
+                  static_cast<int>(l), static_cast<long long>(ql),
+                  static_cast<long long>(d), static_cast<long long>(gout));
+        return false;
+    }
+    if (d != mc.mla_qk_nope + mc.mla_qk_rope) {
+        KRK_ERROR("mla-shared: layer %d latent %lld != nope+rope %d",
+                  static_cast<int>(l), static_cast<long long>(d),
+                  mc.mla_qk_nope + mc.mla_qk_rope);
+        return false;
+    }
+    void *kbase = kvt_k_.base(l);
+    if (!kbase) {
+        KRK_ERROR("mla-shared: no resident KV slot for layer %d",
+                  static_cast<int>(l));
+        return false;
+    }
+
+    MlaSharedDesc sd;
+    sd.n_head = nh;
+    sd.kv_lora = d;
+    sd.qk_rope = mc.mla_qk_rope;
+    sd.o_groups = mc.dsv4_o_groups;
+    sd.o_lora = mc.dsv4_o_lora;
+    sd.n_embd = n_embd_;
+    sd.n_tok = n;
+    sd.pos0 = pos0;
+    // One row: K and V are the same latent, so the stride IS the row.
+    sd.pos_stride = d;
+    // The score is a dot over the whole latent, so this is 1/sqrt(key_length)
+    // and nothing else. The mscale correction belongs to the lite family's
+    // YaRN files and is deliberately NOT applied here.
+    sd.scale = 1.0f / std::sqrt(static_cast<f32>(d));
+    sd.eps = mc.rms_eps;
+    sd.window = mc.dsv4_window > 0 ? mc.dsv4_window : 0;
+    sd.inv_freq = model_.inv_freq_at(l).data();
+    sd.sinks = nullptr;  // refused at init when the file carries any
+
+    // 1. the latent: x -> attn_kv -> rms_norm over the WHOLE row (rope is its
+    //    tail, so the norm covers the rotary dims -- the opposite of the lite
+    //    layout, whose key sits beside the normed latent).
+    be_->gemm(ws_mla_, ws_xn_, L.wkv16.data, L.wkv16.type, d, n_embd_, n);
+    dump_row("mla.kv", l, ws_mla_, d, n);
+
+    // 2. the query trunk: q_a -> its own norm -> q_b, one row at a time.
+    be_->gemm(ws_mlaqn_, ws_xn_, L.wq_a16.data, L.wq_a16.type, ql, n_embd_, n);
+    be_->rmsnorm(ws_mlaqn_, ws_mlaqn_, L.wq_a_norm, n, ql, mc.rms_eps,
+                 nullptr);
+    dump_row("mla.qa", l, ws_mlaqn_, ql, n);
+    be_->gemm(ws_q_, ws_mlaqn_, L.wq_b16.data, L.wq_b16.type, nh * d, ql, n);
+    dump_row("mla.q", l, ws_q_, nh * d, n);
+
+    // 3. cache the normed latent, then attend over the prefix. The write must
+    //    precede the read: row pos0 is visible to itself.
+    be_->mla_shared_latent(kbase, ws_mla_, L.wkv_norm, sd);
+    be_->mla_shared_attention(ws_mlaa_, ws_q_, kbase, sd);
+    kvt_k_.end_layer(l);
+    dump_row("mla.out", l, ws_mlaa_, nh * d, n);
+
+    // 4. the grouped low-rank output: this IS the layer's attention result, so
+    //    it lands in ws_x2_ where the ordinary path keeps `wo`'s output.
+    be_->mla_shared_output(ws_x2_, ws_mlaa_, ws_mlay_, L.wo_a16.data,
+                           L.wo_b16.data, sd);
+    dump_row("attn.proj", l, ws_x2_, n_embd_, n);
     return true;
 }
 
@@ -6943,6 +7188,13 @@ bool Engine::moe_decode_batch(const LayerWeights &L, i32 layer, i32 k, i32 ne,
             }
     if (batch_ids_.empty()) return false;
 
+    // The batch holds EVERY routed expert resident at once, so it needs the
+    // cache to be able to hold them all. That is the semantic condition, and it
+    // is checked before a single acquire: with fewer slots than distinct
+    // experts the resolve below evicts as it goes, and the expert resolved
+    // first is gone by the time the launches read it.
+    if (model_.experts().capacity_slots() < batch_ids_.size()) return false;
+
     // Every expert is resolved BEFORE the first launch, so a refusal here has
     // issued nothing and the caller can fall back safely.
     batch_res_.clear();
@@ -6959,6 +7211,41 @@ bool Engine::moe_decode_batch(const LayerWeights &L, i32 layer, i32 k, i32 ne,
             return false;
         }
         batch_res_.push_back(re);
+    }
+
+    // Every resolved expert must still be its OWN slot. `acquire()` below
+    // EVICTS when the cache cannot hold the routed set: resolve expert 1 with a
+    // one-slot budget, then expert 2, and `batch_res_[0]` still points at the
+    // buffer expert 2 just overwrote. The launches then multiply both experts by
+    // expert 2's weights -- finite, plausible, and wrong, with no refusal and no
+    // fraction of the arithmetic that looks off.
+    //
+    // Measured, not theorised: `test_moe_schema_and_laziness` failed
+    // "generation is identical with a 1-slot and a large expert cache"
+    // (5 4 5 4 5 4 against 5 5 4 5 4 5) and returned to 32/32 the moment the
+    // batch arm was disabled -- the per-expert loop acquires and computes one
+    // expert at a time, so it cannot alias. Distinct buffers between the first
+    // and last resolve is the invariant the batch needs; when it does not hold,
+    // fall back BEFORE anything is launched, which is why this check sits after
+    // the resolve loop and above the first launch.
+    // All nine field pairs, not gate-vs-gate and friends: a tiered cache that
+    // demotes one slot and promotes the next can hand expert 2 the cell expert
+    // 1 used for a DIFFERENT slice, which a same-field comparison misses. The
+    // check that failed with a host tier present was exactly that shape -- the
+    // routed set aliased through the pool and the decode collapsed to token 0
+    // after the first step.
+    {
+        const QuantTensor *slices[3 * 16];
+        size_t n = 0;
+        for (const ResidentExpert *re : batch_res_) {
+            if (n + 3 > sizeof(slices) / sizeof(slices[0])) return false;
+            slices[n++] = &re->gate;
+            slices[n++] = &re->up;
+            slices[n++] = &re->down;
+        }
+        for (size_t i = 0; i < n; i++)
+            for (size_t j = i + 1; j < n; j++)
+                if (slices[i]->data == slices[j]->data) return false;
     }
 
     for (size_t base = 0; base < batch_ids_.size(); base += kMoeBatch) {
@@ -7056,18 +7343,29 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     // row's exponent -- the same contract the residual stream's `ws_rexp_` has.
     be_->fill0(ws_fexp_, static_cast<size_t>(n) * sizeof(i32));
 
+    // Layers below the file's `hash_layer_count` take their expert ids from
+    // `ffn_gate_tid2eid.weight` instead of a top-k over the router. The count is
+    // the metadata's and `L.tid2eid_per_token` is the tensor's, so a file whose
+    // two disagree has a layer that routes by neither -- refused below rather
+    // than routed by the wrong one.
+    const bool hash_layer = layer < mc.dsv4_hash_layers;
+
     if (L.router.present() && k > 0 && ne > 0) {
-        // KRK_TIME_HOST: the router GEMM, the blocking readback, the host softmax
-        // and the plan build, as one number per layer. It is the span whose
-        // removal is the point of moving routing to the device, so it has to be
-        // measurable on its own rather than inferred from a step's wall time.
-        KRK_TIME_HOST_N(n == 1 ? "moe.route" : "moe.route.batch", hs_route);
-        // Routing runs on the host: the logits are tiny ([n, n_expert]) and the
-        // selection is what builds the plan.
-        {
+    // Routing runs on the host: the logits are tiny ([n, n_expert]) and the
+    // selection is what builds the plan.
+    //
+    // This GEMM runs on EVERY routed layer, including a DeepSeek-V4 hash layer.
+    // The distinction those layers make is about the SELECTION, not the scores:
+    // `ffn_gate_tid2eid.weight` names the experts by token id, and the router's
+    // distribution is still what weights them. Skipping the GEMM there would
+    // leave `moe_prob_` at whatever the previous layer wrote and mix the chosen
+    // experts with another layer's numbers -- finite, fluent, wrong.
+    KRK_TIME_HOST_N(n == 1 ? "moe.route" : "moe.route.batch", hs_route);
+    {
         KRK_TIME_HOST_N(n == 1 ? "moe.route.gemm" : "moe.route.gemm.batch", hs_rg);
         be_->gemm(ws_router_, ws_xn_, L.router.data, L.router.type, ne, n_embd_, n);
-        }
+    }
+
         // The blocking device-to-host copy below already orders itself behind
         // every kernel queued on the default stream, so the explicit
         // hipDeviceSynchronize this used to issue first was redundant. Forty of
@@ -7267,6 +7565,51 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
 
             i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
             f32 *wt = moe_wt_.data() + static_cast<size_t>(t) * k;
+            // ---- DeepSeek-V4 hash route ----------------------------------
+            // The table is authority for this layer's ids, and the router's
+            // probability of each named expert is what mixes it. `dsv4_hash_gather`
+            // reads `moe_prob_` in TABLE order -- a caller that sorted by id would
+            // pair expert A's weight with expert B's output, which is in range,
+            // stable and undetectable downstream. Both refuse rather than write a
+            // partial route, so a corrupt table cannot poison half a plan.
+            const bool hash_ids = hash_layer && L.tid2eid_per_token > 0;
+            if (hash_ids) {
+                if (L.tid2eid_per_token != k) {
+                    forward_error_ = "layer " + std::to_string(layer) +
+                                     ": hash table names " +
+                                     std::to_string(L.tid2eid_per_token) +
+                                     " expert(s) per token but the plan has room "
+                                     "for " + std::to_string(k);
+                    return false;
+                }
+                i32 hid[64];
+                f32 hwt[64];
+                // The table is indexed by the row's VOCAB id, not by its
+                // position in this pass. Missing `fwd_toks_` would mean a caller
+                // that reached a hash layer without a forward pass, and routing
+                // by position there is the defect this check exists for.
+                const i32 tok = (fwd_toks_ && t < fwd_toks_n_) ? fwd_toks_[t] : -1;
+                if (k > 64 || tok < 0 ||
+                    !krk::dsv4_hash_route(hid, layer, mc.dsv4_hash_layers,
+                                          L.tid2eid.data(), L.tid2eid_per_token,
+                                          L.tid2eid_n_tokens, tok, ne) ||
+                    !krk::dsv4_hash_gather(hwt, hid, k, moe_prob_.data(), ne)) {
+                    forward_error_ = "layer " + std::to_string(layer) +
+                                     ": hash route refused at token " +
+                                     std::to_string(t);
+                    return false;
+                }
+                for (i32 s = 0; s < k; s++) {
+                    sel[s] = hid[s];
+                    wt[s] = hwt[s];
+                    if ((expert_scan_ || expert_track_) && hid[s] >= 0)
+                        expert_hits_[static_cast<size_t>(layer) *
+                                         static_cast<size_t>(ne) +
+                                     static_cast<size_t>(hid[s])] += 1;
+                }
+            }
+            // A hash layer's ids came from the table, so the top-k below must not
+            // run: it would overwrite the route with the distribution's own.
             // Residency of an expert, as the tier sees it right now: 2 in VRAM,
             // 1 in WARM, 0 nowhere. The expert index is what FILLED those tiers,
             // so this reads the index's answer live -- and correctly, which a
@@ -7278,7 +7621,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 if (model_.experts().in_host(layer, e)) return 1;
                 return 0;
             };
-            for (i32 s = 0; s < k; s++) {
+            for (i32 s = 0; !hash_ids && s < k; s++) {
                 // The top available score first, so "near-equal" has something
                 // to be near. With the preference off this is the only pass and
                 // the arithmetic below reduces to the loop it replaced.

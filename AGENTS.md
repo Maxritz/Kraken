@@ -160,16 +160,34 @@ code, the README, or `docs/`.
   sweep, and `KRK_SELFCHECK_SEED=<n>` draws exactly those aims again -- per
   group, so `--group N` draws what the sweep drew for N; a seed that cannot be
   read is refused (rc=2) rather than silently replaced, because it was set to
-  make a run replayable. `--group <index|name>` runs one group's six arms (~6 s)
+  make a run replayable. `--group <index|name>` runs one group's six arms (~22 s
+  -- the ~6 s a stale note here used to claim is impossible, because an arm is a
+  FULL suite run; see the cost paragraph below)
   and `--selfcheck --selftest` is 17 constructed answers, one per way an arm can
   be wrong (~10 ms) -- that one runs in every isolation check, because a checker
   that cannot fail proves nothing. `KRK_SELFCHECK_BREAK=counts` makes the
   expectation wrong by one check, so a real mismatch can be constructed: it
   only tightens (a green run goes red, never the reverse), and the isolation
   check requires rc=1 from it, which is how the exit status is proved and not
-  just the checker. The whole sweep is 318 suite runs (measured 240 s at eight
-  workers, so a hair over the ~4 min it prints as `wall_ms`), so it is the
-  opt-in arm. `--selfcheck --report <path>` records the arms' verdicts in
+  just the checker. The whole sweep is 83 groups x 6 arms = **498 suite runs**,
+  because an arm is a FULL suite run by construction: its claims are "every
+  group the arm did not aim at still passes, with its own count" and the totals
+  arithmetic, and neither survives scoping an arm to one group. Measured
+  **22.3 min for the whole gate** (suite + proofs + sweep) at eight workers.
+  **The arms of a group now run AT THE SAME TIME, each child on its OWN
+  environment** (`ChildEnv`, built as a Windows block / an envp by
+  `spawn_child_to`): an injection IS an environment variable, two arms differ
+  only in it, and that -- not the arms' design -- is why they could only run one
+  after another. The split is `min(6, workers)` arms in flight x
+  `min(8, cores / arms)` workers each, so the product is one suite's width and
+  not six times it; swept at 2/3/4/6/8 workers on one group the default wins
+  (22.6 s against 31.5 / 26.8 / 26.2 / 22.2). The same 498 runs used to cost
+  **~55 min** serially -- one arm at eight workers is ~7 s, and 498 of them in a
+  row is 58 min -- so this is 2.4x, and the remaining bound is the box: a
+  full wave of six runs spends ~2.3 s per full suite against ~0.9 s for a run
+  alone. A note that quoted "240 s at eight workers" was never reachable at
+  7 s a run and is gone.
+  `--selfcheck --report <path>` records the arms' verdicts in
   the runner's report format (kind `selfcheck`: one line per group, its clean
   counts, and an `arms` map) so the gate can compare the reporting proof and not
   only run it -- `tests/kraken-tests-selfcheck-baseline.json` is that record,
@@ -269,6 +287,36 @@ code, the README, or `docs/`.
   `gemv_m` re-reads the whole matrix per 8-row group, i.e. 32 passes over the
   weights for a 256-row prefill. A windowed (SWA) layer also stays on the tiled
   attention kernel by construction, for the `j_lo` reason above.
+- **The int8 K/V cache is chunk-invariant on the device now, and the defect was a
+  reduction order.** `--kv-quant int8` had every reader implemented and still
+  produced three different hashes for one prompt (chunk 2 == chunk 4, chunk 1 and
+  8 elsewhere), which is why `kv_quant_supported(Int8)` refused it. The cache
+  bytes were never the problem: `kv_append_i8_kernel` quantises per (token,
+  plane) row, and 200 rows one at a time are byte-identical to one 200-row append
+  (the CPU group pins exactly that). The difference was the DECODE lane's dot:
+  `attn_lane_dot_q8` summed `q[e] * dequant(k[e])` as a per-element f32 FMA chain
+  while the tiled and bit-exact paths consumed dequantised PAIRS through one
+  `v_dot2_f32_f16` -- same terms, different rounding, up to one f16 ulp per
+  channel. Decode now builds the pair in a register and calls the same
+  instruction, and one 21-token prompt (`smolcode-coder-cpp-1.5b-q4_k_m`) gives a
+  single hash at `--chunk 1, 2, 4, 8` and `16`: trace `6d4758c0c4754be0` /
+  logits `dc6d7126d56225fb`, first token 576, against f16's
+  `2cb4e7fc46508835` / `67f95a7185846df2` with the same first token. 24 greedy
+  tokens are byte-identical text between the two formats. MLA and the
+  nextn/draft block stay refused for int8 by name (they own their caches).
+  **The arm is per kernel, in `kraken-bench --bitexact`, and it is enforced.** Two
+  claims, measured separately because they fail for different reasons: a
+  position's cache bytes must not depend on the append's arity (one 8-row append
+  against eight one-row appends, byte-exact) and attention must not depend on the
+  query-row count (decode rows against one prefill call). 27 of 27 identical at
+  hd 64/128/256, rows 2/4/8, 64 and 200 keys; `KRK_ATTN_BEXACT=0` makes 17 of 27
+  differ by 1 ulp, which is the red construction, and `--bitexact` exits non-zero
+  when any int8 arm differs. **That exit status is the part that had to be
+  built**: `failures += arm_rows_bitexact(be)` returned 0 by design, and the only
+  conversion to a failure was `gate && failures`, so a run could print
+  `17 int8 K/V arm(s) are NOT chunk-invariant` and still exit 0.
+  Gate: suite 4122/4122 in 86 groups, baseline `no regression`, `build_check.sh`
+  0 failed (fingerprint re-recorded for the relink), `kraken-bench --gate` rc=0.
 - **Concurrency is only safe because every group is self-contained, and the
   runner now enforces both halves of that.** Each child gets its own working
   directory (`<TEMP or TMPDIR>/krk-tests-<pid>/krk-tests-group-N.dir`) -- every fixture path in
@@ -325,9 +373,10 @@ code, the README, or `docs/`.
   passing would compare clean against a baseline of the same defect. Both take
   seconds, and the block can be shown able to fail -- `KRK_SELFCHECK_GROUP=99`
   names a group that does not exist, and the gate then exits 1 with `the reporting
-  proof failed for group 99 (rc=2)`. The 318-run sweep and its arm-by-arm
+  proof failed for group 99 (rc=2)`. The 498-run sweep and its arm-by-arm
   comparison against `tests/kraken-tests-selfcheck-baseline.json` stay behind
-  `KRK_BASELINE_SELFCHECK=1` for cost.
+  `KRK_BASELINE_SELFCHECK=1` for cost (22 min with the arms in flight, 55 serial;
+  see the reporting-proof bullet above).
 - **A missing `return` cannot land any more: `-Werror=return-type` is fatal for every
   translation unit.** That defect class is compiler-visible -- `-Wall` already
   contained `-Wreturn-type`, so the diagnostic was there to read every time and
@@ -526,7 +575,35 @@ code, the README, or `docs/`.
   `KRK_ARCH_ALLOW_EXPERIMENTAL` unset (the claim the row makes, checked). The
   row hash, not the tokens, is the load-bearing part: this fixture's synthetic
   head argmaxes EOS after one token, and a text-only gate is blind in exactly
-  the way the attention rewrite already demonstrated. Red construction: `if
+  the way the attention rewrite already demonstrated.
+  **The HIP half of this group cannot run the fixture, and the reason is a
+  real refusal that had to be built.** The lane stack's bottleneck is
+  `hyper_connection.low_rank` (8 on the fixture, 320 on REAP-288), and it is
+  the up-projection's K: `[hc*n_embd <- low_rank]`. The HIP GEMM walks K in
+  32-value chunks and `std::abort()`s on anything else
+  (`src/hip/backend_hip.hip`), so the CLI printed
+  `gemm: n_in=8 is not a multiple of 32` and then died with **0xC0000409**
+  two rows into the prefill -- reproducible from `cmd /c` with redirection
+  and NOT from bash, which is why it first read as an exit-path crash.
+  `Backend::gemm_k_ok(k)` (default true; HIP answers `k % 32 == 0`) is asked
+  at init, and the run now REFUSES with the geometry named before any pass.
+  The device arm pins both halves: the CLI's `--cpu` run hashes the same row
+  the in-process graph does (`1de9761d6eabaceb`), and the device must refuse
+  with `hyper_connection.low_rank` + `multiple of 32` -- a silent skip would
+  accept a crash, and a fixture padded to K=32 would prove the kernels on a
+  geometry the graph never has.
+  **Its row was re-recorded once, and the bisect that says why is the part
+  worth keeping.** The pin sat at `0x99dbc3445ac66d08` and the fixture
+  produced `0x1de9761d6eabaceb`; the fixture writer is byte-identical to
+  HEAD's apart from the new `perturb_ple` flag, and reverting `src/engine.cpp`
+  and `src/model.cpp` to HEAD (then `src/backend_cpu.cpp` on its own), each
+  rebuilt and re-run, left the row at `1de9761d` -- so the GRAPH was never
+  the outlier and the recorded value was. What still makes the pin
+  load-bearing was re-measured at the new value: a different prompt gives
+  `dd27376b6c3e1639`, the shifted PLE table `d7ff2c97e4406ef8`, and chunk 1
+  reproduces `1de9761d6eabaceb` exactly. A revision that moves it now has to
+  move something real.
+  Red construction: `if
   (false)` around `ple_block` fails 5 of the 18 (row, argmax, PLE sensitivity,
   both text pins). On hard weights the file is
   `H:/OLLAMA-Models/GGUF/qwen3.8-flash-next-reap-288-Q4_K_M.gguf` -- 78.04 GiB
@@ -549,6 +626,195 @@ code, the README, or `docs/`.
   could see: at 8 tokens both pairings emit the reference's text, so an 8-token
   comparison would have called this row clean. qwen35/qwen35moe sit in the same
   IMROPE case arm and still default to `rope_neox=false` here.
+- **deepseek4 RUNS now (dense core), and the two defects that stopped it were both
+  wiring, not kernels.** The shared-latent graph landed in `Engine::mla_shared_forward`
+  (`src/engine.cpp`): latent `attn_kv` -> `mla_shared_latent` (norm over the WHOLE
+  row, rope in its tail), the query trunk `attn_q_a` -> its norm -> `attn_q_b`, then
+  `mla_shared_attention` and `mla_shared_output` writing the layer's FINAL
+  `[n, n_embd]` result into `ws_x2_` -- so the layer loop SKIPS the ordinary
+  `attn_output` gemm for that layout (`mla_grouped`), because wo_a/wo_b are already
+  inside. `MlaLayout::Shared` is no longer refused at init; Split still is, by name.
+  `kv_dim_at` had to change with it: V4's cache row is the latent ALONE (rope is its
+  tail), so the lite rule's `+ qk_rope` sized every plane 64 columns wide and made
+  `pos_stride` disagree with the slot the tier handed out.
+  (1) **The hash route indexes by VOCAB id, not by the row's position in the pass.**
+  `moe_ffn` used `t` -- the row index -- so a 2-row prefill routed row 1 to token
+  1's experts. Symptom: chunk 1 and chunk 8 gave different rows on the fixture and
+  nothing else was wrong. `forward_core` now records `fwd_toks_`/`fwd_toks_n_` and a
+  missing one is REFUSED rather than routed by position.
+  (2) **A poisoned hash table entry has to be poisoned in EVERY slot**, or the arm
+  tests whichever token it happened to hit: `hash_id_oob` first wrote one cell and
+  the out-of-range arm passed while proving nothing.
+  `test_dsv4_whole_graph` is **36 checks**: the fixture loads with NO hatch (the
+  `Partial` row's claim), the last prompt row's whole logits FNV hash
+  (`0x12602ed8b3a49add`) and argmax (0), a second prompt moves it, chunk 1
+  reproduces chunk 8, a SHIFTED table moves it, an out-of-range id REFUSES with
+  `hash route` in the message, and the greedy sequence (`0 4 6 6 6 9`) pins at
+  both chunk sizes. **The pin MOVED when the multi-row prefill landed**
+  (`0x25412f04b8170542` / argmax 4 / `4 4 4 4 4 4` before, the values above
+  after), and that is a re-record, not an oracle: this fixture's truth is its
+  own consistency. What corroborates it is cross-backend agreement on the
+  DECISION, not the bits -- see the device arm below.
+  (3) **A 13-row prompt (twelve words) prefills as ONE call at chunk 16 and as
+  thirteen at chunk 1, and the CPU row is IDENTICAL** (`abd920b0bba85eb8`
+  both) -- so the shared-latent multi-row path is exercised by a prompt wide
+  enough to leave the GEMM's thin-row ladder, which a 2-row prompt does not.
+  (4) **The device arm cannot use the CPU row as its reference, and the
+  control that shows why is a stock model.** `SmolLM2-135M` at a 16-token
+  prompt gives trace `0d47196029f2cb51` / logits `4ccba855c2b297e0` on the card
+  against `a1e5be993b18b62e` / `668768a536fd8d50` on `--cpu`, with the same
+  first token (30) both ways: a HIP row is not bit-equal to the reference on
+  ANY model, so that comparison would have reported a shared-latent bug where
+  the engine only has an engine-wide property. What the arm DOES pin, measured
+  on the fixture: the device prefill folds to the same trace and the same
+  logits row at chunk 1 and 16 (`64aed8850d5541ab` / `dcc441a09e8d64db`), it is
+  deterministic run to run, and it samples the reference's token (7). Both
+  hashes print on every run, so a future divergence is visible even when the
+  checks pass. Five CLI runs, ~4 s.
+  (5) **The CLI's CPU prefill TRACE is NOT reproducible run to run on this
+  fixture**, while its logits row stays `d7ceb589f6f3aa5c` and the device is
+  stable: three values were observed for one unchanged command (`d43d3bc1...`,
+  `35ad165d...`, `15aa217b...`). Two consequences: a CPU trace hash must never
+  be pinned, and the rule that the trace is the signal which never goes blind
+  assumes a backend whose reduction order is fixed -- on `--cpu` it is not, for
+  a multi-row prefill.
+  **Red construction: rotating the leading slice instead of the tail
+  in the CPU kernel's `mla_shared_attention` (`base = 0`) fails 3 of 21 -- row,
+  argmax and sequence -- while `test_mla_shared` STAYS 109/109**, because that
+  group compares the oracle and the kernel against each other and both are
+  unchanged by a shared premise. The per-piece gates could not see it; only  the sentence could. Suite total 4105, 85 groups.
+  **`test_source_literal_hygiene` (8 checks) exists because one session wrote
+  the same defect four times.** A C string sent through a tool path that
+  decodes the escape twice turns `
+` into a REAL newline inside
+  `fprintf(...)`/`KRK_ERROR(...)`, and every occurrence is a compile error
+  that costs a build to find. The group is that rule made checkable: a
+  scanner that knows `//` and block comments, character literals, raw
+  strings (`R"tag(` ... `)tag"`) and the LEGAL backslash continuation, and
+  five in-memory arms -- one broken literal on purpose, one continuation,
+  one raw string, one comment, one escaped form -- before it is trusted on
+  It now carries the NEIGHBOURING class too, which compiles and is
+  therefore invisible: a DOUBLED escape in a print/error argument (source
+  `\n`), where the gate prints the two characters instead of a line break.
+  Only a format string is flagged -- `src/json.cpp`'s escape table and the
+  JSON payload literals carry a backslash on purpose, and `// hygiene-ok`
+  waives the rare print that really prints one. Two measured lessons sit in
+  the arms: the backward search must STOP AT THE END OF THE STATEMENT (it
+  first attributed a table literal on the next line to the fprintf above
+  it, 2 offenders for 1), and the arms must build their inputs from
+  character code 92, because spelling a doubled escape in the test is the
+  defect itself.
+  **The entry points are pinned, not merely swept.** `src/main_cli.cpp` and
+  `src/main_server.cpp` are covered only because they happen to live under
+  `src/`, so the group records both as READ and refuses if either stops
+  being visited: narrowing the sweep to `{include,tests,tools}` trips the
+  file-count floor (54 < 60) AND the entry pin (`cli NO, server NO`), 13/15.
+  Proved on the real file, not synthetic: a doubled escape injected into
+  main_cli.cpp's `kraken: unknown option '%s'` report is named at
+  `src/main_cli.cpp:436`, and reverted leaves 15/15. The `kraken: ...`
+  shape has its own arm, because the entry points are not shaped like the
+  engine's `KRK_ERROR` macros.
+  **Browser-facing text is judged by the module's job, not the call shape.**
+  `src/http.cpp` builds a status line with `format(...)` (a sprintf by
+  contract) and a static header array with no call context at all:
+  `static const char head[] = "HTTP/1.1 200 OK
+"`. In those two files
+  (`src/http.cpp`, `src/server.cpp`) EVERY doubled CR/LF counts, while
+  elsewhere only a print/error argument is flagged. Measured: the probe
+  `"HTTP/1.1 200 OK\r\n"` in that static array is named at
+  `src/http.cpp:146`, 17/18; reverted, 18/18. Current tree: 0 in both
+  classes.
+  Then it sweeps every `.cpp/.hpp/.hip/.h` under
+  `KRK_SOURCE_DIR/{src,include,tests,tools}` (a configure-time define: the
+  group cannot use the CWD, which is a per-group scratch dir by design). Two
+  arms keep it from being vacuous: the scan must find >= 60 files, and the
+  RED construction is a one-line file dropped into `src/` -- measured
+  `first offender: src	mp_hygiene_probe.cpp:2`, 105 files, group 7/8 --
+  removed again, 8/8. Current tree: **104 files, 0 offenders**.
+  **Its runtime twin is `test_http_server`'s strict client, and the substring
+  checks that came before it were measured blind.** The group's original 46
+  checks read the wire with `find()`, which cannot tell well-framed bytes from
+  bytes that merely CONTAIN the expected text. A strict HTTP/1.1 client now
+  parses every response the listener emits: the status line must be exactly
+  `HTTP/1.1 <3 digits> <reason>`, the head CRLF-only with no backslash anywhere
+  in it, `Content-Length` must equal the body byte count, and a chunked body is
+  de-chunked per RFC 7230 (hex size line, exact payload, CRLF, `0\r\n\r\n`,
+  nothing after it) before the SSE framing is checked event by event
+  (`data: <json>` + blank line, `[DONE]` last, one `finish_reason`). Group
+  90/90.
+  **The last 13 checks drive the binary itself**, because the listener and
+  `kraken-server` share `HttpServer` + `OpenAiService` but only the binary
+  proves what `main_server.cpp` owns: argument parsing, `--port 0`, and the
+  banner a client learns the port from. It runs `--cpu` (the suite links no
+  device backend; the bytes are backend-independent), its stdio goes to
+  capture files, the port is polled out of `listening on http://HOST:PORT`, and
+  the three responses are parsed with the same strict client -- including that
+  the binary's completion text and its decoded deltas are the in-process
+  reference's. It is TERMINATED, not asked to stop: `main_server.cpp` has no
+  stop path (its own comment says `server.run()` returns only after `stop()`,
+  which nothing calls), so the helper kills it and waits, and the group removes
+  its captures on the way out (the runner's shape cleanup covers `.gguf` and
+  `-dir`, not `.txt`). Measured red construction: printing `a.port` instead of
+  `server.port()` in the banner -- the exact bug a client sees as a refused
+  connection -- fails only `the binary's banner reports the ephemeral port`,
+  79/80, with the banner dumped; reverted, 90/90, and no `kraken-server`
+  process survives the arm.
+  The blindness is the measurement, not an argument: a `Content-Length`
+  inflated by one byte leaves all 46 substring checks GREEN and fails exactly
+  the four buffered strict checks (73/77); changing the SSE event terminator to
+  `\r\n\r\n` leaves the stream's 200 and every `data: ` search intact and
+  fails four stream checks with `an event payload holds a line break` (73/77).
+  A doubled escape in the `Connection: close` header plus the blank line breaks
+  the response outright (50/72 -- the body vanishes, so the old checks fail
+  too), which is why the two surgical mutations are the ones recorded. The
+  parser carries its own arms (a well-framed response ACCEPTED, one refusal per
+  defect class, the backslash-built-from-code-92 case), so a parser that
+  refused everything could not pass.
+- **The request parser's refusals are byte-checked, and four of them were
+  missing.** RFC 9112 §6.3 makes the body length load-bearing. `serve_client`
+  used to collapse two `Content-Length` headers to the last value and read
+  `5, 44` as 5 through `atoll` -- the two shapes a smuggled second body rides on
+  -- and a body that ended early was dropped with NO response at all (nothing
+  dispatched, but the client learned nothing). It now answers the OpenAI error
+  shape: 400 `duplicate Content-Length` (even for an identical repeat), 400
+  `invalid Content-Length` for anything that is not pure decimal, 400
+  `incomplete request body`, and **431** `Request Header Fields Too Large` for a
+  header block over the 64 KiB cap -- 413 is about CONTENT, so a client retrying
+  with a smaller body learned nothing from it. 413 stays for a body over 8 MiB.
+  Every one of those paths goes through one `refuse()` that half-closes and
+  drains before closing: on Windows a close with unread request bytes sends an
+  RST, and an RST can throw away the refusal the client is about to read.
+  `test_http_server` drives it with a raw socket (`http_exchange_raw`) that takes
+  arbitrary bytes, can half-close where a truncated body arrives, and bounds
+  every read at 10 s so a silent parser fails instead of hanging the suite: 25
+  checks in this block alone. **Measured red before each fix**: 8 of the
+  Content-Length checks failed (99/107), then 3 of the Transfer-Encoding ones
+  (109/112), with the controls (a well-framed request, and the same truncated
+  request sent whole) green throughout; green now 118/118 in the group.
+  **A request-side `Transfer-Encoding` is refused the same way** -- 400
+  `unsupported Transfer-Encoding`. This server implements no request coding, so
+  a body whose extent is described by one (with a `Content-Length` beside it, or
+  with none at all) is a message two parties frame differently. RFC 9112 §6.1
+  suggests 501 for a coding a server does not understand; 400 is the refusal the
+  duplicate header gets, and both mean "I will not guess where your body ends".
+  **`Connection: close` is on every response now, not only on errors.** HTTP/1.1
+  defaults to a PERSISTENT connection and `serve_client` handles exactly one
+  request, so a buffered 200 that closed without saying so invited a compliant
+  client to reuse the socket. Measured red: exactly the two buffered-200 checks
+  failed (113/115) while the SSE head's check passed -- that head always carried
+  the header, which is why the gap was only on the buffered path.
+  **The listen port is configuration, not a literal**: `--port` wins, then
+  `KRK_PORT`, then 8080, and an explicit `--port 0` still means ephemeral --
+  measured against the binary: `KRK_PORT=8090` -> 8090, `KRK_PORT=8090 --port
+  8091` -> 8091, `--port 0` -> 58872. The banner prints `server.port()`, so it
+  reports what was actually bound, which is what the binary arm parses.
+  The arch row is `Partial`, not `Yes`, and the difference is checkable: the
+  CSA/HCA compressors, the sparse indexer and `attn_sinks` are absent, so init
+  REFUSES any file whose `attention.compress_ratios` is non-zero (a run would
+  attend the raw prefix instead of the pooled one) and refuses a file carrying
+  sinks for the same class of reason. `test_mla_loader` was updated with the
+  truth: the shared fixture LOADS without the hatch, and the Split layout is the
+  one the engine still refuses.
 - **A reverted test file is invisible to every gate except the baseline's SHAPE
   comparison, and that is how four groups came back.** `test_qsa_select`,
   `test_qwen4exp_qsa`, `test_qwen4exp_gdn_gate`, `test_qwen4exp_hc_mix` and four
@@ -3353,3 +3619,4 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   from `expert_bytes` over-provisions every tier by ~20%. Derive the average as
   `sum(per_expert(gate)+per_expert(up)+per_expert(down)) / n_layer` from the
   tensor table (`tools/gguf_tensors.py`), not from the layer-0 field.
+- **A batched decode must resolve only the experts it can KEEP resident, and nothing checked that.** `moe_decode_batch` resolves every routed expert before the first launch, then launches; `ExpertCache::acquire` evicts when the budget cannot hold the routed set, so with a one-slot cache the second resolve hands back the cell the first expert was in. Both experts then multiply ONE expert's weights: finite, plausible, no refusal, and it reaches the sampler. Measured on the synthetic 4-expert fixture: one slot decoded `5 4 5 4 5 4` where a large cache decoded `5 5 4 5 4 5`, and `KRK_MOE_BATCH=0` returned `test_moe_schema_and_laziness` to 32/32 -- that arm is what named the path. Two guards now sit in `moe_decode_batch`: `capacity_slots() >= distinct routed experts` before any acquire (the semantic condition), and all pairwise slice-pointer distinctness after the resolve, 3 slices against 3 slices per expert pair, because a tiered cache can hand expert 2 the cell expert 1 used for a DIFFERENT slice and a same-field comparison misses it -- that shape decoded `5 0 0 0 0 0` at `--expert-cache-slots 1 --expert-warm-mb 64`. Result: 32/32 in a child process and under `KRK_TEST_INPROC=1`, four consecutive runs (suite 3870/3870). `Engine::moe_batch_layers()` / `moe_batch_skips()` expose the counters, and `test_moe_batch_fallback` pins BOTH arms: with 2 experts routed and 1 slot, zero layers batched and the per-expert loop ran; with room for the routed set the batch does compute layers. The roomy arm exists so a guard that refuses unconditionally cannot pass. The general rule: a batch whose members are acquired up front needs a residency guarantee; "the cache will sort it out" is a silent wrong answer, not a fallback.

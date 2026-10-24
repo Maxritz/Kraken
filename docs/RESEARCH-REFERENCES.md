@@ -207,9 +207,9 @@ per-layer geometry rather than an addition beside it.
 ## Execution core, kernels and hardware capability
 
 ### RESOLVE (2610.05683) — race/edge-case kernel gates
-**Measured here:** this repo's version of it is `--selfcheck` (318 suite runs: six
-arms per group including crash-at-last-check and a fuzz arm, judged against each
-group's own counts), the isolation check, constructed-failure tests, and md5
+**Measured here:** this repo's version of it is `--selfcheck` (498 suite runs: six
+arms per group including crash-at-last-check and a fuzz arm, each arm a FULL run
+judged against every group's own counts, the arms of one group in flight at once), the isolation check, constructed-failure tests, and md5
 determinism A/Bs. It has already paid: `attention_decode_split_kernel`'s
 warp-leader race made one head's output depend on scheduling — **three distinct
 outputs in six runs of one command**, now stable 10/10.

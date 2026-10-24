@@ -212,16 +212,24 @@ constexpr ArchSpec kTable[] = {
     // false: this is the SHARED latent, whose attention is a different graph
     // from the lite one that runs (the head count lives in a grouped output
     // projection, not in a per-head K/V unfolded at runtime).
-    {"deepseek4", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "deepseek4",
-     "multi-head latent attention (shared latent + grouped output), sinkhorn "
-     "hyper-connections, tid2eid hash routing and compressed attention are "
-     "not implemented",
+    // What runs: the shared-latent attention (one normed latent row per token,
+    // rope on its tail, grouped low-rank output) and the tid2eid hash route that
+    // the first `hash_layer_count` layers select by token id. What does not: the
+    // CSA/HCA compressors (attn_compressor_*), the sparse indexer and
+    // attn_sinks -- so a file whose attention.compress_ratios is non-zero is
+    // refused at Engine::init, and one carrying any of those tensor classes is
+    // refused by the loader's gap map. A dense-core file (all ratios 0) IS this
+    // graph, and test_dsv4_whole_graph pins it end to end.
+    {"deepseek4", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target, "deepseek4",
+     "shared-latent MLA, the grouped output and the tid2eid hash route run; "
+     "compressed attention (attn_compressor_*), the sparse indexer and "
+     "attn_sinks do not, so a file with a non-zero compress_ratios is refused",
      /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
      /*swiglu_oai=*/false, /*hyper_connection=*/false, /*ple=*/false,
      /*qsa=*/false, /*attn_gate_elem=*/false, /*no_out_norm=*/false,
-     /*mla=*/true, /*dsv4=*/true, /*attention_implemented=*/false},
+     /*mla=*/true, /*dsv4=*/true, /*attention_implemented=*/true},
     // The MTP/prediction-head shard of DeepSeek-V4: `mtp.*` tensors, nothing else.
     {"deepseek4-dspark", ArchShape::Moe, ArchSupport::No, ArchRole::Draft,
      "deepseek4",

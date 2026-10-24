@@ -87,6 +87,8 @@ set(KRK_CORE_SOURCES
     src/spec_sampling.cpp
     src/hc.cpp
     src/mla.cpp
+    src/mla_shared.cpp
+    src/dsv4_route.cpp
     src/ple.cpp
     src/qsa.cpp
     src/model.cpp
@@ -100,6 +102,7 @@ set(KRK_CORE_SOURCES
     src/json.cpp
     src/http.cpp
     src/server.cpp
+    src/webui.cpp
 )
 
 add_library(krk_core STATIC ${KRK_CORE_SOURCES})
@@ -632,6 +635,12 @@ if(KRK_BUILD_TESTS)
     if(TARGET krk_hip)
         target_compile_definitions(kraken-tests PRIVATE KRK_TEST_HIP_BUILD=1)
     endif()
+    # The source-literal group sweeps this tree, and it cannot trust the working
+    # directory: kraken-tests runs each group in its own scratch dir, which is
+    # the point of that isolation. Baked in at configure time instead, so the
+    # sweep reads the sources this binary was built from and nothing else.
+    target_compile_definitions(kraken-tests PRIVATE
+        KRK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     add_test(NAME kraken-tests COMMAND kraken-tests)
 endif()
 

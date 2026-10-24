@@ -219,6 +219,10 @@ void ExpertCache::clear() {
     vram_slots_ = 0;
     pin_bytes_ = 0;
     pin_slots_ = 0;
+    // A cleared cache starts a new residency generation, so the free-VRAM
+    // reading the re-clamp measures against has to start over too.
+    last_free_bytes_ = 0;
+    have_free_bytes_ = false;
     host_bytes_ = 0;
     // Pinned bytes are a live figure like host_bytes_, and they are decremented
     // per slot in drop_host(): leaving the total behind makes every later
@@ -505,8 +509,27 @@ size_t ExpertCache::reclamp_vram_budget(size_t free_bytes, size_t floor_bytes) {
     // so the rule is testable at a fixture's 96 bytes instead of being dominated
     // by a constant that is larger than the whole test cache.
     const size_t margin = budget_ / 64;
-    if (cap + margin >= budget_) return budget_;
-    set_vram_budget(cap);
+    // Shrink only by what the CARD gave up since the previous reading. The
+    // cache's own evictions do not appear in `free_bytes`: retire() hands the
+    // cells back to the backend's pool (release_pooled_batch), not to the
+    // driver, so hipMemGetInfo's free count does not move when a slot is
+    // dropped. A cap computed from live residency alone therefore removed what
+    // the cache had just evicted, at every clamp, and the budget walked
+    // 5747 -> 4295 MiB over 93 tokens on the 288-expert file (and 4697 -> 359
+    // on a longer chat) while free VRAM sat still. `taken` is the part of the
+    // shortfall somebody else caused; room-making by the cache itself leaves it
+    // at zero, which makes the clamp a no-op instead of a ratchet.
+    size_t taken = 0;
+    if (have_free_bytes_ && free_bytes < last_free_bytes_)
+        taken = last_free_bytes_ - free_bytes;
+    have_free_bytes_ = true;
+    last_free_bytes_ = free_bytes;
+    if (taken <= margin) return budget_;
+    const size_t shortfall = cap < budget_ ? budget_ - cap : 0;
+    if (shortfall <= margin) return budget_;
+    const size_t cut = taken < shortfall ? taken : shortfall;
+    if (cut <= margin) return budget_;
+    set_vram_budget(budget_ - cut);
     return budget_;
 }
 

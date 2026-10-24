@@ -88,6 +88,94 @@ __global__ void kv_append_kernel(_Float16 *__restrict__ kc, _Float16 *__restrict
 }
 
 // ---------------------------------------------------------------------------
+// int8 K/V: a row is `kv_dim` signed bytes followed by one f32 scale per 32
+// values, so the row stride is a BYTE count. A NEGATIVE pos_stride is the flag
+// that says so: its magnitude is the stride and no kernel needs an extra
+// argument to learn the format. `kv_dim` is n_kv * hd, always available at the
+// read site, and (idx >> 5) is the scale block because the scales are a
+// contiguous plane at the end of the row.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ bool attn_kv_q8(i64 pos_stride) { return pos_stride < 0; }
+__device__ __forceinline__ i64 attn_kv_stride(i64 pos_stride) {
+    return pos_stride < 0 ? -pos_stride : pos_stride;
+}
+__device__ __forceinline__ f32 attn_kv_at_q8(const u8 *row, i64 kv_dim, i64 idx) {
+    const f32 *sc = reinterpret_cast<const f32 *>(row + kv_dim);
+    // Rounded through f16 on the way out, because the tiled and bit-exact
+    // kernels STAGE a dequantised value into f16 shared memory and dot from
+    // there. Without the round trip a chunk-1 decode row (f32 dequant) and a
+    // chunk-8 prefill (f16 staged) differ by up to one f16 ulp per channel,
+    // which moves the prefill trace hash and breaks chunk invariance for a
+    // reason that has nothing to do with the cache bytes.
+    return static_cast<f32>(static_cast<_Float16>(
+        static_cast<f32>(static_cast<i8>(row[idx])) * sc[idx >> 5]));
+}
+
+// Quantise this step's K/V rows into the int8 layout. One thread per 32-value
+// block of one (token, plane): it reads the block, writes the scale and the 32
+// bytes. Per-row, per-32 scaling is what makes a chunked prefill and a decode
+// step produce the same cache bytes.
+// The int8 lane slice: the same channel partition and the same ARITHMETIC as
+// attn_lane_dot. Each pair is dequantised into f16 (which attn_kv_at_q8
+// already rounds to) and consumed by one v_dot2_f32_f16, exactly as the tiled
+// and bit-exact kernels consume a dequantised pair staged in LDS. A per-element
+// f32 FMA chain here instead -- `s += q[e] * dequant(k[e])` -- is a different
+// reduction: two separate FMAs against one packed dot, and it put a chunk-1
+// decode row one f16 ulp per channel away from a chunk-8 prefill over the same
+// cache bytes. That is not a cache defect, so it cannot be excused as one.
+template <int VPT>
+__device__ __forceinline__ f32 attn_lane_dot_q8(const u32 *qp, const u8 *row,
+                                                i64 kv_dim, i64 head_off,
+                                                int lane) {
+    static_assert(VPT % 2 == 0, "decode attention lane slice must pair up");
+    union Pair {
+        u32 u;
+        _Float16 h[2];
+    };
+    const i64 base = head_off + static_cast<i64>(lane) * VPT;
+    f32 s = 0.0f;
+#pragma unroll
+    for (int e = 0; e < VPT / 2; e++) {
+        Pair kp;
+        kp.h[0] = static_cast<_Float16>(
+            attn_kv_at_q8(row, kv_dim, base + 2 * e));
+        kp.h[1] = static_cast<_Float16>(
+            attn_kv_at_q8(row, kv_dim, base + 2 * e + 1));
+        s = d_dot2_pk(qp[e], kp.u, s);
+    }
+    return s;
+}
+
+__global__ void kv_append_i8_kernel(u8 *__restrict__ kc, u8 *__restrict__ vc,
+                                    const _Float16 *__restrict__ k,
+                                    const _Float16 *__restrict__ v,
+                                    const i64 *__restrict__ pos0, i64 n_tok,
+                                    i64 kv_dim, i64 pos_stride) {
+    const i64 blocks = (kv_dim + 31) / 32;
+    const i64 total = n_tok * 2 * blocks;
+    const i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const i64 b = i % blocks;
+    const i64 uv = i / blocks;
+    const bool is_v = uv >= n_tok;
+    const i64 t = is_v ? uv - n_tok : uv;
+    const _Float16 *src = (is_v ? v : k) + t * kv_dim + b * 32;
+    u8 *row = (is_v ? vc : kc) + (*pos0 + t) * pos_stride;
+    const i64 nn = min<i64>(32, kv_dim - b * 32);
+    f32 mx = 0.0f;
+    for (i64 z = 0; z < nn; z++) mx = fmaxf(mx, fabsf(static_cast<f32>(src[z])));
+    const f32 s = mx > 0.0f ? mx / 127.0f : 0.0f;
+    reinterpret_cast<f32 *>(row + kv_dim)[b] = s;
+    const f32 inv = s > 0.0f ? 1.0f / s : 0.0f;
+    for (i64 z = 0; z < nn; z++) {
+        const f32 q = static_cast<f32>(src[z]) * inv;
+        i64 r = static_cast<i64>(q + (q >= 0.0f ? 0.5f : -0.5f));
+        r = r > 127 ? 127 : (r < -127 ? -127 : r);
+        row[b * 32 + z] = static_cast<u8>(static_cast<i8>(r));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // flash attention
 //
 // Shared memory layout (bytes):
@@ -137,8 +225,19 @@ __global__ void __launch_bounds__(kAttnBlock)
 
     const int tid = static_cast<int>(threadIdx.x);
     const _Float16 *qrow = q + (t * n_head + h) * hd;
+    // A negative pos_stride marks an int8 cache; its magnitude is the row
+    // stride in bytes. The tiled kernel stages into f16 LDS in both formats, so
+    // everything downstream of the staging loop is unchanged.
+    const bool kv8 = attn_kv_q8(pos_stride);
+    const i64 kstride = attn_kv_stride(pos_stride);
+    const i64 kv_dim = n_kv * hd;
     const _Float16 *krow = kcache + hkv * hd;
     const _Float16 *vrow = vcache + hkv * hd;
+    // Row base, not the head slice: the scales plane is at row + kv_dim, so a
+    // pointer already offset by hkv*hd would read the scales of a different
+    // head. The head's channels are an INDEX offset below instead.
+    const u8 *krow8 = reinterpret_cast<const u8 *>(kcache);
+    const u8 *vrow8 = reinterpret_cast<const u8 *>(vcache);
 
     for (i64 i = tid; i < hd; i += kAttnBlock) q_sh[i] = qrow[i];
     __syncthreads();
@@ -160,12 +259,18 @@ __global__ void __launch_bounds__(kAttnBlock)
         for (i64 i = tid; i < tile_elems; i += kAttnBlock) {
             const i64 j = i / hd;
             const i64 d = i % hd;
-            k_sh[i] = krow[(k0 + j) * pos_stride + d];
+            k_sh[i] = kv8
+                          ? attn_kv_at_q8(krow8 + (k0 + j) * kstride, kv_dim,
+                                          hkv * hd + d)
+                          : krow[(k0 + j) * kstride + d];
         }
         for (i64 i = tid; i < tile_elems; i += kAttnBlock) {
             const i64 j = i / hd;
             const i64 d = i % hd;
-            v_sh[i] = vrow[(k0 + j) * pos_stride + d];
+            v_sh[i] = kv8
+                          ? attn_kv_at_q8(vrow8 + (k0 + j) * kstride, kv_dim,
+                                          hkv * hd + d)
+                          : vrow[(k0 + j) * kstride + d];
         }
         __syncthreads();
 
@@ -302,6 +407,11 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     for (int e = 0; e < VPT / 2; e++)
         qp[e] = *reinterpret_cast<const u32 *>(q + h * hd + lane * VPT + 2 * e);
 
+    const bool kv8 = attn_kv_q8(pos_stride);
+    const i64 kstride = attn_kv_stride(pos_stride);
+    const i64 kv_dim = n_kv * hd;
+    const u8 *kb8 = reinterpret_cast<const u8 *>(kcache);
+    const u8 *vb8 = reinterpret_cast<const u8 *>(vcache);
     const _Float16 *kb = kcache + hkv * hd;
     const _Float16 *vb = vcache + hkv * hd;
 
@@ -312,16 +422,22 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     for (int e = 0; e < VPT; e++) acc[e] = 0.0f;
 
     for (i64 j = j_lo + warp; j < n_keys; j += kAttnDecWarps) {
-        const _Float16 *krow = kb + j * pos_stride;
-        const _Float16 *vrow = vb + j * pos_stride;
-        const f32 s = d_wave_reduce_sum(attn_lane_dot<VPT>(qp, krow, lane)) * scale;
+        const _Float16 *krow = kb + j * kstride;
+        const _Float16 *vrow = vb + j * kstride;
+        const u8 *krow8 = kb8 + j * kstride;
+        const u8 *vrow8 = vb8 + j * kstride;
+        const f32 s = d_wave_reduce_sum(
+            kv8 ? attn_lane_dot_q8<VPT>(qp, krow8, kv_dim, hkv * hd, lane)
+                : attn_lane_dot<VPT>(qp, krow, lane)) * scale;
         const f32 mnew = fmaxf(m, s);
         const f32 a = __expf(m - mnew);
         const f32 p = __expf(s - mnew);
         l = l * a + p;
 #pragma unroll
         for (int e = 0; e < VPT; e++)
-            acc[e] = acc[e] * a + p * static_cast<f32>(vrow[lane * VPT + e]);
+            acc[e] = acc[e] * a +
+                     p * (kv8 ? attn_kv_at_q8(vrow8, kv_dim, hkv * hd + lane * VPT + e)
+                              : static_cast<f32>(vrow[lane * VPT + e]));
         m = mnew;
     }
 
@@ -448,6 +564,11 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     for (int e = 0; e < VPT / 2; e++)
         qp[e] = *reinterpret_cast<const u32 *>(q + h * hd + lane * VPT + 2 * e);
 
+    const bool kv8 = attn_kv_q8(pos_stride);
+    const i64 kstride = attn_kv_stride(pos_stride);
+    const i64 kv_dim = n_kv * hd;
+    const u8 *kb8 = reinterpret_cast<const u8 *>(kcache);
+    const u8 *vb8 = reinterpret_cast<const u8 *>(vcache);
     const _Float16 *kb = kcache + hkv * hd;
     const _Float16 *vb = vcache + hkv * hd;
 
@@ -458,16 +579,22 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     for (int e = 0; e < VPT; e++) acc[e] = 0.0f;
 
     for (i64 j = j0 + warp; j < j1; j += kAttnDecWarps) {
-        const _Float16 *krow = kb + j * pos_stride;
-        const _Float16 *vrow = vb + j * pos_stride;
-        const f32 s = d_wave_reduce_sum(attn_lane_dot<VPT>(qp, krow, lane)) * scale;
+        const _Float16 *krow = kb + j * kstride;
+        const _Float16 *vrow = vb + j * kstride;
+        const u8 *krow8 = kb8 + j * kstride;
+        const u8 *vrow8 = vb8 + j * kstride;
+        const f32 s = d_wave_reduce_sum(
+            kv8 ? attn_lane_dot_q8<VPT>(qp, krow8, kv_dim, hkv * hd, lane)
+                : attn_lane_dot<VPT>(qp, krow, lane)) * scale;
         const f32 mnew = fmaxf(m, s);
         const f32 a = __expf(m - mnew);
         const f32 p = __expf(s - mnew);
         l = l * a + p;
 #pragma unroll
         for (int e = 0; e < VPT; e++)
-            acc[e] = acc[e] * a + p * static_cast<f32>(vrow[lane * VPT + e]);
+            acc[e] = acc[e] * a +
+                     p * (kv8 ? attn_kv_at_q8(vrow8, kv_dim, hkv * hd + lane * VPT + e)
+                              : static_cast<f32>(vrow[lane * VPT + e]));
         m = mnew;
     }
 
@@ -708,8 +835,13 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     }
     __syncthreads();
 
+    const bool kv8 = attn_kv_q8(pos_stride);
+    const i64 kstride = attn_kv_stride(pos_stride);
+    const i64 kv_dim = n_kv * hd;
     const _Float16 *kb = kcache + hkv * hd;
     const _Float16 *vb = vcache + hkv * hd;
+    const u8 *kb8 = reinterpret_cast<const u8 *>(kcache);
+    const u8 *vb8 = reinterpret_cast<const u8 *>(vcache);
 
     // The newest row's causal bound is the furthest key any row here needs.
     const i64 n_keys = pos0 + t0 + nq;
@@ -730,11 +862,17 @@ __global__ void __launch_bounds__(kAttnDecThreads)
         const i64 tile_elems = static_cast<i64>(tile) * hd;
         for (i64 i = tid; i < tile_elems; i += kAttnDecThreads) {
             const i64 j = i / hd, dd = i % hd;
-            k_sh[i] = kb[(k0 + j) * pos_stride + dd];
+            k_sh[i] = kv8
+                          ? attn_kv_at_q8(kb8 + (k0 + j) * kstride, kv_dim,
+                                          hkv * hd + dd)
+                          : kb[(k0 + j) * kstride + dd];
         }
         for (i64 i = tid; i < tile_elems; i += kAttnDecThreads) {
             const i64 j = i / hd, dd = i % hd;
-            v_sh[i] = vb[(k0 + j) * pos_stride + dd];
+            v_sh[i] = kv8
+                          ? attn_kv_at_q8(vb8 + (k0 + j) * kstride, kv_dim,
+                                          hkv * hd + dd)
+                          : vb[(k0 + j) * kstride + dd];
         }
         __syncthreads();
 

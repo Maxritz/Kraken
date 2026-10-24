@@ -1,5 +1,68 @@
 # What MLA support would cost in kraken, and what it would buy
 
+> **Status 2026-10-26 -- deepseek4 RUNS, dense core only, and the arch row is
+> `Partial`.** `Engine::mla_shared_forward` wires the oracle's graph into the
+> layer loop (latent -> `mla_shared_latent` -> query trunk -> `mla_shared_attention`
+> -> `mla_shared_output` straight into the residual's buffer, so the ordinary
+> `attn_output` projection is skipped for this layout), `MlaLayout::Shared` is no
+> longer refused at init, and `kv_dim_at` sizes V4's cache row as the latent
+> ALONE -- the rope is its tail, and the lite rule's `+ qk_rope` had every plane
+> 64 columns wide. `test_dsv4_whole_graph` (21 checks) pins the fixture end to
+> end: the whole logits row by FNV hash, its argmax, the greedy sequence, a second
+> prompt, chunk 1 vs 8, a shifted hash table, and an out-of-range id that must
+> refuse. Two wiring defects it caught: the hash route was indexed by ROW instead
+> of by vocab id (chunk 1 and chunk 8 disagreed), and the red arm that rotates the
+> leading slice instead of the tail fails 3 of the 21 while `test_mla_shared`
+> stays 109/109 -- the per-piece gate compares two implementations that share the
+> premise, so only the sentence can see it. Refused by construction, not by luck:
+> a non-zero `attention.compress_ratios` (the compressors are absent), any
+> `attn_sinks`, and the Split layout. The indexer, the compressors and sinks are
+> what still separate this from `Yes` on a real V4 file.
+>
+> **Historical status 2026-10-25 -- the V4 SHARED-LATENT attention has a host oracle and a
+> gate; the graph still does not run.** `include/krk/mla_shared.hpp` +
+> `src/mla_shared.cpp` implement one V4 layer of the read path: q_a -> q_a_norm
+> -> q_b, the single `attn_kv` latent (normed whole, rope on the TAIL),
+> sink-in-denominator softmax, the positional window, and the grouped low-rank
+> output (per-group `wo_a` column blocks -> `wo_b`). Two orders -- per-key
+> accumulation and weights-then-gather -- and `test_mla_shared` pins them:
+> **109 checks**, including the one-key reduction (softmax 1 means the head
+> output IS the latent, which pins the q path, the latent norm and the grouped
+> output at once), the rope tail offset, a saturating sink taking all the mass,
+> group isolation (zero group 0's block and rewire heads 0..hpg-1: the answer
+> must not move), and the window excluding keys by POSITION. Red construction:
+> rotating the leading slice instead of the tail and always reading output group
+> 0 fails **34** of the 109, and reverting returns to 109/109. Suite total
+> 3833 (was 3724). The oracle's ONE unconfirmable assumption is stated in the
+> header: V reads the UNROTATED latent (one tensor feeds K and V, so no file on
+> this box can settle it; it is one function, `build_scores`, if a reference
+> comparison says otherwise).
+>
+> **Also landed: the hash route (same session).** `include/krk/dsv4_route.hpp` +
+> `src/dsv4_route.cpp`: `dsv4_hash_route` resolves the first
+> `hash_layer_count` layers from `ffn_gate_tid2eid.weight` -- TOKEN-major
+> (`tid2eid[token * per_token + slot]`), every id range-checked, nothing
+> written on a refusal, duplicates preserved because the table is authority --
+> and `dsv4_hash_gather` reads the selected ids' router scores in TABLE order.
+> `test_dsv4_hash_route` is **25 checks**; red construction (a column-major
+> read, plus a gather that pairs each weight with the neighbouring id) fails
+> **10 of 25**. Suite total 3858. Two things this deliberately does not decide:
+> the mixing weights stay with the engine's existing gating path (hash layers
+> still carry `ffn_gate_inp`, and the file names the transform), and the engine
+> call site is NOT wired, because `deepseek4` refuses at `Engine::init` today
+> and an unreachable call would read as a live gate.
+>
+> **Why the arch row is still `No`:** the oracle is the *dense* attention of the
+> three non-compressed layers. Still missing, in dependency order: the CSA/HCA
+> compressors (`attn_compressor_{ape,gate,kv,norm}` -- not read at all today),
+> the lightning indexer (`indexer_*`, top-512 sparse selection), the `tid2eid`
+> hash route (loaded, never used by the forward), the V4 Sinkhorn hyper-connector
+> (`hc_*` is wired for qwen4exp's DIFFERENT mixer), YaRN rope (absent from the
+> engine), wiring the oracle into the CPU backend and `Engine::mla_forward`, then
+> the HIP kernels. The REAP-160 file also cannot be used as its own oracle:
+> both llama.cpp builds on this box refuse it (`ffn_gate_inp.weight` expects 256
+> experts, the file is pruned to 160 per `reap.layer.expert_count`).
+
 > **Status 2026-10-22 (later) -- the legacy lite layout RUNS.** A 576-wide cache
 > row (kv_lora 512 + the decoupled rope key 64), the absorbed score reduction
 > and the rope-on-the-decoupled-key path are implemented twice: on the device

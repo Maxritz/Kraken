@@ -55,10 +55,16 @@ WMMA**).
 * `stream: true` ⇒ SSE: one `data:` chunk per generated token
   (`choices[0].delta.content`), one terminal chunk with `finish_reason`
   (`stop` / `length`), then `data: [DONE]`.
+* Every response, `200` included, carries `Connection: close`: the server
+  handles one request per connection, so it never invites a client to reuse the
+  socket.
 * `GET /health` → status/arch/n_ctx/device; `GET /v1/models` → OpenAI list
   shape with model geometry under `meta`.
 * Errors use the OpenAI shape `{"error":{"message","type"}}`: 400 (bad JSON,
-  missing prompt/messages), 404, 405, 413, 500.
+  missing prompt/messages, a duplicated or non-numeric `Content-Length`, a
+  request-side `Transfer-Encoding` this server cannot decode, or a body shorter
+  than its declared length), 404, 405, 413 (body over the 8 MiB cap), 431
+  (header block over the 64 KiB cap), 500.
 * Single-sequence engine: connections are concurrent, **generation is
   serialized**; each request starts from a fresh KV context.
 
@@ -165,9 +171,9 @@ build-cpu/kraken --model ../Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf --cpu --info
 build-cpu/kraken --model ../Qwen3-MOE-4x0.6B-2.4B-Q4_K_M.gguf --cpu \
     --greedy --repeat-penalty 1.0 --max-tokens 1 --ctx 256 --prompt "Hi"
 
-build-cpu/kraken-server --model model.gguf --cpu --port 8080
-curl -s localhost:8080/health
-curl -s localhost:8080/v1/completions -d '{"prompt":"Hi","max_tokens":4,"temperature":0}'
+KRK_PORT=8090 build-cpu/kraken-server --model model.gguf --cpu  # --port wins over KRK_PORT
+curl -s localhost:8090/health
+curl -s localhost:8090/v1/completions -d '{"prompt":"Hi","max_tokens":4,"temperature":0}'
 ```
 
 ---

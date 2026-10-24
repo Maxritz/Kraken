@@ -129,6 +129,70 @@ ModelVerdict assess_model(const Gguf &g) {
                                        "layers to load");
     }
 
+    // A model needs a token table to look a token up in. Without one there is
+    // no first row for anything downstream, and `Model::load` fails on
+    // `token_embd.weight` however the rest of the file looks -- so a verdict of
+    // "runnable" there sends the reader to a load that can only fail, after the
+    // whole file has been mapped. The case that prompted this is
+    // DeepSeek-V4.1-Flash's Engram sidecar: 103 GiB in two
+    // `blk.N.engram_embd.weight` tensors under an arch nobody lists, which the
+    // unknown-arch defaults called runnable because no rule in this pass looked
+    // at what the file actually carries. The message says whether there is also
+    // no attention/SSM tensor, because a table pack and an attention-only
+    // extraction are different partial artifacts.
+    //
+    // Only a target (or an unlisted arch) is judged here. A draft file is
+    // refused for its role already, and a head set legitimately has no
+    // embedding: an MTP extract is `mtp.*` tensors, a dspark set is a markov
+    // head.
+    {
+        const bool draft_role = v.known && v.spec->role == ArchRole::Draft;
+        if (!draft_role) {
+            bool has_embd = false, has_mixer = false;
+            std::vector<std::string> shown;
+            for (const GgufTensor &t : g.tensors()) {
+                if (t.name == "token_embd.weight") has_embd = true;
+                if (t.name.find("attn") != std::string::npos ||
+                    t.name.find("ssm") != std::string::npos)
+                    has_mixer = true;
+                if (shown.size() < 3) shown.push_back(t.name);
+            }
+            if (!has_embd) {
+                if (g.tensor_count() == 0) {
+                    add_unique(v.blockers,
+                               "carries no tensors at all, so there is nothing "
+                               "to run");
+                } else {
+                    std::string list;
+                    for (size_t i = 0; i < shown.size(); i++) {
+                        if (i) list += ", ";
+                        list += shown[i];
+                    }
+                    if (g.tensor_count() > shown.size()) list += ", ...";
+                    if (!has_mixer)
+                        add_unique(
+                            v.blockers,
+                            format("carries no token embedding (token_embd.weight) "
+                                   "and no attention tensor: its %zu tensor(s) "
+                                   "name no model schema (%s) -- a table pack "
+                                   "that rides beside a model, not one",
+                                   static_cast<size_t>(g.tensor_count()),
+                                   list.c_str()));
+                    else
+                        add_unique(
+                            v.blockers,
+                            format("carries no token embedding (token_embd.weight), "
+                                   "which every model needs: its %zu tensor(s) "
+                                   "(%s) are attention weights without a token "
+                                   "table, so this is a partial extraction, not "
+                                   "a model",
+                                   static_cast<size_t>(g.tensor_count()),
+                                   list.c_str()));
+                }
+            }
+        }
+    }
+
     if (v.known) {
         if (v.spec->role == ArchRole::Draft) {
             // A head set is refused as a model, and the reason says what it is

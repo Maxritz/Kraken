@@ -654,6 +654,194 @@ measurement and should not be compared directly.
 
 Use `--ctx 256/512` for MoE runs on small machines.
 
+### Prefill, measured on this box (2026-10-24)
+
+Four thousand and eighty-one tokens of the same prose, `--greedy`, `--ctx 32768`,
+`--expert-warmup 1`, one run per cell. These are the prompt-throughput numbers a
+long-context request actually pays; the 55-token `--bench` prompt is dominated by
+fixed cost and reads much lower.
+
+| file | arm | chunk | prefill tok/s | prefill ms | decode tok/s |
+|---|---|---|---|---|---|
+| Qwen3.8-Distill-35B-A3B Q2KXL (11.7 GiB) | exact | 256 | 181.8 | 22 450 | - |
+| Qwen3.8-Distill-35B-A3B Q2KXL | fast | 256 | **402.4** | 10 140 | - |
+| Qwen3-30B-A3B abliterated i1-Q2_K (11.2 GiB) | exact | 64 | 63.7 | 64 043 | 2.0 |
+| Qwen3-30B-A3B abliterated i1-Q2_K | exact | 256 | 176.3 | 23 143 | 29.2 |
+| Qwen3-30B-A3B abliterated i1-Q2_K | exact | 1024 | 176.7 | 23 096 | 29.0 |
+| Qwen3-30B-A3B abliterated i1-Q2_K | fast | 64 | 77.3 | 52 809 | 2.0 |
+| Qwen3-30B-A3B abliterated i1-Q2_K | fast | 256 | 384.4 | 10 618 | 31.0 |
+| Qwen3-30B-A3B abliterated i1-Q2_K | fast | 1024 | **420.9** | 9 695 | 29.5 |
+| Qwen3-Coder-53B-A3B i1-Q4_K_M (29.9 GiB) | exact | 256 | 49.2 | 82 900 | 3.4 |
+| Qwen3-Coder-53B-A3B i1-Q4_K_M | fast | 256 | 65.5 | 62 300 | 3.4 |
+
+Three things this measures, rather than argues:
+
+- **`--prefill fast` is worth 2.2-2.4x on a long MoE prompt** at chunk 256+:
+  181.8 -> 402.4 on the 35B, 176.3 -> 384.4 on the 30B, 384.4 -> 420.9 going from
+  chunk 256 to 1024 with `fast` on. It is a different-arithmetic mode (see the
+  `--prefill` bullet above), so it is not the default and a chunk-invariance gate
+  must stay on the exact arm.
+- **Chunk 64 is not a small chunk, it is a different machine.** 63.7 tok/s
+  prefill and 2.0 tok/s decode against 176.3 / 29.2 at chunk 256, on both arms and
+  therefore not a kernel choice: a 64-row prefill leaves the batched expert path
+  below the width where it batches. Keep `--chunk` at 256 or above.
+- **The 53B is expert-tier bound, not kernel bound.** 29.9 GiB of routed set
+  against the card's 6.4 GiB pool is 3.4 tok/s whatever the prefill arm does; the
+  `fast` arm only helps the part that is not waiting on experts (+33% prefill,
+  decode unchanged).
+
+Decode on the 35B with the fixed 55-token `--bench` prompt is 34.0 tok/s; the
+long-prompt decode column above is a different run (`-` on the 35B rows because
+that prompt's first sampled token was EOS at 32 tokens, so there were no timed
+steps to report).
+
+`kraken-server` takes the same switch (`--prefill exact|fast`, default `exact`),
+so the arm is reachable from the HTTP path and the web UI. Measured through the
+API on the 30B-A3B file, same 4081-token prompt, chunk 1024, `--ctx 32768`:
+**22.98 s exact (177.6 tok/s) against 9.89 s fast (412.5 tok/s), 2.3x**. The
+server prints one line at startup when the fast arm is engaged, because a run
+whose output is no longer chunk-invariant should be identifiable from its log.
+
+### `--kv-quant f16|int8` - a quantized K/V cache
+
+The cache stores `kv_dim` bytes per position per plane instead of `kv_dim * 2`,
+followed by one f32 scale per 32 values, so a row is
+`kv_dim + 4 * ceil(kv_dim / 32)` bytes: **144 against 256 bytes at a 128-wide
+GQA row (1.78x)**, and 144 against 512 on the CPU reference's f32 cache (3.6x).
+Quantisation is per row per 32, which is what keeps it chunk-invariant: the same
+activation produces the same bytes whether it arrived in a one-token decode or a
+64-row prefill.
+
+Both backends implement it. On the reference backend one decode row at the end
+of a **200-key** context lands within **0.71%** (relative L2) of the f32 cache,
+worst channel 0.0037, and the layout-mismatch arm reads an f32 cache through the
+int8 descriptor and must diverge by more than 20%, so the flag cannot pass by
+being ignored. On the card the four readers (`attention_kernel`,
+`attention_bexact_kernel`, `attention_decode_kernel`,
+`attention_decode_split_kernel`) and `kv_append_i8_kernel` speak the layout, and
+the cache is invariant end to end: `smolcode-coder-cpp-1.5b-q4_k_m`, a 21-token
+prompt, `--prefill-hash` gives
+
+    chunk 1, 2, 4, 8 and 16   trace 6d4758c0c4754be0  logits dc6d7126d56225fb  first 576
+
+against `f16`'s `2cb4e7fc46508835` / `67f95a7185846df2` and the same first token
+(the cache holds different numbers, so the two formats must differ; what must
+not move is the hash across chunk sizes). 24 greedy tokens are byte-identical
+text between the two formats. MLA and the nextn/draft block are still refused by
+name: they own their own caches and have no int8 path.
+
+**The device arm is `kraken-bench --bitexact`'s int8 block, and it is enforced,
+not printed.** Two claims, measured per kernel because they fail for different
+reasons: the CACHE BYTES of a position must not depend on the append's arity
+(one 8-row append against eight single-row appends, byte-exact), and ATTENTION
+over that cache must not depend on the query-row count (decode rows against one
+prefill call). **27 of 27 arms identical** across hd 64/128/256, rows 2/4/8 and
+64/200 keys. `KRK_ATTN_BEXACT=0` (the tiled prefill reader) makes **17 of 27**
+differ by **1 ulp**, which is the arm showing it can fail; `--bitexact` exits
+non-zero when any int8 arm differs, while the f16 rows in the same report stay
+informational.
+
+**The defect that closed it was a reduction order, not a layout.** The int8
+decode lane computed its dot as a per-element f32 FMA chain
+(`s += q[e] * dequant(k[e])`) while the tiled and bit-exact prefill consumed
+dequantised PAIRS through one `v_dot2_f32_f16`. Same terms, different rounding:
+a chunk-1 decode row sat up to one f16 ulp per channel away from a chunk-8
+prefill over **identical cache bytes**, so chunk 2 and 4 agreed with each other
+and disagreed with 1 and 8. Decode now builds the same pair and calls the same
+instruction (`attn_lane_dot_q8`), which is why the five rows above are one hash.
+
+The two defects found before it read as working code and are worth keeping:
+
+- **The scales plane is at the ROW base + `kv_dim`, not at the KV-head slice.**
+  The row pointer was built as `cache + hkv * hd` before being handed to the
+  dequant, so every head after the first read another head's scales, i.e. a
+  scale of a different magnitude. The symptom was not a crash but `!!!...`: the
+  first token came out as `<unk>` and every later one followed it. The head's
+  channels are an INDEX offset into the row, not a pointer offset.
+- **The dequant has to round through f16.** The tiled and bit-exact kernels
+  stage a dequantised value into `_Float16` shared memory and dot from there; a
+  decode row computes the same product in f32. Without the round trip the two
+  paths differ by up to one f16 ulp per channel, which is enough to move the
+  prefill trace while the cache bytes are identical.
+
+**This is the 128k lever, and it is measured now.** `qwen3.8-flash-next-reap-288`,
+`--ctx 131072 --chunk 256 --expert-cache-mb 8000 --expert-warm-mb 20000`, both
+arms the second load of the file so the page cache is warm (a first-load int8
+run read 2.53 / 2.02 tok/s and would have made the format look 20% slower than
+it is -- compare load states or do not compare):
+
+| 128k, same flags | f16 | int8 |
+|---|---|---|
+| KV at ctx 131072 | 3072 MiB | **1728 MiB** (1.78x smaller) |
+| expert pool at init | 4697 MiB | **5747 MiB** (+1050, +22%) |
+| pool after 5+24 then 5+64 tokens | 3232 MiB | **4295 MiB** (+1063, +33%) |
+| decode, 24 tok / 64 tok | 3.16 / 2.16 tok/s | 3.26 / 2.24 tok/s |
+| working set | 3.5 GiB | 3.4 GiB |
+
+Two things the table does not say. **The ratchet was still running in that
+measurement**: the int8 pool decayed 5747 -> 4295 MiB over 93 tokens (and the
+earlier long-chat run fell 4697 -> 359). It is fixed below, and the same 128k
+int8 run now prints no re-clamp at all and holds 5747 MiB; the table is kept as
+measured, before the fix, because it is the f16/int8 pair. And `unaccounted` rose
+2016 -> 2310 MiB with the format, so ~294 MiB of the 1344 MiB the KV gave back
+went to allocator slack; the +1050 MiB is net.
+
+Decode on this file is not expert-bound at either context. With `KRK_TIME=1` a
+step is `decode.step` 307 ms, of which `moe.route.fetch` (2.98 ms x 48 layers)
+plus `moe.route.rest` (2.62 ms x 48) is 269 ms, while `moe.experts` is 0.003 ms
+per call and `expert.warm.read` is 23 ms/step. The same table at `--ctx 4096`
+reads 307.6 ms/step and 3.25 / 2.38 tok/s, so **the declared context is not what
+makes 128k feel slow** -- the router readback is. A span that waits on the queue
+attributes the wait to itself, so that 143 ms/step is "wait for this layer's
+router row", not 143 ms of copy; it is the next thing to instrument.
+
+### The expert-cache budget ratchet (fixed)
+
+The re-clamp exists because the init-time plan cannot see the KV tier and the
+workspaces: `reclamp_expert_budget` re-derives the pool's ceiling from a live
+free-VRAM reading every prefill and every 16 decode steps, and only ever lowers
+it. The old arithmetic was
+
+    room = free > floor ? free - floor : 0
+    live = bytes_ - pin_bytes_
+    cap  = live + room
+
+`free` is a device-wide reading, and a cell this cache evicts goes back to the
+BACKEND's pool (`release_pooled_batch`), not to the driver, so `hipMemGetInfo`
+does not move when the cache frees a slot. On this box free VRAM sat at
+**3235 MiB against a 3261 MiB floor**, so `room` was zero at every call and
+`cap == live`: the budget became whatever happened to be resident. Every
+eviction therefore lowered the ceiling by the bytes it had just freed, and there
+was no path back up, because growth is exactly what `room` describes.
+
+Measured, not inferred: **5747 -> 4295 MiB over 93 tokens** on the 288-expert
+file, **4697 -> 359 MiB** on a longer chat, and **6675 -> 1313 MiB across eleven
+decode checks** on the 35B file, every line carrying the same free reading. The
+cost is where the bytes went: a run whose decode split read `room 1211.9 |
+promote 1303.7 ms` of a 29.4 ms step is promoting back the experts the pool no
+longer holds. Text is identical either way (`--prefill exact`, same greedy
+stream); this was a throughput and VRAM-planning defect, not a correctness one.
+
+The fix is causal rather than a floor or a hysteresis: **cut only by what the
+card gave up since the previous reading.**
+
+    taken = last_free > free ? last_free - free : 0
+    cut   = min(taken, budget - (live + room))
+
+The pool's own room-making leaves `taken` at zero -- free did not move, because
+the cells are pooled -- so the clamp is a no-op; a KV tier taking VRAM lowers
+`free` with residency unchanged, and that drop is exactly what the pool gives
+back. The 1/64 margin still absorbs a reading that wanders by a few MiB, and
+`clear()` resets the baseline with the residency generation.
+
+Verified two ways. `test_expert_cache_policy` grows to 380 checks with five for
+this rule: the baseline, an evicting pool that must not cut, an external drop
+that must cut by exactly that much, a repeat that must not cut twice, and free
+above the floor that must not move the budget. The red construction (the old
+unconditional cut) fails all five, **375/380**. On the card, the same 128k int8
+run that printed `5747 -> 4295` now prints **no re-clamp at all** across the same
+two requests and holds 5747 MiB.
+
 ---
 
 ## Usage switches and worked examples
@@ -1427,16 +1615,18 @@ against CPU and call it coherence (`FAIL (cpu)`).
 ## HTTP server (OpenAI-compatible)
 
 ```sh
-kraken-server --model model.gguf --port 8080 --ctx 4096
-# GPU when the HIP backend is present; --cpu forces the reference backend
+KRK_PORT=8090 kraken-server --model model.gguf --ctx 4096
+# GPU when the HIP backend is present; --cpu forces the reference backend.
+# The listen port is --port, then $KRK_PORT, then 8080, and the banner prints
+# the port that was actually bound.
 
-curl http://localhost:8080/health
-curl http://localhost:8080/v1/models
-curl http://localhost:8080/v1/completions \
+curl http://localhost:8090/health
+curl http://localhost:8090/v1/models
+curl http://localhost:8090/v1/completions \
      -d '{"prompt":"The capital of France is","max_tokens":32,"temperature":0}'
-curl -N http://localhost:8080/v1/completions \
+curl -N http://localhost:8090/v1/completions \
      -d '{"prompt":"Hello","max_tokens":32,"stream":true}'        # SSE
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:8090/v1/chat/completions \
      -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":32}'
 ```
 
@@ -1445,7 +1635,17 @@ curl http://localhost:8080/v1/chat/completions \
 `repeat_last_n`, `seed`, `stop` (string or array) and `stream`. Chat requests
 are rendered through the ChatML template and stop on `<|im_end|>` /
 `<|endoftext|>`; both endpoints report `finish_reason` (`stop`/`length`) and a
-`usage` block. `GET /health` and `GET /v1/models` round out the surface.
+`usage` block. `GET /health` and `GET /v1/models` round out the surface, and
+`GET /` serves the built-in chat page: one HTML document with no external
+assets, streaming over `POST /v1/chat/completions`, with a stop button, per-turn
+sampling and delete/regenerate.
+
+`--prefill exact|fast` (default `exact`) selects the rows>1 GEMM rung for the
+HTTP path too. `fast` takes those GEMMs to the RDNA4 matrix cores and measured
+**412.5 against 177.6 tok/s** on a 4081-token request (chunk 1024, 30B-A3B); it
+is a different-arithmetic mode, so the generated text can differ from `exact`
+and the output is not chunk-invariant past 8 rows per chunk. The server prints
+one startup line when it is engaged.
 
 `stream: true` replies with `text/event-stream`: one `data:` chunk per
 generated token, a final chunk carrying `finish_reason`, then `data: [DONE]`.
@@ -1455,7 +1655,7 @@ generation is serialized; each request starts from a fresh KV context. Any
 OpenAI client works:
 
 ```sh
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:8090/v1/chat/completions \
      -H 'Content-Type: application/json' \
      -d '{"model":"local","messages":[{"role":"user","content":"Hello"}]}' \
   | jq -r '.choices[0].message.content'

@@ -81,6 +81,29 @@ bool recv_some(socket_t s, std::string *buf) {
 #endif
 }
 
+// Refuses a request and closes: the response is written first, then the write
+// side is half-closed and whatever the client already sent is drained. The
+// drain is not cosmetic -- on Windows a close with unread request bytes in the
+// receive queue sends an RST, and an RST can discard the refusal the client is
+// about to read, which makes a correct server look silent on the wire.
+void refuse(socket_t s, HttpConn &conn, int status, const char *message) {
+    HttpResponse r;
+    r.status = status;
+    r.body = std::string("{\"error\":{\"message\":\"") + message + "\"}}";
+    http_write_response(conn, r);
+    ::shutdown(s,
+#ifdef _WIN32
+               SD_SEND
+#else
+               SHUT_WR
+#endif
+    );
+    std::string drain;
+    for (int i = 0; i < 4 && recv_some(s, &drain); i++) {
+    }
+    close_socket(s);
+}
+
 std::string lower(std::string s) {
     for (char &c : s)
         if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
@@ -102,6 +125,7 @@ const char *status_text(int code) {
         case 405: return "Method Not Allowed";
         case 408: return "Request Timeout";
         case 413: return "Payload Too Large";
+        case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         case 503: return "Service Unavailable";
         default: return "OK";
@@ -180,7 +204,12 @@ bool http_write_response(HttpConn &conn, const HttpResponse &r) {
     head += "Content-Length: " + std::to_string(r.body.size()) + "\r\n";
     for (const auto &kv : r.extra_headers)
         head += kv.first + ": " + kv.second + "\r\n";
-    if (r.status >= 400) head += "Connection: close\r\n";
+    // Every response closes (serve_client handles exactly one request), and
+    // HTTP/1.1 defaults to a PERSISTENT connection -- so the header belongs on
+    // every status, not only on errors. Without it a compliant client is
+    // entitled to reuse the socket and writes its next request into a closed
+    // pipe; the SSE head has always stated it for the same reason.
+    head += "Connection: close\r\n";
     head += "\r\n";
     if (!conn.write_raw(head.data(), head.size())) return false;
     if (!r.body.empty()) return conn.write_raw(r.body.data(), r.body.size());
@@ -301,11 +330,10 @@ void HttpServer::serve_client(int fd, HttpHandler handler) {
             break;
         }
         if (buf.size() > kMaxHeaderBytes) {
-            HttpResponse r;
-            r.status = 413;
-            r.body = "{\"error\":{\"message\":\"request header too large\"}}";
-            http_write_response(conn, r);
-            close_socket(s);
+            // 431 (RFC 6585), not 413: the CONTENT was never the problem, the
+            // header block was, and a client that retries with a smaller body
+            // would learn nothing from "Payload Too Large".
+            refuse(s, conn, 431, "request header too large");
             return;
         }
         if (!recv_some(s, &buf)) {
@@ -334,11 +362,7 @@ void HttpServer::serve_client(int fd, HttpHandler handler) {
                     const size_t sp1 = line.find(' ');
                     const size_t sp2 = line.rfind(' ');
                     if (sp1 == std::string::npos || sp2 == sp1) {
-                        HttpResponse r;
-                        r.status = 400;
-                        r.body = "{\"error\":{\"message\":\"malformed request line\"}}";
-                        http_write_response(conn, r);
-                        close_socket(s);
+                        refuse(s, conn, 400, "malformed request line");
                         return;
                     }
                     req.method = line.substr(0, sp1);
@@ -348,6 +372,28 @@ void HttpServer::serve_client(int fd, HttpHandler handler) {
                     if (colon != std::string::npos) {
                         const std::string key = lower(trim_copy(line.substr(0, colon)));
                         const std::string val = trim_copy(line.substr(colon + 1));
+                        // RFC 9112 §6.3: a second Content-Length makes the body
+                        // length ambiguous, and collapsing the two to the last
+                        // value is how the wrong party ends up parsing a
+                        // smuggled body. Refuse even when the values agree:
+                        // nothing legitimate sends this header twice.
+                        if (key == "content-length" && req.headers.count(key)) {
+                            refuse(s, conn, 400, "duplicate Content-Length");
+                            return;
+                        }
+                        // A request body is Content-Length or nothing: this
+                        // server implements no request-side transfer coding, so
+                        // a body whose extent is described by one cannot be
+                        // framed, and reading the Content-Length beside it (or
+                        // an empty body without one) is how two parties end up
+                        // parsing different messages. RFC 9112 §6.1 suggests
+                        // 501 for a coding a server does not understand; 400 is
+                        // the same refusal the duplicate header gets, and both
+                        // mean "I will not guess where your body ends".
+                        if (key == "transfer-encoding") {
+                            refuse(s, conn, 400, "unsupported Transfer-Encoding");
+                            return;
+                        }
                         req.headers[key] = val;
                     }
                 }
@@ -366,18 +412,26 @@ void HttpServer::serve_client(int fd, HttpHandler handler) {
     size_t body_start = header_end + 4;
     const std::string cl = req.header("content-length");
     if (!cl.empty()) {
+        // A pure decimal length only. atoll() reads "5, 44" or "5abc" as 5 and
+        // silently truncates the body, which is the same ambiguity a duplicated
+        // header exploits.
+        bool digits = true;
+        for (char c : cl)
+            if (c < '0' || c > '9') digits = false;
+        if (!digits) {
+            refuse(s, conn, 400, "invalid Content-Length");
+            return;
+        }
         const long long want = std::atoll(cl.c_str());
-        if (want < 0 || static_cast<size_t>(want) > kMaxBodyBytes) {
-            HttpResponse r;
-            r.status = 413;
-            r.body = "{\"error\":{\"message\":\"request body too large\"}}";
-            http_write_response(conn, r);
-            close_socket(s);
+        if (static_cast<size_t>(want) > kMaxBodyBytes) {
+            refuse(s, conn, 413, "request body too large");
             return;
         }
         while (buf.size() - body_start < static_cast<size_t>(want)) {
             if (!recv_some(s, &buf)) {
-                close_socket(s);
+                // The peer closed before the declared body arrived. Dispatch
+                // nothing: half a JSON document must never reach the engine.
+                refuse(s, conn, 400, "incomplete request body");
                 return;
             }
         }
