@@ -1748,6 +1748,167 @@ static bool set_kv_tiered_budget(Engine &engine, Backend *cpu, const std::string
     return engine.init(cpu, cfg, err);
 }
 
+// ---------------------------------------------------------------------------
+// int8 K/V cache (KvQuant::Int8): the layout, the quantiser and its cost to
+// the attention answer. The reference backend is the oracle -- the device
+// kernels are refused until they read the same layout -- so what this group
+// pins is the contract a quantized cache has to keep, not a kernel.
+// ---------------------------------------------------------------------------
+static void test_kv_quant_int8() {
+    Backend *cpu = make_cpu_backend();
+
+    // 1. The size arithmetic. A kv_dim-wide row is kv_dim bytes plus one f32
+    //    scale per 32 values, and that is strictly smaller than the f32 row it
+    //    replaces at every width a head can have.
+    {
+        const i64 dims[] = {64, 96, 128, 256, 2048};
+        for (i64 dim : dims) {
+            const size_t q8 = cpu->kv_row_bytes(dim, KvQuant::Int8);
+            const size_t f32b = cpu->kv_row_bytes(dim, KvQuant::F16);
+            CHECK(q8 == static_cast<size_t>(dim) + 4 * ((dim + 31) / 32),
+                  "int8 KV row is the data plus one f32 scale per 32 values");
+            CHECK(q8 < f32b, "and that row is smaller than the f32 one it replaces");
+        }
+        CHECK(cpu->kv_quant_supported(KvQuant::Int8),
+              "the CPU reference implements int8 KV");
+    }
+
+    // 2. The quantiser, on a 200-key cache of realistic values: GQA 8/2, hd 64.
+    const i64 hd = 64, n_kv = 2, n_head = 8;
+    const i64 kv_dim = n_kv * hd;
+    const i64 n_pos = 200;
+    const size_t q8_row = cpu->kv_row_bytes(kv_dim, KvQuant::Int8);
+    const size_t f32_row = cpu->kv_row_bytes(kv_dim, KvQuant::F16);
+
+    std::mt19937 rng(1234);
+    std::normal_distribution<f32> nd(0.0f, 1.0f);
+    std::vector<f32> kbuf(static_cast<size_t>(n_pos) * static_cast<size_t>(kv_dim));
+    std::vector<f32> vbuf(kbuf.size());
+    for (auto &x : kbuf) x = nd(rng);
+    for (auto &x : vbuf) x = nd(rng);
+
+    std::vector<u8> q8k(static_cast<size_t>(n_pos) * q8_row, 0xCC); // poisoned
+    std::vector<u8> q8v(q8k.size(), 0xCC);
+    std::vector<u8> fk(static_cast<size_t>(n_pos) * f32_row, 0);
+    std::vector<u8> fv(fk.size(), 0);
+
+    AttnDesc d;
+    d.n_head = n_head;
+    d.n_kv = n_kv;
+    d.hd = hd;
+    d.n_tok = n_pos;
+    d.pos0 = 0;
+    d.layer_stride = 0;
+    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(hd)));
+    d.causal = true;
+    d.window = 0;
+
+    d.kv_int8 = false;
+    d.pos_stride = kv_dim;
+    cpu->kv_append(fk.data(), fv.data(), kbuf.data(), vbuf.data(), d);
+
+    d.kv_int8 = true;
+    d.pos_stride = static_cast<i64>(q8_row);
+    cpu->kv_append(q8k.data(), q8v.data(), kbuf.data(), vbuf.data(), d);
+
+    // 3. Chunk invariance of the QUANTISER: the same 200 rows appended one at a
+    //    time must leave the same bytes as one 200-row call. Per-row, per-32
+    //    scaling is what makes that true, and it is what keeps a chunked
+    //    prefill and a decode step reading the same cache.
+    {
+        std::vector<u8> ck(q8k.size(), 0), cv(q8v.size(), 0);
+        AttnDesc c = d;
+        c.n_tok = 1;
+        for (i64 t = 0; t < n_pos; t++) {
+            c.pos0 = t;
+            cpu->kv_append(ck.data(), cv.data(),
+                           kbuf.data() + t * kv_dim, vbuf.data() + t * kv_dim, c);
+        }
+        CHECK(ck == q8k && cv == q8v,
+              "one-row and 200-row appends quantise to the same cache bytes");
+    }
+
+    // 4. What it costs the answer: one decode row at the end of a 200-key
+    //    context, int8 against the f32 cache it replaces.
+    std::vector<f32> q(static_cast<size_t>(n_head * hd));
+    for (auto &x : q) x = nd(rng);
+    std::vector<f32> out_ref(q.size(), 0.0f), out_q8(q.size(), 0.0f);
+
+    AttnDesc a = d;
+    a.n_tok = 1;
+    a.pos0 = n_pos - 1;
+    a.kv_int8 = false;
+    a.pos_stride = kv_dim;
+    cpu->attention(out_ref.data(), q.data(), fk.data(), fv.data(), a);
+
+    a.kv_int8 = true;
+    a.pos_stride = static_cast<i64>(q8_row);
+    cpu->attention(out_q8.data(), q.data(), q8k.data(), q8v.data(), a);
+
+    f64 num = 0.0, den = 0.0, worst = 0.0;
+    for (size_t i = 0; i < out_ref.size(); i++) {
+        const f64 e = static_cast<f64>(out_q8[i]) - static_cast<f64>(out_ref[i]);
+        num += e * e;
+        den += static_cast<f64>(out_ref[i]) * out_ref[i];
+        worst = std::max(worst, std::fabs(e));
+    }
+    const f64 rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+    std::fprintf(stderr, "  (int8 KV at %lld keys: rel %.5f, worst %.5f)\n",
+                 static_cast<long long>(n_pos), rel, worst);
+    CHECK(std::isfinite(rel) && rel < 0.02,
+          "int8 KV keeps the decode row within 2% of the f32 cache");
+    CHECK(worst < 0.05, "and no single channel moves by more than 0.05");
+    bool finite = true;
+    for (f32 x : out_q8) finite = finite && std::isfinite(x);
+    CHECK(finite, "the quantized path produces no NaN or inf");
+
+    // 5. The arm that keeps 1-4 from being vacuous: the SAME bytes read with the
+    //    wrong layout must disagree. If the int8 flag were ignored, the int8
+    //    row would be f32 data and this divergence would not appear.
+    {
+        std::vector<f32> out_wrong(q.size(), 0.0f);
+        AttnDesc w = a;
+        w.kv_int8 = true;
+        w.pos_stride = static_cast<i64>(q8_row);
+        cpu->attention(out_wrong.data(), q.data(), fk.data(), fv.data(), w);
+        f64 n2 = 0.0, d2 = 0.0;
+        for (size_t i = 0; i < out_wrong.size(); i++) {
+            const f64 e = static_cast<f64>(out_wrong[i]) - static_cast<f64>(out_ref[i]);
+            n2 += e * e;
+            d2 += static_cast<f64>(out_ref[i]) * out_ref[i];
+        }
+        const f64 wrong_rel = d2 > 0.0 ? std::sqrt(n2 / d2) : 0.0;
+        CHECK(wrong_rel > 0.2,
+              "the int8 layout read out of an f32 cache is a different answer");
+    }
+
+    // 6. A zeroed row is a legal row: scale 0, values 0, and the softmax is
+    //    indifferent rather than NaN. (A scale computed as max/127 would divide
+    //    by zero here if the guard were missing.)
+    {
+        std::vector<f32> zk(static_cast<size_t>(kv_dim), 0.0f);
+        std::vector<f32> zv(static_cast<size_t>(kv_dim), 0.0f);
+        AttnDesc z = d;
+        z.n_tok = 1;
+        z.pos0 = n_pos - 1;
+        z.kv_int8 = true;
+        z.pos_stride = static_cast<i64>(q8_row);
+        // pos0 is the LAST row, so the scales land in that row of the cache,
+        // not at its start: the arm reads them where the append wrote them.
+        std::vector<u8> zrow(static_cast<size_t>(z.pos_stride) * static_cast<size_t>(n_pos),
+                             0xCC);
+        cpu->kv_append(zrow.data(), zrow.data(), zk.data(), zv.data(), z);
+        bool zero_scales = true;
+        const f32 *sc = reinterpret_cast<const f32 *>(
+            zrow.data() + static_cast<size_t>(n_pos - 1) * q8_row + kv_dim);
+        for (i64 b = 0; b < (kv_dim + 31) / 32; b++)
+            zero_scales = zero_scales && sc[b] == 0.0f;
+        CHECK(zero_scales, "a zero activation quantises to a zero scale, not a NaN");
+    }
+
+    delete cpu;
+}
+
 static void test_kv_tier_per_layer_widths() {
     const std::string path = "kraken-sparse-kv-test.gguf";
     CHECK(build_sparse_kv_model(path), "wrote the sparse-KV fixture");
@@ -3343,6 +3504,10 @@ static std::string build_verdict_fixture(const std::string &tag, const std::stri
     b.meta_u32(arch + ".block_count", nextn > 0 ? 2 : 1);
     if (nextn > 0) b.meta_u32(arch + ".nextn_predict_layers", static_cast<u32>(nextn));
     const std::vector<f32> data{1.0f, 2.0f, 3.0f, 4.0f};
+    // Every fixture here is a model-shaped file being judged on ONE name, so it
+    // carries the token table: the verdict refuses a file without one, and that
+    // rule has its own arms below.
+    b.tensor_f32("token_embd.weight", {2, 2}, data);
     if (tensor_type == 0)
         b.tensor_f32(tensor, {2, 2}, data);
     else
@@ -3571,6 +3736,84 @@ static void test_load_verdict() {
             if (b.find("#200") != std::string::npos) named = true;
         CHECK(named, "the blocker names the on-disk format id");
         made.push_back(path);
+    }
+
+    // A table pack is not a model. DeepSeek-V4.1-Flash ships its Engram tables
+    // as a separate 103 GiB GGUF: two `blk.N.engram_embd.weight` tensors, an
+    // arch nobody lists, and no stack metadata -- so every rule in this pass
+    // had nothing to object to and the report said `runnable` while the loader
+    // could only ever answer `token_embd.weight is missing`. The rule is about
+    // what the file carries, not what arch string it wears: the second arm here
+    // is the same shape plus an embedding and attention tensor and must stay
+    // runnable.
+    {
+        const std::string path = "kraken-verdict-engram.gguf";
+        GgufBuilder b;
+        b.meta_str("general.architecture", "deepseek41-engram");
+        b.meta_u32("general.alignment", 32);
+        b.meta_str("general.description", "Shared IQ4_NL Engram lookup tables");
+        const std::vector<f32> data{1.0f, 2.0f, 3.0f, 4.0f};
+        b.tensor_f32("blk.1.engram_embd.weight", {2, 2}, data);
+        b.tensor_f32("blk.14.engram_embd.weight", {2, 2}, data);
+        CHECK(b.write(path), "wrote an Engram-style table pack");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "the table pack opens as a container");
+        const ModelVerdict v = assess_model(g);
+        CHECK(!v.runnable, "a file with no embedding and no attention is refused");
+        bool named_embd = false, named_attn = false, named_tensor = false;
+        bool blamed_format = false;
+        for (const std::string &r : v.blockers) {
+            if (r.find("token_embd.weight") != std::string::npos) named_embd = true;
+            if (r.find("attention tensor") != std::string::npos) named_attn = true;
+            if (r.find("engram_embd") != std::string::npos) named_tensor = true;
+            if (r.find("quantization") != std::string::npos) blamed_format = true;
+        }
+        CHECK(named_embd && named_attn, "the reason names both absent halves");
+        CHECK(named_tensor, "and shows the tensors the file does carry");
+        CHECK(!blamed_format, "its well-formed IQ4_NL payload is not blamed");
+        CHECK(v.headline().find("unknown") != std::string::npos,
+              "the arch is still reported as unlisted");
+        made.push_back(path);
+
+        const std::string control = "kraken-verdict-engram-embd.gguf";
+        GgufBuilder c;
+        c.meta_str("general.architecture", "deepseek41-engram");
+        c.meta_u32("general.alignment", 32);
+        c.tensor_f32("token_embd.weight", {2, 2}, data);
+        c.tensor_f32("blk.1.engram_embd.weight", {2, 2}, data);
+        c.tensor_f32("blk.14.engram_embd.weight", {2, 2}, data);
+        CHECK(c.write(control), "wrote the same pack with an embedding");
+        Gguf gc;
+        CHECK(gc.load(control, &err), "the control loads");
+        const ModelVerdict vc = assess_model(gc);
+        CHECK(vc.runnable, "an embedding alone clears the shape rule");
+        CHECK(vc.blockers.empty(), "and nothing else objects");
+        made.push_back(control);
+
+        // The other half of the rule, and the one a name-level pass misses: a
+        // set of attention weights with no token table cannot look anything up.
+        // It is refused for the embedding, and the reason says which kind of
+        // partial file it is rather than calling it a table pack.
+        const std::string attn_only = "kraken-verdict-attn-only.gguf";
+        GgufBuilder a;
+        a.meta_str("general.architecture", "llama");
+        a.meta_u32("general.alignment", 32);
+        a.meta_u32("llama.block_count", 1);
+        a.tensor_f32("blk.0.attn_q.weight", {2, 2}, data);
+        CHECK(a.write(attn_only), "wrote an attention-only extraction");
+        Gguf ga;
+        CHECK(ga.load(attn_only, &err), "the extraction loads");
+        const ModelVerdict va = assess_model(ga);
+        CHECK(!va.runnable, "attention without an embedding is refused");
+        bool said_embd = false, said_partial = false;
+        for (const std::string &r : va.blockers) {
+            if (r.find("token_embd.weight") != std::string::npos) said_embd = true;
+            if (r.find("partial extraction") != std::string::npos) said_partial = true;
+        }
+        CHECK(said_embd, "the reason names the missing token table");
+        CHECK(said_partial, "and distinguishes it from a table pack");
+        made.push_back(attn_only);
     }
 
     for (const std::string &p : made) std::remove(p.c_str());
@@ -5347,6 +5590,37 @@ static void test_expert_cache_policy() {
         }
         CHECK(in_range, "every seeded rank is inside [1, kPinThreshold)");
         CHECK(monotone, "the seed never rises as the rank gets worse");
+    }
+
+    // 10. The re-clamp must not ratchet. `free_bytes` is a device-wide reading
+    //     and a cell this cache evicts goes back to the BACKEND's pool rather
+    //     than to the driver, so the reading does not rise when the cache
+    //     evicts. A cap derived from live residency therefore removed whatever
+    //     had just been evicted, at every clamp: measured 5747 -> 4295 MiB over
+    //     93 tokens on the 288-expert file, and 4697 -> 359 MiB on a longer
+    //     chat. Both arms below are one cache at one residency; only the free
+    //     reading differs, and only a drop somebody else caused may cut.
+    cache.clear(); // hand the backend's pool back before the fixture re-sizes it
+    {
+        ExpertCache clamp;
+        clamp.configure(&be, 90); // three 24-byte experts fit, a fourth does not
+        const auto load = [&](i32 e) { return clamp.acquire(src, 0, e) != nullptr; };
+        for (i32 e = 0; e < 4; e++) CHECK(load(e), "clamp fixture expert is reachable");
+        CHECK(clamp.evictions() > 0,
+              "the clamp fixture over-subscribes its budget, so it evicts");
+        CHECK(clamp.resident_bytes() < clamp.vram_budget(),
+              "and its residency is below the budget -- the state the ratchet fed on");
+        const size_t budget = clamp.vram_budget();
+        CHECK(clamp.reclamp_vram_budget(1000, 2000) == budget,
+              "the first free reading is a baseline, not a cut");
+        CHECK(clamp.reclamp_vram_budget(1000, 2000) == budget,
+              "an evicting pool does not shrink its own budget");
+        CHECK(clamp.reclamp_vram_budget(996, 2000) == budget - 4,
+              "only the drop somebody else caused shrinks it");
+        CHECK(clamp.reclamp_vram_budget(996, 2000) == budget - 4,
+              "and a repeated reading does not shrink it twice");
+        CHECK(clamp.reclamp_vram_budget(3000, 2000) == budget - 4,
+              "free VRAM above the floor never raises or lowers the budget");
     }
 
     cache.clear();
@@ -14833,6 +15107,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_json)
     TEST_GROUP(test_http_server)
     TEST_GROUP(test_par_pool_covers_every_block)
+    TEST_GROUP(test_kv_quant_int8)
     TEST_GROUP(test_kv_tier_per_layer_widths)
     TEST_GROUP(test_kv_tier_no_kv_layers)
     TEST_GROUP(test_kv_tier_drop_vs_spill)

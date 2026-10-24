@@ -43,6 +43,12 @@ static bool cap_working_set(size_t) { return false; }
 #include <limits>
 #include <sys/stat.h> // struct stat, for the GGUF file-size probe
 
+namespace {
+// The configured cache format in the one spelling every call site uses.
+krk::KvQuant kv_quant_of(const krk::EngineConfig &c) {
+    return c.kv_quant == 1 ? krk::KvQuant::Int8 : krk::KvQuant::F16;
+}
+} // namespace
 namespace krk {
 
 namespace {
@@ -1672,6 +1678,34 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // allocated on top of them. Subtracting "what the workspaces will take"
     // is not the same thing as measuring it, and guessing it is how an
     // over-commit happens. So: take the measurement after the fact.
+    // Quantized K/V is validated before the cache is sized: a backend that
+    // cannot read the layout must refuse, not run f16 kernels over int8 bytes
+    // (which produces fluent text rather than an error).
+    const KvQuant kvq = cfg_.kv_quant == 1 ? KvQuant::Int8 : KvQuant::F16;
+    if (kvq == KvQuant::Int8) {
+        if (!be_->kv_quant_supported(kvq)) {
+            // The CPU reference and HIP both answer true: the quantising append
+            // plus all four attention readers, with the cache bytes and the
+            // attention output invariant to the chunk size
+            // (`kraken-bench --bitexact`'s int8 block is the device proof). A
+            // backend that answers false is one with no int8 reader at all, so
+            // this refusal names what is missing rather than borrowing a
+            // reason from the layout's history.
+            *err = "kv-quant int8: this backend has no attention kernels for "
+                   "the int8 cache layout (the CPU reference and HIP implement "
+                   "it)";
+            return false;
+        }
+        if (model_.cfg().mla_layout != MlaLayout::None) {
+            *err = "kv-quant int8: the MLA cache layout has no int8 write/read path";
+            return false;
+        }
+        if (cfg_.mtp_spec || cfg_.mtp_probe || !cfg_.draft_head.empty()) {
+            *err = "kv-quant int8: the nextn/draft block keeps its own KV and has "
+                   "no int8 path; run it with kv-quant f16";
+            return false;
+        }
+    }
     size_t kv_load_bytes = 0; // both planes, for the load report below
     {
         // Per-layer KV bytes. Only the layers that carry q/k/v hold KV at all
@@ -1686,7 +1720,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         for (i32 l = 0; l < mc.n_layer; l++) {
             if (!model_.layer_has_kv(l)) continue;
             const size_t b = static_cast<size_t>(kv_cap_) *
-                             static_cast<size_t>(model_.kv_dim_at(l)) * as;
+                             be_->kv_row_bytes(model_.kv_dim_at(l), kvq);
             kv_len[static_cast<size_t>(l)] = b;
             kv_plane += b;
         }
@@ -2728,6 +2762,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     // here is the workspace bound, and every use after the loop overwrites it.
     d.layer_stride = 0;
     d.pos_stride = kv_dim_;
+    d.kv_int8 = kv_quant_of(cfg_) == KvQuant::Int8;
     d.layer = 0;
     d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(mc.head_dim))) *
               mc.rope_attn_scale;
@@ -2806,6 +2841,12 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         d.n_head = lh;
         d.n_kv = lkvh;
         d.pos_stride = lkv;
+        // The int8 row is kv_dim bytes plus one f32 scale per 32 values, so a
+        // position's stride is the backend's answer for that width, not the
+        // element count. Both the append and the attention read this one number.
+        if (kv_quant_of(cfg_) == KvQuant::Int8)
+            d.pos_stride = static_cast<i64>(be_->kv_row_bytes(lkv, kv_quant_of(cfg_)));
+        d.kv_int8 = kv_quant_of(cfg_) == KvQuant::Int8;
         // A sliding-window layer sees only its last `swa_window` keys; the full
         // layers of the same stack see the whole prefix.
         d.window = (mc.swa_window > 0 && model_.is_swa(l)) ? mc.swa_window : 0;
@@ -3899,7 +3940,7 @@ bool Engine::kv_rollback_zero(i64 pos) {
     }
     for (i64 l = 0; l < model_.cfg().n_layer; l++) {
         if (!model_.layer_has_kv(l)) continue;
-        const size_t row = static_cast<size_t>(model_.kv_dim_at(l)) * as;
+        const size_t row = be_->kv_row_bytes(model_.kv_dim_at(l), cfg_.kv_quant == 1 ? KvQuant::Int8 : KvQuant::F16);
         u8 *kb = static_cast<u8 *>(kbase[static_cast<size_t>(l)]) +
                  static_cast<size_t>(pos) * row;
         u8 *vb = static_cast<u8 *>(vbase[static_cast<size_t>(l)]) +

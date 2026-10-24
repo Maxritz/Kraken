@@ -54,6 +54,12 @@ struct EngineConfig {
     i32 kv_hot_mb = 0;
     i32 kv_warm_mb = 0;
     std::string kv_cold_dir;
+    // K/V cache element format. 0 = f16/f32 (the default, and the only arm any
+    // model ran before this existed: its arithmetic is unchanged). 1 = int8
+    // with one f32 scale per 32 values, see KvQuant in backend.hpp. The CPU
+    // reference implements both; a backend that cannot read the layout refuses
+    // the run by name instead of running f16 kernels over int8 bytes.
+    i32 kv_quant = 0;
 
     // Dense weight budget in MiB. 0 (the default) is automatic: weights stay
     // resident while they fit, and whole layers are streamed from the file once

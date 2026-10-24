@@ -1679,9 +1679,216 @@ BitExact attn_rows_case(Backend *be, const AttnCase &c, i64 n_tok, i64 n_keys) {
     return r;
 }
 
+// ---- int8 K/V --------------------------------------------------------------
+//
+// Two separate claims, measured separately because they fail for different
+// reasons:
+//   1. the CACHE BYTES of a position must not depend on how many rows were in
+//      the append call (a chunked prefill appends n rows at once, a decode step
+//      appends one);
+//   2. ATTENTION over that cache must not depend on how many QUERY rows shared
+//      a call (decode: one row per launch; prefill: N rows in one launch).
+// Claim 1 is the quantiser's arithmetic; claim 2 is the kernel's reduction
+// order. A failure in either makes a model's text depend on the chunk size, so
+// for this layout both are enforced here rather than merely printed: the whole
+// point of a cache mode is that it does not change the token stream.
+struct Q8Bytes {
+    i64 differ = 0;
+    i64 n = 0;
+};
+
+Q8Bytes cmp_bytes(const std::vector<u8> &a, const std::vector<u8> &b) {
+    Q8Bytes r;
+    r.n = static_cast<i64>(std::min(a.size(), b.size()));
+    for (size_t i = 0; i < static_cast<size_t>(r.n); i++)
+        if (a[i] != b[i]) r.differ++;
+    if (a.size() != b.size()) r.differ += 1; // a size mismatch is never equal
+    return r;
+}
+
+// A value pattern with a wide per-row dynamic range: a block whose scale tracks
+// the wrong row (or the wrong half of one) cannot look right by luck.
+void q8_fill(std::vector<u16> &dst, u32 seed, i64 row_width) {
+    u32 rng = seed;
+    for (size_t i = 0; i < dst.size(); i++) {
+        rng = rng * 1103515245u + 12345u;
+        const i64 row = static_cast<i64>(i) / row_width;
+        const f32 amp = 0.05f + 0.95f * static_cast<f32>((row * 7) % 11) / 10.0f;
+        const f32 f = static_cast<f32>((rng >> 20) & 0xff) / 255.0f - 0.5f;
+        dst[i] = fp32_to_fp16(f * amp);
+    }
+}
+
+// Append n_rows in ONE call against n_rows calls of one row, then compare the
+// whole cache. `n_rows` is the prefill chunk size under test.
+Q8Bytes attn_q8_append_case(Backend *be, const AttnCase &c, i64 n_rows) {
+    const i64 kv_dim = c.n_kv * c.hd;
+    const size_t row_bytes = be->kv_row_bytes(kv_dim, KvQuant::Int8);
+    std::vector<u16> k(static_cast<size_t>(n_rows) * static_cast<size_t>(kv_dim));
+    std::vector<u16> v(k.size());
+    q8_fill(k, 23u, kv_dim);
+    q8_fill(v, 29u, kv_dim);
+
+    void *kd = be->alloc(k.size() * 2);
+    void *vd = be->alloc(v.size() * 2);
+    const size_t cache_bytes = row_bytes * static_cast<size_t>(n_rows);
+    void *ka = be->alloc(cache_bytes);
+    void *va = be->alloc(cache_bytes);
+    void *kb = be->alloc(cache_bytes);
+    void *vb = be->alloc(cache_bytes);
+    be->upload(kd, k.data(), k.size() * 2, 0);
+    be->upload(vd, v.data(), v.size() * 2, 0);
+
+    AttnDesc d;
+    d.n_head = c.n_head;
+    d.n_kv = c.n_kv;
+    d.hd = c.hd;
+    d.layer = 0;
+    d.layer_stride = 0;
+    d.pos_stride = static_cast<i64>(row_bytes);
+    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(c.hd)));
+    d.causal = true;
+    d.window = 0;
+    d.kv_int8 = true;
+
+    d.n_tok = n_rows;
+    d.pos0 = 0;
+    be->kv_append(ka, va, kd, vd, d);
+    for (i64 r = 0; r < n_rows; r++) {
+        d.n_tok = 1;
+        d.pos0 = r;
+        be->kv_append(kb, vb,
+                      static_cast<const u8 *>(kd) + static_cast<size_t>(r) *
+                                                        static_cast<size_t>(kv_dim) * 2,
+                      static_cast<const u8 *>(vd) + static_cast<size_t>(r) *
+                                                        static_cast<size_t>(kv_dim) * 2,
+                      d);
+    }
+
+    std::vector<u8> ca(cache_bytes), va2(cache_bytes), cb(cache_bytes), vb2(cache_bytes);
+    be->download(ca.data(), ka, ca.size());
+    be->download(va2.data(), va, va2.size());
+    be->download(cb.data(), kb, cb.size());
+    be->download(vb2.data(), vb, vb2.size());
+    Q8Bytes r = cmp_bytes(ca, cb);
+    const Q8Bytes rv = cmp_bytes(va2, vb2);
+    r.differ += rv.differ;
+    if (rv.n != r.n) r.differ += 1;
+
+    be->release(kd);
+    be->release(vd);
+    be->release(ka);
+    be->release(va);
+    be->release(kb);
+    be->release(vb);
+    return r;
+}
+
+// The same decode-against-prefill comparison as attn_rows_case, over an int8
+// cache: the cache is written once by a single append (claim 1 is measured
+// above), then the same query rows run once as n_tok calls of one row and once
+// as a single call of n_tok rows.
+BitExact attn_q8_rows_case(Backend *be, const AttnCase &c, i64 n_tok, i64 n_keys) {
+    const i64 kv_dim = c.n_kv * c.hd;
+    const size_t row_bytes = be->kv_row_bytes(kv_dim, KvQuant::Int8);
+    const size_t qsz = static_cast<size_t>(n_tok) *
+                       static_cast<size_t>(c.n_head) *
+                       static_cast<size_t>(c.hd);
+    const size_t ksz = static_cast<size_t>(n_keys) *
+                       static_cast<size_t>(c.n_kv) *
+                       static_cast<size_t>(c.hd);
+    std::vector<u16> q(qsz), k(ksz), v(ksz);
+    auto fill = [](std::vector<u16> &dst, u32 seed) {
+        u32 rng = seed;
+        for (u16 &h : dst) {
+            rng = rng * 1103515245u + 12345u;
+            const f32 f = static_cast<f32>((rng >> 20) & 0xff) / 255.0f - 0.5f;
+            h = fp32_to_fp16(f * 0.5f);
+        }
+    };
+    fill(q, 7u);
+    fill(k, 11u);
+    fill(v, 13u);
+
+    void *qd = be->alloc(q.size() * 2);
+    void *kd = be->alloc(k.size() * 2);
+    void *vd = be->alloc(v.size() * 2);
+    void *o1 = be->alloc(qsz * 2);
+    void *on = be->alloc(qsz * 2);
+    const size_t cache_bytes = row_bytes * static_cast<size_t>(n_keys);
+    void *kc = be->alloc(cache_bytes);
+    void *vc = be->alloc(cache_bytes);
+    be->upload(qd, q.data(), q.size() * 2, 0);
+    be->upload(kd, k.data(), k.size() * 2, 0);
+    be->upload(vd, v.data(), v.size() * 2, 0);
+
+    AttnDesc d;
+    d.n_head = c.n_head;
+    d.n_kv = c.n_kv;
+    d.hd = c.hd;
+    d.layer = 0;
+    d.layer_stride = 0;
+    d.pos_stride = static_cast<i64>(row_bytes);
+    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(c.hd)));
+    d.causal = true;
+    d.window = 0;
+    d.kv_int8 = true;
+    d.n_tok = n_keys;
+    d.pos0 = 0;
+    be->kv_append(kc, vc, kd, vd, d);
+
+    const i64 pos0 = n_keys - n_tok;
+    const size_t row_elems = static_cast<size_t>(c.n_head) * static_cast<size_t>(c.hd);
+    for (i64 r = 0; r < n_tok; r++) {
+        d.n_tok = 1;
+        d.pos0 = pos0 + r;
+        be->attention(static_cast<u8 *>(o1) + static_cast<size_t>(r) * row_elems * 2,
+                      static_cast<const u8 *>(qd) + static_cast<size_t>(r) * row_elems * 2,
+                      kc, vc, d);
+    }
+    d.n_tok = n_tok;
+    d.pos0 = pos0;
+    be->attention(on, qd, kc, vc, d);
+
+    std::vector<u16> a(qsz), b(qsz);
+    be->download(a.data(), o1, a.size() * 2);
+    be->download(b.data(), on, b.size() * 2);
+    const BitExact r = cmp_half(a, b, static_cast<i64>(qsz));
+    be->release(qd);
+    be->release(kd);
+    be->release(vd);
+    be->release(o1);
+    be->release(on);
+    be->release(kc);
+    be->release(vc);
+    return r;
+}
+
+void print_q8_bytes(const char *tag, i64 n_rows, i64 row_bytes, const Q8Bytes &r) {
+    if (r.differ == 0) {
+        std::printf("  %-14s %-5s rows=%-3lld row_bytes=%-4lld  IDENTICAL "
+                    "(%lld bytes)\n",
+                    "kv_append-i8", tag, static_cast<long long>(n_rows),
+                    static_cast<long long>(row_bytes),
+                    static_cast<long long>(r.n));
+    } else {
+        std::printf("  %-14s %-5s rows=%-3lld row_bytes=%-4lld  DIFFERS "
+                    "%lld/%lld bytes\n",
+                    "kv_append-i8", tag, static_cast<long long>(n_rows),
+                    static_cast<long long>(row_bytes),
+                    static_cast<long long>(r.differ),
+                    static_cast<long long>(r.n));
+    }
+}
+
 // Returns how many (kernel, rows) cases differ. It is printed, not enforced:
 // a last-bit difference is a property of the arithmetic, not a broken kernel,
 // and --gate must keep meaning "wrong or NaN", not "not chunk-invariant".
+//
+// The int8 K/V arms are the exception, and return a non-zero count: an int8
+// cache whose bytes or whose attention output depend on the chunk size is not a
+// layout with a rounding property, it is a cache mode that changes the token
+// stream -- which is exactly what --kv-quant int8 is refused for.
 i64 arm_rows_bitexact(Backend *be) {
     struct Case {
         const char *what;
@@ -1772,13 +1979,58 @@ i64 arm_rows_bitexact(Backend *be) {
             }
         }
     }
+    // ---- int8 K/V: both claims, per kernel -------------------------------
+    //
+    // Only the layouts whose decode path exists (64/128/256) are on the f16
+    // case list already; the int8 arms run the same three so a width's absence
+    // cannot read as a pass.
+    std::printf("\nint8 K/V (row = kv_dim + one f32 per 32 values): cache bytes "
+                "per append arity, then attention per call:\n");
+    const i64 q8_rows[] = {2, 4, 8};
+    i64 q8_bad = 0;
+    i64 q8_arms = 0;
+    for (const AttnCase &c : attn) {
+        char tag[32];
+        std::snprintf(tag, sizeof tag, "hd%lld/%lldh",
+                      static_cast<long long>(c.hd),
+                      static_cast<long long>(c.n_head));
+        const size_t row_bytes = be->kv_row_bytes(c.n_kv * c.hd, KvQuant::Int8);
+        for (i64 nrows : q8_rows) {
+            const Q8Bytes a = attn_q8_append_case(be, c, nrows);
+            q8_arms++;
+            if (a.differ) q8_bad++;
+            print_q8_bytes(tag, nrows, static_cast<i64>(row_bytes), a);
+        }
+        for (i64 n_keys : attn_keys) {
+            for (i64 nrows : q8_rows) {
+                const BitExact r = attn_q8_rows_case(be, c, nrows, n_keys);
+                q8_arms++;
+                if (r.differ) q8_bad++;
+                print_bitexact("attn-i8", tag, c.n_head * c.hd, n_keys, nrows,
+                               nrows - 1, r);
+            }
+        }
+    }
     std::printf("\n%d of the (kernel, rows) cases are not bit-identical to the "
                 "decode row. A case that differs here is a case where a prefill "
                 "or a speculative verify writes different bytes than a decode "
                 "step for the same input, so the model's text cannot be "
                 "chunk-invariant on top of it.\n",
                 static_cast<int>(differing));
-    return 0; // informational: --gate means wrong/NaN, not "not invariant"
+    if (q8_bad) {
+        std::printf("\n%d int8 K/V arm(s) are NOT chunk-invariant. An int8 cache "
+                    "that changes bytes or output with the chunk size cannot be "
+                    "answered as supported; this arm is enforced, unlike the f16 "
+                    "rows above.\n",
+                    static_cast<int>(q8_bad));
+    } else {
+        std::printf("\nint8 K/V: %lld of %lld arms identical -- a chunked prefill "
+                    "and a decode step agree on the cache bytes and on the "
+                    "attention output for the same input.\n",
+                    static_cast<long long>(q8_arms),
+                    static_cast<long long>(q8_arms));
+    }
+    return q8_bad; // the int8 layout is enforced; the f16 rows stay informational
 }
 
 // Host->device copy rate, measured on the shapes the expert path actually
@@ -3706,10 +3958,17 @@ int main(int argc, char **argv) {
 
     // clean exit path only when every test group has returned.
     delete be;
-    if (gate && failures) {
+    // `--bitexact` is an ENFORCING flag for its int8 K/V arms: those return a
+    // non-zero count when the quantised cache's bytes or its attention output
+    // depend on the chunk size, which is a cache mode that changes the token
+    // stream rather than a rounding property. The f16 rows in the same report
+    // stay informational (they return 0), so this arm cannot turn "rows 9+
+    // differ by 1 ulp" into a failure -- see the note on arm_rows_bitexact.
+    if (failures && (gate || bitexact)) {
         std::fprintf(stderr,
                      "\nGATE FAILED: %lld check(s) outside tolerance, or NaN/inf, "
-                     "or a logits_topk mismatch\n",
+                     "or a logits_topk mismatch, or an int8 K/V arm that is not "
+                     "chunk-invariant\n",
                      static_cast<long long>(failures));
         return 1;
     }

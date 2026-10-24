@@ -28,6 +28,7 @@ struct Args {
     bool port_set = false;  // distinguishes the flag from the default
     int ctx = 4096;
     int chunk = 256;
+    int kv_quant = 0;  // 0 = f16 KV, 1 = int8 (EngineConfig::kv_quant)
     bool prefill_fast = false; // --prefill fast: rows>1 GEMM on the matrix cores
     int device = 0;
     int threads = 0;
@@ -61,6 +62,9 @@ void usage() {
         "  --port N              TCP port (default $KRK_PORT, else 8080)\n"
         "  --ctx N               KV capacity in tokens (default 4096)\n"
         "  --chunk N             prefill batch size (default 256)\n"
+        "  --kv-quant f16|int8   K/V cache format (default f16): int8 is 1.8x smaller\n"
+        "                        and refuses on a backend whose attention kernels do\n"
+        "                        not read the layout\n"
         "  --prefill exact|fast  exact (default) keeps every prompt row's\n"
         "                        arithmetic independent of --chunk; fast takes\n"
         "                        the rows>1 GEMM to the RDNA4 matrix cores\n"
@@ -127,6 +131,16 @@ bool parse(int argc, char **argv, Args *a) {
             a->port_set = true;
         }
         else if (f == "--ctx") a->ctx = std::atoi(next("--ctx"));
+        else if (f == "--kv-quant") {
+            const std::string v = next("--kv-quant");
+            if (v == "int8") a->kv_quant = 1;
+            else if (v == "f16") a->kv_quant = 0;
+            else {
+                std::fprintf(stderr, "kraken-server: --kv-quant needs f16|int8, got '%s'\n",
+                             v.c_str());
+                return false;
+            }
+        }
         else if (f == "--chunk") a->chunk = std::atoi(next("--chunk"));
         else if (f == "--threads") a->threads = std::atoi(next("--threads"));
         else if (f == "--device") a->device = std::atoi(next("--device"));
@@ -218,6 +232,7 @@ int main(int argc, char **argv) {
     cfg.model_path = a.model;
     cfg.n_ctx = a.ctx;
     cfg.prefill_chunk = a.chunk;
+    cfg.kv_quant = a.kv_quant;
     cfg.threads = a.threads;
     cfg.expert_cache_mb = a.expert_cache_mb;
     cfg.expert_cache_slots = a.expert_cache_slots;

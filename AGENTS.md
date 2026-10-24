@@ -287,6 +287,36 @@ code, the README, or `docs/`.
   `gemv_m` re-reads the whole matrix per 8-row group, i.e. 32 passes over the
   weights for a 256-row prefill. A windowed (SWA) layer also stays on the tiled
   attention kernel by construction, for the `j_lo` reason above.
+- **The int8 K/V cache is chunk-invariant on the device now, and the defect was a
+  reduction order.** `--kv-quant int8` had every reader implemented and still
+  produced three different hashes for one prompt (chunk 2 == chunk 4, chunk 1 and
+  8 elsewhere), which is why `kv_quant_supported(Int8)` refused it. The cache
+  bytes were never the problem: `kv_append_i8_kernel` quantises per (token,
+  plane) row, and 200 rows one at a time are byte-identical to one 200-row append
+  (the CPU group pins exactly that). The difference was the DECODE lane's dot:
+  `attn_lane_dot_q8` summed `q[e] * dequant(k[e])` as a per-element f32 FMA chain
+  while the tiled and bit-exact paths consumed dequantised PAIRS through one
+  `v_dot2_f32_f16` -- same terms, different rounding, up to one f16 ulp per
+  channel. Decode now builds the pair in a register and calls the same
+  instruction, and one 21-token prompt (`smolcode-coder-cpp-1.5b-q4_k_m`) gives a
+  single hash at `--chunk 1, 2, 4, 8` and `16`: trace `6d4758c0c4754be0` /
+  logits `dc6d7126d56225fb`, first token 576, against f16's
+  `2cb4e7fc46508835` / `67f95a7185846df2` with the same first token. 24 greedy
+  tokens are byte-identical text between the two formats. MLA and the
+  nextn/draft block stay refused for int8 by name (they own their caches).
+  **The arm is per kernel, in `kraken-bench --bitexact`, and it is enforced.** Two
+  claims, measured separately because they fail for different reasons: a
+  position's cache bytes must not depend on the append's arity (one 8-row append
+  against eight one-row appends, byte-exact) and attention must not depend on the
+  query-row count (decode rows against one prefill call). 27 of 27 identical at
+  hd 64/128/256, rows 2/4/8, 64 and 200 keys; `KRK_ATTN_BEXACT=0` makes 17 of 27
+  differ by 1 ulp, which is the red construction, and `--bitexact` exits non-zero
+  when any int8 arm differs. **That exit status is the part that had to be
+  built**: `failures += arm_rows_bitexact(be)` returned 0 by design, and the only
+  conversion to a failure was `gate && failures`, so a run could print
+  `17 int8 K/V arm(s) are NOT chunk-invariant` and still exit 0.
+  Gate: suite 4122/4122 in 86 groups, baseline `no regression`, `build_check.sh`
+  0 failed (fingerprint re-recorded for the relink), `kraken-bench --gate` rc=0.
 - **Concurrency is only safe because every group is self-contained, and the
   runner now enforces both halves of that.** Each child gets its own working
   directory (`<TEMP or TMPDIR>/krk-tests-<pid>/krk-tests-group-N.dir`) -- every fixture path in

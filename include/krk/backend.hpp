@@ -96,6 +96,20 @@ struct DeviceCaps {
 // geometry passed to the attention kernel
 // ---------------------------------------------------------------------------
 
+// How the K/V cache stores each element. F16 (the default, and the only arm
+// any model ran before this existed) keeps the row as the backend's activation
+// type. Int8 stores `kv_dim` signed bytes followed by one f32 scale per 32
+// values, so a row is `kv_dim + 4*ceil(kv_dim/32)` bytes whatever the backend's
+// activation type is -- the layout is the same on the CPU reference and on the
+// device, which is what makes the CPU arm an oracle for the kernel.
+//
+// Why: at a long context the cache stops being a rounding error and starts
+// taking the VRAM the expert tier needs (measured: a 128k run re-clamped its
+// expert pool 4697 -> 359 MiB as the KV tier grew). Int8 is 1.78x smaller at
+// 32-wide blocks (1 byte + 4/32) against f16's 2, and 3.6x against the CPU
+// reference's f32.
+enum class KvQuant : i32 { F16 = 0, Int8 = 1 };
+
 struct AttnDesc {
     i64 n_head = 0;        // query heads
     i64 n_kv = 0;          // key/value heads (GQA)
@@ -133,6 +147,10 @@ struct AttnDesc {
     // arithmetic bit for bit, and exact zeros are the only values for which
     // that and the formula can both hold.
     const f32 *sinks = nullptr;
+    // Cache element format. False is f16 (or f32 on the CPU reference) and is
+    // bit-identical to the pre-feature arithmetic: every int8 path is guarded
+    // by this flag, so a run that never sets it cannot change.
+    bool kv_int8 = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -842,6 +860,22 @@ public:
     // out[n_tok, n_head*hd] = softmax(q K^T / sqrt(hd)) V
     virtual void attention(void *out, const void *q, const void *kcache,
                            const void *vcache, const AttnDesc &d) = 0;
+
+    // Quantized KV. A backend that cannot read a format says so instead of
+    // running the f16 path over int8 bytes, which would be fluent nonsense:
+    // Engine::init refuses the run by name when this answers false.
+    virtual bool kv_quant_supported(KvQuant q) const {
+        return q == KvQuant::F16;
+    }
+
+    // Bytes of ONE position's K row (V is the same width) for this backend and
+    // format. The engine sizes the cache and the tier slices from this, so a
+    // backend that adds a format has one number to answer for instead of
+    // every call site learning the layout.
+    virtual size_t kv_row_bytes(i64 kv_dim, KvQuant q) const {
+        (void)q;
+        return static_cast<size_t>(kv_dim) * act_size();
+    }
 
     // ---- multi-head latent attention (see MlaDesc above) ------------------
     // A backend that cannot run MLA says so, and the engine refuses the file

@@ -35,6 +35,7 @@ number in this whole document.
 | Symptom | Cause | Where |
 |---|---|---|
 | `cannot run this file` + blockers | Arch not implemented, or a tensor names an unimplemented piece | `src/verdict.hpp` |
+| `carries no token embedding (token_embd.weight) and no attention tensor` | the file is not a model — an Engram/lookup table pack beside one, a tokenizer artifact, a partial download | `assess_model` shape rule, `src/verdict.cpp` |
 | `architecture 'X': ... (known: ...)` warning, model still runs | Unknown llama-schema variant | `verdict.hpp` notes |
 | Loads, then decodes nonsense | Geometry misread (head count, head dim, rope base) | `Model::load`, `src/model.cpp` |
 | Missing `blk.N.ssm_*` | MTP blocks counted as layers | `cfg_.n_layer_nextn` |

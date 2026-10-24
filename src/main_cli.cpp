@@ -32,6 +32,7 @@ struct Args {
     int max_tokens = 256;
     int ctx = 4096;
     int chunk = 256;
+    int kv_quant = 0; // 0 = f16 KV, 1 = int8 (see EngineConfig::kv_quant)
     int device = 0;
     int threads = 0;
     int expert_cache_mb = 0;    // MoE expert residency budget (MiB), 0 = auto
@@ -112,6 +113,11 @@ void usage() {
         "  --max-tokens N        tokens to generate (default 256)\n"
         "  --ctx N               KV capacity in tokens (default 4096)\n"
         "  --chunk N             prefill batch size (default 256)\n"
+        "  --kv-quant f16|int8   K/V cache format (default f16). int8 stores each\n"
+        "                        row as bytes plus one f32 scale per 32 values, 1.8x\n"
+        "                        smaller; both backends implement it, and on the card\n"
+        "                        decode and prefill agree bit for bit (MLA and the\n"
+        "                        nextn/draft block are still refused by name)\n"
         "  --temp F              sampling temperature, 0 = greedy (default 0.8)\n"
         "  --top-k N             top-k cutoff (default 40)\n"
         "  --top-p F             nucleus cutoff (default 0.95)\n"
@@ -328,6 +334,15 @@ bool parse(int argc, char **argv, Args *a) {
             a->draft_head_prime = std::atoi(next("--draft-head-prime"));
         else if (f == "--max-tokens" || f == "-n") a->max_tokens = std::atoi(next("--max-tokens"));
         else if (f == "--ctx" || f == "-c") a->ctx = std::atoi(next("--ctx"));
+        else if (f == "--kv-quant") {
+            const std::string v = next("--kv-quant");
+            if (v == "int8") a->kv_quant = 1;
+            else if (v == "f16") a->kv_quant = 0;
+            else {
+                std::fprintf(stderr, "kraken: --kv-quant needs f16|int8, got '%s'", v.c_str());
+                return 2;
+            }
+        }
         else if (f == "--chunk") a->chunk = std::atoi(next("--chunk"));
         else if (f == "--temp") a->temp = static_cast<f32>(std::atof(next("--temp")));
         else if (f == "--top-k") a->top_k = std::atoi(next("--top-k"));
@@ -1254,6 +1269,7 @@ int main(int argc, char **argv) {
     cfg.model_path = a.model;
     cfg.n_ctx = a.ctx;
     cfg.prefill_chunk = a.chunk;
+    cfg.kv_quant = a.kv_quant;
     cfg.trace_hash = a.prefill_hash;
     cfg.threads = a.threads;
     cfg.seed = a.seed;

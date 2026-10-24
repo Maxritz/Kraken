@@ -3141,9 +3141,47 @@ public:
             static_cast<const _Float16 *>(wo_b), d.n_embd, d.gout());
     }
 
+    // Both layouts. The int8 row is quantised by kv_append_i8_kernel and read
+    // by the tiled, bit-exact, decode and decode-split kernels through
+    // attn_kv_at_q8, and the two claims that matter are measured per kernel by
+    // `kraken-bench --bitexact` (27 of 27 arms):
+    //   * the cache bytes of a position do not depend on the append's arity
+    //     (one 8-row append against eight single-row appends, byte-exact), and
+    //   * attention over that cache does not depend on the query-row count
+    //     (decode rows against one prefill call, f16-exact).
+    // The second one needed a kernel fix, not a test tweak: the int8 decode
+    // lane did its dot as a per-element f32 FMA chain while the staged prefill
+    // consumed dequantised PAIRS through one v_dot2_f32_f16, so the two paths
+    // differed by up to one f16 ulp per channel and a chunk-1 run drifted from
+    // a chunk-8 run over identical cache bytes. Decode now builds the same
+    // pair and calls the same instruction (attn_lane_dot_q8).
+    bool kv_quant_supported(KvQuant q) const override {
+        return q == KvQuant::F16 || q == KvQuant::Int8;
+    }
+
+    size_t kv_row_bytes(i64 kv_dim, KvQuant q) const override {
+        if (q != KvQuant::Int8) return Backend::kv_row_bytes(kv_dim, q);
+        const size_t blocks = static_cast<size_t>((kv_dim + 31) / 32);
+        return static_cast<size_t>(kv_dim) + blocks * sizeof(f32);
+    }
+
     void kv_append(void *kcache, void *vcache, const void *k, const void *v,
                    const AttnDesc &d) override {
         KRK_TIME_OP("kv_append");
+        if (d.kv_int8) {
+            u8 *kc = static_cast<u8 *>(kcache) + d.layer * d.layer_stride;
+            u8 *vc = static_cast<u8 *>(vcache) + d.layer * d.layer_stride;
+            const i64 kv_dim = d.n_kv * d.hd;
+            const i64 blocks = (kv_dim + 31) / 32;
+            const i64 total = d.n_tok * 2 * blocks;
+            const unsigned nb = static_cast<unsigned>((total + 255) / 256);
+            stage_pos(d.pos0);
+            kv_append_i8_kernel<<<nb, 256>>>(
+                kc, vc, static_cast<const _Float16 *>(k),
+                static_cast<const _Float16 *>(v), pos_dev_, d.n_tok, kv_dim,
+                d.pos_stride);
+            return;
+        }
         _Float16 *kc = static_cast<_Float16 *>(kcache) + d.layer * d.layer_stride;
         _Float16 *vc = static_cast<_Float16 *>(vcache) + d.layer * d.layer_stride;
         const i64 total = d.n_tok * d.pos_stride;
@@ -3158,6 +3196,11 @@ public:
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {
         KRK_TIME_OP("attention");
+        // A negative stride is how the kernels are told the row is int8: they
+        // own the layout (attn_kv_row_bytes / attn_kv_at_q8 in
+        // kernels/attention.hpp) and the engine sizes d.pos_stride from
+        // kv_row_bytes, so the two cannot disagree.
+        const i64 pstride = d.kv_int8 ? -d.pos_stride : d.pos_stride;
         const void *kc =
             static_cast<const _Float16 *>(kcache) + d.layer * d.layer_stride;
         const void *vc =
@@ -3212,7 +3255,7 @@ public:
                 part = attn_part_;
             }
             attention_decode(out, q, kc, vc, d.n_head, d.n_kv, d.hd,
-                             pos_dev_, d.pos_stride, d.causal ? 1 : 0,
+                             pos_dev_, pstride, d.causal ? 1 : 0,
                              d.window, d.scale, nullptr, part, n_split,
                              caps_.cu_count, d.sinks);
             return;
@@ -3225,7 +3268,7 @@ public:
         if (d.n_tok > 1 && d.causal && d.window == 0 && attn_bexact_on() &&
             attn_bexact_supported(d.hd)) {
             attention_bexact(out, q, kc, vc, d.n_head, d.n_kv, d.hd, d.n_tok,
-                             d.pos0, d.pos_stride, d.scale, caps_.lds_bytes,
+                             d.pos0, pstride, d.scale, caps_.lds_bytes,
                              nullptr, d.sinks);
             return;
         }
@@ -3248,7 +3291,7 @@ public:
         attention_kernel<<<grid, kAttnBlock, smem>>>(
             static_cast<_Float16 *>(out), static_cast<const _Float16 *>(q),
             static_cast<const _Float16 *>(kc), static_cast<const _Float16 *>(vc),
-            d.n_head, d.n_kv, d.hd, d.n_tok, d.pos0, d.pos_stride, d.causal ? 1 : 0,
+            d.n_head, d.n_kv, d.hd, d.n_tok, d.pos0, pstride, d.causal ? 1 : 0,
             d.window, d.scale, tile_k, d.sinks);
     }
 
@@ -3268,7 +3311,7 @@ public:
         // it too. Anything else keeps the separate rope() + kv_append() +
         // attention() chain the engine runs as the fallback.
         if (d.n_tok != 1 || !attn_fused_decode_supported(d.hd) ||
-            !attn_fused_ || d.window > 0)
+            !attn_fused_ || d.window > 0 || d.kv_int8)
             return false;
         // A sink model takes the separate chain: the fused kernel folds rope,
         // append and attention into one launch, and folding a sink in means

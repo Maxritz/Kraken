@@ -279,8 +279,61 @@ public:
         }
     }
 
+    // Int8 cache: the row is `kv_dim` signed bytes followed by one f32 scale
+    // per 32 of them. The workspace rows are still f32 and still `kv_dim`
+    // wide, so the SOURCE stride is the head width while the DESTINATION
+    // stride is d.pos_stride (the quantized row size). Quantising per row per
+    // 32 means the same activation always produces the same bytes, whatever
+    // chunk it arrived in: that is what keeps a chunked prefill and a decode
+    // step agreeing on a quantized cache.
+    bool kv_quant_supported(KvQuant q) const override {
+        return q == KvQuant::F16 || q == KvQuant::Int8;
+    }
+
+    size_t kv_row_bytes(i64 kv_dim, KvQuant q) const override {
+        if (q == KvQuant::F16) return static_cast<size_t>(kv_dim) * sizeof(f32);
+        const size_t blocks = static_cast<size_t>((kv_dim + 31) / 32);
+        return static_cast<size_t>(kv_dim) + blocks * sizeof(f32);
+    }
+
     void kv_append(void *kcache, void *vcache, const void *k, const void *v,
                    const AttnDesc &d) override {
+        if (d.kv_int8) {
+            const i64 kv_dim = d.n_kv * d.hd;
+            u8 *kc = static_cast<u8 *>(kcache) + d.layer * d.layer_stride;
+            u8 *vc = static_cast<u8 *>(vcache) + d.layer * d.layer_stride;
+            const f32 *ks = static_cast<const f32 *>(k);
+            const f32 *vs = static_cast<const f32 *>(v);
+            // K rows and V rows are disjoint destinations.
+            par_for(2 * d.n_tok, 1,
+                    4.0 * static_cast<f64>(d.n_tok) * static_cast<f64>(kv_dim),
+                    [&](i64 b, i64 e) {
+                        for (i64 u = b; u < e; u++) {
+                            const bool is_v = u >= d.n_tok;
+                            const i64 t = is_v ? u - d.n_tok : u;
+                            const f32 *src = (is_v ? vs : ks) + t * kv_dim;
+                            u8 *row =
+                                (is_v ? vc : kc) + (d.pos0 + t) * d.pos_stride;
+                            f32 *sc = reinterpret_cast<f32 *>(row + kv_dim);
+                            for (i64 o = 0; o < kv_dim; o += 32) {
+                                const i64 nn = std::min<i64>(32, kv_dim - o);
+                                f32 mx = 0.0f;
+                                for (i64 i = 0; i < nn; i++)
+                                    mx = std::max(mx, std::fabs(src[o + i]));
+                                const f32 s = mx > 0.0f ? mx / 127.0f : 0.0f;
+                                sc[o / 32] = s;
+                                const f32 inv = s > 0.0f ? 1.0f / s : 0.0f;
+                                for (i64 i = 0; i < nn; i++) {
+                                    const f32 qv = src[o + i] * inv;
+                                    i64 r = static_cast<i64>(std::lround(qv));
+                                    r = std::max<i64>(-127, std::min<i64>(127, r));
+                                    row[o + i] = static_cast<u8>(static_cast<i8>(r));
+                                }
+                            }
+                        }
+                    });
+            return;
+        }
         f32 *kc = static_cast<f32 *>(kcache) + d.layer * d.layer_stride;
         f32 *vc = static_cast<f32 *>(vcache) + d.layer * d.layer_stride;
         const f32 *ks = static_cast<const f32 *>(k);
@@ -322,6 +375,80 @@ public:
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {
         const i64 n_rep = d.n_kv > 0 ? d.n_head / d.n_kv : 1;
+        if (d.kv_int8) {
+            // Same formulation as the f32 path, reading (signed byte x scale)
+            // instead of a float. The dequantised value is what the dot and the
+            // value accumulation consume, so the only difference from f16 is
+            // the 8-bit quantisation of the cached activation itself.
+            const i64 kv_dim = d.n_kv * d.hd;
+            const f32 *qf = static_cast<const f32 *>(q);
+            const u8 *kc = static_cast<const u8 *>(kcache) + d.layer * d.layer_stride;
+            const u8 *vc = static_cast<const u8 *>(vcache) + d.layer * d.layer_stride;
+            f32 *of = static_cast<f32 *>(out);
+            const i64 units = d.n_tok * d.n_head;
+            par_for(units, 1,
+                    4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * d.hd,
+                    [&](i64 b, i64 e) {
+                        std::vector<f32> scores;
+                        for (i64 u = b; u < e; u++) {
+                            const i64 t = u / d.n_head;
+                            const i64 h = u - t * d.n_head;
+                            const i64 pos = d.pos0 + t;
+                            const i64 n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
+                            const i64 j_lo = d.window > 0
+                                                 ? std::max<i64>(0, n_keys - d.window)
+                                                 : 0;
+                            const i64 n_vis = n_keys - j_lo;
+                            scores.resize(static_cast<size_t>(n_vis));
+                            const i64 hkv = n_rep > 0 ? h / n_rep : 0;
+                            const i64 base = hkv * d.hd;
+                            const f32 *qh = qf + t * (d.n_head * d.hd) + h * d.hd;
+                            for (i64 j = 0; j < n_vis; j++) {
+                                const u8 *row = kc + (j_lo + j) * d.pos_stride;
+                                const f32 *sc =
+                                    reinterpret_cast<const f32 *>(row + kv_dim);
+                                f32 dot = 0.0f;
+                                for (i64 i = 0; i < d.hd; i++) {
+                                    const i64 c = base + i;
+                                    const f32 kv = static_cast<f32>(
+                                                       reinterpret_cast<const i8 *>(row)[c]) *
+                                                   sc[c / 32];
+                                    dot += qh[i] * kv;
+                                }
+                                scores[static_cast<size_t>(j)] = dot * d.scale;
+                            }
+                            f32 mx = scores[0];
+                            for (i64 j = 1; j < n_vis; j++)
+                                mx = std::max(mx, scores[static_cast<size_t>(j)]);
+                            f32 sum = 0.0f;
+                            for (i64 j = 0; j < n_vis; j++) {
+                                const f32 ex =
+                                    std::exp(scores[static_cast<size_t>(j)] - mx);
+                                scores[static_cast<size_t>(j)] = ex;
+                                sum += ex;
+                            }
+                            const f32 sink_logit = d.sinks ? d.sinks[h] : 0.0f;
+                            if (sink_logit != 0.0f) sum += std::exp(sink_logit - mx);
+                            const f32 inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                            f32 *oh = of + t * (d.n_head * d.hd) + h * d.hd;
+                            for (i64 i = 0; i < d.hd; i++) oh[i] = 0.0f;
+                            for (i64 j = 0; j < n_vis; j++) {
+                                const f32 p = scores[static_cast<size_t>(j)] * inv;
+                                const u8 *row = vc + (j_lo + j) * d.pos_stride;
+                                const f32 *sc =
+                                    reinterpret_cast<const f32 *>(row + kv_dim);
+                                for (i64 i = 0; i < d.hd; i++) {
+                                    const i64 c = base + i;
+                                    const f32 vv = static_cast<f32>(
+                                                       reinterpret_cast<const i8 *>(row)[c]) *
+                                                   sc[c / 32];
+                                    oh[i] += p * vv;
+                                }
+                            }
+                        }
+                    });
+            return;
+        }
         const f32 *qf = static_cast<const f32 *>(q);
         const f32 *kc = static_cast<const f32 *>(kcache) + d.layer * d.layer_stride;
         const f32 *vc = static_cast<const f32 *>(vcache) + d.layer * d.layer_stride;

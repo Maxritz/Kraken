@@ -790,6 +790,13 @@ private:
     Backend *be_ = nullptr;
     size_t budget_ = 0;
     size_t bytes_ = 0;
+    // The previous free-VRAM reading, and whether there is one. The re-clamp
+    // shrinks the budget only by what the CARD gave up between readings -- never
+    // by what this cache evicted itself, because a released cell goes back to
+    // the backend's pool rather than to the driver, so the free count does not
+    // move. Without this the budget ratcheted: 5747 -> 4295 MiB in 93 tokens.
+    size_t last_free_bytes_ = 0;
+    bool have_free_bytes_ = false;
     size_t capacity_ = 0;
     size_t slot_budget_ = 0; // exact slot ceiling, 0 = derive from the bytes
     size_t vram_slots_ = 0;
