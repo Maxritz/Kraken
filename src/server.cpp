@@ -5,6 +5,7 @@
 // Each request rolls the KV cache back to 0 so no state leaks between calls.
 #include "krk/server.hpp"
 #include "krk/host_time.hpp"
+#include "krk/webui.hpp"
 
 #include <cstdio>
 #include <ctime>
@@ -191,6 +192,20 @@ OpenAiService::OpenAiService(Engine *engine, f32 default_temp, std::mutex *servi
 bool OpenAiService::handle(const HttpRequest &req, HttpResponse &res, HttpConn &conn) {
     if (req.method != "GET" && req.method != "POST") {
         res = json_response(405, error_body("method not allowed"));
+        return true;
+    }
+    if (req.path == "/") {
+        // The built-in chat UI. One self-contained document, so a browser gets
+        // a working page from the same binary that serves the API -- and the
+        // page talks to /v1/chat/completions exactly as an external client does,
+        // so a broken endpoint cannot be hidden by the front end.
+        if (req.method != "GET") {
+            res = json_response(405, error_body("use GET"));
+            return true;
+        }
+        res.status = 200;
+        res.content_type = "text/html; charset=utf-8";
+        res.body = web_ui_html();
         return true;
     }
     if (req.path == "/health") {

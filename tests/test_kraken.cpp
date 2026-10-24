@@ -41,6 +41,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -56,6 +57,8 @@
 #include "krk/gguf.hpp"
 #include "krk/hc.hpp"
 #include "krk/mla.hpp"
+#include "krk/mla_shared.hpp"
+#include "krk/dsv4_route.hpp"
 #include "krk/ple.hpp"
 #include "krk/qsa.hpp"
 #include "krk/http.hpp"
@@ -3972,6 +3975,8 @@ struct MoeRun {
     u64 demotions = 0;
     u64 promotions = 0;
     size_t host_slots = 0;
+    u64 batch_ran = 0;     // decode layers the batched MoE path computed
+    u64 batch_skipped = 0; // decode layers that kept the per-expert loop
 };
 
 // Greedy generation through a MoE model, reporting what the expert cache did.
@@ -4009,6 +4014,8 @@ static MoeRun run_moe(const char *path, i32 cache_mb, i32 cache_slots,
     out.demotions = ec.demotions();
     out.promotions = ec.promotions();
     out.host_slots = ec.host_slots();
+    out.batch_ran = engine.moe_batch_layers();
+    out.batch_skipped = engine.moe_batch_skips();
     engine.shutdown();
     delete cpu;
     return out;
@@ -4088,6 +4095,62 @@ static void test_moe_schema_and_laziness() {
           "the tier converts mapping reloads into DMA promotions");
     CHECK(tiered.tokens == tiny.tokens,
           "generation is bit-identical with and without the host tier");
+}
+
+// The batched decode path's RESIDENCY precondition, pinned directly.
+//
+// `moe_decode_batch` resolves the layer's whole routed set before the first
+// launch, so every resolved expert must still be its own slot. When the cache
+// cannot hold the set, `acquire` evicts as it resolves and the earlier experts'
+// pointers start naming the later experts' bytes -- both experts then multiply
+// one expert's weights, produce finite plausible output, and decode the wrong
+// text (measured: 1 slot gave `5 4 5 4 5 4` where every larger cache gave
+// `5 5 4 5 4 5`).
+//
+// So the gate asserts the REFUSAL, not just the text: with 2 experts routed and
+// 1 slot, the batch must report zero layers computed, and with 4 slots it must
+// report some. Without the second arm a broken guard that refuses always would
+// pass unnoticed, and without the first the aliasing bug itself passes.
+static void test_moe_batch_fallback() {
+    MoeSpec vs;
+    vs.dense = false;
+    vs.n_expert = 4;
+    vs.n_expert_used = 2;
+    vs.shared = true;
+    vs.varied = true;
+    CHECK(build_tiny_moe_model(kMoeTestPath, vs), "wrote the MoE fixture");
+
+    // Routed set (2 experts) EXCEEDS the cache (1 slot): the batch must stand
+    // down and the per-expert loop must produce the reference text.
+    const MoeRun squeezed = run_moe(kMoeTestPath, 0, 1, 6);
+    CHECK(squeezed.ok, "the squeezed-cache run generates");
+    CHECK(squeezed.capacity_slots == 1,
+          "the squeezed arm really has one expert slot");
+    CHECK(squeezed.evictions > 0,
+          "the squeezed arm really reloads experts (the set exceeds the cache)");
+    CHECK(squeezed.batch_ran == 0,
+          "with fewer slots than routed experts the batch computes NO layer");
+    CHECK(squeezed.batch_skipped > 0,
+          "...and the per-expert loop is what ran instead");
+
+    // The same model with room for the routed set: the batch must actually
+    // engage, or the arm above proves nothing about a fallback.
+    const MoeRun roomy = run_moe(kMoeTestPath, 4096, 0, 6);
+    CHECK(roomy.ok, "the roomy-cache run generates");
+    CHECK(roomy.batch_ran > 0,
+          "with room for the routed set the batch DOES compute layers");
+    CHECK(roomy.tokens == squeezed.tokens,
+          "the fallback decodes the same text the batch does");
+
+    // And a tier does not change the answer either: the tiered one-slot arm is
+    // the shape whose cross-slice aliasing forced the pointer check, and its
+    // failure mode was not subtle (token 0 forever).
+    const MoeRun tiered = run_moe(kMoeTestPath, 0, 1, 6, 64);
+    CHECK(tiered.ok, "the squeezed arm with a host tier generates");
+    CHECK(tiered.batch_ran == 0,
+          "a host tier does not let the batch outrun the slot budget");
+    CHECK(tiered.tokens == squeezed.tokens,
+          "the tiered squeezed arm decodes the same text");
 }
 
 // ---------------------------------------------------------------------------
@@ -7010,19 +7073,23 @@ struct PrefillProbe {
 static PrefillProbe run_prefill_hash(const std::string &exe,
                                      const std::string &model,
                                      const std::string &prompt, int chunk,
-                                     bool tiled, bool exact_off = false) {
+                                     bool tiled, bool exact_off = false,
+                                     const char *extra = nullptr) {
     PrefillProbe r;
     // Each arm keeps the chunk number and gains a suffix, so two arms never
     // share a capture path (the prefix has no spaces -- it is a filename).
     const std::string tag =
-        (tiled ? "-t" : "") + std::string(exact_off ? "-lottery" : "");
+        (tiled ? "-t" : "") + std::string(exact_off ? "-lottery" : "") +
+        std::string(extra ? extra : "");
     const std::string o = "kraken-prefill-out-" +
                           std::to_string(chunk) + tag + ".txt";
     const std::string e = "kraken-prefill-err-" +
                           std::to_string(chunk) + tag + ".txt";
     std::string cmd = "\"" + exe + "\" -m \"" + model + "\" -p \"" + prompt +
                       "\" --ctx 64 --chunk " + std::to_string(chunk) +
-                      " --greedy --prefill-hash > \"" + o + "\" 2> \"" + e + "\"";
+                      " --greedy --prefill-hash" +
+                      (extra ? (" " + std::string(extra)) : std::string()) +
+                      " > \"" + o + "\" 2> \"" + e + "\"";
 #ifdef _WIN32
     // cmd /c strips the first and last quote of a line that starts with one,
     // which would leave the last redirect target unterminated. `call` makes
@@ -7678,6 +7745,533 @@ static bool http_request(int port, const std::string &method, const std::string 
     return true;
 }
 
+// Sends exactly these bytes, optionally half-closing the write side so the
+// server sees EOF where a truncated body arrives, and reads whatever comes
+// back. SO_RCVTIMEO bounds the read: a parser that neither answers nor closes
+// fails the check instead of hanging the suite. Returns true when any response
+// byte arrived, so a control request and a refusal are judged the same way.
+static bool http_exchange_raw(int port, const std::string &wire, bool half_close,
+                              std::string *out) {
+    const int fd = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
+    if (fd < 0) return false;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<unsigned short>(port));
+    addr.sin_addr.s_addr = htonl(0x7F000001u); // 127.0.0.1
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        socket_close(fd);
+        return false;
+    }
+#ifdef _WIN32
+    DWORD timeout_ms = 10000;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char *>(&timeout_ms),
+                 static_cast<int>(sizeof(timeout_ms)));
+#else
+    timeval tv{};
+    tv.tv_sec = 10;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+    size_t sent = 0;
+    while (sent < wire.size()) {
+#ifdef _WIN32
+        const int n =
+            ::send(fd, wire.data() + sent, static_cast<int>(wire.size() - sent), 0);
+#else
+        const ssize_t n = ::send(fd, wire.data() + sent, wire.size() - sent, 0);
+#endif
+        // A refusal can land while we are still sending (the oversized-header
+        // case): stop writing and read the answer it already wrote.
+        if (n <= 0) break;
+        sent += static_cast<size_t>(n);
+    }
+    if (half_close) {
+#ifdef _WIN32
+        ::shutdown(fd, SD_SEND);
+#else
+        ::shutdown(fd, SHUT_WR);
+#endif
+    }
+    out->clear();
+    char buf[4096];
+#ifdef _WIN32
+    int n;
+#else
+    ssize_t n;
+#endif
+    while ((n = ::recv(fd, buf, sizeof(buf), 0)) > 0) out->append(buf, static_cast<size_t>(n));
+    socket_close(fd);
+    return !out->empty();
+}
+
+// ---------------------------------------------------------------------------
+// Strict HTTP/1.1 client parsing. The endpoint checks below look for
+// substrings, and a substring search cannot tell a well-framed response from
+// one that merely CONTAINS the expected text: a header line ending in a bare
+// newline, a Content-Length that disagrees with the body, or an SSE stream
+// whose chunk sizes are wrong all pass `find()`. This parser is the client's
+// view -- it either yields a body or names the byte that broke the protocol --
+// and its arms show it failing once per defect class, so a green parse is
+// evidence about the wire rather than about the test's search terms.
+// ---------------------------------------------------------------------------
+
+struct HttpWire {
+    bool ok = false;
+    std::string why;
+    int status = 0;
+    std::string reason;
+    std::vector<std::pair<std::string, std::string>> headers;
+    bool chunked = false;
+    size_t chunks = 0; // data chunks decoded (0 for a buffered body)
+    std::string body;  // de-chunked when the transfer was chunked
+};
+
+static std::string http_wire_header(const HttpWire &w, const std::string &name) {
+    for (const auto &kv : w.headers)
+        if (kv.first == name) return kv.second;
+    return std::string();
+}
+
+static bool http_wire_hex(char c, int *d) {
+    if (c >= '0' && c <= '9') { *d = c - '0'; return true; }
+    if (c >= 'a' && c <= 'f') { *d = c - 'a' + 10; return true; }
+    if (c >= 'A' && c <= 'F') { *d = c - 'A' + 10; return true; }
+    return false;
+}
+
+// One CRLF-terminated line at *p; advances past it. False on a bare LF.
+static bool http_wire_line(const std::string &s, size_t *p, std::string *line) {
+    const size_t nl = s.find('\n', *p);
+    if (nl == std::string::npos || nl == *p || s[nl - 1] != '\r') return false;
+    *line = s.substr(*p, nl - 1 - *p);
+    *p = nl + 1;
+    return true;
+}
+
+static HttpWire http_wire_parse(const std::string &raw) {
+    HttpWire w;
+    const size_t sep = raw.find("\r\n\r\n");
+    if (sep == std::string::npos) {
+        w.why = "no CRLF blank line ends the head";
+        return w;
+    }
+    const std::string head = raw.substr(0, sep + 2); // every line keeps its CRLF
+    for (size_t i = 0; i < head.size(); i++) {
+        if (head[i] == '\n' && (i == 0 || head[i - 1] != '\r')) {
+            w.why = "bare LF in the head";
+            return w;
+        }
+        if (head[i] == '\r' && (i + 1 >= head.size() || head[i + 1] != '\n')) {
+            w.why = "bare CR in the head";
+            return w;
+        }
+        if (head[i] == '\\') {
+            // The runtime form of the source-hygiene group's second class: the
+            // escape was written twice, so the bytes carry a backslash where a
+            // line break belongs.
+            w.why = "backslash printed in the head (doubled escape in a header)";
+            return w;
+        }
+    }
+    size_t p = 0;
+    std::string line;
+    if (!http_wire_line(head, &p, &line)) {
+        w.why = "the status line is not CRLF-terminated";
+        return w;
+    }
+    const bool digits = line.size() > 12 && line[9] >= '0' && line[9] <= '9' &&
+                        line[10] >= '0' && line[10] <= '9' &&
+                        line[11] >= '0' && line[11] <= '9';
+    if (line.compare(0, 9, "HTTP/1.1 ") != 0 || !digits || line[12] != ' ' ||
+        line.size() == 13) {
+        w.why = "status line is not 'HTTP/1.1 <3 digits> <reason>'";
+        return w;
+    }
+    w.status = (line[9] - '0') * 100 + (line[10] - '0') * 10 + (line[11] - '0');
+    w.reason = line.substr(13);
+    size_t content_length_lines = 0;
+    while (p < head.size()) {
+        if (!http_wire_line(head, &p, &line)) {
+            w.why = "a header line is not CRLF-terminated";
+            return w;
+        }
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos || colon == 0 || line[colon + 1] != ' ') {
+            w.why = "a header line is not 'Name: value'";
+            return w;
+        }
+        if (line.find(' ') < colon) {
+            w.why = "a header name contains a space";
+            return w;
+        }
+        if (line.compare(0, 14, "Content-Length") == 0) content_length_lines++;
+        w.headers.emplace_back(line.substr(0, colon), line.substr(colon + 2));
+    }
+    const std::string rest = raw.substr(sep + 4);
+    if (http_wire_header(w, "Transfer-Encoding") == "chunked") {
+        w.chunked = true;
+        size_t q = 0;
+        while (true) {
+            const size_t nl = rest.find("\r\n", q);
+            if (nl == std::string::npos) {
+                w.why = "chunked body: no size line";
+                return w;
+            }
+            const size_t n_digits = nl - q;
+            size_t n = 0;
+            if (n_digits == 0 || n_digits > 16) {
+                w.why = "chunked body: size is not 1..16 hex digits";
+                return w;
+            }
+            for (size_t i = q; i < nl; i++) {
+                int d = 0;
+                if (!http_wire_hex(rest[i], &d)) {
+                    w.why = "chunked body: size line is not hex";
+                    return w;
+                }
+                n = n * 16 + static_cast<size_t>(d);
+            }
+            q = nl + 2;
+            if (n == 0) {
+                if (rest.compare(q, 2, "\r\n") != 0) {
+                    w.why = "chunked body: the terminal chunk is not followed by CRLF";
+                    return w;
+                }
+                if (q + 2 != rest.size()) {
+                    w.why = "chunked body: bytes follow the terminal chunk";
+                    return w;
+                }
+                break;
+            }
+            if (q + n + 2 > rest.size()) {
+                w.why = "chunked body: a chunk is shorter than its size line";
+                return w;
+            }
+            w.body.append(rest, q, n);
+            w.chunks++;
+            if (rest.compare(q + n, 2, "\r\n") != 0) {
+                w.why = "chunked body: a chunk is not followed by CRLF";
+                return w;
+            }
+            q += n + 2;
+        }
+    } else {
+        if (content_length_lines != 1) {
+            w.why = content_length_lines ? "Content-Length appears more than once"
+                                         : "no Content-Length and no chunked framing";
+            return w;
+        }
+        const std::string cl = http_wire_header(w, "Content-Length");
+        size_t declared = 0;
+        for (char c : cl) {
+            if (c < '0' || c > '9') {
+                w.why = "Content-Length is not a number";
+                return w;
+            }
+            declared = declared * 10 + static_cast<size_t>(c - '0');
+        }
+        if (declared != rest.size()) {
+            w.why = "Content-Length disagrees with the body";
+            return w;
+        }
+        w.body = rest;
+    }
+    w.ok = true;
+    return w;
+}
+
+// Strict server-sent events: every event is exactly `data: <payload>` + LF LF,
+// the payload holds no line break of its own, and `data: [DONE]` comes last.
+struct SseWire {
+    bool ok = false;
+    std::string why;
+    std::vector<std::string> events; // payloads, [DONE] excluded
+    bool done_seen = false;
+    size_t finish_events = 0;
+    std::string text; // concatenated delta content
+};
+
+static SseWire sse_wire_parse(const std::string &s) {
+    SseWire o;
+    size_t p = 0;
+    while (p < s.size()) {
+        if (s.compare(p, 6, "data: ") != 0) {
+            o.why = "an event does not start with 'data: '";
+            return o;
+        }
+        const size_t end = s.find("\n\n", p + 6);
+        if (end == std::string::npos) {
+            o.why = "an event is not terminated by a blank line";
+            return o;
+        }
+        const std::string payload = s.substr(p + 6, end - p - 6);
+        if (payload.find('\n') != std::string::npos ||
+            payload.find('\r') != std::string::npos) {
+            o.why = "an event payload holds a line break";
+            return o;
+        }
+        p = end + 2;
+        if (payload == "[DONE]") {
+            if (o.done_seen) {
+                o.why = "[DONE] appears twice";
+                return o;
+            }
+            o.done_seen = true;
+            if (p != s.size()) {
+                o.why = "bytes follow [DONE]";
+                return o;
+            }
+            continue;
+        }
+        JsonValue ev;
+        std::string err;
+        if (!json_parse(payload, &ev, &err)) {
+            o.why = "an event payload is not JSON: " + err;
+            return o;
+        }
+        o.events.push_back(payload);
+        const JsonValue *choices = ev.find("choices");
+        if (!choices || !choices->is_array() || choices->items().empty()) continue;
+        const JsonValue &c = choices->items()[0];
+        const JsonValue *delta = c.find("delta");
+        if (delta) {
+            const JsonValue *content = delta->find("content");
+            if (content && content->is_string()) o.text += content->as_string();
+        }
+        const JsonValue *fr = c.find("finish_reason");
+        if (fr && fr->is_string()) o.finish_events++;
+    }
+    if (!o.done_seen) {
+        o.why = "the stream does not end with data: [DONE]";
+        return o;
+    }
+    o.ok = true;
+    return o;
+}
+
+// The parser's own arms. Each defective response must be refused for the reason
+// named, and the well-framed one must be ACCEPTED: without that positive arm a
+// parser that refused everything would pass every other check here.
+static void http_wire_arms() {
+    const std::string good =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "{}";
+    const HttpWire g = http_wire_parse(good);
+    CHECK(g.ok && g.status == 200 && g.reason == "OK" && g.body == "{}" &&
+              !g.chunked && http_wire_header(g, "Content-Type") == "application/json",
+          "http bytes: the strict parser accepts a well-framed response");
+    if (!g.ok) std::fprintf(stderr, "  (good response refused: %s)\n", g.why.c_str());
+
+    auto refused = [](const std::string &raw, const char *needle, const char *what) {
+        const HttpWire w = http_wire_parse(raw);
+        const bool named = w.why.find(needle) != std::string::npos;
+        CHECK(!w.ok && named, what);
+        if (w.ok || !named)
+            std::fprintf(stderr, "  (%s: ok=%d why='%s')\n", what, w.ok ? 1 : 0,
+                         w.why.c_str());
+    };
+
+    refused("HTTP/1.1 200 OK\nContent-Length: 2\r\n\r\n{}", "bare LF",
+            "http bytes: a bare LF in the head is refused");
+    refused("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n{}", "Content-Length",
+            "http bytes: a Content-Length that disagrees with the body is refused");
+    refused("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}", "HTTP/1.1",
+            "http bytes: a status line that is not HTTP/1.1 is refused");
+    refused("HTTP/1.1 200 OK\r\nContent-Length:2\r\n\r\n{}", "Name: value",
+            "http bytes: a header without its space is refused");
+    {
+        // A doubled escape in a header. The backslash comes from character code
+        // 92 so the test does not spell the defect it is checking for.
+        std::string bs = "HTTP/1.1 200 OK\r\nContent-Type: text/pla";
+        bs += static_cast<char>(92);
+        bs += "in\r\nContent-Length: 0\r\n\r\n";
+        refused(bs, "backslash", "http bytes: a backslash printed in the head is refused");
+    }
+    refused("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab\r\n",
+            "shorter than its size line", "http bytes: a short chunk is refused");
+    refused("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n",
+            "no size line", "http bytes: a missing terminal chunk is refused");
+    refused("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\nx",
+            "follow the terminal chunk",
+            "http bytes: trailing bytes after the terminal chunk are refused");
+    refused("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhiX\r\n0\r\n\r\n",
+            "not followed by CRLF", "http bytes: a chunk without its CRLF is refused");
+
+    const std::string two_chunks =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "4\r\ndata\r\n"
+        "6\r\n: hi\n\n\r\n"
+        "0\r\n\r\n";
+    const HttpWire cw = http_wire_parse(two_chunks);
+    CHECK(cw.ok && cw.chunked && cw.chunks == 2 && cw.body == "data: hi\n\n",
+          "http bytes: the parser reassembles a two-chunk body exactly");
+
+    const SseWire ok_sse = sse_wire_parse("data: {\"x\":1}\n\ndata: [DONE]\n\n");
+    CHECK(ok_sse.ok && ok_sse.events.size() == 1 && ok_sse.done_seen,
+          "http bytes: the SSE parser accepts a well-framed event and [DONE]");
+    CHECK(!sse_wire_parse("data: {\"x\":1}\n").ok,
+          "http bytes: an unterminated SSE event is refused");
+    CHECK(!sse_wire_parse("data: [DONE]\n\ndata: x\n\n").ok,
+          "http bytes: bytes after [DONE] are refused");
+}
+
+// ---------------------------------------------------------------------------
+// The real kraken-server binary. The listener below and that process run the
+// same HttpServer + OpenAiService pair, but only the binary proves the wiring
+// main_server.cpp owns: argument parsing, `--port 0`, and the banner a client
+// discovers the port from. It runs --cpu because the suite links no device
+// backend (the response BYTES are backend-independent), its stdio goes to
+// capture files so the banner can be polled, and it is terminated at the end:
+// main_server.cpp has no stop path -- its own comment says server.run() returns
+// only after stop(), which nothing calls -- so a forced end is the only one
+// available, and stop() waits for it before the captures are read or removed.
+// ---------------------------------------------------------------------------
+
+struct ServerProc;
+static void server_proc_stop(ServerProc *sp);
+
+struct ServerProc {
+#ifdef _WIN32
+    void *process = nullptr;
+#else
+    int pid = 0;
+#endif
+    std::string out_path;
+    std::string err_path;
+    bool started = false;
+    ~ServerProc() { server_proc_stop(this); }
+};
+
+#ifdef _WIN32
+static bool server_proc_running(const ServerProc &sp) {
+    if (!sp.process) return false;
+    return WaitForSingleObject(static_cast<HANDLE>(sp.process), 0) == WAIT_TIMEOUT;
+}
+
+static void server_proc_stop(ServerProc *sp) {
+    if (!sp->process) return;
+    TerminateProcess(static_cast<HANDLE>(sp->process), 0);
+    WaitForSingleObject(static_cast<HANDLE>(sp->process), 10000);
+    CloseHandle(static_cast<HANDLE>(sp->process));
+    sp->process = nullptr;
+    sp->started = false;
+}
+
+static bool server_proc_start(ServerProc *sp, const std::string &exe,
+                              const std::vector<std::string> &args) {
+    SECURITY_ATTRIBUTES sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE out = CreateFileA(sp->out_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE err = CreateFileA(sp->err_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE || err == INVALID_HANDLE_VALUE) {
+        if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+        if (err != INVALID_HANDLE_VALUE) CloseHandle(err);
+        return false;
+    }
+    std::string cmd = "\"" + exe + "\"";
+    for (const std::string &a : args) cmd += " \"" + a + "\"";
+    std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+    mutable_cmd.push_back('\0');
+
+    STARTUPINFOA si;
+    std::memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = out;
+    si.hStdError = err;
+    PROCESS_INFORMATION pi;
+    std::memset(&pi, 0, sizeof(pi));
+    const BOOL ok = CreateProcessA(exe.c_str(), mutable_cmd.data(), nullptr, nullptr,
+                                   TRUE, 0, nullptr, nullptr, &si, &pi);
+    CloseHandle(out);
+    CloseHandle(err);
+    if (!ok) return false;
+    CloseHandle(pi.hThread);
+    sp->process = pi.hProcess;
+    sp->started = true;
+    return true;
+}
+#else
+#include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+
+extern char **environ;
+
+static bool server_proc_running(const ServerProc &sp) {
+    if (sp.pid <= 0) return false;
+    int st = 0;
+    return waitpid(sp.pid, &st, WNOHANG) == 0;
+}
+
+static void server_proc_stop(ServerProc *sp) {
+    if (sp->pid <= 0) return;
+    kill(sp->pid, SIGTERM);
+    waitpid(sp->pid, nullptr, 0);
+    sp->pid = 0;
+    sp->started = false;
+}
+
+static bool server_proc_start(ServerProc *sp, const std::string &exe,
+                              const std::vector<std::string> &args) {
+    std::vector<std::string> storage;
+    storage.push_back(exe);
+    for (const std::string &a : args) storage.push_back(a);
+    std::vector<char *> argv;
+    for (std::string &s : storage) argv.push_back(s.data());
+    argv.push_back(nullptr);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 1, sp->out_path.c_str(),
+                                     O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    posix_spawn_file_actions_addopen(&fa, 2, sp->err_path.c_str(),
+                                     O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    pid_t pid = 0;
+    const int rc = posix_spawn(&pid, exe.c_str(), &fa, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) return false;
+    sp->pid = static_cast<int>(pid);
+    sp->started = true;
+    return true;
+}
+#endif
+
+// The banner main_server.cpp prints after bind: `listening on http://HOST:PORT`.
+// `--port 0` makes the port ephemeral, so this is how a caller learns both the
+// port and that the bind actually happened.
+static int server_proc_wait_port(const ServerProc &sp, int timeout_ms) {
+    const std::string key = "listening on http://";
+    const int step = 25;
+    for (int waited = 0; waited < timeout_ms; waited += step) {
+        const std::string out = read_capture(sp.out_path);
+        const size_t at = out.find(key);
+        if (at != std::string::npos) {
+            const size_t colon = out.find(':', at + key.size());
+            if (colon != std::string::npos) {
+                int port = 0;
+                for (size_t i = colon + 1; i < out.size() && out[i] >= '0' && out[i] <= '9';
+                     i++)
+                    port = port * 10 + (out[i] - '0');
+                if (port > 0) return port;
+            }
+        }
+        if (!server_proc_running(sp)) return -1; // exited: the banner will not come
+        std::this_thread::sleep_for(std::chrono::milliseconds(step));
+    }
+    return -1;
+}
+
 static void test_http_server() {
     if (!build_tiny_model(kTestModelPath, false)) {
         CHECK(false, "http test: build_tiny_model failed");
@@ -7889,6 +8483,347 @@ static void test_http_server() {
         CHECK(events >= 1 && finish_seen == 1, "http: one terminal chunk with finish_reason");
         CHECK(data_text == ref.text,
               "http: streamed text is bit-identical to direct generation");
+    }
+
+    // ---- the same responses, read the way a client reads them ---------------
+    // The checks above find their text; these parse the bytes. A client that
+    // splits the head on CRLF, trusts Content-Length and de-chunks per RFC 7230
+    // must accept every response, and http_wire_arms shows that judgement can
+    // fail -- once per defect class, on constructed answers.
+    http_wire_arms();
+    {
+        std::string raw;
+        int code = 0;
+
+        CHECK(http_request(port, "GET", "/health", "", &code, &raw) && code == 200,
+              "http bytes: /health answers 200");
+        const HttpWire hw = http_wire_parse(raw);
+        CHECK(hw.ok, "http bytes: /health is a well-framed HTTP/1.1 response");
+        if (!hw.ok) std::fprintf(stderr, "  (/health framing: %s)\n", hw.why.c_str());
+        CHECK(hw.status == 200 && hw.reason == "OK",
+              "http bytes: the status line is exactly 'HTTP/1.1 200 OK'");
+        // HTTP/1.1 defaults to a PERSISTENT connection, so a server that closes
+        // after one response must say so; otherwise a client is entitled to
+        // reuse the socket and writes its next request into a closed pipe.
+        CHECK(http_wire_header(hw, "Connection") == "close",
+              "http bytes: a 200 states its connection handling (Connection: close)");
+        CHECK(http_wire_header(hw, "Content-Type") == "application/json",
+              "http bytes: Content-Type is application/json");
+        JsonValue hj;
+        std::string he;
+        const bool hj_ok = json_parse(hw.body, &hj, &he);
+        const JsonValue *status_v = hj_ok ? hj.find("status") : nullptr;
+        CHECK(hj_ok && hj.is_object() && status_v && status_v->is_string() &&
+                  status_v->as_string() == "ok",
+              "http bytes: the advertised Content-Length frames a complete JSON body");
+
+        CHECK(http_request(port, "GET", "/v1/nope", "", &code, &raw) && code == 404,
+              "http bytes: an unknown endpoint answers 404");
+        const HttpWire nf = http_wire_parse(raw);
+        CHECK(nf.ok && nf.status == 404 && nf.reason == "Not Found",
+              "http bytes: the 404 carries the standard reason phrase");
+        CHECK(http_wire_header(nf, "Connection") == "close",
+              "http bytes: an error response tells the client the connection closes");
+        JsonValue nj;
+        std::string ne;
+        const bool nj_ok = json_parse(nf.body, &nj, &ne);
+        const JsonValue *err = nj_ok ? nj.find("error") : nullptr;
+        std::string err_msg;
+        CHECK(err && err->get_string("message", &err_msg) &&
+                  err_msg.find("unknown endpoint") != std::string::npos,
+              "http bytes: the 404 body names the endpoint it refused");
+
+        const std::string sreq = "{\"prompt\":\"the\",\"max_tokens\":5,"
+                                 "\"temperature\":0,\"repeat_penalty\":1.0,"
+                                 "\"stream\":true}";
+        CHECK(http_request(port, "POST", "/v1/completions", sreq, &code, &raw) &&
+                  code == 200,
+              "http bytes: the streamed completion answers 200");
+        const HttpWire sw = http_wire_parse(raw);
+        CHECK(sw.ok, "http bytes: the event stream's chunk framing decodes");
+        if (!sw.ok) std::fprintf(stderr, "  (stream framing: %s)\n", sw.why.c_str());
+        CHECK(sw.chunked && sw.chunks >= 3,
+              "http bytes: the stream is chunked and carries more than one chunk");
+        CHECK(http_wire_header(sw, "Content-Type") == "text/event-stream" &&
+                  http_wire_header(sw, "Cache-Control") == "no-cache",
+              "http bytes: the stream's head is the SSE pair");
+        CHECK(http_wire_header(sw, "Connection") == "close",
+              "http bytes: the stream's head states Connection: close");
+        const SseWire sse = sse_wire_parse(sw.body);
+        CHECK(sse.ok, "http bytes: every decoded event is 'data: <json>' + a blank line");
+        if (!sse.ok) std::fprintf(stderr, "  (sse framing: %s)\n", sse.why.c_str());
+        CHECK(sse.done_seen, "http bytes: the decoded stream ends with data: [DONE]");
+        CHECK(sse.finish_events == 1,
+              "http bytes: exactly one event carries a finish_reason");
+        CHECK(sse.text == ref.text,
+              "http bytes: the decoded deltas are the buffered answer, byte for byte");
+        std::fprintf(stderr, "  (stream: %zu chunk(s), %zu event(s), %zu payload byte(s))\n",
+                     sw.chunks, sse.events.size(), sw.body.size());
+    }
+
+    // ---- request framing: what the parser must refuse -----------------------
+    // RFC 9112 §6.3: a request's body length must be unambiguous, and RFC 6585
+    // reserves 431 for a header block over the server's cap (413 is about
+    // content). Every case below is a byte sequence a client can send, and each
+    // must be REFUSED -- none may reach the engine. The raw client half-closes
+    // where a truncated body arrives, and every read is bounded, so a parser
+    // that neither answers nor closes fails rather than hangs the suite.
+    {
+        const std::string head = "POST /v1/completions HTTP/1.0\r\nHost: localhost\r\n";
+        const std::string body =
+            "{\"prompt\":\"the\",\"max_tokens\":1,\"temperature\":0}";
+        const std::string len = std::to_string(body.size());
+        std::string raw;
+
+        // The control: the same raw client sends a well-framed request and gets
+        // its 200. Without it, a client that broke every send would "pass" the
+        // refusals below for the wrong reason.
+        CHECK(http_exchange_raw(port,
+                                head + "Content-Length: " + len + "\r\n\r\n" + body,
+                                false, &raw),
+              "request bytes: the raw client's control request is answered");
+        const HttpWire cw = http_wire_parse(raw);
+        CHECK(cw.ok && cw.status == 200 && cw.reason == "OK",
+              "request bytes: the control request is a well-framed 200");
+        CHECK(cw.ok && http_wire_header(cw, "Connection") == "close",
+              "request bytes: the control 200 also states Connection: close");
+
+        // A second Content-Length, identical value included: accepting it means
+        // two parties can disagree about where the body ends.
+        CHECK(http_exchange_raw(port,
+                                head + "Content-Length: " + len +
+                                    "\r\nContent-Length: " + len + "\r\n\r\n" + body,
+                                false, &raw),
+              "request bytes: a duplicated Content-Length gets an answer");
+        const HttpWire dw = http_wire_parse(raw);
+        CHECK(dw.ok && dw.status == 400 && dw.reason == "Bad Request",
+              "request bytes: a duplicated Content-Length is refused with 400");
+        JsonValue dj;
+        std::string de;
+        const bool dj_ok = dw.ok && json_parse(dw.body, &dj, &de);
+        const JsonValue *dj_err = dj_ok ? dj.find("error") : nullptr;
+        std::string dj_msg;
+        CHECK(dj_err && dj_err->get_string("message", &dj_msg) &&
+                  dj_msg.find("duplicate Content-Length") != std::string::npos,
+              "request bytes: the refusal names the duplicated header");
+
+        // Two DIFFERENT lengths in one message is the smuggling shape.
+        CHECK(http_exchange_raw(
+                  port,
+                  head + "Content-Length: 2\r\nContent-Length: " + len + "\r\n\r\n" +
+                      body,
+                  false, &raw),
+              "request bytes: conflicting Content-Lengths get an answer");
+        const HttpWire xw = http_wire_parse(raw);
+        CHECK(xw.ok && xw.status == 400,
+              "request bytes: conflicting Content-Lengths are refused");
+
+        // The list form is the same ambiguity in one field: atoll() reads
+        // "5, 44" as 5 and would truncate the body silently.
+        CHECK(http_exchange_raw(port,
+                                head + "Content-Length: 5, " + len + "\r\n\r\n" + body,
+                                false, &raw),
+              "request bytes: a Content-Length list gets an answer");
+        const HttpWire lw = http_wire_parse(raw);
+        JsonValue lj;
+        std::string le;
+        const bool lj_ok = lw.ok && json_parse(lw.body, &lj, &le);
+        const JsonValue *lj_err = lj_ok ? lj.find("error") : nullptr;
+        std::string lj_msg;
+        CHECK(lw.ok && lw.status == 400 && lj_err &&
+                  lj_err->get_string("message", &lj_msg) &&
+                  lj_msg.find("invalid Content-Length") != std::string::npos,
+              "request bytes: a non-numeric Content-Length is refused by name");
+
+        // A request-side Transfer-Encoding is the remaining framing ambiguity:
+        // this server speaks Content-Length or no body, so a body whose length
+        // is carried by a coding it does not implement must be refused, not
+        // guessed. The control sent first in this block is the same head and
+        // body WITHOUT this header, so the 400 is attributable to the header.
+        CHECK(http_exchange_raw(port,
+                                head + "Transfer-Encoding: chunked\r\nContent-Length: " +
+                                    len + "\r\n\r\n" + body,
+                                false, &raw),
+              "request bytes: a Transfer-Encoding request gets an answer");
+        const HttpWire tew = http_wire_parse(raw);
+        JsonValue tj;
+        std::string tje;
+        const bool tj_ok = tew.ok && json_parse(tew.body, &tj, &tje);
+        const JsonValue *tj_err = tj_ok ? tj.find("error") : nullptr;
+        std::string tj_msg;
+        CHECK(tew.ok && tew.status == 400,
+              "request bytes: a request-side Transfer-Encoding is refused");
+        CHECK(tj_err && tj_err->get_string("message", &tj_msg) &&
+                  tj_msg.find("Transfer-Encoding") != std::string::npos,
+              "request bytes: the refusal names Transfer-Encoding");
+
+        // No Content-Length at all, chunk framing carried in the body: the old
+        // parser read an EMPTY body and dispatched it, which is a second way to
+        // make two parties disagree about the message.
+        CHECK(http_exchange_raw(port,
+                                head + "Transfer-Encoding: chunked\r\n\r\n"
+                                       "3\r\n{}\r\n0\r\n\r\n",
+                                false, &raw),
+              "request bytes: chunked framing without Content-Length gets an answer");
+        const HttpWire ctw = http_wire_parse(raw);
+        JsonValue ctj;
+        std::string ctje;
+        const bool ctj_ok = ctw.ok && json_parse(ctw.body, &ctj, &ctje);
+        const JsonValue *ctj_err = ctj_ok ? ctj.find("error") : nullptr;
+        std::string ctj_msg;
+        CHECK(ctw.ok && ctw.status == 400 && ctj_err &&
+                  ctj_err->get_string("message", &ctj_msg) &&
+                  ctj_msg.find("Transfer-Encoding") != std::string::npos,
+              "request bytes: chunked framing alone is refused by name");
+
+        // A header block past kMaxHeaderBytes (64 KiB) with no blank line: the
+        // server must cap it, not keep buffering.
+        std::string huge = head + "X-Pad: ";
+        huge.append(68u * 1024u, 'a');
+        huge += "\r\n";
+        CHECK(http_exchange_raw(port, huge, false, &raw),
+              "request bytes: an oversized header block gets an answer");
+        const HttpWire ow = http_wire_parse(raw);
+        CHECK(ow.ok && ow.status == 431 &&
+                  ow.reason == "Request Header Fields Too Large",
+              "request bytes: an oversized header block is refused with 431");
+        CHECK(ow.ok && http_wire_header(ow, "Connection") == "close",
+              "request bytes: the 431 tells the client the connection closes");
+
+        // A body that ends before its declared length. The prefix is a COMPLETE
+        // streaming request on its own; the over-declared length is what must
+        // stop it, so a parser that trusted the prefix would answer 200 and
+        // stream instead of refusing.
+        const std::string stream_body =
+            "{\"prompt\":\"the\",\"max_tokens\":8,\"temperature\":0,\"stream\":true}";
+        const std::string declared = std::to_string(stream_body.size() + 50);
+        CHECK(http_exchange_raw(port,
+                                head + "Content-Length: " + declared + "\r\n\r\n" +
+                                    stream_body,
+                                true, &raw),
+              "request bytes: a short body still gets an answer");
+        const HttpWire tw = http_wire_parse(raw);
+        CHECK(tw.ok && tw.status == 400 && tw.reason == "Bad Request",
+              "request bytes: a body shorter than Content-Length is refused with 400");
+        JsonValue sj;
+        std::string se;
+        const bool sj_ok = tw.ok && json_parse(tw.body, &sj, &se);
+        const JsonValue *sj_err = sj_ok ? sj.find("error") : nullptr;
+        std::string sj_msg;
+        CHECK(sj_err && sj_err->get_string("message", &sj_msg) &&
+                  sj_msg.find("incomplete request body") != std::string::npos,
+              "request bytes: the refusal names the truncated body");
+
+        // The same request sent whole is the 200 stream. That is the
+        // discrimination: the 400 above is about the missing bytes, not about
+        // the request being unacceptable.
+        CHECK(http_exchange_raw(port,
+                                head + "Content-Length: " +
+                                    std::to_string(stream_body.size()) + "\r\n\r\n" +
+                                    stream_body,
+                                false, &raw),
+              "request bytes: the same request sent whole is answered");
+        const HttpWire uw = http_wire_parse(raw);
+        CHECK(uw.ok && uw.status == 200 && uw.chunked,
+              "request bytes: the whole body streams, so the 400 was the truncation");
+    }
+
+    // ---- the same bytes, produced by the real kraken-server binary ----------
+    {
+        const std::string self = self_path();
+        const std::filesystem::path exe_p =
+            std::filesystem::path(self).parent_path() /
+#ifdef _WIN32
+            "kraken-server.exe";
+#else
+            "kraken-server";
+#endif
+        const bool have_server = !self.empty() && std::filesystem::exists(exe_p);
+        CHECK(have_server, "server bytes: kraken-server sits beside kraken-tests");
+        if (have_server) {
+            ServerProc srv;
+            srv.out_path = "kraken-server-out.txt";
+            srv.err_path = "kraken-server-err.txt";
+            const std::vector<std::string> sargs = {
+                "--model", kTestModelPath, "--host", "127.0.0.1", "--port", "0",
+                "--ctx",   "64",         "--chunk", "8",            "--cpu"};
+            CHECK(server_proc_start(&srv, exe_p.string(), sargs),
+                  "server bytes: the binary starts with its stdout captured");
+            const int sport = srv.started ? server_proc_wait_port(srv, 30000) : -1;
+            CHECK(sport > 0,
+                  "server bytes: the binary's banner reports the ephemeral port");
+            if (sport <= 0) {
+                std::fprintf(stderr, "  (server stdout: %.200s)\n",
+                             read_capture(srv.out_path).c_str());
+                std::fprintf(stderr, "  (server stderr: %.400s)\n",
+                             read_capture(srv.err_path).c_str());
+            } else {
+                std::string raw;
+                int code = 0;
+                CHECK(http_request(sport, "GET", "/health", "", &code, &raw) &&
+                          code == 200,
+                      "server bytes: /health answers over loopback");
+                const HttpWire bw = http_wire_parse(raw);
+                CHECK(bw.ok && bw.status == 200 && bw.reason == "OK",
+                      "server bytes: the binary's head parses as HTTP/1.1 200 OK");
+                if (!bw.ok)
+                    std::fprintf(stderr, "  (binary /health: %s)\n", bw.why.c_str());
+                JsonValue bj;
+                std::string be;
+                const bool bj_ok = json_parse(bw.body, &bj, &be);
+                const JsonValue *bs = bj_ok ? bj.find("status") : nullptr;
+                CHECK(bs && bs->is_string() && bs->as_string() == "ok",
+                      "server bytes: the binary's Content-Length frames its JSON body");
+
+                const std::string creq = "{\"prompt\":\"the\",\"max_tokens\":5,"
+                                         "\"temperature\":0,\"repeat_penalty\":1.0}";
+                CHECK(http_request(sport, "POST", "/v1/completions", creq, &code,
+                                   &raw) && code == 200,
+                      "server bytes: a buffered completion answers");
+                const HttpWire cw = http_wire_parse(raw);
+                JsonValue cj;
+                std::string ce;
+                const bool cj_ok = cw.ok && json_parse(cw.body, &cj, &ce);
+                std::string binary_text;
+                const JsonValue *choices = cj_ok ? cj.find("choices") : nullptr;
+                if (choices && choices->is_array() && !choices->items().empty()) {
+                    const JsonValue *t = choices->items()[0].find("text");
+                    if (t && t->is_string()) binary_text = t->as_string();
+                }
+                CHECK(cj_ok && binary_text == ref.text,
+                      "server bytes: the binary's answer is the reference's text");
+
+                CHECK(http_request(sport, "GET", "/v1/nope", "", &code, &raw) &&
+                          code == 404,
+                      "server bytes: the binary answers an unknown path with 404");
+                const HttpWire nw = http_wire_parse(raw);
+                CHECK(nw.ok && nw.status == 404 && nw.reason == "Not Found" &&
+                          http_wire_header(nw, "Connection") == "close",
+                      "server bytes: the binary's 404 is well framed and closes");
+
+                const std::string sreq2 =
+                    "{\"prompt\":\"the\",\"max_tokens\":5,\"temperature\":0,"
+                    "\"repeat_penalty\":1.0,\"stream\":true}";
+                CHECK(http_request(sport, "POST", "/v1/completions", sreq2, &code,
+                                   &raw) && code == 200,
+                      "server bytes: a streamed completion answers");
+                const HttpWire sw2 = http_wire_parse(raw);
+                CHECK(sw2.ok && sw2.chunked,
+                      "server bytes: the binary's stream de-chunks per RFC 7230");
+                if (!sw2.ok)
+                    std::fprintf(stderr, "  (binary stream: %s)\n", sw2.why.c_str());
+                const SseWire sse2 = sse_wire_parse(sw2.body);
+                CHECK(sse2.ok && sse2.done_seen && sse2.text == ref.text,
+                      "server bytes: the binary's decoded deltas are the reference text");
+                std::fprintf(stderr, "  (binary: port %d, %zu chunk(s), %zu event(s))\n",
+                             sport, sw2.chunks, sse2.events.size());
+            }
+            server_proc_stop(&srv);
+            // A green run leaves nothing behind: INPROC mode has no per-group
+            // scratch directory to remove these for us.
+            std::remove(srv.out_path.c_str());
+            std::remove(srv.err_path.c_str());
+        }
     }
 
     // request isolation: two identical requests give identical answers
@@ -8990,7 +9925,8 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
                                 bool extras = true,
                                 bool identical_inject = false,
                                 bool qsa = true,
-                                bool half_indexer = false) {
+                                bool half_indexer = false,
+                                bool perturb_ple = false) {
     // The two numbers the forward test scales up to the real file's shape: four
     // lanes of 2560, mixed through a 32-wide bottleneck (the REAP-288 file
     // mixes through 320; 32 keeps the fixture a few MB instead of 100).
@@ -9103,8 +10039,17 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
                  vec(static_cast<size_t>(low_rank) * wide, 4300));
 
     // The PLE table is [ple_dim, rows]: small here, tens of GB in the real file.
-    b.tensor_f32("per_layer_token_embd.weight", {u64(ple_dim), u64(ple_rows)},
-                 vec(static_cast<size_t>(ple_dim) * ple_rows, 4500));
+    // `perturb_ple` shifts every entry, which is the sensitivity arm of
+    // test_qwen4exp_whole_graph: the whole-graph pin has to be able to fail, and
+    // the module whose wiring bug produced that family's garbage text is the
+    // one a perturbation should move.
+    {
+        std::vector<f32> ple = vec(static_cast<size_t>(ple_dim) * ple_rows, 4500);
+        if (perturb_ple)
+            for (f32 &v : ple) v += 3.0f;
+        b.tensor_f32("per_layer_token_embd.weight", {u64(ple_dim), u64(ple_rows)},
+                     ple);
+    }
 
     for (int l = 0; l < n_layer; l++) {
         const std::string p = "blk." + std::to_string(l) + ".";
@@ -9790,6 +10735,1691 @@ static void test_mla_lite() {
                                    invf.data(), sc, 1e-6f);
 }
 
+// DeepSeek-V4 shared-latent MLA (MlaLayout::Shared), the host maths first.
+//
+// This layout is not V2/V3's: ONE latent row per token is both K and V for
+// every head, the rope is the TAIL of that row, and the head count is folded
+// into a grouped low-rank output (per-group blocks of wo_a, then wo_b). Each
+// of those is a place where a wrong implementation still emits finite,
+// plausible vectors, so this group pins them ALGEBRAICALLY and never by text:
+//
+//   * the two orders (per-key accumulation vs weights-then-gather) agree;
+//   * ONE key means softmax 1, so each head's output IS the cached latent --
+//     which pins the q path, the latent norm and the grouped output at once;
+//   * the rope touches only the tail, and the value side reads the UNROTATED
+//     row (the one assumption include/krk/mla_shared.hpp names);
+//   * a saturating sink takes all the mass, so the output is zero;
+//   * a head feeds only its own output group: zero group 0's wo_a block and
+//     rewiring heads 0..hpg-1 must leave the answer bit-for-bit unchanged,
+//     which an off-by-one group stride cannot survive;
+//   * the window excludes keys by POSITION, not by array index.
+static void test_mla_shared() {
+    krk::MlaSharedGeometry g;
+    g.n_embd = 16;
+    g.n_head = 4;
+    g.q_lora = 8;
+    g.kv_lora = 12; // head_dim == key_length == value_length
+    g.qk_rope = 4;  // rotary tail
+    g.o_groups = 2;
+    g.o_lora = 6;
+    CHECK(g.valid(), "synthetic shared-latent geometry is valid");
+    CHECK(g.qk_nope() == 8, "nope is the latent minus the rotary tail");
+    CHECK(g.heads_per_group() == 2, "4 heads split into 2 groups of 2");
+    CHECK(g.cache_row_width() == 12, "K and V are ONE 12-wide row");
+    u32 rng = 0x9e3779b9U;
+    auto rnd = [&]() {
+        rng = rng * 1103515245u + 12345u;
+        return static_cast<f32>((rng >> 20) & 0xff) / 255.0f - 0.5f;
+    };
+    const i32 gout = g.o_groups * g.o_lora;
+    const i32 gin = g.heads_per_group() * g.kv_lora;
+    std::vector<f32> wqa(g.n_embd * g.q_lora), wqan(g.q_lora),
+        wqb(g.q_lora * g.n_head * g.kv_lora), wkv(g.n_embd * g.kv_lora),
+        wkvn(g.kv_lora), woa(gin * gout), wob(gout * g.n_embd),
+        sinks(g.n_head);
+    for (f32 &v : wqa) v = rnd();
+    for (f32 &v : wqan) v = 0.9f + 0.2f * rnd();
+    for (f32 &v : wqb) v = rnd();
+    for (f32 &v : wkv) v = rnd();
+    for (f32 &v : wkvn) v = 0.9f + 0.2f * rnd();
+    for (f32 &v : woa) v = rnd();
+    for (f32 &v : wob) v = rnd();
+    for (f32 &v : sinks) v = 0.25f * rnd();
+    krk::MlaSharedWeights w;
+    w.wq_a = wqa.data();
+    w.wq_a_norm = wqan.data();
+    w.wq_b = wqb.data();
+    w.wkv = wkv.data();
+    w.wkv_norm = wkvn.data();
+    w.wo_a = woa.data();
+    w.wo_b = wob.data();
+    w.sinks = nullptr;
+    std::vector<f32> invf(g.qk_rope / 2);
+    for (i32 i = 0; i < g.qk_rope / 2; i++)
+        invf[static_cast<size_t>(i)] =
+            1.0f / std::pow(10000.0f, static_cast<f32>(2 * i) / g.qk_rope);
+    // A small cache written through the same helper the write path uses.
+    const i32 n_keys = 4;
+    std::vector<f32> cc(n_keys * g.kv_lora);
+    std::vector<i64> kpos(n_keys);
+    for (i32 t = 0; t < n_keys; t++) {
+        std::vector<f32> xt(g.n_embd);
+        for (f32 &v : xt) v = rnd();
+        krk::mla_shared_latent(cc.data() + t * g.kv_lora, xt.data(), w, g,
+                               1e-6f);
+        kpos[static_cast<size_t>(t)] = t;
+    }
+    std::vector<f32> x(g.n_embd);
+    for (f32 &v : x) v = rnd();
+    const i64 q_pos = 3;
+    const f32 sc = 1.0f / std::sqrt(static_cast<f32>(g.kv_lora));
+    std::vector<f32> oa(g.n_embd), og(g.n_embd), og2(g.n_embd);
+    krk::mla_shared_forward_accum(oa.data(), x.data(), cc.data(), kpos.data(),
+                                  n_keys, q_pos, w, g, invf.data(), sc, 1e-6f,
+                                  0);
+    krk::mla_shared_forward_gather(og.data(), x.data(), cc.data(), kpos.data(),
+                                   n_keys, q_pos, w, g, invf.data(), sc, 1e-6f,
+                                   0);
+    krk::mla_shared_forward_gather(og2.data(), x.data(), cc.data(), kpos.data(),
+                                   n_keys, q_pos, w, g, invf.data(), sc, 1e-6f,
+                                   0);
+    double worst = 0.0;
+    bool finite = true;
+    for (i32 i = 0; i < g.n_embd; i++) {
+        const double d = std::fabs(static_cast<double>(oa[i]) - og[i]);
+        if (d > worst) worst = d;
+        if (!std::isfinite(oa[i]) || !std::isfinite(og[i])) finite = false;
+        CHECK(og[i] == og2[i], "shared-latent gather forward is deterministic");
+    }
+    CHECK(finite, "shared-latent outputs are finite");
+    CHECK(worst < 2e-5, "accum and gather orders agree within f32 association");
+
+    // ONE key: softmax is 1, so every head's output is exactly the latent and
+    // the whole answer is the grouped output applied to one row. A wrong
+    // q path or a wrong group stride cannot produce this.
+    std::vector<f32> one_c(g.kv_lora);
+    std::vector<f32> x1(g.n_embd);
+    for (f32 &v : x1) v = rnd();
+    krk::mla_shared_latent(one_c.data(), x1.data(), w, g, 1e-6f);
+    std::vector<i64> one_pos(1, 0);
+    std::vector<f32> one(g.n_embd), one2(g.n_embd);
+    std::vector<f32> yexp(gout, 0.0f), oexp(g.n_embd, 0.0f);
+    for (i32 grp = 0; grp < g.o_groups; grp++)
+        for (i32 j = 0; j < g.o_lora; j++) {
+            f32 s = 0.0f;
+            for (i32 h = 0; h < g.heads_per_group(); h++)
+                for (i32 i = 0; i < g.kv_lora; i++)
+                    s += woa[(h * g.kv_lora + i) * gout + grp * g.o_lora + j] *
+                         one_c[i];
+            yexp[static_cast<size_t>(grp * g.o_lora + j)] = s;
+        }
+    for (i32 j = 0; j < g.n_embd; j++) {
+        f32 s = 0.0f;
+        for (i32 i = 0; i < gout; i++)
+            s += wob[static_cast<size_t>(i * g.n_embd + j)] *
+                 yexp[static_cast<size_t>(i)];
+        oexp[static_cast<size_t>(j)] = s;
+    }
+    krk::mla_shared_forward_accum(one.data(), x1.data(), one_c.data(),
+                                  one_pos.data(), 1, 0, w, g, invf.data(), sc,
+                                  1e-6f, 0);
+    krk::mla_shared_forward_gather(one2.data(), x1.data(), one_c.data(),
+                                   one_pos.data(), 1, 0, w, g, invf.data(),
+                                   sc, 1e-6f, 0);
+    for (i32 j = 0; j < g.n_embd; j++)
+        CHECK_NEAR(one[j], oexp[static_cast<size_t>(j)], 1e-4,
+                   "one key reduces to the grouped output of the latent");
+    for (i32 j = 0; j < g.n_embd; j++)
+        CHECK_NEAR(one2[j], oexp[static_cast<size_t>(j)], 1e-4,
+                   "the gather order agrees on the one-key reduction");
+
+    // The rope is the TAIL: rotating a row must leave dims [0, nope) alone.
+    std::vector<f32> rv(g.kv_lora), rv0;
+    for (i32 i = 0; i < g.kv_lora; i++) rv[i] = static_cast<f32>(i + 1);
+    rv0 = rv;
+    krk::mla_shared_rope_tail(rv.data(), g.kv_lora, g.qk_rope, 3, invf.data());
+    bool nope_still = true, tail_moved = false;
+    for (i32 i = 0; i < g.qk_nope(); i++)
+        if (rv[i] != rv0[i]) nope_still = false;
+    for (i32 i = g.qk_nope(); i < g.kv_lora; i++)
+        if (rv[i] != rv0[i]) tail_moved = true;
+    CHECK(nope_still, "rope leaves the non-rotary prefix untouched");
+    CHECK(tail_moved, "rope rotates the latent TAIL (offset head_dim - n_rot)");
+
+    // Sinks are a denominator term: saturating upwards takes all the mass.
+    std::vector<f32> sink_hi(g.n_head, 1e30f), sink_lo(g.n_head, -1e30f);
+    std::vector<f32> osat(g.n_embd), ono(g.n_embd);
+    krk::MlaSharedWeights ws = w;
+    ws.sinks = sink_hi.data();
+    krk::mla_shared_forward_accum(osat.data(), x.data(), cc.data(),
+                                  kpos.data(), n_keys, q_pos, ws, g,
+                                  invf.data(), sc, 1e-6f, 0);
+    f32 amax = 0.0f;
+    for (f32 v : osat) amax = std::fmax(amax, std::fabs(v));
+    CHECK(amax < 1e-6f, "a saturating sink takes every key's mass, so out ~ 0");
+    ws.sinks = sink_lo.data();
+    krk::mla_shared_forward_accum(ono.data(), x.data(), cc.data(), kpos.data(),
+                                  n_keys, q_pos, ws, g, invf.data(), sc, 1e-6f,
+                                  0);
+    for (i32 j = 0; j < g.n_embd; j++)
+        CHECK(ono[j] == oa[j],
+              "a sink of -inf is the no-sink answer, bit for bit");
+
+    // Group isolation: zero group 0's wo_a block and rewire heads 0..hpg-1.
+    // Those heads feed only group 0, so the answer must not move; a stride
+    // that reads a neighbouring group's columns cannot pass this.
+    std::vector<f32> woa_g = woa, wqb_h = wqb;
+    for (i32 i = 0; i < gin; i++)
+        for (i32 j = 0; j < g.o_lora; j++)
+            woa_g[static_cast<size_t>(i * gout + j)] = 0.0f;
+    for (i32 i = 0; i < g.q_lora; i++)
+        for (i32 h = 0; h < g.heads_per_group(); h++)
+            for (i32 d = 0; d < g.kv_lora; d++)
+                wqb_h[static_cast<size_t>(
+                    i * g.n_head * g.kv_lora + h * g.kv_lora + d)] *= 3.0f;
+    krk::MlaSharedWeights wg = w;
+    wg.wo_a = woa_g.data();
+    std::vector<f32> ogzero(g.n_embd);
+    krk::mla_shared_forward_accum(ogzero.data(), x.data(), cc.data(),
+                                  kpos.data(), n_keys, q_pos, wg, g,
+                                  invf.data(), sc, 1e-6f, 0);
+    // The baseline has to be the SAME zeroed block: zeroing group 0's columns
+    // removes its contribution, so comparing against the unzeroed answer would
+    // fail for the wrong reason (which it did, 16 of 16, on the first run).
+    bool zeroed_changed = false;
+    for (i32 j = 0; j < g.n_embd; j++)
+        if (ogzero[j] != oa[j]) zeroed_changed = true;
+    CHECK(zeroed_changed, "zeroing an output group removes its contribution");
+    wg.wq_b = wqb_h.data();
+    std::vector<f32> ogrp(g.n_embd);
+    krk::mla_shared_forward_accum(ogrp.data(), x.data(), cc.data(), kpos.data(),
+                                  n_keys, q_pos, wg, g, invf.data(), sc, 1e-6f,
+                                  0);
+    for (i32 j = 0; j < g.n_embd; j++)
+        CHECK(ogrp[j] == ogzero[j],
+              "a head feeds only its own output group (stride pin)");
+
+    // The window is a POSITION rule: with window 2 at q_pos 3, keys 0 and 1
+    // are outside it, so replacing their rows must change nothing.
+    std::vector<f32> cc2 = cc;
+    for (i32 i = 0; i < 2 * g.kv_lora; i++) cc2[static_cast<size_t>(i)] = 5.0f;
+    std::vector<f32> ow(g.n_embd), ow2(g.n_embd), oall(g.n_embd);
+    krk::mla_shared_forward_accum(ow.data(), x.data(), cc.data(), kpos.data(),
+                                  n_keys, q_pos, w, g, invf.data(), sc, 1e-6f,
+                                  2);
+    krk::mla_shared_forward_accum(ow2.data(), x.data(), cc2.data(), kpos.data(),
+                                  n_keys, q_pos, w, g, invf.data(), sc, 1e-6f,
+                                  2);
+    krk::mla_shared_forward_accum(oall.data(), x.data(), cc2.data(),
+                                  kpos.data(), n_keys, q_pos, w, g,
+                                  invf.data(), sc, 1e-6f, 0);
+    for (i32 j = 0; j < g.n_embd; j++)
+        CHECK(ow[j] == ow2[j], "the window excludes keys by position");
+    bool window_matters = false;
+    for (i32 j = 0; j < g.n_embd; j++)
+        if (ow[j] != oall[j]) window_matters = true;
+    CHECK(window_matters, "the keys the window excludes do reach the answer");
+
+    // Scale and query position both reach the scores.
+    std::vector<f32> osc(g.n_embd), opos(g.n_embd);
+    krk::mla_shared_forward_accum(osc.data(), x.data(), cc.data(), kpos.data(),
+                                  n_keys, q_pos, w, g, invf.data(), sc * 0.5f,
+                                  1e-6f, 0);
+    CHECK(osc[0] != oa[0] || osc[1] != oa[1], "scale reaches the scores");
+    krk::mla_shared_forward_accum(opos.data(), x.data(), cc.data(), kpos.data(),
+                                  n_keys, q_pos + 1, w, g, invf.data(), sc,
+                                  1e-6f, 0);
+    CHECK(opos[0] != oa[0] || opos[1] != oa[1], "query position is read");
+    // A zero-length cache returns instead of crashing.
+    krk::mla_shared_forward_accum(opos.data(), x.data(), cc.data(), kpos.data(),
+                                  0, q_pos, w, g, invf.data(), sc, 1e-6f, 0);
+}
+
+// MLA backend ops: the CPU reference the HIP kernels are judged against.
+//
+// The suite cannot open the device, so the device arm lives in `kraken-bench
+// --mla` (the same oracle, on the device). What the suite CAN pin is the
+// reference itself, and it has to: `--cpu` is the arm a mismatch is diagnosed
+// against, and a reference that reads the wrong head's block produces the same
+// kind of fluent nonsense as a kernel that does, only more quietly.
+//
+// Every check below fails on a real defect, and they are chosen so that they do
+// not fail on each other:
+//
+//   * the layer output against src/mla.cpp's absorbed oracle, with the table
+//     transposed into the oracle's head-major layout. Dropping the per-head
+//     offset in the query (`q + h*qk`) or in the table read aliases head h with
+//     head 0, and both move this number.
+//   * every head's V columns zeroed but one -> only that head's output slice
+//     may be non-zero. That is the aliasing check in its own right, and it is
+//     exact rather than approximate.
+//   * changing head 0's query leaves the other heads' slices BIT-identical.
+//   * the cache write: the decoupled key is copied verbatim, the latent is
+//     normed over the LATENT alone, and the negative control is the plausible
+//     mistake -- a norm over the whole row, which is off by sqrt(12/8).
+//   * n single-row calls against one n-row call, bit-identical: the cache row is
+//     written by one pass and read by the same pass, so a chunked prefill and a
+//     token-at-a-time decode have to see the same history.
+static void test_mla_backend() {
+    Backend *cpu = make_cpu_backend();
+    const i32 nh = 3, nope = 4, rope = 4, kv = 8, vd = 4, ne = 16;
+    const i64 qk = nope + rope, hv = nope + vd, row = kv + rope;
+    u32 rng = 0x9e3779b9u;
+    auto rnd = [&]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<f32>((rng >> 8) & 0xFFFFu) / 32768.0f - 1.0f;
+    };
+    const i64 n_keys = 5;
+    std::vector<f32> wkvb(static_cast<size_t>(nh * hv * kv));
+    for (f32 &x : wkvb) x = rnd();
+    std::vector<f32> gamma(static_cast<size_t>(kv));
+    for (f32 &g : gamma) g = 0.5f + 0.5f * std::fabs(rnd());
+    std::vector<f32> invf(static_cast<size_t>(rope / 2));
+    for (i64 i = 0; i < rope / 2; i++)
+        invf[static_cast<size_t>(i)] =
+            1.0f / std::pow(10000.0f, static_cast<f32>(2 * i) / rope);
+
+    // The f16 staging the engine builds at load, in the FILE's order: row
+    // (h*hv + j) holds feature j of head h, the latent k its fastest axis.
+    std::vector<u16> wkb16(static_cast<size_t>(nh * hv * kv));
+    for (size_t i = 0; i < wkvb.size(); i++) wkb16[i] = fp32_to_fp16(wkvb[i]);
+
+    // The projection output, as the engine hands it to the cache write.
+    std::vector<f32> proj(static_cast<size_t>(n_keys * row));
+    for (f32 &x : proj) x = 2.0f * rnd();
+    std::vector<f32> cache(static_cast<size_t>(n_keys * row), -999.0f);
+
+    MlaDesc d;
+    d.n_head = nh;
+    d.qk = qk;
+    d.nope = nope;
+    d.rope = rope;
+    d.kv_lora = kv;
+    d.v_dim = vd;
+    d.n_tok = n_keys;
+    d.pos0 = 0;
+    d.pos_stride = row;
+    d.scale = 1.0f / std::sqrt(static_cast<f32>(qk));
+    d.eps = 1e-6f;
+    d.inv_freq = invf.data();
+    cpu->mla_kv_write(cache.data(), proj.data(), gamma.data(), d);
+
+    // ---- the cache row: latent normed, key verbatim ----------------------
+    std::vector<f32> want(static_cast<size_t>(n_keys * row), 0.0f);
+    std::vector<f32> whole(static_cast<size_t>(n_keys * row), 0.0f);
+    for (i64 t = 0; t < n_keys; t++) {
+        f64 ss = 0.0, ss_all = 0.0;
+        for (i64 k = 0; k < kv; k++) {
+            const f64 v = proj[static_cast<size_t>(t * row + k)];
+            ss += v * v;
+        }
+        for (i64 k = 0; k < row; k++) {
+            const f64 v = proj[static_cast<size_t>(t * row + k)];
+            ss_all += v * v;
+        }
+        const f32 inv = 1.0f / std::sqrt(static_cast<f32>(ss / kv) + d.eps);
+        const f32 inv_all = 1.0f / std::sqrt(static_cast<f32>(ss_all / row) + d.eps);
+        for (i64 k = 0; k < kv; k++) {
+            const f32 v = proj[static_cast<size_t>(t * row + k)];
+            want[static_cast<size_t>(t * row + k)] = v * inv * gamma[static_cast<size_t>(k)];
+            whole[static_cast<size_t>(t * row + k)] = v * inv_all * gamma[static_cast<size_t>(k)];
+        }
+        for (i64 j = 0; j < rope; j++)
+            want[static_cast<size_t>(t * row + kv + j)] =
+                proj[static_cast<size_t>(t * row + kv + j)];
+    }
+    f64 worst = 0.0, differs = 0.0;
+    bool key_exact = true;
+    for (i64 t = 0; t < n_keys; t++) {
+        for (i64 k = 0; k < kv; k++) {
+            const size_t i = static_cast<size_t>(t * row + k);
+            worst = std::max(worst, static_cast<f64>(std::fabs(cache[i] - want[i])));
+            differs = std::max(differs,
+                               static_cast<f64>(std::fabs(cache[i] - whole[i])));
+        }
+        for (i64 j = 0; j < rope; j++) {
+            const size_t i = static_cast<size_t>(t * row + kv + j);
+            if (cache[i] != proj[i]) key_exact = false;
+        }
+    }
+    CHECK(worst < 1e-5, "mla_kv_write norms the latent the way the oracle does");
+    CHECK(key_exact,
+          "the decoupled key reaches the cache UNROTATED and unnormed");
+    CHECK(differs > 1e-3,
+          "a norm over the whole row differs, so the latent-only cover is real");
+
+    // ---- the attention, against the oracle -------------------------------
+    std::vector<f32> x(static_cast<size_t>(n_keys * ne));
+    for (f32 &v : x) v = rnd();
+    std::vector<f32> owq(static_cast<size_t>(ne * nh * qk));
+    for (f32 &v : owq) v = rnd();
+    // q[t] = W^T x[t], in the oracle's [in][out] order so both sides see the
+    // same numbers to the last bit.
+    std::vector<f32> q(static_cast<size_t>(n_keys * nh * qk), 0.0f);
+    const i64 qdim = nh * qk;
+    for (i64 t = 0; t < n_keys; t++)
+        for (i64 o = 0; o < qdim; o++) {
+            f32 s = 0.0f;
+            for (i64 i = 0; i < ne; i++)
+                s += owq[static_cast<size_t>(i * qdim + o)] *
+                     x[static_cast<size_t>(t * ne + i)];
+            q[static_cast<size_t>(t * qdim + o)] = s;
+        }
+    std::vector<f32> got(static_cast<size_t>(n_keys * nh * vd), 0.0f);
+    cpu->mla_attention(got.data(), q.data(), cache.data(), wkb16.data(), d);
+
+    // The oracle's tables: the unsplit one head-major, and an output
+    // projection that is a SELECTION so its result is the attention output
+    // itself (this group tests the attention, not wo).
+    std::vector<f32> owb(static_cast<size_t>(nh * kv * hv));
+    for (i32 h = 0; h < nh; h++)
+        for (i64 k = 0; k < kv; k++)
+            for (i64 j = 0; j < hv; j++)
+                // From the f16 staging, not the f32 originals: the backend
+                // reads the narrowed table, and comparing against wider
+                // numbers would measure the storage format instead of the
+                // arithmetic.
+                owb[static_cast<size_t>((h * kv + k) * hv + j)] = fp16_to_fp32(
+                    wkb16[static_cast<size_t>((h * hv + j) * kv + k)]);
+    std::vector<f32> owo(static_cast<size_t>(nh * vd * ne), 0.0f);
+    for (i64 j = 0; j < nh * vd; j++)
+        owo[static_cast<size_t>(j * ne + j)] = 1.0f;
+    // The cache as the oracle takes it: the latent rows and the raw keys.
+    std::vector<f32> cc(static_cast<size_t>(n_keys * kv), 0.0f);
+    std::vector<f32> kk(static_cast<size_t>(n_keys * rope), 0.0f);
+    std::vector<i64> kpos(static_cast<size_t>(n_keys));
+    for (i64 t = 0; t < n_keys; t++) {
+        for (i64 k = 0; k < kv; k++)
+            cc[static_cast<size_t>(t * kv + k)] = cache[static_cast<size_t>(t * row + k)];
+        for (i64 j = 0; j < rope; j++)
+            kk[static_cast<size_t>(t * rope + j)] =
+                cache[static_cast<size_t>(t * row + kv + j)];
+        kpos[static_cast<size_t>(t)] = t;
+    }
+    krk::MlaLiteWeights w;
+    w.wq = owq.data();
+    w.wkv_a_mqa = nullptr;
+    w.wkv_a_norm = gamma.data();
+    w.wkv_b = owb.data();
+    w.wo = owo.data();
+    krk::MlaLiteGeometry g;
+    g.n_embd = ne;
+    g.n_head = nh;
+    g.kv_lora = kv;
+    g.qk = static_cast<i32>(qk);
+    g.qk_rope = rope;
+    g.v_dim = vd;
+    // The oracle writes a whole n_embd row (its output is the residual's
+    // contribution, not the head stack), so each row lands in its own
+    // n_embd-wide row and the first nh*vd of it is what this group compares.
+    std::vector<f32> want_attn(static_cast<size_t>(n_keys * nh * vd), 0.0f);
+    std::vector<f32> orow(static_cast<size_t>(ne));
+    for (i64 t = 0; t < n_keys; t++) {
+        krk::mla_lite_forward_absorbed(orow.data(), x.data() + t * ne,
+                                       cc.data(), kk.data(), kpos.data(), t + 1,
+                                       t, w, g, invf.data(), d.scale, d.eps);
+        for (i64 j = 0; j < nh * vd; j++)
+            want_attn[static_cast<size_t>(t * nh * vd + j)] =
+                orow[static_cast<size_t>(j)];
+    }
+    f64 attn_worst = 0.0, peak = 0.0;
+    for (size_t i = 0; i < want_attn.size(); i++) {
+        peak = std::max(peak, static_cast<f64>(std::fabs(want_attn[i])));
+        attn_worst = std::max(
+            attn_worst, static_cast<f64>(std::fabs(got[i] - want_attn[i])));
+    }
+    CHECK(peak > 0.0, "the oracle's attention output is not all zero");
+    CHECK(attn_worst < 2e-5 * (peak + 1.0),
+          "the backend's MLA attention matches the absorbed oracle");
+
+    // ---- one head at a time ---------------------------------------------
+    // Zero every head's V half but head 1's: heads 0 and 2 have nothing to
+    // accumulate, so their output slices must be exactly zero. A kernel that
+    // reads feature j of the wrong head (or ignores the head offset entirely)
+    // leaves non-zero output here, which is the aliasing defect.
+    {
+        std::vector<f32> one(static_cast<size_t>(nh * hv * kv), 0.0f);
+        for (i64 k = 0; k < kv; k++)
+            for (i64 j = 0; j < hv; j++)
+                one[static_cast<size_t>((1 * hv + j) * kv + k)] =
+                    wkvb[static_cast<size_t>((1 * hv + j) * kv + k)];
+        std::vector<u16> one16(one.size());
+        for (size_t i = 0; i < one.size(); i++) one16[i] = fp32_to_fp16(one[i]);
+        std::vector<f32> o1(static_cast<size_t>(n_keys * nh * vd), 0.0f);
+        cpu->mla_attention(o1.data(), q.data(), cache.data(), one16.data(), d);
+        bool others_zero = true, mine_nonzero = false;
+        for (i64 t = 0; t < n_keys; t++)
+            for (i32 h = 0; h < nh; h++)
+                for (i64 j = 0; j < vd; j++) {
+                    const f32 v =
+                        o1[static_cast<size_t>((t * nh + h) * vd + j)];
+                    if (h == 1) {
+                        if (v != 0.0f) mine_nonzero = true;
+                    } else if (v != 0.0f) {
+                        others_zero = false;
+                    }
+                }
+        CHECK(others_zero,
+              "a head with no V columns contributes nothing to its own slice");
+        CHECK(mine_nonzero, "... and the head that has them does");
+    }
+
+    // ---- the query's own head slice -------------------------------------
+    // Only head 0's query changes: heads 1 and 2 must be BIT-identical, which
+    // holds however the softmax lands (their scores did not move at all).
+    {
+        std::vector<f32> q2 = q;
+        for (i64 t = 0; t < n_keys; t++)
+            for (i64 j = 0; j < qk; j++)
+                q2[static_cast<size_t>(t * qdim + j)] += 0.75f;
+        std::vector<f32> o2(static_cast<size_t>(n_keys * nh * vd), 0.0f);
+        cpu->mla_attention(o2.data(), q2.data(), cache.data(), wkb16.data(), d);
+        bool h0_moved = false, others_same = true;
+        for (i64 t = 0; t < n_keys; t++)
+            for (i32 h = 0; h < nh; h++)
+                for (i64 j = 0; j < vd; j++) {
+                    const size_t i = static_cast<size_t>((t * nh + h) * vd + j);
+                    if (h == 0) {
+                        if (o2[i] != got[i]) h0_moved = true;
+                    } else if (o2[i] != got[i]) {
+                        others_same = false;
+                    }
+                }
+        CHECK(h0_moved, "head 0's query reaches head 0's output");
+        CHECK(others_same, "and no other head's output");
+    }
+
+    // ---- one row at a time ----------------------------------------------
+    // The same five rows as five single-row calls at their own positions,
+    // bit-identical: this is the chunk invariance of the cache the engine
+    // relies on when a prefill is split across chunks.
+    {
+        std::vector<f32> step(static_cast<size_t>(n_keys * nh * vd), 0.0f);
+        for (i64 t = 0; t < n_keys; t++) {
+            MlaDesc dt = d;
+            dt.n_tok = 1;
+            dt.pos0 = t;
+            cpu->mla_attention(step.data() + t * nh * vd,
+                               q.data() + t * qdim, cache.data(), wkb16.data(),
+                               dt);
+        }
+        CHECK(std::memcmp(step.data(), got.data(),
+                          got.size() * sizeof(f32)) == 0,
+              "five single-row calls match one five-row call, bit for bit");
+    }
+    delete cpu;
+}
+
+// MLA loader: the three layouts, the geometry checks, and why the engine
+// refuses to generate from any of them.
+//
+// Three things are pinned, and they fail differently:
+//
+//  1. The LOADER reads the file. Which layout a file carries is decided by the
+//     TENSORS its layers hold, not by the arch string (one arch ships more than
+//     one layout, and a file is what it carries), and every layer has to agree
+//     on it.
+//
+//  2. The GEOMETRY is checked against the file's own metadata, and a
+//     disagreement is named: which tensor, what shape it has, what the metadata
+//     wants. Reading a file whose tensors disagree with its own keys is how a
+//     wrong number becomes a wrong answer.
+//
+//  3. The ENGINE refuses to generate. A file whose attention path has no
+//     implementation here would decode text that is fluent, plausible and not
+//     the model -- the worst failure this engine has -- so the run is refused
+//     after the load. The loader's escape hatch does NOT lift that refusal.
+//
+// The fixture numbers are small but every one of them is a number the loader
+// checks against, so a fixture that loads is a file whose metadata and tensors
+// agree -- which is the property under test.
+
+enum class MlaFixKind { Legacy, Split, Shared };
+
+struct MlaFix {
+    MlaFixKind kind = MlaFixKind::Legacy;
+    int n_layer = 1;
+    bool mixed_layout = false;    // layer 1 carries a different layout
+    bool short_k_b = false;       // attn_k_b one column short
+    bool int32_weight = false;    // attn_k_b written as an int32 table
+    bool bad_hash_shape = false;  // the route table is half the vocab
+    bool no_hash_table = false;   // a hash layer with no route table
+    // The table still loads and still routes, but sends every token somewhere
+    // else -- the arm that proves the whole-graph pin is SENSITIVE to the route
+    // rather than merely to the weights.
+    int hash_shift = 0;
+    // An id past n_expert. The loader checks the table's SHAPE, not its values,
+    // so this is the file the forward's own range check exists for: it must
+    // refuse the run instead of indexing an expert bank out of bounds.
+    bool hash_id_oob = false;
+};
+
+// 261, not 260: add_spm_vocab always writes 3 specials + 256 byte pieces + the
+// two whitespace pieces, so its table is 261 entries whatever size is asked for
+// once the ask is <= 261. n_vocab is the EMBEDDING's width, and the V4 hash
+// table is checked against it -- a 260-row embedding against a 261-piece table
+// would demand a 260-column route table for a file that has 261 tokens.
+static const int kMlaVocab = 261;
+static const int kMlaEmbd = 32;
+static const int kMlaHead = 2;
+static const int kMlaRope = 4;
+static const int kMlaKeyLen = 12;   // nope = key_length - rope = 8
+static const int kMlaValLen = 8;
+static const int kMlaKvLora = 16;
+// 32, not 24: the HIP GEMM refuses an inner width that is not a multiple of
+// 32, and this fixture has to answer on BOTH backends for the device arm to
+// mean anything. Real V4 files declare 1024+, which is a multiple anyway.
+static const int kMlaQLora = 32;
+static const int kMlaFF = 64;
+static const int kMlaExpert = 2;
+static const int kMlaExpertUsed = 1;
+// 32 for the same reason as kMlaQLora: the expert GEMMs run on the device too.
+static const int kMlaFFExp = 32;
+static const int kMlaOGroups = 1;
+static const int kMlaOLora = 8;
+
+static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
+    const bool shared = f.kind == MlaFixKind::Shared;
+    const std::string arch = shared ? "deepseek4" : "deepseek2";
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-mla-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(f.n_layer));
+    b.meta_u32(arch + ".context_length", 64);
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(kMlaEmbd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(kMlaFF));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(kMlaHead));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(kMlaKeyLen));
+    b.meta_u32(arch + ".attention.value_length", static_cast<u32>(kMlaValLen));
+    b.meta_u32(arch + ".rope.dimension_count", static_cast<u32>(kMlaRope));
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    // The V2/V3 class compresses the KV into a latent of kv_lora_rank and keeps
+    // the decoupled rope key beside it. V4 has no kv_lora_rank: its latent is
+    // key_length wide and the rope is its tail.
+    if (!shared)
+        b.meta_u32(arch + ".attention.kv_lora_rank", static_cast<u32>(kMlaKvLora));
+    // A low-rank query trunk: the V3 class and V4 have one, the V2-Lite class
+    // does not (its query projection is direct).
+    if (f.kind != MlaFixKind::Legacy)
+        b.meta_u32(arch + ".attention.q_lora_rank", static_cast<u32>(kMlaQLora));
+    if (shared) {
+        // V4's own metadata: the grouped output projection, the window, the
+        // hash-route depth and the per-layer compression ratios.
+        b.meta_u32(arch + ".attention.output_group_count",
+                   static_cast<u32>(kMlaOGroups));
+        b.meta_u32(arch + ".attention.output_lora_rank",
+                   static_cast<u32>(kMlaOLora));
+        b.meta_u32(arch + ".attention.sliding_window", 128);
+        b.meta_u32(arch + ".hash_layer_count", 1);
+        b.meta_f32(arch + ".attention.compress_rope_freq_base", 10000.0f);
+        std::vector<i32> ratios(static_cast<size_t>(f.n_layer), 0);
+        b.meta_i32_array(arch + ".attention.compress_ratios", ratios);
+        // The hash route is a ROUTED-expert route, so the layer is a MoE one.
+        b.meta_u32(arch + ".expert_count", static_cast<u32>(kMlaExpert));
+        b.meta_u32(arch + ".expert_used_count", static_cast<u32>(kMlaExpertUsed));
+        b.meta_u32(arch + ".expert_feed_forward_length",
+                   static_cast<u32>(kMlaFFExp));
+    }
+    add_spm_vocab(b, kMlaVocab);
+
+    auto w2 = [&](const std::string &name, u64 a, u64 c, i64 seed) {
+        std::vector<f32> d(static_cast<size_t>(a * c));
+        for (size_t i = 0; i < d.size(); i++)
+            d[i] = wv(static_cast<i64>(i) + seed);
+        b.tensor_f16(name, {a, c}, d);
+    };
+    auto w3 = [&](const std::string &name, u64 a, u64 c, u64 e, i64 seed) {
+        std::vector<f32> d(static_cast<size_t>(a * c * e));
+        for (size_t i = 0; i < d.size(); i++)
+            d[i] = wv(static_cast<i64>(i) + seed);
+        b.tensor_f16(name, {a, c, e}, d);
+    };
+    auto ones = [&](const std::string &name, u64 n) {
+        b.tensor_f32(name, {n}, std::vector<f32>(static_cast<size_t>(n), 1.0f));
+    };
+    // An int32 tensor: DATA, the only format that is not a quantization.
+    auto i32_tensor = [&](const std::string &name, const std::vector<u64> &ne,
+                          i32 mod, int shift = 0, bool oob = false) {
+        size_t n = 1;
+        for (u64 d : ne) n *= static_cast<size_t>(d);
+        std::vector<i32> ids(n);
+        for (size_t i = 0; i < ids.size(); i++) {
+            const size_t base = static_cast<size_t>(mod);
+            ids[i] = static_cast<i32>((i + static_cast<size_t>(shift)) % base);
+        }
+        // EVERY slot, not just the first: the forward reads the row of the
+        // token it is given, so a single poisoned cell at a fixed offset would
+        // be invisible for any prompt whose token is not that one -- and the
+        // arm would pass while testing nothing.
+        if (oob)
+            for (size_t i = 0; i < ids.size(); i++) ids[i] = mod;
+        b.tensor_raw(name, 26, ne, ids.data(), ids.size() * sizeof(i32));
+    };
+
+    w2("token_embd.weight", static_cast<u64>(kMlaEmbd),
+       static_cast<u64>(kMlaVocab), 1);
+    ones("output_norm.weight", static_cast<u64>(kMlaEmbd));
+
+    const u64 nope = static_cast<u64>(kMlaKeyLen - kMlaRope);
+    for (int l = 0; l < f.n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        ones(p + "attn_norm.weight", static_cast<u64>(kMlaEmbd));
+        ones(p + "ffn_norm.weight", static_cast<u64>(kMlaEmbd));
+        MlaFixKind kind = f.kind;
+        if (f.mixed_layout && l == 1)
+            kind = (f.kind == MlaFixKind::Legacy) ? MlaFixKind::Split
+                                                  : MlaFixKind::Legacy;
+
+        // ---- the query trunk -------------------------------------------
+        if (kind == MlaFixKind::Legacy) {
+            // attn_q projects straight to n_head*(nope+rope).
+            w2(p + "attn_q.weight", static_cast<u64>(kMlaEmbd),
+               static_cast<u64>(kMlaHead) * static_cast<u64>(kMlaKeyLen), 100 + l);
+        } else {
+            w2(p + "attn_q_a.weight", static_cast<u64>(kMlaEmbd),
+               static_cast<u64>(kMlaQLora), 100 + l);
+            ones(p + "attn_q_a_norm.weight", static_cast<u64>(kMlaQLora));
+            w2(p + "attn_q_b.weight", static_cast<u64>(kMlaQLora),
+               static_cast<u64>(kMlaHead) * static_cast<u64>(kMlaKeyLen), 200 + l);
+        }
+
+        // ---- the KV path -----------------------------------------------
+        if (kind == MlaFixKind::Shared) {
+            // ONE shared latent, key_length wide, the rope in its tail.
+            w2(p + "attn_kv.weight", static_cast<u64>(kMlaEmbd),
+               static_cast<u64>(kMlaKeyLen), 300 + l);
+            ones(p + "attn_kv_a_norm.weight", static_cast<u64>(kMlaKeyLen));
+            // The head count is folded into a GROUPED output projection:
+            // n_head*key_length/o_groups rows into o_lora_rank*o_groups.
+            w2(p + "attn_output_a.weight",
+               static_cast<u64>(kMlaHead) * static_cast<u64>(kMlaKeyLen) /
+                   static_cast<u64>(kMlaOGroups),
+               static_cast<u64>(kMlaOLora) * static_cast<u64>(kMlaOGroups),
+               400 + l);
+            w2(p + "attn_output_b.weight",
+               static_cast<u64>(kMlaOLora) * static_cast<u64>(kMlaOGroups),
+               static_cast<u64>(kMlaEmbd), 500 + l);
+        } else {
+            // The compressed latent with the decoupled rope key beside it.
+            w2(p + "attn_kv_a_mqa.weight", static_cast<u64>(kMlaEmbd),
+               static_cast<u64>(kMlaKvLora + kMlaRope), 300 + l);
+            ones(p + "attn_kv_a_norm.weight", static_cast<u64>(kMlaKvLora));
+            if (kind == MlaFixKind::Legacy) {
+                // One unsplit table: [kv_lora, n_head*(nope+v)].
+                w2(p + "attn_kv_b.weight", static_cast<u64>(kMlaKvLora),
+                   static_cast<u64>(kMlaHead) *
+                       static_cast<u64>(kMlaKeyLen - kMlaRope + kMlaValLen),
+                   400 + l);
+                w2(p + "attn_output.weight",
+                   static_cast<u64>(kMlaHead) * static_cast<u64>(kMlaValLen),
+                   static_cast<u64>(kMlaEmbd), 500 + l);
+            } else {
+                // Two three-dimensional tables, one matrix per head, and the
+                // contraction index is ne[0] in both.
+                const u64 kb_nope = f.short_k_b ? nope - 1 : nope;
+                if (f.int32_weight) {
+                    // The table of ids where a coefficient matrix belongs.
+                    i32_tensor(p + "attn_k_b.weight",
+                               {kb_nope, static_cast<u64>(kMlaKvLora),
+                                static_cast<u64>(kMlaHead)},
+                               7);
+                } else {
+                    w3(p + "attn_k_b.weight", kb_nope,
+                       static_cast<u64>(kMlaKvLora), static_cast<u64>(kMlaHead),
+                       400 + l);
+                }
+                w3(p + "attn_v_b.weight", static_cast<u64>(kMlaKvLora),
+                   static_cast<u64>(kMlaValLen), static_cast<u64>(kMlaHead),
+                   450 + l);
+                w2(p + "attn_output.weight",
+                   static_cast<u64>(kMlaHead) * static_cast<u64>(kMlaValLen),
+                   static_cast<u64>(kMlaEmbd), 500 + l);
+            }
+        }
+
+        // ---- the FFN ---------------------------------------------------
+        if (shared) {
+            // A routed-expert layer: the hash route lives on one.
+            w2(p + "ffn_gate_inp.weight", static_cast<u64>(kMlaEmbd),
+               static_cast<u64>(kMlaExpert), 600 + l);
+            w3(p + "ffn_gate_exps.weight", static_cast<u64>(kMlaEmbd),
+               static_cast<u64>(kMlaFFExp), static_cast<u64>(kMlaExpert),
+               610 + l);
+            w3(p + "ffn_up_exps.weight", static_cast<u64>(kMlaEmbd),
+               static_cast<u64>(kMlaFFExp), static_cast<u64>(kMlaExpert),
+               620 + l);
+            w3(p + "ffn_down_exps.weight", static_cast<u64>(kMlaFFExp),
+               static_cast<u64>(kMlaEmbd), static_cast<u64>(kMlaExpert),
+               630 + l);
+            if (!f.no_hash_table) {
+                // The route table: one expert id per selected expert, one
+                // column per token id. DATA, never multiplied.
+                const u64 ntok = f.bad_hash_shape
+                                     ? static_cast<u64>(kMlaVocab / 2)
+                                     : static_cast<u64>(kMlaVocab);
+                i32_tensor(p + "ffn_gate_tid2eid.weight",
+                           {static_cast<u64>(kMlaExpertUsed), ntok},
+                           kMlaExpert, f.hash_shift, f.hash_id_oob);
+            }
+        } else {
+            w2(p + "ffn_gate.weight", static_cast<u64>(kMlaEmbd),
+               static_cast<u64>(kMlaFF), 600 + l);
+            w2(p + "ffn_up.weight", static_cast<u64>(kMlaEmbd),
+               static_cast<u64>(kMlaFF), 610 + l);
+            w2(p + "ffn_down.weight", static_cast<u64>(kMlaFF),
+               static_cast<u64>(kMlaEmbd), 620 + l);
+        }
+    }
+    return b.write(path);
+}
+
+static void test_mla_loader() {
+    // The hatch is a LOADER switch and is off for the first arm on purpose:
+    // without it a refused schema is refused before a tensor is read.
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+    std::vector<std::string> made;
+
+    // ---- 0. without the hatch the refused ARCH is refused ----------------
+    // The refusal has to name the architecture: a file refused for its geometry
+    // would send the next reader looking for a wrong tensor. The legacy lite
+    // layout is implemented now, so it is no longer the arch that refuses a
+    // deepseek2 file -- the shared-latent one (deepseek4) still has no graph, so
+    // that is the fixture this arm loads. The legacy fixture is written here
+    // because every arm below reads it.
+    {
+        const std::string legacy = "kraken-mla-legacy.gguf";
+        MlaFix lf;
+        lf.kind = MlaFixKind::Legacy;
+        CHECK(build_mla_fixture(legacy, lf), "wrote the legacy-layout fixture");
+        made.push_back(legacy);
+
+        // The shared-latent schema has a graph now, so it LOADS without the
+        // hatch. That is the row's claim (`Partial`, attention implemented)
+        // checked from the loader's side; the whole-graph group checks the same
+        // claim end to end. A refusal here would be the table disagreeing with
+        // the engine, which is the state this arm used to pin.
+        const std::string path = "kraken-mla-shared-loads.gguf";
+        MlaFix f;
+        f.kind = MlaFixKind::Shared;
+        CHECK(build_mla_fixture(path, f), "wrote the shared-latent fixture");
+        made.push_back(path);
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string err;
+        CHECK(m.load(*cpu, path, &err),
+              "the shared-latent schema loads without the hatch");
+        if (!err.empty()) std::fprintf(stderr, "  (load: %s)\n", err.c_str());
+        CHECK(m.cfg().mla_layout == MlaLayout::Shared,
+              "... as the shared layout, which is what the engine dispatches on");
+        m.unload();
+        delete cpu;
+
+        // The layout this build runs is NOT refused without the hatch: the
+        // table's verdict is about the architecture, and this one has an
+        // implementation, so the file loads with no switch set.
+        Backend *cpu2 = make_cpu_backend();
+        Model m2;
+        std::string err2;
+        CHECK(m2.load(*cpu2, legacy, &err2),
+              "the legacy lite layout loads without the hatch");
+        m2.unload();
+        delete cpu2;
+    }
+
+    // The hatch is set from here on: the loader reads the tensors of a
+    // half-ported schema so the layout and the geometry can be checked. It does
+    // NOT make the file runnable, and the last arm proves that.
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+
+    // ---- 1. the legacy lite layout (DeepSeek-V2-Lite) --------------------
+    {
+        const std::string path = "kraken-mla-legacy.gguf";
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string err;
+        const bool ok = m.load(*cpu, path, &err);
+        CHECK(ok, "the legacy lite layout loads");
+        if (!ok) std::fprintf(stderr, "  (load: %s)\n", err.c_str());
+        if (ok) {
+            const ModelConfig &mc = m.cfg();
+            CHECK(mc.mla && mc.mla_layout == MlaLayout::Legacy,
+                  "the layout is the legacy one, read from the tensors");
+            CHECK(mc.mla_kv_lora == kMlaKvLora,
+                  "the compressed latent's rank is read (kv_lora_rank)");
+            CHECK(mc.mla_qk_nope == kMlaKeyLen - kMlaRope &&
+                      mc.mla_qk_rope == kMlaRope,
+                  "nope is key_length minus the rope, and the rope is the tail");
+            CHECK(mc.mla_v_dim == kMlaValLen, "the value width is read");
+            CHECK(mc.mla_q_lora == 0,
+                  "the legacy class has no low-rank query trunk");
+            const LayerWeights &L0 = m.layers()[0];
+            CHECK(L0.wq_direct.present() && L0.wq_direct.n_in == kMlaEmbd &&
+                      L0.wq_direct.n_out == kMlaHead * kMlaKeyLen,
+                  "the direct query projection is [n_embd -> n_head*(nope+rope)]");
+            CHECK(L0.wkv_a_mqa.present() &&
+                      L0.wkv_a_mqa.n_in == kMlaEmbd &&
+                      L0.wkv_a_mqa.n_out == kMlaKvLora + kMlaRope,
+                  "the MQA projection is kv_lora + rope wide");
+            CHECK(L0.wkv_a_norm != nullptr, "the latent's rms norm is uploaded");
+            CHECK(L0.wkv_b.present() && L0.wkv_b.n_in == kMlaKvLora &&
+                      L0.wkv_b.n_out ==
+                          kMlaHead * (kMlaKeyLen - kMlaRope + kMlaValLen),
+                  "the unsplit per-head table is [kv_lora -> n_head*(nope+v)]");
+            CHECK(L0.wo.present() && L0.wo.n_in == kMlaHead * kMlaValLen &&
+                      L0.wo.n_out == kMlaEmbd,
+                  "the output projection is [n_head*v -> n_embd]");
+            CHECK(!L0.wq_a.present() && !L0.wq_b.present() &&
+                      !L0.wkv.present() && !L0.wk_b.present() &&
+                      !L0.wv_b.present() && !L0.wo_a.present(),
+                  "no tensor of another layout is invented");
+        }
+        m.unload();
+        delete cpu;
+    }
+
+    // ---- 2. the split layout (the V3 class) -----------------------------
+    {
+        const std::string path = "kraken-mla-split.gguf";
+        MlaFix f;
+        f.kind = MlaFixKind::Split;
+        CHECK(build_mla_fixture(path, f), "wrote the split-layout fixture");
+        made.push_back(path);
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string err;
+        const bool ok = m.load(*cpu, path, &err);
+        CHECK(ok, "the split layout loads");
+        if (!ok) std::fprintf(stderr, "  (load: %s)\n", err.c_str());
+        if (ok) {
+            const ModelConfig &mc = m.cfg();
+            CHECK(mc.mla_layout == MlaLayout::Split,
+                  "the layout is the split one");
+            CHECK(mc.mla_q_lora == kMlaQLora,
+                  "the query trunk's rank is read (q_lora_rank)");
+            const LayerWeights &L0 = m.layers()[0];
+            CHECK(L0.wq_a.present() && L0.wq_a.n_out == kMlaQLora &&
+                      L0.wq_a_norm != nullptr,
+                  "the low-rank query projection and its norm are loaded");
+            CHECK(L0.wq_b.present() && L0.wq_b.n_in == kMlaQLora &&
+                      L0.wq_b.n_out == kMlaHead * kMlaKeyLen,
+                  "the query expansion is [q_lora -> n_head*(nope+rope)]");
+            CHECK(L0.wkv_a.present() &&
+                      L0.wkv_a.n_out == kMlaKvLora + kMlaRope,
+                  "the compressed latent carries the decoupled key beside it");
+            CHECK(L0.wkv_norm != nullptr, "the latent's norm is uploaded");
+            CHECK(L0.wk_b.present() &&
+                      L0.wk_b.n_in == kMlaKeyLen - kMlaRope &&
+                      L0.wk_b.n_out == kMlaKvLora * kMlaHead,
+                  "the per-head key table contracts the nope part");
+            CHECK(L0.wv_b.present() && L0.wv_b.n_in == kMlaKvLora &&
+                      L0.wv_b.n_out == kMlaValLen * kMlaHead,
+                  "the per-head value table contracts the latent");
+            CHECK(!L0.wkv_b.present() && !L0.wkv_a_mqa.present() &&
+                      !L0.wq_direct.present(),
+                  "no tensor of another layout is invented");
+        }
+        m.unload();
+        delete cpu;
+    }
+
+    // ---- 3. the shared latent (DeepSeek-V4) -----------------------------
+    {
+        const std::string path = "kraken-mla-shared.gguf";
+        MlaFix f;
+        f.kind = MlaFixKind::Shared;
+        CHECK(build_mla_fixture(path, f), "wrote the shared-latent fixture");
+        made.push_back(path);
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string err;
+        const bool ok = m.load(*cpu, path, &err);
+        CHECK(ok, "the shared-latent layout loads");
+        if (!ok) std::fprintf(stderr, "  (load: %s)\n", err.c_str());
+        if (ok) {
+            const ModelConfig &mc = m.cfg();
+            CHECK(mc.mla_layout == MlaLayout::Shared,
+                  "the layout is the shared-latent one");
+            CHECK(mc.dsv4 && mc.dsv4_o_groups == kMlaOGroups &&
+                      mc.dsv4_o_lora == kMlaOLora,
+                  "V4's grouped output projection is read");
+            CHECK(mc.dsv4_window == 128 && mc.dsv4_hash_layers == 1,
+                  "the window and the hash-route depth are read");
+            CHECK(mc.dsv4_ratio.size() == 1 && mc.dsv4_ratio[0] == 0,
+                  "the per-layer compression ratios are read");
+            const LayerWeights &L0 = m.layers()[0];
+            CHECK(L0.wkv.present() && L0.wkv.n_in == kMlaEmbd &&
+                      L0.wkv.n_out == kMlaKeyLen,
+                  "the shared latent is key_length wide");
+            CHECK(L0.wkv_norm != nullptr, "its norm is uploaded");
+            CHECK(L0.wo_a.present() &&
+                      L0.wo_a.n_in == kMlaHead * kMlaKeyLen / kMlaOGroups &&
+                      L0.wo_a.n_out == kMlaOLora * kMlaOGroups,
+                  "the grouped output projection folds the head count in");
+            CHECK(L0.wo_b.present() &&
+                      L0.wo_b.n_in == kMlaOLora * kMlaOGroups &&
+                      L0.wo_b.n_out == kMlaEmbd,
+                  "... and the second half returns to n_embd");
+            CHECK(!L0.wo.present() && !L0.wkv_b.present() &&
+                      !L0.wq_direct.present(),
+                  "a shared-latent file has none of the other layouts' names");
+            // The hash route: a table of expert IDS, read on the host and
+            // never uploaded. It is data, and the loader has to know that.
+            CHECK(L0.tid2eid.size() ==
+                      static_cast<size_t>(kMlaExpertUsed) * kMlaVocab,
+                  "the route table is read as data, one id per token");
+            CHECK(L0.tid2eid_per_token == kMlaExpertUsed &&
+                      L0.tid2eid_n_tokens == kMlaVocab,
+                  "its shape is the one the metadata declares");
+            CHECK(!L0.tid2eid.empty() && L0.tid2eid[0] >= 0 &&
+                      L0.tid2eid[0] < kMlaExpert,
+                  "and the ids are the ones the file names");
+
+
+            // ---- the f16 staging the shared-latent ops read -----------------
+            // Presence alone would not catch a staging that put the right
+            // numbers in the wrong places, and that is the one error the
+            // shapes cannot see: both output tables are ONE matrix in the file
+            // and a group owns a column block of it. So every element of every
+            // staged table is compared against the fixture's own generator,
+            // read in the file's order -- and one arm proves the comparison
+            // can fail.
+            auto dl16 = [&](const QuantTensor &t) {
+                std::vector<u16> h(static_cast<size_t>(t.n_in * t.n_out));
+                cpu->download(h.data(), t.data, h.size() * 2, 0);
+                return h;
+            };
+            auto stage_exact = [&](const char *what, const QuantTensor &t,
+                                   i64 n_in, i64 n_out, i64 seed,
+                                   const char *shape_msg, const char *bytes_msg) {
+                CHECK(t.present() && t.type == DType::F16 && t.n_in == n_in &&
+                          t.n_out == n_out, shape_msg);
+                if (!t.present()) return;
+                const std::vector<u16> h = dl16(t);
+                i64 wrong = 0, first = -1;
+                for (i64 r = 0; r < n_out; r++)
+                    for (i64 c = 0; c < n_in; c++) {
+                        const u16 want = fp32_to_fp16(wv(r * n_in + c + seed));
+                        if (h[static_cast<size_t>(r * n_in + c)] != want) {
+                            if (first < 0) first = r * n_in + c;
+                            wrong++;
+                        }
+                    }
+                CHECK(wrong == 0, bytes_msg);
+                if (wrong)
+                    std::fprintf(stderr,
+                                 "  (%s: %lld of %lld differ, first at %lld)\n",
+                                 what, static_cast<long long>(wrong),
+                                 static_cast<long long>(n_in * n_out),
+                                 static_cast<long long>(first));
+            };
+            stage_exact("wq_a16", L0.wq_a16, kMlaEmbd, kMlaQLora, 100,
+                        "attn_q_a is staged as f16 [n_embd, q_lora]",
+                        "its bytes are the host dequant, in the file's order");
+            stage_exact("wq_b16", L0.wq_b16, kMlaQLora, kMlaHead * kMlaKeyLen,
+                        200,
+                        "attn_q_b is staged as f16 [q_lora, n_head*key_length]",
+                        "its bytes are the host dequant, in the file's order");
+            stage_exact("wkv16", L0.wkv16, kMlaEmbd, kMlaKeyLen, 300,
+                        "attn_kv is staged as f16 [n_embd, key_length]",
+                        "its bytes are the host dequant, in the file's order");
+            stage_exact("wo_a16", L0.wo_a16,
+                        kMlaHead * kMlaKeyLen / kMlaOGroups,
+                        kMlaOLora * kMlaOGroups, 400,
+                        "attn_output_a is staged as f16 per group",
+                        "its bytes are the host dequant, group block first");
+            stage_exact("wo_b16", L0.wo_b16, kMlaOLora * kMlaOGroups, kMlaEmbd,
+                        500,
+                        "attn_output_b is staged as f16 [o_lora*n_groups, n_embd]",
+                        "its bytes are the host dequant, in the file's order");
+            // The negative control: the same bytes read TRANSPOSED must
+            // disagree, or the comparison above could not have failed and the
+            // gate would pass a staging that swapped the two axes.
+            if (L0.wkv16.present()) {
+                const std::vector<u16> h = dl16(L0.wkv16);
+                i64 wrong = 0;
+                for (i64 r = 0; r < kMlaKeyLen; r++)
+                    for (i64 c = 0; c < kMlaEmbd; c++) {
+                        const u16 want = fp32_to_fp16(wv(r * kMlaEmbd + c + 300));
+                        if (h[static_cast<size_t>(c * kMlaKeyLen + r)] != want)
+                            wrong++;
+                    }
+                CHECK(wrong > 0,
+                      "reading the staged latent transposed does not match");
+            }
+        }
+        m.unload();
+        delete cpu;
+    }
+
+    // ---- 4. layers that disagree on the layout --------------------------
+    {
+        const std::string path = "kraken-mla-mixed.gguf";
+        MlaFix f;
+        f.kind = MlaFixKind::Split;
+        f.n_layer = 2;
+        f.mixed_layout = true;
+        CHECK(build_mla_fixture(path, f),
+              "wrote a file whose layers disagree");
+        made.push_back(path);
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string err;
+        CHECK(!m.load(*cpu, path, &err),
+              "a file whose layers carry different layouts is refused");
+        CHECK(err.find("layer 1") != std::string::npos &&
+                  err.find("layer 0") != std::string::npos,
+              "... and the refusal names both layers");
+        m.unload();
+        delete cpu;
+    }
+
+    // ---- 5. a tensor that disagrees with the file's own metadata --------
+    {
+        const std::string path = "kraken-mla-short.gguf";
+        MlaFix f;
+        f.kind = MlaFixKind::Split;
+        f.short_k_b = true;
+        CHECK(build_mla_fixture(path, f), "wrote a file with a short attn_k_b");
+        made.push_back(path);
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string err;
+        CHECK(!m.load(*cpu, path, &err),
+              "a tensor that disagrees with the metadata is refused");
+        CHECK(err.find("attn_k_b") != std::string::npos,
+              "... and the refusal names the tensor");
+        CHECK(err.find("7") != std::string::npos &&
+                  err.find("8") != std::string::npos,
+              "... and gives both shapes");
+        m.unload();
+        delete cpu;
+    }
+
+    // ---- 6. an int32 table where a weight belongs -----------------------
+    {
+        const std::string path = "kraken-mla-i32.gguf";
+        MlaFix f;
+        f.kind = MlaFixKind::Split;
+        f.int32_weight = true;
+        CHECK(build_mla_fixture(path, f),
+              "wrote a file whose attn_k_b is a table");
+        made.push_back(path);
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string err;
+        CHECK(!m.load(*cpu, path, &err),
+              "an int32 table is not accepted as a matmul weight");
+        CHECK(err.find("int32") != std::string::npos,
+              "... and the refusal says the format is data, not a weight");
+        m.unload();
+        delete cpu;
+    }
+
+    // ---- 7. the hash route's table --------------------------------------
+    {
+        const std::string path = "kraken-mla-hash.gguf";
+        MlaFix f;
+        f.kind = MlaFixKind::Shared;
+        f.bad_hash_shape = true;
+        CHECK(build_mla_fixture(path, f),
+              "wrote a file with a short route table");
+        made.push_back(path);
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string err;
+        CHECK(!m.load(*cpu, path, &err),
+              "a route table of another shape is refused");
+        CHECK(err.find("ffn_gate_tid2eid") != std::string::npos,
+              "... and the refusal names the table");
+        m.unload();
+        delete cpu;
+    }
+    {
+        const std::string path = "kraken-mla-nohash.gguf";
+        MlaFix f;
+        f.kind = MlaFixKind::Shared;
+        f.no_hash_table = true;
+        CHECK(build_mla_fixture(path, f), "wrote a file with no route table");
+        made.push_back(path);
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string err;
+        CHECK(!m.load(*cpu, path, &err),
+              "a hash layer with no route table is refused");
+        CHECK(err.find("ffn_gate_tid2eid") != std::string::npos,
+              "... and the refusal names the table that is missing");
+        m.unload();
+        delete cpu;
+    }
+
+    // ---- 8. the ENGINE: what runs, and what is refused -------------------
+    //
+    // Two different claims, and the group needs both. The legacy lite layout is
+    // IMPLEMENTED, so a V2-Lite file has to initialise and generate -- a group
+    // that only tested refusals would pass over a missing graph. The split (V3
+    // class) and shared-latent (V4) layouts are different computations, so a
+    // file carrying one is refused AFTER the load: a run would decode fluent
+    // text out of the wrong graph, which is the failure this engine must not
+    // produce. The loader's hatch does not lift that, because the hatch is
+    // about reading tensors and this is about the graph.
+    {
+        Backend *cpu = make_cpu_backend();
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = "kraken-mla-legacy.gguf";
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        std::string err;
+        const bool ok = engine.init(cpu, cfg, &err);
+        CHECK(ok, "the legacy lite layout initialises");
+        if (!err.empty()) std::fprintf(stderr, "  (init: %s)\n", err.c_str());
+        if (ok) CHECK(engine.kv_pos() == 0, "... with an empty cache at position 0");
+        engine.shutdown();
+        delete cpu;
+    }
+    // The SPLIT layout (V3 class) still has no graph, and that is now the only
+    // one the engine refuses by layout: the shared-latent layout runs (see
+    // test_dsv4_whole_graph), so a refusal for it here would mean the two
+    // claims disagree.
+    {
+        Backend *cpu = make_cpu_backend();
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = "kraken-mla-split.gguf";
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        std::string err;
+        const bool ok = engine.init(cpu, cfg, &err);
+        CHECK(!ok, "the engine refuses the split layout, whose graph is absent");
+        std::fprintf(stderr, "  (refused split: %s)\n", err.c_str());
+        CHECK(err.find("MLA layout") != std::string::npos,
+              "... and the refusal names the layout");
+        CHECK(err.find("wrong graph") != std::string::npos ||
+                  err.find("not this model") != std::string::npos,
+              "... and says the text would not be the model's");
+        engine.shutdown();
+        delete cpu;
+    }
+
+
+    // The hatch does NOT lift the engine's guard, and the premise is checked
+    // rather than assumed. Both halves are load-bearing: a refusal that came
+    // from the LOAD would read identically at the engine arm above, and would
+    // mean the loader never accepted the tensors at all -- the trap AGENTS.md
+    // records for a check placed above `model_.load()`, where every file looks
+    // refused for the right reason and none of them is.
+    {
+        Backend *cpu = make_cpu_backend();
+        const char *hatch = std::getenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+        CHECK(hatch && std::strcmp(hatch, "1") == 0,
+              "the loader's escape hatch is in force for the engine arm");
+        Model m;
+        std::string err;
+        const bool ok = m.load(*cpu, "kraken-mla-shared.gguf", &err);
+        CHECK(ok && m.cfg().mla_layout == MlaLayout::Shared,
+              "the file the engine refused LOADS under the hatch, as the "
+              "shared-latent layout");
+        if (!ok) std::fprintf(stderr, "  (load: %s)\n", err.c_str());
+        m.unload();
+        delete cpu;
+    }
+
+    for (const std::string &p : made) std::remove(p.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
+// DeepSeek-V4's hash route: the first `hash_layer_count` layers take their
+// experts from `ffn_gate_tid2eid.weight` by TOKEN ID, not from the router.
+//
+// The defect this group exists for is a layout error: a column-major read of
+// the same table is in range, stable, and sends every token to a different
+// token's experts. No downstream stage can notice -- the table is the ground
+// truth for the route -- so the pins are structural: token-major stride, one
+// table per layer, layer depth honoured, ids range-checked, duplicates kept,
+// and the gather in TABLE order rather than sorted.
+static void test_dsv4_hash_route() {
+    const i32 n_expert = 8, per_token = 2, n_tokens = 6, n_hash = 2;
+    // Token-major: row t is {2t, 2t+1}. Token 1's first id is 2, where a
+    // column-major read would answer 1 (table[1]) -- the exact confusion.
+    std::vector<i32> t0(n_tokens * per_token), t1(n_tokens * per_token);
+    for (i32 t = 0; t < n_tokens; t++)
+        for (i32 s = 0; s < per_token; s++) {
+            t0[static_cast<size_t>(t * per_token + s)] = (2 * t + s) % n_expert;
+            t1[static_cast<size_t>(t * per_token + s)] =
+                (2 * t + s + 3) % n_expert;
+        }
+    i32 out[8] = {0};
+    CHECK(krk::dsv4_hash_route(out, 0, n_hash, t0.data(), per_token, n_tokens,
+                               3, n_expert),
+          "a hash layer routes a token that the table covers");
+    CHECK(out[0] == 6 && out[1] == 7, "the route is the token's own row");
+    i32 o1[8] = {0};
+    CHECK(krk::dsv4_hash_route(o1, 1, n_hash, t1.data(), per_token, n_tokens,
+                               3, n_expert),
+          "a second hash layer routes from its own table");
+    CHECK(o1[0] == 1 && o1[1] == 2,
+          "each hash layer has its own table (layer 1 differs from layer 0)");
+    // TOKEN-major stride. Token 1 slot 0 is 2; a column-major read answers 1.
+    i32 ot[8] = {0};
+    CHECK(krk::dsv4_hash_route(ot, 0, n_hash, t0.data(), per_token, n_tokens,
+                               1, n_expert),
+          "token 1 routes");
+    CHECK(ot[0] == 2, "the table is TOKEN-major (a column-major read gives 1)");
+    CHECK(ot[0] != t0[1], "the stride pin is not vacuous");
+    // A wrong table of the same shape MUST change the chosen experts, or the
+    // gate would pass on a lookup that ignores its input.
+    std::vector<i32> wrong(t0.size());
+    for (size_t i = 0; i < t0.size(); i++)
+        wrong[i] = (t0[i] + 1) % n_expert;
+    i32 ow[8] = {0};
+    CHECK(krk::dsv4_hash_route(ow, 0, n_hash, wrong.data(), per_token,
+                               n_tokens, 3, n_expert),
+          "a shifted table still routes");
+    CHECK(ow[0] != out[0] || ow[1] != out[1],
+          "a different table changes the chosen experts");
+    // Depth: layer n_hash is NOT a hash layer.
+    i32 od[8] = {-7, -7};
+    CHECK(!krk::dsv4_hash_route(od, n_hash, n_hash, t0.data(), per_token,
+                                n_tokens, 3, n_expert),
+          "a layer at or past hash_layer_count routes by gate, not by table");
+    CHECK(od[0] == -7 && od[1] == -7,
+          "a refused route writes nothing (no half route left behind)");
+    // Coverage: the token id must be in the table.
+    CHECK(!krk::dsv4_hash_route(od, 0, n_hash, t0.data(), per_token, n_tokens,
+                                n_tokens, n_expert),
+          "a token id past the table is refused");
+    CHECK(!krk::dsv4_hash_route(od, 0, n_hash, t0.data(), per_token, n_tokens,
+                                -1, n_expert),
+          "a negative token id is refused");
+    CHECK(!krk::dsv4_hash_route(od, 0, n_hash, nullptr, per_token, n_tokens, 0,
+                                n_expert),
+          "an empty table is refused");
+    CHECK(!krk::dsv4_hash_route(od, 0, n_hash, t0.data(), 0, n_tokens, 0,
+                                n_expert),
+          "a zero-width table is refused");
+    // An id outside the expert range is a corrupt/misread table, not a route.
+    std::vector<i32> bad(t0);
+    bad[static_cast<size_t>(0 * per_token + 1)] = n_expert;
+    CHECK(!krk::dsv4_hash_route(od, 0, n_hash, bad.data(), per_token, n_tokens,
+                                0, n_expert),
+          "an expert id past n_expert is refused");
+    bad[static_cast<size_t>(0 * per_token + 1)] = -1;
+    CHECK(!krk::dsv4_hash_route(od, 0, n_hash, bad.data(), per_token, n_tokens,
+                                0, n_expert),
+          "a negative expert id is refused");
+    CHECK(od[0] == -7 && od[1] == -7,
+          "a refused id check also writes nothing");
+    // Duplicates are what the file says: no dedupe, count preserved.
+    std::vector<i32> dup(t0);
+    dup[0] = 4;
+    dup[1] = 4;
+    i32 odup[8] = {-7, -7};
+    CHECK(krk::dsv4_hash_route(odup, 0, n_hash, dup.data(), per_token,
+                               n_tokens, 0, n_expert),
+          "a row naming one expert twice still routes");
+    CHECK(odup[0] == 4 && odup[1] == 4,
+          "duplicate ids are preserved, not deduplicated");
+    // The weights come from the router's scores, gathered in TABLE order.
+    const f32 scores[8] = {0.0f, 10.0f, 20.0f, 30.0f,
+                           40.0f, 50.0f, 60.0f, 70.0f};
+    f32 ws[2] = {0.0f, 0.0f};
+    const i32 ids[2] = {6, 7};
+    CHECK(krk::dsv4_hash_gather(ws, ids, 2, scores, n_expert),
+          "the selected ids' scores are gathered");
+    CHECK(ws[0] == 60.0f && ws[1] == 70.0f, "the gather reads the ids' scores");
+    const i32 rev[2] = {7, 6};
+    f32 wr[2] = {0.0f, 0.0f};
+    CHECK(krk::dsv4_hash_gather(wr, rev, 2, scores, n_expert),
+          "the gather accepts a reversed route");
+    CHECK(wr[0] == 70.0f && wr[1] == 60.0f,
+          "the gather keeps TABLE order (a sorted gather swaps the weights)");
+    const i32 badid[2] = {6, n_expert};
+    CHECK(!krk::dsv4_hash_gather(ws, badid, 2, scores, n_expert),
+          "the gather refuses an id outside the score row");
+}
+
+// The whole V4 file, end to end: loader -> per-layer shared-latent attention ->
+// hash-routed MoE -> head. Every piece already had a gate of its own
+// (test_mla_loader, test_mla_shared, test_dsv4_hash_route) and NONE of them
+// pinned a sentence, which is exactly how qwen4exp passed 16 per-block checks
+// while decoding nonsense (the PLE normalisation bug). This group pins the
+// OUTPUT:
+//
+//   1. the fixture loads with no development hatch -- the claim a supported
+//      arch row makes, checked rather than assumed;
+//   2. the last prompt position's WHOLE logits row hashes to the recorded value
+//      and its argmax is the recorded token;
+//   3. a different prompt moves the row (the graph reads its input);
+//   4. chunk 1 reproduces the chunk-8 row exactly (the row arithmetic is
+//      bit-exact inside the thin-row ladder this 1-token prompt sits on);
+//   5. a SHIFTED hash table moves the row, and an out-of-range id makes the run
+//      REFUSE -- the pin can fail, and it fails on the route as well as on the
+//      weights;
+//   6. the greedy sequence is the recorded one, at both chunk sizes.
+//
+// The row, not the tokens, is the load-bearing pin: this fixture's synthetic
+// head can argmax one token and stop, and this repo has already been bitten by a
+// gate that compared only the sampled token (the attention rewrite produced the
+// same first token from two different kernels).
+static void test_dsv4_whole_graph() {
+    const std::string path = "../kraken-dsv4whole.gguf";  // DEBUG path
+    const std::string shifted = "kraken-dsv4whole-shift.gguf";
+    const std::string oob = "kraken-dsv4whole-oob.gguf";
+    MlaFix f;
+    f.kind = MlaFixKind::Shared;
+    CHECK(build_mla_fixture(path, f), "the shared-latent fixture writes");
+    MlaFix fs = f;
+    fs.hash_shift = 1;
+    CHECK(build_mla_fixture(shifted, fs),
+          "and a copy whose hash table sends every token to the next expert");
+    MlaFix fo = f;
+    fo.hash_id_oob = true;
+    CHECK(build_mla_fixture(oob, fo),
+          "and one whose table names an expert past the bank");
+
+    // The hatch is NOT set in this group, on purpose: arm 1 is the claim the
+    // arch row now makes (`Partial`, attention implemented).
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+
+    {
+        Backend *cpu = make_cpu_backend();
+        Model model;
+        std::string err;
+        CHECK(model.load(*cpu, path, &err),
+              "deepseek4 loads with no development hatch");
+        if (!err.empty()) std::fprintf(stderr, "  (load: %s)\n", err.c_str());
+        model.unload();
+        delete cpu;
+    }
+
+    auto row_hash = [](const f32 *v, i32 n) {
+        u64 h = 1469598103934665603ull;
+        for (i32 i = 0; i < n; i++) {
+            u32 bits = 0;
+            std::memcpy(&bits, &v[i], sizeof(bits));
+            h ^= bits;
+            h *= 1099511628211ull;
+        }
+        return h;
+    };
+
+    // Prefill only (max_tokens 0), so the row read afterwards is the one at the
+    // last prompt position -- the row a decode starts from.
+    auto run = [&](const std::string &file, const char *prompt, i32 chunk,
+                   u64 *hash, i32 *top1, std::string *why) -> bool {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = file;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = chunk;
+            std::string err;
+            if (!engine.init(cpu, cfg, &err)) {
+                if (why) *why = err;
+                if (!err.empty()) std::fprintf(stderr, "  (init: %s)\n", err.c_str());
+            } else {
+                GenerateParams p;
+                p.prompt = prompt;
+                p.max_tokens = 0;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(p, &r) && r.finish != FinishError;
+                if (!ok && why) *why = engine.forward_failure();
+                const f32 *lg = engine.last_logits();
+                const i32 nv = engine.model().cfg().n_vocab;
+                if (ok && lg && nv > 0) {
+                    *hash = row_hash(lg, nv);
+                    i32 best = 0;
+                    for (i32 i = 1; i < nv; i++)
+                        if (lg[i] > lg[best]) best = i;
+                    *top1 = best;
+                } else {
+                    ok = false;
+                }
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    auto gen = [&](const std::string &file, const char *prompt, i32 chunk,
+                   std::vector<i32> *tokens) -> bool {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = file;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = chunk;
+            std::string err;
+            if (!engine.init(cpu, cfg, &err)) {
+                if (!err.empty()) std::fprintf(stderr, "  (init: %s)\n", err.c_str());
+            } else {
+                GenerateParams p;
+                p.prompt = prompt;
+                p.max_tokens = 6;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(p, &r) && r.finish != FinishError;
+                *tokens = r.tokens;
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    u64 h_wide = 0, h_narrow = 0, h_other = 0, h_shift = 0;
+    i32 t_wide = -1, t_narrow = -1, t_other = -1, t_shift = -1;
+    std::string why;
+    CHECK(run(path, "the", 8, &h_wide, &t_wide, &why),
+          "the whole graph prefills and the row reaches the head");
+    std::fprintf(stderr, "  (logits row %016llx, argmax %d)\n",
+                 static_cast<unsigned long long>(h_wide),
+                 static_cast<int>(t_wide));
+
+    // ---- 1. the recorded row --------------------------------------------
+    // Recorded from this graph on the fixture, CPU backend, prompt "the".
+    static const u64 kGoldenHash = 0x12602ed8b3a49addull;
+    static const i32 kGoldenArgmax = 0;
+    CHECK(h_wide != 0, "the row is not empty");
+    if (kGoldenHash != 0) {
+        CHECK(h_wide == kGoldenHash,
+              "the last prompt row is the recorded one (the whole graph's output)");
+        CHECK(t_wide == kGoldenArgmax, "and its argmax is the recorded token");
+    }
+
+    // ---- 2. the prompt reaches the row -----------------------------------
+    CHECK(run(path, "a", 8, &h_other, &t_other, &why),
+          "a second prompt prefills");
+    CHECK(h_other != h_wide, "a different prompt produces a different row");
+
+    // ---- 3. chunk invariance ---------------------------------------------
+    CHECK(run(path, "the", 1, &h_narrow, &t_narrow, &why),
+          "the same prompt prefills token by token");
+    CHECK(h_narrow == h_wide, "chunk 1 reproduces the chunk-8 row exactly");
+
+    // ---- 4. the pin can fail: the ROUTE -----------------------------------
+    CHECK(run(shifted, "the", 8, &h_shift, &t_shift, &why),
+          "the shifted-table fixture prefills");
+    CHECK(h_shift != h_wide,
+          "a shifted hash table moves the row (the pin sees the route)");
+    {
+        std::string rwhy;
+        u64 h = 0;
+        i32 t = -1;
+        CHECK(!run(oob, "the", 8, &h, &t, &rwhy),
+              "a table naming an expert past the bank refuses the run");
+        CHECK(rwhy.find("hash route") != std::string::npos,
+              "... and says the hash route refused");
+    }
+
+    // ---- 5. and the graph emits text --------------------------------------
+    std::vector<i32> greedy, greedy1;
+    CHECK(gen(path, "the", 8, &greedy), "the whole graph generates");
+    std::fprintf(stderr, "  (greedy tokens:");
+    for (i32 t : greedy) std::fprintf(stderr, " %d", static_cast<int>(t));
+    std::fprintf(stderr, ")\n");
+    static const i32 kGoldenSeq[] = {0, 4, 6, 6, 6, 9};
+    const i32 kGoldenSeqN = 6;
+    if (kGoldenSeqN > 0) {
+        CHECK(static_cast<i32>(greedy.size()) == kGoldenSeqN,
+              "the run emits the recorded number of tokens");
+        bool same = static_cast<i32>(greedy.size()) == kGoldenSeqN;
+        for (i32 i = 0; same && i < kGoldenSeqN; i++)
+            same = greedy[i] == kGoldenSeq[i];
+        CHECK(same, "and every emitted token is the recorded one");
+    }
+    CHECK(gen(path, "the", 1, &greedy1), "the same prompt generates at chunk 1");
+    CHECK(greedy1 == greedy, "chunk 1 emits the same tokens");
+
+    // ---- 6. the PREFILL path: many rows, one call -------------------------
+    // A real multi-token prompt through the shared-latent forward. Chunk 16
+    // runs the prefill as ONE call of 12+ rows -- the layer's latent write, its
+    // attention over the growing prefix and its grouped output all loop inside
+    // that one pass -- while chunk 1 runs the same rows one at a time. A
+    // one-token prompt would make the two arms the same call and pin nothing,
+    // so the prompt is long enough for the chunk-16 pass to exceed the thin-row
+    // ladder the GEMM uses below nine rows.
+    std::string mprompt;
+    for (int i = 0; i < 12; i++) mprompt += (i ? " the" : "the");
+    u64 h_m1 = 0, h_m16 = 0;
+    i32 t_m1 = -1, t_m16 = -1;
+    CHECK(run(path, mprompt.c_str(), 1, &h_m1, &t_m1, &why),
+          "the multi-token prompt prefills token by token");
+    CHECK(run(path, mprompt.c_str(), 16, &h_m16, &t_m16, &why),
+          "and again in one 16-row chunk");
+    std::fprintf(stderr, "  (multi-token: chunk 1 %016llx, chunk 16 %016llx)\n",
+                 static_cast<unsigned long long>(h_m1),
+                 static_cast<unsigned long long>(h_m16));
+    CHECK(h_m1 != h_wide, "the multi-token prompt is a different row");
+    CHECK(h_m16 == h_m1,
+          h_m16 == h_m1
+              ? "chunk 16 reproduces the chunk-1 row exactly on 12+ prompt rows"
+              : "chunk 16 DIFFERS from chunk 1: the multi-row shared-latent "
+                "prefill does not reproduce the single-row one");
+    std::vector<i32> gm16, gm1;
+    CHECK(gen(path, mprompt.c_str(), 16, &gm16),
+          "the multi-token prompt generates at chunk 16");
+    CHECK(gen(path, mprompt.c_str(), 1, &gm1), "and at chunk 1");
+    CHECK(gm16 == gm1, "both chunk sizes emit the same tokens");
+
+    // ---- 7. the DEVICE arm ------------------------------------------------
+    // kraken-tests is a plain C++ TU and cannot open the device, so the device
+    // half drives the CLI -- the arrangement test_prefill_chunk_bitexact uses.
+    //
+    // What is checkable here, and what is not, was MEASURED rather than
+    // assumed. A HIP row is not bit-equal to the `--cpu` reference on any
+    // model: SmolLM2-135M at a 16-token prompt gives trace 0d47196029f2cb51 /
+    // logits 4ccba855c2b297e0 on the card against a1e5be993b18b62e /
+    // 668768a536fd8d50 on the reference, with the same first token (30) both
+    // ways. The engine's cross-backend contract is the TEXT -- that is why
+    // scripts/coherence_check.sh compares sentences, and why the prefill gate
+    // compares chunk sizes within ONE backend. So this arm pins the two
+    // properties a shared-latent kernel actually owes: the device prefill is
+    // chunk-invariant (thirteen rows in one call against thirteen calls of one
+    // row, both hashes) and it samples the reference's token.
+    const std::string self = self_path();
+    const std::filesystem::path exe_p =
+        std::filesystem::path(self).parent_path() /
+#ifdef _WIN32
+        "kraken.exe";
+#else
+        "kraken";
+#endif
+    const bool have_exe = !self.empty() && std::filesystem::exists(exe_p);
+    CHECK(have_exe, "kraken sits beside kraken-tests (the device arm drives it)");
+    if (have_exe) {
+        const std::string exe = exe_p.string();
+        auto hex = [](const std::string &s) -> u64 {
+            return s.empty() ? 0ull : std::strtoull(s.c_str(), nullptr, 16);
+        };
+        const PrefillProbe cc =
+            run_prefill_hash(exe, path, mprompt, 16, false, false, "--cpu");
+        const PrefillProbe cd1 = run_prefill_hash(exe, path, mprompt, 1, false);
+        const PrefillProbe cd16 = run_prefill_hash(exe, path, mprompt, 16, false);
+        const PrefillProbe cd16b = run_prefill_hash(exe, path, mprompt, 16, false);
+        CHECK(cc.ok, "the CLI prefills the fixture on the CPU reference");
+        if (!cc.ok)
+            std::fprintf(stderr, "  (cpu run rc=%d stderr: %.300s)\n", cc.rc,
+                         cc.err.c_str());
+        CHECK(cd1.ok && cd16.ok,
+              "and on the default backend, at chunk 1 and at chunk 16");
+        if (!cd1.ok || !cd16.ok)
+            std::fprintf(stderr, "  (device rc=%d/%d stderr: %.300s)\n", cd1.rc,
+                         cd16.rc, cd16.err.c_str());
+        std::fprintf(stderr,
+                     "  (13-row prefill  cpu trace %s logits %s first %d)\n",
+                     cc.trace.c_str(), cc.logits.c_str(), cc.first);
+        std::fprintf(stderr,
+                     "  (                dev trace %s logits %s first %d)\n",
+                     cd16.trace.c_str(), cd16.logits.c_str(), cd16.first);
+        bool dev = false;
+#ifdef KRK_TEST_HIP_BUILD
+        dev = cd16.ok && cd16.banner.find("scalar reference") == std::string::npos &&
+              cd16.err.find("falling back to the CPU") == std::string::npos;
+        CHECK(dev,
+              dev ? "the HIP backend answered (not the CPU fallback)"
+                  : "a HIP build fell back to the CPU: the device arm proved "
+                    "nothing");
+#endif
+        if (dev) {
+            // The claim: one call of thirteen rows leaves the same rows behind
+            // as thirteen calls of one row.
+            CHECK(cd16.trace == cd1.trace,
+                  cd16.trace == cd1.trace
+                      ? "the DEVICE prefill folds to the same trace at chunk 1 "
+                        "and 16 (every row, not just the last)"
+                      : "the device prefill is not chunk-invariant: chunk 1 and "
+                        "16 fold to different traces");
+            CHECK(cd16.logits == cd1.logits,
+                  cd16.logits == cd1.logits
+                      ? "and the same logits row"
+                      : "the device prefill is not chunk-invariant: chunk 1 and "
+                        "16 leave different rows");
+            CHECK(cd16b.trace == cd16.trace && cd16b.logits == cd16.logits,
+                  "the device prefill is deterministic run to run");
+            // Cross-backend agreement, on the number the text depends on.
+            CHECK(cd16.first == cc.first && cd1.first == cc.first,
+                  cd16.first == cc.first && cd1.first == cc.first
+                      ? "the device samples the token the CPU reference does"
+                      : "the device and the CPU reference sample different "
+                        "tokens");
+        }
+        std::remove("kraken-prefill-out-16--cpu.txt");
+        std::remove("kraken-prefill-err-16--cpu.txt");
+        std::remove("kraken-prefill-out-1.txt");
+        std::remove("kraken-prefill-err-1.txt");
+        std::remove("kraken-prefill-out-16.txt");
+        std::remove("kraken-prefill-err-16.txt");
+    }
+
+    // DEBUG: fixture kept
+    // std::remove(path.c_str());
+    // std::remove(shifted.c_str());
+    // std::remove(oob.c_str());
+}
+
 // QSA indexer, the host maths first (no engine, no file): pooling over complete
 // blocks only, the per-head relu before the sum, rope at the block's FIRST
 // position, and the selection rule -- budget in CELLS, the still-filling block
@@ -10237,6 +12867,311 @@ static bool dump_row_of(const std::string &file, const char *what, i32 layer,
         return !out->empty();
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// qwen4exp, the WHOLE GRAPH: the output of the stack, not one block of it.
+//
+// This is the gate that was missing, and it is the only reason the family sat
+// behind KRK_ARCH_ALLOW_EXPERIMENTAL with every tensor read and every block
+// proven: the other groups pin the PLE row gather, the lane invariant, the QSA
+// cell list and the delta-net gate, and not one of them asserted the SENTENCE.
+// A graph can pass all of those and still decode nonsense -- which is exactly
+// what the PLE normalisation bug did (every PLE layer put a unit-RMS row on the
+// residual, and the text was CJK glyphs where the reference wrote Python).
+//
+// The pin is a token sequence, and its provenance is the part that matters: the
+// sequence is what THIS graph produces on the fixture, anchored by the real-file
+// match -- on H:/OLLAMA-Models/GGUF/qwen3.8-flash-next-reap-288-Q4_K_M.gguf the
+// same graph reproduces llama.cpp's greedy continuation of "The capital of
+// France is" for 24 of 24 tokens (docs/AUDIT-qwen4exp-support.md). So this is a
+// regression pin with an external anchor, not a second oracle.
+//
+// Five arms, and three of them exist to keep the pin from being vacuous:
+//   1. the fixture loads with NO development hatch -- the claim the arch table
+//      makes now, checked instead of assumed;
+//   2. the greedy tokens equal the recorded sequence;
+//   3. a different prompt gives a different sequence (the graph reads its input,
+//      so a stack that emitted a constant row from any prompt cannot pass);
+//   4. the same prompt at chunk 1 gives the same sequence (the row arithmetic is
+//      bit-exact inside the ladder, which is what a 2-token prompt sits on);
+//   5. a perturbed PLE table gives a DIFFERENT sequence (the pin can fail, and it
+//      fails on the module whose bug this family actually had).
+static void test_qwen4exp_whole_graph() {
+    const std::string path = "kraken-q4whole.gguf";
+    const std::string pert = "kraken-q4whole-pert.gguf";
+    CHECK(build_tiny_q4_model(path, 0),
+          "the full-schema fixture writes (lanes, PLE, indexer, MoE)");
+    CHECK(build_tiny_q4_model(pert, 0, 0, 0, true, false, true, false, true),
+          "and a copy with every PLE table entry shifted");
+
+    // The hatch is NOT set in this group, on purpose. If the family needed it,
+    // the first arm is the one that would say so.
+    {
+        Backend *cpu = make_cpu_backend();
+        Model model;
+        std::string err;
+        CHECK(model.load(*cpu, path, &err),
+              "the family loads with no development hatch");
+        if (!err.empty()) std::fprintf(stderr, "  (load: %s)\n", err.c_str());
+        model.unload();
+        delete cpu;
+    }
+
+    // The hash of one logits row: FNV-1a over the f32 bit patterns. A token
+    // sequence alone would be a weaker pin -- this fixture's synthetic head
+    // argmaxes a special token after one step, so the text arm sees a single id,
+    // and this repo has already been bitten once by a gate that compared only
+    // the sampled token (the attention rewrite produced the same first token
+    // from two different kernels). The row carries every stage's effect.
+    // Byte-wise FNV-1a, the SAME function kraken.exe's --prefill-hash prints
+    // for `logits`. Sharing it is the point: one number then pins the
+    // in-process graph, the CLI's CPU run and the device run against each
+    // other and against the record, instead of three hashes that cannot be
+    // compared.
+    auto row_hash = [](const f32 *v, i32 n) {
+        u64 h = 1469598103934665603ull;
+        const unsigned char *b = reinterpret_cast<const unsigned char *>(v);
+        for (i64 i = 0; i < static_cast<i64>(n) * 4; i++) {
+            h ^= b[i];
+            h *= 1099511628211ull;
+        }
+        return h;
+    };
+
+    // Prefill only (`max_tokens 0`), so the row read afterwards is the one at
+    // the last prompt position -- the row a decode starts from.
+    auto run = [&](const std::string &file, const char *prompt, i32 chunk,
+                   std::vector<i32> *tokens, u64 *hash, i32 *top1) -> bool {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = file;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = chunk;
+            std::string err;
+            if (!engine.init(cpu, cfg, &err)) {
+                if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+            } else {
+                GenerateParams p;
+                p.prompt = prompt;
+                p.max_tokens = 0;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(p, &r) && r.finish != FinishError;
+                const f32 *lg = engine.last_logits();
+                const i32 nv = engine.model().cfg().n_vocab;
+                if (ok && lg && nv > 0) {
+                    *hash = row_hash(lg, nv);
+                    i32 best = 0;
+                    for (i32 i = 1; i < nv; i++)
+                        if (lg[i] > lg[best]) best = i;
+                    *top1 = best;
+
+                } else {
+                    ok = false;
+                }
+                *tokens = r.tokens;
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    // Greedy text, which is the arm a reader means by "the graph's output".
+    auto gen = [&](const std::string &file, const char *prompt, i32 chunk,
+                   std::vector<i32> *tokens) -> bool {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = file;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = chunk;
+            std::string err;
+            if (!engine.init(cpu, cfg, &err)) {
+                if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+            } else {
+                GenerateParams p;
+                p.prompt = prompt;
+                p.max_tokens = 6;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(p, &r) && r.finish != FinishError;
+                *tokens = r.tokens;
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    std::vector<i32> prompt_row, narrow_row, other_row, pert_row;
+    u64 h_wide = 0, h_narrow = 0, h_other = 0, h_pert = 0;
+    i32 t_wide = -1, t_narrow = -1, t_other = -1, t_pert = -1;
+    CHECK(run(path, "the", 8, &prompt_row, &h_wide, &t_wide),
+          "the whole graph prefills and the row reaches the head");
+    std::fprintf(stderr, "  (logits row %016llx, argmax %d)\n",
+                 static_cast<unsigned long long>(h_wide),
+                 static_cast<int>(t_wide));
+
+    // ---- 1. the recorded row --------------------------------------------
+    // Recorded from this graph on the fixture, CPU backend, prompt "the".
+    static const u64 kGoldenHash = 0x1de9761d6eabacebull;
+    static const i32 kGoldenArgmax = 8;
+    CHECK(h_wide != 0, "the row is not empty");
+    CHECK(h_wide == kGoldenHash,
+          "the last prompt row is the recorded one (the whole graph's output)");
+    CHECK(t_wide == kGoldenArgmax, "and its argmax is the recorded token");
+
+    // ---- 2. the prompt reaches the row -----------------------------------
+    CHECK(run(path, "a", 8, &other_row, &h_other, &t_other),
+          "a second prompt prefills");
+    CHECK(h_other != h_wide, "a different prompt produces a different row");
+
+    // ---- 3. chunk invariance ---------------------------------------------
+    CHECK(run(path, "the", 1, &narrow_row, &h_narrow, &t_narrow),
+          "the same prompt prefills token by token");
+    CHECK(h_narrow == h_wide, "chunk 1 reproduces the chunk-8 row exactly");
+
+    // ---- 4. the pin can fail ---------------------------------------------
+    CHECK(run(pert, "the", 8, &pert_row, &h_pert, &t_pert),
+          "the perturbed fixture prefills");
+    CHECK(h_pert != h_wide,
+          "a shifted PLE table moves the row (the pin is sensitive)");
+
+    // ---- 5. and the graph emits text --------------------------------------
+    std::vector<i32> greedy, greedy1;
+    CHECK(gen(path, "the", 8, &greedy), "the whole graph generates");
+    std::fprintf(stderr, "  (greedy tokens:");
+    for (i32 t : greedy) std::fprintf(stderr, " %d", static_cast<int>(t));
+    std::fprintf(stderr, ")\n");
+    // One token: this fixture's synthetic head argmaxes EOS on the step after it
+    // (which is why the row above, not this, is the pin).
+    static const i32 kGoldenSeq[] = {8};
+    const i32 kGoldenSeqN = 1;
+    CHECK(static_cast<i32>(greedy.size()) == kGoldenSeqN,
+          "the run emits the recorded number of tokens");
+    bool same = static_cast<i32>(greedy.size()) == kGoldenSeqN;
+    for (i32 i = 0; same && i < kGoldenSeqN; i++) same = greedy[i] == kGoldenSeq[i];
+    CHECK(same, "and every emitted token is the recorded one");
+    CHECK(gen(path, "the", 1, &greedy1), "the same prompt generates at chunk 1");
+    CHECK(greedy1 == greedy, "chunk 1 emits the same tokens");
+
+    // ---- 6. the DEVICE arm ------------------------------------------------
+    // The same shape as test_dsv4_whole_graph's device arm: kraken-tests cannot
+    // open the device, so the arm drives the CLI. It differs in what it can
+    // claim, and the difference is MEASURED, not a convenience:
+    //
+    //   * the CPU half is a real pin -- the CLI's `--cpu` run hashes the same
+    //     row the in-process graph does, which ties the row above to a second
+    //     entry point and to the FNV the CLI prints;
+    //   * the HIP half does NOT run this fixture, and the reason is measured: the
+    //     lane stack's bottleneck is `low_rank` (8 here), and it is the
+    //     UP-projection's K -- [hc*n_embd <- low_rank]. The HIP GEMM addresses K
+    //     in 32-value chunks and ABORTS on anything else, so before the init
+    //     guard this run died with 0xC0000409 two rows into the prefill. The
+    //     device arm therefore requires a REFUSAL that names the geometry: a
+    //     silent skip would accept a crash, and padding the fixture to K=32
+    //     would prove the kernels on a geometry the graph never has.
+    const std::string self = self_path();
+    const std::filesystem::path exe_p =
+        std::filesystem::path(self).parent_path() /
+#ifdef _WIN32
+        "kraken.exe";
+#else
+        "kraken";
+#endif
+    const bool have_exe = !self.empty() && std::filesystem::exists(exe_p);
+    CHECK(have_exe, "kraken sits beside kraken-tests (the device arm drives it)");
+    if (have_exe) {
+        const std::string exe = exe_p.string();
+        auto hex = [](const std::string &v) -> u64 {
+            return v.empty() ? 0ull : std::strtoull(v.c_str(), nullptr, 16);
+        };
+        const PrefillProbe cc =
+            run_prefill_hash(exe, path, "the", 8, false, false, "--cpu");
+        CHECK(cc.ok, "the CLI prefills the fixture on the CPU reference");
+        if (!cc.ok)
+            std::fprintf(stderr, "  (cpu run rc=%d TAIL: %.400s)\n", cc.rc,
+                         cc.err.size() > 400 ? cc.err.c_str() + cc.err.size() - 400
+                                             : cc.err.c_str());
+        std::fprintf(stderr, "  (q4whole   cpu trace %s logits %s first %d)\n",
+                     cc.trace.c_str(), cc.logits.c_str(), cc.first);
+        // Two entry points, one graph: the number the CLI prints is the row the
+        // group pinned above.
+        CHECK(cc.ok && hex(cc.logits) == h_wide,
+              "the CLI's --cpu run hashes the row the in-process graph did");
+
+        const PrefillProbe cd1 = run_prefill_hash(exe, path, "the", 1, false);
+        const PrefillProbe cd8 = run_prefill_hash(exe, path, "the", 8, false);
+        // The device arm's contract on a geometry HIP cannot address: the
+        // refusal must say WHY. Any other exit -- a crash, a missing DLL, an
+        // OOM -- is a failure, not a skip.
+        const std::string kRule = "hyper_connection.low_rank";
+        const std::string kRule2 = "multiple of 32";
+        const bool refused = !cd8.ok &&
+                             cd8.err.find(kRule) != std::string::npos &&
+                             cd8.err.find(kRule2) != std::string::npos;
+        CHECK(cd8.ok || refused,
+              cd8.ok ? "and the same prefill runs on the device"
+                     : (refused ? "the device REFUSES the fixture by name: the "
+                                  "lane bottleneck (low_rank 8) is the "
+                                  "up-projection's K and its GEMM needs a "
+                                  "multiple of 32"
+                                : "the device neither ran nor refused with a "
+                                  "reason: the arm proved nothing"));
+        if (!cd8.ok && !refused)
+            std::fprintf(stderr, "  (device rc=%d TAIL: %.400s)\n", cd8.rc,
+                         cd8.err.size() > 400 ? cd8.err.c_str() + cd8.err.size() - 400
+                                              : cd8.err.c_str());
+        if (refused) {
+            std::fprintf(stderr,
+                         "  (device: refused at init -- low_rank 8 is the "
+                         "up-projection's K and the HIP GEMM needs 32s)\n");
+            CHECK(cd1.ok == cd8.ok,
+                  "both chunk sizes meet the same rule, so the refusal is the "
+                  "geometry's and not the chunking's");
+        } else if (cd8.ok && cd1.ok) {
+            bool dev = false;
+#ifdef KRK_TEST_HIP_BUILD
+            dev = cd8.banner.find("scalar reference") == std::string::npos &&
+                  cd8.err.find("falling back to the CPU") == std::string::npos;
+            CHECK(dev,
+                  dev ? "the HIP backend answered (not the CPU fallback)"
+                      : "a HIP build fell back to the CPU: the device arm proved "
+                        "nothing");
+#endif
+            if (dev) {
+                std::fprintf(stderr,
+                             "  (           dev trace %s logits %s first %d)\n",
+                             cd8.trace.c_str(), cd8.logits.c_str(), cd8.first);
+                CHECK(cd8.trace == cd1.trace,
+                      cd8.trace == cd1.trace
+                          ? "the DEVICE prefill folds to the same trace at chunk "
+                            "1 and 8"
+                          : "the device prefill is not chunk-invariant");
+                CHECK(cd8.logits == cd1.logits,
+                      cd8.logits == cd1.logits ? "and the same logits row"
+                                               : "the device prefill leaves "
+                                                 "different rows at chunk 1 "
+                                                 "and 8");
+                CHECK(cd8.first == cc.first,
+                      "the device samples the token the CPU reference does");
+            }
+        }
+        std::remove("kraken-prefill-out-8--cpu.txt");
+        std::remove("kraken-prefill-err-8--cpu.txt");
+        std::remove("kraken-prefill-out-1.txt");
+        std::remove("kraken-prefill-err-1.txt");
+        std::remove("kraken-prefill-out-8.txt");
+        std::remove("kraken-prefill-err-8.txt");
+    }
+
+    std::remove(path.c_str());
+    std::remove(pert.c_str());
 }
 
 // The gated normalization's ACTIVATION is the one thing about the delta-net
@@ -11303,6 +14238,484 @@ static void test_pageable_path_probe() {
     std::remove(path.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// Source hygiene: a string literal that spans a RAW newline.
+//
+// This is not a hypothetical class. Four edits in one session wrote a C string
+// through a tool path that decoded the escape twice, so `\n` became a real
+// newline inside `fprintf(...)` and `KRK_ERROR(...)` literals; each one is a
+// compile error, and each cost a build to discover. `str_replace` (one decode)
+// is safe, a heredoc-fed script (two decodes) is not -- and nothing in the repo
+// said so.
+//
+// The scanner below is the rule made checkable. It walks a translation unit the
+// way the compiler does: it knows about `//` and block comments, character
+// literals, raw strings (`R"tag(` ... `)tag"`), and the LEGAL line continuation
+// (a backslash immediately before the newline keeps the literal open). Anything
+// else that reaches a newline with a literal still open is reported with its
+// line number.
+//
+// The group proves the scanner can fail before trusting its answer on the tree:
+// five constructed inputs, one of them broken on purpose, one a continuation and
+// one a raw string. Then it sweeps every source file this binary was built from
+// (`KRK_SOURCE_DIR`, a configure-time define -- the group cannot use the working
+// directory, which is a per-group scratch dir by design).
+// Is the literal starting at `at` an argument of a print/error call? Only there
+// does a doubled escape matter: `fprintf(stderr, "a\\nb")` prints the two
+// characters `\n` where the author meant a line break. A literal that is NOT a
+// format string can legitimately carry a backslash -- escape tables
+// (`src/json.cpp`) and JSON payloads both do, and flagging those would make the
+// group's first act on a healthy tree a false positive.
+static bool source_in_print_call(const std::string &text, size_t at) {
+    // The nearest ( going backwards, then the identifier in front of it -- but
+    // never past the END OF THE STATEMENT. Measured: without the `;` stop, a
+    // table literal on the line after a fprintf was attributed to that fprintf
+    // and the sweep reported a defect that was not there.
+    size_t k = at;
+    int newlines = 0;
+    while (k > 0 && k + 240 > at) {
+        const char p = text[k - 1];
+        if (p == '(') break;
+        if (p == ';' || p == '{' || p == '}') return false;
+        if (p == '\n' && ++newlines > 2) return false;
+        --k;
+    }
+    if (k == 0 || text[k - 1] != '(') return false;
+    size_t e = k - 1;
+    size_t b = e;
+    while (b > 0 && (std::isalnum(static_cast<unsigned char>(text[b - 1])) ||
+                     text[b - 1] == '_' || text[b - 1] == ':'))
+        --b;
+    const std::string fn = text.substr(b, e - b);
+    return fn.size() >= 5 &&
+           (fn.find("printf") != std::string::npos ||
+            fn.find("KRK_ERROR") != std::string::npos ||
+            fn.find("KRK_WARN") != std::string::npos ||
+            fn.find("KRK_NOTE") != std::string::npos ||
+            fn.find("puts") != std::string::npos ||
+            // The HTTP layer's writers: a browser reads what these emit, and a
+            // doubled `\\r\\n` there is a malformed response, not a cosmetic
+            // one. `format` is this repo's sprintf-shaped helper (src/http.cpp
+            // builds its status line with it).
+            fn.find("format") != std::string::npos ||
+            fn.find("write_raw") != std::string::npos ||
+            fn.find("write_chunk") != std::string::npos ||
+            fn.find("send") != std::string::npos ||
+            fn.find("respond") != std::string::npos);
+}
+
+// Is this a file whose whole job is protocol text a client parses? In these,
+// EVERY doubled CR/LF is a defect, call shape or not: `static const char head[]
+// = "HTTP/1.1 200 OK\\r\\n"` is not a print argument and would otherwise have
+// no context to be judged in.
+static bool source_protocol_file(const std::string &path) {
+    std::string p = path;
+    for (char &c : p)
+        if (c == '\\') c = '/';
+    return p.size() >= 13 &&
+           (p.compare(p.size() - 13, 13, "/src/http.cpp") == 0 ||
+            p.compare(p.size() - 15, 15, "/src/server.cpp") == 0);
+}
+
+// `// hygiene-ok` on the literal's own line is the waver for the rare case that
+// really does print a backslash in a format string.
+static bool source_line_waived(const std::string &text, size_t at) {
+    size_t a = at;
+    while (a > 0 && text[a - 1] != '\n') --a;
+    size_t b = at;
+    while (b < text.size() && text[b] != '\n') ++b;
+    return text.find("hygiene-ok", a) != std::string::npos &&
+           text.find("hygiene-ok", a) < b;
+}
+
+// One walk, two classes:
+//   * a literal that spans a RAW newline (a compile error, and the edit-path
+//     defect this group was built for), reported into `lines`;
+//   * a DOUBLED escape that reaches a print/error argument -- source `\\n`,
+//     which prints the two characters instead of the line break, reported into
+//     `escapes`. It compiles, so nothing else would ever name it. `any_context`
+//     widens the count to EVERY literal in the file, which is what the HTTP
+//     layer is judged by: a browser parses that text, and a doubled CRLF there
+//     is a malformed response rather than a cosmetic one.
+static int source_bad_literals(const std::string &text,
+                              std::vector<int> *lines,
+                              std::vector<int> *escapes = nullptr,
+                              bool any_context = false) {
+    int offenders = 0;
+    size_t i = 0;
+    int line_no = 1;
+    bool in_block = false, in_raw = false;
+    std::string raw_tag;
+    const size_t n = text.size();
+    while (i < n) {
+        const char c = text[i];
+        if (c == '\n') {
+            ++line_no;
+            ++i;
+            continue;
+        }
+        if (in_raw) {
+            if (c == ')') {
+                const std::string close = ")" + raw_tag + "\"";
+                if (text.compare(i, close.size(), close) == 0) {
+                    in_raw = false;
+                    i += close.size();
+                    continue;
+                }
+            }
+            ++i;
+            continue;
+        }
+        if (in_block) {
+            if (c == '*' && i + 1 < n && text[i + 1] == '/') {
+                in_block = false;
+                i += 2;
+            } else {
+                ++i;
+            }
+            continue;
+        }
+        if (c == '/' && i + 1 < n && text[i + 1] == '/') {
+            while (i < n && text[i] != '\n') ++i;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && text[i + 1] == '*') {
+            in_block = true;
+            i += 2;
+            continue;
+        }
+        if (c == 'R' && i + 1 < n && text[i + 1] == '"') {
+            size_t p = i + 2;
+            raw_tag.clear();
+            while (p < n && text[p] != '(') raw_tag.push_back(text[p++]);
+            in_raw = true;
+            i = p + 1;
+            continue;
+        }
+        if (c == '\'') {
+            ++i;
+            while (i < n && text[i] != '\'') {
+                if (text[i] == '\\') ++i;
+                ++i;
+            }
+            if (i < n) ++i;
+            continue;
+        }
+        if (c == '"') {
+            const size_t lit_start = i;
+            const int lit_line = line_no;
+            bool doubled = false;
+            ++i;
+            bool esc = false;
+            while (i < n) {
+                const char d = text[i];
+                if (esc) {
+                    esc = false;
+                    if (d == '\n') ++line_no;
+                    ++i;
+                    continue;
+                }
+                if (d == '\\') {
+                    // Source `\\n` / `\\r`: a backslash that survives, rather
+                    // than the control code the author almost always meant.
+                    if (i + 2 < n && text[i + 1] == '\\' &&
+                        (text[i + 2] == 'n' || text[i + 2] == 'r'))
+                        doubled = true;
+                    esc = true;
+                    ++i;
+                    continue;
+                }
+                if (d == '"') {
+                    ++i;
+                    break;
+                }
+                if (d == '\n') {
+                    lines->push_back(line_no);
+                    ++offenders;
+                    // Resync at the END of the broken line, not at the newline:
+                    // the text after the break (`b";`) would otherwise open a
+                    // second phantom literal and report one defect twice.
+                    while (i < n && text[i] != '\n') ++i;
+                    break;
+                }
+                ++i;
+            }
+            if (doubled && escapes &&
+                (any_context || source_in_print_call(text, lit_start)) &&
+                !source_line_waived(text, lit_start))
+                escapes->push_back(lit_line);
+            continue;
+        }
+        ++i;
+    }
+    return offenders;
+}
+
+static void test_source_literal_hygiene() {
+    // ---- 1. the scanner's own arms, before it is trusted on the tree -----
+    {
+        std::vector<int> lines;
+        const std::string ok = "const char *s = \"a\\nb\";";
+        CHECK(source_bad_literals(ok, &lines) == 0 && lines.empty(),
+              "an escaped newline inside a literal is not a defect");
+    }
+    {
+        std::vector<int> lines;
+        std::string bad = "const char *s = \"a";
+        bad.push_back('\n');
+        bad += "b\";";
+        CHECK(source_bad_literals(bad, &lines) == 1 && lines.size() == 1 &&
+                  lines[0] == 1,
+              "a literal broken by a RAW newline is reported, with its line");
+    }
+    {
+        std::vector<int> lines;
+        std::string cont = "const char *s = \"a";
+        cont.push_back('\\');
+        cont.push_back('\n');
+        cont += "b\";";
+        CHECK(source_bad_literals(cont, &lines) == 0,
+              "a backslash continuation keeps the literal open, as the compiler "
+              "does");
+    }
+    {
+        std::vector<int> lines;
+        std::string raw = "auto s = R\"(a";
+        raw.push_back('\n');
+        raw += "b)\";";
+        CHECK(source_bad_literals(raw, &lines) == 0,
+              "a raw string may span newlines and is not reported");
+    }
+    {
+        std::vector<int> lines;
+        std::string cmt = "// a quote \" in a comment";
+        cmt.push_back('\n');
+        cmt += "int x = 1; // another \"\n";
+        CHECK(source_bad_literals(cmt, &lines) == 0,
+              "quotes inside comments are not literals");
+    }
+
+    // ---- 2. the DOUBLED escape, in a print argument ----------------------
+    // Source `\\n` compiles and prints the two characters: a gate that prints
+    // `lit\n` where it meant a line break is unreadable, and nothing else names
+    // it. Only a print/error argument is flagged -- an escape table or a JSON
+    // payload may carry a backslash on purpose.
+    {
+        // The INPUT text has to contain two real backslashes, so they are built
+        // from character code 92: spelling them here would create the doubled
+        // escape this arm is about, one layer up.
+        std::vector<int> lines, esc;
+        std::string fmt = "std::fprintf(stderr, \"a";
+        fmt.push_back(static_cast<char>(92));
+        fmt.push_back(static_cast<char>(92));
+        fmt += "nb\");";
+        CHECK(source_bad_literals(fmt, &lines, &esc) == 0 && esc.size() == 1,
+              "a doubled newline escape in a print argument is reported");
+    }
+    {
+        // The same doubled escape, in a literal that is NOT a print argument.
+        // Built with character codes because this arm's INPUT is a backslash --
+        // writing it as an escape here is the very mistake the group hunts.
+        std::vector<int> lines, esc;
+        std::string tbl = "const char *k = ";
+        tbl += '"';
+        tbl += 'a';
+        tbl.push_back(static_cast<char>(92));
+        tbl.push_back(static_cast<char>(92));
+        tbl += 'n';
+        tbl += '"';
+        tbl += ';';
+        CHECK(source_bad_literals(tbl, &lines, &esc) == 0 && esc.empty(),
+              "the same spelling in a non-print literal is NOT reported (json "
+              "tables and payloads carry backslashes on purpose)");
+    }
+    {
+        // Browser-facing: the HTTP layer builds its status line with `format`,
+        // which is not a printf by name but is one by contract.
+        std::vector<int> lines, esc;
+        std::string line = "std::string h = format(\"HTTP/1.1 200 OK";
+        line.push_back(static_cast<char>(92));
+        line.push_back(static_cast<char>(92));
+        line += "r";
+        line.push_back(static_cast<char>(92));
+        line.push_back(static_cast<char>(92));
+        line += "n\", r.status);";
+        CHECK(source_bad_literals(line, &lines, &esc) == 0 && esc.size() == 1,
+              "a doubled CRLF in the HTTP status line is reported (a browser "
+              "parses that, so it is a malformed response)");
+    }
+    {
+        // The same text in a protocol file, but NOT in a call: a static header
+        // array has no call context at all, and this is the arm that says the
+        // module is judged by its job rather than by its shape.
+        std::vector<int> lines, esc;
+        std::string head = "static const char head[] = \"HTTP/1.1 200 OK";
+        head.push_back(static_cast<char>(92));
+        head.push_back(static_cast<char>(92));
+        head += "r";
+        head.push_back(static_cast<char>(92));
+        head.push_back(static_cast<char>(92));
+        head += "n\";";
+        CHECK(source_bad_literals(head, &lines, &esc) == 0 && esc.empty(),
+              "outside a protocol file that header array is not judged (no "
+              "call context)");
+        CHECK(source_bad_literals(head, &lines, &esc, true) == 0 &&
+                  esc.size() == 1,
+              "inside one it is: every doubled CRLF in the HTTP layer counts");
+    }
+    {
+        // The shape a user actually reads -- the CLI's `kraken: ...` report --
+        // because the entry points are the files this group is supposed to
+        // protect and they are not shaped like the engine's error macros.
+        std::vector<int> lines, esc;
+        std::string msg = "std::fprintf(stderr, \"kraken: bad value";
+        msg.push_back(static_cast<char>(92));
+        msg.push_back(static_cast<char>(92));
+        msg += "n\");";
+        CHECK(source_bad_literals(msg, &lines, &esc) == 0 && esc.size() == 1,
+              "a doubled escape in a `kraken: ...` message is reported (the "
+              "entry points are what a user reads)");
+    }
+    {
+        // Measured false positive, kept as an arm: a table literal on the line
+        // AFTER a fprintf was attributed to that fprintf until the backward
+        // search learned to stop at the end of the statement.
+        std::vector<int> lines, esc;
+        std::string two = "std::fprintf(stderr, \"x\");";
+        two.push_back('\n');
+        two += "const char *k = \"a";
+        two.push_back(static_cast<char>(92));
+        two.push_back(static_cast<char>(92));
+        two += "nb\";";
+        CHECK(source_bad_literals(two, &lines, &esc) == 0 && esc.empty(),
+              "a table literal after a print call is not attributed to it "
+              "(stop at the statement)");
+    }
+    {
+        std::vector<int> lines, esc;
+        std::string waived = "std::fprintf(stderr, \"a";
+        waived.push_back(static_cast<char>(92));
+        waived.push_back(static_cast<char>(92));
+        waived += "nb\"); // hygiene-ok";
+        CHECK(source_bad_literals(waived, &lines, &esc) == 0 && esc.empty(),
+              "`// hygiene-ok` waives a print that really does print a "
+              "backslash");
+    }
+
+    // ---- 2. the tree this binary was built from --------------------------
+    // A sweep that cannot find the sources would pass every check below by
+    // scanning nothing, which is the vacuous arm this repo keeps paying for.
+    const std::string root =
+#ifdef KRK_SOURCE_DIR
+        std::string(KRK_SOURCE_DIR);
+#else
+        std::string();
+#endif
+    CHECK(!root.empty(), "the build recorded its source root (KRK_SOURCE_DIR)");
+    if (root.empty()) return;
+    std::vector<std::string> files;
+    {
+        std::error_code ec;
+        for (const char *sub : {"/src", "/include", "/tests", "/tools"}) {
+            const std::filesystem::path dir = std::filesystem::path(root + sub);
+            if (!std::filesystem::exists(dir, ec)) continue;
+            for (std::filesystem::recursive_directory_iterator it(
+                     dir, std::filesystem::directory_options::skip_permission_denied,
+                     ec),
+                 end;
+                 it != end && !ec; it.increment(ec)) {
+                if (!it->is_regular_file(ec)) continue;
+                const std::string ext = it->path().extension().string();
+                if (ext == ".cpp" || ext == ".hpp" || ext == ".hip" ||
+                    ext == ".cxx" || ext == ".h")
+                    files.push_back(it->path().string());
+            }
+        }
+    }
+    CHECK(files.size() >= 60,
+          "the sweep found the tree's sources (not a silent empty scan)");
+    // The ENTRY POINTS are the files that talk to a user, and they are only
+    // covered because they happen to live under `src/`. That is luck, not a
+    // pin: a sweep narrowed to the engine's own tree would stay green while the
+    // messages a user actually reads went unscanned. Measured, not assumed -- a
+    // doubled escape injected into main_cli.cpp's `kraken: unknown option`
+    // report is named at src/main_cli.cpp:436 -- so the coverage is recorded
+    // here and refused if either file stops being read.
+    const char *kEntryPoints[] = {"/src/main_cli.cpp", "/src/main_server.cpp"};
+    int entry_seen[2] = {0, 0};
+    int total = 0, first_file = -1, first_line = 0;
+    int esc_total = 0, esc_file = -1, esc_line = 0;
+    for (size_t k = 0; k < files.size(); k++) {
+        {
+            std::string rel = files[k].substr(root.size());
+            for (char &ch : rel)
+                if (ch == '\\') ch = '/';
+            for (int e = 0; e < 2; e++)
+                if (rel == kEntryPoints[e]) entry_seen[e] = 1;
+        }
+        std::ifstream in(files[k], std::ios::binary);
+        if (!in) continue;
+        std::string text((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        std::vector<int> lines, esc;
+        const int bad = source_bad_literals(text, &lines, &esc,
+                                           source_protocol_file(files[k]));
+        if (!esc.empty()) {
+            if (esc_file < 0) {
+                esc_file = static_cast<int>(k);
+                esc_line = esc[0];
+            }
+            esc_total += static_cast<int>(esc.size());
+        }
+        if (bad > 0) {
+            if (first_file < 0) {
+                first_file = static_cast<int>(k);
+                first_line = lines.empty() ? 0 : lines[0];
+            }
+            total += bad;
+        }
+    }
+    if (total > 0)
+        std::fprintf(stderr, "  (first offender: %s:%d)\n",
+                     first_file >= 0 ? files[first_file].c_str() : "?",
+                     first_line);
+    // Counted per LINE, not per literal: one literal broken across a newline
+    // leaves an unbalanced quote on each side, and resyncing at the end of the
+    // first line makes the second one honestly unbalanced too.
+    std::fprintf(stderr, "  (scanned %zu source files, %d line(s) with an "
+                         "unterminated literal)\n", files.size(), total);
+    CHECK(total == 0,
+          total == 0
+              ? "no line in the tree leaves a string literal unterminated"
+              : "a string literal spans a raw newline: an edit wrote a newline "
+                "where the escape was meant (see the file:line above)");
+
+    if (esc_total > 0)
+        std::fprintf(stderr, "  (first doubled escape: %s:%d)\n",
+                     esc_file >= 0 ? files[esc_file].c_str() : "?", esc_line);
+    std::fprintf(stderr,
+                 "  (%d doubled newline escape(s) in print/error arguments, or "
+                 "anywhere in the HTTP layer)\n",
+                 esc_total);
+    CHECK(esc_total == 0,
+          esc_total == 0
+              ? "no print/error format string carries a doubled newline escape"
+              : "a print/error format string spells the escape twice, so it "
+                "prints the two characters '\\n' instead of a line break (see "
+                "the file:line above)");
+
+    // ---- 3. the entry points are READ, not merely present ---------------
+    std::fprintf(stderr, "  (entry points scanned: cli %s, server %s)\n",
+                 entry_seen[0] ? "yes" : "NO",
+                 entry_seen[1] ? "yes" : "NO");
+    CHECK(entry_seen[0] && entry_seen[1],
+          entry_seen[0] && entry_seen[1]
+              ? "the CLI and the server are in the sweep: the messages a user "
+                "reads are covered"
+              : "an entry point fell out of the sweep, so a doubled escape in "
+                "a user-facing message would go unreported");
+}
+
 #define TEST_GROUP(fn) {#fn, fn, nullptr},
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
@@ -11345,6 +14758,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_prefill_chunk_bitexact)
     TEST_GROUP(group_attention_sinks)
     TEST_GROUP(test_moe_schema_and_laziness)
+    TEST_GROUP(test_moe_batch_fallback)
     TEST_GROUP(test_router_resident_preference)
     TEST_GROUP(test_moe_matches_dense_twin)
     TEST_GROUP(test_moe_grouped_prefill_matches_tokenwise)
@@ -11361,13 +14775,20 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_ple_hash)
     TEST_GROUP(test_qwen4exp_schema)
     TEST_GROUP(test_qwen4exp_forward)
+    TEST_GROUP(test_qwen4exp_whole_graph)
     TEST_GROUP(test_qwen4exp_gdn_gate)
     TEST_GROUP(test_qwen4exp_hc_mix)
     TEST_GROUP(test_qwen4exp_ple)
     TEST_GROUP(test_mla_absorb)
     TEST_GROUP(test_mla_lite)
+    TEST_GROUP(test_mla_backend)
+    TEST_GROUP(test_mla_loader)
+    TEST_GROUP(test_mla_shared)
+    TEST_GROUP(test_dsv4_hash_route)
+    TEST_GROUP(test_dsv4_whole_graph)
     TEST_GROUP(test_qsa_select)
     TEST_GROUP(test_qwen4exp_qsa)
+    TEST_GROUP(test_source_literal_hygiene)
     TEST_GROUP(test_cpu_expert_pool)
     TEST_GROUP(test_gdn_ops)
     TEST_GROUP(test_gdn_model_loads)
@@ -11516,6 +14937,25 @@ struct ChildExit {
     bool started = false;
     bool crashed = false;
     unsigned long code = 0;
+};
+
+// One child's environment: the parent's own, with these entries forced (an
+// empty value REMOVES the variable). Per-child rather than a mutation of the
+// parent's environment, because a group's arms now run at the SAME time and two
+// arms differ only in which injection they set -- one shared environment would
+// hand them each other's injections, and the arm judge reads the injection to
+// know what to expect.
+struct ChildEnv {
+    std::vector<std::pair<std::string, std::string>> set;
+    void put(const std::string &k, const std::string &v) {
+        for (auto &kv : set)
+            if (kv.first == k) {
+                kv.second = v;
+                return;
+            }
+        set.emplace_back(k, v);
+    }
+    bool overrides() const { return !set.empty(); }
 };
 
 #ifdef _WIN32
@@ -11904,15 +15344,19 @@ static SelfArm selfcheck_arm_for(const char *key, int index, const std::string &
     return a;
 }
 
-static void selfcheck_set_arm_env(const SelfArm &arm) {
-    clear_env_var("KRK_TEST_INJECT_CRASH");
-    clear_env_var("KRK_TEST_INJECT_CRASH_AT");
-    clear_env_var("KRK_TEST_INJECT_FAIL");
-    clear_env_var("KRK_TEST_INJECT_EMPTY");
+static ChildEnv selfcheck_arm_env(const SelfArm &arm) {
+    ChildEnv env;
+    // All four are named explicitly, because an arm runs in its own environment
+    // and "this arm sets no crash" has to mean the variable is ABSENT, not
+    // merely unset in a parent another arm may have touched.
+    env.put("KRK_TEST_INJECT_CRASH", "");
+    env.put("KRK_TEST_INJECT_CRASH_AT", "");
+    env.put("KRK_TEST_INJECT_FAIL", "");
+    env.put("KRK_TEST_INJECT_EMPTY", "");
     if (std::strcmp(arm.key, "fail") == 0) {
-        set_env_var("KRK_TEST_INJECT_FAIL", std::to_string(arm.index));
+        env.put("KRK_TEST_INJECT_FAIL", std::to_string(arm.index));
     } else if (std::strcmp(arm.key, "empty") == 0) {
-        set_env_var("KRK_TEST_INJECT_EMPTY", std::to_string(arm.index));
+        env.put("KRK_TEST_INJECT_EMPTY", std::to_string(arm.index));
     } else {
         std::string groups = std::to_string(arm.index);
         std::string ats = std::to_string(arm.at);
@@ -11920,9 +15364,10 @@ static void selfcheck_set_arm_env(const SelfArm &arm) {
             groups += "," + std::to_string(arm.second_index);
             ats += "," + std::to_string(arm.second_at);
         }
-        set_env_var("KRK_TEST_INJECT_CRASH", groups);
-        set_env_var("KRK_TEST_INJECT_CRASH_AT", ats);
+        env.put("KRK_TEST_INJECT_CRASH", groups);
+        env.put("KRK_TEST_INJECT_CRASH_AT", ats);
     }
+    return env;
 }
 
 // One arm's answer, checked. Returns the problems found, joined with "; ";
@@ -12074,10 +15519,46 @@ static std::string child_command(const std::vector<std::string> &args) {
     return cmd;
 }
 
-static ChildExit spawn_child_to(const std::vector<std::string> &args, const std::string &out_path) {
+// An environment BLOCK for CreateProcessA: sorted "K=V" strings, each with its
+// NUL, then a final NUL. The parent's own entries are copied rather than
+// enumerated by the child, so a child of an arm sees exactly one injection.
+static std::string windows_env_block(const ChildEnv &env) {
+    std::vector<std::string> entries;
+    if (LPCH block = GetEnvironmentStringsA()) {
+        for (const char *p = block; *p;) {
+            const std::string e(p);
+            p += e.size() + 1;
+            const size_t eq = e.find('=');
+            // A leading '=' is the per-drive current-directory pseudo-variable;
+            // CreateProcess requires those to be left out.
+            if (eq == std::string::npos || eq == 0) continue;
+            const std::string key = e.substr(0, eq);
+            bool replaced = false;
+            for (const auto &kv : env.set)
+                if (kv.first == key) replaced = true;
+            if (!replaced) entries.push_back(e);
+        }
+        FreeEnvironmentStringsA(block);
+    }
+    for (const auto &kv : env.set)
+        if (!kv.second.empty()) entries.push_back(kv.first + "=" + kv.second);
+    std::sort(entries.begin(), entries.end());
+    std::string out;
+    for (const std::string &e : entries) {
+        out += e;
+        out.push_back('\0');
+    }
+    if (out.empty()) out.push_back('\0');
+    out.push_back('\0');
+    return out;
+}
+
+static ChildExit spawn_child_to(const std::vector<std::string> &args, const std::string &out_path,
+                                const ChildEnv &env) {
     ChildExit ce;
     std::string cmd = child_command(args);
     std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+    std::string env_block = windows_env_block(env);
     mutable_cmd.push_back('\0');
 
     SECURITY_ATTRIBUTES sa;
@@ -12099,8 +15580,10 @@ static ChildExit spawn_child_to(const std::vector<std::string> &args, const std:
     std::memset(&pi, 0, sizeof(pi));
 
     const std::string exe = self_path();
-    const BOOL ok = !exe.empty() && CreateProcessA(exe.c_str(), mutable_cmd.data(), nullptr,
-                                                   nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
+    const BOOL ok = !exe.empty() &&
+                    CreateProcessA(exe.c_str(), mutable_cmd.data(), nullptr, nullptr, TRUE, 0,
+                                   env.overrides() ? env_block.data() : nullptr, nullptr, &si,
+                                   &pi);
     CloseHandle(h);
     if (!ok) return ce;
     ce.started = true;
@@ -12116,7 +15599,23 @@ static ChildExit spawn_child_to(const std::vector<std::string> &args, const std:
 #else
 #include <fcntl.h>
 
-static ChildExit spawn_child_to(const std::vector<std::string> &args, const std::string &out_path) {
+static std::vector<std::string> posix_env_storage(const ChildEnv &env) {
+    std::vector<std::string> out;
+    for (char **e = environ; e && *e; e++) {
+        const std::string s(*e);
+        const size_t eq = s.find('=');
+        bool replaced = false;
+        for (const auto &kv : env.set)
+            if (eq != std::string::npos && kv.first == s.substr(0, eq)) replaced = true;
+        if (!replaced) out.push_back(s);
+    }
+    for (const auto &kv : env.set)
+        if (!kv.second.empty()) out.push_back(kv.first + "=" + kv.second);
+    return out;
+}
+
+static ChildExit spawn_child_to(const std::vector<std::string> &args, const std::string &out_path,
+                                const ChildEnv &env) {
     ChildExit ce;
     std::vector<std::string> storage = args;
     std::vector<char *> argv;
@@ -12132,7 +15631,12 @@ static ChildExit spawn_child_to(const std::vector<std::string> &args, const std:
     posix_spawn_file_actions_addclose(&fa, fd);
 
     pid_t pid = 0;
-    const int spawned = posix_spawn(&pid, storage[0].c_str(), &fa, nullptr, argv.data(), environ);
+    std::vector<std::string> envs = posix_env_storage(env);
+    std::vector<char *> envp;
+    for (std::string &s : envs) envp.push_back(s.data());
+    envp.push_back(nullptr);
+    const int spawned = posix_spawn(&pid, storage[0].c_str(), &fa, nullptr, argv.data(),
+                                    env.overrides() ? envp.data() : environ);
     posix_spawn_file_actions_destroy(&fa);
     ::close(fd);
     if (spawned != 0) return ce;
@@ -12151,7 +15655,14 @@ static ChildExit spawn_child_to(const std::vector<std::string> &args, const std:
     }
     return ce;
 }
+
 #endif
+
+// The shortest form, for the calls that want the parent's own environment
+// (the clean base run, and the isolation checks).
+static ChildExit spawn_child_to(const std::vector<std::string> &args, const std::string &out_path) {
+    return spawn_child_to(args, out_path, ChildEnv{});
+}
 
 // ---------------------------------------------------------------------------
 //  The fuzz arm's randomness, and the one number that makes it replayable.
@@ -12299,6 +15810,18 @@ static bool selfcheck_env_conflict() {
 
 static int run_selfcheck_selftest();
 
+// One arm's child: what to run, what environment it inherits, and what it
+// answered. A group's arms are launched together, so the job outlives the
+// iteration that built it and the verdict is read after every child is done.
+struct ArmJob {
+    SelfArm arm;
+    std::string tag, log, rep;
+    ChildEnv env;
+    std::vector<std::string> args;
+    ChildExit exit;
+    std::string log_text, rep_text;
+};
+
 static int run_selfcheck(int workers, const std::string &only_raw, const char *report_flag) {
     if (selfcheck_env_conflict()) return 2;
 
@@ -12349,14 +15872,39 @@ static int run_selfcheck(int workers, const std::string &only_raw, const char *r
 
     // The base: one clean run, whose per-group counts every arm is judged
     // against. It is a child too, so it is the same code path as any other run.
+    //
+    // How wide a group's arms run, and how many workers and THREADS each child
+    // gets. The arms x workers product is the sweep's worker budget, so the
+    // sweep is as wide as one suite run and no wider. The thread number is the
+    // part the wave was paying for without being told: a group child builds
+    // Pool(), which takes `hardware_concurrency()` worker threads unless
+    // KRK_THREADS says otherwise, so six concurrent suites were six suites'
+    // worth of 31-thread pools on cores that only one suite can fill. The pool
+    // is capped, never removed -- a floor of 2 keeps it a pool -- and a child's
+    // grandchildren inherit the cap, because it travels in its environment.
+    const int cores = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    const int arms_parallel = std::max(1, std::min(kSelfcheckArmCount, workers));
+    const int arm_workers = std::max(1, std::min(8, cores / arms_parallel));
+    const int threads_per_child = std::max(2, cores / (arms_parallel * arm_workers));
+    const int base_threads = std::max(2, cores / std::max(1, workers));
+
+    // The A/B arm: KRK_SELFCHECK_THREADS=default leaves every child's pool at the
+    // machine's own size, which is what the wave paid for before the cap.
+    const char *thr_env = std::getenv("KRK_SELFCHECK_THREADS");
+    const bool cap_threads =
+        !(thr_env && (!std::strcmp(thr_env, "default") || !std::strcmp(thr_env, "off") ||
+                      !std::strcmp(thr_env, "0")));
+
     const std::string base_log = dir + "/base.log";
     const std::string base_rep = dir + "/base.json";
     const std::string clean_id = std::string(scratch_run_id()) + "-clean";
-    set_env_var("KRK_TEST_SCRATCH_ID", clean_id);
     child_areas.push_back(clean_id);
     const std::vector<std::string> base_args{self_path(), "--workers", std::to_string(workers),
                                              "--report", base_rep};
-    const ChildExit bce = spawn_child_to(base_args, base_log);
+    ChildEnv base_env;
+    base_env.put("KRK_TEST_SCRATCH_ID", clean_id);
+    if (cap_threads) base_env.put("KRK_THREADS", std::to_string(base_threads));
+    const ChildExit bce = spawn_child_to(base_args, base_log, base_env);
     std::string base_text, base_report;
     read_text_file(base_log, &base_text);
     read_text_file(base_rep, &base_report);
@@ -12386,8 +15934,10 @@ static int run_selfcheck(int workers, const std::string &only_raw, const char *r
         }
     }
 
-    std::fprintf(stderr, "selfcheck: %d arms per group, %d group(s), %d worker(s)\n",
-                 kSelfcheckArmCount, kGroupCount, workers);
+    std::fprintf(stderr,
+                 "selfcheck: %d arms per group, %d group(s), %d arm(s) at once x %d worker(s) x "
+                 "%d thread(s) (KRK_SELFCHECK_THREADS=default leaves the pools at their own size)\n",
+                 kSelfcheckArmCount, kGroupCount, arms_parallel, arm_workers, threads_per_child);
     std::fprintf(stderr, "selfcheck: seed %llu (KRK_SELFCHECK_SEED=%llu draws these aims again)\n",
                  static_cast<unsigned long long>(seed), static_cast<unsigned long long>(seed));
     std::fprintf(stderr, "clean run: %d/%d checks\n", totals.passed, totals.run);
@@ -12408,6 +15958,7 @@ static int run_selfcheck(int workers, const std::string &only_raw, const char *r
         std::mt19937_64 rng = selfcheck_rng(seed, g.index);
         std::string notes;
         std::string fuzz_aim;
+        std::vector<ArmJob> jobs;
         for (int a = 0; a < kSelfcheckArmCount; a++) {
             const char *key = kSelfcheckArms[a];
             SelfArm arm = selfcheck_arm_for(key, g.index, g.name, g.run);
@@ -12437,30 +15988,60 @@ static int run_selfcheck(int workers, const std::string &only_raw, const char *r
                 }
                 fuzz_aim = aim;
             }
-            const std::string tag = "arm-" + std::to_string(g.index) + "-" + key;
-            const std::string log = dir + "/" + tag + ".log";
-            const std::string rep = dir + "/" + tag + ".json";
-            selfcheck_set_arm_env(arm);
-            // Its own area, so no two arms can share a group's scratch even if
-            // they are ever run side by side, and so a green arm disposes of its
-            // artifacts without touching the sweep's evidence elsewhere in TEMP.
-            const std::string arm_id = std::string(scratch_run_id()) + "-" + tag;
-            set_env_var("KRK_TEST_SCRATCH_ID", arm_id);
+            ArmJob job;
+            job.arm = arm;
+            job.tag = "arm-" + std::to_string(g.index) + "-" + key;
+            job.log = dir + "/" + job.tag + ".log";
+            job.rep = dir + "/" + job.tag + ".json";
+            // Its own area, so no two arms can share a group's scratch now that
+            // a group's arms are in flight at the same time, and so a green arm
+            // disposes of its artifacts without touching the sweep's evidence
+            // elsewhere in TEMP.
+            const std::string arm_id = std::string(scratch_run_id()) + "-" + job.tag;
+            job.env = selfcheck_arm_env(arm);
+            job.env.put("KRK_TEST_SCRATCH_ID", arm_id);
+            if (cap_threads) job.env.put("KRK_THREADS", std::to_string(threads_per_child));
             child_areas.push_back(arm_id);
-            const std::vector<std::string> args{self_path(), "--workers", std::to_string(workers),
-                                                "--report", rep};
-            const ChildExit ce = spawn_child_to(args, log);
-            std::string log_text, rep_text;
-            read_text_file(log, &log_text);
-            read_text_file(rep, &rep_text);
+            job.args = {self_path(), "--workers", std::to_string(arm_workers), "--report", job.rep};
+            jobs.push_back(std::move(job));
+        }
+
+        // ... and now they run together. Every child is a full suite run of its
+        // own, so this is where the sweep's cost was: six suites per group, one
+        // after another, and 83 groups of that is an hour. The arms share
+        // nothing but the seed -- different environment, different scratch area,
+        // different log and report -- which is exactly what makes them safe to
+        // overlap.
+        {
+            const int n = static_cast<int>(jobs.size());
+            const int in_flight = std::max(1, std::min(n, arms_parallel));
+            for (int a = 0; a < n; a += in_flight) {
+                std::vector<std::thread> pool;
+                const int hi = std::min(n, a + in_flight);
+                for (int j = a; j < hi; j++)
+                    pool.emplace_back([&jobs, j] {
+                        ArmJob &jb = jobs[static_cast<size_t>(j)];
+                        jb.exit = spawn_child_to(jb.args, jb.log, jb.env);
+                        read_text_file(jb.log, &jb.log_text);
+                        read_text_file(jb.rep, &jb.rep_text);
+                    });
+                for (std::thread &t : pool) t.join();
+            }
+        }
+        // The verdicts are read in arm order, so the note text and the report
+        // are the same whatever order the children happened to finish in.
+        for (const ArmJob &job : jobs) {
+            const char *key = job.arm.key;
             std::string problem = selfcheck_arm_check(
-                arm, totals.run, ce.started ? static_cast<int>(ce.code) : -1, log_text, rep_text);
-            if (!ce.started)
+                job.arm, totals.run,
+                job.exit.started ? static_cast<int>(job.exit.code) : -1, job.log_text,
+                job.rep_text);
+            if (!job.exit.started)
                 problem = "the runner could not be started" + (problem.empty() ? "" : "; " + problem);
             v.arms.push_back(SelfArmVerdict{key, problem});
             if (problem.empty()) {
-                std::remove(log.c_str());
-                std::remove(rep.c_str());
+                std::remove(job.log.c_str());
+                std::remove(job.rep.c_str());
             } else {
                 failed_arms++;
                 notes += (notes.empty() ? "" : "; ") + std::string(key) + ": " + problem;

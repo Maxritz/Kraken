@@ -1,7 +1,10 @@
 // main_server.cpp — kraken-server entry point.
 //
 // Usage:
-//   kraken-server --model model.gguf [--host 0.0.0.0] [--port 8080]
+//   kraken-server --model model.gguf [--host 0.0.0.0] [--port N]
+//
+// The listen port is the flag, then $KRK_PORT, then 8080 -- a deployment moves
+// off a busy port with an environment variable instead of a source edit.
 //                 [--ctx N] [--chunk N] [--cpu] [--draft small.gguf] [-v]
 //
 // See server.cpp for the endpoint implementation.
@@ -21,7 +24,8 @@ using namespace krk;
 struct Args {
     std::string model;
     std::string host = "0.0.0.0";
-    int port = 8080;
+    int port = 8080;        // fallback when neither --port nor KRK_PORT is set
+    bool port_set = false;  // distinguishes the flag from the default
     int ctx = 4096;
     int chunk = 256;
     int device = 0;
@@ -53,7 +57,7 @@ void usage() {
         "%s %s server — OpenAI-compatible HTTP endpoint\n\n"
         "usage: kraken-server --model model.gguf [options]\n\n"
         "  --host HOST           bind address (default 0.0.0.0)\n"
-        "  --port N              TCP port (default 8080)\n"
+        "  --port N              TCP port (default $KRK_PORT, else 8080)\n"
         "  --ctx N               KV capacity in tokens (default 4096)\n"
         "  --chunk N             prefill batch size (default 256)\n"
         "  --threads N           CPU backend threads (reserved)\n"
@@ -87,6 +91,18 @@ void usage() {
         kEngineName, kEngineVersion);
 }
 
+// A positive port from the environment, or `fallback`. A value that is not a
+// port is ignored deliberately: a typo must not make the server refuse to
+// start for a reason nobody reads, and 8080 is always a valid answer.
+int env_port(const char *name, int fallback) {
+    const char *v = std::getenv(name);
+    if (!v || !*v) return fallback;
+    char *end = nullptr;
+    const long n = std::strtol(v, &end, 10);
+    if (!end || *end != '\0' || n <= 0 || n > 65535) return fallback;
+    return static_cast<int>(n);
+}
+
 bool parse(int argc, char **argv, Args *a) {
     for (int i = 1; i < argc; i++) {
         const std::string f = argv[i];
@@ -99,7 +115,10 @@ bool parse(int argc, char **argv, Args *a) {
         };
         if (f == "--model" || f == "-m") a->model = next("--model");
         else if (f == "--host") a->host = next("--host");
-        else if (f == "--port") a->port = std::atoi(next("--port"));
+        else if (f == "--port") {
+            a->port = std::atoi(next("--port"));
+            a->port_set = true;
+        }
         else if (f == "--ctx") a->ctx = std::atoi(next("--ctx"));
         else if (f == "--chunk") a->chunk = std::atoi(next("--chunk"));
         else if (f == "--threads") a->threads = std::atoi(next("--threads"));
@@ -203,8 +222,13 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Flag, then KRK_PORT, then the 8080 fallback. `--port 0` still means
+    // "ephemeral": the flag sets port_set, so the environment cannot turn an
+    // explicit 0 into a fixed port.
+    const int port = a.port_set ? a.port : env_port("KRK_PORT", a.port);
+
     HttpServer server;
-    if (!server.listen(a.host, a.port, &err)) {
+    if (!server.listen(a.host, port, &err)) {
         std::fprintf(stderr, "kraken-server: %s\n", err.c_str());
         engine.shutdown();
         delete be;

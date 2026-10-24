@@ -527,6 +527,147 @@ public:
                 });
     }
 
+    // ---- V4 shared-latent MLA (see MlaSharedDesc) ------------------------
+    // The reference the HIP kernels are judged against, in the kernels' own
+    // order and on the kernels' own f16 weights, so a difference between the
+    // two arms is arithmetic and never a different table.
+    bool mla_shared_supported() const override { return true; }
+
+    void mla_shared_latent(void *cache, const void *proj, const void *gamma,
+                           const MlaSharedDesc &d) override {
+        f32 *c = static_cast<f32 *>(cache);
+        const f32 *p = static_cast<const f32 *>(proj);
+        const f32 *g = static_cast<const f32 *>(gamma);
+        const i64 kv = d.kv_lora;
+        par_for(d.n_tok, 1, 4.0 * static_cast<f64>(d.n_tok) * kv,
+                [&](i64 b, i64 e) {
+                    for (i64 t = b; t < e; t++) {
+                        const f32 *src = p + t * kv;
+                        f32 *dst = c + (d.pos0 + t) * d.pos_stride;
+                        f64 ss = 0.0;
+                        for (i64 i = 0; i < kv; i++) {
+                            const f64 v = src[i];
+                            ss += v * v;
+                        }
+                        const f32 inv = 1.0f / std::sqrt(
+                            static_cast<f32>(ss / static_cast<f64>(kv)) + d.eps);
+                        for (i64 i = 0; i < kv; i++)
+                            dst[i] = src[i] * inv * g[i];
+                    }
+                });
+    }
+
+    void mla_shared_attention(void *a, const void *q, const void *cache,
+                              const MlaSharedDesc &d) override {
+        f32 *af = static_cast<f32 *>(a);
+        const f32 *qf = static_cast<const f32 *>(q);
+        const f32 *cf = static_cast<const f32 *>(cache);
+        const i64 nh = d.n_head, kv = d.kv_lora, rope = d.qk_rope;
+        const i64 base = kv - rope;
+        const i64 units = d.n_tok * nh;
+        par_for(units, 1,
+                8.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * kv,
+                [&](i64 b, i64 e) {
+                    std::vector<f32> qr(static_cast<size_t>(kv));
+                    std::vector<f32> kr(static_cast<size_t>(kv));
+                    std::vector<f32> p;
+                    for (i64 u = b; u < e; u++) {
+                        const i64 r = u / nh;
+                        const i64 h = u - r * nh;
+                        const i64 pos = d.pos0 + r;
+                        const f32 *qrow = qf + r * (nh * kv) + h * kv;
+                        for (i64 i = 0; i < kv; i++) qr[static_cast<size_t>(i)] = qrow[i];
+                        for (i64 i = 0; i + 1 < rope; i += 2) {
+                            const f32 th =
+                                static_cast<f32>(pos) * d.inv_freq[i / 2];
+                            const f32 cs = std::cos(th), sn = std::sin(th);
+                            const f32 x0 = qr[static_cast<size_t>(base + i)];
+                            const f32 x1 = qr[static_cast<size_t>(base + i + 1)];
+                            qr[static_cast<size_t>(base + i)] = x0 * cs - x1 * sn;
+                            qr[static_cast<size_t>(base + i + 1)] = x0 * sn + x1 * cs;
+                        }
+                        const i64 t_lo = d.window > 0 ? std::max<i64>(0, pos - d.window + 1) : 0;
+                        const i64 nk = pos - t_lo + 1;
+                        p.assign(static_cast<size_t>(nk), 0.0f);
+                        f32 mx = d.sinks ? d.sinks[h] : -1e30f;
+                        for (i64 t = t_lo; t <= pos; t++) {
+                            const f32 *c = cf + t * d.pos_stride;
+                            for (i64 i = 0; i < kv; i++) kr[static_cast<size_t>(i)] = c[i];
+                            for (i64 i = 0; i + 1 < rope; i += 2) {
+                                const f32 th =
+                                    static_cast<f32>(t) * d.inv_freq[i / 2];
+                                const f32 cs = std::cos(th), sn = std::sin(th);
+                                const f32 x0 = kr[static_cast<size_t>(base + i)];
+                                const f32 x1 = kr[static_cast<size_t>(base + i + 1)];
+                                kr[static_cast<size_t>(base + i)] = x0 * cs - x1 * sn;
+                                kr[static_cast<size_t>(base + i + 1)] = x0 * sn + x1 * cs;
+                            }
+                            f32 s = 0.0f;
+                            for (i64 i = 0; i < kv; i++) s += qr[static_cast<size_t>(i)] * kr[static_cast<size_t>(i)];
+                            s *= d.scale;
+                            p[static_cast<size_t>(t - t_lo)] = s;
+                            if (s > mx) mx = s;
+                        }
+                        f32 sum = 0.0f;
+                        if (d.sinks) sum = std::exp(d.sinks[h] - mx);
+                        for (i64 t = 0; t < nk; t++) {
+                            const f32 ex = std::exp(p[static_cast<size_t>(t)] - mx);
+                            p[static_cast<size_t>(t)] = ex;
+                            sum += ex;
+                        }
+                        f32 *out = af + r * (nh * kv) + h * kv;
+                        for (i64 i = 0; i < kv; i++) {
+                            f32 acc = 0.0f;
+                            for (i64 t = 0; t < nk; t++)
+                                acc += p[static_cast<size_t>(t)] /
+                                       sum * cf[(t_lo + t) * d.pos_stride + i];
+                            out[i] = acc;
+                        }
+                    }
+                });
+    }
+
+    void mla_shared_output(void *out, const void *a, void *scratch,
+                           const void *wo_a, const void *wo_b,
+                           const MlaSharedDesc &d) override {
+        const f32 *af = static_cast<const f32 *>(a);
+        f32 *y = static_cast<f32 *>(scratch);
+        const u16 *wa = static_cast<const u16 *>(wo_a);
+        const u16 *wb = static_cast<const u16 *>(wo_b);
+        const i64 hpg = d.heads_per_group(), kv = d.kv_lora;
+        const i64 gin = hpg * kv, gout = d.gout();
+        par_for(d.n_tok * d.o_groups, 1,
+                2.0 * static_cast<f64>(d.n_tok) * gout * gin,
+                [&](i64 b, i64 e) {
+                    for (i64 u = b; u < e; u++) {
+                        const i64 r = u / d.o_groups;
+                        const i64 g = u - r * d.o_groups;
+                        const f32 *src = af + r * (d.n_head * kv) + g * gin;
+                        const u16 *w = wa + g * d.o_lora * gin;
+                        f32 *dst = y + r * gout + g * d.o_lora;
+                        for (i64 j = 0; j < d.o_lora; j++) {
+                            f32 s = 0.0f;
+                            for (i64 i = 0; i < gin; i++)
+                                s += fp16_to_fp32(w[j * gin + i]) * src[i];
+                            dst[j] = s;
+                        }
+                    }
+                });
+        par_for(d.n_tok, 1, 2.0 * static_cast<f64>(d.n_tok) * d.n_embd * gout,
+                [&](i64 b, i64 e) {
+                    for (i64 r = b; r < e; r++) {
+                        const f32 *src = y + r * gout;
+                        f32 *dst = static_cast<f32 *>(out) + r * d.n_embd;
+                        for (i64 o = 0; o < d.n_embd; o++) {
+                            f32 s = 0.0f;
+                            for (i64 j = 0; j < gout; j++)
+                                s += fp16_to_fp32(wb[o * gout + j]) * src[j];
+                            dst[o] = s;
+                        }
+                    }
+                });
+    }
+
     void silu_mul(void *out, const void *gate, const void *up, i64 n,
                   i64 row_len = 0, f32 *row_scale = nullptr) override {
         f32 *o = static_cast<f32 *>(out);

@@ -27,7 +27,7 @@
 # The gate carries the cheap half of the reporting proof by default: the runner's
 # own selftest (constructed answers, milliseconds) and one group's six injection
 # arms, so a gate that compares two reports has first shown the reports still mean
-# what they say. The all-groups sweep is what KRK_BASELINE_SELFCHECK=1 adds -- 318
+# what they say. The all-groups sweep is what KRK_BASELINE_SELFCHECK=1 adds -- 498
 # suite runs, measured 240 s -- and it compares against its own recorded baseline
 # (KRK_SELFCHECK_BASELINE, default tests/kraken-tests-selfcheck-baseline.json,
 # recorded with the same KRK_TEST_BASELINE_RECORD=1 switch).

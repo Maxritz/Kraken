@@ -176,6 +176,40 @@ struct MlaDesc {
     const f32 *inv_freq = nullptr;
 };
 
+// V4's shared-latent MLA (MlaLayout::Shared), which is a different graph from
+// the layout above: ONE normed latent row per token is used as BOTH K (rotated
+// on read) and V (as it is), and the output is a grouped low-rank projection.
+// There is no decoupled key, so no `nope`/`rope` split of the cache row -- the
+// rotary dims are the TAIL of the same latent. Arithmetic: src/mla_shared.cpp.
+//
+// Weights are the file's own f16 staging: [out][in] rows with ne[0] the
+// contracting axis (GGUF's order). The oracle in src/mla_shared.cpp is [in][out]
+// for the same matrices, which is the convention the bench transposes between.
+struct MlaSharedDesc {
+    i64 n_head = 0;
+    i64 kv_lora = 0;   // key_length == value_length == head_dim
+    i64 qk_rope = 0;   // rotary tail of the latent AND of every query head
+    i64 o_groups = 0;
+    i64 o_lora = 0;
+    i64 n_embd = 0;
+    i64 n_tok = 0;      // query rows in this call
+    i64 pos0 = 0;       // absolute position of row 0
+    i64 pos_stride = 0; // elements between cache positions
+    f32 scale = 1.0f;   // 1/sqrt(kv_lora): the score is over the whole latent
+    f32 eps = 1e-6f;
+    // V4's layers are windowed: keys at or before q_pos - window do not take
+    // part. 0 means every cached key. Positions are the cache slots themselves
+    // (dense cache), which is what the engine keeps -- the oracle takes an
+    // explicit kpos array because the SUITE compacts a cache to test the rule.
+    i32 window = 0;
+    const f32 *inv_freq = nullptr; // HOST [qk_rope/2]
+    // Per-head attention-sink logit, entered into the softmax DENOMINATOR only
+    // (never attended). HOST memory, [n_head]; null on a file with no sinks.
+    const f32 *sinks = nullptr;
+    i64 heads_per_group() const { return o_groups > 0 ? n_head / o_groups : 0; }
+    i64 gout() const { return o_groups * o_lora; }
+};
+
 // ---------------------------------------------------------------------------
 
 class Backend {
@@ -601,6 +635,15 @@ public:
     virtual void gemm(void *out, const void *x, const void *w, DType wt,
                       i64 n_out, i64 n_in, i64 rows) = 0;
 
+    // Can this backend's GEMM address a CONTRACTION of `k` columns? The CPU
+    // reference walks any k; a kernel that vectorizes K in fixed chunks can
+    // only take multiples of that chunk, and the answer has to be asked BEFORE
+    // the first pass -- a shape the kernel cannot address is a refusal that
+    // names the geometry, not a launch that aborts halfway through a prefill.
+    // Default true, and every backend that imposes a rule overrides it: a
+    // default of false would refuse shapes that run fine.
+    virtual bool gemm_k_ok(i64 k) const { return k > 0; }
+
     // dst[rows, n_out] += x[rows, n_in] * W[n_out, n_in]^T : the residual add
     // that ends a layer's projection, folded into that projection's epilogue
     // so the layer pays one launch instead of two. `dst` is both the addend and
@@ -822,6 +865,38 @@ public:
     virtual void mla_attention(void *out, const void *q, const void *cache,
                                const void *wkv_b, const MlaDesc &d) {
         (void)out; (void)q; (void)cache; (void)wkv_b; (void)d;
+    }
+
+    // ---- V4 shared-latent MLA (see MlaSharedDesc) -------------------------
+    // A separate flag from mla_supported(): the two layouts are different
+    // graphs, and a backend that runs V2-Lite is not thereby able to run V4.
+    virtual bool mla_shared_supported() const { return false; }
+    // cache[pos0 + t] = rmsnorm(proj[t][0..kv_lora)) * gamma, the WHOLE row
+    // (the rotary dims are its tail, so they are normed here unlike the lite
+    // layout's decoupled key). `proj` is f16 [n_tok, kv_lora].
+    virtual void mla_shared_latent(void *cache, const void *proj,
+                                   const void *gamma, const MlaSharedDesc &d) {
+        (void)cache; (void)proj; (void)gamma; (void)d;
+    }
+    // a[n_tok, n_head*kv_lora] f32: per head, softmax over the prefix (window
+    // and sink applied) of the rotated latent's dot with that head's query,
+    // then that softmax's weighted sum of the UNROTATED latent. `q` is f16
+    // [n_tok, n_head*kv_lora]` already projected; its rotary tail is rotated
+    // here at the row's own position.
+    virtual void mla_shared_attention(void *a, const void *q, const void *cache,
+                                      const MlaSharedDesc &d) {
+        (void)a; (void)q; (void)cache; (void)d;
+    }
+    // out[n_tok, n_embd] f16: y[g] = Woa_g over group g's concatenated heads,
+    // then Wob over the concatenated y. wo_a is f16 [gout, hpg*kv_lora] with
+    // group g's o_lora output rows at [g*o_lora, (g+1)*o_lora); wo_b is f16
+    // [n_embd, gout]. Both in the file's order (row = output). `scratch` is the
+    // caller's f32 [n_tok, gout] workspace for the intermediate y -- per-call
+    // allocation here would be a device malloc on every layer of every token.
+    virtual void mla_shared_output(void *out, const void *a, void *scratch,
+                                   const void *wo_a, const void *wo_b,
+                                   const MlaSharedDesc &d) {
+        (void)out; (void)a; (void)scratch; (void)wo_a; (void)wo_b; (void)d;
     }
 
     // Compact gather out of a KV cache: dst[r] = src[idx[r]], `row_bytes`

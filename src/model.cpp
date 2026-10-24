@@ -41,6 +41,10 @@ std::vector<QuantTensor *> qt_fields(LayerWeights &L) {
             &L.wq_a,      &L.wq_b,      &L.wkv,
             &L.wkv_a,     &L.wk_b,      &L.wv_b,
             &L.wo_a,      &L.wo_b,
+            // The V4 f16 staging: five more allocations a layer, and missing
+            // them here leaks every one of them on unload.
+            &L.wq_a16,    &L.wq_b16,    &L.wkv16,
+            &L.wo_a16,    &L.wo_b16,
             &L.ssm_alpha,  &L.ssm_beta};
 }
 
@@ -1881,6 +1885,88 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     if (err) *err = e;
                     return false;
                 }
+
+                // ---- the f16 staging the shared-latent ops read ------------
+                // Every table this layout's kernels touch is staged here, once,
+                // for `wkv_b16`'s reason above: the grouped output is addressed
+                // as per-group slices (see LayerWeights::wo_a16) and the host
+                // oracle the device is judged against reads f16. The query
+                // trunk is staged only when the file HAS one -- inventing a
+                // tensor is not the loader's job, and a shared file with no
+                // trunk is a refusal for the ENGINE to make.
+                i64 stage_bytes = 0;
+                auto stage16 = [&](const char *what, QuantTensor &dst,
+                                   const std::string &tname, i64 n_in,
+                                   i64 n_out) {
+                    const GgufTensor *t = gguf_.tensor(tname);
+                    if (!t) {
+                        e = "layer " + std::to_string(l) +
+                            ": the shared-latent path stages '" +
+                            std::string(what) + "' as f16 and the file has no "
+                            "such tensor";
+                        return false;
+                    }
+                    const size_t nelem = static_cast<size_t>(n_in) *
+                                         static_cast<size_t>(n_out);
+                    const size_t rb = dtype_row_bytes(t->type, n_in);
+                    std::vector<f32> row(static_cast<size_t>(n_in));
+                    std::vector<u16> half(nelem);
+                    const u8 *src = static_cast<const u8 *>(t->data);
+                    for (i64 r = 0; r < n_out; r++) {
+                        dequant_row(t->type, src + static_cast<size_t>(r) * rb,
+                                    row.data(), n_in);
+                        for (i64 i = 0; i < n_in; i++)
+                            half[static_cast<size_t>(r * n_in + i)] =
+                                fp32_to_fp16(row[static_cast<size_t>(i)]);
+                    }
+                    void *dev = be.alloc(nelem * 2);
+                    if (!dev) {
+                        e = "layer " + std::to_string(l) +
+                            ": could not allocate " +
+                            std::to_string(nelem * 2 / 1048576u) +
+                            " MiB for the '" + std::string(what) +
+                            "' f16 staging";
+                        return false;
+                    }
+                    upload_timed(dev, half.data(), nelem * 2);
+                    dst.data = dev;
+                    dst.type = DType::F16;
+                    dst.n_in = n_in;
+                    dst.n_out = n_out;
+                    stage_bytes += static_cast<i64>(nelem * 2);
+                    return true;
+                };
+                const i64 gout =
+                    static_cast<i64>(cfg_.dsv4_o_lora) * cfg_.dsv4_o_groups;
+                const i64 q_head = static_cast<i64>(cfg_.n_head) * want_latent;
+                bool staged =
+                    stage16("attn_kv", L.wkv16,
+                            blk_key("blk.%d.attn_kv.weight", l), cfg_.n_embd,
+                            want_latent) &&
+                    stage16("attn_output_a", L.wo_a16,
+                            blk_key("blk.%d.attn_output_a.weight", l),
+                            want_woa_in, want_woa_out) &&
+                    stage16("attn_output_b", L.wo_b16,
+                            blk_key("blk.%d.attn_output_b.weight", l),
+                            want_woa_out, cfg_.n_embd);
+                if (staged && has_q_a)
+                    staged = stage16("attn_q_a", L.wq_a16,
+                                     blk_key("blk.%d.attn_q_a.weight", l),
+                                     cfg_.n_embd, cfg_.mla_q_lora) &&
+                             stage16("attn_q_b", L.wq_b16,
+                                     blk_key("blk.%d.attn_q_b.weight", l),
+                                     cfg_.mla_q_lora, q_head);
+                if (!staged) {
+                    if (err) *err = e;
+                    return false;
+                }
+                // Reported, not hidden: this is VRAM the expert tier cannot
+                // reclaim, so a 10 GB budget has to count it.
+                if (l == 0 && std::getenv("KRK_PHASE"))
+                    std::fprintf(stderr,
+                                 "[load ] %-24s %7.3f MiB/layer\n",
+                                 "mla f16 staging",
+                                 static_cast<f64>(stage_bytes) / 1048576.0);
             }
         } else if (gguf_.tensor(blk_key("blk.%d.attn_q.weight", l)) ||
                    gguf_.tensor(blk_key("blk.%d.attn_qkv.weight", l)) ||

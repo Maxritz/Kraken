@@ -1427,16 +1427,18 @@ against CPU and call it coherence (`FAIL (cpu)`).
 ## HTTP server (OpenAI-compatible)
 
 ```sh
-kraken-server --model model.gguf --port 8080 --ctx 4096
-# GPU when the HIP backend is present; --cpu forces the reference backend
+KRK_PORT=8090 kraken-server --model model.gguf --ctx 4096
+# GPU when the HIP backend is present; --cpu forces the reference backend.
+# The listen port is --port, then $KRK_PORT, then 8080, and the banner prints
+# the port that was actually bound.
 
-curl http://localhost:8080/health
-curl http://localhost:8080/v1/models
-curl http://localhost:8080/v1/completions \
+curl http://localhost:8090/health
+curl http://localhost:8090/v1/models
+curl http://localhost:8090/v1/completions \
      -d '{"prompt":"The capital of France is","max_tokens":32,"temperature":0}'
-curl -N http://localhost:8080/v1/completions \
+curl -N http://localhost:8090/v1/completions \
      -d '{"prompt":"Hello","max_tokens":32,"stream":true}'        # SSE
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:8090/v1/chat/completions \
      -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":32}'
 ```
 
@@ -1455,7 +1457,7 @@ generation is serialized; each request starts from a fresh KV context. Any
 OpenAI client works:
 
 ```sh
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:8090/v1/chat/completions \
      -H 'Content-Type: application/json' \
      -d '{"model":"local","messages":[{"role":"user","content":"Hello"}]}' \
   | jq -r '.choices[0].message.content'

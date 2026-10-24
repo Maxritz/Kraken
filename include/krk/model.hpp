@@ -180,6 +180,26 @@ struct LayerWeights {
     QuantTensor wv_b;          // Split: [kv_lora, n_head*v_dim]
     QuantTensor wo_a;          // Shared: [n_embd, o_lora_rank*n_groups]
     QuantTensor wo_b;          // Shared: [o_lora_rank*n_groups, n_embd]
+    // The five tables above, dequantized to f16 once at load in the FILE's own
+    // element order -- the same staging and the same reason as `wkv_b16` on
+    // the legacy path. The shared-latent ops read the grouped output as
+    // per-group slices of a [heads_per_group*key_length, o_groups*o_lora]
+    // matrix, which `gemm()` cannot address: a group owns a COLUMN block and
+    // its rows are that group's concatenated heads, so the two are interleaved
+    // in a way no output-stride argument expresses. The host oracle the device
+    // is judged against reads these same f16 numbers, so the query trunk and
+    // the latent are staged too and the whole layer runs one dtype.
+    //
+    // These are ALLOCATIONS, not views. On V4's real geometry
+    // (n_embd 4096, key_length 512, 8 groups, o_lora 1024) the two output
+    // tables are 128 MiB a layer and a 43-layer file stages ~5.4 GiB. A VRAM
+    // budget has to carry that, which is why the loader reports the number
+    // rather than letting it appear as unexplained residency.
+    QuantTensor wq_a16;        // [n_embd, q_lora]
+    QuantTensor wq_b16;        // [q_lora, n_head*key_length]
+    QuantTensor wkv16;         // [n_embd, key_length]
+    QuantTensor wo_a16;        // [heads_per_group*key_length, o_groups*o_lora]
+    QuantTensor wo_b16;        // [o_groups*o_lora, n_embd]
 
     // The hash route's expert-id table (DeepSeek-V4): `ffn_gate_tid2eid.weight`
     // is an INT32 tensor -- ggml type 26 -- holding one row per selected
@@ -693,8 +713,17 @@ public:
         // n_kv = 16 and the row is 576 (V2-Lite), which is the whole point of
         // the compression. Reading the head geometry here would size the plane
         // 5x too wide and the kernel would read every row past its end.
-        if (layer_is_mla(layer))
-            return static_cast<i64>(cfg_.mla_kv_lora) + cfg_.mla_qk_rope;
+        if (layer_is_mla(layer)) {
+            // The shared-latent layout (V4) caches ONE row and keeps the rope in
+            // its TAIL, so the row is the latent itself. The lite layout stores
+            // the compressed latent and a decoupled rope key BESIDE it, which is
+            // the +qk_rope. Sizing V4 by the lite rule leaves every plane 64
+            // columns too wide and makes `pos_stride` -- the row the kernels
+            // index by -- disagree with the slot the tier handed out.
+            const i64 row = static_cast<i64>(cfg_.mla_kv_lora);
+            if (cfg_.mla_layout == MlaLayout::Shared) return row;
+            return row + cfg_.mla_qk_rope;
+        }
         return static_cast<i64>(n_head_kv_at(layer)) * cfg_.head_dim;
     }
     // True when this layer reads and writes KV: the ones carrying q/k/v or an

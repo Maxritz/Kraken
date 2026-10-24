@@ -33,6 +33,7 @@
 #include "kernels/gather.hpp"
 #include "kernels/ple.hpp"
 #include "kernels/mla.hpp"
+#include "kernels/mla_shared.hpp"
 #include "op_time.hpp"
 #include "krk/trace.hpp"
 
@@ -2657,6 +2658,10 @@ public:
         return true;
     }
 
+    // K is walked in 32-value chunks (and the formats are packed 32 to a
+    // block), so a contraction the init stage did not clear aborts below.
+    bool gemm_k_ok(i64 k) const override { return k > 0 && (k & 31) == 0; }
+
     void gemm(void *out, const void *x, const void *w, DType wt, i64 n_out,               i64 n_in, i64 rows) override {
         KRK_TIME_OP("gemm");
         if (rows <= 0 || n_out <= 0 || n_in <= 0) return;
@@ -3082,6 +3087,58 @@ public:
             static_cast<const _Float16 *>(wkv_b), d.n_head, d.qk, d.nope,
             d.rope, d.kv_lora, d.v_dim, d.pos0, d.pos_stride, d.scale, fd,
             n_keys_max);
+    }
+
+    // ---- V4 shared-latent MLA (see MlaSharedDesc) ------------------------
+    // A separate provider from the lite layout above: the two graphs share a
+    // cache shape story and nothing else.
+    bool mla_shared_supported() const override { return true; }
+
+    void mla_shared_latent(void *cache, const void *proj, const void *gamma,
+                           const MlaSharedDesc &d) override {
+        KRK_TIME_OP("mla_shared_latent");
+        if (d.n_tok <= 0) return;
+        mla_shared_latent_kernel<256><<<static_cast<unsigned>(d.n_tok), 256>>>(
+            static_cast<_Float16 *>(cache), static_cast<const _Float16 *>(proj),
+            static_cast<const f32 *>(gamma), d.kv_lora, d.pos0, d.pos_stride,
+            d.eps);
+    }
+
+    void mla_shared_attention(void *a, const void *q, const void *cache,
+                              const MlaSharedDesc &d) override {
+        KRK_TIME_OP("mla_shared_attention");
+        if (d.n_tok <= 0) return;
+        const f32 *fd = stage_freq(d.inv_freq, d.qk_rope);
+        const f32 *sk = d.sinks ? stage_sinks(d.sinks, d.n_head) : nullptr;
+        const i64 n_keys_max = d.pos0 + d.n_tok;
+        // The rotated query and this head's scores; the key is never staged
+        // (see the kernel: the query is un-rotated per key instead, which also
+        // removed a data race).
+        const size_t shmem =
+            static_cast<size_t>(d.kv_lora + n_keys_max) * sizeof(f32);
+        const dim3 grid(static_cast<unsigned>(d.n_tok),
+                        static_cast<unsigned>(d.n_head));
+        mla_shared_attention_kernel<256><<<grid, 256, shmem>>>(
+            static_cast<f32 *>(a), static_cast<const _Float16 *>(q),
+            static_cast<const _Float16 *>(cache), d.n_head, d.kv_lora,
+            d.qk_rope, d.pos0, d.pos_stride, d.scale, d.window, fd, sk,
+            n_keys_max);
+    }
+
+    void mla_shared_output(void *out, const void *a, void *scratch,
+                           const void *wo_a, const void *wo_b,
+                           const MlaSharedDesc &d) override {
+        KRK_TIME_OP("mla_shared_output");
+        if (d.n_tok <= 0) return;
+        const dim3 grid_a(static_cast<unsigned>(d.n_tok),
+                          static_cast<unsigned>(d.o_groups));
+        mla_shared_wo_a_kernel<256><<<grid_a, 256>>>(
+            static_cast<f32 *>(scratch), static_cast<const f32 *>(a),
+            static_cast<const _Float16 *>(wo_a), d.n_head, d.kv_lora,
+            d.o_groups, d.o_lora);
+        mla_shared_wo_b_kernel<256><<<static_cast<unsigned>(d.n_tok), 256>>>(
+            static_cast<_Float16 *>(out), static_cast<const f32 *>(scratch),
+            static_cast<const _Float16 *>(wo_b), d.n_embd, d.gout());
     }
 
     void kv_append(void *kcache, void *vcache, const void *k, const void *v,
@@ -3900,6 +3957,10 @@ private:
     };
     FreqSlot freq_[kFreqSlots] = {};
     i64 freq_clock_ = 0;
+    // The V4 sink logits are host memory like the frequencies, and there are a
+    // handful of tables at most (one per layer at worst), so two LRU slots.
+    FreqSlot sink_[2] = {};
+    i64 sink_clock_ = 0;
     // Device-side position scalar for the decode path (rope,
     // kv_append, decode attention). Those kernels read pos0 from
     // device memory so a captured HIP graph can replay a whole
@@ -4225,6 +4286,35 @@ bool stage_upload(void *dst, const void *src, size_t bytes) {
         victim->n = n;
         victim->sig = sig;
         victim->stamp = ++freq_clock_;
+        return static_cast<const f32 *>(victim->dev);
+    }
+
+    // The V4 sink table, staged the same way (keyed on pointer and width). A
+    // sink array is per head and tiny, so a memcpy per layer would be noise if
+    // it did not also synchronize; the slot makes it happen once per layer at
+    // most, and once per model in practice.
+    const f32 *stage_sinks(const f32 *sinks, i64 n_head) {
+        const size_t n = static_cast<size_t>(n_head);
+        FreqSlot *victim = &sink_[0];
+        for (FreqSlot &s : sink_) {
+            if (s.dev && s.src == sinks && s.n == n) {
+                s.stamp = ++sink_clock_;
+                return static_cast<const f32 *>(s.dev);
+            }
+            if (s.stamp <= victim->stamp) victim = &s;
+        }
+        const size_t need = n * sizeof(f32);
+        if (need > victim->cap) {
+            if (victim->dev) KRK_HIP(hipFree(victim->dev));
+            victim->cap = (need + 255u) & ~static_cast<size_t>(255u);
+            victim->dev = nullptr;
+            KRK_HIP(hipMalloc(&victim->dev, victim->cap));
+        }
+        KRK_HIP(hipMemcpy(victim->dev, sinks, need, hipMemcpyHostToDevice));
+        victim->src = sinks;
+        victim->n = n;
+        victim->sig = 0.0f;
+        victim->stamp = ++sink_clock_;
         return static_cast<const f32 *>(victim->dev);
     }
 };

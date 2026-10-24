@@ -53,6 +53,7 @@
 #include <krk/h2d_probe.hpp>
 #include <krk/hc.hpp>
 #include <krk/mla.hpp>
+#include <krk/mla_shared.hpp>
 #include <krk/quant.hpp>
 
 #include <algorithm>
@@ -2851,6 +2852,291 @@ i64 arm_mla(Backend *be) {
     return failed;
 }
 
+// ---------------------------------------------------------------------------
+// V4 shared-latent MLA, against the oracle in src/mla_shared.cpp.
+//
+// The whole chain is driven, not just the attention kernel: the cache write and
+// the grouped output are two more places a stride can be wrong, and both fail
+// quietly (a wrong group reads its neighbour and still produces a full, finite
+// vector). So the arm compares the layer's final rows AND checks the negative
+// control -- a table whose group blocks are swapped has to miss.
+//
+// Geometry is V4-shaped but small (8 heads, a 64-wide latent, 2 groups), and
+// the latent is f16-rounded on both sides before the norms so the comparison is
+// arithmetic and not storage format.
+// ---------------------------------------------------------------------------
+i64 arm_mla_shared(Backend *be) {
+    std::printf("\nshared-latent MLA (V4: 8 heads, latent 64, rope 16, "
+                "2 groups of 16):\n");
+    if (!be->mla_shared_supported()) {
+        std::printf("  this backend has no shared-latent MLA ops -- a deepseek4 "
+                    "file refuses to run on it\n");
+        return 1;
+    }
+    const i32 nh = 8, kv = 64, rope = 16, og = 2, ol = 16, ne = 128;
+    const i32 ql = 32, hpg = nh / og, gin = hpg * kv, gout = og * ol;
+    // pos0 + rows, not rows: the history arm rewrites the whole cache in one
+    // call, so the buffers have to hold the KEYS as well as the queries.
+    const i64 max_rows = 16;
+
+    u32 seed = 20261024u;
+    auto rnd = [&](f64 amp) {
+        seed = seed * 1664525u + 1013904223u;
+        const f64 u = static_cast<f64>((seed >> 8) & 0xFFFFu) / 32768.0 - 1.0;
+        return static_cast<f32>(u * amp);
+    };
+    auto mat = [&](i64 n_out, i64 n_in) {
+        const f64 amp = 1.0 / std::sqrt(static_cast<f64>(n_in));
+        std::vector<f32> m(static_cast<size_t>(n_out * n_in));
+        for (auto &w : m) w = rnd(amp);
+        return m;
+    };
+    // File order: row = OUTPUT, column = input (GGUF's ne[0] is the input axis).
+    const std::vector<f32> wqa = mat(ql, ne);
+    const std::vector<f32> wqb = mat(nh * kv, ql);
+    const std::vector<f32> wkv = mat(kv, ne);
+    const std::vector<f32> woa = mat(gout, gin);
+    const std::vector<f32> wob = mat(ne, gout);
+    std::vector<f32> gq(static_cast<size_t>(ql));
+    for (auto &g : gq) g = 0.5f + 0.5f * std::fabs(rnd(1.0));
+    std::vector<f32> gkv(static_cast<size_t>(kv));
+    for (auto &g : gkv) g = 0.5f + 0.5f * std::fabs(rnd(1.0));
+    std::vector<f32> invf(static_cast<size_t>(rope / 2));
+    for (i64 i = 0; i < rope / 2; i++)
+        invf[static_cast<size_t>(i)] = std::pow(
+            10000.0f, -2.0f * static_cast<f32>(i) / static_cast<f32>(rope));
+    std::vector<f32> sinks(static_cast<size_t>(nh));
+    for (auto &s : sinks) s = rnd(2.0f);
+    const f32 eps = 1e-6f, scale = 1.0f / std::sqrt(static_cast<f32>(kv));
+
+    std::vector<f32> xhost(static_cast<size_t>(max_rows * ne));
+    for (auto &x : xhost) x = rnd(1.2f);
+
+    auto up = [](const std::vector<f32> &v) {
+        std::vector<u16> h(v.size());
+        for (size_t i = 0; i < v.size(); i++) h[i] = fp32_to_fp16(v[i]);
+        return h;
+    };
+    auto updev16 = [&](const std::vector<f32> &v) {
+        void *p = be->alloc(v.size() * 2);
+        const std::vector<u16> h = up(v);
+        be->upload(p, h.data(), h.size() * 2, 0);
+        return p;
+    };
+    // Activations are f16 on the device and f32 on the CPU reference, so their
+    // buffers come from act_type() rather than a guessed width.
+    const bool act16 = be->act_type() == DType::F16;
+    auto upact = [&](const std::vector<f32> &v) {
+        void *p = be->alloc(v.size() * be->act_size());
+        if (act16) {
+            const std::vector<u16> h = up(v);
+            be->upload(p, h.data(), h.size() * 2, 0);
+        } else {
+            be->upload(p, v.data(), v.size() * 4, 0);
+        }
+        return p;
+    };
+    auto downact = [&](void *p, i64 n) {
+        std::vector<f32> v(static_cast<size_t>(n));
+        if (act16) {
+            std::vector<u16> h(v.size());
+            be->download(h.data(), p, h.size() * 2, 0);
+            for (size_t i = 0; i < v.size(); i++) v[i] = fp16_to_fp32(h[i]);
+        } else {
+            be->download(v.data(), p, v.size() * 4, 0);
+        }
+        return v;
+    };
+
+    void *wqa_d = updev16(wqa), *wqb_d = updev16(wqb), *wkv_d = updev16(wkv);
+    void *woa_d = updev16(woa), *wob_d = updev16(wob);
+    std::vector<f32> woa_swap = woa;
+    for (i32 j = 0; j < ol; j++)
+        for (i32 i = 0; i < gin; i++) {
+            woa_swap[static_cast<size_t>(j * gin + i)] =
+                woa[static_cast<size_t>((ol + j) * gin + i)];
+            woa_swap[static_cast<size_t>((ol + j) * gin + i)] =
+                woa[static_cast<size_t>(j * gin + i)];
+        }
+    void *woas_d = updev16(woa_swap);
+    void *gq_d = be->alloc(gq.size() * 4);
+    be->upload(gq_d, gq.data(), gq.size() * 4, 0);
+    void *gkv_d = be->alloc(gkv.size() * 4);
+    be->upload(gkv_d, gkv.data(), gkv.size() * 4, 0);
+
+    const i64 qdim = nh * kv;
+    void *x_d = upact(xhost);
+    void *qa_d = upact(std::vector<f32>(static_cast<size_t>(max_rows * ql), 0.0f));
+    // A separate destination for the norm: in place is a read/write race on a
+    // row-parallel kernel, and it cost exactly one row here before it was one.
+    void *qn_d = upact(std::vector<f32>(static_cast<size_t>(max_rows * ql), 0.0f));
+    void *q_d = upact(std::vector<f32>(static_cast<size_t>(max_rows * qdim), 0.0f));
+    void *kv_d = upact(std::vector<f32>(static_cast<size_t>(max_rows * kv), 0.0f));
+    void *cache_d = upact(std::vector<f32>(static_cast<size_t>(max_rows * kv), 0.0f));
+    void *out_d = upact(std::vector<f32>(static_cast<size_t>(max_rows * ne), 0.0f));
+    void *a_d = be->alloc(static_cast<size_t>(max_rows * qdim) * sizeof(f32));
+    void *y_d = be->alloc(static_cast<size_t>(max_rows * gout) * sizeof(f32));
+
+    // The oracle's arrays: [in][out], which is the transpose of the file's.
+    auto tr = [](const std::vector<f32> &a, i64 n_out, i64 n_in) {
+        std::vector<f32> t(static_cast<size_t>(n_out * n_in));
+        for (i64 o = 0; o < n_out; o++)
+            for (i64 i = 0; i < n_in; i++)
+                t[static_cast<size_t>(i * n_out + o)] =
+                    a[static_cast<size_t>(o * n_in + i)];
+        return t;
+    };
+    krk::MlaSharedWeights w;
+    const std::vector<f32> oqa = tr(wqa, ql, ne);
+    const std::vector<f32> oqb = tr(wqb, nh * kv, ql);
+    const std::vector<f32> okv = tr(wkv, kv, ne);
+    const std::vector<f32> ooa = tr(woa, gout, gin);
+    const std::vector<f32> oob = tr(wob, ne, gout);
+    w.wq_a = oqa.data();
+    w.wq_a_norm = gq.data();
+    w.wq_b = oqb.data();
+    w.wkv = okv.data();
+    w.wkv_norm = gkv.data();
+    w.wo_a = ooa.data();
+    w.wo_b = oob.data();
+
+    krk::MlaSharedGeometry g;
+    g.n_embd = ne;
+    g.n_head = nh;
+    g.q_lora = ql;
+    g.kv_lora = kv;
+    g.qk_rope = rope;
+    g.o_groups = og;
+    g.o_lora = ol;
+
+    struct Case {
+        i64 rows, pos0;
+        i32 window;
+        bool sinks, swap;
+    };
+    const Case cases[] = {{1, 0, 0, false, false}, {2, 0, 0, false, false},
+                          // window 1: every row sees exactly one key, so a
+                          // failure here is the query row, not the softmax.
+                          {2, 0, 1, false, false},
+                          {4, 0, 0, false, false}, {8, 0, 0, false, false},
+                          {4, 5, 0, false, false}, {4, 5, 3, false, false},
+                          {4, 5, 3, true, false}, {4, 5, 3, true, true}};
+    const f64 limit = 2e-2;
+    i64 failed = 0, checks = 0;
+
+    for (const Case &c : cases) {
+        const i64 n_keys = c.pos0 + c.rows;
+        MlaSharedDesc d;
+        d.n_head = nh;
+        d.kv_lora = kv;
+        d.qk_rope = rope;
+        d.o_groups = og;
+        d.o_lora = ol;
+        d.n_embd = ne;
+        d.n_tok = c.rows;
+        d.pos0 = c.pos0;
+        d.pos_stride = kv;
+        d.scale = scale;
+        d.eps = eps;
+        d.window = c.window;
+        d.inv_freq = invf.data();
+        d.sinks = c.sinks ? sinks.data() : nullptr;
+
+        if (c.pos0 > 0) {
+            be->gemm(kv_d, x_d, wkv_d, DType::F16, kv, ne, c.pos0);
+            d.n_tok = c.pos0;
+            d.pos0 = 0;
+            be->mla_shared_latent(cache_d, kv_d, gkv_d, d);
+        }
+        d.n_tok = c.rows;
+        d.pos0 = c.pos0;
+        // x rows for this call start at pos0 (the history is the earlier rows
+        // of the same [rows, ne] buffer).
+        be->gemm(qa_d, x_d, wqa_d, DType::F16, ql, ne, n_keys);
+        be->rmsnorm(qn_d, qa_d, static_cast<const f32 *>(gq_d), n_keys, ql,
+                    eps);
+        be->gemm(q_d, qn_d, wqb_d, DType::F16, qdim, ql, n_keys);
+        be->gemm(kv_d, x_d, wkv_d, DType::F16, kv, ne, n_keys);
+        d.pos0 = 0;
+        d.n_tok = n_keys;
+        be->mla_shared_latent(cache_d, kv_d, gkv_d, d);
+        d.pos0 = c.pos0;
+        d.n_tok = c.rows;
+        // q holds every key row; the query for absolute position pos0 + r
+        // is row pos0 + r, not row r.
+        be->mla_shared_attention(a_d,
+                                 static_cast<char *>(q_d) +
+                                     static_cast<size_t>(c.pos0 * qdim) *
+                                         be->act_size(),
+                                 cache_d, d);
+        be->sync();
+        be->mla_shared_output(out_d, a_d, y_d, c.swap ? woas_d : woa_d, wob_d,
+                              d);
+
+        // The oracle reads the device's own f16-rounded rows, so the only
+        // difference left is association and the f16 weights.
+        const std::vector<f32> cache =
+            downact(cache_d, n_keys * kv);
+        const std::vector<f32> xr = downact(x_d, n_keys * ne);
+        std::vector<i64> kpos(static_cast<size_t>(n_keys));
+        for (i64 t = 0; t < n_keys; t++) kpos[static_cast<size_t>(t)] = t;
+        std::vector<f32> want(static_cast<size_t>(ne));
+        f64 worst = 0.0, worst0 = 0.0, peak = 0.0;
+        for (i64 r = 0; r < c.rows; r++) {
+            w.sinks = c.sinks ? sinks.data() : nullptr;
+            krk::mla_shared_forward_accum(
+                want.data(), xr.data() + (c.pos0 + r) * ne, cache.data(),
+                kpos.data(), n_keys, c.pos0 + r, w, g, invf.data(), scale, eps,
+                c.window);
+            const std::vector<f32> got =
+                downact(static_cast<char *>(out_d) + r * ne * be->act_size(),
+                        ne);
+            for (i32 j = 0; j < ne; j++) {
+                const f64 e = std::fabs(static_cast<f64>(got[j]) -
+                                        static_cast<f64>(want[j]));
+                if (e > worst) worst = e;
+                if (r == 0 && e > worst0) worst0 = e;
+                if (std::fabs(static_cast<double>(want[j])) > peak)
+                    peak = std::fabs(static_cast<double>(want[j]));
+            }
+        }
+        const f64 rel = worst / (peak + 1.0);
+        const bool ok = c.swap ? rel > limit : rel < limit;
+        checks++;
+        if (!ok) failed++;
+        std::printf("  rows=%-2lld pos0=%-2lld window=%-2d sinks=%d%s  "
+                    "rel=%.3g first=%.3g %s\n",
+                    static_cast<long long>(c.rows),
+                    static_cast<long long>(c.pos0), static_cast<int>(c.window),
+                    c.sinks ? 1 : 0, c.swap ? " swap-groups" : "", rel,
+                    worst0 / (peak + 1.0), ok ? "ok" : "FAIL");
+    }
+
+    be->sync();
+    be->release(wqa_d);
+    be->release(wqb_d);
+    be->release(wkv_d);
+    be->release(woa_d);
+    be->release(wob_d);
+    be->release(woas_d);
+    be->release(gq_d);
+    be->release(gkv_d);
+    be->release(x_d);
+    be->release(qa_d);
+    be->release(qn_d);
+    be->release(q_d);
+    be->release(kv_d);
+    be->release(cache_d);
+    be->release(out_d);
+    be->release(a_d);
+    be->release(y_d);
+    std::printf("  mla-shared: %lld of %lld check(s)%s\n",
+                static_cast<long long>(checks - failed),
+                static_cast<long long>(checks),
+                failed == 0 ? " passed" : " FAILED");
+    return failed;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -3237,6 +3523,7 @@ int main(int argc, char **argv) {
     bool bitexact = false;
     bool hc_test = false;
     bool mla_test = false;
+    bool mla_shared_test = false;
     bool moe_table_test = false;
     bool pool_test = false;
     bool floor = false;
@@ -3260,6 +3547,7 @@ int main(int argc, char **argv) {
         else if (a == "--bitexact") bitexact = true;
         else if (a == "--hc") hc_test = true;
         else if (a == "--mla") mla_test = true;
+        else if (a == "--mla-shared") mla_shared_test = true;
         else if (a == "--moe-dispatch") moe_table_test = true;
         else if (a == "--floor") floor = true;
         else if (a == "--h2d") h2d = true;
@@ -3396,6 +3684,9 @@ int main(int argc, char **argv) {
     // The MLA layer, against the host oracle in src/mla.cpp. Its own flag like
     // --hc: it is a device arm, and the gate has to stay runnable on a busy box.
     if (mla_test) failures += arm_mla(be);
+    // V4's shared-latent layout: its own flag, because it is its own graph and
+    // a backend can implement one without the other.
+    if (mla_shared_test) failures += arm_mla_shared(be);
 
     // The device dispatch table. Its own flag like --hc for the same reason: it
     // is a device arm, and the gate has to stay runnable on a busy box.

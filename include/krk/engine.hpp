@@ -15,6 +15,7 @@
 #include "krk/ple.hpp"
 #include "krk/expert_cpu.hpp"
 #include "krk/kv_tier.hpp"
+#include "krk/dsv4_route.hpp"
 #include "krk/draft_head.hpp"
 #include "krk/model.hpp"
 #include "krk/sampler.hpp"
@@ -430,6 +431,18 @@ public:
     // the next forward() will write to.
     i64 kv_pos() const { return kv_pos_; }
     i64 kv_capacity() const { return kv_cap_; }
+
+    // ---- decode-batch telemetry -------------------------------------------
+    // How many single-row layers the batched MoE path computed, and how many
+    // kept the per-expert loop. The pair is the only observable that says WHY
+    // a decode step took the loop: the batch resolves its whole routed set
+    // before launching, so it refuses when the expert cache cannot hold that
+    // set (see Engine::moe_decode_batch). A run whose cache is too small to
+    // hold the routed set must therefore report `ran == 0` -- that is what
+    // test_moe_batch_fallback pins, because the alternative (batching into
+    // aliased slots) produced plausible text from the wrong weights.
+    u64 moe_batch_layers() const { return moe_batch_layers_; }
+    u64 moe_batch_skips() const { return moe_batch_skips_; }
     // Logical rollback to `pos` (must be <= kv_pos()). The occupied region is
     // simply treated as shorter — no zeroing is needed because every forward
     // fully overwrites the rows it touches and attention never reads past
@@ -577,6 +590,11 @@ public:
     u64 router_picks() const { return router_picks_; }
     u64 router_subs() const { return router_subs_; }
     u64 router_hot() const { return router_hot_; }
+    // Why the last forward refused, when it did. Public because a gate that
+    // asserts a run FAILS has to be able to read the reason: "the run stopped"
+    // and "the run stopped for the right cause" are different claims, and only
+    // the second one proves the check that fired is the check under test.
+    std::string forward_failure() const { return forward_failure_error(); }
 
 private:
     std::string kv_resource_error() const;
@@ -589,6 +607,14 @@ private:
     // decode), or every row (speculative verification).
     bool forward(const i32 *toks, i32 n, i32 pos0, bool want_logits);
     bool forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode);
+    // This pass's input token ids (forward_core's `toks`), for the ONE consumer
+    // that needs a vocabulary id rather than a position: DeepSeek-V4's hash
+    // route selects experts BY TOKEN. A row index is not a token id -- on a
+    // multi-row prefill the two differ, and the route then sends every prompt
+    // row but the first to another token's experts (measured: chunk 1 and chunk
+    // 8 disagreed on the whole-graph fixture). Not owned; valid for the pass.
+    const i32 *fwd_toks_ = nullptr;
+    i32 fwd_toks_n_ = 0;
     // Attributes the expert tier's stage timers to the phase the engine is
     // running. Prefill and decode promotions are the same DMA behind different
     // row counts, and the end-of-run report splits them apart
@@ -760,6 +786,12 @@ private:
     // where the ordinary output projection picks it up. False when a geometry
     // this engine cannot run reaches it -- a refusal, not a wrong answer.
     bool mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0);
+    // The same layer in the SHARED-latent layout (DeepSeek-V4): the query trunk,
+    // ONE normed latent row per token used as both K (rope-rotated on read) and
+    // V, and the grouped low-rank output. Unlike the lite path this one writes
+    // the layer's FINAL [n, n_embd] attention output (wo_a/wo_b are inside), so
+    // the caller must not run `attn_output` over it a second time.
+    bool mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0);
     // Clears the convolution windows and delta-rule states (f32, one set per
     // recurrent layer). Only correct to call at a sequence boundary.
     void recurrent_reset();
@@ -1025,7 +1057,20 @@ private:
     void *ws_qpack_ = nullptr;
     // MLA's projection row: latent + decoupled key, NOT the MHA q/k/v shape.
     // Null unless the model runs latent attention; see mla_forward().
-    void *ws_mla_ = nullptr;  // [chunk, kv_lora + rope]
+    void *ws_mla_ = nullptr;  // [chunk, kv_lora + rope] (the latent on Shared)
+    // Shared-latent MLA's query trunk needs the normed `q_a` row to live
+    // somewhere while `q_b` reads it, so these two exist only on that layout:
+    // the trunk's intermediate [chunk, q_lora] and the grouped output's f32
+    // [chunk, gout] accumulator (a per-call allocation would be a device malloc
+    // on every layer of every token).
+    void *ws_mlaqn_ = nullptr; // [chunk, q_lora]
+    void *ws_mlay_ = nullptr;  // f32 [chunk, o_groups * o_lora]
+    // The per-head attention stack [chunk, n_head * kv_lora], kept in f32 on
+    // EVERY backend: it is the input of the grouped output projection, and a
+    // device that rounded it to the activation type would mix a different
+    // number than the host oracle the kernels are judged against. `ws_attn_` is
+    // act-width and cannot hold it on a HIP build (f16 there, f32 on the CPU).
+    void *ws_mlaa_ = nullptr;
     void *ws_k_ = nullptr;    // [chunk, kv_dim]
     void *ws_v_ = nullptr;    // [chunk, kv_dim]
     void *ws_attn_ = nullptr; // [chunk, q_dim]
