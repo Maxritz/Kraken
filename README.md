@@ -654,6 +654,87 @@ measurement and should not be compared directly.
 
 Use `--ctx 256/512` for MoE runs on small machines.
 
+### Prefill, measured on this box (2026-10-24)
+
+Four thousand and eighty-one tokens of the same prose, `--greedy`, `--ctx 32768`,
+`--expert-warmup 1`, one run per cell. These are the prompt-throughput numbers a
+long-context request actually pays; the 55-token `--bench` prompt is dominated by
+fixed cost and reads much lower.
+
+| file | arm | chunk | prefill tok/s | prefill ms | decode tok/s |
+|---|---|---|---|---|---|
+| Qwen3.8-Distill-35B-A3B Q2KXL (11.7 GiB) | exact | 256 | 181.8 | 22 450 | - |
+| Qwen3.8-Distill-35B-A3B Q2KXL | fast | 256 | **402.4** | 10 140 | - |
+| Qwen3-30B-A3B abliterated i1-Q2_K (11.2 GiB) | exact | 64 | 63.7 | 64 043 | 2.0 |
+| Qwen3-30B-A3B abliterated i1-Q2_K | exact | 256 | 176.3 | 23 143 | 29.2 |
+| Qwen3-30B-A3B abliterated i1-Q2_K | exact | 1024 | 176.7 | 23 096 | 29.0 |
+| Qwen3-30B-A3B abliterated i1-Q2_K | fast | 64 | 77.3 | 52 809 | 2.0 |
+| Qwen3-30B-A3B abliterated i1-Q2_K | fast | 256 | 384.4 | 10 618 | 31.0 |
+| Qwen3-30B-A3B abliterated i1-Q2_K | fast | 1024 | **420.9** | 9 695 | 29.5 |
+| Qwen3-Coder-53B-A3B i1-Q4_K_M (29.9 GiB) | exact | 256 | 49.2 | 82 900 | 3.4 |
+| Qwen3-Coder-53B-A3B i1-Q4_K_M | fast | 256 | 65.5 | 62 300 | 3.4 |
+
+Three things this measures, rather than argues:
+
+- **`--prefill fast` is worth 2.2-2.4x on a long MoE prompt** at chunk 256+:
+  181.8 -> 402.4 on the 35B, 176.3 -> 384.4 on the 30B, 384.4 -> 420.9 going from
+  chunk 256 to 1024 with `fast` on. It is a different-arithmetic mode (see the
+  `--prefill` bullet above), so it is not the default and a chunk-invariance gate
+  must stay on the exact arm.
+- **Chunk 64 is not a small chunk, it is a different machine.** 63.7 tok/s
+  prefill and 2.0 tok/s decode against 176.3 / 29.2 at chunk 256, on both arms and
+  therefore not a kernel choice: a 64-row prefill leaves the batched expert path
+  below the width where it batches. Keep `--chunk` at 256 or above.
+- **The 53B is expert-tier bound, not kernel bound.** 29.9 GiB of routed set
+  against the card's 6.4 GiB pool is 3.4 tok/s whatever the prefill arm does; the
+  `fast` arm only helps the part that is not waiting on experts (+33% prefill,
+  decode unchanged).
+
+Decode on the 35B with the fixed 55-token `--bench` prompt is 34.0 tok/s; the
+long-prompt decode column above is a different run (`-` on the 35B rows because
+that prompt's first sampled token was EOS at 32 tokens, so there were no timed
+steps to report).
+
+`kraken-server` does not take `--prefill` yet: it parses `--chunk` and leaves the
+GEMM rung on `exact`, so the 402-421 tok/s arm above is reachable from the CLI
+only. Wire the switch before quoting these numbers for the HTTP path.
+
+### The expert-cache budget ratchet (open, unfixed)
+
+`ExpertCache::reclamp_vram_budget(free, floor)` sets
+
+    room = free > floor ? free - floor : 0
+    live = bytes_ - pin_bytes_
+    cap  = live + room
+
+and clamps the pool to `cap` when `cap` is more than 1/64 below the current budget.
+On this box free VRAM sits at **3253 MiB against a 3261 MiB floor**, so `room` is
+zero at every call and `cap == live`: the budget is set to whatever happens to be
+resident at that instant. `bytes_` only counts live VRAM experts (incremented on
+promote, decremented on retire), so after the pool evicts one expert to stay inside
+its new budget, the next call ratchets to that lower resident value, and there is no
+path back up because growth is exactly what `room` describes.
+
+Measured, not inferred. One 32k-context server run on the 35B file, every line with
+the same `3253 MiB free beside a 3261 MiB floor`:
+
+    re-clamped 6375 -> 6202 MiB at prefill
+    re-clamped 6202 -> 6017 MiB at prefill
+    ... (11 more, each after one prompt) ...
+    re-clamped 1954 -> 1258 MiB at prefill
+
+and a `--bench` decode run on the same file walked 6675 -> 6523 -> 6297 -> 6008 ->
+5665 -> 5260 -> 4791 -> 4246 -> 3616 -> 2914 -> 2145 -> **1313 MiB across eleven
+decode checks**, ending at a fifth of the pool the init plan granted. The cost is
+where the bytes go: that run's decode split reads `room 1211.9 | promote 1303.7 ms`
+of a 29.4 ms step, i.e. the experts the pool no longer holds are promoted back in.
+Text is identical either way (`--prefill exact`, same greedy stream); this is a
+throughput and VRAM-planning defect, not a correctness one.
+
+The fix is not in this commit: the clamp needs a floor at the planned budget (or a
+hysteresis that only ratchets down after N consecutive calls), and the 1/64 margin
+alone cannot see a ratchet that steps 173 MiB at a time.
+
 ---
 
 ## Usage switches and worked examples
