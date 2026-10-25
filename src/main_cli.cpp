@@ -249,11 +249,11 @@ void usage() {
         "                        block, same names: --mtp-probe/--mtp-spec\n"
         "                        drive it exactly as an in-file block\n"
         "  --prefill exact|fast  fast (default) takes the rows>1 GEMM to the\n"
-        "                        RDNA4 matrix cores: +58% chunk throughput on\n"
+        "                        RDNA4 matrix cores: +58%% chunk throughput on\n"
         "                        Qwen3.5-35B-A3B, output identical, but the\n"
         "                        prefill HASH then differs between chunk sizes.\n"
         "                        exact keeps every prompt row's arithmetic\n"
-        "                        independent of --chunk and costs that 36%.\n"
+        "                        independent of --chunk and costs that 36%%.\n"
         "                        --prefill-hash always uses exact.\n"
         "  --mtp-probe           run the file's own nextn (MTP) block for one\n"
         "                        step after prefill and print the token it\n"
@@ -367,8 +367,11 @@ bool parse(int argc, char **argv, Args *a) {
             if (v == "int8") a->kv_quant = 1;
             else if (v == "f16") a->kv_quant = 0;
             else {
-                std::fprintf(stderr, "kraken: --kv-quant needs f16|int8, got '%s'", v.c_str());
-                return 2;
+                std::fprintf(stderr, "kraken: --kv-quant needs f16|int8, got '%s'\n", v.c_str());
+                // parse() is a BOOL: `return 2` converts to true and the caller
+                // reads it as "parsed fine", so a typo here ran the default f16
+                // cache instead of refusing. main() turns false into exit 2.
+                return false;
             }
         }
         else if (f == "--chunk") a->chunk = std::atoi(next("--chunk"));
@@ -442,8 +445,8 @@ bool parse(int argc, char **argv, Args *a) {
             } else if (v == "exact") {
                 a->prefill_fast = false;
             } else {
-                std::fprintf(stderr, "kraken: --prefill needs exact|fast, got '%s'", v.c_str());
-                return 2;
+                std::fprintf(stderr, "kraken: --prefill needs exact|fast, got '%s'\n", v.c_str());
+                return false; // see --kv-quant above: 2 would read as success
             }
         }
         else if (f == "--hybrid-experts")

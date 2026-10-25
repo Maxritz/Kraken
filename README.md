@@ -181,6 +181,213 @@ fails when a group that passed in the recorded baseline stops passing. For this
 checkout, build from the repo root with `ninja -C build-hip kraken kraken-tests
 kraken-bench kraken-inspect` and run `build-hip/kraken-tests.exe`.
 
+### How to run it, in order
+
+1. **Build.** Binaries land in `build-hip/` (`build/` for the CPU-only
+   configure). `kraken-inspect` is in the build line on purpose: it answers
+   from the same `krk_core` tables the loader uses, so one built before a new
+   dequantizer landed reports `refused` for formats the engine already runs.
+2. **Ask what the file is.** `kraken-inspect model.gguf` prints the verdict and
+   the geometry, or the reason it is refused, by name.
+3. **Ask what the device is.** `kraken -m model.gguf --info` prints the device,
+   the measured aperture (the runtime's own ReBAR hint is wrong on this box),
+   the expert budget and the full VRAM ledger. Read the ledger before believing
+   any throughput number: it says where the memory actually went.
+4. **Generate** on a short prompt first. A model that is going to produce
+   nonsense at token 3 has already told you so at token 3.
+5. **Measure** with `--bench`, which needs no flags and uses a fixed prompt.
+
+Exit status: `0` ran, `1` the run failed (the message names the phase), `2` the
+command line was wrong (`--prefill` given something other than `exact|fast`, for
+instance). A refused GGUF is a load-time verdict, not a crash.
+
+### Limits: what fits, what is refused, and what degrades
+
+* **Your card, not the spec sheet.** `--vram-tier N` plans for a class (8, 12,
+  16, 24 GiB) and clamps to what is installed, so `--vram-tier 12` on a 16 GiB
+  box behaves as the 12 GiB one does. The box here reports 15.92 GiB, and its
+  *measured* read bandwidth is 585 GB/s, not the 644 on the spec sheet.
+* **The expert budget is a plan, and it is reported.** `--expert-cache-mb 0`
+  (default) lets the run plan it, then clamp: it keeps a VRAM floor free
+  (`KRK_VRAM_FLOOR_MB`, about 3.2 GiB here) for KV, workspaces and the
+  allocator. When the routed set is larger than the budget the run says so
+  (`the routed set is 15.4 GiB and the device budget is only 10.5 GiB (68%)`)
+  and the cache churns; the WARM tier still holds the full set, so a miss
+  promotes from RAM instead of re-reading the file.
+  A budget the card cannot hold is **refused**, never trimmed: silently keeping
+  less than you asked for would turn your experiment into a different one.
+* **K/V is tiered, and a page that fits nowhere is DROPPED.** `--ctx` sets the
+  capacity; the cache is split into HOT (VRAM), WARM (host RAM) and COLD (a
+  spill directory). A page that fits in none of them has nowhere to go, so its
+  layer is zero-filled and **the run decodes wrong text** rather than failing.
+  That is why `--kv-warm-mb` defaults to covering every KV-carrying layer, and
+  why a smaller value is honoured only when `--kv-cold-dir` exists to take the
+  overflow. This is the one silent degradation in the engine; everything else
+  refuses loudly.
+* **`--kv-quant int8`** stores each row as bytes plus one f32 scale per 32
+  values, 1.8x smaller. Both backends implement it, but MLA and the
+  nextn/draft block are refused by name — the quant is a cache format, not a
+  model property.
+* **`--prefill fast` is the default and is not chunk-invariant.** It takes the
+  rows>1 GEMM to the RDNA4 matrix cores (+58% chunk throughput, identical
+  output), but the prefill *hash* then differs between chunk sizes. `--prefill
+  exact` keeps every prompt row independent of `--chunk` and costs that 36%.
+  `--prefill-hash` always uses exact, so the chunk-invariance gate still means
+  something. Note `kraken-server` defaults the other way (`exact`).
+* **Warmup needs a ranking file.** `--expert-warmup -1` (default) ranks only
+  when the routed set exceeds VRAM, and ranks by `<model>.krakenexperts.json`,
+  which `--expert-scan` writes. Without it the tiers fill in an even order.
+  `--expert-warmup-ms` caps the phase (default 20000): the hottest experts go
+  in first, so running out costs coverage, not the top of the list.
+* **Speculation is opt-in and currently measured out.** `--mtp-spec` is greedy
+  only and bit-identical to plain greedy output, but on the Lightning sidecar at
+  `k=1` it lands at plain-decode parity even with the drafter cost removed. See
+  [the measurement](#speculative-decode-mtp-sidecar--measured-out-at-k1).
+  `--draft` with a small model and `--draft-head` (EAGLE-3) are the other two
+  arms; `--draft-head` needs no extra VRAM.
+* **`--hybrid-experts 1` loses as measured** (5.5 tok/s against 17.2 for
+  promoting instead, at 5.4 ms of host time per expert). It buys memory, not
+  speed; the host arm is a per-layer barrier the device waits on.
+* **`--expert-stub` requires `--expert-scan`** and is refused rather than
+  ignored on its own, because a flag that does nothing is a lie about the run.
+
+### Every switch
+
+Grouped by what you are changing. Defaults are the compiled-in ones.
+
+**Model, input and process**
+
+| switch | default | what it does |
+|---|---|---|
+| `--model FILE` | required | the GGUF to load |
+| `--prompt STR` | interactive | prompt to complete; an empty value still counts as given |
+| `--chat` | off | wrap the prompt in ChatML |
+| `--system STR` | none | system message for `--chat` |
+| `--max-tokens N` | 256 | tokens to generate |
+| `--cpu` | off | scalar reference backend, for correctness work |
+| `--device N` | 0 | HIP device index |
+| `--tokenize` | - | print the prompt's token ids and exit |
+| `--info` | - | model and device info, then exit |
+| `--bench` | - | prefill/decode benchmark on a fixed prompt |
+| `-v` / `-h` | - | verbose logging / help |
+
+**Generation and sampling**
+
+| switch | default | what it does |
+|---|---|---|
+| `--greedy` | off | force argmax decoding |
+| `--temp F` | 0.8 | temperature, 0 = greedy |
+| `--top-k N` | 40 | top-k cutoff |
+| `--top-p F` | 0.95 | nucleus cutoff |
+| `--min-p F` | 0.05 | min-p cutoff |
+| `--repeat-penalty F` | 1.1 | repetition penalty |
+| `--seed N` | 0 | RNG seed |
+| `--sample-host` | off | argmax on the host from the downloaded row; costs ~1 MB per token, and is the correct path while the device argmax carries the Laguna race |
+| `--debug-topk N` | 0 | dump the top-N candidates and log-probs per token |
+
+**Context, prefill, K/V**
+
+| switch | default | what it does |
+|---|---|---|
+| `--ctx N` | 4096 | KV capacity in tokens |
+| `--chunk N` | 256 | prefill batch size |
+| `--kv-quant f16\|int8` | f16 | K/V cache format; int8 is 1.8x smaller |
+| `--prefill exact\|fast` | fast | fast uses the matrix cores but breaks chunk-invariance |
+| `--fast-prefill` | - | old spelling of `--prefill fast`, kept for scripts |
+| `--prefill-hash` | - | hash the last-position logits and exit; forces exact |
+| `--kv-hot-mb N` | 0 = auto | KV HOT tier in VRAM |
+| `--kv-warm-mb N` | <0 = geometry | KV WARM tier in host RAM |
+| `--kv-cold-dir DIR` | unset | spill directory for pages evicted past WARM |
+
+**Memory planning**
+
+| switch | default | what it does |
+|---|---|---|
+| `--host-ram-mb N` | 0 = 1/4 installed | host memory to plan every host tier inside |
+| `--vram-tier N` | unset | plan for a card class in GiB, clamped to the installed one |
+| `--vram-cap-mb N` | 0 = policy | plan for this many MiB of device memory |
+| `--ram-tier N` | 0 = installed | plan host tiers for 16/24/32/48/64/96 GiB |
+| `--weight-vram-mb N` | 0 = auto | dense weights in VRAM; streams whole layers once they do not fit, negative disables |
+
+**MoE residency and experts**
+
+| switch | default | what it does |
+|---|---|---|
+| `--expert-cache-mb N` | 0 = auto | expert residency budget in MiB |
+| `--expert-cache-slots N` | 0 = auto | cap resident (layer, expert) slots |
+| `--expert-warm-mb N` | <0 = auto | WARM expert cache in host RAM (0 off); `--expert-l2-mb` is the old spelling |
+| `--expert-warm-prefetch` | off | fill WARM at load instead of on demand |
+| `--expert-warmup N` | -1 | ranked warmup: -1 when routed set exceeds VRAM, 1 force, 0 off |
+| `--expert-warmup-ms N` | 20000 | ceiling for that phase (0 = none) |
+| `--expert-pin-mb N` | 0 = off | pin the first N MiB of the tier in rank order |
+| `--router-resident P` | 0 = off | send a near-tie (within fraction P) to the expert already in VRAM/WARM |
+| `--expert-scan` | - | measure which experts routing picks; writes `<model>.krakenexperts.json` |
+| `--expert-stub` | - | with `--expert-scan`: run only the routers, skip every FFN |
+| `--expert-adapt` | - | fold this run's routing into the index at exit |
+
+**Hybrid host/device experts**
+
+| switch | default | what it does |
+|---|---|---|
+| `--hybrid-experts 1` | off | compute overflow experts on the host out of the mapping |
+| `--hybrid-threads N` | 0 = min(hw, 8) | host threads for that split |
+| `--hybrid-max-rows N` | 8 (0 unbounded) | widest row count the host arm runs at |
+| `--hybrid-frac F` | 1.0 | share of the device tier's overflow the host takes |
+
+**Speculation**
+
+| switch | default | what it does |
+|---|---|---|
+| `--draft FILE` | none | small draft model for greedy speculative decoding |
+| `--draft-tokens N` | 4 (1 for `--mtp-spec`) | proposal window per round |
+| `--draft-head FILE` | none | EAGLE-3 head from `tools/eagle_to_gguf.py`; no extra VRAM |
+| `--draft-head-prime N` | 256 (0 = whole prompt) | positions a round primes the head over |
+| `--mtp FILE` | none | nextn (MTP) block in a separate GGUF, for `-noMTP` trunks |
+| `--mtp-probe` | off | run the block one step and print what it drafts against the target |
+| `--mtp-spec` | off | decode with the block as the drafter (greedy only) |
+
+**Diagnostics and tracing**
+
+| switch | default | what it does |
+|---|---|---|
+| `--profile` | off | per-op device timeline for the last decode step, with the idle gap before each op |
+| `--trace [PATH]` | off | Chrome-trace of host functions, backend ops, device spans, transfers and syncs |
+
+`kraken-server` has its own, smaller set: `--host` (0.0.0.0), `--port`
+(`$KRK_PORT`, else 8080), `--ctx`, `--chunk`, `--kv-quant`, `--prefill`
+(**default exact**, unlike the CLI), `--threads`. It serves an
+OpenAI-compatible `/v1/chat/completions`.
+
+### Examples worth keeping
+
+```sh
+# smallest useful check before a long run
+kraken -m model.gguf --info
+
+# reproduce the benchmark exactly
+kraken -m model.gguf --bench --greedy
+
+# a long-context run that will not fit the KV in VRAM
+kraken -m model.gguf --ctx 32768 --kv-hot-mb 2048 \
+    --kv-warm-mb 8192 --kv-cold-dir ./kvspill -p "..." --greedy -n 256
+
+# a MoE whose routed set is bigger than the card: rank, then pour the budget in
+kraken -m big-moe.gguf --expert-scan -p "representative prompt" -n 128
+kraken -m big-moe.gguf --expert-cache-mb 9000 --expert-warmup 1 --greedy -p "..."
+
+# prove a forward is chunk-invariant (same hash at --chunk 1 and 8)
+kraken -m model.gguf -p "..." --prefill-hash
+
+# find where a token's time actually goes
+kraken -m model.gguf -p "hi" -n 6 --greedy --profile
+
+# a trace to open in Perfetto
+kraken -m model.gguf -p "hi" -n 8 --greedy --trace ./tok.json
+
+# the server
+kraken-server -m model.gguf --port 8080 --ctx 8192
+```
+
 ---
 
 ## Benchmarks
@@ -904,8 +1111,8 @@ two requests and holds 5747 MiB.
 
 ## Usage switches and worked examples
 
-`kraken --help` lists every switch. These are the ones that change what you
-see rather than what the model does.
+Every switch with its default is in [Every switch](#every-switch) above. These
+are the ones that change what you *see* rather than what the model does.
 
 ### `--profile` - where a decode token goes
 

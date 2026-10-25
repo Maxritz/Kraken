@@ -17368,7 +17368,7 @@ static int run_selfcheck(int workers, const std::string &only_raw, const char *r
 
         // ... and now they run together. Every child is a full suite run of its
         // own, so this is where the sweep's cost was: six suites per group, one
-        // after another, and 83 groups of that is an hour. The arms share
+        // after another, and 93 groups of that is an hour. The arms share
         // nothing but the seed -- different environment, different scratch area,
         // different log and report -- which is exactly what makes them safe to
         // overlap.

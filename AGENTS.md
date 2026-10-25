@@ -18,7 +18,7 @@ code, the README, or `docs/`.
   contradicting the README. `build_check.sh` requires it current for the same
   reason.
 - The gate suite is six things, not one: `sh scripts/build_check.sh`, ninja
-  rc=0 with 0 `error:` lines, `kraken-tests` 3413/3413, `sh
+  rc=0 with 0 `error:` lines, `kraken-tests` 4311/4311, `sh
   scripts/kraken_tests_baseline_check.sh` (names the groups that newly broke
   against the recorded baseline), `kraken-bench --gate` rc=0, and a coherence
   spot check on three models, one per shape, run as:
@@ -50,7 +50,7 @@ code, the README, or `docs/`.
   test_prefill_chunk_bitexact` builds a head_dim-64 / 8-head / 4-layer fixture,
   prefills one 64-token prompt at `--chunk 1`, `2` and `8` through
   `kraken.exe --prefill-hash`, and requires one hash across them. It runs in
-  the default suite (group 35 of 56, 14 checks) and the baseline carries it.
+  the default suite (group 36 of 93, 26 checks) and the baseline carries it.
   `--prefill-hash` prints two hashes and no text:
   `prefill-hash <trace> logits <row> prompt_tokens=N first=I`. The trace folds
   the embedding, every layer's attention output and every layer's hidden state
@@ -119,10 +119,13 @@ code, the README, or `docs/`.
   2329 -> 2751 when the KV-tier per-layer geometry and the sparse-KV fixture
   tests landed, 2751 -> 2760 when the mixed-dtype `gemm_group` case below
   landed, 2760 -> 2994 when the attention micro-test and the KV-tier geometry
-  cases landed, and 2994 -> 3008 when the chunk-invariance gate did. Read the
-  count off the run (`3008/3008 checks passed`) rather than trusting the number
-  written here, which is only the last one seen.
-- **`kraken-tests` runs each of its 56 groups in its own child process, several
+  cases landed, 2994 -> 3008 when the chunk-invariance gate did, and 3008 ->
+  4311 across the MoE decode campaign (per-layer expert counts, LatentMoE, the
+  NVFP4 sidecar scale, the one-launch dispatch and the DFlash spelling arms),
+  which also took the suite from 86 to 93 groups. Read the count off the run
+  (`4311/4311 checks passed`) rather than trusting the number written here,
+  which is only the last one seen.
+- **`kraken-tests` runs each of its 93 groups in its own child process, several
   at a time.** A fastfail, an access violation or an abort inside one group used
   to end the run before the `%d/%d checks passed` line, which is how a single
   `std::fclose(NULL)` in a KV-tier test hid eight real failures for a whole
@@ -169,7 +172,7 @@ code, the README, or `docs/`.
   expectation wrong by one check, so a real mismatch can be constructed: it
   only tightens (a green run goes red, never the reverse), and the isolation
   check requires rc=1 from it, which is how the exit status is proved and not
-  just the checker. The whole sweep is 83 groups x 6 arms = **498 suite runs**,
+  just the checker. The whole sweep is 93 groups x 6 arms = **558 suite runs**,
   because an arm is a FULL suite run by construction: its claims are "every
   group the arm did not aim at still passes, with its own count" and the totals
   arithmetic, and neither survives scoping an arm to one group. Measured
