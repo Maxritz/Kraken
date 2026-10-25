@@ -18,7 +18,7 @@ code, the README, or `docs/`.
   contradicting the README. `build_check.sh` requires it current for the same
   reason.
 - The gate suite is six things, not one: `sh scripts/build_check.sh`, ninja
-  rc=0 with 0 `error:` lines, `kraken-tests` 4320/4320, `sh
+  rc=0 with 0 `error:` lines, `kraken-tests` 4386/4386, `sh
   scripts/kraken_tests_baseline_check.sh` (names the groups that newly broke
   against the recorded baseline), `kraken-bench --gate` rc=0, and a coherence
   spot check on three models, one per shape, run as:
@@ -120,10 +120,10 @@ code, the README, or `docs/`.
   tests landed, 2751 -> 2760 when the mixed-dtype `gemm_group` case below
   landed, 2760 -> 2994 when the attention micro-test and the KV-tier geometry
   cases landed, 2994 -> 3008 when the chunk-invariance gate did, and 3008 ->
-  4320 across the MoE decode campaign (per-layer expert counts, LatentMoE, the
+  4386 across the MoE decode campaign (per-layer expert counts, LatentMoE, the
   NVFP4 sidecar scale, the one-launch dispatch and the DFlash spelling arms)
   plus the CLI-refusal group, which together took the suite from 86 to 94
-  groups. Read the count off the run (`4320/4320 checks passed`) rather than
+  groups. Read the count off the run (`4386/4386 checks passed`) rather than
   trusting the number written here, which is only the last one seen.
 - **`kraken-tests` runs each of its 94 groups in its own child process, several
   at a time.** A fastfail, an access violation or an abort inside one group used

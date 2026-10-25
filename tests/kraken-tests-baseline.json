@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-25T21:19:54Z",
-  "recorded_commit": "304be89",
-  "totals": {"groups": 94, "passed": 4320, "run": 4320, "exit": 0},
+  "recorded_utc": "2026-10-25T21:27:00Z",
+  "recorded_commit": "8a3a3a8",
+  "totals": {"groups": 94, "passed": 4386, "run": 4386, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -97,7 +97,7 @@
     {"name": "test_kv_tier_host_reserve_refusal", "status": "pass", "passed": 31, "run": 31},
     {"name": "test_kv_tier_per_plane_cold_files", "status": "pass", "passed": 7, "run": 7},
     {"name": "test_moe_batch_ops", "status": "pass", "passed": 7, "run": 7},
-    {"name": "test_cli_arg_refusal", "status": "pass", "passed": 9, "run": 9},
+    {"name": "test_cli_arg_refusal", "status": "pass", "passed": 75, "run": 75},
     {"name": "test_pageable_path_probe", "status": "pass", "passed": 140, "run": 140}
   ]
 }

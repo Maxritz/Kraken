@@ -1123,7 +1123,7 @@ opt-in (`--mtp-spec`) and off by default.
 
 ### Gate status at this commit
 
-* `kraken-tests` **4320/4320 checks passed**, exit 0 (94 groups).
+* `kraken-tests` **4386/4386 checks passed**, exit 0 (94 groups).
 * Baseline re-recorded deliberately at 94 groups: verdict is 0 regressions,
   4 groups changed shape, 8 new groups -- seven are this campaign's own
   (`test_moe_per_layer_experts`, `test_moe_latent`, `test_nvfp4_sidecar_scale`,

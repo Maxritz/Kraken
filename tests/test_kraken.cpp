@@ -16068,12 +16068,13 @@ static void test_source_literal_hygiene() {
                 "a user-facing message would go unreported");
 }
 
-// Group: the CLI's refusals are a contract a script depends on, and one arm of
-// it was broken in a way no existing test could see. `parse()` returns bool,
-// but its `--kv-quant` and `--prefill` error paths did `return 2;` -- which
-// converts to TRUE, so the caller read a typo as "parsed fine": `--prefill
-// bogus` ran the default fast rung and `--kv-quant int4` ran f16, each printing
-// one line to stderr and exiting 0.
+// Group: the CLI's refusals are a contract a script depends on, and both arms
+// of it that were broken produced a SILENT default rather than a crash. The
+// enums read a typo as success, because `parse()` returns bool and their error
+// paths did `return 2;`, which converts to TRUE: `--prefill bogus` ran the
+// default fast rung and `--kv-quant int4` ran f16. The numeric flags had no
+// validation at all, so `--ctx abc` ran with a zero-token context and
+// `--ctx 4096x` ran with 4096, each with one line to stderr and exit 0.
 //
 // The check is on the PROCESS, because that is what a script reads. Every arm
 // passes a model path that does NOT exist: a refused value must exit 2 BEFORE
@@ -16117,13 +16118,56 @@ static void test_cli_arg_refusal() {
         return rc;
     };
 
+    // Every flag that takes a TYPED value, with one value that is not it. The
+    // numeric ones are here because they used to be undetectable rather than
+    // refused: std::atoi("abc") is 0, so `--ctx abc` ran with a zero-token
+    // context and `--ctx 4096x` ran with 4096, each silently. `want` is the
+    // flag's own name, which every refusal message carries.
     struct Arm {
         const char *flags;
         const char *want;
     };
     const Arm bad[] = {
+        // enums, with the values they accept named in the message
         {"--kv-quant int4", "--kv-quant needs f16|int8"},
         {"--prefill bogus", "--prefill needs exact|fast"},
+        // whole numbers
+        {"--draft-tokens abc", "--draft-tokens"},
+        {"--draft-head-prime abc", "--draft-head-prime"},
+        {"--max-tokens 12abc", "--max-tokens"},
+        {"--ctx abc", "--ctx"},
+        {"--chunk abc", "--chunk"},
+        {"--top-k abc", "--top-k"},
+        {"--device abc", "--device"},
+        {"--threads abc", "--threads"},
+        {"--host-ram-mb abc", "--host-ram-mb"},
+        {"--weight-vram-mb abc", "--weight-vram-mb"},
+        {"--kv-hot-mb abc", "--kv-hot-mb"},
+        {"--kv-warm-mb abc", "--kv-warm-mb"},
+        {"--vram-cap-mb abc", "--vram-cap-mb"},
+        {"--vram-tier abc", "--vram-tier"},
+        {"--expert-cache-mb abc", "--expert-cache-mb"},
+        {"--expert-cache-slots abc", "--expert-cache-slots"},
+        {"--expert-warm-mb abc", "--expert-warm-mb"},
+        {"--expert-pin-mb abc", "--expert-pin-mb"},
+        {"--expert-warm-prefetch abc", "--expert-warm-prefetch"},
+        {"--expert-warmup abc", "--expert-warmup"},
+        {"--expert-warmup-ms abc", "--expert-warmup-ms"},
+        {"--ram-tier abc", "--ram-tier"},
+        {"--hybrid-experts abc", "--hybrid-experts"},
+        {"--hybrid-threads abc", "--hybrid-threads"},
+        {"--hybrid-max-rows abc", "--hybrid-max-rows"},
+        {"--debug-topk abc", "--debug-topk"},
+        // numbers
+        {"--temp 1.5x", "--temp"},
+        {"--top-p 0.9x", "--top-p"},
+        {"--min-p 0.0x", "--min-p"},
+        {"--repeat-penalty 1.1x", "--repeat-penalty"},
+        {"--router-resident 0.0x", "--router-resident"},
+        {"--hybrid-frac 1.0x", "--hybrid-frac"},
+        // unsigned: a negative seed is not a wrap-around accident
+        {"--seed -3", "--seed"},
+        // and a flag that does not exist at all
         {"--no-such-flag", "unknown option"},
     };
     for (const Arm &a : bad) {

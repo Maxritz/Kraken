@@ -1,6 +1,9 @@
 // main_cli.cpp — the kraken command line front end.
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -345,6 +348,54 @@ bool parse(int argc, char **argv, Args *a) {
             }
             return argv[++i];
         };
+        // A value that is not the number it claims to be USED TO arrive as 0:
+        // std::atoi("abc") is 0 and std::atoi("4096x") is 4096, so `--ctx abc`
+        // ran with a zero-token context while `--ctx 4096x` ran with 4096 -- a
+        // typo read as a choice, silently, with no line anywhere saying so.
+        // These parse the WHOLE string and exit 2 on the rest, which is the
+        // contract the enum flags already had and the one a script can act on.
+        // They exit rather than return false for the same reason `next` does:
+        // the caller is a chain of `else if`, so a value that fails here has no
+        // branch to return from, and parse()'s bool would read a stray `return
+        // 2` as SUCCESS (the defect that made `--prefill bogus` run).
+        auto next_i = [&](const char *what) -> i32 {
+            const char *v = next(what);
+            char *end = nullptr;
+            errno = 0;
+            const long long n = std::strtoll(v, &end, 10);
+            if (end == v || *end != '\0' || errno == ERANGE || n < INT_MIN ||
+                n > INT_MAX) {
+                std::fprintf(stderr, "kraken: %s needs a whole number, got '%s'\n",
+                             what, v);
+                std::exit(2);
+            }
+            return static_cast<i32>(n);
+        };
+        auto next_f = [&](const char *what) -> f32 {
+            const char *v = next(what);
+            char *end = nullptr;
+            errno = 0;
+            const double d = std::strtod(v, &end);
+            if (end == v || *end != '\0' || errno == ERANGE) {
+                std::fprintf(stderr, "kraken: %s needs a number, got '%s'\n", what, v);
+                std::exit(2);
+            }
+            return static_cast<f32>(d);
+        };
+        auto next_u = [&](const char *what) -> u64 {
+            const char *v = next(what);
+            char *end = nullptr;
+            errno = 0;
+            const unsigned long long n = std::strtoull(v, &end, 10);
+            if (end == v || *end != '\0' || errno == ERANGE || v[0] == '-') {
+                std::fprintf(stderr,
+                             "kraken: %s needs a non-negative whole number, got "
+                             "'%s'\n",
+                             what, v);
+                std::exit(2);
+            }
+            return static_cast<u64>(n);
+        };
         if (f == "--model" || f == "-m") a->model = next("--model");
         else if (f == "--prompt" || f == "-p") {
             a->prompt = next("--prompt");
@@ -354,14 +405,14 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--draft" || f == "-d") a->draft = next("--draft");
         else if (f == "--draft-tokens")
         {
-            a->draft_tokens = std::atoi(next("--draft-tokens"));
+            a->draft_tokens = next_i("--draft-tokens");
             a->draft_tokens_given = true;
         }
         else if (f == "--draft-head") a->draft_head = next("--draft-head");
         else if (f == "--draft-head-prime")
-            a->draft_head_prime = std::atoi(next("--draft-head-prime"));
-        else if (f == "--max-tokens" || f == "-n") a->max_tokens = std::atoi(next("--max-tokens"));
-        else if (f == "--ctx" || f == "-c") a->ctx = std::atoi(next("--ctx"));
+            a->draft_head_prime = next_i("--draft-head-prime");
+        else if (f == "--max-tokens" || f == "-n") a->max_tokens = next_i("--max-tokens");
+        else if (f == "--ctx" || f == "-c") a->ctx = next_i("--ctx");
         else if (f == "--kv-quant") {
             const std::string v = next("--kv-quant");
             if (v == "int8") a->kv_quant = 1;
@@ -374,7 +425,7 @@ bool parse(int argc, char **argv, Args *a) {
                 return false;
             }
         }
-        else if (f == "--chunk") a->chunk = std::atoi(next("--chunk"));
+        else if (f == "--chunk") a->chunk = next_i("--chunk");
         // Prefill GEMM policy. The default is the 'exact' grid, because
         // test_prefill_chunk_bitexact asserts that a prefill reproduces DECODE's
         // association byte for byte at every chunk size, and the throughput-first
@@ -388,46 +439,46 @@ bool parse(int argc, char **argv, Args *a) {
             a->prefill_fast = true;
             a->prefill_fast_explicit = true;
         }
-        else if (f == "--temp") a->temp = static_cast<f32>(std::atof(next("--temp")));
-        else if (f == "--top-k") a->top_k = std::atoi(next("--top-k"));
-        else if (f == "--top-p") a->top_p = static_cast<f32>(std::atof(next("--top-p")));
-        else if (f == "--min-p") a->min_p = static_cast<f32>(std::atof(next("--min-p")));
-        else if (f == "--repeat-penalty") a->rep_pen = static_cast<f32>(std::atof(next("--repeat-penalty")));
-        else if (f == "--seed") a->seed = std::strtoull(next("--seed"), nullptr, 10);
-        else if (f == "--device") a->device = std::atoi(next("--device"));
-        else if (f == "--threads") a->threads = std::atoi(next("--threads"));
+        else if (f == "--temp") a->temp = next_f("--temp");
+        else if (f == "--top-k") a->top_k = next_i("--top-k");
+        else if (f == "--top-p") a->top_p = next_f("--top-p");
+        else if (f == "--min-p") a->min_p = next_f("--min-p");
+        else if (f == "--repeat-penalty") a->rep_pen = next_f("--repeat-penalty");
+        else if (f == "--seed") a->seed = next_u("--seed");
+        else if (f == "--device") a->device = next_i("--device");
+        else if (f == "--threads") a->threads = next_i("--threads");
         else if (f == "--host-ram-mb")
-            a->host_ram_mb = std::atoi(next("--host-ram-mb"));
+            a->host_ram_mb = next_i("--host-ram-mb");
         else if (f == "--weight-vram-mb")
-            a->weight_vram_mb = std::atoi(next("--weight-vram-mb"));
+            a->weight_vram_mb = next_i("--weight-vram-mb");
         else if (f == "--kv-hot-mb")
-            a->kv_hot_mb = std::atoi(next("--kv-hot-mb"));
+            a->kv_hot_mb = next_i("--kv-hot-mb");
         else if (f == "--kv-warm-mb")
-            a->kv_warm_mb = std::atoi(next("--kv-warm-mb"));
+            a->kv_warm_mb = next_i("--kv-warm-mb");
         else if (f == "--kv-cold-dir")
             a->kv_cold_dir = next("--kv-cold-dir");
         else if (f == "--vram-cap-mb")
-            a->vram_cap_mb = std::atoi(next("--vram-cap-mb"));
+            a->vram_cap_mb = next_i("--vram-cap-mb");
         else if (f == "--vram-tier" || f == "--vram-tier-gb")
-            a->vram_tier_gb = std::atoi(next("--vram-tier"));
+            a->vram_tier_gb = next_i("--vram-tier");
         else if (f == "--expert-cache-mb")
-            a->expert_cache_mb = std::atoi(next("--expert-cache-mb"));
+            a->expert_cache_mb = next_i("--expert-cache-mb");
         else if (f == "--expert-cache-slots")
-            a->expert_cache_slots = std::atoi(next("--expert-cache-slots"));
+            a->expert_cache_slots = next_i("--expert-cache-slots");
         else if (f == "--expert-warm-mb" || f == "--expert-l2-mb")
-            a->expert_warm_mb = std::atoi(next("--expert-warm-mb"));
+            a->expert_warm_mb = next_i("--expert-warm-mb");
         else if (f == "--expert-pin-mb")
-            a->expert_pin_mb = std::atoi(next("--expert-pin-mb"));
+            a->expert_pin_mb = next_i("--expert-pin-mb");
         else if (f == "--router-resident")
-            a->router_resident = static_cast<f32>(std::atof(next("--router-resident")));
+            a->router_resident = next_f("--router-resident");
         else if (f == "--expert-warm-prefetch")
-            a->expert_warm_prefetch = std::atoi(next("--expert-warm-prefetch")) != 0;
+            a->expert_warm_prefetch = next_i("--expert-warm-prefetch") != 0;
         else if (f == "--expert-warmup")
-            a->expert_warmup = std::atoi(next("--expert-warmup"));
+            a->expert_warmup = next_i("--expert-warmup");
         else if (f == "--expert-warmup-ms")
-            a->expert_warmup_ms = std::atoi(next("--expert-warmup-ms"));
+            a->expert_warmup_ms = next_i("--expert-warmup-ms");
         else if (f == "--ram-tier" || f == "--ram-tier-gb")
-            a->ram_tier_gb = std::atoi(next("--ram-tier"));
+            a->ram_tier_gb = next_i("--ram-tier");
         else if (f == "--mtp") {
             a->mtp_path = next("--mtp");
             // Asking for the block implies loading it: a sidecar that was named
@@ -450,13 +501,13 @@ bool parse(int argc, char **argv, Args *a) {
             }
         }
         else if (f == "--hybrid-experts")
-            a->hybrid_experts = std::atoi(next("--hybrid-experts")) != 0;
+            a->hybrid_experts = next_i("--hybrid-experts") != 0;
         else if (f == "--hybrid-threads")
-            a->hybrid_threads = std::atoi(next("--hybrid-threads"));
+            a->hybrid_threads = next_i("--hybrid-threads");
         else if (f == "--hybrid-max-rows")
-            a->hybrid_max_rows = std::atoi(next("--hybrid-max-rows"));
+            a->hybrid_max_rows = next_i("--hybrid-max-rows");
         else if (f == "--hybrid-frac")
-            a->hybrid_frac = std::atof(next("--hybrid-frac"));
+            a->hybrid_frac = next_f("--hybrid-frac");
         else if (f == "--greedy") a->greedy = true;
         else if (f == "--tokenize") a->tokenize = true;
         else if (f == "--prefill-hash") a->prefill_hash = true;
@@ -487,7 +538,7 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--expert-stub") a->expert_stub = true;
         else if (f == "--expert-adapt") a->expert_adapt = true;
         else if (f == "--debug-topk")
-            a->debug_topk = std::atoi(next("--debug-topk"));
+            a->debug_topk = next_i("--debug-topk");
         else if (f == "--sample-host")
             a->sample_host = true;
         else if (f == "-v" || f == "--verbose") a->verbose = true;
