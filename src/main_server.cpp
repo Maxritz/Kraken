@@ -13,6 +13,7 @@
 #include <string>
 
 #include "krk/backend.hpp"
+#include "krk/cli_value.hpp"
 #include "krk/engine.hpp"
 #include "krk/http.hpp"
 #include "krk/server.hpp"
@@ -128,13 +129,38 @@ bool parse(int argc, char **argv, Args *a) {
             }
             return argv[++i];
         };
+        // The same whole-string contract the CLI uses (krk/cli_value.hpp). The
+        // hole was worse here: `--port abc` was std::atoi -> 0, and 0 is exactly
+        // how the server is asked for an EPHEMERAL port, so a typo silently
+        // started a listener on a random port while the caller waited on 8080.
+        auto next_i = [&](const char *what) -> i32 {
+            const char *v = next(what);
+            long long n = 0;
+            if (!krk::whole_int(v, &n)) {
+                std::fprintf(stderr,
+                             "kraken-server: %s needs a whole number, got '%s'\n",
+                             what, v);
+                std::exit(2);
+            }
+            return static_cast<i32>(n);
+        };
+        auto next_f = [&](const char *what) -> f32 {
+            const char *v = next(what);
+            double d = 0;
+            if (!krk::whole_float(v, &d)) {
+                std::fprintf(stderr, "kraken-server: %s needs a number, got '%s'\n",
+                             what, v);
+                std::exit(2);
+            }
+            return static_cast<f32>(d);
+        };
         if (f == "--model" || f == "-m") a->model = next("--model");
         else if (f == "--host") a->host = next("--host");
         else if (f == "--port") {
-            a->port = std::atoi(next("--port"));
+            a->port = next_i("--port");
             a->port_set = true;
         }
-        else if (f == "--ctx") a->ctx = std::atoi(next("--ctx"));
+        else if (f == "--ctx") a->ctx = next_i("--ctx");
         else if (f == "--kv-quant") {
             const std::string v = next("--kv-quant");
             if (v == "int8") a->kv_quant = 1;
@@ -145,33 +171,33 @@ bool parse(int argc, char **argv, Args *a) {
                 return false;
             }
         }
-        else if (f == "--chunk") a->chunk = std::atoi(next("--chunk"));
-        else if (f == "--threads") a->threads = std::atoi(next("--threads"));
-        else if (f == "--device") a->device = std::atoi(next("--device"));
+        else if (f == "--chunk") a->chunk = next_i("--chunk");
+        else if (f == "--threads") a->threads = next_i("--threads");
+        else if (f == "--device") a->device = next_i("--device");
         else if (f == "--expert-cache-mb")
-            a->expert_cache_mb = std::atoi(next("--expert-cache-mb"));
+            a->expert_cache_mb = next_i("--expert-cache-mb");
         else if (f == "--expert-cache-slots")
-            a->expert_cache_slots = std::atoi(next("--expert-cache-slots"));
+            a->expert_cache_slots = next_i("--expert-cache-slots");
         else if (f == "--expert-warm-mb" || f == "--expert-l2-mb")
-            a->expert_warm_mb = std::atoi(next("--expert-warm-mb"));
+            a->expert_warm_mb = next_i("--expert-warm-mb");
         else if (f == "--expert-pin-mb")
-            a->expert_pin_mb = std::atoi(next("--expert-pin-mb"));
+            a->expert_pin_mb = next_i("--expert-pin-mb");
         else if (f == "--router-resident")
-            a->router_resident = static_cast<f32>(std::atof(next("--router-resident")));
+            a->router_resident = next_f("--router-resident");
         else if (f == "--expert-warmup")
-            a->expert_warmup = std::atoi(next("--expert-warmup"));
+            a->expert_warmup = next_i("--expert-warmup");
         else if (f == "--expert-warmup-ms")
-            a->expert_warmup_ms = std::atoi(next("--expert-warmup-ms"));
+            a->expert_warmup_ms = next_i("--expert-warmup-ms");
         else if (f == "--ram-tier" || f == "--ram-tier-gb")
-            a->ram_tier_gb = std::atoi(next("--ram-tier"));
+            a->ram_tier_gb = next_i("--ram-tier");
         else if (f == "--hybrid-experts")
-            a->hybrid_experts = std::atoi(next("--hybrid-experts")) != 0;
+            a->hybrid_experts = next_i("--hybrid-experts") != 0;
         else if (f == "--hybrid-threads")
-            a->hybrid_threads = std::atoi(next("--hybrid-threads"));
+            a->hybrid_threads = next_i("--hybrid-threads");
         else if (f == "--hybrid-max-rows")
-            a->hybrid_max_rows = std::atoi(next("--hybrid-max-rows"));
+            a->hybrid_max_rows = next_i("--hybrid-max-rows");
         else if (f == "--hybrid-frac")
-            a->hybrid_frac = std::atof(next("--hybrid-frac"));
+            a->hybrid_frac = next_f("--hybrid-frac");
         else if (f == "--prefill") {
             const std::string v = next("--prefill");
             if (v == "fast") a->prefill_fast = true;
@@ -183,7 +209,7 @@ bool parse(int argc, char **argv, Args *a) {
             }
         }
         else if (f == "--draft") a->draft = next("--draft");
-        else if (f == "--draft-tokens") a->draft_tokens = std::atoi(next("--draft-tokens"));
+        else if (f == "--draft-tokens") a->draft_tokens = next_i("--draft-tokens");
         else if (f == "--cpu") a->cpu = true;
         else if (f == "-v" || f == "--verbose") a->verbose = true;
         else if (f == "-h" || f == "--help") { usage(); std::exit(0); }

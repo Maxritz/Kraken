@@ -10,6 +10,7 @@
 
 #include "engine_usage.hpp"
 #include "krk/backend.hpp"
+#include "krk/cli_value.hpp"
 #include "krk/engine.hpp"
 #include "krk/host_time.hpp"
 #include "krk/trace.hpp"
@@ -360,11 +361,8 @@ bool parse(int argc, char **argv, Args *a) {
         // 2` as SUCCESS (the defect that made `--prefill bogus` run).
         auto next_i = [&](const char *what) -> i32 {
             const char *v = next(what);
-            char *end = nullptr;
-            errno = 0;
-            const long long n = std::strtoll(v, &end, 10);
-            if (end == v || *end != '\0' || errno == ERANGE || n < INT_MIN ||
-                n > INT_MAX) {
+            long long n = 0;
+            if (!krk::whole_int(v, &n)) {
                 std::fprintf(stderr, "kraken: %s needs a whole number, got '%s'\n",
                              what, v);
                 std::exit(2);
@@ -373,10 +371,8 @@ bool parse(int argc, char **argv, Args *a) {
         };
         auto next_f = [&](const char *what) -> f32 {
             const char *v = next(what);
-            char *end = nullptr;
-            errno = 0;
-            const double d = std::strtod(v, &end);
-            if (end == v || *end != '\0' || errno == ERANGE) {
+            double d = 0;
+            if (!krk::whole_float(v, &d)) {
                 std::fprintf(stderr, "kraken: %s needs a number, got '%s'\n", what, v);
                 std::exit(2);
             }
@@ -384,10 +380,8 @@ bool parse(int argc, char **argv, Args *a) {
         };
         auto next_u = [&](const char *what) -> u64 {
             const char *v = next(what);
-            char *end = nullptr;
-            errno = 0;
-            const unsigned long long n = std::strtoull(v, &end, 10);
-            if (end == v || *end != '\0' || errno == ERANGE || v[0] == '-') {
+            unsigned long long n = 0;
+            if (!krk::whole_uint(v, &n)) {
                 std::fprintf(stderr,
                              "kraken: %s needs a non-negative whole number, got "
                              "'%s'\n",

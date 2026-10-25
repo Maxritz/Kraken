@@ -16100,11 +16100,12 @@ static void test_cli_arg_refusal() {
     // so a run that got this far exits 1 instead of 2.
     const std::string missing = "kraken-arg-refusal-no-such-model.gguf";
 
-    auto run = [&](const std::string &args, std::string *err) -> int {
+    auto run_bin = [&](const std::string &bin, const std::string &args,
+                       std::string *err) -> int {
         const std::string o = "kraken-argref-out.txt";
         const std::string e = "kraken-argref-err.txt";
         std::string cmd =
-            "\"" + exe + "\" " + args + " > \"" + o + "\" 2> \"" + e + "\"";
+            "\"" + bin + "\" " + args + " > \"" + o + "\" 2> \"" + e + "\"";
 #ifdef _WIN32
         // cmd /c strips the first and last quote of a line that starts with
         // one; `call` makes the line start with a word (the run_prefill_hash
@@ -16116,6 +16117,9 @@ static void test_cli_arg_refusal() {
         std::remove(o.c_str());
         std::remove(e.c_str());
         return rc;
+    };
+    auto run = [&](const std::string &args, std::string *err) -> int {
+        return run_bin(exe, args, err);
     };
 
     // Every flag that takes a TYPED value, with one value that is not it. The
@@ -16207,6 +16211,73 @@ static void test_cli_arg_refusal() {
     CHECK(rc_h == 0, rc_h == 0 ? "--help exits 0 (a refusal arm cannot be "
                                  "\"everything exits 2\")"
                                : "--help did not exit 0");
+
+    // ---- kraken-server takes the same flags, so it owes the same contract ---
+    // Its hole was the worse of the two: `--port abc` was atoi -> 0, and 0 is
+    // exactly how the server is asked for an EPHEMERAL port, so a typo started
+    // a listener on a random port while the caller waited on 8080.
+    const std::filesystem::path srv_p =
+        std::filesystem::path(self).parent_path() /
+#ifdef _WIN32
+        "kraken-server.exe";
+#else
+        "kraken-server";
+#endif
+    const bool have_srv = !self.empty() && std::filesystem::exists(srv_p);
+    CHECK(have_srv, "kraken-server sits beside kraken-tests (the same group "
+                    "covers both entry points)");
+    if (have_srv) {
+        const std::string srv = srv_p.string();
+        auto srun = [&](const std::string &args, std::string *err) -> int {
+            return run_bin(srv, args, err);
+        };
+        const Arm sbad[] = {
+            {"--kv-quant int4", "--kv-quant needs f16|int8"},
+            {"--prefill bogus", "--prefill needs exact|fast"},
+            {"--port abc", "--port"},
+            {"--ctx abc", "--ctx"},
+            {"--chunk abc", "--chunk"},
+            {"--threads abc", "--threads"},
+            {"--device abc", "--device"},
+            {"--draft-tokens abc", "--draft-tokens"},
+            {"--expert-cache-mb abc", "--expert-cache-mb"},
+            {"--expert-cache-slots abc", "--expert-cache-slots"},
+            {"--expert-warm-mb abc", "--expert-warm-mb"},
+            {"--expert-pin-mb abc", "--expert-pin-mb"},
+            {"--expert-warmup abc", "--expert-warmup"},
+            {"--expert-warmup-ms abc", "--expert-warmup-ms"},
+            {"--ram-tier abc", "--ram-tier"},
+            {"--hybrid-experts abc", "--hybrid-experts"},
+            {"--hybrid-threads abc", "--hybrid-threads"},
+            {"--hybrid-max-rows abc", "--hybrid-max-rows"},
+            {"--router-resident 0.0x", "--router-resident"},
+            {"--hybrid-frac 1.0x", "--hybrid-frac"},
+            {"--no-such-flag", "unknown option"},
+        };
+        for (const Arm &a : sbad) {
+            std::string err;
+            const int rc = srun(std::string("-m \"") + missing + "\" " + a.flags, &err);
+            if (rc != 2)
+                std::fprintf(stderr, "  (server %s -> rc=%d, stderr: %.200s)\n",
+                             a.flags, rc, err.c_str());
+            CHECK(rc == 2, rc == 2 ? "the server refuses a bad value with exit 2"
+                                   : "the server ACCEPTED a bad value: it "
+                                     "defaulted silently");
+            CHECK(err.find(a.want) != std::string::npos,
+                  err.find(a.want) != std::string::npos
+                      ? "and the server's message names the flag"
+                      : "the server's refusal does not name the flag");
+        }
+        // Controls: a valid line reaches the loader (1), --help is not a
+        // refusal (0). Without them the arms above prove only "not 2".
+        std::string serr;
+        const int src = srun(std::string("-m \"") + missing + "\"", &serr);
+        CHECK(src == 1, src == 1 ? "a valid server line reaches the loader"
+                                 : "a valid server line did not reach the loader");
+        const int srh = srun("--help", nullptr);
+        CHECK(srh == 0, srh == 0 ? "the server's --help exits 0"
+                                 : "the server's --help did not exit 0");
+    }
 }
 
 #define TEST_GROUP(fn) {#fn, fn, nullptr},
