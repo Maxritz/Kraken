@@ -45,7 +45,10 @@ std::vector<QuantTensor *> qt_fields(LayerWeights &L) {
             // them here leaks every one of them on unload.
             &L.wq_a16,    &L.wq_b16,    &L.wkv16,
             &L.wo_a16,    &L.wo_b16,
-            &L.ssm_alpha,  &L.ssm_beta};
+            &L.ssm_alpha,  &L.ssm_beta,
+            // LatentMoE's pair: the narrow projection the routed bank reads and
+            // the one that lifts its result back to n_embd.
+            &L.latent_down, &L.latent_up};
 }
 
 } // namespace
@@ -345,6 +348,39 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.n_expert_used = static_cast<i32>(
         gguf_.get_i64(key(".expert_used_count"), cfg_.n_expert > 0 ? 1 : 0));
     cfg_.n_ff_exp = static_cast<i32>(gguf_.get_i64(key(".expert_feed_forward_length"), 0));
+    // `expert_used_count` and `expert_feed_forward_length` may be ARRAYS, one
+    // entry per block. Nemotron Bolt 74B-A9B writes both that way: top-k is 0
+    // on its Mamba-2 blocks and 9 on its 40 MoE blocks, and the expert width
+    // varies (2048/1536/...). `get_i64` on an array yields the default, so a
+    // scalar-only read turned that file into "top-1 of a 496-wide router that
+    // is only 240 wide" -- two different wrong answers in one number.
+    // The array is the truth; the model-level scalars become the maxima, which
+    // is what a workspace has to be sized for.
+    if (const std::vector<i32> *used_arr = gguf_.get_i32_array(key(".expert_used_count"))) {
+        cfg_.layer_n_expert_used = *used_arr;
+        i32 mx = 0;
+        for (i32 v : *used_arr)
+            if (v > mx) mx = v;
+        if (mx > 0) cfg_.n_expert_used = mx;
+    }
+    if (const std::vector<i32> *ff_arr =
+            gguf_.get_i32_array(key(".expert_feed_forward_length"))) {
+        i32 mx = 0;
+        for (i32 v : *ff_arr)
+            if (v > mx) mx = v;
+        if (mx > 0) cfg_.n_ff_exp = mx;
+    }
+    // `feed_forward_length` is per-block in the same files (0 on the Mamba-2
+    // blocks, 2048/1536 on the MoE ones). Nothing routes by a dense width per
+    // layer here, so the maximum is the only safe reading: it bounds every
+    // workspace that a dense FFN block could ask for.
+    if (const std::vector<i32> *ffl =
+            gguf_.get_i32_array(key(".feed_forward_length"))) {
+        i32 mx = 0;
+        for (i32 v : *ffl)
+            if (v > mx) mx = v;
+        if (mx > 0) cfg_.n_ff = mx;
+    }
     cfg_.n_ff_shexp = static_cast<i32>(
         gguf_.get_i64(key(".expert_shared_feed_forward_length"), 0));
     cfg_.n_expert_shared = static_cast<i32>(gguf_.get_i64(
@@ -730,7 +766,10 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // refills that ring from this source before the layer runs. 256-byte
             // alignment keeps every row of every quant block naturally aligned.
             const size_t aligned = (t->n_bytes + 255u) & ~size_t(255u);
-            q.data = static_cast<u8 *>(ring_) + stream_off_;
+            // The slot this layer's parity owns. Fixed at load time, so a
+            // layer's addresses never change while the GPU may be reading them.
+            q.data = const_cast<u8 *>(slot_base(stream_layer_index_)) +
+                     stream_off_;
             stream_off_ += aligned;
             stream_[static_cast<size_t>(stream_layer_index_)].push_back(
                 StreamEntry{t, q.data, t->n_bytes});
@@ -742,7 +781,17 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             weight_bytes_ += static_cast<i64>(t->n_bytes);
             return q;
         }
-        q.data = be.alloc(t->n_bytes);
+        // A resident per-layer weight, carved from the one slab when there is
+        // room: the bump keeps the tensors in loader order, which is the order
+        // the kernels read them in.
+        const size_t slab_need = (t->n_bytes + 255u) & ~size_t(255u);
+        if (slab_ && stream_layer_index_ >= 0 &&
+            slab_off_ + slab_need <= slab_bytes_) {
+            q.data = slab_ + slab_off_;
+            slab_off_ += slab_need;
+        } else {
+            q.data = be.alloc(t->n_bytes);
+        }
         const f64 a1 = LoadPhase::now();
         upload_timed(q.data, t->data, t->n_bytes);
         const f64 a2 = LoadPhase::now();
@@ -865,6 +914,26 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         return reinterpret_cast<const f32 *>(t->data)[0];
     };
 
+    // ---- a weight's NVFP4 global scale, found by name ----------------------
+    // The sidecar is `<tensor>.scale` beside `<tensor>.weight`, and it is the
+    // one number a consumer cannot get from the quantized bytes. Resolved HERE,
+    // once per uploaded weight, so that a call site can neither forget to look
+    // for it nor disagree with another call site about where it lives.
+    auto with_sidecar_scale = [&](QuantTensor q, const std::string &wname) {
+        static const char *kWeight = ".weight";
+        const size_t wn = std::strlen(kWeight);
+        const std::string base =
+            (wname.size() > wn && wname.compare(wname.size() - wn, wn, kWeight) == 0)
+                ? wname.substr(0, wname.size() - wn)
+                : wname;
+        q.gs = one_scale(base + ".scale");
+        // The engine scales a scaled weight's INPUT, and that copy has to be as
+        // wide as the widest scaled weight's contraction. Recorded here because
+        // this is the only place that sees the sidecar at all.
+        if (q.gs != 1.0f && q.n_in > max_scaled_in_) max_scaled_in_ = q.n_in;
+        return q;
+    };
+
     auto upload_weight = [&](const std::string &name, bool optional,
                              std::string *e) -> QuantTensor {
         const GgufTensor *t = gguf_.tensor(name);
@@ -913,9 +982,9 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             q.n_in = n_in;
             q.n_out = n_out;
             weight_bytes_ += t->n_elements * 2;
-            return q;
+            return with_sidecar_scale(q, name);
         }
-        return upload_raw(t, t->type);
+        return with_sidecar_scale(upload_raw(t, t->type), name);
     };
 
     lp.mark("arch + metadata resolve");
@@ -1168,6 +1237,10 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (err) *err = e;
             return false;
         }
+        // A lookup TABLE, not a matmul: its rows are copied out by index, so a
+        // per-tensor scale has no projection to ride and is deliberately not
+        // taken here. (A tied file shares this tensor with the head below, and
+        // the head's own gs is read there.)
         tok_embd_ = upload_raw(te, te->type);
         cfg_.n_vocab = static_cast<i32>(te->ne[1]);
         lp.mark("  token_embd upload");
@@ -1181,7 +1254,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (err) *err = e;
             return false;
         }
-        out_head_ = upload_raw(oh, oh->type);
+        out_head_ = with_sidecar_scale(upload_raw(oh, oh->type), "output.weight");
         lp.mark("  output.weight upload");
     }
     if (cfg_.no_out_norm) {
@@ -1310,6 +1383,10 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     const bool can_stream = be.kind() != BackendKind::CPU &&
                             be.device_total_bytes() > 0;
     size_t weight_budget = weight_budget_;
+    // An explicit --weight-vram-mb is a promise, not a hint: the second ring slot
+    // must fit in whatever headroom it left, never come out of the plan. An
+    // automatic budget has the 1 GiB slack below for exactly this.
+    const bool budget_is_auto = weight_budget == 0;
     if (can_stream && weight_budget == 0) {
         const size_t total = be.device_total_bytes();
         const size_t freeb = be.device_free_bytes();
@@ -1321,6 +1398,38 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         weight_budget =
             freeb > reserve + slack ? freeb - reserve - slack : 0;
     }
+    // One-hop-ahead staging needs a second ring slot the size of the largest
+    // layer, and that comes out of the same VRAM the resident prefix is planned
+    // against. Reserve it BEFORE the split so the plan cannot spend it, and drop
+    // the double buffer rather than strand the ring when there is too little to
+    // reserve. KRK_WEIGHT_AHEAD=0 forces the single-slot arm for an A/B.
+    // OFF by default, and the measurement is why: on the 27B the copy of one
+    // layer is 9-10 ms over the link while that layer's compute is 1.7 ms, so a
+    // two-slot window -- whose cover is exactly one layer -- moves the wait into
+    // device idle and leaves the step at 192 -> 197 ms. It wins only where a
+    // layer's compute exceeds its copy, which no PCIe-streamed weight set on
+    // this card reaches. Kept behind KRK_WEIGHT_AHEAD=1 because it is the right
+    // pipeline the day that ratio inverts (a faster link, or a stack whose
+    // streamed layers are the compute-heavy ones).
+    bool want_ahead = false;
+    if (const char *av = std::getenv("KRK_WEIGHT_AHEAD"))
+        want_ahead = std::string(av) == "1";
+    size_t max_layer_bytes = 0;
+    for (size_t b : layer_bytes) max_layer_bytes = std::max(max_layer_bytes, b);
+    max_layer_bytes = (max_layer_bytes + 255u) & ~size_t(255u);
+    if (can_stream && want_ahead && weight_budget > 0 &&
+        weight_budget < (size_t(1) << 60) &&
+        weight_budget > 2 * max_layer_bytes) {
+        // An automatic budget is planned to keep 1 GiB of slack, and the second
+        // slot is paid out of that. An explicit one is not touched: taking a
+        // layer's worth of residency away to buy a slot streams one MORE layer
+        // per token, which is the opposite of the intended trade.
+        if (budget_is_auto) weight_budget -= max_layer_bytes;
+        ring_slots_ = 2;
+    } else {
+        want_ahead = false;
+    }
+
     i32 first_stream = -1;
     if (can_stream && weight_budget > 0) {
         size_t cum = static_cast<size_t>(up_bytes);
@@ -1338,7 +1447,22 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         for (i32 l = first_stream; l < cfg_.n_layer; l++)
             need = std::max(need, layer_bytes[static_cast<size_t>(l)]);
         need = (need + 255u) & ~size_t(255u);
-        ring_ = be.alloc(need);
+        // ring_slots_ was decided above. The second slot is the prefetch target:
+        // one layer's copy in flight while another layer computes.
+        if (ring_slots_ == 2) {
+            // alloc() ABORTS on failure, so ask before taking it: a second slot
+            // that does not fit must cost speed, not the run.
+            const size_t freeb = be.device_free_bytes();
+            const size_t floor = krk::vram_reserve_bytes(be.device_total_bytes());
+            if (freeb < 2 * need + floor) {
+                KRK_WARN("weight residency: %.1f MiB free, no room for a second "
+                         "%.1f MiB ring slot -- staging stays one layer deep",
+                         static_cast<f64>(freeb) / 1048576.0,
+                         static_cast<f64>(need) / 1048576.0);
+                ring_slots_ = 1;
+            }
+        }
+        ring_ = be.alloc(need * static_cast<size_t>(ring_slots_));
         stage_host_ = ring_ ? be.alloc_host(need) : nullptr;
         // The spare pinned buffer the next layer is read into while this one's
         // DMA is in flight. Two buffers, alternating; without the second the
@@ -1368,7 +1492,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             stage_host_ = nullptr;
             first_stream = -1;
         } else {
-            ring_bytes_ = need;
+            ring_bytes_ = need * static_cast<size_t>(ring_slots_);
+            slot_bytes_ = ring_slots_ > 1 ? need : 0;
             layer_streamed_.assign(static_cast<size_t>(cfg_.n_layer), 0);
             stream_.assign(static_cast<size_t>(cfg_.n_layer), std::vector<StreamEntry>());
             for (i32 l = first_stream; l < cfg_.n_layer; l++)
@@ -1380,6 +1505,11 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                      static_cast<f64>(weight_budget) / 1073741824.0,
                      first_stream, cfg_.n_layer - 1,
                      static_cast<f64>(need) / 1048576.0);
+            if (ring_slots_ > 1)
+                KRK_INFO("weight residency: %.1f MiB ring is TWO slots -- one "
+                         "layer's copy stays in flight while the layer before it "
+                         "computes",
+                         static_cast<f64>(ring_bytes_) / 1048576.0);
         }
     } else if (can_stream) {
         size_t total_model = static_cast<size_t>(up_bytes);
@@ -1393,6 +1523,44 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                      "(%.2f GiB budget)",
                      static_cast<f64>(total_model) / 1073741824.0,
                      static_cast<f64>(weight_budget) / 1073741824.0);
+    }
+
+    // ---- one slab for the resident weights ---------------------------------
+    // Every resident per-layer weight goes into ONE device allocation instead of
+    // several hundred. Same bytes, same addresses-per-kernel; the difference the
+    // test measures is page locality. KRK_WEIGHT_SLAB=0 restores per-tensor
+    // allocations for the A/B.
+    {
+        // OFF by default: measured, and layout is not the cause. With promotion
+        // disabled in both arms -- so the resident set, the streamed set and the
+        // policy are identical -- 12.4 GiB of resident weights in ONE slab is
+        // 230.4 ms/step against 225.4 ms in ~700 separate allocations, output md5
+        // identical. The slab also reserves its full size up front, which costs
+        // ~1.9 GiB of promotion headroom (10 promotions become 1) and is why the
+        // first A/B looked 20% worse. KRK_WEIGHT_SLAB=1 keeps the arm.
+        const char *sv = std::getenv("KRK_WEIGHT_SLAB");
+        const bool want_slab = sv && *sv && std::string(sv) != "0";
+        if (want_slab && can_stream) {
+            size_t want = static_cast<size_t>(up_bytes);
+            for (i32 l = 0; l < cfg_.n_layer; l++) {
+                if (!layer_streamed_.empty() &&
+                    layer_streamed_[static_cast<size_t>(l)])
+                    continue;
+                want += layer_bytes[static_cast<size_t>(l)];
+            }
+            // Alignment per tensor is 256 B and the loader rounds each one, so
+            // the sum above is a floor: give it 2% and a 16 MiB floor of slack
+            // rather than let a rounding difference push tensors back out.
+            want = want + want / 50u + (size_t(16) << 20);
+            want = (want + 4095u) & ~static_cast<size_t>(4095u);
+            slab_ = static_cast<u8 *>(be.alloc(want));
+            slab_bytes_ = slab_ ? want : 0;
+            slab_off_ = 0;
+            KRK_INFO("weight residency: %s slab of %.0f MiB for the resident "
+                     "per-layer weights",
+                     slab_ ? "one contiguous" : "could not allocate a",
+                     static_cast<f64>(slab_bytes_) / 1048576.0);
+        }
     }
 
     // ---- per-layer weights ------------------------------------------------
@@ -1529,6 +1697,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 L.ssm_conv_bias = upload_f32(blk_key("blk.%d.ssm_conv1d.bias", l));
                 L.ssm_in = need(blk_key("blk.%d.ssm_in.weight", l));
                 L.ssm_out = need(blk_key("blk.%d.ssm_out.weight", l));
+                // NVFP4's global scale rides the tensors themselves (gs); it is
+                // 1.34e-4 on the Bolt file, against a 4096-wide projection.
                 L.ssm_dt = upload_f32(blk_key("blk.%d.ssm_dt.bias", l));
                 L.ssm_a = upload_f32(blk_key("blk.%d.ssm_a", l));
                 L.ssm_d = upload_f32(blk_key("blk.%d.ssm_d", l));
@@ -2309,17 +2479,27 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 L.shexp_gate = upload_weight(blk_key("blk.%d.ffn_gate_shexp.weight", l), true, &e);
                 L.shexp_up = upload_weight(blk_key("blk.%d.ffn_up_shexp.weight", l), true, &e);
                 L.shexp_down = upload_weight(blk_key("blk.%d.ffn_down_shexp.weight", l), true, &e);
-                L.shexp_up_scale =
-                    one_scale(blk_key("blk.%d.ffn_up_shexp.scale", l));
-                L.shexp_down_scale =
-                    one_scale(blk_key("blk.%d.ffn_down_shexp.scale", l));
-                L.shexp_gate_scale =
-                    one_scale(blk_key("blk.%d.ffn_gate_shexp.scale", l));
             }
             // Qwen3.5 gates the shared expert with a per-token scalar built from a
             // 1-D row; the Qwen2/Qwen3/nemotron schema has no such vector.
             L.shexp_inp_gate =
                 upload_weight(blk_key("blk.%d.ffn_gate_inp_shexp.weight", l), true, &e);
+            // ---- LatentMoE: the routed experts' latent ---------------------
+            // Nemotron 3.5 keeps the routed bank in a narrow space: this pair
+            // projects n_embd -> n_latent and back, and the experts are
+            // [n_latent x n_ff_exp x n_expert] rather than n_embd wide. The
+            // shared expert above stays full width -- it is a different tensor
+            // set for exactly that reason. Both halves or neither: one of the
+            // pair describes a block whose routed leg has no input or no exit,
+            // and the geometry check below refuses it rather than running the
+            // experts on the hidden state and clipping every element.
+            if (gguf_.tensor(blk_key("blk.%d.ffn_latent_down.weight", l)) ||
+                gguf_.tensor(blk_key("blk.%d.ffn_latent_up.weight", l))) {
+                L.latent_down =
+                    upload_weight(blk_key("blk.%d.ffn_latent_down.weight", l), true, &e);
+                L.latent_up =
+                    upload_weight(blk_key("blk.%d.ffn_latent_up.weight", l), true, &e);
+            }
         }
         if (!e.empty()) {
             if (err) *err = e;
@@ -2457,21 +2637,6 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // look the same from the tensors alone.
             const std::vector<i32> *reap_kept =
                 gguf_.get_i32_array("reap.layer.keep_count");
-            const i32 want_expert =
-                (reap_kept && l < static_cast<i32>(reap_kept->size()) &&
-                 (*reap_kept)[l] > 0)
-                    ? (*reap_kept)[l]
-                    : cfg_.n_expert;
-            // ---- router geometry ------------------------------------------
-            if (L.router.n_out != want_expert || L.router.n_in != cfg_.n_embd) {
-                if (err)
-                    *err = "layer " + std::to_string(l) + " router is [" +
-                           std::to_string(L.router.n_in) + " x " +
-                           std::to_string(L.router.n_out) +
-                           "], metadata wants [" + std::to_string(cfg_.n_embd) +
-                           " x " + std::to_string(want_expert) + "]";
-                return false;
-            }
             // ---- routed-expert geometry (per-layer) ---------------------
             // The expert tensors are only *described* here so the cache can know
             // per-expert byte boundaries; nothing is uploaded at load time.
@@ -2481,6 +2646,14 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // matters for the forward path's intermediate workspace is the
             // routed n_ff_exp; the shared-expert sanity is the one that gates the
             // shared branch.
+            //
+            // This block now runs BEFORE the router check on purpose: the bank's
+            // ne[2] is this layer's expert count, and the router has to match
+            // IT. `expert_count` is a CAP, not an equality -- the packed hybrid
+            // merges (Nemotron Bolt 74B-A9B) carry 240/304/368/432/496 experts
+            // across 40 MoE blocks under one `expert_count` of 496, so checking
+            // every router against the cap refuses a file whose tensors agree
+            // with each other perfectly.
             {
                 const GgufTensor *src = nullptr;
                 if (L.experts.up && L.experts.up->n_dims == 3)
@@ -2499,21 +2672,98 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     L.experts.n_embd = static_cast<i64>(src->ne[0]);
                 }
             }
-            if (L.experts.n_expert != want_expert ||
-                L.experts.n_ff_exp != cfg_.n_ff_exp) {
+            // A REAP export prunes each layer independently and records what
+            // each layer KEPT; where it is present it is the expectation. The
+            // bank is the authority otherwise.
+            const i32 want_expert =
+                (reap_kept && l < static_cast<i32>(reap_kept->size()) &&
+                 (*reap_kept)[l] > 0)
+                    ? (*reap_kept)[l]
+                    : (L.experts.n_expert > 0 ? L.experts.n_expert
+                                              : cfg_.n_expert);
+            // ---- router geometry ------------------------------------------
+            // The router must agree with this layer's own bank: a 240-wide
+            // router over a 240-expert bank routes correctly whatever the cap
+            // says, and a 496-wide router over it would index experts that do
+            // not exist.
+            if (L.router.n_out != want_expert || L.router.n_in != cfg_.n_embd) {
+                if (err)
+                    *err = "layer " + std::to_string(l) + " router is [" +
+                           std::to_string(L.router.n_in) + " x " +
+                           std::to_string(L.router.n_out) +
+                           "], this layer's routed bank is [" +
+                           std::to_string(cfg_.n_embd) + " x " +
+                           std::to_string(want_expert) + "]";
+                return false;
+            }
+            // The cap still binds: a layer may be narrower than the declared
+            // maximum (that is the packed-merge shape) but never wider, because
+            // every router row, plan buffer and dispatch slot is sized by it.
+            if (want_expert > cfg_.n_expert) {
+                if (err)
+                    *err = "layer " + std::to_string(l) + " has " +
+                           std::to_string(want_expert) +
+                           " experts, more than the declared expert_count " +
+                           std::to_string(cfg_.n_expert);
+                return false;
+            }
+            if (L.experts.n_ff_exp > cfg_.n_ff_exp) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
-                           " routed-expert tensors are [" +
-                           std::to_string(L.experts.n_expert) + " x " +
+                           " routed-expert width " +
                            std::to_string(L.experts.n_ff_exp) +
-                           "], metadata wants [" + std::to_string(want_expert) +
-                           " x " + std::to_string(cfg_.n_ff_exp) + "]";
+                           " exceeds the declared expert_feed_forward_length " +
+                           std::to_string(cfg_.n_ff_exp);
                 return false;
             }
             if (L.shexp_gate.present() && L.shexp_gate.n_out != cfg_.n_ff_shexp) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
                            " shared-expert width disagrees with the metadata";
+                return false;
+            }
+            // ---- LatentMoE geometry (per layer) ---------------------------
+            // The routed bank's input width is `L.experts.n_embd`. On most
+            // families that IS n_embd, and the block has no latent pair. On
+            // Nemotron 3.5 it is a narrow latent -- 1024 against a 4096-wide
+            // hidden state on Bolt 74B -- and the layer must carry the pair that
+            // gets there and back. Feeding the hidden state to a 1024-wide bank
+            // is not a slow answer, it is a wrong one: every row read lands on
+            // the wrong stride and the routed sum clips to garbage.
+            if (L.latent_down.present() != L.latent_up.present()) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " carries only one of ffn_latent_down / "
+                           "ffn_latent_up; the routed leg needs both or "
+                           "neither";
+                return false;
+            }
+            if (L.latent_moe()) {
+                const i64 ew = L.experts.n_embd;
+                if (ew <= 0 || L.latent_down.n_in != cfg_.n_embd ||
+                    L.latent_down.n_out != ew || L.latent_up.n_in != ew ||
+                    L.latent_up.n_out != cfg_.n_embd) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) +
+                               " latent projection is [" +
+                               std::to_string(L.latent_down.n_in) + " x " +
+                               std::to_string(L.latent_down.n_out) + "] -> [" +
+                               std::to_string(L.latent_up.n_in) + " x " +
+                               std::to_string(L.latent_up.n_out) +
+                               "], which does not join the hidden state (" +
+                               std::to_string(cfg_.n_embd) +
+                               ") to this layer's routed bank (" +
+                               std::to_string(ew) + ") and back";
+                    return false;
+                }
+            } else if (L.experts.n_embd > 0 && L.experts.n_embd != cfg_.n_embd) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " routed bank reads " +
+                           std::to_string(L.experts.n_embd) +
+                           "-wide rows but the layer carries no latent "
+                           "projection to reach it (hidden state is " +
+                           std::to_string(cfg_.n_embd) + ")";
                 return false;
             }
             cfg_.is_moe = true;
@@ -2598,6 +2848,59 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // the load-time budget is then staged on every step, whatever VRAM is left.
     if (const char *v = std::getenv("KRK_WEIGHT_PROMOTE"))
         promote_enabled_ = std::string(v) != "0";
+
+    // ---- pinned host mirror of the streamed layers -------------------------
+    // A streamed layer's bytes do not change between tokens, so reading them out
+    // of the mapping on every pass repeats work that was already done. Measured
+    // on the 15.97 GiB Qwen3.8-27B file at --ctx 512: 9 streamed layers per
+    // token, 64.70 GiB of re-reads across a 32-token bench, and the read was
+    // ~55% of decode -- the mapping is page-cache hot, so the cost is the read
+    // path and not the disk.
+    //
+    // The mirror is one pinned allocation holding every streamed layer at its
+    // own offset, filled once here through the same reader a staging pass used.
+    // Afterwards a staging pass is a DMA straight out of pinned memory, which is
+    // also this card's fastest source (16.4 GB/s pinned against 8.9 GB/s through
+    // the narrow-aperture staging ring). The per-token cost becomes the copy
+    // and no longer includes the read.
+    {
+        const auto refused = [] {
+            const char *e = std::getenv("KRK_WEIGHT_HOST_CACHE");
+            return e && *e && e[0] == '0';
+        };
+        size_t streamed_total = 0;
+        for (size_t l = 0; l < layer_stream_bytes_.size(); l++)
+            if (l < stream_.size() && !stream_[l].empty() &&
+                layer_streamed(static_cast<i32>(l)))
+                streamed_total += layer_stream_bytes_[l];
+        // The cap is a ceiling on pinned (non-swappable) RAM, not a tuning knob:
+        // 8 GiB by default, KRK_WEIGHT_HOST_CACHE_MB=<n> to change it. A set
+        // above the cap keeps the read path, which is slower and still correct.
+        size_t cap = size_t(8) << 30;
+        if (const char *e = std::getenv("KRK_WEIGHT_HOST_CACHE_MB")) {
+            if (*e) {
+                const long long mb = std::atoll(e);
+                cap = mb > 0 ? static_cast<size_t>(mb) * 1048576u : 0;
+            }
+        }
+        if (!refused() && streamed_total > 0 && streamed_total <= cap)
+            build_stream_host_mirror(streamed_total);
+        // The one-hop pipeline needs a source that does not move: with the
+        // mirror, every copy reads a fixed slice of pinned memory. Without it the
+        // per-token read would have to stay valid until its copy landed, which is
+        // what the existing two-buffer read path already does, so the double
+        // buffer is simply not enabled there.
+        ring_ahead_ = ring_slots_ > 1 && stream_host_on_;
+        if (ring_slots_ > 1 && !ring_ahead_)
+            KRK_WARN("weight residency: no pinned host mirror, so the second "
+                     "ring slot cannot be used -- staging stays one layer deep");
+        else if (!refused() && streamed_total > cap)
+            KRK_INFO("weight residency: streamed set is %.2f GiB, above the "
+                     "%.2f GiB pinned host-mirror cap -- staging keeps "
+                     "re-reading the file (KRK_WEIGHT_HOST_CACHE_MB)",
+                     static_cast<f64>(streamed_total) / 1073741824.0,
+                     static_cast<f64>(cap) / 1073741824.0);
+    }
 
     // The nextn/MTP block, when the file carries one and the caller asked for
     // it. Not an error if it is absent: most files have none.
@@ -2988,6 +3291,24 @@ bool Model::load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
         out->type = t->type;
         out->n_in = static_cast<i64>(t->ne[0]);
         out->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
+        // The block's own weights carry NVFP4 global scales like the trunk's,
+        // and this uploader is separate from the layer one -- the same sidecar
+        // rule applies, or a block whose checkpoint is NVFP4 (the Lightning
+        // head set) runs every projection unscaled.
+        static const char *kW = ".weight";
+        const size_t wn = std::strlen(kW);
+        const std::string base =
+            t->name.size() > wn && t->name.compare(t->name.size() - wn, wn, kW) == 0
+                ? t->name.substr(0, t->name.size() - wn)
+                : t->name;
+        out->gs = 1.0f;
+        if (const GgufTensor *s = tensor(base + ".scale")) {
+            if (s->data && s->n_elements >= 1 && s->type == DType::F32) {
+                out->gs = reinterpret_cast<const f32 *>(s->data)[0];
+                if (out->gs != 1.0f && out->n_in > max_scaled_in_)
+                    max_scaled_in_ = out->n_in;
+            }
+        }
         m.bytes += static_cast<size_t>(t->n_bytes);
         return true;
     };
@@ -3169,15 +3490,24 @@ bool Model::promote_layer(i32 l) {
             n++;
         }
         be_->read_host_batch(reqs, n);
-        be_->upload_paged_batch(dst, src, len, n);
+        // `src` is stage_host_, which is alloc_host() memory -- already pinned.
+        // The PAGEABLE call is what used to be here, and it costs the host a
+        // full bounce copy through the 4 MiB ring: measured on this card at
+        // 8.8 GB/s for exactly this promotion loop, against 27.5 GB/s for the
+        // pinned batch the staging path uses. The two differ only in which side
+        // of the copy the driver stages, and this source needs none of it.
+        // Each batch writes a fresh region of stage_host_ (`off` only grows),
+        // so the copies can stay in flight; the default stream is ordered after
+        // them by the backend's event, which is what makes the tensors below
+        // safe to read immediately.
+        be_->upload_pinned_batch(dst, src, len, n);
     }
     // Re-point the layer's own tensors. `dst` keeps its ring-relative offset,
     // so only the address the engine reads through changes.
     for (const StreamEntry &e : es)
         if (e.q)
             e.q->data = static_cast<u8 *>(base) +
-                        (static_cast<const u8 *>(e.dst) -
-                         static_cast<const u8 *>(ring_));
+                        (static_cast<const u8 *>(e.dst) - slot_base(l));
     promoted_.emplace_back(base, bytes);
     promoted_bytes_ += moved;
     promoted_layers_++;
@@ -3235,10 +3565,131 @@ void Model::upload_layer_from(const void *host, const std::vector<StreamEntry> &
     }
 }
 
+// Fill the pinned host mirror described at its call site in load(): one
+// allocation, every streamed layer at its own offset, read once. The offsets
+// are the same aligned offsets read_layer_to already writes, so a layer's
+// mirror slice is byte-for-byte what a staging pass would have read for it.
+void Model::build_stream_host_mirror(size_t streamed_total) {
+    if (!be_ || streamed_total == 0) return;
+    void *base = be_->alloc_host(streamed_total);
+    if (!base) {
+        KRK_WARN("weight residency: no %.2f GiB pinned host mirror for the "
+                 "streamed layers -- they will be re-read every step "
+                 "(KRK_WEIGHT_HOST_CACHE=0 silences this arm)",
+                 static_cast<f64>(streamed_total) / 1073741824.0);
+        return;
+    }
+    stream_host_ = base;
+    stream_host_size_ = streamed_total;
+    stream_host_off_.assign(stream_.size(), 0);
+    size_t off = 0;
+    for (size_t l = 0; l < stream_.size(); l++) {
+        if (stream_[l].empty() || !layer_streamed(static_cast<i32>(l))) continue;
+        stream_host_off_[l] = off;
+        off += layer_stream_bytes_[l];
+    }
+    const u64 t0 = now_us();
+    for (i32 l = 0; l < cfg_.n_layer; l++) {
+        if (!layer_streamed(l)) continue;
+        const std::vector<StreamEntry> &es = stream_[static_cast<size_t>(l)];
+        if (es.empty()) continue;
+        read_layer_to(static_cast<u8 *>(stream_host_) +
+                          stream_host_off_[static_cast<size_t>(l)],
+                      es, nullptr);
+    }
+    stream_host_fill_ms_ = static_cast<f64>(now_us() - t0) / 1000.0;
+    stream_host_on_ = true;
+    KRK_INFO("weight residency: %.2f GiB pinned host mirror of %zu streamed "
+             "layer(s) filled in %.0f ms -- staging DMAs from it instead of "
+             "re-reading the file",
+             static_cast<f64>(streamed_total) / 1073741824.0, streamed_layers_,
+             stream_host_fill_ms_);
+}
+
 i32 Model::next_streamed(i32 after) const {
     for (i32 l = after + 1; l < static_cast<i32>(stream_.size()); l++)
         if (layer_streamed(l)) return l;
     return -1;
+}
+
+// Which ring slot layer `l` owns. Parity, not order of use: it is fixed at load
+// so a layer's tensor addresses never move.
+const u8 *Model::slot_base(i32 l) const {
+    if (!ring_ || slot_bytes_ == 0) return static_cast<const u8 *>(ring_);
+    return static_cast<const u8 *>(ring_) +
+           (static_cast<size_t>(l) & 1u) * slot_bytes_;
+}
+
+i32 Model::first_streamed() const {
+    for (i32 l = 0; l < static_cast<i32>(stream_.size()); l++)
+        if (layer_streamed(l)) return l;
+    return -1;
+}
+
+// Fill the slot the NEXT streamed layer owns while this layer's kernels run.
+//
+// Two orderings make that safe and neither blocks the host:
+//   * the copy stream follows `ready`, an event recorded here on the default
+//     stream. That position covers every kernel enqueued so far, which is
+//     exactly the previous reader of the target slot (the layer two before the
+//     one being filled). This layer's own kernels are not enqueued yet, which is
+//     why the copy may start now.
+//   * the default stream follows the copy before the target layer runs, in
+//     stage_layer.
+void Model::issue_ahead(i32 l) {
+    if (!ring_ahead_ || !be_ || !stream_host_on_) return;
+    i32 nl = next_streamed(l);
+    // Wrap at the end of the stack: the last layer then fills the slot the next
+    // pass begins with, and that copy runs under the logits and the sample.
+    if (nl < 0) nl = first_streamed();
+    if (nl < 0 || nl == l) return;
+    const std::vector<StreamEntry> &es = stream_[static_cast<size_t>(nl)];
+    if (es.empty()) return;
+    if (inflight_layer_ >= 0) {
+        // Reachable only when one pass stages the same layer twice: wait the
+        // older copy out rather than overwrite the bytes it is reading.
+        be_->wait_marker_stream(inflight_ticket_);
+        be_->release_marker(inflight_ticket_);
+        inflight_ticket_ = nullptr;
+        inflight_layer_ = -1;
+    }
+    void *ready = be_->make_marker();
+    if (ready) be_->record_marker(ready);
+    const u8 *hb = static_cast<const u8 *>(stream_host_) +
+                   stream_host_off_[static_cast<size_t>(nl)];
+    const u8 *dstb = slot_base(nl);
+    size_t off = 0;
+    void *ticket = nullptr;
+    const size_t total = es.size();
+    for (size_t b = 0; b < total; b += 32) {
+        void *dst[32];
+        const void *src[32];
+        size_t len[32];
+        int n = 0;
+        for (size_t i = b; i < total && n < 32; i++) {
+            const StreamEntry &e = es[i];
+            dst[n] = const_cast<u8 *>(dstb) + off;
+            src[n] = hb + off;
+            len[n] = e.bytes;
+            off += (e.bytes + 255u) & ~size_t(255u);
+            n++;
+        }
+        // Only the first batch needs the readers' marker: the rest are ordered
+        // behind it on the same copy stream.
+        void *t = be_->prefetch_after(dst, src, len, n, b == 0 ? ready : nullptr);
+        if (b + 32 < total) {
+            // Every batch but the last is ordered by its successor on the copy
+            // stream, so its ticket is not the one to wait on.
+            if (t) be_->release_marker(t);
+        } else {
+            ticket = t;
+        }
+    }
+    if (ready) be_->release_marker(ready);
+    if (ticket) {
+        inflight_layer_ = nl;
+        inflight_ticket_ = ticket;
+    }
 }
 
 void Model::stage_layer(i32 l) {
@@ -3250,6 +3701,34 @@ void Model::stage_layer(i32 l) {
     const std::vector<StreamEntry> &es = stream_[static_cast<size_t>(l)];
     if (es.empty()) return;
 
+    const u64 t0 = now_us();
+    if (ring_ahead_ && inflight_layer_ == l) {
+        // The copy for this layer has been in flight since the previous layer's
+        // staging pass. What is left is one device-side ordering -- the host does
+        // not wait, so the time booked here is the enqueue, not the transfer.
+        be_->wait_marker_stream(inflight_ticket_);
+        be_->release_marker(inflight_ticket_);
+        inflight_ticket_ = nullptr;
+        inflight_layer_ = -1;
+        ahead_copies_++;
+        stage_bytes_ += layer_stream_bytes_[static_cast<size_t>(l)];
+        stage_calls_++;
+        stage_ms_ += static_cast<f64>(now_us() - t0) / 1000.0;
+    } else {
+        // Cold: the first streamed layer of the run, or a layer whose prefetch
+        // was skipped. Fill it through the single-slot path so a miss costs
+        // speed, never correctness.
+        if (ring_ahead_) ahead_cold_++;
+        if (!stage_layer_now(l, es)) return;
+    }
+    // The slot just settled, and every kernel of the layers before this one is
+    // enqueued: this is the one point where the next copy can be issued safely.
+    issue_ahead(l);
+}
+
+// The single-slot pass: drain, read, DMA. Without the double buffer this is what
+// every streamed layer pays; with it, only a cold layer does.
+bool Model::stage_layer_now(i32 l, const std::vector<StreamEntry> &es) {
     // The ring is reused by the next layer, and the previous layer's kernels
     // may still be reading it: the copy is published TO the default stream, not
     // FROM it. Drain once before overwriting, or layer l reads layer l+1's
@@ -3259,45 +3738,57 @@ void Model::stage_layer(i32 l) {
     be_->sync();
     const u64 t_sync = now_us();
 
-    // Which pinned buffer holds this layer. The previous staging pass read it
-    // while THIS layer's predecessor was still copying, which is the overlap
-    // this function exists to create; on the first streamed layer there is
-    // nothing to inherit and the read happens here.
-    int slot = -1;
-    if (prefetched_layer_ == l && read_buf_[prefetched_slot_]) slot = prefetched_slot_;
     size_t bytes = 0;
-    if (slot < 0) {
-        slot = 0;
-        const u64 tr = now_us();
-        read_layer_to(read_buf_[slot], es, &bytes);
-        stage_read_ms_ += static_cast<f64>(now_us() - tr) / 1000.0;
-    } else {
+    const void *src = nullptr;
+    // With the pinned mirror, this layer's bytes are already in host memory and
+    // no read happens at all: the pass is the drain plus the DMA. Without it,
+    // the pass reads the layer into a pinned buffer and DMAs from there, and the
+    // next layer's read rides on the spare buffer while this copy is in flight.
+    if (stream_host_on_) {
         for (const StreamEntry &e : es) bytes += e.bytes;
-    }
-    prefetched_layer_ = -1;
+        src = static_cast<const u8 *>(stream_host_) +
+              stream_host_off_[static_cast<size_t>(l)];
+    } else {
+        // Which pinned buffer holds this layer. The previous staging pass read it
+        // while THIS layer's predecessor was still copying, which is the overlap
+        // this function exists to create; on the first streamed layer there is
+        // nothing to inherit and the read happens here.
+        int slot = -1;
+        if (prefetched_layer_ == l && read_buf_[prefetched_slot_]) slot = prefetched_slot_;
+        if (slot < 0) {
+            slot = 0;
+            const u64 tr = now_us();
+            read_layer_to(read_buf_[slot], es, &bytes);
+            stage_read_ms_ += static_cast<f64>(now_us() - tr) / 1000.0;
+        } else {
+            for (const StreamEntry &e : es) bytes += e.bytes;
+        }
+        prefetched_layer_ = -1;
+        src = read_buf_[slot];
 
-    // Publish this layer's copy, then read the NEXT layer into the spare
-    // buffer while those bytes are still moving over PCIe. The copy is a DMA on
-    // a side stream (upload_pinned_batch), so the host thread is free
-    // immediately; the read is the half that used to wait for it.
+        // Read the NEXT layer into the spare buffer while this layer's copy is
+        // still moving over PCIe. The copy is a DMA on a side stream, so the host
+        // thread is free immediately; the read is the half that used to wait.
+        const i32 nl = prefetch_enabled_ ? next_streamed(l) : -1;
+        const int nslot = 1 - slot;
+        if (read_buf_[nslot] && nl >= 0) {
+            const u64 tr = now_us();
+            read_layer_to(read_buf_[nslot], stream_[static_cast<size_t>(nl)], nullptr);
+            stage_prefetch_ms_ += static_cast<f64>(now_us() - tr) / 1000.0;
+            prefetched_layer_ = nl;
+            prefetched_slot_ = nslot;
+        }
+    }
+
     const u64 tx = now_us();
-    upload_layer_from(read_buf_[slot], es);
+    upload_layer_from(src, es);
     stage_xfer_ms_ += static_cast<f64>(now_us() - tx) / 1000.0;
-
-    const i32 nl = prefetch_enabled_ ? next_streamed(l) : -1;
-    const int nslot = 1 - slot;
-    if (read_buf_[nslot] && nl >= 0) {
-        const u64 tr = now_us();
-        read_layer_to(read_buf_[nslot], stream_[static_cast<size_t>(nl)], nullptr);
-        stage_prefetch_ms_ += static_cast<f64>(now_us() - tr) / 1000.0;
-        prefetched_layer_ = nl;
-        prefetched_slot_ = nslot;
-    }
 
     stage_sync_ms_ += static_cast<f64>(t_sync - t0) / 1000.0;
     stage_ms_ += static_cast<f64>(now_us() - t0) / 1000.0;
     stage_calls_++;
     stage_bytes_ += bytes;
+    return true;
 }
 
 void Model::unload() {
@@ -3339,6 +3830,10 @@ void Model::unload() {
             return ring_ && p >= ring_ &&
                    p < static_cast<const u8 *>(ring_) + ring_bytes_;
         };
+        // ... and the resident slab is the same story, one level down.
+        auto in_slab = [&](const void *p) {
+            return slab_ && p >= slab_ && p < slab_ + slab_bytes_;
+        };
         // A promoted layer's tensors are interior pointers into one base that
         // is released once below; releasing each of them would free one
         // interior pointer per tensor.
@@ -3350,7 +3845,8 @@ void Model::unload() {
             return false;
         };
         for (QuantTensor *q : qt_fields(L))
-            if (q->present() && !in_ring(q->data) && !in_promoted(q->data))
+            if (q->present() && !in_ring(q->data) && !in_promoted(q->data) &&
+                !in_slab(q->data))
                 be_->release(q->data);
         if (L.ssm_d) be_->release(L.ssm_d);
     }
@@ -3367,12 +3863,31 @@ void Model::unload() {
     read_buf_[0] = nullptr;
     read_buf_[1] = nullptr;
     prefetched_layer_ = -1;
+    if (inflight_ticket_) be_->release_marker(inflight_ticket_);
+    inflight_ticket_ = nullptr;
+    inflight_layer_ = -1;
+    ring_ahead_ = false;
+    ring_slots_ = 1;
+    slot_bytes_ = 0;
+    ahead_copies_ = 0;
+    ahead_cold_ = 0;
+    ahead_wait_ms_ = 0;
+    if (stream_host_) be_->release_host(stream_host_);
+    stream_host_ = nullptr;
+    stream_host_off_.clear();
+    stream_host_on_ = false;
+    stream_host_size_ = 0;
+    stream_host_fill_ms_ = 0;
     for (const auto &b : promoted_) be_->release(b.first);
     promoted_.clear();
     promoted_bytes_ = 0;
     promoted_layers_ = 0;
     promote_ms_ = 0;
     layer_stream_bytes_.clear();
+    if (slab_) be_->release(slab_);
+    slab_ = nullptr;
+    slab_bytes_ = 0;
+    slab_off_ = 0;
     if (stage_host_) be_->release_host(stage_host_);
     if (ring_) be_->release(ring_);
     stage_host_ = nullptr;

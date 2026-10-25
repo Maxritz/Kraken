@@ -83,28 +83,63 @@ void build_inv_freq(std::vector<f32> &tab, i32 n_dims, f32 base) {
 } // namespace
 
 bool dflash_arch(std::string_view arch) {
-    // `dflash` is what poolside's converter emits today; `qwen35-dflash-draft`
-    // is the older spelling of the same object (see the header). Both are head
-    // sets, and neither is anything else.
-    return arch == "dflash" || arch == "qwen35-dflash-draft";
+    // Three spellings of the same object, all head sets and nothing else:
+    //   `dflash`            the in-house converter's output
+    //   `qwen35-dflash-draft` its older name, with `dflash.*` tensor names
+    //   `dflash-draft`      poolside's own Laguna export (dflash_fc.weight,
+    //                       dflash_hidden_norm.weight, dflash_aux_hidden_norm.N)
+    return arch == "dflash" || arch == "qwen35-dflash-draft" ||
+           arch == "dflash-draft";
 }
 
-// The two spellings, in one place: each call tries the current name and then the
-// older one, so the rest of the loader can read as if there were one file format.
+// Every spelling of one tensor, in one place: each call tries the current name
+// and then the older ones, so the rest of the loader can read as if there were
+// one file format. `older` is optional; `oldest` is the underscore spelling the
+// Laguna export uses, where the prefix is part of the tensor name rather than a
+// namespace (`dflash_fc.weight`, not `dflash.fc.weight`).
 static const GgufTensor *either(const Gguf &g, const char *current,
-                               const char *legacy) {
+                               const char *legacy,
+                               const char *oldest = nullptr) {
     if (const GgufTensor *t = g.tensor(current)) return t;
-    return legacy ? g.tensor(legacy) : nullptr;
+    if (legacy)
+        if (const GgufTensor *t = g.tensor(legacy)) return t;
+    return oldest ? g.tensor(oldest) : nullptr;
 }
 
 DflashDraft::~DflashDraft() { unload(); }
+
+void DflashDraft::use_target_out_norm(const f32 *gain) {
+    // ALIASED, not copied. The pointer the engine hands over is the backend's own
+    // weight handle (device memory on HIP, host memory on the CPU backend), which
+    // is exactly what a norm call takes; copying from it would be a host memcpy
+    // out of device memory, which is how the first version of this crashed.
+    // Non-owning: the Model keeps it for the run's lifetime, so unload() must not
+    // release it.
+    out_norm_tgt_ = gain;
+}
+
+// dst = x * W^T with the weight's NVFP4 global scale (see the header, and
+// Engine::gemm_w for the trunk's copy of the same rule).
+void DflashDraft::gemm_w(void *dst, const void *x, const QuantTensor &w,
+                         i64 n_out, i64 n_in, i64 rows) {
+    if (w.gs == 1.0f) {
+        be_->gemm(dst, x, w.data, w.type, n_out, n_in, rows);
+        return;
+    }
+    // The scale rides the INPUT: the stored tensor is 1/gs too large, so the raw
+    // product is too, and this store is f16 -- an output scale would be applied
+    // to a value that already saturated.
+    be_->copy_act(ws_gs_, x, rows * n_in);
+    be_->scale_act(ws_gs_, w.gs, rows, n_in, n_in);
+    be_->gemm(dst, ws_gs_, w.data, w.type, n_out, n_in, rows);
+}
 
 void DflashDraft::unload() {
     if (be_) {
         be_->sync();
         for (void **p : {&cap_, &feat_, &enc_out_, &ws_x_, &ws_xn_, &ws_x2_,
                          &ws_q_, &ws_k_, &ws_v_, &ws_attn_, &ws_gate_, &ws_up_,
-                         &ws_agate_, &ws_logits_, &kcache_, &vcache_}) {
+                         &ws_agate_, &ws_logits_, &ws_gs_, &kcache_, &vcache_}) {
             if (*p) {
                 be_->release(*p);
                 *p = nullptr;
@@ -139,7 +174,8 @@ void DflashDraft::unload() {
 }
 
 bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
-                       i32 target_embd, i32 target_layer_count, std::string *err) {
+                       i32 target_embd, i32 target_layer_count, i32 target_vocab,
+                       std::string *err) {
     be_ = &be;
     chunk_ = std::max<i64>(1, chunk);
     gguf_ = std::make_unique<Gguf>();
@@ -150,7 +186,7 @@ bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
     if (!dflash_arch(cfg_.arch)) {
         if (err)
             *err = "not a DFlash head set: general.architecture is '" + cfg_.arch +
-                   "' (expected dflash or qwen35-dflash-draft)";
+                   "' (expected dflash, qwen35-dflash-draft or dflash-draft)";
         return false;
     }
 
@@ -178,7 +214,25 @@ bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
         cfg_.head_dim = cfg_.n_embd / cfg_.n_head;
     cfg_.rms_eps = static_cast<f32>(
         gguf_->get_f64(key(".attention.layer_norm_rms_epsilon"), 1e-6));
+    // The block borrows the TARGET's head, so the vocabulary that matters is the
+    // target's -- `vocab_size` only says which one the set was built for, and
+    // the Laguna export does not even write it. Zero here used to mean a
+    // zero-sized logits workspace, i.e. a drafter that loads and drafts nothing,
+    // so an undeclared vocabulary falls back to the target's and a declared one
+    // that disagrees is refused below.
     cfg_.n_vocab = static_cast<i32>(gguf_->get_i64(key(".vocab_size"), 0));
+    const i32 declared_vocab = cfg_.n_vocab;
+    if (target_vocab > cfg_.n_vocab) cfg_.n_vocab = target_vocab;
+    if (declared_vocab > 0 && target_vocab > 0 && declared_vocab != target_vocab)
+        KRK_WARN("dflash: head set declares a %d-token vocabulary, the target has "
+                 "%d; the block borrows the target's head and embedding, so the "
+                 "wider of the two sizes every workspace",
+                 declared_vocab, target_vocab);
+    if (cfg_.n_vocab <= 0) {
+        if (err) *err = "DFlash head set has no vocabulary: neither the file nor "
+                        "the target declares one";
+        return false;
+    }
     // The drafter's own context ceiling. It is larger than any target's in both
     // files here, so the target's context is what actually bounds the cache.
     cfg_.n_ctx_train = static_cast<i32>(gguf_->get_i64(key(".context_length"), 0));
@@ -409,6 +463,11 @@ bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
         return false;
     }
 
+    // The staged copy a scaled weight's input is scaled into (load_weights has
+    // already recorded the widest contraction such a weight needs). Nothing is
+    // allocated for a head set with no sidecar, which is every non-NVFP4 one.
+    if (gs_in_ > 0)
+        ws_gs_ = be.alloc(static_cast<size_t>(C * gs_in_) * as);
     cap_ = be.alloc(static_cast<size_t>(capture_stride() * n_aux()) * as);
     feat_ = be.alloc(static_cast<size_t>(C * n_embd_enc_) * as);
     enc_out_ = be.alloc(static_cast<size_t>(C * cfg_.n_embd) * as);
@@ -540,14 +599,34 @@ bool DflashDraft::load_weights(std::string *err) {
         }
         q.n_in = n_in;
         q.n_out = n_out;
+        // NVFP4's per-tensor global scale, stored BESIDE the weight as
+        // "<tensor>.scale". A head set can be quantized like any other file
+        // (the Lightning MTP sets are), and this uploader is separate from the
+        // trunk's -- without this, every block projection would run unscaled.
+        static const char *kW = ".weight";
+        const size_t wn = std::strlen(kW);
+        const std::string base =
+            name.size() > wn && name.compare(name.size() - wn, wn, kW) == 0
+                ? name.substr(0, name.size() - wn)
+                : name;
+        q.gs = 1.0f;
+        if (const GgufTensor *s = gguf_->tensor(base + ".scale")) {
+            if (s->data && s->n_elements >= 1 && s->type == DType::F32) {
+                q.gs = reinterpret_cast<const f32 *>(s->data)[0];
+                if (q.gs != 1.0f && q.n_in > gs_in_) gs_in_ = q.n_in;
+            }
+        }
         return q;
     };
 
     // ---- the fusion projection and the two encoder/decoder norms ----------
     {
-        const GgufTensor *t = either(*gguf_, "fc.weight", "dflash.fc.weight");
+        const GgufTensor *t = either(*gguf_, "fc.weight", "dflash.fc.weight",
+                                     "dflash_fc.weight");
         if (!t) {
-            if (err) *err = "DFlash head set has no fusion projection (fc.weight)";
+            if (err)
+                *err = "DFlash head set has no fusion projection (fc.weight / "
+                       "dflash.fc.weight / dflash_fc.weight)";
             return false;
         }
         fc_ = upload_w(t, t->name, 0, 0);
@@ -564,7 +643,8 @@ bool DflashDraft::load_weights(std::string *err) {
     }
     {
         const GgufTensor *t = either(*gguf_, "enc.output_norm.weight",
-                                     "dflash.hidden_norm.weight");
+                                     "dflash.hidden_norm.weight",
+                                     "dflash_hidden_norm.weight");
         if (!t) {
             if (err) *err = "DFlash head set has no encoder output norm";
             return false;
@@ -595,8 +675,10 @@ bool DflashDraft::load_weights(std::string *err) {
             aux_norm_host_.assign(
                 static_cast<size_t>(cfg_.n_embd) * static_cast<size_t>(n_aux()), 0.0f);
             for (i32 a = 0; a < n_aux(); a++) {
-                const GgufTensor *n = gguf_->tensor(
-                    format("dflash.aux_hidden_norm.%d.weight", a));
+                const GgufTensor *n = either(
+                    *gguf_, format("aux_hidden_norm.%d.weight", a).c_str(),
+                    format("dflash.aux_hidden_norm.%d.weight", a).c_str(),
+                    format("dflash_aux_hidden_norm.%d.weight", a).c_str());
                 if (!n) {
                     if (err)
                         *err = format("DFlash head set has neither enc.aux_norm nor "
@@ -644,7 +726,12 @@ bool DflashDraft::load_weights(std::string *err) {
         auto bn = [&](const char *fmt) { return format(fmt, l); };
 
         L.attn_norm = upload_f32_w(gguf_->tensor(bn("blk.%d.attn_norm.weight")));
-        L.ffn_norm = upload_f32_w(gguf_->tensor(bn("blk.%d.ffn_norm.weight")));
+        // The norm that feeds the FFN. The Laguna export calls it
+        // `post_attention_norm` (it is the norm *after* attention, which is the
+        // same tensor by position); the in-house files call it `ffn_norm`.
+        L.ffn_norm = upload_f32_w(
+            either(*gguf_, bn("blk.%d.ffn_norm.weight").c_str(),
+                   bn("blk.%d.post_attention_norm.weight").c_str()));
         if (!L.attn_norm || !L.ffn_norm) {
             if (err) *err = format("DFlash layer %d is missing its norm weights", l);
             return false;
@@ -741,7 +828,7 @@ bool DflashDraft::commit(i32 pos0, i32 n) {
     // ---- fc, then the encoder's output norm -------------------------------
     // `enc_out_` is what the reference calls inp_g: the drafter's context K/V
     // source, not an embedding.
-    be_->gemm(ws_x2_, feat_, fc_.data, fc_.type, E, static_cast<i64>(enc), n);
+    gemm_w(ws_x2_, feat_, fc_, E, static_cast<i64>(enc), n);
     be_->rmsnorm(enc_out_, ws_x2_, enc_out_norm_, n, E, cfg_.rms_eps);
     {   // KRK_DFLASH_KV_ZERO=1 empties the injection. The block's rows must
         // move when the context they read is emptied; if they do not, the block
@@ -814,8 +901,8 @@ bool DflashDraft::commit(i32 pos0, i32 n) {
             be_->rmsnorm(ws_xn_, enc_out_, L.attn_norm, n, E, cfg_.rms_eps);
             kv_inp = ws_xn_;
         }
-        be_->gemm(ws_k_, kv_inp, L.wk.data, L.wk.type, kv_dim, E, n);
-        be_->gemm(ws_v_, kv_inp, L.wv.data, L.wv.type, kv_dim, E, n);
+        gemm_w(ws_k_, kv_inp, L.wk, kv_dim, E, n);
+        gemm_w(ws_v_, kv_inp, L.wv, kv_dim, E, n);
         // Only K is carried through the head norm and the rotation; the query
         // half of rope() is handed the scratch buffer, which is rotated and
         // discarded. Passing a null there would have to be a special case in two
@@ -830,6 +917,12 @@ bool DflashDraft::commit(i32 pos0, i32 n) {
         be_->kv_append(kcache_, vcache_, ws_k_, ws_v_, d);
     }
     committed_ += n;
+    // The capture slots are written from row 0 on every commit, so the row that
+    // belongs to the LAST committed position is row n-1 of the last commit --
+    // after a prefill of 6 that is position 5, not position 0. The readout base
+    // reads it, and reading row 0 instead is the difference between the token's
+    // own pre-final state and the prompt's first one.
+    last_commit_n_ = n;
     return true;
 }
 
@@ -841,12 +934,15 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
     const bool dfdbg_kv = std::getenv("KRK_DFLASH_DEBUG") != nullptr;
     const i32 nt = n_draft + 1; // id_last + n_draft masks
 
-    // The block is placed so that mask row k lands on position pos+k: id_last
-    // goes back to the position it already occupies, and the masks take the
-    // positions the candidates are for. That is the layout the reference driver
-    // builds ([id_last, <mask> * n_draft] at positions pos .. pos+n_draft) read
-    // from the next free position instead of the last filled one, and it is what
-    // makes block row k the candidate for pos+k rather than for pos+k+1.
+    // The block is placed so that row k lands on position blk_pos+k, where
+    // blk_pos = pos + block_base_. With the default base of 0, row 0 (id_last)
+    // sits at pos, which is the position the last token ALREADY occupies in the
+    // injected cache (its own row is at pos-1 there), so row 1 -- the first mask
+    // row, at pos+1 -- is read out as the candidate for pos. The two readings
+    // disagree by one position, which is what KRK_DFLASH_BLOCK_POS=-1 selects
+    // (row 1 at pos). Measured on the Laguna pair: both arms accept 0 proposals
+    // while the readout is wrong (see the note in the readout), so this is not
+    // the lever that moves acceptance -- do not read the default as verified.
     const i32 blk_pos = pos + block_base_;
     if (blk_pos < 0) return 0;
 
@@ -863,7 +959,21 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
     be_->embed(ws_x_, tok_embd.data, tok_embd.type, n_vocab, E, block_tok_.data(), nt);
     // Some drafters are trained with the mask rows carrying no token information
     // at all; the flag says so and the embedding is cleared for those rows.
-    if (zero_mask_embed_ && nt > 1)
+    // KRK_DFLASH_ROW0_FEATURE=1 feeds row 0 the fused feature instead of the
+    // last token's embedding. That is the remaining reading of the block's input
+    // contract: the drafter has no embedding of its own, and its context arrives
+    // as features, so the row that has no mask may be the feature row too.
+    {
+        const char *r0f = std::getenv("KRK_DFLASH_ROW0_FEATURE");
+        if (r0f != nullptr && r0f[0] != '0') {
+            const i64 src_row = last_commit_n_ > 0 ? last_commit_n_ - 1 : 0;
+            be_->copy_act(act_at(ws_x_, as, 0),
+                          act_at(enc_out_, as, src_row * E), E);
+        }
+    }
+    const char *zm = std::getenv("KRK_DFLASH_ZERO_MASK");
+    const bool zero_mask = zero_mask_embed_ || (zm != nullptr && zm[0] != '0');
+    if (zero_mask && nt > 1)
         be_->fill0(act_at(ws_x_, as, E),
                    static_cast<size_t>(nt - 1) * static_cast<size_t>(E) * as);
 
@@ -877,6 +987,16 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
     d.pos_stride = kv_dim;
     d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(hd)));
     d.causal = causal_;
+    // KRK_DFLASH_SELF_MASK=1: each candidate row sees the context and its own
+    // row, not the block's other candidates. They are parallel predictions for
+    // other positions, so a sibling carries no answer for this row -- and with a
+    // plain causal block every row reads all its predecessors' (dead) mask rows.
+    // The range starts at the first MASK row (blk_pos + 1), not at blk_pos: row
+    // 0 is id_last, the token the block continues from, and it is a legitimate
+    // key for every candidate. Only the mask rows -- each one a candidate for a
+    // different position -- are hidden from their siblings.
+    if (const char *sm = std::getenv("KRK_DFLASH_SELF_MASK"))
+        if (sm[0] != '0') d.skip_from = blk_pos + 1;
 
     // KRK_DFLASH_PROBE=1: the candidate row's readout AFTER EVERY LAYER -- the
     // same out_norm + head the final readout uses, applied to row 1's
@@ -892,8 +1012,7 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
         const i64 r1 = E;   // row 1 = the first candidate row
         be_->rmsnorm(ws_xn_, act_at(ws_x_, as, r1), out_norm_, 1, E,
                      cfg_.rms_eps);
-        be_->gemm(act_at(ws_logits_, as, 0), ws_xn_, lm_head.data,
-                  lm_head.type, n_vocab, E, 1);
+        gemm_w(act_at(ws_logits_, as, 0), ws_xn_, lm_head, n_vocab, E, 1);
         be_->download_f32(tmp_host_.data(), act_at(ws_logits_, as, 0), n_vocab);
         f32 b[3] = {-1e30f, -1e30f, -1e30f};
         i32 bi[3] = {-1, -1, -1};
@@ -934,15 +1053,18 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
         // takes it while a mixed-dtype target often does not.
         const bool qkv_group = std::getenv("KRK_DFLASH_QKV_GROUP") == nullptr ||
                                std::getenv("KRK_DFLASH_QKV_GROUP")[0] != '0';
-        if (qkv_group && L.wq.type == L.wk.type && L.wk.type == L.wv.type) {
+        // One launch cannot carry three different global scales, and an NVFP4
+        // head set picks each tensor's format on its own.
+        if (qkv_group && L.wq.type == L.wk.type && L.wk.type == L.wv.type &&
+            !L.wq.scaled() && !L.wk.scaled() && !L.wv.scaled()) {
             void *qkv[3] = {ws_q_, ws_k_, ws_v_};
             const void *wqkv[3] = {L.wq.data, L.wk.data, L.wv.data};
             const i64 nqkv[3] = {q_dim, kv_dim, kv_dim};
             be_->gemm_group(qkv, ws_xn_, wqkv, L.wq.type, nqkv, E, 3, nt);
         } else {
-            be_->gemm(ws_q_, ws_xn_, L.wq.data, L.wq.type, q_dim, E, nt);
-            be_->gemm(ws_k_, ws_xn_, L.wk.data, L.wk.type, kv_dim, E, nt);
-            be_->gemm(ws_v_, ws_xn_, L.wv.data, L.wv.type, kv_dim, E, nt);
+            gemm_w(ws_q_, ws_xn_, L.wq, q_dim, E, nt);
+            gemm_w(ws_k_, ws_xn_, L.wk, kv_dim, E, nt);
+            gemm_w(ws_v_, ws_xn_, L.wv, kv_dim, E, nt);
         }
         be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, nh, nkv, hd, nt,
                      cfg_.rms_eps, false);
@@ -1220,8 +1342,7 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
             // Softplus output gate off the same hidden state q/k/v read -- the
             // laguna drafter's own gate, per-head or per-element by width.
             const i64 g_out = static_cast<i64>(L.wattn_gate.n_out);
-            be_->gemm(ws_agate_, ws_xn_, L.wattn_gate.data, L.wattn_gate.type,
-                      g_out, E, nt);
+            gemm_w(ws_agate_, ws_xn_, L.wattn_gate, g_out, E, nt);
             be_->softplus_act(ws_agate_, static_cast<i64>(nt) * g_out);
             if (g_out == nh)
                 be_->mul_head_broadcast(ws_attn_, ws_agate_, nt, nh, hd);
@@ -1248,7 +1369,7 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
                 std::fputc(10, stderr);
             }
         }
-        be_->gemm(ws_x2_, ws_attn_, L.wo.data, L.wo.type, E, q_dim, nt);
+        gemm_w(ws_x2_, ws_attn_, L.wo, E, q_dim, nt);
         be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(nt) * E);
 
         // KRK_DFLASH_RES_TRACE must read the attention sublayer's contribution
@@ -1277,17 +1398,20 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
         // same unverified-fusion question as the QKV group above.
         const bool ffn_group = std::getenv("KRK_DFLASH_FFN_GROUP") == nullptr ||
                                std::getenv("KRK_DFLASH_FFN_GROUP")[0] != '0';
-        if (ffn_group && L.wgate.type == L.wup.type) {
+        // Same rule, and here the pair's activation is a silu across both, so a
+        // per-matrix scale has to be applied before it.
+        if (ffn_group && L.wgate.type == L.wup.type && !L.wgate.scaled() &&
+            !L.wup.scaled()) {
             void *gu[2] = {ws_gate_, ws_up_};
             const void *wgu[2] = {L.wgate.data, L.wup.data};
             const i64 ngu[2] = {cfg_.n_ff, cfg_.n_ff};
             be_->gemm_group(gu, ws_xn_, wgu, L.wgate.type, ngu, E, 2, nt);
         } else {
-            be_->gemm(ws_gate_, ws_xn_, L.wgate.data, L.wgate.type, cfg_.n_ff, E, nt);
-            be_->gemm(ws_up_, ws_xn_, L.wup.data, L.wup.type, cfg_.n_ff, E, nt);
+            gemm_w(ws_gate_, ws_xn_, L.wgate, cfg_.n_ff, E, nt);
+            gemm_w(ws_up_, ws_xn_, L.wup, cfg_.n_ff, E, nt);
         }
         be_->silu_mul(ws_gate_, ws_gate_, ws_up_, static_cast<i64>(nt) * cfg_.n_ff);
-        be_->gemm(ws_x2_, ws_gate_, L.wdown.data, L.wdown.type, E, cfg_.n_ff, nt);
+        gemm_w(ws_x2_, ws_gate_, L.wdown, E, cfg_.n_ff, nt);
         be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(nt) * E);
 
         // Same row, three numbers: the residual's own scale (carried intact to
@@ -1320,11 +1444,82 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
 
     // Mask rows only: row 0 carries id_last, whose token is already known, so
     // its logits are not a draft. Row k (1-based) is the candidate for pos+k-1.
+    //
+    // KRK_DFLASH_READOUT_BASE=1 adds the target's pre-final-norm hidden state --
+    // the LAST captured feature block, which is the row the drafter's own fc
+    // consumed -- to every candidate row before the readout norm. That is the
+    // EAGLE contract: the block predicts a *correction*, and the head has only
+    // ever seen target-scale hidden states. Without it the row is fed to the head
+    // at the correction's own scale, which reads as a near-uniform distribution
+    // whatever the block computed. Gated because it is a contract question, not a
+    // tuning knob: the two arms are compared by accepted tokens, not by taste.
+    const char *base_env = std::getenv("KRK_DFLASH_READOUT_BASE");
+    const bool base_on = base_env != nullptr && base_env[0] != '0';
+    std::vector<f32> base_host;
+    if (base_on) {
+        base_host.assign(static_cast<size_t>(E), 0.0f);
+        // The pre-final state of the LAST committed position: the last aux slot,
+        // row (n-1) of the commit that preceded this round.
+        const i64 base_row =
+            last_commit_n_ > 0 ? static_cast<i64>(last_commit_n_) - 1 : 0;
+        be_->download_f32(base_host.data(),
+                          act_at(capture_slot(n_aux() - 1), be_->act_size(),
+                                 base_row * E),
+                          E);
+        f64 br = 0.0;
+        for (i64 i = 0; i < E; i++)
+            br += static_cast<f64>(base_host[static_cast<size_t>(i)]) *
+                  static_cast<f64>(base_host[static_cast<size_t>(i)]);
+        if (dfdbg_kv)
+            std::fprintf(stderr, "[dfbase] pre-final capture rms %.6g\n",
+                         std::sqrt(br / static_cast<f64>(E)));
+        // The base-only arm reads the base through the same buffer the summed
+        // arm uses, so the two differ by one addition and nothing else.
+        if (std::getenv("KRK_DFLASH_READOUT_ONLY_BASE") != nullptr &&
+            std::getenv("KRK_DFLASH_READOUT_ONLY_BASE")[0] != '0')
+            upload_act(*be_, ws_x2_, base_host.data(), E);
+    }
+    // KRK_DFLASH_READOUT_ONLY_BASE=1 drops the block's delta entirely and reads
+    // the base alone. That is the falsifier for the whole delta contract: the
+    // target's own pre-final state through the target's own norm and head MUST
+    // reproduce the target's greedy token, and if it does, every wrong number
+    // afterwards belongs to the block and not to the capture.
+    const char *only_env = std::getenv("KRK_DFLASH_READOUT_ONLY_BASE");
+    const bool only_base = only_env != nullptr && only_env[0] != '0';
+    std::vector<f32> row_host;
     for (i32 r = 1; r < nt; r++) {
         const void *row = act_at(ws_x_, as, static_cast<i64>(r) * E);
-        be_->rmsnorm(ws_xn_, row, out_norm_, 1, E, cfg_.rms_eps);
-        be_->gemm(act_at(ws_logits_, as, static_cast<i64>(r - 1) * n_vocab), ws_xn_,
-                  lm_head.data, lm_head.type, n_vocab, E, 1);
+        // KRK_DFLASH_DELTA_SCALE scales the block's delta before it is added to
+        // the base. A correction that is trained at a fixed amplitude and one
+        // that is simply the wrong correction read differently across this
+        // sweep: the first has one scale at which the target's token returns to
+        // the top, the second has none.
+        f64 dscale = 1.0;
+        if (const char *ds = std::getenv("KRK_DFLASH_DELTA_SCALE"))
+            dscale = std::atof(ds);
+        if (only_base && base_on) {
+            row = ws_x2_;
+        } else if (base_on) {
+            row_host.resize(static_cast<size_t>(E));
+            be_->download_f32(row_host.data(), row, E);
+            for (i64 i = 0; i < E; i++)
+                row_host[static_cast<size_t>(i)] = static_cast<f32>(
+                    base_host[static_cast<size_t>(i)] +
+                    dscale * static_cast<f64>(row_host[static_cast<size_t>(i)]));
+            upload_act(*be_, ws_x2_, row_host.data(), E);
+            row = ws_x2_;
+        }
+        // KRK_DFLASH_READOUT_NORM=target selects the target's final-norm gain
+        // for the readout; anything else keeps this file's own. The two arms
+        // differ only in that per-channel mask, so the accepted-token count is
+        // the whole comparison.
+        const char *rn = std::getenv("KRK_DFLASH_READOUT_NORM");
+        const bool rn_target =
+            (only_base || (rn != nullptr && std::strcmp(rn, "target") == 0)) &&
+            out_norm_tgt_ != nullptr;
+        be_->rmsnorm(ws_xn_, row, rn_target ? out_norm_tgt_ : out_norm_, 1, E,
+                     cfg_.rms_eps);
+        gemm_w(act_at(ws_logits_, as, static_cast<i64>(r - 1) * n_vocab), ws_xn_, lm_head, n_vocab, E, 1);
     }
     be_->download_f32(rows_out, ws_logits_,
                       static_cast<i64>(n_draft) * n_vocab);
@@ -1334,6 +1529,22 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
     // from one whose features never reached it. The distinction is the whole
     // diagnosis: a displaced row still puts the right token first among its
     // neighbours, a starved one puts the same few tokens everywhere.
+    // KRK_DFLASH_WATCH=id[,id...] prints, for every drafted row, the rank and
+    // logit of the tokens the TARGET itself chose. That is the one number that
+    // separates the two failure modes this drafter can have: a row whose watched
+    // token sits just below the top is a displaced row (a position, an order or a
+    // readout scale), and a row where it sits at the mean is a starved one (the
+    // features never reached it, and no readout tweak will help).
+    std::vector<i32> watch;
+    if (const char *w = std::getenv("KRK_DFLASH_WATCH")) {
+        const char *p = w;
+        while (*p) {
+            watch.push_back(static_cast<i32>(std::atoi(p)));
+            const char *c = std::strchr(p, ',');
+            if (!c) break;
+            p = c + 1;
+        }
+    }
     if (std::getenv("KRK_DFLASH_DEBUG")) {
         for (i32 r = 0; r < n_draft; r++) {
             const f32 *row = rows_out + static_cast<size_t>(r) * n_vocab;
@@ -1361,6 +1572,17 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
                          static_cast<long long>(blocks_), blk_pos, r, bid[0],
                          static_cast<f64>(best[0]), bid[1], static_cast<f64>(best[1]),
                          bid[2], static_cast<f64>(best[2]), mean);
+            for (i32 wtok : watch) {
+                if (wtok < 0 || wtok >= n_vocab) continue;
+                const f32 wl = row[wtok];
+                i32 rank = 0;
+                for (i32 v = 0; v < n_vocab; v++)
+                    if (row[v] > wl) rank++;
+                std::fprintf(stderr, "[dfwatch] row=%d tok=%d rank=%d/%d logit=%.6g "
+                                     "(top %.6g)\n",
+                             r, wtok, rank, n_vocab, static_cast<f64>(wl),
+                             static_cast<f64>(best[0]));
+            }
         }
         std::fflush(stderr);
     }

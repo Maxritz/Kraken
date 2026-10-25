@@ -1,8 +1,10 @@
 // common.cpp — logging, allocation, half conversion, file mapping, timing.
 #include "krk/common.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <ctime>
+#include <mutex>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -73,7 +75,10 @@ void *host_realloc(void *p, size_t bytes, size_t alignment) {
     return q;
 }
 
-size_t host_available_bytes() {
+// The raw probe. `GlobalMemoryStatusEx` is a kernel call and the staging paths
+// ask it once per expert (10,240 times for this model), so the public entry
+// point memoises it -- see host_available_bytes below.
+static size_t host_available_probe() {
 #if defined(_WIN32)
     MEMORYSTATUSEX st;
     st.dwLength = sizeof(st);
@@ -107,6 +112,23 @@ size_t host_available_bytes() {
     if (pages <= 0 || page <= 0) return 0;
     return static_cast<size_t>(pages) * static_cast<size_t>(page);
 #endif
+}
+
+// 20 ms of memoisation in front of the probe. The number is compared against a
+// reserve measured in gigabytes, so a stale-by-20 ms reading cannot change an
+// admission decision; the syscall it saves, multiplied by 10,240 experts, is
+// inside a load phase that already spends seconds preparing batches.
+size_t host_available_bytes() {
+    static std::mutex m;
+    static std::chrono::steady_clock::time_point stamp;
+    static size_t value = 0;
+    std::lock_guard<std::mutex> lock(m);
+    const std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now();
+    if (value != 0 && now - stamp < std::chrono::milliseconds(20)) return value;
+    value = host_available_probe();
+    stamp = now;
+    return value;
 }
 
 size_t host_total_bytes() {

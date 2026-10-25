@@ -2360,6 +2360,556 @@ static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
     return b.write(path);
 }
 
+// A two-layer qwen2moe whose MoE layers carry DIFFERENT expert counts and
+// top-k. This is the packed-merge shape (Nemotron Bolt 74B-A9B: 240/304/368/432/
+// 496 experts under one `expert_count` of 496, with `expert_used_count` written
+// as a per-block array). `expert_count` is the CAP here -- 5 -- while layer 0
+// keeps 3 experts and layer 1 keeps all 5, and the top-k array says 2 then 3.
+static bool build_per_layer_moe_model(const std::string &path,
+                                     const std::vector<int> &layer_experts,
+                                     const std::vector<int> &layer_k,
+                                     int cap_expert) {
+    const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
+    const int n_ff = 64, n_ff_exp = 64, vocab = 260, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int n_layer = static_cast<int>(layer_experts.size());
+    const std::string arch = "qwen2moe";
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-per-layer-moe");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".expert_count", static_cast<u32>(cap_expert));
+    // The per-block top-k array, which is the key the scalar read cannot see.
+    b.meta_i32_array(arch + ".expert_used_count", layer_k);
+    b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const int ne_l = layer_experts[static_cast<size_t>(l)];
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, 100));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, 200));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, 300));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, 400));
+
+        std::vector<f32> router(static_cast<size_t>(n_embd) * ne_l);
+        for (size_t i = 0; i < router.size(); i++)
+            router[i] = wv(static_cast<i64>(i) * 3 + 7);
+        b.tensor_f16(p + "ffn_gate_inp.weight", {u64(n_embd), u64(ne_l)}, router);
+
+        const size_t gsz = static_cast<size_t>(n_embd) * n_ff_exp;
+        const size_t dsz = static_cast<size_t>(n_ff_exp) * n_embd;
+        const size_t ne = static_cast<size_t>(ne_l);
+        std::vector<f32> gate(gsz * ne), up(gsz * ne), down(dsz * ne);
+        for (size_t e = 0; e < ne; e++) {
+            const i64 bump = static_cast<i64>(e) * 7919;
+            for (size_t k = 0; k < gsz; k++) {
+                gate[e * gsz + k] = wv(500 + static_cast<i64>(k) + bump);
+                up[e * gsz + k] = wv(900 + static_cast<i64>(k) + bump);
+            }
+            for (size_t k = 0; k < dsz; k++)
+                down[e * dsz + k] = wv(1300 + static_cast<i64>(k) + bump);
+        }
+        b.tensor_f16(p + "ffn_gate_exps.weight",
+                     {u64(n_embd), u64(n_ff_exp), u64(ne)}, gate);
+        b.tensor_f16(p + "ffn_up_exps.weight",
+                     {u64(n_embd), u64(n_ff_exp), u64(ne)}, up);
+        b.tensor_f16(p + "ffn_down_exps.weight",
+                     {u64(n_ff_exp), u64(n_embd), u64(ne)}, down);
+    }
+    return b.write(path);
+}
+
+// ---- NVFP4 global-scale ("<tensor>.scale") fixtures ----------------------
+//
+// A GGUF stores an NVFP4 weight's per-tensor global scale BESIDE it, as
+// "<tensor>.scale": one f32 that multiplies the whole matrix. The block format
+// itself is four UE4M3 micro-scales (`0x40` = 1.0) then 32 bytes of E2M1 codes
+// per 64 values, so a weight can be written whose true value is KNOWN exactly:
+// code g (the doubled grid -- 1,2,3,4 -> 0.5, 1.0, 1.5, 2.0) under a micro-scale
+// of 1.0, with a sidecar of 0.5, is 0.5*g. The f16 twin writes exactly those
+// numbers, so the two files describe the SAME model and must produce the same
+// logits. Anything that drops the sidecar runs every element at 2x and cannot.
+static void nvfp4_grid_blocks(i64 n_out, i64 n_in, std::vector<u8> &raw,
+                              std::vector<f32> &twin) {
+    const i64 blocks = std::max<i64>(1, (n_in + 63) / 64);
+    raw.assign(static_cast<size_t>(n_out * blocks * 36), 0);
+    twin.assign(static_cast<size_t>(n_out * n_in), 0.0f);
+    for (i64 r = 0; r < n_out; r++) {
+        for (i64 b = 0; b < blocks; b++) {
+            u8 *p = raw.data() + static_cast<size_t>((r * blocks + b) * 36);
+            p[0] = p[1] = p[2] = p[3] = 0x40; // four micro-scales of 1.0
+            for (int k = 0; k < 32; k++) {
+                // Byte k belongs to sub-block s = k/8 at offset j = k%8, and its
+                // two nibbles are columns s*16 + j (low) and s*16 + j + 8 (high)
+                // -- the layout dequant_chunk<NVFP4> reads.
+                const int s = k / 8, j = k % 8;
+                const i64 c0 = b * 64 + s * 16 + j, c1 = c0 + 8;
+                const int g0 = c0 < n_in ? 1 + static_cast<int>((r * 7 + c0) % 4) : 0;
+                const int g1 = c1 < n_in ? 1 + static_cast<int>((r * 7 + c1) % 4) : 0;
+                p[4 + k] = static_cast<u8>((g0 & 0xF) | ((g1 & 0xF) << 4));
+                if (c0 < n_in) twin[static_cast<size_t>(r * n_in + c0)] = 0.5f * g0;
+                if (c1 < n_in) twin[static_cast<size_t>(r * n_in + c1)] = 0.5f * g1;
+            }
+        }
+    }
+}
+
+// What the fixture installs on the named weight: `sidecar` writes the NVFP4
+// encoding plus a 0.5 sidecar, otherwise the f16 twin of the same values.
+static void put_weight(GgufBuilder &b, const std::string &name, i64 n_out,
+                       i64 n_in, bool sidecar) {
+    std::vector<u8> raw;
+    std::vector<f32> twin;
+    nvfp4_grid_blocks(n_out, n_in, raw, twin);
+    if (!sidecar) {
+        b.tensor_f16(name, {u64(n_in), u64(n_out)}, twin);
+        return;
+    }
+    b.tensor_raw(name, 40 /* NVFP4 */, {u64(n_in), u64(n_out)}, raw.data(), raw.size());
+    static const char *kW = ".weight";
+    const size_t wn = std::strlen(kW);
+    const std::string base = name.size() > wn && name.compare(name.size() - wn, wn, kW) == 0
+                                 ? name.substr(0, name.size() - wn)
+                                 : name;
+    b.tensor_f32(base + ".scale", {1}, std::vector<f32>{0.5f});
+}
+
+// `sidecar` names the weight the two files describe identically -- "head",
+// "attn_q", "ffn_gate", "ffn_down" or "router" -- and `nvfp4` chooses HOW it is
+// written: as the f16 twin, or as NVFP4 plus a 0.5 sidecar. Both files therefore
+// hold the same matrix; only the encoding differs, which is what makes them a
+// controlled comparison.
+static bool build_sidecar_model(const std::string &path, const std::string &sidecar,
+                                bool moe, bool nvfp4) {
+    const int n_embd = 64, n_head = 4, hd = 16, n_kv = 2;
+    const int n_ff = 64, n_ff_exp = 64, vocab = 260, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int n_expert = 4, top_k = 2, n_ff_sh = 64;
+    const std::string arch = moe ? "qwen2moe" : "llama";
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-sidecar");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", 1);
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    if (moe) {
+        b.meta_u32(arch + ".expert_count", static_cast<u32>(n_expert));
+        b.meta_u32(arch + ".expert_used_count", static_cast<u32>(top_k));
+        b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
+        b.meta_u32(arch + ".expert_shared_feed_forward_length",
+                   static_cast<u32>(n_ff_sh));
+    }
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    auto put = [&](const std::string &what, const std::string &name, i64 n_out,
+                   i64 n_in, i64 base) {
+        if (what == sidecar) {
+            put_weight(b, name, n_out, n_in, nvfp4);
+            return;
+        }
+        b.tensor_f16(name, {u64(n_in), u64(n_out)},
+                     vec(static_cast<size_t>(n_in * n_out), base));
+    };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    put("head", "output.weight", vocab, n_embd, 6000);
+    b.tensor_f32("blk.0.attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f32("blk.0.ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+    put("attn_q", "blk.0.attn_q.weight", q_dim, n_embd, 100);
+    b.tensor_f16("blk.0.attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                 vec(static_cast<size_t>(n_embd) * kv_dim, 200));
+    b.tensor_f16("blk.0.attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                 vec(static_cast<size_t>(n_embd) * kv_dim, 300));
+    b.tensor_f16("blk.0.attn_output.weight", {u64(q_dim), u64(n_embd)},
+                 vec(static_cast<size_t>(q_dim) * n_embd, 400));
+
+    if (!moe) {
+        put("ffn_gate", "blk.0.ffn_gate.weight", n_ff, n_embd, 500);
+        b.tensor_f16("blk.0.ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, 900));
+        put("ffn_down", "blk.0.ffn_down.weight", n_embd, n_ff, 1300);
+        return b.write(path);
+    }
+
+    put("router", "blk.0.ffn_gate_inp.weight", n_expert, n_embd, 7);
+    const size_t gsz = static_cast<size_t>(n_embd) * n_ff_exp;
+    const size_t dsz = static_cast<size_t>(n_ff_exp) * n_embd;
+    const size_t ne = static_cast<size_t>(n_expert);
+    std::vector<f32> gate(gsz * ne), up(gsz * ne), down(dsz * ne);
+    for (size_t e = 0; e < ne; e++) {
+        const i64 bump = static_cast<i64>(e) * 7919;
+        for (size_t k = 0; k < gsz; k++) {
+            gate[e * gsz + k] = wv(500 + static_cast<i64>(k) + bump);
+            up[e * gsz + k] = wv(900 + static_cast<i64>(k) + bump);
+        }
+        for (size_t k = 0; k < dsz; k++)
+            down[e * dsz + k] = wv(1300 + static_cast<i64>(k) + bump);
+    }
+    b.tensor_f16("blk.0.ffn_gate_exps.weight",
+                 {u64(n_embd), u64(n_ff_exp), u64(ne)}, gate);
+    b.tensor_f16("blk.0.ffn_up_exps.weight",
+                 {u64(n_embd), u64(n_ff_exp), u64(ne)}, up);
+    b.tensor_f16("blk.0.ffn_down_exps.weight",
+                 {u64(n_ff_exp), u64(n_embd), u64(ne)}, down);
+    b.tensor_f16("blk.0.ffn_up_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                 vec(static_cast<size_t>(n_embd) * n_ff_sh, 2100));
+    b.tensor_f16("blk.0.ffn_down_shexp.weight", {u64(n_ff_sh), u64(n_embd)},
+                 vec(static_cast<size_t>(n_ff_sh) * n_embd, 2500));
+    return b.write(path);
+}
+
+// NVFP4 global scales, at every place a dense weight is used.
+//
+// The oracle is a twin file: the same model with the same NUMBERS written as
+// f16. Each arm therefore tests one projection's sidecar against a known-good
+// answer, and a dropped or doubled sidecar shows up as logits that do not match
+// -- not as a crash, not as a small rounding difference.
+static void test_nvfp4_sidecar_scale() {
+    struct Arm {
+        const char *what; // the weight the sidecar rides
+        bool moe;
+    };
+    const Arm arms[] = {{"head", false}, {"attn_q", false},
+                        {"ffn_gate", false}, {"ffn_down", false},
+                        {"router", true}};
+    for (const Arm &a : arms) {
+        const std::string ref = std::string("kraken-sidecar-f16-") + a.what + ".gguf";
+        const std::string q = std::string("kraken-sidecar-nvfp4-") + a.what + ".gguf";
+        CHECK(build_sidecar_model(ref, a.what, a.moe, false), "wrote the f16 twin");
+        CHECK(build_sidecar_model(q, a.what, a.moe, true), "wrote the NVFP4 file");
+
+        auto logits_of = [](const std::string &p, std::vector<f32> &lg, i32 &tok,
+                            std::string &err) {
+            Backend *be = make_cpu_backend();
+            Engine e;
+            EngineConfig c;
+            c.model_path = p;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            if (!e.init(be, c, &err)) return false;
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 2;
+            GenerateResult r;
+            if (!e.generate(gp, &r)) return false;
+            const i32 nv = e.model().cfg().n_vocab;
+            lg.assign(e.last_logits(), e.last_logits() + nv);
+            tok = r.tokens.empty() ? -1 : r.tokens.back();
+            return true;
+        };
+        std::vector<f32> a_lg, b_lg;
+        i32 a_tok = -1, b_tok = -1;
+        std::string ea, eb;
+        const bool ok_a = logits_of(ref, a_lg, a_tok, ea);
+        const bool ok_b = logits_of(q, b_lg, b_tok, eb);
+        if (!ok_a) std::fprintf(stderr, "  (f16 twin: %s)\n", ea.c_str());
+        if (!ok_b) std::fprintf(stderr, "  (nvfp4 file: %s)\n", eb.c_str());
+        CHECK(ok_a && ok_b, "both files load and generate");
+        if (!ok_a || !ok_b) continue;
+        CHECK(b_tok == a_tok, "the sidecar-scaled model emits the same token");
+        f32 worst = 0.0f;
+        const size_t n = std::min(a_lg.size(), b_lg.size());
+        for (size_t i = 0; i < n; i++)
+            worst = std::max(worst, std::fabs(a_lg[i] - b_lg[i]));
+        if (worst > 2.0f)
+            std::fprintf(stderr, "  (sidecar arm %s: logits differ by %.4g)\n",
+                         a.what, static_cast<double>(worst));
+        // The two files describe the same matrix, so the only difference left is
+        // the kernels' accumulation order. A dropped 0.5 doubles every element of
+        // one projection, which is far outside this.
+        CHECK(worst < 2.0f, "and its logits match the f16 twin's");
+    }
+}
+
+// A LatentMoE block, which is what Nemotron 3.5 Bolt 74B-A9B is: the routed
+// experts read and write a NARROW latent (ffn_latent_down -> experts ->
+// ffn_latent_up) while the shared expert and the residual stay full width.
+// `latent` is the latent width, 0 for a file with no pair; `half` writes only
+// the down half; `mismatch` writes an up tensor that does not join the bank.
+static bool build_latent_moe_model(const std::string &path, int n_embd,
+                                   int latent, int n_ff_exp, int n_expert,
+                                   int top_k, bool half, bool mismatch) {
+    const int n_head = 4, n_kv = 2, hd = 8;
+    const int n_ff = 64, vocab = 260, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int n_ff_sh = 64;
+    const std::string arch = "qwen2moe";
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-latent-moe");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", 1);
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".expert_count", static_cast<u32>(n_expert));
+    b.meta_u32(arch + ".expert_used_count", static_cast<u32>(top_k));
+    b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
+    b.meta_u32(arch + ".expert_shared_feed_forward_length",
+               static_cast<u32>(n_ff_sh));
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000));
+    b.tensor_f32("blk.0.attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f32("blk.0.ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("blk.0.attn_q.weight", {u64(n_embd), u64(q_dim)},
+                 vec(static_cast<size_t>(n_embd) * q_dim, 100));
+    b.tensor_f16("blk.0.attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                 vec(static_cast<size_t>(n_embd) * kv_dim, 200));
+    b.tensor_f16("blk.0.attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                 vec(static_cast<size_t>(n_embd) * kv_dim, 300));
+    b.tensor_f16("blk.0.attn_output.weight", {u64(q_dim), u64(n_embd)},
+                 vec(static_cast<size_t>(q_dim) * n_embd, 400));
+
+    std::vector<f32> router(static_cast<size_t>(n_embd) * n_expert);
+    for (size_t i = 0; i < router.size(); i++)
+        router[i] = wv(static_cast<i64>(i) * 3 + 7);
+    b.tensor_f16("blk.0.ffn_gate_inp.weight", {u64(n_embd), u64(n_expert)}, router);
+
+    // The routed bank is `latent` wide, and an UNGATED one (up/down only) --
+    // which is Bolt's shape, so the gate-absent path is part of what this pins.
+    // A negative `latent` writes a NARROW bank with no projection pair at all:
+    // the shape the loader must refuse rather than read off-stride.
+    const int ew = latent != 0 ? (latent > 0 ? latent : -latent) : n_embd;
+    const size_t gsz = static_cast<size_t>(ew) * n_ff_exp;
+    const size_t dsz = static_cast<size_t>(n_ff_exp) * ew;
+    const size_t ne = static_cast<size_t>(n_expert);
+    std::vector<f32> up(gsz * ne), down(dsz * ne);
+    for (size_t e = 0; e < ne; e++) {
+        const i64 bump = static_cast<i64>(e) * 7919;
+        for (size_t k = 0; k < gsz; k++)
+            up[e * gsz + k] = wv(900 + static_cast<i64>(k) + bump);
+        for (size_t k = 0; k < dsz; k++)
+            down[e * dsz + k] = wv(1300 + static_cast<i64>(k) + bump);
+    }
+    b.tensor_f16("blk.0.ffn_up_exps.weight", {u64(ew), u64(n_ff_exp), u64(ne)}, up);
+    b.tensor_f16("blk.0.ffn_down_exps.weight", {u64(n_ff_exp), u64(ew), u64(ne)},
+                 down);
+
+    // The shared expert is full width on this family: that asymmetry is the
+    // whole point of the test, not an accident of the fixture.
+    b.tensor_f16("blk.0.ffn_up_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                 vec(static_cast<size_t>(n_embd) * n_ff_sh, 2100));
+    b.tensor_f16("blk.0.ffn_down_shexp.weight", {u64(n_ff_sh), u64(n_embd)},
+                 vec(static_cast<size_t>(n_ff_sh) * n_embd, 2500));
+
+    if (latent > 0) {
+        b.tensor_f16("blk.0.ffn_latent_down.weight",
+                     {u64(n_embd), u64(latent)},
+                     vec(static_cast<size_t>(n_embd) * latent, 3100));
+        if (!half) {
+            const int up_in = mismatch ? latent + 1 : latent;
+            b.tensor_f16("blk.0.ffn_latent_up.weight",
+                         {u64(up_in), u64(n_embd)},
+                         vec(static_cast<size_t>(up_in) * n_embd, 3500));
+        }
+    }
+    return b.write(path);
+}
+
+// LatentMoE. What this pins:
+//  * a routed bank narrower than the hidden state loads at all -- the loader
+//    used to be silent about the width and the forward fed n_embd into it;
+//  * the layer reports the bank's own width, so the forward has one number to
+//    size the latent by;
+//  * the block runs end to end (down-projection, experts in the latent,
+//    up-projection, shared expert, residual) and produces tokens;
+//  * half a pair, a pair that does not join the bank, and a narrow bank with no
+//    pair are all REFUSED -- each is a silently wrong answer otherwise.
+static void test_moe_latent() {
+    const std::string path = "kraken-latent-moe.gguf";
+    CHECK(build_latent_moe_model(path, 32, 16, 64, 4, 2, false, false),
+          "wrote the LatentMoE fixture");
+
+    Backend *cpu = make_cpu_backend();
+    Engine engine;
+    EngineConfig cfg;
+    cfg.model_path = path;
+    cfg.n_ctx = 64;
+    cfg.prefill_chunk = 8;
+    std::string err;
+    const bool ok = engine.init(cpu, cfg, &err);
+    if (!ok) std::fprintf(stderr, "  (latent MoE init: %s)\n", err.c_str());
+    CHECK(ok, "a LatentMoE file loads");
+    if (ok) {
+        const Model &m = engine.model();
+        const LayerWeights &L = m.layers()[0];
+        CHECK(L.latent_moe(), "the layer reports its latent pair");
+        CHECK(L.experts.n_embd == 16,
+              "the routed bank keeps its own (latent) input width");
+        GenerateParams p;
+        p.prompt = "the";
+        p.max_tokens = 4;
+        GenerateResult r;
+        const bool gen = engine.generate(p, &r);
+        CHECK(gen, "it generates through the latent");
+        CHECK(r.generated > 0, "... and emits tokens");
+    }
+
+    // ---- the refusals -----------------------------------------------------
+    auto refuses = [](const std::string &p, const char *what) {
+        Backend *be = make_cpu_backend();
+        Engine e;
+        EngineConfig c;
+        c.model_path = p;
+        c.n_ctx = 64;
+        std::string err;
+        const bool loaded = e.init(be, c, &err);
+        CHECK(!loaded, what);
+        CHECK(err.find("latent") != std::string::npos,
+              "... and the refusal names the latent");
+    };
+    CHECK(build_latent_moe_model("kraken-latent-half.gguf", 32, 16, 64, 4, 2, true,
+                                 false),
+          "wrote the half-pair fixture");
+    refuses("kraken-latent-half.gguf",
+            "half a latent pair is refused, not run on the hidden state");
+    CHECK(build_latent_moe_model("kraken-latent-mismatch.gguf", 32, 16, 64, 4, 2,
+                                 false, true),
+          "wrote the mismatched-up fixture");
+    refuses("kraken-latent-mismatch.gguf",
+            "a latent projection that does not join the bank is refused");
+    CHECK(build_latent_moe_model("kraken-latent-nopair.gguf", 32, -16, 64, 4, 2,
+                                 false, false),
+          "wrote the narrow-bank-no-pair fixture");
+    refuses("kraken-latent-nopair.gguf",
+            "a narrow routed bank with no latent projection is refused");
+}
+
+// Per-layer expert counts and top-k. What this pins:
+//  * the loader stops treating `expert_count` as an equality, so a layer whose
+//    bank is narrower than the cap loads (Bolt 74B-A9B was refused here);
+//  * the router is checked against ITS layer's bank, not the cap;
+//  * `expert_used_count` reaches the forward as a per-block array, so a layer
+//    with 3 experts does not try to select 3 out of a 5-wide declaration;
+//  * a heterogeneous stack reports non-uniform geometry, which is what keeps
+//    the uniform dispatch table and the expert scan off it.
+static void test_moe_per_layer_experts() {
+    const std::string path = "kraken-per-layer-moe.gguf";
+    CHECK(build_per_layer_moe_model(path, {3, 5}, {2, 3}, 5),
+          "wrote the per-layer MoE fixture");
+
+    Backend *cpu = make_cpu_backend();
+    Engine engine;
+    EngineConfig cfg;
+    cfg.model_path = path;
+    cfg.n_ctx = 64;
+    cfg.prefill_chunk = 8;
+    std::string err;
+    const bool ok = engine.init(cpu, cfg, &err);
+    if (!ok) std::fprintf(stderr, "  (per-layer MoE init: %s)\n", err.c_str());
+    CHECK(ok, "a file whose layers carry different expert counts loads");
+    if (ok) {
+        const Model &m = engine.model();
+        const ModelConfig &mc = m.cfg();
+        CHECK(mc.n_expert == 5, "expert_count is the cap");
+        CHECK(mc.n_expert_used == 3, "the top-k array's maximum is model-level");
+        CHECK(mc.layer_n_expert_used.size() == 2,
+              "expert_used_count was read as a per-block array");
+        CHECK(m.n_expert_at(0) == 3 && m.n_expert_at(1) == 5,
+              "each layer reports its own expert count");
+        CHECK(m.n_expert_used_at(0) == 2 && m.n_expert_used_at(1) == 3,
+              "each layer reports its own top-k");
+        CHECK(!m.moe_geometry_uniform(),
+              "the stack is reported non-uniform (dispatch/scan stay off)");
+
+        GenerateParams p;
+        p.prompt = "the";
+        p.max_tokens = 4;
+        GenerateResult r;
+        CHECK(engine.generate(p, &r), "it generates");
+        CHECK(r.generated > 0, "... and emits tokens");
+    }
+
+    // The uniform control: the same builder with one expert count everywhere
+    // has to report uniform, or the flag above is vacuous.
+    const std::string upath = "kraken-uniform-moe.gguf";
+    CHECK(build_per_layer_moe_model(upath, {4, 4}, {2, 2}, 4),
+          "wrote the uniform control fixture");
+    {
+        Backend *u_cpu = make_cpu_backend();
+        Engine u_engine;
+        EngineConfig u_cfg;
+        u_cfg.model_path = upath;
+        u_cfg.n_ctx = 64;
+        u_cfg.prefill_chunk = 8;
+        std::string u_err;
+        const bool u_ok = u_engine.init(u_cpu, u_cfg, &u_err);
+        if (!u_ok) std::fprintf(stderr, "  (uniform control: %s)\n", u_err.c_str());
+        CHECK(u_ok, "the uniform control loads");
+        if (u_ok) {
+            CHECK(u_engine.model().moe_geometry_uniform(),
+                  "a uniform stack still reports uniform");
+            CHECK(u_engine.model().n_expert_at(0) == 4 &&
+                      u_engine.model().n_expert_at(1) == 4,
+                  "... with the same count on every layer");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Qwen3.5 / gated delta net
 // ---------------------------------------------------------------------------
@@ -4562,22 +5112,36 @@ public:
     // an idle machine, before the copy's own cost is added. With no aperture
     // set, both arms are exactly the inner backend's memcpy, so no other group
     // changes.
-    void set_test_aperture(double ring_gbs, double direct_gbs, double pin_gbs) {
+    // `block_gbs` defaults to the ring's rate: a test that does not care about
+    // the third mechanism then measures exactly what it did before this arm
+    // existed, and one that does gets a real difference on the clock.
+    void set_test_aperture(double ring_gbs, double direct_gbs, double pin_gbs,
+                           double block_gbs = -1.0) {
         aperture_ = true;
         ring_ns_per_byte_ = ring_gbs > 0.0 ? 1.0 / ring_gbs : 0.0;
         direct_ns_per_byte_ = direct_gbs > 0.0 ? 1.0 / direct_gbs : 0.0;
         pin_ns_per_byte_ = pin_gbs > 0.0 ? 1.0 / pin_gbs : 0.0;
+        block_ns_per_byte_ =
+            block_gbs >= 0.0 ? (block_gbs > 0.0 ? 1.0 / block_gbs : 0.0)
+                             : ring_ns_per_byte_;
     }
     bool pageable_paths_selectable() const override { return aperture_; }
-    void set_pageable_direct(bool on) override {
-        direct_ = on;
+    void set_pageable_path(PageablePath p) override {
+        path_ = static_cast<int>(p);
+        direct_ = path_ == 1;
         ++path_switches_;
     }
+    void set_pageable_direct(bool on) override {
+        set_pageable_path(on ? PageablePath::Direct : PageablePath::Ring);
+    }
     bool direct_enabled() const { return direct_; }
+    int path() const { return path_; }  // 0 ring, 1 direct, 2 blocking
     int path_switches() const { return path_switches_; }
     void upload_paged_batch(void *const dst[], const void *const src[],
                             const size_t bytes[], int n) override {
-        const double cost = direct_ ? direct_ns_per_byte_ : ring_ns_per_byte_;
+        const double cost = path_ == 1   ? direct_ns_per_byte_
+                            : path_ == 2 ? block_ns_per_byte_
+                                         : ring_ns_per_byte_;
         for (int i = 0; i < n; i++) {
             if (!dst[i] || !src[i] || !bytes[i]) continue;
             std::memcpy(dst[i], src[i], bytes[i]);
@@ -4598,10 +5162,20 @@ public:
     u64 host_allocs() const { return host_allocs_; }
     u64 host_releases() const { return host_releases_; }
 
+    // The CPU backend cannot read its own host pool from a "kernel", so the
+    // capability is faked where the cache's half of the contract is under test:
+    // whether a pinned host CELL is publishable, not whether this machine's
+    // driver maps the pool (tools/probe_hostread.hip answers that one).
+    bool host_load_supported() const override {
+        return fake_host_load_ || inner_->host_load_supported();
+    }
+    void set_host_load(bool on) { fake_host_load_ = on; }
+
 private:
     Backend *inner_;
     DeviceCaps fake_caps_;
     bool fake_hip_ = false;
+    bool fake_host_load_ = false;
     bool fake_device_memory_ = false;
     bool fake_host_memory_ = false;
     size_t fake_device_total_ = 0;
@@ -4626,9 +5200,11 @@ private:
     }
     bool aperture_ = false;
     bool direct_ = false;
+    int path_ = 0;  // 0 ring, 1 direct, 2 blocking
     int path_switches_ = 0;
     double ring_ns_per_byte_ = 0.0;
     double direct_ns_per_byte_ = 0.0;
+    double block_ns_per_byte_ = 0.0;
     double pin_ns_per_byte_ = 0.0;
 };
 
@@ -5068,6 +5644,47 @@ static void test_expert_cache_byte_budget() {
         CHECK(krk::pageable_direct_wins(10.0, 26.0) &&
                   !krk::warm_pin_worthwhile(26.0, 27.0),
               "a wide aperture picks direct and drops the pin in one decision");
+        // --- the third mechanism ------------------------------------------
+        // The rates below are the ones measured on this box (RX 9070 XT, ReBAR
+        // on, runtime claiming a 256 MiB window): `tools/bar_probe.hip` for the
+        // size sweep, the engine's own probe for the promotion shape. The ring
+        // is the slowest arm at every size, and a two-way menu could only ever
+        // choose between the two slowest -- which is the bug the third arm
+        // exists to fix, so it is checked against the measured numbers.
+        // The engine's own probe reported these three on this box before the
+        // third arm existed: the ring 8.9 against direct 10.0 is under the 1.20x
+        // line, so the OLD two-way menu kept the ring on every run -- while the
+        // driver's blocking copy measured 1.5x ahead of that ring. This is the
+        // case the third mechanism is for, and it is the real one, not a
+        // constructed ratio.
+        CHECK(krk::pageable_path_choice(8.9, 10.0, 13.4) == 2,
+              "the ring 1.1x behind direct used to win by default; blocking is "
+              "1.5x ahead of the ring and is chosen instead");
+        // At 1 GiB the ring is the outlier and the two driver-staged arms are
+        // inside the band of each other, so the MORE conservative of the two
+        // (direct, which the cache already carried) is what runs.
+        CHECK(krk::pageable_path_choice(8.39, 21.98, 22.15) == 1,
+              "a blocking arm 0.8% ahead of direct does not displace it");
+        CHECK(krk::pageable_path_choice(9.47, 15.23, 14.40) == 1,
+              "at the 16 MiB promotion shape direct wins, and it is the choice");
+        CHECK(krk::pageable_path_choice(10.0, 11.0, 11.5) == 0,
+              "three arms inside the 1.20x band keep the ring (it owns a known "
+              "fallback), rather than picking a path on noise");
+        CHECK(krk::pageable_path_choice(0.0, 0.0, 0.0) == -1,
+              "no measurement is not a choice");
+        CHECK(krk::pageable_path_choice(8.0, 0.0, 0.0) == 0,
+              "and an unmeasured arm simply does not compete");
+        // The aperture: the runtime's attribute is not usable on this platform,
+        // so the wide/narrow answer comes from these two rates. Both sides of
+        // the line are pinned with numbers that were actually measured.
+        CHECK(krk::aperture_is_wide(15.23, 24.35),
+              "15.2 against 24.4 GB/s is wide: a window cannot reach 62% of pinned");
+        CHECK(krk::aperture_is_wide(23.10, 28.06),
+              "and 23.1 against 28.1 at 256 MiB is wider still");
+        CHECK(!krk::aperture_is_wide(8.39, 24.35),
+              "the ring's 8.4 against 24.4 is the windowed population");
+        CHECK(!krk::aperture_is_wide(0.0, 24.35),
+              "an unmeasured pageable arm never claims a wide aperture");
         CHECK(!krk::host_staging_fits(1, 12 * gib, 12 * gib),
               "host staging stops at the exact reserve");
         CHECK(krk::host_staging_fits(1, 12 * gib + 1, 12 * gib),
@@ -5792,8 +6409,11 @@ static void test_expert_cache_warm_tier() {
           "and both are still resident, in WARM and in VRAM");
     CHECK(cache.warm_hits() == 0 && cache.demotions() == 0,
           "nothing has been served out of WARM yet");
-    CHECK(be.host_allocs() == 6,
-          "read-through allocated one pageable copy per tensor, per expert");
+    // ONE host block per expert, not one per slice: the three slices are offsets
+    // inside it (tools/probe_warmalloc.hip measured the pinned tier at 912 ns a
+    // page for slice-sized allocations against 471 for expert-sized ones).
+    CHECK(be.host_allocs() == 2,
+          "read-through allocated one pageable block per expert");
 
     // 2. A VRAM eviction keeps the WARM copy and costs nothing: the one expert's
     //    worth of host allocations here is the *new* expert's admission, not a
@@ -5803,7 +6423,7 @@ static void test_expert_cache_warm_tier() {
     CHECK(cache.evictions() == 1, "one VRAM eviction");
     CHECK(cache.demotions() == 1, "the evicted expert stayed resident in WARM");
     CHECK(cache.warm_slots() == 3, "WARM kept its own copy, not the device's");
-    CHECK(be.host_allocs() == host_allocs_before + 3,
+    CHECK(be.host_allocs() == host_allocs_before + 1,
           "the eviction allocated nothing; only the new admission did");
     CHECK(cache.touch_count(0, 0) == 1, "the evicted expert keeps its LFU counter");
 
@@ -5877,8 +6497,8 @@ static void test_expert_cache_warm_tier() {
           "prefetch deduplicates valid IDs and ignores invalid IDs");
     CHECK(cache.warm_used_bytes() == 48 && cache.warm_slots() == 2,
           "duplicate IDs cannot overwrite or double-count staged buffers");
-    CHECK(be.host_allocs() == before_batch_allocs + 6,
-          "one three-slice host allocation per unique expert");
+    CHECK(be.host_allocs() == before_batch_allocs + 2,
+          "one host block per unique expert, its three slices inside it");
     CHECK(cache.prefetch_layer(src, 0, duplicates, 6) == 0,
           "already WARM experts are not read again");
     const ResidentExpert *staged = cache.acquire(src, 0, 1);
@@ -5886,6 +6506,26 @@ static void test_expert_cache_warm_tier() {
               std::memcmp(staged->up.data, src.up->data + 8, 8) == 0 &&
               std::memcmp(staged->down.data, src.down->data + 8, 8) == 0,
           "staging and promotion preserve every source slice byte for byte");
+
+    // A churning tier must not grow: a two-expert tier refilled with the OTHER
+    // two has to hand both blocks back before it commits two more, or the tier
+    // holds RAM it says it does not and the next admission fails.
+    cache.clear();
+    cache.configure(&be, 48, 48);
+    const i32 first_two[] = {0, 1};
+    const i32 last_two[] = {2, 3};
+    const u64 alloc_before_refill = be.host_allocs();
+    CHECK(cache.prefetch_layer(src, 0, first_two, 2) == 48,
+          "two experts fill the tier");
+    CHECK(be.host_allocs() == alloc_before_refill + 2,
+          "two blocks, one per expert");
+    const u64 rel_before_refill = be.host_releases();
+    CHECK(cache.prefetch_layer(src, 0, last_two, 2) == 48,
+          "the other two replace them");
+    CHECK(be.host_releases() == rel_before_refill + 2,
+          "both evicted blocks give their memory back");
+    CHECK(cache.warm_used_bytes() == 48,
+          "and the tier still reports only the two experts it holds");
 
     cache.clear();
     cache.configure(&be, 48, 96);
@@ -5966,8 +6606,8 @@ static void test_expert_cache_warm_tier() {
     // its own, prove which deallocator ran -- see the note in part 7.)
     const u64 rel_before_clear = be.host_releases();
     cache.clear();
-    CHECK(be.host_releases() == rel_before_clear + 6,
-          "each pinned slice is freed when the slot goes");
+    CHECK(be.host_releases() == rel_before_clear + 2,
+          "each pinned block is freed when its slot goes");
     CHECK(cache.warm_pinned_bytes() == 0 && cache.warm_used_bytes() == 0,
           "and the pin accounting returns to zero with them");
 
@@ -5977,6 +6617,128 @@ static void test_expert_cache_warm_tier() {
     cache.prefetch_layer(src, 0, next_ids, 2);
     CHECK(!cache.stage_next(src, 0, 1, 0), "one-slot budget skips speculative admission");
     CHECK(touch(1), "skipped staging falls back to exact demand loading");
+    cache.clear();
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// The dispatch table's HOST half: a routed set larger than the card
+// ---------------------------------------------------------------------------
+//
+// The arm this group exists for is unreachable any other way. Tiel-Coder-35B-A3B
+// is 22.3 GiB of routed experts against a 9-11 GiB device budget, so requiring
+// the whole set in VRAM (`whole_set_resident`) refused the table from start to
+// finish -- the recorded log says "0 of 10240 slots" -- and the one-launch
+// dispatch never ran on exactly the models it is for. A kernel can read a
+// slot's PINNED host copy directly (measured 24.3 GiB/s on this card,
+// tools/probe_hostread.hip), so a pinned cell is as legal an operand as a pool
+// cell and the overflow is read where it lives.
+//
+// What must NOT become publishable:
+//   * a cell behind a backend that never measured that read (the flag is the
+//     measurement, not a hope about unified addressing);
+//   * a PAGEABLE cell, which a kernel cannot address at all -- skipping it is a
+//     wrong answer, not a slow one.
+static void test_expert_dispatch_host_backed() {
+    const std::string path = "kraken-dispatch-host.gguf";
+    CHECK(build_expert_source_model_mixed(path), "wrote the host-backed GGUF");
+
+    Backend *cpu = make_cpu_backend();
+    CountingBackend be(cpu);
+    Gguf g;
+    std::string err;
+    CHECK(g.load(path, &err), "loaded the host-backed GGUF");
+    const ExpertSource src = expert_source(g);
+    const ExpertSource src1 = expert_source_of(g, 1);
+    CHECK(src.present() && src1.present(), "both expert layers are present");
+    const i32 four[] = {0, 1, 2, 3};
+
+    // 1. The capability gate. Pinning alone is not the promise; the BACKEND's
+    //    measured read path is, and the refusal has to say so rather than looking
+    //    like a residency failure.
+    {
+        ExpertCache cache;
+        cache.configure(&be, 24, 4096);
+        cache.set_host_pin_budget(1u << 20);
+        CHECK(cache.prefetch_layer(src, 0, four, 4) > 0, "the layer is staged pinned");
+        CHECK(cache.warm_pinned_bytes() > 0 && !cache.in_vram(0, 0),
+              "pinned, and not resident in VRAM");
+        std::string why;
+        CHECK(cache.publish_dispatch_table(1, 4, nullptr, &why) == nullptr &&
+                  !why.empty(),
+              "a backend without the measured read path publishes nothing");
+        CHECK(why.find("pinned host") != std::string::npos,
+              "and the reason names the capability, not the residency");
+        cache.clear();
+    }
+
+    // 2. With the capability, a wholly pinned set publishes -- and every entry is
+    //    the host slice a kernel would dereference.
+    ExpertCache cache;
+    be.set_host_load(true);
+    cache.configure(&be, 24, 4096); // room for one VRAM expert: nothing promotes here
+    cache.set_host_pin_budget(1u << 20);
+    CHECK(cache.prefetch_layer(src, 0, four, 4) > 0, "layer 0 into pinned WARM");
+    CHECK(cache.prefetch_layer(src1, 1, four, 4) > 0, "layer 1 into pinned WARM");
+    CHECK(!cache.whole_set_resident(2, 4),
+          "no cell is resident, so the strict query is still false");
+
+    i32 filled = 0;
+    std::string why;
+    void *t = cache.publish_dispatch_table(2, 4, &filled, &why);
+    CHECK(t != nullptr && filled == 8, "a wholly pinned set is publishable");
+    CHECK(cache.dispatch_table_host_cells() == 8,
+          "and every cell is reported as host-read");
+    if (t) {
+        const ResidentExpert *h0 = cache.acquire_inplace(src, 0, 0);
+        const ResidentExpert *h5 = cache.acquire_inplace(src1, 1, 1);
+        CHECK(h0 && h5, "two host slots are readable in place");
+        const MoeDispatchEntry *d = static_cast<const MoeDispatchEntry *>(t);
+        if (h0 && h5) {
+            CHECK(d[0].p[kMoeGate] == h0->gate.data &&
+                      d[0].p[kMoeUp] == h0->up.data &&
+                      d[0].p[kMoeDown] == h0->down.data,
+                  "entry 0 names expert 0's host slices");
+            CHECK(d[5].p[kMoeGate] == h5->gate.data &&
+                      d[5].p[kMoeDown] == h5->down.data,
+                  "entry 5 is layer 1's expert 1, out of its own cells");
+            CHECK(d[0].p[kMoeGate] != d[5].p[kMoeGate], "and the two entries differ");
+            CHECK(d[5].n_in[kMoeGate] == h5->gate.n_in &&
+                      d[5].type[kMoeDown] == static_cast<i32>(h5->down.type),
+                  "with that slot's own shape and type");
+            CHECK(d[0].present[kMoeGate] && d[0].present[kMoeUp] &&
+                      d[0].present[kMoeDown],
+                  "all three matrices marked present");
+        }
+    }
+
+    // 3. A pageable cell is refused. The kernel would have to skip it, and a
+    //    skipped expert is a wrong answer with a plausible shape.
+    {
+        ExpertCache partial;
+        partial.configure(&be, 24, 4096);
+        partial.set_host_pin_budget(24); // one expert out of the eight
+        CHECK(partial.prefetch_layer(src, 0, four, 4) > 0, "four staged");
+        CHECK(partial.prefetch_layer(src1, 1, four, 4) > 0, "and four more");
+        CHECK(partial.warm_pinned_bytes() < partial.warm_used_bytes(),
+              "only what fits the pin budget is pinned; the rest is pageable");
+        std::string why2;
+        CHECK(partial.publish_dispatch_table(2, 4, nullptr, &why2) == nullptr,
+              "a set with pageable cells publishes nothing");
+        CHECK(why2.find("pageable") != std::string::npos,
+              "and the reason counts them");
+    }
+
+    // 4. A promotion rewrites one cell, so the table goes stale and is
+    //    republished against the new split rather than silently mixing a freed
+    //    address with live ones.
+    CHECK(cache.acquire(src, 0, 0) != nullptr, "expert 0 promotes into the VRAM slot");
+    CHECK(cache.dispatch_table_stale(), "a promotion invalidates the published table");
+    i32 filled2 = 0;
+    void *t2 = cache.publish_dispatch_table(2, 4, &filled2, &why);
+    CHECK(t2 != nullptr && filled2 == 8 && cache.dispatch_table_host_cells() == 7,
+          "it republishes with one cell in VRAM and seven on the host");
+
     cache.clear();
     std::remove(path.c_str());
 }
@@ -6621,7 +7383,14 @@ static bool build_dflash_target(const std::string &path) {
     return build_sized_model(path, 32, 64, 12);
 }
 
-static bool build_dflash_head_set(const std::string &path, int mask_id) {
+// `which` names one matrix to write as the NVFP4 encoding (with a 0.5 sidecar)
+// instead of its f16 twin; both spellings carry the SAME numbers (put_weight),
+// so two head sets that differ only in `nvfp4` describe the same drafter. Only
+// weights whose contraction is a multiple of the 64-value NVFP4 block are
+// usable here (fc's 64-wide feature row, ffn_down's 64-wide intermediate).
+static bool build_dflash_head_set(const std::string &path, int mask_id,
+                                  const std::string &which = std::string(),
+                                  bool nvfp4 = false, bool laguna = false) {
     const int n_embd = 32, n_layer = 2, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
     const int n_target_layers = 2;           // captures 0 (input) + 1 (pre-final)
@@ -6630,32 +7399,44 @@ static bool build_dflash_head_set(const std::string &path, int mask_id) {
     // (the Drafter-loads fixture must equal 260 = build_sized_model's vocab).
     const int vocab = 260, block_size = 4;
 
+    // Two spellings of ONE head set, because the loader reads both and they have
+    // to reach the same numbers:
+    //   `dflash`       in-house: `fc.weight`, stacked `enc.aux_norm`,
+    //                  `blk.N.ffn_norm`, and an explicit `vocab_size`.
+    //   `dflash-draft` poolside's Laguna export: the prefix is part of the tensor
+    //                  name (`dflash_fc.weight`, `dflash_hidden_norm.weight`,
+    //                  `dflash_aux_hidden_norm.N.weight`), the FFN norm is called
+    //                  `post_attention_norm`, and `vocab_size` is not written at
+    //                  all -- so the drafter has to size itself from the target.
+    const std::string arch = laguna ? "dflash-draft" : "dflash";
+    auto K = [&](const char *suffix) { return arch + suffix; };
+
     GgufBuilder b;
-    b.meta_str("general.architecture", "dflash");
+    b.meta_str("general.architecture", arch);
     b.meta_str("general.name", "kraken-dflash-mask-test");
     b.meta_u32("general.alignment", 32);
-    b.meta_u32("dflash.block_count", n_layer);
-    b.meta_u32("dflash.context_length", 64);
-    b.meta_u32("dflash.embedding_length", n_embd);
-    b.meta_u32("dflash.feed_forward_length", n_ff);
-    b.meta_u32("dflash.attention.head_count", n_head);
-    b.meta_u32("dflash.attention.head_count_kv", n_kv);
-    b.meta_u32("dflash.attention.key_length", hd);
-    b.meta_f32("dflash.attention.layer_norm_rms_epsilon", 1e-5f);
-    b.meta_u32("dflash.vocab_size", vocab);
-    b.meta_f32("dflash.rope.freq_base", 10000.0f);
-    b.meta_u32("dflash.block_size", block_size);
-    b.meta_u32("dflash.mask_token_id", static_cast<u32>(mask_id));
+    b.meta_u32(K(".block_count"), n_layer);
+    b.meta_u32(K(".context_length"), 64);
+    b.meta_u32(K(".embedding_length"), n_embd);
+    b.meta_u32(K(".feed_forward_length"), n_ff);
+    b.meta_u32(K(".attention.head_count"), n_head);
+    b.meta_u32(K(".attention.head_count_kv"), n_kv);
+    b.meta_u32(K(".attention.key_length"), hd);
+    b.meta_f32(K(".attention.layer_norm_rms_epsilon"), 1e-5f);
+    if (!laguna) b.meta_u32(K(".vocab_size"), vocab);
+    b.meta_f32(K(".rope.freq_base"), 10000.0f);
+    b.meta_u32(K(".block_size"), block_size);
+    b.meta_u32(K(".mask_token_id"), static_cast<u32>(mask_id));
     // Capture ids against the one-layer target: id 0 is the input of layer 0,
     // id 1 is the pre-final-norm state (equal to the target's layer count and
     // the exact top of the range the loader accepts). A two-slot set of width
     // n_embd*2 in fc keeps the shapes legal.
-    b.meta_i32_array("dflash.target_layers", {0, 1});
+    b.meta_i32_array(K(".target_layers"), {0, 1});
     // The loader reads the mask id through dkey(): `<arch>.dflash.mask_token_id`
-    // for the current spelling, i.e. the key lives one level down — this is the
+    // for the current spelling, i.e. the key lives one level down -- this is the
     // same nesting a real head set carries (qwen35-dflash-draft.dflash.mask_
     // token_id). The flat key above is kept so both spellings load.
-    b.meta_u32("dflash.dflash.mask_token_id", static_cast<u32>(mask_id));
+    b.meta_u32(K(".dflash.mask_token_id"), static_cast<u32>(mask_id));
 
     auto vec = [](size_t n, i64 base) {
         std::vector<f32> v(n);
@@ -6663,16 +7444,30 @@ static bool build_dflash_head_set(const std::string &path, int mask_id) {
         return v;
     };
     auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    auto put = [&](const std::string &name, i64 n_out, i64 n_in, i64 base) {
+        if (name == which) {
+            put_weight(b, name, n_out, n_in, nvfp4);
+            return;
+        }
+        b.tensor_f16(name, {u64(n_in), u64(n_out)},
+                     vec(static_cast<size_t>(n_in * n_out), base));
+    };
 
-    // Fusion projection (fc.weight): the loader reads inner width ne[0] as the
-    // *input* (n_captured x target embd) and rows as the output (the drafter's
-    // n_embd), matching the real `n_captured x n_embd -> n_embd` shape.
-    b.tensor_f16("fc.weight", {u64(n_embd_enc), u64(n_embd)},
-                 vec(static_cast<size_t>(n_embd) * n_embd_enc, 10));
-    // Encoder output norm + per-aux norms, one n_embd row per capture slot
-    b.tensor_f32("enc.output_norm.weight", {u64(n_embd)}, ones(n_embd));
-    b.tensor_f32("enc.aux_norm.weight", {u64(n_embd), u64(n_target_layers)},
-                 ones(static_cast<size_t>(n_embd) * n_target_layers));
+    // Fusion projection: the loader reads inner width ne[0] as the *input*
+    // (n_captured x target embd) and rows as the output (the drafter's n_embd),
+    // matching the real `n_captured x n_embd -> n_embd` shape.
+    put(laguna ? "dflash_fc.weight" : "fc.weight", n_embd, n_embd_enc, 10);
+    // Encoder output norm + per-aux norms, one n_embd row per capture slot.
+    if (laguna) {
+        b.tensor_f32("dflash_hidden_norm.weight", {u64(n_embd)}, ones(n_embd));
+        for (int a = 0; a < n_target_layers; a++)
+            b.tensor_f32("dflash_aux_hidden_norm." + std::to_string(a) + ".weight",
+                         {u64(n_embd)}, ones(n_embd));
+    } else {
+        b.tensor_f32("enc.output_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32("enc.aux_norm.weight", {u64(n_embd), u64(n_target_layers)},
+                     ones(static_cast<size_t>(n_embd) * n_target_layers));
+    }
     // Decoder final norm (the loader requires it; the head is borrowed)
     b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
 
@@ -6680,7 +7475,8 @@ static bool build_dflash_head_set(const std::string &path, int mask_id) {
         const std::string p = "blk." + std::to_string(l) + ".";
         auto v = [&](i64 n, i64 base) { return vec(static_cast<size_t>(n), base); };
         b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
-        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + (laguna ? "post_attention_norm.weight" : "ffn_norm.weight"),
+                     {u64(n_embd)}, ones(n_embd));
         b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)}, v(q_dim, 100 + l * 10));
         b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)}, v(kv_dim, 200 + l * 10));
         b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)}, v(kv_dim, 300 + l * 10));
@@ -6688,12 +7484,222 @@ static bool build_dflash_head_set(const std::string &path, int mask_id) {
         // QK-norm is required by dflash's per-head norm contract
         b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
         b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
-        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)}, v(n_ff, 500 + l * 10));
-        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)}, v(n_ff, 900 + l * 10));
-        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
-                     v(n_ff * n_embd, 1300 + l * 10));
+        put(p + "ffn_gate.weight", n_ff, n_embd, 500 + l * 10);
+        put(p + "ffn_up.weight", n_ff, n_embd, 900 + l * 10);
+        put(p + "ffn_down.weight", n_embd, n_ff, 1300 + l * 10);
     }
     return b.write(path);
+}
+
+// One drafted block's logits rows for a head set, through the same calls the
+// speculative loop makes: prefill (which commits the features), then
+// draft_block_rows. Shared by the tests that compare two files.
+static bool dflash_rows_of(const std::string &target, const std::string &head_path,
+                           std::vector<f32> &out, std::string &err) {
+    Backend *cpu = make_cpu_backend();
+    Engine engine;
+    EngineConfig cfg;
+    cfg.model_path = target;
+    cfg.n_ctx = 64;
+    if (!engine.init(cpu, cfg, &err)) return false;
+    if (!engine.load_dflash(head_path, &err)) return false;
+    GenerateParams p;
+    p.prompt = "the";
+    p.max_tokens = 1;
+    p.sampler.greedy = true;
+    GenerateResult gr;
+    if (!engine.generate(p, &gr)) return false;
+    std::vector<i32> ids;
+    if (engine.tokenizer().encode("the", ids, true) <= 0 || ids.empty()) {
+        err = "the fixture prompt does not encode";
+        return false;
+    }
+    const Model &m = engine.model();
+    const i32 nv = m.cfg().n_vocab;
+    const i32 blk = engine.dflash_block_size();
+    Engine::DflashRows dfr;
+    const i32 nr = engine.draft_block_rows(m.tok_embd(), m.out_head(), nv, ids.back(),
+                                           blk - 1,
+                                           static_cast<i32>(gr.prompt_tokens), dfr);
+    if (nr <= 0) {
+        err = "the block produced no rows";
+        return false;
+    }
+    out = dfr.data;
+    return true;
+}
+
+// The third spelling: poolside's `dflash-draft` export. Renamed tensors, one
+// aux norm per layer, `post_attention_norm` for the FFN norm, and no
+// `vocab_size` -- so it exercises both the name fallbacks and the vocabulary
+// fallback. The numbers are the canonical file's, so the drafted rows have to
+// come out identical: a spelling moves names, never values.
+static void test_dflash_laguna_spelling() {
+    const char *target = "kraken-dflash-laguna-target.gguf";
+    CHECK(build_dflash_target(target), "wrote the DFlash target model");
+    const std::string plain = "kraken-dflash-canonical.gguf";
+    const std::string laguna = "kraken-dflash-laguna.gguf";
+    CHECK(build_dflash_head_set(plain, 12), "wrote the canonical head set");
+    CHECK(build_dflash_head_set(laguna, 12, std::string(), false, true),
+          "wrote the poolside-spelling head set");
+    std::vector<f32> a_rows, b_rows;
+    std::string ea, eb;
+    const bool ok_a = dflash_rows_of(target, plain, a_rows, ea);
+    const bool ok_b = dflash_rows_of(target, laguna, b_rows, eb);
+    if (!ok_a) std::fprintf(stderr, "  (canonical: %s)\n", ea.c_str());
+    if (!ok_b) std::fprintf(stderr, "  (poolside spelling: %s)\n", eb.c_str());
+    CHECK(ok_a && ok_b, "both spellings load and draft");
+    if (!ok_a || !ok_b) return;
+    CHECK(a_rows.size() == b_rows.size(),
+          "the two spellings draft the same number of rows");
+    f32 worst = 0.0f;
+    for (size_t i = 0; i < std::min(a_rows.size(), b_rows.size()); i++)
+        worst = std::max(worst, std::fabs(a_rows[i] - b_rows[i]));
+    CHECK(worst == 0.0f, "and the same numbers: a spelling moves names, not values");
+}
+
+// NVFP4 global scales on a DFlash head set. The drafter has its own weight
+// uploader and its own projections, so the trunk's `gemm_w` rule has to reach it
+// too -- and it is checked the same way: the same matrix written two ways (f16
+// twin vs NVFP4 + 0.5 sidecar) must produce the same drafted logits row for row.
+static void test_nvfp4_sidecar_dflash() {
+    const char *target = "kraken-dflash-scale-target.gguf";
+    CHECK(build_dflash_target(target), "wrote the DFlash target model");
+
+    // fc (the fusion projection, run inside commit) and one decoder block's down
+    // projection are the two shapes whose contraction is a whole NVFP4 block.
+    const char *arms[] = {"fc.weight", "blk.0.ffn_down.weight"};
+    for (const char *arm : arms) {
+        const std::string twin = std::string("kraken-dflash-f16-") + "x.gguf";
+        const std::string scaled = std::string("kraken-dflash-nvfp4-") + "x.gguf";
+        CHECK(build_dflash_head_set(twin, 12, arm, false),
+              "wrote the f16 head set");
+        CHECK(build_dflash_head_set(scaled, 12, arm, true),
+              "wrote the NVFP4 head set");
+        std::vector<f32> a_rows, b_rows;
+        std::string ea, eb;
+        const bool ok_a = dflash_rows_of(target, twin, a_rows, ea);
+        const bool ok_b = dflash_rows_of(target, scaled, b_rows, eb);
+        if (!ok_a) std::fprintf(stderr, "  (dflash f16 twin: %s)\n", ea.c_str());
+        if (!ok_b) std::fprintf(stderr, "  (dflash nvfp4: %s)\n", eb.c_str());
+        CHECK(ok_a && ok_b, "both head sets load and draft");
+        if (!ok_a || !ok_b) continue;
+        CHECK(a_rows.size() == b_rows.size(),
+              "the two head sets draft the same number of rows");
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < std::min(a_rows.size(), b_rows.size()); i++)
+            worst = std::max(worst, std::fabs(a_rows[i] - b_rows[i]));
+        if (worst > 2.0f)
+            std::fprintf(stderr, "  (dflash arm %s: rows differ by %.4g)\n", arm,
+                         static_cast<double>(worst));
+        CHECK(worst < 2.0f, "and its drafted logits match the f16 twin's");
+    }
+}
+
+// The masked-block contract (AttnDesc::skip_from): a candidate row of a block
+// sees the context and ITSELF, never its sibling candidates. Checked by
+// perturbation, because invariance under a change the row cannot see IS the
+// property -- and a no-op mask cannot fake it, since the same perturbation must
+// move the row when the mask is off.
+static void test_attention_self_mask() {
+    Backend *cpu = make_cpu_backend();
+    const i64 nh = 2, nkv = 2, hd = 8, nt = 3;
+    const i64 kv_dim = nkv * hd;
+    const i64 npos = 8;
+    const i64 layer_stride = npos * kv_dim;
+    const size_t ne = static_cast<size_t>(layer_stride);
+
+    std::vector<f32> kc(ne, 0.0f), vc(ne, 0.0f);
+    for (i64 j = 0; j < nt; j++)
+        for (i64 i = 0; i < kv_dim; i++) {
+            kc[static_cast<size_t>(j * kv_dim + i)] =
+                0.1f * static_cast<f32>((j + 1) * (i + 3));
+            vc[static_cast<size_t>(j * kv_dim + i)] =
+                0.05f * static_cast<f32>((j + 2) * (i + 1)) - 0.2f;
+        }
+    std::vector<f32> q(static_cast<size_t>(nt * nh * hd));
+    for (size_t i = 0; i < q.size(); i++)
+        q[i] = 0.03f * static_cast<f32>((static_cast<i64>(i) % 7) - 3);
+
+    AttnDesc d;
+    d.n_head = nh;
+    d.n_kv = nkv;
+    d.hd = hd;
+    d.n_tok = nt;
+    d.pos0 = 0;
+    d.pos_stride = kv_dim;
+    d.layer_stride = layer_stride;
+    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(hd)));
+    d.causal = true;
+    d.window = 0;
+
+    std::vector<f32> out_a(q.size(), 0.0f), out_b(q.size(), 0.0f), out_c(q.size(), 0.0f);
+
+    // Arm 1: the mask hides the sibling. Rows are at positions 0, 1, 2, so
+    // skip_from = 1 masks row 1 out of row 2's view (and nothing out of row 1's
+    // own, whose skip range [1, 1) is empty).
+    AttnDesc m = d;
+    m.skip_from = 1;
+    cpu->attention(out_a.data(), q.data(), kc.data(), vc.data(), m);
+
+    std::vector<f32> kc2 = kc, vc2 = vc;
+    for (i64 i = 0; i < kv_dim; i++) {
+        kc2[static_cast<size_t>(kv_dim + i)] += 1.5f;
+        vc2[static_cast<size_t>(kv_dim + i)] -= 1.5f;
+    }
+    cpu->attention(out_b.data(), q.data(), kc2.data(), vc2.data(), m);
+
+    const auto row = [&](const std::vector<f32> &o, i64 t) {
+        std::vector<f32> r(static_cast<size_t>(nh * hd));
+        for (i64 i = 0; i < nh * hd; i++)
+            r[static_cast<size_t>(i)] = o[static_cast<size_t>(t * nh * hd + i)];
+        return r;
+    };
+    const auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 w = 0.0f;
+        for (size_t i = 0; i < std::min(a.size(), b.size()); i++)
+            w = std::max(w, std::fabs(a[i] - b[i]));
+        return w;
+    };
+
+    CHECK(maxdiff(row(out_a, 2), row(out_b, 2)) == 0.0f,
+          "a masked sibling cannot move this row: bit-identical under perturbation");
+    CHECK(maxdiff(row(out_a, 1), row(out_b, 1)) > 0.01f,
+          "while the perturbed row itself does move (the perturbation is real)");
+    CHECK(maxdiff(row(out_a, 0), row(out_b, 0)) == 0.0f,
+          "and row 0 is untouched, as causality already required");
+
+    // Arm 2: no mask -- the same perturbation must reach row 2, or arm 1 proved
+    // nothing about the mask.
+    AttnDesc off = d;
+    off.skip_from = -1;
+    cpu->attention(out_c.data(), q.data(), kc2.data(), vc2.data(), off);
+    CHECK(maxdiff(row(out_c, 2), row(out_a, 2)) > 0.01f,
+          "with skip_from off the same sibling perturbation does reach row 2");
+
+    // Arm 3: the mask is a RANGE, so a block that starts at position 0 leaves a
+    // row with exactly one visible key -- its own. The output is then V itself.
+    AttnDesc one = d;
+    one.skip_from = 0;
+    std::vector<f32> out_d(q.size(), 0.0f);
+    cpu->attention(out_d.data(), q.data(), kc.data(), vc.data(), one);
+    f32 worst = 0.0f;
+    for (i64 h = 0; h < nh; h++)
+        for (i64 i = 0; i < hd; i++) {
+            const i64 hkv = h % nkv;
+            const f32 want = vc[static_cast<size_t>(2 * kv_dim + hkv * hd + i)];
+            const f32 got = out_d[static_cast<size_t>(2 * nh * hd + h * hd + i)];
+            worst = std::max(worst, std::fabs(want - got));
+        }
+    CHECK(worst < 1e-6f, "a row whose only visible key is itself returns V");
+
+    // Arm 4: a block whose rows are the only thing in range still produces
+    // finite numbers (the all-masked-tile trap: exp(0) would leak a phantom
+    // unit of denominator mass).
+    bool finite = true;
+    for (f32 x : out_d) finite = finite && std::isfinite(x);
+    CHECK(finite, "and no NaN or inf appears in the fully masked case");
+    delete cpu;
 }
 
 static void test_dflash_mask_guard() {
@@ -13768,10 +14774,11 @@ static void test_pageable_path_probe() {
     const size_t mib = static_cast<size_t>(1) << 20;
     const size_t gib = static_cast<size_t>(1) << 30;
 
-    auto probe = [&](double ring_gbs, double direct_gbs, double pin_gbs) {
+    auto probe = [&](double ring_gbs, double direct_gbs, double pin_gbs,
+                     double block_gbs = -1.0) {
         CountingBackend be(make_cpu_backend());
         be.set_test_resources(16 * gib, 8 * gib, 16 * gib, 8 * gib);
-        be.set_test_aperture(ring_gbs, direct_gbs, pin_gbs);
+        be.set_test_aperture(ring_gbs, direct_gbs, pin_gbs, block_gbs);
         return krk::probe_h2d_path(&be, 4 * mib, 3);
     };
 
@@ -13796,6 +14803,23 @@ static void test_pageable_path_probe() {
           "a windowed aperture keeps the staging ring");
     CHECK(!krk::pageable_direct_wins(narrow.pageable_gbs, narrow.direct_gbs),
           "and the probe does not switch paths on it");
+
+    // The third arm, at this box's SHAPE: the ring is far behind, and the
+    // driver's own blocking copy is the fastest thing the card offers. The
+    // probe has to measure it (not assume it), report it, and hand the engine a
+    // path of 2 -- the case the old two-way menu could not express at all.
+    const krk::H2dProbe blocking = probe(8.4, 10.0, 24.4, 22.9);
+    CHECK(blocking.valid && blocking.blocking_gbs > 0.0,
+          "the probe measures the blocking copy as a fourth arm");
+    CHECK(blocking.blocking_gbs > blocking.pageable_gbs,
+          "and it measures the ring as the slowest mechanism on that card");
+    CHECK(krk::h2d_path(blocking) == 2,
+          "so the probe's own numbers select the blocking copy");
+    CHECK(krk::h2d_path_gbs(blocking) == blocking.blocking_gbs,
+          "and the rate the engine pins against is the chosen arm's, not the ring's");
+    CHECK(blocking.aperture_wide,
+          "the aperture is WIDE by measurement: 22.9 against 24.4 GB/s pinned");
+    CHECK(!krk::H2dProbe{}.aperture_wide, "an unmeasured probe claims nothing");
 
     // --- when the probe is allowed to stop -------------------------------
     // Driven with the rates measured on this box (`--h2d-noise`, one size per
@@ -13874,10 +14898,11 @@ static void test_pageable_path_probe() {
           "wrote the MoE fixture for the aperture test");
     auto run = [&](double ring_gbs, double direct_gbs, double pin_gbs,
                    bool *direct_on, size_t *pin, std::vector<i32> *tokens,
-                   krk::H2dProbe *used) {
+                   krk::H2dProbe *used, double block_gbs = -1.0,
+                   int *path_used = nullptr) {
         auto *be = new CountingBackend(make_cpu_backend());
         be->set_test_resources(16 * gib, 8 * gib, 16 * gib, 8 * gib);
-        be->set_test_aperture(ring_gbs, direct_gbs, pin_gbs);
+        be->set_test_aperture(ring_gbs, direct_gbs, pin_gbs, block_gbs);
         Engine engine;
         EngineConfig cfg;
         cfg.model_path = path;
@@ -13898,6 +14923,7 @@ static void test_pageable_path_probe() {
                 std::fprintf(stderr, "  aperture generate failed\n");
             *tokens = r.tokens;
             *direct_on = be->direct_enabled();
+            if (path_used) *path_used = be->path();
             *pin = engine.model().experts().host_pin_budget();
             *used = engine.h2d_probe();
         }
@@ -13926,24 +14952,40 @@ static void test_pageable_path_probe() {
     // verdict for the pin here would assert this box's scheduler -- direct and
     // pinned are the same copy on a wide aperture, so that gap is a near-tie by
     // construction.
-    CHECK(wide_direct ==
-              krk::pageable_direct_wins(wide_used.pageable_gbs, wide_used.direct_gbs),
+    CHECK(wide_direct == (krk::h2d_path(wide_used) == 1),
           "the path the engine set is the one its own measurement selected");
     CHECK((wide_pin > 0) ==
-              krk::warm_pin_worthwhile(
-                  wide_direct ? wide_used.direct_gbs : wide_used.pageable_gbs,
-                  wide_used.pinned_gbs),
+              krk::warm_pin_worthwhile(krk::h2d_path_gbs(wide_used),
+                                       wide_used.pinned_gbs),
           "and its pin follows the rate the chosen path will pay");
-    CHECK(narrow_direct ==
-              krk::pageable_direct_wins(narrow_used.pageable_gbs,
-                                        narrow_used.direct_gbs),
+    CHECK(narrow_direct == (krk::h2d_path(narrow_used) == 1),
           "the narrow run applied its own verdict too");
     CHECK((narrow_pin > 0) ==
-              krk::warm_pin_worthwhile(narrow_used.pageable_gbs,
+              krk::warm_pin_worthwhile(krk::h2d_path_gbs(narrow_used),
                                        narrow_used.pinned_gbs),
           "and its pin is the one its own numbers justified");
     CHECK(wide_tokens.size() == narrow_tokens.size() && wide_tokens == narrow_tokens,
           "both apertures decode the same tokens: the path is not numerical");
+
+    // The third mechanism, end to end: a card whose fastest pageable path is the
+    // driver's blocking copy. The engine has to apply path 2 (a value the old
+    // two-way setting could not express), leave `direct` off, and decode the
+    // same tokens -- this is the wiring the ReBAR fix exists for.
+    bool block_direct = true;
+    size_t block_pin = 1;
+    int engine_path = -1;
+    std::vector<i32> block_tokens;
+    krk::H2dProbe block_used;
+    const bool block_ok = run(8.4, 10.0, 24.4, &block_direct, &block_pin,
+                              &block_tokens, &block_used, 22.9, &engine_path);
+    CHECK(block_ok && block_used.valid, "the engine initialises on a blocking-fast card");
+    CHECK(krk::h2d_path(block_used) == 2,
+          "its own measurement says the blocking copy is the fastest mechanism");
+    CHECK(engine_path == 2,
+          "and the engine APPLIED it -- not just reported it");
+    CHECK(!block_direct, "the direct flag is off, because blocking is not direct");
+    CHECK(block_tokens == wide_tokens,
+          "the blocking path decodes the same tokens as the rest");
 
     // --- the cache init reaches for before it measures -----------------------
     // The probe measures the CARD, so its answer is stable across runs and is
@@ -14000,8 +15042,9 @@ static void test_pageable_path_probe() {
     const krk::H2dCacheLookup back = krk::h2d_probe_cache_read(cache_path, key, now);
     CHECK(back.hit && std::fabs(back.probe.pageable_gbs - wide.pageable_gbs) < 1e-3 &&
               std::fabs(back.probe.direct_gbs - wide.direct_gbs) < 1e-3 &&
+              std::fabs(back.probe.blocking_gbs - wide.blocking_gbs) < 1e-3 &&
               std::fabs(back.probe.pinned_gbs - wide.pinned_gbs) < 1e-3,
-          "it reads back as the same three rates");
+          "it reads back as the same four rates");
     CHECK(back.hit && back.probe.valid, "... and as a usable verdict, not just numbers");
 
     // Each invalidation rule is a way a cached answer would be WRONG, so each
@@ -14077,7 +15120,7 @@ static void test_pageable_path_probe() {
         CHECK(f != nullptr, "the reasons file is there to seed");
         if (f) {
             auto emit = [&](int driver, size_t bytes, long long stamp) {
-                std::fprintf(f, "2\t%s\t%llu\t%d\t%d\t%llu\t0.4\t20\t20\t%lld\n",
+                std::fprintf(f, "3\t%s\t%llu\t%d\t%d\t%llu\t0.4\t20\t0.4\t20\t%lld\n",
                              key.name.c_str(),
                              static_cast<unsigned long long>(key.vram_total),
                              key.large_bar, driver,
@@ -14114,7 +15157,7 @@ static void test_pageable_path_probe() {
         CHECK(f != nullptr, "the listing file is there to seed");
         if (f) {
             auto emit = [&](int driver, size_t bytes, long long stamp) {
-                std::fprintf(f, "2\t%s\t%llu\t%d\t%d\t%llu\t0.4\t20\t20\t%lld\n",
+                std::fprintf(f, "3\t%s\t%llu\t%d\t%d\t%llu\t0.4\t20\t0.4\t20\t%lld\n",
                              key.name.c_str(),
                              static_cast<unsigned long long>(key.vram_total),
                              key.large_bar, driver,
@@ -14227,7 +15270,7 @@ static void test_pageable_path_probe() {
             CHECK(f != nullptr, "the verdict fixture is there to seed");
             if (f) {
                 auto emit = [&](int driver, size_t bytes, long long stamp) {
-                    std::fprintf(f, "2\t%s\t%llu\t%d\t%d\t%llu\t0.4\t20\t20\t%lld\n",
+                    std::fprintf(f, "3\t%s\t%llu\t%d\t%d\t%llu\t0.4\t20\t0.4\t20\t%lld\n",
                                  key.name.c_str(),
                                  static_cast<unsigned long long>(key.vram_total),
                                  key.large_bar, driver,
@@ -14260,7 +15303,7 @@ static void test_pageable_path_probe() {
             CHECK(f != nullptr, "the rollback fixture is there to seed");
             if (f) {
                 std::fprintf(f,
-                             "2\t%s\t%llu\t%d\t%d\t%llu\t0.4\t20\t20\t%lld\n",
+                             "3\t%s\t%llu\t%d\t%d\t%llu\t0.4\t20\t0.4\t20\t%lld\n",
                              key.name.c_str(),
                              static_cast<unsigned long long>(key.vram_total),
                              key.large_bar, key.driver_version + 1,
@@ -15067,6 +16110,9 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_prefill_chunk_bitexact)
     TEST_GROUP(group_attention_sinks)
     TEST_GROUP(test_moe_schema_and_laziness)
+    TEST_GROUP(test_moe_per_layer_experts)
+    TEST_GROUP(test_moe_latent)
+    TEST_GROUP(test_nvfp4_sidecar_scale)
     TEST_GROUP(test_moe_batch_fallback)
     TEST_GROUP(test_router_resident_preference)
     TEST_GROUP(test_moe_matches_dense_twin)
@@ -15076,6 +16122,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_expert_cache_byte_budget)
     TEST_GROUP(test_expert_cache_warm_tier)
     TEST_GROUP(test_expert_dispatch_table)
+    TEST_GROUP(test_expert_dispatch_host_backed)
     TEST_GROUP(test_draft_head)
     TEST_GROUP(test_mtp_sidecar)
     TEST_GROUP(test_expert_warmup)
@@ -15103,7 +16150,10 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_gdn_model_loads)
     TEST_GROUP(test_gdn_generation)
     TEST_GROUP(test_speculative_decoding)
+    TEST_GROUP(test_attention_self_mask)
     TEST_GROUP(test_dflash_mask_guard)
+    TEST_GROUP(test_nvfp4_sidecar_dflash)
+    TEST_GROUP(test_dflash_laguna_spelling)
     TEST_GROUP(test_json)
     TEST_GROUP(test_http_server)
     TEST_GROUP(test_par_pool_covers_every_block)

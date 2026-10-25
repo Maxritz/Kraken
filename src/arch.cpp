@@ -293,11 +293,31 @@ constexpr ArchSpec kTable[] = {
     {"qwen35-dflash-draft", ArchShape::Dense, ArchSupport::Yes, ArchRole::Draft,
      "dflash", "",
      true, false, false, false, true, true},
+    // Poolside's own Laguna export, which is the third spelling of the same head
+    // set: `dflash-draft.*` metadata keys and underscore tensor names
+    // (`dflash_fc.weight`, `dflash_hidden_norm.weight`,
+    // `dflash_aux_hidden_norm.N.weight`), with the FFN norm stored as
+    // `post_attention_norm`. src/dflash.cpp reads all three spellings from one
+    // loader, so this entry exists to stop the name being refused before it ever
+    // reaches that loader -- the same flags, because the tensors are the same.
+    {"dflash-draft", ArchShape::Dense, ArchSupport::Yes, ArchRole::Draft,
+     "dflash", "",
+     true, false, false, false, true, true},
     // DSpark is a different head family (Markov/diffusion heads over the
     // target's nextn state) that nothing here reads yet, so it stays refused
     // rather than being claimed by the DFlash loader.
+    //
+    // The message describes the schema the files actually carry, not a
+    // `dspark.*` prefix: `fc.weight` over the target-layer stack, a `blk.N`
+    // stack whose attention is non-causal over a draft block of
+    // `dspark.block_size` rows, `markov.w1/w2` (a rank-256 bigram head) and
+    // `confidence.proj`. The block count is per file (5 and 6 on this box), so
+    // it is not stated here. What is missing is the forward, not a tensor.
     {"dspark", ArchShape::Dense, ArchSupport::No, ArchRole::Draft, "qwen35",
-     "dspark speculative head set (dspark.*, 6 blocks) rather than a model",
+     "a dspark draft-block head set: fc over the target-layer stack, a blk.N "
+     "stack with non-causal attention over a block of draft rows, a markov "
+     "bigram head and a confidence head -- a parallel block drafter, which this "
+     "engine does not implement (dflash, its one-block cousin, is served)",
      false, false, false, false},
     // Laguna (poolside): MoE with a sigmoid router, a per-expert selection
     // bias added to the probabilities before the top-k, a per-head softplus

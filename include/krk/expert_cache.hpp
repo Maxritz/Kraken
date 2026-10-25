@@ -84,8 +84,23 @@ struct QuantTensor {
     DType type = DType::Unknown; // Unknown => tensor absent
     i64 n_in = 0;                // contiguous inner dimension
     i64 n_out = 1;               // outer dimension
+    // The per-tensor global scale GGUF stores BESIDE an NVFP4 weight, as
+    // "<tensor>.scale". NVFP4 is a 4-bit code times a per-16-value UE4M3
+    // micro-scale and that product is NOT the weight: the global factor has to
+    // be applied on top. It is a property of the tensor, so it lives on the
+    // descriptor the loader fills, and every consumer applies it -- the engine
+    // through gemm_w(), which folds it into the projection's result. Ignoring it
+    // is not a rounding difference: measured on the Nemotron 3.5 Bolt file the
+    // factor is 7,480x, and on the Lightning file the routed experts' raw
+    // magnitude is four orders out. 1.0 for every format that has no sidecar,
+    // which is every non-NVFP4 weight, so those take exactly the path they did.
+    f32 gs = 1.0f;
 
     bool present() const { return data != nullptr && type != DType::Unknown; }
+    // Does this weight need its sidecar applied? The engine asks this to decide
+    // between its plain and its scaled launch, and to keep a fused multi-matrix
+    // launch (which cannot scale each output differently) off a scaled weight.
+    bool scaled() const { return gs != 1.0f; }
 };
 
 // One layer's three expert tensors, still pointing into the GGUF mapping. The
@@ -371,6 +386,18 @@ public:
     // those four, accumulated over the whole run, so one run localises the
     // cost instead of a sequence of A/B arms.
     f64 read_ms() const { return read_ms_; }   // read_host / mapping memcpy
+    // The warmup's other two thirds, which `read_ms` does not cover: the
+    // preparation of the batch (room-making; the allocations are timed
+    // separately, in alloc_ms) and the commit that hands the finished slices to
+    // the tier. A phase whose read is 32% of its wall time cannot be improved
+    // by a faster read.
+    f64 prep_ms() const { return prep_ms_; }
+    // Wall time the per-slice allocations spent running CONCURRENTLY with the
+    // file read. Without it a pipelined phase reads exactly like a serialised
+    // one: the read still costs what it cost, it just stopped being on the
+    // critical path, and only `alloc + read - wall` says so.
+    f64 overlap_ms() const { return overlap_ms_; }
+    f64 commit_ms() const { return commit_ms_; }
     f64 room_ms() const { return room_ms_; }   // make_vram_room: evict + retire
     // The two halves of the room row: the victim search (a scan of the slot
     // map) and the release of the cells it picked. They have different fixes,
@@ -583,12 +610,15 @@ public:
     // every MoE layer (measured: 0.523 ms/layer, 85% of it waiting for the
     // layer's own GPU work to retire, on Mellum2.1).
     //
-    // The table is a promise about RESIDENCY, so it is only published when that
-    // promise can be kept: `whole_set_resident` must hold, i.e. every
-    // (layer, expert) of the corpus is in VRAM. Then no promotion and no
-    // eviction can rewrite a pointer underneath the kernel. Anything else
-    // publishes nothing and the caller keeps the host path -- a half-valid
-    // table would be a wrong answer, not a slow one.
+    // The table is a promise about ADDRESSABILITY, so it is published when every
+    // (layer, expert) of the corpus can be named by a kernel: either a VRAM pool
+    // cell, or a PINNED host slot the kernel reads in place (24.3 GiB/s on this
+    // card against 485 GiB/s for VRAM, measured with tools/probe_hostread.hip).
+    // The second case is what lets a routed set larger than the card dispatch at
+    // all -- a set that fits has no use for it. Nothing else publishes: an
+    // absent or pageable cell would have to be skipped, and a skipped expert is
+    // a wrong answer, not a slow one. `whole_set_resident` remains as the
+    // stricter query for callers that want the all-VRAM case.
     bool whole_set_resident(i32 n_layer, i32 n_expert) const;
     // Builds and uploads the table; nullptr (with `why` filled) when the
     // residency promise does not hold or the allocator refuses. Re-publishing
@@ -597,6 +627,9 @@ public:
     void *publish_dispatch_table(i32 n_layer, i32 n_expert, i32 *published_out,
                                  std::string *why);
     const void *dispatch_table() const { return table_; }
+    // How many of the published table's cells are read in place from pinned host
+    // memory (the rest name VRAM cells). Only meaningful while a table exists.
+    i32 dispatch_table_host_cells() const { return table_host_cells_; }
     // A promotion or an eviction rewrote a pointer after the publish, so the
     // callers that already hold a table pointer must stop using it.
     bool dispatch_table_stale() const { return table_stale_; }
@@ -610,6 +643,10 @@ private:
         i32 layer = -1;
         i32 expert = -1;
         size_t bytes = 0;
+        // The ONE host block this read-ahead landed in. t[i].p are offsets into
+        // it (see warm_block_layout in the .cpp), so this -- not t[i].p -- is
+        // what pf_free releases.
+        void *base = nullptr;
         struct T {
             void *p = nullptr;
             size_t len = 0;
@@ -841,6 +878,9 @@ private:
     u64 lookahead_rejected_ = 0; // stage_batch candidates the budget could not hold
     f64 promote_ms_ = 0;     // wall time in promote_to_vram
     f64 read_ms_ = 0;        // wall time in the WARM file read
+    f64 prep_ms_ = 0;        // ... and in preparing a stage batch (room + keys)
+    f64 commit_ms_ = 0;      // ... and in committing it to the tier
+    f64 overlap_ms_ = 0;     // allocation time that hid behind a read
     f64 room_ms_ = 0;        // wall time making VRAM room
     f64 scan_ms_ = 0;        // ... of which the victim search
     f64 retire_ms_ = 0;      // ... and the cell release
@@ -889,6 +929,11 @@ private:
     void *table_ = nullptr;
     size_t table_bytes_ = 0;
     bool table_stale_ = false;
+    // Cells of the last published table that name pinned host memory instead of
+    // a pool cell. Reported so a run can say how much of the routed set is
+    // being read over the bus, rather than leaving it to be inferred from a
+    // tok/s that moved.
+    i32 table_host_cells_ = 0;
 };
 
 } // namespace krk

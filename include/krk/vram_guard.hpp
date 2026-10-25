@@ -304,7 +304,8 @@ inline bool warm_pin_worthwhile(double pageable_gbs, double pinned_gbs) {
 // memcpy plus the per-chunk bookkeeping are gone.
 //
 // 1.20x, and that line is above a band that was MEASURED to flap. On this box
-// (256 MiB aperture) the same two paths read 9.3 against 10.5 GB/s at 16 MiB
+// (whose runtime CLAIMS a 256 MiB aperture -- see `aperture_is_wide`) the same
+// two paths read 9.3 against 10.5 GB/s at 16 MiB
 // (+13%) and 10.88 against 11.00 at 12.6 MB (+1%) -- the size alone moved the
 // answer across a 1.10 line, and a path chosen by that would be chosen by the
 // probe size rather than by the card. A wide aperture does not land in that
@@ -316,6 +317,66 @@ inline bool warm_pin_worthwhile(double pageable_gbs, double pinned_gbs) {
 inline bool pageable_direct_wins(double ring_gbs, double direct_gbs) {
     if (!(ring_gbs > 0.0) || !(direct_gbs > 0.0)) return false;
     return direct_gbs >= ring_gbs * 1.20;
+}
+
+// Which of the THREE pageable mechanisms runs: 0 = staging ring, 1 = direct
+// (driver-staged pageable DMA), 2 = the plain blocking hipMemcpy. -1 when
+// nothing was measured.
+//
+// The third arm is here because the first two are not the whole menu, and the
+// one they omit is the one a wide aperture makes fastest. Measured on this box
+// (RX 9070 XT, 15.9 GiB, ReBAR ON while hipDeviceAttributeIsLargeBar says 0),
+// same buffers, 7 copies, median, one process, `tools/bar_probe.hip`:
+//
+//   size    blocking  direct   ring   pinned
+//   4 MiB     13.39    13.12   10.05   16.40
+//   16 MiB    14.40    15.23    9.47   24.35
+//   64 MiB    17.01    16.18    8.78   27.06
+//   256 MiB   22.90    23.10    8.43   28.06
+//   1024 MiB  22.15    21.98    8.39   28.26
+//
+// The ring's host memcpy caps it at ~8.5-10 GB/s at every size and the two
+// driver-staged arms leave that behind above 4 MiB, so a policy that only ever
+// compares ring against direct cannot see the 1.5-2.7x sitting in blocking, and
+// it pays the ring's copy on every promotion and every streamed weight.
+//
+// The SAME 1.20x band as `pageable_direct_wins`, for the same reason: below it
+// the two paths are inside the noise the probe was measured to have, and the
+// ring at least owns a buffer and a known fallback. Arms are compared against
+// the running best rather than pairwise, so the answer does not depend on the
+// order they were measured in.
+inline int pageable_path_choice(double ring_gbs, double direct_gbs,
+                               double blocking_gbs) {
+    int best = -1;
+    double rate = 0.0;
+    const double gbs[3] = {ring_gbs, direct_gbs, blocking_gbs};
+    for (int p = 0; p < 3; p++) {
+        if (!(gbs[p] > 0.0)) continue;
+        if (best < 0 || gbs[p] >= rate * 1.20) {
+            best = p;
+            rate = gbs[p];
+        }
+    }
+    return best;
+}
+
+// Is the aperture WIDE -- i.e. can the driver write a pageable buffer straight
+// into device memory instead of staging it through a 256 MiB window? Decided by
+// measurement, because the runtime's own answer is not usable: this box reports
+// `hipDeviceAttributeIsLargeBar` 0 while a 1 GiB pageable copy runs at 22.2 GB/s
+// and the device reads host-mapped memory in place at ~10 GB/s, neither of which
+// a 256 MiB window can do.
+//
+// The test is the best pageable rate against the pinned one at the same shape.
+// A wide aperture lets the driver pin and DMA the source itself, so it lands
+// near the pinned rate (measured 15.2 against 24.4 GB/s at 16 MiB = 0.62, and
+// 23.1 against 28.1 at 256 MiB = 0.82). Through a window the staging copy is
+// paid twice, so the best pageable arm stays around a third of pinned (8.4
+// against 24.4 = 0.34). Half sits between the two populations, and the gap on
+// each side is wide enough that probe noise cannot cross it.
+inline bool aperture_is_wide(double pageable_gbs, double pinned_gbs) {
+    if (!(pageable_gbs > 0.0) || !(pinned_gbs > 0.0)) return false;
+    return pageable_gbs >= pinned_gbs * 0.5;
 }
 
 // Process-wide pageable-memory admission shared by the expert WARM tier and
@@ -471,18 +532,21 @@ inline bool expert_budget_fits(size_t budget, size_t total_vram, size_t used,
     if (largest_fits) *largest_fits = room;
     if (total_vram == 0 || budget <= room) return true;
     if (why) {
+        // The suggested flag is the room TRUNCATED to whole MiB, not rounded:
+        // rounding up handed back a value one MiB too large, so following the
+        // engine's own advice re-ran into the same refusal (measured: 11722 MiB
+        // refused while the message named 11722 as the largest that fits).
+        const size_t room_mib = room / 1048576;
         char b[512];
         std::snprintf(
             b, sizeof(b),
             "expert budget %.0f MiB does not fit: %.0f MiB of VRAM, %.0f MiB "
             "already in use, %.0f MiB reserved -> the largest budget this card "
-            "can hold is %.0f MiB (--expert-cache-mb %.0f)",
+            "can hold is %zu MiB (--expert-cache-mb %zu)",
             static_cast<double>(budget) / 1048576.0,
             static_cast<double>(total_vram) / 1048576.0,
             static_cast<double>(used) / 1048576.0,
-            static_cast<double>(reserve) / 1048576.0,
-            static_cast<double>(room) / 1048576.0,
-            static_cast<double>(room) / 1048576.0);
+            static_cast<double>(reserve) / 1048576.0, room_mib, room_mib);
         *why = b;
     }
     return false;

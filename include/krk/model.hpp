@@ -125,12 +125,22 @@ struct LayerWeights {
     // Per-head attention output gate: one scalar per query head, off the
     // pre-attention hidden state.
     QuantTensor wattn_gate;                       // attn_gate.weight [n_embd, n_head]
+    // The shared expert's NVFP4 global scales live on each tensor's `gs` (see
+    // QuantTensor), not in fields beside them: one rule for every weight.
     QuantTensor shexp_gate, shexp_up, shexp_down; // shared expert, if any
-    // The shared expert's NVFP4 global scales (see ExpertSource). 1.0 when the
-    // file carries no sidecar, which is every format that is not NVFP4.
-    f32 shexp_gate_scale = 1.0f, shexp_up_scale = 1.0f, shexp_down_scale = 1.0f;
     QuantTensor shexp_inp_gate;                   // [n_embd] per-token gate
     ExpertSource experts;                         // lazily-loaded routed experts
+    // ---- LatentMoE (Nemotron 3.5 Bolt) -----------------------------------
+    // The routed experts do NOT read the hidden state on this family: the block
+    // projects n_embd -> n_latent (`ffn_latent_down`), runs the bank in that
+    // narrow space and projects back (`ffn_latent_up`). The shared expert and
+    // everything outside the routed leg stay full width, which is why only the
+    // experts are latent. Both tensors present, or neither: half a pair is a
+    // layout the forward cannot run and the loader refuses it.
+    QuantTensor latent_down, latent_up;           // [n_embd, n_latent] / [n_latent, n_embd]
+    bool latent_moe() const {
+        return latent_down.present() && latent_up.present();
+    }
     // ---- MLA legacy (DeepSeek-V2-Lite: direct q, MQA kv, unsplit wkv_b) --
     // attn_q is the direct per-head query (no q_lora trunk on lite);
     // attn_kv_a_mqa emits [kv_lora + rope] (latent plus decoupled key);
@@ -239,6 +249,8 @@ struct LayerWeights {
     // ssm_in (input projection), ssm_d (optional D parameter), no ssm_alpha/beta.
     bool nemotron_ssm = false;  // This layer is a Mamba-2 SSM block (not GDN)
     QuantTensor ssm_in;         // [inner_size, n_embd] - Mamba-2 input projection
+    // NVFP4's global scale needs no field of its own: it is a property of the
+    // TENSOR, so it lives on QuantTensor::gs -- see ssm_in.gs / ssm_out.gs.
     f32 *ssm_d = nullptr;       // [dt_rank] - Mamba-2 D parameter (optional)
     // Projected per head, so these are matmul weights like any other (the
     // loader downcasts an F32 checkpoint tensor to F16).
@@ -500,11 +512,19 @@ struct ModelConfig {
 
     // Mixture-of-Experts geometry (is_moe == false for dense models).
     bool is_moe = false;
-    i32 n_expert = 0;        // routed experts per MoE layer
+    i32 n_expert = 0;        // routed experts per MoE layer (the CAP)
     i32 n_expert_used = 0;   // top-k experts activated per token
     i32 n_ff_exp = 0;        // routed-expert hidden width
     i32 n_ff_shexp = 0;      // shared-expert hidden width (0 when absent)
     i32 n_expert_shared = 0; // always-on shared experts per layer
+    // Per-layer routed-expert top-k. `expert_used_count` is a scalar in every
+    // Qwen/DeepSeek file, but a packed hybrid merge (Nemotron Bolt 74B-A9B)
+    // writes it as one entry per block -- 0 on the Mamba-2 blocks, 9 on the
+    // MoE ones -- so a single global number cannot describe it. Empty means
+    // every layer uses `n_expert_used`. The per-layer expert COUNT needs no
+    // vector here: the routed bank's own ne[2] is each layer's truth and lives
+    // on LayerWeights::experts, with `n_expert` demoted to a cap.
+    std::vector<i32> layer_n_expert_used;
 
     // ---- gated delta net (Qwen3.5 / Qwen3-Next) --------------------------
     // `recurrent` is true when at least one layer is a delta-net layer, which
@@ -650,12 +670,27 @@ public:
     u64 stage_calls() const { return stage_calls_; }
     u64 stage_bytes() const { return stage_bytes_; }
     f64 stage_ms() const { return stage_ms_; }
+    // One-hop-ahead staging: the ring slot count (1 when it is off), and how the
+    // copies that filled a slot were paid for -- in flight under the previous
+    // layer (`ahead_copies`), or synchronously because the pipeline had no
+    // prefetched slot to consume (`ahead_cold`). A cold count that grows with
+    // the token count means the ring is not actually running ahead.
+    int ring_slots() const { return ring_slots_; }
+    u64 ahead_copies() const { return ahead_copies_; }
+    u64 ahead_cold() const { return ahead_cold_; }
+    f64 ahead_wait_ms() const { return ahead_wait_ms_; }
     // Where a staged layer's wall time went: the drain that orders ring reuse,
     // the file read into pinned staging, and the host->device copy. Only useful
     // as a split -- a combined total cannot say which half to fix.
     f64 stage_sync_ms() const { return stage_sync_ms_; }
     f64 stage_read_ms() const { return stage_read_ms_; }
     f64 stage_xfer_ms() const { return stage_xfer_ms_; }
+    // The pinned host mirror: its total bytes, and how long filling it took at
+    // load. A non-zero size means staging no longer reads the file per token.
+    size_t stream_host_bytes() const {
+        return stream_host_ ? stream_host_size_ : 0;
+    }
+    f64 stream_host_fill_ms() const { return stream_host_fill_ms_; }
     // Read time that was NOT paid inside a staging pass: the next layer was
     // read into the spare pinned buffer while this one's copy was in flight.
     // It is wall time the pass would otherwise have spent, so it is reported
@@ -764,6 +799,58 @@ public:
     }
     i64 n_ff() const { return cfg_.n_ff; }
     i64 n_embd() const { return cfg_.n_embd; }
+    // ---- per-layer MoE geometry -----------------------------------------
+    // The routed bank's own width is each layer's expert count (the loader
+    // fills LayerWeights::experts from the tensors), and `n_expert` is the cap
+    // the file declares. A packed merge really does carry different counts per
+    // layer -- Nemotron Bolt 74B-A9B has 240/304/368/432/496 across its 40 MoE
+    // blocks against one `expert_count` of 496 -- so anything that sizes or
+    // routes by layer has to ask these, not the config.
+    i32 n_expert_at(i32 layer) const {
+        if (layer < 0 || layer >= static_cast<i32>(layers_.size()))
+            return cfg_.n_expert;
+        const i32 ne = static_cast<i32>(layers_[static_cast<size_t>(layer)].experts.n_expert);
+        return ne > 0 ? ne : cfg_.n_expert;
+    }
+    // Top-k for one layer: the file's per-layer array when it has one, else the
+    // model-level number, always clamped to that layer's own expert count. A k
+    // larger than ne would select the same expert twice (the loop skips taken
+    // ids, so the tail slots stay -1) and mix a plan of the wrong width.
+    i32 n_expert_used_at(i32 layer) const {
+        i32 k = cfg_.n_expert_used;
+        if (layer >= 0 && layer < static_cast<i32>(cfg_.layer_n_expert_used.size())) {
+            const i32 kv = cfg_.layer_n_expert_used[static_cast<size_t>(layer)];
+            if (kv > 0) k = kv;
+        }
+        const i32 ne = n_expert_at(layer);
+        if (ne > 0 && k > ne) k = ne;
+        return k;
+    }
+    i64 n_ff_exp_at(i32 layer) const {
+        if (layer < 0 || layer >= static_cast<i32>(layers_.size()))
+            return cfg_.n_ff_exp;
+        const i64 w = layers_[static_cast<size_t>(layer)].experts.n_ff_exp;
+        return w > 0 ? w : cfg_.n_ff_exp;
+    }
+    // True when every MoE layer has the same expert count and top-k. The
+    // device plan and the one-launch dispatch publish a UNIFORM table (one
+    // [n_layer x n_expert] grid), so a heterogeneous stack keeps the host path
+    // instead of reading past the end of its own table for the wide layers.
+    bool moe_geometry_uniform() const {
+        i32 first = -1;
+        for (i32 l = 0; l < static_cast<i32>(layers_.size()); l++) {
+            if (!layers_[static_cast<size_t>(l)].moe) continue;
+            if (first < 0) {
+                first = l;
+                continue;
+            }
+            if (n_expert_at(l) != n_expert_at(first) ||
+                n_expert_used_at(l) != n_expert_used_at(first) ||
+                n_ff_exp_at(l) != n_ff_exp_at(first))
+                return false;
+        }
+        return true;
+    }
     // Widest FFN a layer may need (dense, routed expert, or shared expert).
     i64 n_ff_ws() const {
         i64 w = cfg_.n_ff;
@@ -799,6 +886,10 @@ public:
     }
     const QuantTensor &tok_embd() const { return tok_embd_; }
     const QuantTensor &out_head() const { return out_head_; }
+    // The widest CONTRACTION among the weights that carry an NVFP4 global
+    // scale; 0 when the file has none. The engine sizes the staging buffer it
+    // scales such a weight's input into, and allocates nothing when this is 0.
+    i64 max_scaled_in() const { return max_scaled_in_; }
     const f32 *out_norm() const { return out_norm_; }
     // qwen4exp has no output_norm: the final hyper-connection mixer carries it,
     // with its own [n_embd, hc] gamma. Null on every other family.
@@ -907,6 +998,16 @@ private:
     size_t weight_budget_ = 0;   // bytes, 0 = automatic
     std::vector<u8> layer_streamed_;
     std::vector<std::vector<StreamEntry>> stream_;
+    // One contiguous device slab for every RESIDENT per-layer weight, carved at
+    // load time. Four hundred hipMalloc'd buffers of 1-15 MiB and one slab hold
+    // the same bytes, but a kernel walks the slab's pages in order instead of
+    // crossing a heap. Built to test whether allocation layout explains the
+    // in-engine read rate; null means the per-tensor path (which is correct, just
+    // more scattered). Released once, and every interior pointer into it is
+    // skipped by the per-tensor release.
+    u8 *slab_ = nullptr;
+    size_t slab_bytes_ = 0;
+    size_t slab_off_ = 0;
     void *ring_ = nullptr;
     size_t ring_bytes_ = 0;
     void *stage_host_ = nullptr; // pinned staging buffer, ring-sized
@@ -924,6 +1025,50 @@ private:
     int prefetched_slot_ = 0;
     bool prefetch_enabled_ = true;
     f64 stage_prefetch_ms_ = 0;
+    // ---- one-hop-ahead double buffering ---------------------------------
+    // The ring above is ONE layer deep, so every step is [copy layer l] then
+    // [compute layer l]: the measured 27B step is 79 ms of staging DMA and
+    // 84 ms of projections that never overlap. Two slots and a prefetch issued
+    // one layer early put the copy inside the compute that precedes it.
+    //
+    // A layer's slot is chosen by its parity and its tensor addresses are baked
+    // at load time, so nothing is re-pointed per token while the GPU may be
+    // reading. The slot a copy writes was read by the layer two before it: the
+    // copy stream is ordered behind a marker recorded at the point those kernels
+    // were enqueued (Backend::prefetch_after), and the default stream is ordered
+    // behind the copy at the point the layer runs (wait_marker_stream).
+    //
+    // Requires the pinned host mirror: with it, the copy's source never changes.
+    // Without it, a per-token read would have to stay valid until the copy
+    // landed, and the existing read pipeline is already what that path gets.
+    int ring_slots_ = 1;
+    size_t slot_bytes_ = 0;      // stride between slots; 0 when there is one
+    bool ring_ahead_ = false;    // the pipeline is live (mirror present)
+    i32 inflight_layer_ = -1;    // layer whose copy is in flight
+    void *inflight_ticket_ = nullptr;
+    u64 ahead_copies_ = 0, ahead_cold_ = 0;
+    f64 ahead_wait_ms_ = 0;
+    const u8 *slot_base(i32 l) const;
+    i32 first_streamed() const;
+    // Issue the copy that fills `next_streamed(l)`'s slot, ordered behind every
+    // kernel enqueued so far. Called from the END of stage_layer(l), which is
+    // the one point where both facts hold.
+    void issue_ahead(i32 l);
+    // The synchronous single-slot pass: drain, read, DMA. Returns false when the
+    // layer has nothing to stage.
+    bool stage_layer_now(i32 l, const std::vector<StreamEntry> &es);
+    // A pinned host mirror of every streamed layer, one allocation, each layer
+    // at its own offset. Streamed bytes do not change between tokens, so the
+    // per-token file read is pure repetition: the mirror is filled once at load
+    // and every staging pass afterwards is a DMA straight out of pinned memory.
+    // Null when the set is above the cap or the allocation failed, in which case
+    // stage_layer falls back to the read path.
+    void *stream_host_ = nullptr;
+    std::vector<size_t> stream_host_off_; // per-layer offset into stream_host_
+    bool stream_host_on_ = false;
+    size_t stream_host_size_ = 0;
+    f64 stream_host_fill_ms_ = 0;
+    void build_stream_host_mirror(size_t streamed_total);
     // Read layer `l`'s tensors into `host` at the ring's own offsets, and copy
     // them from there into the ring. Split so the read of the next layer can
     // happen between the two.
@@ -971,6 +1116,7 @@ private:
     bool load_mtp_block(std::string *err);
     std::vector<LayerWeights> layers_;
     QuantTensor tok_embd_, out_head_;
+    i64 max_scaled_in_ = 0;
     f32 *out_norm_ = nullptr;
     // qwen4exp's final mixer *is* the output norm (there is no output_norm):
     // the same lane-mix read the blocks use, applied once at the top of the

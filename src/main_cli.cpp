@@ -62,14 +62,29 @@ struct Args {
     std::string mtp_path;   // --mtp FILE: a nextn block in a file of its own
     // Decode with the file's own nextn block as the drafter (greedy only).
     bool mtp_spec = false;
-    // --prefill fast: take the rows>1 GEMM to the matrix cores (WMMA) instead of
-    // the exact grid. 5.6x the prompt throughput on a dense Q8_0, and NOT
-    // chunk-invariant from 9 rows up -- docs/PERF-ANALYSIS.md section 12s.
-    bool prefill_fast = false;
+    // The rows>1 GEMM rung: the rung lottery (matrix cores where present)
+    // instead of the exact grid. DEFAULT ON since the measurement below; the
+    // exact grid keeps every prompt row's arithmetic independent of --chunk and
+    // costs 36% of the chunk on a MoE model that is already streaming weights.
+    //
+    // 27B Q4_K_M, 191-token prompt: 45.5 tok/s exact against 196.0 with the
+    // lottery, md5-identical output at chunk 64/128/256/512. Qwen3.5-35B-A3B
+    // Q4_K_XL, same prompt: 146.3 -> 231.1 tok/s (+58%), output md5-identical,
+    // but the PREFILL HASH then differs between chunk sizes (chunk 128
+    // 1fcaeaa8..., chunk 256 3b7cab4a...) -- so --prefill-hash forces the exact
+    // rung back on, which is the only thing that gate can measure.
+    bool prefill_fast = true;
+    // True only when the caller ASKED for the fast rung, so the --prefill-hash
+    // note below fires on a real conflict instead of on every run.
+    bool prefill_fast_explicit = false;
     int hybrid_threads = 0;     // host worker threads, 0 = min(hardware, 8)
     int hybrid_max_rows = 8;    // rows the host arm runs at, 0 = unbounded
     double hybrid_frac = 1.0;   // share of RESIDENT experts forced to the host
     int draft_tokens = 4;       // speculative decoding window
+    // Whether --draft-tokens was given. The window has a measured default that
+    // differs by drafter (see the set_draft_window call), and an explicit flag
+    // always wins over it.
+    bool draft_tokens_given = false;
     bool cpu = false;
     bool greedy = false;
     bool tokenize = false;
@@ -130,7 +145,9 @@ void usage() {
         "                        last-position logits and exit. Two runs\n"
         "                        that differ only in --chunk print the same\n"
         "                        hash iff the multi-row forward is bit-exact\n"
-        "                        (the chunk-invariance gate).\n"
+        "                        (the chunk-invariance gate). Forces the exact\n"
+        "                        rung: the default fast rung is not chunk-\n"
+        "                        invariant, so the gate could not see anything.\n"
         "  --chat                wrap the prompt in a ChatML template\n"
         "  --system STR          system message for --chat\n"
         "  --cpu                 use the scalar reference backend\n"
@@ -140,6 +157,8 @@ void usage() {
         "                        quarter of installed RAM. Bounds every host\n"
         "                        tier inside the process; the model mapping and\n"
         "                        the dense trunk sit outside it.\n"
+        "  --fast-prefill         same as --prefill fast, which is now the\n"
+        "                         default; kept so existing scripts work\n"
         "  --weight-vram-mb N     dense weights kept in VRAM, in MiB. 0 (default)\n"
         "                        keeps them resident while they fit and streams\n"
         "                        whole layers from the file once they do not,\n"
@@ -229,12 +248,13 @@ void usage() {
         "                        whose MTP was published beside them). Same\n"
         "                        block, same names: --mtp-probe/--mtp-spec\n"
         "                        drive it exactly as an in-file block\n"
-        "  --prefill exact|fast  exact (default) keeps every prompt row's\n"
-        "                        arithmetic independent of --chunk; fast takes\n"
-        "                        the rows>1 GEMM to the RDNA4 matrix cores --\n"
-        "                        measured 5.6x prompt throughput on a dense\n"
-        "                        Q8_0, and the prefill hash then DIFFERS past\n"
-        "                        8 rows per chunk (docs/PERF-ANALYSIS.md 12s)\n"
+        "  --prefill exact|fast  fast (default) takes the rows>1 GEMM to the\n"
+        "                        RDNA4 matrix cores: +58% chunk throughput on\n"
+        "                        Qwen3.5-35B-A3B, output identical, but the\n"
+        "                        prefill HASH then differs between chunk sizes.\n"
+        "                        exact keeps every prompt row's arithmetic\n"
+        "                        independent of --chunk and costs that 36%.\n"
+        "                        --prefill-hash always uses exact.\n"
         "  --mtp-probe           run the file's own nextn (MTP) block for one\n"
         "                        step after prefill and print the token it\n"
         "                        drafts against the target's argmax: a match is\n"
@@ -264,7 +284,12 @@ void usage() {
         "                        residency decides placement. The knob that sweeps\n"
         "                        the split at a fixed cache size.\n"
         "  --draft MODEL         draft model for greedy speculative decoding\n"
-        "  --draft-tokens N      speculation window (default 4)\n"
+        "  --draft-tokens N      speculation window: how many tokens a round\n"
+        "                        may propose (default 4 for a draft model, 1\n"
+        "                        for --mtp-spec -- measured: on the Lightning\n"
+        "                        sidecar k=1 decoded 30.3 tok/s against 14.8 at\n"
+        "                        k=4, because a full-accept round also collects\n"
+        "                        the target's next token)\n"
         "  --draft-head FILE     EAGLE-3 draft head (a GGUF from\n"
         "                        tools/eagle_to_gguf.py); needs no extra VRAM and\n"
         "                        no draft model. Greedy is a prefix match; under\n"
@@ -328,7 +353,10 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--system") a->system = next("--system");
         else if (f == "--draft" || f == "-d") a->draft = next("--draft");
         else if (f == "--draft-tokens")
+        {
             a->draft_tokens = std::atoi(next("--draft-tokens"));
+            a->draft_tokens_given = true;
+        }
         else if (f == "--draft-head") a->draft_head = next("--draft-head");
         else if (f == "--draft-head-prime")
             a->draft_head_prime = std::atoi(next("--draft-head-prime"));
@@ -344,6 +372,19 @@ bool parse(int argc, char **argv, Args *a) {
             }
         }
         else if (f == "--chunk") a->chunk = std::atoi(next("--chunk"));
+        // Prefill GEMM policy. The default is the 'exact' grid, because
+        // test_prefill_chunk_bitexact asserts that a prefill reproduces DECODE's
+        // association byte for byte at every chunk size, and the throughput-first
+        // rung lottery does not: at rows > 8 an intermediate activation trace
+        // differs (the logits do not). That invariant costs 4x the prefill --
+        // 27B Q4_K_M, 191-token prompt: 45.5 tok/s exact against 196.0 with the
+        // lottery (gemm(wmma)), output md5 identical at chunk 64/128/256/512.
+        // This flag is the opt-out for a caller who wants the speed more than the
+        // trace-level reproducibility; KRK_GEMM_EXACT=0 is the same switch.
+        else if (f == "--fast-prefill") {
+            a->prefill_fast = true;
+            a->prefill_fast_explicit = true;
+        }
         else if (f == "--temp") a->temp = static_cast<f32>(std::atof(next("--temp")));
         else if (f == "--top-k") a->top_k = std::atoi(next("--top-k"));
         else if (f == "--top-p") a->top_p = static_cast<f32>(std::atof(next("--top-p")));
@@ -397,6 +438,7 @@ bool parse(int argc, char **argv, Args *a) {
             const std::string v = next("--prefill");
             if (v == "fast") {
                 a->prefill_fast = true;
+                a->prefill_fast_explicit = true;
             } else if (v == "exact") {
                 a->prefill_fast = false;
             } else {
@@ -593,7 +635,8 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     // the rate by the accept rate; reporting tokens/decode_ms against a step
     // count that was never incremented printed 0.0 tok/s. The two are printed
     // as what they are.
-    const bool spec_run = engine.has_draft() && engine.spec_steps() > 0;
+    const bool spec_run =
+        (engine.has_draft() || engine.mtp_spec_active()) && engine.spec_steps() > 0;
     if (spec_run) {
         const f64 spec_tps = r.decode_ms > 0 ? 1000.0 * r.generated / r.decode_ms : 0.0;
         const f64 ms_round = r.decode_steps > 0
@@ -734,6 +777,13 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                      static_cast<unsigned long long>(pool.staged_hidden),
                      static_cast<unsigned long long>(pool.staged_measured));
     }
+    if (pool.allocations || pool.reuses)
+        std::fprintf(out,
+                     "[stats ] pool-alloc where: trim %.1f ms | driver query %.1f ms "
+                     "(%llu probe(s)) | new cell %.1f ms\n",
+                     pool.trim_ms, pool.probe_ms,
+                     static_cast<unsigned long long>(pool.probes),
+                     pool.malloc_ms);
     std::fprintf(out, "[stats ] expert-pool budget %zu committed %zu live %zu reusable %zu bytes; "
                      "alloc %llu reuse %llu trim %llu guard-fallback %llu | "
                      "release %llu mark(s) for %llu slice(s), reader-done %llu | "
@@ -905,14 +955,24 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     if (be && be->pinned_dma_batches() > 0) {
         const f64 pms = be->pinned_dma_ms();
         const f64 pmib = static_cast<f64>(be->pinned_dma_bytes()) / 1048576.0;
+        // The RATE is over the batches the bracket actually covered, never over
+        // every byte: a batch that found all bracket slots busy went untimed.
+        const f64 tmib = static_cast<f64>(be->pinned_dma_timed_bytes()) / 1048576.0;
+        const unsigned long long merged = be->pinned_merged();
         std::fprintf(out,
-                     "[stats ] pinned    %llu batch(es), %.0f MiB on the copy stream "
-                     "in %.1f ms = %.1f GB/s\n"
+                     "[stats ] pinned    %llu batch(es), %.0f MiB on the copy stream; "
+                     "%.0f MiB over %llu timed batch(es) in %.1f ms = %.1f GB/s | "
+                     "%llu per-tensor copy(ies) coalesced into their neighbours\n"
                      "[stats ]           the promote timers above wrap the ENQUEUE of a "
                      "pinned copy, not its flight: read this line for the rate, and the "
-                     "step time for its cost\n",
-                     be->pinned_dma_batches(), pmib, pms,
-                     pms > 0 ? pmib / 1024.0 / (pms / 1000.0) : 0.0);
+                     "step time for its cost. Every batch here is one expert (about "
+                     "1.7 MiB), and bar_probe puts a single copy of that size at 12.6 "
+                     "GB/s against 28.3 for 1 GiB -- the fixed per-copy latency, not "
+                     "the link, is what a small promotion pays. 0 coalesced means the "
+                     "entries were not adjacent, so a decode difference is not from it\n",
+                     be->pinned_dma_batches(), pmib, tmib,
+                     be->pinned_dma_timed_batches(), pms,
+                     pms > 0 ? tmib / 1024.0 / (pms / 1000.0) : 0.0, merged);
     }
     // The draft engine owns its OWN expert tier, and its budget is derived from
     // the free VRAM left after the target has already taken its share. On a
@@ -1041,8 +1101,11 @@ int run_bench(Engine &engine, Backend *be, const Args &a, f64 load_ms,
     }
     usage.stop();
     const f64 prefill_tps = r.prompt_tokens > 0 ? r.prompt_tokens / (r.prefill_ms / 1000.0) : 0;
-    const f64 decode_tps = r.decode_steps > 0
-                               ? r.decode_steps / (r.decode_ms / 1000.0)
+    const bool spec_run =
+        (engine.has_draft() || engine.mtp_spec_active()) && engine.spec_steps() > 0;
+    const f64 decode_count = spec_run ? r.generated : r.decode_steps;
+    const f64 decode_tps = decode_count > 0
+                               ? decode_count / (r.decode_ms / 1000.0)
                                : 0;
     std::printf("\n");
     std::printf("model          %s\n", engine.model().cfg().name.c_str());
@@ -1242,20 +1305,45 @@ int main(int argc, char **argv) {
         be = make_cpu_backend();
     } else {
         // --prefill maps onto the backend's own GEMM rung switch, which is read
-        // once at construction: the exact grid is the default because it makes
-        // every prompt row's arithmetic independent of --chunk, and the matrix
-        // cores are 5.6x the prompt throughput on a dense Q8_0 while breaking
-        // that from 9 rows per chunk (docs/PERF-ANALYSIS.md section 12s).
-        if (a.prefill_fast) {
+        // once at construction. The rung lottery is the default: on
+        // Qwen3.5-35B-A3B it is 146.3 -> 231.1 tok/s (+58%) with md5-identical
+        // output, and it costs the exact grid's chunk-invariance, which nothing
+        // but --prefill-hash consumes.
+        //
+        // KRK_GEMM_EXACT is set rather than KRK_GEMM_PATH so a caller's own
+        // KRK_GEMM_PATH (dp4a/simt probes) still decides WHICH rung the ladder
+        // may use -- this flag only decides whether the exact grid outranks it.
+        // An EXPLICIT KRK_GEMM_EXACT outranks this default. That is not
+        // politeness: the gate's own falsifier runs the same prompt with
+        // KRK_GEMM_EXACT=0 and REQUIRES the hashes to disagree, so pinning the
+        // rung unconditionally would quietly turn the falsifier into a second
+        // copy of the test.
+        const char *exact_env = std::getenv("KRK_GEMM_EXACT");
+        const bool exact_forced = exact_env && *exact_env;
+        if (a.prefill_hash) {
+            // The gate's contract is that a --chunk difference is the only
+            // difference. Under the fast rung the hash differs between chunk
+            // sizes for reasons that have nothing to do with chunking, so the
+            // gate pins the rung it was written for — unless the caller pinned
+            // one themselves.
+            if (!exact_forced) {
 #ifdef _WIN32
-            _putenv_s("KRK_GEMM_PATH", "wmma");
+                _putenv_s("KRK_GEMM_EXACT", "1");
 #else
-            setenv("KRK_GEMM_PATH", "wmma", 1);
+                setenv("KRK_GEMM_EXACT", "1", 1);
 #endif
-            std::fprintf(stderr,
-                         "kraken: --prefill fast takes the rows>1 GEMM to the "
-                         "matrix cores; the prefill hash is then not "
-                         "chunk-invariant past 8 rows per chunk\n");
+                if (a.prefill_fast_explicit)
+                    std::fprintf(stderr,
+                                 "kraken: --prefill-hash pins the exact GEMM "
+                                 "rung (the fast rung is not chunk-\n"
+                                 "invariant)\n");
+            }
+        } else if (a.prefill_fast && !exact_forced) {
+#ifdef _WIN32
+            _putenv_s("KRK_GEMM_EXACT", "0");
+#else
+            setenv("KRK_GEMM_EXACT", "0", 1);
+#endif
         }
         be = make_hip_backend(a.device, &err);
         if (!be) {
@@ -1344,7 +1432,17 @@ int main(int argc, char **argv) {
     // The window is the same knob for both drafters: --draft-tokens N is how
     // many tokens a round may propose, whoever proposes them.
     if (!a.draft.empty() || cfg.mtp_spec) {
-        engine.set_draft_window(a.draft_tokens);
+        // The window the curve chose. Measured on the Lightning 30B sidecar
+        // (32 tokens, same prompt, replay-isolated verify): k=1 30.3 tok/s,
+        // k=2 23.3, k=3 18.5, k=4 14.8 -- fewer proposals win because a
+        // full-accept round emits its draft AND the target's next token from
+        // the same verify row, so k=1 collects 1.68 tokens per round against
+        // k=4's 1.39 while paying one row of verify instead of four.
+        // --draft-tokens still overrides, and a draft MODEL keeps its default:
+        // the curve is this drafter's, whose deep proposals decay.
+        int win = a.draft_tokens;
+        if (cfg.mtp_spec && a.draft.empty() && !a.draft_tokens_given) win = 1;
+        engine.set_draft_window(win);
     }
     if (!a.draft.empty()) {
         if (!engine.load_draft(a.draft, &err)) {
@@ -1548,7 +1646,15 @@ int main(int argc, char **argv) {
         p.sink.user = &sink;
 
         GenerateResult r;
-        if (!engine.generate(p, &r)) return false;
+        // A failed run has always reported WHY in r.error, and this path used to
+        // drop it: `--mtp-spec` on a pool that cannot place the block's first
+        // expert exited 1 with an empty stderr, which reads as a crash. The
+        // error is the only thing that says which of the refusals it was.
+        if (!engine.generate(p, &r)) {
+            if (!r.error.empty())
+                std::fprintf(stderr, "kraken: generate: %s\n", r.error.c_str());
+            return false;
+        }
         unsigned long long sat[3] = {0, 0, 0};
         be->activation_saturation(sat);
         const int rexp_max_run = be->residual_exponent_max();

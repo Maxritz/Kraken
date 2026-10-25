@@ -200,7 +200,7 @@ __global__ void __launch_bounds__(kAttnBlock)
                      const _Float16 *__restrict__ vcache, i64 n_head, i64 n_kv,
                      i64 hd, i64 n_tok, i64 pos0, i64 pos_stride, i64 causal,
                      i64 window, f32 scale, int tile_k,
-                     const f32 *__restrict__ sinks) {
+                     const f32 *__restrict__ sinks, i64 skip_from) {
     extern __shared__ u8 smem[];
     f32 *s_sh = reinterpret_cast<f32 *>(smem);
     const size_t sbytes = (static_cast<size_t>(tile_k) * sizeof(f32) + 15u) &
@@ -278,7 +278,12 @@ __global__ void __launch_bounds__(kAttnBlock)
         // window bound stay in the tile -- the staging is uniform across the
         // block -- but never reach the max or the denominator.
         if (tid < tile) {
-            if (k0 + static_cast<i64>(tid) < k_lo) {
+            const i64 jk = k0 + static_cast<i64>(tid);
+            // Windowed-out keys keep their slot in the score plane and never
+            // reach the max or the denominator; a masked-block sibling row does
+            // the same, and because `pos` is this query's own position the
+            // test is a range, not an equality: [skip_from, pos).
+            if (jk < k_lo || (skip_from >= 0 && jk >= skip_from && jk < pos)) {
                 s_sh[tid] = -1.0e30f;
             } else {
                 f32 dot = 0.0f;
@@ -805,8 +810,9 @@ __global__ void __launch_bounds__(kAttnDecThreads)
                             const _Float16 *__restrict__ q,
                             const _Float16 *__restrict__ kcache,
                             const _Float16 *__restrict__ vcache, i64 n_head, i64 n_kv,
-                            i64 hd, i64 n_tok, i64 pos0, i64 pos_stride, f32 scale,
-                            int tile_k, const f32 *__restrict__ sinks) {
+                            i64 hd,                            i64 n_tok, i64 pos0, i64 pos_stride, f32 scale,
+                            int tile_k, const f32 *__restrict__ sinks,
+                            i64 skip_from) {
     extern __shared__ u8 smem[];
     _Float16 *q_sh = reinterpret_cast<_Float16 *>(smem);
     _Float16 *k_sh = q_sh + static_cast<i64>(QT) * hd;
@@ -882,7 +888,12 @@ __global__ void __launch_bounds__(kAttnDecThreads)
 #pragma unroll
             for (int r = 0; r < QT; r++) {
                 if (r >= nq) continue;
-                if (j > pos0 + t0 + r) continue; // this row's causal bound
+                const i64 rpos = pos0 + t0 + r;
+                if (j > rpos) continue; // this row's causal bound
+                // Masked-block sibling: visible to the causal bound, masked
+                // out for this row because it is another candidate of the
+                // same block. Its own position rpos stays visible.
+                if (skip_from >= 0 && j >= skip_from && j < rpos) continue;
                 f32 s = 0.0f;
 #pragma unroll
                 for (int e = 0; e < VPT / 2; e++)
@@ -1022,7 +1033,7 @@ inline void attention_bexact(void *out, const void *q, const void *kcache,
                              const void *vcache, i64 n_head, i64 n_kv, i64 hd,
                              i64 n_tok, i64 pos0, i64 pos_stride, f32 scale,
                              int lds_bytes, hipStream_t stream = nullptr,
-                             const f32 *sinks = nullptr) {
+                             const f32 *sinks = nullptr, i64 skip_from = -1) {
     // tile_k is a multiple of the warp count so the per-tile warp stride lands
     // on exactly decode's key partition (j % 8), and small enough for the
     // staged pair to fit the device's LDS with the accumulators' merge buffer.
@@ -1048,7 +1059,7 @@ inline void attention_bexact(void *out, const void *q, const void *kcache,
                 static_cast<const _Float16 *>(q),                            \
                 static_cast<const _Float16 *>(kcache),                       \
                 static_cast<const _Float16 *>(vcache), n_head, n_kv, hd,     \
-                n_tok, pos0, pos_stride, scale, kk, sinks);                  \
+                n_tok, pos0, pos_stride, scale, kk, sinks, skip_from);        \
     } while (0)
     // VPT = hd/32, so every width whose lane slice is a whole number of
     // 32-channel runs lands here: 64..256 in steps of 32. The widths decode has

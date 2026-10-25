@@ -77,9 +77,13 @@ public:
     // context so the two cannot disagree about how far a position can reach.
     // `target_embd` is the target's embedding width, which is what the feature
     // blocks in the file are sized against; a mismatch is a refusal, not a
-    // silent reinterpretation.
+    // silent reinterpretation. `target_vocab` sizes the logits workspace: the
+    // block borrows the target's embedding and head, and the Laguna export does
+    // not declare `vocab_size` at all, so the target's is the only vocabulary
+    // the drafter can actually be run against.
     bool load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
-              i32 target_embd, i32 target_layer_count, std::string *err);
+              i32 target_embd, i32 target_layer_count, i32 target_vocab,
+              std::string *err);
     void unload();
 
     // ---- what the target side needs to drive this -------------------------
@@ -122,6 +126,23 @@ public:
     // forward call: a prefill chunk, a speculative verification block, or a
     // single decode row.
     bool commit(i32 pos0, i32 n);
+
+    // dst = x * W^T with the weight's NVFP4 global scale (QuantTensor::gs).
+    //
+    // The same rule the trunk's Engine::gemm_w follows, for the same measured
+    // reason: the stored tensor is 1/gs too large, so the RAW product overflows
+    // the f16 store before any output scale could bring it back -- the scale has
+    // to go on the input. A weight with no sidecar is one plain gemm.
+    void gemm_w(void *dst, const void *x, const QuantTensor &w, i64 n_out,
+                i64 n_in, i64 rows);
+
+    // The readout's norm gain can come from the TARGET's final norm instead of
+    // this file's. A borrowed head was trained on the target's normed input, and
+    // a head set whose own `output_norm.weight` is the frozen identity (every
+    // value 1.0, which is what the Laguna export ships) has no gain of its own to
+    // apply -- the per-channel mask the head expects then never reaches it.
+    // `gain` is the target's host copy, E floats; null clears it.
+    void use_target_out_norm(const f32 *gain);
 
     // ---- step 3: one masked block ----------------------------------------
     // Writes up to n_draft logit rows, four bytes of f32 each, one per candidate.
@@ -194,6 +215,15 @@ private:
     void *ws_logits_ = nullptr; // [block_size-1][n_vocab]
     void *kcache_ = nullptr;
     void *vcache_ = nullptr;
+    // NVFP4 sidecars: the staged copy a scaled weight's INPUT is scaled into,
+    // [chunk][widest scaled contraction]. Null unless this head set carries one.
+    // The TARGET's final-norm gain, when installed: a borrowed handle, not ours.
+    const f32 *out_norm_tgt_ = nullptr;
+    void *ws_gs_ = nullptr;
+    i64 gs_in_ = 0;
+    // Rows written by the most recent commit(): the capture slots restart at row
+    // 0 each time, so the last committed position is row (last_commit_n_ - 1).
+    i32 last_commit_n_ = 0;
 
     // host
     std::vector<f32> feat_host_;

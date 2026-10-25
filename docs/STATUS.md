@@ -1072,3 +1072,66 @@ cd ~/kraken
 cmake --build build-hip --target graph_event_probe
 ./build-hip/graph_event_probe > .graph_event_1031.txt 2>&1; echo EXIT=$? >> .graph_event_1031.txt
 ```
+
+## 13. Decode/prefill campaign (2026-10-25/26) and the speculator verdict
+
+The detailed measurement log for this campaign is
+[`CAMPAIGN-LOG-MOE-2026-10.md`](CAMPAIGN-LOG-MOE-2026-10.md); this section is
+the status summary, not a second copy of the numbers.
+
+### What the campaign changed
+
+The MoE decode path was rebuilt around what the probes said, in this order: the
+per-layer blocking router readback was removed from the decode loop; the
+one-launch expert dispatch was made to engage when the routed set exceeds VRAM;
+its gemv-shaped table kernel became tiled and multi-block-per-expert; the prefill
+chunk path got the same row tiling and then an expert-major WMMA
+dequant-staging GEMM, now the default rung for chunks; the pinned staging path
+was fixed from 6-7.5 GB/s to 24.3 GiB/s; and the output-head GEMV was taken from
+9.3 GiB/s to past 25 GB/s. Expert warmup was pipelined and the load phase split
+into read and prepare so they overlap.
+
+The per-change before/after pairs, each with the probe behind it, are in the
+campaign log; they are not restated here, because a status page that quotes a
+delta it cannot re-run is how a benchmark table drifts. What this commit can
+stand behind, measured 2026-10-26 on the current binary: Lightning 30B-A3B
+NVFP4 **24.7 ms/step (40.5 tok/s)**, 32 greedy tokens at `--ctx 2048`, plain
+decode, three runs. The MoE decode floor is the expert streaming term now, not
+the dispatch or the kernels.
+
+### The speculative arm is measured out at k=1
+
+The Lightning 30B-A3B MTP sidecar accepts 73.7% at k=1 and still loses, and the
+round accounting now closes exactly (a fifth term, `mtp_extra_ms_`, measures the
+one target forward every round pays for the emitted or bonus token):
+
+| term | per round | share |
+|---|---:|---:|
+| verify (1 batched row) | 17.7 ms | 33% |
+| second target forward | 25.4 ms | 45% |
+| block re-feed | 8.5 ms | 16% |
+| propose (block + head + argmax) | 3.4 ms | 6% |
+
+With the drafter block free -- `KRK_MTP_REPLAY_IN`, block never runs -- the arm
+lands on plain-decode **parity** on all three prompts tried (40.7 vs 40.5, 36.3
+vs 36.8, 37.5 vs 38.0 tok/s). Break-even for the first is 1.674 tokens/round
+against 1.68 delivered. So the propose pass is not the binding term and cannot
+be: two target passes per 1.68 tokens is 1.19 passes per token against plain
+decode's 1.00. The design ceiling with a free block and a perfect head is +18%;
+with the real 3.4 ms block it is -9% even at 100% acceptance. Speculation stays
+opt-in (`--mtp-spec`) and off by default.
+
+### Gate status at this commit
+
+* `kraken-tests` **4311/4311 checks passed**, exit 0 (93 groups).
+* Baseline re-recorded deliberately at 93 groups: verdict is 0 regressions,
+  4 groups changed shape, 7 new groups -- the new ones are this campaign's own
+  (`test_moe_per_layer_experts`, `test_moe_latent`, `test_nvfp4_sidecar_scale`,
+  `test_expert_dispatch_host_backed`, `test_attention_self_mask`,
+  `test_nvfp4_sidecar_dflash`, `test_dflash_laguna_spelling`).
+* `scripts/build_check.sh` exit 0 (1 warning, artifact fingerprint recorded).
+* `kraken-bench --gate` **exits 1 in this worktree**: its speculation arm names
+  `models/SmolLM2-135M-Instruct.Q4_K_M.gguf`, which is in neither
+  `G:/More-models` nor `H:/OLLAMA-Models/GGUF`. That is the environment gap
+  `AGENTS.md` already records, not a code failure -- the arm cannot run and an
+  untested path is not a passing one.

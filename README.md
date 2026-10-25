@@ -213,13 +213,13 @@ The per-model prompt length is listed in the sweep table below.
 
 ```
 # Qwen3-8B, current-tree sample (run 1; cold file cache)
-load           3818 ms, 4.68 GiB uploaded of 4.68 GiB weights
-prefill        55 tokens in 548.1 ms  (100.3 tok/s)
-decode         256 tokens in 2893.5 ms  (88.1 tok/s)
+load           4060 ms, 4.68 GiB uploaded of 4.68 GiB weights
+prefill        55 tokens in 342.3 ms  (160.7 tok/s)
+decode         256 tokens in 2801.0 ms  (91.0 tok/s)
 ```
 
 The cold-load row is intentionally kept as an example of why cache state is
-recorded; the two warm-cache loads were 1441 and 1426 ms. See the dated
+recorded; the two warm-cache loads were 1333 and 1301 ms. See the dated
 context check below for a same-build context comparison.
 
 - **prefill** - prompt tokens / time to process them. Throughput, so higher is
@@ -238,27 +238,39 @@ below.
 
 ### Results (current tree, 3 runs each; range shown)
 
-| model | layers / embd | prefill tok/s | decode tok/s | load ms |
-|---|---|---:|---:|---:|
-| Qwen3-4B Q8_0 | 36 / 2560 | 185-200 | 100.6-100.8 | 1303-1357 |
-| Qwen3-8B Q4_K_M | 36 / 4096 | 100.3-100.4 | 87.8-88.1 | 1426-3818 |
-| Qwen3.5-9B Q4_K_M (GDN hybrid) | 32 / 4096 | 101.8-102.9 | 81.9-82.2 | 1601-1637 |
-| Qwen3-30B-A3B i1-Q2_K | 48 / 2048 | 20.5-20.6 | 40.1-40.5 | 595-620 |
+| model | layers / embd | prefill tok/s | decode tok/s | load ms | vs 2026-10-24 |
+|---|---|---:|---:|---:|---|
+| Qwen3-4B Q8_0 | 36 / 2560 | 321-325 | 104.9-105.3 | 1279-2190 | prefill +76%, decode +5% |
+| Qwen3-8B Q4_K_M | 36 / 4096 | 160.2-160.9 | 91.0-91.1 | 1301-4060 | prefill +59%, decode +3% |
+| Qwen3.5-9B Q4_K_M (GDN hybrid) | 32 / 4096 | 150.1-150.5 | 84.9-85.3 | 1429-2335 | prefill +47%, decode +4% |
+| Qwen3-30B-A3B i1-Q2_K | 48 / 2048 | 6.7 first-touch / 20.1-22.9 warm | 17.7 first-touch / 37.1-37.2 warm | 512-1081 | decode **-8%** warm |
 
-Three sequential runs per model used the fixed `--bench` prompt, 256 greedy
-output tokens, `--ctx 4096`, `--chunk 256`; the ranges are run-to-run, not
-confidence intervals. These four replace the previous headline: Qwen3-8B is
+Re-measured 2026-10-25 on the current build, three sequential runs per model,
+same fixed `--bench` prompt, 256 greedy output tokens, `--ctx 4096`,
+`--chunk 256`; the ranges are run-to-run, not confidence intervals. Both
+measured columns are compared against the 2026-10-24 table.
+
+The prefill column moved up on **every** row with no code change on the
+`--prefill exact` path in between (the session's kernel work is all on the
+`--prefill fast` WMMA rung), so read the older prefill column as measured in a
+lower-clock/cold state, not as a kernel baseline: prefill is a short compute
+burst that tracks clocks, decode is long and memory-bound and moved 2-5%.
+Decode is the stable column and the one to compare across dates.
+
+These four replace the previous headline: Qwen3-8B is
 the one row that survived, because its file is still on the box, and the other
 three take the places of SmolLM2, Qwen3.5-0.8B and the 4x0.6B MoE, none of which
 is in either model tree any more. Qwen3-4B and Qwen3.5-9B are the nearest
 dense/hybrid files that are present; Qwen3-30B-A3B is the MoE.
 
-The 30B MoE ran with the default adaptive policy and no expert index. Its three
-runs were the warm-page-cache state; the first run after the file had left the
-page cache is the **5.6 prefill / 16.6 decode** row in the sweep below, and that
-is the number a cold request pays. The 8B's first load (3.82 s) had a cold file
-cache; the next two (1.43-1.44 s) were warm. Throughput is the more stable
-comparison here; do not compare load times across those cache states.
+The 30B MoE ran with the default adaptive policy and no expert index. Its last
+two runs were the warm state (**20.1-22.9 prefill / 37.1-37.2 decode**); the
+first run, right after the file had left the page cache, is **6.7 prefill /
+17.7 decode**, and that is what a cold request pays — a 2.7x spread, which is
+why the sweep below marks its MoE rows cold → warm rather than with one number.
+The 8B's first load (4.06 s) had a cold file cache; the next two (1.33 and
+1.30 s) were warm. Throughput is the more stable comparison here; do not
+compare load times across those cache states.
 
 Build/runtime note: the binary reported HIP 7.16.26332 (SDK 7.16.26331) and
 warned that the loaded HIP runtime did not match the SDK it was built against.
@@ -280,6 +292,37 @@ context limit stops generation before `-n 256` is reached. They corroborate
 flat decode over these short contexts on this build; the full `--bench` result
 above averages 256 tokens while context grows to roughly 300.
 
+### Speculative decode (MTP sidecar) — measured out at k=1
+
+Measured 2026-10-26 on the Lightning 30B-A3B NVFP4 pair, 32 greedy tokens,
+`--ctx 2048`, draft window `k=1`. Same command shape as everywhere else, plus
+`--mtp <sidecar> --mtp-spec`; `KRK_VRAM_FLOOR_MB=512` was needed to fit the
+block's expert acquires on this box.
+
+```
+M="G:/More-models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-noMTP.gguf"
+S="H:/OLLAMA-Models/GGUF/mtp-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf"
+kraken -m "$M" --mtp "$S" --mtp-spec --greedy -p "<prompt>" -n 32 -c 2048
+```
+
+| prompt | plain | spec k=1 | block free (`KRK_MTP_REPLAY_IN`) |
+|---|---:|---:|---:|
+| "The quick brown fox jumps over the lazy dog and then it runs into the" | 40.5 tok/s (24.7 ms/step) | 31.2 (53.92 ms/round) | 40.7 (41.35 ms/round) |
+| "def fibonacci(n):" | 36.8 (27.2) | 26.5 (63.50) | 36.3 (46.45) |
+| "List the first ten prime numbers in order:" | 38.0 (26.3) | 27.2 (56.06) | 37.5 (40.60) |
+
+The head accepts 73.7% of its proposals at k=1 and still loses, and the reason is
+structural rather than the head: every round pays **two target passes** (one
+batched verify row plus the forward for the token the round just emitted) to
+get 1.68 tokens, i.e. 1.19 passes per token against plain decode's 1.00. The
+third column is the ceiling of any propose-pass optimisation — the block never
+runs — and it lands on parity, not on a win. The round decomposes as verify
+17.7 ms + second forward 25.4 ms + block re-feed 8.5 ms + propose 3.4 ms. The
+arm therefore stays opt-in; `--mtp` alone only loads the block for the probe.
+
+The full phase accounting is in [docs/STATUS.md §13](docs/STATUS.md) and the
+[campaign log](docs/CAMPAIGN-LOG-MOE-2026-10.md).
+
 The older context-scaling table below records a before/after kernel fix from a
 prior build; use the dated current-tree check above for current absolute rates.
 
@@ -296,7 +339,7 @@ docs](https://rocm.docs.amd.com/projects/rocprofiler-sdk/en/latest/how-to/using-
 The card's real read bandwidth is **585 GB/s**, not the 644 GB/s on the spec
 sheet - measured with a 4096 MiB streaming read (584.9 GB/s). An 8B Q4_K_M
 token has to read **5.02 GB** of weights, so the absolute floor is **8.58 ms =
-117 tok/s**. The current-tree 8B result is **88.0 tok/s (11.4 ms/token), ~75% of
+117 tok/s**. The current-tree 8B result is **91.0 tok/s (11.0 ms/token), ~78% of
 that ceiling**, averaged over the 256 generated tokens above. Decode is flat in
 context from roughly 256 tokens up (docs/PERF-PLAN.md B0); the ctx-64 row below
 is lower because that run is short enough for pipeline fill to be a real share
@@ -376,59 +419,72 @@ Qwen3.5-0.8B, the 4x0.6B MoE, `qwen3.5-4b-nvfp4`, `Qwen3-4B-Instruct-2507-Q6_K`,
 both 1.7B f16 files, `qwen3.5-9b-nvfp4`, `Q3.5-9B-GLM-5.1-DA Q4_K_S`,
 `Qwen3.5-9b-Sushi-Coder-RL Q4_K_M` and `ornith-35b-Q8_0`.
 
-Each row is **one** `--bench --greedy` run on this build, in file-size order,
-cold for that file. Treat any two rows closer than 2-5% on prefill as noise.
-These are not a diff against the 2026-10-10 numbers: the build changed between
-the two sweeps, and the fixed 55-token prompt is dominated by fixed cost, so
-short-prompt prefill reads much lower than the long-prompt table above on the
-same file. Decode is the comparable column; prefill for a real request is the
-4081-token table above.
+**Re-measured 2026-10-25** on the current build. Each dense row is **one**
+`--bench --greedy` run, in file-size order, cold for that file. The MoE rows
+(`*`) were run twice because they are bimodal — the first run after the file
+leaves the page cache pays expert read-through, the second promotes from the
+host WARM tier — so those are shown **cold → warm** and a single number would
+misreport them by up to 4x. Treat any two rows closer than 2-5% on prefill as
+noise.
+
+The last column is the move against the 2026-10-24 table, shown only where it
+exceeds 5% (`prefill% / decode%`). It is the honest shape of this refresh:
+**decode is flat** on almost every row (the one exception is the Ornith-35B
+MoE at -9%), while **prefill rose on every row** with no exact-path code change
+in between — a short compute burst tracking clocks, versus a long memory-bound
+decode. Read the older prefill column as a cold-clock measurement, not as a
+kernel baseline. Decode is the comparable column; prefill for a real request is
+the 4081-token table above.
 Dense rows are VRAM-bound decode; MoE rows (marked \*) page experts through the
 default budget, so their prefill includes cold-cache paging.
 
 Every row runs the default `--prefill exact`. The same 55-token 8B prompt reads
-**633.5 tok/s on `--prefill fast`** against 100.3 exact, so do not compare a
-prefill column across arms (or across these two sweeps) without checking which
-one produced it.
+**923-925 tok/s on `--prefill fast`** against 160.7 exact (decode is identical,
+91.0 either way), so do not compare a prefill column across arms (or across
+these two sweeps) without checking which one produced it.
 
-| file | size | arch - layers / embd | prompt tok | prefill tok/s | decode tok/s | load ms |
-|---|---|---|---|---|---|---|
-| smolcode-coder-cpp-1.5b-q4_k_m | 1.12 GB | qwen2 - 28 / 1536 | 55 | 406.2 | 218.7 | 1369 |
-| smolcode-coder-cpp-3b-q4_k_m | 2.10 GB | qwen2 - 36 / 2048 | 55 | 237.7 | 162.8 | 1833 |
-| Phi-3.5-mini Q4_K_M | 2.32 GB | llama - 32 / 3072 | 125 | 200.1 | 103.5 | 2206 |
-| qwen3vl-4b-q4_k_m | 2.50 GB | qwen3vl - 36 / 2560 | 55 | 167.8 | 127.6 | 2822 |
-| Spark_one.Q6_K | 2.54 GB | qwen2 - 36 / 2048 | 55 | 140.5 | 123.3 | 1831 |
-| Samastam-2.5B-Q8_0 | 2.69 GB | llama - 28 / 2048 | 122 | 329.1 | 157.5 | 2366 |
-| VibeThinker-3B.Q8_0 † | 3.29 GB | qwen2 - 36 / 2048 | 55 | 262.2 | - (no decode; warmup-token artifact on short prompt) | 3155 |
-| qwen2.5-coder-3b-instruct-q8_0 | 3.62 GB | qwen2 - 36 / 2048 | 55 | 280.5 | 123.3 | 2248 |
-| Qwen3-4B-Q8_0 | 4.28 GB | qwen3 - 36 / 2560 | 55 | 184.5 | 100.2 | 2390 |
-| Opus4.7 Distill 4B Q8_0 | 4.48 GB | qwen35 - 32 / 2560 | 55 | 187.7 | 97.9 | 3367 |
-| Qwen3.5-9B-DeepSeek-V4-Flash-MTP Q3_K_M | 4.74 GB | qwen35 - 32 / 4096 | 55 | 81.5 | 79.3 | 2564 |
-| Ornith-1.0-9b STRIX_LEAN | 4.96 GB | qwen35 - 32 / 4096 | 55 | 119.6 | 98.3 | 5517 |
-| Qwen3-8B-Q4_K_M | 5.03 GB | qwen3 - 36 / 4096 | 55 | 101.1 | 88.1 | 1502 |
-| mythos-9b-unhinged-heretic.i1-Q4_K_M | 5.03 GB | qwen3 - 36 / 4096 | 55 | 100.9 | 88.2 | 4196 |
-| lacuna-v1-Q4_K_M | 5.07 GB | llama - 32 / 4096 | 52 | 100.4 | 90.3 | 4944 |
-| qwen35-9b-instruct-nvfp4 | 5.31 GB | qwen35 - 32 / 4096 | 55 | 104.3 | 88.6 | 5042 |
-| Qwen2.5-Coder-7B Q5_K_M | 5.44 GB | qwen2 - 28 / 3584 | 55 | 75.1 | 84.8 | 4111 |
-| omnicoder-9b-q6_k | 7.36 GB | qwen35 - 32 / 4096 | 55 | 65.3 | 62.1 | 3905 |
-| Qwen3.8-9B-Q6_K | 7.56 GB | qwen35 - 32 / 4096 | 55 | 65.6 | 62.1 | 8201 |
-| Qwen3-30B-A3B Q2_K \* | 11.26 GB | qwen3moe - 48 / 2048 | 55 | 5.6 | 16.6 | 1220 |
-| Qwen2.5-Coder-32B Q4_K_M ‡ | 19.85 GB | qwen2 - 64 / 5120 | 55 | 8.9 | 1.0 | 11203 |
-| qwable-v1-mxfp4_moe \* | 20.26 GB | qwen35moe - 40 / 2048 | 55 | 6 | 11.6 | 23900 |
-| laguna-xs2-Q4_K_M \* | 20.27 GB | laguna - 40 / 2048 | 51 | 5.3 | 13.9 | 22063 |
-| Unsloth-Ornith-1.5-35B-A3B Q4_K_XL \* | 22.36 GB | qwen35moe - 40 / 2048 | 55 | 41 | 30.6 | 22421 |
-| Tiel-Coder-35B-A3B Q5_K_XL \* | 26.59 GB | qwen35moe - 40 / 2048 | 55 | 5.3 | 12 | 24189 |
-| Tiel-Coder-35B-A3B-MTP-APEX \* | 26.67 GB | qwen35moe - 40 / 2048 | 55 | 27.4 | 21.5 | 22517 |
+| file | size | arch - layers / embd | prompt tok | prefill tok/s | decode tok/s | load ms | move |
+|---|---|---|---|---|---|---|---|
+| smolcode-coder-cpp-1.5b-q4_k_m | 1.12 GB | qwen2 - 28 / 1536 | 55 | 658.9 | 260.4 | 1302 | +62 / +19 |
+| smolcode-coder-cpp-3b-q4_k_m | 2.10 GB | qwen2 - 36 / 2048 | 55 | 379.4 | 173.2 | 1718 | +60 / — |
+| Phi-3.5-mini Q4_K_M | 2.32 GB | llama - 32 / 3072 | 125 | 303.3 | 108.0 | 1932 | +52 / — |
+| qwen3vl-4b-q4_k_m | 2.50 GB | qwen3vl - 36 / 2560 | 55 | 282.5 | 138.8 | 2673 | +68 / +9 |
+| Spark_one.Q6_K | 2.54 GB | qwen2 - 36 / 2048 | 55 | 232.0 | 130.5 | 1631 | +65 / +6 |
+| Samastam-2.5B-Q8_0 | 2.69 GB | llama - 28 / 2048 | 122 | 569.6 | 163.2 | 2325 | +73 / — |
+| VibeThinker-3B.Q8_0 † | 3.29 GB | qwen2 - 36 / 2048 | 55 | 452.9 | - (no decode; warmup-token artifact on short prompt) | 2999 | +73 / — |
+| qwen2.5-coder-3b-instruct-q8_0 | 3.62 GB | qwen2 - 36 / 2048 | 55 | 449.1 | 130.1 | 2189 | +60 / +6 |
+| Qwen3-4B-Q8_0 | 4.28 GB | qwen3 - 36 / 2560 | 55 | 324.4 | 105.9 | 2147 | +76 / +6 |
+| Opus4.7 Distill 4B Q8_0 | 4.48 GB | qwen35 - 32 / 2560 | 55 | 331.5 | 103.1 | 3235 | +77 / +5 |
+| Qwen3.5-9B-DeepSeek-V4-Flash-MTP Q3_K_M | 4.74 GB | qwen35 - 32 / 4096 | 55 | 118.8-124.7 | 81.3-81.5 | 1866 | +46 / — |
+| Ornith-1.0-9b STRIX_LEAN | 4.96 GB | qwen35 - 32 / 4096 | 55 | 192.4 | 102.8 | 5074 | +61 / +5 |
+| Qwen3-8B-Q4_K_M | 5.03 GB | qwen3 - 36 / 4096 | 55 | 160.7 | 91.0 | 1300 | +59 / — |
+| mythos-9b-unhinged-heretic.i1-Q4_K_M | 5.03 GB | qwen3 - 36 / 4096 | 55 | 162.1 | 91.0 | 3731 | +61 / — |
+| lacuna-v1-Q4_K_M | 5.07 GB | llama - 32 / 4096 | 52 | 163.2 | 93.2 | 4446 | +63 / — |
+| qwen35-9b-instruct-nvfp4 | 5.31 GB | qwen35 - 32 / 4096 | 55 | 166.2 | 91.7 | 4750 | +59 / — |
+| Qwen2.5-Coder-7B Q5_K_M | 5.44 GB | qwen2 - 28 / 3584 | 55 | 107.3 | 86.6 | 4114 | +43 / — |
+| omnicoder-9b-q6_k | 7.36 GB | qwen35 - 32 / 4096 | 55 | 87.8 | 63.4 | 3777 | +34 / — |
+| Qwen3.8-9B-Q6_K | 7.56 GB | qwen35 - 32 / 4096 | 55 | 87.7 | 63.4 | 8024 | +34 / — |
+| Qwen3-30B-A3B Q2_K \* | 11.26 GB | qwen3moe - 48 / 2048 | 55 | 6.7 → 22.9 | 17.7 → 37.2 | 527-1393 | warm +300 / +124 |
+| Qwen2.5-Coder-32B Q4_K_M ‡ | 19.85 GB | qwen2 - 64 / 5120 | 55 | 31.4 | 3.6-3.8 | 18563 | **+253 / +270** |
+| qwable-v1-mxfp4_moe \* | 20.26 GB | qwen35moe - 40 / 2048 | 55 | 9.9 → 105.3 | 17.2 → 28.6 | 25327 | warm +1655 / +147 |
+| laguna-xs2-Q4_K_M \* | 20.27 GB | laguna - 40 / 2048 | 51 | 17.4 → 79.6 | 25.5 → 35.5 | 22381 | warm +1402 / +155 |
+| Unsloth-Ornith-1.5-35B-A3B Q4_K_XL \* | 22.36 GB | qwen35moe - 40 / 2048 | 55 | 65.9-68.0 | 27.6-28.8 | 21942 | +65 / **-9** |
+| Tiel-Coder-35B-A3B Q5_K_XL \* | 26.59 GB | qwen35moe - 40 / 2048 | 55 | 9.8 → 50.0 | 15.5 → 25.1 | 22468 | warm +843 / +109 |
+| Tiel-Coder-35B-A3B-MTP-APEX \* | 26.67 GB | qwen35moe - 40 / 2048 | 55 | 15.5 → 56.6 | 25.2 → 29.0 | 22463 | warm +107 / +34 |
 
-† The fixed `--bench` prompt tokenizes to 55 tokens here, prefill runs fine (262
+† The fixed `--bench` prompt tokenizes to 55 tokens here, prefill runs fine (452.9
 tok/s), and the GPU backend is fine - `--bench` still emitted 0 decode tokens.
 With a normal prompt (`x` -> 1 tok, forced decode) the same model decodes at
 ~124 tok/s, so the 0.0 is a prompt-training-format artifact, not a kernel or MoE
 path defect. The row is kept for prefill honesty; treat its decode column as "no
 decode measured", not a throughput number.
-‡ The 32B dense model is larger than VRAM (18.5 GiB resident on a 15.9 GiB card)
-and runs oversubscribed at 1 tok/s. It stays in the table to show the loader
-refuses nothing silently; it is not a configuration anyone should use.
+‡ The 32B dense model is larger than VRAM (18.5 GiB on a 15.9 GiB card). With
+the residency planner it now keeps a resident core and streams the rest: **3.6-3.8
+tok/s decode and 31.4 tok/s prefill**, from **1.0 and 8.9** a day earlier — the
+largest single move in this table, and the clearest evidence that layer
+residency plus a staged stream beats wholesale oversubscription. It still costs
+a 18.6 s load and 67 s per 256 tokens, so it is a reachable configuration rather
+than a comfortable one.
 
 NVFP4 and MXFP4 dequantize fine (the 9B NVFP4 and the MXFP4 MoE rows above);
 `nemotron-3-nano-4b-NVFP4` below is refused for its Mamba blocks, not its quant.
@@ -945,13 +1001,53 @@ Measured on the RX 9070 XT (gfx1201, 15.9 GiB), greedy, `--ctx 512`:
 | Qwen3.6-27B-Q5_K_M (18.2 GiB) | auto | 11.83 GiB | 6.07 GiB/token | 3.23 GiB | 0.3 tok/s | coherent |
 | Tiel-Coder-35B-A3B (24.8 GiB MoE) | auto | 1.88 GiB dense | experts page | 0.00 GiB | 3.0 tok/s | coherent |
 
-The staging path runs at **2.1-4.9 GB/s** (`read_host_batch` + `upload_paged_batch`,
-four readers); the per-run line is `[stats ] weight stream: ... GiB from the
-file, ... ms (.. GB/s)`. A model that does not fit cannot be made fast by
-streaming -- every token must move the non-resident bytes over PCIe. What
-streaming buys is a **bounded, predictable** device footprint: the KV cache
-stays flat (`kv flat: whole cache resident in VRAM`) at a 4k context on a model
-larger than the card, instead of thrashing one HOT slot per layer.
+**The streamed bytes are read from a pinned host mirror, not from the file.**
+A streamed layer's bytes do not change between tokens, so re-reading them out of
+the GGUF mapping on every pass repeats work that was already done: on the
+15.97 GiB Qwen3.8-27B file at `--ctx 512`, 9 streamed layers per token meant
+**64.70 GiB of re-reads across a 32-token bench** and the read was about 55% of
+decode. The loader now fills one pinned allocation holding every streamed layer
+at its own offset, once, through the same pooled reader; a staging pass after
+that is `sync` + a DMA straight out of it. Pinned memory is also the faster
+source here -- 16.4 GB/s against 8.9 GB/s through the narrow-aperture staging
+ring -- so the per-token cost becomes the copy and no longer includes a read.
+
+Measured on the RX 9070 XT, greedy, `--ctx 512 --chunk 64 --bench`, 32 tokens,
+mirror versus `KRK_WEIGHT_HOST_CACHE=0`:
+
+| file / arm | arm | staging before | staging after | decode before | decode after |
+|---|---|---:|---:|---:|---:|
+| Qwen3.8-27B Q4_K_M (15.97 GiB), auto | mirror on | 64.70 GiB @ 6.06 GB/s, read 819 ms | 64.70 GiB @ **13.79 GB/s, read 0 ms** | 2.9 tok/s (349 ms/step) | **6.2 tok/s (160 ms/step)** |
+| Qwen3-8B Q4_K_M, `--weight-vram-mb 3072` `KRK_WEIGHT_PROMOTE=0` | off vs on | 55.52 GiB @ 5.96 GB/s | 55.52 GiB @ **19.02 GB/s** | 3.5 tok/s | **12.1 tok/s** |
+
+Greedy output is byte-identical between the two arms (27B prompt run, 289 bytes,
+md5 `b7525fa7dcf3398d4dffd10b432f0812`) and the suite is 4149/4149. The mirror
+costs one load-time pass -- 4.13 GiB in 439 ms on the 27B, 1.74 GiB in 203 ms
+on the 8B arm -- and is capped at 8 GiB of pinned RAM
+(`KRK_WEIGHT_HOST_CACHE_MB=<n>`), because pinned pages cannot be swapped. A set
+above the cap, or a failed allocation, falls back to the read path with a
+warning: slower, still correct. `KRK_WEIGHT_HOST_CACHE=0` forces that arm.
+
+**Promotion takes the same pinned path.** `promote_layer()` reads each batch
+into `stage_host_`, which is already pinned, and used to hand it to the
+*pageable* upload -- the driver's own bounce copy through the 4 MiB staging
+ring, measured at **8.8-9.8 GB/s for exactly this loop** against **27.5 GB/s**
+for the pinned batch the staging path uses. It now issues the pinned batch, so
+a promotion is a DMA out of memory the host already owns: 10 promoted layers on
+the 27B (2.11 GiB) went from **764-1662 ms to 455-513 ms**, and the one-off
+staging charged to the first token fell with it. Greedy output is byte-identical
+with promotion on and off (27B, 24 tokens, md5 `62dfed13c16a7878c620e98d15bfd681`
+in both arms), suite 4149/4149.
+
+**After this the transport is at the card's copy limit**, so the remaining
+lever is fewer bytes rather than a faster path: 2.02 GiB/token at 13.8 GB/s is
+~147 ms against the measured 160 ms/step, and the 8B arm is the same shape
+(1.74 GiB/token at 19.0 GB/s against 80 ms/step). A model that does not fit
+still cannot be made fast by streaming -- every token must move the non-resident
+bytes over PCIe. What streaming buys is a **bounded, predictable** device
+footprint: the KV cache stays flat (`kv flat: whole cache resident in VRAM`) at
+a 4k context on a model larger than the card, instead of thrashing one HOT slot
+per layer.
 
 ### `--mtp-probe` - run the file's own nextn (MTP) block for one step
 

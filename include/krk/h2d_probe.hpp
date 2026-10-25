@@ -81,12 +81,18 @@ struct H2dSamples {
     std::vector<double> ring;
     std::vector<double> direct;
     std::vector<double> pinned;
+    std::vector<double> blocking;
 };
 
 struct H2dProbe {
     bool valid = false;
     double pageable_gbs = 0.0;  // the staging ring
     double direct_gbs = 0.0;    // the driver-staged pageable DMA
+    double blocking_gbs = 0.0;  // the plain blocking hipMemcpy
+    // Measured, not asked: the best pageable arm reached at least half the
+    // pinned rate, which only happens when the driver can write straight into
+    // the aperture. See `aperture_is_wide` for the two populations.
+    bool aperture_wide = false;
     double pinned_gbs = 0.0;
     // How many iterations it actually ran, and the worst relative MAD among the
     // three arms at the point it stopped. Published because the probe's own cost
@@ -95,6 +101,36 @@ struct H2dProbe {
     int iterations = 0;
     double spread = 0.0;
 };
+
+// The chosen path (0 ring, 1 direct, 2 blocking, -1 unmeasured) and the rate it
+// will actually pay. ONE definition, because the engine's init, the pin
+// decision, the log line, `kraken-bench --h2d` and the cache listing all have to
+// name the same mechanism -- a listing that printed "ring" where init would run
+// the blocking copy would be worse than printing nothing.
+inline int h2d_path(const H2dProbe &p) {
+    return pageable_path_choice(p.pageable_gbs, p.direct_gbs, p.blocking_gbs);
+}
+
+inline double h2d_path_gbs(const H2dProbe &p) {
+    switch (h2d_path(p)) {
+        case 0: return p.pageable_gbs;
+        case 1: return p.direct_gbs;
+        case 2: return p.blocking_gbs;
+        default: return 0.0;
+    }
+}
+
+// Named in prose, because the log line is read by someone deciding whether the
+// number describes their machine: "ring 8.4" and "the blocking copy 22.9" are
+// different answers about the same card.
+inline const char *h2d_path_name(int path) {
+    switch (path) {
+        case 0: return "the staging ring";
+        case 1: return "the driver-staged DMA";
+        case 2: return "the driver's blocking copy";
+        default: return "no measured path";
+    }
+}
 
 inline double h2d_median(std::vector<double> v) {
     if (v.empty()) return 0.0;
@@ -152,6 +188,7 @@ inline bool h2d_samples_settled(const std::vector<double> &v, double spread) {
 inline bool h2d_probe_settled(const H2dSamples &s, double spread) {
     return h2d_samples_settled(s.ring, spread) &&
            h2d_samples_settled(s.direct, spread) &&
+           h2d_samples_settled(s.blocking, spread) &&
            h2d_samples_settled(s.pinned, spread);
 }
 
@@ -178,20 +215,22 @@ inline H2dProbe probe_h2d_path(Backend *be, size_t bytes, int iters,
     }
     std::memset(pin, 1, bytes);
     std::memset(pag, 1, bytes);
-    // One copy of one path. 0 = ring, 1 = direct, 2 = pinned. GB/s, or 0 when
-    // the call could not be timed.
+    // One copy of one path. 0 = ring, 1 = direct, 2 = pinned, 3 = blocking.
+    // GB/s, or 0 when the call could not be timed.
     auto one = [&](int mode) {
         void *dsts[1] = {dev};
         const void *srcs[1] = {mode == 2 ? pin : pag};
         const size_t lens[1] = {bytes};
-        if (mode != 2) be->set_pageable_direct(mode == 1);
+        if (mode != 2)
+            be->set_pageable_path(
+                static_cast<Backend::PageablePath>(mode == 3 ? 2 : mode));
         const std::chrono::steady_clock::time_point t0 =
             std::chrono::steady_clock::now();
         if (mode == 2)
             be->upload_pinned_batch(dsts, srcs, lens, 1);
         else
             be->upload_paged_batch(dsts, srcs, lens, 1);
-        be->sync();  // all three return before the copy lands
+        be->sync();  // every arm returns before the copy lands
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - t0)
                               .count();
@@ -203,6 +242,7 @@ inline H2dProbe probe_h2d_path(Backend *be, size_t bytes, int iters,
     one(0);
     one(1);
     one(2);
+    one(3);
     // The A/B arm: `KRK_H2D_PROBE_ITERS=<n>` runs EXACTLY n iterations, which is
     // the fixed quota the early stop replaced -- forcing the cap alone would still
     // stop early and measure the change against itself. Below the floor is
@@ -217,18 +257,23 @@ inline H2dProbe probe_h2d_path(Backend *be, size_t bytes, int iters,
             no_early_stop = true;
         }
     }
-    std::vector<double> ring_gbs_v, direct_gbs_v, pinned_gbs_v;
+    std::vector<double> ring_gbs_v, direct_gbs_v, pinned_gbs_v, block_gbs_v;
     ring_gbs_v.reserve(static_cast<size_t>(iters));
     direct_gbs_v.reserve(static_cast<size_t>(iters));
+    block_gbs_v.reserve(static_cast<size_t>(iters));
     pinned_gbs_v.reserve(static_cast<size_t>(iters));
     for (int iter = 0; iter < iters; iter++) {
+        // Reversed order on alternate iterations, so an arm cannot benefit from
+        // running while the bus is still settling from its predecessor.
         if (iter & 1) {
             pinned_gbs_v.push_back(one(2));
+            block_gbs_v.push_back(one(3));
             direct_gbs_v.push_back(one(1));
             ring_gbs_v.push_back(one(0));
         } else {
             ring_gbs_v.push_back(one(0));
             direct_gbs_v.push_back(one(1));
+            block_gbs_v.push_back(one(3));
             pinned_gbs_v.push_back(one(2));
         }
         // `iters` is a CAP, not a quota: stop once the medians have settled, with
@@ -237,24 +282,29 @@ inline H2dProbe probe_h2d_path(Backend *be, size_t bytes, int iters,
             H2dSamples so_far;
             so_far.ring = ring_gbs_v;
             so_far.direct = direct_gbs_v;
+            so_far.blocking = block_gbs_v;
             so_far.pinned = pinned_gbs_v;
             if (h2d_probe_settled(so_far, kH2dProbeSettleSpread)) break;
         }
     }
     const double ring_gbs = h2d_median(ring_gbs_v);
     const double direct_gbs = h2d_median(direct_gbs_v);
+    const double block_gbs = h2d_median(block_gbs_v);
     const double pin_gbs = h2d_median(pinned_gbs_v);
     r.iterations = static_cast<int>(ring_gbs_v.size());
     // Not std::max: <windows.h> defines `max` as a macro, and this header is
     // included by TUs that have it.
     r.spread = h2d_relative_mad(ring_gbs_v);
     const double spread_direct = h2d_relative_mad(direct_gbs_v);
+    const double spread_block = h2d_relative_mad(block_gbs_v);
     const double spread_pin = h2d_relative_mad(pinned_gbs_v);
     if (spread_direct > r.spread) r.spread = spread_direct;
+    if (spread_block > r.spread) r.spread = spread_block;
     if (spread_pin > r.spread) r.spread = spread_pin;
     if (samples) {
         samples->ring = ring_gbs_v;
         samples->direct = direct_gbs_v;
+        samples->blocking = block_gbs_v;
         samples->pinned = pinned_gbs_v;
     }
     be->release(dev);
@@ -263,8 +313,10 @@ inline H2dProbe probe_h2d_path(Backend *be, size_t bytes, int iters,
     if (ring_gbs > 0.0 && pin_gbs > 0.0) {
         r.pageable_gbs = ring_gbs;
         r.direct_gbs = direct_gbs;
+        r.blocking_gbs = block_gbs;
         r.pinned_gbs = pin_gbs;
         r.valid = true;
+        r.aperture_wide = aperture_is_wide(h2d_path_gbs(r), pin_gbs);
     }
     return r;
 }
@@ -301,7 +353,13 @@ inline H2dProbe probe_h2d_path(Backend *be, size_t bytes, int iters,
 // Bumped when the LINE FORMAT or the probe's own algorithm changes. v2 added the
 // driver version, so a v1 line is a miss -- a verdict whose driver is unknown is
 // exactly the one an update invalidates -- and the next write replaces it.
-inline constexpr int kH2dCacheVersion = 2;
+// v3 added the blocking arm, because a v2 verdict cannot say whether the fastest
+// pageable mechanism on this card is the one it never measured: reusing a v2
+// line would pin the run to the ring/direct choice the old code could make.
+inline constexpr int kH2dCacheVersion = 3;
+// Fields per line: version, card, vram, BAR hint, driver, bytes, ring, direct,
+// blocking, pinned, stamp.
+inline constexpr size_t kH2dCacheFields = 11;
 // 30 days: long enough that a workstation measures once a month, short enough
 // that a BIOS or driver change is re-checked without anyone remembering to.
 inline constexpr long long kH2dCacheMaxAgeSec = 30LL * 24 * 60 * 60;
@@ -408,7 +466,7 @@ inline bool h2d_parse_gbs(const std::string &s, double *out) {
 // which line a write replaces.
 inline bool h2d_line_matches_key(const std::vector<std::string> &f,
                                  const H2dCacheKey &key) {
-    if (f.size() != 10) return false;
+    if (f.size() != kH2dCacheFields) return false;
     long long vram = 0, bar = 0, driver = 0, bytes = 0;
     if (f[1] != key.name) return false;
     if (!h2d_parse_ll(f[2], &vram) ||
@@ -443,15 +501,15 @@ inline H2dCacheLookup h2d_probe_cache_read(const std::string &path,
     while (std::getline(in, line)) {
         if (line.empty()) continue;
         const std::vector<std::string> f = h2d_split_tabs(line);
-        if (f.size() != 10) continue;
+        if (f.size() != kH2dCacheFields) continue;
         long long ver = 0, stamp = 0;
-        double ring = 0.0, direct = 0.0, pin = 0.0;
+        double ring = 0.0, direct = 0.0, block = 0.0, pin = 0.0;
         if (!h2d_parse_ll(f[0], &ver) || ver != kH2dCacheVersion) continue;
         if (!h2d_line_matches_key(f, key)) continue;
         if (!h2d_parse_gbs(f[6], &ring) || !h2d_parse_gbs(f[7], &direct) ||
-            !h2d_parse_gbs(f[8], &pin))
+            !h2d_parse_gbs(f[8], &block) || !h2d_parse_gbs(f[9], &pin))
             continue;
-        if (!h2d_parse_ll(f[9], &stamp)) continue;
+        if (!h2d_parse_ll(f[10], &stamp)) continue;
         if (stamp > now + 60) continue;  // clock moved backwards: do not trust it
         const long long age = now > stamp ? now - stamp : 0;
         if (age > kH2dCacheMaxAgeSec) continue;
@@ -461,7 +519,9 @@ inline H2dCacheLookup h2d_probe_cache_read(const std::string &path,
         r.probe.valid = true;
         r.probe.pageable_gbs = ring;
         r.probe.direct_gbs = direct;
+        r.probe.blocking_gbs = block;
         r.probe.pinned_gbs = pin;
+        r.probe.aperture_wide = aperture_is_wide(h2d_path_gbs(r.probe), pin);
         return r;
     }
     return r;
@@ -521,7 +581,7 @@ inline bool h2d_probe_cache_write(const std::string &path, const H2dCacheKey &ke
         while (read++ < kH2dCacheMaxEntries * 4 && std::getline(in, line)) {
             if (line.empty()) continue;
             const std::vector<std::string> f = h2d_split_tabs(line);
-            if (f.size() != 10) {
+            if (f.size() != kH2dCacheFields) {
                 if (prune) ++prune->unreadable;
                 continue;
             }
@@ -530,7 +590,7 @@ inline bool h2d_probe_cache_write(const std::string &path, const H2dCacheKey &ke
                 if (prune) ++prune->unreadable;
                 continue;
             }
-            if (!h2d_parse_ll(f[9], &stamp)) {
+            if (!h2d_parse_ll(f[10], &stamp)) {
                 if (prune) ++prune->unreadable;
                 continue;
             }
@@ -572,12 +632,12 @@ inline bool h2d_probe_cache_write(const std::string &path, const H2dCacheKey &ke
         if (mine[i] == '\t' || mine[i] == '\n' || mine[i] == '\r') mine[i] = ' ';
     char buf[512];
     std::snprintf(buf, sizeof buf,
-                  "%d\t%s\t%llu\t%d\t%d\t%llu\t%.4f\t%.4f\t%.4f\t%lld",
+                  "%d\t%s\t%llu\t%d\t%d\t%llu\t%.4f\t%.4f\t%.4f\t%.4f\t%lld",
                   kH2dCacheVersion, mine.c_str(),
                   static_cast<unsigned long long>(key.vram_total), key.large_bar,
                   key.driver_version,
                   static_cast<unsigned long long>(key.bytes), probe.pageable_gbs,
-                  probe.direct_gbs, probe.pinned_gbs, now);
+                  probe.direct_gbs, probe.blocking_gbs, probe.pinned_gbs, now);
     keep.push_back(Kept{buf, now});
     const std::string tmp = path + ".tmp";
     {
@@ -653,6 +713,7 @@ struct H2dCacheEntry {
     size_t bytes = 0;
     double pageable_gbs = 0.0;
     double direct_gbs = 0.0;
+    double blocking_gbs = 0.0;
     double pinned_gbs = 0.0;
     long long age_sec = 0;
     std::string dead;              // why a run would skip it; empty = live
@@ -689,10 +750,10 @@ inline std::vector<H2dCacheEntry> h2d_cache_scan(const std::string &path,
         // EXPIRED line still says whose verdict it is and what it measured --
         // "an expired 64 MiB direct verdict" is actionable, "an expired entry"
         // is not. The verdict below only decides which reason wins.
-        if (f.size() == 10 && h2d_parse_ll(f[0], &ver) &&
+        if (f.size() == kH2dCacheFields && h2d_parse_ll(f[0], &ver) &&
             ver == kH2dCacheVersion && h2d_parse_ll(f[2], &vram) &&
             h2d_parse_ll(f[3], &bar) && h2d_parse_ll(f[4], &driver) &&
-            h2d_parse_ll(f[5], &bytes) && h2d_parse_ll(f[9], &stamp)) {
+            h2d_parse_ll(f[5], &bytes) && h2d_parse_ll(f[10], &stamp)) {
             e.name = f[1];
             e.vram_total = static_cast<size_t>(vram < 0 ? 0 : vram);
             e.large_bar = static_cast<int>(
@@ -703,11 +764,12 @@ inline std::vector<H2dCacheEntry> h2d_cache_scan(const std::string &path,
             e.age_sec = stamp > now ? 0 : now - stamp;  // a future stamp is 0 s old
             rates_ok = h2d_parse_gbs(f[6], &e.pageable_gbs) &&
                        h2d_parse_gbs(f[7], &e.direct_gbs) &&
-                       h2d_parse_gbs(f[8], &e.pinned_gbs);
+                       h2d_parse_gbs(f[8], &e.blocking_gbs) &&
+                       h2d_parse_gbs(f[9], &e.pinned_gbs);
         }
         // Same order of refusals as the writer's prune, so the listing and the
         // rewrite cannot disagree about which line is dead and why.
-        if (f.size() != 10) {
+        if (f.size() != kH2dCacheFields) {
             e.dead = "unreadable";
         } else if (!h2d_parse_ll(f[0], &ver) || ver != kH2dCacheVersion) {
             e.dead = "from an older cache format";
@@ -732,7 +794,7 @@ inline std::vector<H2dCacheEntry> h2d_cache_scan(const std::string &path,
         // reader returns -- and only then is one line marked as used. The three
         // bucket sizes are the only ones a run can ask about, so a line written
         // at any other size is not a candidate.
-        if (current && f.size() == 10) {
+        if (current && f.size() == kH2dCacheFields) {
             if (current->bytes != 0) {
                 if (h2d_line_matches_key(f, *current)) {
                     e.matches = true;
@@ -777,23 +839,34 @@ inline std::string h2d_cache_entry_text(const H2dCacheEntry &e,
                       e.dead.empty() ? "unreadable" : e.dead.c_str());
         return std::string(b);
     }
-    const bool direct_path = pageable_direct_wins(e.pageable_gbs, e.direct_gbs);
-    const double pageable = direct_path ? e.direct_gbs : e.pageable_gbs;
+    const int path = pageable_path_choice(e.pageable_gbs, e.direct_gbs,
+                                          e.blocking_gbs);
+    const double pageable = path == 1   ? e.direct_gbs
+                            : path == 2 ? e.blocking_gbs
+                                        : e.pageable_gbs;
     const bool pin = warm_pin_worthwhile(pageable, e.pinned_gbs);
-    char use[128];
+    char use[160];
     if (e.live()) {
-        std::snprintf(use, sizeof use, "%s-> %s, %s", e.used ? "" : "   ",
-                      direct_path ? "direct" : "ring",
-                      pin ? "pin a WARM prefix" : "no pin");
+        // The aperture is stated here too: it is the fact the three rates are
+        // evidence FOR, and a listing that showed the numbers without it would
+        // leave the reader to redo the comparison.
+        std::snprintf(use, sizeof use, "%s-> %s (%.2f GB/s), %s",
+                      e.used ? "" : "   ",
+                      path == 1   ? "direct"
+                      : path == 2 ? "blocking"
+                                  : "ring",
+                      pageable, pin ? "pin a WARM prefix" : "no pin");
     } else {
         std::snprintf(use, sizeof use, "   [%s]", e.dead.c_str());
     }
     const std::string origin = h2d_probe_origin(true, e.age_sec, e.driver_version);
     std::snprintf(b, sizeof b,
-                  "%-44.44s %3zu MiB  ring %5.2f direct %5.2f pinned %5.2f GB/s  "
-                  "%s%s  |  %s",
+                  "%-44.44s %3zu MiB  ring %5.2f direct %5.2f blocking %5.2f "
+                  "pinned %5.2f GB/s  %s%s%s  |  %s",
                   e.name.c_str(), e.bytes >> 20, e.pageable_gbs, e.direct_gbs,
-                  e.pinned_gbs, use,
+                  e.blocking_gbs, e.pinned_gbs, use,
+                  aperture_is_wide(pageable, e.pinned_gbs) ? " [wide aperture]"
+                                                          : "",
                   (e.live() && other_driver) ? "  [another driver]" : "",
                   origin.c_str());
     return std::string(b);
@@ -1112,13 +1185,13 @@ inline std::string h2d_verdict_text(bool cached, long long age_sec,
                       h2d_probe_origin(true, age_sec, driver_version).c_str());
     } else if (iterations > 0) {
         std::snprintf(b, sizeof b,
-                      "H2D verdict: measured the card now (%zu MiB, 3 arms x %d "
+                      "H2D verdict: measured the card now (%zu MiB, 4 arms x %d "
                       "iteration(s)) -- %s",
                       bytes >> 20, iterations,
                       miss.empty() ? "nothing cached for this card" : miss.c_str());
     } else {
         std::snprintf(b, sizeof b,
-                      "H2D verdict: measured the card now (%zu MiB, 3 arms) -- %s",
+                      "H2D verdict: measured the card now (%zu MiB, 4 arms) -- %s",
                       bytes >> 20,
                       miss.empty() ? "nothing cached for this card" : miss.c_str());
     }

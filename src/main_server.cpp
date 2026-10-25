@@ -29,7 +29,11 @@ struct Args {
     int ctx = 4096;
     int chunk = 256;
     int kv_quant = 0;  // 0 = f16 KV, 1 = int8 (EngineConfig::kv_quant)
-    bool prefill_fast = false; // --prefill fast: rows>1 GEMM on the matrix cores
+    // rows>1 GEMM on the throughput rung, matching the CLI's default: the exact
+    // grid costs 36% of a chunk on Qwen3.5-35B-A3B (147.0 -> 225.1 tok/s) for a
+    // chunk-invariance guarantee nothing but --prefill-hash consumes.
+    // `--prefill exact` restores it.
+    bool prefill_fast = true;
     int device = 0;
     int threads = 0;
     int expert_cache_mb = 0;
@@ -209,16 +213,18 @@ int main(int argc, char **argv) {
     } else {
         // Same mapping the CLI uses: the backend reads its GEMM rung switch once
         // at construction, so the env has to be set before make_hip_backend().
-        if (a.prefill_fast) {
+        // Same switch the CLI uses (KRK_GEMM_EXACT) rather than a forced rung,
+        // so a caller's own KRK_GEMM_PATH still picks WHICH rung the ladder may
+        // use; this one only decides whether the exact grid outranks it. An
+        // explicit value in the environment wins, which is what the bit-exact
+        // gates set.
+        const char *exact_env = std::getenv("KRK_GEMM_EXACT");
+        if (!(exact_env && *exact_env)) {
 #ifdef _WIN32
-            _putenv_s("KRK_GEMM_PATH", "wmma");
+            _putenv_s("KRK_GEMM_EXACT", a.prefill_fast ? "0" : "1");
 #else
-            setenv("KRK_GEMM_PATH", "wmma", 1);
+            setenv("KRK_GEMM_EXACT", a.prefill_fast ? "0" : "1", 1);
 #endif
-            std::fprintf(stderr,
-                         "kraken-server: --prefill fast takes the rows>1 GEMM to the "
-                         "matrix cores; the prefill hash is then not chunk-invariant "
-                         "past 8 rows per chunk\n");
         }
         be = make_hip_backend(a.device, &err);
         if (!be) {

@@ -9,6 +9,8 @@
 #include <hip/hip_version.h>
 
 #include <algorithm>
+#include <set>
+#include <string>
 #include <atomic> // std::atomic in the paged-read fail counter; MSVC pulls it in
 #include <chrono>
 #include <cstdlib>
@@ -753,7 +755,11 @@ public:
             pool_live_.emplace(b.p, LiveCell{rounded, b.m});
             return b.p;
         }
-        pool_trim_(rounded);
+        {
+            const double t0 = phase_now();
+            pool_trim_(rounded);
+            expert_pool_.trim_ms += phase_now() - t0;
+        }
         // The budget abort is the per-cell allocator's invariant, and with the
         // arena it stops being one: a slab is rounded up to kSlabCells, so
         // `committed` legitimately sits a slab's slack (up to ~70 MiB) above the
@@ -761,7 +767,10 @@ public:
         // state of a constrained run -- not evidence of a ledged bug. There the
         // right answer is the refusal path the cache already handles (evict,
         // retry, skip), which is what returning nullptr becomes below.
-        if (!expert_arena() &&
+        // Slabs pay while the pool is still filling; once the cache starts
+        // handing cells back the per-cell shape is the cheaper one.
+        const bool slab_growth = expert_arena() && expert_pool_.release_slices == 0;
+        if (!slab_growth && pool_slabs_.empty() &&
             (rounded > expert_pool_.budget ||
              expert_pool_.committed > expert_pool_.budget - rounded)) {
             KRK_ERROR("expert pool physical budget exhausted: live=%zu need=%zu budget=%zu",
@@ -783,14 +792,18 @@ public:
         // budget -- a run that will never come near the floor pays nothing.
         if (expert_arena() && expert_pool_.budget > 0 &&
             expert_pool_.committed >= expert_pool_.budget / 2) {
+            const double probe_t0 = phase_now();
             const size_t total = device_total_bytes();
             const size_t floor = krk::vram_floor_bytes(total);
             size_t free_b = device_free_bytes();
+            ++expert_pool_.probes;
             if (total && free_b < rounded + floor) {
                 // Reuse before refusing: the free cells are already paid for.
                 pool_trim_(rounded);
                 free_b = device_free_bytes();
+                ++expert_pool_.probes;
             }
+            expert_pool_.probe_ms += phase_now() - probe_t0;
             if (total && free_b < rounded + floor) {
                 ++expert_pool_.floor_refusals;
                 if (expert_pool_.floor_refusals == 1)
@@ -804,7 +817,9 @@ public:
                 return nullptr;
             }
         }
-        void *p = expert_arena() ? pool_slab_take_(rounded) : alloc(rounded);
+        const double malloc_t0 = phase_now();
+        void *p = slab_growth ? pool_slab_take_(rounded) : alloc(rounded);
+        expert_pool_.malloc_ms += phase_now() - malloc_t0;
         if (!p) return nullptr;
         {   // Same invariant as the reuse path: a fresh cell carries no stamp.
             const auto stale = pool_reader_done_.find(p);
@@ -814,7 +829,7 @@ public:
             }
         }
         pool_live_.emplace(p, LiveCell{rounded, nullptr});
-        if (!expert_arena()) expert_pool_.committed += rounded;
+        if (!slab_growth) expert_pool_.committed += rounded;
         expert_pool_.live += rounded;
         ++expert_pool_.allocations;
         return p;
@@ -826,11 +841,24 @@ public:
     // 138.0 with the arena. The loss is in `xfer` (894 -> 1486 ms), i.e. the
     // copies into uniformly spaced cells, not the kernels; a padded stride made
     // it worse by costing 3% of capacity, which is the cliff this pool sits on.
-    // So the default stays the per-cell allocator and this is the arm to retest
-    // if the address-locality cause is ever understood.
+    // That verdict is about a CHURNING pool, and it does not hold while the pool
+    // is still filling. Nemotron Bolt 74B IQ2_S, 16 tokens, no warmup (so every
+    // expert is new and nothing is ever handed back): decode ran 237.3 ms/step
+    // with one hipMalloc per cell against 80.6 with the arena -- 4.2 against
+    // 12.4 tok/s -- because 12 226 fresh cells at ~0.19 ms each is 2.4 s, and
+    // hipMalloc is a synchronizing call, so each one also drains the queue.
+    // `alloc` fell 2442 -> 508 ms and the stall it caused on the device does not
+    // appear in any timer at all.
+    //
+    // So the switch is the pool's own state, not a flag: slabs while the pool is
+    // still growing and has never taken a cell back, per-cell once it has. A
+    // churning run stops using slabs at its first release and keeps the shape
+    // that was measured faster there (74B, 8 GiB tier, warmup on, --vram-cap-mb
+    // 6000: 10.7 ms/step per-cell against 9.1 arena, 93.3 against 110.5).
+    // KRK_EXPERT_ARENA=0 forces the per-cell allocator for an A/B.
     static bool expert_arena() {
         const char *e = std::getenv("KRK_EXPERT_ARENA");
-        return e && *e && e[0] != '0';
+        return !(e && e[0] == '0');
     }
     void release_pooled(void *p, size_t bytes) override {
         void *ps[1] = {p};
@@ -1414,6 +1442,18 @@ public:
     // restores the ring path for an A/B.
     void *upload_expert_prefetch(void *const dst[], const void *const src[],
                                  const size_t bytes[], int n) override {
+        return prefetch_into_(dst, src, bytes, n, nullptr);
+    }
+    void *prefetch_after(void *const dst[], const void *const src[],
+                         const size_t bytes[], int n, void *ready) override {
+        return prefetch_into_(dst, src, bytes, n, ready);
+    }
+
+    // The shared body of the two prefetch forms. `ready`, when set, is an event
+    // already recorded on the default stream and is the previous reader of the
+    // destination: the copies below may not begin until it has passed.
+    void *prefetch_into_(void *const dst[], const void *const src[],
+                         const size_t bytes[], int n, void *ready) {
         // Pinned sources only. A pageable source needs a host memcpy into the
         // ring, which would run HERE, at issue time -- the serial cost this path
         // exists to remove -- so it takes the staged path instead.
@@ -1424,19 +1464,48 @@ public:
             static_cast<void>(hipGetLastError());
             return upload_expert_staged(dst, src, bytes, n);
         }
+        if (ready && hipStreamWaitEvent(pinned_stream_,
+                                        static_cast<hipEvent_t>(ready), 0) !=
+                         hipSuccess) {
+            // The stream cannot be ordered behind it, so fall back to ordering
+            // the HOST behind it: slower, and it cannot overwrite bytes a
+            // queued kernel is still reading.
+            static_cast<void>(hipGetLastError());
+            (void)hipEventDestroy(ev);
+            wait_marker(ready);
+            return upload_expert_staged(dst, src, bytes, n);
+        }
         int queued = 0;
-        for (int i = 0; i < n; i++) {
-            if (!dst[i] || !src[i] || !bytes[i]) continue;
+        // Adjacent entries are one DMA, for the same measured reason as
+        // `upload_pinned_batch`: a layer's tensors are contiguous on both sides
+        // and only their call count was costing anything.
+        for (int i = 0; i < n;) {
+            if (!dst[i] || !src[i] || !bytes[i]) {
+                i++;
+                continue;
+            }
             // The cell may still be read by the previous owner; the copy stream
             // waits for that release mark, never the host.
             pool_honor_(dst[i], pinned_stream_);
-            if (hipMemcpyAsync(dst[i], src[i], bytes[i], hipMemcpyHostToDevice,
+            char *d = static_cast<char *>(dst[i]);
+            const char *s = static_cast<const char *>(src[i]);
+            size_t run = bytes[i];
+            int j = i + 1;
+            while (copy_coalesce_() && j < n && dst[j] && src[j] && bytes[j] &&
+                   dst[j] == d + run && src[j] == s + run) {
+                pool_honor_(dst[j], pinned_stream_);
+                run += bytes[j];
+                j++;
+                ++pin_merged_;
+            }
+            if (hipMemcpyAsync(d, s, run, hipMemcpyHostToDevice,
                                pinned_stream_) != hipSuccess) {
                 static_cast<void>(hipGetLastError());
                 (void)hipEventDestroy(ev);
                 return upload_expert_staged(dst, src, bytes, n);
             }
             ++queued;
+            i = j;
         }
         if (!queued || hipEventRecord(ev, pinned_stream_) != hipSuccess) {
             static_cast<void>(hipGetLastError());
@@ -1460,8 +1529,36 @@ public:
         }
         KRK_TIME_OP("upload_pinned");
         i64 batch_bytes = 0;
-        for (int i = 0; i < n; i++) {
-            if (!dst[i] || !src[i] || !bytes[i]) continue;
+        // Bracket the batch on the COPY stream, and start the bracket BEFORE the
+        // first copy is enqueued. The pair used to be recorded after the loop,
+        // which put both events behind the copies in stream order: elapsed was
+        // the gap between two adjacent records, so the published rate was
+        // whatever that gap was over the bytes -- measured 2.2 ms for 6251 MiB
+        // (2719.7 GB/s) on a clean run and 20.7 GB/s on another. A rate that
+        // moves like that is not a rate. With t0 ahead of the copies, the span
+        // is this batch's own flight.
+        pin_fold_(false);
+        const int slot = pin_slot_free_();
+        const bool timed_pair = slot >= 0;
+        if (timed_pair) KRK_HIP(hipEventRecord(pin_t0_[slot], pinned_stream_));
+        // ADJACENT entries are ONE copy. A streamed layer is handed over as up
+        // to 32 tensors that are contiguous on BOTH sides -- the staging buffer
+        // and the ring slot share one aligned offset walk -- so issuing 32
+        // hipMemcpyAsync calls for one contiguous region pays the per-call cost
+        // 32 times for bytes that are already in order. Measured on the 1.67 MB
+        // streamed-layer shape (`tools/bar_probe.hip`, 9 copies, median):
+        //   1677721 bytes as 1 copy     12.98 GB/s
+        //   1677721 bytes as 32 x 51 KiB 11.34 GB/s
+        // so the win is ~19 us per layer and it is the only part of this path's
+        // cost that batching can take: the 482 us a promotion shows in the op
+        // timeline is its SPAN, which includes waiting for the previous reader
+        // of a pooled cell -- ordering that keeps the output correct, and that
+        // no amount of coalescing removes.
+        for (int i = 0; i < n;) {
+            if (!dst[i] || !src[i] || !bytes[i]) {
+                i++;
+                continue;
+            }
             // A reused cell may still be READ by the expert that owned it. The
             // release mark is recorded on the DEFAULT stream and this copy runs
             // on a private non-blocking one, so without this wait the DMA lands
@@ -1476,49 +1573,99 @@ public:
             // 4, because the trim path it replaced `hipFree`d the cell (which
             // synchronizes) and never exercised the hand-out.
             pool_honor_(dst[i], pinned_stream_);
-            KRK_HIP(hipMemcpyAsync(dst[i], src[i], bytes[i], hipMemcpyHostToDevice,
+            // Extend the run while the next entry continues this one on both
+            // sides. `pool_honor_` still runs per cell, so every reused cell is
+            // ordered behind its own previous reader; only the COPY is merged.
+            char *d = static_cast<char *>(dst[i]);
+            const char *s = static_cast<const char *>(src[i]);
+            size_t run = bytes[i];
+            int j = i + 1;
+            while (copy_coalesce_() && j < n && dst[j] && src[j] && bytes[j] &&
+                   dst[j] == d + run && src[j] == s + run) {
+                pool_honor_(dst[j], pinned_stream_);
+                run += bytes[j];
+                j++;
+                ++pin_merged_;
+            }
+            KRK_HIP(hipMemcpyAsync(d, s, run, hipMemcpyHostToDevice,
                                    pinned_stream_));
-            batch_bytes += static_cast<i64>(bytes[i]);
+            // Charge the bytes the caller asked for, not the merged run: the
+            // run also carries the alignment padding between tensors, and a
+            // statistic that grew when the copy got faster would not be
+            // comparable across the two arms of the A/B.
+            for (int k = i; k < j; k++) batch_bytes += static_cast<i64>(bytes[k]);
+            i = j;
         }
         if (batch_bytes == 0) return;
-        // Bracket the batch on its own stream so the report can state a rate
-        // that is the copy's, not the enqueue's. One pair is enough: a decode
-        // step issues a couple of promotions and each DMA (0.7 ms) is long done
-        // before the next one is enqueued. If it is not, that batch goes untimed
-        // rather than blocking the caller -- under-counted time bounds a rate
-        // from above, and blocking would change what is being measured.
-        pin_fold_(false);
-        const bool timed_pair = !pin_live_ && pin_t0_ && pin_t1_;
-        if (timed_pair) KRK_HIP(hipEventRecord(pin_t0_, pinned_stream_));
+        // Close the bracket opened above (t0 is already on the stream, before
+        // this batch's copies). One pair at a time: a batch that arrives while
+        // the previous pair is still in flight goes untimed rather than
+        // blocking the caller -- under-counted time bounds a rate from above,
+        // and blocking would change what is being measured.
         KRK_HIP(hipEventRecord(pinned_ev_, pinned_stream_));
         KRK_HIP(hipStreamWaitEvent(0, pinned_ev_, 0));
         if (timed_pair) {
-            KRK_HIP(hipEventRecord(pin_t1_, pinned_stream_));
-            pin_live_ = true;
+            KRK_HIP(hipEventRecord(pin_t1_[slot], pinned_stream_));
+            // `batch_bytes` is only known now (the copy loop above fills it), and
+            // it is what this pair covers -- the caller's bytes, not the merged
+            // run's padding.
+            pin_slot_bytes_[slot] = static_cast<unsigned long long>(batch_bytes);
+            pin_live_[slot] = true;
         }
         pin_bytes_ += static_cast<unsigned long long>(batch_bytes);
         pin_batches_++;
         krk_op_scope.bytes(batch_bytes);
     }
-    // Folds a completed pair into pin_ms_. Never waits unless told to: sync()
-    // calls it right after the device sync, which is what makes it complete.
+    // Folds every completed pair into pin_ms_. Never waits unless told to:
+    // sync() calls it right after the device sync, which is what makes the last
+    // ones complete.
+    //
+    // A RING of pairs, not one. With a single pair the policy was "one timed
+    // batch at a time, never block", so during the expert tier's warmup --
+    // thousands of batches enqueued back to back, none of them drained -- almost
+    // no batch was ever timed while its bytes were still counted, and the line
+    // printed 2719.7 GB/s for 6251 MiB in 2.2 ms. Eight slots keep a deep queue
+    // sampled; a batch that finds none free goes untimed AND its bytes are not
+    // counted in the rate, so the number is a rate over what it timed.
     void pin_fold_(bool drain) {
-        if (!pin_live_) return;
-        if (!drain && hipEventQuery(pin_t1_) != hipSuccess) {
-            static_cast<void>(hipGetLastError());
-            return;
+        for (int i = 0; i < kPinTimers; i++) {
+            if (!pin_live_[i]) continue;
+            if (!drain && hipEventQuery(pin_t1_[i]) != hipSuccess) {
+                static_cast<void>(hipGetLastError());
+                continue;
+            }
+            float ms = 0.0f;
+            if (hipEventElapsedTime(&ms, pin_t0_[i], pin_t1_[i]) == hipSuccess &&
+                ms > 0.0f) {
+                pin_ms_ += static_cast<double>(ms);
+                pin_timed_bytes_ += pin_slot_bytes_[i];
+                pin_timed_batches_++;
+            }
+            pin_live_[i] = false;
         }
-        float ms = 0.0f;
-        if (hipEventElapsedTime(&ms, pin_t0_, pin_t1_) == hipSuccess && ms > 0.0f)
-            pin_ms_ += static_cast<double>(ms);
-        pin_live_ = false;
+    }
+    int pin_slot_free_() {
+        for (int i = 0; i < kPinTimers; i++)
+            if (!pin_live_[i] && pin_t0_[i] && pin_t1_[i]) return i;
+        return -1;
     }
     double pinned_dma_ms() override {
         pin_fold_(false);
         return pin_ms_;
     }
+    // How many per-tensor copies adjacent-source coalescing removed. Published
+    // so the win is attributable rather than assumed: a model whose streamed
+    // set is resident (or whose expert slices live in separate cells) reports 0
+    // here, and then a decode difference against the old build is noise.
+    unsigned long long pinned_merged() const override { return pin_merged_; }
     unsigned long long pinned_dma_bytes() const override { return pin_bytes_; }
     unsigned long long pinned_dma_batches() const override { return pin_batches_; }
+    unsigned long long pinned_dma_timed_bytes() const override {
+        return pin_timed_bytes_;
+    }
+    unsigned long long pinned_dma_timed_batches() const override {
+        return pin_timed_batches_;
+    }
     static bool pinned_dma_() {
         static const bool v = [] {
             const char *e = std::getenv("KRK_WEIGHT_DMA");
@@ -1534,8 +1681,10 @@ public:
         pinned_tried_ = true;
         // Timing pair for pinned_dma_ms(). A create failure only costs the
         // report its rate, so it is not an error path.
-        (void)hipEventCreate(&pin_t0_);
-        (void)hipEventCreate(&pin_t1_);
+        for (int i = 0; i < kPinTimers; i++) {
+            (void)hipEventCreate(&pin_t0_[i]);
+            (void)hipEventCreate(&pin_t1_[i]);
+        }
         if (hipStreamCreateWithFlags(&pinned_stream_, hipStreamNonBlocking) !=
                 hipSuccess ||
             hipEventCreateWithFlags(&pinned_ev_, hipEventDisableTiming) !=
@@ -1678,36 +1827,50 @@ public:
     // change here can be measured against what it replaced. The ring is built
     // even when the direct path is selected: the direct path borrows one of its
     // streams, and a staging failure has to fall back somewhere.
-    static bool paged_blocking_() {
+    // The A/B arm against coalescing adjacent pinned sources into one copy. On
+    // by default; `KRK_PINNED_COALESCE=0` restores one DMA per entry, which is
+    // what the path did before, so the change can be measured against it.
+    static bool copy_coalesce_() {
         static const bool v = [] {
-            const char *e = std::getenv("KRK_WARM_DMA");
-            return e && e[0] == '0';
+            const char *e = std::getenv("KRK_PINNED_COALESCE");
+            return !(e && e[0] == '0');
         }();
         return v;
     }
+    bool paged_blocking_() const { return pageable_choice_() == 2; }
     // Which pageable path runs is a MEASUREMENT, not a constant: Engine::init
-    // times the ring against the direct DMA at the promotion shape and picks the
-    // faster. That is why this is member state and not a function-static -- the
-    // probe has to flip it between its arms on one backend. KRK_WARM_DMA=1
-    // (ring) / =2 (direct) still forces a path, and it wins over the engine;
-    // =0 is the blocking copy above.
-    bool paged_direct_() const {
+    // times all THREE mechanisms at the promotion shape and picks the fastest
+    // (0 ring, 1 direct, 2 blocking). That is why this is member state and not a
+    // function-static -- the probe has to flip it between its arms on one
+    // backend. KRK_WARM_DMA=1 (ring) / =2 (direct) / =0 (blocking) still forces
+    // a path, and it wins over the engine.
+    bool paged_direct_() const { return pageable_choice_() == 1; }
+    // 0 ring, 1 direct, 2 blocking: the environment when it names one, this
+    // backend's measured setting otherwise.
+    int pageable_choice_() const {
         const int forced = pageable_env_();
-        return forced != 0 ? forced == 2 : pageable_direct_;
+        if (forced > 0) return forced - 1;  // env 1/2/3 -> ring/direct/blocking
+        return pageable_path_;
     }
-    // 0 = not set by the environment, 1 = ring, 2 = direct.
+    // 0 = not set by the environment, 1 = ring, 2 = direct, 3 = blocking.
     static int pageable_env_() {
         static const int v = [] {
             const char *e = std::getenv("KRK_WARM_DMA");
             if (!e) return 0;
             if (e[0] == '2') return 2;
             if (e[0] == '1') return 1;
-            return 0;  // '0' is the blocking copy, and no selector at all
+            if (e[0] == '0') return 3;
+            return 0;
         }();
         return v;
     }
     bool pageable_paths_selectable() const override { return true; }
-    void set_pageable_direct(bool on) override { pageable_direct_ = on; }
+    void set_pageable_path(PageablePath p) override {
+        pageable_path_ = static_cast<int>(p);
+    }
+    void set_pageable_direct(bool on) override {
+        set_pageable_path(on ? PageablePath::Direct : PageablePath::Ring);
+    }
     bool paged_ready_() {
         if (paged_on_) return true;
         if (paged_failed_) return false;
@@ -1763,13 +1926,15 @@ public:
             (void)hipEventDestroy(pinned_ev_);
             pinned_ev_ = nullptr;
         }
-        if (pin_t0_) {
-            (void)hipEventDestroy(pin_t0_);
-            pin_t0_ = nullptr;
-        }
-        if (pin_t1_) {
-            (void)hipEventDestroy(pin_t1_);
-            pin_t1_ = nullptr;
+        for (int i = 0; i < kPinTimers; i++) {
+            if (pin_t0_[i]) {
+                (void)hipEventDestroy(pin_t0_[i]);
+                pin_t0_[i] = nullptr;
+            }
+            if (pin_t1_[i]) {
+                (void)hipEventDestroy(pin_t1_[i]);
+                pin_t1_[i] = nullptr;
+            }
         }
     }
     // Installs the pull-style weight path (see Backend::set_weight_pull).
@@ -2245,6 +2410,24 @@ public:
             static_cast<f32 *>(wts), k, normalize, scale);
     }
 
+    // Routing statistics folded on the device: see Backend::scan_accum. One
+    // small block per layer, no readback -- the host pulls the finished
+    // histograms once, when the index is written.
+    bool scan_accum_supported() const override { return true; }
+    void scan_accum(const void *probs, const void *ids, i64 n_rows,
+                    i32 n_expert, i32 k, i32 layer, void *hits,
+                    void *mass) override {
+        KRK_TIME_OP("scan_accum");
+        if (!probs || !ids || !hits || !mass || n_rows <= 0 || n_expert <= 0 ||
+            k <= 0)
+            return;
+        constexpr int kThreads = 128;
+        scan_accum_kernel<kThreads><<<1, kThreads, 0>>>(
+            static_cast<const f32 *>(probs), static_cast<const i32 *>(ids),
+            static_cast<i32>(n_rows), n_expert, k, layer,
+            static_cast<unsigned int *>(hits), static_cast<f32 *>(mass));
+    }
+
     void moe_plan_build(const void *ids, i64 n_rows, i32 k, i32 n_expert,
                         void *off, void *rows, void *wt, const void *wts) override {
         KRK_TIME_OP("moe_plan_build");
@@ -2292,6 +2475,140 @@ public:
                       static_cast<long long>(n_ff),
                       static_cast<long long>(n_embd));
             std::abort();
+        }
+        // ---- the tiled forms, which the serial kernel is the baseline for ----
+        // The serial kernel is one block per token walking the token's k slots:
+        // one CU for a decode step, and one weight read per PAIR for a chunk. The
+        // tiled forms split it two ways -- row ranges keyed by (token, slot) for a
+        // single row, by EXPERT for a batch -- and both are always better than the
+        // serial kernel on the geometry they are chosen for, so the default is
+        // tiled. The serial kernel stays as the form the bench compares against
+        // and as the fallback when the scratch cannot be had.
+        //
+        // KRK_MOE_FANOUT=0 keeps the serial form; the bench compares them bit for
+        // bit, because the reduce replays the serial accumulation order rather
+        // than approximating it.
+        const char *fan = std::getenv("KRK_MOE_FANOUT");
+        const bool fanout = !(fan && fan[0] == '0');
+        if (fanout) {
+            // Tiled rows: one expert's gate/up and down each span many blocks,
+            // so a decode step fills the card instead of using k CUs. See
+            // kernels/moe_table.hpp for why the activation row goes to global
+            // scratch as f32 (it is the pre-rounding product; the f16 the down
+            // dot reads is produced by the scale pass, which is where the row
+            // scale becomes knowable) and why the arithmetic is unchanged.
+            constexpr i32 kGuRows = 16;
+            constexpr i32 kDownRows = 16;
+            const i64 slots = n_tok * static_cast<i64>(k);
+            const i32 gu_tiles = static_cast<i32>((n_ff + kGuRows - 1) / kGuRows);
+            const i32 dn_tiles = static_cast<i32>((n_embd + kDownRows - 1) / kDownRows);
+            const size_t part_bytes = static_cast<size_t>(slots) *
+                                      static_cast<size_t>(n_embd) * sizeof(f32);
+            const size_t mid_bytes = static_cast<size_t>(slots) *
+                                     static_cast<size_t>(n_ff) * sizeof(f32);
+            const size_t midf_bytes = static_cast<size_t>(slots) *
+                                      static_cast<size_t>(n_ff) * sizeof(_Float16);
+            const size_t rscale_bytes = static_cast<size_t>(slots) * sizeof(f32);
+            // The expert-major group (off / idx): what a BATCH needs, because its
+            // pairs name at most n_expert distinct matrices and reading one per
+            // pair is what made the chunk slow (see moe_table.hpp).
+            const size_t off_bytes = (static_cast<size_t>(n_expert) + 1u) * sizeof(i32);
+            const size_t idx_bytes = static_cast<size_t>(slots) * sizeof(i32);
+            // KRK_MOE_FANOUT=2 forces the expert-major form ("1" the per-pair one,
+            // "0" the serial kernel), so the bench can compare all three on one
+            // case; unset picks by row count, which is the whole point of having
+            // both.
+            const char *fan_g = std::getenv("KRK_MOE_FANOUT");
+            const bool grouped = fan_g && fan_g[0] == '2'
+                                     ? true
+                                     : (fan_g && fan_g[0] == '1' ? false : n_tok > 4);
+            auto fit = [](void *&buf, size_t &cap, size_t bytes) {
+                if (buf && cap >= bytes) return true;
+                if (buf) (void)hipFree(buf);
+                buf = nullptr;
+                cap = 0;
+                if (hipMalloc(&buf, bytes) == hipSuccess) {
+                    cap = bytes;
+                    return true;
+                }
+                (void)hipGetLastError();
+                return false;
+            };
+            const bool ready = fit(moe_part_, moe_part_bytes_, part_bytes) &&
+                               fit(moe_mid_, moe_mid_bytes_, mid_bytes) &&
+                               fit(moe_midf_, moe_midf_bytes_, midf_bytes) &&
+                               fit(moe_rscale_, moe_rscale_bytes_, rscale_bytes) &&
+                               (!grouped || (fit(moe_goff_, moe_goff_bytes_, off_bytes) &&
+                                             fit(moe_gidx_, moe_gidx_bytes_, idx_bytes)));
+            // A grid larger than the tile count covers every row set; the
+            // kernels bounds-check their own row range, so a geometry that does
+            // not divide evenly is exact rather than approximated.
+            if (ready && gu_tiles > 0 && dn_tiles > 0) {
+                if (grouped) {
+                    // One block per (expert, row range), walking the tokens that
+                    // routed to that expert: one weight row read, many dots.
+                    moe_group_plan_kernel<<<1, 1, 0>>>(
+                        static_cast<const i32 *>(ids), static_cast<i32>(n_tok), k,
+                        n_expert, static_cast<i32 *>(moe_goff_),
+                        static_cast<i32 *>(moe_gidx_));
+                    const dim3 gu_dn(static_cast<unsigned>(dn_tiles),
+                                     static_cast<unsigned>(n_expert));
+                    const dim3 gu_gu(static_cast<unsigned>(gu_tiles),
+                                     static_cast<unsigned>(n_expert));
+                    moe_table_gu_grouped<256, kGuRows><<<gu_gu, 256>>>(
+                        static_cast<const MoeDispatchEntry *>(table), layer,
+                        n_expert, static_cast<const i32 *>(moe_goff_),
+                        static_cast<const i32 *>(moe_gidx_),
+                        static_cast<const _Float16 *>(xn),
+                        static_cast<f32 *>(moe_mid_), static_cast<i32>(n_embd),
+                        static_cast<i32>(n_ff), k);
+                    moe_table_scale_kernel<256><<<static_cast<unsigned>(slots), 256>>>(
+                        static_cast<const MoeDispatchEntry *>(table), layer,
+                        n_expert, static_cast<const i32 *>(ids),
+                        static_cast<const f32 *>(moe_mid_),
+                        static_cast<_Float16 *>(moe_midf_),
+                        static_cast<f32 *>(moe_rscale_), static_cast<i32>(n_ff), k);
+                    moe_table_down_grouped<256, kDownRows><<<gu_dn, 256>>>(
+                        static_cast<const MoeDispatchEntry *>(table), layer,
+                        n_expert, static_cast<const i32 *>(moe_goff_),
+                        static_cast<const i32 *>(moe_gidx_),
+                        static_cast<const f32 *>(wts),
+                        static_cast<const _Float16 *>(moe_midf_),
+                        static_cast<const f32 *>(moe_rscale_),
+                        static_cast<f32 *>(moe_part_), static_cast<i32>(n_embd),
+                        static_cast<i32>(n_ff), k);
+                } else {
+                    moe_table_gu_tiled<256, kGuRows>
+                        <<<static_cast<unsigned>(slots * gu_tiles), 256>>>(
+                            static_cast<const MoeDispatchEntry *>(table), layer,
+                            n_expert, static_cast<const i32 *>(ids),
+                            static_cast<const _Float16 *>(xn),
+                            static_cast<f32 *>(moe_mid_), static_cast<i32>(n_embd),
+                            static_cast<i32>(n_ff), k, gu_tiles);
+                    moe_table_scale_kernel<256><<<static_cast<unsigned>(slots), 256>>>(
+                        static_cast<const MoeDispatchEntry *>(table), layer,
+                        n_expert, static_cast<const i32 *>(ids),
+                        static_cast<const f32 *>(moe_mid_),
+                        static_cast<_Float16 *>(moe_midf_),
+                        static_cast<f32 *>(moe_rscale_), static_cast<i32>(n_ff), k);
+                    moe_table_down_tiled<256, kDownRows>
+                        <<<static_cast<unsigned>(slots * dn_tiles), 256>>>(
+                            static_cast<const MoeDispatchEntry *>(table), layer,
+                            n_expert, static_cast<const i32 *>(ids),
+                            static_cast<const f32 *>(wts),
+                            static_cast<const _Float16 *>(moe_midf_),
+                            static_cast<const f32 *>(moe_rscale_),
+                            static_cast<f32 *>(moe_part_), static_cast<i32>(n_embd),
+                            static_cast<i32>(n_ff), k, dn_tiles);
+                }
+                moe_table_reduce_kernel<256>
+                    <<<static_cast<unsigned>(n_tok), 256>>>(
+                        static_cast<const f32 *>(moe_part_),
+                        static_cast<_Float16 *>(out), static_cast<i32>(n_embd), k);
+                return;
+            }
+            // No scratch for the split: fall through to the serial kernel rather
+            // than compute part of the layer.
         }
         moe_table_kernel<256><<<static_cast<unsigned>(n_tok), 256, smem>>>(
             static_cast<const MoeDispatchEntry *>(table), layer, n_expert,
@@ -2424,10 +2741,57 @@ public:
     // size leaves bit-identical bytes. No split-K, no int8 staging, no tile
     // regrouping -- the rung lottery (wmma/dp4a/simt) is throughput-first and
     // regroups by shape. KRK_GEMM_EXACT=0 restores the lottery (the A/B arm).
+    // OFF by default since the measurement. The exact grid exists so that a
+    // chunk-size change cannot change a byte, and it costs 4x the prefill:
+    // 27B Q4_K_M, 191-token prompt -- 45.5 tok/s exact against 196.0 on the
+    // rung lottery (gemm(wmma)), with the OUTPUT IDENTICAL at chunk 64, 128,
+    // 256, 512 and identical to the exact arm's md5
+    // (d9c95a66b0ca96eb8c931b01f466f029, perf-traces/wx-*.err, ex-1/ex-0).
+    // The invariance the exact path guarantees was therefore already true of
+    // the WMMA path for this stack; where it is not, KRK_GEMM_EXACT=1 restores
+    // the grid and the test suite's bit-exact gates are the arbiter.
+    // How many M tiles one block walks on a staged weight tile (§22.17 sweep).
+    // N fragments per wavefront for the prefill GEMM (§22.21 sweep). 2 uses the
+    // 64x32 wave map, where one A fragment feeds two MMAs.
+    // DEFAULT 2, measured (§22.21): 191 rows 257.7 -> 264.6, 701 rows 299.7 ->
+    // 314.0, md5 identical. One A fragment now feeds two MMAs, which is the ILP
+    // the barrier-free loop can use; KRK_WMMA_NF=1 restores the 32x64 map.
+    // BN=128 prefill map: measured in §22.22 and REMOVED, not kept behind a
+    // switch. 191 rows 264.4 vs 233.4, 701 rows 307.9 vs 233.6, byte-identical
+    // output -- the one-chunk-per-thread Q4_K pipeline pins BK to 64 at BN=128,
+    // so the wider tile spends twice the staging rounds. See wmma_cfg_wide's
+    // note in kernels/gemm.hpp for the numbers.
+
+    static int wmma_nf() {
+        static const int v = [] {
+            const char *e = std::getenv("KRK_WMMA_NF");
+            if (!e || !*e) return 2;
+            return std::atoi(e) >= 2 ? 2 : 1;
+        }();
+        return v;
+    }
+
+    static int wmma_mb() {
+        static const int v = [] {
+            // DEFAULT 4, measured (§22.17). The staged weight tile is amortised
+            // over wmb*BM rows, so a 191-row prompt stages it 6 times at MB=1
+            // and twice at MB=4; MB=8 costs more than it saves (accumulators
+            // spill). Bit-identical output at every value, checked by md5.
+            // KRK_WMMA_MB=1 restores the old mapping.
+            const char *e = std::getenv("KRK_WMMA_MB");
+            if (!e || !*e) return 4;
+            // 4 is also the LDS limit for the one-pass staging below: MB tiles
+            // of BM x (BK+pad) halves plus the weight tile is 52 kB at MB=4.
+            const int n = std::atoi(e);
+            return (n >= 1 && n <= 4) ? n : 4;
+        }();
+        return v;
+    }
+
     static bool exact_gemm_enabled() {
         static const bool v = [] {
             const char *e = std::getenv("KRK_GEMM_EXACT");
-            return !(e && e[0] == '0');
+            return !(e && *e && std::string(e) == "0");
         }();
         return v;
     }
@@ -2485,9 +2849,16 @@ public:
             }
             return v;
         }();
-        const char *bar = large_bar == 1  ? ", Resizable BAR"
-                          : large_bar == 0 ? ", no large BAR"
-                                           : ", BAR unknown";
+        // Named as the runtime's CLAIM, not as the fact: this attribute reads 0
+        // on firmware with ReBAR enabled (measured on an RX 9070 XT where a 1 GiB
+        // pageable copy runs at 22 GB/s), so a banner that printed "no large
+        // BAR" told the user their aperture was off while the copy path was
+        // demonstrably using it. The measurement that decides is the H2D probe's,
+        // and its verdict is logged at init.
+        const char *bar = large_bar == 1
+                              ? ", BAR: runtime says large"
+                              : large_bar == 0 ? ", BAR: runtime says 256 MiB"
+                                               : ", BAR: runtime silent";
         return format("%s (%s, %s, %d CU, wave32, %s%s)", caps_.name.c_str(),
                       caps_.gfx.c_str(), caps_.family_name(), caps_.cu_count,
                       gemm_rung_name(), bar);
@@ -2640,6 +3011,45 @@ public:
     // epilogue is not this one, and a K that is not chunk-addressed is the same
     // hard error gemm() raises rather than a silently mis-read row -- so the
     // fused form declines (false) and the caller does it the long way.
+    // KRK_OP_SHAPES=1 prints each distinct (op, weight type, n_out, n_in, rows)
+    // once. A per-op time is an average over every shape that op was handed,
+    // and two call sites of one kernel can differ 3x purely because their
+    // shapes differ -- a rate without the shape it belongs to is not a
+    // comparison. Nothing is printed unless asked; the cost when asked is one
+    // set lookup per call.
+    static void note_op_shape(const char *op, DType wt, i64 n_out, i64 n_in,
+                              i64 rows) {
+        static const bool on = [] {
+            const char *e = std::getenv("KRK_OP_SHAPES");
+            return e && e[0] == '1';
+        }();
+        if (!on) return;
+        static std::set<std::string> seen;
+        char buf[192];
+        std::snprintf(buf, sizeof buf, "shape %s %s n_out=%lld n_in=%lld rows=%lld",
+                      op, dtype_name(wt), static_cast<long long>(n_out),
+                      static_cast<long long>(n_in), static_cast<long long>(rows));
+        if (seen.insert(buf).second) KRK_INFO("%s", buf);
+    }
+
+    // KRK_ACC_REPEAT=<n> is a diagnostic, not a mode: it re-runs this exact
+    // kernel n more times on the same data, right here, and times each repeat on
+    // its own event pair. It answers the one thing a device span cannot: whether
+    // an op measured at 180 GB/s is a SLOW kernel or a STARVED one. A repeat that
+    // runs at the probe's rate (tools/probe_gemv_dtype: 470-500 GB/s at these
+    // shapes) means the first launch was paying a wait the span attributes to it;
+    // a repeat that is just as slow means the engine's device state really does
+    // slow the kernel. **It changes what the model computes** (`dst` is
+    // accumulated n times), so it must never be set for a run whose output
+    // matters, and every repeat logs that.
+    static int acc_repeat() {
+        static const int v = [] {
+            const char *e = std::getenv("KRK_ACC_REPEAT");
+            return (e && *e) ? std::atoi(e) : 0;
+        }();
+        return v;
+    }
+
     bool gemm_accumulate(void *dst, const void *x, const void *w, DType wt,
                          i64 n_out, i64 n_in, i64 rows,
                          const i32 *rexp = nullptr) override {
@@ -2649,12 +3059,44 @@ public:
         if (!x || !w || !dst) return false;
         KRK_TIME_OP("gemm_acc");
         krk_op_scope.retag("gemm_acc(gemv)");
+        note_op_shape("gemm_acc", wt, n_out, n_in, rows);
         krk_op_scope.bytes(static_cast<i64>(dtype_row_bytes(wt, n_in)) * n_out);
         krk_op_scope.flops(2 * n_out * n_in);
-        gemv_kernel<256, true><<<static_cast<unsigned>((n_out + 7) / 8), 256>>>(
-            static_cast<const u8 *>(w), static_cast<int>(wt), n_out, n_in,
-            dtype_row_bytes(wt, n_in), static_cast<const _Float16 *>(x),
-            static_cast<_Float16 *>(dst), rexp);
+        const unsigned rg = static_cast<unsigned>((n_out + 7) / 8);
+        const size_t rrb = dtype_row_bytes(wt, n_in);
+        gemv_kernel<256, true><<<rg, 256>>>(
+            static_cast<const u8 *>(w), static_cast<int>(wt), n_out, n_in, rrb,
+            static_cast<const _Float16 *>(x), static_cast<_Float16 *>(dst), rexp);
+        const int reps = acc_repeat();
+        if (reps > 0) {
+            static std::atomic<int> shown{0};
+            for (int i = 0; i < reps; i++) {
+                hipEvent_t ra, rb;
+                if (hipEventCreate(&ra) != hipSuccess ||
+                    hipEventCreate(&rb) != hipSuccess)
+                    break;
+                hipEventRecord(ra, 0);
+                gemv_kernel<256, true><<<rg, 256>>>(
+                    static_cast<const u8 *>(w), static_cast<int>(wt), n_out, n_in,
+                    rrb, static_cast<const _Float16 *>(x),
+                    static_cast<_Float16 *>(dst), rexp);
+                hipEventRecord(rb, 0);
+                hipEventSynchronize(rb);
+                float rms = 0.f;
+                hipEventElapsedTime(&rms, ra, rb);
+                const double rbytes = (double)rrb * (double)n_out;
+                if (shown.fetch_add(1) < 12)
+                    KRK_INFO("gemm_acc repeat %d: %.3f ms for %.1f MiB = "
+                             "%.1f GB/s (n_out=%lld n_in=%lld %s) -- OUTPUT "
+                             "PERTURBED by this diagnostic",
+                             i + 1, rms, rbytes / 1048576.0,
+                             rbytes / ((double)rms * 1e6),
+                             static_cast<long long>(n_out),
+                             static_cast<long long>(n_in), dtype_name(wt));
+                hipEventDestroy(ra);
+                hipEventDestroy(rb);
+            }
+        }
         return true;
     }
 
@@ -2679,6 +3121,7 @@ public:
             std::abort();
         }
 
+        note_op_shape("gemm", wt, n_out, n_in, rows);
         const GemmRung rung = gemm_rung(wt, rows, n_out, n_in);
         // The rung the shape actually took is the first thing to know when a
         // GEMM looks slow: WMMA is only reachable for rows > 1, and the decode
@@ -2770,13 +3213,22 @@ public:
             krk_op_scope.retag("gemm(grid)");
         } else if (rung == GemmRung::kWmma) {
 #if defined(KRK_WMMA_COMPILED)
-            const unsigned bx = static_cast<unsigned>(
-                (n_out + wmma_cfg::BN - 1) / wmma_cfg::BN);
-            // One block walks wmma_cfg::MB M tiles, so the grid's row
-            // dimension counts groups of MB*BM rows.
-            const unsigned by = static_cast<unsigned>(
-                (rows + wmma_cfg::BM * wmma_cfg::MB - 1) /
-                (wmma_cfg::BM * wmma_cfg::MB));
+            const int wnf = wmma_nf();
+            const int wbn = wmma_cfg::BN;
+            const unsigned bx =
+                static_cast<unsigned>((n_out + wbn - 1) / wbn);
+            // One block walks `wmb` M tiles, so the grid's row dimension counts
+            // groups of wmb*BM rows. KRK_WMMA_MB is the sweep knob (§22.17):
+            // the weight tile is staged once per group, so a 191-row prompt at
+            // BM=32 stages it 6 times at wmb=1 and twice at wmb=4. Bit-identical
+            // by construction -- same staged f16 values, same K order per
+            // accumulator, only the scheduling moves.
+            const int wmb = wnf >= 2 ? wmma_cfg_n2::MB : wmma_mb();
+            const i64 tile_m =
+                static_cast<i64>(wnf >= 2 ? wmma_cfg_n2::BM : wmma_cfg::BM) *
+                wmb;
+            const unsigned by =
+                static_cast<unsigned>((rows + tile_m - 1) / tile_m);
             // Split-K: a short prefill GEMM runs only a
             // handful of blocks, and §2b showed its cost is
             // the per-block staging chain, not CU occupancy.
@@ -2852,6 +3304,27 @@ public:
                             wh, static_cast<int>(wt), n_out, n_in,
                             row_bytes, xh, rows, oh, split, slice,
                             parts, pstride);
+                else if (wnf >= 2)
+                    gemm_wmma_kernel<wmma_cfg_n2, 0,
+                                     static_cast<int>(DType::Q4_K), 2>
+                        <<<grid, wmma_cfg_n2::THREADS>>>(
+                            wh, static_cast<int>(wt), n_out, n_in,
+                            row_bytes, xh, rows, oh, split, slice,
+                            parts, pstride);
+                else if (wmb >= 4)
+                    gemm_wmma_kernel<wmma_cfg, 0,
+                                     static_cast<int>(DType::Q4_K), 4>
+                        <<<grid, wmma_cfg::THREADS>>>(
+                            wh, static_cast<int>(wt), n_out, n_in,
+                            row_bytes, xh, rows, oh, split, slice,
+                            parts, pstride);
+                else if (wmb >= 2)
+                    gemm_wmma_kernel<wmma_cfg, 0,
+                                     static_cast<int>(DType::Q4_K), 2>
+                        <<<grid, wmma_cfg::THREADS>>>(
+                            wh, static_cast<int>(wt), n_out, n_in,
+                            row_bytes, xh, rows, oh, split, slice,
+                            parts, pstride);
                 else
                     gemm_wmma_kernel<wmma_cfg, 0,
                                      static_cast<int>(DType::Q4_K)>
@@ -2859,7 +3332,23 @@ public:
                             wh, static_cast<int>(wt), n_out, n_in,
                             row_bytes, xh, rows, oh, split, slice,
                             parts, pstride);
-            } else
+            } else if (wnf >= 2)
+                gemm_wmma_kernel<wmma_cfg_n2, 0, -1, 2>
+                    <<<grid, wmma_cfg_n2::THREADS>>>(
+                        wh, static_cast<int>(wt), n_out, n_in,
+                        row_bytes, xh, rows, oh, split, slice,
+                        parts, pstride);
+            else if (wmb >= 4)
+                gemm_wmma_kernel<wmma_cfg, 0, -1, 4><<<grid, wmma_cfg::THREADS>>>(
+                    wh, static_cast<int>(wt), n_out, n_in,
+                    row_bytes, xh, rows, oh, split, slice,
+                    parts, pstride);
+            else if (wmb >= 2)
+                gemm_wmma_kernel<wmma_cfg, 0, -1, 2><<<grid, wmma_cfg::THREADS>>>(
+                    wh, static_cast<int>(wt), n_out, n_in,
+                    row_bytes, xh, rows, oh, split, slice,
+                    parts, pstride);
+            else
                 gemm_wmma_kernel<wmma_cfg, 0, -1><<<grid, wmma_cfg::THREADS>>>(
                     wh, static_cast<int>(wt), n_out, n_in,
                     row_bytes, xh, rows, oh, split, slice,
@@ -2954,7 +3443,13 @@ public:
         // rows and anything the group cannot express keep the
         // per-matrix gemm() path, which is what the engine ran
         // before the fusion existed.
+        // The two arms are retagged apart and only the fused one books bytes.
+        // The fallback is a loop over gemm(), and each of those opens its own
+        // span and books its own bytes; booking them here as well would count
+        // the same traffic twice and make the group look like a second, wider
+        // reader of the same weights.
         if (rows != 1 || n_mat < 1 || n_mat > 8 || !fused_layer_) {
+            krk_op_scope.retag("gemm_group(fallback)");
             // Per-matrix type in the fallback too: the group's `wt` is only the
             // default, and a fallback that decodes a Q4_K matrix as the group's
             // Q5_K reads every block from the wrong place -- NaN on the first
@@ -2962,6 +3457,26 @@ public:
             for (int m = 0; m < n_mat; m++)
                 gemm(out[m], x, w[m], wts ? wts[m] : wt, n_out[m], n_in, rows);
             return false;
+        }
+        // The fused decode group had NO byte accounting at all -- every row of
+        // the op table read `0.0 MB` for it -- and on the 27B it is the largest
+        // single decode span (43 ms of a 172 ms step, 1520 calls). A rate row
+        // with no bytes cannot be compared with one that has them, which is how
+        // `gemm_acc` came to look 3x slower than `gemm` for the same kernel.
+        {
+            const DType w0 = static_cast<DType>(wts ? static_cast<int>(wts[0])
+                                                    : static_cast<int>(wt));
+            i64 gb = 0, gout = 0;
+            for (int m = 0; m < n_mat; m++) {
+                const DType wm = static_cast<DType>(wts ? static_cast<int>(wts[m])
+                                                        : static_cast<int>(wt));
+                gb += static_cast<i64>(dtype_row_bytes(wm, n_in)) * n_out[m];
+                gout += n_out[m];
+            }
+            krk_op_scope.retag("gemm_group(fused)");
+            krk_op_scope.bytes(gb);
+            krk_op_scope.flops(2 * rows * gout * n_in);
+            note_op_shape("gemm_group", w0, n_out[0], n_in, rows);
         }
         // Same 32-channel addressing rule as gemm().
         if ((n_in & 31) != 0) {
@@ -3269,7 +3784,7 @@ public:
             attn_bexact_supported(d.hd)) {
             attention_bexact(out, q, kc, vc, d.n_head, d.n_kv, d.hd, d.n_tok,
                              d.pos0, pstride, d.scale, caps_.lds_bytes,
-                             nullptr, d.sinks);
+                             nullptr, d.sinks, d.skip_from);
             return;
         }
 
@@ -3292,7 +3807,7 @@ public:
             static_cast<_Float16 *>(out), static_cast<const _Float16 *>(q),
             static_cast<const _Float16 *>(kc), static_cast<const _Float16 *>(vc),
             d.n_head, d.n_kv, d.hd, d.n_tok, d.pos0, pstride, d.causal ? 1 : 0,
-            d.window, d.scale, tile_k, d.sinks);
+            d.window, d.scale, tile_k, d.sinks, d.skip_from);
     }
 
     bool attn_fused_chain(void *out, void *q, void *kcache, void *vcache,
@@ -3862,6 +4377,24 @@ public:
 
     ~HipBackend() override {
         KRK_HIP(hipDeviceSynchronize());
+        if (moe_part_) (void)hipFree(moe_part_);
+        moe_part_ = nullptr;
+        moe_part_bytes_ = 0;
+        if (moe_mid_) (void)hipFree(moe_mid_);
+        moe_mid_ = nullptr;
+        moe_mid_bytes_ = 0;
+        if (moe_midf_) (void)hipFree(moe_midf_);
+        moe_midf_ = nullptr;
+        moe_midf_bytes_ = 0;
+        if (moe_goff_) (void)hipFree(moe_goff_);
+        moe_goff_ = nullptr;
+        moe_goff_bytes_ = 0;
+        if (moe_gidx_) (void)hipFree(moe_gidx_);
+        moe_gidx_ = nullptr;
+        moe_gidx_bytes_ = 0;
+        if (moe_rscale_) (void)hipFree(moe_rscale_);
+        moe_rscale_ = nullptr;
+        moe_rscale_bytes_ = 0;
         if (expert_copy_stream_) KRK_HIP(hipStreamDestroy(expert_copy_stream_));
         // Free cells release their mark reference with the cell; live cells are
         // released (with theirs) by their owner's clear() before this. The marks
@@ -4051,6 +4584,28 @@ private:
     // hand the thread back, and the buffer is allocated once instead of per call.
     void *dl_pin_ = nullptr;
     size_t dl_pin_cap_ = 0;
+    // The per-(token, slot) partials of the fanned-out dispatch (see
+    // moe_table_reduce_kernel). One small buffer reused across layers: at decode
+    // it is k * n_embd * 4 bytes, tens of KiB, and allocating it per layer would
+    // cost more than the launch it serves.
+    void *moe_part_ = nullptr;
+    size_t moe_part_bytes_ = 0;
+    // The tiled dispatch's staging: the f32 activation row per (token, slot),
+    // the f16 copy the down dot reads, the per-tile maxima the row scale folds,
+    // and the scale itself. All four are reused across layers and sized for the
+    // largest row set seen; a decode step is a few tens of KiB.
+    void *moe_mid_ = nullptr;
+    size_t moe_mid_bytes_ = 0;
+    void *moe_midf_ = nullptr;
+    size_t moe_midf_bytes_ = 0;
+    // The expert-major group: prefix offsets and the flat (token, slot) index of
+    // every pair, in the order the host plan uses. Only a batch allocates them.
+    void *moe_goff_ = nullptr;
+    size_t moe_goff_bytes_ = 0;
+    void *moe_gidx_ = nullptr;
+    size_t moe_gidx_bytes_ = 0;
+    void *moe_rscale_ = nullptr;
+    size_t moe_rscale_bytes_ = 0;
     hipEvent_t dl_ev_ = nullptr;
 
     FileReader warm_reader_;
@@ -4087,18 +4642,26 @@ private:
     int paged_next_ = 0;
     bool paged_on_ = false;
     bool paged_failed_ = false;
-    // Set by Engine::init from its own measurement; KRK_WARM_DMA overrides it.
-    bool pageable_direct_ = false;
+    // Set by Engine::init from its own measurement (0 ring, 1 direct, 2
+    // blocking); KRK_WARM_DMA overrides it.
+    int pageable_path_ = 0;
     size_t paged_chunk_ = kPagedChunk;
     // Private stream + event for pinned-source weight staging (dense streaming).
     hipStream_t pinned_stream_ = nullptr;
     hipEvent_t pinned_ev_ = nullptr;
-    hipEvent_t pin_t0_ = nullptr; // bracket one batch for pinned_dma_ms()
-    hipEvent_t pin_t1_ = nullptr;
-    bool pin_live_ = false;
+    // A ring of bracket pairs for pinned_dma_ms(); see pin_fold_ for why one
+    // pair was not enough to measure anything under a deep queue.
+    static constexpr int kPinTimers = 8;
+    hipEvent_t pin_t0_[kPinTimers] = {};
+    hipEvent_t pin_t1_[kPinTimers] = {};
+    bool pin_live_[kPinTimers] = {};
+    unsigned long long pin_slot_bytes_[kPinTimers] = {};
     double pin_ms_ = 0.0;
-    unsigned long long pin_bytes_ = 0;
+    unsigned long long pin_bytes_ = 0;         // every batch, timed or not
     unsigned long long pin_batches_ = 0;
+    unsigned long long pin_timed_bytes_ = 0;   // what the rate is over
+    unsigned long long pin_timed_batches_ = 0;
+    unsigned long long pin_merged_ = 0;
     bool pinned_tried_ = false;
     char *pull_buf_[kPullThreads][kPullBufs] = {};
     hipStream_t pull_stream_[kPullThreads][kPullBufs] = {};
@@ -4459,9 +5022,11 @@ Backend *make_hip_backend(int device_index, std::string *err) {
              hip_runtime_version().c_str(), driver_version, c.name.c_str(),
              c.gfx.c_str(), c.cu_count,
              static_cast<f64>(c.vram_total) / (1024.0 * 1024.0 * 1024.0),
-             large_bar == 1  ? "BAR: runtime reports large BAR"
-             : large_bar == 0 ? "BAR: runtime reports 256 MiB aperture"
-                              : "BAR: runtime does not say");
+             large_bar == 1
+                 ? "BAR: runtime reports large BAR (a hint, measured at init)"
+             : large_bar == 0
+                 ? "BAR: runtime reports 256 MiB aperture (a hint, measured at init)"
+                 : "BAR: runtime does not say (measured at init)");
     if (!hip_runtime_matches_sdk())
         KRK_WARN("the loaded HIP runtime is not the SDK this binary was built "
                  "against; stage the SDK's amdhip64_*.dll next to the binary "

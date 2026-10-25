@@ -151,6 +151,19 @@ struct AttnDesc {
     // bit-identical to the pre-feature arithmetic: every int8 path is guarded
     // by this flag, so a run that never sets it cannot change.
     bool kv_int8 = false;
+    // Self-only block mask, for a masked-block drafter. When `skip_from >= 0`, a
+    // query row at position p >= skip_from ALSO sees every key in
+    // [skip_from, p) as masked -- i.e. it keeps the context before skip_from and
+    // its own row, and ignores the sibling rows of the same block. Those
+    // siblings are parallel candidates for other positions: they carry no answer
+    // for this row, and letting them in mixes one candidate's guess into the
+    // next one's.
+    //
+    // The range is [skip_from, p), not [skip_from, p], so a row still reads its
+    // own K/V, and row 0 of a block (at p == skip_from) has an empty skip range
+    // and sees the whole context normally. -1 (the default) masks nothing and
+    // every existing model's arithmetic is unchanged.
+    i64 skip_from = -1;
 };
 
 // ---------------------------------------------------------------------------
@@ -333,6 +346,8 @@ public:
     virtual void release_host_pinned_deferred(void *p) {
         if (p) release_host(p);
     }
+
+
     void release_host_deferred_budgeted(void *p) {
         if (p) release_host_deferred(p);
     }
@@ -423,7 +438,18 @@ public:
     // anything, and it is false on the CPU backend, where a promotion is a
     // memcpy either way.
     virtual bool pageable_paths_selectable() const { return false; }
-    virtual void set_pageable_direct(bool) {}
+    // Which pageable mechanism to run. A backend that implements this one is
+    // asked for a MEASURED choice at init (see `pageable_path_choice`); the
+    // default keeps the historical two-way setting working by forwarding.
+    //
+    // `Blocking` is in the enum because on a wide aperture the driver's own
+    // hipMemcpy is the fastest of the three and the engine's ring is the
+    // slowest -- the menu was incomplete, not misordered.
+    enum class PageablePath { Ring = 0, Direct = 1, Blocking = 2 };
+    virtual void set_pageable_path(PageablePath) {}
+    virtual void set_pageable_direct(bool on) {
+        set_pageable_path(on ? PageablePath::Direct : PageablePath::Ring);
+    }
 
     // Time and bytes the pinned copy stream spent moving these batches, from
     // events on that stream. A caller's wall clock around
@@ -434,6 +460,16 @@ public:
     virtual double pinned_dma_ms() { return 0.0; }
     virtual unsigned long long pinned_dma_bytes() const { return 0; }
     virtual unsigned long long pinned_dma_batches() const { return 0; }
+    // The subset the event bracket actually covered. A batch enqueued while every
+    // bracket slot is in flight goes untimed, so a rate over `pinned_dma_bytes()`
+    // would divide real milliseconds by bytes that were never timed; these two are
+    // what the rate is over.
+    virtual unsigned long long pinned_dma_timed_bytes() const { return 0; }
+    virtual unsigned long long pinned_dma_timed_batches() const { return 0; }
+    // Adjacent-source coalescing removed this many per-tensor copies on the
+    // pinned path. Reported so an A/B can say whether a difference came from the
+    // change or from the machine: 0 means the change could not have mattered.
+    virtual unsigned long long pinned_merged() const { return 0; }
 
     // Opt-in promotion ticket. Source bytes must be copied/staged before return;
     // wait_marker(ticket) makes the copy visible before its first consumer.
@@ -456,6 +492,21 @@ public:
     // Orders the default stream behind a prefetch ticket without blocking the
     // host. False when the backend cannot express that (no event to wait on).
     virtual bool wait_marker_stream(void *) { return false; }
+
+    // The same prefetch, with its COPY stream ordered behind `ready` -- an event
+    // already recorded on the default stream by record_marker(). A double
+    // buffered weight ring needs both directions at once and neither call above
+    // can express it: the slot a layer is copied INTO was read by the layer two
+    // before it, so that copy must not begin until those kernels are done, while
+    // the layer being read must start its copy before the current layer's
+    // kernels. One event on each side says exactly that, and the host blocks on
+    // neither. A backend that cannot order its copy stream falls back to waiting
+    // on the host, which is slower and never wrong.
+    virtual void *prefetch_after(void *const dst[], const void *const src[],
+                                 const size_t bytes[], int n, void *ready) {
+        if (ready) wait_marker(ready);
+        return upload_expert_prefetch(dst, src, bytes, n);
+    }
 
     // Small-object device allocations, pooled by the expert cache. A
     // promotion is a handful of ~1-2 MiB slices and the default
@@ -497,6 +548,13 @@ public:
         // driver also holds memory the engine does not account for (measured
         // 7,000 MiB beside 7,430 MiB promoted on Mellum2.1).
         u64 floor_refusals = 0;
+        // Where `alloc` in the expert-path split actually goes. A constrained
+        // run grows the pool between trims, and the three candidates -- freeing
+        // slabs, asking the driver how much is free, taking a new cell -- have
+        // never been separated in the numbers, so a 4.8 s alloc phase could not
+        // be attributed to any of them.
+        f64 trim_ms = 0, malloc_ms = 0, probe_ms = 0;
+        u64 probes = 0;
     };
     // Physical bytes, including alignment. One oversize expert is explicitly
     // allowed by the cache; free cells are trimmed before changing the limit.
@@ -746,6 +804,26 @@ public:
         (void)probs; (void)n_rows; (void)n_expert; (void)k; (void)ids;
         (void)wts; (void)normalize; (void)scale;
     }
+    // ---- routing statistics, accumulated on the device --------------------
+    // A tracking run (`--expert-scan`, `--expert-adapt`) wants one thing per
+    // routed layer: which experts this row chose. Collecting that on the host
+    // costs the router readback -- a blocking drain per layer, which on a
+    // 40-layer stack is 8 ms of a 22 ms token, and it is a tax on the very path
+    // the tracking run is supposed to measure. With these two, the device adds
+    // each layer's choices into a per-(layer, expert) histogram and the host
+    // reads the finished histogram ONCE, after the run.
+    //
+    // `hits` is u32 and `mass` f32, both [n_layer * n_expert]. `mass` is summed
+    // with device atomics, so its last bits depend on the order the rows land
+    // in -- it ranks experts, it does not decide text.
+    virtual bool scan_accum_supported() const { return false; }
+    virtual void scan_accum(const void *probs, const void *ids, i64 n_rows,
+                            i32 n_expert, i32 k, i32 layer, void *hits,
+                            void *mass) {
+        (void)probs; (void)ids; (void)n_rows; (void)n_expert; (void)k;
+        (void)layer; (void)hits; (void)mass;
+    }
+
     virtual void moe_plan_build(const void *ids, i64 n_rows, i32 k,
                                 i32 n_expert, void *off, void *rows, void *wt,
                                 const void *wts) {

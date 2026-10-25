@@ -422,6 +422,23 @@ public:
         i32 target_id = -1; // the target's prediction of position pos + 1
         f32 draft_logit = 0.0f;
         f32 target_logit = 0.0f;
+        // Where the target's token sat in the DRAFTER's own distribution, and
+        // the logit it got there. The pair separates the two failure modes a
+        // low acceptance rate has: a head that puts the right token second is a
+        // calibration/quality problem, while a head that puts it at rank 4000
+        // is not reading the same distribution it was trained on
+        // (wrong hidden capture, wrong norm, wrong concat). Top-1 agreement
+        // alone cannot tell those apart, because both report 14%.
+        i32 target_rank = 0;   // 1 = the drafter had it first
+        f32 target_in_draft = 0.0f;
+        // The capture's own fidelity: the captured pre-final-norm row pushed
+        // through the model's OWN output norm and head (KRK_MTP_CAPCHECK=1).
+        // It skips the nextn block entirely, so it is the row, not the block:
+        // if this disagrees with the target the stored hidden is the wrong row
+        // (an off-by-one position, or a copy that lost its exponent), and if it
+        // agrees, every token the drafter loses is the block's doing.
+        i32 capture_id = -1;
+        f32 capture_logit = 0.0f;
         f64 ms = 0.0;
         std::string note; // why it did not run, when ok is false
     };
@@ -576,7 +593,11 @@ public:
         expert_stub_ = scan && stub;
     }
     // Writes <path> with each expert's routing mass, sorted hottest-first.
-    void write_expert_index(const std::string &path) const;
+    void write_expert_index(const std::string &path);
+    // Pulls the device histograms into expert_mass_/expert_hits_ (no-op when
+    // they are not in use). Called before either writer, so the file is always
+    // built from the complete picture.
+    void scan_dev_fold();
     // Counts routing during a NORMAL run -- no stub, no index write -- so the
     // run can feed what it actually routed back into the index. Must be set
     // before init(): the counters are sized there.
@@ -588,7 +609,7 @@ public:
     // (0.5 = half); the run contributes the rest. Refuses, and leaves the file
     // alone, when it describes a different model; writes a fresh one when there
     // is no file yet.
-    void merge_expert_index(const std::string &path, double retain) const;
+    void merge_expert_index(const std::string &path, double retain);
     // Routing residency preference, for the end-of-run report: was it on, at
     // what margin, and how many picks it moved.
     bool router_pref() const { return router_pref_; }
@@ -675,8 +696,23 @@ private:
     // projection's epilogue (Backend::gemm_accumulate), and as the
     // gemm()-into-scratch + add_inplace() pair everywhere else -- including
     // under KRK_DUMP, whose projection stage reads `scratch`.
+    // `gs` is the weight's NVFP4 global scale (QuantTensor::gs): the folded
+    // epilogue cannot express it, so a scaled weight takes the two-call path.
     void gemm_residual(void *dst, const void *x, const void *w, DType wt,
-                       i64 n_out, i64 n_in, i64 rows, void *scratch);
+                       i64 n_out, i64 n_in, i64 rows, void *scratch,
+                       f32 gs = 1.0f);
+    // dst = x * W^T, with the weight's NVFP4 global scale applied.
+    //
+    // Every DENSE weight goes through this instead of Backend::gemm() so that a
+    // `"<tensor>.scale"` sidecar cannot be honoured at one call site and missed
+    // at another: the scale is a property of the tensor (QuantTensor::gs), and
+    // folding it into the projection's RESULT is exact because the projection is
+    // linear -- gs*(W x) is the same number as (gs*W) x, and everything
+    // downstream then sees exactly what a model with the true weights sees. On a
+    // weight with no sidecar it is one plain gemm() call, which is every
+    // non-NVFP4 file.
+    void gemm_w(void *dst, const void *x, const QuantTensor &w, i64 n_out,
+                i64 n_in, i64 rows);
     // ---- qwen4exp hyper-connections --------------------------------------
     // The lane stack replaces the single residual stream: each sub-block is
     // bracketed by a mix (lanes -> one row, left in ws_xn_ AND ws_x_) and a
@@ -910,6 +946,16 @@ private:
     // single block forward, so if it is slow the answer is either the acquire
     // path (promotion) or the kernels, and those want opposite fixes.
     f64 mtp_acq_ms_ = 0.0;
+    // The round's SECOND target forward. Every round pays exactly one: a
+    // pre-check miss forwards the token it just emitted, a full match forwards
+    // the bonus token so the next round has its state. It is not part of verify
+    // (that is the batched pass over the proposals) and not part of refeed (that
+    // is the block), so without its own term it shows up only as the gap
+    // between the round and the sum of the phases -- which is how it went
+    // unmeasured. `n` counts it: 1.0 forward per round is the whole point of
+    // comparing against a plain step's 1.0 per TOKEN.
+    f64 mtp_extra_ms_ = 0.0;
+    u64 mtp_extra_n_ = 0;
     u64 mtp_acq_n_ = 0;
     u64 mtp_acq_miss_ = 0;
     // --mtp-probe asked for the per-step comparison. Separate from mtp_probe_,
@@ -941,6 +987,28 @@ private:
     // rows since the last one -- replaying the prompt every step would make the
     // per-step acceptance measurement quadratic for no new information.
     i64 mtp_fed_ = 0;
+    // ---- row fidelity (KRK_MTP_ROWFID=1) ----------------------------------
+    // For every HISTORY row the block builds, the block's row is compared with
+    // the stack's own captured hidden at the same position: cosine between the
+    // two rows, and the rank of the token that actually follows that position
+    // under the stack's own head applied to each. The cosine says how far the
+    // block's reconstruction drifts; the two ranks say whether that drift costs
+    // anything on its own terms. Stored per row so the drift can be read
+    // against row index rather than as one average.
+    std::vector<i64> rowfid_pos_;
+    std::vector<f32> rowfid_cos_;
+    std::vector<i32> rowfid_blk_;
+    std::vector<i32> rowfid_cap_;
+    std::vector<f32> rowfid_a_; // one host row, block side
+    std::vector<f32> rowfid_b_; // one host row, capture side
+    // ---- propose-pass split (KRK_MTP_PROP_SPLIT=1) -------------------------
+    // Host enqueue times are useless here: the block's work sits in the queue
+    // until something drains it, so every phase reads as its launch cost. The
+    // split therefore drains between phases (be_->sync()), which costs a little
+    // latency but attributes the DEVICE time to the phase that earned it.
+    f64 prop_embed_ms_ = 0, prop_block_ms_ = 0, prop_argmax_ms_ = 0;
+    f64 prop_head_ms_ = 0; // charged inside prop_block_ms_, split out for the report
+    u64 prop_timed_ = 0;
 
     // ---- external draft head state (allocated only when one is loaded) -----
     // The capture (one row per position, like the MTP probe's) and the two
@@ -1123,6 +1191,17 @@ private:
     // leave f16 when the shared expert is folded in, so that fold renormalizes
     // through the same contract and `ws_ffn_` carries an exponent too.
     void *ws_fexp_ = nullptr;
+    // ---- LatentMoE staging (null on every family without ffn_latent_*) ----
+    // `ws_xlat_` is the block's projection into the experts' narrow space and
+    // `ws_ffn_lat_` is the routed sum accumulated there; `ws_xlat_out_` is that
+    // sum lifted back to n_embd, added into `ws_ffn_` where every other family
+    // already accumulates. Width is the widest latent the file declares.
+    // The scaled-input staging for an NVFP4 weight whose sidecar is not 1.0:
+    // [chunk, widest scaled contraction]. Null on every file without one.
+    void *ws_gs_ = nullptr;
+    void *ws_xlat_ = nullptr;     // [chunk, latent]
+    void *ws_ffn_lat_ = nullptr;  // [chunk, latent]
+    void *ws_xlat_out_ = nullptr; // [chunk, n_embd]
     f32 *logits_host_ = nullptr;
     H2dProbe h2d_probe_;
     H2dProbeTally h2d_tally_;
@@ -1181,7 +1260,12 @@ private:
     i32 table_attempts_ = 0;
     bool table_why_logged_ = false;
     u64 dp_launch_layers_ = 0;   // layers that ran the one-launch dispatch
-    u64 dp_launch_skips_ = 0;    // layers that found the table stale and fell back
+    u64 dp_launch_skips_ = 0;    // layers the dispatch could not serve (shape/residency)
+    // Chunks a host-backed table deliberately does not serve: the table kernel
+    // computes one row at a time, so a prefill chunk keeps the per-expert path.
+    // Counted apart from the fallbacks, because a designed exclusion reported as
+    // a fallback hides a real one.
+    u64 dp_chunk_skips_ = 0;
     u64 moe_batch_layers_ = 0;   // decode layers the batched path computed
     u64 moe_batch_skips_ = 0;    // decode layers that kept the per-expert loop
     // Scratch for the layer-wide expert prefetch: the routed ids, deduped.
@@ -1285,6 +1369,14 @@ private:
     // tools/expert_scan_diff.py.
     std::vector<double> expert_mass_; // [n_layer * n_expert] summed P(expert)
     std::vector<u64> expert_hits_;     // [n_layer * n_expert] times selected
+    // The same two histograms, ON THE DEVICE, where the routing already is.
+    // Non-null only when the backend can accumulate (Backend::scan_accum) and a
+    // scan or an adapt run asked for them; when they are, the host plan stops
+    // counting and the numbers arrive once, after the run, from
+    // scan_dev_fold(). That is what stops a tracking run from paying a router
+    // readback per layer for eight integers.
+    void *scan_hits_dev_ = nullptr;
+    void *scan_mass_dev_ = nullptr;
     i64 expert_scan_tokens_ = 0;       // token positions folded in so far
     bool expert_scan_ = false;         // accumulate
     bool expert_stub_ = false;         // skip the expert GEMMs while scanning

@@ -331,9 +331,42 @@ struct wmma_cfg {
     // f16 values, and each accumulator still walks K in the same order. Only
     // the scheduling changes. MB=1 restores the old mapping exactly.
     static constexpr int MB = 1;
+    // N fragments per wavefront. 1 = one 16x16 accumulator per (wave, M tile);
+    // 2 halves WAVES_N and lets a wave issue two independent MMAs per K step,
+    // which is ILP the barrier-free loop can actually use (§22.21).
+    static constexpr int NF = 1;
 static constexpr int LD_PAD = 8; // half-element padding to break LDS bank conflicts
 }; // struct wmma_cfg
 
+// Two N fragments per wavefront: 4 waves along M (BM=64) x 2 along N, each wave
+// owning 32 columns as two 16x16 accumulators. Same LDS budget as the NF=1
+// config at MB=2 ((64 + 64) * (BK + pad) * 2 B = 52 kB), the same 8 wavefronts,
+// and 4 accumulators per wave either way -- the difference is that two of them
+// are the same M tile at different N, so the A fragment is loaded once and
+// feeds two MMAs.
+struct wmma_cfg_n2 : wmma_cfg {
+    static constexpr int BM = 64;
+    static constexpr int NF = 2;
+    static constexpr int WAVES_M = 4;
+    static constexpr int WAVES_N = 2;
+    static constexpr int MB = 2;
+};
+
+// BN=128 WITH THE ONE-PASS STAGING WAS RE-MEASURED AND AGAIN REJECTED (§22.22).
+// The case for it was that the staging is now one pass per K tile and the store
+// loop is one branch per row, so a wider N tile would halve the activation
+// re-reads per output without paying the old penalties. It does not pay: the
+// Q4_K pipeline gives every thread exactly one 32-value chunk per round
+// (static_assert below), so BN=128 pins BK to 64 -- half the K depth, twice the
+// staging rounds -- and the wider tile never amortises. Interleaved against the
+// shipped map, byte-identical output:
+//   191 rows  264.8 / 263.4 / 264.4 (BN=64)  vs  233.7 / 234.0 / 233.4 (BN=128)
+//   701 rows  308.7 / 307.9                   vs  231.8 / 233.6
+// A fair BN=128 at BK=128 would need two chunk pipelines per thread; the arm
+// that needs no rewrite (BK=64, 23 kB LDS, four blocks/CU) already loses, so
+// the occupancy the wider tile buys back is smaller than the round count it
+// spends. The lever left on this path is quantized staging (unpack in
+// registers), not a wider tile.
 // A half-width N tile (BN=32, 128 threads, grid doubled along N)
 // was measured as the §2e occupancy probe and reverted: it was
 // 32-145% slower on every prefill shape (down 71.1 vs 53.8 us
@@ -583,7 +616,9 @@ inline int pick_split(int base_blocks, i64 n_in, int bk,
     return best;
 }
 
-template <typename CFG, int MODE = 0, int DT = -1>
+// MBO overrides CFG::MB at the instantiation, so the MB lever can be swept
+// without a rebuild. 0 = use the config's own value.
+template <typename CFG, int MODE = 0, int DT = -1, int MBO = 0>
 __global__ void __launch_bounds__(CFG::THREADS)
     gemm_wmma_kernel(const u8 *__restrict__ w, int wt, i64 n_out, i64 n_in,
                      size_t w_row_bytes, const _Float16 *__restrict__ x, i64 rows,
@@ -596,8 +631,13 @@ __global__ void __launch_bounds__(CFG::THREADS)
     constexpr int WAVES_M = CFG::WAVES_M;
     constexpr int WAVES_N = CFG::WAVES_N;
     constexpr int LD_PAD = CFG::LD_PAD;
-    constexpr int MB = CFG::MB;
-    __shared__ _Float16 xs[BM][BK + LD_PAD];
+    constexpr int MB = MBO > 0 ? MBO : CFG::MB;
+    static_assert(MB >= 1 && MB <= 8, "MB outside the accumulator array");
+    constexpr int NF = CFG::NF;
+    static_assert(NF >= 1 && NF <= 2, "NF outside the epilogue mapping");
+    // Every M tile's activation tile lives in LDS at once, so the K tile is
+    // staged by ONE pass and consumed by MB back-to-back MMAs (§22.20).
+    __shared__ _Float16 xs[MB][BM][BK + LD_PAD];
     __shared__ _Float16 ws[BN][BK + LD_PAD];
 
     // This block's K slice, from the z grid dimension (see the
@@ -618,7 +658,7 @@ __global__ void __launch_bounds__(CFG::THREADS)
     const int lane = tid & 31;
     const int wid = tid >> 5;
     const int wave_m = (wid % WAVES_M) * 16;
-    const int wave_n = (wid / WAVES_M) * 16;
+    const int wave_n = (wid / WAVES_M) * (16 * NF);
 
     const int block_bytes = dtype_block_bytes_dev(wt);
     const int cpb = dtype_chunks_per_block_dev(wt);
@@ -630,9 +670,11 @@ __global__ void __launch_bounds__(CFG::THREADS)
     const bool vec_w = (reinterpret_cast<uintptr_t>(w) & 15u) == 0 &&
                        (w_row_bytes & 15u) == 0;
 
-    v8float acc[MB];
+    v8float acc[MB][NF];
 #pragma unroll
-    for (int q = 0; q < MB; q++) acc[q] = v8float{};
+    for (int q = 0; q < MB; q++)
+#pragma unroll
+        for (int r = 0; r < NF; r++) acc[q][r] = v8float{};
     _Float16 af[kFrag];
     _Float16 bf[kFrag];
     _Float16 tmp[32];
@@ -673,12 +715,18 @@ __global__ void __launch_bounds__(CFG::THREADS)
     for (i64 kt = 0; kt < k_tiles; kt++) {
         const i64 k0 = kt * BK;
 
-        // ---- MB M tiles per staged weight tile -------------------------
-        // W is staged on the first pass only; each pass re-stages just the
-        // activation tile, which is the tile that changes with M.
+        // ---- one staging pass for the whole K tile ----------------------
+        // The weights once, then EVERY M tile's activations, then one barrier.
+        // The M loop used to wrap this, which put an activation stage and a
+        // barrier between consecutive MMAs and stopped the MB accumulators from
+        // issuing back to back: MMA-only measured 299 tok/s at MB=1 against 265
+        // at MB=4, while the pair was the other way round (§22.19).
+        if constexpr (MODE != 2) {
+        // Every M tile's activations, staged in one pass. Order inside the
+        // barrier does not matter; what matters is that there is ONE barrier
+        // before the MMAs instead of one per M tile.
         for (int mi = 0; mi < MB; mi++) {
         const i64 m_row = row_base + static_cast<i64>(mi) * BM;
-        if constexpr (MODE != 2) {
         // ---- stage the activation tile (BM x BK), zero past the row end ----
         //
         // MEASURED (9070 XT, gfx1201, Qwen3-8B ffn_up [12288x4096], rows=55):
@@ -708,26 +756,27 @@ __global__ void __launch_bounds__(CFG::THREADS)
             for (int r = tid / kATPR; r < BM; r += kARows) {
                 const i64 gr = m_row + r;
                 if (gr < rows && k0 + c0 < k_n)
-                    *reinterpret_cast<v8half *>(&xs[r][c0]) =
+                    *reinterpret_cast<v8half *>(&xs[mi][r][c0]) =
                         *reinterpret_cast<const v8half *>(
                             &x[gr * n_in + k_off + k0 + c0]);
                 else
 #pragma unroll
                     for (int e = 0; e < kAV; e++)
-                        xs[r][c0 + e] = static_cast<_Float16>(0.0f);
+                        xs[mi][r][c0 + e] = static_cast<_Float16>(0.0f);
             }
         } else {
             for (int i = tid; i < BM * BK; i += THREADS) {
                 const int r = i / BK;
                 const int c = i % BK;
                 const i64 gr = m_row + r;
-                xs[r][c] = (gr < rows && k0 + c < k_n)
-                               ? x[gr * n_in + k_off + k0 + c]
-                               : static_cast<_Float16>(0.0f);
+                xs[mi][r][c] = (gr < rows && k0 + c < k_n)
+                                   ? x[gr * n_in + k_off + k0 + c]
+                                   : static_cast<_Float16>(0.0f);
             }
         }
 
-        if (mi == 0) {
+        } // mi staging
+        {
         // ---- stage the dequantized weight tile (BN x BK) ----
         if constexpr (DT == static_cast<int>(DType::Q4_K)) {
             // Software-pipelined Q4_K staging: cur's decode is pure ALU
@@ -805,26 +854,34 @@ __global__ void __launch_bounds__(CFG::THREADS)
                     *reinterpret_cast<const u32 *>(&tmp[z]);
         }
         } // DT generic
-        } // mi == 0
+        } // weights
         } // MODE != 2
         __syncthreads();
 
+        // MB accumulators, back to back, with no barrier between them.
+        for (int mi = 0; mi < MB; mi++) {
         if constexpr (MODE == 1) {
             // Staging-only timing: touch the tiles so nothing above can be
             // eliminated, but skip the fragment loads and the WMMA itself.
-            acc[mi] += static_cast<f32>(xs[tid & (BM - 1)][0]) +
-                       static_cast<f32>(ws[tid & (BN - 1)][0]);
+            acc[mi][0] += static_cast<f32>(xs[mi][tid & (BM - 1)][0]) +
+                          static_cast<f32>(ws[tid & (BN - 1)][0]);
         } else {
             // ---- WMMA over the K tile ----
+            // A is loaded once per k step and feeds NF independent MMAs, so a
+            // wavefront always has a second MMA in flight to cover the first
+            // one's latency.
 #pragma unroll 1
             for (int k = 0; k < BK; k += 16) {
-                wmma_load_a<CFG>(&xs[0][0], wave_m, k, lane, af);
-                wmma_load_b<CFG>(&ws[0][0], wave_n, k, lane, bf);
-                wmma_mma(acc[mi], af, bf);
+                wmma_load_a<CFG>(&xs[mi][0][0], wave_m, k, lane, af);
+#pragma unroll
+                for (int nf = 0; nf < NF; nf++) {
+                    wmma_load_b<CFG>(&ws[0][0], wave_n + nf * 16, k, lane, bf);
+                    wmma_mma(acc[mi][nf], af, bf);
+                }
             }
         }
-        __syncthreads();
         } // mi
+        __syncthreads();
     }
 
     // ---- scatter the accumulator ----
@@ -835,13 +892,16 @@ __global__ void __launch_bounds__(CFG::THREADS)
         int i, j;
         wmma_slot(g, lane, &i, &j);
         const i64 gr = row_base + static_cast<i64>(mi) * BM + wave_m + i;
-        const i64 gc = col_base + wave_n + j;
-        if (gr < rows && gc < n_out) {
+        if (gr >= rows) continue;
+#pragma unroll
+        for (int nf = 0; nf < NF; nf++) {
+            const i64 gc = col_base + wave_n + nf * 16 + j;
+            if (gc >= n_out) continue;
             if constexpr (MODE == 0) {
                 if (partials)
-                    partials[part_off + gr * n_out + gc] = acc[mi][g];
+                    partials[part_off + gr * n_out + gc] = acc[mi][nf][g];
                 else
-                    out[gr * n_out + gc] = static_cast<_Float16>(acc[mi][g]);
+                    out[gr * n_out + gc] = static_cast<_Float16>(acc[mi][nf][g]);
             }
         }
     }

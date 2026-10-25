@@ -18,7 +18,10 @@
 #include "krk/host_time.hpp"
 #include "krk/vram_guard.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <thread>
 
 // ---------------------------------------------------------------------------
 // Expert access trace (opt-in, KRK_TRACE_EXPERTS=1).
@@ -151,6 +154,96 @@ namespace {
 u64 slot_key(i32 layer, i32 expert) {
     return (static_cast<u64>(static_cast<u32>(layer)) << 32) |
            static_cast<u32>(expert);
+}
+
+// ---- one host block per expert ---------------------------------------------
+//
+// The WARM tier used to allocate each expert THREE times, once per slice, and
+// that shape is what the load phase was paying for: on this box (RX 9070 XT,
+// HIP, tools/probe_warmalloc.hip, one 17.2 GiB pinned tier) 30,720 slice-sized
+// (0.573 MiB) allocations cost 4110 ms at 912 ns per page locked, against
+// 2122 ms at 471 ns for 10,240 expert-sized (1.72 MiB) ones and 1810 ms at
+// 401 ns for 16 experts per block. The per-CALL component is only ~10 us -- the
+// same 30,720 calls at a tenth of the pages cost 324 ms -- so the win is the
+// length of the page run the driver probes and locks, and three-to-one is where
+// most of it is.
+//
+// Going further was measured and declined. A block shared by several experts
+// cannot be handed back one expert at a time, so it needs a slab allocator's
+// free list, and reusing a freed slot needs the promotion-completion event that
+// the per-slice deferred free exists to honour: a slot handed to a new expert
+// while a copy out of it is still in flight is the use-after-free that shows up
+// as plausible text that differs every run. Sixteen experts per block buys
+// another 310 ms of a 6 s phase; this shape buys 2 s for one pointer discipline.
+//
+// The churning tier is what settles it, because that is where slab granularity
+// would have to pay off. Nemotron Bolt 74B, --expert-warm-mb 8192 (8 GiB over a
+// 22 GiB file) and the ranked warmup on, 16 tokens: this shape runs 11.5 tok/s
+// (87.3 ms/step) with the tier at 100% in use, 4245 admissions, 4253 evictions
+// and ZERO rejects -- every eviction reclaimed exactly one expert's block, so
+// there was no stranded capacity for a slab-sized victim to recover. The same
+// run on the 16-slot slab build gave 5.8 tok/s: 6674 evictions for 2339
+// admissions, the tier ending 5% resident with 5284 MiB committed free, because
+// a 1-slot admission freed a 16-slot slab and refilled one slot.
+//
+// So: one allocation per expert, slices at aligned offsets inside it. Every
+// release frees the FIRST slice's pointer, which is the block base -- that is
+// the whole invariant, and warm_block_base is the only place that decides it.
+constexpr size_t kWarmSliceAlign = 64;
+
+inline size_t align_up(size_t v, size_t a) {
+    return (v + a - 1) / a * a;
+}
+
+// Offsets of each slice inside one expert's block, and the block's size. A
+// slice with no tensor behind it (nemotron_h_moe has no ffn_gate_exps) takes no
+// space and keeps the offset it would have had.
+struct WarmBlockLayout {
+    size_t off[3];
+    size_t total;
+};
+
+inline WarmBlockLayout warm_block_layout(const size_t slice[3]) {
+    WarmBlockLayout b{{0, 0, 0}, 0};
+    size_t at = 0;
+    for (int i = 0; i < 3; i++) {
+        if (slice[i] == 0) {
+            b.off[i] = at;
+            continue;
+        }
+        // Align a slice's start to the DMA / vector-load width, but never past
+        // the slice's own size: a fixture with 8-byte tensors must not pay 64
+        // bytes of padding each (no tensor in a real file is under 64 bytes, so
+        // the real tier sees a full 64-byte start for every slice).
+        const size_t a = slice[i] < kWarmSliceAlign ? slice[i] : kWarmSliceAlign;
+        at = align_up(at, a);
+        b.off[i] = at;
+        at += slice[i];
+    }
+    b.total = at;
+    return b;
+}
+
+// The pointer a block is released through: its lowest-offset slice.
+inline void *warm_block_base(void *const dst[3]) {
+    for (int i = 0; i < 3; i++)
+        if (dst[i]) return dst[i];
+    return nullptr;
+}
+
+// Releases one expert's host block. `deferred` keeps the bytes alive until a
+// copy issued out of them has landed, which is the only reason the per-slice
+// path had two deallocators to choose between; the block inherits both rules
+// unchanged.
+inline void warm_release(Backend *be, void *base, bool pinned, bool deferred) {
+    if (!be || !base) return;
+    if (deferred) {
+        if (pinned) be->release_host_pinned_deferred(base);
+        else be->release_host_deferred_budgeted(base);
+    } else {
+        if (pinned) be->release_host(base);
+        else be->release_host_pageable_budgeted(base);
+    }
 }
 
 } // namespace
@@ -395,6 +488,7 @@ void ExpertCache::release_dispatch_table() {
     table_ = nullptr;
     table_bytes_ = 0;
     table_stale_ = false;
+    table_host_cells_ = 0;
 }
 
 void *ExpertCache::publish_dispatch_table(i32 n_layer, i32 n_expert,
@@ -408,25 +502,69 @@ void *ExpertCache::publish_dispatch_table(i32 n_layer, i32 n_expert,
         if (why) *why = "no expert geometry";
         return nullptr;
     }
-    if (!whole_set_resident(n_layer, n_expert)) {
+    // The promise the table has to keep is ADDRESSABILITY, not residency.
+    //
+    // It used to be residency, and that made the whole arm unreachable on the
+    // models this tier exists for: Tiel-Coder-35B-A3B is 22.3 GiB of routed
+    // experts against a 9-11 GiB card budget, so `whole_set_resident` was false
+    // for the entire run and the log said "0 of 10240 slots" from start to
+    // finish. A kernel can read a slot's PINNED host copy directly -- measured
+    // on this card at 24.3 GiB/s against 485 GiB/s for the same read out of
+    // VRAM, with the bytes read back exactly (tools/probe_hostread.hip) -- so a
+    // cell that lives in the pinned pool is as legal an operand as one in the
+    // pool's VRAM cells, and the set that does not fit reads its overflow where
+    // it lives instead of paying a host round trip per expert.
+    //
+    // What is NOT legal is a cell that is absent or pageable: the kernel would
+    // have to skip it, and a skipped expert is a wrong answer, not a slow one.
+    const size_t cells = static_cast<size_t>(n_layer) * static_cast<size_t>(n_expert);
+    const bool host_ok = be_->host_load_supported();
+    i32 in_vram = 0, in_pinned = 0, absent = 0, pageable = 0;
+    for (i32 l = 0; l < n_layer; l++) {
+        for (i32 e = 0; e < n_expert; e++) {
+            auto it = slots_.find(slot_key(l, e));
+            if (it == slots_.end()) {
+                ++absent;
+                continue;
+            }
+            const Slot &s = it->second;
+            if (s.in_vram()) ++in_vram;
+            else if (s.in_host() && s.host_pinned && host_ok) ++in_pinned;
+            else ++pageable;
+        }
+    }
+    if (absent || pageable) {
         if (why) {
-            *why = "the routed set is not wholly device-resident (";
-            *why += std::to_string(vram_slots_);
-            *why += " of ";
-            *why += std::to_string(static_cast<long long>(n_layer) * n_expert);
-            *why += " slots)";
+            *why = "the routed set is not addressable from a kernel (";
+            *why += std::to_string(in_vram);
+            *why += " in VRAM, ";
+            *why += std::to_string(in_pinned);
+            *why += " read in place from pinned host, ";
+            *why += std::to_string(absent);
+            *why += " never loaded, ";
+            *why += std::to_string(pageable);
+            *why += " pageable of ";
+            *why += std::to_string(static_cast<long long>(cells));
+            *why += pageable && !host_ok
+                        ? " -- this backend has not measured a kernel reading "
+                          "pinned host memory)"
+                        : " -- pin the whole routed set (--expert-pin-mb) or grow "
+                          "the device budget)";
         }
         return nullptr;
     }
 
-    const size_t cells = static_cast<size_t>(n_layer) * static_cast<size_t>(n_expert);
     std::vector<MoeDispatchEntry> host(cells);
     i32 filled = 0;
     for (i32 l = 0; l < n_layer; l++) {
         for (i32 e = 0; e < n_expert; e++) {
             auto it = slots_.find(slot_key(l, e));
             if (it == slots_.end()) continue;
-            const ResidentExpert &m = it->second.m;
+            const Slot &slot = it->second;
+            // A resident slot names its pool cells; a pinned host slot names the
+            // WARM copy's slices, which the kernel dereferences the same way.
+            const bool resident = slot.in_vram();
+            const ResidentExpert &m = resident ? slot.m : slot.h;
             const QuantTensor *q[3] = {&m.gate, &m.up, &m.down};
             MoeDispatchEntry &d = host[static_cast<size_t>(l) *
                                        static_cast<size_t>(n_expert) +
@@ -467,6 +605,7 @@ void *ExpertCache::publish_dispatch_table(i32 n_layer, i32 n_expert,
     table_bytes_ = bytes;
     be_->upload(table_, host.data(), bytes);
     table_stale_ = false;
+    table_host_cells_ = in_pinned;
     if (published_out) *published_out = filled;
     return table_;
 }
@@ -626,17 +765,18 @@ const ResidentExpert *ExpertCache::acquire_inplace(const ExpertSource &src,
 
 void ExpertCache::drop_host(Slot &s) {
     if (!be_) return;
+    void *base = nullptr;
     for (QuantTensor *q : {&s.h.gate, &s.h.up, &s.h.down}) {
-        // Deferred: a promotion copy of this expert may still be in flight on a
-        // side stream, and freeing the source under it is a use-after-free.
-        // The pinned arm needs its own deallocator -- hipFree on a hipHostMalloc
+        // The three slices are offsets inside ONE block, so the release below
+        // happens once, through the lowest-offset pointer. Deferred: a
+        // promotion copy of this expert may still be in flight on a side
+        // stream, and freeing the source under it is a use-after-free. The
+        // pinned arm needs its own deallocator -- hipFree on a hipHostMalloc
         // block is the other half of that same mistake.
-        if (q->present() && q->data) {
-            if (s.host_pinned) be_->release_host_pinned_deferred(q->data);
-            else be_->release_host_deferred_budgeted(q->data);
-        }
+        if (q->data && !base) base = q->data;
         *q = {};
     }
+    warm_release(be_, base, s.host_pinned, /*deferred=*/true);
     s.h = {};
     host_bytes_ -= s.host_bytes;
     if (s.host_pinned) {
@@ -814,7 +954,11 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
     // slices to one batch call, and a batch whose sources differ in kind has no
     // single copy path. Admission order is rank order when the model carries an
     // expert index, so this prefix is the hot set.
-    const size_t host_need = s.slice[0] + s.slice[1] + s.slice[2];
+    size_t eff[3] = {0, 0, 0};
+    for (int i = 0; i < 3; i++)
+        if (from[i]) eff[i] = s.slice[i];
+    const WarmBlockLayout blk = warm_block_layout(eff);
+    const size_t host_need = blk.total;
     const bool pin = host_pin_bytes_ > 0 && host_need > 0 &&
                      host_pinned_bytes_ + host_need <= host_pin_bytes_;
     s.host_pinned = pin;
@@ -839,29 +983,26 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
     const void *srcp[3] = {nullptr, nullptr, nullptr};
     int ndst = 0;
     size_t bytes = 0;
+    // ONE allocation for all three slices (see warm_block_layout). Each slice
+    // used to reserve against the process-wide host ledger on its own; the
+    // block now does it once, for the same bytes, so the ledger still holds one
+    // entry per expert. A pinned slot still skips that ledger on purpose: its
+    // bytes come out of the driver's pin pool, which host_pin_bytes_ bounds
+    // instead, and charging both would count the same RAM twice.
+    void *base = nullptr;
+    if (blk.total) {
+        base = pin ? be_->alloc_host(blk.total)
+                   : be_->alloc_host_pageable_budgeted(blk.total);
+        // Nothing is handed to the slot until the whole fill succeeds: a slot
+        // holding some slices and not others is a state the promotion path
+        // would have to defend against.
+        if (!base) return false;
+    }
     for (int i = 0; i < 3; i++) {
         const GgufTensor *t = from[i];
-        const size_t per = s.slice[i];
+        const size_t per = eff[i];
         if (!t || per == 0) continue;
-        // Each slice reserves against the process-wide host ledger atomically;
-        // earlier slices and every other cache are already accounted for there.
-        // A pinned slot skips the process-wide pageable ledger on purpose: its
-        // bytes come out of the driver's pin pool, which host_pin_bytes_ bounds
-        // instead, and charging both would double-count the same RAM.
-        void *p = pin ? be_->alloc_host(per) : be_->alloc_host_pageable_budgeted(per);
-        if (!p) {
-            // Nothing is handed to the slot until the whole fill succeeds, so
-            // the partial allocations are released here rather than left to
-            // drop_host: a slot holding some slices and not others is a state
-            // the promotion path would have to defend against.
-            for (int j = 0; j < ndst; j++) {
-                if (!dst[j]) continue;
-                if (pin) be_->release_host(dst[j]);
-                else be_->release_host_pageable_budgeted(dst[j]);
-            }
-            return false;
-        }
-        dst[ndst] = p;
+        dst[ndst] = static_cast<char *>(base) + blk.off[i];
         srcp[ndst] = t->data + static_cast<size_t>(expert) * per;
         ndst++;
         bytes += per;
@@ -899,10 +1040,9 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
             be_->read_host_batch(reqs, nreq);
             h.bytes(static_cast<krk::i64>(bytes));
         } catch (...) {
-            for (int j = 0; j < ndst; j++) {
-                if (pin) be_->release_host(dst[j]);
-                else be_->release_host_pageable_budgeted(dst[j]);
-            }
+            // The whole block goes back, not the slices that were filled: they
+            // are offsets into it.
+            warm_release(be_, base, pin, /*deferred=*/false);
             return false;
         }
     }
@@ -915,13 +1055,21 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
         to[i]->n_in = static_cast<i64>(t->ne[0]);
         to[i]->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
     }
-    s.host_bytes = bytes;
-    if (pin) host_pinned_bytes_ += bytes;
+    s.host_bytes = blk.total;
+    // The same number the release subtracts, or the pin counter drifts by the
+    // padding between slices.
+    if (pin) host_pinned_bytes_ += blk.total;
     return true;
 }
 
 bool ExpertCache::warm_admit(const ExpertSource &src, i32 expert, Slot &s) {
-    const size_t host_need = s.slice[0] + s.slice[1] + s.slice[2];
+    const GgufTensor *from[3] = {src.gate, src.up, src.down};
+    size_t eff[3] = {0, 0, 0};
+    for (int i = 0; i < 3; i++)
+        if (from[i]) eff[i] = s.slice[i];
+    // The block, not the sum of the slices: the aligned offsets inside it are
+    // what the allocator is asked for, and room has to be made for that.
+    const size_t host_need = warm_block_layout(eff).total;
     if (!be_ || host_budget_ == 0 || host_need == 0) return false;
     make_warm_room(host_need);
     // An expert larger than the whole tier never fits: the alternative would be
@@ -1950,6 +2098,12 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
         if (ts[i]) slice[i] = src.per_expert(ts[i]);
     const size_t one = slice[0] + slice[1] + slice[2];
     if (one == 0) return 0;
+    // One expert's host footprint is its whole BLOCK, not the sum of the slices:
+    // the offsets inside it are aligned (warm_block_layout), so the allocator is
+    // asked for `blk.total` bytes. Every budget test below has to use that or it
+    // admits an expert the allocator cannot fit. `one` stays the number of bytes
+    // actually read out of the file.
+    const WarmBlockLayout blk = warm_block_layout(slice);
 
     // ---- phase 1: make room and reserve a host buffer per expert -----------
     // Keys, not Slot pointers, are carried across phases: make_warm_room below
@@ -1962,6 +2116,9 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
         // Whole slots only: the promotion batches all three slices and a batch
         // cannot mix a pinned source with a pageable one.
         bool pinned = false;
+        // Allocated AND read. The allocation runs on the pipeline's helper
+        // thread, so a job can fail there after phase 1 admitted it.
+        bool ok = false;
     };
     std::vector<Job> jobs;
     jobs.reserve(static_cast<size_t>(n));
@@ -1970,7 +2127,8 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
     // Pinned bytes are spoken for as each job is prepared but only counted once
     // the slot commits, so the budget has to hold both numbers at once.
     size_t pending_pin = 0;
-    bool host_reserve_hit = false;
+    {
+    MsTimer prep_clock(&prep_ms_);
     for (int j = 0; j < n; j++) {
         const i32 e = experts[j];
         if (e < 0 || e >= src.n_expert) continue;
@@ -1979,22 +2137,24 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
         auto it = slots_.find(key);
         if (it != slots_.end() && it->second.in_host()) continue; // already warm
         // Pending reads own RAM too, but are not committed or evictable yet.
-        if (one > host_budget_ - reserved) {
+        if (blk.total > host_budget_ - reserved) {
             warm_rejects_++;
             continue;
         }
-        make_warm_room(one + reserved);
+        {
+            MsTimer room_clock(&room_ms_);
+            make_warm_room(blk.total + reserved);
+        }
         // Preflight this expert against the process-wide ledger. The actual
-        // per-slice reservations below are atomic and account for all earlier
-        // jobs plus any concurrent KV or expert staging.
-        if (!SharedHostRamBudget::can_admit(one, be_->host_available_bytes(),
+        // block reservation happens in phase 2, atomically, and accounts for
+        // all earlier jobs plus any concurrent KV or expert staging.
+        if (!SharedHostRamBudget::can_admit(blk.total, be_->host_available_bytes(),
                                             be_->host_total_bytes())) {
             warm_rejects_++;
-            host_reserve_hit = true;
             break; // every following expert costs at least this much RAM
         }
-        if (reserved > host_budget_ || one > host_budget_ - reserved ||
-            host_bytes_ > host_budget_ - reserved - one) {
+        if (reserved > host_budget_ || blk.total > host_budget_ - reserved ||
+            host_bytes_ > host_budget_ - reserved - blk.total) {
             warm_rejects_++;
             continue;
         }
@@ -2010,87 +2170,194 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
             s.seq = seq_++;
             it = slots_.emplace(key, std::move(s)).first;
         }
-        Job job{key, e, {nullptr, nullptr, nullptr}, false};
+        Job job{key, e, {nullptr, nullptr, nullptr}, false, false};
         // The ranked prefix of the tier, in admission order: this is the hot set
         // the decode loop keeps coming back to, and it is the half whose
         // promotion is a bare DMA instead of a DMA behind a 12.6 MB memcpy.
         const bool pin = host_pin_bytes_ > 0 &&
-                         host_pinned_bytes_ + pending_pin + one <= host_pin_bytes_;
-        bool ok = true;
-        size_t job_reserved = 0;
-        for (int i = 0; i < 3; i++) {
-            if (!slice[i]) continue;
-            // A pinned slice is not charged to the pageable LEDGER: it is pin
-            // pool, bounded by host_pin_bytes_, and charging both would count
-            // the same RAM twice. It IS charged to the tier budget below --
-            // a pin decorates WARM, it does not extend it.
-            job.dst[i] = pin ? be_->alloc_host(slice[i])
-                             : be_->alloc_host_pageable_budgeted(slice[i]);
-            if (!job.dst[i]) {
-                ok = false;
-                host_reserve_hit = !pin && !SharedHostRamBudget::can_admit(
-                    slice[i], be_->host_available_bytes(), be_->host_total_bytes());
-                break;
-            }
-            job_reserved += slice[i];
-        }
-        if (!ok) {
-            for (int i = 0; i < 3; i++)
-                if (job.dst[i]) {
-                    if (pin) be_->release_host(job.dst[i]);
-                    else be_->release_host_pageable_budgeted(job.dst[i]);
-                }
-            warm_rejects_++;
-            forget_if_dead(it);
-            if (host_reserve_hit) break;
-            continue;
-        }
+                         host_pinned_bytes_ + pending_pin + blk.total <=
+                             host_pin_bytes_;
+        // The ALLOCATION is not made here. It is the expensive half of this
+        // function (the driver page-locking an expert's block, ~390 us an
+        // expert at the slice granularity it used to use) and doing it here is
+        // exactly what kept it serial with the read; it moves to phase 2, where
+        // a helper thread runs it ahead of the reader. The reservation is still
+        // taken here, because that is what decides which experts are admitted at
+        // all.
         job.pinned = pin;
-        if (pin) pending_pin += one;
+        if (pin) pending_pin += blk.total;
         jobs.push_back(job);
-        reserved += job_reserved;
+        reserved += blk.total;
+    }
     }
     if (jobs.empty()) return 0;
 
-    // ---- phase 2: one batched read for the whole set ----------------------
-    // 3k requests are handed to the backend at once so its reader pool can keep
-    // several in flight. This is the entire point of the method.
-    std::vector<Backend::ReadReq> reqs;
-    reqs.reserve(jobs.size() * 3);
-    for (const Job &jb : jobs) {
-        for (int i = 0; i < 3; i++) {
-            if (!slice[i]) continue;
-            reqs.push_back(Backend::ReadReq{
-                jb.dst[i],
-                ts[i]->data + static_cast<size_t>(jb.expert) * slice[i],
-                slice[i]});
+    // ---- phase 2: allocate a chunk ahead of the read -----------------------
+    //
+    // Two unrelated bottlenecks, previously issued back to back. The read is
+    // page-cache I/O and already at this box's ceiling (7.1 GB/s through the
+    // reader pool; 7.26 GB/s from 16 standalone threads, so a wider pool buys
+    // nothing). The allocation is the driver page-locking an expert's host
+    // block. Run in series the phase costs their SUM: measured on
+    // Qwen3.5-35B-A3B with a 17.2 GiB tier, 2356 ms of read against 4027 ms of
+    // allocation inside a 7214 ms phase.
+    //
+    // Nothing ties either one to the other, so one helper thread allocates
+    // while this thread reads: chunk k's batch is issued as soon as its own
+    // buffers exist, and the allocator runs on into the next chunks. The helper
+    // takes no slot-map work -- `slots_`, the ledgers and the eviction scan stay
+    // on this thread, the same rule prefetch_warm_next follows -- so the only
+    // thing crossing a thread boundary is each job's own `dst`.
+    auto free_job = [&](Job &jb) {
+        // One block per expert: dst[] are offsets into it, so the release is one
+        // call through the lowest-offset pointer (warm_block_base).
+        warm_release(be_, warm_block_base(jb.dst), jb.pinned, /*deferred=*/false);
+        for (int i = 0; i < 3; i++) jb.dst[i] = nullptr;
+        jb.ok = false;
+    };
+    auto alloc_job = [&](Job &jb) {
+        // A pinned block is not charged to the pageable LEDGER: it is pin pool,
+        // bounded by host_pin_bytes_, and charging both would count the same RAM
+        // twice. It IS charged to the tier budget -- a pin decorates WARM, it
+        // does not extend it.
+        if (!blk.total) {
+            jb.ok = true;
+            return true;
+        }
+        void *base = jb.pinned ? be_->alloc_host(blk.total)
+                               : be_->alloc_host_pageable_budgeted(blk.total);
+        if (!base) {
+            free_job(jb);
+            return false;
+        }
+        for (int i = 0; i < 3; i++)
+            jb.dst[i] = slice[i] ? static_cast<char *>(base) + blk.off[i]
+                                 : nullptr;
+        jb.ok = true;
+        return true;
+    };
+    // One chunk is one allocation batch and one read batch. 32 experts is 96
+    // requests -- 24 per handle for the default 4-reader pool, still deep
+    // enough to saturate the disk -- and about 8 ms of read against 13 ms of
+    // allocation, so the allocator stays ahead.
+    //
+    // KRK_WARM_CHUNK overrides it, which is how the suite drives the multi-chunk
+    // path on the small fixtures it can afford: its staging fixture holds four
+    // experts, so the default is one chunk and would never cross a boundary.
+    //
+    // Load time only. A stage issued inside a token (phase_ != PhaseOther) keeps
+    // the pre-pipeline shape EXACTLY -- allocate the set, then hand it to the
+    // reader in one call -- because there the batch is one layer's routed set
+    // and both the thread and the finer batching would cost more than the
+    // overlap could return. This method is shared by the warmup and the decode
+    // lookahead, so the distinction has to be made here rather than at the call
+    // site.
+    const bool load_time = phase_ == PhaseOther;
+    size_t kChunk = jobs.size(); // one batch: the shape inference always had
+    if (load_time) {
+        kChunk = 32;
+        if (const char *chunk_env = std::getenv("KRK_WARM_CHUNK")) {
+            const long v = std::atol(chunk_env);
+            if (v >= 1) kChunk = static_cast<size_t>(v);
         }
     }
-    {
+
+    std::atomic<size_t> alloc_ready{0};
+    f64 alloc_span = 0.0;
+    // Only a batch with more than one chunk has anything to overlap; anything
+    // smaller (every inference-time call above) takes the serial shape.
+    std::thread allocator;
+    if (jobs.size() > kChunk) {
+        allocator = std::thread([&] {
+            const std::chrono::steady_clock::time_point t0 =
+                std::chrono::steady_clock::now();
+            for (size_t b = 0; b < jobs.size(); b += kChunk) {
+                const size_t e = std::min(jobs.size(), b + kChunk);
+                for (size_t k = b; k < e; k++) alloc_job(jobs[k]);
+                alloc_ready.store(e, std::memory_order_release);
+            }
+            alloc_span = std::chrono::duration<f64, std::milli>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+        });
+    } else {
+        const std::chrono::steady_clock::time_point t0 =
+            std::chrono::steady_clock::now();
+        for (Job &jb : jobs) alloc_job(jb);
+        alloc_span = std::chrono::duration<f64, std::milli>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count();
+        alloc_ready.store(jobs.size(), std::memory_order_release);
+    }
+
+    const f64 read_before = read_ms_;
+    const std::chrono::steady_clock::time_point pip_t0 =
+        std::chrono::steady_clock::now();
+    for (size_t b = 0; b < jobs.size(); b += kChunk) {
+        const size_t e = std::min(jobs.size(), b + kChunk);
+        // Wait for THIS chunk's buffers, not the whole layer: the allocator is
+        // free to run on ahead, which is what makes the two overlap instead of
+        // alternate. Spin with a yield rather than park -- the wait is a few
+        // milliseconds and this happens once per layer, at load.
+        while (alloc_ready.load(std::memory_order_acquire) < e)
+            std::this_thread::yield();
+
+        std::vector<Backend::ReadReq> reqs;
+        reqs.reserve((e - b) * 3);
+        for (size_t k = b; k < e; k++) {
+            const Job &jb = jobs[k];
+            if (!jb.ok) continue;
+            for (int i = 0; i < 3; i++) {
+                if (!slice[i]) continue;
+                reqs.push_back(Backend::ReadReq{
+                    jb.dst[i],
+                    ts[i]->data + static_cast<size_t>(jb.expert) * slice[i],
+                    slice[i]});
+            }
+        }
+        if (reqs.empty()) continue;
         MsTimer t(&read_ms_, phase_sink(&pf_read_ms_, &dc_read_ms_));
         try {
             be_->read_host_batch(reqs.data(), static_cast<int>(reqs.size()));
         } catch (...) {
-            for (Job &job : jobs)
-                for (void *p : job.dst)
-                    if (p) {
-                        if (job.pinned) be_->release_host(p);
-                        else be_->release_host_pageable_budgeted(p);
-                    }
-            return 0;
+            // A read that threw would hand back uninitialised bytes; dropping
+            // these experts leaves them cold, which acquire() still covers.
+            for (size_t k = b; k < e; k++)
+                if (jobs[k].ok) free_job(jobs[k]);
         }
+    }
+    if (allocator.joinable()) allocator.join();
+    alloc_ms_ += alloc_span;
+    const f64 pip_ms = std::chrono::duration<f64, std::milli>(
+                           std::chrono::steady_clock::now() - pip_t0)
+                           .count();
+    // What the pipeline actually bought: the two spans added together minus what
+    // they cost as wall time. A phase that got faster and a read that merely
+    // moved look identical without it.
+    const f64 overlap = (alloc_span + (read_ms_ - read_before)) - pip_ms;
+    if (overlap > 0.0) overlap_ms_ += overlap; // serial shape reports 0, not -0
+
+    // A slot phase 1 made for a chunk that never landed holds nothing, and this
+    // is the thread allowed to touch the map.
+    for (Job &jb : jobs) {
+        if (jb.ok) continue;
+        warm_rejects_++;
+        auto it = slots_.find(jb.key);
+        if (it != slots_.end()) forget_if_dead(it);
     }
 
     // ---- phase 3: commit --------------------------------------------------
+    const std::chrono::steady_clock::time_point commit_t0 =
+        std::chrono::steady_clock::now();
     size_t total = 0;
     for (Job &jb : jobs) {
+        if (!jb.ok) continue; // dropped in the pipeline above
         auto it = slots_.find(jb.key);
         if (it == slots_.end()) { // evicted while the batch was in flight
-            for (int i = 0; i < 3; i++)
-                if (jb.dst[i]) {
-                    if (jb.pinned) be_->release_host(jb.dst[i]);
-                    else be_->release_host_pageable_budgeted(jb.dst[i]);
-                }
+            // Nothing was ever copied out of this block, so it goes back now
+            // rather than through the deferred path.
+            warm_release(be_, warm_block_base(jb.dst), jb.pinned,
+                         /*deferred=*/false);
             continue;
         }
         Slot &s = it->second;
@@ -2102,10 +2369,10 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
             h[i]->n_in = static_cast<i64>(ts[i]->ne[0]);
             h[i]->n_out = ts[i]->n_dims >= 2 ? static_cast<i64>(ts[i]->ne[1]) : 1;
         }
-        s.host_bytes = one;
+        s.host_bytes = blk.total;
         s.host_pinned = jb.pinned;
-        host_bytes_ += one;
-        if (jb.pinned) host_pinned_bytes_ += one;
+        host_bytes_ += blk.total;
+        if (jb.pinned) host_pinned_bytes_ += blk.total;
         warm_admissions_++;
         total += one;
         // The batch above was a real read out of the model file, so it is a
@@ -2121,6 +2388,9 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
         loads_++;
         bytes_loaded_ += one;
     }
+    commit_ms_ += std::chrono::duration<krk::f64, std::milli>(
+                     std::chrono::steady_clock::now() - commit_t0)
+                     .count();
     bytes_staged_ += total;
     return total;
 }
@@ -2152,10 +2422,11 @@ bool ExpertCache::has_warm(i32 layer, i32 expert) const {
 }
 
 void ExpertCache::pf_free(PfEntry &e) {
-    for (int i = 0; i < 3; i++) {
-        if (e.t[i].p && be_) be_->release_host(e.t[i].p);
-        e.t[i].p = nullptr;
-    }
+    // One block per expert (warm_block_layout): t[i].p are offsets into it, so
+    // the release goes through the base the worker recorded, once.
+    if (e.base && be_) be_->release_host(e.base);
+    e.base = nullptr;
+    for (int i = 0; i < 3; i++) e.t[i].p = nullptr;
 }
 
 void ExpertCache::pf_worker() {
@@ -2182,15 +2453,20 @@ void ExpertCache::pf_worker() {
             ent.layer = layer;
             ent.expert = e;
             bool ok = true;
+            // One block per expert, the same shape the read-through fill uses.
+            size_t eff[3] = {0, 0, 0};
+            for (int i = 0; i < 3; i++)
+                if (from[i]) eff[i] = src.per_expert(from[i]);
+            const WarmBlockLayout blk = warm_block_layout(eff);
+            if (blk.total) {
+                ent.base = be_ ? be_->alloc_host(blk.total) : nullptr;
+                ok = ent.base != nullptr;
+            }
             for (int i = 0; i < 3 && ok; i++) {
                 const GgufTensor *t = from[i];
-                const size_t per = src.per_expert(t);
+                const size_t per = eff[i];
                 if (!t || per == 0) continue;
-                void *p = be_ ? be_->alloc_host(per) : nullptr;
-                if (!p) {
-                    ok = false;
-                    break;
-                }
+                void *p = static_cast<char *>(ent.base) + blk.off[i];
                 const void *mapped = t->data + static_cast<size_t>(e) * per;
                 try {
                     // Concurrent: this runs while the main thread decodes, so
@@ -2199,7 +2475,7 @@ void ExpertCache::pf_worker() {
                     std::memcpy(p, mapped, per);
                     h.bytes(static_cast<krk::i64>(per));
                 } catch (...) {
-                    be_->release_host(p);
+                    // The whole block goes back through pf_free, which owns it.
                     ok = false;
                     break;
                 }
@@ -2208,8 +2484,8 @@ void ExpertCache::pf_worker() {
                 ent.t[i].type = t->type;
                 ent.t[i].n_in = static_cast<i64>(t->ne[0]);
                 ent.t[i].n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
-                ent.bytes += per;
             }
+            ent.bytes = blk.total;
             if (!ok) {
                 pf_free(ent);
                 continue;

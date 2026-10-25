@@ -399,11 +399,23 @@ public:
                                                  ? std::max<i64>(0, n_keys - d.window)
                                                  : 0;
                             const i64 n_vis = n_keys - j_lo;
+                            // skip_from: a masked-block row keeps the context
+                            // before the block and its own row. The range is
+                            // halved here rather than tested per key, so the
+                            // visible set stays two contiguous runs.
+                            const bool skip = d.skip_from >= 0 && pos >= d.skip_from;
+                            const i64 s_lo = skip ? std::max<i64>(j_lo, d.skip_from) : 0;
+                            const i64 s_hi = skip ? std::min<i64>(pos, n_keys) : 0;
                             scores.resize(static_cast<size_t>(n_vis));
                             const i64 hkv = n_rep > 0 ? h / n_rep : 0;
                             const i64 base = hkv * d.hd;
                             const f32 *qh = qf + t * (d.n_head * d.hd) + h * d.hd;
                             for (i64 j = 0; j < n_vis; j++) {
+                                if (s_hi > s_lo && j_lo + j >= s_lo &&
+                                    j_lo + j < s_hi) {
+                                    scores[static_cast<size_t>(j)] = -FLT_MAX;
+                                    continue;
+                                }
                                 const u8 *row = kc + (j_lo + j) * d.pos_stride;
                                 const f32 *sc =
                                     reinterpret_cast<const f32 *>(row + kv_dim);
@@ -476,10 +488,22 @@ public:
                                              ? std::max<i64>(0, n_keys - d.window)
                                              : 0;
                         const i64 n_vis = n_keys - j_lo;
+                        // See the int8 path above: masked-block rows keep the
+                        // context and their own row, and drop the block's other
+                        // candidates. A masked key contributes exp(-FLT_MAX - m)
+                        // = 0 to the denominator and nothing to the output.
+                        const bool skip = d.skip_from >= 0 && pos >= d.skip_from;
+                        const i64 s_lo = skip ? std::max<i64>(j_lo, d.skip_from) : 0;
+                        const i64 s_hi = skip ? std::min<i64>(pos, n_keys) : 0;
                         scores.resize(static_cast<size_t>(n_vis));
                         const i64 hkv = n_rep > 0 ? h / n_rep : 0;
                         const f32 *qh = qf + t * (d.n_head * d.hd) + h * d.hd;
                         for (i64 j = 0; j < n_vis; j++) {
+                            if (s_hi > s_lo && j_lo + j >= s_lo &&
+                                j_lo + j < s_hi) {
+                                scores[static_cast<size_t>(j)] = -FLT_MAX;
+                                continue;
+                            }
                             const f32 *kj = kc + (j_lo + j) * d.pos_stride + hkv * d.hd;
                             f32 dot = 0;
                             for (i64 i = 0; i < d.hd; i++) dot += qh[i] * kj[i];

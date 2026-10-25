@@ -2076,18 +2076,20 @@ int h2d_bench(Backend *be, int iters) {
     };
     // The three slices of one expert share one 13 MB pinned source, which is
     // what ExpertCache hands over: a promotion is 3 copies, not 1.
-    Arm arms[6] = {
+    Arm arms[7] = {
         make("pageable  1 x 12.6 MB", 1, kExpert, 0, false),
         make("pageable  1 x 12.6 MB direct", 1, kExpert, 1, false),
+        make("pageable  1 x 12.6 MB blocking", 1, kExpert, 3, false),
         make("pinned    1 x 12.6 MB", 1, kExpert, 2, false),
         make("pinned    3 x  4.4 MB", 3, kSlice, 2, true),
         make("pinned    1 x  128 MB", 1, kBig, 2, false),
         make("pinned   36 x  4.4 MB", 36, kSlice, 2, true),
     };
-    // The two pageable arms are the SAME call with the path flipped, which is
+    // The three pageable arms are the SAME call with the path flipped, which is
     // how the engine's init probe measures them: this table is the machine's
-    // answer to "does the aperture make the driver-staged copy free?", and the
-    // direct row is what a wide-aperture box is expected to win.
+    // answer to "which mechanism does this aperture make free?", and the
+    // blocking row is what a wide-aperture box is expected to win -- it is the
+    // driver's own copy, which the engine's ring can only be slower than.
     std::printf("--- host->device, per call (average of %d)%s\n", iters,
                 be->pageable_paths_selectable()
                     ? ""
@@ -2097,7 +2099,9 @@ int h2d_bench(Backend *be, int iters) {
             if (a.mode == 2) {
                 be->upload_pinned_batch(a.dst, a.src, a.bytes, a.n);
             } else {
-                be->set_pageable_direct(a.mode == 1);
+                // 0 ring, 1 direct, 3 blocking -> the backend's own enum.
+                be->set_pageable_path(static_cast<Backend::PageablePath>(
+                    a.mode == 3 ? 2 : a.mode));
                 be->upload_paged_batch(a.dst, a.src, a.bytes, a.n);
             }
         });
@@ -2116,8 +2120,9 @@ int h2d_bench(Backend *be, int iters) {
         void *dsts[1] = {dev};
         const void *srcs[1] = {pp};
         const size_t lens[1] = {kExpert};
-        auto one = [&](bool direct) {
-            be->set_pageable_direct(direct);
+        // 0 ring, 1 direct, 2 blocking: one call, three mechanisms.
+        auto one = [&](int path) {
+            be->set_pageable_path(static_cast<Backend::PageablePath>(path));
             const std::chrono::steady_clock::time_point t0 =
                 std::chrono::steady_clock::now();
             be->upload_paged_batch(dsts, srcs, lens, 1);
@@ -2127,17 +2132,23 @@ int h2d_bench(Backend *be, int iters) {
                                   .count();
             return ms > 0.0 ? static_cast<double>(kExpert) / (ms * 1e6) : 0.0;
         };
-        one(false);
-        one(true);
-        std::vector<double> ring_v, direct_v;
+        one(0);
+        one(1);
+        one(2);
+        std::vector<double> ring_v, direct_v, block_v;
         const int pairs = iters > 16 ? iters / 8 : 2;
         for (int i = 0; i < pairs; i++) {
+            // The blocking arm is measured too, because it is the one a wide
+            // aperture makes fastest and a table that omitted it could only
+            // report the two slowest mechanisms as the choice.
             if (i & 1) {
-                direct_v.push_back(one(true));
-                ring_v.push_back(one(false));
+                block_v.push_back(one(2));
+                direct_v.push_back(one(1));
+                ring_v.push_back(one(0));
             } else {
-                ring_v.push_back(one(false));
-                direct_v.push_back(one(true));
+                ring_v.push_back(one(0));
+                direct_v.push_back(one(1));
+                block_v.push_back(one(2));
             }
         }
         auto median = [](std::vector<double> &v) {
@@ -2145,17 +2156,16 @@ int h2d_bench(Backend *be, int iters) {
             const size_t n = v.size();
             return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
         };
-        const double ring = median(ring_v), direct = median(direct_v);
-        // The same predicate the engine applies (1.20x, not a separate line for
-        // the tool): a bench that said "direct" at 1.10 while init kept the ring
-        // would be printing a verdict the run does not act on.
-        const bool take_direct = krk::pageable_direct_wins(ring, direct);
+        const double ring = median(ring_v), direct = median(direct_v),
+                     block = median(block_v);
+        // The same predicate the engine applies (1.20x, arms against the running
+        // best), not a separate line for the tool: a bench that said "direct" at
+        // 1.10 while init kept the ring would be printing a verdict the run does
+        // not act on.
+        const int path = krk::pageable_path_choice(ring, direct, block);
         std::printf("  balanced (%d order-swapped pairs, median): ring %.2f GB/s, "
-                    "direct %.2f GB/s (%.2fx) -> %s\n",
-                    pairs, ring, direct, ring > 0.0 ? direct / ring : 0.0,
-                    take_direct
-                        ? "direct (the aperture pays for the copy)"
-                        : "ring (the windowed staging costs more than the copy)");
+                    "direct %.2f GB/s, blocking %.2f GB/s -> %s\n",
+                    pairs, ring, direct, block, krk::h2d_path_name(path));
     }
     // What a normal run will ACT ON, and where it comes from. The engine's probe
     // buckets its copy to 16/32/64 MiB, so those are the only sizes a cache entry
@@ -2171,7 +2181,7 @@ int h2d_bench(Backend *be, int iters) {
         key.vram_total = caps.vram_total;
         key.large_bar = caps.large_bar;
         key.driver_version = caps.driver_version;
-        std::printf("  engine probe (3 arms, up to %d iterations -- it stops when the "
+        std::printf("  engine probe (4 arms, up to %d iterations -- it stops when the "
                     "medians settle, %s):\n",
                     krk::kH2dProbeMaxIters,
                     cache.empty() ? "cache off, nothing will be written"
@@ -2196,15 +2206,16 @@ int h2d_bench(Backend *be, int iters) {
                             bytes >> 20);
                 continue;
             }
-            const bool direct_path =
-                krk::pageable_direct_wins(p.pageable_gbs, p.direct_gbs);
-            const double pageable = direct_path ? p.direct_gbs : p.pageable_gbs;
+            const int path = krk::h2d_path(p);
+            const double pageable = krk::h2d_path_gbs(p);
             const bool pin = krk::warm_pin_worthwhile(pageable, p.pinned_gbs);
             std::printf("    %2zu MiB (%d of %d iter, spread %.1f%%, %.0f ms): ring "
-                        "%.2f direct %.2f pinned %.2f GB/s -> %s, %s\n",
+                        "%.2f direct %.2f blocking %.2f pinned %.2f GB/s -> %s "
+                        "(%s aperture), %s\n",
                         bytes >> 20, p.iterations, krk::kH2dProbeMaxIters,
                         100.0 * p.spread, probe_ms, p.pageable_gbs, p.direct_gbs,
-                        p.pinned_gbs, direct_path ? "direct" : "ring",
+                        p.blocking_gbs, p.pinned_gbs, krk::h2d_path_name(path),
+                        p.aperture_wide ? "wide" : "narrow",
                         pin ? "pin a WARM prefix" : "no pin (nothing to buy back)");
             if (cache.empty()) continue;
             krk::H2dCachePrune pruned;
@@ -2229,7 +2240,7 @@ int h2d_bench(Backend *be, int iters) {
             if (!pruned.empty()) std::printf("  cache %s\n", pruned.c_str());
         }
     }
-    be->set_pageable_direct(false);  // this is a probe, not a mode change
+    be->set_pageable_path(Backend::PageablePath::Ring);  // a probe, not a mode change
     be->release(dev);
     be->release_host(ph);
     be->release_host_pageable(pp);
@@ -2279,13 +2290,15 @@ int h2d_noise(Backend *be, size_t only_mib) {
         }
         std::printf("  %2zu MiB:\n", bytes >> 20);
         for (size_t i = 0; i < s.ring.size(); i++)
-            std::printf("    %2zu  ring %6.2f  direct %6.2f  pinned %6.2f GB/s\n", i + 1,
-                        s.ring[i], s.direct[i], s.pinned[i]);
-        std::printf("    n   relative MAD (ring/direct/pinned)\n");
+            std::printf("    %2zu  ring %6.2f  direct %6.2f  blocking %6.2f  "
+                        "pinned %6.2f GB/s\n",
+                        i + 1, s.ring[i], s.direct[i], s.blocking[i],
+                        s.pinned[i]);
+        std::printf("    n   relative MAD (ring/direct/blocking/pinned)\n");
         for (size_t n = 3; n <= s.ring.size(); n++)
-            std::printf("    %2zu  %5.1f%%  %5.1f%%  %5.1f%%\n", n,
+            std::printf("    %2zu  %5.1f%%  %5.1f%%  %5.1f%%  %5.1f%%\n", n,
                         100.0 * rel(s.ring, n), 100.0 * rel(s.direct, n),
-                        100.0 * rel(s.pinned, n));
+                        100.0 * rel(s.blocking, n), 100.0 * rel(s.pinned, n));
     }
     return 0;
 }
@@ -3634,6 +3647,178 @@ i64 arm_moe_dispatch(Backend *be) {
         std::vector<u16> got(x.size());
         be->download(got.data(), out_d, got.size() * 2);
 
+        // ---- the two launch forms must agree BIT FOR BIT --------------------
+        // A small row set tiles each (token, slot)'s rows over many blocks
+        // (moe_table_gu_tiled / _scale / _down_tiled + the ordered reduce); a
+        // larger one keeps the serial form, where the accumulator lives in the
+        // block. The fanout replaces the loop for
+        // DECODE, so "close" is the wrong contract: the reduce replays the
+        // serial accumulation order and the two must produce the same f16
+        // bytes. This arm is why the reduce is sequential.
+        i64 form_diff = 0;
+        // Set inside the block below and folded into the case verdict after it:
+        // the expert-major form is a third way to compute the same layer, and a
+        // disagreement there has to fail the case, not just print.
+        bool grouped_bad = false;
+        {
+            void *out_alt = be->alloc(x.size() * 2);
+            const char *want = c.n_tok <= 4 ? "0" : "1";
+            const char *other = c.n_tok <= 4 ? "1" : "0";
+#if defined(_WIN32)
+            _putenv_s("KRK_MOE_FANOUT", want);
+#else
+            setenv("KRK_MOE_FANOUT", want, 1);
+#endif
+            be->moe_dispatch(table_d, 0, ne, ids_d, wts_d, xn_d, out_alt, c.n_tok,
+                             c.n_embd, c.n_ff, c.k);
+            be->sync();
+            std::vector<u16> alt(x.size());
+            be->download(alt.data(), out_alt, alt.size() * 2);
+#if defined(_WIN32)
+            _putenv_s("KRK_MOE_FANOUT", other);
+#else
+            setenv("KRK_MOE_FANOUT", other, 1);
+#endif
+            be->moe_dispatch(table_d, 0, ne, ids_d, wts_d, xn_d, out_alt, c.n_tok,
+                             c.n_embd, c.n_ff, c.k);
+            be->sync();
+            std::vector<u16> alt2(x.size());
+            be->download(alt2.data(), out_alt, alt2.size() * 2);
+#if defined(_WIN32)
+            _putenv_s("KRK_MOE_FANOUT", "");
+#else
+            unsetenv("KRK_MOE_FANOUT");
+#endif
+            // A second fanout run: if the two forms disagree, the question is
+            // whether the fanout is even deterministic (a race) or the difference
+            // is arithmetic (slot order, shared-memory rounding).
+            be->fill0(out_alt, x.size() * 2);
+#if defined(_WIN32)
+            _putenv_s("KRK_MOE_FANOUT", other);
+#else
+            setenv("KRK_MOE_FANOUT", other, 1);
+#endif
+            be->moe_dispatch(table_d, 0, ne, ids_d, wts_d, xn_d, out_alt, c.n_tok,
+                             c.n_embd, c.n_ff, c.k);
+            be->sync();
+            std::vector<u16> alt3(x.size());
+            be->download(alt3.data(), out_alt, alt3.size() * 2);
+            i64 self_diff = 0;
+            for (size_t i = 0; i < alt2.size(); i++)
+                if (alt2[i] != alt3[i]) self_diff++;
+            std::printf("  %-11s form self-consistency: %s (%lld of %zu)\n", "",
+                        self_diff == 0 ? "deterministic" : "NON-DETERMINISTIC",
+                        static_cast<long long>(self_diff), alt2.size());
+            // ---- the EXPERT-MAJOR form ----------------------------------
+            // A batch picks it by row count, which no case here reaches, so it
+            // is forced explicitly. It is held to the same contract as the
+            // per-pair form: compare it against the serial reference `alt` and
+            // require the difference to be bounded, not bit-zero (the same
+            // shared-memory rounding sits between them).
+            std::vector<u16> alt4(x.size());
+#if defined(_WIN32)
+            _putenv_s("KRK_MOE_FANOUT", "2");
+#else
+            setenv("KRK_MOE_FANOUT", "2", 1);
+#endif
+            be->fill0(out_alt, x.size() * 2);
+            be->moe_dispatch(table_d, 0, ne, ids_d, wts_d, xn_d, out_alt, c.n_tok,
+                             c.n_embd, c.n_ff, c.k);
+            be->sync();
+            be->download(alt4.data(), out_alt, alt4.size() * 2);
+#if defined(_WIN32)
+            _putenv_s("KRK_MOE_FANOUT", "");
+#else
+            unsetenv("KRK_MOE_FANOUT");
+#endif
+            // A raw bit comparison is the WRONG contract here and the first
+            // version of this arm said so the hard way: the two kernels agree on
+            // the arithmetic but not on which multiply the compiler contracts,
+            // so a small fraction of elements land one f16 ulp apart (measured
+            // below). What matters is that the difference is bounded and that it
+            // is not a race -- so the arm counts ULP distance and the second
+            // fanout run above proves determinism.
+            auto ord16 = [](u16 h) {
+                return (h & 0x8000) ? -static_cast<i32>(h & 0x7fff)
+                                    : static_cast<i32>(h);
+            };
+            f64 s2f = 0.0;
+            for (u16 h : alt) {
+                const f64 v = static_cast<f64>(fp16_to_fp32(h));
+                s2f += v * v;
+            }
+            const f64 frms = std::sqrt(s2f / static_cast<f64>(alt.size()) + 1e-30);
+            i64 form_first = -1;
+            i32 form_worst_ulp = 0;
+            f64 form_worst_rel = 0.0;
+            for (size_t i = 0; i < alt.size(); i++) {
+                if (alt[i] == alt2[i]) continue;
+                const i32 d = ord16(alt[i]) - ord16(alt2[i]);
+                const i32 a = d < 0 ? -d : d;
+                if (a > form_worst_ulp) form_worst_ulp = a;
+                const f64 rel = std::fabs(static_cast<f64>(fp16_to_fp32(alt[i])) -
+                                          static_cast<f64>(fp16_to_fp32(alt2[i]))) /
+                                frms;
+                if (rel > form_worst_rel) form_worst_rel = rel;
+                if (form_first < 0) form_first = static_cast<i64>(i);
+                // The gate is RELATIVE, not a ulp count. With k slots the chain
+                // rounds after every add, so a 1-ulp difference in one partial
+                // lands as many ulp in a sum that cancels; what has to stay
+                // bounded is the error against the row's own magnitude.
+                if (rel > 4e-3) form_diff++;
+            }
+            if (form_worst_ulp > 0)
+                std::printf("  %-11s forms differ by at most %d f16 ulp, worst "
+                            "%.2e of rms; beyond 4e-3 of rms: %lld element(s)\n",
+                            "", static_cast<int>(form_worst_ulp), form_worst_rel,
+                            static_cast<long long>(form_diff));
+            // The expert-major form, against the same reference.
+            i64 gm_diff = 0;
+            i32 gm_worst = 0;
+            f64 gm_rel = 0.0;
+            {
+                f64 s4 = 0.0;
+                for (u16 h : alt4) {
+                    const f64 v = static_cast<f64>(fp16_to_fp32(h));
+                    s4 += v * v;
+                }
+                const f64 r4 = std::sqrt(s4 / static_cast<f64>(alt4.size()) + 1e-30);
+                if (r4 == 0.0 || s4 != s4) {
+                    std::printf("  %-11s grouped form produced no signal (rms %.3g)\n",
+                                "", r4);
+                    gm_diff = -1;
+                }
+                for (size_t i = 0; i < alt.size() && gm_diff >= 0; i++) {
+                    const i32 d = ord16(alt4[i]) - ord16(alt[i]);
+                    const i32 a = d < 0 ? -d : d;
+                    if (a > gm_worst) gm_worst = a;
+                    const f64 rel = std::fabs(static_cast<f64>(fp16_to_fp32(alt4[i])) -
+                                              static_cast<f64>(fp16_to_fp32(alt[i]))) / r4;
+                    if (rel > gm_rel) gm_rel = rel;
+                    if (rel > 4e-3) gm_diff++;
+                }
+            }
+            if (gm_diff >= 0)
+                std::printf("  %-11s grouped (expert-major) vs serial: at most %d f16 "
+                            "ulp, worst %.2e of rms; beyond 4e-3 of rms: %lld element(s)\n",
+                            "", static_cast<int>(gm_worst), gm_rel,
+                            static_cast<long long>(gm_diff));
+            if (gm_diff != 0) {
+                grouped_bad = true;
+                std::printf("  %-11s FAIL: the expert-major form disagrees with the "
+                            "serial reference\n", "");
+            }
+            if (form_first >= 0)
+                std::printf("  %-11s first form difference at %lld: serial=%.6g "
+                            "fanout=%.6g (row %lld of %lld)\n",
+                            "", static_cast<long long>(form_first),
+                            static_cast<f64>(fp16_to_fp32(alt[static_cast<size_t>(form_first)])),
+                            static_cast<f64>(fp16_to_fp32(alt2[static_cast<size_t>(form_first)])),
+                            static_cast<long long>(form_first % c.n_embd),
+                            static_cast<long long>(form_first / c.n_embd));
+            be->release(out_alt);
+        }
+
         i64 diff = 0, nan = 0, inf = 0, over = 0;
         i64 nan_k = 0, nan_r = 0;
         f64 worst = 0.0;
@@ -3662,7 +3847,7 @@ i64 arm_moe_dispatch(Backend *be) {
             if (rel > worst) worst = rel;
             if (rel > 4e-3) over++;
         }
-        const bool values_ok = nan == 0 && inf == 0 && over == 0;
+        const bool values_ok = nan == 0 && inf == 0 && over == 0 && !grouped_bad;
         if (first >= 0)
             std::printf("  %-11s first difference at %lld: kernel=%.6g ref=%.6g "
                         "(nan kernel=%lld ref=%lld)\n",
@@ -3714,12 +3899,13 @@ i64 arm_moe_dispatch(Backend *be) {
         }
 
         std::printf("  %-11s %-5s embd=%-5lld ff=%-6lld experts=%-2lld k=%d "
-                    "tokens=%lld  %s  worst=%.2e  indirection=%s\n",
+                    "tokens=%lld  %s  worst=%.2e  indirection=%s  forms=%s\n",
                     c.tag, dtype_tag(c.t), static_cast<long long>(c.n_embd),
                     static_cast<long long>(c.n_ff), static_cast<long long>(ne),
                     static_cast<int>(c.k), static_cast<long long>(c.n_tok),
                     diff == 0 ? "IDENTICAL" : "differs", worst,
-                    moved ? "ok" : "NOT PROVEN");
+                    moved ? "ok" : "NOT PROVEN",
+                    form_diff == 0 ? "match/1ulp" : "DIFFER");
         if (diff) {
             std::printf("  %-11s %lld of %zu element(s) differ from the "
                         "per-expert path (f16 store rounding, reported not "
@@ -3738,6 +3924,15 @@ i64 arm_moe_dispatch(Backend *be) {
             std::printf("  %-11s FAIL indirection: swapping the selected "
                         "expert's gate and up matrices did not change the output\n",
                         "");
+            ++failures;
+        }
+        if (form_diff) {
+            std::printf("  %-11s FAIL forms: the fanned-out launch and the serial "
+                        "one differ by more than 4e-3 of rms on %lld of %zu "
+                        "element(s); the fanout replaces the serial loop for "
+                        "decode, so it has to stay inside the same tolerance this "
+                        "arm already allows against the per-expert path\n",
+                        "", static_cast<long long>(form_diff), got.size());
             ++failures;
         }
 

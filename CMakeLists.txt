@@ -530,6 +530,12 @@ endif()
 option(KRK_BUILD_PROBES "Build the standalone kernel probes" OFF)
 if(KRK_BUILD_PROBES AND KRK_HIP_AVAILABLE)
     foreach(probe probe_min probe_decode probe_engine graph_event_probe)
+        # Four probes were planned at the repo root and never landed there; a
+        # missing source aborts the whole configure, which made this option
+        # unusable and hid the probes below that do exist.
+        if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${probe}.hip)
+            continue()
+        endif()
         add_executable(${probe} ${CMAKE_CURRENT_SOURCE_DIR}/${probe}.hip)
         target_include_directories(${probe} PRIVATE
                                    ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -593,6 +599,30 @@ if(KRK_BUILD_PROBES AND KRK_HIP_AVAILABLE)
     foreach(tgt IN LISTS CMAKE_HIP_ARCHITECTURES)
         string(TOUPPER "${tgt}" tgt_uc)
         target_compile_definitions(probe_sync PRIVATE
+                                   "KRK_OFFLOAD_${tgt_uc}=1")
+    endforeach()
+
+    # probe_graph prices the alternative to fixing the kernel: if a decode step
+    # is submission-bound then one captured graph replay replaces ~340 launches,
+    # and that is a different (and much cheaper) project than making the ops
+    # faster. It submits the same N dependent launches op-by-op and from a
+    # graph, so the answer is a ratio rather than an opinion.
+    add_executable(probe_graph
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_graph.hip)
+    target_include_directories(probe_graph PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/hip)
+    if(TARGET hip::device)
+        target_link_libraries(probe_graph PRIVATE hip::device)
+    elseif(HIP_FOUND)
+        target_link_libraries(probe_graph PRIVATE ${HIP_LIBRARIES})
+    endif()
+    target_compile_options(probe_graph PRIVATE
+                           -O3 -ffast-math -fno-finite-math-only)
+    foreach(tgt IN LISTS CMAKE_HIP_ARCHITECTURES)
+        string(TOUPPER "${tgt}" tgt_uc)
+        target_compile_definitions(probe_graph PRIVATE
                                    "KRK_OFFLOAD_${tgt_uc}=1")
     endforeach()
 
