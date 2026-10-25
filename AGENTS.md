@@ -335,7 +335,16 @@ code, the README, or `docs/`.
   `KRK_TEST_SERIAL_OVERRIDE=<grp>` forces one for a run so the lane is exercised.
   **Exactly one group declares one**: `test_pageable_path_probe` times host
   copies, so a neighbour's traffic would be read as the simulated aperture --
-  the first real user of that lane. Every other group is silent here: none opens
+  the first real user of that lane. **The lane does not protect it from the
+  selfcheck, and that was measured.** The sweep runs six suites at once, so the
+  probe is measured beside five neighbours -- exactly the condition its
+  declaration names -- and its blocking arm tolerated only 5.6 ms of stall
+  before `pageable_path_choice`'s 1.20x margin collapsed (at 16 MiB its ring is
+  2.0 ms against blocking's 0.73 ms). One gate run in three failed with
+  `another group is not passing: test_pageable_path_probe`. The engine-driven
+  arms of the second and third populations now simulate at 0.1x the rates:
+  same ratios and the same verdict, 56 ms of tolerance instead. Proven by four
+  consecutive green gate runs, against a red at 1.0x that failed one in three. Every other group is silent here: none opens
   the device, binds a fixed port, or reads a clock. Two defects had to be fixed first --
   tokenizer, end-to-end, grouped-prefill and gdn-generation read fixtures an
   earlier group had written, so they passed or failed according to the schedule

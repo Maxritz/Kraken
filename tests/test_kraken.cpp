@@ -14896,13 +14896,30 @@ static void test_pageable_path_probe() {
     MoeSpec spec;
     CHECK(build_tiny_moe_model(path, spec),
           "wrote the MoE fixture for the aperture test");
+    // `scale` stretches every simulated copy without changing a single RATIO.
+    // The verdict is decided by ratios (`pageable_path_choice` asks each arm to
+    // beat the running best by 1.20x); the absolute rates only say how long the
+    // simulated copy BUSY-SPINS, and that spin is timed with steady_clock. A
+    // spinning thread that gets preempted overshoots its deadline, and an
+    // additive overshoot compresses every ratio towards 1 -- the same trap the
+    // 0.4 GB/s arm above exists for, and the reason this group is serial.
+    //
+    // The blocking arm below is the one with a tight margin: at this box's
+    // shape and 16 MiB its ring is 2.0 ms against blocking's 0.73 ms, so the
+    // verdict survives only d <= (2.0 - 1.2*0.73)/0.2 = 5.6 ms of stall -- less
+    // than one scheduler quantum for a preempted thread. That is why six
+    // concurrent selfcheck suites flipped it ("its own measurement says the
+    // blocking copy is the fastest mechanism" failing about one gate run in
+    // three). Ten times slower is the SAME shape and tolerates d <= 56 ms.
     auto run = [&](double ring_gbs, double direct_gbs, double pin_gbs,
                    bool *direct_on, size_t *pin, std::vector<i32> *tokens,
                    krk::H2dProbe *used, double block_gbs = -1.0,
-                   int *path_used = nullptr) {
+                   int *path_used = nullptr, double scale = 1.0) {
         auto *be = new CountingBackend(make_cpu_backend());
         be->set_test_resources(16 * gib, 8 * gib, 16 * gib, 8 * gib);
-        be->set_test_aperture(ring_gbs, direct_gbs, pin_gbs, block_gbs);
+        be->set_test_aperture(ring_gbs * scale, direct_gbs * scale,
+                              pin_gbs * scale,
+                              block_gbs >= 0.0 ? block_gbs * scale : block_gbs);
         Engine engine;
         EngineConfig cfg;
         cfg.model_path = path;
@@ -14976,8 +14993,11 @@ static void test_pageable_path_probe() {
     int engine_path = -1;
     std::vector<i32> block_tokens;
     krk::H2dProbe block_used;
+    // 0.1: the same shape at a tenth of the rates, so the verdict has ~10x the
+    // headroom against a stalled spin (see `scale` on `run` above).
     const bool block_ok = run(8.4, 10.0, 24.4, &block_direct, &block_pin,
-                              &block_tokens, &block_used, 22.9, &engine_path);
+                              &block_tokens, &block_used, 22.9, &engine_path,
+                              0.1);
     CHECK(block_ok && block_used.valid, "the engine initialises on a blocking-fast card");
     CHECK(krk::h2d_path(block_used) == 2,
           "its own measurement says the blocking copy is the fastest mechanism");
