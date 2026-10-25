@@ -293,10 +293,13 @@ for mode in inproc child; do
 done
 rm -rf "$LEAVES"
 
-# The rule has a boundary, and the boundary is the point: it removes the shapes
-# the suite writes and refuses everything else -- including names that merely
-# start with kraken-. A cleanup that is one wildcard too wide deletes a caller's
-# binary, which is why this arm exists rather than a comment saying it is careful.
+# The boundary is now the START DIRECTORY, and that is the point: a run owns an
+# area of its own and touches nothing where it was started. This arm used to
+# assert the opposite -- that the suite cleaned fixture-shaped files out of its
+# caller's directory -- and that rule is how one run deleted a concurrent run's
+# live fixture (`cannot open 'kraken-aperture-path.gguf'` in the probe group).
+# What it removes, and refuses to remove, is decided inside its own area now, so
+# the caller's binary and the caller's decoys must both survive.
 BOUND=$(mktemp -d)
 mkdir -p "$BOUND/kraken-decoy-cold-dir"
 for f in kraken-decoy.gguf kraken-decoy.krakenexperts.json kraken-decoy-cold-dir/data.bin; do
@@ -308,10 +311,11 @@ done
 ( cd "$BOUND" && KRK_TEST_INPROC=1 "$BIN" > run.log 2>&1 )
 left=$(cd "$BOUND" && ls | sort | tr '
 ' ' ')
-if [ "$left" = "keep-me.txt kraken-notes.md kraken.exe run.log " ]; then
-    ok "fixture-boundary" "the suite's shapes went, the look-alikes stayed"
+want="keep-me.txt kraken-decoy-cold-dir kraken-decoy.gguf kraken-decoy.krakenexperts.json kraken-notes.md kraken.exe run.log "
+if [ "$left" = "$want" ]; then
+    ok "fixture-boundary" "the run touched nothing where it was started, decoys and look-alikes alike"
 else
-    bad "fixture-boundary" "want only keep-me.txt, kraken-notes.md, kraken.exe, run.log; got: $left"
+    bad "fixture-boundary" "want only $want; got: $left"
 fi
 rm -rf "$BOUND"
 

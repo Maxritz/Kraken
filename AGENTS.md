@@ -344,7 +344,18 @@ code, the README, or `docs/`.
   `another group is not passing: test_pageable_path_probe`. The engine-driven
   arms of the second and third populations now simulate at 0.1x the rates:
   same ratios and the same verdict, 56 ms of tolerance instead. Proven by four
-  consecutive green gate runs, against a red at 1.0x that failed one in three. Every other group is silent here: none opens
+  consecutive green gate runs, against a red at 1.0x that failed one in three.
+  **The width the sweep uses for this had to be global, and the scoped version
+  was measured red first.** Every arm IS a full suite, so any two arms in flight
+  are two neighbours of the probe -- including arms of a DIFFERENT group. Scoping
+  the serial width to the serial group's own arms (`--selfcheck --group 0`, six
+  arms of a normal group) failed at once: `another group is not passing:
+  test_pageable_path_probe` in the crash-last arm. So when the suite contains a
+  serial group the whole wave is one arm at a time, and that arm gets
+  `min(8, cores)` workers rather than a sixth of them. Cost: `--group 0` 24 s ->
+  44 s, and the optional 564-run sweep ~22 min -> ~68 min; both are wall time,
+  not a claim, since the arms differ in env, scratch, log and report and their
+  order is not part of what is proved. Every other group is silent here: none opens
   the device, binds a fixed port, or reads a clock. Two defects had to be fixed first --
   tokenizer, end-to-end, grouped-prefill and gdn-generation read fixtures an
   earlier group had written, so they passed or failed according to the schedule
@@ -376,6 +387,19 @@ code, the README, or `docs/`.
   removed. `scripts/kraken_tests_isolation_check.sh` section 13 is the proof: two
   suite runs and a group sweep started together must all be green and leave no new
   area behind.
+  **`KRK_TEST_INPROC` was the one mode without an area, and that was a live
+  defect until it got one.** It ran where it was started (the repo root), and the
+  cleanup works by SHAPE, so a second run starting there deleted the first one's
+  fixtures: `test_pageable_path_probe` reported **129/140** with `cannot open
+  'kraken-aperture-path.gguf'`, and the same binary in the next run reported
+  140/140. It is `std::filesystem::current_path(<area>)` now, with the caller's
+  `--report` path resolved to absolute BEFORE the move (it means what it said
+  relative to the start directory) and the area removed when green unless the
+  report lives inside it. Control, on the current binary: two concurrent
+  in-process runs are **4431/4431 both** with a distinct area, and **4404/4412 +
+  4417/4431** with `KRK_TEST_SCRATCH_ID=sharedctl` pinned for both -- which is
+  exactly the old shared-directory behaviour, so the fix is what is being
+  measured.
 - **The reporting proof is in the default gate; the all-groups sweep is not.**
   `scripts/kraken_tests_baseline_check.sh` runs the runner's own selftest
   (`--selfcheck --selftest`, 17 constructed answers) and ONE group's six arms

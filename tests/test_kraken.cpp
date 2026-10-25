@@ -6727,6 +6727,11 @@ static void test_expert_dispatch_host_backed() {
               "a set with pageable cells publishes nothing");
         CHECK(why2.find("pageable") != std::string::npos,
               "and the reason counts them");
+        // Its slots hold ledgered host bytes, and the ledger is SHARED with the
+        // budget groups that follow: leaving them charged made every exact-budget
+        // check downstream fail in the single-process run (isolated they passed),
+        // which is what the isolation check's `ledger=` column is for.
+        partial.clear();
     }
 
     // 4. A promotion rewrites one cell, so the table goes stale and is
@@ -17477,8 +17482,28 @@ static int run_selfcheck(int workers, const std::string &only_raw, const char *r
     // grandchildren inherit the cap, because it travels in its environment.
     const int cores = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
     const int arms_parallel = std::max(1, std::min(kSelfcheckArmCount, workers));
-    const int arm_workers = std::max(1, std::min(8, cores / arms_parallel));
-    const int threads_per_child = std::max(2, cores / (arms_parallel * arm_workers));
+    // A suite that contains a group which declared itself SERIAL cannot be
+    // co-run with its own siblings -- not even with a SIBLING GROUP's arms. That
+    // declaration exists because a neighbour's traffic lands in the group's
+    // measurements, and in this sweep every arm is a full suite, so any two arms
+    // in flight are two neighbours of the serial group. The first attempt scoped
+    // the width to the serial group's own arms and it failed immediately:
+    // `--selfcheck --group 0` reported `another group is not passing:
+    // test_pageable_path_probe` in its crash-last arm, because six of group 0's
+    // arms were six suites and all six ran the probe.
+    //
+    // So one arm at a time, and that arm gets the workers a sixth of them would
+    // deny it. What this costs is wall time, not a claim: the arms differ in
+    // environment, scratch area, log and report, so their ORDER is not part of
+    // what is proved.
+    bool serial_in_suite = false;
+    for (int g = 0; g < kGroupCount; g++) {
+        if (kGroups[g].serial) serial_in_suite = true;
+    }
+    const int arms_width = serial_in_suite ? 1 : arms_parallel;
+    const int arm_workers = std::max(1, std::min(8, cores / arms_width));
+    const int threads_per_child =
+        std::max(2, cores / (arms_width * arm_workers));
     const int base_threads = std::max(2, cores / std::max(1, workers));
 
     // The A/B arm: KRK_SELFCHECK_THREADS=default leaves every child's pool at the
@@ -17529,7 +17554,8 @@ static int run_selfcheck(int workers, const std::string &only_raw, const char *r
 
     std::fprintf(stderr,
                  "selfcheck: %d arms per group, %d group(s), %d arm(s) at once x %d worker(s) x "
-                 "%d thread(s) (KRK_SELFCHECK_THREADS=default leaves the pools at their own size)\n",
+                 "%d thread(s) (KRK_SELFCHECK_THREADS=default leaves the pools at their own size; "
+                 "a suite with a serial group sweeps one arm at a time, on more workers)\n",
                  kSelfcheckArmCount, kGroupCount, arms_parallel, arm_workers, threads_per_child);
     std::fprintf(stderr, "selfcheck: seed %llu (KRK_SELFCHECK_SEED=%llu draws these aims again)\n",
                  static_cast<unsigned long long>(seed), static_cast<unsigned long long>(seed));
@@ -17607,7 +17633,10 @@ static int run_selfcheck(int workers, const std::string &only_raw, const char *r
         // overlap.
         {
             const int n = static_cast<int>(jobs.size());
-            const int in_flight = std::max(1, std::min(n, arms_parallel));
+            // `arms_width` is 1 whenever the suite contains a serial group: arms
+            // are suites, so every pair of arms is a pair of the probe's
+            // neighbours (see its definition).
+            const int in_flight = std::max(1, std::min(n, arms_width));
             for (int a = 0; a < n; a += in_flight) {
                 std::vector<std::thread> pool;
                 const int hi = std::min(n, a + in_flight);
@@ -18253,9 +18282,33 @@ static int run_one_group(int index, const char *progress, const char *log, const
     return g_passed == g_run ? 0 : 1;
 }
 
+static bool path_under(const std::string &child, const std::string &parent);
+
 // The old behaviour, kept as an escape hatch for a debugger and as the A/B that
 // shows the child-process run reports the same numbers.
 static int run_all_inproc(const char *report) {
+    // A run area of its own, for the reason every child has one: the fixtures are
+    // relative paths and the cleanup works by SHAPE (kraken-*.gguf), so two runs
+    // sharing a directory delete each other's files. Measured on this box: the
+    // same binary and tree, `test_pageable_path_probe` failing 11 checks with
+    // `cannot open 'kraken-aperture-path.gguf'` in one run and 140/140 in the
+    // next -- the difference being whether another run happened to start in the
+    // repo root while this one was mid-group.
+    const std::string area = scratch_area();
+    std::error_code area_ec;
+    std::filesystem::create_directories(area, area_ec);
+    // The report path is the caller's, so it means what it said relative to the
+    // directory the caller started in: resolve it BEFORE the move.
+    const std::string report_path =
+        (report && *report) ? absolute_path(report) : std::string();
+    if (!area_ec) {
+        std::error_code chdir_ec;
+        std::filesystem::current_path(area, chdir_ec);
+        if (chdir_ec)
+            std::fprintf(stderr,
+                         "kraken-tests: no private directory (%s); running where started\n",
+                         chdir_ec.message().c_str());
+    }
     std::fprintf(stderr, "kraken test suite: %d groups, all in this process (KRK_TEST_INPROC)\n",
                  kGroupCount);
     int empty_groups = 0;
@@ -18300,11 +18353,21 @@ static int run_all_inproc(const char *report) {
     const int exit_code = (g_passed == g_run && empty_groups == 0) ? 0 : 1;
     // This mode has no per-group log to read, so its report carries the counts
     // and no FAIL text: the child runner is the one that records *why*.
-    const bool reported = write_report(report, done, 1, now_ms() - t0, exit_code);
+    const char *report_c = report_path.empty() ? nullptr : report_path.c_str();
+    const bool reported = write_report(report_c, done, 1, now_ms() - t0, exit_code);
     if (!reported)
-        std::fprintf(stderr, "report: NOT WRITTEN (asked for %s)\n", report ? report : "");
-    else if (report && *report)
-        std::fprintf(stderr, "report: %s\n", report);
+        std::fprintf(stderr, "report: NOT WRITTEN (asked for %s)\n", report_c ? report_c : "");
+    else if (report_c)
+        std::fprintf(stderr, "report: %s\n", report_c);
+    // The area is scoped to this run, so this run disposes of it -- unless the
+    // caller asked for its report under it, which no process may delete.
+    {
+        const bool report_inside =
+            !report_path.empty() && path_under(report_path, area);
+        std::error_code rm;
+        if (exit_code == 0 && reported && !report_inside)
+            std::filesystem::remove_all(area, rm);
+    }
     return (exit_code == 0 && reported) ? 0 : 1;
 }
 
