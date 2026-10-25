@@ -16068,6 +16068,103 @@ static void test_source_literal_hygiene() {
                 "a user-facing message would go unreported");
 }
 
+// Group: the CLI's refusals are a contract a script depends on, and one arm of
+// it was broken in a way no existing test could see. `parse()` returns bool,
+// but its `--kv-quant` and `--prefill` error paths did `return 2;` -- which
+// converts to TRUE, so the caller read a typo as "parsed fine": `--prefill
+// bogus` ran the default fast rung and `--kv-quant int4` ran f16, each printing
+// one line to stderr and exiting 0.
+//
+// The check is on the PROCESS, because that is what a script reads. Every arm
+// passes a model path that does NOT exist: a refused value must exit 2 BEFORE
+// the loader is reached, while a value that slipped through reaches the loader
+// and exits 1 with `cannot open`. That is what makes the arm discriminate
+// rather than merely observe a non-zero status. Two controls pin both ends -- a
+// valid line does reach the loader (1), and `--help` is not a refusal (0) -- so
+// an arm that refused everything could not pass.
+static void test_cli_arg_refusal() {
+    const std::string self = self_path();
+    const std::filesystem::path exe_p =
+        std::filesystem::path(self).parent_path() /
+#ifdef _WIN32
+        "kraken.exe";
+#else
+        "kraken";
+#endif
+    const bool have_exe = !self.empty() && std::filesystem::exists(exe_p);
+    CHECK(have_exe, "kraken sits beside kraken-tests (this group drives it)");
+    if (!have_exe) return;
+    const std::string exe = exe_p.string();
+    // Never created: the point is that a refused flag stops before the loader,
+    // so a run that got this far exits 1 instead of 2.
+    const std::string missing = "kraken-arg-refusal-no-such-model.gguf";
+
+    auto run = [&](const std::string &args, std::string *err) -> int {
+        const std::string o = "kraken-argref-out.txt";
+        const std::string e = "kraken-argref-err.txt";
+        std::string cmd =
+            "\"" + exe + "\" " + args + " > \"" + o + "\" 2> \"" + e + "\"";
+#ifdef _WIN32
+        // cmd /c strips the first and last quote of a line that starts with
+        // one; `call` makes the line start with a word (the run_prefill_hash
+        // trap).
+        cmd = "call " + cmd;
+#endif
+        const int rc = gate_exit_code(std::system(cmd.c_str()));
+        if (err) *err = read_capture(e);
+        std::remove(o.c_str());
+        std::remove(e.c_str());
+        return rc;
+    };
+
+    struct Arm {
+        const char *flags;
+        const char *want;
+    };
+    const Arm bad[] = {
+        {"--kv-quant int4", "--kv-quant needs f16|int8"},
+        {"--prefill bogus", "--prefill needs exact|fast"},
+        {"--no-such-flag", "unknown option"},
+    };
+    for (const Arm &a : bad) {
+        std::string err;
+        const int rc = run(std::string("-m \"") + missing + "\" " + a.flags, &err);
+        if (rc != 2)
+            std::fprintf(stderr, "  (%s -> rc=%d, stderr: %.200s)\n", a.flags, rc,
+                         err.c_str());
+        CHECK(rc == 2,
+              rc == 2 ? "a bad value is refused with exit 2, not read as a "
+                        "successful parse"
+                      : "a bad value was ACCEPTED: parse() returned true, so the "
+                        "run continued on defaults");
+        CHECK(err.find(a.want) != std::string::npos,
+              err.find(a.want) != std::string::npos
+                  ? "and the message names the flag and what it accepts"
+                  : "the refusal does not say which flag or which values it "
+                    "wanted");
+    }
+
+    // Control 1: a VALID command line must get past parse and reach the loader,
+    // which then refuses the missing file with 1. This is what makes "exit 2"
+    // above mean "refused at parse" rather than "this binary always exits 2".
+    std::string err_ok;
+    const int rc_ok = run(std::string("-m \"") + missing + "\"", &err_ok);
+    if (rc_ok != 1)
+        std::fprintf(stderr, "  (valid line -> rc=%d, stderr: %.200s)\n", rc_ok,
+                     err_ok.c_str());
+    CHECK(rc_ok == 1, rc_ok == 1
+                           ? "a valid command line reaches the loader, which "
+                             "refuses the missing file"
+                           : "a valid command line did not reach the loader: the "
+                             "refusal arms above prove nothing");
+
+    // Control 2: --help is not a refusal, so it must NOT come back as 2.
+    const int rc_h = run("--help", nullptr);
+    CHECK(rc_h == 0, rc_h == 0 ? "--help exits 0 (a refusal arm cannot be "
+                                 "\"everything exits 2\")"
+                               : "--help did not exit 0");
+}
+
 #define TEST_GROUP(fn) {#fn, fn, nullptr},
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
@@ -16164,6 +16261,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_kv_tier_host_reserve_refusal)
     TEST_GROUP(test_kv_tier_per_plane_cold_files)
     TEST_GROUP(test_moe_batch_ops)
+    TEST_GROUP(test_cli_arg_refusal)
     TEST_GROUP_SERIAL(test_pageable_path_probe,
                       "times host->device copy rates, so it needs the machine")
 };

@@ -1123,12 +1123,13 @@ opt-in (`--mtp-spec`) and off by default.
 
 ### Gate status at this commit
 
-* `kraken-tests` **4311/4311 checks passed**, exit 0 (93 groups).
-* Baseline re-recorded deliberately at 93 groups: verdict is 0 regressions,
-  4 groups changed shape, 7 new groups -- the new ones are this campaign's own
+* `kraken-tests` **4320/4320 checks passed**, exit 0 (94 groups).
+* Baseline re-recorded deliberately at 94 groups: verdict is 0 regressions,
+  4 groups changed shape, 8 new groups -- seven are this campaign's own
   (`test_moe_per_layer_experts`, `test_moe_latent`, `test_nvfp4_sidecar_scale`,
   `test_expert_dispatch_host_backed`, `test_attention_self_mask`,
-  `test_nvfp4_sidecar_dflash`, `test_dflash_laguna_spelling`).
+  `test_nvfp4_sidecar_dflash`, `test_dflash_laguna_spelling`), and the eighth is
+  `test_cli_arg_refusal`, which pins the CLI's exit-2 refusals on the process.
 * `scripts/build_check.sh` exit 0 (1 warning, artifact fingerprint recorded).
 * `kraken-bench --gate` **exits 1 in this worktree**: its speculation arm names
   `models/SmolLM2-135M-Instruct.Q4_K_M.gguf`, which is in neither
