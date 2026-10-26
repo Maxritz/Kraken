@@ -8262,9 +8262,10 @@ static void test_end_to_end_cpu() {
 // head_dim 64, four full-attention layers, no window. The suite's older
 // fixtures are head_dim 8, below the kernel's supported widths, which is why
 // they could never gate it.
-static bool build_prefill_gate_model(const std::string &path) {
+static bool build_prefill_gate_model(const std::string &path,
+                                     int ctx = 64) {
     const int n_embd = 512, n_layer = 4, n_head = 8, n_kv = 2, hd = 64;
-    const int n_ff = 512, ctx = 64;
+    const int n_ff = 512;
     // add_spm_vocab's fixed pieces plus its two word pieces are 261 entries;
     // the embedding tensor and the tokenizer must agree on that width, or the
     // head's logits row and token_embd disagree by a row.
@@ -8361,7 +8362,8 @@ static PrefillProbe run_prefill_hash(const std::string &exe,
                                      const std::string &model,
                                      const std::string &prompt, int chunk,
                                      bool tiled, bool exact_off = false,
-                                     const char *extra = nullptr) {
+                                     const char *extra = nullptr,
+                                     int ctx = 64) {
     PrefillProbe r;
     // Each arm keeps the chunk number and gains a suffix, so two arms never
     // share a capture path (the prefix has no spaces -- it is a filename).
@@ -8373,8 +8375,8 @@ static PrefillProbe run_prefill_hash(const std::string &exe,
     const std::string e = "kraken-prefill-err-" +
                           std::to_string(chunk) + tag + ".txt";
     std::string cmd = "\"" + exe + "\" -m \"" + model + "\" -p \"" + prompt +
-                      "\" --ctx 64 --chunk " + std::to_string(chunk) +
-                      " --greedy --prefill-hash" +
+                      "\" --ctx " + std::to_string(ctx) + " --chunk " +
+                      std::to_string(chunk) + " --greedy --prefill-hash" +
                       (extra ? (" " + std::string(extra)) : std::string()) +
                       " > \"" + o + "\" 2> \"" + e + "\"";
 #ifdef _WIN32
@@ -8785,6 +8787,48 @@ static void test_prefill_chunk_bitexact() {
         CHECK(c1.logits == c32.logits, "and its logits row agrees");
     }
 
+    // ---- THE DEFAULT CHUNK (512) -----------------------------------------
+    // The default is only a promise if the size it names is itself invariant,
+    // and the arms above cannot see it: their fixture holds 64 tokens, so
+    // --chunk 512 there is ONE call and the comparison is vacuous. This arm
+    // builds the same fixture with a 640-token context and a prompt that
+    // tokenizes past 512, so the 512 arm is the (512 + remainder) split that
+    // the default actually produces on a real prompt.
+    const std::string big = "kraken-prefill-gate-512.gguf";
+    CHECK(build_prefill_gate_model(big, 640),
+          "wrote the 640-token fixture the default-chunk arm needs");
+    std::string bprompt;
+    for (int i = 0; i < 530; i++) bprompt += (i ? " the" : "the");
+    const PrefillProbe d1 = run_prefill_hash(exe, big, bprompt, 1, false, false,
+                                             nullptr, 640);
+    const PrefillProbe d8 = run_prefill_hash(exe, big, bprompt, 8, false, false,
+                                             nullptr, 640);
+    const PrefillProbe d512 = run_prefill_hash(exe, big, bprompt, 512, false,
+                                               false, nullptr, 640);
+    if (!d1.ok || !d8.ok || !d512.ok)
+        std::fprintf(stderr,
+                     "  (default-chunk arms: 1 ok=%d rc=%d | 8 ok=%d rc=%d | "
+                     "512 ok=%d rc=%d; 512 stderr: %.400s)\n",
+                     static_cast<int>(d1.ok), d1.rc,
+                     static_cast<int>(d8.ok), d8.rc,
+                     static_cast<int>(d512.ok), d512.rc, d512.err.c_str());
+    CHECK(d1.ok && d8.ok && d512.ok, "all three default-chunk arms print hashes");
+    if (d1.ok && d8.ok && d512.ok) {
+        std::printf("       default chunk: 1 -> %s  8 -> %s  512 -> %s\n",
+                    d1.trace.c_str(), d8.trace.c_str(), d512.trace.c_str());
+        CHECK(d1.prompt_tokens > 512 && d1.prompt_tokens == d512.prompt_tokens,
+              "the prompt spans more than one 512-row chunk");
+        CHECK(d1.trace == d512.trace,
+              d1.trace == d512.trace
+                  ? "the 512-row prefill (the default) leaves the SAME rows as "
+                    "the 1-row one"
+                  : "the 512-row prefill DIFFERS from the 1-row one: the default "
+                    "chunk size is not bit-exact");
+        CHECK(d1.logits == d512.logits,
+              "and the default chunk's logits row agrees bit for bit");
+        CHECK(d1.trace == d8.trace, "the 8-row arm on this fixture agrees too");
+    }
+
     // THE TEXT PROMISE (token gen as well as prefill). A short prompt the
     // fixture can extend without overflowing its 64-token context, decoded
     // 8 greedy tokens at chunk 1, 8 and 64: chunk 1 threads every row
@@ -8870,6 +8914,21 @@ static void test_prefill_chunk_bitexact() {
                       : "the lottery arm matches the reference -- re-point the "
                         "GEMM control, it no longer proves anything");
         }
+        // THE DEFAULT-CHUNK CONTROL. A 512-row arm that agreed whatever the
+        // GEMM association is would be two single-row calls in disguise --
+        // i.e. it would prove nothing about the size it claims to pin -- so
+        // this arm breaks the one thing it is meant to be sensitive to.
+        const PrefillProbe w512 =
+            run_prefill_hash(exe, big, bprompt, 512, false, true, nullptr, 640);
+        CHECK(w512.ok, "the default-chunk lottery control runs");
+        if (w512.ok && d1.ok) {
+            CHECK(w512.trace != d1.trace,
+                  w512.trace != d1.trace
+                      ? "with the rung lottery forced the 512-row arm differs, "
+                        "so the default-chunk gate can fail"
+                      : "the 512-row lottery arm matches the 1-row reference -- "
+                        "it is measuring one-row calls, not the default chunk");
+        }
     }
 #else
     // No device kernels in this build, so the scalar reference is the arm that
@@ -8883,6 +8942,8 @@ static void test_prefill_chunk_bitexact() {
     // failure they stay, and so does the child-mode scratch directory.
     if (g_run == run0 + (g_passed - pass0)) {
         for (const char *name : {"kraken-prefill-out-1.txt", "kraken-prefill-out-2.txt",
+                                 "kraken-prefill-out-512.txt",
+                                 "kraken-prefill-err-512.txt",
                                  "kraken-prefill-out-8.txt", "kraken-prefill-out-8-t.txt",
                                  "kraken-prefill-err-1.txt", "kraken-prefill-err-2.txt",
                                  "kraken-prefill-err-8.txt", "kraken-prefill-err-8-t.txt",
@@ -8896,6 +8957,7 @@ static void test_prefill_chunk_bitexact() {
                                  "kraken-prefill-err-gen-8.txt", "kraken-prefill-err-gen-64.txt"})
             std::remove(name);
         std::remove(model.c_str());
+        std::remove("kraken-prefill-gate-512.gguf");
     }
 
 }

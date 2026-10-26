@@ -35,7 +35,15 @@ struct Args {
     int draft_head_prime = 256; // positions a round primes the head over
     int max_tokens = 256;
     int ctx = 4096;
-    int chunk = 256;
+    // 512, not 256: a 4096-token prefill of the 35B-A3B measured 397.1 tok/s at
+    // 256 and 462.6 at 512 (+16.5%), and the reason is structural rather than
+    // incidental -- the routed expert set is re-read once per chunk, so the
+    // pass count is ceil(prompt/chunk) and halving it halves that traffic.
+    // Invariance is not traded for it: on that model a 978-token prompt gives
+    // one trace hash and one logits hash at --chunk 1, 8 and 512
+    // (--prefill-hash, the exact rung), and 24 greedy tokens at 256 and 512 are
+    // the same bytes. The cost is workspace VRAM, 88 MiB -> 113 MiB.
+    int chunk = 512;
     int kv_quant = 0; // 0 = f16 KV, 1 = int8 (see EngineConfig::kv_quant)
     int device = 0;
     int threads = 0;
@@ -131,7 +139,7 @@ void usage() {
         "                        as given (omit the flag for interactive)\n"
         "  --max-tokens N        tokens to generate (default 256)\n"
         "  --ctx N               KV capacity in tokens (default 4096)\n"
-        "  --chunk N             prefill batch size (default 256)\n"
+        "  --chunk N             prefill batch size (default 512)\n"
         "  --kv-quant f16|int8   K/V cache format (default f16). int8 stores each\n"
         "                        row as bytes plus one f32 scale per 32 values, 1.8x\n"
         "                        smaller; both backends implement it, and on the card\n"

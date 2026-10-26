@@ -28,7 +28,11 @@ struct Args {
     int port = 8080;        // fallback when neither --port nor KRK_PORT is set
     bool port_set = false;  // distinguishes the flag from the default
     int ctx = 4096;
-    int chunk = 256;
+    // 512 for the same measured reason as the CLI: the expert set is re-read
+    // once per chunk, so the pass count is ceil(prompt/chunk) (35B-A3B, 4096
+    // tokens: 397.1 tok/s at 256 against 462.6 at 512), and the exact-rung
+    // hashes are identical at 1, 8 and 512.
+    int chunk = 512;
     int kv_quant = 0;  // 0 = f16 KV, 1 = int8 (EngineConfig::kv_quant)
     // rows>1 GEMM on the throughput rung, matching the CLI's default: the exact
     // grid costs 36% of a chunk on Qwen3.5-35B-A3B (147.0 -> 225.1 tok/s) for a
@@ -66,7 +70,7 @@ void usage() {
         "  --host HOST           bind address (default 0.0.0.0)\n"
         "  --port N              TCP port (default $KRK_PORT, else 8080)\n"
         "  --ctx N               KV capacity in tokens (default 4096)\n"
-        "  --chunk N             prefill batch size (default 256)\n"
+        "  --chunk N             prefill batch size (default 512)\n"
         "  --kv-quant f16|int8   K/V cache format (default f16): int8 is 1.8x smaller\n"
         "                        and refuses on a backend whose attention kernels do\n"
         "                        not read the layout\n"

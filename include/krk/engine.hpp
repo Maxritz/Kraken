@@ -29,7 +29,11 @@ class DflashDraft;
 struct EngineConfig {
     std::string model_path;
     i32 n_ctx = 4096;        // KV capacity (tokens)
-    i32 prefill_chunk = 256; // prompt tokens per batched forward
+    // Prompt tokens per batched forward. 512 because the routed expert set is
+    // re-read once per chunk: 35B-A3B at a 4096-token prompt measured 397.1
+    // tok/s at 256 against 462.6 at 512, and the exact-rung hashes agree at
+    // chunk 1, 8 and 512 (test_prefill_chunk_bitexact's 512 arm).
+    i32 prefill_chunk = 512;
     // Diagnostics: fold every stage of every prefill row into one hash
     // (see Engine::prefill_trace_hash). --prefill-hash sets it; it is the
     // only observable that sees a one-ulp difference in a row that is
