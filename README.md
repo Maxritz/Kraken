@@ -292,7 +292,7 @@ Grouped by what you are changing. Defaults are the compiled-in ones.
 | `--ctx N` | 4096 | KV capacity in tokens |
 | `--chunk N` | 512 | prefill batch size. The routed expert set is re-read once per chunk, so the pass count is `ceil(prompt/chunk)`; 512 measured +16% over 256 on a 4K prompt and is bit-exact against chunk 1 (see the prefill section) |
 | `--kv-quant f16\|int8` | f16 | K/V cache format; int8 is 1.8x smaller |
-| `--prefill exact\|fast` | fast | fast uses the matrix cores but breaks chunk-invariance |
+| `--prefill exact\|fast` | fast | fast takes the rows>1 GEMM **and** the hd-256 prefill attention to the matrix cores; it is not decode-identical. exact keeps both on the bit-exact path, which is what a hash is recorded from |
 | `--fast-prefill` | - | old spelling of `--prefill fast`, kept for scripts |
 | `--prefill-hash` | - | hash the last-position logits and exit; forces exact |
 | `--kv-hot-mb N` | 0 = auto | KV HOT tier in VRAM |
@@ -1385,17 +1385,50 @@ decode row's arithmetic -- per-key running max, keys split across its 8 warps,
 the same merge -- so a chunked prefill writes the bytes a decode step would.
 Tiel gives `613eb9b3` at `--chunk 1`, `2` and `8` where `2..8` used to give a
 different hash from `1`, and `kraken-bench --bitexact` reports all 24 attention
-cases bit-identical. It is also **faster than what it replaced**, which is why
-it is now the only prefill formulation: +10.4% prefill at a 170-token prompt
-and +113% at 3400 tokens on Qwen3.5-9B, +80% on Phi-3.5 (hd 96) at 2760
-tokens -- same text in every pair. `KRK_ATTN_BEXACT=0` is the arm that falls
-back to the tiled kernel. The query-tiled kernel and its probe are deleted;
-the tiled kernel survives only for a windowed layer, a non-causal call and a
-head width outside 64..256 in steps of 32. Two other kernels still are not
-chunk-invariant -- the GEMM tile rung from 9 rows up, and the recurrent
+cases bit-identical. It is also **faster than what it replaced**: +10.4% prefill
+at a 170-token prompt and +113% at 3400 tokens on Qwen3.5-9B, +80% on Phi-3.5
+(hd 96) at 2760 tokens -- same text in every pair. `KRK_ATTN_BEXACT=0` is the
+arm that falls back to the tiled kernel. The query-tiled kernel and its probe
+are deleted; the tiled kernel survives only for a windowed layer, a non-causal
+call and a head width outside 64..256 in steps of 32. Two other kernels still
+are not chunk-invariant -- the GEMM tile rung from 9 rows up, and the recurrent
 block's conv/scan at rows>1 -- so a hybrid's text can still depend on the
 chunk size away from attention; see `AGENTS.md`, "Chunk invariance was an
 ATTENTION property".
+
+**hd 256 gets a second prefill arm, and it belongs to the fast rung.**
+`attention_wmma_kernel` (`src/hip/kernels/attention.hpp`) runs 16 query rows per
+block with K/V staged once per 32-key group and shared by all 16, and puts
+**both** matmuls on `v_wmma_f32_16x16x16_f16`. It is not bit-identical to the
+decode row -- that is the trade -- so it is the fast rung's arm and never the
+one a hash is recorded from: `--prefill exact` and `--prefill-hash` both keep
+`attention_bexact_kernel`, and `--prefill-hash` is unchanged by this (the gate's
+`bf32bbb3...` at chunks 1/2/8/16/32 still matches). What it *does* keep is
+chunk invariance of its own arithmetic: a row reads K/V in absolute 32-key
+groups from 0 and its MMA output row does not depend on the other 15 rows, so
+the row-tile split cannot move a byte -- `kraken-bench --bitexact` pins that as
+**6 of 6 identical** (hd 256/16 heads, 16/32/48 rows, 64 and 200 keys: one call
+of N rows against `ceil(N/16)` calls of one tile), and the same arm requires the
+matrix-core output to DIFFER from the bit-exact one, so a kernel that never
+launched cannot pass it. Red construction: making the kernel's key bound depend
+on the tile start (`pos0 + (t0 & 16) + n_rows`) fails exactly the 48-row arms and
+exits 1; reverted, 6 of 6 and 24 of 24 f16 identity cases stay green.
+
+What it is worth is a long-context question, not a 4K one. On
+Qwen3.5-35B-A3B (hd 256, 8 of 40 layers attending) at a 4140-token prompt and
+`--chunk 512`, total attention time over 90 calls is **44.9 ms on the matrix
+cores against 54.9 ms bit-exact and 75.9 ms on the tiled kernel** (median of 3
+interleaved runs; the same three arms read 42.6/50.2/52.1 one run earlier, so
+treat 5 ms as this measurement's resolution) -- an 18% cut of an op that is
+**~0.5% of that prefill**, so the end-to-end number does not move (479 against
+383-495 tok/s across runs is the expert tier's own spread, not this kernel). The
+pareto at that prompt is routing 8547 ms, experts 4780 ms, attention ~50 ms:
+this arm is for a context where attention is no longer a rounding error, and it
+is deliberately not sold as a prefill win at 4K. Two cautions for anyone
+re-measuring it: attention times are only comparable **within** a rung
+(`--prefill exact` reads 335-417 ms for every one of the three kernels, because
+the rung's own queue dominates the recorder's device spans), and
+`KRK_ATTN_WMMA=0|1` overrides the rung for A/B runs.
 
 The suite carries that check as a gate now, so a regression fails a run instead
 of a review: `./build-hip/kraken-tests --run-group test_prefill_chunk_bitexact`

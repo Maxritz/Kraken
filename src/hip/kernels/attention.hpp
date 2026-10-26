@@ -26,6 +26,10 @@
 
 #include "normalize.hpp"
 #include "dequant.hpp" // embed_kernel's device dequant helpers
+// The 16x16x16 fragment loaders and the gfx12 slot map, shared with the GEMM.
+// One definition of the fragment layout is what keeps this kernel and the
+// prefill GEMM reading the same lanes for the same (row, column).
+#include "gemm.hpp"
 
 namespace krk {
 
@@ -1081,6 +1085,295 @@ inline void attention_bexact(void *out, const void *q, const void *kcache,
     }
 #undef KRK_ATTN_BEXACT
 }
+
+// ---------------------------------------------------------------------------
+// flash attention — prefill on the matrix cores (hd 256)
+//
+// The bit-exact kernel above is a decode-shaped formulation on purpose: it
+// reproduces attention_decode_kernel's arithmetic so a chunked prefill and a
+// decode step agree bit for bit, which is what the chunk-invariance gate pins.
+// That identity costs the matrix cores: every (row, key) score is one lane dot,
+// so a 512-row chunk runs at a fraction of the card. The figure that motivated
+// this file -- "3.16 s of a 10.31 s prefill, 19.8 ms a call" on the 35B-A3B at
+// 4096 tokens -- does NOT reproduce on the current tree and must not be quoted:
+// re-measured at 4140 tokens with `KRK_TIME=attention`, all 90 calls together
+// cost 54.9 ms bit-exact and 75.9 ms on the tiled kernel (0.6-0.8 ms a call),
+// i.e. attention is ~0.5% of that prefill, not 30%. Same trap as the `--prefill`
+// rung elsewhere in this repo: a device span is only comparable within one rung
+// (under `--prefill exact` the same three kernels read 335/417/338 ms), so a
+// number lifted without its rung is not a measurement. What survives is the
+// ordering -- matrix cores 44.9 ms < bit-exact 54.9 < tiled 75.9 -- and that is
+// the whole claim this file makes.
+//
+// This is the throughput arm for the same shapes, and it is selected first:
+// 16 query rows per block, K and V staged once per 32-key group and shared by
+// all 16 rows, and BOTH matmuls on v_wmma_f32_16x16x16_f16. It is NOT
+// bit-identical to the decode row -- that is the trade -- so it is never the
+// arm a hash is recorded from: `--prefill-hash` pins the bit-exact kernel.
+// Its own chunk invariance IS exact: every row walks absolute 32-key groups
+// from 0, so a row's arithmetic does not depend on how many rows share its
+// block or on where the chunk boundary fell.
+//
+// Why 16 rows and four waves: the 16x16 accumulator gives 8 f32 slots a lane
+// for rows 8*(lane>>4)+g at column lane&15, so a 16-row tile is one MMA and a
+// row's 16 keys live in the 16 lanes of one half-wave. The PV accumulator is
+// 16 rows x 256 channels = 128 f32 a lane if one wave owns it, which is why
+// the output is split four ways (64 channels each, 4 n-fragments, 32 f32 a
+// lane). V is staged transposed because a B fragment wants its reduction
+// index contiguous, and for PV the reduction index is the KEY.
+// ---------------------------------------------------------------------------
+
+#if defined(KRK_WMMA_COMPILED)
+
+constexpr int kAwRows = 16;                  // query rows per block
+constexpr int kAwKeys = 32;                  // keys per staged group
+constexpr int kAwWaves = 4;                  // one 64-channel slice each
+constexpr int kAwThreads = kAwWaves * kWaveSize;
+constexpr int kAwDim = 256;                  // the head width this is written for
+constexpr int kAwSlice = kAwDim / kAwWaves;  // 64 channels a wave
+constexpr int kAwPad = 8;                    // stride padding, both layouts
+constexpr int kAwStrideHd = kAwDim + kAwPad;
+constexpr int kAwStrideKv = kAwKeys + kAwPad;
+
+// The two LDS strides the shared fragment loaders take from a config.
+struct aw_cfg_hd {
+    static constexpr int BK = kAwDim;
+    static constexpr int LD_PAD = kAwPad;
+};
+struct aw_cfg_kv {
+    static constexpr int BK = kAwKeys;
+    static constexpr int LD_PAD = kAwPad;
+};
+
+__host__ __device__ __forceinline__ size_t attn_wmma_smem_bytes() {
+    const size_t f16 = sizeof(_Float16) *
+                       (static_cast<size_t>(kAwRows) * kAwStrideHd +
+                        static_cast<size_t>(kAwKeys) * kAwStrideHd +
+                        static_cast<size_t>(kAwWaves) * kAwSlice * kAwStrideKv +
+                        static_cast<size_t>(kAwRows) * kAwStrideKv);
+    const size_t f32 = sizeof(f32) * static_cast<size_t>(2 * kAwRows * 16 +
+                                                         3 * kAwRows);
+    return f16 + f32;
+}
+
+__global__ void __launch_bounds__(kAwThreads)
+    attention_wmma_kernel(_Float16 *__restrict__ out,
+                          const _Float16 *__restrict__ q,
+                          const _Float16 *__restrict__ kcache,
+                          const _Float16 *__restrict__ vcache, i64 n_head,
+                          i64 n_kv, i64 hd, i64 n_tok, i64 pos0,
+                          i64 pos_stride, f32 scale,
+                          const f32 *__restrict__ sinks) {
+    extern __shared__ u8 smem[];
+    _Float16 *q_sh = reinterpret_cast<_Float16 *>(smem);
+    _Float16 *k_sh = q_sh + kAwRows * kAwStrideHd;
+    _Float16 *v_sh = k_sh + kAwKeys * kAwStrideHd;
+    _Float16 *p_sh = v_sh + kAwWaves * kAwSlice * kAwStrideKv;
+    f32 *s_sh = reinterpret_cast<f32 *>(p_sh + kAwRows * kAwStrideKv);
+    f32 *rm_sh = s_sh + 2 * kAwRows * 16; // running max, per query row
+    f32 *rl_sh = rm_sh + kAwRows;         // running denominator
+    f32 *ra_sh = rl_sh + kAwRows;         // this group's rescale factor
+
+    const i64 h = blockIdx.x;
+    const i64 t0 = static_cast<i64>(blockIdx.y) * kAwRows;
+    const int n_rows = static_cast<int>(n_tok - t0 < kAwRows ? n_tok - t0
+                                                             : kAwRows);
+    if (n_rows <= 0) return;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int wave = tid / kWaveSize;
+    const int lane = tid % kWaveSize;
+    const i64 n_rep = n_kv > 0 ? n_head / n_kv : 1;
+    const i64 hkv = n_rep > 0 ? h / n_rep : 0;
+    const i64 kstride = attn_kv_stride(pos_stride);
+    const _Float16 *khead = kcache + hkv * hd;
+    const _Float16 *vhead = vcache + hkv * hd;
+    const _Float16 *qbase = q + (t0 * n_head + h) * hd;
+    // The last row of this block sees the most keys; every row masks the rest.
+    const i64 n_keys = pos0 + t0 + n_rows;
+    const f32 sink_add = sinks ? sinks[h] : 0.0f;
+    const bool sunk = sink_add != 0.0f;
+
+    // ---- Q staged once (16 rows x 256) ----------------------------------
+    for (int i = tid; i < kAwRows * kAwStrideHd; i += kAwThreads) {
+        const int r = i / kAwStrideHd;
+        const int d = i % kAwStrideHd;
+        q_sh[i] = (r < n_rows && d < kAwDim)
+                      ? qbase[static_cast<i64>(r) * n_head * hd + d]
+                      : static_cast<_Float16>(0);
+    }
+    if (tid < kAwRows) {
+        rm_sh[tid] = -1.0e30f;
+        rl_sh[tid] = 0.0f;
+        ra_sh[tid] = 1.0f;
+    }
+    __syncthreads();
+
+    constexpr int NF = kAwSlice / 16;
+    v8float acc[NF]; // rows x this wave's 64 channels
+#pragma unroll
+    for (int nf = 0; nf < NF; nf++)
+#pragma unroll
+        for (int g = 0; g < 8; g++) acc[nf][g] = 0.0f;
+
+    for (i64 k0 = 0; k0 < n_keys; k0 += kAwKeys) {
+        const int kg = static_cast<int>(
+            n_keys - k0 < kAwKeys ? n_keys - k0 : kAwKeys);
+        // ---- stage K[kg][256] and this wave's V slice transposed ----------
+        for (int i = tid; i < kg * kAwStrideHd; i += kAwThreads) {
+            const int j = i / kAwStrideHd;
+            const int d = i % kAwStrideHd;
+            k_sh[i] = d < kAwDim
+                          ? khead[(k0 + j) * kstride + d]
+                          : static_cast<_Float16>(0);
+        }
+        _Float16 *vt = v_sh + static_cast<i64>(wave) * kAwSlice * kAwStrideKv;
+        for (int i = lane; i < kAwSlice * kAwStrideKv; i += kWaveSize) {
+            const int dloc = i / kAwStrideKv;
+            const int kk = i % kAwStrideKv;
+            vt[i] = kk < kg
+                        ? vhead[(k0 + kk) * kstride + wave * kAwSlice + dloc]
+                        : static_cast<_Float16>(0);
+        }
+        __syncthreads();
+
+        // ---- scores: waves 0 and 1 own one 16-key tile each ---------------
+        if (wave < 2) {
+            v8float sc;
+#pragma unroll
+            for (int g = 0; g < 8; g++) sc[g] = 0.0f;
+            _Float16 af[kFrag];
+            _Float16 bf[kFrag];
+            const _Float16 *ks = k_sh + wave * 16 * kAwStrideHd;
+            for (int k = 0; k < kAwDim; k += 16) {
+                wmma_load_a<aw_cfg_hd>(q_sh, 0, k, lane, af);
+                wmma_load_b<aw_cfg_hd>(ks, 0, k, lane, bf);
+                wmma_mma(sc, af, bf);
+            }
+#pragma unroll
+            for (int g = 0; g < 8; g++) {
+                int i, j;
+                wmma_slot(g, lane, &i, &j);
+                s_sh[(wave * kAwRows + i) * 16 + j] = sc[g] * scale;
+            }
+        }
+        __syncthreads();
+
+        // ---- online softmax, one thread per query row --------------------
+        // Sixteen threads scanning 32 staged scores is a few hundred LDS
+        // reads; it is noise beside the 32 MMAs of one group, and it keeps
+        // the row state (max, denominator, rescale) in ONE place instead of
+        // replicated per wave.
+        if (tid < kAwRows) {
+            const int r = tid;
+            const i64 p = pos0 + t0 + r;
+            f32 tmax = -1.0e30f;
+            for (int T = 0; T < 2; T++)
+                for (int j = 0; j < 16; j++) {
+                    const int jj = T * 16 + j;
+                    if (jj >= kg || k0 + jj > p) continue;
+                    const f32 sc = s_sh[(T * kAwRows + r) * 16 + j];
+                    tmax = fmaxf(tmax, sc);
+                }
+            const f32 mold = rm_sh[r];
+            const f32 mnew = fmaxf(mold, tmax);
+            const f32 alpha = __expf(mold - mnew);
+            f32 sum = 0.0f;
+            for (int T = 0; T < 2; T++)
+                for (int j = 0; j < 16; j++) {
+                    const int jj = T * 16 + j;
+                    const bool vis = jj < kg && k0 + jj <= p;
+                    const f32 e = vis
+                                      ? __expf(s_sh[(T * kAwRows + r) * 16 + j] - mnew)
+                                      : 0.0f;
+                    p_sh[r * kAwStrideKv + jj] = static_cast<_Float16>(e);
+                    sum += e;
+                }
+            rm_sh[r] = mnew;
+            ra_sh[r] = alpha;
+            rl_sh[r] = rl_sh[r] * alpha + sum;
+        }
+        __syncthreads();
+
+        // ---- P x V on the matrix cores, one 64-channel slice per wave -----
+        _Float16 af[kFrag];
+        _Float16 bf[kFrag];
+        f32 al[kFrag];
+#pragma unroll
+        for (int g = 0; g < 8; g++) {
+            int i, j;
+            wmma_slot(g, lane, &i, &j);
+            al[g] = ra_sh[i];
+        }
+#pragma unroll
+        for (int nf = 0; nf < NF; nf++)
+#pragma unroll
+            for (int g = 0; g < 8; g++) acc[nf][g] *= al[g];
+        for (int kf = 0; kf < 2; kf++) {
+            wmma_load_a<aw_cfg_kv>(p_sh, 0, kf * 16, lane, af);
+#pragma unroll
+            for (int nf = 0; nf < NF; nf++) {
+                wmma_load_b<aw_cfg_kv>(vt, nf * 16, kf * 16, lane, bf);
+                wmma_mma(acc[nf], af, bf);
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- normalise and store -------------------------------------------
+#pragma unroll
+    for (int nf = 0; nf < NF; nf++)
+#pragma unroll
+        for (int g = 0; g < 8; g++) {
+            int i, j;
+            wmma_slot(g, lane, &i, &j);
+            if (i >= n_rows) continue;
+            f32 l = rl_sh[i];
+            if (sunk) l += __expf(sink_add - rm_sh[i]);
+            const f32 inv = l > 0.0f ? 1.0f / l : 0.0f;
+            _Float16 *orow = out + ((t0 + i) * n_head + h) * hd;
+            orow[wave * kAwSlice + nf * 16 + j] =
+                static_cast<_Float16>(acc[nf][g] * inv);
+        }
+}
+
+// True when the kernel was launched, false when the device cannot hold its
+// LDS (then the caller falls through to the bit-exact arm).
+inline bool attention_wmma(void *out, const void *q, const void *kcache,
+                           const void *vcache, i64 n_head, i64 n_kv, i64 hd,
+                           i64 n_tok, i64 pos0, i64 pos_stride, f32 scale,
+                           int lds_bytes, hipStream_t stream = nullptr,
+                           const f32 *sinks = nullptr) {
+    const size_t smem = attn_wmma_smem_bytes();
+    if (static_cast<int>(smem) > lds_bytes) return false;
+    hipFuncSetAttribute(
+        reinterpret_cast<const void *>(&attention_wmma_kernel),
+        hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+    const dim3 g(static_cast<unsigned>(n_head),
+                 static_cast<unsigned>((n_tok + kAwRows - 1) / kAwRows));
+    attention_wmma_kernel<<<g, kAwThreads, smem, stream>>>(
+        static_cast<_Float16 *>(out), static_cast<const _Float16 *>(q),
+        static_cast<const _Float16 *>(kcache), static_cast<const _Float16 *>(vcache),
+        n_head, n_kv, hd, n_tok, pos0, pos_stride, scale, sinks);
+    return true;
+}
+
+// Whether this build has the kernel at all: the widths and formats it is
+// written for, and a device that compiles the gfx12 matrix core it uses.
+inline bool attention_wmma_ok(i64 hd, bool kv_int8, i64 window) {
+    return hd == kAwDim && !kv_int8 && window == 0;
+}
+
+#else // !KRK_WMMA_COMPILED
+
+inline bool attention_wmma_ok(i64, bool, i64) { return false; }
+
+inline bool attention_wmma(void *, const void *, const void *, const void *, i64,
+                           i64, i64, i64, i64, i64, f32, int,
+                           hipStream_t = nullptr, const f32 * = nullptr) {
+    return false;
+}
+
+#endif
 
 // ---------------------------------------------------------------------------
 // fused decode chain: RoPE + KV append + attention, one launch

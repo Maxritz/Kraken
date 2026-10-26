@@ -950,6 +950,13 @@ public:
     virtual void attention(void *out, const void *q, const void *kcache,
                            const void *vcache, const AttnDesc &d) = 0;
 
+    // Pinned by --prefill-hash: every prefill row must be produced by the same
+    // arithmetic a decode step uses, because that hash is the observable a
+    // chunk-invariance claim is recorded from. A backend with a faster
+    // approximate prefill (a matrix-core flash attention, say) keeps it out of
+    // this mode rather than making the hash depend on which kernel ran.
+    virtual void set_attn_hash_mode(bool) {}
+
     // Quantized KV. A backend that cannot read a format says so instead of
     // running the f16 path over int8 bytes, which would be fluent nonsense:
     // Engine::init refuses the run by name when this answers false.

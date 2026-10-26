@@ -2737,6 +2737,32 @@ public:
         return v;
     }
 
+    // The matrix-core prefill arm (kernels/attention.hpp, attention_wmma_kernel):
+    // 16 query rows per block and both matmuls on the gfx12 matrix cores.
+    //
+    // It belongs to the FAST rung, not to the default on its own: its per-row
+    // arithmetic is chunk-invariant (every row walks absolute 32-key groups from
+    // 0, so the split of rows into 16-row tiles cannot change a byte) but it is
+    // not bit-identical to the decode row, so a prefill written with it does not
+    // reproduce what `--chunk 1` writes. `--prefill exact` and `--prefill-hash`
+    // both promise that identity, so the rung decides: fast (the default, and
+    // KRK_GEMM_EXACT=0 -- that is the flag the CLI sets for it) turns this on,
+    // exact leaves it off and takes the bit-exact kernel. An explicit
+    // KRK_ATTN_WMMA=1|0 outranks the rung for A/B runs, which is the arm the
+    // bench and the measurements below drive.
+    // Read per call, not cached: `kraken-bench --bitexact` flips it inside one
+    // process to run the matrix-core rows and the identity rows in the same
+    // sweep, and an attention call is once per layer per chunk, not per row.
+    static bool attn_wmma_on() {
+        if (const char *e = std::getenv("KRK_ATTN_WMMA")) {
+            if (*e) return std::string(e) != "0";
+        }
+        const char *g = std::getenv("KRK_GEMM_EXACT");
+        return g && *g && std::string(g) == "0";
+    }
+    void set_attn_hash_mode(bool on) override { attn_hash_ = on; }
+    bool attn_hash_mode() const { return attn_hash_; }
+
     // Prefill (n_tok > 1) with decode's own arithmetic, so a chunked prefill
     // writes the bytes a decode step would. On by default; KRK_ATTN_BEXACT=0
     // restores the query-tiled kernel, which is the A/B arm and the fallback
@@ -3811,6 +3837,17 @@ public:
             return;
         }
 
+        // Matrix-core prefill (see attention_wmma_kernel): 16 query rows per
+        // block over shared K/V groups, both matmuls on the matrix cores. Not
+        // bit-identical to the decode row -- that is the trade for the cores --
+        // so hash mode skips it and pins the exact arm below.
+        if (d.n_tok > 1 && d.causal && d.skip_from < 0 && attn_wmma_on() &&
+            !attn_hash_mode() && attention_wmma_ok(d.hd, d.kv_int8, d.window) &&
+            attention_wmma(out, q, kc, vc, d.n_head, d.n_kv, d.hd, d.n_tok,
+                           d.pos0, pstride, d.scale, caps_.lds_bytes, nullptr,
+                           d.sinks))
+            return;
+
         // Bit-exact prefill (see attention_bexact_kernel): the same arithmetic
         // as the decode row above, over a tile of query rows that shares the
         // staged K/V -- so a prefill chunk and a decode step agree bit for
@@ -4683,6 +4720,9 @@ private:
     size_t paged_chunk_ = kPagedChunk;
     // Private stream + event for pinned-source weight staging (dense streaming).
     hipStream_t pinned_stream_ = nullptr;
+    // --prefill-hash is on: keep the prefill on the bit-exact arm, because the
+    // hash it prints is the observable a chunk-invariance claim rests on.
+    bool attn_hash_ = false;
     hipEvent_t pinned_ev_ = nullptr;
     // A ring of bracket pairs for pinned_dma_ms(); see pin_fold_ for why one
     // pair was not enough to measure anything under a deep queue.

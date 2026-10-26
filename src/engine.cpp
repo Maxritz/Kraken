@@ -767,6 +767,12 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     moe_predictor_.configure(0, 0, moe_predict_history());
     trace_hash_on_ = cfg.trace_hash;
     trace_stage_.clear();
+    // The hash is recorded from whatever kernel actually ran, so the backend
+    // has to know it is in hash mode BEFORE the first prefill: with the
+    // matrix-core prefill available, a hash taken from it would be a hash of
+    // the wrong arithmetic and the chunk-invariance claim would be about a
+    // kernel nobody ships by default.
+    if (be_) be_->set_attn_hash_mode(trace_hash_on_);
     // Size the CPU worker pool before the first forward pass.
     // 0 (the default) keeps the pool's own sizing: one worker per
     // hardware thread minus the calling thread.

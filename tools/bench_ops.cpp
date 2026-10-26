@@ -1679,6 +1679,126 @@ BitExact attn_rows_case(Backend *be, const AttnCase &c, i64 n_tok, i64 n_keys) {
     return r;
 }
 
+// ---- matrix-core prefill (hd 256): row-tile invariance ----------------------
+//
+// attention_wmma_kernel is the one prefill kernel here that is deliberately
+// NOT bit-identical to a decode row: both matmuls run on the matrix cores, so
+// its K walk is 16-wide and its PV reduction is one MMA per 16 keys. What it
+// does claim is that a row's output does not depend on how many OTHER rows
+// shared its launch -- a row reads K/V in absolute 32-key groups from 0 and the
+// MMA leaves its output row independent -- which is what makes the fast rung
+// chunk-invariant even though it is not decode-identical. So the arm is not
+// "decode against prefill" (that pair must differ, and the identity rows above
+// would flag it): it is one call of N rows against ceil(N/16) calls of one
+// 16-row tile each, and it is enforced. If this fails, an hd-256 model's text
+// depends on the chunk size on the fast rung, which no exact-rung gate can see.
+// Two answers, because the arm needs both to mean anything:
+//   tile      -- one call of N rows against ceil(N/16) calls of one tile, which
+//                must be IDENTICAL;
+//   vs_exact  -- the same row through the matrix cores and through the
+//                bit-exact kernel, which must DIFFER. Without the second the
+//                first passes just as well when the fast kernel is never
+//                reached (LDS too small, shape refused), i.e. when it measures
+//                the same kernel twice.
+struct AwCase {
+    BitExact tile;
+    i64 vs_exact = 0;
+    i64 n_vs = 0;
+};
+
+AwCase attn_wmma_tile_case(Backend *be, const AttnCase &c, i64 n_tok,
+                           i64 n_keys) {
+    AwCase out_r;
+    const size_t qsz = static_cast<size_t>(n_tok) *
+                       static_cast<size_t>(c.n_head) *
+                       static_cast<size_t>(c.hd);
+    const size_t ksz = static_cast<size_t>(n_keys) *
+                       static_cast<size_t>(c.n_kv) *
+                       static_cast<size_t>(c.hd);
+    std::vector<u16> q(qsz), k(ksz), v(ksz);
+    auto fill = [](std::vector<u16> &dst, u32 seed) {
+        u32 rng = seed;
+        for (u16 &h : dst) {
+            rng = rng * 1103515245u + 12345u;
+            const f32 f = static_cast<f32>((rng >> 20) & 0xff) / 255.0f - 0.5f;
+            h = fp32_to_fp16(f * 0.5f);
+        }
+    };
+    fill(q, 17u);
+    fill(k, 19u);
+    fill(v, 23u);
+
+    void *qd = be->alloc(q.size() * 2);
+    void *kd = be->alloc(k.size() * 2);
+    void *vd = be->alloc(v.size() * 2);
+    void *one = be->alloc(qsz * 2);    // every row in one call
+    void *split = be->alloc(qsz * 2);  // one call per 16-row tile
+    be->upload(qd, q.data(), q.size() * 2, 0);
+    be->upload(kd, k.data(), k.size() * 2, 0);
+    be->upload(vd, v.data(), v.size() * 2, 0);
+
+    AttnDesc d;
+    d.n_head = c.n_head;
+    d.n_kv = c.n_kv;
+    d.hd = c.hd;
+    d.layer = 0;
+    d.layer_stride = static_cast<i64>(ksz);
+    d.pos_stride = c.n_kv * c.hd;
+    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(c.hd)));
+    d.causal = true;
+    d.window = 0;
+    const i64 pos0 = n_keys - n_tok;
+    const size_t row_elems = static_cast<size_t>(c.n_head) *
+                             static_cast<size_t>(c.hd);
+    const size_t row_bytes = row_elems * 2;
+
+    d.n_tok = n_tok;
+    d.pos0 = pos0;
+    be->attention(one, qd, kd, vd, d);
+    const i64 kAwRows = 16;
+    for (i64 t0 = 0; t0 < n_tok; t0 += kAwRows) {
+        const i64 n = std::min<i64>(kAwRows, n_tok - t0);
+        d.n_tok = n;
+        d.pos0 = pos0 + t0;
+        be->attention(static_cast<u8 *>(split) + static_cast<size_t>(t0) * row_bytes,
+                      static_cast<const u8 *>(qd) + static_cast<size_t>(t0) * row_bytes,
+                      kd, vd, d);
+    }
+
+    // The same rows through the bit-exact kernel, so a fast kernel that never
+    // launched cannot pass this arm by measuring bexact against itself.
+    void *exact = be->alloc(qsz * 2);
+#ifdef _WIN32
+    _putenv_s("KRK_ATTN_WMMA", "0");
+#else
+    setenv("KRK_ATTN_WMMA", "0", 1);
+#endif
+    d.n_tok = n_tok;
+    d.pos0 = pos0;
+    be->attention(exact, qd, kd, vd, d);
+#ifdef _WIN32
+    _putenv_s("KRK_ATTN_WMMA", "1");
+#else
+    setenv("KRK_ATTN_WMMA", "1", 1);
+#endif
+
+    std::vector<u16> a(qsz), b(qsz), x(qsz);
+    be->download(a.data(), one, a.size() * 2);
+    be->download(b.data(), split, b.size() * 2);
+    be->download(x.data(), exact, x.size() * 2);
+    out_r.tile = cmp_half(a, b, static_cast<i64>(qsz));
+    out_r.n_vs = static_cast<i64>(qsz);
+    for (size_t i = 0; i < qsz; i++)
+        if (a[i] != x[i]) out_r.vs_exact++;
+    be->release(qd);
+    be->release(kd);
+    be->release(vd);
+    be->release(one);
+    be->release(split);
+    be->release(exact);
+    return out_r;
+}
+
 // ---- int8 K/V --------------------------------------------------------------
 //
 // Two separate claims, measured separately because they fail for different
@@ -1979,6 +2099,82 @@ i64 arm_rows_bitexact(Backend *be) {
             }
         }
     }
+    // ---- matrix-core prefill: row-tile invariance (hd 256 only) -----------
+    //
+    // Forced on for these rows and restored after, so the identity rows above
+    // keep measuring the bit-exact kernel and this arm keeps measuring the one
+    // that is allowed to differ from decode. The arm count is printed: an arm
+    // that cannot launch (LDS too small) must not read as a pass.
+    std::printf("\nmatrix-core prefill (hd 256): one call of N rows against one "
+                "call per 16-row tile:\n");
+    i64 aw_bad = 0;
+    i64 aw_arms = 0;
+    {
+#ifdef _WIN32
+        char *prev = nullptr;
+        size_t prev_len = 0;
+        if (_dupenv_s(&prev, &prev_len, "KRK_ATTN_WMMA") != 0) prev = nullptr;
+        const std::string saved = prev ? prev : "";
+        std::free(prev);
+        _putenv_s("KRK_ATTN_WMMA", "1");
+#else
+        const char *pe = std::getenv("KRK_ATTN_WMMA");
+        const std::string saved = pe ? pe : "";
+        setenv("KRK_ATTN_WMMA", "1", 1);
+#endif
+        for (const AttnCase &c : attn) {
+            if (c.hd != 256) continue;
+            char tag[32];
+            std::snprintf(tag, sizeof tag, "hd%lld/%lldh",
+                          static_cast<long long>(c.hd),
+                          static_cast<long long>(c.n_head));
+            for (i64 n_keys : attn_keys) {
+                for (i64 nrows : {16, 32, 48}) {
+                    if (nrows > n_keys) continue;
+                    const AwCase w = attn_wmma_tile_case(be, c, nrows, n_keys);
+                    aw_arms++;
+                    if (w.tile.differ) aw_bad++;
+                    print_bitexact("attn-wmma", tag, c.n_head * c.hd, n_keys,
+                                   nrows, nrows - 1, w.tile);
+                    // The kernel must have RUN: identical output to the exact
+                    // arm means it fell back and this row proved nothing.
+                    if (w.vs_exact == 0) {
+                        aw_bad++;
+                        std::printf("  %-14s %-5s in=%-5lld rows=%-3lld "
+                                    "VACUOUS: the matrix-core arm produced "
+                                    "the bit-exact kernel's own output, so it "
+                                    "never launched\n",
+                                    "attn-wmma", tag,
+                                    static_cast<long long>(n_keys),
+                                    static_cast<long long>(nrows));
+                    }
+                }
+            }
+        }
+#ifdef _WIN32
+        _putenv_s("KRK_ATTN_WMMA", saved.c_str());
+#else
+        if (saved.empty())
+            unsetenv("KRK_ATTN_WMMA");
+        else
+            setenv("KRK_ATTN_WMMA", saved.c_str(), 1);
+#endif
+    }
+    if (aw_arms == 0)
+        std::printf("  (no hd-256 case in this sweep -- the arm measured nothing)\n");
+    else if (aw_bad)
+        std::printf("\n%lld of %lld matrix-core arms change with the row-tile "
+                    "split. A 16-row tile's arithmetic must not depend on how "
+                    "many tiles shared its launch: that is what makes the fast "
+                    "rung chunk-invariant without being decode-identical.\n",
+                    static_cast<long long>(aw_bad),
+                    static_cast<long long>(aw_arms));
+    else
+        std::printf("\nmatrix-core prefill: %lld of %lld arms identical across "
+                    "the row-tile split.\n",
+                    static_cast<long long>(aw_arms),
+                    static_cast<long long>(aw_arms));
+
     // ---- int8 K/V: both claims, per kernel -------------------------------
     //
     // Only the layouts whose decode path exists (64/128/256) are on the f16
@@ -2030,7 +2226,10 @@ i64 arm_rows_bitexact(Backend *be) {
                     static_cast<long long>(q8_arms),
                     static_cast<long long>(q8_arms));
     }
-    return q8_bad; // the int8 layout is enforced; the f16 rows stay informational
+    // The int8 layout and the matrix-core row-tile split are enforced; the f16
+    // decode-against-prefill rows stay informational because the fast rung's
+    // kernel is allowed to differ there by design.
+    return q8_bad + aw_bad;
 }
 
 // Host->device copy rate, measured on the shapes the expert path actually

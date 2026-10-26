@@ -290,6 +290,48 @@ code, the README, or `docs/`.
   `gemv_m` re-reads the whole matrix per 8-row group, i.e. 32 passes over the
   weights for a 256-row prefill. A windowed (SWA) layer also stays on the tiled
   attention kernel by construction, for the `j_lo` reason above.
+- **hd 256 has a matrix-core prefill attention arm, and the thing that makes it
+  safe is not bit-identity but TILE identity.** `attention_wmma_kernel` runs 16
+  query rows per block, stages K/V once per 32-key group and shares it across
+  all 16 rows, and puts both matmuls on `v_wmma_f32_16x16x16_f16`. It is not
+  decode-identical -- the K walk is 16 wide and the PV reduction is one MMA per
+  16 keys -- so **it is wired to the rung, not to the default**: `--prefill fast`
+  (which sets `KRK_GEMM_EXACT=0`) gets it, `--prefill exact` and
+  `--prefill-hash` keep `attention_bexact_kernel`, and an explicit
+  `KRK_ATTN_WMMA=1|0` outranks the rung for A/B. The rung is the whole contract:
+  `--prefill exact` promises a hash, so a kernel that cannot produce one must
+  not be reachable there. `attn_wmma_on()` reads the environment **per call**,
+  not into a cached static, because `kraken-bench --bitexact` flips it inside
+  one process to measure both kernels.
+  What it claims instead of identity is that a row's output does not depend on
+  how many other rows shared its launch: every row walks absolute 32-key groups
+  from 0, and an MMA output row does not read the other 15. That is the property
+  `kraken-bench --bitexact` pins -- one call of N rows against `ceil(N/16)`
+  calls of one tile, **6 of 6 identical** at hd 256/16 heads, rows 16/32/48 and
+  64/200 keys -- and it is **enforced** (it adds to the exit status, unlike the
+  f16 decode-against-prefill rows). The same arm requires the matrix-core output
+  to DIFFER from the bit-exact one, because a kernel that refused its shape and
+  fell back would otherwise pass by measuring bexact against itself.
+  Red construction: `const i64 n_keys = pos0 + (t0 & 16) + n_rows;` -- a bound
+  that depends on the tile start -- fails exactly the 48-row arms (65516/196608
+  values, max 19797 ulp) and exits 1; reverted, 6 of 6 again and the 24 f16
+  identity rows stay green. 48 rows is the arm that catches it: with 32 rows the
+  mutation happens to give both arms the same bound, so a 16/32-only sweep would
+  have called it clean.
+  **It is a long-context arm, and saying otherwise would be a lie with a
+  measurement behind it.** Qwen3.5-35B-A3B, 4140-token prompt, `--chunk 512`,
+  `KRK_TIME=attention`: 90 calls total, median of 3 interleaved runs, **44.9 ms
+  on the matrix cores against 54.9 ms bit-exact and 75.9 ms tiled** -- an 18%
+  cut of an op that is ~0.5% of that prefill (routing 8547 ms, experts 4780 ms,
+  attention ~50 ms). End-to-end prefill does not move at 4K; the arm pays where
+  attention stops being a rounding error. A trap that cost a session: the three
+  kernels are only comparable WITHIN a rung. Under `--prefill exact` the same
+  three read 335/417/338 ms, so the rung's own queue is most of what the
+  recorder reports there -- do not quote either set as a kernel's cost without
+  naming its rung. Text is unaffected: 24 greedy tokens are identical at
+  `--chunk 8` and `--chunk 512` on both arms, and the hash gate's
+  `bf32bbb3...`/`e8d8efa9...` at chunks 1/2/8/16/32 and its `f034bf9b...` at 1/8/512
+  are unchanged.
 - **The int8 K/V cache is chunk-invariant on the device now, and the defect was a
   reduction order.** `--kv-quant int8` had every reader implemented and still
   produced three different hashes for one prompt (chunk 2 == chunk 4, chunk 1 and
