@@ -50,7 +50,7 @@ code, the README, or `docs/`.
   test_prefill_chunk_bitexact` builds a head_dim-64 / 8-head / 4-layer fixture,
   prefills one 64-token prompt at `--chunk 1`, `2` and `8` through
   `kraken.exe --prefill-hash`, and requires one hash across them. It runs in
-  the default suite (group 36 of 93, 26 checks) and the baseline carries it.
+  the default suite (group 36 of 95, 26 checks) and the baseline carries it.
   `--prefill-hash` prints two hashes and no text:
   `prefill-hash <trace> logits <row> prompt_tokens=N first=I`. The trace folds
   the embedding, every layer's attention output and every layer's hidden state
@@ -176,7 +176,7 @@ code, the README, or `docs/`.
   expectation wrong by one check, so a real mismatch can be constructed: it
   only tightens (a green run goes red, never the reverse), and the isolation
   check requires rc=1 from it, which is how the exit status is proved and not
-  just the checker. The whole sweep is 94 groups x 6 arms = **564 suite runs**,
+  just the checker. The whole sweep is 95 groups x 6 arms = **570 suite runs**,
   because an arm is a FULL suite run by construction: its claims are "every
   group the arm did not aim at still passes, with its own count" and the totals
   arithmetic, and neither survives scoping an arm to one group. Measured

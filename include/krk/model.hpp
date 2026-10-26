@@ -248,6 +248,24 @@ struct LayerWeights {
     // nemotron_h_moe uses Mamba-2 blocks which have different tensors than GDN:
     // ssm_in (input projection), ssm_d (optional D parameter), no ssm_alpha/beta.
     bool nemotron_ssm = false;  // This layer is a Mamba-2 SSM block (not GDN)
+    // ---- LFM2.5 short convolution (`lfm2moe`) ---------------------------
+    // A third recurrent block, and the only one that is not a scan: the whole
+    // mixer is a depthwise causal convolution over the last `kern` rows of its
+    // own input, gated by one of the two branches its projection also emits.
+    //   B, C, X = in_proj(x)            [n, 3*n_embd], three 2048-wide slices
+    //   y[t]    = sum_k conv[k, c] * X[t - (kern-1) + k, c]
+    //   z       = B * y + C * X
+    //   out     = out_proj(z)
+    // No activation between the conv and the gate, which is what separates it
+    // from the gated delta net's `conv1d_silu`.
+    bool lfm_conv = false;
+    QuantTensor sc_in;          // [n_embd, 3*n_embd]  B | C | X
+    QuantTensor sc_out;         // [n_embd, n_embd]
+    // The depthwise taps, already in the `w[k*ch + c]` layout every conv in
+    // this engine uses (`upload_conv1d`). F32 in every file that has one --
+    // 24 KiB a layer -- and the loader refuses another type rather than
+    // reinterpreting it.
+    QuantTensor sc_conv;        // [kern * n_embd]
     QuantTensor ssm_in;         // [inner_size, n_embd] - Mamba-2 input projection
     // NVFP4's global scale needs no field of its own: it is a property of the
     // TENSOR, so it lives on QuantTensor::gs -- see ssm_in.gs / ssm_out.gs.
@@ -530,6 +548,11 @@ struct ModelConfig {
     // `recurrent` is true when at least one layer is a delta-net layer, which
     // is what makes the engine allocate and carry the recurrent state.
     bool recurrent = false;
+    // LFM2.5: the recurrent layers are short convolutions, not delta nets. The
+    // FILE decides each layer's kind (it carries `shortconv.in_proj` on exactly
+    // the conv ones), so this flag only says the stack is that family -- the
+    // index arithmetic of `full_attention_interval` does not describe it.
+    bool lfm_conv = false;
     i32 full_attention_interval = 4; // every Nth layer keeps real attention
     i32 ssm_d_state = 128;           // state width == key/value head dim
     i32 ssm_dt_rank = 32;            // value heads
@@ -864,6 +887,27 @@ public:
 
     // ---- gated delta net geometry ---------------------------------------
     bool is_recurrent() const { return cfg_.recurrent; }
+    // Does this stack mix with LFM2.5's short convolution? Asked once at init
+    // to size the workspace, because the delta-net buffers are shaped by
+    // metadata this family does not carry.
+    bool has_lfm_conv() const {
+        for (const LayerWeights &L : layers_)
+            if (L.lfm_conv) return true;
+        return false;
+    }
+    // Can a speculative round rewind the sequence state to an accepted prefix?
+    //
+    // A delta-rule state cannot: it is a running product of decay and rank-1
+    // updates with no inverse, so a rejected suffix is unrecoverable and the
+    // sequence rewrite is what makes speculation safe there (src/engine.cpp,
+    // `all_accepted`). A shortconv ring can, and not because the ring holds
+    // history: it can because the engine keeps the ring DEEPER than the window
+    // (Engine::sc_hist_), so a row the round is about to rewrite is never the
+    // row the next convolution reads. Rewinding is then pointer arithmetic.
+    bool speculative_rewind_ok() const {
+        if (has_lfm_conv()) return true;
+        return !is_recurrent();
+    }
     i64 conv_dim() const { return cfg_.ssm_conv_dim; }
     i64 value_dim() const { return cfg_.ssm_value_dim; }
     i64 key_dim() const { return cfg_.ssm_key_dim; }

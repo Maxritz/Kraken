@@ -33,6 +33,7 @@
 #include "kernels/hadamard.hpp"
 #include "kernels/hc.hpp"
 #include "kernels/gather.hpp"
+#include "kernels/sc.hpp"
 #include "kernels/ple.hpp"
 #include "kernels/mla.hpp"
 #include "kernels/mla_shared.hpp"
@@ -4080,6 +4081,15 @@ public:
                                               static_cast<const _Float16 *>(key),
                                               static_cast<const _Float16 *>(qry),
                                               n_tok, hc, ne);
+    }
+
+    // LFM2.5's short convolution (kernels/sc.hpp). Two launches inside the one
+    // op -- the mixer and the history write -- because the write must not race
+    // the reads of the same call.
+    void shortconv(void *out, const void *proj, void *state, const void *w,
+                   i64 n_tok, i64 ch, i64 kern, i64 hist, i64 pos0) override {
+        KRK_TIME_OP("shortconv");
+        shortconv_launch(out, proj, state, w, n_tok, ch, kern, hist, pos0);
     }
 
     void conv1d_dw(void *out, const void *x, const void *w, i64 n_tok, i64 ch,

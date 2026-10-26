@@ -8472,6 +8472,380 @@ static PrefillProbe run_prefill_hash(const std::string &exe,
     return r;
 }
 
+// LFM2.5 (`lfm2moe`): 3 layers, two short-convolution mixers and one
+// attention layer, the last carrying a sigmoid-gated MoE. Small enough to prefll
+// in a second, shaped like the real 24B-A2B file in every respect the engine
+// branches on: a PER-LAYER head_count_kv array (0 on the conv layers), no
+// output_norm (the final norm is token_embd_norm), shortconv.conv as f32 taps,
+// expert_gating_func 2 and an exp_probs_b.bias.
+// `bad_tap` is the red construction the row pin needs: it writes the SAME
+// fixture with one coefficient of layer 0's convolution moved. Everything the
+// mixer is built from -- the ring, the gate, the three projections -- is byte
+// for byte what the good fixture has, so a row that moves here moved because
+// the mixer's own arithmetic contributed something different to the residual.
+static bool build_lfm2_gate_model(const std::string &path, int ctx = 64,
+                                  bool bad_tap = false) {
+    const int n_embd = 64, n_layer = 3, n_head = 4, hd = 16, n_kv = 2;
+    const int n_ff = 64, n_exp = 8, n_used = 3, ff_exp = 32;
+    const int vocab = 261;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", "lfm2moe");
+    b.meta_str("general.name", "kraken-lfm2-gate");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("lfm2moe.block_count", n_layer);
+    b.meta_u32("lfm2moe.context_length", ctx);
+    b.meta_u32("lfm2moe.embedding_length", n_embd);
+    b.meta_u32("lfm2moe.feed_forward_length", n_ff);
+    b.meta_u32("lfm2moe.attention.head_count", n_head);
+    // The array, not a scalar: the conv layers say 0 and only layer 2 attends.
+    b.meta_i32_array("lfm2moe.attention.head_count_kv", {0, 0, n_kv});
+    b.meta_u32("lfm2moe.attention.key_length", hd);
+    b.meta_f32("lfm2moe.attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32("lfm2moe.rope.freq_base", 1e7f);
+    b.meta_u32("lfm2moe.shortconv.l_cache", 3);
+    b.meta_u32("lfm2moe.leading_dense_block_count", 2);
+    b.meta_u32("lfm2moe.expert_count", n_exp);
+    b.meta_u32("lfm2moe.expert_used_count", n_used);
+    b.meta_u32("lfm2moe.expert_feed_forward_length", ff_exp);
+    b.meta_u32("lfm2moe.expert_gating_func", 2);
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    // NO output_norm: this family's final norm is the embedding's.
+    b.tensor_f32("token_embd_norm.weight", {u64(n_embd)}, ones(n_embd));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (l < 2) {
+            b.tensor_f16(p + "shortconv.in_proj.weight",
+                         {u64(n_embd), u64(3 * n_embd)},
+                         vec(static_cast<size_t>(n_embd) * 3 * n_embd,
+                             100 + l * 1000));
+            // f32 taps, [kern, ch] -- the layout the loader uploads verbatim.
+            std::vector<f32> taps = vec(static_cast<size_t>(3) * n_embd,
+                                        200 + l * 1000);
+            // The LAST tap row, not the first: a one-row prompt reads only
+            // `w[kern-1]` (the two older taps address p < 0 and are skipped),
+            // so moving `taps[0]` would change a coefficient this prompt never
+            // reads and the arm would report "identical" for a reason that has
+            // nothing to do with the pin. Measured the hard way.
+            if (bad_tap && l == 0)
+                taps[static_cast<size_t>(2) * n_embd] += 0.75f;
+            b.tensor_f32(p + "shortconv.conv.weight", {3, u64(n_embd)}, taps);
+            b.tensor_f16(p + "shortconv.out_proj.weight",
+                         {u64(n_embd), u64(n_embd)},
+                         vec(static_cast<size_t>(n_embd) * n_embd,
+                             300 + l * 1000));
+            b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                         vec(static_cast<size_t>(n_embd) * n_ff, 400 + l * 1000));
+            b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                         vec(static_cast<size_t>(n_embd) * n_ff, 500 + l * 1000));
+            b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                         vec(static_cast<size_t>(n_ff) * n_embd, 600 + l * 1000));
+        } else {
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                         vec(static_cast<size_t>(n_embd) * q_dim, 700));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, 800));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, 900));
+            b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                         vec(static_cast<size_t>(q_dim) * n_embd, 1000));
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+            b.tensor_f16(p + "ffn_gate_inp.weight", {u64(n_embd), u64(n_exp)},
+                         vec(static_cast<size_t>(n_embd) * n_exp, 1100));
+            b.tensor_f32(p + "exp_probs_b.bias", {u64(n_exp)},
+                         vec(static_cast<size_t>(n_exp), 1200));
+            const size_t gsz = static_cast<size_t>(n_embd) * ff_exp;
+            const size_t dsz = static_cast<size_t>(ff_exp) * n_embd;
+            const size_t ne = static_cast<size_t>(n_exp);
+            std::vector<f32> gate(gsz * ne), up(gsz * ne), down(dsz * ne);
+            for (size_t e = 0; e < ne; e++) {
+                for (size_t k = 0; k < gsz; k++) {
+                    gate[e * gsz + k] = wv(1300 + static_cast<i64>(k) +
+                                          static_cast<i64>(e) * 7919);
+                    up[e * gsz + k] = wv(1500 + static_cast<i64>(k) +
+                                         static_cast<i64>(e) * 7919);
+                }
+                for (size_t k = 0; k < dsz; k++)
+                    down[e * dsz + k] = wv(1700 + static_cast<i64>(k) +
+                                           static_cast<i64>(e) * 7919);
+            }
+            b.tensor_f16(p + "ffn_gate_exps.weight",
+                         {u64(n_embd), u64(ff_exp), u64(ne)}, gate);
+            b.tensor_f16(p + "ffn_up_exps.weight",
+                         {u64(n_embd), u64(ff_exp), u64(ne)}, up);
+            b.tensor_f16(p + "ffn_down_exps.weight",
+                         {u64(ff_exp), u64(n_embd), u64(ne)}, down);
+        }
+    }
+    return b.write(path);
+}
+
+// One CLI prefill of the LFM2 fixture. Same shape as run_prefill_hash, but
+// the tag is explicit so a --cpu arm and a device arm never share a capture.
+static PrefillProbe run_lfm_hash(const std::string &exe, const std::string &model,
+                                const std::string &prompt, int chunk, bool cpu) {
+    PrefillProbe r;
+    const std::string tag = cpu ? "-cpu" : "-dev";
+    const std::string o = "kraken-lfm-out-" + std::to_string(chunk) + tag + ".txt";
+    const std::string e = "kraken-lfm-err-" + std::to_string(chunk) + tag + ".txt";
+    std::string cmd = "\"" + exe + "\" -m \"" + model + "\" -p \"" + prompt +
+                      "\" --ctx 64 --chunk " + std::to_string(chunk) +
+                      " --greedy --prefill-hash" + (cpu ? " --cpu" : "") +
+                      " > \"" + o + "\" 2> \"" + e + "\"";
+#ifdef _WIN32
+    const std::string full = "call " + cmd;
+#else
+    const std::string full = cmd;
+#endif
+    r.rc = gate_exit_code(std::system(full.c_str()));
+    const std::string out = read_capture(o);
+    r.err = read_capture(e);
+    const size_t nl = out.find('\n');
+    r.banner = nl == std::string::npos ? out : out.substr(0, nl);
+    const size_t at = out.find("prefill-hash ");
+    if (at != std::string::npos) {
+        char tr[64] = {0}, lg[64] = {0};
+        int pt = -1, first = -1;
+        if (std::sscanf(out.c_str() + at,
+                        "prefill-hash %63s logits %63s prompt_tokens=%d first=%d",
+                        tr, lg, &pt, &first) == 4) {
+            r.trace = tr;
+            r.logits = lg;
+            r.prompt_tokens = pt;
+            r.first = first;
+            r.ok = true;
+        }
+    }
+    std::remove(o.c_str());
+    std::remove(e.c_str());
+    return r;
+}
+
+// Group: LFM2.5's short-convolution mixer and its per-layer KV.
+//
+// The mixer is the one block in this engine whose arithmetic is a CONVOLUTION
+// over a gated product: `bx = B*X`, then a causal depthwise window over bx, then
+// `C *`. Every step of it was measured against llama.cpp on the 24B-A2B file, and
+// three of the four things that made that file decode whitespace are pinned
+// here: NeoX rope pairing, normalized sigmoid expert weights, and the ring's f16
+// rounding. The last one is the reason this group drives the CLI rather than the
+// CPU backend alone -- the CPU ring is f32 and cannot see it.
+static void test_lfm2_shortconv() {
+    const std::string model = "kraken-lfm2-gate.gguf";
+    CHECK(build_lfm2_gate_model(model), "wrote the lfm2moe fixture");
+
+    // 1. The row's claim: the file LOADS with no KRK_ARCH_ALLOW_EXPERIMENTAL.
+    {
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string err;
+        const bool ok = m.load(*cpu, model, &err);
+        if (!ok)
+            std::fprintf(stderr, "  (lfm2moe refused: %s)\n", err.c_str());
+        CHECK(ok, "lfm2moe loads without an experimental hatch");
+        if (ok) {
+            const ModelConfig &c = m.cfg();
+            CHECK(c.lfm_conv, "the loader marks the family's conv mixer");
+            CHECK(m.has_lfm_conv(), "and the model reports a shortconv layer");
+            CHECK(c.n_dense_lead == 2, "the two leading dense blocks are read");
+            CHECK(c.router_sigmoid, "expert_gating_func 2 selects sigmoid");
+            CHECK(c.expert_w_norm == 1,
+                  "and the top-k sigmoid weights are sum-normalized");
+            CHECK(c.rope_neox, "RoPE pairs NeoX half-split");
+            CHECK(c.ssm_d_conv == 3, "shortconv.l_cache is the window");
+            int conv_layers = 0, attn_layers = 0;
+            for (int l = 0; l < static_cast<int>(m.layers().size()); l++) {
+                if (m.layers()[l].lfm_conv) conv_layers++;
+                if (m.layer_has_kv(l)) attn_layers++;
+            }
+            CHECK(conv_layers == 2, "two conv layers, one attention layer");
+            CHECK(attn_layers == 1,
+                  "and only the attention layer owns a KV cache");
+        }
+        delete cpu;
+    }
+
+    // 1b. The RECORDED row. The arms below pin a property -- that the ring
+    //     leaves the same rows at every chunk size -- and a mixer that is
+    //     chunk-invariant and WRONG passes every one of them: the plausible
+    //     reading of this block (`B*conv(X) + C*X`) is perfectly invariant and
+    //     produces a fluent, wrong model. So the row itself is pinned, by the
+    //     same FNV-1a `--prefill-hash` prints for `logits`, so the in-process
+    //     graph and the CLI's two arms are one number rather than three that
+    //     cannot be compared.
+    auto row_hash = [](const f32 *v, i32 n) {
+        u64 h = 1469598103934665603ull;
+        const unsigned char *b = reinterpret_cast<const unsigned char *>(v);
+        for (i64 i = 0; i < static_cast<i64>(n) * 4; i++) {
+            h ^= b[i];
+            h *= 1099511628211ull;
+        }
+        return h;
+    };
+    const std::string badtap = "kraken-lfm2-gate-badtap.gguf";
+    CHECK(build_lfm2_gate_model(badtap, 64, true),
+          "the moved-tap fixture writes (one conv coefficient, nothing else)");
+    // Prefill only (`max_tokens 0`), so the row read afterwards is the one at
+    // the last prompt position -- the row a decode starts from.
+    auto row = [&](const std::string &file, const char *prompt, i32 chunk,
+                   u64 *hash, i32 *top1) -> bool {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = file;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = chunk;
+            std::string err;
+            if (!engine.init(cpu, cfg, &err)) {
+                if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+            } else {
+                GenerateParams p;
+                p.prompt = prompt;
+                p.max_tokens = 0;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(p, &r) && r.finish != FinishError;
+                const f32 *lg = engine.last_logits();
+                const i32 nv = engine.model().cfg().n_vocab;
+                if (ok && lg && nv > 0) {
+                    *hash = row_hash(lg, nv);
+                    i32 best = 0;
+                    for (i32 i = 1; i < nv; i++)
+                        if (lg[i] > lg[best]) best = i;
+                    *top1 = best;
+                } else {
+                    ok = false;
+                }
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    u64 h_wide = 0, h_other = 0, h_narrow = 0, h_badtap = 0;
+    i32 t_wide = -1, t_other = -1, t_narrow = -1, t_badtap = -1;
+    CHECK(row(model, "the", 8, &h_wide, &t_wide),
+          "the whole fixture graph prefills and the row reaches the head");
+    std::fprintf(stderr, "  (lfm2 logits row %016llx, argmax %d)\n",
+                 static_cast<unsigned long long>(h_wide),
+                 static_cast<int>(t_wide));
+
+    // Recorded from this graph on the fixture, CPU backend, prompt "the".
+    static const u64 kGoldenRow = 0x399373273e5a2b60ull;
+    static const i32 kGoldenTop = 2;
+    CHECK(h_wide != 0, "the row is not empty");
+    CHECK(h_wide == kGoldenRow,
+          "the last prompt row is the recorded one (the mixer's own output)");
+    CHECK(t_wide == kGoldenTop, "and its argmax is the recorded token");
+
+    CHECK(row(model, "a", 8, &h_other, &t_other),
+          "a second prompt prefills");
+    CHECK(h_other != h_wide, "a different prompt moves the row");
+
+    CHECK(row(model, "the", 1, &h_narrow, &t_narrow),
+          "the same prompt token by token");
+    CHECK(h_narrow == h_wide,
+          "chunk 1 reproduces the chunk-8 row exactly");
+
+    CHECK(row(badtap, "the", 8, &h_badtap, &t_badtap),
+          "the moved-tap fixture prefills");
+    std::fprintf(stderr, "  (moved-tap row %016llx)\n",
+                 static_cast<unsigned long long>(h_badtap));
+    CHECK(h_badtap != h_wide,
+          "moving ONE conv coefficient moves the row: the pin sees the mixer");
+
+    // 2. The mixer's chunk invariance, on the device. `--chunk 1` runs every
+    //    row through the decode path and feeds the ring a row at a time; the
+    //    wider arms read the same rows from the call's own proj buffer. They
+    //    agree only because the product is rounded to f16 as the ring stores
+    //    it -- before that, chunk 1 and chunk 2 differed at pos 1 of layer 0
+    //    (0.00055837 against 0.00055800) and the greedy text diverged.
+    const std::string self = self_path();
+    const std::filesystem::path exe_p =
+        std::filesystem::path(self).parent_path() /
+#ifdef _WIN32
+        "kraken.exe";
+#else
+        "kraken";
+#endif
+    const std::string exe = exe_p.string();
+    const bool have_exe = !self.empty() && std::filesystem::exists(exe_p);
+    CHECK(have_exe, "kraken sits beside kraken-tests (the gate drives it)");
+    if (!have_exe) return;
+
+    // Long enough that the window is fed by more than one pass at every chunk
+    // size, and short enough to stay inside the fixture's 64-token context.
+    std::string prompt = "the";
+    for (int i = 0; i < 11; i++) prompt += " the";
+
+    const PrefillProbe c1 = run_lfm_hash(exe, model, prompt, 1, false);
+    const PrefillProbe c2 = run_lfm_hash(exe, model, prompt, 2, false);
+    const PrefillProbe c4 = run_lfm_hash(exe, model, prompt, 4, false);
+    CHECK(c1.ok, "the chunk-1 device prefill prints its hashes");
+    CHECK(c2.ok, "the chunk-2 device prefill prints its hashes");
+    CHECK(c4.ok, "the chunk-4 device prefill prints its hashes");
+    if (!c1.ok || !c2.ok || !c4.ok) {
+        std::fprintf(stderr, "  (chunk 1 rc=%d stderr: %.300s)\n", c1.rc,
+                     c1.err.c_str());
+        return;
+    }
+    CHECK(c1.prompt_tokens > 8 && c1.prompt_tokens == c2.prompt_tokens,
+          "the prompt spans several chunks, and both arms see it");
+    std::printf("       lfm2 chunk 1 trace %s logits %s\n", c1.trace.c_str(),
+                c1.logits.c_str());
+    std::printf("       lfm2 chunk 2 trace %s logits %s\n", c2.trace.c_str(),
+                c2.logits.c_str());
+    std::printf("       lfm2 chunk 4 trace %s logits %s\n", c4.trace.c_str(),
+                c4.logits.c_str());
+    CHECK(c1.trace == c2.trace,
+          c1.trace == c2.trace
+              ? "the shortconv ring leaves the same rows at chunk 1 and 2"
+              : "the shortconv ring is CHUNK-DEPENDENT (chunk 1 != chunk 2)");
+    CHECK(c1.trace == c4.trace, "and at chunk 4");
+    CHECK(c1.logits == c4.logits, "the logits row agrees too");
+    CHECK(c1.first == c4.first && c2.first == c1.first,
+          "and the three arms sample the same first token");
+
+    // 3. The CPU reference has its own ring (f32) and must be invariant as
+    //    well -- the same property, a different storage width. Its hashes are
+    //    NOT compared with the device's: no HIP row is bit-equal to this
+    //    engine's CPU row on any model, which is a property of the backend and
+    //    not of this mixer.
+    const PrefillProbe p1 = run_lfm_hash(exe, model, prompt, 1, true);
+    const PrefillProbe p4 = run_lfm_hash(exe, model, prompt, 4, true);
+    CHECK(p1.ok && p4.ok, "the --cpu arms print their hashes");
+    if (p1.ok && p4.ok) {
+        std::printf("       lfm2 cpu   1 trace %s logits %s\n", p1.trace.c_str(),
+                    p1.logits.c_str());
+        CHECK(p1.trace == p4.trace,
+              p1.trace == p4.trace
+                  ? "the CPU reference is chunk-invariant too"
+                  : "the CPU reference is CHUNK-DEPENDENT");
+        CHECK(p1.logits == p4.logits, "and its logits row agrees");
+        CHECK(p1.first == c1.first,
+              p1.first == c1.first
+                  ? "the CPU and device arms sample the same first token"
+                  : "the CPU and device arms disagree on the first token");
+    }
+}
+
 // Group 57: the supersized-GGUF audit's first landed piece -- attention
 // sinks (deepseek4 / gpt-oss): one logit per query head entered into the
 // softmax DENOMINATOR at the row's running max, with no value row behind it
@@ -16467,6 +16841,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_rope_pair_convention)
     TEST_GROUP(test_end_to_end_cpu)
     TEST_GROUP(test_prefill_chunk_bitexact)
+    TEST_GROUP(test_lfm2_shortconv)
     TEST_GROUP(group_attention_sinks)
     TEST_GROUP(test_moe_schema_and_laziness)
     TEST_GROUP(test_moe_per_layer_experts)

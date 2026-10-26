@@ -407,6 +407,9 @@ static const char *component_of(const char *op) {
         // file that carries it, it is the difference between a recurrent
         // layer's cost and a comparable layer's on a model without one.
         {"ple_gate", "ple"},
+        // LFM2's mixer is not PLE and not the delta net: its own bucket, so a
+        // 30-of-40-conv stack's cost is not read as either.
+        {"shortconv", "gdn"},
         {"conv1d_dw", "ple"},
         {"lane_bcast_mul", "ple"},
         // QSA: the per-query-row cell gather. Its own bucket, because it only

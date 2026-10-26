@@ -70,26 +70,33 @@ constexpr ArchSpec kTable[] = {
      "qwen35", "", true, true, false, false},
     // LFM2.5 (Liquid AI, `lfm2moe`). A hybrid like qwen35 but a different
     // mixer: the non-attending layers are a short DEPTHWISE convolution over
-    // the last `shortconv.l_cache` rows (`shortconv.in_proj` 3*n_embd wide ->
-    // B, C, x, then `y = B*conv(x) + C*x` -> `shortconv.out_proj`), not a gated
-    // delta net. Three more things the schema needs and this engine has no
-    // shape for: `attention.head_count_kv` is a PER-LAYER array of length
-    // block_count (0 on the conv layers), the file carries no `output_norm`
-    // because its final norm is `token_embd_norm`, and `expert_gating_func` 2
-    // selects experts with a sigmoid over the probabilities.
-    // It is refused by name rather than left to the llama defaults: those read
-    // all 30 conv layers as attention layers and die on the first missing
-    // `attn_q.weight`, and on the 24B-A2B file here it never even got that far
-    // -- "output_norm.weight is missing", before a layer was read. Either
-    // message is about a tensor for a mixer the engine has no shape for.
-    {"lfm2moe", ArchShape::RecurrentMoe, ArchSupport::No, ArchRole::Target,
-     "lfm2",
-     "a short-convolution mixer (shortconv), a per-layer "
-     "attention.head_count_kv array, a final norm that is token_embd_norm and "
-     "sigmoid expert gating are not implemented",
+    // the last `shortconv.l_cache` rows -- `shortconv.in_proj` is 3*n_embd wide
+    // and emits B | C | X, the convolution runs on B*X (not on X), and C gates
+    // the convolved row:
+    //
+    //     bx = B * X;  y = conv_dw(bx);  out = out_proj(C * y)
+    //
+    // Three more things the schema needs and the llama defaults do not find:
+    // `attention.head_count_kv` is a PER-LAYER array of length block_count (0
+    // on the conv layers, 8 on the 10 that attend), the file carries no
+    // `output_norm` because its final norm is `token_embd_norm`, and
+    // `expert_gating_func` 2 selects experts with a sigmoid.
+    // Two more answers the file does not state, both measured against the
+    // reference's own text on the 24B-A2B file:
+    //   * RoPE pairs NeoX half-split. llama.cpp reports `rope type = 2` for
+    //     this file and `(j, j + n_rot/2)` is what that case arm applies, so
+    //     the GGUF keeps the HF layout unpermuted and the engine must pair the
+    //     halves, not the neighbours.
+    //   * the top-k sigmoid weights ARE sum-normalized (`expert_w_norm`).
+    //     Without it the same prompt decodes ` "The" and "the"`, with it the
+    //     reference's ` Paris. The capital of ...`; the two differ by the
+    //     sigmoid sum (about 2x on every expert contribution), which is why a
+    //     wrong answer here is fluent rather than broken.
+    {"lfm2moe", ArchShape::RecurrentMoe, ArchSupport::Yes, ArchRole::Target,
+     "lfm2", "",
      /*qk_norm=*/true, /*q_output_gate=*/false, /*qkv_bias=*/false,
-     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
-     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/0},
+     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/true,
+     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/1},
     // Gemma scales the embedding by sqrt(n_embd) and uses a tighter eps.
     // Gemma 1 is the llama schema plus embedding scaling. It is not in the
     // collections here, so the entry says so rather than claiming a validated
@@ -478,12 +485,11 @@ constexpr GapTensor kGapTensors[] = {
     // exists sends the next reader looking for code to write.
     {"ssm_conv1d.weight", "a Mamba-style SSM block (ssm_conv1d)", true},
     {"ssm_out.weight", "a Mamba-style SSM block (ssm_out)", true},
-    // LFM2's mixer: three tensors per layer, and the in_proj is the one every
-    // conv layer carries. Named here as well as in the table so a file whose
-    // `general.architecture` string was never listed is still refused for the
-    // piece it actually carries rather than for a missing attention tensor.
-    {"shortconv.in_proj.weight", "a short-convolution mixer (shortconv)", false},
-    {"shortconv.conv.weight", "a short-convolution mixer (shortconv)", false},
+    // LFM2's shortconv used to be named here. It is gone rather than narrowed
+    // for the same reason as the router bias above: the loader now binds
+    // shortconv.in_proj/conv/out_proj per layer, `Engine::lfm_conv_forward`
+    // runs them, and a refusal for a feature that exists sends the next reader
+    // looking for code to write.
     // Expert routing this engine does not implement. The names are the only
     // evidence a file needs: group-limited selection and a routing bias change
     // *which* experts run, so a model carrying them would decode differently

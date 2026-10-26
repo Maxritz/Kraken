@@ -363,8 +363,16 @@ bool Tokenizer::load(const Gguf &g, std::string *err) {
     bos_ = static_cast<i32>(g.get_i64("tokenizer.ggml.bos_token_id", -1));
     eos_ = static_cast<i32>(g.get_i64("tokenizer.ggml.eos_token_id", -1));
     pad_ = static_cast<i32>(g.get_i64("tokenizer.ggml.padding_token_id", -1));
-    add_bos_ = g.get_bool("tokenizer.ggml.add_bos_token",
-                          model_ == TokModel::Spm);
+    // The KEY IS OPTIONAL AND ITS ABSENCE MEANS TRUE, exactly as it does in
+    // llama.cpp -- not "true for SPM only", which is what this said. Measured
+    // on LFM2.5-24B-A2B: the file declares bos_token_id 124894 and no
+    // add_bos_token key, llama.cpp feeds 6 tokens for a 5-token prompt and this
+    // engine fed 5, and that one token is the difference between the model
+    // answering and the model babbling whitespace -- LFM2 is trained with its
+    // BOS and degrades without it. A file that wants no BOS says so (Qwen's
+    // converter writes false); a file that is silent gets the reference's
+    // answer.
+    add_bos_ = g.get_bool("tokenizer.ggml.add_bos_token", true);
     byte_fallback_ = g.get_bool("tokenizer.ggml.byte_fallback", false);
     pre_ = g.get_str("tokenizer.ggml.pre");
 

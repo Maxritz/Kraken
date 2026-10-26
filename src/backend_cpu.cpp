@@ -1109,6 +1109,56 @@ public:
                 });
     }
 
+    // LFM2.5 short convolution. Same arithmetic as the device op
+    // (kernels/sc.hpp), including the ring: the reference backend is what the
+    // device arm is diffed against on a shape the suite can build, so a
+    // different history convention here would be a silent disagreement.
+    void shortconv(void *out, const void *proj, void *state, const void *w,
+                   i64 n_tok, i64 ch, i64 kern, i64 hist, i64 pos0) override {
+        f32 *o = static_cast<f32 *>(out);
+        const f32 *p = static_cast<const f32 *>(proj);
+        f32 *st = static_cast<f32 *>(state);
+        const f32 *wf = static_cast<const f32 *>(w);
+        if (!o || !p || !wf || n_tok <= 0 || ch <= 0 || kern <= 1 ||
+            hist < kern - 1)
+            return;
+        par_for(n_tok * ch, 8192, 2.0 * static_cast<f64>(n_tok * ch) * kern,
+                [&](i64 b, i64 e) {
+                    for (i64 i = b; i < e; i++) {
+                        const i64 t = i / ch;
+                        const i64 c = i % ch;
+                        f32 acc = 0.0f;
+                        for (i64 k = 0; k < kern; k++) {
+                            const i64 lag = kern - 1 - k;
+                            const i64 pos = pos0 + t - lag;
+                            if (pos < 0) continue;
+                            // The conv's input is B*X, not X: the reference
+                            // multiplies inside the gate and convolves the
+                            // product.
+                            const f32 bx = pos >= pos0
+                                               ? p[(t - lag) * 3 * ch + c] *
+                                                     p[(t - lag) * 3 * ch + 2 * ch + c]
+                                               : st[(pos % hist) * ch + c];
+                            acc += bx * wf[k * ch + c];
+                        }
+                        o[i] = p[t * 3 * ch + ch + c] * acc;
+                    }
+                });
+        if (st) {
+            // One row per position, into its own ring slot -- the ring is at
+            // least `kern-1` deep and may be deeper, so every row this call
+            // produced is kept (a speculation rewind reads them back).
+            for (i64 r = 0; r < n_tok; r++) {
+                const i64 pos = pos0 + r;
+                if (pos < 0) continue;
+                const f32 *src = p + (pos - pos0) * 3 * ch;
+                f32 *dst = st + (pos % hist) * ch;
+                for (i64 c = 0; c < ch; c++)
+                    dst[c] = src[c] * src[2 * ch + c];
+            }
+        }
+    }
+
     void silu_act(void *x, i64 n) override {
         f32 *p = static_cast<f32 *>(x);
         par_for(n, 8192, 4.0 * static_cast<f64>(n),

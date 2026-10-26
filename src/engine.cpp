@@ -1401,7 +1401,37 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     }
     ws_logits_ = alloc(static_cast<size_t>(n_vocab_) * as);
     if (!check_alloc(ws_logits_, "ws_logits")) return false;
-    if (model_.is_recurrent()) {
+    if (model_.is_recurrent() && model_.has_lfm_conv()) {
+        // LFM2.5: none of the delta-net workspaces are shaped by this stack --
+        // there is no [q|k|v] row, no alpha/beta, no scan state. What the block
+        // needs is its own 3*n_embd projection row, the gated result, and one
+        // history ring per layer.
+        rec_layers_ = model_.recurrent_layers();
+        ws_sc_ = alloc(static_cast<size_t>(C) * static_cast<size_t>(3 * n_embd_) * as);
+        if (!check_alloc(ws_sc_, "ws_sc")) return false;
+        ws_sc2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+        if (!check_alloc(ws_sc2_, "ws_sc2")) return false;
+        const i32 sc_kern = mc.ssm_d_conv > 0 ? mc.ssm_d_conv : 3;
+        // + slack for speculation. 16 rows covers every window a caller can ask
+        // for (the drafter's block_size-1 is 8 on the LFM2.5 head set, and
+        // --draft-tokens is clamped to the same order below); the cost is 16 x
+        // n_embd x 4 bytes per layer, which is 1.2 MiB on the 24B file.
+        sc_hist_ = static_cast<i64>(sc_kern - 1) + 16;
+        sc_state_span_ = sc_hist_ * static_cast<i64>(n_embd_);
+        sc_state_ = alloc(static_cast<size_t>(mc.n_layer) *
+                          static_cast<size_t>(sc_state_span_) * as);
+        if (!check_alloc(sc_state_, "sc_state")) return false;
+        // Zeroed: the first chunk of a session reads no negative taps (the
+        // kernel skips p < 0), so this is belt and braces -- but a ring that
+        // starts at whatever the allocator left is the kind of thing that only
+        // shows up as a first-token difference.
+        be_->fill0(sc_state_, static_cast<size_t>(mc.n_layer) *
+                               static_cast<size_t>(sc_state_span_) * as);
+        KRK_INFO("lfm2 short conv: %d layer(s), kernel %d, %lld-row history "
+                 "ring per layer",
+                 model_.recurrent_layers(), sc_kern,
+                 static_cast<long long>(sc_hist_));
+    } else if (model_.is_recurrent()) {
         rec_layers_ = model_.recurrent_layers();
         ws_qkv_ = alloc(static_cast<size_t>(C * conv_dim_) * as);
         if (!check_alloc(ws_qkv_, "ws_qkv")) return false;
@@ -1693,7 +1723,10 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         (q_proj_ != q_dim_ && !require_alloc(ws_qpack_, "ws_qpack")) ||
         ((model_.is_recurrent() || mc.attn_gate) && !require_alloc(ws_agate_, "ws_agate")) ||
         (model_.had().active && !require_alloc(ws_had_, "ws_had")) ||
-        (model_.is_recurrent() &&
+        (model_.is_recurrent() && model_.has_lfm_conv() &&
+         (!require_alloc(ws_sc_, "ws_sc") || !require_alloc(ws_sc2_, "ws_sc2") ||
+          !require_alloc(sc_state_, "sc_state"))) ||
+        (model_.is_recurrent() && !model_.has_lfm_conv() &&
          (!require_alloc(ws_qkv_, "ws_qkv") || !require_alloc(ws_z_, "ws_z") ||
           !require_alloc(ws_h_, "ws_h") || !require_alloc(ws_ssm_, "ws_ssm") ||
           !require_alloc(ws_beta_, "ws_beta") || !require_alloc(conv_state_, "conv_state") ||
@@ -2993,8 +3026,13 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         }
 
         if (L.gdn) {
-            // nemotron_h_moe Mamba-2 SSM layer
-            if (L.nemotron_ssm) {
+            if (L.lfm_conv) {
+                // LFM2.5: a depthwise causal convolution with its own gate, no
+                // KV append (there is none to make) and no scan state. The
+                // residual lands in ws_x_ before the FFN, exactly as the delta
+                // net's does.
+                lfm_conv_forward(L, l, n, pos0);
+            } else if (L.nemotron_ssm) {
                 // nemotron_h_moe Mamba-2 block. NOT the gated delta net: the
                 // file carries no alpha/beta. Its recurrence is the SSD scan
                 // over (xBC, dt, A); the scan performs all per-head prep, the
@@ -4371,7 +4409,12 @@ bool Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
 bool Engine::kv_rollback(i64 pos) {
     if (pos < 0 || pos > kv_pos_) return false;
     if (pos == kv_pos_) return true;
-    if (model_.is_recurrent()) {
+    // A shortconv ring survives a partial rewind (model.hpp,
+    // `speculative_rewind_ok`): the engine keeps it deeper than the window, so
+    // a suffix rewrite can never reach a row a retained convolution reads.
+    // Dropping kv_pos_ is then the whole story -- unlike the delta rule below,
+    // there is no state to put back.
+    if (model_.is_recurrent() && !model_.has_lfm_conv()) {
         // The delta rule has no inverse. Rewinding the attention rows alone
         // would leave the recurrent state describing tokens the caller is
         // about to replace, so the honest options are a full rewind (the
@@ -5338,9 +5381,10 @@ bool Engine::load_draft_head(const std::string &path, std::string *err) {
         return false;
     }
     if (head_) return true; // already loaded
-    if (model_.is_recurrent()) {
+    if (!model_.speculative_rewind_ok()) {
         // Same reason load_draft refuses one: a delta-rule state has no
-        // inverse, so a rejected suffix cannot be rewound.
+        // inverse, so a rejected suffix cannot be rewound. A shortconv ring
+        // is depth-preserved, so it passes.
         if (err)
             *err = "speculative decoding needs a partial KV rewind, which a "
                    "recurrent (gated delta net) model cannot do";
@@ -5879,11 +5923,12 @@ i32 Engine::draft_block_rows(const QuantTensor &tok_embd, const QuantTensor &lm_
 }
 
 bool Engine::load_draft(const std::string &path, std::string *err) {
-    if (model_.is_recurrent()) {
+    if (!model_.speculative_rewind_ok()) {
         // Speculation verifies a block and then rewinds to the accepted
         // prefix; a delta-rule state has no inverse, so the rewind would leave
         // the state describing rejected tokens. Refuse rather than decode
-        // something plausible and wrong.
+        // something plausible and wrong. A shortconv ring rewinds cleanly
+        // (model.hpp, `speculative_rewind_ok`), so lfm2moe is not refused here.
         if (err)
             *err = "speculative decoding needs a partial KV rewind, which a "
                    "recurrent (gated delta net) model cannot do";
@@ -5956,6 +6001,13 @@ void Engine::unload_draft() {
 }
 
 void Engine::recurrent_reset() {
+    // The shortconv ring is its own state and must be cleared even on a stack
+    // that owns neither delta-net buffer (lfm2moe does). Zeroing it is what
+    // makes a full rewind plus replay read the same taps as a fresh session.
+    if (sc_state_)
+        be_->fill0(sc_state_, static_cast<size_t>(model_.cfg().n_layer) *
+                               static_cast<size_t>(sc_state_span_) *
+                               be_->act_size());
     if (!conv_state_ || !rec_state_) return;
     be_->fill0(conv_state_, static_cast<size_t>(rec_layers_) *
                                   static_cast<size_t>(conv_state_span_) * sizeof(f32));
@@ -6295,6 +6347,34 @@ bool Engine::mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
                            L.wo_b16.data, sd);
     dump_row("attn.proj", l, ws_x2_, n_embd_, n);
     return true;
+}
+
+// LFM2.5's short convolution. Three steps and one kernel:
+//
+//   1. in_proj   n_embd -> 3*n_embd   (B | C | X, in that order)
+//   2. shortconv: conv over B*X (causal, depthwise, kern taps), then C gates it
+//   3. out_proj  3 slices -> n_embd, folded onto the residual
+//
+// There is no gate chain, no state matrix and no activation between the
+// convolution and its gate -- the whole mixer is steps 1-3, which is why the
+// block is 4 ops where the delta net is a dozen.
+void Engine::lfm_conv_forward(const LayerWeights &L, i32 l, i32 n, i64 pos0) {
+    KRK_TRACE_COMP("lfm-conv-forward");
+    const i32 kern = model_.cfg().ssm_d_conv > 0 ? model_.cfg().ssm_d_conv : 3;
+    // ws_xn_ was filled by the layer's pre-norm before the mixer ran.
+    gemm_w(ws_sc_, ws_xn_, L.sc_in, 3 * n_embd_, n_embd_, n);
+    void *state = static_cast<char *>(sc_state_) +
+                  static_cast<size_t>(l) *
+                      static_cast<size_t>(sc_state_span_) *
+                      static_cast<size_t>(be_->act_size());
+    be_->shortconv(ws_sc2_, ws_sc_, state, L.sc_conv.data, n, n_embd_, kern,
+                   sc_hist_, pos0);
+    dump_row("lfm.sc", l, ws_sc2_, n_embd_, n);
+    // The output projection lands on the residual with its folded epilogue, so
+    // the mixer costs one add fewer than a separate gemm + add would. ws_attn_
+    // is the fallback scratch and is free here: a conv layer runs no attention.
+    gemm_residual(ws_x_, ws_sc2_, L.sc_out.data, L.sc_out.type, n_embd_, n_embd_,
+                  n, ws_attn_, L.sc_out.gs);
 }
 
 void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {

@@ -1448,6 +1448,28 @@ public:
         (void)out; (void)x; (void)w; (void)n_tok; (void)ch; (void)kern; (void)dil;
     }
 
+    // LFM2.5's short convolution (`lfm2moe`): the mixer on the layers that are
+    // not attention. `proj` is the layer's own projection, `[n_tok, 3*ch]` in
+    // slices B | C | X, and the op is
+    //     bx[t,c] = B[t,c] * X[t,c]
+    //     out[t,c] = C[t,c] * sum_k w[k*ch+c] * bx[t-(kern-1)+k, c]
+    // with the taps reaching into `state` for the rows before this call. `pos0`
+    // is the ABSOLUTE position of row 0: the history is a ring keyed by it, so a
+    // chunked prefill and a token-at-a-time decode address the same slots and a
+    // call never has to shift the window. `state` is `hist * ch` values wide,
+    // where `hist` is the ring's depth -- at least `kern - 1`, and deeper when
+    // the model is speculated over (see Engine::sc_hist_).
+    //
+    // No activation sits between the convolution and the gate -- that is what
+    // makes this not `conv1d_silu`, and it is the whole mixer plus the two
+    // projections either side of it.
+    virtual void shortconv(void *out, const void *proj, void *state,
+                           const void *w, i64 n_tok, i64 ch, i64 kern,
+                           i64 hist, i64 pos0) {
+        (void)out; (void)proj; (void)state; (void)w;
+        (void)n_tok; (void)ch; (void)kern; (void)hist; (void)pos0;
+    }
+
     // The gated value broadcast: one value row per token (shared by every lane)
     // times that LANE's gate.
     //   out[t,c,e] = value[t,e] * g[c*n_tok + t]

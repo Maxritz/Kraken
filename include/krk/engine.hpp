@@ -825,6 +825,10 @@ private:
     // causal short conv, the per-head gate/forget, the delta rule, and the
     // gated output projection. Advances the layer's recurrent state.
     void gdn_forward(const LayerWeights &L, i32 l, i32 n);
+    // LFM2.5's short-convolution mixer (the layers whose block carries
+    // `shortconv.in_proj`). `pos0` is the absolute position of the first row:
+    // the history ring is keyed by it.
+    void lfm_conv_forward(const LayerWeights &L, i32 l, i32 n, i64 pos0);
     // One multi-head latent attention layer (DeepSeek-V2/V3/V4, legacy lite
     // layout): the [kv_lora + rope] projection, the normed latent written to
     // the KV plane, and the absorbed score/value pass over it. Leaves the
@@ -1055,6 +1059,27 @@ private:
     void *rec_state_ = nullptr;
     i32 rec_layers_ = 0;
     i64 conv_state_span_ = 0; // f32 per recurrent layer
+    // ---- LFM2.5 short convolution (`lfm2moe`) ----------------------------
+    // A different recurrent block: the mixer is `out_proj(B*conv(X) + C*X)` and
+    // its memory of the sequence is a ring of the last `kern-1` X rows, keyed
+    // by absolute position. sc_state_ is one span per LAYER (not per recurrent
+    // layer) because the ring is indexed by the layer's own number, and the
+    // activation width is the backend's -- f16 on the card, f32 on the
+    // reference -- so the span is in elements and every address multiplies by
+    // act_size.
+    void *ws_sc_ = nullptr;   // [chunk, 3*n_embd]  the B | C | X projection
+    void *ws_sc2_ = nullptr;  // [chunk, n_embd]    the gated convolution
+    void *sc_state_ = nullptr;
+    i64 sc_state_span_ = 0;   // elements per layer
+    // Ring DEPTH (rows per layer), not the window: `kern - 1` rows are what the
+    // convolution reads, and the rest is slack a speculative round needs. A
+    // round verifies k+1 rows, accepts a prefix and then feeds the replacement
+    // token at pos+ra -- which reads rows the verify pass produced. With a ring
+    // exactly kern-1 deep those rows have been overwritten, so the rewind would
+    // need a snapshot and a replay; with slack, `kv_rollback` is pointer
+    // arithmetic and the conv side needs nothing at all. The slot function is
+    // `pos % hist` in both cases, so a deeper ring is bit-identical.
+    i64 sc_hist_ = 0;
     i64 rec_state_span_ = 0;  // f32 per recurrent layer
     // Mamba-2 layout ([head][p][s] vs GDN's [head][s][p] — same bytes, and the
     // scan never mixes them) and the per-layer conv bias, loaded only when a

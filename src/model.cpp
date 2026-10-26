@@ -416,6 +416,28 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.recurrent = (aspec.shape == ArchShape::Recurrent ||
                       aspec.shape == ArchShape::RecurrentMoe);
     if (cfg_.recurrent) {
+        // LFM2.5 is "recurrent" in the layer-interleaving sense only: its
+        // non-attention layers are a short convolution, and it carries no
+        // ssm.* key at all. The one number it does declare is the conv
+        // kernel (`shortconv.l_cache`), and that is the whole geometry the
+        // block needs -- so this branch must run before the delta-net shape
+        // checks, not through them.
+        if (aspec.family && std::string_view(aspec.family) == "lfm2") {
+            cfg_.lfm_conv = true;
+            cfg_.full_attention_interval = static_cast<i32>(
+                gguf_.get_i64(key(".full_attention_interval"), 4));
+            if (cfg_.full_attention_interval <= 0)
+                cfg_.full_attention_interval = 4;
+            cfg_.ssm_d_conv = static_cast<i32>(
+                gguf_.get_i64(key(".shortconv.l_cache"), 3));
+            if (cfg_.ssm_d_conv <= 0 || cfg_.ssm_d_conv > 16) {
+                if (err)
+                    *err = "arch '" + a + "': shortconv.l_cache " +
+                           std::to_string(cfg_.ssm_d_conv) +
+                           " is out of range";
+                return false;
+            }
+        } else {
         cfg_.full_attention_interval = static_cast<i32>(
             gguf_.get_i64(key(".full_attention_interval"), 4));
         if (cfg_.full_attention_interval <= 0) cfg_.full_attention_interval = 4;
@@ -474,6 +496,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 return false;
             }
         }
+        } // !lfm2: the delta-net / Mamba-2 geometry below is not this stack's
         // Interleaved multi-rotary sections (Phi). `rope.dimension_count`
         // itself is read once above, for every arch rather than only this one.
         if (const std::vector<i32> *sec = gguf_.get_i32_array(key(".rope.dimension_sections"))) {
@@ -1302,6 +1325,16 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     } else {
         out_norm_ = upload_f32("output_norm.weight");
         lp.mark("  output_norm upload");
+        // LFM2 names its final norm `token_embd_norm.weight` and ships no
+        // `output_norm` at all. The two are the same tensor under a different
+        // name -- one RMSNorm over the last hidden row, with the output head
+        // reading its result -- so the fallback is a name, not a graph change.
+        // Done by name rather than by arch so a converter that renames it on
+        // some other family does not need a table row to be told.
+        if (!out_norm_) {
+            out_norm_ = upload_f32("token_embd_norm.weight");
+            if (out_norm_) lp.mark("  token_embd_norm upload (no output_norm)");
+        }
         if (!out_norm_) {
             if (err) *err = "output_norm.weight is missing";
             return false;
@@ -1683,10 +1716,72 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 L.gdn = (gguf_.tensor(ssm_in_name) != nullptr);
                 L.nemotron_ssm = L.gdn;
             }
+            // lfm2moe: the same derivation, off the mixer's own tensor, and it
+            // has to decide BOTH ways. Its stack is 3 conv : 1 attention with
+            // attention at indices 2, 6, ... and no `attention.recurrent_layers`
+            // array, so the interval rule above (every 4th from 1) marks layer 2
+            // as a delta net and layer 3 as attention -- both wrong. What the
+            // file says unambiguously is which layers carry a shortconv block,
+            // so on this family that is the rule: a layer with one is a conv
+            // layer, a layer without one is an attention layer.
+            if (cfg_.lfm_conv) {
+                L.lfm_conv =
+                    gguf_.tensor(blk_key("blk.%d.shortconv.in_proj.weight", l)) !=
+                    nullptr;
+                L.gdn = L.lfm_conv;
+            } else if (gguf_.tensor(
+                           blk_key("blk.%d.shortconv.in_proj.weight", l))) {
+                // An unlisted arch string that still carries the mixer: same
+                // rule, one direction only (there is no table row to say the
+                // rest of the stack is attention).
+                L.gdn = true;
+                L.lfm_conv = true;
+            }
         }
 
         if (L.gdn) {
-            if (L.nemotron_ssm) {
+            if (L.lfm_conv) {
+                // LFM2.5's short convolution: one projection emitting B, C and
+                // the convolved signal's own X, the depthwise taps, and the
+                // output projection. There is no q/k/v, no state matrix and no
+                // gate chain -- the conv plus the two slices is the whole
+                // mixer.
+                L.sc_in = need(blk_key("blk.%d.shortconv.in_proj.weight", l));
+                L.sc_out = need(blk_key("blk.%d.shortconv.out_proj.weight", l));
+                L.sc_conv = upload_conv1d(blk_key("blk.%d.shortconv.conv.weight", l));
+                if (!L.sc_conv.present()) {
+                    if (err)
+                        *err = blk_key("blk.%d.shortconv.conv.weight", l) +
+                               " is missing";
+                    return false;
+                }
+                // The taps are read as f32 by the kernel. Every file here
+                // stores them that way; a quantised one would be a different
+                // dequant path, so it is named instead of guessed at.
+                if (L.sc_conv.type != DType::F32) {
+                    if (err)
+                        *err = blk_key("blk.%d.shortconv.conv.weight", l) +
+                               " is not F32; the short-convolution taps are read "
+                               "as f32";
+                    return false;
+                }
+                // 3*n_embd of OUTPUT, three equal slices of n_embd: the file's
+                // in_proj is [n_embd, 3*n_embd], so n_out is the width the
+                // three slices come out of.
+                if (L.sc_in.n_in != static_cast<i64>(cfg_.n_embd) ||
+                    L.sc_in.n_out != 3 * static_cast<i64>(cfg_.n_embd)) {
+                    if (err)
+                        *err = blk_key("blk.%d.shortconv.in_proj.weight", l) +
+                               " is " + std::to_string(L.sc_in.n_in) + "x" +
+                               std::to_string(L.sc_in.n_out) +
+                               "; the mixer needs n_embd x 3*n_embd = " +
+                               std::to_string(static_cast<i64>(cfg_.n_embd)) +
+                               "x" +
+                               std::to_string(3 * static_cast<i64>(cfg_.n_embd));
+                    return false;
+                }
+                if (cfg_.ssm_d_conv <= 0) cfg_.ssm_d_conv = 3;
+            } else if (L.nemotron_ssm) {
                 // Mamba-2 SSM block (nemotron_h / nemotron_h_moe): no
                 // QKV, no gate, no alpha/beta. Instead: an input
                 // projection (ssm_in), optional D parameter (ssm_d),
@@ -2507,7 +2602,11 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         }
 
         // geometric sanity: the tensor schema must match the metadata
-        if (L.gdn) {
+        // LFM2.5's mixer is checked where it is LOADED instead (three equal
+        // n_embd slices, an F32 tap row, an n_embd output projection): it has
+        // no ssm.* geometry to agree with, and every check below would compare
+        // an absent tensor's default against a width this stack never sets.
+        if (L.gdn && !L.lfm_conv) {
             // The gated-delta-net block has no head geometry at all: one fused
             // [q|k|v] projection and one output projection, both sized by the
             // ssm.* keys. nemotron's mamba-2 block has no wqkv or z gate at all
