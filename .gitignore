@@ -5,6 +5,7 @@
 !/.gitignore
 !/CMakeLists.txt
 !/README.md
+!/more-info.md
 !/AGENTS.md
 !/include/
 !/src/
