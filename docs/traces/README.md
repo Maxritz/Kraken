@@ -97,7 +97,12 @@ python3 tools/probe_read.py G:/More-models/laguna-xs2-Q4_K_M.gguf 4 16
 `laguna-krk_time.err` is the full `KRK_TIME=1 KRK_PHASE=1` per-op table for
 laguna-xs2, 137011 ops over 24 decode tokens. The `.err` files are the stderr
 streams of interleaved A/B determinism runs (`none`, `vram3`, `pf` arms).
-`results.tsv` is the 26-model device benchmark sweep.
+`results.tsv` is the device benchmark sweep, 21 rows, last re-run on 2026-10-26
+after the prefill GEMM's activation prefetch landed; `tools/sweep_models.sh`
+reproduces it (one run per model, `--bench --greedy --max-tokens 64 --ctx 4096
+--chunk 512`). Prefill is the column a kernel change moves, and the MoE rows'
+prefill follows the expert tier's state rather than the kernel -- read those two
+rows as indicators and not as row-to-row comparisons.
 
 These are the raw material for `docs/PERF-ANALYSIS.md`.
 ## Coherence sweep

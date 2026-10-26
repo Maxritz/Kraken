@@ -132,43 +132,60 @@ form describes.
 Measured on 2026-10-26 with `kraken --model <MODEL> --bench --greedy
 --max-tokens 64`, one run per model, device only, greedy sampling, `--ctx 4096`
 and `--chunk 512`. Radeon RX 9070 XT, `gfx1201`, 64 CU, 15.9 GiB VRAM, HIP 7.12
-runtime, Release build.
+runtime, Release build. The sweep was re-run the same day after the prefill
+staging change, so the prefill column is one build newer than the rest of the
+record; `docs/AUDIT-prefill-gemm.md` has that change and its numbers.
 
 | Model | Size MiB | Arch | Load ms | Prefill tok/s | Decode tok/s | Note |
 |---|---:|---|---:|---:|---:|---|
-| Laguna-S-2.1-PS-IQ2_XXS | 32093 | laguna | 22407 | 21.2 | 6.1 | range guard fired |
+| Laguna-S-2.1-PS-IQ2_XXS | 32093 | laguna | 23214 | 5.5 | 4.5 | range guard fired |
 | K2-Horizon-MoVA-36B-A4B-Q4_K_M | 21331 | not loaded | - | - | - | refused at load |
-| laguna-xs2-Q4_K_M | 19335 | laguna | 22212 | 92.8 | 32.3 | |
-| LFM2.5-24B-A2B-QAD-Q4_0 | 12949 | lfm2moe | 7171 | 410.3 | 81.4 | |
-| Mellum2.1-12B-A2.5B-Thinking-Q8_0 | 12326 | mellum | 10428 | 476.0 | 62.7 | range guard fired |
-| Underdog-Saluki-27B-1.0-IQ2-mix-MTP | 7962 | qwen35 | 6206 | 172.9 | 31.0 | |
-| omnicoder-9b-q6_k | 7018 | qwen35 | 4719 | 221.5 | 58.1 | |
-| Qwen2.5-Coder-7B-Instruct-Q5_K_M | 5192 | qwen2 | 4514 | 494.3 | 73.1 | |
-| qwen35-9b-instruct-nvfp4 | 5067 | qwen35 | 5511 | 634.6 | 78.3 | |
-| lacuna-v1-Q4_K_M | 4836 | llama | 4142 | 520.1 | 81.9 | |
-| Qwen3-8B-Q4_K_M | 4794 | qwen3 | 4331 | 561.2 | 80.2 | |
-| mythos-9b-unhinged-heretic.i1-Q4_K_M | 4794 | qwen3 | 3820 | 558.4 | 80.7 | |
-| Qwen3.5-9B-DeepSeek-V4-Flash-MTP-Q3_K_M | 4518 | qwen35 | 2826 | 647.7 | 68.9 | |
-| Opus4.7-GODs.Ghost.Codex.Distill.4B-Q8_0 | 4274 | qwen35 | 3455 | 1024.6 | 90.2 | |
-| Qwen3-4B-Q8_0 | 4082 | qwen3 | 1448 | 1031.3 | 95.9 | |
-| VibeThinker-3B.Q8_0 | 3133 | qwen2 | 2864 | 1360.0 | 0.0 | emits EOS at once |
-| Samastam-2.5B-Q8_0 | 2560 | llama | 2389 | 2877.2 | 148.8 | |
-| Phi-3.5-mini-instruct-python_coding_assistanQ4_K_M | 2211 | llama | 2346 | 1463.2 | 94.8 | |
-| smolcode-coder-cpp-3b-q4_k_m | 2007 | qwen2 | 2159 | 1092.9 | 137.2 | |
-| smolcode-coder-cpp-1.5b-q4_k_m | 1065 | qwen2 | 1556 | 2029.6 | 200.7 | |
-| bitnet-2b-tq1_0 | 1054 | bitnet | 631 | 878.6 | 66.3 | |
+| laguna-xs2-Q4_K_M | 19335 | laguna | 22089 | 98.1 | 33.2 | |
+| LFM2.5-24B-A2B-QAD-Q4_0 | 12949 | lfm2moe | 6293 | 424.3 | 80.7 | |
+| Mellum2.1-12B-A2.5B-Thinking-Q8_0 | 12326 | mellum | 9134 | 460.9 | 60.7 | range guard fired |
+| Underdog-Saluki-27B-1.0-IQ2-mix-MTP | 7962 | qwen35 | 6102 | 224.9 | 30.8 | |
+| omnicoder-9b-q6_k | 7018 | qwen35 | 8763 | 271.2 | 63.1 | |
+| Qwen2.5-Coder-7B-Instruct-Q5_K_M | 5192 | qwen2 | 4309 | 561.2 | 72.5 | |
+| qwen35-9b-instruct-nvfp4 | 5067 | qwen35 | 4860 | 798.5 | 79.0 | |
+| lacuna-v1-Q4_K_M | 4836 | llama | 3956 | 655.3 | 91.7 | |
+| Qwen3-8B-Q4_K_M | 4794 | qwen3 | 4279 | 639.5 | 80.8 | |
+| mythos-9b-unhinged-heretic.i1-Q4_K_M | 4794 | qwen3 | 3721 | 654.3 | 80.8 | |
+| Qwen3.5-9B-DeepSeek-V4-Flash-MTP-Q3_K_M | 4518 | qwen35 | 2632 | 778.7 | 68.8 | |
+| Opus4.7-GODs.Ghost.Codex.Distill.4B-Q8_0 | 4274 | qwen35 | 3870 | 1328.8 | 92.8 | |
+| Qwen3-4B-Q8_0 | 4082 | qwen3 | 2407 | 1333.5 | 96.2 | |
+| VibeThinker-3B.Q8_0 | 3133 | qwen2 | 3181 | 1630.8 | 0.0 | emits EOS at once |
+| Samastam-2.5B-Q8_0 | 2560 | llama | 2248 | 3705.3 | 148.8 | |
+| Phi-3.5-mini-instruct-python_coding_assistanQ4_K_M | 2211 | llama | 1739 | 1851.7 | 94.2 | |
+| smolcode-coder-cpp-3b-q4_k_m | 2007 | qwen2 | 2103 | 1293.5 | 138.8 | |
+| smolcode-coder-cpp-1.5b-q4_k_m | 1065 | qwen2 | 1377 | 2521.6 | 196.9 | |
+| bitnet-2b-tq1_0 | 1054 | bitnet | 953 | 940.1 | 66.2 | |
 
 Three things the table says:
 
-* **Prefill is the weak number on the larger dense files.** Underdog-Saluki-27B
-  reads a prompt at 172.9 tok/s against 31.0 tok/s of decode, omnicoder-9b at
-  221.5 against 58.1, and Qwen2.5-Coder-7B at 494.3 against 73.1. The small
-  models are quick at both ends (smolcode 1.5B: 2029.6 and 200.7), so what these
-  rows measure is the weight read rather than the kernel shape.
-* **MoE decode is bound by expert bring-in.** laguna-xs2 holds 71% of its expert
-  acquires in VRAM and decodes at 32.3 tok/s against 92.8 tok/s of prefill, while
-  LFM2.5-24B, whose routed set fits its tier at 98.9% hits, decodes at 81.4.
-  Laguna-S-2.1 is 32 GiB against a 15.9 GiB card and drops to 6.1 tok/s.
+* **Prefill is still the weak number on the larger dense files, but it moved.**
+  Underdog-Saluki-27B reads a prompt at 224.9 tok/s against 30.8 tok/s of decode,
+  omnicoder-9b at 271.2 against 63.1, and Qwen2.5-Coder-7B at 561.2 against 72.5,
+  against 172.9, 221.5 and 494.3 in the previous sweep. The small models are
+  quick at both ends (smolcode 1.5B: 2521.6 and 196.9), so what these rows
+  measure is the weight read rather than the kernel shape.
+* **What moved is the prefill GEMM's staging chain, and it is measured.** The
+  activation tile was the one operand staged with no prefetch, so its loads sat
+  in front of the barrier with nothing to overlap them; holding them in
+  registers for one round is worth 22% of prefill on Qwen3-8B (830.9 -> 1013.7
+  tok/s at a 501-token prompt, interleaved medians) and 31% of the GEMM itself
+  (375.1 -> 258.9 ms). The decomposition, the LDS wall that stops a full double
+  buffer from fitting, and what is still open are in
+  [docs/AUDIT-prefill-gemm.md](docs/AUDIT-prefill-gemm.md): prefill is the GEMM
+  first (59 to 69% of it) and attention second (24 to 33%), the GEMM now runs at
+  about a quarter of the card's peak against a fifth before, and `--prefill
+  exact`, the rung that can produce a hash, measures 8 to 12 times slower than
+  the default.
+* **MoE decode is bound by expert bring-in, and those rows are not stable.**
+  laguna-xs2 holds 74.3% of its expert acquires in VRAM and decodes at 33.2
+  tok/s, while LFM2.5-24B, whose routed set fits its tier at 98.9% hits, decodes
+  at 80.7. Their prefill column follows the tier's state rather than the kernel:
+  laguna-xs2 read 92.8, 82.0 and 98.1 tok/s across three sweeps the same day,
+  and Laguna-S-2.1 is 32 GiB against a 15.9 GiB card at 4.5 tok/s.
 * **Two MoEs do not produce a trustworthy answer at these defaults.** Mellum2.1
   and Laguna-S-2.1 both leave the f16 activation range, the range guard reports
   the clipped stores, and the run exits 2. Their rates are what the run reached

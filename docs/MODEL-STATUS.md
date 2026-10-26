@@ -14,7 +14,10 @@ else. One run each, so treat a row as an indicator and not as a tight number.
 The first load after a build reads the file cold; every other row here used the
 warm file cache.
 
-Raw rows: `docs/traces/results.tsv`. Re-run instructions: `docs/traces/README.md`.
+Raw rows: `docs/traces/results.tsv`. Re-run instructions: `docs/traces/README.md`,
+and `tools/sweep_models.sh` is the sweep itself. The table below was re-run the
+same day after the prefill GEMM's activation prefetch, so its prefill column is
+one build newer than the rest of the record.
 
 **Radeon RX 9070 XT (gfx1201, RDNA4, 64 CU, 15.9 GiB VRAM), HIP 7.12.60602
 runtime, SDK 7.16.26331, Release.**
@@ -23,27 +26,27 @@ runtime, SDK 7.16.26331, Release.**
 
 | Model | Size MiB | Arch | Load ms | Prefill tok/s | Decode tok/s | ms/tok | HOT % | Status |
 |---|---:|---|---:|---:|---:|---:|---:|---|
-| Laguna-S-2.1-PS-IQ2_XXS | 32093 | laguna MoE | 22407 | 21.2 | 6.1 | 163.9 | 48.0 | range guard fired |
+| Laguna-S-2.1-PS-IQ2_XXS | 32093 | laguna MoE | 23214 | 5.5 | 4.5 | 222.2 | 49.5 | range guard fired |
 | K2-Horizon-MoVA-36B-A4B-Q4_K_M | 21331 | not loaded | - | - | - | - | - | refused at load |
-| laguna-xs2-Q4_K_M | 19335 | laguna MoE | 22212 | 92.8 | 32.3 | 31.0 | 71.0 | ran |
-| LFM2.5-24B-A2B-QAD-Q4_0 | 12949 | lfm2moe | 7171 | 410.3 | 81.4 | 12.3 | 98.9 | ran |
-| Mellum2.1-12B-A2.5B-Thinking-Q8_0 | 12326 | mellum MoE | 10428 | 476.0 | 62.7 | 15.9 | 100.0 | range guard fired |
-| Underdog-Saluki-27B-1.0-IQ2-mix-MTP-abliterated | 7962 | qwen35 dense | 6206 | 172.9 | 31.0 | 32.3 | - | ran |
-| omnicoder-9b-q6_k | 7018 | qwen35 dense | 4719 | 221.5 | 58.1 | 17.2 | - | ran |
-| Qwen2.5-Coder-7B-Instruct-Q5_K_M | 5192 | qwen2 dense | 4514 | 494.3 | 73.1 | 13.7 | - | ran |
-| qwen35-9b-instruct-nvfp4 | 5067 | qwen35 dense | 5511 | 634.6 | 78.3 | 12.8 | - | ran |
-| lacuna-v1-Q4_K_M | 4836 | llama dense | 4142 | 520.1 | 81.9 | 12.2 | - | ran |
-| Qwen3-8B-Q4_K_M | 4794 | qwen3 dense | 4331 | 561.2 | 80.2 | 12.5 | - | ran |
-| mythos-9b-unhinged-heretic.i1-Q4_K_M | 4794 | qwen3 dense | 3820 | 558.4 | 80.7 | 12.4 | - | ran |
-| Qwen3.5-9B-DeepSeek-V4-Flash-MTP-Q3_K_M | 4518 | qwen35 dense | 2826 | 647.7 | 68.9 | 14.5 | - | ran |
-| Opus4.7-GODs.Ghost.Codex.Distill.4B-Q8_0 | 4274 | qwen35 dense | 3455 | 1024.6 | 90.2 | 11.1 | - | ran |
-| Qwen3-4B-Q8_0 | 4082 | qwen3 dense | 1448 | 1031.3 | 95.9 | 10.4 | - | ran |
-| VibeThinker-3B.Q8_0 | 3133 | qwen2 dense | 2864 | 1360.0 | 0.0 | - | - | ran, emits EOS |
-| Samastam-2.5B-Q8_0 | 2560 | llama dense | 2389 | 2877.2 | 148.8 | 6.7 | - | ran |
-| Phi-3.5-mini-instruct-python_coding_assistanQ4_K_M | 2211 | llama dense | 2346 | 1463.2 | 94.8 | 10.5 | - | ran |
-| smolcode-coder-cpp-3b-q4_k_m | 2007 | qwen2 dense | 2159 | 1092.9 | 137.2 | 7.3 | - | ran |
-| smolcode-coder-cpp-1.5b-q4_k_m | 1065 | qwen2 dense | 1556 | 2029.6 | 200.7 | 5.0 | - | ran |
-| bitnet-2b-tq1_0 | 1054 | bitnet dense | 631 | 878.6 | 66.3 | 15.1 | - | ran |
+| laguna-xs2-Q4_K_M | 19335 | laguna MoE | 22089 | 98.1 | 33.2 | 30.1 | 74.3 | ran |
+| LFM2.5-24B-A2B-QAD-Q4_0 | 12949 | lfm2moe | 6293 | 424.3 | 80.7 | 12.4 | 98.9 | ran |
+| Mellum2.1-12B-A2.5B-Thinking-Q8_0 | 12326 | mellum MoE | 9134 | 460.9 | 60.7 | 16.5 | 100.0 | range guard fired |
+| Underdog-Saluki-27B-1.0-IQ2-mix-MTP-abliterated | 7962 | qwen35 dense | 6102 | 224.9 | 30.8 | 32.5 | - | ran |
+| omnicoder-9b-q6_k | 7018 | qwen35 dense | 8763 | 271.2 | 63.1 | 15.8 | - | ran |
+| Qwen2.5-Coder-7B-Instruct-Q5_K_M | 5192 | qwen2 dense | 4309 | 561.2 | 72.5 | 13.8 | - | ran |
+| qwen35-9b-instruct-nvfp4 | 5067 | qwen35 dense | 4860 | 798.5 | 79.0 | 12.7 | - | ran |
+| lacuna-v1-Q4_K_M | 4836 | llama dense | 3956 | 655.3 | 91.7 | 10.9 | - | ran |
+| Qwen3-8B-Q4_K_M | 4794 | qwen3 dense | 4279 | 639.5 | 80.8 | 12.4 | - | ran |
+| mythos-9b-unhinged-heretic.i1-Q4_K_M | 4794 | qwen3 dense | 3721 | 654.3 | 80.8 | 12.4 | - | ran |
+| Qwen3.5-9B-DeepSeek-V4-Flash-MTP-Q3_K_M | 4518 | qwen35 dense | 2632 | 778.7 | 68.8 | 14.5 | - | ran |
+| Opus4.7-GODs.Ghost.Codex.Distill.4B-Q8_0 | 4274 | qwen35 dense | 3870 | 1328.8 | 92.8 | 10.8 | - | ran |
+| Qwen3-4B-Q8_0 | 4082 | qwen3 dense | 2407 | 1333.5 | 96.2 | 10.4 | - | ran |
+| VibeThinker-3B.Q8_0 | 3133 | qwen2 dense | 3181 | 1630.8 | 0.0 | - | - | ran, emits EOS |
+| Samastam-2.5B-Q8_0 | 2560 | llama dense | 2248 | 3705.3 | 148.8 | 6.7 | - | ran |
+| Phi-3.5-mini-instruct-python_coding_assistanQ4_K_M | 2211 | llama dense | 1739 | 1851.7 | 94.2 | 10.6 | - | ran |
+| smolcode-coder-cpp-3b-q4_k_m | 2007 | qwen2 dense | 2103 | 1293.5 | 138.8 | 7.2 | - | ran |
+| smolcode-coder-cpp-1.5b-q4_k_m | 1065 | qwen2 dense | 1377 | 2521.6 | 196.9 | 5.1 | - | ran |
+| bitnet-2b-tq1_0 | 1054 | bitnet dense | 953 | 940.1 | 66.2 | 15.1 | - | ran |
 
 `ms/tok` is the reciprocal of the decode rate, quoted so a step cost can be
 compared across rows. `HOT %` is the expert cache's hit share and is blank on a
@@ -52,18 +55,21 @@ dense model, which has no expert tier.
 ## What the numbers say
 
 * **Prefill is the weak number on the larger dense files.** Underdog-Saluki-27B
-  reads 172.9 tok/s of prompt against 31.0 tok/s of decode, omnicoder-9b 221.5
-  against 58.1, and Qwen2.5-Coder-7B 494.3 against 73.1. The small models are
-  fast at both ends (smolcode 1.5B: 2029.6 and 200.7), so what is being measured
-  is the weight read, not the kernel shape.
+  reads 224.9 tok/s of prompt against 30.8 tok/s of decode, omnicoder-9b 271.2
+  against 63.1, and Qwen2.5-Coder-7B 561.2 against 72.5 -- against 172.9, 221.5
+  and 494.3 before the prefill staging change earlier the same day. The small
+  models are fast at both ends (smolcode 1.5B: 2521.6 and 196.9), so what is
+  being measured is the weight read, not the kernel shape.
 * **Decode tracks bytes per token, not parameter count.** bitnet-2b is ternary
   and dense, and loses to the much smaller fp16-adjacent files on prefill
-  (878.6 against 2029.6) because its 6912-wide FFN rows are read one at a time at
+  (940.1 against 2521.6) because its 6912-wide FFN rows are read one at a time at
   one token.
-* **MoE decode is bound by expert bring-in.** laguna-xs2 holds 71% of its
-  acquires in VRAM and still decodes at 32.3 tok/s against 92.8 tok/s of prefill,
-  while LFM2.5-24B, whose whole routed set fits the tier (98.9% hit), decodes at
-  81.4. Laguna-S-2.1, at 32 GiB against a 15.9 GiB card, drops to 6.1 tok/s.
+* **MoE decode is bound by expert bring-in, and the MoE prefill column is not a
+  kernel number.** laguna-xs2 holds 74.3% of its acquires in VRAM and decodes at
+  33.2 tok/s, while LFM2.5-24B, whose whole routed set fits the tier (98.9% hit),
+  decodes at 80.7. Their prefill follows the tier's state: laguna-xs2 read 92.8,
+  82.0 and 98.1 tok/s across three sweeps the same day, against 5.5 for
+  Laguna-S-2.1 at 32 GiB on a 15.9 GiB card.
 * **Two MoEs do not produce a trustworthy answer at these defaults.** Mellum2.1
   and Laguna-S-2.1 both leave the f16 activation range (`experts-sum` stores
   clipped) and exit rc=2, which is the range guard refusing the output. Their

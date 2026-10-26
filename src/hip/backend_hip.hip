@@ -3358,48 +3358,37 @@ public:
                                                        : "mma-only");
                     }
                 }
-                if (gemm_stage_only())
-                    gemm_wmma_kernel<wmma_cfg, 1,
-                                     static_cast<int>(DType::Q4_K)>
-                        <<<grid, wmma_cfg::THREADS>>>(
-                            wh, static_cast<int>(wt), n_out, n_in,
-                            row_bytes, xh, rows, oh, split, slice,
-                            parts, pstride);
-                else if (gemm_mma_only())
-                    gemm_wmma_kernel<wmma_cfg, 2,
-                                     static_cast<int>(DType::Q4_K)>
-                        <<<grid, wmma_cfg::THREADS>>>(
-                            wh, static_cast<int>(wt), n_out, n_in,
-                            row_bytes, xh, rows, oh, split, slice,
-                            parts, pstride);
-                else if (wnf >= 2)
-                    gemm_wmma_kernel<wmma_cfg_n2, 0,
-                                     static_cast<int>(DType::Q4_K), 2>
-                        <<<grid, wmma_cfg_n2::THREADS>>>(
-                            wh, static_cast<int>(wt), n_out, n_in,
-                            row_bytes, xh, rows, oh, split, slice,
-                            parts, pstride);
-                else if (wmb >= 4)
-                    gemm_wmma_kernel<wmma_cfg, 0,
-                                     static_cast<int>(DType::Q4_K), 4>
-                        <<<grid, wmma_cfg::THREADS>>>(
-                            wh, static_cast<int>(wt), n_out, n_in,
-                            row_bytes, xh, rows, oh, split, slice,
-                            parts, pstride);
-                else if (wmb >= 2)
-                    gemm_wmma_kernel<wmma_cfg, 0,
-                                     static_cast<int>(DType::Q4_K), 2>
-                        <<<grid, wmma_cfg::THREADS>>>(
-                            wh, static_cast<int>(wt), n_out, n_in,
-                            row_bytes, xh, rows, oh, split, slice,
-                            parts, pstride);
-                else
-                    gemm_wmma_kernel<wmma_cfg, 0,
-                                     static_cast<int>(DType::Q4_K)>
-                        <<<grid, wmma_cfg::THREADS>>>(
-                            wh, static_cast<int>(wt), n_out, n_in,
-                            row_bytes, xh, rows, oh, split, slice,
-                            parts, pstride);
+                // ONE launch shape for every arm, so an arm can differ from
+                // the default only in the template arguments.
+                constexpr int kQ4K = static_cast<int>(DType::Q4_K);
+#define KRK_GEMM_LAUNCH(CFG, MODE, MBO)                                      \
+    gemm_wmma_kernel<CFG, MODE, kQ4K, MBO><<<grid, CFG::THREADS>>>(          \
+        wh, static_cast<int>(wt), n_out, n_in, row_bytes, xh, rows, oh,      \
+        split, slice, parts, pstride)
+                // The diagnostic arms instantiate the SAME config the default
+                // does. They used to hard-code wmma_cfg (BM 32, MB 1, 26 kB
+                // LDS) whatever the default was, so the split they print
+                // described a kernel the engine does not run -- and on the 8B
+                // at 501 tokens that kernel measures 696.4 tok/s against the
+                // n2 default's 816.6. A split of the wrong kernel is worse
+                // than no split, because it is a number that looks like
+                // evidence.
+                if (gemm_stage_only()) {
+                    if (wnf >= 2) KRK_GEMM_LAUNCH(wmma_cfg_n2, 1, 2);
+                    else KRK_GEMM_LAUNCH(wmma_cfg, 1, 0);
+                } else if (gemm_mma_only()) {
+                    if (wnf >= 2) KRK_GEMM_LAUNCH(wmma_cfg_n2, 2, 2);
+                    else KRK_GEMM_LAUNCH(wmma_cfg, 2, 0);
+                } else if (wnf >= 2) {
+                    KRK_GEMM_LAUNCH(wmma_cfg_n2, 0, 2);
+                } else if (wmb >= 4) {
+                    KRK_GEMM_LAUNCH(wmma_cfg, 0, 4);
+                } else if (wmb >= 2) {
+                    KRK_GEMM_LAUNCH(wmma_cfg, 0, 2);
+                } else {
+                    KRK_GEMM_LAUNCH(wmma_cfg, 0, 0);
+                }
+#undef KRK_GEMM_LAUNCH
             } else if (wnf >= 2)
                 gemm_wmma_kernel<wmma_cfg_n2, 0, -1, 2>
                     <<<grid, wmma_cfg_n2::THREADS>>>(

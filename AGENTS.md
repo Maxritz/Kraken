@@ -1732,6 +1732,62 @@ code, the README, or `docs/`.
   quantized bytes (0.5 B/value) unpacked in registers at MMA time, which is the
   int8/MMQ rewrite, not a tile tweak. Baseline to beat: 1105-1138 us /
   13.7-14.2 TFLOP/s at rows=466, 340 us at rows=22.
+- **The prefill GEMM's staging phase had ONE unprefetched operand, and
+  prefetching it is worth 11-22% of prefill.** The Q4_K weight staging already
+  keeps round kt and kt+1's raw bytes in registers, so the weight side's load
+  latency is hidden under the MMAs; the **activation tile had no such
+  prefetch** -- its 8 loads per thread were issued and consumed by its own LDS
+  stores inside one phase, in front of the barrier, with nothing to overlap
+  them. At 52 kB of LDS the block gets one slot per CU (8 warps over 4 SIMDs, 2
+  warps per SIMD), so both warps of a SIMD stall on the same load together;
+  `tools/gemm_res.hip` reports the shipped instantiation at `LDS Size
+  [bytes/block]: 52224`, 143 VGPRs, 0 spills. `gemm_wmma_kernel` now holds this
+  thread's activation rows in registers for one round (`a_prefetch(kt+1)`
+  inside round kt's staging phase, `a_publish()` at the top of round kt+1), so
+  the loads are in flight across the weight decode, the barrier and the MMAs.
+  Interleaved medians of 3, and the two arms are two BINARIES -- an env switch
+  keeps both code paths alive in one binary and differs in register allocation
+  too: Qwen3-8B-Q4_K_M 501 tok **830.9 -> 1013.7 tok/s (+22.0%)**,
+  Qwen2.5-Coder-7B-Q5_K_M **881.1 -> 1073.0 (+21.8%)**, bitnet-2b-tq1_0
+  **1577.6 -> 1752.6 (+11.1%)**. In the op table the GEMM itself goes
+  375.14 -> 258.86 ms (**-31.0%**, 252 calls) and prefill wall 570.5 -> 459.9 ms.
+  Decode is untouched (40 tokens, 77.0-77.3 tok/s both arms: it runs the
+  `gemv_m` ladder, not the tile). Identity: `--bitexact`'s verdict lines are
+  identical (every gemm/group+silu row at rows 2..64 IDENTICAL), greedy 24
+  tokens are byte-identical on all three files, and the coherence check passes
+  on the dense, recurrent and MoE arms (`1 coherent, 0 not` each).
+- **A full LDS double buffer of the shipped tile does not fit, and the
+  arithmetic is the reason rather than the intuition.**
+  `(MB*BM + BN) * (BK + LD_PAD) * 2 B` is 52224 B at the default (BM 64,
+  BN 64, MB 2, BK 128, pad 8), so two buffer sets are 104448 B against a
+  65536 B cap -- and the padding is not negotiable either: at `LD_PAD=0` both
+  fragment loads put all 16 lanes of a half-warp in ONE bank (a 128-half row
+  stride is 0 mod 32 words), a 16-way conflict. The variants that do fit are
+  worse on measurement: `KRK_WMMA_NF=1 KRK_WMMA_MB=1` (26112 B, the 26 kB
+  config that fits two blocks per CU) reads **696.4 tok/s** against the
+  default's **816.6** at 501 tokens, `MB=2` 776.2, `MB=4` 770.1. So a second
+  resident block is not what this kernel wants; fewer staging rounds per output
+  row plus the NF=2 fragment pair is. Two traps from that sweep, both of which
+  have already produced numbers in this repo: `KRK_WMMA_MB` is **DEAD** while
+  `KRK_WMMA_NF=2` (the dispatch reads `wmma_cfg_n2::MB`), so an "MB=1 against
+  the default" A/B with NF left at 2 measures one kernel twice and reports
+  838.4 against 838.2 -- a real number, from two identical arms; and the
+  staging-vs-MMA arms (`KRK_GEMM_STAGE_ONLY`, `KRK_GEMM_MMA_ONLY`) **compile to
+  EMPTY kernels** (`LDS Size [bytes/block]: 0`, `VGPRs: 0` -- the staged tiles
+  become dead stores, and the mma-only arm's fragment loads read LDS nothing
+  writes), so their 124.5 / 123.4 ms against a 370.2 ms kernel is queue time,
+  not a split. That claim is withdrawn in `docs/AUDIT-prefill-gemm.md`: a split
+  arm has to keep its result alive to be a measurement, and the arms are now
+  instantiated on the shipped `wmma_cfg_n2` (they used to describe `wmma_cfg`
+  MB=1, a kernel 17% slower than the one the engine runs).
+- **The model sweep's MoE rows are not a measure of a GEMM change.** Refreshing
+  the 21-row sweep after the activation prefetch moved every DENSE row by +13 to
+  +31% prefill (Samastam 3673.5 from 2877.2, Qwen3-4B 1342.6 from 1031.3,
+  lacuna 621.1 from 520.1, Underdog 223.2 from 172.9; the short-prompt number
+  the README quotes for the 8B is 638.5 from 561.2) while the two files whose
+  rows stream 19 and 32 GiB of experts moved the other way (laguna-xs2 82.0 from
+  92.8, Laguna-S 19.1 from 21.2) -- their prefill is expert bring-in, not the
+  tile, and it is not stable run to run.
 - **A fused group's fallback runs on PREFILL, and it must use each matrix's own
   metadata.** `gemm_group`'s fused path is decode-only (rows == 1), so a prefill
   pass takes the per-matrix fallback -- and a fallback that decodes a Q4_K

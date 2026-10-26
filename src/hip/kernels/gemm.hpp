@@ -679,6 +679,80 @@ __global__ void __launch_bounds__(CFG::THREADS)
     _Float16 bf[kFrag];
     _Float16 tmp[32];
 
+    // ---- the activation tile, prefetched one K tile ahead -----------------
+    //
+    // The weight bytes for round kt+1 are already in flight during round kt
+    // (the Q4_K q4k_nxt pipeline below), which left the activation tile as the
+    // only global traffic in the staging phase whose latency sat in front of
+    // the barrier with nothing to hide it: its loads were issued and consumed
+    // inside one phase, and at 52 kB of LDS the block gets one slot per CU --
+    // 8 warps over 4 SIMDs, so both warps of a SIMD stall on the same load
+    // together. Holding this thread's rows in registers for one round moves
+    // that latency under the MMAs.
+    //
+    // Bit-identical by construction: the same rows, the same columns, the same
+    // 128-bit stores, only one round earlier. The values come from `x`, which
+    // nothing writes during the kernel, so a row loaded a round early holds
+    // exactly the bytes the old code read at use. `kraken-bench --bitexact` and
+    // the prefill hashes are the check.
+    //
+    // Register cost is kAReg*MB 128-bit vectors (32 VGPRs at the shipped
+    // config); the resource-usage probe in tools/gemm_res.hip reports it.
+    constexpr int kAV = 8;                       // halves per store
+    constexpr int kATPR = BK / kAV;              // threads per row
+    constexpr int kARows = THREADS / kATPR;      // rows per pass
+    static_assert(kAV <= BK && (BK % kAV) == 0, "BK must tile by 8");
+    static_assert((THREADS % kATPR) == 0, "THREADS must tile the row");
+    static_assert((BM % kARows) == 0, "BM must tile by the rows a pass covers");
+    constexpr int kAReg = BM / kARows;           // rows this thread holds
+    // The A tile vector path needs 8-half columns everywhere: the row width,
+    // the alignment and this block's slice length. Anything else keeps the
+    // direct staging below, which is the same tile by a scalar path.
+    const bool a_vec = (n_in % kAV) == 0 &&
+                       (reinterpret_cast<uintptr_t>(x) & 15u) == 0 &&
+                       (k_n % kAV) == 0;
+    v8half a_pre[MB][kAReg];
+
+    // Load this thread's rows of the activation tile for the K tile starting at
+    // `k0_arg` (an offset into the block's own K slice). Rows past `rows` and
+    // columns past the slice's end read as zero, exactly as the direct path
+    // stores them.
+    auto a_prefetch = [&](i64 k0_arg) {
+        const int c0 = (tid % kATPR) * kAV;
+#pragma unroll
+        for (int mi = 0; mi < MB; mi++) {
+            const i64 m_row = row_base + static_cast<i64>(mi) * BM;
+#pragma unroll
+            for (int q = 0; q < kAReg; q++) {
+                const int r = tid / kATPR + q * kARows;
+                const i64 gr = m_row + r;
+                if (gr < rows && k0_arg + c0 < k_n) {
+                    a_pre[mi][q] = *reinterpret_cast<const v8half *>(
+                        &x[gr * n_in + k_off + k0_arg + c0]);
+                } else {
+                    _Float16 z[kAV];
+#pragma unroll
+                    for (int e = 0; e < kAV; e++)
+                        z[e] = static_cast<_Float16>(0.0f);
+                    a_pre[mi][q] = *reinterpret_cast<const v8half *>(z);
+                }
+            }
+        }
+    };
+
+    // Publish what a_prefetch() loaded last round to the activation tile.
+    auto a_publish = [&]() {
+        const int c0 = (tid % kATPR) * kAV;
+#pragma unroll
+        for (int mi = 0; mi < MB; mi++) {
+#pragma unroll
+            for (int q = 0; q < kAReg; q++) {
+                const int r = tid / kATPR + q * kARows;
+                *reinterpret_cast<v8half *>(&xs[mi][r][c0]) = a_pre[mi][q];
+            }
+        }
+    };
+
     // Q4_K pipeline state: the raw bytes of the chunk this thread stages
     // in the current K-tile round (cur) and in the next (nxt). With
     // BK=128 the weight tile holds exactly THREADS 32-value chunks, so
@@ -711,6 +785,11 @@ __global__ void __launch_bounds__(CFG::THREADS)
         }
     }
 
+    // Round 0's activation rows, one round early like every later round.
+    if constexpr (MODE != 2) {
+        if (a_vec) a_prefetch(0);
+    }
+
     const i64 k_tiles = (k_n + BK - 1) / BK;
     for (i64 kt = 0; kt < k_tiles; kt++) {
         const i64 k0 = kt * BK;
@@ -722,60 +801,42 @@ __global__ void __launch_bounds__(CFG::THREADS)
         // issuing back to back: MMA-only measured 299 tok/s at MB=1 against 265
         // at MB=4, while the pair was the other way round (§22.19).
         if constexpr (MODE != 2) {
-        // Every M tile's activations, staged in one pass. Order inside the
-        // barrier does not matter; what matters is that there is ONE barrier
-        // before the MMAs instead of one per M tile.
-        for (int mi = 0; mi < MB; mi++) {
-        const i64 m_row = row_base + static_cast<i64>(mi) * BM;
-        // ---- stage the activation tile (BM x BK), zero past the row end ----
+        // ---- the activation tile: publish kt, prefetch kt+1 -----------------
         //
-        // MEASURED (9070 XT, gfx1201, Qwen3-8B ffn_up [12288x4096], rows=55):
-        // feeding this kernel F16 weights -- same WMMA count, 3.6x the
-        // staging bytes -- made it SLOWER (8.90 vs 13.56 TFLOP/s), so the
-        // limit is the staging path, not dequant arithmetic and not the
-        // tensor issue rate. The activation tile is the bigger half of
-        // that traffic: the grid is (12288/BN) * (rows/BM) = 192 column
-        // blocks, and every one of them re-reads the same A rows, so the
-        // activation side moves ~98 MB against ~28 MB of weights.
+        // A(kt)'s bytes were loaded during round kt-1 (a_prefetch), so this
+        // round only stores them; A(kt+1)'s loads are issued now and have the
+        // weight decode, the barrier and the whole MMA phase to land. That is
+        // the overlap the weights already had and the activations did not.
         //
-        // Each thread used to write 16 separate 2-byte elements per round.
-        // Handing it 8 consecutive halves instead makes each of those 16
-        // stores one 128-bit store, with the same bytes and the same
-        // values -- this is a store-width change, not a reordering, so
-        // the tile contents are bit-identical to the scalar path.
-        constexpr int kAV = 8;                          // halves per store
-        constexpr int kATPR = BK / kAV;                 // threads per row
-        constexpr int kARows = THREADS / kATPR;         // rows per pass
-        static_assert(kAV <= BK && (BK % kAV) == 0, "BK must tile by 8");
-        static_assert((THREADS % kATPR) == 0, "THREADS must tile the row");
-        const bool a_vec = (n_in % kAV) == 0 &&
-                           (reinterpret_cast<uintptr_t>(x) & 15u) == 0 &&
-                           (k_n % kAV) == 0;
+        // The tile's earlier comment still holds for the bytes that move: the
+        // activation side is the bigger half of the staging traffic, because
+        // every one of the (n_out/BN) column blocks re-reads the same A rows
+        // (~98 MB against ~28 MB of weights at 9070 XT ffn_up rows=55), and
+        // feeding this kernel F16 weights -- same WMMA count, 3.6x the staging
+        // bytes -- made it SLOWER, so the limit is this path and not dequant
+        // arithmetic or the tensor issue rate.
+        //
+        // Each thread writes 8-half columns, so a row's stores are 128-bit
+        // stores of exactly the values the direct path stored -- a store-width
+        // and issue-order change, not an arithmetic one, and the tile is
+        // bit-identical either way.
         if (a_vec) {
-            const int c0 = (tid % kATPR) * kAV;
-            for (int r = tid / kATPR; r < BM; r += kARows) {
-                const i64 gr = m_row + r;
-                if (gr < rows && k0 + c0 < k_n)
-                    *reinterpret_cast<v8half *>(&xs[mi][r][c0]) =
-                        *reinterpret_cast<const v8half *>(
-                            &x[gr * n_in + k_off + k0 + c0]);
-                else
-#pragma unroll
-                    for (int e = 0; e < kAV; e++)
-                        xs[mi][r][c0 + e] = static_cast<_Float16>(0.0f);
-            }
+            // kt == 0's rows were prefetched in the prologue.
+            a_publish();
+            if (kt + 1 < k_tiles) a_prefetch(k0 + BK);
         } else {
-            for (int i = tid; i < BM * BK; i += THREADS) {
-                const int r = i / BK;
-                const int c = i % BK;
-                const i64 gr = m_row + r;
-                xs[mi][r][c] = (gr < rows && k0 + c < k_n)
-                                   ? x[gr * n_in + k_off + k0 + c]
-                                   : static_cast<_Float16>(0.0f);
+            for (int mi = 0; mi < MB; mi++) {
+                const i64 m_row = row_base + static_cast<i64>(mi) * BM;
+                for (int i = tid; i < BM * BK; i += THREADS) {
+                    const int r = i / BK;
+                    const int c = i % BK;
+                    const i64 gr = m_row + r;
+                    xs[mi][r][c] = (gr < rows && k0 + c < k_n)
+                                       ? x[gr * n_in + k_off + k0 + c]
+                                       : static_cast<_Float16>(0.0f);
+                }
             }
         }
-
-        } // mi staging
         {
         // ---- stage the dequantized weight tile (BN x BK) ----
         if constexpr (DT == static_cast<int>(DType::Q4_K)) {
