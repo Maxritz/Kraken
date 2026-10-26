@@ -796,6 +796,19 @@ inline void attention_decode(void *out, const void *q, const void *kcache,
 // and one block cannot serve rows whose offsets differ.
 // ---------------------------------------------------------------------------
 
+// A product that has to be rounded BEFORE it is added, with no way for the
+// optimizer to see through it. `-ffast-math` carries `-ffp-contract=fast`, and
+// it fuses `fadd(fmul(x, y), z)` into an FMA whatever rounding intrinsics name
+// the two steps -- measured on this kernel's ISA: 0 `v_fmac_f32` in the form
+// whose products went through shared memory, 268 in the one that scaled in a
+// register. An FMA keeps the product's low bits, which is a different f16
+// output by an ulp. An empty asm is a barrier LLVM will not reorder or fuse
+// across, and it costs no instruction.
+__device__ __forceinline__ f32 d_rounded(f32 v) {
+    asm volatile("" : "+v"(v));
+    return v;
+}
+
 template <int VPT, int QT>
 __host__ __device__ __forceinline__ size_t attn_bexact_smem_bytes(int tile_k, i64 hd) {
     const size_t halves =
@@ -836,12 +849,15 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     const int lane = tid & (kWaveSize - 1);
     const int warp = tid / kWaveSize;
 
-    // Q rows are strided by n_head*hd, not contiguous: staging them as one
-    // run walks straight into the next head's row.
-    // staging them as one run walks into the next head's row.
-    for (i64 i = tid; i < static_cast<i64>(nq) * hd; i += kAttnDecThreads) {
-        const i64 qi = i / hd, dd = i % hd;
-        q_sh[i] = q[((t0 + qi) * n_head + h) * hd + dd];
+    // Q rows are strided by n_head*hd, so a contiguous run walks straight into
+    // the next head's row. Enumerating (row, 32-channel chunk) instead puts
+    // every lane on its own contiguous 64 B run and needs no per-element
+    // division: VPT IS hd/32, so `task / VPT` is a compile-time divide. The
+    // old flat form paid one i64 divide AND one i64 modulo per staged element.
+    const int ntask_q = nq * VPT;
+    for (int task = warp; task < ntask_q; task += kAttnDecWarps) {
+        const int r = task / VPT, d = (task % VPT) * kWaveSize + lane;
+        q_sh[static_cast<i64>(r) * hd + d] = q[((t0 + r) * n_head + h) * hd + d];
     }
     __syncthreads();
 
@@ -869,20 +885,25 @@ __global__ void __launch_bounds__(kAttnDecThreads)
     for (i64 k0 = 0; k0 < n_keys; k0 += tile_k) {
         const int tile =
             static_cast<int>((n_keys - k0) < tile_k ? (n_keys - k0) : tile_k);
-        const i64 tile_elems = static_cast<i64>(tile) * hd;
-        for (i64 i = tid; i < tile_elems; i += kAttnDecThreads) {
-            const i64 j = i / hd, dd = i % hd;
-            k_sh[i] = kv8
-                          ? attn_kv_at_q8(kb8 + (k0 + j) * kstride, kv_dim,
-                                          hkv * hd + dd)
-                          : kb[(k0 + j) * kstride + dd];
+        // Same index form as the Q stage above, and it matters more here: this
+        // loop runs once per key tile, so a division per element is paid on the
+        // per-pair side of the cost, not the per-block one. One (row,
+        // 32-channel chunk) task per warp step, `task / VPT` a compile-time
+        // divide, each lane on a contiguous 64 B run from global.
+        const int ntask_kv = tile * VPT;
+        for (int task = warp; task < ntask_kv; task += kAttnDecWarps) {
+            const int j = task / VPT, d = (task % VPT) * kWaveSize + lane;
+            k_sh[static_cast<i64>(j) * hd + d] =
+                kv8 ? attn_kv_at_q8(kb8 + static_cast<i64>(k0 + j) * kstride,
+                                    kv_dim, hkv * hd + d)
+                    : kb[static_cast<i64>(k0 + j) * kstride + d];
         }
-        for (i64 i = tid; i < tile_elems; i += kAttnDecThreads) {
-            const i64 j = i / hd, dd = i % hd;
-            v_sh[i] = kv8
-                          ? attn_kv_at_q8(vb8 + (k0 + j) * kstride, kv_dim,
-                                          hkv * hd + dd)
-                          : vb[(k0 + j) * kstride + dd];
+        for (int task = warp; task < ntask_kv; task += kAttnDecWarps) {
+            const int j = task / VPT, d = (task % VPT) * kWaveSize + lane;
+            v_sh[static_cast<i64>(j) * hd + d] =
+                kv8 ? attn_kv_at_q8(vb8 + static_cast<i64>(k0 + j) * kstride,
+                                    kv_dim, hkv * hd + d)
+                    : vb[static_cast<i64>(k0 + j) * kstride + d];
         }
         __syncthreads();
 
@@ -937,33 +958,64 @@ __global__ void __launch_bounds__(kAttnDecThreads)
 
     // Decode's tail, once per row and in warp order. `nq` is block-uniform, so
     // the guarded iterations keep every __syncthreads() on one path.
+    //
+    // ONE publish and TWO barriers per row, where this used to be two publishes
+    // and three: a warp writes its own (m, l) and its UNSCALED output
+    // accumulator, and the reader applies `aw = exp(m_w - mstar)` to each
+    // contribution inside the reduction. That is the same arithmetic to the
+    // last rounding step -- `acc_w[e] * aw_w` rounds once in f32 exactly as the
+    // old `slot[e] = acc[r][e] * aw` did, and the w-ascending sum order is
+    // unchanged -- so it moves no hash. What it removes is the round trip of
+    // the pre-scaled slot the old form wrote and re-read, and the per-warp `aw`
+    // it had to publish before the reduction could start.
+    //
+    // The slot is channel-major (`e` outer, lane inner) on purpose: the old
+    // lane-major layout put consecutive lanes VPT floats apart, so every one of
+    // the reduce's 8*VPT LDS reads was a 4-way bank conflict at VPT 4 (2-way at
+    // VPT 2), and it reads them 8 times per row. Channel-major puts lane L on
+    // bank L. The total is the same `kAttnDecWarps * kWaveSize * VPT` floats, so
+    // this changes no LDS footprint and therefore no occupancy.
 #pragma unroll
     for (int r = 0; r < QT; r++) {
         if (r >= nq) continue;
-        if (lane == 0) {
-            m_sh[warp] = mq[r];
-            l_sh[warp] = lq[r];
-        }
-        __syncthreads();
         f32 mstar = -1.0e30f;
-#pragma unroll
-        for (int w = 0; w < kAttnDecWarps; w++) mstar = fmaxf(mstar, m_sh[w]);
-        const f32 aw = __expf(mq[r] - mstar);
-        f32 *slot = o_sh + (warp * kWaveSize + lane) * VPT;
-#pragma unroll
-        for (int e = 0; e < VPT; e++) slot[e] = acc[r][e] * aw;
-        if (lane == 0) l_sh[warp] = lq[r] * aw;
-        __syncthreads();
         f32 lt = 0.0f;
         f32 ot[VPT];
 #pragma unroll
         for (int e = 0; e < VPT; e++) ot[e] = 0.0f;
+        if (lane == 0) {
+            m_sh[warp] = mq[r];
+            l_sh[warp] = lq[r];
+        }
+#pragma unroll
+        for (int e = 0; e < VPT; e++)
+            o_sh[e * kAttnDecThreads + warp * kWaveSize + lane] = acc[r][e];
+        __syncthreads();
+#pragma unroll
+        for (int w = 0; w < kAttnDecWarps; w++) mstar = fmaxf(mstar, m_sh[w]);
 #pragma unroll
         for (int w = 0; w < kAttnDecWarps; w++) {
-            lt += l_sh[w];
-            const f32 *s2 = o_sh + (w * kWaveSize + lane) * VPT;
+            // Recomputing `aw` per contributing warp is 8 MUFU exps a row per
+            // thread against the pair loop's 2 per (row, key) pair -- measured
+            // at under 1% of the kernel, and the exchange it removes is not.
+            const f32 aw = __expf(m_sh[w] - mstar);
+            // `d_rounded` around every product, and it is not decoration. The
+            // old form wrote the scaled slot through shared memory, and a
+            // store cannot be fused into anything; here the product and the add
+            // sit in one expression, and `-ffast-math` (which carries
+            // `-ffp-contract=fast`) fused them into `v_fmac_f32` -- 268 of them
+            // in this kernel against 0 in the old one, read off the ISA. An FMA
+            // keeps the product's low bits, so the row's output moved by an
+            // f16 ulp in a couple of elements per row and the chunk-8 trace
+            // hash moved with it. Neither `__fmul_rn`/`__fadd_rn` nor
+            // `#pragma clang fp contract(off)` stopped it; an asm barrier does,
+            // and costs no instruction. The ADDS are left alone on purpose:
+            // they reassociate into the same tree the old form's LDS reads did.
+            lt += d_rounded(l_sh[w] * aw);
+            const f32 *sb = o_sh + w * kWaveSize + lane;
 #pragma unroll
-            for (int e = 0; e < VPT; e++) ot[e] += s2[e];
+            for (int e = 0; e < VPT; e++)
+                ot[e] += d_rounded(sb[e * kAttnDecThreads] * aw);
         }
         // Sink for this row's head at the row's merged max -- the same
         // expression the decode row uses, which is what keeps a chunked
@@ -1025,31 +1077,73 @@ inline void attention_sink(const f32 *sinks, f32 *l, i64 n_head,
     attention_sink_launch(sinks, l, n_head, pos_stride, n_keys, stream);
 }
 
-inline bool attn_bexact_qt8() {
-    static const bool v = [] {
-        const char *e = std::getenv("KRK_ATTN_BEXACT_QT");
-        return e && e[0] == '8';
-    }();
-    return v;
+// The two A/B knobs this kernel exposes, and the one property that makes them
+// usable for a latency question: BOTH ARE ARITHMETIC-FREE. A warp still walks
+// the keys `j % 8 == warp` in increasing order and each row keeps its own
+// (m, l, acc) chain, so neither the tile depth (which only changes how many
+// keys are staged at once) nor QT (which only changes how many rows share a
+// staged tile) can move a hash. Every arm therefore has to reproduce the
+// default's `--prefill-hash` trace and logits -- measured on Qwen3-8B at 501
+// tokens, trace `b59269247d55ed24` / logits `119d51f3cda0cf18`, identical from
+// tile depths 8/16/32/64 and from QT 4/8/16 (see
+// docs/AUDIT-prefill-attention.md).
+//
+// QT is read per call rather than into a `static` cache for the same reason
+// `attn_wmma_on()` is: `kraken-bench --bitexact` flips it inside one process.
+inline int attn_bexact_qt(int def) {
+    const char *e = std::getenv("KRK_ATTN_BEXACT_QT");
+    if (!e) return def;
+    const int v = std::atoi(e);
+    return (v == 4 || v == 8 || v == 16) ? v : def;
 }
+
+// Tile depth: a multiple of the warp count, because the per-tile warp stride
+// has to land on decode's key partition `j % 8`, and at least one warp deep.
+// A caller who names a depth (the A/B arm) gets exactly that depth.
+inline int attn_bexact_tile_override() {
+    const char *e = std::getenv("KRK_ATTN_BEXACT_TILE");
+    const int v = e ? std::atoi(e) : 0;
+    return (v >= kAttnDecWarps && v % kAttnDecWarps == 0) ? v : 0;
+}
+
+// The default depth is the LDS footprint's, not the key count's: the staged
+// K/V pair is what decides how many blocks a CU can hold, and one block (the
+// old 64-deep default at hd 128) leaves 2 warps per SIMD to hide a per-pair
+// dependency chain. So walk down from the old default until the pair plus the
+// merge buffer fits this budget, floored at one warp.
+//
+// MEASURED (Qwen3-8B, 501-token prompt, 144.87M (row,key) pairs, median of 4
+// interleaved runs, KRK_TIME=attention): 8 keys 153.4 ms / 16 keys 156.5 /
+// 24 169.6 / 32 181.9 / 64 216.6, against LDS-per-block 10.3 / 14.4 / 18.5 /
+// 22.6 / 39.0 KiB. The 12 KiB budget lands on 32 keys at hd 64, 16 at hd 96, 8
+// at hd 128-160, and the 8-key floor at hd 192 and up, where the merge buffer
+// alone is most of the budget.
+constexpr int kAttnTileLdsBudget = 12 * 1024;
 
 inline void attention_bexact(void *out, const void *q, const void *kcache,
                              const void *vcache, i64 n_head, i64 n_kv, i64 hd,
                              i64 n_tok, i64 pos0, i64 pos_stride, f32 scale,
                              int lds_bytes, hipStream_t stream = nullptr,
                              const f32 *sinks = nullptr, i64 skip_from = -1) {
-    // tile_k is a multiple of the warp count so the per-tile warp stride lands
-    // on exactly decode's key partition (j % 8), and small enough for the
-    // staged pair to fit the device's LDS with the accumulators' merge buffer.
-    int tile_k = 64;
-    if (hd >= 256) tile_k = 32;
+    // The tile depth is a multiple of the warp count so the per-tile warp
+    // stride lands on exactly decode's key partition (j % 8). Its DEFAULT is
+    // read off the LDS budget above rather than the device's LDS ceiling: the
+    // ceiling is what the old 64-deep default already respected at hd 128
+    // (39.0 KiB of 64 KiB), and respecting only the ceiling is what pinned the
+    // kernel to one block per CU. An explicit `KRK_ATTN_BEXACT_TILE` is the
+    // A/B arm and is held to the ceiling, not to the budget.
+    const int tile_override = attn_bexact_tile_override();
+    const size_t tile_cap =
+        static_cast<size_t>(kAttnTileLdsBudget < lds_bytes ? kAttnTileLdsBudget
+                                                          : lds_bytes);
 #define KRK_ATTN_BEXACT(VPTV, QTV)                                            \
     do {                                                                     \
-        int kk = tile_k;                                                     \
+        int kk = tile_override ? tile_override : (hd >= 256 ? 32 : 64);       \
+        const size_t budget =                                                 \
+            tile_override ? static_cast<size_t>(lds_bytes) : tile_cap;        \
         while (kk > kAttnDecWarps &&                                         \
-               attn_bexact_smem_bytes<VPTV, QTV>(kk, hd) >                    \
-                   static_cast<size_t>(lds_bytes))                           \
-            kk /= 2;                                                         \
+               attn_bexact_smem_bytes<VPTV, QTV>(kk, hd) > budget)            \
+            kk -= kAttnDecWarps;                                             \
         const size_t bs = attn_bexact_smem_bytes<VPTV, QTV>(kk, hd);         \
         const dim3 g(static_cast<unsigned>(n_head),                          \
                      static_cast<unsigned>((n_tok + (QTV) - 1) / (QTV)));    \
@@ -1071,15 +1165,30 @@ inline void attention_bexact(void *out, const void *q, const void *kcache,
     // ones (96, 160, 224) have no decode kernel at all, so this is simply their
     // prefill path. QT holds VPT*QT at ~32 registers.
     switch (static_cast<int>(hd)) {
-        case 64: KRK_ATTN_BEXACT(2, 8); break;
+        case 64:
+            switch (attn_bexact_qt(8)) {
+                case 4: KRK_ATTN_BEXACT(2, 4); break;
+                case 16: KRK_ATTN_BEXACT(2, 16); break;
+                default: KRK_ATTN_BEXACT(2, 8); break;
+            }
+            break;
         case 96: KRK_ATTN_BEXACT(3, 8); break;
-        case 128: KRK_ATTN_BEXACT(4, 8); break;
+        case 128:
+            switch (attn_bexact_qt(8)) {
+                case 4: KRK_ATTN_BEXACT(4, 4); break;
+                case 16: KRK_ATTN_BEXACT(4, 16); break;
+                default: KRK_ATTN_BEXACT(4, 8); break;
+            }
+            break;
         case 160: KRK_ATTN_BEXACT(5, 4); break;
         case 192: KRK_ATTN_BEXACT(6, 4); break;
         case 224: KRK_ATTN_BEXACT(7, 4); break;
         case 256:
-            if (attn_bexact_qt8()) KRK_ATTN_BEXACT(8, 8);
-            else KRK_ATTN_BEXACT(8, 4);
+            switch (attn_bexact_qt(4)) {
+                case 8: KRK_ATTN_BEXACT(8, 8); break;
+                case 16: KRK_ATTN_BEXACT(8, 16); break;
+                default: KRK_ATTN_BEXACT(8, 4); break;
+            }
             break;
         default: break;
     }

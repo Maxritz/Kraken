@@ -336,6 +336,88 @@ code, the README, or `docs/`.
   `--chunk 8` and `--chunk 512` on both arms, and the hash gate's
   `bf32bbb3...`/`e8d8efa9...` at chunks 1/2/8/16/32 and its `f034bf9b...` at 1/8/512
   are unchanged.
+- **The prefill attention kernel had ONE BLOCK PER CU because of its LDS
+  footprint, and the tile depth is now read off a 12 KiB budget instead of a
+  constant.** `attention_bexact_smem_bytes<VPT,QT>(k,hd)` is
+  `(QT + 2k)*hd*2 + floats`, and at hd 128 the old constant tile 64 asked
+  **38,976 B of a 65,536 B CU**, i.e. 8 warps over 4 SIMDs -- 2 warps per SIMD --
+  for a loop whose every (row, key) pair is a serial chain. Qwen3-8B, 501-token
+  prompt, 144.87M pairs, interleaved medians, `KRK_TIME=attention`: tile 8
+  153.4 ms / 16 156.5 / 24 169.6 / 32 181.9 / 64 216.6, against LDS-per-block
+  10.3 / 14.4 / 18.5 / 22.6 / 39.0 KiB. The shipped rule walks down from the old
+  constant until the staged pair plus the merge buffer fits **12 KiB** (floored
+  at one warp), which lands on 32 at hd 64, 16 at hd 96, 8 at hd 128-160 and the
+  8-key floor at 192 and up; `KRK_ATTN_BEXACT_TILE` overrides it for A/B and is
+  held to the device ceiling, not the budget. A/B: **hd 128 −29.8% attention
+  (217.2 -> 152.5 ms) and +25.9% prefill (1029 -> 1295 tok/s)**, hd 64 −15.1%,
+  hd 96 and hd 256 −6.1%.
+  **It is arithmetic-free, and that is proved, not argued.** A warp still walks
+  `j % 8 == warp` ascending, each row keeps its own (m,l,acc) chain, and only the
+  staged tile depth changes, so `--prefill-hash` on the 8B at 501 tokens gives
+  `b59269247d55ed24` / logits `119d51f3cda0cf18` / first 576 from **tile 8, the
+  rule, tile 32 and tile 64 alike**, and the LFM2.5-24B-A2B pin recorded above
+  reproduces exactly (`c19de85c8a06d85d` / `9fce30dd39c9bf6f` / 4741) even though
+  the rule moved that file's depth 64 -> 32. `--bitexact` stays rc=0 (27/27 int8
+  arms, 0 kernel/rows cases differing) and the chunk gate's
+  `f034bf9b`/`bf32bbb3`/`33048d8c` are unchanged.
+- **The prefill attention number to quote is `0.286 ns x (row,key) pair + 1.059
+  us x block`, and NEITHER the KV walk nor the softmax chain is the limit.** The
+  first fit read `0.55 ns + 1.09 us`, the middle point of three landing within
+  1.7%; the index-form staging then halved the pair term (0.557 -> 0.283) and the
+  one-pass row epilogue took 8.6% off the block term (1.159 -> 1.059), which is
+  what the three-length fit is for -- it says which coefficient a change landed
+  on, and those two land on different ones. At 72,576 blocks the per-block term is
+  now **77 ms of the 118 ms**, and it is the larger share of a short prompt's
+  cost: for a short prompt the fixed per-block work is *the* cost. A temporary
+  decomposition arm (removed after measuring, wrong outputs by construction)
+  attributes the per-pair loop, quoted against its own control because its
+  plumbing costs ~6%: **no K/V staging −31%, no 32-lane reduce −15%, no softmax
+  chain 0%**, and a bare loop (guards + 2 `v_dot2` + the V read) still −47%.
+  The KV walk's *volume* is not it either: QT 16 halves the staged bytes per pair
+  and QT 4 doubles them, and at a fixed tile that is ±10% with the sign flipping
+  with the depth (QT 16 is also the one instantiation the compiler marks down:
+  134 VGPRs, 13 spilled SGPRs, 10 waves/SIMD against 16). What is NOT explained:
+  the bare loop still runs at ~128 cycles per pair per CU against a ~3-5 cycle
+  instruction-count model, and this box has no counter path on this op, so the
+  stall is unattributed -- the candidates are the LDS K read (a `u32` per lane at
+  an 8-byte stride hits half the banks twice) and the per-block Q staging +
+  per-row epilogue (8 barriers per block at QT 8, down from 16).
+- **`-ffast-math` fuses `fadd(fmul(x,y),z)` into an FMA whatever rounding
+  intrinsics name the two steps, and that alone is a moved hash.** The prefill
+  attention epilogue now scales on the READER side, in a register, where the old
+  form wrote its scaled slot through shared memory -- and a store cannot be fused
+  into anything. The same arithmetic in the register form compiled to **268
+  `v_fmac_f32` against 0** in the old one (read off the device ISA), an FMA keeps
+  the product's low bits, and `--prefill-hash` moved from `03e265735b71b0a4` to
+  `17f6d26aeb0ae0d3` at chunk 8 while chunk 1 and the first token stayed put. The
+  difference was 1 f16 ulp in 1-2 of 4096 elements per row and the first differing
+  stage was `attn.out` with `q`/`k`/`v` identical, so it looked like a rounding
+  defect in the merge and was a codegen one. **`__fmul_rn`/`__fadd_rn` do not stop
+  it and neither does `#pragma clang fp contract(off)`**; `d_rounded()` in
+  `attention.hpp` -- an empty `asm volatile("" : "+v"(v))` around each product --
+  does, and costs no instruction. The ADDS are left free to reassociate, because
+  the old form's own reduce is a `v_dual_add_f32` tree and not a chain. The ISA is
+  what settled it and it is cheap to read: `tools/attn_isa_probe.hip` instantiates
+  the kernel alone, `hipcc <the TU's flags> --save-temps` leaves
+  `<name>.hip-hip-amdgcn-amd-amdhsa.hipfb.amdgcn.gfx1201.img.lto.s`, and the
+  opcode counts of one symbol diffed across two revisions named the mechanism in
+  one build. Numbers, the fit table and the identity proof:
+  `docs/AUDIT-prefill-attention.md` §7.
+- **`attention_wmma_kernel` refuses every head width except 256, so the FAST
+  rung runs the bit-exact kernel at hd 64/96/128 too.** `attention_wmma_ok` is
+  `hd == 256 && !kv_int8 && window == 0`, and `attn_bexact_on()` is not tied to
+  the rung, so `--prefill fast` only changes the attention kernel at hd 256.
+  Measured at 501 tokens on Qwen3.5-9B the two are level (matrix cores 248.3 ms
+  against bit-exact 249.0), and the tiled fallback is 4.3-6.1x either of them on
+  the 8B (928.7 ms against 216.6/152.5). The widths most local dense files use
+  are 64/96/128, where attention is 30-60% of prefill. Two traps in the op
+  recorder here: a *per-call* term is charged to the op on some files -- an
+  11-token prompt reports 48.15 ms of "attention" over 8 launches that do ~100
+  pairs on the qwen35 hybrid, against a 0.43 ms-per-call floor on the dense 8B --
+  so cross-file per-pair rates carry that error, and the hd-256 row's 15.47
+  ns/pair is **not attributed** (QT and tile arms do not move it).
+  `docs/AUDIT-prefill-attention.md` has the full tables, the trap arms, the
+  resource report and the ranked next fixes.
 - **The `routing` component row is a PARENT span, and reading it as the router's
   own cost is off by ~4x.** On Qwen3.5-35B-A3B, 4140-token prompt, `--chunk 512`,
   `KRK_PROFILE=1`, `moe.route.batch` reads 23885 ms over 360 calls (66.3 ms a
