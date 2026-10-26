@@ -5185,8 +5185,12 @@ bool Engine::configure_expert_cache(std::string *err) {
                  static_cast<f64>(staged) / 1048576.0, stage_ms, ram_mib,
                  hit_host_reserve ? " (stopped at the host RAM reserve)" : "");
     }
-    char warm_note[80] = "";
-    if (warm > 0)
+    char warm_note[96] = "";
+    if (model_.experts().warm_as_mapping())
+        std::snprintf(warm_note, sizeof(warm_note),
+                      " + no WARM (KRK_EXPERT_WARM_MAP=1: the mapping is the "
+                      "second tier)");
+    else if (warm > 0)
         std::snprintf(warm_note, sizeof(warm_note),
                       " + WARM %.0f MiB pageable%s",
                       static_cast<f64>(warm) / (1024.0 * 1024.0),
@@ -5215,9 +5219,11 @@ bool Engine::configure_expert_cache(std::string *err) {
                      static_cast<f64>(total_bytes) / (1024.0 * 1024.0 * 1024.0),
                      static_cast<f64>(budget) / (1024.0 * 1024.0 * 1024.0),
                      frac * 100.0,
-                     warm >= total_bytes
-                         ? "the WARM tier still holds the full set, so a device miss promotes from RAM instead of reading the file"
-                         : "raise --expert-cache-mb, lower --ctx / --kv-hot-mb, or use a model whose routed set fits the card");
+                     model_.experts().warm_as_mapping()
+                         ? "under KRK_EXPERT_WARM_MAP=1 a device miss reads the file's page cache instead of promoting a host copy, so the churn is a read, not a promotion"
+                         : warm >= total_bytes
+                               ? "the WARM tier still holds the full set, so a device miss promotes from RAM instead of reading the file"
+                               : "raise --expert-cache-mb, lower --ctx / --kv-hot-mb, or use a model whose routed set fits the card");
         }
     }
     // Every path above either refused (return false) or configured the cache.
@@ -6716,7 +6722,8 @@ bool Engine::expert_warmup_wanted() const {
     const ModelConfig &mc = model_.cfg();
     if (!mc.is_moe || mc.n_expert <= 0) return false;
     const ExpertCache &ec = model_.experts();
-    if (ec.warm_capacity_bytes() == 0) return false; // no second tier to fill
+    if (ec.warm_capacity_bytes() == 0 && !ec.warm_as_mapping())
+        return false; // no second tier to fill
     bool on = cfg_.expert_warmup > 0;
     if (cfg_.expert_warmup < 0) {
         // Default: on exactly when the ORDER of the two tiers can change the
@@ -7180,7 +7187,11 @@ void Engine::warm_experts() {
     if (!mc.is_moe || mc.n_expert <= 0) return;
     ExpertCache &ec = model_.experts();
     const size_t one = model_.max_expert_bytes();
-    if (one == 0 || ec.warm_capacity_bytes() == 0) return;
+    // Under the mapping policy the phase has a product even with a 0-byte WARM
+    // tier: it faults the model's pages in, which is what the acquire path then
+    // reads instead of a promoted copy.
+    if (one == 0 || (ec.warm_capacity_bytes() == 0 && !ec.warm_as_mapping()))
+        return;
 
     const std::chrono::steady_clock::time_point t0 =
         std::chrono::steady_clock::now();
@@ -7259,7 +7270,10 @@ void Engine::warm_experts() {
         }
         const size_t used = ec.warm_used_bytes();
         const size_t left = warm_cap > used ? (warm_cap - used) / one : 0;
-        if (left == 0) break; // tier full
+        // A full tier ends the phase; under the mapping policy the tier is a
+        // page cache the cache does not own, so "full" is not a thing it can
+        // observe -- the ceiling, the depth and the depth of the rank are.
+        if (left == 0 && !ec.warm_as_mapping()) break; // tier full
         // Round width: what the remaining tier holds across every layer at
         // once. Without the division a tier that filled mid-round would leave
         // the layers it had not reached yet with nothing, which is the exact
@@ -7331,7 +7345,10 @@ void Engine::warm_experts() {
                 if (ec.full_for(L.experts)) continue;
                 room = true;
                 const i32 e = lst[r];
-                if (!ec.in_host(l, e)) continue; // staging did not reach it
+                // Under the mapping policy nothing is ever in host RAM, so the
+                // WARM half cannot have staged the expert the VRAM half is
+                // about to ask for -- acquire() reads the mapping instead.
+                if (!ec.warm_as_mapping() && !ec.in_host(l, e)) continue;
                 const size_t had = ec.resident_slots();
                 if (ec.acquire(L.experts, l, e) && ec.resident_slots() > had) {
                     promoted++;
@@ -7377,21 +7394,34 @@ void Engine::warm_experts() {
     // is declared -- reading it there reports 0 ms for a phase that exists to
     // read, which is how this line first came out as "0 ms = 0.0 GB/s".
     const f64 read_ms = ec.read_ms();
-    KRK_INFO("expert warmup: %s order, %d rounds, %zu experts/layer deep; WARM "
-             "%.0f MiB of %.0f MiB in %zu slots (%.0f MiB read in %.0f ms = "
-             "%.1f GB/s; book %.0f ms + room %.0f ms, alloc %.0f ms of which "
-             "%.0f overlapped the read, commit %.0f ms), "
-             "VRAM +%zu "
-             "experts (%.0f MiB, %zu slots); %.0f ms%s",
-             ranked ? "ranked" : "even", rounds, depth,
-             static_cast<f64>(ec.warm_used_bytes()) / 1048576.0,
-             static_cast<f64>(warm_cap) / 1048576.0, ec.warm_slots(),
-             static_cast<f64>(staged) / 1048576.0, read_ms,
-             read_ms > 0.0 ? static_cast<f64>(staged) / 1073741824.0 /
-                                 (read_ms / 1000.0)
-                           : 0.0,
-             ec.prep_ms(), ec.room_ms(), ec.alloc_ms(), ec.overlap_ms(),
-             ec.commit_ms(), promoted,
+    const f64 read_gbs = read_ms > 0.0
+                             ? static_cast<f64>(staged) / 1073741824.0 /
+                                   (read_ms / 1000.0)
+                             : 0.0;
+    // Under the mapping policy the phase has no tier to describe: its whole
+    // product is that the model file's pages are resident, which the acquire
+    // path then reads once instead of a second copy. Saying "WARM 0 MiB of X"
+    // there would read as a phase that failed.
+    char tier_note[256];
+    if (ec.warm_as_mapping())
+        std::snprintf(tier_note, sizeof(tier_note),
+                      "MAPPING (page cache: %.0f MiB read in %.0f ms = %.1f "
+                      "GB/s, nothing retained)",
+                      static_cast<f64>(staged) / 1048576.0, read_ms, read_gbs);
+    else
+        std::snprintf(tier_note, sizeof(tier_note),
+                      "WARM %.0f MiB of %.0f MiB in %zu slots (%.0f MiB read in "
+                      "%.0f ms = %.1f GB/s; book %.0f ms + room %.0f ms, alloc "
+                      "%.0f ms of which %.0f overlapped the read, commit %.0f "
+                      "ms)",
+                      static_cast<f64>(ec.warm_used_bytes()) / 1048576.0,
+                      static_cast<f64>(warm_cap) / 1048576.0, ec.warm_slots(),
+                      static_cast<f64>(staged) / 1048576.0, read_ms, read_gbs,
+                      ec.prep_ms(), ec.room_ms(), ec.alloc_ms(), ec.overlap_ms(),
+                      ec.commit_ms());
+    KRK_INFO("expert warmup: %s order, %d rounds, %zu experts/layer deep; %s, "
+             "VRAM +%zu experts (%.0f MiB, %zu slots); %.0f ms%s",
+             ranked ? "ranked" : "even", rounds, depth, tier_note, promoted,
              static_cast<f64>(promoted_bytes) / 1048576.0, ec.resident_slots(),
              ms, why.c_str());
     // The warmup's traffic is not the run's. Reset the counters it earned so

@@ -255,6 +255,10 @@ void ExpertCache::configure(Backend *be, size_t budget_bytes, size_t host_budget
     budget_ = budget_bytes;
     host_budget_ = host_budget_bytes;
     slot_budget_ = slot_budget;
+    // KRK_EXPERT_WARM_MAP=1: the page cache is the second tier and nothing is
+    // kept in host RAM (see the header). Read once per configure so the A/B is
+    // one environment variable wide and the rest of the file asks a bool.
+    if (const char *e = std::getenv("KRK_EXPERT_WARM_MAP")) warm_map_ = e[0] == '1';
     // KRK_HOST_PIN_MB: how much of WARM to admit into pinned host memory. Off by
     // default, because the arm has to exist before the measurement (and because
     // pinned pages are a scarce, non-swappable pool on Windows). Clamped to the
@@ -294,6 +298,12 @@ void ExpertCache::clear() {
     // from the slots below: stop it first, or a completed entry installs itself
     // into a generation that no longer exists.
     prefetch_warm_join();
+    // The touch scratch is the only host buffer here that is not a slot's, and
+    // it belongs to the backend that allocated it -- which is why this happens
+    // before configure() reassigns be_.
+    if (touch_buf_ && be_) be_->release_host_pageable(touch_buf_);
+    touch_buf_ = nullptr;
+    touch_buf_bytes_ = 0;
     {
         std::lock_guard<std::mutex> lk(pf_mu_);
         pf_stop_ = false; // a cleared cache may be used again
@@ -1063,6 +1073,10 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
 }
 
 bool ExpertCache::warm_admit(const ExpertSource &src, i32 expert, Slot &s) {
+    // Under the mapping policy there is no retained copy to admit to, and the
+    // caller's cold path reads the mapping instead -- which is the whole point
+    // of the policy, so this is not a rejection and does not count as one.
+    if (warm_map_) return false;
     const GgufTensor *from[3] = {src.gate, src.up, src.down};
     size_t eff[3] = {0, 0, 0};
     for (int i = 0; i < 3; i++)
@@ -1408,8 +1422,13 @@ bool ExpertCache::pick_warm_victim(u64 *out) {
 }
 
 size_t ExpertCache::preload_one(const ExpertSource &src, i32 layer, i32 expert) {
-    if (!be_ || !src.present() || host_budget_ == 0) return 0;
+    if (!be_ || !src.present()) return 0;
     if (expert < 0 || expert >= src.n_expert) return 0;
+    // The mapping policy keeps nothing, so an eager sweep's only useful product
+    // is a warm page cache -- read the bytes and drop them, and report them as
+    // the traffic it was.
+    if (warm_map_) return touch_layer(src, layer, &expert, 1);
+    if (host_budget_ == 0) return 0;
     const u64 key = slot_key(layer, expert);
     if (slots_.count(key)) return 0; // already resident in some tier
     Slot s;
@@ -1620,7 +1639,12 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
         // WARM hit: the weights are already in RAM, so this acquire costs a DMA
         // instead of a re-read of the file. It also earns the same counter —
         // an expert hot enough to be evicted is still hot.
-        if (promote_to_vram(s)) {
+        // Under the mapping policy this copy is dropped instead of promoted:
+        // the bytes are in the file's page cache already, so a promotion copies
+        // them twice (RAM -> staging ring -> VRAM) and holds a second copy of
+        // the whole tier in RAM to do it. Falling through to the cold path
+        // reads the mapping -- one copy, and no host allocation at all.
+        if (!warm_map_ && promote_to_vram(s)) {
             touch(s);
             host_hits_++;
             xtrace(layer, expert, 1);
@@ -2113,8 +2137,72 @@ size_t ExpertCache::stage_ahead(const ExpertSource &src, i32 layer,
     return staged;
 }
 
+size_t ExpertCache::touch_layer(const ExpertSource &src, i32 layer,
+                                const i32 *experts, int n) {
+    if (!be_ || !src.present() || !experts || n <= 0) return 0;
+    const GgufTensor *ts[3] = {src.gate, src.up, src.down};
+    size_t slice[3] = {0, 0, 0};
+    for (int i = 0; i < 3; i++)
+        if (ts[i]) slice[i] = src.per_expert(ts[i]);
+    const WarmBlockLayout blk = warm_block_layout(slice);
+    if (blk.total == 0) return 0;
+    // One bounded scratch block, reused for every chunk of the call. The bytes
+    // have to land SOMEWHERE for the OS to fault the pages in, and eight
+    // experts is enough to keep three reads each in flight, which is what the
+    // reader pool needs to reach its ~7 GB/s. Nothing is retained, so this is
+    // the whole of the tier's RAM cost under the mapping policy.
+    const size_t chunk = 8;
+    const size_t want = chunk * blk.total;
+    if (touch_buf_bytes_ < want) {
+        if (touch_buf_) be_->release_host_pageable(touch_buf_);
+        touch_buf_ = be_->alloc_host_pageable(want);
+        touch_buf_bytes_ = touch_buf_ ? want : 0;
+        // No scratch is a touch that cannot happen, not a failure: the run's
+        // first acquire of each expert still reads it.
+        if (!touch_buf_) return 0;
+    }
+    size_t bytes = 0;
+    {
+        MsTimer t(&read_ms_, phase_sink(&pf_read_ms_, &dc_read_ms_));
+        for (int b = 0; b < n; b += static_cast<int>(chunk)) {
+            const int last = b + static_cast<int>(chunk) < n
+                                 ? b + static_cast<int>(chunk)
+                                 : n;
+            std::vector<Backend::ReadReq> reqs;
+            reqs.reserve(static_cast<size_t>(last - b) * 3);
+            for (int k = b; k < last; k++) {
+                const i32 id = experts[k];
+                if (id < 0 || id >= src.n_expert) continue;
+                char *base = static_cast<char *>(touch_buf_) +
+                             static_cast<size_t>(k - b) * blk.total;
+                for (int i = 0; i < 3; i++) {
+                    if (!slice[i] || !ts[i] || !ts[i]->data) continue;
+                    reqs.push_back(Backend::ReadReq{
+                        base + blk.off[i],
+                        ts[i]->data + static_cast<size_t>(id) * slice[i],
+                        slice[i]});
+                }
+            }
+            if (reqs.empty()) continue;
+            try {
+                be_->read_host_batch(reqs.data(), static_cast<int>(reqs.size()));
+            } catch (...) {
+                // Advisory by contract, exactly like prefetch_layer: a read
+                // that threw costs the page-cache warmth, never the run.
+                bytes_touched_ += bytes;
+                return bytes;
+            }
+            for (const Backend::ReadReq &r : reqs) bytes += r.bytes;
+        }
+    }
+    bytes_touched_ += bytes;
+    return bytes;
+}
+
 size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
                                    const i32 *experts, int n) {
+    // The mapping policy's version of this call: the same reads, kept nowhere.
+    if (warm_map_) return touch_layer(src, layer, experts, n);
     if (!be_ || host_budget_ == 0 || !src.present() || n <= 0) return 0;
     const GgufTensor *ts[3] = {src.gate, src.up, src.down};
     size_t slice[3] = {0, 0, 0};
@@ -2541,6 +2629,10 @@ void ExpertCache::pf_worker() {
 
 void ExpertCache::prefetch_warm_next(const ExpertSource &src, i32 layer,
                                      const i32 *ids, int n) {
+    // Nothing is retained under the mapping policy, so a read-ahead would copy
+    // bytes into a host buffer the next acquire then drops -- strictly more
+    // traffic than the acquire's own mapping read.
+    if (warm_map_) return;
     if (!be_ || !src.present() || n <= 0) return;
     {
         std::lock_guard<std::mutex> lk(pf_mu_);
@@ -2584,9 +2676,12 @@ bool ExpertCache::take_prefetched(i32 layer, i32 expert) {
     }
     // The layer got there first, or there is no tier to put it in: the bytes are
     // a duplicate and go back. Never a different answer, only a wasted read.
+    // `warm_map_` belongs in the same test: the entry is a host copy, which is
+    // exactly what the mapping policy keeps no copy of, so installing it would
+    // leave WARM non-empty by a path that never asked the policy.
     auto sit = slots_.find(slot_key(layer, expert));
     if ((sit != slots_.end() && sit->second.in_host()) || !be_ ||
-        host_budget_ == 0) {
+        host_budget_ == 0 || warm_map_) {
         pf_free(ent);
         return false;
     }
@@ -2647,6 +2742,11 @@ void ExpertCache::prefetch_warm_join() {
     pf_done_bytes_ = 0;
 }
 
-ExpertCache::~ExpertCache() { prefetch_warm_join(); }
+ExpertCache::~ExpertCache() {
+    prefetch_warm_join();
+    if (touch_buf_ && be_) be_->release_host_pageable(touch_buf_);
+    touch_buf_ = nullptr;
+    touch_buf_bytes_ = 0;
+}
 
 } // namespace krk

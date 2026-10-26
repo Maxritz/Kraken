@@ -860,16 +860,25 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     const f64 token_div = r.generated > 0 ? static_cast<f64>(r.generated) : 1.0;
     std::fprintf(out,
                  "[stats ] experts   %.0f MiB VRAM budget, %zu/%zu slots resident, "
-                 "%zu pinned | WARM %.0f MiB (%.0f pinned of a %.0f budget), "
-                 "%zu held (%.0f MiB, %.0f MiB prefetched)\n",
+                 "%zu pinned | ",
                  static_cast<f64>(ec.budget_bytes()) / 1048576.0, ec.resident_slots(),
-                 ec.capacity_slots(), ec.pinned_slots(),
-                 static_cast<f64>(ec.warm_capacity_bytes()) / 1048576.0,
-                 static_cast<f64>(ec.warm_pinned_bytes()) / 1048576.0,
-                 static_cast<f64>(ec.warm_pin_budget_bytes()) / 1048576.0,
-                 ec.warm_slots(),
-                 static_cast<f64>(ec.warm_used_bytes()) / 1048576.0,
-                 static_cast<f64>(ec.bytes_staged()) / 1048576.0);
+                 ec.capacity_slots(), ec.pinned_slots());
+    if (ec.warm_as_mapping())
+        // The tier's size is a plan, not a residency: under the mapping policy
+        // the cache holds nothing, and quoting the configured bytes here would
+        // read as a full tier the next line then contradicts.
+        std::fprintf(out, "no host tier (KRK_EXPERT_WARM_MAP=1), %zu held\n",
+                     ec.warm_slots());
+    else
+        std::fprintf(out,
+                     "WARM %.0f MiB (%.0f pinned of a %.0f budget), "
+                     "%zu held (%.0f MiB, %.0f MiB prefetched)\n",
+                     static_cast<f64>(ec.warm_capacity_bytes()) / 1048576.0,
+                     static_cast<f64>(ec.warm_pinned_bytes()) / 1048576.0,
+                     static_cast<f64>(ec.warm_pin_budget_bytes()) / 1048576.0,
+                     ec.warm_slots(),
+                     static_cast<f64>(ec.warm_used_bytes()) / 1048576.0,
+                     static_cast<f64>(ec.bytes_staged()) / 1048576.0);
     // The three tiers reported apart. A single "hit rate" reads as "the
     // cache works 20% of the time" when VRAM 20% / RAM 80% / file 0% is
     // exactly the policy working: the tiers answer different questions and
@@ -1107,6 +1116,19 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                          static_cast<unsigned long long>(hs.policy_violations));
         }
     }
+    // Under the mapping policy there is no tier to report: the second copy is
+    // the file's own pages, which the cache neither owns nor evicts. Printing
+    // "0 MiB capacity, 0.0% in use" there would read as a tier that failed.
+    if (ec.warm_as_mapping())
+        std::fprintf(out,
+                     "[stats ] warm      MAPPING (KRK_EXPERT_WARM_MAP=1): the "
+                     "file's page cache is the second tier, nothing retained | "
+                     "%.0f MiB read to warm it | %llu device evictions, %llu "
+                     "decay events\n",
+                     static_cast<f64>(ec.bytes_touched()) / 1048576.0,
+                     static_cast<unsigned long long>(ec.evictions()),
+                     static_cast<unsigned long long>(ec.decay_events()));
+    else
     std::fprintf(out,
                  "[stats ] warm      %.0f MiB capacity, %.1f%% in use | %llu admissions, "
                  "%llu evictions, %llu rejects | %llu device evictions, %llu decay events"

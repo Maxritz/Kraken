@@ -334,6 +334,32 @@ public:
     // Returns bytes read.
     size_t prefetch_layer(const ExpertSource &src, i32 layer, const i32 *experts,
                           int n);
+    // ---- the MAPPING as the second tier (KRK_EXPERT_WARM_MAP=1) ------------
+    //
+    // WARM's job is to turn a file read into a RAM read. On a box where the
+    // model's pages are already resident — every run after the first, on a
+    // corpus smaller than the page cache — the OS has already done that job,
+    // and the tier is a SECOND copy of the same bytes, bought with a host
+    // allocation, a memcpy into the DMA staging ring and a shared-ledger
+    // entry. Measured on Tiel-Coder-35B-A3B (22.6 GiB corpus against an 11920
+    // MiB pool): a staged corpus made every VRAM eviction come back as a
+    // ~156 us promotion instead of a read from the mapping — 28,050
+    // promotions against 2,702, 10.4 tok/s against 17.0.
+    //
+    // With this on the cache keeps NOTHING in host RAM. A miss reads the
+    // mapping through Backend::upload's pull path (a read() into a bounce
+    // buffer, overlapped — not a 4 KiB-at-a-time mapping fault), and a slot
+    // that still has a host copy drops it and takes that same path rather
+    // than promoting. The page cache is the second tier; the warmup's
+    // equivalent of prefetch_layer() is touch_layer(), which reads the same
+    // bytes and keeps none of them.
+    bool warm_as_mapping() const { return warm_map_; }
+    // Warms the page cache for one layer's routed set without retaining a
+    // byte: the same batched reads prefetch_layer issues, into a bounded
+    // scratch block that is reused for every chunk. Returns bytes read.
+    size_t touch_layer(const ExpertSource &src, i32 layer, const i32 *experts,
+                       int n);
+    u64 bytes_touched() const { return bytes_touched_; }
     // One-step exact lookahead: only an already WARM next routed expert.
     // The current expert is leased during admission; too-small budgets skip it.
     bool stage_next(const ExpertSource &src, i32 layer, i32 expert, i32 current);
@@ -874,6 +900,13 @@ private:
     u64 bytes_demoted_ = 0;  // VRAM evicted with a WARM copy already in place
     u64 bytes_promoted_ = 0; // WARM -> VRAM
     u64 bytes_staged_ = 0;   // file -> WARM ahead of the run (prefetch)
+    // The mapping policy (KRK_EXPERT_WARM_MAP=1): no host copy is retained, so
+    // `bytes_touched_` is the warmup's traffic and `bytes_staged_` stays 0.
+    bool warm_map_ = false;
+    u64 bytes_touched_ = 0;
+    // The scratch a touch reads into, reallocated only when a call needs more.
+    void *touch_buf_ = nullptr;
+    size_t touch_buf_bytes_ = 0;
     u64 lookahead_staged_ = 0;   // stage_batch promotions
     u64 lookahead_rejected_ = 0; // stage_batch candidates the budget could not hold
     f64 promote_ms_ = 0;     // wall time in promote_to_vram

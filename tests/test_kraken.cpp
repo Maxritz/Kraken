@@ -6619,6 +6619,64 @@ static void test_expert_cache_warm_tier() {
     cache.prefetch_layer(src, 0, next_ids, 2);
     CHECK(!cache.stage_next(src, 0, 1, 0), "one-slot budget skips speculative admission");
     CHECK(touch(1), "skipped staging falls back to exact demand loading");
+
+    // 8. KRK_EXPERT_WARM_MAP=1: the page cache is the second tier and the cache
+    //    retains nothing. Off by default -- it was measured and it LOST, and the
+    //    numbers are in docs/PERF-WARMUP.md -- but the arm is what keeps that
+    //    path measurable instead of a claim, so its contract is pinned here:
+    //    no admission, no host block per expert, and an evicted expert served
+    //    by a mapping read rather than a promotion.
+    //
+    //    The flag is read once, in configure(), so it has to be set before the
+    //    call and cleared after: the groups that follow configure their own
+    //    caches in this process, and an environment left behind would silently
+    //    change every one of them.
+    cache.clear();
+#ifdef _WIN32
+    _putenv_s("KRK_EXPERT_WARM_MAP", "1");
+#else
+    setenv("KRK_EXPERT_WARM_MAP", "1", 1);
+#endif
+    cache.configure(&be, 48, 96);
+    CHECK(cache.warm_as_mapping(), "the mapping policy is on when asked for");
+    const u64 host_allocs_map = be.host_allocs();
+    CHECK(touch(0) && touch(1), "two experts load under the mapping policy");
+    CHECK(cache.warm_admissions() == 0 && cache.warm_slots() == 0,
+          "and nothing is admitted to the host tier");
+    CHECK(be.host_allocs() == host_allocs_map,
+          "no host block is allocated for an expert");
+    CHECK(cache.loads() == 2, "both acquires were file reads, by design");
+    // Evict both, then ask for one: the reload must come from the mapping.
+    CHECK(touch(2) && touch(3), "a third and fourth expert evict both");
+    CHECK(cache.evictions() >= 2 && cache.demotions() == 0,
+          "a VRAM eviction has no host copy to fall back to");
+    const u64 loads_before_map = cache.loads();
+    CHECK(touch(0), "the evicted expert comes back");
+    CHECK(cache.loads() == loads_before_map + 1 && cache.promotions() == 0 &&
+              cache.warm_hits() == 0,
+          "served out of the mapping, not promoted out of WARM");
+    // The warmup's stand-in for prefetch_layer: the same reads, kept nowhere.
+    const i32 four_ids[] = {0, 1, 2, 3};
+    const u64 touched_before = cache.bytes_touched();
+    const u64 allocs_before_touch = be.host_allocs();
+    const size_t one_expert = src.per_expert(src.gate) +
+                              src.per_expert(src.up) +
+                              src.per_expert(src.down);
+    const size_t read = cache.touch_layer(src, 0, four_ids, 4);
+    CHECK(read > 0 && cache.bytes_touched() == touched_before + read,
+          "touch_layer counts the bytes it read as page-cache traffic");
+    CHECK(read == 4 * one_expert,
+          "and reads one block per expert, nothing more");
+    CHECK(cache.warm_used_bytes() == 0 && cache.warm_slots() == 0,
+          "while retaining none of it");
+    CHECK(be.host_allocs() == allocs_before_touch + 1,
+          "one scratch block per call, not one per expert");
+#ifdef _WIN32
+    _putenv_s("KRK_EXPERT_WARM_MAP", "");
+#else
+    unsetenv("KRK_EXPERT_WARM_MAP");
+#endif
+
     cache.clear();
     std::remove(path.c_str());
 }
