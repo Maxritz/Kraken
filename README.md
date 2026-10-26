@@ -234,11 +234,19 @@ instance). A refused GGUF is a load-time verdict, not a crash.
   exact` keeps every prompt row independent of `--chunk` and costs that 36%.
   `--prefill-hash` always uses exact, so the chunk-invariance gate still means
   something. Note `kraken-server` defaults the other way (`exact`).
-* **Warmup needs a ranking file.** `--expert-warmup -1` (default) ranks only
-  when the routed set exceeds VRAM, and ranks by `<model>.krakenexperts.json`,
-  which `--expert-scan` writes. Without it the tiers fill in an even order.
+* **Warmup needs a ranking file.** `--expert-warmup -1` (default) runs for every
+  MoE with a device tier and ranks by `<model>.krakenexperts.json`, which
+  `--expert-scan` writes; without it the tiers fill in an even order, which
+  still removes the first-touch reads from the prefill.
   `--expert-warmup-ms` caps the phase (default 20000): the hottest experts go
-  in first, so running out costs coverage, not the top of the list.
+  in first, so running out costs coverage, not the top of the list. The phase
+  only prefills VRAM when the pool can hold the routed set (within 5%): at a
+  larger ratio the prefix evicts and the LRU does better without it, so the file
+  is left to read-through (`KRK_WARM_PREFILL=1` forces the prefill).
+  `KRK_EXPERT_WARM_MAP=1` is the opposite arm -- no host tier at all, evicted
+  experts served from the page-cached mapping -- and it is **off by default
+  because it measured slower** (13.6 against 17.2 tok/s on the 35B, 16.5 against
+  84.0 on the 24B): one batched promotion beats three serialised mapping reads.
 * **Speculation is opt-in and currently measured out.** `--mtp-spec` is greedy
   only and bit-identical to plain greedy output, but on the Lightning sidecar at
   `k=1` it lands at plain-decode parity even with the drafter cost removed. See
@@ -317,8 +325,10 @@ Grouped by what you are changing. Defaults are the compiled-in ones.
 | `--expert-cache-slots N` | 0 = auto | cap resident (layer, expert) slots |
 | `--expert-warm-mb N` | <0 = auto | WARM expert cache in host RAM (0 off); `--expert-l2-mb` is the old spelling |
 | `--expert-warm-prefetch` | off | fill WARM at load instead of on demand |
-| `--expert-warmup N` | -1 | ranked warmup: -1 when routed set exceeds VRAM, 1 force, 0 off |
+| `--expert-warmup N` | -1 | ranked warmup: -1 for every MoE with a device tier, 1 force, 0 off |
 | `--expert-warmup-ms N` | 20000 | ceiling for that phase (0 = none) |
+| `KRK_WARM_PREFILL=1\|0` | corpus vs pool | force (or forbid) the warmup's VRAM prefill; it only helps when the pool holds the routed set |
+| `KRK_EXPERT_WARM_MAP=1` | off | no host tier at all: serve evicted experts from the page-cached mapping. Measured slower, kept as an A/B arm |
 | `--expert-pin-mb N` | 0 = off | pin the first N MiB of the tier in rank order |
 | `--router-resident P` | 0 = off | send a near-tie (within fraction P) to the expert already in VRAM/WARM |
 | `--expert-scan` | - | measure which experts routing picks; writes `<model>.krakenexperts.json` |
@@ -842,8 +852,22 @@ The MoE residency feature from the prior section has a startup mode too: at load
 before the first token, the engine can warm both expert tiers from a routing ranking
 so the first decode steps do not pay a cold-cache page storm. Two switches drive it:
 
-- `--expert-warmup N` - bounded warm startup. `-1` (the default) runs it only when the
-  routed expert set exceeds the device budget; `0` disables it; a positive `N` forces it.
+- `--expert-warmup N` - bounded warm startup. `-1` (the default) runs it for every MoE
+  with a device tier, because what it removes is the *compulsory first touch* of a
+  layer's experts, not eviction; on the LFM2.5-24B (12.6 GiB against a 12.0 GiB budget)
+  that is 39.7 → 83.4 tok/s decode and 2410 → 111 ms of prefill, on a 3x-slack
+  7B MoE 19.2 → 107.4 tok/s, and on Qwen3-30B-A3B 9.7 → 47.5. `0` disables it; a
+  positive `N` forces it. It costs one pass over the corpus at load (3.87 s on the
+  24B), which a second request in the same process does not pay again. It is not
+  unconditional either: on `Tiel-Coder-35B-A3B` (a 22.6 GiB corpus against an
+  11920 MiB pool, 320 expert acquires per token) the phase used to read 10.4 tok/s
+  against 17.0 with the warmup off, because its **VRAM prefill** filled the whole
+  pool with a prefix the run then routes around (65.9% HOT against 87.5%). That
+  half is now gated on the pool holding essentially the whole routed set
+  (`corpus <= pool + 5%`): staging still runs, VRAM is left to the LFU, and the
+  same file reads 22.3-24.1 tok/s with a 363 ms prompt. `KRK_WARM_PREFILL=1|0`
+  overrides the rule. `docs/PERF-WARMUP.md` has the curve, the counters and the
+  decomposition (staging vs prefill) behind every number here.
   `--expert-warmup-ms N` caps that phase's wall time in ms (default 20000 = 20 s, `0` = no
   cap). The phase prints a single verbose line: the order it used, the number of rounds, the
   experts-per-layer depth, how much WARM it filled, how much VRAM it added, bytes read, and

@@ -18,7 +18,7 @@ code, the README, or `docs/`.
   contradicting the README. `build_check.sh` requires it current for the same
   reason.
 - The gate suite is six things, not one: `sh scripts/build_check.sh`, ninja
-  rc=0 with 0 `error:` lines, `kraken-tests` 4431/4431, `sh
+  rc=0 with 0 `error:` lines, `kraken-tests` 4521/4521, `sh
   scripts/kraken_tests_baseline_check.sh` (names the groups that newly broke
   against the recorded baseline), `kraken-bench --gate` rc=0, and a coherence
   spot check on three models, one per shape, run as:
@@ -123,9 +123,13 @@ code, the README, or `docs/`.
   4431 across the MoE decode campaign (per-layer expert counts, LatentMoE, the
   NVFP4 sidecar scale, the one-launch dispatch and the DFlash spelling arms)
   plus the CLI-refusal group, which together took the suite from 86 to 94
-  groups. Read the count off the run (`4431/4431 checks passed`) rather than
-  trusting the number written here, which is only the last one seen.
-- **`kraken-tests` runs each of its 94 groups in its own child process, several
+  groups. 4431 -> 4497 when the LFM2.5 shortconv group landed (95 groups), and
+  4497 -> 4508 when that group grew its recorded-row pin (24 -> 35 checks), and
+  4508 -> 4521 when `test_expert_cache_warm_tier` grew from 77 to 90 for the
+  `KRK_EXPERT_WARM_MAP` arm. Read the count off the run (`4521/4521 checks
+  passed`) rather than trusting the number written here, which is only the last
+  one seen.
+- **`kraken-tests` runs each of its 95 groups in its own child process, several
   at a time.** A fastfail, an access violation or an abort inside one group used
   to end the run before the `%d/%d checks passed` line, which is how a single
   `std::fclose(NULL)` in a KV-tier test hid eight real failures for a whole
@@ -349,22 +353,143 @@ code, the README, or `docs/`.
   separates the copy from the wait it sits behind, currently dies at prefill
   start with `hipErrorInvalidHandle` (rc=127), so that split has to come from
   the arithmetic above rather than from the arm.
-- **LFM2.5 (`lfm2moe`) is refused by name, and that row is the whole fix so
-  far.** Before it existed the 24B-A2B file fell through to llama defaults and
-  died on `output_norm.weight is missing` before reading a layer -- a message
-  about a tensor, for a mixer with no shape here. The stack is 3 conv : 1
-  attention (attention at indices 2, 6, ... 38, i.e. 10 of 40), hd 64 over 8 KV
+- **LFM2.5 (`lfm2moe`) RUNS, and all four of the things that stopped it were
+  silent-wrong-answer defects rather than missing pieces.** The stack is 3 conv :
+  1 attention (attention at indices 2, 6, ... 38, i.e. 10 of 40), hd 64 over 8 KV
   heads of 32 queries with q/k norms, 2 dense leading blocks then 64 experts
   top-4 with `exp_probs_b.bias` and sigmoid gating, and its final norm is
-  `token_embd_norm` (there is no `output_norm`). The one genuinely new block is
-  `shortconv`: `in_proj` 3*n_embd -> B,C,X, depthwise F32 conv k=3 over the last
-  3 rows, `B*conv(X) + C*X`, `out_proj` -- `conv1d_dw` plus the PLE block's
-  per-layer window is the precedent. Derive conv-vs-attention from
+  `token_embd_norm` (there is no `output_norm`). Derive conv-vs-attention from
   `shortconv.in_proj.weight` being present (as `nemotron_h_moe` does with
   `ssm_in.weight`): the file has no `attention.recurrent_layers` array and the
-  `(l+1) % full_attention_interval` rule is off by one for it. `docs/AUDIT-lfm2.md`
-  has the measured geometry and the four pieces a port needs. Its DSpark drafter
-  is a valid `dflash` head set already -- the drafter is not the blocker.
+  `(l+1) % full_attention_interval` rule is off by one for it.
+  (1) **The mixer is `C * conv(B*X)`, not `B*conv(X) + C*X`.** `in_proj` is
+  3*n_embd wide and emits B | C | X; the reference multiplies B by X *before* the
+  convolution and gates the CONVOLVED row with C afterwards
+  (`hidden_states = B * x` immediately before the conv in transformers'
+  `Lfm2ShortConv`, and the same two lines in llama.cpp's graph). The plausible
+  reading has the same shape, the same op count and one fewer multiply, and it
+  produces a finite, fluent, wrong model -- `"The" (the) (the) (the)` on the 24B.
+  (2) **Its RoPE pairing is NeoX half-split.** llama.cpp prints `rope type = 2`
+  for the file, so the GGUF keeps the HF layout unpermuted and the engine must
+  pair `(j, j + n_rot/2)`. With the interleaved pairing the same prompt decodes
+  fluent but different text -- a short text arm cannot see this.
+  (3) **The top-k sigmoid weights are sum-normalized.** Without
+  `expert_w_norm` the 24B says ` "The" and "the" are the same`; with it, ` Paris.
+  The capital of Italy is Rome`. The two differ by the sigmoid sum (about 2x on
+  every expert contribution), so again a fluent wrong answer, not a crash.
+  (4) **The conv ring's f16 rounding is load-bearing for chunk invariance.**
+  The ring holds B*X as f16, but a row the SAME call produced was still f32, so
+  `--chunk 1` carried one extra bit into the tap: measured at pos 1 of layer 0,
+  0.00055837 against 0.00055800, which moved the trace hash (b3c59e96... vs
+  cc555b05...) and the greedy text. Rounding the in-call product to f16 too
+  makes chunks 1/2/5/8/16 one hash: trace `c19de85c8a06d85d`, logits
+  `9fce30dd39c9bf6f`, first token 4741 on the 24B-A2B file.
+  **The BOS default was the fifth, and it lives in the tokenizer, not the
+  family.** `tokenizer.ggml.add_bos_token` is OPTIONAL and its absence means
+  TRUE (llama.cpp's rule); this engine defaulted it to true for SPM only, so the
+  gpt2-style LFM2 file got no BOS even with `--tokenize` asking for specials, and
+  without its BOS this model outputs whitespace soup. The same prompt then reads
+  ` Paris. The capital of Italy is Rome. The capital of`, against llama.cpp's
+  ` Paris. The capital of Germany is Berlin. The capital of` -- the one word that
+  differs is a genuine near-tie between two numerically different pipelines
+  (f16 GPU against the CPU q8 dot-products), and an independent f32 numpy
+  reference of the same graph agrees with the engine word for word. So the
+  reference gate here is the FIRST token plus the whole logits row's own
+  consistency, not the sentence: `test_lfm2_shortconv` pins the fixture's row
+  and its chunk invariance, and the 24B file's text is evidence, not a pin.
+  `docs/AUDIT-lfm2.md` has the measured geometry.
+  **The row is now PINNED, and the arm that keeps it honest had to be fixed
+  twice.** `test_lfm2_shortconv` grew from 24 to 35 checks: the fixture's last
+  prompt row by FNV-1a (`0x399373273e5a2b60`, argmax 2, CPU, `the`, chunk 8),
+  a second prompt moving it, chunk 1 reproducing it, and a fixture whose ONE
+  conv coefficient is moved (`0xd8b9a0cef214f8fc`). Red construction on the real
+  arithmetic: reading the mixer as `conv(X)` instead of `conv(B*X)` in
+  `backend_cpu.cpp` fails 3 of 35 (row, argmax, chunk 1 == 8); reverted, 35/35.
+  The trap: the first moved-tap arm changed `w[0]`, the tap a ONE-row prompt
+  never reads (its taps address p < 0 and are skipped) -- the row stayed
+  bit-identical and the arm read as "the pin is blind" when the pin was fine. It
+  moves the LAST tap row now. A chunk-invariant mixer that is simply wrong
+  passes every invariance arm, which is why the row and not only the hashes is
+  recorded.
+  **The ranked warmup is ON by default now, and the old rule was wrong about
+  what it is for.** The auto default used to fire only when the expert CORPUS
+  exceeded the plan -- "a set that fits is resident anyway, so staging is pure
+  wall time". Three files say the premise is false, because what staging removes
+  is not eviction but COMPULSORY FIRST TOUCH: a layer's first pass reads every
+  expert it routes to whatever the budget is, and that read sits inside the
+  prefill. Same card, greedy, one process per arm:
+
+  | model | corpus vs budget | decode | prefill | COLD |
+  |---|---|---|---|---|
+  | LFM2.5-24B-A2B | 12312 MiB vs 11964 | 39.7 -> **83.4** | 2410 -> **111 ms** | 25.7% -> 0 |
+  | Qwen3-30B-A3B i1-Q2_K | 10008 vs 10008 (exact) | 9.7 -> **47.5** | — | 41.8% -> 0 |
+  | llada-moe-7b-a1b | 3720 vs ~11.9 GiB (3x slack) | 19.2 -> **107.4** | 541 -> **34 ms** | 36.4% -> 0 |
+
+  The third is the decisive one: pool slack does not make the first touch free.
+  **The counter-example was real, and this note blamed the wrong half of the
+  phase for it.** On `Tiel-Coder-35B-A3B` (22.6 GiB corpus against an 11920 MiB
+  pool, 320 expert acquires per token) the default was a 1.7x loss at 256 tokens
+  -- 20.5 s / 17.0 tok/s with `--expert-warmup 0` against 35.2 s / 10.4 warm --
+  and the explanation here used to be "WARM covers the corpus, so every eviction
+  comes back as a promotion" (28,050 against 2,702). **That was not the cause.**
+  The phase has two halves, and switching only the second one off isolates it:
+  with the staging untouched and `KRK_WARM_PREFILL=0` the same file reads
+  **22.3 / 24.1 tok/s and a 363 ms prompt** against 10.4 and 1197 ms. At that
+  ratio the prefilled prefix is not a head start INSIDE the working set, it is
+  the pool (4757 experts, 10500 MiB of a 10498 MiB budget, and a set the run
+  routes slightly differently), so it holds HOT at 79% against the 87.5% the LFU
+  earns when it fills the pool itself.
+  So the prefill is now gated on **the pool holding essentially the whole routed
+  set** -- `corpus <= pool + 5%`, where the 5% is LFM2's measured 12312 against
+  11964. Measured either side of it: Tiel 215% -> skip -> 22.3 / 24.1; LFM2
+  103% -> prefill -> 84.0 / 84.8 (37 ms prompt) against 25.2 with the prefill
+  off; Qwen3-30B 100% -> prefill -> 46.0 / 47.0, unchanged. `KRK_WARM_PREFILL=1|0`
+  overrides the rule, which is how each row was measured.
+  Neither a byte bound on the STAGED set nor a `--max-tokens`-derived time
+  ceiling was the lever: both were implemented, measured (2622 MiB -> 17.6, 5210
+  -> 12.3, 9278 -> 19.2, 10507 -> 12.8, 22604 -> 10.4 tok/s, i.e. non-monotonic
+  with a cliff between 9.3 and 10.5 GiB) and reverted -- they only ever moved
+  the prefix's SIZE, and the prefix was never the win. `docs/PERF-WARMUP.md` has
+  the curve, the counters and both decompositions.
+  **`KRK_EXPERT_WARM_MAP=1` is the other arm, and it LOST, which is why it is
+  off by default.** It keeps nothing in host RAM -- an evicted expert is served
+  from the page-cached mapping, and the warmup's stand-in for the staging pass
+  is `touch_layer()`, the same batched reads discarded -- on the theory that a
+  promotion copies bytes twice (RAM -> ring -> VRAM) and a mapping read once.
+  Measured: Tiel 13.6 tok/s against 17.2 for `--expert-warmup 0` **at the same
+  hit rate** (87.9% HOT against 87.3%) and 12.1% COLD against 6.6%, i.e. ~385 us
+  per extra miss; LFM2 16.5 against 84.0. The copy was never the problem: a
+  promotion is ONE batched call whose slice N+1 stages while N is in flight,
+  while `acquire()`'s mapping path is three `upload()` calls with a pool-honor
+  wait and its own read each. `test_expert_cache_warm_tier` grew 77 -> 90 checks
+  to pin the arm anyway (no admission, no per-expert host block, an evicted
+  expert reloaded rather than promoted, `touch_layer` retaining nothing) and
+  disabling `warm_admit`'s refusal fails 4 of them.
+  So `--expert-warmup -1` means ON for every MoE with a device tier, and the
+  corpus-vs-budget comparison survives only on the CPU backend (where the
+  suite's fixtures assert on the counters a staging pass would move). The
+  earlier LFM2 numbers that made `-1` look like a four-MiB near miss came from
+  the plan being made before the KV tier and workspaces exist: 12312 planned
+  against a 11964 earned budget.
+  It is a wall-time tax, not a throughput one: 3.87 s up front on the 24B
+  (12312 MiB read at 7.9 GB/s), so a single cold 24-token run's wall is worse
+  (6.66 s against 4.77 s) and break-even is about 165 output tokens; a second
+  request in the same process pays none of it. `--expert-warmup 0` and
+  `KRK_EXPERT_WARMUP=0` still disable it, and `--expert-warmup-ms` bounds the
+  phase for a corpus too big to stage. `--expert-warm-prefetch 1` ALONE is
+  still a loss (25.5 tok/s): it fills WARM without staging VRAM, so every decode
+  step pays a promotion.
+  **The DSpark drafter does NOT load, and the earlier note here was wrong to say
+  it was a valid `dflash` head set.** `--draft` exits 1 with `DFlash head set
+  has neither enc.aux_norm nor aux_hidden_norm.0`, which is the right answer:
+  the file is a different input CONTRACT. It ships `fc.weight` [10240, 2048] --
+  five target hidden layers concatenated and projected, in place of the per-layer
+  aux norms -- plus `markov_w1`/`markov_w2` [256, 128000] (a rank-256 additive
+  bias on the PROPOSAL logits, taken from the anchor) and `conf_proj` [2304, 1]
+  with `sample_from_anchor`. Running it without the markov head proposes
+  different tokens, so no acceptance figure for this file exists yet and none
+  should be quoted. The port is `fc` as an input transform (and a 5-slot hidden
+  capture), the markov bias, and the confidence gate.
 - **The int8 K/V cache is chunk-invariant on the device now, and the defect was a
   reduction order.** `--kv-quant int8` had every reader implemented and still
   produced three different hashes for one prompt (chunk 2 == chunk 4, chunk 1 and

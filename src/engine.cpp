@@ -7329,7 +7329,38 @@ void Engine::warm_experts() {
     // routed set that is where the desktop starts to stall.
     const size_t vram_reserve = krk::vram_floor_bytes(be_->device_total_bytes());
     bool hit_reserve = false;
-    if (be_->caps().vram_free > 0) {
+    // Does the prefilled prefix have anywhere to live? A prefill is worth its
+    // cost only when the pool can hold (essentially) the WHOLE routed set: then
+    // every expert the run routes to is one acquire away and the prefix is what
+    // traffic would have admitted anyway, just earlier.
+    //
+    // When the corpus is a multiple of the pool the prefix is a DIFFERENT set
+    // from the one the run keeps asking for. It spends half the pool on slots
+    // that then evict, against an LFU that was doing better without it.
+    // Measured on Tiel-Coder-35B-A3B (22604 MiB corpus, 10498 MiB pool), 256
+    // greedy tokens, paired: 4757 prefilled experts left 65.9% HOT hits and
+    // 10.6 tok/s, against 87.5% HOT and 17.2 tok/s with the prefill skipped --
+    // same pool, same WARM tier, same budget, and 3.2% WARM hits either way.
+    // The prefix was charged with 10500 MiB of a 10498 MiB pool, i.e. it is not
+    // a head start inside the working set, it IS the whole pool.
+    //
+    // The 5% slack is LFM2.5-24B-A2B's measured shape: a 12312 MiB corpus
+    // against a 11964 MiB budget (2.9% over, once the KV tier and workspaces
+    // exist), which is "the whole set fits" in every sense this prefill cares
+    // about -- and there it is worth 71.1 tok/s against 17.8.
+    const size_t corpus_bytes = model_.total_expert_bytes();
+    const size_t pool_bytes = ec.vram_budget();
+    bool prefill = pool_bytes > 0 && corpus_bytes <= pool_bytes + pool_bytes / 20;
+    if (const char *e = std::getenv("KRK_WARM_PREFILL"))
+        prefill = e[0] != '0' && e[0] != '\0';
+    if (!prefill)
+        KRK_INFO("expert warmup: the routed set is %.0f MiB against a %.0f MiB "
+                 "device pool, so the ranked prefix is not preloaded into VRAM "
+                 "-- at that ratio it competes with the experts the LFU is "
+                 "still earning (KRK_WARM_PREFILL=1 forces it)",
+                 static_cast<f64>(corpus_bytes) / 1048576.0,
+                 static_cast<f64>(pool_bytes) / 1048576.0);
+    if (prefill && be_->caps().vram_free > 0) {
         for (size_t r = 0; r < depth; r++) {
             if (out_of_time()) break;
             if (be_->device_free_bytes() <= vram_reserve) {
