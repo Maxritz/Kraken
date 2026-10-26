@@ -6806,10 +6806,42 @@ bool Engine::expert_warmup_wanted() const {
         return false; // no second tier to fill
     bool on = cfg_.expert_warmup > 0;
     if (cfg_.expert_warmup < 0) {
-        // Default: on exactly when the ORDER of the two tiers can change the
-        // answer, which is when the routed set does not fit the device. When it
-        // fits, every expert is resident anyway and staging is pure wall time.
-        on = model_.total_expert_bytes() > ec.budget_bytes();
+        // Default: ON for every MoE that has a device tier to stage into, and
+        // the corpus-vs-budget comparison below only decides the CPU case.
+        //
+        // That is not the obvious rule, and it is the one the measurements
+        // forced. The old rule staged only when the CORPUS exceeded the budget,
+        // on the premise that a set which fits is "resident anyway, so staging
+        // is pure wall time". Three files say the premise is false, because what
+        // staging removes is not eviction but COMPULSORY FIRST TOUCH: a layer's
+        // first pass has to read every expert it routes to whatever the budget
+        // is, and that read sits inside the prefill.
+        //
+        //   LFM2.5-24B-A2B   12312 MiB corpus, 11964 MiB earned budget
+        //                    (the plan said 12312, so this file read as
+        //                    "fits"): 39.7 -> 83.4 tok/s decode,
+        //                    2410 -> 111 ms prefill, COLD 25.7% -> 0.
+        //   Qwen3-30B-A3B    10008 MiB corpus, 10008 MiB budget -- the exact
+        //                    fit the rule called "all resident": 9.7 -> 47.5
+        //                    tok/s, COLD 41.8% -> 0.
+        //   llada-moe-7b     3720 MiB corpus against ~11.9 GiB of room, i.e.
+        //                    3x slack: 19.2 -> 107.4 tok/s, 541 -> 34 ms
+        //                    prefill, COLD 36.4% -> 0.
+        //
+        // The third is the decisive one: slack in the pool does not make the
+        // first touch free, so "it fits" was never the right question.
+        // `--expert-warmup 0` (or KRK_EXPERT_WARMUP=0) is the escape, and
+        // `--expert-warmup-ms` bounds the phase for a corpus too big to stage.
+        //
+        // The CPU backend keeps the old comparison: it has no device tier to
+        // stage against, and the suite's MoE fixtures assert on the counters a
+        // staging pass would move. That is a test-scope choice, stated as one.
+        const size_t corpus = model_.total_expert_bytes();
+        if (!be_ || be_->kind() == BackendKind::CPU ||
+            be_->device_total_bytes() == 0)
+            on = corpus > ec.budget_bytes();
+        else
+            on = true;
         // The one-launch dispatch needs every cell, not just the hot ones: a
         // table cannot name an expert the tiers never loaded, and the first
         // forward touches k experts per layer, not all of them. So a run that
@@ -7336,6 +7368,13 @@ void Engine::warm_experts() {
     size_t staged = 0;
     size_t from = 0;
     i32 rounds = 0;
+    // NOT bounded by the device tier's size, and that was tried: see the note on
+    // the Tiel curve in docs/PERF-WARMUP.md. Bounding the staged bytes by the
+    // pool room (`min(plan, room)`, or half of it) made the file WORSE than
+    // staging the lot -- 12.3-12.9 tok/s against 10.4 for the full fill and
+    // 17.0-19.2 across the small ceilings -- because the lever is not how much
+    // is staged but how the pool then treats WARM as an eviction target. The
+    // numbers live in the doc so the next attempt starts from them.
     // The host twin of the VRAM reserve, and for the same reason: the ram policy
     // above plans a 20% headroom once, before the KV tier, the workspaces and
     // the model's own buffers exist, and staging is what spends it. Ask the

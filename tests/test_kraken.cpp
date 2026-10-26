@@ -5418,6 +5418,15 @@ static void test_kv_tier_host_reserve_refusal() {
     cfg.prefill_chunk = 4;
     cfg.kv_hot_mb = 1; // each plane gets 0.5 MiB: less than its 1 MiB cache
     cfg.kv_warm_mb = 1;
+    // This group's subject is the KV tier's host reserve, so the expert tier is
+    // silenced: the fixture is a qwen2moe file, and the default warmup now
+    // stages its tier on a fake device just as it does on a real one -- which
+    // claims the process-wide SharedHostRamBudget and leaves the SECOND
+    // engine's 512 KiB KV staging page no room (measured: the arm failed with
+    // `no room for a KV staging page after the safety reserve and other
+    // pageable tiers`). Two engines sharing 8 GiB of host is a real answer, not
+    // a bug; it is just not the answer this group is asking for.
+    cfg.expert_warmup = 0;
     Engine engine;
     std::string err;
     CHECK(engine.init(be, cfg, &err), "tiered sparse-KV engine initializes with headroom");

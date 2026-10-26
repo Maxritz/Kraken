@@ -811,9 +811,10 @@ private:
     std::vector<std::pair<i32, i32>> load_expert_index() const;
     // Whether the ranked warmup should run for this configuration: false for a
     // routing scan, a dense model, or a run with no WARM tier, and otherwise
-    // cfg_.expert_warmup with the default (-1) resolved against whether the
-    // routed set actually exceeds the device budget. KRK_EXPERT_WARMUP=0/1
-    // overrides all of it, which is what makes the A/B one variable wide.
+    // cfg_.expert_warmup, whose default (-1) is ON for every MoE with a device
+    // tier and is the corpus-vs-budget comparison only on the CPU backend.
+    // KRK_EXPERT_WARMUP=0/1 overrides all of it, which is what makes the A/B
+    // one variable wide.
     bool expert_warmup_wanted() const;
     // The one index writer: the scan and the adaptation pass fill the same
     // arrays, so they must not produce two formats -- the loader reads both.
