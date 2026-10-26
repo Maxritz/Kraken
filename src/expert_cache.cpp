@@ -1191,15 +1191,25 @@ bool ExpertCache::promote_to_vram(Slot &s, bool staged, bool prefetch) {
             // default stream is deliberately NOT ordered behind it here. The
             // consumer (finish_stage, at the next layer's acquire) does that,
             // which is what lets the copy run under the layer in front of it.
-            s.ready = be_->upload_expert_prefetch(batch_dst, batch_src, batch_len, nb);
+            // merge=false: the three slices of this expert only LOOK contiguous
+            // in the address space. A run the driver refuses costs a fallback,
+            // not a wrong answer, but it also costs a warning line on every
+            // promotion of the hot set -- measured on the 35B-A3B, whose three
+            // 544 KiB slices merged into one 1632 KiB DMA and came back
+            // hipErrorInvalidValue.
+            s.ready = be_->upload_expert_prefetch(batch_dst, batch_src, batch_len, nb,
+                                                  /*merge=*/false);
             s.staged = s.ready != nullptr;
         } else if (s.host_pinned) {
             // The hot arm: the source is already pinned, so this is the DMA and
             // nothing else -- no bounded ring, no host memcpy of the expert in
             // front of it. The backend publishes the copies to the default
             // stream with one event, which is why no marker travels back: the
-            // consumer's own stream order already covers the bytes.
-            be_->upload_pinned_batch(batch_dst, batch_src, batch_len, nb);
+            // consumer's own stream order already covers the bytes. merge=false
+            // for the reason above: the entries are per-slice sources, and the
+            // driver refused their merged span.
+            be_->upload_pinned_batch(batch_dst, batch_src, batch_len, nb,
+                                     /*merge=*/false);
         } else if (staged) {
             s.ready = be_->upload_expert_staged(batch_dst, batch_src, batch_len, nb);
             s.staged = true;
@@ -1739,7 +1749,12 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
         // directly -- so the promotion out of it is the same bare DMA the
         // warm-hit path pays, not a ring memcpy of bytes that were already
         // copied once on the way in.
-        if (s.host_pinned) be_->upload_pinned_batch(batch_dst, batch_src, batch_len, nb);
+        // merge=false: one DMA per slice. The merged span is the shape the
+        // driver refused (hipErrorInvalidValue) on this card, and the split
+        // copies of the same bytes from the same address all succeed.
+        if (s.host_pinned)
+            be_->upload_pinned_batch(batch_dst, batch_src, batch_len, nb,
+                                     /*merge=*/false);
         else be_->upload_paged_batch(batch_dst, batch_src, batch_len, nb);
     }
 
@@ -1943,9 +1958,18 @@ size_t ExpertCache::promote_batch(const ExpertSource &src, i32 layer,
         if (dst.empty()) continue;
         {
             MsTimer t(&xfer_ms_, phase_sink(&pf_xfer_ms_, &dc_xfer_ms_));
+            // merge=false: every expert in this batch is its own hipHostMalloc
+            // block, and two of them can be neighbours in the address space --
+            // which the coalescing loop reads as one contiguous source. The
+            // driver refuses a copy that spans two registrations
+            // (hipErrorInvalidValue), and the 35B-A3B died on the first batched
+            // promotion with the default pinned prefix because of it. One copy
+            // per entry is what this shape can have; the measured win the merge
+            // exists for is the streamed-layer path, whose source IS one buffer.
             if (want_pinned)
                 be_->upload_pinned_batch(dst.data(), srcp.data(), len.data(),
-                                         static_cast<int>(dst.size()));
+                                         static_cast<int>(dst.size()),
+                                         /*merge=*/false);
             else
                 be_->upload_paged_batch(dst.data(), srcp.data(), len.data(),
                                         static_cast<int>(dst.size()));

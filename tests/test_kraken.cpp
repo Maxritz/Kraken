@@ -5149,7 +5149,9 @@ public:
         }
     }
     void upload_pinned_batch(void *const dst[], const void *const src[],
-                             const size_t bytes[], int n) override {
+                             const size_t bytes[], int n,
+                             bool merge = true) override {
+        static_cast<void>(merge);
         for (int i = 0; i < n; i++) {
             if (!dst[i] || !src[i] || !bytes[i]) continue;
             std::memcpy(dst[i], src[i], bytes[i]);

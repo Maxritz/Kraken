@@ -416,8 +416,17 @@ public:
     // difference between a copy the host thread pays for and one it only
     // enqueues -- see Model::stage_layer, where the next layer's file read
     // happens while this batch is still in flight.
+    // `merge` says whether adjacent entries may be issued as ONE copy. It is a
+    // property of the SOURCE, not a preference: a merged run must lie inside a
+    // single host allocation, because a pinned registration is what the copy
+    // is validated against. Passing true for a batch whose sources are one
+    // allocation per entry (a WARM tier slot is one hipHostMalloc per expert)
+    // is how a run came to span two of them -- the driver answers that with
+    // hipErrorInvalidValue, and the caller read it as a dead process.
     virtual void upload_pinned_batch(void *const dst[], const void *const src[],
-                                     const size_t bytes[], int n) {
+                                     const size_t bytes[], int n,
+                                     bool merge = true) {
+        static_cast<void>(merge);
         upload_paged_batch(dst, src, bytes, n);
     }
 
@@ -486,7 +495,9 @@ public:
     // upload_expert_staged, whose ring copies through host memory at issue time
     // and whose ticket is host-synchronised at consumption.
     virtual void *upload_expert_prefetch(void *const dst[], const void *const src[],
-                                         const size_t bytes[], int n) {
+                                         const size_t bytes[], int n,
+                                         bool merge = true) {
+        static_cast<void>(merge);
         return upload_expert_staged(dst, src, bytes, n);
     }
     // Orders the default stream behind a prefetch ticket without blocking the

@@ -1441,19 +1441,22 @@ public:
     // almost entirely the memcpy through the pageable ring. KRK_WEIGHT_DMA=0
     // restores the ring path for an A/B.
     void *upload_expert_prefetch(void *const dst[], const void *const src[],
-                                 const size_t bytes[], int n) override {
-        return prefetch_into_(dst, src, bytes, n, nullptr);
+                                 const size_t bytes[], int n,
+                                 bool merge = true) override {
+        return prefetch_into_(dst, src, bytes, n, nullptr, merge);
     }
     void *prefetch_after(void *const dst[], const void *const src[],
                          const size_t bytes[], int n, void *ready) override {
-        return prefetch_into_(dst, src, bytes, n, ready);
+        // The streamed-layer caller hands one host mirror, so a run may span
+        // entries: this is the shape the 19 us/layer merge was measured on.
+        return prefetch_into_(dst, src, bytes, n, ready, /*merge=*/true);
     }
 
     // The shared body of the two prefetch forms. `ready`, when set, is an event
     // already recorded on the default stream and is the previous reader of the
     // destination: the copies below may not begin until it has passed.
     void *prefetch_into_(void *const dst[], const void *const src[],
-                         const size_t bytes[], int n, void *ready) {
+                         const size_t bytes[], int n, void *ready, bool merge) {
         // Pinned sources only. A pageable source needs a host memcpy into the
         // ring, which would run HERE, at issue time -- the serial cost this path
         // exists to remove -- so it takes the staged path instead.
@@ -1491,8 +1494,8 @@ public:
             const char *s = static_cast<const char *>(src[i]);
             size_t run = bytes[i];
             int j = i + 1;
-            while (copy_coalesce_() && j < n && dst[j] && src[j] && bytes[j] &&
-                   dst[j] == d + run && src[j] == s + run) {
+            while (merge && copy_coalesce_() && j < n && dst[j] && src[j] &&
+                   bytes[j] && dst[j] == d + run && src[j] == s + run) {
                 pool_honor_(dst[j], pinned_stream_);
                 run += bytes[j];
                 j++;
@@ -1521,7 +1524,8 @@ public:
     }
 
     void upload_pinned_batch(void *const dst[], const void *const src[],
-                             const size_t bytes[], int n) override {
+                             const size_t bytes[], int n,
+                             bool merge = true) override {
         if (n <= 0) return;
         if (!pinned_dma_() || !pinned_ready_()) {
             upload_paged_batch(dst, src, bytes, n);
@@ -1554,6 +1558,10 @@ public:
         // timeline is its SPAN, which includes waiting for the previous reader
         // of a pooled cell -- ordering that keeps the output correct, and that
         // no amount of coalescing removes.
+        // `merge` is the caller's statement that these sources are ONE host
+        // allocation -- see the refusal handler below for why that matters, and
+        // why it is the caller's to state rather than something to guess from
+        // adjacency.
         for (int i = 0; i < n;) {
             if (!dst[i] || !src[i] || !bytes[i]) {
                 i++;
@@ -1580,15 +1588,42 @@ public:
             const char *s = static_cast<const char *>(src[i]);
             size_t run = bytes[i];
             int j = i + 1;
-            while (copy_coalesce_() && j < n && dst[j] && src[j] && bytes[j] &&
-                   dst[j] == d + run && src[j] == s + run) {
+            while (merge && copy_coalesce_() && j < n && dst[j] && src[j] &&
+                   bytes[j] && dst[j] == d + run && src[j] == s + run) {
                 pool_honor_(dst[j], pinned_stream_);
                 run += bytes[j];
                 j++;
                 ++pin_merged_;
             }
-            KRK_HIP(hipMemcpyAsync(d, s, run, hipMemcpyHostToDevice,
-                                   pinned_stream_));
+            // A refused copy is a copy that did NOT happen, not a wrong answer,
+            // so the batch degrades to one DMA per entry instead of ending the
+            // process. That is what the expert tier hit: three slices of one
+            // warm slot, merged into their 1671168-byte span, came back
+            // hipErrorInvalidValue while the three unmerged copies of the SAME
+            // bytes from the SAME address all succeeded -- the driver validates
+            // a copy against one pinned registration and there is no way to ask
+            // it where that registration ends. Callers that hand over one
+            // buffer keep the merge; a caller whose entries are one allocation
+            // each must pass merge=false (see the expert cache's promotion).
+            if (hipMemcpyAsync(d, s, run, hipMemcpyHostToDevice, pinned_stream_) !=
+                hipSuccess) {
+                static_cast<void>(hipGetLastError());
+                static bool told = false;
+                if (!told) {
+                    told = true;
+                    KRK_WARN("weight stream: the driver refused a merged %.2f MiB "
+                             "pinned copy; that batch is re-issued one DMA per "
+                             "entry (the bytes are the same, only the run is "
+                             "split)",
+                             static_cast<f64>(run) / 1048576.0);
+                }
+                for (int k = i; k < j; k++) {
+                    if (!dst[k] || !src[k] || !bytes[k]) continue;
+                    KRK_HIP(hipMemcpyAsync(dst[k], src[k], bytes[k],
+                                           hipMemcpyHostToDevice,
+                                           pinned_stream_));
+                }
+            }
             // Charge the bytes the caller asked for, not the merged run: the
             // run also carries the alignment padding between tensors, and a
             // statistic that grew when the copy got faster would not be
