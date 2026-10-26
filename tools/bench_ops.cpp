@@ -3698,6 +3698,173 @@ std::vector<u8> moe_weights(DType t, size_t row_bytes, i64 n_out, u32 salt) {
     return w;
 }
 
+// ---- the row-scaled gated store (Backend::silu_mul) -------------------------
+//
+// The dense FFN's `silu(gate)*up` row goes into an f16 activation buffer, and on
+// bitnet-2b its true peak is 3.5e6 -- 53x f16's ceiling -- so the unscaled store
+// saturates 88 of layer 0's 6912 elements and the RMSNorm that consumes the row
+// (BitNet's SubLN) then normalises a row whose direction is 108% wrong. That is
+// not a rounding: 88 elements stored at 1/53rd of their value, and measured as
+// the first stage the device and the --cpu arm disagree about.
+//
+// The engine answers with the row-scaled store: f16(p / 2^k), the smallest power
+// of two that puts the row inside f16, and the norm's scale invariance means
+// nothing has to fold it back. Nothing in the suite can see any of this -- it is
+// a device store, the CPU backend's activations are f32 (it needs no scale), and
+// this row is wider than the register form's 2048-element budget, so the wide
+// two-pass form is the path a model of this size actually takes.
+//
+// Four claims, each with an arm that fails when it is not true:
+//   * in range: the scale is exactly 1.0 and the bytes ARE the plain store's, so
+//     a row that fits is bit-for-bit unaffected by the change;
+//   * out of range: the bytes are f16(p / 2^k) for the smallest k that fits,
+//     against the host's own arithmetic, with nothing left at the ceiling;
+//   * per row: one buffer, one row in range and one out -- the scales are 1.0
+//     and 2^k, and the in-range row stays byte-identical to the plain store's. A
+//     kernel that scaled the whole buffer by row 1's scale fails here;
+//   * and the DEFECT is present: the same data through the unscaled store must
+//     saturate and must move the silu counter, while the scaled store moves it by
+//     zero. Without this arm the three above pass on a kernel that quietly fell
+//     back to the elementwise store -- which is exactly what it did before.
+i64 arm_silu_scale(Backend *be) {
+    constexpr i64 kWide = 6912;   // bitnet-2b's n_ff, over the 2048 budget
+    constexpr i64 kNarrow = 1024; // a model whose n_ff fits the register form
+    struct Case {
+        const char *tag;
+        i64 row_len;
+        i64 rows;
+        bool hot;  // the row's product leaves f16 (rows > 1: row 1 only)
+    };
+    const Case cases[] = {
+        {"in-range 6912 wide", kWide, 1, false},
+        {"over-range 6912 wide", kWide, 1, true},
+        {"over-range 1024 narrow", kNarrow, 1, true},
+        {"mixed rows 6912", kWide, 2, false},
+    };
+    std::printf("\nFFN gated store (Backend::silu_mul's row scale):\n");
+    i64 checks = 0, bad = 0;
+    for (const Case &c : cases) {
+        const i64 n = c.row_len * c.rows;
+        // gate ~1000 (silu(g) ~ g) against up 2.0 keeps the product near 1.5e3;
+        // up 4000.0 puts a row's peak at 3.5e6, the magnitude measured on
+        // bitnet-2b layer 0. Every element is rounded to f16 before the upload,
+        // so both sides read the same numbers.
+        std::vector<u16> g(static_cast<size_t>(n)), u(static_cast<size_t>(n));
+        std::vector<bool> row_hot(static_cast<size_t>(c.rows), c.hot);
+        for (i64 i = 0; i < n; i++) {
+            const i64 r = c.rows > 1 ? i / c.row_len : 0;
+            const bool hot = c.rows > 1 ? (r == 1) : c.hot;
+            row_hot[static_cast<size_t>(r)] = hot;
+            g[static_cast<size_t>(i)] = fp32_to_fp16(hot ? 1000.0f : 1.0f);
+            u[static_cast<size_t>(i)] = fp32_to_fp16(hot ? 4000.0f : 2.0f);
+        }
+        void *gd = be->alloc(static_cast<size_t>(n) * 2);
+        void *ud = be->alloc(static_cast<size_t>(n) * 2);
+        void *od = be->alloc(static_cast<size_t>(n) * 2);
+        void *od2 = be->alloc(static_cast<size_t>(n) * 2);
+        void *sd = be->alloc(static_cast<size_t>(c.rows) * sizeof(f32));
+        be->upload(gd, g.data(), static_cast<size_t>(n) * 2, 0);
+        be->upload(ud, u.data(), static_cast<size_t>(n) * 2, 0);
+        be->fill0(od, static_cast<size_t>(n) * 2);
+        be->fill0(od2, static_cast<size_t>(n) * 2);
+        // -1 is a value no kernel would leave: a slot nobody wrote reads back as
+        // a failure of the row-scale contract rather than as silence.
+        std::vector<f32> sinit(static_cast<size_t>(c.rows), -1.0f);
+        be->upload(sd, sinit.data(), static_cast<size_t>(c.rows) * sizeof(f32), 0);
+
+        // One store per reading, so each count describes that store alone: the
+        // counters are cumulative, and only a difference of two readings can be
+        // attributed to one call.
+        unsigned long long s0[3], s1[3];
+        be->reset_activation_saturation();
+        be->silu_mul(od, gd, ud, n, c.row_len, static_cast<f32 *>(sd));
+        be->sync();
+        be->activation_saturation(s0);
+        const unsigned long long scaled_clips = s0[0];
+        be->reset_activation_saturation();
+        be->silu_mul(od2, gd, ud, n, 0, nullptr);  // the unscaled store
+        be->sync();
+        be->activation_saturation(s1);
+        const unsigned long long plain_clips = s1[0];
+
+        std::vector<u16> got(static_cast<size_t>(n));
+        std::vector<u16> plain(static_cast<size_t>(n));
+        std::vector<f32> sc(static_cast<size_t>(c.rows));
+        be->download(got.data(), od, static_cast<size_t>(n) * 2);
+        be->download(plain.data(), od2, static_cast<size_t>(n) * 2);
+        be->download(sc.data(), sd, static_cast<size_t>(c.rows) * sizeof(f32));
+
+        i64 scale_bad = 0, misfit = 0, at_ceiling = 0, plain_diff = 0;
+        for (i64 r = 0; r < c.rows; r++) {
+            const bool hot = row_hot[static_cast<size_t>(r)];
+            f64 m = 0.0;
+            for (i64 i = 0; i < c.row_len; i++) {
+                const size_t k = static_cast<size_t>(r * c.row_len + i);
+                const f32 gv = fp16_to_fp32(g[k]);
+                const f32 uv = fp16_to_fp32(u[k]);
+                const f64 p =
+                    std::fabs(static_cast<f64>(gv / (1.0f + std::exp(-gv))) * uv);
+                if (p > m) m = p;
+            }
+            f64 mul = 1.0;
+            while (m > 65504.0 * mul && mul < 16777216.0) mul *= 2.0;
+            if (sc[static_cast<size_t>(r)] != static_cast<f32>(mul)) scale_bad++;
+            for (i64 i = 0; i < c.row_len; i++) {
+                const size_t k = static_cast<size_t>(r * c.row_len + i);
+                const f32 gv = fp16_to_fp32(g[k]);
+                const f32 uv = fp16_to_fp32(u[k]);
+                const f32 p = (gv / (1.0f + std::exp(-gv))) * uv;
+                const u16 want = fp32_to_fp16(static_cast<f32>(p / mul));
+                const f32 ref = fp16_to_fp32(want);
+                const f32 have = fp16_to_fp32(got[k]);
+                if (std::fabs(have - ref) > 2e-3f * std::max(1.0f, std::fabs(ref)))
+                    misfit++;
+                if (std::fabs(have) >= 65503.0f) at_ceiling++;
+                // The unscaled store's own bytes: identical where the row is in
+                // range (that is the bit-identity claim) and short of the
+                // reference where it is not (that is the defect).
+                if (plain[k] == want) {
+                    if (plain[k] != got[k] && !hot) misfit++;
+                } else {
+                    plain_diff++;
+                    if (!hot) misfit++;
+                }
+            }
+        }
+        checks += 8;
+        i64 case_bad = 0;
+        case_bad += scale_bad ? 1 : 0;
+        case_bad += misfit ? 1 : 0;
+        case_bad += at_ceiling ? 1 : 0;
+        case_bad += scaled_clips ? 1 : 0;
+        const bool any_hot =
+            std::find(row_hot.begin(), row_hot.end(), true) != row_hot.end();
+        case_bad += ((plain_clips > 0) == any_hot) ? 0 : 1;
+        case_bad += (!any_hot || plain_diff > 0) ? 0 : 1;
+        case_bad += (sc[0] == 1.0f || row_hot[0]) ? 0 : 1;
+        case_bad += (c.rows < 2 || (sc[0] == 1.0f && sc[1] > 1.0f)) ? 0 : 1;
+        std::string scale_str = std::to_string(sc[0]);
+        if (c.rows > 1) scale_str += "+" + std::to_string(sc[1]);
+        std::printf("  %-22s rows=%lld row_len=%lld scale=%s  scaled clips=%llu "
+                    "plain clips=%llu  plain-only bytes=%lld  %s\n",
+                    c.tag, static_cast<long long>(c.rows),
+                    static_cast<long long>(c.row_len), scale_str.c_str(),
+                    scaled_clips, plain_clips,
+                    static_cast<long long>(plain_diff), case_bad ? "FAIL" : "ok");
+        bad += case_bad;
+        be->release(gd);
+        be->release(ud);
+        be->release(od);
+        be->release(od2);
+        be->release(sd);
+    }
+    std::printf("  FFN gated store: %lld of %lld checks passed%s\n",
+                static_cast<long long>(checks - bad),
+                static_cast<long long>(checks), bad ? "  <-- FAIL" : "");
+    be->reset_activation_saturation();
+    return bad;
+}
+
 i64 arm_moe_dispatch(Backend *be) {
     const MoeCase cases[] = {
         {"k=1 q4_k", DType::Q4_K, 2048, 1024, 4, 1, 2},
@@ -4167,6 +4334,7 @@ int main(int argc, char **argv) {
     bool sweep = false;
     bool gate = false;
     bool bitexact = false;
+    bool silu_scale_test = false;
     bool hc_test = false;
     bool mla_test = false;
     bool mla_shared_test = false;
@@ -4191,6 +4359,7 @@ int main(int argc, char **argv) {
         else if (a == "--pool") pool_test = true;
         else if (a == "--gate") gate = true;
         else if (a == "--bitexact") bitexact = true;
+        else if (a == "--silu-scale") silu_scale_test = true;
         else if (a == "--hc") hc_test = true;
         else if (a == "--mla") mla_test = true;
         else if (a == "--mla-shared") mla_shared_test = true;
@@ -4323,6 +4492,12 @@ int main(int argc, char **argv) {
 
     if (bitexact) failures += arm_rows_bitexact(be);
 
+    // The row-scaled gated store: the one device arm that can see whether the
+    // FFN intermediate survives f16 at all (see arm_silu_scale). Enforcing, like
+    // --bitexact's int8 rows: a store that saturates is a wrong answer, not a
+    // rounding, and the exit status is the only place that reaches a caller.
+    if (silu_scale_test) failures += arm_silu_scale(be);
+
     // Device-only, so it is its own flag rather than part of --gate: the gate
     // must stay runnable on a box where the device is busy.
     if (hc_test) failures += arm_hc(be);
@@ -4358,7 +4533,7 @@ int main(int argc, char **argv) {
     // stream rather than a rounding property. The f16 rows in the same report
     // stay informational (they return 0), so this arm cannot turn "rows 9+
     // differ by 1 ulp" into a failure -- see the note on arm_rows_bitexact.
-    if (failures && (gate || bitexact)) {
+    if (failures && (gate || bitexact || silu_scale_test)) {
         std::fprintf(stderr,
                      "\nGATE FAILED: %lld check(s) outside tolerance, or NaN/inf, "
                      "or a logits_topk mismatch, or an int8 K/V arm that is not "

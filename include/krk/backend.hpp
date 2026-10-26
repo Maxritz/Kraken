@@ -1096,14 +1096,18 @@ public:
     // out = silu(gate) * up
     //
     // `row_len` > 0 with `row_scale` non-null takes the row-scaled form: `n`
-    // is `n / row_len` rows of `row_len` elements (one token expert
-    // activation, which is the dimension the down projection reduces over),
-    // the products are stored divided by one power of two per row so each row
-    // fits the f16 activation buffer, and the multiplier 2^k is written to
-    // row_scale[row] for the caller to fold back into whatever consumes that
-    // row (the MoE scatter alpha). A power-of-two divide is exact in f16, so
-    // this buys exponent range and spends no precision, and it is
-    // bit-identical to the plain form whenever the row is already in range.
+    // is `n / row_len` rows of `row_len` elements (one row of the gated
+    // intermediate, which is the dimension the down projection reduces over --
+    // one token expert activation, or a dense FFN's gated row), the products
+    // are stored divided by one power of two per row so each row fits the f16
+    // activation buffer, and the multiplier 2^k is written to row_scale[row]
+    // for the caller to fold back into whatever consumes that row (the MoE
+    // scatter alpha). A consumer that is itself scale-invariant folds nothing
+    // back and is exactly right either way: BitNet's `ffn_sub_norm` is an
+    // RMSNorm on this row, so it reads the row's direction and never its size.
+    // A power-of-two divide is exact in f16, so this buys exponent range and
+    // spends no precision, and it is bit-identical to the plain form whenever
+    // the row is already in range.
     // A backend whose activations are wider than f16 needs no scale: it stores
     // exactly and fills row_scale with 1.0, so the caller contract holds
     // either way.

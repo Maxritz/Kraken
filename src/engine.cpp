@@ -1253,6 +1253,16 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     ws_fexp_ = alloc(static_cast<size_t>(C) * sizeof(i32));
     if (!check_alloc(ws_fexp_, "ws_fexp")) return false;
     be_->fill0(ws_fexp_, static_cast<size_t>(C) * sizeof(i32));
+    // The gated FFN intermediate's per-row store scale (Backend::silu_mul's
+    // row-scaled form). Filled with 1.0 rather than zeroed: a layer that never
+    // writes one must read as unscaled, and the trace multiplies by this array.
+    ws_fscl_ = alloc(static_cast<size_t>(C) * sizeof(f32));
+    if (!check_alloc(ws_fscl_, "ws_fscl")) return false;
+    {
+        std::vector<f32> ones(static_cast<size_t>(C), 1.0f);
+        be_->upload(ws_fscl_, ones.data(), static_cast<size_t>(C) * sizeof(f32),
+                    0);
+    }
 
     ws_xn_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     if (!check_alloc(ws_xn_, "ws_xn")) return false;
@@ -2257,7 +2267,7 @@ void Engine::shutdown() {
                      model_.cfg().n_expert),
                  ds_max_);
     }
-    for (void **p : {&ws_x_, &ws_rexp_, &ws_fexp_, &ws_xn_, &ws_x2_, &ws_gs_, &ws_q_,
+    for (void **p : {&ws_x_, &ws_rexp_, &ws_fexp_, &ws_fscl_, &ws_xn_, &ws_x2_, &ws_gs_, &ws_q_,
                      &ws_qpack_, &ws_k_,
                      &ws_v_, &ws_attn_, &ws_mlaqn_, &ws_mlay_, &ws_mlaa_,
                      &ws_gate_, &ws_up_, &ws_had_, &ws_logits_,
@@ -2322,7 +2332,7 @@ void Engine::shutdown() {
 }
 
 void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
-                      i64 rows) {
+                      i64 rows, const f32 *row_scale) {
     if (dump_path_.empty() || rows <= 0) return;
     be_->sync();
     // Two shapes of trace, because one row cannot answer every question.
@@ -2356,6 +2366,22 @@ void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
     be_->download_f32(vals.data(),
                       act_at(const_cast<void *>(buf), be_->act_size(), off),
                       static_cast<i64>(vals.size()));
+    // A row the store divided by a power of two (Backend::silu_mul's row-scaled
+    // form) is dumped at TRUE scale. The stored bytes are f16(p / 2^k) and the
+    // divide is exact, so multiplying by 2^k returns the value the --cpu arm's
+    // f32 row holds to f16 precision -- which is what keeps this trace naming
+    // the first stage that really differs instead of reporting a 2^k scale gap
+    // at a stage that is right.
+    if (row_scale) {
+        std::vector<f32> scl(static_cast<size_t>(rows));
+        be_->download(scl.data(), row_scale,
+                      static_cast<size_t>(rows) * sizeof(f32));
+        for (i64 r = 0; r < nrow; r++) {
+            const f32 s = scl[static_cast<size_t>(row0 + r)];
+            for (i64 i = 0; i < width; i++)
+                vals[static_cast<size_t>(r * width + i)] *= s;
+        }
+    }
     std::FILE *f = std::fopen(dump_path_.c_str(), "a");
     if (!f) return;
     if (full) {
@@ -3323,6 +3349,19 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             had_xform(ws_had_, ws_attn_, n, aw, false, false);
             attn_in = ws_had_;
         }
+        // BitNet's SubLN, attention half: an RMSNorm on the CONTEXT, between
+        // the attention and its output projection -- NOT a second norm on the
+        // layer's input, which is what attn_norm already is. The two are
+        // different tensors of the same width, so reading this one as a second
+        // pre-norm keeps the same op and the same shape and still decodes
+        // nonsense; the position is stated here and the loader checks the
+        // width. In place on whichever buffer holds the context: the fold above
+        // has already consumed ws_attn_ when it ran, and ws_had_ holds the
+        // transformed copy otherwise.
+        if (L.attn_sub_norm) {
+            void *ctx = attn_in == ws_attn_ ? ws_attn_ : ws_had_;
+            be_->rmsnorm(ctx, ctx, L.attn_sub_norm, n, aw, mc.rms_eps);
+        }
         if (!mla_grouped)
             gemm_w(ws_x2_, attn_in, L.wo, n_embd_, aw, n);
         // gpt-oss biases the attention output: one value per output channel,
@@ -3474,7 +3513,11 @@ void Engine::gemm_residual(void *dst, const void *x, const void *w, DType wt,
         be_->scale_act(ws_gs_, gs, rows, n_in, n_in);
         xin = ws_gs_;
     }
-    if (gs == 1.0f && dump_path_.empty() && rows > 0 &&
+    // `resid_scaled_` refuses the fold on a run whose residual rows ride a
+    // storage exponent: the fold's store is at the row's current exponent and
+    // cannot renormalize, so a contribution that needs a bigger one clips
+    // instead of re-scaling. See the note in Engine::forward.
+    if (gs == 1.0f && !resid_scaled_ && dump_path_.empty() && rows > 0 &&
         be_->gemm_accumulate(dst, x, w, wt, n_out, n_in, rows, rexp))
         return;
     be_->gemm(scratch, xin, w, wt, n_out, n_in, rows);
@@ -4307,6 +4350,19 @@ Engine::MtpProbe Engine::mtp_probe_step() {
     return r;
 }
 
+// KRK_FFN_ROWSCALE=0 restores the unscaled gated store for a layer with a
+// sub-norm -- and with it the fused gate/up epilogue -- which is the A/B arm for
+// the row-scaled store: on bitnet-2b it is the arm that clips 88 elements of
+// layer 0's row and decodes different text, and it is the only way back to a
+// measurement of what the scaled store costs.
+static bool ffn_rowscale_on() {
+    static const bool on = [] {
+        const char *e = std::getenv("KRK_FFN_ROWSCALE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
 void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
     KRK_TRACE_COMP("dense-ffn");
     // gate/up share the FFN-norm output: one fused launch on the decode row.
@@ -4329,16 +4385,30 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
     // a family whose graph is otherwise a copy of the SwiGLU one.
     const ModelConfig &dmc = model_.cfg();
     const bool gelu = dmc.gelu_ffn;
+    // BitNet's SubLN normalises this row, and an RMSNorm reads a row's
+    // direction and never its size, so the store's absolute scale does not reach
+    // the model. That is what makes the row-scaled store safe here, and it is
+    // REQUIRED: on bitnet-2b this row's true peak is 3.5e6, 53x f16's ceiling,
+    // so the unscaled store saturates 88 of its 6912 elements at layer 0 and the
+    // norm then normalises a row whose direction is 108% wrong -- measured as
+    // the first stage the device and --cpu arms disagree about, and as the
+    // difference between their text. See AGENTS.md.
+    const bool row_scaled = L.ffn_sub_norm != nullptr && ffn_rowscale_on();
     bool silu_done = false;
     // Same rule as the q/k/v group: the folded epilogue computes silu(gate)*up,
     // which is nonlinear in each, so a per-matrix scale has to be applied BEFORE
     // it -- which is exactly what the per-matrix path below does.
+    //
+    // A row-scaled store asks for the bare pair as well, and for a different
+    // reason: the fused epilogue's warp holds ONE element of the row, so the row
+    // maximum the scale is derived from does not exist inside it. The activation
+    // runs as its own op for those layers.
     if (L.wgate.type == L.wup.type && !L.wgate.scaled() && !L.wup.scaled()) {
         void *gu[2] = {ws_gate_, ws_up_};
         const void *wgu[2] = {L.wgate.data, L.wup.data};
         const i64 ngu[2] = {n_ff_, n_ff_};
-        be_->gemm_group(gu, xn, wgu, L.wgate.type, ngu, n_embd_, 2, n, !gelu,
-                        &silu_done);
+        be_->gemm_group(gu, xn, wgu, L.wgate.type, ngu, n_embd_, 2, n,
+                        !gelu && !row_scaled, &silu_done);
     } else {
         gemm_w(ws_gate_, xn, L.wgate, n_ff_, n_embd_, n);
         gemm_w(ws_up_, xn, L.wup, n_ff_, n_embd_, n);
@@ -4348,10 +4418,21 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
             be_->gelu_act(ws_gate_, n * n_ff_);
             be_->mul_act(ws_gate_, ws_up_, n * n_ff_);
         } else {
-            be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_);
+            be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_,
+                          row_scaled ? n_ff_ : 0,
+                          row_scaled ? static_cast<f32 *>(ws_fscl_) : nullptr);
         }
     }
-    dump_row("attn.ffng", l, ws_gate_, n_ff_, n);
+    dump_row("attn.ffng", l, ws_gate_, n_ff_, n,
+             row_scaled ? static_cast<const f32 *>(ws_fscl_) : nullptr);
+    // BitNet's SubLN, FFN half: an RMSNorm on the GATED INTERMEDIATE, between
+    // silu(gate)*up and the down projection -- not on the pre-FFN input, which
+    // is what ffn_norm already is. `ffn_sub_norm` is n_ff wide against
+    // ffn_norm's n_embd, and that is the shape that says which is which. In
+    // place, so the folded-down transform below reads the normalized row; the
+    // dump above is still the raw gated product.
+    if (L.ffn_sub_norm)
+        be_->rmsnorm(ws_gate_, ws_gate_, L.ffn_sub_norm, n, n_ff_, dmc.rms_eps);
     // The intermediate is a folded input as well (its width is n_ff, wider
     // than anything above), which is safe to put over ws_had_ because the
     // gate/up gemms have already consumed their copy.
@@ -4390,6 +4471,29 @@ bool Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
     // different thing). See reclamp_expert_budget.
     if (n > 1 || (++reclamp_tick_ % 16u) == 0)
         reclamp_expert_budget(n > 1 ? "prefill" : "decode");
+    // The folded residual store (Backend::gemm_accumulate) divides the
+    // contribution by the row's CURRENT storage exponent and sums in f16, so it
+    // is only sound while that exponent still holds the sum. A row that left
+    // f16 is exactly the case where it may not -- and there the fold stores
+    // 65504 where the true value is larger, the one defect class this repo
+    // treats as a failure rather than a rounding (see the `residual` counter).
+    // So the fold is dropped for the rest of the run once any residual row has
+    // been stored scaled. The evidence is the residual store's own exponent,
+    // read on the cadence the budget re-clamp above already established --
+    // every prefill, every 16th decode row: one 4-byte query, sticky, so a
+    // model whose rows stay inside f16 pays it and keeps the one-launch fold,
+    // and bitnet-2b (exponent 2 on its first prompt row) never folds at all.
+    //
+    // It can only REMOVE a wrong answer, never change a right one: where the
+    // fold runs its store is bit-identical to the gemm+add_residual pair it
+    // replaces, and where it is dropped that pair is what runs.
+    if (!resid_scaled_ && (n > 1 || (reclamp_tick_ % 16u) == 0) &&
+        be_->residual_exponent_max() > 0) {
+        resid_scaled_ = true;
+        KRK_INFO("residual fold off: a residual row left f16 (max exponent %d), "
+                 "so the folded projection store is dropped for this run",
+                 be_->residual_exponent_max());
+    }
     // KRK_VRAM_TRACE=1 prints the ledger after every forward with more than one
     // row. The re-clamp above can only fire on a live reading, so when it does
     // fire the question is always "which allocation took the bytes between the

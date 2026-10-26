@@ -701,6 +701,75 @@ code, the README, or `docs/`.
   re-record deliberately with `KRK_REFRESH_FINGERPRINT=1`, then run it once more
   plainly to show the hashes match.
 
+- **BitNet's dense FFN needs two things an f16 activation buffer does not give
+  it, and it ran without both.** `bitnet-2b-tq1_0` (2B dense ternary, 30 blocks,
+  n_embd 2560, n_ff 6912, 20 heads / 5 KV, rope base 500000) now answers with the
+  same words on the device as on `--cpu` -- `The capital of France is the capital
+  of France ...` at 8, 16 and 32 tokens -- and `scripts/coherence_check.sh`
+  classifies it `PASS`. Before this it said `a capital is a capital is a capital`.
+  `kraken-inspect` still reports `arch bitnet -- unknown (llama-like defaults)`,
+  so the family's verdict rests on the loader's own reads plus that gate and not
+  on a declared table row.
+  (1) **SubLN is a SECOND RMSNorm per sub-block, on the intermediate.** The file
+  carries `attn_sub_norm` [n_embd] and `ffn_sub_norm` [n_ff] per layer; the widths
+  say which is which, and neither is `attn_norm`/`ffn_norm`, which are the
+  PRE-block norms. The order is `attn_norm -> qkv -> attention -> attn_sub_norm ->
+  wo` and `ffn_norm -> gate/up -> silu(gate)*up -> ffn_sub_norm -> down`. Read
+  against llama defaults they are simply unknown tensors, and the model ran
+  without them.
+  (2) **`silu(gate)*up` leaves f16 by 53x here, and the norm that consumes the row
+  is why that is not a rounding error.** Measured on layer 0 with `--cpu` as the
+  f32 reference: that row's peak is **3.497e6** against f16's 65504, **88 of its
+  6912 elements** are over the ceiling, and the unscaled f16 store hands its
+  consumer a row whose **direction is 58 degrees off** (`cos` 0.4153, `relL2`
+  0.946) -- an RMSNorm reads direction and never size, so nothing downstream can
+  undo that. The row-scaled store lands at `relL2` 3.3e-4, `cos` 0.99999995.
+  `tools/dump_diff.py` over the same pair puts the FIRST divergence at
+  **`attn.ffng L00`, rel 5.24e1** with nothing before it, and `attn.down L00`
+  (rel 4.2 unscaled against 3.5e-4 scaled) is the cascade.
+  The fix is `Backend::silu_mul`'s row-scale form: `row_len` > 0 asks for the
+  products to be stored divided by ONE power of two per row, chosen so that row
+  fits, and the multiplier is written to `row_scale[row]`. A power-of-two divide
+  is exact in f16, so it buys exponent range and spends no precision, and it is
+  bit-identical to the plain store for a row already in range. The dense FFN asks
+  for it on exactly the layers that own an `ffn_sub_norm` and passes `ws_fscl_`;
+  its consumer folds nothing back because the RMSNorm it feeds is
+  scale-invariant -- which is why the form is safe there and would not be for an
+  arbitrary consumer. `KRK_FFN_ROWSCALE=0` is the A/B arm (the old store).
+  **The guard that makes this loud is fatal by default, which is the point of it.**
+  Every run prints `range f16 activation bounds fired: silu N, experts-sum N,
+  residual N`; the unscaled arm exits **rc=2** with `silu 11975` at 32 tokens
+  against `silu 0` and rc=0 for the scaled one, and `KRK_RANGE_STRICT=1` keeps it
+  fatal where a caller has asked for a comparison. The fix's own gate is a strict
+  run: device, 32 tokens, **rc=0 and no clip line at all**.
+  The cost is real and it is not the arithmetic: **3-5% slower decode, prefill
+  unchanged** (six runs per arm over three experiments -- 48.4 against 49.5, 50.1
+  against 52.0, 48.0 against 50.5 tok/s; prefill 96.4 against 96.0 ms at a
+  6-token prompt). The fused gate/up epilogue holds ONE element of the row per
+  warp, so no row maximum exists inside it and a row-scaled layer declines it:
+  `silu_mul` becomes its own launch (960 calls for 32 tokens x 30 layers, 1.91 ms
+  against 0.05 ms of kernel time) and writes two rows where the fused form wrote
+  one. That kernel time is 0.3% of the run and the arms' op tables are not
+  comparable row by row (the scaled arm's whole table reads ~10% higher on ops
+  whose arguments are identical), so the 3-5% is a whole-run measurement taken
+  three ways and not a per-op decomposition -- the lost epilogue and its exposed
+  launch is where it lives.
+  `kraken-bench --silu-scale` is the arm that keeps the store honest and it is
+  ENFORCING (it adds to the exit status, like `--bitexact`'s int8 rows): **32 of
+  32 checks** over four cases -- an in-range row that must come back bit-identical
+  to the plain store, an over-range row at scale 64, the same row at a narrow 1024
+  width, and two rows in ONE call whose scales must differ per row (1.0 and 64.0).
+  Red construction: disabling the wide scaled path fails **26 of 32**, both wide
+  cases reporting `scaled clips=6912` while the narrow register case stays green,
+  so the arm is specific to the path it names rather than counting a failure.
+  Gate: `kraken-tests` 4528/4528 in 95 groups, `scripts/build_check.sh` 0 failed,
+  the baseline check `no regression`, `kraken-bench --bitexact` rc=0, the
+  coherence check PASS on all three shapes (Qwen3-4B-Q8_0 dense, Qwen3.5-9B-Q4_K_M
+  recurrent, Qwen3-30B-A3B i1-Q2_K MoE, `1 coherent, 0 not` each), and `bench --gate` green
+  except the speculation arm, which cannot find
+  `models/SmolLM2-135M-Instruct.Q4_K_M.gguf` on this box and fails before any of
+  this code runs.
+
 ## Cross-engine baselines (Strata)
 
 - Strata is the sibling engine on this box that targets the same card, and its

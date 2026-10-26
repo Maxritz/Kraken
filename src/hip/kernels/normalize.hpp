@@ -436,6 +436,55 @@ __global__ void silu_mul_scaled_kernel(_Float16 *__restrict__ out,
                     scale_out + blockIdx.x);
 }
 
+// The same row scale for a row too WIDE for the register form above: it holds
+// a whole row in `kMaxVec` f32 per thread, which caps it at 2048 elements, and
+// a dense FFN intermediate is wider than that (n_ff 6912 on bitnet-2b). This
+// form walks the row twice instead -- pass 1 for the peak, pass 2 to store --
+// and the recomputation is exact: the same f16 reads, the same `d_silu`, the
+// same f32 product, so pass 2 stores f16(p / mul) for the p pass 1 measured.
+// The power of two is the smallest that puts the row inside f16, chosen by the
+// same three lines as the register form, so a row's scale does not depend on
+// which of the two ran.
+__global__ void silu_mul_wide_scaled_kernel(_Float16 *__restrict__ out,
+                                            const _Float16 *__restrict__ gate,
+                                            const _Float16 *__restrict__ up,
+                                            i64 row_len,
+                                            f32 *__restrict__ scale_out) {
+    constexpr f32 kCeil = 65504.0f;
+    const i64 base = static_cast<i64>(blockIdx.x) * row_len;
+    const int t = static_cast<int>(threadIdx.x);
+    f32 mx = 0.0f;
+    for (i64 i = t; i < row_len; i += blockDim.x) {
+        const f32 p = d_silu(static_cast<f32>(gate[base + i])) *
+                      static_cast<f32>(up[base + i]);
+        const f32 a = fabsf(p);
+        if (a > mx) mx = a;
+    }
+    __shared__ f32 smx[32];
+    mx = d_wave_reduce_max(mx);
+    if ((t & 31) == 0) smx[t >> 5] = mx;
+    __syncthreads();
+    if (t == 0) {
+        f32 m = smx[0];
+        for (int w = 1; w < static_cast<int>(blockDim.x >> 5); w++)
+            m = fmaxf(m, smx[w]);
+        f32 mul = 1.0f;
+        while (m > kCeil * mul && mul < 16777216.0f) mul *= 2.0f;
+        smx[0] = mul;
+        scale_out[blockIdx.x] = mul;
+    }
+    __syncthreads();
+    const f32 mul = smx[0];
+    for (i64 i = t; i < row_len; i += blockDim.x) {
+        // Through the bound as well, exactly as the register form does: a row
+        // still over after 2^24 is a fact the counters must carry rather than
+        // an inf the model eats.
+        const f32 p = d_silu(static_cast<f32>(gate[base + i])) *
+                      static_cast<f32>(up[base + i]);
+        out[base + i] = d_sat_f16_count(p / mul, &g_krk_sat_silu);
+    }
+}
+
 // `count` independent ONE-ROW buffers in one launch: block i is row i, and its
 // body is the function above. The MoE decode path uses it for its routed
 // experts, which at one token are one row each in their own buffers; the

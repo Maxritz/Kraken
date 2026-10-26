@@ -3956,15 +3956,26 @@ public:
     void silu_mul(void *out, const void *gate, const void *up, i64 n,
                   i64 row_len = 0, f32 *row_scale = nullptr) override {
         KRK_TIME_OP("silu_mul");
-        // The row-scaled form keeps each thread share of a row in registers,
-        // so it is taken only for rows that fit that budget (2048 = 8 x 256).
-        // Anything wider falls through to the elementwise kernel, and the
-        // caller row-scale contract is then answered with 1.0 per row rather
-        // than with whatever the buffer last held.
-        const bool scaled = row_len > 0 && row_scale && n % row_len == 0;
-        const i64 rows = scaled ? n / row_len : 0;
+        // The row-scaled form has two shapes, and the split is a register
+        // budget rather than a preference: the register form holds each
+        // thread's share of a row in 8 f32, which caps it at 2048 elements,
+        // and the wide form walks the row twice instead. A dense FFN
+        // intermediate at n_ff 6912 is the wide case; both derive the same
+        // smallest power of two, so a row's scale does not depend on the form.
+        // Without a row to tile (no row_len, or n not a whole number of rows)
+        // the elementwise kernel stores the unscaled product, so 1.0 per row is
+        // what a caller asking for scales still gets.
+        const bool asked = row_len > 0 && row_scale != nullptr;
+        const i64 rows = (asked && n % row_len == 0) ? n / row_len : 0;
         if (rows > 0 && row_len <= 2048) {
             silu_mul_scaled_kernel<<<static_cast<unsigned>(rows), 256>>>(
+                static_cast<_Float16 *>(out),
+                static_cast<const _Float16 *>(gate),
+                static_cast<const _Float16 *>(up), row_len, row_scale);
+            return;
+        }
+        if (rows > 0) {
+            silu_mul_wide_scaled_kernel<<<static_cast<unsigned>(rows), 256>>>(
                 static_cast<_Float16 *>(out),
                 static_cast<const _Float16 *>(gate),
                 static_cast<const _Float16 *>(up), row_len, row_scale);
@@ -3974,9 +3985,10 @@ public:
         silu_mul_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(out),
                                          static_cast<const _Float16 *>(gate),
                                          static_cast<const _Float16 *>(up), n);
-        if (rows > 0) {
-            const unsigned fb = static_cast<unsigned>((rows + 255) / 256);
-            fill_f32_kernel<<<fb, 256>>>(row_scale, 1.0f, rows);
+        if (asked) {
+            const i64 nr = (n + row_len - 1) / row_len;
+            const unsigned fb = static_cast<unsigned>((nr + 255) / 256);
+            fill_f32_kernel<<<fb, 256>>>(row_scale, 1.0f, nr);
         }
     }
 

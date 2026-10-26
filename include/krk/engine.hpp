@@ -667,7 +667,10 @@ private:
     // KRK_DUMP: append the last row of `buf` (width x rows elements, f32 host
     // or f16 device) to the dump file, one text line per call. A CPU run and a
     // HIP run of the same prompt then differ at exactly one line per stage.
-    void dump_row(const char *what, i32 layer, const void *buf, i64 width, i64 rows);
+    // `row_scale` (nullable) is a per-row f32 multiplier the row was stored
+    // divided by; it is applied on the host so the trace shows true scale.
+    void dump_row(const char *what, i32 layer, const void *buf, i64 width, i64 rows,
+                  const f32 *row_scale = nullptr);
     // Folds every row of `buf` into the prefill trace hash. The row-local
     // stages a chunk composition must leave unchanged; unlike the text dump it
     // covers ALL rows and never a stage that only one chain emits.
@@ -808,6 +811,12 @@ private:
     // staged when they are already in WARM (a copy, never a read).
     i32 expert_lookahead_ = 0;
     u32 reclamp_tick_ = 0;
+    // Set once this run has stored a residual row divided by a power of two
+    // (Backend::add_residual's exponent). It disables the folded projection
+    // store (Backend::gemm_accumulate), which divides its contribution by the
+    // row's CURRENT exponent and so cannot hold a sum that needs a bigger one.
+    // Sticky and one-way: see the note in Engine::forward.
+    bool resid_scaled_ = false;
     // `<model>.krakenexperts.json` (see write_expert_index) as a hottest-first
     // (layer, expert) list. Empty when the file is missing or does not describe
     // this exact model: a ranking measured on other weights is worse than no
@@ -1225,6 +1234,13 @@ private:
     // leave f16 when the shared expert is folded in, so that fold renormalizes
     // through the same contract and `ws_ffn_` carries an exponent too.
     void *ws_fexp_ = nullptr;
+    // One f32 per token row: the power of two that row's gated FFN intermediate
+    // was stored divided by (Backend::silu_mul's row-scaled form). Only the
+    // layers with an `ffn_sub_norm` ask for it, and their consumer is that
+    // RMSNorm, which is scale-invariant and reads the direction -- so nothing
+    // folds it back into the graph; the trace applies it so a dump stays at
+    // true scale (Engine::dump_row).
+    void *ws_fscl_ = nullptr;
     // ---- LatentMoE staging (null on every family without ffn_latent_*) ----
     // `ws_xlat_` is the block's projection into the experts' narrow space and
     // `ws_ffn_lat_` is the routed sum accumulated there; `ws_xlat_out_` is that

@@ -1679,6 +1679,39 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             return false;
         }
 
+        // BitNet's SubLN: an RMSNorm on each sub-block's INTERMEDIATE output,
+        // present on that family and on nothing else, so it is read when it is
+        // there rather than required -- absent keeps the graph a file already
+        // had (see LayerWeights::attn_sub_norm for the two positions, which are
+        // not the pre-norms'). Both widths are checked, because each is indexed
+        // by a column count that comes from elsewhere in the graph (`aw` for
+        // the context, n_ff for the gated intermediate): a wrong width is an
+        // out-of-bounds weight read, not a wrong answer.
+        {
+            const std::string sa = blk_key("blk.%d.attn_sub_norm.weight", l);
+            const std::string sf = blk_key("blk.%d.ffn_sub_norm.weight", l);
+            L.attn_sub_norm = upload_f32(sa);
+            L.ffn_sub_norm = upload_f32(sf);
+            const GgufTensor *ta = gguf_.tensor(sa);
+            const GgufTensor *tf = gguf_.tensor(sf);
+            if (L.attn_sub_norm && ta && ta->n_elements != cfg_.n_embd) {
+                if (err)
+                    *err = "layer " + std::to_string(l) + " attn_sub_norm has " +
+                           std::to_string(ta->n_elements) +
+                           " elements; the attention context is " +
+                           std::to_string(cfg_.n_embd) + " wide";
+                return false;
+            }
+            if (L.ffn_sub_norm && tf && tf->n_elements != cfg_.n_ff) {
+                if (err)
+                    *err = "layer " + std::to_string(l) + " ffn_sub_norm has " +
+                           std::to_string(tf->n_elements) +
+                           " elements; the FFN intermediate is " +
+                           std::to_string(cfg_.n_ff) + " wide";
+                return false;
+            }
+        }
+
         // Attention sinks (deepseek4, gpt-oss): one fp32 scalar per query
         // head, uploaded like every other 1-D weight. Absent is not an
         // error -- it is the whole rest of the model set, and the kernels
@@ -3899,6 +3932,8 @@ void Model::unload() {
         if (L.attn_post_norm) be_->release(L.attn_post_norm);
         if (L.ffn_post_norm) be_->release(L.ffn_post_norm);
         if (L.ffn_norm) be_->release(L.ffn_norm);
+        if (L.attn_sub_norm) be_->release(L.attn_sub_norm);
+        if (L.ffn_sub_norm) be_->release(L.ffn_sub_norm);
         if (L.q_bias) be_->release(L.q_bias);
         if (L.k_bias) be_->release(L.k_bias);
         if (L.v_bias) be_->release(L.v_bias);

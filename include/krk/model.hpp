@@ -65,6 +65,22 @@ struct LayerWeights {
     // other family, and null is what keeps their graph unchanged.
     f32 *attn_post_norm = nullptr; // f32 [n_embd]
     f32 *ffn_post_norm = nullptr;  // f32 [n_embd]
+    // BitNet's SubLN (bitnet-b1.58-2B-4T): a SECOND RMSNorm per sub-block, and
+    // it sits on the sub-block's intermediate output rather than on the
+    // pre-normed input --
+    //
+    //   x -> attn_norm -> qkv -> attention -> attn_sub_norm -> wo  -> +x
+    //   x -> ffn_norm  -> gate/up -> silu(gate)*up -> ffn_sub_norm -> down
+    //
+    // -- so the plausible reading (norm the layer's input a second time) runs
+    // the right weights on the wrong operand and decodes nonsense rather than
+    // failing. The WIDTH is the shape that tells them apart, from the pre-norms
+    // and from each other: `attn_sub_norm` is n_embd wide because the attention
+    // context is, and `ffn_sub_norm` is n_ff wide because the gated FFN
+    // intermediate is. Null on every other family, and null is what keeps their
+    // graph exactly as it was.
+    f32 *attn_sub_norm = nullptr; // f32 [n_embd]
+    f32 *ffn_sub_norm = nullptr;  // f32 [n_ff]
     QuantTensor wgate, wup, wdown;
 
     // ---- qwen4exp: hyper-connections, PLE, indexer (optional) ------------
