@@ -445,6 +445,43 @@ code, the README, or `docs/`.
   103% -> prefill -> 84.0 / 84.8 (37 ms prompt) against 25.2 with the prefill
   off; Qwen3-30B 100% -> prefill -> 46.0 / 47.0, unchanged. `KRK_WARM_PREFILL=1|0`
   overrides the rule, which is how each row was measured.
+  **The seed FRACTION is chosen by the same rule now, so neither reply length
+  pays for the other's default.** The gate above is binary, and the measurement
+  says a binary is wrong in one direction: at a ratio the gate declines, a
+  prefix is still worth it to a SHORT reply. REAP-320 (4.1x, 8 GiB pool) at 24
+  tokens: half the pool seeded gives 41.7 tok/s prefill at decode parity,
+  against 27.0 unseeded and 31.9 seeded whole. Tiel-Coder-35B-A3B (2.17x) at 256
+  tokens: half a pool is +44% prefill and **-45% decode**, and the two arms cross
+  at ~96 reply tokens (4 tokens: the seed wins by 34%; 128: loses by 19%; 256:
+  by 71%), because the seeded pool starts full of the PROMPT's set and the
+  continuation evicts through it (promotions 9579 -> 23548) while the LFU's own
+  choice keeps learning (per-step 92.2 -> 46.8 ms unseeded, 66.8 -> 83.1
+  seeded). So: `corpus <= pool + 5%` seeds the whole pool as before; a larger
+  ratio with `--max-tokens` <= 64 seeds **50%**; anything longer or unbounded
+  seeds **nothing**. `--max-tokens` is the only expectation the engine has at
+  init, so it is what the rule reads (`EngineConfig::expected_reply_tokens`,
+  0 = unknown = long; `main_server` leaves it 0 on purpose, because its
+  requests carry their own budgets and 0 is the arm measured safe at every
+  length). `KRK_VRAM_SEED_PCT=0..100` and `KRK_WARM_PREFILL=1` still outrank the
+  rule. Verified against the flag it replaces on both shapes: LFM2 (fits) 100%
+  cap, 2357 experts / 11932 MiB; Tiel `-n 8` 50% cap, 2363 experts / 5217 MiB
+  and `-n 256` 0% with +0 experts; REAP-320 `-n 24` 50% cap, 1859 experts /
+  4002 MiB -- the same numbers the hand-set `KRK_VRAM_SEED_PCT=50` produced.
+  **The seed can only promote what WARM staged**, so a COLD first run can hit the
+  staging ceiling and seed nothing (`VRAM +0 experts (0 MiB of a 50% seed cap)`):
+  that is the safe arm's performance, not a wrong answer. And it is a
+  prefill-for-decode trade wherever WARM is short of the set -- at `--ram-tier
+  24` it is 12.9 prefill / 6.7 decode against 9.55 / 7.0 unseeded, so there the
+  best wall clock depends on the reply length. **Pinning is not the mechanism:**
+  `KRK_EXPERT_PIN_HITS` was added to test the obvious reading and it is
+  backwards -- with pinning effectively off the same seeded arm reads 9.1 tok/s
+  against 12.2 at the default 24, because pinned slots are what stops the seeded
+  set being re-promoted. An earlier version of this note said the seed loses at
+  every length; it extrapolated 256-token per-step costs down to short replies,
+  and neither arm's step cost is constant in length.
+  The full curve, both machines and the two defects found on the way (a
+  full-forward scan cannot run at the budget it describes; a 0-position index
+  must not be written or trusted) are in `docs/AUDIT-REAP-DECODE.md`.
   Neither a byte bound on the STAGED set nor a `--max-tokens`-derived time
   ceiling was the lever: both were implemented, measured (2622 MiB -> 17.6, 5210
   -> 12.3, 9278 -> 19.2, 10507 -> 12.8, 22604 -> 10.4 tok/s, i.e. non-monotonic

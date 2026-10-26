@@ -5242,7 +5242,7 @@ bool Engine::configure_expert_cache(std::string *err) {
              "policy LFU+aging (pin at %u hits, decay every %u); cold reads are "
              "read-through",
              static_cast<f64>(budget) / (1024.0 * 1024.0), warm_note, mc.n_expert,
-             mc.n_expert_used, mc.n_layer, ExpertCache::kPinThreshold,
+             mc.n_expert_used, mc.n_layer, ExpertCache::pin_threshold(),
              ExpertCache::kPinDecay);
     if (budget < total_bytes && total_bytes > 0) {
         if (be_->caps().vram_free == 0) {
@@ -6571,6 +6571,21 @@ void Engine::write_expert_index_rows(const std::string &path,
     const size_t cells = static_cast<size_t>(mc.n_layer) *
                          static_cast<size_t>(ne);
     if (mass_in.size() < cells || hits_in.size() < cells) return;
+    // A file that measured nothing is not a ranking, so it must not be written
+    // -- least of all over a real index. The scan path used to write one anyway
+    // when the run died before counting a position (the REAP-320 file at an
+    // 8 GiB budget refused an expert in generation and still wrote
+    // "0 positions, full-forward"), and the next load trusted it: measured 8.6
+    // tok/s against 11.8 for the even order it replaced. `merge_expert_index`
+    // already refuses this case; every writer goes through here, so the guard
+    // belongs here too.
+    if (tokens <= 0) {
+        KRK_WARN("expert index: %s not written -- the run observed 0 positions, "
+                 "so it has no ranking to record. Any index already there is "
+                 "left untouched; re-run --expert-scan once the run completes",
+                 path.c_str());
+        return;
+    }
     const double *mass_all = mass_in.data();
     const u64 *hits_all = hits_in.data();
     const size_t one = model_.max_expert_bytes();
@@ -6675,9 +6690,16 @@ ExpertIndexRows expert_index_parse(const std::string &text, i32 n_layer,
     if (isz > 0 && src_size > 0 &&
         static_cast<unsigned long long>(isz) != src_size)
         return out;
+    // `positions_scanned` 0 (or absent, which reads as 0) means the file
+    // records no measurement at all -- a scan that died before its first
+    // position. Its per-layer order is then whatever the one partial forward
+    // pass left behind, which is not a ranking of the workload and measured
+    // *worse* than no ranking at all. Every reader refuses it here, so the
+    // warmup, the adapt-merge and the tests all agree.
+    out.tokens = root.get_int("positions_scanned", 0);
+    if (out.tokens <= 0) return out;
     out.mass.assign(cells, 0.0);
     out.hits.assign(cells, 0);
-    out.tokens = root.get_int("positions_scanned", 0);
     const JsonValue *layers = root.find("layers");
     if (!layers || !layers->is_array()) return out;
     for (const JsonValue &L : layers->items()) {
@@ -7182,6 +7204,22 @@ std::vector<std::pair<i32, i32>> Engine::load_expert_index() const {
                  path.c_str(), arch.c_str(), mc.arch.c_str());
         return out;
     }
+    // A file that recorded no positions has no ranking to apply, and applying
+    // one anyway is not a benign default. Measured on the REAP-320 file at an
+    // 8 GiB budget, a 0-position index (written when a scan died mid-generation)
+    // gave 8.6 tok/s against 11.8 for the even order it replaced: its partial
+    // order changes which cells are resident, the pool then stops recycling
+    // slots (reuse 2876 -> 119) and every decode miss pays a fresh allocation.
+    // Fall back to the even order, loudly -- the file is the thing to fix.
+    const i64 measured = root.get_int("positions_scanned", 0);
+    if (measured <= 0) {
+        KRK_WARN("expert warmup: %s records %lld scanned positions, so it "
+                 "carries no ranking -- filling the tiers evenly instead. A "
+                 "scan only writes this when it measured nothing, so re-run "
+                 "--expert-scan and let it finish",
+                 path.c_str(), static_cast<long long>(measured));
+        return out;
+    }
     const i64 isz = root.get_int("source_size", -1);
     u64 model_size = 0;
     if (isz <= 0 || !file_size(cfg_.model_path, &model_size)) {
@@ -7448,6 +7486,10 @@ void Engine::warm_experts() {
     // routed set that is where the desktop starts to stall.
     const size_t vram_reserve = krk::vram_floor_bytes(be_->device_total_bytes());
     bool hit_reserve = false;
+    // Stopped at the seed fraction rather than at the card: that is a choice,
+    // not a limit, and it has to show in the line or a partial seed and a full
+    // one read the same.
+    bool capped = false;
     // Does the prefilled prefix have anywhere to live? A prefill is worth its
     // cost only when the pool can hold (essentially) the WHOLE routed set: then
     // every expert the run routes to is one acquire away and the prefix is what
@@ -7470,8 +7512,38 @@ void Engine::warm_experts() {
     const size_t corpus_bytes = model_.total_expert_bytes();
     const size_t pool_bytes = ec.vram_budget();
     bool prefill = pool_bytes > 0 && corpus_bytes <= pool_bytes + pool_bytes / 20;
-    if (const char *e = std::getenv("KRK_WARM_PREFILL"))
+    // How much of the pool the seed may fill, when the set does not fit. There
+    // are two measured optima and they disagree because the seed's value decays
+    // with the reply: HALF the pool while the reply is short (REAP-320, 4.1x
+    // corpus/pool, 24 tokens: 41.7 tok/s prefill with decode equal to the best
+    // arm, against 27.0 unseeded and 31.9 seeded whole), and NOTHING once it is
+    // long (Tiel-Coder-35B-A3B, 2.17x: 50% wins to 64 tokens, ties at 96, loses
+    // 19% at 128 and 71% at 256 as the prompt's set decays and the LFU would
+    // otherwise have kept learning).
+    // `--max-tokens` is the only expectation the engine has at init, so it is
+    // what this reads; 0 or negative means unbounded, i.e. a long reply.
+    int seed_pct = 100;
+    if (pool_bytes > 0 && corpus_bytes > pool_bytes + pool_bytes / 20) {
+        const i64 want = cfg_.expected_reply_tokens;
+        seed_pct = (want > 0 && want <= 64) ? 50 : 0;
+        prefill = seed_pct > 0;
+    }
+    // The force arm is a whole-pool seed, which is what it has always meant.
+    if (const char *e = std::getenv("KRK_WARM_PREFILL")) {
         prefill = e[0] != '0' && e[0] != '\0';
+        if (prefill && seed_pct == 0) seed_pct = 100;
+    }
+    // An explicit fraction outranks both, and turns the seed on by itself.
+    if (const char *e = std::getenv("KRK_VRAM_SEED_PCT")) {
+        const int v = std::atoi(e);
+        if (v >= 0 && v <= 100) {
+            seed_pct = v;
+            prefill = v > 0 && pool_bytes > 0;
+        } else {
+            KRK_WARN("KRK_VRAM_SEED_PCT=%s is not 0..100 -- ignored", e);
+        }
+    }
+    const size_t seed_cap = pool_bytes * static_cast<size_t>(seed_pct) / 100;
     if (!prefill)
         KRK_INFO("expert warmup: the routed set is %.0f MiB against a %.0f MiB "
                  "device pool, so the ranked prefix is not preloaded into VRAM "
@@ -7503,8 +7575,13 @@ void Engine::warm_experts() {
                 if (ec.acquire(L.experts, l, e) && ec.resident_slots() > had) {
                     promoted++;
                     promoted_bytes += L.experts.expert_bytes();
+                    if (promoted_bytes >= seed_cap) {
+                        capped = true;
+                        break;
+                    }
                 }
             }
+            if (capped) break;
             if (!room) break; // every layer's device tier is full
         }
     }
@@ -7570,10 +7647,11 @@ void Engine::warm_experts() {
                       ec.prep_ms(), ec.room_ms(), ec.alloc_ms(), ec.overlap_ms(),
                       ec.commit_ms());
     KRK_INFO("expert warmup: %s order, %d rounds, %zu experts/layer deep; %s, "
-             "VRAM +%zu experts (%.0f MiB, %zu slots); %.0f ms%s",
+             "VRAM +%zu experts (%.0f MiB of a %d%% seed cap, %zu slots); "
+             "%.0f ms%s",
              ranked ? "ranked" : "even", rounds, depth, tier_note, promoted,
-             static_cast<f64>(promoted_bytes) / 1048576.0, ec.resident_slots(),
-             ms, why.c_str());
+             static_cast<f64>(promoted_bytes) / 1048576.0, seed_pct,
+             ec.resident_slots(), ms, why.c_str());
     // The warmup's traffic is not the run's. Reset the counters it earned so
     // the residency report describes what the run did with the tiers it was
     // handed; the line above is the warmup's own record of what it spent.

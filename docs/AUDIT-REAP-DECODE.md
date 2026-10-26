@@ -630,3 +630,233 @@ above the measured flap band (1.01-1.17x across copy sizes) on purpose.
 Prefill is a separate anomaly worth its own pass: 5 prompt tokens take 985 ms
 (197 ms/row, 10x a decode row), and `gemm(gemv_m)` -- the rows 2-8 ladder the
 prefill uses -- measures **29 GB/s against gemv's 743**.
+
+## A ranked index: worth +70-87% decode when RAM is short, and -25% when it is not
+
+Measured on this file at `--expert-cache-mb 8000` (routed set 32.3 GiB = 24% of
+the pool), greedy, one 55-token prompt, 24 tokens, one run per arm, same prompt
+in both. The index is 62 positions, full-forward, measured on that same prompt --
+the best case a ranking can have.
+
+**96 GiB installed, so WARM holds the whole routed set (33062 MiB).**
+
+| arm | prefill | decode | ms/step | decode promote | VRAM evictions | pool `reuse` |
+|---|---|---|---|---|---|---|
+| even order | 27.0 / 27.1 tok/s | **11.9 / 11.8 tok/s** | 84.3 / 84.8 | 14.4 ms/step | 1194 | 2876 |
+| ranked | 31.7 / 32.2 tok/s | **9.2 / 8.9 tok/s** | 109.2 / 112.6 | 22.7 ms/step | 59 | 119 |
+
+**`--ram-tier 24`, so WARM holds 14746 MiB of the 33062 MiB set (45%) and the
+disk tier is live.**
+
+| arm | prefill | decode | ms/step | promotions | bytes promoted | read from file |
+|---|---|---|---|---|---|---|
+| even order | 8.6 / 8.6 tok/s | **4.1 / 3.8 tok/s** | 246.1 / 262.3 | 5872 / 6887 | 13.9 / 16.5 GiB | 12.0 / 11.6 GiB |
+| ranked | 9.8 / 9.3 tok/s | **6.9 / 7.1 tok/s** | 144.6 / 141.4 | 3965 / 3580 | 8.3 / 7.6 GiB | 11.4 / 11.3 GiB |
+
+**The ranking does the same thing in both regimes -- it cuts promotion roughly in
+half -- and only one regime turns that into time.** At the 24 GiB class the
+ranked arm promotes 7.6-8.3 GiB instead of 13.9-16.5 and decode gains **+70-87%**.
+At the 96 GiB class it promotes fewer experts too (3678 against 4827) and still
+loses 25%, because there the resident set goes sticky: 59 evictions against 1194,
+and the pool's slot `reuse` collapses from 2876 to **119**. A freed cell is then
+rare, so each decode miss takes the fresh-allocation path instead of recycling
+the cell the previous step released -- decode promotion 22.7 ms/step against 14.4
+for the same 10 experts per token.
+
+So the rule is not "rank" or "do not rank": it is that **the ranking pays where
+the tier it fills is too small to hold the set, and costs where the pool can no
+longer recycle cells.**
+
+### The pool is not the defect, and fixing it did not pay
+
+The 119-reuse reading above looked like a stranded free list, so it was chased:
+the pool's GROWTH path enforces its plan only through `pool_slab_take_`, which
+caps a slab to the room left. After the first release growth is per-cell and
+unguarded, so `committed` walked to 8429 MiB against an 8002 MiB plan; and
+`release_batch_` hands a slice back to the driver (instead of the free list)
+whenever `committed > budget`, which is exactly the state that overshoot creates.
+
+Refusing that growth did fix both counters -- `committed` 8429 -> 8000, `reuse`
+119 -> 390, i.e. **92% of the 423 slices the run ever freed were reused** (67%
+before) -- and **decode did not move: 8.8 tok/s against 8.9, 113.1 ms/step against
+112.6.** It also broke two arms that live at their plan by construction: the
+LFM2.5 fixture's CLI prefill exits 1, and `kraken-bench` crashes on a refused
+allocation it never expected. Reverted.
+
+The counters say why the reuse number was never the cost. The ranked arm's decode
+spends 546 ms in promotion across 23 steps at ~476 us per expert, i.e. **~1147
+promotions inside decode, against ~765 for the even order** -- it misses ~50%
+more, and that is the 29 ms/step. A ranking measured on a 62-position prompt
+holds the PROMPT's set; the continuation's routing differs from it by a thousand
+experts. The lever is the set, not the free list.
+
+### Seeding VRAM from the top of the rank, measured
+
+That lever already exists: `warm_experts` promotes the top of the ranked order
+into VRAM at init, and the gate that normally skips it at this ratio (corpus must
+fit the pool, +5%) is bypassed with `KRK_WARM_PREFILL=1`. Same prompt, 24 greedy
+tokens, one run per arm unless noted, index 62 positions:
+
+| machine | arm | prefill | decode | ms/step | VRAM seeded |
+|---|---|---|---|---|---|
+| 96 GiB RAM, 8 GiB pool | even order, read-through | 27.0 / 27.1 | **11.9 / 11.8** | 84.3 / 84.8 | 0 |
+| | ranked, read-through | 31.7 / 32.2 | 8.9 / 9.2 | 113.1 / 109.2 | 0 |
+| | **ranked, seeded** | **40.6 / 42.8** | 10.4 / 10.6 | 96.5 / 94.8 | 3715 experts, 8000 MiB |
+| 24 GiB RAM, 8 GiB pool | ranked, read-through | 9.8 / 9.3 | **6.9 / 7.1** | 144.6 / 141.4 | 0 |
+| | **ranked, seeded** | **16.5** | 6.0 | 166.3 | (WARM-staged top) |
+
+Seeding is a PREFILL trade, not a win: +31% prefill on the 96 GiB box and +75% on
+the 24 GiB one, against -11% and -15% decode, because a seeded pool starts full
+of the prompt's set and the continuation then evicts through it (3674 evictions
+against 141 for read-through). The phase costs 750 ms of extra startup (7009 ms
+against 6263). Break-even, from those rates: **~57 decode tokens on the 96 GiB
+box, ~97 on the 24 GiB one** -- below that the seed's faster prompt wins the wall
+clock (24 tokens: 3.61 s against 4.06 s), above it the churning pool does.
+
+**Read-through plus a ranked index is the worst configuration of the three in both
+regimes**, so on this file at 24% fit the index only pays with the seed on.
+
+### The seed does not have to fill the pool, and at 50% it is free
+
+`KRK_VRAM_SEED_PCT=0..100` caps the seed at that fraction of the pool (and turns
+the seed on by itself at ratios the rule above declines). Sweep at 8 GiB, 96 GiB
+RAM, same prompt and index:
+
+| seed | VRAM seeded | prefill | decode | ms/step |
+|---|---|---|---|---|
+| 0% (= read-through) | 0 | 31.7 / 32.2 | 8.9 / 9.2 | 113.1 / 109.2 |
+| 25% | 928 experts, 2002 MiB | 36.8 | 10.5 | 95.5 |
+| 40% | -- | 40.6 | 11.4 | 87.5 |
+| **50%** | **1859 experts, 4002 MiB** | **41.8 / 41.7** | **11.9 / 11.8** | **84.0 / 84.9** |
+| 60% | -- | 42.8 | 10.7 | 93.2 |
+| 75% | 2787 experts, 6002 MiB | 42.2 | 10.8 | 92.4 |
+| 100% | 3715 experts, 8000 MiB | 40.6 / 42.8 | 10.4 / 10.6 | 96.5 / 94.8 |
+
+**Half the pool is a free win against both baselines**: decode 11.85 tok/s matches
+the even order exactly (11.9 / 11.8) while prefill is 41.7 against its 27.0, i.e.
++54%; against read-through ranked it is +30% prefill AND +31% decode. The curve is
+sharp -- 40% and 60% are each ~1 ms/step worse -- and the mechanism is the one the
+auto rule's own comment gives: half the pool is seeded from the rank and half the
+LFU still earns, so neither a sticky prompt-shaped set nor an unseeded pool gets
+the whole tier. Whole-pool seeding fails for the reason measured above (3674
+evictions through a pool with no room to adapt); no seeding fails because the
+first tokens then decide everything.
+
+At `--ram-tier 24` the same sweep is a monotone trade instead, because WARM only
+holds 45% of the set and the seed can only use what WARM staged: 50% gives 12.9
+prefill / 6.7 decode against read-through's 9.55 / 7.0, and 100% gives 16.0 / 6.4.
+There the seed's prefill gain always costs some decode, so the best wall clock
+depends on the reply length (24 tokens: 100% wins, 7.19 s against 7.84 at 50% and
+9.19 unseeded).
+
+**Not made the default, and Tiel-Coder-35B-A3B is why.** Same file, same 256
+greedy tokens, 10430 MiB budget (22604 MiB routed set, 2.17x), index present, all
+three arms staging the whole WARM tier (the first 0% run of the sweep read a cold
+page cache, stopped at 2 rounds of staging and reported 19.7 / 17.8 -- the numbers
+below are the warm re-run, which is the fair comparison):
+
+| seed | prefill | decode | ms/step | promotions | bytes promoted | pinned |
+|---|---|---|---|---|---|---|
+| 0% | 34.1 tok/s | **22.1 tok/s** | **45.2** | 9579 | 21448 MiB | 751 |
+| 50% | 49.0 tok/s | 12.2 tok/s | 81.9 | 23548 | 52840 MiB | 1173 |
+| 100% | 42.1 tok/s | 8.9 tok/s | 112.9 | 35856 | 80903 MiB | 1464 |
+
+Half a pool is +44% prefill and **-45% decode** at 256 tokens. The seed
+multiplies promotion 2.5x, because the set it holds is the prompt's and the
+continuation keeps re-promoting what it evicted.
+
+**Which arm wins depends on how long the reply is, and the crossover is ~96
+tokens.** Same file and prompt, both arms, `prefill + decode` as the user pays it:
+
+| reply tokens | 0% seed | 50% seed | winner |
+|---|---|---|---|
+| 4 | 1124 ms | **745 ms** | seed, -34% |
+| 8 | 1317 ms | **931 ms** | seed, -29% |
+| 12 | 1610 ms | **1244 ms** | seed, -23% |
+| 16 | 1856 ms | **1394 ms** | seed, -25% |
+| 32 | 2734 ms | **2228 ms** | seed, -19% |
+| 64 | 4288 ms | **3628 ms** | seed, -15% |
+| 96 | **5645 ms** | 5675 ms | tie (0.5%) |
+| 128 | **6848 ms** | 8157 ms | unseeded, -19% |
+| 256 | **12704 ms** | 21724 ms | unseeded, -71% |
+
+Per-step cost explains the shape, and it moves in opposite directions: the seeded
+arm reads 66.8 -> 57.7 -> 56.9 -> 53.0 -> 49.1 -> 54.1 -> 60.0 -> **83.1** ms/step as
+the reply lengthens, while the unseeded one reads 92.2 -> 77.4 -> 71.7 -> 62.7 ->
+55.7 -> 51.3 -> 47.8 -> **46.8**: the LFU keeps learning, and a prompt-shaped set
+keeps decaying. So the seed buys a fixed ~236 ms of prefill plus cheaper early
+steps, and a reply longer than ~96 tokens spends all of it.
+
+**An earlier version of this note said the seed loses at every length. That was
+wrong, and the way it was wrong is worth keeping:** it extrapolated the 256-token
+per-step cost down to short replies, and neither arm's step cost is constant in
+length. At 24 tokens the seed is not 0.65 s slower -- it is about 0.4 s faster.
+
+**It is not the pin rule, and that was measured rather than assumed.** A seeded
+expert crosses the LFU's 24-hit threshold quickly, so a 50% seed lifted the pinned
+count 751 -> 1173; `KRK_EXPERT_PIN_HITS` was added to test the obvious reading,
+and it is backwards: with pinning effectively off (999999, 0 slots pinned) the
+same arm reads **9.1 tok/s**, and at 96 hits it reads 9.7 -- both WORSE than 12.2
+at the default 24. Pinned slots are what stops the seeded set being re-promoted a
+third time.
+
+So the rule is narrower than "seed half the pool": it pays on a file whose routed
+set is many times the pool and whose reply is short relative to the prompt (the
+REAP-320 shape, 4.1x, 24 tokens), and it loses badly once the run is long enough
+that the continuation's set differs from the prompt's.
+
+### Choosing the fraction without a flag
+
+`warm_experts` now picks the arm from the two things the measurement says matter --
+whether the routed set fits the pool, and how long the reply is expected to be:
+
+- set fits the pool (+5%, the LFM2 shape): seed the whole pool, as before;
+- set does not fit, `--max-tokens` <= 64: seed **50%** of the pool;
+- set does not fit, anything longer or unbounded: seed **nothing** (the pre-existing
+  default), because past ~96 tokens the prompt-shaped set decays faster than a
+  half-seeded pool pays back.
+
+`--max-tokens` is the only expectation the engine has at init, so it is what the
+rule reads (`EngineConfig::expected_reply_tokens`, 0 = unknown = long). The server
+leaves it 0 on purpose: its requests carry their own budgets, so init has no honest
+expectation and the safe arm is chosen. `KRK_VRAM_SEED_PCT` and
+`KRK_WARM_PREFILL=1` still outrank the rule for an experiment.
+
+Checked on both files at both ends of the curve: Tiel at `-n 24` seeds 2700
+experts (5960 MiB of a 50% cap) and gives 43.5 tok/s prefill / 1327 ms decode
+against the unseeded ~2295 ms at that length; at `-n 256` it seeds nothing and
+reads 32.1 / 12116 ms, the arm that wins there. REAP-320 at `-n 24` seeds 1859
+experts (4002 MiB) for 34.7 tok/s prefill and 1995 ms decode.
+
+**A caveat that bit the first verification run:** the seed can only promote what
+the WARM phase staged, so a COLD file (26 GiB read with an empty page cache) can
+hit the staging ceiling before the ranked experts are in RAM and then promote
+nothing at all -- it reported `VRAM +0 experts (0 MiB of a 50% seed cap)`. The
+numbers above are warm-cache runs. A cold first invocation gets the safe arm's
+performance, not a wrong answer.
+
+Why the ranking is so flat: 320 experts top-10 is ~3.1% of routing each, and the
+file's 62-position mass gives the top-80-by-mass 29.4% of it against 24.1% for
+ids 0-79 -- a mild prior, not a hot set. Correlation between expert id and mass
+rank is -0.162, so the even order's advantage is not "low ids are hot"; it is
+that a churning LFU tracks a flat distribution better than a sticky set does.
+
+Prefill tok/s is the misleading half in both tables: the ranking warms the very
+prompt being measured, so it reads as a win even where decode loses. Judge a
+ranking on decode.
+
+Two defects surfaced getting to even that measurement:
+
+- **A full-forward scan cannot run at the budget it is meant to describe.**
+  `--expert-scan` disables the ranked warmup, and at 8000 MiB the run dies in
+  generation with `expert cache refused a routed expert ... no resident slot
+  could be reclaimed (moe layer 47 expert 1)`. Routing does not depend on the
+  cache budget, so the scan belongs at headroom: at `--expert-cache-mb 10000`
+  the same scan completes cleanly (62 positions, 55 prompt + 7 generated).
+- **The scan writes an index with zero positions, and the loader reads it as a
+  ranking.** The crashed run above still wrote
+  `(0 positions, full-forward)`/15360 pairs, and the next run loaded it at HOT
+  28.8% and **8.6 tok/s against 11.8**. `merge_expert_index` already refuses a
+  run with `expert_scan_tokens_ <= 0`; `write_expert_index` has no such guard.
+  A scan that measured nothing must not be written, and a file that says 0
+  positions must not be trusted on load.

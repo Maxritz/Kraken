@@ -271,6 +271,10 @@ int main(int argc, char **argv) {
     cfg.kv_quant = a.kv_quant;
     cfg.threads = a.threads;
     cfg.expert_cache_mb = a.expert_cache_mb;
+    // No expected_reply_tokens here on purpose: the server's requests carry
+    // their own max_tokens, so init has no honest expectation to size a seed
+    // by. 0 is read as a long reply, the arm measured to be safe at every
+    // length on Tiel-Coder-35B-A3B.
     cfg.expert_cache_slots = a.expert_cache_slots;
     cfg.expert_warm_mb = a.expert_warm_mb;
     cfg.expert_pin_mb = a.expert_pin_mb;

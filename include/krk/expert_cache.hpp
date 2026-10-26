@@ -170,6 +170,21 @@ public:
     // counter faster than any single expert is re-selected once a
     // model has hundreds of slots, and nothing could ever pin.
     static constexpr u32 kPinThreshold = 24;
+    // The threshold in force. KRK_EXPERT_PIN_HITS overrides it, and that is the
+    // arm which separates "the seed is a bad set" from "the seed's slots get
+    // pinned": a pinned slot is one the eviction scan cannot return, so a
+    // policy that pins too much of a small pool churns what is left. Measured
+    // on Tiel-Coder-35B-A3B: a 50% seed lifted the pinned count 751 -> 1173 and
+    // cost 45% of decode.
+    static u32 pin_threshold() {
+        static const u32 v = [] {
+            const char *e = std::getenv("KRK_EXPERT_PIN_HITS");
+            if (!e || !e[0]) return kPinThreshold;
+            const long n = std::strtol(e, nullptr, 10);
+            return n < 0 ? kPinThreshold : static_cast<u32>(n);
+        }();
+        return v;
+    }
     static constexpr u32 kPinDecay = 64;
     // Per-decay subtraction, applied when a counter exceeds it (keeps small
     // counts meaningful instead of driving everything to the same floor).

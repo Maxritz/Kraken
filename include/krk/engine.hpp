@@ -92,6 +92,10 @@ struct EngineConfig {
     // most often, and a promotion out of pinned memory is one DMA with no host
     // memcpy in front of it: measured 22.7 GB/s against 7.6.
     i32 expert_pin_mb = -1;
+    // How many tokens the caller expects to generate, when it knows. The seed
+    // fraction at init depends on it: a short reply is worth a half-seeded
+    // pool, a long one is not (see warm_experts). 0 = unknown, read as long.
+    i32 expected_reply_tokens = 0;
     // Fill WARM ahead of the run rather than on demand. Off by default: an eager
     // sweep costs the whole corpus in wall time and RAM before the first token,
     // and read-through already admits every expert the run touches.

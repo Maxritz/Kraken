@@ -6854,12 +6854,13 @@ static void test_expert_warmup() {
 
     // Writes an index whose layer-0 ranking names exactly two of the four
     // experts. n_expert is a parameter so the caller can also write a STALE one.
-    const auto write_index = [&](int n_expert) {
+    const auto write_index = [&](int n_expert, i64 positions = 64) {
         std::ofstream f(idx, std::ios::binary);
         f << "{\n  \"version\": 1,\n  \"kind\": \"kraken-expert-index\",\n"
           << "  \"mode\": \"full-forward\",\n  \"source_size\": " << src_size
           << ",\n  \"n_layer\": 1,\n  \"n_expert\": " << n_expert
-          << ",\n  \"positions_scanned\": 64,\n  \"layers\": [\n"
+          << ",\n  \"positions_scanned\": " << positions
+          << ",\n  \"layers\": [\n"
           << "    {\"layer\": 0, \"experts\": [{\"e\": 2}, {\"e\": 0}]}\n"
           << "  ]\n}\n";
     };
@@ -6923,6 +6924,54 @@ static void test_expert_warmup() {
         const WarmupRun r = warm(0);
         CHECK(r.ok, "a disabled warmup initialises");
         CHECK(r.warm_slots == 0, "a disabled warmup stages nothing");
+    }
+
+    // 5. A file that recorded 0 positions carries no ranking, so the warmup
+    //    falls back to the even order -- the same fallback as a stale index and
+    //    for the same reason. This is the file the REAP-320 scan wrote when it
+    //    died mid-generation, which the next load applied for a 25% decode
+    //    loss; the even order is both safer and faster than that order.
+    write_index(4, 0);
+    {
+        const WarmupRun r = warm(1);
+        CHECK(r.ok, "a zero-position index still initialises");
+        CHECK(r.warm_slots == 4,
+              "an index that measured nothing falls back to the even order");
+    }
+
+    // 6. And a scan that observed nothing writes NO file: a ranking already on
+    //    disk has to survive a run that could not measure one. The writer is the
+    //    last place this can be caught, because the run that dies mid-generation
+    //    still reaches the CLI's index write.
+    write_index(4, 64);
+    {
+        Backend *cpu = make_cpu_backend();
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = kMoeTestPath;
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        cfg.expert_cache_mb = 1;
+        cfg.expert_warm_mb = 64;
+        cfg.expert_warmup = 1;
+        engine.set_expert_scan(true, false);
+        std::string err;
+        const bool ok = engine.init(cpu, cfg, &err);
+        CHECK(ok, "a scan-only engine initialises on the warmup fixture");
+        if (ok) {
+            // No prefill and no decode, so the scan has observed nothing.
+            engine.write_expert_index(idx);
+            engine.shutdown();
+        }
+        delete cpu;
+    }
+    {
+        std::ifstream f(idx, std::ios::binary);
+        const std::string kept((std::istreambuf_iterator<char>(f)),
+                               std::istreambuf_iterator<char>());
+        const ExpertIndexRows rows = expert_index_parse(kept, 1, 4, "", 0);
+        CHECK(rows.valid && rows.tokens == 64,
+              "a scan that measured nothing leaves the existing index alone");
     }
     std::remove(idx.c_str());
 }
@@ -11355,6 +11404,28 @@ static void test_expert_index_adapt() {
           "an index for another build of the weights is refused");
     CHECK(!expert_index_parse("not json", 2, 4, "qwen35moe", 0).valid,
           "a file that is not JSON is refused");
+
+    // The position count is a MEASUREMENT claim, not decoration: 0 (or a
+    // missing field, which reads as 0) means the run never counted a position,
+    // so its per-layer order is whatever one partial forward pass left behind.
+    // Trusting such a file measured 8.6 tok/s against 11.8 for the even order
+    // on the REAP-320 file. Both readers share this parser -- the warmup and
+    // the adapt-merge -- so the refusal lives here.
+    const std::string pos_field = "\"positions_scanned\": 100";
+    const size_t pos_at = text.find(pos_field);
+    CHECK(pos_at != std::string::npos, "the fixture states its position count");
+    {
+        std::string zero = text;
+        zero.replace(pos_at, pos_field.size(), "\"positions_scanned\": 0");
+        CHECK(!expert_index_parse(zero, 2, 4, "qwen35moe", 4096).valid,
+              "an index that measured 0 positions is refused");
+    }
+    {
+        std::string absent = text;
+        absent.replace(pos_at, pos_field.size(), "\"positions_unrecorded\": 0");
+        CHECK(!expert_index_parse(absent, 2, 4, "qwen35moe", 4096).valid,
+              "an index that does not record its positions is refused");
+    }
 
     // The run routed layer 0 to expert 3, and layer 1 not at all -- so layer 1
     // must keep the file's row while layer 0 follows the traffic.

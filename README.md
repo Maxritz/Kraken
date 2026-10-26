@@ -243,6 +243,14 @@ instance). A refused GGUF is a load-time verdict, not a crash.
   only prefills VRAM when the pool can hold the routed set (within 5%): at a
   larger ratio the prefix evicts and the LRU does better without it, so the file
   is left to read-through (`KRK_WARM_PREFILL=1` forces the prefill).
+  At that larger ratio the prefix is still worth it to a SHORT reply, so the
+  fraction is chosen rather than fixed: `--max-tokens` <= 64 seeds **half** the
+  pool in rank order (measured, REAP-320 at 4.1x: 41.7 tok/s prefill at decode
+  parity, against 27.0 unseeded; the 35B at 2.17x is +44% prefill), while a
+  longer or unbounded expectation seeds nothing, because past ~96 reply tokens
+  the prompt-shaped set decays faster than a half-seeded pool pays back (-19% at
+  128, -71% at 256). `KRK_VRAM_SEED_PCT=0..100` overrides the fraction and
+  `--expert-warmup 0` still removes the phase entirely.
   `KRK_EXPERT_WARM_MAP=1` is the opposite arm -- no host tier at all, evicted
   experts served from the page-cached mapping -- and it is **off by default
   because it measured slower** (13.6 against 17.2 tok/s on the 35B, 16.5 against
@@ -271,7 +279,7 @@ Grouped by what you are changing. Defaults are the compiled-in ones.
 | `--prompt STR` | interactive | prompt to complete; an empty value still counts as given |
 | `--chat` | off | wrap the prompt in ChatML |
 | `--system STR` | none | system message for `--chat` |
-| `--max-tokens N` | 256 | tokens to generate |
+| `--max-tokens N` | 256 | tokens to generate; also the reply-length expectation the warmup picks its seed fraction from |
 | `--cpu` | off | scalar reference backend, for correctness work |
 | `--device N` | 0 | HIP device index |
 | `--tokenize` | - | print the prompt's token ids and exit |
@@ -328,6 +336,8 @@ Grouped by what you are changing. Defaults are the compiled-in ones.
 | `--expert-warmup N` | -1 | ranked warmup: -1 for every MoE with a device tier, 1 force, 0 off |
 | `--expert-warmup-ms N` | 20000 | ceiling for that phase (0 = none) |
 | `KRK_WARM_PREFILL=1\|0` | corpus vs pool | force (or forbid) the warmup's VRAM prefill; it only helps when the pool holds the routed set |
+| `KRK_VRAM_SEED_PCT=0..100` | auto | cap the seed at that fraction of the pool; also turns the seed on by itself at ratios the rule declines |
+| `KRK_EXPERT_PIN_HITS N` | 24 | hits at which a resident expert is pinned, i.e. against the eviction scan. An A/B arm for the seed, not a tuning knob |
 | `KRK_EXPERT_WARM_MAP=1` | off | no host tier at all: serve evicted experts from the page-cached mapping. Measured slower, kept as an A/B arm |
 | `--expert-pin-mb N` | 0 = off | pin the first N MiB of the tier in rank order |
 | `--router-resident P` | 0 = off | send a near-tie (within fraction P) to the expert already in VRAM/WARM |

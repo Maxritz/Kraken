@@ -648,7 +648,13 @@ public:
                     cells.pop_back();
                     pool_kill_(b);
                     expert_pool_.committed -= entry.first;
-                    expert_pool_.reusable -= entry.first;
+                    // Clamped: this branch trims a cell the free list already
+                    // counted, and an unguarded subtract printed the stats line
+                    // as 18446744073671714816 bytes at 13% fit -- a u64
+                    // underflow reading as the opposite of what it means.
+                    expert_pool_.reusable = expert_pool_.reusable > entry.first
+                                                ? expert_pool_.reusable - entry.first
+                                                : 0;
                     ++expert_pool_.trims;
                     progress = true;
                 }

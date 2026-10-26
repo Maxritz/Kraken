@@ -458,7 +458,8 @@ void ExpertCache::seed_count(i32 layer, i32 expert, u32 count) {
     if (it == slots_.end()) return;
     // Clamped below the pin threshold on purpose: see the header. A seed tells
     // the eviction ranking what the warmup measured, it does not promise VRAM.
-    if (count >= kPinThreshold) count = kPinThreshold - 1;
+    const u32 pin = pin_threshold();
+    if (pin > 0 && count >= pin) count = pin - 1;
     Slot &s = it->second;
     if (s.count < count) s.count = count;
 }
@@ -693,7 +694,7 @@ void ExpertCache::set_pin_budget(size_t bytes) {
 
 void ExpertCache::touch(Slot &s) {
     s.count++;
-    if (!s.pinned && s.count >= kPinThreshold) set_pinned(s, true);
+    if (!s.pinned && s.count >= pin_threshold()) set_pinned(s, true);
 }
 
 void ExpertCache::finish_stage(Slot &s) {
@@ -1258,7 +1259,7 @@ void ExpertCache::decay() {
         } else {
             s.count = s.count > kPinDecayStep / 4 ? s.count - kPinDecayStep / 4 : 0;
         }
-        if (s.pinned && s.count < kPinThreshold) set_pinned(s, false);
+        if (s.pinned && s.count < pin_threshold()) set_pinned(s, false);
     }
     acquires_ = 0;
     decays_++;
@@ -1499,7 +1500,8 @@ size_t ExpertCache::pin_layer(const ExpertSource &src, i32 layer,
         // drop it (this bank is re-acquired by every proposal, so it re-earns
         // the count anyway).
         set_pinned(it->second, true);
-        if (it->second.count < kPinThreshold) it->second.count = kPinThreshold;
+        if (it->second.count < pin_threshold())
+            it->second.count = pin_threshold();
         pinned++;
     }
     // The footprint, not `bytes_` after the fact: admitting the set evicts other

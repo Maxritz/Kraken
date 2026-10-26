@@ -1447,6 +1447,7 @@ int main(int argc, char **argv) {
     cfg.threads = a.threads;
     cfg.seed = a.seed;
     cfg.expert_cache_mb = a.expert_cache_mb;
+    cfg.expected_reply_tokens = a.max_tokens;
     cfg.vram_cap_mb = a.vram_cap_mb;
     cfg.vram_tier_gb = a.vram_tier_gb;
     cfg.host_ram_mb = a.host_ram_mb;
@@ -1593,7 +1594,7 @@ int main(int argc, char **argv) {
                         "policy LFU+aging (pin at %u)\n",
                         static_cast<f64>(ec.budget_bytes()) / (1024.0 * 1024.0),
                         ec.resident_slots(), ec.capacity_slots(),
-                        ExpertCache::kPinThreshold);
+                        ExpertCache::pin_threshold());
             if (ec.warm_capacity_bytes() > 0)
                 std::printf("expert WARM    %.0f MiB pageable host tier "
                             "(cold reads are read-through; VRAM misses promote)\n",
