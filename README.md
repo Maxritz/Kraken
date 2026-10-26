@@ -290,7 +290,7 @@ Grouped by what you are changing. Defaults are the compiled-in ones.
 | switch | default | what it does |
 |---|---|---|
 | `--ctx N` | 4096 | KV capacity in tokens |
-| `--chunk N` | 256 | prefill batch size |
+| `--chunk N` | 512 | prefill batch size. The routed expert set is re-read once per chunk, so the pass count is `ceil(prompt/chunk)`; 512 measured +16% over 256 on a 4K prompt and is bit-exact against chunk 1 (see the prefill section) |
 | `--kv-quant f16\|int8` | f16 | K/V cache format; int8 is 1.8x smaller |
 | `--prefill exact\|fast` | fast | fast uses the matrix cores but breaks chunk-invariance |
 | `--fast-prefill` | - | old spelling of `--prefill fast`, kept for scripts |
@@ -412,8 +412,10 @@ tokenizes to **51-125 tokens depending on the model's tokenizer** - 55 for
 most Qwen-family files, 122-125 for a few others), generates
 up to **256 tokens** (generation stops at `--ctx`), and reports the *whole*
 process budget, not just the two phases it owns. Defaults in force for every
-row: greedy sampling, `--ctx 4096`, `--chunk 256`. Generation stops at the
-context limit, so rows with a short `--ctx` can produce fewer than 256 tokens.
+row: greedy sampling, `--ctx 4096`, `--chunk 512` (the default since
+2026-10-26; the runs below that name 256 were taken while 256 was the
+default). Generation stops at the context limit, so rows with a short `--ctx`
+can produce fewer than 256 tokens.
 The per-model prompt length is listed in the sweep table below.
 
 
@@ -454,8 +456,9 @@ below.
 
 Re-measured 2026-10-25 on the current build, three sequential runs per model,
 same fixed `--bench` prompt, 256 greedy output tokens, `--ctx 4096`,
-`--chunk 256`; the ranges are run-to-run, not confidence intervals. Both
-measured columns are compared against the 2026-10-24 table.
+`--chunk 256` (the default at the time); the ranges are run-to-run, not
+confidence intervals. Both measured columns are compared against the 2026-10-24
+table.
 
 The prefill column moved up on **every** row with no code change on the
 `--prefill exact` path in between (the session's kernel work is all on the
@@ -877,8 +880,9 @@ With the ranking read and `--ram-tier 6144` (6144 MiB VRAM budget + 6144 MiB WAR
     [info ] expert warmup: ranked order, 2 rounds, 256 experts/layer deep; WARM 6143 MiB of 6144 MiB in 6553 slots
             (6150 MiB read), VRAM +6553 experts (6143 MiB, 6553 slots); 3126 ms
 
-That warmup is well inside the 20 s ceiling. A full `--bench` (greedy, `--ctx 4096`, `--chunk 256`,
-up to 256 decode tokens) on that warmed run then reported:
+That warmup is well inside the 20 s ceiling. A full `--bench` (greedy,
+`--ctx 4096`, `--chunk 256` -- the default at the time, up to 256 decode tokens)
+on that warmed run then reported:
 
     prefill        55 tokens in 1251.8 ms  (43.9 tok/s)
     decode         256 tokens in 10948.8 ms  (23.3 tok/s)
@@ -919,15 +923,21 @@ measurement and should not be compared directly.
 
 Use `--ctx 256/512` for MoE runs on small machines.
 
-### Prefill, measured on this box (2026-10-24)
+### Prefill, measured on this box (2026-10-24; Q4_K_XL rows 2026-10-26)
 
 Four thousand and eighty-one tokens of the same prose, `--greedy`, `--ctx 32768`,
 `--expert-warmup 1`, one run per cell. These are the prompt-throughput numbers a
 long-context request actually pays; the 55-token `--bench` prompt is dominated by
-fixed cost and reads much lower.
+fixed cost and reads much lower. The three `UD-Q4_K_XL` rows are 4096 tokens of a
+different repeated-word prompt at the stock `--ctx 4096` with the default ranked
+warmup, so they compare against each other and not against the Q2KXL row above
+them -- a Q4 file has about twice the weight bytes per token of a Q2 one.
 
 | file | arm | chunk | prefill tok/s | prefill ms | decode tok/s |
 |---|---|---|---|---|---|
+| Qwen3.5-35B-A3B UD-Q4_K_XL (18.3 GiB) | fast | 256 | 397.1 | 10 314 | - |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | fast | 512 | **461.9** | 8 867 | - |
+| Qwen3.5-35B-A3B UD-Q4_K_XL | exact | 256 | 221.9 | 18 459 | - |
 | Qwen3.8-Distill-35B-A3B Q2KXL (11.7 GiB) | exact | 256 | 181.8 | 22 450 | - |
 | Qwen3.8-Distill-35B-A3B Q2KXL | fast | 256 | **402.4** | 10 140 | - |
 | Qwen3-30B-A3B abliterated i1-Q2_K (11.2 GiB) | exact | 64 | 63.7 | 64 043 | 2.0 |
@@ -939,8 +949,19 @@ fixed cost and reads much lower.
 | Qwen3-Coder-53B-A3B i1-Q4_K_M (29.9 GiB) | exact | 256 | 49.2 | 82 900 | 3.4 |
 | Qwen3-Coder-53B-A3B i1-Q4_K_M | fast | 256 | 65.5 | 62 300 | 3.4 |
 
-Three things this measures, rather than argues:
+Four things this measures, rather than argues:
 
+- **`--chunk 512` is the default because the pass count is what costs.** The
+  routed expert set is re-read once per chunk, so a prompt is `ceil(len/chunk)`
+  passes over it: 397.1 tok/s at 256 against 461.9 at 512 on the Q4_K_XL 35B
+  (+16.3%), and 332.2 at 128 (-16%) in the other direction. Invariance is not
+  traded for it: on a 978-token prompt `--chunk 1`, `8` and `512` give one
+  `--prefill-hash` trace (`d23b7956e02fd4a9`) and one logits row
+  (`c1c4ba96ed6d4aca`), 24 greedy tokens at 256 and 512 are the same bytes, and
+  `test_prefill_chunk_bitexact` builds a 640-token fixture to pin the 512 split
+  with a `KRK_GEMM_EXACT=0` control that makes it differ. The cost is workspace
+  VRAM: 88 MiB -> 113 MiB. Keep `--chunk` at 256 only for a card where that
+  25 MiB is the difference between fitting and not.
 - **`--prefill fast` is worth 2.2-2.4x on a long MoE prompt** at chunk 256+:
   181.8 -> 402.4 on the 35B, 176.3 -> 384.4 on the 30B, 384.4 -> 420.9 going from
   chunk 256 to 1024 with `fast` on. It is a different-arithmetic mode (see the
@@ -956,9 +977,10 @@ Three things this measures, rather than argues:
   decode unchanged).
 
 Decode on the 35B with the fixed 55-token `--bench` prompt is 34.0 tok/s; the
-long-prompt decode column above is a different run (`-` on the 35B rows because
-that prompt's first sampled token was EOS at 32 tokens, so there were no timed
-steps to report).
+long-prompt decode column above is a different run. The `-` on the Q2KXL 35B
+rows is because that prompt's first sampled token was EOS at 32 tokens, so there
+were no timed steps to report; the `-` on the UD-Q4_K_XL rows is because those
+were prefill-only runs (`-n 1`).
 
 `kraken-server` takes the same switch (`--prefill exact|fast`, default `exact`),
 so the arm is reachable from the HTTP path and the web UI. Measured through the
@@ -1377,10 +1399,12 @@ ATTENTION property".
 
 The suite carries that check as a gate now, so a regression fails a run instead
 of a review: `./build-hip/kraken-tests --run-group test_prefill_chunk_bitexact`
-prefills one 64-token prompt at `--chunk 1`, `2` and `8` through
-`kraken.exe --prefill-hash` and requires one hash across them -- and then runs
-the chunk-8 arm again with `KRK_ATTN_BEXACT=0`, where the hash must DIFFER, so
-the gate is shown able to fail. The hash covers every prefill row, not just the
+prefills one 64-token prompt at `--chunk 1`, `2`, `8`, `16` and `32` through
+`kraken.exe --prefill-hash` and requires one hash across them, builds a second
+fixture with a 640-token context so a prompt can span the default 512 split, and
+then re-runs the chunk-8 arm with `KRK_ATTN_BEXACT=0` (and the 512 arm with
+`KRK_GEMM_EXACT=0`), where the hash must DIFFER, so each gate is shown able to
+fail. The hash covers every prefill row, not just the
 last: a last-row logits hash is blind here, because the f16 residual absorbs
 the drift before the head.
 
