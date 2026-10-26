@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-26T07:05:44Z",
-  "recorded_commit": "ff644aa",
-  "totals": {"groups": 95, "passed": 4521, "run": 4521, "exit": 0},
+  "recorded_utc": "2026-10-26T09:27:38Z",
+  "recorded_commit": "6a04820",
+  "totals": {"groups": 95, "passed": 4528, "run": 4528, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -59,8 +59,8 @@
     {"name": "test_expert_dispatch_host_backed", "status": "pass", "passed": 26, "run": 26},
     {"name": "test_draft_head", "status": "pass", "passed": 50, "run": 50},
     {"name": "test_mtp_sidecar", "status": "pass", "passed": 17, "run": 17},
-    {"name": "test_expert_warmup", "status": "pass", "passed": 11, "run": 11},
-    {"name": "test_expert_index_adapt", "status": "pass", "passed": 16, "run": 16},
+    {"name": "test_expert_warmup", "status": "pass", "passed": 15, "run": 15},
+    {"name": "test_expert_index_adapt", "status": "pass", "passed": 19, "run": 19},
     {"name": "test_hc_lanes", "status": "pass", "passed": 24, "run": 24},
     {"name": "test_ple_hash", "status": "pass", "passed": 22, "run": 22},
     {"name": "test_qwen4exp_schema", "status": "pass", "passed": 21, "run": 21},
