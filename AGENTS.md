@@ -332,6 +332,39 @@ code, the README, or `docs/`.
   `--chunk 8` and `--chunk 512` on both arms, and the hash gate's
   `bf32bbb3...`/`e8d8efa9...` at chunks 1/2/8/16/32 and its `f034bf9b...` at 1/8/512
   are unchanged.
+- **The `routing` component row is a PARENT span, and reading it as the router's
+  own cost is off by ~4x.** On Qwen3.5-35B-A3B, 4140-token prompt, `--chunk 512`,
+  `KRK_PROFILE=1`, `moe.route.batch` reads 23885 ms over 360 calls (66.3 ms a
+  call) and `moe.experts.batch` reads 17151 ms (47.6). They NEST: `route.batch`
+  contains `route.rest.batch`, which contains `experts.batch`. Per 512-row chunk
+  (2666 ms): experts 1904 (71%), the router D2H readback `moe.route.fetch.batch`
+  596 (22%, 14.9 ms a call for a 512 KB copy -- it is waiting on the device, not
+  copying), and the host's own top-k + plan 136 (5%, 3.4 ms a layer for 512x256
+  scores). So the host is not doing 8.5 s of routing; it is doing ~1.2 s across
+  that prefill, and the 22% is the expert tier's device time surfacing at the
+  one blocking point in the layer. Nothing to win by moving the top-k to the
+  device until the readback stops being an exposure. Two traps: the component
+  table takes the MAX of nested rows, so `routing` and `experts` overlap by
+  construction and must never be added; and `KRK_ROUTER_2X=1`, the control that
+  separates the copy from the wait it sits behind, currently dies at prefill
+  start with `hipErrorInvalidHandle` (rc=127), so that split has to come from
+  the arithmetic above rather than from the arm.
+- **LFM2.5 (`lfm2moe`) is refused by name, and that row is the whole fix so
+  far.** Before it existed the 24B-A2B file fell through to llama defaults and
+  died on `output_norm.weight is missing` before reading a layer -- a message
+  about a tensor, for a mixer with no shape here. The stack is 3 conv : 1
+  attention (attention at indices 2, 6, ... 38, i.e. 10 of 40), hd 64 over 8 KV
+  heads of 32 queries with q/k norms, 2 dense leading blocks then 64 experts
+  top-4 with `exp_probs_b.bias` and sigmoid gating, and its final norm is
+  `token_embd_norm` (there is no `output_norm`). The one genuinely new block is
+  `shortconv`: `in_proj` 3*n_embd -> B,C,X, depthwise F32 conv k=3 over the last
+  3 rows, `B*conv(X) + C*X`, `out_proj` -- `conv1d_dw` plus the PLE block's
+  per-layer window is the precedent. Derive conv-vs-attention from
+  `shortconv.in_proj.weight` being present (as `nemotron_h_moe` does with
+  `ssm_in.weight`): the file has no `attention.recurrent_layers` array and the
+  `(l+1) % full_attention_interval` rule is off by one for it. `docs/AUDIT-lfm2.md`
+  has the measured geometry and the four pieces a port needs. Its DSpark drafter
+  is a valid `dflash` head set already -- the drafter is not the blocker.
 - **The int8 K/V cache is chunk-invariant on the device now, and the defect was a
   reduction order.** `--kv-quant int8` had every reader implemented and still
   produced three different hashes for one prompt (chunk 2 == chunk 4, chunk 1 and
