@@ -286,6 +286,34 @@ and every other block format through a generic tile -- Q4_K, Q5_K, Q6_K,
 iq-quants, which is most of a real collection. Unlisted formats and hosts
 without the ISA fall back to the per-element path rather than refusing.
 
+### The NPU arm of the same benchmark
+
+The virtual NPU does not win by tiling. A device trace of a 58-token prefill
+puts **864 ms of device work inside a 2464 ms run** -- 67% of the wall clock the
+device is idle, and the remaining 1600 ms is host work (rope, attention, KV,
+routing), sync waits, and one-time weight expansion. Its GEMMs run at 24.8
+GFLOPS in-graph and 25.7 GFLOPS standalone at the same shape, so the kernel is
+*not* being starved; it is shape-limited, and it is already the fastest thing in
+the run.
+
+Two defects were worth more than any kernel change, both fixed:
+
+| defect | effect | fix | measured |
+|---|---|---|---|
+| staging budget was a flat 1024 MiB, silently declining 393 of 1087 GEMMs to the host | 83% device idle | derive the default from available RAM | 3042 -> 2357 ms (1.29x) |
+| `KRK_NPU_W8A8` packed every weight on first use, including prefills that never reuse one | +1.0 s of pure loss | pack only when a weight is reused (decode) | 3395 -> 2381 ms (1.43x) |
+
+Both show up in the run summary (`0 declined`, and a w8a8 line that reports how
+many weights were deferred), so neither is a silent trade. Against the CPU arm on
+the same box the NPU prefill goes from 1.34x to **1.73x**, and W8A8 decode stays
+at 72.84 ms/token against 131.37 ms without it.
+
+The arithmetic ceiling for this build, with the host cost driven to zero and the
+f32 kernels kept, is 4.7x -- an 8x target additionally needs the int8 kernels, a
+packed-weight cache, and the host gap cut by roughly 9x. Full evidence, including
+the M-scaling table that shows tile-aligned M is 1.74x faster than the M=58 a
+58-token prompt produces, is in [docs/NPU-PREFILL.md](docs/NPU-PREFILL.md).
+
 Method, the rejected first attempt, and the arm table: [docs/MOE-RESIDENCY.md](docs/MOE-RESIDENCY.md) §7.
 
 ## MoE under a RAM limit
