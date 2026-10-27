@@ -14,6 +14,12 @@
 !/tools/
 !/docs/
 !/palcfg/
+# Patches carried against sibling projects (npuxl), applied by hand.
+!/patches/
+
+# Python bytecode from the tools/ helpers.
+__pycache__/
+*.pyc
 
 # Docs: keep the written docs, drop probe transcripts
 /docs/*
