@@ -1267,6 +1267,14 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     if (!check_alloc(ws_xn_, "ws_xn")) return false;
     ws_x2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     if (!check_alloc(ws_x2_, "ws_x2")) return false;
+    // GPT-2 only: the fused attn_qkv output, [chunk, 3*n_embd] f32. Allocated
+    // by the same rule as every other workspace (chunked, backend activation
+    // size) and only when the file is gpt2-shaped, so no other family pays for
+    // a buffer its graph never touches.
+    if (mc.gpt2_style) {
+        ws_qkv_fused_ = alloc(static_cast<size_t>(C * 3 * n_embd_) * as);
+        if (!check_alloc(ws_qkv_fused_, "ws_qkv_fused")) return false;
+    }
     // NVFP4 sidecars: the staging row a scaled weight's INPUT is copied and
     // scaled into before its projection (see gemm_w for why the input and not
     // the result). Sized by the widest scaled contraction in the file, and not
@@ -2909,6 +2917,192 @@ void Engine::head_compute(i32 row) {
     gemm_w(ws_logits_, xn, head, n_vocab_, n_embd_, 1);
 }
 
+// GPT-2's forward: a clean loop, because its graph is a different shape rather
+// than a variant of llama's.
+//
+//   x = tok_embd[t] + pos_embd[pos]
+//   per layer:
+//     xn = LayerNorm(x, attn_norm, attn_norm_bias)
+//     qkv = xn @ attn_qkv + attn_qkv_bias          [one projection, 3*n_embd]
+//     (q, k, v) = qkv[:, 0:E], qkv[:, E:2E], qkv[:, 2E:3E]
+//     x += attn(q, k, v) @ attn_output
+//     xn = LayerNorm(x, ffn_norm, ffn_norm_bias)
+//     x += gelu(xn @ ffn_up + up_bias) @ ffn_down
+//   logits = LayerNorm(x, output_norm, output_norm_bias) @ output
+//
+// Three things the shared path does that this one must not, and one it must:
+//
+//   * NO rope. Position is a vector added to the embedding, not a rotation of
+//     q/k. Rotating here would rotate vectors that already carry position.
+//   * NO RMSNorm. LayerNorm subtracts the row mean before scaling and adds a
+//     bias after; the mean is what the other families never remove, and a
+//     missing bias is a different function, not a rounding difference.
+//   * NO silu(gate)*up. There is no gate tensor; the MLP is up -> gelu -> down.
+//   * The KV cache is the engine's own, appended through the same kv_append
+//     every other family uses, so chunked prefill and decode share one code
+//     path and one invariance property.
+// LayerNorm, mean-subtracting, with a bias: y = (x - mean) / sqrt(var + eps) * w + b.
+//
+// The engine's other norm is RMSNorm, which never subtracts the mean, so this
+// is a different function rather than a variant: on a 64-wide residual row the
+// mean is a real component, and leaving it in shifts every downstream GEMM by a
+// vector that changes per token.
+//
+// Host round-trip on purpose. The op is E wide; the transfers are n*E floats
+// against the n*E*3E GEMMs that bracket it, and doing it here means it is
+// exactly right on every backend instead of on the one that got a kernel.
+void Engine::layernorm(void *out, const void *x, const f32 *w, const f32 *b,
+                       i64 rows, i64 n, f32 eps) {
+    if (!rows || !n) return;
+    std::vector<f32> buf(static_cast<size_t>(rows) * static_cast<size_t>(n));
+    be_->sync();
+    be_->download_f32(buf.data(), x, static_cast<i64>(buf.size()));
+    for (i64 r = 0; r < rows; r++) {
+        f32 *row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(n);
+        f64 mean = 0.0;
+        for (i64 i = 0; i < n; i++) mean += row[i];
+        mean /= static_cast<f64>(n);
+        f64 var = 0.0;
+        for (i64 i = 0; i < n; i++) {
+            const f64 d = static_cast<f64>(row[i]) - mean;
+            var += d * d;
+        }
+        var /= static_cast<f64>(n);
+        const f32 inv = 1.0f / std::sqrt(static_cast<f32>(var) + eps);
+        for (i64 i = 0; i < n; i++) {
+            f32 y = (row[i] - static_cast<f32>(mean)) * inv;
+            if (w) y *= w[i];
+            if (b) y += b[i];
+            row[i] = y;
+        }
+    }
+    be_->upload(out, buf.data(), buf.size() * sizeof(f32), 0);
+}
+
+// Split a fused [rows, 3E] projection row into three [rows, E] buffers. Each
+// row of the source is Q(0..E) | K(E..2E) | V(2E..3E) contiguously.
+void Engine::split_qkv(void *q, void *k, void *v, const void *qkv, i64 rows,
+                       i64 E) {
+    if (!rows || !E) return;
+    std::vector<f32> src(static_cast<size_t>(rows) * static_cast<size_t>(3 * E));
+    be_->sync();
+    be_->download_f32(src.data(), qkv, static_cast<i64>(src.size()));
+    std::vector<f32> qb(static_cast<size_t>(rows) * static_cast<size_t>(E));
+    std::vector<f32> kb(qb.size()), vb(qb.size());
+    for (i64 r = 0; r < rows; r++) {
+        const f32 *s =
+            src.data() + static_cast<size_t>(r) * static_cast<size_t>(3 * E);
+        const size_t off = static_cast<size_t>(r) * static_cast<size_t>(E);
+        std::memcpy(qb.data() + off, s, sizeof(f32) * static_cast<size_t>(E));
+        std::memcpy(kb.data() + off, s + E,
+                    sizeof(f32) * static_cast<size_t>(E));
+        std::memcpy(vb.data() + off, s + 2 * E,
+                    sizeof(f32) * static_cast<size_t>(E));
+    }
+    be_->upload(q, qb.data(), qb.size() * sizeof(f32), 0);
+    be_->upload(k, kb.data(), kb.size() * sizeof(f32), 0);
+    be_->upload(v, vb.data(), vb.size() * sizeof(f32), 0);
+}
+
+bool Engine::gpt2_forward(const i32 *toks, i32 n, i32 pos0) {
+    const ModelConfig &mc = model_.cfg();
+    const auto &layers = model_.layers();
+    const i64 E = mc.n_embd;
+    const i64 FF = mc.n_ff;
+    const f32 eps = mc.rms_eps; // the file's layer_norm_epsilon
+    const QuantTensor &embd = model_.tok_embd();
+
+    be_->fill0(ws_rexp_, static_cast<size_t>(n) * sizeof(i32));
+    be_->embed(ws_x_, embd.data, embd.type, mc.n_vocab, E, toks, n);
+
+    // ---- learned absolute positions ---------------------------------------
+    // Dequantized on the host one position at a time and added row-wise. The
+    // table is [n_ctx_train, E] and a row is E wide, so this is n small row
+    // copies per pass -- not a GEMM, and not worth a device kernel.
+    {
+        const QuantTensor &pos = model_.pos_embd();
+        if (!pos.present()) {
+            forward_error_ = "gpt2 forward reached without position_embd";
+            return false;
+        }
+        const size_t row_bytes = dtype_row_bytes(pos.type, E);
+        std::vector<f32> rows(static_cast<size_t>(n) * static_cast<size_t>(E));
+        const u8 *base = static_cast<const u8 *>(pos.data);
+        for (i32 r = 0; r < n; r++) {
+            const i64 ps = static_cast<i64>(pos0) + r;
+            if (ps < 0 || ps >= mc.n_ctx_train) {
+                forward_error_ = "gpt2 position " + std::to_string(ps) +
+                                 " is outside the learned table (" +
+                                 std::to_string(mc.n_ctx_train) + " rows)";
+                return false;
+            }
+            dequant_row(pos.type,
+                        base + static_cast<size_t>(ps) * row_bytes,
+                        rows.data() + static_cast<size_t>(r) * E, E);
+        }
+        be_->upload(act_at(ws_x2_, be_->act_size(), 0), rows.data(),
+                    rows.size() * sizeof(f32), 0);
+        be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * E);
+    }
+
+    // ---- blocks ------------------------------------------------------------
+    AttnDesc d;
+    d.n_head = mc.n_head;
+    d.n_kv = mc.n_head_kv > 0 ? mc.n_head_kv : mc.n_head;
+    d.hd = mc.head_dim;
+    d.scale = 1.0f / std::sqrt(static_cast<f32>(mc.head_dim));
+    d.causal = true;
+    d.pos0 = pos0;
+    // One position's K row is n_kv*hd wide, and both the append and the
+    // attention read this number. Leaving it at its 0 default is not a slow
+    // path, it is a write at a zero stride.
+    d.pos_stride = d.n_kv * d.hd;
+    d.kv_int8 = false;
+
+    for (i32 l = 0; l < mc.n_layer; l++) {
+        const LayerWeights &L = layers[static_cast<size_t>(l)];
+        d.n_tok = n;
+        d.layer = l;
+        d.layer_stride = 0; // filled from the cache below, like every family
+        void *kbase = nullptr;
+        void *vbase = nullptr;
+
+        // ---- attention ----
+        layernorm(ws_xn_, ws_x_, L.attn_norm, L.attn_norm_bias, n, E, eps);
+        gemm_w(ws_qkv_fused_, ws_xn_, L.wqkv_fused, 3 * E, E, n);
+        if (L.qkv_bias) be_->add_bias_rows(ws_qkv_fused_, L.qkv_bias, 3 * E, n);
+        // The Q|K|V split is three contiguous E-wide blocks of one row, so it
+        // is a strided copy per row, not a gather.
+        split_qkv(ws_q_, ws_k_, ws_v_, ws_qkv_fused_, n, E);
+
+        kbase = const_cast<void *>(kvt_k_.base(l));
+        vbase = const_cast<void *>(kvt_v_.base(l));
+        d.layer = l;
+        be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
+        be_->attention(ws_attn_, ws_q_, kbase, vbase, d);
+        kvt_k_.end_layer(l);
+        kvt_v_.end_layer(l);
+
+        gemm_w(ws_x2_, ws_attn_, L.wo, E, E, n);
+        if (L.wo_bias) be_->add_bias_rows(ws_x2_, L.wo_bias, E, n);
+        be_->add_residual(ws_x_, ws_x2_, n, E, nullptr);
+
+        // ---- MLP: up -> gelu -> down ----
+        layernorm(ws_xn_, ws_x_, L.ffn_norm, L.ffn_norm_bias, n, E, eps);
+        gemm_w(ws_gate_, ws_xn_, L.wup, FF, E, n);
+        be_->gelu_act(ws_gate_, static_cast<i64>(n) * FF);
+        gemm_w(ws_x2_, ws_gate_, L.wdown, E, FF, n);
+        be_->add_residual(ws_x_, ws_x2_, n, E, nullptr);
+    }
+
+    // ---- final norm + head, on the last row only ---------------------------
+    const i32 row = n - 1;
+    layernorm(ws_xn_, act_at(ws_x_, be_->act_size(), static_cast<i64>(row) * E),
+              model_.out_norm(), model_.out_norm_bias(), 1, E, eps);
+    gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, E, 1);
+    return true;
+}
+
 bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     KRK_TRACE_COMP("forward-core");
     forward_error_.clear();
@@ -2929,6 +3123,11 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     const ModelConfig &mc = model_.cfg();
     const auto &layers = model_.layers();
     const QuantTensor &embd = model_.tok_embd();
+    // GPT-2 has its own loop (LayerNorm, learned positions, a fused qkv and an
+    // ungated GELU MLP are one architecture rather than four options). Taking
+    // the branch here rather than inside the loop keeps every other family's
+    // graph literally untouched.
+    if (mc.gpt2_style) return gpt2_forward(toks, n, pos0);
     // Qwen3.5 packs its output gate behind the query (a per-layer shape only
     // when the arch says so); laguna projects its own. Decided once from the
     // arch, the same way Engine::init decided the packed workspace.

@@ -44,6 +44,19 @@ struct HadamardPlan {
 
 struct LayerWeights {
     f32 *attn_norm = nullptr; // f32 [n_embd]
+    // ---- GPT-2 -----------------------------------------------------------
+    // The two pre-norms are LayerNorms, so each carries a bias beside its
+    // weight. Null on every other family, and null keeps their graph exactly
+    // as it was: the engine only looks at these when cfg_.gpt2_style is set.
+    f32 *attn_norm_bias = nullptr; // f32 [n_embd]
+    f32 *ffn_norm_bias = nullptr;  // f32 [n_embd]
+    // The FUSED query/key/value projection, [n_embd -> 3*n_embd]. Its output
+    // row is Q | K | V, three contiguous n_embd blocks, and one bias covers
+    // all three. wq/wk/wv stay empty on this family; the forward splits the
+    // fused result instead of running three projections, which is also what
+    // the file expects -- there are no separate q/k/v tensors to run.
+    QuantTensor wqkv_fused;   // distinct from the delta-net wqkv below
+    f32 *qkv_bias = nullptr;  // f32 [3*n_embd]
     QuantTensor wq, wk, wv, wo;
     f32 *q_bias = nullptr; // optional [n_head*hd]
     f32 *k_bias = nullptr; // optional [n_kv*hd]
@@ -392,6 +405,12 @@ struct ModelConfig {
     bool attn_gate_sigmoid = false;
     // gelu(gate) * up instead of silu(gate) * up (gemma).
     bool gelu_ffn = false;
+    // ---- GPT-2 -----------------------------------------------------------
+    // LayerNorm instead of RMSNorm (mean-subtracting, with a bias), learned
+    // absolute position embeddings, a fused attn_qkv whose three outputs share
+    // one projection and one bias, and a plain GELU MLP. See
+    // ArchSpec::gpt2_style -- these are one architecture, not four switches.
+    bool gpt2_style = false;
     // Rotate only on the windowed layers (muse-glimmer's full layers are NoPE).
     bool rope_swa_only = false;
 
@@ -811,9 +830,15 @@ public:
     // they hold no KV, are charged for none, and get no plane in the cache.
     // This is the same predicate the engine's attention branch uses.
     bool layer_has_kv(i32 layer) const {
-        return layer >= 0 && layer < static_cast<i32>(layers_.size()) &&
-               (layers_[static_cast<size_t>(layer)].wq.present() ||
-                layers_[static_cast<size_t>(layer)].mla);
+        if (layer < 0 || layer >= static_cast<i32>(layers_.size())) return false;
+        const LayerWeights &w = layers_[static_cast<size_t>(layer)];
+        // A fused QKV layer keeps its query inside the fused tensor and so has
+        // no standalone `wq` to test. Asking only about `wq` declares every
+        // such layer KV-free, and the KV plane for the whole stack then sizes
+        // to zero: the cache hands out a null base and the first append writes
+        // through it. Measured, GPT-2 TinyStories: `KV=0 MiB`, SIGSEGV in
+        // layer 0's first decode.
+        return w.wq.present() || w.mla || w.wqkv_fused.present();
     }
     size_t kv_layer_count() const {
         size_t n = 0;
@@ -957,6 +982,8 @@ public:
     // scales such a weight's input into, and allocates nothing when this is 0.
     i64 max_scaled_in() const { return max_scaled_in_; }
     const f32 *out_norm() const { return out_norm_; }
+    const f32 *out_norm_bias() const { return out_norm_bias_; }
+    const QuantTensor &pos_embd() const { return pos_embd_; }
     // qwen4exp has no output_norm: the final hyper-connection mixer carries it,
     // with its own [n_embd, hc] gamma. Null on every other family.
     const f32 *hc_head_norm() const { return hc_head_norm_; }
@@ -1184,6 +1211,14 @@ private:
     QuantTensor tok_embd_, out_head_;
     i64 max_scaled_in_ = 0;
     f32 *out_norm_ = nullptr;
+    // ---- GPT-2 -----------------------------------------------------------
+    // Learned absolute position embeddings, [n_ctx_train, n_embd], added to
+    // the token embedding before the first block. Held in its original dtype
+    // like every other weight, so the read is a dequantizing row copy, not a
+    // widened resident table.
+    QuantTensor pos_embd_;
+    // LayerNorm bias on the final norm, beside out_norm_.
+    f32 *out_norm_bias_ = nullptr;
     // qwen4exp's final mixer *is* the output norm (there is no output_norm):
     // the same lane-mix read the blocks use, applied once at the top of the
     // stack. `ple_table_` is the flat n-gram embedding table, kept as a POINTER

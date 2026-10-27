@@ -255,6 +255,55 @@ went from 135 ms to 27 ms with byte-identical text. A request that fails clears
 the cache entry rather than leaving rows behind that a later prompt would assume
 were its own.
 
+### Schemas, not flags
+
+A schema is a separate reader, not a set of flags on llama: a file read against
+the wrong schema does not fail, it emits fluent nonsense. So
+`general.architecture` selects the reader, and an architecture this build does
+not know is refused by name with the list of ones it does.
+
+**GPT-2 is the newest one, and it is the first that is not a llama variant.**
+
+| | GPT-2 | llama |
+|---|---|---|
+| norm | LayerNorm, carries a bias | RMSNorm, no bias |
+| positions | learned table, added into the embedding | RoPE |
+| q / k / v | one fused `attn_qkv` and one bias | three tensors |
+| MLP | GELU, ungated -- the file has no `ffn_gate` at all | SwiGLU, gated |
+| output | untied `output.weight` with a bias | often tied |
+
+`attn_qkv.weight` is the tensor every other family is *refused* for; it is
+served for gpt2 only, by a flag on the arch table rather than by a name test at
+the call site. LayerNorm has no backend op, so it runs host-side -- that is a
+kernel still to write, not something to fake with an RMSNorm.
+
+```sh
+build-npu/kraken -m Tinystories-gpt-0.1-3m.gguf --cpu -p "Once upon a time" -n 48 --greedy
+```
+
+```
+, there was a little boy named Tim. Tim was a big, happy dog named Tim. He
+lived in a big house, there lived a big house with a big house. One day, Tim
+was a little boy named Tim was
+```
+
+That is a 3M-parameter model with 8 layers, 64-wide embeddings, 4-wide heads and
+four quant formats in one file (F32, Q8_0, Q3_K, IQ4_NL), so the loop, not the
+prose, is what it demonstrates: `--cpu` and `--npu-cpu` emit byte-identical
+text, and `--chunk 1 / 2 / 3 / 512` emit identical text, on a 50257-token
+vocabulary.
+
+On a real Q3_K_M llama (`tinyllama-15M-stories`, 6 layers, 288 embd, hd 48,
+`vocab 32000`) the same gates hold and the device is worth 2.58x on prefill:
+
+| arm | prefill (17 tok) | decode |
+|---|---|---|
+| `--cpu` | 337 tok/s | 112.8 tok/s |
+| `--npu-cpu` | **870 tok/s** (2.58x) | 111.6 tok/s |
+
+Decode does not move at this size because it is a bandwidth walk over 14 MB of
+weights; prefill is where the batched GEMM has work to do.
+
 ## Prefill
 
 Prefill was running at GEMV speed. `gemm()` split its work over the flat

@@ -58,10 +58,32 @@ constexpr ArchSpec gemma_spec(const char *name, ArchSupport sup, const char *why
 // refused entry are descriptive: they record what the file carries so the entry
 // can be flipped to Yes without re-deriving the schema, and they are never
 // consulted by a load that is refused.
+// GPT-2's row needs a flag that sits after every other member, and this table is
+// positional. Building it here keeps the row readable and keeps the flag from
+// having to be written as forty commas.
+constexpr ArchSpec gpt2_spec() {
+    ArchSpec s{"gpt2", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "gpt2", "", false, false, false, false};
+    // LayerNorm carries a bias on every norm; the fused qkv carries one bias;
+    // every projection in the stack carries one. `has_bias` is what makes the
+    // loader look for them.
+    s.gpt2_style = true;
+    s.rope_neox = false;
+    // No RoPE anywhere: learned positions are added into the embedding instead.
+    // The engine reads this off gpt2_style rather than off a rotary flag, so
+    // leaving rope defaults alone here is deliberate -- there is no table to
+    // build and nothing should try.
+    return s;
+}
+
 constexpr ArchSpec kTable[] = {
     // ---- the schemas this engine runs ------------------------------------
     {"llama", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
      false, false, false, false},
+    // GPT-2 and its descendants: LayerNorm (biased), learned absolute
+    // positions, a fused attn_qkv, and a plain GELU MLP. See
+    // ArchSpec::gpt2_style for why those four travel together.
+    gpt2_spec(),
     // Qwen2 adds a bias on q/k/v; everything else is the llama schema. It is
     // the first arch here whose rope is the *NeoX* pairing (llama.cpp's table
     // lists qwen2 under LLAMA_ROPE_TYPE_NEOX): the pair is channel j with
@@ -541,7 +563,12 @@ struct GapTensor {
     // the same gate tensor and the same existing code path -- was refused for a
     // feature the engine has. A name list cannot fix itself when a second arch
     // shows up.
-    enum class Served : unsigned char { Never, ByAttnGateFlag, ByMlaFlag };
+    enum class Served : unsigned char {
+        Never,
+        ByAttnGateFlag,
+        ByMlaFlag,
+        ByGpt2Flag
+    };
     Served served = Served::Never;
 };
 
@@ -549,7 +576,11 @@ constexpr GapTensor kGapTensors[] = {
     // On a recurrent arch `attn_qkv` is the gated delta net's own projection and
     // is what the loader uploads; on a dense one it is a fused attention
     // projection this engine has no shape for.
-    {"attn_qkv.weight", "a fused query/key/value projection (attn_qkv)", true},
+    // Served when the schema is gpt2-shaped: that loader binds the fused
+    // projection and Engine::gpt2_forward splits the Q|K|V row. Anywhere else
+    // it is still a fused attention projection this engine has no shape for.
+    {"attn_qkv.weight", "a fused query/key/value projection (attn_qkv)", true,
+     GapTensor::Served::ByGpt2Flag},
     // Implemented: src/model.cpp loads attn_gate.weight behind
     // ArchSpec::attn_gate and src/engine.cpp softplus-gates and broadcasts it
     // over the attention result before wo.
@@ -666,6 +697,9 @@ const char *arch_tensor_gap(std::string_view tensor_name, ArchShape shape,
             arch_spec(arch).attn_gate)
             continue;
         if (g.served == GapTensor::Served::ByMlaFlag && arch_spec(arch).mla)
+            continue;
+        if (g.served == GapTensor::Served::ByGpt2Flag &&
+            arch_spec(arch).gpt2_style)
             continue;
         if (has(tensor_name, g.needle)) return g.gap;
     }
