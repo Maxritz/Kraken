@@ -21,12 +21,15 @@
 // ============================================================================
 #include "npu_offload.hpp"
 
+#include "krk/common.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -73,6 +76,31 @@ struct Counters {
     unsigned long long declined = 0; // offered, but the device could not take it
     unsigned long long batches = 0;  // submissions actually made
     unsigned long long flushes = 0;  // flush() calls (queue empty included)
+    // Where a flushed batch's wall time actually goes. submit() hands the batch
+    // to the device's thread pool; sync() waits for it. Those two numbers plus
+    // the device's own execution time are what separate "the device is slow"
+    // from "the host is stalled around the device", which is the question a GPU
+    // trace answers with queue-wait and launch-overhead columns. KRK_NPU_OPTIME
+    // gates the clocks; they cost two calls per batch.
+    double submit_ms = 0.0;
+    double sync_ms = 0.0;
+    // One-time host work: quantizing a weight row into the device's packed int8
+    // layout. The pack is memoized by weight address, so this is paid once per
+    // weight for the whole run -- but it is paid DURING prefill, the first time
+    // an expert slot is touched, which is exactly where it can hide.
+    double pack_ms = 0.0;      // whole weight_i8() miss path
+    double stage_ms = 0.0;     // whole weight() miss path: q8_0 -> f32 expansion
+    double pack_host_ms = 0.0; // the host convert loop alone
+    double pack_flush_ms = 0.0;// the drain before the device pack
+    double pack_dev_ms = 0.0;  // vnpu_pack_weights_i8 itself
+    unsigned long long packed_weights = 0;
+    // Weights whose first int8 request was served by the f32 path on purpose,
+    // because they had not yet been asked for twice.
+    unsigned long long w8a8_deferred = 0;
+    // GEMM row-count histogram: 1 row, 2-8, 9-32, 33+. Distinguishes decode
+    // steps from prefill chunks in the numbers rather than by assumption.
+    unsigned long long rows_hist[4] = {0, 0, 0, 0};
+    unsigned long long staged_weights = 0;
     unsigned long long flops = 0;
     unsigned long long elements = 0; // activation elements the device touched
     // W8A8 (KRK_NPU_W8A8): GEMMs the int8 path took, and GEMMs it handed back
@@ -158,6 +186,12 @@ public:
     // the device has no "int8 weights x f32 activations" op. Measured worst
     // case on the probe: 3.36e-03 absolute, 3.32e-04 relative to the row peak.
     bool w8a8 = false;
+    // KRK_NPU_OPTIME=1: time submit() and sync() separately so a batch's wall
+    // time can be split into host dispatch and device wait.
+    bool optime = false;
+    // KRK_NPU_W8A8_EAGER=1 packs on first use instead of waiting for a second
+    // request. Off is the measured default; see weight_i8.
+    bool w8a8_eager = false;
     std::unordered_map<const void *, EntryI8> stage_i8;
     size_t stage_i8_bytes = 0;
     // Activation scratch for the int8 path: one int8 row block plus the
@@ -215,6 +249,15 @@ public:
     std::string describe() const;
 };
 
+// Wall clock for the submit/sync split. KRK_NPU_OPTIME=1 arms it; off, the
+// only cost is a branch, because the callers check the flag first.
+inline double optime_now_ms() {
+    using clk = std::chrono::steady_clock;
+    return std::chrono::duration<double, std::milli>(
+               clk::now().time_since_epoch())
+        .count();
+}
+
 const f32 *Offload::weight(const void *w, DType wt, i64 n_out, i64 n_in) {
     if (wt == DType::F32) return static_cast<const f32 *>(w);
     std::lock_guard<std::mutex> lk(mu);
@@ -241,12 +284,17 @@ const f32 *Offload::weight(const void *w, DType wt, i64 n_out, i64 n_in) {
         // that overflows size_t. Either way the caller takes its own body.
         return nullptr;
     }
+    const double t_stage0 = optime ? optime_now_ms() : 0.0;
     const size_t row_bytes = dtype_row_bytes(wt, n_in);
     const u8 *src = static_cast<const u8 *>(w);
     f32 *dst = e.data.data();
     for (i64 o = 0; o < n_out; o++)
         dequant_row(wt, src + static_cast<size_t>(o) * row_bytes,
                     dst + static_cast<size_t>(o) * static_cast<size_t>(n_in), n_in);
+    if (optime) {
+        n.stage_ms += optime_now_ms() - t_stage0;
+        n.staged_weights++;
+    }
     const f32 *out = e.data.data();
     stage_bytes += need;
     stage.emplace(w, std::move(e));
@@ -261,6 +309,26 @@ vnpu_packed_weights_t *Offload::weight_i8(const void *w, DType wt, i64 n_out,
     auto it = stage_i8.find(w);
     if (it != stage_i8.end()) return it->second.packed;
 
+    // Packing a weight into the device's int8 layout costs about 2.3 ms per
+    // 768x768 (253 MB/s standalone; across 737 weights that is 1718 ms of the
+    // 3786 ms a W8A8 prefill once spent packing) and buys back 418 ms of GEMM
+    // time -- the same GEMMs run 803 ms as f32 against 385 ms as int8. On a
+    // prefill, which reads each expert once and never comes back, the pack is a
+    // net loss: 3350 ms with it against 2400 ms without. On decode the same
+    // weights are re-read on every token, so the pack is paid once and kept.
+    //
+    // A request counter was the first attempt at telling those apart. It
+    // measured 18% better than always packing and still 36% worse than never
+    // packing, because the load-time expert warmup touches every weight once:
+    // prefill's second request then earned a pack the prefill never repaid.
+    //
+    // Rows are the honest signal. A many-row GEMM is a prefill -- the packed
+    // weight is streamed once for the whole chunk, so packing costs more than it
+    // saves. A one-row GEMM is a decode step -- the weight comes back on every
+    // token. So pack for decode, stay f32 for prefill.
+    // KRK_NPU_W8A8_EAGER=1 packs on every request, which is what earlier builds
+    // did and what the 3350/3522 ms rows above were measured with.
+    const double t_pack0 = optime ? optime_now_ms() : 0.0;
     const size_t elems = static_cast<size_t>(n_out) * static_cast<size_t>(n_in);
     if (stage_i8_bytes + elems > stage_budget) {
         if (!stage_refused) {
@@ -291,6 +359,7 @@ vnpu_packed_weights_t *Offload::weight_i8(const void *w, DType wt, i64 n_out,
     const size_t src_row = (wt == DType::F32) ? static_cast<size_t>(n_in) * 4u
                                               : dtype_row_bytes(wt, n_in);
     const u8 *src = static_cast<const u8 *>(w);
+    const double t_host0 = optime ? optime_now_ms() : 0.0;
     for (i64 o = 0; o < n_out; o++) {
         const u8 *sp = src + static_cast<size_t>(o) * src_row;
         if (wt == DType::F32) {
@@ -320,11 +389,15 @@ vnpu_packed_weights_t *Offload::weight_i8(const void *w, DType wt, i64 n_out,
         }
     }
 
+    if (optime) n.pack_host_ms += optime_now_ms() - t_host0;
     // Packing is a synchronous device call, and the queue may hold commands
     // referencing buffers it is about to be handed. Drain first so the pack
     // cannot interleave with work already issued. This is once per weight, on
     // the same warm-up pass that stages the f32 copies.
+    const double t_fl0 = optime ? optime_now_ms() : 0.0;
     flush(this);
+    if (optime) n.pack_flush_ms += optime_now_ms() - t_fl0;
+    const double t_dev0 = optime ? optime_now_ms() : 0.0;
 
     vnpu_packed_weights_t *packed = nullptr;
     const vnpu_status_t rc =
@@ -337,6 +410,11 @@ vnpu_packed_weights_t *Offload::weight_i8(const void *w, DType wt, i64 n_out,
     stage_i8_bytes += elems;
     EntryI8 e;
     e.packed = packed;
+    if (optime) {
+        n.pack_dev_ms += optime_now_ms() - t_dev0;
+        n.pack_ms += optime_now_ms() - t_pack0;
+        n.packed_weights++;
+    }
     e.bytes = elems;
     stage_i8.emplace(w, e);
     return packed;
@@ -407,6 +485,8 @@ Offload *create(int device_index, Mode mode, std::string *why) {
     o->unit = unit;
     o->strict_queue = env_on("KRK_NPU_STRICT_QUEUE");
     o->w8a8 = env_on("KRK_NPU_W8A8");
+    o->optime = env_on("KRK_NPU_OPTIME");
+    o->w8a8_eager = env_on("KRK_NPU_W8A8_EAGER");
     o->attn_on = env_on("KRK_NPU_ATTN");
     o->attn_min_tok = env_i64("KRK_NPU_ATTN_MIN_TOK", o->attn_min_tok);
     vnpu_status_t rc = vnpu_device_create(&cfg, &o->dev);
@@ -427,8 +507,35 @@ Offload *create(int device_index, Mode mode, std::string *why) {
         return nullptr;
     }
     vnpu_device_get_info(o->dev, &o->info);
-    o->stage_budget =
-        static_cast<size_t>(env_i64("KRK_NPU_WEIGHT_MB", 1024)) * 1024ull * 1024ull;
+    // How much non-f32 weight data the device may hold, expanded.
+    //
+    // This used to be a flat 1024 MiB, and the flat default was costing more
+    // than it looked: on the 2 GiB q8_0 MoE it silently declined 393 of the
+    // 1087 GEMMs in a 58-token prefill, and every one of them fell back to a
+    // host GEMM. The device then sat idle through the host's work -- a device
+    // trace of that run shows 508 ms busy out of a 3059 ms span, 83% idle,
+    // with ~30 ms holes in the timeline exactly where an expert's
+    // down-projection had been pushed back onto the CPU. Raising the budget to
+    // 2048 MiB took the declines to zero and the prefill from 2885 ms to
+    // 2398 ms (1.20x) with no other change.
+    //
+    // A fixed number cannot be right, because what the budget needs to cover is
+    // a property of the model (its non-f32 weights, expanded to f32) and of the
+    // host (how much memory is actually free). So the default is derived:
+    // three quarters of what the host says is available, never below the old
+    // 1024 MiB floor so no box gets a smaller budget than it had before.
+    // KRK_NPU_WEIGHT_MB overrides it exactly, for reproducing a run or for
+    // deliberately measuring a constrained one.
+    if (const char *mb = env_str("KRK_NPU_WEIGHT_MB")) {
+        o->stage_budget = static_cast<size_t>(std::atoll(mb)) * 1024ull * 1024ull;
+    } else {
+        const size_t avail = krk::host_available_bytes();
+        const size_t floor_bytes = 1024ull * 1024ull * 1024ull;
+        // A failed probe reports 0; fall back to the floor rather than to a
+        // budget of nothing, which would send every weight to the host.
+        const size_t derived = avail ? (avail / 4) * 3 : 0;
+        o->stage_budget = derived > floor_bytes ? derived : floor_bytes;
+    }
     o->min_elems = env_i64("KRK_NPU_MIN_ELEMS", o->min_elems);
     o->queue.reserve(64);
     return o;
@@ -501,9 +608,11 @@ bool flush(Offload *o) {
     o->n.flushes++;
     if (o->queue.empty()) return true;
     const size_t submitted = o->queue.size();
+    const double t_sub0 = o->optime ? optime_now_ms() : 0.0;
     const vnpu_status_t rc =
         vnpu_stream_submit(o->stream, o->queue.data(), submitted, nullptr);
     o->queue.clear();
+    if (o->optime) o->n.submit_ms += optime_now_ms() - t_sub0;
     // A failed submission is not a fallback, it is a correctness event. The
     // ops already in this batch returned true -- their callers have moved on --
     // so the rows they were asked to produce were never written, and decoding
@@ -520,7 +629,9 @@ bool flush(Offload *o) {
         std::abort();
     }
     o->n.batches++;
+    const double t_sync0 = o->optime ? optime_now_ms() : 0.0;
     const vnpu_status_t src = vnpu_stream_sync(o->stream);
+    if (o->optime) o->n.sync_ms += optime_now_ms() - t_sync0;
     if (src != VNPU_OK) {
         KRK_ERROR("npu: the device reported an error (%s) after %zu command(s); "
                   "their outputs cannot be trusted and there is no point in the "
@@ -540,6 +651,25 @@ std::string stats(const Offload *o) {
         o->n.declined, o->n.batches,
         static_cast<double>(o->n.flops) / 1.0e9,
         static_cast<double>(o->stage_bytes) / (1024.0 * 1024.0));
+    // The submit/sync split, only when the clocks were armed. `sync` is wall
+    // time spent waiting for the device to finish a batch it has already been
+    // handed; `submit` is the host handing it over. Anything neither of those
+    // nor the device's own execution time is host work between batches.
+    if (o->optime) {
+        out += format(" | submit %.1f ms, sync %.1f ms over %llu batch(es), "
+                      "pack %.1f ms over %llu weight(s) "
+                      "[host %.1f, flush %.1f, dev %.1f]",
+                      o->n.submit_ms, o->n.sync_ms, o->n.batches,
+                      o->n.pack_ms, o->n.packed_weights, o->n.pack_host_ms,
+                      o->n.pack_flush_ms, o->n.pack_dev_ms);
+        out += format("; stage %.1f ms over %llu weight(s)", o->n.stage_ms,
+                      o->n.staged_weights);
+    }
+    // The shape mix, always: it is what tells a prefill deficit apart from a
+    // decode one, and both arms of every comparison need to show it.
+    out += format("; gemm rows 1:%llu 2-8:%llu 9-32:%llu 33+:%llu",
+                  o->n.rows_hist[0], o->n.rows_hist[1],
+                  o->n.rows_hist[2], o->n.rows_hist[3]);
     // Only when the switch is on: a default run should not have to read a
     // zero-row about a path it never took.
     if (o->w8a8) {
@@ -547,6 +677,9 @@ std::string stats(const Offload *o) {
                       o->n.w8a8_gemm,
                       static_cast<double>(o->stage_i8_bytes) / (1024.0 * 1024.0),
                       o->n.w8a8_fallback);
+        if (o->n.w8a8_deferred)
+            out += format(", %llu deferred (first use served as f32)",
+                          o->n.w8a8_deferred);
     }
     // Attention: how many calls the device took, and -- when any stayed on the
     // reference -- the feature that blocked each group, by name. A model whose
@@ -582,6 +715,28 @@ namespace {
 // path is meant to speed up.
 bool gemm_i8(Offload *o, void *out, const void *x, const void *w, DType wt,
              i64 n_out, i64 n_in, i64 rows) {
+    // Packing only pays for itself when the weight is read many times.
+    //
+    // Measured on the 2 GiB q8_0 MoE at --npu-cpu, 58-token prompt: packing
+    // costs ~1.2 s of wall across 737 weights (2.3 ms each at 253 MB/s; host
+    // convert 977 ms + device pack 2376 ms) and buys back 418 ms -- the same
+    // GEMMs run 803 ms as f32 against 385 ms as int8. End to end that made
+    // w8a8 a 67% LOSS on prefill (4367 ms against 2619 ms off), because a
+    // prefill chunk reads each expert once and never repays its conversion.
+    // A request counter was tried next and still lost (3567 ms): the load-time
+    // expert warmup touches every weight once, so prefill's "second" request
+    // earned a pack that prefill then never repaid.
+    //
+    // Rows are the honest signal. A many-row GEMM is a prefill: the packed
+    // weight is streamed once for the whole chunk, so the pack costs more than
+    // it saves. A one-row GEMM is a decode step: the same weight comes back on
+    // every token and the pack is paid once for hundreds of reads. So pack for
+    // decode and stay f32 for prefill. KRK_NPU_W8A8_EAGER=1 restores packing
+    // on every request, which is what the earlier builds did.
+    if (!o->w8a8_eager && rows > 1) {
+        o->n.w8a8_deferred++;
+        return false; // caller falls through to the f32 GEMM
+    }
     vnpu_packed_weights_t *pk = o->weight_i8(w, wt, n_out, n_in);
     if (!pk) return false;
 
@@ -649,6 +804,7 @@ bool gemm(Offload *o, void *out, const void *x, const void *w, DType wt,
     // Opt-in W8A8. A decline here is not a substitution: it falls through to
     // the device's own f32 GEMM, which is the MORE accurate path on the same
     // device, and the run summary counts it.
+    o->n.rows_hist[rows == 1 ? 0 : rows <= 8 ? 1 : rows <= 32 ? 2 : 3]++;
     if (o->w8a8 && gemm_i8(o, out, x, w, wt, n_out, n_in, rows)) return true;
     if (o->w8a8) o->n.w8a8_fallback++;
     const f32 *b = o->weight(w, wt, n_out, n_in);
