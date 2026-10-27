@@ -184,6 +184,23 @@ f32 vec_dot(DType t, const void *src, const f32 *x, i64 n);
 void set_vec_dot_fast(bool on);
 bool vec_dot_fast();
 
+// Fused AVX2 kernels for q8_0 and q4_0 (KRK_CPU_DOT_AVX2=1). These compute
+// d * (f32)w[k] with one rounding and add term k to accumulator k mod 4 in
+// increasing k, then fold as (a0+a1)+(a2+a3) -- the same operations in the same
+// order as set_vec_dot_fast(true), so the result is BIT-IDENTICAL to it. They
+// exist to stop paying for a stack buffer and a second pass over every
+// 32-value block, not to change any answer.
+//
+// Asking for it on a build or host without AVX2 is not an error: vec_dot_avx2()
+// answers false, the four-lane path runs, and the answer is the same one. The
+// flag implies the four-lane order; formats without a fused kernel keep the
+// four-lane loop.
+//
+// Opt-in because the path it accelerates is opt-in: with set_vec_dot_fast(false)
+// this flag alone turns the non-exact order on.
+void set_vec_dot_avx2(bool on);
+bool vec_dot_avx2();
+
 // Number of activations quantized at once by the Q8_1 activation format.
 constexpr i64 kAttentionQuantBlock = 32;
 
