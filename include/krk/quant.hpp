@@ -217,6 +217,14 @@ bool vec_dot_fast();
 // this flag alone turns the non-exact order on.
 void set_vec_dot_avx2(bool on);
 bool vec_dot_avx2();
+// Q4_K against an int8 activation. Unlike the flags above this is NOT a
+// bit-identical tier -- it quantises the activation -- so it is the one switch
+// here that trades rounding for speed, and it is measured as such.
+void set_vec_dot_int8(bool on);
+bool vec_dot_int8();
+// The pieces the GEMM needs; xq is n int8 and dx is n/32 scales.
+void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx);
+f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 
 // Number of activations quantized at once by the Q8_1 activation format.
 constexpr i64 kAttentionQuantBlock = 32;

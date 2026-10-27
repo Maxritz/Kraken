@@ -1286,6 +1286,145 @@ bool cpu_has_avx2() {
 }
 #endif // KRK_DOT_AVX2
 
+// ---------------------------------------------------------------------------
+// Q4_K against an int8 activation (KRK_CPU_DOT_INT8).
+//
+// This is the K-quant kernel that was missing. The generic tile widens every
+// block to f32 and FMA's four lanes, which is ~12 GFLOPS on this box; the
+// format itself supports something far cheaper.
+//
+// Q4_K stores, per 32-value sub-block,
+//     w_k = d * s * q_k - dmin * m          q_k in 0..15, s and m 6-bit
+// so for any activation x,
+//     sum(w*x) = d*s * sum(q_k*x_k) - dmin*m * sum(x_k)
+// and if x is quantised to int8 as x ~ dx*xi the two sums are EXACT integers:
+//     sum(w*x) = dx * ( d*s*I - dmin*m*S ),  I = sum(q_k*xi_k), S = sum(xi_k)
+//
+// So the weights are read in the format they are stored in -- no f32 widening
+// at any point -- and the multiply is vpmaddubsw + vpmaddwd instead of four
+// f32 FMA lanes. I and S come out of the same two-instruction pair.
+//
+// Accuracy: this is an int8 activation against a 4-bit weight. The activation
+// quantisation is the only loss and it is the same one llama.cpp ships. The
+// gate is not a tolerance, it is the text: the greedy trajectory must be
+// identical to the exact path, and docs/DECODE-REVIEW.md records the measured
+// relative error per format next to it.
+__attribute__((target("avx2,fma"))) inline i32 hsum8_i32(__m256i v) {
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v),
+                              _mm256_extracti128_si256(v, 1));
+    s = _mm_hadd_epi32(s, s);
+    s = _mm_hadd_epi32(s, s);
+    return _mm_cvtsi128_si32(s);
+}
+
+// One 32-value block of the activation row -> int8 plus its scale. Four
+// eight-wide steps: the max has to span all 32 before any of them is rounded,
+// or the four halves would be scaled by different amounts and the block would
+// no longer have a single dx to apply at the end.
+__attribute__((target("avx2,fma"))) inline void quantize_q8_32_d(const f32 *x,
+                                                                i8 *xq, f32 *dx) {
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    __m256 v[4];
+    for (int i = 0; i < 4; i++) v[i] = _mm256_loadu_ps(x + 8 * i);
+    __m256 a = _mm256_max_ps(_mm256_andnot_ps(sign, v[0]),
+                             _mm256_andnot_ps(sign, v[1]));
+    a = _mm256_max_ps(a, _mm256_andnot_ps(sign, v[2]));
+    a = _mm256_max_ps(a, _mm256_andnot_ps(sign, v[3]));
+    __m128 m = _mm_max_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
+    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 0x55));
+    const f32 amax = _mm_cvtss_f32(m);
+    const f32 d = amax > 0.0f ? amax / 127.0f : 0.0f;
+    *dx = d;
+    if (d == 0.0f) {
+        std::memset(xq, 0, 32);
+        return;
+    }
+    const __m256 inv = _mm256_set1_ps(1.0f / d);
+    const __m256i lo32 = _mm256_set1_epi32(-127), hi32 = _mm256_set1_epi32(127);
+    for (int i = 0; i < 4; i++) {
+        __m256i q = _mm256_cvtps_epi32(_mm256_mul_ps(v[i], inv));
+        q = _mm256_max_epi32(q, lo32);
+        q = _mm256_min_epi32(q, hi32);
+        const __m128i p16 = _mm_packs_epi32(_mm256_castsi256_si128(q),
+                                           _mm256_extracti128_si256(q, 1));
+        const __m128i p8 = _mm_packs_epi16(p16, p16);
+        _mm_storel_epi64(reinterpret_cast<__m128i *>(xq + 8 * i), p8);
+    }
+}
+
+// n must be a multiple of 32; xq gets n int8, dx gets n/32 scales.
+__attribute__((target("avx2,fma"))) void quantize_q8_row_d(const f32 *x, i64 n,
+                                                          i8 *xq, f32 *dx) {
+    for (i64 b = 0; b < n; b += 32)
+        quantize_q8_32_d(x + b, xq + b, dx + b / 32);
+}
+
+// One weight row of Q4_K against one quantized activation row.
+__attribute__((target("avx2,fma"))) f32 dot_q4_K_q8_d(const u8 *w, const i8 *xq,
+                                                      const f32 *dx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    f32 sum = 0.0f;
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        for (int j = 0; j < 256; j += 64) {
+            // Two sub-blocks per 32 packed bytes: low nibbles are the first 32
+            // values, high nibbles the second 32, exactly as deq_q4_k reads
+            // them.
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs));
+            const __m256i q_lo = _mm256_and_si256(qb, kLo);
+            const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+            const i64 base = (nb * 256) + j;
+            const __m256i x_lo = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base));
+            const __m256i x_hi = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base + 32));
+            u8 s1, m1, s2, m2;
+            get_scale_min_k4(static_cast<int>(j / 32) + 0, sc, &s1, &m1);
+            get_scale_min_k4(static_cast<int>(j / 32) + 1, sc, &s2, &m2);
+            // I and S are exact integers; the two scales are applied once per
+            // sub-block rather than per element.
+            const i32 I1 = hsum8_i32(_mm256_madd_epi16(
+                _mm256_maddubs_epi16(q_lo, x_lo), ones16));
+            const i32 S1 = hsum8_i32(_mm256_madd_epi16(
+                _mm256_maddubs_epi16(ones8, x_lo), ones16));
+            const i32 I2 = hsum8_i32(_mm256_madd_epi16(
+                _mm256_maddubs_epi16(q_hi, x_hi), ones16));
+            const i32 S2 = hsum8_i32(_mm256_madd_epi16(
+                _mm256_maddubs_epi16(ones8, x_hi), ones16));
+            const f32 dx1 = dx[(base) / 32];
+            const f32 dx2 = dx[(base + 32) / 32];
+            sum += dx1 * (d * static_cast<f32>(s1) * static_cast<f32>(I1) -
+                          dmin * static_cast<f32>(m1) * static_cast<f32>(S1));
+            sum += dx2 * (d * static_cast<f32>(s2) * static_cast<f32>(I2) -
+                          dmin * static_cast<f32>(m2) * static_cast<f32>(S2));
+            qs += 32;
+        }
+    }
+    return sum;
+}
+
+std::atomic<bool> g_dot_int8{false};
+std::atomic<bool> g_dot_int8_set{false};
+
+bool env_dot_int8() {
+    const char *e = std::getenv("KRK_CPU_DOT_INT8");
+    if (!e || e[0] == '\0') {
+#if defined(KRK_DOT_AVX2)
+        return cpu_has_avx2();
+#else
+        return false;
+#endif
+    }
+    return e[0] != '0';
+}
+
 std::atomic<bool> g_dot_avx2{false};
 std::atomic<bool> g_dot_avx2_set{false};
 
@@ -1309,6 +1448,44 @@ bool env_dot_avx2() {
     return e[0] != '0';
 }
 } // namespace
+
+// The kernels live in the anonymous namespace above; these are the names the
+// backend links against. Without AVX2 there is no int8 kernel and the flag is
+// false, so the stubs are never reached -- they exist so the translation unit
+// links on every target.
+void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx) {
+#if defined(KRK_DOT_AVX2)
+    quantize_q8_row_d(x, n, xq, dx);
+#else
+    (void)x; (void)n; (void)xq; (void)dx;
+#endif
+}
+
+f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+#if defined(KRK_DOT_AVX2)
+    return dot_q4_K_q8_d(w, xq, dx, n);
+#else
+    (void)w; (void)xq; (void)dx; (void)n;
+    return 0.0f;
+#endif
+}
+
+void set_vec_dot_int8(bool on) {
+    g_dot_int8.store(on, std::memory_order_relaxed);
+    g_dot_int8_set.store(true, std::memory_order_relaxed);
+}
+
+bool vec_dot_int8() {
+    if (!g_dot_int8_set.load(std::memory_order_relaxed)) {
+        g_dot_int8.store(env_dot_int8(), std::memory_order_relaxed);
+        g_dot_int8_set.store(true, std::memory_order_relaxed);
+    }
+#if defined(KRK_DOT_AVX2)
+    return g_dot_int8.load(std::memory_order_relaxed) && cpu_has_avx2();
+#else
+    return false;
+#endif
+}
 
 void set_vec_dot_avx2(bool on) {
     g_dot_avx2.store(on, std::memory_order_relaxed);

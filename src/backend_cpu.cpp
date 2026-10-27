@@ -312,6 +312,44 @@ public:
         const size_t row_bytes = dtype_row_bytes(wt, n_in);
         const f32 *xf = static_cast<const f32 *>(x);
         f32 *of = static_cast<f32 *>(out);
+        // Q4_K fast path. The activation is quantised to int8 ONCE for the
+        // whole call and every output element is then an integer dot against a
+        // weight row that never leaves its stored blocks. Doing it here rather
+        // than inside vec_dot() is the whole point: vec_dot() is called once
+        // per output element, so a per-call quantisation there would undo the
+        // win it is trying to buy.
+        if (wt == DType::Q4_K && n_in > 0 && (n_in % 256) == 0 && rows > 0 &&
+            vec_dot_int8()) {
+            const i64 nb = n_in / 32;
+            // Owned by the CALLING thread and captured by value below. These
+            // were thread_local, which looks like a free optimisation and is a
+            // null dereference: par_for runs the body on pool workers, and a
+            // worker's own thread_local vector has never been resized, so
+            // data() is nullptr there. ASan caught the read at address 0.
+            std::vector<i8> xq(static_cast<size_t>(rows * n_in));
+            std::vector<f32> xd(static_cast<size_t>(rows * nb));
+            for (i64 r = 0; r < rows; r++)
+                quantize_q8_row(xf + r * n_in, n_in,
+                                xq.data() + r * n_in, xd.data() + r * nb);
+            const i8 *xqp = xq.data();
+            const f32 *xdp = xd.data();
+            const u8 *wb = static_cast<const u8 *>(w);
+            const i64 grain = std::max<i64>(8, std::min<i64>(256, n_out / 8));
+            par_for(n_out, grain,
+                    2.0 * static_cast<f64>(rows) * static_cast<f64>(n_out) *
+                        static_cast<f64>(n_in),
+                    [&](i64 b, i64 e) {
+                        for (i64 o = b; o < e; o++) {
+                            const u8 *wr = wb + static_cast<size_t>(o) * row_bytes;
+                            for (i64 r = 0; r < rows; r++)
+                                of[r * n_out + o] =
+                                    dot_q4_K_q8(wr, xqp + r * n_in,
+                                                xdp + r * nb, n_in);
+                        }
+                    });
+            return;
+        }
+
         // Every output element is an independent dot product, so the
         // flat (row, column) index space splits without sharing any
         // reduction — results are bit-identical to the serial loop.
