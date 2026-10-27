@@ -225,6 +225,7 @@ bool vec_dot_int8();
 // The pieces the GEMM needs; xq is n int8 and dx is n/32 scales.
 void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx);
 f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 // Eight rows at once, weight block decoded once. out[r*out_stride].
 void dot_q4_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);

@@ -13,6 +13,7 @@
 #include "krk/cli_value.hpp"
 #include "krk/engine.hpp"
 #include "krk/host_time.hpp"
+#include "krk/kernel_time.hpp"
 #include "krk/trace.hpp"
 
 #if !defined(_WIN32)
@@ -383,6 +384,8 @@ void usage() {
         "                        transfers, syncs and counters. PATH sets\n"
         "                        KRK_TRACE_PATH. Bounded window only; compare\n"
         "                        untraced wall time.\n"
+        "  --kprof               per-component device time, ranked by total:\n"
+        "                        ops, dev_us, us/op. Works on every backend.\n"
         "  --profile             per-op device timeline for the last decode\n"
         "                        step(s), with the idle gap before each op\n"
         "                        (KRK_PROFILE_STEPS/FROM/OPS tune the window)\n"
@@ -586,6 +589,13 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--info") a->info = true;
         else if (f == "--bench") a->bench = true;
         else if (f == "--profile") a->profile = true;
+        else if (f == "--kprof") {
+            // Per-COMPONENT device time, ranked, for every backend. --profile
+            // is the host-side phase table and the device op trace; this is
+            // the kernel table that says which one is eating the run.
+            setenv("KRK_KPROF", "1", 1);
+            a->profile = true;
+        }
         else if (f == "--trace") {
             a->trace = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') a->trace_path = argv[++i];
@@ -1409,6 +1419,7 @@ static double adapt_retain() {
 }
 
 int main(int argc, char **argv) {
+    bool ktime_registered = false;
     PhaseClock ph;
     ph.mark("process start");
     Args a;
@@ -1917,5 +1928,11 @@ int main(int argc, char **argv) {
 
     engine.shutdown();
     delete be;
+    // Registered here rather than printed here so every exit path above
+    // (--prefill-hash, --bench, an error return) still gets the table.
+    if (::krk::KernelTime::enabled() && !ktime_registered) {
+        ktime_registered = true;
+        std::atexit([] { ::krk::KernelTime::get().report("this run"); });
+    }
     return rc != 0 ? rc : g_range_exit;
 }
