@@ -220,10 +220,25 @@ bool vec_dot_avx2();
 // Q4_K against an int8 activation. Unlike the flags above this is NOT a
 // bit-identical tier -- it quantises the activation -- so it is the one switch
 // here that trades rounding for speed, and it is measured as such.
+// Measured ceiling for this host, all cores, at the width the kernels use.
+// int8=true is the u8*i8 dot rate, false the f32 FMA rate. Used by the
+// component trace so a "%peak" is a measurement and not a datasheet.
+double isa_peak_gmacs(bool int8);
+
 void set_vec_dot_int8(bool on);
 bool vec_dot_int8();
 // The pieces the GEMM needs; xq is n int8 and dx is n/32 scales.
 void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx);
+// Also emits sx[]: sum of the quantised values per 32-value sub-block. It is
+// activation-only, so the dmin term uses it instead of recomputing it for every
+// weight row.
+void quantize_q8_row_sx(const f32 *x, i64 n, i8 *xq, f32 *dx, i32 *sx);
+f32 dot_q4_K_q8_sx(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx, i64 n);
+// Eight activation rows against one weight row, with the min term taken from
+// sx[] once per 256-value block instead of recomputed per row.
+void dot_q4_K_q8_sx_x8(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
+                       i64 n, i64 rstride, i64 dstride, i64 sstride, f32 *out,
+                       i64 out_stride);
 f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 // Eight rows at once, weight block decoded once. out[r*out_stride].

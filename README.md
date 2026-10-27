@@ -243,7 +243,7 @@ command line was wrong. A refused GGUF is a load-time verdict and not a crash.
 The test suite needs no GPU:
 
 ```sh
-build-hip/kraken-tests.exe
+build-hip/kraken-tests.exe     # 4796/4796 checks on the CPU-only build
 ```
 
 There is also an OpenAI-compatible HTTP server, `kraken-server`, which the long
@@ -347,9 +347,88 @@ measure -- was the slow one, and every device comparison was drawn against it.
 They are bit-identical to the four-lane path they accelerate
 (`test_vec_dot_avx2_matches_fast` asserts that with `memcmp`), so an AVX2 host
 should simply run them. `KRK_CPU_DOT_AVX2=0` still forces the scalar reference
-for a bit-exactness run, and an AVX-512-only improvement is not claimed: this
-box shows `KRK_CPU_DOT_AVX512=1` at 22.2 tok/s against 22.9 for the scalar
-path, i.e. no kernel behind that name yet.
+for a bit-exactness run.
+
+VNNI is chosen at run time, not at build time: `cpu_has_vnni()` tests
+`avx512vnni`/`avxvnni` with `__builtin_cpu_supports`, so one binary runs
+`vpdpbusd` kernels on a Zen 4 / Sapphire Rapids host and the `maddubs + madd`
+pair on the Zen 3 target, with no rebuild and no flag.
+`KRK_CPU_NO_VNNI=1` forces the AVX2 kernels on a VNNI host -- that is how the
+AVX2 twins are measured here, and it is the escape hatch for a hypervisor that
+reports the feature wrongly.
+
+#### The min term, and what it was costing
+
+Q4_K stores `w = d*sc*(q) - dmin*m` per 32 values, so every dot product also
+needs `S_s = sum(x_k)` for that sub-block. The kernels were rebuilding `S_s`
+**per weight row** -- two `maddubs`, one `madd`, a `cvt` and a `fnmadd` for every
+32 values -- which is as many instructions as the dot product itself. That is
+the whole reason the prefill kernel sat at 3.5 MAC/instruction when its own
+scale structure allows about 6.4.
+
+`quantize_q8_row_sx()` computes the sub-block sums once per *activation row*,
+next to the quantisation it already does. Two kernels then use them:
+
+* `dot_q4_K_q8_sx_x8()` -- eight activation rows against one weight row. The
+  block's eight `(sc, m)` pairs are decoded once into an eight-lane f32 vector,
+  and the min term becomes **one `cvt` + one `fnmadd` per row per block**, where
+  the old kernel spent thirty-two instructions per row per block on it. The
+  scale sweep is shared by all eight rows instead of repeated 64 times.
+* `dot_q4_K_q8_sx()` -- the single-row (decode) shape, same substitution.
+
+Nothing is dequantised: the block is read where it is stored, and the scale
+decoding produces registers, not a tensor. `KRK_CPU_DOT_X8SX=0` routes the
+eight-row shape back through the per-row min term; that is the A/B below.
+
+Measured on Tiny-Moe Q4_K_M, greedy, 98-token prompt, best-of-5 interleaved arms,
+same binary, both arms on the int8 path:
+
+| arm | prefill | decode |
+|---|---:|---:|
+| per-row min term (before) | 177.8 tok/s | 83.5 tok/s |
+| `sx` + batched min term | **265.4 tok/s** | **86.8 tok/s** |
+| | **1.49x** | 1.04x |
+
+On a 46-token prompt the same change measures 1.37x, because the fixed cost of
+the prompt-encoding tail is a larger share of a shorter prefill. Decode gains
+4-11% depending on prompt length, from the single-row kernel alone.
+
+#### What the trace says now
+
+`--kprof` prints a `GMAC/s` and a `%peak` column per component, and the peak is
+**measured in the same process** on the first `--kprof` run: sixteen independent
+`vpdpbusd` (or `fma`) chains, register-only operands, counted against the exact
+number of MACs those instructions retire, times the cores in the pool. A
+datasheet number would have been wrong here -- this box quotes 512-bit VNNI while
+the kernels are 256-bit.
+
+Tiny-Moe, `--cpu --kprof`, one quality run:
+
+```
+component                       ops         dev_us      us/op    %run    GMAC/s    %peak
+gemm_q4k_i8_rN                  102       119371.0     1170.3   37.2%      45.9    13.3%
+gemm_q4k_i8_r1                 1122       113818.0      101.4   35.4%      11.5     3.3%
+gemm_q6k_rN                      18        48111.0     2672.8   15.0%      21.4     6.2%
+gemm_q6k_r1                     210        17964.0       85.5    5.6%      15.8     4.6%
+attention                       144         9559.0       66.4    3.0%       5.2     4.8%
+silu_mul                        288         5866.0       20.4    1.8%       0.0        -
+kv_append                       144         2481.0       17.2    0.8%       0.0        -
+rope                            144         2180.0       15.1    0.7%       0.0        -
+rmsnorm                         300         1341.0        4.5    0.4%       0.0        -
+tracked total: 281.7 ms across 12 component(s) -- model load, sampling and tokenisation are outside every row
+roofline probe: int8 365 GMAC/s, f32 115 GMAC/s (this host, all cores)
+```
+
+`13.3%` is the number to look at. It is not a scheduling artefact: the kernel is
+instruction-bound, and the instruction budget per 64 values is dominated by the
+per-32-value scale application, not by the dot product. Closing that gap needs a
+different *layout* -- a permuted or unpack-free weight representation so the
+scale can be folded once -- not another multiply. Unpack-free 4-bit and ternary
+paths exist (BitNet's ternary dot, NVFP4/MXFP4 micro-scaling, table-lookup
+NPU datapaths); they are on the list, and the current `x8` kernel is the best
+this layout can do at 45.9 GMAC/s. The Q6_K rows (18% of the run, at 6% of peak)
+are next, and they have no `sc`-per-32 structure problem -- the same
+`sx` substitution applies.
 
 Measured on three real files, greedy, 24 tokens, `--cpu`, same output to the
 byte on every row:

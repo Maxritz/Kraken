@@ -14,6 +14,7 @@
 #include "krk/engine.hpp"
 #include "krk/host_time.hpp"
 #include "krk/kernel_time.hpp"
+#include "krk/quant.hpp"
 #include "krk/trace.hpp"
 
 #if !defined(_WIN32)
@@ -1932,7 +1933,11 @@ int main(int argc, char **argv) {
     // (--prefill-hash, --bench, an error return) still gets the table.
     if (::krk::KernelTime::enabled() && !ktime_registered) {
         ktime_registered = true;
-        std::atexit([] { ::krk::KernelTime::get().report("this run"); });
+        std::atexit([] {
+            ::krk::KernelTime::get().set_roofline(::krk::isa_peak_gmacs(true),
+                                                 ::krk::isa_peak_gmacs(false));
+            ::krk::KernelTime::get().report("this run");
+        });
     }
     return rc != 0 ? rc : g_range_exit;
 }
