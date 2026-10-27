@@ -294,15 +294,21 @@ text, and `--chunk 1 / 2 / 3 / 512` emit identical text, on a 50257-token
 vocabulary.
 
 On a real Q3_K_M llama (`tinyllama-15M-stories`, 6 layers, 288 embd, hd 48,
-`vocab 32000`) the same gates hold and the device is worth 2.58x on prefill:
+`vocab 32000`) the same gates hold. The device is worth nothing there, and the
+comparison is only honest because the reference arm now runs the kernels its
+host can actually execute:
 
-| arm | prefill (17 tok) | decode |
+| arm | prefill | decode |
 |---|---|---|
-| `--cpu` | 337 tok/s | 112.8 tok/s |
-| `--npu-cpu` | **870 tok/s** (2.58x) | 111.6 tok/s |
+| `--cpu` | 655 tok/s | 209 tok/s |
+| `--npu-cpu` | 602 tok/s | 119 tok/s |
 
-Decode does not move at this size because it is a bandwidth walk over 14 MB of
-weights; prefill is where the batched GEMM has work to do.
+An earlier version of this table read 337 -> 870 tok/s, a 2.58x win for the
+device. That was measured against a reference arm that was running the scalar
+dot product on a host with AVX2, i.e. against a handicap this file set up
+itself. Fixing the handicap (`KRK_CPU_DOT_AVX2` now defaults to whatever the
+CPU reports, see below) removed the win. On the Q4_K MoE the device does still
+win prefill, 49 -> 132 tok/s, and loses decode, 21 -> 17.
 
 ## Prefill
 
@@ -334,6 +340,25 @@ Covered formats: `q8_0`, `q4_0` (hand-written AVX2 kernels), `f16`, `f32` (F16C)
 and every other block format through a generic tile -- Q4_K, Q5_K, Q6_K,
 iq-quants, which is most of a real collection. Unlisted formats and hosts
 without the ISA fall back to the per-element path rather than refusing.
+
+**These kernels are now selected by the CPU, not by the environment.** They used
+to need `KRK_CPU_DOT_AVX2=1`, which meant the default run -- the one people
+measure -- was the slow one, and every device comparison was drawn against it.
+They are bit-identical to the four-lane path they accelerate
+(`test_vec_dot_avx2_matches_fast` asserts that with `memcmp`), so an AVX2 host
+should simply run them. `KRK_CPU_DOT_AVX2=0` still forces the scalar reference
+for a bit-exactness run, and an AVX-512-only improvement is not claimed: this
+box shows `KRK_CPU_DOT_AVX512=1` at 22.2 tok/s against 22.9 for the scalar
+path, i.e. no kernel behind that name yet.
+
+Measured on three real files, greedy, 24 tokens, `--cpu`, same output to the
+byte on every row:
+
+| model | quant | prefill scalar -> auto | decode scalar -> auto |
+|---|---|---|---|
+| Tinystories-gpt-0.1-3m | Q3_K/Q8_0/IQ4_NL | 2198 -> **3328** tok/s | 523 -> **895** tok/s |
+| tinyllama-15M-stories | Q3_K_M | 345 -> **653** tok/s | 121 -> **206** tok/s |
+| Tiny-Moe | Q4_K_M | 22.5 -> **49.0** tok/s | 13.8 -> **22.0** tok/s |
 
 ### The NPU arm of the same benchmark
 
