@@ -341,7 +341,13 @@ public:
                     [&](i64 b, i64 e) {
                         for (i64 o = b; o < e; o++) {
                             const u8 *wr = wb + static_cast<size_t>(o) * row_bytes;
-                            for (i64 r = 0; r < rows; r++)
+                            i64 r = 0;
+                            // Eight rows share one decode of the weight block.
+                            for (; r + 8 <= rows; r += 8)
+                                dot_q4_K_q8_x8(wr, xqp + r * n_in,
+                                               xdp + r * nb, n_in, n_in, nb,
+                                               of + r * n_out + o, n_out);
+                            for (; r < rows; r++)
                                 of[r * n_out + o] =
                                     dot_q4_K_q8(wr, xqp + r * n_in,
                                                 xdp + r * nb, n_in);
