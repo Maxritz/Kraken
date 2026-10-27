@@ -139,12 +139,12 @@ index 0000000..da45af3
 +| 128x768x768 | 39.735 ms | 30.869 ms | **1.960 ms** | **15.7x** |
 +| 1x2048x768 (wide K) | 0.956 ms | 0.909 ms | **0.108 ms** | **8.4x** |
 +
-+At prefill shapes the 256-bit kernel now **outruns the AVX-512 VNNI path** on
-+this host (38.5 vs 31.2 GMAC/s at 128 rows). That is not a knock on AVX-512 --
-+`dpbusd` is the better instruction -- it is a knock on the VNNI tile's scalar
-+`tmp[16]` epilogue and its per-group `make_vnni_avec` construction, which the
-+next person should fix. Until then, forcing `avx2` on an AVX-512 host is a
-+legitimate choice, and the parity test below says the answers are identical.
++**Correction (2026-10-27).** An earlier revision of this file claimed that the
++256-bit kernel "outruns the AVX-512 VNNI path" here. It does not. That number
++came from `VNPU_FORCE_ISA=avx512`, which stripped the VNNI feature bit and so
++ran this same AVX2 kernel on both arms; see npuxl-0003. With VNNI reachable the
++AVX-512 kernel is ~4x faster (130 vs 32 GMAC/s, single thread, 128x768x768).
++Forcing `avx2` on an AVX-512 host is still legitimate, but not because it wins.
 +
 +## 2. Per-row int8 quantisation
 +

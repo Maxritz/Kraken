@@ -1,0 +1,345 @@
+From 5c4b05c89962744ffe23c7b7deee20389ca44129 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Tue, 27 Oct 2026 14:55:31 +0000
+Subject: [PATCH] force-isa: stop stripping VNNI from `avx512`, and fix the
+ int8 scale order
+
+Two defects, both invisible until VNNI was actually reachable.
+
+1. VNPU_FORCE_ISA=avx512 cleared VNPU_FEATURE_AVX512VNNI. Forcing the
+   baseline ISA must not subtract a feature the host has: the int8 GEMM
+   silently fell through to the AVX2 kernel. Measured single-threaded at
+   128x768x768 on this box: 20,304 MAC/s forced-avx512 vs 82,395 with VNNI
+   enabled, 4.1x, with nothing in the output saying which kernel ran.
+   VNPU_FORCE_ISA is documented as the way to make deterministic
+   cross-machine comparisons, so every such comparison was measuring AVX2
+   and calling it AVX-512. `avx512-novnni` is the arm that wants the
+   non-VNNI kernel; it is still available, by name.
+
+2. The VNNI kernel multiplied its scales in the opposite order from
+   store_i8_c(): (dot * scale_b) * scale_a against the oracle's
+   (dot * scale_a) * scale_b. Commutative, not associative, so it differed
+   in the last bit and was the only arm disagreeing with the scalar
+   reference. vnpu-isa-parity caught it the moment VNNI became reachable.
+
+Also: forcing an ISA the host cannot execute is now refused by name
+instead of executing an illegal instruction. An AVX2-only host (Zen 3,
+pre-Skylake) asked for avx512 used to fault inside the first kernel.
+
+tests/bench_kernel.cpp is added because the public bench could not answer
+the question that mattered: it calls kernel_gemm_i8_range directly with one
+tile and one worker, separating microkernel throughput from tile
+construction, pool dispatch and the barrier. It is what showed the 4.1x.
+
+Verified: selftest 16/16 and fuzz 60/0 on unforced, scalar, avx2, avx512
+and avx512-novnni; vnpu-isa-parity now reports identical int8 GEMM digests
+on all four arms for every shape, including the K%4 and N%16 edges.
+---
+ CMakeLists.txt          |  11 ++++
+ src/core/runtime.cpp    |  59 +++++++++++++++--
+ src/kernels/kernels.cpp |  11 +++-
+ tests/bench_i8.cpp      |   3 +-
+ tests/bench_kernel.cpp  | 136 ++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 212 insertions(+), 8 deletions(-)
+ create mode 100644 tests/bench_kernel.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 13160e8..039c9ee 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -119,6 +119,17 @@ if(VNPU_BUILD_TOOLS)
+     target_link_libraries(vnpu-isa-parity PRIVATE ${VNPU_LINK_TARGET} Threads::Threads)
+     vnpu_set_warnings(vnpu-isa-parity)
+ 
++    # Links the STATIC archive on purpose: this one calls the microkernel
++    # directly, and the shared library hides internal symbols.
++    add_executable(vnpu-bench-kernel tests/bench_kernel.cpp)
++    target_include_directories(vnpu-bench-kernel PRIVATE ${VNPU_INCLUDE_DIRS})
++    if(TARGET vnpu_static)
++      target_link_libraries(vnpu-bench-kernel PRIVATE vnpu_static Threads::Threads)
++    else()
++      target_link_libraries(vnpu-bench-kernel PRIVATE ${VNPU_LINK_TARGET} Threads::Threads)
++    endif()
++    vnpu_set_warnings(vnpu-bench-kernel)
++
+     add_executable(vnpu-bench-i8 tests/bench_i8.cpp)
+     target_include_directories(vnpu-bench-i8 PRIVATE ${VNPU_INCLUDE_DIRS})
+     target_link_libraries(vnpu-bench-i8 PRIVATE ${VNPU_LINK_TARGET} Threads::Threads)
+diff --git a/src/core/runtime.cpp b/src/core/runtime.cpp
+index de4d561..1a71a7b 100644
+--- a/src/core/runtime.cpp
++++ b/src/core/runtime.cpp
+@@ -4,6 +4,8 @@
+  */
+ #include "../internal.h"
+ 
++#include <cstdio>
++
+ #include <algorithm>
+ #include <fstream>
+ #include <iomanip>
+@@ -728,11 +730,37 @@ VNPU_API vnpu_status_t VNPU_CALL vnpu_device_create(const vnpu_config_t *config,
+         auto *device = new vnpu_device_t();
+         device->config = cfg;
+         device->cpu = vnpu::detect_cpu_features();
+-        /* VNPU_FORCE_ISA=scalar|avx2|avx512 is useful for sanitizer builds and
++        /* VNPU_FORCE_ISA=scalar|avx2|avx512|avx512-novnni is useful for sanitizer builds and
+          * deterministic cross-machine comparisons. */
+         const char *forced_isa = std::getenv("VNPU_FORCE_ISA");
+-        if (forced_isa && forced_isa[0]) {
+-            std::string forced(forced_isa);
++        std::string forced = (forced_isa && forced_isa[0]) ? forced_isa : "";
++        if (!forced.empty()) {
++            /* Forcing an ISA the host cannot execute is a SIGILL, not a
++             * benchmark. Say so and keep what was detected. This matters on
++             * exactly the machines the flag is most tempting on: an AVX2-only
++             * host (Zen 3, pre-Skylake) asked for avx512 used to fault inside
++             * the first kernel instead of explaining itself. */
++            const bool have_avx2 =
++                (device->cpu.bits & VNPU_FEATURE_AVX2_FMA) != 0;
++            const bool have_avx512 =
++                (device->cpu.bits & VNPU_FEATURE_AVX512F) != 0;
++            const bool need_avx512 = forced.rfind("avx512", 0) == 0;
++            if ((need_avx512 && !have_avx512) ||
++                (forced == "avx2" && !have_avx2)) {
++                std::fprintf(stderr,
++                             "vnpu: VNPU_FORCE_ISA=%s requested but this CPU "
++                             "does not report %s; keeping the detected ISA "
++                             "(%s) instead of executing an illegal "
++                             "instruction\n",
++                             forced.c_str(),
++                             need_avx512 ? "AVX-512" : "AVX2+FMA",
++                             device->cpu.backend.empty()
++                                 ? "unknown"
++                                 : device->cpu.backend.c_str());
++                forced.clear();
++            }
++        }
++        if (!forced.empty()) {
+             if (forced == "scalar") {
+                 device->cpu.isa = vnpu::ISA_SCALAR;
+                 device->cpu.simd_bits = 0;
+@@ -747,12 +775,31 @@ VNPU_API vnpu_status_t VNPU_CALL vnpu_device_create(const vnpu_config_t *config,
+                 device->cpu.bits &= ~(VNPU_FEATURE_AVX512F |
+                                       VNPU_FEATURE_AVX512VNNI);
+                 device->cpu.backend = "AVX2+FMA(forced)";
+-            } else if (forced == "avx512") {
++            } else if (forced == "avx512" || forced == "avx512-novnni") {
++                /* Forcing the baseline ISA must not SUBTRACT a feature the host
++                 * actually has. This used to clear VNNI unconditionally, which
++                 * silently routed the int8 GEMM to the AVX2 kernel: measured
++                 * 31 GMAC/s instead of 130 on this box, 4.1x, with nothing in
++                 * the output saying so. Anyone comparing arms with
++                 * VNPU_FORCE_ISA=avx512 -- which is what the flag is for --
++                 * was measuring AVX2 and calling it AVX-512.
++                 *
++                 * avx512-novnni is the arm that genuinely wants the non-VNNI
++                 * kernel; it stays because that comparison is worth being able
++                 * to make, it just has to be asked for by name. */
++                const bool want_vnni = forced == "avx512";
+                 device->cpu.isa = vnpu::ISA_AVX512;
+                 device->cpu.simd_bits = 512;
+                 device->cpu.bits |= VNPU_FEATURE_AVX512F;
+-                device->cpu.bits &= ~VNPU_FEATURE_AVX512VNNI;
+-                device->cpu.backend = "AVX512F(forced)";
++                if (want_vnni)
++                    device->cpu.backend = (device->cpu.bits &
++                                           VNPU_FEATURE_AVX512VNNI)
++                                              ? "AVX512F+VNNI(forced)"
++                                              : "AVX512F(forced)";
++                else {
++                    device->cpu.bits &= ~VNPU_FEATURE_AVX512VNNI;
++                    device->cpu.backend = "AVX512F(forced, no VNNI)";
++                }
+             }
+         }
+         uint32_t threads = cfg.num_threads ? cfg.num_threads : device->cpu.logical_cpus;
+diff --git a/src/kernels/kernels.cpp b/src/kernels/kernels.cpp
+index dbe80bb..f666a93 100644
+--- a/src/kernels/kernels.cpp
++++ b/src/kernels/kernels.cpp
+@@ -692,8 +692,17 @@ static void gemm_i8_vnni_tile(const GemmI8Params &p, const TileJob &tile,
+                     __m512 dotsf = _mm512_cvtepi32_ps(acc[i][b]);
+                     __m512 scalea = _mm512_set1_ps(
+                         p.scale_a ? p.scale_a[m0 + i] : 1.0f);
++                    /* (dot * scale_a) * scale_b, in that order, because that
++                     * is what store_i8_c() does and float multiplication is
++                     * commutative but not associative. Multiplying the scales
++                     * the other way round is mathematically identical and
++                     * differs in the last bit, which is enough to make this
++                     * kernel the only arm that disagrees with the scalar
++                     * oracle -- caught by vnpu-isa-parity the first time VNNI
++                     * was actually reachable (it is not, if VNPU_FORCE_ISA
++                     * strips the VNNI bit; see runtime.cpp). */
+                     __m512 out = _mm512_mul_ps(
+-                        _mm512_mul_ps(dotsf, scalesb), scalea);
++                        _mm512_mul_ps(dotsf, scalea), scalesb);
+                     std::memcpy(tmp, &out, sizeof(out));
+                     for (uint32_t j = 0; j < counts[b]; ++j) {
+                         float value = tmp[j];
+diff --git a/tests/bench_i8.cpp b/tests/bench_i8.cpp
+index ac588a3..a93d180 100644
+--- a/tests/bench_i8.cpp
++++ b/tests/bench_i8.cpp
+@@ -63,6 +63,7 @@ int main() {
+         {1, 768, 768, "decode expert row"},
+         {32, 768, 768, "prefill 32 rows"},
+         {128, 768, 768, "prefill 128 rows"},
++        {256, 768, 768, "prefill 256 rows"},
+         {1, 2048, 768, "decode wide-K"},
+     };
+ 
+@@ -98,7 +99,7 @@ int main() {
+         /* Warm, then best of N: the first call pays page faults on C. */
+         for (int i = 0; i < 3; ++i) vnpu_matmul_i8(stream, &args);
+         double best = 1e30;
+-        const int reps = M <= 32 ? 60 : 12;
++        const int reps = M <= 32 ? 60 : (M <= 128 ? 20 : 10);
+         for (int i = 0; i < reps; ++i) {
+             const double t0 = now_ms();
+             vnpu_matmul_i8(stream, &args);
+diff --git a/tests/bench_kernel.cpp b/tests/bench_kernel.cpp
+new file mode 100644
+index 0000000..53d1b91
+--- /dev/null
++++ b/tests/bench_kernel.cpp
+@@ -0,0 +1,136 @@
++/*
++ * bench_kernel.cpp - the int8 GEMM microkernel on its own.
++ *
++ * The public bench (bench_i8) measures vnpu_matmul_i8, which is tile
++ * construction, a thread-pool dispatch, a barrier and the kernel. When that
++ * number will not move, the question is whether the kernel is slow or whether
++ * everything around it is -- and the public API cannot tell you.
++ *
++ * This calls kernel_gemm_i8_range directly with one tile covering the whole
++ * matrix and one worker, so the number is the microkernel and nothing else.
++ *
++ *     VNPU_FORCE_ISA=avx512 ./build/vnpu-bench-kernel
++ *
++ * What it prints is MAC/s for a set of shapes plus the ratio to the same
++ * workload scalar-summed on the spot, which is the honest ceiling on what the
++ * arithmetic can do versus what the memory system allows.
++ */
++#include "internal.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++namespace {
++
++double now_ms() {
++    using clock = std::chrono::steady_clock;
++    return std::chrono::duration<double, std::milli>(
++               clock::now().time_since_epoch())
++        .count();
++}
++
++}  // namespace
++
++int main() {
++    vnpu_config_t cfg;
++    vnpu_config_init(&cfg);
++    cfg.node_name = "bench-kernel";
++    vnpu_device_t *device = nullptr;
++    if (vnpu_device_create(&cfg, &device) != VNPU_OK) {
++        std::fprintf(stderr, "bench-kernel: device create failed\n");
++        return 1;
++    }
++
++    std::printf("bench-kernel  isa=%u  vnni=%d  single worker, one tile\n",
++                device->cpu.isa, device->has_vnni() ? 1 : 0);
++
++    const struct { uint32_t M, K, N; } shapes[] = {
++        {1, 768, 768}, {32, 768, 768}, {128, 768, 768}, {256, 768, 768},
++        {128, 512, 512},
++    };
++
++    std::printf("%-22s %10s %12s %10s\n", "shape", "best ms", "MAC/s", "GFLOP/s");
++    for (const auto &sh : shapes) {
++        const uint32_t M = sh.M, K = sh.K, N = sh.N;
++        std::vector<int8_t> A(static_cast<size_t>(M) * K);
++        std::vector<int8_t> Bm(static_cast<size_t>(K) * N);
++        std::vector<float> scale_a(M, 1.0f);
++        std::vector<float> scales_b(N, 1.0f);
++        std::vector<float> C(static_cast<size_t>(M) * N, 0.0f);
++        for (size_t i = 0; i < A.size(); ++i)
++            A[i] = static_cast<int8_t>((i * 37 + 11) % 255 - 127);
++        for (size_t i = 0; i < Bm.size(); ++i)
++            Bm[i] = static_cast<int8_t>((i * 53 + 7) % 255 - 127);
++
++        vnpu_packed_weights_t *packed = nullptr;
++        if (vnpu_pack_weights_i8(device, Bm.data(), scales_b.data(), K, N, 0, 0,
++                                 &packed) != VNPU_OK) {
++            std::fprintf(stderr, "bench-kernel: pack failed\n");
++            return 1;
++        }
++
++        vnpu::GemmI8Params p;
++        p.A = A.data();
++        p.scale_a = scale_a.data();
++        p.C = C.data();
++        p.M = M;
++        p.K = K;
++        p.N = N;
++        p.lda = K;
++        p.ldc = N;
++        p.epilogue = VNPU_EPILOGUE_NONE;
++        p.unit = VNPU_UNIT_VOODOO;
++        p.isa = device->cpu.isa;
++        p.has_vnni = device->has_vnni();
++        p.B.packed = packed->packed.data();
++        p.B.original = packed->original.data();
++        p.B.scales = packed->scales.data();
++        p.B.column_sums = packed->column_sums.data();
++        p.B.K = packed->K;
++        p.B.N = packed->N;
++        p.B.Kpad = packed->Kpad;
++        p.B.Npad = packed->Npad;
++        p.B.packed_bytes = packed->packed.size();
++
++        /* One tile over the whole matrix: no tiling effects, no culling. */
++        std::vector<vnpu::TileJob> tiles;
++        vnpu::TileJob t{};
++        t.m0 = 0;
++        t.n0 = 0;
++        t.tm = M;
++        t.tn = N;
++        t.tile_m = M;
++        t.tile_n = N;
++        t.tile_k = K;
++        t.cull = 0;
++        tiles.push_back(t);
++        p.tiles = &tiles;
++
++        std::vector<std::vector<uint8_t>> stores(1);
++        stores[0].resize(VNPU_LOCAL_STORE_BYTES + VNPU_CACHELINE_BYTES);
++        p.local_stores = &stores;
++        p.local_store_bytes = VNPU_LOCAL_STORE_BYTES;
++
++        for (int i = 0; i < 3; ++i) vnpu::kernel_gemm_i8_range(p, 0, 1, 0);
++        double best = 1e30;
++        const int reps = M <= 32 ? 60 : (M <= 128 ? 20 : 10);
++        for (int i = 0; i < reps; ++i) {
++            const double t0 = now_ms();
++            vnpu::kernel_gemm_i8_range(p, 0, 1, 0);
++            best = std::min(best, now_ms() - t0);
++        }
++        const double macs = static_cast<double>(M) * K * N;
++        char label[32];
++        std::snprintf(label, sizeof(label), "%ux%ux%u", M, K, N);
++        std::printf("%-22s %10.3f %12.2f %10.2f\n", label, best,
++                    macs / (best / 1000.0) / 1e6,
++                    macs * 2.0 / (best / 1000.0) / 1e9);
++        vnpu_packed_weights_destroy(packed);
++    }
++    vnpu_device_destroy(device);
++    return 0;
++}
+-- 
+2.39.5
+
