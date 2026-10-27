@@ -660,6 +660,20 @@ private:
     // decode), or every row (speculative verification).
     bool forward(const i32 *toks, i32 n, i32 pos0, bool want_logits);
     bool forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode);
+    // GPT-2 runs its own loop rather than threading four family-specific
+    // branches through forward_core: LayerNorm with a bias, learned absolute
+    // positions, a fused attn_qkv whose row is Q|K|V, and an ungated GELU MLP.
+    // Those four are one architecture, and a separate loop keeps every other
+    // family's graph literally unchanged.
+    bool gpt2_forward(const i32 *toks, i32 n, i32 pos0);
+    // LayerNorm with a bias, and the Q|K|V split of a fused projection row.
+    // Both are GPT-2-only and both go through the backend's own download /
+    // upload, so they are correct on every backend rather than only the one the
+    // author happened to run. Neither is hot: a LayerNorm here is E = 64 wide
+    // and the split is a strided copy, against E-by-3E GEMMs either side.
+    void layernorm(void *out, const void *x, const f32 *w, const f32 *b,
+                   i64 rows, i64 n, f32 eps);
+    void split_qkv(void *q, void *k, void *v, const void *qkv, i64 rows, i64 E);
     // This pass's input token ids (forward_core's `toks`), for the ONE consumer
     // that needs a vocabulary id rather than a position: DeepSeek-V4's hash
     // route selects experts BY TOKEN. A row index is not a token id -- on a
@@ -1209,6 +1223,10 @@ private:
     void *ws_k_ = nullptr;    // [chunk, kv_dim]
     void *ws_v_ = nullptr;    // [chunk, kv_dim]
     void *ws_attn_ = nullptr; // [chunk, q_dim]
+    // GPT-2's fused attn_qkv projection lands here: [chunk, 3*n_embd], one row
+    // of Q|K|V. Distinct from the GDN path's ws_qkv_ below, which is a
+    // conv-shaped buffer for a different mixer.
+    void *ws_qkv_fused_ = nullptr;
     void *ws_gate_ = nullptr; // [chunk, max(n_ff, n_ff_exp, n_ff_shexp)]
     void *ws_up_ = nullptr;   // [chunk, same]
     // prism.hadamard scratch: the transformed copy of a folded matmul's
