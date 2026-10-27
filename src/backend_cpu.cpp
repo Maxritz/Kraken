@@ -193,10 +193,13 @@ public:
         // though, and on this backend every entry in it is zero (see
         // rmsnorm_rows: f32 activations already hold the range), so an array of
         // zeros is the same request as no array and goes to the device.
-        bool scaling = row_exp != nullptr;
-        for (i64 r = 0; scaling && r < rows; r++) scaling = row_exp[r] != 0;
-        if (npu_ && !scaling && npu::rmsnorm(npu_, out, x, w, rows, n, eps))
-            return;
+        if (npu_) {
+            // The scan is O(rows) against O(rows*n) of work, and it only runs
+            // when a device is attached at all.
+            bool scaling = row_exp != nullptr;
+            for (i64 r = 0; scaling && r < rows; r++) scaling = row_exp[r] != 0;
+            if (!scaling && npu::rmsnorm(npu_, out, x, w, rows, n, eps)) return;
+        }
         npu_flush_();
         rmsnorm_rows(static_cast<f32 *>(out), static_cast<const f32 *>(x), w, rows,
                      n, eps, row_exp);
