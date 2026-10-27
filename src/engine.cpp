@@ -1823,6 +1823,21 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // allocated on top of them. Subtracting "what the workspaces will take"
     // is not the same thing as measuring it, and guessing it is how an
     // over-commit happens. So: take the measurement after the fact.
+    // Gemma 2's attention-logit bound is part of the model, not an
+    // optimization: cap * tanh(score / cap) before the softmax is a different
+    // probability distribution. A backend that cannot apply it must refuse
+    // before the first token, because the run would otherwise decode a model
+    // nobody asked for and look completely healthy doing it.
+    if (model_.cfg().attn_softcap > 0.0f && !be_->attention_softcap_supported()) {
+        *err = format(
+            "%s declares attention.logit_softcapping=%g, and this backend's "
+            "attention kernels do not apply cap*tanh(score/cap) before the "
+            "softmax. The reference body does: run --cpu, or --npu-cpu to keep "
+            "the GEMM on the virtual NPU with the reference attention",
+            model_.cfg().arch.c_str(), static_cast<double>(model_.cfg().attn_softcap));
+        return false;
+    }
+
     // Quantized K/V is validated before the cache is sized: a backend that
     // cannot read the layout must refuse, not run f16 kernels over int8 bytes
     // (which produces fluent text rather than an error).
@@ -2956,6 +2971,10 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     d.layer = 0;
     d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(mc.head_dim))) *
               mc.rope_attn_scale;
+    // gemma2's bound on the attention logits, applied inside attention. 0 on
+    // every other family, which is the arithmetic that existed before the field
+    // did.
+    d.softcap = mc.attn_softcap;
 
     // One dump hook per stage, taking the row this call will predict from (the
     // last one): a CPU run and a HIP run of the same prompt then differ at
@@ -4023,6 +4042,7 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
     d.window = 0;
     d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(hd))) *
               mc.rope_attn_scale;
+    d.softcap = mc.attn_softcap;
     // ---- which rotary, over how much of the head, over what window --------
     // The block inherits the stack's rotary, and on a hybrid that inheritance
     // has three parts that can each be wrong: the TABLE (a windowed model

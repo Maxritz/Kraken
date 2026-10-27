@@ -225,6 +225,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.rope_scale = static_cast<f32>(gguf_.get_f64(key(".rope.scaling.factor"), 1.0));
     cfg_.logit_softcap =
         static_cast<f32>(gguf_.get_f64(key(".final_logit_softcapping"), 0.0));
+    cfg_.attn_softcap =
+        static_cast<f32>(gguf_.get_f64(key(".attention.logit_softcapping"), 0.0));
     {
         const std::string st = gguf_.get_str(key(".rope.scaling.type"), "");
         if (st == "none" || st.empty()) cfg_.rope_scale = 1.0f;

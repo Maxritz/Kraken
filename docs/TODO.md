@@ -1013,9 +1013,20 @@ the suspect. Fix = take dequant off the critical path: double-buffered LDS, a
 - **Landed**: final-logit softcapping (one place, all paths); per-stage
   coherence instrumentation; `KRK_TIME` per-op timing with a filter; the
   coherence gate with instruct templates.
-- **Sliding-window attention** (per-layer patterns) — the arch table records it
-  as a blocker for gemma2/gemma3; needs the per-layer window in `AttnDesc` and
-  a mask in the attention kernels.
+- **Landed (reference backends)**: the attention-logit softcap
+  (`AttnDesc::softcap`, `cap * tanh(score / cap)` at score formation, i.e.
+  before the running max — not a transform of the result). gemma2 loads and runs
+  on `--cpu`, `--npu` and `--npu-cpu`; `test_attention_softcap` pins the
+  probabilities against an independently computed capped softmax, the masked-key
+  arm and the monotone-ranking property. Still open: the four HIP score paths
+  (decode, matrix-core prefill, bit-exact prefill, tiled) do not cap, so
+  `attention_softcap_supported()` answers false there and a `--device` run
+  refuses by name.
+- **Sliding-window attention** (per-layer patterns) — landed since: the arch
+  table carries the pattern (`swa_period`/`swa_window_first`) and the loader's
+  `is_swa()` sets `AttnDesc::window` per layer, which is how gemma2's
+  windowed-first period-2 stack runs. What is left is measured coverage of the
+  windowed range in the HIP kernels' own decode path.
 - **Per-layer input embeddings** (gemma4) — a second embedding table read per
   layer, plus the shared-KV 18-layer geometry it comes with.
 - **YaRN rope scaling** — `rope_scale`/`rope_frac` exist; YaRN needs the

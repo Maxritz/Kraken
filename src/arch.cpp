@@ -129,17 +129,24 @@ constexpr ArchSpec kTable[] = {
                "not validated against a file in this collection; the schema is "
                "llama plus embedding scaling, GeGLU and a final-logit softcap",
                0, false),
-    // Gemma 2: the alternating window (period 2, windowed layer first) is now
-    // read from this entry and the loader's is_swa() drives it, so that half is
-    // implemented. What is still missing is the softcap on the ATTENTION logits
-    // -- cap * tanh(score / cap) between the QK dot and the softmax, i.e.
-    // inside the kernel, where no host-side transform reaches. Softcapping the
-    // result afterwards is not the same function, so this stays refused rather
-    // than running a close approximation of the model.
-    gemma_spec("gemma2", ArchSupport::No,
-               "the attention-logit softcap (cap * tanh(score / cap) inside the "
-               "softmax) is not implemented; the alternating window, GeGLU and "
-               "the final-logit softcap are",
+    // Gemma 2: every piece of its schema is now implemented. The alternating
+    // window (period 2, windowed layer first) is read from this entry and the
+    // loader's is_swa() drives it; GeGLU, the embedding scaling and the
+    // final-logit softcap were already there; and the softcap on the ATTENTION
+    // logits -- cap * tanh(score / cap) between the QK dot and the softmax, i.e.
+    // inside the score formation rather than as a transform of the result,
+    // which is a different function -- is AttnDesc::softcap, applied by the
+    // reference attention and gated against a hand-computed softmax in the
+    // tests. The HIP kernels keep four score paths of their own and none caps
+    // yet, so that backend answers attention_softcap_supported() == false and
+    // Engine::init refuses the run by name rather than decoding a different
+    // model; --cpu and both NPU arms run it.
+    gemma_spec("gemma2", ArchSupport::Partial,
+               "the attention-logit softcap is applied by the reference "
+               "attention (--cpu, --npu, --npu-cpu) but not by the HIP "
+               "kernels, which refuse the run by name; the alternating window, "
+               "GeGLU and the final-logit softcap are implemented; not "
+               "validated against a gemma2 file in this collection",
                2, true),
     // Gemma 3: QK-norm, GeGLU, embedding scaling, a final-logit softcap and a
     // 5:1 local/global pattern (period 6, windowed layers first, 1024-token

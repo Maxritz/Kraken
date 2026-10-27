@@ -128,6 +128,21 @@ struct AttnDesc {
     i64 layer_stride = 0;  // elements between layers in the KV cache
     i64 pos_stride = 0;    // elements between positions in the KV cache
     f32 scale = 1.0f;      // 1/sqrt(hd)
+    // Attention-logit bound (Gemma 2 carries `attention.logit_softcapping` =
+    // 50): every score becomes cap * tanh(score / cap) AT SCORE FORMATION,
+    // before the running max and therefore before the softmax. This is not an
+    // equivalent rewrite of a transform on the result -- tanh is monotone, but
+    // the softmax sees capped scores, so the probabilities are those of the
+    // capped vector and not a monotone image of the uncapped ones. 0 (the
+    // default) caps nothing, and the cap lives strictly inside
+    // `if (softcap > 0)`, so every model that never sets it runs the same
+    // arithmetic in the same order it always did.
+    //
+    // Masked keys keep -inf: the cap is applied where the dot product is,
+    // never to the mask, which would turn a masked key into a visible one.
+    // The sink is a denominator-only term with no score behind it, so it is
+    // not capped either.
+    f32 softcap = 0.0f;
     bool causal = true;
     // Sliding-window bound: when > 0 a query attends only to the `window`
     // most recent keys, i.e. key j is visible when j >= n_keys - window.
@@ -982,6 +997,13 @@ public:
     // approximate prefill (a matrix-core flash attention, say) keeps it out of
     // this mode rather than making the hash depend on which kernel ran.
     virtual void set_attn_hash_mode(bool) {}
+
+    // Whether attention() applies AttnDesc::softcap. The reference body does.
+    // The HIP kernels keep four separate score paths (decode, matrix-core
+    // prefill, bit-exact prefill, tiled) and none of them caps yet, so that
+    // backend answers false and Engine::init refuses such a run BY NAME
+    // instead of decoding a model whose attention is a different function.
+    virtual bool attention_softcap_supported() const { return true; }
 
     // Quantized KV. A backend that cannot read a format says so instead of
     // running the f16 path over int8 bytes, which would be fluent nonsense:

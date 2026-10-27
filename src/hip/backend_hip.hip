@@ -3765,6 +3765,14 @@ public:
                                           pos_dev_, d.n_tok, d.pos_stride);
     }
 
+    // The four score paths below (decode, matrix-core prefill, bit-exact
+    // prefill, tiled) each format and reduce their own scores, and none caps
+    // them. Rather than run a model whose attention is a different function or
+    // claim a capability this build does not have, this says so and Engine::init
+    // refuses the run by name. The reference body (--cpu, and the attention of
+    // both NPU arms) implements it.
+    bool attention_softcap_supported() const override { return false; }
+
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {
         KRK_TIME_OP("attention");

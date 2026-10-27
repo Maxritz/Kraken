@@ -4099,10 +4099,20 @@ static void test_arch_table() {
           "gemma2 alternates every layer, windowed first");
     CHECK(arch_lookup("gemma3")->support != ArchSupport::No,
           "and gemma3 is no longer refused for a window the engine can do");
-    CHECK(arch_lookup("gemma2")->support == ArchSupport::No &&
-              std::string(arch_lookup("gemma2")->why).find("softcap") !=
+    // gemma2 was refused for one gap: the bound on the ATTENTION logits, which
+    // belongs inside the score formation and cannot be reproduced by a
+    // host-side transform of the result. The reference attention applies it now
+    // (test_attention_softcap pins the arithmetic), so the schema loads. The
+    // why-text must still name the softcap, because the HIP kernels do not cap
+    // and refuse the run by name -- a Partial that did not say so would read as
+    // "the gap is closed everywhere".
+    CHECK(arch_lookup("gemma2")->support == ArchSupport::Partial,
+          "gemma2 loads now that the reference attention bounds its logits");
+    CHECK(std::string(arch_lookup("gemma2")->why).find("softcap") !=
+                  std::string::npos &&
+              std::string(arch_lookup("gemma2")->why).find("HIP") !=
                   std::string::npos,
-          "gemma2 stays refused for the one gap it has: the attention softcap");
+          "and still names the softcap, because the HIP kernels do not cap");
 
     CHECK(arch_lookup("") == nullptr, "the empty arch name is not in the table");
     CHECK(arch_lookup("no-such-arch-anywhere") == nullptr,
@@ -7857,6 +7867,159 @@ static void test_nvfp4_sidecar_dflash() {
 // perturbation, because invariance under a change the row cannot see IS the
 // property -- and a no-op mask cannot fake it, since the same perturbation must
 // move the row when the mask is off.
+// Gemma 2's attention-logit bound (AttnDesc::softcap): every score becomes
+// cap * tanh(score / cap) at score formation, so the softmax runs on the capped
+// vector. The distinction matters -- tanh is monotone, but the probabilities
+// are those of the capped vector, not a monotone image of the uncapped ones --
+// and it is the reason the bound cannot be applied to the attention output.
+//
+// The fixture makes the arithmetic checkable by hand: unit-norm keys along one
+// axis so the raw scores are exactly 0, 4, 8, and value rows that are the basis
+// vectors e0, e1, e2, so the last row's four outputs ARE the three softmax
+// probabilities. Expected values are computed here in double from the formula,
+// not from the backend.
+static void test_attention_softcap() {
+    Backend *cpu = make_cpu_backend();
+    CHECK(cpu->attention_softcap_supported(),
+          "the reference attention applies the attention-logit bound");
+    const i64 nh = 1, nkv = 1, hd = 4, nt = 3, npos = 3;
+    const i64 kv_dim = nkv * hd;
+    const i64 layer_stride = npos * kv_dim;
+    const f32 raw[3] = {0.0f, 4.0f, 8.0f};
+
+    std::vector<f32> kc(static_cast<size_t>(layer_stride), 0.0f);
+    std::vector<f32> vc(static_cast<size_t>(layer_stride), 0.0f);
+    for (i64 j = 0; j < nt; j++) {
+        kc[static_cast<size_t>(j * kv_dim + 0)] = raw[j]; // dot with q = raw[j]
+        vc[static_cast<size_t>(j * kv_dim + j)] = 1.0f;    // e_j
+    }
+    std::vector<f32> q(static_cast<size_t>(nt * nh * hd), 0.0f);
+    for (i64 t = 0; t < nt; t++) q[static_cast<size_t>(t * hd + 0)] = 1.0f;
+
+    AttnDesc d;
+    d.n_head = nh;
+    d.n_kv = nkv;
+    d.hd = hd;
+    d.n_tok = nt;
+    d.pos0 = 0;
+    d.pos_stride = kv_dim;
+    d.layer_stride = layer_stride;
+    d.scale = 1.0f;   // the scores ARE the dots, which is what makes them exact
+    d.causal = true;
+
+    // The three probabilities of a capped softmax, in double. `lo` and `hi` are
+    // the visible key indices (the mask arms below narrow this).
+    auto probs = [](const f32 *scores, i64 n, f64 cap) {
+        std::vector<f64> v(static_cast<size_t>(n));
+        f64 mx = -1e300, sum = 0.0;
+        for (i64 j = 0; j < n; j++) {
+            v[static_cast<size_t>(j)] =
+                cap > 0.0 ? cap * std::tanh(static_cast<f64>(scores[j]) / cap)
+                          : static_cast<f64>(scores[j]);
+            mx = std::max(mx, v[static_cast<size_t>(j)]);
+        }
+        for (i64 j = 0; j < n; j++) {
+            v[static_cast<size_t>(j)] = std::exp(v[static_cast<size_t>(j)] - mx);
+            sum += v[static_cast<size_t>(j)];
+        }
+        for (i64 j = 0; j < n; j++) v[static_cast<size_t>(j)] /= sum;
+        return v;
+    };
+    // Row `t` sees keys [0, t]; its output is sum_j p_j e_j, so out[t][j] == p_j
+    // for the visible j and 0 otherwise.
+    auto check_rows = [&](const std::vector<f32> &out, f64 cap,
+                          const char *what) {
+        bool ok = true;
+        for (i64 t = 0; t < nt; t++) {
+            const std::vector<f64> want = probs(raw, t + 1, cap);
+            for (i64 j = 0; j < t + 1; j++) {
+                const f64 got = out[static_cast<size_t>(t * hd + j)];
+                if (!(std::fabs(got - want[static_cast<size_t>(j)]) < 2e-6)) ok = false;
+            }
+            // A key outside the causal prefix must contribute nothing at all.
+            for (i64 j = t + 1; j < hd; j++)
+                if (out[static_cast<size_t>(t * hd + j)] != 0.0f) ok = false;
+            const f64 sum = out[static_cast<size_t>(t * hd + 0)] +
+                            out[static_cast<size_t>(t * hd + 1)] +
+                            out[static_cast<size_t>(t * hd + 2)];
+            if (!(std::fabs(sum - 1.0) < 2e-6)) ok = false;
+        }
+        CHECK(ok, what);
+    };
+
+    // ---- 1. the uncapped arm: the arithmetic that predates the field ------
+    std::vector<f32> out_default(static_cast<size_t>(nt * nh * hd), 0.0f);
+    std::vector<f32> out_zero(static_cast<size_t>(nt * nh * hd), 0.0f);
+    cpu->attention(out_default.data(), q.data(), kc.data(), vc.data(), d);
+    AttnDesc z = d;
+    z.softcap = 0.0f;
+    cpu->attention(out_zero.data(), q.data(), kc.data(), vc.data(), z);
+    CHECK(std::memcmp(out_default.data(), out_zero.data(),
+                      out_default.size() * sizeof(f32)) == 0,
+          "an unset softcap and an explicit 0 are the same call: the field "
+          "cannot change a model that does not carry it");
+    check_rows(out_default, 0.0, "and it is the plain softmax of the raw scores");
+
+    // ---- 2. the capped arm, against the formula --------------------------
+    std::vector<f32> out_cap(static_cast<size_t>(nt * nh * hd), 0.0f);
+    AttnDesc c = d;
+    c.softcap = 2.0f;
+    cpu->attention(out_cap.data(), q.data(), kc.data(), vc.data(), c);
+    check_rows(out_cap, 2.0,
+               "cap*tanh(score/cap) at score formation: the probabilities are "
+               "the capped softmax's, computed independently in double");
+    // Row 2 is where the bound bites: raw scores 0/4/8 would put 98% of the
+    // mass on the last key; capped at 2 the split is ~0.07/0.45/0.48.
+    CHECK(out_cap[static_cast<size_t>(2 * hd + 2)] < 0.60f &&
+              out_cap[static_cast<size_t>(2 * hd + 2)] > 0.40f,
+          "the bound compresses a 0/4/8 score spread towards uniform, which is "
+          "the whole point of it");
+    CHECK(out_default[static_cast<size_t>(2 * hd + 2)] > 0.95f,
+          "and the uncapped arm keeps the peak, so the two arms are not the "
+          "same computation");
+    CHECK(std::memcmp(out_cap.data(), out_default.data(),
+                      out_cap.size() * sizeof(f32)) != 0,
+          "a run that sets the field and one that does not cannot agree");
+
+    // ---- 3. the mask is not a score --------------------------------------
+    // skip_from makes key 1 invisible to row 2, and the reference represents
+    // that as -FLT_MAX. If the bound were applied to the sentinel it would
+    // become -cap, i.e. exp(-2 - m) of real probability on a key the model
+    // asked to hide. Row 2 must be the capped softmax of {0, 2} only.
+    std::vector<f32> out_mask(static_cast<size_t>(nt * nh * hd), 0.0f);
+    AttnDesc m = c;
+    m.skip_from = 1;
+    cpu->attention(out_mask.data(), q.data(), kc.data(), vc.data(), m);
+    {
+        const f32 visible[2] = {raw[0], raw[2]};
+        const std::vector<f64> want = probs(visible, 2, 2.0);
+        const f64 p0 = out_mask[static_cast<size_t>(2 * hd + 0)];
+        const f64 p2 = out_mask[static_cast<size_t>(2 * hd + 2)];
+        CHECK(std::fabs(p0 - want[0]) < 2e-6,
+              "a masked key contributes nothing even when the bound is on: it "
+              "is a mask, not a score");
+        CHECK(std::fabs(p2 - want[1]) < 2e-6, "and the visible keys renormalize");
+
+        // The bound's own renormalization is the counter-check: with the same
+        // cap but no mask, key 1 takes a share. If the two arms agreed here the
+        // mask test would be vacuous.
+        CHECK(std::fabs(p0 - out_cap[static_cast<size_t>(2 * hd + 0)]) > 1e-4,
+              "and that is a different split from the unmasked row's");
+    }
+
+    // ---- 4. the cap is monotone, so ranking survives ---------------------
+    // A bound this aggressive still must not reorder the scores: the visible
+    // key with the largest dot keeps the largest probability.
+    CHECK(out_cap[static_cast<size_t>(2 * hd + 2)] >
+              out_cap[static_cast<size_t>(2 * hd + 1)] &&
+              out_cap[static_cast<size_t>(2 * hd + 1)] >
+                  out_cap[static_cast<size_t>(2 * hd + 0)],
+          "tanh is monotone, so the bound changes the distribution and not the "
+          "ordering");
+
+    delete cpu;
+}
+
 static void test_attention_self_mask() {
     Backend *cpu = make_cpu_backend();
     const i64 nh = 2, nkv = 2, hd = 8, nt = 3;
@@ -17494,6 +17657,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_gdn_model_loads)
     TEST_GROUP(test_gdn_generation)
     TEST_GROUP(test_speculative_decoding)
+    TEST_GROUP(test_attention_softcap)
     TEST_GROUP(test_attention_self_mask)
     TEST_GROUP(test_dflash_mask_guard)
     TEST_GROUP(test_nvfp4_sidecar_dflash)

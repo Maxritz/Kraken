@@ -520,7 +520,14 @@ public:
                                                    sc[c / 32];
                                     dot += qh[i] * kv;
                                 }
-                                scores[static_cast<size_t>(j)] = dot * d.scale;
+                                // Gemma 2's attention-logit bound, applied
+                                // where the score is formed (see
+                                // AttnDesc::softcap); the masked branch above
+                                // never reaches here, so the mask stays -inf.
+                                f32 sv = dot * d.scale;
+                                if (d.softcap > 0.0f)
+                                    sv = d.softcap * std::tanh(sv / d.softcap);
+                                scores[static_cast<size_t>(j)] = sv;
                             }
                             f32 mx = scores[0];
                             for (i64 j = 1; j < n_vis; j++)
@@ -600,7 +607,9 @@ public:
                             const f32 *kj = kc + (j_lo + j) * d.pos_stride + hkv * d.hd;
                             f32 dot = 0;
                             for (i64 i = 0; i < d.hd; i++) dot += qh[i] * kj[i];
-                            scores[static_cast<size_t>(j)] = dot * d.scale;
+                            f32 sv = dot * d.scale;
+                            if (d.softcap > 0.0f) sv = d.softcap * std::tanh(sv / d.softcap);
+                            scores[static_cast<size_t>(j)] = sv;
                         }
                         f32 mx = scores[0];
                         for (i64 j = 1; j < n_vis; j++)

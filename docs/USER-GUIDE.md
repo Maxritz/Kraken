@@ -172,6 +172,14 @@ The LLaMA-family tensor schema, `blk.N.attn_*` / `blk.N.ffn_*`:
 Grouped-query attention, per-head QK RMSNorm, QKV biases, tied embeddings and
 partial RoPE are all handled.
 
+Gemma 2's two softcaps are both applied: the final-logit one (`cap *
+tanh(logit / cap)` before sampling) and the ATTENTION-logit one
+(`attention.logit_softcapping`), which has to land inside the score formation
+because the softmax runs on the capped scores. The reference attention
+implements it, so `--cpu`, `--npu` and `--npu-cpu` run gemma2; the HIP kernels
+keep four score paths of their own and none caps yet, so a device run refuses
+by name rather than decoding a model whose attention is a different function.
+
 **Mixture-of-Experts** — `qwen2moe`, `qwen3moe`, and any arch emitting the
 standard `blk.N.ffn_gate_inp.weight` router plus `ffn_{gate,up,down}_exps`
 expert tensors. Qwen2-MoE's always-on shared expert is supported. Whether a
