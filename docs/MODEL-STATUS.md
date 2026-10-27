@@ -52,6 +52,37 @@ runtime, SDK 7.16.26331, Release.**
 compared across rows. `HOT %` is the expert cache's hit share and is blank on a
 dense model, which has no expert tier.
 
+## A note on the prefill column
+
+**The sweep above is the HIP arm and predates the CPU prefill fix; it is not
+re-run here because this sandbox has no GPU (HIP off).** Do not read the CPU
+numbers below as contradicting it -- they are a different backend.
+
+The CPU backend had a defect that made prefill unamortized: `gemm()` called
+`vec_dot()` once per (row, output) element, and `vec_dot()` decodes a weight row
+as it goes, so every weight row was decoded once per ROW of the batch. The
+signature in this table is the prefill:decode ratio. A batched GEMM should show
+a large one; a GEMV times N rows shows the ratio of a single-token read. Values
+near 1 mean prefill was not batching at all.
+
+Measured on the CPU fixture (2 GiB q8_0 MoE, 2 vCPU), before and after:
+
+| prompt tokens | before | after | speedup |
+|---|---:|---:|---:|
+| 58 | 1833 ms | 804 ms | 2.28x |
+| 149 | 4438 ms | 1495 ms | 2.97x |
+| 331 | 9300 ms | 2778 ms | 3.35x |
+| 695 | 19575 ms | 6760 ms | 2.90x |
+
+and on a 1 GiB f16 dense file, 3.8-4.3x (details and the bit-identity witnesses:
+[MOE-RESIDENCY.md §7](MOE-RESIDENCY.md)).
+
+The same defect **cannot be ruled out on the GPU arm** -- it would show up in
+this table as a prefill:decode ratio far below what the card can do, and several
+rows have exactly that shape (Underdog-Saluki-27B 7.3, omnicoder-9b 4.3,
+Laguna-S-2.1 1.2). Confirming or clearing it needs a run on the card; nothing in
+this document claims a GPU number that was not measured on a GPU.
+
 ## What the numbers say
 
 * **Prefill is the weak number on the larger dense files.** Underdog-Saluki-27B

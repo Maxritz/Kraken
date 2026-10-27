@@ -319,6 +319,28 @@ public:
         // is ~91% of decode FLOPs and parallelizes across all cores.
         const i64 total = rows * n_out;
         const i64 grain = std::max<i64>(32, std::min<i64>(2048, n_out / 32));
+
+        // Batched prefill. The loop below splits on (row, column) and calls
+        // vec_dot() per element, and vec_dot() decodes the weight as it goes --
+        // so a batch of `rows` decoded every weight row `rows` times and
+        // prefill ran at GEMV speed. Measured on the 2 GiB q8_0 MoE at --cpu
+        // with KRK_CPU_DOT_AVX2=1: prefill cost per token was FLAT at 34.1,
+        // 29.1, 27.8 and 28.3 ms across prompts of 58, 149, 331 and 695 tokens,
+        // where a batched GEMM must fall steeply. vec_dot_tiled() decodes each
+        // weight block once and reuses it across a tile of rows, and returns
+        // bit-identical values, so this changes speed and nothing else.
+        //
+        // Kept to rows > 1: at rows == 1 (every decode step) there is nothing
+        // to amortize, and the fused kernel below is the better shape.
+        if (rows > 1 && n_in > 0) {
+            const i64 tile = std::max<i64>(1, std::min<i64>(64, n_out));
+            par_for(n_out, tile,
+                    2.0 * static_cast<f64>(total) * static_cast<f64>(n_in),
+                    [&](i64 b, i64 e) {
+                        vec_dot_tiled(wt, w, xf, n_in, b, e, rows, of, n_out);
+                    });
+            return;
+        }
         par_for(total, grain, 2.0 * static_cast<f64>(total) * n_in,
                 [&](i64 b, i64 e) {
                     i64 r = b / n_out;

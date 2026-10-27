@@ -84,6 +84,35 @@ prefill is a union problem, and `--expert-cache-mb` is one knob for both. Size
 it for prefill to avoid churn; size it for decode to save memory and accept
 re-reads during prefill.
 
+### The prefill defect, and the number behind it
+
+Prefill was not batching. `gemm()` called `vec_dot()` once per (row, output)
+element and `vec_dot()` decodes the weight as it goes, so every weight row was
+decoded once per ROW of the batch; weight traffic was `rows x` the matrix. The
+tell was that cost per prefilled token was FLAT -- 34.1, 29.1, 27.8, 28.3 ms at
+58, 149, 331 and 695 tokens -- where a GEMM must fall steeply.
+
+`vec_dot_tiled()` decodes each block once into registers and FMAs it against a
+tile of eight rows: hand-written for q8_0/q4_0, an F16C tile for f16/f32, and a
+generic tile for every other block format (Q4_K, Q5_K, Q6_K, iq-quants). Same
+flags, parent commit against this one: **2.28-3.35x** on the q8_0 MoE and
+**3.83-4.29x** on a 1 GiB f16 dense file.
+
+Results are bit-identical, not close: each kernel performs the same operations
+in the same order as the path it replaces. `test_gemm_batched_bit_identical`
+(100 checks: 5 formats x 4 arms x 5 tile widths, `memcmp` against `vec_dot()`)
+and an unchanged `--prefill-hash` end to end on both a q8_0 MoE and an f16 dense
+file. The first attempt -- widening each weight row to f32 and reusing it -- was
+1.9x SLOWER and was reverted; it is written up in
+[MOE-RESIDENCY.md §7](MOE-RESIDENCY.md) because it is the obvious first idea.
+
+**This also changed the residency conclusion.** Prefill used to look immune to
+expert residency (13.68 s against 13.95 s). It looked that way because compute
+was dominating for the wrong reason: with the GEMM fixed, the expert read is 61%
+of a streamed prefill at a 64 MiB budget, so `--expert-warm-mb` and the device
+budget now matter for prefill as well. The ladder below is the pre-fix record
+and is kept for its decode column, which is still current.
+
 ### The measured ladder (2026-10-27)
 
 Full tables in [MOE-RESIDENCY.md](MOE-RESIDENCY.md); the shape of the result, on
@@ -206,6 +235,15 @@ Dense models split across RAM and VRAM through the **tiering** machinery
 HIP backend's weight residency. There is **no dense layer-streaming path** that
 pages dense weights from disk on demand — the expert cache is the only
 streaming tier, and that is a genuine gap for dense models larger than RAM.
+
+### The prefill GEMM (2026-10-27)
+
+`gemm()` on the CPU backend was not batching: it called `vec_dot()` per
+`(row, output)` element, and `vec_dot()` decodes the weight row as it goes, so
+every weight row was decoded once per row of the batch. `vec_dot_tiled()` decodes
+each block once into registers and reuses it across eight rows; 2.28-3.35x on
+the q8_0 MoE and 3.83-4.29x on f16 dense, bit-identical, decode untouched. Full
+write-up and the rejected first attempt: [MOE-RESIDENCY.md §7](MOE-RESIDENCY.md).
 
 ## 6. The NPU path
 

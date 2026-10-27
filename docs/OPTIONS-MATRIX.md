@@ -38,13 +38,14 @@ unless the row says otherwise.
 | `KRK_NPU_ATTN=1` | attention on the device | 34.8 → 32.8 ms decode, 3597.9 → 3557.5 ms prefill (small, additive to w8a8) |
 | `--expert-cache-mb N` | device expert budget | the decode lever: 41.1 ms (resident) → 73.6 ms (64 MiB) → 74.6 ms (16 MiB). Prefill unmoved (3.82–3.94 s) |
 | `--expert-warm-mb N` | host-RAM WARM tier for evicted experts | read **2519 → 246 MiB (0.10×)** at a 64 MiB device budget; decode 73.6 → 70.5 ms |
-| `--chunk N` | prefill batch | 8 → 4739.3 ms and 3907 MiB read; **128 → 3858.4 ms and 1372 MiB**. Below 128 the gathers repeat |
+| `--chunk N` | prefill batch | 8 → 4739.3 ms and 3907 MiB read; **128 → 3858.4 ms and 1372 MiB**. Below 128 the gathers repeat. (Pre-batched-GEMM numbers; the ratio holds, the absolute times are now ~4x lower) |
 | `--threads N` | host workers | 1 vs 2: prefill **5307.9 vs 2940.9 ms (1.80×)**, decode **73.8 vs 73.6 ms (nothing)** |
 | `--kv-quant int8` | int8 KV cache | on this fixture **costs** 8% of prefill (3185.3 vs 2940.9 ms) and saves nothing: KV is 4×64 over 20 layers. Worth it only when the cache is large relative to the model |
 | `--hybrid-experts 1` | overflow experts computed on the host out of the mapping | 73.6 → 72.7 ms decode at 64 MiB (1.2%) |
 | `--router-resident P` | let a near-tied pick land on an already-resident expert | **no effect at 64 MiB** (0.0% HOT): there is no resident tier to prefer. It reorders picks among resident experts |
 | `--vram-tier`, `--ram-tier`, `--host-ram-mb`, `--vram-cap-mb` | plan for a smaller machine than the installed one | planning only, clamped to what is installed; no throughput claim here (GPU arms unmeasured) |
 | `--cpu` | scalar reference | 3.5× slower than AVX2 on prefill, by design. It is the accuracy witness, not the fast path |
+| *(no flag)* the batched prefill GEMM | decodes each weight block once per 8 rows instead of once per row | **2.28–3.35×** on the q8_0 MoE, **3.83–4.29×** on f16 dense. Always on; bit-identical to the old path ([MOE-RESIDENCY.md §7](MOE-RESIDENCY.md)) |
 
 ## 2. Correctness and determinism opt-ins
 

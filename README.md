@@ -255,48 +255,77 @@ went from 135 ms to 27 ms with byte-identical text. A request that fails clears
 the cache entry rather than leaving rows behind that a later prompt would assume
 were its own.
 
+## Prefill
+
+Prefill was running at GEMV speed. `gemm()` split its work over the flat
+`(row, output)` index space and called `vec_dot()` per element, and `vec_dot()`
+decodes a weight row as it goes -- so every weight row was decoded once **per
+row of the batch** instead of once per chunk. The signature was that cost per
+prefilled token did not fall with batch size: flat at 34.1, 29.1, 27.8, 28.3 ms
+across prompts of 58, 149, 331 and 695 tokens.
+
+`vec_dot_tiled()` decodes each weight block once into registers and reuses it
+across a tile of eight rows. Same flags, parent commit's binary against this one:
+
+| model | prompt tok | before | after | speedup |
+|---|---:|---:|---:|---:|
+| 2 GiB q8_0 MoE, `KRK_CPU_DOT_AVX2=1` | 331 | 9300 ms | 2778 ms | **3.35x** |
+| | 695 | 19575 ms | 6760 ms | **2.90x** |
+| 1 GiB f16 dense | 149 | 14348 ms | 3348 ms | **4.29x** |
+
+It is a speed change and nothing else: every kernel does the same operations in
+the same order as the path it replaces, so results are **bit-identical**, not
+close. `test_gemm_batched_bit_identical` compares 5 formats against `vec_dot()`
+with `memcmp` across 4 arms and 5 tile widths (100 checks), and `--prefill-hash`
+is unchanged end to end on both a q8_0 MoE and an f16 dense file. Decode is
+untouched -- at `rows == 1` there is nothing to amortize, so it keeps the old
+path.
+
+Covered formats: `q8_0`, `q4_0` (hand-written AVX2 kernels), `f16`, `f32` (F16C),
+and every other block format through a generic tile -- Q4_K, Q5_K, Q6_K,
+iq-quants, which is most of a real collection. Unlisted formats and hosts
+without the ISA fall back to the per-element path rather than refusing.
+
+Method, the rejected first attempt, and the arm table: [docs/MOE-RESIDENCY.md](docs/MOE-RESIDENCY.md) §7.
+
 ## MoE under a RAM limit
 
-The question this project gets asked most: **can I run a big MoE with only a few
-experts in RAM, and what does that cost me?** Measured on a 1.2 GiB q8_0 MoE
-(20 layers, 32 experts, top-4) on 2 vCPU / 3.9 GiB, no GPU. Full tables and
-method in [docs/MOE-RESIDENCY.md](docs/MOE-RESIDENCY.md).
+Can you run a big MoE with a few experts in RAM and the rest on disk? Full
+tables in [docs/MOE-RESIDENCY.md](docs/MOE-RESIDENCY.md).
 
-| | all experts resident | 64 MiB of experts, rest on disk |
+| | all experts resident | 64 MiB, rest on disk |
 |---|---:|---:|
-| prefill, AVX2 dot | 3.94 s | 3.82 s |
-| decode, AVX2 dot | 41.1 ms/token | 73.6 ms/token |
-| read from disk | 369 MiB | 2519 MiB |
+| prefill, AVX2 dot | 1020 ms | 857 ms |
+| decode, AVX2 dot | 61.1 ms/token | 75.3 ms/token |
+| expert read | 307 ms | 521 ms |
+| read share of prefill | 30% | **61%** |
 
-**Prefill does not care how much of the model is resident; decode cares
-completely.** Prefill amortises one expert gather per layer across a chunk of
-rows, so the arithmetic hides the I/O — the expert path is 533 ms of a 3858 ms
-prefill (14%) at a 64 MiB budget. Decode has one row and nothing to hide behind,
-so the same gathers are the whole cost, and it pays 1.79×. Three consequences
-worth knowing before tuning anything:
+Before the prefill fix this table said residency did not matter for prefill at
+all (13.95 s against 13.68 s). It read that way because prefill was not batching:
+once compute stopped dominating, the expert read became the majority of a
+streamed prefill. **So `--expert-warm-mb` and the device budget now matter for
+prefill too**, which they did not before.
+
+Three things worth knowing before tuning:
 
 - `--expert-warm-mb` is the lever, not the device budget. A 512 MiB host WARM
-  tier at a 64 MiB device budget cut the read from 2519 to 246 MiB (**0.10×**).
-- `--chunk` multiplies fetches. Chunk 8 re-fetches per 8 rows: 3907 MiB read and
-  4739 ms prefill, against 1372 MiB and 3858 ms at chunk 128.
-- `--threads` moves prefill 1.80× and decode not at all. Prefill is compute,
-  decode is bytes.
+  tier at a 64 MiB device budget cut the read from 2519 to 246 MiB (**0.10x**).
+- `--chunk` multiplies fetches. Chunk 8 re-fetches per 8 rows: 3907 MiB read
+  against 1372 MiB at chunk 128.
+- `--threads` halves prefill 1.80x and moves decode not at all. Decode is bytes;
+  prefill is arithmetic and, now, some bytes too.
 
-The arms do not agree about which is fastest, and both answers are real: **AVX2
-CPU wins prefill** (2.84 s vs 3.41 s) and **the virtual NPU wins decode**
-(32.8 ms/token with `KRK_NPU_W8A8=1 KRK_NPU_ATTN=1`, against 42.0 ms on CPU) —
-but only while the experts are resident. With experts streaming, the NPU arm's
-decode collapses 12.7× (32.8 → 416 ms) where the CPU's costs 1.79×, because the
-int8 pack is memoized per weight address and a streaming slot changes address
-every visit. That defect, the fix that was tried and rejected on measurement, and
-the exact numbers are in
-[docs/MOE-RESIDENCY.md §5](docs/MOE-RESIDENCY.md). **Until it is fixed, do not
-combine `KRK_NPU_W8A8=1` with forced streaming** (149.0 ms/token against 718.7).
+The arms disagree, and the fix changed which one wins: **AVX2 CPU prefills 3.2x
+faster than the virtual NPU** (1071 ms against 3386 ms) and the **NPU keeps the
+decode win** (33.4 ms against 58.2 ms). With experts streaming the NPU's decode
+collapses 12.7x (32.8 -> 416 ms) where the CPU's costs 1.79x, because the int8
+pack is memoized per weight address and a streaming slot changes address every
+visit -- **do not combine `KRK_NPU_W8A8=1` with forced streaming** (149.0
+ms/token against 718.7). That defect and the fix that was tried and rejected on
+measurement are in [docs/MOE-RESIDENCY.md §5](docs/MOE-RESIDENCY.md).
 
 Every switch, the arm it belongs to and what it is worth:
-[docs/OPTIONS-MATRIX.md](docs/OPTIONS-MATRIX.md) — 66 flags and 200+ environment
-variables, the ones that decide throughput first, the full list by owning file at
-the end.
+[docs/OPTIONS-MATRIX.md](docs/OPTIONS-MATRIX.md).
 
 ```sh
 # keep 64 MiB of experts on the device and a 512 MiB warm tier in host RAM

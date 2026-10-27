@@ -1624,6 +1624,31 @@ code, the README, or `docs/`.
 
 ## Measuring performance (the expensive lessons)
 
+- **A GEMM whose cost per token does not fall with batch size is not a GEMM.**
+  This is the cheapest diagnostic in the file and it was missed for a long time:
+  `gemm()` split over the flat `(row, output)` space and called `vec_dot()` per
+  element, and `vec_dot()` decodes the weight row as it goes -- so every weight
+  row was decoded once per ROW of the batch and weight traffic was `rows x` the
+  matrix. Cost per prefilled token was flat at 34.1, 29.1, 27.8, 28.3 ms at 58,
+  149, 331 and 695 tokens. It is invisible at `rows == 1`, which is why decode
+  always looked healthy and only prefill was "slow". When a prefill number looks
+  bad, sweep the prompt length FIRST: if ms/token does not fall, stop looking at
+  the kernel's FLOPs and look at what it re-reads.
+- **Hoisting the decode out of the row loop is only a win if you keep it in
+  registers.** The obvious fix -- dequantize each weight row into an f32 buffer
+  once, then run the old dot against it -- is bit-identical, much simpler, and
+  **1.9x SLOWER** (63.5 against 34.1 ms/token): it writes 4x the weight bytes and
+  replaces a fused vector decode with a scalar one. Tile it instead: decode a
+  block once into registers and FMA it against 8 rows.
+- **When you reshape a reduction, prove bit-identity or do not ship it.**
+  `vec_dot_tiled()` reproduces `vec_dot()`'s own accumulation shape per (weight
+  row, activation row) pair, so `--prefill-hash` is unchanged. Two things caught
+  real bugs while writing it, both invisible to a tolerance test: the four-lane
+  arm uses a FUSED multiply-add where the host has F16C (a separate multiply and
+  add disagrees in the last few ulp), and F32 takes the vector path on an F16C
+  host while F16 does too. Test with `memcmp`, across every arm and every format,
+  including the rows that fall off the tile.
+
 - **Never trust a probe whose arms ran in sequence.** Page cache and
   driver state warm between arms, and the ordering alone is worth several GB/s.
   Every A/B must be interleaved run-by-run, and a win must hold across
