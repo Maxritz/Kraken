@@ -163,7 +163,26 @@ void dequant_row_f16(DType t, const void *src, u16 *out, i64 n);
 
 // y = dot(dequant(src), x) over n elements. This is the reference GEMV inner
 // product; the device `dot_*` kernels are validated against it.
+//
+// OPT-IN FAST PATH (block formats only). The default path accumulates the whole
+// row into ONE f32 chain, which is what makes it the oracle: every device kernel
+// is compared against these exact rounding. That single chain is also a serial
+// dependency -- one FMA waiting four cycles on the previous one -- so a q4_0 or
+// q8_0 row runs at ~0.65 G element/s per thread no matter how wide the SIMD is.
+//
+// `set_vec_dot_fast(true)` (or KRK_CPU_DOT_FAST=1 in the environment) switches
+// the block formats to four accumulators combined as (a0+a1)+(a2+a3). That is
+// the same shape the f16 path already uses and it is ~3x faster, but it is a
+// DIFFERENT summation order: results agree with the reference to within a few
+// ulp and are no longer bit-identical to it. That is why it is off by default,
+// why the CPU backend stops being a bit-exact oracle while it is on, and why
+// every comparison against a device backend must be run with it off.
+//
+// The f16/f32 paths are exact under either setting (same four lanes, same
+// order) and do not consult this flag.
 f32 vec_dot(DType t, const void *src, const f32 *x, i64 n);
+void set_vec_dot_fast(bool on);
+bool vec_dot_fast();
 
 // Number of activations quantized at once by the Q8_1 activation format.
 constexpr i64 kAttentionQuantBlock = 32;

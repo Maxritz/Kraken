@@ -467,6 +467,68 @@ static void test_q8_0_layout() {
         CHECK_NEAR(out[i], 0.5f * static_cast<f32>(i - 16), 1e-3, "Q8_0 value");
 }
 
+// The block formats have an OPT-IN four-accumulator dot
+// (set_vec_dot_fast / KRK_CPU_DOT_FAST=1). It exists because the default path
+// accumulates a whole row into one f32 chain -- required, because that path is
+// the oracle every device kernel is compared against -- and one chain is a
+// serial FMA dependency, so a q4_0/q8_0 row runs at ~0.65 G element/s per
+// thread however wide the SIMD is. Four accumulators remove the dependency and
+// cost a different summation order.
+//
+// What this test pins is the trade, not a number: the opt-in tracks the
+// reference chain to within a bound, and the lossless formats are untouched by
+// the flag either way.
+static void test_vec_dot_fast_opt_in() {
+    // Eight q8_0 blocks with different scales, so the four lanes see mixed
+    // magnitudes rather than a flat row where every order agrees.
+    u8 w[8 * 34];
+    f32 x[256];
+    u32 seed = 12345u;
+    auto rnd = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return seed;
+    };
+    for (int b = 0; b < 8; b++) {
+        const u16 dh = fp32_to_fp16(0.01f + 0.005f * static_cast<f32>(b));
+        w[b * 34] = static_cast<u8>(dh & 0xFF);
+        w[b * 34 + 1] = static_cast<u8>(dh >> 8);
+        for (int i = 0; i < 32; i++)
+            w[b * 34 + 2 + i] = static_cast<u8>(
+                static_cast<i8>(static_cast<i32>(rnd() % 255) - 127));
+    }
+    for (int i = 0; i < 256; i++)
+        x[i] = static_cast<f32>(static_cast<i32>(rnd() % 2001) - 1000) / 1000.0f;
+
+    set_vec_dot_fast(false);
+    const f32 exact = vec_dot(DType::Q8_0, w, x, 256);
+    set_vec_dot_fast(true);
+    CHECK(vec_dot_fast(), "the block-dot switch reports the state it was set to");
+    const f32 fast = vec_dot(DType::Q8_0, w, x, 256);
+    // Relative to the SIZE OF THE TERMS, not to the result. A dot that should
+    // be 0.001 and lands on 0.0013 is "30% wrong" and completely fine, so the
+    // result is the wrong denominator near a cancellation; sum|w.x| is the
+    // magnitude the summation order can actually perturb. Measured on real
+    // q8_0 expert rows (tools/dot_fast_witness.py): max 1.4e-07 of that scale.
+    std::vector<f32> row(256);
+    dequant_row(DType::Q8_0, w, row.data(), 256);
+    f32 scale = 0.0f;
+    for (int i = 0; i < 256; i++) scale += std::fabs(row[i] * x[i]);
+    const f32 err = std::fabs(fast - exact);
+    CHECK(err <= 1e-6f * scale, "the opt-in dot is within an ulp of the terms");
+
+    // f16 is exact under either setting: it does not read the flag.
+    u16 h[256];
+    for (int i = 0; i < 256; i++) h[i] = fp32_to_fp16(x[i] * 0.5f);
+    const f32 h_fast = vec_dot(DType::F16, h, x, 256);
+    set_vec_dot_fast(false);
+    const f32 h_exact = vec_dot(DType::F16, h, x, 256);
+    CHECK(h_fast == h_exact, "the f16 dot ignores the block-format switch");
+
+    // Leave the run on the reference chain: every check after this one assumes
+    // the oracle's exact rounding.
+    CHECK(!vec_dot_fast(), "and the switch is back off for the rest of the run");
+}
+
 static void test_q5_0_high_bit_layout() {
     // The MSB of elements 16..31 comes from bits 16..31 of qh, not 12..27.
     // Getting this wrong corrupts half of every block, so pin it down.
@@ -17904,6 +17966,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_quant_geometry)
     TEST_GROUP(test_q4_0_layout)
     TEST_GROUP(test_q8_0_layout)
+    TEST_GROUP(test_vec_dot_fast_opt_in)
     TEST_GROUP(test_q5_0_high_bit_layout)
     TEST_GROUP(test_kquant_roundtrip_shape)
     TEST_GROUP(test_q2_k_plane_layout)
