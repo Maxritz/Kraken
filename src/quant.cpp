@@ -15,6 +15,15 @@
 #define KRK_DOT_F16C 1
 #endif
 
+// The fused block kernels need AVX2 for the 8-wide widen, but must also build
+// on a target that lacks it: -march=native is an option (KRK_NATIVE_CPU), so
+// __AVX2__ is not something this file may assume. Target attributes put the
+// code in the binary; __builtin_cpu_supports decides whether it is entered.
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+#define KRK_DOT_AVX2 1
+#endif
+
 namespace krk {
 
 namespace {
@@ -1177,6 +1186,135 @@ void dequant_row_f16(DType t, const void *src, u16 *out, i64 n) {
 }
 
 namespace {
+#if defined(KRK_DOT_AVX2)
+// ---------------------------------------------------------------------------
+// Fused block kernels (KRK_CPU_DOT_AVX2).
+//
+// What this replaces: dequant_block() widening a 32-value block into a stack
+// buffer one element at a time, then a second pass multiplying that buffer by
+// the activation. Two round trips through L1 per weight, and on a q8_0 expert
+// matrix -- 768x768, the shape a routed expert has in every MoE -- it is what
+// the host-side prefill time is made of.
+//
+// What this does instead: widen eight int8 to eight f32 with two instructions,
+// scale by the block's d, and FMA straight into the accumulator. No stack
+// buffer, no second pass.
+//
+// Why this is allowed near an "exact" backend: it performs the SAME arithmetic
+// in the SAME order as the four-lane path. Element k is d * (f32)w[k] -- one
+// rounding, exactly as the scalar dequant rounds it -- and term k is added to
+// accumulator k mod 4 in increasing k, exactly as the four-lane loop adds it.
+// Both fold as (a0+a1)+(a2+a3). The result is BIT-IDENTICAL to
+// KRK_CPU_DOT_FAST, not merely close, and test_vec_dot_avx2_matches_fast
+// asserts that rather than a tolerance. This is not a third rounding tier.
+//
+// It is still opt-in, because the four-lane path it accelerates is opt-in: the
+// flag alone turns that order on.
+__attribute__((target("avx2,fma"))) inline void fma8(__m128 &acc, __m256 w,
+                                                    const f32 *x) {
+    acc = _mm_fmadd_ps(_mm256_castps256_ps128(w), _mm_loadu_ps(x), acc);
+    acc = _mm_fmadd_ps(_mm256_extractf128_ps(w, 1), _mm_loadu_ps(x + 4), acc);
+}
+
+// q8_0: d (f16) + 32 int8, 34 bytes per block.
+__attribute__((target("avx2,fma"))) f32 dot_q8_0_avx2(const u8 *p, const f32 *x,
+                                                      i64 nb) {
+    __m128 acc = _mm_setzero_ps();
+    for (i64 b = 0; b < nb; b++, p += 34, x += 32) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(
+            p[0] | (static_cast<u16>(p[1]) << 8)));
+        const __m256 dv = _mm256_set1_ps(d);
+        for (int k = 0; k < 32; k += 8) {
+            const __m128i q8 = _mm_loadl_epi64(
+                reinterpret_cast<const __m128i *>(p + 2 + k));
+            const __m256 w = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8)), dv);
+            fma8(acc, w, x + k);
+        }
+    }
+    alignas(16) f32 a[4];
+    _mm_store_ps(a, acc);
+    return (a[0] + a[1]) + (a[2] + a[3]);
+}
+
+// q4_0: d (f16) + 16 bytes of nibbles, 18 bytes per block. Low nibbles are
+// values 0..15 and high nibbles 16..31, so the four widen-and-FMA passes below
+// walk the block in that order and land on the same accumulators the four-lane
+// path would have used.
+__attribute__((target("avx2,fma"))) f32 dot_q4_0_avx2(const u8 *p, const f32 *x,
+                                                      i64 nb) {
+    __m128 acc = _mm_setzero_ps();
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const __m256i off = _mm256_set1_epi32(8);
+    for (i64 b = 0; b < nb; b++, p += 18, x += 32) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(
+            p[0] | (static_cast<u16>(p[1]) << 8)));
+        const __m256 dv = _mm256_set1_ps(d);
+        const __m128i raw = _mm_loadu_si128(
+            reinterpret_cast<const __m128i *>(p + 2));
+        const __m128i lo = _mm_and_si128(raw, m4);
+        const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m4);
+        const __m256 w0 = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo), off)),
+            dv);
+        const __m256 w1 = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_sub_epi32(
+                _mm256_cvtepu8_epi32(_mm_srli_si128(lo, 8)), off)),
+            dv);
+        const __m256 w2 = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi), off)),
+            dv);
+        const __m256 w3 = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_sub_epi32(
+                _mm256_cvtepu8_epi32(_mm_srli_si128(hi, 8)), off)),
+            dv);
+        fma8(acc, w0, x);
+        fma8(acc, w1, x + 8);
+        fma8(acc, w2, x + 16);
+        fma8(acc, w3, x + 24);
+    }
+    alignas(16) f32 a[4];
+    _mm_store_ps(a, acc);
+    return (a[0] + a[1]) + (a[2] + a[3]);
+}
+
+// Asked once. A build made without AVX2 in -march still contains the code
+// above, so the answer has to come from the CPU, not the preprocessor.
+bool cpu_has_avx2() {
+    static const bool v = __builtin_cpu_supports("avx2") != 0;
+    return v;
+}
+#endif // KRK_DOT_AVX2
+
+std::atomic<bool> g_dot_avx2{false};
+std::atomic<bool> g_dot_avx2_set{false};
+
+bool env_dot_avx2() {
+    const char *e = std::getenv("KRK_CPU_DOT_AVX2");
+    return e && e[0] != '\0' && e[0] != '0';
+}
+} // namespace
+
+void set_vec_dot_avx2(bool on) {
+    g_dot_avx2.store(on, std::memory_order_relaxed);
+    g_dot_avx2_set.store(true, std::memory_order_relaxed);
+}
+
+bool vec_dot_avx2() {
+    if (!g_dot_avx2_set.load(std::memory_order_relaxed)) {
+        g_dot_avx2.store(env_dot_avx2(), std::memory_order_relaxed);
+        g_dot_avx2_set.store(true, std::memory_order_relaxed);
+    }
+    // The flag AND the CPU: a caller that logs this gets the truth on a build
+    // where the kernels exist but the host cannot run them.
+#if defined(KRK_DOT_AVX2)
+    return g_dot_avx2.load(std::memory_order_relaxed) && cpu_has_avx2();
+#else
+    return false;
+#endif
+}
+
+namespace {
 std::atomic<bool> g_dot_fast{false};
 std::atomic<bool> g_dot_fast_set{false};
 
@@ -1294,7 +1432,19 @@ f32 vec_dot(DType t, const void *src, const f32 *x, i64 n) {
     const int bs = dtype_block_size(t);
     const int bb = dtype_block_bytes(t);
     f32 buf[256];
-    if (vec_dot_fast()) {
+#if defined(KRK_DOT_AVX2)
+    // The fused arm, for the two formats it has kernels for. Everything else --
+    // and any run where the host lacks AVX2 -- falls through to the four-lane
+    // loop below, which is the same arithmetic, so the answer does not depend
+    // on which of the two ran.
+    if (n > 0 && (n % 32) == 0 && vec_dot_avx2()) {
+        if (t == DType::Q8_0)
+            return dot_q8_0_avx2(static_cast<const u8 *>(src), x, n / 32);
+        if (t == DType::Q4_0)
+            return dot_q4_0_avx2(static_cast<const u8 *>(src), x, n / 32);
+    }
+#endif
+    if (vec_dot_fast() || vec_dot_avx2()) {
         // Four lanes over the widened block. dequant_block is unchanged, so the
         // VALUES are identical to the loop below; only the summation order
         // differs. See the contract on set_vec_dot_fast in krk/quant.hpp.

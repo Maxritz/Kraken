@@ -529,6 +529,72 @@ static void test_vec_dot_fast_opt_in() {
     CHECK(!vec_dot_fast(), "and the switch is back off for the rest of the run");
 }
 
+// The fused AVX2 arm is not a third rounding tier: it is the four-lane arm with
+// the stack buffer removed. Element k is d * (f32)w[k] -- one rounding, exactly
+// what dequant_block rounds -- and term k lands on accumulator k mod 4 in
+// increasing k, then both fold as (a0+a1)+(a2+a3). So the assertion here is
+// BITWISE equality, not a tolerance. If a future edit reorders the lanes to win
+// another few percent, this fails and the change has to be argued for instead
+// of shipped quietly.
+static void test_vec_dot_avx2_matches_fast() {
+    // NOTE: vec_dot_avx2() reports "enabled AND this host can run it", not bare
+    // availability, so it is not a probe for the CPU's features. It does not
+    // need to be one: the contract below holds on both hosts. With AVX2 the
+    // fused kernel runs and matches the four-lane arm bit for bit; without it
+    // the flag still selects the four-lane arm, which trivially matches itself.
+    set_vec_dot_avx2(false);
+    set_vec_dot_fast(false);
+
+    u32 seed = 987654321u;
+    auto rnd = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return seed;
+    };
+    f32 x[256];
+    for (int i = 0; i < 256; i++)
+        x[i] = static_cast<f32>(static_cast<i32>(rnd() % 2001) - 1000) / 1000.0f;
+
+    u8 q8[8 * 34];
+    for (int b = 0; b < 8; b++) {
+        const u16 dh = fp32_to_fp16(0.01f + 0.005f * static_cast<f32>(b));
+        q8[b * 34] = static_cast<u8>(dh & 0xFF);
+        q8[b * 34 + 1] = static_cast<u8>(dh >> 8);
+        for (int i = 0; i < 32; i++)
+            q8[b * 34 + 2 + i] = static_cast<u8>(
+                static_cast<i8>(static_cast<i32>(rnd() % 255) - 127));
+    }
+    // q4_0: low nibble is value k, high nibble is value k+16, both biased by 8.
+    u8 q4[8 * 18];
+    for (int b = 0; b < 8; b++) {
+        const u16 dh = fp32_to_fp16(0.02f + 0.003f * static_cast<f32>(b));
+        q4[b * 18] = static_cast<u8>(dh & 0xFF);
+        q4[b * 18 + 1] = static_cast<u8>(dh >> 8);
+        for (int i = 0; i < 16; i++) {
+            const u8 lo = static_cast<u8>(rnd() % 16);
+            const u8 hi = static_cast<u8>(rnd() % 16);
+            q4[b * 18 + 2 + i] = static_cast<u8>(lo | (hi << 4));
+        }
+    }
+
+    struct AVCase { const char *name; DType t; const void *w; };
+    const AVCase cases[] = {{"q8_0", DType::Q8_0, q8},
+                            {"q4_0", DType::Q4_0, q4}};
+    for (const AVCase &c : cases) {
+        set_vec_dot_avx2(false);
+        set_vec_dot_fast(true);
+        const f32 ref = vec_dot(c.t, c.w, x, 256);
+        set_vec_dot_avx2(true);
+        set_vec_dot_fast(false);  // the AVX2 flag alone selects this order
+        const f32 got = vec_dot(c.t, c.w, x, 256);
+        const bool same = std::memcmp(&ref, &got, sizeof(f32)) == 0;
+        CHECK(same,
+              "the fused AVX2 dot is bit-identical to the four-lane dot "
+              "(and to itself on a host without AVX2, via the fallback)");
+    }
+    set_vec_dot_avx2(false);
+    set_vec_dot_fast(false);
+}
+
 static void test_q5_0_high_bit_layout() {
     // The MSB of elements 16..31 comes from bits 16..31 of qh, not 12..27.
     // Getting this wrong corrupts half of every block, so pin it down.
@@ -17967,6 +18033,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_q4_0_layout)
     TEST_GROUP(test_q8_0_layout)
     TEST_GROUP(test_vec_dot_fast_opt_in)
+    TEST_GROUP(test_vec_dot_avx2_matches_fast)
     TEST_GROUP(test_q5_0_high_bit_layout)
     TEST_GROUP(test_kquant_roundtrip_shape)
     TEST_GROUP(test_q2_k_plane_layout)
