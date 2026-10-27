@@ -19,11 +19,10 @@ constexpr f64 kParFlopFloor = 1.0e5;
 template <class F>
 inline void par_for(i64 n, i64 grain, f64 est_flops, F &&body) {
     if (n <= 0) return;
-    if (est_flops < kParFlopFloor || grain < 1) {
-        body(static_cast<i64>(0), n);
-        return;
-    }
-    Pool::get().run(n, grain, std::forward<F>(body));
+    // Same policy as backend_cpu.cpp's helper: the floor is throughput only,
+    // and both paths run the same compiled body (see Pool::run).
+    const bool split = est_flops >= kParFlopFloor && grain >= 1;
+    Pool::get().run(n, grain, split, std::forward<F>(body));
 }
 
 } // namespace

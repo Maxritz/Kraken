@@ -362,6 +362,12 @@ struct ModelConfig {
     // the log-probs a sampler sees and for anything that mixes logits from
     // different sources. 0 disables it. See apply_logit_softcap.
     f32 logit_softcap = 0.0f;
+    // Gemma 2 also bounds the ATTENTION logits: cap * tanh(score / cap) between
+    // the QK dot product and the softmax (`attention.logit_softcapping`, 50 on
+    // every gemma2 file). It is a different function from the final-logit one
+    // above -- it changes the probabilities, not just their log-scale -- so it
+    // belongs inside attention (AttnDesc::softcap). 0 disables it.
+    f32 attn_softcap = 0.0f;
     bool tied_embeddings = false;
     bool has_bias = false;
     bool qk_norm = false;

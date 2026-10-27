@@ -39,6 +39,15 @@ private:
     bool handle_models(HttpResponse &res);
     bool handle_completion(const HttpRequest &req, HttpResponse &res, HttpConn &conn);
 
+    // The token ids the KV cache's first rows hold, from the last request that
+    // ran to completion. A new prompt that extends or repeats this prefix is
+    // prefilled only from the point where it stops matching: the cache is
+    // already the answer for the rest. Cleared on any failure, so a request
+    // that dies mid-prefill can never be mistaken for a cache entry.
+    std::vector<i32> prefix_ids_;
+    // Longest common prefix length, in tokens, between `prompt` and the cache.
+    i64 reusable_prefix(const std::vector<i32> &prompt) const;
+
     Engine *engine_;
     f32 default_temp_;
     std::mutex *mu_;

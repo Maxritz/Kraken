@@ -274,6 +274,109 @@ f32 rnd(u32 &s) {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// row pins that survive the HOST, not just the code
+// ---------------------------------------------------------------------------
+//
+// Three groups (lfm2, qwen4exp, dsv4) pin "the whole graph" by hashing the
+// last prompt row's logits bit for bit and comparing against a constant. That
+// constant is a property of the MACHINE as much as of the graph: this binary
+// is built with -march=native, and GCC contracts `a * c - b * s` into an FMA
+// in one inlining context and not another, so the same graph on a second host
+// produces a different bit hash. Measured on the LFM2 fixture: the pinned
+// argmax reproduced while the row hash did not, which reads as a broken mixer
+// and is really a different CPU.
+//
+// A pin that cannot be reproduced on another machine is worse than no pin: it
+// hides real regressions behind a permanent failure. So the recorded value is
+// a RowPin -- the things the graph decides and the host cannot:
+//
+//   * the row's eight largest logits, sorted, at 1e-3 relative (a routing,
+//     head or norm change moves them),
+//   * the row's minimum, L1 and L2 sums, at 1e-3 relative.
+//
+// Contraction noise is ~1e-7 relative, four orders below the tolerance, and a
+// graph change moves these by far more than 1e-3 -- the qwen4exp PLE bug that
+// motivated these gates moved a logit row by whole units.
+//
+// NOT the token ids. These fixtures are small models with pseudo-random
+// weights, so their logit rows are full of near-ties: on the dsv4 fixture the
+// two largest logits are equal to the last bit and the argmax is whichever
+// index the sort happened to keep. Pinning ids there pins memcmp, not the
+// graph. The exact hash stays in the FAIL message and is still compared when
+// KRK_GOLDEN_BITS=1 is set, which is what a recording host uses to re-pin one
+// bit-exactly after a deliberate change.
+struct RowPin {
+    f64 top[8] = {0.0};  // the eight largest logits, descending
+    f64 min_val = 0.0;   // the row's minimum
+    f64 l1 = 0.0;
+    f64 l2 = 0.0;
+};
+
+static RowPin row_pin(const f32 *v, i32 n) {
+    RowPin p;
+    if (!v || n <= 0) return p;
+    const i32 want = n < 8 ? n : 8;
+    std::vector<f32> top(static_cast<size_t>(want), -3.4e38f);
+    f64 lo = static_cast<f64>(v[0]), l1 = 0.0, l2 = 0.0;
+    for (i32 i = 0; i < n; i++) {
+        const f32 x = v[i];
+        const f64 d = static_cast<f64>(x);
+        if (d < lo) lo = d;
+        l1 += std::fabs(d);
+        l2 += d * d;
+        // Insertion into the running top-want: `want` is 8, so this is a
+        // shift chain over a register-resident array, not a sort.
+        if (x > top[static_cast<size_t>(want - 1)]) {
+            i32 k = want - 1;
+            while (k > 0 && x > top[static_cast<size_t>(k - 1)]) {
+                top[static_cast<size_t>(k)] = top[static_cast<size_t>(k - 1)];
+                k--;
+            }
+            top[static_cast<size_t>(k)] = x;
+        }
+    }
+    for (i32 k = 0; k < 8; k++)
+        p.top[k] = k < want ? static_cast<f64>(top[static_cast<size_t>(k)]) : 0.0;
+    p.min_val = lo;
+    p.l1 = l1;
+    p.l2 = std::sqrt(l2);
+    return p;
+}
+
+// Relative comparison, with an absolute floor so a value that is legitimately
+// near zero does not fail on noise.
+static bool pin_near(f64 a, f64 b, f64 rel) {
+    const f64 d = std::fabs(a - b);
+    const f64 scale = std::fmax(std::fabs(a), std::fabs(b));
+    return d <= rel * scale + 1e-6;
+}
+
+static bool pin_close(const RowPin &a, const RowPin &b) {
+    for (i32 k = 0; k < 8; k++)
+        if (!pin_near(a.top[k], b.top[k], 1e-3)) return false;
+    return pin_near(a.min_val, b.min_val, 1e-3) &&
+           pin_near(a.l1, b.l1, 1e-3) && pin_near(a.l2, b.l2, 1e-3);
+}
+
+// One line a failed run can be re-recorded from.
+static std::string pin_str(const RowPin &p) {
+    std::string s = "top";
+    char buf[64];
+    for (i32 k = 0; k < 8; k++) {
+        std::snprintf(buf, sizeof buf, " %.6f", p.top[k]);
+        s += buf;
+    }
+    std::snprintf(buf, sizeof buf, " | min %.6f l1 %.6f l2 %.6f", p.min_val,
+                  p.l1, p.l2);
+    return s + buf;
+}
+
+static bool golden_bits_on() {
+    const char *e = std::getenv("KRK_GOLDEN_BITS");
+    return e && e[0] != '\0' && e[0] != '0';
+}
+
+// ---------------------------------------------------------------------------
 // quant layouts
 // ---------------------------------------------------------------------------
 
@@ -3971,6 +4074,46 @@ static void test_arch_table() {
     CHECK(arch_lookup("qwen4exp")->hyper_connection &&
               arch_lookup("qwen4exp")->ple && arch_lookup("qwen4exp")->qsa,
           "and the schema flags record the three pieces still missing");
+    // The gemma stack: every one of these files gates its FFN with GeGLU and
+    // scales the embedding, and the family's alternating window is a property
+    // of the architecture rather than of the metadata. Two of those were
+    // declared in comments and nowhere else.
+    for (const char *g : {"gemma", "gemma2", "gemma3", "gemma4"}) {
+        const ArchSpec *s = arch_lookup(g);
+        CHECK(s != nullptr, "the gemma family is in the table");
+        if (!s) continue;
+        CHECK(s->gelu_ffn,
+              "a gemma stack gates its FFN with GeGLU, not SwiGLU");
+        CHECK(s->gemma_norm, "and scales the embedding by sqrt(n_embd)");
+        CHECK(s->qk_norm, "and carries QK-norm tensors");
+    }
+    // The window pattern is the arch's, and it is the one thing that made
+    // gemma3 look unimplemented after the kernel learned windows: period 6 with
+    // the WINDOWED layer first (5 local to 1 global), gemma2 period 2 the same
+    // way round.
+    CHECK(arch_lookup("gemma3")->swa_period == 6 &&
+              arch_lookup("gemma3")->swa_window_first,
+          "gemma3 declares a 5:1 local/global pattern, windowed layer first");
+    CHECK(arch_lookup("gemma2")->swa_period == 2 &&
+              arch_lookup("gemma2")->swa_window_first,
+          "gemma2 alternates every layer, windowed first");
+    CHECK(arch_lookup("gemma3")->support != ArchSupport::No,
+          "and gemma3 is no longer refused for a window the engine can do");
+    // gemma2 was refused for one gap: the bound on the ATTENTION logits, which
+    // belongs inside the score formation and cannot be reproduced by a
+    // host-side transform of the result. The reference attention applies it now
+    // (test_attention_softcap pins the arithmetic), so the schema loads. The
+    // why-text must still name the softcap, because the HIP kernels do not cap
+    // and refuse the run by name -- a Partial that did not say so would read as
+    // "the gap is closed everywhere".
+    CHECK(arch_lookup("gemma2")->support == ArchSupport::Partial,
+          "gemma2 loads now that the reference attention bounds its logits");
+    CHECK(std::string(arch_lookup("gemma2")->why).find("softcap") !=
+                  std::string::npos &&
+              std::string(arch_lookup("gemma2")->why).find("HIP") !=
+                  std::string::npos,
+          "and still names the softcap, because the HIP kernels do not cap");
+
     CHECK(arch_lookup("") == nullptr, "the empty arch name is not in the table");
     CHECK(arch_lookup("no-such-arch-anywhere") == nullptr,
           "an unlisted arch is not in the table");
@@ -7724,6 +7867,159 @@ static void test_nvfp4_sidecar_dflash() {
 // perturbation, because invariance under a change the row cannot see IS the
 // property -- and a no-op mask cannot fake it, since the same perturbation must
 // move the row when the mask is off.
+// Gemma 2's attention-logit bound (AttnDesc::softcap): every score becomes
+// cap * tanh(score / cap) at score formation, so the softmax runs on the capped
+// vector. The distinction matters -- tanh is monotone, but the probabilities
+// are those of the capped vector, not a monotone image of the uncapped ones --
+// and it is the reason the bound cannot be applied to the attention output.
+//
+// The fixture makes the arithmetic checkable by hand: unit-norm keys along one
+// axis so the raw scores are exactly 0, 4, 8, and value rows that are the basis
+// vectors e0, e1, e2, so the last row's four outputs ARE the three softmax
+// probabilities. Expected values are computed here in double from the formula,
+// not from the backend.
+static void test_attention_softcap() {
+    Backend *cpu = make_cpu_backend();
+    CHECK(cpu->attention_softcap_supported(),
+          "the reference attention applies the attention-logit bound");
+    const i64 nh = 1, nkv = 1, hd = 4, nt = 3, npos = 3;
+    const i64 kv_dim = nkv * hd;
+    const i64 layer_stride = npos * kv_dim;
+    const f32 raw[3] = {0.0f, 4.0f, 8.0f};
+
+    std::vector<f32> kc(static_cast<size_t>(layer_stride), 0.0f);
+    std::vector<f32> vc(static_cast<size_t>(layer_stride), 0.0f);
+    for (i64 j = 0; j < nt; j++) {
+        kc[static_cast<size_t>(j * kv_dim + 0)] = raw[j]; // dot with q = raw[j]
+        vc[static_cast<size_t>(j * kv_dim + j)] = 1.0f;    // e_j
+    }
+    std::vector<f32> q(static_cast<size_t>(nt * nh * hd), 0.0f);
+    for (i64 t = 0; t < nt; t++) q[static_cast<size_t>(t * hd + 0)] = 1.0f;
+
+    AttnDesc d;
+    d.n_head = nh;
+    d.n_kv = nkv;
+    d.hd = hd;
+    d.n_tok = nt;
+    d.pos0 = 0;
+    d.pos_stride = kv_dim;
+    d.layer_stride = layer_stride;
+    d.scale = 1.0f;   // the scores ARE the dots, which is what makes them exact
+    d.causal = true;
+
+    // The three probabilities of a capped softmax, in double. `lo` and `hi` are
+    // the visible key indices (the mask arms below narrow this).
+    auto probs = [](const f32 *scores, i64 n, f64 cap) {
+        std::vector<f64> v(static_cast<size_t>(n));
+        f64 mx = -1e300, sum = 0.0;
+        for (i64 j = 0; j < n; j++) {
+            v[static_cast<size_t>(j)] =
+                cap > 0.0 ? cap * std::tanh(static_cast<f64>(scores[j]) / cap)
+                          : static_cast<f64>(scores[j]);
+            mx = std::max(mx, v[static_cast<size_t>(j)]);
+        }
+        for (i64 j = 0; j < n; j++) {
+            v[static_cast<size_t>(j)] = std::exp(v[static_cast<size_t>(j)] - mx);
+            sum += v[static_cast<size_t>(j)];
+        }
+        for (i64 j = 0; j < n; j++) v[static_cast<size_t>(j)] /= sum;
+        return v;
+    };
+    // Row `t` sees keys [0, t]; its output is sum_j p_j e_j, so out[t][j] == p_j
+    // for the visible j and 0 otherwise.
+    auto check_rows = [&](const std::vector<f32> &out, f64 cap,
+                          const char *what) {
+        bool ok = true;
+        for (i64 t = 0; t < nt; t++) {
+            const std::vector<f64> want = probs(raw, t + 1, cap);
+            for (i64 j = 0; j < t + 1; j++) {
+                const f64 got = out[static_cast<size_t>(t * hd + j)];
+                if (!(std::fabs(got - want[static_cast<size_t>(j)]) < 2e-6)) ok = false;
+            }
+            // A key outside the causal prefix must contribute nothing at all.
+            for (i64 j = t + 1; j < hd; j++)
+                if (out[static_cast<size_t>(t * hd + j)] != 0.0f) ok = false;
+            const f64 sum = out[static_cast<size_t>(t * hd + 0)] +
+                            out[static_cast<size_t>(t * hd + 1)] +
+                            out[static_cast<size_t>(t * hd + 2)];
+            if (!(std::fabs(sum - 1.0) < 2e-6)) ok = false;
+        }
+        CHECK(ok, what);
+    };
+
+    // ---- 1. the uncapped arm: the arithmetic that predates the field ------
+    std::vector<f32> out_default(static_cast<size_t>(nt * nh * hd), 0.0f);
+    std::vector<f32> out_zero(static_cast<size_t>(nt * nh * hd), 0.0f);
+    cpu->attention(out_default.data(), q.data(), kc.data(), vc.data(), d);
+    AttnDesc z = d;
+    z.softcap = 0.0f;
+    cpu->attention(out_zero.data(), q.data(), kc.data(), vc.data(), z);
+    CHECK(std::memcmp(out_default.data(), out_zero.data(),
+                      out_default.size() * sizeof(f32)) == 0,
+          "an unset softcap and an explicit 0 are the same call: the field "
+          "cannot change a model that does not carry it");
+    check_rows(out_default, 0.0, "and it is the plain softmax of the raw scores");
+
+    // ---- 2. the capped arm, against the formula --------------------------
+    std::vector<f32> out_cap(static_cast<size_t>(nt * nh * hd), 0.0f);
+    AttnDesc c = d;
+    c.softcap = 2.0f;
+    cpu->attention(out_cap.data(), q.data(), kc.data(), vc.data(), c);
+    check_rows(out_cap, 2.0,
+               "cap*tanh(score/cap) at score formation: the probabilities are "
+               "the capped softmax's, computed independently in double");
+    // Row 2 is where the bound bites: raw scores 0/4/8 would put 98% of the
+    // mass on the last key; capped at 2 the split is ~0.07/0.45/0.48.
+    CHECK(out_cap[static_cast<size_t>(2 * hd + 2)] < 0.60f &&
+              out_cap[static_cast<size_t>(2 * hd + 2)] > 0.40f,
+          "the bound compresses a 0/4/8 score spread towards uniform, which is "
+          "the whole point of it");
+    CHECK(out_default[static_cast<size_t>(2 * hd + 2)] > 0.95f,
+          "and the uncapped arm keeps the peak, so the two arms are not the "
+          "same computation");
+    CHECK(std::memcmp(out_cap.data(), out_default.data(),
+                      out_cap.size() * sizeof(f32)) != 0,
+          "a run that sets the field and one that does not cannot agree");
+
+    // ---- 3. the mask is not a score --------------------------------------
+    // skip_from makes key 1 invisible to row 2, and the reference represents
+    // that as -FLT_MAX. If the bound were applied to the sentinel it would
+    // become -cap, i.e. exp(-2 - m) of real probability on a key the model
+    // asked to hide. Row 2 must be the capped softmax of {0, 2} only.
+    std::vector<f32> out_mask(static_cast<size_t>(nt * nh * hd), 0.0f);
+    AttnDesc m = c;
+    m.skip_from = 1;
+    cpu->attention(out_mask.data(), q.data(), kc.data(), vc.data(), m);
+    {
+        const f32 visible[2] = {raw[0], raw[2]};
+        const std::vector<f64> want = probs(visible, 2, 2.0);
+        const f64 p0 = out_mask[static_cast<size_t>(2 * hd + 0)];
+        const f64 p2 = out_mask[static_cast<size_t>(2 * hd + 2)];
+        CHECK(std::fabs(p0 - want[0]) < 2e-6,
+              "a masked key contributes nothing even when the bound is on: it "
+              "is a mask, not a score");
+        CHECK(std::fabs(p2 - want[1]) < 2e-6, "and the visible keys renormalize");
+
+        // The bound's own renormalization is the counter-check: with the same
+        // cap but no mask, key 1 takes a share. If the two arms agreed here the
+        // mask test would be vacuous.
+        CHECK(std::fabs(p0 - out_cap[static_cast<size_t>(2 * hd + 0)]) > 1e-4,
+              "and that is a different split from the unmasked row's");
+    }
+
+    // ---- 4. the cap is monotone, so ranking survives ---------------------
+    // A bound this aggressive still must not reorder the scores: the visible
+    // key with the largest dot keeps the largest probability.
+    CHECK(out_cap[static_cast<size_t>(2 * hd + 2)] >
+              out_cap[static_cast<size_t>(2 * hd + 1)] &&
+              out_cap[static_cast<size_t>(2 * hd + 1)] >
+                  out_cap[static_cast<size_t>(2 * hd + 0)],
+          "tanh is monotone, so the bound changes the distribution and not the "
+          "ordering");
+
+    delete cpu;
+}
+
 static void test_attention_self_mask() {
     Backend *cpu = make_cpu_backend();
     const i64 nh = 2, nkv = 2, hd = 8, nt = 3;
@@ -8458,6 +8754,73 @@ static std::string read_capture(const std::string &path) {
     return s;
 }
 
+// The gemma 2 / gemma 3 schema as the engine reads it, in one fixture: GeGLU,
+// the embedding scale, per-head QK-norm, the alternating window, the
+// final-logit bound, and -- on gemma2 only -- the bound on the ATTENTION
+// logits. `with_attn_cap` builds the same file without that key, which is the
+// control: if the two files hash the same, the key is not being read.
+static bool build_gemma_gate_model(const std::string &path, const char *arch,
+                                   bool with_attn_cap, int ctx = 64) {
+    const int n_embd = 256, n_layer = 4, n_head = 4, n_kv = 2, hd = 64;
+    const int n_ff = 512, vocab = 261;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string a = arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", std::string("kraken-") + arch + "-gate");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(a + ".block_count", n_layer);
+    b.meta_u32(a + ".context_length", ctx);
+    b.meta_u32(a + ".embedding_length", n_embd);
+    b.meta_u32(a + ".feed_forward_length", n_ff);
+    b.meta_u32(a + ".attention.head_count", n_head);
+    b.meta_u32(a + ".attention.head_count_kv", n_kv);
+    b.meta_u32(a + ".attention.key_length", hd);
+    b.meta_f32(a + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(a + ".rope.freq_base", 10000.0f);
+    // A window short enough to bite on a 55-token prompt: half the layers are
+    // windowed by the arch's pattern, so the windowed arm is exercised on every
+    // token rather than only past 1024.
+    b.meta_u32(a + ".attention.sliding_window", 6);
+    b.meta_f32(a + ".final_logit_softcapping", 30.0f);
+    if (with_attn_cap) b.meta_f32(a + ".attention.logit_softcapping", 50.0f);
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+        b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, 100 + l * 1000));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, 200 + l * 1000));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, 300 + l * 1000));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, 400 + l * 1000));
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, 500 + l * 1000));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, 900 + l * 1000));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, 1300 + l * 1000));
+    }
+    return b.write(path);
+}
+
 struct PrefillProbe {
     bool ok = false;
     std::string trace;  // hash of the prefill's rows (see --prefill-hash)
@@ -8761,7 +9124,7 @@ static void test_lfm2_shortconv() {
     // Prefill only (`max_tokens 0`), so the row read afterwards is the one at
     // the last prompt position -- the row a decode starts from.
     auto row = [&](const std::string &file, const char *prompt, i32 chunk,
-                   u64 *hash, i32 *top1) -> bool {
+                   u64 *hash, i32 *top1, RowPin *pin = nullptr) -> bool {
         Backend *cpu = make_cpu_backend();
         bool ok = false;
         {
@@ -8788,6 +9151,7 @@ static void test_lfm2_shortconv() {
                     for (i32 i = 1; i < nv; i++)
                         if (lg[i] > lg[best]) best = i;
                     *top1 = best;
+                    if (pin) *pin = row_pin(lg, nv);
                 } else {
                     ok = false;
                 }
@@ -8799,19 +9163,30 @@ static void test_lfm2_shortconv() {
 
     u64 h_wide = 0, h_other = 0, h_narrow = 0, h_badtap = 0;
     i32 t_wide = -1, t_other = -1, t_narrow = -1, t_badtap = -1;
-    CHECK(row(model, "the", 8, &h_wide, &t_wide),
+    RowPin pin_wide;
+    CHECK(row(model, "the", 8, &h_wide, &t_wide, &pin_wide),
           "the whole fixture graph prefills and the row reaches the head");
     std::fprintf(stderr, "  (lfm2 logits row %016llx, argmax %d)\n",
                  static_cast<unsigned long long>(h_wide),
                  static_cast<int>(t_wide));
 
     // Recorded from this graph on the fixture, CPU backend, prompt "the".
-    static const u64 kGoldenRow = 0x399373273e5a2b60ull;
-    static const i32 kGoldenTop = 2;
+    // The PIN is the portable fingerprint (see row_pin's note): the bit hash
+    // is a property of the host's floating point as much as of the graph, so
+    // it is compared only when a recording host asks for it.
+    static const RowPin kGolden = {
+        {3.079364, 3.079364, 3.079364, 3.079364, 3.079364, 3.079364, 3.079364,
+         3.079364},
+        -1.947591, 352.351005, 24.527738};
     CHECK(h_wide != 0, "the row is not empty");
-    CHECK(h_wide == kGoldenRow,
-          "the last prompt row is the recorded one (the mixer's own output)");
-    CHECK(t_wide == kGoldenTop, "and its argmax is the recorded token");
+    std::fprintf(stderr, "  (lfm2 pin: %s)\n", pin_str(pin_wide).c_str());
+    if (kGolden.l1 != 0.0)
+        CHECK(pin_close(pin_wide, kGolden),
+              "the last prompt row matches the recorded fingerprint (the "
+              "mixer's own output)");
+    if (golden_bits_on())
+        CHECK(h_wide == 0x399373273e5a2b60ull,
+              "KRK_GOLDEN_BITS: the recorded row, bit for bit");
 
     CHECK(row(model, "a", 8, &h_other, &t_other),
           "a second prompt prefills");
@@ -9450,6 +9825,123 @@ static void test_prefill_chunk_bitexact() {
         std::remove("kraken-prefill-gate-512.gguf");
     }
 
+}
+
+// The gemma families, driven end to end through the CLI: load, schema flags,
+// per-layer window selection, the final-logit bound, gemma2's attention-logit
+// bound, and the prefill rows all have to agree with themselves across chunk
+// sizes before "gemma2 is supported" means anything. That is what this group
+// measures, on fixtures built here rather than on a file nobody in this
+// collection has.
+//
+// Three arms per family. Chunk 1 threads every prompt row through the
+// decode-shaped single-row forward, so it stands in for token generation; chunk
+// 8 and 32 take the multi-row paths. One hash across the three is the gate. The
+// fourth check is the control that keeps it honest: for gemma2 the same file
+// with the softcapping key removed must hash DIFFERENTLY, or the key is being
+// ignored and the gate above would pass on a model that never applied the
+// bound.
+static void test_gemma_family_chunk_gate() {
+    const std::string self = self_path();
+    const std::filesystem::path exe_p =
+        std::filesystem::path(self).parent_path() /
+#ifdef _WIN32
+        "kraken.exe";
+#else
+        "kraken";
+#endif
+    const std::string exe = exe_p.string();
+    const bool have_exe = !self.empty() && std::filesystem::exists(exe_p);
+    CHECK(have_exe, "kraken sits beside kraken-tests (this gate drives it)");
+    if (!have_exe) return;
+
+    std::string prompt;
+    for (int i = 0; i < 55; i++) prompt += (i ? " the" : "the");
+
+    struct Fam {
+        const char *arch;
+        bool cap;
+        const char *file;
+    };
+    const Fam fams[] = {
+        {"gemma2", true, "kraken-gemma2-gate.gguf"},
+        {"gemma3", false, "kraken-gemma3-gate.gguf"},
+    };
+    for (const Fam &f : fams) {
+        CHECK(build_gemma_gate_model(f.file, f.arch, f.cap),
+              (std::string("wrote the ") + f.arch + " fixture this gate prefills")
+                  .c_str());
+        const PrefillProbe c1 = run_prefill_hash(exe, f.file, prompt, 1, false);
+        const PrefillProbe c8 = run_prefill_hash(exe, f.file, prompt, 8, false);
+        const PrefillProbe c32 = run_prefill_hash(exe, f.file, prompt, 32, false);
+        CHECK(c1.ok, (std::string(f.arch) + " loads and prefills at chunk 1").c_str());
+        CHECK(c8.ok, (std::string(f.arch) + " loads and prefills at chunk 8").c_str());
+        CHECK(c32.ok,
+              (std::string(f.arch) + " loads and prefills at chunk 32").c_str());
+        if (!c1.ok || !c8.ok || !c32.ok) {
+            std::fprintf(stderr, "  (%s: rc %d/%d/%d stderr: %.400s)\n", f.arch,
+                         c1.rc, c8.rc, c32.rc, c1.err.c_str());
+            continue;
+        }
+        // A load that silently fell back to the llama schema would still
+        // produce a hash; the banner's layer/window line is what says the
+        // family's own schema was read.
+        std::printf("       %s chunk  1 trace %s logits %s\n", f.arch,
+                    c1.trace.c_str(), c1.logits.c_str());
+        std::printf("       %s chunk  8 trace %s logits %s\n", f.arch,
+                    c8.trace.c_str(), c8.logits.c_str());
+        std::printf("       %s chunk 32 trace %s logits %s\n", f.arch,
+                    c32.trace.c_str(), c32.logits.c_str());
+        // The count is the tokenizer's answer, not this test's: what matters is
+        // that the prompt spans several chunks (so every arm's last write is a
+        // multi-row one at some point) and that all three arms see the same
+        // sequence. 55 words tokenizes to >= 40 pieces on this vocab.
+        CHECK(c1.prompt_tokens >= 40 &&
+                  c1.prompt_tokens == c8.prompt_tokens &&
+                  c8.prompt_tokens == c32.prompt_tokens,
+              (std::string(f.arch) + ": every arm tokenizes the same prompt")
+                  .c_str());
+        CHECK(c1.trace == c8.trace && c8.trace == c32.trace,
+              (c1.trace == c8.trace && c8.trace == c32.trace
+                   ? std::string(f.arch) +
+                         ": chunk 1, 8 and 32 leave the same rows, so prefill "
+                         "and decode agree across the window and the softcaps"
+                   : std::string(f.arch) +
+                         ": the chunk sizes DISAGREE -- the multi-row forward "
+                         "is not the decode formulation")
+                  .c_str());
+        CHECK(c1.logits == c32.logits,
+              (std::string(f.arch) +
+               ": and the logits row agrees bit for bit")
+                  .c_str());
+
+        // Token generation on the same file: a greedy decode must run and
+        // print text (a load that refused, or a NaN forward, prints nothing).
+        int rc = -1;
+        const std::string txt =
+            run_generate_text(exe, f.file, prompt.substr(0, 40), 1, 8, f.arch, rc);
+        CHECK(rc == 0 && !txt.empty(),
+              (std::string(f.arch) +
+               ": decodes 8 greedy tokens without failing")
+                  .c_str());
+    }
+
+    // ---- the control: gemma2's bound is READ, not decorative --------------
+    const std::string capped = "kraken-gemma2-gate.gguf";
+    const std::string nokey = "kraken-gemma2-nocap.gguf";
+    CHECK(build_gemma_gate_model(nokey, "gemma2", false),
+          "wrote the same gemma2 file without attention.logit_softcapping");
+    const PrefillProbe a = run_prefill_hash(exe, capped, prompt, 8, false);
+    const PrefillProbe bcap = run_prefill_hash(exe, nokey, prompt, 8, false);
+    CHECK(a.ok && bcap.ok, "both gemma2 files prefill");
+    if (a.ok && bcap.ok) {
+        CHECK(a.trace != bcap.trace,
+              a.trace != bcap.trace
+                  ? "the softcapping key changes the model: cap*tanh(score/cap) "
+                    "is applied, not ignored"
+                  : "the softcapping key is IGNORED -- the two files prefill "
+                    "byte-identically, so gemma2's bound is not applied");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -10247,6 +10739,40 @@ static void test_http_server() {
         CHECK(usage && usage->get_int("prompt_tokens") == ref.prompt_tokens &&
                   usage->get_int("completion_tokens") == ref.generated,
               "http: usage matches the reference run");
+        // The first request after a direct generate() finds a cache entry only
+        // if it shares a prefix with what generate() left behind, which for the
+        // same prompt it does -- but never the last token (a run needs a row to
+        // sample from).
+        const JsonValue *det = usage ? usage->find("prompt_tokens_details") : nullptr;
+        const i64 cached0 = det ? det->get_int("cached_tokens", -1) : -1;
+        CHECK(cached0 >= 0 && cached0 < ref.prompt_tokens,
+              "http: usage reports how many prompt tokens came from the cache");
+    }
+
+    // ---- a warm request answers from the KV cache and agrees bit for bit ----
+    // Same prompt, same sampler: the second request finds the first one's
+    // prompt in the KV, prefills only its last token, and must produce exactly
+    // the same text. This is the property that makes prefix reuse safe to
+    // ship -- a cache that changes the answer is not an optimisation.
+    {
+        CHECK(http_request(port, "POST", "/v1/completions", req, &status, &body) &&
+                  status == 200,
+              "http: a repeated prompt is answered from the warm cache");
+        JsonValue j;
+        std::string e;
+        const std::string payload = body.substr(body.find("\r\n\r\n") + 4);
+        CHECK(json_parse(payload, &j, &e), "http: warm body is valid JSON");
+        const JsonValue *choices = j.find("choices");
+        std::string warm_text;
+        if (choices && !choices->items().empty())
+            choices->items()[0].get_string("text", &warm_text);
+        CHECK(warm_text == ref.text,
+              "http: the warm run's text is bit-identical to the cold one");
+        const JsonValue *usage = j.find("usage");
+        const JsonValue *det = usage ? usage->find("prompt_tokens_details") : nullptr;
+        const i64 cached = det ? det->get_int("cached_tokens", -1) : -1;
+        CHECK(cached == ref.prompt_tokens - 1,
+              "http: it reused every prompt token but the one it must prefill");
     }
 
     // chat completion renders the ChatML template and answers
@@ -10822,7 +11348,7 @@ static void test_par_pool_covers_every_block() {
         const i64 n = 1 + next(4000);
         const i64 grain = 1 + next(static_cast<u64>(std::min<i64>(64, n)));
         std::fill(hits.begin(), hits.begin() + static_cast<size_t>(n), 0);
-        Pool::get().run(n, grain, [&](i64 b, i64 e) {
+        Pool::get().run(n, grain, /*split=*/true, [&](i64 b, i64 e) {
             // Exactly what the backend's bodies do: each block owns a
             // disjoint slice of the output and touches nothing shared.
             for (i64 i = b; i < e; i++) hits[static_cast<size_t>(i)]++;
@@ -13146,6 +13672,329 @@ static void test_mla_backend() {
     delete cpu;
 }
 
+// The virtual-NPU backend: github.com/riteshnair/npuxl-improved, reached
+// through src/npu/npu_offload.cpp. There are two arms of it and this group
+// gates both.
+//
+//   --npu      the GEMM path only: >95% of a transformer's FLOPs, and the one
+//              VNPU op whose numerics are within f32 rounding of the reference.
+//   --npu-cpu  `whole_graph`: every op the device has, which adds RMSNorm,
+//              SwiGLU, add and mul. Its nonlinearities run the device's own
+//              `fast_expf`, so this arm is NOT bit-identical -- the gate is a
+//              measured bound, not equality, and the bound is asserted here so
+//              a device that got worse cannot pass quietly.
+//
+// Three things are worth a gate. The seam (a factory that quietly returned the
+// CPU backend would still run every model correctly, so the only way to know
+// the option exists is to ask for it and ask the object what it is). The GEMM's
+// numerics, in both weight formats the offload accepts. And the whole-graph
+// arm's three properties: each routed op is within its documented bound of the
+// reference, the queue and the strict one-submit-per-op path produce identical
+// numbers (which is what proves no host op reads a row the device has not
+// written), and the ops the device does NOT have still run.
+static void test_npu_backend() {
+    // The reference backend answers the new capability question the way the
+    // engine's device tiers need it to: no memory of its own.
+    {
+        Backend *cpu = make_cpu_backend();
+        CHECK(cpu->kind() == BackendKind::CPU, "the reference reports CPU");
+        CHECK(!cpu->has_device_memory(),
+              "and says it computes in host memory (no VRAM tier to plan)");
+        CHECK(cpu->backend_stats().empty(),
+              "and has no offload counters to report");
+        delete cpu;
+    }
+
+    if (!npu_available()) {
+        std::string why;
+        Backend *b = make_npu_backend(0, /*whole_graph=*/true, &why);
+        CHECK(b == nullptr,
+              "a build without -DKRK_ENABLE_NPU cannot open the device");
+        CHECK(why.find("KRK_ENABLE_NPU") != std::string::npos,
+              "and the refusal names the switch that would build it");
+        if (b) delete b;
+        return;
+    }
+
+    std::string why;
+    Backend *npu = make_npu_backend(0, /*whole_graph=*/false, &why);
+    CHECK(npu != nullptr, why.empty() ? "the virtual NPU opens" : why.c_str());
+    if (!npu) return;
+    Backend *cpu = make_cpu_backend();
+    CHECK(npu->kind() == BackendKind::NPU, "it reports its own backend kind");
+    CHECK(!npu->has_device_memory(),
+          "and computes in host memory, so no VRAM tier is planned for it");
+    CHECK(npu->describe().find("Virtual NPU") != std::string::npos,
+          "its banner names the device it opened");
+    CHECK(npu->act_type() == DType::F32 && npu->act_size() == 4,
+          "activations are still the reference's f32");
+
+    // ---- the GEMM, at a decode shape and a prefill shape -------------------
+    const i64 n_in = 64, n_out = 24;
+    std::vector<f32> w(static_cast<size_t>(n_out * n_in));
+    u32 rng = 0x1234abcdu;
+    auto rnd = [&]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<f32>((rng >> 8) & 0xFFFFu) / 32768.0f - 1.0f;
+    };
+    for (f32 &v : w) v = rnd();
+    // The f16 arm re-reads weights that have been through the same rounding the
+    // file would carry, so the check measures the kernel and not the cast.
+    std::vector<u16> wbits(w.size());
+    for (size_t i = 0; i < w.size(); i++) wbits[i] = fp32_to_fp16(w[i]);
+
+    for (i64 rows : {i64(1), i64(5)}) {
+        std::vector<f32> x(static_cast<size_t>(rows * n_in));
+        for (f32 &v : x) v = rnd();
+        std::vector<f32> got(static_cast<size_t>(rows * n_out), 0.0f);
+        std::vector<f32> want(static_cast<size_t>(rows * n_out), 0.0f);
+        cpu->gemm(want.data(), x.data(), w.data(), DType::F32, n_out, n_in, rows);
+        npu->gemm(got.data(), x.data(), w.data(), DType::F32, n_out, n_in, rows);
+        f64 worst = 0.0, mag = 0.0;
+        for (size_t i = 0; i < got.size(); i++) {
+            const f64 d = std::fabs(static_cast<f64>(got[i]) - want[i]);
+            if (d > worst) worst = d;
+            mag = std::max<f64>(mag, std::fabs(want[i]));
+        }
+        const f64 rel = mag > 0.0 ? worst / mag : worst;
+        CHECK(rel < 2e-6,
+              rows == 1 ? "the device's f32 GEMV matches the reference to f32 "
+                          "rounding"
+                        : "and so does its multi-row GEMM (the prefill shape)");
+    }
+
+    // ---- determinism across row counts -------------------------------------
+    // One row's value must not depend on how many rows rode along with it, or
+    // the engine's chunk-invariance property (a gate of its own) would stop
+    // holding the moment a kernel switched units on M.
+    {
+        std::vector<f32> x5(static_cast<size_t>(5 * n_in));
+        for (f32 &v : x5) v = rnd();
+        std::vector<f32> five(static_cast<size_t>(5 * n_out), 0.0f);
+        npu->gemm(five.data(), x5.data(), w.data(), DType::F32, n_out, n_in, 5);
+        std::vector<f32> one(static_cast<size_t>(n_out), 0.0f);
+        npu->gemm(one.data(), x5.data() + 2 * n_in, w.data(), DType::F32, n_out,
+                  n_in, 1);
+        CHECK(std::memcmp(one.data(),
+                          five.data() + 2 * n_out,
+                          static_cast<size_t>(n_out) * sizeof(f32)) == 0,
+              "row 2 of a five-row call is bit-identical to the same row "
+              "computed alone");
+    }
+
+    // ---- f16 weights: the dequantizing staging path ------------------------
+    {
+        const size_t row_bytes = dtype_row_bytes(DType::F16, n_in);
+        std::vector<u8> wf16(static_cast<size_t>(n_out) * row_bytes);
+        for (i64 o = 0; o < n_out; o++)
+            std::memcpy(wf16.data() + static_cast<size_t>(o) * row_bytes,
+                        wbits.data() + static_cast<size_t>(o) * n_in,
+                        static_cast<size_t>(n_in) * 2);
+        std::vector<f32> x(static_cast<size_t>(3 * n_in));
+        for (f32 &v : x) v = rnd();
+        std::vector<f32> got(static_cast<size_t>(3 * n_out), 0.0f);
+        std::vector<f32> want(static_cast<size_t>(3 * n_out), 0.0f);
+        cpu->gemm(want.data(), x.data(), wf16.data(), DType::F16, n_out, n_in, 3);
+        npu->gemm(got.data(), x.data(), wf16.data(), DType::F16, n_out, n_in, 3);
+        f64 worst = 0.0, mag = 0.0;
+        for (size_t i = 0; i < got.size(); i++) {
+            worst = std::max<f64>(worst, std::fabs(static_cast<f64>(got[i]) - want[i]));
+            mag = std::max<f64>(mag, std::fabs(want[i]));
+        }
+        CHECK(mag > 0.0 && (mag > 0.0 ? worst / mag : worst) < 2e-6,
+              "an f16 weight tensor, dequantized once into the staging cache, "
+              "matches the reference GEMM");
+    }
+
+    // ---- the counters the run summary prints -------------------------------
+    {
+        const std::string stats = npu->backend_stats();
+        CHECK(stats.find("gemm ") != std::string::npos,
+              "the offload reports its per-op call counts");
+        CHECK(stats.find("gemm 0,") == std::string::npos,
+              "and the GEMM count is not zero after the calls above");
+        CHECK(stats.find("host: rope, attention") != std::string::npos,
+              "and names the ops that stayed on the host");
+    }
+    delete npu;
+
+    // =======================================================================
+    //  --npu-cpu: the whole graph through the device
+    // =======================================================================
+    Backend *graph = make_npu_backend(0, /*whole_graph=*/true, &why);
+    CHECK(graph != nullptr,
+          why.empty() ? "the whole-graph NPU backend opens" : why.c_str());
+    if (!graph) {
+        delete cpu;
+        return;
+    }
+    CHECK(graph->describe().find("whole graph") != std::string::npos,
+          "and says so in its banner, so a run cannot be mistaken for the "
+          "GEMM-only arm");
+    CHECK(graph->kind() == BackendKind::NPU, "it is still an NPU backend");
+    CHECK(!graph->has_device_memory(), "still computing in host memory");
+
+    // ---- RMSNorm: f32 rounding, not equality (the device reduces in SIMD) --
+    {
+        const i64 rows = 3, n = 256;
+        std::vector<f32> x(static_cast<size_t>(rows * n)), wgt(static_cast<size_t>(n));
+        for (f32 &v : x) v = rnd();
+        for (i64 i = 0; i < n; i++) wgt[static_cast<size_t>(i)] = 0.5f + 0.5f * std::fabs(rnd());
+        std::vector<f32> got(x.size(), 0.0f), want(x.size(), 0.0f);
+        cpu->rmsnorm(want.data(), x.data(), wgt.data(), rows, n, 1e-5f);
+        graph->rmsnorm(got.data(), x.data(), wgt.data(), rows, n, 1e-5f);
+        graph->sync(); // the routed ops are queued; sync is what submits them
+        f64 worst = 0.0, mag = 0.0;
+        for (size_t i = 0; i < got.size(); i++) {
+            worst = std::max<f64>(worst, std::fabs(static_cast<f64>(got[i]) - want[i]));
+            mag = std::max<f64>(mag, std::fabs(want[i]));
+        }
+        CHECK(mag > 0.0 && worst / mag < 2e-6,
+              "the device's RMSNorm matches the reference to f32 rounding");
+    }
+
+    // ---- SwiGLU: the documented 1e-4 bound, measured not assumed ----------
+    // This is the whole accuracy story of the arm: the device's silu is its own
+    // polynomial, so a bound is what the arm can promise. The number below is
+    // 8.4e-05 measured on the device; the gate holds it under 2e-4 and would
+    // fail if a future device made it worse.
+    {
+        const i64 n = 2048;
+        std::vector<f32> g(static_cast<size_t>(n)), u(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; i++) {
+            g[static_cast<size_t>(i)] = -12.0f + 24.0f * static_cast<f32>(i) / static_cast<f32>(n - 1);
+            u[static_cast<size_t>(i)] = 1.0f; // isolate the activation itself
+        }
+        std::vector<f32> got(static_cast<size_t>(n), 0.0f), want(static_cast<size_t>(n), 0.0f);
+        cpu->silu_mul(want.data(), g.data(), u.data(), n);
+        graph->silu_mul(got.data(), g.data(), u.data(), n);
+        graph->sync();
+        // Relative to each element's own value, ignoring the ones a silu sends
+        // to zero (there the absolute error is what matters and it is smaller).
+        f64 worst = 0.0, rel = 0.0;
+        for (i64 i = 0; i < n; i++) {
+            const f64 wv = want[static_cast<size_t>(i)];
+            const f64 d = std::fabs(static_cast<f64>(got[static_cast<size_t>(i)]) - wv);
+            worst = std::max(worst, d);
+            if (std::fabs(wv) > 1e-3) rel = std::max(rel, d / std::fabs(wv));
+        }
+        CHECK(rel < 2e-4,
+              rel < 2e-4 ? "the device's SwiGLU stays inside the arm's documented "
+                           "2e-4 relative bound"
+                         : "the device's SwiGLU has drifted outside the bound the "
+                           "arm documents -- check whether npuxl changed its exp");
+        std::printf("       (npu swiglu: worst %.3e absolute, %.3e relative)\n",
+                    worst, rel);
+    }
+
+    // ---- add / axpy / mul are exact: same expression, same order ----------
+    {
+        const i64 n = 512;
+        std::vector<f32> a(static_cast<size_t>(n)), b(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; i++) {
+            a[static_cast<size_t>(i)] = rnd();
+            b[static_cast<size_t>(i)] = rnd();
+        }
+        std::vector<f32> ga = a, gb = b, wa = a, wb = b;
+        graph->add_inplace(ga.data(), gb.data(), n);
+        graph->sync();
+        cpu->add_inplace(wa.data(), wb.data(), n);
+        CHECK(std::memcmp(ga.data(), wa.data(), static_cast<size_t>(n) * 4) == 0,
+              "the device's add is bit-identical to the reference's");
+        ga = a;
+        graph->axpy(ga.data(), b.data(), 0.25f, n);
+        graph->sync();
+        wa = a;
+        cpu->axpy(wa.data(), b.data(), 0.25f, n);
+        CHECK(std::memcmp(ga.data(), wa.data(), static_cast<size_t>(n) * 4) == 0,
+              "and so is axpy, scale included");
+        ga = a;
+        graph->mul_act(ga.data(), b.data(), n);
+        graph->sync();
+        wa = a;
+        cpu->mul_act(wa.data(), b.data(), n);
+        CHECK(std::memcmp(ga.data(), wa.data(), static_cast<size_t>(n) * 4) == 0,
+              "and mul");
+    }
+
+    // ---- the queue: batching must not change a single number --------------
+    // The whole-graph arm queues ops and submits them in one batch, and every
+    // host-implemented op flushes first. If that discipline had a hole -- one
+    // host kernel reading a row the device had not written yet -- the two
+    // submission policies would disagree. This builds a layer-shaped sequence
+    // that mixes routed and host ops (rmsnorm -> add -> silu -> mul -> a host
+    // op) and requires the two arms to produce identical bytes.
+    {
+        auto chain = [&](Backend *be, std::vector<f32> *out) {
+            const i64 n = 128;
+            std::vector<f32> x(static_cast<size_t>(n)), y(static_cast<size_t>(n));
+            std::vector<f32> gate(static_cast<size_t>(n)), up(static_cast<size_t>(n));
+            u32 seed = 0xfeed1234u;
+            auto r2 = [&]() {
+                seed = seed * 1664525u + 1013904223u;
+                return static_cast<f32>((seed >> 8) & 0xFFFFu) / 32768.0f - 1.0f;
+            };
+            for (i64 i = 0; i < n; i++) {
+                x[static_cast<size_t>(i)] = r2();
+                y[static_cast<size_t>(i)] = r2();
+                gate[static_cast<size_t>(i)] = 4.0f * r2();
+                up[static_cast<size_t>(i)] = r2();
+            }
+            std::vector<f32> g(static_cast<size_t>(n), 0.0f), u(static_cast<size_t>(n), 0.0f);
+            be->rmsnorm(g.data(), x.data(), nullptr, 1, n, 1e-5f);   // queued
+            be->add_inplace(g.data(), y.data(), n);                  // queued
+            be->silu_mul(u.data(), gate.data(), up.data(), n);       // queued
+            be->mul_act(g.data(), u.data(), n);                      // queued
+            // A host op that reads what the queue just produced. If the flush
+            // discipline were wrong this would read stale bytes.
+            const std::vector<f32> bias(static_cast<size_t>(n), 0.5f);
+            be->add_bias_rows(g.data(), bias.data(), n, 1);
+            *out = g;
+        };
+        std::vector<f32> batched, strict;
+        chain(graph, &batched);
+        set_env_var("KRK_NPU_STRICT_QUEUE", "1");
+        {
+            std::string w2;
+            Backend *strict_be = make_npu_backend(0, /*whole_graph=*/true, &w2);
+            if (strict_be) {
+                chain(strict_be, &strict);
+                delete strict_be;
+            }
+        }
+        clear_env_var("KRK_NPU_STRICT_QUEUE");
+        CHECK(!strict.empty() &&
+                  std::memcmp(batched.data(), strict.data(),
+                              batched.size() * sizeof(f32)) == 0,
+              "one batch per layer and one submit per op leave the same bytes: "
+              "no host kernel reads a row the device has not written");
+    }
+
+    // ---- the ops the device does not have still run -----------------------
+    // gelu is deliberately NOT offloaded (the device's is 0.74 relative off),
+    // so the reference body must still be what runs there.
+    {
+        std::vector<f32> xg(64), xc(64);
+        for (size_t i = 0; i < xg.size(); i++)
+            xg[i] = xc[i] = -4.0f + 0.125f * static_cast<f32>(i);
+        graph->gelu_act(xg.data(), static_cast<i64>(xg.size()));
+        cpu->gelu_act(xc.data(), static_cast<i64>(xc.size()));
+        CHECK(std::memcmp(xg.data(), xc.data(), xg.size() * sizeof(f32)) == 0,
+              "the GeGLU activation is the reference's: the device's own gelu "
+              "measures 0.74 relative off and is not used");
+    }
+
+    {
+        const std::string gs = graph->backend_stats();
+        CHECK(gs.find("rmsnorm 0,") == std::string::npos,
+              "the summary counts the RMSNorms the device ran");
+        CHECK(gs.find("swiglu 0,") == std::string::npos, "and the SwiGLUs");
+    }
+
+    delete graph;
+    delete cpu;
+}
+
 // MLA loader: the three layouts, the geometry checks, and why the engine
 // refuses to generate from any of them.
 //
@@ -14060,7 +14909,8 @@ static void test_dsv4_whole_graph() {
     // Prefill only (max_tokens 0), so the row read afterwards is the one at the
     // last prompt position -- the row a decode starts from.
     auto run = [&](const std::string &file, const char *prompt, i32 chunk,
-                   u64 *hash, i32 *top1, std::string *why) -> bool {
+                   u64 *hash, i32 *top1, std::string *why,
+                   RowPin *pin = nullptr) -> bool {
         Backend *cpu = make_cpu_backend();
         bool ok = false;
         {
@@ -14089,6 +14939,7 @@ static void test_dsv4_whole_graph() {
                     for (i32 i = 1; i < nv; i++)
                         if (lg[i] > lg[best]) best = i;
                     *top1 = best;
+                    if (pin) *pin = row_pin(lg, nv);
                 } else {
                     ok = false;
                 }
@@ -14127,8 +14978,9 @@ static void test_dsv4_whole_graph() {
 
     u64 h_wide = 0, h_narrow = 0, h_other = 0, h_shift = 0;
     i32 t_wide = -1, t_narrow = -1, t_other = -1, t_shift = -1;
+    RowPin pin_wide;
     std::string why;
-    CHECK(run(path, "the", 8, &h_wide, &t_wide, &why),
+    CHECK(run(path, "the", 8, &h_wide, &t_wide, &why, &pin_wide),
           "the whole graph prefills and the row reaches the head");
     std::fprintf(stderr, "  (logits row %016llx, argmax %d)\n",
                  static_cast<unsigned long long>(h_wide),
@@ -14136,14 +14988,24 @@ static void test_dsv4_whole_graph() {
 
     // ---- 1. the recorded row --------------------------------------------
     // Recorded from this graph on the fixture, CPU backend, prompt "the".
+    // The pin is the portable fingerprint (see row_pin's note); the bit hash
+    // is host-dependent and is compared only under KRK_GOLDEN_BITS=1.
     static const u64 kGoldenHash = 0x12602ed8b3a49addull;
     static const i32 kGoldenArgmax = 0;
+    static const RowPin kGolden = {
+        {1.555394, 1.555394, 1.555394, 1.555394, 1.555394, 1.555394, 1.555394,
+         1.555394},
+        -2.707561, 343.138183, 24.373835};
     CHECK(h_wide != 0, "the row is not empty");
-    if (kGoldenHash != 0) {
+    CHECK(t_wide == kGoldenArgmax, "and its argmax is the recorded token");
+    std::fprintf(stderr, "  (dsv4 pin: %s)\n", pin_str(pin_wide).c_str());
+    if (kGolden.l1 != 0.0)
+        CHECK(pin_close(pin_wide, kGolden),
+              "the last prompt row matches the recorded fingerprint (the whole "
+              "graph's output)");
+    if (golden_bits_on() && kGoldenHash != 0)
         CHECK(h_wide == kGoldenHash,
-              "the last prompt row is the recorded one (the whole graph's output)");
-        CHECK(t_wide == kGoldenArgmax, "and its argmax is the recorded token");
-    }
+              "KRK_GOLDEN_BITS: the recorded row, bit for bit");
 
     // ---- 2. the prompt reaches the row -----------------------------------
     CHECK(run(path, "a", 8, &h_other, &t_other, &why),
@@ -14838,7 +15700,8 @@ static void test_qwen4exp_whole_graph() {
     // Prefill only (`max_tokens 0`), so the row read afterwards is the one at
     // the last prompt position -- the row a decode starts from.
     auto run = [&](const std::string &file, const char *prompt, i32 chunk,
-                   std::vector<i32> *tokens, u64 *hash, i32 *top1) -> bool {
+                   std::vector<i32> *tokens, u64 *hash, i32 *top1,
+                   RowPin *pin = nullptr) -> bool {
         Backend *cpu = make_cpu_backend();
         bool ok = false;
         {
@@ -14865,7 +15728,7 @@ static void test_qwen4exp_whole_graph() {
                     for (i32 i = 1; i < nv; i++)
                         if (lg[i] > lg[best]) best = i;
                     *top1 = best;
-
+                    if (pin) *pin = row_pin(lg, nv);
                 } else {
                     ok = false;
                 }
@@ -14907,7 +15770,8 @@ static void test_qwen4exp_whole_graph() {
     std::vector<i32> prompt_row, narrow_row, other_row, pert_row;
     u64 h_wide = 0, h_narrow = 0, h_other = 0, h_pert = 0;
     i32 t_wide = -1, t_narrow = -1, t_other = -1, t_pert = -1;
-    CHECK(run(path, "the", 8, &prompt_row, &h_wide, &t_wide),
+    RowPin pin_wide;
+    CHECK(run(path, "the", 8, &prompt_row, &h_wide, &t_wide, &pin_wide),
           "the whole graph prefills and the row reaches the head");
     std::fprintf(stderr, "  (logits row %016llx, argmax %d)\n",
                  static_cast<unsigned long long>(h_wide),
@@ -14915,12 +15779,24 @@ static void test_qwen4exp_whole_graph() {
 
     // ---- 1. the recorded row --------------------------------------------
     // Recorded from this graph on the fixture, CPU backend, prompt "the".
+    // The pin is the portable fingerprint (see row_pin's note); the bit hash
+    // is host-dependent and is compared only under KRK_GOLDEN_BITS=1.
     static const u64 kGoldenHash = 0x1de9761d6eabacebull;
     static const i32 kGoldenArgmax = 8;
+    static const RowPin kGolden = {
+        {0.626528, 0.626528, 0.626528, 0.626528, 0.626528, 0.626528, 0.626528,
+         0.626528},
+        -0.944485, 132.638909, 9.229401};
     CHECK(h_wide != 0, "the row is not empty");
-    CHECK(h_wide == kGoldenHash,
-          "the last prompt row is the recorded one (the whole graph's output)");
     CHECK(t_wide == kGoldenArgmax, "and its argmax is the recorded token");
+    std::fprintf(stderr, "  (qwen4exp pin: %s)\n", pin_str(pin_wide).c_str());
+    if (kGolden.l1 != 0.0)
+        CHECK(pin_close(pin_wide, kGolden),
+              "the last prompt row matches the recorded fingerprint (the whole "
+              "graph's output)");
+    if (golden_bits_on())
+        CHECK(h_wide == kGoldenHash,
+              "KRK_GOLDEN_BITS: the recorded row, bit for bit");
 
     // ---- 2. the prompt reaches the row -----------------------------------
     CHECK(run(path, "a", 8, &other_row, &h_other, &t_other),
@@ -16921,6 +17797,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_rope_pair_convention)
     TEST_GROUP(test_end_to_end_cpu)
     TEST_GROUP(test_prefill_chunk_bitexact)
+    TEST_GROUP(test_gemma_family_chunk_gate)
     TEST_GROUP(test_lfm2_shortconv)
     TEST_GROUP(group_attention_sinks)
     TEST_GROUP(test_moe_schema_and_laziness)
@@ -16952,6 +17829,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_mla_absorb)
     TEST_GROUP(test_mla_lite)
     TEST_GROUP(test_mla_backend)
+    TEST_GROUP(test_npu_backend)
     TEST_GROUP(test_mla_loader)
     TEST_GROUP(test_mla_shared)
     TEST_GROUP(test_dsv4_hash_route)
@@ -16964,6 +17842,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_gdn_model_loads)
     TEST_GROUP(test_gdn_generation)
     TEST_GROUP(test_speculative_decoding)
+    TEST_GROUP(test_attention_softcap)
     TEST_GROUP(test_attention_self_mask)
     TEST_GROUP(test_dflash_mask_guard)
     TEST_GROUP(test_nvfp4_sidecar_dflash)

@@ -79,7 +79,7 @@ public:
     // first forward pass.
     void set_workers(i64 n) {
         std::unique_lock<std::mutex> lk(mu_);
-        if (n < 1 || body_ != nullptr) return;
+        if (n < 1 || body_fn_ != nullptr) return;
         const i64 want = std::min<i64>(n - 1, 63);
         if (want == static_cast<i64>(workers_.size())) return;
         // Retire the current generation: each worker exits its loop as
@@ -103,12 +103,34 @@ public:
     // Run body(b, e) over blocks of at most `grain` indices covering
     // [0, n). body must touch only data disjoint from other blocks and
     // must not call back into the pool.
-    void run(i64 n, i64 grain, const std::function<void(i64, i64)> &body) {
-        if (n <= 0 || !body) return;
+    //
+    // `split == false` forces the serial path: the flop floor in par_for is a
+    // throughput policy, not a semantic one. Both branches below call the SAME
+    // instantiation of `invoke`, and that is load-bearing rather than tidy.
+    //
+    // Calling the lambda directly at the call site (what this did for small
+    // ops) and calling it through std::function inside the pool (what it did
+    // for large ones) compiles the same arithmetic TWICE, and GCC contracts
+    // `a * c - b * s` into an FMA in one copy and not in the other. The
+    // rounding difference is ~1e-7 relative, which is enough to make the CPU
+    // reference backend's answer depend on how many rows the caller passed in
+    // one call: measured on RoPE, row 65 of a 66-row call differed from the
+    // same row of a 1-row call in 200 of 512 lanes, and that is exactly the
+    // chunk-invariance property test_prefill_chunk_bitexact gates on. One
+    // trampoline for both paths makes the serial case and the pooled case the
+    // same machine code, so the floor can be tuned without moving a number.
+    template <class F>
+    void run(i64 n, i64 grain, bool split, F &&body) {
+        if (n <= 0) return;
+        using G = typename std::remove_reference<F>::type;
+        void (*const invoke)(void *, i64, i64) = [](void *ctx, i64 b, i64 e) {
+            (*static_cast<G *>(ctx))(b, e);
+        };
+        if (grain < 1) grain = n < 1 ? 1 : n;
         const i64 blocks = (n + grain - 1) / grain;
         const i64 participants = static_cast<i64>(workers_.size()) + 1;
-        if (blocks <= 1 || workers_.empty()) {
-            body(0, n);
+        if (!split || blocks <= 1 || workers_.empty()) {
+            invoke(&body, 0, n);
             return;
         }
         // Static partition of the (uniform) blocks. stride >= 1 even
@@ -125,7 +147,8 @@ public:
             grain_ = grain;
             blocks_ = blocks;
             stride_ = stride;
-            body_ = &body;
+            body_ctx_ = &body;
+            body_fn_ = invoke;
             done_ = 0;
             // Release-order bump: workers acquire-load the id, so every
             // field written above is visible the moment they observe it.
@@ -137,7 +160,8 @@ public:
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_done_.wait(lk, [&] { return done_ >= blocks_; });
-            body_ = nullptr;
+            body_ctx_ = nullptr;
+            body_fn_ = nullptr;
         }
     }
 
@@ -157,12 +181,13 @@ private:
     // (test_par_pool_covers_every_block failed ~1 run in 3).
     struct Slice {
         i64 n = 0, grain = 0, blocks = 0, stride = 0;
-        const std::function<void(i64, i64)> *body = nullptr;
+        void *ctx = nullptr;
+        void (*invoke)(void *, i64, i64) = nullptr;
     };
 
     // Snapshot the published geometry. Called under mu_.
     Slice snapshot() const {
-        return Slice{n_, grain_, blocks_, stride_, body_};
+        return Slice{n_, grain_, blocks_, stride_, body_ctx_, body_fn_};
     }
 
     // Run blocks [me*stride, min((me+1)*stride, blocks)) of the task
@@ -173,9 +198,8 @@ private:
         const i64 b = me * s.stride;
         if (b >= s.blocks) return;
         const i64 e = std::min(b + s.stride, s.blocks);
-        const std::function<void(i64, i64)> &fn = *s.body;
         for (i64 i = b; i < e; i++)
-            fn(i * s.grain, std::min((i + 1) * s.grain, s.n));
+            s.invoke(s.ctx, i * s.grain, std::min((i + 1) * s.grain, s.n));
         // One completion report per participant per task — staggered by
         // work completion, so the mutex sees almost no contention.
         {
@@ -244,7 +268,7 @@ private:
                     if (task_id_.load(std::memory_order_acquire) > seen) {
                         run_id = task_id_.load(std::memory_order_acquire);
                         s = snapshot();
-                        have = s.body != nullptr;
+                        have = s.invoke != nullptr;
                     }
                     if (have) break;
                     // The task was retired before we could claim it (the
@@ -268,7 +292,7 @@ private:
                     // and the geometry always come from the same publish.
                     run_id = task_id_.load(std::memory_order_acquire);
                     s = snapshot();
-                    have = run_id > seen && s.body != nullptr;
+                    have = run_id > seen && s.invoke != nullptr;
                     if (!have) {
                         seen = run_id;
                         lk.unlock();
@@ -292,7 +316,8 @@ private:
     std::condition_variable cv_start_;
     std::condition_variable cv_done_;
     std::vector<std::thread> workers_;
-    const std::function<void(i64, i64)> *body_ = nullptr;
+    void *body_ctx_ = nullptr;
+    void (*body_fn_)(void *, i64, i64) = nullptr;
     i64 n_ = 0;
     i64 grain_ = 0;
     i64 blocks_ = 0;

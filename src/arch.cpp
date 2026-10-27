@@ -30,6 +30,30 @@ constexpr ArchSpec kFallback = {
     /*gemma_norm=*/false,
 };
 
+// The gemma stack, built here rather than spelled out inline. Every gemma file
+// gates its FFN with GeGLU -- gelu(gate) * up, not silu(gate) * up -- and that
+// is ArchSpec::gelu_ffn, which sits behind twelve members that have to be
+// written out to reach it positionally. A silent SwiGLU there is not a visible
+// failure: the two activations agree near zero and differ only in the tail, so
+// the model keeps producing plausible text with the wrong function. Naming the
+// four shared flags once and setting the rest by name is the way to keep that
+// from coming back.
+//
+//   swa_period / window_first are the family's alternating pattern:
+//     gemma2: 2, windowed layer first (even layers 4096-token window)
+//     gemma3: 6, windowed first (five local layers per one global)
+//   gemma/gemma4 consult the file for the window and keep period 0.
+constexpr ArchSpec gemma_spec(const char *name, ArchSupport sup, const char *why,
+                              int swa_period, bool window_first) {
+    ArchSpec s{name,       ArchShape::Dense, sup,     ArchRole::Target,
+               "gemma",    why,              /*qk_norm=*/true,
+               /*q_output_gate=*/false, /*qkv_bias=*/false,
+               /*gemma_norm=*/true,      /*attn_gate=*/false,
+               /*rope_neox=*/true,       swa_period, window_first};
+    s.gelu_ffn = true;
+    return s;
+}
+
 // The loadable schemas first, then the ones that stop at a reason. Flags on a
 // refused entry are descriptive: they record what the file carries so the entry
 // can be flipped to Yes without re-deriving the schema, and they are never
@@ -97,25 +121,43 @@ constexpr ArchSpec kTable[] = {
      /*qk_norm=*/true, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/true,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/1},
-    // Gemma scales the embedding by sqrt(n_embd) and uses a tighter eps.
-    // Gemma 1 is the llama schema plus embedding scaling. It is not in the
-    // collections here, so the entry says so rather than claiming a validated
-    // run. (Final-logit softcapping is implemented; the attention-side
-    // softcap and sliding windows are not — see gemma2/gemma3.)
-    {"gemma", ArchShape::Dense, ArchSupport::Partial, ArchRole::Target, "gemma",
-     "not validated against a file in this collection; the schema is llama plus "
-     "embedding scaling",
-     true, false, false, true, false, true},
-    // Gemma 2 adds a softcap on the *attention* logits (inside the softmax,
-    // where a host-side fix cannot reach) and alternating sliding-window
-    // attention. Neither is implemented.
-    {"gemma2", ArchShape::Dense, ArchSupport::No, ArchRole::Target, "gemma",
-     "attention-logit softcapping and alternating sliding-window attention are "
-     "not implemented",
-     true, false, false, true, false, true},
-    {"gemma3", ArchShape::Dense, ArchSupport::No, ArchRole::Target, "gemma",
-     "alternating sliding-window attention is not implemented",
-     true, false, false, true, false, true},
+    // Gemma scales the embedding by sqrt(n_embd), uses a tighter eps, gates its
+    // FFN with GeGLU and softcaps the final logits. Gemma 1 is the llama schema
+    // plus those four. It is not in the collections here, so the entry says so
+    // rather than claiming a validated run.
+    gemma_spec("gemma", ArchSupport::Partial,
+               "not validated against a file in this collection; the schema is "
+               "llama plus embedding scaling, GeGLU and a final-logit softcap",
+               0, false),
+    // Gemma 2: every piece of its schema is now implemented. The alternating
+    // window (period 2, windowed layer first) is read from this entry and the
+    // loader's is_swa() drives it; GeGLU, the embedding scaling and the
+    // final-logit softcap were already there; and the softcap on the ATTENTION
+    // logits -- cap * tanh(score / cap) between the QK dot and the softmax, i.e.
+    // inside the score formation rather than as a transform of the result,
+    // which is a different function -- is AttnDesc::softcap, applied by the
+    // reference attention and gated against a hand-computed softmax in the
+    // tests. The HIP kernels keep four score paths of their own and none caps
+    // yet, so that backend answers attention_softcap_supported() == false and
+    // Engine::init refuses the run by name rather than decoding a different
+    // model; --cpu and both NPU arms run it.
+    gemma_spec("gemma2", ArchSupport::Partial,
+               "the attention-logit softcap is applied by the reference "
+               "attention (--cpu, --npu, --npu-cpu) but not by the HIP "
+               "kernels, which refuse the run by name; the alternating window, "
+               "GeGLU and the final-logit softcap are implemented; not "
+               "validated against a gemma2 file in this collection",
+               2, true),
+    // Gemma 3: QK-norm, GeGLU, embedding scaling, a final-logit softcap and a
+    // 5:1 local/global pattern (period 6, windowed layers first, 1024-token
+    // window declared in the file). Every one of those pieces is implemented
+    // and driven by schema flags rather than by arch name; the remaining doubt
+    // is a validated run, which this collection has no gemma3 file for.
+    gemma_spec("gemma3", ArchSupport::Partial,
+               "the loader reads its whole schema (QK-norm, GeGLU, the 5:1 "
+               "windowed/global pattern, embedding scaling, final-logit softcap); "
+               "not validated against a file in this collection",
+               6, true),
     // Gemma 4 (E-series) as the files in the collection declare it: 42 layers,
     // shared-KV layers, two attention geometries (global heads of 512 with 512
     // rope dims, sliding-window heads of 256 with 256) and per-layer input
@@ -128,11 +170,13 @@ constexpr ArchSpec kTable[] = {
     // got past the arch table was refused by the head-geometry check with
     // "attention tensors disagree with the declared head geometry" -- a message
     // about the file's own tensors, for a feature this engine does not have.
-    {"gemma4", ArchShape::Dense, ArchSupport::No, ArchRole::Target, "gemma",
-     "per-layer input embeddings, shared-KV layers, two attention geometries "
-     "(global + sliding window), per-layer attention.head_count_kv and the "
-     "attention-logit softcap are not implemented",
-     true, false, false, true, false, true},
+    gemma_spec("gemma4", ArchSupport::No,
+               "per-layer input embeddings, shared-KV layers, two attention "
+               "geometries (global + sliding window) and the attention-logit "
+               "softcap are not implemented; the per-layer "
+               "attention.head_count_kv array, GeGLU and the final-logit softcap "
+               "are",
+               0, false),
 
     // ---- loads and runs, with a named gap ---------------------------------
     // The language tower of a vision model is the text schema; the vision tower

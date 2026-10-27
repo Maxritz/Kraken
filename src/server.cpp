@@ -189,6 +189,25 @@ void report_request_time(const GenerateResult &r) {
 OpenAiService::OpenAiService(Engine *engine, f32 default_temp, std::mutex *service_mutex)
     : engine_(engine), default_temp_(default_temp), mu_(service_mutex) {}
 
+// How many leading tokens of `prompt` the KV cache already holds. The cache is
+// the same tokens at the same positions, so a prefill that starts here computes
+// exactly what a prefill from 0 would have computed for the rows above it --
+// this is not an approximation of the prefix, it IS the prefix.
+//
+// At least one token is always left for the prefill: the row a run samples
+// from is the row its last prefill call produces, and a "reuse everything"
+// request would have no logits row to sample at all.
+i64 OpenAiService::reusable_prefix(const std::vector<i32> &prompt) const {
+    if (prefix_ids_.empty() || prompt.empty()) return 0;
+    const i64 held = std::min<i64>(static_cast<i64>(prefix_ids_.size()),
+                                  engine_->kv_pos());
+    const i64 cap = std::min<i64>(held, static_cast<i64>(prompt.size()) - 1);
+    i64 n = 0;
+    while (n < cap && prefix_ids_[static_cast<size_t>(n)] == prompt[static_cast<size_t>(n)])
+        n++;
+    return n;
+}
+
 bool OpenAiService::handle(const HttpRequest &req, HttpResponse &res, HttpConn &conn) {
     if (req.method != "GET" && req.method != "POST") {
         res = json_response(405, error_body("method not allowed"));
@@ -333,7 +352,28 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
 
     GenerateResult r;
     std::lock_guard<std::mutex> lock(*mu_);
-    if (!engine_->kv_rollback(0)) {
+
+    // ---- KV prefix reuse ---------------------------------------------------
+    // Before this, every request threw the whole cache away (`kv_rollback(0)`)
+    // and re-prefilled the entire prompt. Two requests that share a prefix --
+    // which is what a chat session is -- paid for the shared part twice. The
+    // cache is now cut back to the longest common prefix instead, and the
+    // prefill starts there.
+    //
+    // The comparison is over token ids, not text: a template marker that
+    // tokenizes differently would otherwise look like a shared prefix and be
+    // answered from a stale row.
+    std::vector<i32> prompt_ids;
+    if (engine_->tokenizer().encode(prompt, prompt_ids, true) < 0) prompt_ids.clear();
+    i64 reuse = reusable_prefix(prompt_ids);
+    bool rolled = false;
+    if (reuse > 0) rolled = engine_->kv_rollback(reuse);
+    if (!rolled) {
+        reuse = 0;
+        rolled = engine_->kv_rollback(0);
+    }
+    if (!rolled) {
+        prefix_ids_.clear();
         res = json_response(
             503, error_body("context rollback could not preserve KV history within the "
                             "host-memory reserve; free host RAM, raise --kv-hot-mb, "
@@ -341,6 +381,22 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
                             "resource_exhausted"));
         return true;
     }
+    p.reuse_tokens = static_cast<i32>(reuse);
+    if (reuse > 0)
+        KRK_DEBUG("prefix cache: %lld of %zu prompt tokens are already in the KV",
+                  static_cast<long long>(reuse), prompt_ids.size());
+    // A request that fails must not leave a cache entry behind: the rows it
+    // wrote are not the ones a later request would assume they are.
+    auto note_kv = [&](bool ok) {
+        if (!ok) {
+            prefix_ids_.clear();
+            return;
+        }
+        const i64 held = engine_->kv_pos();
+        if (held < static_cast<i64>(prompt_ids.size()))
+            prompt_ids.resize(static_cast<size_t>(held));
+        prefix_ids_ = prompt_ids;
+    };
 
     if (stream) {
         StreamState st;
@@ -368,11 +424,13 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
         }
         res.status = ok ? 200 : (r.finish == FinishError ? 503 : 500);
         res.content_type = "text/event-stream";
+        note_kv(ok);
         report_request_time(r);
         return true;
     }
 
     const bool ok = engine_->generate(p, &r);
+    note_kv(ok);
     if (!ok) {
         const bool resource_error = r.finish == FinishError;
         const std::string message = r.error.empty() ? "generation failed" : r.error;
@@ -406,6 +464,14 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
     usage.set("prompt_tokens", static_cast<i64>(r.prompt_tokens));
     usage.set("completion_tokens", static_cast<i64>(r.generated));
     usage.set("total_tokens", static_cast<i64>(r.prompt_tokens) + r.generated);
+    // OpenAI's field for "this many prompt tokens were already cached": the
+    // prefill was allowed to skip them. Carried in the response so a client can
+    // tell a warm request from a cold one instead of guessing from latency.
+    {
+        JsonValue details = JsonValue::object();
+        details.set("cached_tokens", static_cast<i64>(r.reused_tokens));
+        usage.set("prompt_tokens_details", std::move(details));
+    }
     root.set("usage", std::move(usage));
     res = json_response(200, std::move(root));
     return true;

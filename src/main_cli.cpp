@@ -98,6 +98,8 @@ struct Args {
     // always wins over it.
     bool draft_tokens_given = false;
     bool cpu = false;
+    bool npu = false;
+    bool npu_cpu = false;
     bool greedy = false;
     bool tokenize = false;
     // Print one hash of the prompt's last-position logits and exit (see
@@ -164,6 +166,25 @@ void usage() {
         "  --system STR          system message for --chat\n"
         "  --cpu                 use the scalar reference backend\n"
         "  --device N            HIP device index (default 0)\n"
+        "  --npu                 run the GEMM path on the virtual NPU\n"
+        "                        (github.com/riteshnair/npuxl-improved;\n"
+        "                        needs a -DKRK_ENABLE_NPU=ON build). The\n"
+        "                        rest of the graph stays on the scalar\n"
+        "                        reference, so numbers match the CPU arm\n"
+        "                        to f32 rounding rather than bit-exactly\n"
+        "  --npu-cpu             run the WHOLE inference through the virtual\n"
+        "                        NPU: every op the device has (GEMM, RMSNorm,\n"
+        "                        SwiGLU, add, mul) is issued to it, and the\n"
+        "                        ops it lacks keep the reference body. 11x the\n"
+        "                        prefill and 2.5x the decode of --cpu on a\n"
+        "                        4-layer 512-dim fixture, and within noise of\n"
+        "                        --npu (the GEMM dominates both). Not\n"
+        "                        bit-identical to --cpu: its silu is the\n"
+        "                        device's own and is measured 8.4e-05\n"
+        "                        relative off; it still reproduces --cpu's\n"
+        "                        greedy trajectory on that fixture.\n"
+        "                        KRK_NPU_MIN_ELEMS=N sends only ops of N or\n"
+        "                        more elements to the device (0 = all).\n"
         "  --expert-cache-mb N   MoE expert residency budget in MiB (0 = auto)\n"
         "  --host-ram-mb N       host memory to plan for, in MiB. 0 uses a\n"
         "                        quarter of installed RAM. Bounds every host\n"
@@ -522,6 +543,8 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--prefill-hash") a->prefill_hash = true;
         else if (f == "--chat") a->chat = true;
         else if (f == "--cpu") a->cpu = true;
+        else if (f == "--npu") a->npu = true;
+        else if (f == "--npu-cpu") a->npu_cpu = true;
         else if (f == "--info") a->info = true;
         else if (f == "--bench") a->bench = true;
         else if (f == "--profile") a->profile = true;
@@ -716,6 +739,12 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                      "= %.1f tok/s (%.1f ms/step)\n",
                      r.generated, r.decode_ms,
                      static_cast<long long>(r.decode_steps), dtps, dper);
+    }
+    // What the GEMM hand-over actually did. Printed only when the backend has
+    // something to report, so CPU and HIP runs are unchanged.
+    if (be) {
+        const std::string bs = be->backend_stats();
+        if (!bs.empty()) std::fprintf(out, "[stats ] npu       %s\n", bs.c_str());
     }
     if (dev_total > 0)
         std::fprintf(out,
@@ -1386,7 +1415,23 @@ int main(int argc, char **argv) {
 
     std::string err;
     Backend *be = nullptr;
-    if (a.cpu) {
+    if (a.cpu && (a.npu || a.npu_cpu)) {
+        KRK_WARN("--cpu and --npu/--npu-cpu both given; the reference backend wins");
+        a.npu = false;
+        a.npu_cpu = false;
+    }
+    if (a.npu && a.npu_cpu) {
+        KRK_WARN("--npu and --npu-cpu both given; --npu-cpu (the whole graph) wins");
+        a.npu = false;
+    }
+    if (a.npu || a.npu_cpu) {
+        be = make_npu_backend(a.device, a.npu_cpu, &err);
+        if (!be) {
+            KRK_WARN("%s", err.c_str());
+            KRK_WARN("falling back to the CPU reference backend");
+            be = make_cpu_backend();
+        }
+    } else if (a.cpu) {
         be = make_cpu_backend();
     } else {
         // --prefill maps onto the backend's own GEMM rung switch, which is read
