@@ -88,6 +88,34 @@ ModelVerdict assess_model(const Gguf &g) {
                                 std::string(v.spec->family) + " defaults");
     }
 
+    // An unlisted arch usually has no geometry to read, and saying "runnable"
+    // about it sends the reader to a load that can only fail -- after the whole
+    // file has been mapped, with a message that blames the metadata rather than
+    // the architecture.
+    //
+    // Measured, not supposed: a qwen3moe fixture with only its
+    // `general.architecture` string rewritten to an unlisted name made
+    // `kraken-inspect` print "verdict runnable" while `kraken` refused with
+    // "GGUF metadata is missing core geometry (arch='zzz9moxx')". The engine
+    // was right and the verdict was wrong, and the verdict is what gets read
+    // first. The underlying keys are `<arch>.block_count`, so an unknown prefix
+    // finds none of them: that is the actual reason, and it is worth naming.
+    //
+    // Not every unlisted arch is unloadable, which is why this asks the file
+    // rather than the name: a converter that keeps llama's key prefix under a
+    // new label still has its geometry, and that case stays runnable with the
+    // note above.
+    if (!v.arch.empty() && !v.known &&
+        g.get_i64(v.arch + ".block_count", -1) < 0) {
+        v.blockers.push_back(
+            "architecture '" + v.arch +
+            "' is not in the architecture table and the file carries no '" +
+            v.arch +
+            ".block_count' key, so the layer stack cannot be determined. "
+            "Known architectures: " +
+            arch_known_names());
+    }
+
     const ArchShape shape = v.spec->shape;
 
     // What kind of file this is, before what arch it is. A shard of a split

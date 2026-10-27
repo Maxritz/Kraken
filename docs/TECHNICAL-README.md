@@ -84,6 +84,33 @@ prefill is a union problem, and `--expert-cache-mb` is one knob for both. Size
 it for prefill to avoid churn; size it for decode to save memory and accept
 re-reads during prefill.
 
+### The measured ladder (2026-10-27)
+
+Full tables in [MOE-RESIDENCY.md](MOE-RESIDENCY.md); the shape of the result, on
+a 1.2 GiB q8_0 MoE (20 layers, 32 experts, top-4) on 2 vCPU:
+
+| | all resident | 64 MiB | 16 MiB |
+|---|---:|---:|---:|
+| prefill, exact | 13.95 s | 13.68 s | 14.02 s |
+| prefill, AVX2 dot | 3.94 s | 3.82 s | 3.95 s |
+| decode, AVX2 dot | 41.1 ms | 73.6 ms | 74.6 ms |
+| read | 369 MiB | 2519 MiB | 2519 MiB |
+
+**Prefill is flat across residency and decode is not.** The expert path's read is
+533 ms of a 3858 ms prefill at 64 MiB (14%): the gathers are real but they are
+not what prefill is spending its time on. Decode pays 1.79× for the same
+residency because it has one row of arithmetic to hide 1405 expert loads behind.
+Two corollaries that change how the knobs should be set: `--chunk` below ~128
+multiplies the gathers (chunk 8 reads 2.8× what chunk 128 does for the same
+prompt), and `--expert-warm-mb` is worth more than the device budget (a 512 MiB
+WARM tier at a 64 MiB budget cuts the read to 246 MiB, 0.10×).
+
+On the virtual NPU the asymmetry becomes a cliff rather than a slope: with
+`KRK_NPU_W8A8=1` decode is 32.8 ms/token resident against 416–719 ms/token when
+experts stream, because the int8 pack is memoized per weight address and a
+streaming slot changes address on every visit. The mechanism, the rejected fix
+and the numbers are in [MOE-RESIDENCY.md §5](MOE-RESIDENCY.md).
+
 Prefetch and prediction, all opt-in and all measured before being believed:
 
 - `--expert-warm-prefetch` fills WARM at load.
@@ -130,7 +157,7 @@ into this sandbox: HuggingFace is not reachable from it, and the smallest is
 |---|---|---|---|
 | **DeepSeek-V4.1-Flash-1017** (552 B backbone / 763 B weights, 40 layers, hidden 5120, 384 routed experts top-6 + 1 shared) | `deepseek41` | **recognised, Partial** — added this pass | The graph is `deepseek4`'s and maps onto it: shared-latent MLA, the grouped low-rank output projection and the `tid2eid` hash route run (`test_dsv4_whole_graph` pins the dense-core case). Missing: the **CSA/HCA compressors** (`attn_compressor_*`), the **sparse indexer**, `attn_sinks`, **Engram** conditional memory (196 B params, a token-hash lookup), and the 4-wide **hyper-connections**. A real V4.1 checkpoint carries a non-zero `compress_ratios` and will be refused at `Engine::init` **by name** rather than mis-loaded |
 | **Qwen3.8-Flash-Next** (125 B MoE + 51 B n-gram head, 512 routed experts top-10 + 1 shared, 48 layers, Gated DeltaNet + QSA hybrid) | `qwen4exp` | **implemented, gated** | Every component has a kernel (HC, PLE, QSA, GDN, experts) and component tests pass. What is missing is a **whole-graph coherence gate** against an independently verified reference on the real GGUF: one recorded REAP-288 prompt matched 24/24 and another coding prompt historically diverged. Serving fluent wrong output is the failure this engine exists to avoid, so the family stays gated until that gate is built |
-| **MiniMax-M3.1-Flash** (428 B MoE, 23 B active, 1M context, MSA sparse attention throughout, native multimodal, DSpark draft head) | not mapped | **not supported** | No GGUF tensor schema has been validated for it, and the graph needs pieces this engine does not have: **MSA** (a MinMax-specific sparse attention), multimodal input towers (text+image+video), and DSpark. Mapping a schema from the safetensors naming alone would be a guess, and a guessed mapping is what produces silently wrong output |
+| **MiniMax-M3.1-Flash** (428 B MoE, 23 B active, 1M context, MSA sparse attention throughout, native multimodal, DSpark draft head) | `minimax-m3` (registered 2026-10-27) | **not supported, refused by name** | No GGUF tensor schema has been validated for it, and the graph needs pieces this engine does not have: **MSA** (a MinMax-specific sparse attention), multimodal input towers (text+image+video), and DSpark. Mapping a schema from the safetensors naming alone would be a guess, and a guessed mapping is what produces silently wrong output |
 | **Ornith-1.5** (122 B, released 2026-10-20) | not mapped | **not supported** | Same position: no schema validated, no architecture reference to implement against |
 
 **What would move these:** a `kraken-inspect` run on a real file (it prints the
@@ -296,6 +323,22 @@ paths and hash differently. Default runs stay byte-identical to before.
 - `tools/ref_llama.py --check` — an independent NumPy reference for the dense
   graph (5/5 match, 15/15 across sizes).
 
+### An unlisted architecture is refused, and the verdict says so
+
+`assess_model` and the loader used to disagree about files whose
+`general.architecture` is not in the table. The loader refused them
+(`GGUF metadata is missing core geometry`) because `<arch>.block_count` is read
+from the arch prefix and an unlisted prefix has no such key. The verdict, having
+no rule that looked at it, called them `runnable`. The tool that a user reaches
+for first was the one giving the wrong answer.
+
+The rule now asks the file rather than the name: an unlisted arch with no
+`<arch>.block_count` is a blocker naming the architecture, the missing key, and
+the architectures that *are* known; an unlisted label whose file still carries
+usable geometry stays runnable with a note, because that file can load. Pinned by
+`test_load_verdict`, with the control file declaring geometry so the test is
+about the shape rule rather than about this one.
+
 ## 8. Building
 
 ```bash
@@ -318,6 +361,8 @@ ON and configuration fails without it.
 
 | document | covers |
 |---|---|
+| [MOE-RESIDENCY.md](MOE-RESIDENCY.md) | expert residency against prefill and decode, the WARM tier, chunk size, the CPU/NPU arms, the int8+streaming cliff |
+| [OPTIONS-MATRIX.md](OPTIONS-MATRIX.md) | every flag and `KRK_*` variable, the ones that decide throughput first, the full list by owning file |
 | [BENCH-CPU-DOT.md](BENCH-CPU-DOT.md) | the dot-product finding, the 2 GiB MoE experiment, block-format limits, headroom |
 | [CPU-VS-NPU-BENCHMARK.md](CPU-VS-NPU-BENCHMARK.md) | the NPU path end to end: w8a8, device attention, refusal rules, repro commands |
 | [ARCHITECTURE.md](ARCHITECTURE.md), [ARCHITECTURE-TIERED.md](ARCHITECTURE-TIERED.md) | module layout and the residency tiers |

@@ -4622,6 +4622,12 @@ static void test_load_verdict() {
         GgufBuilder c;
         c.meta_str("general.architecture", "deepseek41-engram");
         c.meta_u32("general.alignment", 32);
+        // The layer count, because an unlisted arch that also carries no
+        // `<arch>.block_count` is refused for that alone: the loader reads the
+        // stack from that key, and `kraken` fails on it after mapping the file.
+        // This control is about the SHAPE rule (an embedding clears it), so it
+        // has to look like a file the loader could actually start on.
+        c.meta_u32("deepseek41-engram.block_count", 1);
         c.tensor_f32("token_embd.weight", {2, 2}, data);
         c.tensor_f32("blk.1.engram_embd.weight", {2, 2}, data);
         c.tensor_f32("blk.14.engram_embd.weight", {2, 2}, data);
