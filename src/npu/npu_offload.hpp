@@ -36,12 +36,25 @@
 //  vnpu_gelu_f32 is not used at all: measured against the exact tanh-GELU it is
 //  5.5e-03 absolute and 0.74 relative on the tails, three orders of magnitude
 //  worse than the same polynomial's swiglu. gemma's GeGLU stays on the
-//  reference. rope and attention stay there too, and not for accuracy reasons:
-//  the device's rope takes one theta and one scaling where Kraken carries an
-//  arbitrary per-layer inv_freq table (YaRN, per-layer windows), and its
-//  attention takes contiguous [batch, heads, seq, dim] K/V where Kraken has a
-//  grouped-query cache with a row stride, a window, sinks and an int8 layout.
-//  Both would change the model, not just its rounding.
+//  reference. rope stays there too: the device's rope takes one theta and one
+//  scaling where Kraken carries an arbitrary per-layer inv_freq table (YaRN,
+//  per-layer windows), so handing it over would change the model rather than
+//  its rounding.
+//
+//  ATTENTION is offered, but only for the calls the device can express, and
+//  that subset is checked field by field (see AttnCall). The device wants
+//  contiguous head-major [batch, heads, seq, dim] where Kraken's cache is
+//  token-major with a row stride, so this layer gathers. That is worth doing
+//  because the reference attention is a scalar loop and attention is the
+//  quadratic term in prefill: measured at the shapes prefill actually runs, the
+//  gather + device kernel is 2.4x the reference at 257x257 and 3.4x at 513x513,
+//  and the end-to-end difference is 1.2e-07 -- the f32 rounding of a different
+//  summation order. At DECODE shapes the gather is O(cache) for one query row
+//  and the device LOSES below about four rows (measured 0.21x at 1x129), so
+//  `attn_min_tok` keeps decode on the reference. A call carrying an 8-bit
+//  cache, a sliding window, a masked block, a logit softcap or a sink is not
+//  representable at all and is refused by name, counted, and named in the run
+//  summary -- it is never silently approximated.
 //
 //  ORDERING
 //
@@ -140,6 +153,44 @@ bool add_scaled(Offload *o, void *dst, const void *src, f32 alpha, i64 n);
 
 // a[i] *= b[i].
 bool mul(Offload *o, void *a, const void *b, i64 n);
+
+// One attention call, as the backend's AttnDesc describes it. Every field that
+// can make a call unrepresentable on the device is carried here so the decision
+// and the counting live in ONE place instead of being spread over the caller:
+// a call is either taken by the device or refused with a name.
+struct AttnCall {
+    void *out = nullptr;
+    const void *q = nullptr;
+    const void *kcache = nullptr;
+    const void *vcache = nullptr;
+    i64 n_head = 0;
+    i64 n_kv = 0;
+    i64 hd = 0;
+    i64 n_tok = 0;
+    i64 pos0 = 0;
+    i64 layer = 0;
+    i64 layer_stride = 0; // elements
+    i64 pos_stride = 0;   // elements (the f32 cache layout)
+    f32 scale = 1.0f;
+    bool causal = true;
+    // The features that make a call unrepresentable. All default to "absent".
+    bool kv_int8 = false;
+    bool has_sinks = false;
+    i64 window = 0;
+    i64 skip_from = -1;
+    f32 softcap = 0.0f;
+};
+
+// Run one attention call on the device. Returns false -- having written
+// nothing -- when the call is not representable, is below `attn_min_tok`, or a
+// staging buffer did not fit; the caller then runs its own body. Every refusal
+// is counted under the reason that caused it.
+bool attention(Offload *o, const AttnCall &c);
+
+// Whether attention is offered to the device at all (KRK_NPU_ATTN). The caller
+// uses this to word its run summary honestly: with the opt-in off, attention is
+// one of the ops that stayed on the host, and the summary says so.
+bool attention_offered(const Offload *o);
 
 } // namespace npu
 } // namespace krk
