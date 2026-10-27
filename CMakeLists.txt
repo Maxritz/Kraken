@@ -165,7 +165,28 @@ if(KRK_ENABLE_NPU)
     target_compile_definitions(krk_core PUBLIC KRK_ENABLE_NPU=1)
     target_include_directories(krk_core PUBLIC "${KRK_VNPU_ROOT}/include")
     target_link_libraries(krk_core PUBLIC "${_krk_vnpu_lib}" Threads::Threads)
-    message(STATUS "virtual NPU backend: ${_krk_vnpu_lib}")
+    # CAPABILITY PROBE, not a version check. The device's opcode set has moved:
+    # VNPU_OP_MATMUL_Q8_0 exists in some builds of npuxl-improved and not in
+    # v1.0.0, and a compile failure is a bad way to find out. Ask the compiler
+    # whether the header names the opcode; if it does not, the Q8_0-in-place
+    # path is compiled out and weights go through the device's f32 matmul
+    # instead, which is a working path and the more accurate one. The run
+    # summary reports which of the two the binary carries.
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES "${KRK_VNPU_ROOT}/include")
+    check_cxx_source_compiles(
+        "#include <vnpu.h>\nint main() { return (int)VNPU_OP_MATMUL_Q8_0; }"
+        KRK_VNPU_HAS_Q8_0)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    if(KRK_VNPU_HAS_Q8_0)
+        target_compile_definitions(krk_core PUBLIC KRK_VNPU_HAS_Q8_0=1)
+        message(STATUS "virtual NPU backend: ${_krk_vnpu_lib} (q8_0 in place: yes)")
+    else()
+        message(STATUS
+            "virtual NPU backend: ${_krk_vnpu_lib} (q8_0 in place: NO -- this "
+            "vnpu.h has no VNPU_OP_MATMUL_Q8_0, so q8_0 weights take the f32 "
+            "staging path)")
+    endif()
 endif()
 
 if(MSVC)

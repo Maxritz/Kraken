@@ -453,6 +453,65 @@ top-2 are 0.017 apart there, and int8 quantisation is worth ~0.03, so that is a
 coin flip in the model and not a kernel defect. Judging a kernel by greedy text
 on a 4096-piece vocabulary is how you chase noise.
 
+#### The same table on the NPU
+
+`--kprof` was CPU-only, which made it useless for the backend that needed it
+most. The vNPU executes a *batch*, so the only honest way to put device time on
+a component is to remember which component filled the batch, measure the batch
+once at `sync`, and split it across those components by MAC count. That is what
+`src/npu/npu_offload.cpp` now does, into the same `KernelTime` table — so a run
+reads the same on every backend, and a mixed run (`--npu-cpu`, where the ops the
+device has no opcode for stay on the host) shows device rows and host rows
+side by side, which is the question "what is the NPU not doing" answered
+directly.
+
+Tiny-Moe Q4_K_M, `--npu --kprof`, 46-token prompt, 32 tokens:
+
+```
+component                       ops         dev_us      us/op    %run    GMAC/s    %peak
+npu_gemm_f32_r1                4124      1169020.0      283.5   79.4%       3.8    13.1%
+npu_gemm_f32_rN                 132       253280.1     1918.8   17.2%      25.7    87.6%
+attention                       384        31054.0       80.9    2.1%       2.4     3.5%
+silu_mul                        768         9795.0       12.8    0.7%       0.0        -
+rope                            384         3641.0        9.5    0.2%       0.0        -
+kv_append                       384         3413.0        8.9    0.2%       0.0        -
+rmsnorm                         800         2580.0        3.2    0.2%       0.0        -
+```
+
+`%peak` here is the **device's own** ceiling, measured on the device at first
+use: one 64×1024×1024 matmul through the same stream the GEMMs use, three
+passes, best kept. Against the host ISA it would have been a nonsense number,
+and against a datasheet it would have been a lie.
+
+The table answers the question in one line, and the answer is not the one the
+earlier write-up assumed:
+
+* **`npu_gemm_f32_rN` runs at 87.6% of the device's peak.** On batched work the
+  device kernel is essentially done. There is nothing to tune there.
+* **`npu_gemm_f32_r1` runs at 13.1%** — and not because of the round trip. A
+  bare stream probe (no Kraken, no engine) times a single 1×1024×1024 matmul at
+  **107 µs**, which is 4 MiB of weights at ~39 GB/s: the call is **memory-bound
+  on the f32 staging copy**, not launch-bound. Submit over a whole run is
+  26.6 ms against 1434.6 ms of sync, so dispatch is 1.8% of the wait.
+
+The cause is structural and now measurable: **this vnpu.h has no
+block-quantized matmul opcode**, so every weight the device touches is first
+expanded from Q4_K to f32 — 552.1 MiB staged from a 90 MB model, 6.1×. The host
+path never does that; it reads the 144-byte blocks where they lie.
+
+The device *does* have a packed int8 matmul, and turning it on
+(`KRK_NPU_W8A8=1`) moves decode 17.4 → **21.6 tok/s** (+24%), which is the
+direction the arithmetic predicts — but it quantizes activations as well, and it
+still loses to the host's 124. On a shared host the NPU cannot win decode by
+running the same CPU better; it wins only if the weight format stops being
+expanded. That needs an opcode; it is not something the engine can paper over.
+
+This is also why `KRK_ENABLE_NPU` now runs a **capability probe** at configure
+time rather than assuming: `VNPU_OP_MATMUL_Q8_0` exists in some builds of
+npuxl-improved and not in v1.0.0, and a link error is a bad way to discover
+that. The probe reports which way the binary was built, and the Q8_0-in-place
+path compiles out to the f32 staging path — a working path, not a stub.
+
 #### What the trace says now
 
 `--kprof` prints a `GMAC/s` and a `%peak` column per component, and the peak is
