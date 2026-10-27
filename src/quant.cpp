@@ -1338,6 +1338,332 @@ bool vec_dot_fast() {
     return g_dot_fast.load(std::memory_order_relaxed);
 }
 
+// ---- the batched prefill kernel -------------------------------------------
+//
+// vec_dot() is a GEMV inner product: it decodes the weight row as it goes, so a
+// GEMM that calls it once per output element decodes every weight row once per
+// ROW of the batch. That is the whole of the prefill problem below -- measured
+// before this existed, on the 2 GiB q8_0 MoE at --cpu with KRK_CPU_DOT_AVX2=1,
+// cost per prefilled token was FLAT at 34.1, 29.1, 27.8, 28.3 ms across prompts
+// of 58, 149, 331 and 695 tokens. A batched GEMM is supposed to pay the weight
+// read once and reuse it for the whole batch, so prefill was running at GEMV
+// speed and its throughput could not improve with batch size.
+//
+// This decodes each weight block ONCE into registers and FMAs it against
+// `kTileRows` activation rows before moving on. Weight decode is amortized
+// kTileRows times instead of once, and there is no f32 scratch buffer: a
+// widening pass was tried first and made prefill 1.9x SLOWER, because it wrote
+// 4x the weight bytes to memory and replaced a fused vector decode with a
+// scalar one.
+//
+// Bit-identity is exact, not approximate. For one (weight row, activation row)
+// pair this performs the same operations in the same order as the fused kernel
+// it generalises -- per 8-element step, fma8() adds weight element k to
+// accumulator lane k mod 4, walking k upward -- so its result for that pair is
+// bit-identical to dot_q8_0_avx2/dot_q4_0_avx2, which are in turn bit-identical
+// to the four-lane arm. test_gemm_batched_bit_identical pins it against
+// vec_dot() on the same rows.
+
+#if defined(KRK_DOT_AVX2)
+namespace {
+
+constexpr i64 kTileRows = 8;
+
+// q8_0: d (f16) + 32 int8 per 34-byte block.
+__attribute__((target("avx2,fma"))) void dot_q8_0_tiled(
+    const u8 *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
+    const i64 nb = n / 32;
+    for (i64 r0 = 0; r0 + kTileRows <= rows; r0 += kTileRows) {
+        __m128 acc[kTileRows];
+        for (i64 j = 0; j < kTileRows; j++) acc[j] = _mm_setzero_ps();
+        const f32 *xr[kTileRows];
+        for (i64 j = 0; j < kTileRows; j++) xr[j] = x + (r0 + j) * n;
+        const u8 *p = w;
+        for (i64 b = 0; b < nb; b++, p += 34) {
+            const f32 d = fp16_to_fp32(
+                static_cast<u16>(p[0] | (static_cast<u16>(p[1]) << 8)));
+            const __m256 dv = _mm256_set1_ps(d);
+            for (int k = 0; k < 32; k += 8) {
+                const __m128i q8 = _mm_loadl_epi64(
+                    reinterpret_cast<const __m128i *>(p + 2 + k));
+                const __m256 wv = _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8)), dv);
+                for (i64 j = 0; j < kTileRows; j++)
+                    fma8(acc[j], wv, xr[j] + b * 32 + k);
+            }
+        }
+        for (i64 j = 0; j < kTileRows; j++) {
+            alignas(16) f32 a[4];
+            _mm_store_ps(a, acc[j]);
+            out[(r0 + j) * stride] = (a[0] + a[1]) + (a[2] + a[3]);
+        }
+    }
+}
+
+// q4_0: d (f16) + 16 bytes of nibbles, 18-byte block. Low nibble is value k,
+// high nibble is value k+16, both biased by 8.
+__attribute__((target("avx2,fma"))) void dot_q4_0_tiled(
+    const u8 *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
+    const i64 nb = n / 32;
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const __m256i off = _mm256_set1_epi32(8);
+    for (i64 r0 = 0; r0 + kTileRows <= rows; r0 += kTileRows) {
+        __m128 acc[kTileRows];
+        for (i64 j = 0; j < kTileRows; j++) acc[j] = _mm_setzero_ps();
+        const f32 *xr[kTileRows];
+        for (i64 j = 0; j < kTileRows; j++) xr[j] = x + (r0 + j) * n;
+        const u8 *p = w;
+        for (i64 b = 0; b < nb; b++, p += 18) {
+            const f32 d = fp16_to_fp32(
+                static_cast<u16>(p[0] | (static_cast<u16>(p[1]) << 8)));
+            const __m256 dv = _mm256_set1_ps(d);
+            const __m128i raw = _mm_loadu_si128(
+                reinterpret_cast<const __m128i *>(p + 2));
+            const __m128i lo = _mm_and_si128(raw, m4);
+            const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m4);
+            const __m256 w0 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo), off)),
+                dv);
+            const __m256 w1 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_sub_epi32(
+                    _mm256_cvtepu8_epi32(_mm_srli_si128(lo, 8)), off)),
+                dv);
+            const __m256 w2 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi), off)),
+                dv);
+            const __m256 w3 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_sub_epi32(
+                    _mm256_cvtepu8_epi32(_mm_srli_si128(hi, 8)), off)),
+                dv);
+            for (i64 j = 0; j < kTileRows; j++) {
+                const f32 *xv = xr[j] + b * 32;
+                fma8(acc[j], w0, xv);
+                fma8(acc[j], w1, xv + 8);
+                fma8(acc[j], w2, xv + 16);
+                fma8(acc[j], w3, xv + 24);
+            }
+        }
+        for (i64 j = 0; j < kTileRows; j++) {
+            alignas(16) f32 a[4];
+            _mm_store_ps(a, acc[j]);
+            out[(r0 + j) * stride] = (a[0] + a[1]) + (a[2] + a[3]);
+        }
+    }
+}
+
+} // namespace
+#endif
+
+// The unquantized formats, tiled. They have no block decode to hoist, but they
+// have the same problem for a different reason: vec_dot() widens the weight
+// element-by-element INSIDE the row loop, so every row re-converts the whole
+// matrix. On a 1 GiB f16 dense model that showed up as prefill 10.5 tok/s
+// against a decode of ~7.5 -- a 1.4x ratio, i.e. no batch amortization at all.
+// Converting each 4-element group once and reusing it across the tile fixes it
+// with the same arithmetic F16C already does, in the same order.
+#if defined(KRK_DOT_F16C)
+namespace {
+
+template <bool IsF16>
+__attribute__((target("f16c,fma"))) void dot_wide_tiled(
+    const void *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
+    constexpr i64 kT = 8;
+    for (i64 r0 = 0; r0 + kT <= rows; r0 += kT) {
+        __m128 acc[kT];
+        for (i64 j = 0; j < kT; j++) acc[j] = _mm_setzero_ps();
+        i64 i = 0;
+        for (; i + 4 <= n; i += 4) {
+            __m128 wv;
+            if constexpr (IsF16)
+                wv = _mm_cvtph_ps(_mm_loadl_epi64(
+                    reinterpret_cast<const __m128i *>(
+                        static_cast<const u16 *>(w) + i)));
+            else
+                wv = _mm_loadu_ps(static_cast<const f32 *>(w) + i);
+            for (i64 j = 0; j < kT; j++)
+                acc[j] = _mm_fmadd_ps(wv, _mm_loadu_ps(x + (r0 + j) * n + i),
+                                      acc[j]);
+        }
+        for (i64 j = 0; j < kT; j++) {
+            alignas(16) f32 a[4];
+            _mm_store_ps(a, acc[j]);
+            f32 sum = (a[0] + a[1]) + (a[2] + a[3]);
+            const f32 *xr = x + (r0 + j) * n;
+            for (i64 k = i; k < n; k++)
+                sum += (IsF16 ? fp16_to_fp32(static_cast<const u16 *>(w)[k])
+                              : static_cast<const f32 *>(w)[k]) *
+                       xr[k];
+            out[(r0 + j) * stride] = sum;
+        }
+    }
+}
+
+} // namespace
+#endif
+
+// Every block format without a hand-written kernel, tiled the same way: decode
+// a block ONCE and multiply it against kTileRows activation rows. This is the
+// path that carries K-quants (Q4_K/Q5_K/Q6_K), iq-quants and the rest of a real
+// collection, and it is the one that matters for anything not converted to
+// q8_0/q4_0 -- the fixture used for the headline measurement is q8_0, but the
+// sweep in docs/MODEL-STATUS.md is mostly Q4_K_M.
+//
+// Bit-identity comes from doing what vec_dot() does, per row, in its order.
+// vec_dot() walks the row block by block and has two shapes: a single in-order
+// chain (the oracle) and four accumulators folded (a0+a1)+(a2+a3) with a `tail`
+// for any run shorter than four. Both are reproduced here, and the `tail` is
+// accumulated ACROSS blocks exactly as there -- moving it inside the block
+// would change the summation order on any format whose block size is not a
+// multiple of four.
+namespace {
+
+// Decode each block once, then run it against every row of the tile. The inner
+// loop keeps kTileRows independent accumulators, which is what turns the weight
+// read from "once per row" into "once per tile".
+template <bool FourLane>
+void dot_generic_tiled(DType t, const u8 *w, const f32 *x, i64 n, i64 o_begin,
+                       i64 o_end, i64 rows, f32 *out, i64 out_stride) {
+    const int bs = dtype_block_size(t);
+    const int bb = dtype_block_bytes(t);
+    const size_t rb = dtype_row_bytes(t, n);
+    constexpr i64 kT = 8;
+    f32 buf[256];
+    for (i64 o = o_begin; o < o_end; o++) {
+        const u8 *p0 = w + static_cast<size_t>(o) * rb;
+        i64 r0 = 0;
+        for (; r0 + kT <= rows; r0 += kT) {
+            f32 a0[kT] = {}, a1[kT] = {}, a2[kT] = {}, a3[kT] = {}, tl[kT] = {};
+            if constexpr (!FourLane) {
+                f32 one[kT] = {};
+                i64 i = 0;
+                const u8 *p = p0;
+                while (i < n) {
+                    const int cnt = static_cast<int>((n - i) < bs ? (n - i) : bs);
+                    dequant_block(t, p, buf);
+                    for (i64 j = 0; j < kT; j++) {
+                        const f32 *xr = x + (r0 + j) * n + i;
+                        f32 s = one[j];
+                        for (int k = 0; k < cnt; k++) s += buf[k] * xr[k];
+                        one[j] = s;
+                    }
+                    i += cnt;
+                    p += bb;
+                }
+                for (i64 j = 0; j < kT; j++) out[(r0 + j) * out_stride + o] = one[j];
+            } else {
+                // The four-lane arm, in the shape vec_dot() itself uses. On an
+                // F16C host that shape is a FUSED multiply-add, and a separate
+                // multiply and add rounds differently -- using the scalar form
+                // here made Q4_K disagree with vec_dot() in the last few ulp,
+                // which is what this test caught.
+#if defined(KRK_DOT_F16C)
+                __m128 acc[kT];
+                for (i64 j = 0; j < kT; j++) acc[j] = _mm_setzero_ps();
+#endif
+                i64 i = 0;
+                const u8 *p = p0;
+                while (i < n) {
+                    const int cnt = static_cast<int>((n - i) < bs ? (n - i) : bs);
+                    dequant_block(t, p, buf);
+                    for (i64 j = 0; j < kT; j++) {
+                        const f32 *xr = x + (r0 + j) * n + i;
+                        int k = 0;
+#if defined(KRK_DOT_F16C)
+                        for (; k + 4 <= cnt; k += 4)
+                            acc[j] = _mm_fmadd_ps(_mm_loadu_ps(buf + k),
+                                                  _mm_loadu_ps(xr + k), acc[j]);
+#else
+                        for (; k + 4 <= cnt; k += 4) {
+                            a0[j] += buf[k] * xr[k];
+                            a1[j] += buf[k + 1] * xr[k + 1];
+                            a2[j] += buf[k + 2] * xr[k + 2];
+                            a3[j] += buf[k + 3] * xr[k + 3];
+                        }
+#endif
+                        for (; k < cnt; k++) tl[j] += buf[k] * xr[k];
+                    }
+                    i += cnt;
+                    p += bb;
+                }
+                for (i64 j = 0; j < kT; j++) {
+#if defined(KRK_DOT_F16C)
+                    alignas(16) f32 a[4];
+                    _mm_store_ps(a, acc[j]);
+                    out[(r0 + j) * out_stride + o] =
+                        ((a[0] + a[1]) + (a[2] + a[3])) + tl[j];
+#else
+                    out[(r0 + j) * out_stride + o] =
+                        ((a0[j] + a1[j]) + (a2[j] + a3[j])) + tl[j];
+#endif
+                }
+            }
+        }
+        // Leftover rows: the per-element oracle, same bits.
+        for (i64 r = rows - (rows % kT); r < rows; r++)
+            out[r * out_stride + o] = vec_dot(t, p0, x + r * n, n);
+    }
+}
+
+} // namespace
+
+void vec_dot_tiled(DType t, const void *w, const f32 *x, i64 n_in, i64 o_begin,
+                   i64 o_end, i64 rows, f32 *out, i64 out_stride) {
+    const size_t rb = dtype_row_bytes(t, n_in);
+    const u8 *wb = static_cast<const u8 *>(w);
+#if defined(KRK_DOT_AVX2)
+    if ((t == DType::Q8_0 || t == DType::Q4_0) && n_in > 0 && (n_in % 32) == 0 &&
+        rows > 0 && vec_dot_avx2()) {
+        for (i64 o = o_begin; o < o_end; o++) {
+            const u8 *wr = wb + static_cast<size_t>(o) * rb;
+            if (t == DType::Q8_0)
+                dot_q8_0_tiled(wr, x, n_in, rows, out + o, out_stride);
+            else
+                dot_q4_0_tiled(wr, x, n_in, rows, out + o, out_stride);
+            // Rows past the last whole tile: the per-element path, same bits.
+            for (i64 r = rows - (rows % kTileRows); r < rows; r++)
+                out[r * out_stride + o] = vec_dot(t, wr, x + r * n_in, n_in);
+        }
+        return;
+    }
+#endif
+#if defined(KRK_DOT_F16C)
+    // f16 and f32: the widening arm, tiled. bf16 and i32 keep the per-element
+    // loop -- they are rare enough in a collection that they are not worth a
+    // fourth kernel, and they are correct either way.
+    if ((t == DType::F16 || t == DType::F32) && rows > 0 && n_in > 0) {
+        for (i64 o = o_begin; o < o_end; o++) {
+            const u8 *wr = wb + static_cast<size_t>(o) * rb;
+            if (t == DType::F16)
+                dot_wide_tiled<true>(wr, x, n_in, rows, out + o, out_stride);
+            else
+                dot_wide_tiled<false>(wr, x, n_in, rows, out + o, out_stride);
+            for (i64 r = rows - (rows % 8); r < rows; r++)
+                out[r * out_stride + o] = vec_dot(t, wr, x + r * n_in, n_in);
+        }
+        return;
+    }
+#endif
+    // Every other block format: the generic tile, which decodes each block once
+    // and reuses it across rows.
+    if (t != DType::F16 && t != DType::F32 && t != DType::BF16 &&
+        t != DType::I32 && rows > 0 && n_in > 0) {
+        if (vec_dot_fast() || vec_dot_avx2())
+            dot_generic_tiled<true>(t, wb, x, n_in, o_begin, o_end, rows, out,
+                                    out_stride);
+        else
+            dot_generic_tiled<false>(t, wb, x, n_in, o_begin, o_end, rows, out,
+                                     out_stride);
+        return;
+    }
+    // Every other format, and every host without AVX2: the per-element path,
+    // which is what the fused kernels are also validated against.
+    for (i64 o = o_begin; o < o_end; o++) {
+        const u8 *wr = wb + static_cast<size_t>(o) * rb;
+        for (i64 r = 0; r < rows; r++)
+            out[r * out_stride + o] = vec_dot(t, wr, x + r * n_in, n_in);
+    }
+}
+
 f32 vec_dot(DType t, const void *src, const f32 *x, i64 n) {
     // The unquantized formats have no block structure, so widen them directly
     // rather than routing through the block loop (which would look for a

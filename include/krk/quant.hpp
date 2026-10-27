@@ -181,6 +181,23 @@ void dequant_row_f16(DType t, const void *src, u16 *out, i64 n);
 // The f16/f32 paths are exact under either setting (same four lanes, same
 // order) and do not consult this flag.
 f32 vec_dot(DType t, const void *src, const f32 *x, i64 n);
+
+// out[r*out_stride + o] = dot(dequant(w[o]), x[r]) for every row and every
+// output, which is a batched GEMV -- i.e. the GEMM a prefill chunk needs.
+//
+// This exists because vec_dot() decodes a weight row as it goes, so a GEMM that
+// calls it once per output element decodes every weight row once per ROW of the
+// batch. Measured before this existed, on the 2 GiB q8_0 MoE at --cpu with
+// KRK_CPU_DOT_AVX2=1, prefill cost per token was FLAT at 34.1, 29.1, 27.8, 28.3
+// ms across prompts of 58, 149, 331 and 695 tokens: the weight read was never
+// amortized, so prefill ran at GEMV speed.
+//
+// q8_0 and q4_0 on an AVX2 host decode each block once into registers and reuse
+// it across a tile of rows; every result is BIT-IDENTICAL to vec_dot() on the
+// same (row, output) pair, because the tile performs the fused kernel's own
+// operations in its own order. Everything else takes the per-element loop.
+void vec_dot_tiled(DType t, const void *w, const f32 *x, i64 n_in, i64 o_begin,
+                   i64 o_end, i64 rows, f32 *out, i64 out_stride);
 void set_vec_dot_fast(bool on);
 bool vec_dot_fast();
 

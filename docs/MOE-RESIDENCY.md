@@ -20,28 +20,48 @@ flag except the two `KRK_*` opt-ins, which are named where they appear.
 
 ## 1. The headline
 
+**Measured twice: before and after the batched-prefill fix in §7.** The fix is
+what this document is now mostly about, because it changed the answer.
+
+Before (prefill still called `vec_dot` per output element, so every weight row
+was decoded once per row of the batch):
+
 | | all experts resident | 64 MiB of experts | penalty |
 |---|---:|---:|---:|
-| prefill (CPU, exact) | 13.95 s | 13.68 s | **1.00× — none** |
-| prefill (CPU, AVX2 dot) | 3.94 s | 3.82 s | **1.00× — none** |
-| decode (CPU, exact) | 133.1 ms | 163.8 ms | 1.23× |
-| decode (CPU, AVX2 dot) | 41.1 ms | 73.6 ms | **1.79×** |
-| read from disk | 369 MiB | 2519 MiB | 6.8× |
+| prefill (CPU, exact) | 13.95 s | 13.68 s | **1.00x -- none** |
+| prefill (CPU, AVX2 dot) | 3.94 s | 3.82 s | **1.00x -- none** |
+| decode (CPU, exact) | 133.1 ms | 163.8 ms | 1.23x |
+| decode (CPU, AVX2 dot) | 41.1 ms | 73.6 ms | 1.79x |
+| read from disk | 369 MiB | 2519 MiB | 6.8x |
 
-Prefill does not care how much of the model is resident. Decode cares
-completely, and it cares in proportion to how far the expert set has to be
-pulled off disk **per token**.
+After (same fixture, same flags, batched GEMM):
 
-The reason is a straight division. 20 layers × top-4 = 80 expert gathers per
-token, and at 64 MiB (35 slots of 285) essentially none of them hit. Prefill
-amortises those same gathers over 121 tokens of rows — one pass per layer, not
-one pass per token — so the arithmetic that dominates prefill swamps the I/O.
-Decode has one row and no arithmetic to hide behind, so the I/O is the whole
-cost.
+| | all experts resident | 64 MiB of experts | penalty |
+|---|---:|---:|---:|
+| prefill (CPU, AVX2 dot), 121-tok prompt | **1020 ms** | **857 ms** | 1.00x |
+| decode (CPU, AVX2 dot) | 61.1 ms | 75.3 ms | 1.23x |
+| expert-path read | 307 ms | 521 ms | 1.7x |
+| **read share of prefill** | **30%** | **61%** | |
 
----
+The old reading -- "prefill is compute-bound, residency does not matter" -- was
+true and was the symptom. Prefill did not care how much of the model was
+resident because it was not doing a batched GEMM at all: cost per prefilled
+token was **flat at 34.1, 29.1, 27.8, 28.3 ms** across prompts of 58, 149, 331
+and 695 tokens. A GEMM is supposed to read the weight once and reuse it for the
+batch, which makes cost per token fall steeply as the batch grows. It never fell
+because every weight row was decoded once **per row** instead of once per chunk.
+
+With that fixed, prefill on this fixture is 2.3-3.4x faster and it is no longer
+flat: the expert read is now the majority of a streamed prefill (61% at a 64 MiB
+budget), so `--expert-warm-mb` and the device budget matter for prefill too.
+Full before/after and the mechanism: **§7**.
 
 ## 2. The residency ladder (121-token prompt, `--chunk 128`)
+
+**Measured before the §7 fix.** Kept because the decode column is still current
+(decode does not enter the batched path at all) and because it is the evidence
+for how prefill behaved while it was broken -- flat, at every residency. The
+prefill columns here are the BROKEN numbers; §1 and §7 carry the fixed ones.
 
 Exact reference dot (`--cpu`, no opt-ins):
 
@@ -236,13 +256,161 @@ arm — check hashes within one arm, not across two.
 
 ## 6. What to actually set
 
-- **Prefill is compute-bound.** Spend on the dot product (`KRK_CPU_DOT_AVX2=1`,
-  3.5× here) and on threads. Do not spend it on expert residency; it buys
-  nothing. Keep `--chunk` at 128 or above so a chunk's gathers are not repeated.
+Written after the §7 fix, because two of these answers changed with it.
+
+- **Prefill is now I/O-aware as well as compute-bound.** Spend first on the dot
+  product (`KRK_CPU_DOT_AVX2=1`) and on threads -- and then on residency, which
+  did not matter before the fix and does now: at a 64 MiB budget the expert read
+  is 61% of a prefill. Keep `--chunk` at 128 or above so a chunk's gathers are
+  not repeated. `--expert-warm-mb` helps prefill as well as decode for the same
+  reason.
 - **Decode is I/O-bound.** Spend on residency and on `--expert-warm-mb`. A host
-  WARM tier at 512 MiB cut disk reads 10× and was the only knob that moved a
+  WARM tier at 512 MiB cut disk reads 10x and was the only knob that moved a
   streamed decode back toward the resident figure.
-- **Pick the arm by phase.** AVX2 CPU for prefill-heavy work, `--npu-cpu` with
-  w8a8 + attn for decode-heavy work **while the experts are resident**.
+- **Pick the arm by phase, and re-check which wins.** Since the fix, AVX2 CPU
+  prefills 3.2x faster than the NPU on the fixture (1071 ms against 3386 ms) and
+  the NPU keeps only its decode win (33.4 ms against 58.2 ms). Before the fix
+  the NPU was the better all-round arm. On a prefill-heavy workload the CPU arm
+  is now the default choice.
 - **Do not combine `KRK_NPU_W8A8=1` with forced streaming** until the pack memo
   is keyed by expert identity.
+
+---
+
+## 7. The prefill defect: the GEMM was not a GEMM
+
+### The symptom
+
+Prefill cost per token did not fall with batch size:
+
+| prompt tokens | prefill | ms/token | prefill tok/s |
+|---|---:|---:|---:|
+| 58 | 1977 ms | 34.1 | 29.3 |
+| 149 | 4332 ms | 29.1 | 34.4 |
+| 331 | 9206 ms | 27.8 | 36.0 |
+| 695 | 19659 ms | 28.3 | 35.4 |
+
+A batched multiply-accumulate amortises the weight read across the batch, so
+ms/token must drop steeply as the batch grows -- in a healthy GEMM it falls by
+most of the total on the first few rows and then flattens far below the
+single-row cost. Here it never fell. Prefill was running at **GEMV speed**: the
+same cost per token as decoding, times the number of tokens.
+
+That is also why prefill looked immune to expert residency. It was not hiding
+the I/O behind arithmetic; it was doing the arithmetic badly enough that the I/O
+was lost in the noise.
+
+### The cause
+
+`src/backend_cpu.cpp`, `gemm()`: the work was split over the flat
+`(row, output)` index space, one `vec_dot()` per element.
+
+```cpp
+const i64 total = rows * n_out;
+par_for(total, grain, ..., [&](i64 b, i64 e) {
+    i64 r = b / n_out;
+    i64 o = b - r * n_out;
+    for (i64 f = b; f < e; f++)
+        of[f] = vec_dot(wt, wrow, xr, n_in);   // decodes wrow EVERY time
+});
+```
+
+`vec_dot()` decodes the weight row as it goes -- that is exactly right for a
+GEMV, and exactly wrong here. For `rows = 695` every weight row in the model was
+decoded 695 times. Weight traffic was `rows x` the matrix instead of `1 x`, and
+the decode cost (int8 -> f32, the subnormal-tolerant f16 scale conversion, the
+multiply by the block scale) was paid per row instead of per chunk.
+
+It was not visible at `rows = 1`, which is why decode was always fine.
+
+### What was tried and rejected first
+
+Widening: dequantize each weight row into an f32 buffer once, then run the
+existing four-lane dot against it for every row. Bit-identical and simple.
+
+**It made prefill 1.9x slower** (63.5 vs 34.1 ms/token). It writes 4x the weight
+bytes to memory, and it replaces a fused vector decode (decode-in-register,
+FMA-fused) with a scalar decode into a buffer followed by a separate vector
+pass. The extra memory traffic cost more than the decode it saved. Recorded here
+because it is the obvious first idea and it does not work.
+
+### The fix
+
+`vec_dot_tiled()`: decode each weight block **once into registers**, then FMA it
+against a tile of 8 activation rows before moving on. Weight decode is
+amortized over the whole tile, and there is no f32 scratch buffer.
+
+Three kernels, picked by format:
+
+| format | kernel | why |
+|---|---|---|
+| `q8_0`, `q4_0` on AVX2 | `dot_q8_0_tiled` / `dot_q4_0_tiled` | hand-written, one vector decode per 8 weight elements reused across 8 rows |
+| `f16`, `f32` on F16C | `dot_wide_tiled` | same idea for the widening formats; the 4-element conversion is hoisted out of the row loop |
+| every other block format (Q4_K, Q5_K, Q6_K, iq-quants, …) | `dot_generic_tiled` | `dequant_block` into a stack buffer once, then the same four-lane shape against 8 rows |
+
+Rows past the last whole tile, and hosts without the relevant ISA, fall back to
+`vec_dot()` per element -- so nothing is refused and nothing changes meaning.
+
+### It is a speed change and nothing else
+
+Every kernel performs the same operations, in the same order, as the path it
+replaces, per (weight row, activation row) pair. Not "within tolerance" --
+**bit-identical**, because the summation order is the one `vec_dot()` uses:
+
+- q8_0/q4_0 tile: per 8 elements it FMAs weight element `k` into accumulator lane
+  `k mod 4`, walking `k` upward -- the fused kernel's own order, then folded
+  `(a0+a1)+(a2+a3)`.
+- generic tile: reproduces both the oracle's single in-order chain and the
+  four-lane form, including the `tail` accumulator that spans blocks.
+- f16/f32 tile: `_mm_fmadd_ps` over 4-element groups, folded, then the tail.
+
+The four-lane generic form uses a **fused** multiply-add where the host has
+F16C, because `vec_dot()` does. Using a separate multiply and add there is what
+broke the Q4_K case when this was first written -- visibly, as a disagreement in
+the last few ulp -- and it is why the test below exists.
+
+Witnesses:
+
+- `test_gemm_batched_bit_identical` — 100 checks: 5 formats (q8_0, q4_0, f32,
+  f16, Q4_K) x 4 arms (exact, fast, avx2, fast+avx2) x 5 tile widths (1, 7, 8,
+  9, 13, of which 13 leaves five rows on the fallback path), each comparing the
+  whole output matrix with `memcmp` against the per-element `vec_dot()` result.
+- End to end, `--prefill-hash` against the binary built from the parent commit:
+
+  | model | arm | before | after |
+  |---|---|---|---|
+  | q8_0 MoE | exact | `37fd02de1f322777` | `37fd02de1f322777` |
+  | q8_0 MoE | `KRK_CPU_DOT_AVX2=1` | `e1137aac2d7143a6` | `e1137aac2d7143a6` |
+  | f16 dense | default | `8a21ccff16da6d78` | `8a21ccff16da6d78` |
+
+### What it is worth
+
+Same binary flags, same fixture, only the parent commit's binary against this
+one:
+
+| model | prompt tok | before | after | speedup |
+|---|---:|---:|---:|---:|
+| q8_0 MoE, AVX2 dot | 58 | 1833 ms | 804 ms | **2.28x** |
+| | 149 | 4438 ms | 1495 ms | **2.97x** |
+| | 331 | 9300 ms | 2778 ms | **3.35x** |
+| | 695 | 19575 ms | 6760 ms | **2.90x** |
+| f16 dense 1 GiB | 149 | 14348 ms | 3348 ms | **4.29x** |
+| | 331 | 31769 ms | 8290 ms | **3.83x** |
+
+Decode is untouched (f16 dense: 174 -> 175 ms/step, i.e. noise): `rows == 1`
+keeps the old path, which is the right shape for a GEMV.
+
+### The arm table changes with it
+
+88-token prompt, all experts resident:
+
+| arm | prefill | decode |
+|---|---:|---:|
+| `--cpu` + `KRK_CPU_DOT_AVX2=1` | **1071 ms** | 58.2 ms |
+| `--npu-cpu` + `KRK_NPU_W8A8=1` | 3386 ms | **33.4 ms** |
+| `--npu` + `KRK_NPU_W8A8=1` | 3319 ms | 35.1 ms |
+
+Before this fix the CPU arm prefilled at ~2900 ms and the NPU arms were the
+better choice overall on this fixture. Now the CPU arm prefills **3.2x faster
+than the NPU**, and the NPU keeps only the decode win. The NPU arms are
+unchanged by this fix because they never enter the CPU `gemm()`.

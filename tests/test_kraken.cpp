@@ -536,6 +536,115 @@ static void test_vec_dot_fast_opt_in() {
 // BITWISE equality, not a tolerance. If a future edit reorders the lanes to win
 // another few percent, this fails and the change has to be argued for instead
 // of shipped quietly.
+static void test_gemm_batched_bit_identical() {
+    // The batched prefill kernel decodes each weight block once and reuses it
+    // across a tile of activation rows. That is only legitimate if every
+    // (row, output) pair comes back with the SAME BITS as the per-element
+    // vec_dot() path it replaces -- on every arm, and including the rows past
+    // the last whole tile, which take a different code path.
+    struct Arm { const char *name; bool fast; bool avx2; };
+    const Arm arms[] = {{"exact", false, false},
+                        {"fast", true, false},
+                        {"avx2", false, true},
+                        {"fast+avx2", true, true}};
+
+    u32 seed = 24681357u;
+    auto rnd = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return seed;
+    };
+
+    constexpr i64 n = 256;
+    constexpr i64 rows = 13; // deliberately not a whole tile
+    constexpr i64 n_out = 5;
+    f32 x[rows * n];
+    for (i64 i = 0; i < rows * n; i++)
+        x[i] = static_cast<f32>(static_cast<i32>(rnd() % 2001) - 1000) / 1000.0f;
+
+    // q8_0 / q4_0: n_out rows of 8 blocks each.
+    std::vector<u8> q8(n_out * 8 * 34), q4(n_out * 8 * 18);
+    for (i64 o = 0; o < n_out; o++) {
+        for (int b = 0; b < 8; b++) {
+            u8 *p = q8.data() + (o * 8 + b) * 34;
+            const u16 dh = fp32_to_fp16(0.01f + 0.005f * static_cast<f32>(b));
+            p[0] = static_cast<u8>(dh & 0xFF);
+            p[1] = static_cast<u8>(dh >> 8);
+            for (int i = 0; i < 32; i++)
+                p[2 + i] = static_cast<u8>(
+                    static_cast<i8>(static_cast<i32>(rnd() % 255) - 127));
+            u8 *p4 = q4.data() + (o * 8 + b) * 18;
+            const u16 dh4 = fp32_to_fp16(0.02f + 0.003f * static_cast<f32>(b));
+            p4[0] = static_cast<u8>(dh4 & 0xFF);
+            p4[1] = static_cast<u8>(dh4 >> 8);
+            for (int i = 0; i < 16; i++)
+                p4[2 + i] = static_cast<u8>((rnd() % 16) | ((rnd() % 16) << 4));
+        }
+    }
+    std::vector<f32> f32w(n_out * n);
+    std::vector<u16> f16w(n_out * n);
+    for (i64 i = 0; i < n_out * n; i++) {
+        f32w[i] = static_cast<f32>(static_cast<i32>(rnd() % 2001) - 1000) / 977.0f;
+        f16w[i] = fp32_to_fp16(f32w[i]);
+    }
+
+    // A K-quant row, because that is what a real collection carries and it
+    // takes the generic tile rather than a hand-written kernel. Random bytes
+    // are not a valid Q4_K super-block -- the 6-bit scale/min bundles would
+    // decode to garbage f16 -- but the kernel only has to agree with vec_dot()
+    // on whatever dequant_block() produces from them, which is the property
+    // under test. n must be a whole number of 256-element super-blocks.
+    const i64 k_n = 256 * 2;
+    const i64 k_rb = dtype_row_bytes(DType::Q4_K, k_n);
+    std::vector<u8> q4k(static_cast<size_t>(n_out) * static_cast<size_t>(k_rb));
+    for (auto &b : q4k) b = static_cast<u8>(rnd() & 0xFF);
+    std::vector<f32> kx(rows * k_n);
+    for (i64 i = 0; i < rows * k_n; i++)
+        kx[i] = static_cast<f32>(static_cast<i32>(rnd() % 2001) - 1000) / 1000.0f;
+
+    struct Case {
+        const char *name;
+        DType t;
+        const void *w;
+        i64 width;    // elements per row
+        const f32 *xv; // activations for this case
+    };
+    const Case cases[] = {{"q8_0", DType::Q8_0, q8.data(), n, x},
+                          {"q4_0", DType::Q4_0, q4.data(), n, x},
+                          {"f32", DType::F32, f32w.data(), n, x},
+                          {"f16", DType::F16, f16w.data(), n, x},
+                          {"q4_k", DType::Q4_K, q4k.data(), k_n, kx.data()}};
+
+    std::vector<f32> got(rows * n_out), want(rows * n_out);
+    for (const Arm &a : arms) {
+        set_vec_dot_fast(a.fast);
+        set_vec_dot_avx2(a.avx2);
+        for (const Case &c : cases) {
+            // Every tile boundary: 1 tiles nothing, 8 is exactly one tile, 13
+            // exercises five leftover rows.
+            const i64 widths[] = {1, 7, 8, 9, 13};
+            for (i64 r : widths) {
+                if (r > rows) continue;
+                vec_dot_tiled(c.t, c.w, c.xv, c.width, 0, n_out, r, got.data(),
+                              n_out);
+                for (i64 rr = 0; rr < r; rr++)
+                    for (i64 o = 0; o < n_out; o++)
+                        want[rr * n_out + o] = vec_dot(
+                            c.t,
+                            static_cast<const u8 *>(c.w) +
+                                static_cast<size_t>(o) *
+                                    dtype_row_bytes(c.t, c.width),
+                            c.xv + rr * c.width, c.width);
+                CHECK(std::memcmp(got.data(), want.data(),
+                                  sizeof(f32) * static_cast<size_t>(r * n_out)) ==
+                          0,
+                      "the tiled GEMM reproduces vec_dot bit for bit");
+            }
+        }
+    }
+    set_vec_dot_fast(false);
+    set_vec_dot_avx2(false);
+}
+
 static void test_vec_dot_avx2_matches_fast() {
     // NOTE: vec_dot_avx2() reports "enabled AND this host can run it", not bare
     // availability, so it is not a probe for the CPU's features. It does not
@@ -18039,6 +18148,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_q4_0_layout)
     TEST_GROUP(test_q8_0_layout)
     TEST_GROUP(test_vec_dot_fast_opt_in)
+    TEST_GROUP(test_gemm_batched_bit_identical)
     TEST_GROUP(test_vec_dot_avx2_matches_fast)
     TEST_GROUP(test_q5_0_high_bit_layout)
     TEST_GROUP(test_kquant_roundtrip_shape)
