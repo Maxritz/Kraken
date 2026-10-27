@@ -506,6 +506,14 @@ still loses to the host's 124. On a shared host the NPU cannot win decode by
 running the same CPU better; it wins only if the weight format stops being
 expanded. That needs an opcode; it is not something the engine can paper over.
 
+The HIP backend already had a richer recorder of its own (`hipEvents`, a
+per-op device span plus host submit time and a device-idle gap), but it printed
+in its own format. It now also feeds the shared table — device span net of the
+recorder's measured per-op floor, MACs from the FLOPs the op reports — so
+`--kprof` is one tool with one heading on all three backends. It passes no
+roofline there: a `%peak` against a number this process cannot measure would be
+a guess, so those rows print `-`.
+
 This is also why `KRK_ENABLE_NPU` now runs a **capability probe** at configure
 time rather than assuming: `VNPU_OP_MATMUL_Q8_0` exists in some builds of
 npuxl-improved and not in v1.0.0, and a link error is a bad way to discover

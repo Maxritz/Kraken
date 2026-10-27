@@ -86,6 +86,18 @@ public:
         n_++;
     }
 
+    // A backend that already accumulates its own op counts (the HIP recorder
+    // does, from its event pool) corrects the count here instead of calling
+    // add() ops+1 times.
+    inline void add_ops(const char *name, uint64_t extra) {
+        for (int i = 0; i < n_; i++) {
+            if (rows_[i].name == name) {
+                rows_[i].ops += extra;
+                return;
+            }
+        }
+    }
+
     // Printed under the table so a %peak number can be checked against the
     // measurement it came from rather than a datasheet.
     inline void set_roofline(double int8_gmacs, double f32_gmacs) {
