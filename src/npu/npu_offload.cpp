@@ -102,6 +102,8 @@ struct Counters {
     // steps from prefill chunks in the numbers rather than by assumption.
     unsigned long long rows_hist[4] = {0, 0, 0, 0};
     unsigned long long staged_weights = 0;
+    unsigned long long streamed_weights = 0; // of those, served by the ring
+    unsigned long long q8_0_gemm = 0; // GEMMs that read weights in place
     unsigned long long flops = 0;
     unsigned long long elements = 0; // activation elements the device touched
     // W8A8 (KRK_NPU_W8A8): GEMMs the int8 path took, and GEMMs it handed back
@@ -237,7 +239,13 @@ public:
 
     Counters n;
 
-    const f32 *weight(const void *w, DType wt, i64 n_out, i64 n_in);
+    const f32 *weight(const void *w, DType wt, i64 n_out, i64 n_in,
+                      i64 rows);
+    // The prefill half of weight(): a bounded ring of f32 scratch slots.
+    const f32 *weight_streamed(const void *w, DType wt, i64 n_out, i64 n_in);
+    std::vector<std::vector<f32>> ring;
+    size_t ring_next = 0;  // next slot to hand out
+    size_t ring_elems = 0; // slots' current capacity, in f32
     // The same weight, packed for the device's int8 GEMM. nullptr means the
     // caller must fall back -- the device could not pack it, or the staging
     // budget is spent.
@@ -261,9 +269,32 @@ inline double optime_now_ms() {
         .count();
 }
 
-const f32 *Offload::weight(const void *w, DType wt, i64 n_out, i64 n_in) {
+const f32 *Offload::weight(const void *w, DType wt, i64 n_out, i64 n_in,
+                          i64 rows) {
     if (wt == DType::F32) return static_cast<const f32 *>(w);
     std::lock_guard<std::mutex> lk(mu);
+
+    // Two staging policies, because a prefill and a decode step want opposite
+    // things from the same cache. See the note in gemm() for the measurements
+    // that separate them.
+    //
+    //  - A many-row GEMM is a prefill. It reads this weight once, streams it
+    //    through the device's tile loop, and never comes back inside the chunk.
+    //    Keeping the expansion would only fill RAM with data nothing will read
+    //    again, which is what the old cache did: 2800 MiB of it on a 1.2 GiB
+    //    model, and then 318 GEMMs handed back to the host for want of room.
+    //    So prefill STREAMS: the weight is dequantized into one slot of a small
+    //    rotating ring, the slot is read by the queued command, and the same
+    //    slot is refilled for the next weight after a drain. RAM cost is
+    //    ring_slots * largest_weight, independent of how big the model is --
+    //    which is the whole point, because the model is 4.4 GiB expanded and
+    //    this box has 3.9 GiB.
+    //
+    //  - A one-row GEMM is a decode step. The same weight comes back on every
+    //    token, so the expansion is re-used hundreds of times and must persist.
+    //    Those go in the memo cache, still bounded by the budget.
+    if (rows > 1) return weight_streamed(w, wt, n_out, n_in);
+
     auto it = stage.find(w);
     if (it != stage.end()) return it->second.data.data();
     const size_t need = static_cast<size_t>(n_out) * static_cast<size_t>(n_in) * 4;
@@ -302,6 +333,67 @@ const f32 *Offload::weight(const void *w, DType wt, i64 n_out, i64 n_in) {
     stage_bytes += need;
     stage.emplace(w, std::move(e));
     return out;
+}
+
+// The streaming half of weight(): dequantize into a rotating slot and hand the
+// pointer straight to the caller.
+//
+// Correctness rests on one rule: a slot's bytes may not be overwritten while a
+// queued device command still reads them. Slots are therefore handed out
+// distinct until the ring wraps, and wrapping drains the queue first. A drain
+// costs one submit+sync, and the ring is deep enough that a prefill pays it
+// once per `ring_slots` weights rather than once per weight.
+const f32 *Offload::weight_streamed(const void *w, DType wt, i64 n_out,
+                                    i64 n_in) {
+    const size_t elems = static_cast<size_t>(n_out) * static_cast<size_t>(n_in);
+    // Grow the ring so every slot can hold the largest weight seen so far.
+    // Growth invalidates nothing that is queued only because it is preceded by
+    // the same drain the wrap does.
+    if (elems > ring_elems) {
+        flush(this);
+        try {
+            for (auto &slot : ring) slot.assign(elems, 0.0f);
+            ring.shrink_to_fit();
+            for (auto &slot : ring) slot.resize(elems);
+        } catch (const std::exception &) {
+            ring.clear();
+            ring_elems = 0;
+            return nullptr;
+        }
+        ring_elems = elems;
+        ring_next = 0;
+    }
+    if (ring.empty()) {
+        // A handful of slots: enough that the per-weight cost of the drain is
+        // amortised away, small enough that even the widest MoE expert block
+        // here (3072x768 f32 = 9 MiB) stays a rounding error next to the model.
+        const int slots = static_cast<int>(env_i64("KRK_NPU_RING_SLOTS", 8));
+        try {
+            ring.resize(static_cast<size_t>(slots > 1 ? slots : 1),
+                        std::vector<f32>(elems, 0.0f));
+        } catch (const std::exception &) {
+            return nullptr;
+        }
+        ring_elems = elems;
+        ring_next = 0;
+    }
+    if (ring_next >= ring.size()) {
+        if (!flush(this)) return nullptr;
+        ring_next = 0;
+    }
+    f32 *dst = ring[ring_next++].data();
+    const size_t row_bytes = dtype_row_bytes(wt, n_in);
+    const u8 *src = static_cast<const u8 *>(w);
+    const double t_stage0 = optime ? optime_now_ms() : 0.0;
+    for (i64 o = 0; o < n_out; o++)
+        dequant_row(wt, src + static_cast<size_t>(o) * row_bytes,
+                    dst + static_cast<size_t>(o) * static_cast<size_t>(n_in), n_in);
+    if (optime) {
+        n.stage_ms += optime_now_ms() - t_stage0;
+        n.staged_weights++;
+        n.streamed_weights++;
+    }
+    return dst;
 }
 
 vnpu_packed_weights_t *Offload::weight_i8(const void *w, DType wt, i64 n_out,
@@ -665,11 +757,14 @@ std::string stats(const Offload *o) {
                       o->n.submit_ms, o->n.sync_ms, o->n.batches,
                       o->n.pack_ms, o->n.packed_weights, o->n.pack_host_ms,
                       o->n.pack_flush_ms, o->n.pack_dev_ms);
-        out += format("; stage %.1f ms over %llu weight(s)", o->n.stage_ms,
-                      o->n.staged_weights);
+        out += format("; stage %.1f ms over %llu weight(s) (%llu streamed)",
+                      o->n.stage_ms, o->n.staged_weights,
+                      o->n.streamed_weights);
     }
     // The shape mix, always: it is what tells a prefill deficit apart from a
     // decode one, and both arms of every comparison need to show it.
+    if (o->n.q8_0_gemm)
+        out += format("; q8_0 in place %llu", o->n.q8_0_gemm);
     out += format("; gemm rows 1:%llu 2-8:%llu 9-32:%llu 33+:%llu",
                   o->n.rows_hist[0], o->n.rows_hist[1],
                   o->n.rows_hist[2], o->n.rows_hist[3]);
@@ -811,6 +906,38 @@ bool gemm_i8(Offload *o, void *out, const void *x, const void *w, DType wt,
 
 } // namespace
 
+// Q8_0 x f32 on the device, weights used where they lie.
+//
+// Kept out of the f32 staging path entirely: the pointer handed to the device
+// is the caller's own mapped weight block, so this costs no host memory and no
+// host time beyond the command itself. The kernel reads N*(K/32) blocks of 34
+// bytes; see gemm_q80_avx512_tile / gemm_q80_avx2_tile in the engine, which
+// are chosen there by runtime ISA detection.
+bool gemm_q8_0(Offload *o, void *out, const void *x, const void *w, i64 n_out,
+               i64 n_in, i64 rows) {
+    vnpu_command_t c{};
+    c.opcode = VNPU_OP_MATMUL_Q8_0;
+    vnpu_matmul_q8_0_args_t &a = c.args.matmul_q8_0;
+    a.A = static_cast<const float *>(x);
+    a.B = w;
+    a.C = static_cast<float *>(out);
+    a.M = static_cast<uint32_t>(rows);
+    a.K = static_cast<uint32_t>(n_in);
+    a.N = static_cast<uint32_t>(n_out);
+    a.lda = 0;
+    a.ldc = 0;
+    a.epilogue = VNPU_EPILOGUE_NONE;
+    a.unit = o->unit;
+    a.reserved0 = 0;
+    if (!o->push(c)) return false;
+    o->n.gemm++;
+    o->n.q8_0_gemm++;
+    o->n.flops += 2ull * static_cast<unsigned long long>(rows) *
+                  static_cast<unsigned long long>(n_out) *
+                  static_cast<unsigned long long>(n_in);
+    return true;
+}
+
 bool gemm(Offload *o, void *out, const void *x, const void *w, DType wt,
           i64 n_out, i64 n_in, i64 rows) {
     if (!o || !o->stream || !out || !x || !w) return false;
@@ -821,7 +948,16 @@ bool gemm(Offload *o, void *out, const void *x, const void *w, DType wt,
     o->n.rows_hist[rows == 1 ? 0 : rows <= 8 ? 1 : rows <= 32 ? 2 : 3]++;
     if (o->w8a8 && gemm_i8(o, out, x, w, wt, n_out, n_in, rows)) return true;
     if (o->w8a8) o->n.w8a8_fallback++;
-    const f32 *b = o->weight(w, wt, n_out, n_in);
+    // Q8_0 weights go to the device exactly as they sit in the mapped file.
+    // No dequantization, no staging, no copy: the block array is handed over
+    // and the kernel widens each 34-byte block into registers as it reads it.
+    // This is the path that makes a 1.2 GiB checkpoint usable on a host that
+    // cannot hold it expanded (4.4 GiB), and it removes the whole-model
+    // conversion pass that used to run before the first token.
+    if (wt == DType::Q8_0 && n_in % 32 == 0 && gemm_q8_0(o, out, x, w, n_out,
+                                                         n_in, rows))
+        return true;
+    const f32 *b = o->weight(w, wt, n_out, n_in, rows);
     if (!b) {
         o->n.declined++;
         return false;

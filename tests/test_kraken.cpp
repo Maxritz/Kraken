@@ -14070,6 +14070,62 @@ static void test_npu_backend() {
               "matches the reference GEMM");
     }
 
+    // ---- q8_0 weights used IN PLACE (no dequantization) --------------------
+    //
+    // The engine's newest weight path hands the device the GGUF block array as
+    // it sits in the mapped file: 34-byte blocks of {f16 d; int8 q[32]}, no
+    // expansion, no staging copy. That is a different kernel from the staging
+    // path above and it needs its own agreement gate, because a block read at
+    // the wrong stride or a scale applied per weight instead of per block
+    // still produces plausible numbers -- just not the same ones.
+    //
+    // The reference is the CPU backend reading the SAME blocks through its own
+    // dequantizer, so this measures the kernel and not the quantizer.
+    {
+        const size_t nblk = static_cast<size_t>(n_in) / 32u;
+        std::vector<u8> wq8(static_cast<size_t>(n_out) * nblk * 34u);
+        for (i64 o = 0; o < n_out; o++) {
+            for (size_t b = 0; b < nblk; b++) {
+                u8 *blk = wq8.data() + (static_cast<size_t>(o) * nblk + b) * 34u;
+                const u16 d = fp32_to_fp16(0.01f + 0.002f * static_cast<f32>(o % 7));
+                std::memcpy(blk, &d, sizeof(d));
+                for (size_t i = 0; i < 32; i++) {
+                    const u32 r = (rng = rng * 1664525u + 1013904223u) >> 24;
+                    reinterpret_cast<i8 *>(blk + 2)[i] =
+                        static_cast<i8>(static_cast<int>(r % 255u) - 127);
+                }
+            }
+        }
+        for (i64 rows : {i64(1), i64(3), i64(16), i64(58)}) {
+            std::vector<f32> x(static_cast<size_t>(rows * n_in));
+            for (f32 &v : x) v = rnd();
+            std::vector<f32> got(static_cast<size_t>(rows * n_out), 0.0f);
+            std::vector<f32> want(static_cast<size_t>(rows * n_out), 0.0f);
+            cpu->gemm(want.data(), x.data(), wq8.data(), DType::Q8_0, n_out, n_in,
+                      rows);
+            npu->gemm(got.data(), x.data(), wq8.data(), DType::Q8_0, n_out, n_in,
+                      rows);
+            f64 worst = 0.0, mag = 0.0;
+            for (size_t i = 0; i < got.size(); i++) {
+                worst = std::max<f64>(
+                    worst, std::fabs(static_cast<f64>(got[i]) - want[i]));
+                mag = std::max<f64>(mag, std::fabs(want[i]));
+            }
+            const f64 rel = mag > 0.0 ? worst / mag : worst;
+            CHECK(mag > 0.0 && rel < 2e-5,
+                  rows == 1
+                      ? "a q8_0 weight tensor used in place matches the reference "
+                        "GEMV"
+                      : "and the same blocks used in place match at every "
+                        "multi-row shape (3, 16, 58 -- the last is a prompt "
+                        "length, i.e. a tail that is not a tile multiple)");
+        }
+        // The in-place path must not have cost any host memory: staging is for
+        // formats that have no device kernel and q8_0 now has one.
+        CHECK(npu->backend_stats().find("q8_0 in place") != std::string::npos,
+              "the run summary says how many GEMMs read blocks in place");
+    }
+
     // ---- the counters the run summary prints -------------------------------
     {
         const std::string stats = npu->backend_stats();

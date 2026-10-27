@@ -1,0 +1,570 @@
+diff -ru -x build -x '*.o' -x '*.a' -x '*.so*' -x npuxl-improved-patched.zip pristine2/npuxl-improved-main/include/vnpu.h /home/user/npuxl-improved/npuxl-improved-full-d9eefc5/include/vnpu.h
+--- pristine2/npuxl-improved-main/include/vnpu.h	2026-10-27 12:03:59.000000000 +0000
++++ /home/user/npuxl-improved/npuxl-improved-full-d9eefc5/include/vnpu.h	2026-10-27 20:19:36.005428387 +0000
+@@ -180,7 +180,9 @@
+     VNPU_OP_COPY                = 14,
+     VNPU_OP_MEMSET              = 15,
+     VNPU_OP_BARRIER             = 16,
+-    VNPU_OP_COUNT               = 17
++    /* A f32 x Q8_0 GEMM: B stays in its on-disk block format. */
++    VNPU_OP_MATMUL_Q8_0         = 17,
++    VNPU_OP_COUNT               = 18
+ } vnpu_opcode_t;
+ 
+ typedef struct vnpu_config_t {
+@@ -295,6 +297,27 @@
+     uint32_t mask_tile_n;
+ } vnpu_matmul_f32_args_t;
+ 
++/* ------------------------------------------------------------------------- */
++/* Q8_0 weights, used where they lie                                        */
++/* ------------------------------------------------------------------------- */
++/* A GGUF q8_0 matrix is N rows of K weights, quantised 32 at a time into
++ * blocks of 34 bytes: one f16 scale, then 32 signed bytes. Splitting the scale
++ * out of each block and expanding the bytes to f32 is what a dequantising
++ * cache does, and it costs 3.76x the memory and a conversion pass over the
++ * whole model before the first token.
++ *
++ * This opcode takes the blocks as they are. B is the matrix exactly as it sits
++ * in the mapped file (or anywhere else): N * (K/32) blocks, row-major, no
++ * padding, no transpose, no staging. The kernel widens 32 bytes into registers
++ * per block, multiplies, and folds the block scale in at the end of the block,
++ * so the arithmetic is
++ *
++ *     C[m,n] = sum_blocks d_b * ( sum_{i<32} A[m, 32b+i] * q_b[i] )
++ *
++ * which is the same thing a dequantising dot computes, without ever
++ * materialising the dequantised row. K must be a multiple of 32.
++ */
++
+ typedef struct vnpu_matmul_i8_args_t {
+     const int8_t *A;             /* symmetric signed int8, MxK */
+     vnpu_packed_weights_t *B;    /* packed signed int8 weights */
+@@ -310,6 +333,21 @@
+     uint32_t unit;
+ } vnpu_matmul_i8_args_t;
+ 
++typedef struct vnpu_matmul_q8_0_args_t {
++    const float *A;              /* f32 activations, MxK */
++    const void *B;               /* q8_0 weights in place: N rows, K/32 blocks
++                                  * of {f16 d; int8 qs[32]} each, 34 bytes */
++    float *C;                    /* MxN */
++    uint32_t M;
++    uint32_t K;                  /* multiple of 32 */
++    uint32_t N;
++    uint32_t lda;                /* 0 = K */
++    uint32_t ldc;                /* 0 = N */
++    uint32_t epilogue;
++    uint32_t unit;
++    uint32_t reserved0;          /* 0 */
++} vnpu_matmul_q8_0_args_t;
++
+ typedef struct vnpu_rmsnorm_f32_args_t {
+     const float *X;
+     const float *W;
+@@ -449,6 +487,7 @@
+     union {
+         vnpu_matmul_f32_args_t matmul_f32;
+         vnpu_matmul_i8_args_t matmul_i8;
++        vnpu_matmul_q8_0_args_t matmul_q8_0;
+         vnpu_rmsnorm_f32_args_t rmsnorm;
+         vnpu_softmax_f32_args_t softmax;
+         vnpu_rope_f32_args_t rope;
+@@ -552,6 +591,9 @@
+                                                  const vnpu_matmul_f32_args_t *args);
+ VNPU_API vnpu_status_t VNPU_CALL vnpu_matmul_i8(vnpu_stream_t *stream,
+                                                 const vnpu_matmul_i8_args_t *args);
++VNPU_API vnpu_status_t VNPU_CALL vnpu_matmul_q8_0(
++    vnpu_stream_t *stream,
++    const vnpu_matmul_q8_0_args_t *args);
+ VNPU_API vnpu_status_t VNPU_CALL vnpu_quantize_i8(vnpu_stream_t *stream,
+                                                   const vnpu_quantize_i8_args_t *args);
+ VNPU_API vnpu_status_t VNPU_CALL vnpu_rmsnorm_f32(vnpu_stream_t *stream,
+diff -ru -x build -x '*.o' -x '*.a' -x '*.so*' -x npuxl-improved-patched.zip pristine2/npuxl-improved-main/src/core/runtime.cpp /home/user/npuxl-improved/npuxl-improved-full-d9eefc5/src/core/runtime.cpp
+--- pristine2/npuxl-improved-main/src/core/runtime.cpp	2026-10-27 12:03:59.000000000 +0000
++++ /home/user/npuxl-improved/npuxl-improved-full-d9eefc5/src/core/runtime.cpp	2026-10-27 20:19:39.037443704 +0000
+@@ -580,7 +580,7 @@
+         "NOP", "MATMUL_F32", "MATMUL_I8", "RMSNORM_F32", "SOFTMAX_F32",
+         "ROPE_F32", "SWIGLU_F32", "GELU_F32", "ADD_F32", "MUL_F32",
+         "ATTENTION_F32", "QUANTIZE_I8", "PACK_WEIGHTS_I8", "MTP_HEAD_F32",
+-        "COPY", "MEMSET", "BARRIER"
++        "COPY", "MEMSET", "BARRIER", "MATMUL_Q8_0"
+     };
+     return opcode < (sizeof(names) / sizeof(names[0])) ? names[opcode] : "UNKNOWN";
+ }
+diff -ru -x build -x '*.o' -x '*.a' -x '*.so*' -x npuxl-improved-patched.zip pristine2/npuxl-improved-main/src/core/scheduler.cpp /home/user/npuxl-improved/npuxl-improved-full-d9eefc5/src/core/scheduler.cpp
+--- pristine2/npuxl-improved-main/src/core/scheduler.cpp	2026-10-27 12:03:59.000000000 +0000
++++ /home/user/npuxl-improved/npuxl-improved-full-d9eefc5/src/core/scheduler.cpp	2026-10-27 20:20:03.761568598 +0000
+@@ -238,6 +238,63 @@
+         ctx.dma_bytes += a_bytes + b_bytes;
+ }
+ 
++// f32 activations against q8_0 weights held in place.
++//
++// No staging, no expansion, no copy: B is the caller's mapped block array and
++// the kernel reads it block by block. The only validation that can be done
++// without walking the matrix is the geometry -- K has to be a whole number of
++// 32-weight blocks, and every lane pointer has to be live for the duration of
++// the tile loop, which the caller guarantees by keeping the queue drained
++// around a weight whose storage it is about to move.
++static void execute_matmul_q8_0(ExecCtx &ctx)
++{
++    const auto &in = ctx.cmd->args.matmul_q8_0;
++    if (!in.A || !in.B || !in.C || !in.M || !in.N || !in.K)
++        throw std::runtime_error("matmul_q8_0: null operand or empty shape");
++    if (in.K % 32u)
++        throw std::runtime_error("matmul_q8_0: K must be a multiple of 32");
++    GemmQ80Params p{};
++    p.A = in.A;
++    p.B = static_cast<const uint8_t *>(in.B);
++    p.C = in.C;
++    p.M = in.M;
++    p.K = in.K;
++    p.N = in.N;
++    p.lda = in.lda ? in.lda : in.K;
++    p.ldc = in.ldc ? in.ldc : in.N;
++    p.epilogue = in.epilogue;
++    p.unit = in.unit;
++    p.isa = ctx.device->cpu.isa;
++    p.tile_m = ctx.device->tile_m.load();
++    p.tile_k = ctx.device->tile_k.load();
++    p.tile_n = ctx.device->tile_n.load();
++
++    uint32_t unit = in.unit ? in.unit : VNPU_UNIT_VOODOO;
++    std::vector<TileJob> tiles;
++    vnpu_status_t rc = build_tiles_generic(ctx.device, in.M, in.N, unit,
++                                           nullptr, 0, 0, tiles);
++    if (rc != VNPU_OK) throw std::runtime_error(vnpu_status_string(rc));
++    p.tiles = &tiles;
++    uint64_t active = 0;
++    for (const auto &t : tiles)
++        if (!t.cull) active++;
++    ctx.tiles_dispatched += active;
++    ctx.tiles_culled += tiles.size() - active;
++    uint64_t grain = std::max<uint64_t>(1,
++        ceil_div_u32(static_cast<uint32_t>(tiles.size()),
++                     static_cast<uint32_t>(ctx.device->info.num_threads * 4)));
++    ctx.device->pool->parallel_for(tiles.size(), grain,
++        [&](uint64_t begin, uint64_t end, uint32_t worker) {
++            kernel_gemm_q80_range(p, begin, end, worker);
++        });
++
++    uint64_t a_bytes = static_cast<uint64_t>(in.M) * in.K * sizeof(float);
++    uint64_t b_bytes = static_cast<uint64_t>(in.N) * (in.K / 32u) * 34u;
++    uint64_t c_bytes = static_cast<uint64_t>(in.M) * in.N * sizeof(float);
++    ctx.add_bytes(a_bytes + b_bytes, c_bytes);
++    ctx.add_flops(2ull * in.M * in.K * in.N);
++}
++
+ static PackedI8View make_packed_view(const vnpu_packed_weights_t *w)
+ {
+     PackedI8View v{};
+@@ -570,6 +627,7 @@
+     switch (cmd.opcode) {
+     case VNPU_OP_MATMUL_F32: unit = cmd.args.matmul_f32.unit; break;
+     case VNPU_OP_MATMUL_I8: unit = cmd.args.matmul_i8.unit; break;
++    case VNPU_OP_MATMUL_Q8_0: unit = cmd.args.matmul_q8_0.unit; break;
+     case VNPU_OP_MTP_HEAD_F32: unit = cmd.args.mtp_head.unit; break;
+     default: break;
+     }
+@@ -597,6 +655,7 @@
+             break;
+         case VNPU_OP_MATMUL_F32: execute_matmul_f32(ctx); break;
+         case VNPU_OP_MATMUL_I8: execute_matmul_i8(ctx); break;
++        case VNPU_OP_MATMUL_Q8_0: execute_matmul_q8_0(ctx); break;
+         case VNPU_OP_RMSNORM_F32: execute_rmsnorm(ctx); break;
+         case VNPU_OP_SOFTMAX_F32: execute_softmax(ctx); break;
+         case VNPU_OP_ROPE_F32: execute_rope(ctx); break;
+@@ -762,6 +821,8 @@
+                     vnpu_matmul_f32_args_t)
+ VNPU_SIMPLE_WRAPPER(vnpu_matmul_i8, VNPU_OP_MATMUL_I8, matmul_i8,
+                     vnpu_matmul_i8_args_t)
++VNPU_SIMPLE_WRAPPER(vnpu_matmul_q8_0, VNPU_OP_MATMUL_Q8_0, matmul_q8_0,
++                    vnpu_matmul_q8_0_args_t)
+ VNPU_SIMPLE_WRAPPER(vnpu_quantize_i8, VNPU_OP_QUANTIZE_I8, quantize_i8,
+                     vnpu_quantize_i8_args_t)
+ VNPU_SIMPLE_WRAPPER(vnpu_rmsnorm_f32, VNPU_OP_RMSNORM_F32, rmsnorm,
+diff -ru -x build -x '*.o' -x '*.a' -x '*.so*' -x npuxl-improved-patched.zip pristine2/npuxl-improved-main/src/internal.h /home/user/npuxl-improved/npuxl-improved-full-d9eefc5/src/internal.h
+--- pristine2/npuxl-improved-main/src/internal.h	2026-10-27 12:03:59.000000000 +0000
++++ /home/user/npuxl-improved/npuxl-improved-full-d9eefc5/src/internal.h	2026-10-27 20:19:56.281530813 +0000
+@@ -416,6 +416,28 @@
+ };
+ 
+ /* kernels.cpp */
++/* Q8_0 weights multiplied in place. B is the raw block array. */
++struct GemmQ80Params {
++    const float *A;
++    const uint8_t *B; /* N rows of K/32 blocks, 34 bytes each */
++    float *C;
++    uint32_t M;
++    uint32_t K;
++    uint32_t N;
++    uint32_t lda;
++    uint32_t ldc;
++    uint32_t epilogue;
++    uint32_t unit;
++    uint32_t isa;
++    uint32_t tile_m;
++    uint32_t tile_k;
++    uint32_t tile_n;
++    const std::vector<TileJob> *tiles;
++};
++
++void kernel_gemm_q80_range(const GemmQ80Params &p, size_t begin, size_t end,
++                           uint32_t worker_id);
++
+ void kernel_gemm_f32_range(const GemmF32Params &p, size_t begin, size_t end,
+                            uint32_t worker_id);
+ void kernel_gemm_i8_range(const GemmI8Params &p, size_t begin, size_t end,
+diff -ru -x build -x '*.o' -x '*.a' -x '*.so*' -x npuxl-improved-patched.zip pristine2/npuxl-improved-main/src/kernels/kernels.cpp /home/user/npuxl-improved/npuxl-improved-full-d9eefc5/src/kernels/kernels.cpp
+--- pristine2/npuxl-improved-main/src/kernels/kernels.cpp	2026-10-27 12:03:59.000000000 +0000
++++ /home/user/npuxl-improved/npuxl-improved-full-d9eefc5/src/kernels/kernels.cpp	2026-10-27 20:24:00.544526897 +0000
+@@ -8,10 +8,25 @@
+ #include "../internal.h"
+ 
+ #if VNPU_X86 && (defined(__GNUC__) || defined(__clang__))
++/* This TU is compiled with baseline flags on purpose, so that one binary runs
++ * everywhere. The ISA-specific functions below carry target attributes, which
++ * lets the compiler emit AVX2/AVX512 inside them and nowhere else. Which one
++ * RUNS is decided at runtime by runtime.cpp's __builtin_cpu_supports probe
++ * (device->cpu.isa), not by the preprocessor.
++ *
++ * VNPU_HAVE_X86_TARGETS is therefore "the compiler can emit these under an
++ * attribute", which is true for every GCC/Clang x86 build and is NOT the same
++ * question as "__AVX512F__ is defined in this TU". Gating the kernels on the
++ * latter -- which is what this file did -- silently compiled the AVX512 paths
++ * out of every default build, so a machine with 512-bit units ran the AVX2
++ * kernels and a machine with neither ran them too. Zen 3 (AVX2 only) must
++ * still build them; it just must never enter them. */
++#  define VNPU_HAVE_X86_TARGETS 1
+ #  define VNPU_TARGET_AVX2   __attribute__((target("avx2,fma")))
+ #  define VNPU_TARGET_AVX512 __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512vnni,fma")))
+ #  define VNPU_TARGET_VNNI   __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512vnni")))
+ #else
++#  define VNPU_HAVE_X86_TARGETS 0
+ #  define VNPU_TARGET_AVX2
+ #  define VNPU_TARGET_AVX512
+ #  define VNPU_TARGET_VNNI
+@@ -53,6 +68,13 @@
+     *dst = apply_epilogue(out, p.epilogue);
+ }
+ 
++inline void store_c_q80(const GemmQ80Params &p, uint32_t m, uint32_t n,
++                        float value)
++{
++    float *dst = p.C + static_cast<size_t>(m) * p.ldc + n;
++    *dst = apply_epilogue(value, p.epilogue);
++}
++
+ void zero_c_tile(const GemmF32Params &p, const TileJob &tile)
+ {
+     for (uint32_t m = tile.m0; m < tile.m0 + tile.tm; ++m) {
+@@ -65,6 +87,147 @@
+     }
+ }
+ 
++/* ------------------------------------------------------------------------- */
++/* Q8_0 weights, consumed exactly where they lie                             */
++/* ------------------------------------------------------------------------- */
++/*
++ * A GGUF q8_0 row is K/32 blocks of 34 bytes: an f16 scale then 32 signed
++ * bytes. The dequantising cache every engine starts with expands that to f32
++ * before the first token -- 3.76x the bytes and a full pass over the model --
++ * and on a 1.2 GiB checkpoint that is 4.4 GiB of resident weights that will
++ * not fit a 3.9 GiB box at all.
++ *
++ * This kernel reads the blocks as they are. Per block it widens 32 signed
++ * bytes to two vectors of 16 f32 lanes (one vpmovsxbd + vcvtdq2ps each), does
++ * the FMAs against A, and folds the block scale in once per block rather than
++ * once per weight:
++ *
++ *     C[m,n] = sum_b d_b * ( sum_{i<32} A[m,32b+i] * q_b[i] )
++ *
++ * The scale multiply moves off the 32 FMAs and onto one, so the arithmetic is
++ * the same as the dequantising dot and the memory traffic is 4x smaller. That
++ * ratio is the entire point on a prefill, which is bound by how fast B can be
++ * streamed rather than by flops.
++ *
++ * Rows of the output are blocked 4 at a time because four rows share one
++ * reading of B -- the same reason the f32 tile does it.
++ */
++
++/* F16 -> f32, matching the conversion the dequantising paths use. */
++static inline float q8_0_block_scale(const uint8_t *blk)
++{
++    uint16_t h;
++    std::memcpy(&h, blk, sizeof(h));
++    return vnpu_f16_to_float(h);
++}
++
++void gemm_q80_scalar_tile(const GemmQ80Params &p, const TileJob &tile)
++{
++    for (uint32_t m = tile.m0; m < tile.m0 + tile.tm; ++m) {
++        const float *arow = p.A + static_cast<size_t>(m) * p.lda;
++        for (uint32_t n = tile.n0; n < tile.n0 + tile.tn; ++n) {
++            const uint8_t *brow = p.B + static_cast<size_t>(n) * (p.K / 32u) * 34u;
++            float total = 0.0f;
++            for (uint32_t b = 0; b < p.K / 32u; ++b) {
++                const uint8_t *blk = brow + static_cast<size_t>(b) * 34u;
++                const float d = q8_0_block_scale(blk);
++                const int8_t *q = reinterpret_cast<const int8_t *>(blk + 2);
++                float acc = 0.0f;
++                for (uint32_t i = 0; i < 32; ++i)
++                    acc += arow[b * 32u + i] * static_cast<float>(q[i]);
++                total += d * acc;
++            }
++            store_c_q80(p, m, n, total);
++        }
++    }
++}
++
++#if VNPU_X86 && VNPU_HAVE_X86_TARGETS
++/* Local reduction: hsum512_ps lives further down the file with the f32 tiles,
++ * and this kernel has to compile both with and without -mavx512f in the TU. */
++VNPU_TARGET_AVX512
++static inline float q80_hsum512(__m512 v)
++{
++    __m256 lo = _mm512_castps512_ps256(v);
++    __m256 hi = _mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(v), 1));
++    __m256 sum = _mm256_add_ps(lo, hi);
++    __m128 a = _mm256_castps256_ps128(sum);
++    __m128 b = _mm256_extractf128_ps(sum, 1);
++    __m128 c = _mm_add_ps(a, b);
++    c = _mm_hadd_ps(c, c);
++    c = _mm_hadd_ps(c, c);
++    return _mm_cvtss_f32(c);
++}
++
++VNPU_TARGET_AVX512
++static void gemm_q80_avx512_tile(const GemmQ80Params &p, const TileJob &tile)
++{
++    /* One accumulator per output row, held as 16 f32 lanes across the WHOLE
++     * k loop and reduced once at the end.
++     *
++     * The first version reduced per block -- four hsums for every 32 weights --
++     * and measured 7 GFLOPS, because a horizontal reduction is a serial chain
++     * of shuffles and there is one per block per row. Folding the block scale
++     * into the 32 weight lanes instead (two multiplies, shared by all four
++     * rows) leaves the loop as FMAs only, and the reduction happens once per
++     * output element rather than once per block.
++     *
++     * The arithmetic is unchanged: each block still contributes d_b * q_b * a,
++     * because scaling w by d before the FMA is the same product as scaling
++     * the block sum by d after it. */
++    constexpr uint32_t MR = 4;
++    const uint32_t mend = tile.m0 + tile.tm;
++    const uint32_t nend = tile.n0 + tile.tn;
++    const uint32_t nblk = p.K / 32u;
++    uint32_t m = tile.m0;
++    for (; m + MR <= mend; m += MR) {
++        const float *a0 = p.A + static_cast<size_t>(m + 0) * p.lda;
++        const float *a1 = p.A + static_cast<size_t>(m + 1) * p.lda;
++        const float *a2 = p.A + static_cast<size_t>(m + 2) * p.lda;
++        const float *a3 = p.A + static_cast<size_t>(m + 3) * p.lda;
++        for (uint32_t n = tile.n0; n < nend; ++n) {
++            const uint8_t *brow = p.B + static_cast<size_t>(n) * nblk * 34u;
++            __m512 acc0 = _mm512_setzero_ps();
++            __m512 acc1 = _mm512_setzero_ps();
++            __m512 acc2 = _mm512_setzero_ps();
++            __m512 acc3 = _mm512_setzero_ps();
++            for (uint32_t b = 0; b < nblk; ++b) {
++                const uint8_t *blk = brow + static_cast<size_t>(b) * 34u;
++                const __m512 d = _mm512_set1_ps(q8_0_block_scale(blk));
++                const int8_t *q = reinterpret_cast<const int8_t *>(blk + 2);
++                const __m512 w0 = _mm512_mul_ps(d, _mm512_cvtepi32_ps(
++                    _mm512_cvtepi8_epi32(_mm_loadu_si128(
++                        reinterpret_cast<const __m128i *>(q)))));
++                const __m512 w1 = _mm512_mul_ps(d, _mm512_cvtepi32_ps(
++                    _mm512_cvtepi8_epi32(_mm_loadu_si128(
++                        reinterpret_cast<const __m128i *>(q + 16)))));
++                const float *ap = a0 + b * 32u;
++                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(ap), w0, acc0);
++                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(ap + 16), w1, acc0);
++                ap = a1 + b * 32u;
++                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(ap), w0, acc1);
++                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(ap + 16), w1, acc1);
++                ap = a2 + b * 32u;
++                acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(ap), w0, acc2);
++                acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(ap + 16), w1, acc2);
++                ap = a3 + b * 32u;
++                acc3 = _mm512_fmadd_ps(_mm512_loadu_ps(ap), w0, acc3);
++                acc3 = _mm512_fmadd_ps(_mm512_loadu_ps(ap + 16), w1, acc3);
++            }
++            store_c_q80(p, m + 0, n, q80_hsum512(acc0));
++            store_c_q80(p, m + 1, n, q80_hsum512(acc1));
++            store_c_q80(p, m + 2, n, q80_hsum512(acc2));
++            store_c_q80(p, m + 3, n, q80_hsum512(acc3));
++        }
++    }
++    for (; m < mend; ++m)
++        gemm_q80_scalar_tile(p, TileJob{m, tile.n0, 1, tile.tn, tile.tile_m,
++                                       tile.tile_n, tile.tile_k, 0, {0, 0, 0}});
++}
++
++#endif /* VNPU_HAVE_X86_TARGETS */
++
++
+ /* Portable scalar path - also the correctness oracle. */
+ void gemm_f32_scalar_tile(const GemmF32Params &p, const TileJob &tile)
+ {
+@@ -241,9 +404,60 @@
+ static void gemm_f32_avx512_nt_tile(const GemmF32Params &p,
+                                     const TileJob &tile)
+ {
++    /* B is N x K (trans_b), so row n of B is the weight row behind output
++     * column n and EVERY row of A needs it. The original form walked m
++     * outermost and read a whole B row per (m,n) pair, so a B that fits in L2
++     * was still streamed M times over. Block MR rows of A -- which are M*4
++     * bytes each and stay in L1 -- hold them for the whole n sweep, and read
++     * each B row once per block instead of once per row.
++     *
++     * Bit-identical to the unblocked form by construction: each output still
++     * accumulates k in the same order, into the same 16-lane accumulator, with
++     * the same horizontal sum and the same scalar k-tail. Only the loop order
++     * around it changed. */
++    constexpr uint32_t MR = 4;
+     const uint32_t mend = tile.m0 + tile.tm;
+     const uint32_t nend = tile.n0 + tile.tn;
+-    for (uint32_t m = tile.m0; m < mend; ++m) {
++    uint32_t m = tile.m0;
++    for (; m + MR <= mend; m += MR) {
++        const float *a0 = a_ptr(p, m + 0, 0);
++        const float *a1 = a_ptr(p, m + 1, 0);
++        const float *a2 = a_ptr(p, m + 2, 0);
++        const float *a3 = a_ptr(p, m + 3, 0);
++        for (uint32_t n = tile.n0; n < nend; ++n) {
++            const float *brow = p.B + static_cast<size_t>(n) * p.ldb;
++            __m512 acc0 = _mm512_setzero_ps();
++            __m512 acc1 = _mm512_setzero_ps();
++            __m512 acc2 = _mm512_setzero_ps();
++            __m512 acc3 = _mm512_setzero_ps();
++            uint32_t k = 0;
++            for (; k + 16 <= p.K; k += 16) {
++                __m512 bv = _mm512_loadu_ps(brow + k);
++                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a0 + k), bv, acc0);
++                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(a1 + k), bv, acc1);
++                acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(a2 + k), bv, acc2);
++                acc3 = _mm512_fmadd_ps(_mm512_loadu_ps(a3 + k), bv, acc3);
++            }
++            float d0 = hsum512_ps(acc0);
++            float d1 = hsum512_ps(acc1);
++            float d2 = hsum512_ps(acc2);
++            float d3 = hsum512_ps(acc3);
++            for (; k < p.K; ++k) {
++                const float bk = brow[k];
++                d0 += a0[k] * bk;
++                d1 += a1[k] * bk;
++                d2 += a2[k] * bk;
++                d3 += a3[k] * bk;
++            }
++            store_c(p, m + 0, n, d0);
++            store_c(p, m + 1, n, d1);
++            store_c(p, m + 2, n, d2);
++            store_c(p, m + 3, n, d3);
++        }
++    }
++    /* Remaining rows (at most MR-1): same blocked n sweep, no row reuse left
++     * to win, so keep the plain per-element dot. */
++    for (; m < mend; ++m) {
+         const float *arow = a_ptr(p, m, 0);
+         for (uint32_t n = tile.n0; n < nend; ++n) {
+             const float *brow = p.B + static_cast<size_t>(n) * p.ldb;
+@@ -260,6 +474,7 @@
+         }
+     }
+ }
++
+ #endif /* VNPU_X86 */
+ 
+ #if VNPU_NEON
+@@ -695,6 +910,90 @@
+ 
+ } /* anonymous namespace */
+ 
++#if VNPU_X86 && VNPU_HAVE_X86_TARGETS
++VNPU_TARGET_AVX2
++static inline float q80_hsum256(__m256 v)
++{
++    __m128 lo = _mm256_castps256_ps128(v);
++    __m128 hi = _mm256_extractf128_ps(v, 1);
++    __m128 c = _mm_add_ps(lo, hi);
++    c = _mm_hadd_ps(c, c);
++    c = _mm_hadd_ps(c, c);
++    return _mm_cvtss_f32(c);
++}
++
++/* Zen 3 and anything else with AVX2 but no AVX-512: 8 f32 lanes instead of 16,
++ * four widening steps per 32-weight block instead of two. Same structure as
++ * the 512-bit kernel, so the fallback is vectorised rather than scalar -- the
++ * scalar path is 5-7x slower and would make the "we fall back cleanly" story
++ * a 7x regression on the most common server core there is. */
++VNPU_TARGET_AVX2
++static void gemm_q80_avx2_tile(const GemmQ80Params &p, const TileJob &tile)
++{
++    constexpr uint32_t MR = 4;
++    const uint32_t mend = tile.m0 + tile.tm;
++    const uint32_t nend = tile.n0 + tile.tn;
++    const uint32_t nblk = p.K / 32u;
++    uint32_t m = tile.m0;
++    for (; m + MR <= mend; m += MR) {
++        const float *a0 = p.A + static_cast<size_t>(m + 0) * p.lda;
++        const float *a1 = p.A + static_cast<size_t>(m + 1) * p.lda;
++        const float *a2 = p.A + static_cast<size_t>(m + 2) * p.lda;
++        const float *a3 = p.A + static_cast<size_t>(m + 3) * p.lda;
++        for (uint32_t n = tile.n0; n < nend; ++n) {
++            const uint8_t *brow = p.B + static_cast<size_t>(n) * nblk * 34u;
++            __m256 acc0 = _mm256_setzero_ps();
++            __m256 acc1 = _mm256_setzero_ps();
++            __m256 acc2 = _mm256_setzero_ps();
++            __m256 acc3 = _mm256_setzero_ps();
++            for (uint32_t b = 0; b < nblk; ++b) {
++                const uint8_t *blk = brow + static_cast<size_t>(b) * 34u;
++                const __m256 d = _mm256_set1_ps(q8_0_block_scale(blk));
++                const int8_t *q = reinterpret_cast<const int8_t *>(blk + 2);
++                const float *ap = a0 + b * 32u;
++                for (uint32_t j = 0; j < 4; ++j) {
++                    const __m256 w = _mm256_mul_ps(d, _mm256_cvtepi32_ps(
++                        _mm256_cvtepi8_epi32(_mm_loadl_epi64(
++                            reinterpret_cast<const __m128i *>(q + j * 8)))));
++                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(ap + j * 8), w, acc0);
++                    acc1 = _mm256_fmadd_ps(
++                        _mm256_loadu_ps(a1 + b * 32u + j * 8), w, acc1);
++                    acc2 = _mm256_fmadd_ps(
++                        _mm256_loadu_ps(a2 + b * 32u + j * 8), w, acc2);
++                    acc3 = _mm256_fmadd_ps(
++                        _mm256_loadu_ps(a3 + b * 32u + j * 8), w, acc3);
++                }
++            }
++            store_c_q80(p, m + 0, n, q80_hsum256(acc0));
++            store_c_q80(p, m + 1, n, q80_hsum256(acc1));
++            store_c_q80(p, m + 2, n, q80_hsum256(acc2));
++            store_c_q80(p, m + 3, n, q80_hsum256(acc3));
++        }
++    }
++    for (; m < mend; ++m)
++        gemm_q80_scalar_tile(p, TileJob{m, tile.n0, 1, tile.tn, tile.tile_m,
++                                       tile.tile_n, tile.tile_k, 0, {0, 0, 0}});
++}
++#endif /* VNPU_X86 && VNPU_HAVE_X86_TARGETS */
++
++/* Q8_0 GEMM entry point. Lives outside the anonymous namespace above because
++ * scheduler.cpp calls it across translation units. */
++void kernel_gemm_q80_range(const GemmQ80Params &p, size_t begin, size_t end,
++                           uint32_t worker_id)
++{
++    (void)worker_id;
++    if (!p.tiles) return;
++    for (size_t i = begin; i < end; ++i) {
++        const TileJob &tile = (*p.tiles)[i];
++        if (tile.cull) continue;
++#if VNPU_X86 && VNPU_HAVE_X86_TARGETS
++        if (p.isa == ISA_AVX512) { gemm_q80_avx512_tile(p, tile); continue; }
++        if (p.isa == ISA_AVX2) { gemm_q80_avx2_tile(p, tile); continue; }
++#endif
++        gemm_q80_scalar_tile(p, tile);
++    }
++}
++
+ void kernel_gemm_f32_range(const GemmF32Params &p, size_t begin, size_t end,
+                            uint32_t worker_id)
+ {
