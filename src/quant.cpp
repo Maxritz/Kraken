@@ -6,8 +6,11 @@
 #include "krk/quant.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <ctime>
+#include <thread>
 
 #if defined(__F16C__) && defined(__FMA__) && \
     (defined(__x86_64__) || defined(__i386__))
@@ -35,6 +38,11 @@
 namespace krk {
 
 namespace {
+
+// Keep-alive sinks for the roofline probes below.
+std::atomic<int> g_probe_sink{0};
+std::atomic<float> g_probe_sink_f{0.0f};
+
 
 // NVFP4 / MXFP4 E2M1 grid, doubled (ggml kvalues_fp4).
 const i8 kValuesFp4[16] = {
@@ -1300,8 +1308,18 @@ bool cpu_has_avx2() {
 // Zen 3 does NOT have it (it shipped with Zen 4), so this is a runtime branch
 // and the AVX2 kernel below stays the fallback -- one binary, as required.
 bool cpu_has_vnni() {
-    static const bool v = __builtin_cpu_supports("avx512vnni") != 0 ||
-                          __builtin_cpu_supports("avxvnni") != 0;
+    // Detection AND the fallback switch: KRK_CPU_NO_VNNI=1 forces the AVX2
+    // kernels on a host that has VNNI, which is what makes them measurable on
+    // this box and what a user with a misreporting hypervisor needs.
+    //
+    // Only avx512vnni counts. The VNNI kernels in this file are compiled with
+    // the avx512vnni target attribute, so their vpdpbusd is the EVEX form: a
+    // host that has AVX-VNNI (Alder Lake) and NOT avx512vnni would raise SIGILL
+    // if it were dispatched here. Checking the feature the encoding actually
+    // requires is the difference between a fallback and a crash.
+    static const bool v = !(std::getenv("KRK_CPU_NO_VNNI") &&
+                            std::getenv("KRK_CPU_NO_VNNI")[0] == '1') &&
+                          __builtin_cpu_supports("avx512vnni") != 0;
     return v;
 }
 #endif // KRK_DOT_AVX2
@@ -1378,6 +1396,21 @@ __attribute__((target("avx2,fma"))) void quantize_q8_row_d(const f32 *x, i64 n,
                                                           i8 *xq, f32 *dx) {
     for (i64 b = 0; b < n; b += 32)
         quantize_q8_32_d(x + b, xq + b, dx + b / 32);
+}
+
+// Sum of 32 int8 as int32. This is the `dmin` term's other half and it depends
+// ONLY on the activation, so it is computed once per quantise, not once per
+// weight row. maddubs pairs (1*xi) twice into int16, then madd widens to int32:
+// |xi| <= 127 so a pair is <= 254 and nothing overflows.
+__attribute__((target("avx2"))) inline i32 sum_i8_32(const i8 *p) {
+    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
+    const __m256i m = _mm256_maddubs_epi16(_mm256_set1_epi8(1), v);
+    const __m256i s = _mm256_madd_epi16(m, _mm256_set1_epi16(1));
+    __m128i lo = _mm_add_epi32(_mm256_castsi256_si128(s),
+                               _mm256_extracti128_si256(s, 1));
+    lo = _mm_hadd_epi32(lo, lo);
+    lo = _mm_hadd_epi32(lo, lo);
+    return _mm_cvtsi128_si32(lo);
 }
 
 // One weight row of Q4_K against one quantized activation row.
@@ -1503,6 +1536,159 @@ __attribute__((target("avx2,fma"))) void dot_q4_K_q8_x8_d(
         out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
     }
 }
+
+// The same eight rows, with the min term taken out of the inner loop.
+//
+// dot_q4_K_q8_x8_d() above still rebuilds  S_s = sum(x_k)  for every weight
+// row: two maddubs + madd + cvt + fnmadd per 32 values per row, which is as
+// many instructions as the dot product itself. That is the whole reason the
+// prefill kernel measured 3.5 MAC/instruction while the kernel's own ceiling
+// with per-32 scales is about 6.4.
+//
+// With sx[] (computed once per activation row by quantize_q8_row_sx) the term
+// is  sum_s (dmin * m_s) * dx_s * S_s  -- pipelined as ONE eight-lane f32
+// vector per 256-value block: lane s is sub-block s, the eight m_s come from
+// one get_scale_min_k4 sweep of the block, and the eight S_s are one 32-byte
+// load. One cvt + one fnmadd per row per block replaces thirty-two
+// instructions per row per block. Nothing is dequantised: the block bytes are
+// read where they are stored, the scales are decoded into a register, not a
+// tensor.
+//
+// VNNI's vpdpbusd (Q4_K's nibbles are 0..15, so the weight side is already the
+// unsigned operand and the int8 activation the signed one) then does a 32-value
+// sub-block in a single instruction, against two for maddubs + madd.
+#if defined(KRK_DOT_AVX512)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+void dot_q4_K_q8_sx_x8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
+                              const i32 *sx, i64 n, i64 rstride, i64 dstride,
+                              i64 sstride, f32 *out, i64 out_stride) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        // The block's eight (scale, min) pairs, widened once and shared by all
+        // eight rows. get_scale_min_k4() is packed and branchy; doing it 8x8
+        // times per block is most of what the scalar tail was spending.
+        f32 sf[8], mf[8];
+        for (int s = 0; s < 8; s++) {
+            u8 a = 0, b = 0;
+            get_scale_min_k4(s, sc, &a, &b);
+            sf[s] = static_cast<f32>(a) * d;
+            mf[s] = static_cast<f32>(b) * dmin;
+        }
+        const __m256 sfv = _mm256_loadu_ps(sf);
+        const __m256 mfv = _mm256_loadu_ps(mf);
+        // The block decoded ONCE: eight 32-value unsigned vectors, in stored
+        // order. sub-block 2g is the low nibble of qs[32g..], 2g+1 the high.
+        __m256i qv[8];
+        for (int g = 0; g < 4; g++) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs + 32 * g));
+            qv[2 * g] = _mm256_and_si256(qb, kLo);
+            qv[2 * g + 1] = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+        }
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const __m256 dxv =
+                _mm256_loadu_ps(dx + static_cast<i64>(r) * dstride + nb * 8);
+            // dx_s * d * sc_s for the eight sub-blocks, then broadcast one lane
+            // at a time. The store/broadcast pair keeps these on the load
+            // ports; permuting would spend eight ALU slots instead.
+            f32 af[8];
+            _mm256_storeu_ps(af, _mm256_mul_ps(sfv, dxv));
+            for (int s = 0; s < 8; s++) {
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xr + 32 * s));
+                const __m256i iv = _mm256_dpbusd_epi32(zero, qv[s], xv);
+                acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                                         _mm256_broadcast_ss(af + s), acc[r]);
+            }
+            const __m256i s8 = _mm256_loadu_si256(reinterpret_cast<
+                const __m256i *>(sx + static_cast<i64>(r) * sstride + nb * 8));
+            acc[r] = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(s8),
+                                      _mm256_mul_ps(mfv, dxv), acc[r]);
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+
+#endif // KRK_DOT_AVX512
+
+#if defined(KRK_DOT_AVX2)
+// The AVX2 twin, for hosts without VNNI: maddubs + madd instead of dpbusd.
+// Same batched min term, which is where most of the gain is.
+__attribute__((target("avx2,fma")))
+void dot_q4_K_q8_sx_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
+                              const i32 *sx, i64 n, i64 rstride, i64 dstride,
+                              i64 sstride, f32 *out, i64 out_stride) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        f32 sf[8], mf[8];
+        for (int s = 0; s < 8; s++) {
+            u8 a = 0, b = 0;
+            get_scale_min_k4(s, sc, &a, &b);
+            sf[s] = static_cast<f32>(a) * d;
+            mf[s] = static_cast<f32>(b) * dmin;
+        }
+        const __m256 sfv = _mm256_loadu_ps(sf);
+        const __m256 mfv = _mm256_loadu_ps(mf);
+        __m256i qv[8];
+        for (int g = 0; g < 4; g++) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs + 32 * g));
+            qv[2 * g] = _mm256_and_si256(qb, kLo);
+            qv[2 * g + 1] = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+        }
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const __m256 dxv =
+                _mm256_loadu_ps(dx + static_cast<i64>(r) * dstride + nb * 8);
+            f32 af[8];
+            _mm256_storeu_ps(af, _mm256_mul_ps(sfv, dxv));
+            for (int s = 0; s < 8; s++) {
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xr + 32 * s));
+                const __m256i iv = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(qv[s], xv), ones16);
+                acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                                         _mm256_broadcast_ss(af + s), acc[r]);
+            }
+            const __m256i s8 = _mm256_loadu_si256(reinterpret_cast<
+                const __m256i *>(sx + static_cast<i64>(r) * sstride + nb * 8));
+            acc[r] = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(s8),
+                                      _mm256_mul_ps(mfv, dxv), acc[r]);
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+
+#endif // KRK_DOT_AVX2
 
 // ---------------------------------------------------------------------------
 // Q6_K against an int8 activation.
@@ -1638,6 +1824,116 @@ f32 dot_q4_K_q8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     return _mm_cvtss_f32(lo);
 }
 
+// Q4_K with the dmin term HOISTED. sx[] carries sum(xi) per 32-value sub-block,
+// which the quantise pass already knows. What that removes from the inner loop
+// is not small: the previous form spent two vpdpbusd (against an all-ones
+// operand), two cvt and two fnmadd per 64 values recomputing a number that is
+// identical for every one of the n_out weight rows. Here it is one scalar fma
+// per sub-block against a value that was computed once.
+//
+// Measured on Tiny-Moe: see the commit.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+f32 dot_q4_K_q8_sx_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
+                          const i32 *sx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    __m256 acc = _mm256_setzero_ps();
+    f32 macc = 0.0f;
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs));
+            const __m256i q_lo = _mm256_and_si256(qb, kLo);
+            const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+            const i64 base = (nb * 256) + j;
+            const i64 sb = base / 32;
+            const __m256i x_lo = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base));
+            const __m256i x_hi = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base + 32));
+            u8 s1, m1, s2, m2;
+            get_scale_min_k4(static_cast<int>(j / 32) + 0, sc, &s1, &m1);
+            get_scale_min_k4(static_cast<int>(j / 32) + 1, sc, &s2, &m2);
+            const __m256i i1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(),
+                                                   q_lo, x_lo);
+            const __m256i i2 = _mm256_dpbusd_epi32(_mm256_setzero_si256(),
+                                                   q_hi, x_hi);
+            const f32 dx1 = dx[sb];
+            const f32 dx2 = dx[sb + 1];
+            __m256 t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i1),
+                                       _mm256_set1_ps(dx1 * d * static_cast<f32>(s1)),
+                                       _mm256_mul_ps(_mm256_cvtepi32_ps(i2),
+                                                     _mm256_set1_ps(dx2 * d * static_cast<f32>(s2))));
+            acc = _mm256_add_ps(acc, t);
+            // Scalar, once per sub-block: the term the vector loop used to
+            // rebuild for every weight row.
+            macc += dx1 * dmin * static_cast<f32>(m1) * static_cast<f32>(sx[sb]);
+            macc += dx2 * dmin * static_cast<f32>(m2) * static_cast<f32>(sx[sb + 1]);
+            qs += 32;
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo) - macc;
+}
+
+// The same, on the AVX2 path (no VNNI: maddubs + madd instead of dpbusd).
+__attribute__((target("avx2,fma")))
+f32 dot_q4_K_q8_sx_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
+                          const i32 *sx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+    f32 macc = 0.0f;
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs));
+            const __m256i q_lo = _mm256_and_si256(qb, kLo);
+            const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+            const i64 base = (nb * 256) + j;
+            const i64 sb = base / 32;
+            const __m256i x_lo = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base));
+            const __m256i x_hi = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base + 32));
+            u8 s1, m1, s2, m2;
+            get_scale_min_k4(static_cast<int>(j / 32) + 0, sc, &s1, &m1);
+            get_scale_min_k4(static_cast<int>(j / 32) + 1, sc, &s2, &m2);
+            const __m256i i1 = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(q_lo, x_lo), ones16);
+            const __m256i i2 = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(q_hi, x_hi), ones16);
+            const f32 dx1 = dx[sb];
+            const f32 dx2 = dx[sb + 1];
+            const __m256 t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i1),
+                                             _mm256_set1_ps(dx1 * d * static_cast<f32>(s1)),
+                                             _mm256_mul_ps(_mm256_cvtepi32_ps(i2),
+                                                           _mm256_set1_ps(dx2 * d * static_cast<f32>(s2))));
+            acc = _mm256_add_ps(acc, t);
+            macc += dx1 * dmin * static_cast<f32>(m1) * static_cast<f32>(sx[sb]);
+            macc += dx2 * dmin * static_cast<f32>(m2) * static_cast<f32>(sx[sb + 1]);
+            qs += 32;
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo) - macc;
+}
+
 std::atomic<bool> g_dot_int8{false};
 std::atomic<bool> g_dot_int8_set{false};
 
@@ -1681,6 +1977,15 @@ bool env_dot_avx2() {
 // backend links against. Without AVX2 there is no int8 kernel and the flag is
 // false, so the stubs are never reached -- they exist so the translation unit
 // links on every target.
+void quantize_q8_row_sx(const f32 *x, i64 n, i8 *xq, f32 *dx, i32 *sx) {
+#if defined(KRK_DOT_AVX2)
+    quantize_q8_row_d(x, n, xq, dx);
+    for (i64 b = 0; b < n; b += 32) sx[b / 32] = sum_i8_32(xq + b);
+#else
+    (void)x; (void)n; (void)xq; (void)dx; (void)sx;
+#endif
+}
+
 void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx) {
 #if defined(KRK_DOT_AVX2)
     quantize_q8_row_d(x, n, xq, dx);
@@ -1703,12 +2008,57 @@ f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 #endif
 }
 
+f32 dot_q4_K_q8_sx(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
+                  i64 n) {
+#if defined(KRK_DOT_AVX512)
+    if (cpu_has_vnni()) return dot_q4_K_q8_sx_vnni_d(w, xq, dx, sx, n);
+#endif
+#if defined(KRK_DOT_AVX2)
+    return dot_q4_K_q8_sx_avx2_d(w, xq, dx, sx, n);
+#else
+    (void)w; (void)xq; (void)dx; (void)sx; (void)n;
+    return 0.0f;
+#endif
+}
+
 f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 #if defined(KRK_DOT_AVX2)
     return dot_q6_K_q8_d(w, xq, dx, n);
 #else
     (void)w; (void)xq; (void)dx; (void)n;
     return 0.0f;
+#endif
+}
+
+// Default on: the batched-min kernel is the fast path. KRK_CPU_DOT_X8SX=0
+// routes the eight-row prefill shape back through the per-row min term, which
+// is the A/B used to measure it and the fallback if a host ever disagrees.
+bool env_dot_x8sx() {
+    const char *e = std::getenv("KRK_CPU_DOT_X8SX");
+    return !e || e[0] != '0';
+}
+
+void dot_q4_K_q8_sx_x8(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
+                       i64 n, i64 rstride, i64 dstride, i64 sstride, f32 *out,
+                       i64 out_stride) {
+    static const bool use_sx = env_dot_x8sx();
+    if (!use_sx) {
+        dot_q4_K_q8_x8(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
+#if defined(KRK_DOT_AVX512)
+    if (cpu_has_vnni()) {
+        dot_q4_K_q8_sx_x8_vnni_d(w, xq, dx, sx, n, rstride, dstride, sstride,
+                                 out, out_stride);
+        return;
+    }
+#endif
+#if defined(KRK_DOT_AVX2)
+    dot_q4_K_q8_sx_x8_avx2_d(w, xq, dx, sx, n, rstride, dstride, sstride, out,
+                             out_stride);
+#else
+    (void)w; (void)xq; (void)dx; (void)sx; (void)n; (void)rstride;
+    (void)dstride; (void)sstride; (void)out; (void)out_stride;
 #endif
 }
 
@@ -1720,6 +2070,112 @@ void dot_q4_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 rstride
     (void)w; (void)xq; (void)dx; (void)n; (void)rstride; (void)dstride;
     (void)out; (void)out_stride;
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// The roofline probe.
+//
+// A "%peak" column is worthless if the peak is a datasheet number, and it is
+// actively misleading when the kernel under test is 256-bit and the datasheet
+// quotes the 512-bit rate. So the ceiling is MEASURED here, in this process,
+// with the same instruction width the kernels use: sixteen independent chains
+// (enough to saturate the ports, no loop-carried latency), register-only
+// operands, and a MAC count that is exactly what those instructions retire.
+#if defined(KRK_DOT_AVX512)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+double probe_int8_vnni_gmacs() {
+    const int iters = 20000;
+    __m256i a0 = _mm256_set1_epi8(3), a1 = _mm256_set1_epi8(5);
+    __m256i x = _mm256_set1_epi8(7);
+    __m256i s0 = _mm256_setzero_si256(), s1 = _mm256_setzero_si256();
+    __m256i s2 = _mm256_setzero_si256(), s3 = _mm256_setzero_si256();
+    __m256i s4 = _mm256_setzero_si256(), s5 = _mm256_setzero_si256();
+    __m256i s6 = _mm256_setzero_si256(), s7 = _mm256_setzero_si256();
+    timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < iters; i++) {
+        s0 = _mm256_dpbusd_epi32(s0, a0, x);
+        s1 = _mm256_dpbusd_epi32(s1, a1, x);
+        s2 = _mm256_dpbusd_epi32(s2, a0, x);
+        s3 = _mm256_dpbusd_epi32(s3, a1, x);
+        s4 = _mm256_dpbusd_epi32(s4, a0, x);
+        s5 = _mm256_dpbusd_epi32(s5, a1, x);
+        s6 = _mm256_dpbusd_epi32(s6, a0, x);
+        s7 = _mm256_dpbusd_epi32(s7, a1, x);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    s0 = _mm256_add_epi32(_mm256_add_epi32(s0, s1), _mm256_add_epi32(s2, s3));
+    s4 = _mm256_add_epi32(_mm256_add_epi32(s4, s5), _mm256_add_epi32(s6, s7));
+    s0 = _mm256_add_epi32(s0, s4);
+    // Keep the loop alive; the value is irrelevant.
+    g_probe_sink.store(_mm256_extract_epi32(s0, 0), std::memory_order_relaxed);
+    const double us = static_cast<double>(t1.tv_sec - t0.tv_sec) * 1e6 +
+                      static_cast<double>(t1.tv_nsec - t0.tv_nsec) / 1e3;
+    // 8 dpbusd per iteration, 32 MACs each, 256-bit.
+    const double macs = static_cast<double>(iters) * 8.0 * 32.0;
+    return us > 0 ? macs / us / 1e3 : 0.0;
+}
+
+#else
+double probe_int8_vnni_gmacs() { return 0.0; }
+#endif
+
+#if defined(KRK_DOT_AVX2)
+__attribute__((target("avx2,fma"))) double probe_f32_avx2_gmacs() {
+    const int iters = 20000;
+    __m256 p = _mm256_set1_ps(1.0001f), q = _mm256_set1_ps(0.9999f);
+    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+    __m256 s2 = _mm256_setzero_ps(), s3 = _mm256_setzero_ps();
+    __m256 s4 = _mm256_setzero_ps(), s5 = _mm256_setzero_ps();
+    __m256 s6 = _mm256_setzero_ps(), s7 = _mm256_setzero_ps();
+    timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < iters; i++) {
+        s0 = _mm256_fmadd_ps(p, q, s0);
+        s1 = _mm256_fmadd_ps(p, q, s1);
+        s2 = _mm256_fmadd_ps(p, q, s2);
+        s3 = _mm256_fmadd_ps(p, q, s3);
+        s4 = _mm256_fmadd_ps(p, q, s4);
+        s5 = _mm256_fmadd_ps(p, q, s5);
+        s6 = _mm256_fmadd_ps(p, q, s6);
+        s7 = _mm256_fmadd_ps(p, q, s7);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    s0 = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
+    s4 = _mm256_add_ps(_mm256_add_ps(s4, s5), _mm256_add_ps(s6, s7));
+    s0 = _mm256_add_ps(s0, s4);
+    g_probe_sink_f.store(_mm256_cvtss_f32(s0), std::memory_order_relaxed);
+    const double us = static_cast<double>(t1.tv_sec - t0.tv_sec) * 1e6 +
+                      static_cast<double>(t1.tv_nsec - t0.tv_nsec) / 1e3;
+    const double macs = static_cast<double>(iters) * 8.0 * 8.0;
+    return us > 0 ? macs / us / 1e3 : 0.0;
+}
+
+#else
+double probe_f32_avx2_gmacs() { return 0.0; }
+#endif
+
+// Reported by the CPU backend so the trace's %peak column is against this
+// host, at this kernel width, with every core it has.
+double isa_peak_gmacs(bool int8) {
+    // Off unless something is going to print it: a probe is a few milliseconds
+    // of the user's run and a normal run must not pay for it.
+    {
+        const char *e = std::getenv("KRK_KPROF");
+        if (!e || e[0] == '\0' || e[0] == '0') return 0.0;
+    }
+    static const double i8 = [] {
+        double per = 0.0;
+#if defined(KRK_DOT_AVX512)
+        if (cpu_has_vnni()) per = probe_int8_vnni_gmacs();
+#endif
+        if (per <= 0.0) per = probe_f32_avx2_gmacs() * 4.0; // maddubs = 16 MAC/instr
+        return per;
+    }();
+    static const double f32 = [] { return probe_f32_avx2_gmacs(); }();
+    const double cores = static_cast<double>(
+        std::max(1u, std::thread::hardware_concurrency()));
+    return (int8 ? i8 : f32) * cores;
 }
 
 void set_vec_dot_int8(bool on) {

@@ -345,7 +345,16 @@ public:
         // One row in the table per distinct kernel, because "gemm" as a single
         // row hides the thing that matters: a decode step and a batched
         // prefill run different kernels and belong on different lines.
-        KRK_KTIME(rows == 1 ? dtype_tag_r1(wt, n_in) : dtype_tag_rn(wt, n_in));
+        // MACs, not FLOPs: one per multiply-add, which is the unit %peak is
+        // measured in. Every GEMM row is compared against the ceiling for the
+        // instruction class it actually executes -- int8 dot where the int8
+        // fast path below takes it, f32 FMA otherwise.
+        KRK_KTIME_MAC(rows == 1 ? dtype_tag_r1(wt, n_in) : dtype_tag_rn(wt, n_in),
+                      static_cast<double>(rows) * static_cast<double>(n_out) *
+                          static_cast<double>(n_in),
+                      isa_peak_gmacs((wt == DType::Q4_K || wt == DType::Q6_K) &&
+                                     n_in > 0 && (n_in % 256) == 0 &&
+                                     vec_dot_int8()));
         const size_t row_bytes = dtype_row_bytes(wt, n_in);
         const f32 *xf = static_cast<const f32 *>(x);
         f32 *of = static_cast<f32 *>(out);
@@ -366,11 +375,17 @@ public:
             // data() is nullptr there. ASan caught the read at address 0.
             std::vector<i8> xq(static_cast<size_t>(rows * n_in));
             std::vector<f32> xd(static_cast<size_t>(rows * nb));
+            // sum(xi) per sub-block, for formats whose dmin term needs it. The
+            // Q4_K kernel reads it; Q6_K does not. Computing it here means it is
+            // done once per GEMM call instead of once per weight row.
+            std::vector<i32> xs(static_cast<size_t>(rows * nb), 0);
             for (i64 r = 0; r < rows; r++)
-                quantize_q8_row(xf + r * n_in, n_in,
-                                xq.data() + r * n_in, xd.data() + r * nb);
+                quantize_q8_row_sx(xf + r * n_in, n_in,
+                                   xq.data() + r * n_in, xd.data() + r * nb,
+                                   xs.data() + r * nb);
             const i8 *xqp = xq.data();
             const f32 *xdp = xd.data();
+            const i32 *xsp = xs.data();
             const u8 *wb = static_cast<const u8 *>(w);
             const i64 grain = std::max<i64>(8, std::min<i64>(256, n_out / 8));
             par_for(n_out, grain,
@@ -387,15 +402,17 @@ public:
                             // other's -- every token came out <unk>.
                             if (!q6)
                                 for (; r + 8 <= rows; r += 8)
-                                    dot_q4_K_q8_x8(wr, xqp + r * n_in,
-                                                   xdp + r * nb, n_in, n_in, nb,
-                                                   of + r * n_out + o, n_out);
+                                    dot_q4_K_q8_sx_x8(
+                                        wr, xqp + r * n_in, xdp + r * nb,
+                                        xsp + r * nb, n_in, n_in, nb, nb,
+                                        of + r * n_out + o, n_out);
                             for (; r < rows; r++)
                                 of[r * n_out + o] =
                                     q6 ? dot_q6_K_q8(wr, xqp + r * n_in,
                                                      xdp + r * nb, n_in)
-                                       : dot_q4_K_q8(wr, xqp + r * n_in,
-                                                     xdp + r * nb, n_in);
+                                       : dot_q4_K_q8_sx(wr, xqp + r * n_in,
+                                                        xdp + r * nb,
+                                                        xsp + r * nb, n_in);
                         }
                     });
             return;
@@ -589,7 +606,14 @@ public:
 
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {
-        KRK_KTIME("attention");
+        // Attention is a GEMM pair -- QK^T then AV -- over the cached keys, so
+        // its MACs are countable and its ceiling is the f32 FMA rate. It is the
+        // one non-GEMM component with a roofline worth printing.
+        KRK_KTIME_MAC("attention",
+                      static_cast<double>(d.n_tok) * static_cast<double>(d.n_head) *
+                          static_cast<double>(d.pos0 + d.n_tok) *
+                          static_cast<double>(d.hd) * 2.0,
+                      isa_peak_gmacs(false));
         // npu_flush_ first: q is usually the output of a GEMM still queued on
         // the device, and the gather below reads it on the host.
         npu_flush_();
