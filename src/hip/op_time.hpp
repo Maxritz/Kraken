@@ -63,6 +63,7 @@
 #include <map>
 #include <string>
 #include "krk/host_time.hpp"
+#include "krk/kernel_time.hpp"
 #include "krk/trace.hpp"
 #include <utility>
 #include <vector>
@@ -236,6 +237,33 @@ public:
             // runs, so the component table printed there had every device
             // column at zero.
             HostTime::get().report_components(out);
+        }
+        // ---- the same table as the CPU and NPU backends -----------------
+        //
+        // KernelTime is the backend-agnostic sink: one table, one column set,
+        // whoever filled it. Feeding it from here is what makes --kprof a
+        // cross-backend tool instead of three tools with different headings.
+        //
+        // `dev_ms` is the event span, which is the right quantity on this
+        // backend (it includes the launch-to-start gap, so a starved queue is
+        // visible rather than averaged away), and the recorder's own per-op
+        // floor is subtracted here exactly as it is below. No roofline is
+        // passed: a %peak column against a number this process cannot measure
+        // would be a guess, and the table prints "-" instead.
+        if (KernelTime::enabled()) {
+            for (const auto &kv : rows_) {
+                const Row &r = kv.second;
+                const double net =
+                    r.dev_ms - floor_ms * static_cast<double>(r.calls);
+                KernelTime::get().add(kv.first.c_str(),
+                                      (net > 0.0 ? net : 0.0) * 1000.0,
+                                      static_cast<double>(r.flops) / 2.0, 0.0);
+            }
+            // `add` counts one op per call, so a row's op count has to be the
+            // real one; patch it up from the recorder, which knows.
+            for (const auto &kv : rows_) {
+                KernelTime::get().add_ops(kv.first.c_str(), kv.second.calls);
+            }
         }
         double net_total = 0.0;
         i64 unresolved = 0;

@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <algorithm>
 #include <string>
 
@@ -83,6 +84,18 @@ public:
         rows_[n_].macs = macs;
         rows_[n_].peak_gmacs = peak_gmacs;
         n_++;
+    }
+
+    // A backend that already accumulates its own op counts (the HIP recorder
+    // does, from its event pool) corrects the count here instead of calling
+    // add() ops+1 times.
+    inline void add_ops(const char *name, uint64_t extra) {
+        for (int i = 0; i < n_; i++) {
+            if (rows_[i].name == name) {
+                rows_[i].ops += extra;
+                return;
+            }
+        }
     }
 
     // Printed under the table so a %peak number can be checked against the

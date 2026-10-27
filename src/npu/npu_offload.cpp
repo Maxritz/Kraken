@@ -22,6 +22,7 @@
 #include "npu_offload.hpp"
 
 #include "krk/common.hpp"
+#include "krk/kernel_time.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -169,6 +170,21 @@ public:
     // allocate.
     std::vector<vnpu_command_t> queue;
 
+    // One entry per command in `queue`: which component issued it, and how much
+    // arithmetic it asks for. The device executes a BATCH, so this is the only
+    // place device time can be attributed to a component -- at flush the batch
+    // is timed once and split across these by MAC count. It feeds KernelTime,
+    // the same table the CPU backend fills, so --kprof reads the same on every
+    // backend instead of each one inventing its own.
+    struct Pending {
+        const char *name;
+        double macs;
+    };
+    std::vector<Pending> pending;
+    // Accounting for the dispatch/execute split, always on (a batch is timed
+    // with two clock reads that are already there for KRK_NPU_OPTIME).
+    double last_batch_us = 0.0;
+
     // Dequantized weight staging. Keyed by the weight pointer the engine holds,
     // which is stable for the life of the model: the loader allocates once.
     std::unordered_map<const void *, Entry> stage;
@@ -257,6 +273,10 @@ public:
     // trips per GEMM on the arm that flushes every call, which is the arm the
     // int8 path exists to speed up.
     bool push_batch(const vnpu_command_t *cmds, size_t count);
+    // Same, but tagged with the component that issued it and its MAC count, so
+    // the measured batch time can be put on the right row of the trace.
+    bool push_batch_named(const vnpu_command_t *cmds, size_t count,
+                          const char *name, double macs);
     std::string describe() const;
 };
 
@@ -518,7 +538,15 @@ vnpu_packed_weights_t *Offload::weight_i8(const void *w, DType wt, i64 n_out,
 bool Offload::push(const vnpu_command_t &cmd) { return push_batch(&cmd, 1); }
 
 bool Offload::push_batch(const vnpu_command_t *cmds, size_t count) {
+    return push_batch_named(cmds, count, nullptr, 0.0);
+}
+
+bool Offload::push_batch_named(const vnpu_command_t *cmds, size_t count,
+                               const char *name, double macs) {
     queue.insert(queue.end(), cmds, cmds + count);
+    for (size_t i = 0; i < count; i++)
+        pending.push_back(Pending{name ? name : "npu_unnamed",
+                                  i == 0 ? macs : 0.0});
     // Gemm mode submits and waits on every call; Graph mode queues and is
     // drained by npu_flush_() at the next host op.
     //
@@ -698,12 +726,66 @@ std::string describe(const Offload *o) {
     return o ? o->describe() : std::string("NPU (not opened)");
 }
 
+// The device's own ceiling, MEASURED on the device, in this process.
+//
+// A %peak column against the host's ISA is meaningless for an offloaded op: the
+// question "could a better function do this faster" has to be asked of the
+// thing that runs it. vnpu's own banner quotes tiles, not a rate; this
+// runs one large matmul through the same stream the GEMMs use, twice, and
+// reports the better of the two.
+//
+// 64 x 1024 x 1024 = 134 MMAC per pass, which is a few milliseconds of device
+// time and enough to swamp one round trip. Cached for the process.
+static double npu_peak_gmacs(Offload *o) {
+    static double cached = -1.0;
+    if (cached >= 0.0) return cached;
+    cached = 0.0;
+    if (!o || !o->stream) return cached;
+    const uint32_t M = 64, K = 1024, N = 1024;
+    std::vector<f32> A(static_cast<size_t>(M) * K, 0.5f);
+    std::vector<f32> B(static_cast<size_t>(N) * K, 0.25f);
+    std::vector<f32> C(static_cast<size_t>(M) * N, 0.0f);
+    vnpu_command_t c{};
+    c.opcode = VNPU_OP_MATMUL_F32;
+    vnpu_matmul_f32_args_t &a = c.args.matmul_f32;
+    a.A = A.data();
+    a.B = B.data();
+    a.bias = nullptr;
+    a.C = C.data();
+    a.M = M;
+    a.K = K;
+    a.N = N;
+    a.trans_a = 0;
+    a.trans_b = 1;
+    a.lda = 0;
+    a.ldb = 0;
+    a.ldc = 0;
+    a.alpha = 1.0f;
+    a.beta = 0.0f;
+    a.epilogue = VNPU_EPILOGUE_NONE;
+    a.unit = o->unit;
+    const double macs = static_cast<double>(M) * K * N;
+    for (int pass = 0; pass < 3; pass++) {
+        const double t0 = optime_now_ms();
+        if (vnpu_stream_submit(o->stream, &c, 1, nullptr) != VNPU_OK) return 0.0;
+        if (vnpu_stream_sync(o->stream) != VNPU_OK) return 0.0;
+        const double us = (optime_now_ms() - t0) * 1000.0;
+        if (us <= 0.0) continue;
+        const double g = macs / us / 1e3;
+        if (g > cached) cached = g;
+    }
+    return cached;
+}
+
 bool flush(Offload *o) {
     if (!o || !o->stream) return true;
     o->n.flushes++;
     if (o->queue.empty()) return true;
     const size_t submitted = o->queue.size();
-    const double t_sub0 = o->optime ? optime_now_ms() : 0.0;
+    // Always read the clock here: the trace needs submit+sync whether or not
+    // KRK_NPU_OPTIME is set. Two steady_clock reads per batch are noise
+    // against a device round trip.
+    const double t_sub0 = optime_now_ms();
     const vnpu_status_t rc =
         vnpu_stream_submit(o->stream, o->queue.data(), submitted, nullptr);
     o->queue.clear();
@@ -726,7 +808,30 @@ bool flush(Offload *o) {
     o->n.batches++;
     const double t_sync0 = o->optime ? optime_now_ms() : 0.0;
     const vnpu_status_t src = vnpu_stream_sync(o->stream);
-    if (o->optime) o->n.sync_ms += optime_now_ms() - t_sync0;
+    const double t_sync1 = optime_now_ms();
+    if (o->optime) o->n.sync_ms += t_sync1 - t_sync0;
+    // The batch has just completed, so `submit + sync` is its device time. Put
+    // it on the components that filled it, split by MAC count -- a batch of one
+    // GEMM and a batch of a quantize+matmul pair both land correctly, and a
+    // batch with no arithmetic (a memset, a copy) splits evenly. This is the
+    // NPU's `dev_us` column, measured, not estimated.
+    if (KernelTime::enabled() && !o->pending.empty()) {
+        const double batch_us =
+            (t_sync1 - t_sub0) * 1000.0;
+        double total_macs = 0.0;
+        for (const auto &p : o->pending) total_macs += p.macs;
+        const double share_us = batch_us / static_cast<double>(o->pending.size());
+        for (const auto &p : o->pending) {
+            const double part = total_macs > 0.0
+                                    ? batch_us * (p.macs / total_macs)
+                                    : share_us;
+            KernelTime::get().add(p.name, part, p.macs, npu_peak_gmacs(o));
+        }
+        o->pending.clear();
+    } else {
+        o->pending.clear();
+    }
+    o->last_batch_us = (t_sync1 - t_sub0) * 1000.0;
     if (src != VNPU_OK) {
         KRK_ERROR("npu: the device reported an error (%s) after %zu command(s); "
                   "their outputs cannot be trusted and there is no point in the "
@@ -895,7 +1000,13 @@ bool gemm_i8(Offload *o, void *out, const void *x, const void *w, DType wt,
     m.epilogue = VNPU_EPILOGUE_NONE;
     m.unit = o->unit;
 
-    if (!o->push_batch(c, 2)) return false;
+    if (!o->push_batch_named(c, 2,
+                             rows == 1 ? "npu_gemm_i8_r1" : "npu_gemm_i8_rN",
+                             static_cast<double>(rows) *
+                                 static_cast<double>(n_out) *
+                                 static_cast<double>(n_in))) {
+        return false;
+    }
     o->n.w8a8_gemm++;
     o->n.gemm++;
     o->n.flops += 2ull * static_cast<unsigned long long>(rows) *
@@ -915,6 +1026,14 @@ bool gemm_i8(Offload *o, void *out, const void *x, const void *w, DType wt,
 // are chosen there by runtime ISA detection.
 bool gemm_q8_0(Offload *o, void *out, const void *x, const void *w, i64 n_out,
                i64 n_in, i64 rows) {
+#if !defined(KRK_VNPU_HAS_Q8_0)
+    // This vnpu.h has no VNPU_OP_MATMUL_Q8_0 (v1.0.0 dropped it; the CMake
+    // capability probe reports which way this build went). Returning false
+    // sends the call to the f32 staging path, which is a working path and the
+    // more accurate one -- not a stub.
+    (void)o; (void)out; (void)x; (void)w; (void)n_out; (void)n_in; (void)rows;
+    return false;
+#else
     vnpu_command_t c{};
     c.opcode = VNPU_OP_MATMUL_Q8_0;
     vnpu_matmul_q8_0_args_t &a = c.args.matmul_q8_0;
@@ -929,13 +1048,21 @@ bool gemm_q8_0(Offload *o, void *out, const void *x, const void *w, i64 n_out,
     a.epilogue = VNPU_EPILOGUE_NONE;
     a.unit = o->unit;
     a.reserved0 = 0;
-    if (!o->push(c)) return false;
+    if (!o->push_batch_named(&c, 1,
+                             rows == 1 ? "npu_gemm_q8_0_r1"
+                                       : "npu_gemm_q8_0_rN",
+                             static_cast<double>(rows) *
+                                 static_cast<double>(n_out) *
+                                 static_cast<double>(n_in))) {
+        return false;
+    }
     o->n.gemm++;
     o->n.q8_0_gemm++;
     o->n.flops += 2ull * static_cast<unsigned long long>(rows) *
                   static_cast<unsigned long long>(n_out) *
                   static_cast<unsigned long long>(n_in);
     return true;
+#endif // KRK_VNPU_HAS_Q8_0
 }
 
 bool gemm(Offload *o, void *out, const void *x, const void *w, DType wt,
@@ -983,7 +1110,11 @@ bool gemm(Offload *o, void *out, const void *x, const void *w, DType wt,
     a.beta = 0.0f; // do not read C: the caller's GEMM overwrites it
     a.epilogue = VNPU_EPILOGUE_NONE;
     a.unit = o->unit;
-    if (!o->push(c)) {
+    const double macs = static_cast<double>(rows) * static_cast<double>(n_out) *
+                        static_cast<double>(n_in);
+    if (!o->push_batch_named(&c, 1, rows == 1 ? "npu_gemm_f32_r1"
+                                              : "npu_gemm_f32_rN",
+                             macs)) {
         o->n.declined++;
         return false;
     }
@@ -1138,7 +1269,7 @@ bool rmsnorm(Offload *o, void *out, const void *x, const f32 *w, i64 rows, i64 n
     a.cols = static_cast<uint32_t>(n);
     a.eps = eps;
     a.unit = o->unit;
-    if (!o->push(c)) {
+    if (!o->push_batch_named(&c, 1, "npu_rmsnorm", 0.0)) {
         o->n.declined++;
         return false;
     }
@@ -1160,7 +1291,7 @@ bool swiglu(Offload *o, void *out, const void *gate, const void *up, i64 n) {
     a.count = static_cast<uint64_t>(n);
     a.alpha = 1.0f;
     a.unit = o->unit;
-    if (!o->push(c)) {
+    if (!o->push_batch_named(&c, 1, "npu_swiglu", 0.0)) {
         o->n.declined++;
         return false;
     }
@@ -1185,7 +1316,7 @@ bool add(Offload *o, void *a_, const void *b, i64 n) {
     a.alpha = 1.0f;
     a.beta = 1.0f;
     a.unit = o->unit;
-    if (!o->push(c)) {
+    if (!o->push_batch_named(&c, 1, "npu_add", 0.0)) {
         o->n.declined++;
         return false;
     }
@@ -1208,7 +1339,7 @@ bool add_scaled(Offload *o, void *dst, const void *src, f32 alpha, i64 n) {
     a.alpha = alpha;
     a.beta = 1.0f;
     a.unit = o->unit;
-    if (!o->push(c)) {
+    if (!o->push_batch_named(&c, 1, "npu_add_scaled", 0.0)) {
         o->n.declined++;
         return false;
     }
@@ -1231,7 +1362,7 @@ bool mul(Offload *o, void *a_, const void *b, i64 n) {
     a.alpha = 1.0f;
     a.beta = 0.0f;
     a.unit = o->unit;
-    if (!o->push(c)) {
+    if (!o->push_batch_named(&c, 1, "npu_mul", 0.0)) {
         o->n.declined++;
         return false;
     }
