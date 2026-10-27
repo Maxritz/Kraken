@@ -310,7 +310,9 @@ def analyse_device(t: Trace, top: int, gap_us: float) -> dict:
                 f"{_q(d['dur'], 0.50):.1f}",
                 f"{_q(d['dur'], 0.95):.1f}",
                 f"{max(d['dur']):.1f}",
-                f"{moved / 1e6:.1f} MiB",
+                # MiB, not MB: a column headed MiB that divides by 1e6 is a
+                # unit lie, and it read as 1699.7 where the true figure is 1621.
+                f"{moved / 1048576.0:.1f} MiB",
                 f"{gbs:.1f}",
                 f"{gfs:.1f}",
                 ",".join(sorted(d["units"])),

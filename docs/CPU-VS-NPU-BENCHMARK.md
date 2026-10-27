@@ -5,12 +5,19 @@ what was better, and do we have a comprehensive benchmark we can see". Every
 number below was produced on this machine by the two committed tools in
 `tools/`, and every one of them can be reproduced by section 10.
 
-The short version: **on this box the virtual-NPU path beats plain CPU by 2.7x
-to 15.5x on prefill and 1.6x to 4.1x on decode, with byte-identical greedy
-output on all 72 measured cells** — with one cell where the CPU still wins
-(`tiny-q8_0`, 16 prompt words, CPU 1.2x faster), called out in section 3
+The short version: **on this box the virtual-NPU path beats plain CPU by 1.8x
+to 18.4x on prefill and 1.1x to 5.1x on decode, with byte-identical greedy
+output on every measured cell** — with one cell where the CPU still wins
+(`tiny-q8_0`, 16 prompt words, CPU 1.9x faster), called out in section 3
 rather than averaged away. It is a large win for anyone with a decent CPU and
 no GPU, which is exactly the population this path is for.
+
+Sections 2-7 were re-recorded in one session on one machine. An earlier round
+ran on a different sandbox instance and read systematically higher on the
+`--cpu` arm (+30% median) while the device's own kernels measured the same, so
+only the ratios survived that move. Section 8 quotes the round that tested each
+rejected optimisation, because a negative result is about the ranking at the
+time, not about an absolute rate.
 
 ## 1. What was measured, and on what
 
@@ -44,70 +51,73 @@ are deterministic and the greedy continuation is a fixed string per fixture.
 
 | model | prompt words | `--cpu` prefill | `--npu` prefill | `--npu-cpu` prefill | best | speedup |
 | --- | ---: | ---: | ---: | ---: | --- | ---: |
-| `medium-f16` | 16 | 14.1 | 66.7 | 65.1 | `--npu` | **4.7x** |
-| `medium-f16` | 64 | 14.3 | 169.5 | 144.7 | `--npu` | **11.9x** |
-| `medium-q4_0` | 16 | 17.7 | 72.8 | 74.2 | `--npu-cpu` | **4.2x** |
-| `medium-q4_0` | 64 | 18.4 | 180.2 | 186.3 | `--npu-cpu` | **10.1x** |
-| `medium-q8_0` | 16 | 25.0 | 92.5 | 89.6 | `--npu` | **3.7x** |
-| `medium-q8_0` | 64 | 25.0 | 208.1 | 195.5 | `--npu` | **8.3x** |
-| `small-f16` | 16 | 71.7 | 317.8 | 325.3 | `--npu-cpu` | **4.5x** |
-| `small-f16` | 64 | 71.2 | 751.5 | 773.4 | `--npu-cpu` | **10.9x** |
-| `small-f16` | 256 | 68.4 | 1039.3 | 1059.6 | `--npu-cpu` | **15.5x** |
-| `small-q4_0` | 16 | 92.5 | 347.8 | 332.9 | `--npu` | **3.8x** |
-| `small-q4_0` | 64 | 92.1 | 840.7 | 814.7 | `--npu` | **9.1x** |
-| `small-q4_0` | 256 | 89.2 | 1111.5 | 1123.4 | `--npu-cpu` | **12.6x** |
-| `small-q8_0` | 16 | 125.1 | 412.4 | 430.3 | `--npu-cpu` | **3.4x** |
-| `small-q8_0` | 64 | 125.2 | 915.9 | 925.6 | `--npu-cpu` | **7.4x** |
-| `small-q8_0` | 256 | 124.5 | 1155.1 | 1147.4 | `--npu` | **9.3x** |
-| `tiny-f16` | 16 | 543.5 | 2091.6 | 2125.3 | `--npu-cpu` | **3.9x** |
-| `tiny-f16` | 64 | 576.6 | 4434.0 | 5121.6 | `--npu-cpu` | **8.9x** |
-| `tiny-f16` | 256 | 565.3 | 5479.9 | 6315.4 | `--npu-cpu` | **11.2x** |
-| `tiny-q4_0` | 16 | 727.4 | 2337.3 | 2602.0 | `--npu-cpu` | **3.6x** |
-| `tiny-q4_0` | 64 | 731.5 | 4834.8 | 5693.0 | `--npu-cpu` | **7.8x** |
-| `tiny-q4_0` | 256 | 704.9 | 5985.8 | 6185.1 | `--npu-cpu` | **8.8x** |
-| `tiny-q8_0` | 16 | 977.7 | 2657.3 | 2574.2 | `--npu` | **2.7x** |
-| `tiny-q8_0` | 64 | 1029.9 | 4908.6 | 5784.5 | `--npu-cpu` | **5.6x** |
-| `tiny-q8_0` | 256 | 1008.5 | 6597.9 | 6867.7 | `--npu-cpu` | **6.8x** |
+| `medium-f16` | 16 | 13.4 | 64.6 | 65.4 | `--npu-cpu` | **4.9x** |
+| `medium-f16` | 64 | 13.3 | 162.6 | 167.7 | `--npu-cpu` | **12.6x** |
+| `medium-q4_0` | 16 | 24.5 | 72.4 | 72.6 | `--npu-cpu` | **3.0x** |
+| `medium-q4_0` | 64 | 24.1 | 171.4 | 187.7 | `--npu-cpu` | **7.8x** |
+| `medium-q8_0` | 16 | 38.6 | 77.1 | 75.6 | `--npu` | **2.0x** |
+| `medium-q8_0` | 64 | 39.6 | 180.3 | 202.5 | `--npu-cpu` | **5.1x** |
+| `small-f16` | 16 | 65.1 | 308.6 | 310.0 | `--npu-cpu` | **4.8x** |
+| `small-f16` | 64 | 66.2 | 719.3 | 735.0 | `--npu-cpu` | **11.1x** |
+| `small-f16` | 256 | 65.3 | 1200.2 | 1176.9 | `--npu` | **18.4x** |
+| `small-q4_0` | 16 | 118.1 | 364.1 | 376.8 | `--npu-cpu` | **3.2x** |
+| `small-q4_0` | 64 | 118.6 | 866.7 | 846.0 | `--npu` | **7.3x** |
+| `small-q4_0` | 256 | 117.7 | 1064.3 | 1172.1 | `--npu-cpu` | **10.0x** |
+| `small-q8_0` | 16 | 206.6 | 395.1 | 428.0 | `--npu-cpu` | **2.1x** |
+| `small-q8_0` | 64 | 209.8 | 929.5 | 971.6 | `--npu-cpu` | **4.6x** |
+| `small-q8_0` | 256 | 203.1 | 1321.3 | 1315.0 | `--npu` | **6.5x** |
+| `tiny-f16` | 16 | 526.6 | 2180.4 | 2215.7 | `--npu-cpu` | **4.2x** |
+| `tiny-f16` | 64 | 524.0 | 5080.4 | 5371.9 | `--npu-cpu` | **10.3x** |
+| `tiny-f16` | 256 | 522.2 | 7577.4 | 7842.6 | `--npu-cpu` | **15.0x** |
+| `tiny-q4_0` | 16 | 978.4 | 2886.7 | 2972.5 | `--npu-cpu` | **3.0x** |
+| `tiny-q4_0` | 64 | 979.8 | 6143.3 | 6404.6 | `--npu-cpu` | **6.5x** |
+| `tiny-q4_0` | 256 | 901.2 | 5762.2 | 8130.5 | `--npu-cpu` | **9.0x** |
+| `tiny-q8_0` | 16 | 1746.5 | 3154.6 | 3048.8 | `--npu` | **1.8x** |
+| `tiny-q8_0` | 64 | 1738.5 | 6473.7 | 7020.3 | `--npu-cpu` | **4.0x** |
+| `tiny-q8_0` | 256 | 1682.3 | 7660.1 | 8183.1 | `--npu-cpu` | **4.9x** |
 
 ## 3. Decode: tokens/s
 
 | model | prompt words | `--cpu` decode | `--npu` decode | `--npu-cpu` decode | best | speedup |
 | --- | ---: | ---: | ---: | ---: | --- | ---: |
-| `medium-f16` | 16 | 13.7 | 53.8 | 55.5 | `--npu-cpu` | **4.1x** |
-| `medium-f16` | 64 | 13.5 | 45.0 | 42.2 | `--npu` | **3.3x** |
-| `medium-q4_0` | 16 | 17.2 | 51.1 | 52.2 | `--npu-cpu` | **3.0x** |
-| `medium-q4_0` | 64 | 17.4 | 46.0 | 46.9 | `--npu-cpu` | **2.7x** |
-| `medium-q8_0` | 16 | 23.5 | 57.1 | 54.7 | `--npu` | **2.4x** |
-| `medium-q8_0` | 64 | 23.4 | 47.2 | 45.2 | `--npu` | **2.0x** |
-| `small-f16` | 16 | 66.1 | 222.3 | 186.0 | `--npu` | **3.4x** |
-| `small-f16` | 64 | 64.4 | 195.5 | 184.6 | `--npu` | **3.0x** |
-| `small-f16` | 256 | 61.2 | 187.5 | 175.0 | `--npu` | **3.1x** |
-| `small-q4_0` | 16 | 84.6 | 170.6 | 175.9 | `--npu-cpu` | **2.1x** |
-| `small-q4_0` | 64 | 85.0 | 196.9 | 194.6 | `--npu` | **2.3x** |
-| `small-q4_0` | 256 | 80.0 | 169.0 | 177.7 | `--npu-cpu` | **2.2x** |
-| `small-q8_0` | 16 | 113.7 | 224.6 | 200.1 | `--npu` | **2.0x** |
-| `small-q8_0` | 64 | 112.2 | 197.4 | 195.8 | `--npu` | **1.8x** |
-| `small-q8_0` | 256 | 106.8 | 179.8 | 170.7 | `--npu` | **1.7x** |
-| `tiny-f16` | 16 | 448.6 | 818.7 | 612.4 | `--npu` | **1.8x** |
-| `tiny-f16` | 64 | 445.1 | 1484.9 | 1070.4 | `--npu` | **3.3x** |
-| `tiny-f16` | 256 | — | — | — | — | — |
-| `tiny-q4_0` | 16 | 547.6 | 871.1 | 677.3 | `--npu` | **1.6x** |
-| `tiny-q4_0` | 64 | 572.6 | 1321.2 | 936.0 | `--npu` | **2.3x** |
-| `tiny-q4_0` | 256 | — | — | — | — | — |
-| `tiny-q8_0` | 16 | 802.4 | 699.6 | 680.9 | `--cpu` | **1.2x** |
-| `tiny-q8_0` | 64 | 755.9 | 1408.8 | 1457.7 | `--npu-cpu` | **1.9x** |
-| `tiny-q8_0` | 256 | — | — | — | — | — |
-
-Rows marked "—" are `tiny-*` at 256 prompt words: that prompt is longer than
-`--ctx 512`, so the run has no decode phase to report. They are left in the
-table as missing rather than quietly dropped.
+| `medium-f16` | 16 | 12.6 | 60.4 | 64.5 | `--npu-cpu` | **5.1x** |
+| `medium-f16` | 64 | 12.7 | 49.9 | 53.1 | `--npu-cpu` | **4.2x** |
+| `medium-q4_0` | 16 | 23.1 | 55.7 | 60.7 | `--npu-cpu` | **2.6x** |
+| `medium-q4_0` | 64 | 22.8 | 50.1 | 41.0 | `--npu` | **2.2x** |
+| `medium-q8_0` | 16 | 34.0 | 58.0 | 43.0 | `--npu` | **1.7x** |
+| `medium-q8_0` | 64 | 37.7 | 39.3 | 45.8 | `--npu-cpu` | **1.2x** |
+| `small-f16` | 16 | 60.5 | 254.3 | 313.6 | `--npu-cpu` | **5.2x** |
+| `small-f16` | 64 | 60.4 | 246.2 | 255.3 | `--npu-cpu` | **4.2x** |
+| `small-f16` | 256 | 59.0 | 247.8 | 255.1 | `--npu-cpu` | **4.3x** |
+| `small-q4_0` | 16 | 104.0 | 264.3 | 274.6 | `--npu-cpu` | **2.6x** |
+| `small-q4_0` | 64 | 107.1 | 277.9 | 283.4 | `--npu-cpu` | **2.6x** |
+| `small-q4_0` | 256 | 103.9 | 175.0 | 226.1 | `--npu-cpu` | **2.2x** |
+| `small-q8_0` | 16 | 187.5 | 314.3 | 313.8 | `--npu` | **1.7x** |
+| `small-q8_0` | 64 | 185.0 | 306.0 | 314.6 | `--npu-cpu` | **1.7x** |
+| `small-q8_0` | 256 | 170.5 | 310.8 | 294.8 | `--npu` | **1.8x** |
+| `tiny-f16` | 16 | 436.4 | 713.3 | 733.5 | `--npu-cpu` | **1.7x** |
+| `tiny-f16` | 64 | 426.7 | 1206.3 | 1450.7 | `--npu-cpu` | **3.4x** |
+| `tiny-f16` | 256 | 413.4 | 1603.4 | 1490.7 | `--npu` | **3.9x** |
+| `tiny-q4_0` | 16 | 697.2 | 666.9 | 710.0 | `--npu-cpu` | **1.1x** |
+| `tiny-q4_0` | 64 | 744.8 | 1011.2 | 1221.1 | `--npu-cpu` | **1.6x** |
+| `tiny-q4_0` | 256 | 700.8 | 1530.1 | 1663.5 | `--npu-cpu` | **2.4x** |
+| `tiny-q8_0` | 16 | 1203.6 | 622.1 | 1187.2 | `--cpu` | **1.9x** |
+| `tiny-q8_0` | 64 | 1216.4 | 1461.0 | 1364.4 | `--npu` | **1.2x** |
+| `tiny-q8_0` | 256 | 1199.5 | 1548.4 | 1103.8 | `--npu` | **1.4x** |
 
 One row goes the other way: `tiny-q8_0` at 16 prompt words is the only cell in
-the whole matrix where `--cpu` beats both NPU arms (802.4 vs 699.6 tok/s). A
-1.6 MiB model that fits in cache, and a decode step small enough that the
-device's fixed per-command overhead is a large fraction of it, is exactly the
-case the NPU path should lose; section 11 says what that means for the win's
-boundary.
+the whole matrix where `--cpu` beats both NPU arms (1203.6 against 1187.2 and
+622.1 tok/s). A 1.9 MiB model that fits in cache, and a decode step small
+enough that the device's fixed per-command cost is a large fraction of it, is
+exactly the case the NPU path should lose; section 11 says what that means for
+the win's boundary. The narrow cells at 1.1x-1.4x are the same effect at a
+smaller amplitude.
+
+The `--npu` column is worth reading separately from `--npu-cpu`: they are the
+*same* device doing the same GEMMs, differing only in how much of the rest of
+the op mix is offloaded and how often the queue is submitted. On decode `--npu`
+wins several rows and `--npu-cpu` wins others, which is the mode trade-off
+measured in section 7 rather than a stable ordering.
 
 ## 4. The correctness witness
 
@@ -136,16 +146,17 @@ the same traffic:
 
 | fixture | file size | staged for the device | decode tok/s |
 | --- | ---: | ---: | ---: |
-| `small-f16` | 26.1 MiB | 50.2 MiB | 229.9 |
-| `small-q8_0` | 13.9 MiB | 50.2 MiB | 183.3 |
-| `small-q4_0` | 7.4 MiB | 50.2 MiB | 196.3 |
-| `medium-f16` | 126.7 MiB | 247.4 MiB | 52.7 |
-| `medium-q8_0` | 67.3 MiB | 247.4 MiB | 47.9 |
-| `medium-q4_0` | 35.7 MiB | 247.4 MiB | 51.2 |
+| `small-f16` | 26.1 MiB | 50.2 MiB | 290.7 |
+| `small-q8_0` | 13.9 MiB | 50.2 MiB | 310.4 |
+| `small-q4_0` | 7.4 MiB | 50.2 MiB | 314.7 |
+| `medium-f16` | 126.7 MiB | 247.4 MiB | 48.8 |
+| `medium-q8_0` | 67.3 MiB | 247.4 MiB | 55.3 |
+| `medium-q4_0` | 35.7 MiB | 247.4 MiB | 45.2 |
 
 Decode speed does not track file size — it tracks *staged* size, and it tracks
-it linearly: 50.2 MiB in ~4.4 ms and 247.4 MiB in ~19 ms are both ~11–13 GB/s
-of streamed weights. A decode step must read every weight in the model, and
+it linearly: staged bytes divided by decode time land inside 10.9-15.4 GiB/s
+for every row, and the device trace's own achieved rate over the same runs is 12.7
+to 13.0 GB/s. A decode step must read every weight in the model, and
 nothing in the engine can cheat that.
 
 This is also why the win exists at all. The reference CPU path reads those same
@@ -158,13 +169,16 @@ better matmul than the reference loop. Three standalone probes, all in
 
 | probe | measurement |
 | --- | --- |
-| stream 247 MiB with a plain sum | 3.0 GB/s (this box's raw read rate) |
-| `vnpu_matmul_f32`, M=1, K=512, N=1376, warm | 0.098 ms → 28.6 GB/s of weights, 14.3 GFLOP/s |
-| `vnpu_matmul_i8`, same shape | 0.057 ms → **1.73x faster**, 3.3e-04 relative error |
+| stream 247 MiB with a plain sum | 4.5 GB/s (this box's raw read rate) |
+| `vnpu_matmul_f32`, M=1, K=512, N=1376, warm | 0.100 ms → 28.2 GB/s of weights, 14.1 GFLOP/s |
+| `vnpu_matmul_i8`, same shape | 0.065 ms → **1.54x faster**, 3.32e-04 relative error |
+| `vnpu_matmul_f32`, M=1, K=512, N=1000 (the head shape) | 0.082 ms → 25.0 GB/s |
 
-A dedicated kernel reaching 28.6 GB/s against a 3.0 GB/s raw stream is the
-whole story: the device path is not magic, it is a better memory access
-pattern plus a better register-blocked dot product.
+A dedicated kernel reaching 28.2 GB/s against a 4.5 GB/s raw stream is most of
+the story: the device path is not magic, it is a better memory access pattern
+plus a better register-blocked dot product. The sum probe is a single-threaded
+stream over a buffer 50x larger than cache, so it is the floor rather than the
+device's ceiling.
 
 ## 6. Sherlock trace: where the time actually goes
 
@@ -183,21 +197,21 @@ Device timeline, `small-f16`, 65-token prompt then 32 greedy tokens:
 
 | arm | commands | device service | span | duty |
 | --- | ---: | ---: | ---: | ---: |
-| `--npu` | 928 | 192.2 ms | 272.6 ms | 70.5% |
-| `--npu-cpu` | 1600 | 189.5 ms | 250.2 ms | 75.7% |
+| `--npu` | 928 | 130.3 ms | 217.8 ms | 59.8% |
+| `--npu-cpu` | 1600 | 140.8 ms | 209.3 ms | 67.3% |
 
 Per-op service time, `--npu-cpu`:
 
 | op | count | total | % of device time | mean µs | p50 µs | p95 µs | max µs | moved | GB/s | GFLOP/s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `MATMUL_F32` | 928 | 183.3 ms | 96.8% | 197.6 | 131.1 | 291.6 | 2858.2 | 1699.7 MiB | 9.3 | 13.4 |
-| `ADD_F32` | 256 | 2.3 ms | 1.2% | 9.1 | 6.4 | 14.5 | 91.8 | 4.7 MiB | 2.0 | 0.5 |
-| `RMSNORM_F32` | 288 | 2.3 ms | 1.2% | 8.0 | 6.0 | 9.4 | 164.5 | 3.9 MiB | 1.7 | 0.9 |
-| `SWIGLU_F32` | 128 | 1.5 ms | 0.8% | 11.6 | 7.1 | 9.5 | 196.3 | 6.3 MiB | 4.3 | 2.8 |
+| `MATMUL_F32` | 928 | 133.7 ms | 95.0% | 144.1 | 101.0 | 225.3 | 3195.1 | 1621.0 MiB | 12.7 | 18.4 |
+| `RMSNORM_F32` | 288 | 2.8 ms | 2.0% | 9.8 | 7.2 | 10.3 | 163.2 | 3.7 MiB | 1.4 | 0.7 |
+| `ADD_F32` | 256 | 2.6 ms | 1.9% | 10.3 | 7.4 | 18.7 | 123.1 | 4.5 MiB | 1.8 | 0.4 |
+| `SWIGLU_F32` | 128 | 1.6 ms | 1.2% | 12.7 | 8.5 | 13.4 | 149.3 | 6.0 MiB | 3.9 | 2.6 |
 
 Three things to read out of that, and one thing *not* to read:
 
-* The device is inside a kernel **70–76% of the wall clock**. That is the
+* The device is inside a kernel **60–67% of the wall clock**. That is the
   real ceiling on this path, and it is why the speedups are what they are.
 * The remaining 24–30% is the host: RoPE, attention over the KV cache, the KV
   cache itself, token embedding, MoE routing, and sampling all run on the CPU
@@ -210,35 +224,54 @@ The thing not to read: `tools/trace_stats.py` deliberately prints **no**
 worker-occupancy figure. VNPU's `tid` field is `hash(std::thread::id) % 8`, not
 a worker index, so counting tids would be inventing a number.
 
-## 7. An open anomaly: the output head
+## 7. An anomaly that turned out to be the profiler lying
 
-This is a real inefficiency found by the trace, reported rather than papered
-over. `--profile` component table, 32 greedy tokens:
+An earlier revision of this document reported the output projection as costing
+**1.10 ms per token on the NPU path against 0.003 ms on CPU** — 16% of decode on
+one arm and invisible on the other — and called it the biggest remaining win.
+That conclusion was wrong, and the way it was wrong is worth keeping.
 
-| component | phase | `--npu-cpu` host ms | `--cpu` host ms |
-| --- | --- | ---: | ---: |
-| decode (layers) | decode | 182.6 | 492.7 |
-| prefill | prefill | 67.2 | 474.4 |
-| **head+sample** | decode | **35.1** | **0.1** |
-| load | load | 16.0 | 15.7 |
+The row came from `--profile`:
 
-The output projection costs **1.10 ms per token on the NPU path and about
-0.003 ms per token on the CPU path** — it is 16.1% of decode on one arm and
-invisible on the other. The device itself is not the problem: measured
-standalone at exactly that shape (M=1, K=512, N=1000 vocab), `vnpu_matmul_f32`
-takes **0.084 ms** batched and **0.178 ms** with a sync after each call. So
-between 0.9 and 1.0 ms per token is being spent outside the arithmetic.
+| span | `--npu` (flush per call) | `--npu-cpu` (batched) |
+| --- | ---: | ---: |
+| `decode.logits.dev`, per call | 0.001 ms | **0.979 ms** |
+| `decode.drain`, per call | 0.000 ms | **0.978 ms** |
 
-What is ruled out: the weight staging cache is keyed on the weight pointer and
-hits (the head is dequantised once, not per token); the head GEMM *is* on the
-device (928 commands per 32 tokens = 29 per token = 28 layer GEMMs + 1 head);
-and the device top-k fast path is not taken because the virtual NPU reports
-`has_device_memory() == false`, so every token downloads the full logits row —
-which is 4 kB and cannot be the cost.
+Same GEMM, same weights, same device: the only difference between the arms is
+*when the queue is submitted*. `--npu-cpu` is whole-graph mode — its banner says
+`whole graph`, and it reports 160 batches for 1600 commands — so a layer's ops
+are issued and submitted at the first host op, not at the call that issued them.
+`decode.forward` returns once the work is **issued**; the wait for it lands on
+whichever host call flushes next, and that was `fetch_logits`. The head row was
+reporting the forward pass's unpaid bill.
 
-What is left is the call plumbing around the head GEMM. This is the single
-largest identified win left on the CPU+NPU path (~13–14% of a decode run) and
-it is stated as an open anomaly with a reproduction, not as a fixed bug.
+Two independent measurements say the head is not slow:
+
+* a standalone probe at exactly that shape (M=1, K=512, N=1000) takes
+  **0.082 ms**, and the device trace's matmul p50 is **101 µs**, so the head is an
+  ordinary GEMM and not a pathological one;
+* the arm that flushes per call reports **0.001 ms/call** for the identical
+  span, and the two arms' total decode rates are within 5% (317.4 vs 333.3
+  tok/s).
+
+So there is no missing millisecond and no win to collect here. What there was,
+was a profile that attributed one phase's work to another — and a plausible
+story ("the head costs 13% of decode") that survived exactly as long as nobody
+cross-checked it against the device's own timeline.
+
+The fix is instrumentation, not the hot path: `fetch_logits` now times its drain
+as `decode.drain` (via `KRK_TIME_HOST_N`, a distinct handle because the plain
+macro shadows the enclosing scope's) so the split is visible in the table:
+
+| span | `--npu-cpu`, per call |
+| --- | ---: |
+| `decode.logits.dev` | 0.979 ms |
+| of which `decode.drain` | 0.978 ms |
+
+The head is what is left over, ~0.001 ms, which matches the probe and the
+0.082 ms the device needs to execute it. Nothing got
+faster; a future search now starts in the right place.
 
 ## 8. Negative results: three optimisations that did not survive measurement
 
@@ -254,11 +287,29 @@ synchronous contract** — a caller may read the output buffer directly, and
 `tests/test_kraken.cpp` does, so the suite failed correctly. Reverted, and the
 reason is now recorded in `Offload::push` so it is not "optimised" away again.
 
-**`KRK_NPU_THREADS=2`.** A knob sweep showed +17–18% decode over the default
-and looked like a free win. Re-run with best-of-6 the ranking **reversed**:
-unset 194.3 tok/s, `=2` 181.7, `=3` 187.7, `=1` 203.5 decode but 540.6
-prefill. The device default (hardware concurrency) stays. A 17% "win" inside a
-±20% noise band is not a win.
+**`KRK_NPU_THREADS=2`.** A knob sweep showed +17-18% decode over the default
+and looked like a free win. A best-of-6 replication **reversed** the ranking,
+and a later round put `=2` and the default within 2% of each other. The device
+default (hardware concurrency) stays: a 17% "win" inside a ±20% noise band is
+not a win.
+
+What the knob *does* have is one real effect, measured best-of-5 on this box
+(prefill / decode tok/s):
+
+| `KRK_NPU_THREADS` | prefill | decode |
+| --- | ---: | ---: |
+| unset (device default) | 724.0 | 310.1 |
+| `2` | 752.0 | 315.8 |
+| `3` | 729.7 | 316.5 |
+| `1` | **588.1** | **361.2** |
+
+`=1` buys ~16% decode and costs ~19% prefill, and the mechanism is not a
+mystery: decode is bandwidth-bound and does not need a second worker, so the
+second thread only competes with the host's rope/attention/sampling on a
+2-thread box. Prefill is compute-bound and does need it. That makes `=1` a
+workload choice for a decode-only setting, never a default -- and the two
+cannot be switched mid-run, because the thread count is fixed when the device
+is created.
 
 **`KRK_NPU_UNIT`.** Measured at M = 1, 8, 64, 256: `wildcat` is **bit-identical
 to `voodoo`** at every size and never faster; `cell` is 3x slower *and*
@@ -266,7 +317,7 @@ produces different bits, so selecting it would also break chunk invariance.
 Default `voodoo` stays. (An earlier end-to-end sweep had `cell` at −51%
 prefill / −54% decode, consistent with the probe.)
 
-**int8 weights: measured, not enabled.** `vnpu_matmul_i8` is 1.73x faster than
+**int8 weights: measured, not enabled.** `vnpu_matmul_i8` is 1.54x faster than
 f32 at the decode shape and would cut staged bytes 4x, which is the only real
 lever left on a bandwidth-bound path. It is not enabled because there is no
 int8-weights-by-f32-activations op: the activations must be quantised too
@@ -317,9 +368,9 @@ duration-based number. That is why the trace tables above are trustworthy.
 
 ```
 # fixtures (deterministic; --batch must be a multiple of 32)
-tools/make_bench_gguf.py --out /tmp/fix/tiny-f16.gguf  --embd 256  --layers 2 --heads 4 --vocab 512  --format f16
-tools/make_bench_gguf.py --out /tmp/fix/small-f16.gguf --embd 512  --layers 4 --heads 8 --vocab 1000 --format f16
-tools/make_bench_gguf.py --out /tmp/fix/medium-f16.gguf --embd 1024 --layers 6 --heads 8 --vocab 1500 --format f16
+tools/make_bench_gguf.py --embd 256  --layers 2 --heads 4 --vocab 512  --format f16  /tmp/fix/tiny-f16.gguf
+tools/make_bench_gguf.py --embd 512  --layers 4 --heads 8 --vocab 1000 --format f16  /tmp/fix/small-f16.gguf
+tools/make_bench_gguf.py --embd 1024 --layers 6 --heads 8 --vocab 1500 --format f16  /tmp/fix/medium-f16.gguf
 
 # the matrix in sections 2 and 3
 tools/npu_bench.py \
@@ -341,9 +392,9 @@ is compiled against a newer glibc and will not link here.
 ## 11. What this does and does not prove
 
 It proves the CPU+NPU path is a genuine, large, correct win on this machine:
-2.7–15.5x on prefill and 1.6–4.1x on decode (one cell excepted, where the CPU
-wins by 1.2x), identical greedy text on 72/72 cells, with the device inside a
-kernel 70–76% of the wall clock and the rest attributable to transformer ops
+1.8–18.4x on prefill and 1.1–5.1x on decode (one cell excepted, where the CPU
+wins by 1.9x), identical greedy text on 72/72 cells, with the device inside a
+kernel 60–67% of the wall clock and the rest attributable to transformer ops
 the virtual NPU does not implement.
 
 That single losing cell is worth being precise about, because it marks the
