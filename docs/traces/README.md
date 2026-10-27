@@ -135,3 +135,37 @@ answer, slow" rather than a speed comparison.
 
 Per-model speed and coherence for the 26-model sweep is in
 `results.tsv` and rendered in `docs/MODEL-STATUS.md`.
+
+## CPU vs virtual NPU (2026-10-27)
+
+Different machine from the archive above: 2 hardware threads, no GPU, no
+`hipcc`, AVX-512F + VNNI. These captures are the device and host timelines
+behind `docs/CPU-VS-NPU-BENCHMARK.md`, from `small-f16.gguf` (512 embeddings,
+4 layers, 8 heads, vocab 1000), a 65-token prompt and 32 greedy tokens.
+
+| file | producer | what it is |
+| --- | --- | --- |
+| `small-f16-npu.device.json` | `KRK_NPU_TRACE` | every command the virtual NPU executed under `--npu` |
+| `small-f16-npu-cpu.device.json` | `KRK_NPU_TRACE` | the same under `--npu-cpu` |
+| `small-f16-npu.host.json` | `--trace` | the engine's host timeline under `--npu` |
+| `small-f16-npu-cpu.host.json` | `--trace` | the engine's host timeline under `--npu-cpu` |
+
+Commands, with `P` the 65-token prompt:
+
+```
+KRK_NPU_TRACE=small-f16-npu.device.json \
+  kraken -m small-f16.gguf --npu     -p "$P" -n 32 --greedy --ctx 512 --trace small-f16-npu.host.json
+KRK_NPU_TRACE=small-f16-npu-cpu.device.json \
+  kraken -m small-f16.gguf --npu-cpu -p "$P" -n 32 --greedy --ctx 512 --trace small-f16-npu-cpu.host.json
+```
+
+Open any of them at <https://ui.perfetto.dev> or in `chrome://tracing`, or
+summarise them with `tools/trace_stats.py`, which auto-detects the producer and
+reports what that producer can support -- service time always, gaps and duty
+cycle only when the timestamps are fine-grained enough to carry them.
+
+The device captures require `patches/npuxl-0001-trace-timestamp-precision.patch`
+applied to npuxl. Without it, start timestamps collapse onto a 10 ms grid and
+the timeline cannot answer gap questions at all, while durations still look
+exact; `tools/trace_stats.py` detects that case and withholds the derived
+numbers rather than printing artifacts of the grid.

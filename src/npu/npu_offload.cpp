@@ -155,6 +155,21 @@ const f32 *Offload::weight(const void *w, DType wt, i64 n_out, i64 n_in) {
 
 bool Offload::push(const vnpu_command_t &cmd) {
     queue.push_back(cmd);
+    // Gemm mode submits and waits on every call; Graph mode queues and is
+    // drained by npu_flush_() at the next host op.
+    //
+    // That asymmetry looks like a missed optimisation and is not one. Backend::
+    // gemm is a SYNCHRONOUS virtual: `out` must hold the result when it
+    // returns, because a caller is entitled to read that host buffer directly
+    // instead of going through sync() or download_f32(). tests/test_kraken.cpp
+    // does exactly that, and it fails -- correctly -- if this flush is removed.
+    // Graph mode buys its batching a level up, where the whole layer is one
+    // event and the host op that follows it flushes once.
+    //
+    // Measured before deciding: batching this instead moved end-to-end decode
+    // by a median +1.3% (within this box's +-20% noise) except on 2-layer toy
+    // models, where the round trip is a large share of a tiny step. Not worth
+    // an interface contract.
     if (mode == Mode::Gemm || strict_queue) return flush(this);
     return true;
 }
