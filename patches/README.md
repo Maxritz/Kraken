@@ -66,6 +66,56 @@ cd <npuxl tree> && git am npuxl-0002-zen3-avx2-int8.patch && make -j
 VNPU_FORCE_ISA=avx2 ./bin/vnpu-selftest
 ```
 
+## `npuxl-0003-force-isa-vnni-and-scale-order.patch`
+
+Two defects that were invisible until VNNI was actually reachable. Applies on
+top of 0002.
+
+**`VNPU_FORCE_ISA=avx512` cleared the VNNI feature bit**, silently routing the
+int8 GEMM to the AVX2 kernel. Forcing the baseline ISA must not subtract a
+feature the host has, and this flag is documented as the way to make
+deterministic cross-machine comparisons -- so every such comparison was
+measuring AVX2 and calling it AVX-512. Measured single-threaded at
+128x768x768: **20,304 MAC/s forced-avx512 against 82,395 with VNNI**, 4.1x,
+with nothing in the output saying which kernel ran. `avx512-novnni` is now the
+arm that wants the non-VNNI kernel, asked for by name.
+
+This one is worth reading twice, because it caused two wrong conclusions in
+this repository's own documentation before it was found, including a claim in
+`ZEN3-AVX2.md` (inside 0002) that the 256-bit kernel beat the AVX-512 one. It
+never did; both arms were the same kernel. That file now carries the
+correction.
+
+**The VNNI kernel multiplied its scales in the opposite order** from
+`store_i8_c()`: `(dot * scale_b) * scale_a` where the oracle does
+`(dot * scale_a) * scale_b`. Float multiplication is commutative but not
+associative, so it differed in the last bit and was the only arm disagreeing
+with the scalar reference. `vnpu-isa-parity` caught it the moment VNNI became
+reachable, which is the case that test was built for.
+
+Also: forcing an ISA the host cannot execute is now **refused by name** instead
+of executing an illegal instruction. An AVX2-only host (Zen 3, pre-Skylake)
+asked for `avx512` used to fault inside the first kernel.
+
+```
+src/core/runtime.cpp      the force-flag fix, the refusal, avx512-novnni
+src/kernels/kernels.cpp   one line: the scale multiplication order
+tests/bench_kernel.cpp    new  microkernel throughput, one tile, one worker
+tests/bench_i8.cpp        one more shape (256 rows) to expose fixed overhead
+CMakeLists.txt            builds bench-kernel against the static archive
+```
+
+`bench-kernel` exists because the public benchmark could not answer the
+question that mattered. It calls `kernel_gemm_i8_range` directly, so tile
+construction, pool dispatch and the barrier are excluded; that separation is
+what turned "the VNNI epilogue looks slow" into "VNNI is 4x faster and you
+were never running it".
+
+Verified from a cold clone with both patches applied in sequence: `git am`
+clean, `vnpu-selftest` 16/16 on unforced/scalar/avx2/avx512/avx512-novnni,
+`vnpu-fuzz 60` clean, and `vnpu-isa-parity` reports **identical int8 GEMM
+digests on all four arms** for every shape, including the K%4 and N%16 edges.
+
 ## `npuxl-improved-patched.zip`
 
 The complete npuxl tree from `Maxnpuxl.zip.zip` with patch 0001 already applied,

@@ -243,6 +243,33 @@ Without `KRK_NPU_W8A8=1` the improvement is **not** distinguishable from noise
 (run-to-run spread is 6-8% on this box, and the difference is inside it), which
 is the expected result: that arm's device work is `MATMUL_F32`.
 
+#### What the engine's own benchmark flag was hiding
+
+The AVX-512 path is faster than the AVX2 one by a wide margin, and until
+recently it was not possible to see that through the engine's test flag.
+`VNPU_FORCE_ISA=avx512` cleared the VNNI feature bit, so forcing "avx512" fell
+straight through to the AVX2 int8 kernel: **20,304 MAC/s against 82,395**, 4.1x,
+silently. Since that flag is the documented way to make cross-machine
+comparisons, it meant anyone comparing arms was measuring AVX2 twice.
+
+That is recorded here because it produced a wrong claim in this document's own
+history: an earlier revision said the 256-bit kernel "outruns the AVX-512 VNNI
+path". It does not. Single-threaded and kernel-only, VNNI is the faster path by
+about 4x at 128x768x768; it always was. The comparison was an artefact of the
+flag, not a property of the kernels.
+
+Both are fixed in `patches/npuxl-0003`: `avx512` now keeps VNNI (with
+`avx512-novnni` as the explicit opt-out), forcing an ISA the host cannot run is
+refused by name instead of faulting, and the VNNI kernel's scale multiplication
+was reordered to match the scalar oracle, which made it bit-identical on every
+shape for the first time.
+
+A second lesson worth keeping: the public benchmark could not answer "is the
+kernel slow or is everything around it slow". `tests/bench_kernel.cpp` calls the
+microkernel directly, one tile, one worker -- that separation is what turned a
+plausible theory about the epilogue into a measurement, and the measurement
+said the theory was wrong.
+
 Verification is exact rather than tolerance-based. `tests/isa_parity.cpp` in the
 engine hashes the raw output bytes per op, so the three ISA arms can be
 compared directly: the int8 GEMM and the quantiser are **bit-identical** across
