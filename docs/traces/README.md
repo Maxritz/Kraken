@@ -164,6 +164,25 @@ summarise them with `tools/trace_stats.py`, which auto-detects the producer and
 reports what that producer can support -- service time always, gaps and duty
 cycle only when the timestamps are fine-grained enough to carry them.
 
+### The int8 arms (`small-f16-long-*`)
+
+Section 10 of `docs/CPU-VS-NPU-BENCHMARK.md` compares the f32 and int8 GEMM
+paths on one fixture, so these four are captured as a pair at identical settings
+-- a 257-token prompt, ctx 1024, 32 greedy tokens, which is long enough that the
+one-time int8 packing cost has been amortised:
+
+```
+for arm in f32 w8a8; do
+  [ $arm = w8a8 ] && E=KRK_NPU_W8A8=1 || E=
+  env $E KRK_NPU_TRACE=small-f16-long-$arm.device.json \
+    kraken -m small-f16.gguf --npu-cpu -p "$P" -n 32 --greedy --ctx 1024 \
+      --trace small-f16-long-$arm.host.json
+done
+```
+
+The w8a8 device trace carries two op kinds the f32 one does not: `MATMUL_I8`
+and the per-row `QUANTIZE_I8` that feeds it, one per GEMM.
+
 The device captures require `patches/npuxl-0001-trace-timestamp-precision.patch`
 applied to npuxl. Without it, start timestamps collapse onto a 10 ms grid and
 the timeline cannot answer gap questions at all, while durations still look

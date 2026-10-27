@@ -3,7 +3,7 @@
 This is the answer to "when you compared direct CPU coding and through NPU,
 what was better, and do we have a comprehensive benchmark we can see". Every
 number below was produced on this machine by the two committed tools in
-`tools/`, and every one of them can be reproduced by section 10.
+`tools/`, and every one of them can be reproduced by section 11.
 
 The short version: **on this box the virtual-NPU path beats plain CPU by 1.8x
 to 18.4x on prefill and 1.1x to 5.1x on decode, with byte-identical greedy
@@ -364,7 +364,190 @@ quantised start times and **withholds** gaps, idle time, duty cycle and overlap
 rather than computing them from a grid, while still reporting every
 duration-based number. That is why the trace tables above are trustworthy.
 
-## 10. Reproducing all of it
+## 10. An opt-in: int8 weights (`KRK_NPU_W8A8`)
+
+Everything above is the f32 path, and it leaves one lever untouched: section 5
+shows decode is bound by weight traffic, not arithmetic, and the cheapest way to
+move fewer bytes is to make the weights smaller. VNPU has an int8 GEMM for
+exactly that. It is **off by default and it is lossy**, so it is opt-in:
+
+```sh
+KRK_NPU_W8A8=1 kraken -m model.gguf --npu-cpu -p "..." -n 32
+```
+
+### 10.1 What it does
+
+Each weight is dequantized once, put through a per-output-row symmetric int8
+quantiser (scale = row peak / 127, so no row spends its range on another row's
+outlier), and handed to `vnpu_pack_weights_i8`. Activations are quantized on the
+device, per row, immediately before the multiply. Both commands go out as one
+`push_batch` of two, because the arm this path speeds up is the one that waits
+on every call, and two commands submitted separately would pay two waits.
+
+The composition is the device's own: `C[m,n] = dot8(A8[m,:], B8[n,:]) *
+scale_a[m] * scale_b[n]`, with both scales applied inside the epilogue. No
+scale arithmetic is left on the host.
+
+There is no "int8 weights with f32 activations" opcode, so this is W8A8 and the
+accuracy cost is the activation quantisation as much as the weights. That is the
+whole reason it is not the default.
+
+### 10.2 What it costs, once
+
+Packing is not free and it lands on the first prefill chunk. Measured as the
+difference in `--profile`'s `prefill.chunk` between the two arms on a 33-token
+prompt:
+
+| weights | one-time cost | per MiB |
+| --- | ---: | ---: |
+| 12.6 MiB (`small-f16`) | 31.7 ms | 2.5 ms |
+| 61.8 MiB (`medium-f16`) | 213.2 ms | 3.5 ms |
+
+The first cut of the quantiser was **8.5x slower than it needed to be**: it
+rounded with `std::lround` on a double, which cost 20.3 ms where the same
+rounding in float costs 2.4 ms on a 1376x512 tensor. That turned a ~30 ms setup
+into ~125 ms and read as a **40% prefill regression** until it was profiled --
+the regression was this loop, not int8. It is now float, with the same
+half-away-from-zero rule and the same result for every value in range.
+
+Because the cost is fixed and the per-token saving is not, it amortises against
+prompt length. `small-f16`, prefill only, median of 3, arms interleaved:
+
+| prompt | f32 prefill | w8a8 prefill | ratio |
+| --- | ---: | ---: | ---: |
+| 33 tokens | 463 tok/s | 331 tok/s | **0.72x** |
+| 257 tokens | 1236 tok/s | 1366 tok/s | **1.11x** |
+| 513 tokens | 1237 tok/s | 1474 tok/s | **1.19x** |
+
+A short prompt loses and a long one wins; the crossover is the pack cost
+divided by the per-token saving, which lands somewhere under 250 tokens on this
+fixture. That figure is not extrapolated to other models from these three
+points, because the last two are within 3% of each other and this box drifts by
+more than that. The point is the shape: a one-time cost against a per-token
+benefit, stated at both ends rather than only at the flattering one.
+
+### 10.3 What it wins
+
+All nine fixtures, 32 greedy tokens, median of 3 runs **with the arms
+interleaved** inside each repetition. Interleaving matters: a blocked harness
+(run all f32, then all w8a8) reported `tiny-f16` decode at 0.56x on this box,
+and the interleaved measurement of the same thing is 1.42x. Throughput drifts
+several percent a minute here, so a blocked A/B compares two different machines.
+
+Prompt 257 tokens, ctx 1024:
+
+| fixture | prefill | decode | staged -> packed |
+| --- | ---: | ---: | --- |
+| `tiny-f16` | 1.12x | 1.38x | 6.4 -> 1.6 MiB |
+| `tiny-q8_0` | 1.06x | 1.27x | 6.4 -> 1.6 MiB |
+| `tiny-q4_0` | 1.03x | 1.52x | 6.4 -> 1.6 MiB |
+| `small-f16` | 1.14x | 1.39x | 50.2 -> 12.6 MiB |
+| `small-q8_0` | 1.18x | 1.58x | 50.2 -> 12.6 MiB |
+| `small-q4_0` | 1.11x | 1.53x | 50.2 -> 12.6 MiB |
+| `medium-f16` | 1.13x | 3.32x | 247.4 -> 61.8 MiB |
+| `medium-q8_0` | 1.15x | 3.34x | 247.4 -> 61.8 MiB |
+| `medium-q4_0` | 1.13x | 3.61x | 247.4 -> 61.8 MiB |
+
+Prompt 33 tokens, ctx 512 -- the same runs, at the length where the setup cost
+has not been earned back:
+
+| fixture | prefill | decode |
+| --- | ---: | ---: |
+| `tiny-f16` | 0.64x | 0.95x |
+| `tiny-q8_0` | 0.72x | 1.06x |
+| `tiny-q4_0` | 0.56x | 0.79x |
+| `small-f16` | 0.61x | 1.17x |
+| `small-q8_0` | 0.64x | 1.16x |
+| `small-q4_0` | 0.60x | 1.04x |
+| `medium-f16` | 0.65x | 2.76x |
+| `medium-q8_0` | 0.51x | 2.44x |
+| `medium-q4_0` | 0.55x | 2.42x |
+
+The decode gain scales with the weights, which is the same conclusion section 5
+reached by a different route: the bigger the tensor, the more of decode is
+traffic and the more a 4x traffic cut is worth. Decode 3.3-3.6x on the 1024-dim
+fixture, 1.3-1.6x on the 512-dim one, and at 256 dimensions the weights already
+fit in cache, so there is little traffic left to cut and most of the win is gone.
+
+### 10.4 Where the time goes now
+
+Device traces, both arms, same fixture and prompt
+(`docs/traces/small-f16-long-{f32,w8a8}.{device,host}.json`):
+
+| | f32 arm | w8a8 arm |
+| --- | --- | --- |
+| GEMM | 928 `MATMUL_F32`, 188.0 ms | 928 `MATMUL_I8`, 76.1 ms |
+| GEMM rate | 1649.6 MiB, 9.2 GB/s, 38.9 GFLOP/s | 432.7 MiB, 6.0 GB/s, 96.2 GFLOP/s |
+| quantise | -- | 928 `QUANTIZE_I8`, 24.1 ms, 24.5 MiB |
+| device busy | 195.0 ms (68.6% of span) | 106.9 ms (46.0% of span) |
+| device span | 284.3 ms | 232.5 ms |
+| host wall | 303.1 ms | 249.0 ms |
+| host waiting (`decode.drain`) | 39.5 ms | 10.0 ms |
+
+`MATMUL_I8` is 2.47x the f32 kernel on identical GEMM counts, at 3.81x less
+traffic, which is the mechanism working as designed. Two things follow, and both
+are left alone deliberately rather than papered over:
+
+- `QUANTIZE_I8` is now 22.5% of device busy at 1.1 GB/s. It is re-quantising the
+  same activation block once per GEMM that consumes it (q, k and v all read the
+  same row block). Caching it is the obvious next move, but it is only safe if
+  the key covers every host write to that buffer, and get that wrong and the
+  device multiplies stale activations -- silently, because the output still
+  looks like a matrix. It is not in this change.
+- Device busy falls to 46.0%, so the device is now idle most of the span and the
+  limit has moved to the host. That is a different problem, and section 8 is
+  what happens when it is attacked without measuring.
+
+### 10.5 Does the answer survive?
+
+A lossy path has to be judged on how far it moves the output, not on whether it
+moved it. Two witnesses, neither of which is the engine reporting on itself.
+
+**An independent reference.** `tools/ref_llama.py` is a float32 numpy forward
+written from the fixture's GGUF metadata, not from kraken's source. It is
+validated against the engine's own `--prefill-hash first=` on 15 prompt/model
+pairs (f16) and 6 (q8_0, q4_0) -- 21/21 argmax agreement. Getting it to agree
+took finding that these fixtures rotate with the **interleaved** pairing, not
+NeoX half-split; with the wrong pairing it disagreed on two of three models.
+
+**The quantiser, propagated.** `tools/int8_witness.py` puts the fixtures'
+weights through the exact quantiser the NPU path uses (per row, symmetric
+127-level, round-half-away-from-zero) and runs the reference twice:
+
+| fixture | max abs dlogit | mean abs dlogit | median top1-top2 margin | min margin | positions where margin < error | argmax flips (of 33) | 32-token match |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `tiny-f16` | 0.0558 | 0.0118 | 0.1660 | 0.0040 | 8 | 3 | 20/32 |
+| `tiny-q8_0` | 0.0562 | 0.0107 | 0.1881 | 0.0061 | 7 | 2 | 32/32 |
+| `tiny-q4_0` | 0.0499 | 0.0103 | 0.1146 | 0.0058 | 8 | 1 | 25/32 |
+| `small-f16` | 0.1187 | 0.0237 | 0.1244 | 0.0024 | 16 | 3 | 9/32 |
+| `small-q8_0` | 0.1108 | 0.0224 | 0.1404 | 0.0169 | 15 | 2 | 24/32 |
+| `small-q4_0` | 0.1185 | 0.0210 | 0.1284 | 0.0072 | 14 | 0 | 1/32 |
+| `medium-f16` | 0.3549 | 0.0648 | 0.2866 | 0.0025 | 18 | 2 | 7/32 |
+| `medium-q8_0` | 0.3957 | 0.0634 | 0.3357 | 0.0013 | 17 | 5 | 2/32 |
+| `medium-q4_0` | 0.3871 | 0.0597 | 0.2165 | 0.0210 | 26 | 5 | 32/32 |
+
+Read the last three columns together, because any one of them alone misleads:
+
+- The **per-position** flip rate is low: 1-5 of 33 positions, so the next token
+  is usually the same one.
+- Those flips happen where the margin is smaller than the error, and these
+  fixtures are random weights, so their logits are nearly flat -- the median
+  margin is 0.12-0.34 and the error is the same order. On 7-26 of 33 positions
+  the margin is below the injected error, so a flip there is expected rather
+  than surprising. A trained model's confident positions have much wider
+  margins; **that is a general expectation, not something measured here**, and
+  this table is the only accuracy claim this document makes.
+- The **trajectory** column swings from 32/32 to 1/32 for the same per-position
+  flip rate, because one flipped token changes the prefix and every later token
+  is conditioned on it. End to end at 257 prompt tokens, 6 of 9 fixtures produce
+  byte-identical 32-token greedy text and 3 do not; at 33 prompt tokens, none
+  do. Trajectory agreement is therefore a property of the prompt, not a
+  constant, and it is why this is opt-in.
+
+What it does not change: the f32 path. `--npu-cpu` text is byte-identical to
+`--cpu` on all 9 fixtures in both tables, before and after this change.
+
+## 11. Reproducing all of it
 
 ```
 # fixtures (deterministic; --batch must be a multiple of 32)
@@ -382,14 +565,31 @@ tools/npu_bench.py \
 KRK_NPU_TRACE=/tmp/tr/npu.json kraken -m small-f16.gguf --npu     -p "..." -n 32 --greedy --trace /tmp/tr/npu.krk.json
 KRK_NPU_TRACE=/tmp/tr/cpu.json kraken -m small-f16.gguf --npu-cpu -p "..." -n 32 --greedy --trace /tmp/tr/cpu.krk.json
 tools/trace_stats.py /tmp/tr/npu.json /tmp/tr/cpu.json --label npu --label npu-cpu
+
+# the int8 opt-in (section 10): same fixture, both arms, one-time cost first
+for words in 8 64; do
+  P="$(python3 -c "print(' '.join(['the quick brown fox']*$words))")"
+  kraken -m /tmp/fix/small-f16.gguf --npu-cpu -p "$P" -n 32 --greedy --ctx 1024 --profile
+  KRK_NPU_W8A8=1 kraken -m /tmp/fix/small-f16.gguf --npu-cpu -p "$P" -n 32 --greedy --ctx 1024 --profile
+done
+
+# the accuracy witnesses (section 10.5). --check needs a kraken binary on
+# PATH or in KRAKEN_BIN; both tools read only the GGUF and the engine's
+# --prefill-hash, never kraken's source.
+tools/ref_llama.py /tmp/fix/small-f16.gguf --check
+tools/int8_witness.py /tmp/fix/tiny-*.gguf /tmp/fix/small-*.gguf /tmp/fix/medium-*.gguf
 ```
+
+`int8_witness.py` needs numpy; it runs the reference forward once per fixture in
+float32 numpy, so the medium fixtures take ~25 s each. `ref_llama.py` supports
+F32, F16, Q8_0 and Q4_0 tensors — everything the fixture generator emits.
 
 The build needs the NPU engine: configure with `-DKRK_ENABLE_NPU=ON
 -DKRK_VNPU_ROOT=<npuxl> -DKRK_VNPU_LIB=<npuxl>/build/libvnpu.a`. Link the
 archive **you built** — the prebuilt `lib/libvnpu.a` that ships in npuxl's zip
 is compiled against a newer glibc and will not link here.
 
-## 11. What this does and does not prove
+## 12. What this does and does not prove
 
 It proves the CPU+NPU path is a genuine, large, correct win on this machine:
 1.8–18.4x on prefill and 1.1–5.1x on decode (one cell excepted, where the CPU
@@ -404,6 +604,13 @@ already, and a decode step is small enough that the device's fixed per-command
 cost outweighs its better kernel. The CPU+NPU path pays off when the model is
 big enough that streaming weights dominates — which is every model anyone
 would actually run.
+
+Section 10 adds an opt-in second answer: with `KRK_NPU_W8A8=1` the weights are
+packed to int8 and the decode runs 1.3-3.6x faster again on top of the NPU arm,
+for a 4x cut in weight footprint, at the cost of a one-time 32-213 ms pack and a
+greedy tail that is byte-identical on 6 of 9 fixtures and differs on 3. That
+trade is real, it is measured in both directions, and it is why the switch is
+off unless asked for.
 
 It does not prove anything about a GPU. There is no `hipcc` on this box and no
 GPU to measure, so this document says nothing about the HIP path beyond "it
