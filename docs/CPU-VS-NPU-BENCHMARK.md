@@ -410,17 +410,21 @@ into ~125 ms and read as a **40% prefill regression** until it was profiled --
 the regression was this loop, not int8. It is now float, with the same
 half-away-from-zero rule and the same result for every value in range.
 
-Because the cost is fixed, it amortises against prompt length. On the 4-layer
-fixture, f32 prefill runs at ~1.4k tok/s, so 32 ms buys back ~45 tokens of work:
+Because the cost is fixed and the per-token saving is not, it amortises against
+prompt length. `small-f16`, prefill only, median of 3, arms interleaved:
 
 | prompt | f32 prefill | w8a8 prefill | ratio |
 | --- | ---: | ---: | ---: |
-| 33 tokens | 562 tok/s | 376 tok/s | **0.67x** |
-| 257 tokens | 1376 tok/s | 1510 tok/s | **1.10x** |
-| 513 tokens | 1323 tok/s | 1534 tok/s | **1.16x** |
+| 33 tokens | 463 tok/s | 331 tok/s | **0.72x** |
+| 257 tokens | 1236 tok/s | 1366 tok/s | **1.11x** |
+| 513 tokens | 1237 tok/s | 1474 tok/s | **1.19x** |
 
-A short prompt loses; anything past ~50 tokens wins. That is the honest shape of
-a one-time cost, and it is why the numbers below are taken at both lengths.
+A short prompt loses and a long one wins; the crossover is the pack cost
+divided by the per-token saving, which lands somewhere under 250 tokens on this
+fixture. That figure is not extrapolated to other models from these three
+points, because the last two are within 3% of each other and this box drifts by
+more than that. The point is the shape: a one-time cost against a per-token
+benefit, stated at both ends rather than only at the flattering one.
 
 ### 10.3 What it wins
 
