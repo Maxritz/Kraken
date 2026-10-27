@@ -8,15 +8,15 @@ the kernels.** In a 58-token prefill the device is busy for 864 ms of a 2464 ms
 wall. The GEMMs are already the fastest thing in the run; the other 1600 ms is
 the host, and no amount of tiling inside the kernel touches it. The arithmetic
 ceiling for this exact build, with the host cost driven to *zero* and the current
-f32 kernels kept, is 5.3x. Getting to 8x needs the int8 kernels and a packed-
+f32 kernels kept, is 4.7x. Getting to 8x needs the int8 kernels and a packed-
 weight cache as well, and even then the host has to come down by about 9x.
 
 Two real defects were found and fixed on the way:
 
 | # | Defect | Effect | Fix | Measured |
 |---|--------|--------|-----|----------|
-| 1 | Staging budget was a flat 1024 MiB and silently declined 393 of 1087 GEMMs to the host | 83% device idle | default budget derived from available RAM, env override kept | 3440 -> 2793 ms (1.23x) |
-| 2 | `KRK_NPU_W8A8` packed every weight on first use, including in a prefill that never reuses it | +1.0-1.4 s of pure loss | pack only for multi-row-tile GEMMs (decode), not prefill | 3522 -> 2793 ms (1.26x) |
+| 1 | Staging budget was a flat 1024 MiB and silently declined 393 of 1087 GEMMs to the host | 83% device idle | default budget derived from available RAM, env override kept | 3042 -> 2357 ms (1.29x) |
+| 2 | `KRK_NPU_W8A8` packed every weight on first use, including in a prefill that never reuses it | +1.0 s of pure loss | pack only when a weight is reused (decode), not on prefill | 3395 -> 2381 ms (1.43x) |
 
 Both are visible in the run summary, not inferred.
 
@@ -41,20 +41,34 @@ The CPU arm is the real competitor, not a straw man: same box, same SIMD, built
 
 ## 2. Baseline
 
-Prefill, 58 tokens (`--npu-cpu` = host execution with the NPU offload layer on;
+Prefill only, 58 tokens, `-n 0` so no decode step can land inside the
+measurement (`--npu-cpu` = host execution with the NPU offload layer on;
 `--cpu` = plain CPU backend):
 
 | arm | median | vs CPU | samples |
 |-----|--------|--------|---------|
-| `--cpu` | 5086 ms | 1.00x | 4153, 5086, 5723 |
-| `--npu-cpu`, fixed | 2793 ms | 1.82x | 2691, 2793, 2862 |
-| `--npu-cpu` + W8A8 (rows rule) | 3113 ms | 1.63x | 2732, 3654, 3113 |
-| `--npu-cpu` + W8A8 eager | 3522 ms | 1.44x | 3397, 3522, 3711 |
-| `--npu-cpu`, old 1024 MiB budget | 3440 ms | 1.48x | 3285, 3573, 3440 |
+| `--cpu` | 4089 ms | 1.00x | 3677, 4473, 4089 |
+| `--npu-cpu` (fixed default) | 2357 ms | **1.73x** | 2357, 2327, 2699 |
+| `--npu-cpu` + W8A8, reuse rule | 2381 ms | 1.72x | 2381, 2325, 2444 |
+| `--npu-cpu` + W8A8, eager | 3395 ms | 1.20x | 3242, 3395, 3687 |
+| `--npu-cpu`, old 1024 MiB budget | 3042 ms | 1.34x | 3042, 2888, 3237 |
 
-The CPU arm carries most of the noise (4153-5723 ms, 38% spread on a 2-vCPU
-shared box); the NPU arm is stable to about 6%. Ratios are therefore quoted to
-two figures at most.
+Decode, 200 tokens, same model (ms per token, two reps):
+
+| arm | ms/tok | vs off |
+|-----|--------|--------|
+| W8A8 off | 131.37 | 1.00x |
+| W8A8 reuse rule | 72.84 | 1.80x |
+| W8A8 eager | 61.15 | 2.15x |
+
+The CPU arm carries most of the noise (3677-4473 ms, 18% spread on a 2-vCPU
+shared box); the NPU arms are stable to about 10%. Ratios are quoted to two
+figures at most.
+
+Note the measurement trap this replaced: with `-n 2` the decode steps land after
+the prefill timer stops, but any lazy weight packing they trigger can be pulled
+into the same process' later behaviour, and an earlier version of this table
+mixed the two phases. Prefill claims in this document are all `-n 0`.
 
 ## 3. Decomposition
 
@@ -107,7 +121,7 @@ Not a defect, a boundary. Rope, attention, KV cache, embedding, MoE routing and
 top-k have no NPU opcode and stay on the host, and every one of them is
 fenced by `npu_flush_()` in `src/backend_cpu.cpp` because it may read memory the
 device still has queued. The device is idle across all of it. This is the cost of
-the offload boundary, and it is why the ceiling is 5.3x, not 8x.
+the offload boundary, and it is why the ceiling is 4.7x, not 8x.
 
 Evidence it is the boundary and not launch overhead: a trivial 1x64x64 op
 through submit+sync costs **0.0642 ms** (median of 200, p10 0.0609, p90 0.0777).
@@ -137,12 +151,19 @@ trace showed exactly what that costs: ~30 ms holes between SWIGLU and SWIGLU
 with **no device matmul in between**, i.e. an expert down-projection running on
 the CPU, 83% device idle, 508 ms busy in a 3059 ms span.
 
+Single runs, `-n 0`, so the declines are the only thing that changes:
+
 | budget | declines | prefill |
 |--------|----------|---------|
-| 1024 MiB (old default) | 393 | 3440 ms |
-| 2048 MiB | 0 | 2398 ms |
-| 4096 MiB | 0 | 2229 ms |
-| derived from RAM (new default) | 0 | 2793 ms |
+| 1024 MiB (old default) | 393 | 3207 ms |
+| 2048 MiB | 0 | 2495 ms |
+| 4096 MiB | 0 | 2360 ms |
+| derived from RAM (new default) | 0 | 2435 ms |
+
+The derived default is three quarters of `host_available_bytes()`; on a 3.9 GiB
+box that lands near 2048 MiB, which is why it tracks that row rather than 4096.
+The interleaved medians in section 7 are the numbers to quote for the fix; this
+table is here to show that declines, not anything else, are what moves.
 
 The default is now three quarters of `host_available_bytes()`, floored at the
 old 1024 MiB so no box regresses, and `KRK_NPU_WEIGHT_MB` still overrides it
@@ -152,22 +173,29 @@ exactly.
 
 Packing costs about 2.3 ms per 768x768 weight (253 MB/s standalone, 1718 ms for
 737 weights) and buys back 418 ms of GEMM time (the same GEMMs are 803 ms as f32
-against 385 ms as int8). On a prefill that touches each expert once, the pack
-never repays itself: W8A8 eager measured 3522 ms against 2793 ms with it off, a
-26% loss.
+against 385 ms as int8). On a prefill that touches each expert once the pack
+never repays itself: eager W8A8 measured 3395 ms against 2357 ms with it off.
 
-A request counter was tried first and only got to 3113 ms, because the load-time
-expert warmup touches every weight once, so prefill's *second* request earned a
-pack the prefill never repaid. **Rows** are the honest signal: a many-row GEMM is
-a prefill (weight streamed once for the whole chunk), a one-row GEMM is a decode
-step (weight re-read every token). Packing is now gated on `rows > 1`, so prefill
-never packs and decode still pays the pack once and keeps the 2.6x it buys
-(113.9 ms/token with int8 off, 43.3 ms/token with it on, 200-token run).
-`KRK_NPU_W8A8_EAGER=1` restores pack-on-first-use.
+Two signals were tried before one worked, and the first one is worth recording:
 
-The break-even is around 15-20 generated tokens: below that the deferred policy
-wins because prefill stays cheap, above it eager wins because decode stops
-paying. The default optimises the phase this document is about.
+1. **A request counter** (pack on the second request): 3113 ms. It fails because
+   the load-time expert warmup touches every weight once, so prefill's *second*
+   request earned a pack the prefill never repaid.
+2. **Row count alone** (`rows > 1` means prefill): 3172 ms, packing 106 weights.
+   Better, still a 563 ms loss, because a prefill does issue single-row GEMMs --
+   106 weights' worth on this model.
+3. **Row count plus reuse:** defer every `rows > 1` GEMM, and for `rows == 1`
+   defer the first one-row request for that weight and pack only from the
+   second. Decode re-requests the same weight on the next token; a one-shot
+   single-row prefill GEMM never comes back. Result: **0 weights packed in a
+   prefill-only run, 2381 ms against 2357 ms off** -- free within noise -- while
+   decode still pays the pack once and keeps 72.84 ms/token against 131.37.
+
+`KRK_NPU_W8A8_EAGER=1` restores pack-on-first-use. The break-even between the
+reuse rule and eager is about **87 generated tokens** at 200-token decode rates
+(eager costs 1014 ms more prefill and saves 11.7 ms per token), so the default
+optimises the phase this document is about and long generations should set the
+flag.
 
 ### 4.6 Tiling: M=58 is the worst band the kernel has - measured, not yet fixed
 
@@ -214,7 +242,7 @@ change as two 20%+ fixes. It is the first item under next actions.
 |----------|-------|--------|
 | device busy, 58-token prefill | 863.6 ms | trace |
 | device busy, int8 kernels | 385 ms | earlier int8 trace |
-| CPU arm, same prompt | 5086 ms (median) | interleaved run |
+| CPU arm, same prompt | 4089 ms (median) | interleaved run |
 | single-op round trip | 0.0642 ms | 200-iteration probe |
 | in-graph f32 GEMM | 24.8-31.5 GFLOPS | trace |
 | standalone f32 GEMM, M=58 | 25.7 GFLOPS | bench |
@@ -231,15 +259,15 @@ Ceilings, in order of how much they assume:
 
 | scenario | prefill | vs CPU |
 |----------|---------|--------|
-| today | 2464 ms | 1.82x |
-| host cost driven to zero, f32 kernels kept | 864 ms | 5.3x |
-| ... plus M-padding to tile multiples | ~784 ms | 6.0x |
-| ... plus int8 kernels (385 ms device) | 385 ms | 12.2x (needs a paid-off pack) |
-| **8x target = 565 ms** | | needs int8 **and** host < 180 ms |
+| today | 2357 ms | 1.73x |
+| host cost driven to zero, f32 kernels kept | 864 ms | 4.7x |
+| ... plus M-padding to tile multiples | ~784 ms | 5.2x |
+| ... plus int8 kernels (385 ms device) | 385 ms | 10.6x (needs a paid-off pack) |
+| **8x target = 511 ms** | | needs int8 **and** host < 130 ms |
 
 8x is therefore not a tiling problem. It needs the int8 kernels *and* the host
 gap down by roughly 9x *and* the 2.4 s weight pack amortised or cached. The
-current build delivers 1.82x with zero of that host work removed.
+current build delivers 1.73x with none of that host work removed.
 
 ## 6. Optimisation plan, in cost order
 
@@ -261,10 +289,11 @@ current build delivers 1.82x with zero of that host work removed.
 
 | arm | before | after | ratio |
 |-----|--------|-------|-------|
-| `--npu-cpu`, prefill 58 tok, old budget | 3440 ms | 2793 ms | 1.23x |
-| `--npu-cpu`, prefill 58 tok, W8A8 | 3522 ms | 2793 ms (rows rule) | 1.26x |
+| `--npu-cpu`, prefill 58 tok, old budget | 3042 ms | 2357 ms | 1.29x |
+| `--npu-cpu`, prefill 58 tok, W8A8 | 3395 ms | 2381 ms (reuse rule) | 1.43x |
 | declines on the same run | 393 / 1087 | 0 | - |
-| vs CPU arm | 1.48x | 1.82x | - |
+| vs CPU arm | 1.34x | 1.73x | - |
+| decode, W8A8 reuse rule | 131.37 ms/tok | 72.84 ms/tok | 1.80x |
 
 Correctness: `kraken-tests` **4791/4791**, including the int8 parity digests in
 `tests/isa_parity.cpp`. No kernel was modified; every change is in the offload
@@ -286,8 +315,10 @@ shipped in #15.
 # baseline vs arms, interleaved
 KRK_NPU_WEIGHT_MB=1024 ./build-npu/kraken -m fix/moe-2g-q8_0.gguf --npu-cpu \
     -p "<58-token prompt>" -n 2 --greedy --ctx 1024 --chunk 512
-KRK_NPU_W8A8=1 ./build-npu/kraken ... same        # rows rule
+KRK_NPU_W8A8=1 ./build-npu/kraken ... same        # reuse rule (prefill-free)
 KRK_NPU_W8A8=1 KRK_NPU_W8A8_EAGER=1 ./build-npu/kraken ...  # pack on first use
+
+# isolate prefill: -n 0 keeps decode steps out of the measurement
 
 # where the time goes
 KRK_NPU_OPTIME=1 KRK_NPU_TRACE=/tmp/t.json ./build-npu/kraken ...

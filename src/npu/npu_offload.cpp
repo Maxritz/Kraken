@@ -33,6 +33,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace krk {
@@ -189,9 +190,11 @@ public:
     // KRK_NPU_OPTIME=1: time submit() and sync() separately so a batch's wall
     // time can be split into host dispatch and device wait.
     bool optime = false;
-    // KRK_NPU_W8A8_EAGER=1 packs on first use instead of waiting for a second
-    // request. Off is the measured default; see weight_i8.
+    // KRK_NPU_W8A8_EAGER=1 packs on first use instead of waiting for reuse.
+    // Off is the measured default; see gemm_i8.
     bool w8a8_eager = false;
+    // Weights already asked for once with a single row -- see gemm_i8.
+    std::unordered_set<const void *> seen_1row;
     std::unordered_map<const void *, EntryI8> stage_i8;
     size_t stage_i8_bytes = 0;
     // Activation scratch for the int8 path: one int8 row block plus the
@@ -733,9 +736,20 @@ bool gemm_i8(Offload *o, void *out, const void *x, const void *w, DType wt,
     // every token and the pack is paid once for hundreds of reads. So pack for
     // decode and stay f32 for prefill. KRK_NPU_W8A8_EAGER=1 restores packing
     // on every request, which is what the earlier builds did.
-    if (!o->w8a8_eager && rows > 1) {
-        o->n.w8a8_deferred++;
-        return false; // caller falls through to the f32 GEMM
+    if (!o->w8a8_eager) {
+        bool defer = rows > 1;
+        if (!defer) {
+            // A single-row GEMM is not proof of decode on its own: a prefill
+            // still issues some (106 weights on the 58-token MoE, measured),
+            // and packing for those was 563 ms of a 2609 ms prefill for nothing.
+            // Decode is the case where the SAME weight comes back with a single
+            // row again, so require a second one-row request before packing.
+            defer = o->seen_1row.insert(w).second;
+        }
+        if (defer) {
+            o->n.w8a8_deferred++;
+            return false; // caller falls through to the f32 GEMM
+        }
     }
     vnpu_packed_weights_t *pk = o->weight_i8(w, wt, n_out, n_in);
     if (!pk) return false;
