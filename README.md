@@ -393,6 +393,66 @@ On a 46-token prompt the same change measures 1.37x, because the fixed cost of
 the prompt-encoding tail is a larger share of a shorter prefill. Decode gains
 4-11% depending on prompt length, from the single-row kernel alone.
 
+#### Q6_K: the bias was being recomputed per row, twice over
+
+Q6_K stores `w = d·sc·(q − 32)` with `sc` every **16** values. Three things were
+wrong with the kernel:
+
+1. `S = Σx` was computed **per weight row**, for every one of the `n_out` rows.
+2. The correction was applied as `t = I − 32·S` in int32 — a `mullo` and a `sub`
+   per 16 values, on top of the dot.
+3. There was no eight-row kernel at all, so Q6_K prefill ran at GEMV speed while
+   Q4_K had been batched for months. That is why Q6_K was 18% of the run at 6% of
+   peak.
+
+The fix is to notice that `vpdpbusd` takes an **accumulator**: Q6_K's nibbles are
+0..63 (the unsigned operand), the activation is int8 (the signed one), and
+`Σ(q−32)·x` is exactly what you get if the `−32·Σx` is already sitting in the
+lanes when the dot lands. So `quantize_q8_row_sq4()` stores
+`−32·Σx` per **four** values — four, not sixteen, because the lanes of
+`vpdpbusd` each own four values, and a 16-value sum written into all four lanes
+subtracts it four times (measured 3.8e+02 relative error; that is how the wrong
+granularity announces itself). With that, the correction costs the kernel
+nothing — no subtract, no multiply, no permute — and the whole 32-value group is
+`load · vpdpbusd · cvt · fmadd`.
+
+`dot_q6_K_q8_sq4_x8()` adds the eight-row prefill shape, which decodes the
+210-byte weight block and its nibble unpack **once** and uses it eight times.
+
+| Tiny-Moe Q4_K_M, 98-token prompt, 10 runs interleaved both ways | prefill | decode |
+|---|---:|---:|
+| per-row bias, no x8 (before) | 266.4 tok/s | 113.1 tok/s |
+| `sq4` + x8 (after) | **309.1 tok/s** | **124.0 tok/s** |
+| | 1.18x | 1.10x |
+
+Per component, which is where the change actually lands:
+
+| row | before | after | |
+|---|---:|---:|---|
+| `gemm_q6k_rN` (prefill) | 4226.9 us/op, 20.3 GMAC/s | **1697.1 us/op, 50.6 GMAC/s** | **2.49x** |
+| `gemm_q6k_r1` (decode) | 84.1 us/op, 16.0 GMAC/s | **62.1 us/op, 21.7 GMAC/s** | 1.35x |
+
+End-to-end moves less than the kernel because Q6_K is 12-15% of the run and the
+Q4_K rows are larger. `KRK_CPU_DOT_Q6SQ4=0` restores the old kernel; that is the
+A/B.
+
+**Accuracy is the *same* kernel, not a near miss.** `dot_q6_K_q8_sq4()` and the
+eight-row form agree with the dequantised block to 1.50e-06 relative — identical
+to the kernel they replace, because the integer dot is exact and only the order
+of the f32 scale application moves. The gate is logits, not text: on four
+prompts, against the exact non-int8 path, the new arm sits **closer** to the
+reference than the old one and agrees on the top-1 token more often.
+
+| arm | mean \|Δlogit\| on the exact top-1 | top-1 agreement |
+|---|---:|---:|
+| int8, per-row bias (before) | 0.0346 | 3/4 |
+| int8, `sq4` (after) | **0.0320** | **4/4** |
+
+Greedy text still differs between arms on one prompt — the exact model's own
+top-2 are 0.017 apart there, and int8 quantisation is worth ~0.03, so that is a
+coin flip in the model and not a kernel defect. Judging a kernel by greedy text
+on a 4096-piece vocabulary is how you chase noise.
+
 #### What the trace says now
 
 `--kprof` prints a `GMAC/s` and a `%peak` column per component, and the peak is

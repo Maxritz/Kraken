@@ -1691,6 +1691,251 @@ void dot_q4_K_q8_sx_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
 #endif // KRK_DOT_AVX2
 
 // ---------------------------------------------------------------------------
+// Q6_K with the per-16 bias folded into the dot product.
+//
+// The kernel below (dot_q6_K_q8_d) rebuilds  S = sum(x) over 16  for every
+// weight row and then computes  t = I - 32*S  in int32, before converting. Two
+// things are wrong with that here. The sum is per ROW, so it is recomputed for
+// every one of the n_out weight rows; and the subtract-then-convert costs a
+// multiply and a subtract per 16 values on top of the dot.
+//
+// x86 can do better: vpdpbusd takes an ACCUMULATOR, so the -32*S correction can
+// be sitting in the lanes before the dot lands. Q6_K's nibbles are 0..63 (u8,
+// the unsigned operand) and the activation is int8 (the signed one), so one
+// vpdpbusd per 32 values replaces maddubs+madd+mullo+sub, and the bias that
+// used to be a correction is free. sq4[] gives the biased sums once per activation
+// row instead of once per weight row.
+//
+// Lane structure: both vpdpbusd and maddubs+madd land on 8 int32 lanes of four
+// values each, so lanes 0-3 are the first 16 values and 4-7 the second -- which
+// is exactly where `sc` changes. One f32 vector carries both scales.
+// One 32-value group's Q6_K nibbles: 4 bits from ql, 2 from qh, plus the 4.
+__attribute__((target("avx2")))
+inline __m256i q6_group(const u8 *ql, __m256i qhv, int g) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i k3 = _mm256_set1_epi8(0x03);
+    // Groups 0 and 1 take the low nibble of ql[0..31] and ql[32..63]; groups 2
+    // and 3 take the HIGH nibble of the same 64 bytes.
+    const __m256i qlv = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i *>(ql + 32 * (g & 1)));
+    __m256i lo4 = qlv;
+    if (g >= 2) lo4 = _mm256_srli_epi16(qlv, 4);
+    lo4 = _mm256_and_si256(lo4, kLo);
+    __m256i hi = qhv;
+    if (g) hi = _mm256_srli_epi16(qhv, 2 * g);
+    hi = _mm256_and_si256(hi, k3);
+    hi = _mm256_slli_epi16(hi, 4);
+    return _mm256_or_si256(lo4, hi);
+}
+
+#if defined(KRK_DOT_AVX512)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+f32 dot_q6_K_q8_sq4_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
+                           const i32 *sq4, i64 n) {
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 210) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[208] | (w[209] << 8)));
+        for (int half = 0; half < 2; half++) {
+            const u8 *ql = w + half * 64;
+            const u8 *qh = w + 128 + half * 32;
+            const i8 *sc = reinterpret_cast<const i8 *>(w + 192 + half * 8);
+            const __m256i qhv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qh));
+            const i64 vbase = nb * 256 + half * 128;
+            for (int g = 0; g < 4; g++) {
+                const __m256i q = q6_group(ql, qhv, g);
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xq + vbase + 32 * g));
+                // -32 * sum(4) per lane, precomputed: the dot lands on it.
+                const __m256i pm = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(sq4 + (vbase + 32 * g) / 4));
+                const __m256i iv = _mm256_dpbusd_epi32(pm, q, xv);
+                const f32 dxg = dx[(vbase + 32 * g) / 32];
+                const f32 s0 = d * dxg * static_cast<f32>(sc[2 * g + 0]);
+                const f32 s1 = d * dxg * static_cast<f32>(sc[2 * g + 1]);
+                acc = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(iv),
+                    _mm256_setr_ps(s0, s0, s0, s0, s1, s1, s1, s1), acc);
+            }
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+#endif // KRK_DOT_AVX512
+
+// The AVX2 twin. maddubs + madd give the same four-values-per-lane structure,
+// so the pre-biased sums are one vpaddd instead of being the accumulator.
+__attribute__((target("avx2,fma")))
+f32 dot_q6_K_q8_sq4_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
+                           const i32 *sq4, i64 n) {
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 210) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[208] | (w[209] << 8)));
+        for (int half = 0; half < 2; half++) {
+            const u8 *ql = w + half * 64;
+            const u8 *qh = w + 128 + half * 32;
+            const i8 *sc = reinterpret_cast<const i8 *>(w + 192 + half * 8);
+            const __m256i qhv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qh));
+            const i64 vbase = nb * 256 + half * 128;
+            for (int g = 0; g < 4; g++) {
+                const __m256i q = q6_group(ql, qhv, g);
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xq + vbase + 32 * g));
+                const __m256i pm = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(sq4 + (vbase + 32 * g) / 4));
+                const __m256i iv = _mm256_add_epi32(
+                    _mm256_madd_epi16(_mm256_maddubs_epi16(q, xv), ones16), pm);
+                const f32 dxg = dx[(vbase + 32 * g) / 32];
+                const f32 s0 = d * dxg * static_cast<f32>(sc[2 * g + 0]);
+                const f32 s1 = d * dxg * static_cast<f32>(sc[2 * g + 1]);
+                acc = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(iv),
+                    _mm256_setr_ps(s0, s0, s0, s0, s1, s1, s1, s1), acc);
+            }
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
+// Eight activation rows against one weight row. The weight block -- 210 bytes,
+// and the nibble unpack with it -- is decoded ONCE and used eight times. That
+// is the prefill shape, and without it Q6_K prefill runs at GEMV speed.
+#if defined(KRK_DOT_AVX512)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+void dot_q6_K_q8_sq4_x8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
+                               const i32 *sq4, i64 n, i64 rstride, i64 dstride,
+                               i64 sstride, f32 *out, i64 out_stride) {
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 210) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[208] | (w[209] << 8)));
+        // q and the weight scale, once per block, shared by all eight rows.
+        __m256i qv[8];
+        __m256 bwv[8];
+        for (int half = 0; half < 2; half++) {
+            const u8 *ql = w + half * 64;
+            const u8 *qh = w + 128 + half * 32;
+            const i8 *sc = reinterpret_cast<const i8 *>(w + 192 + half * 8);
+            const __m256i qhv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qh));
+            for (int g = 0; g < 4; g++) {
+                qv[half * 4 + g] = q6_group(ql, qhv, g);
+                const f32 b0 = d * static_cast<f32>(sc[2 * g + 0]);
+                const f32 b1 = d * static_cast<f32>(sc[2 * g + 1]);
+                bwv[half * 4 + g] =
+                    _mm256_setr_ps(b0, b0, b0, b0, b1, b1, b1, b1);
+            }
+        }
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const i32 *sr = sq4 + static_cast<i64>(r) * sstride + nb * 64;
+            const f32 *dr = dx + static_cast<i64>(r) * dstride + nb * 8;
+            for (int half = 0; half < 2; half++) {
+                for (int g = 0; g < 4; g++) {
+                    const i64 off = half * 128 + 32 * g;
+                    const __m256i xv = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(xr + off));
+                    const __m256i pm = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(sr + off / 4));
+                    const __m256i iv = _mm256_dpbusd_epi32(pm, qv[half * 4 + g],
+                                                           xv);
+                    const __m256 scale = _mm256_mul_ps(
+                        bwv[half * 4 + g],
+                        _mm256_broadcast_ss(dr + half * 4 + g));
+                    acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv), scale,
+                                             acc[r]);
+                }
+            }
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+#endif // KRK_DOT_AVX512
+
+__attribute__((target("avx2,fma")))
+void dot_q6_K_q8_sq4_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
+                               const i32 *sq4, i64 n, i64 rstride, i64 dstride,
+                               i64 sstride, f32 *out, i64 out_stride) {
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 210) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[208] | (w[209] << 8)));
+        __m256i qv[8];
+        __m256 bwv[8];
+        for (int half = 0; half < 2; half++) {
+            const u8 *ql = w + half * 64;
+            const u8 *qh = w + 128 + half * 32;
+            const i8 *sc = reinterpret_cast<const i8 *>(w + 192 + half * 8);
+            const __m256i qhv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qh));
+            for (int g = 0; g < 4; g++) {
+                qv[half * 4 + g] = q6_group(ql, qhv, g);
+                const f32 b0 = d * static_cast<f32>(sc[2 * g + 0]);
+                const f32 b1 = d * static_cast<f32>(sc[2 * g + 1]);
+                bwv[half * 4 + g] =
+                    _mm256_setr_ps(b0, b0, b0, b0, b1, b1, b1, b1);
+            }
+        }
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const i32 *sr = sq4 + static_cast<i64>(r) * sstride + nb * 64;
+            const f32 *dr = dx + static_cast<i64>(r) * dstride + nb * 8;
+            for (int half = 0; half < 2; half++) {
+                for (int g = 0; g < 4; g++) {
+                    const i64 off = half * 128 + 32 * g;
+                    const __m256i xv = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(xr + off));
+                    const __m256i pm = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(sr + off / 4));
+                    const __m256i iv = _mm256_add_epi32(
+                        _mm256_madd_epi16(
+                            _mm256_maddubs_epi16(qv[half * 4 + g], xv),
+                            ones16),
+                        pm);
+                    const __m256 scale = _mm256_mul_ps(
+                        bwv[half * 4 + g],
+                        _mm256_broadcast_ss(dr + half * 4 + g));
+                    acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv), scale,
+                                             acc[r]);
+                }
+            }
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Q6_K against an int8 activation.
 //
 // Q6_K stores   w_k = d * sc_s * (q_k - 32)   q_k in 0..63, sc one int8 per 16
@@ -1977,6 +2222,38 @@ bool env_dot_avx2() {
 // backend links against. Without AVX2 there is no int8 kernel and the flag is
 // false, so the stubs are never reached -- they exist so the translation unit
 // links on every target.
+// Per-FOUR biased sums, for Q6_K.
+//
+// Q6_K stores  w = d * sc_s * (q_k - 32)  and its dot needs  sum((q-32)*x).
+// The kernel forms that with one vpdpbusd, whose 8 int32 lanes each own FOUR
+// consecutive values -- so the -32 correction has to be present once per lane,
+// not once per 16 (putting a 16-sum in all four lanes subtracts it four times;
+// measured 3.8e+02 relative, which is how this was found).
+//
+// sx[i] = -32 * sum(x[4i .. 4i+3]), computed once per activation row. It is the
+// ACCUMULATOR the dot lands on, so the correction costs the kernel nothing at
+// all -- not a subtract, not a multiply, not a permute. One int32 per four
+// values is n bytes per row.
+__attribute__((target("avx2"))) inline __m256i bias4_of_32(const i8 *p) {
+    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
+    const __m256i pairs = _mm256_maddubs_epi16(_mm256_set1_epi8(1), v);
+    const __m256i quads = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
+    return _mm256_sub_epi32(_mm256_setzero_si256(),
+                            _mm256_slli_epi32(quads, 5));
+}
+
+void quantize_q8_row_sq4(const f32 *x, i64 n, i8 *xq, f32 *dx, i32 *sq4) {
+#if defined(KRK_DOT_AVX2)
+    quantize_q8_row_d(x, n, xq, dx);
+    for (i64 b = 0; b < n; b += 32) {
+        const __m256i c = bias4_of_32(xq + b);
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(sq4 + b / 4), c);
+    }
+#else
+    (void)x; (void)n; (void)xq; (void)dx; (void)sq4;
+#endif
+}
+
 void quantize_q8_row_sx(const f32 *x, i64 n, i8 *xq, f32 *dx, i32 *sx) {
 #if defined(KRK_DOT_AVX2)
     quantize_q8_row_d(x, n, xq, dx);
@@ -2018,6 +2295,47 @@ f32 dot_q4_K_q8_sx(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
 #else
     (void)w; (void)xq; (void)dx; (void)sx; (void)n;
     return 0.0f;
+#endif
+}
+
+f32 dot_q6_K_q8_sq4(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4,
+                    i64 n) {
+#if defined(KRK_DOT_AVX512)
+    if (cpu_has_vnni()) return dot_q6_K_q8_sq4_vnni_d(w, xq, dx, sq4, n);
+#endif
+#if defined(KRK_DOT_AVX2)
+    return dot_q6_K_q8_sq4_avx2_d(w, xq, dx, sq4, n);
+#else
+    (void)w; (void)xq; (void)dx; (void)sq4; (void)n;
+    return 0.0f;
+#endif
+}
+
+void dot_q6_K_q8_sq4_x8(const u8 *w, const i8 *xq, const f32 *dx,
+                        const i32 *sq4, i64 n, i64 rstride, i64 dstride,
+                        i64 sstride, f32 *out, i64 out_stride) {
+    static const char *e = std::getenv("KRK_CPU_DOT_Q6SQ4");
+    const bool use = !e || e[0] != '0';
+    if (!use) {
+        for (int r = 0; r < 8; r++)
+            out[static_cast<i64>(r) * out_stride] =
+                dot_q6_K_q8(w, xq + static_cast<i64>(r) * rstride,
+                            dx + static_cast<i64>(r) * dstride, n);
+        return;
+    }
+#if defined(KRK_DOT_AVX512)
+    if (cpu_has_vnni()) {
+        dot_q6_K_q8_sq4_x8_vnni_d(w, xq, dx, sq4, n, rstride, dstride, sstride,
+                                  out, out_stride);
+        return;
+    }
+#endif
+#if defined(KRK_DOT_AVX2)
+    dot_q6_K_q8_sq4_x8_avx2_d(w, xq, dx, sq4, n, rstride, dstride, sstride, out,
+                              out_stride);
+#else
+    (void)w; (void)xq; (void)dx; (void)sq4; (void)n; (void)rstride;
+    (void)dstride; (void)sstride; (void)out; (void)out_stride;
 #endif
 }
 
