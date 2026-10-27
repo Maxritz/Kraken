@@ -481,6 +481,23 @@ constexpr ArchSpec kTable[] = {
      "attention values are a routed expert set of their own "
      "(attn_v_exps/attn_v_gate); that is not implemented",
      false, false, false, false, true, false},
+    // MiniMax's sparse-attention MoE. Listed rather than left to the fallback
+    // because the fallback reads an unlisted file against llama defaults, and a
+    // 428B MoE is the last model that should be run through a schema nobody
+    // checked: the defaults would find a plausible layer stack and quietly
+    // compute the wrong graph instead of refusing.
+    //
+    // Three gaps, all of them structural rather than a missing flag. MiniMax
+    // Sparse Attention is block-sparse throughout -- M3.1 replaced the last
+    // full-attention layers, so there is no dense prefix to fall back on and
+    // the attention op's causal/window masks cannot express it. The model is
+    // natively multimodal, so a vision/video tower feeds the token stream. And
+    // it ships a DSpark draft head, which this engine can load as a draft file
+    // against a matching target but which has nothing to attach to here.
+    {"minimax-m3", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "minimax-m3",
+     "MiniMax Sparse Attention (block-sparse, no dense prefix), a native "
+     "vision/video tower and a DSpark draft head are not implemented",
+     false, false, false, false},
     // Dense FFN with an attention output gate and Gemma-style post-norms.
     {"muse-glimmer", ArchShape::Dense, ArchSupport::No, ArchRole::Target,
      "muse-glimmer",

@@ -255,6 +255,63 @@ went from 135 ms to 27 ms with byte-identical text. A request that fails clears
 the cache entry rather than leaving rows behind that a later prompt would assume
 were its own.
 
+## MoE under a RAM limit
+
+The question this project gets asked most: **can I run a big MoE with only a few
+experts in RAM, and what does that cost me?** Measured on a 1.2 GiB q8_0 MoE
+(20 layers, 32 experts, top-4) on 2 vCPU / 3.9 GiB, no GPU. Full tables and
+method in [docs/MOE-RESIDENCY.md](docs/MOE-RESIDENCY.md).
+
+| | all experts resident | 64 MiB of experts, rest on disk |
+|---|---:|---:|
+| prefill, AVX2 dot | 3.94 s | 3.82 s |
+| decode, AVX2 dot | 41.1 ms/token | 73.6 ms/token |
+| read from disk | 369 MiB | 2519 MiB |
+
+**Prefill does not care how much of the model is resident; decode cares
+completely.** Prefill amortises one expert gather per layer across a chunk of
+rows, so the arithmetic hides the I/O — the expert path is 533 ms of a 3858 ms
+prefill (14%) at a 64 MiB budget. Decode has one row and nothing to hide behind,
+so the same gathers are the whole cost, and it pays 1.79×. Three consequences
+worth knowing before tuning anything:
+
+- `--expert-warm-mb` is the lever, not the device budget. A 512 MiB host WARM
+  tier at a 64 MiB device budget cut the read from 2519 to 246 MiB (**0.10×**).
+- `--chunk` multiplies fetches. Chunk 8 re-fetches per 8 rows: 3907 MiB read and
+  4739 ms prefill, against 1372 MiB and 3858 ms at chunk 128.
+- `--threads` moves prefill 1.80× and decode not at all. Prefill is compute,
+  decode is bytes.
+
+The arms do not agree about which is fastest, and both answers are real: **AVX2
+CPU wins prefill** (2.84 s vs 3.41 s) and **the virtual NPU wins decode**
+(32.8 ms/token with `KRK_NPU_W8A8=1 KRK_NPU_ATTN=1`, against 42.0 ms on CPU) —
+but only while the experts are resident. With experts streaming, the NPU arm's
+decode collapses 12.7× (32.8 → 416 ms) where the CPU's costs 1.79×, because the
+int8 pack is memoized per weight address and a streaming slot changes address
+every visit. That defect, the fix that was tried and rejected on measurement, and
+the exact numbers are in
+[docs/MOE-RESIDENCY.md §5](docs/MOE-RESIDENCY.md). **Until it is fixed, do not
+combine `KRK_NPU_W8A8=1` with forced streaming** (149.0 ms/token against 718.7).
+
+Every switch, the arm it belongs to and what it is worth:
+[docs/OPTIONS-MATRIX.md](docs/OPTIONS-MATRIX.md) — 66 flags and 200+ environment
+variables, the ones that decide throughput first, the full list by owning file at
+the end.
+
+```sh
+# keep 64 MiB of experts on the device and a 512 MiB warm tier in host RAM
+KRK_CPU_DOT_AVX2=1 kraken -m moe.gguf --cpu --expert-cache-mb 64 \
+    --expert-warm-mb 512 -p "..." -n 64 --greedy
+
+# fastest decode measured here: whole graph on the virtual NPU, int8 + attention
+KRK_NPU_W8A8=1 KRK_NPU_ATTN=1 kraken -m moe.gguf --npu-cpu -p "..." -n 64
+```
+
+`kraken-inspect` is the first thing to run on an unfamiliar file: it gives the
+same verdict the loader will, without loading the weights, and an architecture it
+does not know is now **refused by name** instead of being read against llama
+defaults.
+
 ## Scores
 
 Measured on 2026-10-26 with `kraken --model <MODEL> --bench --greedy
@@ -336,6 +393,11 @@ and the refusal list, is in [docs/MODEL-STATUS.md](docs/MODEL-STATUS.md) and
 * [AGENTS.md](AGENTS.md) is the working note: what each gate in the repository
   is for, the trap behind each default, and the measurement each default rests
   on.
+* [docs/MOE-RESIDENCY.md](docs/MOE-RESIDENCY.md) is the expert-residency study:
+  prefill and decode against every expert budget, the WARM tier, chunk size, and
+  the device arms side by side.
+* [docs/OPTIONS-MATRIX.md](docs/OPTIONS-MATRIX.md) is every switch with its
+  measured worth.
 * `docs/` holds the design and audit documents, one per subsystem.
 * `scripts/` holds the gates (`build_check.sh`, `kraken_tests_baseline_check.sh`,
   `coherence_check.sh`) and the benchmark harnesses.
