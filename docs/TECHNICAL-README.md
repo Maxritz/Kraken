@@ -199,6 +199,58 @@ And on the CPU side, independent of the NPU:
 |---|---|---|
 | `KRK_CPU_DOT_FAST=1` | four accumulators in the block-format dot (q4_0/q8_0/q5/q6) | 3.07x prefill / 2.71x decode on q8_0, ~2x on q4_0; up to 1.4e-07 of the term magnitude different, so the CPU arm stops being the bit-exact oracle while it is set |
 
+### The Zen 3 arm (`VNPU_FORCE_ISA=avx2`)
+
+Most machines running a quantised model have no AVX-512. Zen 3 does not; its
+per-core ceiling is two 256-bit FMA3 pipes, and AVX-512 only arrives with Zen 4
+(where it is double-pumped and buys roughly the same throughput in fewer
+instructions). So the 256-bit kernel is the *fast path* on that class of
+hardware, not a fallback -- which is why it was worth fixing rather than
+inheriting.
+
+The engine's AVX2 int8 GEMM was widening 8 int8 to int32, multiplying with
+`mullo_epi32`, and gathering B one byte at a time: 8 MACs per iteration, and
+measured at **4.89 GFLOP/s against scalar's 3.80**. On the packed
+`[n_block][k4][16][4]` layout, `maddubs` + `madd_epi16` does 32 MACs in two
+instructions. The `+128` offset the VNNI path relies on cannot be reused --
+`maddubs` produces int16 and `255*127*2` overflows it -- so the kernel uses
+`|a| * (b*sign(a))` instead, which peaks at 32512 and needs no correction term.
+`quantize_rows`, 25.8% of device busy in a W8A8 trace, was scalar and is now
+vectorised to be bit-identical (half-away-from-zero is emulated, because
+`vcvtps2dq` rounds half to even).
+
+| one core, 768x768 expert | scalar | old avx2 | new avx2 | gain |
+|---|---:|---:|---:|---:|
+| 1 row (decode) | 0.358 ms | 0.326 ms | **0.075 ms** | **4.3x** |
+| 32 rows | 9.456 ms | 8.321 ms | **0.548 ms** | **15.2x** |
+| 128 rows | 39.735 ms | 30.869 ms | **1.960 ms** | **15.7x** |
+
+End to end on the 2 GiB q8_0 MoE fixture with `KRK_NPU_W8A8=1`, forcing the
+Zen 3 arm (best of 3):
+
+| arm | prefill before | prefill after | decode before | after |
+|---|---:|---:|---:|---:|
+| `VNPU_FORCE_ISA=avx2` | 13271.4 ms | **3446.9 ms (3.85x)** | 233.4 ms | **42.8 ms (5.5x)** |
+| default (AVX-512) | 2974.5 ms | 2940.5 ms | 29.6 ms | 24.9 ms |
+
+The prefill hash is unchanged (`fc8a5598db7ec9cd` on both arms before and
+after), so the 3.85x costs no accuracy. The baseline AVX2 number was within 1%
+of scalar: before this, a Zen 3 user turning on int8 weights got scalar speed
+and no reason to know it. The AVX-512 VNNI path was not touched and did not
+regress.
+
+Without `KRK_NPU_W8A8=1` the improvement is **not** distinguishable from noise
+(run-to-run spread is 6-8% on this box, and the difference is inside it), which
+is the expected result: that arm's device work is `MATMUL_F32`.
+
+Verification is exact rather than tolerance-based. `tests/isa_parity.cpp` in the
+engine hashes the raw output bytes per op, so the three ISA arms can be
+compared directly: the int8 GEMM and the quantiser are **bit-identical** across
+scalar, AVX2 and AVX-512 on every shape tested, including K not a multiple of 4
+and N not a multiple of 16. The vectorised f32 reductions (RMSNorm, softmax,
+f32 GEMM) still differ across ISAs in the last bits -- that predates this work
+and is worth knowing before pinning results across a mixed fleet.
+
 Attention is **off by default because of chunk invariance, not accuracy**: the
 device kernel is invariant on its own, but the host/device *switch* is a
 per-call gate, so two runs differing only in `--chunk` can land on different
