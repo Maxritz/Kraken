@@ -15109,9 +15109,6 @@ static void test_dsv4_whole_graph() {
     CHECK(have_exe, "kraken sits beside kraken-tests (the device arm drives it)");
     if (have_exe) {
         const std::string exe = exe_p.string();
-        auto hex = [](const std::string &s) -> u64 {
-            return s.empty() ? 0ull : std::strtoull(s.c_str(), nullptr, 16);
-        };
         const PrefillProbe cc =
             run_prefill_hash(exe, path, mprompt, 16, false, false, "--cpu");
         const PrefillProbe cd1 = run_prefill_hash(exe, path, mprompt, 1, false);

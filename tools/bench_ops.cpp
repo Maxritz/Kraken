@@ -1250,7 +1250,6 @@ bool floor_floor(Backend *be, int iters) {
                                    static_cast<i64>(be->act_size()));
         });
     const i64 bytes = 1024 * 1024;
-    double mb = static_cast<double>(bytes) / 1e6;
     // copy_act copies one direction, so throughput here is in bytes/scheduled,
     // not bytes*2.
     double gbs = bytes / (ms * 1e6);

@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -105,7 +106,6 @@ public:
     size_t stage_bytes = 0;
     size_t stage_budget = 1024ull * 1024ull * 1024ull;
     bool stage_refused = false; // budget hit at least once -- say so, once
-    bool submit_failed = false; // reported once
     std::mutex mu;
 
     Counters n;
@@ -136,7 +136,9 @@ const f32 *Offload::weight(const void *w, DType wt, i64 n_out, i64 n_in) {
     e.n_in = n_in;
     try {
         e.data.resize(static_cast<size_t>(n_out) * static_cast<size_t>(n_in));
-    } catch (const std::bad_alloc &) {
+    } catch (const std::exception &) {
+        // bad_alloc for a weight that does not fit, length_error for a geometry
+        // that overflows size_t. Either way the caller takes its own body.
         return nullptr;
     }
     const size_t row_bytes = dtype_row_bytes(wt, n_in);
@@ -239,26 +241,33 @@ bool flush(Offload *o) {
     if (!o || !o->stream) return true;
     o->n.flushes++;
     if (o->queue.empty()) return true;
+    const size_t submitted = o->queue.size();
     const vnpu_status_t rc =
-        vnpu_stream_submit(o->stream, o->queue.data(), o->queue.size(), nullptr);
+        vnpu_stream_submit(o->stream, o->queue.data(), submitted, nullptr);
     o->queue.clear();
+    // A failed submission is not a fallback, it is a correctness event. The
+    // ops already in this batch returned true -- their callers have moved on --
+    // so the rows they were asked to produce were never written, and decoding
+    // on from here is decoding garbage. There is no recovery point inside a
+    // graph, so this stops the run and says why. (Same rule, and the same
+    // reason, as the reference backend's hadamard_act default: a lost
+    // transformation is fluent nonsense, not an error anyone can see.)
     if (rc != VNPU_OK) {
-        if (!o->submit_failed) {
-            o->submit_failed = true;
-            KRK_WARN("npu: submit failed (%s); this arm is no longer trustworthy",
-                     vnpu_status_string(rc));
-        }
-        return false;
+        KRK_ERROR("npu: submitting %zu command(s) failed (%s); the %llu "
+                  "command(s) queued before them were never executed, so the "
+                  "activations they were meant to produce are undefined",
+                  submitted, vnpu_status_string(rc),
+                  static_cast<unsigned long long>(o->n.batches));
+        std::abort();
     }
     o->n.batches++;
     const vnpu_status_t src = vnpu_stream_sync(o->stream);
     if (src != VNPU_OK) {
-        if (!o->submit_failed) {
-            o->submit_failed = true;
-            KRK_WARN("npu: the device reported an error (%s)",
-                     vnpu_status_string(src));
-        }
-        return false;
+        KRK_ERROR("npu: the device reported an error (%s) after %zu command(s); "
+                  "their outputs cannot be trusted and there is no point in the "
+                  "graph to restart from",
+                  vnpu_status_string(src), submitted);
+        std::abort();
     }
     return true;
 }

@@ -726,7 +726,6 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         return false;
     }
 
-    const i64 q_dim = static_cast<i64>(cfg_.n_head) * cfg_.head_dim;
     // No single kv_dim here on purpose: the KV width is per layer
     // (kv_dim_at(l)), and the maximum is only what the workspaces and one KV
     // slot are sized against. A local constant is how the geometry check below
@@ -907,7 +906,10 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (e) *e = "table '" + name + "' is empty";
             return false;
         }
-        if (t->n_bytes < t->n_elements * 4) {
+        // n_elements is positive (checked above) and 4 bytes wide, so the
+        // widening to size_t is exact; comparing the two types directly was a
+        // signed/unsigned mix.
+        if (t->n_bytes < static_cast<size_t>(t->n_elements) * 4u) {
             if (e)
                 *e = "table '" + name + "' is truncated (" +
                      std::to_string(t->n_bytes) + " bytes for " +
@@ -1294,8 +1296,9 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // the file's own order -- hc_head first, so nothing that loaded before
         // changes -- and the shape check below decides whether what was found is
         // a mixer at all.
-        auto head_name = [&](const char *a, const char *b) {
-            return gguf_.tensor(a) ? std::string(a) : std::string(b);
+        auto head_name = [&](const char *first, const char *second) {
+            return gguf_.tensor(first) ? std::string(first)
+                                       : std::string(second);
         };
         const std::string hc_norm = head_name("hc_head_norm.weight",
                                               "output_hc_norm.weight");
@@ -1886,8 +1889,6 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 gguf_.tensor(blk_key("blk.%d.attn_kv.weight", l)) != nullptr;
             const bool has_kv_a_mqa =
                 gguf_.tensor(blk_key("blk.%d.attn_kv_a_mqa.weight", l)) != nullptr;
-            const bool has_kv_a =
-                gguf_.tensor(blk_key("blk.%d.attn_kv_a.weight", l)) != nullptr;
             const bool has_k_b =
                 gguf_.tensor(blk_key("blk.%d.attn_k_b.weight", l)) != nullptr;
             const bool has_v_b =
@@ -2236,8 +2237,6 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     stage_bytes += static_cast<i64>(nelem * 2);
                     return true;
                 };
-                const i64 gout =
-                    static_cast<i64>(cfg_.dsv4_o_lora) * cfg_.dsv4_o_groups;
                 const i64 q_head = static_cast<i64>(cfg_.n_head) * want_latent;
                 bool staged =
                     stage16("attn_kv", L.wkv16,
@@ -3070,7 +3069,6 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // interpolated frequency already carries the 1/factor, and the kernel
     // divides the *position* by rope_scale, so leaving both would apply it
     // twice.
-    const i64 half = std::max<i64>(1, cfg_.rope_dim / 2);
     auto build_inv_freq = [](std::vector<f32> &tab, i32 n_dims, f32 base) {
         const i64 h = std::max<i32>(1, n_dims / 2);
         tab.assign(static_cast<size_t>(h), 0.0f);

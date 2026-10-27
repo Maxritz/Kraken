@@ -253,12 +253,15 @@ bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
     // layer i is the input of block i+1), and an id equal to the target's layer
     // count is the pre-final-norm state. The older spelling writes the raw
     // checkpoint ids, so the +1 is applied here.
-    if (const std::vector<i32> *tl = gguf_->get_i32_array(key(".target_layers"))) {
-        target_layers_ = *tl;
-    } else if (const std::vector<i32> *tl =
+    // One name per candidate spelling: all three used to be `tl`, which shadowed
+    // and made three different keys read like a single chain.
+    if (const std::vector<i32> *tl_primary =
+            gguf_->get_i32_array(key(".target_layers"))) {
+        target_layers_ = *tl_primary;
+    } else if (const std::vector<i32> *tl_alt =
                    gguf_->get_i32_array(dkey(".target_layers"))) {
-        target_layers_ = *tl;
-    } else if (const std::vector<i32> *tl =
+        target_layers_ = *tl_alt;
+    } else if (const std::vector<i32> *tl_ids =
                    gguf_->get_i32_array(dkey(".target_layer_ids"))) {
         // `target_layer_ids` is the checkpoint's own numbering, where an id means
         // "the output of layer i", which is the input of block i+1. That shift
@@ -268,7 +271,7 @@ bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
         if (const char *env = std::getenv("KRK_DFLASH_LAYER_OFFSET"))
             off = std::atoi(env);
         target_layers_.clear();
-        for (i32 v : *tl) target_layers_.push_back(v + off);
+        for (i32 v : *tl_ids) target_layers_.push_back(v + off);
     }
     if (target_layers_.empty()) {
         if (err) *err = "DFlash head set declares no target_layers / target_layer_ids";
@@ -1436,7 +1439,10 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
                          trace_attn_rms, rms_of(ws_x2_));
         }
         {
-            char stage[16];
+            // "post-l" + a 32-bit layer index is at most 7 + 11 = 18 characters
+            // plus the terminator; the buffer used to be 16, which snprintf
+            // would have truncated (a truncated capture name, not a crash).
+            char stage[24];
             std::snprintf(stage, sizeof(stage), "post-l%d", l);
             probe_row(stage, l);
         }
@@ -1553,9 +1559,9 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
             for (i32 v = 0; v < n_vocab; v++) {
                 for (int c = 0; c < 3; c++) {
                     if (row[v] > best[c]) {
-                        for (int d = 2; d > c; d--) {
-                            best[d] = best[d - 1];
-                            bid[d] = bid[d - 1];
+                        for (int slot = 2; slot > c; slot--) {
+                            best[slot] = best[slot - 1];
+                            bid[slot] = bid[slot - 1];
                         }
                         best[c] = row[v];
                         bid[c] = v;
