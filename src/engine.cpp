@@ -615,7 +615,6 @@ static void run_dequant_probe(Backend &be, const std::string &model_path) {
     const size_t row_bytes = dtype_row_bytes(t->type, width);
     const i64 flat_row = expert * rows_per_expert + row;
     const size_t total_rows = static_cast<size_t>(n_experts) * static_cast<size_t>(rows_per_expert);
-    const u8 *src = t->data + static_cast<size_t>(flat_row) * row_bytes;
 
     std::fprintf(stderr,
                  "[deqprobe] %s type=%s row_width=%lld experts=%lld rows/expert=%lld\n"
@@ -4583,7 +4582,6 @@ bool Engine::kv_rollback(i64 pos) {
 }
 
 bool Engine::kv_rollback_zero(i64 pos) {
-    const size_t as = be_->act_size();
     // Resolve every layer in both planes before mutating any retained bytes.
     // Otherwise K can be zeroed successfully and V can then refuse promotion,
     // leaving the cache half-rolled-back while kv_pos_ still advertises the
@@ -5328,7 +5326,12 @@ bool Engine::configure_expert_cache(std::string *err) {
         // carries a .krakenexperts.json; this is the order that needs no
         // prior run and does not concentrate the hot set in one place.
         size_t staged = 0;
-        const size_t host_reserve = krk::host_reserve_bytes(be_->host_total_bytes());
+        // Against INSTALLED RAM, not the planned tier: this sweep stages into
+        // whatever the machine really has, so the reserve it must leave is the
+        // installed one. (The run's own ceiling, sized from --ram-tier, is a
+        // different number and is applied where the tiers are planned.)
+        const size_t reserve_installed =
+            krk::host_reserve_bytes(be_->host_total_bytes());
         bool hit_host_reserve = false;
         for (i32 e = 0; e < mc.n_expert && !hit_host_reserve; e++) {
             for (i32 l = 0; l < mc.n_layer; l++) {
@@ -5339,7 +5342,7 @@ bool Engine::configure_expert_cache(std::string *err) {
                 staged += added;
                 if (added == 0) {
                     if (!krk::host_staging_fits(0, be_->host_available_bytes(),
-                                                host_reserve))
+                                                reserve_installed))
                         hit_host_reserve = true;
                     if (hit_host_reserve ||
                         model_.experts().warm_used_bytes() >=
@@ -5351,7 +5354,7 @@ bool Engine::configure_expert_cache(std::string *err) {
         if (hit_host_reserve)
             KRK_INFO("expert WARM prefetch stopped at the host RAM reserve: %.0f MiB "
                      "kept free",
-                     static_cast<f64>(host_reserve) / 1048576.0);
+                     static_cast<f64>(reserve_installed) / 1048576.0);
         const f64 stage_ms = std::chrono::duration<f64, std::milli>(
                                  std::chrono::steady_clock::now() - t0)
                                  .count();
@@ -5541,18 +5544,23 @@ bool Engine::load_draft_head(const std::string &path, std::string *err) {
         if (err) *err = why;
         return false;
     }
-    if (h->cfg().n_in != 1) {
+    // Read the geometry BEFORE the head is destroyed: both messages below name
+    // a field of the object, and deleting first made them read freed memory
+    // (harmless in practice only because nothing had reused the block yet).
+    const i32 head_n_in = h->cfg().n_in;
+    const i32 head_n_layer = h->cfg().n_layer;
+    if (head_n_in != 1) {
         delete h;
         if (err)
-            *err = "draft head: it fuses " + std::to_string(h->cfg().n_in) +
+            *err = "draft head: it fuses " + std::to_string(head_n_in) +
                    " target hidden slot(s); this engine captures the "
                    "pre-final-norm row, i.e. one";
         return false;
     }
-    if (h->cfg().n_layer != 1) {
+    if (head_n_layer != 1) {
         delete h;
         if (err)
-            *err = "draft head: " + std::to_string(h->cfg().n_layer) +
+            *err = "draft head: " + std::to_string(head_n_layer) +
                    " layer(s); this engine runs the single-block EAGLE-3 head";
         return false;
     }
@@ -6171,7 +6179,6 @@ void Engine::recurrent_reset() {
 // because the conv would otherwise have to know to skip it.
 void Engine::mamba2_forward(const LayerWeights &L, i32 l, i32 n) {
     const ModelConfig &mc = model_.cfg();
-    const size_t as = be_->act_size();
     const i64 inner = value_dim_;   // nemotron: ssm_value_dim == inner_size
     const i64 cdim = conv_dim_;     // inner + 2*n_group*d_state
     const i64 n_head = mc.ssm_dt_rank;
@@ -8586,18 +8593,6 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         const bool scan_dev_layer =
             dispatch_cap && scan_hits_dev_ != nullptr && scan_mass_dev_ != nullptr;
 
-        // The device selection needs the device probabilities, so the plan arm
-        // implies the softmax arm. Both are restricted to the plain softmax case
-        // (no sigmoid, no pre-bias): a file with either keeps the host path until
-        // the dispatch covers them.
-        // `hybrid` is decided later (from residency), so the hybrid exclusion is
-        // applied at the device-plan block instead of here -- this flag is only
-        // the device capabilities and the file's routing shape.
-        const bool dplan = dev_plan() && be_->router_softmax_supported() &&
-                           be_->router_topk_supported() && uniform_moe &&
-                           !expert_stub_ && ne <= 256 && k <= 64 &&
-                           !mc.router_sigmoid &&
-                           !(mc.router_bias_pre && L.router_bias);
         // The device activation, for the numerics measurement. The host softmax
         // below still runs -- it is the reference the drift is measured against
         // -- and the device result replaces it before selection. Restricted to
@@ -8613,14 +8608,22 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             be_->router_softmax(ws_routerp_, ws_router_, n, ne);
             // ---- the ids and weights the one-launch dispatch reads ----------
             // The dispatch picks each expert out of the DEVICE table, so this
-            // row's ids and weights have to BE on the device. They were not:
-            // ws_ids_ and ws_wts_ were allocated at init and never written, and
-            // `dplan` was computed above and never used, so the arm has been
-            // reading uninitialised VRAM since it shipped. That is the whole
-            // explanation for "it runs at speed and the text is degenerate" --
-            // the kernel was faithfully multiplying whatever bytes were there.
-            // Same normalisation and scale the host applies below, or the mix
-            // would differ from the path this replaces by more than the router.
+            // row's ids and weights have to BE on the device, and this call is
+            // what puts them there. The invariant is a subset relation, and it
+            // is what makes the arm correct rather than fast-and-wrong:
+            //
+            //     dispatch_cap  =>  ds        (dispatch_capable() contains every
+            //                                  term of ds, including
+            //                                  `device_softmax() || dev_plan()`)
+            //     dispatch_dev  =>  dispatch_cap  (its first conjunct)
+            //
+            // so a layer that dispatches has always been through this block and
+            // written ws_ids_/ws_wts_. Reading uninitialised VRAM here was a real
+            // bug once -- the arm ran at speed on degenerate text because the
+            // kernel faithfully multiplied whatever bytes were there -- and the
+            // conjunction above is what closed it. Same normalisation and scale
+            // the host applies below, or the mix would differ from the path this
+            // replaces by more than the router.
             if (dispatch_cap) {
                 be_->router_topk(ws_routerp_, n, ne, k, ws_ids_, ws_wts_,
                                  mc.expert_w_norm != 0 ? 1 : 0,
@@ -9750,9 +9753,9 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                         std::exp2(static_cast<f64>(hy_exp[static_cast<size_t>(t)]));
                     f64 mx = 0.0;
                     for (i64 j = 0; j < n_embd_; j++) {
-                        const size_t k = base + static_cast<size_t>(j);
-                        const f64 v = static_cast<f64>(hy_ffn_[k]) * sc +
-                                      static_cast<f64>(hy_out_[k]);
+                        const size_t at = base + static_cast<size_t>(j);
+                        const f64 v = static_cast<f64>(hy_ffn_[at]) * sc +
+                                      static_cast<f64>(hy_out_[at]);
                         const f64 av = std::fabs(v);
                         if (av > mx) mx = av;
                     }
@@ -9763,10 +9766,10 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                     }
                     const f64 inv = std::exp2(-static_cast<f64>(e2));
                     for (i64 j = 0; j < n_embd_; j++) {
-                        const size_t k = base + static_cast<size_t>(j);
-                        const f64 v = static_cast<f64>(hy_ffn_[k]) * sc +
-                                      static_cast<f64>(hy_out_[k]);
-                        hy_f16_[k] = fp32_to_fp16(static_cast<f32>(v * inv));
+                        const size_t at = base + static_cast<size_t>(j);
+                        const f64 v = static_cast<f64>(hy_ffn_[at]) * sc +
+                                      static_cast<f64>(hy_out_[at]);
+                        hy_f16_[at] = fp32_to_fp16(static_cast<f32>(v * inv));
                     }
                     hy_exp[static_cast<size_t>(t)] = e2;
                 }
@@ -11457,7 +11460,10 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         // the same), so this is the identical token, not an approximation.
         i32 token = 0;
         {
-        KRK_TIME_HOST("decode.sample");
+        // _N, not the default name: this sits inside decode.step's scope, and a
+        // second `krk_host_scope` would shadow the outer one (the sample span
+        // would close the step's). The rows are meant to nest.
+        KRK_TIME_HOST_N("decode.sample", krk_host_scope_sample);
         token = topk_valid_ ? topk_id_
                             : sampler.sample(logits_host_, n_vocab_);
         }
@@ -11541,11 +11547,17 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
         // block's rows differ from the stack's but whether they drift as the
         // history grows, which is what makes a long attended past hurt.
         if (!rowfid_pos_.empty()) {
+            // Half-open row buckets. The last one has no upper bound, and the
+            // bound is written as an i64 literal: `1 << 40` is an int shift,
+            // i.e. undefined behaviour, which is what this used to be.
             const char *names[4] = {"rows 0-7", "rows 8-15", "rows 16-31",
                                     "rows 32+"};
+            const i64 lo_of[4] = {0, 8, 16, 32};
+            const i64 hi_of[4] = {8, 16, 32,
+                                  std::numeric_limits<i64>::max()};
             for (int b = 0; b < 4; b++) {
-                const i64 lo = b == 0 ? 0 : (b == 1 ? 8 : (b == 2 ? 16 : 32));
-                const i64 hi = b == 0 ? 8 : (b == 1 ? 16 : (b == 2 ? 32 : 1 << 40));
+                const i64 lo = lo_of[b];
+                const i64 hi = hi_of[b];
                 i32 n = 0, top1 = 0, cap_top1 = 0;
                 f64 cos = 0.0, br = 0.0, cr = 0.0;
                 for (size_t i = 0; i < rowfid_pos_.size(); i++) {

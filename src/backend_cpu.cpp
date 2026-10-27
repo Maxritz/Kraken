@@ -995,8 +995,8 @@ public:
         f32 *af = static_cast<f32 *>(a);
         const f32 *bf = static_cast<const f32 *>(b);
         par_for(n, 8192, 2.0 * static_cast<f64>(n),
-                [&](i64 b, i64 e) {
-                    for (i64 i = b; i < e; i++) af[i] += bf[i];
+                [&](i64 lo, i64 hi) {
+                    for (i64 i = lo; i < hi; i++) af[i] += bf[i];
                 });
     }
 
