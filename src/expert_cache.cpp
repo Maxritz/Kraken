@@ -1765,6 +1765,17 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
         } else {
             // Rejected or no tier: read it in the way the cache did before the
             // tier existed, straight from the mapping through the pull path.
+            //
+            // Timed as a READ, not as a transfer. This upload IS the file read:
+            // it faults the mapping in and copies it to the device, and on the
+            // arm this cache exists for -- no WARM tier, so every miss comes
+            // here -- it is the whole I/O cost of the run. It used to sit
+            // outside every timer, and the consequence was a profile that
+            // claimed `expert-path read 0.0 ms` while the same run reported
+            // 366 MiB read from the file. `xfer` is for the DMA out of a WARM
+            // buffer, where the bytes are already in RAM.
+            MsTimer read_clock(&read_ms_,
+                               phase_sink(&pf_read_ms_, &dc_read_ms_));
             be_->upload(dsts[i]->data, t->data + static_cast<size_t>(e) * per, per);
         }
     }
