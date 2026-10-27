@@ -5,7 +5,14 @@ Kraken links the virtual-NPU engine from
 That repository ships its source as `Maxnpuxl.zip.zip` rather than as a browsable
 tree, so fixes against it are carried here and applied by hand.
 
-## `npuxl-0001-trace-timestamp-precision.patch`
+## `npuxl-0001-trace-timestamp-precision.patch` — applied upstream, retired
+
+**This one has landed in `riteshnair/npuxl-improved` and no longer needs
+applying.** Re-checked 2026-10-27: the relative-timestamp code is present in
+`src/core/runtime.cpp` on `main`, and the patch no longer applies to a fresh
+clone because of it. Kept here only as a record. Skip straight to 0002.
+
+The original description follows.
 
 38 lines against `src/core/runtime.cpp`. `write_trace` emitted start timestamps
 through a stream left at the default 6 significant digits, so an absolute
@@ -116,23 +123,45 @@ clean, `vnpu-selftest` 16/16 on unforced/scalar/avx2/avx512/avx512-novnni,
 `vnpu-fuzz 60` clean, and `vnpu-isa-parity` reports **identical int8 GEMM
 digests on all four arms** for every shape, including the K%4 and N%16 edges.
 
-## `npuxl-improved-patched.zip`
+## `npuxl-improved-full-d9eefc5.zip` — the whole tree, all fixes applied
 
-The complete npuxl tree from `Maxnpuxl.zip.zip` with patch 0001 already applied,
-for anyone who would rather take the fixed source in one piece than apply a
-diff. It differs from upstream in exactly two files:
+The complete `npuxl-improved` tree with 0002 and 0003 already applied (and
+0001, which is upstream). 132 files, including the new `README.md`, the per-ISA
+tests and the rebuilt `lib/libvnpu.*`.
+
+**Why this exists rather than a branch:** pushing to `riteshnair/npuxl-improved`
+returns 403 from this environment. The credential is a GitHub App installation
+scoped to `Kraken-x`; the API reports `permissions.push: true` because that
+reflects the account, not the installation, and writes fail with *"Resource not
+accessible by integration"*. Until the app is installed on that repository, the
+tree ships here for manual upload.
+
+Upload: extract, and push the result, or replace the repository contents with
+it. The commit history inside the zip is the three commits this file documents.
+
+### What is different from upstream
 
 ```
-src/core/runtime.cpp   +13 -1   the fix
-PATCHES.md             new      defect, reproducer, before/after, verify steps
+README.md                 new      documentation that vanished upstream
+src/kernels/kernels.cpp    +105/-1  the AVX2 int8 kernel
+src/kernels/llm.cpp        +116     vectorised per-row quantise
+src/core/runtime.cpp       +52/-4   the force-ISA fix and the refusal
+tests/isa_parity.cpp       new      cross-ISA, byte-exact comparison
+tests/bench_i8.cpp         new      public-API benchmark
+tests/bench_kernel.cpp     new      microkernel benchmark
+docs/ZEN3-AVX2.md          new      the kernel write-up
+lib/libvnpu.a, .so         rebuilt  glibc floor 2.38 -> 2.34
 ```
 
-The `lib/libvnpu.a` and `lib/libvnpu.so` inside it are the **originals from
-upstream**, not rebuilt here: they are glibc- and toolchain-specific, so
-rebuilding them on one machine and shipping the result only moves a link error
-onto someone else's. Consequence: a consumer linking those prebuilt binaries
-keeps the 10 ms grid until they rebuild from the patched source.
+### Verified from a cold extract
 
-Verified from a cold extract: `make -j` builds clean, `bin/vnpu-selftest`
-reports 16 tests / 0 failures, and `bin/vnpu-cli trace` writes
-`"ts":0.000` with distinct fine-grained start times.
+Builds clean, `vnpu-selftest` 16/16 on unforced/scalar/avx2/avx512/
+avx512-novnni, `vnpu-fuzz 60` clean, and `vnpu-isa-parity` prints **identical
+int8 GEMM and quantiser digests on all four arms** — 8 distinct values across
+32 arm-op pairs. Linked into Kraken with `-DKRK_VNPU_ROOT=<extracted tree>`:
+`kraken-tests` **4653/4653**.
+
+The `lib/` binaries are still one machine's output (gcc 12.2, glibc 2.36) and
+the README says to build from source; they are included because upstream tracks
+them and a stale archive is the silent failure this whole line of work was
+about.
