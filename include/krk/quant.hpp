@@ -233,6 +233,11 @@ void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx);
 // activation-only, so the dmin term uses it instead of recomputing it for every
 // weight row.
 void quantize_q8_row_sx(const f32 *x, i64 n, i8 *xq, f32 *dx, i32 *sx);
+// Per-four biased sums (n/4 int32), sx[i] = -32 * sum(x[4i..4i+3]). Q6_K's dot
+// is sum((q-32)*x) and its lanes own four values each, so the bias has to be
+// present once per lane; storing it already multiplied makes it the ACCUMULATOR
+// the int8 dot lands on, which costs the kernel nothing.
+void quantize_q8_row_sq4(const f32 *x, i64 n, i8 *xq, f32 *dx, i32 *sq4);
 f32 dot_q4_K_q8_sx(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx, i64 n);
 // Eight activation rows against one weight row, with the min term taken from
 // sx[] once per 256-value block instead of recomputed per row.
@@ -241,6 +246,13 @@ void dot_q4_K_q8_sx_x8(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
                        i64 out_stride);
 f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+// Q6_K with the q-32 bias taken from sq4 (per-four biased sums) and folded
+// into the integer dot, plus the eight-row prefill shape for the same.
+f32 dot_q6_K_q8_sq4(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4,
+                    i64 n);
+void dot_q6_K_q8_sq4_x8(const u8 *w, const i8 *xq, const f32 *dx,
+                        const i32 *sq4, i64 n, i64 rstride, i64 dstride,
+                        i64 sstride, f32 *out, i64 out_stride);
 // Eight rows at once, weight block decoded once. out[r*out_stride].
 void dot_q4_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);

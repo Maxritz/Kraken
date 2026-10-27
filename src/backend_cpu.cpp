@@ -379,13 +379,25 @@ public:
             // Q4_K kernel reads it; Q6_K does not. Computing it here means it is
             // done once per GEMM call instead of once per weight row.
             std::vector<i32> xs(static_cast<size_t>(rows * nb), 0);
-            for (i64 r = 0; r < rows; r++)
-                quantize_q8_row_sx(xf + r * n_in, n_in,
-                                   xq.data() + r * n_in, xd.data() + r * nb,
-                                   xs.data() + r * nb);
+            // Q6_K's scale changes every 16 values and its bias is 32*sum(16),
+            // so it needs its own array; Q4_K's is per 32. Only one is filled.
+            const i64 nq4 = n_in / 4;
+            std::vector<i32> xs4(static_cast<size_t>(rows * nq4), 0);
+            for (i64 r = 0; r < rows; r++) {
+                if (q6)
+                    quantize_q8_row_sq4(xf + r * n_in, n_in,
+                                        xq.data() + r * n_in,
+                                        xd.data() + r * nb,
+                                        xs4.data() + r * nq4);
+                else
+                    quantize_q8_row_sx(xf + r * n_in, n_in,
+                                       xq.data() + r * n_in, xd.data() + r * nb,
+                                       xs.data() + r * nb);
+            }
             const i8 *xqp = xq.data();
             const f32 *xdp = xd.data();
             const i32 *xsp = xs.data();
+            const i32 *xs4p = xs4.data();
             const u8 *wb = static_cast<const u8 *>(w);
             const i64 grain = std::max<i64>(8, std::min<i64>(256, n_out / 8));
             par_for(n_out, grain,
@@ -400,7 +412,13 @@ public:
                             // Q4_K's 144 bytes, and a Q6_K block is 210. Using
                             // it for both reads one format's bytes as the
                             // other's -- every token came out <unk>.
-                            if (!q6)
+                            if (q6)
+                                for (; r + 8 <= rows; r += 8)
+                                    dot_q6_K_q8_sq4_x8(
+                                        wr, xqp + r * n_in, xdp + r * nb,
+                                        xs4p + r * nq4, n_in, n_in, nb, nq4,
+                                        of + r * n_out + o, n_out);
+                            else
                                 for (; r + 8 <= rows; r += 8)
                                     dot_q4_K_q8_sx_x8(
                                         wr, xqp + r * n_in, xdp + r * nb,
@@ -408,8 +426,9 @@ public:
                                         of + r * n_out + o, n_out);
                             for (; r < rows; r++)
                                 of[r * n_out + o] =
-                                    q6 ? dot_q6_K_q8(wr, xqp + r * n_in,
-                                                     xdp + r * nb, n_in)
+                                    q6 ? dot_q6_K_q8_sq4(wr, xqp + r * n_in,
+                                                         xdp + r * nb,
+                                                         xs4p + r * nq4, n_in)
                                        : dot_q4_K_q8_sx(wr, xqp + r * n_in,
                                                         xdp + r * nb,
                                                         xsp + r * nb, n_in);
