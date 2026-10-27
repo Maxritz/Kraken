@@ -1289,9 +1289,24 @@ bool cpu_has_avx2() {
 std::atomic<bool> g_dot_avx2{false};
 std::atomic<bool> g_dot_avx2_set{false};
 
+// Unset means "ask the CPU". The two flags exist to choose a ROUNDING TIER,
+// not to unlock a feature: these kernels are bit-identical to the four-lane
+// path (test_vec_dot_avx2_matches_fast asserts that, not a tolerance), so a
+// host that can run them should run them without being told. Measured on
+// Tiny-Moe Q4_K_M, --cpu, 46-token prefill: 22.2 -> 47.8 tok/s prefill and
+// 13.9 -> 21.3 tok/s decode, with the same 24 greedy tokens to the byte.
+// `KRK_CPU_DOT_AVX2=0` still forces the scalar path for a bit-exactness run.
+bool dot_avx2_default() {
+#if defined(KRK_DOT_AVX2)
+    return cpu_has_avx2();
+#else
+    return false;
+#endif
+}
 bool env_dot_avx2() {
     const char *e = std::getenv("KRK_CPU_DOT_AVX2");
-    return e && e[0] != '\0' && e[0] != '0';
+    if (!e || e[0] == '\0') return dot_avx2_default();
+    return e[0] != '0';
 }
 } // namespace
 
@@ -1318,9 +1333,13 @@ namespace {
 std::atomic<bool> g_dot_fast{false};
 std::atomic<bool> g_dot_fast_set{false};
 
+// The same policy: a host whose vectors are wide enough runs the four-lane
+// order unless it is told not to. The order is the numerics tier, so
+// `KRK_CPU_DOT_FAST=0` is the way back to the strictly serial reference.
 bool env_dot_fast() {
     const char *e = std::getenv("KRK_CPU_DOT_FAST");
-    return e && e[0] != '\0' && e[0] != '0';
+    if (!e || e[0] == '\0') return dot_avx2_default() || cpu_has_avx2();
+    return e[0] != '0';
 }
 } // namespace
 
