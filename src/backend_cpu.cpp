@@ -8,6 +8,7 @@
 // here, which is why the engine asks the backend for its activation
 // type instead of assuming f16.
 #include "krk/backend.hpp"
+#include "krk/kernel_time.hpp"
 #include "krk/hc.hpp"
 #include "krk/vram_guard.hpp"
 #include "npu/npu_offload.hpp"
@@ -22,6 +23,36 @@
 namespace krk {
 
 namespace {
+// Static names so the recorder compares pointers, not strings. The dtype is in
+// the row name because "gemm_other" hid the fact that one format was 41% of a
+// decode run.
+inline const char *dtype_tag_r1(DType t, i64 n_in) {
+    const bool i8ok = (n_in % 256) == 0 && vec_dot_int8();
+    switch (t) {
+        case DType::Q4_K: return i8ok ? "gemm_q4k_i8_r1" : "gemm_q4k_x_r1";
+        case DType::Q6_K: return "gemm_q6k_r1";
+        case DType::Q3_K: return "gemm_q3k_r1";
+        case DType::Q5_K: return "gemm_q5k_r1";
+        case DType::Q8_0: return "gemm_q8_0_r1";
+        case DType::F32:  return "gemm_f32_r1";
+        case DType::F16:  return "gemm_f16_r1";
+        default:          return "gemm_oth_r1";
+    }
+}
+inline const char *dtype_tag_rn(DType t, i64 n_in) {
+    const bool i8ok = (n_in % 256) == 0 && vec_dot_int8();
+    switch (t) {
+        case DType::Q4_K: return i8ok ? "gemm_q4k_i8_rN" : "gemm_q4k_x_rN";
+        case DType::Q6_K: return "gemm_q6k_rN";
+        case DType::Q3_K: return "gemm_q3k_rN";
+        case DType::Q5_K: return "gemm_q5k_rN";
+        case DType::Q8_0: return "gemm_q8_0_rN";
+        case DType::F32:  return "gemm_f32_rN";
+        case DType::F16:  return "gemm_f16_rN";
+        default:          return "gemm_oth_rN";
+    }
+}
+
 
 // Below this many estimated flops, the pool round trip costs more
 // than the computation, so ops stay serial. Decode's elementwise ops
@@ -174,6 +205,7 @@ public:
 
     void embed(void *out, const void *tok_embd, DType tt, i64 n_vocab, i64 n_embd,
                const i32 *tokens, i64 n_tok) override {
+        KRK_KTIME("embed");
         npu_flush_();
         (void)n_vocab;
         const size_t row_bytes = dtype_row_bytes(tt, n_embd);
@@ -193,6 +225,7 @@ public:
 
     void rmsnorm(void *out, const void *x, const f32 *w, i64 rows, i64 n,
                  f32 eps, const i32 *row_exp = nullptr) override {
+        KRK_KTIME("rmsnorm");
         // `row_exp` is the residual stream's per-row storage exponent, which
         // only a backend whose activations cannot hold the range ever sets; the
         // device has no way to apply it, so a row that carries one takes the
@@ -309,6 +342,10 @@ public:
                       w, wt, n_out, n_in, rows))
             return;
         npu_flush_();
+        // One row in the table per distinct kernel, because "gemm" as a single
+        // row hides the thing that matters: a decode step and a batched
+        // prefill run different kernels and belong on different lines.
+        KRK_KTIME(rows == 1 ? dtype_tag_r1(wt, n_in) : dtype_tag_rn(wt, n_in));
         const size_t row_bytes = dtype_row_bytes(wt, n_in);
         const f32 *xf = static_cast<const f32 *>(x);
         f32 *of = static_cast<f32 *>(out);
@@ -318,8 +355,9 @@ public:
         // than inside vec_dot() is the whole point: vec_dot() is called once
         // per output element, so a per-call quantisation there would undo the
         // win it is trying to buy.
-        if (wt == DType::Q4_K && n_in > 0 && (n_in % 256) == 0 && rows > 0 &&
-            vec_dot_int8()) {
+        if ((wt == DType::Q4_K || wt == DType::Q6_K) && n_in > 0 &&
+            (n_in % 256) == 0 && rows > 0 && vec_dot_int8()) {
+            const bool q6 = wt == DType::Q6_K;
             const i64 nb = n_in / 32;
             // Owned by the CALLING thread and captured by value below. These
             // were thread_local, which looks like a free optimisation and is a
@@ -343,14 +381,21 @@ public:
                             const u8 *wr = wb + static_cast<size_t>(o) * row_bytes;
                             i64 r = 0;
                             // Eight rows share one decode of the weight block.
-                            for (; r + 8 <= rows; r += 8)
-                                dot_q4_K_q8_x8(wr, xqp + r * n_in,
-                                               xdp + r * nb, n_in, n_in, nb,
-                                               of + r * n_out + o, n_out);
+                            // Q4_K only: the tiled kernel's block stride is
+                            // Q4_K's 144 bytes, and a Q6_K block is 210. Using
+                            // it for both reads one format's bytes as the
+                            // other's -- every token came out <unk>.
+                            if (!q6)
+                                for (; r + 8 <= rows; r += 8)
+                                    dot_q4_K_q8_x8(wr, xqp + r * n_in,
+                                                   xdp + r * nb, n_in, n_in, nb,
+                                                   of + r * n_out + o, n_out);
                             for (; r < rows; r++)
                                 of[r * n_out + o] =
-                                    dot_q4_K_q8(wr, xqp + r * n_in,
-                                                xdp + r * nb, n_in);
+                                    q6 ? dot_q6_K_q8(wr, xqp + r * n_in,
+                                                     xdp + r * nb, n_in)
+                                       : dot_q4_K_q8(wr, xqp + r * n_in,
+                                                     xdp + r * nb, n_in);
                         }
                     });
             return;
@@ -404,6 +449,7 @@ public:
 
     void rope(void *q, void *k, i64 n_head, i64 n_kv, i64 hd, i64 n_tok, i64 pos0,
               const f32 *inv_freq, f32 scale, f32 frac, bool neox) override {
+        KRK_KTIME("rope");
         npu_flush_();
         rope_apply(static_cast<f32 *>(q), n_head, hd, n_tok, pos0, inv_freq, scale, frac, neox);
         rope_apply(static_cast<f32 *>(k), n_kv, hd, n_tok, pos0, inv_freq, scale, frac, neox);
@@ -464,6 +510,7 @@ public:
 
     void kv_append(void *kcache, void *vcache, const void *k, const void *v,
                    const AttnDesc &d) override {
+        KRK_KTIME("kv_append");
         npu_flush_();
         if (d.kv_int8) {
             const i64 kv_dim = d.n_kv * d.hd;
@@ -542,6 +589,7 @@ public:
 
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {
+        KRK_KTIME("attention");
         // npu_flush_ first: q is usually the output of a GEMM still queued on
         // the device, and the gather below reads it on the host.
         npu_flush_();
@@ -1032,6 +1080,7 @@ public:
 
     void silu_mul(void *out, const void *gate, const void *up, i64 n,
                   i64 row_len = 0, f32 *row_scale = nullptr) override {
+        KRK_KTIME("silu_mul");
         // The device's SwiGLU, which is this formula with its own exp: measured
         // 8.4e-05 relative against the exact silu. That is the whole accuracy
         // story of the graph arm in one place -- see npu_offload.hpp.

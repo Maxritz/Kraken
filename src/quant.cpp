@@ -1484,6 +1484,81 @@ __attribute__((target("avx2,fma"))) void dot_q4_K_q8_x8_d(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Q6_K against an int8 activation.
+//
+// Q6_K stores   w_k = d * sc_s * (q_k - 32)   q_k in 0..63, sc one int8 per 16
+// so
+//     sum(w*x) = d * sum_s sc_s * (I_s - 32*S_s)
+// with I_s = sum(q_k*x_k) and S_s = sum(x_k), both EXACT integers once x is
+// int8. Weights are read from the blocks they are stored in.
+//
+// Lane structure: maddubs puts values 0..15 in lanes 0-3 and 16..31 in lanes
+// 4-7, which is exactly where the scale changes (one sc per 16 values), so a
+// single 8-lane float vector carries both halves' scales.
+__attribute__((target("avx2,fma"))) f32 dot_q6_K_q8_d(const u8 *w, const i8 *xq,
+                                                      const f32 *dx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i c32 = _mm256_set1_epi32(32);
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 210) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[208] | (w[209] << 8)));
+        for (int half = 0; half < 2; half++) {
+            const u8 *ql = w + half * 64;
+            const u8 *qh = w + 128 + half * 32;
+            const i8 *sc = reinterpret_cast<const i8 *>(w + 192 + half * 8);
+            const __m256i qhv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qh));
+            const i64 base = nb * 256 + half * 128;
+            const f32 *dxh = dx + base / 32;
+            for (int g = 0; g < 4; g++) {
+                // Groups 0 and 1 take the LOW nibble of ql[0..31] and
+                // ql[32..63]; groups 2 and 3 take the HIGH nibble of the same
+                // 64 bytes. Reading ql+64 and ql+96 instead -- which is what
+                // the obvious bit layout suggests -- is a different tensor:
+                // measured 32% relative error against the exact dequant.
+                const __m256i qlv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(ql + 32 * (g & 1)));
+                __m256i lo4 = qlv;
+                if (g >= 2) lo4 = _mm256_srli_epi16(qlv, 4);
+                lo4 = _mm256_and_si256(lo4, kLo);
+                __m256i hi = qhv;
+                if (g) hi = _mm256_srli_epi16(qhv, 2 * g);
+                hi = _mm256_and_si256(hi, _mm256_set1_epi8(0x03));
+                hi = _mm256_slli_epi16(hi, 4);
+                const __m256i q = _mm256_or_si256(lo4, hi);
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xq + base + 32 * g));
+                const __m256i iv = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(q, xv), ones16);
+                const __m256i sv = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(ones8, xv), ones16);
+                const __m256i t = _mm256_sub_epi32(iv, _mm256_mullo_epi32(sv, c32));
+                // lanes 0-3 -> first 16 values, lanes 4-7 -> second 16, and the
+                // scale changes exactly there.
+                // Two STRIDES, and getting them confused is silent: the
+                // activation scale `dx` is one per 32 values, so the whole
+                // group shares dxh[g]; the weight scale `sc` is one per 16, so
+                // the two halves of the group take sc[2g] and sc[2g+1].
+                // Indexing dx with 2g read a neighbouring group's scale and
+                // measured 32% relative error on synthetic data.
+                const f32 s0 = d * dxh[g] * static_cast<f32>(sc[2 * g + 0]);
+                const f32 s1 = d * dxh[g] * static_cast<f32>(sc[2 * g + 1]);
+                const __m256 scale = _mm256_setr_ps(s0, s0, s0, s0, s1, s1, s1, s1);
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(t), scale, acc);
+            }
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
 std::atomic<bool> g_dot_int8{false};
 std::atomic<bool> g_dot_int8_set{false};
 
@@ -1538,6 +1613,15 @@ void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx) {
 f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 #if defined(KRK_DOT_AVX2)
     return dot_q4_K_q8_d(w, xq, dx, n);
+#else
+    (void)w; (void)xq; (void)dx; (void)n;
+    return 0.0f;
+#endif
+}
+
+f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+#if defined(KRK_DOT_AVX2)
+    return dot_q6_K_q8_d(w, xq, dx, n);
 #else
     (void)w; (void)xq; (void)dx; (void)n;
     return 0.0f;
