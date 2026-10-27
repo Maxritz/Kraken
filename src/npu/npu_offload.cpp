@@ -240,11 +240,57 @@ Offload *create(int device_index, Mode mode, std::string *why) {
     return o;
 }
 
+// Does the trace we just asked the device to write carry a usable time base?
+//
+// The device's own clock is fine; its JSON writer was not. Absolute monotonic
+// microseconds near 1.2e9 printed through an ostream at the default six
+// significant digits land on a 10 ms grid, so every command inside one cell
+// shares a start instant while its duration -- a small number, same six digits
+// -- stays exact. The trace then looks plausible and cannot answer a single
+// gap or duty-cycle question.
+//
+// The fix lives in the device's writer (patches/npuxl-0001-trace-timestamp-
+// precision.patch, which rebases timestamps to the first event), and this build
+// links whichever library the user built. So check the artifact instead of
+// trusting it: a rebased trace starts at ts 0, and anything else arrives with
+// an absolute stamp. Say so at capture time, because the alternative is a user
+// drawing conclusions from a timeline quantised by 10 ms and finding out weeks
+// later -- which is what happened here.
+static void warn_if_trace_timebase_is_absolute(const std::string &path) {
+    std::FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return;
+    char buf[4096];
+    const size_t got = std::fread(buf, 1, sizeof(buf), f);
+    std::fclose(f);
+    if (got == 0) return;
+    const char *end = buf + got;
+    const char *hit = nullptr;
+    for (const char *p = buf; p + 5 < end; p++)
+        if (p[0] == '"' && p[1] == 't' && p[2] == 's' && p[3] == '"' &&
+            p[4] == ':') {
+            hit = p + 5;
+            break;
+        }
+    if (!hit) return; // trace is on but nothing was recorded
+    const double ts = std::strtod(hit, nullptr);
+    // A rebased trace's first event is at 0 (or a few ns of rounding). An
+    // absolute monotonic stamp is >= 1e6 us -- a second of uptime -- and this
+    // box had been up for ~1000 s, so the two cases are separated by orders
+    // of magnitude rather than by a threshold anyone has to tune.
+    if (ts < 1e6) return;
+    KRK_WARN("npu: trace '%s' starts at ts=%.0f us, i.e. an ABSOLUTE stamp, so "
+             "its start times are quantised to ~10 ms (only durations are "
+             "exact). Apply patches/npuxl-0001-trace-timestamp-precision.patch "
+             "to the NPU engine and relink; tools/trace_stats.py detects this "
+             "and withholds the derived numbers.", path.c_str(), ts);
+}
+
 void destroy(Offload *o) {
     if (!o) return;
     flush(o);
     if (o->stream) vnpu_stream_destroy(o->stream);
     if (o->dev) vnpu_device_destroy(o->dev);
+    if (!o->trace_path.empty()) warn_if_trace_timebase_is_absolute(o->trace_path);
     delete o;
 }
 

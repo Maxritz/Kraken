@@ -9893,7 +9893,27 @@ void Engine::fetch_logits(bool device_only) {
     // a boolean is invisible until you measure the thing it controls.
     if (device_only && topk_argmax(&topk_id_)) return;
     topk_valid_ = false;
-    if (logits_sync()) be_->sync();
+    if (logits_sync()) {
+        // Name the drain, because in whole-graph mode this call is not the
+        // head's cost -- it is the forward pass's unpaid bill.
+        //
+        // The offload batches a run of device ops and submits them at the
+        // first host op. `decode.forward` therefore returns once the layer's
+        // work has been *issued*, and the wait for it lands on whichever host
+        // call flushes next. That used to be this one, so "decode.logits.dev"
+        // absorbed ~0.7 ms/token of layer work and the output projection read
+        // as 13-16% of a decode run. The same head GEMM measures 0.001 ms/call
+        // on the arm that flushes every call, and the device executes it in
+        // 127 us, so the row was reporting someone else's time.
+        //
+        // Splitting the wait into its own row makes the arithmetic add up:
+        // head + drain is the span, and drain is the part that scales with how
+        // much of the layer stack is still in flight. Nothing is made faster by
+        // this; a profile that misattributes a cost is how a search for a
+        // 13% win starts in the wrong place, which is exactly what happened.
+        KRK_TIME_HOST_N("decode.drain", drain_scope);
+        be_->sync();
+    }
     be_->download_f32(logits_host_, ws_logits_, n_vocab_);
     // Gemma 2/3/4 cap the *final* logits. This is the one place logits become
     // host-visible, so every path (plain, speculative, draft) gets the bound for
