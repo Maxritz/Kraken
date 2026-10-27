@@ -153,8 +153,8 @@ faster.
 | MoE 2 GiB prefill (T=128) | 4.7 tok/s | 28.0 tok/s | 6.0x |
 | MoE 2 GiB decode | ~260 ms/step | 58.9 ms/step | 4.3x |
 
-Exactness witness: **4576/4576 checks unchanged** across the change, golden
-hashes included. Full record, method, block-format limits and remaining
+Exactness witness: **4576/4576 checks unchanged** across the change (4621/4621
+with the opt-in block-format test added), golden hashes included. Full record, method, block-format limits and remaining
 headroom: [BENCH-CPU-DOT.md](BENCH-CPU-DOT.md).
 
 Known limits, stated because they are the next person's starting point:

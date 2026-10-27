@@ -199,6 +199,39 @@ numeric deviation, measured on real quantized rows.
   same order, so they are exact either way).
 - 4621/4621 with the flag off, which is the default path being unchanged.
 
+### 5.4 The flag in context: all six arms
+
+The flag is not only a CPU-backend switch. The NPU path takes the transformer
+GEMMs the device has opcodes for and leaves the rest on the host, so a third of
+its prefill is still `vec_dot`, and the block formats there are the same code.
+Measured on the same fixture and prompt, best-of-2 interleaved, one binary:
+
+| arm | prefill | tok/s | decode | vs `--cpu` prefill |
+|---|---:|---:|---:|---:|
+| `--cpu` | 13657.8 ms | 8.93 | 132.2 ms | 1.00x |
+| `--cpu` + fast dot | 4570.2 ms | 26.69 | 48.7 ms | 2.99x |
+| `--npu-cpu` | 5916.9 ms | 20.62 | 108.1 ms | 2.31x |
+| `--npu-cpu` + fast dot | **3021.1 ms** | **40.38** | 74.6 ms | **4.52x** |
+| `--npu-cpu` + `KRK_NPU_W8A8=1` | 3258.2 ms | 37.44 | **31.2 ms** | 4.19x |
+| `--npu-cpu` + both | 3363.0 ms | 36.28 | 32.0 ms | 4.06x |
+
+Two things this table settles:
+
+- **The best prefill arm is `--npu-cpu` with the fast dot** (4.52x over the
+  default CPU path), and **the best decode arm is w8a8** (31.2 ms/step, 4.2x).
+  They are different arms: w8a8 pays a re-quantise of every activation row, which
+  is cheap at one row per step and not cheap at 122 rows, so it wins decode and
+  loses prefill to the fast dot.
+- **w8a8 is not a prefill regression.** It is 1.82x faster than the f32 NPU arm
+  on prefill (5916.9 -> 3258.2 ms) despite the extra `QUANTIZE_I8` pass. An
+  earlier draft of this work claimed the opposite; the arm had been measured
+  against a baseline that inherited `KRK_CPU_DOT_FAST=1` from the shell, so the
+  comparison silently gave the fast dot to one side only.
+
+That last point is worth stating as a rule: **an A/B harness must set the
+environment of every arm explicitly, including the arms that want a variable
+absent.** `env -u` in the harness, not a variable left exported in a terminal.
+
 ## 6. What the 2 GiB MoE actually showed about experts and disk
 
 The engine keeps experts in three tiers: HOT (resident, 512 MiB budgeted here),
@@ -248,8 +281,9 @@ P="the quick brown fox jumps over the lazy dog the quick brown fox"
 ```
 
 The correctness witness is not a hash table in this document: it is
-`kraken-tests`, 4576 checks, of which the numeric golden hashes are the ones
-that would move if the dot product had changed.
+`kraken-tests` -- 4576 checks at the time of that change, 4621 after section 5's
+opt-in test was added -- of which the numeric golden hashes are the ones that
+would move if the dot product had changed.
 
 ## 8. Remaining headroom, honestly
 
