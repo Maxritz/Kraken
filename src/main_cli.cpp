@@ -99,6 +99,7 @@ struct Args {
     bool draft_tokens_given = false;
     bool cpu = false;
     bool npu = false;
+    bool npu_cpu = false;
     bool greedy = false;
     bool tokenize = false;
     // Print one hash of the prompt's last-position logits and exit (see
@@ -171,6 +172,19 @@ void usage() {
         "                        rest of the graph stays on the scalar\n"
         "                        reference, so numbers match the CPU arm\n"
         "                        to f32 rounding rather than bit-exactly\n"
+        "  --npu-cpu             run the WHOLE inference through the virtual\n"
+        "                        NPU: every op the device has (GEMM, RMSNorm,\n"
+        "                        SwiGLU, add, mul) is issued to it, and the\n"
+        "                        ops it lacks keep the reference body. 11x the\n"
+        "                        prefill and 2.5x the decode of --cpu on a\n"
+        "                        4-layer 512-dim fixture, and within noise of\n"
+        "                        --npu (the GEMM dominates both). Not\n"
+        "                        bit-identical to --cpu: its silu is the\n"
+        "                        device's own and is measured 8.4e-05\n"
+        "                        relative off; it still reproduces --cpu's\n"
+        "                        greedy trajectory on that fixture.\n"
+        "                        KRK_NPU_MIN_ELEMS=N sends only ops of N or\n"
+        "                        more elements to the device (0 = all).\n"
         "  --expert-cache-mb N   MoE expert residency budget in MiB (0 = auto)\n"
         "  --host-ram-mb N       host memory to plan for, in MiB. 0 uses a\n"
         "                        quarter of installed RAM. Bounds every host\n"
@@ -530,6 +544,7 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--chat") a->chat = true;
         else if (f == "--cpu") a->cpu = true;
         else if (f == "--npu") a->npu = true;
+        else if (f == "--npu-cpu") a->npu_cpu = true;
         else if (f == "--info") a->info = true;
         else if (f == "--bench") a->bench = true;
         else if (f == "--profile") a->profile = true;
@@ -1400,12 +1415,17 @@ int main(int argc, char **argv) {
 
     std::string err;
     Backend *be = nullptr;
-    if (a.cpu && a.npu) {
-        KRK_WARN("--cpu and --npu both given; the reference backend wins");
+    if (a.cpu && (a.npu || a.npu_cpu)) {
+        KRK_WARN("--cpu and --npu/--npu-cpu both given; the reference backend wins");
+        a.npu = false;
+        a.npu_cpu = false;
+    }
+    if (a.npu && a.npu_cpu) {
+        KRK_WARN("--npu and --npu-cpu both given; --npu-cpu (the whole graph) wins");
         a.npu = false;
     }
-    if (a.npu) {
-        be = make_npu_backend(a.device, &err);
+    if (a.npu || a.npu_cpu) {
+        be = make_npu_backend(a.device, a.npu_cpu, &err);
         if (!be) {
             KRK_WARN("%s", err.c_str());
             KRK_WARN("falling back to the CPU reference backend");

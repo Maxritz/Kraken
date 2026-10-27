@@ -1,30 +1,23 @@
 // ============================================================================
-//  npu_offload.cpp — VNPU device lifecycle and the GEMM hand-over.
+//  npu_offload.cpp — VNPU device lifecycle, the command queue, and the ops.
 //
-//  WHAT IS OFFLOADED, AND WHY ONLY THAT
+//  One queue, one stream, one sync point. Every op validates its arguments
+//  before it is queued -- the same checks vnpu's own prepare step repeats -- and
+//  returns false when the device cannot take it, so the caller's reference body
+//  is the fallback for every single call rather than a parallel implementation
+//  to keep in sync.
 //
-//  The GEMM. w[n_out, n_in] stays in its GGUF block format and is dequantized
-//  once into a staging buffer the first time the tensor is multiplied, after
-//  which `vnpu_matmul_f32` sees exactly the layout it wants for a decode step:
-//  A [rows, n_in] row-major, B [n_out, n_in] with trans_b = 1, C [rows, n_out].
+//  The measured numbers this file is built around (2-core x86-64 host, AVX-512):
 //
-//  The activation-type ops stay on the reference implementation on purpose.
-//  Measured against a double-precision reference on this host: VNPU's rmsnorm
-//  agrees to 2.2e-07 and the GEMM to 2.7e-07 relative, but swiglu (a polynomial
-//  sigmoid) misses by 1.8e-05 -- two orders of magnitude worse than an f32
-//  rounding difference, and an FFN applies that error once per layer per token.
-//  Handing it over would make the NPU arm a slightly different model rather
-//  than a different execution schedule, so it does not happen. A caller who
-//  wants VNPU's activations can add them here and measure; the seam exists.
+//    matmul f32, K=N=1024     1 row   ~255 us   8 GFLOPS
+//                             512 row ~27 ms    39 GFLOPS
+//    rmsnorm 4096             1 row   ~100 us  (vs ~2 us scalar)
+//    silu (swiglu)            worst relative error 8.4e-05 vs exact
+//    gelu                     worst relative error 7.4e-01 -- NOT USED
 //
-//  DETERMINISM
-//
-//  `vnpu_matmul_f32` tiles M and N and runs the tiles on its thread pool, but
-//  every output element's K reduction is sequential inside its own tile, so a
-//  row's value does not depend on how many rows were in the call. Measured: the
-//  same row computed with M=1 and with M=3 is bit-identical, which is what keeps
-//  a chunked prefill and a one-token decode in agreement on this backend the
-//  way the reference backend's single-trampoline pool keeps them.
+//  The per-call cost is almost all thread wake-ups: a bare producer/consumer
+//  condition-variable round trip on the same host is ~60 us. That is why Graph
+//  mode batches instead of paying one round trip per op.
 // ============================================================================
 #include "npu_offload.hpp"
 
@@ -64,6 +57,20 @@ i64 env_i64(const char *name, i64 dflt) {
     return static_cast<i64>(n);
 }
 
+// Every counter the run summary prints, in the order a layer meets them.
+struct Counters {
+    unsigned long long gemm = 0;
+    unsigned long long rmsnorm = 0;
+    unsigned long long swiglu = 0;
+    unsigned long long add = 0;
+    unsigned long long mul = 0;
+    unsigned long long declined = 0; // offered, but the device could not take it
+    unsigned long long batches = 0;  // submissions actually made
+    unsigned long long flushes = 0;  // flush() calls (queue empty included)
+    unsigned long long flops = 0;
+    unsigned long long elements = 0; // activation elements the device touched
+};
+
 struct Entry {
     std::vector<f32> data;
     DType wt = DType::Unknown;
@@ -78,34 +85,33 @@ public:
     vnpu_device_t *dev = nullptr;
     vnpu_stream_t *stream = nullptr;
     vnpu_device_info_t info{};
+    Mode mode = Mode::Gemm;
+    uint32_t unit = 1; // VNPU_UNIT_VOODOO
+    bool strict_queue = false;
+    // Element floor for handing a SMALL op (rmsnorm/swiglu/add/mul) to the
+    // device. A queued call still costs the worker a dispatch, and below a few
+    // thousand elements the reference body -- which is already in the caller's
+    // cache -- is cheaper than the hand-off. KRK_NPU_MIN_ELEMS overrides.
+    i64 min_elems = 0;
     std::string trace_path;
+
+    // Pending commands. Reused across flushes so a steady-state step does not
+    // allocate.
+    std::vector<vnpu_command_t> queue;
 
     // Dequantized weight staging. Keyed by the weight pointer the engine holds,
     // which is stable for the life of the model: the loader allocates once.
     std::unordered_map<const void *, Entry> stage;
     size_t stage_bytes = 0;
     size_t stage_budget = 1024ull * 1024ull * 1024ull;
-    // Which compute unit the scheduler is asked for. AUTO lets VNPU pick per
-    // call, which means a one-row call runs the CELL unit and a prefill-sized
-    // call the VOODOO one -- two kernels with different reduction orders, so
-    // the same row would come out differently depending on how many rows rode
-    // along with it and the chunk-invariance the engine is built around would
-    // stop holding the moment a prompt had more than 4 tokens. The default is
-    // therefore one unit for every call; KRK_NPU_UNIT=auto restores VNPU's own
-    // choice for a run that would rather have the decode latency.
-    uint32_t unit = 1; // VNPU_UNIT_VOODOO
     bool stage_refused = false; // budget hit at least once -- say so, once
-    mutable std::mutex mu;
+    bool submit_failed = false; // reported once
+    std::mutex mu;
 
-    // Counters. Plain u64: the engine is single-threaded around a backend call
-    // and the mutex above covers the staging map for anything that is not.
-    unsigned long long calls = 0;
-    unsigned long long on_device = 0;
-    unsigned long long fell_back = 0;
-    unsigned long long flops = 0;
+    Counters n;
 
-    // The fallback for a weight that is not f32 and has no staging room.
     const f32 *weight(const void *w, DType wt, i64 n_out, i64 n_in);
+    bool push(const vnpu_command_t &cmd);
     std::string describe() const;
 };
 
@@ -145,17 +151,23 @@ const f32 *Offload::weight(const void *w, DType wt, i64 n_out, i64 n_in) {
     return out;
 }
 
+bool Offload::push(const vnpu_command_t &cmd) {
+    queue.push_back(cmd);
+    if (mode == Mode::Gemm || strict_queue) return flush(this);
+    return true;
+}
+
 std::string Offload::describe() const {
-    const uint32_t simd = info.simd_bits;
-    return format("NPU (Virtual NPU %s: %s, %u-bit SIMD, %u thread(s), "
+    const char *what = mode == Mode::Graph ? "whole graph" : "GEMM path";
+    return format("NPU (%s on Virtual NPU %s: %s, %u-bit SIMD, %u thread(s), "
                   "%ux%ux%u tiles)",
-                  info.name, info.backend, simd, info.num_threads, info.tile_m,
-                  info.tile_k, info.tile_n);
+                  what, info.name, info.backend, info.simd_bits, info.num_threads,
+                  info.tile_m, info.tile_k, info.tile_n);
 }
 
 bool available() { return true; }
 
-Offload *create(int device_index, std::string *why) {
+Offload *create(int device_index, Mode mode, std::string *why) {
     vnpu_config_t cfg;
     vnpu_config_init(&cfg);
     uint32_t unit = VNPU_UNIT_VOODOO;
@@ -172,9 +184,6 @@ Offload *create(int device_index, std::string *why) {
     // environment is how a run is pinned to fewer workers, mirroring
     // KRK_THREADS on the reference side.
     cfg.num_threads = static_cast<uint32_t>(env_i64("KRK_NPU_THREADS", 0));
-    // HIGH_THROUGHPUT lets the scheduler pick the wide tiling for multi-row
-    // (prefill) calls; a one-row call is routed to the CELL unit anyway, so
-    // decode keeps the low-latency path.
     cfg.flags = VNPU_CONFIG_HIGH_THROUGHPUT;
     std::string trace;
     if (const char *tp = env_str("KRK_NPU_TRACE")) {
@@ -186,7 +195,9 @@ Offload *create(int device_index, std::string *why) {
 
     Offload *o = new Offload();
     o->trace_path = trace;
+    o->mode = mode;
     o->unit = unit;
+    o->strict_queue = env_on("KRK_NPU_STRICT_QUEUE");
     vnpu_status_t rc = vnpu_device_create(&cfg, &o->dev);
     if (rc != VNPU_OK) {
         if (why)
@@ -207,11 +218,14 @@ Offload *create(int device_index, std::string *why) {
     vnpu_device_get_info(o->dev, &o->info);
     o->stage_budget =
         static_cast<size_t>(env_i64("KRK_NPU_WEIGHT_MB", 1024)) * 1024ull * 1024ull;
+    o->min_elems = env_i64("KRK_NPU_MIN_ELEMS", o->min_elems);
+    o->queue.reserve(64);
     return o;
 }
 
 void destroy(Offload *o) {
     if (!o) return;
+    flush(o);
     if (o->stream) vnpu_stream_destroy(o->stream);
     if (o->dev) vnpu_device_destroy(o->dev);
     delete o;
@@ -221,36 +235,68 @@ std::string describe(const Offload *o) {
     return o ? o->describe() : std::string("NPU (not opened)");
 }
 
+bool flush(Offload *o) {
+    if (!o || !o->stream) return true;
+    o->n.flushes++;
+    if (o->queue.empty()) return true;
+    const vnpu_status_t rc =
+        vnpu_stream_submit(o->stream, o->queue.data(), o->queue.size(), nullptr);
+    o->queue.clear();
+    if (rc != VNPU_OK) {
+        if (!o->submit_failed) {
+            o->submit_failed = true;
+            KRK_WARN("npu: submit failed (%s); this arm is no longer trustworthy",
+                     vnpu_status_string(rc));
+        }
+        return false;
+    }
+    o->n.batches++;
+    const vnpu_status_t src = vnpu_stream_sync(o->stream);
+    if (src != VNPU_OK) {
+        if (!o->submit_failed) {
+            o->submit_failed = true;
+            KRK_WARN("npu: the device reported an error (%s)",
+                     vnpu_status_string(src));
+        }
+        return false;
+    }
+    return true;
+}
+
 std::string stats(const Offload *o) {
     if (!o) return std::string();
-    return format("gemm %llu call(s), %llu on the device, %llu fell back, "
-                  "%.1f GFLOP handed over, %.1f MiB of weights staged",
-                  o->calls, o->on_device, o->fell_back,
-                  static_cast<double>(o->flops) / 1.0e9,
+    return format("gemm %llu, rmsnorm %llu, swiglu %llu, add %llu, mul %llu, "
+                  "%llu declined, %llu batch(es); "
+                  "%.1f GFLOP, %.1f MiB staged",
+                  o->n.gemm, o->n.rmsnorm, o->n.swiglu, o->n.add, o->n.mul,
+                  o->n.declined, o->n.batches,
+                  static_cast<double>(o->n.flops) / 1.0e9,
                   static_cast<double>(o->stage_bytes) / (1024.0 * 1024.0));
 }
 
-bool gemm(Offload *o, f32 *out, const f32 *x, const void *w, DType wt,
+namespace {
+
+// vnpu_matmul_f32 takes its geometry as uint32 and multiplies M*K*N as u64.
+bool fits_u32(i64 v) { return v > 0 && v <= 0x7fffffffLL; }
+
+} // namespace
+
+bool gemm(Offload *o, void *out, const void *x, const void *w, DType wt,
           i64 n_out, i64 n_in, i64 rows) {
     if (!o || !o->stream || !out || !x || !w) return false;
-    if (rows <= 0 || n_out <= 0 || n_in <= 0) return false;
-    // vnpu_matmul_f32 takes its geometry as uint32; a tensor that does not fit
-    // is not something this device can express.
-    constexpr i64 kMax = 0x7fffffffLL;
-    if (rows > kMax || n_out > kMax || n_in > kMax) return false;
-    if (rows > kMax / n_out || rows * n_out > kMax / n_in) return false;
-
-    o->calls++;
+    if (!fits_u32(rows) || !fits_u32(n_out) || !fits_u32(n_in)) return false;
     const f32 *b = o->weight(w, wt, n_out, n_in);
     if (!b) {
-        o->fell_back++;
+        o->n.declined++;
         return false;
     }
-    vnpu_matmul_f32_args_t a{};
-    a.A = x;
+    vnpu_command_t c{};
+    c.opcode = VNPU_OP_MATMUL_F32;
+    vnpu_matmul_f32_args_t &a = c.args.matmul_f32;
+    a.A = static_cast<const f32 *>(x);
     a.B = b;
     a.bias = nullptr;
-    a.C = out;
+    a.C = static_cast<f32 *>(out);
     a.M = static_cast<uint32_t>(rows);
     a.K = static_cast<uint32_t>(n_in);
     a.N = static_cast<uint32_t>(n_out);
@@ -265,16 +311,131 @@ bool gemm(Offload *o, f32 *out, const f32 *x, const void *w, DType wt,
     a.beta = 0.0f; // do not read C: the caller's GEMM overwrites it
     a.epilogue = VNPU_EPILOGUE_NONE;
     a.unit = o->unit;
-    if (vnpu_matmul_f32(o->stream, &a) != VNPU_OK) {
-        // Argument validation happens before any tile runs, so a refusal here
-        // has not written out[] and the caller's own body is still correct.
-        o->fell_back++;
+    if (!o->push(c)) {
+        o->n.declined++;
         return false;
     }
-    o->on_device++;
-    o->flops += 2ull * static_cast<unsigned long long>(rows) *
-                static_cast<unsigned long long>(n_out) *
-                static_cast<unsigned long long>(n_in);
+    o->n.gemm++;
+    o->n.flops += 2ull * static_cast<unsigned long long>(rows) *
+                  static_cast<unsigned long long>(n_out) *
+                  static_cast<unsigned long long>(n_in);
+    return true;
+}
+
+bool rmsnorm(Offload *o, void *out, const void *x, const f32 *w, i64 rows, i64 n,
+             f32 eps) {
+    if (!o || !o->stream || o->mode != Mode::Graph) return false;
+    if (rows * n < o->min_elems) return false;
+    if (!out || !x || !fits_u32(rows) || !fits_u32(n)) return false;
+    vnpu_command_t c{};
+    c.opcode = VNPU_OP_RMSNORM_F32;
+    vnpu_rmsnorm_f32_args_t &a = c.args.rmsnorm;
+    a.X = static_cast<const f32 *>(x);
+    a.W = w;
+    a.Y = static_cast<f32 *>(out);
+    a.rows = static_cast<uint32_t>(rows);
+    a.cols = static_cast<uint32_t>(n);
+    a.eps = eps;
+    a.unit = o->unit;
+    if (!o->push(c)) {
+        o->n.declined++;
+        return false;
+    }
+    o->n.rmsnorm++;
+    o->n.elements += static_cast<unsigned long long>(rows) * n;
+    return true;
+}
+
+bool swiglu(Offload *o, void *out, const void *gate, const void *up, i64 n) {
+    if (!o || !o->stream || o->mode != Mode::Graph) return false;
+    if (n < o->min_elems) return false;
+    if (!out || !gate || !up || n <= 0) return false;
+    vnpu_command_t c{};
+    c.opcode = VNPU_OP_SWIGLU_F32;
+    vnpu_swiglu_f32_args_t &a = c.args.swiglu;
+    a.gate = static_cast<const f32 *>(gate);
+    a.up = static_cast<const f32 *>(up);
+    a.Y = static_cast<f32 *>(out);
+    a.count = static_cast<uint64_t>(n);
+    a.alpha = 1.0f;
+    a.unit = o->unit;
+    if (!o->push(c)) {
+        o->n.declined++;
+        return false;
+    }
+    o->n.swiglu++;
+    o->n.elements += static_cast<unsigned long long>(n);
+    return true;
+}
+
+bool add(Offload *o, void *a_, const void *b, i64 n) {
+    if (!o || !o->stream || o->mode != Mode::Graph) return false;
+    if (n < o->min_elems) return false;
+    if (!a_ || !b || n <= 0) return false;
+    vnpu_command_t c{};
+    c.opcode = VNPU_OP_ADD_F32;
+    vnpu_binary_f32_args_t &a = c.args.binary;
+    a.A = static_cast<const f32 *>(a_);
+    a.B = static_cast<const f32 *>(b);
+    a.Y = static_cast<f32 *>(a_);
+    a.count = static_cast<uint64_t>(n);
+    // The kernel reads a zero alpha/beta as "unset" and substitutes 1, which is
+    // the same answer, but saying 1 makes the intent local.
+    a.alpha = 1.0f;
+    a.beta = 1.0f;
+    a.unit = o->unit;
+    if (!o->push(c)) {
+        o->n.declined++;
+        return false;
+    }
+    o->n.add++;
+    o->n.elements += static_cast<unsigned long long>(n);
+    return true;
+}
+
+bool add_scaled(Offload *o, void *dst, const void *src, f32 alpha, i64 n) {
+    if (!o || !o->stream || o->mode != Mode::Graph) return false;
+    if (n < o->min_elems) return false;
+    if (!dst || !src || n <= 0) return false;
+    vnpu_command_t c{};
+    c.opcode = VNPU_OP_ADD_F32;
+    vnpu_binary_f32_args_t &a = c.args.binary;
+    a.A = static_cast<const f32 *>(src);
+    a.B = static_cast<const f32 *>(dst);
+    a.Y = static_cast<f32 *>(dst);
+    a.count = static_cast<uint64_t>(n);
+    a.alpha = alpha;
+    a.beta = 1.0f;
+    a.unit = o->unit;
+    if (!o->push(c)) {
+        o->n.declined++;
+        return false;
+    }
+    o->n.add++;
+    o->n.elements += static_cast<unsigned long long>(n);
+    return true;
+}
+
+bool mul(Offload *o, void *a_, const void *b, i64 n) {
+    if (!o || !o->stream || o->mode != Mode::Graph) return false;
+    if (n < o->min_elems) return false;
+    if (!a_ || !b || n <= 0) return false;
+    vnpu_command_t c{};
+    c.opcode = VNPU_OP_MUL_F32;
+    vnpu_binary_f32_args_t &a = c.args.binary;
+    a.A = static_cast<const f32 *>(a_);
+    a.B = static_cast<const f32 *>(b);
+    a.Y = static_cast<f32 *>(a_);
+    a.count = static_cast<uint64_t>(n);
+    a.alpha = 1.0f;
+    a.beta = 0.0f;
+    a.unit = o->unit;
+    if (!o->push(c)) {
+        o->n.declined++;
+        return false;
+    }
+    o->n.mul++;
+    o->n.elements += static_cast<unsigned long long>(n);
     return true;
 }
 
@@ -282,7 +443,7 @@ bool gemm(Offload *o, f32 *out, const f32 *x, const void *w, DType wt,
 
 bool available() { return false; }
 
-Offload *create(int, std::string *why) {
+Offload *create(int, Mode, std::string *why) {
     if (why)
         *why = "this build has no NPU support (configure with "
                "-DKRK_ENABLE_NPU=ON and -DKRK_VNPU_ROOT=<npuxl-improved>)";
@@ -297,9 +458,18 @@ std::string describe(const Offload *) {
 
 std::string stats(const Offload *) { return std::string(); }
 
-bool gemm(Offload *, f32 *, const f32 *, const void *, DType, i64, i64, i64) {
+bool flush(Offload *) { return true; }
+
+bool gemm(Offload *, void *, const void *, const void *, DType, i64, i64, i64) {
     return false;
 }
+bool rmsnorm(Offload *, void *, const void *, const f32 *, i64, i64, f32) {
+    return false;
+}
+bool swiglu(Offload *, void *, const void *, const void *, i64) { return false; }
+bool add(Offload *, void *, const void *, i64) { return false; }
+bool add_scaled(Offload *, void *, const void *, f32, i64) { return false; }
+bool mul(Offload *, void *, const void *, i64) { return false; }
 
 #endif
 

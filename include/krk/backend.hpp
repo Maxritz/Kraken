@@ -1637,12 +1637,13 @@ Backend *make_cpu_backend();
 // Compiled only when KRK_ENABLE_HIP is defined (see CMakeLists.txt).
 Backend *make_hip_backend(int device_index, std::string *err);
 
-// The virtual-NPU backend: the same reference implementation, with the GEMM
-// path handed to a VNPU device (github.com/riteshnair/npuxl-improved). Compiled
-// only when KRK_ENABLE_NPU is defined (see CMakeLists.txt); otherwise
-// make_npu_backend() returns nullptr and *err says so. `err` is filled on
-// failure in both cases.
-Backend *make_npu_backend(int device_index, std::string *err);
+// The virtual-NPU backend: the same reference implementation, with the compute
+// handed to a VNPU device (github.com/riteshnair/npuxl-improved) — the whole
+// GEMM path for `mode` = false, and every op the device has for `mode` = true
+// (`--npu` vs `--npu-cpu`). Compiled only when KRK_ENABLE_NPU is defined (see
+// CMakeLists.txt); otherwise make_npu_backend() returns nullptr and *err says
+// so. `err` is filled on failure in both cases.
+Backend *make_npu_backend(int device_index, bool whole_graph, std::string *err);
 // True when this build has NPU support compiled in (the device itself may
 // still fail to open).
 bool npu_available();

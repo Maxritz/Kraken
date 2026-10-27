@@ -13326,20 +13326,25 @@ static void test_mla_backend() {
 }
 
 // The virtual-NPU backend: github.com/riteshnair/npuxl-improved, reached
-// through src/npu/npu_offload.cpp. Two things are worth a gate here.
+// through src/npu/npu_offload.cpp. There are two arms of it and this group
+// gates both.
 //
-// The first is the seam itself: a backend selection that quietly returned the
+//   --npu      the GEMM path only: >95% of a transformer's FLOPs, and the one
+//              VNPU op whose numerics are within f32 rounding of the reference.
+//   --npu-cpu  `whole_graph`: every op the device has, which adds RMSNorm,
+//              SwiGLU, add and mul. Its nonlinearities run the device's own
+//              `fast_expf`, so this arm is NOT bit-identical -- the gate is a
+//              measured bound, not equality, and the bound is asserted here so
+//              a device that got worse cannot pass quietly.
+//
+// Three things are worth a gate. The seam (a factory that quietly returned the
 // CPU backend would still run every model correctly, so the only way to know
-// the option exists is to ask the factory for it and then ask the object it
-// returns what it is. That is what the kind()/describe()/stats() checks do.
-//
-// The second is the GEMM hand-over's numerics. The device reduces K in its own
-// order, so its result cannot be bit-identical to the reference dot product --
-// and it must not be off by more than f32 rounding either, or an "accelerated"
-// arm quietly decodes a different model. So this compares the device against
-// the reference on the same inputs, in both weight formats the offload accepts
-// (f32 straight through, f16 through the dequantizing staging cache), at a
-// decode-shaped call and a prefill-shaped one.
+// the option exists is to ask for it and ask the object what it is). The GEMM's
+// numerics, in both weight formats the offload accepts. And the whole-graph
+// arm's three properties: each routed op is within its documented bound of the
+// reference, the queue and the strict one-submit-per-op path produce identical
+// numbers (which is what proves no host op reads a row the device has not
+// written), and the ops the device does NOT have still run.
 static void test_npu_backend() {
     // The reference backend answers the new capability question the way the
     // engine's device tiers need it to: no memory of its own.
@@ -13355,7 +13360,7 @@ static void test_npu_backend() {
 
     if (!npu_available()) {
         std::string why;
-        Backend *b = make_npu_backend(0, &why);
+        Backend *b = make_npu_backend(0, /*whole_graph=*/true, &why);
         CHECK(b == nullptr,
               "a build without -DKRK_ENABLE_NPU cannot open the device");
         CHECK(why.find("KRK_ENABLE_NPU") != std::string::npos,
@@ -13365,7 +13370,7 @@ static void test_npu_backend() {
     }
 
     std::string why;
-    Backend *npu = make_npu_backend(0, &why);
+    Backend *npu = make_npu_backend(0, /*whole_graph=*/false, &why);
     CHECK(npu != nullptr, why.empty() ? "the virtual NPU opens" : why.c_str());
     if (!npu) return;
     Backend *cpu = make_cpu_backend();
@@ -13457,13 +13462,189 @@ static void test_npu_backend() {
     // ---- the counters the run summary prints -------------------------------
     {
         const std::string stats = npu->backend_stats();
-        CHECK(stats.find("on the device") != std::string::npos,
-              "the offload reports its call counts");
-        CHECK(stats.find(" 0 on the device") == std::string::npos,
-              "and those counts are not zero after the calls above");
+        CHECK(stats.find("gemm ") != std::string::npos,
+              "the offload reports its per-op call counts");
+        CHECK(stats.find("gemm 0,") == std::string::npos,
+              "and the GEMM count is not zero after the calls above");
+        CHECK(stats.find("host: rope, attention") != std::string::npos,
+              "and names the ops that stayed on the host");
+    }
+    delete npu;
+
+    // =======================================================================
+    //  --npu-cpu: the whole graph through the device
+    // =======================================================================
+    Backend *graph = make_npu_backend(0, /*whole_graph=*/true, &why);
+    CHECK(graph != nullptr,
+          why.empty() ? "the whole-graph NPU backend opens" : why.c_str());
+    if (!graph) {
+        delete cpu;
+        return;
+    }
+    CHECK(graph->describe().find("whole graph") != std::string::npos,
+          "and says so in its banner, so a run cannot be mistaken for the "
+          "GEMM-only arm");
+    CHECK(graph->kind() == BackendKind::NPU, "it is still an NPU backend");
+    CHECK(!graph->has_device_memory(), "still computing in host memory");
+
+    // ---- RMSNorm: f32 rounding, not equality (the device reduces in SIMD) --
+    {
+        const i64 rows = 3, n = 256;
+        std::vector<f32> x(static_cast<size_t>(rows * n)), wgt(static_cast<size_t>(n));
+        for (f32 &v : x) v = rnd();
+        for (i64 i = 0; i < n; i++) wgt[static_cast<size_t>(i)] = 0.5f + 0.5f * std::fabs(rnd());
+        std::vector<f32> got(x.size(), 0.0f), want(x.size(), 0.0f);
+        cpu->rmsnorm(want.data(), x.data(), wgt.data(), rows, n, 1e-5f);
+        graph->rmsnorm(got.data(), x.data(), wgt.data(), rows, n, 1e-5f);
+        graph->sync(); // the routed ops are queued; sync is what submits them
+        f64 worst = 0.0, mag = 0.0;
+        for (size_t i = 0; i < got.size(); i++) {
+            worst = std::max<f64>(worst, std::fabs(static_cast<f64>(got[i]) - want[i]));
+            mag = std::max<f64>(mag, std::fabs(want[i]));
+        }
+        CHECK(mag > 0.0 && worst / mag < 2e-6,
+              "the device's RMSNorm matches the reference to f32 rounding");
     }
 
-    delete npu;
+    // ---- SwiGLU: the documented 1e-4 bound, measured not assumed ----------
+    // This is the whole accuracy story of the arm: the device's silu is its own
+    // polynomial, so a bound is what the arm can promise. The number below is
+    // 8.4e-05 measured on the device; the gate holds it under 2e-4 and would
+    // fail if a future device made it worse.
+    {
+        const i64 n = 2048;
+        std::vector<f32> g(static_cast<size_t>(n)), u(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; i++) {
+            g[static_cast<size_t>(i)] = -12.0f + 24.0f * static_cast<f32>(i) / static_cast<f32>(n - 1);
+            u[static_cast<size_t>(i)] = 1.0f; // isolate the activation itself
+        }
+        std::vector<f32> got(static_cast<size_t>(n), 0.0f), want(static_cast<size_t>(n), 0.0f);
+        cpu->silu_mul(want.data(), g.data(), u.data(), n);
+        graph->silu_mul(got.data(), g.data(), u.data(), n);
+        graph->sync();
+        // Relative to each element's own value, ignoring the ones a silu sends
+        // to zero (there the absolute error is what matters and it is smaller).
+        f64 worst = 0.0, rel = 0.0;
+        for (i64 i = 0; i < n; i++) {
+            const f64 wv = want[static_cast<size_t>(i)];
+            const f64 d = std::fabs(static_cast<f64>(got[static_cast<size_t>(i)]) - wv);
+            worst = std::max(worst, d);
+            if (std::fabs(wv) > 1e-3) rel = std::max(rel, d / std::fabs(wv));
+        }
+        CHECK(rel < 2e-4,
+              rel < 2e-4 ? "the device's SwiGLU stays inside the arm's documented "
+                           "2e-4 relative bound"
+                         : "the device's SwiGLU has drifted outside the bound the "
+                           "arm documents -- check whether npuxl changed its exp");
+        std::printf("       (npu swiglu: worst %.3e absolute, %.3e relative)\n",
+                    worst, rel);
+    }
+
+    // ---- add / axpy / mul are exact: same expression, same order ----------
+    {
+        const i64 n = 512;
+        std::vector<f32> a(static_cast<size_t>(n)), b(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; i++) {
+            a[static_cast<size_t>(i)] = rnd();
+            b[static_cast<size_t>(i)] = rnd();
+        }
+        std::vector<f32> ga = a, gb = b, wa = a, wb = b;
+        graph->add_inplace(ga.data(), gb.data(), n);
+        graph->sync();
+        cpu->add_inplace(wa.data(), wb.data(), n);
+        CHECK(std::memcmp(ga.data(), wa.data(), static_cast<size_t>(n) * 4) == 0,
+              "the device's add is bit-identical to the reference's");
+        ga = a;
+        graph->axpy(ga.data(), b.data(), 0.25f, n);
+        graph->sync();
+        wa = a;
+        cpu->axpy(wa.data(), b.data(), 0.25f, n);
+        CHECK(std::memcmp(ga.data(), wa.data(), static_cast<size_t>(n) * 4) == 0,
+              "and so is axpy, scale included");
+        ga = a;
+        graph->mul_act(ga.data(), b.data(), n);
+        graph->sync();
+        wa = a;
+        cpu->mul_act(wa.data(), b.data(), n);
+        CHECK(std::memcmp(ga.data(), wa.data(), static_cast<size_t>(n) * 4) == 0,
+              "and mul");
+    }
+
+    // ---- the queue: batching must not change a single number --------------
+    // The whole-graph arm queues ops and submits them in one batch, and every
+    // host-implemented op flushes first. If that discipline had a hole -- one
+    // host kernel reading a row the device had not written yet -- the two
+    // submission policies would disagree. This builds a layer-shaped sequence
+    // that mixes routed and host ops (rmsnorm -> add -> silu -> mul -> a host
+    // op) and requires the two arms to produce identical bytes.
+    {
+        auto chain = [&](Backend *be, std::vector<f32> *out) {
+            const i64 n = 128;
+            std::vector<f32> x(static_cast<size_t>(n)), y(static_cast<size_t>(n));
+            std::vector<f32> gate(static_cast<size_t>(n)), up(static_cast<size_t>(n));
+            u32 seed = 0xfeed1234u;
+            auto r2 = [&]() {
+                seed = seed * 1664525u + 1013904223u;
+                return static_cast<f32>((seed >> 8) & 0xFFFFu) / 32768.0f - 1.0f;
+            };
+            for (i64 i = 0; i < n; i++) {
+                x[static_cast<size_t>(i)] = r2();
+                y[static_cast<size_t>(i)] = r2();
+                gate[static_cast<size_t>(i)] = 4.0f * r2();
+                up[static_cast<size_t>(i)] = r2();
+            }
+            std::vector<f32> g(static_cast<size_t>(n), 0.0f), u(static_cast<size_t>(n), 0.0f);
+            be->rmsnorm(g.data(), x.data(), nullptr, 1, n, 1e-5f);   // queued
+            be->add_inplace(g.data(), y.data(), n);                  // queued
+            be->silu_mul(u.data(), gate.data(), up.data(), n);       // queued
+            be->mul_act(g.data(), u.data(), n);                      // queued
+            // A host op that reads what the queue just produced. If the flush
+            // discipline were wrong this would read stale bytes.
+            const std::vector<f32> bias(static_cast<size_t>(n), 0.5f);
+            be->add_bias_rows(g.data(), bias.data(), n, 1);
+            *out = g;
+        };
+        std::vector<f32> batched, strict;
+        chain(graph, &batched);
+        set_env_var("KRK_NPU_STRICT_QUEUE", "1");
+        {
+            std::string w2;
+            Backend *strict_be = make_npu_backend(0, /*whole_graph=*/true, &w2);
+            if (strict_be) {
+                chain(strict_be, &strict);
+                delete strict_be;
+            }
+        }
+        clear_env_var("KRK_NPU_STRICT_QUEUE");
+        CHECK(!strict.empty() &&
+                  std::memcmp(batched.data(), strict.data(),
+                              batched.size() * sizeof(f32)) == 0,
+              "one batch per layer and one submit per op leave the same bytes: "
+              "no host kernel reads a row the device has not written");
+    }
+
+    // ---- the ops the device does not have still run -----------------------
+    // gelu is deliberately NOT offloaded (the device's is 0.74 relative off),
+    // so the reference body must still be what runs there.
+    {
+        std::vector<f32> xg(64), xc(64);
+        for (size_t i = 0; i < xg.size(); i++)
+            xg[i] = xc[i] = -4.0f + 0.125f * static_cast<f32>(i);
+        graph->gelu_act(xg.data(), static_cast<i64>(xg.size()));
+        cpu->gelu_act(xc.data(), static_cast<i64>(xc.size()));
+        CHECK(std::memcmp(xg.data(), xc.data(), xg.size() * sizeof(f32)) == 0,
+              "the GeGLU activation is the reference's: the device's own gelu "
+              "measures 0.74 relative off and is not used");
+    }
+
+    {
+        const std::string gs = graph->backend_stats();
+        CHECK(gs.find("rmsnorm 0,") == std::string::npos,
+              "the summary counts the RMSNorms the device ran");
+        CHECK(gs.find("swiglu 0,") == std::string::npos, "and the SwiGLUs");
+    }
+
+    delete graph;
     delete cpu;
 }
 

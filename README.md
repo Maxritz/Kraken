@@ -102,9 +102,8 @@ is a scalar f32 reference, and it is what the device path is checked against.
 
 The compute backend is selectable: HIP, the scalar CPU reference, or the virtual
 NPU from [npuxl-improved](https://github.com/riteshnair/npuxl-improved) — a
-dependency-free software device that runs the GEMM path on its own SIMD kernels
-(AVX2 / AVX-512 / NEON / scalar). Build the device first, then the engine against
-it:
+dependency-free software device that runs on its own SIMD kernels (AVX2 /
+AVX-512 / NEON / scalar). Build the device first, then the engine against it:
 
 ```sh
 git clone https://github.com/riteshnair/npuxl-improved
@@ -119,33 +118,76 @@ cmake --build build-npu -j
 build-npu/kraken -m model.gguf -p "The capital of France is" -n 64 --npu
 ```
 
-`--npu` is per run, so the same binary still runs the reference arm (`--cpu`) for
-comparison. What goes to the device is the GEMM — the whole of the model's
-weight math, and the one VNPU op whose numerics agree with the reference to f32
-rounding. The activation-type ops stay on the reference implementation on
-purpose: VNPU's swiglu is a polynomial sigmoid that measures 1.8e-05 off on small
-inputs, two orders of magnitude worse than an f32 rounding difference, and an FFN
-applies it once per layer per token. Handing that over would make the NPU arm a
-slightly different model rather than a different execution schedule.
-`src/npu/npu_offload.hpp` has the full argument.
+Both arms are per run, so the same binary still runs the reference arm (`--cpu`)
+for comparison:
+
+| arm | what runs on the device | what stays on the reference |
+| --- | --- | --- |
+| `--npu` | the GEMM: all of the model's weight math | everything else |
+| `--npu-cpu` | the GEMM plus RMSNorm (and `qk_norm`), SwiGLU, add, and mul | rope, attention, the KV cache, embedding, MoE routing and top-k, the SSM / MLA / hyper-connection blocks |
+
+`--npu` is the conservative arm: the GEMM is the one VNPU op whose numerics
+agree with the reference to f32 rounding (measured 2.7e-07 relative), so the run
+differs from `--cpu` in the last bits and nowhere else. `--npu-cpu` adds the ops
+whose results are defined by a nonlinearity — and a nonlinearity is where a
+device stops agreeing to the last bit. Its SwiGLU runs VNPU's own `fast_expf`
+(a degree-5 polynomial for 2^x) rather than libm: measured **8.4e-05 relative**
+against the exact silu, which is still better than an f16 activation's 5e-04 and
+still a different rounding of the same model, not a different model. `add`,
+`axpy` and `mul` are bit-identical to the reference; RMSNorm is f32 rounding.
+VNPU's `gelu` is *not* used at all — it measures 5.5e-03 absolute and 0.74
+relative on the tails — so a GeGLU model keeps the reference activation on both
+arms. `src/npu/npu_offload.hpp` has the full argument, op by op.
+
+Measured on this box (2 cores, AVX-512 VNNI) against a 4-layer 512-dim llama
+fixture, 88-token prefill then 64-token greedy decode, min of 5:
+
+| arm | prefill | decode |
+| --- | --- | --- |
+| `--cpu` | 1393 ms (63 tok/s) | 63.5 tok/s |
+| `--npu` | 128 ms (689 tok/s) | 159.7 tok/s |
+| `--npu-cpu` | 125 ms (706 tok/s) | 153.1 tok/s |
+
+So the GEMM is the whole story at this size: both NPU arms are ~11x the
+reference on prefill and ~2.5x on decode, and `--npu-cpu` is within noise of
+`--npu`, not faster than it — the extra ops are 512-1376 elements per call,
+which the reference body does in a few microseconds from cache. Routing them
+is not free but it is close to it, and it is the arm to read the whole graph
+through. `KRK_NPU_MIN_ELEMS=N` sends only ops of N or more elements to the
+device, which is how to skip the hand-off for tiny calls (0, the default, sends
+everything).
+
+What the two arms do *not* change:
+
+- **Chunk invariance still holds.** Each arm prints the same `--prefill-hash`
+  for `--chunk 8`, `128` and `512` (and each arm's hash differs from the
+  others', which is the point of having them).
+- **Batching loses nothing.** `KRK_NPU_STRICT_QUEUE=1` submits and waits on
+  every single call instead of one batch per host boundary, and produces
+  byte-identical output — that is the control that proves no host kernel reads
+  a row the device has not written.
+- **The greedy trajectory survives the rounding.** On that fixture `--cpu`,
+  `--npu` and `--npu-cpu` all produce the same 128-token greedy text. That is a
+  coherence check, not an accuracy claim; the accuracy claim is the 8.4e-05
+  above, measured directly against the reference activation.
 
 Every GEMM call is pinned to one compute unit by default (`KRK_NPU_UNIT=voodoo`;
 `cell` and `wildcat` are the other fixed choices), because VNPU's `auto` picks a
 different kernel for a one-row call than for a prefill-sized one and the
-chunk-invariance
-the engine is built around would stop holding as soon as a prompt had more than
-four tokens. `KRK_NPU_UNIT=auto` restores VNPU's own choice. The run summary
-carries the split:
+chunk-invariance the engine is built around would stop holding as soon as a
+prompt had more than four tokens. `KRK_NPU_UNIT=auto` restores VNPU's own
+choice. The run summary carries the split, per op and with the host ops named:
 
 ```
-[stats ] npu       gemm 87 call(s), 87 on the device, 0 fell back, 0.7 GFLOP handed over, 22.5 MiB of weights staged
+[stats ] npu       gemm 3712, rmsnorm 1152, swiglu 512, add 1024, mul 0, 0 declined, 640 batch(es); 4.7 GFLOP, 50.2 MiB staged; host: rope, attention, kv cache, embedding, MoE routing, top-k, ssm/MLA/HC blocks (no VNPU opcode)
 ```
 
 Other knobs: `KRK_NPU_THREADS` (device workers, 0 = hardware concurrency),
 `KRK_NPU_WEIGHT_MB` (dequantized weight staging budget, default 1024),
-`KRK_NPU_PIN_THREADS=1` and `KRK_NPU_TRACE=file.json` (VNPU's own Chrome trace).
+`KRK_NPU_MIN_ELEMS` (small-op floor, see above), `KRK_NPU_PIN_THREADS=1` and
+`KRK_NPU_TRACE=file.json` (VNPU's own Chrome trace).
 A weight tensor that does not fit the staging budget stays on the reference
-path, counted in `fell back`, and says so once.
+path, counted in `declined`, and says so once.
 
 ## Run
 
