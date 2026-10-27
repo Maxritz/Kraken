@@ -8754,6 +8754,73 @@ static std::string read_capture(const std::string &path) {
     return s;
 }
 
+// The gemma 2 / gemma 3 schema as the engine reads it, in one fixture: GeGLU,
+// the embedding scale, per-head QK-norm, the alternating window, the
+// final-logit bound, and -- on gemma2 only -- the bound on the ATTENTION
+// logits. `with_attn_cap` builds the same file without that key, which is the
+// control: if the two files hash the same, the key is not being read.
+static bool build_gemma_gate_model(const std::string &path, const char *arch,
+                                   bool with_attn_cap, int ctx = 64) {
+    const int n_embd = 256, n_layer = 4, n_head = 4, n_kv = 2, hd = 64;
+    const int n_ff = 512, vocab = 261;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string a = arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", std::string("kraken-") + arch + "-gate");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(a + ".block_count", n_layer);
+    b.meta_u32(a + ".context_length", ctx);
+    b.meta_u32(a + ".embedding_length", n_embd);
+    b.meta_u32(a + ".feed_forward_length", n_ff);
+    b.meta_u32(a + ".attention.head_count", n_head);
+    b.meta_u32(a + ".attention.head_count_kv", n_kv);
+    b.meta_u32(a + ".attention.key_length", hd);
+    b.meta_f32(a + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(a + ".rope.freq_base", 10000.0f);
+    // A window short enough to bite on a 55-token prompt: half the layers are
+    // windowed by the arch's pattern, so the windowed arm is exercised on every
+    // token rather than only past 1024.
+    b.meta_u32(a + ".attention.sliding_window", 6);
+    b.meta_f32(a + ".final_logit_softcapping", 30.0f);
+    if (with_attn_cap) b.meta_f32(a + ".attention.logit_softcapping", 50.0f);
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+        b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, 100 + l * 1000));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, 200 + l * 1000));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, 300 + l * 1000));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, 400 + l * 1000));
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, 500 + l * 1000));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, 900 + l * 1000));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, 1300 + l * 1000));
+    }
+    return b.write(path);
+}
+
 struct PrefillProbe {
     bool ok = false;
     std::string trace;  // hash of the prefill's rows (see --prefill-hash)
@@ -9758,6 +9825,123 @@ static void test_prefill_chunk_bitexact() {
         std::remove("kraken-prefill-gate-512.gguf");
     }
 
+}
+
+// The gemma families, driven end to end through the CLI: load, schema flags,
+// per-layer window selection, the final-logit bound, gemma2's attention-logit
+// bound, and the prefill rows all have to agree with themselves across chunk
+// sizes before "gemma2 is supported" means anything. That is what this group
+// measures, on fixtures built here rather than on a file nobody in this
+// collection has.
+//
+// Three arms per family. Chunk 1 threads every prompt row through the
+// decode-shaped single-row forward, so it stands in for token generation; chunk
+// 8 and 32 take the multi-row paths. One hash across the three is the gate. The
+// fourth check is the control that keeps it honest: for gemma2 the same file
+// with the softcapping key removed must hash DIFFERENTLY, or the key is being
+// ignored and the gate above would pass on a model that never applied the
+// bound.
+static void test_gemma_family_chunk_gate() {
+    const std::string self = self_path();
+    const std::filesystem::path exe_p =
+        std::filesystem::path(self).parent_path() /
+#ifdef _WIN32
+        "kraken.exe";
+#else
+        "kraken";
+#endif
+    const std::string exe = exe_p.string();
+    const bool have_exe = !self.empty() && std::filesystem::exists(exe_p);
+    CHECK(have_exe, "kraken sits beside kraken-tests (this gate drives it)");
+    if (!have_exe) return;
+
+    std::string prompt;
+    for (int i = 0; i < 55; i++) prompt += (i ? " the" : "the");
+
+    struct Fam {
+        const char *arch;
+        bool cap;
+        const char *file;
+    };
+    const Fam fams[] = {
+        {"gemma2", true, "kraken-gemma2-gate.gguf"},
+        {"gemma3", false, "kraken-gemma3-gate.gguf"},
+    };
+    for (const Fam &f : fams) {
+        CHECK(build_gemma_gate_model(f.file, f.arch, f.cap),
+              (std::string("wrote the ") + f.arch + " fixture this gate prefills")
+                  .c_str());
+        const PrefillProbe c1 = run_prefill_hash(exe, f.file, prompt, 1, false);
+        const PrefillProbe c8 = run_prefill_hash(exe, f.file, prompt, 8, false);
+        const PrefillProbe c32 = run_prefill_hash(exe, f.file, prompt, 32, false);
+        CHECK(c1.ok, (std::string(f.arch) + " loads and prefills at chunk 1").c_str());
+        CHECK(c8.ok, (std::string(f.arch) + " loads and prefills at chunk 8").c_str());
+        CHECK(c32.ok,
+              (std::string(f.arch) + " loads and prefills at chunk 32").c_str());
+        if (!c1.ok || !c8.ok || !c32.ok) {
+            std::fprintf(stderr, "  (%s: rc %d/%d/%d stderr: %.400s)\n", f.arch,
+                         c1.rc, c8.rc, c32.rc, c1.err.c_str());
+            continue;
+        }
+        // A load that silently fell back to the llama schema would still
+        // produce a hash; the banner's layer/window line is what says the
+        // family's own schema was read.
+        std::printf("       %s chunk  1 trace %s logits %s\n", f.arch,
+                    c1.trace.c_str(), c1.logits.c_str());
+        std::printf("       %s chunk  8 trace %s logits %s\n", f.arch,
+                    c8.trace.c_str(), c8.logits.c_str());
+        std::printf("       %s chunk 32 trace %s logits %s\n", f.arch,
+                    c32.trace.c_str(), c32.logits.c_str());
+        // The count is the tokenizer's answer, not this test's: what matters is
+        // that the prompt spans several chunks (so every arm's last write is a
+        // multi-row one at some point) and that all three arms see the same
+        // sequence. 55 words tokenizes to >= 40 pieces on this vocab.
+        CHECK(c1.prompt_tokens >= 40 &&
+                  c1.prompt_tokens == c8.prompt_tokens &&
+                  c8.prompt_tokens == c32.prompt_tokens,
+              (std::string(f.arch) + ": every arm tokenizes the same prompt")
+                  .c_str());
+        CHECK(c1.trace == c8.trace && c8.trace == c32.trace,
+              (c1.trace == c8.trace && c8.trace == c32.trace
+                   ? std::string(f.arch) +
+                         ": chunk 1, 8 and 32 leave the same rows, so prefill "
+                         "and decode agree across the window and the softcaps"
+                   : std::string(f.arch) +
+                         ": the chunk sizes DISAGREE -- the multi-row forward "
+                         "is not the decode formulation")
+                  .c_str());
+        CHECK(c1.logits == c32.logits,
+              (std::string(f.arch) +
+               ": and the logits row agrees bit for bit")
+                  .c_str());
+
+        // Token generation on the same file: a greedy decode must run and
+        // print text (a load that refused, or a NaN forward, prints nothing).
+        int rc = -1;
+        const std::string txt =
+            run_generate_text(exe, f.file, prompt.substr(0, 40), 1, 8, f.arch, rc);
+        CHECK(rc == 0 && !txt.empty(),
+              (std::string(f.arch) +
+               ": decodes 8 greedy tokens without failing")
+                  .c_str());
+    }
+
+    // ---- the control: gemma2's bound is READ, not decorative --------------
+    const std::string capped = "kraken-gemma2-gate.gguf";
+    const std::string nokey = "kraken-gemma2-nocap.gguf";
+    CHECK(build_gemma_gate_model(nokey, "gemma2", false),
+          "wrote the same gemma2 file without attention.logit_softcapping");
+    const PrefillProbe a = run_prefill_hash(exe, capped, prompt, 8, false);
+    const PrefillProbe bcap = run_prefill_hash(exe, nokey, prompt, 8, false);
+    CHECK(a.ok && bcap.ok, "both gemma2 files prefill");
+    if (a.ok && bcap.ok) {
+        CHECK(a.trace != bcap.trace,
+              a.trace != bcap.trace
+                  ? "the softcapping key changes the model: cap*tanh(score/cap) "
+                    "is applied, not ignored"
+                  : "the softcapping key is IGNORED -- the two files prefill "
+                    "byte-identically, so gemma2's bound is not applied");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -17613,6 +17797,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_rope_pair_convention)
     TEST_GROUP(test_end_to_end_cpu)
     TEST_GROUP(test_prefill_chunk_bitexact)
+    TEST_GROUP(test_gemma_family_chunk_gate)
     TEST_GROUP(test_lfm2_shortconv)
     TEST_GROUP(group_attention_sinks)
     TEST_GROUP(test_moe_schema_and_laziness)
