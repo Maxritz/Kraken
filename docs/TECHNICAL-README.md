@@ -159,10 +159,15 @@ headroom: [BENCH-CPU-DOT.md](BENCH-CPU-DOT.md).
 
 Known limits, stated because they are the next person's starting point:
 
-- The **block formats (q8_0/q4_0) do not get this win** and cannot, while
-  staying exact: their reduction is a single dependent chain. q4_0 is *half the
-  bytes of q8_0 and 30% slower* for that reason. Fixing it means changing the
-  numbers, so it has to be an opt-in with an accuracy witness.
+- The **block formats (q8_0/q4_0) do not get this win by default** and cannot,
+  while staying exact: their reduction is a single dependent chain, and q4_0 is
+  *half the bytes of q8_0 and 30% slower* for that reason. The opt-in is
+  `KRK_CPU_DOT_FAST=1` — four accumulators instead of one, **3.07x / 2.71x** on
+  a q8_0 MoE (prefill / decode) and 1.98x / 2.02x on q4_0, at a cost of up to
+  1.4e-07 of the term magnitude. While it is on, the CPU arm is **no longer a
+  bit-exact oracle**, so turn it off before comparing against `--device` or
+  `--npu`. Witness and numbers: `tools/dot_fast_witness.py`,
+  [BENCH-CPU-DOT.md](BENCH-CPU-DOT.md) §5.
 - Dense weights are re-read once per row of `x`. Inverting the loop is not
   enough (`vec_dot` re-widens each call); it needs a widened row reused across
   a row block, with output blocking to keep the activation block in L2.
@@ -187,6 +192,12 @@ Two optimisations, both opt-in and both measured:
 |---|---|---|
 | `KRK_NPU_W8A8=1` | int8 weight staging for the device | 1.12-1.14x prefill on small stacks, up to 3.6x on medium ones |
 | `KRK_NPU_ATTN=1` | runs attention on the device when the call is expressible | +10.3% prefill at 257 tokens, +25.6% at 513, decode unchanged |
+
+And on the CPU side, independent of the NPU:
+
+| switch | what it does | measured |
+|---|---|---|
+| `KRK_CPU_DOT_FAST=1` | four accumulators in the block-format dot (q4_0/q8_0/q5/q6) | 3.07x prefill / 2.71x decode on q8_0, ~2x on q4_0; up to 1.4e-07 of the term magnitude different, so the CPU arm stops being the bit-exact oracle while it is set |
 
 Attention is **off by default because of chunk invariance, not accuracy**: the
 device kernel is invariant on its own, but the host/device *switch* is a

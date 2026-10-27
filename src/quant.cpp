@@ -5,7 +5,9 @@
 // tests/test_quant.cpp, so keep the two in lockstep when editing.
 #include "krk/quant.hpp"
 
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 
 #if defined(__F16C__) && defined(__FMA__) && \
     (defined(__x86_64__) || defined(__i386__))
@@ -1174,6 +1176,30 @@ void dequant_row_f16(DType t, const void *src, u16 *out, i64 n) {
     }
 }
 
+namespace {
+std::atomic<bool> g_dot_fast{false};
+std::atomic<bool> g_dot_fast_set{false};
+
+bool env_dot_fast() {
+    const char *e = std::getenv("KRK_CPU_DOT_FAST");
+    return e && e[0] != '\0' && e[0] != '0';
+}
+} // namespace
+
+void set_vec_dot_fast(bool on) {
+    g_dot_fast.store(on, std::memory_order_relaxed);
+    g_dot_fast_set.store(true, std::memory_order_relaxed);
+}
+
+bool vec_dot_fast() {
+    if (!g_dot_fast_set.load(std::memory_order_relaxed)) {
+        // One racy init: every thread that gets here writes the same value.
+        g_dot_fast.store(env_dot_fast(), std::memory_order_relaxed);
+        g_dot_fast_set.store(true, std::memory_order_relaxed);
+    }
+    return g_dot_fast.load(std::memory_order_relaxed);
+}
+
 f32 vec_dot(DType t, const void *src, const f32 *x, i64 n) {
     // The unquantized formats have no block structure, so widen them directly
     // rather than routing through the block loop (which would look for a
@@ -1266,7 +1292,50 @@ f32 vec_dot(DType t, const void *src, const f32 *x, i64 n) {
         return s;
     }
     const int bs = dtype_block_size(t);
+    const int bb = dtype_block_bytes(t);
     f32 buf[256];
+    if (vec_dot_fast()) {
+        // Four lanes over the widened block. dequant_block is unchanged, so the
+        // VALUES are identical to the loop below; only the summation order
+        // differs. See the contract on set_vec_dot_fast in krk/quant.hpp.
+        f32 tail = 0.0f;
+        const u8 *p = static_cast<const u8 *>(src);
+        i64 i = 0;
+#if defined(KRK_DOT_F16C)
+        __m128 acc = _mm_setzero_ps();
+        while (i < n) {
+            const int cnt = static_cast<int>((n - i) < bs ? (n - i) : bs);
+            dequant_block(t, p, buf);
+            int k = 0;
+            for (; k + 4 <= cnt; k += 4)
+                acc = _mm_fmadd_ps(_mm_loadu_ps(buf + k),
+                                   _mm_loadu_ps(x + i + k), acc);
+            for (; k < cnt; k++) tail += buf[k] * x[i + k];
+            i += cnt;
+            p += bb;
+        }
+        alignas(16) f32 a[4];
+        _mm_store_ps(a, acc);
+        return ((a[0] + a[1]) + (a[2] + a[3])) + tail;
+#else
+        f32 acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+        while (i < n) {
+            const int cnt = static_cast<int>((n - i) < bs ? (n - i) : bs);
+            dequant_block(t, p, buf);
+            int k = 0;
+            for (; k + 4 <= cnt; k += 4) {
+                acc0 += buf[k] * x[i + k];
+                acc1 += buf[k + 1] * x[i + k + 1];
+                acc2 += buf[k + 2] * x[i + k + 2];
+                acc3 += buf[k + 3] * x[i + k + 3];
+            }
+            for (; k < cnt; k++) tail += buf[k] * x[i + k];
+            i += cnt;
+            p += bb;
+        }
+        return ((acc0 + acc1) + (acc2 + acc3)) + tail;
+#endif
+    }
     f32 sum = 0;
     const u8 *p = static_cast<const u8 *>(src);
     i64 i = 0;
@@ -1275,7 +1344,7 @@ f32 vec_dot(DType t, const void *src, const f32 *x, i64 n) {
         dequant_block(t, p, buf);
         for (int k = 0; k < cnt; k++) sum += buf[k] * x[i + k];
         i += cnt;
-        p += dtype_block_bytes(t);
+        p += bb;
     }
     return sum;
 }
