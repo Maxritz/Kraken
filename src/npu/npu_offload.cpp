@@ -21,6 +21,8 @@
 // ============================================================================
 #include "npu_offload.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +60,9 @@ i64 env_i64(const char *name, i64 dflt) {
     return static_cast<i64>(n);
 }
 
+// vnpu_matmul_f32 takes its geometry as uint32 and multiplies M*K*N as u64.
+bool fits_u32(i64 v) { return v > 0 && v <= 0x7fffffffLL; }
+
 // Every counter the run summary prints, in the order a layer meets them.
 struct Counters {
     unsigned long long gemm = 0;
@@ -70,6 +75,12 @@ struct Counters {
     unsigned long long flushes = 0;  // flush() calls (queue empty included)
     unsigned long long flops = 0;
     unsigned long long elements = 0; // activation elements the device touched
+    // W8A8 (KRK_NPU_W8A8): GEMMs the int8 path took, and GEMMs it handed back
+    // to the device's f32 kernel because a weight or a scratch buffer did not
+    // fit. A fallback is not a silent substitution -- it is the more accurate
+    // path on the same device -- but it is counted so a run can say so.
+    unsigned long long w8a8_gemm = 0;
+    unsigned long long w8a8_fallback = 0;
 };
 
 struct Entry {
@@ -77,6 +88,15 @@ struct Entry {
     DType wt = DType::Unknown;
     i64 n_out = 0;
     i64 n_in = 0;
+};
+
+// A weight the device has packed into its own int8 layout. The handle belongs
+// to this layer and is released with vnpu_packed_weights_destroy at teardown;
+// `bytes` is what the pack actually costs (n_out*n_in, a quarter of the f32
+// staging entry for the same tensor), so the two budgets are comparable.
+struct EntryI8 {
+    vnpu_packed_weights_t *packed = nullptr;
+    size_t bytes = 0;
 };
 
 } // namespace
@@ -106,12 +126,46 @@ public:
     size_t stage_bytes = 0;
     size_t stage_budget = 1024ull * 1024ull * 1024ull;
     bool stage_refused = false; // budget hit at least once -- say so, once
+
+    // ---- int8 weights (KRK_NPU_W8A8) ------------------------------------
+    //
+    // Decode is bandwidth-bound on the f32 staging cache (measured: 50.2 MiB
+    // staged feeds 290-315 tok/s on a 4-layer fixture, i.e. ~12-15 GiB/s), so
+    // the only lever left that is not a better kernel is FEWER BYTES. The
+    // device's int8 GEMM multiplies a packed int8 weight by int8 activations
+    // and multiplies both scales back in, which quarters the weight traffic and
+    // measured 1.54x on the decode GEMM overhead-free.
+    //
+    // It is opt-in and it is lossy: W8A8 quantizes the activations too, because
+    // the device has no "int8 weights x f32 activations" op. Measured worst
+    // case on the probe: 3.36e-03 absolute, 3.32e-04 relative to the row peak.
+    bool w8a8 = false;
+    std::unordered_map<const void *, EntryI8> stage_i8;
+    size_t stage_i8_bytes = 0;
+    // Activation scratch for the int8 path: one int8 row block plus the
+    // per-row scale the quantize op writes. Reused across calls; the stream is
+    // ordered, so a later call may reuse the buffer while earlier commands are
+    // still queued -- but a RESIZE must flush first, or a queued command would
+    // be left pointing at freed storage.
+    std::vector<int8_t> a8;
+    std::vector<f32> a_scale;
+
     std::mutex mu;
 
     Counters n;
 
     const f32 *weight(const void *w, DType wt, i64 n_out, i64 n_in);
+    // The same weight, packed for the device's int8 GEMM. nullptr means the
+    // caller must fall back -- the device could not pack it, or the staging
+    // budget is spent.
+    vnpu_packed_weights_t *weight_i8(const void *w, DType wt, i64 n_out,
+                                     i64 n_in);
     bool push(const vnpu_command_t &cmd);
+    // Several commands submitted as one batch. The int8 GEMM is a quantize
+    // followed by a matmul; submitting them separately would pay two round
+    // trips per GEMM on the arm that flushes every call, which is the arm the
+    // int8 path exists to speed up.
+    bool push_batch(const vnpu_command_t *cmds, size_t count);
     std::string describe() const;
 };
 
@@ -153,8 +207,99 @@ const f32 *Offload::weight(const void *w, DType wt, i64 n_out, i64 n_in) {
     return out;
 }
 
-bool Offload::push(const vnpu_command_t &cmd) {
-    queue.push_back(cmd);
+vnpu_packed_weights_t *Offload::weight_i8(const void *w, DType wt, i64 n_out,
+                                          i64 n_in) {
+    if (!w || n_out <= 0 || n_in <= 0) return nullptr;
+    if (!fits_u32(n_out) || !fits_u32(n_in)) return nullptr;
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = stage_i8.find(w);
+    if (it != stage_i8.end()) return it->second.packed;
+
+    const size_t elems = static_cast<size_t>(n_out) * static_cast<size_t>(n_in);
+    if (stage_i8_bytes + elems > stage_budget) {
+        if (!stage_refused) {
+            stage_refused = true;
+            KRK_WARN("npu: weight staging budget is %zu MiB (KRK_NPU_WEIGHT_MB); "
+                     "further weights stay on the reference path",
+                     stage_budget / (1024ull * 1024ull));
+        }
+        return nullptr;
+    }
+
+    std::vector<int8_t> q;
+    std::vector<f32> scales;
+    std::vector<f32> row;
+    try {
+        q.resize(elems);
+        scales.resize(static_cast<size_t>(n_out));
+        row.resize(static_cast<size_t>(n_in));
+    } catch (const std::exception &) {
+        return nullptr; // bad_alloc / length_error: caller takes its own body
+    }
+
+    // One row at a time: dequantize into the scratch row, take its peak, store
+    // the per-row scale and the int8 row. Per-ROW, not per-tensor, because a
+    // GGUF tensor's rows routinely differ by an order of magnitude and a single
+    // scale for the whole matrix would spend most of the int8 range on one
+    // outlier row.
+    const size_t src_row = (wt == DType::F32) ? static_cast<size_t>(n_in) * 4u
+                                              : dtype_row_bytes(wt, n_in);
+    const u8 *src = static_cast<const u8 *>(w);
+    for (i64 o = 0; o < n_out; o++) {
+        const u8 *sp = src + static_cast<size_t>(o) * src_row;
+        if (wt == DType::F32) {
+            std::memcpy(row.data(), sp, static_cast<size_t>(n_in) * sizeof(f32));
+        } else {
+            dequant_row(wt, sp, row.data(), n_in);
+        }
+        f32 amax = 0.0f;
+        for (i64 k = 0; k < n_in; k++) amax = std::max(amax, std::fabs(row[k]));
+        const f32 s = amax > 0.0f ? amax / 127.0f : 0.0f;
+        scales[static_cast<size_t>(o)] = s;
+        const f32 inv = s > 0.0f ? 1.0f / s : 0.0f;
+        int8_t *dst = q.data() + static_cast<size_t>(o) * static_cast<size_t>(n_in);
+        // Round half away from zero in FLOAT, not std::lround on a double.
+        // Same rounding rule (lround is also half-away-from-zero), same result
+        // for every value in range, and measured 8.5x faster on a real tensor
+        // (20.3 ms to 2.4 ms for 1376x512). Done in doubles this pass was the
+        // single largest part of the int8 path's one-time warm-up: the first
+        // prefill chunk paid ~95 ms of it and read as a 40% prefill
+        // regression, which is not a property of int8 at all.
+        for (i64 k = 0; k < n_in; k++) {
+            const f32 f = row[k] * inv;
+            int v = static_cast<int>(f >= 0.0f ? f + 0.5f : f - 0.5f);
+            if (v > 127) v = 127;
+            if (v < -127) v = -127; // symmetric: -127..127, so no -128 corner
+            dst[k] = static_cast<int8_t>(v);
+        }
+    }
+
+    // Packing is a synchronous device call, and the queue may hold commands
+    // referencing buffers it is about to be handed. Drain first so the pack
+    // cannot interleave with work already issued. This is once per weight, on
+    // the same warm-up pass that stages the f32 copies.
+    flush(this);
+
+    vnpu_packed_weights_t *packed = nullptr;
+    const vnpu_status_t rc =
+        vnpu_pack_weights_i8(dev, q.data(), scales.data(),
+                             static_cast<uint32_t>(n_in),
+                             static_cast<uint32_t>(n_out),
+                             /*ldb=*/0, /*trans_b=*/1, &packed);
+    if (rc != VNPU_OK || !packed) return nullptr;
+
+    stage_i8_bytes += elems;
+    EntryI8 e;
+    e.packed = packed;
+    e.bytes = elems;
+    stage_i8.emplace(w, e);
+    return packed;
+}
+
+bool Offload::push(const vnpu_command_t &cmd) { return push_batch(&cmd, 1); }
+
+bool Offload::push_batch(const vnpu_command_t *cmds, size_t count) {
+    queue.insert(queue.end(), cmds, cmds + count);
     // Gemm mode submits and waits on every call; Graph mode queues and is
     // drained by npu_flush_() at the next host op.
     //
@@ -215,6 +360,7 @@ Offload *create(int device_index, Mode mode, std::string *why) {
     o->mode = mode;
     o->unit = unit;
     o->strict_queue = env_on("KRK_NPU_STRICT_QUEUE");
+    o->w8a8 = env_on("KRK_NPU_W8A8");
     vnpu_status_t rc = vnpu_device_create(&cfg, &o->dev);
     if (rc != VNPU_OK) {
         if (why)
@@ -288,6 +434,10 @@ static void warn_if_trace_timebase_is_absolute(const std::string &path) {
 void destroy(Offload *o) {
     if (!o) return;
     flush(o);
+    // Packed int8 weights belong to the device, so they go before it does.
+    for (auto &kv : o->stage_i8)
+        if (kv.second.packed) vnpu_packed_weights_destroy(kv.second.packed);
+    o->stage_i8.clear();
     if (o->stream) vnpu_stream_destroy(o->stream);
     if (o->dev) vnpu_device_destroy(o->dev);
     if (!o->trace_path.empty()) warn_if_trace_timebase_is_absolute(o->trace_path);
@@ -335,19 +485,95 @@ bool flush(Offload *o) {
 
 std::string stats(const Offload *o) {
     if (!o) return std::string();
-    return format("gemm %llu, rmsnorm %llu, swiglu %llu, add %llu, mul %llu, "
-                  "%llu declined, %llu batch(es); "
-                  "%.1f GFLOP, %.1f MiB staged",
-                  o->n.gemm, o->n.rmsnorm, o->n.swiglu, o->n.add, o->n.mul,
-                  o->n.declined, o->n.batches,
-                  static_cast<double>(o->n.flops) / 1.0e9,
-                  static_cast<double>(o->stage_bytes) / (1024.0 * 1024.0));
+    std::string out = format(
+        "gemm %llu, rmsnorm %llu, swiglu %llu, add %llu, mul %llu, "
+        "%llu declined, %llu batch(es); %.1f GFLOP, %.1f MiB staged",
+        o->n.gemm, o->n.rmsnorm, o->n.swiglu, o->n.add, o->n.mul,
+        o->n.declined, o->n.batches,
+        static_cast<double>(o->n.flops) / 1.0e9,
+        static_cast<double>(o->stage_bytes) / (1024.0 * 1024.0));
+    // Only when the switch is on: a default run should not have to read a
+    // zero-row about a path it never took.
+    if (o->w8a8) {
+        out += format("; w8a8 %llu int8 (%.1f MiB packed), %llu on f32",
+                      o->n.w8a8_gemm,
+                      static_cast<double>(o->stage_i8_bytes) / (1024.0 * 1024.0),
+                      o->n.w8a8_fallback);
+    }
+    return out;
 }
 
 namespace {
 
-// vnpu_matmul_f32 takes its geometry as uint32 and multiplies M*K*N as u64.
-bool fits_u32(i64 v) { return v > 0 && v <= 0x7fffffffLL; }
+// The int8 GEMM, as two device commands: quantize the activation rows, then
+// multiply by the packed weight.
+//
+//   C[m,n] = (sum_k A8[m,k]*B8[n,k]) * scale_a[m] * scale_b[n]
+//
+// which is the device kernel's own composition (store_i8_c multiplies both
+// scales back in), so no scale arithmetic is left to the host. Both commands
+// go out as ONE batch: submitting the quantize on its own would add a round
+// trip to the arm that flushes every call, which is precisely the arm this
+// path is meant to speed up.
+bool gemm_i8(Offload *o, void *out, const void *x, const void *w, DType wt,
+             i64 n_out, i64 n_in, i64 rows) {
+    vnpu_packed_weights_t *pk = o->weight_i8(w, wt, n_out, n_in);
+    if (!pk) return false;
+
+    const size_t need = static_cast<size_t>(rows) * static_cast<size_t>(n_in);
+    if (need > o->a8.size() || static_cast<size_t>(rows) > o->a_scale.size()) {
+        // A queued command may still hold these pointers, so drain before the
+        // reallocation. Growth is monotonic and stops after the first few
+        // tokens, so this costs a handful of flushes over a run, not one per
+        // call.
+        if (!flush(o)) return false;
+        try {
+            o->a8.resize(std::max(need, static_cast<size_t>(1)));
+            o->a_scale.resize(std::max(static_cast<size_t>(rows),
+                                       static_cast<size_t>(1)));
+        } catch (const std::exception &) {
+            return false;
+        }
+    }
+
+    vnpu_command_t c[2]{};
+    c[0].opcode = VNPU_OP_QUANTIZE_I8;
+    vnpu_quantize_i8_args_t &q = c[0].args.quantize_i8;
+    q.X = static_cast<const f32 *>(x);
+    q.Y = o->a8.data();
+    q.scales = o->a_scale.data();
+    q.rows = static_cast<uint64_t>(rows);
+    q.cols = static_cast<uint64_t>(n_in);
+    // Per ROW, because the matmul takes one scale per activation row (scale_a
+    // is length M). Per-tensor would be simpler and strictly worse: every
+    // token's activation row has its own peak, and a shared scale would spend
+    // the int8 range on whichever row happens to be largest.
+    q.axis = VNPU_QUANT_PER_ROW;
+    q.unit = o->unit;
+
+    c[1].opcode = VNPU_OP_MATMUL_I8;
+    vnpu_matmul_i8_args_t &m = c[1].args.matmul_i8;
+    m.A = o->a8.data();
+    m.B = pk;
+    m.scale_a = o->a_scale.data();
+    m.bias = nullptr;
+    m.C = static_cast<f32 *>(out);
+    m.M = static_cast<uint32_t>(rows);
+    m.K = static_cast<uint32_t>(n_in);
+    m.N = static_cast<uint32_t>(n_out);
+    m.lda = 0; // 0 = K, the device's default for a dense activation block
+    m.ldc = 0; // 0 = N
+    m.epilogue = VNPU_EPILOGUE_NONE;
+    m.unit = o->unit;
+
+    if (!o->push_batch(c, 2)) return false;
+    o->n.w8a8_gemm++;
+    o->n.gemm++;
+    o->n.flops += 2ull * static_cast<unsigned long long>(rows) *
+                  static_cast<unsigned long long>(n_out) *
+                  static_cast<unsigned long long>(n_in);
+    return true;
+}
 
 } // namespace
 
@@ -355,6 +581,11 @@ bool gemm(Offload *o, void *out, const void *x, const void *w, DType wt,
           i64 n_out, i64 n_in, i64 rows) {
     if (!o || !o->stream || !out || !x || !w) return false;
     if (!fits_u32(rows) || !fits_u32(n_out) || !fits_u32(n_in)) return false;
+    // Opt-in W8A8. A decline here is not a substitution: it falls through to
+    // the device's own f32 GEMM, which is the MORE accurate path on the same
+    // device, and the run summary counts it.
+    if (o->w8a8 && gemm_i8(o, out, x, w, wt, n_out, n_in, rows)) return true;
+    if (o->w8a8) o->n.w8a8_fallback++;
     const f32 *b = o->weight(w, wt, n_out, n_in);
     if (!b) {
         o->n.declined++;

@@ -189,6 +189,20 @@ Other knobs: `KRK_NPU_THREADS` (device workers, 0 = hardware concurrency),
 A weight tensor that does not fit the staging budget stays on the reference
 path, counted in `declined`, and says so once.
 
+`KRK_NPU_W8A8=1` switches the GEMM path to the device's int8 kernel: weights
+are packed to int8 once (per output row, so each row keeps its own scale) and
+the activations are quantized to int8 on the device, per row, immediately
+before each multiply. That quarters the weight traffic, which is what decode is
+bound by, and it is **off by default because it is lossy** -- it quantizes the
+activations as well as the weights, there is no int8-weights-by-f32-activations
+opcode to fall back on. Measured on the synthetic fixtures, weights land 4x
+smaller (247.4 -> 61.8 MiB on the 1024-dim one) and decode runs 1.3x-3.6x
+faster, but a 32-token greedy continuation is byte-identical to the f32 arm on
+6 of 9 fixtures and differs on the other 3; the per-position flip rate is 3-15%.
+Use it when a changed tail is acceptable and the tokens/s is not.
+`docs/CPU-VS-NPU-BENCHMARK.md` section 10 has the full table, the one-time cost
+and the accuracy witness.
+
 ## Run
 
 ```sh

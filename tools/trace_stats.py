@@ -24,17 +24,23 @@ Both clocks are microseconds, but from different epochs: the engine's is
 relative to the recorder, VNPU's is CLOCK_MONOTONIC-derived. The two are
 therefore NOT joined into one timeline here.
 
-A caveat this tool checks for and will not paper over: VNPU's recorded START
-times are quantised to a 10 ms grid, so many commands share a timestamp even
+A caveat this tool checks for and will not paper over: an UNPATCHED VNPU writes
+start times quantised to a 10 ms grid, so many commands share a timestamp even
 though their durations are exact. (Measured: a 928-command run carries 29
 distinct start times, all exactly 10000 us apart, with the durations inside
-each 10 ms slot summing to just under 10000 us -- real quantisation, not
-precision loss. The platform clock is fine-grained: its own steady_clock
-resolves changes 100-200 ns apart, so the coarseness is in what reached the
-file.) When that is detected, the timing-derived aggregates -- gaps, idle
+each 10 ms slot summing to just under 10000 us.) The clock is not the problem:
+`std::ostream`'s default precision of 6 significant digits truncates a
+microsecond timestamp near 1.2e9 to a 10 ms grid, while durations -- small
+numbers -- keep their digits. It is a one-line formatting defect in the
+producer, diagnosed and fixed in section 9 of docs/CPU-VS-NPU-BENCHMARK.md,
+with the patch in patches/npuxl-0001-trace-timestamp-precision.patch.
+
+When quantised starts are detected, the timing-derived aggregates -- gaps, idle
 time, duty cycle, overlap -- are NOT reported, because a duty cycle computed
 from a 10 ms grid would be an artifact of the grid. Per-op service time,
-achieved bandwidth and GFLOP/s are measured from durations and remain valid.
+achieved bandwidth and GFLOP/s are measured from durations and remain valid, so
+a trace from an unpatched library is still worth reading -- it just cannot say
+when anything happened.
 
 A second caveat: VNPU's `tid` is `hash(std::thread::id) % 8`, not a worker
 index, so nothing here reports "worker occupancy".
