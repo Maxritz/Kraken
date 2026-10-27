@@ -7,6 +7,12 @@
 
 #include <cmath>
 
+#if defined(__F16C__) && defined(__FMA__) && \
+    (defined(__x86_64__) || defined(__i386__))
+#include <immintrin.h>
+#define KRK_DOT_F16C 1
+#endif
+
 namespace krk {
 
 namespace {
@@ -1172,6 +1178,49 @@ f32 vec_dot(DType t, const void *src, const f32 *x, i64 n) {
     // The unquantized formats have no block structure, so widen them directly
     // rather than routing through the block loop (which would look for a
     // 1-element "block" decoder that does not exist).
+    //
+    // F32 and F16 are evaluated four lanes at a time where the ISA has F16C:
+    // lane k of the vector IS accumulator k of the scalar loop below, fed the
+    // same elements in the same order, and the final combination is still
+    // (a0 + a1) + (a2 + a3). That is what makes the fast path safe to have in
+    // an oracle -- it is the same arithmetic, not a rearranged version of it,
+    // so every golden hash in the suite stays valid.
+    //
+    // Why it matters here: the scalar form below called fp16_to_fp32() once per
+    // weight element, and that is an out-of-line function with a subnormal
+    // normalisation loop in it. One core / two SMT threads at 2.6 GHz measured
+    // 0.8 GMAC/s on a 1 GiB f16 model -- 583 ms per prefill token, identical at
+    // rows=1..64 because the cost is per weight element and not per row. The
+    // same machine does ~4 GMAC/s through this path (see BENCH-CPU-DOT.md).
+#if defined(KRK_DOT_F16C)
+    if (t == DType::F32) {
+        const f32 *w = static_cast<const f32 *>(src);
+        __m128 acc = _mm_setzero_ps();
+        i64 i = 0;
+        for (; i + 4 <= n; i += 4)
+            acc = _mm_fmadd_ps(_mm_loadu_ps(w + i), _mm_loadu_ps(x + i), acc);
+        alignas(16) f32 a[4];
+        _mm_store_ps(a, acc);
+        f32 s = (a[0] + a[1]) + (a[2] + a[3]);
+        for (; i < n; i++) s += w[i] * x[i];
+        return s;
+    }
+    if (t == DType::F16) {
+        const u16 *h = static_cast<const u16 *>(src);
+        __m128 acc = _mm_setzero_ps();
+        i64 i = 0;
+        for (; i + 4 <= n; i += 4) {
+            const __m128i h4 =
+                _mm_loadl_epi64(reinterpret_cast<const __m128i *>(h + i));
+            acc = _mm_fmadd_ps(_mm_cvtph_ps(h4), _mm_loadu_ps(x + i), acc);
+        }
+        alignas(16) f32 a[4];
+        _mm_store_ps(a, acc);
+        f32 s = (a[0] + a[1]) + (a[2] + a[3]);
+        for (; i < n; i++) s += fp16_to_fp32(h[i]) * x[i];
+        return s;
+    }
+#endif
     if (t == DType::F32) {
         const f32 *w = static_cast<const f32 *>(src);
         f32 acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;

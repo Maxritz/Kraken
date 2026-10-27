@@ -303,6 +303,33 @@ constexpr ArchSpec kTable[] = {
      /*swiglu_oai=*/false, /*hyper_connection=*/false, /*ple=*/false,
      /*qsa=*/false, /*attn_gate_elem=*/false, /*no_out_norm=*/false,
      /*mla=*/true, /*dsv4=*/true, /*attention_implemented=*/true},
+    // DeepSeek-V4.1-Flash (-1017 and the earlier V4.1-Flash): the same graph
+    // as deepseek4 under the architecture string llama.cpp's converter writes
+    // for this family, which is `deepseek41` rather than `deepseek4`. A file
+    // carrying the V4.1 name was previously "unknown architecture" -- the
+    // least useful answer available, because the reasons it cannot run are
+    // specific and already enumerated on the entry above (compressed
+    // attention, the sparse indexer, attn_sinks, hyper-connections). Mapping
+    // the name onto the implementation inherits every one of those refusals
+    // instead of replacing them with a shrug.
+    //
+    // What this does NOT do is make V4.1 run. A V4.1 checkpoint is 343B-763B
+    // with compress_ratios non-zero on most layers, so Engine::init refuses it
+    // by name exactly as it refuses deepseek4, and the loader's gap map names
+    // the tensors it could not take. The entry exists so the refusal says
+    // which graph it read and what is missing from it.
+    {"deepseek41", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target,
+     "deepseek4",
+     "recognised as the deepseek4 graph: shared-latent MLA, the grouped output "
+     "and the tid2eid hash route; compressed attention, the sparse indexer and "
+     "hyper-connections are not implemented, so a V4.1 checkpoint with "
+     "compress_ratios or hc_* tensors is refused by name, not mis-loaded",
+     /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
+     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
+     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
+     /*swiglu_oai=*/false, /*hyper_connection=*/false, /*ple=*/false,
+     /*qsa=*/false, /*attn_gate_elem=*/false, /*no_out_norm=*/false,
+     /*mla=*/true, /*dsv4=*/true, /*attention_implemented=*/true},
     // The MTP/prediction-head shard of DeepSeek-V4: `mtp.*` tensors, nothing else.
     {"deepseek4-dspark", ArchShape::Moe, ArchSupport::No, ArchRole::Draft,
      "deepseek4",

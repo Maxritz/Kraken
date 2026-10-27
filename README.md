@@ -325,6 +325,10 @@ and the refusal list, is in [docs/MODEL-STATUS.md](docs/MODEL-STATUS.md) and
 
 ## Where the rest of it is
 
+* [docs/TECHNICAL-README.md](docs/TECHNICAL-README.md) is the technical readme:
+  how a token flows, the expert residency tiers, the full model-family table
+  with the reason each unsupported family is unsupported, what is measured and
+  what is not.
 * [more-info.md](more-info.md) is the long form: every switch with worked
   examples, the full benchmark record with context scaling, KV quantization and
   speculative decode, the HTTP server, the supported model table, and the list of

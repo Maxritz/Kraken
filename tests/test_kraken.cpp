@@ -4074,6 +4074,27 @@ static void test_arch_table() {
     CHECK(arch_lookup("qwen4exp")->hyper_connection &&
               arch_lookup("qwen4exp")->ple && arch_lookup("qwen4exp")->qsa,
           "and the schema flags record the three pieces still missing");
+    // DeepSeek-V4.1-Flash ships under llama.cpp's `deepseek41` name, not the
+    // `deepseek4` this table was written against. Before the alias a V4.1 file
+    // reported "unknown architecture" -- true, and useless: the graph IS
+    // deepseek4's, and every reason it cannot run is already on that entry.
+    // Pinned here so the two cannot drift: same implementation, same flags,
+    // still Partial, and still carrying the reason a user needs to read.
+    {
+        const ArchSpec *v41 = arch_lookup("deepseek41");
+        const ArchSpec *v4 = arch_lookup("deepseek4");
+        CHECK(v41 != nullptr, "deepseek41 is a known architecture");
+        CHECK(v4 != nullptr, "and deepseek4, which it maps onto, still is");
+        CHECK(v41 && v4 && std::string(v41->family) == v4->family,
+              "V4.1 and V4 share one schema");
+        CHECK(v41 && v4 && v41->dsv4 == v4->dsv4 && v41->mla == v4->mla &&
+                  v41->attention_implemented == v4->attention_implemented,
+              "with the same MLA/dsv4/attention flags");
+        CHECK(v41 && v41->support == ArchSupport::Partial,
+              "V4.1 is Partial, not supported: compressed attention is absent");
+        CHECK(v41 && v41->why[0] != '\0',
+              "and a non-Yes entry carries the reason, as the table requires");
+    }
     // The gemma stack: every one of these files gates its FFN with GeGLU and
     // scales the embedding, and the family's alternating window is a property
     // of the architecture rather than of the metadata. Two of those were
