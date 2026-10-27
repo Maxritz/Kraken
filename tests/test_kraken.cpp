@@ -13816,6 +13816,128 @@ static void test_npu_backend() {
         CHECK(stats.find("host: rope, attention") != std::string::npos,
               "and names the ops that stayed on the host");
     }
+
+    // ---- attention on the device (KRK_NPU_ATTN) -----------------------------
+    //
+    // Three things have to hold, and the third is the one that makes this
+    // shippable: the DEFAULT path is untouched, the opted-in path agrees with
+    // the reference to f32 rounding, and a cache the device cannot take is
+    // refused by NAME rather than approximated.
+    {
+        const i64 hd = 8, nh = 2, nkv = 1, npos = 12, ntok = 6;
+        const i64 kv_dim = nkv * hd;
+        std::mt19937 rng(2024);
+        std::normal_distribution<f32> nd(0.0f, 0.3f);
+        std::vector<f32> fk(static_cast<size_t>(npos * kv_dim));
+        std::vector<f32> fv(static_cast<size_t>(npos * kv_dim));
+        for (auto &x : fk) x = nd(rng);
+        for (auto &x : fv) x = nd(rng);
+        std::vector<f32> q(static_cast<size_t>(ntok * nh * hd));
+        for (auto &x : q) x = nd(rng);
+        std::vector<f32> kbuf(static_cast<size_t>(npos * kv_dim), 0.0f);
+        std::vector<f32> vbuf(static_cast<size_t>(npos * kv_dim), 0.0f);
+
+        AttnDesc a;
+        a.n_head = nh;
+        a.n_kv = nkv;
+        a.hd = hd;
+        a.n_tok = npos;
+        a.pos0 = 0;
+        a.layer = 0;
+        a.layer_stride = 0;
+        a.pos_stride = kv_dim;
+        a.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(hd)));
+        a.causal = true;
+        a.kv_int8 = false;
+        cpu->kv_append(kbuf.data(), vbuf.data(), fk.data(), fv.data(), a);
+
+        const i64 out_elems = ntok * nh * hd;
+        std::vector<f32> want(static_cast<size_t>(out_elems), 0.0f);
+        AttnDesc d = a;
+        d.n_tok = ntok;
+        d.pos0 = npos - ntok;
+        cpu->attention(want.data(), q.data(), kbuf.data(), vbuf.data(), d);
+
+        // (1) default: attention is NOT offered, so the Graph arm must produce
+        //     the reference's own bits and say the op stayed on the host.
+        {
+            std::string w2;
+            Backend *g = make_npu_backend(0, /*whole_graph=*/true, &w2);
+            CHECK(g != nullptr, w2.empty() ? "the graph arm opens" : w2.c_str());
+            if (g) {
+                std::vector<f32> got(static_cast<size_t>(out_elems), 0.0f);
+                g->attention(got.data(), q.data(), kbuf.data(), vbuf.data(), d);
+                CHECK(got == want,
+                      "with KRK_NPU_ATTN unset, attention is bit-identical to "
+                      "the reference (the device is not offered it)");
+                CHECK(g->backend_stats().find("host: rope, attention") !=
+                          std::string::npos,
+                      "and the run summary still names attention as a host op");
+                delete g;
+            }
+        }
+
+        // (2) opt-in: the device takes it, and what comes back is the same
+        //     attention to f32 rounding -- a different summation order, not a
+        //     different model. ntok is 6 here, below the decode threshold, so
+        //     lower it for the test.
+        setenv("KRK_NPU_ATTN", "1", 1);
+        setenv("KRK_NPU_ATTN_MIN_TOK", "4", 1);
+        {
+            std::string w2;
+            Backend *g = make_npu_backend(0, /*whole_graph=*/true, &w2);
+            CHECK(g != nullptr, w2.empty() ? "the graph arm opens" : w2.c_str());
+            if (g) {
+                std::vector<f32> got(static_cast<size_t>(out_elems), 0.0f);
+                g->attention(got.data(), q.data(), kbuf.data(), vbuf.data(), d);
+                f64 num = 0.0, den = 0.0, worst = 0.0;
+                for (i64 i = 0; i < out_elems; i++) {
+                    const f64 e = static_cast<f64>(got[i]) - want[i];
+                    num += e * e;
+                    den += static_cast<f64>(want[i]) * want[i];
+                    worst = std::max<f64>(worst, std::fabs(e));
+                }
+                const f64 rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+                // Measured at these toy dims: 2.0e-05 relative, 6.1e-06
+                // absolute. The device's softmax runs its own polynomial exp,
+                // which at hd=8 and a handful of keys is a larger share of the
+                // result than at the shapes the engine actually runs (hd=64,
+                // 257x257 measured 1.2e-07). The bound is set a little above
+                // the measurement, and it is still four orders below the O(1)
+                // error a layout mistake in the gather would produce.
+                CHECK(rel < 5e-5,
+                      "with KRK_NPU_ATTN=1 the device attention matches the "
+                      "reference to its own f32/exp rounding");
+                CHECK(worst < 2e-5, "and no single element strays further");
+                CHECK(g->backend_stats().find("attn 1 dev") != std::string::npos,
+                      "and the run summary counts the call as device work");
+                CHECK(g->backend_stats().find("host: rope, attention") ==
+                          std::string::npos,
+                      "and stops calling attention a host op");
+
+                // (3) refusal by name: an 8-bit cache is not representable.
+                std::vector<f32> q8k(kbuf.size(), 0.0f), q8v(vbuf.size(), 0.0f);
+                AttnDesc q8 = a;
+                q8.n_tok = npos;
+                q8.kv_int8 = true;
+                q8.pos_stride = kv_dim + 1; // not the f32 layout
+                // The cache is only used for the refusal decision here.
+                std::vector<f32> out8(static_cast<size_t>(out_elems), 0.0f);
+                AttnDesc r = d;
+                r.kv_int8 = true;
+                g->attention(out8.data(), q.data(), q8k.data(), q8v.data(), r);
+                const std::string st = g->backend_stats();
+                // The device call above already succeeded, so the split is
+                // 1 device / 1 host and the host one carries its reason.
+                CHECK(st.find("attn 1 dev, 1 host") != std::string::npos &&
+                          st.find("1 8-bit cache") != std::string::npos,
+                      "and an int8 cache is refused BY NAME, not approximated");
+                delete g;
+            }
+        }
+        unsetenv("KRK_NPU_ATTN");
+        unsetenv("KRK_NPU_ATTN_MIN_TOK");
+    }
     delete npu;
 
     // =======================================================================

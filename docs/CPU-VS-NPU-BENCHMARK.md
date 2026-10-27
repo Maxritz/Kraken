@@ -3,7 +3,7 @@
 This is the answer to "when you compared direct CPU coding and through NPU,
 what was better, and do we have a comprehensive benchmark we can see". Every
 number below was produced on this machine by the two committed tools in
-`tools/`, and every one of them can be reproduced by section 11.
+`tools/`, and every one of them can be reproduced by section 12.
 
 The short version: **on this box the virtual-NPU path beats plain CPU by 1.8x
 to 18.4x on prefill and 1.1x to 5.1x on decode, with byte-identical greedy
@@ -109,7 +109,7 @@ One row goes the other way: `tiny-q8_0` at 16 prompt words is the only cell in
 the whole matrix where `--cpu` beats both NPU arms (1203.6 against 1187.2 and
 622.1 tok/s). A 1.9 MiB model that fits in cache, and a decode step small
 enough that the device's fixed per-command cost is a large fraction of it, is
-exactly the case the NPU path should lose; section 11 says what that means for
+exactly the case the NPU path should lose; section 13 says what that means for
 the win's boundary. The narrow cells at 1.1x-1.4x are the same effect at a
 smaller amplitude.
 
@@ -165,7 +165,7 @@ the same bytes with an AVX-512 kernel whose inner loop is better than the
 generic one. On prefill the difference is enormous (11–15x) because the
 problem becomes compute-bound and the device's vector kernel is simply a much
 better matmul than the reference loop. Three standalone probes, all in
-`tools/`-adjacent scratch work and reproduced in section 10:
+`tools/`-adjacent scratch work and reproduced in section 12:
 
 | probe | measurement |
 | --- | --- |
@@ -547,7 +547,145 @@ Read the last three columns together, because any one of them alone misleads:
 What it does not change: the f32 path. `--npu-cpu` text is byte-identical to
 `--cpu` on all 9 fixtures in both tables, before and after this change.
 
-## 11. Reproducing all of it
+## 11. Attention on the device (`KRK_NPU_ATTN`)
+
+Sections 2-5 established that decode is bound by weight traffic and the GEMM is
+the whole story there. Prefill is a different shape of problem, and the traces in
+section 10.4 point at it directly: after the GEMM moved to int8 the device sat
+**idle for 54% of the span**. Something on the host was holding the wall clock.
+
+### 11.1 Finding it: prefill is not all GEMM
+
+Prefill scales as (GEMM work ∝ T) + (attention work ∝ T²) + a constant for
+staging the weights. Sweeping the prompt length and fitting
+`a + b·T + c·T²` to `prefill.chunk` separates the three:
+
+| T | prefill.chunk (f32 arm) |
+| ---: | ---: |
+| 65 | 108.2 ms |
+| 129 | 141.6 ms |
+| 257 | 229.7 ms |
+| 513 | 519.4 ms |
+
+Least squares on those four points: `a = 85.7 ms`, `b = 0.274 ms/token`,
+`c = 1.11e-3 ms/token²`. The per-token cost rises with T -- that is the
+quadratic term, and it is attention. At 257 tokens it is **73.5 ms of a 229.7 ms
+prefill (32%)**; at 513 it is **293 ms of 519 ms (56%)**.
+
+Attention was on the host in every NPU mode, and the host implementation is the
+scalar reference:
+
+```cpp
+for (i64 i = 0; i < d.hd; i++) dot += qh[i] * kj[i];
+```
+
+That loop must stay scalar -- it is the oracle the GPU and NPU paths are tested
+against, and its bit-exactness is what makes `--prefill-hash` a gate. So the
+answer is not to vectorise it, it is to stop asking the host to do it.
+
+### 11.2 What the device can and cannot take
+
+`vnpu_attention_f32` wants contiguous head-major `[batch, heads, seq, dim]` with
+a causal flag. Kraken's cache is token-major with a row stride, and carries
+features the op has no field for. So the call is offered only when every one of
+these holds, and refused **by name** otherwise -- counted, and printed in the run
+summary, never silently approximated:
+
+| feature | why it is refused |
+| --- | --- |
+| 8-bit KV cache | the op takes f32 rows |
+| sliding window | no window field; the causal flag cannot express it |
+| masked block (`skip_from`) | a non-contiguous visible set per row |
+| logit softcap (Gemma 2) | applied at score formation, before the softmax |
+| attention sink | a denominator-only term with no value row |
+| `n_tok` below the threshold | see 11.3 -- the device loses there |
+
+A refusal looks like this, from a real run with `--kv-quant int8`:
+
+```
+attn 0 dev, 32 host (32 8-bit cache)
+```
+
+The gather itself is free for grouped-query models: the transpose has to touch
+every `(position, head)` row anyway, so broadcasting `n_kv` into `n_head` costs
+nothing extra.
+
+### 11.3 Where it wins, and where it does not
+
+Isolated measurement against this backend's scalar body, gather and scatter
+included (a gain eaten by the layout change is not a gain):
+
+| T | P | host scalar | device + gather | speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 129 | 0.07 ms | 0.32 ms | **0.21x** |
+| 1 | 1025 | 0.72 ms | 1.00 ms | **0.72x** |
+| 8 | 257 | 1.02 ms | 0.53 ms | 1.93x |
+| 32 | 257 | 4.08 ms | 1.59 ms | 2.57x |
+| 257 | 257 | 16.55 ms | 6.74 ms | 2.45x |
+| 513 | 513 | 76.90 ms | 22.36 ms | 3.44x |
+
+Decode loses badly: one query row cannot amortise a gather that is O(the whole
+cache). The crossover is around four rows, so the threshold defaults to 16 and
+decode keeps the reference. End to end, best-of-N and median of interleaved
+runs (`small-f16`, ctx 2048 unless noted):
+
+| fixture | T | prefill off | prefill on | gain | decode |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `small-f16` | 257 | 262.3 ms | 237.7 ms | **+10.3%** | unchanged |
+| `small-f16` | 513 | 565.3 ms | 450.2 ms | **+25.6%** | unchanged |
+| `medium-f16` | 257 | 1041.6 ms | 994.6 ms | +4.7% | unchanged |
+
+(best-of-N over the same samples: +9.0%, +31.0%, +4.1%. This box's samples
+spread ±10%, so both statistics are quoted and they agree in direction. Decode
+moves by less than 2% in both directions, which is the noise floor.)
+
+The gain tracks the arithmetic: it grows with prompt length because attention is
+the quadratic term, and shrinks as the model grows because the GEMMs grow with
+it while attention does not. On the 1024-dim fixture at 257 tokens the GEMMs
+dominate enough that attention is only worth 5%.
+
+The device trace shows what it costs on the device side -- 4 calls per prefill,
+one per layer:
+
+| op | count | total | %busy | mean | moved | GFLOP/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `MATMUL_F32` | 116 | 171.9 ms | 84.9% | 1481.8 us | 239.6 MiB | 38.3 |
+| `ATTENTION_F32` | 4 | 26.1 ms | 12.9% | 6522.6 us | 8.0 MiB | 20.7 |
+
+### 11.4 What it costs the answer
+
+Two different bounds, and the difference between them is itself informative.
+
+At the shapes the engine actually runs (hd 64, 257x257) the device attention
+differs from the scalar reference by **1.19e-07 absolute** -- the f32 rounding of
+a different summation order. Greedy text is byte-identical to `--cpu` on all 9
+fixtures with the opt-in on, and on a 4-layer grouped-query fixture (8 query
+heads, 2 KV heads) that exercises the broadcast.
+
+At a deliberately small shape (hd 8, 6 query rows over 12 keys) the difference is
+**2.0e-05 relative, 6.1e-06 absolute**, because the device's softmax runs its own
+polynomial `exp` and at that size the approximation is a larger share of a small
+result. The test bound is set a little above the measurement.
+
+### 11.5 The real cost is the chunk-invariance gate, not accuracy
+
+The engine guarantees that two runs differing only in `--chunk` produce the same
+`--prefill-hash`. That holds because every row's arithmetic is identical whatever
+the batch shape. This optimisation challenges it in a specific and measurable way:
+
+| configuration | `--chunk 8` | `--chunk 128` | `--chunk 512` |
+| --- | --- | --- | --- |
+| default (opt-in off) | `e666a682d7750d0a` | `e666a682d7750d0a` | `e666a682d7750d0a` |
+| opt-in on, threshold 16 | `e666a682d7750d0a` | `3348d4abbdaa93df` | `3787136ed87eb06c` |
+| opt-in on, threshold 0 | `3787136ed87eb06c` | `3787136ed87eb06c` | `3787136ed87eb06c` |
+
+Read the third row: **the device kernel is chunk-invariant on its own.** It is
+the SWITCH -- small chunks on the reference, large chunks on the device -- that
+breaks the invariant, and the switch is what buys decode. There is no threshold
+that keeps both, so it is the user's call, and it is off by default. The default
+row is byte-identical to the tree before this change.
+
+## 12. Reproducing all of it
 
 ```
 # fixtures (deterministic; --batch must be a multiple of 32)
@@ -573,6 +711,22 @@ for words in 8 64; do
   KRK_NPU_W8A8=1 kraken -m /tmp/fix/small-f16.gguf --npu-cpu -p "$P" -n 32 --greedy --ctx 1024 --profile
 done
 
+# attention on the device (section 11): the same fixture, both arms interleaved.
+# Run each arm several times and take best-of-N; this box's samples spread ~10%.
+for words in 64 128; do
+  P="$(python3 -c "print(' '.join(['the quick brown fox']*$words))")"
+  for arm in off on; do
+    [ $arm = on ] && E=KRK_NPU_ATTN=1 || E=
+    env $E kraken -m /tmp/fix/small-f16.gguf --npu-cpu -p "$P" -n 32 --greedy --ctx 2048
+  done
+done
+
+# the chunk-invariance gate, which the switch is off to protect (section 11.5)
+for c in 8 128 512; do
+  kraken -m /tmp/fix/small-f16.gguf --npu-cpu --prefill-hash -p "$P" --ctx 1024 --chunk $c
+done
+KRK_NPU_ATTN=1 ... # same three, to see the invariant go
+
 # the accuracy witnesses (section 10.5). --check needs a kraken binary on
 # PATH or in KRAKEN_BIN; both tools read only the GGUF and the engine's
 # --prefill-hash, never kraken's source.
@@ -589,7 +743,7 @@ The build needs the NPU engine: configure with `-DKRK_ENABLE_NPU=ON
 archive **you built** — the prebuilt `lib/libvnpu.a` that ships in npuxl's zip
 is compiled against a newer glibc and will not link here.
 
-## 12. What this does and does not prove
+## 13. What this does and does not prove
 
 It proves the CPU+NPU path is a genuine, large, correct win on this machine:
 1.8–18.4x on prefill and 1.1–5.1x on decode (one cell excepted, where the CPU
@@ -611,6 +765,14 @@ for a 4x cut in weight footprint, at the cost of a one-time 32-213 ms pack and a
 greedy tail that is byte-identical on 6 of 9 fixtures and differs on 3. That
 trade is real, it is measured in both directions, and it is why the switch is
 off unless asked for.
+
+Section 11 adds the other half of the prefill story. Attention was the
+quadratic term in prefill and it ran on the scalar reference; `KRK_NPU_ATTN=1`
+hands it to the device when the call is expressible, worth **+10% prefill at 257
+tokens and +26% at 513** on the 4-layer fixture and +5% on the 1024-dim one,
+with decode unchanged and greedy text unchanged. It is off by default for a
+reason that is not accuracy but the chunk-invariance gate: the device kernel is
+invariant, the host/device *switch* is not, and the switch is what buys decode.
 
 It does not prove anything about a GPU. There is no `hipcc` on this box and no
 GPU to measure, so this document says nothing about the HIP path beyond "it

@@ -135,9 +135,16 @@ public:
         // The ops the device has no opcode for are named once, here, so the run
         // summary says what "whole graph" actually covered instead of implying
         // it covered everything.
-        return npu::stats(npu_) +
-               "; host: rope, attention, kv cache, embedding, MoE routing, "
-               "top-k, ssm/MLA/HC blocks (no VNPU opcode)";
+        // attention is named here only when it is NOT offered to the device.
+        // With KRK_NPU_ATTN off (the default) it runs entirely on the reference,
+        // so the summary must say so; with it on, npu::stats reports how many
+        // calls the device took and names whatever blocked the rest, and
+        // claiming it was a host op would be wrong.
+        std::string s = npu::stats(npu_) + "; host: rope, ";
+        if (!npu::attention_offered(npu_)) s += "attention, ";
+        s += "kv cache, embedding, MoE routing, top-k, ssm/MLA/HC blocks "
+             "(no VNPU opcode)";
+        return s;
     }
 
     std::string describe() const override {
@@ -469,7 +476,35 @@ public:
 
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {
+        // npu_flush_ first: q is usually the output of a GEMM still queued on
+        // the device, and the gather below reads it on the host.
         npu_flush_();
+        if (npu_) {
+            // Everything that can make this call unrepresentable is handed over
+            // rather than tested here, so the decision, the counting and the
+            // run-summary wording all come from one place (npu::attention).
+            npu::AttnCall c;
+            c.out = out;
+            c.q = q;
+            c.kcache = kcache;
+            c.vcache = vcache;
+            c.n_head = d.n_head;
+            c.n_kv = d.n_kv;
+            c.hd = d.hd;
+            c.n_tok = d.n_tok;
+            c.pos0 = d.pos0;
+            c.layer = d.layer;
+            c.layer_stride = d.layer_stride;
+            c.pos_stride = d.pos_stride;
+            c.scale = d.scale;
+            c.causal = d.causal;
+            c.kv_int8 = d.kv_int8;
+            c.has_sinks = d.sinks != nullptr;
+            c.window = d.window;
+            c.skip_from = d.skip_from;
+            c.softcap = d.softcap;
+            if (npu::attention(npu_, c)) return;
+        }
         const i64 n_rep = d.n_kv > 0 ? d.n_head / d.n_kv : 1;
         if (d.kv_int8) {
             // Same formulation as the f32 path, reading (signed byte x scale)

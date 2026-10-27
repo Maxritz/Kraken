@@ -203,6 +203,23 @@ Use it when a changed tail is acceptable and the tokens/s is not.
 `docs/CPU-VS-NPU-BENCHMARK.md` section 10 has the full table, the one-time cost
 and the accuracy witness.
 
+`KRK_NPU_ATTN=1` offers ATTENTION to the device as well. It is the quadratic
+term in prefill and the reference implementation is a scalar loop, so on a
+4-layer fixture prefill runs 8% faster at a 257-token prompt and 28% faster at
+513 -- the gain grows with prompt length exactly as the arithmetic predicts.
+Decode is unchanged, because the device loses below about four query rows and
+those calls stay on the reference (measured 0.21x at 1x129).
+
+It is **off by default for a different reason than int8's**: not accuracy, but
+the chunk-invariance gate. The device's own attention kernel is chunk-invariant
+-- a run with every chunk on the device hashes identically at `--chunk 8`, `128`
+and `512` -- but the row-count threshold means a small chunk takes the reference
+and a large one takes the device, and those differ at 1e-07. So the *switch*,
+not the kernel, is what costs the invariant. With the switch off, this tree
+still prints the same `--prefill-hash` at every chunk size, byte for byte, which
+is what the shipped default does. `KRK_NPU_ATTN_MIN_TOK` (default 16) moves the
+crossover. Section 11 has the numbers and the refusal table.
+
 ## Run
 
 ```sh

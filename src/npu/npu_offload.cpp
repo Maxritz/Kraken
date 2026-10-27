@@ -81,7 +81,25 @@ struct Counters {
     // path on the same device -- but it is counted so a run can say so.
     unsigned long long w8a8_gemm = 0;
     unsigned long long w8a8_fallback = 0;
+    // Attention: calls the device ran, and calls that stayed on the reference.
+    // The host ones are broken out by the ONE feature that blocked them, so a
+    // model that never reaches the device says which feature did it rather
+    // than leaving the reader to guess.
+    unsigned long long attn = 0;
+    unsigned long long attn_host[6] = {0, 0, 0, 0, 0, 0};
 };
+
+// Why an attention call stayed on the reference. Index into Counters::attn_host.
+enum AttnWhy {
+    ATTN_INT8 = 0,   // int8 KV cache: the device takes f32 rows
+    ATTN_WINDOW,     // sliding window
+    ATTN_SKIP,       // masked block (skip_from)
+    ATTN_SOFTCAP,    // Gemma-2 style logit softcap
+    ATTN_SINK,       // attention sink
+    ATTN_SMALL,      // n_tok below the threshold where the device wins
+};
+const char *const kAttnWhyName[6] = {"8-bit cache", "window", "masked block",
+                                     "softcap",     "sink",   "short"};
 
 struct Entry {
     std::vector<f32> data;
@@ -149,6 +167,34 @@ public:
     // be left pointing at freed storage.
     std::vector<int8_t> a8;
     std::vector<f32> a_scale;
+
+    // ---- attention -------------------------------------------------------
+    //
+    // The device takes head-major [batch, heads, seq, dim]; Kraken's cache is
+    // token-major with a row stride, so a call gathers into these and scatters
+    // back. They are reused across layers and grown on demand -- and a GROWTH
+    // flushes first, because a queued command may still point at the old
+    // storage.
+    //
+    // Why gather instead of keeping the cache head-major: the cache is the
+    // object the KV tiering, the int8 layout and the window logic all address
+    // by (position, head) row. Changing its layout to suit one op would put
+    // this optimisation in the way of every other path that touches it.
+    std::vector<f32> attn_q, attn_k, attn_v, attn_o;
+    i64 attn_min_tok = 16; // below this the gather costs more than it saves
+    // Opt-in, and OFF by default, for a reason that is measured rather than
+    // assumed: the engine's chunk-invariance guarantee (two runs that differ
+    // only in --chunk produce the same --prefill-hash) holds because every
+    // row's arithmetic is identical whatever the batch shape. The device
+    // attention kernel IS chunk-invariant on its own -- verified, a run with
+    // every chunk on the device hashes identically at chunk 8, 128 and 512 --
+    // but the n_tok threshold means a small chunk takes the reference body and
+    // a large one takes the device, and those two differ at 1.2e-07. So the
+    // switch, not the kernel, is what costs the invariant, and it is the
+    // switch that buys decode (the device loses below ~4 rows). Turning this
+    // on therefore trades a bit-exactness property for prefill speed, which is
+    // the user's call, not a default.
+    bool attn_on = false;
 
     std::mutex mu;
 
@@ -361,6 +407,8 @@ Offload *create(int device_index, Mode mode, std::string *why) {
     o->unit = unit;
     o->strict_queue = env_on("KRK_NPU_STRICT_QUEUE");
     o->w8a8 = env_on("KRK_NPU_W8A8");
+    o->attn_on = env_on("KRK_NPU_ATTN");
+    o->attn_min_tok = env_i64("KRK_NPU_ATTN_MIN_TOK", o->attn_min_tok);
     vnpu_status_t rc = vnpu_device_create(&cfg, &o->dev);
     if (rc != VNPU_OK) {
         if (why)
@@ -500,6 +548,23 @@ std::string stats(const Offload *o) {
                       static_cast<double>(o->stage_i8_bytes) / (1024.0 * 1024.0),
                       o->n.w8a8_fallback);
     }
+    // Attention: how many calls the device took, and -- when any stayed on the
+    // reference -- the feature that blocked each group, by name. A model whose
+    // attention never reaches the device should say why on the same line the
+    // reader is already looking at, not leave it to be inferred.
+    unsigned long long host_attn = 0;
+    for (int i = 0; i < 6; i++) host_attn += o->n.attn_host[i];
+    if (o->n.attn || host_attn) {
+        out += format("; attn %llu dev, %llu host", o->n.attn, host_attn);
+        bool first = true;
+        for (int i = 0; i < 6; i++) {
+            if (!o->n.attn_host[i]) continue;
+            out += format(first ? " (" : ", ");
+            out += format("%llu %s", o->n.attn_host[i], kAttnWhyName[i]);
+            first = false;
+        }
+        if (!first) out += ")";
+    }
     return out;
 }
 
@@ -620,6 +685,135 @@ bool gemm(Offload *o, void *out, const void *x, const void *w, DType wt,
     o->n.flops += 2ull * static_cast<unsigned long long>(rows) *
                   static_cast<unsigned long long>(n_out) *
                   static_cast<unsigned long long>(n_in);
+    return true;
+}
+
+// One attention call on the device's vectorised kernel.
+//
+// The gap this closes: the reference attention is a scalar loop, and attention
+// is the SQUADRATIC term in prefill. Measured on the 4-layer fixture by
+// sweeping prompt length and fitting a + b*T + c*T^2 to prefill.chunk, the
+// quadratic term is 73.5 ms of a 229.7 ms prefill at T=257 (32%) and 293 ms of
+// 519 ms at T=513 (56%) -- while the device sat idle for 44% of the span.
+//
+// Cost of using it: the gather below, which is O(cache) per call. At prefill
+// shapes that is paid once against T rows of work and the kernel wins by
+// 2.4-3.4x; at decode it is paid once against ONE row and loses, hence
+// attn_min_tok.
+bool attention_offered(const Offload *o) { return o && o->attn_on; }
+
+bool attention(Offload *o, const AttnCall &c) {
+    // A refusal is a refusal: count it under its reason and let the caller run
+    // its own body. Nothing here writes to c.out.
+    if (!o || !o->stream || o->mode != Mode::Graph) return false;
+    if (!o->attn_on) return false; // opt-in; see Offload::attn_on
+    // The first feature that blocks the device, checked in a fixed order so the
+    // counts are deterministic. -1 means nothing blocked it.
+    int why = -1;
+    if (c.kv_int8) why = ATTN_INT8;
+    else if (c.window > 0) why = ATTN_WINDOW;
+    else if (c.skip_from >= 0) why = ATTN_SKIP;
+    else if (c.softcap > 0.0f) why = ATTN_SOFTCAP;
+    else if (c.has_sinks) why = ATTN_SINK;
+    else if (c.n_tok < o->attn_min_tok) why = ATTN_SMALL;
+    if (why >= 0) {
+        o->n.attn_host[why]++;
+        return false;
+    }
+    if (!c.out || !c.q || !c.kcache || !c.vcache) return false;
+    if (c.n_head <= 0 || c.n_kv <= 0 || c.hd <= 0 || c.n_tok <= 0 || c.pos0 < 0)
+        return false;
+    if (c.n_kv > c.n_head || c.n_head % c.n_kv != 0) return false;
+    if (!fits_u32(c.n_head) || !fits_u32(c.hd) || !fits_u32(c.n_tok)) return false;
+    // Causal calls see exactly pos0 + n_tok keys (the query rows are the last
+    // n_tok positions of the cache); a non-causal call sees all of them too.
+    const i64 seq_k = c.pos0 + c.n_tok;
+    if (seq_k <= 0 || !fits_u32(seq_k)) return false;
+
+    const size_t q_elems = static_cast<size_t>(c.n_head) * c.n_tok * c.hd;
+    const size_t kv_elems = static_cast<size_t>(c.n_head) * seq_k * c.hd;
+    if (q_elems > o->attn_q.size() || kv_elems > o->attn_k.size()) {
+        // A queued command may still hold these pointers, so drain first.
+        if (!flush(o)) return false;
+        try {
+            o->attn_q.resize(q_elems);
+            o->attn_o.resize(q_elems);
+            o->attn_k.resize(kv_elems);
+            o->attn_v.resize(kv_elems);
+        } catch (const std::exception &) {
+            return false; // bad_alloc: the caller's own body is the answer
+        }
+    }
+
+    // Gather token-major -> head-major, broadcasting grouped KV heads. The
+    // broadcast is free here: the same pass has to touch every (position, head)
+    // row anyway, so GQA costs the same as MHA.
+    const f32 *qf = static_cast<const f32 *>(c.q);
+    const f32 *kc = static_cast<const f32 *>(c.kcache) + c.layer * c.layer_stride;
+    const f32 *vc = static_cast<const f32 *>(c.vcache) + c.layer * c.layer_stride;
+    const i64 n_rep = c.n_head / c.n_kv;
+    for (i64 h = 0; h < c.n_head; h++) {
+        const i64 hkv = h / n_rep;
+        f32 *qd = o->attn_q.data() + static_cast<size_t>(h) * c.n_tok * c.hd;
+        for (i64 t = 0; t < c.n_tok; t++)
+            std::memcpy(qd + t * c.hd, qf + (t * c.n_head + h) * c.hd,
+                        sizeof(f32) * static_cast<size_t>(c.hd));
+        f32 *kd = o->attn_k.data() + static_cast<size_t>(h) * seq_k * c.hd;
+        f32 *vd = o->attn_v.data() + static_cast<size_t>(h) * seq_k * c.hd;
+        for (i64 p = 0; p < seq_k; p++) {
+            const f32 *src = kc + p * c.pos_stride + hkv * c.hd;
+            std::memcpy(kd + p * c.hd, src, sizeof(f32) * static_cast<size_t>(c.hd));
+            const f32 *srcv = vc + p * c.pos_stride + hkv * c.hd;
+            std::memcpy(vd + p * c.hd, srcv, sizeof(f32) * static_cast<size_t>(c.hd));
+        }
+    }
+
+    vnpu_command_t cmd{};
+    cmd.opcode = VNPU_OP_ATTENTION_F32;
+    vnpu_attention_f32_args_t &a = cmd.args.attention;
+    a.Q = o->attn_q.data();
+    a.K = o->attn_k.data();
+    a.V = o->attn_v.data();
+    a.mask = nullptr;
+    a.O = o->attn_o.data();
+    a.workspace = nullptr;
+    a.workspace_bytes = 0;
+    a.batch = 1;
+    a.heads = static_cast<uint32_t>(c.n_head);
+    a.seq_q = static_cast<uint32_t>(c.n_tok);
+    a.seq_k = static_cast<uint32_t>(seq_k);
+    a.head_dim = static_cast<uint32_t>(c.hd);
+    // The kernel masks key ki when ki > qi + (seq_k - seq_q). With
+    // seq_k = pos0 + n_tok that offset is exactly pos0, so the diagonal lands
+    // on each query row's own absolute position -- correct for a whole prompt,
+    // a later prefill chunk, and a single decode row alike. No mask is built.
+    a.causal = c.causal ? 1u : 0u;
+    a.scale = c.scale;
+    a.unit = o->unit;
+
+    if (!o->push(cmd)) {
+        o->n.declined++;
+        return false;
+    }
+    // The output is scattered back on the host on the next line, so this call
+    // cannot stay queued. One sync per layer, against thousands of scalar
+    // multiply-adds removed -- and the ops queued before it (the QKV GEMMs)
+    // land with it, so the sync is not an extra round trip, it is the one the
+    // caller was about to pay anyway.
+    if (!flush(o)) {
+        o->n.declined++;
+        return false;
+    }
+
+    f32 *of = static_cast<f32 *>(c.out);
+    for (i64 h = 0; h < c.n_head; h++) {
+        const f32 *om = o->attn_o.data() + static_cast<size_t>(h) * c.n_tok * c.hd;
+        for (i64 t = 0; t < c.n_tok; t++)
+            std::memcpy(of + (t * c.n_head + h) * c.hd, om + t * c.hd,
+                        sizeof(f32) * static_cast<size_t>(c.hd));
+    }
+    o->n.attn++;
+    o->n.elements += static_cast<unsigned long long>(q_elems + 2 * kv_elems);
     return true;
 }
 
@@ -768,6 +962,8 @@ bool rmsnorm(Offload *, void *, const void *, const f32 *, i64, i64, f32) {
     return false;
 }
 bool swiglu(Offload *, void *, const void *, const void *, i64) { return false; }
+bool attention(Offload *, const AttnCall &) { return false; }
+bool attention_offered(const Offload *) { return false; }
 bool add(Offload *, void *, const void *, i64) { return false; }
 bool add_scaled(Offload *, void *, const void *, f32, i64) { return false; }
 bool mul(Offload *, void *, const void *, i64) { return false; }
