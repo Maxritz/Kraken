@@ -26,7 +26,7 @@ int main(int argc, char **argv) {
         const i64 grain = 1 + next(static_cast<u64>(std::min<i64>(64, n)));
         const i64 blocks = (n + grain - 1) / grain;
         std::fill(hits.begin(), hits.begin() + static_cast<size_t>(n), 0);
-        Pool::get().run(n, grain, [&](i64 b, i64 e) {
+        Pool::get().run(n, grain, /*split=*/true, [&](i64 b, i64 e) {
             for (i64 i = b; i < e; i++) hits[static_cast<size_t>(i)]++;
         });
         i64 covered = 0, doubled = 0, zero = 0;

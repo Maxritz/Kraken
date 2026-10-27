@@ -22,7 +22,15 @@
 
 namespace krk {
 
-enum class BackendKind { CPU, HIP };
+enum class BackendKind {
+    CPU,
+    HIP,
+    // A virtual NPU (github.com/riteshnair/npuxl-improved): a software device
+    // that runs the GEMM path on its own SIMD kernels. It addresses host
+    // memory directly, so like the CPU reference it has no separate device
+    // tier -- see has_device_memory().
+    NPU,
+};
 
 // A per-shard weight pull source. The loader passes a table of these; the
 // backend turns a source pointer back into a file offset by checking which
@@ -249,6 +257,18 @@ public:
 
     virtual BackendKind kind() const = 0;
     virtual const DeviceCaps &caps() const = 0;
+
+    // True when this backend computes out of a memory space of its own, so
+    // alloc() hands back device memory that has to be staged through upload()
+    // and a VRAM ledger, expert cache and weight streaming all have something
+    // to plan against. False for a backend that computes in place on host
+    // memory: the CPU reference and the virtual NPU. The default keeps every
+    // kind that is not the CPU reference on the device side, which is what
+    // `kind() != BackendKind::CPU` meant at every call site before this
+    // existed.
+    virtual bool has_device_memory() const {
+        return kind() != BackendKind::CPU;
+    }
 
     // Element type used for activations (F16 on GPU, F32 on CPU).
     virtual DType act_type() const = 0;
@@ -700,6 +720,12 @@ public:
     virtual void download_f32(f32 *dst, const void *src, i64 n) = 0;
     // Public device name for logging.
     virtual std::string describe() const = 0;
+
+    // Counters for a run summary, or empty when the backend has none to add.
+    // The NPU backend reports what its GEMM hand-over actually did (calls
+    // offered, calls served, GFLOPs); the reference and the HIP arms do not
+    // keep a parallel ledger and return nothing.
+    virtual std::string backend_stats() const { return std::string(); }
 
     // ---- ops -------------------------------------------------------------
 
@@ -1610,6 +1636,16 @@ Backend *make_cpu_backend();
 
 // Compiled only when KRK_ENABLE_HIP is defined (see CMakeLists.txt).
 Backend *make_hip_backend(int device_index, std::string *err);
+
+// The virtual-NPU backend: the same reference implementation, with the GEMM
+// path handed to a VNPU device (github.com/riteshnair/npuxl-improved). Compiled
+// only when KRK_ENABLE_NPU is defined (see CMakeLists.txt); otherwise
+// make_npu_backend() returns nullptr and *err says so. `err` is filled on
+// failure in both cases.
+Backend *make_npu_backend(int device_index, std::string *err);
+// True when this build has NPU support compiled in (the device itself may
+// still fail to open).
+bool npu_available();
 // Number of visible HIP devices, or 0 when this build has no HIP support.
 int hip_device_count();
 // Human-readable runtime/version string for logging, or "unavailable".

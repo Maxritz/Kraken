@@ -10,6 +10,7 @@
 #include "krk/backend.hpp"
 #include "krk/hc.hpp"
 #include "krk/vram_guard.hpp"
+#include "npu/npu_offload.hpp"
 #include "par_pool.hpp"
 
 #include <algorithm>
@@ -43,11 +44,12 @@ inline f32 silu_scalar(f32 x) { return x / (1.0f + std::exp(-x)); }
 template <class F>
 inline void par_for(i64 n, i64 grain, f64 est_flops, F &&body) {
     if (n <= 0) return;
-    if (est_flops < kParFlopFloor || grain < 1) {
-        body(static_cast<i64>(0), n);
-        return;
-    }
-    Pool::get().run(n, grain, std::forward<F>(body));
+    // The floor decides THROUGHPUT only: the same compiled body runs either
+    // way (see Pool::run's note -- two copies of the arithmetic round
+    // differently, and this backend's whole contract is that its numbers do
+    // not depend on how the work was scheduled).
+    const bool split = est_flops >= kParFlopFloor && grain >= 1;
+    Pool::get().run(n, grain, split, std::forward<F>(body));
 }
 
 void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps,
@@ -79,10 +81,24 @@ void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps
 
 class CpuBackend final : public Backend {
 public:
-    explicit CpuBackend(const DeviceCaps &c) : caps_(c) {}
+    // `npu` is the virtual-NPU offload handle when this instance is the NPU
+    // backend, and null for the plain reference backend. Only the GEMM path
+    // consults it -- see npu_offload.hpp for why that is the whole of the
+    // hand-over and not the first slice of a larger one.
+    explicit CpuBackend(const DeviceCaps &c, npu::Offload *npu = nullptr)
+        : caps_(c), npu_(npu) {}
+    ~CpuBackend() override {
+        if (npu_) npu::destroy(npu_);
+    }
 
-    BackendKind kind() const override { return BackendKind::CPU; }
+    BackendKind kind() const override {
+        return npu_ ? BackendKind::NPU : BackendKind::CPU;
+    }
     const DeviceCaps &caps() const override { return caps_; }
+    // The device computes in place on the memory it is handed, so there is no
+    // separate tier for the engine's VRAM ledger, expert cache or weight
+    // streaming to plan against.
+    bool has_device_memory() const override { return false; }
     DType act_type() const override { return DType::F32; }
     size_t act_size() const override { return 4; }
 
@@ -99,7 +115,14 @@ public:
     void download_f32(f32 *dst, const void *src, i64 n) override {
         std::memcpy(dst, src, static_cast<size_t>(n) * 4);
     }
+    std::string backend_stats() const override {
+        return npu_ ? npu::stats(npu_) : std::string();
+    }
+
     std::string describe() const override {
+        if (npu_)
+            return format("CPU (scalar reference) + %s, %s",
+                          npu::describe(npu_).c_str(), caps_.gfx.c_str());
         return format("CPU (scalar reference), %s", caps_.gfx.c_str());
     }
     // No card here, so the memory policy has nothing to measure and would take
@@ -230,6 +253,13 @@ public:
 
     void gemm(void *out, const void *x, const void *w, DType wt, i64 n_out,
               i64 n_in, i64 rows) override {
+        // The virtual NPU computes this dot product block on its own SIMD
+        // kernels. It returns false -- having written nothing -- for a shape or
+        // weight type it cannot take, and the reference loop below then runs.
+        if (npu_ &&
+            npu::gemm(npu_, static_cast<f32 *>(out), static_cast<const f32 *>(x),
+                      w, wt, n_out, n_in, rows))
+            return;
         const size_t row_bytes = dtype_row_bytes(wt, n_in);
         const f32 *xf = static_cast<const f32 *>(x);
         f32 *of = static_cast<f32 *>(out);
@@ -1618,6 +1648,7 @@ private:
     }
 
     DeviceCaps caps_;
+    npu::Offload *npu_ = nullptr;
 };
 
 Backend *make_cpu_backend() {
@@ -1629,5 +1660,23 @@ Backend *make_cpu_backend() {
     c.cu_count = 1;
     return new CpuBackend(c);
 }
+
+Backend *make_npu_backend(int device_index, std::string *err) {
+    std::string why;
+    npu::Offload *o = npu::create(device_index, &why);
+    if (!o) {
+        if (err) *err = why;
+        return nullptr;
+    }
+    DeviceCaps c;
+    c.name = npu::describe(o);
+    c.gfx = "vnpu";
+    c.family = GfxFamily::Unknown;
+    c.wave_size = 1; // one command at a time per stream, not lockstep lanes
+    c.cu_count = 1;
+    return new CpuBackend(c, o);
+}
+
+bool npu_available() { return npu::available(); }
 
 } // namespace krk

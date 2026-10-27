@@ -1413,7 +1413,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
     // The CPU backend has no device/host split: streaming there would copy host
     // memory to host memory and buy nothing. `weight_budget_ == 0` is automatic.
-    const bool can_stream = be.kind() != BackendKind::CPU &&
+    const bool can_stream = be.has_device_memory() &&
                             be.device_total_bytes() > 0;
     size_t weight_budget = weight_budget_;
     // An explicit --weight-vram-mb is a promise, not a hint: the second ring slot

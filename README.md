@@ -98,6 +98,55 @@ them current: `kraken-inspect` answers from the same tables the loader uses, so 
 stale copy reports `refused` for formats the engine already runs. The CPU backend
 is a scalar f32 reference, and it is what the device path is checked against.
 
+### On a virtual NPU
+
+The compute backend is selectable: HIP, the scalar CPU reference, or the virtual
+NPU from [npuxl-improved](https://github.com/riteshnair/npuxl-improved) — a
+dependency-free software device that runs the GEMM path on its own SIMD kernels
+(AVX2 / AVX-512 / NEON / scalar). Build the device first, then the engine against
+it:
+
+```sh
+git clone https://github.com/riteshnair/npuxl-improved
+cmake -S npuxl-improved -B npuxl-improved/build -DVNPU_BUILD_TOOLS=OFF \
+      -DVNPU_BUILD_TESTS=OFF -DVNPU_BUILD_SHARED=OFF
+cmake --build npuxl-improved/build -j
+
+cmake -B build-npu -DKRK_ENABLE_HIP=OFF -DKRK_ENABLE_NPU=ON \
+      -DKRK_VNPU_ROOT=$PWD/npuxl-improved
+cmake --build build-npu -j
+
+build-npu/kraken -m model.gguf -p "The capital of France is" -n 64 --npu
+```
+
+`--npu` is per run, so the same binary still runs the reference arm (`--cpu`) for
+comparison. What goes to the device is the GEMM — the whole of the model's
+weight math, and the one VNPU op whose numerics agree with the reference to f32
+rounding. The activation-type ops stay on the reference implementation on
+purpose: VNPU's swiglu is a polynomial sigmoid that measures 1.8e-05 off on small
+inputs, two orders of magnitude worse than an f32 rounding difference, and an FFN
+applies it once per layer per token. Handing that over would make the NPU arm a
+slightly different model rather than a different execution schedule.
+`src/npu/npu_offload.hpp` has the full argument.
+
+Every GEMM call is pinned to one compute unit by default (`KRK_NPU_UNIT=voodoo`;
+`cell` and `wildcat` are the other fixed choices), because VNPU's `auto` picks a
+different kernel for a one-row call than for a prefill-sized one and the
+chunk-invariance
+the engine is built around would stop holding as soon as a prompt had more than
+four tokens. `KRK_NPU_UNIT=auto` restores VNPU's own choice. The run summary
+carries the split:
+
+```
+[stats ] npu       gemm 87 call(s), 87 on the device, 0 fell back, 0.7 GFLOP handed over, 22.5 MiB of weights staged
+```
+
+Other knobs: `KRK_NPU_THREADS` (device workers, 0 = hardware concurrency),
+`KRK_NPU_WEIGHT_MB` (dequantized weight staging budget, default 1024),
+`KRK_NPU_PIN_THREADS=1` and `KRK_NPU_TRACE=file.json` (VNPU's own Chrome trace).
+A weight tensor that does not fit the staging budget stays on the reference
+path, counted in `fell back`, and says so once.
+
 ## Run
 
 ```sh
@@ -125,7 +174,13 @@ build-hip/kraken-tests.exe
 ```
 
 There is also an OpenAI-compatible HTTP server, `kraken-server`, which the long
-form describes.
+form describes. It keeps the KV cache between requests: a prompt that repeats or
+extends what the previous request prefilled is only prefilled from the point
+where it stops matching, and `usage.prompt_tokens_details.cached_tokens` says how
+many tokens that was. Measured on a 21-token prompt, the second identical request
+went from 135 ms to 27 ms with byte-identical text. A request that fails clears
+the cache entry rather than leaving rows behind that a later prompt would assume
+were its own.
 
 ## Scores
 

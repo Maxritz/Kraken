@@ -1169,7 +1169,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // engine allocated anything. Without it, `unaccounted` at the end of init is
     // ambiguous between "a buffer we forgot" and "the desktop and the driver",
     // and that ambiguity is how an inferred 3 GiB of scratch survived.
-    if (be_->kind() != BackendKind::CPU && be_->device_total_bytes() > 0) {
+    if (be_->has_device_memory() && be_->device_total_bytes() > 0) {
         const size_t tot = be_->device_total_bytes();
         const size_t fr = be_->device_free_bytes();
         KRK_INFO("vram at start: %.0f MiB total, %.0f MiB free before this engine "
@@ -1889,7 +1889,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // tier inert and the cache one flat allocation, which is what a run
         // whose cache fits does on the GPU too.
         size_t hot;
-        if (be_->kind() == BackendKind::CPU) {
+        if (!be_->has_device_memory()) {
             hot = kv_total;
         } else if (cfg_.kv_hot_mb > 0) {
             hot = static_cast<size_t>(cfg_.kv_hot_mb) * 1048576u;
@@ -2110,7 +2110,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // The CPU backend has no device/host split (every byte is host RAM), so a
     // VRAM floor there is a cap on nothing -- measured: it clamped the suite's
     // CPU MoE fixtures to a zero-byte expert cache.
-    if (be_->kind() != BackendKind::CPU && be_->device_total_bytes() > 0 &&
+    if (be_->has_device_memory() && be_->device_total_bytes() > 0 &&
         model_.experts().vram_budget() > 0) {
         const size_t total = be_->device_total_bytes();
         const size_t floor = krk::vram_floor_bytes(total);
@@ -2451,6 +2451,21 @@ void Engine::trace_rows(const char *what, i32 layer, const void *buf,
 }
 
 u64 Engine::prefill_trace_hash() const {
+    // KRK_TRACE_STAGES=1 prints the per-(stage, layer) hashes the folded value
+    // is made of, one per line, in the same key order. The folded hash answers
+    // "did anything move"; this answers "what moved first", which is the
+    // question a chunk-invariance failure actually asks. It is a diagnostic
+    // and never affects a run that does not set it.
+    static const bool stages_on = [] {
+        const char *e = std::getenv("KRK_TRACE_STAGES");
+        return e && e[0] != '\0' && e[0] != '0';
+    }();
+    if (stages_on) {
+        std::fprintf(stderr, "[stages] %zu key(s)\n", trace_stage_.size());
+        for (const auto &kv : trace_stage_)
+            std::fprintf(stderr, "[stage] %s %016llx\n", kv.first.c_str(),
+                         static_cast<unsigned long long>(kv.second));
+    }
     u64 h = 1469598103934665603ull;
     for (const auto &kv : trace_stage_) { // std::map iterates in key order
         for (char c : kv.first) {
@@ -6963,7 +6978,7 @@ bool Engine::expert_warmup_wanted() const {
         // stage against, and the suite's MoE fixtures assert on the counters a
         // staging pass would move. That is a test-scope choice, stated as one.
         const size_t corpus = model_.total_expert_bytes();
-        if (!be_ || be_->kind() == BackendKind::CPU ||
+        if (!be_ || !be_->has_device_memory() ||
             be_->device_total_bytes() == 0)
             on = corpus > ec.budget_bytes();
         else
@@ -7010,7 +7025,7 @@ bool Engine::expert_warmup_wanted() const {
 // pool's growth room and a pool with none is the measured pathological arm
 // (alloc 30 ms per 2.2 MiB cell, 3.1 tok/s on the same file).
 void Engine::pin_hot_experts() {
-    if (!be_ || be_->kind() == BackendKind::CPU) return;
+    if (!be_ || !be_->has_device_memory()) return;
     const ModelConfig &mc = model_.cfg();
     if (!mc.is_moe || mc.n_expert <= 0 || mc.n_layer <= 0) return;
     ExpertCache &ec = model_.experts();
@@ -7106,7 +7121,7 @@ void Engine::pin_hot_experts() {
 // numbers from the card -- that was wrong by more than 30x: the measured
 // workspace total on this build is 88 MiB at ctx 4096.
 void Engine::log_vram_ledger(const char *when) {
-    if (!be_ || be_->kind() == BackendKind::CPU ||
+    if (!be_ || !be_->has_device_memory() ||
         be_->device_total_bytes() == 0)
         return;
     const size_t weights = model_.upload_bytes();
@@ -7208,7 +7223,7 @@ void Engine::publish_expert_table() {
 // reading, and it only ever lowers: growth has to go through the ring, which
 // names what it is for.
 void Engine::reclamp_expert_budget(const char *why) {
-    if (!be_ || be_->kind() == BackendKind::CPU) return;
+    if (!be_ || !be_->has_device_memory()) return;
     // KRK_RECLAMP=0 is the A/B arm. It exists because this clamp is the one
     // place a run's residency can be cut on a measurement taken while the pool
     // itself was growing, and a budget cut cannot be undone (`reclamp_` only
@@ -9871,7 +9886,7 @@ bool Engine::topk_argmax(i32 *out) {
     // The CPU twin of this op is a plain partial_sort over the whole row, so
     // calling it there would be strictly slower than the host argmax loop it is
     // replacing. Only the device path can win, and it wins by not moving data.
-    if (!be_ || be_->kind() == BackendKind::CPU || topk_scratch_ == nullptr)
+    if (!be_ || !be_->has_device_memory() || topk_scratch_ == nullptr)
         return false;
     // No leading sync. This used to drain the whole device before the launch,
     // which is a stall the stream already prevents: ws_logits_ was written by
@@ -11204,6 +11219,35 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     }
     res->prompt_tokens = static_cast<i32>(ids.size());
 
+    // ---- KV prefix reuse ---------------------------------------------------
+    // The rows [0, reuse) already hold exactly these tokens at these positions,
+    // because the caller rolled the cache back to a prefix it verified and told
+    // us how long it is. Prefilling them again would be the same arithmetic
+    // done twice, so the loop below starts at `reuse` -- and at least one token
+    // is always left, because the row this run samples from is the one the last
+    // prefill call produces.
+    //
+    // The two exclusions are not politeness: a recurrent model's state cannot be
+    // reconstructed by rolling the cursor back, and the speculative paths take
+    // `ids` and prefill the prompt themselves, so honouring the skip there would
+    // leave them prefilling from 0 into a cursor that starts at `reuse`.
+    if (p.reuse_tokens > 0) {
+        if (mtp_spec_ || head_ || draft_ || dflash_) {
+            KRK_WARN("KV prefix reuse is off for this request: a drafter prefills "
+                     "the prompt itself");
+        } else if (model_.is_recurrent()) {
+            KRK_WARN("KV prefix reuse is off for this request: a recurrent model's "
+                     "state cannot be restored by a rollback");
+        } else {
+            const i64 reuse = std::min<i64>(
+                p.reuse_tokens, static_cast<i64>(ids.size()) - 1);
+            if (reuse > 0) {
+                kv_pos_ = reuse;
+                res->reused_tokens = static_cast<i32>(reuse);
+            }
+        }
+    }
+
     // The nextn block is a drafter that ships inside the target's own file, so
     // it is tried before the external draft engines; --draft and --mtp-spec are
     // alternatives, and a run with both loaded uses the block.
@@ -11294,7 +11338,8 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     // after the logits fetch.
     krk::HostTime::set_phase(krk::HostTime::kPrefill);
     const Timer prefill_timer;
-    for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+    for (i64 i = res->reused_tokens; i < static_cast<i64>(ids.size());
+         i += chunk_) {
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());

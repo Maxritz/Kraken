@@ -265,6 +265,20 @@ struct GenerateParams {
     // first step already differing means something raced.
     i32 debug_topk = 0;
 
+    // Prompt tokens already resident in the KV cache, from position 0. A
+    // server that keeps the cache across requests sets this after rolling the
+    // cache back to the longest common prefix it found, and the prefill then
+    // starts at `reuse_tokens` instead of at 0 -- the rows below it already
+    // hold exactly these tokens at exactly these positions, so the result is
+    // the one a full prefill would have produced.
+    //
+    // 0 (the default) is the historical behaviour: prefill the whole prompt.
+    // It is ignored, with a warning, for a recurrent model (whose state cannot
+    // be reconstructed by a rollback) and for the speculative paths (which
+    // prefill the prompt themselves), so a caller cannot corrupt a run by
+    // setting it when it does not apply.
+    i32 reuse_tokens = 0;
+
     // Force the argmax on the host from the downloaded logits row instead of
     // on the device via logits_topk. Costs a 993 kB download per token at this
     // vocab, and buys determinism: the device argmax path is the one carrying
@@ -294,6 +308,10 @@ struct GenerateResult {
     std::vector<i32> tokens;
     int finish = FinishLength;
     i32 prompt_tokens = 0;
+    // How many of prompt_tokens the prefill was allowed to skip because the KV
+    // cache already held them (see GenerateParams::reuse_tokens). 0 for a run
+    // that prefilled the whole prompt.
+    i32 reused_tokens = 0;
     i32 generated = 0;
     f64 prefill_ms = 0;
     f64 decode_ms = 0;
