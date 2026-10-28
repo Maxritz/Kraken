@@ -72,6 +72,12 @@ constexpr ArchSpec gpt2_spec() {
     // that names it is set here too. `fused_gate_up` stays false: GPT-2's MLP
     // has no gate tensor, and reading one would halve the intermediate.
     s.fused_qkv = true;
+    // The bundle, spelled out in the fine flags the rest of the plain family
+    // sets individually. Every reader now keys off these, so GPT-2 and its
+    // relatives run the same code path with different pieces switched on.
+    s.ln_bias = true;
+    s.learned_pos = true;
+    s.no_gate_ffn = true;
     s.rope_neox = false;
     // No RoPE anywhere: learned positions are added into the embedding instead.
     // The engine reads this off gpt2_style rather than off a rotary flag, so
@@ -103,11 +109,62 @@ constexpr ArchSpec phi3_spec() {
     return s;
 }
 
+// GPT-NeoX: rotary positions, LayerNorm-with-bias everywhere, one fused
+// `attn_qkv` WITH a bias, and -- the part that is its own graph -- a PARALLEL
+// residual: the attention and the FFN both read the same normed row and are
+// summed into the residual, rather than the FFN re-norming the post-attention
+// stream. That is `use_parallel_residual` in the file, true for every released
+// NeoX checkpoint; the sequential shape would still load and would still
+// decode, one graph deeper, which is why the flag exists.
+constexpr ArchSpec gptneox_spec() {
+    ArchSpec s{"gptneox", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "gptneox", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.ln_bias = true;
+    s.parallel_residual = true;
+    s.no_gate_ffn = true;
+    // NeoX pairs channel j with j + n_rot/2 (llama.cpp's LLAMA_ROPE_TYPE_NEOX).
+    s.rope_neox = true;
+    return s;
+}
+
+// GPT-J: the same stack with no biases anywhere and the NORM rope pairing.
+// It has no `attn_output.bias`, no `ffn_*.bias` and no norm biases, so the
+// loader finds them absent -- `upload_f32` returns null for a missing tensor and
+// every one of those applications is guarded on the pointer.
+constexpr ArchSpec gptj_spec() {
+    ArchSpec s{"gptj", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "gptj", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.ln_bias = true;
+    s.no_gate_ffn = true;
+    return s;
+}
+
+// Phi-2: a fused `attn_qkv` WITH a bias (which this engine refused until now),
+// LayerNorm, an ungated GELU MLP, and PARTIAL rotary -- `rope.dimension_count`
+// is 32 of an 80-wide head, so only the first 32 channels rotate. The loader
+// already reads that into ModelConfig::rope_frac; the forward passes it to the
+// rope, which is the same partial-rotary path Phi-3 uses.
+constexpr ArchSpec phi2_spec() {
+    ArchSpec s{"phi2", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "phi2", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.ln_bias = true;
+    s.no_gate_ffn = true;
+    return s;
+}
+
 constexpr ArchSpec kTable[] = {
     // ---- the schemas this engine runs ------------------------------------
     {"llama", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
      false, false, false, false},
     phi3_spec(),
+    // The plain pre-norm family: rotary (or learned) positions, LayerNorm and a
+    // fused QKV, differing only in which of the fine flags above they set.
+    gptneox_spec(),
+    gptj_spec(),
+    phi2_spec(),
     // GPT-2 and its descendants: LayerNorm (biased), learned absolute
     // positions, a fused attn_qkv, and a plain GELU MLP. See
     // ArchSpec::gpt2_style for why those four travel together.

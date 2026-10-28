@@ -374,16 +374,20 @@ def _quant_np(v, fmt):
 
 def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
           arch="llama", n_expert=0, n_expert_used=0, n_ff_exp=0, scale=0.04,
-          fused=False, fused_ffn=None):
+          fused=False, fused_ffn=None, plain=None, split_qkv=False):
     # `fused` is the Q|K|V projection, `fused_ffn` the gate|up one; a Phi file
     # has both, and the two are separable so a test can fuse one at a time and
     # find which of them changed the logits.
     if fused_ffn is None:
         fused_ffn = fused
+    # The plain pre-norm family. `biases` is true for the members that carry a
+    # bias beside every weight (gptneox, phi2); GPT-J has none anywhere.
+    biases = plain in ("gptneox", "phi2")
     rnd = random.Random(seed)
     q_dim, kv_dim = n_head * hd, n_kv * hd
     moe = n_expert > 0
-    assert arch in ("llama", "phi3") or arch == "qwen3moe", arch
+    assert arch in ("llama", "phi3", "gptneox", "gptj", "phi2") \
+        or arch == "qwen3moe", arch
     assert not moe or (n_ff_exp > 0 and 0 < n_expert_used <= n_expert)
 
     tokens = ["<unk>", "<s>", "</s>"]
@@ -488,24 +492,57 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
     def ones(name, n):
         g.tensor(name, n, 1, struct.pack("<%df" % n, *([1.0] * n)), T_F32)
 
+    def zeros(name, n):
+        g.tensor(name, n, 1, struct.pack("<%df" % n, *([0.0] * n)), T_F32)
+
     w("token_embd.weight", n_embd, vocab)
     ones("output_norm.weight", n_embd)
     w("output.weight", n_embd, vocab)
+    if plain:
+        # LayerNorm on the way out, with its bias -- a LayerNorm run without
+        # its bias keeps each row's mean, which shifts every logit.
+        if biases:
+            zeros("output_norm.bias", n_embd)
     for l in range(n_layer):
         p = "blk.%d." % l
         ones(p + "attn_norm.weight", n_embd)
         ones(p + "ffn_norm.weight", n_embd)
-        if fused:
-            # Phi-3: Q | K | V in one projection, and under GQA the K and V
-            # blocks are kv_dim wide, not n_embd -- drawn q, k, v in that order
-            # so the stream matches the split file's.
+        if biases:
+            zeros(p + "attn_norm.bias", n_embd)
+            zeros(p + "ffn_norm.bias", n_embd)
+        if fused or (plain and not split_qkv):
+            # Phi-3 and the plain family: Q | K | V in one projection, and
+            # under GQA the K and V blocks are kv_dim wide, not n_embd --
+            # drawn q, k, v in that order so the stream matches the split
+            # file's.
             w_cat(p + "attn_qkv.weight",
                   [(n_embd, q_dim), (n_embd, kv_dim), (n_embd, kv_dim)])
+            if biases:
+                g.tensor(p + "attn_qkv.bias", q_dim + 2 * kv_dim, 1,
+                         struct.pack("<%df" % (q_dim + 2 * kv_dim),
+                                     *[0.01 * (i % 7 - 3)
+                                       for i in range(q_dim + 2 * kv_dim)]),
+                         T_F32)
         else:
             w(p + "attn_q.weight", n_embd, q_dim)
             w(p + "attn_k.weight", n_embd, kv_dim)
             w(p + "attn_v.weight", n_embd, kv_dim)
+            if biases:
+                # The SAME bias the fused file carries, cut at the same
+                # offsets -- the pattern keeps running across the parts instead
+                # of restarting, so a split file and a fused file are the same
+                # function and their logits must match exactly.
+                boff = 0
+                for nm, wd in (("attn_q", q_dim), ("attn_k", kv_dim),
+                               ("attn_v", kv_dim)):
+                    g.tensor(p + nm + ".bias", wd, 1,
+                             struct.pack("<%df" % wd,
+                                         *[0.01 * ((boff + i) % 7 - 3)
+                                           for i in range(wd)]), T_F32)
+                    boff += wd
         w(p + "attn_output.weight", q_dim, n_embd)
+        if biases:
+            zeros(p + "attn_output.bias", n_embd)
         if moe:
             # Router projection, then the three stacked expert tensors. An
             # all-MoE checkpoint legitimately has no dense ffn_* tensors: the
@@ -518,10 +555,19 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
             if fused_ffn:
                 # gate | up in one row, gate first (drawn gate-then-up).
                 w_cat(p + "ffn_up.weight", [(n_embd, n_ff), (n_embd, n_ff)])
+            elif plain:
+                # Ungated MLP: one up projection and no ffn_gate tensor at all.
+                w(p + "ffn_up.weight", n_embd, n_ff)
+                if biases:
+                    zeros(p + "ffn_up.bias", n_ff)
             else:
                 w(p + "ffn_gate.weight", n_embd, n_ff)
                 w(p + "ffn_up.weight", n_embd, n_ff)
+                if biases:
+                    zeros(p + "ffn_up.bias", n_ff)
             w(p + "ffn_down.weight", n_ff, n_embd)
+            if biases:
+                zeros(p + "ffn_down.bias", n_embd)
 
     return g.write(path)
 
@@ -549,6 +595,14 @@ def main(argv=None):
                     help="experts routed per token (0 = 2)")
     ap.add_argument("--expert-ff", type=int, default=0,
                     help="expert hidden width (0 = --ff)")
+    ap.add_argument("--plain", default="",
+                    choices=["", "gptneox", "gptj", "phi2"],
+                    help="one of the plain pre-norm family layouts: a fused "
+                         "attn_qkv (Q|K|V), LayerNorm, rotary positions and an "
+                         "ungated GELU MLP")
+    ap.add_argument("--split-qkv", action="store_true",
+                    help="with --plain: store attn_q/attn_k/attn_v separately "
+                         "so the two layouts can be compared on one weight set")
     ap.add_argument("--phi3-qkv-only", action="store_true",
                     help="phi3 arch with only attn_qkv fused (bisecting aid)")
     ap.add_argument("--phi3-ffn-only", action="store_true",
@@ -579,11 +633,13 @@ def main(argv=None):
     size = build(a.out, a.embd, a.layers, heads, kv_heads, a.head_dim, ff,
                  a.vocab, a.ctx, a.format, a.seed,
                  arch="qwen3moe" if a.experts
-                 else ("phi3" if (a.phi3 or a.phi3_qkv_only or a.phi3_ffn_only)
-                       else "llama"),
+                 else (a.plain or
+                       ("phi3" if (a.phi3 or a.phi3_qkv_only or a.phi3_ffn_only)
+                        else "llama")),
                  n_expert=a.experts, n_expert_used=used, n_ff_exp=ff_exp,
                  scale=a.scale, fused=a.phi3 or a.phi3_qkv_only,
-                 fused_ffn=a.phi3 or a.phi3_ffn_only)
+                 fused_ffn=a.phi3 or a.phi3_ffn_only,
+                 plain=a.plain or None, split_qkv=a.split_qkv)
     moe = ("%d experts top-%d, expert ff %d, " % (a.experts, used, ff_exp)
            if a.experts else "")
     print("wrote %s: %d layers, embd %d, %d/%d heads, hd %d, ff %d, %s"

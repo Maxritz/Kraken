@@ -238,6 +238,31 @@ struct ArchSpec {
     //               n_ff each, with no `ffn_gate` tensor in the file at all.
     bool fused_qkv = false;
     bool fused_gate_up = false;
+    // ---- the plain pre-norm family (gpt2, gptneox, gptj, phi2) -------------
+    // These four flags are the pieces `gpt2_style` bundles. It bundled them
+    // because on GPT-2 they are one architecture; they are NOT one architecture
+    // across the family, and the bundle is the reason `gptneox` had nowhere to
+    // be added: it wants LayerNorm-with-bias and an ungated GELU MLP and a
+    // fused QKV (all of the bundle) but RoPE instead of learned positions (not
+    // the bundle). Naming the pieces separately lets each family take what it
+    // has. `gpt2_spec()` now sets all of them, so GPT-2 reads exactly as it
+    // did.
+    //
+    //   ln_bias          LayerNorm (mean and variance, a bias beside every
+    //                    weight) rather than RMSNorm.
+    //   learned_pos      `position_embd.weight` summed into the token
+    //                    embedding; no rotary table anywhere.
+    //   parallel_residual  the attention and the FFN both read the SAME normed
+    //                    row and are summed into the residual, instead of the
+    //                    FFN re-norming the post-attention stream. Two
+    //                    different graphs; see Engine::plain_forward.
+    //   no_gate_ffn      up -> gelu -> down, with no `ffn_gate` tensor in the
+    //                    file. Reading ffn_up as a gate instead would halve the
+    //                    intermediate width.
+    bool ln_bias = false;
+    bool learned_pos = false;
+    bool parallel_residual = false;
+    bool no_gate_ffn = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

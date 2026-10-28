@@ -1169,3 +1169,20 @@ Verified against the reference decoder on the *same* activation by
 `kraken-kquant-dot`: worst error 4.1e-08 of gross magnitude, `failure: none`.
 Measured over six alternating reps, Q2_K **2.1×** and Q3_K **4.5×** median
 (6/6 reps favour the kernel for both).
+
+### The plain pre-norm family: gptneox, gptj, phi2
+
+`gpt2_style` bundled four things as one architecture — LayerNorm-with-bias,
+learned positions, a fused QKV and an ungated GELU MLP — because on GPT-2 they
+*are* one architecture. They are not one architecture across the family, which
+is why `gptneox` had nowhere to be added. Four flags now name the pieces
+(`ln_bias`, `learned_pos`, `parallel_residual`, `no_gate_ffn`), `gpt2_spec()`
+sets all four so GPT-2 is unchanged, and `Engine::plain_forward` covers all four
+architectures.
+
+`gptneox` reads the fused QKV **as row views** of one weight, so fused and split
+layouts are bit-identical on the same weights — verified for all three, with
+`parallel_residual` separately checked to change the graph rather than being
+ignored. See [docs/PLAIN-PRENORM-FAMILY.md](docs/PLAIN-PRENORM-FAMILY.md), which
+also records two loader bugs this found (`output_norm.bias` wrongly *required*,
+so complete GPT-J files were refused; and `layer_norm_epsilon` never read).
