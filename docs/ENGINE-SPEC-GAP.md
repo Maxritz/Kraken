@@ -48,7 +48,19 @@ hard requirements:
 * **No float atomics in the reduction.** Expert outputs are summed on the host
   in a fixed order, not in completion order.
 
-Two gaps against the contract:
+One design difference the spec names as disqualifying is **present and opt-in**:
+`--router-resident` / `KRK_ROUTER_TIE_MARGIN` (`src/engine.cpp`, `router_pref_`)
+sends a pick within a margin of the top score to an expert that is *resident*
+in VRAM or WARM. That is `score' = score + beta * 1[e in P]` — the bias targets
+the physical store, which is the one arrangement §1.2 says cannot satisfy
+bit-identical paged-vs-resident runs, because the selected set then depends on
+what happened to be in memory. It is off by default (`router_tie_margin_ = 0`
+unless the flag or env var is set) and the engine logs that it is active, so it
+is a hazard rather than a live defect. The spec's fix is to prefer resident
+experts through a deterministic logical set `L` instead of through `P`; that
+change would keep the speed trick and pass the gate, and it is not made here.
+
+Two further gaps against the contract:
 
 1. **Tie-break is not by expert id.** The router picks with
    `partial_sort(..., [&](i32 a, i32 b) { return row[a] > row[b]; })`
