@@ -1386,6 +1386,52 @@ proved it was **not**, because the load sat inside `if (cfg_.ln_bias)` and Phi-M
 is an RMSNorm family that never enters that branch. `kraken-tests` 5500/5500.
 See [docs/LLAMA-SCHEMA-VARIANTS.md](docs/LLAMA-SCHEMA-VARIANTS.md).
 
+### Two more families, and a null buffer the test found
+
+`lfm2` and `qwen2moe` are now read, and between them they show the two shapes a
+port takes.
+
+**`lfm2` is a dense sibling, not a new graph.** llama.cpp keeps one builder and
+one hparam set for LFM2 and LFM2-MoE (`case LLM_ARCH_LFM2: case
+LLM_ARCH_LFM2MOE:`), so the dense form is the same shortconv mixer, the same
+per-layer `head_count_kv` array, the same missing `output_norm` and the same
+NeoX rope pairing — only `expert_count` is gone, and the layer's own bank
+decides which FFN runs. The entry is `lfm2moe` with `expert_w_norm = 0` and no
+expert bank required, and `build_lfm2_dense_model` drives the mixer, the
+per-layer KV counts and the no-output-norm path end to end.
+
+**`qwen2moe` is Qwen2's body plus a gated shared expert.** The reference
+computes the gate as `silu(g)/g` from a 1-D `ffn_gate_inp_shexp` row, which is
+exactly `sigmoid(g)`, and multiplies the shared branch by it before folding it
+into the routed sum; the router is a plain softmax and the top-k weights are
+used un-normalized (`norm_w = false`), so `expert_w_norm` is 0.
+
+That gate is where the port found a **live defect**. `Engine::moe_ffn` wrote the
+gate into `ws_ssm_`, a workspace allocated only under
+`model_.is_recurrent() && model_.has_lfm_conv()`. The family that wrote the path
+— Qwen3.5 — *is* recurrent, so it never noticed; `qwen2moe` is a dense-MoE
+stack with the same tensor, and its first forward dereferenced a null pointer.
+The gate now has its own `ws_shexp_g_`, allocated with the other MoE buffers
+whenever the model has routed experts. `test_qwen2moe`'s arms pin it: with the
+shared expert zeroed the logits must match a shared-expert-free forward, and
+with the gate row driven to ±20 (`sigmoid` ≈ 1 / ≈ 0) the shared branch must
+move in one direction only.
+
+The audit that class of bug comes from — every workspace, the guard around its
+allocation, and the functions that use it — is
+[docs/ENGINE-AUDIT.md](docs/ENGINE-AUDIT.md); the per-family delta against the
+reference's tensor list, and the order to close the rest of the gap, is
+[docs/REFERENCE-COVERAGE.md](docs/REFERENCE-COVERAGE.md).
+
+One more thing the port fixed: `test_moe_matches_dense_twin` compared a
+`qwen2moe` single-expert layer against a **`llama`** dense layer. That was the
+same attention only while `qwen2moe` fell through to the fallback spec; the
+moment the family became real its rope became the NeoX pairing, and the twins
+could no longer agree. Both arms are `qwen2` family files now, so the test
+measures the FFN and not the arch string.
+
+`kraken-tests` 5974/5974.
+
 ### Fused projections: Phi-3 / Phi-4
 
 `phi3` is now a supported architecture. Phi-3 and Phi-4 store two fused

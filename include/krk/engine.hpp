@@ -1275,6 +1275,11 @@ private:
     // MoE-only workspaces (null for dense models)
     void *ws_router_ = nullptr; // [chunk, n_expert]
     void *ws_ffn_ = nullptr;    // [chunk, n_embd] MoE output accumulator
+    // One f32 scalar per token: the shared expert's gate. It used to live in
+    // `ws_ssm_`, which is allocated only for a RECURRENT stack, so the first
+    // non-hybrid family to carry `ffn_gate_inp_shexp` (qwen2moe) dereferenced a
+    // null pointer in its first forward.
+    void *ws_shexp_g_ = nullptr; // [chunk] shared-expert gate
 
     // ---- gemma4 per-layer input embeddings -------------------------------
     // `ws_ppl_` holds the gathered per-layer token table for these tokens and

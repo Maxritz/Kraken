@@ -2613,7 +2613,13 @@ static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
     const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
     const int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32, vocab = 260, ctx = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
-    const std::string arch = s.dense ? "llama" : "qwen2moe";
+    // Both arms must be the SAME attention body or the twin comparison measures
+    // the arch strings instead of the FFN: `qwen2moe` is the `qwen2` family, so
+    // its rope is the NeoX pairing, and the dense arm has to be a `qwen2` file
+    // to get the same pairing. Written as `llama` this fixture compared a
+    // NeoX-rope MoE layer against an adjacent-pair dense one and the tokens
+    // could only differ (`test_moe_matches_dense_twin`).
+    const std::string arch = s.dense ? "qwen2" : "qwen2moe";
 
     GgufBuilder b;
     b.meta_str("general.architecture", arch);
@@ -11081,6 +11087,299 @@ static bool build_lfm2_gate_model(const std::string &path, int ctx = 64,
         }
     }
     return b.write(path);
+}
+
+// Dense LFM2: the SAME stack as the LFM2-MoE gate fixture with a plain FFN in
+// place of the routed block. The reference keeps one builder and one hparam
+// set for both arch strings (`case LLM_ARCH_LFM2: case LLM_ARCH_LFM2MOE:`), so
+// the mixer, the per-layer `head_count_kv` array and the missing `output_norm`
+// must all work with no experts at all -- and `expert_gating_func` is absent
+// from a dense file, which is the field the loader used to require.
+static bool build_lfm2_dense_model(const std::string &path, int ctx = 64) {
+    const int n_embd = 64, n_layer = 3, n_head = 4, hd = 16, n_kv = 2;
+    const int n_ff = 64, vocab = 261;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", "lfm2");
+    b.meta_str("general.name", "kraken-lfm2-dense");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("lfm2.block_count", n_layer);
+    b.meta_u32("lfm2.context_length", ctx);
+    b.meta_u32("lfm2.embedding_length", n_embd);
+    b.meta_u32("lfm2.feed_forward_length", n_ff);
+    b.meta_u32("lfm2.attention.head_count", n_head);
+    // The per-layer array again: the conv layers say 0, the attention layer
+    // says 2. Nothing about it is MoE-specific.
+    b.meta_i32_array("lfm2.attention.head_count_kv", {0, 0, n_kv});
+    b.meta_u32("lfm2.attention.key_length", hd);
+    b.meta_f32("lfm2.attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32("lfm2.rope.freq_base", 1e7f);
+    b.meta_u32("lfm2.shortconv.l_cache", 3);
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("token_embd_norm.weight", {u64(n_embd)}, ones(n_embd));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (l < 2) {
+            b.tensor_f16(p + "shortconv.in_proj.weight",
+                         {u64(n_embd), u64(3 * n_embd)},
+                         vec(static_cast<size_t>(n_embd) * 3 * n_embd,
+                             100 + l * 1000));
+            b.tensor_f32(p + "shortconv.conv.weight", {3, u64(n_embd)},
+                         vec(static_cast<size_t>(3) * n_embd, 200 + l * 1000));
+            b.tensor_f16(p + "shortconv.out_proj.weight",
+                         {u64(n_embd), u64(n_embd)},
+                         vec(static_cast<size_t>(n_embd) * n_embd,
+                             300 + l * 1000));
+        } else {
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                         vec(static_cast<size_t>(n_embd) * q_dim, 700));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, 800));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, 900));
+            b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                         vec(static_cast<size_t>(q_dim) * n_embd, 1000));
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        }
+        // Every layer is dense: the same SwiGLU block on both mixes.
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, 400 + l * 1000));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, 500 + l * 1000));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, 600 + l * 1000));
+    }
+    return b.write(path);
+}
+
+// Qwen1.5-MoE (`qwen2moe`): Qwen2's body with a routed bank beside a SHARED
+// expert, and the three details the reference is explicit about -- a
+// per-token sigmoid gate on the shared branch (`silu(g)/g`), top-k weights used
+// as the softmax emitted them (`norm_w = false`), and q/k/v biases.
+//
+// The arms A/B the two pieces that are this family's own: the shared expert and
+// its gate. Neither can be seen by "it loads and generates", which is why each
+// is zeroed/driven to its extremes and the logits compared.
+static bool build_qwen2moe_model(const std::string &path, f32 shexp_gate_scale,
+                                 bool zero_shexp_down) {
+    const int n_embd = 32, n_layer = 2, n_head = 4, n_kv = 2, hd = 8;
+    const int n_ff = 64, vocab = 261, n_exp = 4, n_used = 2, ff_exp = 16;
+    const int n_ff_sh = 24;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", "qwen2moe");
+    b.meta_str("general.name", "kraken-qwen2moe");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("qwen2moe.block_count", n_layer);
+    b.meta_u32("qwen2moe.context_length", 64);
+    b.meta_u32("qwen2moe.embedding_length", n_embd);
+    b.meta_u32("qwen2moe.feed_forward_length", n_ff);
+    b.meta_u32("qwen2moe.attention.head_count", n_head);
+    b.meta_u32("qwen2moe.attention.head_count_kv", n_kv);
+    b.meta_u32("qwen2moe.attention.key_length", hd);
+    b.meta_f32("qwen2moe.attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32("qwen2moe.rope.freq_base", 10000.0f);
+    b.meta_u32("qwen2moe.expert_count", n_exp);
+    b.meta_u32("qwen2moe.expert_used_count", n_used);
+    b.meta_u32("qwen2moe.expert_feed_forward_length", ff_exp);
+    b.meta_u32("qwen2moe.expert_shared_feed_forward_length", n_ff_sh);
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + l * 4096;
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, base + 100));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 200));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 300));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400));
+        // Qwen2's biases -- the family carries all three.
+        b.tensor_f32(p + "attn_q.bias", {u64(q_dim)}, vec(q_dim, base + 500));
+        b.tensor_f32(p + "attn_k.bias", {u64(kv_dim)}, vec(kv_dim, base + 600));
+        b.tensor_f32(p + "attn_v.bias", {u64(kv_dim)}, vec(kv_dim, base + 700));
+
+        // Routed bank.
+        b.tensor_f16(p + "ffn_gate_inp.weight", {u64(n_embd), u64(n_exp)},
+                     vec(static_cast<size_t>(n_embd) * n_exp, base + 800));
+        const size_t gsz = static_cast<size_t>(n_embd) * ff_exp;
+        const size_t dsz = static_cast<size_t>(ff_exp) * n_embd;
+        std::vector<f32> gate(gsz * n_exp), up(gsz * n_exp), down(dsz * n_exp);
+        for (size_t e = 0; e < static_cast<size_t>(n_exp); e++) {
+            for (size_t k = 0; k < gsz; k++) {
+                gate[e * gsz + k] = wv(base + 900 + static_cast<i64>(k) + static_cast<i64>(e) * 7919);
+                up[e * gsz + k] = wv(base + 1100 + static_cast<i64>(k) + static_cast<i64>(e) * 7919);
+            }
+            for (size_t k = 0; k < dsz; k++)
+                down[e * dsz + k] = wv(base + 1300 + static_cast<i64>(k) + static_cast<i64>(e) * 7919);
+        }
+        b.tensor_f16(p + "ffn_gate_exps.weight", {u64(n_embd), u64(ff_exp), u64(n_exp)}, gate);
+        b.tensor_f16(p + "ffn_up_exps.weight", {u64(n_embd), u64(ff_exp), u64(n_exp)}, up);
+        b.tensor_f16(p + "ffn_down_exps.weight", {u64(ff_exp), u64(n_embd), u64(n_exp)}, down);
+
+        // Shared expert, with the 1-D gate the family gates it by. A zero-width
+        // gate vector would make the branch a constant; the caller drives it to
+        // either extreme instead.
+        b.tensor_f16(p + "ffn_gate_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                     vec(static_cast<size_t>(n_embd) * n_ff_sh, base + 1500));
+        b.tensor_f16(p + "ffn_up_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                     vec(static_cast<size_t>(n_embd) * n_ff_sh, base + 1700));
+        b.tensor_f16(p + "ffn_down_shexp.weight", {u64(n_ff_sh), u64(n_embd)},
+                     zero_shexp_down
+                         ? std::vector<f32>(static_cast<size_t>(n_ff_sh) * n_embd, 0.0f)
+                         : vec(static_cast<size_t>(n_ff_sh) * n_embd, base + 1900));
+        b.tensor_f32(p + "ffn_gate_inp_shexp.weight", {u64(n_embd)},
+                     std::vector<f32>(static_cast<size_t>(n_embd), shexp_gate_scale));
+    }
+    return b.write(path);
+}
+
+static bool qwen2moe_logits(const std::string &p, std::vector<f32> &lg, std::string &err) {
+    Backend *be = make_cpu_backend();
+    bool ok = false;
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = p;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        if (e.init(be, c, &err)) {
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 2;
+            GenerateResult r;
+            if (e.generate(gp, &r)) {
+                const i32 nv = e.model().cfg().n_vocab;
+                lg.assign(e.last_logits(), e.last_logits() + nv);
+                ok = true;
+            }
+        }
+    }
+    delete be;
+    return ok;
+}
+
+static void test_qwen2moe() {
+    const std::string base = "kraken-qwen2moe.gguf";
+    CHECK(build_qwen2moe_model(base, 1.0f, false), "wrote the qwen2moe fixture");
+    CHECK(arch_lookup("qwen2moe") != nullptr &&
+              arch_lookup("qwen2moe")->support == ArchSupport::Yes,
+          "qwen2moe is a supported arch");
+    CHECK(arch_lookup("qwen2moe")->shape == ArchShape::Moe,
+          "and declares the routed shape");
+    CHECK(arch_lookup("qwen2moe")->qkv_bias && !arch_lookup("qwen2moe")->qk_norm,
+          "with qwen2's biases and no QK norm");
+
+    std::string err;
+    std::vector<f32> lg;
+    const bool ok = qwen2moe_logits(base, lg, err);
+    if (!ok) std::fprintf(stderr, "  (qwen2moe: %s)\n", err.c_str());
+    CHECK(ok, "a qwen2moe file loads and generates");
+    if (!ok) return;
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 d = 0.0f;
+        for (size_t i = 0; i < std::min(a.size(), b.size()); i++)
+            d = std::max(d, std::fabs(a[i] - b[i]));
+        return d;
+    };
+    // The shared expert is in the graph: zeroing its down projection must move
+    // the answer. A shared branch that was silently dropped would leave the two
+    // arms identical.
+    const std::string no_sh = "kraken-qwen2moe-noshexp.gguf";
+    CHECK(build_qwen2moe_model(no_sh, 1.0f, true), "wrote the shared-expert-off twin");
+    std::vector<f32> lg2;
+    std::string err2;
+    if (qwen2moe_logits(no_sh, lg2, err2))
+        CHECK(maxdiff(lg, lg2) > 1e-4f,
+              "the shared expert contributes: zeroing it moves the logits");
+    else
+        CHECK(false, ("the shared-expert-off twin failed: " + err2).c_str());
+    // ... and its GATE is in the graph: a gate vector of +20 makes sigmoid ~1,
+    // -20 makes it ~0. The two arms differ from each other and from the base,
+    // which a graph that ignored `ffn_gate_inp_shexp` could not do.
+    const std::string g_hi = "kraken-qwen2moe-ghi.gguf";
+    const std::string g_lo = "kraken-qwen2moe-glo.gguf";
+    CHECK(build_qwen2moe_model(g_hi, 20.0f, false), "wrote the gate-open twin");
+    CHECK(build_qwen2moe_model(g_lo, -20.0f, false), "wrote the gate-closed twin");
+    std::vector<f32> lhi, llo;
+    std::string ehi, elo;
+    const bool okhi = qwen2moe_logits(g_hi, lhi, ehi);
+    const bool oklo = qwen2moe_logits(g_lo, llo, elo);
+    CHECK(okhi && oklo, "both gate extremes run");
+    if (okhi && oklo) {
+        CHECK(maxdiff(lhi, llo) > 1e-3f,
+              "the shared-expert gate is applied: open and closed disagree");
+        CHECK(maxdiff(llo, lg) > 1e-4f,
+              "and the closed gate is not the default arm: the row is read");
+    }
+}
+
+static void test_lfm2_dense() {
+    const std::string file = "kraken-lfm2-dense.gguf";
+    CHECK(build_lfm2_dense_model(file), "wrote the dense LFM2 fixture");
+    CHECK(arch_lookup("lfm2") != nullptr && arch_lookup("lfm2")->support == ArchSupport::Yes,
+          "lfm2 is a supported arch, not an alias of the MoE one");
+    Backend *cpu = make_cpu_backend();
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = file;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        std::string err;
+        const bool ok = e.init(cpu, c, &err);
+        if (!ok) std::fprintf(stderr, "  (lfm2 dense init: %s)\n", err.c_str());
+        CHECK(ok, "a dense LFM2 file loads");
+        if (ok) {
+            const Model &m = e.model();
+            CHECK(!m.cfg().is_moe, "and reports no experts");
+            CHECK(m.cfg().n_layer == 3 && m.cfg().n_ff == 64,
+                  "the FFN width is the file's dense one");
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 4;
+            GenerateResult r;
+            CHECK(e.generate(gp, &r), "it generates through the short-conv mixer");
+            CHECK(r.generated > 0, "... and emits tokens");
+            const f32 *lg = e.last_logits();
+            bool finite = lg != nullptr;
+            for (i32 i = 0; finite && i < m.cfg().n_vocab; i++)
+                finite = std::isfinite(lg[i]);
+            CHECK(finite, "and the logits are finite");
+        }
+    }
+    delete cpu;
 }
 
 // One CLI prefill of the LFM2 fixture. Same shape as run_prefill_hash, but
@@ -20404,6 +20703,8 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_dsv4_compressed_attention)
     TEST_GROUP(test_per_layer_head_width)
     TEST_GROUP(test_gemma4_forward)
+    TEST_GROUP(test_lfm2_dense)
+    TEST_GROUP(test_qwen2moe)
     TEST_GROUP(test_arch_table)
     TEST_GROUP(test_arch_tensor_maps)
     TEST_GROUP(test_load_verdict)

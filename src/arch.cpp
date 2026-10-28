@@ -415,6 +415,21 @@ constexpr ArchSpec kTable[] = {
      true, false, false, false, false, true},
     {"qwen3moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "qwen3", "",
      true, false, false, false, false, true},
+    // Qwen1.5-MoE (`qwen2moe`): Qwen2's body -- q/k/v biases, NeoX rotary,
+    // RMSNorm -- with a routed bank beside a SHARED expert, and three details
+    // that are the family's own:
+    //   * the shared expert is gated by a per-token scalar: the reference
+    //     computes `silu(g)/g`, which is exactly sigmoid(g), from a 1-D
+    //     `ffn_gate_inp_shexp` row, and multiplies the shared branch by it
+    //     before folding it into the routed sum;
+    //   * the top-k weights are used as the softmax emitted them -- llama.cpp
+    //     passes `norm_w = false` -- so `expert_w_norm` is 0, the same choice
+    //     OLMoE makes and the opposite of LFM2-MoE's;
+    //   * the router is the plain softmax of `ffn_gate_inp`, no bias vector.
+    // Everything else is machinery this engine already runs for qwen2/qwen3moe,
+    // so the entry is the qwen2 flags plus the MoE shape.
+    {"qwen2moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "qwen2", "",
+     false, false, true, false, false, true, 0, false, /*expert_w_norm=*/0},
     // OLMoE: llama-shaped attention whose QK norm is WIDE -- the weight spans
     // n_head*hd, one RMS over the whole projected row, not one per head -- and a
     // top-8 softmax MoE that uses the router probabilities as they come out of
@@ -463,6 +478,17 @@ constexpr ArchSpec kTable[] = {
      /*qk_norm=*/true, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/true,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/1},
+    // LFM2 (dense): the same stack as LFM2-MoE with the routed block replaced
+    // by a plain dense FFN. The reference keeps ONE builder and one hparam set
+    // for both (`case LLM_ARCH_LFM2: case LLM_ARCH_LFM2MOE:`), and the mixer,
+    // the per-layer `head_count_kv` array, the missing `output_norm` and the
+    // NeoX rope pairing are identical -- only `expert_count` is absent. So the
+    // family is declared once and the layer's own bank decides which block runs.
+    {"lfm2", ArchShape::Recurrent, ArchSupport::Yes, ArchRole::Target,
+     "lfm2", "",
+     /*qk_norm=*/true, /*q_output_gate=*/false, /*qkv_bias=*/false,
+     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/true,
+     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/0},
     // Gemma scales the embedding by sqrt(n_embd), uses a tighter eps, gates its
     // FFN with GeGLU and softcaps the final logits. Gemma 1 is the llama schema
     // plus those four. It is not in the collections here, so the entry says so
