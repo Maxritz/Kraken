@@ -629,13 +629,22 @@ constexpr ArchSpec kTable[] = {
     // projection, not in a per-head K/V unfolded at runtime).
     // What runs: the shared-latent attention (one normed latent row per token,
     // rope on its tail, grouped low-rank output) and the tid2eid hash route that
-    // the first `hash_layer_count` layers select by token id. What does not: the
-    // CSA/HCA compressors (attn_compressor_*) and the sparse indexer -- so a
-    // file whose attention.compress_ratios is non-zero is refused at
-    // Engine::init, and one carrying either tensor class is refused by the
-    // loader's gap map. `attn_sinks` DO run: they are a per-head logit that
-    // competes with every visible key for softmax mass and contributes no value
-    // of its own, which the kernel and the host oracle both already carried.
+    // the first `hash_layer_count` layers select by token id. `attn_sinks` DO
+    // run: they are a per-head logit that competes with every visible key for
+    // softmax mass and contributes no value of its own, which the kernel and the
+    // host oracle both already carried.
+    //
+    // The CSA/HCA compressors are now IMPLEMENTED as arithmetic --
+    // include/krk/dsv4_compress.hpp (state row with APE, per-channel softmax
+    // pool, the overlap halves, the compression-base rope) and
+    // mla_shared_forward_compressed() in include/krk/mla_shared.hpp (raw rows and
+    // pooled rows in one attention, windowed and always-visible respectively),
+    // both pinned by test_dsv4_compressed_attention. What is NOT done is the
+    // engine's half: the per-layer state rows and pooled keys need a second KV
+    // stream and a load arm for attn_compressor_*/indexer_* tensors. Until that
+    // lands, a file whose attention.compress_ratios is non-zero is still refused
+    // at Engine::init and by the loader's gap map -- the refusal is about the
+    // wiring, not about unknown maths.
     // A dense-core file (all ratios 0) IS this graph, and
     // test_dsv4_whole_graph pins it end to end.
     {"deepseek4", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target, "deepseek4",

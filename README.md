@@ -243,7 +243,7 @@ command line was wrong. A refused GGUF is a load-time verdict and not a crash.
 The test suite needs no GPU:
 
 ```sh
-build-hip/kraken-tests.exe     # 5773/5773 checks on the CPU-only build
+build-hip/kraken-tests.exe     # 5806/5806 checks on the CPU-only build
 ```
 
 There is also an OpenAI-compatible HTTP server, `kraken-server`, which the long
@@ -254,6 +254,38 @@ many tokens that was. Measured on a 21-token prompt, the second identical reques
 went from 135 ms to 27 ms with byte-identical text. A request that fails clears
 the cache entry rather than leaving rows behind that a later prompt would assume
 were its own.
+
+### Compressed attention (DeepSeek-V4)
+
+A V4 layer either attends the raw latent window or the window **plus pooled
+keys**, one per block of `attention.compress_ratios[i]` tokens: ratio 128 (HCA)
+over every block, ratio 4 (CSA) over the blocks a small "lightning indexer"
+picks, with the pool overlapping the previous block. The pooled key is not an
+average — each token contributes two projections, and the weights are a
+**per-channel** softmax over the block's tokens:
+
+```
+kv_t    = Wkv x_t                                  [coff*hd]
+score_t = Wgate x_t + APE[:, p % ratio]            [coff*hd]
+w       = softmax_over_t(score[:, c])              per channel c
+pooled  = rms_norm(sum_t w_t * kv_t[:, c], comp_norm)
+K       = rope_tail(pooled, pos = block_start, base = compress_rope_base)
+```
+
+`include/krk/dsv4_compress.hpp` owns that arithmetic and
+`mla_shared_forward_compressed()` in `include/krk/mla_shared.hpp` attends raw
+rows (windowed) and pooled rows (always visible, roped with the compression
+table) in one pass. Both are pinned by `test_dsv4_compressed_attention`: a
+uniform block averages to the normalized mean, each channel picks its own row
+(a row-wise softmax lands in between and is caught), the CSA halves are read
+prev-then-cur (swapped, the arm reads zero), the rope is the tail at the
+compression base, the indexer's ReLU zeroes a negative similarity, and top-k
+breaks ties toward the lower index.
+
+What is **not** wired yet: the per-layer state rows and pooled keys need a
+second KV stream and a load arm for `attn_compressor_*`/`indexer_*`, so a file
+with a non-zero compress ratio is still refused by name. The maths is done; the
+streams are the next commit.
 
 ### Chat templates
 

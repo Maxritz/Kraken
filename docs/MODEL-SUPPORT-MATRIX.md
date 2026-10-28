@@ -25,7 +25,12 @@ adds six of the GGUF spec's own "known values" architectures — `mpt` and
 `bloom` bring ALiBi, `falcon` a parallel branch with two norms — see
 `docs/ALIBI-AND-MPT-BLOOM.md`.
 
-Verified arch strings in `src/arch.cpp`: `llama`, `qwen2`, `qwen3`, `qwen35`,
+Verified arch strings in `src/arch.cpp` — KNOWN and read, which is not the same
+as running: `gemma4`, `deepseek4-dspark`, `qwen4-mtp`, `dspark`, `k2-horizon`,
+`minimax-m3`, `muse-glimmer`, `spark2_5` and `diffuse` are recognised and still
+refused, each with its own named reason (`Assess`, `--inspect`). A recognised
+arch is how a refusal names the graph it read instead of shrugging. The full
+list: `llama`, `qwen2`, `qwen3`, `qwen35`,
 `qwen35moe`, `qwen3moe`, `qwen3vl`, `gemma`, `gemma2`, `gemma3`, `gemma4`,
 `deepseek2`, `deepseek4`, `deepseek41`, `gpt-oss`, `gpt2`, `olmoe`, `lfm2`,
 `lfm2moe`, `nemotron_h`, `nemotron_h_moe`, `minimax-m3`, `laguna`, `k2-horizon`,
@@ -41,7 +46,7 @@ the format has no kernel. `REFUSED` = no arch.
 | file | arch | format | status |
 |---|---|---|---|
 | Firefly-v5.Q4_K_M | llama¹ | Q4_K | FAST |
-| gemma-4-E4B-it-Q4_K_M | **gemma4** ✓ | Q4_K | FAST |
+| gemma-4-E4B-it-Q4_K_M | `gemma4` — known, **REFUSED** | Q4_K | **REFUSED** (per-layer input embeddings, shared-KV layers, two attention geometries) |
 | GLM-4.7-Flash-Q4_K_M | `glm4` ✓ | Q4_K | FAST |
 | L3.2-8X3B-MOE-…-Q8_0 | llama-moe² | Q8_0 | FAST if ² |
 | (Phi-3.5-MoE class) | `phi3moe` ✓ | Q4_K | FAST |
