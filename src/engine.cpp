@@ -1271,8 +1271,16 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // by the same rule as every other workspace (chunked, backend activation
     // size) and only when the file is gpt2-shaped, so no other family pays for
     // a buffer its graph never touches.
-    if (mc.gpt2_style) {
-        ws_qkv_fused_ = alloc(static_cast<size_t>(C * 3 * n_embd_) * as);
+    if (mc.gpt2_style || mc.fused_qkv) {
+        // gpt2's row is 3*n_embd; Phi's is n_embd + 2*n_head_kv*head_dim. Both
+        // collapse to the same expression when n_head_kv is n_head, so the
+        // fused flag alone decides which one this is.
+        const size_t kvw =
+            static_cast<size_t>(mc.n_head_kv) * static_cast<size_t>(mc.head_dim);
+        const size_t row = mc.fused_qkv
+                               ? static_cast<size_t>(n_embd_) + 2 * kvw
+                               : static_cast<size_t>(3) * static_cast<size_t>(n_embd_);
+        ws_qkv_fused_ = alloc(static_cast<size_t>(C) * row * as);
         if (!check_alloc(ws_qkv_fused_, "ws_qkv_fused")) return false;
     }
     // NVFP4 sidecars: the staging row a scaled weight's INPUT is copied and
@@ -3388,7 +3396,10 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // cache budget and the tier geometry come out right.
         if (L.mla) {
             if (!mla_forward(L, l, n, pos0)) return false;
-        } else if (L.wq.present()) {
+        } else if (L.wq.present() || L.wqkv_fused.present()) {
+            // A fused Q | K | V projection is attention too: `wq` alone would
+            // send a Phi layer down the no-attention short path, which reads as
+            // a working model that ignores its context.
         const void *xn_att = ws_xn_;
         if (L.h_attn_in || L.h_attn_gate) {
             had_xform(ws_had_, ws_xn_, n, n_embd_, false, false);
@@ -3399,7 +3410,33 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // One launch cannot carry three different global scales, and an NVFP4
         // checkpoint picks each tensor's format (and its sidecar) on its own.
         // A scaled weight takes the per-matrix path, which can.
-        if (L.wq.type == L.wk.type && L.wk.type == L.wv.type &&
+        // Phi-3: one fused Q | K | V projection instead of three. The split
+        // widths differ because Phi is GQA, which is why this cannot reuse the
+        // gpt2 path's equal-width split_qkv.
+        if (L.wqkv_fused.present()) {
+            // Phi-3: one fused Q | K | V projection whose row is Q then K then
+            // V. Both part widths are whole numbers of quantisation blocks, so
+            // the three row ranges are VIEWS of the one weight rather than a
+            // copy of its output: the same three projections the split path
+            // runs, over the same bytes, so the result is identical by
+            // construction -- no split buffer, no device sync, and therefore no
+            // way for a stride convention to differ between the two paths.
+            const i64 kvw = static_cast<i64>(lkv);
+            const i64 rb = static_cast<i64>(
+                dtype_row_bytes(L.wqkv_fused.type, L.wqkv_fused.n_in));
+            QuantTensor wq = L.wqkv_fused;
+            wq.n_out = n_embd_;
+            QuantTensor wk = L.wqkv_fused;
+            wk.data = static_cast<u8 *>(L.wqkv_fused.data) + n_embd_ * rb;
+            wk.n_out = kvw;
+            QuantTensor wv = L.wqkv_fused;
+            wv.data = static_cast<u8 *>(L.wqkv_fused.data) + (n_embd_ + kvw) * rb;
+            wv.n_out = kvw;
+            void *qkv[3] = {q_out, ws_k_, ws_v_};
+            const void *wqkv[3] = {wq.data, wk.data, wv.data};
+            const i64 nqkv[3] = {lq_proj, kvw, kvw};
+            be_->gemm_group(qkv, xn_proj, wqkv, wq.type, nqkv, n_embd_, 3, n);
+        } else if (L.wq.type == L.wk.type && L.wk.type == L.wv.type &&
             !L.wq.scaled() && !L.wk.scaled() && !L.wv.scaled()) {
             void *qkv[3] = {q_out, ws_k_, ws_v_};
             const void *wqkv[3] = {L.wq.data, L.wk.data, L.wv.data};
@@ -3581,7 +3618,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // Everything below reads ws_attn_ and writes the residual, so it is
         // shared by both attention kinds; only a block with NO attention at all
         // (nemotron's attention-only layers' mirror image) takes the short path.
-        if (L.mla || L.wq.present()) {
+        if (L.mla || L.wq.present() || L.wqkv_fused.present()) {
         // The attention result's width is the OUTPUT projection's input width,
         // not the query width: they are the same number on every family that
         // projects per-head V, and differ exactly on an MLA layer, whose
@@ -3695,7 +3732,10 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // that layer, and every token it emits, is that buffer's contents.
         if (L.moe) {
             if (!moe_ffn(L, l, n)) return false;
-        } else if (L.wgate.present()) {
+        } else if (L.wgate.present() || L.wup_fused.present()) {
+            // A fused gate|up projection IS the gate: keying only on wgate
+            // skipped the FFN altogether on a Phi file, which is the same shape
+            // of bug the attention gate above had.
             dense_ffn(L, l, n);
         }
         if (hc_active_) hc_leave(n);
@@ -4667,15 +4707,30 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
     // reason: the fused epilogue's warp holds ONE element of the row, so the row
     // maximum the scale is derived from does not exist inside it. The activation
     // runs as its own op for those layers.
-    if (L.wgate.type == L.wup.type && !L.wgate.scaled() && !L.wup.scaled()) {
+    // Phi-3: gate and up are the two halves of one projection. n_ff is a whole
+    // number of blocks wide, so the halves are row VIEWS of the one weight and
+    // the gated path below runs unchanged -- same gemm_group, same silu
+    // epilogue, same values the split tensors would have given.
+    QuantTensor wgate = L.wgate;
+    QuantTensor wup = L.wup;
+    if (L.wup_fused.present()) {
+        const i64 rb = static_cast<i64>(
+            dtype_row_bytes(L.wup_fused.type, L.wup_fused.n_in));
+        wgate = L.wup_fused;
+        wgate.n_out = n_ff_;
+        wup = L.wup_fused;
+        wup.data = static_cast<u8 *>(L.wup_fused.data) + n_ff_ * rb;
+        wup.n_out = n_ff_;
+    }
+    if (wgate.type == wup.type && !wgate.scaled() && !wup.scaled()) {
         void *gu[2] = {ws_gate_, ws_up_};
-        const void *wgu[2] = {L.wgate.data, L.wup.data};
+        const void *wgu[2] = {wgate.data, wup.data};
         const i64 ngu[2] = {n_ff_, n_ff_};
-        be_->gemm_group(gu, xn, wgu, L.wgate.type, ngu, n_embd_, 2, n,
+        be_->gemm_group(gu, xn, wgu, wgate.type, ngu, n_embd_, 2, n,
                         !gelu && !row_scaled, &silu_done);
     } else {
-        gemm_w(ws_gate_, xn, L.wgate, n_ff_, n_embd_, n);
-        gemm_w(ws_up_, xn, L.wup, n_ff_, n_embd_, n);
+        gemm_w(ws_gate_, xn, wgate, n_ff_, n_embd_, n);
+        gemm_w(ws_up_, xn, wup, n_ff_, n_embd_, n);
     }
     if (!silu_done) {
         if (gelu) {

@@ -300,6 +300,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.post_norm_eps = static_cast<f32>(aspec.post_norm_eps);
     cfg_.gelu_ffn = aspec.gelu_ffn;
     cfg_.gpt2_style = aspec.gpt2_style;
+    cfg_.fused_qkv = aspec.fused_qkv;
+    cfg_.fused_gate_up = aspec.fused_gate_up;
     cfg_.rope_swa_only = aspec.rope_swa_only;
     // RoPE's pair convention is a property of the export, so it comes from
     // the arch table rather than from the tensors. KRK_ROPE_NEOX=0/1 forces
@@ -2335,8 +2337,16 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // norm of the same stream). A layer with neither attention nor
             // experts is still a truncated file, which is what keeps this from
             // accepting half a download as a model.
-            if (cfg_.gpt2_style) {
-                // One projection, [n_embd -> 3*n_embd], whose output row is
+            // The flag says the SCHEMA has a fused projection; whether this
+            // file uses one is a fact about the file. Keying off the tensor
+            // lets a mixed fixture be loaded, and lets a file that carries both
+            // shapes take the one it actually has.
+            const bool has_fused_qkv =
+                gguf_.tensor(blk_key("blk.%d.attn_qkv.weight", l)) != nullptr;
+            if (cfg_.gpt2_style || (cfg_.fused_qkv && has_fused_qkv)) {
+                // One projection whose output row is Q | K | V -- three
+                // contiguous blocks, so the split is a stride and not a gather.
+                // The block widths differ by family (see phi3_spec).
                 // Q | K | V as three contiguous n_embd blocks, with one
                 // 3*n_embd bias covering all of them. The file carries no
                 // separate q/k/v tensors at all, so this is not an
@@ -2354,13 +2364,30 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 // the Q|K|V split below reads past its own row and every head
                 // after the first is silently somebody else's. Cheap to check,
                 // and a wrong-width file cannot be rescued downstream.
-                if (L.wqkv_fused.n_out != 3 * static_cast<i64>(cfg_.n_embd)) {
+                const i64 kv_wide =
+                    static_cast<i64>(cfg_.n_head_kv) * cfg_.head_dim;
+                const i64 qkv_wide =
+                    (cfg_.fused_qkv && !cfg_.gpt2_style)
+                        ? static_cast<i64>(cfg_.n_embd) + 2 * kv_wide
+                        : 3 * static_cast<i64>(cfg_.n_embd);
+                if (L.qkv_bias && !cfg_.gpt2_style) {
+                    // phi2 puts a bias on the fused projection; the view-based
+                    // split applies the bias per projection, which that family
+                    // needs and phi3 does not have. Refuse rather than ignore
+                    // it -- an unapplied bias is a wrong answer, not a small one.
+                    if (err)
+                        *err = "layer " + std::to_string(l) +
+                               ": a fused attn_qkv with a bias (phi2) is not "
+                               "implemented";
+                    return false;
+                }
+                if (L.wqkv_fused.n_out != qkv_wide) {
                     if (err)
                         *err = "layer " + std::to_string(l) +
                                " attn_qkv is " +
                                std::to_string(L.wqkv_fused.n_out) +
-                               " wide, expected 3*n_embd = " +
-                               std::to_string(3 * cfg_.n_embd);
+                               " wide, expected Q + 2*(n_head_kv*head_dim) = " +
+                               std::to_string(qkv_wide);
                     return false;
                 }
             } else {
@@ -2489,9 +2516,29 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // asking for one would fail the load on a file that is complete;
             // reading ffn_up as a gate instead would halve the intermediate
             // width and run the wrong activation over it.
-            if (!cfg_.gpt2_style)
-                L.wgate = need(blk_key("blk.%d.ffn_gate.weight", l));
-            L.wup = need(blk_key("blk.%d.ffn_up.weight", l));
+            const bool ffn_fused =
+                cfg_.fused_gate_up &&
+                gguf_.tensor(blk_key("blk.%d.ffn_gate.weight", l)) == nullptr;
+            if (ffn_fused) {
+                // gate | up in one row. There is no ffn_gate tensor to read;
+                // treating ffn_up as the gate instead -- what happens if this
+                // flag is missed -- halves the intermediate width and gates the
+                // wrong operand, which is a wrong answer rather than a failure.
+                L.wup_fused = need(blk_key("blk.%d.ffn_up.weight", l));
+                const i64 want = 2 * static_cast<i64>(cfg_.n_ff);
+                if (L.wup_fused.n_out != want) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) + " ffn_up is " +
+                               std::to_string(L.wup_fused.n_out) +
+                               " wide, expected gate|up = " +
+                               std::to_string(want);
+                    return false;
+                }
+            } else {
+                if (!cfg_.gpt2_style)
+                    L.wgate = need(blk_key("blk.%d.ffn_gate.weight", l));
+                L.wup = need(blk_key("blk.%d.ffn_up.weight", l));
+            }
             L.wdown = need(blk_key("blk.%d.ffn_down.weight", l));
         } else if (L.moe) {
             // The router is small and always resident. The routed experts are
@@ -2839,10 +2886,18 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // GPT-2 has no gate tensor: its intermediate width is ffn_up's output.
         // Checking wgate here would fail every complete gpt2 file, because an
         // absent gate reads as width 0 rather than as "no gate".
+        // Three shapes reach here, and each says the width from a different
+        // tensor: gpt2 has ffn_up alone, every split family has ffn_gate beside
+        // it, and Phi-3 has neither -- its gate and up are the two halves of
+        // ffn_up, which the load above already checked is 2*n_ff wide.
         const bool ffn_width_ok =
-            cfg_.gpt2_style
-                ? (L.wup.n_out == cfg_.n_ff && L.wdown.n_in == cfg_.n_ff)
-                : (L.wgate.n_out == cfg_.n_ff && L.wdown.n_in == cfg_.n_ff);
+            L.wup_fused.present()
+                ? (L.wup_fused.n_out == 2 * static_cast<i64>(cfg_.n_ff) &&
+                   L.wdown.n_in == cfg_.n_ff)
+                : cfg_.gpt2_style
+                      ? (L.wup.n_out == cfg_.n_ff && L.wdown.n_in == cfg_.n_ff)
+                      : (L.wgate.n_out == cfg_.n_ff &&
+                         L.wdown.n_in == cfg_.n_ff);
         if (!L.moe && has_dense_ffn && !ffn_width_ok) {
             if (err)
                 *err = "layer " + std::to_string(l) + " FFN tensors disagree with n_ff";

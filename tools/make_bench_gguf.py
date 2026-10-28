@@ -326,11 +326,17 @@ def _quant_np(v, fmt):
 
 
 def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
-          arch="llama", n_expert=0, n_expert_used=0, n_ff_exp=0, scale=0.04):
+          arch="llama", n_expert=0, n_expert_used=0, n_ff_exp=0, scale=0.04,
+          fused=False, fused_ffn=None):
+    # `fused` is the Q|K|V projection, `fused_ffn` the gate|up one; a Phi file
+    # has both, and the two are separable so a test can fuse one at a time and
+    # find which of them changed the logits.
+    if fused_ffn is None:
+        fused_ffn = fused
     rnd = random.Random(seed)
     q_dim, kv_dim = n_head * hd, n_kv * hd
     moe = n_expert > 0
-    assert arch == ("qwen3moe" if moe else "llama"), arch
+    assert arch in ("llama", "phi3") or arch == "qwen3moe", arch
     assert not moe or (n_ff_exp > 0 and 0 < n_expert_used <= n_expert)
 
     tokens = ["<unk>", "<s>", "</s>"]
@@ -392,6 +398,21 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
                                      scale, n_exp)
         g.tensor3(name, n_in, n_out, n_exp, FORMATS[fmt][0], emit, nbytes)
 
+    def w_cat(name, parts):
+        """One tensor whose row is the concatenation of `parts`, all n_in wide.
+
+        Every row is a whole number of quantisation blocks, so quantising the
+        concatenated stream produces byte-for-byte the same bytes the separate
+        tensors would have carried. That is what lets a fused fixture and a
+        split fixture hold the SAME weights, which is the only way to test a
+        fused load: compare the two files' logits, not the layout."""
+        assert all(p[0] == parts[0][0] for p in parts), "parts must share n_in"
+        vals = []
+        for (ni, no) in parts:
+            vals.extend(rnd.gauss(0.0, scale) for _ in range(ni * no))
+        data, dtype = make_weights(vals, fmt)
+        g.tensor(name, parts[0][0], sum(p[1] for p in parts), data, dtype)
+
     def ones(name, n):
         g.tensor(name, n, 1, struct.pack("<%df" % n, *([1.0] * n)), T_F32)
 
@@ -402,9 +423,16 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
         p = "blk.%d." % l
         ones(p + "attn_norm.weight", n_embd)
         ones(p + "ffn_norm.weight", n_embd)
-        w(p + "attn_q.weight", n_embd, q_dim)
-        w(p + "attn_k.weight", n_embd, kv_dim)
-        w(p + "attn_v.weight", n_embd, kv_dim)
+        if fused:
+            # Phi-3: Q | K | V in one projection, and under GQA the K and V
+            # blocks are kv_dim wide, not n_embd -- drawn q, k, v in that order
+            # so the stream matches the split file's.
+            w_cat(p + "attn_qkv.weight",
+                  [(n_embd, q_dim), (n_embd, kv_dim), (n_embd, kv_dim)])
+        else:
+            w(p + "attn_q.weight", n_embd, q_dim)
+            w(p + "attn_k.weight", n_embd, kv_dim)
+            w(p + "attn_v.weight", n_embd, kv_dim)
         w(p + "attn_output.weight", q_dim, n_embd)
         if moe:
             # Router projection, then the three stacked expert tensors. An
@@ -415,8 +443,12 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
             ws(p + "ffn_up_exps.weight", n_embd, n_ff_exp, n_expert)
             ws(p + "ffn_down_exps.weight", n_ff_exp, n_embd, n_expert)
         else:
-            w(p + "ffn_gate.weight", n_embd, n_ff)
-            w(p + "ffn_up.weight", n_embd, n_ff)
+            if fused_ffn:
+                # gate | up in one row, gate first (drawn gate-then-up).
+                w_cat(p + "ffn_up.weight", [(n_embd, n_ff), (n_embd, n_ff)])
+            else:
+                w(p + "ffn_gate.weight", n_embd, n_ff)
+                w(p + "ffn_up.weight", n_embd, n_ff)
             w(p + "ffn_down.weight", n_ff, n_embd)
 
     return g.write(path)
@@ -445,6 +477,14 @@ def main(argv=None):
                     help="experts routed per token (0 = 2)")
     ap.add_argument("--expert-ff", type=int, default=0,
                     help="expert hidden width (0 = --ff)")
+    ap.add_argument("--phi3-qkv-only", action="store_true",
+                    help="phi3 arch with only attn_qkv fused (bisecting aid)")
+    ap.add_argument("--phi3-ffn-only", action="store_true",
+                    help="phi3 arch with only gate|up fused (bisecting aid)")
+    ap.add_argument("--phi3", action="store_true",
+                    help="write the Phi-3 layout: arch string phi3, one fused "
+                         "attn_qkv (Q|K|V) and one fused ffn_up (gate|up), no "
+                         "ffn_gate tensor")
     ap.add_argument("--scale", type=float, default=0.04,
                     help="std-dev of the weights; a deep stack needs a "
                          "smaller value to stay in an f16 activation range")
@@ -466,9 +506,12 @@ def main(argv=None):
 
     size = build(a.out, a.embd, a.layers, heads, kv_heads, a.head_dim, ff,
                  a.vocab, a.ctx, a.format, a.seed,
-                 arch="qwen3moe" if a.experts else "llama",
+                 arch="qwen3moe" if a.experts
+                 else ("phi3" if (a.phi3 or a.phi3_qkv_only or a.phi3_ffn_only)
+                       else "llama"),
                  n_expert=a.experts, n_expert_used=used, n_ff_exp=ff_exp,
-                 scale=a.scale)
+                 scale=a.scale, fused=a.phi3 or a.phi3_qkv_only,
+                 fused_ffn=a.phi3 or a.phi3_ffn_only)
     moe = ("%d experts top-%d, expert ff %d, " % (a.experts, used, ff_exp)
            if a.experts else "")
     print("wrote %s: %d layers, embd %d, %d/%d heads, hd %d, ff %d, %s"

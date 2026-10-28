@@ -220,6 +220,24 @@ struct ArchSpec {
     // `gpt2_style` landed where `qkv_bias` had been, and every row from
     // deepseek2 onwards then read as GPT-2 in the loader.
     bool gpt2_style = false;
+    // ---- fused projections (phi3 and the family it belongs to) -------------
+    // `gpt2_style` bundles the fused `attn_qkv` together with LayerNorm,
+    // learned positions and a plain GELU MLP, because on GPT-2 those four are
+    // one architecture rather than four options. They are NOT one architecture
+    // on Phi-3: it wants the fused projection with RMSNorm, a partial rotary
+    // and a SwiGLU MLP. Keeping the bundle whole would have meant either
+    // running Phi's norms as LayerNorm -- a wrong answer that still decodes --
+    // or refusing the family over the packaging, so the two fused shapes get
+    // their own flags and gpt2 sets what it uses.
+    //
+    // fused_qkv     one `attn_qkv` projection whose output row is Q | K | V.
+    //               On GPT-2 all three parts are n_embd wide; on Phi the K and
+    //               V parts are n_head_kv*head_dim, because Phi is GQA and a
+    //               3*n_embd split would read K out of V's rows.
+    // fused_gate_up one `ffn_up` projection whose output row is gate | up,
+    //               n_ff each, with no `ffn_gate` tensor in the file at all.
+    bool fused_qkv = false;
+    bool fused_gate_up = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

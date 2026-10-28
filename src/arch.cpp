@@ -68,6 +68,10 @@ constexpr ArchSpec gpt2_spec() {
     // every projection in the stack carries one. `has_bias` is what makes the
     // loader look for them.
     s.gpt2_style = true;
+    // The bundle's fused attn_qkv is the same mechanism phi3 uses, so the flag
+    // that names it is set here too. `fused_gate_up` stays false: GPT-2's MLP
+    // has no gate tensor, and reading one would halve the intermediate.
+    s.fused_qkv = true;
     s.rope_neox = false;
     // No RoPE anywhere: learned positions are added into the embedding instead.
     // The engine reads this off gpt2_style rather than off a rotary flag, so
@@ -76,10 +80,34 @@ constexpr ArchSpec gpt2_spec() {
     return s;
 }
 
+// Phi-3 / Phi-4, which llama.cpp's converter writes as `phi3`. What makes it
+// its own schema rather than a llama variant:
+//
+//   * one `attn_qkv` projection, row = Q | K | V, with K and V
+//     n_head_kv*head_dim wide instead of n_embd (Phi is GQA);
+//   * one `ffn_up` projection, row = gate | up, n_ff each, and no `ffn_gate`
+//     tensor anywhere -- the file has 21 tensors a layer, not 22;
+//   * partial rotary: `rope.dimension_count` covers part of the head dim, the
+//     rest passes through unrotated. The loader already reads that into
+//     ModelConfig::rope_frac, so nothing here has to say so;
+//   * the NORM rope pairing, per llama.cpp's llm_arch_rope table, which lists
+//     phi2/phi3 as LLAMA_ROPE_TYPE_NORM. That is the default, so it is left
+//     alone -- and it is the one choice in this row that a wrong guess would
+//     turn into fluent nonsense rather than a refusal, which is why it is
+//     named here rather than silently inherited.
+constexpr ArchSpec phi3_spec() {
+    ArchSpec s{"phi3", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "phi3", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.fused_gate_up = true;
+    return s;
+}
+
 constexpr ArchSpec kTable[] = {
     // ---- the schemas this engine runs ------------------------------------
     {"llama", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
      false, false, false, false},
+    phi3_spec(),
     // GPT-2 and its descendants: LayerNorm (biased), learned absolute
     // positions, a fused attn_qkv, and a plain GELU MLP. See
     // ArchSpec::gpt2_style for why those four travel together.
@@ -567,7 +595,8 @@ struct GapTensor {
         Never,
         ByAttnGateFlag,
         ByMlaFlag,
-        ByGpt2Flag
+        ByGpt2Flag,
+        ByFusedQkvFlag
     };
     Served served = Served::Never;
 };
@@ -580,7 +609,7 @@ constexpr GapTensor kGapTensors[] = {
     // projection and Engine::gpt2_forward splits the Q|K|V row. Anywhere else
     // it is still a fused attention projection this engine has no shape for.
     {"attn_qkv.weight", "a fused query/key/value projection (attn_qkv)", true,
-     GapTensor::Served::ByGpt2Flag},
+     GapTensor::Served::ByFusedQkvFlag},
     // Implemented: src/model.cpp loads attn_gate.weight behind
     // ArchSpec::attn_gate and src/engine.cpp softplus-gates and broadcasts it
     // over the attention result before wo.
@@ -700,6 +729,9 @@ const char *arch_tensor_gap(std::string_view tensor_name, ArchShape shape,
             continue;
         if (g.served == GapTensor::Served::ByGpt2Flag &&
             arch_spec(arch).gpt2_style)
+            continue;
+        if (g.served == GapTensor::Served::ByFusedQkvFlag &&
+            arch_spec(arch).fused_qkv)
             continue;
         if (has(tensor_name, g.needle)) return g.gap;
     }
