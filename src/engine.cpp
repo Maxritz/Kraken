@@ -1566,6 +1566,12 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         if (!check_alloc(ws_router_, "ws_router")) return false;
         ws_ffn_ = alloc(static_cast<size_t>(C * n_embd_) * as);
         if (!check_alloc(ws_ffn_, "ws_ffn")) return false;
+        // The shared expert's per-token gate. It used to be computed into
+        // `ws_ssm_`, which is allocated only for a RECURRENT stack, so the
+        // first non-hybrid family to carry `ffn_gate_inp_shexp` (qwen2moe)
+        // dereferenced a null pointer in its first forward.
+        ws_shexp_g_ = alloc(static_cast<size_t>(C) * as);
+        if (!check_alloc(ws_shexp_g_, "ws_shexp_g")) return false;
         // ---- LatentMoE ----------------------------------------------------
         // One narrow space per forward, sized by the widest latent the file
         // declares (a merged stack may vary it per layer, and every layer must
@@ -2388,7 +2394,7 @@ void Engine::shutdown() {
                      &ws_v_, &ws_attn_, &ws_mlaqn_, &ws_mlay_, &ws_mlaa_,
                      &ws_gate_, &ws_up_, &ws_had_, &ws_logits_,
                      &ws_router_, &ws_routerp_, &ws_ids_, &ws_wts_, &ws_off_,
-                     &ws_ffn_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
+                     &ws_ffn_, &ws_shexp_g_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
                      &ws_scale_, &ws_ebatch_, &ws_edown_, &ws_ebscale_,
                      &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
                      &ws_m2in_,
@@ -10469,9 +10475,9 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // Qwen3.5 scales the shared expert by a per-token sigmoid of a small
         // vector before folding it in; the Qwen2/Qwen3 schema has no such gate.
         if (L.shexp_inp_gate.present()) {
-            gemm_w(ws_ssm_, ws_xn_, L.shexp_inp_gate, 1, n_embd_, n);
-            be_->sigmoid_act(ws_ssm_, n);
-            be_->scale_rows(ws_x2_, ws_ssm_, n, n_embd_);
+            gemm_w(ws_shexp_g_, ws_xn_, L.shexp_inp_gate, 1, n_embd_, n);
+            be_->sigmoid_act(ws_shexp_g_, n);
+            be_->scale_rows(ws_x2_, ws_shexp_g_, n, n_embd_);
         }
         // The fold is the one place a sum of two in-range rows leaves f16 on
         // its own -- measured on Laguna-S-2.1: the routed sum saturated at 65504
