@@ -46,7 +46,7 @@ the format has no kernel. `REFUSED` = no arch.
 | file | arch | format | status |
 |---|---|---|---|
 | Firefly-v5.Q4_K_M | llama¹ | Q4_K | FAST |
-| gemma-4-E4B-it-Q4_K_M | `gemma4` — known, **REFUSED** | Q4_K | **REFUSED** (per-layer input embeddings, shared-KV layers, two attention geometries) |
+| gemma-4-E4B-it-Q4_K_M | `gemma4` — known, **REFUSED** | Q4_K | **REFUSED** — two-geometry read landed; per-layer input embeddings, shared-KV layers, layer_output_scale and proportional rope still missing |
 | GLM-4.7-Flash-Q4_K_M | `glm4` ✓ | Q4_K | FAST |
 | L3.2-8X3B-MOE-…-Q8_0 | llama-moe² | Q8_0 | FAST if ² |
 | (Phi-3.5-MoE class) | `phi3moe` ✓ | Q4_K | FAST |

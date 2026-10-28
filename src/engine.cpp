@@ -3351,8 +3351,16 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     d.pos_stride = kv_dim_;
     d.kv_int8 = kv_quant_of(cfg_) == KvQuant::Int8;
     d.layer = 0;
-    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(mc.head_dim))) *
-              mc.rope_attn_scale;
+    // The scale follows the layer's own head width, and a family that declares
+    // no pre-attention scaling (gemma4: f_attention_scale = 1.0) says so in the
+    // file rather than being approximated by the default 1/sqrt(hd).
+    auto attn_scale_at = [&](i32 layer) -> f32 {
+        if (mc.attn_scale > 0.0f) return mc.attn_scale * mc.rope_attn_scale;
+        return static_cast<f32>(1.0 / std::sqrt(
+                   static_cast<f64>(model_.head_dim_at(layer)))) *
+               mc.rope_attn_scale;
+    };
+    d.scale = attn_scale_at(0);
     // gemma2's bound on the attention logits, applied inside attention. 0 on
     // every other family, which is the arithmetic that existed before the field
     // did.
@@ -3431,6 +3439,13 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // prefill chunk sizes.
         d.n_head = lh;
         d.n_kv = lkvh;
+        // The head WIDTH is per layer for the same reason the counts are:
+        // gemma4 declares two attention geometries in one stack (512 on the
+        // global layers, 256 on the windowed ones), so a layer that reads the
+        // stack maximum rotates and dots the wrong number of dims -- and the
+        // workspace is wide enough that nothing overruns to say so.
+        d.hd = model_.head_dim_at(l);
+        d.scale = attn_scale_at(l);
         d.pos_stride = lkv;
         // The int8 row is kv_dim bytes plus one f32 scale per 32 values, so a
         // position's stride is the backend's answer for that width, not the

@@ -207,6 +207,21 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         for (i32 v : *hckv)
             if (v > cfg_.n_head_kv) cfg_.n_head_kv = v;
     }
+    // ---- per-layer head WIDTH (gemma4's two attention geometries) ----------
+    // `attention.key_length` is the global-attention width and
+    // `attention.key_length_swa` the windowed one; gemma4 puts both in one
+    // stack (512 and 256 on the E-series). The layer's own width is
+    // head_dim_at(), `head_dim` is the stack maximum, and the workspace is
+    // sized against the maximum just as it is for the head counts.
+    //
+    // The windowed width applies to the layers the file's own
+    // `attention.sliding_window_pattern` marks, read HERE and not re-derived:
+    // a period is a guess about the pattern, and on this family the file states
+    // the pattern itself.
+    if (const std::vector<i32> *swa_pat =
+            gguf_.get_i32_array(key(".attention.sliding_window_pattern"))) {
+        cfg_.swa_pattern = *swa_pat;
+    }
     cfg_.n_ctx_train =
         static_cast<i32>(gguf_.get_i64(key(".context_length"), 2048));
     cfg_.head_dim = static_cast<i32>(gguf_.get_i64(key(".attention.key_length"), 0));
@@ -219,6 +234,36 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     const bool head_dim_declared = cfg_.head_dim > 0;
     if (cfg_.head_dim == 0 && cfg_.n_head > 0)
         cfg_.head_dim = cfg_.n_embd / cfg_.n_head;
+    {
+        const i32 hd_swa =
+            static_cast<i32>(gguf_.get_i64(key(".attention.key_length_swa"), 0));
+        const i64 vd_swa =
+            gguf_.get_i64(key(".attention.value_length_swa"), 0);
+        if (hd_swa > 0) {
+            // A windowed layer whose key and value widths disagree is a shape
+            // this engine cannot express (it caches one row that serves as
+            // both), and it is the file that is wrong, so say which.
+            if (vd_swa > 0 && vd_swa != hd_swa) {
+                if (err) {
+                    *err = "arch '" + a + "': attention.key_length_swa " +
+                           std::to_string(hd_swa) + " and value_length_swa " +
+                           std::to_string(vd_swa) +
+                           " differ, and this engine caches one row for both";
+                }
+                return false;
+            }
+            cfg_.head_dim_layer.assign(static_cast<size_t>(cfg_.n_layer),
+                                       cfg_.head_dim);
+            for (i32 l = 0; l < cfg_.n_layer; l++) {
+                const bool swa =
+                    l < static_cast<i32>(cfg_.swa_pattern.size())
+                        ? cfg_.swa_pattern[static_cast<size_t>(l)] != 0
+                        : (cfg_.swa_period > 0 && l % cfg_.swa_period == 0);
+                if (swa) cfg_.head_dim_layer[static_cast<size_t>(l)] = hd_swa;
+            }
+            if (hd_swa > cfg_.head_dim) cfg_.head_dim = hd_swa;
+        }
+    }
     // Two keys name the same epsilon. RMSNorm families write
     // `layer_norm_rms_epsilon`; the LayerNorm families (gpt2, gptneox, gptj,
     // phi2) write `layer_norm_epsilon`. Reading only the first left every one
