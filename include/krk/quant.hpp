@@ -250,6 +250,19 @@ f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 // which keeps maddubs inside i16 for the whole legal byte range (including the
 // -128 the format allows) and needs no bias correction.
 f32 dot_q8_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+// The rungs of the Q8_0 x8 ladder, exposed so tools/ta_q80_tiers.cpp can
+// compare every one against the scalar reference. Production code goes through
+// dot_q8_0_q8_x8() below, which picks a rung from the CPU's feature bits.
+void dot_q8_0_q8_x8_scalar(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                           i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+void dot_q8_0_q8_x8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                         i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+// One named rung: -1 scalar, 1 avx2, 2 avx512bw, 3 vnni. Falls through to
+// whatever the host can run, so an absent rung degrades instead of crashing.
+void dot_q8_0_q8_x8_tier(i32 tier, const u8 *w, const i8 *xq, const f32 *dx,
+                         i64 n, i64 rstride, i64 dstride, f32 *out,
+                         i64 out_stride);
+
 void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);
 f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);

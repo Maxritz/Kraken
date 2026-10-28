@@ -142,3 +142,72 @@ for decode and a tiled path for prefill, and treat tile geometry as something to
 measure per shape rather than fix. The one place this repo departs from it is
 the quantised-weight correction above — and that departure is a property of
 keeping weights in their storage format, not a difference of opinion.
+
+## The Q8_0 x8 ladder, and a correction
+
+### VNNI was present on this host all along
+
+Earlier rounds recorded this machine as having **no** VNNI and treated every
+VNNI result as unmeasurable. That was wrong. `__builtin_cpu_supports
+("avx512vnni")` returns true here; `/proc/cpuinfo` does not list the flag, which
+is what the earlier census was reading. The lesson is about method, not about
+CPUs: a capability census that reads one source is a guess. The ladder below
+reports what the CPU says, and `tools/ta_q80_tiers.cpp` exercises it.
+
+### The ladder
+
+| rung | how it is selected | notes |
+|---|---|---|
+| VNNI | `avx512vnni` at runtime | `vpdpbusd`: one instruction where BW needs two |
+| AVX-512BW | `avx512f` + `avx512bw` | needs an even block count |
+| AVX2 | `avx2` at runtime | needs `KRK_DOT_AVX2` in the build |
+| scalar | always | the floor; i64 accumulation, no target attribute |
+
+Every rung is guarded by the CPU's own feature bits and every rung was verified
+against the scalar reference on this host:
+
+```
+nb=24 (even)
+  vnni           ok      max rel 8.394e-08
+  avx512bw+f16c  ok      max rel 8.394e-08
+  avx2           ok      max rel 1.119e-07
+  scalar         ok      max rel 0.000e+00  (bit-exact)
+nb=25 (odd: 512-bit rungs must refuse)
+  vnni           ok      max rel 0.000e+00  (bit-exact)
+  avx512bw+f16c  ok      max rel 0.000e+00  (bit-exact)
+  avx2           ok      max rel 1.871e-07
+  scalar         ok      max rel 0.000e+00  (bit-exact)
+```
+
+### Two bugs this found
+
+1. **The AVX2 call was unconditional.** `dot_q8_0_q8_x8` ended in a bare
+   `dot_q8_0_q8_x8_avx2(...)`, with no feature test and no scalar floor. On any
+   host without AVX2 that is SIGILL, not a slow path — on exactly the class of
+   machine (a VM with a masked CPU model, or an old Zen) where a fallback is
+   the whole point. Now guarded, with the scalar rung beneath it.
+2. **The scalar floor was wrong.** Its first version accumulated each 32-value
+   block sum in i32 with `static_cast<i32>(static_cast<i8>(byte))`. With
+   products bounded by 128 x 127 and only 32 of them, overflow is impossible,
+   yet it disagreed with every vector rung by ~1.1 relative. Widening through an
+   explicit unsigned-then-signed step and summing in i64 made all four rungs
+   agree to 1.9e-07. A fallback that is silently wrong is worse than one that
+   crashes.
+
+### VNNI against BW, measured here
+
+`kraken-q80-gemm-bench 768 2048 512`, four interleaved pairs alternating order
+(`KRK_CPU_Q80_KERNEL=bw|vnni`), GMAC/s:
+
+| rep | BW | VNNI |
+|---|---:|---:|
+| 1 | 14.12 | **15.63** |
+| 2 | 15.49 | **22.60** |
+| 3 | 22.38 | **26.26** |
+| 4 | 18.38 | **22.85** |
+
+4 of 4. Paired ratios 1.11 / 1.46 / 1.17 / 1.24, median **1.21x**. The absolute
+spread (14-26 GMAC/s for the same kernel) is this host's two throughput modes,
+which is why only the paired ratio is quoted. VNNI is now the default rung on
+this machine; `KRK_CPU_Q80_KERNEL=bw` restores the previous kernel and
+`=scalar` reaches the floor.
