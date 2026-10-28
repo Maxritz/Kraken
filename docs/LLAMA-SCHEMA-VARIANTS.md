@@ -178,11 +178,14 @@ instead. The loader read and shape-checked that trunk — and the forward never
 asked for it, so the projection ran against an absent tensor and produced
 queries at 2.8e22 that became NaN one layer later. Nothing errored.
 
-It was not only MiniCPM3: **every V3-class DeepSeek file has that trunk**, so
-the `deepseek2` row's "runs" claim covered a file shape nothing had ever
-executed end to end. The trunk is now projected (with its norm) and falls back
-to the direct path only when the file has no trunk; a layer with neither is a
-named refusal instead of a multiply by nothing.
+The V3-class *Split* layout (`attn_k_b`/`attn_v_b`) also carries a trunk, but
+it is refused by name at `Engine::init` and never reaches this code -- so the
+reach of the bug was every **legacy-layout file with a `q_lora_rank`**, which
+before MiniCPM3 nothing in the suite had ever built. The trunk is now projected
+(with its norm) and falls back to the direct path only when the file has no
+trunk at all; a layer with neither is a named refusal instead of a multiply by
+nothing. The Split refusal is pinned by the same test, so it cannot quietly
+turn into a decode.
 
 The second half of the same bug: `ws_mlaqn_` — the trunk's intermediate row —
 was allocated **only for the shared layout**, so the fixed projection then

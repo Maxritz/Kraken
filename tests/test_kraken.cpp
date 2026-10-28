@@ -16986,6 +16986,33 @@ static void test_minicpm3_whole_graph() {
         differs = worst > 1e-3f;
     }
     CHECK(differs, "and they differ from the unscaled run, so the scale acts");
+
+    // The V3-class Split layout (attn_k_b/attn_v_b) is REFUSED by name -- it
+    // has no graph here, and the stub this test would otherwise be guarding is
+    // exactly the failure mode: a file that loads, shape-checks, and then runs
+    // a different graph than it describes. Pinned so the refusal cannot quietly
+    // become a decode.
+    {
+        const std::string sp = "kraken-mla-split-run.gguf";
+        MlaFix sf;
+        sf.kind = MlaFixKind::Split;
+        sf.n_layer = 4;
+        CHECK(build_mla_fixture(sp, sf), "wrote a split-layout fixture");
+        Backend *cpu2 = make_cpu_backend();
+        EngineConfig c;
+        c.model_path = sp;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        Engine e;
+        std::string e2;
+        const bool ran = e.init(cpu2, c, &e2);
+        CHECK(!ran, "the V3-class split layout does not run");
+        CHECK(e2.find("split") != std::string::npos &&
+                  e2.find("refused") != std::string::npos,
+              "and the refusal names the layout rather than failing obscurely");
+        if (ran) e.shutdown();
+        delete cpu2;
+    }
     delete cpu;
 }
 

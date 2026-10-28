@@ -1141,11 +1141,11 @@ The lite latent-attention forward projected the query **only** through
 attn_q_b` instead. The loader read and shape-checked that trunk, the forward
 never asked for it, and the projection ran against an absent tensor to produce
 queries at 2.8e22 that turned into NaN one layer later — with nothing reported
-in between. That was not only MiniCPM3: every V3-class DeepSeek file carries a
-trunk, so the `deepseek2` row's "runs" claim covered a shape nothing had
-executed end to end. Both halves are fixed now, including the workspace that was
-allocated only for the shared layout — which turned the first fix into a
-segfault until it was noticed.
+in between. The V3-class Split layout carries a trunk too, but it is refused by name and
+never reaches that code, so the reach of the bug was every legacy-layout file
+with a `q_lora_rank` — a shape nothing in the suite had ever built. Both halves
+are fixed now, including the workspace that was allocated only for the shared
+layout, which turned the first fix into a segfault until it was noticed.
 
 `test_minicpm3_whole_graph` pins all three facts: the file loads, the resolved
 scale is `1.4/sqrt(n_layer)`, and the same bytes under a label without the scale
