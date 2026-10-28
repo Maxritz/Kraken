@@ -207,42 +207,83 @@ __attribute__((target("avx2,fma"))) inline void attn_score64(
     }
 }
 
+// The visible-key window for one query row, computed once and shared.
+//
+// It used to be written out three times -- the scalar reference, the AVX2 row
+// and the NPU hand-off -- because each was added at a different time. Three
+// copies of `window`, `skip_from`, the causal clamp and the two masked-run
+// bounds is three chances for the paths to disagree about which keys a row can
+// see, and a disagreement there is silent: the output stays plausible and only
+// a fixture comparison finds it. The arithmetic lives here; the paths consume
+// the result.
+struct AttnRange {
+    i64 n_keys = 0;  // keys this row may attend to, from position 0
+    i64 j_lo = 0;    // first visible key
+    i64 n_vis = 0;   // j_lo + n_vis == n_keys
+    i64 m0 = 0;      // masked sub-run, j-relative
+    i64 m1 = 0;
+};
+
+inline AttnRange attn_range(const AttnDesc &d, i64 t) {
+    AttnRange r;
+    const i64 pos = d.pos0 + t;
+    r.n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
+    r.j_lo = d.window > 0 ? std::max<i64>(0, r.n_keys - d.window) : 0;
+    r.n_vis = r.n_keys - r.j_lo;
+    // skip_from: a query at pos >= skip_from keeps the context before
+    // skip_from and its own row, and sees its block's siblings as masked. That
+    // is one contiguous run in j, so the hot loop carries no branch.
+    if (d.skip_from >= 0 && pos >= d.skip_from) {
+        const i64 s_lo = std::max(r.j_lo, d.skip_from);
+        const i64 s_hi = std::min(pos, r.n_keys);
+        r.m0 = std::max<i64>(0, s_lo - r.j_lo);
+        r.m1 = std::min(r.n_vis, s_hi - r.j_lo);
+    }
+    return r;
+}
+
 // One (token, head) row on the f32 cache. Same arithmetic as the scalar body,
 // same masks, same softmax, same sink rule -- only the two inner loops change.
+// `kbase`/`vbase` address the first VISIBLE key's head slice and `row_stride`
+// is the distance between keys. That is the whole addressing contract, and it
+// is what lets one body read either the cache in place (row_stride =
+// pos_stride, 3072 B on this model) or a gathered tile (row_stride = hd)
+// without a second copy of the arithmetic.
 __attribute__((target("avx2,fma"))) void attn_row_f32_avx2(
-    const f32 *qf, const f32 *kc, const f32 *vc, f32 *of, const AttnDesc &d,
-    i64 t, i64 h, i64 n_rep, f32 *scores) {
+    const f32 *qf, const f32 *kbase, const f32 *vbase, i64 row_stride, f32 *of,
+    const AttnDesc &d, i64 t, i64 h, const AttnRange &r, f32 *scores) {
     const i64 hd = d.hd;
-    const i64 pos = d.pos0 + t;
-    const i64 n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
-    const i64 j_lo = d.window > 0 ? std::max<i64>(0, n_keys - d.window) : 0;
-    const i64 n_vis = n_keys - j_lo;
+    const i64 n_vis = r.n_vis;
     if (n_vis <= 0) return;
-    const bool skip = d.skip_from >= 0 && pos >= d.skip_from;
-    const i64 s_lo = skip ? std::max<i64>(j_lo, d.skip_from) : 0;
-    const i64 s_hi = skip ? std::min<i64>(pos, n_keys) : 0;
-    // The masked block is one contiguous run in j, so the branch inside the
-    // score loop becomes two ranges instead of a per-key test.
-    const i64 m0 = skip ? std::max<i64>(0, s_lo - j_lo) : 0;
-    const i64 m1 = skip ? std::min<i64>(n_vis, s_hi - j_lo) : 0;
-    const i64 hkv = n_rep > 0 ? h / n_rep : 0;
+    const i64 m0 = r.m0;
+    const i64 m1 = r.m1;
     const f32 *qh = qf + t * (d.n_head * hd) + h * hd;
 
     // 64-dimension chunks with q resident in registers; anything left over takes
     // the generic dot. The mask is applied in the second pass so the hot loop
     // carries no branch at all.
-    const i64 hkv_off = hkv * hd;
-    for (i64 j = 0; j < n_vis; j++) scores[j] = 0.0f;
+    // 64-dimension chunks ACCUMULATE, so hd = 128 and 256 are covered by the
+    // same code as hd = 64. The array is zeroed only when a chunk will run;
+    // a row narrower than one chunk is a single dot and assigns.
+    //
+    // Both mistakes this shape of code invites were caught by the fixture in
+    // tools/ta_attn_acc.cpp and not by reading it: an assigning chunk loses all
+    // but the last 64 dimensions at hd = 128/256, and an assigning remainder
+    // loses the first 64 at hd = 80/96. The fixture is the reason those two
+    // arms exist.
     i64 off = 0;
-    for (; off + 64 <= hd; off += 64)
-        attn_score64(qh + off, kc, d.pos_stride, hkv_off + off, j_lo, n_vis,
-                     scores);
-    if (off < hd) {
+    if (hd >= 64) {
+        for (i64 j = 0; j < n_vis; j++) scores[j] = 0.0f;
+        for (; off + 64 <= hd; off += 64)
+            attn_score64(qh + off, kbase, row_stride, off, 0, n_vis, scores);
+        if (off < hd) {
+            for (i64 j = 0; j < n_vis; j++)
+                scores[j] += attn_dot_avx2(qh + off, kbase + j * row_stride + off,
+                                           hd - off);
+        }
+    } else {
         for (i64 j = 0; j < n_vis; j++)
-            scores[j] += attn_dot_avx2(qh + off,
-                                       kc + (j_lo + j) * d.pos_stride + hkv_off +
-                                           off,
-                                       hd - off);
+            scores[j] = attn_dot_avx2(qh, kbase + j * row_stride, hd);
     }
     for (i64 j = 0; j < n_vis; j++) {
         if (j >= m0 && j < m1) {
@@ -274,8 +315,8 @@ __attribute__((target("avx2,fma"))) void attn_row_f32_avx2(
         __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
         __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps();
         __m256 a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
-        const f32 *vj = vc + j_lo * d.pos_stride + hkv * hd + i;
-        for (i64 j = 0; j < n_vis; j++, vj += d.pos_stride) {
+        const f32 *vj = vbase + i;
+        for (i64 j = 0; j < n_vis; j++, vj += row_stride) {
             const __m256 p = _mm256_set1_ps(scores[j] * inv);
             a0 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 0), a0);
             a1 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 8), a1);
@@ -300,8 +341,8 @@ __attribute__((target("avx2,fma"))) void attn_row_f32_avx2(
     // reordered sum, and this half of the kernel is supposed to be exact.
     for (; i + 16 <= hd; i += 16) {
         __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
-        const f32 *vj = vc + j_lo * d.pos_stride + hkv * hd + i;
-        for (i64 j = 0; j < n_vis; j++, vj += d.pos_stride) {
+        const f32 *vj = vbase + i;
+        for (i64 j = 0; j < n_vis; j++, vj += row_stride) {
             const __m256 p = _mm256_set1_ps(scores[j] * inv);
             a0 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj), a0);
             a1 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 8), a1);
@@ -311,16 +352,16 @@ __attribute__((target("avx2,fma"))) void attn_row_f32_avx2(
     }
     for (; i + 8 <= hd; i += 8) {
         __m256 a0 = _mm256_setzero_ps();
-        const f32 *vj = vc + j_lo * d.pos_stride + hkv * hd + i;
-        for (i64 j = 0; j < n_vis; j++, vj += d.pos_stride)
+        const f32 *vj = vbase + i;
+        for (i64 j = 0; j < n_vis; j++, vj += row_stride)
             a0 = _mm256_fmadd_ps(_mm256_set1_ps(scores[j] * inv),
                                  _mm256_loadu_ps(vj), a0);
         _mm256_storeu_ps(oh + i, a0);
     }
     for (; i < hd; i++) {
-        const f32 *vj = vc + j_lo * d.pos_stride + hkv * hd + i;
+        const f32 *vj = vbase + i;
         f32 acc = 0.0f;
-        for (i64 j = 0; j < n_vis; j++, vj += d.pos_stride)
+        for (i64 j = 0; j < n_vis; j++, vj += row_stride)
             acc += scores[j] * inv * vj[0];
         oh[i] = acc;
     }
@@ -1014,6 +1055,72 @@ public:
             return __builtin_cpu_supports("avx2") &&
                    __builtin_cpu_supports("fma");
         }();
+        // Gather arm, latched with the ISA probe. KRK_CPU_ATTN_GATHER=0 keeps
+        // the in-place path, which is the A/B and the arm a cache-layout
+        // experiment wants.
+        static const i64 n_gather = [] {
+            const char *e = std::getenv("KRK_CPU_ATTN_GATHER");
+            return (e && e[0] == '0') ? 0 : 1;
+        }();
+        // Gather the visible key/value slices into a contiguous tile, per head,
+        // for the whole token chunk.
+        //
+        // The cache is [position][head][hd], so a head's slice of one key is 256
+        // B out of a 3072 B stride on this model. The score loop then reads
+        // four cache lines and uses one -- measured on the same arithmetic,
+        // 16.14 ns/key strided against 2.99 ns/key contiguous, a 5.4x gap that
+        // no amount of loop work recovers (four keys in flight: 14.47; software
+        // prefetch: 13.77).
+        //
+        // The gather does not remove that traffic, it AMORTISES it: one pass
+        // over the strided cache serves every query row in the chunk, instead
+        // of once per (token, head). That is why it is gated on n_tok > 1 --
+        // for a decode step there is nothing to amortise and the copy is pure
+        // cost. It is also why the rows are walked head-major here: the tile
+        // belongs to a head, and every token in the chunk reuses it.
+        //
+        // The tile is exactly the bytes each row would have read, in the same
+        // order, so the row body runs the identical arithmetic -- accuracy is
+        // checked against the in-place path on ten shapes, not argued.
+        if (attn_vec && n_gather > 0 && d.n_tok > 1) {
+            par_for(d.n_head, 1,
+                    4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * d.hd,
+                    [&](i64 hb, i64 he) {
+                        std::vector<f32> kg, vg, scores;
+                        for (i64 h = hb; h < he; h++) {
+                            const i64 hkv = n_rep > 0 ? h / n_rep : 0;
+                            const i64 base_j = attn_range(d, 0).j_lo;
+                            const i64 span = attn_range(d, d.n_tok - 1).n_keys -
+                                             base_j;
+                            if (span <= 0) continue;
+                            const size_t need = static_cast<size_t>(span * d.hd);
+                            if (kg.size() < need) {
+                                kg.resize(need);
+                                vg.resize(need);
+                            }
+                            const f32 *kb = kc + base_j * d.pos_stride + hkv * d.hd;
+                            const f32 *vb = vc + base_j * d.pos_stride + hkv * d.hd;
+                            for (i64 j = 0; j < span; j++) {
+                                std::memcpy(kg.data() + j * d.hd,
+                                            kb + j * d.pos_stride,
+                                            static_cast<size_t>(d.hd) * sizeof(f32));
+                                std::memcpy(vg.data() + j * d.hd,
+                                            vb + j * d.pos_stride,
+                                            static_cast<size_t>(d.hd) * sizeof(f32));
+                            }
+                            for (i64 t = 0; t < d.n_tok; t++) {
+                                const AttnRange r = attn_range(d, t);
+                                if (r.n_vis <= 0) continue;
+                                scores.resize(static_cast<size_t>(r.n_vis));
+                                const i64 off = (r.j_lo - base_j) * d.hd;
+                                attn_row_f32_avx2(qf, kg.data() + off,
+                                                  vg.data() + off, d.hd, of, d, t,
+                                                  h, r, scores.data());
+                            }
+                        }
+                    });
+            return;
+        }
         if (attn_vec) {
             par_for(units, 1,
                     4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * d.hd,
@@ -1022,10 +1129,14 @@ public:
                         for (i64 u = b; u < e; u++) {
                             const i64 t = u / d.n_head;
                             const i64 h = u - t * d.n_head;
-                            const i64 n_vis_max = d.causal ? d.pos0 + t + 1
-                                                           : d.pos0 + d.n_tok;
-                            scores.resize(static_cast<size_t>(n_vis_max));
-                            attn_row_f32_avx2(qf, kc, vc, of, d, t, h, n_rep,
+                            const AttnRange r = attn_range(d, t);
+                            scores.resize(static_cast<size_t>(r.n_vis));
+                            const i64 hkv = n_rep > 0 ? h / n_rep : 0;
+                            attn_row_f32_avx2(qf, kc + r.j_lo * d.pos_stride +
+                                                      hkv * d.hd,
+                                              vc + r.j_lo * d.pos_stride +
+                                                  hkv * d.hd,
+                                              d.pos_stride, of, d, t, h, r,
                                               scores.data());
                         }
                     });
