@@ -591,6 +591,11 @@ target_link_libraries(kraken-isa-ceiling PRIVATE krk_core)
 add_executable(kraken-q80-odd tools/ta_q80_odd.cpp)
 target_link_libraries(kraken-q80-odd PRIVATE krk_core)
 
+# Component ablation of the Q8_0 kernel: one instruction group changed per rung,
+# all rungs in one process, to price what the inner loop actually spends.
+add_executable(kraken-q80-ablate tools/bench_q80_ablate.cpp)
+target_link_libraries(kraken-q80-ablate PRIVATE krk_core)
+
 if(KRK_HIP_AVAILABLE)
     add_executable(kraken-oracle tools/oracle_probe.cpp)
     target_link_libraries(kraken-oracle PRIVATE krk_core krk_hip)
