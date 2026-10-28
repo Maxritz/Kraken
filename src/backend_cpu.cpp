@@ -397,6 +397,17 @@ public:
         return s;
     }
 
+    // The device is the one with a one-time weight conversion, so the seam is
+    // forwarded rather than implemented here: with W8A8 off there is nothing to
+    // move, and the prepare pass is skipped entirely.
+    bool wants_prepare() const override {
+        return npu_ && npu::wants_prepare(npu_);
+    }
+    void set_prepare(bool on) override {
+        if (npu_) npu::set_preparing(npu_, on);
+    }
+    bool preparing() const override { return npu_ && npu::preparing(npu_); }
+
     std::string describe() const override {
         // Report placement with the part: on a hybrid host this line is the
         // difference between "why is it slow" and "it is on the E cores".

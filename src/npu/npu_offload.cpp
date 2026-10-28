@@ -102,6 +102,9 @@ struct Counters {
     // GEMM row-count histogram: 1 row, 2-8, 9-32, 33+. Distinguishes decode
     // steps from prefill chunks in the numbers rather than by assumption.
     unsigned long long rows_hist[4] = {0, 0, 0, 0};
+    // GEMMs the device refused because the host is the faster arm for that
+    // shape. Not a fallback: a routing decision, made per call.
+    unsigned long long shape_refused = 0;
     unsigned long long staged_weights = 0;
     unsigned long long streamed_weights = 0; // of those, served by the ring
     unsigned long long q8_0_gemm = 0; // GEMMs that read weights in place
@@ -205,6 +208,23 @@ public:
     // the device has no "int8 weights x f32 activations" op. Measured worst
     // case on the probe: 3.36e-03 absolute, 3.32e-04 relative to the row peak.
     bool w8a8 = false;
+    // Set while the engine's load-time prepare pass runs: a single-row GEMM
+    // packs instead of deferring, which is what moves the one-time cost out of
+    // the first measured step. See wants_prepare() in npu_offload.hpp.
+    bool preparing = false;
+    // Row-shape gate: GEMMs with more rows than this stay on the host.
+    //
+    // The device and the host win different phases. Measured on the dense q8_0
+    // fixture, same prompt: prefill (rows = prompt length) is 1.45x FASTER on
+    // the host, because the host reads Q4_K/Q6_K/Q8_0 blocks where they lie and
+    // the device has to expand them; decode (rows = 1) is 1.45x faster on the
+    // device, because the host's advantage is a format the decode shape cannot
+    // use. Neither arm is wrong; they are good at different shapes.
+    //
+    // So the device declines a shape it does not win, the same way it declines
+    // a weight type it cannot read -- and the run summary counts it, because a
+    // silent refusal would be indistinguishable from a device that is slow.
+    i64 max_rows = 0;  // 0 = take every shape (previous behaviour)
     // KRK_NPU_OPTIME=1: time submit() and sync() separately so a batch's wall
     // time can be split into host dispatch and device wait.
     bool optime = false;
@@ -610,6 +630,12 @@ Offload *create(int device_index, Mode mode, std::string *why) {
     o->unit = unit;
     o->strict_queue = env_on("KRK_NPU_STRICT_QUEUE");
     o->w8a8 = env_on("KRK_NPU_W8A8");
+    // Default 1 whenever the int8 path is on, because that is where the
+    // measurement lands: prefill-shaped GEMMs are 2.2x (5 rows) to 1.0x (339
+    // rows) faster on the host, and every row count measured from 5 up loses on
+    // the device. A one-row GEMM is the single shape the device wins, and it is
+    // the whole of decode. KRK_NPU_MAX_ROWS=0 restores take-everything.
+    o->max_rows = env_i64("KRK_NPU_MAX_ROWS", o->w8a8 ? 1 : 0);
     o->optime = env_on("KRK_NPU_OPTIME");
     o->w8a8_eager = env_on("KRK_NPU_W8A8_EAGER");
     o->attn_on = env_on("KRK_NPU_ATTN");
@@ -793,6 +819,20 @@ static double npu_peak_gmacs(Offload *o) {
     return cached;
 }
 
+bool wants_prepare(const Offload *o) {
+    if (!o || !o->w8a8) return false;
+    // KRK_NPU_NO_PREPARE=1 restores the old behaviour, which is the only way to
+    // A/B the pass itself in one binary. It is also the honest escape hatch: a
+    // long-lived server prefers a pay-as-you-go first step to a 0.5 s spike at
+    // load, and that is a judgement about the workload, not about the device.
+    const char *e = std::getenv("KRK_NPU_NO_PREPARE");
+    return !(e && e[0] == '1');
+}
+void set_preparing(Offload *o, bool on) {
+    if (o) o->preparing = on;
+}
+bool preparing(const Offload *o) { return o != nullptr && o->preparing; }
+
 bool flush(Offload *o) {
     if (!o || !o->stream) return true;
     o->n.flushes++;
@@ -886,6 +926,10 @@ std::string stats(const Offload *o) {
     // decode one, and both arms of every comparison need to show it.
     if (o->n.q8_0_gemm)
         out += format("; q8_0 in place %llu", o->n.q8_0_gemm);
+    if (o->n.shape_refused)
+        out += format("; shape refused %llu (rows > %lld: the host is the "
+                      "faster arm for that shape)",
+                      o->n.shape_refused, static_cast<long long>(o->max_rows));
     out += format("; gemm rows 1:%llu 2-8:%llu 9-32:%llu 33+:%llu",
                   o->n.rows_hist[0], o->n.rows_hist[1],
                   o->n.rows_hist[2], o->n.rows_hist[3]);
@@ -960,7 +1004,14 @@ bool gemm_i8(Offload *o, void *out, const void *x, const void *w, DType wt,
     // on every request, which is what the earlier builds did.
     if (!o->w8a8_eager) {
         bool defer = rows > 1;
-        if (!defer) {
+        if (!defer && o->preparing) {
+            // The prepare pass: every request has one row by construction, so
+            // the "second request" heuristic below would pack nothing and the
+            // pass would be a no-op. Record the weight as seen anyway, so the
+            // post-load state is identical to a run that had already decoded.
+            o->seen_1row.insert(w);
+            defer = false;
+        } else if (!defer) {
             // A single-row GEMM is not proof of decode on its own: a prefill
             // still issues some (106 weights on the 58-token MoE, measured),
             // and packing for those was 563 ms of a 2609 ms prefill for nothing.
@@ -1091,6 +1142,12 @@ bool gemm(Offload *o, void *out, const void *x, const void *w, DType wt,
           i64 n_out, i64 n_in, i64 rows) {
     if (!o || !o->stream || !out || !x || !w) return false;
     if (!fits_u32(rows) || !fits_u32(n_out) || !fits_u32(n_in)) return false;
+    // Decline BEFORE queueing anything: the caller reads that as "the device
+    // wrote nothing", flushes, and runs its own body.
+    if (o->max_rows > 0 && rows > o->max_rows) {
+        o->n.shape_refused++;
+        return false;
+    }
     // Opt-in W8A8. A decline here is not a substitution: it falls through to
     // the device's own f32 GEMM, which is the MORE accurate path on the same
     // device, and the run summary counts it.
@@ -1413,6 +1470,12 @@ std::string describe(const Offload *) {
 std::string stats(const Offload *) { return std::string(); }
 
 bool flush(Offload *) { return true; }
+
+// The prepare-pass seam, in a build with no device: there is no one-time
+// conversion to move, and the engine must still link.
+bool wants_prepare(const Offload *) { return false; }
+void set_preparing(Offload *, bool) {}
+bool preparing(const Offload *) { return false; }
 
 bool gemm(Offload *, void *, const void *, const void *, DType, i64, i64, i64) {
     return false;

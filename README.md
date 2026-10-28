@@ -526,6 +526,43 @@ consolidated inventory — every idea from the porting table, the patch stack, t
 device's own docs and the traces, with the duplicates collapsed — is in
 [docs/NPU-CONSOLIDATED.md](docs/NPU-CONSOLIDATED.md).
 
+#### Two changes that made the device the faster arm at decode
+
+Both are routing, not kernels. Same fixture, `--ctx 512`, greedy, medians of 3:
+
+| arm | n=16 | n=64 | n=128 | prefill ms |
+|---|---:|---:|---:|---:|
+| host CPU | 52.4 | 49.4 | 50.9 | 328.8 |
+| NPU f32 | 20.4 | 24.6 | 26.1 | 473.0 |
+| NPU int8, one-time cost left in the decode steps (previous) | 15.6 | 41.6 | 54.7 | 316.7 |
+| **NPU int8, both (default)** | **83.5** | **76.3** | **77.4** | **314.3** |
+
+1. **The pack moved to load.** The device converts each weight into its int8
+   layout once, 2.3 ms each. Left in the decode path it was 48% of a 16-token
+   run, which made the int8 arm read as a 0.74x regression while its steady
+   state was 2.5x — the earlier "the NPU cannot win decode" verdict came from
+   the short end of that curve. The engine now runs one 1-token prepare pass at
+   load (`prepare pass: 537.0 ms (one-time weight conversion, outside the timed
+   run)`), bracketed by `Backend::set_prepare` and skipped entirely by backends
+   with no such cost. It is numerically neutral: it produces identical tokens to
+   packing lazily on first use, and differs from *never* packing eagerly only
+   because the first use of a weight would otherwise run f32.
+   `KRK_NPU_NO_PREPARE=1` opts out.
+
+2. **The device declines shapes it does not win.** Sweeping prompt length, the
+   host is faster for every GEMM with more than one row — 2.2x at 5 rows, parity
+   at 339 — because the host reads block formats where they lie and the device
+   must expand them. So `npu::gemm` now refuses a GEMM above `KRK_NPU_MAX_ROWS`
+   (default 1 with int8 on) **before queueing anything**, the caller runs its
+   own body, and the summary counts it: `shape refused 84 (rows > 1: the host is
+   the faster arm for that shape)`. A refusal is a routing decision, printed, not
+   a silent fallback.
+
+Net: decode **1.5x the host CPU, flat from 16 to 128 tokens**, and the prefill
+penalty for using the device at all drops from 1.5x to nothing. Details, the
+crossover table and the reproduce commands:
+[docs/NPU-ROUTING.md](docs/NPU-ROUTING.md).
+
 The HIP backend already had a richer recorder of its own (`hipEvents`, a
 per-op device span plus host submit time and a device-idle gap), but it printed
 in its own format. It now also feeds the shared table — device span net of the

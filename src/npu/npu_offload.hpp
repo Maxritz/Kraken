@@ -119,6 +119,25 @@ std::string describe(const Offload *o);
 // host. Empty for a null handle.
 std::string stats(const Offload *o);
 
+// ---- the load-time prepare pass -------------------------------------------
+//
+// Packing a weight into the device's int8 layout costs 2.3 ms, and the cost is
+// paid once per weight. Where it lands is not cosmetic: leaving it in the first
+// decode step makes a 16-token run look like an int8 REGRESSION (0.74x) while
+// the steady state is a 2.5x WIN (measured, both arms, this box). A one-time
+// cost inside a benchmark is a lie about the thing being benchmarked.
+//
+// So the engine asks, at load, whether the backend wants a pass whose only job
+// is to touch every weight, and runs one 1-token forward with `preparing` set.
+// In that mode a single-row GEMM packs instead of deferring, so every weight is
+// converted before the first prompt and the decode path starts warm.
+//
+// wants_prepare() is false unless the int8 path is on: with W8A8 off there is
+// no pack to move, and a prepare pass would be a wasted forward.
+bool wants_prepare(const Offload *o);
+void set_preparing(Offload *o, bool on);
+bool preparing(const Offload *o);
+
 // Submits and waits for everything queued. Returns false if the device reported
 // an error; the queue is empty afterwards either way. Cheap when empty: a Gemm
 // arm that has already synced costs one vector-size check.

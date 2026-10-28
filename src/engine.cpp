@@ -2193,17 +2193,48 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         }
     }
 
-    if (cfg_.warmup) {
-        KRK_TIME_HOST("load.warmup_pass");
+    // One 1-token pass at load, doing up to two jobs.
+    //
+    //   cfg_.warmup    pages the weights in (the original purpose);
+    //   wants_prepare  a backend with a ONE-TIME weight conversion does it
+    //                  here instead of inside the first measured step.
+    //
+    // The second job is not cosmetic. The virtual NPU packs each weight into
+    // the device's int8 layout once, at 2.3 ms each; while that cost sat in the
+    // first decode step, a 16-token run measured 0.74x against the f32 arm and
+    // the same code measured 2.51x at 128 tokens. The cost is the same either
+    // way -- what changed is whether a benchmark can see it. Charged to the
+    // load phase it prints on the load line, where a reader expects one-time
+    // costs, and the decode number becomes length-independent.
+    //
+    // The pass is a real forward, so it needs the KV cursor put back: it ran at
+    // position 0 and the caller's prompt also starts at 0. `kv_rollback(0)` is
+    // the same "new sequence" primitive generate() uses, including the
+    // recurrent-model reset.
+    const bool want_prepare = be_->wants_prepare();
+    if (cfg_.warmup || want_prepare) {
+        KRK_TIME_HOST(want_prepare ? "load.prepare_pass" : "load.warmup_pass");
         const i32 t = tok_.bos() >= 0 ? tok_.bos() : 0;
         const Timer w;
-        if (!forward(&t, 1, 0, true)) {
+        if (want_prepare) be_->set_prepare(true);
+        const bool ok = forward(&t, 1, 0, true);
+        if (want_prepare) be_->set_prepare(false);
+        if (!ok) {
             if (err) *err = "KV promotion refused during the engine warmup";
             shutdown();
             return false;
         }
         be_->sync();
-        KRK_INFO("warmup pass: %.1f ms", w.ms());
+        if (kv_pos_ != 0 && !kv_rollback(0)) {
+            if (err) *err = "KV promotion refused before the first prompt";
+            shutdown();
+            return false;
+        }
+        KRK_INFO("%s pass: %.1f ms%s",
+                 want_prepare ? "prepare" : "warmup", w.ms(),
+                 want_prepare ? " (one-time weight conversion, outside the "
+                                "timed run)"
+                              : "");
     }
 
     // LAST, and deliberately so: the warmup pass above promotes experts, and a
