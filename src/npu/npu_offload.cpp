@@ -443,7 +443,7 @@ vnpu_packed_weights_t *Offload::weight_i8(const void *w, DType wt, i64 n_out,
     // token. So pack for decode, stay f32 for prefill.
     // KRK_NPU_W8A8_EAGER=1 packs on every request, which is what earlier builds
     // did and what the 3350/3522 ms rows above were measured with.
-    const double t_pack0 = optime ? optime_now_ms() : 0.0;
+    const double t_pack0 = optime_now_ms();
     const size_t elems = static_cast<size_t>(n_out) * static_cast<size_t>(n_in);
     if (stage_i8_bytes + elems > stage_budget) {
         if (!stage_refused) {
@@ -525,11 +525,13 @@ vnpu_packed_weights_t *Offload::weight_i8(const void *w, DType wt, i64 n_out,
     stage_i8_bytes += elems;
     EntryI8 e;
     e.packed = packed;
-    if (optime) {
-        n.pack_dev_ms += optime_now_ms() - t_dev0;
-        n.pack_ms += optime_now_ms() - t_pack0;
-        n.packed_weights++;
-    }
+    // `pack_ms` and the weight count stay unconditional: they are two clock
+    // reads per weight, and the run summary quotes them next to the packed
+    // MiB. Gating them on KRK_NPU_OPTIME printed "packed in 0 ms", which is
+    // the one number that makes a short decode look like an int8 regression.
+    n.pack_ms += optime_now_ms() - t_pack0;
+    n.packed_weights++;
+    if (optime) n.pack_dev_ms += optime_now_ms() - t_dev0;
     e.bytes = elems;
     stage_i8.emplace(w, e);
     return packed;
@@ -628,6 +630,20 @@ Offload *create(int device_index, Mode mode, std::string *why) {
         vnpu_device_destroy(o->dev);
         delete o;
         return nullptr;
+    }
+    // Tile geometry, per phase.
+    //
+    // The device ships one default (64x256x64 here) and it is a prefill shape:
+    // a 64-row M tile over a one-row GEMV spends 63/64 of its work on padding.
+    // Its own autotuner picks 1x128x64 for M=1 and 32x128x64 for M=64 on this
+    // host. KRK_NPU_TILES=M,K,N overrides both phases; any field left 0 keeps
+    // the device default. Measured effect is in docs/NPU-CONSOLIDATED.md.
+    if (const char *t = env_str("KRK_NPU_TILES")) {
+        unsigned tm = 0, tk = 0, tn = 0;
+        if (std::sscanf(t, "%u,%u,%u", &tm, &tk, &tn) == 3 && tm && tk && tn)
+            vnpu_device_set_tiles(o->dev, tm, tk, tn);
+        else
+            KRK_WARN("npu: KRK_NPU_TILES wants M,K,N -- got '%s'", t);
     }
     vnpu_device_get_info(o->dev, &o->info);
     // How much non-f32 weight data the device may hold, expanded.
@@ -876,10 +892,16 @@ std::string stats(const Offload *o) {
     // Only when the switch is on: a default run should not have to read a
     // zero-row about a path it never took.
     if (o->w8a8) {
-        out += format("; w8a8 %llu int8 (%.1f MiB packed), %llu on f32",
+        // The pack time is printed next to the MiB on purpose. It is a
+        // ONE-TIME cost paid inside whichever step first re-requests a weight
+        // with a single row, so a short decode shows it as a steady-state
+        // regression: int8 loses to f32 at 16 tokens and wins 2.5x by 128.
+        // Without the number in the line, that reads as "int8 is slower".
+        out += format("; w8a8 %llu int8 (%.1f MiB packed in %.0f ms one-time), "
+                      "%llu on f32",
                       o->n.w8a8_gemm,
                       static_cast<double>(o->stage_i8_bytes) / (1024.0 * 1024.0),
-                      o->n.w8a8_fallback);
+                      o->n.pack_ms, o->n.w8a8_fallback);
         if (o->n.w8a8_deferred)
             out += format(", %llu deferred (first use served as f32)",
                           o->n.w8a8_deferred);

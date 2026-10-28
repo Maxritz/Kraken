@@ -500,11 +500,31 @@ expanded from Q4_K to f32 — 552.1 MiB staged from a 90 MB model, 6.1×. The ho
 path never does that; it reads the 144-byte blocks where they lie.
 
 The device *does* have a packed int8 matmul, and turning it on
-(`KRK_NPU_W8A8=1`) moves decode 17.4 → **21.6 tok/s** (+24%), which is the
-direction the arithmetic predicts — but it quantizes activations as well, and it
-still loses to the host's 124. On a shared host the NPU cannot win decode by
-running the same CPU better; it wins only if the weight format stops being
-expanded. That needs an opcode; it is not something the engine can paper over.
+(`KRK_NPU_W8A8=1`) is the only configuration measured in this project where the
+virtual NPU **beats the host CPU at decode**. That claim was missed for months
+because it was measured at the wrong generation length. The pack is one-time and
+it lands inside whichever step first re-requests a weight, so a 16-token decode
+reports it as a regression:
+
+| n | f32 ms/step | i8 ms/step | i8 / f32 |
+|---:|---:|---:|---:|
+| 16 | 43.2 | 58.4 | 0.74x |
+| 32 | 35.6 | 32.6 | 1.09x |
+| 64 | 36.2 | 20.5 | 1.76x |
+| 128 | 35.7 | **14.2** | **2.51x** |
+
+At n=128 on a dense q8_0 fixture (12 layers x 768, ff 2048, 2 cores): host CPU
+58.0 tok/s, NPU f32 28.0, **NPU int8 70.4, NPU+CPU hybrid int8 72.7**. The
+summary line now prints the pack time (`84.0 MiB packed in 524 ms one-time`) so
+the one-time cost cannot be read as steady state — in a 32-token run it is 48%
+of the wall clock, in a 128-token run it is 4.1 ms of 14.2.
+
+The format problem is still the ceiling: `MATMUL_I8` gets the weight traffic
+from 370 MiB to 92 MiB per token but pays for it by quantising activations, and
+there is still no opcode that reads a block format where it lies. The
+consolidated inventory — every idea from the porting table, the patch stack, the
+device's own docs and the traces, with the duplicates collapsed — is in
+[docs/NPU-CONSOLIDATED.md](docs/NPU-CONSOLIDATED.md).
 
 The HIP backend already had a richer recorder of its own (`hipEvents`, a
 per-op device span plus host submit time and a device-idle gap), but it printed
