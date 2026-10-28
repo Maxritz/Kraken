@@ -155,6 +155,40 @@ constexpr ArchSpec phi2_spec() {
     return s;
 }
 
+// MPT: LayerNorm with a bias, a fused `attn_qkv` WITH a bias, an ungated GELU
+// MLP with biases on both projections, and ALiBi in place of any position
+// embedding -- `attention.max_alibi_bias` from the file, with an OPTIONAL
+// learned position table some exports carry (`mpt-7b` does). llama.cpp lists
+// LLM_ARCH_MPT under LLAMA_ROPE_TYPE_NONE, so no rotary is built.
+//
+// Its ALiBi is a file key, not a constant: `load_arch_hparams` reads
+// LLM_KV_ATTENTION_MAX_ALIBI_BIAS as optional and leaves f_max_alibi_bias at 0
+// when the key is absent, which is exactly what the loader here does.
+constexpr ArchSpec mpt_spec() {
+    ArchSpec s{"mpt", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "mpt", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.ln_bias = true;
+    s.no_gate_ffn = true;
+    return s;
+}
+
+// BLOOM: LayerNorm with a bias everywhere, a fused `attn_qkv` with a bias, an
+// ungated GELU MLP with biases, and ALiBi at a FIXED max bias of 8.0 (the
+// reference's own constant for this arch -- the key is not in the files).
+// It also normalizes the token embedding before block 0, which is why
+// `embd_norm` exists.
+constexpr ArchSpec bloom_spec() {
+    ArchSpec s{"bloom", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "bloom", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.ln_bias = true;
+    s.no_gate_ffn = true;
+    s.embd_norm = true;
+    s.alibi_max_bias = 8.0f;
+    return s;
+}
+
 constexpr ArchSpec kTable[] = {
     // ---- the schemas this engine runs ------------------------------------
     {"llama", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
@@ -165,6 +199,8 @@ constexpr ArchSpec kTable[] = {
     gptneox_spec(),
     gptj_spec(),
     phi2_spec(),
+    mpt_spec(),
+    bloom_spec(),
     // GPT-2 and its descendants: LayerNorm (biased), learned absolute
     // positions, a fused attn_qkv, and a plain GELU MLP. See
     // ArchSpec::gpt2_style for why those four travel together.

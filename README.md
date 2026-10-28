@@ -1186,3 +1186,24 @@ layouts are bit-identical on the same weights — verified for all three, with
 ignored. See [docs/PLAIN-PRENORM-FAMILY.md](docs/PLAIN-PRENORM-FAMILY.md), which
 also records two loader bugs this found (`output_norm.bias` wrongly *required*,
 so complete GPT-J files were refused; and `layer_norm_epsilon` never read).
+
+### ALiBi, and the mpt and bloom families
+
+`mpt` and `bloom` are the same pre-norm stack again with a different position
+signal: **ALiBi**, a per-head multiple of the query-to-key distance subtracted
+from the attention score. No rotary, no learned position. The slope anchor is
+`floor(log2(n_head))` and the second group of heads uses *half* the max bias as
+its base — two details that silently re-scale every penalty if guessed at, so
+both are written out in `alibi_slope_impl()` and the slope is hoisted per head
+rather than recomputed per key.
+
+MPT states its scale in the file; BLOOM hardcodes 8.0 in its loader and reads no
+key. Reading only the key leaves BLOOM with ALiBi **off**, which still decodes —
+the failure mode this change exists to avoid. BLOOM additionally normalizes the
+embedding before block 0. With ALiBi forced to 0, MPT reproduces `phi2`'s logits
+digit for digit; with it on, they move — and BLOOM's graph provably equals MPT's
+plus that one norm. See [docs/ALIBI-AND-MPT-BLOOM.md](docs/ALIBI-AND-MPT-BLOOM.md),
+which also records three loader bugs this found (`position_embd.weight` wrongly
+*required*, so complete MPT files were refused; per-head QK-norm tensors loaded
+but never applied in the plain path, decoding silently wrong; and
+`token_embd_norm` confused for a per-layer norm).

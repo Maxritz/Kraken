@@ -146,6 +146,22 @@ struct AttnDesc {
     i64 layer_stride = 0;  // elements between layers in the KV cache
     i64 pos_stride = 0;    // elements between positions in the KV cache
     f32 scale = 1.0f;      // 1/sqrt(hd)
+    // ALiBi: an additive per-head distance bias on the score, in place of a
+    // rotary or learned position. `attention.max_alibi_bias` from the file;
+    // 0 means the family does not use it.
+    //
+    // The slope is NOT stored per head here. It is derived inside the kernel
+    // from this one number and the head index, because llama.cpp derives it the
+    // same way from the same key (ggml-cpu soft_max_ext): with
+    // `n_head_log2 = 1 << floor(log2(n_head))`,
+    //     m0 = 2^(-max_bias / n_head_log2)
+    //     m1 = 2^(-(max_bias/2) / n_head_log2)
+    //     slope(h) = h < n_head_log2 ? m0^(h+1) : m1^(2*(h-n_head_log2)+1)
+    // and the bias added to the score is `slope * (-|pos_q - pos_k|)`. Storing
+    // the scalar rather than a per-head table keeps the one formula in the one
+    // place, so a file and this engine cannot disagree about it.
+    f32 alibi_max_bias = 0.0f;
+
     // Attention-logit bound (Gemma 2 carries `attention.logit_softcapping` =
     // 50): every score becomes cap * tanh(score / cap) AT SCORE FORMATION,
     // before the running max and therefore before the softmax. This is not an

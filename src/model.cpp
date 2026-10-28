@@ -312,6 +312,11 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.learned_pos = aspec.learned_pos;
     cfg_.parallel_residual = aspec.parallel_residual;
     cfg_.no_gate_ffn = aspec.no_gate_ffn;
+    cfg_.embd_norm = aspec.embd_norm;
+    // The arch entry supplies the family's own constant (BLOOM's 8.0); the
+    // file's key wins when it has one, which is how MPT states its value.
+    cfg_.alibi_max_bias = static_cast<f32>(gguf_.get_f64(
+        key(".attention.max_alibi_bias"), aspec.alibi_max_bias));
     cfg_.rope_swa_only = aspec.rope_swa_only;
     // RoPE's pair convention is a property of the export, so it comes from
     // the arch table rather than from the tensors. KRK_ROPE_NEOX=0/1 forces
@@ -1287,11 +1292,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // token embedding before the first block. There is no rotary table
             // anywhere in this family, and building one would rotate vectors
             // that already carry their position.
+            // OPTIONAL, not required. GPT-2 and Phi-2 always carry the table;
+            // MPT carries it on some exports and relies on ALiBi alone on
+            // others, and refusing the second kind would reject a complete
+            // file. `learned_pos` says the family CAN use a table, and the
+            // forward adds it only when the tensor is there.
             const GgufTensor *pe = gguf_.tensor("position_embd.weight");
             if (!pe) {
-                if (err) *err = "gpt2 file has no position_embd.weight";
-                return false;
-            }
+                // nothing to load; the position signal is ALiBi's
+            } else {
             pos_embd_ = upload_raw(pe, pe->type);
             if (pe->n_elements !=
                 static_cast<i64>(cfg_.n_ctx_train) * cfg_.n_embd) {
@@ -1302,6 +1311,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                            std::to_string(static_cast<i64>(cfg_.n_ctx_train) *
                                           cfg_.n_embd);
                 return false;
+            }
             }
         }
         cfg_.n_vocab = static_cast<i32>(te->ne[1]);
@@ -1390,6 +1400,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // demanding the tensor would refuse a complete file -- and the
             // same distinction already exists for the per-layer norms.
             out_norm_bias_ = upload_f32("output_norm.bias");
+            // BLOOM's embedding norm. The file carries it BESIDE the output
+            // norm and beside every per-layer norm, so reading the wrong one is
+            // a same-shape substitution that still decodes -- which is why it
+            // is loaded only under the arch flag that says this family has it.
+            if (cfg_.embd_norm) {
+                embd_norm_ = upload_f32("token_embd_norm.weight");
+                embd_norm_bias_ = upload_f32("token_embd_norm.bias");
+                if (!embd_norm_) {
+                    if (err)
+                        *err = "bloom file has no token_embd_norm.weight "
+                               "(this family normalizes the embedding)";
+                    return false;
+                }
+            }
         }
     }
 

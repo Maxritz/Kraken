@@ -227,6 +227,34 @@ struct AttnRange {
 // A row's own position. With no per-row table this is the old consecutive
 // layout; with one, each row carries its own -- which is what lets a single
 // call mix several sequences at different points in their history.
+// ALiBi slope for one head, exactly as llama.cpp derives it.
+//
+// ggml-cpu's soft_max_ext builds the same table from the same
+// `attention.max_alibi_bias` key and the same head count:
+//
+//     n_head_log2 = 1 << (uint32_t) floor(log2(n_head));
+//     m0 = powf(2, -max_bias / n_head_log2);
+//     m1 = powf(2, -(max_bias/2) / n_head_log2);
+//     slope(h) = h < n_head_log2 ? powf(m0, h + 1)
+//                                : powf(m1, 2*(h - n_head_log2) + 1);
+//
+// The floor(log2(n_head)) is the part worth naming: for a head count that is
+// not a power of two the geometric ramp is anchored at the largest power of two
+// BELOW it, so the tail heads take the halved base instead. Getting this wrong
+// is not a rounding difference -- it re-scales every head's distance penalty,
+// which decodes as plausible text with the wrong context weighting.
+inline f32 alibi_slope_impl(i64 h, i64 n_head, f32 max_bias) {
+    if (max_bias <= 0.0f) return 0.0f;
+    u32 nh = static_cast<u32>(n_head > 0 ? n_head : 1);
+    u32 nh_log2 = 1u;
+    while ((nh_log2 << 1) <= nh) nh_log2 <<= 1;
+    const f32 m0 = std::pow(2.0f, -max_bias / static_cast<f32>(nh_log2));
+    const f32 m1 = std::pow(2.0f, -(max_bias / 2.0f) / static_cast<f32>(nh_log2));
+    const u32 hu = static_cast<u32>(h);
+    return hu < nh_log2 ? std::pow(m0, static_cast<f32>(hu + 1))
+                        : std::pow(m1, static_cast<f32>(2 * (hu - nh_log2) + 1));
+}
+
 inline i64 attn_pos(const AttnDesc &d, i64 t) {
     return d.row_pos ? d.row_pos[t] : d.pos0 + t;
 }
@@ -1111,6 +1139,13 @@ public:
                             scores.resize(static_cast<size_t>(n_vis));
                             const i64 hkv = n_rep > 0 ? h / n_rep : 0;
                             const i64 base = hkv * d.hd;
+                            // One slope per (head), computed once outside the
+                            // key loop rather than per key.
+                            const bool alibi = d.alibi_max_bias > 0.0f;
+                            const f32 slope =
+                                alibi ? alibi_slope_impl(h, d.n_head,
+                                                         d.alibi_max_bias)
+                                      : 0.0f;
                             const f32 *qh = qf + t * (d.n_head * d.hd) + h * d.hd;
                             for (i64 j = 0; j < n_vis; j++) {
                                 if (s_hi > s_lo && j_lo + j >= s_lo &&
@@ -1136,6 +1171,16 @@ public:
                                 f32 sv = dot * d.scale;
                                 if (d.softcap > 0.0f)
                                     sv = d.softcap * std::tanh(sv / d.softcap);
+                                // ALiBi: the same additive distance bias
+                                // llama.cpp folds into its softmax, computed
+                                // from the same scalar with the same formula
+                                // (see AttnDesc::alibi_max_bias). The distance
+                                // is signed the way llama.cpp's mask is --
+                                // -(pos_q - pos_k) -- and the row is causal, so
+                                // every key seen here is at or before the
+                                // query.
+                                if (alibi) sv -= slope * static_cast<f32>(
+                                                       pos - (j_lo + j));
                                 scores[static_cast<size_t>(j)] = sv;
                             }
                             f32 mx = scores[0];
