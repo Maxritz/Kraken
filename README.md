@@ -255,6 +255,36 @@ went from 135 ms to 27 ms with byte-identical text. A request that fails clears
 the cache entry rather than leaving rows behind that a later prompt would assume
 were its own.
 
+### Two attention geometries in one stack (gemma4)
+
+gemma4 declares **two head widths in one file**: `attention.key_length` on the
+global layers and `attention.key_length_swa` on the windowed ones, with the
+windowed/full pattern stated per layer in `attention.sliding_window_pattern`.
+On the E-series that is 512 and 256 in the same stack, beside a per-layer
+`attention.head_count_kv` array (`{1,8}`).
+
+Reading only the stack maximum is invisible: the workspace is sized for the
+wider geometry, so nothing overruns, the text still decodes, and 21 of 42
+layers quietly rotate and dot the wrong number of dims. So the width is now
+per layer, and everything downstream follows it — `q_dim_at()`, `kv_dim_at()`,
+the KV slot stride, the rope width, and the attention scale:
+
+```cpp
+const i64 hd  = model_.head_dim_at(l);   // 512 or 256, the layer's own
+const i64 lq  = model_.q_dim_at(l);
+const i64 lkv = model_.kv_dim_at(l);     // n_kv_at(l) * head_dim_at(l)
+```
+
+`cfg_.swa_pattern` also outranks any period derived from the arch table: a
+family that states its pattern per layer is not asking for one to be guessed.
+And `cfg_.attn_scale` exists because gemma4 declares `f_attention_scale = 1.0`
+and applies no pre-attention scaling at all, which is not a tweak to
+`1/sqrt(hd)` — it is a different number.
+
+`test_per_layer_head_width` pins the read through a real GGUF: the per-layer
+widths, the stated pattern (`is_swa` true/false/true/false), the stack maximum,
+and `kv_dim_at` following both the width *and* the per-layer head count.
+
 ### Compressed attention (DeepSeek-V4)
 
 A V4 layer either attends the raw latent window or the window **plus pooled

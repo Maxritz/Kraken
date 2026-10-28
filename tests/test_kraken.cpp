@@ -5110,6 +5110,86 @@ static void test_dsv4_compressed_attention() {
     }
 }
 
+// gemma4 declares TWO attention geometries in one stack: global layers of
+// `attention.key_length` dims and windowed layers of `attention.key_length_swa`,
+// with the pattern stated per layer in `attention.sliding_window_pattern`.
+//
+// Every downstream dimension follows the layer's own width -- q_dim_at,
+// kv_dim_at, the KV slot stride, the rope width, the attention scale -- so a
+// reader that uses the stack maximum runs those layers with the wrong number of
+// dims. Nothing overruns (the workspace is sized for the wider geometry), the
+// text still decodes, and the model is quietly not itself. This arm pins the
+// read, on metadata alone, so it is a fact about the file and not about a run.
+static void test_per_layer_head_width() {
+    const std::string path = "kraken-gemma4-geometry.gguf";
+    {
+        GgufBuilder b;
+        b.meta_str("general.architecture", "gemma4");
+        b.meta_str("general.name", "kraken-gemma4-geometry");
+        b.meta_u32("general.alignment", 32);
+        b.meta_u32("gemma4.block_count", 4);
+        b.meta_u32("gemma4.context_length", 256);
+        b.meta_u32("gemma4.embedding_length", 256);
+        b.meta_u32("gemma4.feed_forward_length", 512);
+        b.meta_u32("gemma4.attention.head_count", 4);
+        b.meta_i32_array("gemma4.attention.head_count_kv", {2, 2, 1, 2});
+        b.meta_u32("gemma4.attention.key_length", 64);
+        b.meta_u32("gemma4.attention.key_length_swa", 32);
+        b.meta_u32("gemma4.attention.value_length_swa", 32);
+        b.meta_u32("gemma4.attention.sliding_window", 128);
+        b.meta_i32_array("gemma4.attention.sliding_window_pattern", {1, 0, 1, 0});
+        b.meta_u32("gemma4.vocab_size", 32);
+        const std::vector<f32> d{1.0f, 2.0f, 3.0f, 4.0f};
+        b.tensor_f32("token_embd.weight", {2, 2}, d);
+        CHECK(b.write(path), "wrote a two-geometry gemma4 fixture");
+    }
+
+    Gguf g;
+    std::string err;
+    CHECK(g.load(path, &err), "the geometry fixture reads as a GGUF");
+    // Model::load may still refuse the run (the forward is the next commit),
+    // but the geometry is parsed before any tensor is validated, and that is
+    // what this arm is about.
+    // gemma4 is still refused at load (the forward is the next commit), so the
+    // geometry below is reached through the loader's documented development
+    // hatch -- the metadata parse is what this arm is about, and it is the same
+    // code path a supported arch takes.
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+    Backend *cpu = make_cpu_backend();
+    Model m;
+    std::string lerr;
+    (void)m.load(*cpu, path, &lerr);
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+    const ModelConfig &mc = m.cfg();
+    CHECK(mc.head_dim == 64, "the stack max head width is the global one");
+    CHECK(mc.head_dim_layer.size() == 4, "and every layer has its own");
+    if (mc.head_dim_layer.size() == 4) {
+        CHECK(mc.head_dim_layer[0] == 32 && mc.head_dim_layer[2] == 32,
+              "windowed layers take key_length_swa");
+        CHECK(mc.head_dim_layer[1] == 64 && mc.head_dim_layer[3] == 64,
+              "global layers keep key_length");
+    }
+    CHECK(mc.swa_pattern.size() == 4, "the pattern is read from the file");
+    CHECK(m.is_swa(0) && !m.is_swa(1) && m.is_swa(2) && !m.is_swa(3),
+          "is_swa follows the stated pattern, not a period");
+    // The width follows the layer all the way to the row the cache stores.
+    CHECK(m.head_dim_at(0) == 32 && m.head_dim_at(1) == 64,
+          "head_dim_at is the layer's own width");
+    CHECK(m.kv_dim_at(0) == 2 * 32, "a windowed layer's KV row is n_kv*32");
+    CHECK(m.kv_dim_at(1) == 2 * 64, "a global layer's KV row is n_kv*64");
+    CHECK(m.kv_dim_at(2) == 1 * 32,
+          "and the per-layer head COUNT still applies (1 KV head here)");
+    delete cpu;
+}
+
 static void test_arch_table() {
     // The table is the only place an arch string is spelled out, so its own
     // invariants are worth checking: names distinct, every non-Yes entry
@@ -20003,6 +20083,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_chat_template_builtins)
     TEST_GROUP(test_chat_template_language)
     TEST_GROUP(test_dsv4_compressed_attention)
+    TEST_GROUP(test_per_layer_head_width)
     TEST_GROUP(test_arch_table)
     TEST_GROUP(test_arch_tensor_maps)
     TEST_GROUP(test_load_verdict)

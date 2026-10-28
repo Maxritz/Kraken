@@ -450,6 +450,12 @@ struct ModelConfig {
     // under YaRN and the windowed ones rotating all 128 under plain RoPE.
     // `swa_period` 0 or 1 means every layer attends fully.
     i32 swa_period = 0;
+    // The windowed/full pattern stated EXPLICITLY by the file
+    // (`attention.sliding_window_pattern`, one entry per layer; gemma4 writes
+    // it). When present it is the authority and `swa_period` is not consulted:
+    // a period is a guess about the pattern, and a family that declares the
+    // pattern is not asking for one to be guessed.
+    std::vector<i32> swa_pattern;
     // Phase of the pattern: is_swa(l) == ((l + swa_phase) % swa_period) != 0.
     // 0 is the historical (full layer first) reading; 1 flips the pair so the
     // *windowed* layer comes first (gpt-oss).
@@ -467,6 +473,18 @@ struct ModelConfig {
     // varies it per layer (`attention.head_count` stored as an array) the whole
     // vector is kept here, and `n_head` is its maximum — which is what the
     // workspaces size to, since the query projection is the widest one.
+    // Per-layer head WIDTH. gemma4 declares two attention geometries in one
+    // stack: global layers of 512 dims and sliding-window layers of 256
+    // (`attention.key_length` vs `attention.key_length_swa`). Empty means every
+    // layer uses `head_dim`, which is every other family. The stack maximum is
+    // head_dim (workspaces are sized against it) and head_dim_at() is the
+    // layer's own -- the same split as n_head_layer/n_head.
+    std::vector<i32> head_dim_layer;
+    // The attention scale, when the family does not use the default
+    // 1/sqrt(head_dim). gemma4 sets f_attention_scale = 1.0 and applies no
+    // pre-attention scaling at all, which is not expressible by tweaking the
+    // default. 0 means "unset, use the default".
+    f32 attn_scale = 0.0f;
     std::vector<i32> n_head_layer;
     // Same idea for the KV side: a per-layer array (nemotron_h_moe: 2 on its
     // six attention layers, 0 on the 46 that have none, gemma4: {1,8}) with
@@ -827,8 +845,16 @@ public:
             return cfg_.n_head;
         return cfg_.n_head_layer[static_cast<size_t>(layer)];
     }
+    // The layer's own head width (see cfg_.head_dim_layer).
+    i32 head_dim_at(i32 layer) const {
+        if (cfg_.head_dim_layer.empty()) return cfg_.head_dim;
+        if (layer < 0 || layer >= static_cast<i32>(cfg_.head_dim_layer.size()))
+            return cfg_.head_dim;
+        const i32 d = cfg_.head_dim_layer[static_cast<size_t>(layer)];
+        return d > 0 ? d : cfg_.head_dim;
+    }
     i64 q_dim_at(i32 layer) const {
-        return static_cast<i64>(n_head_at(layer)) * cfg_.head_dim;
+        return static_cast<i64>(n_head_at(layer)) * head_dim_at(layer);
     }
 
     // ---- per-layer KV geometry --------------------------------------------
@@ -862,7 +888,7 @@ public:
             if (cfg_.mla_layout == MlaLayout::Shared) return row;
             return row + cfg_.mla_qk_rope;
         }
-        return static_cast<i64>(n_head_kv_at(layer)) * cfg_.head_dim;
+        return static_cast<i64>(n_head_kv_at(layer)) * head_dim_at(layer);
     }
     // True when this layer reads and writes KV: the ones carrying q/k/v or an
     // MLA latent. A mamba/SSM block and a pure-MoE block append nothing, so
@@ -893,6 +919,14 @@ public:
         // wrong end runs a full-attention kernel on layers the checkpoint
         // trained with a 128-token window and vice versa: the shapes fit, so
         // nothing complains, and every layer sees the wrong context.
+        // A pattern the FILE states outranks any period derived from the arch
+        // table: gemma4 writes `attention.sliding_window_pattern` per layer, and
+        // a period inferred here would be a guess about a fact the file already
+        // gave. Out-of-range layers fall through to the period rule.
+        if (layer >= 0 &&
+            layer < static_cast<i32>(cfg_.swa_pattern.size()) &&
+            cfg_.swa_window > 0)
+            return cfg_.swa_pattern[static_cast<size_t>(layer)] != 0;
         return cfg_.swa_period > 1 && cfg_.swa_window > 0 &&
                ((layer + cfg_.swa_phase) % cfg_.swa_period) != 0;
     }

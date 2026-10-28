@@ -512,12 +512,28 @@ constexpr ArchSpec kTable[] = {
     // got past the arch table was refused by the head-geometry check with
     // "attention tensors disagree with the declared head geometry" -- a message
     // about the file's own tensors, for a feature this engine does not have.
+    // Two attention geometries in one stack: `attention.key_length` on the
+    // global layers and `attention.key_length_swa` on the windowed ones, with
+    // the pattern stated per layer in `attention.sliding_window_pattern`. Both
+    // are READ now (cfg_.head_dim_layer, cfg_.swa_pattern, head_dim_at(),
+    // is_swa()) and pinned by test_per_layer_head_width through a real file, so
+    // every downstream width -- q_dim_at, kv_dim_at, the KV slot stride, the
+    // rope width, the attention scale -- follows the layer rather than the
+    // stack maximum.
+    //
+    // What still refuses: the forward. gemma4 needs per-layer input embeddings
+    // (per_layer_token_embd + per_layer_model_proj + per-layer inp_gate/proj),
+    // shared-KV layers (`attention.shared_kv_layers`: the last N layers reuse an
+    // earlier layer's cache instead of writing their own), `layer_output_scale`
+    // and the proportional rope (`blk.N.rope_freqs`). Those are the next commit;
+    // until they land a gemma4 file is refused by name, which is the honest
+    // answer rather than a run with the wrong graph.
     gemma_spec("gemma4", ArchSupport::No,
-               "per-layer input embeddings, shared-KV layers, two attention "
-               "geometries (global + sliding window) and the attention-logit "
-               "softcap are not implemented; the per-layer "
-               "attention.head_count_kv array, GeGLU and the final-logit softcap "
-               "are",
+               "the two-geometry read (key_length / key_length_swa, the stated "
+               "sliding_window_pattern, per-layer KV widths) and the per-layer "
+               "head_count_kv array are implemented and pinned; per-layer input "
+               "embeddings, shared-KV layers, layer_output_scale and the "
+               "proportional rope are not, so a gemma4 file is still refused",
                0, false),
 
     // ---- loads and runs, with a named gap ---------------------------------
