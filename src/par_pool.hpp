@@ -34,11 +34,19 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+#endif
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -60,6 +68,133 @@ inline void cpu_relax() {}
 inline void cpu_relax() {}
 #endif
 
+// ============================================================================
+//  Core placement.
+//
+//  Every thread the pool spawns is an OS thread, and the OS is free to move it
+//  at any time: through a whole GEMM a worker can land on a slow core, share a
+//  core with another worker, or follow a migrating interrupt. On a hybrid part
+//  (Zen 4/5, Alder/Raptor Lake, Snapdragon X) it is worse than that — the fast
+//  cores are not enumerated first, so `hardware_concurrency()` threads spread
+//  over the slow cores and the *whole* pool runs at the E-core clock. That is
+//  the single cheapest throughput a CPU backend can leave on the table, and it
+//  costs one syscall per thread at startup.
+//
+//  Policy, fastest core first:
+//    * the calling thread (which also runs a slice) gets the best core;
+//    * worker i gets the (i+1)-th best core, so a small pool lands entirely on
+//      the performance cluster instead of straddling both;
+//    * a pool larger than the machine wraps — sharing is better than parking.
+//
+//  The ordering comes from cpufreq, which is the only portable way to tell the
+//  clusters apart without a vendor SDK (Apple exposes nothing at all; Windows
+//  would need GetSystemCpuSetInformation). No cpufreq — a VM, a container, an
+//  old kernel, a CPU without the driver — means no order to impose, and the
+//  pool keeps its previous unpinned behaviour. KRK_AFFINITY=1 forces pinning on
+//  such a box anyway (useful to measure placement alone), KRK_AFFINITY=0 always
+//  disables it.
+// ============================================================================
+struct CpuTopology {
+    std::vector<i64> order;  // CPU ids, fastest first
+    i64 n_fast = 0;          // cores within 15% of the fastest clock
+    i64 n_slow = 0;          // the rest, when the part is hybrid
+    i64 max_khz = 0;
+    bool hybrid = false;
+    bool pinned = false;
+
+    std::string summary() const {
+        if (order.empty()) return "cpu topology unknown";
+        std::string s = format("%lld cores", static_cast<long long>(order.size()));
+        if (max_khz > 0) {
+            s += format(", top %.2f GHz", max_khz / 1e6);
+            if (hybrid)
+                s += format(", %lldP+%lldE", static_cast<long long>(n_fast),
+                                static_cast<long long>(n_slow));
+            else
+                s += " (uniform)";
+        }
+        s += pinned ? ", pinned" : ", unpinned";
+        return s;
+    }
+};
+
+inline i64 cpu_max_khz(i64 cpu) {
+#if defined(__linux__)
+    static const char *const sinks[] = {
+        "/sys/devices/system/cpu/cpu%lld/cpufreq/cpuinfo_max_freq",
+        "/sys/devices/system/cpu/cpu%lld/cpufreq/scaling_max_freq",
+    };
+    for (const char *pat : sinks) {
+        char path[192];
+        std::snprintf(path, sizeof path, pat, static_cast<long long>(cpu));
+        if (FILE *f = std::fopen(path, "r")) {
+            long long v = 0;
+            if (std::fscanf(f, "%lld", &v) == 1) {
+                std::fclose(f);
+                if (v > 0) return v;
+                continue;
+            }
+            std::fclose(f);
+        }
+    }
+#else
+    (void)cpu;
+#endif
+    return 0;
+}
+
+inline CpuTopology detect_cpu_topology(i64 hc) {
+    CpuTopology t;
+    t.order.reserve(static_cast<size_t>(hc));
+    std::vector<std::pair<i64, i64>> f;  // (khz, cpu)
+    f.reserve(static_cast<size_t>(hc));
+    for (i64 i = 0; i < hc; i++) {
+        const i64 k = cpu_max_khz(i);
+        if (k > 0) {
+            f.emplace_back(k, i);
+            if (k > t.max_khz) t.max_khz = k;
+        }
+    }
+    if (static_cast<i64>(f.size()) == hc && hc > 1) {
+        // Stable: equal clocks keep their CPU order, so a uniform part gets the
+        // identity permutation and nothing moves.
+        std::stable_sort(f.begin(), f.end(),
+                         [](const std::pair<i64, i64> &a, const std::pair<i64, i64> &b) {
+                             return a.first > b.first;
+                         });
+        for (const auto &kv : f) {
+            t.order.push_back(kv.second);
+            // 15%: absorbs DVFS rounding and SMT siblings, still separates a
+            // 3.0 GHz P core from a 2.0 GHz E core.
+            if (kv.first * 100 >= t.max_khz * 85) t.n_fast++;
+            else t.n_slow++;
+        }
+        t.hybrid = t.n_slow > 0;
+    } else {
+        for (i64 i = 0; i < hc; i++) t.order.push_back(i);
+        t.n_fast = hc;
+    }
+    return t;
+}
+
+inline bool pin_this_thread(i64 cpu) {
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(static_cast<int>(cpu), &set);
+    return pthread_setaffinity_np(pthread_self(), sizeof set, &set) == 0;
+#elif defined(_WIN32)
+    if (cpu < 64) {
+        SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(1) << cpu);
+        return true;
+    }
+    return false;
+#else
+    (void)cpu;
+    return false;
+#endif
+}
+
 class Pool {
 public:
     static Pool &get() {
@@ -72,6 +207,10 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         return static_cast<i64>(workers_.size()) + 1;
     }
+
+    // Which core each participant landed on. Settled at construction and
+    // re-settled by set_workers(), so it is safe to read any time.
+    const CpuTopology &topology() const { return topo_; }
 
     // Pin the total participant count (workers = n - 1). Retires the
     // current worker generation and spawns a new one; a no-op while a
@@ -216,12 +355,33 @@ private:
             if (v > 0) hc = v;
         }
         if (hc < 1) hc = 1;
+        setup_placement(hc);
         const i64 nw = std::min<i64>(hc - 1, 63);
         const i64 start = task_id_.load(std::memory_order_acquire);
         for (i64 i = 0; i < nw; i++)
             workers_.emplace_back([this, g = gen_.load(), idx = i, start] {
+                if (pinned_) pin_this_thread(worker_cpu(idx));
                 worker_loop(g, idx, start);
             });
+    }
+
+    // Decide the placement once, then apply it: the caller keeps the fastest
+    // core (it also runs a slice, and on the MoE path it does the routing, the
+    // sampling and the device submissions between slices) and the workers take
+    // the cores that follow, in the same fastest-first order.
+    void setup_placement(i64 hc) {
+        topo_ = detect_cpu_topology(hc);
+        bool want = topo_.hybrid;
+        if (const char *e = std::getenv("KRK_AFFINITY")) want = std::atoll(e) != 0;
+        if (!want) return;
+        pinned_ = topo_.order.size() > 1 && pin_this_thread(topo_.order[0]);
+        topo_.pinned = pinned_;
+    }
+
+    i64 worker_cpu(i64 idx) const {
+        const i64 n = static_cast<i64>(topo_.order.size());
+        if (n == 0) return -1;
+        return topo_.order[static_cast<size_t>((idx + 1) % n)];
     }
 
     ~Pool() {
@@ -316,6 +476,8 @@ private:
     std::condition_variable cv_start_;
     std::condition_variable cv_done_;
     std::vector<std::thread> workers_;
+    CpuTopology topo_;
+    bool pinned_ = false;
     void *body_ctx_ = nullptr;
     void (*body_fn_)(void *, i64, i64) = nullptr;
     i64 n_ = 0;
