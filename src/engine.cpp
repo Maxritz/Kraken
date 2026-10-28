@@ -1072,20 +1072,18 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             be_ = nullptr;
             return false;
         };
-        // TWO layouts run: the legacy lite one (attn_q + attn_kv_a_mqa +
-        // attn_kv_b) and the shared-latent one (attn_q_a/attn_q_b + attn_kv +
-        // attn_output_a/b). The split (V3 class) layout does not, and is refused
-        // by name: three shapes, three graphs, and a file that loaded and then
-        // decoded the wrong one is the failure this refusal exists for.
-        if (mc.mla_layout != MlaLayout::Legacy &&
-            mc.mla_layout != MlaLayout::Shared) {
+        // All THREE layouts run. The two lite ones differ only in how the
+        // per-head K/V up-projection is STORED -- one fused table
+        // (`attn_kv_b`) or two three-dimensional ones (`attn_k_b` +
+        // `attn_v_b`) -- and by linearity the absorbed and unabsorbed
+        // formulations compute the same score and the same weighted sum, so
+        // the loader composes the fused staging from either and one validated
+        // kernel serves both. The shared-latent layout (V4) is a different
+        // graph and has its own forward.
+        if (mc.mla_layout == MlaLayout::None) {
             return refuse_mla(
-                std::string("MLA layout '") + mla_layout_name(mc.mla_layout) +
-                "': this engine runs the legacy lite layout "
-                "(attn_q + attn_kv_a_mqa + attn_kv_b) and the shared-latent one "
-                "(attn_q_a/attn_q_b + attn_kv + attn_output_a/b) only, so a run "
-                "would decode the wrong graph. The file loaded and its tensors "
-                "were read; generating from it is refused.");
+                "MLA: the model config lists no layout, so there is no "
+                "attention to run");
         }
         const bool mla_shared = mc.mla_layout == MlaLayout::Shared;
         if (mla_shared && mc.dsv4_o_groups <= 0)
@@ -1117,14 +1115,6 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                         " and the compressed-attention path (attn_compressor_*) "
                         "is not implemented; a run would attend the raw prefix "
                         "instead of the pooled one");
-        if (mla_shared)
-            for (const LayerWeights &lw : model_.layers()) {
-                if (!lw.sinks) continue;
-                return refuse_mla(
-                    "MLA layout 'shared-latent': this file carries attn_sinks "
-                    "and the shared-latent path does not feed them to the "
-                    "softmax yet; a run would mix heads unnormalized");
-            }
         if (mla_shared ? !be_->mla_shared_supported() : !be_->mla_supported()) {
             return refuse_mla(
                 std::string("the selected backend has no ") +
@@ -6777,7 +6767,16 @@ bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     // 1. the compressed projection. Its two halves have different fates -- the
     // latent is normed and attended, the key is neither -- but they come out of
     // ONE matmul, which is why the file stores one matrix for both.
-    gemm_w(ws_mla_, ws_xn_, L.wkv_a_mqa, row, n_embd_, n);
+    // The compressed projection's weight has TWO spellings: the legacy layout
+    // stores it as `attn_kv_a_mqa` and the loader keeps it on `wkv_a_mqa`,
+    // while the V3-class split layout's branch keeps the identical
+    // [n_embd, kv_lora + rope] tensor on `wkv_a`. Reading one name and not the
+    // other left the split layout projecting against an EMPTY weight: the GEMM
+    // wrote nothing, `ws_mla_` kept whatever the previous stage left, and the
+    // crash came two kernels later -- measured as 2.07e37 in the latent dump
+    // on a V3 fixture, i.e. plausible-looking garbage rather than an error.
+    const QuantTensor &kv_a = L.wkv_a_mqa;
+    gemm_w(ws_mla_, ws_xn_, kv_a, row, n_embd_, n);
     dump_row("mla.kv", l, ws_mla_, row, n);
 
     // The plane this layer appends to. base() always returns this layer alone
@@ -6938,7 +6937,12 @@ bool Engine::mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     sd.eps = mc.rms_eps;
     sd.window = mc.dsv4_window > 0 ? mc.dsv4_window : 0;
     sd.inv_freq = model_.inv_freq_at(l).data();
-    sd.sinks = nullptr;  // refused at init when the file carries any
+    // `attention.sinks` per head: a learned logit that competes with every
+    // visible key for softmax mass and contributes no value of its own (the
+    // reference adds it with `ggml_soft_max_add_sinks`). Both the host oracle
+    // (src/mla_shared.cpp) and this kernel already carry it -- the engine was
+    // the only place that dropped it, and refused the file instead.
+    sd.sinks = L.sinks;
 
     // 1. the latent: x -> attn_kv -> rms_norm over the WHOLE row (rope is its
     //    tail, so the norm covers the rotary dims -- the opposite of the lite

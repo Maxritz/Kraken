@@ -2212,15 +2212,27 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 const std::string kv_a =
                     has_kv_a_mqa ? blk_key("blk.%d.attn_kv_a_mqa.weight", l)
                                  : blk_key("blk.%d.attn_kv_a.weight", l);
-                L.wkv_a = need(kv_a);
-                L.wkv_norm = upload_f32(blk_key("blk.%d.attn_kv_a_norm.weight", l));
+                // The SAME two fields the legacy layout uses, because the same
+                // forward reads them: this branch used to keep the compressed
+                // projection on `wkv_a` and its norm on `wkv_norm`, while
+                // `mla_forward` reads `wkv_a_mqa` and `wkv_a_norm`. The
+                // mismatch was invisible at load -- the tensors were read and
+                // shape-checked -- and surfaced as a GEMM against an empty
+                // weight (latent dump 2.07e37) and then a null gamma inside
+                // `mla_kv_write`. Two names for one tensor is the whole bug, so
+                // the loader now stores the lite layout's pair under the lite
+                // layout's names.
+                L.wkv_a_mqa = need(kv_a);
+                L.wkv_a_norm =
+                    upload_f32(blk_key("blk.%d.attn_kv_a_norm.weight", l));
                 L.wk_b = need(blk_key("blk.%d.attn_k_b.weight", l));
                 L.wv_b = need(blk_key("blk.%d.attn_v_b.weight", l));
                 L.wo = need(blk_key("blk.%d.attn_output.weight", l));
                 const GgufTensor *tkn =
                     gguf_.tensor(blk_key("blk.%d.attn_kv_a_norm.weight", l));
-                if (!L.wkv_a.present() || !L.wkv_norm || !L.wk_b.present() ||
-                    !L.wv_b.present() || !L.wo.present()) {
+                if (!L.wkv_a_mqa.present() || !L.wkv_a_norm ||
+                    !L.wk_b.present() || !L.wv_b.present() ||
+                    !L.wo.present()) {
                     if (e.empty())
                         e = "layer " + std::to_string(l) +
                             " has an incomplete split MLA attention block";
@@ -2235,8 +2247,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     static_cast<i64>(cfg_.mla_v_dim) * cfg_.n_head;
                 const i64 want_wo =
                     static_cast<i64>(cfg_.n_head) * cfg_.mla_v_dim;
-                if (bad("attn_kv_a", L.wkv_a.n_in, cfg_.n_embd,
-                        L.wkv_a.n_out, want_kva) ||
+                if (bad("attn_kv_a", L.wkv_a_mqa.n_in, cfg_.n_embd,
+                        L.wkv_a_mqa.n_out, want_kva) ||
                     bad("attn_k_b", L.wk_b.n_in, cfg_.mla_qk_nope,
                         L.wk_b.n_out, want_kb) ||
                     bad("attn_v_b", L.wv_b.n_in, cfg_.mla_kv_lora,
@@ -2246,6 +2258,84 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     bad_norm("attn_kv_a_norm", tkn, cfg_.mla_kv_lora)) {
                     if (err) *err = e;
                     return false;
+                }
+                // ---- the same f16 staging, COMPOSED from the split tables --
+                // The legacy layout stores one [kv_lora, n_head*(nope+v)] table;
+                // this one stores `attn_k_b` [nope, kv_lora, n_head] and
+                // `attn_v_b` [kv_lora, v_dim, n_head] separately. That is a
+                // STORAGE difference, not a different computation: the
+                // reference absorbs the query's nope part with k_b and expands
+                // the attention result with v_b, and by linearity
+                // `<W_k q, c>` is the same score as `<q, W_k^T c>` and
+                // `sum_j p_j (W_v c_j)` is `W_v (sum_j p_j c_j)`. So the two
+                // layouts differ only in floating-point order, and composing
+                // the fused table here lets the one already-validated kernel
+                // run both.
+                //
+                // The per-head block must come out in the SAME order the legacy
+                // table has -- nope rows first, then v rows -- because that is
+                // the order `mla_attention` splits a head's block at `nope`.
+                // Getting it wrong would score the value rows as keys: shapes
+                // fit, scores are plausible, and the answer is another model.
+                {
+                    const GgufTensor *tk =
+                        gguf_.tensor(blk_key("blk.%d.attn_k_b.weight", l));
+                    const GgufTensor *tv =
+                        gguf_.tensor(blk_key("blk.%d.attn_v_b.weight", l));
+                    const i64 kv = cfg_.mla_kv_lora;
+                    const i64 nope = cfg_.mla_qk_nope;
+                    const i64 vdim = cfg_.mla_v_dim;
+                    const i64 per = nope + vdim;   // one head's output block
+                    const i64 n_out = static_cast<i64>(cfg_.n_head) * per;
+                    std::vector<f32> krow(static_cast<size_t>(nope));
+                    std::vector<f32> vrow(static_cast<size_t>(kv));
+                    std::vector<u16> half(
+                        static_cast<size_t>(kv) * static_cast<size_t>(n_out));
+                    const size_t rbk = dtype_row_bytes(tk->type, nope);
+                    const size_t rbv = dtype_row_bytes(tv->type, kv);
+                    const u8 *ks = static_cast<const u8 *>(tk->data);
+                    const u8 *vs = static_cast<const u8 *>(tv->data);
+                    // k_b's flat order is (nope, kv_lora, n_head), so its
+                    // `nope`-wide rows run head-major over the LATENT column:
+                    // row h*kv + j is column j of head h.
+                    for (i64 h = 0; h < cfg_.n_head; h++) {
+                        for (i64 j = 0; j < kv; j++) {
+                            dequant_row(tk->type,
+                                        ks + static_cast<size_t>(h * kv + j) * rbk,
+                                        krow.data(), nope);
+                            for (i64 i = 0; i < nope; i++)
+                                half[static_cast<size_t>((h * per + i) * kv + j)] =
+                                    fp32_to_fp16(krow[static_cast<size_t>(i)]);
+                        }
+                        // v_b is (kv_lora, v_dim, n_head): its rows are the
+                        // CONTRACTION index, so row h*vdim + j is output
+                        // channel j of head h.
+                        for (i64 j = 0; j < vdim; j++) {
+                            dequant_row(
+                                tv->type,
+                                vs + static_cast<size_t>(h * vdim + j) * rbv,
+                                vrow.data(), kv);
+                            for (i64 k = 0; k < kv; k++)
+                                half[static_cast<size_t>(
+                                    (h * per + nope + j) * kv + k)] =
+                                    fp32_to_fp16(vrow[static_cast<size_t>(k)]);
+                        }
+                    }
+                    const size_t nelem = half.size();
+                    void *dst = be.alloc(nelem * 2);
+                    if (!dst) {
+                        if (err)
+                            *err = "layer " + std::to_string(l) +
+                                   ": could not allocate " +
+                                   std::to_string(nelem * 2 / 1048576u) +
+                                   " MiB for the MLA f16 staging";
+                        return false;
+                    }
+                    upload_timed(dst, half.data(), nelem * 2);
+                    L.wkv_b16.data = dst;
+                    L.wkv_b16.type = DType::F16;
+                    L.wkv_b16.n_in = kv;
+                    L.wkv_b16.n_out = n_out;
                 }
             } else {
                 // ---- V4: ONE shared latent, a GROUPED output projection ----

@@ -15193,6 +15193,16 @@ enum class MlaFixKind { Legacy, Split, Shared };
 
 struct MlaFix {
     MlaFixKind kind = MlaFixKind::Legacy;
+    // Write the split tables so that they describe the SAME function as the
+    // legacy arm's single `attn_kv_b` on the same seed: then the two files must
+    // produce identical logits, which is the only way to tell a correct
+    // composition from one that merely runs.
+    bool split_mirrors_legacy = false;
+    // Write `attn_sinks` per layer: one logit per query head that competes with
+    // every visible key for softmax mass and contributes no value of its own.
+    // The values are non-zero and differ per head, so a run that ignores them
+    // cannot produce the same logits as one that reads them.
+    bool sinks = false;
     // A low-rank query trunk over the LEGACY KV path. That pairing is not one
     // of llama.cpp's three naming conventions, and it is exactly what MiniCPM3
     // ships: `attn_q_a`/`attn_q_b` with `attn_kv_a_mqa`/`attn_kv_b`. Without
@@ -15329,6 +15339,13 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
     for (int l = 0; l < f.n_layer; l++) {
         const std::string p = "blk." + std::to_string(l) + ".";
         ones(p + "attn_norm.weight", static_cast<u64>(kMlaEmbd));
+        if (f.sinks) {
+            std::vector<f32> sv(static_cast<size_t>(kMlaHead));
+            for (i32 h = 0; h < kMlaHead; h++)
+                sv[static_cast<size_t>(h)] = 0.75f * static_cast<f32>(h + 1);
+            b.tensor_f16(p + "attn_sinks.weight",
+                         {static_cast<u64>(kMlaHead)}, sv);
+        }
         ones(p + "ffn_norm.weight", static_cast<u64>(kMlaEmbd));
         MlaFixKind kind = f.kind;
         if (f.mixed_layout && l == 1)
@@ -15384,7 +15401,9 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
                 // Two three-dimensional tables, one matrix per head, and the
                 // contraction index is ne[0] in both.
                 const u64 kb_nope = f.short_k_b ? nope - 1 : nope;
-                if (f.int32_weight) {
+                if (f.split_mirrors_legacy) {
+                    // The mirror arm writes BOTH tables below, from one stream.
+                } else if (f.int32_weight) {
                     // The table of ids where a coefficient matrix belongs.
                     i32_tensor(p + "attn_k_b.weight",
                                {kb_nope, static_cast<u64>(kMlaKvLora),
@@ -15395,9 +15414,47 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
                        static_cast<u64>(kMlaKvLora), static_cast<u64>(kMlaHead),
                        400 + l);
                 }
-                w3(p + "attn_v_b.weight", static_cast<u64>(kMlaKvLora),
-                   static_cast<u64>(kMlaValLen), static_cast<u64>(kMlaHead),
-                   450 + l);
+                if (f.split_mirrors_legacy) {
+                    // Same numbers as the legacy arm's `attn_kv_b` (seed
+                    // 400 + l, laid out [kv_lora, n_head*(nope+v)] with the
+                    // latent fastest), cut into the two three-dimensional
+                    // tables the V3 class ships. k_b's flat order is
+                    // (nope, kv_lora, n_head) and v_b's is
+                    // (kv_lora, v_dim, n_head), so the k side is a per-head
+                    // TRANSPOSE of the legacy rows and the v side is a
+                    // straight copy.
+                    const i64 kv = kMlaKvLora;
+                    const i64 nop = kMlaKeyLen - kMlaRope;
+                    const i64 vd = kMlaValLen;
+                    const i64 per = nop + vd;
+                    auto base = [&](i64 k, i64 o) {
+                        return wv(k + o * kv + 400 + l);
+                    };
+                    std::vector<f32> kb(static_cast<size_t>(nop * kv * kMlaHead));
+                    std::vector<f32> vb(static_cast<size_t>(kv * vd * kMlaHead));
+                    for (i64 h = 0; h < kMlaHead; h++) {
+                        for (i64 j = 0; j < kv; j++)
+                            for (i64 i = 0; i < nop; i++)
+                                kb[static_cast<size_t>(i + j * nop + h * nop * kv)] =
+                                    base(j, h * per + i);
+                        for (i64 j = 0; j < vd; j++)
+                            for (i64 k = 0; k < kv; k++)
+                                vb[static_cast<size_t>(k + j * kv + h * kv * vd)] =
+                                    base(k, h * per + nop + j);
+                    }
+                    b.tensor_f16(p + "attn_k_b.weight",
+                                 {static_cast<u64>(nop),
+                                  static_cast<u64>(kv),
+                                  static_cast<u64>(kMlaHead)}, kb);
+                    b.tensor_f16(p + "attn_v_b.weight",
+                                 {static_cast<u64>(kv),
+                                  static_cast<u64>(vd),
+                                  static_cast<u64>(kMlaHead)}, vb);
+                } else {
+                    w3(p + "attn_v_b.weight", static_cast<u64>(kMlaKvLora),
+                       static_cast<u64>(kMlaValLen), static_cast<u64>(kMlaHead),
+                       450 + l);
+                }
                 w2(p + "attn_output.weight",
                    static_cast<u64>(kMlaHead) * static_cast<u64>(kMlaValLen),
                    static_cast<u64>(kMlaEmbd), 500 + l);
@@ -15578,10 +15635,19 @@ static void test_mla_loader() {
             CHECK(L0.wq_b.present() && L0.wq_b.n_in == kMlaQLora &&
                       L0.wq_b.n_out == kMlaHead * kMlaKeyLen,
                   "the query expansion is [q_lora -> n_head*(nope+rope)]");
-            CHECK(L0.wkv_a.present() &&
-                      L0.wkv_a.n_out == kMlaKvLora + kMlaRope,
+            // The lite forward reads ONE pair of fields, whichever of the two
+            // lite layouts the file is: `wkv_a_mqa` for the compressed
+            // projection and `wkv_a_norm` for its norm. This branch used to
+            // keep them on `wkv_a`/`wkv_norm` instead, which the forward never
+            // looks at -- so the layout loaded, shape-checked, and then
+            // projected against an empty weight and a null gamma. Pinned here
+            // by field name so the two cannot drift apart again.
+            CHECK(L0.wkv_a_mqa.present() &&
+                      L0.wkv_a_mqa.n_out == kMlaKvLora + kMlaRope,
                   "the compressed latent carries the decoupled key beside it");
-            CHECK(L0.wkv_norm != nullptr, "the latent's norm is uploaded");
+            CHECK(L0.wkv_a_norm != nullptr,
+                  "the latent's norm is uploaded under the field the forward "
+                  "reads");
             CHECK(L0.wk_b.present() &&
                       L0.wk_b.n_in == kMlaKeyLen - kMlaRope &&
                       L0.wk_b.n_out == kMlaKvLora * kMlaHead,
@@ -15589,9 +15655,13 @@ static void test_mla_loader() {
             CHECK(L0.wv_b.present() && L0.wv_b.n_in == kMlaKvLora &&
                       L0.wv_b.n_out == kMlaValLen * kMlaHead,
                   "the per-head value table contracts the latent");
-            CHECK(!L0.wkv_b.present() && !L0.wkv_a_mqa.present() &&
-                      !L0.wq_direct.present(),
+            CHECK(!L0.wkv_b.present() && !L0.wq_direct.present(),
                   "no tensor of another layout is invented");
+            CHECK(L0.wkv_b16.n_in == kMlaKvLora &&
+                      L0.wkv_b16.n_out == kMlaHead * (kMlaKeyLen - kMlaRope +
+                                                      kMlaValLen),
+                  "and the fused f16 table the kernel reads is COMPOSED from "
+                  "the two three-dimensional ones");
         }
         m.unload();
         delete cpu;
@@ -15852,10 +15922,11 @@ static void test_mla_loader() {
         engine.shutdown();
         delete cpu;
     }
-    // The SPLIT layout (V3 class) still has no graph, and that is now the only
-    // one the engine refuses by layout: the shared-latent layout runs (see
-    // test_dsv4_whole_graph), so a refusal for it here would mean the two
-    // claims disagree.
+    // All THREE layouts run now. The split one used to be refused here, and
+    // that arm is replaced by a live one: the loader composes the fused table
+    // the kernel reads, and test_minicpm3_whole_graph then proves the composed
+    // table is the SAME function the fused one is (identical logits on the
+    // same weights in the two layouts).
     {
         Backend *cpu = make_cpu_backend();
         Engine engine;
@@ -15865,13 +15936,8 @@ static void test_mla_loader() {
         cfg.prefill_chunk = 8;
         std::string err;
         const bool ok = engine.init(cpu, cfg, &err);
-        CHECK(!ok, "the engine refuses the split layout, whose graph is absent");
-        std::fprintf(stderr, "  (refused split: %s)\n", err.c_str());
-        CHECK(err.find("MLA layout") != std::string::npos,
-              "... and the refusal names the layout");
-        CHECK(err.find("wrong graph") != std::string::npos ||
-                  err.find("not this model") != std::string::npos,
-              "... and says the text would not be the model's");
+        CHECK(ok, "the engine runs the split (V3 class) layout");
+        if (!ok) std::fprintf(stderr, "  (split init: %s)\n", err.c_str());
         engine.shutdown();
         delete cpu;
     }
@@ -16347,6 +16413,63 @@ static void test_dsv4_whole_graph() {
         std::remove("kraken-prefill-err-1.txt");
         std::remove("kraken-prefill-out-16.txt");
         std::remove("kraken-prefill-err-16.txt");
+    }
+
+    // ---- 8. attention sinks in the shared-latent path --------------------
+    // `attn_sinks` is a per-head logit that competes with every visible key for
+    // softmax mass and contributes no value of its own. The kernel and the host
+    // oracle both carried it; the ENGINE dropped it (`sd.sinks = nullptr`) and
+    // refused any file that had one. This arm is the difference between
+    // accepting such a file and reading it: the sinks are non-zero and differ
+    // per head, so the logits must move.
+    {
+        const std::string sinkf = "kraken-dsv4whole-sinks.gguf";
+        MlaFix fskip = f;
+        fskip.sinks = true;
+        CHECK(build_mla_fixture(sinkf, fskip),
+              "wrote a shared-latent fixture carrying attn_sinks");
+        auto logits_of = [&](const std::string &file, std::vector<f32> &out,
+                             std::string &err) {
+            Backend *cpu = make_cpu_backend();
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = file;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            bool ok = false;
+            if (!engine.init(cpu, cfg, &err)) {
+                if (!err.empty()) std::fprintf(stderr, "  (sinks init: %s)\n", err.c_str());
+            } else {
+                GenerateParams gp;
+                gp.prompt = "the";
+                gp.max_tokens = 2;
+                gp.sampler.temp = 0.0f;
+                GenerateResult r;
+                ok = engine.generate(gp, &r);
+                if (ok) {
+                    const f32 *lg = engine.last_logits();
+                    const i32 nv = engine.model().cfg().n_vocab;
+                    out.assign(lg, lg + nv);
+                }
+                engine.shutdown();
+            }
+            delete cpu;
+            return ok;
+        };
+        std::vector<f32> plain, withs;
+        std::string e1, e2;
+        const bool okp = logits_of(path, plain, e1);
+        const bool oks = logits_of(sinkf, withs, e2);
+        CHECK(okp, "the sink-free file still runs");
+        CHECK(oks, "and the file WITH attn_sinks runs instead of being refused");
+        bool differs = okp && oks && plain.size() == withs.size() && !plain.empty();
+        if (differs) {
+            f32 worst = 0.0f;
+            for (size_t i = 0; i < plain.size(); i++)
+                worst = std::max(worst, std::fabs(plain[i] - withs[i]));
+            differs = worst > 1e-4f;
+        }
+        CHECK(differs, "and the sinks reach the softmax: the logits move");
     }
 
     // DEBUG: fixture kept
@@ -16987,31 +17110,69 @@ static void test_minicpm3_whole_graph() {
     }
     CHECK(differs, "and they differ from the unscaled run, so the scale acts");
 
-    // The V3-class Split layout (attn_k_b/attn_v_b) is REFUSED by name -- it
-    // has no graph here, and the stub this test would otherwise be guarding is
-    // exactly the failure mode: a file that loads, shape-checks, and then runs
-    // a different graph than it describes. Pinned so the refusal cannot quietly
-    // become a decode.
+    // The V3-class Split layout (`attn_k_b` + `attn_v_b`) stores the per-head
+    // K/V up-projection as two three-dimensional tables instead of one fused
+    // `attn_kv_b`. That is a STORAGE difference: the reference absorbs the
+    // query's nope part with k_b and expands the attention result with v_b, and
+    // by linearity both formulations compute the same score and the same
+    // weighted sum. So the loader composes the fused table the kernel reads,
+    // and the two files below hold the SAME weights in the two layouts --
+    // which means their logits must agree. A composition that merely ran
+    // (right shapes, wrong index order) would decode a different model and
+    // pass any weaker test.
     {
-        const std::string sp = "kraken-mla-split-run.gguf";
+        const std::string lg = "kraken-mla-legacy-eq.gguf";
+        const std::string sp = "kraken-mla-split-eq.gguf";
+        MlaFix lf2;
+        lf2.kind = MlaFixKind::Legacy;
+        // The V3 class always ships a low-rank query trunk, and the split arm
+        // below cannot help but have one. Matching it here keeps the TWO
+        // fixtures differing in exactly one thing -- how the per-head K/V
+        // up-projection is stored -- which is what the comparison is about.
+        lf2.q_lora = true;
+        lf2.n_layer = 4;
         MlaFix sf;
         sf.kind = MlaFixKind::Split;
         sf.n_layer = 4;
-        CHECK(build_mla_fixture(sp, sf), "wrote a split-layout fixture");
-        Backend *cpu2 = make_cpu_backend();
-        EngineConfig c;
-        c.model_path = sp;
-        c.n_ctx = 64;
-        c.prefill_chunk = 8;
-        Engine e;
-        std::string e2;
-        const bool ran = e.init(cpu2, c, &e2);
-        CHECK(!ran, "the V3-class split layout does not run");
-        CHECK(e2.find("split") != std::string::npos &&
-                  e2.find("refused") != std::string::npos,
-              "and the refusal names the layout rather than failing obscurely");
-        if (ran) e.shutdown();
-        delete cpu2;
+        sf.split_mirrors_legacy = true;
+        CHECK(build_mla_fixture(lg, lf2), "wrote the fused-table fixture");
+        CHECK(build_mla_fixture(sp, sf),
+              "wrote the same weights as two three-dimensional tables");
+
+        auto logits_of = [&](const std::string &path, std::vector<f32> &out,
+                             std::string &err) {
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            Engine e;
+            if (!e.init(cpu, c, &err)) return false;
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 2;
+            gp.sampler.temp = 0.0f;
+            GenerateResult r;
+            if (!e.generate(gp, &r)) return false;
+            out.assign(e.last_logits(),
+                       e.last_logits() + e.model().cfg().n_vocab);
+            e.shutdown();
+            return true;
+        };
+        std::vector<f32> la, lb;
+        std::string ea, eb;
+        const bool oka = logits_of(lg, la, ea);
+        const bool okb = logits_of(sp, lb, eb);
+        CHECK(oka, "the fused-table file runs");
+        CHECK(okb, "the split-table file runs");
+        if (!ea.empty()) std::fprintf(stderr, "  (legacy: %s)\n", ea.c_str());
+        if (!eb.empty()) std::fprintf(stderr, "  (split: %s)\n", eb.c_str());
+        bool same = oka && okb && !la.empty() && la.size() == lb.size();
+        if (same) {
+            for (size_t i = 0; i < la.size(); i++)
+                if (la[i] != lb[i]) same = false;
+        }
+        CHECK(same, "and the two layouts produce IDENTICAL logits, so the "
+                    "composed table is the same function the fused one is");
     }
     delete cpu;
 }
