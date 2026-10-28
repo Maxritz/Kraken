@@ -586,6 +586,11 @@ target_link_libraries(kraken-q80-gemm-bench PRIVATE krk_core)
 add_executable(kraken-isa-ceiling tools/bench_isa_ceiling.cpp)
 target_link_libraries(kraken-isa-ceiling PRIVATE krk_core)
 
+# Every block count, odd ones included: the 512-bit Q8_0 kernel advances two
+# blocks per iteration, so an odd count depends on the dispatcher refusing it.
+add_executable(kraken-q80-odd tools/ta_q80_odd.cpp)
+target_link_libraries(kraken-q80-odd PRIVATE krk_core)
+
 if(KRK_HIP_AVAILABLE)
     add_executable(kraken-oracle tools/oracle_probe.cpp)
     target_link_libraries(kraken-oracle PRIVATE krk_core krk_hip)
