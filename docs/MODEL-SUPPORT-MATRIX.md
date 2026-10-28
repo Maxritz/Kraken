@@ -17,6 +17,11 @@ So "unsupported" (refused) and "supported but dequantizing" are different
 problems. The second is the bigger one numerically, the first is the one that
 stops a model running.
 
+**Update:** `phi3` (Phi-3, Phi-4) and `gptneox`, `gptj`, `phi2` are now
+supported — see `docs/PHI3-FUSED-PROJECTIONS.md` and
+`docs/PLAIN-PRENORM-FAMILY.md`. That clears Phi-3-mini, Phi-4-reasoning-plus and
+adds three of the GGUF spec's own "known values" architectures.
+
 Verified arch strings in `src/arch.cpp`: `llama`, `qwen2`, `qwen3`, `qwen35`,
 `qwen35moe`, `qwen3moe`, `qwen3vl`, `gemma`, `gemma2`, `gemma3`, `gemma4`,
 `deepseek2`, `deepseek4`, `deepseek41`, `gpt-oss`, `gpt2`, `olmoe`, `lfm2`,

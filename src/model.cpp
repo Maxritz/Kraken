@@ -219,8 +219,14 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     const bool head_dim_declared = cfg_.head_dim > 0;
     if (cfg_.head_dim == 0 && cfg_.n_head > 0)
         cfg_.head_dim = cfg_.n_embd / cfg_.n_head;
-    cfg_.rms_eps =
-        static_cast<f32>(gguf_.get_f64(key(".attention.layer_norm_rms_epsilon"), 1e-5));
+    // Two keys name the same epsilon. RMSNorm families write
+    // `layer_norm_rms_epsilon`; the LayerNorm families (gpt2, gptneox, gptj,
+    // phi2) write `layer_norm_epsilon`. Reading only the first left every one
+    // of those files on the 1e-5 default -- right for all four in practice and
+    // wrong as a rule, since the file is what says.
+    cfg_.rms_eps = static_cast<f32>(gguf_.get_f64(
+        key(".attention.layer_norm_rms_epsilon"),
+        gguf_.get_f64(key(".attention.layer_norm_epsilon"), 1e-5)));
     cfg_.rope_base = static_cast<f32>(gguf_.get_f64(key(".rope.freq_base"), 10000.0));
     cfg_.rope_scale = static_cast<f32>(gguf_.get_f64(key(".rope.scaling.factor"), 1.0));
     cfg_.logit_softcap =
@@ -302,6 +308,10 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.gpt2_style = aspec.gpt2_style;
     cfg_.fused_qkv = aspec.fused_qkv;
     cfg_.fused_gate_up = aspec.fused_gate_up;
+    cfg_.ln_bias = aspec.ln_bias;
+    cfg_.learned_pos = aspec.learned_pos;
+    cfg_.parallel_residual = aspec.parallel_residual;
+    cfg_.no_gate_ffn = aspec.no_gate_ffn;
     cfg_.rope_swa_only = aspec.rope_swa_only;
     // RoPE's pair convention is a property of the export, so it comes from
     // the arch table rather than from the tensors. KRK_ROPE_NEOX=0/1 forces
@@ -1272,7 +1282,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // taken here. (A tied file shares this tensor with the head below, and
         // the head's own gs is read there.)
         tok_embd_ = upload_raw(te, te->type);
-        if (cfg_.gpt2_style) {
+        if (cfg_.learned_pos) {
             // Learned absolute positions, [n_ctx_train, n_embd], added to the
             // token embedding before the first block. There is no rotary table
             // anywhere in this family, and building one would rotate vectors
@@ -1369,19 +1379,17 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (err) *err = "output_norm.weight is missing";
             return false;
         }
-        if (cfg_.gpt2_style) {
+        if (cfg_.ln_bias) {
             // The final LayerNorm's bias. Without it the last hidden row keeps
             // its mean, which shifts every logit by a constant per row -- and
             // a constant on the LOGIT axis does not divide out of a softmax
             // unless every row shares it, so this changes the next-token
             // distribution rather than just its scale.
+            // Loaded when the file has one, not required. GPT-NeoX and Phi-2
+            // carry it; GPT-J is a LayerNorm with a weight and NO bias, so
+            // demanding the tensor would refuse a complete file -- and the
+            // same distinction already exists for the per-layer norms.
             out_norm_bias_ = upload_f32("output_norm.bias");
-            if (!out_norm_bias_) {
-                if (err)
-                    *err = "gpt2 file has no output_norm.bias (its final "
-                           "LayerNorm needs one)";
-                return false;
-            }
         }
     }
 
@@ -1681,20 +1689,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
         L.attn_norm = upload_f32(blk_key("blk.%d.attn_norm.weight", l));
         L.ffn_norm = upload_f32(blk_key("blk.%d.ffn_norm.weight", l));
-        if (cfg_.gpt2_style) {
+        if (cfg_.ln_bias) {
             // LayerNorm, so each pre-norm has a bias beside its weight. A
             // LayerNorm run without its bias is a different function, not a
             // rounding difference: every row keeps its mean instead of being
             // centred, and the error compounds over eight blocks.
             L.attn_norm_bias = upload_f32(blk_key("blk.%d.attn_norm.bias", l));
             L.ffn_norm_bias = upload_f32(blk_key("blk.%d.ffn_norm.bias", l));
-            if (!L.attn_norm_bias || !L.ffn_norm_bias) {
-                if (err)
-                    *err = "layer " + std::to_string(l) +
-                           " is gpt2-shaped but its LayerNorm biases are "
-                           "missing (attn_norm.bias / ffn_norm.bias)";
-                return false;
-            }
+            // Loaded, not required. The layer norms take their bias whenever
+            // the file has one: GPT-2 and GPT-NeoX carry both, Phi-2 carries
+            // both, and GPT-J -- which is a LayerNorm with weights and no
+            // biases anywhere -- carries neither. Requiring them would refuse a
+            // complete GPT-J file, and the per-layer norm is where the
+            // difference actually lives, since the same `ln_bias` flag also
+            // sizes the LayerNorm the forward runs.
         }
         // The two branch post norms. They are NOT the FFN's input norm under
         // another name -- the file carries `ffn_norm` beside them (gemma3) --
@@ -2370,17 +2378,6 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     (cfg_.fused_qkv && !cfg_.gpt2_style)
                         ? static_cast<i64>(cfg_.n_embd) + 2 * kv_wide
                         : 3 * static_cast<i64>(cfg_.n_embd);
-                if (L.qkv_bias && !cfg_.gpt2_style) {
-                    // phi2 puts a bias on the fused projection; the view-based
-                    // split applies the bias per projection, which that family
-                    // needs and phi3 does not have. Refuse rather than ignore
-                    // it -- an unapplied bias is a wrong answer, not a small one.
-                    if (err)
-                        *err = "layer " + std::to_string(l) +
-                               ": a fused attn_qkv with a bias (phi2) is not "
-                               "implemented";
-                    return false;
-                }
                 if (L.wqkv_fused.n_out != qkv_wide) {
                     if (err)
                         *err = "layer " + std::to_string(l) +
@@ -2402,6 +2399,13 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // model without one look the same from here -- which is why it was
             // never noticed that this tensor existed and was ignored.
             L.wo_bias = upload_f32(blk_key("blk.%d.attn_output.bias", l));
+            // The plain family's MLP biases. GPT-NeoX carries both, GPT-J
+            // neither, and a missing tensor uploads as null with both
+            // applications guarded -- so one flag covers both files.
+            if (cfg_.ln_bias) {
+                L.wup_bias = upload_f32(blk_key("blk.%d.ffn_up.bias", l));
+                L.wdown_bias = upload_f32(blk_key("blk.%d.ffn_down.bias", l));
+            }
             // laguna's per-head output gate is a projection of its own off the
             // same hidden state q/k/v read — not a slice of attn_q — so it is a
             // weight like any other and is uploaded with them.
@@ -2535,7 +2539,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     return false;
                 }
             } else {
-                if (!cfg_.gpt2_style)
+                if (!cfg_.no_gate_ffn)
                     L.wgate = need(blk_key("blk.%d.ffn_gate.weight", l));
                 L.wup = need(blk_key("blk.%d.ffn_up.weight", l));
             }
@@ -2894,7 +2898,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             L.wup_fused.present()
                 ? (L.wup_fused.n_out == 2 * static_cast<i64>(cfg_.n_ff) &&
                    L.wdown.n_in == cfg_.n_ff)
-                : cfg_.gpt2_style
+                : cfg_.no_gate_ffn
                       ? (L.wup.n_out == cfg_.n_ff && L.wdown.n_in == cfg_.n_ff)
                       : (L.wgate.n_out == cfg_.n_ff &&
                          L.wdown.n_in == cfg_.n_ff);
@@ -4082,6 +4086,8 @@ void Model::unload() {
         if (L.ffn_norm) be_->release(L.ffn_norm);
         if (L.attn_sub_norm) be_->release(L.attn_sub_norm);
         if (L.ffn_sub_norm) be_->release(L.ffn_sub_norm);
+        if (L.wup_bias) be_->release(L.wup_bias);
+        if (L.wdown_bias) be_->release(L.wdown_bias);
         if (L.q_bias) be_->release(L.q_bias);
         if (L.k_bias) be_->release(L.k_bias);
         if (L.v_bias) be_->release(L.v_bias);

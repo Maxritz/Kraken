@@ -75,6 +75,11 @@ struct LayerWeights {
     // memory -- the GEMM that produces the result runs there, and the add is
     // one launch with the same shape as `add_bias_cols`.
     f32 *wo_bias = nullptr;
+    // The plain family biases its MLP projections (`ffn_up.bias` /
+    // `ffn_down.bias`, GPT-NeoX). Absent on GPT-J, which has no biases at all,
+    // so both applications are guarded on the pointer.
+    f32 *wup_bias = nullptr;
+    f32 *wdown_bias = nullptr;
     f32 *ffn_norm = nullptr; // f32 [n_embd]
     // Branch post norms (gemma2/3/4, muse-glimmer): applied to the sub-block's
     // output BEFORE the residual add, each with its own weight. Null on every
@@ -418,6 +423,13 @@ struct ModelConfig {
     // every family that carries separate q/k/v and gate/up tensors.
     bool fused_qkv = false;
     bool fused_gate_up = false;
+    // The plain pre-norm family's pieces (see ArchSpec). `gpt2_style` still
+    // means the whole GPT-2 bundle; these name the parts so gptneox/gptj/phi2
+    // can take what they have and nothing they do not.
+    bool ln_bias = false;
+    bool learned_pos = false;
+    bool parallel_residual = false;
+    bool no_gate_ffn = false;
     // Rotate only on the windowed layers (muse-glimmer's full layers are NoPE).
     bool rope_swa_only = false;
 

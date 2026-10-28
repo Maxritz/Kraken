@@ -665,7 +665,11 @@ private:
     // positions, a fused attn_qkv whose row is Q|K|V, and an ungated GELU MLP.
     // Those four are one architecture, and a separate loop keeps every other
     // family's graph literally unchanged.
-    bool gpt2_forward(const i32 *toks, i32 n, i32 pos0);
+    // The plain pre-norm family (GPT-2, GPT-NeoX, GPT-J, Phi-2): LayerNorm,
+// a fused or separate QKV, optional rotary or learned positions, an
+// optional parallel residual and an optional gated MLP. Which of those
+// are on is the arch table's business, not this loop's.
+    bool plain_forward(const i32 *toks, i32 n, i32 pos0);
     // LayerNorm with a bias, and the Q|K|V split of a fused projection row.
     // Both are GPT-2-only and both go through the backend's own download /
     // upload, so they are correct on every backend rather than only the one the

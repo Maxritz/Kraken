@@ -3043,13 +3043,21 @@ void Engine::split_qkv(void *q, void *k, void *v, const void *qkv, i64 rows,
     be_->upload(v, vb.data(), vb.size() * sizeof(f32), 0);
 }
 
-bool Engine::gpt2_forward(const i32 *toks, i32 n, i32 pos0) {
+bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
     const ModelConfig &mc = model_.cfg();
     const auto &layers = model_.layers();
     const i64 E = mc.n_embd;
     const i64 FF = mc.n_ff;
-    const f32 eps = mc.rms_eps; // the file's layer_norm_epsilon
+    // The file's layer_norm_epsilon. This family is LayerNorm, so it is the
+    // mean-and-variance epsilon, not the RMS one -- the loader fills the same
+    // field from whichever key the file used.
+    const f32 eps = mc.rms_eps;
     const QuantTensor &embd = model_.tok_embd();
+    const i64 lh = mc.n_head;
+    const i64 lkvh = mc.n_head_kv > 0 ? mc.n_head_kv : mc.n_head;
+    const i64 hd = mc.head_dim;
+    const i64 lq = lh * hd;
+    const i64 kvw = lkvh * hd;
 
     be_->fill0(ws_rexp_, static_cast<size_t>(n) * sizeof(i32));
     be_->embed(ws_x_, embd.data, embd.type, mc.n_vocab, E, toks, n);
@@ -3058,10 +3066,14 @@ bool Engine::gpt2_forward(const i32 *toks, i32 n, i32 pos0) {
     // Dequantized on the host one position at a time and added row-wise. The
     // table is [n_ctx_train, E] and a row is E wide, so this is n small row
     // copies per pass -- not a GEMM, and not worth a device kernel.
-    {
+    //
+    // Only the families that have the table read it. GPT-NeoX, GPT-J and Phi-2
+    // carry rotary positions instead and have no `position_embd` tensor at all,
+    // so requiring one here would refuse every complete file of those families.
+    if (mc.learned_pos) {
         const QuantTensor &pos = model_.pos_embd();
         if (!pos.present()) {
-            forward_error_ = "gpt2 forward reached without position_embd";
+            forward_error_ = "plain forward reached without position_embd";
             return false;
         }
         const size_t row_bytes = dtype_row_bytes(pos.type, E);
@@ -3070,7 +3082,7 @@ bool Engine::gpt2_forward(const i32 *toks, i32 n, i32 pos0) {
         for (i32 r = 0; r < n; r++) {
             const i64 ps = static_cast<i64>(pos0) + r;
             if (ps < 0 || ps >= mc.n_ctx_train) {
-                forward_error_ = "gpt2 position " + std::to_string(ps) +
+                forward_error_ = "position " + std::to_string(ps) +
                                  " is outside the learned table (" +
                                  std::to_string(mc.n_ctx_train) + " rows)";
                 return false;
@@ -3087,8 +3099,8 @@ bool Engine::gpt2_forward(const i32 *toks, i32 n, i32 pos0) {
     // ---- blocks ------------------------------------------------------------
     AttnDesc d;
     d.n_head = mc.n_head;
-    d.n_kv = mc.n_head_kv > 0 ? mc.n_head_kv : mc.n_head;
-    d.hd = mc.head_dim;
+    d.n_kv = lkvh;
+    d.hd = hd;
     d.scale = 1.0f / std::sqrt(static_cast<f32>(mc.head_dim));
     d.causal = true;
     d.pos0 = pos0;
@@ -3102,35 +3114,94 @@ bool Engine::gpt2_forward(const i32 *toks, i32 n, i32 pos0) {
         const LayerWeights &L = layers[static_cast<size_t>(l)];
         d.n_tok = n;
         d.layer = l;
-        d.layer_stride = 0; // filled from the cache below, like every family
+        d.layer_stride = 0;
         void *kbase = nullptr;
         void *vbase = nullptr;
 
         // ---- attention ----
         layernorm(ws_xn_, ws_x_, L.attn_norm, L.attn_norm_bias, n, E, eps);
-        gemm_w(ws_qkv_fused_, ws_xn_, L.wqkv_fused, 3 * E, E, n);
-        if (L.qkv_bias) be_->add_bias_rows(ws_qkv_fused_, L.qkv_bias, 3 * E, n);
-        // The Q|K|V split is three contiguous E-wide blocks of one row, so it
-        // is a strided copy per row, not a gather.
-        split_qkv(ws_q_, ws_k_, ws_v_, ws_qkv_fused_, n, E);
+        // q/k/v read the SAME normed row, so the fused projection and the three
+        // separate ones are the same arithmetic. The fused form is split into
+        // row VIEWS rather than copied, which is what keeps the two paths
+        // bit-identical -- there is no second buffer and no stride convention
+        // to disagree.
+        if (L.wqkv_fused.present()) {
+            const i64 rb = static_cast<i64>(
+                dtype_row_bytes(L.wqkv_fused.type, L.wqkv_fused.n_in));
+            QuantTensor wq = L.wqkv_fused;
+            wq.n_out = lq;
+            QuantTensor wk = L.wqkv_fused;
+            wk.data = static_cast<u8 *>(L.wqkv_fused.data) + lq * rb;
+            wk.n_out = kvw;
+            QuantTensor wv = L.wqkv_fused;
+            wv.data = static_cast<u8 *>(L.wqkv_fused.data) + (lq + kvw) * rb;
+            wv.n_out = kvw;
+            void *dq[3] = {ws_q_, ws_k_, ws_v_};
+            const void *wqkv[3] = {wq.data, wk.data, wv.data};
+            const i64 nqkv[3] = {lq, kvw, kvw};
+            be_->gemm_group(dq, ws_xn_, wqkv, wq.type, nqkv, E, 3, n);
+            // The bias is one vector laid out Q | K | V, i.e. the same split as
+            // the weight, so the three parts are three offsets into it.
+            // GPT-NeoX and Phi-2 carry one; GPT-J and GPT-2 have none and the
+            // null pointer skips all three.
+            if (L.qkv_bias) {
+                be_->add_bias_rows(ws_q_, L.qkv_bias, lq, n);
+                be_->add_bias_rows(ws_k_, L.qkv_bias + lq, kvw, n);
+                be_->add_bias_rows(ws_v_, L.qkv_bias + lq + kvw, kvw, n);
+            }
+        } else {
+            gemm_w(ws_q_, ws_xn_, L.wq, lq, E, n);
+            gemm_w(ws_k_, ws_xn_, L.wk, kvw, E, n);
+            gemm_w(ws_v_, ws_xn_, L.wv, kvw, E, n);
+            if (L.q_bias) be_->add_bias_rows(ws_q_, L.q_bias, lq, n);
+            if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, kvw, n);
+            if (L.v_bias) be_->add_bias_rows(ws_v_, L.v_bias, kvw, n);
+        }
+
+        // Rotary, when the family has it. GPT-2 has none: its positions are
+        // already in the embedding by now, and rotating here would apply a
+        // second, wrong position signal.
+        if (!mc.learned_pos)
+            be_->rope(ws_q_, ws_k_, lh, lkvh, hd, n, pos0,
+                      model_.inv_freq_at(l).data(), mc.rope_scale,
+                      model_.rope_frac_at(l), mc.rope_neox);
 
         kbase = const_cast<void *>(kvt_k_.base(l));
         vbase = const_cast<void *>(kvt_v_.base(l));
-        d.layer = l;
         be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
         be_->attention(ws_attn_, ws_q_, kbase, vbase, d);
         kvt_k_.end_layer(l);
         kvt_v_.end_layer(l);
 
-        gemm_w(ws_x2_, ws_attn_, L.wo, E, E, n);
+        gemm_w(ws_x2_, ws_attn_, L.wo, E, lq, n);
         if (L.wo_bias) be_->add_bias_rows(ws_x2_, L.wo_bias, E, n);
         be_->add_residual(ws_x_, ws_x2_, n, E, nullptr);
 
-        // ---- MLP: up -> gelu -> down ----
-        layernorm(ws_xn_, ws_x_, L.ffn_norm, L.ffn_norm_bias, n, E, eps);
-        gemm_w(ws_gate_, ws_xn_, L.wup, FF, E, n);
-        be_->gelu_act(ws_gate_, static_cast<i64>(n) * FF);
+        // ---- MLP ----
+        // Sequential (GPT-2, GPT-J, Phi-2): the FFN reads the norm of the
+        // post-attention stream. Parallel (GPT-NeoX): it reads the SAME normed
+        // row the attention read -- still in ws_xn_, untouched since -- so the
+        // second norm is skipped rather than recomputed and both contributions
+        // land in the residual independently. Two different graphs, and only
+        // the file's own flag says which.
+        if (!mc.parallel_residual)
+            layernorm(ws_xn_, ws_x_, L.ffn_norm, L.ffn_norm_bias, n, E, eps);
+
+        // Gated when the file has a gate tensor, ungated (up -> gelu -> down)
+        // when it does not. Reading ffn_up as a gate on an ungated file would
+        // halve the intermediate width and apply the wrong activation.
+        if (L.wgate.present()) {
+            gemm_w(ws_gate_, ws_xn_, L.wgate, FF, E, n);
+            gemm_w(ws_up_, ws_xn_, L.wup, FF, E, n);
+            if (L.wup_bias) be_->add_bias_rows(ws_up_, L.wup_bias, FF, n);
+            be_->silu_mul(ws_gate_, ws_gate_, ws_up_, static_cast<i64>(n) * FF);
+        } else {
+            gemm_w(ws_gate_, ws_xn_, L.wup, FF, E, n);
+            if (L.wup_bias) be_->add_bias_rows(ws_gate_, L.wup_bias, FF, n);
+            be_->gelu_act(ws_gate_, static_cast<i64>(n) * FF);
+        }
         gemm_w(ws_x2_, ws_gate_, L.wdown, E, FF, n);
+        if (L.wdown_bias) be_->add_bias_rows(ws_x2_, L.wdown_bias, E, n);
         be_->add_residual(ws_x_, ws_x2_, n, E, nullptr);
     }
 
@@ -3166,7 +3237,11 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     // ungated GELU MLP are one architecture rather than four options). Taking
     // the branch here rather than inside the loop keeps every other family's
     // graph literally untouched.
-    if (mc.gpt2_style) return gpt2_forward(toks, n, pos0);
+    // The plain pre-norm family -- GPT-2, GPT-NeoX, GPT-J, Phi-2. One loop
+    // handles all four because they differ only in which pieces of the
+    // old gpt2_style bundle they set (see ArchSpec), and taking the
+    // branch here keeps every other family's graph untouched.
+    if (mc.gpt2_style || mc.ln_bias) return plain_forward(toks, n, pos0);
     // Qwen3.5 packs its output gate behind the query (a per-layer shape only
     // when the arch says so); laguna projects its own. Decided once from the
     // arch, the same way Engine::init decided the packed workspace.
