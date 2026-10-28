@@ -245,3 +245,56 @@ recorded here rather than papered over.
   retracted it came from a compile-time-constant scale, which lets the compiler
   delete the int-to-float tail. Section 7's F variant redoes that measurement
   with a runtime scale and finds 1.4x, not 1.8x.
+
+## 12. Ablation: which instruction group actually costs what
+
+`tools/bench_q80_ablate.cpp` takes the production kernel and changes exactly
+one component per rung, all rungs in one process (this host moves up to 1.8x
+between processes). Rungs marked WRONG change the result on purpose; they price
+an instruction, they are not shippable.
+
+768x2048x512, one thread, GMAC/s:
+
+| rung | GMAC/s | of L0 | cost |
+|---|---:|---:|---:|
+| L0 production | 24.54 | 100% | — |
+| **L2 constant weight scale** | **33.01** | **135%** | **34.5%** |
+| **L7 integer accumulate** | **30.54** | **124%** | **24.4%** |
+| L5 no per-block activation flip | 25.38 | 103% | 3.4% |
+| L3 contiguous weight load | 24.92 | 102% | 1.5% |
+| L1 constant activation scale | 24.66 | 100% | **-0.5%** |
+| L4 constant sign mask | 24.68 | 101% | -0.5% |
+| L6 no weight magnitude | 24.64 | 100% | -0.4% |
+
+### What this settles
+
+**The activation scale chain is free.** L1 deletes it entirely — no `dx` load,
+no `d0 * d1`, no broadcast, no permute — and the kernel does not get faster.
+That is the post-hoc explanation for the three null results in §9 and §11: all
+three rewrites optimised a dependency that costs nothing. The chain was never
+the problem; the reasoning that produced it came from variant E-vs-F in §7,
+where F also removed the ability to *fold the scale into the accumulator*, and
+that is what the 1.4x was measuring.
+
+**Two real costs, both fixable:**
+
+1. **The fp16 weight-scale decode, 34.5%.** `fp16_to_fp32` is a branchy scalar
+   routine with a denormal-normalisation loop, called twice per block pair. One
+   `_mm_cvtph_ps` converts both scales. Measured 4 of 4 interleaved pairs at
+   context 4096: **40.9 / 37.5 / 34.9 / 39.9 GMAC/s against 33.5 / 32.5 / 33.8 /
+   31.0** for the scalar path, median 38.7 vs 33.0, i.e. **1.17x**. Bit-identical
+   — checked across all 65536 half values, zero mismatches outside NaN payloads.
+   Shipped behind `KRK_CPU_Q80_NOF16C=1` as the escape hatch.
+2. **The int-to-float tail, 24.4%** (`cvtepi32_ps` + `fmadd` per row per block
+   pair). Not yet addressed. Removing it means either VNNI-style integer
+   accumulation with a per-block scale applied at the end, or accepting a
+   different rounding — and VNNI is absent on this host, so the end-of-loop
+   scale would have to be paid for somewhere else.
+
+### What it retires
+
+The "0.9 IPC vs 2.7 in the probe" gap is not a single mysterious stall. It
+decomposes into a scalar fp16 routine the compiler could not vectorise (34.5%,
+now fixed) and a float conversion/addition pair per 64 MACs (24.4%). After the
+fp16 fix the kernel is at roughly 47% of variant C instead of 41%, and the
+remaining headroom is the float tail, not the loop structure.
