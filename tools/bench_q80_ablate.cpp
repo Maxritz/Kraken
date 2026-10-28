@@ -135,6 +135,84 @@ __attribute__((target("avx512f,avx512bw"))) static void rung(const u8 *w,
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Row depth as a parameter.
+//
+// At 38.7 GMAC/s across two cores the production kernel retires roughly 10
+// MACs per cycle against ~34 for the instruction mix on its own, i.e. under
+// 1 IPC. That is the signature of dependency stalls rather than instruction
+// count, and the ablation below confirms it from the other side: deleting the
+// single largest instruction group buys 24%, not the 2-3x a dispatch-bound loop
+// would give. Two tiles of eight rows share one weight decode, which both
+// halves the weight traffic per MAC and doubles the number of independent
+// chains the out-of-order engine can find.
+template <int NROWS>
+__attribute__((target("avx512f,avx512bw,f16c"))) static void rung_rows(
+    const u8 *w, const i8 *xq, const f32 *dx, i64 nb, i64 n_out, i64 rows,
+    i64 row_bytes, f32 *out) {
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i ones = _mm512_set1_epi16(1);
+    for (i64 r0 = 0; r0 + NROWS <= rows; r0 += NROWS) {
+        for (i64 o = 0; o < n_out; o++) {
+            const u8 *wr = w + static_cast<size_t>(o) * static_cast<size_t>(row_bytes);
+            __m512 acc[NROWS];
+            for (int r = 0; r < NROWS; r++) acc[r] = _mm512_setzero_ps();
+            for (i64 b = 0; b + 2 <= nb; b += 2, wr += 68) {
+                const __m128i two = _mm_setr_epi16(
+                    static_cast<short>(wr[0] | (static_cast<u16>(wr[1]) << 8)),
+                    static_cast<short>(wr[34] | (static_cast<u16>(wr[35]) << 8)),
+                    0, 0, 0, 0, 0, 0);
+                const __m128 d2 = _mm_cvtph_ps(two);
+                const f32 d0 = _mm_cvtss_f32(d2);
+                const f32 d1 = _mm_cvtss_f32(_mm_shuffle_ps(d2, d2, 0x55));
+                const __m256i lo =
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i *>(wr + 2));
+                const __m256i hi =
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i *>(wr + 36));
+                const __m512i wv =
+                    _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+                const __mmask64 neg = _mm512_cmp_epi8_mask(wv, zero, _MM_CMPINT_LT);
+                const __m512i mag = _mm512_mask_sub_epi8(wv, neg, zero, wv);
+                for (int r = 0; r < NROWS; r++) {
+                    const __m512i xv = _mm512_loadu_si512(
+                        reinterpret_cast<const void *>(
+                            xq + static_cast<i64>(r0 + r) * static_cast<i64>(nb * 32) +
+                            b * 32));
+                    const __m512i xb = _mm512_mask_sub_epi8(xv, neg, zero, xv);
+                    const __m512i iv =
+                        _mm512_madd_epi16(_mm512_maddubs_epi16(mag, xb), ones);
+                    const f32 s0 = d0 * dx[(r0 + r) * nb + b];
+                    const f32 s1 = d1 * dx[(r0 + r) * nb + b + 1];
+                    const __m512 sc = _mm512_castsi512_ps(_mm512_inserti64x4(
+                        _mm512_castps_si512(
+                            _mm512_castps256_ps512(_mm256_broadcast_ss(&s0))),
+                        _mm256_castps_si256(_mm256_broadcast_ss(&s1)), 1));
+                    acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iv), sc, acc[r]);
+                }
+            }
+            f32 sum = 0.0f;
+            for (int r = 0; r < NROWS; r++) sum += _mm512_reduce_add_ps(acc[r]);
+            out[r0 * n_out + o] = sum;
+        }
+    }
+}
+
+template <int NROWS>
+static double time_rows(const u8 *w, const i8 *xq, const f32 *dx, i64 nb,
+                        i64 n_out, i64 rows, i64 row_bytes, f32 *out) {
+    double best = 1e30;
+    for (int rep = 0; rep < 5; rep++) {
+        const double t0 = now_s();
+        rung_rows<NROWS>(w, xq, dx, nb, n_out, rows, row_bytes, out);
+        const double dt = now_s() - t0;
+        if (dt < best) best = dt;
+    }
+    const double macs = static_cast<double>(rows / NROWS * NROWS) *
+                        static_cast<double>(n_out) * static_cast<double>(nb) * 32.0;
+    return macs / best / 1e9;
+}
+
 struct Case {
     const char *name;
     int mode;
@@ -229,6 +307,22 @@ int main(int argc, char **argv) {
         const double share = 100.0 * (ref - g[i]) / ref;
         std::printf("%-26s %8.2f %6.0f%% %9s %8.1f%%%s\n", cases[i].name, g[i],
                     100.0 * g[i] / ref, "", share, cases[i].wrong ? "  (WRONG)" : "");
+    }
+    std::printf("\nrow depth, production kernel, same data\n");
+    std::printf("%-26s %8s %7s %10s\n", "rows in flight", "GMAC/s", "of 8",
+                "us per row");
+    const double r8 = time_rows<8>(w.data(), xq.data(), dx.data(), nb, n_out,
+                                   rows, row_bytes, out.data());
+    for (int n : {4, 8, 16}) {
+        const double g2 = n == 8 ? r8
+                         : (n == 4 ? time_rows<4>(w.data(), xq.data(), dx.data(), nb,
+                                                  n_out, rows, row_bytes, out.data())
+                                   : time_rows<16>(w.data(), xq.data(), dx.data(), nb,
+                                                   n_out, rows, row_bytes, out.data()));
+        // Microseconds of wall time per (row, output column) pair, so depth can
+        // be compared directly even though the tiles differ in size.
+        const double us_row = 1e6 / g2 / static_cast<double>(n_out * nb * 32) * 1e0;
+        std::printf("%-26d %8.2f %6.0f%% %10.2f\n", n, g2, 100.0 * g2 / r8, us_row);
     }
     (void)time_rung;
 }

@@ -298,3 +298,42 @@ decomposes into a scalar fp16 routine the compiler could not vectorise (34.5%,
 now fixed) and a float conversion/addition pair per 64 MACs (24.4%). After the
 fp16 fix the kernel is at roughly 47% of variant C instead of 41%, and the
 remaining headroom is the float tail, not the loop structure.
+
+## 13. Deep trace after the f16c fix: what is left
+
+Same ablation tool, re-run once the fp16 decode was replaced. Two new
+measurements.
+
+**Row depth is already optimal.** Two 8-row tiles share a weight decode, which
+halves weight traffic per MAC and doubles the independent chains — the standard
+cure for a stall-bound inner loop:
+
+| rows in flight | GMAC/s | vs 8 rows |
+|---:|---:|---:|
+| 4 | 24.72 | 90% |
+| **8** | **27.42** | **100%** |
+| 16 | 26.43 | 96% |
+
+16 rows is *slower*, so the kernel is not short of independent work and the
+register pressure of a second tile costs more than the extra ILP buys. Combined
+with the earlier finding that 4 rows is also worse, 8 is a genuine optimum and
+this lever is closed.
+
+**The int-to-float tail is now the single largest cost**, and it is larger than
+the first run suggested:
+
+| rung | GMAC/s | of L0 |
+|---|---:|---:|
+| L0 production | ~24.5 | 100% |
+| **L7 integer accumulate** | **34.85** | **144%** |
+
+So `cvtepi32_ps` + `fmadd`, two instructions per row per 128 values, are worth
+44% of the kernel. That is disproportionately expensive for two instructions out
+of roughly six per row per block pair, and the reason is port pressure:
+`vcvtdq2ps` zmm issues on one port on this core, and it competes with
+`vpmaddwd`. It cannot be removed without either VNNI (absent here) or a format
+change that gives a row one scale instead of one per 32 values.
+
+The remaining smaller rungs are not worth chasing: the per-block activation
+flip is 3.4%, the two-load weight assembly 1.5%, and the sign mask and magnitude
+formation approximately nothing.

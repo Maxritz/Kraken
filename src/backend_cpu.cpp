@@ -224,10 +224,36 @@ struct AttnRange {
     i64 m1 = 0;
 };
 
+// A row's own position. With no per-row table this is the old consecutive
+// layout; with one, each row carries its own -- which is what lets a single
+// call mix several sequences at different points in their history.
+inline i64 attn_pos(const AttnDesc &d, i64 t) {
+    return d.row_pos ? d.row_pos[t] : d.pos0 + t;
+}
+
+// A row's element offset into the KV plane, before layer_stride/pos_stride.
+// Zero for the single-sequence layout, where the caller already offset the
+// plane to the start of its context.
+inline i64 attn_kv_base(const AttnDesc &d, i64 t) {
+    return d.row_kv_base ? d.row_kv_base[t] : 0;
+}
+
+// True when this call addresses more than one KV region. The gather path
+// copies one head's slices out of ONE contiguous run of keys, so it has no
+// meaning here and the per-row paths below are used instead.
+inline bool attn_multiseq(const AttnDesc &d) {
+    return d.row_pos != nullptr || d.row_kv_base != nullptr;
+}
+
 inline AttnRange attn_range(const AttnDesc &d, i64 t) {
     AttnRange r;
-    const i64 pos = d.pos0 + t;
-    r.n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
+    const i64 pos = attn_pos(d, t);
+    // Non-causal batches are contiguous by construction today, so the chunk's
+    // last position is the bound. A per-row table changes that, and there is
+    // no caller that both wants non-causal attention and mixes sequences, so
+    // the multiseq case uses each row's own position instead of guessing.
+    r.n_keys = d.causal ? pos + 1
+                        : (d.row_pos ? pos + 1 : d.pos0 + d.n_tok);
     r.j_lo = d.window > 0 ? std::max<i64>(0, r.n_keys - d.window) : 0;
     r.n_vis = r.n_keys - r.j_lo;
     // skip_from: a query at pos >= skip_from keeps the context before
@@ -1019,8 +1045,9 @@ public:
                         for (i64 u = b; u < e; u++) {
                             const i64 t = u / d.n_head;
                             const i64 h = u - t * d.n_head;
-                            const i64 pos = d.pos0 + t;
-                            const i64 n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
+                            const i64 pos = attn_pos(d, t);
+                            const i64 kvb = attn_kv_base(d, t);
+                            const i64 n_keys = pos + 1;
                             const i64 j_lo = d.window > 0
                                                  ? std::max<i64>(0, n_keys - d.window)
                                                  : 0;
@@ -1042,7 +1069,7 @@ public:
                                     scores[static_cast<size_t>(j)] = -FLT_MAX;
                                     continue;
                                 }
-                                const u8 *row = kc + (j_lo + j) * d.pos_stride;
+                                const u8 *row = kc + kvb + (j_lo + j) * d.pos_stride;
                                 const f32 *sc =
                                     reinterpret_cast<const f32 *>(row + kv_dim);
                                 f32 dot = 0.0f;
@@ -1146,7 +1173,12 @@ public:
         // The tile is exactly the bytes each row would have read, in the same
         // order, so the row body runs the identical arithmetic -- accuracy is
         // checked against the in-place path on ten shapes, not argued.
-        if (attn_vec && n_gather > 0 && d.n_tok > 1) {
+        // The gather copies one head's slices out of a single contiguous run of
+        // keys, so it cannot express rows that address different sequences.
+        // Multi-sequence batches therefore take the per-row paths below; the
+        // copy is an amortisation, not a requirement, and it is the next thing
+        // to generalise once the batched path is measured.
+        if (attn_vec && n_gather > 0 && d.n_tok > 1 && !attn_multiseq(d)) {
             par_for(d.n_head, 1,
                     4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * d.hd,
                     [&](i64 hb, i64 he) {
@@ -1196,9 +1228,13 @@ public:
                             const AttnRange r = attn_range(d, t);
                             scores.resize(static_cast<size_t>(r.n_vis));
                             const i64 hkv = n_rep > 0 ? h / n_rep : 0;
-                            attn_row_f32_avx2(qf, kc + r.j_lo * d.pos_stride +
+                            // The row's own KV region, so a batch can carry rows
+                            // from different sequences. Zero for every call that
+                            // does not set row_kv_base.
+                            const i64 kvb = attn_kv_base(d, t);
+                            attn_row_f32_avx2(qf, kc + kvb + r.j_lo * d.pos_stride +
                                                       hkv * d.hd,
-                                              vc + r.j_lo * d.pos_stride +
+                                              vc + kvb + r.j_lo * d.pos_stride +
                                                   hkv * d.hd,
                                               d.pos_stride, of, d, t, h, r,
                                               scores.data());
@@ -1214,8 +1250,9 @@ public:
                     for (i64 u = b; u < e; u++) {
                         const i64 t = u / d.n_head;
                         const i64 h = u - t * d.n_head;
-                        const i64 pos = d.pos0 + t;
-                        const i64 n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
+                        const i64 pos = attn_pos(d, t);
+                        const i64 kvb = attn_kv_base(d, t);
+                        const i64 n_keys = pos + 1;
                         // Sliding window (laguna's hybrid layers): the query
                         // sees only the `window` most recent keys, so the ones
                         // below the bound are skipped outright -- they never
@@ -1240,7 +1277,8 @@ public:
                                 scores[static_cast<size_t>(j)] = -FLT_MAX;
                                 continue;
                             }
-                            const f32 *kj = kc + (j_lo + j) * d.pos_stride + hkv * d.hd;
+                            const f32 *kj =
+                                kc + kvb + (j_lo + j) * d.pos_stride + hkv * d.hd;
                             f32 dot = 0;
                             for (i64 i = 0; i < d.hd; i++) dot += qh[i] * kj[i];
                             f32 sv = dot * d.scale;
@@ -1271,7 +1309,8 @@ public:
                         for (i64 i = 0; i < d.hd; i++) oh[i] = 0;
                         for (i64 j = 0; j < n_vis; j++) {
                             const f32 p = scores[static_cast<size_t>(j)] * inv;
-                            const f32 *vj = vc + (j_lo + j) * d.pos_stride + hkv * d.hd;
+                            const f32 *vj =
+                                vc + kvb + (j_lo + j) * d.pos_stride + hkv * d.hd;
                             for (i64 i = 0; i < d.hd; i++) oh[i] += p * vj[i];
                         }
                     }
