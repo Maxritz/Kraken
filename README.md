@@ -1207,3 +1207,10 @@ which also records three loader bugs this found (`position_embd.weight` wrongly
 *required*, so complete MPT files were refused; per-head QK-norm tensors loaded
 but never applied in the plain path, decoding silently wrong; and
 `token_embd_norm` confused for a per-layer norm).
+
+`falcon` joined them on the same change, and is *not* ALiBi: its loader reads
+only the norm epsilon, so its position signal is the NEOX rotary. Its parallel
+branch uses **two** norms — `x + attn(ln1(x)) + mlp(ln2(x))` — where GPT-NeoX
+reuses one, so `parallel_two_norm` takes a second row of the *pre-attention*
+residual. Proved by a file whose `attn_norm_2` carries `attn_norm`'s own
+weights: the result must be, and is, identical to the last digit.

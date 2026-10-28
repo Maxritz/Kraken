@@ -279,6 +279,15 @@ struct ArchSpec {
     // under another name -- the file carries both -- and skipping it leaves
     // every row at the wrong scale entering layer 0.
     bool embd_norm = false;
+    // Falcon's parallel branch has TWO norms, not one: the FFN is fed by its
+    // own LayerNorm over the same pre-attention residual row the attention
+    // read, rather than by the row the attention already normalized. GPT-NeoX
+    // (parallel_residual, this false) reuses one normed row for both arms;
+    // Falcon does not, so the second norm must be computed from the residual
+    // BEFORE the attention residual lands in it. On Falcon-7B the two norms
+    // hold the same weights (the file has no attn_norm_2), so the arithmetic
+    // collapses to the single-norm case; on Falcon-40B they differ.
+    bool parallel_two_norm = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

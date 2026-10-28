@@ -49,6 +49,10 @@ struct LayerWeights {
     // weight. Null on every other family, and null keeps their graph exactly
     // as it was: the engine only looks at these when cfg_.gpt2_style is set.
     f32 *attn_norm_bias = nullptr; // f32 [n_embd]
+    // Falcon-40B's second pre-attention norm (`attn_norm_2`). Optional on the
+    // family: Falcon-7B has one norm and reuses it for both arms.
+    f32 *attn_norm_2 = nullptr;       // f32 [n_embd]
+    f32 *attn_norm_2_bias = nullptr;  // f32 [n_embd]
     f32 *ffn_norm_bias = nullptr;  // f32 [n_embd]
     // The FUSED query/key/value projection, [n_embd -> 3*n_embd]. Its output
     // row is Q | K | V, three contiguous n_embd blocks, and one bias covers
@@ -433,6 +437,7 @@ struct ModelConfig {
     // ALiBi's scale, and BLOOM's embedding norm (see ArchSpec).
     f32 alibi_max_bias = 0.0f;
     bool embd_norm = false;
+    bool parallel_two_norm = false;
     // Rotate only on the windowed layers (muse-glimmer's full layers are NoPE).
     bool rope_swa_only = false;
 

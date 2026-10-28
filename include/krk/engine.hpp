@@ -1142,6 +1142,9 @@ private:
     // workspaces, sized for `chunk_` rows
     void *ws_x_ = nullptr;    // [chunk, n_embd]
     void *ws_xn_ = nullptr;   // [chunk, n_embd]
+    // [chunk, n_embd] -- Falcon's second parallel norm, null unless
+    // ArchSpec::parallel_two_norm.
+    void *ws_xn2_ = nullptr;
     void *ws_x2_ = nullptr;   // [chunk, n_embd]
     // qwen4exp's lane stack and its mixer workspaces. All null unless the file
     // declares hyper_connection.count > 1; `hc_active_` is the single switch

@@ -313,6 +313,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.parallel_residual = aspec.parallel_residual;
     cfg_.no_gate_ffn = aspec.no_gate_ffn;
     cfg_.embd_norm = aspec.embd_norm;
+    cfg_.parallel_two_norm = aspec.parallel_two_norm;
     // The arch entry supplies the family's own constant (BLOOM's 8.0); the
     // file's key wins when it has one, which is how MPT states its value.
     cfg_.alibi_max_bias = static_cast<f32>(gguf_.get_f64(
@@ -1713,6 +1714,10 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
         L.attn_norm = upload_f32(blk_key("blk.%d.attn_norm.weight", l));
         L.ffn_norm = upload_f32(blk_key("blk.%d.ffn_norm.weight", l));
+        // Falcon-40B's second pre-attention norm. Optional: 7B has none, and
+        // then the FFN's norm is attn_norm, which the fallback below aliases.
+        L.attn_norm_2 = upload_f32(blk_key("blk.%d.attn_norm_2.weight", l));
+        L.attn_norm_2_bias = upload_f32(blk_key("blk.%d.attn_norm_2.bias", l));
         if (cfg_.ln_bias) {
             // LayerNorm, so each pre-norm has a bias beside its weight. A
             // LayerNorm run without its bias is a different function, not a
@@ -4108,6 +4113,8 @@ void Model::unload() {
         if (L.attn_post_norm) be_->release(L.attn_post_norm);
         if (L.ffn_post_norm) be_->release(L.ffn_post_norm);
         if (L.ffn_norm) be_->release(L.ffn_norm);
+        if (L.attn_norm_2) be_->release(L.attn_norm_2);
+        if (L.attn_norm_2_bias) be_->release(L.attn_norm_2_bias);
         if (L.attn_sub_norm) be_->release(L.attn_sub_norm);
         if (L.ffn_sub_norm) be_->release(L.ffn_sub_norm);
         if (L.wup_bias) be_->release(L.wup_bias);

@@ -375,7 +375,8 @@ def _quant_np(v, fmt):
 def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
           arch="llama", n_expert=0, n_expert_used=0, n_ff_exp=0, scale=0.04,
           fused=False, fused_ffn=None, plain=None, split_qkv=False,
-          alibi=8.0, qk_norm=False):
+          alibi=8.0, qk_norm=False, attn_norm_2=False,
+          attn_norm_2_identity=False):
     # `fused` is the Q|K|V projection, `fused_ffn` the gate|up one; a Phi file
     # has both, and the two are separable so a test can fuse one at a time and
     # find which of them changed the logits.
@@ -384,11 +385,17 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
     # The plain pre-norm family. `biases` is true for the members that carry a
     # bias beside every weight (gptneox, phi2); GPT-J has none anywhere.
     biases = plain in ("gptneox", "phi2", "mpt", "bloom")
+    # Falcon is the one family with norm biases and NO linear biases: every
+    # LayerNorm carries one, no projection does.
+    norm_bias = biases or plain == "falcon"
+    # Falcon has a single norm per layer under the name attn_norm; the FFN arm
+    # reads it too, so no ffn_norm tensor exists in the file at all.
+    has_ffn_norm = plain != "falcon"
     rnd = random.Random(seed)
     q_dim, kv_dim = n_head * hd, n_kv * hd
     moe = n_expert > 0
     assert arch in ("llama", "phi3", "gptneox", "gptj", "phi2", "mpt",
-                    "bloom") or arch == "qwen3moe", arch
+                    "bloom", "falcon") or arch == "qwen3moe", arch
     assert not moe or (n_ff_exp > 0 and 0 < n_expert_used <= n_expert)
 
     tokens = ["<unk>", "<s>", "</s>"]
@@ -523,7 +530,7 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
     if plain:
         # LayerNorm on the way out, with its bias -- a LayerNorm run without
         # its bias keeps each row's mean, which shifts every logit.
-        if biases:
+        if norm_bias:
             zeros("output_norm.bias", n_embd)
     for l in range(n_layer):
         p = "blk.%d." % l
@@ -533,10 +540,26 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
             # reference loader, and the file decides.
             ramp(p + "attn_q_norm.weight", hd)
             ramp(p + "attn_k_norm.weight", hd)
-        ones(p + "ffn_norm.weight", n_embd)
-        if biases:
+        if has_ffn_norm:
+            ones(p + "ffn_norm.weight", n_embd)
+        if attn_norm_2:
+            # Falcon-40B's second pre-attention norm. A ramp, not ones: it has
+            # to be visible in the logits or "the engine read it" cannot be
+            # told apart from "the engine ignored it".
+            # `--attn-norm-2-identity` writes the same weights attn_norm has,
+            # so the two arms normalize with identical weights and the result
+            # must equal the one-norm file exactly. If the engine took the
+            # second norm AFTER the attention residual instead of before, the
+            # rows would differ and so would the logits.
+            if attn_norm_2_identity:
+                ones(p + "attn_norm_2.weight", n_embd)
+            else:
+                ramp(p + "attn_norm_2.weight", n_embd)
+            zeros(p + "attn_norm_2.bias", n_embd)
+        if norm_bias:
             zeros(p + "attn_norm.bias", n_embd)
-            zeros(p + "ffn_norm.bias", n_embd)
+            if has_ffn_norm:
+                zeros(p + "ffn_norm.bias", n_embd)
         if fused or (plain and not split_qkv):
             # Phi-3 and the plain family: Q | K | V in one projection, and
             # under GQA the K and V blocks are kv_dim wide, not n_embd --
@@ -623,10 +646,16 @@ def main(argv=None):
     ap.add_argument("--expert-ff", type=int, default=0,
                     help="expert hidden width (0 = --ff)")
     ap.add_argument("--plain", default="",
-                    choices=["", "gptneox", "gptj", "phi2", "mpt", "bloom"],
+                    choices=["", "gptneox", "gptj", "phi2", "mpt", "bloom",
+                             "falcon"],
                     help="one of the plain pre-norm family layouts: a fused "
                          "attn_qkv (Q|K|V), LayerNorm, rotary positions and an "
                          "ungated GELU MLP")
+    ap.add_argument("--attn-norm-2-identity", action="store_true",
+                    help="write attn_norm_2 with attn_norm's weights, so the "
+                         "second parallel norm must be a no-op")
+    ap.add_argument("--attn-norm-2", action="store_true",
+                    help="emit Falcon-40B's second pre-attention norm")
     ap.add_argument("--qk-norm", action="store_true",
                     help="emit per-head attn_q_norm/attn_k_norm (some MPT "
                          "exports have them)")
@@ -673,7 +702,9 @@ def main(argv=None):
                  scale=a.scale, fused=a.phi3 or a.phi3_qkv_only,
                  fused_ffn=a.phi3 or a.phi3_ffn_only,
                  plain=a.plain or None, split_qkv=a.split_qkv,
-                 alibi=a.alibi, qk_norm=a.qk_norm)
+                 alibi=a.alibi, qk_norm=a.qk_norm,
+                 attn_norm_2=a.attn_norm_2 or a.attn_norm_2_identity,
+                 attn_norm_2_identity=a.attn_norm_2_identity)
     moe = ("%d experts top-%d, expert ff %d, " % (a.experts, used, ff_exp)
            if a.experts else "")
     print("wrote %s: %d layers, embd %d, %d/%d heads, hd %d, ff %d, %s"
