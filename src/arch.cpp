@@ -208,6 +208,117 @@ constexpr ArchSpec falcon_spec() {
     return s;
 }
 
+// ---- chatglm --------------------------------------------------------------
+// ChatGLM's transformer block is llama's: RMSNorm, rotary, SwiGLU. The one
+// difference that has to be declared is that its MLP is ONE fused
+// `ffn_up` projection whose row is gate | up (the reference's
+// `{ n_embd, n_ff * 2 }` with LLM_FFN_SWIGLU), so there is no `ffn_gate`
+// tensor in the file at all. Reading that tensor as a plain `up` would run an
+// ungated GELU over twice the intended width -- fluent, wrong, and the same
+// class of mistake Phi-3's fused projections had.
+constexpr ArchSpec chatglm_spec() {
+    ArchSpec s{"chatglm", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "llama", "", false, false, false, false};
+    s.fused_gate_up = true;
+    return s;
+}
+
+// ---- glm4 ------------------------------------------------------------------
+// GLM-4 keeps llama's body and adds a norm on EACH branch's OUTPUT:
+//
+//     x = x + post_attention_norm(attn(norm(x)))
+//     x = x + post_ffw_norm(ffn(norm(x + ...)))
+//
+// which is exactly gemma2's graph, so it rides the existing post_branch_norm
+// path rather than getting a new one. Its MLP is one fused `ffn_up`
+// (gate | up), and the NextN layers past `block_count` are skipped by the
+// reference's own loop -- this engine already ignores blocks past the layer
+// count, so that part needs nothing.
+constexpr ArchSpec glm4_spec() {
+    ArchSpec s{"glm4", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "llama", "", false, false, false, false};
+    s.fused_gate_up = true;
+    s.post_branch_norm = true;
+    return s;
+}
+
+// ---- mellum ----------------------------------------------------------------
+// Mellum is qwen3-MoE's schema: RMSNorm, per-head q/k norm, NeoX rotary, a
+// router plus routed experts. It differs in declaring a sliding window on a
+// 4-layer pattern (llama.cpp calls load_swa_pattern(ml, 4), i.e. period 4 with
+// the full-attention layer first -- this engine's historical default, so
+// swa_period only has to name the period).
+constexpr ArchSpec mellum_spec() {
+    ArchSpec s{"mellum", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target,
+               "qwen3", "", true, false, false, false};
+    s.rope_neox = true;
+    s.swa_period = 4;
+    return s;
+}
+
+// ---- phimoe ----------------------------------------------------------------
+// Phi-MoE is Phi-3's block with the FFN replaced by routed experts: the same
+// fused `attn_qkv`, the same RMSNorm-with-a-bias norms (which Phi-3 itself
+// carries as an optional tensor and Phi-MoE always does), an `attn_output.bias`
+// and an `output.bias` on the head. llama.cpp reuses phi3's graph for it, so
+// the only thing that has to change here is the shape and the two biases.
+constexpr ArchSpec phimoe_spec() {
+    ArchSpec s{"phimoe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target,
+               "phi3", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.fused_gate_up = true;
+    return s;
+}
+
+// ---- minicpm ---------------------------------------------------------------
+// MiniCPM (v1/v2) is llama's schema with a partial rotary and a scale on the
+// embedding (`scale_emb`), which llama.cpp applies as a multiply on the
+// embedding row. The tensor set is llama's, so the family is the llama one.
+constexpr ArchSpec minicpm_spec() {
+    ArchSpec s{"minicpm", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "llama", "", false, false, false, false};
+    return s;
+}
+
+// ---- qwen2vl ---------------------------------------------------------------
+// Qwen2-VL's TEXT tower is Qwen2: q/k/v biases, NeoX rotary, RMSNorm. The
+// vision tower and the multimodal projector are separate tensors this engine
+// never reads, so a text-only file runs and an image prompt is ignored --
+// the same bargain qwen3vl already makes.
+constexpr ArchSpec qwen2vl_spec() {
+    ArchSpec s{"qwen2vl", ArchShape::Dense, ArchSupport::Partial,
+               ArchRole::Target, "qwen2",
+               "the vision tower and multimodal projector are not read; images "
+               "are ignored and the text tower loads as qwen2",
+               false, false, true, false};
+    s.rope_neox = true;
+    return s;
+}
+
+// ---- qwen38 (an ALIAS, resolved by evidence) ------------------------------
+// There is no `qwen38` architecture in llama.cpp. "Qwen3.8" is the marketing
+// name for a family that llama.cpp converts as **`qwen4exp`**: the converter
+// registers `Qwen4ExpForCausalLM` / `Qwen4ExpForConditionalGeneration` with
+// `@ModelBase.example("Qwen/Qwen3.8-Flash-Next")`, and the arch string it
+// writes is `qwen4exp`. So a checkpoint labelled Qwen3.8 Flash IS qwen4exp,
+// which this engine already runs.
+//
+// That cuts both ways, which is why this row is a conservative default rather
+// than the answer. A DENSE Qwen3.8 carries no hyper-connections, no PLE table
+// and no indexer, so reading it as qwen4exp would demand metadata it does not
+// have -- and reading a Flash file as qwen3 would ignore the delta-net layers,
+// the 4-lane residual and the n-gram table. Neither string decides it; the
+// TENSORS do, so `assess_model` resolves the alias from what the file carries
+// (see kAliases in verdict.cpp) and this entry is only what a file with no
+// evidence at all falls back to: qwen3's geometry, which is the stack both
+// variants share.
+constexpr ArchSpec qwen38_spec() {
+    ArchSpec s{"qwen38", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "qwen3", "", true, false, false, false};
+    s.rope_neox = true;
+    return s;
+}
+
 constexpr ArchSpec kTable[] = {
     // ---- the schemas this engine runs ------------------------------------
     {"llama", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
@@ -221,6 +332,13 @@ constexpr ArchSpec kTable[] = {
     mpt_spec(),
     bloom_spec(),
     falcon_spec(),
+    chatglm_spec(),
+    glm4_spec(),
+    mellum_spec(),
+    phimoe_spec(),
+    minicpm_spec(),
+    qwen2vl_spec(),
+    qwen38_spec(),
     // GPT-2 and its descendants: LayerNorm (biased), learned absolute
     // positions, a fused attn_qkv, and a plain GELU MLP. See
     // ArchSpec::gpt2_style for why those four travel together.

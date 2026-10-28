@@ -478,6 +478,13 @@ struct ModelConfig {
     // from the packed query gate of Qwen3.5, which is a sigmoid off the query
     // projection rather than a separate tensor.
     bool attn_gate = false;
+    // The query projection packs a per-head output gate beside q (Qwen3.5,
+    // qwen4exp): the stored row is 2*n_head*head_dim, the q half first. It is
+    // geometry, so it lives here rather than being re-derived from the arch
+    // STRING at engine init -- see the note on q_proj_ in Engine::init. An
+    // aliased or unlisted label used to answer that question differently from
+    // the loader, which changes the graph instead of failing.
+    bool q_output_gate = false;
     // ---- qwen4exp (Qwen3.8-Flash-Next) -----------------------------------
     // The residual is `hc` lanes of n_embd, mixed through a low-rank bottleneck
     // (4 x 2560 through 320 on the REAP-288 file). `ple` is the n-gram hash
@@ -1013,6 +1020,11 @@ public:
     const f32 *embd_norm() const { return embd_norm_; }
     const f32 *embd_norm_bias() const { return embd_norm_bias_; }
     const f32 *out_norm() const { return out_norm_; }
+    // `output.bias`, one f32 per vocabulary row. Not every family has one --
+    // Phi-MoE does, and adds it to the logits after the head's projection, so a
+    // file that carries it with the tensor ignored gets every logit shifted by
+    // a per-token amount. Null when absent, like every other optional weight.
+    const f32 *out_bias() const { return out_bias_; }
     const f32 *out_norm_bias() const { return out_norm_bias_; }
     const QuantTensor &pos_embd() const { return pos_embd_; }
     // qwen4exp has no output_norm: the final hyper-connection mixer carries it,
@@ -1244,6 +1256,7 @@ private:
     f32 *embd_norm_ = nullptr;
     f32 *embd_norm_bias_ = nullptr;
     f32 *out_norm_ = nullptr;
+    f32 *out_bias_ = nullptr;
     // ---- GPT-2 -----------------------------------------------------------
     // Learned absolute position embeddings, [n_ctx_train, n_embd], added to
     // the token embedding before the first block. Held in its original dtype

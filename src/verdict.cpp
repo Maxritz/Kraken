@@ -56,6 +56,38 @@ std::string ModelVerdict::headline() const {
     return name + " — not supported";
 }
 
+namespace {
+
+// An arch string whose SCHEMA is decided by the file's tensors. `probes` are
+// checked in order; the first tensor the file actually has picks the schema.
+// Written as data rather than as an if-chain because the next alias (there will
+// be one: every renamed checkpoint is a candidate) is then a row, not a branch.
+struct ArchAlias {
+    const char *name;
+    struct Probe {
+        const char *tensor;
+        const char *schema;
+    };
+    std::vector<Probe> probes;
+};
+
+// qwen38: "Qwen3.8" is llama.cpp's `qwen4exp` (the Qwen3.8-Flash-Next family)
+// for the sparse/flash variants and a plain qwen3 stack for the dense ones.
+// `ssm_conv1d` and the hyper-connection inject tensors exist only on the former;
+// `blk.0.attn_qkv.weight` alone says nothing, so it is not probed.
+const std::vector<ArchAlias> kAliases = {
+    {"qwen38",
+     {{"blk.0.hc_attn_inject.weight", "qwen4exp"},
+      {"blk.0.hc_ffn_inject.weight", "qwen4exp"},
+      {"per_layer_token_embd.weight", "qwen4exp"},
+      {"blk.0.ssm_conv1d.weight", "qwen4exp"},
+      {"blk.0.indexer.q_norm.weight", "qwen4exp"},
+      {"blk.0.attn_q_norm.weight", "qwen38"},
+      {"blk.0.attn_q.weight", "qwen38"}}},
+};
+
+} // namespace
+
 ModelVerdict assess_model(const Gguf &g) {
     ModelVerdict v;
     v.arch = g.get_str("general.architecture");
@@ -77,7 +109,43 @@ ModelVerdict assess_model(const Gguf &g) {
             }
         }
     }
-    v.spec = &arch_spec(v.arch, &v.known);
+    // ---- alias resolution, from the file rather than from the string -------
+    // Some arch strings name a family whose SCHEMA depends on the variant, and
+    // the label alone cannot say which. "Qwen3.8" is the case that forced this:
+    // llama.cpp converts Qwen3.8-Flash as `qwen4exp` (its converter registers
+    // Qwen4ExpForCausalLM with Qwen/Qwen3.8-Flash-Next as the example), and a
+    // dense Qwen3.8 has none of qwen4exp's parts. Reading the tag as either one
+    // unconditionally is wrong for the other half of the family -- as qwen4exp
+    // it demands hyper-connection metadata a dense file does not have, as qwen3
+    // it silently ignores the delta-net layers, the 4-lane residual and the
+    // n-gram table of a Flash file.
+    //
+    // So the alias is resolved from what the file CARRIES. This is the same
+    // rule the qk_norm width decision follows: when two schemas are both
+    // plausible from the label, the tensors decide, and the note says which way
+    // it went so the choice is never invisible.
+    // Only the SCHEMA is decided here; the rest of the assessment runs on it
+    // exactly as it would for a file that named the schema itself. (An early
+    // return from this block skipped every check below it, which made an
+    // aliased file report "refused" with no blocker and no reason.)
+    bool aliased = false;
+    for (const ArchAlias &al : kAliases) {
+        if (v.arch != al.name) continue;
+        for (const ArchAlias::Probe &pr : al.probes) {
+            if (!g.tensor(pr.tensor)) continue;
+            const ArchSpec *target = arch_lookup(pr.schema);
+            if (!target || pr.schema == al.name) break; // no evidence either way
+            v.spec = target;
+            v.known = true;
+            aliased = true;
+            add_unique(v.notes, std::string("'") + al.name + "' is an alias: " +
+                                    "the file carries " + pr.tensor +
+                                    ", so it is read as '" + pr.schema + "'");
+            break;
+        }
+        break;
+    }
+    if (!aliased) v.spec = &arch_spec(v.arch, &v.known);
 
     if (v.arch.empty()) {
         add_unique(v.notes,

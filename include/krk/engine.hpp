@@ -760,6 +760,13 @@ private:
     // non-NVFP4 file.
     void gemm_w(void *dst, const void *x, const QuantTensor &w, i64 n_out,
                 i64 n_in, i64 rows);
+    // The vocabulary head, one row: the projection plus the head's own bias
+    // (`output.bias`) when the file carries one. Every path that forms logits
+    // goes through here so the bias cannot be present on one and missing on
+    // another -- the device top-k, the host sampling path and the MTP probe all
+    // read the same ws_logits_ buffer, and a bias applied after the download
+    // would leave the device argmax choosing from a different distribution.
+    void logit_head(const void *xn);
     // ---- qwen4exp hyper-connections --------------------------------------
     // The lane stack replaces the single residual stream: each sub-block is
     // bracketed by a mix (lanes -> one row, left in ws_xn_ AND ws_x_) and a

@@ -1119,6 +1119,51 @@ and the refusal list, is in [docs/MODEL-STATUS.md](docs/MODEL-STATUS.md) and
 * `scripts/` holds the gates (`build_check.sh`, `kraken_tests_baseline_check.sh`,
   `coherence_check.sh`) and the benchmark harnesses.
 
+### llama's schema with a piece swapped: six families, and one alias
+
+Six architectures that were refused are llama's own tensor set with one or two
+parts exchanged, which is why they cost a flag each rather than a graph:
+`chatglm` (one fused `ffn_up` whose row is gate | up), `glm4` (that MLP plus a
+norm on each branch's output before the residual), `mellum` (qwen3-MoE with a
+4-layer sliding-window pattern and softmax gating), `phimoe` (Phi-3's block with
+routed experts and `output.bias` on the logits), `minicpm` (partial rotary) and
+`qwen2vl` (the text tower of the MiniCPM-V family, with q/k/v biases).
+
+Two of them needed something real. `glm4` reuses the gemma post-branch norm,
+which is a different function from norming the residual sum. `phimoe` adds a
+per-vocabulary bias to the logits, and the device top-k reads the logits buffer
+without ever touching the host copy — so the bias has to land in the buffer.
+That is now `Engine::logit_head()`, the single place the vocabulary head is
+formed; six call sites used to build it inline, and a bias added at one would
+have been missing at the other five.
+
+The seventh, **`qwen38`, is an alias and not a schema.** llama.cpp has no such
+architecture; `Qwen3.8-Flash-Next` converts as **`qwen4exp`**
+(`conversion/qwen4exp.py` registers `Qwen4ExpForCausalLM` with that exact
+`.example()`). But the name cannot pick the schema either, because the family
+has a sparse Flash form — hyper-connections, a 4-lane residual, a PLE n-gram
+table, a QSA indexer, a 288-expert MoE — and a dense one with none of it. So the
+alias probes the file: any `hc_*_inject` / `per_layer_token_embd` / `ssm_conv1d` /
+`indexer.q_norm` tensor and it is read as `qwen4exp`; otherwise as qwen3
+geometry. The verdict prints which way it went.
+
+Writing the test for that found a live bug. `Engine::init` sized the query
+projection with `arch_spec(mc.arch).q_output_gate` — asking the table **by
+name** — while the loader had already bound the packed row from the resolved
+spec. For a file whose name is an alias the two disagree, and the engine decoded
+a different model with no error anywhere. The flag now travels on `ModelConfig`,
+copied from the resolved spec. The general rule: **the engine must never
+re-derive geometry from `general.architecture`**, because after alias resolution
+or a format fallback the name is no longer the authority.
+
+Seven fixtures, all seven run; `minicpm` reproduces `chatglm`'s logits with no
+fusing at all, and `--split-ffn` reproduces them from split tensors, which is a
+third independent check on the same equivalence. `--out-bias` was added to the
+fixture generator to prove the Phi-MoE bias is read — and on the first attempt it
+proved it was **not**, because the load sat inside `if (cfg_.ln_bias)` and Phi-MoE
+is an RMSNorm family that never enters that branch. `kraken-tests` 5500/5500.
+See [docs/LLAMA-SCHEMA-VARIANTS.md](docs/LLAMA-SCHEMA-VARIANTS.md).
+
 ### Fused projections: Phi-3 / Phi-4
 
 `phi3` is now a supported architecture. Phi-3 and Phi-4 store two fused

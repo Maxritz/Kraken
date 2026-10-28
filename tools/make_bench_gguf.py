@@ -376,7 +376,8 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
           arch="llama", n_expert=0, n_expert_used=0, n_ff_exp=0, scale=0.04,
           fused=False, fused_ffn=None, plain=None, split_qkv=False,
           alibi=8.0, qk_norm=False, attn_norm_2=False,
-          attn_norm_2_identity=False):
+          attn_norm_2_identity=False, schema=None, split_ffn=False,
+          out_bias=0.0):
     # `fused` is the Q|K|V projection, `fused_ffn` the gate|up one; a Phi file
     # has both, and the two are separable so a test can fuse one at a time and
     # find which of them changed the logits.
@@ -385,17 +386,37 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
     # The plain pre-norm family. `biases` is true for the members that carry a
     # bias beside every weight (gptneox, phi2); GPT-J has none anywhere.
     biases = plain in ("gptneox", "phi2", "mpt", "bloom")
-    # Falcon is the one family with norm biases and NO linear biases: every
-    # LayerNorm carries one, no projection does.
-    norm_bias = biases or plain == "falcon"
-    # Falcon has a single norm per layer under the name attn_norm; the FFN arm
-    # reads it too, so no ffn_norm tensor exists in the file at all.
-    has_ffn_norm = plain != "falcon"
     rnd = random.Random(seed)
     q_dim, kv_dim = n_head * hd, n_kv * hd
     moe = n_expert > 0
     assert arch in ("llama", "phi3", "gptneox", "gptj", "phi2", "mpt",
-                    "bloom", "falcon") or arch == "qwen3moe", arch
+                    "bloom", "falcon", "chatglm", "glm4", "mellum", "phimoe",
+                    "minicpm", "qwen2vl", "qwen38") or arch == "qwen3moe", arch
+
+    # ---- llama-schema variants --------------------------------------------
+    # These are llama's tensor set with one or two pieces swapped, which is the
+    # whole reason they are cheap to support: the pieces already exist. Each
+    # flag below names the piece, and the arch string only says which of them a
+    # file of that family carries.
+    if schema:
+        arch = schema
+    s_fused_ffn = schema in ("chatglm", "glm4")
+    s_post_norms = schema == "glm4"
+    s_qk_norm = schema in ("mellum", "qwen38") or qk_norm
+    s_qkv_bias = schema == "qwen2vl"
+    s_wo_bias = schema == "phimoe"
+    s_out_bias = schema == "phimoe"
+    s_norm_bias = schema == "phimoe"
+    s_swa = schema == "mellum"
+    if s_fused_ffn:
+        fused_ffn = True
+    # Falcon is the one family with norm biases and NO linear biases: every
+    # LayerNorm carries one, no projection does. Phi-MoE is the RMSNorm version
+    # of the same statement -- a bias beside each norm, and one on the head.
+    norm_bias = biases or plain == "falcon" or s_norm_bias
+    # Falcon has a single norm per layer under the name attn_norm; the FFN arm
+    # reads it too, so no ffn_norm tensor exists in the file at all.
+    has_ffn_norm = plain != "falcon"
     assert not moe or (n_ff_exp > 0 and 0 < n_expert_used <= n_expert)
 
     tokens = ["<unk>", "<s>", "</s>"]
@@ -434,6 +455,15 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
         # carries the 8.0 constant instead), so only MPT writes the key here.
         g.f32(arch + ".attention.max_alibi_bias", alibi)
     g.f32(arch + ".rope.freq_base", 10000.0)
+    if s_swa:
+        # Mellum declares a sliding window and llama.cpp patterns it every 4
+        # layers with the full-attention layer first.
+        g.u32(arch + ".attention.sliding_window", 32)
+    if schema in ("mellum", "phimoe"):
+        # Mellum normalizes the surviving experts' weights (its loader defaults
+        # it true); both are read from the file, so the fixture declares them
+        # rather than relying on this engine's legacy defaults.
+        g.boolean(arch + ".expert_weights_norm", True)
     if moe:
         g.u32(arch + ".expert_count", n_expert)
         g.u32(arch + ".expert_used_count", n_expert_used)
@@ -526,8 +556,16 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
         ones("token_embd_norm.weight", n_embd)
         zeros("token_embd_norm.bias", n_embd)
     ones("output_norm.weight", n_embd)
+    if s_out_bias:
+        # Phi-MoE's head bias: one value per vocabulary row, added to the logits
+        # after the projection. Nonzero on request so "the bias is read" can be
+        # told apart from "the bias is ignored" without a second fixture.
+        g.tensor("output.bias", vocab, 1,
+                 struct.pack("<%df" % vocab,
+                             *[out_bias * (1.0 if i % 3 else -1.0)
+                               for i in range(vocab)]), T_F32)
     w("output.weight", n_embd, vocab)
-    if plain:
+    if plain or s_norm_bias:
         # LayerNorm on the way out, with its bias -- a LayerNorm run without
         # its bias keeps each row's mean, which shifts every logit.
         if norm_bias:
@@ -535,13 +573,23 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
     for l in range(n_layer):
         p = "blk.%d." % l
         ones(p + "attn_norm.weight", n_embd)
-        if qk_norm:
+        if s_norm_bias:
+            zeros(p + "attn_norm.bias", n_embd)
+        if s_post_norms:
+            # GLM-4 normalizes each branch's OUTPUT, with its own weight.
+            # A ramp, not ones, so the norm is visible in the logits.
+            ramp(p + "post_attention_norm.weight", n_embd)
+        if qk_norm or s_qk_norm:
             # Some MPT exports carry these and some do not -- optional in the
             # reference loader, and the file decides.
             ramp(p + "attn_q_norm.weight", hd)
             ramp(p + "attn_k_norm.weight", hd)
         if has_ffn_norm:
             ones(p + "ffn_norm.weight", n_embd)
+            if s_norm_bias:
+                zeros(p + "ffn_norm.bias", n_embd)
+        if s_post_norms:
+            ramp(p + "post_ffw_norm.weight", n_embd)
         if attn_norm_2:
             # Falcon-40B's second pre-attention norm. A ramp, not ones: it has
             # to be visible in the logits or "the engine read it" cannot be
@@ -560,14 +608,14 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
             zeros(p + "attn_norm.bias", n_embd)
             if has_ffn_norm:
                 zeros(p + "ffn_norm.bias", n_embd)
-        if fused or (plain and not split_qkv):
+        if fused or (plain and not split_qkv) or schema == "phimoe":
             # Phi-3 and the plain family: Q | K | V in one projection, and
             # under GQA the K and V blocks are kv_dim wide, not n_embd --
             # drawn q, k, v in that order so the stream matches the split
             # file's.
             w_cat(p + "attn_qkv.weight",
                   [(n_embd, q_dim), (n_embd, kv_dim), (n_embd, kv_dim)])
-            if biases:
+            if biases or s_qkv_bias:
                 g.tensor(p + "attn_qkv.bias", q_dim + 2 * kv_dim, 1,
                          struct.pack("<%df" % (q_dim + 2 * kv_dim),
                                      *[0.01 * (i % 7 - 3)
@@ -577,7 +625,7 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
             w(p + "attn_q.weight", n_embd, q_dim)
             w(p + "attn_k.weight", n_embd, kv_dim)
             w(p + "attn_v.weight", n_embd, kv_dim)
-            if biases:
+            if biases or s_qkv_bias:
                 # The SAME bias the fused file carries, cut at the same
                 # offsets -- the pattern keeps running across the parts instead
                 # of restarting, so a split file and a fused file are the same
@@ -591,7 +639,7 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
                                            for i in range(wd)]), T_F32)
                     boff += wd
         w(p + "attn_output.weight", q_dim, n_embd)
-        if biases:
+        if biases or s_wo_bias:
             zeros(p + "attn_output.bias", n_embd)
         if moe:
             # Router projection, then the three stacked expert tensors. An
@@ -602,15 +650,17 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
             ws(p + "ffn_up_exps.weight", n_embd, n_ff_exp, n_expert)
             ws(p + "ffn_down_exps.weight", n_ff_exp, n_embd, n_expert)
         else:
-            if fused_ffn:
+            if fused_ffn and not split_ffn:
                 # gate | up in one row, gate first (drawn gate-then-up).
                 w_cat(p + "ffn_up.weight", [(n_embd, n_ff), (n_embd, n_ff)])
-            elif plain:
+            elif plain and not split_ffn:
                 # Ungated MLP: one up projection and no ffn_gate tensor at all.
                 w(p + "ffn_up.weight", n_embd, n_ff)
                 if biases:
                     zeros(p + "ffn_up.bias", n_ff)
             else:
+                # Drawn gate-then-up, the same order the fused row uses, so a
+                # split file of a fused family holds the same numbers.
                 w(p + "ffn_gate.weight", n_embd, n_ff)
                 w(p + "ffn_up.weight", n_embd, n_ff)
                 if biases:
@@ -645,6 +695,20 @@ def main(argv=None):
                     help="experts routed per token (0 = 2)")
     ap.add_argument("--expert-ff", type=int, default=0,
                     help="expert hidden width (0 = --ff)")
+    ap.add_argument("--out-bias", type=float, default=0.0,
+                    help="value of output.bias on a phimoe file (0 writes zeros)")
+    ap.add_argument("--split-ffn", action="store_true",
+                    help="with --schema chatglm: store ffn_gate and ffn_up "
+                         "separately instead of the fused gate|up row, on the "
+                         "same weight stream, so the two layouts must match")
+    ap.add_argument("--schema", default="",
+                    choices=["", "chatglm", "glm4", "mellum", "phimoe",
+                             "minicpm", "qwen2vl", "qwen38"],
+                    help="write a llama-schema variant: chatglm/glm4 fuse the "
+                         "gate|up MLP (glm4 also normalizes each branch), "
+                         "mellum is qwen3-MoE with qk-norm and a sliding "
+                         "window, phimoe is phi3's block with routed experts "
+                         "and two head biases, qwen38 is the qwen3 stack")
     ap.add_argument("--plain", default="",
                     choices=["", "gptneox", "gptj", "phi2", "mpt", "bloom",
                              "falcon"],
@@ -694,17 +758,20 @@ def main(argv=None):
 
     size = build(a.out, a.embd, a.layers, heads, kv_heads, a.head_dim, ff,
                  a.vocab, a.ctx, a.format, a.seed,
-                 arch="qwen3moe" if a.experts
+                 arch=(a.schema or "qwen3moe") if (a.experts and not a.schema)
+                 else ("qwen3moe" if a.experts
                  else (a.plain or
                        ("phi3" if (a.phi3 or a.phi3_qkv_only or a.phi3_ffn_only)
-                        else "llama")),
+                        else "llama"))),
                  n_expert=a.experts, n_expert_used=used, n_ff_exp=ff_exp,
                  scale=a.scale, fused=a.phi3 or a.phi3_qkv_only,
                  fused_ffn=a.phi3 or a.phi3_ffn_only,
                  plain=a.plain or None, split_qkv=a.split_qkv,
                  alibi=a.alibi, qk_norm=a.qk_norm,
                  attn_norm_2=a.attn_norm_2 or a.attn_norm_2_identity,
-                 attn_norm_2_identity=a.attn_norm_2_identity)
+                 attn_norm_2_identity=a.attn_norm_2_identity,
+                 schema=a.schema or None, split_ffn=a.split_ffn,
+                 out_bias=a.out_bias)
     moe = ("%d experts top-%d, expert ff %d, " % (a.experts, used, ff_exp)
            if a.experts else "")
     print("wrote %s: %d layers, embd %d, %d/%d heads, hd %d, ff %d, %s"

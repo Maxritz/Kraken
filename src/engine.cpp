@@ -1041,7 +1041,13 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // engine splits the two apart.
     // The arch table owns this rule; the engine only mirrors it (see
     // include/krk/arch.hpp for why it lives in one place).
-    q_proj_ = arch_spec(mc.arch).q_output_gate ? 2 * q_dim_ : q_dim_;
+    // From the RESOLVED spec's own flag, not from arch_spec(mc.arch): an arch
+    // that is an alias (qwen38 -> qwen4exp, decided from the file's tensors)
+    // carries a different spec than its name does, and asking by name here
+    // silently halved the query width on a file whose q row is packed. The
+    // loader had already read the packed row, so the two disagreed and the
+    // graph decoded a different model.
+    q_proj_ = mc.q_output_gate ? 2 * q_dim_ : q_dim_;
     conv_dim_ = model_.conv_dim();
     value_dim_ = model_.value_dim();
     n_vocab_ = mc.n_vocab;
@@ -2980,7 +2986,7 @@ void Engine::head_compute(i32 row) {
         had_xform(ws_had_, ws_xn_, 1, n_embd_, false, false);
         xn = ws_had_;
     }
-    gemm_w(ws_logits_, xn, head, n_vocab_, n_embd_, 1);
+    logit_head(xn);
 }
 
 // GPT-2's forward: a clean loop, because its graph is a different shape rather
@@ -3274,7 +3280,7 @@ bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
     const i32 row = n - 1;
     layernorm(ws_xn_, act_at(ws_x_, be_->act_size(), static_cast<i64>(row) * E),
               model_.out_norm(), model_.out_norm_bias(), 1, E, eps);
-    gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, E, 1);
+    logit_head(ws_xn_);
     return true;
 }
 
@@ -3939,6 +3945,15 @@ void Engine::gemm_w(void *dst, const void *x, const QuantTensor &w, i64 n_out,
     be_->gemm(dst, ws_gs_, w.data, w.type, n_out, n_in, rows);
 }
 
+void Engine::logit_head(const void *xn) {
+    gemm_w(ws_logits_, xn, model_.out_head(), n_vocab_, n_embd_, 1);
+    // Phi-MoE's `output.bias`. Adding it on the device keeps the buffer the
+    // single source of truth: topk_argmax() reads ws_logits_ directly and never
+    // sees the host copy.
+    if (const f32 *b = model_.out_bias())
+        be_->add_bias_rows(ws_logits_, b, n_vocab_, 1);
+}
+
 void Engine::gemm_residual(void *dst, const void *x, const void *w, DType wt,
                            i64 n_out, i64 n_in, i64 rows, void *scratch, f32 gs) {
     // `rexp` goes down both paths: `dst` is the residual stream, so the
@@ -4569,7 +4584,7 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
         const u64 th0 = now_us();
         be_->rmsnorm(ws_xn_, ws_x_, m.shared_head_norm, 1, n_embd_, mc.rms_eps);
         const QuantTensor &head = model_.out_head();
-        gemm_w(ws_logits_, ws_xn_, head, n_vocab_, n_embd_, 1);
+        logit_head(ws_xn_);
         if (hsplit) {
             be_->sync();
             prop_head_ms_ += static_cast<f64>(now_us() - th0) / 1000.0;
@@ -4714,7 +4729,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
                 // The same head, twice: once on the block's row, once on the
                 // stack's. rmsnorm is scale-invariant, so a row that is merely
                 // scaled differently still competes fairly here.                be_->rmsnorm(ws_xn_, ws_x_, model_.out_norm(), 1, n_embd_, mc.rms_eps);
-                gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, n_embd_, 1);
+                logit_head(ws_xn_);
                 be_->download_f32(logits_host_, ws_logits_, n_vocab_);
                 const i32 blk_rank =
                     rank_of_token(logits_host_, n_vocab_, nxt, mc.logit_softcap);
@@ -4722,8 +4737,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
                 if (!last_row) {
                     be_->rmsnorm(ws_xn_, cap_row, model_.out_norm(), 1, n_embd_,
                                  mc.rms_eps);
-                    gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, n_embd_,
-                           1);
+                    logit_head(ws_xn_);
                     be_->download_f32(logits_host_, ws_logits_, n_vocab_);
                     cap_rank =
                         rank_of_token(logits_host_, n_vocab_, nxt, mc.logit_softcap);
@@ -4732,8 +4746,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
                     // output is what the probe (and the caller) reads next.
                     be_->rmsnorm(ws_xn_, ws_x_, m.shared_head_norm, 1, n_embd_,
                                  mc.rms_eps);
-                    gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, n_embd_,
-                           1);
+                    logit_head(ws_xn_);
                 }
                 rowfid_pos_.push_back(p);
                 rowfid_cos_.push_back(cos);
@@ -4784,7 +4797,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
             had_xform(ws_had_, ws_xn_, 1, n_embd_, false, false);
             xn = ws_had_;
         }
-        gemm_w(ws_logits_, xn, model_.out_head(), n_vocab_, n_embd_, 1);
+        logit_head(xn);
         r.capture_id = read_argmax(&r.capture_logit);
         std::memcpy(logits_host_, keep.data(),
                     static_cast<size_t>(n_vocab_) * sizeof(f32));

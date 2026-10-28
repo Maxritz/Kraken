@@ -294,6 +294,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // The attention output gate is a property of the schema, not of a tensor:
     // the loader has to know to look for it before the layer loop starts.
     cfg_.attn_gate = aspec.attn_gate;
+    cfg_.q_output_gate = aspec.q_output_gate;
     // muse-glimmer gates with a sigmoid where laguna gates with a softplus.
     cfg_.attn_gate_sigmoid = aspec.attn_gate_sigmoid;
     // Per-branch post norms, and the GeGLU FFN that comes with the gemma stack.
@@ -1417,6 +1418,13 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             }
         }
     }
+
+    // The head bias (`output.bias`, Phi-MoE). It belongs OUTSIDE the LayerNorm
+    // branch above: Phi-MoE is an RMSNorm family, so a load placed inside
+    // `if (cfg_.ln_bias)` never ran and the bias was silently dropped. The A/B
+    // that caught it is a file with a nonzero bias whose logits did not move by
+    // a single digit. Optional everywhere: no other family writes one.
+    if (!out_bias_) out_bias_ = upload_f32("output.bias");
 
     if (cfg_.ple) {
         const GgufTensor *t = gguf_.tensor("per_layer_token_embd.weight");
@@ -4106,6 +4114,10 @@ bool Model::stage_layer_now(i32 l, const std::vector<StreamEntry> &es) {
 
 void Model::unload() {
     if (!be_) return;
+    if (out_bias_) {
+        be_->release(out_bias_);
+        out_bias_ = nullptr;
+    }
     // The expert cache owns backend allocations too; drop them first.
     experts_.clear();
     for (auto &L : layers_) {

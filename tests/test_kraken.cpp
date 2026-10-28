@@ -13301,7 +13301,8 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
                                 bool identical_inject = false,
                                 bool qsa = true,
                                 bool half_indexer = false,
-                                bool perturb_ple = false) {
+                                bool perturb_ple = false,
+                                const char *arch_override = nullptr) {
     // The two numbers the forward test scales up to the real file's shape: four
     // lanes of 2560, mixed through a 32-wide bottleneck (the REAP-288 file
     // mixes through 320; 32 keeps the fixture a few MB instead of 100).
@@ -13334,7 +13335,10 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
     // the whole wide stream: those numbers have to meet, which is why the
     // fixture's head_dim is the lane width and not a small stand-in.
     const int ple_dim = n_embd, ple_heads = 1, ple_rows = 8, ple_conv = 2;
-    const std::string arch = "qwen4exp";
+    // The arch string is normally the real one; a caller can re-tag the same
+    // bytes to test what the label does to the verdict (see
+    // test_qwen38_is_an_alias).
+    const std::string arch = arch_override ? arch_override : "qwen4exp";
 
     GgufBuilder b;
     b.meta_str("general.architecture", arch);
@@ -16792,6 +16796,84 @@ static bool dump_row_of(const std::string &file, const char *what, i32 layer,
 //      bit-exact inside the ladder, which is what a 2-token prompt sits on);
 //   5. a perturbed PLE table gives a DIFFERENT sequence (the pin can fail, and it
 //      fails on the module whose bug this family actually had).
+// "Qwen3.8" is not an architecture in llama.cpp: its converter registers
+// Qwen4ExpForCausalLM with Qwen/Qwen3.8-Flash-Next as the example, so a Qwen3.8
+// Flash checkpoint IS qwen4exp. A DENSE Qwen3.8 is a plain qwen3 stack. The
+// label therefore cannot decide the schema -- the tensors have to.
+//
+// This is the test for that, and it is an equality: the SAME bytes written under
+// the two labels must produce the same logits. If the alias resolved a qwen4exp
+// file to the qwen3 schema the hyper-connection, PLE and indexer tensors would
+// be ignored and the numbers would move; if it resolved to qwen4exp but read the
+// metadata as though the file were sparse-only it would refuse the load.
+static void test_qwen38_is_an_alias() {
+    const std::string real = "kraken-q38-qwen4exp.gguf";
+    const std::string tagged = "kraken-q38-tagged.gguf";
+    CHECK(build_tiny_q4_model(real, 0), "wrote the qwen4exp fixture");
+    CHECK(build_tiny_q4_model(tagged, 0, 0, 0, true, false, true, false, false,
+                              "qwen38"),
+          "wrote the same bytes under the qwen38 label");
+
+    // The verdict has to resolve the alias from the tensors and SAY so.
+    {
+        Gguf g;
+        std::string err;
+        CHECK(g.load(tagged, &err), "the aliased file parses");
+        const ModelVerdict v = assess_model(g);
+        CHECK(v.runnable, "and is runnable");
+        CHECK(v.spec != nullptr && std::string(v.spec->name) == "qwen4exp",
+              "the file carries hyper-connection tensors, so it resolves to "
+              "qwen4exp rather than to the qwen3 fallback");
+        bool named = false;
+        for (const std::string &n : v.notes)
+            if (n.find("alias") != std::string::npos &&
+                n.find("qwen4exp") != std::string::npos)
+                named = true;
+        CHECK(named, "and the note names the schema it resolved to");
+        Gguf g2;
+        CHECK(g2.load(real, &err), "the honestly-labelled file parses");
+        const ModelVerdict v2 = assess_model(g2);
+        CHECK(v2.runnable && std::string(v2.spec->name) == "qwen4exp",
+              "the honest label resolves to the same schema");
+    }
+
+    // Same weights, same graph, same answer -- through the engine.
+    Backend *be = make_cpu_backend();
+    auto greedy = [&](const std::string &path, std::vector<i32> &toks,
+                      std::vector<f32> &lg, std::string &err) {
+        EngineConfig c;
+        c.model_path = path;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        Engine e;
+        if (!e.init(be, c, &err)) return false;
+        GenerateParams gp;
+        gp.prompt = "the";
+        gp.max_tokens = 4;
+        gp.sampler.temp = 0.0f; // greedy: the comparison is the token, not a draw
+        GenerateResult r;
+        if (!e.generate(gp, &r)) return false;
+        toks = r.tokens;
+        lg.assign(e.last_logits(), e.last_logits() + e.model().cfg().n_vocab);
+        return true;
+    };
+    std::vector<i32> ta, tb;
+    std::vector<f32> la, lb;
+    std::string ea, eb;
+    const bool oka = greedy(real, ta, la, ea);
+    const bool okb = greedy(tagged, tb, lb, eb);
+    if (!oka) std::fprintf(stderr, "  (qwen4exp: %s)\n", ea.c_str());
+    if (!okb) std::fprintf(stderr, "  (tagged: %s)\n", eb.c_str());
+    CHECK(oka && okb, "both labels generate");
+    if (oka && okb) {
+        CHECK(tb == ta, "the aliased file produces the same greedy tokens");
+        CHECK(lb == la, "and the identical logits, to the bit");
+    }
+    delete be;
+    std::remove(real.c_str());
+    std::remove(tagged.c_str());
+}
+
 static void test_qwen4exp_whole_graph() {
     const std::string path = "kraken-q4whole.gguf";
     const std::string pert = "kraken-q4whole-pert.gguf";
@@ -18962,6 +19044,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_ple_hash)
     TEST_GROUP(test_qwen4exp_schema)
     TEST_GROUP(test_qwen4exp_forward)
+    TEST_GROUP(test_qwen38_is_an_alias)
     TEST_GROUP(test_qwen4exp_whole_graph)
     TEST_GROUP(test_qwen4exp_gdn_gate)
     TEST_GROUP(test_qwen4exp_hc_mix)

@@ -17,8 +17,9 @@ So "unsupported" (refused) and "supported but dequantizing" are different
 problems. The second is the bigger one numerically, the first is the one that
 stops a model running.
 
-**Update:** `phi3` (Phi-3, Phi-4), `gptneox`, `gptj`, `phi2`, `mpt`, `bloom` and
-`falcon` are now supported — see `docs/PHI3-FUSED-PROJECTIONS.md` and
+**Update:** `phi3` (Phi-3, Phi-4), `gptneox`, `gptj`, `phi2`, `mpt`, `bloom`,
+`falcon`, `chatglm`, `glm4`, `mellum`, `phimoe`, `minicpm`, `qwen2vl` and
+`qwen38` are now supported — see `docs/PHI3-FUSED-PROJECTIONS.md` and
 `docs/PLAIN-PRENORM-FAMILY.md`. That clears Phi-3-mini, Phi-4-reasoning-plus and
 adds six of the GGUF spec's own "known values" architectures — `mpt` and
 `bloom` bring ALiBi, `falcon` a parallel branch with two norms — see
@@ -41,22 +42,22 @@ the format has no kernel. `REFUSED` = no arch.
 |---|---|---|---|
 | Firefly-v5.Q4_K_M | llama¹ | Q4_K | FAST |
 | gemma-4-E4B-it-Q4_K_M | **gemma4** ✓ | Q4_K | FAST |
-| **GLM-4.7-Flash-Q4_K_M** | **glm4 — absent** | Q4_K | **REFUSED** |
+| GLM-4.7-Flash-Q4_K_M | `glm4` ✓ | Q4_K | FAST |
 | L3.2-8X3B-MOE-…-Q8_0 | llama-moe² | Q8_0 | FAST if ² |
 | Llama-3.2-1B-4B-Quad-MoE.Q4_K_M | llama-moe² | Q4_K | FAST if ² |
 | Llama-3.2-1B-Instruct-Q8_0 | llama ✓ | Q8_0 | FAST |
 | Mellum2.1-12B-A2.5B-Q4_K_M | llama/qwen3? ² | Q4_K | FAST if ² |
-| **MiniCPM-V-4_6-Q8_0** | **minicpmv/qwen2vl — absent** | Q8_0 | **REFUSED** |
+| MiniCPM-V-4_6-Q8_0 | `qwen2vl`/`minicpm` ✓ (text tower) | Q8_0 | FAST (text) |
 | MiniCPM5-1B-Q8_0 | llama¹ | Q8_0 | FAST |
 | MiniCPM5-1B.i1-Q6_K | llama¹ | Q6_K | FAST |
-| **Phi-3-mini-4k-instruct-q4** | **phi3 — absent** | Q4_0 | **REFUSED** |
-| **Phi-4-reasoning-plus-Q3_K_M** | **phi3 — absent** | Q3_K | **REFUSED** |
+| Phi-3-mini-4k-instruct-q4 | `phi3` ✓ | Q4_0 | **DEQUANT** (no Q4_0 dot) |
+| Phi-4-reasoning-plus-Q3_K_M | `phi3` ✓ | Q3_K | **DEQUANT** (no Q3_K dot) |
 | qwen2.5-0.5b-instruct-q2_k | qwen2 ✓ | **Q2_K** | **DEQUANT** |
 | Qwen2.5-1.5B-MoE-A0.9B-Q4_K_M | qwen2-moe ² | Q4_K | FAST if ² |
 | Qwen3.5-35B-A3B-UD-Q4_K_XL | qwen35moe ✓ | Q4_K | FAST |
 | Qwen3.5-9B-Q4_K_M | qwen35 ✓ | Q4_K | FAST |
-| **Qwen3.8-4B-Q4_K_M** | **qwen38 — absent** ³ | Q4_K | **REFUSED** if the file says qwen38 |
-| **qwen3.8-flash-next-reap-288-Q4_K_M** | **qwen38 — absent** ³ | Q4_K | **REFUSED** if qwen38 |
+| Qwen3.8-4B-Q4_K_M | `qwen38` → qwen3 (alias, no hc tensors) | Q4_K | FAST |
+| qwen3.8-flash-next-reap-288-Q4_K_M | `qwen38` → **qwen4exp** (alias, by its hc tensors) | Q4_K | FAST |
 | smollm-135m-instruct-add-basics-q8_0 | llama ✓ | Q8_0 | FAST |
 | Ternary-Bonsai-2-27B-…-PTQ1_0-MTP-Q4_0 | llama¹ | **PTQ1_0 + Q4_0** | **DEQUANT** (both) |
 | Ternary-Bonsai-2-2B-PTQ1_0 | llama¹ | **PTQ1_0** | **DEQUANT** |
@@ -77,9 +78,18 @@ against the files.
 says `llama` but carries `ffn_*_exps` tensors, `arch_tensor_gap` decides — it
 looks for implemented computations by tensor name, so this either runs or is
 refused with a named blocker rather than mis-loading.
-³ `qwen38` is not in the table at all. If these files declare `qwen38` they are
-refused; if they declare `qwen3`/`qwen35`, they run. **This is the one entry that
-needs a file to settle** — it is 2 of the 30 and cannot be answered by reading
+³ **Settled: `qwen38` is an alias, not a schema.** llama.cpp has no such arch
+(170 model files, no `qwen38`); Qwen3.8-Flash-Next converts as **`qwen4exp`**
+(`conversion/qwen4exp.py`: `@ModelBase.register("Qwen4ExpForConditionalGeneration",
+"Qwen4ExpForCausalLM")` with `@ModelBase.example("Qwen/Qwen3.8-Flash-Next")`). The
+name still cannot pick the schema, because the family has a sparse form and a
+dense one. So `kAliases` in `src/verdict.cpp` probes the file: any of
+`hc_attn_inject` / `hc_ffn_inject` / `per_layer_token_embd` / `ssm_conv1d` /
+`indexer.q_norm` ⇒ `qwen4exp`; none ⇒ qwen3 geometry. Both are FAST. See
+`docs/LLAMA-SCHEMA-VARIANTS.md`.
+
+The earlier note here read the *name* rather than the family, and both of these
+were listed as refused on that basis. The old text follows for the record — it is 2 of the 30 and cannot be answered by reading
 the tree.
 
 ## Counts
@@ -87,7 +97,7 @@ the tree.
 | outcome | count | files |
 |---|---:|---|
 | FAST today | 16 | the Q4_K/Q6_K/Q8_0 llama/gemma/qwen family |
-| **REFUSED — arch missing** | **5** | GLM-4.7, MiniCPM-V-4_6, Phi-3, Phi-4, (+Qwen3.8 x2 if qwen38) |
+| **REFUSED — arch missing** | **0** | none — every arch named here is now in the table |
 | **DEQUANT — no dot kernel** | **7** | 4x Q2_K, 2x Q3_K, 2x PTQ1_0, 1x Q4_0 |
 | uncertain (MoE arch string) | 4 | L3.2-8X3B, Quad-MoE, Mellum2.1, Qwen2.5-MoE |
 
