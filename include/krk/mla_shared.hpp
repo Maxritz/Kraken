@@ -115,6 +115,26 @@ void mla_shared_forward_accum(f32 *out, const f32 *x, const f32 *c_cache,
                               const MlaSharedGeometry &g, const f32 *inv_freq,
                               f32 scale, f32 eps, i32 window);
 
+// A COMPRESSED layer (DeepSeek-V4 CSA/HCA): the cache holds two kinds of row.
+// Rows [0, n_raw) are raw latents, exactly what the calls above take -- windowed,
+// roped on read with the layer's attention table. Rows [n_raw, n_keys) are
+// pooled keys from dsv4_comp_pool(): normed, unroped, ALWAYS visible (a block
+// covers positions the window has already passed), and roped on read with
+// `compress_inv_freq` -- the file's `attention.compress_rope_base`, a different
+// table from the attention one. `kpos[t]` carries each row's position: the
+// token position for a raw row, the block's first token for a pooled one.
+//
+// For CSA the caller passes only the pooled rows the indexer selected; there is
+// no block mask here, because a compacted array is the same answer without a
+// second definition of "visible".
+void mla_shared_forward_compressed(f32 *out, const f32 *x, const f32 *c_cache,
+                                  const i64 *kpos, i64 n_raw, i64 n_keys,
+                                  i64 q_pos, const MlaSharedWeights &w,
+                                  const MlaSharedGeometry &g,
+                                  const f32 *inv_freq,
+                                  const f32 *compress_inv_freq, f32 scale,
+                                  f32 eps, i32 window);
+
 // Order B: weights first, then one pass over the cache per head. Same inputs,
 // same answer within f32 association. This is the order a kernel wants (the
 // weights are a [n_head, n_keys] tile it can keep in LDS), so it is checked

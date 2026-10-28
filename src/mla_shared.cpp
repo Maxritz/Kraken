@@ -235,4 +235,75 @@ void mla_shared_forward_gather(f32 *out, const f32 *x, const f32 *c_cache,
     grouped_output(out, a, w, g);
 }
 
+void mla_shared_forward_compressed(f32 *out, const f32 *x, const f32 *c_cache,
+                                  const i64 *kpos, i64 n_raw, i64 n_keys,
+                                  i64 q_pos, const MlaSharedWeights &w,
+                                  const MlaSharedGeometry &g,
+                                  const f32 *inv_freq,
+                                  const f32 *compress_inv_freq, f32 scale,
+                                  f32 eps, i32 window) {
+    if (!out || !x || !c_cache || !kpos || !g.valid() || !inv_freq ||
+        !compress_inv_freq || n_keys <= 0)
+        return;
+    if (n_raw < 0 || n_raw > n_keys) return;
+    const i64 d = g.kv_lora;
+    std::vector<f32> q;
+    build_queries(q, x, q_pos, w, g, inv_freq, eps);
+
+    // Two visibility rules, one per kind of row: a raw row is windowed, a
+    // pooled row is not. Table so the softmax loops below stay a single pass.
+    std::vector<char> visible(static_cast<size_t>(n_keys), 0);
+    for (i64 t = 0; t < n_keys; t++)
+        visible[static_cast<size_t>(t)] =
+            (t < n_raw) ? (key_in_range(kpos[t], q_pos, window) ? 1 : 0) : 1;
+
+    std::vector<f32> scores(static_cast<size_t>(g.n_head) * n_keys, 0.0f);
+    std::vector<f32> k(static_cast<size_t>(d));
+    for (i64 t = 0; t < n_keys; t++) {
+        if (!visible[static_cast<size_t>(t)]) continue;
+        const f32 *c = c_cache + t * d;
+        for (i64 i = 0; i < d; i++) k[static_cast<size_t>(i)] = c[i];
+        // The base is chosen by the row's KIND, not by its position: pooled
+        // keys were compressed at a coarser scale and the file says so.
+        mla_shared_rope_tail(k.data(), d, g.qk_rope, kpos[t],
+                             t < n_raw ? inv_freq : compress_inv_freq);
+        for (i32 h = 0; h < g.n_head; h++) {
+            const f32 *qh = q.data() + static_cast<size_t>(h) * d;
+            f32 s = 0.0f;
+            for (i64 i = 0; i < d; i++) s += qh[i] * k[static_cast<size_t>(i)];
+            scores[static_cast<size_t>(h) * n_keys + t] = s * scale;
+        }
+    }
+
+    std::vector<f32> a(static_cast<size_t>(g.n_head) * d, 0.0f);
+    for (i32 h = 0; h < g.n_head; h++) {
+        f32 *row = scores.data() + static_cast<size_t>(h) * n_keys;
+        f32 mx = w.sinks ? w.sinks[h] : -INFINITY;
+        for (i64 t = 0; t < n_keys; t++)
+            if (visible[static_cast<size_t>(t)] && row[t] > mx) mx = row[t];
+        f32 sum = 0.0f;
+        if (w.sinks) sum = std::exp(w.sinks[h] - mx);
+        for (i64 t = 0; t < n_keys; t++) {
+            if (!visible[static_cast<size_t>(t)]) {
+                row[t] = 0.0f;
+                continue;
+            }
+            row[t] = std::exp(row[t] - mx);
+            sum += row[t];
+        }
+        if (sum <= 0.0f) continue;
+        f32 *oh = a.data() + static_cast<size_t>(h) * d;
+        // The value is the row as it sits in the cache (unroped) -- the same
+        // split the uncompressed path uses, so a compressed layer and a dense
+        // one cannot disagree about what V is.
+        for (i64 t = 0; t < n_keys; t++) {
+            const f32 p = row[t] / sum;
+            if (p == 0.0f) continue;
+            const f32 *c = c_cache + t * d;
+            for (i64 i = 0; i < d; i++) oh[i] += p * c[i];
+        }
+    }
+    grouped_output(out, a, w, g);
+}
+
 } // namespace krk

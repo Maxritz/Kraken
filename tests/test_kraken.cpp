@@ -50,6 +50,7 @@
 #include "krk/h2d_probe.hpp"
 #include "krk/arch.hpp"
 #include "krk/chat_template.hpp"
+#include "krk/dsv4_compress.hpp"
 #include "krk/draft_head.hpp"
 #include "krk/spec_sampling.hpp"
 #include "krk/backend.hpp"
@@ -4784,6 +4785,328 @@ static void test_chat_template_language() {
         CHECK(chat_template_supported(
                   "{% for m in messages %}{{ m['content'] }}{% endfor %}", &why),
               "a template inside the subset is accepted");
+    }
+}
+
+// DeepSeek-V4 compressed attention: the compressor, the pooled key and the
+// sparse indexer, against numbers worked out by hand.
+//
+// Every arm here is a case where the maths could be done a different, plausible
+// way and still produce a finite full-size key: a softmax over the whole row
+// instead of per channel, the rope on the head instead of the tail, the
+// attention base instead of the compression base, the CSA halves swapped. Each
+// one gets a distinct expected value, so a regression is a number, not a hunch.
+static void test_dsv4_compressed_attention() {
+    using namespace krk;
+
+    // ---- the state row: projection + the APE column for pos % ratio --------
+    {
+        // 2-wide embedding, 2-wide key, ratio 4 => the state row is 4 wide
+        // (cur half | prev half), so both halves project x.
+        const f32 wkv[8] = {1, 0, 1, 0, 0, 1, 0, 1};
+        const f32 wgate[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // score == APE alone
+        const f32 ape[16] = {1, 10, 100, 1000,          // channel 0, columns 0..3
+                             2, 20, 200, 2000,          // channel 1
+                             3, 30, 300, 3000,          // channel 2
+                             4, 40, 400, 4000};         // channel 3
+        const f32 norm[2] = {1, 1};
+        Dsv4Compressor c;
+        c.ratio = kDsv4CsaRatio;
+        c.n_embd = 2;
+        c.hd = 2;
+        c.rope = 2;
+        c.rope_base = 10000.0f;
+        c.eps = 1e-6f;
+        c.wkv = wkv;
+        c.wgate = wgate;
+        c.ape = ape;
+        c.norm = norm;
+        CHECK(c.valid(), "the compressor descriptor validates");
+        CHECK(c.coff() == 2 && c.pool_rows() == 8,
+              "an overlapping compressor pools two blocks");
+
+        const f32 x[2] = {3, 4};
+        f32 kv[4], sc[4];
+        CHECK(dsv4_comp_state(c, x, 1, kv, sc), "the state row computes");
+        CHECK(kv[0] == 3 && kv[1] == 4 && kv[2] == 3 && kv[3] == 4,
+              "kv is the projection of x, in both halves");
+        // wgate is zero, so the score IS the APE column: column 1, not row 1,
+        // which reads 10/20/30/40 rather than 2/20/200/2000.
+        CHECK(sc[0] == 10 && sc[1] == 20 && sc[2] == 30 && sc[3] == 40,
+              "the APE column is position % ratio");
+        CHECK(!dsv4_comp_state(c, x, 4, kv, sc),
+              "a position outside the block is rejected rather than wrapped");
+    }
+
+    // ---- HCA pool: a uniform block averages, then norms -------------------
+    {
+        const f32 wkv[4] = {1, 0, 0, 1};
+        const f32 wgate[4] = {0, 0, 0, 0};
+        const f32 ape[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        const f32 ones[2] = {1, 1};
+        Dsv4Compressor c;
+        c.ratio = kDsv4HcaRatio;
+        c.n_embd = 2;
+        c.hd = 2;
+        c.rope = 2;
+        c.rope_base = 10000.0f;
+        c.eps = 1e-6f;
+        c.wkv = wkv;
+        c.wgate = wgate;
+        c.ape = ape;
+        c.norm = ones;
+
+        // 64 rows of [1, 1] and 64 of [2, 2], all scores equal -> weights
+        // 1/128 each, so the pooled key is the plain mean of the two values.
+        std::vector<f32> kv(128 * 2), sc(128 * 2, 0.0f);
+        for (i32 t = 0; t < 128; t++) {
+            const f32 v = t < 64 ? 1.0f : 2.0f;
+            kv[static_cast<size_t>(t) * 2 + 0] = v;
+            kv[static_cast<size_t>(t) * 2 + 1] = v;
+        }
+        f32 out[2];
+        // The pool stops at the norm; the rope is the caller's read-time copy,
+        // which the arms below pin separately.
+        CHECK(dsv4_comp_pool(c, kv.data(), sc.data(), out),
+              "the dense block pools");
+        // mean = [1.5, 1.5]; rms == 1.5; normed = [1, 1].
+        CHECK(std::fabs(out[0] - 1.0f) < 1e-5f && std::fabs(out[1] - 1.0f) < 1e-5f,
+              "a uniform dense block averages to the rms-normalized mean");
+    }
+
+    // ---- the softmax is PER CHANNEL, not per row -------------------------
+    {
+        const f32 wkv[4] = {1, 0, 0, 1};
+        const f32 wgate[4] = {0, 0, 0, 0};
+        const f32 ape[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        const f32 ones[2] = {1, 1};
+        Dsv4Compressor c;
+        c.ratio = kDsv4HcaRatio;
+        c.n_embd = 2;
+        c.hd = 2;
+        c.rope = 2;
+        c.rope_base = 10000.0f;
+        c.eps = 1e-6f;
+        c.wkv = wkv;
+        c.wgate = wgate;
+        c.ape = ape;
+        c.norm = ones;
+
+        // Channel 0 wants row 0 (value 3), channel 1 wants row 127 (value 7).
+        // A softmax over each ROW would instead mix the two and land in the
+        // middle of both.
+        std::vector<f32> kv(128 * 2, 0.0f), sc(128 * 2, -10.0f);
+        kv[0] = 3.0f;                    // row 0, channel 0
+        kv[127 * 2 + 1] = 7.0f;          // row 127, channel 1
+        sc[0] = 10.0f;                   // row 0, channel 0 wins
+        sc[127 * 2 + 1] = 10.0f;         // row 127, channel 1 wins
+        f32 out[2];
+        CHECK(dsv4_comp_pool(c, kv.data(), sc.data(), out),
+              "a per-channel block pools");
+        // acc = [3, 7]; rms = sqrt(29); out = acc / rms.
+        const f32 rms = std::sqrt((9.0f + 49.0f) / 2.0f);
+        CHECK(std::fabs(out[0] - 3.0f / rms) < 1e-4f,
+              "channel 0 takes its own row's value");
+        CHECK(std::fabs(out[1] - 7.0f / rms) < 1e-4f,
+              "channel 1 takes its own row's value");
+    }
+
+    // ---- CSA overlap: the prev block reads the FIRST half of its rows -----
+    {
+        const f32 wkv[16] = {0};   // unused: rows are supplied directly
+        const f32 wgate[16] = {0};
+        const f32 ape[16] = {0};
+        const f32 ones[2] = {1, 1};
+        Dsv4Compressor c;
+        c.ratio = kDsv4CsaRatio;
+        c.n_embd = 2;
+        c.hd = 2;
+        c.rope = 2;
+        c.rope_base = 10000.0f;
+        c.eps = 1e-6f;
+        c.wkv = wkv;
+        c.wgate = wgate;
+        c.ape = ape;
+        c.norm = ones;
+        CHECK(c.coff() == 2 && c.pool_rows() == 8,
+              "the overlapping compressor pools two blocks");
+
+        // prev rows: first half 2, second half 0.  cur rows: first half 0,
+        // second half 5.  Uniform scores, so channel i <- (4*prev + 4*cur)/8
+        // with prev from the FIRST half and cur from the SECOND.
+        f32 kv[32] = {0};
+        f32 sc[32] = {0};
+        for (i32 t = 0; t < 8; t++) {
+            const bool cur = t >= 4;
+            kv[t * 4 + 0] = cur ? 0.0f : 2.0f;
+            kv[t * 4 + 1] = cur ? 0.0f : 2.0f;
+            kv[t * 4 + 2] = cur ? 5.0f : 0.0f;
+            kv[t * 4 + 3] = cur ? 5.0f : 0.0f;
+        }
+        f32 out[2];
+        CHECK(dsv4_comp_pool(c, kv, sc, out), "the overlapping block pools");
+        // acc[0] = (4*2 + 4*5)/8 = 3.5, same for channel 1 -> normed [1, 1].
+        // Swapping the halves would read prev's 0s and cur's 0s, i.e. a zero
+        // row, and a zero row normalizes to zero -- the arm would read 0.
+        CHECK(std::fabs(out[0] - 1.0f) < 1e-5f && std::fabs(out[1] - 1.0f) < 1e-5f,
+              "the overlap pools prev-half and cur-half, not one half twice");
+    }
+
+    // ---- the rope is the TAIL, at the compression base -------------------
+    {
+        f32 v[4] = {1, 2, 3, 4};
+        // base 100 with rope 2: the first (and only) pair has exponent 0, so
+        // inv_freq is 1 whatever the base, and the angle is exactly pos.
+        dsv4_comp_rope(v, 4, 2, 1, 100.0f);
+        const f32 c = std::cos(1.0f), s = std::sin(1.0f);
+        CHECK(std::fabs(v[0] - 1.0f) < 1e-6f && std::fabs(v[1] - 2.0f) < 1e-6f,
+              "the nope head of the row is untouched");
+        CHECK(std::fabs(v[2] - (3.0f * c - 4.0f * s)) < 1e-5f &&
+                  std::fabs(v[3] - (3.0f * s + 4.0f * c)) < 1e-5f,
+              "the rotary tail rotates at pos");
+
+        // A 4-dim rope with base 100: pair 0 uses exponent 0 (angle = pos),
+        // pair 1 exponent 2/4 (angle = pos * 100^-0.5).
+        f32 w[4] = {1, 2, 3, 4};
+        dsv4_comp_rope(w, 4, 4, 2, 100.0f);
+        const f32 a0 = 2.0f;                       // pos * 100^0
+        const f32 a1 = 2.0f * std::pow(100.0f, -0.5f);
+        CHECK(std::fabs(w[0] - (1.0f * std::cos(a0) - 2.0f * std::sin(a0))) < 1e-5f,
+              "pair 0 rotates at pos");
+        CHECK(std::fabs(w[2] - (3.0f * std::cos(a1) - 4.0f * std::sin(a1))) < 1e-5f,
+              "pair 1 rotates at pos * base^(-i/rope), i.e. the base matters");
+        // pos 0 is the identity on any base: two runs over the same prefix
+        // must land on the same angle.
+        f32 z[4] = {1, 2, 3, 4};
+        dsv4_comp_rope(z, 4, 4, 0, 100.0f);
+        CHECK(z[0] == 1 && z[1] == 2 && z[2] == 3 && z[3] == 4,
+              "block 0 is not rotated");
+    }
+
+    // ---- the indexer: relu, per-head weights, the mask -------------------
+    {
+        // Two heads of width 2: head 0 reads dim 0, head 1 reads dim 1.
+        const f32 q[4] = {1, 0, 0, 1};
+        const f32 k[6] = {1, 1,    // block 0: both heads fire
+                          1, 0,    // block 1: head 0 only
+                          -1, -1}; // block 2: negative -> relu zeroes it
+        const f32 w[2] = {0.5f, 0.5f};
+        f32 sc[3];
+        CHECK(dsv4_indexer_scores(2, 2, q, k, w, nullptr, 3, sc),
+              "the indexer scores");
+        CHECK(std::fabs(sc[0] - 1.0f) < 1e-6f, "both heads contribute 0.5 each");
+        CHECK(std::fabs(sc[1] - 0.5f) < 1e-6f, "one head contributes");
+        CHECK(sc[2] == 0.0f, "a negative similarity is zeroed, not signed");
+
+        const f32 mask[3] = {0.0f, 0.0f, -INFINITY};
+        dsv4_indexer_scores(2, 2, q, k, w, mask, 3, sc);
+        CHECK(sc[2] == -INFINITY, "the mask is additive, so -inf stays -inf");
+    }
+
+    // ---- a compressed layer attends raw rows and pooled rows together ----
+    {
+        // A minimal shared-latent geometry: 1 head, a 3-wide latent of which
+        // the last 2 are rotary. With q built from a zero wq_b every score is
+        // 0, so the answer is the plain mean of the VISIBLE cache rows and the
+        // arm can be read with a calculator.
+        const i32 n_embd = 2, q_lora = 2, kv_lora = 3, rope = 2;
+        std::vector<f32> wq_a(n_embd * q_lora, 0.0f);      // x -> 0
+        std::vector<f32> wq_a_norm(q_lora, 1.0f);
+        std::vector<f32> wq_b(q_lora * kv_lora, 0.0f);     // q == 0
+        std::vector<f32> wkv(n_embd * kv_lora, 0.0f);      // unused: cache given
+        std::vector<f32> wkv_norm(kv_lora, 1.0f);
+        std::vector<f32> wo_a(kv_lora * kv_lora, 0.0f);    // identity 3x3
+        for (i32 i = 0; i < kv_lora; i++) wo_a[i * kv_lora + i] = 1.0f;
+        std::vector<f32> wo_b(kv_lora * n_embd, 0.0f);     // keep dims 0 and 1
+        for (i32 i = 0; i < n_embd; i++) wo_b[i * n_embd + i] = 1.0f;
+
+        MlaSharedGeometry g;
+        g.n_embd = n_embd;
+        g.n_head = 1;
+        g.q_lora = q_lora;
+        g.kv_lora = kv_lora;
+        g.qk_rope = rope;
+        g.o_groups = 1;
+        g.o_lora = kv_lora;
+        CHECK(g.valid(), "the compressed-layer geometry validates");
+
+        MlaSharedWeights w;
+        w.wq_a = wq_a.data();
+        w.wq_a_norm = wq_a_norm.data();
+        w.wq_b = wq_b.data();
+        w.wkv = wkv.data();
+        w.wkv_norm = wkv_norm.data();
+        w.wo_a = wo_a.data();
+        w.wo_b = wo_b.data();
+
+        const f32 inv[1] = {1.0f};          // attention table (rope 2 -> 1 pair)
+        const f32 cinv[1] = {0.5f};         // compression table, deliberately apart
+        const f32 x[2] = {1, 1};
+
+        // Two raw rows and one pooled row.
+        std::vector<f32> cache = {4, 0, 0,   /* raw, pos 0 */
+                                  6, 0, 0,   /* raw, pos 1 */
+                                  9, 0, 0};  /* pooled, pos 3 */
+        const i64 kpos[3] = {0, 1, 3};
+        f32 out[2];
+
+        // No window: every row visible, all scores equal -> mean = 19/3.
+        mla_shared_forward_compressed(out, x, cache.data(), kpos, 2, 3, 1, w, g,
+                                      inv, cinv, 1.0f, 1e-6f, 0);
+        CHECK(std::fabs(out[0] - 19.0f / 3.0f) < 1e-5f,
+              "a compressed layer averages raw and pooled rows together");
+
+        // A window of 1 at q_pos 1 hides the raw row at pos 0 but NOT the
+        // pooled block at pos 3: a block covers positions the window has
+        // already passed, which is the whole point of pooling them.
+        mla_shared_forward_compressed(out, x, cache.data(), kpos, 2, 3, 1, w, g,
+                                      inv, cinv, 1.0f, 1e-6f, 1);
+        CHECK(std::fabs(out[0] - 7.5f) < 1e-5f,
+              "the window hides a raw row and keeps the pooled block");
+
+        // The pooled row must not be roped with the attention table: with a
+        // nonzero tail in the q rows the two tables give different scores.
+        std::vector<f32> wq_b2(q_lora * kv_lora, 0.0f);
+        wq_b2[0 * kv_lora + 2] = 1.0f;   // q[0][2] = q_a[0]
+        std::vector<f32> wq_a2(n_embd * q_lora, 0.0f);
+        wq_a2[0 * q_lora + 0] = 1.0f;    // q_a[0] = x[0] = 1
+        w.wq_b = wq_b2.data();
+        w.wq_a = wq_a2.data();
+        // The pooled row is the VALUE [1, 0, 1]: the 1 in dim 0 is what reaches
+        // the output, and the 1 in the rotary tail (dims 1..2) is what the
+        // score sees, so the chosen table moves out[0] through the softmax.
+        std::vector<f32> tail = {0, 0, 0,   /* raw at pos 5 */
+                                 1, 0, 1};  /* pooled at pos 3 */
+        const f32 onea[1] = {0.25f};
+        const f32 oneb[1] = {0.75f};
+        const i64 kpos2[2] = {5, 3};
+        // Only the pooled row and one raw row, both zero-scoring, so the tail
+        // of the pooled key enters through its dot with q: cos(3*0.75) and
+        // cos(3*0.25) are different angles, and equal weights would average
+        // the same values either way -- so compare the two runs' difference.
+        mla_shared_forward_compressed(out, x, tail.data(), kpos2, 1, 2, 5, w, g,
+                                      onea, oneb, 1.0f, 1e-6f, 0);
+        const f32 with_compress = out[0];
+        mla_shared_forward_compressed(out, x, tail.data(), kpos2, 1, 2, 5, w, g,
+                                      onea, onea, 1.0f, 1e-6f, 0);
+        const f32 with_attention = out[0];
+        CHECK(std::fabs(with_compress - with_attention) > 1e-3f,
+              "the pooled row is roped with the compression table, not the "
+              "attention one");
+    }
+
+    // ---- top-k: descending, ties to the lower index ----------------------
+    {
+        const f32 s[4] = {0.5f, 1.0f, 0.5f, 0.2f};
+        i32 idx[4] = {-1, -1, -1, -1};
+        CHECK(dsv4_top_k(idx, 2, s, 4) == 2, "top-2 returns two");
+        CHECK(idx[0] == 1, "the largest score wins");
+        CHECK(idx[1] == 0, "a tie goes to the lower index");
+        CHECK(dsv4_top_k(idx, 10, s, 4) == 4, "k is clamped to the block count");
+        const f32 flat[3] = {0, 0, 0};
+        CHECK(dsv4_top_k(idx, 3, flat, 3) == 3 && idx[0] == 0 && idx[1] == 1 &&
+                  idx[2] == 2,
+              "an all-equal row selects in index order, not in sort order");
     }
 }
 
@@ -19679,6 +20002,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_vec_dot)
     TEST_GROUP(test_chat_template_builtins)
     TEST_GROUP(test_chat_template_language)
+    TEST_GROUP(test_dsv4_compressed_attention)
     TEST_GROUP(test_arch_table)
     TEST_GROUP(test_arch_tensor_maps)
     TEST_GROUP(test_load_verdict)
