@@ -1267,6 +1267,15 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     if (!check_alloc(ws_xn_, "ws_xn")) return false;
     ws_x2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     if (!check_alloc(ws_x2_, "ws_x2")) return false;
+    // Falcon's second parallel norm: its two arms normalize the SAME residual
+    // row, and the attention arm's copy cannot be reused because the FFN's must
+    // be taken before the attention residual lands in ws_x_. Only the family
+    // that has two different norms allocates it -- on Falcon-7B `attn_norm_2`
+    // is absent and the arms share weights, so this is null and unused.
+    if (mc.parallel_two_norm) {
+        ws_xn2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+        if (!check_alloc(ws_xn2_, "ws_xn2")) return false;
+    }
     // GPT-2 only: the fused attn_qkv output, [chunk, 3*n_embd] f32. Allocated
     // by the same rule as every other workspace (chunked, backend activation
     // size) and only when the file is gpt2-shaped, so no other family pays for
@@ -2328,7 +2337,7 @@ void Engine::shutdown() {
                      model_.cfg().n_expert),
                  ds_max_);
     }
-    for (void **p : {&ws_x_, &ws_rexp_, &ws_fexp_, &ws_fscl_, &ws_xn_, &ws_x2_, &ws_gs_, &ws_q_,
+    for (void **p : {&ws_x_, &ws_rexp_, &ws_fexp_, &ws_fscl_, &ws_xn_, &ws_xn2_, &ws_x2_, &ws_gs_, &ws_q_,
                      &ws_qpack_, &ws_k_,
                      &ws_v_, &ws_attn_, &ws_mlaqn_, &ws_mlay_, &ws_mlaa_,
                      &ws_gate_, &ws_up_, &ws_had_, &ws_logits_,
@@ -3130,7 +3139,21 @@ bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
         void *vbase = nullptr;
 
         // ---- attention ----
-        layernorm(ws_xn_, ws_x_, L.attn_norm, L.attn_norm_bias, n, E, eps);
+        // Falcon-40B normalizes the attention arm with `attn_norm_2` and the
+        // FFN arm with `attn_norm`; Falcon-7B and every other family carry one
+        // norm, so this is just attn_norm there.
+        const f32 *an_w = L.attn_norm_2 ? L.attn_norm_2 : L.attn_norm;
+        const f32 *an_b = L.attn_norm_2 ? L.attn_norm_2_bias : L.attn_norm_bias;
+        layernorm(ws_xn_, ws_x_, an_w, an_b, n, E, eps);
+        // Both arms read the PRE-attention residual row, so the second norm is
+        // taken here, before the attention output is added into ws_x_. Taking
+        // it after would normalize x + attn and quietly change the graph --
+        // the one mistake in this layer that still decodes cleanly.
+        const void *ffn_in = ws_xn_;
+        if (mc.parallel_two_norm && L.attn_norm_2) {
+            layernorm(ws_xn2_, ws_x_, L.ffn_norm, L.ffn_norm_bias, n, E, eps);
+            ffn_in = ws_xn2_;
+        }
         // q/k/v read the SAME normed row, so the fused projection and the three
         // separate ones are the same arithmetic. The fused form is split into
         // row VIEWS rather than copied, which is what keeps the two paths
@@ -3215,12 +3238,12 @@ bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
         // when it does not. Reading ffn_up as a gate on an ungated file would
         // halve the intermediate width and apply the wrong activation.
         if (L.wgate.present()) {
-            gemm_w(ws_gate_, ws_xn_, L.wgate, FF, E, n);
-            gemm_w(ws_up_, ws_xn_, L.wup, FF, E, n);
+            gemm_w(ws_gate_, ffn_in, L.wgate, FF, E, n);
+            gemm_w(ws_up_, ffn_in, L.wup, FF, E, n);
             if (L.wup_bias) be_->add_bias_rows(ws_up_, L.wup_bias, FF, n);
             be_->silu_mul(ws_gate_, ws_gate_, ws_up_, static_cast<i64>(n) * FF);
         } else {
-            gemm_w(ws_gate_, ws_xn_, L.wup, FF, E, n);
+            gemm_w(ws_gate_, ffn_in, L.wup, FF, E, n);
             if (L.wup_bias) be_->add_bias_rows(ws_gate_, L.wup_bias, FF, n);
             be_->gelu_act(ws_gate_, static_cast<i64>(n) * FF);
         }

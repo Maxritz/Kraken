@@ -189,6 +189,25 @@ constexpr ArchSpec bloom_spec() {
     return s;
 }
 
+// Falcon: LayerNorm with a bias, a fused `attn_qkv` with NO bias, an ungated
+// GELU MLP, no position embedding and no ALiBi on the files llama.cpp ships
+// (its loader reads `attention.layer_norm_epsilon` and nothing else) -- the
+// position signal is the NEOX-paired rotary. What makes it its own arch is the
+// parallel branch with two norms; see ArchSpec::parallel_two_norm.
+constexpr ArchSpec falcon_spec() {
+    ArchSpec s{"falcon", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "falcon", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.ln_bias = true;
+    s.no_gate_ffn = true;
+    s.parallel_residual = true;
+    s.parallel_two_norm = true;
+    // llama.cpp lists LLAMA_ARCH_FALCON under LLAMA_ROPE_TYPE_NEOX: the pair is
+    // channel j with j + n_rot/2, the same pairing GPT-NeoX uses.
+    s.rope_neox = true;
+    return s;
+}
+
 constexpr ArchSpec kTable[] = {
     // ---- the schemas this engine runs ------------------------------------
     {"llama", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
@@ -201,6 +220,7 @@ constexpr ArchSpec kTable[] = {
     phi2_spec(),
     mpt_spec(),
     bloom_spec(),
+    falcon_spec(),
     // GPT-2 and its descendants: LayerNorm (biased), learned absolute
     // positions, a fused attn_qkv, and a plain GELU MLP. See
     // ArchSpec::gpt2_style for why those four travel together.

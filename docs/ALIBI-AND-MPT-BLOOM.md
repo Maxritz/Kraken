@@ -137,11 +137,59 @@ Eight tokens of decode on both families: no NaN, no inf, KV cache resident, no
 tiering traffic. `kraken-inspect` reports both `supported (dense)` / `runnable`;
 `kraken-tests` **5039/5039**.
 
+## falcon: parallel attention with two norms
+
+`falcon` was the other name on the refused list that reuses this stack — but it
+is **not** ALiBi. Its loader reads `attention.layer_norm_epsilon` and nothing
+else, so `f_max_alibi_bias` stays 0 and the position signal is the NEOX-paired
+rotary, the same pairing GPT-NeoX uses. What it does have is a parallel branch
+with **two different norms**:
+
+```
+x = x + attn(ln1(x)) + mlp(ln2(x))      // Falcon-40B
+x = x + attn(ln1(x)) + mlp(ln1(x))      // Falcon-7B -- no attn_norm_2 in the file
+```
+
+GPT-NeoX's `parallel_residual` reuses the row attention already normalized.
+Falcon normalizes the *same pre-attention residual* a second time with different
+weights, so `ArchSpec::parallel_two_norm` exists and the second row
+(`ws_xn2_`, allocated only for this family) has to be taken **before** the
+attention residual lands in `ws_x_`. Norming after the residual is the one
+mistake in this layer that still produces clean, coherent text.
+
+Note which norm the MLP reads: `attn_norm` (ln1), not `attn_norm_2`, even on
+40B — the reference's `build_ffn(attn_norm, ...)` is explicit that it is the
+attention's *first* norm, not the result's.
+
+### Proof
+
+`--plain falcon` (norm biases, no linear biases), `--attn-norm-2`. Fused vs
+split, as everywhere else on this stack:
+
+```
+falcon         73=1.18236196(-0.682557) 24=1.16106832(-0.703851)
+falcon-split   73=1.18236196(-0.682557) 24=1.16106832(-0.703851)
+falcon-ln2     73=1.19939208(-0.675833) 24=1.16445804(-0.710767)
+falcon-ln2-split 73=1.19939208(-0.675833) 24=1.16445804(-0.710767)
+```
+
+The second norm is live — adding `attn_norm_2` moves the logits. And its
+**placement** is pinned by the one file that must be a no-op:
+`--attn-norm-2-identity` writes `attn_norm_2` with `attn_norm`'s own weights, so
+the two arms normalize identically and the result must equal the one-norm file
+*exactly*:
+
+```
+falcon           73=1.18236196(-0.682557) 24=1.16106832(-0.703851)
+falcon-ln2-id    73=1.18236196(-0.682557) 24=1.16106832(-0.703851)
+```
+
+Equal to the last digit. Norming after the attention residual would consume a
+different row and could not match. `kraken-inspect`: `supported (dense)` /
+`runnable`; `kraken-tests` **5083/5083**.
+
 ## Still refused
 
-`falcon` needs the same ALiBi plus parallel attention, but with **two different
-norms** in the parallel branch (`ln_attn` and `ln_mlp`) rather than the one
-shared row GPT-NeoX reuses — a separate flag, next change. `mamba` and `rwkv`
-are not transformer stacks at all: a selective state-space recurrence and a
-linear-attention recurrence, neither of which is the gated delta net this engine
-already implements.
+`mamba` and `rwkv` — not transformer stacks at all: a selective state-space
+recurrence and a linear-attention recurrence, neither of which is the gated
+delta net this engine already implements.
