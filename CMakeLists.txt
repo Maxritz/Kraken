@@ -596,6 +596,12 @@ target_link_libraries(kraken-q80-odd PRIVATE krk_core)
 add_executable(kraken-q80-ablate tools/bench_q80_ablate.cpp)
 target_link_libraries(kraken-q80-ablate PRIVATE krk_core)
 
+# The acceptance gate for per-row positions and per-sequence KV bases: a batch
+# of rows from different sequences must equal the same rows computed one at a
+# time, bit for bit.
+add_executable(kraken-attn-multiseq tools/ta_attn_multiseq.cpp)
+target_link_libraries(kraken-attn-multiseq PRIVATE krk_core)
+
 if(KRK_HIP_AVAILABLE)
     add_executable(kraken-oracle tools/oracle_probe.cpp)
     target_link_libraries(kraken-oracle PRIVATE krk_core krk_hip)

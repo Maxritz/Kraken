@@ -842,7 +842,19 @@ cost is the scalar `fp16_to_fp32` weight-scale decode (**34.5%**) — a branchy
 routine with a denormal loop, called twice per block pair where one
 `_mm_cvtph_ps` does both. Replacing it won 4 of 4 interleaved pairs, **1.17x**
 on the GEMM (median 38.7 vs 33.0 GMAC/s), bit-identical across all 65536 half
-values. The int-to-float tail is the next 24.4% and is untouched.
+values. The int-to-float tail is the next **44%** and is untouched; 16 rows in flight
+measures 96% of 8, so the inner loop is not short of independent work and that
+lever is closed.
+
+##### Batching several sequences: the enabling change is in
+
+`AttnDesc` now carries `row_pos` and `row_kv_base` (both null by default, i.e.
+no behaviour change for any existing caller). Every other kernel is already
+row-independent — the GEMM is 85% of prefill — so this is the only piece that
+had to learn about sequences. `kraken-attn-multiseq` gates it: four rows from
+four sequences at positions 3/17/40/63 must equal the same rows computed one at
+a time, **bit for bit**. They do, in both the causal and prefix cases, and the
+legacy contiguous path is unchanged.
 
 ##### Against the engine spec
 

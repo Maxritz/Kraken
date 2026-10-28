@@ -124,6 +124,24 @@ struct AttnDesc {
     i64 hd = 0;            // head dimension
     i64 n_tok = 0;         // query rows in this call
     i64 pos0 = 0;          // position of query row 0
+    // ---- multi-sequence rows ------------------------------------------------
+    // Both default to null, which means "all rows belong to one sequence,
+    // consecutive from pos0, against the one KV region at the caller's base" --
+    // exactly the behaviour every existing caller has. Setting them lets one
+    // call carry rows from DIFFERENT sequences: row t attends to its own
+    // history at row_pos[t], addressed from row_kv_base[t] (in elements, before
+    // layer_stride/pos_stride are applied).
+    //
+    // This is the enabling change for serving several sequences at once: every
+    // other kernel in the engine is already row-independent, so the GEMM, the
+    // norms and the FFN need no knowledge of which sequence a row came from --
+    // only attention does, because only attention reads a per-sequence cache.
+    //
+    // `n_keys` per row is derived as usual from that row's own position, so a
+    // batch where one sequence is at position 4 and another at 500 asks each
+    // row for the right prefix length.
+    const i64 *row_pos = nullptr;      // [n_tok] position of each query row
+    const i64 *row_kv_base = nullptr;  // [n_tok] element offset into the KV plane
     i64 layer = 0;
     i64 layer_stride = 0;  // elements between layers in the KV cache
     i64 pos_stride = 0;    // elements between positions in the KV cache
