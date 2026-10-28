@@ -561,6 +561,14 @@ target_link_libraries(kraken-inspect PRIVATE krk_core)
 add_executable(kraken-cpu-expert-ceiling tools/cpu_expert_ceiling.cpp)
 target_link_libraries(kraken-cpu-expert-ceiling PRIVATE krk_core)
 
+# Checks the attention body against a scalar reference over every shape that
+# has its own code path: decode, prefill, GQA, hd 80/96/128/256, windowed,
+# skip_from, sinks with softcap. Writes raw f32 so two builds can be diffed
+# byte for byte. Two bugs in the gather change were caught here and neither was
+# visible by reading the code, so it runs against any touch to attention.
+add_executable(kraken-attn-acc tools/ta_attn_acc.cpp)
+target_link_libraries(kraken-attn-acc PRIVATE krk_core)
+
 if(KRK_HIP_AVAILABLE)
     add_executable(kraken-oracle tools/oracle_probe.cpp)
     target_link_libraries(kraken-oracle PRIVATE krk_core krk_hip)

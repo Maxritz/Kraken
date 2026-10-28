@@ -653,7 +653,68 @@ reduction, nothing else. `--prefill-hash` moves (it must: the QK dot order
 changed) but stays invariant across `--chunk 8/32/128`, and the suite is
 4796/4796.
 
-`9%` of peak is still the number to argue with, and the arithmetic is no longer
+#### The layout was the kernel: one gather, 2.2x
+
+`9%` of peak was still the number to argue with, so the next step was the obvious
+one: four keys per horizontal reduce. It bought **nothing** — and the reason is
+the whole of the next change. Same arithmetic, same flags, 4800 key-rows:
+
+| variant | real cache (`pos_stride` 3072 B) | contiguous tile (256 B) |
+|---|---:|---:|
+| one key per reduce (as shipped) | 16.14 ns/key | 2.99 |
+| four keys per reduce | 14.47 | 2.44 |
+| + prefetch 8 ahead | 13.77 | 2.29 |
+
+The KV cache is `[position][head][hd]`, so one head's slice of one key is **256 B
+out of a 3072 B stride** — the loop reads four cache lines and uses one. Against
+a contiguous tile the identical kernel is **5.4x** faster; every optimisation
+aimed at the loop is capped at ~1.2x.
+
+So the strided pass is **amortised, not removed**: one gather per head serves
+every query row in the chunk, instead of one pass per (token, head). It is gated
+on `n_tok > 1` — a decode step has one row, nothing to amortise — and the loop
+is now head-major, because the tile belongs to a head and every token reuses it.
+`KRK_CPU_ATTN_GATHER=0` keeps the in-place path for comparison.
+
+Full metrics, 3 interleaved reps, `median [min, max]`, attention row from
+`--kprof`:
+
+| prompt | arm | prefill tok/s | attention ms/op | %run | GMAC/s | %peak |
+|---|---|---:|---:|---:|---:|---:|
+| ~46 | scalar | 329.9 [273.9, 352.3] | 0.2 | 4.7% | 8.1 | 6.8% |
+| ~46 | in-place | 372.2 [335.7, 418.6] | 0.1 | 2.0% | 20.0 | 16.2% |
+| ~46 | **gather** | 370.2 [353.4, 385.2] | 0.1 | 1.6% | 25.5 | 19.0% |
+| ~900 | scalar | 117.6 [114.3, 119.4] | 54.3 | 51.0% | 4.1 | 3.6% |
+| ~900 | in-place | 166.3 [156.5, 172.6] | 21.7 | 29.1% | 10.1 | 8.7% |
+| ~900 | **gather** | **212.5 [193.5, 214.1]** | 7.9 | 13.4% | 28.0 | 24.7% |
+| ~2040 | scalar | 89.9 [88.6, 92.5] | 293.6 | 61.9% | 3.4 | 3.0% |
+| ~2040 | in-place | 148.0 [146.7, 150.2] | 105.4 | 37.0% | 9.5 | 8.5% |
+| ~2040 | **gather** | **198.1 [197.0, 202.7]** | **35.6** | **16.9%** | 28.3 | **25.3%** |
+
+| prompt | in-place / scalar | gather / scalar | gather / in-place |
+|---|---:|---:|---:|
+| ~46 | 1.13x | 1.12x | 0.99x |
+| ~900 | 1.41x | **1.81x** | **1.28x** |
+| ~2040 | 1.65x | **2.20x** | **1.34x** |
+
+Attention on its own op at ~2040 tokens: **293.6 -> 35.6 ms/op, 8.25x** against
+the scalar reference and 2.96x against the previous kernel; its share of the run
+61.9% -> **16.9%**, its rate 3.4 -> **28.3 GMAC/s** (25.3% of the measured f32
+peak). Decode is untouched by design (60.0 vs 60.8 tok/s at ~46 tokens).
+
+**The gather adds exactly zero error**: in-place vs gather is **100.00%
+bit-identical** on all ten accuracy shapes, and both sit at rel **7.7e-08** to
+the scalar reference. The fixture earned its keep twice here — it caught two
+bugs written in this change, an assigning 64-dim chunk (loses all but the last at
+`hd` 128/256, rel 7e-02) and an assigning remainder (loses the first at
+`hd` 80/96), neither of which is visible by reading the code.
+
+Details, the crossover table and the reproduce commands:
+[docs/ATTN-GATHER.md](docs/ATTN-GATHER.md). INT8 kernel tiers by ISA, and why
+ggml's block formats need none of the bias correction Intel's VNNI sample
+describes: [docs/INT8-ISA-TIERS.md](docs/INT8-ISA-TIERS.md).
+
+`25%` of peak is still the number to argue with, and the arithmetic is no longer
 what stops it. At 2048 tokens this kernel *asks for* roughly 155 GB of K/V loads
 — every query row re-streams the keys before it — and this host reads 22.75 GB/s,
 so the same work done from DRAM would cost 6.8 s against the 5.3 s measured. It
