@@ -42,6 +42,7 @@ namespace {
 // Keep-alive sinks for the roofline probes below.
 std::atomic<int> g_probe_sink{0};
 std::atomic<float> g_probe_sink_f{0.0f};
+std::atomic<int> g_probe_sink_i{0};
 
 
 // NVFP4 / MXFP4 E2M1 grid, doubled (ggml kvalues_fp4).
@@ -2459,16 +2460,20 @@ void dot_q8_0_q8_x8_bw(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
         const __m512i wv =
             _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
         const __mmask64 neg = _mm512_cmp_epi8_mask(wv, zero, _MM_CMPINT_LT);
-        const __m512i wp = _mm512_maskz_mov_epi8(~neg, wv);
-        const __m512i wn = _mm512_maskz_sub_epi8(neg, zero, wv);
+        // |w| as an unsigned magnitude. A masked subtract, not abs_epi8: for
+        // -128 the negate is 0x80 as u8 = 128, which is the correct magnitude,
+        // while abs_epi8 saturates it to 127 and would be wrong for one value
+        // in 256.
+        const __m512i mag = _mm512_mask_sub_epi8(wv, neg, zero, wv);
         for (int r = 0; r < 8; r++) {
             const __m512i xv = _mm512_loadu_si512(reinterpret_cast<const void *>(
                 xq + static_cast<i64>(r) * rstride + b * 32));
-            const __m512i pi =
-                _mm512_madd_epi16(_mm512_maddubs_epi16(wp, xv), ones);
-            const __m512i ni =
-                _mm512_madd_epi16(_mm512_maddubs_epi16(wn, xv), ones);
-            const __m512i iv = _mm512_sub_epi32(pi, ni);
+            // Where the weight is negative the product needs -x, so flip the
+            // activation there. One instruction, and it removes the second
+            // maddubs and the second magnitude register entirely.
+            const __m512i xb = _mm512_mask_sub_epi8(xv, neg, zero, xv);
+            const __m512i iv =
+                _mm512_madd_epi16(_mm512_maddubs_epi16(mag, xb), ones);
             const f32 s0 = d0 * dx[static_cast<i64>(r) * dstride + b];
             const f32 s1 = d1 * dx[static_cast<i64>(r) * dstride + b + 1];
             // Lanes 0-7 are block b, 8-15 block b+1, because maddubs/madd keep
@@ -2499,18 +2504,18 @@ void dot_q8_0_q8_x8_avx2(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
         const __m256i wv =
             _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
         const __m256i sm = _mm256_cmpgt_epi8(zero, wv);
-        const __m256i wp = _mm256_andnot_si256(sm, wv);
-        const __m256i wn =
-            _mm256_and_si256(sm, _mm256_sub_epi8(zero, wv));
+        // Same sign-flip as the 512-bit kernel: |w| once, activation flipped
+        // per row, one maddubs instead of two.
+        const __m256i mag =
+            _mm256_blendv_epi8(wv, _mm256_sub_epi8(zero, wv), sm);
         for (int r = 0; r < 8; r++) {
             const __m256i xv = _mm256_loadu_si256(
                 reinterpret_cast<const __m256i *>(xq + static_cast<i64>(r) *
                                                           rstride + b * 32));
-            const __m256i pv =
-                _mm256_madd_epi16(_mm256_maddubs_epi16(wp, xv), ones);
-            const __m256i nv =
-                _mm256_madd_epi16(_mm256_maddubs_epi16(wn, xv), ones);
-            const __m256i iv = _mm256_sub_epi32(pv, nv);
+            const __m256i xb =
+                _mm256_blendv_epi8(xv, _mm256_sub_epi8(zero, xv), sm);
+            const __m256i iv =
+                _mm256_madd_epi16(_mm256_maddubs_epi16(mag, xb), ones);
             const f32 sc = d * dx[static_cast<i64>(r) * dstride + b];
             acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
                                      _mm256_set1_ps(sc), acc[r]);
@@ -2664,6 +2669,102 @@ __attribute__((target("avx2,fma"))) double probe_f32_avx2_gmacs() {
 double probe_f32_avx2_gmacs() { return 0.0; }
 #endif
 
+// The int8 ceiling, MEASURED rather than assumed.
+//
+// isa_peak_gmacs() used to answer int8 with `f32 peak x 4`, on the argument that
+// maddubs retires 16 MACs per instruction where an fma retires 8. That argument
+// assumes the wide form issues at the same rate as the narrow one, and the Q8_0
+// GEMM disproved it: widening that kernel from 256 to 512 bits made it 1.07x
+// faster, not 2x, which is what a part that issues one 512-bit op per cycle and
+// two 256-bit ops per cycle looks like. So the multiplier is not 4, and every
+// %peak column computed from it was dividing by a number nobody had measured.
+//
+// This probe runs the instruction mix the int8 GEMM actually issues per 64
+// values -- maddubs, madd, accumulate -- with eight independent chains so it
+// measures throughput and not latency. Both widths are reported: if they agree,
+// the core is not width-limited and the 256-bit path is the one to build.
+#if defined(KRK_DOT_AVX2)
+__attribute__((target("avx2,fma"))) double probe_int8_avx2_gmacs() {
+    const int iters = 20000;
+    // `a` is bumped every iteration on purpose. With both operands loop
+    // invariant the whole maddubs is a constant, the compiler hoists it out,
+    // and the loop measures integer ADD throughput labelled as a dot-product
+    // ceiling -- which is how the first version of this probe reported 301
+    // GMAC/s that no kernel could reach.
+    __m256i a = _mm256_set1_epi8(3);
+    const __m256i b = _mm256_set1_epi8(2);
+    const __m256i bump = _mm256_set1_epi8(1);
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256i s0 = _mm256_setzero_si256(), s1 = _mm256_setzero_si256();
+    __m256i s2 = _mm256_setzero_si256(), s3 = _mm256_setzero_si256();
+    __m256i s4 = _mm256_setzero_si256(), s5 = _mm256_setzero_si256();
+    __m256i s6 = _mm256_setzero_si256(), s7 = _mm256_setzero_si256();
+    timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < iters; i++) {
+        a = _mm256_add_epi8(a, bump);
+        s0 = _mm256_add_epi32(s0, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
+        s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
+        s2 = _mm256_add_epi32(s2, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
+        s3 = _mm256_add_epi32(s3, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
+        s4 = _mm256_add_epi32(s4, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
+        s5 = _mm256_add_epi32(s5, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
+        s6 = _mm256_add_epi32(s6, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
+        s7 = _mm256_add_epi32(s7, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    s0 = _mm256_add_epi32(_mm256_add_epi32(s0, s1), _mm256_add_epi32(s2, s3));
+    s4 = _mm256_add_epi32(_mm256_add_epi32(s4, s5), _mm256_add_epi32(s6, s7));
+    s0 = _mm256_add_epi32(s0, s4);
+    g_probe_sink_i.store(_mm256_extract_epi32(s0, 0), std::memory_order_relaxed);
+    const double us = static_cast<double>(t1.tv_sec - t0.tv_sec) * 1e6 +
+                      static_cast<double>(t1.tv_nsec - t0.tv_nsec) / 1e3;
+    // maddubs retires 32 byte-products per instruction.
+    const double macs = static_cast<double>(iters) * 8.0 * 32.0;
+    return us > 0 ? macs / us / 1e3 : 0.0;
+}
+#else
+double probe_int8_avx2_gmacs() { return 0.0; }
+#endif
+
+#if defined(KRK_DOT_AVX512)
+__attribute__((target("avx512f,avx512bw"))) double probe_int8_bw_gmacs() {
+    const int iters = 20000;
+    __m512i a = _mm512_set1_epi8(3);
+    const __m512i b = _mm512_set1_epi8(2);
+    const __m512i bump = _mm512_set1_epi8(1);
+    const __m512i ones = _mm512_set1_epi16(1);
+    __m512i s0 = _mm512_setzero_si512(), s1 = _mm512_setzero_si512();
+    __m512i s2 = _mm512_setzero_si512(), s3 = _mm512_setzero_si512();
+    __m512i s4 = _mm512_setzero_si512(), s5 = _mm512_setzero_si512();
+    __m512i s6 = _mm512_setzero_si512(), s7 = _mm512_setzero_si512();
+    timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < iters; i++) {
+        a = _mm512_add_epi8(a, bump);
+        s0 = _mm512_add_epi32(s0, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
+        s1 = _mm512_add_epi32(s1, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
+        s2 = _mm512_add_epi32(s2, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
+        s3 = _mm512_add_epi32(s3, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
+        s4 = _mm512_add_epi32(s4, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
+        s5 = _mm512_add_epi32(s5, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
+        s6 = _mm512_add_epi32(s6, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
+        s7 = _mm512_add_epi32(s7, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    s0 = _mm512_add_epi32(_mm512_add_epi32(s0, s1), _mm512_add_epi32(s2, s3));
+    s4 = _mm512_add_epi32(_mm512_add_epi32(s4, s5), _mm512_add_epi32(s6, s7));
+    s0 = _mm512_add_epi32(s0, s4);
+    g_probe_sink_i.store(_mm512_reduce_add_epi32(s0), std::memory_order_relaxed);
+    const double us = static_cast<double>(t1.tv_sec - t0.tv_sec) * 1e6 +
+                      static_cast<double>(t1.tv_nsec - t0.tv_nsec) / 1e3;
+    const double macs = static_cast<double>(iters) * 8.0 * 64.0;
+    return us > 0 ? macs / us / 1e3 : 0.0;
+}
+#else
+double probe_int8_bw_gmacs() { return 0.0; }
+#endif
+
 // Reported by the CPU backend so the trace's %peak column is against this
 // host, at this kernel width, with every core it has.
 double isa_peak_gmacs(bool int8) {
@@ -2677,8 +2778,11 @@ double isa_peak_gmacs(bool int8) {
         double per = 0.0;
 #if defined(KRK_DOT_AVX512)
         if (cpu_has_vnni()) per = probe_int8_vnni_gmacs();
+        // The widest byte-dot form the host has, measured. Falling back to
+        // f32*4 below was the old guess and it is not what this core does.
+        if (per <= 0.0) per = probe_int8_bw_gmacs();
 #endif
-        if (per <= 0.0) per = probe_f32_avx2_gmacs() * 4.0; // maddubs = 16 MAC/instr
+        if (per <= 0.0) per = probe_int8_avx2_gmacs();
         return per;
     }();
     static const double f32 = [] { return probe_f32_avx2_gmacs(); }();

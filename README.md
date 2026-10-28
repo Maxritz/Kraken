@@ -758,6 +758,41 @@ predicts, so this kernel is not instruction-bound on this host. That gap is the
 honest state of it and the next thing to measure.
 [docs/Q80-INT8-GEMM.md](docs/Q80-INT8-GEMM.md).
 
+#### Chasing that gap: two hypotheses, both partly wrong
+
+The GEMM is 83.7% of the run and 13% of the int8 ceiling, so the missing
+performance is there. Two explanations were each tested and each explained far
+less than it predicted.
+
+**The ceiling had never been measured** — `%peak` divided by `f32 x 4`, a guess.
+Probing it properly took two attempts: the first probe used loop-invariant
+`maddubs` operands, the compiler hoisted them, and the loop degenerated to eight
+integer adds reported as 301 GMAC/s. With the operands bumped so the dot cannot
+hoist, the measured ceiling is **int8 301 / f32 102 GMAC/s**, consistent with
+2 cores at 3.2 GHz.
+
+| | GMAC/s | vs before |
+|---|---:|---:|
+| GEMM, before | 29.3 | — |
+| + column blocking (1.04x) | 30.5 | the loop streamed the whole activation matrix once per output column — 805 MB per call |
+| + sign flip (1.26x) | **39.1** | `sum(w*x) = sum(|w|*(x*sign(w)))`: one `maddubs` instead of two, 5 instructions per 64 MACs instead of 8 |
+| prefill tok/s | 299 -> **384** | 1.28x |
+
+Blocking is correct as well as faster — bit-identical logits, which is what a
+loop reorder should give. The sign flip is exact for `-128` (a masked subtract,
+where `abs_epi8` saturates to 127) and its accuracy is unchanged at 2.329e-08.
+
+**What is actually left**: `objdump` shows the hot loop still spilling its eight
+zmm accumulators to the stack — `vmovaps 0xc0(%rsp),%zmm13` … `vfmadd231ps` …
+`vmovaps %zmm13,0x440(%rsp)` — 60 stack moves in a ~50-instruction body. At 5.6
+instructions per 64 MACs and 2.2 ops/cycle it should reach ~80 GMAC/s per core
+and reaches 24.4. Fewer rows in flight does not fix it (2 rows is 14.3 vs 24.4),
+so the fix is to stop the allocator spilling, not to use fewer registers: build
+the scale as two 256-bit `vbroadcastss`+`fmadd` instead of a `vinserti64x4` per
+row, and hoist the eight row pointers. That is the next change, and it is
+measured to be the right one rather than assumed.
+[docs/GEMM-PERF-WALL.md](docs/GEMM-PERF-WALL.md).
+
 `25%` of peak is still the number to argue with, and the arithmetic is no longer
 what stops it. At 2048 tokens this kernel *asks for* roughly 155 GB of K/V loads
 — every query row re-streams the keys before it — and this host reads 22.75 GB/s,

@@ -680,49 +680,98 @@ public:
             const i32 *xsp = xs.data();
             const i32 *xs4p = xs4.data();
             const u8 *wb = static_cast<const u8 *>(w);
-            const i64 grain = std::max<i64>(8, std::min<i64>(256, n_out / 8));
-            par_for(n_out, grain,
-                    2.0 * static_cast<f64>(rows) * static_cast<f64>(n_out) *
-                        static_cast<f64>(n_in),
-                    [&](i64 b, i64 e) {
-                        for (i64 o = b; o < e; o++) {
-                            const u8 *wr = wb + static_cast<size_t>(o) * row_bytes;
-                            i64 r = 0;
-                            // Eight rows share one decode of the weight block.
-                            // Q4_K only: the tiled kernel's block stride is
-                            // Q4_K's 144 bytes, and a Q6_K block is 210. Using
-                            // it for both reads one format's bytes as the
-                            // other's -- every token came out <unk>.
-                            if (q80)
-                                for (; r + 8 <= rows; r += 8)
-                                    dot_q8_0_q8_x8(
-                                        wr, xqp + r * n_in, xdp + r * nb,
-                                        n_in, n_in, nb,
-                                        of + r * n_out + o, n_out);
-                            else if (q6)
-                                for (; r + 8 <= rows; r += 8)
-                                    dot_q6_K_q8_sq4_x8(
-                                        wr, xqp + r * n_in, xdp + r * nb,
-                                        xs4p + r * nq4, n_in, n_in, nb, nq4,
-                                        of + r * n_out + o, n_out);
-                            else
-                                for (; r + 8 <= rows; r += 8)
-                                    dot_q4_K_q8_sx_x8(
-                                        wr, xqp + r * n_in, xdp + r * nb,
-                                        xsp + r * nb, n_in, n_in, nb, nb,
-                                        of + r * n_out + o, n_out);
-                            for (; r < rows; r++)
+            // Which loop is outermost decides the memory traffic, and the
+            // traffic was the whole cost.
+            //
+            // The original order was `for each output column { for each row
+            // tile }`. That is the obvious shape -- one weight row, eight
+            // activations, eight results -- and it streams the ENTIRE
+            // activation matrix once per output column. On the 512x2048x768 FF
+            // shape that is 512*768 bytes re-read 2048 times: 805 MB per GEMM
+            // call, against 1.67 MB of unique weights. Measured against the
+            // 301 GMAC/s int8 ceiling the kernel sat at 34.5, and no amount of
+            // widening moved it, because widening changes instructions and the
+            // instructions were never the limit.
+            //
+            // Blocking the columns fixes it the standard way: an activation
+            // tile is 8*768 bytes, small enough to stay in L1 across a whole
+            // block of output columns, and each weight row is then read once
+            // per block instead of once per row tile. Activation traffic drops
+            // by the block factor (805 MB -> 6.3 MB at NC=128) and weight
+            // traffic drops to one pass.
+            //
+            // KRK_CPU_GEMM_NC=0 restores the original order, which is how the
+            // two are compared.
+            const i64 nc = [&]() -> i64 {
+                const char *e = std::getenv("KRK_CPU_GEMM_NC");
+                if (e && e[0] != '\0') {
+                    const i64 v = std::atoll(e);
+                    if (v <= 0) return 0;                    // old order
+                    return std::min<i64>(v, n_out);
+                }
+                if (n_out < 2) return 0;
+                // Aim a block's weights at a little under 128 KiB, which keeps
+                // the weight block in L2 while the activation tile stays in L1.
+                const i64 per = std::max<i64>(1, static_cast<i64>(row_bytes));
+                return std::max<i64>(16, std::min<i64>(512, 131072 / per));
+            }();
+            const f64 flops = 2.0 * static_cast<f64>(rows) *
+                              static_cast<f64>(n_out) * static_cast<f64>(n_in);
+            const i64 rows8 = rows - rows % 8;
+            auto dot8 = [&](const u8 *wr, i64 r, i64 o) {
+                if (q80)
+                    dot_q8_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in,
+                                   nb, of + r * n_out + o, n_out);
+                else if (q6)
+                    dot_q6_K_q8_sq4_x8(wr, xqp + r * n_in, xdp + r * nb,
+                                       xs4p + r * nq4, n_in, n_in, nb, nq4,
+                                       of + r * n_out + o, n_out);
+                else
+                    dot_q4_K_q8_sx_x8(wr, xqp + r * n_in, xdp + r * nb,
+                                      xsp + r * nb, n_in, n_in, nb, nb,
+                                      of + r * n_out + o, n_out);
+            };
+            auto dot1 = [&](const u8 *wr, i64 r, i64 o) {
+                if (q80)
+                    return dot_q8_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q6)
+                    return dot_q6_K_q8_sq4(wr, xqp + r * n_in, xdp + r * nb,
+                                           xs4p + r * nq4, n_in);
+                return dot_q4_K_q8_sx(wr, xqp + r * n_in, xdp + r * nb,
+                                      xsp + r * nb, n_in);
+            };
+            if (nc > 0) {
+                // One row tile at a time, every column in the block against it.
+                // The activation pointers for the tile are hoisted out of the
+                // column loop so the compiler keeps them in registers.
+                const i64 nblk = (n_out + nc - 1) / nc;
+                par_for(nblk, 1, flops, [&](i64 cb, i64 ce) {
+                    for (i64 c = cb; c < ce; c++) {
+                        const i64 o0 = c * nc;
+                        const i64 o1 = std::min<i64>(n_out, o0 + nc);
+                        for (i64 r = 0; r < rows8; r += 8)
+                            for (i64 o = o0; o < o1; o++)
+                                dot8(wb + static_cast<size_t>(o) * row_bytes, r,
+                                     o);
+                        for (i64 r = rows8; r < rows; r++)
+                            for (i64 o = o0; o < o1; o++)
                                 of[r * n_out + o] =
-                                    q80 ? dot_q8_0_q8(wr, xqp + r * n_in,
-                                                      xdp + r * nb, n_in)
-                                    : q6 ? dot_q6_K_q8_sq4(wr, xqp + r * n_in,
-                                                         xdp + r * nb,
-                                                         xs4p + r * nq4, n_in)
-                                       : dot_q4_K_q8_sx(wr, xqp + r * n_in,
-                                                        xdp + r * nb,
-                                                        xsp + r * nb, n_in);
-                        }
-                    });
+                                    dot1(wb + static_cast<size_t>(o) * row_bytes,
+                                         r, o);
+                    }
+                });
+                return;
+            }
+            const i64 grain = std::max<i64>(8, std::min<i64>(256, n_out / 8));
+            par_for(n_out, grain, flops, [&](i64 b, i64 e) {
+                for (i64 o = b; o < e; o++) {
+                    const u8 *wr = wb + static_cast<size_t>(o) * row_bytes;
+                    i64 r = 0;
+                    // Eight rows share one decode of the weight block.
+                    for (; r + 8 <= rows; r += 8) dot8(wr, r, o);
+                    for (; r < rows; r++) of[r * n_out + o] = dot1(wr, r, o);
+                }
+            });
             return;
         }
 

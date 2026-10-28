@@ -575,6 +575,11 @@ target_link_libraries(kraken-attn-acc PRIVATE krk_core)
 add_executable(kraken-q80-dot tools/ta_q80_dot.cpp)
 target_link_libraries(kraken-q80-dot PRIVATE krk_core)
 
+# Isolated Q8_0 GEMM throughput: the kernel on pre-laid-out data, per variant,
+# so a number from it cannot be explained by cache behaviour or loop order.
+add_executable(kraken-q80-gemm-bench tools/bench_q80_gemm.cpp)
+target_link_libraries(kraken-q80-gemm-bench PRIVATE krk_core)
+
 if(KRK_HIP_AVAILABLE)
     add_executable(kraken-oracle tools/oracle_probe.cpp)
     target_link_libraries(kraken-oracle PRIVATE krk_core krk_hip)
