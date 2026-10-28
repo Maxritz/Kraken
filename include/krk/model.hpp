@@ -91,6 +91,20 @@ struct LayerWeights {
     // other family, and null is what keeps their graph unchanged.
     f32 *attn_post_norm = nullptr; // f32 [n_embd]
     f32 *ffn_post_norm = nullptr;  // f32 [n_embd]
+    // ---- gemma4's per-layer input embeddings -----------------------------
+    // The PLE contribution is a fourth stage inside the block:
+    //   cur = gelu(inp_gate @ cur) * ple_slice[l]
+    //   cur = post_norm(proj @ cur)
+    //   x  += cur
+    // `ple_slice` is the layer's own [n_embd_per_layer, n_tok] block of the
+    // per-layer input, computed once before the stack.
+    QuantTensor ple_inp_gate;   // [n_embd, n_embd_per_layer]
+    QuantTensor ple_proj;       // [n_embd_per_layer, n_embd]
+    f32 *ple_post_norm = nullptr;  // f32 [n_embd]
+    // gemma4's per-layer output scalar (`layer_output_scale.weight`, one
+    // value). Multiplied into the residual at the end of the block. 1.0 means
+    // the file carries none.
+    f32 out_scale = 1.0f;
     // BitNet's SubLN (bitnet-b1.58-2B-4T): a SECOND RMSNorm per sub-block, and
     // it sits on the sub-block's intermediate output rather than on the
     // pre-normed input --
@@ -456,6 +470,29 @@ struct ModelConfig {
     // a period is a guess about the pattern, and a family that declares the
     // pattern is not asking for one to be guessed.
     std::vector<i32> swa_pattern;
+    // ---- gemma's embedding scale -----------------------------------------
+    // llama.cpp builds the input embedding scaled by sqrt(n_embd) for this
+    // family, and it is not a detail: every downstream norm sees a row an
+    // order of magnitude away from what the model was trained on, so the
+    // residual grows (or shrinks) geometrically with depth. 1.0 means no scale.
+    f32 embd_scale = 1.0f;
+    // ---- gemma4 per-layer input embeddings (PLE) -------------------------
+    // Width of ONE layer's slice; 0 means the family has none. The per-layer
+    // token table is [n_layer * n_embd_per_layer, n_vocab] and the model
+    // projection is [n_embd, n_layer * n_embd_per_layer].
+    i32 n_embd_per_layer = 0;
+    // How many of the LAST layers write no KV and attend an earlier layer's
+    // cache (`attention.shared_kv_layers`). 0 on every other family.
+    i32 n_kv_shared = 0;
+    // The value path is RMS-normalized with no weight (gemma4).
+    bool v_norm_weightless = false;
+    // The family runs the per-layer embedding module (gemma4). Mirrors
+    // `ArchSpec::per_layer_embd`, which is where the declaration lives; the
+    // loader and the forward read this one so a family that does not have it
+    // pays no branch in the hot loop beyond a bool.
+    bool per_layer_embd = false;
+    // Every layer multiplies its output by `blk.N.layer_output_scale` (gemma4).
+    bool layer_out_scale = false;
     // Phase of the pattern: is_swa(l) == ((l + swa_phase) % swa_period) != 0.
     // 0 is the historical (full layer first) reading; 1 flips the pair so the
     // *windowed* layer comes first (gpt-oss).
@@ -894,6 +931,27 @@ public:
     // MLA latent. A mamba/SSM block and a pure-MoE block append nothing, so
     // they hold no KV, are charged for none, and get no plane in the cache.
     // This is the same predicate the engine's attention branch uses.
+    // The layer whose KV cache this one attends. Equal to `layer` unless the
+    // file declares shared-KV layers (gemma4's `attention.shared_kv_layers`),
+    // in which case the last N layers reuse an earlier one:
+    //
+    //     source = n_layer_kv_from_start - (is_swa(layer) ? 2 : 1)
+    //
+    // which is llama.cpp's rule, and the pairing is the file's own: a windowed
+    // layer shares with the last windowed layer, a full one with the last full
+    // layer, so the geometry (head count, width, window) always matches the
+    // cache it reads. A shared layer must not append: it would allocate a plane
+    // nobody reads, and reading its own plane would attend an empty cache.
+    i32 kv_source_layer(i32 layer) const {
+        const i32 start = cfg_.n_layer - cfg_.n_kv_shared;
+        if (cfg_.n_kv_shared <= 0 || layer < start || start < 2) return layer;
+        return start - (is_swa(layer) ? 2 : 1);
+    }
+    // True when this layer writes KV of its own.
+    bool layer_writes_kv(i32 layer) const {
+        return layer_has_kv(layer) && kv_source_layer(layer) == layer;
+    }
+
     bool layer_has_kv(i32 layer) const {
         if (layer < 0 || layer >= static_cast<i32>(layers_.size())) return false;
         const LayerWeights &w = layers_[static_cast<size_t>(layer)];
@@ -1079,6 +1137,21 @@ public:
     DType ple_table_type() const { return ple_table_type_; }
     const QuantTensor &hc_head_down() const { return hc_head_down_; }
     const QuantTensor &hc_head_up() const { return hc_head_up_; }
+    // ---- gemma4 per-layer input embeddings -------------------------------
+    // The token table is [n_layer*n_embd_per_layer, n_vocab] and stays on the
+    // device (it is a full embedding matrix, gathered a row per token); the
+    // model projection and its norm are read every pass.
+    QuantTensor ple_tok_embd;      // [n_layer*n_embd_per_layer, n_vocab]
+    QuantTensor ple_model_proj;    // [n_embd, n_layer*n_embd_per_layer]
+    f32 *ple_proj_norm = nullptr;  // f32 [n_embd_per_layer]
+    // The same norm weight repeated once per layer. The file carries ONE
+    // [n_embd_per_layer] vector and the graph applies it to every layer's slice
+    // of the projection; the grouped norm kernel indexes its weight by group
+    // (`w + g * width`), so the repetition is the shape that kernel wants and
+    // is built once here instead of a second kernel path that would have to
+    // special-case a shared weight.
+    std::vector<f32> ple_proj_norm_rep;
+
     // NeoX inverse frequencies, length head_dim/2, host-resident (tiny).
     const std::vector<f32> &inv_freq() const { return inv_freq_; }
     i64 weight_bytes() const { return weight_bytes_; }

@@ -108,7 +108,15 @@ void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps
                         ss += v * v;
                     }
                     const f32 inv = 1.0f / std::sqrt(ss / static_cast<f32>(n) + eps);
-                    for (i64 i = 0; i < n; i++) orow[i] = xr[i] * sc * inv * w[i];
+                    // A null weight is the weightless norm (gemma4's value
+                    // row): one multiply per element fewer, which is the only
+                    // difference from a gamma of ones and must not be a sparse
+                    // branch inside the loop.
+                    if (w) {
+                        for (i64 i = 0; i < n; i++) orow[i] = xr[i] * sc * inv * w[i];
+                    } else {
+                        for (i64 i = 0; i < n; i++) orow[i] = xr[i] * sc * inv;
+                    }
                 }
             });
 }
@@ -575,7 +583,7 @@ public:
             // when a device is attached at all.
             bool scaling = row_exp != nullptr;
             for (i64 r = 0; scaling && r < rows; r++) scaling = row_exp[r] != 0;
-            if (!scaling && npu::rmsnorm(npu_, out, x, w, rows, n, eps)) return;
+            if (!scaling && w && npu::rmsnorm(npu_, out, x, w, rows, n, eps)) return;
         }
         npu_flush_();
         rmsnorm_rows(static_cast<f32 *>(out), static_cast<const f32 *>(x), w, rows,
@@ -2159,6 +2167,22 @@ public:
                         for (i64 i = 0; i < width; i++) row[i] *= alpha;
                     }
                 });
+    }
+
+    void mul_slice(void *a, const void *b, i64 rows, i64 width, i64 stride,
+                   i64 off) override {
+        npu_flush_();
+        f32 *pa = static_cast<f32 *>(a);
+        const f32 *pb = static_cast<const f32 *>(b);
+        // Rows are independent, so the split is over rows and the inner loop
+        // stays a contiguous multiply -- the same shape mul_act has.
+        par_for(rows, 1, 4.0 * static_cast<f64>(rows) * width, [&](i64 r0, i64 r1) {
+            for (i64 r = r0; r < r1; r++) {
+                f32 *ar = pa + r * width;
+                const f32 *br = pb + r * stride + off;
+                for (i64 i = 0; i < width; i++) ar[i] *= br[i];
+            }
+        });
     }
 
     void mul_act(void *a, const void *b, i64 n) override {

@@ -582,6 +582,12 @@ public:
     int tokenize_prompt(const std::string &prompt, std::vector<i32> &ids) const;
     // Debug: logits from the most recent forward (n_vocab floats).
     const f32 *last_logits() const { return logits_host_; }
+    // Test hook: the resident plane a layer's attention reads, as the cache
+    // handed it to the kernels. `which` is 0 for K and 1 for V. A shared-KV
+    // layer returns the SAME pointer as the layer it shares with (that aliasing
+    // is the feature), and a test can also read the rows to check what the
+    // value norm did to them.
+    const void *kv_plane_debug(i32 which, i32 layer);
     // Test hook, qwen4exp only: the hyper-connection lane stack after the last
     // forward pass, as f32 host rows [n_tok, hc, n_embd], or nullptr when the
     // file carries no lane stack (or the backend keeps it on device only). The
@@ -1269,6 +1275,19 @@ private:
     // MoE-only workspaces (null for dense models)
     void *ws_router_ = nullptr; // [chunk, n_expert]
     void *ws_ffn_ = nullptr;    // [chunk, n_embd] MoE output accumulator
+
+    // ---- gemma4 per-layer input embeddings -------------------------------
+    // `ws_ppl_` holds the gathered per-layer token table for these tokens and
+    // `ws_ppl_in_` the projection that is added to it; both are [chunk,
+    // n_layer*n_embd_per_layer], because the model projection is ONE matrix
+    // whose output spans every layer. Only a file that declares the module
+    // allocates them.
+    void *ws_ppl_ = nullptr;      // [chunk, n_layer*npl] token rows * sqrt(npl)
+    void *ws_ppl_in_ = nullptr;   // [chunk, n_layer*npl] the finished table
+    void *ws_ppl_g_ = nullptr;    // [chunk, npl] one layer's gated input
+    void *ws_ppl_o_ = nullptr;    // [chunk, n_embd] one layer's contribution
+    i64 ppl_width_ = 0;           // n_layer * npl, 0 when the module is off
+    i64 ppl_npl_ = 0;             // n_embd_per_layer
     // Batched-expert staging: rows are permuted activations and their
     // intermediate buffers, both [chunk, ...]. Chunked prefill bounds the plan
     // size, so chunk_ slots always suffice. The speculative verification pass

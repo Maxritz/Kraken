@@ -483,23 +483,37 @@ constexpr ArchSpec kTable[] = {
     // yet, so that backend answers attention_softcap_supported() == false and
     // Engine::init refuses the run by name rather than decoding a different
     // model; --cpu and both NPU arms run it.
-    gemma_spec("gemma2", ArchSupport::Partial,
+    // gemma2 and gemma3 both normalize each branch's OUTPUT
+    // (`attn_post_norm`, `ffn_post_norm` in the reference's layer) and add that
+    // instead of the raw branch. Until this flag was set the loader never bound
+    // either tensor, so both families ran as if they had none -- a wrong graph
+    // that decodes fluently. gemma1 is the family WITHOUT them.
+    [] {
+        ArchSpec s = gemma_spec("gemma2", ArchSupport::Partial,
                "the attention-logit softcap is applied by the reference "
                "attention (--cpu, --npu, --npu-cpu) but not by the HIP "
                "kernels, which refuse the run by name; the alternating window, "
                "GeGLU and the final-logit softcap are implemented; not "
                "validated against a gemma2 file in this collection",
-               2, true),
+               2, true);
+        s.post_branch_norm = true;
+        return s;
+    }(),
     // Gemma 3: QK-norm, GeGLU, embedding scaling, a final-logit softcap and a
     // 5:1 local/global pattern (period 6, windowed layers first, 1024-token
     // window declared in the file). Every one of those pieces is implemented
     // and driven by schema flags rather than by arch name; the remaining doubt
     // is a validated run, which this collection has no gemma3 file for.
-    gemma_spec("gemma3", ArchSupport::Partial,
+    [] {
+        ArchSpec s = gemma_spec("gemma3", ArchSupport::Partial,
                "the loader reads its whole schema (QK-norm, GeGLU, the 5:1 "
-               "windowed/global pattern, embedding scaling, final-logit softcap); "
-               "not validated against a file in this collection",
-               6, true),
+               "windowed/global pattern, embedding scaling, the branch post "
+               "norms and the final-logit softcap); not validated against a "
+               "file in this collection",
+               6, true);
+        s.post_branch_norm = true;
+        return s;
+    }(),
     // Gemma 4 (E-series) as the files in the collection declare it: 42 layers,
     // shared-KV layers, two attention geometries (global heads of 512 with 512
     // rope dims, sliding-window heads of 256 with 256) and per-layer input
@@ -528,13 +542,25 @@ constexpr ArchSpec kTable[] = {
     // and the proportional rope (`blk.N.rope_freqs`). Those are the next commit;
     // until they land a gemma4 file is refused by name, which is the honest
     // answer rather than a run with the wrong graph.
-    gemma_spec("gemma4", ArchSupport::No,
-               "the two-geometry read (key_length / key_length_swa, the stated "
-               "sliding_window_pattern, per-layer KV widths) and the per-layer "
-               "head_count_kv array are implemented and pinned; per-layer input "
-               "embeddings, shared-KV layers, layer_output_scale and the "
-               "proportional rope are not, so a gemma4 file is still refused",
-               0, false),
+    // Every piece the parse above describes is now RUN: the per-layer input
+    // table and its model projection (a pre-pass plus one small gate/proj per
+    // layer), the shared-KV tail (those layers read an earlier layer's plane
+    // and append nothing), the weightless value norm, the per-layer output
+    // scalar, the proportional rope folded into the frequency table, and the
+    // two geometries this family's layers alternate between. So the entry is
+    // Yes, and what remains for this family is the shared-MLP MoE variant's
+    // two-norm branch -- which is refused per file, not per arch, because a
+    // dense gemma4 (E2B/E4B) runs the whole graph.
+    [] {
+        ArchSpec s = gemma_spec("gemma4", ArchSupport::Yes, "",
+                                0, false);
+        s.per_layer_embd = true;
+        s.v_norm_weightless = true;
+        s.shared_kv = true;
+        s.layer_out_scale = true;
+        s.post_branch_norm = true;
+        return s;
+    }(),
 
     // ---- loads and runs, with a named gap ---------------------------------
     // The language tower of a vision model is the text schema; the vision tower

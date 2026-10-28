@@ -1267,6 +1267,29 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     if (!check_alloc(ws_xn_, "ws_xn")) return false;
     ws_x2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     if (!check_alloc(ws_x2_, "ws_x2")) return false;
+    // ---- gemma4 per-layer input embeddings ----------------------------
+    // One [n_layer * n_embd_per_layer] row per token, twice: the gathered
+    // token table and the projection that is added to it. This is the
+    // width the model projection's output actually has -- not n_embd --
+    // because ONE matrix produces every layer's slice at once, which is
+    // why the reference computes it before the first layer rather than
+    // inside each one.
+    if (mc.n_embd_per_layer > 0 && model_.ple_tok_embd.present()) {
+        ppl_npl_ = mc.n_embd_per_layer;
+        ppl_width_ = static_cast<i64>(mc.n_layer) * ppl_npl_;
+        ws_ppl_ = alloc(static_cast<size_t>(C * ppl_width_) * as);
+        if (!check_alloc(ws_ppl_, "ws_ppl")) return false;
+        ws_ppl_in_ = alloc(static_cast<size_t>(C * ppl_width_) * as);
+        if (!check_alloc(ws_ppl_in_, "ws_ppl_in")) return false;
+        ws_ppl_g_ = alloc(static_cast<size_t>(C * ppl_npl_) * as);
+        if (!check_alloc(ws_ppl_g_, "ws_ppl_g")) return false;
+        ws_ppl_o_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+        if (!check_alloc(ws_ppl_o_, "ws_ppl_o")) return false;
+        KRK_INFO("per-layer embd: [chunk %lld x %lld] table, %lld per layer",
+                 static_cast<long long>(C), static_cast<long long>(ppl_width_),
+                 static_cast<long long>(ppl_npl_));
+    }
+
     // Falcon's second parallel norm: its two arms normalize the SAME residual
     // row, and the attention arm's copy cannot be reused because the FFN's must
     // be taken before the attention residual lands in ws_x_. Only the family
@@ -2679,6 +2702,14 @@ void Engine::hc_head_mix(i32 row, const f32 *norm_w, const QuantTensor &down,
     be_->hc_mix(ws_xn_, ws_hc_n_, ws_hc_g_, 1, hc, ne);
 }
 
+const void *Engine::kv_plane_debug(i32 which, i32 layer) {
+    // The same resolution the forward does: a shared-KV layer has no plane of
+    // its own, so this is what any consumer of "layer l's cache" must use.
+    if (layer < 0 || layer >= model_.cfg().n_layer) return nullptr;
+    const i32 src = model_.kv_source_layer(layer);
+    return which == 0 ? kvt_k_.base(src) : kvt_v_.base(src);
+}
+
 const f32 *Engine::hc_debug_lanes(i32 *hc_out, i64 *width_out) const {
     if (hc_out) *hc_out = 0;
     if (width_out) *width_out = 0;
@@ -3324,6 +3355,46 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     be_->fill0(ws_rexp_, static_cast<size_t>(n) * sizeof(i32));
     be_->embed(ws_x_, embd.data, embd.type, mc.n_vocab, mc.n_embd, toks, n);
 
+    // ---- the gemma embedding scale ---------------------------------------
+    // sqrt(n_embd), applied to the input row before anything reads it. The
+    // family's every norm sees this magnitude, so a stack run without it has a
+    // residual whose growth with depth is wrong by a constant factor per layer:
+    // it decodes, and it is not the model. Done here rather than folded into
+    // the table because the table is shared with the output projection on a
+    // tied model, where the same weights must NOT be scaled.
+    if (mc.embd_scale != 1.0f)
+        be_->scale_act(ws_x_, mc.embd_scale, n, n_embd_, n_embd_);
+
+    // ---- the per-layer input table (gemma4) ------------------------------
+    // Built once per pass, before the first layer, because the model
+    // projection and the token table are ONE matrix each covering every
+    // layer's slice:
+    //     proj = model_proj @ (embd * sqrt(n_embd)) * (1/sqrt(n_embd))
+    //          = model_proj @ embd
+    //     tok  = tok_table[token] * sqrt(n_embd_per_layer)
+    //     ple  = (rmsnorm(proj, proj_norm) + tok) * (1/sqrt(2))
+    // The two sqrt factors cancel in `proj`, which is exactly what the
+    // reference does -- it scales the input by sqrt(n_embd) and then divides
+    // the projection by it -- so this multiplies the ALREADY SCALED ws_x_ by
+    // 1/sqrt(n_embd) rather than reaching for the unscaled embedding.
+    if (ppl_width_ > 0) {
+        const f32 npl = static_cast<f32>(ppl_npl_);
+        KRK_TRACE_COMP("ppl-table");
+        be_->embed(ws_ppl_, model_.ple_tok_embd.data, model_.ple_tok_embd.type,
+                   mc.n_vocab, ppl_width_, toks, n);
+        be_->scale_act(ws_ppl_, std::sqrt(npl), n, ppl_width_, ppl_width_);
+        gemm_w(ws_ppl_in_, ws_x_, model_.ple_model_proj, ppl_width_, n_embd_, n);
+        be_->scale_act(ws_ppl_in_, 1.0f / std::sqrt(static_cast<f32>(n_embd_)), n,
+                       ppl_width_, ppl_width_);
+        // One RMS per (token, layer) slice: the weight is the file's single
+        // [n_embd_per_layer] vector, repeated per layer by the loader.
+        be_->rmsnorm_grouped(ws_ppl_in_, ws_ppl_in_,
+                             model_.ple_proj_norm_rep.data(), n, mc.n_layer,
+                             ppl_npl_, ppl_width_, mc.rms_eps);
+        be_->add_inplace(ws_ppl_in_, ws_ppl_, n * ppl_width_);
+        be_->scale_act(ws_ppl_in_, 1.0f / std::sqrt(2.0f), n, ppl_width_, ppl_width_);
+    }
+
     // A latent token embedding stores ROTATED rows: un-rotate them here, once,
     // and the whole residual stream above this point is in the primal basis
     // that every norm, every non-folded matmul and every dump expects.
@@ -3647,8 +3718,14 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // The alternative -- keep the whole-array base and the stride -- is
         // incompatible with paging, because a paged layer has no fixed
         // offset. Hence per-layer bases and a zero stride.
-        void *kbase = kvt_k_.base(l);
-        void *vbase = kvt_v_.base(l);
+        // A shared-KV layer reads the plane of the layer it shares with; its
+        // own is never allocated (see the kv_len pass). Resolving the source
+        // here makes the append gate, the attention and every dump below
+        // address one plane -- the aliasing llama.cpp implements by pointing
+        // two layers' cache tensors at the same buffer.
+        const i32 kv_src = model_.kv_source_layer(l);
+        void *kbase = kvt_k_.base(kv_src);
+        void *vbase = kvt_v_.base(kv_src);
         // A model may have no KV on this layer; only a missing pointer for a
         // KV-carrying layer is a resource refusal. Do not turn a valid null pair
         // on recurrent/pure-FFN blocks into a request failure.
@@ -3683,8 +3760,12 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             const char *e = std::getenv("KRK_FUSED_ATTN_NEOX");
             return !(e && e[0] == '0');
         }();
+        // A shared-KV layer (kv_src != l) must not append, a weightless V-norm
+        // has to run before the cache and the fused chain carries neither, so
+        // those shapes take the separate chain. It is the same arithmetic with
+        // one extra launch per such layer.
         if (!(n == 1 && !packed_gate && d.window == 0 && !mc.attn_gate &&
-              !qsa_sel &&
+              !qsa_sel && kv_src == l && !mc.v_norm_weightless &&
               (fused_neox || !(mc.rope_neox && mc.qk_norm)) &&
               be_->attn_fused_chain(ws_attn_, ws_q_, kbase, vbase,
                                       ws_k_, ws_v_, d,
@@ -3702,15 +3783,25 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // per-head one Qwen3 and Gemma3 use.
             if (mc.qk_norm)
                 be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, lh, lkvh,
-                             mc.head_dim, n, mc.rms_eps, mc.qk_norm_wide);
+                             d.hd, n, mc.rms_eps, mc.qk_norm_wide);
+            // gemma4 RMS-normalizes the VALUE row with no weight at all
+            // (`Vcur = ggml_rms_norm(Vcur)`). It is not a gamma of ones: the
+            // file carries no tensor, so a family that declares it must run it
+            // here, before the row reaches the cache -- normalizing on read
+            // would cost a pass per attended key instead of one per token.
+            if (mc.v_norm_weightless && L.wv.present())
+                be_->rmsnorm(ws_v_, ws_v_, nullptr, n, lkv, mc.rms_eps);
             // Post-norm, pre-rope: the row the rotation consumes. The
             // fused arm's copy of it lives in registers and never lands
             // in this buffer, so this row covers the separate chain only.
             dump_row("attn.qk", l, ws_q_, lq, n);
-            be_->rope(ws_q_, ws_k_, lh, lkvh, mc.head_dim,
+            be_->rope(ws_q_, ws_k_, lh, lkvh, d.hd,
                       n, pos0, model_.inv_freq_at(l).data(), mc.rope_scale,
                       model_.rope_frac_at(l), mc.rope_neox);
-            be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
+            // A shared-KV layer appends nothing: the layer that owns this
+            // plane wrote these rows already, and a second write would put the
+            // token at two positions in one cache.
+            if (kv_src == l) be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
             if (qsa_sel)
                 qsa_attention(l, n, d);
             else
@@ -3907,6 +3998,27 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             dense_ffn(L, l, n);
         }
         if (hc_active_) hc_leave(n);
+        // ---- the per-layer embedding residual (gemma4) -------------------
+        // After the FFN and BEFORE the layer's output scale, which is the
+        // order the reference's graph has: the block's own output includes
+        // this residual, so scaling first would leave the per-layer
+        // contribution at the wrong magnitude on every layer. `inp_gate`
+        // reads the finished residual (attn + ffn), not the FFN's input --
+        // the graph's `pe_in` is taken after `cur += attn_out`.
+        if (ppl_width_ > 0 && L.ple_inp_gate.present()) {
+            gemm_w(ws_ppl_g_, ws_x_, L.ple_inp_gate, ppl_npl_, n_embd_, n);
+            be_->gelu_act(ws_ppl_g_, n * ppl_npl_);
+            be_->mul_slice(ws_ppl_g_, ws_ppl_in_, n, ppl_npl_, ppl_width_,
+                           static_cast<i64>(l) * ppl_npl_);
+            gemm_w(ws_ppl_o_, ws_ppl_g_, L.ple_proj, n_embd_, ppl_npl_, n);
+            be_->rmsnorm(ws_ppl_o_, ws_ppl_o_, L.ple_post_norm, n, n_embd_, mc.rms_eps);
+            be_->add_inplace(ws_x_, ws_ppl_o_, n * n_embd_);
+        }
+        // The layer's output scalar. gemma4 stores one per layer and the
+        // reference multiplies the finished block output by it; a stack whose
+        // tensors are all 1.0 keeps 1.0 here and this is a compare per layer.
+        if (L.out_scale != 1.0f)
+            be_->scale_act(ws_x_, L.out_scale, n, n_embd_, n_embd_);
         dump_stage("attn", l);
     }
     // The MTP probe's feature rows: the same pre-final-norm state DFlash
@@ -5050,14 +5162,17 @@ bool Engine::kv_rollback_zero(i64 pos) {
     std::vector<void *> kbase(static_cast<size_t>(model_.cfg().n_layer), nullptr);
     std::vector<void *> vbase(static_cast<size_t>(model_.cfg().n_layer), nullptr);
     for (i64 l = 0; l < model_.cfg().n_layer; l++) {
-        if (!model_.layer_has_kv(l)) continue;
+        // Only a writing layer owns a plane; a shared one is zero-filled above
+        // through its source and asking for its own pointer would refuse a
+        // rollback the model never needed.
+        if (!model_.layer_writes_kv(l)) continue;
         kbase[static_cast<size_t>(l)] = kvt_k_.base(l);
         vbase[static_cast<size_t>(l)] = kvt_v_.base(l);
         if (!kbase[static_cast<size_t>(l)] || !vbase[static_cast<size_t>(l)])
             return false;
     }
     for (i64 l = 0; l < model_.cfg().n_layer; l++) {
-        if (!model_.layer_has_kv(l)) continue;
+        if (!model_.layer_writes_kv(l)) continue;
         const size_t row = be_->kv_row_bytes(model_.kv_dim_at(l), cfg_.kv_quant == 1 ? KvQuant::Int8 : KvQuant::F16);
         u8 *kb = static_cast<u8 *>(kbase[static_cast<size_t>(l)]) +
                  static_cast<size_t>(pos) * row;

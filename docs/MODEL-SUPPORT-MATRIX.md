@@ -26,9 +26,10 @@ adds six of the GGUF spec's own "known values" architectures — `mpt` and
 `docs/ALIBI-AND-MPT-BLOOM.md`.
 
 Verified arch strings in `src/arch.cpp` — KNOWN and read, which is not the same
-as running: `gemma4`, `deepseek4-dspark`, `qwen4-mtp`, `dspark`, `k2-horizon`,
+as running: `deepseek4-dspark`, `qwen4-mtp`, `dspark`, `k2-horizon`,
 `minimax-m3`, `muse-glimmer`, `spark2_5` and `diffuse` are recognised and still
-refused, each with its own named reason (`Assess`, `--inspect`). A recognised
+refused, each with its own named reason (`Assess`, `--inspect`). `gemma4` ran the
+whole dense graph in this pass (below). A recognised
 arch is how a refusal names the graph it read instead of shrugging. The full
 list: `llama`, `qwen2`, `qwen3`, `qwen35`,
 `qwen35moe`, `qwen3moe`, `qwen3vl`, `gemma`, `gemma2`, `gemma3`, `gemma4`,
@@ -46,7 +47,7 @@ the format has no kernel. `REFUSED` = no arch.
 | file | arch | format | status |
 |---|---|---|---|
 | Firefly-v5.Q4_K_M | llama¹ | Q4_K | FAST |
-| gemma-4-E4B-it-Q4_K_M | `gemma4` — known, **REFUSED** | Q4_K | **REFUSED** — two-geometry read landed; per-layer input embeddings, shared-KV layers, layer_output_scale and proportional rope still missing |
+| gemma-4-E4B-it-Q4_K_M | `gemma4` ✓ | Q4_K | FAST — two geometries, per-layer input embeddings, weightless value norm, layer_output_scale, proportional rope, shared-KV tail; pinned by `test_gemma4_forward` |
 | GLM-4.7-Flash-Q4_K_M | `glm4` ✓ | Q4_K | FAST |
 | L3.2-8X3B-MOE-…-Q8_0 | llama-moe² | Q8_0 | FAST if ² |
 | (Phi-3.5-MoE class) | `phi3moe` ✓ | Q4_K | FAST |
