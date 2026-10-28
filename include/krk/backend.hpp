@@ -736,6 +736,28 @@ public:
     // Public device name for logging.
     virtual std::string describe() const = 0;
 
+    // ---- the load-time prepare pass --------------------------------------
+    //
+    // A backend whose first use of a weight costs more than its steady state
+    // has a problem that is not about kernels: the cost lands inside the first
+    // measured step, where it reads as a property of the steady state. The
+    // virtual NPU is exactly that case -- packing a weight into the device's
+    // int8 layout is 2.3 ms each, once, and while it sat in the first decode
+    // step a 16-token run measured 0.74x while the steady state was 2.51x.
+    //
+    // So the engine offers one forward pass at load whose only job is to touch
+    // every weight. `wants_prepare()` is the backend saying it has such a cost;
+    // `set_prepare(true)` brackets the pass, so the backend may convert eagerly
+    // instead of deferring. The pass is charged to the load phase and printed
+    // there, so a reader sees what it cost rather than inferring it from a
+    // decode number that moves when the length of the run changes.
+    //
+    // The default is "no such cost", and a backend that does not override these
+    // behaves exactly as before.
+    virtual bool wants_prepare() const { return false; }
+    virtual void set_prepare(bool on) { (void)on; }
+    virtual bool preparing() const { return false; }
+
     // Counters for a run summary, or empty when the backend has none to add.
     // The NPU backend reports what its GEMM hand-over actually did (calls
     // offered, calls served, GFLOPs); the reference and the HIP arms do not
