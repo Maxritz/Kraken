@@ -178,14 +178,12 @@ instead. The loader read and shape-checked that trunk — and the forward never
 asked for it, so the projection ran against an absent tensor and produced
 queries at 2.8e22 that became NaN one layer later. Nothing errored.
 
-The V3-class *Split* layout (`attn_k_b`/`attn_v_b`) also carries a trunk, but
-it is refused by name at `Engine::init` and never reaches this code -- so the
-reach of the bug was every **legacy-layout file with a `q_lora_rank`**, which
-before MiniCPM3 nothing in the suite had ever built. The trunk is now projected
-(with its norm) and falls back to the direct path only when the file has no
-trunk at all; a layer with neither is a named refusal instead of a multiply by
-nothing. The Split refusal is pinned by the same test, so it cannot quietly
-turn into a decode.
+The V3-class *Split* layout (`attn_k_b`/`attn_v_b`) also carries a trunk, and at
+the time it was refused by name at `Engine::init`, so the reach of the bug was
+every **legacy-layout file with a `q_lora_rank`** -- which before MiniCPM3
+nothing in the suite had ever built. The trunk is now projected (with its norm)
+and falls back to the direct path only when the file has no trunk at all; a
+layer with neither is a named refusal instead of a multiply by nothing.
 
 The second half of the same bug: `ws_mlaqn_` — the trunk's intermediate row —
 was allocated **only for the shared layout**, so the fixed projection then
@@ -196,3 +194,46 @@ Pinned by `test_minicpm3_whole_graph`: the file loads, the resolved scale is
 `1.4/sqrt(n_layer)`, the logits are finite, and the same bytes under a label
 without the scale produce different logits — so the multiply is known to act
 rather than merely to be configured.
+
+## Third pass: all three MLA layouts run
+
+`MlaLayout::Split` (the V3 class) was refused by name. It is not a different
+graph: the reference **absorbs** the query's nope part with `attn_k_b` and
+expands the attention result with `attn_v_b`, while the legacy layout unfolds
+both from one fused `attn_kv_b`. By linearity
+
+```
+<W_k q, c>          = <q, W_k^T c>            (same score)
+sum_j p_j (W_v c_j) = W_v (sum_j p_j c_j)     (same weighted sum)
+```
+
+so the two are the same function in a different storage order. The loader now
+**composes** the fused `wkv_b16` the one validated lite kernel reads:
+
+* `attn_k_b` `[nope, kv_lora, n_head]` -> per-head rows transposed into the
+  fused block (its flat order has `nope` fastest, the fused table has
+  `kv_lora` fastest);
+* `attn_v_b` `[kv_lora, v_dim, n_head]` -> straight copies, since its rows are
+  already the contraction index.
+
+Getting the order wrong would score value rows as keys: shapes fit, scores look
+plausible, the text is another model. So the suite builds **the same weights in
+both layouts** and requires the logits to be identical -- which they are,
+bit for bit, `test_minicpm3_whole_graph`.
+
+### Two field-name bugs the same fixture found
+
+Both were invisible at load, because the loader read and shape-checked every
+tensor; only the forward disagreed.
+
+1. `mla_forward` projected the compressed latent with `L.wkv_a_mqa`, and the
+   split branch stored it on `L.wkv_a`. The GEMM then ran against an **empty
+   weight**: it wrote nothing, `ws_mla_` kept what the previous stage left, and
+   the latent dump read `2.07e37`. Two kernels later it segfaulted.
+2. The same mismatch on the norm: the split branch filled `L.wkv_norm`, the
+   forward reads `L.wkv_a_norm`, so `mla_kv_write` normalised with a **null
+   gamma** -- a dereference of null, not a wrong number.
+
+The loader now stores the lite layout's pair under the lite layout's names
+(`wkv_a_mqa`, `wkv_a_norm`), and `test_mla_loader` pins those field names so a
+future branch cannot drift back.

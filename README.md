@@ -1141,11 +1141,18 @@ The lite latent-attention forward projected the query **only** through
 attn_q_b` instead. The loader read and shape-checked that trunk, the forward
 never asked for it, and the projection ran against an absent tensor to produce
 queries at 2.8e22 that turned into NaN one layer later — with nothing reported
-in between. The V3-class Split layout carries a trunk too, but it is refused by name and
-never reaches that code, so the reach of the bug was every legacy-layout file
-with a `q_lora_rank` — a shape nothing in the suite had ever built. Both halves
-are fixed now, including the workspace that was allocated only for the shared
-layout, which turned the first fix into a segfault until it was noticed.
+in between. The V3-class Split layout carries a trunk too — and is now **run** rather than
+refused: the reference absorbs the query's nope part with `attn_k_b` and expands
+the result with `attn_v_b`, which by linearity is the same function as unfolding
+both from one fused `attn_kv_b`, so the loader composes the fused table the
+validated lite kernel already reads. The suite builds the same weights in both
+layouts and requires identical logits. Doing so caught two field-name bugs that
+loading could not: the forward read `wkv_a_mqa`/`wkv_a_norm` while the split
+branch filled `wkv_a`/`wkv_norm`, so the latent projected against an empty
+weight (a `2.07e37` dump) and was normalised with a null gamma. Both halves of
+the trunk bug are fixed too, including the workspace that was allocated only for
+the shared layout, which turned the first fix into a segfault until it was
+noticed.
 
 `test_minicpm3_whole_graph` pins all three facts: the file loads, the resolved
 scale is `1.4/sqrt(n_layer)`, and the same bytes under a label without the scale
