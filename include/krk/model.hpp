@@ -56,6 +56,9 @@ struct LayerWeights {
     // fused result instead of running three projections, which is also what
     // the file expects -- there are no separate q/k/v tensors to run.
     QuantTensor wqkv_fused;   // distinct from the delta-net wqkv below
+    // Phi-3's fused gate|up projection, [n_embd -> 2*n_ff]: one row holds the
+    // gate's n_ff channels then the up's, and the file carries no ffn_gate.
+    QuantTensor wup_fused;
     f32 *qkv_bias = nullptr;  // f32 [3*n_embd]
     QuantTensor wq, wk, wv, wo;
     f32 *q_bias = nullptr; // optional [n_head*hd]
@@ -411,6 +414,10 @@ struct ModelConfig {
     // one projection and one bias, and a plain GELU MLP. See
     // ArchSpec::gpt2_style -- these are one architecture, not four switches.
     bool gpt2_style = false;
+    // Fused projections, as named by ArchSpec (see arch.hpp). Both are off for
+    // every family that carries separate q/k/v and gate/up tensors.
+    bool fused_qkv = false;
+    bool fused_gate_up = false;
     // Rotate only on the windowed layers (muse-glimmer's full layers are NoPE).
     bool rope_swa_only = false;
 

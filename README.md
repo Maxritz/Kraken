@@ -1118,3 +1118,19 @@ and the refusal list, is in [docs/MODEL-STATUS.md](docs/MODEL-STATUS.md) and
 * `docs/` holds the design and audit documents, one per subsystem.
 * `scripts/` holds the gates (`build_check.sh`, `kraken_tests_baseline_check.sh`,
   `coherence_check.sh`) and the benchmark harnesses.
+
+### Fused projections: Phi-3 / Phi-4
+
+`phi3` is now a supported architecture. Phi-3 and Phi-4 store two fused
+projections — `attn_qkv` (`Q | K | V`, with K/V `n_head_kv*head_dim` wide under
+GQA) and `ffn_up` (`gate | up`, no `ffn_gate` tensor) — and the engine reads both
+as **row views** of one weight, so each runs the same gemm the split tensors
+would. `fused_qkv` and `fused_gate_up` are new `ArchSpec` flags, separate from
+`gpt2_style` because Phi needs the fused shapes with RMSNorm, partial rotary and
+SwiGLU rather than GPT-2's bundle.
+
+Verified bit-exact: a split-tensor model and the same weights laid out fused give
+identical logits (`58=1.20879912` both), for QKV alone, gate|up alone, and both.
+See [docs/PHI3-FUSED-PROJECTIONS.md](docs/PHI3-FUSED-PROJECTIONS.md), which also
+records the two gating bugs the equality test caught — attention and FFN both
+skipped silently on a fused file.
