@@ -569,6 +569,12 @@ target_link_libraries(kraken-cpu-expert-ceiling PRIVATE krk_core)
 add_executable(kraken-attn-acc tools/ta_attn_acc.cpp)
 target_link_libraries(kraken-attn-acc PRIVATE krk_core)
 
+# The Q8_0 int8 dot against an f64 reference of the same integer arithmetic,
+# over shapes that include a block count that is odd (the dispatcher's wholesale
+# fallback) and weight bytes drawn from the full legal range including -128.
+add_executable(kraken-q80-dot tools/ta_q80_dot.cpp)
+target_link_libraries(kraken-q80-dot PRIVATE krk_core)
+
 if(KRK_HIP_AVAILABLE)
     add_executable(kraken-oracle tools/oracle_probe.cpp)
     target_link_libraries(kraken-oracle PRIVATE krk_core krk_hip)

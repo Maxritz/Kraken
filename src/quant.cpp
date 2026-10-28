@@ -1301,6 +1301,17 @@ bool cpu_has_avx2() {
     return v;
 }
 
+// AVX-512F + AVX-512BW, WITHOUT assuming VNNI: the 512-bit int8 pair kernels
+// need only maddubs/madd, which are BW. Skylake-SP is exactly this machine --
+// it has the wide byte ops and none of the VNNI accumulator forms -- so
+// checking avx512vnni here would throw away half the register width on the very
+// parts most likely to run this code.
+bool cpu_has_avx512bw() {
+    static const bool v = __builtin_cpu_supports("avx512f") != 0 &&
+                          __builtin_cpu_supports("avx512bw") != 0;
+    return v;
+}
+
 // VNNI is what makes a 4-bit dot cheap: vpdpbusd accumulates 32 int8 products
 // into int32 in ONE instruction, where the AVX2 path needs maddubs + madd.
 // Measured on the Tiny-Moe GEMM shapes: 3.5 -> 7.4 MAC/instruction.
@@ -2354,6 +2365,186 @@ f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 bool env_dot_x8sx() {
     const char *e = std::getenv("KRK_CPU_DOT_X8SX");
     return !e || e[0] != '0';
+}
+
+// Q8_0 against int8 activations, WITHOUT expanding either side to f32.
+//
+// Q8_0 was the last format whose batched prefill still ran through a dequant
+// loop: dot_q8_0_tiled() widened every weight byte to f32 with cvtepi8_epi32
+// and multiplied by the block scale, eight rows at a time. Measured on the
+// 768x12 q8_0 fixture that path took 81.3% of a 2040-token prefill run at
+// 19.3 GMAC/s, i.e. the largest single cost in the engine and a direct
+// violation of "never dequant".
+//
+// Q8_0's weight is a SIGNED byte, and maddubs wants its first operand unsigned.
+// The obvious fix -- bias by 128 and correct with -128*sum(x) -- is the one
+// Intel's VNNI sample uses, and it is unsafe here: 255*127*2 overflows the i16
+// pair accumulator and maddubs would silently saturate. So the weight is split
+// into its magnitude and its sign instead, and both magnitudes are unsigned:
+//
+//     w = wp - wn,   wp = max(w,0) in 0..127,  wn = |min(w,0)| in 1..128
+//     sum(w*x) = madd(maddubs(wp, x), 1) - madd(maddubs(wn, x), 1)
+//
+// Both products are bounded by 128*127*2 = 32512 < 32767, so nothing saturates
+// for ANY legal byte pair, including the -128 that the format permits and that
+// an abs_epi8 (which saturates to 127) would get wrong. |min(w,0)| is computed
+// as a wrapping negate of the bit pattern, which is exactly 256-pattern, so
+// -128 becomes 128 without ever being negated as a signed value.
+//
+// No bias term and no sx[] array are needed: the split is exact, so the only
+// per-block cost above the dot is the scale product. Q8_0 blocks 32 values, so
+// the scale changes every 32 and one cvt + one fma per block per row is the
+// floor for this layout.
+__attribute__((target("avx2,fma")))
+f32 dot_q8_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    const i64 nb = n / 32;
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 b = 0; b < nb; b++, w += 34) {
+        const f32 d = fp16_to_fp32(
+            static_cast<u16>(w[0] | (static_cast<u16>(w[1]) << 8)));
+        const __m256i wv =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i sm = _mm256_cmpgt_epi8(zero, wv);
+        const __m256i wp = _mm256_andnot_si256(sm, wv);
+        const __m256i wn =
+            _mm256_and_si256(sm, _mm256_sub_epi8(zero, wv));
+        const __m256i xv = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(xq + b * 32));
+        const __m256i pv = _mm256_madd_epi16(_mm256_maddubs_epi16(wp, xv), ones);
+        const __m256i nv = _mm256_madd_epi16(_mm256_maddubs_epi16(wn, xv), ones);
+        const __m256i iv = _mm256_sub_epi32(pv, nv);
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                              _mm256_set1_ps(d * dx[b]), acc);
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
+// Eight activation rows against one weight row. The block decode -- the f16
+// scale, the sign mask and the two magnitudes -- is done once and every one of
+// the eight rows reuses it, which is the same 8x share the Q4_K/Q6_K kernels
+// get. This is the shape batched prefill actually calls.
+//
+// The magnitude split costs a second maddubs, and at 256 bits that is the whole
+// cost: 8 instructions per 32 MACs. Q8_0's block is 32 bytes, so two blocks are
+// exactly one 512-bit register and one maddubs pair does 64 values. The
+// activations for two consecutive blocks are contiguous (unlike the weights,
+// which carry a 2-byte scale between them), so the x side is one aligned-width
+// load while the weight side costs two loads plus an insert -- amortised over
+// all eight rows. That halves the per-row instruction count to 8 per 64 MACs.
+#if defined(KRK_DOT_AVX512)
+__attribute__((target("avx512f,avx512bw")))
+void dot_q8_0_q8_x8_bw(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                       i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    const i64 nb = n / 32;
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i ones = _mm512_set1_epi16(1);
+    __m512 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm512_setzero_ps();
+    for (i64 b = 0; b + 2 <= nb; b += 2, w += 68) {
+        const f32 d0 = fp16_to_fp32(
+            static_cast<u16>(w[0] | (static_cast<u16>(w[1]) << 8)));
+        const f32 d1 = fp16_to_fp32(
+            static_cast<u16>(w[34] | (static_cast<u16>(w[35]) << 8)));
+        const __m256i lo =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i hi =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 36));
+        const __m512i wv =
+            _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+        const __mmask64 neg = _mm512_cmp_epi8_mask(wv, zero, _MM_CMPINT_LT);
+        const __m512i wp = _mm512_maskz_mov_epi8(~neg, wv);
+        const __m512i wn = _mm512_maskz_sub_epi8(neg, zero, wv);
+        for (int r = 0; r < 8; r++) {
+            const __m512i xv = _mm512_loadu_si512(reinterpret_cast<const void *>(
+                xq + static_cast<i64>(r) * rstride + b * 32));
+            const __m512i pi =
+                _mm512_madd_epi16(_mm512_maddubs_epi16(wp, xv), ones);
+            const __m512i ni =
+                _mm512_madd_epi16(_mm512_maddubs_epi16(wn, xv), ones);
+            const __m512i iv = _mm512_sub_epi32(pi, ni);
+            const f32 s0 = d0 * dx[static_cast<i64>(r) * dstride + b];
+            const f32 s1 = d1 * dx[static_cast<i64>(r) * dstride + b + 1];
+            // Lanes 0-7 are block b, 8-15 block b+1, because maddubs/madd keep
+            // the 512-bit input order. One scale vector, one fma, both blocks.
+            const __m512 sc = _mm512_castsi512_ps(_mm512_inserti64x4(
+                _mm512_castps_si512(_mm512_castps256_ps512(
+                    _mm256_broadcast_ss(&s0))),
+                _mm256_castps_si256(_mm256_broadcast_ss(&s1)), 1));
+            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iv), sc, acc[r]);
+        }
+    }
+    for (int r = 0; r < 8; r++)
+        out[static_cast<i64>(r) * out_stride] = _mm512_reduce_add_ps(acc[r]);
+}
+#endif // KRK_DOT_AVX512
+
+__attribute__((target("avx2,fma")))
+void dot_q8_0_q8_x8_avx2(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                         i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    const i64 nb = n / 32;
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 b = 0; b < nb; b++, w += 34) {
+        const f32 d = fp16_to_fp32(
+            static_cast<u16>(w[0] | (static_cast<u16>(w[1]) << 8)));
+        const __m256i wv =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i sm = _mm256_cmpgt_epi8(zero, wv);
+        const __m256i wp = _mm256_andnot_si256(sm, wv);
+        const __m256i wn =
+            _mm256_and_si256(sm, _mm256_sub_epi8(zero, wv));
+        for (int r = 0; r < 8; r++) {
+            const __m256i xv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + static_cast<i64>(r) *
+                                                          rstride + b * 32));
+            const __m256i pv =
+                _mm256_madd_epi16(_mm256_maddubs_epi16(wp, xv), ones);
+            const __m256i nv =
+                _mm256_madd_epi16(_mm256_maddubs_epi16(wn, xv), ones);
+            const __m256i iv = _mm256_sub_epi32(pv, nv);
+            const f32 sc = d * dx[static_cast<i64>(r) * dstride + b];
+            acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                                     _mm256_set1_ps(sc), acc[r]);
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+
+// The entry point the backend calls: widest kernel the host can run. An odd
+// block count falls back wholesale rather than growing a second tail path --
+// one code path that is always exercised beats two where one is never tested.
+void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    const i64 nb = n / 32;
+#if defined(KRK_DOT_AVX512)
+    static const bool bw = [] {
+        const char *e = std::getenv("KRK_CPU_Q80_NOBW");
+        return cpu_has_avx512bw() && !(e && e[0] == '1');
+    }();
+    if (bw && (nb & 1) == 0) {
+        dot_q8_0_q8_x8_bw(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
+#else
+    (void)nb;
+#endif
+    dot_q8_0_q8_x8_avx2(w, xq, dx, n, rstride, dstride, out, out_stride);
 }
 
 void dot_q4_K_q8_sx_x8(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,

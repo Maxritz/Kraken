@@ -245,6 +245,13 @@ void dot_q4_K_q8_sx_x8(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
                        i64 n, i64 rstride, i64 dstride, i64 sstride, f32 *out,
                        i64 out_stride);
 f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+// Q8_0 against int8 activations with neither side expanded to f32: the signed
+// weight is split into unsigned magnitudes |w| and the products are subtracted,
+// which keeps maddubs inside i16 for the whole legal byte range (including the
+// -128 the format allows) and needs no bias correction.
+f32 dot_q8_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride);
 f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 // Q6_K with the q-32 bias taken from sq4 (per-four biased sums) and folded
 // into the integer dot, plus the eight-row prefill shape for the same.
