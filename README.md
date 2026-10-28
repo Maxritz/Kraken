@@ -1134,3 +1134,19 @@ identical logits (`58=1.20879912` both), for QKV alone, gate|up alone, and both.
 See [docs/PHI3-FUSED-PROJECTIONS.md](docs/PHI3-FUSED-PROJECTIONS.md), which also
 records the two gating bugs the equality test caught — attention and FFN both
 skipped silently on a fused file.
+
+### Ternary int8 dot kernels (BitNet, Ternary-Bonsai)
+
+`TQ1_0` (BitNet, 256 values / 54 B) and `PTQ1_0` (Ternary-Bonsai, 128 values /
+28 B) now have int8 dot kernels instead of dequantising. Values are
+{-1, 0, +1} behind one f16 scale, so the dot has no bias term and no multiply in
+the inner loop at all — `_mm256_sign_epi8(x, t)` *is* `x*t` for a trit, and
+`maddubs`+`madd` reduce 32 products to eight i32 lanes. The trit expansion calls
+the same `tq1_trit_at`/`ptq1_trit_at` the dequantiser uses, so the kernel cannot
+drift from the reference.
+
+Measured on a 23.4 MiB PTQ1_0 model, three interleaved reps: **26.8 vs 22.4
+tok/s prefill (1.20×)**. Verified against the dequantising path on identical
+bytes — same ranking, values agreeing to the fourth decimal.
+See [docs/TERNARY-KERNELS.md](docs/TERNARY-KERNELS.md), which also lists the
+formats still missing kernels and why each is the same job again.
