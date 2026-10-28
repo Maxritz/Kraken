@@ -57,6 +57,10 @@ T_F32, T_F16, T_Q4_0, T_Q8_0 = 0, 1, 2, 8
 # Ternary ids: TQ1_0 is ggml's BitNet format, PTQ1_0 is the Prism/Bonsai
 # group-128 one.
 T_TQ1_0, T_PTQ1_0 = 34, 143
+# K-quants: 256-value blocks. Q2_K is 84 B (d, dmin, 16 packed scales,
+# 64 B of 2-bit quants); Q3_K is 110 B (32 B hmask, 64 B quants, 12 B of
+# scrambled 6-bit scales, d).
+T_Q2_K, T_Q3_K = 10, 11
 FORMATS = {
     "f32": (T_F32, 1, 0),
     "f16": (T_F16, 1, 0),
@@ -70,6 +74,12 @@ FORMATS = {
     # any disagreement between them is a kernel bug and nothing else.
     "ptq1_0": (T_PTQ1_0, 28, 128),
     "tq1_0": (T_TQ1_0, 54, 256),
+    # Raw-byte reference fixtures, same reasoning as the ternary ones: every
+    # byte pattern is a legal K-quant block once the dtype slots are set to a
+    # real f16, so the dequantising path and the int8 kernel read identical
+    # bytes and any disagreement is a kernel bug.
+    "q2_K": (T_Q2_K, 84, 256),
+    "q3_K": (T_Q3_K, 110, 256),
 }
 
 GGUF_MAGIC = 0x46554747
@@ -228,6 +238,17 @@ def make_weights(vals, fmt):
         return quantize_q8_0(vals), dtype
     if dtype == T_Q4_0:
         return quantize_q4_0(vals), dtype
+    if dtype in (T_Q2_K, T_Q3_K):
+        nblk = len(vals) // blk
+        raw = bytearray()
+        for _ in range(nblk):
+            b2 = bytearray(rnd_byte() for _ in range(_blk_bytes))
+            if dtype == T_Q2_K:
+                b2[80:82], b2[82:84] = f16(0.02), f16(0.01)
+            else:
+                b2[108:110] = f16(0.02)
+            raw += b2
+        return bytes(raw), dtype
     if dtype in (T_PTQ1_0, T_TQ1_0):
         # Random trit payload; the scale is a real f16 so the block is legal.
         nblk = len(vals) // blk
@@ -410,14 +431,23 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
         # it is what makes a model big enough to measure against (a 1024x4096
         # tensor is 4M Python floats otherwise, for bytes that are then thrown
         # away one line later).
-        if FORMATS[fmt][0] in (T_PTQ1_0, T_TQ1_0):
+        if FORMATS[fmt][0] in (T_PTQ1_0, T_TQ1_0, T_Q2_K, T_Q3_K):
             _t, _bb, _blk = FORMATS[fmt]
             assert (n_in * n_out) % _blk == 0, (name, n_in, n_out, _blk)
             nblk = (n_in * n_out) // _blk
             raw = bytearray()
             for _ in range(nblk):
-                raw += bytes(rnd_byte() for _ in range(_bb - 2))
-                raw += f16(0.02)
+                if _t == T_Q2_K:
+                    b2 = bytearray(rnd_byte() for _ in range(_bb))
+                    b2[80:82], b2[82:84] = f16(0.02), f16(0.01)
+                    raw += b2
+                elif _t == T_Q3_K:
+                    b2 = bytearray(rnd_byte() for _ in range(_bb))
+                    b2[108:110] = f16(0.02)
+                    raw += b2
+                else:
+                    raw += bytes(rnd_byte() for _ in range(_bb - 2))
+                    raw += f16(0.02)
             g.tensor(name, n_in, n_out, bytes(raw), _t)
             return
         # Streaming threshold: below it the pure-Python boxed-float list is

@@ -910,6 +910,256 @@ void deq_ptq1_0(const u8 *b, f32 *y, i64 nblk) {
 #include "quant_fmt_c.inc"
 
 // ---------------------------------------------------------------------------
+// K-quant int8 dots: Q3_K (110 B / 256) and Q2_K (84 B / 256).
+//
+// Both are Q6_K's block shape -- 256 values in sixteen 16-value sub-blocks, one
+// scale per sub-block -- so the dot is sixteen short integer dots, each scaled
+// by its own `d` and by the activation scale of the 32-value chunk it sits in.
+// What differs is only the unpack:
+//
+//   Q3_K   value = (q >> 2j & 3) - (hmask bit ? 0 : 4),   in [-4, 3]
+//          scale = d_all * (6-bit signed scale - 32)
+//   Q2_K   value = (q >> 2j & 3),                        in [0, 3]
+//          w = d*sc_lo*value - dmin*sc_hi
+//
+// Q3_K's values are SIGNED and range to -4, so the magnitude/sign trick that
+// carries Q8_0 and the ternary kernels does not apply directly (sign_epi8 is
+// only exact for -1/0/+1). `_mm_abs_epi8` gives |v| in 0..4, which IS a legal
+// unsigned operand for maddubs, and sign_epi8(x, v) gives x*sign(v) -- so
+// maddubs(|v|, x*sign(v)) is exactly SUM v*x.
+//
+// Q2_K needs two sums per sub-block: SUM value*x for the d*sc_lo term and
+// SUM x for the dmin*sc_hi term. The second one is per 16 values, which is why
+// this format does not use the per-32 `xs` sidecar Q4_K reads -- the kernel
+// computes it inline from the activation bytes it already has in registers.
+//
+// Both unpackers below are the dequantisers' own formulas restricted to one
+// block (deq_q3_k / deq_q2_k), and the fixtures that drive them are random
+// bytes. So the kernel is pinned to the reference decoder rather than to a
+// second opinion about the layout.
+
+// Fill `vals` (256) and `dsub` (16) for one Q3_K block; returns nothing.
+static void q3k_unpack(const u8 *b, i8 *vals, f32 *dsub) {
+    constexpr u32 kMask1 = 0x03030303u;
+    constexpr u32 kMask2 = 0x0f0f0f0fu;
+    const f32 d_all = fp16_to_fp32(static_cast<u16>(b[108] | (b[109] << 8)));
+    const u8 *hm = b;
+    const u8 *q = b + 32;
+    u32 aux[4];
+    std::memset(aux, 0, sizeof(aux));
+    std::memcpy(aux, b + 96, 12);
+    const u32 tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kMask2) | (((tmp >> 4) & kMask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kMask2) | (((tmp >> 6) & kMask1) << 4);
+    aux[0] = (aux[0] & kMask2) | (((tmp >> 0) & kMask1) << 4);
+    aux[1] = (aux[1] & kMask2) | (((tmp >> 2) & kMask1) << 4);
+    const i8 *scales = reinterpret_cast<const i8 *>(aux);
+    const __m128i m3 = _mm_set1_epi8(3);
+    const __m128i m1 = _mm_set1_epi8(1);
+    const __m128i four = _mm_set1_epi8(4);
+    for (int s = 0; s < 16; s++) {
+        dsub[s] = d_all * static_cast<f32>(scales[s] - 32);
+        // Sub-block s covers values [s*16, s*16+16): the low/high half of the
+        // 2j bit-plane, in the 128-value group s/8. Value v's quantum byte is
+        // hm[v % 32] and its hmask bit is v/32 == s/2.
+        const int nn = s / 8, j = (s % 8) / 2, half = s % 2;
+        const u8 *qq = q + nn * 32 + half * 16;
+        const u8 *hh = hm + half * 16;
+        const __m128i qv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(qq));
+        const __m128i hv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(hh));
+        // The 2-bit plane, sixteen values at once. A 16-bit-lane shift would
+        // pull the neighbouring byte's low bits into the high byte, but the
+        // mask to 2 bits discards exactly those, for both bytes of every lane.
+        const __m128i q2 = _mm_and_si128(
+            _mm_srl_epi16(qv, _mm_cvtsi32_si128(2 * j)), m3);
+        // The hmask bit is UNIFORM across the group (it is s/2), so the same
+        // 16-bit-lane shift is exact here too once masked to one bit.
+        const __m128i hb = _mm_and_si128(
+            _mm_srl_epi16(hv, _mm_cvtsi32_si128(s / 2)), m1);
+        // value = q2 - (hb ? 0 : 4) = q2 + 4*hb - 4
+        const __m128i v = _mm_sub_epi8(
+            _mm_add_epi8(q2, _mm_slli_epi16(hb, 2)), four);
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(vals + s * 16), v);
+    }
+}
+
+// Fill `vals` (256, in [0,3]) plus the two per-sub-block scale tables.
+static void q2k_unpack(const u8 *b, i8 *vals, f32 *dlo, f32 *dmn) {
+    const f32 d = fp16_to_fp32(static_cast<u16>(b[80] | (b[81] << 8)));
+    const f32 dmin = fp16_to_fp32(static_cast<u16>(b[82] | (b[83] << 8)));
+    for (int s = 0; s < 16; s++) {
+        const u8 sc = b[s];
+        dlo[s] = d * static_cast<f32>(sc & 0xF);
+        dmn[s] = dmin * static_cast<f32>(sc >> 4);
+        const int g = s / 8, j = (s % 8) / 2, half = s % 2;
+        const u8 *qq = b + 16 + g * 32 + half * 16;
+        const __m128i qv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(qq));
+        const __m128i q2 = _mm_and_si128(
+            _mm_srl_epi16(qv, _mm_cvtsi32_si128(2 * j)), _mm_set1_epi8(3));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(vals + s * 16), q2);
+    }
+}
+
+// The four i32 lane partial sums of a 16-value dot. Returned as a vector, NOT
+// reduced to a scalar: the first version of these kernels summed the lanes by
+// storing to the stack and reloading them once per 16-value sub-block, sixteen
+// times per block per row, which measured SLOWER than dequantising -- 24.1
+// against 36.1 tok/s on a Q2_K model. A store-to-load of a vector lane is a
+// forwarding stall on most cores, and there were 128 of them per block for the
+// eight rows.
+//
+// Keeping the lanes in registers and folding them into an f32 accumulator (the
+// scale multiply has to be per sub-block anyway) removes the round trip
+// entirely: the reduction is one horizontal add per row at the very end.
+static inline __m128i dot16_signed_lanes(const i8 *av, const i8 *bv,
+                                         const __m128i ones16) {
+    const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(av));
+    const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(bv));
+    const __m128i mag = _mm_abs_epi8(a);
+    const __m128i sg = _mm_sign_epi8(b, a);
+    return _mm_madd_epi16(_mm_maddubs_epi16(mag, sg), ones16);
+}
+
+static inline __m128i dot16_unsigned_lanes(const i8 *av, const i8 *bv,
+                                           const __m128i ones16) {
+    const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(av));
+    const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(bv));
+    return _mm_madd_epi16(_mm_maddubs_epi16(a, b), ones16);
+}
+
+static inline __m128i sum16_lanes(const i8 *bv, const __m128i ones8,
+                                  const __m128i ones16) {
+    const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(bv));
+    return _mm_madd_epi16(_mm_maddubs_epi16(ones8, b), ones16);
+}
+
+// horizontal sum of four f32 lanes
+static inline f32 hsum4_ps(__m128 v) {
+    const __m128 t = _mm_add_ps(v, _mm_movehl_ps(v, v));
+    return _mm_cvtss_f32(_mm_add_ss(t, _mm_shuffle_ps(t, t, 0x55)));
+}
+
+static void q3k_dot_x8_impl(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                            i64 rstride, i64 dstride, f32 *out,
+                            i64 out_stride) {
+    const __m128i ones16 = _mm_set1_epi16(1);
+    __m128 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm_setzero_ps();
+    alignas(32) i8 vals[256];
+    f32 dsub[16];
+    for (i64 nb = 0; nb < n / 256; nb++, w += 110) {
+        q3k_unpack(w, vals, dsub);
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const f32 *dr = dx + static_cast<i64>(r) * dstride + nb * 8;
+            for (int s = 0; s < 16; s++) {
+                const __m128 sc = _mm_set1_ps(dsub[s] * dr[s / 2]);
+                const __m128i l =
+                    dot16_signed_lanes(vals + s * 16, xr + s * 16, ones16);
+                acc[r] = _mm_fmadd_ps(sc, _mm_cvtepi32_ps(l), acc[r]);
+            }
+        }
+    }
+    for (int r = 0; r < 8; r++)
+        out[static_cast<i64>(r) * out_stride] = hsum4_ps(acc[r]);
+}
+
+static void q2k_dot_x8_impl(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                            i64 rstride, i64 dstride, f32 *out,
+                            i64 out_stride) {
+    const __m128i ones8 = _mm_set1_epi8(1);
+    const __m128i ones16 = _mm_set1_epi16(1);
+    __m128 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm_setzero_ps();
+    alignas(32) i8 vals[256];
+    f32 dlo[16], dmn[16];
+    for (i64 nb = 0; nb < n / 256; nb++, w += 84) {
+        q2k_unpack(w, vals, dlo, dmn);
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const f32 *dr = dx + static_cast<i64>(r) * dstride + nb * 8;
+            for (int s = 0; s < 16; s++) {
+                const i8 *xs = xr + s * 16;
+                const f32 dc = dr[s / 2];
+                const __m128 sl = _mm_set1_ps(dlo[s] * dc);
+                const __m128 sm = _mm_set1_ps(-dmn[s] * dc);
+                const __m128i l2 = dot16_unsigned_lanes(vals + s * 16, xs,
+                                                        ones16);
+                const __m128i lx = sum16_lanes(xs, ones8, ones16);
+                acc[r] = _mm_fmadd_ps(sl, _mm_cvtepi32_ps(l2), acc[r]);
+                acc[r] = _mm_fmadd_ps(sm, _mm_cvtepi32_ps(lx), acc[r]);
+            }
+        }
+    }
+    for (int r = 0; r < 8; r++)
+        out[static_cast<i64>(r) * out_stride] = hsum4_ps(acc[r]);
+}
+
+static f32 q3k_dot_1_impl(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    const __m128i ones16 = _mm_set1_epi16(1);
+    alignas(32) i8 vals[256];
+    f32 dsub[16];
+    __m128 acc = _mm_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 110) {
+        q3k_unpack(w, vals, dsub);
+        const i8 *xr = xq + nb * 256;
+        const f32 *dr = dx + nb * 8;
+        for (int s = 0; s < 16; s++) {
+            const __m128 sc = _mm_set1_ps(dsub[s] * dr[s / 2]);
+            acc = _mm_fmadd_ps(
+                sc, _mm_cvtepi32_ps(dot16_signed_lanes(vals + s * 16,
+                                                       xr + s * 16, ones16)),
+                acc);
+        }
+    }
+    return hsum4_ps(acc);
+}
+
+static f32 q2k_dot_1_impl(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    const __m128i ones8 = _mm_set1_epi8(1);
+    const __m128i ones16 = _mm_set1_epi16(1);
+    alignas(32) i8 vals[256];
+    f32 dlo[16], dmn[16];
+    __m128 acc = _mm_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 84) {
+        q2k_unpack(w, vals, dlo, dmn);
+        const i8 *xr = xq + nb * 256;
+        const f32 *dr = dx + nb * 8;
+        for (int s = 0; s < 16; s++) {
+            const i8 *xs = xr + s * 16;
+            const f32 dc = dr[s / 2];
+            acc = _mm_fmadd_ps(
+                _mm_set1_ps(dlo[s] * dc),
+                _mm_cvtepi32_ps(
+                    dot16_unsigned_lanes(vals + s * 16, xs, ones16)),
+                acc);
+            acc = _mm_fmadd_ps(
+                _mm_set1_ps(-dmn[s] * dc),
+                _mm_cvtepi32_ps(sum16_lanes(xs, ones8, ones16)), acc);
+        }
+    }
+    return hsum4_ps(acc);
+}
+
+void q3k_q8_x8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                        i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    q3k_dot_x8_impl(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+
+void q2k_q8_x8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                        i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    q2k_dot_x8_impl(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+
+f32 q3k_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return q3k_dot_1_impl(w, xq, dx, n);
+}
+
+f32 q2k_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return q2k_dot_1_impl(w, xq, dx, n);
+}
+
+// ---------------------------------------------------------------------------
 // TERNARY int8 dots: TQ1_0 (BitNet, 256 values / 54 B) and PTQ1_0
 // (Ternary-Bonsai, 128 values / 28 B).
 //
@@ -1099,6 +1349,24 @@ f32 dot_tq1_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 
 f32 dot_ptq1_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     return ptq1_0_q8_internal(w, xq, dx, n);
+}
+
+void dot_q3_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    q3k_q8_x8_internal(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+
+void dot_q2_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    q2k_q8_x8_internal(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+
+f32 dot_q3_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return q3k_q8_internal(w, xq, dx, n);
+}
+
+f32 dot_q2_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return q2k_q8_internal(w, xq, dx, n);
 }
 
 // ---------------------------------------------------------------------------

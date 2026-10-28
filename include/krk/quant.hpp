@@ -274,6 +274,15 @@ f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 // into the integer dot, plus the eight-row prefill shape for the same.
 f32 dot_q6_K_q8_sq4(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4,
                     i64 n);
+// Q2_K / Q3_K: 256 values in sixteen 16-value sub-blocks, one scale each --
+// Q6_K's block shape with a different unpack. Neither needs a sum(x) sidecar.
+void dot_q3_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+void dot_q2_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+f32 dot_q3_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_q2_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+
 // Ternary blocks (BitNet TQ1_0, Ternary-Bonsai PTQ1_0): values are
 // {-1,0,+1} behind one f16 scale, so the dot needs no sum(x) sidecar.
 void dot_tq1_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
