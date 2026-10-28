@@ -604,6 +604,9 @@ target_link_libraries(kraken-attn-multiseq PRIVATE krk_core)
 
 # Every rung of the Q8_0 kernel ladder on whatever host runs it: VNNI, AVX-512BW,
 # AVX2, scalar. Absent rungs are reported, not skipped silently.
+add_executable(kraken-kquant-dot tools/ta_kquant_dot.cpp)
+target_link_libraries(kraken-kquant-dot PRIVATE krk_core)
+
 add_executable(kraken-q80-tiers tools/ta_q80_tiers.cpp)
 target_link_libraries(kraken-q80-tiers PRIVATE krk_core)
 

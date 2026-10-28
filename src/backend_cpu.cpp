@@ -670,17 +670,24 @@ public:
         // an int8 dot with no bias term and no sidecar -- the cheapest of any
         // format in this list per stored byte. The gate is the same 256-value
         // alignment because that is what the activation quantiser produces.
+        // Q2_K and Q3_K join here too: both are Q6_K's 256-value block with a
+        // different unpack, so they take the same dispatch and the same
+        // eight-row sharing.
         if ((wt == DType::Q4_K || wt == DType::Q6_K || wt == DType::Q8_0 ||
-             wt == DType::TQ1_0 || wt == DType::PTQ1_0) &&
+             wt == DType::TQ1_0 || wt == DType::PTQ1_0 ||
+             wt == DType::Q2_K || wt == DType::Q3_K) &&
             n_in > 0 && (n_in % 256) == 0 && rows > 0 && vec_dot_int8()) {
             const bool q6 = wt == DType::Q6_K;
             const bool q80 = wt == DType::Q8_0;
             const bool tq1 = wt == DType::TQ1_0;
             const bool ptq1 = wt == DType::PTQ1_0;
-            // Both ternary formats are "magnitude-split free" like Q8_0: the
-            // dot needs no per-block sum of the activation, so neither aux
-            // array is allocated for them.
-            const bool none_aux = q80 || tq1 || ptq1;
+            const bool q3k = wt == DType::Q3_K;
+            const bool q2k = wt == DType::Q2_K;
+            // Only Q4_K reads the per-32 `xs` sidecar. Q8_0 and the ternary
+            // formats need no sum of the activation at all, and Q2_K/Q3_K take
+            // their sums per 16-value sub-block inside the kernel -- where the
+            // bytes are already in registers -- so none of them allocates it.
+            const bool none_aux = q80 || tq1 || ptq1 || q2k || q3k;
             const i64 nb = n_in / 32;
             // Owned by the CALLING thread and captured by value below. These
             // were thread_local, which looks like a free optimisation and is a
@@ -767,7 +774,13 @@ public:
                               static_cast<f64>(n_out) * static_cast<f64>(n_in);
             const i64 rows8 = rows - rows % 8;
             auto dot8 = [&](const u8 *wr, i64 r, i64 o) {
-                if (tq1)
+                if (q3k)
+                    dot_q3_K_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                   n_in, nb, of + r * n_out + o, n_out);
+                else if (q2k)
+                    dot_q2_K_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                   n_in, nb, of + r * n_out + o, n_out);
+                else if (tq1)
                     dot_tq1_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
                                     n_in, nb, of + r * n_out + o, n_out);
                 else if (ptq1)
@@ -786,6 +799,10 @@ public:
                                       of + r * n_out + o, n_out);
             };
             auto dot1 = [&](const u8 *wr, i64 r, i64 o) {
+                if (q3k)
+                    return dot_q3_K_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q2k)
+                    return dot_q2_K_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
                 if (tq1)
                     return dot_tq1_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
                 if (ptq1)

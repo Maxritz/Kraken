@@ -1150,3 +1150,22 @@ tok/s prefill (1.20×)**. Verified against the dequantising path on identical
 bytes — same ranking, values agreeing to the fourth decimal.
 See [docs/TERNARY-KERNELS.md](docs/TERNARY-KERNELS.md), which also lists the
 formats still missing kernels and why each is the same job again.
+
+### Q2_K and Q3_K int8 dot kernels
+
+Six of the thirty support-list files are Q2_K or Q3_K; neither had a dot kernel.
+Both are Q6_K's block shape (256 values, sixteen 16-value sub-blocks, one scale
+each), so the kernels are ports — Q3_K's signed `[-4,3]` values go through
+`abs`/`sign_epi8` because `sign_epi8` is only exact for `-1/0/+1`, and Q2_K
+takes its two per-sub-block sums inline instead of reading a sidecar.
+
+Two measured mistakes are recorded in [docs/KQUANT-KERNELS.md](docs/KQUANT-KERNELS.md):
+reducing vector lanes through memory made the kernel **slower than
+dequantising** (24.1 vs 36.1 tok/s), and scalar unpacking left Q3_K a non-win
+(23.8 vs 28.0). Vectorised bit-plane extraction — legal because the hmask bit
+index is uniform per 16-value group — turned Q3_K into the biggest ratio here.
+
+Verified against the reference decoder on the *same* activation by
+`kraken-kquant-dot`: worst error 4.1e-08 of gross magnitude, `failure: none`.
+Measured over six alternating reps, Q2_K **2.1×** and Q3_K **4.5×** median
+(6/6 reps favour the kernel for both).
