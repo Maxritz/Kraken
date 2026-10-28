@@ -262,6 +262,10 @@ void dot_q8_0_q8_x8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 void dot_q8_0_q8_x8_tier(i32 tier, const u8 *w, const i8 *xq, const f32 *dx,
                          i64 n, i64 rstride, i64 dstride, f32 *out,
                          i64 out_stride);
+// The single-row (decode) rungs, same ladder: vnni -> bw -> avx2 -> scalar.
+f32 dot_q8_0_q8_scalar(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_q8_0_q8_bw(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_q8_0_q8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 
 void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);

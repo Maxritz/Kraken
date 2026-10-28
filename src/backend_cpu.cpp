@@ -677,14 +677,23 @@ public:
             // data() is nullptr there. ASan caught the read at address 0.
             std::vector<i8> xq(static_cast<size_t>(rows * n_in));
             std::vector<f32> xd(static_cast<size_t>(rows * nb));
+            // The two auxiliary arrays are allocated ONLY for the format that
+            // reads them. They used to be value-initialised unconditionally,
+            // so every Q8_0 call -- the hot format, and the one that needs
+            // neither -- paid to zero rows*nb*4 plus rows*(n_in/4)*4 bytes:
+            // 442 KiB per call at 512x768, times one call per GEMM per layer.
+            // An empty vector's data() is a valid pointer for a size-0
+            // span, and the kernels are only reached from the branch that
+            // filled the matching array.
+            //
             // sum(xi) per sub-block, for formats whose dmin term needs it. The
             // Q4_K kernel reads it; Q6_K does not. Computing it here means it is
             // done once per GEMM call instead of once per weight row.
-            std::vector<i32> xs(static_cast<size_t>(rows * nb), 0);
+            const i64 nq4 = n_in / 4;
+            std::vector<i32> xs(q6 || q80 ? 0 : static_cast<size_t>(rows * nb), 0);
             // Q6_K's scale changes every 16 values and its bias is 32*sum(16),
             // so it needs its own array; Q4_K's is per 32. Only one is filled.
-            const i64 nq4 = n_in / 4;
-            std::vector<i32> xs4(static_cast<size_t>(rows * nq4), 0);
+            std::vector<i32> xs4(q6 ? static_cast<size_t>(rows * nq4) : 0, 0);
             for (i64 r = 0; r < rows; r++) {
                 if (q80)
                     // No sx[]: the magnitude split is exact, so Q8_0 needs no
