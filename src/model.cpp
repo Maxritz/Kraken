@@ -378,6 +378,31 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
     cfg_.tied_embeddings = (gguf_.tensor("output.weight") == nullptr);
 
+    // ---- chat template ---------------------------------------------------
+    // The file's own template when it carries one THIS ENGINE CAN RUN, else the
+    // builtin for the family. The capability check is not decoration: a
+    // template with a `macro` in it parses fine as text and then fails at the
+    // first turn a user types, so the decision is made once, at load, and the
+    // reason is kept.
+    {
+        std::string tmpl = gguf_.get_str("tokenizer.chat_template");
+        if (!chat_template_override_.empty()) tmpl = chat_template_override_;
+        const std::string pre = gguf_.get_str("tokenizer.ggml.pre");
+        builtin_name_ = builtin_chat_template_name(cfg_.arch, pre);
+        builtin_template_ = builtin_chat_template(cfg_.arch, pre);
+        if (!tmpl.empty()) {
+            std::string why;
+            if (chat_template_supported(tmpl, &why)) {
+                chat_template_ = std::move(tmpl);
+            } else {
+                KRK_WARN("chat template: the file's template is outside the "
+                         "supported subset (%s); falling back to the builtin "
+                         "'%s' for arch '%s'",
+                         why.c_str(), builtin_name_, cfg_.arch.c_str());
+            }
+        }
+    }
+
     // ---- Mixture-of-Experts geometry -------------------------------------
     // Qwen2-MoE / Qwen3-MoE (and the other `*moe` archs) describe routed
     // experts with these keys; a dense model simply has n_expert == 0.

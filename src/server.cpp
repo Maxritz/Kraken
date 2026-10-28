@@ -56,12 +56,24 @@ void apply_sampling(const JsonValue &body, f32 default_temp, SampleParams *sp) {
     sp->seed = seed > 0.0 ? static_cast<u64>(seed) : 0;
 }
 
-// Flattens OpenAI `messages` into a prompt using the ChatML template
-// (same shape the CLI's --chat path renders).
-bool render_chat(const JsonValue &body, std::string *prompt) {
+// Flattens OpenAI `messages` into a prompt using the MODEL's chat template --
+// the one the file carries in `tokenizer.chat_template`, or the builtin for its
+// family when the file has none this engine can run.
+//
+// This used to hardcode ChatML. That is Qwen's layout, and every other family
+// in this collection was being handed markers it never saw: Llama-3 answers a
+// `<|im_start|>` prompt the way you would answer a question in a language you
+// only half know -- fluently, and not with what was asked. The template is part
+// of the model.
+bool render_chat(const Engine &engine, const JsonValue &body, std::string *prompt,
+                 std::string *why) {
+    why->clear();
     const JsonValue *msgs = body.find("messages");
-    if (!msgs || !msgs->is_array()) return false;
-    std::string system, transcript;
+    if (!msgs || !msgs->is_array()) {
+        *why = "'messages' must be an array of {role, content} objects";
+        return false;
+    }
+    std::vector<ChatMessage> turns;
     for (const JsonValue &m : msgs->items()) {
         std::string role, content;
         m.get_string("role", &role);
@@ -69,23 +81,39 @@ bool render_chat(const JsonValue &body, std::string *prompt) {
             // tolerate null content (some clients send it for tool stubs)
             const JsonValue *c = m.find("content");
             if (c && c->is_null()) continue;
+            *why = "every message needs a string 'content'";
             return false;
         }
-        if (role == "system") {
-            if (!system.empty()) system += "\n";
-            system += content;
-        } else if (role == "user") {
-            transcript += "<|im_start|>user\n" + content + "<|im_end|>\n";
-        } else if (role == "assistant") {
-            transcript += "<|im_start|>assistant\n" + content + "<|im_end|>\n";
-        }
-        // unknown roles are skipped rather than rejected
+        turns.push_back({role, content});
     }
-    prompt->clear();
-    if (!system.empty()) *prompt += "<|im_start|>system\n" + system + "<|im_end|>\n";
-    *prompt += transcript;
-    *prompt += "<|im_start|>assistant\n";
-    return true;
+    if (turns.empty()) {
+        *why = "'messages' is empty";
+        return false;
+    }
+    const Model &model = engine.model();
+    const Tokenizer &tk = engine.tokenizer();
+    const std::string bos = tk.piece(tk.bos());
+    const std::string eos = tk.piece(tk.eos());
+    // `add_generation_prompt` is true unless the client explicitly asked for the
+    // transcript alone: an OpenAI chat call is by definition about to be
+    // continued by the model.
+    bool add_prompt = true;
+    body.get_bool("add_generation_prompt", &add_prompt);
+    std::string err;
+    if (render_chat_prompt(model.chat_template_or_builtin(), turns, add_prompt,
+                           bos, eos, prompt, &err)) {
+        return true;
+    }
+    // The template ran and refused the conversation (Gemma with an odd number
+    // of turns, say). Reporting the template's own words is the only honest
+    // answer: rendering some other layout would answer a different prompt.
+    std::fprintf(stderr, "[warn ] chat template: %s\n", err.c_str());
+    // The template's own words: the caller sent a conversation this model's
+    // layout cannot express, and inventing a different one would answer a
+    // prompt nobody wrote.
+    *why = "chat template (" + std::string(model.chat_template_source()) +
+           "): " + err;
+    return false;
 }
 
 const char *finish_name(int finish) {
@@ -310,9 +338,9 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
 
     std::string prompt;
     if (chat) {
-        if (!render_chat(body, &prompt)) {
-            res = json_response(
-                400, error_body("'messages' must be an array of {role, content} objects"));
+        std::string why;
+        if (!render_chat(*engine_, body, &prompt, &why)) {
+            res = json_response(400, error_body(why));
             return true;
         }
     } else {

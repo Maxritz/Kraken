@@ -377,7 +377,7 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
           fused=False, fused_ffn=None, plain=None, split_qkv=False,
           alibi=8.0, qk_norm=False, attn_norm_2=False,
           attn_norm_2_identity=False, schema=None, split_ffn=False,
-          out_bias=0.0):
+          out_bias=0.0, chat_template=""):
     # `fused` is the Q|K|V projection, `fused_ffn` the gate|up one; a Phi file
     # has both, and the two are separable so a test can fuse one at a time and
     # find which of them changed the logits.
@@ -496,6 +496,12 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
             # from it exactly as llama.cpp derives it).
             g.u32(arch + ".expert_shared_count", 1)
             g.u32(arch + ".expert_gating_func", g_meta_gating)
+    # `tokenizer.chat_template` is a Jinja program in the file. Written verbatim
+    # so a fixture can pin what the engine does with a real one -- the layout is
+    # part of the model, and a test that never sees the metadata cannot check
+    # that the engine reads it.
+    if chat_template:
+        g.string("tokenizer.chat_template", chat_template)
     g.string("tokenizer.ggml.model", "llama")
     g.str_array("tokenizer.ggml.tokens", tokens)
     g.f32_array("tokenizer.ggml.scores", scores)
@@ -745,6 +751,9 @@ def main(argv=None):
                     help="with --schema chatglm: store ffn_gate and ffn_up "
                          "separately instead of the fused gate|up row, on the "
                          "same weight stream, so the two layouts must match")
+    ap.add_argument("--chat-template", default="",
+                    help="write this Jinja program as tokenizer.chat_template, "
+                         "so the file declares its own turn layout")
     ap.add_argument("--schema", default="",
                     choices=["", "chatglm", "glm4", "glm4moe", "mellum",
                              "phimoe", "phi3moe", "minicpm", "minicpm3",
@@ -816,7 +825,8 @@ def main(argv=None):
                  attn_norm_2=a.attn_norm_2 or a.attn_norm_2_identity,
                  attn_norm_2_identity=a.attn_norm_2_identity,
                  schema=a.schema or None, split_ffn=a.split_ffn,
-                 out_bias=a.out_bias)
+                 out_bias=a.out_bias,
+                 chat_template=a.chat_template)
     moe = ("%d experts top-%d, expert ff %d, " % (a.experts, used, ff_exp)
            if a.experts else "")
     print("wrote %s: %d layers, embd %d, %d/%d heads, hd %d, ff %d, %s"

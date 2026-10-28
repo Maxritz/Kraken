@@ -29,6 +29,10 @@ struct Args {
     std::string model;
     std::string prompt;
     std::string system;
+    // --chat-template NAME|PATH: a builtin by name, or a .jinja file, used
+    // INSTEAD of the one the model carries. Empty keeps the file's own, which
+    // is what a file that has one should always get.
+    std::string chat_template;
     std::string draft;
     // An EAGLE-3 head (tools/eagle_to_gguf.py): a small GGUF beside the model
     // that reads the target's own hidden state and proposes for the same verify
@@ -164,8 +168,13 @@ void usage() {
         "                        (the chunk-invariance gate). Forces the exact\n"
         "                        rung: the default fast rung is not chunk-\n"
         "                        invariant, so the gate could not see anything.\n"
-        "  --chat                wrap the prompt in a ChatML template\n"
+        "  --chat                wrap the prompt in the model's chat template\n"
+        "                        (the file's tokenizer.chat_template, else the\n"
+        "                        builtin for its family -- see --chat-template)\n"
         "  --system STR          system message for --chat\n"
+        "  --chat-template X     a builtin name (chatml, llama3, llama2, mistral,\n"
+        "                        gemma, phi3, deepseek, glm4) or a .jinja file, used\n"
+        "                        instead of the model's own tokenizer.chat_template\n"
         "  --cpu                 use the scalar reference backend\n"
         "                        KRK_CPU_DOT_FAST=1 replaces the block-format\n"
         "                        (q4_0/q8_0/q5/q6...) dot product's single\n"
@@ -474,6 +483,7 @@ bool parse(int argc, char **argv, Args *a) {
             a->prompt_given = true;
         }
         else if (f == "--system") a->system = next("--system");
+        else if (f == "--chat-template") a->chat_template = next("--chat-template");
         else if (f == "--draft" || f == "-d") a->draft = next("--draft");
         else if (f == "--draft-tokens")
         {
@@ -636,19 +646,83 @@ bool parse(int argc, char **argv, Args *a) {
     return true;
 }
 
-std::string chatml(const std::string &system, const std::string &user) {
+// Whole file into a string, for --chat-template FILE.jinja. Returns false when
+// the path does not open; an empty file is the caller's problem to reject.
+bool read_text_file(const std::string &path, std::string *out) {
+    std::FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::string r;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) r.append(buf, n);
+    std::fclose(f);
+    *out = std::move(r);
+    return true;
+}
+
+// Comma-joined for one error message.
+std::string join_names(const std::vector<std::string> &v) {
+    std::string r;
+    for (size_t i = 0; i < v.size(); i++) {
+        if (i) r += ", ";
+        r += v[i];
+    }
+    return r;
+}
+
+// One user turn rendered with the MODEL's template -- the file's own when it
+// carries one this engine can run, otherwise the builtin for its family.
+//
+// This used to be a hardcoded ChatML string. ChatML is Qwen's layout; feeding
+// it to a Llama-3, Gemma, Phi-3 or Mistral checkpoint hands the model markers it
+// never saw, and the result reads as a much dumber model rather than as a bug.
+// The layout is part of the model, and the file states it.
+std::string render_turn(const Engine &engine, const std::string &system,
+                        const std::string &user) {
+    const Model &m = engine.model();
+    std::vector<ChatMessage> msgs;
+    if (!system.empty()) msgs.push_back({"system", system});
+    msgs.push_back({"user", user});
+    std::string out, err;
+    // The token ids are what the template's `bos_token`/`eos_token` mean, so
+    // they are read from the tokenizer's own vocabulary rather than guessed.
+    const Tokenizer &tk = engine.tokenizer();
+    const std::string bos = tk.piece(tk.bos());
+    const std::string eos = tk.piece(tk.eos());
+    if (render_chat_prompt(m.chat_template_or_builtin(), msgs, true, bos, eos,
+                           &out, &err)) {
+        return out;
+    }
+    // The template ran and refused (a role the family does not accept, say).
+    // Falling back to ChatML would decode a different prompt; saying so and
+    // rendering the plain transcript is the honest recovery.
+    std::fprintf(stderr, "[warn ] chat template: %s\n", err.c_str());
     std::string s;
-    if (!system.empty()) s += "<|im_start|>system\n" + system + "<|im_end|>\n";
-    s += "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n";
+    if (!system.empty()) s += system + "\n\n";
+    s += user;
     return s;
 }
 
 struct SinkCtx {
     bool chat = false;
     std::string hold;
+    // The turn-end markers this model's template actually uses. ChatML's
+    // `<|im_end|>` was hardcoded here, so a Llama-3 run printed `<|eot_id|>` at
+    // the end of every reply and a Gemma run printed `<end_of_turn>`. The
+    // rendered prompt contains the separator the template writes after each
+    // turn, so the markers are read from it rather than assumed.
+    std::vector<std::string> markers;
+    size_t longest = 0;
 };
 
-// Streams generated text, hiding the ChatML end marker from the transcript.
+void collect_turn_markers(const std::string &prompt, SinkCtx *c) {
+    c->markers = chat_turn_markers(prompt);
+    for (const std::string &m : c->markers)
+        if (m.size() > c->longest) c->longest = m.size();
+}
+
+// Streams generated text, hiding the template's turn-end markers from the
+// transcript.
 void sink_cb(void *user, const char *text, i32 token, bool done) {
     SinkCtx *c = static_cast<SinkCtx *>(user);
     (void)token;
@@ -663,14 +737,25 @@ void sink_cb(void *user, const char *text, i32 token, bool done) {
         return;
     }
     c->hold += text;
-    const std::string marker = "<|im_end|>";
-    size_t pos;
-    while ((pos = c->hold.find(marker)) != std::string::npos) {
-        std::fputs(c->hold.substr(0, pos).c_str(), stdout);
-        c->hold.erase(0, pos + marker.size());
+    // Cut out every marker, earliest first, so a reply that closes two turns
+    // still emits its words in order.
+    for (;;) {
+        size_t best = std::string::npos, best_len = 0;
+        for (const std::string &marker : c->markers) {
+            const size_t pos = c->hold.find(marker);
+            if (pos != std::string::npos && (best == std::string::npos || pos < best)) {
+                best = pos;
+                best_len = marker.size();
+            }
+        }
+        if (best == std::string::npos) break;
+        std::fputs(c->hold.substr(0, best).c_str(), stdout);
+        c->hold.erase(0, best + best_len);
     }
-    if (c->hold.size() > marker.size()) {
-        const size_t keep = marker.size() - 1;
+    // Hold back enough characters that a marker split across two tokens is
+    // still recognised instead of being printed half and then dropped.
+    const size_t keep = c->longest > 1 ? c->longest - 1 : 0;
+    if (c->hold.size() > keep) {
         const size_t emit = c->hold.size() - keep;
         std::fputs(c->hold.substr(0, emit).c_str(), stdout);
         c->hold.erase(0, emit);
@@ -1535,6 +1620,26 @@ int main(int argc, char **argv) {
 
     EngineConfig cfg;
     cfg.model_path = a.model;
+    // --chat-template: a builtin name, or a path to a .jinja file. Resolved
+    // here so a typo is a startup error rather than a silent ChatML prompt on
+    // the first turn.
+    if (!a.chat_template.empty()) {
+        std::string t = builtin_chat_template_by_name(a.chat_template);
+        if (t.empty()) {
+            std::string contents;
+            if (read_text_file(a.chat_template, &contents) && !contents.empty()) {
+                t = contents;
+            } else {
+                std::fprintf(stderr,
+                             "kraken: --chat-template '%s' is neither a builtin "
+                             "(%s) nor a readable file\n",
+                             a.chat_template.c_str(),
+                             join_names(builtin_chat_template_names()).c_str());
+                return 1;
+            }
+        }
+        cfg.chat_template = std::move(t);
+    }
     cfg.n_ctx = a.ctx;
     cfg.prefill_chunk = a.chunk;
     cfg.kv_quant = a.kv_quant;
@@ -1734,10 +1839,10 @@ int main(int argc, char **argv) {
     // rules can be diffed instead of inferred from the generated text.
     if (a.tokenize) {
         const std::string text =
-            a.prompt_given ? (a.chat ? chatml(a.system, a.prompt) : a.prompt)
+            a.prompt_given ? (a.chat ? render_turn(engine, a.system, a.prompt) : a.prompt)
                            : std::string();
         std::vector<i32> ids;
-        const int n = engine.tokenizer().encode(text, ids, true);
+        const int n = engine.tokenize_prompt(text, ids);
         std::printf("%d tokens\n[", n);
         for (int i = 0; i < n; i++) std::printf("%s%d", i ? ", " : "", ids[i]);
         std::printf("]\n");
@@ -1766,7 +1871,7 @@ int main(int argc, char **argv) {
     if (a.prefill_hash) {
         GenerateParams p;
         p.prompt = a.prompt_given
-                       ? (a.chat ? chatml(a.system, a.prompt) : a.prompt)
+                       ? (a.chat ? render_turn(engine, a.system, a.prompt) : a.prompt)
                        : std::string();
         p.max_tokens = 1; // the loop stops after the prefill's first token
         p.sampler.greedy = true;
@@ -1807,6 +1912,13 @@ int main(int argc, char **argv) {
 
     SinkCtx sink;
     sink.chat = a.chat;
+    if (a.chat) {
+        // The markers are a property of the layout, so they are collected from
+        // the template's own output for this very turn.
+        const std::string probe = render_turn(engine, a.system,
+                                              a.prompt_given ? a.prompt : std::string());
+        collect_turn_markers(probe, &sink);
+    }
 
     const f64 load_ms = bench_load_ms;
     auto generate_once = [&](const std::string &prompt) -> bool {
@@ -1890,7 +2002,7 @@ int main(int argc, char **argv) {
 
     int rc = 0;
     if (a.prompt_given) {
-        rc = generate_once(a.chat ? chatml(a.system, a.prompt) : a.prompt) ? 0 : 1;
+        rc = generate_once(a.chat ? render_turn(engine, a.system, a.prompt) : a.prompt) ? 0 : 1;
         std::printf("\n");
     } else if (a.interactive) {
         std::string line;
@@ -1901,7 +2013,7 @@ int main(int argc, char **argv) {
             if (line == "/quit" || line == "/exit") break;
             if (line.empty()) continue;
             sink.hold.clear();
-            if (!generate_once(a.chat ? chatml(a.system, line) : line)) {
+            if (!generate_once(a.chat ? render_turn(engine, a.system, line) : line)) {
                 rc = 1;
                 break;
             }

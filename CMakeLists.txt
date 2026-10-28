@@ -104,6 +104,7 @@ set(KRK_CORE_SOURCES
     src/quant.cpp
     src/gguf.cpp
     src/tokenizer.cpp
+    src/chat_template.cpp
     src/sampler.cpp
     src/spec_sampling.cpp
     src/hc.cpp

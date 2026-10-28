@@ -13,6 +13,7 @@
 
 #include "krk/backend.hpp"
 #include "krk/expert_cache.hpp"
+#include "krk/chat_template.hpp"
 #include "krk/gguf.hpp"
 
 #include <cmath> // std::tanh in apply_logit_softcap, called from every path
@@ -1048,6 +1049,30 @@ public:
     const std::vector<f32> &inv_freq() const { return inv_freq_; }
     i64 weight_bytes() const { return weight_bytes_; }
     const Gguf &gguf() const { return gguf_; }
+
+    // ---- chat template ---------------------------------------------------
+    // The Jinja program the file carries (`tokenizer.chat_template`), or empty.
+    // It is the file's own statement of the byte layout its turns were trained
+    // on, which is why it is read rather than guessed from the arch -- see
+    // include/krk/chat_template.hpp for why the layout is correctness and not
+    // cosmetics.
+    const std::string &chat_template() const { return chat_template_; }
+    // What to actually render with: the file's template when it has one this
+    // engine can run, otherwise the builtin for the family. Never empty.
+    const std::string &chat_template_or_builtin() const {
+        return chat_template_.empty() ? builtin_template_ : chat_template_;
+    }
+    // "file", or the builtin's name -- for a log line that has to say which
+    // template produced the prompt, because a silent fallback is exactly the
+    // failure this whole module exists to prevent.
+    const char *chat_template_source() const {
+        return chat_template_.empty() ? builtin_name_ : "file";
+    }
+    // A caller's override (--chat-template): set BEFORE load(), since the
+    // resolution happens there.
+    void set_chat_template_override(std::string t) {
+        chat_template_override_ = std::move(t);
+    }
     // The prism.hadamard plan for this file (inactive for everything else).
     const HadamardPlan &had() const { return had_; }
     // The +-1 sign vector for a folded input `width` wide, in the backend's
@@ -1239,6 +1264,10 @@ private:
     size_t stream_off_ = 0;      // ring write offset for the current layer
     i32 stream_layer_index_ = -1;
     Gguf gguf_;
+    std::string chat_template_;
+    std::string builtin_template_ = builtin_chat_template("", "");
+    const char *builtin_name_ = kBuiltinDefault;
+    std::string chat_template_override_;
     ModelConfig cfg_;
     MtpBlock mtp_;
     bool mtp_load_ = false;
