@@ -134,6 +134,26 @@ struct ArchSpec {
     bool qsa = false;
     bool attn_gate_elem = false;
     bool no_out_norm = false;
+    // ---- GPT-2 (gpt2) -----------------------------------------------------
+    // The pre-RMSNorm, pre-rotary family, and four differences that all have to
+    // travel together because they are one architecture rather than four
+    // options -- a file that had some and not others does not exist, and
+    // splitting them into separate booleans would let a future reader set an
+    // impossible combination:
+    //
+    //   * LayerNorm (mean-subtracting, with a bias) in place of RMSNorm, so
+    //     every norm in the stack carries a `bias` tensor beside its weight.
+    //   * LEARNED absolute position embeddings (`position_embd.weight`,
+    //     [n_ctx_train, n_embd]) summed into the token embedding. There is no
+    //     rotary table at all; rotating here would be silently wrong because
+    //     positional information has already been added by the time attention
+    //     runs.
+    //   * a FUSED `attn_qkv` projection, [n_embd, 3*n_embd], whose output is
+    //     three contiguous blocks (Q | K | V) of n_embd each, plus a single
+    //     3*n_embd bias. The split is a stride, not a gather.
+    //   * a PLAIN GELU MLP: up -> gelu -> down. The gated `silu(gate)*up`
+    //     shape the other families use has no gate tensor here, and reading
+    //     ffn_up as a gate would halve the intermediate width.
     // ---- MLA (DeepSeek-V2/V3/V4) -----------------------------------------
     // Multi-head latent attention: the K/V a layer attends is not per-head
     // rows but one compressed latent (cKV, kv_lora_rank wide) plus a
@@ -194,6 +214,12 @@ struct ArchSpec {
     // windowed layers, NoPE on the full ones). The rotation table is still
     // built per layer; this says the full layers' table is not used.
     bool rope_swa_only = false;
+    // GPT-2 and its descendants. This flag must stay LAST: every row below is
+    // a positional aggregate initializer, so a member inserted in the middle
+    // silently shifts every field after it onto the wrong value. It did --
+    // `gpt2_style` landed where `qkv_bias` had been, and every row from
+    // deepseek2 onwards then read as GPT-2 in the loader.
+    bool gpt2_style = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

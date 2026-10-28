@@ -59,6 +59,8 @@ struct Args {
     std::string draft;
     int draft_tokens = 4;
     bool cpu = false;
+    bool npu = false;
+    bool npu_cpu = false;
     bool verbose = false;
     f32 default_temp = 0.8f;
 };
@@ -106,6 +108,12 @@ void usage() {
         "  --draft MODEL         draft model for greedy speculative decoding\n"
         "  --draft-tokens N      speculation window (default 4)\n"
         "  --cpu                 use the scalar reference backend\n"
+        "  --npu                 run the GEMM path on the virtual NPU\n"
+        "                        (github.com/riteshnair/npuxl-improved; needs a\n"
+                        "                        -DKRK_ENABLE_NPU=ON build)\n"
+        "  --npu-cpu             run the whole inference through the virtual NPU\n"
+        "                        (every op the device has; reference bodies for\n"
+        "                        the ops it lacks)\n"
         "  -v                    verbose logging\n"
         "  -h, --help            this message\n",
         kEngineName, kEngineVersion);
@@ -215,6 +223,8 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--draft") a->draft = next("--draft");
         else if (f == "--draft-tokens") a->draft_tokens = next_i("--draft-tokens");
         else if (f == "--cpu") a->cpu = true;
+        else if (f == "--npu") a->npu = true;
+        else if (f == "--npu-cpu") a->npu_cpu = true;
         else if (f == "-v" || f == "--verbose") a->verbose = true;
         else if (f == "-h" || f == "--help") { usage(); std::exit(0); }
         else {
@@ -238,7 +248,23 @@ int main(int argc, char **argv) {
 
     std::string err;
     Backend *be = nullptr;
-    if (a.cpu) {
+    if (a.cpu && (a.npu || a.npu_cpu)) {
+        KRK_WARN("--cpu and --npu/--npu-cpu both given; the reference backend wins");
+        a.npu = false;
+        a.npu_cpu = false;
+    }
+    if (a.npu && a.npu_cpu) {
+        KRK_WARN("--npu and --npu-cpu both given; --npu-cpu (the whole graph) wins");
+        a.npu = false;
+    }
+    if (a.npu || a.npu_cpu) {
+        be = make_npu_backend(a.device, a.npu_cpu, &err);
+        if (!be) {
+            KRK_WARN("%s", err.c_str());
+            KRK_WARN("falling back to the CPU reference backend");
+            be = make_cpu_backend();
+        }
+    } else if (a.cpu) {
         be = make_cpu_backend();
     } else {
         // Same mapping the CLI uses: the backend reads its GEMM rung switch once

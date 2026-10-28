@@ -5,11 +5,44 @@
 // tests/test_quant.cpp, so keep the two in lockstep when editing.
 #include "krk/quant.hpp"
 
+#include <atomic>
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <ctime>
+#include <thread>
+
+#if defined(__F16C__) && defined(__FMA__) && \
+    (defined(__x86_64__) || defined(__i386__))
+#include <immintrin.h>
+#define KRK_DOT_F16C 1
+#endif
+
+// The fused block kernels need AVX2 for the 8-wide widen, but must also build
+// on a target that lacks it: -march=native is an option (KRK_NATIVE_CPU), so
+// __AVX2__ is not something this file may assume. Target attributes put the
+// code in the binary; __builtin_cpu_supports decides whether it is entered.
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+#define KRK_DOT_AVX2 1
+// VNNI is a SEPARATE guard: these are GCC/clang target attributes, so the code
+// is in every binary, but a compiler that predates avx512vnni would reject the
+// attribute outright. Guarding it keeps old toolchains building the AVX2 path.
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ >= 11)
+#define KRK_DOT_AVX512 1
+#elif defined(__clang__)
+#define KRK_DOT_AVX512 1
+#endif
+#endif
 
 namespace krk {
 
 namespace {
+
+// Keep-alive sinks for the roofline probes below.
+std::atomic<int> g_probe_sink{0};
+std::atomic<float> g_probe_sink_f{0.0f};
+
 
 // NVFP4 / MXFP4 E2M1 grid, doubled (ggml kvalues_fp4).
 const i8 kValuesFp4[16] = {
@@ -1168,10 +1201,1929 @@ void dequant_row_f16(DType t, const void *src, u16 *out, i64 n) {
     }
 }
 
+namespace {
+#if defined(KRK_DOT_AVX2)
+// ---------------------------------------------------------------------------
+// Fused block kernels (KRK_CPU_DOT_AVX2).
+//
+// What this replaces: dequant_block() widening a 32-value block into a stack
+// buffer one element at a time, then a second pass multiplying that buffer by
+// the activation. Two round trips through L1 per weight, and on a q8_0 expert
+// matrix -- 768x768, the shape a routed expert has in every MoE -- it is what
+// the host-side prefill time is made of.
+//
+// What this does instead: widen eight int8 to eight f32 with two instructions,
+// scale by the block's d, and FMA straight into the accumulator. No stack
+// buffer, no second pass.
+//
+// Why this is allowed near an "exact" backend: it performs the SAME arithmetic
+// in the SAME order as the four-lane path. Element k is d * (f32)w[k] -- one
+// rounding, exactly as the scalar dequant rounds it -- and term k is added to
+// accumulator k mod 4 in increasing k, exactly as the four-lane loop adds it.
+// Both fold as (a0+a1)+(a2+a3). The result is BIT-IDENTICAL to
+// KRK_CPU_DOT_FAST, not merely close, and test_vec_dot_avx2_matches_fast
+// asserts that rather than a tolerance. This is not a third rounding tier.
+//
+// It is still opt-in, because the four-lane path it accelerates is opt-in: the
+// flag alone turns that order on.
+__attribute__((target("avx2,fma"))) inline void fma8(__m128 &acc, __m256 w,
+                                                    const f32 *x) {
+    acc = _mm_fmadd_ps(_mm256_castps256_ps128(w), _mm_loadu_ps(x), acc);
+    acc = _mm_fmadd_ps(_mm256_extractf128_ps(w, 1), _mm_loadu_ps(x + 4), acc);
+}
+
+// q8_0: d (f16) + 32 int8, 34 bytes per block.
+__attribute__((target("avx2,fma"))) f32 dot_q8_0_avx2(const u8 *p, const f32 *x,
+                                                      i64 nb) {
+    __m128 acc = _mm_setzero_ps();
+    for (i64 b = 0; b < nb; b++, p += 34, x += 32) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(
+            p[0] | (static_cast<u16>(p[1]) << 8)));
+        const __m256 dv = _mm256_set1_ps(d);
+        for (int k = 0; k < 32; k += 8) {
+            const __m128i q8 = _mm_loadl_epi64(
+                reinterpret_cast<const __m128i *>(p + 2 + k));
+            const __m256 w = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8)), dv);
+            fma8(acc, w, x + k);
+        }
+    }
+    alignas(16) f32 a[4];
+    _mm_store_ps(a, acc);
+    return (a[0] + a[1]) + (a[2] + a[3]);
+}
+
+// q4_0: d (f16) + 16 bytes of nibbles, 18 bytes per block. Low nibbles are
+// values 0..15 and high nibbles 16..31, so the four widen-and-FMA passes below
+// walk the block in that order and land on the same accumulators the four-lane
+// path would have used.
+__attribute__((target("avx2,fma"))) f32 dot_q4_0_avx2(const u8 *p, const f32 *x,
+                                                      i64 nb) {
+    __m128 acc = _mm_setzero_ps();
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const __m256i off = _mm256_set1_epi32(8);
+    for (i64 b = 0; b < nb; b++, p += 18, x += 32) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(
+            p[0] | (static_cast<u16>(p[1]) << 8)));
+        const __m256 dv = _mm256_set1_ps(d);
+        const __m128i raw = _mm_loadu_si128(
+            reinterpret_cast<const __m128i *>(p + 2));
+        const __m128i lo = _mm_and_si128(raw, m4);
+        const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m4);
+        const __m256 w0 = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo), off)),
+            dv);
+        const __m256 w1 = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_sub_epi32(
+                _mm256_cvtepu8_epi32(_mm_srli_si128(lo, 8)), off)),
+            dv);
+        const __m256 w2 = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi), off)),
+            dv);
+        const __m256 w3 = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_sub_epi32(
+                _mm256_cvtepu8_epi32(_mm_srli_si128(hi, 8)), off)),
+            dv);
+        fma8(acc, w0, x);
+        fma8(acc, w1, x + 8);
+        fma8(acc, w2, x + 16);
+        fma8(acc, w3, x + 24);
+    }
+    alignas(16) f32 a[4];
+    _mm_store_ps(a, acc);
+    return (a[0] + a[1]) + (a[2] + a[3]);
+}
+
+// Asked once. A build made without AVX2 in -march still contains the code
+// above, so the answer has to come from the CPU, not the preprocessor.
+bool cpu_has_avx2() {
+    static const bool v = __builtin_cpu_supports("avx2") != 0;
+    return v;
+}
+
+// AVX-512F + AVX-512BW, WITHOUT assuming VNNI: the 512-bit int8 pair kernels
+// need only maddubs/madd, which are BW. Skylake-SP is exactly this machine --
+// it has the wide byte ops and none of the VNNI accumulator forms -- so
+// checking avx512vnni here would throw away half the register width on the very
+// parts most likely to run this code.
+bool cpu_has_avx512bw() {
+    static const bool v = __builtin_cpu_supports("avx512f") != 0 &&
+                          __builtin_cpu_supports("avx512bw") != 0;
+    return v;
+}
+
+// VNNI is what makes a 4-bit dot cheap: vpdpbusd accumulates 32 int8 products
+// into int32 in ONE instruction, where the AVX2 path needs maddubs + madd.
+// Measured on the Tiny-Moe GEMM shapes: 3.5 -> 7.4 MAC/instruction.
+//
+// Zen 3 does NOT have it (it shipped with Zen 4), so this is a runtime branch
+// and the AVX2 kernel below stays the fallback -- one binary, as required.
+bool cpu_has_vnni() {
+    // Detection AND the fallback switch: KRK_CPU_NO_VNNI=1 forces the AVX2
+    // kernels on a host that has VNNI, which is what makes them measurable on
+    // this box and what a user with a misreporting hypervisor needs.
+    //
+    // Only avx512vnni counts. The VNNI kernels in this file are compiled with
+    // the avx512vnni target attribute, so their vpdpbusd is the EVEX form: a
+    // host that has AVX-VNNI (Alder Lake) and NOT avx512vnni would raise SIGILL
+    // if it were dispatched here. Checking the feature the encoding actually
+    // requires is the difference between a fallback and a crash.
+    static const bool v = !(std::getenv("KRK_CPU_NO_VNNI") &&
+                            std::getenv("KRK_CPU_NO_VNNI")[0] == '1') &&
+                          __builtin_cpu_supports("avx512vnni") != 0;
+    return v;
+}
+#endif // KRK_DOT_AVX2
+
+// ---------------------------------------------------------------------------
+// Q4_K against an int8 activation (KRK_CPU_DOT_INT8).
+//
+// This is the K-quant kernel that was missing. The generic tile widens every
+// block to f32 and FMA's four lanes, which is ~12 GFLOPS on this box; the
+// format itself supports something far cheaper.
+//
+// Q4_K stores, per 32-value sub-block,
+//     w_k = d * s * q_k - dmin * m          q_k in 0..15, s and m 6-bit
+// so for any activation x,
+//     sum(w*x) = d*s * sum(q_k*x_k) - dmin*m * sum(x_k)
+// and if x is quantised to int8 as x ~ dx*xi the two sums are EXACT integers:
+//     sum(w*x) = dx * ( d*s*I - dmin*m*S ),  I = sum(q_k*xi_k), S = sum(xi_k)
+//
+// So the weights are read in the format they are stored in -- no f32 widening
+// at any point -- and the multiply is vpmaddubsw + vpmaddwd instead of four
+// f32 FMA lanes. I and S come out of the same two-instruction pair.
+//
+// Accuracy: this is an int8 activation against a 4-bit weight. The activation
+// quantisation is the only loss and it is the same one llama.cpp ships. The
+// gate is not a tolerance, it is the text: the greedy trajectory must be
+// identical to the exact path, and docs/DECODE-REVIEW.md records the measured
+// relative error per format next to it.
+__attribute__((target("avx2,fma"))) inline i32 hsum8_i32(__m256i v) {
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v),
+                              _mm256_extracti128_si256(v, 1));
+    s = _mm_hadd_epi32(s, s);
+    s = _mm_hadd_epi32(s, s);
+    return _mm_cvtsi128_si32(s);
+}
+
+// One 32-value block of the activation row -> int8 plus its scale. Four
+// eight-wide steps: the max has to span all 32 before any of them is rounded,
+// or the four halves would be scaled by different amounts and the block would
+// no longer have a single dx to apply at the end.
+__attribute__((target("avx2,fma"))) inline void quantize_q8_32_d(const f32 *x,
+                                                                i8 *xq, f32 *dx) {
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    __m256 v[4];
+    for (int i = 0; i < 4; i++) v[i] = _mm256_loadu_ps(x + 8 * i);
+    __m256 a = _mm256_max_ps(_mm256_andnot_ps(sign, v[0]),
+                             _mm256_andnot_ps(sign, v[1]));
+    a = _mm256_max_ps(a, _mm256_andnot_ps(sign, v[2]));
+    a = _mm256_max_ps(a, _mm256_andnot_ps(sign, v[3]));
+    __m128 m = _mm_max_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
+    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 0x55));
+    const f32 amax = _mm_cvtss_f32(m);
+    const f32 d = amax > 0.0f ? amax / 127.0f : 0.0f;
+    *dx = d;
+    if (d == 0.0f) {
+        std::memset(xq, 0, 32);
+        return;
+    }
+    const __m256 inv = _mm256_set1_ps(1.0f / d);
+    const __m256i lo32 = _mm256_set1_epi32(-127), hi32 = _mm256_set1_epi32(127);
+    for (int i = 0; i < 4; i++) {
+        __m256i q = _mm256_cvtps_epi32(_mm256_mul_ps(v[i], inv));
+        q = _mm256_max_epi32(q, lo32);
+        q = _mm256_min_epi32(q, hi32);
+        const __m128i p16 = _mm_packs_epi32(_mm256_castsi256_si128(q),
+                                           _mm256_extracti128_si256(q, 1));
+        const __m128i p8 = _mm_packs_epi16(p16, p16);
+        _mm_storel_epi64(reinterpret_cast<__m128i *>(xq + 8 * i), p8);
+    }
+}
+
+// n must be a multiple of 32; xq gets n int8, dx gets n/32 scales.
+__attribute__((target("avx2,fma"))) void quantize_q8_row_d(const f32 *x, i64 n,
+                                                          i8 *xq, f32 *dx) {
+    for (i64 b = 0; b < n; b += 32)
+        quantize_q8_32_d(x + b, xq + b, dx + b / 32);
+}
+
+// Sum of 32 int8 as int32. This is the `dmin` term's other half and it depends
+// ONLY on the activation, so it is computed once per quantise, not once per
+// weight row. maddubs pairs (1*xi) twice into int16, then madd widens to int32:
+// |xi| <= 127 so a pair is <= 254 and nothing overflows.
+__attribute__((target("avx2"))) inline i32 sum_i8_32(const i8 *p) {
+    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
+    const __m256i m = _mm256_maddubs_epi16(_mm256_set1_epi8(1), v);
+    const __m256i s = _mm256_madd_epi16(m, _mm256_set1_epi16(1));
+    __m128i lo = _mm_add_epi32(_mm256_castsi256_si128(s),
+                               _mm256_extracti128_si256(s, 1));
+    lo = _mm_hadd_epi32(lo, lo);
+    lo = _mm_hadd_epi32(lo, lo);
+    return _mm_cvtsi128_si32(lo);
+}
+
+// One weight row of Q4_K against one quantized activation row.
+//
+// The reduction is the whole design. A first version closed every 32-value
+// sub-block with two horizontal sums, and a horizontal sum is a dependent
+// chain -- per 32 values it cost about 20 cycles against the eight f32 FMA
+// instructions it replaced, which is why it measured 1.27x and not 4x.
+//
+// Here the eight lanes of a __m256i carry the eight partial sums of a
+// sub-block, which are converted to f32, scaled by that sub-block's
+// (dx, d*s, dmin*m) and ACCUMULATED into one vector across the whole row. The
+// horizontal sum happens once, at the end, instead of twice per sub-block.
+__attribute__((target("avx2,fma"))) f32 dot_q4_K_q8_d(const u8 *w, const i8 *xq,
+                                                      const f32 *dx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs));
+            const __m256i q_lo = _mm256_and_si256(qb, kLo);
+            const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+            const i64 base = (nb * 256) + j;
+            const __m256i x_lo = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base));
+            const __m256i x_hi = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base + 32));
+            u8 s1, m1, s2, m2;
+            get_scale_min_k4(static_cast<int>(j / 32) + 0, sc, &s1, &m1);
+            get_scale_min_k4(static_cast<int>(j / 32) + 1, sc, &s2, &m2);
+            const auto accumulate = [&](__m256i qn, __m256i xv, f32 sxk,
+                                        f32 smk) -> void {
+                const __m256 fI = _mm256_cvtepi32_ps(_mm256_madd_epi16(
+                    _mm256_maddubs_epi16(qn, xv), ones16));
+                const __m256 fS = _mm256_cvtepi32_ps(_mm256_madd_epi16(
+                    _mm256_maddubs_epi16(ones8, xv), ones16));
+                acc = _mm256_fmadd_ps(fI, _mm256_set1_ps(sxk), acc);
+                acc = _mm256_fnmadd_ps(fS, _mm256_set1_ps(smk), acc);
+            };
+            const f32 dx1 = dx[base / 32];
+            const f32 dx2 = dx[(base + 32) / 32];
+            accumulate(q_lo, x_lo, dx1 * d * static_cast<f32>(s1),
+                       dx1 * dmin * static_cast<f32>(m1));
+            accumulate(q_hi, x_hi, dx2 * d * static_cast<f32>(s2),
+                       dx2 * dmin * static_cast<f32>(m2));
+            qs += 32;
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
+// Eight activation rows against one weight row, with the weight block decoded
+// ONCE and reused eight times. This is the prefill shape: without it the row is
+// re-read per input row and the kernel runs at GEMV speed, which is what the
+// 1.53x measured -- the same defect vec_dot_tiled() was written to fix, one
+// level down.
+__attribute__((target("avx2,fma"))) void dot_q4_K_q8_x8_d(
+    const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 rstride, i64 dstride,
+    f32 *out, i64 out_stride) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs));
+            const __m256i q_lo = _mm256_and_si256(qb, kLo);
+            const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+            const i64 base = (nb * 256) + j;
+            u8 s1, m1, s2, m2;
+            get_scale_min_k4(static_cast<int>(j / 32) + 0, sc, &s1, &m1);
+            get_scale_min_k4(static_cast<int>(j / 32) + 1, sc, &s2, &m2);
+            for (i64 r = 0; r < 8; r++) {
+                const i8 *xr = xq + r * rstride;
+                const f32 *dr = dx + r * dstride;
+                const __m256i x_lo = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xr + base));
+                const __m256i x_hi = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xr + base + 32));
+                const auto accumulate = [&](__m256i qn, __m256i xv, f32 sxk,
+                                            f32 smk) -> void {
+                    const __m256 fI = _mm256_cvtepi32_ps(_mm256_madd_epi16(
+                        _mm256_maddubs_epi16(qn, xv), ones16));
+                    const __m256 fS = _mm256_cvtepi32_ps(_mm256_madd_epi16(
+                        _mm256_maddubs_epi16(ones8, xv), ones16));
+                    acc[r] = _mm256_fmadd_ps(fI, _mm256_set1_ps(sxk), acc[r]);
+                    acc[r] = _mm256_fnmadd_ps(fS, _mm256_set1_ps(smk), acc[r]);
+                };
+                const f32 dx1 = dr[base / 32];
+                const f32 dx2 = dr[(base + 32) / 32];
+                accumulate(q_lo, x_lo, dx1 * d * static_cast<f32>(s1),
+                           dx1 * dmin * static_cast<f32>(m1));
+                accumulate(q_hi, x_hi, dx2 * d * static_cast<f32>(s2),
+                           dx2 * dmin * static_cast<f32>(m2));
+            }
+            qs += 32;
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+
+// The same eight rows, with the min term taken out of the inner loop.
+//
+// dot_q4_K_q8_x8_d() above still rebuilds  S_s = sum(x_k)  for every weight
+// row: two maddubs + madd + cvt + fnmadd per 32 values per row, which is as
+// many instructions as the dot product itself. That is the whole reason the
+// prefill kernel measured 3.5 MAC/instruction while the kernel's own ceiling
+// with per-32 scales is about 6.4.
+//
+// With sx[] (computed once per activation row by quantize_q8_row_sx) the term
+// is  sum_s (dmin * m_s) * dx_s * S_s  -- pipelined as ONE eight-lane f32
+// vector per 256-value block: lane s is sub-block s, the eight m_s come from
+// one get_scale_min_k4 sweep of the block, and the eight S_s are one 32-byte
+// load. One cvt + one fnmadd per row per block replaces thirty-two
+// instructions per row per block. Nothing is dequantised: the block bytes are
+// read where they are stored, the scales are decoded into a register, not a
+// tensor.
+//
+// VNNI's vpdpbusd (Q4_K's nibbles are 0..15, so the weight side is already the
+// unsigned operand and the int8 activation the signed one) then does a 32-value
+// sub-block in a single instruction, against two for maddubs + madd.
+#if defined(KRK_DOT_AVX512)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+void dot_q4_K_q8_sx_x8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
+                              const i32 *sx, i64 n, i64 rstride, i64 dstride,
+                              i64 sstride, f32 *out, i64 out_stride) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        // The block's eight (scale, min) pairs, widened once and shared by all
+        // eight rows. get_scale_min_k4() is packed and branchy; doing it 8x8
+        // times per block is most of what the scalar tail was spending.
+        f32 sf[8], mf[8];
+        for (int s = 0; s < 8; s++) {
+            u8 a = 0, b = 0;
+            get_scale_min_k4(s, sc, &a, &b);
+            sf[s] = static_cast<f32>(a) * d;
+            mf[s] = static_cast<f32>(b) * dmin;
+        }
+        const __m256 sfv = _mm256_loadu_ps(sf);
+        const __m256 mfv = _mm256_loadu_ps(mf);
+        // The block decoded ONCE: eight 32-value unsigned vectors, in stored
+        // order. sub-block 2g is the low nibble of qs[32g..], 2g+1 the high.
+        __m256i qv[8];
+        for (int g = 0; g < 4; g++) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs + 32 * g));
+            qv[2 * g] = _mm256_and_si256(qb, kLo);
+            qv[2 * g + 1] = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+        }
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const __m256 dxv =
+                _mm256_loadu_ps(dx + static_cast<i64>(r) * dstride + nb * 8);
+            // dx_s * d * sc_s for the eight sub-blocks, then broadcast one lane
+            // at a time. The store/broadcast pair keeps these on the load
+            // ports; permuting would spend eight ALU slots instead.
+            f32 af[8];
+            _mm256_storeu_ps(af, _mm256_mul_ps(sfv, dxv));
+            for (int s = 0; s < 8; s++) {
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xr + 32 * s));
+                const __m256i iv = _mm256_dpbusd_epi32(zero, qv[s], xv);
+                acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                                         _mm256_broadcast_ss(af + s), acc[r]);
+            }
+            const __m256i s8 = _mm256_loadu_si256(reinterpret_cast<
+                const __m256i *>(sx + static_cast<i64>(r) * sstride + nb * 8));
+            acc[r] = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(s8),
+                                      _mm256_mul_ps(mfv, dxv), acc[r]);
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+
+#endif // KRK_DOT_AVX512
+
+#if defined(KRK_DOT_AVX2)
+// The AVX2 twin, for hosts without VNNI: maddubs + madd instead of dpbusd.
+// Same batched min term, which is where most of the gain is.
+__attribute__((target("avx2,fma")))
+void dot_q4_K_q8_sx_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
+                              const i32 *sx, i64 n, i64 rstride, i64 dstride,
+                              i64 sstride, f32 *out, i64 out_stride) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        f32 sf[8], mf[8];
+        for (int s = 0; s < 8; s++) {
+            u8 a = 0, b = 0;
+            get_scale_min_k4(s, sc, &a, &b);
+            sf[s] = static_cast<f32>(a) * d;
+            mf[s] = static_cast<f32>(b) * dmin;
+        }
+        const __m256 sfv = _mm256_loadu_ps(sf);
+        const __m256 mfv = _mm256_loadu_ps(mf);
+        __m256i qv[8];
+        for (int g = 0; g < 4; g++) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs + 32 * g));
+            qv[2 * g] = _mm256_and_si256(qb, kLo);
+            qv[2 * g + 1] = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+        }
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const __m256 dxv =
+                _mm256_loadu_ps(dx + static_cast<i64>(r) * dstride + nb * 8);
+            f32 af[8];
+            _mm256_storeu_ps(af, _mm256_mul_ps(sfv, dxv));
+            for (int s = 0; s < 8; s++) {
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xr + 32 * s));
+                const __m256i iv = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(qv[s], xv), ones16);
+                acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                                         _mm256_broadcast_ss(af + s), acc[r]);
+            }
+            const __m256i s8 = _mm256_loadu_si256(reinterpret_cast<
+                const __m256i *>(sx + static_cast<i64>(r) * sstride + nb * 8));
+            acc[r] = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(s8),
+                                      _mm256_mul_ps(mfv, dxv), acc[r]);
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+
+#endif // KRK_DOT_AVX2
+
+// ---------------------------------------------------------------------------
+// Q6_K with the per-16 bias folded into the dot product.
+//
+// The kernel below (dot_q6_K_q8_d) rebuilds  S = sum(x) over 16  for every
+// weight row and then computes  t = I - 32*S  in int32, before converting. Two
+// things are wrong with that here. The sum is per ROW, so it is recomputed for
+// every one of the n_out weight rows; and the subtract-then-convert costs a
+// multiply and a subtract per 16 values on top of the dot.
+//
+// x86 can do better: vpdpbusd takes an ACCUMULATOR, so the -32*S correction can
+// be sitting in the lanes before the dot lands. Q6_K's nibbles are 0..63 (u8,
+// the unsigned operand) and the activation is int8 (the signed one), so one
+// vpdpbusd per 32 values replaces maddubs+madd+mullo+sub, and the bias that
+// used to be a correction is free. sq4[] gives the biased sums once per activation
+// row instead of once per weight row.
+//
+// Lane structure: both vpdpbusd and maddubs+madd land on 8 int32 lanes of four
+// values each, so lanes 0-3 are the first 16 values and 4-7 the second -- which
+// is exactly where `sc` changes. One f32 vector carries both scales.
+// One 32-value group's Q6_K nibbles: 4 bits from ql, 2 from qh, plus the 4.
+__attribute__((target("avx2")))
+inline __m256i q6_group(const u8 *ql, __m256i qhv, int g) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i k3 = _mm256_set1_epi8(0x03);
+    // Groups 0 and 1 take the low nibble of ql[0..31] and ql[32..63]; groups 2
+    // and 3 take the HIGH nibble of the same 64 bytes.
+    const __m256i qlv = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i *>(ql + 32 * (g & 1)));
+    __m256i lo4 = qlv;
+    if (g >= 2) lo4 = _mm256_srli_epi16(qlv, 4);
+    lo4 = _mm256_and_si256(lo4, kLo);
+    __m256i hi = qhv;
+    if (g) hi = _mm256_srli_epi16(qhv, 2 * g);
+    hi = _mm256_and_si256(hi, k3);
+    hi = _mm256_slli_epi16(hi, 4);
+    return _mm256_or_si256(lo4, hi);
+}
+
+#if defined(KRK_DOT_AVX512)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+f32 dot_q6_K_q8_sq4_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
+                           const i32 *sq4, i64 n) {
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 210) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[208] | (w[209] << 8)));
+        for (int half = 0; half < 2; half++) {
+            const u8 *ql = w + half * 64;
+            const u8 *qh = w + 128 + half * 32;
+            const i8 *sc = reinterpret_cast<const i8 *>(w + 192 + half * 8);
+            const __m256i qhv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qh));
+            const i64 vbase = nb * 256 + half * 128;
+            for (int g = 0; g < 4; g++) {
+                const __m256i q = q6_group(ql, qhv, g);
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xq + vbase + 32 * g));
+                // -32 * sum(4) per lane, precomputed: the dot lands on it.
+                const __m256i pm = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(sq4 + (vbase + 32 * g) / 4));
+                const __m256i iv = _mm256_dpbusd_epi32(pm, q, xv);
+                const f32 dxg = dx[(vbase + 32 * g) / 32];
+                const f32 s0 = d * dxg * static_cast<f32>(sc[2 * g + 0]);
+                const f32 s1 = d * dxg * static_cast<f32>(sc[2 * g + 1]);
+                acc = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(iv),
+                    _mm256_setr_ps(s0, s0, s0, s0, s1, s1, s1, s1), acc);
+            }
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+#endif // KRK_DOT_AVX512
+
+// The AVX2 twin. maddubs + madd give the same four-values-per-lane structure,
+// so the pre-biased sums are one vpaddd instead of being the accumulator.
+__attribute__((target("avx2,fma")))
+f32 dot_q6_K_q8_sq4_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
+                           const i32 *sq4, i64 n) {
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 210) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[208] | (w[209] << 8)));
+        for (int half = 0; half < 2; half++) {
+            const u8 *ql = w + half * 64;
+            const u8 *qh = w + 128 + half * 32;
+            const i8 *sc = reinterpret_cast<const i8 *>(w + 192 + half * 8);
+            const __m256i qhv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qh));
+            const i64 vbase = nb * 256 + half * 128;
+            for (int g = 0; g < 4; g++) {
+                const __m256i q = q6_group(ql, qhv, g);
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xq + vbase + 32 * g));
+                const __m256i pm = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(sq4 + (vbase + 32 * g) / 4));
+                const __m256i iv = _mm256_add_epi32(
+                    _mm256_madd_epi16(_mm256_maddubs_epi16(q, xv), ones16), pm);
+                const f32 dxg = dx[(vbase + 32 * g) / 32];
+                const f32 s0 = d * dxg * static_cast<f32>(sc[2 * g + 0]);
+                const f32 s1 = d * dxg * static_cast<f32>(sc[2 * g + 1]);
+                acc = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(iv),
+                    _mm256_setr_ps(s0, s0, s0, s0, s1, s1, s1, s1), acc);
+            }
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
+// Eight activation rows against one weight row. The weight block -- 210 bytes,
+// and the nibble unpack with it -- is decoded ONCE and used eight times. That
+// is the prefill shape, and without it Q6_K prefill runs at GEMV speed.
+#if defined(KRK_DOT_AVX512)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+void dot_q6_K_q8_sq4_x8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
+                               const i32 *sq4, i64 n, i64 rstride, i64 dstride,
+                               i64 sstride, f32 *out, i64 out_stride) {
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 210) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[208] | (w[209] << 8)));
+        // q and the weight scale, once per block, shared by all eight rows.
+        __m256i qv[8];
+        __m256 bwv[8];
+        for (int half = 0; half < 2; half++) {
+            const u8 *ql = w + half * 64;
+            const u8 *qh = w + 128 + half * 32;
+            const i8 *sc = reinterpret_cast<const i8 *>(w + 192 + half * 8);
+            const __m256i qhv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qh));
+            for (int g = 0; g < 4; g++) {
+                qv[half * 4 + g] = q6_group(ql, qhv, g);
+                const f32 b0 = d * static_cast<f32>(sc[2 * g + 0]);
+                const f32 b1 = d * static_cast<f32>(sc[2 * g + 1]);
+                bwv[half * 4 + g] =
+                    _mm256_setr_ps(b0, b0, b0, b0, b1, b1, b1, b1);
+            }
+        }
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const i32 *sr = sq4 + static_cast<i64>(r) * sstride + nb * 64;
+            const f32 *dr = dx + static_cast<i64>(r) * dstride + nb * 8;
+            for (int half = 0; half < 2; half++) {
+                for (int g = 0; g < 4; g++) {
+                    const i64 off = half * 128 + 32 * g;
+                    const __m256i xv = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(xr + off));
+                    const __m256i pm = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(sr + off / 4));
+                    const __m256i iv = _mm256_dpbusd_epi32(pm, qv[half * 4 + g],
+                                                           xv);
+                    const __m256 scale = _mm256_mul_ps(
+                        bwv[half * 4 + g],
+                        _mm256_broadcast_ss(dr + half * 4 + g));
+                    acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv), scale,
+                                             acc[r]);
+                }
+            }
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+#endif // KRK_DOT_AVX512
+
+__attribute__((target("avx2,fma")))
+void dot_q6_K_q8_sq4_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
+                               const i32 *sq4, i64 n, i64 rstride, i64 dstride,
+                               i64 sstride, f32 *out, i64 out_stride) {
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 210) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[208] | (w[209] << 8)));
+        __m256i qv[8];
+        __m256 bwv[8];
+        for (int half = 0; half < 2; half++) {
+            const u8 *ql = w + half * 64;
+            const u8 *qh = w + 128 + half * 32;
+            const i8 *sc = reinterpret_cast<const i8 *>(w + 192 + half * 8);
+            const __m256i qhv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qh));
+            for (int g = 0; g < 4; g++) {
+                qv[half * 4 + g] = q6_group(ql, qhv, g);
+                const f32 b0 = d * static_cast<f32>(sc[2 * g + 0]);
+                const f32 b1 = d * static_cast<f32>(sc[2 * g + 1]);
+                bwv[half * 4 + g] =
+                    _mm256_setr_ps(b0, b0, b0, b0, b1, b1, b1, b1);
+            }
+        }
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const i32 *sr = sq4 + static_cast<i64>(r) * sstride + nb * 64;
+            const f32 *dr = dx + static_cast<i64>(r) * dstride + nb * 8;
+            for (int half = 0; half < 2; half++) {
+                for (int g = 0; g < 4; g++) {
+                    const i64 off = half * 128 + 32 * g;
+                    const __m256i xv = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(xr + off));
+                    const __m256i pm = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(sr + off / 4));
+                    const __m256i iv = _mm256_add_epi32(
+                        _mm256_madd_epi16(
+                            _mm256_maddubs_epi16(qv[half * 4 + g], xv),
+                            ones16),
+                        pm);
+                    const __m256 scale = _mm256_mul_ps(
+                        bwv[half * 4 + g],
+                        _mm256_broadcast_ss(dr + half * 4 + g));
+                    acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv), scale,
+                                             acc[r]);
+                }
+            }
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Q6_K against an int8 activation.
+//
+// Q6_K stores   w_k = d * sc_s * (q_k - 32)   q_k in 0..63, sc one int8 per 16
+// so
+//     sum(w*x) = d * sum_s sc_s * (I_s - 32*S_s)
+// with I_s = sum(q_k*x_k) and S_s = sum(x_k), both EXACT integers once x is
+// int8. Weights are read from the blocks they are stored in.
+//
+// Lane structure: maddubs puts values 0..15 in lanes 0-3 and 16..31 in lanes
+// 4-7, which is exactly where the scale changes (one sc per 16 values), so a
+// single 8-lane float vector carries both halves' scales.
+__attribute__((target("avx2,fma"))) f32 dot_q6_K_q8_d(const u8 *w, const i8 *xq,
+                                                      const f32 *dx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i c32 = _mm256_set1_epi32(32);
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 210) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[208] | (w[209] << 8)));
+        for (int half = 0; half < 2; half++) {
+            const u8 *ql = w + half * 64;
+            const u8 *qh = w + 128 + half * 32;
+            const i8 *sc = reinterpret_cast<const i8 *>(w + 192 + half * 8);
+            const __m256i qhv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qh));
+            const i64 base = nb * 256 + half * 128;
+            const f32 *dxh = dx + base / 32;
+            for (int g = 0; g < 4; g++) {
+                // Groups 0 and 1 take the LOW nibble of ql[0..31] and
+                // ql[32..63]; groups 2 and 3 take the HIGH nibble of the same
+                // 64 bytes. Reading ql+64 and ql+96 instead -- which is what
+                // the obvious bit layout suggests -- is a different tensor:
+                // measured 32% relative error against the exact dequant.
+                const __m256i qlv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(ql + 32 * (g & 1)));
+                __m256i lo4 = qlv;
+                if (g >= 2) lo4 = _mm256_srli_epi16(qlv, 4);
+                lo4 = _mm256_and_si256(lo4, kLo);
+                __m256i hi = qhv;
+                if (g) hi = _mm256_srli_epi16(qhv, 2 * g);
+                hi = _mm256_and_si256(hi, _mm256_set1_epi8(0x03));
+                hi = _mm256_slli_epi16(hi, 4);
+                const __m256i q = _mm256_or_si256(lo4, hi);
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xq + base + 32 * g));
+                const __m256i iv = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(q, xv), ones16);
+                const __m256i sv = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(ones8, xv), ones16);
+                const __m256i t = _mm256_sub_epi32(iv, _mm256_mullo_epi32(sv, c32));
+                // lanes 0-3 -> first 16 values, lanes 4-7 -> second 16, and the
+                // scale changes exactly there.
+                // Two STRIDES, and getting them confused is silent: the
+                // activation scale `dx` is one per 32 values, so the whole
+                // group shares dxh[g]; the weight scale `sc` is one per 16, so
+                // the two halves of the group take sc[2g] and sc[2g+1].
+                // Indexing dx with 2g read a neighbouring group's scale and
+                // measured 32% relative error on synthetic data.
+                const f32 s0 = d * dxh[g] * static_cast<f32>(sc[2 * g + 0]);
+                const f32 s1 = d * dxh[g] * static_cast<f32>(sc[2 * g + 1]);
+                const __m256 scale = _mm256_setr_ps(s0, s0, s0, s0, s1, s1, s1, s1);
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(t), scale, acc);
+            }
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
+// ---------------------------------------------------------------------------
+// Q4_K against int8, with vpdpbusd (AVX-512 VNNI, 256-bit form).
+//
+// Same algebra as dot_q4_K_q8_d -- the integer dot is exact, d/s and dmin/m are
+// applied once per sub-block -- but the dot itself is one instruction per 32
+// values instead of two. Measured at the GEMM shapes Tiny-Moe actually calls:
+// 3.5 MAC/instr (AVX2) -> 7.4 (VNNI).
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+f32 dot_q4_K_q8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs));
+            const __m256i q_lo = _mm256_and_si256(qb, kLo);
+            const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+            const i64 base = (nb * 256) + j;
+            const __m256i x_lo = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base));
+            const __m256i x_hi = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base + 32));
+            u8 s1, m1, s2, m2;
+            get_scale_min_k4(static_cast<int>(j / 32) + 0, sc, &s1, &m1);
+            get_scale_min_k4(static_cast<int>(j / 32) + 1, sc, &s2, &m2);
+            // Both sums come out of vpdpbusd: q*x for the integer dot, and
+            // 1*x for the activation sum the dmin term needs.
+            const __m256i i1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q_lo, x_lo);
+            const __m256i i2 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q_hi, x_hi);
+            const __m256i t1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones8, x_lo);
+            const __m256i t2 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones8, x_hi);
+            const f32 dx1 = dx[base / 32];
+            const f32 dx2 = dx[(base + 32) / 32];
+            const f32 sA = dx1 * d * static_cast<f32>(s1);
+            const f32 sB = dx2 * d * static_cast<f32>(s2);
+            const f32 mA = dx1 * dmin * static_cast<f32>(m1);
+            const f32 mB = dx2 * dmin * static_cast<f32>(m2);
+            __m256 t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i1), _mm256_set1_ps(sA),
+                                       _mm256_mul_ps(_mm256_cvtepi32_ps(i2),
+                                                     _mm256_set1_ps(sB)));
+            t = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(t1), _mm256_set1_ps(mA), t);
+            t = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(t2), _mm256_set1_ps(mB), t);
+            acc = _mm256_add_ps(acc, t);
+            qs += 32;
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
+// Q4_K with the dmin term HOISTED. sx[] carries sum(xi) per 32-value sub-block,
+// which the quantise pass already knows. What that removes from the inner loop
+// is not small: the previous form spent two vpdpbusd (against an all-ones
+// operand), two cvt and two fnmadd per 64 values recomputing a number that is
+// identical for every one of the n_out weight rows. Here it is one scalar fma
+// per sub-block against a value that was computed once.
+//
+// Measured on Tiny-Moe: see the commit.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+f32 dot_q4_K_q8_sx_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
+                          const i32 *sx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    __m256 acc = _mm256_setzero_ps();
+    f32 macc = 0.0f;
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs));
+            const __m256i q_lo = _mm256_and_si256(qb, kLo);
+            const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+            const i64 base = (nb * 256) + j;
+            const i64 sb = base / 32;
+            const __m256i x_lo = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base));
+            const __m256i x_hi = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base + 32));
+            u8 s1, m1, s2, m2;
+            get_scale_min_k4(static_cast<int>(j / 32) + 0, sc, &s1, &m1);
+            get_scale_min_k4(static_cast<int>(j / 32) + 1, sc, &s2, &m2);
+            const __m256i i1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(),
+                                                   q_lo, x_lo);
+            const __m256i i2 = _mm256_dpbusd_epi32(_mm256_setzero_si256(),
+                                                   q_hi, x_hi);
+            const f32 dx1 = dx[sb];
+            const f32 dx2 = dx[sb + 1];
+            __m256 t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i1),
+                                       _mm256_set1_ps(dx1 * d * static_cast<f32>(s1)),
+                                       _mm256_mul_ps(_mm256_cvtepi32_ps(i2),
+                                                     _mm256_set1_ps(dx2 * d * static_cast<f32>(s2))));
+            acc = _mm256_add_ps(acc, t);
+            // Scalar, once per sub-block: the term the vector loop used to
+            // rebuild for every weight row.
+            macc += dx1 * dmin * static_cast<f32>(m1) * static_cast<f32>(sx[sb]);
+            macc += dx2 * dmin * static_cast<f32>(m2) * static_cast<f32>(sx[sb + 1]);
+            qs += 32;
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo) - macc;
+}
+
+// The same, on the AVX2 path (no VNNI: maddubs + madd instead of dpbusd).
+__attribute__((target("avx2,fma")))
+f32 dot_q4_K_q8_sx_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
+                          const i32 *sx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+    f32 macc = 0.0f;
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs));
+            const __m256i q_lo = _mm256_and_si256(qb, kLo);
+            const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+            const i64 base = (nb * 256) + j;
+            const i64 sb = base / 32;
+            const __m256i x_lo = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base));
+            const __m256i x_hi = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base + 32));
+            u8 s1, m1, s2, m2;
+            get_scale_min_k4(static_cast<int>(j / 32) + 0, sc, &s1, &m1);
+            get_scale_min_k4(static_cast<int>(j / 32) + 1, sc, &s2, &m2);
+            const __m256i i1 = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(q_lo, x_lo), ones16);
+            const __m256i i2 = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(q_hi, x_hi), ones16);
+            const f32 dx1 = dx[sb];
+            const f32 dx2 = dx[sb + 1];
+            const __m256 t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i1),
+                                             _mm256_set1_ps(dx1 * d * static_cast<f32>(s1)),
+                                             _mm256_mul_ps(_mm256_cvtepi32_ps(i2),
+                                                           _mm256_set1_ps(dx2 * d * static_cast<f32>(s2))));
+            acc = _mm256_add_ps(acc, t);
+            macc += dx1 * dmin * static_cast<f32>(m1) * static_cast<f32>(sx[sb]);
+            macc += dx2 * dmin * static_cast<f32>(m2) * static_cast<f32>(sx[sb + 1]);
+            qs += 32;
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo) - macc;
+}
+
+std::atomic<bool> g_dot_int8{false};
+std::atomic<bool> g_dot_int8_set{false};
+
+bool env_dot_int8() {
+    const char *e = std::getenv("KRK_CPU_DOT_INT8");
+    if (!e || e[0] == '\0') {
+#if defined(KRK_DOT_AVX2)
+        return cpu_has_avx2();
+#else
+        return false;
+#endif
+    }
+    return e[0] != '0';
+}
+
+std::atomic<bool> g_dot_avx2{false};
+std::atomic<bool> g_dot_avx2_set{false};
+
+// Unset means "ask the CPU". The two flags exist to choose a ROUNDING TIER,
+// not to unlock a feature: these kernels are bit-identical to the four-lane
+// path (test_vec_dot_avx2_matches_fast asserts that, not a tolerance), so a
+// host that can run them should run them without being told. Measured on
+// Tiny-Moe Q4_K_M, --cpu, 46-token prefill: 22.2 -> 47.8 tok/s prefill and
+// 13.9 -> 21.3 tok/s decode, with the same 24 greedy tokens to the byte.
+// `KRK_CPU_DOT_AVX2=0` still forces the scalar path for a bit-exactness run.
+bool dot_avx2_default() {
+#if defined(KRK_DOT_AVX2)
+    return cpu_has_avx2();
+#else
+    return false;
+#endif
+}
+bool env_dot_avx2() {
+    const char *e = std::getenv("KRK_CPU_DOT_AVX2");
+    if (!e || e[0] == '\0') return dot_avx2_default();
+    return e[0] != '0';
+}
+} // namespace
+
+// The kernels live in the anonymous namespace above; these are the names the
+// backend links against. Without AVX2 there is no int8 kernel and the flag is
+// false, so the stubs are never reached -- they exist so the translation unit
+// links on every target.
+// Per-FOUR biased sums, for Q6_K.
+//
+// Q6_K stores  w = d * sc_s * (q_k - 32)  and its dot needs  sum((q-32)*x).
+// The kernel forms that with one vpdpbusd, whose 8 int32 lanes each own FOUR
+// consecutive values -- so the -32 correction has to be present once per lane,
+// not once per 16 (putting a 16-sum in all four lanes subtracts it four times;
+// measured 3.8e+02 relative, which is how this was found).
+//
+// sx[i] = -32 * sum(x[4i .. 4i+3]), computed once per activation row. It is the
+// ACCUMULATOR the dot lands on, so the correction costs the kernel nothing at
+// all -- not a subtract, not a multiply, not a permute. One int32 per four
+// values is n bytes per row.
+__attribute__((target("avx2"))) inline __m256i bias4_of_32(const i8 *p) {
+    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
+    const __m256i pairs = _mm256_maddubs_epi16(_mm256_set1_epi8(1), v);
+    const __m256i quads = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
+    return _mm256_sub_epi32(_mm256_setzero_si256(),
+                            _mm256_slli_epi32(quads, 5));
+}
+
+void quantize_q8_row_sq4(const f32 *x, i64 n, i8 *xq, f32 *dx, i32 *sq4) {
+#if defined(KRK_DOT_AVX2)
+    quantize_q8_row_d(x, n, xq, dx);
+    for (i64 b = 0; b < n; b += 32) {
+        const __m256i c = bias4_of_32(xq + b);
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(sq4 + b / 4), c);
+    }
+#else
+    (void)x; (void)n; (void)xq; (void)dx; (void)sq4;
+#endif
+}
+
+void quantize_q8_row_sx(const f32 *x, i64 n, i8 *xq, f32 *dx, i32 *sx) {
+#if defined(KRK_DOT_AVX2)
+    quantize_q8_row_d(x, n, xq, dx);
+    for (i64 b = 0; b < n; b += 32) sx[b / 32] = sum_i8_32(xq + b);
+#else
+    (void)x; (void)n; (void)xq; (void)dx; (void)sx;
+#endif
+}
+
+void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx) {
+#if defined(KRK_DOT_AVX2)
+    quantize_q8_row_d(x, n, xq, dx);
+#else
+    (void)x; (void)n; (void)xq; (void)dx;
+#endif
+}
+
+f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+#if defined(KRK_DOT_AVX512)
+    // One binary, three ISAs: VNNI where the host has it, the AVX2 kernel
+    // otherwise. Zen 3 falls through to AVX2 by construction.
+    if (cpu_has_vnni()) return dot_q4_K_q8_vnni_d(w, xq, dx, n);
+#endif
+#if defined(KRK_DOT_AVX2)
+    return dot_q4_K_q8_d(w, xq, dx, n);
+#else
+    (void)w; (void)xq; (void)dx; (void)n;
+    return 0.0f;
+#endif
+}
+
+f32 dot_q4_K_q8_sx(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
+                  i64 n) {
+#if defined(KRK_DOT_AVX512)
+    if (cpu_has_vnni()) return dot_q4_K_q8_sx_vnni_d(w, xq, dx, sx, n);
+#endif
+#if defined(KRK_DOT_AVX2)
+    return dot_q4_K_q8_sx_avx2_d(w, xq, dx, sx, n);
+#else
+    (void)w; (void)xq; (void)dx; (void)sx; (void)n;
+    return 0.0f;
+#endif
+}
+
+f32 dot_q6_K_q8_sq4(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4,
+                    i64 n) {
+#if defined(KRK_DOT_AVX512)
+    if (cpu_has_vnni()) return dot_q6_K_q8_sq4_vnni_d(w, xq, dx, sq4, n);
+#endif
+#if defined(KRK_DOT_AVX2)
+    return dot_q6_K_q8_sq4_avx2_d(w, xq, dx, sq4, n);
+#else
+    (void)w; (void)xq; (void)dx; (void)sq4; (void)n;
+    return 0.0f;
+#endif
+}
+
+void dot_q6_K_q8_sq4_x8(const u8 *w, const i8 *xq, const f32 *dx,
+                        const i32 *sq4, i64 n, i64 rstride, i64 dstride,
+                        i64 sstride, f32 *out, i64 out_stride) {
+    static const char *e = std::getenv("KRK_CPU_DOT_Q6SQ4");
+    const bool use = !e || e[0] != '0';
+    if (!use) {
+        for (int r = 0; r < 8; r++)
+            out[static_cast<i64>(r) * out_stride] =
+                dot_q6_K_q8(w, xq + static_cast<i64>(r) * rstride,
+                            dx + static_cast<i64>(r) * dstride, n);
+        return;
+    }
+#if defined(KRK_DOT_AVX512)
+    if (cpu_has_vnni()) {
+        dot_q6_K_q8_sq4_x8_vnni_d(w, xq, dx, sq4, n, rstride, dstride, sstride,
+                                  out, out_stride);
+        return;
+    }
+#endif
+#if defined(KRK_DOT_AVX2)
+    dot_q6_K_q8_sq4_x8_avx2_d(w, xq, dx, sq4, n, rstride, dstride, sstride, out,
+                              out_stride);
+#else
+    (void)w; (void)xq; (void)dx; (void)sq4; (void)n; (void)rstride;
+    (void)dstride; (void)sstride; (void)out; (void)out_stride;
+#endif
+}
+
+f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+#if defined(KRK_DOT_AVX2)
+    return dot_q6_K_q8_d(w, xq, dx, n);
+#else
+    (void)w; (void)xq; (void)dx; (void)n;
+    return 0.0f;
+#endif
+}
+
+// Default on: the batched-min kernel is the fast path. KRK_CPU_DOT_X8SX=0
+// routes the eight-row prefill shape back through the per-row min term, which
+// is the A/B used to measure it and the fallback if a host ever disagrees.
+bool env_dot_x8sx() {
+    const char *e = std::getenv("KRK_CPU_DOT_X8SX");
+    return !e || e[0] != '0';
+}
+
+// Q8_0 against int8 activations, WITHOUT expanding either side to f32.
+//
+// Q8_0 was the last format whose batched prefill still ran through a dequant
+// loop: dot_q8_0_tiled() widened every weight byte to f32 with cvtepi8_epi32
+// and multiplied by the block scale, eight rows at a time. Measured on the
+// 768x12 q8_0 fixture that path took 81.3% of a 2040-token prefill run at
+// 19.3 GMAC/s, i.e. the largest single cost in the engine and a direct
+// violation of "never dequant".
+//
+// Q8_0's weight is a SIGNED byte, and maddubs wants its first operand unsigned.
+// The obvious fix -- bias by 128 and correct with -128*sum(x) -- is the one
+// Intel's VNNI sample uses, and it is unsafe here: 255*127*2 overflows the i16
+// pair accumulator and maddubs would silently saturate. So the weight is split
+// into its magnitude and its sign instead, and both magnitudes are unsigned:
+//
+//     w = wp - wn,   wp = max(w,0) in 0..127,  wn = |min(w,0)| in 1..128
+//     sum(w*x) = madd(maddubs(wp, x), 1) - madd(maddubs(wn, x), 1)
+//
+// Both products are bounded by 128*127*2 = 32512 < 32767, so nothing saturates
+// for ANY legal byte pair, including the -128 that the format permits and that
+// an abs_epi8 (which saturates to 127) would get wrong. |min(w,0)| is computed
+// as a wrapping negate of the bit pattern, which is exactly 256-pattern, so
+// -128 becomes 128 without ever being negated as a signed value.
+//
+// No bias term and no sx[] array are needed: the split is exact, so the only
+// per-block cost above the dot is the scale product. Q8_0 blocks 32 values, so
+// the scale changes every 32 and one cvt + one fma per block per row is the
+// floor for this layout.
+__attribute__((target("avx2,fma")))
+f32 dot_q8_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    const i64 nb = n / 32;
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 b = 0; b < nb; b++, w += 34) {
+        const f32 d = fp16_to_fp32(
+            static_cast<u16>(w[0] | (static_cast<u16>(w[1]) << 8)));
+        const __m256i wv =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i sm = _mm256_cmpgt_epi8(zero, wv);
+        const __m256i wp = _mm256_andnot_si256(sm, wv);
+        const __m256i wn =
+            _mm256_and_si256(sm, _mm256_sub_epi8(zero, wv));
+        const __m256i xv = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(xq + b * 32));
+        const __m256i pv = _mm256_madd_epi16(_mm256_maddubs_epi16(wp, xv), ones);
+        const __m256i nv = _mm256_madd_epi16(_mm256_maddubs_epi16(wn, xv), ones);
+        const __m256i iv = _mm256_sub_epi32(pv, nv);
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                              _mm256_set1_ps(d * dx[b]), acc);
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
+// Eight activation rows against one weight row. The block decode -- the f16
+// scale, the sign mask and the two magnitudes -- is done once and every one of
+// the eight rows reuses it, which is the same 8x share the Q4_K/Q6_K kernels
+// get. This is the shape batched prefill actually calls.
+//
+// The magnitude split costs a second maddubs, and at 256 bits that is the whole
+// cost: 8 instructions per 32 MACs. Q8_0's block is 32 bytes, so two blocks are
+// exactly one 512-bit register and one maddubs pair does 64 values. The
+// activations for two consecutive blocks are contiguous (unlike the weights,
+// which carry a 2-byte scale between them), so the x side is one aligned-width
+// load while the weight side costs two loads plus an insert -- amortised over
+// all eight rows. That halves the per-row instruction count to 8 per 64 MACs.
+#if defined(KRK_DOT_AVX512)
+__attribute__((target("avx512f,avx512bw")))
+void dot_q8_0_q8_x8_bw(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                       i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    const i64 nb = n / 32;
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i ones = _mm512_set1_epi16(1);
+    __m512 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm512_setzero_ps();
+    for (i64 b = 0; b + 2 <= nb; b += 2, w += 68) {
+        const f32 d0 = fp16_to_fp32(
+            static_cast<u16>(w[0] | (static_cast<u16>(w[1]) << 8)));
+        const f32 d1 = fp16_to_fp32(
+            static_cast<u16>(w[34] | (static_cast<u16>(w[35]) << 8)));
+        const __m256i lo =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i hi =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 36));
+        const __m512i wv =
+            _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+        const __mmask64 neg = _mm512_cmp_epi8_mask(wv, zero, _MM_CMPINT_LT);
+        const __m512i wp = _mm512_maskz_mov_epi8(~neg, wv);
+        const __m512i wn = _mm512_maskz_sub_epi8(neg, zero, wv);
+        for (int r = 0; r < 8; r++) {
+            const __m512i xv = _mm512_loadu_si512(reinterpret_cast<const void *>(
+                xq + static_cast<i64>(r) * rstride + b * 32));
+            const __m512i pi =
+                _mm512_madd_epi16(_mm512_maddubs_epi16(wp, xv), ones);
+            const __m512i ni =
+                _mm512_madd_epi16(_mm512_maddubs_epi16(wn, xv), ones);
+            const __m512i iv = _mm512_sub_epi32(pi, ni);
+            const f32 s0 = d0 * dx[static_cast<i64>(r) * dstride + b];
+            const f32 s1 = d1 * dx[static_cast<i64>(r) * dstride + b + 1];
+            // Lanes 0-7 are block b, 8-15 block b+1, because maddubs/madd keep
+            // the 512-bit input order. One scale vector, one fma, both blocks.
+            const __m512 sc = _mm512_castsi512_ps(_mm512_inserti64x4(
+                _mm512_castps_si512(_mm512_castps256_ps512(
+                    _mm256_broadcast_ss(&s0))),
+                _mm256_castps_si256(_mm256_broadcast_ss(&s1)), 1));
+            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iv), sc, acc[r]);
+        }
+    }
+    for (int r = 0; r < 8; r++)
+        out[static_cast<i64>(r) * out_stride] = _mm512_reduce_add_ps(acc[r]);
+}
+#endif // KRK_DOT_AVX512
+
+__attribute__((target("avx2,fma")))
+void dot_q8_0_q8_x8_avx2(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                         i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    const i64 nb = n / 32;
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 b = 0; b < nb; b++, w += 34) {
+        const f32 d = fp16_to_fp32(
+            static_cast<u16>(w[0] | (static_cast<u16>(w[1]) << 8)));
+        const __m256i wv =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i sm = _mm256_cmpgt_epi8(zero, wv);
+        const __m256i wp = _mm256_andnot_si256(sm, wv);
+        const __m256i wn =
+            _mm256_and_si256(sm, _mm256_sub_epi8(zero, wv));
+        for (int r = 0; r < 8; r++) {
+            const __m256i xv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + static_cast<i64>(r) *
+                                                          rstride + b * 32));
+            const __m256i pv =
+                _mm256_madd_epi16(_mm256_maddubs_epi16(wp, xv), ones);
+            const __m256i nv =
+                _mm256_madd_epi16(_mm256_maddubs_epi16(wn, xv), ones);
+            const __m256i iv = _mm256_sub_epi32(pv, nv);
+            const f32 sc = d * dx[static_cast<i64>(r) * dstride + b];
+            acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                                     _mm256_set1_ps(sc), acc[r]);
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+
+// The entry point the backend calls: widest kernel the host can run. An odd
+// block count falls back wholesale rather than growing a second tail path --
+// one code path that is always exercised beats two where one is never tested.
+void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    const i64 nb = n / 32;
+#if defined(KRK_DOT_AVX512)
+    static const bool bw = [] {
+        const char *e = std::getenv("KRK_CPU_Q80_NOBW");
+        return cpu_has_avx512bw() && !(e && e[0] == '1');
+    }();
+    if (bw && (nb & 1) == 0) {
+        dot_q8_0_q8_x8_bw(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
+#else
+    (void)nb;
+#endif
+    dot_q8_0_q8_x8_avx2(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+
+void dot_q4_K_q8_sx_x8(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
+                       i64 n, i64 rstride, i64 dstride, i64 sstride, f32 *out,
+                       i64 out_stride) {
+    static const bool use_sx = env_dot_x8sx();
+    if (!use_sx) {
+        dot_q4_K_q8_x8(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
+#if defined(KRK_DOT_AVX512)
+    if (cpu_has_vnni()) {
+        dot_q4_K_q8_sx_x8_vnni_d(w, xq, dx, sx, n, rstride, dstride, sstride,
+                                 out, out_stride);
+        return;
+    }
+#endif
+#if defined(KRK_DOT_AVX2)
+    dot_q4_K_q8_sx_x8_avx2_d(w, xq, dx, sx, n, rstride, dstride, sstride, out,
+                             out_stride);
+#else
+    (void)w; (void)xq; (void)dx; (void)sx; (void)n; (void)rstride;
+    (void)dstride; (void)sstride; (void)out; (void)out_stride;
+#endif
+}
+
+void dot_q4_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 rstride,
+                    i64 dstride, f32 *out, i64 out_stride) {
+#if defined(KRK_DOT_AVX2)
+    dot_q4_K_q8_x8_d(w, xq, dx, n, rstride, dstride, out, out_stride);
+#else
+    (void)w; (void)xq; (void)dx; (void)n; (void)rstride; (void)dstride;
+    (void)out; (void)out_stride;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// The roofline probe.
+//
+// A "%peak" column is worthless if the peak is a datasheet number, and it is
+// actively misleading when the kernel under test is 256-bit and the datasheet
+// quotes the 512-bit rate. So the ceiling is MEASURED here, in this process,
+// with the same instruction width the kernels use: sixteen independent chains
+// (enough to saturate the ports, no loop-carried latency), register-only
+// operands, and a MAC count that is exactly what those instructions retire.
+#if defined(KRK_DOT_AVX512)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+double probe_int8_vnni_gmacs() {
+    const int iters = 20000;
+    __m256i a0 = _mm256_set1_epi8(3), a1 = _mm256_set1_epi8(5);
+    __m256i x = _mm256_set1_epi8(7);
+    __m256i s0 = _mm256_setzero_si256(), s1 = _mm256_setzero_si256();
+    __m256i s2 = _mm256_setzero_si256(), s3 = _mm256_setzero_si256();
+    __m256i s4 = _mm256_setzero_si256(), s5 = _mm256_setzero_si256();
+    __m256i s6 = _mm256_setzero_si256(), s7 = _mm256_setzero_si256();
+    timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < iters; i++) {
+        s0 = _mm256_dpbusd_epi32(s0, a0, x);
+        s1 = _mm256_dpbusd_epi32(s1, a1, x);
+        s2 = _mm256_dpbusd_epi32(s2, a0, x);
+        s3 = _mm256_dpbusd_epi32(s3, a1, x);
+        s4 = _mm256_dpbusd_epi32(s4, a0, x);
+        s5 = _mm256_dpbusd_epi32(s5, a1, x);
+        s6 = _mm256_dpbusd_epi32(s6, a0, x);
+        s7 = _mm256_dpbusd_epi32(s7, a1, x);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    s0 = _mm256_add_epi32(_mm256_add_epi32(s0, s1), _mm256_add_epi32(s2, s3));
+    s4 = _mm256_add_epi32(_mm256_add_epi32(s4, s5), _mm256_add_epi32(s6, s7));
+    s0 = _mm256_add_epi32(s0, s4);
+    // Keep the loop alive; the value is irrelevant.
+    g_probe_sink.store(_mm256_extract_epi32(s0, 0), std::memory_order_relaxed);
+    const double us = static_cast<double>(t1.tv_sec - t0.tv_sec) * 1e6 +
+                      static_cast<double>(t1.tv_nsec - t0.tv_nsec) / 1e3;
+    // 8 dpbusd per iteration, 32 MACs each, 256-bit.
+    const double macs = static_cast<double>(iters) * 8.0 * 32.0;
+    return us > 0 ? macs / us / 1e3 : 0.0;
+}
+
+#else
+double probe_int8_vnni_gmacs() { return 0.0; }
+#endif
+
+#if defined(KRK_DOT_AVX2)
+__attribute__((target("avx2,fma"))) double probe_f32_avx2_gmacs() {
+    const int iters = 20000;
+    __m256 p = _mm256_set1_ps(1.0001f), q = _mm256_set1_ps(0.9999f);
+    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+    __m256 s2 = _mm256_setzero_ps(), s3 = _mm256_setzero_ps();
+    __m256 s4 = _mm256_setzero_ps(), s5 = _mm256_setzero_ps();
+    __m256 s6 = _mm256_setzero_ps(), s7 = _mm256_setzero_ps();
+    timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < iters; i++) {
+        s0 = _mm256_fmadd_ps(p, q, s0);
+        s1 = _mm256_fmadd_ps(p, q, s1);
+        s2 = _mm256_fmadd_ps(p, q, s2);
+        s3 = _mm256_fmadd_ps(p, q, s3);
+        s4 = _mm256_fmadd_ps(p, q, s4);
+        s5 = _mm256_fmadd_ps(p, q, s5);
+        s6 = _mm256_fmadd_ps(p, q, s6);
+        s7 = _mm256_fmadd_ps(p, q, s7);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    s0 = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
+    s4 = _mm256_add_ps(_mm256_add_ps(s4, s5), _mm256_add_ps(s6, s7));
+    s0 = _mm256_add_ps(s0, s4);
+    g_probe_sink_f.store(_mm256_cvtss_f32(s0), std::memory_order_relaxed);
+    const double us = static_cast<double>(t1.tv_sec - t0.tv_sec) * 1e6 +
+                      static_cast<double>(t1.tv_nsec - t0.tv_nsec) / 1e3;
+    const double macs = static_cast<double>(iters) * 8.0 * 8.0;
+    return us > 0 ? macs / us / 1e3 : 0.0;
+}
+
+#else
+double probe_f32_avx2_gmacs() { return 0.0; }
+#endif
+
+// Reported by the CPU backend so the trace's %peak column is against this
+// host, at this kernel width, with every core it has.
+double isa_peak_gmacs(bool int8) {
+    // Off unless something is going to print it: a probe is a few milliseconds
+    // of the user's run and a normal run must not pay for it.
+    {
+        const char *e = std::getenv("KRK_KPROF");
+        if (!e || e[0] == '\0' || e[0] == '0') return 0.0;
+    }
+    static const double i8 = [] {
+        double per = 0.0;
+#if defined(KRK_DOT_AVX512)
+        if (cpu_has_vnni()) per = probe_int8_vnni_gmacs();
+#endif
+        if (per <= 0.0) per = probe_f32_avx2_gmacs() * 4.0; // maddubs = 16 MAC/instr
+        return per;
+    }();
+    static const double f32 = [] { return probe_f32_avx2_gmacs(); }();
+    const double cores = static_cast<double>(
+        std::max(1u, std::thread::hardware_concurrency()));
+    return (int8 ? i8 : f32) * cores;
+}
+
+void set_vec_dot_int8(bool on) {
+    g_dot_int8.store(on, std::memory_order_relaxed);
+    g_dot_int8_set.store(true, std::memory_order_relaxed);
+}
+
+bool vec_dot_int8() {
+    if (!g_dot_int8_set.load(std::memory_order_relaxed)) {
+        g_dot_int8.store(env_dot_int8(), std::memory_order_relaxed);
+        g_dot_int8_set.store(true, std::memory_order_relaxed);
+    }
+#if defined(KRK_DOT_AVX2)
+    return g_dot_int8.load(std::memory_order_relaxed) && cpu_has_avx2();
+#else
+    return false;
+#endif
+}
+
+void set_vec_dot_avx2(bool on) {
+    g_dot_avx2.store(on, std::memory_order_relaxed);
+    g_dot_avx2_set.store(true, std::memory_order_relaxed);
+}
+
+bool vec_dot_avx2() {
+    if (!g_dot_avx2_set.load(std::memory_order_relaxed)) {
+        g_dot_avx2.store(env_dot_avx2(), std::memory_order_relaxed);
+        g_dot_avx2_set.store(true, std::memory_order_relaxed);
+    }
+    // The flag AND the CPU: a caller that logs this gets the truth on a build
+    // where the kernels exist but the host cannot run them.
+#if defined(KRK_DOT_AVX2)
+    return g_dot_avx2.load(std::memory_order_relaxed) && cpu_has_avx2();
+#else
+    return false;
+#endif
+}
+
+namespace {
+std::atomic<bool> g_dot_fast{false};
+std::atomic<bool> g_dot_fast_set{false};
+
+// The same policy: a host whose vectors are wide enough runs the four-lane
+// order unless it is told not to. The order is the numerics tier, so
+// `KRK_CPU_DOT_FAST=0` is the way back to the strictly serial reference.
+bool env_dot_fast() {
+    const char *e = std::getenv("KRK_CPU_DOT_FAST");
+    if (!e || e[0] == '\0') return dot_avx2_default() || cpu_has_avx2();
+    return e[0] != '0';
+}
+} // namespace
+
+void set_vec_dot_fast(bool on) {
+    g_dot_fast.store(on, std::memory_order_relaxed);
+    g_dot_fast_set.store(true, std::memory_order_relaxed);
+}
+
+bool vec_dot_fast() {
+    if (!g_dot_fast_set.load(std::memory_order_relaxed)) {
+        // One racy init: every thread that gets here writes the same value.
+        g_dot_fast.store(env_dot_fast(), std::memory_order_relaxed);
+        g_dot_fast_set.store(true, std::memory_order_relaxed);
+    }
+    return g_dot_fast.load(std::memory_order_relaxed);
+}
+
+// ---- the batched prefill kernel -------------------------------------------
+//
+// vec_dot() is a GEMV inner product: it decodes the weight row as it goes, so a
+// GEMM that calls it once per output element decodes every weight row once per
+// ROW of the batch. That is the whole of the prefill problem below -- measured
+// before this existed, on the 2 GiB q8_0 MoE at --cpu with KRK_CPU_DOT_AVX2=1,
+// cost per prefilled token was FLAT at 34.1, 29.1, 27.8, 28.3 ms across prompts
+// of 58, 149, 331 and 695 tokens. A batched GEMM is supposed to pay the weight
+// read once and reuse it for the whole batch, so prefill was running at GEMV
+// speed and its throughput could not improve with batch size.
+//
+// This decodes each weight block ONCE into registers and FMAs it against
+// `kTileRows` activation rows before moving on. Weight decode is amortized
+// kTileRows times instead of once, and there is no f32 scratch buffer: a
+// widening pass was tried first and made prefill 1.9x SLOWER, because it wrote
+// 4x the weight bytes to memory and replaced a fused vector decode with a
+// scalar one.
+//
+// Bit-identity is exact, not approximate. For one (weight row, activation row)
+// pair this performs the same operations in the same order as the fused kernel
+// it generalises -- per 8-element step, fma8() adds weight element k to
+// accumulator lane k mod 4, walking k upward -- so its result for that pair is
+// bit-identical to dot_q8_0_avx2/dot_q4_0_avx2, which are in turn bit-identical
+// to the four-lane arm. test_gemm_batched_bit_identical pins it against
+// vec_dot() on the same rows.
+
+#if defined(KRK_DOT_AVX2)
+namespace {
+
+constexpr i64 kTileRows = 8;
+
+// q8_0: d (f16) + 32 int8 per 34-byte block.
+__attribute__((target("avx2,fma"))) void dot_q8_0_tiled(
+    const u8 *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
+    const i64 nb = n / 32;
+    for (i64 r0 = 0; r0 + kTileRows <= rows; r0 += kTileRows) {
+        __m128 acc[kTileRows];
+        for (i64 j = 0; j < kTileRows; j++) acc[j] = _mm_setzero_ps();
+        const f32 *xr[kTileRows];
+        for (i64 j = 0; j < kTileRows; j++) xr[j] = x + (r0 + j) * n;
+        const u8 *p = w;
+        for (i64 b = 0; b < nb; b++, p += 34) {
+            const f32 d = fp16_to_fp32(
+                static_cast<u16>(p[0] | (static_cast<u16>(p[1]) << 8)));
+            const __m256 dv = _mm256_set1_ps(d);
+            for (int k = 0; k < 32; k += 8) {
+                const __m128i q8 = _mm_loadl_epi64(
+                    reinterpret_cast<const __m128i *>(p + 2 + k));
+                const __m256 wv = _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8)), dv);
+                for (i64 j = 0; j < kTileRows; j++)
+                    fma8(acc[j], wv, xr[j] + b * 32 + k);
+            }
+        }
+        for (i64 j = 0; j < kTileRows; j++) {
+            alignas(16) f32 a[4];
+            _mm_store_ps(a, acc[j]);
+            out[(r0 + j) * stride] = (a[0] + a[1]) + (a[2] + a[3]);
+        }
+    }
+}
+
+// q4_0: d (f16) + 16 bytes of nibbles, 18-byte block. Low nibble is value k,
+// high nibble is value k+16, both biased by 8.
+__attribute__((target("avx2,fma"))) void dot_q4_0_tiled(
+    const u8 *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
+    const i64 nb = n / 32;
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const __m256i off = _mm256_set1_epi32(8);
+    for (i64 r0 = 0; r0 + kTileRows <= rows; r0 += kTileRows) {
+        __m128 acc[kTileRows];
+        for (i64 j = 0; j < kTileRows; j++) acc[j] = _mm_setzero_ps();
+        const f32 *xr[kTileRows];
+        for (i64 j = 0; j < kTileRows; j++) xr[j] = x + (r0 + j) * n;
+        const u8 *p = w;
+        for (i64 b = 0; b < nb; b++, p += 18) {
+            const f32 d = fp16_to_fp32(
+                static_cast<u16>(p[0] | (static_cast<u16>(p[1]) << 8)));
+            const __m256 dv = _mm256_set1_ps(d);
+            const __m128i raw = _mm_loadu_si128(
+                reinterpret_cast<const __m128i *>(p + 2));
+            const __m128i lo = _mm_and_si128(raw, m4);
+            const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m4);
+            const __m256 w0 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo), off)),
+                dv);
+            const __m256 w1 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_sub_epi32(
+                    _mm256_cvtepu8_epi32(_mm_srli_si128(lo, 8)), off)),
+                dv);
+            const __m256 w2 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi), off)),
+                dv);
+            const __m256 w3 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_sub_epi32(
+                    _mm256_cvtepu8_epi32(_mm_srli_si128(hi, 8)), off)),
+                dv);
+            for (i64 j = 0; j < kTileRows; j++) {
+                const f32 *xv = xr[j] + b * 32;
+                fma8(acc[j], w0, xv);
+                fma8(acc[j], w1, xv + 8);
+                fma8(acc[j], w2, xv + 16);
+                fma8(acc[j], w3, xv + 24);
+            }
+        }
+        for (i64 j = 0; j < kTileRows; j++) {
+            alignas(16) f32 a[4];
+            _mm_store_ps(a, acc[j]);
+            out[(r0 + j) * stride] = (a[0] + a[1]) + (a[2] + a[3]);
+        }
+    }
+}
+
+} // namespace
+#endif
+
+// The unquantized formats, tiled. They have no block decode to hoist, but they
+// have the same problem for a different reason: vec_dot() widens the weight
+// element-by-element INSIDE the row loop, so every row re-converts the whole
+// matrix. On a 1 GiB f16 dense model that showed up as prefill 10.5 tok/s
+// against a decode of ~7.5 -- a 1.4x ratio, i.e. no batch amortization at all.
+// Converting each 4-element group once and reusing it across the tile fixes it
+// with the same arithmetic F16C already does, in the same order.
+#if defined(KRK_DOT_F16C)
+namespace {
+
+template <bool IsF16>
+__attribute__((target("f16c,fma"))) void dot_wide_tiled(
+    const void *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
+    constexpr i64 kT = 8;
+    for (i64 r0 = 0; r0 + kT <= rows; r0 += kT) {
+        __m128 acc[kT];
+        for (i64 j = 0; j < kT; j++) acc[j] = _mm_setzero_ps();
+        i64 i = 0;
+        for (; i + 4 <= n; i += 4) {
+            __m128 wv;
+            if constexpr (IsF16)
+                wv = _mm_cvtph_ps(_mm_loadl_epi64(
+                    reinterpret_cast<const __m128i *>(
+                        static_cast<const u16 *>(w) + i)));
+            else
+                wv = _mm_loadu_ps(static_cast<const f32 *>(w) + i);
+            for (i64 j = 0; j < kT; j++)
+                acc[j] = _mm_fmadd_ps(wv, _mm_loadu_ps(x + (r0 + j) * n + i),
+                                      acc[j]);
+        }
+        for (i64 j = 0; j < kT; j++) {
+            alignas(16) f32 a[4];
+            _mm_store_ps(a, acc[j]);
+            f32 sum = (a[0] + a[1]) + (a[2] + a[3]);
+            const f32 *xr = x + (r0 + j) * n;
+            for (i64 k = i; k < n; k++)
+                sum += (IsF16 ? fp16_to_fp32(static_cast<const u16 *>(w)[k])
+                              : static_cast<const f32 *>(w)[k]) *
+                       xr[k];
+            out[(r0 + j) * stride] = sum;
+        }
+    }
+}
+
+} // namespace
+#endif
+
+// Every block format without a hand-written kernel, tiled the same way: decode
+// a block ONCE and multiply it against kTileRows activation rows. This is the
+// path that carries K-quants (Q4_K/Q5_K/Q6_K), iq-quants and the rest of a real
+// collection, and it is the one that matters for anything not converted to
+// q8_0/q4_0 -- the fixture used for the headline measurement is q8_0, but the
+// sweep in docs/MODEL-STATUS.md is mostly Q4_K_M.
+//
+// Bit-identity comes from doing what vec_dot() does, per row, in its order.
+// vec_dot() walks the row block by block and has two shapes: a single in-order
+// chain (the oracle) and four accumulators folded (a0+a1)+(a2+a3) with a `tail`
+// for any run shorter than four. Both are reproduced here, and the `tail` is
+// accumulated ACROSS blocks exactly as there -- moving it inside the block
+// would change the summation order on any format whose block size is not a
+// multiple of four.
+namespace {
+
+// Decode each block once, then run it against every row of the tile. The inner
+// loop keeps kTileRows independent accumulators, which is what turns the weight
+// read from "once per row" into "once per tile".
+template <bool FourLane>
+void dot_generic_tiled(DType t, const u8 *w, const f32 *x, i64 n, i64 o_begin,
+                       i64 o_end, i64 rows, f32 *out, i64 out_stride) {
+    const int bs = dtype_block_size(t);
+    const int bb = dtype_block_bytes(t);
+    const size_t rb = dtype_row_bytes(t, n);
+    constexpr i64 kT = 8;
+    f32 buf[256];
+    for (i64 o = o_begin; o < o_end; o++) {
+        const u8 *p0 = w + static_cast<size_t>(o) * rb;
+        i64 r0 = 0;
+        for (; r0 + kT <= rows; r0 += kT) {
+            f32 a0[kT] = {}, a1[kT] = {}, a2[kT] = {}, a3[kT] = {}, tl[kT] = {};
+            if constexpr (!FourLane) {
+                f32 one[kT] = {};
+                i64 i = 0;
+                const u8 *p = p0;
+                while (i < n) {
+                    const int cnt = static_cast<int>((n - i) < bs ? (n - i) : bs);
+                    dequant_block(t, p, buf);
+                    for (i64 j = 0; j < kT; j++) {
+                        const f32 *xr = x + (r0 + j) * n + i;
+                        f32 s = one[j];
+                        for (int k = 0; k < cnt; k++) s += buf[k] * xr[k];
+                        one[j] = s;
+                    }
+                    i += cnt;
+                    p += bb;
+                }
+                for (i64 j = 0; j < kT; j++) out[(r0 + j) * out_stride + o] = one[j];
+            } else {
+                // The four-lane arm, in the shape vec_dot() itself uses. On an
+                // F16C host that shape is a FUSED multiply-add, and a separate
+                // multiply and add rounds differently -- using the scalar form
+                // here made Q4_K disagree with vec_dot() in the last few ulp,
+                // which is what this test caught.
+#if defined(KRK_DOT_F16C)
+                __m128 acc[kT];
+                for (i64 j = 0; j < kT; j++) acc[j] = _mm_setzero_ps();
+#endif
+                i64 i = 0;
+                const u8 *p = p0;
+                while (i < n) {
+                    const int cnt = static_cast<int>((n - i) < bs ? (n - i) : bs);
+                    dequant_block(t, p, buf);
+                    for (i64 j = 0; j < kT; j++) {
+                        const f32 *xr = x + (r0 + j) * n + i;
+                        int k = 0;
+#if defined(KRK_DOT_F16C)
+                        for (; k + 4 <= cnt; k += 4)
+                            acc[j] = _mm_fmadd_ps(_mm_loadu_ps(buf + k),
+                                                  _mm_loadu_ps(xr + k), acc[j]);
+#else
+                        for (; k + 4 <= cnt; k += 4) {
+                            a0[j] += buf[k] * xr[k];
+                            a1[j] += buf[k + 1] * xr[k + 1];
+                            a2[j] += buf[k + 2] * xr[k + 2];
+                            a3[j] += buf[k + 3] * xr[k + 3];
+                        }
+#endif
+                        for (; k < cnt; k++) tl[j] += buf[k] * xr[k];
+                    }
+                    i += cnt;
+                    p += bb;
+                }
+                for (i64 j = 0; j < kT; j++) {
+#if defined(KRK_DOT_F16C)
+                    alignas(16) f32 a[4];
+                    _mm_store_ps(a, acc[j]);
+                    out[(r0 + j) * out_stride + o] =
+                        ((a[0] + a[1]) + (a[2] + a[3])) + tl[j];
+#else
+                    out[(r0 + j) * out_stride + o] =
+                        ((a0[j] + a1[j]) + (a2[j] + a3[j])) + tl[j];
+#endif
+                }
+            }
+        }
+        // Leftover rows: the per-element oracle, same bits.
+        for (i64 r = rows - (rows % kT); r < rows; r++)
+            out[r * out_stride + o] = vec_dot(t, p0, x + r * n, n);
+    }
+}
+
+} // namespace
+
+void vec_dot_tiled(DType t, const void *w, const f32 *x, i64 n_in, i64 o_begin,
+                   i64 o_end, i64 rows, f32 *out, i64 out_stride) {
+    const size_t rb = dtype_row_bytes(t, n_in);
+    const u8 *wb = static_cast<const u8 *>(w);
+#if defined(KRK_DOT_AVX2)
+    if ((t == DType::Q8_0 || t == DType::Q4_0) && n_in > 0 && (n_in % 32) == 0 &&
+        rows > 0 && vec_dot_avx2()) {
+        for (i64 o = o_begin; o < o_end; o++) {
+            const u8 *wr = wb + static_cast<size_t>(o) * rb;
+            if (t == DType::Q8_0)
+                dot_q8_0_tiled(wr, x, n_in, rows, out + o, out_stride);
+            else
+                dot_q4_0_tiled(wr, x, n_in, rows, out + o, out_stride);
+            // Rows past the last whole tile: the per-element path, same bits.
+            for (i64 r = rows - (rows % kTileRows); r < rows; r++)
+                out[r * out_stride + o] = vec_dot(t, wr, x + r * n_in, n_in);
+        }
+        return;
+    }
+#endif
+#if defined(KRK_DOT_F16C)
+    // f16 and f32: the widening arm, tiled. bf16 and i32 keep the per-element
+    // loop -- they are rare enough in a collection that they are not worth a
+    // fourth kernel, and they are correct either way.
+    if ((t == DType::F16 || t == DType::F32) && rows > 0 && n_in > 0) {
+        for (i64 o = o_begin; o < o_end; o++) {
+            const u8 *wr = wb + static_cast<size_t>(o) * rb;
+            if (t == DType::F16)
+                dot_wide_tiled<true>(wr, x, n_in, rows, out + o, out_stride);
+            else
+                dot_wide_tiled<false>(wr, x, n_in, rows, out + o, out_stride);
+            for (i64 r = rows - (rows % 8); r < rows; r++)
+                out[r * out_stride + o] = vec_dot(t, wr, x + r * n_in, n_in);
+        }
+        return;
+    }
+#endif
+    // Every other block format: the generic tile, which decodes each block once
+    // and reuses it across rows.
+    if (t != DType::F16 && t != DType::F32 && t != DType::BF16 &&
+        t != DType::I32 && rows > 0 && n_in > 0) {
+        if (vec_dot_fast() || vec_dot_avx2())
+            dot_generic_tiled<true>(t, wb, x, n_in, o_begin, o_end, rows, out,
+                                    out_stride);
+        else
+            dot_generic_tiled<false>(t, wb, x, n_in, o_begin, o_end, rows, out,
+                                     out_stride);
+        return;
+    }
+    // Every other format, and every host without AVX2: the per-element path,
+    // which is what the fused kernels are also validated against.
+    for (i64 o = o_begin; o < o_end; o++) {
+        const u8 *wr = wb + static_cast<size_t>(o) * rb;
+        for (i64 r = 0; r < rows; r++)
+            out[r * out_stride + o] = vec_dot(t, wr, x + r * n_in, n_in);
+    }
+}
+
 f32 vec_dot(DType t, const void *src, const f32 *x, i64 n) {
     // The unquantized formats have no block structure, so widen them directly
     // rather than routing through the block loop (which would look for a
     // 1-element "block" decoder that does not exist).
+    //
+    // F32 and F16 are evaluated four lanes at a time where the ISA has F16C:
+    // lane k of the vector IS accumulator k of the scalar loop below, fed the
+    // same elements in the same order, and the final combination is still
+    // (a0 + a1) + (a2 + a3). That is what makes the fast path safe to have in
+    // an oracle -- it is the same arithmetic, not a rearranged version of it,
+    // so every golden hash in the suite stays valid.
+    //
+    // Why it matters here: the scalar form below called fp16_to_fp32() once per
+    // weight element, and that is an out-of-line function with a subnormal
+    // normalisation loop in it. One core / two SMT threads at 2.6 GHz measured
+    // 0.8 GMAC/s on a 1 GiB f16 model -- 583 ms per prefill token, identical at
+    // rows=1..64 because the cost is per weight element and not per row. The
+    // same machine does ~4 GMAC/s through this path (see BENCH-CPU-DOT.md).
+#if defined(KRK_DOT_F16C)
+    if (t == DType::F32) {
+        const f32 *w = static_cast<const f32 *>(src);
+        __m128 acc = _mm_setzero_ps();
+        i64 i = 0;
+        for (; i + 4 <= n; i += 4)
+            acc = _mm_fmadd_ps(_mm_loadu_ps(w + i), _mm_loadu_ps(x + i), acc);
+        alignas(16) f32 a[4];
+        _mm_store_ps(a, acc);
+        f32 s = (a[0] + a[1]) + (a[2] + a[3]);
+        for (; i < n; i++) s += w[i] * x[i];
+        return s;
+    }
+    if (t == DType::F16) {
+        const u16 *h = static_cast<const u16 *>(src);
+        __m128 acc = _mm_setzero_ps();
+        i64 i = 0;
+        for (; i + 4 <= n; i += 4) {
+            const __m128i h4 =
+                _mm_loadl_epi64(reinterpret_cast<const __m128i *>(h + i));
+            acc = _mm_fmadd_ps(_mm_cvtph_ps(h4), _mm_loadu_ps(x + i), acc);
+        }
+        alignas(16) f32 a[4];
+        _mm_store_ps(a, acc);
+        f32 s = (a[0] + a[1]) + (a[2] + a[3]);
+        for (; i < n; i++) s += fp16_to_fp32(h[i]) * x[i];
+        return s;
+    }
+#endif
     if (t == DType::F32) {
         const f32 *w = static_cast<const f32 *>(src);
         f32 acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
@@ -1217,7 +3169,62 @@ f32 vec_dot(DType t, const void *src, const f32 *x, i64 n) {
         return s;
     }
     const int bs = dtype_block_size(t);
+    const int bb = dtype_block_bytes(t);
     f32 buf[256];
+#if defined(KRK_DOT_AVX2)
+    // The fused arm, for the two formats it has kernels for. Everything else --
+    // and any run where the host lacks AVX2 -- falls through to the four-lane
+    // loop below, which is the same arithmetic, so the answer does not depend
+    // on which of the two ran.
+    if (n > 0 && (n % 32) == 0 && vec_dot_avx2()) {
+        if (t == DType::Q8_0)
+            return dot_q8_0_avx2(static_cast<const u8 *>(src), x, n / 32);
+        if (t == DType::Q4_0)
+            return dot_q4_0_avx2(static_cast<const u8 *>(src), x, n / 32);
+    }
+#endif
+    if (vec_dot_fast() || vec_dot_avx2()) {
+        // Four lanes over the widened block. dequant_block is unchanged, so the
+        // VALUES are identical to the loop below; only the summation order
+        // differs. See the contract on set_vec_dot_fast in krk/quant.hpp.
+        f32 tail = 0.0f;
+        const u8 *p = static_cast<const u8 *>(src);
+        i64 i = 0;
+#if defined(KRK_DOT_F16C)
+        __m128 acc = _mm_setzero_ps();
+        while (i < n) {
+            const int cnt = static_cast<int>((n - i) < bs ? (n - i) : bs);
+            dequant_block(t, p, buf);
+            int k = 0;
+            for (; k + 4 <= cnt; k += 4)
+                acc = _mm_fmadd_ps(_mm_loadu_ps(buf + k),
+                                   _mm_loadu_ps(x + i + k), acc);
+            for (; k < cnt; k++) tail += buf[k] * x[i + k];
+            i += cnt;
+            p += bb;
+        }
+        alignas(16) f32 a[4];
+        _mm_store_ps(a, acc);
+        return ((a[0] + a[1]) + (a[2] + a[3])) + tail;
+#else
+        f32 acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+        while (i < n) {
+            const int cnt = static_cast<int>((n - i) < bs ? (n - i) : bs);
+            dequant_block(t, p, buf);
+            int k = 0;
+            for (; k + 4 <= cnt; k += 4) {
+                acc0 += buf[k] * x[i + k];
+                acc1 += buf[k + 1] * x[i + k + 1];
+                acc2 += buf[k + 2] * x[i + k + 2];
+                acc3 += buf[k + 3] * x[i + k + 3];
+            }
+            for (; k < cnt; k++) tail += buf[k] * x[i + k];
+            i += cnt;
+            p += bb;
+        }
+        return ((acc0 + acc1) + (acc2 + acc3)) + tail;
+#endif
+    }
     f32 sum = 0;
     const u8 *p = static_cast<const u8 *>(src);
     i64 i = 0;
@@ -1226,7 +3233,7 @@ f32 vec_dot(DType t, const void *src, const f32 *x, i64 n) {
         dequant_block(t, p, buf);
         for (int k = 0; k < cnt; k++) sum += buf[k] * x[i + k];
         i += cnt;
-        p += dtype_block_bytes(t);
+        p += bb;
     }
     return sum;
 }

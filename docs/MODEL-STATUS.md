@@ -52,6 +52,37 @@ runtime, SDK 7.16.26331, Release.**
 compared across rows. `HOT %` is the expert cache's hit share and is blank on a
 dense model, which has no expert tier.
 
+## A note on the prefill column
+
+**The sweep above is the HIP arm and predates the CPU prefill fix; it is not
+re-run here because this sandbox has no GPU (HIP off).** Do not read the CPU
+numbers below as contradicting it -- they are a different backend.
+
+The CPU backend had a defect that made prefill unamortized: `gemm()` called
+`vec_dot()` once per (row, output) element, and `vec_dot()` decodes a weight row
+as it goes, so every weight row was decoded once per ROW of the batch. The
+signature in this table is the prefill:decode ratio. A batched GEMM should show
+a large one; a GEMV times N rows shows the ratio of a single-token read. Values
+near 1 mean prefill was not batching at all.
+
+Measured on the CPU fixture (2 GiB q8_0 MoE, 2 vCPU), before and after:
+
+| prompt tokens | before | after | speedup |
+|---|---:|---:|---:|
+| 58 | 1833 ms | 804 ms | 2.28x |
+| 149 | 4438 ms | 1495 ms | 2.97x |
+| 331 | 9300 ms | 2778 ms | 3.35x |
+| 695 | 19575 ms | 6760 ms | 2.90x |
+
+and on a 1 GiB f16 dense file, 3.8-4.3x (details and the bit-identity witnesses:
+[MOE-RESIDENCY.md §7](MOE-RESIDENCY.md)).
+
+The same defect **cannot be ruled out on the GPU arm** -- it would show up in
+this table as a prefill:decode ratio far below what the card can do, and several
+rows have exactly that shape (Underdog-Saluki-27B 7.3, omnicoder-9b 4.3,
+Laguna-S-2.1 1.2). Confirming or clearing it needs a run on the card; nothing in
+this document claims a GPU number that was not measured on a GPU.
+
 ## What the numbers say
 
 * **Prefill is the weak number on the larger dense files.** Underdog-Saluki-27B
@@ -95,6 +126,75 @@ not be re-measured: `SmolLM2-135M-Instruct.Q4_K_M`, `SmolLM2-135M-Instruct.IQ4_X
 `qwen3-1.7b-coder-distilled-sft-f16`, `qwen3-1.7b-stem-proof-f16`,
 `qwen3.5-4b-nvfp4`, `qwen3.5-9b-nvfp4` and `Qwen3.5-9b-Sushi-Coder-RL.Q4_K_M`.
 Their old numbers are in the commit history of this file.
+
+## How a file is judged
+
+`kraken-inspect FILE` answers "will this run, and if not, why" **without loading
+the weights**. It runs the same verdict the loader runs, so its answer and the
+engine's answer are the same answer — that agreement is a test
+(`test_load_verdict`), and it is the point of the tool.
+
+The pipeline, in order. The first rule that fires decides:
+
+1. **Architecture.** `general.architecture` is looked up in the table in
+   `src/arch.cpp` (~31 entries). Each entry carries a shape (dense, MoE,
+   recurrent, recurrent-MoE, diffusion), a support level, a role, and — for
+   anything that is not a plain `Yes` — a sentence naming the gap.
+2. **Shape.** A file needs a token table to look anything up in, and a target
+   needs attention or SSM tensors to be a transformer. A table pack with neither
+   is refused for what it is, and the reason names the tensors the file *does*
+   carry.
+3. **Role.** A draft head set (`dflash`, `dspark`, `qwen4-mtp`,
+   `deepseek4-dspark`, `qwen35-dflash-draft`, `dflash-draft`) is not a model; it
+   is refused unless a target is given to attach it to.
+4. **Tensor level.** The refused-tensor table names each unimplemented tensor
+   kind (`attn_qkv`, `attn_gate`, `attn_v_exps`, `attn_kv_a/b`, `ssm_conv1d`,
+   `ssm_out`, …). A file carrying one is refused **by tensor name** rather than
+   loaded and decoded as nonsense.
+5. **Support level.** `Partial` architectures load and run, leaving the named
+   feature out; `No` architectures refuse. `KRK_ARCH_ALLOW_EXPERIMENTAL=1` is a
+   *loader* switch — it lets the tensors of a refused schema be read so a
+   half-ported architecture can be checked stage by stage, and it does not admit
+   the graph: an arch whose attention has no implementation is refused after the
+   load and before generation. There is no switch that makes a `No` run.
+
+**Unlisted architectures are refused.** They used to be read against llama
+defaults, which meant `kraken-inspect` printed
+`zzz9moxx — unknown (llama-like defaults)` and `verdict runnable` while
+`kraken` failed later with `GGUF metadata is missing core geometry`. The verdict
+was wrong and the engine was right. Now the verdict refuses first, with the
+reason that actually applies:
+
+```
+verdict    refused
+           - architecture 'zzz9moxx' is not in the architecture table and the
+             file carries no 'zzz9moxx.block_count' key, so the layer stack
+             cannot be determined. Known architectures: llama, qwen2, qwen3, ...
+```
+
+The rule asks the *file*, not the name: an unlisted label whose file still
+carries a usable `<arch>.block_count` keeps its geometry and stays runnable with
+a note, because that file can load. Verified on `fix/unknown-arch.gguf` — the
+MoE fixture with only its `general.architecture` string rewritten.
+
+## Family coverage
+
+The four families that were open, and the exact state of each. An arch string
+that llama.cpp does not define is not invented here; those files are refused as
+unlisted, which is now a named refusal rather than a silent llama-default load.
+
+| Family | GGUF arch | State | What is missing |
+|---|---|---|---|
+| DeepSeek-V4.1-Flash | `deepseek41` | **Partial** — loads as the deepseek4 graph | compressed attention, the sparse indexer, hyper-connections (`hc_*`), Engram sidecar tensors. A checkpoint carrying them is refused by tensor name |
+| MiniMax-M3.1-Flash | `minimax-m3` | **No** — registered this pass, refuses by name | MiniMax Sparse Attention (block-sparse with no dense prefix), the native vision/video tower, the DSpark draft head. No GGUF schema has been validated for it either, so the refusal is doubly correct |
+| Qwen3.8-Flash-Next | `qwen4exp` | **supported, gated** — every component has a kernel | not a missing kernel but a missing **whole-graph coherence gate** against an independently verified reference on the real GGUF: one recorded REAP-288 prompt matched 24/24 and another coding prompt historically diverged. Serving fluent wrong output is the failure this engine exists to avoid, so it stays gated until that gate exists (see [TECHNICAL-README.md §4](TECHNICAL-README.md)) |
+| Ornith-1.5-122B | none (unlisted) | **refused as unlisted** | no published GGUF arch string to read it against; refused rather than guessed |
+
+`minimax-m3` was added to the table for a specific reason: the fallback path
+read unlisted files against llama defaults, and a 428B sparse-attention MoE is
+the worst possible candidate for a schema nobody checked — the defaults would
+find a plausible layer stack and compute the wrong graph. A named refusal is the
+honest answer until MSA exists.
 
 ## Refused at load
 

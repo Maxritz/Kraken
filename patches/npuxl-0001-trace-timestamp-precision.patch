@@ -1,0 +1,38 @@
+--- a/src/core/runtime.cpp
++++ b/src/core/runtime.cpp
+@@ -4,6 +4,7 @@
+  */
+ #include "../internal.h"
+ 
++#include <algorithm>
+ #include <fstream>
+ #include <iomanip>
+ #include <sstream>
+@@ -437,6 +438,18 @@
+             std::lock_guard<std::mutex> lock(mutex);
+             copy = events;
+         }
++        // Timestamps are written RELATIVE to the first event and with fixed
++        // precision. Both halves matter, and the default was wrong in a way
++        // that looked like a coarse clock: this stream inherits ostream's
++        // default 6 significant digits, so an absolute monotonic microsecond
++        // stamp near 1.2e9 was emitted as e.g. "1.1953e+09" -- a 10 ms grid.
++        // Every command inside one grid cell shared an instant, so a trace
++        // could not answer gap or duty-cycle questions at all, while durations
++        // (small numbers, same 6 digits) stayed exact and looked trustworthy.
++        // Rebasing removes the magnitude; fixed(3) pins 1 ns of resolution.
++        uint64_t t0 = copy.empty() ? 0u : copy[0].start_ns;
++        for (const auto &e : copy) t0 = std::min(t0, e.start_ns);
++        out << std::fixed << std::setprecision(3);
+         out << "{\n\"traceEvents\":[\n";
+         for (size_t i = 0; i < 8; ++i) {
+             out << "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"tid\":"
+@@ -448,7 +461,7 @@
+             uint32_t tid = std::min<uint32_t>(e.thread_id, 7);
+             out << "{\"name\":\"" << json_escape(e.name)
+                 << "\",\"cat\":\"" << json_escape(e.category)
+-                << "\",\"ph\":\"X\",\"ts\":" << (e.start_ns / 1000.0)
++                << "\",\"ph\":\"X\",\"ts\":" << ((e.start_ns - t0) / 1000.0)
+                 << ",\"dur\":" << (e.duration_ns / 1000.0)
+                 << ",\"pid\":1,\"tid\":" << tid
+                 << ",\"args\":{\"op\":\"" << vnpu_opcode_name(e.opcode)

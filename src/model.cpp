@@ -225,6 +225,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.rope_scale = static_cast<f32>(gguf_.get_f64(key(".rope.scaling.factor"), 1.0));
     cfg_.logit_softcap =
         static_cast<f32>(gguf_.get_f64(key(".final_logit_softcapping"), 0.0));
+    cfg_.attn_softcap =
+        static_cast<f32>(gguf_.get_f64(key(".attention.logit_softcapping"), 0.0));
     {
         const std::string st = gguf_.get_str(key(".rope.scaling.type"), "");
         if (st == "none" || st.empty()) cfg_.rope_scale = 1.0f;
@@ -297,6 +299,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // point, so resolving it here would capture the pre-override value.
     cfg_.post_norm_eps = static_cast<f32>(aspec.post_norm_eps);
     cfg_.gelu_ffn = aspec.gelu_ffn;
+    cfg_.gpt2_style = aspec.gpt2_style;
     cfg_.rope_swa_only = aspec.rope_swa_only;
     // RoPE's pair convention is a property of the export, so it comes from
     // the arch table rather than from the tensors. KRK_ROPE_NEOX=0/1 forces
@@ -724,7 +727,6 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         return false;
     }
 
-    const i64 q_dim = static_cast<i64>(cfg_.n_head) * cfg_.head_dim;
     // No single kv_dim here on purpose: the KV width is per layer
     // (kv_dim_at(l)), and the maximum is only what the workspaces and one KV
     // slot are sized against. A local constant is how the geometry check below
@@ -905,7 +907,10 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (e) *e = "table '" + name + "' is empty";
             return false;
         }
-        if (t->n_bytes < t->n_elements * 4) {
+        // n_elements is positive (checked above) and 4 bytes wide, so the
+        // widening to size_t is exact; comparing the two types directly was a
+        // signed/unsigned mix.
+        if (t->n_bytes < static_cast<size_t>(t->n_elements) * 4u) {
             if (e)
                 *e = "table '" + name + "' is truncated (" +
                      std::to_string(t->n_bytes) + " bytes for " +
@@ -1265,6 +1270,28 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // taken here. (A tied file shares this tensor with the head below, and
         // the head's own gs is read there.)
         tok_embd_ = upload_raw(te, te->type);
+        if (cfg_.gpt2_style) {
+            // Learned absolute positions, [n_ctx_train, n_embd], added to the
+            // token embedding before the first block. There is no rotary table
+            // anywhere in this family, and building one would rotate vectors
+            // that already carry their position.
+            const GgufTensor *pe = gguf_.tensor("position_embd.weight");
+            if (!pe) {
+                if (err) *err = "gpt2 file has no position_embd.weight";
+                return false;
+            }
+            pos_embd_ = upload_raw(pe, pe->type);
+            if (pe->n_elements !=
+                static_cast<i64>(cfg_.n_ctx_train) * cfg_.n_embd) {
+                if (err)
+                    *err = "position_embd.weight is " +
+                           std::to_string(pe->n_elements) +
+                           " elements, expected n_ctx_train*n_embd = " +
+                           std::to_string(static_cast<i64>(cfg_.n_ctx_train) *
+                                          cfg_.n_embd);
+                return false;
+            }
+        }
         cfg_.n_vocab = static_cast<i32>(te->ne[1]);
         lp.mark("  token_embd upload");
     }
@@ -1292,8 +1319,9 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // the file's own order -- hc_head first, so nothing that loaded before
         // changes -- and the shape check below decides whether what was found is
         // a mixer at all.
-        auto head_name = [&](const char *a, const char *b) {
-            return gguf_.tensor(a) ? std::string(a) : std::string(b);
+        auto head_name = [&](const char *first, const char *second) {
+            return gguf_.tensor(first) ? std::string(first)
+                                       : std::string(second);
         };
         const std::string hc_norm = head_name("hc_head_norm.weight",
                                               "output_hc_norm.weight");
@@ -1338,6 +1366,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         if (!out_norm_) {
             if (err) *err = "output_norm.weight is missing";
             return false;
+        }
+        if (cfg_.gpt2_style) {
+            // The final LayerNorm's bias. Without it the last hidden row keeps
+            // its mean, which shifts every logit by a constant per row -- and
+            // a constant on the LOGIT axis does not divide out of a softmax
+            // unless every row shares it, so this changes the next-token
+            // distribution rather than just its scale.
+            out_norm_bias_ = upload_f32("output_norm.bias");
+            if (!out_norm_bias_) {
+                if (err)
+                    *err = "gpt2 file has no output_norm.bias (its final "
+                           "LayerNorm needs one)";
+                return false;
+            }
         }
     }
 
@@ -1413,7 +1455,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
     // The CPU backend has no device/host split: streaming there would copy host
     // memory to host memory and buy nothing. `weight_budget_ == 0` is automatic.
-    const bool can_stream = be.kind() != BackendKind::CPU &&
+    const bool can_stream = be.has_device_memory() &&
                             be.device_total_bytes() > 0;
     size_t weight_budget = weight_budget_;
     // An explicit --weight-vram-mb is a promise, not a hint: the second ring slot
@@ -1637,6 +1679,21 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
         L.attn_norm = upload_f32(blk_key("blk.%d.attn_norm.weight", l));
         L.ffn_norm = upload_f32(blk_key("blk.%d.ffn_norm.weight", l));
+        if (cfg_.gpt2_style) {
+            // LayerNorm, so each pre-norm has a bias beside its weight. A
+            // LayerNorm run without its bias is a different function, not a
+            // rounding difference: every row keeps its mean instead of being
+            // centred, and the error compounds over eight blocks.
+            L.attn_norm_bias = upload_f32(blk_key("blk.%d.attn_norm.bias", l));
+            L.ffn_norm_bias = upload_f32(blk_key("blk.%d.ffn_norm.bias", l));
+            if (!L.attn_norm_bias || !L.ffn_norm_bias) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " is gpt2-shaped but its LayerNorm biases are "
+                           "missing (attn_norm.bias / ffn_norm.bias)";
+                return false;
+            }
+        }
         // The two branch post norms. They are NOT the FFN's input norm under
         // another name -- the file carries `ffn_norm` beside them (gemma3) --
         // and the fallback below deliberately does not look at them, because
@@ -1884,8 +1941,6 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 gguf_.tensor(blk_key("blk.%d.attn_kv.weight", l)) != nullptr;
             const bool has_kv_a_mqa =
                 gguf_.tensor(blk_key("blk.%d.attn_kv_a_mqa.weight", l)) != nullptr;
-            const bool has_kv_a =
-                gguf_.tensor(blk_key("blk.%d.attn_kv_a.weight", l)) != nullptr;
             const bool has_k_b =
                 gguf_.tensor(blk_key("blk.%d.attn_k_b.weight", l)) != nullptr;
             const bool has_v_b =
@@ -2234,8 +2289,6 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     stage_bytes += static_cast<i64>(nelem * 2);
                     return true;
                 };
-                const i64 gout =
-                    static_cast<i64>(cfg_.dsv4_o_lora) * cfg_.dsv4_o_groups;
                 const i64 q_head = static_cast<i64>(cfg_.n_head) * want_latent;
                 bool staged =
                     stage16("attn_kv", L.wkv16,
@@ -2282,9 +2335,39 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // norm of the same stream). A layer with neither attention nor
             // experts is still a truncated file, which is what keeps this from
             // accepting half a download as a model.
-            L.wq = need(blk_key("blk.%d.attn_q.weight", l));
-            L.wk = need(blk_key("blk.%d.attn_k.weight", l));
-            L.wv = need(blk_key("blk.%d.attn_v.weight", l));
+            if (cfg_.gpt2_style) {
+                // One projection, [n_embd -> 3*n_embd], whose output row is
+                // Q | K | V as three contiguous n_embd blocks, with one
+                // 3*n_embd bias covering all of them. The file carries no
+                // separate q/k/v tensors at all, so this is not an
+                // optimisation here -- it is the only shape that exists.
+                L.wqkv_fused = need(blk_key("blk.%d.attn_qkv.weight", l));
+                L.qkv_bias = upload_f32(blk_key("blk.%d.attn_qkv.bias", l));
+                if (!L.wqkv_fused.present()) {
+                    if (e.empty())
+                        e = "layer " + std::to_string(l) +
+                            " is missing its fused attn_qkv projection";
+                    if (err) *err = e;
+                    return false;
+                }
+                // The fused weight must be exactly three embeddings wide, or
+                // the Q|K|V split below reads past its own row and every head
+                // after the first is silently somebody else's. Cheap to check,
+                // and a wrong-width file cannot be rescued downstream.
+                if (L.wqkv_fused.n_out != 3 * static_cast<i64>(cfg_.n_embd)) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) +
+                               " attn_qkv is " +
+                               std::to_string(L.wqkv_fused.n_out) +
+                               " wide, expected 3*n_embd = " +
+                               std::to_string(3 * cfg_.n_embd);
+                    return false;
+                }
+            } else {
+                L.wq = need(blk_key("blk.%d.attn_q.weight", l));
+                L.wk = need(blk_key("blk.%d.attn_k.weight", l));
+                L.wv = need(blk_key("blk.%d.attn_v.weight", l));
+            }
             L.wo = need(blk_key("blk.%d.attn_output.weight", l));
             // Attention-output bias (gpt-oss). One f32 per output channel,
             // added to the projection's result before the residual. Absent on
@@ -2402,7 +2485,12 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             gguf_.tensor(blk_key("blk.%d.ffn_up.weight", l)) != nullptr;
         L.moe = gguf_.tensor(exps_gate) != nullptr || (has_exps_up && !has_dense_gate);
         if (!L.moe && has_dense_ffn) {
-            L.wgate = need(blk_key("blk.%d.ffn_gate.weight", l));
+            // GPT-2's MLP is up -> gelu -> down. There is no gate tensor, and
+            // asking for one would fail the load on a file that is complete;
+            // reading ffn_up as a gate instead would halve the intermediate
+            // width and run the wrong activation over it.
+            if (!cfg_.gpt2_style)
+                L.wgate = need(blk_key("blk.%d.ffn_gate.weight", l));
             L.wup = need(blk_key("blk.%d.ffn_up.weight", l));
             L.wdown = need(blk_key("blk.%d.ffn_down.weight", l));
         } else if (L.moe) {
@@ -2748,8 +2836,14 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 return false;
             }
         }
-        if (!L.moe && has_dense_ffn &&
-            (L.wgate.n_out != cfg_.n_ff || L.wdown.n_in != cfg_.n_ff)) {
+        // GPT-2 has no gate tensor: its intermediate width is ffn_up's output.
+        // Checking wgate here would fail every complete gpt2 file, because an
+        // absent gate reads as width 0 rather than as "no gate".
+        const bool ffn_width_ok =
+            cfg_.gpt2_style
+                ? (L.wup.n_out == cfg_.n_ff && L.wdown.n_in == cfg_.n_ff)
+                : (L.wgate.n_out == cfg_.n_ff && L.wdown.n_in == cfg_.n_ff);
+        if (!L.moe && has_dense_ffn && !ffn_width_ok) {
             if (err)
                 *err = "layer " + std::to_string(l) + " FFN tensors disagree with n_ff";
             return false;
@@ -3068,7 +3162,6 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // interpolated frequency already carries the 1/factor, and the kernel
     // divides the *position* by rope_scale, so leaving both would apply it
     // twice.
-    const i64 half = std::max<i64>(1, cfg_.rope_dim / 2);
     auto build_inv_freq = [](std::vector<f32> &tab, i32 n_dims, f32 base) {
         const i64 h = std::max<i32>(1, n_dims / 2);
         tab.assign(static_cast<size_t>(h), 0.0f);

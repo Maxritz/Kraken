@@ -30,14 +30,60 @@ constexpr ArchSpec kFallback = {
     /*gemma_norm=*/false,
 };
 
+// The gemma stack, built here rather than spelled out inline. Every gemma file
+// gates its FFN with GeGLU -- gelu(gate) * up, not silu(gate) * up -- and that
+// is ArchSpec::gelu_ffn, which sits behind twelve members that have to be
+// written out to reach it positionally. A silent SwiGLU there is not a visible
+// failure: the two activations agree near zero and differ only in the tail, so
+// the model keeps producing plausible text with the wrong function. Naming the
+// four shared flags once and setting the rest by name is the way to keep that
+// from coming back.
+//
+//   swa_period / window_first are the family's alternating pattern:
+//     gemma2: 2, windowed layer first (even layers 4096-token window)
+//     gemma3: 6, windowed first (five local layers per one global)
+//   gemma/gemma4 consult the file for the window and keep period 0.
+constexpr ArchSpec gemma_spec(const char *name, ArchSupport sup, const char *why,
+                              int swa_period, bool window_first) {
+    ArchSpec s{name,       ArchShape::Dense, sup,     ArchRole::Target,
+               "gemma",    why,              /*qk_norm=*/true,
+               /*q_output_gate=*/false, /*qkv_bias=*/false,
+               /*gemma_norm=*/true,      /*attn_gate=*/false,
+               /*rope_neox=*/true,       swa_period, window_first};
+    s.gelu_ffn = true;
+    return s;
+}
+
 // The loadable schemas first, then the ones that stop at a reason. Flags on a
 // refused entry are descriptive: they record what the file carries so the entry
 // can be flipped to Yes without re-deriving the schema, and they are never
 // consulted by a load that is refused.
+// GPT-2's row needs a flag that sits after every other member, and this table is
+// positional. Building it here keeps the row readable and keeps the flag from
+// having to be written as forty commas.
+constexpr ArchSpec gpt2_spec() {
+    ArchSpec s{"gpt2", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "gpt2", "", false, false, false, false};
+    // LayerNorm carries a bias on every norm; the fused qkv carries one bias;
+    // every projection in the stack carries one. `has_bias` is what makes the
+    // loader look for them.
+    s.gpt2_style = true;
+    s.rope_neox = false;
+    // No RoPE anywhere: learned positions are added into the embedding instead.
+    // The engine reads this off gpt2_style rather than off a rotary flag, so
+    // leaving rope defaults alone here is deliberate -- there is no table to
+    // build and nothing should try.
+    return s;
+}
+
 constexpr ArchSpec kTable[] = {
     // ---- the schemas this engine runs ------------------------------------
     {"llama", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
      false, false, false, false},
+    // GPT-2 and its descendants: LayerNorm (biased), learned absolute
+    // positions, a fused attn_qkv, and a plain GELU MLP. See
+    // ArchSpec::gpt2_style for why those four travel together.
+    gpt2_spec(),
     // Qwen2 adds a bias on q/k/v; everything else is the llama schema. It is
     // the first arch here whose rope is the *NeoX* pairing (llama.cpp's table
     // lists qwen2 under LLAMA_ROPE_TYPE_NEOX): the pair is channel j with
@@ -97,25 +143,43 @@ constexpr ArchSpec kTable[] = {
      /*qk_norm=*/true, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/true,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/1},
-    // Gemma scales the embedding by sqrt(n_embd) and uses a tighter eps.
-    // Gemma 1 is the llama schema plus embedding scaling. It is not in the
-    // collections here, so the entry says so rather than claiming a validated
-    // run. (Final-logit softcapping is implemented; the attention-side
-    // softcap and sliding windows are not — see gemma2/gemma3.)
-    {"gemma", ArchShape::Dense, ArchSupport::Partial, ArchRole::Target, "gemma",
-     "not validated against a file in this collection; the schema is llama plus "
-     "embedding scaling",
-     true, false, false, true, false, true},
-    // Gemma 2 adds a softcap on the *attention* logits (inside the softmax,
-    // where a host-side fix cannot reach) and alternating sliding-window
-    // attention. Neither is implemented.
-    {"gemma2", ArchShape::Dense, ArchSupport::No, ArchRole::Target, "gemma",
-     "attention-logit softcapping and alternating sliding-window attention are "
-     "not implemented",
-     true, false, false, true, false, true},
-    {"gemma3", ArchShape::Dense, ArchSupport::No, ArchRole::Target, "gemma",
-     "alternating sliding-window attention is not implemented",
-     true, false, false, true, false, true},
+    // Gemma scales the embedding by sqrt(n_embd), uses a tighter eps, gates its
+    // FFN with GeGLU and softcaps the final logits. Gemma 1 is the llama schema
+    // plus those four. It is not in the collections here, so the entry says so
+    // rather than claiming a validated run.
+    gemma_spec("gemma", ArchSupport::Partial,
+               "not validated against a file in this collection; the schema is "
+               "llama plus embedding scaling, GeGLU and a final-logit softcap",
+               0, false),
+    // Gemma 2: every piece of its schema is now implemented. The alternating
+    // window (period 2, windowed layer first) is read from this entry and the
+    // loader's is_swa() drives it; GeGLU, the embedding scaling and the
+    // final-logit softcap were already there; and the softcap on the ATTENTION
+    // logits -- cap * tanh(score / cap) between the QK dot and the softmax, i.e.
+    // inside the score formation rather than as a transform of the result,
+    // which is a different function -- is AttnDesc::softcap, applied by the
+    // reference attention and gated against a hand-computed softmax in the
+    // tests. The HIP kernels keep four score paths of their own and none caps
+    // yet, so that backend answers attention_softcap_supported() == false and
+    // Engine::init refuses the run by name rather than decoding a different
+    // model; --cpu and both NPU arms run it.
+    gemma_spec("gemma2", ArchSupport::Partial,
+               "the attention-logit softcap is applied by the reference "
+               "attention (--cpu, --npu, --npu-cpu) but not by the HIP "
+               "kernels, which refuse the run by name; the alternating window, "
+               "GeGLU and the final-logit softcap are implemented; not "
+               "validated against a gemma2 file in this collection",
+               2, true),
+    // Gemma 3: QK-norm, GeGLU, embedding scaling, a final-logit softcap and a
+    // 5:1 local/global pattern (period 6, windowed layers first, 1024-token
+    // window declared in the file). Every one of those pieces is implemented
+    // and driven by schema flags rather than by arch name; the remaining doubt
+    // is a validated run, which this collection has no gemma3 file for.
+    gemma_spec("gemma3", ArchSupport::Partial,
+               "the loader reads its whole schema (QK-norm, GeGLU, the 5:1 "
+               "windowed/global pattern, embedding scaling, final-logit softcap); "
+               "not validated against a file in this collection",
+               6, true),
     // Gemma 4 (E-series) as the files in the collection declare it: 42 layers,
     // shared-KV layers, two attention geometries (global heads of 512 with 512
     // rope dims, sliding-window heads of 256 with 256) and per-layer input
@@ -128,11 +192,13 @@ constexpr ArchSpec kTable[] = {
     // got past the arch table was refused by the head-geometry check with
     // "attention tensors disagree with the declared head geometry" -- a message
     // about the file's own tensors, for a feature this engine does not have.
-    {"gemma4", ArchShape::Dense, ArchSupport::No, ArchRole::Target, "gemma",
-     "per-layer input embeddings, shared-KV layers, two attention geometries "
-     "(global + sliding window), per-layer attention.head_count_kv and the "
-     "attention-logit softcap are not implemented",
-     true, false, false, true, false, true},
+    gemma_spec("gemma4", ArchSupport::No,
+               "per-layer input embeddings, shared-KV layers, two attention "
+               "geometries (global + sliding window) and the attention-logit "
+               "softcap are not implemented; the per-layer "
+               "attention.head_count_kv array, GeGLU and the final-logit softcap "
+               "are",
+               0, false),
 
     // ---- loads and runs, with a named gap ---------------------------------
     // The language tower of a vision model is the text schema; the vision tower
@@ -253,6 +319,33 @@ constexpr ArchSpec kTable[] = {
      "shared-latent MLA, the grouped output and the tid2eid hash route run; "
      "compressed attention (attn_compressor_*), the sparse indexer and "
      "attn_sinks do not, so a file with a non-zero compress_ratios is refused",
+     /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
+     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
+     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
+     /*swiglu_oai=*/false, /*hyper_connection=*/false, /*ple=*/false,
+     /*qsa=*/false, /*attn_gate_elem=*/false, /*no_out_norm=*/false,
+     /*mla=*/true, /*dsv4=*/true, /*attention_implemented=*/true},
+    // DeepSeek-V4.1-Flash (-1017 and the earlier V4.1-Flash): the same graph
+    // as deepseek4 under the architecture string llama.cpp's converter writes
+    // for this family, which is `deepseek41` rather than `deepseek4`. A file
+    // carrying the V4.1 name was previously "unknown architecture" -- the
+    // least useful answer available, because the reasons it cannot run are
+    // specific and already enumerated on the entry above (compressed
+    // attention, the sparse indexer, attn_sinks, hyper-connections). Mapping
+    // the name onto the implementation inherits every one of those refusals
+    // instead of replacing them with a shrug.
+    //
+    // What this does NOT do is make V4.1 run. A V4.1 checkpoint is 343B-763B
+    // with compress_ratios non-zero on most layers, so Engine::init refuses it
+    // by name exactly as it refuses deepseek4, and the loader's gap map names
+    // the tensors it could not take. The entry exists so the refusal says
+    // which graph it read and what is missing from it.
+    {"deepseek41", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target,
+     "deepseek4",
+     "recognised as the deepseek4 graph: shared-latent MLA, the grouped output "
+     "and the tid2eid hash route; compressed attention, the sparse indexer and "
+     "hyper-connections are not implemented, so a V4.1 checkpoint with "
+     "compress_ratios or hc_* tensors is refused by name, not mis-loaded",
      /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
@@ -410,6 +503,23 @@ constexpr ArchSpec kTable[] = {
      "attention values are a routed expert set of their own "
      "(attn_v_exps/attn_v_gate); that is not implemented",
      false, false, false, false, true, false},
+    // MiniMax's sparse-attention MoE. Listed rather than left to the fallback
+    // because the fallback reads an unlisted file against llama defaults, and a
+    // 428B MoE is the last model that should be run through a schema nobody
+    // checked: the defaults would find a plausible layer stack and quietly
+    // compute the wrong graph instead of refusing.
+    //
+    // Three gaps, all of them structural rather than a missing flag. MiniMax
+    // Sparse Attention is block-sparse throughout -- M3.1 replaced the last
+    // full-attention layers, so there is no dense prefix to fall back on and
+    // the attention op's causal/window masks cannot express it. The model is
+    // natively multimodal, so a vision/video tower feeds the token stream. And
+    // it ships a DSpark draft head, which this engine can load as a draft file
+    // against a matching target but which has nothing to attach to here.
+    {"minimax-m3", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "minimax-m3",
+     "MiniMax Sparse Attention (block-sparse, no dense prefix), a native "
+     "vision/video tower and a DSpark draft head are not implemented",
+     false, false, false, false},
     // Dense FFN with an attention output gate and Gemma-style post-norms.
     {"muse-glimmer", ArchShape::Dense, ArchSupport::No, ArchRole::Target,
      "muse-glimmer",
@@ -453,7 +563,12 @@ struct GapTensor {
     // the same gate tensor and the same existing code path -- was refused for a
     // feature the engine has. A name list cannot fix itself when a second arch
     // shows up.
-    enum class Served : unsigned char { Never, ByAttnGateFlag, ByMlaFlag };
+    enum class Served : unsigned char {
+        Never,
+        ByAttnGateFlag,
+        ByMlaFlag,
+        ByGpt2Flag
+    };
     Served served = Served::Never;
 };
 
@@ -461,7 +576,11 @@ constexpr GapTensor kGapTensors[] = {
     // On a recurrent arch `attn_qkv` is the gated delta net's own projection and
     // is what the loader uploads; on a dense one it is a fused attention
     // projection this engine has no shape for.
-    {"attn_qkv.weight", "a fused query/key/value projection (attn_qkv)", true},
+    // Served when the schema is gpt2-shaped: that loader binds the fused
+    // projection and Engine::gpt2_forward splits the Q|K|V row. Anywhere else
+    // it is still a fused attention projection this engine has no shape for.
+    {"attn_qkv.weight", "a fused query/key/value projection (attn_qkv)", true,
+     GapTensor::Served::ByGpt2Flag},
     // Implemented: src/model.cpp loads attn_gate.weight behind
     // ArchSpec::attn_gate and src/engine.cpp softplus-gates and broadcasts it
     // over the attention result before wo.
@@ -578,6 +697,9 @@ const char *arch_tensor_gap(std::string_view tensor_name, ArchShape shape,
             arch_spec(arch).attn_gate)
             continue;
         if (g.served == GapTensor::Served::ByMlaFlag && arch_spec(arch).mla)
+            continue;
+        if (g.served == GapTensor::Served::ByGpt2Flag &&
+            arch_spec(arch).gpt2_style)
             continue;
         if (has(tensor_name, g.needle)) return g.gap;
     }

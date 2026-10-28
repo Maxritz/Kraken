@@ -11,7 +11,7 @@
 //      would avoid reading.
 //
 // Build:
-//   c++ -O2 -std=c++17 -Iinclude tools/probe_tq_file.cpp src/gguf.cpp \
+//   c++ -O2 -std=c++17 -Iinclude tools/probe_tq_file.cpp src/gguf.cpp
 //       src/quant.cpp src/common.cpp -o probe_tq_file
 #include "krk/gguf.hpp"
 

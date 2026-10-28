@@ -1,0 +1,903 @@
+From 1b388799fe5a6f10adf727d87a51a5841be9d512 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Tue, 27 Oct 2026 14:30:56 +0000
+Subject: [PATCH] avx2: real int8 GEMM over packed weights, vectorised row
+ quantise
+
+The AVX2 int8 tile widened 8 int8 to int32 and used mullo_epi32, after
+gathering B one byte at a time out of the row-major copy: 8 MACs per
+iteration, measured equal to scalar (4.89 vs 3.80 GFLOP/s). On the packed
+[n_block][k4][16][4] layout maddubs+madd_epi16 does 32 MACs in two
+instructions. The +128 offset the VNNI path uses cannot be reused
+(maddubs accumulates to int16 and 255*127*2 overflows), so this uses
+|a| * (b*sign(a)), which peaks at 32512 and needs no correction term:
+padding is zero on both sides and |0| = 0.
+
+quantize_rows was fully scalar and is 25.8% of device busy in a W8A8
+trace, second only to the GEMM. Vectorised to be bit-identical:
+round-half-away-from-zero is emulated in four instructions because
+vcvtps2dq rounds half to even.
+
+Measured on 768x768 expert shapes, one core:
+  1x768x768    0.326 -> 0.075 ms   (4.3x)
+  32x768x768   8.321 -> 0.548 ms   (15.2x)
+  128x768x768 30.869 -> 1.960 ms   (15.7x)
+  1x2048x768   0.909 -> 0.108 ms   (8.4x)
+
+tests/isa_parity.cpp hashes raw output bytes per op so the three arms can
+be compared exactly rather than within a tolerance; int8 GEMM and quantise
+are bit-identical across scalar/avx2/avx512 on every shape tested,
+including K%4 != 0 and N%16 != 0 edges. tests/bench_i8.cpp is the
+benchmark above. docs/ZEN3-AVX2.md records the whole thing, including
+which f32 ops still differ across ISAs and why that predates this change.
+
+End to end in an engine (Kraken, 2 GiB q8_0 MoE, W8A8, forced zen3 arm):
+prefill 13271 -> 3447 ms, decode 233 -> 43 ms, identical output hash.
+---
+ CMakeLists.txt          |  13 ++
+ docs/ZEN3-AVX2.md       | 127 ++++++++++++++++
+ src/kernels/kernels.cpp | 105 +++++++++++++-
+ src/kernels/llm.cpp     | 116 +++++++++++++++
+ tests/bench_i8.cpp      | 116 +++++++++++++++
+ tests/isa_parity.cpp    | 310 ++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 786 insertions(+), 1 deletion(-)
+ create mode 100644 docs/ZEN3-AVX2.md
+ create mode 100644 tests/bench_i8.cpp
+ create mode 100644 tests/isa_parity.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9533b58..13160e8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -110,6 +110,19 @@ if(VNPU_BUILD_TOOLS)
+     target_link_libraries(vnpu-fuzz PRIVATE ${VNPU_LINK_TARGET} Threads::Threads)
+     vnpu_set_warnings(vnpu-fuzz)
+     add_test(NAME vnpu_fuzz COMMAND vnpu-fuzz 60)
++
++    # Cross-ISA parity: build once, run per ISA (VNPU_FORCE_ISA), compare the
++    # printed digest. The AVX2 arm is the Zen 3 one, so it is checked here
++    # rather than being left to a machine nobody has.
++    add_executable(vnpu-isa-parity tests/isa_parity.cpp)
++    target_include_directories(vnpu-isa-parity PRIVATE ${VNPU_INCLUDE_DIRS})
++    target_link_libraries(vnpu-isa-parity PRIVATE ${VNPU_LINK_TARGET} Threads::Threads)
++    vnpu_set_warnings(vnpu-isa-parity)
++
++    add_executable(vnpu-bench-i8 tests/bench_i8.cpp)
++    target_include_directories(vnpu-bench-i8 PRIVATE ${VNPU_INCLUDE_DIRS})
++    target_link_libraries(vnpu-bench-i8 PRIVATE ${VNPU_LINK_TARGET} Threads::Threads)
++    vnpu_set_warnings(vnpu-bench-i8)
+   endif()
+ endif()
+ 
+diff --git a/docs/ZEN3-AVX2.md b/docs/ZEN3-AVX2.md
+new file mode 100644
+index 0000000..da45af3
+--- /dev/null
++++ b/docs/ZEN3-AVX2.md
+@@ -0,0 +1,127 @@
++# The Zen 3 arm: what AVX2 actually does here
++
++This file exists because "AVX2 fallback" was, on the int8 path, not an
++optimisation. It was a widening loop that measured the same as scalar, and
++anything claiming otherwise was measuring the scalar path.
++
++Zen 3 has no AVX-512. The per-core ceiling is **2x 256-bit FMA3** (FP0 and
++FP1), so 8 f32 lanes x 2 ops = 16 MAC/cycle, and a 256-bit vector is the widest
++thing that retires at full rate. AVX-512 first appears in Zen 4, where it is
++double-pumped and therefore worth about the same throughput with fewer
++instructions. So on this hardware class the 256-bit kernel is not a
++consolation prize: it is the fast path.
++
++Force the arm on any x86 machine to test it:
++
++```
++VNPU_FORCE_ISA=avx2 ./bin/vnpu-selftest
++VNPU_FORCE_ISA=avx2 ./build/vnpu-isa-parity
++VNPU_FORCE_ISA=avx2 ./build/vnpu-bench-i8
++```
++
++## 1. The int8 GEMM
++
++The packed weight layout is `[n_block][k4][16][4]`: for each group of four
++k-values, the four multipliers belonging to column `n` sit at `dst[lane*4 + kk]`.
++That contiguity is the whole point, and the old kernel did not use it.
++
++```c
++/* before: gemm_i8_avx2_tile */
++for (; k + 8 <= p.K; k += 8) {
++    for (uint32_t j = 0; j < 8; ++j)          /* 8 scalar byte-gathers */
++        ((uint8_t*)&bv)[j] = p.B.original[(k+j)*p.B.N + n];
++    __m256i a32 = _mm256_cvtepi8_epi32(a8);   /* widen 8 int8 -> 8 int32 */
++    __m256i b32 = _mm256_cvtepi8_epi32(b8);
++    acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(a32, b32));
++}
++```
++
++Eight MACs per iteration, paid for with eight scalar loads, two widens and a
++32-bit multiply, all serialised through one accumulator. The AVX-512 path
++twenty lines below uses `dpbusd` and does 16 MACs per instruction; this did not.
++
++`_mm256_maddubs_epi16` + `_mm256_madd_epi16` does **32 MACs in two
++instructions** on the packed layout. The catch is `+128`, the offset the VNNI
++path uses to make its first operand unsigned: `dpbusd` accumulates into int32
++and absorbs it, but `maddubs` produces int16 and `255 * 127 * 2 = 64770`
++overflows that immediately.
++
++So this uses the sign trick instead: the first operand becomes `|a|` and the
++second becomes `b * sign(a)`, via `_mm256_sign_epi8`. Peak magnitude is then
++`128 * 127 * 2 = 32512`, which fits int16 exactly, and **no correction term is
++needed** -- padding is zero on both sides when the weights are packed (see
++`vnpu_pack_weights_i8`), and a zero A byte has `|a| = 0`, so it contributes
++nothing regardless of what sign it is given.
++
++Result, one core, 768x768 expert matrices (`vnpu-bench-i8`):
++
++| shape | scalar | old avx2 | **new avx2** | old -> new |
++|---|---:|---:|---:|---:|
++| 1x768x768 (decode row) | 0.358 ms | 0.326 ms | **0.075 ms** | **4.3x** |
++| 32x768x768 | 9.456 ms | 8.321 ms | **0.548 ms** | **15.2x** |
++| 128x768x768 | 39.735 ms | 30.869 ms | **1.960 ms** | **15.7x** |
++| 1x2048x768 (wide K) | 0.956 ms | 0.909 ms | **0.108 ms** | **8.4x** |
++
++**Correction (2026-10-27).** An earlier revision of this file claimed that the
++256-bit kernel "outruns the AVX-512 VNNI path" here. It does not. That number
++came from `VNPU_FORCE_ISA=avx512`, which stripped the VNNI feature bit and so
++ran this same AVX2 kernel on both arms; see npuxl-0003. With VNNI reachable the
++AVX-512 kernel is ~4x faster (130 vs 32 GMAC/s, single thread, 128x768x768).
++Forcing `avx2` on an AVX-512 host is still legitimate, but not because it wins.
++
++## 2. Per-row int8 quantisation
++
++`quantize_rows` was entirely scalar: one `std::fabs`/`std::max` pass for the
++scale, then one `std::round` per element. It is 25.8% of device busy time in the
++Kraken W8A8 trace, second only to the GEMM itself, because a quantised model
++re-quantises every activation row on every projection.
++
++The vector version is **bit-identical**, deliberately. `quantize_value()` rounds
++with `std::round`, which is half-away-from-zero, while `vcvtps2dq` rounds half to
++even. Emulating round() costs four instructions (trunc, fractional part, two
++compares) and removes a class of "the AVX2 arm and the AVX-512 arm disagree"
++reports. The max reduction is exact (max is associative over finite floats), and
++a row containing a non-finite value takes the scalar path wholesale.
++
++## 3. Proof that the answers did not move
++
++`tests/isa_parity.cpp` hashes the raw bytes of every kernel output and prints
++one digest per op, so the arms can be compared directly:
++
++```
++for isa in scalar avx2 avx512; do VNPU_FORCE_ISA=$isa ./build/vnpu-isa-parity; done
++```
++
++| op | scalar | avx2 | avx512 |
++|---|---|---|---|
++| int8 GEMM, all six shapes | `1b1e6304...` etc. | **identical** | **identical** |
++| quantize rows / scales | `f4328060...` | **identical** | **identical** |
++| add | `10ba4f9d...` | identical | identical |
++| f32 GEMM, swiglu | reference | = avx512 | != scalar |
++| rmsnorm, softmax | reference | != scalar | != scalar |
++
++Shapes include `767x763` (K not a multiple of 4, N not a multiple of 16),
++`4x4x4`, `1x...` decode rows and `33x...` prefill rows, because the padding
++edges are where a block kernel breaks and the round numbers never do.
++
++The f32 rows are a **pre-existing** property of this engine, not something these
++changes introduced: the vectorised f32 reductions sum in a different order from
++the scalar loop, so `VNPU_FORCE_ISA` changes f32 results in the last bits. That
++is worth knowing before blaming it on the int8 work, and worth keeping in mind
++if a deployment pins results across a mixed fleet.
++
++## 4. End to end, in an engine
++
++Kraken, 2 GiB q8_0 MoE fixture, 121-token prompt, `KRK_NPU_W8A8=1`, best of 3:
++
++| arm | prefill before | prefill after | decode before | decode after |
++|---|---:|---:|---:|---:|
++| avx2 (Zen 3 forced) | 13271.4 ms | **3446.9 ms (3.85x)** | 233.4 ms | **42.8 ms (5.5x)** |
++| avx512 (default) | 2974.5 ms | 2940.5 ms | 29.6 ms | 24.9 ms |
++
++The baseline AVX2 number was within 1% of the scalar arm, which is the point:
++before this change, a Zen 3 user enabling int8 weights got scalar speed and no
++reason to know it. The prefill hash is unchanged (`fc8a5598db7ec9cd` on both),
++so the 3.85x costs no accuracy.
++
++The AVX-512 arm did not regress -- the VNNI path was not touched.
+diff --git a/src/kernels/kernels.cpp b/src/kernels/kernels.cpp
+index 5b3e48f..dbe80bb 100644
+--- a/src/kernels/kernels.cpp
++++ b/src/kernels/kernels.cpp
+@@ -448,7 +448,99 @@ static inline int32_t hsum256_epi32(__m256i v)
+ }
+ 
+ VNPU_TARGET_AVX2
+-static void gemm_i8_avx2_tile(const GemmI8Params &p, const TileJob &tile)
++/* AVX2 int8 GEMM over the packed weight layout (Zen 3 class: two 256-bit FMA
++ * pipes, no AVX-512, so 256-bit vectors are the widest thing that runs at full
++ * rate).
++ *
++ * The previous AVX2 tile widened each 8 int8 to int32 and multiplied with
++ * mullo_epi32, after gathering the B bytes one at a time out of the row-major
++ * copy: 8 MACs per iteration paid for with 8 scalar loads, two vpmovsxbd and a
++ * vpmulld, and a serial dependency through one accumulator. On the packed
++ * layout the four k-values belonging to one output column are CONTIGUOUS, so
++ * maddubs does 32 MACs in one instruction and madd_epi16 folds the pairs.
++ *
++ * The +128 offset the VNNI path uses to make A unsigned cannot be reused here:
++ * dpbusd accumulates straight into int32, but maddubs produces int16 and
++ * 255*127*2 = 64770 overflows it. So this uses the sign trick instead -- the
++ * first operand becomes |a| (unsigned, <=128) and the second becomes b*sign(a).
++ * Max magnitude is then 128*127*2 = 32512, which fits int16 exactly, and no
++ * correction term is needed at all: padding is zero on both sides (see
++ * vnpu_pack_weights_i8), and a zero A byte has |a| = 0, so it contributes
++ * nothing.
++ *
++ * Requires the packed view. Without it the caller must already have taken the
++ * slow widen path, which is kept below for exactly that case. */
++VNPU_TARGET_AVX2
++static void gemm_i8_avx2_packed_tile(const GemmI8Params &p, const TileJob &tile)
++{
++    const uint32_t k4_groups = p.B.Kpad / 4;
++    const uint32_t mend = tile.m0 + tile.tm;
++    const uint32_t nend = std::min<uint32_t>(tile.n0 + tile.tn, p.N);
++    const __m256i ones16 = _mm256_set1_epi16(1);
++    for (uint32_t m = tile.m0; m < mend; ++m) {
++        const int8_t *arow = p.A + static_cast<size_t>(m) * p.lda;
++        const float scale_a = p.scale_a ? p.scale_a[m] : 1.0f;
++        float *crow = p.C + static_cast<size_t>(m) * p.ldc;
++        for (uint32_t n0 = tile.n0; n0 < nend; n0 += 16) {
++            const uint8_t *bp = p.B.packed +
++                (static_cast<size_t>(n0 / 16) * k4_groups) * 64;
++            __m256i acc0 = _mm256_setzero_si256(); /* columns n0+0  .. n0+7  */
++            __m256i acc1 = _mm256_setzero_si256(); /* columns n0+8  .. n0+15 */
++            for (uint32_t g = 0; g < k4_groups; ++g) {
++                const uint32_t kbase = g * 4;
++                /* One 4-byte A pattern, broadcast to all 16 columns: the
++                 * absolute values, and a sign mask for sign_epi8. */
++                uint8_t ab[4], sg[4];
++                for (uint32_t j = 0; j < 4; ++j) {
++                    const uint32_t k = kbase + j;
++                    const int32_t v = k < p.K ? arow[k] : 0;
++                    ab[j] = static_cast<uint8_t>(v < 0 ? -v : v);
++                    sg[j] = static_cast<uint8_t>(v < 0 ? 0xFF : 0x01);
++                }
++                int32_t abw, sgw;
++                std::memcpy(&abw, ab, sizeof(abw));
++                std::memcpy(&sgw, sg, sizeof(sgw));
++                const __m256i aabs = _mm256_set1_epi32(abw);
++                const __m256i asgn = _mm256_set1_epi32(sgw);
++                const uint8_t *b = bp + static_cast<size_t>(g) * 64;
++                __m256i b0 = _mm256_sign_epi8(
++                    _mm256_loadu_si256(reinterpret_cast<const __m256i *>(b)),
++                    asgn);
++                __m256i b1 = _mm256_sign_epi8(
++                    _mm256_loadu_si256(
++                        reinterpret_cast<const __m256i *>(b + 32)),
++                    asgn);
++                acc0 = _mm256_add_epi32(
++                    acc0, _mm256_madd_epi16(
++                              _mm256_maddubs_epi16(aabs, b0), ones16));
++                acc1 = _mm256_add_epi32(
++                    acc1, _mm256_madd_epi16(
++                              _mm256_maddubs_epi16(aabs, b1), ones16));
++            }
++            float out[16];
++            const __m256 sa = _mm256_set1_ps(scale_a);
++            const __m256 o0 = _mm256_mul_ps(
++                _mm256_mul_ps(_mm256_cvtepi32_ps(acc0), sa),
++                _mm256_loadu_ps(p.B.scales + n0));
++            const __m256 o1 = _mm256_mul_ps(
++                _mm256_mul_ps(_mm256_cvtepi32_ps(acc1), sa),
++                _mm256_loadu_ps(p.B.scales + n0 + 8));
++            std::memcpy(out, &o0, sizeof(o0));
++            std::memcpy(out + 8, &o1, sizeof(o1));
++            const uint32_t cols = std::min<uint32_t>(16u, nend - n0);
++            for (uint32_t j = 0; j < cols; ++j) {
++                float v = out[j];
++                if (p.bias) v += p.bias[n0 + j];
++                crow[n0 + j] = apply_epilogue(v, p.epilogue);
++            }
++        }
++    }
++}
++
++/* Fallback for a packed view that is absent: 8 MACs per iteration, kept
++ * because a caller may hand the kernel only the row-major copy. */
++VNPU_TARGET_AVX2
++static void gemm_i8_avx2_flat_tile(const GemmI8Params &p, const TileJob &tile)
+ {
+     for (uint32_t m = tile.m0; m < tile.m0 + tile.tm; ++m) {
+         const int8_t *arow = p.A + static_cast<size_t>(m) * p.lda;
+@@ -480,6 +572,17 @@ static void gemm_i8_avx2_tile(const GemmI8Params &p, const TileJob &tile)
+     }
+ }
+ 
++static void gemm_i8_avx2_tile(const GemmI8Params &p, const TileJob &tile)
++{
++    /* The packed kernel walks whole 16-column blocks and needs the four k of a
++     * group; anything else takes the flat path, which has no such requirement. */
++    if (p.B.packed && p.B.Kpad >= p.K && (tile.n0 & 15u) == 0) {
++        gemm_i8_avx2_packed_tile(p, tile);
++        return;
++    }
++    gemm_i8_avx2_flat_tile(p, tile);
++}
++
+ /* AVX512-VNNI: A is int8 + 128 (u8), B is signed int8 in [16][4] blocks.
+  * The extra 128*sum(B) term is removed with precomputed column sums. */
+ VNPU_TARGET_VNNI
+diff --git a/src/kernels/llm.cpp b/src/kernels/llm.cpp
+index 6ac6b3f..0871373 100644
+--- a/src/kernels/llm.cpp
++++ b/src/kernels/llm.cpp
+@@ -524,6 +524,106 @@ static inline int8_t quantize_value(float x, float inv_scale)
+     return static_cast<int8_t>(static_cast<int>(q));
+ }
+ 
++#if VNPU_X86
++/* Vectorised per-row int8 quantisation -- the Zen 3 (AVX2) answer to the scalar
++ * two-pass loop below.
++ *
++ * It is bit-identical to the scalar loop, on purpose: quantize_value() rounds
++ * with std::round, which is half-AWAY-from-zero, while vcvtps2dq rounds half to
++ * EVEN. Emulating round() costs four instructions (trunc, frac, two compares)
++ * and removes a whole class of "the AVX2 arm and the AVX-512 arm disagree on
++ * this fixture" reports. The max is an exact reduction (max is associative for
++ * finite floats), and a row containing a non-finite value takes the scalar path
++ * wholesale, because that is the case where the two roundings could differ in
++ * what they do with the result rather than in the result. */
++VNPU_TARGET_AVX2
++static inline __m256 round_half_away(__m256 v)
++{
++    const __m256 t = _mm256_round_ps(v, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
++    const __m256 frac = _mm256_sub_ps(v, t);
++    const __m256 up = _mm256_and_ps(
++        _mm256_cmp_ps(frac, _mm256_set1_ps(0.5f), _CMP_GE_OQ),
++        _mm256_set1_ps(1.0f));
++    const __m256 dn = _mm256_and_ps(
++        _mm256_cmp_ps(frac, _mm256_set1_ps(-0.5f), _CMP_LE_OQ),
++        _mm256_set1_ps(-1.0f));
++    return _mm256_add_ps(t, _mm256_add_ps(up, dn));
++}
++
++VNPU_TARGET_AVX2
++static void quantize_range_avx2(const float *x, int8_t *y, uint64_t n,
++                                float inv)
++{
++    const __m256 vinv = _mm256_set1_ps(inv);
++    const __m256 vhi = _mm256_set1_ps(127.0f);
++    const __m256 vlo = _mm256_set1_ps(-128.0f);
++    uint64_t j = 0;
++    for (; j + 32 <= n; j += 32) {
++        __m256i q[4];
++        for (int b = 0; b < 4; ++b) {
++            __m256 v = _mm256_mul_ps(
++                _mm256_loadu_ps(x + j + 8 * b), vinv);
++            v = round_half_away(v);
++            v = _mm256_min_ps(_mm256_max_ps(v, vlo), vhi);
++            q[b] = _mm256_cvttps_epi32(v);
++        }
++        /* 4 x 8 int32 -> 32 int8. packs works inside 128-bit lanes, so the
++         * dwords land in the order 0,4,1,5,2,6,3,7 and are put back in
++         * sequence here. */
++        const __m256i p01 = _mm256_packs_epi32(q[0], q[1]);
++        const __m256i p23 = _mm256_packs_epi32(q[2], q[3]);
++        const __m256i packed = _mm256_packs_epi16(p01, p23);
++        const __m256i fixed = _mm256_permutevar8x32_epi32(
++            packed, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
++        _mm256_storeu_si256(reinterpret_cast<__m256i *>(y + j), fixed);
++    }
++    for (; j < n; ++j) y[j] = quantize_value(x[j], inv);
++}
++
++VNPU_TARGET_AVX2
++static void quantize_rows_avx2(const vnpu_quantize_i8_args_t &a,
++                               uint64_t begin, uint64_t end)
++{
++    const __m256 absmask = _mm256_castsi256_ps(
++        _mm256_set1_epi32(static_cast<int>(0x7FFFFFFFu)));
++    for (uint64_t r = begin; r < end; ++r) {
++        const float *row = a.X + r * a.cols;
++        int8_t *out = a.Y + r * a.cols;
++        __m256 vmax = _mm256_setzero_ps();
++        uint64_t j = 0;
++        int nonfinite = 0;
++        for (; j + 8 <= a.cols; j += 8) {
++            const __m256 v = _mm256_loadu_ps(row + j);
++            nonfinite |= _mm256_movemask_ps(_mm256_cmp_ps(v, v, _CMP_UNORD_Q));
++            vmax = _mm256_max_ps(vmax, _mm256_and_ps(v, absmask));
++        }
++        alignas(32) float lanes[8];
++        _mm256_store_ps(lanes, vmax);
++        float maxabs = 0.0f;
++        for (int i = 0; i < 8; ++i) maxabs = std::max(maxabs, lanes[i]);
++        for (; j < a.cols; ++j) {
++            if (!std::isfinite(row[j])) nonfinite = 1;
++            maxabs = std::max(maxabs, std::fabs(row[j]));
++        }
++        if (nonfinite) {
++            /* Same values out as the scalar loop, including what it does with
++             * the infinities and NaNs a broken model produces. */
++            for (uint64_t k = 0; k < a.cols; ++k) {
++                float s2 = maxabs / 127.0f;
++                if (s2 <= 0.0f || !std::isfinite(s2)) s2 = 1.0f;
++                a.scales[r] = s2;
++                out[k] = quantize_value(row[k], 1.0f / s2);
++            }
++            continue;
++        }
++        float scale = maxabs / 127.0f;
++        if (scale <= 0.0f || !std::isfinite(scale)) scale = 1.0f;
++        a.scales[r] = scale;
++        quantize_range_avx2(row, out, a.cols, 1.0f / scale);
++    }
++}
++#endif /* VNPU_X86 */
++
+ void quantize_rows(const vnpu_quantize_i8_args_t &a, uint64_t begin,
+                    uint64_t end)
+ {
+@@ -794,7 +894,23 @@ void kernel_mul_range(const vnpu_binary_f32_args_t &a, uint64_t begin,
+ void kernel_quantize_i8_range(const vnpu_quantize_i8_args_t &a,
+                               uint64_t begin, uint64_t end, uint32_t isa)
+ {
++#if VNPU_X86
++    /* The AVX2 kernel is what a Zen 3 host runs: no AVX-512 there at all, so
++     * "AVX2 or better" is the whole fast path, not a consolation prize. */
++    if (isa == ISA_AVX2 || isa == ISA_AVX512) {
++        if (a.axis == VNPU_QUANT_PER_ROW) {
++            quantize_rows_avx2(a, begin, end);
++            return;
++        }
++        if (a.axis == VNPU_QUANT_PER_TENSOR) {
++            const float inv = 1.0f / (a.scales[0] > 0.0f ? a.scales[0] : 1.0f);
++            quantize_range_avx2(a.X + begin, a.Y + begin, end - begin, inv);
++            return;
++        }
++    }
++#else
+     (void)isa;
++#endif
+     switch (a.axis) {
+     case VNPU_QUANT_PER_ROW:
+         quantize_rows(a, begin, end);
+diff --git a/tests/bench_i8.cpp b/tests/bench_i8.cpp
+new file mode 100644
+index 0000000..ac588a3
+--- /dev/null
++++ b/tests/bench_i8.cpp
+@@ -0,0 +1,116 @@
++/*
++ * bench_i8.cpp - int8 GEMM throughput at the shapes an MoE expert actually has.
++ *
++ * The number this exists to produce: MAC/s on the packed int8 kernel, per ISA.
++ * Run it for each arm and compare:
++ *
++ *     for isa in scalar avx2 avx512; do
++ *         VNPU_FORCE_ISA=$isa ./build/vnpu-bench-i8
++ *     done
++ *
++ * Shapes are the ones Kraken asks for: a routed expert is a 768x768 matrix
++ * (gate, up, down all the same width in the bench fixture), fed one row per
++ * decode step and a whole block of rows per prefill chunk. Both are measured
++ * because they stress different things -- M=1 is bound by the B stream, M=128
++ * by the multiply -- and a kernel that only wins at one of them is not a win
++ * for a real run.
++ */
++#include "vnpu.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++namespace {
++
++uint32_t rng_state = 0x9e3779b9u;
++int8_t rnd_i8() {
++    rng_state ^= rng_state << 13;
++    rng_state ^= rng_state >> 17;
++    rng_state ^= rng_state << 5;
++    return static_cast<int8_t>(static_cast<int>(rng_state % 255) - 127);
++}
++
++double now_ms() {
++    using clock = std::chrono::steady_clock;
++    return std::chrono::duration<double, std::milli>(
++               clock::now().time_since_epoch())
++        .count();
++}
++
++}  // namespace
++
++int main() {
++    vnpu_config_t cfg;
++    vnpu_config_init(&cfg);
++    cfg.node_name = "bench-i8";
++    vnpu_device_t *device = nullptr;
++    vnpu_stream_t *stream = nullptr;
++    if (vnpu_device_create(&cfg, &device) != VNPU_OK ||
++        vnpu_stream_create(device, 0, &stream) != VNPU_OK) {
++        std::fprintf(stderr, "bench: failed to create runtime\n");
++        return 1;
++    }
++
++    vnpu_device_info_t info{};
++    vnpu_device_get_info(device, &info);
++    const char *name = info.name;
++
++    const struct { uint32_t M, K, N; const char *what; } shapes[] = {
++        {1, 768, 768, "decode expert row"},
++        {32, 768, 768, "prefill 32 rows"},
++        {128, 768, 768, "prefill 128 rows"},
++        {1, 2048, 768, "decode wide-K"},
++    };
++
++    std::printf("bench-i8  device=%s\n", name);
++    std::printf("%-20s %6s %6s %6s %10s %10s %10s\n", "shape", "M", "K", "N",
++                "best ms", "MAC/s", "GFLOP/s");
++    for (const auto &sh : shapes) {
++        const uint32_t M = sh.M, K = sh.K, N = sh.N;
++        std::vector<int8_t> A(static_cast<size_t>(M) * K);
++        std::vector<int8_t> B(static_cast<size_t>(K) * N);
++        std::vector<float> scale_a(M, 1.0f), scales_b(N, 1.0f);
++        std::vector<float> C(static_cast<size_t>(M) * N, 0.0f);
++        for (auto &v : A) v = rnd_i8();
++        for (auto &v : B) v = rnd_i8();
++
++        vnpu_packed_weights_t *packed = nullptr;
++        if (vnpu_pack_weights_i8(device, B.data(), scales_b.data(), K, N, 0, 0,
++                                 &packed) != VNPU_OK) {
++            std::fprintf(stderr, "bench: pack failed\n");
++            return 1;
++        }
++        vnpu_matmul_i8_args_t args{};
++        args.A = A.data();
++        args.B = packed;
++        args.scale_a = scale_a.data();
++        args.C = C.data();
++        args.M = M;
++        args.K = K;
++        args.N = N;
++        args.epilogue = VNPU_EPILOGUE_NONE;
++        args.unit = VNPU_UNIT_VOODOO;
++
++        /* Warm, then best of N: the first call pays page faults on C. */
++        for (int i = 0; i < 3; ++i) vnpu_matmul_i8(stream, &args);
++        double best = 1e30;
++        const int reps = M <= 32 ? 60 : 12;
++        for (int i = 0; i < reps; ++i) {
++            const double t0 = now_ms();
++            vnpu_matmul_i8(stream, &args);
++            best = std::min(best, now_ms() - t0);
++        }
++        const double macs = static_cast<double>(M) * K * N;
++        std::printf("%-20s %6u %6u %6u %10.3f %10.2f %10.2f\n", sh.what, M, K,
++                    N, best, macs / (best / 1000.0) / 1e6,
++                    macs * 2.0 / (best / 1000.0) / 1e9);
++        vnpu_packed_weights_destroy(packed);
++    }
++    vnpu_stream_destroy(stream);
++    vnpu_device_destroy(device);
++    return 0;
++}
+diff --git a/tests/isa_parity.cpp b/tests/isa_parity.cpp
+new file mode 100644
+index 0000000..68f7b08
+--- /dev/null
++++ b/tests/isa_parity.cpp
+@@ -0,0 +1,310 @@
++/*
++ * isa_parity.cpp - do the ISA arms agree, bit for bit?
++ *
++ * Why this exists: the AVX2 (Zen 3 class) kernels and the AVX-512 kernels take
++ * different routes to the same dot products, and on top of that each route has
++ * its own rounding. A tolerance-based test cannot tell "the AVX2 path is
++ * correct" from "the AVX2 path is off by an amount the tolerance happens to
++ * cover", and the failure this is really looking for -- a wrong lane order in a
++ * pack, a stale sign mask, an accumulator read one block early -- produces
++ * plausible numbers that happen to be wrong. So this compares BYTES.
++ *
++ * Run it once per ISA and compare the digests:
++ *
++ *     for isa in scalar avx2 avx512; do
++ *         VNPU_FORCE_ISA=$isa ./bin/vnpu-isa-parity
++ *     done
++ *
++ * Every arm must print the same digest. The scalar arm is the reference by
++ * construction (it is the loop the others are supposed to reproduce), and the
++ * other two are held to it exactly.
++ *
++ * What is covered: int8 GEMM against packed weights (the kernel this test was
++ * written for), per-row int8 quantisation, f32 GEMM, RMSNorm, softmax, SwiGLU,
++ * and elementwise add -- i.e. the set of ops an engine actually calls per
++ * layer. Shapes are deliberately awkward (K not a multiple of 4, N not a
++ * multiple of 16, M = 1 decode rows and M = 17 prefill rows) because the block
++ * kernels have edges there and the pretty shapes are the ones that never fail.
++ */
++#include "vnpu.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++namespace {
++
++/* FNV-1a over bytes. Deterministic, dependency-free, and short enough that a
++ * mismatch is obvious on sight. */
++struct Digest {
++    uint64_t h = 0xcbf29ce484222325ull;
++    void bytes(const void *p, size_t n) {
++        const unsigned char *b = static_cast<const unsigned char *>(p);
++        for (size_t i = 0; i < n; ++i) {
++            h ^= static_cast<uint64_t>(b[i]);
++            h *= 0x100000001b3ull;
++        }
++    }
++    template <typename T>
++    void value(const T &v) {
++        bytes(&v, sizeof(v));
++    }
++};
++
++uint64_t rng_state = 0x243f6a8885a308d3ull;
++uint32_t xs() {
++    uint64_t x = rng_state;
++    x ^= x << 13;
++    x ^= x >> 7;
++    x ^= x << 17;
++    rng_state = x;
++    return static_cast<uint32_t>(x >> 16);
++}
++float rnd() {
++    return static_cast<float>(static_cast<int>(xs() % 2001) - 1000) / 1000.0f;
++}
++int8_t rnd_i8() {
++    return static_cast<int8_t>(static_cast<int>(xs() % 255) - 127);
++}
++
++}  // namespace
++
++int main() {
++    vnpu_config_t cfg;
++    vnpu_config_init(&cfg);
++    cfg.node_name = "parity";
++    vnpu_device_t *device = nullptr;
++    vnpu_stream_t *stream = nullptr;
++    if (vnpu_device_create(&cfg, &device) != VNPU_OK ||
++        vnpu_stream_create(device, 0, &stream) != VNPU_OK) {
++        std::fprintf(stderr, "parity: failed to create runtime\n");
++        return 1;
++    }
++
++    Digest d;
++    int failures = 0;
++    auto report = [](const char *what, const Digest &g) {
++        std::printf("  %-22s %016llx\n", what,
++                    static_cast<unsigned long long>(g.h));
++    };
++    (void)report;
++
++    /* ---- int8 GEMM over packed weights -------------------------------- */
++    /* (M, K, N) chosen for the edges: K%4 != 0 exercises the k4 padding, N%16
++     * != 0 the column padding, M=1 the decode shape, M=17 the prefill shape. */
++    const struct { uint32_t M, K, N; } shapes[] = {
++        {1, 768, 768},   {17, 768, 768}, {1, 767, 763},
++        {17, 767, 763},  {4, 4, 4},      {33, 1024, 2048},
++    };
++    for (const auto &sh : shapes) {
++        const uint32_t M = sh.M, K = sh.K, N = sh.N;
++        std::vector<int8_t> A(static_cast<size_t>(M) * K);
++        std::vector<int8_t> B(static_cast<size_t>(K) * N);
++        std::vector<float> scale_a(M), scales_b(N), bias(N);
++        std::vector<float> C(static_cast<size_t>(M) * N, 0.0f);
++        for (auto &v : A) v = rnd_i8();
++        for (auto &v : B) v = rnd_i8();
++        for (auto &v : scale_a) v = 0.001f + std::fabs(rnd()) * 0.01f;
++        for (auto &v : scales_b) v = 0.001f + std::fabs(rnd()) * 0.01f;
++        for (auto &v : bias) v = rnd();
++
++        vnpu_packed_weights_t *packed = nullptr;
++        if (vnpu_pack_weights_i8(device, B.data(), scales_b.data(), K, N,
++                                 /*ldb=*/0, /*trans_b=*/0, &packed) != VNPU_OK ||
++            !packed) {
++            std::fprintf(stderr, "parity: pack failed\n");
++            return 1;
++        }
++        vnpu_matmul_i8_args_t args{};
++        args.A = A.data();
++        args.B = packed;
++        args.scale_a = scale_a.data();
++        args.bias = bias.data();
++        args.C = C.data();
++        args.M = M;
++        args.K = K;
++        args.N = N;
++        args.lda = 0;
++        args.ldc = 0;
++        args.epilogue = VNPU_EPILOGUE_NONE;
++        args.unit = VNPU_UNIT_VOODOO;
++        if (vnpu_matmul_i8(stream, &args) != VNPU_OK) {
++            std::fprintf(stderr, "parity: matmul_i8 failed (%ux%ux%u)\n", M, K,
++                         N);
++            return 1;
++        }
++        {
++            Digest g;
++            g.bytes(C.data(), C.size() * sizeof(float));
++            std::printf("  i8gemm %ux%ux%u        %016llx\n", M, K, N,
++                        static_cast<unsigned long long>(g.h));
++        }
++        d.bytes(C.data(), C.size() * sizeof(float));
++        vnpu_packed_weights_destroy(packed);
++    }
++
++    /* ---- per-row int8 quantisation ------------------------------------ */
++    {
++        const uint32_t rows = 7, cols = 300;
++        std::vector<float> X(static_cast<size_t>(rows) * cols);
++        std::vector<int8_t> Y(X.size(), 0);
++        std::vector<float> sc(rows, 0.0f);
++        for (auto &v : X) v = rnd() * 3.0f;
++        /* Force the half-way case std::round and vcvtps2dq disagree on: every
++         * 16th element is exactly half a quantum. */
++        for (uint32_t r = 0; r < rows; ++r) {
++            X[static_cast<size_t>(r) * cols] = 4.0f;
++            for (uint32_t j = 0; j + 16 < cols; j += 16)
++                X[static_cast<size_t>(r) * cols + j] += 0.5f * 4.0f / 127.0f;
++        }
++        vnpu_quantize_i8_args_t q{};
++        q.X = X.data();
++        q.Y = Y.data();
++        q.scales = sc.data();
++        q.rows = rows;
++        q.cols = cols;
++        q.axis = VNPU_QUANT_PER_ROW;
++        q.unit = VNPU_UNIT_VOODOO;
++        if (vnpu_quantize_i8(stream, &q) != VNPU_OK) {
++            std::fprintf(stderr, "parity: quantize failed\n");
++            return 1;
++        }
++        {
++            Digest g;
++            g.bytes(Y.data(), Y.size());
++            std::printf("  quant rows           %016llx\n",
++                        static_cast<unsigned long long>(g.h));
++            Digest g2;
++            g2.bytes(sc.data(), sc.size() * sizeof(float));
++            std::printf("  quant scales         %016llx\n",
++                        static_cast<unsigned long long>(g2.h));
++        }
++        d.bytes(Y.data(), Y.size());
++        d.bytes(sc.data(), sc.size() * sizeof(float));
++    }
++
++    /* ---- f32 GEMM ----------------------------------------------------- */
++    {
++        const uint32_t M = 9, K = 130, N = 70;
++        std::vector<float> A(static_cast<size_t>(M) * K);
++        std::vector<float> B(static_cast<size_t>(K) * N);
++        std::vector<float> C(static_cast<size_t>(M) * N, 0.0f);
++        for (auto &v : A) v = rnd();
++        for (auto &v : B) v = rnd();
++        vnpu_matmul_f32_args_t m{};
++        m.A = A.data();
++        m.B = B.data();
++        m.C = C.data();
++        m.M = M;
++        m.K = K;
++        m.N = N;
++        m.alpha = 1.0f;
++        m.beta = 0.0f;
++        m.unit = VNPU_UNIT_VOODOO;
++        if (vnpu_matmul_f32(stream, &m) != VNPU_OK) {
++            std::fprintf(stderr, "parity: matmul_f32 failed\n");
++            return 1;
++        }
++        {
++            Digest g;
++            g.bytes(C.data(), C.size() * sizeof(float));
++            std::printf("  f32gemm              %016llx\n",
++                        static_cast<unsigned long long>(g.h));
++        }
++        d.bytes(C.data(), C.size() * sizeof(float));
++    }
++
++    /* ---- RMSNorm, softmax, SwiGLU, add -------------------------------- */
++    {
++        const uint32_t rows = 5, cols = 100;
++        std::vector<float> X(static_cast<size_t>(rows) * cols);
++        std::vector<float> W(cols), Y(X.size(), 0.0f), Z(X.size(), 0.0f);
++        for (auto &v : X) v = rnd() * 2.0f;
++        for (auto &v : W) v = 0.5f + std::fabs(rnd());
++
++        vnpu_rmsnorm_f32_args_t rn{};
++        rn.X = X.data();
++        rn.W = W.data();
++        rn.Y = Y.data();
++        rn.rows = rows;
++        rn.cols = cols;
++        rn.eps = 1e-5f;
++        rn.unit = VNPU_UNIT_VOODOO;
++        if (vnpu_rmsnorm_f32(stream, &rn) != VNPU_OK) {
++            std::fprintf(stderr, "parity: rmsnorm failed\n");
++            return 1;
++        }
++        {
++            Digest g;
++            g.bytes(Y.data(), Y.size() * sizeof(float));
++            std::printf("  rmsnorm              %016llx\n",
++                        static_cast<unsigned long long>(g.h));
++        }
++        d.bytes(Y.data(), Y.size() * sizeof(float));
++
++        vnpu_softmax_f32_args_t sm{};
++        sm.X = X.data();
++        sm.Y = Z.data();
++        sm.rows = rows;
++        sm.cols = cols;
++        sm.unit = VNPU_UNIT_VOODOO;
++        if (vnpu_softmax_f32(stream, &sm) != VNPU_OK) {
++            std::fprintf(stderr, "parity: softmax failed\n");
++            return 1;
++        }
++        {
++            Digest g;
++            g.bytes(Z.data(), Z.size() * sizeof(float));
++            std::printf("  softmax              %016llx\n",
++                        static_cast<unsigned long long>(g.h));
++        }
++        d.bytes(Z.data(), Z.size() * sizeof(float));
++
++        /* SwiGLU reads gate and up, writes silu(gate) * up. */
++        vnpu_swiglu_f32_args_t sg{};
++        sg.gate = X.data();
++        sg.up = X.data();
++        sg.Y = Y.data();
++        sg.count = static_cast<uint64_t>(X.size());
++        sg.alpha = 1.0f;
++        sg.unit = VNPU_UNIT_VOODOO;
++        if (vnpu_swiglu_f32(stream, &sg) != VNPU_OK) {
++            std::fprintf(stderr, "parity: swiglu failed\n");
++            return 1;
++        }
++        {
++            Digest g;
++            g.bytes(Y.data(), Y.size() * sizeof(float));
++            std::printf("  swiglu               %016llx\n",
++                        static_cast<unsigned long long>(g.h));
++        }
++        d.bytes(Y.data(), Y.size() * sizeof(float));
++
++        vnpu_binary_f32_args_t ad{};
++        ad.A = X.data();
++        ad.B = X.data();
++        ad.Y = Z.data();
++        ad.count = static_cast<uint64_t>(X.size());
++        ad.alpha = 1.0f;
++        ad.beta = 1.0f;
++        ad.unit = VNPU_UNIT_VOODOO;
++        if (vnpu_add_f32(stream, &ad) != VNPU_OK) {
++            std::fprintf(stderr, "parity: add failed\n");
++            return 1;
++        }
++        {
++            Digest g;
++            g.bytes(Z.data(), Z.size() * sizeof(float));
++            std::printf("  add                  %016llx\n",
++                        static_cast<unsigned long long>(g.h));
++        }
++        d.bytes(Z.data(), Z.size() * sizeof(float));
++    }
++
++    std::printf("isa_parity digest=%016llx\n",
++                static_cast<unsigned long long>(d.h));
++    vnpu_stream_destroy(stream);
++    vnpu_device_destroy(device);
++    return failures == 0 ? 0 : 1;
++}
+-- 
+2.39.5
+

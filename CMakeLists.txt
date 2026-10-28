@@ -69,6 +69,27 @@ endif()
 
 option(KRK_ENABLE_HIP "Build the HIP/ROCm backend" ON)
 option(KRK_BUILD_TESTS "Build the test suite" ON)
+
+# ---------------------------------------------------------------------------
+# virtual NPU backend (github.com/riteshnair/npuxl-improved)
+#
+# OFF by default and never vendored: the engine links the device's own static
+# library, so a checkout without the sources still configures and builds. With
+# it ON the GEMM path runs on the VNPU device and everything else stays on the
+# reference implementation (src/npu/npu_offload.hpp explains the split).
+#
+#   cmake -B build -DKRK_ENABLE_NPU=ON \
+#         -DKRK_VNPU_ROOT=/path/to/npuxl-improved \
+#         -DKRK_VNPU_LIB=/path/to/npuxl-improved/build/libvnpu.a
+#
+# Build the device first (cmake -DVNPU_BUILD_TOOLS=OFF -DVNPU_BUILD_TESTS=OFF
+# -DVNPU_BUILD_SHARED=OFF -B build; cmake --build build). KRK_VNPU_LIB is
+# optional: with only KRK_VNPU_ROOT set, build/, lib/ and cmake-build/ are
+# searched for libvnpu.a.
+# ---------------------------------------------------------------------------
+option(KRK_ENABLE_NPU "Build the virtual-NPU backend" OFF)
+set(KRK_VNPU_ROOT "" CACHE PATH "npuxl-improved source tree (for include/vnpu.h)")
+set(KRK_VNPU_LIB "" CACHE FILEPATH "libvnpu.a to link; empty = search KRK_VNPU_ROOT")
 set(KRK_GPU_TARGETS "gfx1031;gfx1201"
     CACHE STRING "Semicolon-separated GPU targets, priority order (gfx1031 = RX 6700 XT RDNA2 primary, gfx1201 = RX 9070 XT RDNA4)")
 
@@ -99,6 +120,7 @@ set(KRK_CORE_SOURCES
     src/kv_tier.cpp
     src/engine.cpp
     src/backend_cpu.cpp
+    src/npu/npu_offload.cpp
     src/json.cpp
     src/http.cpp
     src/server.cpp
@@ -109,6 +131,62 @@ add_library(krk_core STATIC ${KRK_CORE_SOURCES})
 target_include_directories(krk_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(WIN32)
     target_link_libraries(krk_core PUBLIC ws2_32)
+endif()
+
+if(KRK_ENABLE_NPU)
+    if(NOT KRK_VNPU_ROOT)
+        message(FATAL_ERROR
+            "KRK_ENABLE_NPU=ON needs KRK_VNPU_ROOT=<npuxl-improved checkout>")
+    endif()
+    if(NOT EXISTS "${KRK_VNPU_ROOT}/include/vnpu.h")
+        message(FATAL_ERROR
+            "KRK_VNPU_ROOT=${KRK_VNPU_ROOT} has no include/vnpu.h -- point it "
+            "at the npuxl-improved source tree")
+    endif()
+    set(_krk_vnpu_lib "${KRK_VNPU_LIB}")
+    if(NOT _krk_vnpu_lib)
+        foreach(_cand
+                "${KRK_VNPU_ROOT}/build/libvnpu.a"
+                "${KRK_VNPU_ROOT}/lib/libvnpu.a"
+                "${KRK_VNPU_ROOT}/cmake-build/libvnpu.a"
+                "${KRK_VNPU_ROOT}/build/libvnpu.so")
+            if(EXISTS "${_cand}")
+                set(_krk_vnpu_lib "${_cand}")
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(NOT _krk_vnpu_lib OR NOT EXISTS "${_krk_vnpu_lib}")
+        message(FATAL_ERROR
+            "no libvnpu.a found for KRK_ENABLE_NPU; build the device and pass "
+            "-DKRK_VNPU_LIB=<path>")
+    endif()
+    find_package(Threads REQUIRED)
+    target_compile_definitions(krk_core PUBLIC KRK_ENABLE_NPU=1)
+    target_include_directories(krk_core PUBLIC "${KRK_VNPU_ROOT}/include")
+    target_link_libraries(krk_core PUBLIC "${_krk_vnpu_lib}" Threads::Threads)
+    # CAPABILITY PROBE, not a version check. The device's opcode set has moved:
+    # VNPU_OP_MATMUL_Q8_0 exists in some builds of npuxl-improved and not in
+    # v1.0.0, and a compile failure is a bad way to find out. Ask the compiler
+    # whether the header names the opcode; if it does not, the Q8_0-in-place
+    # path is compiled out and weights go through the device's f32 matmul
+    # instead, which is a working path and the more accurate one. The run
+    # summary reports which of the two the binary carries.
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES "${KRK_VNPU_ROOT}/include")
+    check_cxx_source_compiles(
+        "#include <vnpu.h>\nint main() { return (int)VNPU_OP_MATMUL_Q8_0; }"
+        KRK_VNPU_HAS_Q8_0)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    if(KRK_VNPU_HAS_Q8_0)
+        target_compile_definitions(krk_core PUBLIC KRK_VNPU_HAS_Q8_0=1)
+        message(STATUS "virtual NPU backend: ${_krk_vnpu_lib} (q8_0 in place: yes)")
+    else()
+        message(STATUS
+            "virtual NPU backend: ${_krk_vnpu_lib} (q8_0 in place: NO -- this "
+            "vnpu.h has no VNPU_OP_MATMUL_Q8_0, so q8_0 weights take the f32 "
+            "staging path)")
+    endif()
 endif()
 
 if(MSVC)
@@ -482,6 +560,20 @@ target_link_libraries(kraken-inspect PRIVATE krk_core)
 # alone, so it can be run without the GPU being busy.
 add_executable(kraken-cpu-expert-ceiling tools/cpu_expert_ceiling.cpp)
 target_link_libraries(kraken-cpu-expert-ceiling PRIVATE krk_core)
+
+# Checks the attention body against a scalar reference over every shape that
+# has its own code path: decode, prefill, GQA, hd 80/96/128/256, windowed,
+# skip_from, sinks with softcap. Writes raw f32 so two builds can be diffed
+# byte for byte. Two bugs in the gather change were caught here and neither was
+# visible by reading the code, so it runs against any touch to attention.
+add_executable(kraken-attn-acc tools/ta_attn_acc.cpp)
+target_link_libraries(kraken-attn-acc PRIVATE krk_core)
+
+# The Q8_0 int8 dot against an f64 reference of the same integer arithmetic,
+# over shapes that include a block count that is odd (the dispatcher's wholesale
+# fallback) and weight bytes drawn from the full legal range including -128.
+add_executable(kraken-q80-dot tools/ta_q80_dot.cpp)
+target_link_libraries(kraken-q80-dot PRIVATE krk_core)
 
 if(KRK_HIP_AVAILABLE)
     add_executable(kraken-oracle tools/oracle_probe.cpp)

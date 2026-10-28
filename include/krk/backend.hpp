@@ -22,7 +22,15 @@
 
 namespace krk {
 
-enum class BackendKind { CPU, HIP };
+enum class BackendKind {
+    CPU,
+    HIP,
+    // A virtual NPU (github.com/riteshnair/npuxl-improved): a software device
+    // that runs the GEMM path on its own SIMD kernels. It addresses host
+    // memory directly, so like the CPU reference it has no separate device
+    // tier -- see has_device_memory().
+    NPU,
+};
 
 // A per-shard weight pull source. The loader passes a table of these; the
 // backend turns a source pointer back into a file offset by checking which
@@ -120,6 +128,21 @@ struct AttnDesc {
     i64 layer_stride = 0;  // elements between layers in the KV cache
     i64 pos_stride = 0;    // elements between positions in the KV cache
     f32 scale = 1.0f;      // 1/sqrt(hd)
+    // Attention-logit bound (Gemma 2 carries `attention.logit_softcapping` =
+    // 50): every score becomes cap * tanh(score / cap) AT SCORE FORMATION,
+    // before the running max and therefore before the softmax. This is not an
+    // equivalent rewrite of a transform on the result -- tanh is monotone, but
+    // the softmax sees capped scores, so the probabilities are those of the
+    // capped vector and not a monotone image of the uncapped ones. 0 (the
+    // default) caps nothing, and the cap lives strictly inside
+    // `if (softcap > 0)`, so every model that never sets it runs the same
+    // arithmetic in the same order it always did.
+    //
+    // Masked keys keep -inf: the cap is applied where the dot product is,
+    // never to the mask, which would turn a masked key into a visible one.
+    // The sink is a denominator-only term with no score behind it, so it is
+    // not capped either.
+    f32 softcap = 0.0f;
     bool causal = true;
     // Sliding-window bound: when > 0 a query attends only to the `window`
     // most recent keys, i.e. key j is visible when j >= n_keys - window.
@@ -249,6 +272,18 @@ public:
 
     virtual BackendKind kind() const = 0;
     virtual const DeviceCaps &caps() const = 0;
+
+    // True when this backend computes out of a memory space of its own, so
+    // alloc() hands back device memory that has to be staged through upload()
+    // and a VRAM ledger, expert cache and weight streaming all have something
+    // to plan against. False for a backend that computes in place on host
+    // memory: the CPU reference and the virtual NPU. The default keeps every
+    // kind that is not the CPU reference on the device side, which is what
+    // `kind() != BackendKind::CPU` meant at every call site before this
+    // existed.
+    virtual bool has_device_memory() const {
+        return kind() != BackendKind::CPU;
+    }
 
     // Element type used for activations (F16 on GPU, F32 on CPU).
     virtual DType act_type() const = 0;
@@ -701,6 +736,34 @@ public:
     // Public device name for logging.
     virtual std::string describe() const = 0;
 
+    // ---- the load-time prepare pass --------------------------------------
+    //
+    // A backend whose first use of a weight costs more than its steady state
+    // has a problem that is not about kernels: the cost lands inside the first
+    // measured step, where it reads as a property of the steady state. The
+    // virtual NPU is exactly that case -- packing a weight into the device's
+    // int8 layout is 2.3 ms each, once, and while it sat in the first decode
+    // step a 16-token run measured 0.74x while the steady state was 2.51x.
+    //
+    // So the engine offers one forward pass at load whose only job is to touch
+    // every weight. `wants_prepare()` is the backend saying it has such a cost;
+    // `set_prepare(true)` brackets the pass, so the backend may convert eagerly
+    // instead of deferring. The pass is charged to the load phase and printed
+    // there, so a reader sees what it cost rather than inferring it from a
+    // decode number that moves when the length of the run changes.
+    //
+    // The default is "no such cost", and a backend that does not override these
+    // behaves exactly as before.
+    virtual bool wants_prepare() const { return false; }
+    virtual void set_prepare(bool on) { (void)on; }
+    virtual bool preparing() const { return false; }
+
+    // Counters for a run summary, or empty when the backend has none to add.
+    // The NPU backend reports what its GEMM hand-over actually did (calls
+    // offered, calls served, GFLOPs); the reference and the HIP arms do not
+    // keep a parallel ledger and return nothing.
+    virtual std::string backend_stats() const { return std::string(); }
+
     // ---- ops -------------------------------------------------------------
 
     // out[n_tok, n_embd] <- rows of tok_embd selected by tokens.
@@ -956,6 +1019,13 @@ public:
     // approximate prefill (a matrix-core flash attention, say) keeps it out of
     // this mode rather than making the hash depend on which kernel ran.
     virtual void set_attn_hash_mode(bool) {}
+
+    // Whether attention() applies AttnDesc::softcap. The reference body does.
+    // The HIP kernels keep four separate score paths (decode, matrix-core
+    // prefill, bit-exact prefill, tiled) and none of them caps yet, so that
+    // backend answers false and Engine::init refuses such a run BY NAME
+    // instead of decoding a model whose attention is a different function.
+    virtual bool attention_softcap_supported() const { return true; }
 
     // Quantized KV. A backend that cannot read a format says so instead of
     // running the f16 path over int8 bytes, which would be fluent nonsense:
@@ -1610,6 +1680,17 @@ Backend *make_cpu_backend();
 
 // Compiled only when KRK_ENABLE_HIP is defined (see CMakeLists.txt).
 Backend *make_hip_backend(int device_index, std::string *err);
+
+// The virtual-NPU backend: the same reference implementation, with the compute
+// handed to a VNPU device (github.com/riteshnair/npuxl-improved) — the whole
+// GEMM path for `mode` = false, and every op the device has for `mode` = true
+// (`--npu` vs `--npu-cpu`). Compiled only when KRK_ENABLE_NPU is defined (see
+// CMakeLists.txt); otherwise make_npu_backend() returns nullptr and *err says
+// so. `err` is filled on failure in both cases.
+Backend *make_npu_backend(int device_index, bool whole_graph, std::string *err);
+// True when this build has NPU support compiled in (the device itself may
+// still fail to open).
+bool npu_available();
 // Number of visible HIP devices, or 0 when this build has no HIP support.
 int hip_device_count();
 // Human-readable runtime/version string for logging, or "unavailable".

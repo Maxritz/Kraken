@@ -8,19 +8,56 @@
 // here, which is why the engine asks the backend for its activation
 // type instead of assuming f16.
 #include "krk/backend.hpp"
+#include "krk/kernel_time.hpp"
 #include "krk/hc.hpp"
 #include "krk/vram_guard.hpp"
+#include "npu/npu_offload.hpp"
 #include "par_pool.hpp"
 
 #include <algorithm>
 #include <cfloat> // FLT_MAX bounding the SIMT/CPU rsqrt and the clamp paths
 #include <cmath>
+#include <cstdlib>
 #include <utility>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 #include <vector>
 
 namespace krk {
 
 namespace {
+// Static names so the recorder compares pointers, not strings. The dtype is in
+// the row name because "gemm_other" hid the fact that one format was 41% of a
+// decode run.
+inline const char *dtype_tag_r1(DType t, i64 n_in) {
+    const bool i8ok = (n_in % 256) == 0 && vec_dot_int8();
+    switch (t) {
+        case DType::Q4_K: return i8ok ? "gemm_q4k_i8_r1" : "gemm_q4k_x_r1";
+        case DType::Q6_K: return "gemm_q6k_r1";
+        case DType::Q3_K: return "gemm_q3k_r1";
+        case DType::Q5_K: return "gemm_q5k_r1";
+        case DType::Q8_0: return i8ok ? "gemm_q8_0_i8_r1" : "gemm_q8_0_r1";
+        case DType::F32:  return "gemm_f32_r1";
+        case DType::F16:  return "gemm_f16_r1";
+        default:          return "gemm_oth_r1";
+    }
+}
+inline const char *dtype_tag_rn(DType t, i64 n_in) {
+    const bool i8ok = (n_in % 256) == 0 && vec_dot_int8();
+    switch (t) {
+        case DType::Q4_K: return i8ok ? "gemm_q4k_i8_rN" : "gemm_q4k_x_rN";
+        case DType::Q6_K: return "gemm_q6k_rN";
+        case DType::Q3_K: return "gemm_q3k_rN";
+        case DType::Q5_K: return "gemm_q5k_rN";
+        case DType::Q8_0: return i8ok ? "gemm_q8_0_i8_rN" : "gemm_q8_0_rN";
+        case DType::F32:  return "gemm_f32_rN";
+        case DType::F16:  return "gemm_f16_rN";
+        default:          return "gemm_oth_rN";
+    }
+}
+
 
 // Below this many estimated flops, the pool round trip costs more
 // than the computation, so ops stay serial. Decode's elementwise ops
@@ -43,11 +80,12 @@ inline f32 silu_scalar(f32 x) { return x / (1.0f + std::exp(-x)); }
 template <class F>
 inline void par_for(i64 n, i64 grain, f64 est_flops, F &&body) {
     if (n <= 0) return;
-    if (est_flops < kParFlopFloor || grain < 1) {
-        body(static_cast<i64>(0), n);
-        return;
-    }
-    Pool::get().run(n, grain, std::forward<F>(body));
+    // The floor decides THROUGHPUT only: the same compiled body runs either
+    // way (see Pool::run's note -- two copies of the arithmetic round
+    // differently, and this backend's whole contract is that its numbers do
+    // not depend on how the work was scheduled).
+    const bool split = est_flops >= kParFlopFloor && grain >= 1;
+    Pool::get().run(n, grain, split, std::forward<F>(body));
 }
 
 void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps,
@@ -75,32 +113,350 @@ void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps
             });
 }
 
+// ---------------------------------------------------------------------------
+// Attention, one (token, head) row at a time.
+//
+// The reference body here is a scalar loop, and at any context length worth
+// calling real, attention is the TOP row of the profile: measured on Tiny-Moe
+// with a 1400-token prompt, 63.4% of the run at 5.2% of the f32 peak, while the
+// GEMMs that had absorbed three rounds of kernel work were down to 27%.
+//
+// Two loops matter and they want different treatment:
+//
+//   score   s_j = <q, k_j>          a REDUCTION over hd
+//   output  o_i = sum_j p_j * v_j   an accumulation over j, indexed by i
+//
+// The output loop is vectorised ACROSS i, so every output dimension still sums
+// over j in the same order it always did -- that half is bit-identical to the
+// scalar body, not merely close. The score loop has to reduce, so a horizontal
+// sum is unavoidable and it changes the order of the last few bits. That is the
+// same trade the int8 GEMV kernels make, and the tests hold it to their
+// tolerances rather than to memcmp.
+//
+// Neither loop can be made 8x: each is roughly one load and one FMA per eight
+// lanes, and the score loop pays a horizontal reduce per key. Measured below.
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+#define KRK_ATTN_AVX2 1
+#endif
+
+#if defined(KRK_ATTN_AVX2)
+__attribute__((target("avx2,fma"))) inline f32 attn_dot_avx2(const f32 *a,
+                                                             const f32 *b,
+                                                             i64 n) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+    i64 i = 0;
+    for (; i + 16 <= n; i += 16) {
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),
+                             _mm256_loadu_ps(b + i + 8), a1);
+    }
+    for (; i + 8 <= n; i += 8)
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), a0);
+    a0 = _mm256_add_ps(a0, a1);
+    __m128 lo = _mm256_castps256_ps128(a0);
+    __m128 hi = _mm256_extractf128_ps(a0, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    f32 s = _mm_cvtss_f32(lo);
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
+// 64 dimensions of q, held in REGISTERS across every key of the row.
+//
+// The obvious inner loop reloads q for each key, and that is the whole cost:
+// with 256-bit operands every FMA needs one load for k and one for q, so the
+// loop is load-port bound at twice the FMA count and the FMA units idle. q is
+// the same 64 floats for all n_vis keys, so it belongs in registers -- that
+// halves the loads and takes the loop to the FMA limit instead.
+//
+// Four accumulators, two FMAs deep each. A single accumulator is a 64-deep
+// dependent chain (measured: 59 ns for one hd=64 scalar dot, i.e. ~153 cycles
+// for 64 multiply-adds), which is why the reference body lost to latency rather
+// than to arithmetic. Four chains is 8 cycles of latency for the same work.
+__attribute__((target("avx2,fma"))) inline void attn_score64(
+    const f32 *qh, const f32 *kc, i64 pos_stride, i64 k_off, i64 j_lo,
+    i64 n_vis, f32 *scores) {
+    const __m256 q0 = _mm256_loadu_ps(qh + 0);
+    const __m256 q1 = _mm256_loadu_ps(qh + 8);
+    const __m256 q2 = _mm256_loadu_ps(qh + 16);
+    const __m256 q3 = _mm256_loadu_ps(qh + 24);
+    const __m256 q4 = _mm256_loadu_ps(qh + 32);
+    const __m256 q5 = _mm256_loadu_ps(qh + 40);
+    const __m256 q6 = _mm256_loadu_ps(qh + 48);
+    const __m256 q7 = _mm256_loadu_ps(qh + 56);
+    const f32 *kj = kc + j_lo * pos_stride + k_off;
+    for (i64 j = 0; j < n_vis; j++, kj += pos_stride) {
+        __m256 a0 = _mm256_mul_ps(q0, _mm256_loadu_ps(kj + 0));
+        __m256 a1 = _mm256_mul_ps(q1, _mm256_loadu_ps(kj + 8));
+        __m256 a2 = _mm256_mul_ps(q2, _mm256_loadu_ps(kj + 16));
+        __m256 a3 = _mm256_mul_ps(q3, _mm256_loadu_ps(kj + 24));
+        a0 = _mm256_fmadd_ps(q4, _mm256_loadu_ps(kj + 32), a0);
+        a1 = _mm256_fmadd_ps(q5, _mm256_loadu_ps(kj + 40), a1);
+        a2 = _mm256_fmadd_ps(q6, _mm256_loadu_ps(kj + 48), a2);
+        a3 = _mm256_fmadd_ps(q7, _mm256_loadu_ps(kj + 56), a3);
+        const __m256 s01 = _mm256_add_ps(a0, a1);
+        const __m256 s23 = _mm256_add_ps(a2, a3);
+        __m128 t = _mm_add_ps(_mm256_castps256_ps128(_mm256_add_ps(s01, s23)),
+                              _mm256_extractf128_ps(_mm256_add_ps(s01, s23), 1));
+        t = _mm_hadd_ps(t, t);
+        t = _mm_hadd_ps(t, t);
+        scores[j] += _mm_cvtss_f32(t);
+    }
+}
+
+// The visible-key window for one query row, computed once and shared.
+//
+// It used to be written out three times -- the scalar reference, the AVX2 row
+// and the NPU hand-off -- because each was added at a different time. Three
+// copies of `window`, `skip_from`, the causal clamp and the two masked-run
+// bounds is three chances for the paths to disagree about which keys a row can
+// see, and a disagreement there is silent: the output stays plausible and only
+// a fixture comparison finds it. The arithmetic lives here; the paths consume
+// the result.
+struct AttnRange {
+    i64 n_keys = 0;  // keys this row may attend to, from position 0
+    i64 j_lo = 0;    // first visible key
+    i64 n_vis = 0;   // j_lo + n_vis == n_keys
+    i64 m0 = 0;      // masked sub-run, j-relative
+    i64 m1 = 0;
+};
+
+inline AttnRange attn_range(const AttnDesc &d, i64 t) {
+    AttnRange r;
+    const i64 pos = d.pos0 + t;
+    r.n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
+    r.j_lo = d.window > 0 ? std::max<i64>(0, r.n_keys - d.window) : 0;
+    r.n_vis = r.n_keys - r.j_lo;
+    // skip_from: a query at pos >= skip_from keeps the context before
+    // skip_from and its own row, and sees its block's siblings as masked. That
+    // is one contiguous run in j, so the hot loop carries no branch.
+    if (d.skip_from >= 0 && pos >= d.skip_from) {
+        const i64 s_lo = std::max(r.j_lo, d.skip_from);
+        const i64 s_hi = std::min(pos, r.n_keys);
+        r.m0 = std::max<i64>(0, s_lo - r.j_lo);
+        r.m1 = std::min(r.n_vis, s_hi - r.j_lo);
+    }
+    return r;
+}
+
+// One (token, head) row on the f32 cache. Same arithmetic as the scalar body,
+// same masks, same softmax, same sink rule -- only the two inner loops change.
+// `kbase`/`vbase` address the first VISIBLE key's head slice and `row_stride`
+// is the distance between keys. That is the whole addressing contract, and it
+// is what lets one body read either the cache in place (row_stride =
+// pos_stride, 3072 B on this model) or a gathered tile (row_stride = hd)
+// without a second copy of the arithmetic.
+__attribute__((target("avx2,fma"))) void attn_row_f32_avx2(
+    const f32 *qf, const f32 *kbase, const f32 *vbase, i64 row_stride, f32 *of,
+    const AttnDesc &d, i64 t, i64 h, const AttnRange &r, f32 *scores) {
+    const i64 hd = d.hd;
+    const i64 n_vis = r.n_vis;
+    if (n_vis <= 0) return;
+    const i64 m0 = r.m0;
+    const i64 m1 = r.m1;
+    const f32 *qh = qf + t * (d.n_head * hd) + h * hd;
+
+    // 64-dimension chunks with q resident in registers; anything left over takes
+    // the generic dot. The mask is applied in the second pass so the hot loop
+    // carries no branch at all.
+    // 64-dimension chunks ACCUMULATE, so hd = 128 and 256 are covered by the
+    // same code as hd = 64. The array is zeroed only when a chunk will run;
+    // a row narrower than one chunk is a single dot and assigns.
+    //
+    // Both mistakes this shape of code invites were caught by the fixture in
+    // tools/ta_attn_acc.cpp and not by reading it: an assigning chunk loses all
+    // but the last 64 dimensions at hd = 128/256, and an assigning remainder
+    // loses the first 64 at hd = 80/96. The fixture is the reason those two
+    // arms exist.
+    i64 off = 0;
+    if (hd >= 64) {
+        for (i64 j = 0; j < n_vis; j++) scores[j] = 0.0f;
+        for (; off + 64 <= hd; off += 64)
+            attn_score64(qh + off, kbase, row_stride, off, 0, n_vis, scores);
+        if (off < hd) {
+            for (i64 j = 0; j < n_vis; j++)
+                scores[j] += attn_dot_avx2(qh + off, kbase + j * row_stride + off,
+                                           hd - off);
+        }
+    } else {
+        for (i64 j = 0; j < n_vis; j++)
+            scores[j] = attn_dot_avx2(qh, kbase + j * row_stride, hd);
+    }
+    for (i64 j = 0; j < n_vis; j++) {
+        if (j >= m0 && j < m1) {
+            scores[j] = -FLT_MAX;
+            continue;
+        }
+        f32 sv = scores[j] * d.scale;
+        if (d.softcap > 0.0f) sv = d.softcap * std::tanh(sv / d.softcap);
+        scores[j] = sv;
+    }
+    f32 mx = scores[0];
+    for (i64 j = 1; j < n_vis; j++) mx = std::max(mx, scores[j]);
+    f32 sum = 0.0f;
+    for (i64 j = 0; j < n_vis; j++) {
+        const f32 ex = std::exp(scores[j] - mx);
+        scores[j] = ex;
+        sum += ex;
+    }
+    const f32 sink_logit = d.sinks ? d.sinks[h] : 0.0f;
+    if (sink_logit != 0.0f) sum += std::exp(sink_logit - mx);
+    const f32 inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+    f32 *oh = of + t * (d.n_head * hd) + h * hd;
+
+    // Chunks of 64 output dimensions in eight live accumulators; the j order is
+    // untouched, so this is the scalar sum, eight dimensions at a time.
+    i64 i = 0;
+    for (; i + 64 <= hd; i += 64) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps();
+        __m256 a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+        const f32 *vj = vbase + i;
+        for (i64 j = 0; j < n_vis; j++, vj += row_stride) {
+            const __m256 p = _mm256_set1_ps(scores[j] * inv);
+            a0 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 0), a0);
+            a1 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 8), a1);
+            a2 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 16), a2);
+            a3 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 24), a3);
+            a4 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 32), a4);
+            a5 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 40), a5);
+            a6 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 48), a6);
+            a7 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 56), a7);
+        }
+        _mm256_storeu_ps(oh + i + 0, a0);
+        _mm256_storeu_ps(oh + i + 8, a1);
+        _mm256_storeu_ps(oh + i + 16, a2);
+        _mm256_storeu_ps(oh + i + 24, a3);
+        _mm256_storeu_ps(oh + i + 32, a4);
+        _mm256_storeu_ps(oh + i + 40, a5);
+        _mm256_storeu_ps(oh + i + 48, a6);
+        _mm256_storeu_ps(oh + i + 56, a7);
+    }
+    // 16 dims in two accumulators, 8 in one. The second accumulator is over
+    // DIMENSIONS, never over j: two j-chains added together at the end is a
+    // reordered sum, and this half of the kernel is supposed to be exact.
+    for (; i + 16 <= hd; i += 16) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        const f32 *vj = vbase + i;
+        for (i64 j = 0; j < n_vis; j++, vj += row_stride) {
+            const __m256 p = _mm256_set1_ps(scores[j] * inv);
+            a0 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj), a0);
+            a1 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 8), a1);
+        }
+        _mm256_storeu_ps(oh + i, a0);
+        _mm256_storeu_ps(oh + i + 8, a1);
+    }
+    for (; i + 8 <= hd; i += 8) {
+        __m256 a0 = _mm256_setzero_ps();
+        const f32 *vj = vbase + i;
+        for (i64 j = 0; j < n_vis; j++, vj += row_stride)
+            a0 = _mm256_fmadd_ps(_mm256_set1_ps(scores[j] * inv),
+                                 _mm256_loadu_ps(vj), a0);
+        _mm256_storeu_ps(oh + i, a0);
+    }
+    for (; i < hd; i++) {
+        const f32 *vj = vbase + i;
+        f32 acc = 0.0f;
+        for (i64 j = 0; j < n_vis; j++, vj += row_stride)
+            acc += scores[j] * inv * vj[0];
+        oh[i] = acc;
+    }
+}
+#endif // KRK_ATTN_AVX2
+
 } // namespace
 
 class CpuBackend final : public Backend {
 public:
-    explicit CpuBackend(const DeviceCaps &c) : caps_(c) {}
+    // `npu` is the virtual-NPU offload handle when this instance is the NPU
+    // backend, and null for the plain reference backend. Only the GEMM path
+    // consults it -- see npu_offload.hpp for why that is the whole of the
+    // hand-over and not the first slice of a larger one.
+    explicit CpuBackend(const DeviceCaps &c, npu::Offload *npu = nullptr)
+        : caps_(c), npu_(npu) {}
+    ~CpuBackend() override {
+        if (npu_) npu::destroy(npu_);
+    }
 
-    BackendKind kind() const override { return BackendKind::CPU; }
+    // Submits everything queued for the device and waits for it, so a host
+    // kernel that is about to read an activation buffer sees what the device
+    // wrote. Called at the top of every op this file implements itself, and
+    // nowhere else: the six ops that CAN go to the device (gemm, rmsnorm,
+    // qk_norm, silu_mul, add_inplace, axpy, mul_act) reach it only in the
+    // fallback branches -- queueing there and flushing here is what turns ten
+    // small ops per layer into zero extra round trips. Cheap when the queue is
+    // empty, which is every call on a plain CPU build.
+    void npu_flush_() {
+        if (npu_) npu::flush(npu_);
+    }
+
+    BackendKind kind() const override {
+        return npu_ ? BackendKind::NPU : BackendKind::CPU;
+    }
     const DeviceCaps &caps() const override { return caps_; }
+    // The device computes in place on the memory it is handed, so there is no
+    // separate tier for the engine's VRAM ledger, expert cache or weight
+    // streaming to plan against.
+    bool has_device_memory() const override { return false; }
     DType act_type() const override { return DType::F32; }
     size_t act_size() const override { return 4; }
 
     void *alloc(size_t bytes) override { return host_alloc(bytes); }
-    void release(void *p) override { host_free(p); }
+    void release(void *p) override { npu_flush_(); host_free(p); }
     void upload(void *dst, const void *src, size_t bytes, size_t off) override {
+        npu_flush_();
         std::memcpy(static_cast<char *>(dst) + off, src, bytes);
     }
     void download(void *dst, const void *src, size_t bytes, size_t off) override {
+        npu_flush_();
         std::memcpy(dst, static_cast<const char *>(src) + off, bytes);
     }
-    void fill0(void *dst, size_t bytes) override { std::memset(dst, 0, bytes); }
-    void sync() override {}
+    void fill0(void *dst, size_t bytes) override { npu_flush_(); std::memset(dst, 0, bytes); }
+    void sync() override { npu_flush_(); }
     void download_f32(f32 *dst, const void *src, i64 n) override {
+        npu_flush_();
         std::memcpy(dst, src, static_cast<size_t>(n) * 4);
     }
+    std::string backend_stats() const override {
+        if (!npu_) return std::string();
+        // The ops the device has no opcode for are named once, here, so the run
+        // summary says what "whole graph" actually covered instead of implying
+        // it covered everything.
+        // attention is named here only when it is NOT offered to the device.
+        // With KRK_NPU_ATTN off (the default) it runs entirely on the reference,
+        // so the summary must say so; with it on, npu::stats reports how many
+        // calls the device took and names whatever blocked the rest, and
+        // claiming it was a host op would be wrong.
+        std::string s = npu::stats(npu_) + "; host: rope, ";
+        if (!npu::attention_offered(npu_)) s += "attention, ";
+        s += "kv cache, embedding, MoE routing, top-k, ssm/MLA/HC blocks "
+             "(no VNPU opcode)";
+        return s;
+    }
+
+    // The device is the one with a one-time weight conversion, so the seam is
+    // forwarded rather than implemented here: with W8A8 off there is nothing to
+    // move, and the prepare pass is skipped entirely.
+    bool wants_prepare() const override {
+        return npu_ && npu::wants_prepare(npu_);
+    }
+    void set_prepare(bool on) override {
+        if (npu_) npu::set_preparing(npu_, on);
+    }
+    bool preparing() const override { return npu_ && npu::preparing(npu_); }
+
     std::string describe() const override {
-        return format("CPU (scalar reference), %s", caps_.gfx.c_str());
+        // Report placement with the part: on a hybrid host this line is the
+        // difference between "why is it slow" and "it is on the E cores".
+        const std::string topo = Pool::get().topology().summary();
+        if (npu_)
+            return format("CPU (scalar reference) + %s, %s, %s",
+                          npu::describe(npu_).c_str(), caps_.gfx.c_str(), topo.c_str());
+        return format("CPU (scalar reference), %s, %s", caps_.gfx.c_str(), topo.c_str());
     }
     // No card here, so the memory policy has nothing to measure and would take
     // its "cannot say" path for every run. `KRK_VRAM_TOTAL_MB` says "behave as if
@@ -123,6 +479,8 @@ public:
 
     void embed(void *out, const void *tok_embd, DType tt, i64 n_vocab, i64 n_embd,
                const i32 *tokens, i64 n_tok) override {
+        KRK_KTIME("embed");
+        npu_flush_();
         (void)n_vocab;
         const size_t row_bytes = dtype_row_bytes(tt, n_embd);
         f32 *o = static_cast<f32 *>(out);
@@ -141,6 +499,22 @@ public:
 
     void rmsnorm(void *out, const void *x, const f32 *w, i64 rows, i64 n,
                  f32 eps, const i32 *row_exp = nullptr) override {
+        KRK_KTIME("rmsnorm");
+        // `row_exp` is the residual stream's per-row storage exponent, which
+        // only a backend whose activations cannot hold the range ever sets; the
+        // device has no way to apply it, so a row that carries one takes the
+        // reference body. The engine hands this array over unconditionally,
+        // though, and on this backend every entry in it is zero (see
+        // rmsnorm_rows: f32 activations already hold the range), so an array of
+        // zeros is the same request as no array and goes to the device.
+        if (npu_) {
+            // The scan is O(rows) against O(rows*n) of work, and it only runs
+            // when a device is attached at all.
+            bool scaling = row_exp != nullptr;
+            for (i64 r = 0; scaling && r < rows; r++) scaling = row_exp[r] != 0;
+            if (!scaling && npu::rmsnorm(npu_, out, x, w, rows, n, eps)) return;
+        }
+        npu_flush_();
         rmsnorm_rows(static_cast<f32 *>(out), static_cast<const f32 *>(x), w, rows,
                      n, eps, row_exp);
     }
@@ -148,6 +522,7 @@ public:
     void rmsnorm_grouped(void *o, const void *x, const f32 *w, i64 n_tok,
                          i64 n_group, i64 width, i64 stride,
                          f32 eps) override {
+        npu_flush_();
         const f32 *s = static_cast<const f32 *>(x);
         f32 *d = static_cast<f32 *>(o);
         // Salient difference from rmsnorm_rows above: the reduction and the
@@ -181,6 +556,7 @@ public:
                      f32 rep_pen, f32 softcap, f32 temp, i32 *ids, f32 *vals,
                      f32 *mass_out, void *scratch, i32 cand_cap,
                      i64 *count_out) override {
+        npu_flush_();
         (void)scratch;
         (void)cand_cap;
         const f32 *l = static_cast<const f32 *>(logits);
@@ -230,9 +606,126 @@ public:
 
     void gemm(void *out, const void *x, const void *w, DType wt, i64 n_out,
               i64 n_in, i64 rows) override {
+        // The virtual NPU computes this dot product block on its own SIMD
+        // kernels. It returns false -- having written nothing -- for a shape or
+        // weight type it cannot take, and the reference loop below then runs
+        // only after the queue has landed, because `x` is very often a buffer
+        // the device itself just wrote (the RMSNorm in front of this GEMM).
+        if (npu_ &&
+            npu::gemm(npu_, static_cast<f32 *>(out), static_cast<const f32 *>(x),
+                      w, wt, n_out, n_in, rows))
+            return;
+        npu_flush_();
+        // One row in the table per distinct kernel, because "gemm" as a single
+        // row hides the thing that matters: a decode step and a batched
+        // prefill run different kernels and belong on different lines.
+        // MACs, not FLOPs: one per multiply-add, which is the unit %peak is
+        // measured in. Every GEMM row is compared against the ceiling for the
+        // instruction class it actually executes -- int8 dot where the int8
+        // fast path below takes it, f32 FMA otherwise.
+        KRK_KTIME_MAC(rows == 1 ? dtype_tag_r1(wt, n_in) : dtype_tag_rn(wt, n_in),
+                      static_cast<double>(rows) * static_cast<double>(n_out) *
+                          static_cast<double>(n_in),
+                      isa_peak_gmacs((wt == DType::Q4_K || wt == DType::Q6_K ||
+                                      wt == DType::Q8_0) &&
+                                     n_in > 0 && (n_in % 256) == 0 &&
+                                     vec_dot_int8()));
         const size_t row_bytes = dtype_row_bytes(wt, n_in);
         const f32 *xf = static_cast<const f32 *>(x);
         f32 *of = static_cast<f32 *>(out);
+        // Q4_K fast path. The activation is quantised to int8 ONCE for the
+        // whole call and every output element is then an integer dot against a
+        // weight row that never leaves its stored blocks. Doing it here rather
+        // than inside vec_dot() is the whole point: vec_dot() is called once
+        // per output element, so a per-call quantisation there would undo the
+        // win it is trying to buy.
+        if ((wt == DType::Q4_K || wt == DType::Q6_K || wt == DType::Q8_0) &&
+            n_in > 0 && (n_in % 256) == 0 && rows > 0 && vec_dot_int8()) {
+            const bool q6 = wt == DType::Q6_K;
+            const bool q80 = wt == DType::Q8_0;
+            const i64 nb = n_in / 32;
+            // Owned by the CALLING thread and captured by value below. These
+            // were thread_local, which looks like a free optimisation and is a
+            // null dereference: par_for runs the body on pool workers, and a
+            // worker's own thread_local vector has never been resized, so
+            // data() is nullptr there. ASan caught the read at address 0.
+            std::vector<i8> xq(static_cast<size_t>(rows * n_in));
+            std::vector<f32> xd(static_cast<size_t>(rows * nb));
+            // sum(xi) per sub-block, for formats whose dmin term needs it. The
+            // Q4_K kernel reads it; Q6_K does not. Computing it here means it is
+            // done once per GEMM call instead of once per weight row.
+            std::vector<i32> xs(static_cast<size_t>(rows * nb), 0);
+            // Q6_K's scale changes every 16 values and its bias is 32*sum(16),
+            // so it needs its own array; Q4_K's is per 32. Only one is filled.
+            const i64 nq4 = n_in / 4;
+            std::vector<i32> xs4(static_cast<size_t>(rows * nq4), 0);
+            for (i64 r = 0; r < rows; r++) {
+                if (q80)
+                    // No sx[]: the magnitude split is exact, so Q8_0 needs no
+                    // per-block sum of the activation.
+                    quantize_q8_row(xf + r * n_in, n_in,
+                                    xq.data() + r * n_in, xd.data() + r * nb);
+                else if (q6)
+                    quantize_q8_row_sq4(xf + r * n_in, n_in,
+                                        xq.data() + r * n_in,
+                                        xd.data() + r * nb,
+                                        xs4.data() + r * nq4);
+                else
+                    quantize_q8_row_sx(xf + r * n_in, n_in,
+                                       xq.data() + r * n_in, xd.data() + r * nb,
+                                       xs.data() + r * nb);
+            }
+            const i8 *xqp = xq.data();
+            const f32 *xdp = xd.data();
+            const i32 *xsp = xs.data();
+            const i32 *xs4p = xs4.data();
+            const u8 *wb = static_cast<const u8 *>(w);
+            const i64 grain = std::max<i64>(8, std::min<i64>(256, n_out / 8));
+            par_for(n_out, grain,
+                    2.0 * static_cast<f64>(rows) * static_cast<f64>(n_out) *
+                        static_cast<f64>(n_in),
+                    [&](i64 b, i64 e) {
+                        for (i64 o = b; o < e; o++) {
+                            const u8 *wr = wb + static_cast<size_t>(o) * row_bytes;
+                            i64 r = 0;
+                            // Eight rows share one decode of the weight block.
+                            // Q4_K only: the tiled kernel's block stride is
+                            // Q4_K's 144 bytes, and a Q6_K block is 210. Using
+                            // it for both reads one format's bytes as the
+                            // other's -- every token came out <unk>.
+                            if (q80)
+                                for (; r + 8 <= rows; r += 8)
+                                    dot_q8_0_q8_x8(
+                                        wr, xqp + r * n_in, xdp + r * nb,
+                                        n_in, n_in, nb,
+                                        of + r * n_out + o, n_out);
+                            else if (q6)
+                                for (; r + 8 <= rows; r += 8)
+                                    dot_q6_K_q8_sq4_x8(
+                                        wr, xqp + r * n_in, xdp + r * nb,
+                                        xs4p + r * nq4, n_in, n_in, nb, nq4,
+                                        of + r * n_out + o, n_out);
+                            else
+                                for (; r + 8 <= rows; r += 8)
+                                    dot_q4_K_q8_sx_x8(
+                                        wr, xqp + r * n_in, xdp + r * nb,
+                                        xsp + r * nb, n_in, n_in, nb, nb,
+                                        of + r * n_out + o, n_out);
+                            for (; r < rows; r++)
+                                of[r * n_out + o] =
+                                    q80 ? dot_q8_0_q8(wr, xqp + r * n_in,
+                                                      xdp + r * nb, n_in)
+                                    : q6 ? dot_q6_K_q8_sq4(wr, xqp + r * n_in,
+                                                         xdp + r * nb,
+                                                         xs4p + r * nq4, n_in)
+                                       : dot_q4_K_q8_sx(wr, xqp + r * n_in,
+                                                        xdp + r * nb,
+                                                        xsp + r * nb, n_in);
+                        }
+                    });
+            return;
+        }
+
         // Every output element is an independent dot product, so the
         // flat (row, column) index space splits without sharing any
         // reduction — results are bit-identical to the serial loop.
@@ -240,6 +733,28 @@ public:
         // is ~91% of decode FLOPs and parallelizes across all cores.
         const i64 total = rows * n_out;
         const i64 grain = std::max<i64>(32, std::min<i64>(2048, n_out / 32));
+
+        // Batched prefill. The loop below splits on (row, column) and calls
+        // vec_dot() per element, and vec_dot() decodes the weight as it goes --
+        // so a batch of `rows` decoded every weight row `rows` times and
+        // prefill ran at GEMV speed. Measured on the 2 GiB q8_0 MoE at --cpu
+        // with KRK_CPU_DOT_AVX2=1: prefill cost per token was FLAT at 34.1,
+        // 29.1, 27.8 and 28.3 ms across prompts of 58, 149, 331 and 695 tokens,
+        // where a batched GEMM must fall steeply. vec_dot_tiled() decodes each
+        // weight block once and reuses it across a tile of rows, and returns
+        // bit-identical values, so this changes speed and nothing else.
+        //
+        // Kept to rows > 1: at rows == 1 (every decode step) there is nothing
+        // to amortize, and the fused kernel below is the better shape.
+        if (rows > 1 && n_in > 0) {
+            const i64 tile = std::max<i64>(1, std::min<i64>(64, n_out));
+            par_for(n_out, tile,
+                    2.0 * static_cast<f64>(total) * static_cast<f64>(n_in),
+                    [&](i64 b, i64 e) {
+                        vec_dot_tiled(wt, w, xf, n_in, b, e, rows, of, n_out);
+                    });
+            return;
+        }
         par_for(total, grain, 2.0 * static_cast<f64>(total) * n_in,
                 [&](i64 b, i64 e) {
                     i64 r = b / n_out;
@@ -259,12 +774,34 @@ public:
 
     void rope(void *q, void *k, i64 n_head, i64 n_kv, i64 hd, i64 n_tok, i64 pos0,
               const f32 *inv_freq, f32 scale, f32 frac, bool neox) override {
+        KRK_KTIME("rope");
+        npu_flush_();
         rope_apply(static_cast<f32 *>(q), n_head, hd, n_tok, pos0, inv_freq, scale, frac, neox);
         rope_apply(static_cast<f32 *>(k), n_kv, hd, n_tok, pos0, inv_freq, scale, frac, neox);
     }
 
     void qk_norm(void *q, void *k, const f32 *wq, const f32 *wk, i64 n_head,
                  i64 n_kv, i64 hd, i64 n_tok, f32 eps, bool wide) override {
+        // Both arms of this are one RMSNorm per row with a row-wide weight, so
+        // the device takes them as one call each: `wide` normalizes over the
+        // whole q row, and the per-head form is the same arithmetic on hd-wide
+        // rows, of which there are n_tok * n_head.
+        bool queued = true;
+        if (wq) {
+            queued = wide
+                         ? npu::rmsnorm(npu_, q, q, wq, n_tok, n_head * hd, eps)
+                         : npu::rmsnorm(npu_, q, q, wq, n_tok * n_head, hd, eps);
+            if (!queued) npu_flush_();
+        }
+        if (wq && queued) {
+            if (wk) {
+                if (wide)
+                    npu::rmsnorm(npu_, k, k, wk, n_tok, n_kv * hd, eps);
+                else
+                    npu::rmsnorm(npu_, k, k, wk, n_tok * n_kv, hd, eps);
+            }
+            return;
+        }
         if (wq) {
             if (wide)
                 row_norm(static_cast<f32 *>(q), wq, n_tok, n_head * hd, eps);
@@ -298,6 +835,8 @@ public:
 
     void kv_append(void *kcache, void *vcache, const void *k, const void *v,
                    const AttnDesc &d) override {
+        KRK_KTIME("kv_append");
+        npu_flush_();
         if (d.kv_int8) {
             const i64 kv_dim = d.n_kv * d.hd;
             u8 *kc = static_cast<u8 *>(kcache) + d.layer * d.layer_stride;
@@ -355,6 +894,7 @@ public:
 
     void gather_rows(void *dst, const void *src, const i64 *idx, i64 n_rows,
                      size_t row_bytes) override {
+        npu_flush_();
         if (!dst || !src || !idx || n_rows <= 0 || row_bytes == 0) return;
         u8 *o = static_cast<u8 *>(dst);
         const u8 *s = static_cast<const u8 *>(src);
@@ -374,6 +914,43 @@ public:
 
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {
+        // Attention is a GEMM pair -- QK^T then AV -- over the cached keys, so
+        // its MACs are countable and its ceiling is the f32 FMA rate. It is the
+        // one non-GEMM component with a roofline worth printing.
+        KRK_KTIME_MAC("attention",
+                      static_cast<double>(d.n_tok) * static_cast<double>(d.n_head) *
+                          static_cast<double>(d.pos0 + d.n_tok) *
+                          static_cast<double>(d.hd) * 2.0,
+                      isa_peak_gmacs(false));
+        // npu_flush_ first: q is usually the output of a GEMM still queued on
+        // the device, and the gather below reads it on the host.
+        npu_flush_();
+        if (npu_) {
+            // Everything that can make this call unrepresentable is handed over
+            // rather than tested here, so the decision, the counting and the
+            // run-summary wording all come from one place (npu::attention).
+            npu::AttnCall c;
+            c.out = out;
+            c.q = q;
+            c.kcache = kcache;
+            c.vcache = vcache;
+            c.n_head = d.n_head;
+            c.n_kv = d.n_kv;
+            c.hd = d.hd;
+            c.n_tok = d.n_tok;
+            c.pos0 = d.pos0;
+            c.layer = d.layer;
+            c.layer_stride = d.layer_stride;
+            c.pos_stride = d.pos_stride;
+            c.scale = d.scale;
+            c.causal = d.causal;
+            c.kv_int8 = d.kv_int8;
+            c.has_sinks = d.sinks != nullptr;
+            c.window = d.window;
+            c.skip_from = d.skip_from;
+            c.softcap = d.softcap;
+            if (npu::attention(npu_, c)) return;
+        }
         const i64 n_rep = d.n_kv > 0 ? d.n_head / d.n_kv : 1;
         if (d.kv_int8) {
             // Same formulation as the f32 path, reading (signed byte x scale)
@@ -427,7 +1004,14 @@ public:
                                                    sc[c / 32];
                                     dot += qh[i] * kv;
                                 }
-                                scores[static_cast<size_t>(j)] = dot * d.scale;
+                                // Gemma 2's attention-logit bound, applied
+                                // where the score is formed (see
+                                // AttnDesc::softcap); the masked branch above
+                                // never reaches here, so the mask stays -inf.
+                                f32 sv = dot * d.scale;
+                                if (d.softcap > 0.0f)
+                                    sv = d.softcap * std::tanh(sv / d.softcap);
+                                scores[static_cast<size_t>(j)] = sv;
                             }
                             f32 mx = scores[0];
                             for (i64 j = 1; j < n_vis; j++)
@@ -471,6 +1055,109 @@ public:
         // max/sum stay inside one head — bit-identical to the
         // serial loop (which used one shared scratch).
         const i64 units = d.n_tok * d.n_head;
+        // One binary, two ISAs: the vector path where the host has AVX2+FMA,
+        // the scalar body below everywhere else. KRK_CPU_ATTN_SCALAR=1 forces
+        // the reference -- that is the A/B this was measured with, and the arm
+        // a bit-exactness run wants.
+#if defined(KRK_ATTN_AVX2)
+        // Latched once: the ISA probe is a cpuid-derived bit test, but it is
+        // still read on every layer of every token, and the answer cannot
+        // change within a process. KRK_CPU_ATTN_SCALAR=1 is the reference arm
+        // the accuracy fixture and the A/B runs compare against.
+        static const bool attn_vec = [] {
+            const char *e = std::getenv("KRK_CPU_ATTN_SCALAR");
+            if (e && e[0] == '1') return false;
+            return __builtin_cpu_supports("avx2") &&
+                   __builtin_cpu_supports("fma");
+        }();
+        // Gather arm, latched with the ISA probe. KRK_CPU_ATTN_GATHER=0 keeps
+        // the in-place path, which is the A/B and the arm a cache-layout
+        // experiment wants.
+        static const i64 n_gather = [] {
+            const char *e = std::getenv("KRK_CPU_ATTN_GATHER");
+            return (e && e[0] == '0') ? 0 : 1;
+        }();
+        // Gather the visible key/value slices into a contiguous tile, per head,
+        // for the whole token chunk.
+        //
+        // The cache is [position][head][hd], so a head's slice of one key is 256
+        // B out of a 3072 B stride on this model. The score loop then reads
+        // four cache lines and uses one -- measured on the same arithmetic,
+        // 16.14 ns/key strided against 2.99 ns/key contiguous, a 5.4x gap that
+        // no amount of loop work recovers (four keys in flight: 14.47; software
+        // prefetch: 13.77).
+        //
+        // The gather does not remove that traffic, it AMORTISES it: one pass
+        // over the strided cache serves every query row in the chunk, instead
+        // of once per (token, head). That is why it is gated on n_tok > 1 --
+        // for a decode step there is nothing to amortise and the copy is pure
+        // cost. It is also why the rows are walked head-major here: the tile
+        // belongs to a head, and every token in the chunk reuses it.
+        //
+        // The tile is exactly the bytes each row would have read, in the same
+        // order, so the row body runs the identical arithmetic -- accuracy is
+        // checked against the in-place path on ten shapes, not argued.
+        if (attn_vec && n_gather > 0 && d.n_tok > 1) {
+            par_for(d.n_head, 1,
+                    4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * d.hd,
+                    [&](i64 hb, i64 he) {
+                        std::vector<f32> kg, vg, scores;
+                        for (i64 h = hb; h < he; h++) {
+                            const i64 hkv = n_rep > 0 ? h / n_rep : 0;
+                            const i64 base_j = attn_range(d, 0).j_lo;
+                            const i64 span = attn_range(d, d.n_tok - 1).n_keys -
+                                             base_j;
+                            if (span <= 0) continue;
+                            const size_t need = static_cast<size_t>(span * d.hd);
+                            if (kg.size() < need) {
+                                kg.resize(need);
+                                vg.resize(need);
+                            }
+                            const f32 *kb = kc + base_j * d.pos_stride + hkv * d.hd;
+                            const f32 *vb = vc + base_j * d.pos_stride + hkv * d.hd;
+                            for (i64 j = 0; j < span; j++) {
+                                std::memcpy(kg.data() + j * d.hd,
+                                            kb + j * d.pos_stride,
+                                            static_cast<size_t>(d.hd) * sizeof(f32));
+                                std::memcpy(vg.data() + j * d.hd,
+                                            vb + j * d.pos_stride,
+                                            static_cast<size_t>(d.hd) * sizeof(f32));
+                            }
+                            for (i64 t = 0; t < d.n_tok; t++) {
+                                const AttnRange r = attn_range(d, t);
+                                if (r.n_vis <= 0) continue;
+                                scores.resize(static_cast<size_t>(r.n_vis));
+                                const i64 off = (r.j_lo - base_j) * d.hd;
+                                attn_row_f32_avx2(qf, kg.data() + off,
+                                                  vg.data() + off, d.hd, of, d, t,
+                                                  h, r, scores.data());
+                            }
+                        }
+                    });
+            return;
+        }
+        if (attn_vec) {
+            par_for(units, 1,
+                    4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * d.hd,
+                    [&](i64 b, i64 e) {
+                        std::vector<f32> scores;
+                        for (i64 u = b; u < e; u++) {
+                            const i64 t = u / d.n_head;
+                            const i64 h = u - t * d.n_head;
+                            const AttnRange r = attn_range(d, t);
+                            scores.resize(static_cast<size_t>(r.n_vis));
+                            const i64 hkv = n_rep > 0 ? h / n_rep : 0;
+                            attn_row_f32_avx2(qf, kc + r.j_lo * d.pos_stride +
+                                                      hkv * d.hd,
+                                              vc + r.j_lo * d.pos_stride +
+                                                  hkv * d.hd,
+                                              d.pos_stride, of, d, t, h, r,
+                                              scores.data());
+                        }
+                    });
+            return;
+        }
+#endif
         par_for(units, 1,
                 4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * d.hd,
                 [&](i64 b, i64 e) {
@@ -507,7 +1194,9 @@ public:
                             const f32 *kj = kc + (j_lo + j) * d.pos_stride + hkv * d.hd;
                             f32 dot = 0;
                             for (i64 i = 0; i < d.hd; i++) dot += qh[i] * kj[i];
-                            scores[static_cast<size_t>(j)] = dot * d.scale;
+                            f32 sv = dot * d.scale;
+                            if (d.softcap > 0.0f) sv = d.softcap * std::tanh(sv / d.softcap);
+                            scores[static_cast<size_t>(j)] = sv;
                         }
                         f32 mx = scores[0];
                         for (i64 j = 1; j < n_vis; j++)
@@ -552,6 +1241,7 @@ public:
 
     void mla_kv_write(void *cache, const void *proj, const void *gamma,
                       const MlaDesc &d) override {
+        npu_flush_();
         f32 *c = static_cast<f32 *>(cache);
         const f32 *p = static_cast<const f32 *>(proj);
         const f32 *g = static_cast<const f32 *>(gamma);
@@ -582,6 +1272,7 @@ public:
 
     void mla_attention(void *out, const void *q, const void *cache,
                        const void *wkv_b, const MlaDesc &d) override {
+        npu_flush_();
         const f32 *qf = static_cast<const f32 *>(q);
         const f32 *cf = static_cast<const f32 *>(cache);
         const u16 *w = static_cast<const u16 *>(wkv_b);
@@ -686,6 +1377,7 @@ public:
 
     void mla_shared_latent(void *cache, const void *proj, const void *gamma,
                            const MlaSharedDesc &d) override {
+        npu_flush_();
         f32 *c = static_cast<f32 *>(cache);
         const f32 *p = static_cast<const f32 *>(proj);
         const f32 *g = static_cast<const f32 *>(gamma);
@@ -710,6 +1402,7 @@ public:
 
     void mla_shared_attention(void *a, const void *q, const void *cache,
                               const MlaSharedDesc &d) override {
+        npu_flush_();
         f32 *af = static_cast<f32 *>(a);
         const f32 *qf = static_cast<const f32 *>(q);
         const f32 *cf = static_cast<const f32 *>(cache);
@@ -781,6 +1474,7 @@ public:
     void mla_shared_output(void *out, const void *a, void *scratch,
                            const void *wo_a, const void *wo_b,
                            const MlaSharedDesc &d) override {
+        npu_flush_();
         const f32 *af = static_cast<const f32 *>(a);
         f32 *y = static_cast<f32 *>(scratch);
         const u16 *wa = static_cast<const u16 *>(wo_a);
@@ -821,6 +1515,18 @@ public:
 
     void silu_mul(void *out, const void *gate, const void *up, i64 n,
                   i64 row_len = 0, f32 *row_scale = nullptr) override {
+        KRK_KTIME("silu_mul");
+        // The device's SwiGLU, which is this formula with its own exp: measured
+        // 8.4e-05 relative against the exact silu. That is the whole accuracy
+        // story of the graph arm in one place -- see npu_offload.hpp.
+        if (npu_ && npu::swiglu(npu_, out, gate, up, n)) {
+            // f32 activations need no exponent restore; the contract still asks
+            // for one scale per row and 1.0 is that scale.
+            if (row_scale && row_len > 0 && n % row_len == 0)
+                for (i64 r = 0; r < n / row_len; r++) row_scale[r] = 1.0f;
+            return;
+        }
+        npu_flush_();
         f32 *o = static_cast<f32 *>(out);
         const f32 *g = static_cast<const f32 *>(gate);
         const f32 *u = static_cast<const f32 *>(up);
@@ -844,6 +1550,7 @@ public:
     // multiplier. Written out rather than folded so the two arms are
     // comparable line by line.
     void swiglu_oai(void *out, const void *gate, const void *up, i64 n) override {
+        npu_flush_();
         f32 *o = static_cast<f32 *>(out);
         const f32 *g = static_cast<const f32 *>(gate);
         const f32 *u = static_cast<const f32 *>(up);
@@ -858,6 +1565,7 @@ public:
     }
 
     void add_bias_rows(void *out, const f32 *bias, i64 n, i64 rows) override {
+        npu_flush_();
         f32 *o = static_cast<f32 *>(out);
         par_for(rows, 1, 2.0 * static_cast<f64>(rows) * n,
                 [&](i64 b, i64 e) {
@@ -867,19 +1575,24 @@ public:
     }
 
     void add_inplace(void *a, const void *b, i64 n) override {
+        if (npu_ && npu::add(npu_, a, b, n)) return;
+        npu_flush_();
         f32 *af = static_cast<f32 *>(a);
         const f32 *bf = static_cast<const f32 *>(b);
         par_for(n, 8192, 2.0 * static_cast<f64>(n),
-                [&](i64 b, i64 e) {
-                    for (i64 i = b; i < e; i++) af[i] += bf[i];
+                [&](i64 lo, i64 hi) {
+                    for (i64 i = lo; i < hi; i++) af[i] += bf[i];
                 });
     }
 
     void copy_act(void *dst, const void *src, i64 n) override {
+        npu_flush_();
         std::memcpy(dst, src, static_cast<size_t>(n) * 4);
     }
 
     void axpy(void *dst, const void *src, f32 alpha, i64 n) override {
+        if (npu_ && npu::add_scaled(npu_, dst, src, alpha, n)) return;
+        npu_flush_();
         f32 *d = static_cast<f32 *>(dst);
         const f32 *s = static_cast<const f32 *>(src);
         par_for(n, 8192, 2.0 * static_cast<f64>(n),
@@ -894,6 +1607,7 @@ public:
 
     // The reference backend shares one address space, so "staging" is a copy.
     void upload_i32(i32 *dst, const i32 *src, i64 n) override {
+        npu_flush_();
         std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(i32));
     }
 
@@ -909,6 +1623,7 @@ public:
     // Everything stays in f32, exactly like the fork's graph tensors.
     void hadamard_act(void *out, const void *in, i64 rows,
                       const Backend::HadDesc &d) override {
+        npu_flush_();
         if (rows <= 0 || d.n <= 0) return;
         const i64 n = d.n;
         const i64 block = d.block;
@@ -971,6 +1686,7 @@ public:
 
     void l2norm(void *o, const void *x, i64 n_tok, i64 n_head, i64 hd, i64 stride,
                 f32 eps) override {
+        npu_flush_();
         const f32 *s = static_cast<const f32 *>(x);
         f32 *d = static_cast<f32 *>(o);
         // Each head carries its own reduction, so (token, head) pairs are the
@@ -999,6 +1715,7 @@ public:
     bool hc_supported() const override { return true; }
 
     void hc_init(void *lanes, const void *x, i64 n_tok, i64 hc, i64 ne) override {
+        npu_flush_();
         f32 *o = static_cast<f32 *>(lanes);
         const f32 *s = static_cast<const f32 *>(x);
         if (!o || !s || n_tok <= 0 || hc <= 0 || ne <= 0) return;
@@ -1018,6 +1735,7 @@ public:
 
     void hc_mix(void *mixed, const void *xn, const void *gate, i64 n_tok,
                 i64 hc, i64 ne) override {
+        npu_flush_();
         HcGeometry g;
         g.n_embd = static_cast<i32>(ne);
         g.hc = static_cast<i32>(hc);
@@ -1029,6 +1747,7 @@ public:
 
     void hc_combine(void *res, const void *block_out, const void *inject,
                     i64 n_tok, i64 hc, i64 ne) override {
+        npu_flush_();
         HcGeometry g;
         g.n_embd = static_cast<i32>(ne);
         g.hc = static_cast<i32>(hc);
@@ -1041,6 +1760,7 @@ public:
     // ---- per-layer embedding (PLE), qwen4exp ------------------------------
     void ple_gate(void *out, const void *key, const void *qry, i64 n_tok,
                   i64 hc, i64 ne) override {
+        npu_flush_();
         f32 *o = static_cast<f32 *>(out);
         const f32 *kf = static_cast<const f32 *>(key);
         const f32 *qf = static_cast<const f32 *>(qry);
@@ -1072,6 +1792,7 @@ public:
     // then is the heap reused.
     void lane_bcast_mul(void *out, const void *value, const void *g, i64 n_tok,
                         i64 hc, i64 ne) override {
+        npu_flush_();
         f32 *o = static_cast<f32 *>(out);
         const f32 *vf = static_cast<const f32 *>(value);
         const f32 *gf = static_cast<const f32 *>(g);
@@ -1091,6 +1812,7 @@ public:
 
     void conv1d_dw(void *out, const void *x, const void *w, i64 n_tok, i64 ch,
                    i64 kern, i64 dil) override {
+        npu_flush_();
         f32 *o = static_cast<f32 *>(out);
         const f32 *xf = static_cast<const f32 *>(x);
         const f32 *wf = static_cast<const f32 *>(w);
@@ -1115,6 +1837,7 @@ public:
     // different history convention here would be a silent disagreement.
     void shortconv(void *out, const void *proj, void *state, const void *w,
                    i64 n_tok, i64 ch, i64 kern, i64 hist, i64 pos0) override {
+        npu_flush_();
         f32 *o = static_cast<f32 *>(out);
         const f32 *p = static_cast<const f32 *>(proj);
         f32 *st = static_cast<f32 *>(state);
@@ -1160,6 +1883,7 @@ public:
     }
 
     void silu_act(void *x, i64 n) override {
+        npu_flush_();
         f32 *p = static_cast<f32 *>(x);
         par_for(n, 8192, 4.0 * static_cast<f64>(n),
                 [&](i64 b, i64 e) {
@@ -1171,6 +1895,7 @@ public:
     }
 
     void gelu_act(void *x, i64 n) override {
+        npu_flush_();
         f32 *p = static_cast<f32 *>(x);
         par_for(n, 8192, 6.0 * static_cast<f64>(n),
                 [&](i64 b, i64 e) {
@@ -1182,6 +1907,7 @@ public:
     }
 
     void sigmoid_act(void *x, i64 n) override {
+        npu_flush_();
         f32 *p = static_cast<f32 *>(x);
         par_for(n, 8192, 4.0 * static_cast<f64>(n),
                 [&](i64 b, i64 e) {
@@ -1190,6 +1916,7 @@ public:
     }
 
     void relu_sqr_act(void *x, i64 n) override {
+        npu_flush_();
         f32 *p = static_cast<f32 *>(x);
         par_for(n, 8192, 4.0 * static_cast<f64>(n),
                 [&](i64 b, i64 e) {
@@ -1202,6 +1929,7 @@ public:
     }
 
     void softplus_act(void *x, i64 n) override {
+        npu_flush_();
         f32 *p = static_cast<f32 *>(x);
         par_for(n, 8192, 4.0 * static_cast<f64>(n),
                 [&](i64 b, i64 e) {
@@ -1215,6 +1943,7 @@ public:
     }
 
     void scale_act(void *x, f32 alpha, i64 n_tok, i64 width, i64 stride) override {
+        npu_flush_();
         f32 *p = static_cast<f32 *>(x);
         par_for(n_tok, 1, static_cast<f64>(n_tok) * width,
                 [&](i64 b, i64 e) {
@@ -1226,6 +1955,8 @@ public:
     }
 
     void mul_act(void *a, const void *b, i64 n) override {
+        if (npu_ && npu::mul(npu_, a, b, n)) return;
+        npu_flush_();
         f32 *p = static_cast<f32 *>(a);
         const f32 *s = static_cast<const f32 *>(b);
         par_for(n, 8192, 2.0 * static_cast<f64>(n),
@@ -1236,6 +1967,7 @@ public:
 
     void mul_head_broadcast(void *x, const void *g, i64 n_tok, i64 n_head,
                             i64 hd) override {
+        npu_flush_();
         f32 *xf = static_cast<f32 *>(x);
         const f32 *gf = static_cast<const f32 *>(g);
         par_for(n_tok, 1, 2.0 * static_cast<f64>(n_tok) * n_head * hd,
@@ -1251,6 +1983,7 @@ public:
     }
 
     void add_bias_cols(void *x, const f32 *bias, i64 n_row, i64 n_col) override {
+        npu_flush_();
         f32 *p = static_cast<f32 *>(x);
         par_for(n_row, 1, static_cast<f64>(n_row) * n_col,
                 [&](i64 b, i64 e) {
@@ -1262,6 +1995,7 @@ public:
     }
 
     void scale_cols(void *x, const f32 *col, i64 n_row, i64 n_col) override {
+        npu_flush_();
         f32 *p = static_cast<f32 *>(x);
         par_for(n_row, 1, static_cast<f64>(n_row) * n_col,
                 [&](i64 b, i64 e) {
@@ -1273,6 +2007,7 @@ public:
     }
 
     void scale_rows(void *x, const void *alpha, i64 n_row, i64 n) override {
+        npu_flush_();
         f32 *p = static_cast<f32 *>(x);
         const f32 *a = static_cast<const f32 *>(alpha);
         par_for(n_row, 1, 2.0 * static_cast<f64>(n_row) * n,
@@ -1287,6 +2022,7 @@ public:
 
     void qwen3_next_split(void *q, void *gate, const void *packed, i64 n_tok,
                           i64 n_head, i64 hd) override {
+        npu_flush_();
         const f32 *p = static_cast<const f32 *>(packed);
         f32 *qd = static_cast<f32 *>(q);
         f32 *gd = static_cast<f32 *>(gate);
@@ -1320,6 +2056,7 @@ public:
     void conv1d_silu(void *out, const void *in, void *state, const void *kern,
                      DType wt, i64 n_tok, i64 chan, i64 ksize,
                      const void *bias = nullptr) override {
+        npu_flush_();
         if (ksize <= 0 || ksize > kMaxConvKernel) return;
         const f32 *xp = static_cast<const f32 *>(in);
         f32 *st = static_cast<f32 *>(state);
@@ -1380,6 +2117,7 @@ public:
                    const void *a_v, const void *db_v, const void *dp_v,
                    i64 n_tok, i64 n_head, i64 head_dim, i64 d_state,
                    i64 n_group, i64 inner, i64 conv_dim, bool has_d) override {
+        npu_flush_();
         f32 *o = static_cast<f32 *>(out);
         f32 *S = static_cast<f32 *>(state);
         const f32 *xbc = static_cast<const f32 *>(xbc_v);
@@ -1448,6 +2186,7 @@ public:
                     const void *v, const void *g, const void *beta, i64 n_tok,
                     i64 n_k_head, i64 n_v_head, i64 d_state, i64 hd,
                     i64 row_stride) override {
+        npu_flush_();
         f32 *S = static_cast<f32 *>(state);
         const f32 *qp = static_cast<const f32 *>(q);
         const f32 *kp = static_cast<const f32 *>(k);
@@ -1520,6 +2259,7 @@ public:
                            const f32 *alpha, i64 n_rows, i64 n,
                            const f32 *row_scale = nullptr,
                            i32 *row_exp = nullptr) override {
+        npu_flush_();
         // The scalar reference works in f32, so no row here ever leaves a
         // representable range and the storage exponent stays 0: the
         // contract is answered by leaving the caller's slot alone.
@@ -1618,6 +2358,7 @@ private:
     }
 
     DeviceCaps caps_;
+    npu::Offload *npu_ = nullptr;
 };
 
 Backend *make_cpu_backend() {
@@ -1629,5 +2370,25 @@ Backend *make_cpu_backend() {
     c.cu_count = 1;
     return new CpuBackend(c);
 }
+
+Backend *make_npu_backend(int device_index, bool whole_graph, std::string *err) {
+    std::string why;
+    npu::Offload *o =
+        npu::create(device_index, whole_graph ? npu::Mode::Graph : npu::Mode::Gemm,
+                    &why);
+    if (!o) {
+        if (err) *err = why;
+        return nullptr;
+    }
+    DeviceCaps c;
+    c.name = npu::describe(o);
+    c.gfx = "vnpu";
+    c.family = GfxFamily::Unknown;
+    c.wave_size = 1; // one command at a time per stream, not lockstep lanes
+    c.cu_count = 1;
+    return new CpuBackend(c, o);
+}
+
+bool npu_available() { return npu::available(); }
 
 } // namespace krk

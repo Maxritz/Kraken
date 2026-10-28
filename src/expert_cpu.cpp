@@ -222,8 +222,8 @@ struct CpuExpertPool::Impl {
                             s.row.data(), nin);
                 f32 u = 0.0f;
                 for (i64 i = 0; i < nin; i++) u += s.row[static_cast<size_t>(i)] * x[i];
-                const f32 u16 = r16(u); // ... and the up projection too
-                s.h[static_cast<size_t>(j)] = r16(silu(g16) * u16);
+                const f32 up16 = r16(u); // ... and the up projection too
+                s.h[static_cast<size_t>(j)] = r16(silu(g16) * up16);
             }
             // down, then the weighted accumulate the device's
             // scatter_axpy_rows does into an f16 accumulator.

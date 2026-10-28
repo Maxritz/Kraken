@@ -163,7 +163,106 @@ void dequant_row_f16(DType t, const void *src, u16 *out, i64 n);
 
 // y = dot(dequant(src), x) over n elements. This is the reference GEMV inner
 // product; the device `dot_*` kernels are validated against it.
+//
+// OPT-IN FAST PATH (block formats only). The default path accumulates the whole
+// row into ONE f32 chain, which is what makes it the oracle: every device kernel
+// is compared against these exact rounding. That single chain is also a serial
+// dependency -- one FMA waiting four cycles on the previous one -- so a q4_0 or
+// q8_0 row runs at ~0.65 G element/s per thread no matter how wide the SIMD is.
+//
+// `set_vec_dot_fast(true)` (or KRK_CPU_DOT_FAST=1 in the environment) switches
+// the block formats to four accumulators combined as (a0+a1)+(a2+a3). That is
+// the same shape the f16 path already uses and it is ~3x faster, but it is a
+// DIFFERENT summation order: results agree with the reference to within a few
+// ulp and are no longer bit-identical to it. That is why it is off by default,
+// why the CPU backend stops being a bit-exact oracle while it is on, and why
+// every comparison against a device backend must be run with it off.
+//
+// The f16/f32 paths are exact under either setting (same four lanes, same
+// order) and do not consult this flag.
 f32 vec_dot(DType t, const void *src, const f32 *x, i64 n);
+
+// out[r*out_stride + o] = dot(dequant(w[o]), x[r]) for every row and every
+// output, which is a batched GEMV -- i.e. the GEMM a prefill chunk needs.
+//
+// This exists because vec_dot() decodes a weight row as it goes, so a GEMM that
+// calls it once per output element decodes every weight row once per ROW of the
+// batch. Measured before this existed, on the 2 GiB q8_0 MoE at --cpu with
+// KRK_CPU_DOT_AVX2=1, prefill cost per token was FLAT at 34.1, 29.1, 27.8, 28.3
+// ms across prompts of 58, 149, 331 and 695 tokens: the weight read was never
+// amortized, so prefill ran at GEMV speed.
+//
+// q8_0 and q4_0 on an AVX2 host decode each block once into registers and reuse
+// it across a tile of rows; every result is BIT-IDENTICAL to vec_dot() on the
+// same (row, output) pair, because the tile performs the fused kernel's own
+// operations in its own order. Everything else takes the per-element loop.
+void vec_dot_tiled(DType t, const void *w, const f32 *x, i64 n_in, i64 o_begin,
+                   i64 o_end, i64 rows, f32 *out, i64 out_stride);
+void set_vec_dot_fast(bool on);
+bool vec_dot_fast();
+
+// Fused AVX2 kernels for q8_0 and q4_0 (KRK_CPU_DOT_AVX2=1). These compute
+// d * (f32)w[k] with one rounding and add term k to accumulator k mod 4 in
+// increasing k, then fold as (a0+a1)+(a2+a3) -- the same operations in the same
+// order as set_vec_dot_fast(true), so the result is BIT-IDENTICAL to it. They
+// exist to stop paying for a stack buffer and a second pass over every
+// 32-value block, not to change any answer.
+//
+// Asking for it on a build or host without AVX2 is not an error: vec_dot_avx2()
+// answers false, the four-lane path runs, and the answer is the same one. The
+// flag implies the four-lane order; formats without a fused kernel keep the
+// four-lane loop.
+//
+// Opt-in because the path it accelerates is opt-in: with set_vec_dot_fast(false)
+// this flag alone turns the non-exact order on.
+void set_vec_dot_avx2(bool on);
+bool vec_dot_avx2();
+// Q4_K against an int8 activation. Unlike the flags above this is NOT a
+// bit-identical tier -- it quantises the activation -- so it is the one switch
+// here that trades rounding for speed, and it is measured as such.
+// Measured ceiling for this host, all cores, at the width the kernels use.
+// int8=true is the u8*i8 dot rate, false the f32 FMA rate. Used by the
+// component trace so a "%peak" is a measurement and not a datasheet.
+double isa_peak_gmacs(bool int8);
+
+void set_vec_dot_int8(bool on);
+bool vec_dot_int8();
+// The pieces the GEMM needs; xq is n int8 and dx is n/32 scales.
+void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx);
+// Also emits sx[]: sum of the quantised values per 32-value sub-block. It is
+// activation-only, so the dmin term uses it instead of recomputing it for every
+// weight row.
+void quantize_q8_row_sx(const f32 *x, i64 n, i8 *xq, f32 *dx, i32 *sx);
+// Per-four biased sums (n/4 int32), sx[i] = -32 * sum(x[4i..4i+3]). Q6_K's dot
+// is sum((q-32)*x) and its lanes own four values each, so the bias has to be
+// present once per lane; storing it already multiplied makes it the ACCUMULATOR
+// the int8 dot lands on, which costs the kernel nothing.
+void quantize_q8_row_sq4(const f32 *x, i64 n, i8 *xq, f32 *dx, i32 *sq4);
+f32 dot_q4_K_q8_sx(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx, i64 n);
+// Eight activation rows against one weight row, with the min term taken from
+// sx[] once per 256-value block instead of recomputed per row.
+void dot_q4_K_q8_sx_x8(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
+                       i64 n, i64 rstride, i64 dstride, i64 sstride, f32 *out,
+                       i64 out_stride);
+f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+// Q8_0 against int8 activations with neither side expanded to f32: the signed
+// weight is split into unsigned magnitudes |w| and the products are subtracted,
+// which keeps maddubs inside i16 for the whole legal byte range (including the
+// -128 the format allows) and needs no bias correction.
+f32 dot_q8_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+// Q6_K with the q-32 bias taken from sq4 (per-four biased sums) and folded
+// into the integer dot, plus the eight-row prefill shape for the same.
+f32 dot_q6_K_q8_sq4(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4,
+                    i64 n);
+void dot_q6_K_q8_sq4_x8(const u8 *w, const i8 *xq, const f32 *dx,
+                        const i32 *sq4, i64 n, i64 rstride, i64 dstride,
+                        i64 sstride, f32 *out, i64 out_stride);
+// Eight rows at once, weight block decoded once. out[r*out_stride].
+void dot_q4_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride);
 
 // Number of activations quantized at once by the Q8_1 activation format.
 constexpr i64 kAttentionQuantBlock = 32;

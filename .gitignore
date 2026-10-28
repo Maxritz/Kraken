@@ -14,6 +14,12 @@
 !/tools/
 !/docs/
 !/palcfg/
+# Patches carried against sibling projects (npuxl), applied by hand.
+!/patches/
+
+# Python bytecode from the tools/ helpers.
+__pycache__/
+*.pyc
 
 # Docs: keep the written docs, drop probe transcripts
 /docs/*
@@ -26,3 +32,17 @@
 !/docs/*.md
 !/docs/traces/
 !/docs/traces/**
+
+# Model weights. Never in the repo: one file is bigger than the whole packfile
+# budget, GitHub refuses anything over 100 MB outright (so a push that includes
+# one is a push that never finishes), and the Drive connector stages downloads
+# in google_drive/ inside whatever directory it is called from -- which is this
+# checkout. Weights live outside the tree, in ../models.
+*.gguf
+*.ggml
+*.safetensors
+*.pt
+*.pth
+*.npz
+google_drive/
+models/

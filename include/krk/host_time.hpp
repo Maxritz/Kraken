@@ -332,8 +332,11 @@ public:
             }
         std::sort(lines.begin(), lines.end(),
                   [](const Line &a, const Line &b) { return a.ms > b.ms; });
+        // "%%run" is a literal percent: the header used to carry "%run" in its
+        // FORMAT string, which is an invalid conversion (`%r`) and undefined
+        // behaviour -- glibc prints the specifier back out, other libcs may not.
         std::fprintf(out,
-                     "\n[stats ] components  (%run is of the row's own phase; dev ms net of the recorder floor)\n"
+                     "\n[stats ] components  (%%run is of the row's own phase; dev ms net of the recorder floor)\n"
                      "    %-14s %-8s %8s %10s %10s %7s %7s\n",
                      "component", "phase", "ops", "dev ms", "host ms", "%phase", "%run");
         for (const Line &l : lines) {
@@ -418,7 +421,9 @@ private:
 };
 
 // One per scope. KRK_TIME_HOST uses the default guard name; use KRK_TIME_HOST_N
-// when two scopes have to nest in the same block.
+// when two scopes have to nest in the same block -- and note that a nested
+// KRK_TIME_HOST is a -Wshadow warning, not an error, so what it costs is the
+// wrong row's name in a report rather than a build failure.
 #define KRK_TIME_HOST(nm) ::krk::HostScope krk_host_scope(nm)
 #define KRK_TIME_HOST_N(nm, var) ::krk::HostScope var(nm)
 // Use from a thread that runs BESIDE the main one (the expert read-ahead

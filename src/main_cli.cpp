@@ -13,6 +13,8 @@
 #include "krk/cli_value.hpp"
 #include "krk/engine.hpp"
 #include "krk/host_time.hpp"
+#include "krk/kernel_time.hpp"
+#include "krk/quant.hpp"
 #include "krk/trace.hpp"
 
 #if !defined(_WIN32)
@@ -98,6 +100,8 @@ struct Args {
     // always wins over it.
     bool draft_tokens_given = false;
     bool cpu = false;
+    bool npu = false;
+    bool npu_cpu = false;
     bool greedy = false;
     bool tokenize = false;
     // Print one hash of the prompt's last-position logits and exit (see
@@ -163,7 +167,64 @@ void usage() {
         "  --chat                wrap the prompt in a ChatML template\n"
         "  --system STR          system message for --chat\n"
         "  --cpu                 use the scalar reference backend\n"
+        "                        KRK_CPU_DOT_FAST=1 replaces the block-format\n"
+        "                        (q4_0/q8_0/q5/q6...) dot product's single\n"
+        "                        accumulator with four, which is 2x-3x the\n"
+        "                        prefill and 2x-2.7x the decode on a quantized\n"
+        "                        MoE. It is a DIFFERENT summation order: the\n"
+        "                        result moves by up to 1.4e-07 of the terms\n"
+        "                        (tools/dot_fast_witness.py), so the CPU arm is\n"
+        "                        no longer a bit-exact oracle while it is on --\n"
+        "                        turn it off before comparing against --npu or\n"
+        "                        --device. f16/f32 weights are unaffected.\n"
+        "                        Off by default; see docs/BENCH-CPU-DOT.md 5.\n"
+        "                        KRK_CPU_DOT_AVX2=1 adds fused AVX2 kernels for\n"
+        "                        q8_0 and q4_0 on top of that: same four\n"
+        "                        accumulators, same order, no stack buffer --\n"
+        "                        measured 2.20x the exact prefill against\n"
+        "                        1.78x for KRK_CPU_DOT_FAST alone, and the\n"
+        "                        output is BIT-IDENTICAL to DOT_FAST, not a\n"
+        "                        further rounding tier. Ignored on a host\n"
+        "                        without AVX2, where the four-lane loop runs.\n"
         "  --device N            HIP device index (default 0)\n"
+        "  --npu                 run the GEMM path on the virtual NPU\n"
+        "                        (github.com/riteshnair/npuxl-improved;\n"
+        "                        needs a -DKRK_ENABLE_NPU=ON build). The\n"
+        "                        rest of the graph stays on the scalar\n"
+        "                        reference, so numbers match the CPU arm\n"
+        "                        to f32 rounding rather than bit-exactly\n"
+        "  --npu-cpu             run the WHOLE inference through the virtual\n"
+        "                        NPU: every op the device has (GEMM, RMSNorm,\n"
+        "                        SwiGLU, add, mul) is issued to it, and the\n"
+        "                        ops it lacks keep the reference body. 11x the\n"
+        "                        prefill and 2.5x the decode of --cpu on a\n"
+        "                        4-layer 512-dim fixture, and within noise of\n"
+        "                        --npu (the GEMM dominates both). Not\n"
+        "                        bit-identical to --cpu: its silu is the\n"
+        "                        device's own and is measured 8.4e-05\n"
+        "                        relative off; it still reproduces --cpu's\n"
+        "                        greedy trajectory on that fixture.\n"
+        "                        KRK_NPU_MIN_ELEMS=N sends only ops of N or\n"
+        "                        more elements to the device (0 = all).\n"
+        "                        KRK_NPU_W8A8=1 runs the GEMMs on the device's\n"
+        "                        int8 kernel: 4x smaller weights, 1.3x-3.6x the\n"
+        "                        decode, but lossy -- the activations are\n"
+        "                        quantized too, so the greedy tail can change.\n"
+        "                        Off by default. See section 10 of\n"
+        "                        docs/CPU-VS-NPU-BENCHMARK.md before turning it\n"
+        "                        on.\n"
+        "                        KRK_NPU_ATTN=1 runs ATTENTION on the device\n"
+        "                        too. Prefill 8-28% faster on the measured\n"
+        "                        fixtures (it grows with prompt length, since\n"
+        "                        attention is the quadratic term), decode\n"
+        "                        unchanged. Off by default because the device\n"
+        "                        takes only the calls it can express and the\n"
+        "                        rest stay on the reference, which makes the\n"
+        "                        result depend on --chunk at the 1e-07 level\n"
+        "                        and so gives up the chunk-invariance gate.\n"
+        "                        KRK_NPU_ATTN_MIN_TOK=N moves the row count\n"
+        "                        below which attention stays on the host\n"
+        "                        (default 16; the device loses below ~4).\n"
         "  --expert-cache-mb N   MoE expert residency budget in MiB (0 = auto)\n"
         "  --host-ram-mb N       host memory to plan for, in MiB. 0 uses a\n"
         "                        quarter of installed RAM. Bounds every host\n"
@@ -324,6 +385,8 @@ void usage() {
         "                        transfers, syncs and counters. PATH sets\n"
         "                        KRK_TRACE_PATH. Bounded window only; compare\n"
         "                        untraced wall time.\n"
+        "  --kprof               per-component device time, ranked by total:\n"
+        "                        ops, dev_us, us/op. Works on every backend.\n"
         "  --profile             per-op device timeline for the last decode\n"
         "                        step(s), with the idle gap before each op\n"
         "                        (KRK_PROFILE_STEPS/FROM/OPS tune the window)\n"
@@ -522,9 +585,18 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--prefill-hash") a->prefill_hash = true;
         else if (f == "--chat") a->chat = true;
         else if (f == "--cpu") a->cpu = true;
+        else if (f == "--npu") a->npu = true;
+        else if (f == "--npu-cpu") a->npu_cpu = true;
         else if (f == "--info") a->info = true;
         else if (f == "--bench") a->bench = true;
         else if (f == "--profile") a->profile = true;
+        else if (f == "--kprof") {
+            // Per-COMPONENT device time, ranked, for every backend. --profile
+            // is the host-side phase table and the device op trace; this is
+            // the kernel table that says which one is eating the run.
+            setenv("KRK_KPROF", "1", 1);
+            a->profile = true;
+        }
         else if (f == "--trace") {
             a->trace = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') a->trace_path = argv[++i];
@@ -716,6 +788,12 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                      "= %.1f tok/s (%.1f ms/step)\n",
                      r.generated, r.decode_ms,
                      static_cast<long long>(r.decode_steps), dtps, dper);
+    }
+    // What the GEMM hand-over actually did. Printed only when the backend has
+    // something to report, so CPU and HIP runs are unchanged.
+    if (be) {
+        const std::string bs = be->backend_stats();
+        if (!bs.empty()) std::fprintf(out, "[stats ] npu       %s\n", bs.c_str());
     }
     if (dev_total > 0)
         std::fprintf(out,
@@ -1342,6 +1420,7 @@ static double adapt_retain() {
 }
 
 int main(int argc, char **argv) {
+    bool ktime_registered = false;
     PhaseClock ph;
     ph.mark("process start");
     Args a;
@@ -1386,7 +1465,23 @@ int main(int argc, char **argv) {
 
     std::string err;
     Backend *be = nullptr;
-    if (a.cpu) {
+    if (a.cpu && (a.npu || a.npu_cpu)) {
+        KRK_WARN("--cpu and --npu/--npu-cpu both given; the reference backend wins");
+        a.npu = false;
+        a.npu_cpu = false;
+    }
+    if (a.npu && a.npu_cpu) {
+        KRK_WARN("--npu and --npu-cpu both given; --npu-cpu (the whole graph) wins");
+        a.npu = false;
+    }
+    if (a.npu || a.npu_cpu) {
+        be = make_npu_backend(a.device, a.npu_cpu, &err);
+        if (!be) {
+            KRK_WARN("%s", err.c_str());
+            KRK_WARN("falling back to the CPU reference backend");
+            be = make_cpu_backend();
+        }
+    } else if (a.cpu) {
         be = make_cpu_backend();
     } else {
         // --prefill maps onto the backend's own GEMM rung switch, which is read
@@ -1834,5 +1929,15 @@ int main(int argc, char **argv) {
 
     engine.shutdown();
     delete be;
+    // Registered here rather than printed here so every exit path above
+    // (--prefill-hash, --bench, an error return) still gets the table.
+    if (::krk::KernelTime::enabled() && !ktime_registered) {
+        ktime_registered = true;
+        std::atexit([] {
+            ::krk::KernelTime::get().set_roofline(::krk::isa_peak_gmacs(true),
+                                                 ::krk::isa_peak_gmacs(false));
+            ::krk::KernelTime::get().report("this run");
+        });
+    }
     return rc != 0 ? rc : g_range_exit;
 }

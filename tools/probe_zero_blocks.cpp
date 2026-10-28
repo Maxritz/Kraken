@@ -8,7 +8,7 @@
 // so the answer is in terms of values the model would really see.
 //
 // Build:
-//   c++ -O2 -std=c++17 -Iinclude tools/probe_zero_blocks.cpp src/gguf.cpp \
+//   c++ -O2 -std=c++17 -Iinclude tools/probe_zero_blocks.cpp src/gguf.cpp
 //       src/quant.cpp src/common.cpp -o probe_zero_blocks
 #include "krk/gguf.hpp"
 
