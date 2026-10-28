@@ -630,15 +630,19 @@ constexpr ArchSpec kTable[] = {
     // What runs: the shared-latent attention (one normed latent row per token,
     // rope on its tail, grouped low-rank output) and the tid2eid hash route that
     // the first `hash_layer_count` layers select by token id. What does not: the
-    // CSA/HCA compressors (attn_compressor_*), the sparse indexer and
-    // attn_sinks -- so a file whose attention.compress_ratios is non-zero is
-    // refused at Engine::init, and one carrying any of those tensor classes is
-    // refused by the loader's gap map. A dense-core file (all ratios 0) IS this
-    // graph, and test_dsv4_whole_graph pins it end to end.
+    // CSA/HCA compressors (attn_compressor_*) and the sparse indexer -- so a
+    // file whose attention.compress_ratios is non-zero is refused at
+    // Engine::init, and one carrying either tensor class is refused by the
+    // loader's gap map. `attn_sinks` DO run: they are a per-head logit that
+    // competes with every visible key for softmax mass and contributes no value
+    // of its own, which the kernel and the host oracle both already carried.
+    // A dense-core file (all ratios 0) IS this graph, and
+    // test_dsv4_whole_graph pins it end to end.
     {"deepseek4", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target, "deepseek4",
-     "shared-latent MLA, the grouped output and the tid2eid hash route run; "
-     "compressed attention (attn_compressor_*), the sparse indexer and "
-     "attn_sinks do not, so a file with a non-zero compress_ratios is refused",
+     "shared-latent MLA, the grouped output, the attention sinks and the "
+     "tid2eid hash route run; compressed attention (attn_compressor_*) and the "
+     "sparse indexer do not, so a file with a non-zero compress_ratios is "
+     "refused",
      /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,

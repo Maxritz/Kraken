@@ -1115,14 +1115,6 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                         " and the compressed-attention path (attn_compressor_*) "
                         "is not implemented; a run would attend the raw prefix "
                         "instead of the pooled one");
-        if (mla_shared)
-            for (const LayerWeights &lw : model_.layers()) {
-                if (!lw.sinks) continue;
-                return refuse_mla(
-                    "MLA layout 'shared-latent': this file carries attn_sinks "
-                    "and the shared-latent path does not feed them to the "
-                    "softmax yet; a run would mix heads unnormalized");
-            }
         if (mla_shared ? !be_->mla_shared_supported() : !be_->mla_supported()) {
             return refuse_mla(
                 std::string("the selected backend has no ") +
@@ -6945,7 +6937,12 @@ bool Engine::mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     sd.eps = mc.rms_eps;
     sd.window = mc.dsv4_window > 0 ? mc.dsv4_window : 0;
     sd.inv_freq = model_.inv_freq_at(l).data();
-    sd.sinks = nullptr;  // refused at init when the file carries any
+    // `attention.sinks` per head: a learned logit that competes with every
+    // visible key for softmax mass and contributes no value of its own (the
+    // reference adds it with `ggml_soft_max_add_sinks`). Both the host oracle
+    // (src/mla_shared.cpp) and this kernel already carry it -- the engine was
+    // the only place that dropped it, and refused the file instead.
+    sd.sinks = L.sinks;
 
     // 1. the latent: x -> attn_kv -> rms_norm over the WHOLE row (rope is its
     //    tail, so the norm covers the rotary dims -- the opposite of the lite

@@ -15198,6 +15198,11 @@ struct MlaFix {
     // produce identical logits, which is the only way to tell a correct
     // composition from one that merely runs.
     bool split_mirrors_legacy = false;
+    // Write `attn_sinks` per layer: one logit per query head that competes with
+    // every visible key for softmax mass and contributes no value of its own.
+    // The values are non-zero and differ per head, so a run that ignores them
+    // cannot produce the same logits as one that reads them.
+    bool sinks = false;
     // A low-rank query trunk over the LEGACY KV path. That pairing is not one
     // of llama.cpp's three naming conventions, and it is exactly what MiniCPM3
     // ships: `attn_q_a`/`attn_q_b` with `attn_kv_a_mqa`/`attn_kv_b`. Without
@@ -15334,6 +15339,13 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
     for (int l = 0; l < f.n_layer; l++) {
         const std::string p = "blk." + std::to_string(l) + ".";
         ones(p + "attn_norm.weight", static_cast<u64>(kMlaEmbd));
+        if (f.sinks) {
+            std::vector<f32> sv(static_cast<size_t>(kMlaHead));
+            for (i32 h = 0; h < kMlaHead; h++)
+                sv[static_cast<size_t>(h)] = 0.75f * static_cast<f32>(h + 1);
+            b.tensor_f16(p + "attn_sinks.weight",
+                         {static_cast<u64>(kMlaHead)}, sv);
+        }
         ones(p + "ffn_norm.weight", static_cast<u64>(kMlaEmbd));
         MlaFixKind kind = f.kind;
         if (f.mixed_layout && l == 1)
@@ -16401,6 +16413,63 @@ static void test_dsv4_whole_graph() {
         std::remove("kraken-prefill-err-1.txt");
         std::remove("kraken-prefill-out-16.txt");
         std::remove("kraken-prefill-err-16.txt");
+    }
+
+    // ---- 8. attention sinks in the shared-latent path --------------------
+    // `attn_sinks` is a per-head logit that competes with every visible key for
+    // softmax mass and contributes no value of its own. The kernel and the host
+    // oracle both carried it; the ENGINE dropped it (`sd.sinks = nullptr`) and
+    // refused any file that had one. This arm is the difference between
+    // accepting such a file and reading it: the sinks are non-zero and differ
+    // per head, so the logits must move.
+    {
+        const std::string sinkf = "kraken-dsv4whole-sinks.gguf";
+        MlaFix fskip = f;
+        fskip.sinks = true;
+        CHECK(build_mla_fixture(sinkf, fskip),
+              "wrote a shared-latent fixture carrying attn_sinks");
+        auto logits_of = [&](const std::string &file, std::vector<f32> &out,
+                             std::string &err) {
+            Backend *cpu = make_cpu_backend();
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = file;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            bool ok = false;
+            if (!engine.init(cpu, cfg, &err)) {
+                if (!err.empty()) std::fprintf(stderr, "  (sinks init: %s)\n", err.c_str());
+            } else {
+                GenerateParams gp;
+                gp.prompt = "the";
+                gp.max_tokens = 2;
+                gp.sampler.temp = 0.0f;
+                GenerateResult r;
+                ok = engine.generate(gp, &r);
+                if (ok) {
+                    const f32 *lg = engine.last_logits();
+                    const i32 nv = engine.model().cfg().n_vocab;
+                    out.assign(lg, lg + nv);
+                }
+                engine.shutdown();
+            }
+            delete cpu;
+            return ok;
+        };
+        std::vector<f32> plain, withs;
+        std::string e1, e2;
+        const bool okp = logits_of(path, plain, e1);
+        const bool oks = logits_of(sinkf, withs, e2);
+        CHECK(okp, "the sink-free file still runs");
+        CHECK(oks, "and the file WITH attn_sinks runs instead of being refused");
+        bool differs = okp && oks && plain.size() == withs.size() && !plain.empty();
+        if (differs) {
+            f32 worst = 0.0f;
+            for (size_t i = 0; i < plain.size(); i++)
+                worst = std::max(worst, std::fabs(plain[i] - withs[i]));
+            differs = worst > 1e-4f;
+        }
+        CHECK(differs, "and the sinks reach the softmax: the logits move");
     }
 
     // DEBUG: fixture kept
