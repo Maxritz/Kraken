@@ -2860,6 +2860,26 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         const bool has_dense_ffn =
             gguf_.tensor(blk_key("blk.%d.ffn_up.weight", l)) != nullptr;
         L.moe = gguf_.tensor(exps_gate) != nullptr || (has_exps_up && !has_dense_gate);
+        // gemma4's routed layers are NOT the generic MoE block: the shared MLP
+        // and the expert bank are two branches with their own norms
+        // (`post_ffw_norm_1` on the MLP, `pre_norm_2`/`post_ffw_norm_2` on the
+        // experts) and a router that reads a WEIGHTLESS norm of the attention
+        // output scaled by `ffn_gate_inp.scale`. Running them through the
+        // generic path would produce a fluent, wrong model, so a routed gemma4
+        // file is refused by name until that branch lands. The dense files of
+        // the same family run the whole graph.
+        if (L.moe && cfg_.per_layer_embd) {
+            if (err)
+                *err = "layer " + std::to_string(l) +
+                       " is a routed layer of a per-layer-embedding stack: that "
+                       "family's MoE is two separately-normed branches (shared "
+                       "MLP with post_ffw_norm_1, experts with ffn_pre_norm_2 / "
+                       "post_ffw_norm_2) and a router on a weightless norm of "
+                       "the attention output -- not the generic block, which "
+                       "would run a different graph; a dense file of this "
+                       "family runs the whole graph";
+            return false;
+        }
         if (!L.moe && has_dense_ffn) {
             // GPT-2's MLP is up -> gelu -> down. There is no gate tensor, and
             // asking for one would fail the load on a file that is complete;
