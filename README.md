@@ -327,6 +327,37 @@ each branch's *output* too and that cancels any uniform scaling of V. (That is
 how the first version of this test was caught being vacuous: it scaled `wv` and
 compared logits, and it passed with the norm switched off.)
 
+**The routed form runs too.** gemma4's 26B/31B checkpoints add a routed bank to
+the same block, and that block is *not* the generic MoE path: the dense FFN stays
+as the shared branch and both branches are normalized before they are summed.
+
+```
+mlp = post_ffw_norm_1( gelu(gate*n1) * (up*n1) )      n1 = ffn_norm(attn_out)
+moe = post_ffw_norm_2( experts(pre_ffw_norm_2(attn_out)) )
+x  += post_ffw_norm(mlp + moe)
+```
+
+and the router reads `rms_norm(attn_out) * (1/sqrt(n_embd)) * ffn_gate_inp.scale`
+— a norm with **no weight**, over the post-attention row, which is neither
+branch's input. The generic block norms one row, runs one bank and adds the
+result straight back, so a routed file through it decodes fluent wrong text.
+
+The engine assembles the block from the two halves it already had rather than
+duplicating the expert machinery: `dense_ffn` grew an output buffer and a
+post-norm override (it becomes a *branch*), and `moe_ffn` grew three seams — the
+row its experts read, the router's input, and "leave the residual to the caller".
+Its expert GeGLU comes from the family's own flag, and the fused silu paths
+(batched decode, one-launch dispatch, the gate/up epilogue) are switched off for
+a GeGLU bank, since each of them would compute the right projections and the
+wrong function of them.
+
+`test_gemma4_forward` pins all four pieces through real files: the routed file
+must differ from its dense twin (same geometry, no bank), zeroing the bank must
+move the answer, and three independent ways of removing the expert branch —
+zero bank, zero `post_ffw_norm_2`, zero `pre_ffw_norm_2` — must land on the same
+logits. Zeroing `post_ffw_norm_1` (the shared branch) and zeroing
+`ffn_gate_inp.scale` (the router's input) each move it.
+
 One real bug fell out of the same work: **gemma2 and gemma3 were running without
 their branch post-norms.** Both families carry `post_attention_norm` and
 `post_ffw_norm` and add `post_norm(branch(...))` instead of the raw branch; the

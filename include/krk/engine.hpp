@@ -755,7 +755,14 @@ private:
     // The dense (non-MoE) SwiGLU FFN both layer shapes share: gate/up on one
     // fused launch, silu, down, residual. Shared because the recurrent path's
     // copy was the stale one and had drifted off the fused group.
-    void dense_ffn(const LayerWeights &L, i32 l, i64 n);
+    void dense_ffn(const LayerWeights &L, i32 l, i64 n,
+                   void *dst = nullptr, const f32 *post_norm = nullptr);
+    // gemma4's routed block: the shared MLP and the expert bank are two
+    // separately-normed branches off the same post-attention row, and the
+    // router reads a weightless norm of that row rather than either branch's
+    // input. `moe_ffn` cannot express it (one norm, one bank, one residual
+    // add), so the block is assembled here from both.
+    bool gemma_moe_ffn(const LayerWeights &L, i32 layer, i64 n);
     // dst += x * W^T as ONE launch where the backend can fold the add into the
     // projection's epilogue (Backend::gemm_accumulate), and as the
     // gemm()-into-scratch + add_inplace() pair everywhere else -- including
@@ -1280,6 +1287,21 @@ private:
     // non-hybrid family to carry `ffn_gate_inp_shexp` (qwen2moe) dereferenced a
     // null pointer in its first forward.
     void *ws_shexp_g_ = nullptr; // [chunk] shared-expert gate
+    // ---- gemma4's two-branch routed block --------------------------------
+    // `ws_g4_post_` is the post-attention row the two branches both read (the
+    // residual has to survive until the block's own add at the end), `ws_g4_mlp_`
+    // is the shared MLP's finished output, and `ws_router_in_` is the router's
+    // detached input: a WEIGHTLESS norm of the post-attention row, scaled by
+    // 1/sqrt(n_embd) and then elementwise by `ffn_gate_inp.scale`. None of the
+    // three exists on a family without `moe_two_branch`.
+    void *ws_g4_post_ = nullptr;  // [chunk, n_embd] post-attention row
+    void *ws_g4_mlp_ = nullptr;   // [chunk, n_embd] shared MLP branch
+    void *ws_router_in_ = nullptr; // [chunk, n_embd] router input
+    // Per-call overrides, set only around a two-branch layer: the row the
+    // experts read, and "leave the residual alone, the caller will assemble
+    // the block". Both are nullptr/false on every other family.
+    const void *moe_in_ = nullptr;
+    bool moe_no_residual_ = false;
 
     // ---- gemma4 per-layer input embeddings -------------------------------
     // `ws_ppl_` holds the gathered per-layer token table for these tokens and

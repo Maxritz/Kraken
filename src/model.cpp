@@ -354,6 +354,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // `post_norm_eps` 0 means "use the model's rms_eps", which is the gemma case;
     // muse-glimmer states its own 1e-8 for these two norms.
     cfg_.post_branch_norm = aspec.post_branch_norm;
+    cfg_.moe_two_branch = aspec.moe_two_branch;
     // Stored as given; 0 means "the model's rms_eps", resolved by the engine at
     // the call -- the gemma eps override is applied further down, AFTER this
     // point, so resolving it here would capture the pre-override value.
@@ -2862,25 +2863,31 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         L.moe = gguf_.tensor(exps_gate) != nullptr || (has_exps_up && !has_dense_gate);
         // gemma4's routed layers are NOT the generic MoE block: the shared MLP
         // and the expert bank are two branches with their own norms
-        // (`post_ffw_norm_1` on the MLP, `pre_norm_2`/`post_ffw_norm_2` on the
-        // experts) and a router that reads a WEIGHTLESS norm of the attention
-        // output scaled by `ffn_gate_inp.scale`. Running them through the
-        // generic path would produce a fluent, wrong model, so a routed gemma4
-        // file is refused by name until that branch lands. The dense files of
-        // the same family run the whole graph.
-        if (L.moe && cfg_.per_layer_embd) {
-            if (err)
-                *err = "layer " + std::to_string(l) +
-                       " is a routed layer of a per-layer-embedding stack: that "
-                       "family's MoE is two separately-normed branches (shared "
-                       "MLP with post_ffw_norm_1, experts with ffn_pre_norm_2 / "
-                       "post_ffw_norm_2) and a router on a weightless norm of "
-                       "the attention output -- not the generic block, which "
-                       "would run a different graph; a dense file of this "
-                       "family runs the whole graph";
-            return false;
+        // (`post_ffw_norm_1` on the MLP, `pre_ffw_norm_2`/`post_ffw_norm_2` on
+        // the experts) and a router that reads a WEIGHTLESS norm of the
+        // attention output scaled by `ffn_gate_inp.scale`. The generic path
+        // norms ONE row, runs one bank and adds the result straight back, so
+        // running a routed file through it is a fluent wrong model. The three
+        // norms are required, not optional: an absent one means either a
+        // truncated file or a family this branch does not describe.
+        const bool g4_routed = L.moe && cfg_.moe_two_branch;
+        if (g4_routed) {
+            L.ffn_pre_norm2 = upload_f32(blk_key("blk.%d.pre_ffw_norm_2.weight", l));
+            L.ffn_post_norm1 = upload_f32(blk_key("blk.%d.post_ffw_norm_1.weight", l));
+            L.ffn_post_norm2 = upload_f32(blk_key("blk.%d.post_ffw_norm_2.weight", l));
+            L.router_scale = upload_f32(blk_key("blk.%d.ffn_gate_inp.scale", l));
+            if (!L.ffn_pre_norm2 || !L.ffn_post_norm1 || !L.ffn_post_norm2 ||
+                !L.router_scale) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " is a routed layer of this family but is missing "
+                           "one of pre_ffw_norm_2 / post_ffw_norm_1 / "
+                           "post_ffw_norm_2 / ffn_gate_inp.scale -- the two-"
+                           "branch MoE shape cannot run without all four";
+                return false;
+            }
         }
-        if (!L.moe && has_dense_ffn) {
+        if ((!L.moe || g4_routed) && has_dense_ffn) {
             // GPT-2's MLP is up -> gelu -> down. There is no gate tensor, and
             // asking for one would fail the load on a file that is complete;
             // reading ffn_up as a gate instead would halve the intermediate
@@ -2909,7 +2916,11 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 L.wup = need(blk_key("blk.%d.ffn_up.weight", l));
             }
             L.wdown = need(blk_key("blk.%d.ffn_down.weight", l));
-        } else if (L.moe) {
+        }
+        // Not `else if`: gemma4's routed layer carries BOTH the dense FFN (its
+        // shared branch) and the expert bank, so the two blocks run one after
+        // the other when the arch says so.
+        if (L.moe) {
             // The router is small and always resident. The routed experts are
             // only *described* here — nothing is uploaded, which is what keeps
             // a 235B-A22B model from needing 235B of VRAM at load time.
@@ -4492,6 +4503,10 @@ void Model::unload() {
         if (L.attn_norm) be_->release(L.attn_norm);
         if (L.attn_post_norm) be_->release(L.attn_post_norm);
         if (L.ffn_post_norm) be_->release(L.ffn_post_norm);
+        if (L.ffn_pre_norm2) be_->release(L.ffn_pre_norm2);
+        if (L.ffn_post_norm1) be_->release(L.ffn_post_norm1);
+        if (L.ffn_post_norm2) be_->release(L.ffn_post_norm2);
+        if (L.router_scale) be_->release(L.router_scale);
         if (L.ffn_norm) be_->release(L.ffn_norm);
         if (L.attn_norm_2) be_->release(L.attn_norm_2);
         if (L.attn_norm_2_bias) be_->release(L.attn_norm_2_bias);

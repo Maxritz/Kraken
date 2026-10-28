@@ -58,7 +58,7 @@ table, refused with a reason. `—` = not in the table yet.
 | Qwen3.5-MoE, dense Qwen-3.5 | `qwen35moe`, `qwen35` | ✓ | |
 | Qwen-3.8-Flash-Next | `qwen4exp` (alias `qwen38`) | ✓ | hyper-connections + n-gram PLE |
 | Qwen3-VL / Qwen2-VL | `qwen3vl`, `qwen2vl` | △ | text tower runs, vision tower not read |
-| Gemma3 / Gemma4 | `gemma3`, `gemma4` | △ / ✓ | gemma4 dense runs; the routed (26B/31B) variant is refused by file |
+| Gemma3 / Gemma4 | `gemma3`, `gemma4` | ✓ | dense and routed forms both run (routed = two branches, three norms, detached router input) |
 | Gemma4 assistant | `gemma4-assistant` | — | draft-head schema, absent |
 | DeepSeek-V3 | `deepseek2` | ✓ | MLA |
 | DeepSeek-V4 / V4-Flash-Vision-Exp / V4.1 | `deepseek4`, `deepseek41` | △ | compressed attention + sparse indexer read; streams/multi-sequence open |

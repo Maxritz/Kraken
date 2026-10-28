@@ -329,6 +329,20 @@ struct ArchSpec {
     // A per-layer scalar (`blk.N.layer_output_scale`) multiplied into the
     // residual at the end of the block.
     bool layer_out_scale = false;
+    // gemma4's routed layers are NOT the generic MoE block. A routed layer
+    // keeps its dense FFN as the SHARED branch and adds two norms around the
+    // expert branch:
+    //
+    //   mlp  = post_ffw_norm_1( gelu(gate*n1) * (up*n1) )      n1 = ffn_norm(x)
+    //   moe  = post_ffw_norm_2( experts( pre_ffw_norm_2(x) ) )
+    //   out  = post_ffw_norm( mlp + moe ) + x
+    //
+    // and the router reads a WEIGHTLESS norm of x scaled by 1/sqrt(n_embd) and
+    // then elementwise by `ffn_gate_inp.scale` -- not the normed row the
+    // experts see. The generic block norms one row, runs one bank and adds the
+    // result straight back, so a routed file of this family through it is a
+    // fluent wrong model rather than a failure.
+    bool moe_two_branch = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.
