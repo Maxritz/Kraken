@@ -818,6 +818,10 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // nothing said which part of it a slow start was spending.
     {
     KRK_TIME_HOST("load.model");
+    // Before load(): the template is resolved while the metadata is being
+    // read, so an override has to be in hand by then.
+    if (!cfg.chat_template.empty())
+        model_.set_chat_template_override(cfg.chat_template);
     if (!model_.load(*be_, cfg.model_path, err)) {
         model_.unload();
         be_ = nullptr;
@@ -6131,6 +6135,25 @@ bool Engine::head_prime(i64 pos, std::string *why) {
     head_fed_ = pos;
     head_prime_ms_ += t.ms();
     return true;
+}
+
+// A chat template that emits `bos_token` (Llama-3, Gemma and Mistral all do)
+// has already opened the sequence. Adding the tokenizer's special token on top
+// puts a second BOS in the KV cache -- it shifts every logit, and you cannot
+// see it by eyeballing the rendered text, only in the ids. So: if the prompt
+// already starts with the BOS piece, do not add it again.
+int Engine::tokenize_prompt(const std::string &prompt, std::vector<i32> &ids) const {
+    const bool prompt_has_bos = tok_.starts_with_bos(prompt);
+    if (prompt_has_bos) {
+        // llama.cpp warns here and then keeps both BOS tokens. We take the
+        // other branch: a template that opens with BOS was written by the model
+        // author against the transcript they trained on, and a doubled marker
+        // is never part of it. Say so in debug, so a logit comparison against
+        // llama.cpp has an explanation rather than a mystery.
+        KRK_DEBUG("prompt starts with '%s' (BOS) -- not adding a second one",
+                  tok_.piece(tok_.bos()).c_str());
+    }
+    return tok_.encode(prompt, ids, !prompt_has_bos);
 }
 
 bool Engine::generate_speculative_head(const GenerateParams &p, GenerateResult *res,
@@ -11728,7 +11751,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     // ---- tokenize ---------------------------------------------------------
     // Timed inside Tokenizer::encode, which covers every caller.
     std::vector<i32> ids;
-    if (tok_.encode(p.prompt, ids, true) < 0) return false;
+    if (tokenize_prompt(p.prompt, ids) < 0) return false;
     if (ids.empty()) {
         KRK_ERROR("prompt encoded to zero tokens");
         return false;

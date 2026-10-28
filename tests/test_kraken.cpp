@@ -49,6 +49,7 @@
 #include "krk/vram_guard.hpp"
 #include "krk/h2d_probe.hpp"
 #include "krk/arch.hpp"
+#include "krk/chat_template.hpp"
 #include "krk/draft_head.hpp"
 #include "krk/spec_sampling.hpp"
 #include "krk/backend.hpp"
@@ -2601,6 +2602,10 @@ struct MoeSpec {
     int n_expert_used = 2;
     bool shared = true;   // Qwen2-MoE style always-on shared expert
     bool varied = true;   // false => every expert identical to the dense FFN
+    // Jinja program to write as `tokenizer.chat_template`, exactly as a real
+    // file would carry it. Empty means the fixture declares no template, which
+    // is the builtin-fallback case.
+    std::string chat_template;
 };
 
 static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
@@ -2612,6 +2617,8 @@ static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
     GgufBuilder b;
     b.meta_str("general.architecture", arch);
     b.meta_str("general.name", "kraken-moe-test");
+    if (!s.chat_template.empty())
+        b.meta_str("tokenizer.chat_template", s.chat_template);
     b.meta_u32("general.alignment", 32);
     b.meta_u32(arch + ".block_count", 1);
     b.meta_u32(arch + ".context_length", ctx);
@@ -4495,6 +4502,291 @@ static std::vector<std::string> split_names(const std::string &s) {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Chat templates
+//
+// The layout a chat model was trained on is not formatting: the markers are
+// special tokens the model attends to as structure, and a checkpoint fed
+// another family's markers answers a prompt it never saw. That is why these
+// tests compare the EXACT BYTES a real template must produce, taken from the
+// template sources llama.cpp and the model authors ship -- a renderer that
+// "works" but emits a stray newline is wrong in a way no smoke test catches.
+//
+// The interpreter is also the one place where a silent failure would be
+// invisible: a template that parses but hits an unknown filter at turn three
+// must FAIL BY NAME, so the loader can fall back to a builtin instead of
+// shipping a prompt nobody authored. Both halves are pinned below.
+// ---------------------------------------------------------------------------
+static std::string render1(const std::string &tmpl,
+                           const std::vector<ChatMessage> &msgs,
+                           bool add_prompt = true,
+                           const std::string &bos = "<s>",
+                           const std::string &eos = "</s>") {
+    std::string out, err;
+    if (!render_chat_prompt(tmpl, msgs, add_prompt, bos, eos, &out, &err)) {
+        std::fprintf(stderr, "  (render: %s)\n", err.c_str());
+        return "<FAILED: " + err + ">";
+    }
+    return out;
+}
+
+static void test_chat_template_builtins() {
+    using krk::render_chat_prompt;
+    using krk::ChatMessage;
+
+    // ---- ChatML (Qwen, and this engine's own builtin default) -------------
+    {
+        const std::string t = builtin_chat_template_by_name("chatml");
+        CHECK(!t.empty(), "chatml is a builtin by name");
+        const std::string got =
+            render1(t, {{"system", "S"}, {"user", "U"}});
+        const std::string want =
+            "<|im_start|>system\nS<|im_end|>\n"
+            "<|im_start|>user\nU<|im_end|>\n"
+            "<|im_start|>assistant\n";
+        CHECK(got == want, "chatml renders the exact bytes");
+        if (got != want) std::fprintf(stderr, "  got:  %s\n", got.c_str());
+        // Without the generation prompt the trailing header must vanish: a
+        // transcript scored as a completion may not end on "assistant".
+        const std::string no =
+            render1(t, {{"user", "U"}}, false);
+        CHECK(no == "<|im_start|>user\nU<|im_end|>\n",
+              "... and add_generation_prompt=false omits the header");
+    }
+
+    // ---- Llama 3 ----------------------------------------------------------
+    // Exercises: {% set %} inside a loop, a filter on a NAME (`content | trim`),
+    // `loop.index0`, and the bos prefix on the first turn only.
+    {
+        const std::string t = builtin_chat_template_by_name("llama3");
+        const std::string got =
+            render1(t, {{"system", "S"}, {"user", "  U  "}});
+        const std::string want =
+            "<s><|start_header_id|>system<|end_header_id|>\n\nS<|eot_id|>"
+            "<|start_header_id|>user<|end_header_id|>\n\nU<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n";
+        CHECK(got == want, "llama3 renders the exact bytes");
+        if (got != want) std::fprintf(stderr, "  got:  %s\n", got.c_str());
+        // The trim is the thing that proves the filter bound to the NAME and
+        // not to the whole `'...' + content` expression: with the wrong
+        // precedence the marker would be trimmed instead of the content.
+        CHECK(got.find("\n\nU<|eot_id|>") != std::string::npos,
+              "... and the filter trimmed the CONTENT, not the markers");
+    }
+
+    // ---- Gemma ------------------------------------------------------------
+    {
+        const std::string t = builtin_chat_template_by_name("gemma");
+        const std::string got = render1(t, {{"user", "hi"}});
+        const std::string want =
+            "<s><start_of_turn>user\nhi<end_of_turn>\n<start_of_turn>model\n";
+        CHECK(got == want, "gemma renders the exact bytes");
+        if (got != want) std::fprintf(stderr, "  got:  %s\n", got.c_str());
+        // Gemma's template RAISES on a system role. The renderer's documented
+        // recovery is to fold the system text into the first user turn -- and
+        // the result must still be a legal Gemma transcript, not ChatML.
+        const std::string merged =
+            render1(t, {{"system", "be nice"}, {"user", "hi"}});
+        CHECK(merged ==
+                  "<s><start_of_turn>user\nbe nice\n\nhi<end_of_turn>\n"
+                  "<start_of_turn>model\n",
+              "... and a system message is folded into the first user turn");
+        if (merged.rfind("<s><start_of_turn>", 0) != 0)
+            std::fprintf(stderr, "  merged: %s\n", merged.c_str());
+    }
+
+    // ---- Phi-3 ------------------------------------------------------------
+    {
+        const std::string t = builtin_chat_template_by_name("phi3");
+        const std::string got =
+            render1(t, {{"system", "S"}, {"user", "U"}});
+        CHECK(got ==
+                  "<|system|>\nS<|end|>\n<|user|>\nU<|end|>\n<|assistant|>\n",
+              "phi3 renders the exact bytes");
+    }
+
+    // ---- Mistral, and the alternation check its template performs ---------
+    {
+        const std::string t = builtin_chat_template_by_name("mistral");
+        const std::string got =
+            render1(t, {{"user", "U"}, {"assistant", "A"}});
+        CHECK(got == "<s>[INST] U [/INST]A</s>",
+              "mistral renders the exact bytes");
+        if (got != "<s>[INST] U [/INST]A</s>")
+            std::fprintf(stderr, "  got:  %s\n", got.c_str());
+        // Two user turns in a row is the conversation the template rejects.
+        std::string out, err;
+        const bool ok = render_chat_prompt(
+            t, {{"user", "U1"}, {"user", "U2"}}, true, "<s>", "</s>", &out,
+            &err);
+        CHECK(!ok, "mistral's alternation check rejects two user turns");
+        CHECK(err.find("alternate") != std::string::npos,
+              "... and the error is the template's own words, not a generic one");
+    }
+
+    // ---- selection by family ---------------------------------------------
+    // The arch/pre pair is what a file declares, and the mapping has to send a
+    // family to ITS layout. Getting this wrong is the silent failure this whole
+    // module exists for, so every family this engine supports is checked.
+    {
+        struct Case {
+            const char *arch;
+            const char *pre;
+            const char *want;
+        };
+        const Case cases[] = {
+            {"llama", "llama-bpe", "llama3"},
+            {"llama", "llama3", "llama3"},
+            {"gemma3", "gemma3", "gemma"},
+            {"gemma4", "", "gemma"},
+            {"phi3", "", "phi3"},
+            {"phimoe", "", "phi3"},
+            {"phi3moe", "", "phi3"},
+            {"glm4", "", "glm4"},
+            {"glm4moe", "", "glm4"},
+            {"deepseek2", "deepseek", "deepseek"},
+            {"mistral", "", "mistral"},
+            {"qwen3", "qwen2", "chatml"},
+            {"qwen38", "qwen35", "chatml"},
+            {"chatglm", "", "chatml"},
+            {"minicpm3", "", "chatml"},
+            {"mamba", "", "chatml"},
+        };
+        for (const Case &c : cases) {
+            const std::string got = builtin_chat_template_name(c.arch, c.pre);
+            if (got != c.want)
+                std::fprintf(stderr, "  %s/%s -> %s (wanted %s)\n", c.arch,
+                             c.pre, got.c_str(), c.want);
+            CHECK(got == c.want, "the family maps to its own layout");
+        }
+        CHECK(std::string(builtin_chat_template_name("", "")) == kBuiltinDefault,
+              "an unknown family gets the default rather than nothing");
+    }
+
+    // --- the markers a streaming CLI hides --------------------------------
+    // The display must drop the marker the model actually closes turns with,
+    // not a fixed one. ChatML's `<|im_end|>` was hardcoded once, so a Llama-3
+    // reply ended with a visible `<|eot_id|>`.
+    {
+        using krk::chat_turn_markers;
+        const std::string c = render1(builtin_chat_template_by_name("chatml"),
+                                      {{"user", "U"}});
+        const std::vector<std::string> cm = chat_turn_markers(c);
+        CHECK(std::find(cm.begin(), cm.end(), "<|im_end|>") != cm.end(),
+              "chatml transcripts hide <|im_end|>");
+        const std::string l3 = render1(builtin_chat_template_by_name("llama3"),
+                                       {{"user", "U"}});
+        const std::vector<std::string> lm = chat_turn_markers(l3);
+        CHECK(std::find(lm.begin(), lm.end(), "<|eot_id|>") != lm.end(),
+              "llama3 transcripts hide <|eot_id|>");
+        CHECK(std::find(lm.begin(), lm.end(), "<|im_end|>") == lm.end(),
+              "and do not hide a marker the layout never wrote");
+        const std::string gm = render1(builtin_chat_template_by_name("gemma"),
+                                       {{"user", "U"}});
+        const std::vector<std::string> gmm = chat_turn_markers(gm);
+        CHECK(std::find(gmm.begin(), gmm.end(), "<end_of_turn>") != gmm.end(),
+              "gemma transcripts hide <end_of_turn>");
+    }
+}
+static void test_chat_template_language() {
+    using krk::render_chat_prompt;
+    using krk::ChatMessage;
+    const std::vector<ChatMessage> one = {{"user", "x"}};
+    auto R = [&](const std::string &t,
+                 const std::vector<ChatMessage> &m = {}) {
+        return render1(t, m.empty() ? one : m);
+    };
+
+    // Each of these is a construct real templates use, and the expected string
+    // is what Jinja produces: precedence, whitespace control and loop state are
+    // all pinned by exact output rather than by "it produced something".
+    CHECK(R("{{ 1 + 2 * 3 }}") == "7", "arithmetic honours precedence");
+    CHECK(R("{{ 'a' + 'b' }}") == "ab", "strings concatenate with +");
+    CHECK(R("{{ 'a' ~ 1 ~ 'b' }}") == "a1b", "~ stringifies and concatenates");
+    CHECK(R("{{ 'x' if true else 'y' }}") == "x", "conditional expressions");
+    CHECK(R("{{ 'x' if false else 'y' }}") == "y",
+          "... and take the other branch");
+    CHECK(R("{% if 1 in [1, 2] %}in{% endif %}") == "in", "the 'in' operator");
+    CHECK(R("{% if 3 not in [1, 2] %}out{% endif %}") == "out",
+          "and 'not in'");
+    CHECK(R("{% for i in range(3) %}{{ i }}{% endfor %}") == "012", "range()");
+    CHECK(R("{% for i in range(3) %}{{ loop.index }}{{ loop.revindex }}"
+            "{% endfor %}") == "132231",
+          "loop.index/revindex count from 1, revindex from the end");
+    CHECK(R("{% for i in range(3) %}{% if loop.first %}F{% endif %}"
+            "{% endfor %}") == "F", "loop.first only on the first turn");
+    CHECK(R("{% for i in range(3) %}{% if loop.last %}L{% endif %}"
+            "{% endfor %}") == "L", "loop.last only on the last turn");
+    CHECK(R("{% for i in range(5) %}{% if i == 2 %}{% break %}{% endif %}"
+            "{{ i }}{% endfor %}") == "01", "break stops the loop");
+    CHECK(R("{% for i in range(4) %}{% if i == 1 %}{% continue %}{% endif %}"
+            "{{ i }}{% endfor %}") == "023", "continue skips one turn");
+    CHECK(R("{% for i in [] %}{% else %}none{% endfor %}") == "none",
+          "a for/else else runs on an empty list");
+    CHECK(R("{% set x = 'v' %}{{ x }}") == "v", "set binds a name");
+    CHECK(R("{%- if true -%}   pad   {%- endif -%}") == "pad",
+          "-%} trims the whitespace on both sides");
+    CHECK(R("{% for m in messages %}{{ m['role'] }};{% endfor %}") ==
+              "user;",
+          "subscript with a string key reads a dict field");
+    CHECK(R("{% for m in messages %}{{ m.role }};{% endfor %}") == "user;",
+          "... and attribute access reads the same field");
+    CHECK(R("{{ messages[1:] | length }}",
+            {{"user", "a"}, {"assistant", "b"}}) == "1",
+          "slices work on lists, and drop the head they name");
+    CHECK(R("{{ undefined_name | default('d') }}") == "d",
+          "default catches an undefined name");
+    CHECK(R("{{ undefined_name }}") == "",
+          "an undefined name renders as empty, as Jinja's does");
+    CHECK(R("{% if undefined_name is not defined %}u{% endif %}") == "u",
+          "is defined / is not defined");
+    CHECK(R("{{ {'a': 1} | tojson }}") == "{\"a\": 1}",
+          "tojson escapes a dict");
+    CHECK(R("{{ 'a\"b' | tojson }}") == "\"a\\\"b\"",
+          "tojson escapes quotes");
+    CHECK(R("{{ '  x  ' | trim }}") == "x", "the trim filter");
+    CHECK(R("{% set ns = namespace(v=0) %}{% for i in range(3) %}"
+            "{% set ns.v = ns.v + i %}{% endfor %}{{ ns.v }}") == "3",
+          "namespace() survives a loop, which is why templates reach for it");
+    CHECK(R("{% for k, v in {'a': 1}.items() %}{{ k }}={{ v }}{% endfor %}") ==
+              "a=1",
+          "dict .items() destructures into two names");
+    CHECK(R("{{ 'a,b'.split(',') | join('-') }}") == "a-b",
+          "string methods chain into filters");
+    CHECK(R("{{ 'abc'.startswith('ab') }}") == "True",
+          "method calls return Jinja-typed values");
+    CHECK(R("{{ 7 // 2 }} {{ 7 % 2 }}") == "3 1",
+          "integer division and modulo");
+    // f2/f4 are false, so a conditional on them must not render f1: the
+    // point is that `==` against a missing key is false, not undefined-dirty.
+    CHECK(R("{% if messages[0]['nope'] == 'x' %}y{% else %}n{% endif %}") ==
+              "n",
+          "a missing dict key compares false rather than erroring");
+
+    // ---- the named failure ------------------------------------------------
+    // A template outside the subset must come back with the construct NAMED.
+    // That is the difference between a loader that can fall back and one that
+    // ships a prompt nobody authored.
+    {
+        std::string why;
+        CHECK(!chat_template_supported("{% macro f() %}x{% endmacro %}", &why),
+              "a macro is outside the subset");
+        CHECK(why.find("macro") != std::string::npos,
+              "... and the reason names it");
+        CHECK(!chat_template_supported("{{ x | selectattr('a') }}", &why),
+              "selectattr is outside the subset");
+        CHECK(why.find("selectattr") != std::string::npos,
+              "... and that one is named too");
+        CHECK(!chat_template_supported("{% include 'x.jinja' %}", &why),
+              "include is outside the subset");
+        CHECK(!chat_template_supported("{{ ", &why),
+              "an unterminated tag is rejected");
+        CHECK(chat_template_supported(
+                  "{% for m in messages %}{{ m['content'] }}{% endfor %}", &why),
+              "a template inside the subset is accepted");
+    }
+}
+
 static void test_arch_table() {
     // The table is the only place an arch string is spelled out, so its own
     // invariants are worth checking: names distinct, every non-Yes entry
@@ -5058,6 +5350,24 @@ static void test_tokenizer_spm_and_bpe() {
         std::vector<i32> ids;
         CHECK(tok.encode("the", ids, true) > 0, "SPM encodes");
         CHECK(!ids.empty() && ids[0] == 1, "SPM prepends bos");
+        // A chat template that emits bos_token has already opened the
+        // sequence. Rendering Llama-3's layout and then encoding it with
+        // add_special would put two BOS tokens in the KV cache.
+        CHECK(tok.starts_with_bos("<s>the"), "a prompt opening with the BOS piece is detected");
+        CHECK(!tok.starts_with_bos("the"), "a plain prompt is not detected as BOS-led");
+        CHECK(!tok.starts_with_bos(""), "an empty prompt is not BOS-led");
+        std::vector<i32> led, led_special;
+        CHECK(tok.encode("<s>the", led, !tok.starts_with_bos("<s>the")) > 0,
+              "BOS-led prompt encodes");
+        CHECK(tok.encode("<s>the", led_special, true) > 0,
+              "BOS-led prompt encodes with add_special");
+        // Vocab-independent form of the rule: honouring add_special on a
+        // BOS-led prompt yields exactly one more BOS than not honouring it.
+        const int n_led = static_cast<int>(std::count(led.begin(), led.end(), tok.bos()));
+        const int n_special =
+            static_cast<int>(std::count(led_special.begin(), led_special.end(), tok.bos()));
+        CHECK(n_special == n_led + 1,
+              "add_special on a BOS-led prompt adds exactly one extra BOS");
         const std::string back = tok.decode(ids.data() + 1,
                                             static_cast<int>(ids.size()) - 1);
         CHECK(back.find("the") != std::string::npos, "SPM round trips 'the'");
@@ -5471,6 +5781,62 @@ static void test_moe_schema_and_laziness() {
         std::string err;
         CHECK(m.load(*cpu, kMoeTestPath, &err), "loaded the synthetic MoE model");
         if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+        // No template in the file: the engine supplies one for the family and
+        // says which, so a caller never has to guess the turn layout.
+        CHECK(m.chat_template().empty(), "a file with no template carries none");
+        CHECK(m.chat_template_source() != std::string("file"),
+              "the layout comes from the builtin, not the file");
+        CHECK(!m.chat_template_or_builtin().empty(),
+              "and the builtin layout is non-empty");
+
+    // --- the file's own template, read and run -----------------------------
+    // The layout is part of the model: the file says how its turns are
+    // delimited, and the engine has to obey it rather than impose ChatML. This
+    // arm is the whole point of the feature, exercised through a real GGUF.
+    {
+        const std::string path = "kraken-moe-chat-template.gguf";
+        MoeSpec cs = vs;
+        cs.chat_template =
+            "{% for message in messages %}{{ '<|start_header_id|>' + message['role'] + "
+            "'<|end_header_id|>\\n\\n' + message['content'] + '<|eot_id|>' }}"
+            "{% endfor %}{% if add_generation_prompt %}"
+            "{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}{% endif %}";
+        CHECK(build_tiny_moe_model(path, cs), "wrote a file that carries a template");
+        Backend *cpu2 = make_cpu_backend();
+        Model m2;
+        std::string err2;
+        CHECK(m2.load(*cpu2, path, &err2), "the templated file loads");
+        CHECK(m2.chat_template_source() == std::string("file"),
+              "the source is the file, not the builtin");
+        CHECK(m2.chat_template() == cs.chat_template,
+              "the program is kept verbatim");
+        const std::string got = render1(m2.chat_template(), {{"user", "hi"}});
+        CHECK(got == "<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"
+                     "<|start_header_id|>assistant<|end_header_id|>\n\n",
+              "and it renders the layout the file declares");
+        delete cpu2;
+    }
+
+    // --- a template outside the subset falls back, loudly -------------------
+    // `macro` is not in the subset. Silently ignoring it would mean the first
+    // user request fails instead of load, so the decision is made at load and
+    // the builtin takes over.
+    {
+        const std::string path = "kraken-moe-macro-template.gguf";
+        MoeSpec cs = vs;
+        cs.chat_template = "{% macro turn(role) %}{{ role }}{% endmacro %}";
+        CHECK(build_tiny_moe_model(path, cs), "wrote a file with an unsupported template");
+        Backend *cpu3 = make_cpu_backend();
+        Model m3;
+        std::string err3;
+        CHECK(m3.load(*cpu3, path, &err3), "an unsupported template does not fail the load");
+        CHECK(m3.chat_template().empty(), "its template is not adopted");
+        CHECK(m3.chat_template_source() != std::string("file"),
+              "the builtin is used instead");
+        CHECK(!m3.chat_template_or_builtin().empty(),
+              "and there is still a layout to render with");
+        delete cpu3;
+    }
         const ModelConfig &mc = m.cfg();
         CHECK(mc.is_moe, "model is detected as MoE");
         CHECK(mc.n_expert == 4, "expert_count parsed");
@@ -19311,6 +19677,8 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_hadamard_act)
     TEST_GROUP(test_iq_family_structure)
     TEST_GROUP(test_vec_dot)
+    TEST_GROUP(test_chat_template_builtins)
+    TEST_GROUP(test_chat_template_language)
     TEST_GROUP(test_arch_table)
     TEST_GROUP(test_arch_tensor_maps)
     TEST_GROUP(test_load_verdict)

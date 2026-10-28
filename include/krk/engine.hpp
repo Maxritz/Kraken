@@ -28,6 +28,10 @@ class DflashDraft;
 
 struct EngineConfig {
     std::string model_path;
+    // A chat template to use INSTEAD of the file's (`--chat-template NAME`,
+    // where NAME is a builtin, or a path to a .jinja file). Empty keeps the
+    // file's own, which is what a file that carries one should always get.
+    std::string chat_template;
     i32 n_ctx = 4096;        // KV capacity (tokens)
     // Prompt tokens per batched forward. 512 because the routed expert set is
     // re-read once per chunk: 35B-A3B at a 4096-token prompt measured 397.1
@@ -569,6 +573,13 @@ public:
     // verdict is a hit rate of 100% or 0% and says nothing on its own.
     const H2dProbeTally &h2d_tally() const { return h2d_tally_; }
     const Tokenizer &tokenizer() const { return tok_; }
+
+    // The one place that decides how a prompt string becomes token ids, so the
+    // `--tokenize` dump cannot disagree with what `generate()` actually feeds
+    // the model. The rule that matters: a chat template which emitted
+    // `bos_token` has already opened the sequence, so `add_special` must not
+    // add a second BOS.
+    int tokenize_prompt(const std::string &prompt, std::vector<i32> &ids) const;
     // Debug: logits from the most recent forward (n_vocab floats).
     const f32 *last_logits() const { return logits_host_; }
     // Test hook, qwen4exp only: the hyper-connection lane stack after the last

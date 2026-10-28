@@ -243,7 +243,7 @@ command line was wrong. A refused GGUF is a load-time verdict and not a crash.
 The test suite needs no GPU:
 
 ```sh
-build-hip/kraken-tests.exe     # 4796/4796 checks on the CPU-only build
+build-hip/kraken-tests.exe     # 5773/5773 checks on the CPU-only build
 ```
 
 There is also an OpenAI-compatible HTTP server, `kraken-server`, which the long
@@ -254,6 +254,78 @@ many tokens that was. Measured on a 21-token prompt, the second identical reques
 went from 135 ms to 27 ms with byte-identical text. A request that fails clears
 the cache entry rather than leaving rows behind that a later prompt would assume
 were its own.
+
+### Chat templates
+
+`--chat` used to wrap the prompt in ChatML, and so did the server. ChatML is
+Qwen's layout. Handing it to a Llama-3, Gemma, Phi-3 or Mistral checkpoint gives
+the model markers it never saw during training, and the result reads as a much
+dumber model rather than as a bug — the failure is silent, and it is the kind
+that makes people conclude a small model "can't chat".
+
+The layout is part of the model, and the file states it:
+`tokenizer.chat_template` is a Jinja program. The engine reads it and runs it.
+
+```
+kraken -m model.gguf --chat --system "Be terse." -p "Hi" --tokenize
+```
+
+`--tokenize` prints the ids the model actually receives, so the rendered
+transcript can be diffed against llama.cpp instead of inferred from the prose.
+
+**Which template is used**, in order:
+
+| source | when |
+|---|---|
+| the file's `tokenizer.chat_template` | the file carries one and it is inside the supported subset |
+| `--chat-template NAME\|PATH` | given on the command line, overriding both |
+| the builtin for the family | the file carries none, or its template is outside the subset |
+
+`--chat-template` takes a builtin name or a path to a `.jinja` file. An unknown
+name that is not a readable file is a startup error, not a silent ChatML prompt.
+
+| builtin | picked for |
+|---|---|
+| `chatml` | qwen2/qwen3/qwen3.5/qwen3.8, chatglm, minicpm3, and the default |
+| `llama3` | `tokenizer.ggml.pre` = `llama-bpe` / `llama3`, or arch `llama3` |
+| `llama2` | requested by name; `[INST]` framing |
+| `mistral` | arch `mistral`, `mixtral` |
+| `gemma` | pre `gemma*`, arch `gemma*` |
+| `phi3` | arch `phi3`, `phimoe`, `phi3moe` |
+| `deepseek` | arch `deepseek2`, pre `deepseek*` |
+| `glm4` | arch `glm4`, `glm4moe` |
+
+The pre-tokenizer name is checked before the architecture because finetunes
+reuse `general.architecture = llama`; `llama-bpe` is the Llama-3 family whatever
+the arch string says.
+
+**The subset.** A turn renderer needs `if`/`elif`/`else`, `for` with
+`loop.index`, `loop.first`, `loop.last`, `break`/`continue` and `for-else`,
+`set` (including `{% set ns.x = ... %}` on a `namespace()`), `{% raw %}`,
+`{{- -}}` and `{%- -%}` whitespace control, `~`, `in`/`not in`, comparison
+chains, `//` and `%`, slicing, `.items()` destructuring, method chains,
+`default`, `tojson`, and the usual string/list filters. That is what every
+template in the target collection actually uses. A template needing `{% macro %}`,
+`selectattr` or `{% include %}` is *not* run: it is detected at load, the reason
+is logged, and the builtin takes over, so the first user request does not fail.
+
+A conversation the layout cannot express is a 400 that quotes the template —
+`chat template (file): the template rejected this conversation: roles must
+alternate` — not a fallback to some other family's markers.
+
+**One BOS.** Llama-3, Gemma and Mistral templates emit `bos_token` themselves.
+The tokenizer would add a second one, which shifts every logit and is invisible
+in the rendered text. If a prompt already starts with the BOS piece, the
+sequence marker is not added again; `KRK_DEBUG` says so, and `--tokenize` shows
+the ids.
+
+**Checks.** 32 assertions pin the exact bytes of the builtins (including
+`content | trim` binding to the name in Llama-3's header and Gemma's
+system-message fold), 38 pin the interpreter (`macro`, `selectattr`, `include`
+and an unterminated `{{` must fail by name), and two arms load a real GGUF whose
+metadata carries a template — one proving the file's program is used verbatim,
+one proving a `{% macro %}` falls back to the builtin at load instead of at the
+first request.
 
 ### Schemas, not flags
 
