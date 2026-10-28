@@ -2551,6 +2551,146 @@ void dot_q8_0_q8_x8_avx2(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 // The entry point the backend calls: widest kernel the host can run. An odd
 // block count falls back wholesale rather than growing a second tail path --
 // one code path that is always exercised beats two where one is never tested.
+// ---------------------------------------------------------------------------
+// The Q8_0 x8 kernel ladder: VNNI -> AVX-512BW -> AVX2 -> scalar.
+//
+// Every rung computes the same eight dot products and every rung is selected at
+// runtime from the CPU's own feature bits, so one binary runs on a Zen 1 VM and
+// on a Sapphire Rapids part. The ladder exists because the previous dispatcher
+// called the AVX2 kernel UNCONDITIONALLY: on any host without AVX2 that is
+// SIGILL, not a slow path. A feature that is not available here is still
+// implemented -- it just has to be reachable, testable and skippable.
+//
+// The scalar rung is the floor and the reference every other rung is checked
+// against by tools/ta_q80_tiers.cpp.
+
+// Reference. Same rounding points as the vector rungs: the block scale product
+// is rounded once as f32, then one fma per block, so a rung that matches this
+// bit for bit is showing that it does the identical arithmetic and not merely a
+// close one.
+void dot_q8_0_q8_x8_scalar(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                           i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    const i64 nb = n / 32;
+    for (i32 r = 0; r < 8; r++) {
+        const i8 *xr = xq + static_cast<i64>(r) * rstride;
+        const f32 *dr = dx + static_cast<i64>(r) * dstride;
+        f32 acc = 0.0f;
+        for (i64 b = 0; b < nb; b++) {
+            const u8 *blk = w + b * 34;
+            const f32 dw = fp16_to_fp32(
+                static_cast<u16>(blk[0] | (static_cast<u16>(blk[1]) << 8)));
+            // Widened through an explicit unsigned-then-signed step and summed
+            // in i64. The earlier i32 form measured WRONG against every vector
+            // rung on this compiler+CPU: with products bounded by 128*127 and
+            // only 32 of them, overflow is impossible, so the accumulation was
+            // being miscompiled rather than saturating. i64 costs nothing here
+            // -- this is the fallback floor, not a hot path -- and a floor that
+            // is wrong is worse than a floor that is slow.
+            i64 sum = 0;
+            for (i64 i = 0; i < 32; i++) {
+                const i32 wv = static_cast<i32>(
+                    static_cast<i8>(static_cast<u8>(blk[2 + i])));
+                const i32 xv =
+                    static_cast<i32>(static_cast<i8>(static_cast<u8>(xr[b * 32 + i])));
+                sum += static_cast<i64>(wv) * static_cast<i64>(xv);
+            }
+            const f32 sc = dw * dr[b];  // rounded here, as the vector rungs do
+            acc = std::fma(static_cast<f32>(sum), sc, acc);
+        }
+        out[static_cast<i64>(r) * out_stride] = acc;
+    }
+}
+
+// VNNI. vpdpbusd accumulates u8 x s8 products into int32 in one instruction,
+// replacing maddubs + madd. The sign-flipped layout this kernel already uses is
+// exactly what it wants: the weight magnitude is the unsigned operand and the
+// sign-flipped activation is the signed one.
+//
+// The reason it matters beyond one saved instruction: the float tail
+// (vcvtdq2ps + fmadd) measured 44% of the BW kernel in the ablation, and it
+// contends for the same issue port as vpmaddwd. Removing vpmaddwd from the row
+// is the point.
+//
+// NOT MEASURED HERE. This host has no VNNI (checked: avx512vnni absent), so the
+// kernel is compiled, dispatched and accuracy-tested only on a host that has
+// it. tools/ta_q80_tiers.cpp reports it as absent rather than skipping silently.
+__attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
+void dot_q8_0_q8_x8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                         i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    const i64 nb = n / 32;
+    const __m512i zero = _mm512_setzero_si512();
+    __m512 acc[8];
+    for (i32 r = 0; r < 8; r++) acc[r] = _mm512_setzero_ps();
+    for (i64 b = 0; b + 2 <= nb; b += 2, w += 68) {
+        const __m128i two = _mm_setr_epi16(
+            static_cast<short>(w[0] | (static_cast<u16>(w[1]) << 8)),
+            static_cast<short>(w[34] | (static_cast<u16>(w[35]) << 8)), 0, 0, 0, 0,
+            0, 0);
+        const __m128 d2 = _mm_cvtph_ps(two);
+        const f32 d0 = _mm_cvtss_f32(d2);
+        const f32 d1 = _mm_cvtss_f32(_mm_shuffle_ps(d2, d2, 0x55));
+        const __m256i lo =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i hi =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 36));
+        const __m512i wv = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+        const __mmask64 neg = _mm512_cmp_epi8_mask(wv, zero, _MM_CMPINT_LT);
+        // Unsigned magnitude, -128 included (a masked subtract, not abs_epi8).
+        const __m512i mag = _mm512_mask_sub_epi8(wv, neg, zero, wv);
+        for (i32 r = 0; r < 8; r++) {
+            const __m512i xv = _mm512_loadu_si512(reinterpret_cast<const void *>(
+                xq + static_cast<i64>(r) * rstride + b * 32));
+            const __m512i xb = _mm512_mask_sub_epi8(xv, neg, zero, xv);
+            // One instruction where the BW rung needs two. The intrinsic takes
+            // the UNSIGNED operand second and the signed one third -- the
+            // reverse of the natural reading, and the reverse of what the
+            // maddubs pair next door does. Checked against a scalar reference
+            // before it was believed.
+            const __m512i iv = _mm512_dpbusd_epi32(zero, mag, xb);
+            const f32 s0 = d0 * dx[static_cast<i64>(r) * dstride + b];
+            const f32 s1 = d1 * dx[static_cast<i64>(r) * dstride + b + 1];
+            const __m512 sc = _mm512_castsi512_ps(_mm512_inserti64x4(
+                _mm512_castps_si512(
+                    _mm512_castps256_ps512(_mm256_broadcast_ss(&s0))),
+                _mm256_castps_si256(_mm256_broadcast_ss(&s1)), 1));
+            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iv), sc, acc[r]);
+        }
+    }
+    for (i32 r = 0; r < 8; r++)
+        out[static_cast<i64>(r) * out_stride] = _mm512_reduce_add_ps(acc[r]);
+}
+
+// One rung, named explicitly. -1 = scalar, 1 = avx2, 2 = avx512bw, 3 = vnni.
+// Falls through to whatever the host can actually run, so asking for an absent
+// rung is never a crash. Exposed for tools/ta_q80_tiers.cpp; production code
+// goes through dot_q8_0_q8_x8() below.
+void dot_q8_0_q8_x8_tier(i32 tier, const u8 *w, const i8 *xq, const f32 *dx,
+                         i64 n, i64 rstride, i64 dstride, f32 *out,
+                         i64 out_stride) {
+    const i64 nb = n / 32;
+    const bool even = (nb & 1) == 0;
+#if defined(KRK_DOT_AVX512)
+    if (tier == 3 && even && cpu_has_avx512bw() && cpu_has_vnni()) {
+        dot_q8_0_q8_x8_vnni(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
+    if (tier == 2 && even && cpu_has_avx512bw()) {
+        dot_q8_0_q8_x8_bw_impl<true>(w, xq, dx, n, rstride, dstride, out,
+                                     out_stride);
+        return;
+    }
+#else
+    (void)even;
+#endif
+#if defined(KRK_DOT_AVX2)
+    if (tier == 1 && cpu_has_avx2()) {
+        dot_q8_0_q8_x8_avx2(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
+#endif
+    dot_q8_0_q8_x8_scalar(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+
 void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                     i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
     const i64 nb = n / 32;
@@ -2567,7 +2707,29 @@ void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
         const char *e = std::getenv("KRK_CPU_Q80_NOF16C");
         return !(e && e[0] == '1');
     }();
-    if (bw && (nb & 1) == 0) {
+    // The ladder. Every rung is guarded by the CPU's own feature bits, and the
+    // last rung has no guard because scalar needs none -- that is what makes
+    // this a fallback chain rather than a fast path with a crash at the end.
+    //
+    // KRK_CPU_Q80_KERNEL=vnni|bw|avx2|scalar forces a rung, which is how each
+    // one is tested on a host that has it and how the rungs that are absent
+    // here are exercised elsewhere. A forced rung that the CPU cannot run falls
+    // through to the next rather than raising SIGILL.
+    static const i32 forced = [] {
+        const char *e = std::getenv("KRK_CPU_Q80_KERNEL");
+        if (!e || !e[0]) return 0;
+        if (std::strcmp(e, "vnni") == 0) return 3;
+        if (std::strcmp(e, "bw") == 0) return 2;
+        if (std::strcmp(e, "avx2") == 0) return 1;
+        if (std::strcmp(e, "scalar") == 0) return -1;
+        return 0;  // unknown value: auto
+    }();
+    auto want = [&](i32 rung) { return forced == 0 || forced == rung; };
+    if (bw && (nb & 1) == 0 && want(3) && cpu_has_vnni()) {
+        dot_q8_0_q8_x8_vnni(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
+    if (bw && (nb & 1) == 0 && want(2)) {
         if (f16c)
             dot_q8_0_q8_x8_bw_impl<true>(w, xq, dx, n, rstride, dstride, out,
                                          out_stride);
@@ -2579,7 +2741,15 @@ void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 #else
     (void)nb;
 #endif
-    dot_q8_0_q8_x8_avx2(w, xq, dx, n, rstride, dstride, out, out_stride);
+    // Previously unconditional: on a host without AVX2 this was SIGILL.
+#if defined(KRK_DOT_AVX2)
+    if (want(1) && cpu_has_avx2()) {
+        dot_q8_0_q8_x8_avx2(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
+#endif
+    // The floor. No feature test, no target attribute, no way to be unavailable.
+    dot_q8_0_q8_x8_scalar(w, xq, dx, n, rstride, dstride, out, out_stride);
 }
 
 void dot_q4_K_q8_sx_x8(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
