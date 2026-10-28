@@ -811,6 +811,27 @@ cannot help, only overlapping it can. `docs/GEMM-PERF-WALL.md` records both
 dead ends, the two throughput modes this host flips between, and why every
 number here is quoted as a ratio.
 
+##### Hoisting the chain into L1 also loses
+
+The obvious third attempt — build the scale products for a chunk of block pairs
+into a 4 KiB stack buffer that stays in L1, so the loop reads them as plain
+loads — was built and measured. It is correct (accuracy unchanged at
+2.329e-08) and **slower in four of four interleaved pairs**, 313/334/320/339
+tok/s against 335/354/351/343 for the shipped kernel. The store-then-load
+traffic and the extra addressing cost more than the dependency it removes.
+Three attempts at the chain, three dead ends: it survives shortening *and*
+hoisting, so the remaining win has to come from doing fewer operations per MAC
+or fewer bytes per MAC, not from rearranging this one.
+
+##### Against the engine spec
+
+`docs/ENGINE-SPEC-GAP.md` maps `ENGINE_MASTER_SPEC.md` onto the code that is
+actually on disk. Its headline: the spec's MoE gap list is out of date — the
+hot-expert predictor (`moe_predictor.hpp`) and the byte-budgeted expert cache
+(`expert_cache.cpp`, LFU with aging) both exist. The real gaps are paged KV +
+continuous batching (§1.3), the two determinism-contract items in §1.2, and
+Linux read-ahead, which is the cheapest unclaimed item in the document.
+
 **What is actually left**: `objdump` shows the hot loop still spilling its eight
 zmm accumulators to the stack — `vmovaps 0xc0(%rsp),%zmm13` … `vfmadd231ps` …
 `vmovaps %zmm13,0x440(%rsp)` — 60 stack moves in a ~50-instruction body. At 5.6
