@@ -806,6 +806,12 @@ public:
 
     // out[rows, n] = rmsnorm(x[rows, n]) * w[n], computed in f32.
     //
+    // `w` may be NULL, which is the WEIGHTLESS norm -- gemma4 normalizes its
+    // value row with no gamma at all (`Vcur = ggml_rms_norm(Vcur)`), and a file
+    // of that family carries no tensor to pass here. A backend that cannot
+    // express the weightless case must still produce it exactly; the reference
+    // body drops the multiply rather than reading a fabricated vector of ones.
+    //
     // `row_exp` (nullable) is the per-row power-of-two exponent the residual
     // stream is stored under (see add_residual): row r holds x * 2^-row_exp[r],
     // and this multiplies it back before squaring, which is exact and is a
@@ -1488,6 +1494,17 @@ public:
         (void)x; (void)alpha; (void)n_tok; (void)width; (void)stride;
     }
     virtual void mul_act(void *a, const void *b, i64 n) { (void)a; (void)b; (void)n; }
+
+    // a[r][0..width) *= b[r*stride + off .. + width), for `rows` dense rows of
+    // `a`. This is `mul_act` with the second operand taken from one slice of a
+    // strided row, which is what a per-layer block of a model-projected table
+    // is: gemma4's per-layer embedding adds the layer's slice of a
+    // [n_layer x n_embd_per_layer] row to the gate, and materializing the
+    // slice per layer would be a copy of every row per layer.
+    virtual void mul_slice(void *a, const void *b, i64 rows, i64 width,
+                           i64 stride, i64 off) {
+        (void)a; (void)b; (void)rows; (void)width; (void)stride; (void)off;
+    }
 
     // ---- hyper-connections (qwen4exp) ------------------------------------
     //

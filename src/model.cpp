@@ -513,6 +513,47 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         cfg_.rms_eps = static_cast<f32>(
             gguf_.get_f64(key(".attention.layer_norm_rms_epsilon"), 1e-6));
         cfg_.rope_base = 10000.0f;
+        // llama.cpp's build_inp_embd() takes a scale for this family and it is
+        // sqrt(n_embd). It is not cosmetic: it sets the magnitude every norm in
+        // the stack sees, so a stack run without it has a residual that grows
+        // (or decays) geometrically with depth -- the run decodes, and it is
+        // not the model. The flag existed from the beginning and nothing read
+        // it; this is the read.
+        cfg_.embd_scale = std::sqrt(static_cast<f32>(cfg_.n_embd));
+    }
+    // The two gemma4 features the forward has to run. Declared by the arch, so
+    // a file is never asked for tensors its family does not carry.
+    cfg_.per_layer_embd = aspec.per_layer_embd;
+    cfg_.layer_out_scale = aspec.layer_out_scale;
+    cfg_.v_norm_weightless = aspec.v_norm_weightless;
+    // gemma4's per-layer input embeddings. The width is the FILE's
+    // (`embedding_length_per_layer_input`); the table and the projection it
+    // implies are validated against it where the tensors are bound.
+    cfg_.n_embd_per_layer = static_cast<i32>(
+        gguf_.get_i64(key(".embedding_length_per_layer_input"), 0));
+    if (aspec.per_layer_embd && cfg_.n_embd_per_layer <= 0) {
+        if (err) {
+            *err = "arch '" + a + "': the schema carries per-layer input "
+                   "embeddings but the file states no "
+                   "embedding_length_per_layer_input";
+        }
+        return false;
+    }
+    if (!aspec.per_layer_embd) cfg_.n_embd_per_layer = 0;
+    cfg_.v_norm_weightless = aspec.v_norm_weightless;
+    {
+        const i64 shared =
+            gguf_.get_i64(key(".attention.shared_kv_layers"), 0);
+        if (shared < 0 || shared >= cfg_.n_layer) {
+            if (err) {
+                *err = "arch '" + a + "': attention.shared_kv_layers is " +
+                       std::to_string(shared) + " against " +
+                       std::to_string(cfg_.n_layer) +
+                       " blocks, which cannot be honoured";
+            }
+            return false;
+        }
+        cfg_.n_kv_shared = aspec.shared_kv ? static_cast<i32>(shared) : 0;
     }
 
     // ---- gated delta net geometry (Qwen3.5 / Qwen3-Next) -----------------
@@ -1511,6 +1552,71 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // a single digit. Optional everywhere: no other family writes one.
     if (!out_bias_) out_bias_ = upload_f32("output.bias");
 
+    // ---- gemma4 per-layer input embeddings --------------------------------
+    // A different schema from the n-gram PLE above despite the tensor name:
+    // here the table is [n_layer*n_embd_per_layer, n_vocab], one wide row per
+    // token, and there is a model projection beside it. Bound only when the
+    // arch declares the flag, so a file of the other family is untouched.
+    if (cfg_.per_layer_embd) {
+        const i64 npl = cfg_.n_embd_per_layer;
+        const i64 wid = npl * cfg_.n_layer;
+        std::string pe;
+        ple_tok_embd = upload_weight("per_layer_token_embd.weight", false, &pe);
+        if (!ple_tok_embd.present()) {
+            if (err)
+                *err = "per_layer_token_embd.weight is missing (this file declares "
+                       "embedding_length_per_layer and the graph runs the "
+                       "per-layer branch)";
+            return false;
+        }
+        // Stored like the token table: ne0 is the WIDTH of one token's row and
+        // ne1 the row count, so the width is `n_in` here -- not `n_out`, which
+        // is what a weight matrix's rows would be. (Reading the two the other
+        // way round refused a correct file with "is 260 wide, expected 16".)
+        if (ple_tok_embd.n_in != wid || ple_tok_embd.n_out < cfg_.n_vocab) {
+            if (err)
+                *err = "per_layer_token_embd is [" +
+                       std::to_string(ple_tok_embd.n_in) + ", " +
+                       std::to_string(ple_tok_embd.n_out) + "], expected [" +
+                       std::to_string(wid) + ", >= " +
+                       std::to_string(cfg_.n_vocab) + "]";
+            return false;
+        }
+        ple_model_proj = upload_weight("per_layer_model_proj.weight", false, &pe);
+        if (!ple_model_proj.present()) {
+            if (err) *err = "per_layer_model_proj.weight is missing";
+            return false;
+        }
+        if (ple_model_proj.n_out != wid || ple_model_proj.n_in != cfg_.n_embd) {
+            if (err)
+                *err = "per_layer_model_proj is [" + std::to_string(ple_model_proj.n_out) +
+                       ", " + std::to_string(ple_model_proj.n_in) + "], expected [" +
+                       std::to_string(wid) + ", " + std::to_string(cfg_.n_embd) + "]";
+            return false;
+        }
+        ple_proj_norm = upload_f32("per_layer_proj_norm.weight");
+        if (!ple_proj_norm) {
+            if (err) *err = "per_layer_proj_norm.weight is missing";
+            return false;
+        }
+        // Host copy for the grouped norm: n_layer blocks of the same vector.
+        // `upload_f32` returns device or pageable memory depending on the
+        // build, so the repetition is made from a host read of it rather than
+        // aliased -- n_layer * npl floats, kilobytes.
+        ple_proj_norm_rep.resize(static_cast<size_t>(wid));
+        {
+            std::vector<f32> one(static_cast<size_t>(npl));
+            be_->download_f32(one.data(), ple_proj_norm, npl);
+            for (i64 g = 0; g < cfg_.n_layer; g++)
+                std::copy(one.begin(), one.end(),
+                          ple_proj_norm_rep.begin() + static_cast<size_t>(g * npl));
+        }
+        KRK_INFO("per-layer embd: n_layer %lld x %lld wide, model proj [%lld, %lld]",
+                 static_cast<long long>(cfg_.n_layer), static_cast<long long>(npl),
+                 static_cast<long long>(ple_model_proj.n_out),
+                 static_cast<long long>(ple_model_proj.n_in));
+    }
+
     if (cfg_.ple) {
         const GgufTensor *t = gguf_.tensor("per_layer_token_embd.weight");
         if (!t) {
@@ -1807,6 +1913,33 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
         L.attn_norm = upload_f32(blk_key("blk.%d.attn_norm.weight", l));
         L.ffn_norm = upload_f32(blk_key("blk.%d.ffn_norm.weight", l));
+        // gemma4's per-layer embedding module and its layer-output scalar.
+        // Each is a plain tensor of this family's graph, so it is bound here
+        // beside the norms rather than in the FFN branch: `inp_gate`/`proj`
+        // have no FFN role, and a loader that only looked for them under the
+        // MoE branch would drop them on a dense stack.
+        if (cfg_.per_layer_embd) {
+            L.ple_inp_gate = need(blk_key("blk.%d.inp_gate.weight", l));
+            L.ple_proj = need(blk_key("blk.%d.proj.weight", l));
+            L.ple_post_norm = upload_f32(blk_key("blk.%d.post_norm.weight", l));
+            if (!L.ple_post_norm) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " is missing post_norm.weight, which the per-layer "
+                           "embedding branch of this family normalizes with";
+                return false;
+            }
+        }
+        if (cfg_.layer_out_scale) {
+            // {1}, one scalar per layer. `TENSOR_NOT_REQUIRED` in the reference
+            // loader, so an all-ones stack legitimately carries none and the
+            // default 1.0 below is then the exact value.
+            f32 *os = upload_f32(blk_key("blk.%d.layer_output_scale.weight", l));
+            if (os) {
+                L.out_scale = *os;
+                be_->release(os);
+            }
+        }
         // Falcon-40B's second pre-attention norm. Optional: 7B has none, and
         // then the FFN's norm is attn_norm, which the fallback below aliases.
         L.attn_norm_2 = upload_f32(blk_key("blk.%d.attn_norm_2.weight", l));
@@ -3509,6 +3642,46 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     if (cfg_.rope_neox)
         KRK_INFO("rope pairing: NeoX half-split (channel j with j + %d)",
                  cfg_.rope_dim / 2);
+
+    // ---- proportional rope (gemma4's `rope_freqs`) ------------------------
+    // The file carries a per-frequency DIVISOR for the full-attention layers:
+    // llama.cpp passes it to ggml_rope_ext as `freq_factors`, which computes
+    // theta = pos * base^(-2i/d) / freq_factors[i]. Dividing the table here is
+    // the same arithmetic in the same place the other tables are built, so no
+    // kernel needs a new argument and the windowed layers -- which the file
+    // gives no factors -- keep the plain table. Both are properties of the
+    // file, read once.
+    if (const GgufTensor *rf = gguf_.tensor("rope_freqs.weight")) {
+        const i64 want = cfg_.rope_dim / 2;
+        if (rf->ne[0] != want) {
+            if (err) {
+                *err = "rope_freqs.weight is " + std::to_string(rf->ne[0]) +
+                       " wide and the rotary table is " + std::to_string(want) +
+                       "; a proportional rope of the wrong width divides the "
+                       "wrong channels";
+            }
+            return false;
+        }
+        if (static_cast<i64>(inv_freq_.size()) != want) {
+            if (err) *err = "rope_freqs.weight is present but the rotary table "
+                            "is not the size it divides";
+            return false;
+        }
+        std::vector<f32> div(static_cast<size_t>(want));
+        dequant_row(rf->type, static_cast<const u8 *>(rf->data), div.data(), want);
+        for (i64 i = 0; i < want; i++) {
+            if (!(div[static_cast<size_t>(i)] > 0.0f)) {
+                if (err) {
+                    *err = "rope_freqs.weight has a non-positive divisor at " +
+                           std::to_string(i) +
+                           "; the table would rotate by an infinite angle";
+                }
+                return false;
+            }
+            inv_freq_[static_cast<size_t>(i)] /= div[static_cast<size_t>(i)];
+        }
+        KRK_INFO("rope: proportional (%lld divisors from rope_freqs)", want);
+    }
 
     KRK_INFO("loaded %s (%s): %d layers, %d embd, %d/%d heads, hd=%d, ff=%d, vocab=%d",
              cfg_.name.c_str(), cfg_.arch.c_str(), cfg_.n_layer, cfg_.n_embd,

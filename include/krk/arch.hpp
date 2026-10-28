@@ -309,6 +309,26 @@ struct ArchSpec {
     // leaves `expert_weights_norm` false, so a file that is silent on it is
     // NOT renormalized.
     int router_w_norm = -1;
+    // ---- gemma4's per-layer input embeddings (PLE) ------------------------
+    // `per_layer_token_embd.weight` is [n_embd_per_layer * n_layer, n_vocab]:
+    // one embedding per token PER LAYER, gated into every block's output. It is
+    // not qwen4exp's n-gram PLE (a hash of the previous tokens through a conv)
+    // -- the tensor names differ and so does the graph, so the two are separate
+    // flags rather than one.
+    bool per_layer_embd = false;
+    // The value path is RMS-normalized with NO weight (gemma4's
+    // `Vcur = ggml_rms_norm(Vcur)`), which is a different function from a norm
+    // whose gamma happens to be all ones only in that there is no tensor to
+    // read: a file that carries no V norm must not be run as if it did.
+    bool v_norm_weightless = false;
+    // The last `attention.shared_kv_layers` layers write no KV of their own:
+    // they attend the cache of an earlier layer (see Model::kv_source_layer).
+    // Appending for them would be a second, never-read plane; reading their own
+    // empty plane would attend nothing.
+    bool shared_kv = false;
+    // A per-layer scalar (`blk.N.layer_output_scale`) multiplied into the
+    // residual at the end of the block.
+    bool layer_out_scale = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

@@ -5120,6 +5120,274 @@ static void test_dsv4_compressed_attention() {
 // dims. Nothing overruns (the workspace is sized for the wider geometry), the
 // text still decodes, and the model is quietly not itself. This arm pins the
 // read, on metadata alone, so it is a fact about the file and not about a run.
+// ---------------------------------------------------------------------------
+// gemma4's four own pieces, through the real forward path.
+//
+// * per-layer input embeddings: a [n_layer*npl, n_vocab] token table, a
+//   [n_embd, n_layer*npl] model projection and one small gate/proj pair per
+//   layer -- computed BEFORE the first layer, applied AFTER the FFN, exactly
+//   as the reference graph orders them;
+// * the weightless RMS norm on V (`Vcur = ggml_rms_norm(Vcur)`);
+// * the per-layer output scalar (`blk.N.layer_output_scale`);
+// * shared-KV layers: the last N read an earlier layer's plane and append
+//   nothing.
+//
+// The arms are A/Bs, not inspection: each feature is shown to MOVE the logits
+// (or, for the weightless norm, to leave them unchanged under a scaling of V
+// that only that norm can cancel), so a wiring that silently dropped one would
+// fail here rather than decode fluently.
+static bool build_gemma4_model(const std::string &path, int n_layer, int n_kv_shared,
+                               f32 v_scale, f32 out_scale, bool zero_ple) {
+    const int n_embd = 16, n_head = 2, n_kv = 1, hd = 8, n_ff = 32, vocab = 260;
+    const int ctx = 64;
+    const int npl = 4;  // embedding_length_per_layer_input
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int wid = npl * n_layer;
+    const std::string arch = "gemma4";
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-gemma4-ple");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-6f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".vocab_size", static_cast<u32>(vocab));
+    b.meta_u32(arch + ".embedding_length_per_layer_input", static_cast<u32>(npl));
+    if (n_kv_shared > 0)
+        b.meta_u32(arch + ".attention.shared_kv_layers", static_cast<u32>(n_kv_shared));
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base, f32 scale) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = scale * wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0, 1.0f));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+
+    // The per-layer table. Zeroed in the `zero_ple` arm, which makes the whole
+    // branch add exactly zero -- the control for "is it wired".
+    const f32 ple_scale = zero_ple ? 0.0f : 1.0f;
+    b.tensor_f16("per_layer_token_embd.weight", {u64(wid), u64(vocab)},
+                 vec(static_cast<size_t>(wid) * vocab, 20000, ple_scale));
+    b.tensor_f16("per_layer_model_proj.weight", {u64(n_embd), u64(wid)},
+                 vec(static_cast<size_t>(n_embd) * wid, 30000, ple_scale));
+    b.tensor_f32("per_layer_proj_norm.weight", {u64(npl)}, ones(npl));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, v_scale));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+        b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+        b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, ones(n_embd));
+        // The per-layer embedding module of this layer.
+        b.tensor_f16(p + "inp_gate.weight", {u64(n_embd), u64(npl)},
+                     vec(static_cast<size_t>(n_embd) * npl, base + 800, 1.0f));
+        b.tensor_f16(p + "proj.weight", {u64(npl), u64(n_embd)},
+                     vec(static_cast<size_t>(npl) * n_embd, base + 900, 1.0f));
+        b.tensor_f32(p + "post_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "layer_output_scale.weight", {1},
+                     std::vector<f32>{out_scale});
+    }
+    return b.write(path);
+}
+
+// One forward from a fixed prompt, returning the logits. `err` carries the
+// loader's own message so a fixture that stops loading is diagnosable.
+static bool gemma4_logits(const std::string &p, std::vector<f32> &lg,
+                          std::string &err) {
+    Backend *be = make_cpu_backend();
+    Engine e;
+    EngineConfig c;
+    c.model_path = p;
+    c.n_ctx = 64;
+    c.prefill_chunk = 8;
+    if (!e.init(be, c, &err)) return false;
+    GenerateParams gp;
+    gp.prompt = "the";
+    gp.max_tokens = 2;
+    GenerateResult r;
+    if (!e.generate(gp, &r)) return false;
+    const i32 nv = e.model().cfg().n_vocab;
+    lg.assign(e.last_logits(), e.last_logits() + nv);
+    return true;
+}
+
+static void test_gemma4_forward() {
+    const std::string base_file = "kraken-gemma4-ple.gguf";
+    CHECK(build_gemma4_model(base_file, 4, 2, 1.0f, 0.75f, false),
+          "wrote the gemma4 fixture (4 layers, 2 shared-KV, out_scale 0.75)");
+
+    Backend *cpu = make_cpu_backend();
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = base_file;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        std::string err;
+        const bool ok = e.init(cpu, c, &err);
+        if (!ok) std::fprintf(stderr, "  (gemma4 init: %s)\n", err.c_str());
+        CHECK(ok, "a gemma4 file loads and inits");
+        if (ok) {
+            const Model &m = e.model();
+            const ModelConfig &mc = m.cfg();
+            CHECK(mc.n_embd_per_layer == 4, "embedding_length_per_layer_input is read");
+            CHECK(mc.per_layer_embd && mc.layer_out_scale && mc.v_norm_weightless,
+                  "the three forward features are declared on the loaded config");
+            CHECK(m.ple_tok_embd.present() && m.ple_model_proj.present() &&
+                      m.ple_proj_norm != nullptr,
+                  "the PLE table, its projection and its norm are bound");
+            CHECK(m.layers()[0].wv.present(),
+                  "the fixture's V projection is bound (control for the V arm)");
+            CHECK(m.layers()[0].ple_inp_gate.present(),
+                  "the per-layer gate is bound");
+            CHECK(m.ple_proj_norm_rep.size() == 16,
+                  "the norm is repeated per layer for the grouped kernel");
+            CHECK(std::fabs(mc.embd_scale - std::sqrt(16.0f)) < 1e-6f,
+                  "the embedding scale is sqrt(n_embd)");
+            // Shared-KV tail: start = 4 - 2 = 2, and the rule pairs a layer
+            // with the layer `period` steps back (1 for a full layer, 2 for a
+            // windowed one). No window here, so both tail layers read layer 1.
+            CHECK(m.kv_source_layer(2) == 1 && m.kv_source_layer(3) == 1,
+                  "the shared-KV tail reads the last writing layer's plane");
+            CHECK(!m.layer_writes_kv(2) && !m.layer_writes_kv(3),
+                  "and those layers append nothing of their own");
+            CHECK(m.layer_writes_kv(0) && m.layer_writes_kv(1),
+                  "the layers before the tail write their own");
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 4;
+            GenerateResult r;
+            CHECK(e.generate(gp, &r), "it generates");
+            CHECK(r.generated > 0, "... and emits tokens");
+        }
+    }
+    delete cpu;
+
+    std::vector<f32> base_lg;
+    std::string err;
+    CHECK(gemma4_logits(base_file, base_lg, err),
+          "the base fixture produces logits");
+    if (base_lg.empty()) return;
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 d = 0.0f;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; i++) d = std::max(d, std::fabs(a[i] - b[i]));
+        return d;
+    };
+
+    // ---- the weightless V norm ------------------------------------------
+    // The value row is normalized BEFORE it reaches the cache, so what proves
+    // the wiring is the row in the cache itself: every stored value row must
+    // have RMS 1. (A logits A/B cannot see this: gemma4 RMS-normalizes each
+    // branch's OUTPUT too, which cancels any uniform scaling of V -- an arm
+    // that scaled wv and compared logits passed with the norm switched off, so
+    // it is not the test.) The plane pointer also has to be the SHARED one for
+    // the tail layers, which is the second thing this reads.
+    {
+        Backend *be = make_cpu_backend();
+        {
+        Engine e;
+        EngineConfig c;
+        c.model_path = base_file;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        std::string cerr;
+        if (e.init(be, c, &cerr)) {
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 3;
+            GenerateResult r;
+            if (e.generate(gp, &r)) {
+                const Model &m = e.model();
+                const i64 kvw = m.kv_dim_at(0);
+                // The CPU backend stores KV rows as f32 (kv_row_bytes returns
+                // kv_dim * 4 for the F16 arm), so the row is read as floats.
+                const auto *vrow0 = static_cast<const f32 *>(e.kv_plane_debug(1, 0));
+                if (vrow0) {
+                    f32 ss = 0.0f;
+                    for (i64 i = 0; i < kvw; i++) ss += vrow0[i] * vrow0[i];
+                    const f32 rms = std::sqrt(ss / static_cast<f32>(kvw));
+                    CHECK(std::fabs(rms - 1.0f) < 2e-2f,
+                          "the cached value row has RMS 1: the weightless norm ran");
+                } else {
+                    CHECK(false, "the value plane is resident");
+                }
+                CHECK(e.kv_plane_debug(0, 2) == e.kv_plane_debug(0, 1) &&
+                          e.kv_plane_debug(1, 2) == e.kv_plane_debug(1, 1),
+                      "a shared-KV layer reads the SAME plane as its source layer");
+                CHECK(e.kv_plane_debug(0, 1) != e.kv_plane_debug(0, 0),
+                      "... and that plane is not layer 0's");
+            } else {
+                CHECK(false, "the cache probe ran a forward");
+            }
+        } else {
+            CHECK(false, ("the cache probe inits: " + cerr).c_str());
+        }
+        }
+        // The backend outlives the engine: Engine::shutdown() releases its
+        // workspaces through the pointer it was given.
+        delete be;
+    }
+
+    // ---- the per-layer output scalar ------------------------------------
+    const std::string os_file = "kraken-gemma4-outscale.gguf";
+    CHECK(build_gemma4_model(os_file, 4, 2, 1.0f, 1.25f, false),
+          "wrote the out_scale twin");
+    std::vector<f32> os_lg;
+    std::string oserr;
+    if (gemma4_logits(os_file, os_lg, oserr)) {
+        CHECK(maxdiff(base_lg, os_lg) > 1e-4f,
+              "layer_output_scale changes the answer: the scalar is applied");
+    } else {
+        CHECK(false, ("out_scale twin failed to run: " + oserr).c_str());
+    }
+
+    // ---- the per-layer embedding branch ---------------------------------
+    const std::string z_file = "kraken-gemma4-zerople.gguf";
+    CHECK(build_gemma4_model(z_file, 4, 2, 1.0f, 0.75f, true),
+          "wrote the zero-PLE twin");
+    std::vector<f32> z_lg;
+    std::string zerr;
+    if (gemma4_logits(z_file, z_lg, zerr)) {
+        CHECK(maxdiff(base_lg, z_lg) > 1e-4f,
+              "zeroing the per-layer table changes the answer: the branch runs");
+    } else {
+        CHECK(false, ("zero-PLE twin failed to run: " + zerr).c_str());
+    }
+}
+
 static void test_per_layer_head_width() {
     const std::string path = "kraken-gemma4-geometry.gguf";
     {
@@ -10551,6 +10819,12 @@ static bool build_gemma_gate_model(const std::string &path, const char *arch,
         b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
         b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
         b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        // Every gemma stack from 2 on normalizes each branch's OUTPUT and adds
+        // that instead of the raw branch. The reference creates both tensors
+        // unconditionally for gemma2/3/4, so a file of this family that lacked
+        // them would be incomplete rather than an older layout.
+        b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, ones(n_embd));
         b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
                      vec(static_cast<size_t>(n_embd) * q_dim, 100 + l * 1000));
         b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
@@ -20084,6 +20358,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_chat_template_language)
     TEST_GROUP(test_dsv4_compressed_attention)
     TEST_GROUP(test_per_layer_head_width)
+    TEST_GROUP(test_gemma4_forward)
     TEST_GROUP(test_arch_table)
     TEST_GROUP(test_arch_tensor_maps)
     TEST_GROUP(test_load_verdict)

@@ -285,6 +285,55 @@ and applies no pre-attention scaling at all, which is not a tweak to
 widths, the stated pattern (`is_swa` true/false/true/false), the stack maximum,
 and `kv_dim_at` following both the width *and* the per-layer head count.
 
+### The per-layer input table, and the three pieces beside it (gemma4)
+
+gemma4 is not gemma3 with a wider head. Four parts of its graph have no
+counterpart in the rest of the gemma stack, and all four now run:
+
+* **Per-layer input embeddings.** One `[n_layer*n_embd_per_layer, n_vocab]`
+  token table and one `[n_embd, n_layer*n_embd_per_layer]` model projection,
+  evaluated **once per pass before the first layer** — the projection's output
+  spans every layer's slice, so computing it inside a layer would compute the
+  whole matrix `n_layer` times:
+
+  ```
+  proj = model_proj @ (embd * sqrt(n_embd)) * (1/sqrt(n_embd))
+  tok  = tok_table[token] * sqrt(n_embd_per_layer)
+  ple  = (rmsnorm(proj, proj_norm) + tok) * (1/sqrt(2))
+  ```
+
+  and then, **after** each layer's FFN, the layer's own `n_embd_per_layer` slice
+  is gated by `gelu(inp_gate · x)`, projected back to `n_embd` by `proj`,
+  normalized by `post_norm` and added to the residual. The slice is read through
+  `Backend::mul_slice`, which multiplies one strided block of the table rather
+  than materializing it per layer.
+* **The weightless value norm.** `Vcur = ggml_rms_norm(Vcur)` — no gamma at all.
+  `Backend::rmsnorm` takes a null weight for exactly this and drops the multiply;
+  a fabricated vector of ones would be a different function to a reader and a
+  wasted pass to the kernel.
+* **`layer_output_scale`.** One scalar per layer, multiplied into the finished
+  block output (after the per-layer residual, before the next layer).
+* **Shared-KV layers.** The last `attention.shared_kv_layers` layers write no
+  cache of their own: `Model::kv_source_layer(l)` names the earlier layer whose
+  plane they read, the plane of a shared layer is never allocated, and
+  `kv_append` is skipped for it. That is the same aliasing llama.cpp gets by
+  pointing two layers' cache tensors at one buffer.
+
+`test_gemma4_forward` runs the whole path through a real file and A/Bs each
+piece: zeroing the per-layer table moves the logits, `layer_output_scale` 1.25
+moves them, and the cached value row is read back and must have RMS 1 — which is
+the only observable that distinguishes the value norm, because gemma normalizes
+each branch's *output* too and that cancels any uniform scaling of V. (That is
+how the first version of this test was caught being vacuous: it scaled `wv` and
+compared logits, and it passed with the norm switched off.)
+
+One real bug fell out of the same work: **gemma2 and gemma3 were running without
+their branch post-norms.** Both families carry `post_attention_norm` and
+`post_ffw_norm` and add `post_norm(branch(...))` instead of the raw branch; the
+arch table never set `post_branch_norm` for them, so the loader bound neither
+tensor and the forward ran a different graph — fluently. They are set now, and
+the gemma gate fixture carries the tensors a real file of that family has.
+
 ### Compressed attention (DeepSeek-V4)
 
 A V4 layer either attends the raw latent window or the window **plus pooled
