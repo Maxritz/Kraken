@@ -5142,9 +5142,18 @@ static void test_dsv4_compressed_attention() {
 // (or, for the weightless norm, to leave them unchanged under a scaling of V
 // that only that norm can cancel), so a wiring that silently dropped one would
 // fail here rather than decode fluently.
+// `routed_mode` drives the A/B arms of the two-branch block:
+//   0 the whole routed layer
+//   1 expert banks zeroed        -> the expert branch contributes nothing
+//   2 post_ffw_norm_2 zeroed     -> the expert branch contributes nothing
+//   3 post_ffw_norm_1 zeroed     -> the shared MLP contributes nothing
+//   4 ffn_gate_inp.scale zeroed  -> every expert gets the same weight
+//   5 pre_ffw_norm_2 zeroed      -> the experts read a zero row
+// Arms 1, 2 and 5 are three independent constructions of "no expert
+// contribution" and they must agree; 3 and 4 must move the answer.
 static bool build_gemma4_model(const std::string &path, int n_layer, int n_kv_shared,
                                f32 v_scale, f32 out_scale, bool zero_ple,
-                               bool routed = false) {
+                               bool routed = false, int routed_mode = 0) {
     const int n_embd = 16, n_head = 2, n_kv = 1, hd = 8, n_ff = 32, vocab = 260;
     const int ctx = 64;
     const int npl = 4;  // embedding_length_per_layer_input
@@ -5169,6 +5178,11 @@ static bool build_gemma4_model(const std::string &path, int n_layer, int n_kv_sh
     b.meta_u32(arch + ".embedding_length_per_layer_input", static_cast<u32>(npl));
     if (n_kv_shared > 0)
         b.meta_u32(arch + ".attention.shared_kv_layers", static_cast<u32>(n_kv_shared));
+    if (routed) {
+        b.meta_u32(arch + ".expert_count", 2);
+        b.meta_u32(arch + ".expert_used_count", 2);
+        b.meta_u32(arch + ".expert_feed_forward_length", 8);
+    }
     add_spm_vocab(b, vocab, -1);
 
     auto vec = [](size_t n, i64 base, f32 scale) {
@@ -5226,22 +5240,37 @@ static bool build_gemma4_model(const std::string &path, int n_layer, int n_kv_sh
         b.tensor_f32(p + "layer_output_scale.weight", {1},
                      std::vector<f32>{out_scale});
         if (routed) {
-            // A routed gemma4 layer: the router, the two branch norms the
-            // generic MoE block does not have, and a two-expert bank. Nothing
-            // in this fixture is run -- the loader must refuse the file before
-            // a forward can read it through the wrong graph.
+            // A routed gemma4 layer. Four tensors the generic MoE block does
+            // not have (two branch norms, the experts' own input norm and the
+            // router's per-element scale) sit beside the dense FFN above, which
+            // is the SHARED branch on this layer and is loaded as well.
+            const f32 exp_scale = routed_mode == 1 ? 0.0f : 1.0f;
             b.tensor_f32(p + "ffn_gate_inp.weight", {u64(n_embd), u64(2)},
                          vec(static_cast<size_t>(n_embd) * 2, base + 1200, 1.0f));
-            b.tensor_f32(p + "ffn_gate_inp.scale", {u64(n_embd)}, ones(n_embd));
-            b.tensor_f32(p + "post_ffw_norm_1.weight", {u64(n_embd)}, ones(n_embd));
-            b.tensor_f32(p + "pre_norm_2.weight", {u64(n_embd)}, ones(n_embd));
-            b.tensor_f32(p + "post_ffw_norm_2.weight", {u64(n_embd)}, ones(n_embd));
+            b.tensor_f32(p + "ffn_gate_inp.scale", {u64(n_embd)},
+                         routed_mode == 4 ? std::vector<f32>(n_embd, 0.0f)
+                                          : ones(n_embd));
+            b.tensor_f32(p + "post_ffw_norm_1.weight", {u64(n_embd)},
+                         routed_mode == 3 ? std::vector<f32>(n_embd, 0.0f)
+                                          : ones(n_embd));
+            b.tensor_f32(p + "pre_ffw_norm_2.weight", {u64(n_embd)},
+                         routed_mode == 5 ? std::vector<f32>(n_embd, 0.0f)
+                                          : ones(n_embd));
+            b.tensor_f32(p + "post_ffw_norm_2.weight", {u64(n_embd)},
+                         routed_mode == 2 ? std::vector<f32>(n_embd, 0.0f)
+                                          : ones(n_embd));
+            // The two experts differ from each other, so a router that changes
+            // the mix changes the answer -- with identical banks every router
+            // would produce the same weighted sum.
             b.tensor_f16(p + "ffn_gate_exps.weight", {u64(n_embd), u64(8), u64(2)},
-                         vec(static_cast<size_t>(n_embd) * 8 * 2, base + 1300, 1.0f));
+                         vec(static_cast<size_t>(n_embd) * 8 * 2, base + 1300,
+                             exp_scale));
             b.tensor_f16(p + "ffn_up_exps.weight", {u64(n_embd), u64(8), u64(2)},
-                         vec(static_cast<size_t>(n_embd) * 8 * 2, base + 1400, 1.0f));
+                         vec(static_cast<size_t>(n_embd) * 8 * 2, base + 1400,
+                             exp_scale));
             b.tensor_f16(p + "ffn_down_exps.weight", {u64(8), u64(n_embd), u64(2)},
-                         vec(static_cast<size_t>(8) * n_embd * 2, base + 1500, 1.0f));
+                         vec(static_cast<size_t>(8) * n_embd * 2, base + 1500,
+                             exp_scale));
         }
     }
     return b.write(path);
@@ -5386,30 +5415,96 @@ static void test_gemma4_forward() {
         delete be;
     }
 
-    // ---- the routed variant is refused by name until its branch lands ------
-    // A routed gemma4 layer is a different graph (two separately-normed
-    // branches, router on a weightless norm). Running it through the generic
-    // MoE block would decode fluent wrong text, so the loader has to stop it --
-    // and say which shape it read.
-    {
-        const std::string moe_file = "kraken-gemma4-moe.gguf";
-        CHECK(build_gemma4_model(moe_file, 4, 0, 1.0f, 1.0f, false, true),
-              "wrote the routed gemma4 fixture");
-        Backend *be = make_cpu_backend();
-        {
-            Engine e;
-            EngineConfig c;
-            c.model_path = moe_file;
-            c.n_ctx = 64;
-            c.prefill_chunk = 8;
-            std::string merr;
-            const bool loaded = e.init(be, c, &merr);
-            CHECK(!loaded, "a routed gemma4 file is refused, not run as another graph");
-            CHECK(merr.find("pre_norm_2") != std::string::npos &&
-                      merr.find("shared MLP") != std::string::npos,
-                  "... and the refusal names the branch it would have had to run");
+    // ---- the routed form: two branches, three norms, a detached router -----
+    // gemma4's routed layer is not the generic MoE block. These arms pin each
+    // of the four pieces that differ, because every one of them produces
+    // fluent text when dropped: the shared MLP branch, the experts' own input
+    // norm, the expert branch's output norm, and the router input (a WEIGHTLESS
+    // norm of the post-attention row, scaled by 1/sqrt(n_embd) and then
+    // elementwise by ffn_gate_inp.scale).
+    const std::string moe_file = "kraken-gemma4-moe.gguf";
+    CHECK(build_gemma4_model(moe_file, 4, 0, 1.0f, 1.0f, false, true, 0),
+          "wrote the routed gemma4 fixture (4 layers, 2 experts, top-2)");
+    std::vector<f32> moe_lg;
+    std::string moe_err;
+    const bool moe_ran = gemma4_logits(moe_file, moe_lg, moe_err);
+    CHECK(moe_ran, ("the routed gemma4 file loads and runs: " + moe_err).c_str());
+    if (moe_ran) {
+        // The dense twin is the SAME file with the routed bank taken out: same
+        // layers, same shared-KV count, same output scale. A routed file that
+        // ran through the dense path would land exactly on it, so this is the
+        // arm that separates "the routed block ran" from "the FFN ran".
+        const std::string dense_twin = "kraken-gemma4-dense-twin.gguf";
+        CHECK(build_gemma4_model(dense_twin, 4, 0, 1.0f, 1.0f, false, false),
+              "wrote the dense twin (same geometry, no routed bank)");
+        std::vector<f32> twin_lg;
+        std::string twin_err;
+        if (gemma4_logits(dense_twin, twin_lg, twin_err)) {
+            CHECK(maxdiff(twin_lg, moe_lg) > 1e-4f,
+                  "the routed block is not the dense FFN: the answer moves");
+            f32 peak = 0.0f;
+            for (f32 v : moe_lg) peak = std::max(peak, std::fabs(v));
+            CHECK(peak > 1e-3f && peak < 1e6f,
+                  "the routed answer is finite and non-zero (the branch ran)");
+        } else {
+            CHECK(false, ("the dense twin runs: " + twin_err).c_str());
         }
-        delete be;
+        CHECK(moe_lg.size() == base_lg.size(), "same vocabulary as the dense file");
+
+        // Three independent ways to remove the expert branch. All three must
+        // land on the same logits, and all three must differ from the whole
+        // layer -- that is what separates "the branch ran" from "the branch was
+        // wired to nothing".
+        std::vector<f32> noexp_lg, nonorm2_lg, nopre2_lg;
+        std::string e1;
+        const std::string f1 = "kraken-gemma4-moe-noexp.gguf";
+        const std::string f2 = "kraken-gemma4-moe-nonorm2.gguf";
+        const std::string f3 = "kraken-gemma4-moe-nopre2.gguf";
+        CHECK(build_gemma4_model(f1, 4, 0, 1.0f, 1.0f, false, true, 1),
+              "wrote the zero-expert twin");
+        CHECK(build_gemma4_model(f2, 4, 0, 1.0f, 1.0f, false, true, 2),
+              "wrote the zero-post_ffw_norm_2 twin");
+        CHECK(build_gemma4_model(f3, 4, 0, 1.0f, 1.0f, false, true, 5),
+              "wrote the zero-pre_ffw_norm_2 twin");
+        const bool r1 = gemma4_logits(f1, noexp_lg, e1);
+        const bool r2 = gemma4_logits(f2, nonorm2_lg, e1);
+        const bool r3 = gemma4_logits(f3, nopre2_lg, e1);
+        CHECK(r1 && r2 && r3, "all three expert-free twins run");
+        if (r1 && r2 && r3) {
+            CHECK(maxdiff(moe_lg, noexp_lg) > 1e-4f,
+                  "zeroing the expert banks changes the answer: the bank runs");
+            CHECK(maxdiff(noexp_lg, nonorm2_lg) < 1e-5f,
+                  "a zero expert branch and a zero expert output norm agree");
+            CHECK(maxdiff(noexp_lg, nopre2_lg) < 1e-5f,
+                  "... and so does an expert branch that reads a zero row");
+        }
+
+        // The shared MLP branch: zeroing its output norm removes it, and the
+        // answer must move.
+        std::vector<f32> nomlp_lg;
+        const std::string f4 = "kraken-gemma4-moe-nomlp.gguf";
+        CHECK(build_gemma4_model(f4, 4, 0, 1.0f, 1.0f, false, true, 3),
+              "wrote the zero-post_ffw_norm_1 twin");
+        if (gemma4_logits(f4, nomlp_lg, e1)) {
+            CHECK(maxdiff(moe_lg, nomlp_lg) > 1e-4f,
+                  "zeroing the shared MLP's post norm changes the answer: it runs");
+        } else {
+            CHECK(false, ("the zero-shared-MLP twin runs: " + e1).c_str());
+        }
+
+        // The router's scale. With two different experts a reweighting changes
+        // the mix, so a scale that is read at all moves the answer -- and a
+        // scale read as a per-TOKEN scalar (or not at all) leaves it alone.
+        std::vector<f32> noscale_lg;
+        const std::string f5 = "kraken-gemma4-moe-noscale.gguf";
+        CHECK(build_gemma4_model(f5, 4, 0, 1.0f, 1.0f, false, true, 4),
+              "wrote the zero-router-scale twin");
+        if (gemma4_logits(f5, noscale_lg, e1)) {
+            CHECK(maxdiff(moe_lg, noscale_lg) > 1e-4f,
+                  "ffn_gate_inp.scale reaches the router: the mix moves");
+        } else {
+            CHECK(false, ("the zero-router-scale twin runs: " + e1).c_str());
+        }
     }
 
     // ---- the per-layer output scalar ------------------------------------

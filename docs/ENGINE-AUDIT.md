@@ -83,6 +83,7 @@ wrong.
 | `ws_qkv_`, `ws_z_`, `ws_h_`, `ws_beta_`, `ws_ssm_` | recurrent branches | `gdn_forward`, `mamba2_forward`, `lfm_conv_forward`, `recurrent_reset` | all four functions are dispatched from `model_.is_recurrent()` |
 | `ws_ebatch_`, `ws_edown_`, `ws_ebscale_`, `ws_plan_`, `ws_alpha_`, `ws_scale_`, `ws_xg_`, `ws_upg_`, `ws_gateg_`, `ws_router_`, `ws_ids_`, `ws_wts_`, `ws_off_`, `ws_ffn_`, `ws_shexp_g_` | `mc.is_moe && mc.n_expert > 0` | MoE paths only | `moe_ffn`/`moe_decode_batch` are called for `L.moe` layers, and `ws_ffn_`'s one non-MoE reader (`mtp_ffn`) is null-checked |
 | `ws_xlat_`, `ws_xlat_out_`, `ws_ffn_lat_` | `lat_w > 0` | `moe_ffn` | `latent` is computed from the same per-layer latency test |
+| `ws_g4_post_`, `ws_g4_mlp_`, `ws_router_in_` | `mc.moe_two_branch` (gemma4) | `gemma_moe_ffn` | entered only for a layer carrying `pre_ffw_norm_2`, which the loader requires exactly when the arch says `moe_two_branch` |
 | `ws_m2in_` | `mc.nemotron_moe` | `init` only | no forward use |
 | `ws_qpack_` | `q_proj_ != q_dim_` | `forward_core`, `mtp_block_forward` | both go through the same `q_proj_` handling |
 

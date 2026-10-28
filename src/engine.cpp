@@ -1571,6 +1571,18 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // first non-hybrid family to carry `ffn_gate_inp_shexp` (qwen2moe)
         // dereferenced a null pointer in its first forward.
         ws_shexp_g_ = alloc(static_cast<size_t>(C) * as);
+        // The two-branch block's own buffers. They exist only for a family that
+        // declares `moe_two_branch`, and the block that reads them is entered
+        // only on a layer of that family, so the guard and the use are the same
+        // predicate (docs/ENGINE-AUDIT.md).
+        if (mc.moe_two_branch) {
+            ws_g4_post_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+            if (!check_alloc(ws_g4_post_, "ws_g4_post")) return false;
+            ws_g4_mlp_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+            if (!check_alloc(ws_g4_mlp_, "ws_g4_mlp")) return false;
+            ws_router_in_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+            if (!check_alloc(ws_router_in_, "ws_router_in")) return false;
+        }
         if (!check_alloc(ws_shexp_g_, "ws_shexp_g")) return false;
         // ---- LatentMoE ----------------------------------------------------
         // One narrow space per forward, sized by the widest latent the file
@@ -2394,7 +2406,8 @@ void Engine::shutdown() {
                      &ws_v_, &ws_attn_, &ws_mlaqn_, &ws_mlay_, &ws_mlaa_,
                      &ws_gate_, &ws_up_, &ws_had_, &ws_logits_,
                      &ws_router_, &ws_routerp_, &ws_ids_, &ws_wts_, &ws_off_,
-                     &ws_ffn_, &ws_shexp_g_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
+                     &ws_ffn_, &ws_shexp_g_, &ws_g4_post_, &ws_g4_mlp_, &ws_router_in_,
+        &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
                      &ws_scale_, &ws_ebatch_, &ws_edown_, &ws_ebscale_,
                      &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
                      &ws_m2in_,
@@ -3995,7 +4008,11 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // whatever the previous layer left, which measured 6.2e6 into the gate
         // and 1.6e11 into the residual at L05 -- the whole reference arm past
         // that layer, and every token it emits, is that buffer's contents.
-        if (L.moe) {
+        if (L.moe && L.ffn_pre_norm2) {
+            // gemma4's routed block: two branches, three norms, a detached
+            // router input. See Engine::gemma_moe_ffn.
+            if (!gemma_moe_ffn(L, l, n)) return false;
+        } else if (L.moe) {
             if (!moe_ffn(L, l, n)) return false;
         } else if (L.wgate.present() || L.wup_fused.present()) {
             // A fused gate|up projection IS the gate: keying only on wgate
@@ -4960,7 +4977,13 @@ static bool ffn_rowscale_on() {
     return on;
 }
 
-void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
+// `dst` and `post_norm`: a two-branch family (gemma4) runs this FFN as the
+// SHARED branch of a routed layer, so its result must not go straight into the
+// residual (the block's own sum happens after the expert branch) and its output
+// norm is `post_ffw_norm_1`, not the block's `post_ffw_norm`. Null on every
+// other family, which is the graph that was here before.
+void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
+                       const f32 *post_norm) {
     KRK_TRACE_COMP("dense-ffn");
     // gate/up share the FFN-norm output: one fused launch on the decode row.
     // A folded gate/up reads the transformed copy instead; the router of a
@@ -5053,7 +5076,8 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
         had_xform(ws_had_, ws_gate_, n, n_ff_, false, false);
         gn = ws_had_;
     }
-    if (L.ffn_post_norm) {
+    const f32 *pn = post_norm ? post_norm : L.ffn_post_norm;
+    if (pn) {
         // Branch post norm: the down projection's own output is normalized
         // with the FFN branch's weight, and only then added. That costs the
         // folded residual store -- the norm has to read the projection, so the
@@ -5062,9 +5086,15 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
         gemm_w(ws_x2_, gn, L.wdown, n_embd_, n_ff_, n);
         const f32 peps =
             dmc.post_norm_eps > 0.0f ? dmc.post_norm_eps : dmc.rms_eps;
-        be_->rmsnorm(ws_x2_, ws_x2_, L.ffn_post_norm, n, n_embd_, peps, nullptr);
+        be_->rmsnorm(ws_x2_, ws_x2_, pn, n, n_embd_, peps, nullptr);
         dump_row("attn.down", l, ws_x2_, n_embd_, n);
-        be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
+        if (dst) be_->copy_act(dst, ws_x2_, static_cast<i64>(n) * n_embd_);
+        else be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
+    } else if (dst) {
+        // A branch with no norm of its own still cannot take the folded
+        // residual store, because it has no residual to store into.
+        gemm_w(dst, gn, L.wdown, n_embd_, n_ff_, n);
+        dump_row("attn.down", l, dst, n_embd_, n);
     } else {
         gemm_residual(ws_x_, gn, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n,
                       ws_x2_, L.wdown.gs);
@@ -9039,7 +9069,13 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     const bool latent = L.latent_moe() && L.experts.n_embd > 0 &&
                         L.experts.n_embd != n_embd_; 
     const i64 ew = latent ? L.experts.n_embd : n_embd_;
-    void *const xin = latent ? ws_xlat_ : ws_xn_;
+    // The routed block normally reads the FFN-normed row the caller left in
+    // `ws_xn_`. A two-branch family (gemma4) reads a DIFFERENT norm of the same
+    // post-attention row, so the caller hands it over instead of recomputing it
+    // here -- and every read of the activation below goes through `xin`.
+    void *const xin = latent ? ws_xlat_
+                             : (moe_in_ ? const_cast<void *>(moe_in_)
+                                        : ws_xn_);
     void *const acc = latent ? ws_ffn_lat_ : ws_ffn_;
 
     be_->fill0(ws_ffn_, static_cast<size_t>(n) * static_cast<size_t>(n_embd_) * as);
@@ -9075,7 +9111,13 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     KRK_TIME_HOST_N(n == 1 ? "moe.route" : "moe.route.batch", hs_route);
     {
         KRK_TIME_HOST_N(n == 1 ? "moe.route.gemm" : "moe.route.gemm.batch", hs_rg);
-        gemm_w(ws_router_, ws_xn_, L.router, ne, n_embd_, n);
+        // A detached router input (gemma4): the weightless norm of the
+        // post-attention row, scaled and then multiplied elementwise by
+        // `ffn_gate_inp.scale`. It is not either branch's normed input, which
+        // is why it arrives precomputed rather than being derived here.
+        const void *rin = L.router_scale ? ws_router_in_
+                                        : (moe_in_ ? moe_in_ : ws_xn_);
+        gemm_w(ws_router_, rin, L.router, ne, n_embd_, n);
     }
 
         // The blocking device-to-host copy below already orders itself behind
@@ -9584,8 +9626,10 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // there is no host read to miss, and the batch case keeps the dispatch.
         const bool small_rows = n <= 4 || tile_chunk() ||
                                 model_.experts().dispatch_table_host_cells() == 0;
+        // `moe_dispatch`'s kernel folds the silu pair too, so a GeGLU bank
+        // keeps the per-expert loop.
         const bool dispatch_dev = dispatch_cap && decode_shape_ok && small_rows &&
-                                  !hybrid;
+                                  !hybrid && !mc.gelu_ffn;
         if (dev_table_ && !dispatch_dev)
             (n > 4 && model_.experts().dispatch_table_host_cells() != 0
                  ? dp_chunk_skips_
@@ -9868,7 +9912,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
 
         if (dispatch_dev) {
             KRK_TIME_HOST_N(n == 1 ? "moe.dispatch" : "moe.dispatch.batch", hs_disp);
-            be_->moe_dispatch(dev_table_, layer, ne, ws_ids_, ws_wts_, ws_xn_,
+            be_->moe_dispatch(dev_table_, layer, ne, ws_ids_, ws_wts_, xin,
                               ws_ffn_, n, n_embd_, ff_exp, k);
             ++dp_launch_layers_;
             // That one launch read every routed expert's cells, and the per-expert
@@ -9908,8 +9952,12 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // bias, no sidecar scale, no host arm and no arm that measures a
         // per-expert ordering (KRK_MOE_BATCH=0 is this path's own arm).
         const bool use_plan_off0 = plan_grouped && dp_used_ == 0;
+        // The batched path's epilogue is a silu, so a GeGLU bank (gemma4) must
+        // not take it: the launch would compute the right projections and the
+        // wrong function of them.
         const bool batch_ok =
             n == 1 && !latent && moe_batch() && use_plan_off0 && !expert_stub_ &&
+            !mc.gelu_ffn &&
             !dispatch_dev && !hybrid && !moe_probe() && !sync_expert() &&
             !moe_silu_fused() && !moe_active_stage() &&
             L.experts.gate && gs_free &&
@@ -10062,7 +10110,8 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 const i64 gno[2] = {ff_exp, ff_exp};
                 const DType gwts[2] = {re->gate.type, re->up.type};
                 be_->gemm_group(gout, ws_xg_, gw, re->gate.type, gno, ew, 2,
-                                m, moe_silu_fused(), &pair_fused, false, gwts);
+                                m, moe_silu_fused() && !mc.gelu_ffn, &pair_fused,
+                                false, gwts);
             } else {
                 be_->gemm(ws_upg_, ws_xg_, re->up.data, re->up.type, ff_exp,
                           ew, m);
@@ -10125,7 +10174,15 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 // A swiglu-oai file never takes that kernel: this activation is
                 // a different function of the same two operands.
                 if (!pair_fused) {
-                    if (mc.ffn_swiglu_oai) {
+                    if (mc.gelu_ffn) {
+                        // gemma4's experts are GeGLU: gelu(gate) * up, the same
+                        // function its shared MLP applies. The silu pair below
+                        // is the wrong nonlinearity on the right operands, which
+                        // is why this cannot be left to the default.
+                        be_->gelu_act(ws_gateg_, m * ff_exp);
+                        be_->mul_act(ws_gateg_, ws_upg_, m * ff_exp);
+                        scatter_scale = nullptr;
+                    } else if (mc.ffn_swiglu_oai) {
                         be_->swiglu_oai(ws_gateg_, ws_gateg_, ws_upg_, m * ff_exp);
                         // Bounded by construction (|g| <= 7, |y + 1| <= 8), so
                         // there is no row maximum to store and the scatter sums
@@ -10312,7 +10369,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // The activation the host arm reads, widened from the f16 the device
             // holds: download_f32 converts without changing the values, so the
             // host computes against exactly the numbers the device would have.
-            be_->download_f32(hy_xn_.data(), ws_xn_, static_cast<i64>(cells));
+            be_->download_f32(hy_xn_.data(), xin, static_cast<i64>(cells));
 
             hy_jobs_.clear();
             hy_job_rows_.clear();
@@ -10501,10 +10558,98 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     // factor and poisons every later layer). It goes through the storage
     // contract instead -- summed in f32, stored at a per-token power-of-two
     // exponent, un-scaled by the next norm.
+    // A two-branch block (gemma4) has one more branch to compute and a norm
+    // between them: the routed sum stays in `ws_ffn_`, with its storage
+    // exponents, and `gemma_moe_ffn` assembles the block from it.
+    if (moe_no_residual_) return true;
     be_->add_residual(ws_x_, ws_ffn_, n, n_embd_,
                       static_cast<i32 *>(ws_rexp_),
                       static_cast<const i32 *>(ws_fexp_));
     dump_row("moe.post", layer, ws_x_, n_embd_, n);
+    return true;
+}
+
+// gemma4's routed block, assembled from the two halves the engine already has.
+//
+// The reference graph is:
+//
+//   attn_out = x + attn(attn_norm(x))
+//   mlp      = post_ffw_norm_1( gelu(gate * n1) * (up * n1) )      n1 = ffn_norm(attn_out)
+//   moe      = post_ffw_norm_2( experts(pre_ffw_norm_2(attn_out)) )
+//   x       += post_ffw_norm(mlp + moe)
+//
+// with the router reading `rms_norm(attn_out) * (1/sqrt(n_embd)) * ffn_gate_inp.scale`
+// -- a norm with NO weight, over the post-attention row, which is neither
+// branch's input.
+//
+// Four places differ from the generic block and each of them is a wrong answer
+// rather than a failure if it is dropped: the second norm on the same row, the
+// two branch norms, the detached router input, and the block norm applied to
+// the SUM instead of to each branch.
+bool Engine::gemma_moe_ffn(const LayerWeights &L, i32 layer, i64 n) {
+    const ModelConfig &mc = model_.cfg();
+    const i64 E = n_embd_;
+    const f32 peps = mc.post_norm_eps > 0.0f ? mc.post_norm_eps : mc.rms_eps;
+    if (!ws_g4_post_ || !ws_g4_mlp_ || !ws_router_in_) {
+        forward_error_ = "gemma4 routed layer reached without its branch buffers";
+        return false;
+    }
+    // The post-attention row is what both branches read and what the block's
+    // own residual add needs at the end, and the shared MLP consumes `ws_x_`
+    // through `dense_ffn`'s residual store -- so it is set aside here rather
+    // than re-derived from the projection buffers.
+    be_->copy_act(ws_g4_post_, ws_x_, static_cast<i64>(n) * E);
+
+    // ---- the shared MLP branch ------------------------------------------
+    // Its input is already in `ws_xn_` (the caller's fused add_rmsnorm computed
+    // it), its output norm is post_ffw_norm_1, and its result is a BRANCH: it
+    // goes into `ws_g4_mlp_` instead of into the residual.
+    { KRK_TRACE_COMP("gemma-moe.mlp");
+      dense_ffn(L, layer, n, ws_g4_mlp_, L.ffn_post_norm1); }
+
+    // ---- the expert branch's input and the router's own -----------------
+    { KRK_TRACE_COMP("gemma-moe.norm");
+    be_->rmsnorm(ws_xn_, ws_g4_post_, L.ffn_pre_norm2, n, E, peps, nullptr);
+    dump_row("moe.pre2", layer, ws_xn_, E, n);
+    be_->rmsnorm(ws_router_in_, ws_g4_post_, nullptr, n, E, peps, nullptr);
+    be_->scale_act(ws_router_in_, 1.0f / std::sqrt(static_cast<f32>(E)), n, E, E);
+    // Per-ELEMENT: `ggml_mul` with a [n_embd] tensor broadcasts down the rows,
+    // so the scale is a column vector and not the per-token scalar
+    // `scale_rows` would apply.
+    be_->scale_cols(ws_router_in_, L.router_scale, n, E);
+    dump_row("moe.routerin", layer, ws_router_in_, E, n); }
+
+    // ---- the expert branch ----------------------------------------------
+    // `moe_ffn` reads `moe_in_` instead of `ws_xn_` for the experts, takes the
+    // router's input from `ws_router_in_`, and leaves its routed sum in
+    // `ws_ffn_` (with per-row storage exponents) instead of adding it to the
+    // residual.
+    bool ok = false;
+    {
+        KRK_TRACE_COMP("gemma-moe.experts");
+        moe_in_ = ws_xn_;
+        moe_no_residual_ = true;
+        ok = moe_ffn(L, layer, static_cast<i32>(n));
+        moe_in_ = nullptr;
+        moe_no_residual_ = false;
+    }
+    if (!ok) return false;
+
+    // post_ffw_norm_2 on the routed sum. The sum is stored under a per-row
+    // power-of-two exponent, so the norm reads through it and then the rows are
+    // back at true scale: leaving the exponents behind would divide the
+    // normalized row by 2^e on the add below.
+    be_->rmsnorm(ws_ffn_, ws_ffn_, L.ffn_post_norm2, n, E, peps,
+                 static_cast<const i32 *>(ws_fexp_));
+    be_->fill0(ws_fexp_, static_cast<size_t>(n) * sizeof(i32));
+    dump_row("moe.branch2", layer, ws_ffn_, E, n);
+    be_->add_inplace(ws_ffn_, ws_g4_mlp_, static_cast<i64>(n) * E);
+
+    // ---- the block's own post norm, then the residual -------------------
+    be_->rmsnorm(ws_x2_, ws_ffn_, L.ffn_post_norm, n, E, peps, nullptr);
+    dump_row("moe.postnorm", layer, ws_x2_, E, n);
+    be_->add_residual(ws_x_, ws_x2_, n, E, static_cast<i32 *>(ws_rexp_));
+    dump_row("moe.post", layer, ws_x_, E, n);
     return true;
 }
 

@@ -91,6 +91,18 @@ struct LayerWeights {
     // other family, and null is what keeps their graph unchanged.
     f32 *attn_post_norm = nullptr; // f32 [n_embd]
     f32 *ffn_post_norm = nullptr;  // f32 [n_embd]
+    // ---- gemma4's routed layers (see ArchSpec::moe_two_branch) ------------
+    // The expert branch's own input norm, and the two branch output norms.
+    // `ffn_post_norm` above is the BLOCK's norm on the summed branches, so a
+    // layer of this family carries three of them and they are not
+    // interchangeable: swapping any two still produces fluent text from the
+    // right weights in the wrong place.
+    f32 *ffn_pre_norm2 = nullptr;  // f32 [n_embd]
+    f32 *ffn_post_norm1 = nullptr; // f32 [n_embd]
+    f32 *ffn_post_norm2 = nullptr; // f32 [n_embd]
+    // The router's per-element input scale (`ffn_gate_inp.scale`). Present
+    // exactly when `ffn_pre_norm2` is: both are the routed shape.
+    f32 *router_scale = nullptr;   // f32 [n_embd]
     // ---- gemma4's per-layer input embeddings -----------------------------
     // The PLE contribution is a fourth stage inside the block:
     //   cur = gelu(inp_gate @ cur) * ple_slice[l]
@@ -493,6 +505,10 @@ struct ModelConfig {
     bool per_layer_embd = false;
     // Every layer multiplies its output by `blk.N.layer_output_scale` (gemma4).
     bool layer_out_scale = false;
+    // A routed layer of this family is two separately-normed branches plus a
+    // detached router input, not the generic MoE block (gemma4). Mirrors
+    // `ArchSpec::moe_two_branch`.
+    bool moe_two_branch = false;
     // Phase of the pattern: is_swa(l) == ((l + swa_phase) % swa_period) != 0.
     // 0 is the historical (full layer first) reading; 1 flips the pair so the
     // *windowed* layer comes first (gpt-oss).

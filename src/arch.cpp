@@ -561,22 +561,17 @@ constexpr ArchSpec kTable[] = {
     // rope width, the attention scale -- follows the layer rather than the
     // stack maximum.
     //
-    // What still refuses: the forward. gemma4 needs per-layer input embeddings
-    // (per_layer_token_embd + per_layer_model_proj + per-layer inp_gate/proj),
-    // shared-KV layers (`attention.shared_kv_layers`: the last N layers reuse an
-    // earlier layer's cache instead of writing their own), `layer_output_scale`
-    // and the proportional rope (`blk.N.rope_freqs`). Those are the next commit;
-    // until they land a gemma4 file is refused by name, which is the honest
-    // answer rather than a run with the wrong graph.
+    // Everything this family's dense form needs is RUN: per-layer input
+    // embeddings (per_layer_token_embd + per_layer_model_proj + per-layer
+    // inp_gate/proj/post_norm), shared-KV layers, `layer_output_scale`, the
+    // weightless value norm and the two attention geometries. The ROUTED form
+    // is a two-branch block (moe_two_branch) and runs through its own path.
     // Every piece the parse above describes is now RUN: the per-layer input
     // table and its model projection (a pre-pass plus one small gate/proj per
     // layer), the shared-KV tail (those layers read an earlier layer's plane
     // and append nothing), the weightless value norm, the per-layer output
     // scalar, the proportional rope folded into the frequency table, and the
-    // two geometries this family's layers alternate between. So the entry is
-    // Yes, and what remains for this family is the shared-MLP MoE variant's
-    // two-norm branch -- which is refused per file, not per arch, because a
-    // dense gemma4 (E2B/E4B) runs the whole graph.
+    // two geometries this family's layers alternate between.
     [] {
         ArchSpec s = gemma_spec("gemma4", ArchSupport::Yes, "",
                                 0, false);
@@ -585,6 +580,13 @@ constexpr ArchSpec kTable[] = {
         s.shared_kv = true;
         s.layer_out_scale = true;
         s.post_branch_norm = true;
+        // The routed form: the dense FFN becomes the shared branch, and the
+        // experts get their own pre/post norms plus a detached router input.
+        s.moe_two_branch = true;
+        // `build_moe_ffn(..., norm_w = true, ...)`: the top-k weights are
+        // renormalized after selection, the opposite of qwen2moe's
+        // un-normalized softmax.
+        s.expert_w_norm = 1;
         return s;
     }(),
 
