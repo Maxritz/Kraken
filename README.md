@@ -557,6 +557,75 @@ this layout can do at 45.9 GMAC/s. The Q6_K rows (18% of the run, at 6% of peak)
 are next, and they have no `sc`-per-32 structure problem -- the same
 `sx` substitution applies.
 
+#### Attention, which owns the other half of a long prompt
+
+The `--kprof` table above is a short prompt, where attention is 3% of the run.
+Give the same model a real context and the composition inverts: at 2048 tokens
+attention is **two thirds** of the wall clock, and it was running at 3% of the
+f32 roofline. That is not a rounding error in a kernel nobody needs — it is the
+reason long prompts stall while short ones look fine.
+
+The kernel was the textbook form: for every (token, head), walk the visible keys,
+dot `q` against each one, softmax, then walk them again for `A·V`. Every key dot
+was a 64-deep dependent FMA chain with `q` re-loaded from L1 for each key. Two
+changes, both in `CpuBackend::attention`:
+
+* `q` lives in eight `__m256` registers for the whole scan, and the dot reduces
+  over 4 independent accumulators instead of one — the chain depth per key drops
+  from 64 to 8, which is the difference between waiting on latency and waiting
+  on ports;
+* the mask moves to a second pass, so the key loop is branch-free, and `A·V`
+  accumulates *across dimensions* (the j order of the output sum is untouched,
+  so the output half of the kernel is order-exact).
+
+Same run, both arms, 2048-token prefill, `--kprof`:
+
+| arm | prefill | `attention` µs/op | share of run | GMAC/s | %peak |
+|---|---:|---:|---:|---:|---:|
+| scalar reference (`KRK_CPU_ATTN_SCALAR=1`) | 92.7 tok/s | 310,955 | 67.9% | 3.2 | 3.0% |
+| AVX2 + FMA | **162.7 tok/s** | 110,906 | 42.6% | 9.1 | 9.0% |
+
+**1.75x end to end, 2.80x on the op.** On a short prompt attention is 3% of the
+run and the same change is 1.08x, which is the honest size of it.
+
+Accuracy, on a 10-shape fixture (decode row at pos 1400, 64-token prefill, GQA
+8/2, `hd` 80/96/256, window 64, `skip_from`, sinks, softcap) against the scalar
+reference: 18.5% of the 88,320 output floats bit-identical, global relative
+error **1.82e-07**, max absolute **9.5e-07** — the signature of a reordered f32
+reduction, nothing else. `--prefill-hash` moves (it must: the QK dot order
+changed) but stays invariant across `--chunk 8/32/128`, and the suite is
+4796/4796.
+
+`9%` of peak is still the number to argue with, and the arithmetic is no longer
+what stops it. At 2048 tokens this kernel *asks for* roughly 155 GB of K/V loads
+— every query row re-streams the keys before it — and this host reads 22.75 GB/s,
+so the same work done from DRAM would cost 6.8 s against the 5.3 s measured. It
+is a **load** problem now: the fix is to block query rows so one K row feeds
+several rows of output, exactly the `rN` trick that took `gemm_q6k` from 4227 to
+1697 µs/op. That is the next kernel, not another shuffle of this one.
+
+#### Where the threads land
+
+Every thread here is an OS thread, and until this change nothing told the OS
+which core to put it on: through a whole GEMM a worker could sit on a slow core
+or share one with another worker. On a hybrid part (Zen 4/5, Alder/Raptor Lake)
+it is worse, because the fast cores are not enumerated first — a pool of
+`hardware_concurrency()` threads spreads over the *slow* cluster and the whole
+pool runs at the E-core clock.
+
+`par_pool.hpp` now reads `cpufreq` for every CPU, orders them fastest-first, and
+gives the calling thread the best core and worker *i* the (i+1)-th best, so a
+small pool lands entirely on the performance cluster. The ranking is a stable
+sort, so a uniform part gets the identity permutation and nothing moves. No
+`cpufreq` (VM, container, no driver) means no order to impose and the previous
+behaviour — `KRK_AFFINITY=1` forces placement anyway, `=0` disables it. The
+backend prints what it did: `2 cores, unpinned` here, `8 cores, top 3.40 GHz,
+4P+8E, pinned` on a hybrid laptop.
+
+Measured on this box, which is 2 uniform cores and therefore the *no-op* case:
+**1.00x** on decode over 20 interleaved runs. The win is on parts that have two
+core classes; it cannot be shown here, and it is not claimed here.
+
 Measured on three real files, greedy, 24 tokens, `--cpu`, same output to the
 byte on every row:
 

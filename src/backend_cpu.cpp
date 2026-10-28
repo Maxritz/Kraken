@@ -17,7 +17,12 @@
 #include <algorithm>
 #include <cfloat> // FLT_MAX bounding the SIMT/CPU rsqrt and the clamp paths
 #include <cmath>
+#include <cstdlib>
 #include <utility>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 #include <vector>
 
 namespace krk {
@@ -108,6 +113,220 @@ void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps
             });
 }
 
+// ---------------------------------------------------------------------------
+// Attention, one (token, head) row at a time.
+//
+// The reference body here is a scalar loop, and at any context length worth
+// calling real, attention is the TOP row of the profile: measured on Tiny-Moe
+// with a 1400-token prompt, 63.4% of the run at 5.2% of the f32 peak, while the
+// GEMMs that had absorbed three rounds of kernel work were down to 27%.
+//
+// Two loops matter and they want different treatment:
+//
+//   score   s_j = <q, k_j>          a REDUCTION over hd
+//   output  o_i = sum_j p_j * v_j   an accumulation over j, indexed by i
+//
+// The output loop is vectorised ACROSS i, so every output dimension still sums
+// over j in the same order it always did -- that half is bit-identical to the
+// scalar body, not merely close. The score loop has to reduce, so a horizontal
+// sum is unavoidable and it changes the order of the last few bits. That is the
+// same trade the int8 GEMV kernels make, and the tests hold it to their
+// tolerances rather than to memcmp.
+//
+// Neither loop can be made 8x: each is roughly one load and one FMA per eight
+// lanes, and the score loop pays a horizontal reduce per key. Measured below.
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+#define KRK_ATTN_AVX2 1
+#endif
+
+#if defined(KRK_ATTN_AVX2)
+__attribute__((target("avx2,fma"))) inline f32 attn_dot_avx2(const f32 *a,
+                                                             const f32 *b,
+                                                             i64 n) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+    i64 i = 0;
+    for (; i + 16 <= n; i += 16) {
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),
+                             _mm256_loadu_ps(b + i + 8), a1);
+    }
+    for (; i + 8 <= n; i += 8)
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), a0);
+    a0 = _mm256_add_ps(a0, a1);
+    __m128 lo = _mm256_castps256_ps128(a0);
+    __m128 hi = _mm256_extractf128_ps(a0, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    f32 s = _mm_cvtss_f32(lo);
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
+// 64 dimensions of q, held in REGISTERS across every key of the row.
+//
+// The obvious inner loop reloads q for each key, and that is the whole cost:
+// with 256-bit operands every FMA needs one load for k and one for q, so the
+// loop is load-port bound at twice the FMA count and the FMA units idle. q is
+// the same 64 floats for all n_vis keys, so it belongs in registers -- that
+// halves the loads and takes the loop to the FMA limit instead.
+//
+// Four accumulators, two FMAs deep each. A single accumulator is a 64-deep
+// dependent chain (measured: 59 ns for one hd=64 scalar dot, i.e. ~153 cycles
+// for 64 multiply-adds), which is why the reference body lost to latency rather
+// than to arithmetic. Four chains is 8 cycles of latency for the same work.
+__attribute__((target("avx2,fma"))) inline void attn_score64(
+    const f32 *qh, const f32 *kc, i64 pos_stride, i64 k_off, i64 j_lo,
+    i64 n_vis, f32 *scores) {
+    const __m256 q0 = _mm256_loadu_ps(qh + 0);
+    const __m256 q1 = _mm256_loadu_ps(qh + 8);
+    const __m256 q2 = _mm256_loadu_ps(qh + 16);
+    const __m256 q3 = _mm256_loadu_ps(qh + 24);
+    const __m256 q4 = _mm256_loadu_ps(qh + 32);
+    const __m256 q5 = _mm256_loadu_ps(qh + 40);
+    const __m256 q6 = _mm256_loadu_ps(qh + 48);
+    const __m256 q7 = _mm256_loadu_ps(qh + 56);
+    const f32 *kj = kc + j_lo * pos_stride + k_off;
+    for (i64 j = 0; j < n_vis; j++, kj += pos_stride) {
+        __m256 a0 = _mm256_mul_ps(q0, _mm256_loadu_ps(kj + 0));
+        __m256 a1 = _mm256_mul_ps(q1, _mm256_loadu_ps(kj + 8));
+        __m256 a2 = _mm256_mul_ps(q2, _mm256_loadu_ps(kj + 16));
+        __m256 a3 = _mm256_mul_ps(q3, _mm256_loadu_ps(kj + 24));
+        a0 = _mm256_fmadd_ps(q4, _mm256_loadu_ps(kj + 32), a0);
+        a1 = _mm256_fmadd_ps(q5, _mm256_loadu_ps(kj + 40), a1);
+        a2 = _mm256_fmadd_ps(q6, _mm256_loadu_ps(kj + 48), a2);
+        a3 = _mm256_fmadd_ps(q7, _mm256_loadu_ps(kj + 56), a3);
+        const __m256 s01 = _mm256_add_ps(a0, a1);
+        const __m256 s23 = _mm256_add_ps(a2, a3);
+        __m128 t = _mm_add_ps(_mm256_castps256_ps128(_mm256_add_ps(s01, s23)),
+                              _mm256_extractf128_ps(_mm256_add_ps(s01, s23), 1));
+        t = _mm_hadd_ps(t, t);
+        t = _mm_hadd_ps(t, t);
+        scores[j] += _mm_cvtss_f32(t);
+    }
+}
+
+// One (token, head) row on the f32 cache. Same arithmetic as the scalar body,
+// same masks, same softmax, same sink rule -- only the two inner loops change.
+__attribute__((target("avx2,fma"))) void attn_row_f32_avx2(
+    const f32 *qf, const f32 *kc, const f32 *vc, f32 *of, const AttnDesc &d,
+    i64 t, i64 h, i64 n_rep, f32 *scores) {
+    const i64 hd = d.hd;
+    const i64 pos = d.pos0 + t;
+    const i64 n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
+    const i64 j_lo = d.window > 0 ? std::max<i64>(0, n_keys - d.window) : 0;
+    const i64 n_vis = n_keys - j_lo;
+    if (n_vis <= 0) return;
+    const bool skip = d.skip_from >= 0 && pos >= d.skip_from;
+    const i64 s_lo = skip ? std::max<i64>(j_lo, d.skip_from) : 0;
+    const i64 s_hi = skip ? std::min<i64>(pos, n_keys) : 0;
+    // The masked block is one contiguous run in j, so the branch inside the
+    // score loop becomes two ranges instead of a per-key test.
+    const i64 m0 = skip ? std::max<i64>(0, s_lo - j_lo) : 0;
+    const i64 m1 = skip ? std::min<i64>(n_vis, s_hi - j_lo) : 0;
+    const i64 hkv = n_rep > 0 ? h / n_rep : 0;
+    const f32 *qh = qf + t * (d.n_head * hd) + h * hd;
+
+    // 64-dimension chunks with q resident in registers; anything left over takes
+    // the generic dot. The mask is applied in the second pass so the hot loop
+    // carries no branch at all.
+    const i64 hkv_off = hkv * hd;
+    for (i64 j = 0; j < n_vis; j++) scores[j] = 0.0f;
+    i64 off = 0;
+    for (; off + 64 <= hd; off += 64)
+        attn_score64(qh + off, kc, d.pos_stride, hkv_off + off, j_lo, n_vis,
+                     scores);
+    if (off < hd) {
+        for (i64 j = 0; j < n_vis; j++)
+            scores[j] += attn_dot_avx2(qh + off,
+                                       kc + (j_lo + j) * d.pos_stride + hkv_off +
+                                           off,
+                                       hd - off);
+    }
+    for (i64 j = 0; j < n_vis; j++) {
+        if (j >= m0 && j < m1) {
+            scores[j] = -FLT_MAX;
+            continue;
+        }
+        f32 sv = scores[j] * d.scale;
+        if (d.softcap > 0.0f) sv = d.softcap * std::tanh(sv / d.softcap);
+        scores[j] = sv;
+    }
+    f32 mx = scores[0];
+    for (i64 j = 1; j < n_vis; j++) mx = std::max(mx, scores[j]);
+    f32 sum = 0.0f;
+    for (i64 j = 0; j < n_vis; j++) {
+        const f32 ex = std::exp(scores[j] - mx);
+        scores[j] = ex;
+        sum += ex;
+    }
+    const f32 sink_logit = d.sinks ? d.sinks[h] : 0.0f;
+    if (sink_logit != 0.0f) sum += std::exp(sink_logit - mx);
+    const f32 inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+    f32 *oh = of + t * (d.n_head * hd) + h * hd;
+
+    // Chunks of 64 output dimensions in eight live accumulators; the j order is
+    // untouched, so this is the scalar sum, eight dimensions at a time.
+    i64 i = 0;
+    for (; i + 64 <= hd; i += 64) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps();
+        __m256 a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+        const f32 *vj = vc + j_lo * d.pos_stride + hkv * hd + i;
+        for (i64 j = 0; j < n_vis; j++, vj += d.pos_stride) {
+            const __m256 p = _mm256_set1_ps(scores[j] * inv);
+            a0 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 0), a0);
+            a1 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 8), a1);
+            a2 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 16), a2);
+            a3 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 24), a3);
+            a4 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 32), a4);
+            a5 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 40), a5);
+            a6 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 48), a6);
+            a7 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 56), a7);
+        }
+        _mm256_storeu_ps(oh + i + 0, a0);
+        _mm256_storeu_ps(oh + i + 8, a1);
+        _mm256_storeu_ps(oh + i + 16, a2);
+        _mm256_storeu_ps(oh + i + 24, a3);
+        _mm256_storeu_ps(oh + i + 32, a4);
+        _mm256_storeu_ps(oh + i + 40, a5);
+        _mm256_storeu_ps(oh + i + 48, a6);
+        _mm256_storeu_ps(oh + i + 56, a7);
+    }
+    // 16 dims in two accumulators, 8 in one. The second accumulator is over
+    // DIMENSIONS, never over j: two j-chains added together at the end is a
+    // reordered sum, and this half of the kernel is supposed to be exact.
+    for (; i + 16 <= hd; i += 16) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        const f32 *vj = vc + j_lo * d.pos_stride + hkv * hd + i;
+        for (i64 j = 0; j < n_vis; j++, vj += d.pos_stride) {
+            const __m256 p = _mm256_set1_ps(scores[j] * inv);
+            a0 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj), a0);
+            a1 = _mm256_fmadd_ps(p, _mm256_loadu_ps(vj + 8), a1);
+        }
+        _mm256_storeu_ps(oh + i, a0);
+        _mm256_storeu_ps(oh + i + 8, a1);
+    }
+    for (; i + 8 <= hd; i += 8) {
+        __m256 a0 = _mm256_setzero_ps();
+        const f32 *vj = vc + j_lo * d.pos_stride + hkv * hd + i;
+        for (i64 j = 0; j < n_vis; j++, vj += d.pos_stride)
+            a0 = _mm256_fmadd_ps(_mm256_set1_ps(scores[j] * inv),
+                                 _mm256_loadu_ps(vj), a0);
+        _mm256_storeu_ps(oh + i, a0);
+    }
+    for (; i < hd; i++) {
+        const f32 *vj = vc + j_lo * d.pos_stride + hkv * hd + i;
+        f32 acc = 0.0f;
+        for (i64 j = 0; j < n_vis; j++, vj += d.pos_stride)
+            acc += scores[j] * inv * vj[0];
+        oh[i] = acc;
+    }
+}
+#endif // KRK_ATTN_AVX2
+
 } // namespace
 
 class CpuBackend final : public Backend {
@@ -179,10 +398,13 @@ public:
     }
 
     std::string describe() const override {
+        // Report placement with the part: on a hybrid host this line is the
+        // difference between "why is it slow" and "it is on the E cores".
+        const std::string topo = Pool::get().topology().summary();
         if (npu_)
-            return format("CPU (scalar reference) + %s, %s",
-                          npu::describe(npu_).c_str(), caps_.gfx.c_str());
-        return format("CPU (scalar reference), %s", caps_.gfx.c_str());
+            return format("CPU (scalar reference) + %s, %s, %s",
+                          npu::describe(npu_).c_str(), caps_.gfx.c_str(), topo.c_str());
+        return format("CPU (scalar reference), %s, %s", caps_.gfx.c_str(), topo.c_str());
     }
     // No card here, so the memory policy has nothing to measure and would take
     // its "cannot say" path for every run. `KRK_VRAM_TOTAL_MB` says "behave as if
@@ -766,6 +988,39 @@ public:
         // max/sum stay inside one head — bit-identical to the
         // serial loop (which used one shared scratch).
         const i64 units = d.n_tok * d.n_head;
+        // One binary, two ISAs: the vector path where the host has AVX2+FMA,
+        // the scalar body below everywhere else. KRK_CPU_ATTN_SCALAR=1 forces
+        // the reference -- that is the A/B this was measured with, and the arm
+        // a bit-exactness run wants.
+#if defined(KRK_ATTN_AVX2)
+        // Latched once: the ISA probe is a cpuid-derived bit test, but it is
+        // still read on every layer of every token, and the answer cannot
+        // change within a process. KRK_CPU_ATTN_SCALAR=1 is the reference arm
+        // the accuracy fixture and the A/B runs compare against.
+        static const bool attn_vec = [] {
+            const char *e = std::getenv("KRK_CPU_ATTN_SCALAR");
+            if (e && e[0] == '1') return false;
+            return __builtin_cpu_supports("avx2") &&
+                   __builtin_cpu_supports("fma");
+        }();
+        if (attn_vec) {
+            par_for(units, 1,
+                    4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * d.hd,
+                    [&](i64 b, i64 e) {
+                        std::vector<f32> scores;
+                        for (i64 u = b; u < e; u++) {
+                            const i64 t = u / d.n_head;
+                            const i64 h = u - t * d.n_head;
+                            const i64 n_vis_max = d.causal ? d.pos0 + t + 1
+                                                           : d.pos0 + d.n_tok;
+                            scores.resize(static_cast<size_t>(n_vis_max));
+                            attn_row_f32_avx2(qf, kc, vc, of, d, t, h, n_rep,
+                                              scores.data());
+                        }
+                    });
+            return;
+        }
+#endif
         par_for(units, 1,
                 4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * d.hd,
                 [&](i64 b, i64 e) {
