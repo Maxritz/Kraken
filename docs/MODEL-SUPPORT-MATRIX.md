@@ -18,8 +18,8 @@ problems. The second is the bigger one numerically, the first is the one that
 stops a model running.
 
 **Update:** `phi3` (Phi-3, Phi-4), `gptneox`, `gptj`, `phi2`, `mpt`, `bloom`,
-`falcon`, `chatglm`, `glm4`, `mellum`, `phimoe`, `minicpm`, `qwen2vl` and
-`qwen38` are now supported — see `docs/PHI3-FUSED-PROJECTIONS.md` and
+`falcon`, `chatglm`, `glm4`, `glm4moe`, `mellum`, `phimoe`, `phi3moe`,
+`minicpm`, `minicpm3`, `qwen2vl` and `qwen38` are now supported — see `docs/PHI3-FUSED-PROJECTIONS.md` and
 `docs/PLAIN-PRENORM-FAMILY.md`. That clears Phi-3-mini, Phi-4-reasoning-plus and
 adds six of the GGUF spec's own "known values" architectures — `mpt` and
 `bloom` bring ALiBi, `falcon` a parallel branch with two norms — see
@@ -44,6 +44,7 @@ the format has no kernel. `REFUSED` = no arch.
 | gemma-4-E4B-it-Q4_K_M | **gemma4** ✓ | Q4_K | FAST |
 | GLM-4.7-Flash-Q4_K_M | `glm4` ✓ | Q4_K | FAST |
 | L3.2-8X3B-MOE-…-Q8_0 | llama-moe² | Q8_0 | FAST if ² |
+| (Phi-3.5-MoE class) | `phi3moe` ✓ | Q4_K | FAST |
 | Llama-3.2-1B-4B-Quad-MoE.Q4_K_M | llama-moe² | Q4_K | FAST if ² |
 | Llama-3.2-1B-Instruct-Q8_0 | llama ✓ | Q8_0 | FAST |
 | Mellum2.1-12B-A2.5B-Q4_K_M | llama/qwen3? ² | Q4_K | FAST if ² |

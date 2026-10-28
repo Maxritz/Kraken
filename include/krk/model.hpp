@@ -485,6 +485,10 @@ struct ModelConfig {
     // aliased or unlisted label used to answer that question differently from
     // the loader, which changes the graph instead of failing.
     bool q_output_gate = false;
+    // The attention branch's output is multiplied by this before it joins the
+    // residual (minicpm3: `depth / sqrt(n_layer)`, already divided at load).
+    // 1.0 everywhere else, and 1.0 keeps the multiply folded away.
+    f32 attn_out_scale = 1.0f;
     // ---- qwen4exp (Qwen3.8-Flash-Next) -----------------------------------
     // The residual is `hc` lanes of n_embd, mixed through a low-rank bottleneck
     // (4 x 2560 through 320 on the REAP-288 file). `ple` is the n-gram hash

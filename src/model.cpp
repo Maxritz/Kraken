@@ -295,6 +295,14 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // the loader has to know to look for it before the layer loop starts.
     cfg_.attn_gate = aspec.attn_gate;
     cfg_.q_output_gate = aspec.q_output_gate;
+    // minicpm3 scales each layer's attention output by depth/sqrt(n_layer)
+    // before the residual add. The divisor is a property of the stack, so the
+    // division happens once here and the engine only ever multiplies by 1.0
+    // (a no-op it can skip) or by the final constant.
+    cfg_.attn_out_scale =
+        aspec.residual_depth > 0.0f && cfg_.n_layer > 0
+            ? aspec.residual_depth / std::sqrt(static_cast<f32>(cfg_.n_layer))
+            : 1.0f;
     // muse-glimmer gates with a sigmoid where laguna gates with a softplus.
     cfg_.attn_gate_sigmoid = aspec.attn_gate_sigmoid;
     // Per-branch post norms, and the GeGLU FFN that comes with the gemma stack.
@@ -341,8 +349,13 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // wrong for every file of the family, and softmax over 128 logits is a
     // different selection as well as a different weight.
     const bool nemotron_h = (a == "nemotron_h" || a == "nemotron_h_moe");
+    // The arch's own default, when its files do not declare one: nemotron's
+    // is hardcoded in the reference, and glm4-moe's loader defaults to
+    // sigmoid for a file that is silent. 1 is softmax.
+    const i32 gating_default =
+        nemotron_h ? 2 : (aspec.router_gating > 0 ? aspec.router_gating : 1);
     cfg_.router_sigmoid = static_cast<i32>(
-        gguf_.get_i64(key(".expert_gating_func"), nemotron_h ? 2 : 1)) == 2;
+        gguf_.get_i64(key(".expert_gating_func"), gating_default)) == 2;
     cfg_.ffn_relu_sqr = nemotron_h;
     // Tri-state: -1 keeps the engine's legacy always-normalize for files that
     // do not declare it (see ModelConfig::expert_w_norm).
@@ -357,6 +370,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // holding. llama.cpp leaves `expert_weights_norm` false for this arch.
     if (cfg_.expert_w_norm < 0 && aspec.expert_w_norm >= 0)
         cfg_.expert_w_norm = aspec.expert_w_norm;
+    if (cfg_.expert_w_norm < 0 && aspec.router_w_norm >= 0)
+        cfg_.expert_w_norm = aspec.router_w_norm;
     cfg_.ffn_swiglu_oai = aspec.swiglu_oai;
     cfg_.expert_w_scale =
         static_cast<f32>(gguf_.get_f64(key(".expert_weights_scale"), 1.0));

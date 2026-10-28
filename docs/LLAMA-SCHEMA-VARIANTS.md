@@ -125,3 +125,71 @@ A/B on the same weights:
   bit-identical logits above.
 
 `kraken-tests` **5500/5500**.
+
+## Second pass: `glm4moe`, `phi3moe`, `minicpm3`
+
+Three more, and only one of them was a schema question.
+
+**`glm4moe`** (GLM-4.5 / GLM-4.7-Flash) is `glm4` with routed experts: the same
+attention with an `attn_post_norm` on its branch, q/k RMS norms and biases on
+q/k/v, then a sigmoid router carrying a per-expert selection bias beside a
+shared expert of `n_ff_exp * n_expert_shared` columns. Everything but two
+defaults already existed, and both are *defaults for a silent file*, not new
+code:
+
+* the router activation — llama.cpp's glm4-moe loader falls back to **sigmoid**
+  when `expert_gating_func` is absent, while this engine's generic fallback is
+  softmax. On a 128-expert stack those are different *selections*, not just
+  different weights;
+* `expert_weights_norm` — the reference leaves it false, so a file that says
+  nothing must not renormalize. The engine's historical default is to
+  renormalize, which is right for Qwen and wrong here.
+
+Both are now `ArchSpec::router_gating` / `ArchSpec::router_w_norm`, and the
+file's own key still wins when it has one. The dense/MoE mix needs no code at
+all: the layer's own tensors say which it is, and the leading dense blocks are
+already read into `cfg_.n_dense_lead`.
+
+**`phi3moe`** is literally the same graph — llama.cpp's phi3 MoE branch is
+`llama_model_phi3::graph` with a `build_moe_ffn` call in place of the dense MLP
+— so the spec is phi3's two fused-projection flags and nothing else. Its logits
+on the fixture match `phimoe`'s to the digit, which is the expected result:
+both read the same schema and the fixture's biases are zero.
+
+**`minicpm3`** is the V2-Lite latent attention (which this engine already ran)
+with a **low-rank query trunk** over that same uncompressed KV path, plus a
+depth scale. The scale is one line: each layer multiplies the ATTENTION
+branch's output by `1.4 / sqrt(n_layer)` before the residual add, and only that
+branch. It is a constant in the reference graph with no tensor and no metadata
+key, so it is divided once at load and applied where the branch's value is
+final; at 1.0 the multiply is skipped entirely.
+
+### The bug that found
+
+Building the fixture exposed a real defect, and not in the new code. The lite
+MLA forward projected the query **only** through `attn_q` (the direct form):
+
+```cpp
+gemm_w(ws_q_, ws_xn_, L.wq_direct, nh * qk, n_embd_, n);
+```
+
+A file with a `q_lora_rank` stores `attn_q_a → attn_q_a_norm → attn_q_b`
+instead. The loader read and shape-checked that trunk — and the forward never
+asked for it, so the projection ran against an absent tensor and produced
+queries at 2.8e22 that became NaN one layer later. Nothing errored.
+
+It was not only MiniCPM3: **every V3-class DeepSeek file has that trunk**, so
+the `deepseek2` row's "runs" claim covered a file shape nothing had ever
+executed end to end. The trunk is now projected (with its norm) and falls back
+to the direct path only when the file has no trunk; a layer with neither is a
+named refusal instead of a multiply by nothing.
+
+The second half of the same bug: `ws_mlaqn_` — the trunk's intermediate row —
+was allocated **only for the shared layout**, so the fixed projection then
+segfaulted on the first token. It is now allocated whenever the file declares a
+`q_lora_rank`, which is the condition that makes it readable.
+
+Pinned by `test_minicpm3_whole_graph`: the file loads, the resolved scale is
+`1.4/sqrt(n_layer)`, the logits are finite, and the same bytes under a label
+without the scale produce different logits — so the multiply is known to act
+rather than merely to be configured.

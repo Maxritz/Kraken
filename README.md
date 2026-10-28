@@ -1119,6 +1119,38 @@ and the refusal list, is in [docs/MODEL-STATUS.md](docs/MODEL-STATUS.md) and
 * `scripts/` holds the gates (`build_check.sh`, `kraken_tests_baseline_check.sh`,
   `coherence_check.sh`) and the benchmark harnesses.
 
+### Nine families, one alias, and a latent-attention bug
+
+A second pass added `glm4moe` (GLM-4.5 / GLM-4.7-Flash: glm4's attention with
+routed experts, a sigmoid router carrying a per-expert selection bias, and a
+shared expert of `n_ff_exp * n_expert_shared` columns), `phi3moe` (literally
+phi3's graph with a `build_moe_ffn` where the dense MLP was) and `minicpm3`.
+
+Only two of the three needed code, and both are *defaults for a file that says
+nothing*: glm4-moe's files default to a **sigmoid** router where this engine's
+generic fallback is softmax — on 128 experts that is a different selection, not
+a different weighting — and its reference leaves `expert_weights_norm` false
+where the engine's historical default renormalizes. `minicpm3` needed its depth
+scale: every layer multiplies the ATTENTION branch's output by
+`1.4 / sqrt(n_layer)` before the residual add, a constant in the reference with
+no tensor and no metadata key behind it.
+
+Building the MiniCPM3 fixture found a real defect in code that already shipped.
+The lite latent-attention forward projected the query **only** through
+`attn_q`; a file with a `q_lora_rank` stores `attn_q_a → attn_q_a_norm →
+attn_q_b` instead. The loader read and shape-checked that trunk, the forward
+never asked for it, and the projection ran against an absent tensor to produce
+queries at 2.8e22 that turned into NaN one layer later — with nothing reported
+in between. That was not only MiniCPM3: every V3-class DeepSeek file carries a
+trunk, so the `deepseek2` row's "runs" claim covered a shape nothing had
+executed end to end. Both halves are fixed now, including the workspace that was
+allocated only for the shared layout — which turned the first fix into a
+segfault until it was noticed.
+
+`test_minicpm3_whole_graph` pins all three facts: the file loads, the resolved
+scale is `1.4/sqrt(n_layer)`, and the same bytes under a label without the scale
+produce different logits. `kraken-tests` 5676/5676.
+
 ### llama's schema with a piece swapped: six families, and one alias
 
 Six architectures that were refused are llama's own tensor set with one or two

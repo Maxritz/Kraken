@@ -1409,13 +1409,18 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         ws_mla_ = alloc(static_cast<size_t>(C) *
                         static_cast<size_t>(mc.mla_kv_lora + mc.mla_qk_rope) * as);
         if (!check_alloc(ws_mla_, "ws_mla")) return false;
-        if (mc.mla_layout == MlaLayout::Shared) {
-            // The trunk's intermediate row and the grouped output's f32
-            // accumulator. Sized by the file's own geometry, so a V4 file with
-            // 8 groups of 1024 reserves what it asks for and nothing more.
+        // The trunk's intermediate row. Sized by the file's own geometry, so a
+        // V4 file with 8 groups of 1024 reserves what it asks for and nothing
+        // more -- and reserved for BOTH layouts: the LITE path carries a query
+        // trunk too (the V3 class and MiniCPM3), and gating this allocation on
+        // the shared layout left `ws_mlaqn_` null on every file that had one.
+        // That read as a working load and a SIGSEGV on the first token.
+        if (mc.mla_q_lora > 0) {
             ws_mlaqn_ = alloc(static_cast<size_t>(C) *
                               static_cast<size_t>(mc.mla_q_lora) * as);
             if (!check_alloc(ws_mlaqn_, "ws_mlaqn")) return false;
+        }
+        if (mc.mla_layout == MlaLayout::Shared) {
             // f32, not `as`: see the member's note -- the grouped output reads it
             // and the host oracle it is compared against keeps f32 there.
             ws_mlaa_ = alloc(static_cast<size_t>(C) *
@@ -3815,6 +3820,14 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // broadcast over the rows of the GEMM output, which is exactly the
         // `add_bias_cols` shape (n rows of n_embd columns).
         if (L.wo_bias) be_->add_bias_cols(ws_x2_, L.wo_bias, n, n_embd_);
+        // MiniCPM3's depth scale: the ATTENTION branch is multiplied by
+        // `depth / sqrt(n_layer)` before it joins the residual, and only that
+        // branch -- the FFN's output is added at full weight. It is one
+        // constant per stack, so it is divided once at load (ModelConfig says
+        // why) and applied here, where the branch's final value is known and
+        // nothing else has read it yet. Skipped entirely at 1.0.
+        if (mc.attn_out_scale != 1.0f)
+            be_->scale_act(ws_x2_, mc.attn_out_scale, n, n_embd_, n_embd_);
         dump_row("attn.proj", l, ws_x2_, n_embd_, n);
         // Branch post norm (gemma2/3/4, muse-glimmer): the projection's own
         // output is normalized with THIS branch's weight before it joins the
@@ -6820,7 +6833,30 @@ bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     // 2. the query, directly projected: head h owns columns
     // [h*(nope+rope), ...), nope first -- the file's own packing, and the same
     // packing mla_attention reads.
-    gemm_w(ws_q_, ws_xn_, L.wq_direct, nh * qk, n_embd_, n);
+    // 2. the query. A file with a `q_lora_rank` stores a LOW-RANK TRUNK
+    // (attn_q_a -> attn_q_a_norm -> attn_q_b) instead of one direct
+    // projection, and the two are different graphs -- not two shapes of one.
+    // Only the direct form was ever projected here, so on a trunk file the
+    // missing tensor was multiplied by an absent weight and the queries came
+    // out at 2.8e22, turning into NaN one layer later with no error from the
+    // loader: it had read and shape-checked the trunk, and the forward simply
+    // never asked for it. Measured on a MiniCPM3 fixture (the V2-Lite KV path
+    // with a trunk over it), which is the pairing no earlier fixture covered.
+    if (L.wq_a.present()) {
+        const i64 ql = mc.mla_q_lora;
+        gemm_w(ws_mlaqn_, ws_xn_, L.wq_a, ql, n_embd_, n);
+        be_->rmsnorm(ws_mlaqn_, ws_mlaqn_, L.wq_a_norm, n, ql, mc.rms_eps,
+                     nullptr);
+        dump_row("mla.qa", l, ws_mlaqn_, ql, n);
+        gemm_w(ws_q_, ws_mlaqn_, L.wq_b, nh * qk, ql, n);
+    } else if (L.wq_direct.present()) {
+        gemm_w(ws_q_, ws_xn_, L.wq_direct, nh * qk, n_embd_, n);
+    } else {
+        KRK_ERROR("mla: layer %lld carries neither a query trunk "
+                  "(attn_q_a/attn_q_b) nor a direct query projection",
+                  static_cast<long long>(l));
+        return false;
+    }
     dump_row("mla.q", l, ws_q_, nh * qk, n);
 
     // 3. append this pass's rows. Must precede the attention call: row pos0+0 is

@@ -242,6 +242,64 @@ constexpr ArchSpec glm4_spec() {
     return s;
 }
 
+// ---- glm4moe (GLM-4.5 / GLM-4.7-Flash) -------------------------------------
+// GLM-4's stack with routed experts: an `attn_post_norm` on the attention
+// branch (the same post_branch_norm graph glm4 uses), q/k RMS norms, biases on
+// q/k/v, a sigmoid router with a per-expert selection bias, and a shared
+// expert whose width is `n_ff_exp * n_expert_shared`.
+//
+// Three pieces are per-LAYER rather than per-arch and need nothing here: the
+// leading dense blocks (`leading_dense_block_count`, already read into
+// cfg_.n_dense_lead), the experts themselves (dispatched on `ffn_gate_inp`),
+// and the shared expert (loaded from `ffn_*_shexp`). A file mixing dense and
+// MoE layers therefore needs no special case -- the layer says which it is.
+//
+// The MLP is NOT fused here: glm4-moe's dense layers carry separate
+// `ffn_gate`/`ffn_up`, unlike glm4's single gate|up row. Setting
+// fused_gate_up would read a gate of half the intended width.
+constexpr ArchSpec glm4moe_spec() {
+    ArchSpec s{"glm4moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target,
+               "glm4", "", false, false, false, false};
+    s.qk_norm = true;
+    s.qkv_bias = true;
+    s.post_branch_norm = true;
+    s.router_gating = 2;   // sigmoid, like every GLM-4.5/4.7 batch
+    s.router_w_norm = 0;   // llama.cpp leaves expert_weights_norm false here
+    return s;
+}
+
+// ---- phi3moe (Phi-3.5-MoE) -------------------------------------------------
+// Phi-3's block with routed experts in place of the dense MLP: the fused
+// `attn_qkv`, the fused gate|up, the partial rotary and the Phi attention
+// scaling are all unchanged, and the reference build for this arch is
+// literally `llama_model_phi3::graph` with a `build_moe_ffn` call. The router
+// is silu/softmax and there is no shared expert, so the two flags are the phi3
+// ones and the MoE path is the generic one.
+constexpr ArchSpec phi3moe_spec() {
+    ArchSpec s{"phi3moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target,
+               "phi3", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.fused_gate_up = true;
+    return s;
+}
+
+// ---- minicpm3 --------------------------------------------------------------
+// Multi-head latent attention in the V2-Lite layout (`attn_q_a`/`attn_q_b`
+// with `attn_kv_a_mqa`/`attn_kv_b`), which the loader already recognises from
+// the tensors, plus one thing no other family here does: each layer scales the
+// ATTENTION branch's output by `1.4 / sqrt(n_layer)` before the residual add.
+// Without it every layer adds a full-size attention contribution to a stack
+// trained to add four fifths of one, and the residual grows faster than the
+// model expects -- fluent text, wrong model.
+constexpr ArchSpec minicpm3_spec() {
+    ArchSpec s{"minicpm3", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "minicpm3", "", false, false, false, false};
+    s.mla = true;
+    s.rope_neox = true;      // llama.cpp lists minicpm3 under LLAMA_ROPE_TYPE_NEOX
+    s.residual_depth = 1.4f; // scale_depth in the reference graph
+    return s;
+}
+
 // ---- mellum ----------------------------------------------------------------
 // Mellum is qwen3-MoE's schema: RMSNorm, per-head q/k norm, NeoX rotary, a
 // router plus routed experts. It differs in declaring a sliding window on a
@@ -324,6 +382,7 @@ constexpr ArchSpec kTable[] = {
     {"llama", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
      false, false, false, false},
     phi3_spec(),
+    phi3moe_spec(),
     // The plain pre-norm family: rotary (or learned) positions, LayerNorm and a
     // fused QKV, differing only in which of the fine flags above they set.
     gptneox_spec(),
@@ -334,9 +393,11 @@ constexpr ArchSpec kTable[] = {
     falcon_spec(),
     chatglm_spec(),
     glm4_spec(),
+    glm4moe_spec(),
     mellum_spec(),
     phimoe_spec(),
     minicpm_spec(),
+    minicpm3_spec(),
     qwen2vl_spec(),
     qwen38_spec(),
     // GPT-2 and its descendants: LayerNorm (biased), learned absolute

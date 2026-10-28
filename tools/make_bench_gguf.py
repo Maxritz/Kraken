@@ -391,7 +391,8 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
     moe = n_expert > 0
     assert arch in ("llama", "phi3", "gptneox", "gptj", "phi2", "mpt",
                     "bloom", "falcon", "chatglm", "glm4", "mellum", "phimoe",
-                    "minicpm", "qwen2vl", "qwen38") or arch == "qwen3moe", arch
+                    "minicpm", "qwen2vl", "qwen38", "glm4moe", "phi3moe",
+                    "minicpm3") or arch == "qwen3moe", arch
 
     # ---- llama-schema variants --------------------------------------------
     # These are llama's tensor set with one or two pieces swapped, which is the
@@ -401,13 +402,34 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
     if schema:
         arch = schema
     s_fused_ffn = schema in ("chatglm", "glm4")
-    s_post_norms = schema == "glm4"
-    s_qk_norm = schema in ("mellum", "qwen38") or qk_norm
-    s_qkv_bias = schema == "qwen2vl"
+    s_post_norms = schema in ("glm4", "glm4moe")
+    s_qk_norm = schema in ("mellum", "qwen38", "glm4moe") or qk_norm
+    s_qkv_bias = schema in ("qwen2vl", "glm4moe")
     s_wo_bias = schema == "phimoe"
     s_out_bias = schema == "phimoe"
     s_norm_bias = schema == "phimoe"
     s_swa = schema == "mellum"
+    # glm4moe batches its experts with a sigmoid and a per-expert SELECTION
+    # bias, and carries a shared expert beside the routed ones. phi3moe is
+    # Phi-3's block with the routed set in place of the dense MLP, so it keeps
+    # phi3's fused projections and adds no shared expert.
+    s_exp_bias = schema == "glm4moe"
+    if schema == "glm4moe":
+        moe = True
+        fused_ffn = False
+    if schema == "phi3moe":
+        moe = True
+        fused = True
+        fused_ffn = True
+    if schema in ("glm4moe", "phi3moe"):
+        assert n_expert > 0, "a MoE schema needs --experts"
+    if s_exp_bias:
+        # glm4-moe's own metadata: the reference defaults a file that says
+        # nothing to SIGMOID, and this fixture says it explicitly so the
+        # engine's arch default is not what is being measured.
+        g_meta_gating = 2
+    else:
+        g_meta_gating = None
     if s_fused_ffn:
         fused_ffn = True
     # Falcon is the one family with norm biases and NO linear biases: every
@@ -468,6 +490,12 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
         g.u32(arch + ".expert_count", n_expert)
         g.u32(arch + ".expert_used_count", n_expert_used)
         g.u32(arch + ".expert_feed_forward_length", n_ff_exp)
+        if s_exp_bias:
+            # One always-on shared expert, `n_ff_exp` wide -- the GLM-4.5
+            # arrangement (`expert_shared_count`, and the shared width derived
+            # from it exactly as llama.cpp derives it).
+            g.u32(arch + ".expert_shared_count", 1)
+            g.u32(arch + ".expert_gating_func", g_meta_gating)
     g.string("tokenizer.ggml.model", "llama")
     g.str_array("tokenizer.ggml.tokens", tokens)
     g.f32_array("tokenizer.ggml.scores", scores)
@@ -646,9 +674,25 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
             # all-MoE checkpoint legitimately has no dense ffn_* tensors: the
             # loader falls back to expert_feed_forward_length for n_ff.
             w(p + "ffn_gate_inp.weight", n_embd, n_expert)
+            if s_exp_bias:
+                # The selection bias, one per expert. NON-ZERO on purpose: a
+                # zero bias makes the biased and unbiased selections identical,
+                # so a fixture built with zeros cannot tell whether the engine
+                # read the tensor at all.
+                g.tensor(p + "ffn_exp_probs_b.bias", n_expert, 1,
+                         struct.pack("<%df" % n_expert,
+                                     *[0.05 * (i % 3) for i in range(n_expert)]),
+                         T_F32)
             ws(p + "ffn_gate_exps.weight", n_embd, n_ff_exp, n_expert)
             ws(p + "ffn_up_exps.weight", n_embd, n_ff_exp, n_expert)
             ws(p + "ffn_down_exps.weight", n_ff_exp, n_embd, n_expert)
+            if s_exp_bias:
+                # GLM-4.5/4.7's shared expert: `n_expert_shared` experts' worth
+                # of width, added to the routed result at full weight.
+                sh = n_ff_exp * 1
+                w(p + "ffn_gate_shexp.weight", n_embd, sh)
+                w(p + "ffn_up_shexp.weight", n_embd, sh)
+                w(p + "ffn_down_shexp.weight", sh, n_embd)
         else:
             if fused_ffn and not split_ffn:
                 # gate | up in one row, gate first (drawn gate-then-up).
@@ -702,8 +746,9 @@ def main(argv=None):
                          "separately instead of the fused gate|up row, on the "
                          "same weight stream, so the two layouts must match")
     ap.add_argument("--schema", default="",
-                    choices=["", "chatglm", "glm4", "mellum", "phimoe",
-                             "minicpm", "qwen2vl", "qwen38"],
+                    choices=["", "chatglm", "glm4", "glm4moe", "mellum",
+                             "phimoe", "phi3moe", "minicpm", "minicpm3",
+                             "qwen2vl", "qwen38"],
                     help="write a llama-schema variant: chatglm/glm4 fuse the "
                          "gate|up MLP (glm4 also normalizes each branch), "
                          "mellum is qwen3-MoE with qk-norm and a sliding "

@@ -288,6 +288,27 @@ struct ArchSpec {
     // hold the same weights (the file has no attn_norm_2), so the arithmetic
     // collapses to the single-norm case; on Falcon-40B they differ.
     bool parallel_two_norm = false;
+    // ---- MiniCPM3's residual depth scale ---------------------------------
+    // Every layer multiplies the ATTENTION branch's output by
+    // `depth / sqrt(n_layer)` before adding it to the residual -- a
+    // depth-dependent shrink of the attention contribution, not of the FFN.
+    // 0 means no scale. The engine divides by sqrt(n_layer) once at load and
+    // keeps the result on ModelConfig, because the divisor is a property of
+    // the stack, not of the layer.
+    float residual_depth = 0.0f;
+    // ---- the router's activation, when the family's files do not say -------
+    // 0 keeps whatever the file declares (and softmax when it declares
+    // nothing); 2 forces sigmoid. GLM-4.5/4.7 batches its experts with
+    // `sigmoid`, and llama.cpp's glm4-moe loader defaults to SIGMOID when the
+    // key is missing -- while the generic default here is softmax. On a
+    // 128-expert stack softmax and sigmoid are different SELECTIONS as well as
+    // different weights, so this cannot be left to the file.
+    int router_gating = 0;
+    // ---- expert weights are renormalized unless the file says otherwise ----
+    // -1 keeps the engine's legacy always-normalize. glm4-moe's reference
+    // leaves `expert_weights_norm` false, so a file that is silent on it is
+    // NOT renormalized.
+    int router_w_norm = -1;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

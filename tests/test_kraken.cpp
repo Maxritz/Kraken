@@ -4505,6 +4505,32 @@ static void test_arch_table() {
           "the MTP head set tools/mtp_extract.py writes is in the table");
     CHECK(arch_lookup("qwen4-mtp")->role == ArchRole::Draft,
           "and it is a draft file rather than a model");
+    // The three families added this pass, and the ONE flag on each that is not
+    // shared with the relative it was derived from -- that flag is the whole
+    // reason the entry exists, so a copy-paste that dropped it has to fail
+    // here rather than at the first token.
+    {
+        const ArchSpec *gm = arch_lookup("glm4moe");
+        CHECK(gm != nullptr && gm->support == ArchSupport::Yes,
+              "glm4moe is supported");
+        CHECK(gm && gm->router_gating == 2,
+              "and declares the SIGMOID router its files default to ...");
+        CHECK(gm && gm->post_branch_norm && gm->qkv_bias && gm->qk_norm,
+              "... beside glm4's post-attention norm and the q/k/v biases");
+        CHECK(gm && !gm->fused_gate_up,
+              "but NOT glm4's fused gate|up: glm4-moe splits them");
+        const ArchSpec *pm = arch_lookup("phi3moe");
+        CHECK(pm != nullptr && pm->support == ArchSupport::Yes,
+              "phi3moe is supported");
+        CHECK(pm && pm->fused_qkv && pm->fused_gate_up,
+              "and keeps phi3's two fused projections");
+        const ArchSpec *m3 = arch_lookup("minicpm3");
+        CHECK(m3 != nullptr && m3->support == ArchSupport::Yes,
+              "minicpm3 is supported");
+        CHECK(m3 && m3->mla, "as latent attention ...");
+        CHECK(m3 && std::fabs(m3->residual_depth - 1.4f) < 1e-6f,
+              "... with the 1.4 depth scale the reference graph carries");
+    }
     CHECK(arch_lookup("qwen4exp") != nullptr, "the qwen4exp family is in the table");
     CHECK(arch_lookup("qwen4exp")->role == ArchRole::Target &&
               arch_lookup("qwen4exp")->support == ArchSupport::Yes,
@@ -15167,6 +15193,11 @@ enum class MlaFixKind { Legacy, Split, Shared };
 
 struct MlaFix {
     MlaFixKind kind = MlaFixKind::Legacy;
+    // A low-rank query trunk over the LEGACY KV path. That pairing is not one
+    // of llama.cpp's three naming conventions, and it is exactly what MiniCPM3
+    // ships: `attn_q_a`/`attn_q_b` with `attn_kv_a_mqa`/`attn_kv_b`. Without
+    // this the fixture can only pair a q trunk with the V3-class split KV.
+    bool q_lora = false;
     int n_layer = 1;
     bool mixed_layout = false;    // layer 1 carries a different layout
     bool short_k_b = false;       // attn_k_b one column short
@@ -15207,9 +15238,12 @@ static const int kMlaFFExp = 32;
 static const int kMlaOGroups = 1;
 static const int kMlaOLora = 8;
 
-static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
+static bool build_mla_fixture(const std::string &path, const MlaFix &f,
+                              const char *arch_override = nullptr) {
     const bool shared = f.kind == MlaFixKind::Shared;
-    const std::string arch = shared ? "deepseek4" : "deepseek2";
+    const std::string arch =
+        arch_override ? arch_override : (shared ? "deepseek4" : "deepseek2");
+    const bool q_lora = f.q_lora || f.kind != MlaFixKind::Legacy;
     GgufBuilder b;
     b.meta_str("general.architecture", arch);
     b.meta_str("general.name", "kraken-mla-test");
@@ -15231,7 +15265,7 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
         b.meta_u32(arch + ".attention.kv_lora_rank", static_cast<u32>(kMlaKvLora));
     // A low-rank query trunk: the V3 class and V4 have one, the V2-Lite class
     // does not (its query projection is direct).
-    if (f.kind != MlaFixKind::Legacy)
+    if (q_lora)
         b.meta_u32(arch + ".attention.q_lora_rank", static_cast<u32>(kMlaQLora));
     if (shared) {
         // V4's own metadata: the grouped output projection, the window, the
@@ -15302,7 +15336,9 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
                                                   : MlaFixKind::Legacy;
 
         // ---- the query trunk -------------------------------------------
-        if (kind == MlaFixKind::Legacy) {
+        // Independent of the KV layout: a low-rank trunk is `q_lora`, whether
+        // the KV it feeds is the unsplit legacy table or the V3-class pair.
+        if (!q_lora) {
             // attn_q projects straight to n_head*(nope+rope).
             w2(p + "attn_q.weight", static_cast<u64>(kMlaEmbd),
                static_cast<u64>(kMlaHead) * static_cast<u64>(kMlaKeyLen), 100 + l);
@@ -16872,6 +16908,85 @@ static void test_qwen38_is_an_alias() {
     delete be;
     std::remove(real.c_str());
     std::remove(tagged.c_str());
+}
+
+// MiniCPM3 is the V2-Lite latent attention -- which this engine already runs
+// for deepseek2 -- with a low-rank query trunk over that same unsplit KV path,
+// and one thing no other family here has: every layer multiplies the
+// ATTENTION branch's output by `1.4 / sqrt(n_layer)` before the residual add.
+//
+// The scale is the piece worth pinning, because it is invisible in the file:
+// no tensor, no metadata key, just a constant in the reference graph. Get it
+// wrong and the model still loads and still emits fluent text, having added a
+// full-size attention contribution to a stack trained on four fifths of one.
+// So this test checks the resolved VALUE on the config AND that the same bytes
+// under a label without the scale produce different logits.
+static void test_minicpm3_whole_graph() {
+    const std::string m3 = "kraken-minicpm3.gguf";
+    const std::string ds2 = "kraken-minicpm3-as-ds2.gguf";
+    MlaFix f;
+    f.kind = MlaFixKind::Legacy;
+    f.q_lora = true;   // attn_q_a/attn_q_b + attn_kv_a_mqa/attn_kv_b
+    f.n_layer = 4;
+    CHECK(build_mla_fixture(m3, f, "minicpm3"), "wrote the minicpm3 fixture");
+    CHECK(build_mla_fixture(ds2, f, "deepseek2"),
+          "and the same bytes under a label without the depth scale");
+
+    Backend *cpu = make_cpu_backend();
+    auto run = [&](const std::string &path, f32 &scale, std::vector<f32> &lg,
+                   std::string &err) {
+        Model m;
+        if (!m.load(*cpu, path, &err)) return false;
+        scale = m.cfg().attn_out_scale;
+        // A low-rank query trunk over the legacy KV path is what the fixture
+        // carries; the loader must have recognised it rather than refused it
+        // as one of llama.cpp's three named pairings.
+        const bool ok_layout = m.cfg().mla_layout == MlaLayout::Legacy;
+        m.unload();
+        EngineConfig c;
+        c.model_path = path;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        Engine e;
+        if (!e.init(cpu, c, &err)) return false;
+        GenerateParams gp;
+        gp.prompt = "the";
+        gp.max_tokens = 2;
+        gp.sampler.temp = 0.0f;
+        GenerateResult r;
+        if (!e.generate(gp, &r)) return false;
+        lg.assign(e.last_logits(), e.last_logits() + e.model().cfg().n_vocab);
+        return ok_layout;
+    };
+
+    f32 s_m3 = 0.0f, s_ds2 = 0.0f;
+    std::vector<f32> l_m3, l_ds2;
+    std::string err;
+    CHECK(run(m3, s_m3, l_m3, err), "the minicpm3 schema loads and decodes");
+    if (!err.empty()) std::fprintf(stderr, "  (minicpm3: %s)\n", err.c_str());
+    CHECK(std::fabs(s_m3 - 1.4f / std::sqrt(4.0f)) < 1e-6f,
+          "... with the attention branch scaled by 1.4/sqrt(n_layer) = 0.7");
+    CHECK(run(ds2, s_ds2, l_ds2, err),
+          "the same bytes under deepseek2 load and decode too");
+    CHECK(s_ds2 == 1.0f, "... unscaled there, so the compare below is an A/B");
+
+    bool finite = true;
+    for (f32 v : l_m3)
+        if (!std::isfinite(v)) finite = false;
+    CHECK(finite && !l_m3.empty(), "the minicpm3 logits are finite");
+    // The scale is a per-layer multiply on a term that then goes through every
+    // remaining layer, so the logits cannot agree unless the multiply is not
+    // happening. A tolerance is right here rather than a bit compare: the two
+    // files differ by an intentional, large, numeric change.
+    bool differs = l_m3.size() == l_ds2.size() && !l_m3.empty();
+    if (differs) {
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < l_m3.size(); i++)
+            worst = std::max(worst, std::fabs(l_m3[i] - l_ds2[i]));
+        differs = worst > 1e-3f;
+    }
+    CHECK(differs, "and they differ from the unscaled run, so the scale acts");
+    delete cpu;
 }
 
 static void test_qwen4exp_whole_graph() {
@@ -19045,6 +19160,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_qwen4exp_schema)
     TEST_GROUP(test_qwen4exp_forward)
     TEST_GROUP(test_qwen38_is_an_alias)
+    TEST_GROUP(test_minicpm3_whole_graph)
     TEST_GROUP(test_qwen4exp_whole_graph)
     TEST_GROUP(test_qwen4exp_gdn_gate)
     TEST_GROUP(test_qwen4exp_hc_mix)
