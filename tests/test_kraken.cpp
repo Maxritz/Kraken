@@ -14122,8 +14122,17 @@ static void test_npu_backend() {
         }
         // The in-place path must not have cost any host memory: staging is for
         // formats that have no device kernel and q8_0 now has one.
+        //
+        // Gated on the configure-time probe, because the counter is only
+        // reachable when the engine actually exposes VNPU_OP_MATMUL_Q8_0. The
+        // opcode exists in this repo's npuxl patch set and NOT in the upstream
+        // tree the patches were cut from, so an unpatched clone compiled the
+        // counter out and this assertion could never pass -- that is how the
+        // fork divergence documented in docs/NPU-CONSOLIDATED.md §3 was found.
+#if defined(KRK_VNPU_HAS_Q8_0)
         CHECK(npu->backend_stats().find("q8_0 in place") != std::string::npos,
               "the run summary says how many GEMMs read blocks in place");
+#endif
     }
 
     // ---- the counters the run summary prints -------------------------------
