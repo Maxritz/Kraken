@@ -54,11 +54,22 @@ import sys
 
 # ggml tensor type ids (ggml.h); the four this tool writes.
 T_F32, T_F16, T_Q4_0, T_Q8_0 = 0, 1, 2, 8
+# Ternary ids: TQ1_0 is ggml's BitNet format, PTQ1_0 is the Prism/Bonsai
+# group-128 one.
+T_TQ1_0, T_PTQ1_0 = 34, 143
 FORMATS = {
     "f32": (T_F32, 1, 0),
     "f16": (T_F16, 1, 0),
     "q8_0": (T_Q8_0, 34, 32),
     "q4_0": (T_Q4_0, 18, 32),
+    # Ternary, for the TQ1_0 / PTQ1_0 dot kernels. The payload is written as
+    # RAW BYTES rather than from the f32 stream, on purpose: a ternary block is
+    # {-1,0,+1} behind one scale, and every byte pattern decodes to a legal
+    # block. That makes this fixture a reference test rather than a plausible
+    # one -- the dequantising path and the int8 kernel read the SAME bytes, so
+    # any disagreement between them is a kernel bug and nothing else.
+    "ptq1_0": (T_PTQ1_0, 28, 128),
+    "tq1_0": (T_TQ1_0, 54, 256),
 }
 
 GGUF_MAGIC = 0x46554747
@@ -197,6 +208,13 @@ def quantize_q4_0(vals):
     return bytes(out)
 
 
+_rnd = random.Random(0xC0FFEE)
+
+
+def rnd_byte():
+    return _rnd.getrandbits(8)
+
+
 def make_weights(vals, fmt):
     dtype, _blk_bytes, blk = FORMATS[fmt]
     if blk:
@@ -210,6 +228,14 @@ def make_weights(vals, fmt):
         return quantize_q8_0(vals), dtype
     if dtype == T_Q4_0:
         return quantize_q4_0(vals), dtype
+    if dtype in (T_PTQ1_0, T_TQ1_0):
+        # Random trit payload; the scale is a real f16 so the block is legal.
+        nblk = len(vals) // blk
+        raw = bytearray()
+        for _ in range(nblk):
+            raw += bytes(rnd_byte() for _ in range(_blk_bytes - 2))
+            raw += f16(0.02)
+        return bytes(raw), dtype
     raise ValueError(fmt)
 
 
@@ -378,6 +404,22 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
     g.boolean("tokenizer.ggml.add_bos_token", True)
 
     def w(name, n_in, n_out):
+        # Ternary is emitted straight from a byte source: the f32 value list
+        # below exists only to be quantised, and for a ternary block there is
+        # nothing to quantise -- every byte pattern is a legal block. Skipping
+        # it is what makes a model big enough to measure against (a 1024x4096
+        # tensor is 4M Python floats otherwise, for bytes that are then thrown
+        # away one line later).
+        if FORMATS[fmt][0] in (T_PTQ1_0, T_TQ1_0):
+            _t, _bb, _blk = FORMATS[fmt]
+            assert (n_in * n_out) % _blk == 0, (name, n_in, n_out, _blk)
+            nblk = (n_in * n_out) // _blk
+            raw = bytearray()
+            for _ in range(nblk):
+                raw += bytes(rnd_byte() for _ in range(_bb - 2))
+                raw += f16(0.02)
+            g.tensor(name, n_in, n_out, bytes(raw), _t)
+            return
         # Streaming threshold: below it the pure-Python boxed-float list is
         # cheap and gives the fixtures their byte-for-byte reproducibility;
         # above it (an embedding table, a wide projection) the list is

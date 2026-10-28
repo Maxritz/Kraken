@@ -909,6 +909,125 @@ void deq_ptq1_0(const u8 *b, f32 *y, i64 nblk) {
 #include "quant_fmt_b.inc"
 #include "quant_fmt_c.inc"
 
+// ---------------------------------------------------------------------------
+// TERNARY int8 dots: TQ1_0 (BitNet, 256 values / 54 B) and PTQ1_0
+// (Ternary-Bonsai, 128 values / 28 B).
+//
+// Both formats store {-1, 0, +1} behind one f16 scale per block, so the dot
+// against an int8 activation collapses to
+//
+//     dot = d_w * SUM_c dx_c * SUM_{i in chunk c} t_i * xq_i
+//
+// -- no bias term, no per-sub-block weight table, and therefore no `sum(x)`
+// sidecar of the kind Q4_K's dmin term needs. The whole weight-side cost per
+// value is one nibble of the packed trit stream expanded to {-1,0,1}; the
+// activation is never touched beyond the int8 it is already stored as.
+//
+// That is why these matter: at 1.69 and 1.75 bits per weight the stored form is
+// 9x to 18x smaller than the f32 expansion the generic path walks, and the
+// generic path walks it once per row tile.
+//
+// `_mm256_sign_epi8(x, t)` IS x*t for t in {-1,0,1} -- zero stays zero, a
+// negative negates -- so no multiply is needed at all: maddubs then madd reduce
+// 32 trit-weighted products to eight i32 lanes.
+//
+// The trit expansion calls the SAME tq1_trit_at / ptq1_trit_at the dequantiser
+// uses, deliberately. A second "optimised" bit-twiddling copy of the base-3
+// unpack would be a second thing to get wrong, and this one is already pinned
+// against the reference decoder.
+static inline f32 unpack_tq1_trits(const u8 *w, i8 *tr) {
+    for (int v = 0; v < 256; v++) tr[v] = static_cast<i8>(tq1_trit_at(w, v));
+    return fp16_to_fp32(static_cast<u16>(w[52] | (w[53] << 8)));
+}
+
+static inline f32 unpack_ptq1_trits(const u8 *w, i8 *tr) {
+    for (int v = 0; v < 128; v++) tr[v] = static_cast<i8>(ptq1_trit_at(w, v));
+    return fp16_to_fp32(static_cast<u16>(w[26] | (w[27] << 8)));
+}
+
+// SUM over 32 values of t*x, as an i32.
+static inline i32 ternary_chunk_sum(const i8 *xv, const i8 *tv,
+                                    const __m256i ones8, const __m256i ones16) {
+    const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(xv));
+    const __m256i t = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(tv));
+    const __m256i sx = _mm256_sign_epi8(x, t);
+    __m256i pr = _mm256_maddubs_epi16(ones8, sx);
+    pr = _mm256_madd_epi16(pr, ones16);
+    alignas(32) i32 l[8];
+    _mm256_store_si256(reinterpret_cast<__m256i *>(l), pr);
+    return l[0] + l[1] + l[2] + l[3] + l[4] + l[5] + l[6] + l[7];
+}
+
+// B values per block, BLK bytes per block. The trits are expanded once per
+// block and shared by all eight rows -- the same amortisation the K-quant
+// kernels get from unpacking q/hmask/scales once.
+static void ternary_dot_x8_impl(const u8 *w, const i8 *xq, const f32 *dx,
+                                i64 n, i64 rstride, i64 dstride, f32 *out,
+                                i64 out_stride, i64 B, i64 BLK,
+                                f32 (*unpack)(const u8 *, i8 *)) {
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const i64 chunks = B / 32;
+    f32 acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    alignas(32) i8 tr[256];
+    for (i64 nb = 0; nb < n / B; nb++, w += BLK) {
+        const f32 d = unpack(w, tr);
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * B;
+            const f32 *dr = dx + static_cast<i64>(r) * dstride + nb * chunks;
+            f32 a = 0.0f;
+            for (i64 c = 0; c < chunks; c++)
+                a = std::fma(dr[c],
+                             static_cast<f32>(ternary_chunk_sum(
+                                 xr + c * 32, tr + c * 32, ones8, ones16)),
+                             a);
+            acc[r] = std::fma(d, a, acc[r]);
+        }
+    }
+    for (int r = 0; r < 8; r++) out[static_cast<i64>(r) * out_stride] = acc[r];
+}
+
+void tq1_0_q8_x8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                     i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    ternary_dot_x8_impl(w, xq, dx, n, rstride, dstride, out, out_stride, 256, 54,
+                        unpack_tq1_trits);
+}
+
+void ptq1_0_q8_x8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                      i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    ternary_dot_x8_impl(w, xq, dx, n, rstride, dstride, out, out_stride, 128, 28,
+                        unpack_ptq1_trits);
+}
+
+// Single-row form: the trailing (rows % 8) rows, and decode.
+static f32 ternary_dot_1(const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 B,
+                         i64 BLK, f32 (*unpack)(const u8 *, i8 *)) {
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const i64 chunks = B / 32;
+    f32 acc = 0.0f;
+    alignas(32) i8 tr[256];
+    for (i64 nb = 0; nb < n / B; nb++, w += BLK) {
+        const f32 d = unpack(w, tr);
+        f32 a = 0.0f;
+        for (i64 c = 0; c < chunks; c++)
+            a = std::fma(dx[nb * chunks + c],
+                         static_cast<f32>(ternary_chunk_sum(
+                             xq + nb * B + c * 32, tr + c * 32, ones8, ones16)),
+                         a);
+        acc = std::fma(d, a, acc);
+    }
+    return acc;
+}
+
+f32 tq1_0_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return ternary_dot_1(w, xq, dx, n, 256, 54, unpack_tq1_trits);
+}
+
+f32 ptq1_0_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return ternary_dot_1(w, xq, dx, n, 128, 28, unpack_ptq1_trits);
+}
+
 // One whole block of `t` decoded into buf (>= block_size floats).
 void dequant_block(DType t, const u8 *p, f32 *buf) {
     switch (t) {
@@ -958,6 +1077,29 @@ void dequant_block(DType t, const u8 *p, f32 *buf) {
 }
 
 } // namespace
+
+// ---- ternary dot kernels, public -------------------------------------------
+// The implementations live inside the anonymous namespace above because they
+// call the private base-3 trit unpackers -- deliberately the same ones the
+// dequantiser runs, so a kernel and the reference cannot drift apart. These
+// wrappers are the only exported surface.
+void dot_tq1_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                     i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    tq1_0_q8_x8_internal(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+
+void dot_ptq1_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                      i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    ptq1_0_q8_x8_internal(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+
+f32 dot_tq1_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return tq1_0_q8_internal(w, xq, dx, n);
+}
+
+f32 dot_ptq1_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return ptq1_0_q8_internal(w, xq, dx, n);
+}
 
 // ---------------------------------------------------------------------------
 

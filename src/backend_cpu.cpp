@@ -665,10 +665,22 @@ public:
         // than inside vec_dot() is the whole point: vec_dot() is called once
         // per output element, so a per-call quantisation there would undo the
         // win it is trying to buy.
-        if ((wt == DType::Q4_K || wt == DType::Q6_K || wt == DType::Q8_0) &&
+        // Ternary joins here on the same terms: TQ1_0 (BitNet) and PTQ1_0
+        // (Ternary-Bonsai) hold {-1,0,+1} behind one f16 scale, so their dot is
+        // an int8 dot with no bias term and no sidecar -- the cheapest of any
+        // format in this list per stored byte. The gate is the same 256-value
+        // alignment because that is what the activation quantiser produces.
+        if ((wt == DType::Q4_K || wt == DType::Q6_K || wt == DType::Q8_0 ||
+             wt == DType::TQ1_0 || wt == DType::PTQ1_0) &&
             n_in > 0 && (n_in % 256) == 0 && rows > 0 && vec_dot_int8()) {
             const bool q6 = wt == DType::Q6_K;
             const bool q80 = wt == DType::Q8_0;
+            const bool tq1 = wt == DType::TQ1_0;
+            const bool ptq1 = wt == DType::PTQ1_0;
+            // Both ternary formats are "magnitude-split free" like Q8_0: the
+            // dot needs no per-block sum of the activation, so neither aux
+            // array is allocated for them.
+            const bool none_aux = q80 || tq1 || ptq1;
             const i64 nb = n_in / 32;
             // Owned by the CALLING thread and captured by value below. These
             // were thread_local, which looks like a free optimisation and is a
@@ -690,13 +702,14 @@ public:
             // Q4_K kernel reads it; Q6_K does not. Computing it here means it is
             // done once per GEMM call instead of once per weight row.
             const i64 nq4 = n_in / 4;
-            std::vector<i32> xs(q6 || q80 ? 0 : static_cast<size_t>(rows * nb), 0);
+            std::vector<i32> xs(q6 || none_aux ? 0 : static_cast<size_t>(rows * nb), 0);
             // Q6_K's scale changes every 16 values and its bias is 32*sum(16),
             // so it needs its own array; Q4_K's is per 32. Only one is filled.
             std::vector<i32> xs4(q6 ? static_cast<size_t>(rows * nq4) : 0, 0);
             for (i64 r = 0; r < rows; r++) {
-                if (q80)
-                    // No sx[]: the magnitude split is exact, so Q8_0 needs no
+                if (none_aux)
+                    // No sx[]: Q8_0's magnitude split is exact and the ternary
+                    // formats have no bias term at all, so neither needs a
                     // per-block sum of the activation.
                     quantize_q8_row(xf + r * n_in, n_in,
                                     xq.data() + r * n_in, xd.data() + r * nb);
@@ -754,7 +767,13 @@ public:
                               static_cast<f64>(n_out) * static_cast<f64>(n_in);
             const i64 rows8 = rows - rows % 8;
             auto dot8 = [&](const u8 *wr, i64 r, i64 o) {
-                if (q80)
+                if (tq1)
+                    dot_tq1_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                    n_in, nb, of + r * n_out + o, n_out);
+                else if (ptq1)
+                    dot_ptq1_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                     n_in, nb, of + r * n_out + o, n_out);
+                else if (q80)
                     dot_q8_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in,
                                    nb, of + r * n_out + o, n_out);
                 else if (q6)
@@ -767,6 +786,10 @@ public:
                                       of + r * n_out + o, n_out);
             };
             auto dot1 = [&](const u8 *wr, i64 r, i64 o) {
+                if (tq1)
+                    return dot_tq1_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (ptq1)
+                    return dot_ptq1_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
                 if (q80)
                     return dot_q8_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
                 if (q6)
