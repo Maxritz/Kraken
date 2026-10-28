@@ -1041,7 +1041,13 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // engine splits the two apart.
     // The arch table owns this rule; the engine only mirrors it (see
     // include/krk/arch.hpp for why it lives in one place).
-    q_proj_ = arch_spec(mc.arch).q_output_gate ? 2 * q_dim_ : q_dim_;
+    // From the RESOLVED spec's own flag, not from arch_spec(mc.arch): an arch
+    // that is an alias (qwen38 -> qwen4exp, decided from the file's tensors)
+    // carries a different spec than its name does, and asking by name here
+    // silently halved the query width on a file whose q row is packed. The
+    // loader had already read the packed row, so the two disagreed and the
+    // graph decoded a different model.
+    q_proj_ = mc.q_output_gate ? 2 * q_dim_ : q_dim_;
     conv_dim_ = model_.conv_dim();
     value_dim_ = model_.value_dim();
     n_vocab_ = mc.n_vocab;
@@ -1403,13 +1409,18 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         ws_mla_ = alloc(static_cast<size_t>(C) *
                         static_cast<size_t>(mc.mla_kv_lora + mc.mla_qk_rope) * as);
         if (!check_alloc(ws_mla_, "ws_mla")) return false;
-        if (mc.mla_layout == MlaLayout::Shared) {
-            // The trunk's intermediate row and the grouped output's f32
-            // accumulator. Sized by the file's own geometry, so a V4 file with
-            // 8 groups of 1024 reserves what it asks for and nothing more.
+        // The trunk's intermediate row. Sized by the file's own geometry, so a
+        // V4 file with 8 groups of 1024 reserves what it asks for and nothing
+        // more -- and reserved for BOTH layouts: the LITE path carries a query
+        // trunk too (the V3 class and MiniCPM3), and gating this allocation on
+        // the shared layout left `ws_mlaqn_` null on every file that had one.
+        // That read as a working load and a SIGSEGV on the first token.
+        if (mc.mla_q_lora > 0) {
             ws_mlaqn_ = alloc(static_cast<size_t>(C) *
                               static_cast<size_t>(mc.mla_q_lora) * as);
             if (!check_alloc(ws_mlaqn_, "ws_mlaqn")) return false;
+        }
+        if (mc.mla_layout == MlaLayout::Shared) {
             // f32, not `as`: see the member's note -- the grouped output reads it
             // and the host oracle it is compared against keeps f32 there.
             ws_mlaa_ = alloc(static_cast<size_t>(C) *
@@ -2980,7 +2991,7 @@ void Engine::head_compute(i32 row) {
         had_xform(ws_had_, ws_xn_, 1, n_embd_, false, false);
         xn = ws_had_;
     }
-    gemm_w(ws_logits_, xn, head, n_vocab_, n_embd_, 1);
+    logit_head(xn);
 }
 
 // GPT-2's forward: a clean loop, because its graph is a different shape rather
@@ -3274,7 +3285,7 @@ bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
     const i32 row = n - 1;
     layernorm(ws_xn_, act_at(ws_x_, be_->act_size(), static_cast<i64>(row) * E),
               model_.out_norm(), model_.out_norm_bias(), 1, E, eps);
-    gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, E, 1);
+    logit_head(ws_xn_);
     return true;
 }
 
@@ -3809,6 +3820,14 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // broadcast over the rows of the GEMM output, which is exactly the
         // `add_bias_cols` shape (n rows of n_embd columns).
         if (L.wo_bias) be_->add_bias_cols(ws_x2_, L.wo_bias, n, n_embd_);
+        // MiniCPM3's depth scale: the ATTENTION branch is multiplied by
+        // `depth / sqrt(n_layer)` before it joins the residual, and only that
+        // branch -- the FFN's output is added at full weight. It is one
+        // constant per stack, so it is divided once at load (ModelConfig says
+        // why) and applied here, where the branch's final value is known and
+        // nothing else has read it yet. Skipped entirely at 1.0.
+        if (mc.attn_out_scale != 1.0f)
+            be_->scale_act(ws_x2_, mc.attn_out_scale, n, n_embd_, n_embd_);
         dump_row("attn.proj", l, ws_x2_, n_embd_, n);
         // Branch post norm (gemma2/3/4, muse-glimmer): the projection's own
         // output is normalized with THIS branch's weight before it joins the
@@ -3937,6 +3956,15 @@ void Engine::gemm_w(void *dst, const void *x, const QuantTensor &w, i64 n_out,
     be_->copy_act(ws_gs_, x, rows * n_in);
     be_->scale_act(ws_gs_, w.gs, rows, n_in, n_in);
     be_->gemm(dst, ws_gs_, w.data, w.type, n_out, n_in, rows);
+}
+
+void Engine::logit_head(const void *xn) {
+    gemm_w(ws_logits_, xn, model_.out_head(), n_vocab_, n_embd_, 1);
+    // Phi-MoE's `output.bias`. Adding it on the device keeps the buffer the
+    // single source of truth: topk_argmax() reads ws_logits_ directly and never
+    // sees the host copy.
+    if (const f32 *b = model_.out_bias())
+        be_->add_bias_rows(ws_logits_, b, n_vocab_, 1);
 }
 
 void Engine::gemm_residual(void *dst, const void *x, const void *w, DType wt,
@@ -4569,7 +4597,7 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
         const u64 th0 = now_us();
         be_->rmsnorm(ws_xn_, ws_x_, m.shared_head_norm, 1, n_embd_, mc.rms_eps);
         const QuantTensor &head = model_.out_head();
-        gemm_w(ws_logits_, ws_xn_, head, n_vocab_, n_embd_, 1);
+        logit_head(ws_xn_);
         if (hsplit) {
             be_->sync();
             prop_head_ms_ += static_cast<f64>(now_us() - th0) / 1000.0;
@@ -4714,7 +4742,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
                 // The same head, twice: once on the block's row, once on the
                 // stack's. rmsnorm is scale-invariant, so a row that is merely
                 // scaled differently still competes fairly here.                be_->rmsnorm(ws_xn_, ws_x_, model_.out_norm(), 1, n_embd_, mc.rms_eps);
-                gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, n_embd_, 1);
+                logit_head(ws_xn_);
                 be_->download_f32(logits_host_, ws_logits_, n_vocab_);
                 const i32 blk_rank =
                     rank_of_token(logits_host_, n_vocab_, nxt, mc.logit_softcap);
@@ -4722,8 +4750,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
                 if (!last_row) {
                     be_->rmsnorm(ws_xn_, cap_row, model_.out_norm(), 1, n_embd_,
                                  mc.rms_eps);
-                    gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, n_embd_,
-                           1);
+                    logit_head(ws_xn_);
                     be_->download_f32(logits_host_, ws_logits_, n_vocab_);
                     cap_rank =
                         rank_of_token(logits_host_, n_vocab_, nxt, mc.logit_softcap);
@@ -4732,8 +4759,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
                     // output is what the probe (and the caller) reads next.
                     be_->rmsnorm(ws_xn_, ws_x_, m.shared_head_norm, 1, n_embd_,
                                  mc.rms_eps);
-                    gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, n_embd_,
-                           1);
+                    logit_head(ws_xn_);
                 }
                 rowfid_pos_.push_back(p);
                 rowfid_cos_.push_back(cos);
@@ -4784,7 +4810,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
             had_xform(ws_had_, ws_xn_, 1, n_embd_, false, false);
             xn = ws_had_;
         }
-        gemm_w(ws_logits_, xn, model_.out_head(), n_vocab_, n_embd_, 1);
+        logit_head(xn);
         r.capture_id = read_argmax(&r.capture_logit);
         std::memcpy(logits_host_, keep.data(),
                     static_cast<size_t>(n_vocab_) * sizeof(f32));
@@ -6807,7 +6833,30 @@ bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     // 2. the query, directly projected: head h owns columns
     // [h*(nope+rope), ...), nope first -- the file's own packing, and the same
     // packing mla_attention reads.
-    gemm_w(ws_q_, ws_xn_, L.wq_direct, nh * qk, n_embd_, n);
+    // 2. the query. A file with a `q_lora_rank` stores a LOW-RANK TRUNK
+    // (attn_q_a -> attn_q_a_norm -> attn_q_b) instead of one direct
+    // projection, and the two are different graphs -- not two shapes of one.
+    // Only the direct form was ever projected here, so on a trunk file the
+    // missing tensor was multiplied by an absent weight and the queries came
+    // out at 2.8e22, turning into NaN one layer later with no error from the
+    // loader: it had read and shape-checked the trunk, and the forward simply
+    // never asked for it. Measured on a MiniCPM3 fixture (the V2-Lite KV path
+    // with a trunk over it), which is the pairing no earlier fixture covered.
+    if (L.wq_a.present()) {
+        const i64 ql = mc.mla_q_lora;
+        gemm_w(ws_mlaqn_, ws_xn_, L.wq_a, ql, n_embd_, n);
+        be_->rmsnorm(ws_mlaqn_, ws_mlaqn_, L.wq_a_norm, n, ql, mc.rms_eps,
+                     nullptr);
+        dump_row("mla.qa", l, ws_mlaqn_, ql, n);
+        gemm_w(ws_q_, ws_mlaqn_, L.wq_b, nh * qk, ql, n);
+    } else if (L.wq_direct.present()) {
+        gemm_w(ws_q_, ws_xn_, L.wq_direct, nh * qk, n_embd_, n);
+    } else {
+        KRK_ERROR("mla: layer %lld carries neither a query trunk "
+                  "(attn_q_a/attn_q_b) nor a direct query projection",
+                  static_cast<long long>(l));
+        return false;
+    }
     dump_row("mla.q", l, ws_q_, nh * qk, n);
 
     // 3. append this pass's rows. Must precede the attention call: row pos0+0 is
