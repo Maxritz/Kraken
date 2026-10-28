@@ -48,6 +48,7 @@ the format has no kernel. `REFUSED` = no arch.
 |---|---|---|---|
 | Firefly-v5.Q4_K_M | llama¹ | Q4_K | FAST |
 | gemma-4-E4B-it-Q4_K_M | `gemma4` ✓ | Q4_K | FAST — two geometries, per-layer input embeddings, weightless value norm, layer_output_scale, proportional rope, shared-KV tail; pinned by `test_gemma4_forward` |
+| gemma-4-26B-A4B / 31B (routed) | `gemma4` — dense graph only | Q4_K | **REFUSED by file** — the 26B/31B layers are two separately-normed branches (shared MLP + `post_ffw_norm_1`, experts + `pre_norm_2`/`post_ffw_norm_2`) with a router on a weightless norm of the attention output; the generic MoE block would run a different graph, so the loader names it and stops |
 | GLM-4.7-Flash-Q4_K_M | `glm4` ✓ | Q4_K | FAST |
 | L3.2-8X3B-MOE-…-Q8_0 | llama-moe² | Q8_0 | FAST if ² |
 | (Phi-3.5-MoE class) | `phi3moe` ✓ | Q4_K | FAST |

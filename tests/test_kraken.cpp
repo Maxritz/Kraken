@@ -5137,7 +5137,8 @@ static void test_dsv4_compressed_attention() {
 // that only that norm can cancel), so a wiring that silently dropped one would
 // fail here rather than decode fluently.
 static bool build_gemma4_model(const std::string &path, int n_layer, int n_kv_shared,
-                               f32 v_scale, f32 out_scale, bool zero_ple) {
+                               f32 v_scale, f32 out_scale, bool zero_ple,
+                               bool routed = false) {
     const int n_embd = 16, n_head = 2, n_kv = 1, hd = 8, n_ff = 32, vocab = 260;
     const int ctx = 64;
     const int npl = 4;  // embedding_length_per_layer_input
@@ -5218,6 +5219,24 @@ static bool build_gemma4_model(const std::string &path, int n_layer, int n_kv_sh
         b.tensor_f32(p + "post_norm.weight", {u64(n_embd)}, ones(n_embd));
         b.tensor_f32(p + "layer_output_scale.weight", {1},
                      std::vector<f32>{out_scale});
+        if (routed) {
+            // A routed gemma4 layer: the router, the two branch norms the
+            // generic MoE block does not have, and a two-expert bank. Nothing
+            // in this fixture is run -- the loader must refuse the file before
+            // a forward can read it through the wrong graph.
+            b.tensor_f32(p + "ffn_gate_inp.weight", {u64(n_embd), u64(2)},
+                         vec(static_cast<size_t>(n_embd) * 2, base + 1200, 1.0f));
+            b.tensor_f32(p + "ffn_gate_inp.scale", {u64(n_embd)}, ones(n_embd));
+            b.tensor_f32(p + "post_ffw_norm_1.weight", {u64(n_embd)}, ones(n_embd));
+            b.tensor_f32(p + "pre_norm_2.weight", {u64(n_embd)}, ones(n_embd));
+            b.tensor_f32(p + "post_ffw_norm_2.weight", {u64(n_embd)}, ones(n_embd));
+            b.tensor_f16(p + "ffn_gate_exps.weight", {u64(n_embd), u64(8), u64(2)},
+                         vec(static_cast<size_t>(n_embd) * 8 * 2, base + 1300, 1.0f));
+            b.tensor_f16(p + "ffn_up_exps.weight", {u64(n_embd), u64(8), u64(2)},
+                         vec(static_cast<size_t>(n_embd) * 8 * 2, base + 1400, 1.0f));
+            b.tensor_f16(p + "ffn_down_exps.weight", {u64(8), u64(n_embd), u64(2)},
+                         vec(static_cast<size_t>(8) * n_embd * 2, base + 1500, 1.0f));
+        }
     }
     return b.write(path);
 }
@@ -5358,6 +5377,32 @@ static void test_gemma4_forward() {
         }
         // The backend outlives the engine: Engine::shutdown() releases its
         // workspaces through the pointer it was given.
+        delete be;
+    }
+
+    // ---- the routed variant is refused by name until its branch lands ------
+    // A routed gemma4 layer is a different graph (two separately-normed
+    // branches, router on a weightless norm). Running it through the generic
+    // MoE block would decode fluent wrong text, so the loader has to stop it --
+    // and say which shape it read.
+    {
+        const std::string moe_file = "kraken-gemma4-moe.gguf";
+        CHECK(build_gemma4_model(moe_file, 4, 0, 1.0f, 1.0f, false, true),
+              "wrote the routed gemma4 fixture");
+        Backend *be = make_cpu_backend();
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = moe_file;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            std::string merr;
+            const bool loaded = e.init(be, c, &merr);
+            CHECK(!loaded, "a routed gemma4 file is refused, not run as another graph");
+            CHECK(merr.find("pre_norm_2") != std::string::npos &&
+                      merr.find("shared MLP") != std::string::npos,
+                  "... and the refusal names the branch it would have had to run");
+        }
         delete be;
     }
 
