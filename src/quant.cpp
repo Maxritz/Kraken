@@ -2692,7 +2692,11 @@ __attribute__((target("avx2,fma"))) double probe_int8_avx2_gmacs() {
     // ceiling -- which is how the first version of this probe reported 301
     // GMAC/s that no kernel could reach.
     __m256i a = _mm256_set1_epi8(3);
-    const __m256i b = _mm256_set1_epi8(2);
+    // Distinct multiplier per chain -- see the AVX-512 probe below for why.
+    const __m256i b0 = _mm256_set1_epi8(2), b1 = _mm256_set1_epi8(3);
+    const __m256i b2 = _mm256_set1_epi8(4), b3 = _mm256_set1_epi8(5);
+    const __m256i b4 = _mm256_set1_epi8(6), b5 = _mm256_set1_epi8(7);
+    const __m256i b6 = _mm256_set1_epi8(8), b7 = _mm256_set1_epi8(9);
     const __m256i bump = _mm256_set1_epi8(1);
     const __m256i ones = _mm256_set1_epi16(1);
     __m256i s0 = _mm256_setzero_si256(), s1 = _mm256_setzero_si256();
@@ -2703,14 +2707,14 @@ __attribute__((target("avx2,fma"))) double probe_int8_avx2_gmacs() {
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int i = 0; i < iters; i++) {
         a = _mm256_add_epi8(a, bump);
-        s0 = _mm256_add_epi32(s0, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
-        s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
-        s2 = _mm256_add_epi32(s2, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
-        s3 = _mm256_add_epi32(s3, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
-        s4 = _mm256_add_epi32(s4, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
-        s5 = _mm256_add_epi32(s5, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
-        s6 = _mm256_add_epi32(s6, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
-        s7 = _mm256_add_epi32(s7, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
+        s0 = _mm256_add_epi32(s0, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b0), ones));
+        s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b1), ones));
+        s2 = _mm256_add_epi32(s2, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b2), ones));
+        s3 = _mm256_add_epi32(s3, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b3), ones));
+        s4 = _mm256_add_epi32(s4, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b4), ones));
+        s5 = _mm256_add_epi32(s5, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b5), ones));
+        s6 = _mm256_add_epi32(s6, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b6), ones));
+        s7 = _mm256_add_epi32(s7, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b7), ones));
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     s0 = _mm256_add_epi32(_mm256_add_epi32(s0, s1), _mm256_add_epi32(s2, s3));
@@ -2731,7 +2735,16 @@ double probe_int8_avx2_gmacs() { return 0.0; }
 __attribute__((target("avx512f,avx512bw"))) double probe_int8_bw_gmacs() {
     const int iters = 20000;
     __m512i a = _mm512_set1_epi8(3);
-    const __m512i b = _mm512_set1_epi8(2);
+    // One multiplier per chain. With a shared `b` all eight maddubs are the
+    // same expression, and with both operands loop-invariant the compiler is
+    // entitled to compute one of them outside the loop -- which it does: the
+    // disassembly of the previous version had a single vpmaddubsw and a single
+    // vpaddd in the body while crediting eight dots, overstating the ceiling by
+    // roughly 8x. Every %peak column divided by that number.
+    const __m512i b0 = _mm512_set1_epi8(2), b1 = _mm512_set1_epi8(3);
+    const __m512i b2 = _mm512_set1_epi8(4), b3 = _mm512_set1_epi8(5);
+    const __m512i b4 = _mm512_set1_epi8(6), b5 = _mm512_set1_epi8(7);
+    const __m512i b6 = _mm512_set1_epi8(8), b7 = _mm512_set1_epi8(9);
     const __m512i bump = _mm512_set1_epi8(1);
     const __m512i ones = _mm512_set1_epi16(1);
     __m512i s0 = _mm512_setzero_si512(), s1 = _mm512_setzero_si512();
@@ -2742,14 +2755,14 @@ __attribute__((target("avx512f,avx512bw"))) double probe_int8_bw_gmacs() {
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int i = 0; i < iters; i++) {
         a = _mm512_add_epi8(a, bump);
-        s0 = _mm512_add_epi32(s0, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
-        s1 = _mm512_add_epi32(s1, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
-        s2 = _mm512_add_epi32(s2, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
-        s3 = _mm512_add_epi32(s3, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
-        s4 = _mm512_add_epi32(s4, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
-        s5 = _mm512_add_epi32(s5, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
-        s6 = _mm512_add_epi32(s6, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
-        s7 = _mm512_add_epi32(s7, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), ones));
+        s0 = _mm512_add_epi32(s0, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b0), ones));
+        s1 = _mm512_add_epi32(s1, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b1), ones));
+        s2 = _mm512_add_epi32(s2, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b2), ones));
+        s3 = _mm512_add_epi32(s3, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b3), ones));
+        s4 = _mm512_add_epi32(s4, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b4), ones));
+        s5 = _mm512_add_epi32(s5, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b5), ones));
+        s6 = _mm512_add_epi32(s6, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b6), ones));
+        s7 = _mm512_add_epi32(s7, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b7), ones));
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     s0 = _mm512_add_epi32(_mm512_add_epi32(s0, s1), _mm512_add_epi32(s2, s3));
