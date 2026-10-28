@@ -2397,7 +2397,179 @@ bool env_dot_x8sx() {
 // the scale changes every 32 and one cvt + one fma per block per row is the
 // floor for this layout.
 __attribute__((target("avx2,fma")))
+// ---------------------------------------------------------------------------
+// Single-row q8_0 dot: the DECODE kernel.
+//
+// Everything in this file that got faster over the last few rounds -- the sign
+// flip, the f16c scale decode, VNNI -- was applied to the eight-row prefill
+// kernel. Decode calls this one, once per output element with one activation
+// row, and it was still the original 256-bit form: two maddubs per block for
+// the positive and negative halves, a scalar fp16 decode, no VNNI, no 512-bit
+// width. On a top-4 MoE decode step this is the kernel that runs the most.
+//
+// Same three ideas, applied here:
+//   * sign flip: sum(w*x) = sum(|w| * (x * sign(w))), one maddubs instead of
+//     two, and the negative half never exists as a register;
+//   * one F16C convert for two block scales;
+//   * VNNI where the host has it, 512-bit BW where it does not, the existing
+//     256-bit kernel below that, and scalar as the floor.
+//
+// The rungs are bit-compatible with each other to the f32 reassociation the
+// other fixtures bound at 1e-6, and tools/ta_q80_tiers.cpp checks them.
+
+// Scalar floor. Same rounding points as the vector rungs so a rung that matches
+// it is showing identical arithmetic rather than a lucky approximation.
+f32 dot_q8_0_q8_scalar(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    const i64 nb = n / 32;
+    f32 acc = 0.0f;
+    for (i64 b = 0; b < nb; b++, w += 34) {
+        const f32 d = fp16_to_fp32(
+            static_cast<u16>(w[0] | (static_cast<u16>(w[1]) << 8)));
+        i64 sum = 0;
+        for (i64 i = 0; i < 32; i++) {
+            const i32 wv =
+                static_cast<i32>(static_cast<i8>(static_cast<u8>(w[2 + i])));
+            const i32 xv =
+                static_cast<i32>(static_cast<i8>(static_cast<u8>(xq[b * 32 + i])));
+            sum += static_cast<i64>(wv) * static_cast<i64>(xv);
+        }
+        acc = std::fma(static_cast<f32>(sum), d * dx[b], acc);
+    }
+    return acc;
+}
+
+// 512-bit, two blocks per iteration, sign flipped. BW only -- no VNNI needed.
+__attribute__((target("avx512f,avx512bw,f16c")))
+f32 dot_q8_0_q8_bw(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    const i64 nb = n / 32;
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i ones = _mm512_set1_epi16(1);
+    __m512 acc = _mm512_setzero_ps();
+    for (i64 b = 0; b + 2 <= nb; b += 2, w += 68) {
+        const __m128i two = _mm_setr_epi16(
+            static_cast<short>(w[0] | (static_cast<u16>(w[1]) << 8)),
+            static_cast<short>(w[34] | (static_cast<u16>(w[35]) << 8)), 0, 0, 0, 0,
+            0, 0);
+        const __m128 d2 = _mm_cvtph_ps(two);
+        const f32 d0 = _mm_cvtss_f32(d2);
+        const f32 d1 = _mm_cvtss_f32(_mm_shuffle_ps(d2, d2, 0x55));
+        const __m256i lo =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i hi =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 36));
+        const __m512i wv = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+        const __mmask64 neg = _mm512_cmp_epi8_mask(wv, zero, _MM_CMPINT_LT);
+        const __m512i mag = _mm512_mask_sub_epi8(wv, neg, zero, wv);
+        const __m512i xv = _mm512_loadu_si512(
+            reinterpret_cast<const void *>(xq + b * 32));
+        const __m512i xb = _mm512_mask_sub_epi8(xv, neg, zero, xv);
+        const __m512i iv = _mm512_madd_epi16(_mm512_maddubs_epi16(mag, xb), ones);
+        const f32 s0 = d0 * dx[b];
+        const f32 s1 = d1 * dx[b + 1];
+        const __m512 sc = _mm512_castsi512_ps(_mm512_inserti64x4(
+            _mm512_castps_si512(
+                _mm512_castps256_ps512(_mm256_broadcast_ss(&s0))),
+            _mm256_castps_si256(_mm256_broadcast_ss(&s1)), 1));
+        acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iv), sc, acc);
+    }
+    // An odd block count leaves the last block to the tail below.
+    f32 tail = 0.0f;
+    for (i64 b = (nb / 2) * 2; b < nb; b++) {
+        const u8 *blk = w + (b - (nb / 2) * 2) * 34;
+        const f32 d = fp16_to_fp32(
+            static_cast<u16>(blk[0] | (static_cast<u16>(blk[1]) << 8)));
+        i64 sum = 0;
+        for (i64 i = 0; i < 32; i++) {
+            const i32 wv2 =
+                static_cast<i32>(static_cast<i8>(static_cast<u8>(blk[2 + i])));
+            const i32 xv2 = static_cast<i32>(
+                static_cast<i8>(static_cast<u8>(xq[b * 32 + i])));
+            sum += static_cast<i64>(wv2) * static_cast<i64>(xv2);
+        }
+        tail = std::fma(static_cast<f32>(sum), d * dx[b], tail);
+    }
+    return _mm512_reduce_add_ps(acc) + tail;
+}
+
+// VNNI: one dpbusd where the BW rung needs maddubs + madd.
+__attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
+f32 dot_q8_0_q8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    const i64 nb = n / 32;
+    const __m512i zero = _mm512_setzero_si512();
+    __m512 acc = _mm512_setzero_ps();
+    for (i64 b = 0; b + 2 <= nb; b += 2, w += 68) {
+        const __m128i two = _mm_setr_epi16(
+            static_cast<short>(w[0] | (static_cast<u16>(w[1]) << 8)),
+            static_cast<short>(w[34] | (static_cast<u16>(w[35]) << 8)), 0, 0, 0, 0,
+            0, 0);
+        const __m128 d2 = _mm_cvtph_ps(two);
+        const f32 d0 = _mm_cvtss_f32(d2);
+        const f32 d1 = _mm_cvtss_f32(_mm_shuffle_ps(d2, d2, 0x55));
+        const __m256i lo =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i hi =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 36));
+        const __m512i wv = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+        const __mmask64 neg = _mm512_cmp_epi8_mask(wv, zero, _MM_CMPINT_LT);
+        const __m512i mag = _mm512_mask_sub_epi8(wv, neg, zero, wv);
+        const __m512i xv = _mm512_loadu_si512(
+            reinterpret_cast<const void *>(xq + b * 32));
+        const __m512i xb = _mm512_mask_sub_epi8(xv, neg, zero, xv);
+        // Unsigned operand second: see the note on the eight-row VNNI kernel.
+        const __m512i iv = _mm512_dpbusd_epi32(zero, mag, xb);
+        const f32 s0 = d0 * dx[b];
+        const f32 s1 = d1 * dx[b + 1];
+        const __m512 sc = _mm512_castsi512_ps(_mm512_inserti64x4(
+            _mm512_castps_si512(
+                _mm512_castps256_ps512(_mm256_broadcast_ss(&s0))),
+            _mm256_castps_si256(_mm256_broadcast_ss(&s1)), 1));
+        acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iv), sc, acc);
+    }
+    const i64 done = (nb / 2) * 2;
+    f32 tail = 0.0f;
+    for (i64 b = done; b < nb; b++) {
+        const u8 *blk = w + (b - done) * 34;
+        const f32 d = fp16_to_fp32(
+            static_cast<u16>(blk[0] | (static_cast<u16>(blk[1]) << 8)));
+        i64 sum = 0;
+        for (i64 i = 0; i < 32; i++) {
+            const i32 wv2 =
+                static_cast<i32>(static_cast<i8>(static_cast<u8>(blk[2 + i])));
+            const i32 xv2 = static_cast<i32>(
+                static_cast<i8>(static_cast<u8>(xq[b * 32 + i])));
+            sum += static_cast<i64>(wv2) * static_cast<i64>(xv2);
+        }
+        tail = std::fma(static_cast<f32>(sum), d * dx[b], tail);
+    }
+    return _mm512_reduce_add_ps(acc) + tail;
+}
+
 f32 dot_q8_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    // Decode's ladder, same rungs and same guards as the eight-row kernel.
+    // KRK_CPU_Q80_KERNEL forces a rung for testing (r1|bw|vnni|scalar).
+    static const i32 forced = [] {
+        const char *e = std::getenv("KRK_CPU_Q80_KERNEL");
+        if (!e || !e[0]) return 0;
+        if (std::strcmp(e, "vnni") == 0) return 3;
+        if (std::strcmp(e, "bw") == 0) return 2;
+        if (std::strcmp(e, "avx2") == 0) return 1;
+        if (std::strcmp(e, "scalar") == 0) return -1;
+        return 0;
+    }();
+#if defined(KRK_DOT_AVX512)
+    if ((forced == 0 || forced == 3) && cpu_has_avx512bw() && cpu_has_vnni())
+        return dot_q8_0_q8_vnni(w, xq, dx, n);
+    if ((forced == 0 || forced == 2) && cpu_has_avx512bw())
+        return dot_q8_0_q8_bw(w, xq, dx, n);
+#endif
+    if (forced == -1) return dot_q8_0_q8_scalar(w, xq, dx, n);
+    if (forced == 3 || forced == 2) {
+        // Asked for a rung this build or this CPU cannot run: fall through to
+        // the best available rather than returning a wrong number.
+        if (forced == 3 && !cpu_has_vnni() && cpu_has_avx512bw())
+            return dot_q8_0_q8_bw(w, xq, dx, n);
+    }
+    if (!cpu_has_avx2()) return dot_q8_0_q8_scalar(w, xq, dx, n);
     const i64 nb = n / 32;
     const __m256i zero = _mm256_setzero_si256();
     const __m256i ones = _mm256_set1_epi16(1);

@@ -856,6 +856,29 @@ four sequences at positions 3/17/40/63 must equal the same rows computed one at
 a time, **bit for bit**. They do, in both the causal and prefix cases, and the
 legacy contiguous path is unchanged.
 
+##### Decode had none of it, and now does
+
+Every kernel win of the previous rounds went into the *eight-row prefill*
+kernel. Decode calls the single-row one, which was still the original 256-bit
+form: two `maddubs` per block, a scalar fp16 decode, no sign flip. It now has all
+three ideas, and decode went **66.6 -> 78.2 tok/s median** (3 interleaved reps).
+VNNI specifically buys nothing at one row (latency-bound, one accumulator
+chain), so `bw` and `vnni` are equal there; the win is width + sign flip + f16c.
+
+Prefill, same three reps: `avx2` 345.4, `bw` 395.2, **`vnni` 433.5 tok/s**
+median — 1.26x across the ladder. Full tables, component breakdown and the
+historical progression are in `docs/SCORES.md`.
+
+##### The fill is 1% and the allocation behind it was the bug
+
+`docs/FILL-CODE-ANALYSIS.md` measures it: quantising 512x768 activations costs
+0.145 ms, and 84 GEMM calls per prefill make that **12.1 ms, 1.0% of the run**.
+Parallelising it would save half a percent, inside this host's noise — so the
+serial fill loop is not a lever and was left alone. What *was* wrong: the two
+auxiliary arrays (`xs` for Q4_K, `xs4` for Q6_K) were allocated and zero-filled
+**for every format**, so Q8_0 paid 442 KiB of pointless memset per GEMM call.
+They are now sized to zero where unused.
+
 ##### Against the engine spec
 
 `docs/EXPERT-PATH-BUDGET.md` measures what expert management is actually worth.
