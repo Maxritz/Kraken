@@ -1061,6 +1061,15 @@ public:
     // instead of decoding a model whose attention is a different function.
     virtual bool attention_softcap_supported() const { return true; }
 
+    // Whether attention() applies AttnDesc::alibi_max_bias. The reference body
+    // does. This is a capability query rather than an assumption for the same
+    // reason as the one above: ALiBi is part of the model's DEFINITION, not an
+    // optimisation. A backend that skipped the bias would decode a different
+    // attention distribution and look perfectly healthy doing it, so a family
+    // that declares an ALiBi scale refuses BY NAME on a backend that answers
+    // false -- exactly as the softcap families do.
+    virtual bool attention_alibi_supported() const { return true; }
+
     // Quantized KV. A backend that cannot read a format says so instead of
     // running the f16 path over int8 bytes, which would be fluent nonsense:
     // Engine::init refuses the run by name when this answers false.

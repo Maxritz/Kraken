@@ -198,6 +198,11 @@ struct AttnCall {
     i64 window = 0;
     i64 skip_from = -1;
     f32 softcap = 0.0f;
+    // ALiBi's scale. The device body has no per-head distance bias, so a call
+    // carrying one is refused below rather than run WITHOUT it: the bias is the
+    // family's whole position signal, so dropping it would decode fluent text
+    // from a different attention distribution.
+    f32 alibi_max_bias = 0.0f;
 };
 
 // Run one attention call on the device. Returns false -- having written

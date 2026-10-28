@@ -129,13 +129,17 @@ verified by equality rather than by inspection.
 alone would be invisible):
 
 ```
-mpt --qk-norm  140=1.11651647(-0.685522) 16=1.10120773(-0.700831)
-mpt            42=1.16766608(-0.685854) 70=1.15302539(-0.700494)
+mpt            70=1.30606139(-0.668154) 42=1.25543475(-0.718781)
+mpt --qk-norm  140=1.07797599(-0.674125) 16=1.03956342(-0.712538)
 ```
 
+The ramp exists because an all-ones RMSNorm weight *is* the identity: with one, a
+file cannot distinguish "the engine applied the tensor" from "the engine ignored
+it". The block had been loaded and never called, which is a wrong answer that
+decodes.
+
 Eight tokens of decode on both families: no NaN, no inf, KV cache resident, no
-tiering traffic. `kraken-inspect` reports both `supported (dense)` / `runnable`;
-`kraken-tests` **5039/5039**.
+tiering traffic. `kraken-inspect` reports both `supported (dense)` / `runnable`.
 
 ## falcon: parallel attention with two norms
 
@@ -186,7 +190,7 @@ falcon-ln2-id    73=1.18236196(-0.682557) 24=1.16106832(-0.703851)
 
 Equal to the last digit. Norming after the attention residual would consume a
 different row and could not match. `kraken-inspect`: `supported (dense)` /
-`runnable`; `kraken-tests` **5083/5083**.
+`runnable`. `kraken-tests` **5153/5153** across 115 groups.
 
 ## Still refused
 

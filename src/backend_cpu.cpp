@@ -305,7 +305,8 @@ inline AttnRange attn_range(const AttnDesc &d, i64 t) {
 // without a second copy of the arithmetic.
 __attribute__((target("avx2,fma"))) void attn_row_f32_avx2(
     const f32 *qf, const f32 *kbase, const f32 *vbase, i64 row_stride, f32 *of,
-    const AttnDesc &d, i64 t, i64 h, const AttnRange &r, f32 *scores) {
+    const AttnDesc &d, i64 t, i64 h, i64 kpos0, const AttnRange &r,
+    f32 *scores) {
     const i64 hd = d.hd;
     const i64 n_vis = r.n_vis;
     if (n_vis <= 0) return;
@@ -339,6 +340,13 @@ __attribute__((target("avx2,fma"))) void attn_row_f32_avx2(
         for (i64 j = 0; j < n_vis; j++)
             scores[j] = attn_dot_avx2(qh, kbase + j * row_stride, hd);
     }
+    // ALiBi's slope is a property of the HEAD, so it is one multiply-add in
+    // this per-key pass rather than a table lookup. `kpos0` is the absolute
+    // position of j == 0, which on a causal row is the row's own position
+    // minus (n_vis - 1).
+    const f32 slope = d.alibi_max_bias > 0.0f
+                          ? alibi_slope_impl(h, d.n_head, d.alibi_max_bias)
+                          : 0.0f;
     for (i64 j = 0; j < n_vis; j++) {
         if (j >= m0 && j < m1) {
             scores[j] = -FLT_MAX;
@@ -346,6 +354,7 @@ __attribute__((target("avx2,fma"))) void attn_row_f32_avx2(
         }
         f32 sv = scores[j] * d.scale;
         if (d.softcap > 0.0f) sv = d.softcap * std::tanh(sv / d.softcap);
+        if (slope != 0.0f) sv -= slope * static_cast<f32>(kpos0 - j);
         scores[j] = sv;
     }
     f32 mx = scores[0];
@@ -1101,6 +1110,7 @@ public:
             c.window = d.window;
             c.skip_from = d.skip_from;
             c.softcap = d.softcap;
+            c.alibi_max_bias = d.alibi_max_bias;
             if (npu::attention(npu_, c)) return;
         }
         const i64 n_rep = d.n_kv > 0 ? d.n_head / d.n_kv : 1;
@@ -1301,11 +1311,14 @@ public:
                             for (i64 t = 0; t < d.n_tok; t++) {
                                 const AttnRange r = attn_range(d, t);
                                 if (r.n_vis <= 0) continue;
+                                // The row's own position, for ALiBi's distance.
+                                const i64 pos = attn_pos(d, t);
                                 scores.resize(static_cast<size_t>(r.n_vis));
                                 const i64 off = (r.j_lo - base_j) * d.hd;
-                                attn_row_f32_avx2(qf, kg.data() + off,
-                                                  vg.data() + off, d.hd, of, d, t,
-                                                  h, r, scores.data());
+                                attn_row_f32_avx2(
+                                    qf, kg.data() + off, vg.data() + off, d.hd,
+                                    of, d, t, h, pos - (r.n_vis - 1), r,
+                                    scores.data());
                             }
                         }
                     });
@@ -1320,18 +1333,19 @@ public:
                             const i64 t = u / d.n_head;
                             const i64 h = u - t * d.n_head;
                             const AttnRange r = attn_range(d, t);
+                            const i64 pos = attn_pos(d, t);
                             scores.resize(static_cast<size_t>(r.n_vis));
                             const i64 hkv = n_rep > 0 ? h / n_rep : 0;
                             // The row's own KV region, so a batch can carry rows
                             // from different sequences. Zero for every call that
                             // does not set row_kv_base.
                             const i64 kvb = attn_kv_base(d, t);
-                            attn_row_f32_avx2(qf, kc + kvb + r.j_lo * d.pos_stride +
-                                                      hkv * d.hd,
-                                              vc + kvb + r.j_lo * d.pos_stride +
-                                                  hkv * d.hd,
-                                              d.pos_stride, of, d, t, h, r,
-                                              scores.data());
+                            attn_row_f32_avx2(
+                                qf,
+                                kc + kvb + r.j_lo * d.pos_stride + hkv * d.hd,
+                                vc + kvb + r.j_lo * d.pos_stride + hkv * d.hd,
+                                d.pos_stride, of, d, t, h,
+                                pos - (r.n_vis - 1), r, scores.data());
                         }
                     });
             return;
@@ -1365,6 +1379,15 @@ public:
                         scores.resize(static_cast<size_t>(n_vis));
                         const i64 hkv = n_rep > 0 ? h / n_rep : 0;
                         const f32 *qh = qf + t * (d.n_head * d.hd) + h * d.hd;
+                        // ALiBi, hoisted out of the key loop: the slope is a
+                        // property of the head. Same formula and same signed
+                        // distance as the int8 body above -- this f32 path
+                        // ignored the bias entirely until test_alibi_slope_ladder
+                        // recovered the ladder from the softmax output.
+                        const f32 slope =
+                            d.alibi_max_bias > 0.0f
+                                ? alibi_slope_impl(h, d.n_head, d.alibi_max_bias)
+                                : 0.0f;
                         for (i64 j = 0; j < n_vis; j++) {
                             if (s_hi > s_lo && j_lo + j >= s_lo &&
                                 j_lo + j < s_hi) {
@@ -1377,6 +1400,8 @@ public:
                             for (i64 i = 0; i < d.hd; i++) dot += qh[i] * kj[i];
                             f32 sv = dot * d.scale;
                             if (d.softcap > 0.0f) sv = d.softcap * std::tanh(sv / d.softcap);
+                            if (slope != 0.0f)
+                                sv -= slope * static_cast<f32>(pos - (j_lo + j));
                             scores[static_cast<size_t>(j)] = sv;
                         }
                         f32 mx = scores[0];

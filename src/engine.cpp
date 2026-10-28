@@ -1862,6 +1862,24 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         return false;
     }
 
+    // ALiBi is the same kind of thing: a per-head distance penalty on the
+    // score, so a backend that ignored it would be running a different
+    // attention function on a file that has no rotary and no learned position
+    // to fall back on. Refuse before the first token rather than decode
+    // something else.
+    if (model_.cfg().alibi_max_bias > 0.0f && !be_->attention_alibi_supported()) {
+        *err = format(
+            "%s uses ALiBi (max bias %g), and this backend's attention kernels "
+            "do not apply the per-head distance bias. That bias IS this "
+            "family's position signal -- there is no rotary or learned position "
+            "underneath it. The reference body applies it: run --cpu, or "
+            "--npu-cpu to keep the GEMM on the virtual NPU with the reference "
+            "attention",
+            model_.cfg().arch.c_str(),
+            static_cast<double>(model_.cfg().alibi_max_bias));
+        return false;
+    }
+
     // Quantized K/V is validated before the cache is sized: a backend that
     // cannot read the layout must refuse, not run f16 kernels over int8 bytes
     // (which produces fluent text rather than an error).
