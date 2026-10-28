@@ -782,6 +782,35 @@ Blocking is correct as well as faster — bit-identical logits, which is what a
 loop reorder should give. The sign flip is exact for `-128` (a masked subtract,
 where `abs_epi8` saturates to 127) and its accuracy is unchanged at 2.329e-08.
 
+##### The ceiling above was wrong, and the kernel is not near it
+
+The 301 GMAC/s figure came from a register-only probe, and it is not repeatable
+against the same loop measured standalone: reproducing that exact loop gives
+73.7–99.1 GMAC/s per core, so two threads reporting 338–430 GMAC/s are at least
+1.7x too high. The host is also not the 3.2 GHz the figure implied — a
+dependent FP add with 4-cycle latency takes 2.14 ns here, about 1.87 GHz
+effective, with `cpu/wall` at 1.00 and steal time of 7 ticks, so it is not
+being descheduled.
+
+The measurement that does hold up puts the same instruction mix, with loads,
+in one process beside the shipped kernel (`tools/bench_isa_ceiling.cpp`):
+
+| variant | GMAC/s | of C |
+|---|---:|---:|
+| A registers only, integer accumulate | 45–70 | 115–133% |
+| C A plus the real loads and float tail | 35–58 | 100% |
+| F shipped kernel body, scale chain removed | 19–45 | 55–70% |
+| E **the shipped kernel** | 13–33 | **29–53%** |
+
+So the GEMM runs at about 41% of what this machine does with the same
+instructions, and removing the per-block scale dependency chain alone is worth
+1.4x. Two attempts to shorten that chain — pair-expanded scales and a 64-bit
+broadcast plus permute — both measured neutral (1.04x and 1.01x), which says
+the cost is the chain's latency and not its instruction count: shortening it
+cannot help, only overlapping it can. `docs/GEMM-PERF-WALL.md` records both
+dead ends, the two throughput modes this host flips between, and why every
+number here is quoted as a ratio.
+
 **What is actually left**: `objdump` shows the hot loop still spilling its eight
 zmm accumulators to the stack — `vmovaps 0xc0(%rsp),%zmm13` … `vfmadd231ps` …
 `vmovaps %zmm13,0x440(%rsp)` — 60 stack moves in a ~50-instruction body. At 5.6
