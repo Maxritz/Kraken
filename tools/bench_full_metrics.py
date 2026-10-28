@@ -6,11 +6,19 @@ base="The quick brown fox jumps over the lazy dog and keeps running through the 
 PROMPTS={"short(~46)":(base.strip(),4096),
          "mid(~900)":((base*18).strip(),4096),
          "long(~2040)":((base*40).strip(),4096)}
-ARMS=[("scalar",{"KRK_CPU_ATTN_SCALAR":"1"}),
-      ("in-place",{"KRK_CPU_ATTN_GATHER":"0"}),
-      ("gather",{})]
-COMPONENTS=("attention","gemm_q4k_i8_rN","gemm_q6k_rN","gemm_q4k_i8_r1","gemm_q6k_r1",
-            "silu_mul","rope","kv_append","rmsnorm","embed","gemm_f16_rN")
+# The arms are the Q8_0 GEMM's three implementations: the f32 dequant loop it
+# replaced, the 256-bit int8 kernel, and the 512-bit two-block kernel the
+# dispatcher picks when the host has AVX-512BW.
+ARMS=[("dequant",{"KRK_CPU_DOT_INT8":"0"}),
+      ("i8-256",{"KRK_CPU_Q80_NOBW":"1"}),
+      ("i8-512",{})]
+# Parse EVERY op row, not a whitelist: the previous fixed list named q4_K/Q6_K
+# kernels only, so a q8_0 fixture silently dropped its gemm row — 81% of the
+# run — and the table still looked complete. Any op name the trace emits is
+# kept, and the parser checks the rows sum to a plausible share of the run.
+# The batched tag ends in _rN with a CAPITAL N (gemm_q8_0_i8_rN). A lowercase
+# class silently dropped every multi-row GEMM row, which is most of the run.
+OPNAME=re.compile(r"^[a-z][a-zA-Z0-9_]{2,}$")
 
 def one(env,P,ctx,n=8):
     e=dict(os.environ); e.update(env)
@@ -25,7 +33,7 @@ def one(env,P,ctx,n=8):
                        "tps":float(m.group(4)),"ms_step":float(m.group(5))}
     for line in o.splitlines():
         f=line.split()
-        if len(f)>=7 and f[0] in COMPONENTS:
+        if len(f)>=7 and OPNAME.match(f[0]):
             try:
                 r["components"][f[0]]={"ops":float(f[1]),"dev_us":float(f[2]),"us_op":float(f[3]),
                     "pct_run":float(f[4].rstrip('%')),"gmacs":float(f[5]),
@@ -76,9 +84,9 @@ for label in PROMPTS:
             "attn_ms_op":{"med":med(ams),"min":am,"max":AM},
             "attn_pct_run":med(apc),"attn_gmacs":med(agm),"attn_pct_peak":med(apk),
             "components":rows[0]["components"],"roofline":rows[0].get("roofline")}
-    s=med([r.get("prefill",{}).get("tps") for r in data[(label,"scalar")]])
-    ip=med([r.get("prefill",{}).get("tps") for r in data[(label,"in-place")]])
-    g=med([r.get("prefill",{}).get("tps") for r in data[(label,"gather")]])
-    print(f"{'ratios':10} in-place {ip/s:.2f}x scalar   gather {g/s:.2f}x scalar   gather {g/ip:.2f}x in-place")
+    s=med([r.get("prefill",{}).get("tps") for r in data[(label,"dequant")]])
+    ip=med([r.get("prefill",{}).get("tps") for r in data[(label,"i8-256")]])
+    g=med([r.get("prefill",{}).get("tps") for r in data[(label,"i8-512")]])
+    print(f"{'ratios':10} i8-256 {ip/s:.2f}x dequant   i8-512 {g/s:.2f}x dequant   i8-512 {g/ip:.2f}x i8-256")
 json.dump(out,open("/tmp/full_metrics.json","w"),indent=1)
 print("\nWROTE /tmp/full_metrics.json")

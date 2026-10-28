@@ -714,6 +714,50 @@ Details, the crossover table and the reproduce commands:
 ggml's block formats need none of the bias correction Intel's VNNI sample
 describes: [docs/INT8-ISA-TIERS.md](docs/INT8-ISA-TIERS.md).
 
+#### Q8_0 was the last format that dequantised in the hot loop
+
+With attention down, the trace shows what it was hiding: **`gemm_q8_0_rN`, 81.3%
+of the run at 19.3 GMAC/s**. Q8_0 was one of the two documented exceptions to
+"never dequant" — `dot_q8_0_tiled()` widened every weight byte to f32 and
+multiplied by the block scale.
+
+`VPDPBUSD` is unsigned × signed and Q8_0 is signed × signed, so the tutorial fix
+is to bias the weight by 128 and subtract `128*sum(x)`. **On AVX2 that silently
+breaks**: `VPMADDUBSW` accumulates into int16 and `255*127*2` overflows it, so
+the instruction *saturates* rather than wraps. The kernel instead splits the
+weight into unsigned magnitudes and subtracts the products — `128*127*2 = 32512`
+fits, for any legal byte pair, including the `-128` the format allows (which a
+saturating `abs_epi8` would have mangled to 127). No bias, no `sx[]` array.
+
+Two 32-byte blocks are exactly one 512-bit register and consecutive blocks'
+activations are contiguous, so the 512-bit kernel does 64 MACs per maddubs pair.
+
+| ~2040 tokens | prefill tok/s | GEMM ms/op | GEMM %run | GEMM GMAC/s |
+|---|---:|---:|---:|---:|
+| dequant | 180.9 [179.0, 189.8] | 9689.5 | 82.0% | 18.0 |
+| int8 256-bit | 256.8 [245.6, 274.2] | 5986.7 | 73.7% | 29.1 |
+| **int8 512-bit** | **272.1 [244.5, 277.8]** | **5048.0** | **70.4%** | **34.5** |
+
+**The GEMM op is 1.92x faster; the run is 1.50x** (1.49x at ~900 tokens, 1.39x
+at ~46), because attention becomes 17.0% -> 25.7% of what remains. Decode
+improves too without any decode kernel changing — rows == 1 lands on the
+single-row int8 kernel instead of the f32 widen: 33.1 -> 44.4 tok/s at ~900.
+
+**Accuracy, asked as two separate questions.** The kernel computes the dot it
+claims to: worst error vs an f64 reference **2.329e-08**, and the 256-bit
+single-row and 8-row kernels are bit-identical. The 512-bit one is *not*, and
+must not be required to be — it accumulates 16 i32 lanes per two blocks where
+the 256-bit kernel accumulates 8 per one, so the reduction tree differs while
+the integers summed do not. End to end, quantising activations (which the Q4_K
+and Q6_K paths have always done) moves the worst top-8 log-prob by 1.7e-02 with
+**identical greedy text over 16 tokens**; `KRK_CPU_DOT_INT8=0` restores the exact
+f32 path.
+
+The 512-bit widening bought only 1.07x, not the ~2x the instruction count
+predicts, so this kernel is not instruction-bound on this host. That gap is the
+honest state of it and the next thing to measure.
+[docs/Q80-INT8-GEMM.md](docs/Q80-INT8-GEMM.md).
+
 `25%` of peak is still the number to argue with, and the arithmetic is no longer
 what stops it. At 2048 tokens this kernel *asks for* roughly 155 GB of K/V loads
 — every query row re-streams the keys before it — and this host reads 22.75 GB/s,

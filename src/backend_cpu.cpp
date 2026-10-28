@@ -38,7 +38,7 @@ inline const char *dtype_tag_r1(DType t, i64 n_in) {
         case DType::Q6_K: return "gemm_q6k_r1";
         case DType::Q3_K: return "gemm_q3k_r1";
         case DType::Q5_K: return "gemm_q5k_r1";
-        case DType::Q8_0: return "gemm_q8_0_r1";
+        case DType::Q8_0: return i8ok ? "gemm_q8_0_i8_r1" : "gemm_q8_0_r1";
         case DType::F32:  return "gemm_f32_r1";
         case DType::F16:  return "gemm_f16_r1";
         default:          return "gemm_oth_r1";
@@ -51,7 +51,7 @@ inline const char *dtype_tag_rn(DType t, i64 n_in) {
         case DType::Q6_K: return "gemm_q6k_rN";
         case DType::Q3_K: return "gemm_q3k_rN";
         case DType::Q5_K: return "gemm_q5k_rN";
-        case DType::Q8_0: return "gemm_q8_0_rN";
+        case DType::Q8_0: return i8ok ? "gemm_q8_0_i8_rN" : "gemm_q8_0_rN";
         case DType::F32:  return "gemm_f32_rN";
         case DType::F16:  return "gemm_f16_rN";
         default:          return "gemm_oth_rN";
@@ -626,7 +626,8 @@ public:
         KRK_KTIME_MAC(rows == 1 ? dtype_tag_r1(wt, n_in) : dtype_tag_rn(wt, n_in),
                       static_cast<double>(rows) * static_cast<double>(n_out) *
                           static_cast<double>(n_in),
-                      isa_peak_gmacs((wt == DType::Q4_K || wt == DType::Q6_K) &&
+                      isa_peak_gmacs((wt == DType::Q4_K || wt == DType::Q6_K ||
+                                      wt == DType::Q8_0) &&
                                      n_in > 0 && (n_in % 256) == 0 &&
                                      vec_dot_int8()));
         const size_t row_bytes = dtype_row_bytes(wt, n_in);
@@ -638,9 +639,10 @@ public:
         // than inside vec_dot() is the whole point: vec_dot() is called once
         // per output element, so a per-call quantisation there would undo the
         // win it is trying to buy.
-        if ((wt == DType::Q4_K || wt == DType::Q6_K) && n_in > 0 &&
-            (n_in % 256) == 0 && rows > 0 && vec_dot_int8()) {
+        if ((wt == DType::Q4_K || wt == DType::Q6_K || wt == DType::Q8_0) &&
+            n_in > 0 && (n_in % 256) == 0 && rows > 0 && vec_dot_int8()) {
             const bool q6 = wt == DType::Q6_K;
+            const bool q80 = wt == DType::Q8_0;
             const i64 nb = n_in / 32;
             // Owned by the CALLING thread and captured by value below. These
             // were thread_local, which looks like a free optimisation and is a
@@ -658,7 +660,12 @@ public:
             const i64 nq4 = n_in / 4;
             std::vector<i32> xs4(static_cast<size_t>(rows * nq4), 0);
             for (i64 r = 0; r < rows; r++) {
-                if (q6)
+                if (q80)
+                    // No sx[]: the magnitude split is exact, so Q8_0 needs no
+                    // per-block sum of the activation.
+                    quantize_q8_row(xf + r * n_in, n_in,
+                                    xq.data() + r * n_in, xd.data() + r * nb);
+                else if (q6)
                     quantize_q8_row_sq4(xf + r * n_in, n_in,
                                         xq.data() + r * n_in,
                                         xd.data() + r * nb,
@@ -686,7 +693,13 @@ public:
                             // Q4_K's 144 bytes, and a Q6_K block is 210. Using
                             // it for both reads one format's bytes as the
                             // other's -- every token came out <unk>.
-                            if (q6)
+                            if (q80)
+                                for (; r + 8 <= rows; r += 8)
+                                    dot_q8_0_q8_x8(
+                                        wr, xqp + r * n_in, xdp + r * nb,
+                                        n_in, n_in, nb,
+                                        of + r * n_out + o, n_out);
+                            else if (q6)
                                 for (; r + 8 <= rows; r += 8)
                                     dot_q6_K_q8_sq4_x8(
                                         wr, xqp + r * n_in, xdp + r * nb,
@@ -700,7 +713,9 @@ public:
                                         of + r * n_out + o, n_out);
                             for (; r < rows; r++)
                                 of[r * n_out + o] =
-                                    q6 ? dot_q6_K_q8_sq4(wr, xqp + r * n_in,
+                                    q80 ? dot_q8_0_q8(wr, xqp + r * n_in,
+                                                      xdp + r * nb, n_in)
+                                    : q6 ? dot_q6_K_q8_sq4(wr, xqp + r * n_in,
                                                          xdp + r * nb,
                                                          xs4p + r * nq4, n_in)
                                        : dot_q4_K_q8_sx(wr, xqp + r * n_in,

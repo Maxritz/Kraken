@@ -106,8 +106,15 @@ The reported value moves because the probe runs on a shared host; the ratio of
 int8 to f32 (~6.5x per thread) is the stable part, and it is what a `%peak`
 column divides by.
 
-The tiers this box can run: **T5** (AVX-512 VNNI), with T2/T4 as the fallbacks
-and no AMX. A Meteor Lake laptop tops out at **T3**; a Zen 3 laptop at **T2**.
+The tiers this build runs on this box: **T4** — AVX-512F + AVX-512BW, and
+**no VNNI at all** (`avx512vnni` and `avx_vnni` are both absent from
+`/proc/cpuinfo`). So the VNNI kernels in `src/quant.cpp` are compiled and
+correct but **never dispatched here**; every int8 dot measured in this repo's
+tables goes through the `_avx2_d` twins (`VPMADDUBSW` + `VPMADDWD`), widened to
+512 bits where the `avx512bw` target allows. A Meteor Lake laptop at **T3** and
+a Sapphire Rapids box at **T7** are strictly better machines for this code than
+the one it was measured on, and this is exactly why the tiers are dispatch
+targets rather than a compile-time assumption.
 
 ## 4. What is missing, stated as work rather than as a wish
 
