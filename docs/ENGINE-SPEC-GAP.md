@@ -71,10 +71,16 @@ Two further gaps against the contract:
    parallelised or compared against another engine's tie-break. Fixing it
    changes which expert wins a near-tie, so it needs a logits gate, not a
    silent edit; it is left as the next MoE task rather than bundled here.
-2. **`(n, beta, |P|/|E|)` is not printed next to any speed or hit figure.**
-   Contract item 5 wants all three beside every number. The profiler prints
-   ops/dev_us/us-op/%run/GMAC/s/%peak, none of which describe the cache
-   operating point.
+2. **`beta` is not printed next to the hit figure.** Contract item 5 wants
+   `(n, beta, |P|/|E|)` beside every speed and hit number. Two of the three
+   already are: `[stats ] experts` prints the VRAM budget and `N/M slots
+   resident` (`|P|/|E|`), and `[stats ] cache` prints acquires, HOT hits with a
+   percentage, WARM hits, in-place hits and COLD misses, beside
+   `[stats ] expert-path read <ms>`. What is missing is the router tie margin
+   (`beta`) on that same line, so a run that used `--router-resident` cannot be
+   told from one that did not by reading the stats alone. **This item was
+   previously reported here as "not printed at all", which was wrong** — the
+   instrumentation is substantially there.
 
 ## §1.1 Cross-platform backends
 
@@ -120,6 +126,17 @@ The spec is emphatic that read-ahead is mandatory rather than optional for a
 disk-streamed engine; it is a small, self-contained change (a `posix_fadvise`
 or `readahead(2)` call on the mapping at load) that has not been made.
 
+## Measured: what expert management is worth
+
+`docs/EXPERT-PATH-BUDGET.md` measures the expert path on a synthetic 111.8 MiB
+`qwen3moe` fixture across three cache budgets. Summary: going from a fully
+thrashing cache to a perfect one is **1.27x** on decode here (110.1 -> 140.3
+tok/s), because expert reads are 39.5% of decode at 0% hit and 27.7% at the
+floor. At 512 MB the cache is already at the compulsory-miss floor (98 misses =
+98 distinct experts touched), i.e. no predictor can improve it. The lever only
+becomes dominant when the per-expert read is slow (NVMe at 593 MiB/s rather
+than page cache), which is exactly the 2-3 GB VRAM case.
+
 ## What this changes about the plan
 
 1. The spec's §1.2 gap list is **wrong about this repository** — predictor and
@@ -129,7 +146,10 @@ or `readahead(2)` call on the mapping at load) that has not been made.
    *reporting and tie-breaks*, not about new mechanisms.
 3. The real §1.3 work is **paged KV + continuous batching**, which is a
    structural change to the engine rather than a kernel.
-4. Read-ahead is the cheapest unclaimed item in the whole document.
+4. Read-ahead is the cheapest unclaimed item in the whole document, and by the
+   measurement above it also has the clearest payoff: the per-expert read cost
+   is what the hit rate multiplies, and more reads in flight is a 2.4x on that
+   cost by the header's own numbers (593 -> 1446 MiB/s).
 
 Everything in §1.2/§1.3 above was checked by symbol; nothing here is inferred
 from prose.

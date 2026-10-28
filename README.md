@@ -825,6 +825,14 @@ or fewer bytes per MAC, not from rearranging this one.
 
 ##### Against the engine spec
 
+`docs/EXPERT-PATH-BUDGET.md` measures what expert management is actually worth.
+On a 111.8 MiB `qwen3moe` fixture, decoding goes 110.1 -> 140.3 tok/s as the
+cache improves from thrashing to perfect — **1.27x** — because expert reads are
+39.5% of decode at 0% hit. At a 512 MB budget the cache already sits on the
+compulsory-miss floor (98 misses, 98 distinct experts routed), which no
+predictor can beat. The lever only becomes dominant when weights are on NVMe
+rather than in page cache, i.e. exactly the small-VRAM case.
+
 `docs/ENGINE-SPEC-GAP.md` maps `ENGINE_MASTER_SPEC.md` onto the code that is
 actually on disk. Its headline: the spec's MoE gap list is out of date — the
 hot-expert predictor (`moe_predictor.hpp`) and the byte-budgeted expert cache
