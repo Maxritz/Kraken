@@ -3256,6 +3256,214 @@ static void test_moe_per_layer_experts() {
 
 static const char *kGdnTestPath = "kraken-gdn-test.gguf";
 
+// ---------------------------------------------------------------------------
+// A miniature file in the PLAIN pre-norm family (gptneox/gptj/phi2/mpt/bloom/
+// falcon). One builder serves all of them because that is the point of the
+// family: the same tensors with different pieces switched on. What varies here
+// is what a test needs to isolate -- the fused-vs-split layout, whether ALiBi is
+// declared, whether BLOOM's embedding norm is present, and whether Falcon's
+// second pre-attention norm is.
+//
+// The bias pattern RUNS ACROSS the Q/K/V parts rather than restarting per part.
+// With a fresh pattern per part the fused and split files would hold different
+// numbers and an equality test between them would compare two different
+// functions.
+struct PlainSpec {
+    std::string arch = "mpt";
+    bool split_qkv = false;
+    bool alibi_key = true;      // write attention.max_alibi_bias
+    f32 alibi = 8.0f;
+    bool embd_norm = false;     // BLOOM's token_embd_norm
+    bool attn_norm_2 = false;   // Falcon-40B's second norm
+    bool attn_norm_2_identity = false;
+    bool ffn_norm = true;
+    // GPT-J ships a LayerNorm with weights and NO biases anywhere. Emitting one
+    // is what makes the file testable at all: a loader that demanded the biases
+    // would refuse a complete checkpoint, which is the bug this guards.
+    bool biases = true;
+};
+
+static bool build_tiny_plain_model(const std::string &path, const PlainSpec &p) {
+    const int n_embd = 32, n_layer = 1, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, ctx = 64;
+    const std::string &arch = p.arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-plain-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", n_layer);
+    b.meta_u32(arch + ".context_length", ctx);
+    b.meta_u32(arch + ".embedding_length", n_embd);
+    b.meta_u32(arch + ".feed_forward_length", n_ff);
+    b.meta_u32(arch + ".attention.head_count", n_head);
+    b.meta_u32(arch + ".attention.head_count_kv", n_kv);
+    b.meta_u32(arch + ".attention.key_length", hd);
+    b.meta_u32(arch + ".attention.value_length", hd);
+    // The LayerNorm epsilon key, which is what this family's converters emit.
+    b.meta_f32(arch + ".attention.layer_norm_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    // Only MPT states its ALiBi scale in the file; BLOOM's is the loader's own
+    // constant, so a bloom file carries no such key.
+    if (p.alibi_key && arch == "mpt")
+        b.meta_f32(arch + ".attention.max_alibi_bias", p.alibi);
+
+    std::vector<std::string> tokens = {"<unk>", "<s>", "</s>"};
+    std::vector<f32> scores = {-10.0f, 0.0f, 0.0f};
+    for (int i = 0; i < 256; i++) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "<0x%02X>", i);
+        tokens.push_back(buf);
+        scores.push_back(-30.0f);
+    }
+    while (static_cast<int>(tokens.size()) < vocab) {
+        tokens.push_back(format("<extra%d>", static_cast<int>(tokens.size())));
+        scores.push_back(-50.0f);
+    }
+    b.meta_str("tokenizer.ggml.model", "llama");
+    b.meta_str_array("tokenizer.ggml.tokens", tokens);
+    b.meta_f32_array("tokenizer.ggml.scores", scores);
+    b.meta_u32("tokenizer.ggml.bos_token_id", 1);
+    b.meta_u32("tokenizer.ggml.eos_token_id", 2);
+    b.meta_bool("tokenizer.ggml.add_bos_token", true);
+
+    u32 seed = 0xBEEF01u;
+    auto rndvec = [&](size_t n) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = rnd(seed);
+        return v;
+    };
+    auto one = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    auto ramp = [](size_t n) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = 1.0f + 0.01f * static_cast<f32>(i % 7);
+        return v;
+    };
+    auto zero = [](size_t n) { return std::vector<f32>(n, 0.0f); };
+
+    b.tensor_f16("token_embd.weight",
+                 {static_cast<u64>(n_embd), static_cast<u64>(vocab)},
+                 rndvec(static_cast<size_t>(n_embd) * vocab));
+    if (p.embd_norm) {
+        b.tensor_f32("token_embd_norm.weight", {static_cast<u64>(n_embd)},
+                     one(n_embd));
+        b.tensor_f32("token_embd_norm.bias", {static_cast<u64>(n_embd)},
+                     zero(n_embd));
+    }
+    b.tensor_f32("output_norm.weight", {static_cast<u64>(n_embd)}, one(n_embd));
+    if (p.biases)
+        b.tensor_f32("output_norm.bias", {static_cast<u64>(n_embd)}, zero(n_embd));
+    b.tensor_f16("output.weight",
+                 {static_cast<u64>(n_embd), static_cast<u64>(vocab)},
+                 rndvec(static_cast<size_t>(n_embd) * vocab));
+
+    b.tensor_f32("blk.0.attn_norm.weight", {static_cast<u64>(n_embd)}, one(n_embd));
+    if (p.biases)
+        b.tensor_f32("blk.0.attn_norm.bias", {static_cast<u64>(n_embd)},
+                     zero(n_embd));
+    if (p.ffn_norm) {
+        b.tensor_f32("blk.0.ffn_norm.weight", {static_cast<u64>(n_embd)},
+                     one(n_embd));
+        if (p.biases)
+            b.tensor_f32("blk.0.ffn_norm.bias", {static_cast<u64>(n_embd)},
+                         zero(n_embd));
+    }
+    if (p.attn_norm_2) {
+        b.tensor_f32("blk.0.attn_norm_2.weight", {static_cast<u64>(n_embd)},
+                     p.attn_norm_2_identity ? one(n_embd) : ramp(n_embd));
+        b.tensor_f32("blk.0.attn_norm_2.bias", {static_cast<u64>(n_embd)},
+                     zero(n_embd));
+    }
+
+    // The fused QKV, and the three projections cut from it. `w_cat` exists for
+    // exactly this: the parts are drawn from ONE stream, so their bytes under
+    // f16 are the same bytes the split file carries.
+    if (!p.split_qkv) {
+        std::vector<f32> all;
+        all.reserve(static_cast<size_t>(n_embd) * (q_dim + 2 * kv_dim));
+        for (int i = 0; i < n_embd * (q_dim + 2 * kv_dim); i++)
+            all.push_back(rnd(seed));
+        b.tensor_f16("blk.0.attn_qkv.weight",
+                     {static_cast<u64>(n_embd),
+                      static_cast<u64>(q_dim + 2 * kv_dim)},
+                     all);
+        // One bias laid out Q | K | V, which the loader splits at the same
+        // offsets the weight splits at.
+        std::vector<f32> bias(static_cast<size_t>(q_dim + 2 * kv_dim));
+        for (size_t i = 0; i < bias.size(); i++)
+            bias[i] = 0.01f * static_cast<f32>(static_cast<int>(i % 7) - 3);
+        if (p.biases)
+            b.tensor_f32("blk.0.attn_qkv.bias",
+                         {static_cast<u64>(q_dim + 2 * kv_dim)}, bias);
+    } else {
+        std::vector<f32> qw(static_cast<size_t>(n_embd) * q_dim);
+        std::vector<f32> kw(static_cast<size_t>(n_embd) * kv_dim);
+        std::vector<f32> vw(static_cast<size_t>(n_embd) * kv_dim);
+        for (auto &v : qw) v = rnd(seed);
+        for (auto &v : kw) v = rnd(seed);
+        for (auto &v : vw) v = rnd(seed);
+        b.tensor_f16("blk.0.attn_q.weight",
+                     {static_cast<u64>(n_embd), static_cast<u64>(q_dim)}, qw);
+        b.tensor_f16("blk.0.attn_k.weight",
+                     {static_cast<u64>(n_embd), static_cast<u64>(kv_dim)}, kw);
+        b.tensor_f16("blk.0.attn_v.weight",
+                     {static_cast<u64>(n_embd), static_cast<u64>(kv_dim)}, vw);
+        // The same numbers the fused file's bias holds, at the same offsets.
+        const int widths[3] = {q_dim, kv_dim, kv_dim};
+        const char *names[3] = {"blk.0.attn_q", "blk.0.attn_k", "blk.0.attn_v"};
+        int off = 0;
+        for (int part = 0; part < 3; part++) {
+            std::vector<f32> bias(static_cast<size_t>(widths[part]));
+            for (int i = 0; i < widths[part]; i++)
+                bias[static_cast<size_t>(i)] =
+                    0.01f * static_cast<f32>(((off + i) % 7) - 3);
+            if (p.biases)
+                b.tensor_f32(std::string(names[part]) + ".bias",
+                             {static_cast<u64>(widths[part])}, bias);
+            off += widths[part];
+        }
+    }
+    b.tensor_f16("blk.0.attn_output.weight",
+                 {static_cast<u64>(q_dim), static_cast<u64>(n_embd)},
+                 rndvec(static_cast<size_t>(q_dim) * n_embd));
+    if (p.biases)
+        b.tensor_f32("blk.0.attn_output.bias", {static_cast<u64>(n_embd)},
+                     zero(n_embd));
+    b.tensor_f16("blk.0.ffn_up.weight",
+                 {static_cast<u64>(n_embd), static_cast<u64>(n_ff)},
+                 rndvec(static_cast<size_t>(n_embd) * n_ff));
+    if (p.biases)
+        b.tensor_f32("blk.0.ffn_up.bias", {static_cast<u64>(n_ff)}, zero(n_ff));
+    b.tensor_f16("blk.0.ffn_down.weight",
+                 {static_cast<u64>(n_ff), static_cast<u64>(n_embd)},
+                 rndvec(static_cast<size_t>(n_ff) * n_embd));
+    if (p.biases)
+        b.tensor_f32("blk.0.ffn_down.bias", {static_cast<u64>(n_embd)},
+                     zero(n_embd));
+    return b.write(path);
+}
+
+// The logits and first sampled token of one file, through the real engine.
+static bool plain_logits_of(const std::string &path, std::vector<f32> &lg,
+                            std::string &err) {
+    Backend *be = make_cpu_backend();
+    Engine e;
+    EngineConfig c;
+    c.model_path = path;
+    c.n_ctx = 64;
+    c.prefill_chunk = 8;
+    if (!e.init(be, c, &err)) return false;
+    GenerateParams gp;
+    gp.prompt = "the";
+    gp.max_tokens = 2;
+    GenerateResult r;
+    if (!e.generate(gp, &r)) return false;
+    const i32 nv = e.model().cfg().n_vocab;
+    lg.assign(e.last_logits(), e.last_logits() + nv);
+    return true;
+}
+
 // A miniature qwen35moe: `n_layer` layers where every full_attention_interval'th
 // one keeps real attention (with a packed output gate) and the rest are delta
 // net layers. Deliberately tiny (d_state 8, 2 key / 4 value heads) so the CPU
@@ -5470,6 +5678,11 @@ public:
                    const AttnDesc &d) override {
         inner_->kv_append(kc, vc, k, v, d);
     }
+    // The capability gate is a query, not a guess: this wrapper can claim the
+    // reference body's ALiBi arithmetic is absent, which is how the refusal is
+    // tested without a second backend.
+    bool attention_alibi_supported() const override { return !no_alibi_; }
+    void set_no_alibi(bool v) { no_alibi_ = v; }
     void attention(void *o, const void *q, const void *kc, const void *vc,
                    const AttnDesc &d) override {
         inner_->attention(o, q, kc, vc, d);
@@ -5596,6 +5809,7 @@ private:
     i64 fail_allocation_after_ = -1;
     bool fail_markers_ = false;
     bool require_markers_ = false;
+    bool no_alibi_ = false;
     u64 host_allocs_ = 0;
     u64 host_releases_ = 0;
     static void sim_wait(double ns) {
@@ -8137,6 +8351,481 @@ static void test_nvfp4_sidecar_dflash() {
 // are those of the capped vector, not a monotone image of the uncapped ones --
 // and it is the reason the bound cannot be applied to the attention output.
 //
+// ALiBi's slope ladder, recovered from the arithmetic rather than from the
+// helper that builds it: `alibi_slope_impl` is internal to the backend, so the
+// only honest way to test it is to make a softmax whose probabilities ARE the
+// slope. Two visible keys at equal raw score, one at distance 0 and one at
+// distance 1, leave
+//
+//     p1 = 1 / (1 + exp(-slope))        i.e.   slope = -log(p0 / p1)
+//
+// so one attention call with n_head heads reads back the whole table. The
+// expectation below is computed HERE, in double, from the published formula --
+// independent of the implementation being checked.
+// Fused and split QKV are the same function on this family, because the fused
+// form is read as three ROW VIEWS of one weight rather than copied and
+// re-laid-out. That makes the expectation exact equality, not a tolerance --
+// and it is the property the generator's cross-part bias pattern exists to make
+// meaningful.
+// GPT-J is this family with no biases at all: LayerNorm weights, no norm bias, no
+// projection bias. Every one of those was REQUIRED by an earlier loader, which
+// refused complete checkpoints. The file here therefore has none of them, and
+// the only assertion that matters is that it loads and decodes -- with the
+// bias-free graph, not with a zero-filled stand-in that would be a different
+// (and, for LayerNorm, a visibly different) function.
+// The plain family writes `attention.layer_norm_epsilon`; the RMS families write
+// `attention.layer_norm_rms_epsilon`. The loader used to read only the second,
+// which was invisible because every real file of either kind happens to use
+// 1e-5 -- the accident that stops being right later. A file declaring a
+// different epsilon must carry it into ModelConfig, or the norm silently runs
+// with someone else's value.
+static void test_layer_norm_epsilon_is_read() {
+    // The builder writes 1e-5; a file that says otherwise is written by hand so
+    // the metadata is the only thing that differs.
+    PlainSpec spec;
+    spec.arch = "mpt";
+    const std::string path = "kraken-epsilon.gguf";
+    CHECK(build_tiny_plain_model(path, spec), "wrote the plain-family file");
+    {
+        Backend *be = make_cpu_backend();
+        Model m;
+        std::string err;
+        CHECK(m.load(*be, path, &err), "the file loads");
+        CHECK_NEAR(m.cfg().rms_eps, 1e-5, 1e-9,
+                   "layer_norm_epsilon reaches the config");
+        m.unload();
+        delete be;
+    }
+    // Rewriting the key is not something GgufBuilder can do after the fact, so
+    // the second arm asserts the SAME reader against the RMS spelling: both keys
+    // must land in one field, and a family that writes the RMS one must not be
+    // left at the default by a reader that only knows the other spelling.
+    {
+        const std::string p2 = "kraken-epsilon-rms.gguf";
+        GgufBuilder b;
+        b.meta_str("general.architecture", "llama");
+        b.meta_u32("general.alignment", 32);
+        b.meta_u32("llama.block_count", 1);
+        b.meta_u32("llama.embedding_length", 8);
+        b.meta_u32("llama.feed_forward_length", 8);
+        b.meta_u32("llama.attention.head_count", 1);
+        b.meta_u32("llama.attention.head_count_kv", 1);
+        b.meta_u32("llama.attention.key_length", 8);
+        b.meta_f32("llama.attention.layer_norm_rms_epsilon", 0.003f);
+        b.meta_str("tokenizer.ggml.model", "llama");
+        std::vector<std::string> toks = {"<unk>", "<s>", "</s>"};
+        b.meta_str_array("tokenizer.ggml.tokens", toks);
+        b.meta_f32_array("tokenizer.ggml.scores", {-10.0f, 0.0f, 0.0f});
+        b.meta_u32("tokenizer.ggml.bos_token_id", 1);
+        b.meta_u32("tokenizer.ggml.eos_token_id", 2);
+        const std::vector<f32> tiny(static_cast<size_t>(8 * 8), 0.01f);
+        b.tensor_f32("token_embd.weight", {8, 8}, tiny);
+        CHECK(b.write(p2), "wrote the RMS-epsilon file");
+        Backend *be = make_cpu_backend();
+        Model m;
+        std::string err;
+        const bool ok = m.load(*be, p2, &err);
+        // The geometry may well be rejected -- this fixture is metadata-only.
+        // What matters is that whatever reader ran picked the epsilon up, and
+        // that a failure is not the epsilon's fault.
+        if (ok) {
+            CHECK_NEAR(m.cfg().rms_eps, 0.003, 1e-9,
+                       "layer_norm_rms_epsilon reaches the same field");
+            m.unload();
+        } else {
+            CHECK(err.find("epsilon") == std::string::npos,
+                  "a rejected file is not rejected over its epsilon");
+        }
+        delete be;
+        std::remove(p2.c_str());
+    }
+    std::remove(path.c_str());
+}
+
+static void test_plain_family_without_any_bias() {
+    PlainSpec gptj;
+    gptj.arch = "gptj";
+    gptj.biases = false;
+    const std::string p = "kraken-gptj-nobias.gguf";
+    CHECK(build_tiny_plain_model(p, gptj), "wrote a bias-free gptj file");
+
+    Backend *be = make_cpu_backend();
+    {
+        Model m;
+        std::string err;
+        CHECK(m.load(*be, p, &err), "a file with no biases anywhere loads");
+        if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+        // Nothing was substituted: the quantised bias pointers stay null.
+        const LayerWeights &L = m.layers()[0];
+        CHECK(L.attn_norm_bias == nullptr, "attn_norm.bias is absent, not zeroed");
+        CHECK(L.qkv_bias == nullptr, "attn_qkv.bias is absent, not zeroed");
+        CHECK(L.wo_bias == nullptr, "attn_output.bias is absent");
+        m.unload();
+    }
+
+    std::vector<f32> a, b;
+    std::string e1, e2;
+    CHECK(plain_logits_of(p, a, e1), "and it generates");
+    CHECK(plain_logits_of(p, b, e2), "twice");
+    CHECK(a == b, "deterministically");
+    if (!e1.empty()) std::fprintf(stderr, "  (%s)\n", e1.c_str());
+    delete be;
+    std::remove(p.c_str());
+}
+
+static void test_plain_fused_equals_split() {
+    struct Arm { const char *arch, *tag; PlainSpec extra; };
+    std::vector<Arm> arms;
+    arms.push_back({"mpt", "mpt", PlainSpec{}});
+    arms.push_back({"bloom", "bloom", PlainSpec{}});
+    arms.push_back({"falcon", "falcon", PlainSpec{}});
+    arms.back().extra.arch = "falcon";
+    arms.back().extra.ffn_norm = false;
+    arms.back().extra.alibi_key = false;
+    arms[1].extra.arch = "bloom";
+    arms[1].extra.embd_norm = true;
+    arms[1].extra.alibi_key = false;
+    arms[0].extra.arch = "mpt";
+
+    for (const Arm &a : arms) {
+        PlainSpec fused = a.extra, split = a.extra;
+        fused.arch = a.arch;
+        split.arch = a.arch;
+        split.split_qkv = true;
+        const std::string pf = std::string("kraken-plain-") + a.tag + "-fused.gguf";
+        const std::string ps = std::string("kraken-plain-") + a.tag + "-split.gguf";
+        CHECK(build_tiny_plain_model(pf, fused), "wrote the fused-layout file");
+        CHECK(build_tiny_plain_model(ps, split), "wrote the split-layout file");
+
+        std::vector<f32> lf, ls;
+        std::string ef, es;
+        const bool okf = plain_logits_of(pf, lf, ef);
+        const bool oks = plain_logits_of(ps, ls, es);
+        if (!okf) std::fprintf(stderr, "  (%s fused: %s)\n", a.tag, ef.c_str());
+        if (!oks) std::fprintf(stderr, "  (%s split: %s)\n", a.tag, es.c_str());
+        CHECK(okf && oks, "both layouts load and generate");
+        if (!okf || !oks) {
+            std::remove(pf.c_str());
+            std::remove(ps.c_str());
+            continue;
+        }
+        bool same = lf.size() == ls.size();
+        f32 worst = 0.0f;
+        for (size_t i = 0; same && i < lf.size(); i++) {
+            worst = std::max(worst, std::fabs(lf[i] - ls[i]));
+            if (lf[i] != ls[i]) same = false;
+        }
+        if (!same)
+            std::fprintf(stderr, "  (%s: fused vs split differ, worst %g)\n",
+                         a.tag, static_cast<double>(worst));
+        CHECK(same, "fused and split logits are bit-identical");
+        std::remove(pf.c_str());
+        std::remove(ps.c_str());
+    }
+}
+
+// ALiBi declared in the file must change the LOGITS, and declaring the scale as
+// zero must leave a model with no position signal at all -- which on this family
+// is a real, loadable configuration (MPT ships files with no max_alibi_bias
+// key). Both arms are the same weights, so the difference can only be the bias.
+//
+// This is the test that would have caught the bias being applied in only one of
+// the backend's three attention bodies, which is exactly what happened: the
+// earlier "alibi 8 differs from alibi 0" evidence was rope suppression, not the
+// bias. See test_alibi_slope_ladder for the arithmetic itself.
+static void test_alibi_reaches_the_graph() {
+    PlainSpec on, off;
+    on.arch = "mpt";
+    off.arch = "mpt";
+    off.alibi = 0.0f;
+    const std::string pon = "kraken-alibi-on.gguf";
+    const std::string poff = "kraken-alibi-off.gguf";
+    CHECK(build_tiny_plain_model(pon, on), "wrote the ALiBi file");
+    CHECK(build_tiny_plain_model(poff, off), "wrote the no-ALiBi file");
+
+    std::vector<f32> lon, loff;
+    std::string e1, e2;
+    const bool ok1 = plain_logits_of(pon, lon, e1);
+    const bool ok2 = plain_logits_of(poff, loff, e2);
+    if (!ok1) std::fprintf(stderr, "  (alibi on: %s)\n", e1.c_str());
+    if (!ok2) std::fprintf(stderr, "  (alibi off: %s)\n", e2.c_str());
+    CHECK(ok1 && ok2, "both ALiBi arms run");
+    if (ok1 && ok2) {
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < std::min(lon.size(), loff.size()); i++)
+            worst = std::max(worst, std::fabs(lon[i] - loff[i]));
+        CHECK(worst > 1e-3f, "ALiBi changes the logits, so it reaches attention");
+        // Same file twice: still deterministic, which the bias must not disturb.
+        std::vector<f32> again;
+        std::string e3;
+        CHECK(plain_logits_of(pon, again, e3) && again == lon,
+              "a second run of the ALiBi model is identical");
+    }
+    std::remove(pon.c_str());
+    std::remove(poff.c_str());
+}
+
+// BLOOM normalizes the embedding before block 0, and the tensor is REQUIRED:
+// the family's graph has no other place for that scale, so a file without it is
+// truncated, not merely unusual. The refusal must name the tensor -- a loader
+// that quietly skipped the norm would decode every row at the wrong scale and
+// look healthy.
+static void test_embd_norm_required() {
+    PlainSpec full, missing;
+    full.arch = "bloom";
+    full.embd_norm = true;
+    full.alibi_key = false;
+    missing = full;
+    missing.embd_norm = false;
+    const std::string pf = "kraken-bloom-norm.gguf";
+    const std::string pm = "kraken-bloom-nonorm.gguf";
+    CHECK(build_tiny_plain_model(pf, full), "wrote a bloom file with its norm");
+    CHECK(build_tiny_plain_model(pm, missing), "wrote one without it");
+
+    {
+        Backend *be = make_cpu_backend();
+        Model m;
+        std::string err;
+        CHECK(m.load(*be, pf, &err), "the complete file loads");
+        CHECK(m.cfg().embd_norm, "and the config says the family normalizes");
+        CHECK(m.embd_norm() != nullptr, "the norm weight is resident");
+        m.unload();
+        delete be;
+    }
+    {
+        Backend *be = make_cpu_backend();
+        Model m;
+        std::string err;
+        CHECK(!m.load(*be, pm, &err), "a file without token_embd_norm is refused");
+        CHECK(err.find("token_embd_norm") != std::string::npos,
+              "and the message names the missing tensor");
+        m.unload();
+        delete be;
+    }
+    std::remove(pf.c_str());
+    std::remove(pm.c_str());
+}
+
+// Falcon's parallel branch normalizes the same PRE-attention residual twice. The
+// claim to test is the placement, not the presence: with `attn_norm_2` carrying
+// `attn_norm`'s own weights the two arms normalize identically, so the result
+// must equal a file with no second norm AT ALL -- to the last digit. Norming
+// after the attention residual would consume a different row and could not
+// match, and that is the mistake in this layer that still decodes cleanly.
+static void test_falcon_two_norm_placement() {
+    PlainSpec one, ident, ramp;
+    for (PlainSpec *p : {&one, &ident, &ramp}) {
+        p->arch = "falcon";
+        p->ffn_norm = false;
+        p->alibi_key = false;
+    }
+    ident.attn_norm_2 = true;
+    ident.attn_norm_2_identity = true;
+    ramp.attn_norm_2 = true;
+
+    const std::string p1 = "kraken-falcon-one.gguf";
+    const std::string p2 = "kraken-falcon-ident.gguf";
+    const std::string p3 = "kraken-falcon-ramp.gguf";
+    CHECK(build_tiny_plain_model(p1, one), "wrote the single-norm falcon");
+    CHECK(build_tiny_plain_model(p2, ident), "wrote the identity second norm");
+    CHECK(build_tiny_plain_model(p3, ramp), "wrote the ramped second norm");
+
+    std::vector<f32> l1, l2, l3;
+    std::string e1, e2, e3;
+    const bool ok1 = plain_logits_of(p1, l1, e1);
+    const bool ok2 = plain_logits_of(p2, l2, e2);
+    const bool ok3 = plain_logits_of(p3, l3, e3);
+    if (!ok1) std::fprintf(stderr, "  (one norm: %s)\n", e1.c_str());
+    if (!ok2) std::fprintf(stderr, "  (identity: %s)\n", e2.c_str());
+    if (!ok3) std::fprintf(stderr, "  (ramp: %s)\n", e3.c_str());
+    CHECK(ok1 && ok2 && ok3, "all three falcon arms run");
+    if (ok1 && ok2 && ok3) {
+        CHECK(l2 == l1, "an identity second norm is exactly the single-norm graph");
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < std::min(l1.size(), l3.size()); i++)
+            worst = std::max(worst, std::fabs(l1[i] - l3[i]));
+        CHECK(worst > 1e-3f, "and a different second norm really is applied");
+    }
+    std::remove(p1.c_str());
+    std::remove(p2.c_str());
+    std::remove(p3.c_str());
+}
+
+// A backend that cannot apply ALiBi must REFUSE a family that declares it,
+// before the first token and by name. The alternative is the failure this whole
+// family is exposed to: the bias is the position signal, so a backend that
+// ignored it would decode a different attention distribution and look healthy.
+// The CPU reference answers true; the wrapper here answers false on demand.
+static void test_alibi_refusal_names_the_bias() {
+    PlainSpec spec;
+    spec.arch = "mpt";
+    const std::string path = "kraken-alibi-gate.gguf";
+    CHECK(build_tiny_plain_model(path, spec), "wrote the ALiBi file");
+
+    {
+        // Control: the honest backend runs it.
+        Backend *be = make_cpu_backend();
+        Engine e;
+        EngineConfig c;
+        c.model_path = path;
+        c.n_ctx = 64;
+        std::string err;
+        CHECK(e.init(be, c, &err), "the real backend accepts an ALiBi model");
+    }
+    {
+        Backend *be = new CountingBackend(make_cpu_backend());
+        static_cast<CountingBackend *>(be)->set_no_alibi(true);
+        CHECK(!be->attention_alibi_supported(), "the wrapper denies ALiBi");
+        bool ok = true;
+        std::string err;
+        {
+            // The Engine keeps the pointer and its destructor still reaches the
+            // backend, so the engine is destroyed BEFORE the wrapper -- the
+            // other order was a use-after-free that segfaulted this group.
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            ok = e.init(be, c, &err);
+        }
+        CHECK(!ok, "and the engine refuses before the first token");
+        CHECK(err.find("ALiBi") != std::string::npos,
+              "the refusal names ALiBi rather than failing later");
+        CHECK(err.find("pos") != std::string::npos,
+              "and says the bias is the position signal");
+        delete be;
+    }
+    // A file that declares NO ALiBi must still run on that same backend: the
+    // gate keys on the model's scale, not on the architecture's name.
+    {
+        PlainSpec off = spec;
+        off.alibi = 0.0f;
+        const std::string p2 = "kraken-alibi-gate-off.gguf";
+        CHECK(build_tiny_plain_model(p2, off), "wrote the no-ALiBi sibling");
+        Backend *be = new CountingBackend(make_cpu_backend());
+        static_cast<CountingBackend *>(be)->set_no_alibi(true);
+        bool ok = false;
+        {
+            // Engine outlives nothing here: see the note above.
+            Engine e;
+            EngineConfig c;
+            c.model_path = p2;
+            c.n_ctx = 64;
+            std::string err;
+            ok = e.init(be, c, &err);
+        }
+        CHECK(ok, "a model with no ALiBi is not blocked by a backend without it");
+        delete be;
+        std::remove(p2.c_str());
+    }
+    std::remove(path.c_str());
+}
+
+static void test_alibi_slope_ladder() {
+    Backend *cpu = make_cpu_backend();
+    CHECK(cpu->attention_alibi_supported(),
+          "the reference attention can apply an ALiBi bias");
+
+    const i64 nh = 12;   // deliberately NOT a power of two
+    const i64 hd = 4, nkv = nh;               // plain multi-head: no GQA split
+    const i64 kv_dim = nkv * hd;
+    const i64 nt = 2, npos = 2;
+    const i64 layer_stride = npos * kv_dim;
+    const f32 max_bias = 8.0f;
+
+    // Both keys identical, the query identical to them: every raw score is the
+    // same number, so the only thing that can separate the two keys is the
+    // bias. The values are e0 and e1, so out[1][0..1] are the probabilities.
+    std::vector<f32> kc(static_cast<size_t>(layer_stride * 1), 0.0f);
+    std::vector<f32> vc(static_cast<size_t>(layer_stride * 1), 0.0f);
+    for (i64 j = 0; j < nt; j++) {
+        for (i64 i = 0; i < kv_dim; i++) kc[static_cast<size_t>(j * kv_dim + i)] = 1.0f;
+        // e_j, written into EVERY head's slice: head h reads channels
+        // [h*hd, h*hd+hd), so a basis vector in head 0's slice alone would
+        // leave every other head reading zeros and the recovered "probability"
+        // would be 0/0.
+        for (i64 h = 0; h < nh; h++)
+            vc[static_cast<size_t>(j * kv_dim + h * hd + j)] = 1.0f;
+    }
+    std::vector<f32> q(static_cast<size_t>(nt * nh * hd), 0.0f);
+    for (i64 t = 0; t < nt; t++)
+        for (i64 i = 0; i < nh * hd; i++) q[static_cast<size_t>(t * nh * hd + i)] = 1.0f;
+
+    std::vector<f32> out(static_cast<size_t>(nt * nh * hd), 0.0f);
+    std::vector<f32> scratch(static_cast<size_t>(nt * nh * hd), 0.0f);
+
+    auto slopes_of = [&](f32 mb, std::vector<f64> &got) {
+        AttnDesc d;
+        d.n_head = nh;
+        d.n_kv = nkv;
+        d.hd = hd;
+        d.n_tok = nt;
+        d.pos0 = 0;
+        d.pos_stride = kv_dim;
+        d.layer_stride = layer_stride;
+        d.scale = 1.0f;
+        d.causal = true;
+        d.alibi_max_bias = mb;
+        std::fill(out.begin(), out.end(), 0.0f);
+        cpu->attention(out.data(), q.data(), kc.data(), vc.data(), d);
+        got.assign(static_cast<size_t>(nh), 0.0);
+        for (i64 h = 0; h < nh; h++) {
+            // Row 1, head h: the two value slots are p0 and p1.
+            const f64 p0 = out[static_cast<size_t>(1 * nh * hd + h * hd + 0)];
+            const f64 p1 = out[static_cast<size_t>(1 * nh * hd + h * hd + 1)];
+            got[static_cast<size_t>(h)] = -std::log(p0 / p1);
+        }
+    };
+
+    // The reference ladder, in double, from the formula llama.cpp publishes.
+    auto want_slope = [&](i64 h) {
+        i64 nh_log2 = 1;
+        while ((nh_log2 << 1) <= nh) nh_log2 <<= 1;
+        const f64 m0 = std::pow(2.0, -static_cast<f64>(max_bias) / nh_log2);
+        const f64 m1 = std::pow(2.0, -(static_cast<f64>(max_bias) / 2.0) / nh_log2);
+        return h < nh_log2 ? std::pow(m0, static_cast<f64>(h + 1))
+                           : std::pow(m1, static_cast<f64>(2 * (h - nh_log2) + 1));
+    };
+
+    std::vector<f64> got;
+    slopes_of(max_bias, got);
+    f64 worst = 0.0;
+    for (i64 h = 0; h < nh; h++) {
+        const f64 w = want_slope(h);
+        worst = std::max(worst, std::fabs(got[static_cast<size_t>(h)] - w) /
+                                    std::max(w, 1e-12));
+    }
+    // The recovery goes through a f32 softmax and a f32 log, so the tolerance
+    // is a roundtrip budget, not a slack on the formula: measured worst error
+    // 2.45e-6 relative, while the two mistakes this test exists to catch are
+    // 2x and 256x.
+    CHECK_NEAR(worst, 0.0, 1e-5, "every head's ALiBi slope matches the formula");
+
+    // The two places a plausible implementation goes wrong, stated as values so
+    // a failure says which one happened. 12 heads anchor the ramp at 8.
+    CHECK_NEAR(want_slope(0), 0.5, 1e-12, "head 0 is m0^1 = 1/2 at max_bias 8");
+    CHECK_NEAR(want_slope(7), 1.0 / 256.0, 1e-12, "head 7 is m0^8");
+    // Head 8 is the first past the anchor: m1^1 = 2^(-4/8) = sqrt(1/2). With
+    // the anchor at ceil (16) it would instead be m0^9 = 1/512, and with the
+    // anchor at n_head (12) there would be no halved base at all.
+    CHECK_NEAR(want_slope(8), std::sqrt(0.5), 1e-12,
+               "head 8 starts the halved-base group at floor(log2(12)) = 8");
+    CHECK_NEAR(got[8], std::sqrt(0.5), 2e-6,
+               "and the backend puts head 8 there too, not on the m0 ramp");
+    CHECK(got[8] > 0.1 && got[7] < 0.01,
+          "the anchor is not at ceil or at n_head: head 8 is five times head 7");
+
+    // max_bias 0 is "no ALiBi", and it has to be exactly no ALiBi: equal scores
+    // split evenly, whatever the head count.
+    std::vector<f64> off;
+    slopes_of(0.0f, off);
+    for (i64 h = 0; h < nh; h++)
+        CHECK_NEAR(off[static_cast<size_t>(h)], 0.0, 1e-9,
+                   "max_bias 0 leaves every head unbiased");
+
+    delete cpu;
+}
+
 // The fixture makes the arithmetic checkable by hand: unit-norm keys along one
 // axis so the raw scores are exactly 0, 4, 8, and value rows that are the basis
 // vectors e0, e1, e2, so the last row's four outputs ARE the three softmax
@@ -18293,6 +18982,14 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_gdn_model_loads)
     TEST_GROUP(test_gdn_generation)
     TEST_GROUP(test_speculative_decoding)
+    TEST_GROUP(test_alibi_refusal_names_the_bias)
+    TEST_GROUP(test_layer_norm_epsilon_is_read)
+    TEST_GROUP(test_plain_family_without_any_bias)
+    TEST_GROUP(test_plain_fused_equals_split)
+    TEST_GROUP(test_alibi_reaches_the_graph)
+    TEST_GROUP(test_embd_norm_required)
+    TEST_GROUP(test_falcon_two_norm_placement)
+    TEST_GROUP(test_alibi_slope_ladder)
     TEST_GROUP(test_attention_softcap)
     TEST_GROUP(test_attention_self_mask)
     TEST_GROUP(test_dflash_mask_guard)

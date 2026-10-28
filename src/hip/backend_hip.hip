@@ -3772,6 +3772,10 @@ public:
     // refuses the run by name. The reference body (--cpu, and the attention of
     // both NPU arms) implements it.
     bool attention_softcap_supported() const override { return false; }
+    // No ALiBi term in these kernels either. Same rule as the softcap above:
+    // answer honestly and let the engine refuse the family by name, rather than
+    // run attention without the position signal it exists to supply.
+    bool attention_alibi_supported() const override { return false; }
 
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {

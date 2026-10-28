@@ -1214,3 +1214,13 @@ branch uses **two** norms — `x + attn(ln1(x)) + mlp(ln2(x))` — where GPT-Neo
 reuses one, so `parallel_two_norm` takes a second row of the *pre-attention*
 residual. Proved by a file whose `attn_norm_2` carries `attn_norm`'s own
 weights: the result must be, and is, identical to the last digit.
+
+ALiBi is now covered by tests that recover the **slope ladder out of the softmax
+probabilities** and compare it against the published formula
+(`test_alibi_slope_ladder`, 12 heads so the anchor is 8 — not 12, not 16). That
+test found a real bug in the change above: the bias had been added to the int8-KV
+attention body only, so the f32 body every checkpoint uses ignored it, and the
+model still decoded. The bias now lives in all three bodies, `Backend` has an
+`attention_alibi_supported()` gate so a backend without it refuses the family by
+name instead of decoding something else, and the virtual-NPU attention layer
+declines such a call under its own `alibi` counter rather than dropping the term.

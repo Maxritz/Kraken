@@ -121,7 +121,7 @@ struct Counters {
     // model that never reaches the device says which feature did it rather
     // than leaving the reader to guess.
     unsigned long long attn = 0;
-    unsigned long long attn_host[6] = {0, 0, 0, 0, 0, 0};
+    unsigned long long attn_host[7] = {0, 0, 0, 0, 0, 0, 0};
 };
 
 // Why an attention call stayed on the reference. Index into Counters::attn_host.
@@ -132,9 +132,11 @@ enum AttnWhy {
     ATTN_SOFTCAP,    // Gemma-2 style logit softcap
     ATTN_SINK,       // attention sink
     ATTN_SMALL,      // n_tok below the threshold where the device wins
+    ATTN_ALIBI,      // ALiBi distance bias: the device body has no such term
 };
-const char *const kAttnWhyName[6] = {"8-bit cache", "window", "masked block",
-                                     "softcap",     "sink",   "short"};
+const char *const kAttnWhyName[7] = {"8-bit cache", "window", "masked block",
+                                     "softcap",     "sink",   "short",
+                                     "alibi"};
 
 struct Entry {
     std::vector<f32> data;
@@ -955,7 +957,7 @@ std::string stats(const Offload *o) {
     // attention never reaches the device should say why on the same line the
     // reader is already looking at, not leave it to be inferred.
     unsigned long long host_attn = 0;
-    for (int i = 0; i < 6; i++) host_attn += o->n.attn_host[i];
+    for (int i = 0; i < 7; i++) host_attn += o->n.attn_host[i];
     if (o->n.attn || host_attn) {
         out += format("; attn %llu dev, %llu host", o->n.attn, host_attn);
         bool first = true;
@@ -1230,6 +1232,7 @@ bool attention(Offload *o, const AttnCall &c) {
     else if (c.window > 0) why = ATTN_WINDOW;
     else if (c.skip_from >= 0) why = ATTN_SKIP;
     else if (c.softcap > 0.0f) why = ATTN_SOFTCAP;
+    else if (c.alibi_max_bias > 0.0f) why = ATTN_ALIBI;
     else if (c.has_sinks) why = ATTN_SINK;
     else if (c.n_tok < o->attn_min_tok) why = ATTN_SMALL;
     if (why >= 0) {
