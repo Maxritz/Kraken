@@ -580,6 +580,12 @@ target_link_libraries(kraken-q80-dot PRIVATE krk_core)
 add_executable(kraken-q80-gemm-bench tools/bench_q80_gemm.cpp)
 target_link_libraries(kraken-q80-gemm-bench PRIVATE krk_core)
 
+# The measured ceiling for an 8-bit x 8-bit dot on this exact host, so a kernel
+# number can be stated as a fraction of what the machine can do rather than
+# against an assumed clock and port count.
+add_executable(kraken-isa-ceiling tools/bench_isa_ceiling.cpp)
+target_link_libraries(kraken-isa-ceiling PRIVATE krk_core)
+
 if(KRK_HIP_AVAILABLE)
     add_executable(kraken-oracle tools/oracle_probe.cpp)
     target_link_libraries(kraken-oracle PRIVATE krk_core krk_hip)

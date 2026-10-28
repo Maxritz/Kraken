@@ -122,3 +122,126 @@ KRK_CPU_GEMM_NC=0 ./build/kraken ... --kprof   # the unblocked loop order
 `tools/bench_q80_gemm.cpp` is deliberately standalone: it measures the kernel
 with the data pre-laid-out, so a number from it cannot be explained by cache
 behaviour or by the engine's loop order.
+
+```bash
+./build/kraken-isa-ceiling   # what the machine can do, and what the kernel does
+```
+
+## 7. The measured ceiling, not an assumed one
+
+Sections 1-5 argued from an assumed 2.6 GHz and an assumed port count. That was
+wrong twice over, so the ceiling is now measured on this host by
+`tools/bench_isa_ceiling.cpp` -- same instruction mix, same 8-row shape, all in
+one process so the ratios survive the host's mood swings (section 8).
+
+| variant | what it is | of C |
+|---|---|---|
+| A | registers only, integer accumulate | 115-133% |
+| B | A plus the real `cvtepi32_ps` + `fmadd` tail | 93-112% |
+| C | B plus the real weight and activation loads | 100% |
+| D | C at four rows instead of eight | 95-106% |
+| F | the shipped kernel body with the per-block scale chain removed | 55-70% |
+| E | **the shipped kernel** | **29-53%** (median ~41%) |
+
+Two things follow, and they are the only solid conclusions this file can offer:
+
+* **E/C = 0.41.** The shipped kernel runs at about 41% of what the same
+  instruction mix achieves on this machine. There *is* roughly 2x inside the
+  loop, so the earlier instinct -- that the dot itself was near its limit --
+  was wrong.
+* **F/E = 1.4.** Removing the per-block scale load and its dependency chain is
+  worth 1.4x on its own. That is the largest single term inside the loop.
+* **F/C = 0.55.** Even with no scale chain at all, the kernel is at 55% of C.
+  The rest is the streaming read of the 1.67 MB weight matrix, which C never
+  does because its buffer is 8 KiB.
+
+Note that C, B and A all hold their scale in a *register* for the length of the
+call. That is deliberate and it is also why the earlier "signflip NO scale"
+reading of 42 GMAC/s was not evidence of anything: a compile-time constant
+scale lets the compiler drop the whole float tail, so that variant measured a
+different kernel. F fixes this by taking the scale as a runtime `f32`.
+
+## 8. This host has two throughput modes
+
+The same binary, back to back, on an otherwise idle box:
+
+| run | C | F | E |
+|---|---|---|---|
+| 1 | 44.1 | 30.9 | 23.4 |
+| 2 | 58.5 | 32.4 | 16.7 |
+| 3 | 80.7 | 44.5 | 32.7 |
+
+1.8x between runs, with `cpu/wall = 1.00` and a steal time of 7 ticks. The
+process is not being descheduled, so this is either SMT sibling contention or a
+frequency policy; whatever it is, it is invisible from inside the process. The
+consequence for method is absolute: **an absolute GMAC/s figure from this box is
+not repeatable, and only a ratio taken inside one process is.** That is why the
+kernel A/B in `bench_q80_gemm.cpp` alternates arms rep by rep, and why every
+number in this file is quoted as a ratio or with its spread.
+
+## 9. Why two attempts to shorten the chain both did nothing
+
+Both rewrites removed instructions from the per-block scale construction and
+both measured neutral:
+
+| attempt | what changed | measured |
+|---|---|---|
+| pair-expanded scales (`dx8`) | 1 load instead of 2 broadcasts + insert | 1.04x |
+| 64-bit broadcast + `permutexvar_ps` | 8 bytes loaded instead of 64, 3 ops instead of 5 | 1.01x |
+
+Section 7 explains why: F/E = 1.4 but the wins above are ~1.0, so the cost is
+the *latency* of the chain inside each block-pair iteration, not the size of the
+instruction sequence. Eight independent accumulation chains are not enough to
+cover a load -> convert -> multiply -> permute -> `fmadd` dependency that runs
+the length of the loop body. Shortening it cannot help; only overlapping it can.
+
+The untested restructuring that follows from that: process **two output columns
+per call**, so one activation-scale chain feeds two `maddubs` chains. The MACs
+per block-pair stay at 512 (4 rows x 2 columns instead of 8 rows x 1), the
+accumulator count stays at 8, and the scale construction halves per MAC. That
+is the next experiment, and it is listed as an experiment rather than a fix
+because the same reasoning has now been wrong once.
+
+## 10. The in-engine roofline probe does not agree with any of this
+
+`--kprof` prints `roofline probe: int8 N GMAC/s`, and every `%peak` column is
+that number, so the column is only as good as the probe. Its loop shape is
+reproduced in `tools/bench_isa_ceiling.cpp` as variant P, and in the same
+process where C measures 47-57 GMAC/s:
+
+| | GMAC/s | of C |
+|---|---:|---:|
+| P, probe loop shape, one core | 73.7-99.1 | 173-213% |
+| engine's own report, two cores (169-215 per core) | 338-430 | — |
+
+Two threads cannot retire more than twice what one thread does on the same
+loop, so the engine's figure is at least 1.7-2.2x higher than the same code
+measures standalone. The probe also walks no memory at all, unlike a kernel
+that has to fetch its operands, which accounts for P being a further 1.7-2.1x
+above C.
+
+**What to use instead.** Compare kernels against C, not against the probe. The
+probe is an upper bound on issue width and nothing else; against it the Q8_0
+GEMM reads as 9-13% of peak, which understates it by roughly 3x. Of the two
+numbers, C is the one a kernel can be held to.
+
+**Why the probe is left as it is.** Two attempts to make it honest were made
+and both were reverted: giving each chain its own multiplier (removing a
+possible common-subexpression win) moved the reported figure from 430 to 338
+without changing what the loop does, and replacing the register operand with an
+L1 load produced 175 in one run and 430 in the next three. Neither could be
+validated from inside the process, so neither was shipped. The disagreement is
+recorded here rather than papered over.
+
+## 11. Corrections to earlier claims in this file
+
+* **"int8 301 GMAC/s, consistent with 2 cores at 3.2 GHz"** (README) is not
+  supported. This host reports 2.60 GHz nominal, and a dependent FP add with a
+  4-cycle latency takes 2.14 ns, i.e. ~1.87 GHz effective; `cpu/wall` is 1.00
+  with a steal time of 7 ticks, so the gap is not descheduling. The 301 figure
+  also exceeds what the identical loop shape measures standalone (section 10).
+* **"the dot itself is the cost"** was already retracted in section 4 and stays
+  retracted, but the reason given there was wrong: the 42.2 GMAC/s reading that
+  retracted it came from a compile-time-constant scale, which lets the compiler
+  delete the int-to-float tail. Section 7's F variant redoes that measurement
+  with a runtime scale and finds 1.4x, not 1.8x.
