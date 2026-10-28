@@ -374,7 +374,8 @@ def _quant_np(v, fmt):
 
 def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
           arch="llama", n_expert=0, n_expert_used=0, n_ff_exp=0, scale=0.04,
-          fused=False, fused_ffn=None, plain=None, split_qkv=False):
+          fused=False, fused_ffn=None, plain=None, split_qkv=False,
+          alibi=8.0, qk_norm=False):
     # `fused` is the Q|K|V projection, `fused_ffn` the gate|up one; a Phi file
     # has both, and the two are separable so a test can fuse one at a time and
     # find which of them changed the logits.
@@ -382,12 +383,12 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
         fused_ffn = fused
     # The plain pre-norm family. `biases` is true for the members that carry a
     # bias beside every weight (gptneox, phi2); GPT-J has none anywhere.
-    biases = plain in ("gptneox", "phi2")
+    biases = plain in ("gptneox", "phi2", "mpt", "bloom")
     rnd = random.Random(seed)
     q_dim, kv_dim = n_head * hd, n_kv * hd
     moe = n_expert > 0
-    assert arch in ("llama", "phi3", "gptneox", "gptj", "phi2") \
-        or arch == "qwen3moe", arch
+    assert arch in ("llama", "phi3", "gptneox", "gptj", "phi2", "mpt",
+                    "bloom") or arch == "qwen3moe", arch
     assert not moe or (n_ff_exp > 0 and 0 < n_expert_used <= n_expert)
 
     tokens = ["<unk>", "<s>", "</s>"]
@@ -415,7 +416,16 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
     g.u32(arch + ".attention.head_count_kv", n_kv)
     g.u32(arch + ".attention.key_length", hd)
     g.u32(arch + ".attention.value_length", hd)
-    g.f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5)
+    if plain:
+        # The plain family is LayerNorm, and writes the key that names its
+        # epsilon -- the same one llama.cpp's converters emit.
+        g.f32(arch + ".attention.layer_norm_epsilon", 1e-5)
+    else:
+        g.f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5)
+    if arch == "mpt" and alibi is not None:
+        # MPT states its ALiBi scale in the file; BLOOM does not (its loader
+        # carries the 8.0 constant instead), so only MPT writes the key here.
+        g.f32(arch + ".attention.max_alibi_bias", alibi)
     g.f32(arch + ".rope.freq_base", 10000.0)
     if moe:
         g.u32(arch + ".expert_count", n_expert)
@@ -492,10 +502,22 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
     def ones(name, n):
         g.tensor(name, n, 1, struct.pack("<%df" % n, *([1.0] * n)), T_F32)
 
+    def ramp(name, n):
+        # Non-identity on purpose: an RMSNorm weight of all ones is the identity,
+        # so a file carrying it would look the same whether the engine applied
+        # the norm or ignored the tensor entirely. This makes presence provable.
+        g.tensor(name, n, 1,
+                 struct.pack("<%df" % n, *[1.0 + 0.01 * (i % 7) for i in range(n)]),
+                 T_F32)
+
     def zeros(name, n):
         g.tensor(name, n, 1, struct.pack("<%df" % n, *([0.0] * n)), T_F32)
 
     w("token_embd.weight", n_embd, vocab)
+    if plain == "bloom":
+        # Normalizes the embedding before block 0, with a bias.
+        ones("token_embd_norm.weight", n_embd)
+        zeros("token_embd_norm.bias", n_embd)
     ones("output_norm.weight", n_embd)
     w("output.weight", n_embd, vocab)
     if plain:
@@ -506,6 +528,11 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
     for l in range(n_layer):
         p = "blk.%d." % l
         ones(p + "attn_norm.weight", n_embd)
+        if qk_norm:
+            # Some MPT exports carry these and some do not -- optional in the
+            # reference loader, and the file decides.
+            ramp(p + "attn_q_norm.weight", hd)
+            ramp(p + "attn_k_norm.weight", hd)
         ones(p + "ffn_norm.weight", n_embd)
         if biases:
             zeros(p + "attn_norm.bias", n_embd)
@@ -596,10 +623,16 @@ def main(argv=None):
     ap.add_argument("--expert-ff", type=int, default=0,
                     help="expert hidden width (0 = --ff)")
     ap.add_argument("--plain", default="",
-                    choices=["", "gptneox", "gptj", "phi2"],
+                    choices=["", "gptneox", "gptj", "phi2", "mpt", "bloom"],
                     help="one of the plain pre-norm family layouts: a fused "
                          "attn_qkv (Q|K|V), LayerNorm, rotary positions and an "
                          "ungated GELU MLP")
+    ap.add_argument("--qk-norm", action="store_true",
+                    help="emit per-head attn_q_norm/attn_k_norm (some MPT "
+                         "exports have them)")
+    ap.add_argument("--alibi", type=float, default=8.0,
+                    help="max_alibi_bias written for --plain mpt (0 writes the "
+                         "key as 0, i.e. no ALiBi, for an A/B)")
     ap.add_argument("--split-qkv", action="store_true",
                     help="with --plain: store attn_q/attn_k/attn_v separately "
                          "so the two layouts can be compared on one weight set")
@@ -639,7 +672,8 @@ def main(argv=None):
                  n_expert=a.experts, n_expert_used=used, n_ff_exp=ff_exp,
                  scale=a.scale, fused=a.phi3 or a.phi3_qkv_only,
                  fused_ffn=a.phi3 or a.phi3_ffn_only,
-                 plain=a.plain or None, split_qkv=a.split_qkv)
+                 plain=a.plain or None, split_qkv=a.split_qkv,
+                 alibi=a.alibi, qk_norm=a.qk_norm)
     moe = ("%d experts top-%d, expert ff %d, " % (a.experts, used, ff_exp)
            if a.experts else "")
     print("wrote %s: %d layers, embd %d, %d/%d heads, hd %d, ff %d, %s"

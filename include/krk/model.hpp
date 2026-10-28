@@ -430,6 +430,9 @@ struct ModelConfig {
     bool learned_pos = false;
     bool parallel_residual = false;
     bool no_gate_ffn = false;
+    // ALiBi's scale, and BLOOM's embedding norm (see ArchSpec).
+    f32 alibi_max_bias = 0.0f;
+    bool embd_norm = false;
     // Rotate only on the windowed layers (muse-glimmer's full layers are NoPE).
     bool rope_swa_only = false;
 
@@ -1000,6 +1003,10 @@ public:
     // scale; 0 when the file has none. The engine sizes the staging buffer it
     // scales such a weight's input into, and allocates nothing when this is 0.
     i64 max_scaled_in() const { return max_scaled_in_; }
+    // BLOOM normalizes the token embedding before block 0; both null on every
+    // other family (ArchSpec::embd_norm).
+    const f32 *embd_norm() const { return embd_norm_; }
+    const f32 *embd_norm_bias() const { return embd_norm_bias_; }
     const f32 *out_norm() const { return out_norm_; }
     const f32 *out_norm_bias() const { return out_norm_bias_; }
     const QuantTensor &pos_embd() const { return pos_embd_; }
@@ -1229,6 +1236,8 @@ private:
     std::vector<LayerWeights> layers_;
     QuantTensor tok_embd_, out_head_;
     i64 max_scaled_in_ = 0;
+    f32 *embd_norm_ = nullptr;
+    f32 *embd_norm_bias_ = nullptr;
     f32 *out_norm_ = nullptr;
     // ---- GPT-2 -----------------------------------------------------------
     // Learned absolute position embeddings, [n_ctx_train, n_embd], added to

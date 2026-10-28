@@ -263,6 +263,22 @@ struct ArchSpec {
     bool learned_pos = false;
     bool parallel_residual = false;
     bool no_gate_ffn = false;
+    // ---- ALiBi (mpt, bloom, falcon) --------------------------------------
+    // The position signal is an additive per-head distance bias on the
+    // attention score, with no rotary table and no learned position embedding
+    // at all. Stored as the SCALE the file names (`attention.max_alibi_bias`),
+    // because the per-head slope is derived from it inside the kernel by the
+    // same formula llama.cpp uses -- see AttnDesc::alibi_max_bias.
+    //
+    // BLOOM's converter does not write the key, so its value is the model's own
+    // constant: the reference sets f_max_alibi_bias = 8.0f in that arch's
+    // loader. Every other family leaves this 0.
+    float alibi_max_bias = 0.0f;
+    // BLOOM normalizes the token EMBEDDING before the first block
+    // (`token_embd_norm`, a LayerNorm with a bias). It is not a per-layer norm
+    // under another name -- the file carries both -- and skipping it leaves
+    // every row at the wrong scale entering layer 0.
+    bool embd_norm = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

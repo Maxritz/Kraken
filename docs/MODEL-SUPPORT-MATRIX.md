@@ -17,16 +17,19 @@ So "unsupported" (refused) and "supported but dequantizing" are different
 problems. The second is the bigger one numerically, the first is the one that
 stops a model running.
 
-**Update:** `phi3` (Phi-3, Phi-4) and `gptneox`, `gptj`, `phi2` are now
-supported — see `docs/PHI3-FUSED-PROJECTIONS.md` and
+**Update:** `phi3` (Phi-3, Phi-4), `gptneox`, `gptj`, `phi2`, `mpt` and `bloom`
+are now supported — see `docs/PHI3-FUSED-PROJECTIONS.md` and
 `docs/PLAIN-PRENORM-FAMILY.md`. That clears Phi-3-mini, Phi-4-reasoning-plus and
-adds three of the GGUF spec's own "known values" architectures.
+adds five of the GGUF spec's own "known values" architectures — `mpt` and
+`bloom` bring ALiBi, see `docs/ALIBI-AND-MPT-BLOOM.md`.
 
 Verified arch strings in `src/arch.cpp`: `llama`, `qwen2`, `qwen3`, `qwen35`,
 `qwen35moe`, `qwen3moe`, `qwen3vl`, `gemma`, `gemma2`, `gemma3`, `gemma4`,
 `deepseek2`, `deepseek4`, `deepseek41`, `gpt-oss`, `gpt2`, `olmoe`, `lfm2`,
 `lfm2moe`, `nemotron_h`, `nemotron_h_moe`, `minimax-m3`, `laguna`, `k2-horizon`,
-`muse-glimmer`, `qwen4exp`, `recurrent`, `dflash`, `dspark`, `diffuse`.
+`muse-glimmer`, `qwen4exp`, `recurrent`, `dflash`, `dspark`, `diffuse`, `mpt`,
+`bloom` (and `gptneox`, `gptj`, `phi2`, `phi3`). Still absent from the spec's
+known-values list: `falcon`, `mamba`, `rwkv`.
 
 ## The matrix
 

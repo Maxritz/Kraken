@@ -112,9 +112,10 @@ guesses at the numerical cause were wrong.
 
 ## Still refused
 
-`mpt` and `bloom` need **ALiBi** — a per-head distance bias added to the
-attention scores instead of a rotary or learned position. `falcon` needs ALiBi
-plus parallel attention with multiquery. `mamba` and `rwkv` are not transformer
+`falcon` needs ALiBi plus parallel attention with multiquery — and two
+*different* norms in the parallel branch, unlike GPT-NeoX's shared row.
+(`mpt` and `bloom` were the other two entries here; they are supported now, see
+[ALIBI-AND-MPT-BLOOM.md](ALIBI-AND-MPT-BLOOM.md).) `mamba` and `rwkv` are not transformer
 stacks at all: a selective state-space recurrence and a linear-attention
 recurrence respectively, and neither is the gated delta net this engine already
 implements. Those five are the honest remainder of the spec's list.

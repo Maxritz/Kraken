@@ -3096,6 +3096,14 @@ bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
         be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * E);
     }
 
+    // BLOOM's embedding norm, applied once to the whole [n, E] block before
+    // layer 0 rather than per layer. Layers are n rows, so this is one call.
+    if (mc.embd_norm) {
+        layernorm(ws_x2_, ws_x_, model_.embd_norm(), model_.embd_norm_bias(),
+                  n, E, eps);
+        be_->copy_act(ws_x_, ws_x2_, static_cast<i64>(n) * E);
+    }
+
     // ---- blocks ------------------------------------------------------------
     AttnDesc d;
     d.n_head = mc.n_head;
@@ -3109,6 +3117,9 @@ bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
     // path, it is a write at a zero stride.
     d.pos_stride = d.n_kv * d.hd;
     d.kv_int8 = false;
+    // ALiBi supplies the position signal on this family, so the bias is carried
+    // by every attention call rather than a rotary table.
+    d.alibi_max_bias = mc.alibi_max_bias;
 
     for (i32 l = 0; l < mc.n_layer; l++) {
         const LayerWeights &L = layers[static_cast<size_t>(l)];
@@ -3158,10 +3169,23 @@ bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
             if (L.v_bias) be_->add_bias_rows(ws_v_, L.v_bias, kvw, n);
         }
 
+        // Per-head QK-norm, when the file carries the weights. Some MPT
+        // exports do and some do not; the loader sets mc.qk_norm from the
+        // presence of the tensors, and skipping it here would leave a file
+        // that loads, decodes plausible text and is silently wrong -- and
+        // wrong on both backends, since they share this op.
+        if (mc.qk_norm)
+            be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, lh, lkvh, hd, n,
+                         mc.rms_eps, mc.qk_norm_wide);
+
         // Rotary, when the family has it. GPT-2 has none: its positions are
         // already in the embedding by now, and rotating here would apply a
         // second, wrong position signal.
-        if (!mc.learned_pos)
+        // No rotary on a family whose position signal is ALiBi: the bias is
+        // added to the score inside attention(), and rotating here as well
+        // would apply a second, different position signal. llama.cpp lists
+        // these archs under LLAMA_ROPE_TYPE_NONE for the same reason.
+        if (!mc.learned_pos && mc.alibi_max_bias <= 0.0f)
             be_->rope(ws_q_, ws_k_, lh, lkvh, hd, n, pos0,
                       model_.inv_freq_at(l).data(), mc.rope_scale,
                       model_.rope_frac_at(l), mc.rope_neox);
