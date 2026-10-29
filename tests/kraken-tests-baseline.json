@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-29T15:14:10Z",
-  "recorded_commit": "d21ff50",
-  "totals": {"groups": 158, "passed": 7083, "run": 7083, "exit": 0},
+  "recorded_utc": "2026-10-29T15:18:03Z",
+  "recorded_commit": "407b1e9",
+  "totals": {"groups": 159, "passed": 7099, "run": 7099, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -61,6 +61,7 @@
     {"name": "test_pending_model_fixtures", "status": "pass", "passed": 36, "run": 36},
     {"name": "test_pending_model_refusals", "status": "pass", "passed": 23, "run": 23},
     {"name": "test_yes_row_fixtures", "status": "pass", "passed": 40, "run": 40},
+    {"name": "test_diffusion_sampler", "status": "pass", "passed": 16, "run": 16},
     {"name": "test_k2_horizon_mova", "status": "pass", "passed": 20, "run": 20},
     {"name": "test_mova_router", "status": "pass", "passed": 9, "run": 9},
     {"name": "test_dsv4_sinkhorn_mixer", "status": "pass", "passed": 11, "run": 11},

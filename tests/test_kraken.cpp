@@ -61,6 +61,7 @@
 #include "krk/gguf.hpp"
 #include "krk/hc.hpp"
 #include "krk/mova.hpp"
+#include "krk/diffusion.hpp"
 #include "krk/mla.hpp"
 #include "krk/mla_shared.hpp"
 #include "krk/dsv4_route.hpp"
@@ -23404,6 +23405,201 @@ static void test_k2_horizon_mova() {
     std::remove("kraken-k2-full.gguf");
 }
 
+// ---- the block-diffusion sampler (diffuse / LLaDA2.x) ---------------------
+//
+// The schedule is driven by a FORWARD THE TEST OWNS, so every commitment is
+// predictable: the fake model gives position t a sharp peak on token (t % 5) at
+// the LAST block it was asked about and a flat distribution everywhere else.
+// That means "who gets committed" is decided by the schedule and the confidence
+// order, which is exactly what is under test -- not by a real model's opinion.
+static void test_diffusion_sampler() {
+    // ---- the transfer plan: base plus remainder, never flat ----
+    {
+        i32 plan[8];
+        diffusion_transfer_plan(plan, 10, 3);
+        // 10 masks over 3 steps: 4, 3, 3. A flat 10/3 = 3 leaves one behind.
+        const bool ok = plan[0] == 4 && plan[1] == 3 && plan[2] == 3;
+        std::fprintf(stderr, "[dllm] transfer 10/3 = %d %d %d\n", plan[0], plan[1],
+                     plan[2]);
+        CHECK(ok, "transfer is base plus remainder, remainder first");
+        i32 total = 0;
+        for (i32 k = 0; k < 3; k++) total += plan[k];
+        CHECK(total == 10, "and it sums to exactly the block's mask count");
+
+        diffusion_transfer_plan(plan, 4, 4);
+        CHECK(plan[0] == 1 && plan[3] == 1, "an exact division is flat");
+        diffusion_transfer_plan(plan, 3, 8);
+        total = 0;
+        for (i32 k = 0; k < 8; k++) total += plan[k];
+        CHECK(total == 3, "more steps than masks still commits every mask");
+        CHECK(plan[0] == 1 && plan[1] == 1 && plan[2] == 1 && plan[3] == 0,
+              "and the extra steps commit nothing rather than something");
+    }
+
+    // ---- the loop, on a model with a known answer ----
+    // peak(t) = t % 5, and the peak is sharp (logit 20 vs 0) so softmax
+    // confidence is ~1.0 for the argmax of every position: ties across
+    // positions are then broken by POSITION, which is the documented rule.
+    const i32 n_vocab = 8;
+    auto make_forward = [&](i32 *calls, i32 peak_shift = 0) {
+        return [&, peak_shift, calls](const i32 *toks, i32 n_tok, f32 *logits) {
+            (*calls)++;
+            for (i32 t = 0; t < n_tok; t++) {
+                (void)toks;
+                f32 *row = logits + static_cast<i64>(t) * n_vocab;
+                for (i32 v = 0; v < n_vocab; v++) row[v] = 0.0f;
+                const i32 peak = ((t + peak_shift) % 5) + 1;   // never the mask id 0
+                row[peak] = 20.0f;
+            }
+            return true;
+        };
+    };
+
+    DiffusionParams p;
+    p.gen_length = 8;
+    p.block_length = 4;
+    p.steps = 2;              // 2 blocks x 2 steps = 4 forwards
+    p.mask_id = 0;
+    i32 calls = 0;
+    std::vector<i32> seq;
+    const i32 prompt_len = 3;
+    const i32 fwd = diffusion_generate(seq, prompt_len, n_vocab, p,
+                                       make_forward(&calls));
+    std::fprintf(stderr, "[dllm] forwards %d (calls %d)  seq:", fwd, calls);
+    for (i32 t = prompt_len; t < (i32)seq.size(); t++) std::fprintf(stderr, " %d", seq[t]);
+    std::fprintf(stderr, "\n");
+    CHECK(fwd == 4 && calls == 4,
+          "the forward runs steps x blocks times -- 2 blocks of 2 steps");
+    CHECK(seq.size() == (size_t)(prompt_len + p.gen_length),
+          "the sequence is the prompt plus gen_length tokens");
+    bool any_mask = false;
+    for (i32 t = prompt_len; t < (i32)seq.size(); t++)
+        if (seq[t] == p.mask_id) any_mask = true;
+    CHECK(!any_mask, "and nothing is left masked: the block completes");
+
+    // ---- every position got the token the model peaked on ----
+    // The fake's peak for position t is ((t % 5) + 1). It is the same at every
+    // step, so WHICH step committed a position cannot change the value -- what
+    // the schedule decides is only who is committed when.
+    {
+        bool ok = true;
+        for (i32 t = prompt_len; t < (i32)seq.size(); t++)
+            if (seq[t] != ((t % 5) + 1)) ok = false;
+        CHECK(ok, "every committed token is the model's argmax for its position");
+    }
+
+    // ---- arm: candidates restricted to the current block ----
+    // If a later block's positions were candidates in an earlier block, the
+    // first block's steps would commit them too. Measured by giving each
+    // position a DIFFERENT peak per forward and seeing which block's value wins:
+    // with the restriction, a position can only be written by its own block.
+    {
+        i32 n_calls = 0;
+        std::vector<i32> s2;
+        // Forward number k peaks every position on k+1, so the value a position
+        // ends up with names the block (really the step) that committed it.
+        auto fwd_n = [&](const i32 *, i32 n_tok, f32 *lg) {
+            n_calls++;
+            for (i32 t = 0; t < n_tok; t++) {
+                f32 *row = lg + static_cast<i64>(t) * n_vocab;
+                for (i32 v = 0; v < n_vocab; v++) row[v] = 0.0f;
+                row[1 + (n_calls % 5)] = 20.0f;
+            }
+            return true;
+        };
+        DiffusionParams q = p;
+        q.gen_length = 4;
+        q.block_length = 4;
+        q.steps = 2;
+        diffusion_generate(s2, 2, n_vocab, q, fwd_n);
+        // Both steps ran inside the ONE block, and each committed 2 of the 4
+        // masks, so the first two positions carry step 1's token and the last
+        // two step 2's.
+        std::fprintf(stderr, "[dllm] block-order seq: %d %d %d %d (peaks 1,2)\n",
+                     s2[2], s2[3], s2[4], s2[5]);
+        const i32 first = 1 + (1 % 5), second = 1 + (2 % 5);
+        CHECK(s2[2] == first && s2[3] == first,
+              "the first step commits the highest-confidence two");
+        CHECK(s2[4] == second && s2[5] == second,
+              "and the second step commits the rest, from ITS logits");
+    }
+
+    // ---- arm: a committed token is never re-decided ----
+    // The fake is given a peak that CHANGES every call. A sampler that re-scores
+    // committed positions would let a later step overwrite an earlier one; the
+    // reference does not, and neither does this one.
+    {
+        i32 n_calls = 0;
+        std::vector<i32> s3;
+        auto fwd_alt = [&](const i32 *toks, i32 n_tok, f32 *lg) {
+            n_calls++;
+            for (i32 t = 0; t < n_tok; t++) {
+                f32 *row = lg + static_cast<i64>(t) * n_vocab;
+                for (i32 v = 0; v < n_vocab; v++) row[v] = 0.0f;
+                // A committed token keeps its value in `toks`; the fake makes
+                // the CURRENT answer depend on the call count instead.
+                row[1 + (n_calls % 5)] = 20.0f;
+                (void)toks;
+            }
+            return true;
+        };
+        DiffusionParams q = p;
+        q.gen_length = 4;
+        q.block_length = 4;
+        q.steps = 4;              // one mask per step
+        diffusion_generate(s3, 1, n_vocab, q, fwd_alt);
+        std::fprintf(stderr, "[dllm] no-rewrite seq: %d %d %d %d\n", s3[1], s3[2],
+                     s3[3], s3[4]);
+        bool ok = true;
+        for (i32 k = 0; k < 4; k++)
+            if (s3[1 + k] != 1 + ((k + 1) % 5)) ok = false;
+        CHECK(ok, "each step commits a fresh position, never rewriting one");
+    }
+
+    // ---- arm: the block schedule is semi-autoregressive ----
+    // Block 0 must be finished before block 1 is touched. With 2 steps per
+    // block, forward 1 and 2 belong to block 0; if block 1 were a candidate in
+    // them, positions 4..7 would carry block 0's values.
+    {
+        i32 n_calls = 0;
+        std::vector<i32> s4;
+        auto fwd_blk = [&](const i32 *, i32 n_tok, f32 *lg) {
+            n_calls++;
+            const i32 block = n_calls <= 2 ? 0 : 1;
+            for (i32 t = 0; t < n_tok; t++) {
+                f32 *row = lg + static_cast<i64>(t) * n_vocab;
+                for (i32 v = 0; v < n_vocab; v++) row[v] = 0.0f;
+                row[1 + block] = 20.0f;      // token 1 = block 0, token 2 = block 1
+            }
+            return true;
+        };
+        diffusion_generate(s4, 0 + 2, n_vocab, p, fwd_blk);
+        bool b0 = true, b1 = true;
+        // forward 1 and 2 peak token 1 (block 0); 3 and 4 peak token 2.
+        for (i32 t = 2; t < 6; t++) if (s4[t] != 1) b0 = false;
+        for (i32 t = 6; t < 10; t++) if (s4[t] != 2) b1 = false;
+        std::fprintf(stderr, "[dllm] blocks seq:");
+        for (i32 t = 2; t < 10; t++) std::fprintf(stderr, " %d", s4[t]);
+        std::fprintf(stderr, "\n");
+        CHECK(b0, "block 0's four positions carry block 0's answer");
+        CHECK(b1, "and block 1's carry block 1's");
+    }
+
+    // ---- a malformed schedule is refused, not run ----
+    {
+        std::vector<i32> s5;
+        DiffusionParams bad = p;
+        bad.block_length = 0;
+        i32 c2 = 0;
+        CHECK(diffusion_generate(s5, 3, n_vocab, bad, make_forward(&c2)) == -1,
+              "a zero block length is refused");
+        bad = p;
+        bad.steps = 0;
+        CHECK(diffusion_generate(s5, 3, n_vocab, bad, make_forward(&c2)) == -1,
+              "and so is a zero step count");
+    }
+}
+
 // ---- every `Yes` row: a file of its family, built from its own flags ------
 //
 // The same bargain as the pending pass, turned on the rows that already claim
@@ -27010,6 +27206,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_pending_model_fixtures)
     TEST_GROUP(test_pending_model_refusals)
     TEST_GROUP(test_yes_row_fixtures)
+    TEST_GROUP(test_diffusion_sampler)
     TEST_GROUP(test_k2_horizon_mova)
     TEST_GROUP(test_mova_router)
     TEST_GROUP(test_dsv4_sinkhorn_mixer)

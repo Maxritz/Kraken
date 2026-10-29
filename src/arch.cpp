@@ -1250,10 +1250,22 @@ constexpr ArchSpec kTable[] = {
     // schema read off LLaDA2.2-flash and the reference decoding loop. The three
     // pieces this engine lacks are named here; the bidirectionality itself is
     // already reachable (the attention op has always taken a causal flag).
+    // The SAMPLER is done: src/diffusion.cpp is the reference's block schedule
+    // (base-plus-remainder transfer, candidates restricted to this block and to
+    // masked positions, confidence top-k, no rewriting of committed tokens), and
+    // test_diffusion_sampler drives it with a forward the test owns so every
+    // commitment is predictable. What is NOT done is everything around it: the
+    // `diffuse.*` loader schema (fused attn_qkv split, post_attn_norm mapped to
+    // the pre-FFN norm, moe_gate/moe_experts_* onto the MoE slots), the
+    // group-limited routing rule with its selection bias, and the cacheless
+    // bidirectional forward wired into Engine::generate. The row stays No and
+    // says so, in that order -- docs/LLaDA.md is the plan and now has one item
+    // fewer on it.
     {"diffuse", ArchShape::Diffusion, ArchSupport::No, ArchRole::Target, "diffuse",
-     "block-diffusion sampling, fused attn_qkv/qk-norm/post-attn-norm loading and "
-     "group-limited expert routing with a routing bias are not implemented yet "
-     "(docs/LLaDA.md)",
+     "the block-diffusion sampler runs (src/diffusion.cpp, pinned by "
+     "test_diffusion_sampler); the diffuse.* loader schema, the group-limited "
+     "expert routing with its bias, and the cacheless bidirectional forward in "
+     "Engine::generate are not implemented yet (docs/LLaDA.md)",
      true, false, false, false},
 };
 
