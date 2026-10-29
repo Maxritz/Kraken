@@ -1028,6 +1028,16 @@ static void q2k_unpack(const u8 *b, i8 *vals, f32 *dlo, f32 *dmn) {
 // Keeping the lanes in registers and folding them into an f32 accumulator (the
 // scale multiply has to be per sub-block anyway) removes the round trip
 // entirely: the reduction is one horizontal add per row at the very end.
+// PRECONDITION: `bv` (the activation) is in [-127, 127], never -128. This
+// computes sum(a*b) as abs(a) * sign_epi8(b, a), and sign_epi8(-128, -1) is
+// -128 because int8 has no +128 -- so a single -128 in an activation would
+// flip that element's contribution. The engine's quantiser clamps to exactly
+// [-127, 127] (quantize_q8_32_d's lo32/hi32), which is what makes this kernel
+// exact; test_q8_activation_domain pins that clamp so an "optimisation" that
+// widens it fails there rather than in a model. Unlike the trit/code kernels,
+// this one KEEPS the sign trick: it is on the hot path for Q3_K/Q4_K, and a
+// p/n split there costs two extra compares per 16 values for an input the
+// quantiser cannot produce.
 static inline __m128i dot16_signed_lanes(const i8 *av, const i8 *bv,
                                          const __m128i ones16) {
     const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(av));

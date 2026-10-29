@@ -1513,6 +1513,46 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         }
     }
 
+    // A LOOKUP TABLE with a per-tensor scale cannot ride a projection: the
+    // rows are copied out by index, so there is no `gemm_w` to fold `gs` into
+    // (the token embedding's own comment says as much). I2_S is the format
+    // that has one -- BitNet-embedding-0.6B stores `token_embd.weight` in it --
+    // and simply loading the bytes would give every token vector a magnitude
+    // of +-1 instead of +-scale: an embedding table 1/scale too large, with
+    // every rope angle, every norm and every logit off, and nothing to crash.
+    //
+    // So the table is MATERIALIZED once, here, with the scale folded in. It
+    // costs 2 bytes a value instead of 0.25 for the table alone, and it is the
+    // one place a per-tensor scale genuinely cannot be deferred.
+    auto upload_table = [&](const GgufTensor *t) -> QuantTensor {
+        if (t->type != DType::I2_S) return upload_raw(t, t->type);
+        QuantTensor q;
+        if (!t->tail || t->tail_bytes < 4) return q;      // gguf.cpp refuses these
+        const f32 gs = reinterpret_cast<const f32 *>(t->tail)[0];
+        const i64 inner = static_cast<i64>(t->ne[0]);
+        if (inner <= 0 || (inner % 128) != 0) return q;   // caller refuses by shape
+        const i64 rows = t->n_elements / inner;
+        std::vector<f32> f(static_cast<size_t>(inner));
+        std::vector<u16> h(static_cast<size_t>(inner));
+        const u8 *p = t->data;
+        u8 *dst = static_cast<u8 *>(be.alloc(
+            static_cast<size_t>(t->n_elements) * 2));
+        for (i64 r = 0; r < rows; r++) {
+            dequant_row(DType::I2_S, p, f.data(), inner);
+            for (i64 i = 0; i < inner; i++)
+                h[static_cast<size_t>(i)] = fp32_to_fp16(f[static_cast<size_t>(i)] * gs);
+            upload_timed(dst + static_cast<size_t>(r * inner) * 2, h.data(),
+                         static_cast<size_t>(inner) * 2);
+            p += static_cast<size_t>(inner / 4);
+        }
+        q.data = dst;
+        q.type = DType::F16;
+        q.n_in = inner;
+        q.n_out = rows;
+        weight_bytes_ += t->n_elements * 2;
+        return q;
+    };
+
     // ---- token embedding + head ------------------------------------------
     {
         std::string e;
@@ -1522,10 +1562,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             return false;
         }
         // A lookup TABLE, not a matmul: its rows are copied out by index, so a
-        // per-tensor scale has no projection to ride and is deliberately not
-        // taken here. (A tied file shares this tensor with the head below, and
-        // the head's own gs is read there.)
-        tok_embd_ = upload_raw(te, te->type);
+        // per-tensor scale has no projection to ride -- an I2_S table is
+        // materialized (scale folded in) by upload_table above rather than
+        // loaded as raw blocks. (A tied file shares this tensor with the head
+        // below, and the materialized table is what the head then reads.)
+        tok_embd_ = upload_table(te);
+        if (!tok_embd_.present()) {
+            if (err)
+                *err = "token_embd.weight is I2_S on a shape this build cannot "
+                       "materialize (inner dimension " +
+                       std::to_string(static_cast<long long>(te->ne[0])) +
+                       ", which must be a multiple of 128, with a 32-byte scale "
+                       "tail)";
+            return false;
+        }
         if (cfg_.learned_pos) {
             // Learned absolute positions, [n_ctx_train, n_embd], added to the
             // token embedding before the first block. There is no rotary table
@@ -1540,7 +1590,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (!pe) {
                 // nothing to load; the position signal is ALiBi's
             } else {
-            pos_embd_ = upload_raw(pe, pe->type);
+            pos_embd_ = upload_table(pe);
             if (pe->n_elements !=
                 static_cast<i64>(cfg_.n_ctx_train) * cfg_.n_embd) {
                 if (err)
@@ -1675,7 +1725,12 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         const i64 npl = cfg_.n_embd_per_layer;
         const i64 wid = npl * cfg_.n_layer;
         std::string pe;
-        ple_tok_embd = upload_weight("per_layer_token_embd.weight", false, &pe);
+        // A LOOKUP TABLE, not a matmul (engine.cpp reads it with be_->embed),
+        // so an I2_S one has to be materialized with its scale -- exactly like
+        // the token embedding. Through upload_weight it would have carried a
+        // `gs` that the embedding path never applies.
+        const GgufTensor *pt = gguf_.tensor("per_layer_token_embd.weight");
+        ple_tok_embd = pt ? upload_table(pt) : QuantTensor{};
         if (!ple_tok_embd.present()) {
             if (err)
                 *err = "per_layer_token_embd.weight is missing (this file declares "

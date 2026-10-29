@@ -6508,7 +6508,8 @@ std::vector<u8> i2s_pack(const std::vector<f32> &tern_unit, f32 scale) {
 // matmul weight ternary. `as_i2s` decides whether those weights are stored in
 // I2_S (with `scale` in the tail) or as F16 holding scale*ternary, which is
 // the same matrix either way.
-bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale) {
+bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale,
+                       f32 embd_i2s_scale = 0.0f) {
     const int n_embd = 256, n_layer = 2, n_head = 8, n_kv = 8, hd = 32;
     const int n_ff = 256, vocab = 260, ctx = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;   // 256 / 256
@@ -6554,7 +6555,18 @@ bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale) {
     };
     auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
 
-    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)}, embd(static_cast<size_t>(n_embd) * vocab));
+    if (embd_i2s_scale > 0.0f) {
+        // BitNet-embedding-0.6B's shape: the TABLE is I2_S, everything else is
+        // whatever the rest of this fixture is. All codes are 2 (+1) so the
+        // materialized value is the tail scale exactly -- 0.25, not 1.0.
+        const std::vector<f32> unit(static_cast<size_t>(n_embd) * vocab, 1.0f);
+        const std::vector<u8> packed = i2s_pack(unit, embd_i2s_scale);
+        b.tensor_raw("token_embd.weight", 36, {u64(n_embd), u64(vocab)},
+                     packed.data(), packed.size());
+    } else {
+        b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                     embd(static_cast<size_t>(n_embd) * vocab));
+    }
     b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
     for (int l = 0; l < n_layer; l++) {
         const std::string p = "blk." + std::to_string(l) + ".";
@@ -6665,6 +6677,51 @@ static void test_i2_s_model() {
           "and that reference runs too (the pair is well-formed)");
 }
 
+// I2_S embeddings. A lookup table has no projection to ride, so the scale has
+// to be folded in when the table is materialized -- and if it is dropped the
+// values are 1.0 instead of 0.25, which no shape check and no "it loaded"
+// message can tell you apart. Hence a value assertion on the table itself.
+static void test_i2_s_embedding() {
+    std::string err;
+    CHECK(build_bitnet_file("kraken-i2s-table.gguf", true, 0.125f, 0.25f),
+          "wrote a file whose token_embd is I2_S and whose matmuls are I2_S");
+    Backend *be = make_cpu_backend();
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = "kraken-i2s-table.gguf";
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        if (!e.init(be, c, &err)) {
+            CHECK(false, ("the I2_S-embedding file LOADS: " + err).c_str());
+        } else {
+            const QuantTensor &t = e.model().tok_embd();
+            CHECK(t.present() && t.type == DType::F16,
+                  "the I2_S TABLE is materialized as F16 (a lookup cannot apply gs)");
+            if (t.present() && t.n_in > 0) {
+                // On the CPU backend the weight pointer IS host memory, and
+                // the table is F16: dequant_row converts it. (download_f32
+                // would copy the bytes as f32 -- two f16 values of 0.25 read
+                // back as one 1.19e-07 float, which is exactly the trap this
+                // assertion fell into first.)
+                std::vector<f32> row(static_cast<size_t>(t.n_in));
+                dequant_row(DType::F16, t.data, row.data(), t.n_in);
+                bool all = true;
+                for (f32 v : row) all = all && std::fabs(v - 0.25f) < 1e-6f;
+                CHECK(all, "and every value carries the table's 0.25 scale, not 1.0");
+            }
+            // It also has to RUN: the head is tied to this table.
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 2;
+            GenerateResult r;
+            CHECK(e.generate(gp, &r) && r.tokens.size() <= 2,
+                  "and the tied head reads the materialized table");
+        }
+    }
+    delete be;
+}
+
 static void test_bitnet_family() {
     std::string err;
 
@@ -6759,6 +6816,34 @@ static void test_bitnet_family() {
 //
 // One block, one non-zero activation at -128, d = 1, dx = 1, so the answer is
 // exactly the code's value times -128 -- an integer, with nowhere to hide.
+// The int8 activation domain. Several hot kernels (dot16_signed_lanes for
+// Q3_K/Q4_K) are exact only because the quantiser clamps to [-127, 127] --
+// -128 has no negation in int8, so any sign trick on it flips. Nothing pinned
+// that clamp; if a future quantiser emitted the full int8 range, those kernels
+// would go quietly wrong on saturated values instead.
+static void test_q8_activation_domain() {
+    const i64 n = 512;
+    std::vector<f32> x(static_cast<size_t>(n));
+    for (i64 i = 0; i < n; i++) {
+        // Saturated, denormal, zero and ordinary values, all in one row.
+        const f32 mag[6] = {1e30f, -1e30f, 1e-30f, 0.0f, 3.5f, -0.001f};
+        x[static_cast<size_t>(i)] = mag[static_cast<size_t>(i % 6)];
+    }
+    std::vector<i8> xq(static_cast<size_t>(n));
+    std::vector<f32> dx(static_cast<size_t>(n / 32));
+    quantize_q8_row(x.data(), n, xq.data(), dx.data());
+    int lo = 0, hi = 0;
+    for (i8 v : xq) {
+        lo = std::min(lo, static_cast<int>(v));
+        hi = std::max(hi, static_cast<int>(v));
+    }
+    CHECK(hi == 127 && lo == -127,
+          "a saturated activation quantizes to exactly +-127, never -128");
+    // ... and the row still reconstructs: 1e30 lands on 127*scale.
+    CHECK_NEAR(static_cast<f32>(xq[0]) * dx[0], 1e30f, 1e30f * 0.02f,
+               "and the dequantised value matches its own scale");
+}
+
 static void test_trit_sign_extreme() {
     const u16 one = fp32_to_fp16(1.0f);
     const i8 x_neg128 = static_cast<i8>(-128);
@@ -22874,6 +22959,8 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_bitnet_family)
     TEST_GROUP(test_i2_s_layout)
     TEST_GROUP(test_i2_s_model)
+    TEST_GROUP(test_i2_s_embedding)
+    TEST_GROUP(test_q8_activation_domain)
     TEST_GROUP(test_trit_sign_extreme)
     TEST_GROUP(test_q2code_dot)
     TEST_GROUP(test_arch_row_pins)
