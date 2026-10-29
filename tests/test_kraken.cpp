@@ -17817,6 +17817,72 @@ static void test_mla_lite() {
 //     rewiring heads 0..hpg-1 must leave the answer bit-for-bit unchanged,
 //     which an off-by-one group stride cannot survive;
 //   * the window excludes keys by POSITION, not by array index.
+// B7 -- DeepSeek's YaRN attention scale.
+//
+// The number is not a tuning constant, it is arithmetic the reference performs
+// in three places, so it is pinned twice: against the closed form (which is
+// what the reference's chain collapses to) and against a file, where the loader
+// has to read the two keys and the engine has to use the result.
+//
+// Plain 1/sqrt(key_length) on a factor-40 file is 1.874x too small -- a 36.6%
+// amplitude error on every attention score. It does not produce garbage; it
+// produces fluent text that diverges a few tokens in, which is why it survived
+// this long.
+static void test_deepseek_yarn_mscale() {
+    // ---- the closed form, against the reference's chain ---------------
+    // llama.cpp: get_mscale(f, m) = 0.1*m*ln(f) + 1 for f > 1, else 1;
+    // attn_factor = get_mscale(f,mscale)/get_mscale(f,mscale_all)
+    //               * 1/(1+0.1*ln f);  mscale = attn_factor*(1+0.1*ln f)
+    //               * (1 + 0.1*mscale_all*ln f);  kq = mscale^2/sqrt(k).
+    // For deepseek2 the first ratio is exactly 1, so the whole thing is
+    // kq = (1 + log_mul*ln(f))^2 / sqrt(k) with log_mul = 0.1*mscale_all_dim.
+    auto reference = [](f32 f, f32 mscale_all, i32 k) {
+        auto get_mscale = [](f32 scale, f32 m) {
+            return scale <= 1.0f ? 1.0f : 0.1f * m * std::log(scale) + 1.0f;
+        };
+        const f32 factor = f;
+        // the deepseek2 branch: mscale == mscale_all, so the ratio is 1
+        const f32 attn = (get_mscale(factor, mscale_all) /
+                          get_mscale(factor, mscale_all)) *
+                         (1.0f / (1.0f + 0.1f * std::log(factor)));
+        const f32 attn_org = attn * (1.0f + 0.1f * std::log(factor));
+        const f32 mscale = attn_org * (1.0f + 0.1f * mscale_all * std::log(factor));
+        return mscale * mscale / std::sqrt(static_cast<f32>(k));
+    };
+    // mscale_all_dim = 1.0 is what DeepSeek-V2/V3 ship, and the converter
+    // writes 0.1*1.0 = 0.1 as the key.
+    CHECK_NEAR(krk::deepseek_kq_scale(40.0f, 0.1f, 192),
+               reference(40.0f, 1.0f, 192), 1e-6,
+               "a V2/V3 file at factor 40 matches the reference's chain");
+    CHECK_NEAR(krk::deepseek_yarn_mscale(40.0f, 0.1f), 1.36889f, 1e-4,
+               "and the multiplier is 1 + 0.1*ln(40) = 1.3689");
+    CHECK_NEAR(krk::deepseek_kq_scale(40.0f, 0.1f, 192) * std::sqrt(192.0f),
+               1.87385f, 1e-4,
+               "... squared: the score scale is 1.874x the plain one");
+    // mscale_all_dim = 0.5 (a file that asks for a different magnitude)
+    CHECK_NEAR(krk::deepseek_kq_scale(40.0f, 0.05f, 192),
+               reference(40.0f, 0.5f, 192), 1e-6,
+               "a different mscale_all_dim follows the same chain");
+
+    // ---- the cases that must stay EXACTLY plain ---------------
+    CHECK(krk::deepseek_yarn_mscale(1.0f, 0.1f) == 1.0f,
+          "factor 1 is not a scaling, and gets a multiplier of exactly 1");
+    CHECK(krk::deepseek_yarn_mscale(40.0f, 0.0f) == 1.0f,
+          "a file with no yarn_log_multiplier gets exactly 1");
+    CHECK(krk::deepseek_kq_scale(40.0f, 0.0f, 192) ==
+              1.0f / std::sqrt(192.0f),
+          "and its scale is bit-exactly 1/sqrt(key_length)");
+    CHECK(krk::deepseek_kq_scale(1.0f, 0.1f, 128) ==
+              1.0f / std::sqrt(128.0f),
+          "so is a non-YaRN file's");
+    CHECK(krk::deepseek_yarn_mscale(std::numeric_limits<f32>::quiet_NaN(), 0.1f)
+              == 1.0f,
+          "a non-finite factor does not poison the scale");
+    CHECK(krk::deepseek_yarn_mscale(40.0f,
+                                    std::numeric_limits<f32>::infinity()) == 1.0f,
+          "and neither does a non-finite multiplier");
+}
+
 static void test_mla_shared() {
     krk::MlaSharedGeometry g;
     g.n_embd = 16;
@@ -18881,6 +18947,12 @@ struct MlaFix {
     // so this is the file the forward's own range check exists for: it must
     // refuse the run instead of indexing an expert bank out of bounds.
     bool hash_id_oob = false;
+    // B7: write the YaRN metadata the reference builds the MLA score scale
+    // from. `yarn_factor` is `rope.scaling.factor` (0 = no scaling key at
+    // all), `yarn_log_mul` is `rope.scaling.yarn_log_multiplier` exactly as
+    // the converter writes it, i.e. 0.1*mscale_all_dim.
+    f32 yarn_factor = 0.0f;
+    f32 yarn_log_mul = 0.0f;
 };
 
 // 261, not 260: add_spm_vocab always writes 3 specials + 256 byte pieces + the
@@ -18927,6 +18999,17 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
     b.meta_u32(arch + ".rope.dimension_count", static_cast<u32>(kMlaRope));
     b.meta_f32(arch + ".rope.freq_base", 10000.0f);
     b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    if (f.yarn_factor > 0.0f) {
+        // A real DeepSeek file: type yarn, factor 40, and the log multiplier
+        // the converter derives from mscale_all_dim. `original_context_length`
+        // is what the frequency correction ramps around.
+        b.meta_str(arch + ".rope.scaling.type", "yarn");
+        b.meta_f32(arch + ".rope.scaling.factor", f.yarn_factor);
+        b.meta_u32(arch + ".rope.scaling.original_context_length", 32);
+        b.meta_f32(arch + ".rope.scaling.yarn_log_multiplier", f.yarn_log_mul);
+        b.meta_f32(arch + ".rope.scaling.yarn_beta_fast", 32.0f);
+        b.meta_f32(arch + ".rope.scaling.yarn_beta_slow", 1.0f);
+    }
     // The V2/V3 class compresses the KV into a latent of kv_lora_rank and keeps
     // the decoupled rope key beside it. V4 has no kv_lora_rank: its latent is
     // key_length wide and the rope is its tail.
@@ -19206,6 +19289,130 @@ static void test_minicpm3_scales() {
         } else {
             CHECK(false, ("a MiniCPM3 run: " + err).c_str());
         }
+    }
+}
+
+// B7 at the FILE level: the loader has to read the two keys, and the engine has
+// to use the result. The config arm proves the first; the run A/B proves the
+// second, because a multiplier written onto a config that nothing consumes is
+// exactly the state this defect was in.
+static void test_mla_yarn_file() {
+    std::string err;
+    auto logs = [&](const char *path, std::vector<f32> &lg) {
+        Backend *be = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            if (e.init(be, c, &err)) {
+                GenerateParams gp;
+                gp.prompt = "the";
+                gp.max_tokens = 2;
+                GenerateResult r;
+                ok = e.generate(gp, &r);
+                if (ok) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    lg.assign(e.last_logits(), e.last_logits() + nv);
+                }
+            }
+        }
+        delete be;
+        return ok;
+    };
+
+    // 1. no scaling: the multiplier is exactly 1 and the scale is plain.
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Legacy;
+        CHECK(build_mla_fixture("kraken-mla-plain.gguf", f),
+              "wrote a deepseek2 file with no rope scaling");
+        bool ok = false;
+        if (schema_cfg("kraken-mla-plain.gguf", [&](const Model &m) {
+                ok = true;
+                CHECK(m.cfg().mla_kq_mscale == 1.0f,
+                      "no yarn_log_multiplier -> a multiplier of exactly 1");
+            }, err)) {
+            CHECK(ok, "the plain file loads");
+        } else {
+            CHECK(false, ("the plain file loads: " + err).c_str());
+        }
+    }
+
+    // 2. a real V2/V3 Yaml file: factor 40, mscale_all_dim 1.0.
+    std::vector<f32> plain_lg, yarn_lg;
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Legacy;
+        f.yarn_factor = 40.0f;
+        f.yarn_log_mul = 0.1f;
+        CHECK(build_mla_fixture("kraken-mla-yarn.gguf", f),
+              "wrote a deepseek2 file with YaRN factor 40");
+        bool ok = false;
+        if (schema_cfg("kraken-mla-yarn.gguf", [&](const Model &m) {
+                ok = true;
+                const ModelConfig &c = m.cfg();
+                std::fprintf(stderr,
+                             "[b7] factor=%g log_mul=%g mscale=%g qk=%d\n",
+                             static_cast<double>(c.rope_yarn_factor),
+                             static_cast<double>(c.rope_yarn_log_mul),
+                             static_cast<double>(c.mla_kq_mscale),
+                             c.mla_qk_nope + c.mla_qk_rope);
+                CHECK(c.rope_yarn && c.rope_yarn_factor == 40.0f,
+                      "the loader reads rope.scaling.factor");
+                CHECK(std::fabs(c.rope_yarn_log_mul - 0.1f) < 1e-7f,
+                      "and rope.scaling.yarn_log_multiplier");
+                CHECK_NEAR(c.mla_kq_mscale, 1.36889f, 1e-4,
+                           "so the multiplier is 1 + 0.1*ln(40)");
+            }, err)) {
+            CHECK(ok, "the YaRN file loads");
+        } else {
+            CHECK(false, ("the YaRN file loads: " + err).c_str());
+        }
+        CHECK(logs("kraken-mla-yarn.gguf", yarn_lg), "and it generates");
+    }
+    CHECK(logs("kraken-mla-plain.gguf", plain_lg), "the plain file generates");
+
+    // 3. The arm that isolates the SCALE from the rope. `yarn_log_multiplier`
+    //    feeds nothing but mscale -- the frequency correction is built from
+    //    factor/original_context/beta, not from it -- so two files identical
+    //    except for that key differ ONLY in the attention scale. When the
+    //    engine ignored the multiplier these were bit-identical (measured:
+    //    maxdiff = 0), and when it applies it they are not.
+    std::vector<f32> yarn_half_lg;
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Legacy;
+        f.yarn_factor = 40.0f;      // same rope as above
+        f.yarn_log_mul = 0.05f;     // mscale_all_dim = 0.5, so mscale = 1.1845
+        CHECK(build_mla_fixture("kraken-mla-yarn2.gguf", f),
+              "wrote the same rope with half the log multiplier");
+        CHECK(logs("kraken-mla-yarn2.gguf", yarn_half_lg), "and it generates");
+    }
+    if (!yarn_lg.empty() && !yarn_half_lg.empty()) {
+        f32 md = 0.0f, peak = 0.0f;
+        for (size_t i = 0; i < std::min(yarn_lg.size(), yarn_half_lg.size()); i++) {
+            md = std::max(md, std::fabs(yarn_lg[i] - yarn_half_lg[i]));
+            peak = std::max(peak, std::fabs(yarn_lg[i]));
+        }
+        std::fprintf(stderr, "[b7] log_mul 0.1 vs 0.05: maxdiff=%g peak=%g\n",
+                     static_cast<double>(md), static_cast<double>(peak));
+        CHECK(md > 0.0f,
+              "the multiplier ALONE changes the logits (the rope is identical)");
+        CHECK(peak > 0.05f, "and the logits are not degenerate");
+    }
+    // The plain-vs-YaRN pair is a different claim -- the rope correction
+    // itself -- kept because a file whose frequencies changed but whose scores
+    // did not would mean the loader dropped half the scaling.
+    if (!plain_lg.empty() && !yarn_lg.empty()) {
+        f32 md = 0.0f;
+        for (size_t i = 0; i < std::min(plain_lg.size(), yarn_lg.size()); i++)
+            md = std::max(md, std::fabs(plain_lg[i] - yarn_lg[i]));
+        std::fprintf(stderr, "[b7] plain vs yarn: maxdiff=%g\n",
+                     static_cast<double>(md));
+        CHECK(md > 1e-5f, "and an unscaled file differs from a YaRN one");
     }
 }
 
@@ -23093,6 +23300,8 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_mla_backend)
     TEST_GROUP(test_npu_backend)
     TEST_GROUP(test_mla_loader)
+    TEST_GROUP(test_deepseek_yarn_mscale)
+    TEST_GROUP(test_mla_yarn_file)
     TEST_GROUP(test_mla_shared)
     TEST_GROUP(test_dsv4_hash_route)
     TEST_GROUP(test_dsv4_whole_graph)

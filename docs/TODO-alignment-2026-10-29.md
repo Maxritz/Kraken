@@ -125,3 +125,37 @@ dominated by the tied head), not of the engine.
 | id | pri | class | item | state |
 |---|---|---|---|---|
 | D11 | **P1** | CONFIRMED | **I2_S has two dialects.** `convert-hf-to-gguf-bitnet.py` writes code = value + 1 and zero-fills the 28 tail bytes after its f32 scale; `convert-ms-to-gguf-bitnet.py` writes code = value + 2 and permutes the payload into that build's tile layout (`preprocess_weights`, constants from its own `build/kcfg.ini`). Decoding the second as the first is silently wrong -- measured: the ms file loaded with verdict `runnable` and produced `prefill-hash 28eaece7b3a5a08f` against `c21ca3e304853383` for the same weights, with no warning | **fixed**: `i2s_tail_is_ms_converter()` (one predicate, used by the loader AND the verdict) refuses it by name; `test_i2_s_ms_dialect_refused` pins both tails and the three non-signatures (zero, short, unknown) |
+
+## Remaining work — routed 2026-10-29 (branch `arena/7e9ab449-kraken-x`)
+
+Every open item from the two ledgers above, in execution order. `[x]` means the
+closing check runs and passes; `[~]` means classified with evidence and left
+open on purpose.
+
+- [x] **B7 (P1)** DeepSeek V2/V3 YaRN `mscale^2` attention scale.
+      `deepseek_yarn_mscale`/`deepseek_kq_scale` + `ModelConfig::mla_kq_mscale`,
+      consumed by `mla_forward`. The old code's argument -- "the reference's
+      mscale is built from `rope.freq_scale`, and when that is 1.0 the whole
+      correction is 1.0" -- was false: on a YaRN file `rope_freq_scale` IS
+      1/factor (llama-model.cpp:1516-1518). `test_deepseek_yarn_mscale` pins the
+      closed form against the reference's own chain; `test_mla_yarn_file` pins
+      the two keys, the multiplier on the config, and an A/B where two files
+      differ **only** in `yarn_log_multiplier` (negative control: maxdiff was
+      exactly 0 before the fix, 0.1019 after).
+- [ ] **B6 (P2)** gemma2/gemma3 27B use `1/sqrt(n_embd/n_head)`, not
+      `1/sqrt(head_dim)`; only the model type says which.
+- [ ] **B1b/B2b (P2)** isolate the MiniCPM3 scales numerically instead of
+      asserting "config read + the run is finite".
+- [ ] **D6 (P2)** TL2 vs Q2_0 on ggml id 42: refuse the fork dialect by name
+      instead of decoding it as Q2_0.
+- [ ] **D9 (P2)** a ternary file whose `general.architecture` is `llama` gets
+      SubLN from its tensors but silu, not relu^2.
+- [ ] **D8 (P3)** the dense relu^2 arm skips the row-scale range guard.
+- [ ] **B3b (P2)** a windowed layer cannot carry its own linear rope scale.
+- [ ] **B4 (P2)** a real gemma4 fixture (per-layer embeddings + shared KV +
+      two-branch MoE).
+- [ ] **B5 (P2)** forward fixtures for minicpm / olmoe / qwen3moe /
+      nemotron_h*, and the `parallel_residual` graph A/B.
+- [ ] **C1 (P1, blocked)** DeepSeek-V4 compressed attention: a feature, not a
+      defect. The rows are `Partial` and the engine refuses a non-zero
+      `compress_ratio` by name.

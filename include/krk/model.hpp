@@ -389,6 +389,21 @@ enum class MlaLayout { None, Legacy, Split, Shared };
 // The layout's name, for a refusal message. "none" for MlaLayout::None.
 const char *mla_layout_name(MlaLayout l);
 
+// The DeepSeek V2/V3 YaRN attention scale: mscale^2 / sqrt(key_length), with
+// mscale = 1 + 0.1*mscale_all_dim*ln(factor) and mscale_all_dim recovered from
+// the file's `rope.scaling.yarn_log_multiplier` (which the converter writes as
+// 0.1*mscale_all_dim). `log_mul` is the RAW key, not the divided one.
+//
+// `deepseek_yarn_mscale` returns the bare multiplier (1.0 -- exactly, not
+// approximately -- when the file is not YaRN-scaled or carries no key), which
+// is what ModelConfig stores; `deepseek_kq_scale` is the finished number.
+//
+// Free functions, not members, because they are the thing under test: the
+// whole point of B7 is that this arithmetic can be checked against the
+// reference's without a model in the room.
+f32 deepseek_yarn_mscale(f32 factor, f32 log_mul);
+f32 deepseek_kq_scale(f32 factor, f32 log_mul, i32 key_length);
+
 struct ModelConfig {
     std::string arch = "llama";
     std::string name;
@@ -707,19 +722,38 @@ struct ModelConfig {
     // whether `rope_scale` has already been folded into `inv_freq` and must be
     // left at 1.0 for the rotation op.
     bool rope_yarn = false;
-    // The file's rope.scaling.factor and rope.scaling.yarn_log_multiplier.
-    // They are the INPUTS of DeepSeek's MLA softmax scale -- mscale =
-    // attn_factor * (1 + 0.1 * log_mul * ln(factor)) and the attention scale is
-    // mscale^2 / sqrt(key_length) (llama.cpp src/models/deepseek2.cpp:433-437,
-    // TAG_DEEPSEEK2_YARN_LOG_MUL_FIX, where the stored key is first divided by
-    // 0.1) -- and that correction is NOT applied yet: the MLA paths still use
-    // plain 1/sqrt(qk). Read here so the number is on the config and testable;
-    // tracked as B7 in docs/TODO-alignment-2026-10-29.md. A 5% scale error here
-    // does not look like a bug in any single token -- it looks like a model
-    // that answers in the right voice and picks a different word a few steps
-    // in, which is why it is recorded rather than silently defaulted.
+    // The file's rope.scaling.factor and rope.scaling.yarn_log_multiplier --
+    // the INPUTS of DeepSeek's YaRN attention scale, which is applied to the
+    // MLA score through `mla_kq_mscale` below.
+    //
+    // The arithmetic, all of it from the reference and none of it inferred
+    // (llama.cpp @ f5222f25: src/llama-context.cpp:269-300 builds
+    // cparams.yarn_attn_factor, src/models/deepseek2.cpp:431-437 consumes it):
+    //
+    //   factor        = 1 / rope_freq_scale                 (40 on a V2/V3 file)
+    //   mscale_all    = yarn_log_multiplier / 0.1           (the loader stores
+    //                                                        0.1*mscale_all_dim)
+    //   attn_factor   = get_mscale(factor, mscale)
+    //                 / get_mscale(factor, mscale_all)      (== 1 for deepseek)
+    //                   * 1/(1 + 0.1*ln(factor))            (the cancel step)
+    //   mscale        = attn_factor*(1+0.1*ln(factor))
+    //                   * (1 + 0.1*mscale_all*ln(factor))
+    //
+    // which collapses to  mscale = 1 + 0.1*mscale_all*ln(factor), i.e.
+    // `1 + yarn_log_multiplier * ln(factor)` in the file's own units, and the
+    // MLA score scale is mscale^2 / sqrt(key_length). DeepSeek's own modelling
+    // code (`yarn_get_mscale` in modelling_deepseek_v2.py) computes the same
+    // number, which is why this is not "llama.cpp's quirk".
+    //
+    // It is applied to the V2/V3 path only. deepseek4/deepseek41 pass a plain
+    // 1/sqrt(n_embd_head) (src/models/deepseek4.cpp:1195-1206,
+    // deepseek41.cpp:427), so the V4 shared-latent path keeps its own scale.
     f32 rope_yarn_factor = 1.0f;
     f32 rope_yarn_log_mul = 0.0f;
+    // mscale above, resolved once at load. 1.0 whenever the file is not
+    // YaRN-scaled or carries no yarn_log_multiplier, so every non-DeepSeek and
+    // every non-YaRN file keeps a scale of exactly 1/sqrt(key_length).
+    f32 mla_kq_mscale = 1.0f;
     // 1 = sum-normalize the selected expert weights, 0 = keep the raw
     // probabilities, -1 = the file does not declare the key. The engine has
     // always normalized, and every model in the collection that *does* declare

@@ -7105,23 +7105,22 @@ bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     // over the whole per-head key, nope + rope -- and not plain 1/sqrt(qk)
     // either on a YaRN file.
     //
-    // DeepSeek multiplies its query and key by an mscale of its own
-    // (rope.scaling.yarn_log_multiplier), which llama.cpp deepseek2 folds into
-    // the attention scale instead of into the rope (the rope's magnitude is
-    // pre-divided by exactly the same factor, so the rotation stays at unity
-    // and only the score changes -- see TAG_DEEPSEEK2_YARN_LOG_MUL_FIX). On
-    // the V2-Lite file that is mscale = 1.0261 and a scale 5.3% above
-    // 1/sqrt(192): small enough that a short greedy run agrees for a few tokens
-    // and then picks a different word, which is exactly how it showed up.
-    // MEASURED, not derived: with the mscale^2 factor this engine's first
-    // greedy token on the Coder-V2-Lite file differs from llama.cpp's, and with
-    // plain 1/sqrt(key_length) it matches. That is the one number this couldn't
-    // be reasoned out of -- llama.cpp's deepseek2 kq_scale reads
-    // mscale^2/sqrt(key_length), but its mscale is built from
-    // rope.freq_scale, and when that is 1.0 the whole correction is 1.0 too.
-    // The file's factor of 40 is applied to the FREQUENCIES (folded into
-    // inv_freq above), not to this scale, and the text is the witness.
-    d.scale = 1.0f / std::sqrt(static_cast<f32>(qk));
+    // This used to be plain 1/sqrt(qk), on a written-down argument that the
+    // reference's mscale "is built from rope.freq_scale, and when that is 1.0
+    // the whole correction is 1.0 too". The premise is false for a YaRN file:
+    // rope_freq_scale IS 1/factor on one (llama-model.cpp:1516-1518 sets
+    // rope_freq_scale_train = 1/ropescale, llama-context.cpp:227 adopts it when
+    // the caller does not override), so on a factor-40 DeepSeek file the
+    // parenthesis is 1 + 0.1*mscale_all_dim*ln(40) = 1.369 and the score scale
+    // is 1.874x the plain one -- a 36.6% amplitude error on every score, which
+    // reads as fluent text with a different word a few tokens in.
+    //
+    // The loader resolves the multiplier once (ModelConfig::mla_kq_mscale, see
+    // deepseek_yarn_mscale for the full chain); this path is the V2/V3 one and
+    // is the only consumer, because deepseek4/deepseek41 pass plain
+    // 1/sqrt(n_embd_head) in the reference.
+    const f32 mscale = mc.mla_kq_mscale;
+    d.scale = mscale * mscale / std::sqrt(static_cast<f32>(qk));
     d.eps = mc.rms_eps;
     // The file's own rotary table, YaRN already folded into the frequencies by
     // the loader. The kernel rotates the q rope half and each cache row's key
@@ -7231,8 +7230,11 @@ bool Engine::mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     // One row: K and V are the same latent, so the stride IS the row.
     sd.pos_stride = d;
     // The score is a dot over the whole latent, so this is 1/sqrt(key_length)
-    // and nothing else. The mscale correction belongs to the lite family's
-    // YaRN files and is deliberately NOT applied here.
+    // and nothing else. The mscale correction belongs to the lite (V2/V3)
+    // family's YaRN files and is deliberately NOT applied here: the reference's
+    // deepseek4/deepseek41 models pass a plain 1/sqrt(n_embd_head) too
+    // (src/models/deepseek4.cpp:1195-1206, deepseek41.cpp:427). Applying
+    // mla_forward's mscale here would make a V4 file 1.87x too hot.
     sd.scale = 1.0f / std::sqrt(static_cast<f32>(d));
     sd.eps = mc.rms_eps;
     sd.window = mc.dsv4_window > 0 ? mc.dsv4_window : 0;

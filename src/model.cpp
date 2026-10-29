@@ -63,6 +63,40 @@ const char *mla_layout_name(MlaLayout l) {
     return "none";
 }
 
+// B7: DeepSeek V2/V3's YaRN attention scale.
+//
+// Reference chain, quoted because the simplification is not obvious:
+//   llama.cpp llama-context.cpp:269-300 (cparams.yarn_attn_factor)
+//     get_mscale(s, m) = s <= 1 ? 1 : 0.1*m*log(s) + 1
+//     factor           = 1/rope_freq_scale                       (40 here)
+//     attn_factor      = get_mscale(f, mscale)/get_mscale(f, mscale_all)
+//                        * 1/(1 + 0.1*log(f))                    (cancel step)
+//   llama.cpp models/deepseek2.cpp:431-437
+//     attn_factor_org  = attn_factor * (1 + 0.1*log(f))           == 1 here
+//     mscale           = attn_factor_org * (1 + 0.1*log_mul_all*log(f))
+//     kq_scale         = mscale^2 / sqrt(n_embd_head_k)
+//
+// The first branch is exactly 1 for every deepseek2 file: when
+// mscale_all != 1 the reference sets mscale = mscale_all, and when it is 1 the
+// two get_mscale calls are the same call. So the whole chain is
+//   1 * (1 + 0.1*mscale_all_dim*ln(factor))  squared  over sqrt(key_length),
+// and mscale_all_dim is the file's `yarn_log_multiplier` / 0.1.
+f32 deepseek_yarn_mscale(f32 factor, f32 log_mul) {
+    // No YaRN, no key, or a factor that does not scale: the reference's own
+    // guard is `scale <= 1 -> 1`, and an absent key is a zero log_mul, which
+    // makes the parenthesis exactly 1 anyway.
+    if (!(factor > 1.0f) || !(log_mul > 0.0f) || !std::isfinite(factor) ||
+        !std::isfinite(log_mul))
+        return 1.0f;
+    return 1.0f + log_mul * std::log(factor);   // log_mul = 0.1*mscale_all_dim
+}
+
+f32 deepseek_kq_scale(f32 factor, f32 log_mul, i32 key_length) {
+    const f32 m = deepseek_yarn_mscale(factor, log_mul);
+    const f32 base = 1.0f / std::sqrt(static_cast<f32>(std::max<i32>(1, key_length)));
+    return m * m * base;
+}
+
 // Load-phase timeline (KRK_PHASE=1). The engine reports one "load N ms" line,
 // which cannot say whether the time went to the mapping, the metadata, the
 // embedding, the per-layer loop, or the transfers -- and the answer decides
@@ -3918,14 +3952,16 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // kernel exactly what it was (a position times a frequency) and keeps the
     // position-scaling path free for the linear scaling it already implements.
     //
-    // The magnitude half of YaRN is deliberately left out: its mscale is
-    // 1 + 0.1*ln(factor) applied to cos/sin, and the reference driver
-    // (llama.cpp's llama_context) pre-divides the checkpoint's
-    // `yarn_attn_factor` by exactly that before handing it to the rope op. For
-    // a checkpoint whose yarn_attn_factor is 1 the two cancel and the attention
-    // scale is plain 1/sqrt(head_dim), which is what rope_attn_scale staying at
-    // 1.0 means; a checkpoint that asks for something else would need the
-    // mscale folded into the attention scale instead.
+    // The magnitude half of YaRN is not applied to the ROTATION: its mscale is
+    // 1 + 0.1*ln(factor) on cos/sin, and the reference driver (llama.cpp's
+    // llama_context) pre-divides the checkpoint's `yarn_attn_factor` by exactly
+    // that before handing it to the rope op, so the rotation stays at unity and
+    // rope_attn_scale staying at 1.0 is right. Where the magnitude does land is
+    // the ATTENTION SCALE: for the DeepSeek MLA rows the reference folds a
+    // second factor, mscale = 1 + 0.1*mscale_all_dim*ln(factor), into the score
+    // scale as mscale^2/sqrt(key_length). That is B7: it is resolved into
+    // ModelConfig::mla_kq_mscale here and consumed by mla_forward, and leaving
+    // it out cost a factor-40 file 36.6% of its score amplitude.
     //
     // Folding the factor in also means rope_scale must go back to 1.0: the
     // interpolated frequency already carries the 1/factor, and the kernel
@@ -3980,6 +4016,14 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         cfg_.rope_yarn_factor = factor;
         cfg_.rope_yarn_log_mul = static_cast<f32>(
             gguf_.get_f64(key(".rope.scaling.yarn_log_multiplier"), 0.0));
+        // B7. The mscale MULTIPLIER only (1.0 when the file does not ask for
+        // any), resolved once from the file's own numbers so the engine has no
+        // second opinion and a test can read it off the config. TheMLA path
+        // squares it and divides by sqrt(key_length); only the V2/V3 path
+        // (mla_forward) consumes it, because deepseek4/41 pass a plain
+        // 1/sqrt(n_embd_head) in the reference.
+        cfg_.mla_kq_mscale = deepseek_yarn_mscale(cfg_.rope_yarn_factor,
+                                                  cfg_.rope_yarn_log_mul);
         const i32 orig = static_cast<i32>(gguf_.get_i64(
             key(".rope.scaling.original_context_length"), cfg_.n_ctx_train));
         const f32 beta_fast = static_cast<f32>(
