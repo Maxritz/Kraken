@@ -49,6 +49,10 @@ every RMSNorm and this engine read them only under the LayerNorm flag, so every
 real Phi-MoE checkpoint ran with three bias vectors per layer dropped (measured:
 two files differing only in those vectors gave `md` exactly 0). They are applied
 now (`ArchSpec::norm_bias`), and the same pair moves the logits by 0.0782.
+The same audit run over every family llama.cpp writes a norm bias for found one
+more: `lfm2`/`lfm2moe` (`lfm2.cpp:60/68`), measured at md exactly 0 and now
+0.8572 — of the twelve families with such a bias, only `phimoe` and `lfm2` are
+RMSNorm stacks this engine runs, and the other ten take `ln_bias`.
 
 That pass also closed two holes it found. `gemma`'s QK-norm was a family
 constant, so every real Gemma-1/2 file was refused for `attn_q_norm.weight` — a

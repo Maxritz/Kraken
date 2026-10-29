@@ -448,6 +448,37 @@ constexpr ArchSpec qwen38_spec() {
     return s;
 }
 
+// LFM2 and LFM2-MoE, one generator. The reference keeps one loader for both
+// (`case LLM_ARCH_LFM2: case LLM_ARCH_LFM2MOE:`), so the only thing that
+// differs here is the shape and the expert-weight normalisation.
+//
+// `norm_bias` is the part the two rows were missing: llama.cpp's lfm2.cpp
+// creates `attn_norm.bias` and `ffn_norm.bias` on every layer with no
+// OPTIONAL flag, and this engine read per-layer norm biases only under
+// `ln_bias`, which also selects the LayerNorm forward. Measured before the
+// flag: an lfm2moe twin pair differing only in those two vectors gave
+// logits that differed by exactly 0 (peak 3.455).
+constexpr ArchSpec lfm2_spec(bool moe) {
+    ArchSpec s{moe ? "lfm2moe" : "lfm2",
+               moe ? ArchShape::RecurrentMoe : ArchShape::Recurrent,
+               ArchSupport::Yes,
+               ArchRole::Target,
+               "lfm2",
+               "",
+               /*qk_norm=*/true,
+               /*q_output_gate=*/false,
+               /*qkv_bias=*/false,
+               /*gemma_norm=*/false,
+               /*attn_gate=*/false,
+               /*rope_neox=*/true,
+               /*swa_period=*/0,
+               /*swa_window_first=*/false,
+               /*expert_w_norm=*/moe ? 1 : 0};
+    s.norm_bias = true;
+    return s;
+}
+
+
 constexpr ArchSpec kTable[] = {
     // ---- the schemas this engine runs ------------------------------------
     {"llama", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
@@ -658,22 +689,14 @@ constexpr ArchSpec kTable[] = {
     //     reference's ` Paris. The capital of ...`; the two differ by the
     //     sigmoid sum (about 2x on every expert contribution), which is why a
     //     wrong answer here is fluent rather than broken.
-    {"lfm2moe", ArchShape::RecurrentMoe, ArchSupport::Yes, ArchRole::Target,
-     "lfm2", "",
-     /*qk_norm=*/true, /*q_output_gate=*/false, /*qkv_bias=*/false,
-     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/true,
-     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/1},
+    lfm2_spec(/*moe=*/true),
     // LFM2 (dense): the same stack as LFM2-MoE with the routed block replaced
     // by a plain dense FFN. The reference keeps ONE builder and one hparam set
     // for both (`case LLM_ARCH_LFM2: case LLM_ARCH_LFM2MOE:`), and the mixer,
     // the per-layer `head_count_kv` array, the missing `output_norm` and the
     // NeoX rope pairing are identical -- only `expert_count` is absent. So the
     // family is declared once and the layer's own bank decides which block runs.
-    {"lfm2", ArchShape::Recurrent, ArchSupport::Yes, ArchRole::Target,
-     "lfm2", "",
-     /*qk_norm=*/true, /*q_output_gate=*/false, /*qkv_bias=*/false,
-     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/true,
-     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/0},
+    lfm2_spec(/*moe=*/false),
     // Gemma scales the embedding by sqrt(n_embd), uses a tighter eps, gates its
     // FFN with GeGLU and softcaps the final logits. Gemma 1 is the llama schema
     // plus those four, and it carries NO QK-norm: llama.cpp's gemma.cpp creates
