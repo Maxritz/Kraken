@@ -552,18 +552,32 @@ public:
                const i32 *tokens, i64 n_tok) override {
         KRK_KTIME("embed");
         npu_flush_();
-        (void)n_vocab;
         const size_t row_bytes = dtype_row_bytes(tt, n_embd);
         f32 *o = static_cast<f32 *>(out);
         // Token rows are independent; each dequantizes into its
         // own output slice.
+        //
+        // `n_vocab` was `(void)`-ed here before this line existed, and the id
+        // went straight into the address arithmetic: an id at or past n_vocab
+        // read the row AFTER the table (on a real file that is the next tensor's
+        // bytes, or in ASan terms a heap-buffer-overflow 0 bytes past the
+        // region). Engine::init now refuses a file whose tokenizer can produce
+        // such an id, so this is the belt to that brace -- and it is the only
+        // check a caller that builds ids itself ever hits. An out-of-range id
+        // gets a zero row: a defined, visible value, not another tensor's data.
         par_for(n_tok, 1, 2.0 * static_cast<f64>(n_tok) * n_embd,
                 [&](i64 b, i64 e) {
                     for (i64 t = b; t < e; t++) {
+                        f32 *dst = o + t * n_embd;
                         const i32 id = tokens[t];
+                        if (id < 0 || static_cast<i64>(id) >= n_vocab) {
+                            std::memset(dst, 0,
+                                        static_cast<size_t>(n_embd) * sizeof(f32));
+                            continue;
+                        }
                         dequant_row(tt, static_cast<const u8 *>(tok_embd) +
                                            static_cast<size_t>(id) * row_bytes,
-                                    o + t * n_embd, n_embd);
+                                    dst, n_embd);
                     }
                 });
     }

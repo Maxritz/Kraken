@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-29T13:11:57Z",
-  "recorded_commit": "d9dac24",
-  "totals": {"groups": 154, "passed": 7006, "run": 7006, "exit": 0},
+  "recorded_utc": "2026-10-29T13:59:59Z",
+  "recorded_commit": "0d972cd",
+  "totals": {"groups": 155, "passed": 7047, "run": 7047, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -60,7 +60,8 @@
     {"name": "test_arch_row_pins", "status": "pass", "passed": 23, "run": 23},
     {"name": "test_pending_model_fixtures", "status": "pass", "passed": 36, "run": 36},
     {"name": "test_pending_model_refusals", "status": "pass", "passed": 24, "run": 24},
-    {"name": "test_yes_row_fixtures", "status": "pass", "passed": 37, "run": 37},
+    {"name": "test_yes_row_fixtures", "status": "pass", "passed": 40, "run": 40},
+    {"name": "test_gpt_oss_whole_graph", "status": "pass", "passed": 38, "run": 38},
     {"name": "test_dflash_qwen35_spelling", "status": "pass", "passed": 7, "run": 7},
     {"name": "test_minicpm_embedding_scale_forward", "status": "pass", "passed": 6, "run": 6},
     {"name": "test_olmoe_expert_weight_forward", "status": "pass", "passed": 7, "run": 7},

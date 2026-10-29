@@ -22342,6 +22342,449 @@ static void test_pending_model_refusals() {
     }
 }
 
+// ---- gpt-oss: the whole graph, at depth, pinned ---------------------------
+//
+// The row's remaining gap is not a tensor it cannot read -- it reads all of
+// them -- it is that no test pinned the SENTENCE a gpt-oss file produces over a
+// stack deep enough for a per-layer mistake to accumulate. A block-level group
+// can pass every arm and still decode nonsense, which is exactly what the PLE
+// normalisation bug did on qwen4exp before `test_qwen4exp_whole_graph`.
+//
+// So: four layers, every gpt-oss-specific tensor in the file (attention sinks,
+// the attention-output bias, the pre-softmax router bias, the per-expert FFN
+// biases), the alternating window the row declares, and a pinned logits row.
+// Then four arms that each remove ONE piece and must move the pin -- without
+// them the pin is a number, not a measurement.
+struct GptOssFix {
+    int n_layer = 4;
+    bool sinks = true;
+    bool attn_out_bias = true;
+    bool router_bias = true;      // ffn_gate_inp.bias, added to the LOGITS
+    bool exp_biases = true;       // per-expert gate/up/down biases
+    bool window = true;           // <arch>.attention.sliding_window
+    f32 router_bias_value = 0.35f;
+    i64 seed_bump = 0;            // shifts every weight, for the prompt A/B twin
+    // Tokenizer pieces to declare, 0 = the same as `vocab` (a consistent file).
+    // Set it ABOVE `vocab` to write the malformed shape described on the check
+    // in Engine::init: more ids than the table has rows.
+    int tok_vocab = 0;
+};
+
+static bool build_gpt_oss_model(const std::string &path, const GptOssFix &f) {
+    const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    // 264, not 260: `add_spm_vocab` writes <unk>/<s>/</s> plus 256 byte pieces
+    // plus two word pieces = 261 entries BEFORE its padding loop, so a smaller
+    // `vocab` leaves the file declaring 261 ids while the tables here were built
+    // with `vocab` rows. That mismatch is exactly how this fixture first failed:
+    // greedy picked the 261st id, `embed()` read one row past the table, and the
+    // "run-to-run noise" was the heap behind it. A fixture whose vocab is one
+    // longer than its table is a broken file, not a measurement.
+    const int n_expert = 4, n_used = 2, n_ff_exp = 32, vocab = 264, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string arch = "gpt-oss";
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-gptoss-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(f.n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 150000.0f);
+    b.meta_u32(arch + ".expert_count", static_cast<u32>(n_expert));
+    b.meta_u32(arch + ".expert_used_count", static_cast<u32>(n_used));
+    b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
+    // The alternating window: gpt-oss runs a windowed layer on the EVEN indices
+    // and full attention on the odd ones, which is the row's `swa_period 2,
+    // window first`. 16 tokens is inside a 32-token fixture, so the mask bites
+    // on the windowed layers without hiding the whole prompt.
+    if (f.window) b.meta_u32(arch + ".attention.sliding_window", 16);
+    add_spm_vocab(b, f.tok_vocab > 0 ? f.tok_vocab : vocab);
+
+    // A splitmix-style hash, NOT `wv()`. `wv` is `((i % 11) - 5) * 0.03`: a
+    // sawtooth with period 11, which over a 32-wide row repeats three times and
+    // makes many router logits EXACTLY equal. On this fixture that produced
+    // pathological ties -- the top eight logits came out identical to six
+    // decimals -- so the MoE's top-k was decided by the last bit of a reduction.
+    // The measurement that exposed it: two identical runs of the same file
+    // disagreed by 1% in L1, and a two-token prompt disagreed with itself under
+    // a different prefill chunk. A fixture whose answer depends on tie-breaking
+    // cannot pin anything.
+    auto rnd = [](i64 i) {
+        u64 z = static_cast<u64>(i) * 0x9E3779B97F4A7C15ull + 0x1234567ull;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z = z ^ (z >> 31);
+        return static_cast<f32>((z >> 40) & 0xFFFFFF) / 8388608.0f - 1.0f;  // -1..1
+    };
+    auto vec = [&](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = 0.30f * rnd(base + static_cast<i64>(i) + f.seed_bump);
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    auto small = [&](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = 0.02f * rnd(base + static_cast<i64>(i) + f.seed_bump);
+        return v;
+    };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)}, vec(n_embd * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000));
+
+    for (int l = 0; l < f.n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, base + 100));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 200));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 300));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400));
+        // One sink per query head: a logit that competes with every visible key
+        // and contributes no value. Non-zero and per-head, so a run that drops
+        // them cannot agree with one that applies them.
+        if (f.sinks) {
+            std::vector<f32> sk(static_cast<size_t>(n_head));
+            for (int i = 0; i < n_head; i++)
+                sk[static_cast<size_t>(i)] = 0.4f - 0.15f * static_cast<f32>(i);
+            b.tensor_f32(p + "attn_sinks.weight", {u64(n_head)}, sk);
+        }
+        // gpt-oss biases the attention OUTPUT, after the projection and before
+        // the residual. A constant on the residual axis is not free: every
+        // subsequent norm divides by a different RMS.
+        if (f.attn_out_bias)
+            b.tensor_f32(p + "attn_output.bias", {u64(n_embd)},
+                         small(n_embd, base + 450));
+
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        // The router and its bias. `ffn_gate_inp.bias` is added to the router's
+        // LOGITS before the softmax (llama.cpp's convention, and the one this
+        // loader implements), so a non-zero bias re-ranks the experts.
+        b.tensor_f16(p + "ffn_gate_inp.weight", {u64(n_embd), u64(n_expert)},
+                     vec(static_cast<size_t>(n_embd) * n_expert, base + 500));
+        if (f.router_bias) {
+            std::vector<f32> rb(static_cast<size_t>(n_expert));
+            for (int e = 0; e < n_expert; e++)
+                rb[static_cast<size_t>(e)] = f.router_bias_value *
+                                             (e % 2 == 0 ? 1.0f : -1.0f);
+            b.tensor_f32(p + "ffn_gate_inp.bias", {u64(n_expert)}, rb);
+        }
+        const size_t gsz = static_cast<size_t>(n_embd) * n_ff_exp;
+        const size_t dsz = static_cast<size_t>(n_ff_exp) * n_embd;
+        std::vector<f32> gate(gsz * n_expert), up(gsz * n_expert), down(dsz * n_expert);
+        for (int e = 0; e < n_expert; e++) {
+            const i64 bump = static_cast<i64>(e) * 7919;
+            for (size_t k = 0; k < gsz; k++) {
+                gate[static_cast<size_t>(e) * gsz + k] = 0.30f * rnd(base + 500 + static_cast<i64>(k) + bump);
+                up[static_cast<size_t>(e) * gsz + k] = 0.30f * rnd(base + 1500 + static_cast<i64>(k) + bump);
+            }
+            for (size_t k = 0; k < dsz; k++)
+                down[static_cast<size_t>(e) * dsz + k] = 0.30f * rnd(base + 2300 + static_cast<i64>(k) + bump);
+        }
+        b.tensor_f16(p + "ffn_gate_exps.weight",
+                     {u64(n_embd), u64(n_ff_exp), u64(n_expert)}, gate);
+        b.tensor_f16(p + "ffn_up_exps.weight",
+                     {u64(n_embd), u64(n_ff_exp), u64(n_expert)}, up);
+        b.tensor_f16(p + "ffn_down_exps.weight",
+                     {u64(n_ff_exp), u64(n_embd), u64(n_expert)}, down);
+        if (f.exp_biases) {
+            // FLAT per-expert rows, which is the layout the engine documents on
+            // LayerWeights::exp_{gate,up,down}_bias: gate/up are
+            // [n_expert * n_ff_exp] and down is [n_expert * n_embd]. Writing
+            // them 3-D as [n_embd, n_ff, n_expert] loaded without complaint and
+            // then read the wrong offsets, which is a shape the loader should
+            // not accept -- recorded as a finding, not hidden by the fixture.
+            std::vector<f32> gb(static_cast<size_t>(n_expert) * n_ff_exp);
+            std::vector<f32> ub(static_cast<size_t>(n_expert) * n_ff_exp);
+            std::vector<f32> db(static_cast<size_t>(n_expert) * n_embd);
+            for (size_t k = 0; k < gb.size(); k++) {
+                gb[k] = 0.05f * rnd(base + 3100 + static_cast<i64>(k));
+                ub[k] = 0.05f * rnd(base + 3300 + static_cast<i64>(k));
+            }
+            for (size_t k = 0; k < db.size(); k++)
+                db[k] = 0.05f * rnd(base + 3500 + static_cast<i64>(k));
+            b.tensor_f32(p + "ffn_gate_exps.bias",
+                         {u64(n_ff_exp), u64(n_expert)}, gb);
+            b.tensor_f32(p + "ffn_up_exps.bias", {u64(n_ff_exp), u64(n_expert)}, ub);
+            b.tensor_f32(p + "ffn_down_exps.bias", {u64(n_embd), u64(n_expert)}, db);
+        }
+    }
+    return b.write(path);
+}
+
+static void test_gpt_oss_whole_graph() {
+    // The instrument is RowPin, not a bit hash, and that is a measured choice:
+    // two runs of the same file in the same process differ in the last bits of
+    // several logits (the GEMM reduction order is not fixed), so a hash is
+    // stable only by luck. top-8 / min / L1 / L2 at 1e-3 relative is the
+    // portable reading, and it is the same fingerprint `test_qwen4exp_whole_graph`
+    // and the CLI's --prefill-hash record use.
+    auto run = [&](const std::string &file, const char *prompt, i32 chunk,
+                   i32 max_tokens, RowPin *pin, std::vector<i32> *toks,
+                   std::vector<f32> *logits = nullptr) -> bool {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = file;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = chunk;
+            std::string err;
+            if (!engine.init(cpu, cfg, &err)) {
+                std::fprintf(stderr, "  (gpt-oss init: %s)\n", err.c_str());
+            } else {
+                GenerateParams gp;
+                gp.prompt = prompt;
+                gp.max_tokens = max_tokens;
+                gp.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(gp, &r) && r.finish != FinishError;
+                if (ok) {
+                    const f32 *lg = engine.last_logits();
+                    const i32 nv = engine.model().cfg().n_vocab;
+                    if (pin && lg && nv > 0) *pin = row_pin(lg, nv);
+                    if (logits && lg && nv > 0) logits->assign(lg, lg + nv);
+                    if (toks) *toks = r.tokens;
+                }
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    // ---- the pinned file: four layers, every gpt-oss tensor present ----
+    GptOssFix full;
+    CHECK(build_gpt_oss_model("kraken-gptoss-full.gguf", full),
+          "wrote a four-layer gpt-oss file with sinks, both biases and a window");
+    {
+        // The row's own claim, checked on the file: the reader must take every
+        // one of those tensors rather than ignoring them silently.
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string err;
+        if (m.load(*cpu, "kraken-gptoss-full.gguf", &err)) {
+            CHECK(m.cfg().n_layer == 4, "four layers are read");
+            CHECK(m.cfg().swa_period == 2 && m.cfg().swa_phase == 1,
+                  "the alternating window is the row's (period 2, window first)");
+            bool any_sink = false, any_out_bias = true, any_router_bias = false;
+            for (i32 l = 0; l < m.cfg().n_layer; l++) {
+                if (m.layers()[static_cast<size_t>(l)].sinks) any_sink = true;
+                if (!m.layers()[static_cast<size_t>(l)].wo_bias) any_out_bias = false;
+                if (m.layers()[static_cast<size_t>(l)].router_bias) any_router_bias = true;
+            }
+            CHECK(any_sink, "the attention sinks are resident");
+            CHECK(any_out_bias, "every layer carries its attention-output bias");
+            CHECK(any_router_bias, "and its pre-softmax router bias");
+            CHECK(m.is_swa(0) && !m.is_swa(1),
+                  "layer 0 is the windowed one, layer 1 the full-attention one");
+        } else {
+            CHECK(false, ("the gpt-oss file loads: " + err).c_str());
+        }
+        m.unload();
+        delete cpu;
+    }
+
+    // A consistent file says nothing. (The note is an observation about the
+    // file, so it has to be silent on the file this group pins.)
+    {
+        Backend *cpu = make_cpu_backend();
+        // The engine owns buffers on the backend and frees them in its
+        // destructor, so it has to die BEFORE the backend does.
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = "kraken-gptoss-full.gguf";
+            cfg.n_ctx = 64;
+            std::string err;
+            CHECK(engine.init(cpu, cfg, &err), "the consistent file initialises");
+            CHECK(engine.vocab_note().empty(),
+                  "and reports no vocabulary mismatch");
+        }
+        delete cpu;
+    }
+
+    RowPin pin_full;
+    std::vector<i32> toks;
+    CHECK(run("kraken-gptoss-full.gguf", "the quick brown fox", 8, 4, &pin_full,
+              &toks),
+          "the whole graph runs at depth");
+    CHECK(!toks.empty(), "and produces a greedy sequence");
+    std::fprintf(stderr, "[gpt-oss] pinned %s\n", pin_str(pin_full).c_str());
+    {
+        std::string seq;
+        for (i32 t : toks) seq += std::to_string(t) + " ";
+        std::fprintf(stderr, "[gpt-oss] greedy: %s\n", seq.c_str());
+    }
+
+    // ---- the repeat arm: two identical runs must land on the same pin.
+    //      Without this the pin below could be measuring heap state.
+    {
+        RowPin again;
+        CHECK(run("kraken-gptoss-full.gguf", "the quick brown fox", 8, 4, &again,
+                  nullptr),
+              "the run repeats");
+        std::fprintf(stderr, "[gpt-oss] repeat    %s\n", pin_str(again).c_str());
+        CHECK(pin_close(pin_full, again),
+              "and two runs of one file agree: the pin is a property of the "
+              "graph, not of the process");
+    }
+
+    // ---- the arms that make the pin a measurement ----
+    // Each writes the same file with ONE gpt-oss piece removed. Every one must
+    // move the row, or that piece was never in the path.
+    struct Arm {
+        const char *name;
+        GptOssFix fix;
+    };
+    std::vector<Arm> arms;
+    {
+        GptOssFix f; f.sinks = false; arms.push_back({"sinks", f});
+    }
+    {
+        GptOssFix f; f.attn_out_bias = false; arms.push_back({"attn_out_bias", f});
+    }
+    {
+        GptOssFix f; f.router_bias = false; arms.push_back({"router_bias", f});
+    }
+    {
+        GptOssFix f; f.exp_biases = false; arms.push_back({"expert_biases", f});
+    }
+    {
+        GptOssFix f; f.window = false; arms.push_back({"window", f});
+    }
+    for (const Arm &a : arms) {
+        const std::string path = std::string("kraken-gptoss-") + a.name + ".gguf";
+        CHECK(build_gpt_oss_model(path, a.fix),
+              (std::string("wrote the ") + a.name + " arm").c_str());
+        RowPin pin;
+        const bool ok = run(path, "the quick brown fox", 8, 4, &pin, nullptr);
+        CHECK(ok, (std::string("the ") + a.name + " arm runs").c_str());
+        if (ok) {
+            // 4 tokens, like the pin it is compared against: a row belongs to
+            // the position that produced it, so a 1-token row is a different
+            // measurement, not a cheaper one.
+            RowPin pc1;
+            run(path, "the quick brown fox", 1, 4, &pc1, nullptr);
+            std::fprintf(stderr,
+                         "[gpt-oss] without %-14s %-9s chunk1-vs-8 %s\n", a.name,
+                         pin_close(pin_full, pin) ? "UNCHANGED" : "moved",
+                         pin_close(pin, pc1) ? "AGREE" : "DIFFER");
+            CHECK(!pin_close(pin_full, pin),
+                  (std::string("removing ") + a.name + " moves the pinned row")
+                      .c_str());
+        }
+        std::remove(path.c_str());
+    }
+
+    // ---- chunking invariance: the pin is a property of the file, not of how
+    //      the prompt was fed. A per-layer state that leaks across a chunk
+    //      boundary shows up here and nowhere else.
+    {
+        RowPin pin_c1;
+        CHECK(run("kraken-gptoss-full.gguf", "the quick brown fox", 1, 4, &pin_c1,
+                  nullptr),
+              "the same file at one token per chunk");
+        std::fprintf(stderr, "[gpt-oss] chunk1    %s\n", pin_str(pin_c1).c_str());
+        CHECK(pin_close(pin_full, pin_c1),
+              "and the same row: prefill chunking is invisible");
+    }
+
+    // ---- a vocabulary that does not fit its table is refused, not run ----
+    //
+    // The negative control for the check in Engine::init. This file is the
+    // fixture above with one number changed: the tokenizer declares 280 pieces
+    // over a 264-row token_embd. That is not a hypothetical shape -- it is
+    // exactly what this group's own first draft was (261 pieces, a 260-row
+    // table, because the vocab constant was one short), and it did not fail
+    // loudly. It loaded, it generated, and it read the row past the table:
+    // AddressSanitizer put a READ of size 2 at 0 bytes to the right of the
+    // 16640-byte token_embd region, in dequant_row under CpuBackend::embed. The
+    // visible symptom was worse than a crash for a test: two runs of the SAME
+    // file in one process decoded different tokens, because the row past the
+    // table is whatever the heap holds there, so the fixture looked
+    // nondeterministic instead of looking wrong.
+    {
+        GptOssFix bad;
+        bad.tok_vocab = 280;
+        CHECK(build_gpt_oss_model("kraken-gptoss-badvocab.gguf", bad),
+              "wrote a file whose tokenizer is longer than its table");
+        Backend *cpu = make_cpu_backend();
+        bool loaded = false;
+        std::string note;
+        {
+            // Outlived by nothing: see the note in the block above.
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = "kraken-gptoss-badvocab.gguf";
+            cfg.n_ctx = 64;
+            std::string err;
+            loaded = engine.init(cpu, cfg, &err);
+            note = loaded ? engine.vocab_note() : ("REFUSED: " + err);
+        }
+        // Reported, not refused: 41 groups of this suite's own fixtures carry
+        // exactly this shape (a 261-piece tokenizer over a smaller table) and
+        // run correctly, because sampling draws from the table and never lands
+        // in the gap. See the check in Engine::init for the measurement that
+        // made "warn + bounds-check the id" the right pair and "refuse" the
+        // wrong one.
+        std::fprintf(stderr, "[gpt-oss] bad vocab: %s\n", note.c_str());
+        CHECK(loaded, "a tokenizer longer than the table still runs");
+        CHECK(note.find("280") != std::string::npos &&
+                  note.find("264") != std::string::npos,
+              "and the note names both counts");
+        CHECK(note.find("zero") != std::string::npos,
+              "and says what happens to a token past the table");
+        delete cpu;
+        std::remove("kraken-gptoss-badvocab.gguf");
+    }
+
+    // ---- and the backstop: an id past the table gets a zero row ----
+    // Engine::init is one caller. `embed` is a public backend entry point, and
+    // it used to ignore the `n_vocab` it was handed, so the id went straight
+    // into the address arithmetic. Two ids here, the second one past the end.
+    {
+        Backend *cpu = make_cpu_backend();
+        std::vector<f32> table(4 * 4);
+        for (size_t i = 0; i < table.size(); i++)
+            table[i] = static_cast<f32>(i) + 1.0f;          // rows 1..4
+        std::vector<f32> out(2 * 4, -1.0f);
+        const i32 ids[2] = {3, 9};
+        cpu->embed(out.data(), table.data(), DType::F32, /*n_vocab=*/4,
+                   /*n_embd=*/4, ids, 2);
+        bool in_range = true, zeroed = true;
+        for (int k = 0; k < 4; k++) {
+            if (out[k] != table[3 * 4 + k]) in_range = false;
+            if (out[4 + k] != 0.0f) zeroed = false;
+        }
+        CHECK(in_range, "an in-range id still copies its row");
+        CHECK(zeroed, "and an id past n_vocab gets zeros, not the next tensor");
+        delete cpu;
+    }
+
+    // ---- a different prompt moves it (the pin is not a constant) ----
+    {
+        RowPin pin2;
+        CHECK(run("kraken-gptoss-full.gguf", "pack my box", 8, 4, &pin2, nullptr),
+              "a second prompt runs");
+        CHECK(!pin_close(pin_full, pin2), "and lands on a different row");
+    }
+    std::remove("kraken-gptoss-full.gguf");
+}
+
 // ---- every `Yes` row: a file of its family, built from its own flags ------
 //
 // The same bargain as the pending pass, turned on the rows that already claim
@@ -22393,6 +22836,8 @@ static void test_yes_row_fixtures() {
     arm("kraken-row-qwen3.gguf", "qwen3");
     // laguna: per-head QK-norm, a separate softplus attention gate and a NeoX
     // pairing, over a routed FFN.
+    CHECK(build("gpt-oss", 4, false), "wrote gpt-oss");
+    arm("kraken-row-gpt-oss.gguf", "gpt-oss");
     CHECK(build("laguna", 4, false), "wrote laguna");
     arm("kraken-row-laguna.gguf", "laguna");
     // ---- phimoe, measured on the bias its files always carry ----
@@ -25946,6 +26391,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_pending_model_fixtures)
     TEST_GROUP(test_pending_model_refusals)
     TEST_GROUP(test_yes_row_fixtures)
+    TEST_GROUP(test_gpt_oss_whole_graph)
     TEST_GROUP(test_dflash_qwen35_spelling)
     TEST_GROUP(test_minicpm_embedding_scale_forward)
     TEST_GROUP(test_olmoe_expert_weight_forward)
