@@ -121,6 +121,13 @@ public:
     const GgufValue *find(const std::string &key) const;
     const GgufTensor *tensor(const std::string &name) const;
 
+    // Ask the OS to start reading this tensor's bytes (or its first `bytes`
+    // bytes, for a tensor larger than the read-ahead budget) before the loader
+    // copies them. Advisory: a file that cannot take the advice returns false
+    // and the copy still happens, one page at a time as before. See
+    // MappedFile::advise_willneed for why this is worth a syscall per tensor.
+    bool advise(const GgufTensor &t, size_t bytes) const;
+
     // ---- name resolution for a family that spells the same tensor differently
     //
     // A converter is free to call a tensor whatever the model author called it.

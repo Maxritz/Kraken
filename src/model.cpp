@@ -1466,6 +1466,77 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         if (bytes < 16777216u) return 6;
         return 7;
     };
+    // ---- read-ahead ------------------------------------------------------
+    //
+    // The bytes come out of a mapping, so every tensor the loop copies is paid
+    // for with a soft fault per 4 KiB page taken ON THIS THREAD, one after the
+    // other -- a fault cannot overlap the copy that is waiting on it. The
+    // loader's own note measures 1.2M faults / 1209 ms for an 8B file, and on a
+    // 200 GB file that is the minutes before the first token.
+    //
+    // One madvise(MADV_WILLNEED) issued K tensors ahead turns that into
+    // readahead the kernel performs while this thread is still copying the
+    // current tensor. No thread, no queue and no lifetime to manage: the advice
+    // is advisory by contract, so a wrong guess costs a read that is never used,
+    // never a different answer.
+    //
+    // The window is a BYTE budget, not a tensor count: one 2 GiB expert bank and
+    // one 4 KiB norm should not free the same lookahead. KRK_LOAD_AHEAD_MB
+    // overrides it, 0 disables it.
+    struct AheadState {
+        const std::vector<GgufTensor> *tensors = nullptr;
+        std::unordered_map<const GgufTensor *, size_t> index;
+        size_t bytes = 64u << 20;
+        size_t done_upto = 0;   // tensors [0, done_upto) have been advised
+        bool on = false;
+    } ahead;
+    ahead.tensors = &gguf_.tensors();
+    ahead.on = [&] {
+        const char *e = std::getenv("KRK_LOAD_AHEAD_MB");
+        if (e && e[0] != '\0') {
+            const long mb = std::atol(e);
+            if (mb <= 0) return false;
+            ahead.bytes = static_cast<size_t>(mb) << 20;
+        }
+        return true;
+    }();
+    if (ahead.on) {
+        ahead.index.reserve(ahead.tensors->size() * 2);
+        for (size_t i = 0; i < ahead.tensors->size(); i++)
+            ahead.index.emplace(&(*ahead.tensors)[i], i);
+    }
+    // Called with the tensor about to be copied; advises everything between the
+    // previous call and this one, plus `bytes` of lookahead beyond it.
+    auto load_ahead = [&](const GgufTensor *t) {
+        if (!ahead.on || !t) return;
+        auto it = ahead.index.find(t);
+        if (it == ahead.index.end()) return;
+        const size_t cur = it->second;
+        if (cur < ahead.done_upto) return;   // already advised
+        size_t at = ahead.done_upto;
+        size_t budget = ahead.bytes;
+        // Start one page-ish before the current tensor so the copy in flight is
+        // covered too, then run forward until the budget is spent.
+        const GgufTensor &ct = (*ahead.tensors)[cur];
+        if (ct.n_bytes && budget) {
+            const size_t take = std::min(budget, static_cast<size_t>(ct.n_bytes));
+            gguf_.advise(ct, take);
+            budget -= take;
+        }
+        at = cur + 1;
+        while (at < ahead.tensors->size() && budget) {
+            const GgufTensor &nt = (*ahead.tensors)[at];
+            if (nt.n_bytes) {
+                const size_t take =
+                    std::min(budget, static_cast<size_t>(nt.n_bytes));
+                gguf_.advise(nt, take);
+                budget -= take;
+            }
+            at++;
+        }
+        ahead.done_upto = at;
+    };
+
     auto upload_timed = [&](void *dst, const void *src, size_t bytes) {
         const f64 t0 = LoadPhase::now();
         be.upload(dst, src, bytes);
@@ -1531,6 +1602,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         } else {
             q.data = be.alloc(t->n_bytes);
         }
+        load_ahead(t);
         const f64 a1 = LoadPhase::now();
         upload_timed(q.data, t->data, t->n_bytes);
         const f64 a2 = LoadPhase::now();

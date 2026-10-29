@@ -526,6 +526,22 @@ const GgufTensor *Gguf::tensor(const std::string &name) const {
     return nullptr;
 }
 
+bool Gguf::advise(const GgufTensor &t, size_t bytes) const {
+    if (bytes == 0 || bytes > t.n_bytes) bytes = static_cast<size_t>(t.n_bytes);
+    if (bytes == 0) return false;
+    // A tensor's offset is relative to its own shard's data section, so the
+    // shard is found by range, not assumed to be shard 0. A sharded set has one
+    // mapping per file and the last shard is often the short one.
+    const size_t at = static_cast<size_t>(t.offset);
+    for (const auto &s : shards_) {
+        if (!s.file || !s.file->ok()) continue;
+        if (static_cast<u32>(s.split_no) != t.shard) continue;
+        if (at > s.data_off + s.file->size()) continue;
+        return s.file->advise_willneed(s.data_off + at, bytes);
+    }
+    return false;
+}
+
 std::string Gguf::get_str(const std::string &key, const std::string &def) const {
     const GgufValue *v = find(key);
     return (v && v->type == GgufType::String) ? v->str : def;

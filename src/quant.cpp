@@ -3947,6 +3947,30 @@ void set_vec_dot_fast(bool on) {
     g_dot_fast_set.store(true, std::memory_order_relaxed);
 }
 
+std::atomic<bool> g_dot_wide{false};
+std::atomic<bool> g_dot_wide_set{false};
+
+// KRK_CPU_DOT_WIDE=1: the 8/16-lane tiled GEMM. Off by default because it is
+// NOT bit-identical to vec_dot -- that is the whole point of it -- while every
+// cross-backend comparison in this repo reads the CPU arm as the reference.
+bool vec_dot_wide() {
+    if (!g_dot_wide_set.load(std::memory_order_relaxed)) {
+        const char *e = std::getenv("KRK_CPU_DOT_WIDE");
+        g_dot_wide.store(e && e[0] != '\0' && e[0] != '0', std::memory_order_relaxed);
+        g_dot_wide_set.store(true, std::memory_order_relaxed);
+    }
+#if defined(KRK_DOT_AVX2)
+    return g_dot_wide.load(std::memory_order_relaxed) && cpu_has_avx2();
+#else
+    return false;
+#endif
+}
+
+void set_vec_dot_wide(bool on) {
+    g_dot_wide.store(on, std::memory_order_relaxed);
+    g_dot_wide_set.store(true, std::memory_order_relaxed);
+}
+
 bool vec_dot_fast() {
     if (!g_dot_fast_set.load(std::memory_order_relaxed)) {
         // One racy init: every thread that gets here writes the same value.
@@ -4116,6 +4140,263 @@ __attribute__((target("f16c,fma"))) void dot_wide_tiled(
     }
 }
 
+// ---- the wide tiers -------------------------------------------------------
+//
+// `dot_wide_tiled` above is FOUR lane. That is the correct default -- four
+// accumulators summed (a0+a1)+(a2+a3) is the only width whose result is the
+// scalar loop's, so it is the shape the CPU oracle is allowed to be. On a host
+// that has AVX2 or AVX-512 it is also leaving 2x-4x on the table, and the
+// reason is not subtle: it is 128-bit code on a 512-bit machine.
+//
+// The two below are the same idea at 8 and 16 lanes. They are NOT bit-identical
+// to the four-lane path -- a different number of accumulators is a different
+// summation order, by definition -- so they are reached only through the
+// KRK_CPU_DOT_FAST tier, which is the switch that already means "I am trading
+// the oracle property for throughput". Everything that compares this backend
+// against a device runs with it off.
+//
+// Why this is the shape the hardware wants: one weight vector is converted
+// ONCE and multiplied against kT activation rows, so the loads per FMA are one
+// (the activation) plus one shared across the whole tile (the weight). The
+// dependency chains are kT independent accumulators, which is what keeps the
+// FMA units fed instead of waiting on a single add chain.
+//
+// Runtime dispatch, one binary: a Zen 3 or Meteor Lake host takes the 8-lane
+// path, Zen 4/5 and Ice Lake+ take the 16-lane one, and nothing here is
+// compiled into a host that cannot execute it (`__builtin_cpu_supports`).
+
+#if defined(KRK_DOT_AVX2)
+template <bool IsF16>
+__attribute__((target("avx2,fma,f16c"))) void dot_wide_tiled_avx2(
+    const void *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
+    constexpr i64 kT = 8;
+    for (i64 r0 = 0; r0 + kT <= rows; r0 += kT) {
+        __m256 acc[kT];
+        for (i64 j = 0; j < kT; j++) acc[j] = _mm256_setzero_ps();
+        i64 i = 0;
+        for (; i + 8 <= n; i += 8) {
+            __m256 wv;
+            if constexpr (IsF16)
+                wv = _mm256_cvtph_ps(_mm_loadu_si128(
+                    reinterpret_cast<const __m128i *>(
+                        static_cast<const u16 *>(w) + i)));
+            else
+                wv = _mm256_loadu_ps(static_cast<const f32 *>(w) + i);
+            for (i64 j = 0; j < kT; j++)
+                acc[j] = _mm256_fmadd_ps(
+                    wv, _mm256_loadu_ps(x + (r0 + j) * n + i), acc[j]);
+        }
+        for (i64 j = 0; j < kT; j++) {
+            alignas(32) f32 a[8];
+            _mm256_store_ps(a, acc[j]);
+            f32 sum = ((a[0] + a[1]) + (a[2] + a[3])) +
+                      ((a[4] + a[5]) + (a[6] + a[7]));
+            const f32 *xr = x + (r0 + j) * n;
+            for (i64 k = i; k < n; k++)
+                sum += (IsF16 ? fp16_to_fp32(static_cast<const u16 *>(w)[k])
+                              : static_cast<const f32 *>(w)[k]) *
+                       xr[k];
+            out[(r0 + j) * stride] = sum;
+        }
+    }
+}
+#endif
+
+#if defined(KRK_DOT_AVX512)
+// One weight row against one activation row, for the leftovers of the tiled
+// square below. Same fold as the other wide kernels.
+template <bool IsF16>
+__attribute__((target("avx512f,avx512bw,fma,f16c"))) f32 vec_dot_wide_row(
+    const u8 *w, const f32 *x, i64 n) {
+    __m512 acc = _mm512_setzero_ps();
+    i64 i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 wv;
+        if constexpr (IsF16)
+            wv = _mm512_cvtph_ps(_mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(
+                    reinterpret_cast<const u16 *>(w) + i)));
+        else
+            wv = _mm512_loadu_ps(reinterpret_cast<const f32 *>(w) + i);
+        acc = _mm512_fmadd_ps(wv, _mm512_loadu_ps(x + i), acc);
+    }
+    alignas(64) f32 a[16];
+    _mm512_store_ps(a, acc);
+    f32 s4[4];
+    for (int q = 0; q < 4; q++)
+        s4[q] = ((a[q * 4 + 0] + a[q * 4 + 1]) + (a[q * 4 + 2] + a[q * 4 + 3]));
+    f32 sum = (s4[0] + s4[1]) + (s4[2] + s4[3]);
+    for (i64 k = i; k < n; k++)
+        sum += (IsF16 ? fp16_to_fp32(reinterpret_cast<const u16 *>(w)[k])
+                      : reinterpret_cast<const f32 *>(w)[k]) *
+               x[k];
+    return sum;
+}
+
+// 4 output rows x 4 token rows, sixteen accumulators, AVX-512.
+//
+// The one-row-at-a-time kernel below does sixteen FMAs per seventeen loads:
+// one weight vector plus sixteen activation vectors. The load ports, not the
+// FMA units, are the limit, which is why it measures ~45% of the f32 peak.
+//
+// This is the standard fix -- hold a small RECTANGLE of output rows and a small
+// RECTANGLE of token rows, so every loaded vector feeds four FMAs instead of
+// one. Per four-element chunk it is four weight loads + four activation loads
+// for sixteen FMAs: two FMAs per load instead of one, and 32 zmm is exactly
+// enough (16 accumulators + 4 weight + 4 activation = 24, with room for the
+// compiler to hold the base pointers).
+//
+// Only whole 4x4 squares are taken here; the leftovers run through the
+// single-row kernel, so no output is ever dropped and no shape is special-cased
+// at the call site.
+template <bool IsF16>
+__attribute__((target("avx512f,avx512bw,fma,f16c"))) void dot_tile_avx512(
+    const u8 *wbase, i64 row_bytes, const f32 *x, i64 n, i64 o0, i64 o1, i64 r0,
+    i64 r1, i64 n_out, f32 *out) {
+    const i64 no = o1 - o0;   // output rows in this square's column span
+    const i64 nr = r1 - r0;   // token rows
+    i64 o = 0;
+    for (; o + 4 <= no; o += 4) {
+        i64 r = 0;
+        for (; r + 4 <= nr; r += 4) {
+            const u8 *wr0 = wbase + static_cast<size_t>((o0 + o + 0)) * row_bytes;
+            const u8 *wr1 = wbase + static_cast<size_t>((o0 + o + 1)) * row_bytes;
+            const u8 *wr2 = wbase + static_cast<size_t>((o0 + o + 2)) * row_bytes;
+            const u8 *wr3 = wbase + static_cast<size_t>((o0 + o + 3)) * row_bytes;
+            __m512 a00 = _mm512_setzero_ps(), a01 = _mm512_setzero_ps();
+            __m512 a02 = _mm512_setzero_ps(), a03 = _mm512_setzero_ps();
+            __m512 a10 = _mm512_setzero_ps(), a11 = _mm512_setzero_ps();
+            __m512 a12 = _mm512_setzero_ps(), a13 = _mm512_setzero_ps();
+            __m512 a20 = _mm512_setzero_ps(), a21 = _mm512_setzero_ps();
+            __m512 a22 = _mm512_setzero_ps(), a23 = _mm512_setzero_ps();
+            __m512 a30 = _mm512_setzero_ps(), a31 = _mm512_setzero_ps();
+            __m512 a32 = _mm512_setzero_ps(), a33 = _mm512_setzero_ps();
+            i64 i = 0;
+            for (; i + 16 <= n; i += 16) {
+                __m512 w0, w1, w2, w3;
+                if constexpr (IsF16) {
+                    w0 = _mm512_cvtph_ps(_mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(
+                            reinterpret_cast<const u16 *>(wr0) + i)));
+                    w1 = _mm512_cvtph_ps(_mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(
+                            reinterpret_cast<const u16 *>(wr1) + i)));
+                    w2 = _mm512_cvtph_ps(_mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(
+                            reinterpret_cast<const u16 *>(wr2) + i)));
+                    w3 = _mm512_cvtph_ps(_mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(
+                            reinterpret_cast<const u16 *>(wr3) + i)));
+                } else {
+                    w0 = _mm512_loadu_ps(reinterpret_cast<const f32 *>(wr0) + i);
+                    w1 = _mm512_loadu_ps(reinterpret_cast<const f32 *>(wr1) + i);
+                    w2 = _mm512_loadu_ps(reinterpret_cast<const f32 *>(wr2) + i);
+                    w3 = _mm512_loadu_ps(reinterpret_cast<const f32 *>(wr3) + i);
+                }
+                const __m512 x0 = _mm512_loadu_ps(x + (r0 + r + 0) * n + i);
+                const __m512 x1 = _mm512_loadu_ps(x + (r0 + r + 1) * n + i);
+                const __m512 x2 = _mm512_loadu_ps(x + (r0 + r + 2) * n + i);
+                const __m512 x3 = _mm512_loadu_ps(x + (r0 + r + 3) * n + i);
+                a00 = _mm512_fmadd_ps(w0, x0, a00);
+                a01 = _mm512_fmadd_ps(w0, x1, a01);
+                a02 = _mm512_fmadd_ps(w0, x2, a02);
+                a03 = _mm512_fmadd_ps(w0, x3, a03);
+                a10 = _mm512_fmadd_ps(w1, x0, a10);
+                a11 = _mm512_fmadd_ps(w1, x1, a11);
+                a12 = _mm512_fmadd_ps(w1, x2, a12);
+                a13 = _mm512_fmadd_ps(w1, x3, a13);
+                a20 = _mm512_fmadd_ps(w2, x0, a20);
+                a21 = _mm512_fmadd_ps(w2, x1, a21);
+                a22 = _mm512_fmadd_ps(w2, x2, a22);
+                a23 = _mm512_fmadd_ps(w2, x3, a23);
+                a30 = _mm512_fmadd_ps(w3, x0, a30);
+                a31 = _mm512_fmadd_ps(w3, x1, a31);
+                a32 = _mm512_fmadd_ps(w3, x2, a32);
+                a33 = _mm512_fmadd_ps(w3, x3, a33);
+            }
+            // The tail past the last whole 16 runs scalar, in vec_dot's order,
+            // and is added to the folded vector sum -- the same treatment the
+            // single-row kernel gives its own tail.
+            auto fold = [](__m512 v) {
+                alignas(64) f32 a[16];
+                _mm512_store_ps(a, v);
+                f32 s4[4];
+                for (int q = 0; q < 4; q++)
+                    s4[q] = ((a[q * 4 + 0] + a[q * 4 + 1]) +
+                             (a[q * 4 + 2] + a[q * 4 + 3]));
+                return (s4[0] + s4[1]) + (s4[2] + s4[3]);
+            };
+            __m512 acc[4][4] = {{a00, a01, a02, a03},
+                                {a10, a11, a12, a13},
+                                {a20, a21, a22, a23},
+                                {a30, a31, a32, a33}};
+            const u8 *wrow[4] = {wr0, wr1, wr2, wr3};
+            for (int q = 0; q < 4; q++) {
+                for (int v = 0; v < 4; v++) {
+                    f32 sum = fold(acc[q][v]);
+                    const f32 *xr = x + (r0 + r + v) * n;
+                    for (i64 k = i; k < n; k++)
+                        sum += (IsF16 ? fp16_to_fp32(
+                                            reinterpret_cast<const u16 *>(wrow[q])[k])
+                                      : reinterpret_cast<const f32 *>(wrow[q])[k]) *
+                               xr[k];
+                    out[(r0 + r + v) * n_out + (o0 + o + q)] = sum;
+                }
+            }
+        }
+        // Token rows left over in this column square: the single-row kernel,
+        // which is correct for any row count.
+        for (; r < nr; r++)
+            for (int q = 0; q < 4; q++)
+                out[(r0 + r) * n_out + (o0 + o + q)] = vec_dot_wide_row<IsF16>(
+                    wbase + static_cast<size_t>(o0 + o + q) * row_bytes,
+                    x + (r0 + r) * n, n);
+    }
+    // Output rows left over: single-row kernel across every token row.
+    for (; o < no; o++)
+        for (i64 r = 0; r < nr; r++)
+            out[(r0 + r) * n_out + (o0 + o)] = vec_dot_wide_row<IsF16>(
+                wbase + static_cast<size_t>(o0 + o) * row_bytes,
+                x + (r0 + r) * n, n);
+}
+
+#endif // KRK_DOT_AVX512
+
+// One place that decides which of the three runs, so a caller cannot pick a
+// width the host does not have. `want_wide` is the KRK_CPU_DOT_FAST tier.
+template <bool IsF16>
+void dot_wide_dispatch(const void *w, const f32 *x, i64 n, i64 rows, f32 *out,
+                       i64 stride) {
+    // Its OWN tier, not the `fast` one. `fast` promises a tiled GEMM that
+    // reproduces vec_dot bit for bit (four accumulators, the same order) and
+    // test_vec_dot_tiled_bitexact pins that on every tile boundary. Eight or
+    // sixteen accumulators cannot keep that promise -- the association changes,
+    // which is arithmetic, not tuning -- so widening has to be a switch that
+    // says out loud what it gives up. Default off: the oracle is the reason
+    // this backend exists.
+    const bool want_wide = vec_dot_wide();
+    (void)0;
+#if defined(KRK_DOT_AVX512)
+    if (want_wide && cpu_has_avx512bw()) {
+        // One weight row, every token row: the per-row form of the 16-lane
+        // kernel. The 4x4 square in vec_dot_tiled is the fast shape; this is
+        // what a caller that only ever has one output row at a time gets.
+        const u8 *wb_ = static_cast<const u8 *>(w);
+        for (i64 r = 0; r < rows; r++)
+            out[r * stride] = vec_dot_wide_row<IsF16>(
+                wb_, x + r * n, n);
+        return;
+    }
+#endif
+#if defined(KRK_DOT_AVX2)
+    if (want_wide && cpu_has_avx2()) {
+        dot_wide_tiled_avx2<IsF16>(w, x, n, rows, out, stride);
+        return;
+    }
+#endif
+    dot_wide_tiled<IsF16>(w, x, n, rows, out, stride);
+}
+
 } // namespace
 #endif
 
@@ -4249,12 +4530,28 @@ void vec_dot_tiled(DType t, const void *w, const f32 *x, i64 n_in, i64 o_begin,
     // loop -- they are rare enough in a collection that they are not worth a
     // fourth kernel, and they are correct either way.
     if ((t == DType::F16 || t == DType::F32) && rows > 0 && n_in > 0) {
+#if defined(KRK_DOT_AVX512)
+        // The wide tier takes the whole (column block x row block) at once,
+        // because its 4x4 register square needs four output rows and four token
+        // rows to exist at the same time. Calling it per output row -- the
+        // shape the four-lane path below uses -- cannot express that.
+        if (vec_dot_wide() && cpu_has_avx512bw() && rows >= 4) {
+            const i64 rb_ = static_cast<i64>(rb);
+            if (t == DType::F16)
+                dot_tile_avx512<true>(wb, rb_, x, n_in, o_begin, o_end, 0, rows,
+                                      out_stride, out);
+            else
+                dot_tile_avx512<false>(wb, rb_, x, n_in, o_begin, o_end, 0, rows,
+                                       out_stride, out);
+            return;
+        }
+#endif
         for (i64 o = o_begin; o < o_end; o++) {
             const u8 *wr = wb + static_cast<size_t>(o) * rb;
             if (t == DType::F16)
-                dot_wide_tiled<true>(wr, x, n_in, rows, out + o, out_stride);
+                dot_wide_dispatch<true>(wr, x, n_in, rows, out + o, out_stride);
             else
-                dot_wide_tiled<false>(wr, x, n_in, rows, out + o, out_stride);
+                dot_wide_dispatch<false>(wr, x, n_in, rows, out + o, out_stride);
             for (i64 r = rows - (rows % 8); r < rows; r++)
                 out[r * out_stride + o] = vec_dot(t, wr, x + r * n_in, n_in);
         }
