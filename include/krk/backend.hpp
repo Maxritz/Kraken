@@ -1481,6 +1481,26 @@ public:
         (void)stride; (void)eps;
     }
 
+    // ---- k2-horizon's grouped RMS norm -----------------------------------
+    //   o[t, g, i] = x[t, g, i] * rsqrt(mean_j x[t, g, j]^2 + eps) * w[g*width + i]
+    //
+    // NOT rmsnorm_grouped above, and the difference is the whole reason this
+    // exists: that one takes its weight from `w + g*width` (a separate vector
+    // PER GROUP, the Mamba-2 ssm_norm layout), while k2-horizon multiplies the
+    // whole row by ONE elementwise weight (`ggml_mul` of the reshaped matrix
+    // against a [n_embd] tensor, in k2_horizon_group_rms_norm). Only the
+    // REDUCTION is grouped here; the scale is not. Using the other op would read
+    // n_group vectors out of a buffer that holds one and scale every group by
+    // the next group's numbers.
+    //
+    // `n_group == 1` must equal a plain rmsnorm with the same weight, which is
+    // what lets a file without `attention.group_norm_groups` keep the old path.
+    virtual bool group_norm_supported() const { return false; }
+    virtual void rmsnorm_bands(void *o, const void *x, const f32 *w, i64 n_tok,
+                               i64 n_group, i64 ne, f32 eps) {
+        (void)o; (void)x; (void)w; (void)n_tok; (void)n_group; (void)ne; (void)eps;
+    }
+
     // x <- sigmoid(x), and x <- softplus(x) = log1p(exp(x)). Both in place.
     virtual void sigmoid_act(void *x, i64 n) { (void)x; (void)n; }
     virtual void softplus_act(void *x, i64 n) { (void)x; (void)n; }

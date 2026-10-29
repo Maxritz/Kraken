@@ -1150,10 +1150,27 @@ constexpr ArchSpec kTable[] = {
     // than it is, and a wrong diagnosis costs the next person a kernel to write.
     // The real gap is the routed expert set on the attention values, and only
     // that.
-    {"k2-horizon", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "k2-horizon",
-     "attention values are a routed expert set of their own "
-     "(attn_v_exps/attn_v_gate); that is not implemented",
-     false, false, false, false, true, false},
+    //   * MoVA: the attention VALUES are a routed expert set of their own
+    //     (`attn_v_gate` + its optional bias + `attn_v_exps`), which is
+    //     Engine::mova_value -- selection on the BIASED probability, mixing with
+    //     the UNBIASED one, silu on each expert's output before the weight.
+    //   * a GROUPED RMS norm (`attention.group_norm_groups`): the reduction is
+    //     over each band of the row, the weight is elementwise over the whole
+    //     row. That is Backend::rmsnorm_bands, and it is NOT rmsnorm_grouped,
+    //     which takes a separate weight vector per group.
+    // Both are implemented and both are refused BY CAPABILITY on a backend that
+    // lacks the op, so a device path cannot silently run the ungrouped norm.
+    // What is left is the vision tower on the multimodal checkpoints; the text
+    // stack runs end to end and test_k2_horizon_mova pins it.
+    [] {
+        ArchSpec s{"k2-horizon", ArchShape::Moe, ArchSupport::Yes,
+                   ArchRole::Target, "k2-horizon", "", false, false, false,
+                   false, true, false};
+        // llama.cpp marks k2-horizon's wqkv_gate TENSOR_NOT_REQUIRED, so an
+        // ablated export is a legitimate file and must load ungated.
+        s.attn_gate_optional = true;
+        return s;
+    }(),
     // MiniMax's sparse-attention MoE. Listed rather than left to the fallback
     // because the fallback reads an unlisted file against llama defaults, and a
     // 428B MoE is the last model that should be run through a schema nobody
@@ -1303,9 +1320,12 @@ constexpr GapTensor kGapTensors[] = {
     // but a repack that inlines them is still a V4.1 file, and the lookup is
     // part of the layer it sits in -- not a side table the engine may skip.
     {"engram_", "Engram conditional memory (engram_*)", false},
-    {"attn_v_exps.weight", "routed experts on the attention values (attn_v_exps)",
-     false},
-    {"attn_v_gate.", "a gate on the attention values (attn_v_gate)", false},
+    // SERVED, not gaps: attn_v_exps/attn_v_gate are MoVA, implemented by
+    // Engine::mova_value (see the k2-horizon row). They were the row's whole
+    // stated reason for No, and a refusal for a feature the engine now runs is
+    // worse than no entry at all -- it would refuse every k2-horizon file. The
+    // one thing that still refuses is a backend without the grouped-norm op,
+    // which is a capability check at init and not a tensor name.
     {"attn_kv_a.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false,
      GapTensor::Served::ByMlaFlag},
     {"attn_kv_b.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false,

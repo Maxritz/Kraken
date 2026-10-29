@@ -604,6 +604,33 @@ public:
                      n, eps, row_exp);
     }
 
+    bool group_norm_supported() const override { return true; }
+    // k2-horizon's grouped reduction with ONE weight over the whole row. See
+    // Backend::rmsnorm_bands: only the mean square is per group.
+    void rmsnorm_bands(void *o, const void *x, const f32 *w, i64 n_tok,
+                       i64 n_group, i64 ne, f32 eps) override {
+        npu_flush_();
+        const f32 *s = static_cast<const f32 *>(x);
+        f32 *d = static_cast<f32 *>(o);
+        if (n_group <= 1) {           // the ordinary norm, same arithmetic
+            rmsnorm(o, x, w, n_tok, ne, eps);
+            return;
+        }
+        const i64 width = ne / n_group;
+        for (i64 t = 0; t < n_tok; t++) {
+            const f32 *sr = s + t * ne;
+            f32 *dr = d + t * ne;
+            for (i64 g = 0; g < n_group; g++) {
+                const i64 off = g * width;
+                f32 ss = 0.0f;
+                for (i64 i = 0; i < width; i++) ss += sr[off + i] * sr[off + i];
+                const f32 inv = 1.0f / std::sqrt(ss / static_cast<f32>(width) + eps);
+                for (i64 i = 0; i < width; i++)
+                    dr[off + i] = w ? sr[off + i] * inv * w[off + i]
+                                    : sr[off + i] * inv;
+            }
+        }
+    }
     void rmsnorm_grouped(void *o, const void *x, const f32 *w, i64 n_tok,
                          i64 n_group, i64 width, i64 stride,
                          f32 eps) override {

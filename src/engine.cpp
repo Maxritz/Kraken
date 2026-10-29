@@ -1,6 +1,7 @@
 // engine.cpp — prefill (batched) + decode (single token) with a paged-free
 // contiguous KV cache, streaming output and stop-string handling.
 #include "krk/engine.hpp"
+#include "krk/mova.hpp"
 #include "krk/dsv4_compress.hpp"
 #include "krk/arch.hpp"
 #include "krk/dflash.hpp"
@@ -879,6 +880,27 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // AROUND the residual -- the PLE n-gram module and the QSA indexer -- and a
     // file carrying either would decode fluent text that is not this model, so
     // it is refused by name rather than run without the block it declares.
+    // k2-horizon's grouped norm is a reduction a backend has to implement; one
+    // that does not would apply the identity on that op and run a model whose
+    // every norm site is missing, which decodes. Refuse by name instead, the
+    // same bargain hc_supported() makes below.
+    if (model_.cfg().n_norm_groups > 1 && !be_->group_norm_supported()) {
+        if (err)
+            *err = "arch '" + model_.cfg().arch +
+                   "': attention.group_norm_groups is " +
+                   std::to_string(model_.cfg().n_norm_groups) +
+                   ", and this backend has no grouped-RMS-norm op, so every "
+                   "norm site would run ungrouped";
+        return false;
+    }
+    if (model_.cfg().n_value_expert > 0 &&
+        model_.cfg().n_value_expert_used > model_.cfg().n_value_expert) {
+        if (err)
+            *err = "arch '" + model_.cfg().arch +
+                   "': attention.value_expert_used_count exceeds "
+                   "value_expert_count";
+        return false;
+    }
     if (model_.cfg().hc) {
         const ModelConfig &hcc = model_.cfg();
         if (!be_->hc_supported()) {
@@ -1678,6 +1700,16 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     if (!check_alloc(topk_out_, "topk_out")) return false;
     ws_routerp_ = alloc(static_cast<size_t>(C) * static_cast<size_t>(mc.n_expert) * 4);
     if (!check_alloc(ws_routerp_, "ws_routerp")) return false;
+    // The value router. Sized from the FILE's value_expert_count, so a family
+    // without them allocates nothing and the pointers stay null.
+    if (mc.n_value_expert > 0) {
+        const i64 kvw = static_cast<i64>(mc.n_head_kv) * mc.head_dim;
+        ws_vgate_ = alloc(static_cast<size_t>(C) * static_cast<size_t>(mc.n_value_expert) * 4);
+        if (!check_alloc(ws_vgate_, "ws_vgate")) return false;
+        ws_vexp_ = alloc(static_cast<size_t>(C) * static_cast<size_t>(kvw) * be_->act_size());
+        if (!check_alloc(ws_vexp_, "ws_vexp")) return false;
+        vgate_host_.resize(static_cast<size_t>(C) * static_cast<size_t>(mc.n_value_expert));
+    }
     // The device selection and its plan. Allocated for every backend, exactly
     // like ws_routerp_: "is this available" is a runtime question, and a
     // separate allocation path with a null to forget is how a null gets used.
@@ -2539,6 +2571,7 @@ void Engine::shutdown() {
                      &ws_v_, &ws_attn_, &ws_mlaqn_, &ws_mlay_, &ws_mlaa_,
                      &ws_gate_, &ws_up_, &ws_had_, &ws_logits_,
                      &ws_router_, &ws_routerp_, &ws_ids_, &ws_wts_, &ws_off_,
+                     &ws_vgate_, &ws_vexp_,
                      &ws_ffn_, &ws_shexp_g_, &ws_g4_post_, &ws_g4_mlp_, &ws_router_in_,
         &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
                      &ws_scale_, &ws_ebatch_, &ws_edown_, &ws_ebscale_,
@@ -3741,6 +3774,14 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             hc_enter(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
                      L.hc_attn_inject, n);
         } else {
+            // k2-horizon divides the row into `n_norm_groups` bands and takes
+            // the RMS over each band, scaling the whole row by ONE weight. Every
+            // other family leaves the count at 1, where rmsnorm_bands() calls
+            // rmsnorm() itself so the arithmetic is bit-identical to before.
+            if (mc.n_norm_groups > 1)
+                be_->rmsnorm_bands(ws_xn_, ws_x_, L.attn_norm, n, mc.n_norm_groups,
+                                   n_embd_, mc.rms_eps);
+            else
             be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, n, n_embd_, mc.rms_eps,
                          static_cast<const i32 *>(ws_rexp_));
             norm_bias_add(static_cast<f32 *>(ws_xn_), L.attn_norm_bias, n, n_embd_);
@@ -3778,6 +3819,10 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                     hc_enter(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
                              L.hc_ffn_inject, n);
                 } else {
+                    if (mc.n_norm_groups > 1)
+                        be_->rmsnorm_bands(ws_xn_, ws_x_, L.ffn_norm, n,
+                                           mc.n_norm_groups, n_embd_, mc.rms_eps);
+                    else
                     be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_,
                                  mc.rms_eps, static_cast<const i32 *>(ws_rexp_));
                     norm_bias_add(static_cast<f32 *>(ws_xn_), L.ffn_norm_bias, n, n_embd_);
@@ -3861,6 +3906,18 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             const void *wqkv[3] = {wq.data, wk.data, wv.data};
             const i64 nqkv[3] = {lq_proj, kvw, kvw};
             be_->gemm_group(qkv, xn_proj, wqkv, wq.type, nqkv, n_embd_, 3, n);
+        } else if (L.attn_v_exps.present()) {
+            // MoVA (k2-horizon): q and k project, V does not. It is routed --
+            // see mova_value() -- so the fused q|k|v launch cannot be used even
+            // though q and k are the same dtype: V is not a third column block.
+            gemm_w(q_out, xn_proj, L.wq, lq_proj, n_embd_, n);
+            gemm_w(ws_k_, xn_proj, L.wk, lkv, n_embd_, n);
+            KRK_TIME_HOST("mova.value");
+            if (!mova_value(L, l, xn_proj, n, lkv, mc.router_sigmoid)) {
+                forward_error_ = "MoVA: the value router could not run on this "
+                                 "backend (no workspace)";
+                return false;
+            }
         } else if (L.wq.type == L.wk.type && L.wk.type == L.wv.type &&
             !L.wq.scaled() && !L.wk.scaled() && !L.wv.scaled()) {
             void *qkv[3] = {q_out, ws_k_, ws_v_};
@@ -9661,6 +9718,77 @@ bool Engine::moe_decode_batch(const LayerWeights &L, i32 layer, i32 k, i32 ne,
                 static_cast<const f32 *>(ws_alpha_) + off, 1, n_embd_,
                 scale_at(j), static_cast<i32 *>(ws_fexp_));
             model_.experts().note_read(layer, e);
+        }
+    }
+    return true;
+}
+
+// ---- MoVA: the attention VALUES are a routed expert set (k2-horizon) ------
+//
+// This is llama.cpp's build_routed_value, in the same order, because every step
+// of it is a place to get the model wrong in a way that still decodes:
+//
+//   gate   = attn_v_gate @ xn                    [n_value_expert]
+//   probs  = softmax | sigmoid(gate)             (expert_gating_func)
+//   score  = probs + attn_v_gate_b               SELECTION ONLY
+//   sel    = top-k(score)                        k = value_expert_used_count
+//   w_k    = probs[sel_k]                        the UNBIASED probability
+//   w      = w / sum(w)                          only when expert_weights_norm
+//   V      = sum_k w_k * silu(attn_v_exps[sel_k] @ xn)
+//
+// Three of those are load-bearing and cheap to get backwards:
+//   * the bias shifts SELECTION and never the weight. Adding it to `probs`
+//     changes the mixture, and on a 4-of-8 route it changes the value row.
+//   * the silu is applied to the EXPERT OUTPUT, before the weight, not to the
+//     input and not after the sum. `sum w_k silu(...)` is not `silu(sum w_k ...)`.
+//   * the renormalisation divides by the sum of the SELECTED probabilities, and
+//     is skipped entirely when the file does not ask for it -- a sigmoid router
+//     without the norm is a sum of independent gates, not a convex mix.
+//
+// The expert bank is resident and small (n_value_expert is 4-16 in every file
+// that ships this, against 128+ for the FFN bank), so it is a plain 3-D tensor
+// read with gemm_w over one expert's slice rather than an ExpertSource: no
+// residency policy, no prefetch, nothing to evict. A row is `kvw` wide, so
+// expert e starts at e*kvw rows.
+bool Engine::mova_value(const LayerWeights &L, i32 l, const void *xn, i32 n,
+                        i64 kvw, bool sigmoid_gate) {
+    const ModelConfig &mc = model_.cfg();
+    const i32 nv = mc.n_value_expert;
+    const i32 k = mc.n_value_expert_used > 0 ? mc.n_value_expert_used : 1;
+    if (nv <= 0 || !ws_vgate_ || !ws_vexp_) return false;
+    gemm_w(ws_vgate_, xn, L.attn_v_gate, nv, n_embd_, n);
+    be_->download_f32(vgate_host_.data(), ws_vgate_, static_cast<i64>(n) * nv);
+    // One expert slice of the bank, re-pointed per selection. The stride is the
+    // ROW BYTES of the weight's own dtype, not sizeof(f32): this is a quantized
+    // tensor in every file that carries it.
+    const i64 rb = static_cast<i64>(dtype_row_bytes(L.attn_v_exps.type,
+                                                    L.attn_v_exps.n_in));
+    be_->fill0(ws_v_, static_cast<size_t>(n) * static_cast<size_t>(kvw) *
+                          be_->act_size());
+    std::vector<i32> sel(static_cast<size_t>(k));
+    std::vector<f32> wt(static_cast<size_t>(k));
+    for (i32 t = 0; t < n; t++) {
+        const f32 *logits = vgate_host_.data() + static_cast<i64>(t) * nv;
+        // The decision is mmova's, not this loop's: MovaRoute::route is the
+        // oracle the suite calls directly, so there is one implementation of
+        // "bias selects, probability mixes, renorm divides by the selected
+        // sum" and a test that pins it is pinning what the engine runs.
+        MovaRoute::route(sel.data(), wt.data(), logits, L.attn_v_gate_b, nv, k,
+                         sigmoid_gate, mc.expert_w_norm);
+        for (i32 j = 0; j < k; j++) {
+            if (sel[static_cast<size_t>(j)] < 0) continue;
+            QuantTensor w = L.attn_v_exps;
+            w.data = static_cast<u8 *>(L.attn_v_exps.data) +
+                     static_cast<i64>(sel[static_cast<size_t>(j)]) * kvw * rb;
+            w.n_out = kvw;
+            gemm_w(ws_vexp_, xn, w, kvw, n_embd_, n);
+            // silu on the expert's OUTPUT, then the weight, then accumulate.
+            be_->silu_act(ws_vexp_, static_cast<i64>(n) * kvw);
+            // Row t of V only: this token's routed value, times its weight.
+            // A per-token axpy rather than a scatter is what keeps the loop
+            // above honest -- each token picks its own experts.
+            be_->axpy(act_at(ws_v_, be_->act_size(), static_cast<i64>(t) * kvw),
+                      ws_vexp_, wt[static_cast<size_t>(j)], kvw);
         }
     }
     return true;
