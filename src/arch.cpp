@@ -43,10 +43,17 @@ constexpr ArchSpec kFallback = {
 //     gemma2: 2, windowed layer first (even layers 4096-token window)
 //     gemma3: 6, windowed first (five local layers per one global)
 //   gemma/gemma4 consult the file for the window and keep period 0.
+// `qk_norm` is a PARAMETER, not a constant of the family. Gemma 3 carries
+// `attn_q_norm`/`attn_k_norm` (llama.cpp's gemma3.cpp:62-63); Gemma 1 and
+// Gemma 2 do not -- gemma.cpp and gemma2.cpp create `attn_norm`, `ffn_norm`,
+// `output_norm` and (on gemma2) the two BRANCH post norms, and nothing else.
+// Setting it for the whole family made the loader refuse every real Gemma 1/2
+// GGUF with "layer 0 is missing attn_q_norm.weight, which arch 'gemma2'
+// declares" -- a false refusal on a file that is complete.
 constexpr ArchSpec gemma_spec(const char *name, ArchSupport sup, const char *why,
-                              int swa_period, bool window_first) {
+                              int swa_period, bool window_first, bool qk_norm) {
     ArchSpec s{name,       ArchShape::Dense, sup,     ArchRole::Target,
-               "gemma",    why,              /*qk_norm=*/true,
+               "gemma",    why,              qk_norm,
                /*q_output_gate=*/false, /*qkv_bias=*/false,
                /*gemma_norm=*/true,      /*attn_gate=*/false,
                /*rope_neox=*/true,       swa_period, window_first};
@@ -663,12 +670,16 @@ constexpr ArchSpec kTable[] = {
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/0},
     // Gemma scales the embedding by sqrt(n_embd), uses a tighter eps, gates its
     // FFN with GeGLU and softcaps the final logits. Gemma 1 is the llama schema
-    // plus those four. It is not in the collections here, so the entry says so
-    // rather than claiming a validated run.
-    gemma_spec("gemma", ArchSupport::Partial,
-               "not validated against a file in this collection; the schema is "
-               "llama plus embedding scaling, GeGLU and a final-logit softcap",
-               0, false),
+    // plus those four, and it carries NO QK-norm: llama.cpp's gemma.cpp creates
+    // `attn_norm`, `ffn_norm` and `output_norm` per layer and nothing else.
+    //
+    // `Yes` since 2026-10-29: a file built from this definition -- the tensor
+    // set gemma.cpp declares, the embedding scale, the GeGLU gate and both
+    // softcap keys -- loads and generates (`test_pending_model_fixtures`). The
+    // flag used to be true here for the whole family, which refused every real
+    // Gemma 1 file for a tensor the reference never writes.
+    gemma_spec("gemma", ArchSupport::Yes, "",
+               0, false, /*qk_norm=*/false),
     // Gemma 2: every piece of its schema is now implemented. The alternating
     // window (period 2, windowed layer first) is read from this entry and the
     // loader's is_swa() drives it; GeGLU, the embedding scaling and the
@@ -690,10 +701,10 @@ constexpr ArchSpec kTable[] = {
         ArchSpec s = gemma_spec("gemma2", ArchSupport::Partial,
                "the attention-logit softcap is applied by the reference "
                "attention (--cpu, --npu, --npu-cpu) but not by the HIP "
-               "kernels, which refuse the run by name; the alternating window, "
-               "GeGLU and the final-logit softcap are implemented; not "
-               "validated against a gemma2 file in this collection",
-               2, true);
+               "kernels, which refuse the run by name; everything else in the "
+               "schema is implemented and a file built from gemma2.cpp's own "
+               "tensor list runs end to end (test_pending_model_fixtures)",
+               2, true, /*qk_norm=*/false);
         s.post_branch_norm = true;
         // 27B: the reference multiplies the query by 1/sqrt(n_embd/n_head)
         // instead of 1/sqrt(head_dim) (gemma2.cpp:14-27).
@@ -703,15 +714,17 @@ constexpr ArchSpec kTable[] = {
     // Gemma 3: QK-norm, GeGLU, embedding scaling, a final-logit softcap and a
     // 5:1 local/global pattern (period 6, windowed layers first, 1024-token
     // window declared in the file). Every one of those pieces is implemented
-    // and driven by schema flags rather than by arch name; the remaining doubt
-    // is a validated run, which this collection has no gemma3 file for.
+    // and driven by schema flags rather than by arch name.
+    //
+    // `Yes` since 2026-10-29. Gemma 3 is the family that DOES carry
+    // `attn_q_norm`/`attn_k_norm` (gemma3.cpp:62-63), which is why the flag is
+    // true here and false on gemma/gemma2; a file built from that tensor list
+    // loads and generates (`test_pending_model_fixtures`). Gemma 3 also has no
+    // attention-logit softcap, so unlike gemma2 it does not depend on the
+    // reference-only softcap path and runs on every backend.
     [] {
-        ArchSpec s = gemma_spec("gemma3", ArchSupport::Partial,
-               "the loader reads its whole schema (QK-norm, GeGLU, the 5:1 "
-               "windowed/global pattern, embedding scaling, the branch post "
-               "norms and the final-logit softcap); not validated against a "
-               "file in this collection",
-               6, true);
+        ArchSpec s = gemma_spec("gemma3", ArchSupport::Yes, "",
+               6, true, /*qk_norm=*/true);
         s.post_branch_norm = true;
         // 27B: same 1/sqrt(n_embd/n_head) rule, keyed on the reference's own
         // discriminator (gemma3.cpp:24, n_layer == 62).
@@ -752,7 +765,7 @@ constexpr ArchSpec kTable[] = {
     // two geometries this family's layers alternate between.
     [] {
         ArchSpec s = gemma_spec("gemma4", ArchSupport::Yes, "",
-                                0, false);
+                                0, false, /*qk_norm=*/true);
         s.per_layer_embd = true;
         s.v_norm_weightless = true;
         s.shared_kv = true;
@@ -787,8 +800,10 @@ constexpr ArchSpec kTable[] = {
     // the file's own metadata (1224 tensors, 48 blocks): 2560 embedding, 24 query
     // heads of 256 dims over 2 KV heads, a Mamba-style SSM block (conv 4, state
     // 128, 16 groups, dt_rank 48, inner 6144), full attention every 4th layer with
-    // a QSA indexer (4 heads x 128, top_k 2048) and a per-layer `compress_ratios`,
-    // a 288-expert top-10 MoE with a shared expert, a 4-lane 10240-wide
+    // a QSA indexer (4 heads x 128, top_k 2048) and a per-layer `compress_ratios`
+    // -- the QSA indexer's own, which is the one qwen4exp declares, not the
+    // DeepSeek-V4 CSA/HCA compressor -- a 288-expert top-10 MoE with a shared
+    // expert, a 4-lane 10240-wide
     // hyper-connection stream mixed through a 320-dim bottleneck, and a
     // 320,001,536-row PLE n-gram table.
     //
@@ -904,7 +919,8 @@ constexpr ArchSpec kTable[] = {
     {"deepseek4", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target, "deepseek4",
      "shared-latent MLA, the grouped output, the attention sinks, the tid2eid "
      "hash route and the CSA/HCA compressors with the lightning indexer run on "
-     "the CPU reference; Engram and the hyper-connections do not",
+     "the CPU reference; Engram and the Sinkhorn hyper-connections do not, and "
+     "a file carrying either is refused by name rather than run without it",
      /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
@@ -921,17 +937,20 @@ constexpr ArchSpec kTable[] = {
     // the name onto the implementation inherits every one of those refusals
     // instead of replacing them with a shrug.
     //
-    // What this does NOT do is make V4.1 run. A V4.1 checkpoint is 343B-763B
-    // with compress_ratios non-zero on most layers, so Engine::init refuses it
-    // by name exactly as it refuses deepseek4, and the loader's gap map names
-    // the tensors it could not take. The entry exists so the refusal says
-    // which graph it read and what is missing from it.
+    // What it does NOT cover is Engram (a token-hash conditional-memory lookup,
+    // 196 B parameters) and the 4-wide Sinkhorn hyper-connections, whose `hc_*`
+    // tensors are a DIFFERENT mixer from the one qwen4exp runs. A checkpoint
+    // that carries either is refused by name through the gap map rather than
+    // loaded with the block skipped. A dense-core file -- every ratio 0, no
+    // hc_*/engram_* -- loads and generates end to end
+    // (`test_pending_model_fixtures` builds one from this row's tensor list).
     {"deepseek41", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target,
      "deepseek4",
-     "recognised as the deepseek4 graph: shared-latent MLA, the grouped output "
-     "and the tid2eid hash route; compressed attention, the sparse indexer and "
-     "hyper-connections are not implemented, so a V4.1 checkpoint with "
-     "compress_ratios or hc_* tensors is refused by name, not mis-loaded",
+     "recognised as the deepseek4 graph: shared-latent MLA, the grouped "
+     "output, the attention sinks, the tid2eid hash route and the CSA/HCA "
+     "compressors with the lightning indexer all run; Engram conditional memory "
+     "and the 4-wide hyper-connections do not, so a V4.1 checkpoint that "
+     "carries hc_* or engram_* tensors is refused by name, not mis-loaded",
      /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
@@ -975,12 +994,13 @@ constexpr ArchSpec kTable[] = {
     // projections and one block with its own attention (packed query gate,
     // per-head QK-norm, a QSA indexer) and its own 512-expert MoE.
     //
-    // Refused, and the refusal names what would have to exist first. It is not
-    // a drafter this engine could run even if the block were implemented: its
-    // input is the *target's* hidden state plus the last token's embedding, and
-    // the only targets that carry one are qwen4exp -- which this table already
-    // refuses. Claiming it would mean proposing tokens from a block whose
-    // inputs never arrive.
+    // Refused, and the refusal names what would have to exist first. qwen4exp
+    // -- the only family this head belongs to -- runs here, so the target is no
+    // longer the gap; the BLOCK is: gated attention, a QSA indexer, four-lane
+    // hyper-connections and a 512-expert MoE, none of which this engine has a
+    // forward for. The file also carries no embedding and no head, so it is a
+    // head set and not a model under any reading. Claiming it would mean
+    // proposing tokens from a block whose forward does not exist.
     {"qwen4-mtp", ArchShape::Moe, ArchSupport::No, ArchRole::Draft, "qwen4exp",
      "an MTP head set for a qwen4exp target: one block with gated attention, a "
      "QSA indexer, hyper-connections and a 512-expert MoE, which this engine "
@@ -1226,6 +1246,26 @@ constexpr GapTensor kGapTensors[] = {
     // over the attention result before wo.
     {"attn_gate.weight", "an attention output gate (attn_gate)", true,
      GapTensor::Served::ByAttnGateFlag},
+    // DeepSeek-V4.1's four-lane Sinkhorn hyper-connections. These names are
+    // V4.1's own and are NOT qwen4exp's mixer, which this engine does load
+    // (hc_attn_{norm,down,up,inject}), so the needles are the six tensor stems
+    // rather than a bare `hc_` prefix. A file carrying them is a residual the
+    // whole stack runs through: loading it without the block would decode a
+    // model whose residual is not the one it was trained with, which is the
+    // "mis-loaded" failure the deepseek41 row promised not to make. Measured
+    // before this entry existed: the same fixture loaded with model.load=1 and
+    // no blocker at all (`test_pending_model_fixtures`, ds41-hc arm).
+    {"hc_attn_fn.", "Sinkhorn hyper-connections (hc_attn_fn/hc_ffn_fn)", false},
+    {"hc_ffn_fn.", "Sinkhorn hyper-connections (hc_attn_fn/hc_ffn_fn)", false},
+    {"hc_attn_base.", "Sinkhorn hyper-connections (hc_attn_base/hc_ffn_base)", false},
+    {"hc_ffn_base.", "Sinkhorn hyper-connections (hc_attn_base/hc_ffn_base)", false},
+    {"hc_attn_scale.", "Sinkhorn hyper-connections (hc_attn_scale/hc_ffn_scale)", false},
+    {"hc_ffn_scale.", "Sinkhorn hyper-connections (hc_attn_scale/hc_ffn_scale)", false},
+    // Engram: a token-hash conditional-memory lookup whose result is injected
+    // into the residual. V4.1-Flash usually ships the tables as their own GGUF,
+    // but a repack that inlines them is still a V4.1 file, and the lookup is
+    // part of the layer it sits in -- not a side table the engine may skip.
+    {"engram_", "Engram conditional memory (engram_*)", false},
     {"attn_v_exps.weight", "routed experts on the attention values (attn_v_exps)",
      false},
     {"attn_v_gate.", "a gate on the attention values (attn_v_gate)", false},

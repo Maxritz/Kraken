@@ -22,6 +22,44 @@ Status legend: **todo** · **done** · **blocked (why)**
 | B2 | P1 | MiniCPM3 residual scale on **both** branches (`ArchSpec::residual_scale_ffn` → gemm + scale + add in `dense_ffn`) | `test_minicpm3_scales`: flag on the config, `attn_out_scale == 1.4/√n_layer`, 4-layer run finite (a double add would leave f16 range) |
 | B3 | P2 | windowed layers rotate with PLAIN rope when the stack is YaRN-scaled (`ArchSpec::swa_plain_rope`, mellum + olmo2) | `test_family_scales` (5): a YaRN mellum file's windowed table differs from its full-layer table; the unscaled control has one table for both |
 
+## Pending-model pass (2026-10-29)
+
+Every row in `src/arch.cpp` that was not `Yes` now has a fixture built from that
+family's OWN definition (llama.cpp's declared tensor list plus the metadata its
+loader reads), taken through `assess -> Model::load -> Engine::init -> generate`,
+and deleted again. Two groups own the claims, so a family is never measured two
+ways:
+
+* `test_pending_model_fixtures` (36 checks) — the families that RUN.
+* `test_pending_model_refusals` (24 checks) — the families that do not, where the
+  assertion is that the refusal is the ROW's and NAMES the missing piece (an
+  unknown arch string is refused too, so a bare refusal would prove nothing).
+
+| row | before | fixture result | now |
+|-----|--------|----------------|-----|
+| `gemma` | Partial (unvalidated) | loads, inits, generates — once the family's QK-norm constant was removed | **Yes** |
+| `gemma2` | Partial (softcap) | loads, inits, generates on CPU | **Partial**, reason still true: the attention-logit softcap is applied by the reference attention only, so a HIP build refuses BY CAPABILITY |
+| `gemma3` | Partial | loads, inits, generates, `qk_norm=1`, `swa=1024` | **Yes** |
+| `qwen2vl` | Partial | text tower runs; a file WITH `v.blk.*`/`mm.*` also runs and the report names the vision tower it cannot read | **Partial**, honest: images are ignored |
+| `qwen3vl` | Partial | text tower runs, `qk_norm=1` | **Partial**, same |
+| `deepseek41` | Partial | dense-core file runs the whole deepseek4 graph | **Partial**: Engram and the Sinkhorn hyper-connections are real gaps |
+| `gpt-oss` | Partial | loads, inits, generates on its own schema | **Partial** (loader schema only) |
+| `deepseek4` | Partial | covered by C1 above | **Partial** |
+| `k2-horizon` | No | refused, names "routed experts on the attention values (attn_v_exps)" | **No** |
+| `minimax-m3` | No | refused, names MiniMax Sparse Attention | **No** |
+| `diffuse` | No | refused, names block diffusion | **No** |
+| `dspark` | No | refused, names its markov head | **No** |
+| `deepseek4-dspark` | No | refused, names the multi-token-prediction head shard | **No** |
+| `qwen4-mtp` | No | refused, names the qwen4exp target it belongs to | **No** |
+
+### Defects this pass found
+
+| ID | P | Item | Closing check |
+|----|---|------|---------------|
+| D1 | **P0** | `gemma_spec` set `qk_norm` for the whole family, so a real Gemma-1 or Gemma-2 file was refused for `attn_q_norm.weight` — a tensor llama.cpp's gemma.cpp/gemma2.cpp never create. Every Gemma 1/2 checkpoint was rejected by a constant, not by a graph. | per-row flag; `test_arch_table` now asserts true for gemma3/gemma4 and false for gemma/gemma2. Control observed: with `qk_norm=true` restored, the gemma2 fixture is refused with "layer 0 is missing attn_q_norm.weight, which arch 'gemma2' declares" |
+| D2 | **P0** | A `deepseek41` file carrying V4.1's `hc_attn_fn`/`hc_attn_base`/`hc_attn_scale` tensors LOADED with `model.load=1` and no blocker recorded — the row promised "refused by name, not mis-loaded", and the loader silently dropped the residual the whole stack runs through. Engram had the same hole (`engram_*` was a note, not a gap). | `kGapTensors` entries for the six Sinkhorn stems and `engram_`; `test_pending_model_fixtures` ds41-hc arm asserts the refusal, and `test_load_verdict`'s Engram control now asserts the shape rule is cleared while Engram refuses. Control observed: before the entries, the same arm printed "verdict runnable but expected the opposite; no blocker was recorded; model.load=1" |
+| D3 | P3 | The vision caveat on `qwen2vl`/`qwen3vl` is the ROW's reason, so a text-only file carries it too. | NOT A DEFECT — conservative and never silent; measured and asserted in the qwen2vl arm so it cannot be mistaken for tensor-level detection later |
+
 ## Open
 
 Every row below is CLOSED as of this commit; the closing check names the
