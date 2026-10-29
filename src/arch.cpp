@@ -431,9 +431,11 @@ constexpr ArchSpec kTable[] = {
     {"qwen2moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "qwen2", "",
      false, false, true, false, false, true, 0, false, /*expert_w_norm=*/0},
     // Qwen1: llama's block with a FUSED q/k/v projection (`attn_qkv`, one row
-    // of Q | K | V) and the NeoX rope pairing, no biases anywhere. Qwen2
-    // splits the projection again, which is why this is its own entry rather
-    // than a flag on `qwen2`.
+    // of Q | K | V) and the NeoX rope pairing. The fused row carries a MANDATORY
+    // `attn_qkv.bias` of the same width (`src/models/qwen.cpp` creates it with
+    // flags 0, so every file has one) -- the loader reads it as `qkv_bias` and
+    // the engine adds its three slices to q/k/v. Qwen2 splits the projection
+    // again, which is why this is its own entry rather than a flag on `qwen2`.
     [] {
         ArchSpec s{"qwen", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
                    "llama", "", false, false, false, false};
@@ -452,33 +454,68 @@ constexpr ArchSpec kTable[] = {
         return s;
     }(),
     // ---- llama's schema with a piece renamed, a flag, or a scalar ---------
-    // Five families whose graphs are llama's, each with one thing of its own.
+    // A handful of families whose graphs are llama's, each with one thing of
+    // its own (or -- OLMo-1 -- with its norms missing entirely).
     // The reference is `src/models/*.cpp` at llama.cpp f5222f25; every claim
     // below is read off that family's own builder, not inferred from the name.
     //
-    // OLMo (allenai OLMo-1/2 7B/1B): llama's tensors, llama's NORM rope
-    // pairing, an ungated-silu FFN and no biases anywhere. Nothing to add.
-    {"olmo", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
-     false, false, false, false},
+    // OLMo-1 (allenai OLMo 1B/7B/70B): llama's block with the NORM rope pairing,
+    // an ungated-silu FFN, no biases -- and two pieces of its own that are not
+    // in any tensor, which is why this row was wrong for two releases:
+    //
+    //   * EVERY norm is WEIGHTLESS. `src/models/olmo.cpp` calls
+    //     `build_norm(inpL, NULL, NULL, LLM_NORM)` for the attention norm, the
+    //     FFN norm and the final norm, and its tensor list creates no
+    //     `attn_norm`/`ffn_norm`/`output_norm` at all. Listing the family
+    //     against the llama base therefore refused every complete checkpoint
+    //     ("layer 0 is missing its norm weights") -- a wrong refusal, not a
+    //     wrong answer.
+    //   * the attention projection is CLAMPED to `attention.clamp_kqv` before
+    //     the rotary (the reference reads LLM_KV_ATTENTION_CLAMP_KQV and the
+    //     converter writes `clip_qkv: 8.0` from every OLMo-1 config). The
+    //     loader now reads the key and the engine applies it; left out, the
+    //     layer sees unbounded q/k/v and the answer is plausible and wrong.
+    [] {
+        ArchSpec s{"olmo", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+                   "llama", "", false, false, false, false};
+        s.noweight_norm = true;
+        return s;
+    }(),
     // XVERSE: the same, and the same rope pairing. Its 40B/65B checkpoints
     // carry a partial-rotary `rope.dimension_count`, which is read per model
     // rather than per arch.
     {"xverse", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
      false, false, false, false},
-    // OLMo 2/3: per-head QK norm (head-width weights, the qwen3 shape) and the
-    // NEOX rope pairing, and -- the part that is not llama -- a post norm on
-    // EACH branch before it is added:
+    // OLMo 2/3: WIDE QK norm, the NEOX rope pairing, a sliding-window pattern,
+    // and -- the part that is not llama -- a post norm on EACH branch before it
+    // is added:
     //     x += attn_post_norm(attn(attn_norm(x)))
     //     x += ffn_post_norm(ffn(ffn_norm(x)))
     // which is gemma2/3's `post_branch_norm` with different tensor names
     // (`post_attention_norm` / `post_ffw_norm`, which the loader already binds
     // under that flag) and OLMo's own rope.
+    //
+    // The norm WIDTH is the family's own shape and was described here as "per
+    // head, the qwen3 shape" -- it is not. `src/models/olmo2.cpp` applies both
+    // norms to the PROJECTED row before the head split:
+    //     attn_q_norm = {n_embd}                = n_head * n_embd_head
+    //     attn_k_norm = {n_head_kv * n_embd_head}
+    // so q is one RMS over the whole query row and k is one RMS over the whole
+    // key row -- which on a GQA stack is NARROWER than n_embd (8 KV heads of
+    // 128 on the 7B is 1024 against 4096). The loader's width check accepted
+    // only `head_dim` or `n_embd`, so every GQA file of this family was refused
+    // with "neither head_dim nor the full row"; it now accepts each branch's
+    // own row width (see Model::load's qk_norm block).
+    //
+    // The window pattern is `load_swa_pattern(ml, 4)`, whose default is
+    // dense_first = false: layers 0..2 windowed, layer 3 full.
     [] {
         ArchSpec s{"olmo2", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
                    "llama", "", /*qk_norm=*/true, /*q_output_gate=*/false,
                    /*qkv_bias=*/false, /*gemma_norm=*/false,
                    /*attn_gate=*/false, /*rope_neox=*/true};
         s.post_branch_norm = true;
+        s.swa_window_first = true;
         return s;
     }(),
     // Seed-OSS: NEOX rope, silu FFN, an `attn_output.bias`, and its FFN input
@@ -491,8 +528,11 @@ constexpr ArchSpec kTable[] = {
      false, false, false, false, false, true},
     // SmolLM3: llama's schema and rope pairing plus a NoPE pattern -- every
     // fourth layer rotates nothing (`n_no_rope_layer_step = 4` in the
-    // reference; `(l + 1) % 4 != 0` is when rope runs) -- and an
-    // `attn_output.bias`, which the loader reads for every family.
+    // reference; `(l + 1) % 4 != 0` is when rope runs). This comment used to
+    // claim an `attn_output.bias` as well: the reference creates none
+    // (`src/models/smollm3.cpp` loads exactly llama's tensors), and the loader
+    // reads `attn_output.bias` only when a file carries it, so the claim was
+    // wrong about the family rather than about the reading.
     [] {
         ArchSpec s{"smollm3", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
                    "llama", "", false, false, false, false};
@@ -1018,6 +1058,18 @@ constexpr ArchSpec kTable[] = {
         s.post_norm_eps = 1e-8f;
         s.embd_rms_noweight = true;
         s.rope_swa_only = true;
+        // The window pattern is `load_swa_pattern(ml, 4)`, whose default is
+        // dense_first = false -- layers 0..2 windowed, layer 3 full. The file
+        // MAY spell the pattern out as an array (`attention.sliding_window_pattern
+        // = [1,1,1,0,...]`), and the loader reads that first; this flag is the
+        // fallback for a file that declares only the window width. Without it
+        // the windowed set was the other three layers, and since this family
+        // rotates ONLY on its windowed layers, that is a different model: the
+        // rotating layers and the windowed layers would both be wrong at once.
+        s.swa_window_first = true;
+        // The head's output is scaled by `<arch>.logit_scale` before the
+        // (optional) final-logit softcap. Read per file into
+        // ModelConfig::logit_scale and applied in Engine::logit_head.
         return s;
     }(),
     // spark2_5: llama's block with a fused `attn_qkv` row and a per-head

@@ -420,6 +420,21 @@ struct ModelConfig {
     // above -- it changes the probabilities, not just their log-scale -- so it
     // belongs inside attention (AttnDesc::softcap). 0 disables it.
     f32 attn_softcap = 0.0f;
+    // muse-glimmer multiplies the head's output by `<arch>.logit_scale` BEFORE
+    // the final-logit softcap (`cur = ggml_scale(cur, hparams.f_logit_scale)` in
+    // src/models/muse-glimmer.cpp). It is not the same thing as the softcap and
+    // it does not divide out: with a cap the composed function is
+    // cap*tanh(s*x/cap), not s*cap*tanh(x/cap), and even without one the scale
+    // changes the temperature-relative distribution the sampler draws from. The
+    // reference REQUIRES the key on that family (`get_key` with no optional
+    // flag), so a muse-glimmer file always carries it; every other family
+    // leaves it at 1.0 and the multiply is skipped.
+    f32 logit_scale = 1.0f;
+    // OLMo-1 bounds the attention projections: `attention.clamp_kqv` (8.0 in
+    // every OLMo-1 config, `clip_qkv` on the HF side) clamps q, k and v to
+    // [-c, +c] after the projection and the bias, before the rotary. 0 means
+    // the file declares no clamp, which is every other family.
+    f32 attn_clamp_kqv = 0.0f;
     bool tied_embeddings = false;
     bool has_bias = false;
     bool qk_norm = false;
@@ -438,6 +453,11 @@ struct ModelConfig {
     // means the projection cannot fold its residual store into the GEMM epilogue
     // (the norm has to read the projection first).
     bool post_branch_norm = false;
+    // Every norm in the stack is weightless and the file carries no norm
+    // tensors at all (OLMo-1; see ArchSpec::noweight_norm). The loader stops
+    // requiring `attn_norm`/`ffn_norm`/`output_norm` and the engine hands the
+    // null weight to Backend::rmsnorm, which is its weightless case.
+    bool noweight_norm = false;
     f32 post_norm_eps = 0.0f; // 0 keeps rms_eps (muse-glimmer's are 1e-8)
     // The gate activation differs by family while the tensor shape does not:
     // laguna softplus's `attn_gate`, muse-glimmer sigmoids it.
