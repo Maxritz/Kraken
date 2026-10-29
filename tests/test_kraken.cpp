@@ -3507,7 +3507,9 @@ static bool plain_logits_of(const std::string &path, std::vector<f32> &lg,
 // net layers. Deliberately tiny (d_state 8, 2 key / 4 value heads) so the CPU
 // oracle can run it, but structurally identical to the 35B checkpoint's schema.
 static bool build_tiny_gdn_model(const std::string &path, int n_layer,
-                                 int interval) {
+                                 int interval,
+                                 const char *arch_name = "qwen35moe",
+                                 bool dense = false) {
     const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
     const int d_state = 8, n_k_head = 2, n_v_head = 4, conv_k = 4;
     const int rope_dim = 4;
@@ -3517,7 +3519,7 @@ static bool build_tiny_gdn_model(const std::string &path, int n_layer,
     const int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32, n_expert = 4, vocab = 260,
               ctx = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
-    const std::string arch = "qwen35moe";
+    const std::string arch = arch_name;
 
     GgufBuilder b;
     b.meta_str("general.architecture", arch);
@@ -3541,11 +3543,14 @@ static bool build_tiny_gdn_model(const std::string &path, int n_layer,
     b.meta_u32(arch + ".ssm.group_count", static_cast<u32>(n_k_head));
     b.meta_u32(arch + ".ssm.inner_size", static_cast<u32>(value_dim));
     b.meta_u32(arch + ".full_attention_interval", static_cast<u32>(interval));
-    // MoE geometry, identical to the qwen2moe path.
-    b.meta_u32(arch + ".expert_count", static_cast<u32>(n_expert));
-    b.meta_u32(arch + ".expert_used_count", 2);
-    b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
-    b.meta_u32(arch + ".expert_shared_feed_forward_length", static_cast<u32>(n_ff_sh));
+    // MoE geometry, identical to the qwen2moe path. qwen35 (the dense sibling)
+    // declares none of it, and the loader reads a layer's FFN from the tensors.
+    if (!dense) {
+        b.meta_u32(arch + ".expert_count", static_cast<u32>(n_expert));
+        b.meta_u32(arch + ".expert_used_count", 2);
+        b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
+        b.meta_u32(arch + ".expert_shared_feed_forward_length", static_cast<u32>(n_ff_sh));
+    }
     add_spm_vocab(b, vocab);
 
     auto vec = [](size_t n, i64 base) {
@@ -3631,6 +3636,16 @@ static bool build_tiny_gdn_model(const std::string &path, int n_layer,
             b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
         }
 
+        if (dense) {
+            // qwen35: the same mixer stack with a plain gated MLP.
+            b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                         vec(static_cast<size_t>(n_embd) * n_ff, 500));
+            b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                         vec(static_cast<size_t>(n_embd) * n_ff, 900));
+            b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                         vec(static_cast<size_t>(n_ff) * n_embd, 1300));
+            continue;
+        }
         // ---- MoE FFN, shared by both layer kinds ----
         std::vector<f32> router(static_cast<size_t>(n_embd) * n_expert);
         for (size_t i = 0; i < router.size(); i++) router[i] = wv(static_cast<i64>(i) * 3 + 7);
@@ -12886,7 +12901,8 @@ static bool build_dflash_target(const std::string &path) {
 // usable here (fc's 64-wide feature row, ffn_down's 64-wide intermediate).
 static bool build_dflash_head_set(const std::string &path, int mask_id,
                                   const std::string &which = std::string(),
-                                  bool nvfp4 = false, bool laguna = false) {
+                                  bool nvfp4 = false, bool laguna = false,
+                                  const char *arch_name = nullptr) {
     const int n_embd = 32, n_layer = 2, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
     const int n_target_layers = 2;           // captures 0 (input) + 1 (pre-final)
@@ -12904,7 +12920,12 @@ static bool build_dflash_head_set(const std::string &path, int mask_id,
     //                  `dflash_aux_hidden_norm.N.weight`), the FFN norm is called
     //                  `post_attention_norm`, and `vocab_size` is not written at
     //                  all -- so the drafter has to size itself from the target.
-    const std::string arch = laguna ? "dflash-draft" : "dflash";
+    // The THIRD entry in the table that names this same head set: qwen35's
+    // own export, which uses poolside's underscore tensor names under its own
+    // metadata prefix. `arch_name` lets one builder serve all three, so the
+    // arms differ in the name and never in the numbers.
+    const std::string arch = arch_name ? std::string(arch_name)
+                                       : (laguna ? "dflash-draft" : "dflash");
     auto K = [&](const char *suffix) { return arch + suffix; };
 
     GgufBuilder b;
@@ -13052,6 +13073,43 @@ static void test_dflash_laguna_spelling() {
     for (size_t i = 0; i < std::min(a_rows.size(), b_rows.size()); i++)
         worst = std::max(worst, std::fabs(a_rows[i] - b_rows[i]));
     CHECK(worst == 0.0f, "and the same numbers: a spelling moves names, not values");
+}
+
+// The fourth spelling question, and the one the table had no file for:
+// `qwen35-dflash-draft` is the SAME head set under its own metadata prefix
+// (`qwen35-dflash-draft.*`) with poolside's underscore tensor names. The row
+// exists so the name is not refused before the dflash loader sees it, so the
+// arm has to show the loader takes it and drafts the same rows as the others.
+static void test_dflash_qwen35_spelling() {
+    const char *target = "kraken-dflash-q35-target.gguf";
+    CHECK(build_dflash_target(target), "wrote the qwen35 DFlash target model");
+    const std::string canonical = "kraken-dflash-q35-canonical.gguf";
+    const std::string q35 = "kraken-dflash-q35.gguf";
+    CHECK(build_dflash_head_set(canonical, 12), "wrote the canonical head set");
+    CHECK(build_dflash_head_set(q35, 12, std::string(), false, /*laguna=*/true,
+                                "qwen35-dflash-draft"),
+          "wrote the qwen35-prefixed head set");
+    const ArchSpec *row = arch_lookup("qwen35-dflash-draft");
+    CHECK(row && row->role == ArchRole::Draft &&
+              std::string_view(row->family ? row->family : "") == "dflash",
+          "the qwen35 draft row still points at the dflash loader");
+    std::vector<f32> a_rows, b_rows;
+    std::string ea, eb;
+    const bool ok_a = dflash_rows_of(target, canonical, a_rows, ea);
+    const bool ok_b = dflash_rows_of(target, q35, b_rows, eb);
+    if (!ok_a) std::fprintf(stderr, "  (canonical: %s)\n", ea.c_str());
+    if (!ok_b) std::fprintf(stderr, "  (qwen35 spelling: %s)\n", eb.c_str());
+    CHECK(ok_a && ok_b, "the qwen35-prefixed head set loads and drafts");
+    if (!ok_a || !ok_b) return;
+    CHECK(a_rows.size() == b_rows.size(), "and drafts the same number of rows");
+    f32 worst = 0.0f;
+    for (size_t i = 0; i < std::min(a_rows.size(), b_rows.size()); i++)
+        worst = std::max(worst, std::fabs(a_rows[i] - b_rows[i]));
+    CHECK(worst == 0.0f,
+          "with the same numbers: the prefix is a name, not a graph");
+    std::remove(target);
+    std::remove(canonical.c_str());
+    std::remove(q35.c_str());
 }
 
 // NVFP4 global scales on a DFlash head set. The drafter has its own weight
@@ -21663,6 +21721,217 @@ static void test_dsv4_hash_route() {
 // head can argmax one token and stop, and this repo has already been bitten by a
 // gate that compared only the sampled token (the attention rewrite produced the
 // same first token from two different kernels).
+// ---- the row fixtures: the tensor set the ROW's own flags imply ----------
+//
+// A `Yes` row is a claim that a file of that family loads and runs. The claim
+// is only worth what a file says, so this builder writes the tensors
+// `ArchSpec` says the family carries -- fused q|k|v, per-head QK-norm, q/k/v
+// biases, a separate attention gate, branch post-norms, a fused gate|up row --
+// rather than a hand-written list per name. When a row's flags and its family's
+// real tensor list disagree, the load refuses and the arm fails, which is the
+// point: the row and the loader are checked against each other, not against a
+// comment.
+struct RowFix {
+    std::string arch;
+    int n_layer = 2;
+    int n_expert = 0;          // > 0 => an expert bank instead of a dense FFN
+    int n_expert_used = 2;
+    bool shared_expert = false;
+    bool router_sigmoid = false;
+    f32 window = 0.0f;         // attention.sliding_window, when the file says one
+    // Value written into the three NORM biases (attn_norm, ffn_norm,
+    // output_norm). 0 writes them as zeros -- the shape a real Phi-MoE file has,
+    // with the value muted so a twin pair measures whether the bias reaches the
+    // graph at all.
+    f32 norm_bias = 0.0f;
+    // The projections and the head: Phi-MoE carries `attn_qkv.bias`,
+    // `attn_output.bias` and `output.bias` on every file.
+    bool proj_bias = false;
+};
+
+static bool build_row_fixture(const std::string &path, const RowFix &f) {
+    const ArchSpec &as = arch_spec(f.arch);
+    const int n_embd = 32, n_head = 4, hd = 8, n_ff = 64;
+    // GPT-2 is plain multi-head attention, so its K and V rows are n_embd wide
+    // like Q's -- a file with fewer KV heads is a different (GQA) family, and
+    // the fused 3*n_embd row is what the loader checks for.
+    const int n_kv = as.gpt2_style ? n_head : 2;
+    const int n_ff_exp = 64, n_ff_sh = 32, vocab = 260, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string &arch = f.arch;
+    const bool moe = f.n_expert > 0;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-row-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(f.n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_u32(arch + ".attention.value_length", static_cast<u32>(hd));
+    b.meta_u32(arch + ".rope.dimension_count", static_cast<u32>(hd));
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    if (f.window > 0.0f)
+        b.meta_u32(arch + ".attention.sliding_window", static_cast<u32>(f.window));
+    if (moe) {
+        b.meta_u32(arch + ".expert_count", static_cast<u32>(f.n_expert));
+        b.meta_u32(arch + ".expert_used_count",
+                   static_cast<u32>(f.n_expert_used));
+        if (f.shared_expert) {
+            b.meta_u32(arch + ".expert_shared_count", 1);
+            // The shared branch's own width, which glm4-moe declares and which
+            // the loader checks each `ffn_*_shexp` row against.
+            b.meta_u32(arch + ".expert_shared_feed_forward_length",
+                       static_cast<u32>(n_ff_sh));
+        }
+    }
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base, f32 scale) {
+        std::vector<f32> out(n);
+        for (size_t i = 0; i < n; i++)
+            out[i] = scale * wv(base + static_cast<i64>(i));
+        return out;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    auto zeros = [](size_t n) { return std::vector<f32>(n, 0.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0, 1.0f));
+    // GPT-2's absolute position table; every other family rotates instead.
+    if (as.learned_pos)
+        b.tensor_f16("position_embd.weight", {u64(ctx), u64(n_embd)},
+                     vec(static_cast<size_t>(ctx) * n_embd, 9000, 0.05f));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    if (as.ln_bias || f.norm_bias != 0.0f || f.proj_bias)
+        b.tensor_f32("output_norm.bias", {u64(n_embd)},
+                     std::vector<f32>(n_embd, f.norm_bias));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+
+    for (int l = 0; l < f.n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        // --- attention norms ---
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (as.ln_bias || f.norm_bias != 0.0f || f.proj_bias)
+            b.tensor_f32(p + "attn_norm.bias", {u64(n_embd)},
+                         std::vector<f32>(n_embd, f.norm_bias));
+        // --- the query/key/value rows, in the layout the row declares ---
+        if (as.fused_qkv) {
+            std::vector<f32> w;
+            w.reserve(static_cast<size_t>(n_embd) * (q_dim + 2 * kv_dim));
+            for (f32 x : vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f))
+                w.push_back(x);
+            b.tensor_f16(p + "attn_qkv.weight", {u64(n_embd), u64(q_dim + 2 * kv_dim)}, w);
+            if (as.qkv_bias || f.proj_bias)
+                b.tensor_f32(p + "attn_qkv.bias", {u64(q_dim + 2 * kv_dim)},
+                             zeros(q_dim + 2 * kv_dim));
+        } else {
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                         vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f));
+            if (as.qkv_bias) {
+                b.tensor_f32(p + "attn_q.bias", {u64(q_dim)}, zeros(q_dim));
+                b.tensor_f32(p + "attn_k.bias", {u64(kv_dim)}, zeros(kv_dim));
+                b.tensor_f32(p + "attn_v.bias", {u64(kv_dim)}, zeros(kv_dim));
+            }
+        }
+        // --- per-head QK-norm, at the head width ---
+        if (as.qk_norm) {
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        }
+        // --- a separate per-head attention gate (laguna) ---
+        if (as.attn_gate)
+            b.tensor_f16(p + "attn_gate.weight", {u64(n_embd), u64(n_head)},
+                         vec(static_cast<size_t>(n_embd) * n_head, base + 350, 1.0f));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        if (as.ln_bias || f.proj_bias)
+            b.tensor_f32(p + "attn_output.bias", {u64(n_embd)}, zeros(n_embd));
+        if (as.post_branch_norm) {
+            // The GGUF names for LLM_TENSOR_{ATTN,FFN}_POST_NORM, which is what
+            // llama.cpp's name table writes (`attn_post_norm` is the C++ member,
+            // not the tensor).
+            b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
+        }
+        // --- the FFN ---
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (as.ln_bias || f.norm_bias != 0.0f || f.proj_bias)
+            b.tensor_f32(p + "ffn_norm.bias", {u64(n_embd)},
+                         std::vector<f32>(n_embd, f.norm_bias));
+        if (moe) {
+            b.tensor_f16(p + "ffn_gate_inp.weight", {u64(n_embd), u64(f.n_expert)},
+                         vec(static_cast<size_t>(n_embd) * f.n_expert, base + 500, 1.0f));
+            // The expert bank is gate/up per expert even on the families whose
+            // DENSE MLP is a fused gate|up row: llama.cpp's phimoe.cpp creates
+            // `ffn_gate_exps` and `ffn_up_exps` each n_ff wide and calls
+            // build_moe_ffn with has_gate -- the fusion is a property of phi3's
+            // dense `ffn_up`, not of the bank. Writing a fused bank here is what
+            // the width check refused, and it was right to.
+            b.tensor_f16(p + "ffn_gate_exps.weight",
+                         {u64(n_embd), u64(n_ff_exp), u64(f.n_expert)},
+                         vec(static_cast<size_t>(n_embd) * n_ff_exp * f.n_expert,
+                             base + 550, 1.0f));
+            b.tensor_f16(p + "ffn_up_exps.weight",
+                         {u64(n_embd), u64(n_ff_exp), u64(f.n_expert)},
+                         vec(static_cast<size_t>(n_embd) * n_ff_exp * f.n_expert,
+                             base + 600, 1.0f));
+            b.tensor_f16(p + "ffn_down_exps.weight",
+                         {u64(n_ff_exp), u64(n_embd), u64(f.n_expert)},
+                         vec(static_cast<size_t>(n_ff_exp) * n_embd * f.n_expert,
+                             base + 700, 1.0f));
+            if (f.shared_expert) {
+                b.tensor_f16(p + "ffn_gate_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                             vec(static_cast<size_t>(n_embd) * n_ff_sh, base + 800, 1.0f));
+                b.tensor_f16(p + "ffn_up_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                             vec(static_cast<size_t>(n_embd) * n_ff_sh, base + 850, 1.0f));
+                b.tensor_f16(p + "ffn_down_shexp.weight", {u64(n_ff_sh), u64(n_embd)},
+                             vec(static_cast<size_t>(n_ff_sh) * n_embd, base + 900, 1.0f));
+            }
+        } else if (as.fused_gate_up) {
+            // One `ffn_up` row of gate | up -- Phi-3's MLP and GLM-4's.
+            std::vector<f32> w;
+            w.reserve(static_cast<size_t>(n_embd) * 2 * n_ff);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f))
+                w.push_back(x);
+            b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(2 * n_ff)}, w);
+            b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                         vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+        } else {
+            if (!as.no_gate_ffn)
+                b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                             vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
+            b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                         vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
+            b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                         vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+            if (as.ln_bias) {
+                b.tensor_f32(p + "ffn_up.bias", {u64(n_ff)}, zeros(n_ff));
+                b.tensor_f32(p + "ffn_down.bias", {u64(n_embd)}, zeros(n_embd));
+            }
+        }
+        if (as.post_branch_norm)
+            b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, ones(n_embd));
+    }
+    return b.write(path);
+}
+
 // ---- the pending-model fixtures -------------------------------------------
 //
 // Every architecture string the table lists and the engine could not run had a
@@ -22060,6 +22329,117 @@ static void test_pending_model_refusals() {
         CHECK(b.write("kraken-pend-qwen4mtp.gguf"), "wrote qwen4-mtp");
         arm("kraken-pend-qwen4mtp.gguf", "qwen4-mtp", "qwen4exp target");
     }
+}
+
+// ---- every `Yes` row: a file of its family, built from its own flags ------
+//
+// The same bargain as the pending pass, turned on the rows that already claim
+// `Yes`: a row is a promise that a file of that family loads and runs, and a
+// promise with no file behind it is weaker than a `Partial` with a named gap.
+// The fixture's tensor set comes from the row's own `ArchSpec` (see
+// build_row_fixture), so this group is as much a check that the ROW agrees with
+// the loader as it is a check of the loader.
+static void test_yes_row_fixtures() {
+    auto arm = [](const std::string &path, const char *label) {
+        const std::string bad = pend_probe(path, label, /*expect_run=*/true);
+        if (!bad.empty())
+            std::fprintf(stderr, "[row] %s: %s\n", label, bad.c_str());
+        CHECK(bad.empty(), (std::string(label) +
+                            " builds, loads and generates from its own row")
+                               .c_str());
+        CHECK(std::remove(path.c_str()) == 0,
+              (std::string(label) + "'s fixture is removed").c_str());
+    };
+    auto build = [](const char *arch, int n_expert, bool shared) {
+        RowFix f;
+        f.arch = arch;
+        f.n_expert = n_expert;
+        f.shared_expert = shared;
+        return build_row_fixture(std::string("kraken-row-") + arch + ".gguf", f);
+    };
+
+    // phi3: one fused q|k|v row and one fused gate|up row, and nothing else.
+    CHECK(build("phi3", 0, false), "wrote phi3");
+    arm("kraken-row-phi3.gguf", "phi3");
+    // phi3moe and phimoe: Phi-3's block with the MLP replaced by experts. The
+    // expert bank keeps the fused gate|up row per expert.
+    CHECK(build("phi3moe", 4, false), "wrote phi3moe");
+    arm("kraken-row-phi3moe.gguf", "phi3moe");
+    CHECK(build("phimoe", 4, false), "wrote phimoe");
+    arm("kraken-row-phimoe.gguf", "phimoe");
+    // chatglm: llama's split q/k/v with the fused gate|up MLP.
+    CHECK(build("chatglm", 0, false), "wrote chatglm");
+    arm("kraken-row-chatglm.gguf", "chatglm");
+    // glm4: the same MLP plus a norm on each branch's OUTPUT.
+    CHECK(build("glm4", 0, false), "wrote glm4");
+    arm("kraken-row-glm4.gguf", "glm4");
+    // glm4moe: glm4's post-norms, per-head QK-norm, q/k/v biases, routed
+    // experts and an always-on shared expert.
+    CHECK(build("glm4moe", 4, true), "wrote glm4moe");
+    arm("kraken-row-glm4moe.gguf", "glm4moe");
+    // qwen3: llama's block with a per-head QK-norm pair.
+    CHECK(build("qwen3", 0, false), "wrote qwen3");
+    arm("kraken-row-qwen3.gguf", "qwen3");
+    // laguna: per-head QK-norm, a separate softplus attention gate and a NeoX
+    // pairing, over a routed FFN.
+    CHECK(build("laguna", 4, false), "wrote laguna");
+    arm("kraken-row-laguna.gguf", "laguna");
+    // ---- phimoe, measured on the bias its files always carry ----
+    // A real Phi-MoE file writes `attn_norm.bias`, `ffn_norm.bias` and
+    // `output_norm.bias` (llama.cpp's phimoe.cpp creates all three with no
+    // OPTIONAL flag) beside the RMSNorm weight, and its graph adds them after
+    // the norm. The twin pair below is the measurement: two files that differ
+    // ONLY in the value of those three vectors. If the logits do not move, the
+    // bias is being dropped on every real Phi-MoE checkpoint.
+    {
+        RowFix a2;
+        a2.arch = "phimoe";
+        a2.n_expert = 4;
+        a2.proj_bias = true;
+        a2.norm_bias = 0.0f;
+        CHECK(build_row_fixture("kraken-row-phimoe-b0.gguf", a2), "wrote phimoe A");
+        a2.norm_bias = 0.5f;
+        CHECK(build_row_fixture("kraken-row-phimoe-b5.gguf", a2), "wrote phimoe B");
+        std::vector<f32> lg0, lg1;
+        std::string e0, e1;
+        const bool ok0 = variant_logits("kraken-row-phimoe-b0.gguf", lg0, e0);
+        const bool ok1 = variant_logits("kraken-row-phimoe-b5.gguf", lg1, e1);
+        CHECK(ok0 && ok1, "both phimoe twins run");
+        if (ok0 && ok1 && lg0.size() == lg1.size()) {
+            f32 md = 0.0f, peak = 0.0f;
+            for (size_t i = 0; i < lg0.size(); i++) {
+                md = std::max(md, std::fabs(lg0[i] - lg1[i]));
+                peak = std::max(peak, std::fabs(lg0[i]));
+            }
+            std::fprintf(stderr,
+                         "[row] phimoe norm bias: md %.8g at peak %.6g\n", md, peak);
+            CHECK(md > 1e-4f,
+                  "the RMSNorm bias reaches the graph (a file that differs only "
+                  "in attn_norm/ffn_norm/output_norm bias moves the logits)");
+        }
+        std::remove("kraken-row-phimoe-b0.gguf");
+        std::remove("kraken-row-phimoe-b5.gguf");
+    }
+    // ---- qwen35: the dense sibling of the gated delta net above ----
+    // Every full-attention-interval'th layer attends (with the packed per-head
+    // output gate in attn_q) and the rest run the delta net; the FFN is a plain
+    // gated MLP rather than an expert bank. The qwen35moe half of this builder
+    // is already exercised elsewhere; this arm is the row that had no file.
+    {
+        CHECK(build_tiny_gdn_model("kraken-row-qwen35.gguf", 4, 4, "qwen35",
+                                   /*dense=*/true),
+              "wrote qwen35");
+        const std::string bad = pend_probe("kraken-row-qwen35.gguf", "qwen35",
+                                          /*expect_run=*/true);
+        if (!bad.empty()) std::fprintf(stderr, "[row] qwen35: %s\n", bad.c_str());
+        CHECK(bad.empty(),
+              "qwen35 builds, loads and generates from its own row");
+        std::remove("kraken-row-qwen35.gguf");
+    }
+    // gpt2: LayerNorm with biases, learned absolute positions, one fused q|k|v
+    // row and an MLP with no gate tensor at all.
+    CHECK(build("gpt2", 0, false), "wrote gpt2");
+    arm("kraken-row-gpt2.gguf", "gpt2");
 }
 
 // C1 -- DeepSeek-V4 compressed attention, END TO END.
@@ -25524,6 +25904,8 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_arch_row_pins)
     TEST_GROUP(test_pending_model_fixtures)
     TEST_GROUP(test_pending_model_refusals)
+    TEST_GROUP(test_yes_row_fixtures)
+    TEST_GROUP(test_dflash_qwen35_spelling)
     TEST_GROUP(test_minicpm_embedding_scale_forward)
     TEST_GROUP(test_olmoe_expert_weight_forward)
     TEST_GROUP(test_qwen3moe_forward)

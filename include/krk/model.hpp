@@ -547,6 +547,8 @@ struct ModelConfig {
     bool learned_pos = false;
     bool parallel_residual = false;
     bool no_gate_ffn = false;
+    // see ArchSpec::norm_bias
+    bool norm_bias = false;
     // ALiBi's scale, and BLOOM's embedding norm (see ArchSpec).
     f32 alibi_max_bias = 0.0f;
     bool embd_norm = false;

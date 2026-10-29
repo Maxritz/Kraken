@@ -263,6 +263,16 @@ struct ArchSpec {
     bool learned_pos = false;
     bool parallel_residual = false;
     bool no_gate_ffn = false;
+    // The NORM BIASES of an RMSNorm family. Phi-MoE is the case: llama.cpp's
+    // phimoe.cpp creates `attn_norm.bias`, `ffn_norm.bias` and
+    // `output_norm.bias` with no OPTIONAL flag and its graph adds them after
+    // the norm (`build_norm(..., LLM_NORM_RMS, ...)` with the bias argument).
+    // This is NOT `ln_bias`: that one also selects the LayerNorm forward
+    // (`Engine::plain_forward`), and routing an RMSNorm family through it would
+    // change the graph. Measured before the flag existed: two Phi-MoE files
+    // differing only in those three vectors gave logits that differed by
+    // exactly 0 (peak 2.344), i.e. the bias was dropped on every real file.
+    bool norm_bias = false;
     // ---- ALiBi (mpt, bloom, falcon) --------------------------------------
     // The position signal is an additive per-head distance bias on the
     // attention score, with no rotary table and no learned position embedding

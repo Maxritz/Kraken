@@ -812,6 +812,13 @@ private:
     // It is the only place this engine reads a weight straight out of the file
     // mapping on the hot path, which is why the rows are computed on the host.
     void ple_block(const LayerWeights &L, i32 l, i32 n, i64 pos0);
+    // A norm bias added AFTER the RMSNorm, for the families whose files carry
+    // one (`ArchSpec::norm_bias`: Phi-MoE's attn/ffn/output norms). The
+    // LayerNorm path applies its biases inside `layernorm()`; this one exists
+    // because the RMS path shares no code with it and a file that carries the
+    // bias would otherwise load it and never use it -- measured at md 0 between
+    // two files differing only in these vectors.
+    void norm_bias_add(f32 *dst, const f32 *bias, i32 n_tok, i64 width);
     // ---- qwen4exp QSA indexer --------------------------------------------
     // Pooled keys per block of `ratio` cells -> one score per block -> top-k
     // blocks -> the cells of those blocks. Returns true when this row set is a
