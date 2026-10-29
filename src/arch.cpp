@@ -430,6 +430,27 @@ constexpr ArchSpec kTable[] = {
     // so the entry is the qwen2 flags plus the MoE shape.
     {"qwen2moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "qwen2", "",
      false, false, true, false, false, true, 0, false, /*expert_w_norm=*/0},
+    // Qwen1: llama's block with a FUSED q/k/v projection (`attn_qkv`, one row
+    // of Q | K | V) and the NeoX rope pairing, no biases anywhere. Qwen2
+    // splits the projection again, which is why this is its own entry rather
+    // than a flag on `qwen2`.
+    [] {
+        ArchSpec s{"qwen", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+                   "llama", "", false, false, false, false};
+        s.fused_qkv = true;
+        s.rope_neox = true;
+        return s;
+    }(),
+    // InternLM2: the same fused Q | K | V row, but the adjacent-pair (NORM)
+    // rope pairing. Two families that differ only in the pairing are the
+    // cleanest demonstration of why it is a declared flag: the wrong one mixes
+    // the wrong channels and every token still lands in the right range.
+    [] {
+        ArchSpec s{"internlm2", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+                   "llama", "", false, false, false, false};
+        s.fused_qkv = true;
+        return s;
+    }(),
     // ---- llama's schema with a piece renamed, a flag, or a scalar ---------
     // Five families whose graphs are llama's, each with one thing of its own.
     // The reference is `src/models/*.cpp` at llama.cpp f5222f25; every claim

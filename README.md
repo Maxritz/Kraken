@@ -1500,6 +1500,28 @@ not: the new `variant_logits` helper deleted the backend while the `Engine` was
 still alive, and `Engine::~Engine` frees its workspaces *through that backend* —
 a shutdown through a dangling pointer. The engine is scoped to die first now.
 
+### The fused-projection pair: qwen and internlm2
+
+`qwen` (Qwen1) and `internlm2` store **one** `attn_qkv` row of `Q | K | V`, so the
+split into three projections is a stride, not a copy. Both are otherwise llama's
+block, and they differ from each other in exactly one thing: qwen uses the NeoX
+rope pairing, internlm2 the adjacent-pair one. Two families that differ only in
+a convention are the cleanest reason that convention is a declared flag — the
+wrong pairing mixes the wrong channels and every token still lands in the right
+range, so it reads as a slightly different model rather than as a bug.
+
+The pair is now pinned by a test that writes the **same numbers two ways**: one
+file with three separate q/k/v tensors, one with them as slices of a single
+fused row. The fused path must reproduce the split path exactly. And the same
+fixture with the other pairing declared must *differ*, which is what proves the
+flag is read rather than defaulted.
+
+Writing that test found a live gap in the main forward: it added `q_bias`,
+`k_bias` and `v_bias` but never `qkv_bias` — the single bias a fused projection
+carries, laid out `Q | K | V`. The plain (GPT-2) loop had always handled it, so
+only a fused-qkv family on the *main* path lost its bias, silently, while
+decoding fluently. The three offsets are applied beside the other three now.
+
 ### Fused projections: Phi-3 / Phi-4
 
 `phi3` is now a supported architecture. Phi-3 and Phi-4 store two fused
