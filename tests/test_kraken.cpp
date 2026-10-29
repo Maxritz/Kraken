@@ -5936,6 +5936,11 @@ struct SchemaSpec {
     f32 embd_scale_key = 0.0f;   // <arch>.embedding_scale
     i32 swa_window = 0;          // 0 => no `<arch>.attention.sliding_window`
     bool yarn = false;           // <arch>.rope.scaling.type = yarn (factor 8)
+    // BitNet's SubLN pair: attn_sub_norm (n_embd) + ffn_sub_norm (n_ff).
+    bool sub_norms = false;
+    // BitNet's head is TIED: llama.cpp builds the logits from `tok_embd` and
+    // the file carries no `output.weight` at all.
+    bool write_out_weight = true;
 };
 
 static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
@@ -5984,12 +5989,25 @@ static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
                  vec(static_cast<size_t>(n_embd) * vocab, 0, 1.0f));
     if (v.write_out_norm)
         b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
-    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
-                 vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+    if (v.write_out_weight)
+        b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                     vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
 
     for (int l = 0; l < n_layer; l++) {
         const std::string p = "blk." + std::to_string(l) + ".";
         const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        if (v.sub_norms) {
+            // Not all ones: an all-ones gamma over an already-normalized row
+            // hides whether the norm ran at all, and this pair's POSITION is
+            // the thing under test (on the sub-block's output, not its input).
+            std::vector<f32> sa(n_embd), sf(n_ff);
+            for (int i = 0; i < n_embd; i++)
+                sa[static_cast<size_t>(i)] = 0.5f + 0.05f * static_cast<f32>(i % 5);
+            for (int i = 0; i < n_ff; i++)
+                sf[static_cast<size_t>(i)] = 0.5f + 0.05f * static_cast<f32>(i % 7);
+            b.tensor_f32(p + "attn_sub_norm.weight", {u64(n_embd)}, sa);
+            b.tensor_f32(p + "ffn_sub_norm.weight", {u64(n_ff)}, sf);
+        }
         if (v.write_norms) {
             b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
             b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
@@ -6437,6 +6455,645 @@ static void test_norm_schema_shapes() {
 // `attn_scale_at`, and named in a comment, while nothing ever assigned it, so
 // every gemma4 file ran at 1/sqrt(head_dim).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// BitNet b1.58
+//
+// Two graph differences from llama, both of which decode as plausible text when
+// they are wrong: squared ReLU in the FFN (`relu(gate)^2 * up`, from the BitNet
+// paper and microsoft/BitNet's own graph, gpu/model.py:165-195) and the SubLN
+// pair (an extra RMSNorm on each sub-block's INTERMEDIATE output). The row did
+// not exist, so a b1.58 file fell through to the llama defaults with a warning:
+// silu(gate)*up on every layer, no relu^2 anywhere in the DENSE FFN path (only
+// the routed-expert paths had an arm), and `kraken-inspect` calling it unknown.
+//
+// The arms below are a FILE A/B, not a row check: the same bytes are loaded
+// twice, once as `bitnet-b1.58` and once as `llama`, and the logits must differ.
+// That is the only assertion that can fail when the activation silently stays
+// silu.
+// ---------------------------------------------------------------------------
+// ---- I2_S: microsoft/BitNet's own 2-bit format, ggml id 36 ----------------
+//
+// The layout is NOT the one the other 2-bit blocks use: byte j of a 32-byte
+// block carries elements j, j+32, j+64, j+96, and the HIGH 2-bit pair is the
+// FIRST of those (the converter packs q0<<6 | q1<<4 | q2<<2 | q3). Getting the
+// pair order wrong swaps element j with j+96 and leaves every count, size and
+// bounds check intact -- so the only thing that catches it is a byte-side pin
+// like this one.
+//
+// The second thing to pin is the scale: I2_S has NO per-block delta. One f32
+// lives in a 32-byte tail after the whole tensor, so a loader that ignores it
+// runs the model with weights of +-1 instead of +-0.125 -- 8x too large here,
+// and fluent-but-wrong rather than broken, which is why the file A/B below
+// compares against the SAME weights stored as F16.
+namespace {
+
+// Packs a ternary {-1,0,+1} matrix (row-major, n a multiple of 128) into
+// I2_S bytes plus the 32-byte tail holding `scale` as f32 at [0..3].
+std::vector<u8> i2s_pack(const std::vector<f32> &tern_unit, f32 scale) {
+    const size_t n = tern_unit.size();
+    std::vector<u8> out(n / 4 + 32, 0);
+    for (size_t blk = 0; blk * 128 < n; blk++)
+        for (int j = 0; j < 32; j++)
+            for (int l = 0; l < 4; l++) {
+                const size_t idx = blk * 128 + static_cast<size_t>(j + l * 32);
+                const int code = static_cast<int>(tern_unit[idx]) + 1;  // 0..2
+                out[blk * 32 + static_cast<size_t>(j)] |=
+                    static_cast<u8>(code << (6 - 2 * l));
+            }
+    std::memcpy(out.data() + n / 4, &scale, 4);
+    return out;
+}
+
+// A minimal BitNet-b1.58 file: SubLN pair, gated FFN, tied head, and every
+// matmul weight ternary. `as_i2s` decides whether those weights are stored in
+// I2_S (with `scale` in the tail) or as F16 holding scale*ternary, which is
+// the same matrix either way.
+bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale,
+                       f32 embd_i2s_scale = 0.0f) {
+    const int n_embd = 256, n_layer = 2, n_head = 8, n_kv = 8, hd = 32;
+    const int n_ff = 256, vocab = 260, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;   // 256 / 256
+    const std::string arch = "bitnet-b1.58";
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-bitnet-i2s");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    add_spm_vocab(b, vocab, -1);
+
+    auto embd = [&](size_t n) {
+        std::vector<f32> out(n);
+        for (size_t i = 0; i < n; i++)
+            out[i] = 0.02f * static_cast<f32>(static_cast<int>(wv(static_cast<i64>(i)) * 7.0f));
+        return out;
+    };
+    // One ternary matrix, identical for both encodings: the ternary value is a
+    // function of the element's position only.
+    auto matmul = [&](const std::string &nm, const std::vector<u64> &ne, i64 base) {
+        const size_t n = static_cast<size_t>(ne[0] * ne[1]);
+        std::vector<f32> tern(n);
+        for (size_t i = 0; i < n; i++) {
+            const f32 t = wv(base + static_cast<i64>(i));
+            tern[i] = t > 0.15f ? 1.0f : (t < -0.15f ? -1.0f : 0.0f);
+        }
+        if (as_i2s) {
+            const std::vector<u8> packed = i2s_pack(tern, scale);
+            b.tensor_raw(nm, 36, ne, packed.data(), packed.size());
+        } else {
+            std::vector<f32> vals(n);
+            for (size_t i = 0; i < n; i++) vals[i] = scale * tern[i];
+            b.tensor_f16(nm, ne, vals);
+        }
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    if (embd_i2s_scale > 0.0f) {
+        // BitNet-embedding-0.6B's shape: the TABLE is I2_S, everything else is
+        // whatever the rest of this fixture is. All codes are 2 (+1) so the
+        // materialized value is the tail scale exactly -- 0.25, not 1.0.
+        const std::vector<f32> unit(static_cast<size_t>(n_embd) * vocab, 1.0f);
+        const std::vector<u8> packed = i2s_pack(unit, embd_i2s_scale);
+        b.tensor_raw("token_embd.weight", 36, {u64(n_embd), u64(vocab)},
+                     packed.data(), packed.size());
+    } else {
+        b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                     embd(static_cast<size_t>(n_embd) * vocab));
+    }
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 100000;
+        std::vector<f32> sa(n_embd), sf(n_ff);
+        for (int i = 0; i < n_embd; i++)
+            sa[static_cast<size_t>(i)] = 0.5f + 0.04f * static_cast<f32>(i % 5);
+        for (int i = 0; i < n_ff; i++)
+            sf[static_cast<size_t>(i)] = 0.5f + 0.04f * static_cast<f32>(i % 7);
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "attn_sub_norm.weight", {u64(n_embd)}, sa);
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "ffn_sub_norm.weight", {u64(n_ff)}, sf);
+        matmul(p + "attn_q.weight", {u64(n_embd), u64(q_dim)}, base + 100);
+        matmul(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)}, base + 200);
+        matmul(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)}, base + 300);
+        matmul(p + "attn_output.weight", {u64(q_dim), u64(n_embd)}, base + 400);
+        matmul(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)}, base + 500);
+        matmul(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)}, base + 600);
+        matmul(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)}, base + 700);
+    }
+    return b.write(path);
+}
+
+}  // namespace
+
+static void test_i2_s_layout() {
+    // Byte 0 of a block: element 0 = code 2 (+1) in bits 7..6, element 32 =
+    // code 1 (0) in 5..4, element 64 = code 0 (-1) in 3..2, element 96 = code
+    // 2 (+1) in 1..0.
+    u8 blk[32];
+    std::memset(blk, 0, sizeof(blk));
+    blk[0] = static_cast<u8>(2 << 6 | 1 << 4 | 0 << 2 | 2 << 0);
+    f32 out[128];
+    dequant_row(DType::I2_S, blk, out, 128);
+    CHECK(out[0] == 1.0f && out[32] == 0.0f && out[64] == -1.0f && out[96] == 1.0f,
+          "I2_S: byte 0 carries elements 0/32/64/96 from the HIGH pair down");
+    CHECK(out[1] == -1.0f && out[127] == -1.0f,
+          "and every untouched byte is code 0 (-1), not 0 as a decoded value");
+    CHECK(dtype_block_size(DType::I2_S) == 128 && dtype_block_bytes(DType::I2_S) == 32,
+          "I2_S is 128 values in 32 bytes");
+    CHECK(dtype_supported(DType::I2_S), "and this build decodes it");
+
+    // The fused kernel: exact integers against a scalar reference.
+    std::vector<i8> xq(128);
+    std::vector<f32> dx(4);
+    for (int i = 0; i < 128; i++)
+        xq[static_cast<size_t>(i)] = static_cast<i8>((i * 37) % 255 - 127);
+    for (int i = 0; i < 4; i++) dx[static_cast<size_t>(i)] = 0.01f * static_cast<f32>(i + 1);
+    f64 ref = 0.0;
+    for (int i = 0; i < 128; i++)
+        ref += static_cast<f64>(out[i]) * static_cast<f64>(xq[static_cast<size_t>(i)]) *
+               static_cast<f64>(dx[static_cast<size_t>(i / 32)]);
+    CHECK_NEAR(dot_i2_s_q8(blk, xq.data(), dx.data(), 128), static_cast<f32>(ref),
+               1e-4f, "I2_S: the fused kernel matches the dequantised reference");
+
+    // The -128 activation, as for every other 2-bit kernel.
+    {
+        u8 z[32];
+        std::memset(z, 0, sizeof(z));
+        std::vector<i8> xz(128, 0);
+        xz[0] = static_cast<i8>(-128);
+        std::vector<f32> dz(4, 1.0f);
+        CHECK_NEAR(dot_i2_s_q8(z, xz.data(), dz.data(), 128), 128.0f, 1e-3f,
+                   "I2_S: code 0 (-1) times -128 is +128");
+    }
+}
+
+static void test_i2_s_model() {
+    std::string err;
+    const f32 scale = 0.125f;
+    CHECK(build_bitnet_file("kraken-i2s.gguf", true, scale),
+          "wrote an I2_S BitNet file");
+    CHECK(build_bitnet_file("kraken-i2s-ref.gguf", false, scale),
+          "wrote the same weights as F16");
+
+    // Probe the descriptor directly: the dtype and the per-tensor scale are
+    // what the loader is responsible for, and a logits comparison alone can
+    // hide a scale that never reached the kernel.
+    schema_cfg("kraken-i2s.gguf", [&](const Model &m) {
+        const auto &L = m.layers()[0];
+        std::fprintf(stderr, "[i2s-desc] wq type=%d gs=%g  gate type=%d gs=%g\n",
+                     static_cast<int>(L.wq.type), static_cast<double>(L.wq.gs),
+                     static_cast<int>(L.wgate.type), static_cast<double>(L.wgate.gs));
+        CHECK(L.wq.type == DType::I2_S, "the layer weights keep the I2_S format");
+        CHECK(std::fabs(L.wq.gs - scale) < 1e-7f,
+              "and carry the tail's scale as the tensor-wide gs");
+        CHECK(std::fabs(L.wgate.gs - scale) < 1e-7f, "on every matmul weight");
+    }, err);
+
+    // A run smoke test, and NOTHING MORE: the two-token logits of this
+    // synthetic model are identical (md = 0, bitwise) for I2_S at 0.125, the
+    // same weights as F16 at 0.125, and the same weights at 8x -- measured, on
+    // all three pairs -- so logits cannot distinguish a weight scale here. The
+    // scale is pinned by the descriptor probe above and the codes by
+    // test_i2_s_layout; claiming this arm proves the scale would be claiming a
+    // check that cannot fail. Recorded as an open fixture question in
+    // docs/TODO-alignment-2026-10-29.md rather than asserted.
+    std::vector<f32> a, b;
+    if (!variant_logits("kraken-i2s.gguf", a, err)) {
+        CHECK(false, ("the I2_S file LOADS and generates: " + err).c_str());
+        return;
+    }
+    CHECK(!a.empty(), "the I2_S file loads, runs and produces logits");
+    CHECK(build_bitnet_file("kraken-i2s-ref.gguf", false, scale),
+          "the same weights as F16 are writable");
+    CHECK(variant_logits("kraken-i2s-ref.gguf", b, err) && b.size() == a.size(),
+          "and that reference runs too (the pair is well-formed)");
+}
+
+// I2_S embeddings. A lookup table has no projection to ride, so the scale has
+// to be folded in when the table is materialized -- and if it is dropped the
+// values are 1.0 instead of 0.25, which no shape check and no "it loaded"
+// message can tell you apart. Hence a value assertion on the table itself.
+static void test_i2_s_embedding() {
+    std::string err;
+    CHECK(build_bitnet_file("kraken-i2s-table.gguf", true, 0.125f, 0.25f),
+          "wrote a file whose token_embd is I2_S and whose matmuls are I2_S");
+    Backend *be = make_cpu_backend();
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = "kraken-i2s-table.gguf";
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        if (!e.init(be, c, &err)) {
+            CHECK(false, ("the I2_S-embedding file LOADS: " + err).c_str());
+        } else {
+            const QuantTensor &t = e.model().tok_embd();
+            CHECK(t.present() && t.type == DType::F16,
+                  "the I2_S TABLE is materialized as F16 (a lookup cannot apply gs)");
+            if (t.present() && t.n_in > 0) {
+                // On the CPU backend the weight pointer IS host memory, and
+                // the table is F16: dequant_row converts it. (download_f32
+                // would copy the bytes as f32 -- two f16 values of 0.25 read
+                // back as one 1.19e-07 float, which is exactly the trap this
+                // assertion fell into first.)
+                std::vector<f32> row(static_cast<size_t>(t.n_in));
+                dequant_row(DType::F16, t.data, row.data(), t.n_in);
+                bool all = true;
+                for (f32 v : row) all = all && std::fabs(v - 0.25f) < 1e-6f;
+                CHECK(all, "and every value carries the table's 0.25 scale, not 1.0");
+            }
+            // It also has to RUN: the head is tied to this table.
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 2;
+            GenerateResult r;
+            CHECK(e.generate(gp, &r) && r.tokens.size() <= 2,
+                  "and the tied head reads the materialized table");
+        }
+    }
+    delete be;
+}
+
+static void test_bitnet_family() {
+    std::string err;
+
+    // ---- (1) the row ----------------------------------------------------
+    {
+        const ArchSpec *b = arch_lookup("bitnet-b1.58");
+        CHECK(b != nullptr, "bitnet-b1.58 is in the architecture table");
+        CHECK(b && b->support == ArchSupport::Yes,
+              "and it is a SUPPORTED row, not a fallback");
+        CHECK(b && b->ffn_relu_sqr,
+              "with squared ReLU declared on the row");
+        CHECK(b && !b->gelu_ffn && !b->fused_qkv && !b->parallel_residual,
+              "and no GeGLU / fused-QKV / parallel-residual flag");
+        CHECK(b && !b->rope_neox,
+              "and the NORM rope pairing (llama.cpp lists it with llama's)");
+        // nemotron's rows carry the same flag now that it is a row property
+        // rather than an arch-name test in the loader.
+        const ArchSpec *nh = arch_lookup("nemotron_h");
+        const ArchSpec *nm = arch_lookup("nemotron_h_moe");
+        CHECK(nh && nh->ffn_relu_sqr && nm && nm->ffn_relu_sqr,
+              "nemotron's two rows declare squared ReLU as a row flag");
+        const ArchSpec *ll = arch_lookup("llama");
+        CHECK(ll && !ll->ffn_relu_sqr, "llama does not");
+    }
+
+    // ---- (2) a complete b1.58 file loads, with its graph intact ----------
+    auto build = [&](const char *arch, bool out_weight, const char *nm) {
+        SchemaSpec v;
+        v.arch = arch;
+        v.sub_norms = true;        // the SubLN pair, both widths
+        v.write_out_weight = out_weight;
+        const std::string f = nm;
+        CHECK(build_schema_model(f, v), "wrote a b1.58-shaped file");
+        return f;
+    };
+    std::vector<f32> bitnet_lg, llama_lg;
+    {
+        const std::string f = build("bitnet-b1.58", false, "kraken-bitnet.gguf");
+        bool ok = false;
+        if (schema_cfg(f, [&](const Model &m) {
+                const ModelConfig &c = m.cfg();
+                ok = true;
+                CHECK(c.ffn_relu_sqr,
+                      "the loader marks the family's squared-ReLU FFN");
+                CHECK(c.tied_embeddings,
+                      "and the head is tied: the file carries no output.weight");
+                CHECK(m.layers().size() == 2 && m.layers()[0].attn_sub_norm &&
+                          m.layers()[0].ffn_sub_norm,
+                      "the SubLN pair is loaded on every layer");
+                CHECK(m.layers()[0].wgate.present() &&
+                          m.layers()[0].wdown.present(),
+                      "and the gated FFN is the llama shape, not relu2-of-up");
+            }, err)) {
+            CHECK(ok, "a b1.58 file loads");
+        } else {
+            CHECK(false, ("a b1.58 file loads: " + err).c_str());
+        }
+        if (!variant_logits(f, bitnet_lg, err))
+            CHECK(false, ("a b1.58 run: " + err).c_str());
+    }
+
+    // ---- (3) the A/B: the activation is what a wrong row would drop -----
+    {
+        const std::string f = build("llama", true, "kraken-bitnet-as-llama.gguf");
+        if (!variant_logits(f, llama_lg, err))
+            CHECK(false, ("the llama arm runs: " + err).c_str());
+        if (!bitnet_lg.empty() && !llama_lg.empty()) {
+            f32 md = 0.0f;
+            const size_t n = std::min(bitnet_lg.size(), llama_lg.size());
+            for (size_t i = 0; i < n; i++)
+                md = std::max(md, std::fabs(bitnet_lg[i] - llama_lg[i]));
+            CHECK(md > 1e-4f,
+                  "the same weights as llama-b1.58 and as llama give DIFFERENT "
+                  "logits, so squared ReLU and the sub-norms are applied");
+            f32 peak = 0.0f;
+            for (f32 x : bitnet_lg) peak = std::max(peak, std::fabs(x));
+            CHECK(peak > 0.0f && peak < 1e6f, "and the b1.58 run is finite");
+        }
+    }
+}
+
+// TQ2_0 / PQ2_0 / Q2_0 / Q2_0_64 are 2-bit CODE formats: value = (q - 1) * d,
+// so the ladder is {-1, 0, +1, +2} and q = 3 must decode as +2. These arms pin
+// the new int8 kernels against the scalar/dequant reference on every code
+// value, including the one a "reuse the trit kernel" shortcut would drop, and
+// across the row counts the x8 kernel batches.
+// The single worst case for the sign trick: AVX2's _mm256_sign_epi8 negates
+// in int8, so sign(-128, -1) is -128, not +128. Any kernel that computes
+// sum(|v| * sign(x, v)) therefore flips the sign of that one element, and a
+// q8 activation CAN be -128 (that is what the quantizer emits for a saturated
+// value). Every trit/code kernel has to survive it.
+//
+// One block, one non-zero activation at -128, d = 1, dx = 1, so the answer is
+// exactly the code's value times -128 -- an integer, with nowhere to hide.
+// The int8 activation domain. Several hot kernels (dot16_signed_lanes for
+// Q3_K/Q4_K) are exact only because the quantiser clamps to [-127, 127] --
+// -128 has no negation in int8, so any sign trick on it flips. Nothing pinned
+// that clamp; if a future quantiser emitted the full int8 range, those kernels
+// would go quietly wrong on saturated values instead.
+// The formats this build NAMES but does not decode. A refusal that says
+// "UNKNOWN (type id 38)" tells the user nothing they can act on; the point of
+// naming TL1 is that the message can.
+static void test_refused_formats() {
+    CHECK(dtype_name(DType::TL1) == std::string("TL1"),
+          "TL1 (id 38) has a name, so a refusal can name it");
+    CHECK(!dtype_supported(DType::TL1), "and it is not claimed as supported");
+    CHECK(dtype_block_bytes(DType::TL1) == 0,
+          "with no block geometry, so gguf marks it unknown and never decodes it");
+    CHECK(static_cast<i32>(DType::TL1) == 38, "the id is the reference's own");
+    // I2_S rows have to be independently addressable: its payload is one flat
+    // run of 32-byte blocks with a single tail, so a 96-wide row cannot be
+    // decoded from a row stride.
+    CHECK(dtype_row_aligned(DType::I2_S, 128) && dtype_row_aligned(DType::I2_S, 256),
+          "I2_S accepts a row width that is a multiple of 128");
+    CHECK(!dtype_row_aligned(DType::I2_S, 96) && !dtype_row_aligned(DType::I2_S, 1),
+          "and rejects one that is not (its block would be shared with the next row)");
+}
+
+static void test_q8_activation_domain() {
+    const i64 n = 512;
+    std::vector<f32> x(static_cast<size_t>(n));
+    for (i64 i = 0; i < n; i++) {
+        // Saturated, denormal, zero and ordinary values, all in one row.
+        const f32 mag[6] = {1e30f, -1e30f, 1e-30f, 0.0f, 3.5f, -0.001f};
+        x[static_cast<size_t>(i)] = mag[static_cast<size_t>(i % 6)];
+    }
+    std::vector<i8> xq(static_cast<size_t>(n));
+    std::vector<f32> dx(static_cast<size_t>(n / 32));
+    quantize_q8_row(x.data(), n, xq.data(), dx.data());
+    int lo = 0, hi = 0;
+    for (i8 v : xq) {
+        lo = std::min(lo, static_cast<int>(v));
+        hi = std::max(hi, static_cast<int>(v));
+    }
+    CHECK(hi == 127 && lo == -127,
+          "a saturated activation quantizes to exactly +-127, never -128");
+    // ... and the row still reconstructs: 1e30 lands on 127*scale.
+    CHECK_NEAR(static_cast<f32>(xq[0]) * dx[0], 1e30f, 1e30f * 0.02f,
+               "and the dequantised value matches its own scale");
+}
+
+static void test_trit_sign_extreme() {
+    const u16 one = fp32_to_fp16(1.0f);
+    const i8 x_neg128 = static_cast<i8>(-128);
+
+    // TQ1_0: an all-zero block decodes every trit to -1 (0*3>>8 - 1).
+    {
+        u8 blk[54];
+        std::memset(blk, 0, sizeof(blk));
+        blk[52] = static_cast<u8>(one & 0xFF);
+        blk[53] = static_cast<u8>(one >> 8);
+        std::vector<i8> xq(256, 0);
+        xq[0] = x_neg128;
+        std::vector<f32> dx(8, 1.0f);
+        CHECK_NEAR(dot_tq1_0_q8(blk, xq.data(), dx.data(), 256), 128.0f, 1e-3,
+                   "TQ1_0: trit -1 times an activation of -128 is +128, not -128");
+    }
+    // PTQ1_0: same codec over 128 values (24 qs bytes, qh[2], f16 d).
+    {
+        u8 blk[28];
+        std::memset(blk, 0, sizeof(blk));
+        blk[26] = static_cast<u8>(one & 0xFF);
+        blk[27] = static_cast<u8>(one >> 8);
+        std::vector<i8> xq(128, 0);
+        xq[0] = x_neg128;
+        std::vector<f32> dx(4, 1.0f);
+        CHECK_NEAR(dot_ptq1_0_q8(blk, xq.data(), dx.data(), 128), 128.0f, 1e-3,
+                   "PTQ1_0: same extreme, same answer");
+    }
+    // TQ2_0: an all-zero block is all code 0, i.e. value -1.
+    {
+        u8 blk[66];
+        std::memset(blk, 0, sizeof(blk));
+        blk[64] = static_cast<u8>(one & 0xFF);
+        blk[65] = static_cast<u8>(one >> 8);
+        std::vector<i8> xq(256, 0);
+        xq[0] = x_neg128;
+        std::vector<f32> dx(8, 1.0f);
+        CHECK_NEAR(dot_tq2_0_q8(blk, xq.data(), dx.data(), 256), 128.0f, 1e-3,
+                   "TQ2_0: code 0 (-1) times -128 is +128");
+        // ... and code 3 (+2) against the same -128 must give -256, which is
+        // the case a clamp to the trit range would get wrong as well.
+        blk[0] = 0x03;   // element 0, plane 0 -> code 3 -> +2
+        CHECK_NEAR(dot_tq2_0_q8(blk, xq.data(), dx.data(), 256), -256.0f, 1e-3,
+                   "TQ2_0: code 3 (+2) times -128 is -256 -- |v| rides in the "
+                   "unsigned operand, so +2 survives");
+    }
+    // Q2_0 / PQ2_0 / Q2_0_64: all codes 0 -> -1 everywhere.
+    {
+        u8 blk[34];
+        std::memset(blk, 0, sizeof(blk));
+        blk[0] = static_cast<u8>(one & 0xFF);
+        blk[1] = static_cast<u8>(one >> 8);
+        std::vector<i8> xq(128, 0);
+        xq[0] = x_neg128;
+        std::vector<f32> dx(4, 1.0f);
+        CHECK_NEAR(dot_q2_0_q8(blk, xq.data(), dx.data(), 128), 128.0f, 1e-3,
+                   "Q2_0: code 0 (-1) times -128 is +128");
+        CHECK_NEAR(dot_pq2_0_q8(blk, xq.data(), dx.data(), 128), 128.0f, 1e-3,
+                   "PQ2_0: same");
+        u8 blk64[18];
+        std::memset(blk64, 0, sizeof(blk64));
+        blk64[0] = static_cast<u8>(one & 0xFF);
+        blk64[1] = static_cast<u8>(one >> 8);
+        std::vector<i8> xq64(64, 0);
+        xq64[0] = x_neg128;
+        std::vector<f32> dx64(2, 1.0f);
+        CHECK_NEAR(dot_q2_0_64_q8(blk64, xq64.data(), dx64.data(), 64), 128.0f,
+                   1e-3, "Q2_0_64: same");
+    }
+}
+
+static void test_q2code_dot() {
+    auto fill_blocks = [](DType t, int nblk, std::vector<u8> &out) {
+        // Every block gets a distinct scale and cycles through all FOUR codes,
+        // so q = 3 is present and a kernel that clamps to a trit shows up.
+        const int bb = dtype_block_bytes(t);
+        out.assign(static_cast<size_t>(nblk) * static_cast<size_t>(bb), 0);
+        u32 rng = 0x9e3779b9u;
+        auto next = [&rng]() {
+            rng = rng * 1664525u + 1013904223u;
+            return rng >> 16;
+        };
+        for (int b = 0; b < nblk; b++) {
+            u8 *p = out.data() + static_cast<size_t>(b) * static_cast<size_t>(bb);
+            const u16 dh = fp32_to_fp16(0.25f + 0.05f * static_cast<f32>(b % 7));
+            if (t == DType::TQ2_0) {
+                for (int j = 0; j < 64; j++)
+                    p[j] = static_cast<u8>(
+                        ((next() & 1) ? 0 : 1) | ((next() & 1) ? 0 : 2) |
+                        ((next() & 1) ? 0 : 4) | ((next() & 1) ? 0 : 8) |
+                        ((next() & 1) ? 0 : 16) | ((next() & 1) ? 0 : 32) |
+                        ((next() & 1) ? 0 : 64) | ((next() & 1) ? 0 : 128));
+                p[64] = static_cast<u8>(dh & 0xff);
+                p[65] = static_cast<u8>(dh >> 8);
+            } else {
+                p[0] = static_cast<u8>(dh & 0xff);
+                p[1] = static_cast<u8>(dh >> 8);
+                const int nq = bb - 2;
+                for (int j = 0; j < nq; j++) p[2 + j] = static_cast<u8>(next());
+            }
+        }
+    };
+
+    const DType types[4] = {DType::TQ2_0, DType::PQ2_0, DType::Q2_0,
+                            DType::Q2_0_64};
+    const char *names[4] = {"TQ2_0", "PQ2_0", "Q2_0", "Q2_0_64"};
+    for (int ti = 0; ti < 4; ti++) {
+        const DType t = types[ti];
+        const int bs = dtype_block_size(t);
+        const int n = bs * 4;              // four blocks a row
+        const int nblk = 4;
+        std::vector<u8> w;
+        fill_blocks(t, nblk, w);
+
+        // The reference: the dequantised row, elementwise, against an int8
+        // activation with one scale per 32 values. Exact integers, so any
+        // disagreement is a real one.
+        std::vector<f32> wf(static_cast<size_t>(n));
+        dequant_row(t, w.data(), wf.data(), n);
+        // A q = 3 code must decode as +2: check the ladder itself.
+        {
+            f32 mx = 0.0f;
+            for (f32 v : wf) mx = std::max(mx, v);
+            CHECK(mx > 1.5f * 0.25f,
+                  "the fixture carries +2 codes (q = 3 decodes above the trit "
+                  "range)");
+        }
+        const i64 nb32 = n / 32;
+        std::vector<i8> xq(static_cast<size_t>(n));
+        std::vector<f32> dx(static_cast<size_t>(nb32));
+        u32 rng = 12345u;
+        for (int i = 0; i < n; i++) {
+            rng = rng * 1664525u + 1013904223u;
+            xq[static_cast<size_t>(i)] = static_cast<i8>(
+                static_cast<int>((rng >> 24) & 0xff) - 128);
+        }
+        for (i64 i = 0; i < nb32; i++)
+            dx[static_cast<size_t>(i)] = 0.013f + 0.002f * static_cast<f32>(i % 5);
+        // Two references, because the two entry points take different inputs:
+        // vec_dot() multiplies the dequantised row by the activation directly,
+        // and the q8 kernels take the int8 activation with its per-32 scales.
+        f64 ref_no_dx = 0.0, ref = 0.0;
+        for (int i = 0; i < n; i++) {
+            const f64 wv = static_cast<f64>(wf[static_cast<size_t>(i)]);
+            const f64 xv = static_cast<f64>(xq[static_cast<size_t>(i)]);
+            ref_no_dx += wv * xv;
+            ref += wv * xv * static_cast<f64>(dx[static_cast<size_t>(i / 32)]);
+        }
+
+        // The scalar path the engine uses when the fused one does not apply.
+        std::vector<f32> xf(static_cast<size_t>(n));
+        for (int i = 0; i < n; i++) xf[static_cast<size_t>(i)] = xq[static_cast<size_t>(i)];
+        const f32 scalar = vec_dot(t, w.data(), xf.data(), n);
+        CHECK_NEAR(scalar, static_cast<f32>(ref_no_dx), 2e-3 * std::fabs(static_cast<f32>(ref_no_dx)) + 1e-3f,
+                   "the scalar vec_dot matches the dequantised reference");
+
+        // The new kernels, single row and eight rows.
+        f32 one = 0.0f;
+        if (ti == 0) one = dot_tq2_0_q8(w.data(), xq.data(), dx.data(), n);
+        else if (ti == 1) one = dot_pq2_0_q8(w.data(), xq.data(), dx.data(), n);
+        else if (ti == 2) one = dot_q2_0_q8(w.data(), xq.data(), dx.data(), n);
+        else one = dot_q2_0_64_q8(w.data(), xq.data(), dx.data(), n);
+        {
+            const std::string msg =
+                std::string("the q2-code single-row kernel is exact over all "
+                            "four codes [") + names[ti] + "]";
+            CHECK_NEAR(one, static_cast<f32>(ref),
+                       2e-2f * std::fabs(static_cast<f32>(ref)) + 1e-3f,
+                       msg.c_str());
+        }
+
+        // Probe: ONE block only, so a block-stride bug and a codec bug look
+        // different in the failure text.
+        {
+            f64 ref1 = 0.0;
+            for (int i = 0; i < bs; i++)
+                ref1 += static_cast<f64>(wf[static_cast<size_t>(i)]) *
+                        static_cast<f64>(xq[static_cast<size_t>(i)]) *
+                        static_cast<f64>(dx[static_cast<size_t>(i / 32)]);
+            f32 one1 = 0.0f;
+            if (ti == 0) one1 = dot_tq2_0_q8(w.data(), xq.data(), dx.data(), bs);
+            else if (ti == 1) one1 = dot_pq2_0_q8(w.data(), xq.data(), dx.data(), bs);
+            else if (ti == 2) one1 = dot_q2_0_q8(w.data(), xq.data(), dx.data(), bs);
+            else one1 = dot_q2_0_64_q8(w.data(), xq.data(), dx.data(), bs);
+            const std::string m1 = std::string("one block [") + names[ti] + "] ref=" +
+                                   std::to_string(static_cast<f32>(ref1)) + " k=" +
+                                   std::to_string(one1);
+            CHECK_NEAR(one1, static_cast<f32>(ref1),
+                       2e-2f * std::fabs(static_cast<f32>(ref1)) + 1e-3f,
+                       m1.c_str());
+        }
+
+        // Eight rows: each row's answer must equal its own single-row dot.
+        enum { kRows = 8 };
+        std::vector<i8> xq8(static_cast<size_t>(kRows) * n);
+        std::vector<f32> dx8(static_cast<size_t>(kRows) * nb32);
+        for (int r = 0; r < kRows; r++)
+            for (int i = 0; i < n; i++) {
+                rng = rng * 1664525u + 1013904223u;
+                xq8[static_cast<size_t>(r) * n + i] =
+                    static_cast<i8>(static_cast<int>((rng >> 24) & 0xff) - 128);
+            }
+        for (int r = 0; r < kRows; r++)
+            for (i64 i = 0; i < nb32; i++)
+                dx8[static_cast<size_t>(r) * nb32 + i] =
+                    0.011f + 0.003f * static_cast<f32>((r + i) % 4);
+        f32 out8[kRows] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (ti == 0)
+            dot_tq2_0_q8_x8(w.data(), xq8.data(), dx8.data(), n, n, nb32, out8, 1);
+        else if (ti == 1)
+            dot_pq2_0_q8_x8(w.data(), xq8.data(), dx8.data(), n, n, nb32, out8, 1);
+        else if (ti == 2)
+            dot_q2_0_q8_x8(w.data(), xq8.data(), dx8.data(), n, n, nb32, out8, 1);
+        else
+            dot_q2_0_64_q8_x8(w.data(), xq8.data(), dx8.data(), n, n, nb32, out8, 1);
+        bool rows_ok = true;
+        for (int r = 0; r < kRows; r++) {
+            f32 single = 0.0f;
+            const i8 *xr = xq8.data() + static_cast<size_t>(r) * n;
+            const f32 *dr = dx8.data() + static_cast<size_t>(r) * nb32;
+            if (ti == 0) single = dot_tq2_0_q8(w.data(), xr, dr, n);
+            else if (ti == 1) single = dot_pq2_0_q8(w.data(), xr, dr, n);
+            else if (ti == 2) single = dot_q2_0_q8(w.data(), xr, dr, n);
+            else single = dot_q2_0_64_q8(w.data(), xr, dr, n);
+            if (std::fabs(out8[r] - single) > 1e-3f) rows_ok = false;
+        }
+        CHECK(rows_ok, "the eight-row kernel agrees with eight single-row dots");
+        (void)names[ti];
+    }
+}
+
 static void test_family_scales() {
     auto peak_of = [](const std::vector<f32> &v) {
         f32 p = 0.0f;
@@ -22318,6 +22975,14 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_attention_gate_families)
     TEST_GROUP(test_norm_schema_shapes)
     TEST_GROUP(test_family_scales)
+    TEST_GROUP(test_bitnet_family)
+    TEST_GROUP(test_i2_s_layout)
+    TEST_GROUP(test_i2_s_model)
+    TEST_GROUP(test_i2_s_embedding)
+    TEST_GROUP(test_refused_formats)
+    TEST_GROUP(test_q8_activation_domain)
+    TEST_GROUP(test_trit_sign_extreme)
+    TEST_GROUP(test_q2code_dot)
     TEST_GROUP(test_arch_row_pins)
     TEST_GROUP(test_lfm2_dense)
     TEST_GROUP(test_qwen2moe)

@@ -50,3 +50,53 @@ Status legend: **todo** · **done** · **blocked (why)**
   row pin fails, and "a stated attention scale of 4.0 changes the answer" fails.
   Reverted; the suite is 6566/6566 with the fixes in place. These arms were
   observed to fail, not assumed to.
+
+## BitNet / ternary / 2-bit pass (2026-10-29, later same day)
+
+| id | pri | item | state | evidence |
+|---|---|---|---|---|
+| D1 | P1 | `I2_S` (ggml id 36) — microsoft/BitNet's own 2-bit format, i.e. every official `ggml-model-i2_s.gguf` — was not in `DType`, so those files were refused as "unknown type 36" | **fixed** | `DType::I2_S`, 128/32 geometry, `deq_i2_s`, fused `dot_i2_s_q8[_x8]`, tensor-tail scale -> `QuantTensor::gs`; `test_i2_s_layout` + `test_i2_s_model` |
+| D2 | P1 | TQ2_0/PQ2_0/Q2_0/Q2_0_64 had no fused int8 kernel | **fixed** | `q2code_dot_1/_x8` with code ladder {-1,0,+1,+2}; `test_q2code_dot` |
+| D3 | P1 | **`_mm256_sign_epi8(x, v)` is not `x*v` at `x = -128`** (no int8 negation), so the TQ1_0/PTQ1_0 kernels that were already shipping flipped that element's contribution — and the same trick was in the first draft of the 2-bit kernels | **fixed** | exact positive/negative split (`maddubs(+1 where v>0, x) - maddubs(+1 where v<0, x)`); `test_trit_sign_extreme` fails 6/7 before the fix and passes 7/7 after |
+| D4 | P1 | `bitnet-b1.58` had **no arch row**: it fell through to the llama defaults, so no SubLN and (in the dense FFN) no squared ReLU anywhere | **fixed** | `ArchSpec::ffn_relu_sqr` + a `bitnet` row + a `dense_ffn` arm; `test_bitnet_family` |
+| D5 | P2 | I2_S **embeddings** (BitNet-embedding-0.6B): `token_embd.weight` in I2_S is a lookup table, so its per-tensor scale has no projection to ride | **fixed** by materializing the table at load (scale folded in), which also covers `per_layer_token_embd` and a tied head | `test_i2_s_embedding`; the 1.0-instead-of-0.25 control was observed to fail |
+| D7 | P3 | `dot16_signed_lanes` (Q3_K/Q4_K hot path) keeps the `sign_epi8` trick and is exact only while the quantiser clamps activations to [-127, 127] | **pinned** | `test_q8_activation_domain` asserts the clamp; the reason is written at the kernel |
+| D6 | P2 | TL1 (38) / the fork's TL2 are not named: 38 falls out as "UNKNOWN (type id 38)" and 42 is resolved as Q2_0 by tensor geometry, so a fork TL2 file would decode as Q2_0 | todo | an explicit by-name refusal |
+
+### Activation of BitNet's FFN — the one deliberate contradiction
+
+llama.cpp's CPU port (`src/models/bitnet.cpp` @ `f5222f25`) builds the FFN with
+`LLM_FFN_SILU`; microsoft/BitNet's GPU reference (`gpu/model.py`) computes
+`ffn_sub_norm(squared_relu(gate) * up)`. Both are real and they disagree. The
+row follows the paper and the reference the weights were trained against
+(squared ReLU), recorded here because a later reader will find the llama.cpp
+line and think the flag is a mistake.
+
+### Open, NEEDS VERIFICATION: the synthetic fixtures' logits are scale-blind
+
+Measured while testing I2_S: for the synthetic 2-layer BitNet fixture, the
+two-token logits are **bitwise identical** across (a) I2_S weights with
+`gs = 0.125`, (b) the same weights as F16 at 0.125, and (c) the same weights as
+F16 at 1.0 -- `max|a-b| = max|a-c| = max|b-c| = 0` over all 260 logits. So a
+whole-model logits A/B cannot validate a weight scale in these fixtures, and
+the I2_S scale is pinned by a descriptor probe (dtype + `gs`) plus the byte-
+level code test instead. Hypothesis (unverified): the response is dominated by
+the tied head over `token_embd` and the layer contribution rounds away in f16
+activations. Consequence: any future "the scales are applied" claim that rests
+on a logits comparison in a synthetic fixture needs a fixture that is first
+shown to move when a weight scale moves.
+
+### Audit pass over the BitNet/2-bit work (goli-mat-de, before the commit)
+
+| id | pri | class | item | state |
+|---|---|---|---|---|
+| D8 | P3 | CONFIRMED (code path), SUSPECTED (impact) | the dense relu^2 arm does not apply `row_scaled` (there is no relu_sqr+mul+row-max kernel). Mathematically identical -- the sub-norm divides the scale back in -- but relu^2 is quadratic, so this arm reaches the f16 store with larger magnitudes than silu | documented at the arm; no fixture needed as it is a range guard, not a function |
+| D9 | P2 | NEEDS VERIFICATION | a *ternary* file whose `general.architecture` is `llama` (the HF1BitLLM Llama3-8B-1.58 and Falcon3-*-1.58bit exports may well be) gets SubLN from the tensor set but **silu**, not relu^2, because the inference is keyed on the arch row. No file of that shape was available to check, and inferring relu^2 from the presence of `ffn_sub_norm` alone would change the graph of every family that happens to carry one | open; needs one real file's metadata |
+
+Two integrity guards added while auditing:
+- `gguf.cpp` refuses an I2_S tensor whose 32-byte tail falls outside the shard
+  (the alternative is reading past the mapping and getting a scale of 4.6e-41,
+  i.e. an all-zero model that still runs).
+- the loader refuses an I2_S matmul whose inner dimension is not a multiple of
+  128: the payload is one flat run, so such a row shares its block with the
+  next one and a row-strided read decodes the padding as weights.

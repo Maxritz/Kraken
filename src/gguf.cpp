@@ -243,8 +243,25 @@ bool Gguf::parse_shard(MappedFile &f, i32 shard_index, bool keep_all_kv,
             if (err) *err = "tensor '" + t.name + "' overruns '" + f.path() + "'";
             return false;
         }
+        // I2_S carries a 32-byte scale tail past the payload. It is inside the
+        // declared tensor range only by construction, so check it here: reading
+        // it past the mapping would be the silent kind of wrong (a scale of
+        // 4.6e-41 -- i.e. every weight zero) rather than a crash.
+        size_t suffix = 0;
+        if (t.type == DType::I2_S) {
+            if (t.offset + bytes + 32 > f.size() - off) {
+                if (err)
+                    *err = "tensor '" + t.name +
+                           "' is I2_S but its 32-byte scale tail is past the end "
+                           "of '" + f.path() + "'";
+                return false;
+            }
+            suffix = 32;
+        }
         t.data = data_base + t.offset;
         t.n_bytes = bytes;
+        if (suffix)
+            t.tail = data_base + t.offset + bytes, t.tail_bytes = suffix;
     }
     return true;
 }
