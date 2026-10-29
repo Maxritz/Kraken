@@ -442,6 +442,10 @@ struct ModelConfig {
     // The gate activation differs by family while the tensor shape does not:
     // laguna softplus's `attn_gate`, muse-glimmer sigmoids it.
     bool attn_gate_sigmoid = false;
+    // The gate is per ELEMENT of the attention row, not per head (muse-glimmer).
+    bool attn_gate_wide = false;
+    // A weightless RMS norm on the embedding before layer 0 (muse-glimmer).
+    bool embd_rms_noweight = false;
     // gelu(gate) * up instead of silu(gate) * up (gemma).
     bool gelu_ffn = false;
     // ---- GPT-2 -----------------------------------------------------------

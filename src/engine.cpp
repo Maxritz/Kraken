@@ -3384,6 +3384,14 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     if (mc.embd_scale != 1.0f)
         be_->scale_act(ws_x_, mc.embd_scale, n, n_embd_, n_embd_);
 
+    // muse-glimmer RMS-normalizes the embedding before layer 0, with no weight
+    // and no bias (`inpL = build_norm(inpL, nullptr, ...)`). Skipping it leaves
+    // every row at whatever magnitude the table happened to have, which the
+    // first attn_norm then partly masks -- the run stays fluent and is not the
+    // model.
+    if (mc.embd_rms_noweight)
+        be_->rmsnorm(ws_x_, ws_x_, nullptr, n, n_embd_, mc.rms_eps);
+
     // ---- the per-layer input table (gemma4) ------------------------------
     // Built once per pass, before the first layer, because the model
     // projection and the token table are ONE matrix each covering every
@@ -3828,8 +3836,12 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // architecture (every 4th layer), so skipping it here is what the
             // file was trained with. Rotating anyway is a wrong answer that
             // still decodes.
+            // Two patterns skip the rotation, and both are the architecture's:
+            // smollm3's every-Nth NoPE layer, and muse-glimmer's full-attention
+            // layers (it rotates only on the sliding-window ones).
             const bool layer_rotates =
-                !(mc.no_rope_step > 0 && ((l + 1) % mc.no_rope_step) == 0);
+                !(mc.no_rope_step > 0 && ((l + 1) % mc.no_rope_step) == 0) &&
+                !(mc.rope_swa_only && !model_.is_swa(l));
             if (layer_rotates)
                 be_->rope(ws_q_, ws_k_, lh, lkvh, d.hd,
                           n, pos0, model_.inv_freq_at(l).data(), mc.rope_scale,
@@ -3879,17 +3891,27 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // is what makes it a gate on the attention result rather than on the
         // residual.
         if (mc.attn_gate && L.wattn_gate.present()) {
-            gemm_w(ws_agate_, L.h_attn_gate ? xn_att : ws_xn_, L.wattn_gate, lh, n_embd_, n);
+            // Two widths under one tensor name. laguna and spark2_5 project one
+            // value per head and broadcast it over that head's row;
+            // muse-glimmer projects one per element of the attention row, so
+            // its gate is as wide as the row itself.
+            const i64 gw = mc.attn_gate_wide ? lq : lh;
+            gemm_w(ws_agate_, L.h_attn_gate ? xn_att : ws_xn_, L.wattn_gate, gw,
+                   n_embd_, n);
             // Same tensor, two activations: laguna softplus's the gate,
-            // muse-glimmer sigmoids it. Getting this wrong is not a crash --
-            // every head is simply gated a little too hard, and the text stays
-            // fluent -- so the activation is a declared property of the arch.
+            // muse-glimmer and spark2_5 sigmoid it. Getting this wrong is not a
+            // crash -- every head is simply gated a little too hard, and the
+            // text stays fluent -- so the activation is a declared property of
+            // the arch.
             if (mc.attn_gate_sigmoid)
-                be_->sigmoid_act(ws_agate_, static_cast<i64>(n) * lh);
+                be_->sigmoid_act(ws_agate_, static_cast<i64>(n) * gw);
             else
-                be_->softplus_act(ws_agate_, static_cast<i64>(n) * lh);
-            dump_row("attn.gate", l, ws_agate_, lh, n);
-            be_->mul_head_broadcast(ws_attn_, ws_agate_, n, lh, mc.head_dim);
+                be_->softplus_act(ws_agate_, static_cast<i64>(n) * gw);
+            dump_row("attn.gate", l, ws_agate_, gw, n);
+            if (mc.attn_gate_wide)
+                be_->mul_act(ws_attn_, ws_agate_, static_cast<i64>(n) * lq);
+            else
+                be_->mul_head_broadcast(ws_attn_, ws_agate_, n, lh, mc.head_dim);
             dump_row("attn.gated", l, ws_attn_, lq, n);
         }
 

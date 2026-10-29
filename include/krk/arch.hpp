@@ -279,6 +279,17 @@ struct ArchSpec {
     // under another name -- the file carries both -- and skipping it leaves
     // every row at the wrong scale entering layer 0.
     bool embd_norm = false;
+    // muse-glimmer normalizes the embedding too, but with a WEIGHTLESS RMS and
+    // no tensor in the file (`inpL = build_norm(inpL, nullptr, ...)`). It is
+    // BLOOM's role with a different function, so it is a second flag rather
+    // than a variant of the first: a LayerNorm subtracts the mean and a
+    // weightless gamma cannot be read from a file that does not carry one.
+    bool embd_rms_noweight = false;
+    // The attention output gate is one value per ELEMENT of the attention row
+    // rather than one per head. Same tensor (`attn_gate.weight`), same place in
+    // the graph (on the attention result, before wo), different width: spark2_5
+    // projects n_head values and muse-glimmer projects n_head*head_dim.
+    bool attn_gate_wide = false;
     // Falcon's parallel branch has TWO norms, not one: the FFN is fed by its
     // own LayerNorm over the same pre-attention residual row the attention
     // read, rather than by the row the attention already normalized. GPT-NeoX

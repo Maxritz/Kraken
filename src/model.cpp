@@ -350,6 +350,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             : 1.0f;
     // muse-glimmer gates with a sigmoid where laguna gates with a softplus.
     cfg_.attn_gate_sigmoid = aspec.attn_gate_sigmoid;
+    cfg_.attn_gate_wide = aspec.attn_gate_wide;
+    cfg_.embd_rms_noweight = aspec.embd_rms_noweight;
     // Per-branch post norms, and the GeGLU FFN that comes with the gemma stack.
     // `post_norm_eps` 0 means "use the model's rms_eps", which is the gemma case;
     // muse-glimmer states its own 1e-8 for these two norms.
@@ -360,6 +362,12 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // the call -- the gemma eps override is applied further down, AFTER this
     // point, so resolving it here would capture the pre-override value.
     cfg_.post_norm_eps = static_cast<f32>(aspec.post_norm_eps);
+    // A file that states the eps wins over the arch's constant: gemma writes
+    // none (its 1e-6 is the body's), muse-glimmer's converter may, and a
+    // family whose post norms run at a different eps from its body produces a
+    // different graph -- not a slightly different one.
+    if (const f64 pe = gguf_.get_f64(key(".post_norm_epsilon"), 0.0); pe > 0.0)
+        cfg_.post_norm_eps = static_cast<f32>(pe);
     cfg_.gelu_ffn = aspec.gelu_ffn;
     cfg_.gpt2_style = aspec.gpt2_style;
     cfg_.fused_qkv = aspec.fused_qkv;
@@ -1989,8 +1997,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // and a family that carries the gemma branch norm declares it above.
         if (!L.ffn_norm)
             L.ffn_norm = upload_f32(blk_key("blk.%d.post_attention_norm.weight", l));
-        if (!L.ffn_norm && !cfg_.post_branch_norm)
-            L.ffn_norm = upload_f32(blk_key("blk.%d.attn_post_norm.weight", l));
+
         // nemotron_h / nemotron_h_moe have no second norm at all: the converter
         // applies attn_norm before BOTH sub-blocks (the file carries one norm
         // per layer and the graph reads it twice), so the FFN consumes
@@ -3260,14 +3267,27 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                            " attention tensors disagree with the declared head geometry";
                 return false;
             }
-            // laguna's output gate is one scalar per query head, projected
-            // from the embedding, so its shape is a second, independent check
-            // of the head count this layer is supposed to have.
-            if (cfg_.attn_gate &&
-                (L.wattn_gate.n_out != head_at(l) || L.wattn_gate.n_in != cfg_.n_embd)) {
+        }
+        // The attention output gate's shape, checked for every layer that
+        // carries one -- not only the MoE layers, which is where this test
+        // first lived: muse-glimmer and spark2_5 are DENSE, so a gate bound to
+        // the wrong axis would have been broadcast over the wrong width with no
+        // error at all. The width is the family's own: one value per head
+        // (laguna, spark2_5) or one per element of the attention row
+        // (muse-glimmer).
+        if (cfg_.attn_gate && L.wattn_gate.present()) {
+            const i64 want_gate =
+                cfg_.attn_gate_wide
+                    ? static_cast<i64>(head_at(l)) * cfg_.head_dim
+                    : static_cast<i64>(head_at(l));
+            if (L.wattn_gate.n_out != want_gate || L.wattn_gate.n_in != cfg_.n_embd) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
-                           " attention output gate disagrees with the head count";
+                           " attention output gate is " +
+                           std::to_string(L.wattn_gate.n_out) +
+                           " wide, expected " + std::to_string(want_gate) +
+                           " (this architecture gates the attention row " +
+                           (cfg_.attn_gate_wide ? "per element)" : "per head)");
                 return false;
             }
         }

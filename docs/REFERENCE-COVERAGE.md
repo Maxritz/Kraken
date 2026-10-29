@@ -63,10 +63,10 @@ table, refused with a reason. `—` = not in the table yet.
 | DeepSeek-V3 | `deepseek2` | ✓ | MLA |
 | DeepSeek-V4 / V4-Flash-Vision-Exp / V4.1 | `deepseek4`, `deepseek41` | △ | compressed attention + sparse indexer read; streams/multi-sequence open |
 | Kimi-2 / K2-Horizon | `k2-horizon` | No | table entry, refused |
-| Muse-Glimmer | `muse-glimmer` | No | table entry, refused |
+| Muse-Glimmer | `muse-glimmer` | ✓ | weightless embedding norm, per-element sigmoid gate, branch post norms at 1e-8, rope on the windowed layers only |
 | DSpark / DFlash | `dspark`, `dflash` | No / ✓ | `dflash` + `dflash-draft` run |
 | MiniMax-M3 | `minimax-m3` | No | table entry, refused |
-| Spark 2.5 | `spark2_5` | No | table entry, refused |
+| Spark 2.5 | `spark2_5` | ✓ | fused `attn_qkv` row + per-head sigmoid gate |
 | MiniCPM5 | `minicpm3` (`minicpm` v1/v2) | ✓ | |
 | Mellum2 | `mellum` | ✓ | |
 | Laguna XS.2 / M.1 | `laguna` | ✓ | |

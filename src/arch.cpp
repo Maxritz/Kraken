@@ -992,17 +992,50 @@ constexpr ArchSpec kTable[] = {
      "MiniMax Sparse Attention (block-sparse, no dense prefix), a native "
      "vision/video tower and a DSpark draft head are not implemented",
      false, false, false, false},
-    // Dense FFN with an attention output gate and Gemma-style post-norms.
-    {"muse-glimmer", ArchShape::Dense, ArchSupport::No, ArchRole::Target,
-     "muse-glimmer",
-     "the attention output gate and the post-attention/post-FFN norms are not "
-     "implemented",
-     true, false, false, false},
-    // One fused projection for q/k/v plus a gate on the attention output.
-    {"spark2_5", ArchShape::Dense, ArchSupport::No, ArchRole::Target, "spark2_5",
-     "a fused attn_qkv projection and an attention output gate are not "
-     "implemented",
-     false, false, false, false},
+    // muse-glimmer (dense): four pieces of its own around llama's block, read
+    // off llama.cpp's src/models/muse-glimmer.cpp.
+    //   * a WEIGHTLESS RMS norm on the embedding before layer 0 (`build_norm(
+    //     inpL, nullptr, ...)`), which no tensor in the file describes;
+    //   * an attention output gate projected from the pre-attention row,
+    //     sigmoid'd, and multiplied ELEMENTWISE into the attention result
+    //     before wo -- the same tensor spark2_5 uses at one value per head, so
+    //     the width is what tells the two graphs apart;
+    //   * a post norm on each branch before it joins the residual, with its own
+    //     eps (1e-8 against a 1e-5 body);
+    //   * RoPE on the sliding-window layers only -- the full-attention layers
+    //     rotate nothing, the opposite of the usual arrangement.
+    [] {
+        // `gemma_spec` is not reused: this family's norms are gemma's in SHAPE
+        // and not in position, and its FFN is SwiGLU where gemma's is GeGLU.
+        ArchSpec s{"muse-glimmer", ArchShape::Dense, ArchSupport::Yes,
+                   ArchRole::Target, "llama", "",
+                   /*qk_norm=*/true, /*q_output_gate=*/false,
+                   /*qkv_bias=*/false, /*gemma_norm=*/false,
+                   /*attn_gate=*/true, /*rope_neox=*/false};
+        s.attn_gate_sigmoid = true;
+        s.attn_gate_wide = true;
+        s.post_branch_norm = true;
+        s.post_norm_eps = 1e-8f;
+        s.embd_rms_noweight = true;
+        s.rope_swa_only = true;
+        return s;
+    }(),
+    // spark2_5: llama's block with a fused `attn_qkv` row and a per-head
+    // sigmoid gate on the attention output (before wo), GeGLU-free but GELU
+    // gated FFN, NeoX rope, and a sliding window on its own pattern. The gate
+    // is `attn_gate.weight` at one value per head -- muse-glimmer's tensor at a
+    // different width, which is why the two entries differ by one flag.
+    [] {
+        ArchSpec s{"spark2_5", ArchShape::Dense, ArchSupport::Yes,
+                   ArchRole::Target, "llama", "",
+                   /*qk_norm=*/false, /*q_output_gate=*/false,
+                   /*qkv_bias=*/false, /*gemma_norm=*/false,
+                   /*attn_gate=*/true, /*rope_neox=*/true};
+        s.fused_qkv = true;
+        s.attn_gate_sigmoid = true;
+        s.gelu_ffn = true;
+        return s;
+    }(),
     // LLaDA-family masked-diffusion model: bidirectional attention over the
     // whole sequence, a block denoising schedule, and MoE expert routing with
     // group-limited selection and a routing bias. See docs/LLaDA.md for the
