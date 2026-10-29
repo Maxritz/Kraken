@@ -3714,6 +3714,16 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         if (L.q_bias) be_->add_bias_rows(ws_q_, L.q_bias, lq, n);
         if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, lkv, n);
         if (L.v_bias) be_->add_bias_rows(ws_v_, L.v_bias, lkv, n);
+        // A FUSED projection carries one bias laid out Q | K | V, i.e. the same
+        // split as the weight -- so it is three offsets into one vector, not a
+        // fourth tensor. The plain family's loop has always done this; this
+        // path did not, which silently dropped the bias for any fused-qkv
+        // family that carries one and still decodes fluent text.
+        if (L.qkv_bias) {
+            be_->add_bias_rows(ws_q_, L.qkv_bias, lq, n);
+            be_->add_bias_rows(ws_k_, L.qkv_bias + lq, lkv, n);
+            be_->add_bias_rows(ws_v_, L.qkv_bias + lq + lkv, lkv, n);
+        }
         // QSA: the indexer's own projections and its block selection, computed
         // from the same normed input q/k/v read and BEFORE rope touches
         // anything (the indexer rotates pooled keys and its own queries, not

@@ -80,6 +80,8 @@ table, refused with a reason. `—` = not in the table yet.
 | XVERSE | `xverse` | ✓ | llama's block verbatim |
 | Seed-OSS | `seed_oss` | ✓ | its FFN pre-norm is named `attn_post_norm` (loader fallback) |
 | SmolLM3 | `smollm3` | ✓ | NoPE: every 4th layer rotates nothing |
+| Qwen1 | `qwen` | ✓ | one fused `attn_qkv` row, NeoX rope |
+| InternLM2 | `internlm2` | ✓ | the same fused row, adjacent-pair rope |
 | Hunyuan-MoE | `hunyuan-moe` | — | shared expert + QK norm |
 | Ernie 4.5 / 4.5-MoE | `ernie4_5`, `ernie4_5-moe` | — | shared-expert bank |
 | grok-2 | `grok` | — | attn/ffn out norms + layer-out norm |
@@ -104,8 +106,11 @@ Counts at `1c5ea12`: **100** arch strings upstream, **52** in this table
 
 1. **Aliases onto graphs already implemented** — cheapest, and each one is a
    test away. Done this pass: `olmo`, `olmo2`, `xverse`, `seed_oss`, `smollm3`.
-   Left: `openelm` (fused qkv + QK norm), `plamo`, `codeshell` (GELU MLP),
-   `jais` (fused qkv, **no rope at all**), `orion`, `deci`, `granite`.
+   Done this pass too: `qwen`, `internlm2` (both fused-qkv, opposite pairings).
+   Left: `openelm` (fused qkv + QK norm), `plamo` (FFN reads the attention
+   output, no second norm), `codeshell`/`starcoder2` (LayerNorm + ungated GELU),
+   `jais` (fused qkv, **no rope at all**), `orion`, `deci`, `granite` (three
+   multipliers: embedding, residual, logit).
 2. **Families whose extra tensors are already bound** — `qwen2moe` and `lfm2`
    went in this pass; next are `hunyuan-moe`, `dots1`, `ernie4_5(-moe)`,
    `bailingmoe2`, `cohere2_moe`, `mimo2`, `grok`.

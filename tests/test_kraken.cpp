@@ -5661,6 +5661,186 @@ static bool variant_logits(const std::string &p, std::vector<f32> &lg,
     return ok;
 }
 
+// ---- the fused-projection pair: qwen and internlm2 -----------------------
+//
+// Both store ONE `attn_qkv` row of Q | K | V, so the split is a stride; both
+// are otherwise llama's block. They differ only in the rope pairing (qwen is
+// NeoX, internlm2 is adjacent-pair), which makes the pair a direct test of the
+// flag: the SAME weights written as one fused row must reproduce the same
+// answer as three separate projections, and the pairing must move it.
+struct FusedSpec {
+    std::string arch = "qwen";
+    bool fused = true;      // false => three separate q/k/v tensors
+    bool qkv_bias = false;  // one bias laid out Q | K | V
+    f32 q_bias = 0.0f;      // added to the Q slice when qkv_bias is set
+};
+
+static bool build_fused_model(const std::string &path, const FusedSpec &v) {
+    const int n_embd = 32, n_layer = 2, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, ctx = 64;
+    const std::string &arch = v.arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-fused-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base, f32 scale) {
+        std::vector<f32> out(n);
+        for (size_t i = 0; i < n; i++)
+            out[i] = scale * wv(base + static_cast<i64>(i));
+        return out;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0, 1.0f));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (v.fused) {
+            // Q | K | V in one row: q rows first, then k, then v. Written as
+            // three slices of one tensor so the split path and the fused path
+            // read byte-identical weights.
+            std::vector<f32> w;
+            w.reserve(static_cast<size_t>(n_embd) * (q_dim + 2 * kv_dim));
+            for (f32 x : vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f))
+                w.push_back(x);
+            b.tensor_f16(p + "attn_qkv.weight", {u64(n_embd), u64(q_dim + 2 * kv_dim)}, w);
+            if (v.qkv_bias) {
+                std::vector<f32> bias(static_cast<size_t>(q_dim + 2 * kv_dim), 0.0f);
+                for (int i = 0; i < q_dim; i++) bias[static_cast<size_t>(i)] = v.q_bias;
+                b.tensor_f32(p + "attn_qkv.bias", {u64(q_dim + 2 * kv_dim)}, bias);
+            }
+        } else {
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                         vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f));
+        }
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+    }
+    return b.write(path);
+}
+
+static void test_fused_projection_pair() {
+    {
+        const ArchSpec *q1 = arch_lookup("qwen");
+        CHECK(q1 && q1->support == ArchSupport::Yes, "qwen is supported");
+        CHECK(q1 && q1->fused_qkv && q1->rope_neox,
+              "and declares the fused Q|K|V row with the NeoX rope pairing");
+        CHECK(q1 && !q1->qkv_bias, "with no bias tensor");
+        const ArchSpec *il = arch_lookup("internlm2");
+        CHECK(il && il->support == ArchSupport::Yes, "internlm2 is supported");
+        CHECK(il && il->fused_qkv && !il->rope_neox,
+              "and differs from qwen in exactly one thing: the rope pairing");
+    }
+
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 m = 0.0f;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+
+    // ---- fused Q|K|V == three separate projections -----------------------
+    // The same numbers written two ways, read by two code paths. This is the
+    // arm that makes the fused path a statement about the SPLIT rather than
+    // about a fixture that only ever had one shape.
+    std::vector<f32> split_lg, fused_lg;
+    std::string err;
+    {
+        FusedSpec sp;
+        sp.arch = "qwen";
+        sp.fused = false;  // three tensors, but declared `qwen` (fused allowed,
+                           // absent, so the loader takes the split path)
+        const std::string f = "kraken-fused-split.gguf";
+        CHECK(build_fused_model(f, sp), "wrote the split q/k/v file");
+        CHECK(variant_logits(f, split_lg, err), ("the split file runs: " + err).c_str());
+    }
+    {
+        FusedSpec fz;
+        fz.arch = "qwen";
+        fz.fused = true;
+        const std::string f = "kraken-fused-qkv.gguf";
+        CHECK(build_fused_model(f, fz), "wrote the fused attn_qkv file");
+        CHECK(variant_logits(f, fused_lg, err), ("the fused file runs: " + err).c_str());
+    }
+    if (!split_lg.empty() && !fused_lg.empty())
+        CHECK(maxdiff(split_lg, fused_lg) == 0.0f,
+              "the fused Q|K|V row reproduces the three separate projections exactly");
+
+    // ---- the fused bias --------------------------------------------------
+    // The bias is one vector laid out Q | K | V. A bias of +0.5 on the Q slice
+    // only must move the answer; before this pass the main forward added
+    // q_bias/k_bias/v_bias and never qkv_bias, so the bias was dropped and the
+    // model decoded fluent text without it.
+    std::vector<f32> bias_lg;
+    {
+        FusedSpec fb;
+        fb.arch = "qwen";
+        fb.fused = true;
+        fb.qkv_bias = true;
+        fb.q_bias = 0.5f;
+        const std::string f = "kraken-fused-qkvbias.gguf";
+        CHECK(build_fused_model(f, fb), "wrote the fused file with a Q-only bias");
+        if (variant_logits(f, bias_lg, err)) {
+            CHECK(!fused_lg.empty() && maxdiff(fused_lg, bias_lg) > 0.0f,
+                  "the fused attn_qkv bias reaches the projection");
+        } else {
+            CHECK(false, ("the biased fused file runs: " + err).c_str());
+        }
+    }
+
+    // ---- the two pairings are not the same model -------------------------
+    // internlm2 is qwen's file with the other pairing declared. If the flag
+    // were ignored the two would agree exactly, and every token would still be
+    // in a plausible range -- which is why the arm compares logits and not text.
+    {
+        FusedSpec il;
+        il.arch = "internlm2";
+        const std::string f = "kraken-fused-internlm2.gguf";
+        CHECK(build_fused_model(f, il), "wrote the internlm2 file");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) {
+            CHECK(!fused_lg.empty() && maxdiff(fused_lg, lg) > 0.0f,
+                  "the rope pairing moves the answer: it is read per arch");
+        } else {
+            CHECK(false, ("internlm2 runs: " + err).c_str());
+        }
+    }
+}
+
 static void test_llama_variants() {
     // The table first: each entry has to be recognised AND carry the flag that
     // is the whole reason it exists. A copy-paste that dropped the flag would
@@ -21082,6 +21262,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_per_layer_head_width)
     TEST_GROUP(test_gemma4_forward)
     TEST_GROUP(test_llama_variants)
+    TEST_GROUP(test_fused_projection_pair)
     TEST_GROUP(test_lfm2_dense)
     TEST_GROUP(test_qwen2moe)
     TEST_GROUP(test_arch_table)
