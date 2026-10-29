@@ -5,6 +5,7 @@
 #include "krk/verdict.hpp"
 #include "krk/vram_guard.hpp"
 #include "krk/backend.hpp"
+#include "krk/dsv4_compress.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -440,6 +441,17 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.ln_bias = aspec.ln_bias;
     cfg_.learned_pos = aspec.learned_pos;
     cfg_.parallel_residual = aspec.parallel_residual;
+    // The residual SHAPE as an A/B arm, for the same reason KRK_ROPE_NEOX is
+    // one: parallel (GPT-NeoX) and sequential (GPT-2/Phi-2) differ by whether
+    // the FFN reads the attention norm or a fresh norm of the updated stream,
+    // and on a fixture whose two rows differ in OTHER flags too a logits diff
+    // cannot say which one moved. With the override the same file runs both
+    // graphs and the difference is the graph and nothing else.
+    // An EMPTY value means unset: clear_env_var() in the tests sets "" rather
+    // than unsetting, and a cleared hatch must restore the row's answer or a
+    // test that reads the row back gets the forced one.
+    if (const char *pr = std::getenv("KRK_PARALLEL_RESIDUAL"))
+        if (*pr) cfg_.parallel_residual = pr[0] != '0';
     cfg_.no_gate_ffn = aspec.no_gate_ffn;
     cfg_.embd_norm = aspec.embd_norm;
     cfg_.parallel_two_norm = aspec.parallel_two_norm;
@@ -534,6 +546,13 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         gguf_.find(key(".expert_weights_norm")) != nullptr
             ? (gguf_.get_bool(key(".expert_weights_norm")) ? 1 : 0)
             : -1;
+    // The same A/B hatch for the top-k weight rule. olmoe's row says the softmax
+    // weights are used as emitted, qwen's rows renormalize them, and a file that
+    // states `expert_weights_norm` wins over both -- so the ONLY way to measure
+    // what the flag does on one file is to force it.
+    // Empty means unset, for the reason given at KRK_PARALLEL_RESIDUAL.
+    if (const char *ew = std::getenv("KRK_EXPERT_W_NORM"))
+        if (*ew) cfg_.expert_w_norm = ew[0] == '0' ? 0 : 1;
     // A file that is silent on it takes its architecture's default, and the two
     // answers are not close: gpt-oss routes 128 experts and its top four hold
     // ~13% of the softmax mass, so renormalizing them multiplies each layer's
@@ -875,6 +894,17 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             gguf_.get_i64(key(".hash_layer_count"), 0));
         cfg_.dsv4_compress_rope_base = static_cast<f32>(
             gguf_.get_f64(key(".attention.compress_rope_freq_base"), 0.0));
+        // The lightning indexer's geometry. Read whenever the file declares it
+        // so a half-declared indexer is caught here, before a layer that needs
+        // it is loaded; a dense-core V4 file carries none and is not asked.
+        if (gguf_.find(key(".attention.indexer.head_count")) != nullptr) {
+            cfg_.idx_n_head = static_cast<i32>(
+                gguf_.get_i64(key(".attention.indexer.head_count"), 0));
+            cfg_.idx_head_dim = static_cast<i32>(
+                gguf_.get_i64(key(".attention.indexer.key_length"), 0));
+            cfg_.idx_top_k = static_cast<i32>(
+                gguf_.get_i64(key(".attention.indexer.top_k"), 0));
+        }
         std::vector<i64> ratios;
         const bool have_ratios =
             gguf_.get_i64_array(key(".attention.compress_ratios"), &ratios);
@@ -887,6 +917,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                                std::to_string(v) + " (want 0, 4 or 128)";
                     return false;
                 }
+        }
+        // A CSA layer (ratio 4) cannot run without the indexer's geometry: the
+        // selection is what makes the pool sparse, and a layer that attended
+        // EVERY pooled block instead would be an HCA layer with the wrong
+        // arithmetic. HCA (ratio 128) needs none of it.
+        bool any_csa = false;
+        for (i64 v : ratios) any_csa = any_csa || v == kDsv4CsaRatio;
+        if (any_csa && (cfg_.idx_n_head <= 0 || cfg_.idx_head_dim <= 0 ||
+                        cfg_.idx_top_k <= 0)) {
+            if (err)
+                *err = "arch '" + a + "': compress_ratios carries a 4 (CSA) and "
+                       "the file declares no indexer geometry "
+                       "(attention.indexer.head_count/key_length/top_k)";
+            return false;
         }
         if (cfg_.dsv4_o_groups <= 0 || cfg_.dsv4_o_lora <= 0 ||
             cfg_.dsv4_window <= 0 || cfg_.dsv4_compress_rope_base <= 0.0f ||
@@ -2998,6 +3042,101 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                                  "[load ] %-24s %7.3f MiB/layer\n",
                                  "mla f16 staging",
                                  static_cast<f64>(stage_bytes) / 1048576.0);
+
+                // ---- the CSA/HCA compressor (optional, per layer) --------
+                // A layer whose compress_ratio is non-zero attends a stream of
+                // POOLED keys as well as the raw window, and the pool is a
+                // projection of the layer's input through tables the file
+                // carries. They are read as HOST f32 here because the pool is
+                // the host oracle's arithmetic (src/dsv4_compress.cpp), whose
+                // three silent-wrong details -- the per-channel softmax, the
+                // overlapping halves and the block-start rope position -- are
+                // pinned by the suite; a quantized read would be a second
+                // dequant path for numbers that are then fed to one scalar
+                // routine.
+                //
+                // A file that declares a ratio and carries no tables is
+                // REFUSED rather than run as a dense layer: that is the shape
+                // that decodes plausible text from a graph the file does not
+                // describe.
+                if (l < static_cast<i32>(cfg_.dsv4_ratio.size()) &&
+                    cfg_.dsv4_ratio[static_cast<size_t>(l)] != 0) {
+                    const i32 ratio = cfg_.dsv4_ratio[static_cast<size_t>(l)];
+                    const i64 hd = cfg_.mla_kv_lora;
+                    const i64 coff = ratio == kDsv4CsaRatio ? 2 : 1;
+                    const i64 sw = coff * hd;
+                    auto load_host = [&](const char *suffix, i64 want,
+                                        std::vector<f32> &out) -> bool {
+                        const std::string fmt = std::string("blk.%d.") + suffix;
+                        const std::string tname = blk_key(fmt.c_str(), l);
+                        const GgufTensor *t = gguf_.tensor(tname);
+                        if (!t) {
+                            e = "layer " + std::to_string(l) +
+                                " compresses with ratio " + std::to_string(ratio) +
+                                " and the file has no " + tname;
+                            return false;
+                        }
+                        if (static_cast<i64>(t->n_elements) != want) {
+                            e = tname + " has " +
+                                std::to_string(t->n_elements) +
+                                " elements; the declared geometry wants " +
+                                std::to_string(want);
+                            return false;
+                        }
+                        out.assign(static_cast<size_t>(want), 0.0f);
+                        const i64 row_w = static_cast<i64>(t->ne[0]);
+                        const i64 rows = want / (row_w > 0 ? row_w : 1);
+                        const size_t rb = dtype_row_bytes(t->type, row_w);
+                        const u8 *src = static_cast<const u8 *>(t->data);
+                        for (i64 r = 0; r < rows; r++)
+                            dequant_row(t->type, src + static_cast<size_t>(r) * rb,
+                                        out.data() + static_cast<size_t>(r * row_w),
+                                        row_w);
+                        return true;
+                    };
+                    if (!load_host("attn_compressor_wkv.weight", cfg_.n_embd * sw,
+                                   L.comp_wkv) ||
+                        !load_host("attn_compressor_wgate.weight", cfg_.n_embd * sw,
+                                   L.comp_wgate) ||
+                        !load_host("attn_compressor_ape.weight", sw * ratio,
+                                   L.comp_ape) ||
+                        !load_host("attn_compressor_norm.weight", hd,
+                                   L.comp_norm)) {
+                        if (err) *err = e;
+                        return false;
+                    }
+                    // The lightning indexer exists on CSA layers only, and its
+                    // own compressor is always the two-wide overlapping one --
+                    // that is the reference's shape (deepseek4.cpp:134-142),
+                    // not a choice this engine makes.
+                    if (ratio == kDsv4CsaRatio) {
+                        if (cfg_.idx_n_head <= 0 || cfg_.idx_head_dim <= 0) {
+                            e = "layer " + std::to_string(l) +
+                                " compresses with ratio 4 and the file declares "
+                                "no indexer geometry";
+                            if (err) *err = e;
+                            return false;
+                        }
+                        const i64 ih = cfg_.idx_head_dim;
+                        const i64 inh = cfg_.idx_n_head;
+                        if (!load_host("indexer_proj.weight", cfg_.n_embd * inh,
+                                       L.idx_proj) ||
+                            !load_host("indexer_attn_q_b.weight",
+                                       static_cast<i64>(cfg_.mla_q_lora) * inh * ih,
+                                       L.idx_q_b) ||
+                            !load_host("indexer_compressor_wkv.weight",
+                                       cfg_.n_embd * 2 * ih, L.idx_wkv) ||
+                            !load_host("indexer_compressor_wgate.weight",
+                                       cfg_.n_embd * 2 * ih, L.idx_wgate) ||
+                            !load_host("indexer_compressor_ape.weight",
+                                       2 * ih * ratio, L.idx_ape) ||
+                            !load_host("indexer_compressor_norm.weight", ih,
+                                       L.idx_norm)) {
+                            if (err) *err = e;
+                            return false;
+                        }
+                    }
+                }
             }
         } else if (gguf_.tensor(blk_key("blk.%d.attn_q.weight", l)) ||
                    gguf_.tensor(blk_key("blk.%d.attn_qkv.weight", l)) ||
@@ -4216,6 +4355,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                              static_cast<f64>(bucket_b[i]) / 1048576.0);
         std::fflush(stderr);
     }
+    // The per-head QK norm as an A/B arm, for the same reason KRK_ROPE_NEOX is
+    // one: the flag is set per layer by whether the tensors are there, so the
+    // only way to measure what the norm DOES on a file that has them is to turn
+    // it off on that same file. Comparing a normed family against an unnormed
+    // one measures two rows, not the norm -- measured on the qwen3moe/qwen2moe
+    // pair, 1.24 total of which 0.56 is the top-k weight rule. Empty means
+    // unset (clear_env_var in the tests sets "").
+    if (const char *qn = std::getenv("KRK_QK_NORM"))
+        if (*qn) cfg_.qk_norm = qn[0] != '0';
     lp.mark("post-load (rope table etc)");
     return true;
 }

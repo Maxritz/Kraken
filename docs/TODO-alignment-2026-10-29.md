@@ -24,16 +24,20 @@ Status legend: **todo** · **done** · **blocked (why)**
 
 ## Open
 
+Every row below is CLOSED as of this commit; the closing check names the
+measurement that closed it and the negative control that was observed, so a row
+cannot read as fixed on the strength of a passing group alone.
+
 | ID | P | Item | Status | Closing check |
 |----|---|------|--------|---------------|
-| B1b | P2 | isolate the MiniCPM3 head-input multiply numerically (config + finiteness is not the same as "the logits move by exactly 8.0") | todo | two files of one arch that differ only in the constant |
-| B2b | P2 | same for the FFN-side residual scale | todo | FFN-branch A/B on the minicpm3 fixture |
+| B1b | P2 | isolate the MiniCPM3 head-input multiply numerically (config + finiteness is not the same as "the logits move by exactly 8.0") | **fixed** | the head row dumped on both sides of the multiply on a 4-layer minicpm3 fixture: every layer's head input is its pre-multiply row x scale, worst relative error `5.72205e-06` at peak 18.35 (f32 ulp), and a twin stating a different constant moves the logits |
+| B2b | P2 | same for the FFN-side residual scale | **fixed** | FFN-branch A/B on the same fixture: all 4 layers' residual contribution equals `ffn.pre * 0.7`, worst `9.53674e-07` at peak 4.27, and the layer count is reported so a run that measured none cannot read as a pass |
 | B3b | P2 | linear (non-YaRN) rope scaling on a windowed half: the factor rides one stack-wide `mc.rope_scale`, so a windowed layer cannot carry its own 1.0 | **fixed** | `ModelConfig::rope_scale_layer` + `Model::rope_scale_at(l)`, resolved in `Model::load` for a family whose windowed layers rotate with plain rope (`ArchSpec::swa_plain_rope`: olmo2, mellum) when the file scales linearly and declares a window; the four engine rope sites now pass the layer's own divisor. YaRN leaves the vector empty (its factor is already in the table), as does any file with no window. `test_windowed_rope_scale` (18 checks): the config arm (layers 0..2 -> 1.0, layer 3 -> 2.0), the two "nothing else changes" twins (no window, YaRN), and the rotation itself -- `attn.q` reproduces a hand rotation at position/1.0 (md 9.5e-7) and NOT at position/2.0 (md 3.76). Negative control observed: with the stack-wide value restored the match inverts (pos/2 md 8.3e-7, pos/1 md 3.76), 16/18 |
 | B4 | P2 | a real `gemma4` fixture (per-layer embeddings + shared-KV + two-branch MoE) so the row is graph-tested, not row-tested | **fixed** | `build_gemma4_model` (16-wide, 4 layers, 2 shared-KV, per-layer embedding table, routed two-branch variant) runs end to end in `test_gemma4_forward`; the attention scale is now pinned on the real file rather than on `llama` lookalikes: `mc.attn_scale == 1.0` from the row, and a twin stating 1/sqrt(head_dim) = 0.3536 moves the three-token logits row by **0.3058**. Negative control observed: row constant removed -> both arms fail (42/44) |
-| B5 | P2 | forward fixtures for `minicpm`, `minicpm`-v1 scales, `olmoe`, `qwen3moe`, `nemotron_h*`, and the `parallel_residual` graph A/B for gptneox/phi2 | todo | one group per family; the A/B moves the logits |
-| B6 | P2 | gemma2/gemma3 **27B** use `1/√(n_embd/n_head)` rather than `1/√head_dim`; only the model type says which, and metadata does not carry it | todo | either a size-keyed rule with a fixture, or a documented limitation |
-| B7 | P1 | DeepSeek's YaRN `mscale²` attention scale (`attn_factor*(1+0.1*log_mul*ln(factor))`, squared, over √key_length; the file's `yarn_log_multiplier` is divided by 0.1 first). The inputs are read (`rope_yarn_factor`/`rope_yarn_log_mul`) and not applied | todo | a deepseek2/V4 YaRN fixture whose scores match the formula |
-| C1 | P1 | `deepseek4`/`deepseek41` compressed attention: the engine still refuses a non-zero `compress_ratio` (`mla_shared_forward_compressed` exists test-only) | **blocked** (a feature, not a defect; the rows are `Partial`) | end-to-end V4 file with compression runs |
+| B5 | P2 | forward fixtures for `minicpm`, `minicpm`-v1 scales, `olmoe`, `qwen3moe`, `nemotron_h*`, and the `parallel_residual` graph A/B for gptneox/phi2 | **fixed** | one group per family (7 groups, 49 checks); every A/B moves the logits — minicpm 0.59714, olmoe 0.4228, qwen3moe 0.7258, gptneox 2.11504, phi2 3.46209, nemotron_h 0.0245, nemotron_h_moe 0.0535 — and each collapse to 0 was observed with the behaviour removed |
+| B6 | P2 | gemma2/gemma3 **27B** use `1/√(n_embd/n_head)` rather than `1/√head_dim`; only the model type says which, and metadata does not carry it | **fixed** | the size-keyed rule is on the row (`gemma2` 46 layers, `gemma3` 62, 0 everywhere else) and `test_gemma_27b_scale` pins it on fixtures: a 46-layer gemma2 gets `1/√(n_embd/n_head)`, a 62-layer gemma3 the same, and a twin declaring `head_dim` 16 against the same `n_embd/n_head` of 8 separates the two formulas (they coincide in the miniature, which is why the second fixture exists) |
+| B7 | P1 | DeepSeek's YaRN `mscale²` attention scale (`attn_factor*(1+0.1*log_mul*ln(factor))`, squared, over √key_length; the file's `yarn_log_multiplier` is divided by 0.1 first) | **fixed** | `test_deepseek_yarn_mscale` on a YaRN fixture: `mscale(factor 40, log_mul 0.1) = 1.36889`, giving `qk = 1.87385x` the plain `1/√key_length`; a twin carrying `log_mul 0.05` moves the logits by `0.101924` at peak 1.57344, and a plain-rope twin by `0.239383` |
+| C1 | P1 | `deepseek4`/`deepseek41` compressed attention: the engine still refuses a non-zero `compress_ratio` (`mla_shared_forward_compressed` exists test-only) | **fixed** | end-to-end V4 file with compression runs: a CSA (ratio 4 + indexer) layer and an HCA (ratio 128) layer load and generate, and the same weights with the ratios off differ by md 0.06096 (CSA, 9 tokens) and 0.000433 (HCA, 134 tokens); control observed, dispatch disabled -> md 0 on both |
 
 ## Notes
 
@@ -224,8 +228,40 @@ open on purpose.
       Fixture trap recorded at the arm: a ONE-token prompt cannot see the
       attention scale at all (softmax over one key cancels it exactly), which
       is why the A/B uses three tokens.
-- [ ] **B5 (P2)** forward fixtures for minicpm / olmoe / qwen3moe /
-      nemotron_h*, and the `parallel_residual` graph A/B.
-- [ ] **C1 (P1, blocked)** DeepSeek-V4 compressed attention: a feature, not a
-      defect. The rows are `Partial` and the engine refuses a non-zero
-      `compress_ratio` by name.
+- [x] **B5 (P2)** forward fixtures for minicpm / olmoe / qwen3moe /
+      nemotron_h*, and the `parallel_residual` graph A/B. One test group per
+      family (`test_minicpm_embedding_scale_forward`,
+      `test_olmoe_expert_weight_forward`, `test_qwen3moe_forward`,
+      `test_gptneox_forward`, `test_phi2_forward`, `test_nemotron_h_forward`,
+      `test_nemotron_h_moe_forward`; 49 checks). Measured: 12x on the minicpm
+      embedding vs the same weights as `llama` md 0.59714; olmoe's top-k rule
+      forced on md 0.4228; qwen3moe's per-head QK norm off md 0.7258 (the
+      `qwen2moe` twin was REJECTED as evidence: the two rows also differ in the
+      top-k rule, and with the norm forced off the pair still differs by
+      0.5562, so a new one-file `KRK_QK_NORM` hatch replaced it); gptneox
+      residual 0 vs 1 md 2.11504, phi2 3.46209; nemotron_h A=0 twin md
+      0.0245, nemotron_h_moe 0.0535, and chunk 1 vs 8 md 0 for both. Negative
+      controls observed: with the minicpm scale forced to 1.0 md=0, with
+      `KRK_EXPERT_W_NORM` ignored md=0, with `KRK_QK_NORM` ignored md=0, with
+      `KRK_PARALLEL_RESIDUAL` ignored md=0 on BOTH plain families, and with the
+      nemotron twin built at the same A md=0 -- each collapse turns the arm red.
+- [x] **C1 (P1)** DeepSeek-V4 compressed attention. The loader reads the
+      per-layer `attn_compressor_{wkv,wgate,ape,norm}` tables and, on ratio-4
+      layers, the indexer's (`indexer_proj`, `indexer_attn_q_b`,
+      `indexer_compressor_*`); `Engine::mla_shared_forward_compressed` keeps the
+      two-block state ring, pools a block when its last token arrives (AFTER
+      that row's attention, so a pooled key never serves its own block), and
+      attends raw + pooled rows through the new
+      `Backend::mla_shared_attention_compressed`. Closing check measured on a
+      two-layer fixture (layer 0 CSA ratio 4 + indexer, layer 1 HCA ratio 128):
+      the file initialises and runs, and the same weights with every ratio 0
+      give md 0.06096 at 9 tokens (CSA) and md 0.000433 at 134 tokens (HCA,
+      past a completed 128-token block). Negative control observed: with the
+      dispatch to the compressed path disabled both differences collapse to
+      exactly 0 and the two arms fail. A third arm replays the same prompt twice
+      on one engine: md 0 (a pooled key is taken once, when its block ends, so
+      without `Engine::compressed_reset()` the second run attends the first
+      run's summaries) -- control observed, reset disabled -> md 1.45795. The op is host f32 (the oracle is the
+      definition), so it is gated on `mla_shared_compressed_supported()` -- the
+      CPU reference answers true, a device backend is refused BY CAPABILITY.
+

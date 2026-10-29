@@ -923,9 +923,21 @@ private:
     // the layer's FINAL [n, n_embd] attention output (wo_a/wo_b are inside), so
     // the caller must not run `attn_output` over it a second time.
     bool mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0);
+    // The same layer when the file declares a compress ratio for it (V4
+    // CSA/HCA): the query trunk and the grouped output are unchanged, the
+    // ATTENTION reads two row families -- the raw window and the pooled keys
+    // this method maintains. See Engine::comp_* for the streams.
+    bool mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
+                                       i32 pos0);
     // Clears the convolution windows and delta-rule states (f32, one set per
     // recurrent layer). Only correct to call at a sequence boundary.
     void recurrent_reset();
+    // Clears the compressed-attention streams (state rings + pooled keys). The
+    // pooled keys are a SUMMARY of positions a prefill cannot rewrite in place
+    // -- a block's pool is taken once, when its last token arrives -- so a new
+    // sequence that kept them would attend the previous run's history through a
+    // row the KV cursor cannot invalidate. Same boundary as recurrent_reset().
+    void compressed_reset();
     // Downloads the last row of logits into logits_host_. With device_only true the
     // row stays in VRAM and is reduced to a single greedy argmax by
     // topk_argmax() instead; see fetch_logits() for when that is legal. The
@@ -1258,6 +1270,51 @@ private:
     // number than the host oracle the kernels are judged against. `ws_attn_` is
     // act-width and cannot hold it on a HIP build (f16 there, f32 on the CPU).
     void *ws_mlaa_ = nullptr;
+
+    // ---- DeepSeek-V4 compressed attention (CSA/HCA) ----------------------
+    // Host f32, one set per COMPRESSED layer: the pool is the oracle's
+    // arithmetic (src/dsv4_compress.cpp) and the op it feeds reads these
+    // through `mla_shared_attention_compressed`, so they never become device
+    // buffers. They exist only on a file whose `attention.compress_ratios`
+    // names a non-zero ratio, and the backend must say
+    // `mla_shared_compressed_supported()` -- a device that cannot run the two
+    // row families would otherwise read the attention table for both.
+    //
+    // Footprint: the pooled keys are (n_ctx / ratio) rows of kv_lora floats per
+    // compressed layer -- 67 MiB a layer on a real V4-Flash context of 128K with
+    // ratio 4, which a 40-layer checkpoint multiplies into the gigabytes. That
+    // is the price of a stream that summarizes positions the window has passed,
+    // and it is stated here rather than discovered as unexplained residency.
+    //
+    // `comp_state_kv_`/`comp_state_sc_` are a two-block ring of per-token state
+    // rows (the pool reads the previous block and the current one), kept as two
+    // arrays because the projection emits a value and a score per token and the
+    // pool consumes them in different halves. `comp_pooled_` holds the pooled
+    // keys in block order and `comp_kpos_` each block's FIRST token -- the rope
+    // angle, not the block index. `idx_state_*`/`idx_key_` are the CSA
+    // indexer's own, which is always the two-wide overlapping compressor and
+    // whose pooled key is stored ALREADY ROTATED (the score is a plain dot
+    // against the rotated query).
+    std::vector<i32> comp_ratio_;               // [layer], 0 = dense
+    std::vector<std::vector<f32>> comp_state_kv_;  // [layer][2*ratio*state_width]
+    std::vector<std::vector<f32>> comp_state_sc_;  // [layer][2*ratio*state_width]
+    std::vector<std::vector<f32>> comp_pooled_;    // [layer][blocks * kv_lora]
+    std::vector<std::vector<i64>> comp_kpos_;      // [layer][blocks]
+    std::vector<std::vector<f32>> idx_state_kv_;   // [layer][2*ratio*2*idx_head]
+    std::vector<std::vector<f32>> idx_state_sc_;   // [layer][2*ratio*2*idx_head]
+    std::vector<std::vector<f32>> idx_key_;        // [layer][blocks * idx_head]
+    std::vector<i64> comp_nblocks_;                // per layer, blocks so far
+    std::vector<f32> comp_inv_freq_;               // [qk_rope/2], compress base
+    std::vector<f32> comp_pool_kv_;                // scratch, pool_rows*state_width
+    std::vector<f32> comp_pool_sc_;                // scratch, pool_rows*state_width
+    std::vector<f32> comp_row_kv_;                 // scratch, state_width
+    std::vector<f32> comp_row_sc_;                 // scratch, state_width
+    std::vector<f32> comp_idx_kv_;                 // scratch, 2*idx_head
+    std::vector<f32> comp_idx_sc_;                 // scratch, 2*idx_head
+    std::vector<f32> comp_iq_;                     // scratch, idx_n_head*idx_head
+    std::vector<f32> comp_iw_;                     // scratch, idx_n_head
+    std::vector<f32> comp_score_;                  // scratch, blocks
+    std::vector<i32> comp_sel_;                    // scratch, top-k
     void *ws_k_ = nullptr;    // [chunk, kv_dim]
     void *ws_v_ = nullptr;    // [chunk, kv_dim]
     void *ws_attn_ = nullptr; // [chunk, q_dim]

@@ -198,3 +198,23 @@ and is not worth shipping). Otherwise the right near-term DeepSeek move
 is the one already ranked in DFLASH-DRAFTER.md: DFlash2 support against
 a Qwen3.8 target, which is the same drafter family and a target this
 box already runs.
+
+## 2026-10-29 — the CSA/HCA rows in this file are closed
+
+The audit entries above describe the state at their own dates. What has changed
+since, so a reader does not take "not read at all today" as current:
+
+* `attn_compressor_{kv,gate,ape,norm}` are **read** and **run**:
+  `Engine::mla_shared_forward_compressed` keeps the per-token state rows and the
+  pooled keys, and `Backend::mla_shared_attention_compressed` attends the raw
+  window and the pooled rows in one softmax (the arithmetic is the oracle in
+  `src/dsv4_compress.cpp`). Measured end to end in
+  `test_dsv4_compressed_end_to_end`: a CSA (ratio 4) and an HCA (ratio 128)
+  layer load, generate, and differ from the same weights with the ratios off by
+  md 0.06096 and 0.000433; with the dispatch disabled both differences are 0.
+* The lightning indexer's tables are read per layer and drive the top-k block
+  selection, per query row.
+* `attn_sinks` run (they were already carried by the kernel and the oracle).
+* Still missing on this row, unchanged: Engram conditional memory and the 4-wide
+  hyper-connections. The compressed op is host f32 and therefore CPU-reference
+  only — a device backend is refused by capability rather than approximated.

@@ -1136,6 +1136,25 @@ public:
                                       const MlaSharedDesc &d) {
         (void)a; (void)q; (void)cache; (void)d;
     }
+    // The COMPRESSED variant (DeepSeek-V4 CSA/HCA). The cache holds two kinds
+    // of row: [0, pos0+n_tok) are raw latents at their own positions, windowed
+    // and roped with `d.inv_freq`; `pooled` holds `n_pooled` rows of kv_lora
+    // floats that are ALWAYS visible and roped with `compress_inv_freq` at
+    // `pooled_pos[b]` (the block's first token, not the block index). `sel` is
+    // the CSA indexer's block selection (`n_sel` entries); null means every
+    // pooled row, which is the HCA rule.
+    //
+    // Separate from the dense op because the difference is a second row family
+    // and a second frequency table, not a flag: a backend that runs one and not
+    // the other says so here rather than reading the wrong table silently.
+    virtual bool mla_shared_compressed_supported() const { return false; }
+    virtual void mla_shared_attention_compressed(
+        void *a, const void *q, const void *cache, const void *pooled,
+        const i64 *pooled_pos, i64 n_pooled, const i32 *sel, i64 n_sel,
+        const MlaSharedDesc &d, const f32 *compress_inv_freq) {
+        (void)a; (void)q; (void)cache; (void)pooled; (void)pooled_pos;
+        (void)n_pooled; (void)sel; (void)n_sel; (void)d; (void)compress_inv_freq;
+    }
     // out[n_tok, n_embd] f16: y[g] = Woa_g over group g's concatenated heads,
     // then Wob over the concatenated y. wo_a is f16 [gout, hpg*kv_lora] with
     // group g's o_lora output rows at [g*o_lora, (g+1)*o_lora); wo_b is f16
