@@ -3041,8 +3041,14 @@ void Engine::head_compute(i32 row) {
     // head: the block's output (the embeddings a caller may ask for) keeps the
     // unscaled normed row, which is what `res->t_embd` holds in the reference
     // too.
+    // Both sides of the multiply are dumped, so a trace can show the factor
+    // itself rather than only that the head ran: `head.pre` is the normed row
+    // the head would read on a family without the scale, `head.in` is what it
+    // actually reads. test_minicpm3_scale_arithmetic compares the two.
+    dump_row("head.pre", -1, xn, n_embd_, 1);
     if (mc.lm_head_scale != 1.0f)
         be_->scale_act(xn, mc.lm_head_scale, 1, n_embd_, n_embd_);
+    dump_row("head.in", -1, xn, n_embd_, 1);
     logit_head(xn);
 }
 
@@ -5202,8 +5208,13 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
         // carry a multiply: this is the gemm + scale + add the reference does,
         // gated on the flag so every other family keeps the fold.
         gemm_w(ws_x2_, gn, L.wdown, n_embd_, n_ff_, n);
-        if (dmc.attn_out_scale != 1.0f)
+        // The branch as projected, before the residual scale -- the other side
+        // of the multiply, so a trace can prove the factor is applied ONCE and
+        // with the value the config says (test_minicpm3_scale_arithmetic).
+        if (dmc.attn_out_scale != 1.0f) {
+            dump_row("ffn.pre", l, ws_x2_, n_embd_, n);
             be_->scale_act(ws_x2_, dmc.attn_out_scale, n, n_embd_, n_embd_);
+        }
         dump_row("attn.down", l, ws_x2_, n_embd_, n);
         be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
     } else {

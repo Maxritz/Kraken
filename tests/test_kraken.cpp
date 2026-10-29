@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <chrono>
 #include <fstream>
+#include <sstream>
 #include <functional>
 
 #if defined(_WIN32)
@@ -19365,6 +19366,155 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
 // so a fixture that loads is what proves they reach ModelConfig. The multiplies
 // themselves are covered by the generic arms in test_family_scales (embedding)
 // and by wiring that is visible here (the two that have no file key).
+// B1b / B2b -- the MiniCPM3 constants, isolated NUMERICALLY.
+//
+// "the config says 256/n_embd and the run is finite" does not prove the engine
+// multiplies by that number, once, at the right place. These two do, because
+// the engine can dump both sides of each multiply: `head.pre`/`head.in` around
+// the head-input scale and `ffn.pre`/`attn.down` around the FFN residual scale.
+//
+// The relation asserted is exact arithmetic on the same f32 row, so the only
+// slack is printf's 7 significant digits (1e-6 relative).
+static void test_minicpm3_scale_arithmetic() {
+    // A reader for KRK_DUMP's "<stage> L<layer> n=<rows> v v v ..." lines.
+    // The `n=` field is the ROW count, not the width: one line carries
+    // rows*width values, so the values are read to end of line rather than to
+    // a count. Reading `n` values and stopping left the cursor inside the
+    // first line and the parse stalled there -- the arm then failed for a
+    // reason that had nothing to do with the scale.
+    auto read_dump = [](const std::string &path,
+                        std::map<std::string, std::vector<f32>> &out) {
+        std::ifstream f(path);
+        if (!f) return false;
+        std::string line;
+        while (std::getline(f, line)) {
+            std::istringstream is(line);
+            std::string name, ltag, ntag;
+            if (!(is >> name >> ltag >> ntag)) continue;
+            if (ltag.size() < 2 || ltag[0] != 'L' ||
+                ntag.compare(0, 2, "n=") != 0)
+                continue;
+            const int layer = std::atoi(ltag.c_str() + 1);
+            std::vector<f32> vals;
+            f32 v = 0.0f;
+            while (is >> v) vals.push_back(v);
+            // Layer -1 (the head) and layer 0 share a key only if the stage
+            // name is shared, which it is not.
+            out[std::string(name) + "@" + std::to_string(layer)] = vals;
+        }
+        return !out.empty();
+    };
+
+    MlaFix f;
+    f.kind = MlaFixKind::Legacy;
+    f.q_lora = true;
+    f.n_layer = 4;
+    const std::string path = "kraken-minicpm3-arith.gguf";
+    CHECK(build_mla_fixture(path, f, "minicpm3"),
+          "wrote a MiniCPM3 file for the arithmetic arm");
+
+    const std::string dump = "krk-minicpm3-dump.txt";
+    std::remove(dump.c_str());
+    set_env_var("KRK_DUMP", dump);
+    f32 head_scale = 0.0f, res_scale = 0.0f;
+    std::vector<f32> lg;
+    std::string err;
+    bool ran = false;
+    {
+        Backend *be = make_cpu_backend();
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            if (e.init(be, c, &err)) {
+                head_scale = e.model().cfg().lm_head_scale;
+                res_scale = e.model().cfg().attn_out_scale;
+                GenerateParams gp;
+                gp.prompt = "the";
+                gp.max_tokens = 2;
+                GenerateResult r;
+                ran = e.generate(gp, &r);
+                if (ran) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    lg.assign(e.last_logits(), e.last_logits() + nv);
+                }
+            }
+        }
+        delete be;
+    }
+    clear_env_var("KRK_DUMP");
+    CHECK(ran, ("the arithmetic run completes: " + err).c_str());
+    CHECK_NEAR(head_scale, 8.0f, 1e-6, "256/32 = 8 is the head-input factor");
+    CHECK_NEAR(res_scale, 0.7f, 1e-6, "1.4/sqrt(4) = 0.7 is the residual factor");
+
+    std::map<std::string, std::vector<f32>> d;
+    CHECK(read_dump(dump, d), "the run wrote a stage dump");
+    if (d.empty()) return;
+
+    // ---- B1b: the head input is exactly `head.pre * lm_head_scale` -------
+    {
+        auto pre = d.find("head.pre@-1");
+        auto in = d.find("head.in@-1");
+        CHECK(pre != d.end() && in != d.end(),
+              "both sides of the head multiply were dumped");
+        if (pre != d.end() && in != d.end() &&
+            pre->second.size() == in->second.size() && !in->second.empty()) {
+            f32 worst = 0.0f, peak = 0.0f;
+            bool applied_twice = true;
+            for (size_t i = 0; i < in->second.size(); i++) {
+                const f32 want = pre->second[i] * head_scale;
+                worst = std::max(worst, std::fabs(in->second[i] - want));
+                peak = std::max(peak, std::fabs(want));
+                if (std::fabs(in->second[i] - pre->second[i] * head_scale *
+                                                        head_scale) > 1e-6f * peak)
+                    applied_twice = false;
+            }
+            std::fprintf(stderr, "[b1b] head scale: worst=%g peak=%g\n",
+                         static_cast<double>(worst), static_cast<double>(peak));
+            CHECK(peak > 0.0f && worst <= 1e-5f * peak,
+                  "the head input is head.pre * 8, to f32 precision");
+            CHECK(!applied_twice,
+                  "... and NOT head.pre * 64, so the factor is applied once");
+        }
+    }
+    // ---- B2b: the FFN branch is exactly `ffn.pre * attn_out_scale` -------
+    {
+        int layers_checked = 0;
+        bool all = true;
+        f32 worst = 0.0f, peak = 0.0f;
+        for (int l = 0; l < 4; l++) {
+            auto pre = d.find("ffn.pre@" + std::to_string(l));
+            auto post = d.find("attn.down@" + std::to_string(l));
+            if (pre == d.end() || post == d.end()) continue;
+            if (pre->second.size() != post->second.size()) { all = false; continue; }
+            layers_checked++;
+            for (size_t i = 0; i < post->second.size(); i++) {
+                const f32 want = pre->second[i] * res_scale;
+                worst = std::max(worst, std::fabs(post->second[i] - want));
+                peak = std::max(peak, std::fabs(want));
+            }
+        }
+        std::fprintf(stderr,
+                     "[b2b] ffn residual: %d layers, worst=%g peak=%g\n",
+                     layers_checked, static_cast<double>(worst),
+                     static_cast<double>(peak));
+        CHECK(layers_checked == 4, "every layer dumped both sides of its FFN scale");
+        CHECK(all && peak > 0.0f && worst <= 1e-5f * peak,
+              "each layer's residual contribution is ffn.pre * 0.7");
+    }
+    // The logits are the head's linear output, so they are 8x what a family
+    // without the head scale would produce. That is checkable without a second
+    // run only through the dump above; here it is enough that the run was
+    // finite and non-degenerate, which the peak pins.
+    if (!lg.empty()) {
+        f32 peak = 0.0f;
+        for (f32 v : lg) peak = std::max(peak, std::fabs(v));
+        CHECK(peak > 0.0f && peak < 1e6f, "and the logits are finite");
+    }
+}
+
 static void test_minicpm3_scales() {
     MlaFix f;
     f.kind = MlaFixKind::Legacy;
@@ -23416,6 +23566,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_qwen4exp_ple)
     TEST_GROUP(test_mla_absorb)
     TEST_GROUP(test_mla_lite)
+    TEST_GROUP(test_minicpm3_scale_arithmetic)
     TEST_GROUP(test_minicpm3_scales)
     TEST_GROUP(test_mla_backend)
     TEST_GROUP(test_npu_backend)

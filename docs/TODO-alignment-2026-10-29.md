@@ -149,8 +149,17 @@ open on purpose.
       with a 16-wide-head fixture, pins the off-by-one, and both cross-counts
       (gemma3 at 46 is not gemma3's 27B). Negative control observed: 3 arms
       fail with the rule disabled.
-- [ ] **B1b/B2b (P2)** isolate the MiniCPM3 scales numerically instead of
-      asserting "config read + the run is finite".
+- [x] **B1b/B2b (P2)** isolate the MiniCPM3 scales numerically instead of
+      asserting "config read + the run is finite". `head_compute` dumps
+      `head.pre` (the normed row) and `head.in` (what the head reads) around
+      `lm_head_scale`; `dense_ffn`'s residual-scale arm dumps `ffn.pre` (the
+      down projection as computed) and `attn.down` (after the multiply).
+      `test_minicpm3_scale_arithmetic` (11 checks) asserts
+      `head.in == head.pre * 8` and `attn.down == ffn.pre * 0.7` on all four
+      layers to f32 precision, and that the head factor is applied ONCE (a
+      `head.pre * 64` arm is rejected). Negative control observed: with both
+      multiplies removed the two arms fail (head worst 11.45 vs peak 13.09,
+      FFN worst 1.88 vs peak 4.38), 9/11; restored, 11/11.
 - [ ] **D6 (P2)** TL2 vs Q2_0 on ggml id 42: refuse the fork dialect by name
       instead of decoding it as Q2_0.
 - [ ] **D9 (P2)** a ternary file whose `general.architecture` is `llama` gets
