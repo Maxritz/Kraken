@@ -326,6 +326,13 @@ f32 dot_q8_0_q8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 // per 64-element block pair (2 per row), built once per row tile with
 // build_q8_0_scales8() and reused across every output row of the matrix. Pass
 // nullptr to get the no-table kernel. Bit-identical to dot_q8_0_q8_x8.
+// Four output rows of a q8_0 GEMV against one activation row at a time, to
+// keep four weight streams in flight per thread. Identical values to calling
+// dot_q8_0_q8() four times.
+void dot_q8_0_q8_r1xN(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
+                      i64 n, i64 dstride, f32 *out, i64 out_stride, i32 kc);
+i32 q8_0_gemv_width(void);
+
 // True when dot_q8_0_q8_tab8() can use its table on this host.
 bool q8_0_tab_supported(void);
 

@@ -1012,6 +1012,30 @@ public:
             std::vector<f32> sctab;
             if (use_tab)
                 sctab.assign(static_cast<size_t>((n_in / 64) * 16), 0.0f);
+        // Decode, q8_0, VNNI: four output rows per call. Each is an
+        // independent weight stream, so a thread keeps four in flight instead
+        // of one, which is what this kernel is short of (see the comment on
+        // dot_q8_0_q8_x4_gemv). Falls through to the per-element path for every
+        // other tier, so nothing else changes.
+        if (rows == 1 && q80 && n_in > 0 && (n_in % 64) == 0 && n_out >= 4 &&
+            ((n_in / 32) & 1) == 0) {
+            const i32 kw = q8_0_gemv_width();
+            const i64 n4 = n_out - n_out % kw;
+            const i64 g4 = std::max<i64>(1, std::min<i64>(1024, (n4 / kw) / 16));
+            par_for(n4 / kw, g4, 2.0 * static_cast<f64>(n4) * n_in,
+                    [&](i64 b, i64 e) {
+                        for (i64 g = b; g < e; g++) {
+                            const i64 o = g * kw;
+                            dot_q8_0_q8_r1xN(
+                                wb + static_cast<size_t>(o) * row_bytes,
+                                row_bytes, xqp, xdp, n_in, nb, of + o, 1, kw);
+                        }
+                    });
+            for (i64 o = n4; o < n_out; o++)
+                of[o] = dot_q8_0_q8(wb + static_cast<size_t>(o) * row_bytes,
+                                    xqp, xdp, n_in);
+            return;
+        }
             if (nc > 0) {
                 // One row tile at a time, every column in the block against it.
                 // The activation pointers for the tile are hoisted out of the

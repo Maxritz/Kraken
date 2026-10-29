@@ -3682,6 +3682,116 @@ void dot_q8_0_q8_tab8_vnni(const u8 *w, const i8 *xq, i64 n, i64 rstride,
         out[static_cast<i64>(r) * out_stride] = _mm512_reduce_add_ps(acc[r]);
 }
 
+// ---- four output rows against one activation row (decode) -----------------
+//
+// The single-row kernel walks one weight stream per thread. Measured against
+// this host's own streaming roofline (two threads: 114 GB/s reading 512 MiB
+// with 512-bit loads) it delivers 10.6 GB/s, and it does so whether it runs the
+// VNNI rung or the AVX2 rung -- 254 us/op against 283, an 11% difference from a
+// fourfold change in work per instruction. So the decode GEMV is neither
+// instruction-bound nor MAC-bound: it is starved of memory-level parallelism,
+// with a single outstanding stream per thread and a serial accumulator chain.
+//
+// This kernel gives each thread four independent weight rows in flight at once.
+// The activation block is decoded once and consumed by all four, which is also
+// where the saved uops come from: one 64-byte activation load and one sign
+// split instead of four.
+//
+// Results are bit-identical to dot_q8_0_q8_x8_vnni: same block-pair stepping,
+// same f32 products, same reduction order.
+//
+// How many streams is enough is a measurement, not a guess: the width is a
+// template parameter so that 1, 2, 4, 8 and 16 can be run against each other in
+// one binary (KRK_CPU_GEMV_W). Measured medians of three on the q8_0 fixture's
+// decode GEMM: 234 us/op at one stream, 138 at two, 139 at four, 123 at eight,
+// 128 at sixteen. The whole gain is in 1 -> 2 and it is 1.7x; eight is where the
+// curve tops out, so eight is the default.
+template <i32 kC>
+__attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
+void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
+                         i64 n, f32 *out, i64 out_stride) {
+    const i64 nb = n / 32;
+    __m512 acc[kC];
+    for (i32 c = 0; c < kC; c++) acc[c] = _mm512_setzero_ps();
+    i64 p = 0;
+    for (i64 b = 0; b + 2 <= nb; b += 2, p++) {
+        const __m512i xv =
+            _mm512_loadu_si512(reinterpret_cast<const void *>(xq + b * 32));
+        const f32 sx0 = dx[b];
+        const f32 sx1 = dx[b + 1];
+        for (i32 c = 0; c < kC; c++) {
+            const u8 *wp = w + static_cast<i64>(c) * wstride + p * 68;
+            const __m128i two = _mm_setr_epi16(
+                static_cast<short>(wp[0] | (static_cast<u16>(wp[1]) << 8)),
+                static_cast<short>(wp[34] | (static_cast<u16>(wp[35]) << 8)), 0,
+                0, 0, 0, 0, 0);
+            const __m128 d2 = _mm_cvtph_ps(two);
+            const f32 d0 = _mm_cvtss_f32(d2);
+            const f32 d1 = _mm_cvtss_f32(_mm_shuffle_ps(d2, d2, 0x55));
+            const __m256i lo =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(wp + 2));
+            const __m256i hi =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(wp + 36));
+            const __m512i wv =
+                _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+            const __mmask64 neg =
+                _mm512_cmp_epi8_mask(wv, _mm512_setzero_si512(), _MM_CMPINT_LT);
+            const __m512i mag =
+                _mm512_mask_sub_epi8(wv, neg, _mm512_setzero_si512(), wv);
+            const __m512i xb = _mm512_mask_sub_epi8(
+                xv, neg, _mm512_setzero_si512(), xv);
+            const __m512i iv = _mm512_dpbusd_epi32(_mm512_setzero_si512(), mag,
+                                                   xb);
+            const f32 s0 = d0 * sx0;
+            const f32 s1 = d1 * sx1;
+            const __m512 sc = _mm512_castsi512_ps(_mm512_inserti64x4(
+                _mm512_castps_si512(
+                    _mm512_castps256_ps512(_mm256_broadcast_ss(&s0))),
+                _mm256_castps_si256(_mm256_broadcast_ss(&s1)), 1));
+            acc[c] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iv), sc, acc[c]);
+        }
+    }
+    for (i32 c = 0; c < kC; c++)
+        out[static_cast<i64>(c) * out_stride] = _mm512_reduce_add_ps(acc[c]);
+}
+
+// Four rows at a time when the host and the shape allow it, otherwise the
+// single-row kernel for each. Same values either way.
+i32 q8_0_gemv_width(void) {
+    // The width the decode kernel will use: 8 unless overridden. Only used to
+    // size the last partial group, so a wrong answer costs one extra call.
+    const char *e = std::getenv("KRK_CPU_GEMV_W");
+    if (e && e[0] != '\0') {
+        const i64 v = std::atoll(e);
+        if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16)
+            return static_cast<i32>(v);
+    }
+    return 8;
+}
+
+void dot_q8_0_q8_r1xN(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
+                      i64 n, i64 dstride, f32 *out, i64 out_stride, i32 kc) {
+#if defined(KRK_DOT_AVX512)
+    if (q8_0_tab_supported() && ((n / 32) & 1) == 0 && (n / 32) >= 2) {
+        switch (kc) {
+            case 1:
+                out[0] = _mm512_reduce_add_ps(_mm512_setzero_ps());
+                out[0] = dot_q8_0_q8(w, xq, dx, n);
+                return;
+            case 2: dot_q8_0_q8_xk_gemv<2>(w, wstride, xq, dx, n, out, out_stride); return;
+            case 4: dot_q8_0_q8_xk_gemv<4>(w, wstride, xq, dx, n, out, out_stride); return;
+            case 8: dot_q8_0_q8_xk_gemv<8>(w, wstride, xq, dx, n, out, out_stride); return;
+            case 16: dot_q8_0_q8_xk_gemv<16>(w, wstride, xq, dx, n, out, out_stride); return;
+            default: break;
+        }
+    }
+#endif
+    (void)wstride;
+    for (i32 c = 0; c < kc; c++)
+        out[static_cast<i64>(c) * out_stride] =
+            dot_q8_0_q8(w + static_cast<i64>(c) * wstride, xq, dx, n);
+}
+
 // Public feature probe. Defined here, outside the anonymous namespace that
 // holds cpu_has_vnni(), so callers in other translation units can ask without
 // the name collision that a bare re-declaration of cpu_has_vnni() causes.
