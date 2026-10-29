@@ -7006,6 +7006,17 @@ void Engine::recurrent_reset() {
                                  static_cast<size_t>(rs) * sizeof(f32));
 }
 
+void Engine::compressed_reset() {
+    for (auto &v : comp_state_kv_) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto &v : comp_state_sc_) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto &v : idx_state_kv_) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto &v : idx_state_sc_) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto &v : comp_pooled_) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto &v : idx_key_) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto &k : comp_kpos_) std::fill(k.begin(), k.end(), 0);
+    std::fill(comp_nblocks_.begin(), comp_nblocks_.end(), 0);
+}
+
 // The Mamba-2 block forward (nemotron_h / nemotron_h_moe). The engine does
 // everything the GDN path does in the same op order — projection, short conv
 // (with this block's bias), scan, gate, norm, out-projection, residual —
@@ -12588,6 +12599,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     mtp_fed_ = 0;
     if (trace_hash_on_) trace_stage_.clear();
     if (model_.is_recurrent()) recurrent_reset();
+    if (!comp_nblocks_.empty()) compressed_reset();
     if (moe_predict_enabled_) moe_predictor_.reset();
     moe_predict_ids_.clear();
 

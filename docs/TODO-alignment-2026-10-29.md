@@ -258,7 +258,10 @@ open on purpose.
       give md 0.06096 at 9 tokens (CSA) and md 0.000433 at 134 tokens (HCA,
       past a completed 128-token block). Negative control observed: with the
       dispatch to the compressed path disabled both differences collapse to
-      exactly 0 and the two arms fail. The op is host f32 (the oracle is the
+      exactly 0 and the two arms fail. A third arm replays the same prompt twice
+      on one engine: md 0 (a pooled key is taken once, when its block ends, so
+      without `Engine::compressed_reset()` the second run attends the first
+      run's summaries) -- control observed, reset disabled -> md 1.45795. The op is host f32 (the oracle is the
       definition), so it is gated on `mla_shared_compressed_supported()` -- the
       CPU reference answers true, a device backend is refused BY CAPABILITY.
 

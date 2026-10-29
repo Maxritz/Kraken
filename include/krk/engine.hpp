@@ -932,6 +932,12 @@ private:
     // Clears the convolution windows and delta-rule states (f32, one set per
     // recurrent layer). Only correct to call at a sequence boundary.
     void recurrent_reset();
+    // Clears the compressed-attention streams (state rings + pooled keys). The
+    // pooled keys are a SUMMARY of positions a prefill cannot rewrite in place
+    // -- a block's pool is taken once, when its last token arrives -- so a new
+    // sequence that kept them would attend the previous run's history through a
+    // row the KV cursor cannot invalidate. Same boundary as recurrent_reset().
+    void compressed_reset();
     // Downloads the last row of logits into logits_host_. With device_only true the
     // row stays in VRAM and is reduced to a single greedy argmax by
     // topk_argmax() instead; see fetch_logits() for when that is legal. The
@@ -1273,6 +1279,12 @@ private:
     // names a non-zero ratio, and the backend must say
     // `mla_shared_compressed_supported()` -- a device that cannot run the two
     // row families would otherwise read the attention table for both.
+    //
+    // Footprint: the pooled keys are (n_ctx / ratio) rows of kv_lora floats per
+    // compressed layer -- 67 MiB a layer on a real V4-Flash context of 128K with
+    // ratio 4, which a 40-layer checkpoint multiplies into the gigabytes. That
+    // is the price of a stream that summarizes positions the window has passed,
+    // and it is stated here rather than discovered as unexplained residency.
     //
     // `comp_state_kv_`/`comp_state_sc_` are a two-block ring of per-token state
     // rows (the pool reads the previous block and the current one), kept as two

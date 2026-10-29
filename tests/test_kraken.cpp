@@ -21755,6 +21755,52 @@ static void test_dsv4_compressed_end_to_end() {
               "branch of the compressor is wired too");
     }
 
+    // ---- a second generation on the same engine -------------------------
+    // A pooled key is taken ONCE, when its block's last token arrives, so a
+    // prefill cannot rewrite it: without a reset the second run attends the
+    // first run's summaries through rows the KV cursor cannot invalidate. The
+    // same prompt twice on ONE engine must therefore be bit-identical.
+    {
+        Backend *cpu = make_cpu_backend();
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = csa;
+            c.n_ctx = 192;
+            c.prefill_chunk = 8;
+            std::string e2;
+            if (e.init(cpu, c, &e2)) {
+                GenerateParams gp;
+                gp.prompt = "the the the the";
+                gp.max_tokens = 4;
+                GenerateResult r;
+                std::vector<f32> first, second;
+                const bool o1 = e.generate(gp, &r);
+                if (o1) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    first.assign(e.last_logits(), e.last_logits() + nv);
+                }
+                const bool o2 = e.generate(gp, &r);
+                if (o2) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    second.assign(e.last_logits(), e.last_logits() + nv);
+                }
+                CHECK(o1 && o2, "the same engine runs the prompt twice");
+                if (first.size() == second.size() && !first.empty()) {
+                    const f32 md = fwd_maxdiff(first, second);
+                    std::fprintf(stderr, "[c1] replay on one engine: md=%g\n",
+                                 static_cast<double>(md));
+                    CHECK(md == 0.0f,
+                          "and the second run replays the first: the pooled "
+                          "keys did not survive the sequence boundary");
+                }
+            } else {
+                CHECK(false, ("the replay arm initialises: " + e2).c_str());
+            }
+        }
+        delete cpu;
+    }
+
     // ---- what the loader still refuses, by name -------------------------
     MlaFix no_tables = f;
     no_tables.comp_no_tables = true;
