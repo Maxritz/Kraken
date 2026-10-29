@@ -1500,6 +1500,51 @@ not: the new `variant_logits` helper deleted the backend while the `Engine` was
 still alive, and `Engine::~Engine` frees its workspaces *through that backend* —
 a shutdown through a dangling pointer. The engine is scoped to die first now.
 
+### The attention output gate, and the two families behind it
+
+`spark2_5` and `muse-glimmer` both gate the **attention result** before its
+output projection, with a projection of the *pre-attention* row — not of the
+attention output, and not folded into `wo`. One tensor, `attn_gate.weight`, at
+three different shapes across three families:
+
+| family | width | activation |
+|---|---|---|
+| `laguna` | one per head | softplus |
+| `spark2_5` | one per head | sigmoid |
+| `muse-glimmer` | one per **element** of the attention row | sigmoid |
+
+Each of those is a flag (`attn_gate`, `attn_gate_wide`, `attn_gate_sigmoid`)
+because getting one wrong is not a crash: a per-head gate broadcast over a
+per-element row still produces fluent text, and a softplus where a sigmoid
+belongs reads as "a bit too much gate everywhere".
+
+`muse-glimmer` carries three more pieces of its own: a **weightless** RMS norm on
+the embedding before layer 0 (no tensor in the file describes it), a post norm on
+**each** branch before it joins the residual at its own eps (1e-8 against a 1e-5
+body), and RoPE **only on the sliding-window layers** — its full-attention layers
+rotate nothing, the opposite of the usual arrangement. `spark2_5` is otherwise
+llama's block: a fused `attn_qkv` row, a GELU FFN and NeoX rope.
+
+`test_attention_gate_families` pins them through real files:
+
+* the fused `attn_qkv` row reproduces three separate projections **exactly**;
+* the gate **saturates**: weights of +10 and +20 give the same answer, which is
+  what a sigmoid does and a softplus cannot (it would double the gate), while
+  gate 0 (sigmoid 0.5) differs from both — so the gate is applied *and* is the
+  right function;
+* 1024× the embedding table leaves `muse-glimmer`'s answer within the norm's
+  eps — the weightless RMS is scale-free, which no dump can see;
+* a per-head gate on `muse-glimmer` is **refused** with the width it expected;
+* a file that windows every layer does not agree with one that windows half of
+  them, which is the only outside view of "rope on the windowed layers only".
+
+Two real defects fell out. The gate's **shape check lived inside the MoE branch**
+of the loader, so it never ran on a dense family — a muse-glimmer file with a
+per-head gate was accepted and broadcast over the wrong axis with no error at
+all. It is now checked for every layer that carries a gate. And the eps the post
+norms run at is now read from the file's own `post_norm_epsilon` when it states
+one, instead of being the arch's constant only.
+
 ### The fused-projection pair: qwen and internlm2
 
 `qwen` (Qwen1) and `internlm2` store **one** `attn_qkv` row of `Q | K | V`, so the

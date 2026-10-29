@@ -5611,7 +5611,12 @@ static bool build_variant_model(const std::string &path, const VariantSpec &v) {
         // why the arm exists: a loader that only knows `ffn_norm` refuses the
         // file, and one that reads the name as gemma's BRANCH norm runs the
         // wrong graph.
-        b.tensor_f32(p + (v.seed_oss_norm ? "attn_post_norm.weight" : "ffn_norm.weight"),
+        // The tensor llama.cpp calls ATTN_POST_NORM lays down as
+        // `post_attention_norm`; seed_oss runs it as the FFN's PRE norm, which
+        // is why the loader binds it to ffn_norm when the classic key is gone
+        // and the family does not declare gemma's branch norms.
+        b.tensor_f32(p + (v.seed_oss_norm ? "post_attention_norm.weight"
+                                          : "ffn_norm.weight"),
                      {u64(n_embd)}, ones(n_embd));
         if (v.seed_oss_norm) {
             // Seed-OSS's attention-output bias, which the loader reads for
@@ -5751,6 +5756,292 @@ static bool build_fused_model(const std::string &path, const FusedSpec &v) {
                      vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
     }
     return b.write(path);
+}
+
+// ---- the two attention-gate families: spark2_5 and muse-glimmer ----------
+//
+// Both put a gate on the attention RESULT, before wo, projected from the
+// pre-attention row. They differ in three ways that are all flags: the gate's
+// WIDTH (one value per head vs one per element), its ACTIVATION (sigmoid vs
+// laguna's softplus), and what else the family carries (spark2_5 fuses its q/k/v
+// row; muse-glimmer post-norms both branches, weightless-norms its embedding
+// and rotates only on its sliding-window layers).
+struct GateSpec {
+    std::string arch = "spark2_5";
+    bool wide_gate = false;     // muse-glimmer: one gate value per ELEMENT
+    bool fused_qkv = false;     // spark2_5
+    f32 gate = 1.0f;            // value written into attn_gate.weight
+    f32 embd_scale = 1.0f;      // muse-glimmer's weightless embd RMS is scale-free
+    std::vector<i32> swa_pattern;  // empty => no window declared
+    bool post_norms = false;    // muse-glimmer's two branch norms
+    bool qk_norm = false;
+};
+
+static bool build_gate_model(const std::string &path, const GateSpec &v) {
+    const int n_embd = 32, n_layer = 4, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, ctx = 64;
+    const std::string &arch = v.arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-gate-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    if (!v.swa_pattern.empty()) {
+        b.meta_u32(arch + ".attention.sliding_window", 16);
+        b.meta_i32_array(arch + ".attention.sliding_window_pattern", v.swa_pattern);
+    }
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base, f32 scale) {
+        std::vector<f32> out(n);
+        for (size_t i = 0; i < n; i++)
+            out[i] = scale * wv(base + static_cast<i64>(i));
+        return out;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0, v.embd_scale));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (v.post_norms) {
+            // `post_attention_norm` / `post_ffw_norm`: the same two tensors
+            // gemma2/3/4 carry, which is why the loader binds them under
+            // `post_branch_norm` and not under a muse-glimmer name.
+            std::vector<f32> w(n_embd);
+            for (int i = 0; i < n_embd; i++)
+                w[static_cast<size_t>(i)] = 0.6f + 0.05f * static_cast<f32>(i % 5);
+            b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, w);
+            b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, w);
+        }
+        if (v.fused_qkv) {
+            std::vector<f32> w;
+            for (f32 x : vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f))
+                w.push_back(x);
+            b.tensor_f16(p + "attn_qkv.weight", {u64(n_embd), u64(q_dim + 2 * kv_dim)}, w);
+        } else {
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                         vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f));
+        }
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        if (v.qk_norm) {
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        }
+        // The gate: one value per head (spark2_5) or one per element
+        // (muse-glimmer). Its width is what the loader checks.
+        const int gw = v.wide_gate ? q_dim : n_head;
+        b.tensor_f32(p + "attn_gate.weight", {u64(n_embd), u64(gw)},
+                     std::vector<f32>(static_cast<size_t>(n_embd) * gw, v.gate));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+    }
+    return b.write(path);
+}
+
+static void test_attention_gate_families() {
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 m = 0.0f;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+
+    // ---- the table -------------------------------------------------------
+    {
+        const ArchSpec *sp = arch_lookup("spark2_5");
+        CHECK(sp && sp->support == ArchSupport::Yes, "spark2_5 is supported");
+        CHECK(sp && sp->attn_gate && sp->attn_gate_sigmoid && !sp->attn_gate_wide,
+              "with a per-HEAD sigmoid gate -- not laguna's softplus ...");
+        CHECK(sp && sp->fused_qkv && sp->gelu_ffn && sp->rope_neox,
+              "... beside its fused qkv row, its GELU FFN and NeoX rope");
+        const ArchSpec *mg = arch_lookup("muse-glimmer");
+        CHECK(mg && mg->support == ArchSupport::Yes, "muse-glimmer is supported");
+        CHECK(mg && mg->attn_gate && mg->attn_gate_sigmoid && mg->attn_gate_wide,
+              "and its gate is the same tensor at one value per ELEMENT");
+        CHECK(mg && mg->post_branch_norm && mg->post_norm_eps == 1e-8f,
+              "with branch post norms on their own eps (1e-8) ...");
+        CHECK(mg && mg->embd_rms_noweight && mg->rope_swa_only && mg->qk_norm,
+              "... a weightless embedding norm, rope on the windowed layers only");
+    }
+
+    std::string err;
+    // ---- spark2_5 --------------------------------------------------------
+    std::vector<f32> sp_lg;
+    {
+        GateSpec v;
+        v.arch = "spark2_5";
+        v.fused_qkv = true;
+        const std::string f = "kraken-gate-spark.gguf";
+        CHECK(build_gate_model(f, v), "wrote the spark2_5 file");
+        if (variant_logits(f, sp_lg, err)) {
+            f32 peak = 0.0f;
+            for (f32 x : sp_lg) peak = std::max(peak, std::fabs(x));
+            CHECK(peak > 0.0f && peak < 1e6f,
+                  "spark2_5 runs and produces finite, non-zero logits");
+        } else {
+            CHECK(false, ("spark2_5 runs: " + err).c_str());
+        }
+        // The fused row and the split one are the same arithmetic: writing
+        // spark2_5's numbers as three tensors must not change the answer.
+        GateSpec v2;
+        v2.arch = "spark2_5";
+        v2.fused_qkv = false;
+        const std::string f2 = "kraken-gate-spark-split.gguf";
+        CHECK(build_gate_model(f2, v2), "wrote the same weights without the fused row");
+        std::vector<f32> split_lg;
+        if (variant_logits(f2, split_lg, err) && !sp_lg.empty())
+            CHECK(maxdiff(sp_lg, split_lg) == 0.0f,
+                  "the fused attn_qkv row reproduces the split projections exactly");
+        else
+            CHECK(false, ("the split twin runs: " + err).c_str());
+    }
+
+    // The gate is SIGMOID, and that is observable: a sigmoid saturates at 1, a
+    // softplus does not. Two files whose gate weight is +10 and +20 give the
+    // same answer under a sigmoid and wildly different ones under a softplus.
+    std::vector<f32> g10, g20, g0;
+    {
+        GateSpec v;
+        v.arch = "spark2_5";
+        v.fused_qkv = true;
+        v.gate = 10.0f;
+        const std::string f = "kraken-gate-spark-g10.gguf";
+        CHECK(build_gate_model(f, v), "wrote the +10 gate file");
+        CHECK(variant_logits(f, g10, err), ("the +10 gate file runs: " + err).c_str());
+        v.gate = 20.0f;
+        const std::string f2 = "kraken-gate-spark-g20.gguf";
+        CHECK(build_gate_model(f2, v), "wrote the +20 gate file");
+        CHECK(variant_logits(f2, g20, err), ("the +20 gate file runs: " + err).c_str());
+        v.gate = 0.0f;
+        const std::string f3 = "kraken-gate-spark-g0.gguf";
+        CHECK(build_gate_model(f3, v), "wrote the zero gate file");
+        CHECK(variant_logits(f3, g0, err), ("the zero gate file runs: " + err).c_str());
+    }
+    if (!g10.empty() && !g20.empty() && !g0.empty()) {
+        // A sigmoid is BOUNDED: +10 and +20 both sit at 1.0, and the small
+        // residual difference (4.5e-5 per element, then amplified by four
+        // layers) is rounding. A softplus is unbounded -- +10 vs +20 would
+        // double the gate, and the answer would move by far more than the
+        // gate-off arm does.
+        CHECK(maxdiff(g10, g20) < 1e-2f,
+              "the gate saturates: +10 and +20 agree, so it is a sigmoid, not a softplus");
+        CHECK(maxdiff(g10, g20) < 0.5f * maxdiff(g0, g10),
+              "... and the saturation gap is small against the gate's own effect");
+        CHECK(maxdiff(g0, g10) > 1e-4f,
+              "and it is applied: gate 0 (sigmoid 0.5) differs from a saturated one");
+    }
+
+    // ---- muse-glimmer ----------------------------------------------------
+    // The weightless embedding norm is exactly scale-free: scaling the table by
+    // a power of two (exact in f16) must leave the logits BIT-IDENTICAL. Without
+    // the norm the residual enters layer 0 at a different magnitude and every
+    // answer changes, so this pins the piece no dump can see.
+    std::vector<f32> mg_lg;
+    {
+        GateSpec v;
+        v.arch = "muse-glimmer";
+        v.wide_gate = true;
+        v.post_norms = true;
+        v.qk_norm = true;
+        v.swa_pattern = {1, 0, 1, 0};
+        const std::string f = "kraken-gate-muse.gguf";
+        CHECK(build_gate_model(f, v), "wrote the muse-glimmer file");
+        CHECK(variant_logits(f, mg_lg, err), ("muse-glimmer runs: " + err).c_str());
+
+        v.embd_scale = 1024.0f;
+        const std::string f2 = "kraken-gate-muse-embd.gguf";
+        CHECK(build_gate_model(f2, v), "wrote the 1024x embedding twin");
+        std::vector<f32> lg2;
+        if (variant_logits(f2, lg2, err) && !mg_lg.empty())
+            {
+                // Not bit-identical, and the reason is the norm's eps: the
+                // sum of squares is 2^20 times larger, so the same 1e-5 lands
+                // on a different relative scale. What scale-freedom buys is
+                // that the row's DIRECTION is unchanged to within that term.
+                f32 peak = 0.0f;
+                for (f32 x : mg_lg) peak = std::max(peak, std::fabs(x));
+                const f32 d = maxdiff(mg_lg, lg2);
+                CHECK(d < 1e-3f * std::max(peak, 1.0f),
+                      "the weightless embedding norm is scale-free: 1024x the "
+                      "table leaves the answer within the norm's eps");
+            }
+        else
+            CHECK(false, ("the scaled-embedding twin runs: " + err).c_str());
+    }
+
+    // The gate here is one value per ELEMENT, so a file with the per-head width
+    // must be refused by the loader rather than broadcast over the wrong axis.
+    {
+        GateSpec v;
+        v.arch = "muse-glimmer";
+        v.wide_gate = false;  // per-head width on a family that needs per-element
+        v.post_norms = true;
+        v.qk_norm = true;
+        const std::string f = "kraken-gate-muse-narrow.gguf";
+        CHECK(build_gate_model(f, v), "wrote a muse-glimmer file with a per-head gate");
+        Backend *be = make_cpu_backend();
+        Engine e;
+        EngineConfig c;
+        c.model_path = f;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        std::string lerr;
+        const bool loaded = e.init(be, c, &lerr);
+        CHECK(!loaded, "a per-head gate on this family is refused, not broadcast");
+        CHECK(lerr.find("output gate") != std::string::npos,
+              "and the refusal names the gate");
+        delete be;
+    }
+
+    // The sliding-window pattern decides which layers rotate at all, so a file
+    // that windows every layer must not agree with one that windows none.
+    {
+        GateSpec v;
+        v.arch = "muse-glimmer";
+        v.wide_gate = true;
+        v.post_norms = true;
+        v.qk_norm = true;
+        v.swa_pattern = {1, 1, 1, 1};
+        const std::string f = "kraken-gate-muse-allswa.gguf";
+        CHECK(build_gate_model(f, v), "wrote the all-windowed twin");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err) && !mg_lg.empty())
+            CHECK(maxdiff(mg_lg, lg) > 1e-4f,
+                  "rope on the windowed layers only: the pattern changes the answer");
+        else
+            CHECK(false, ("the all-windowed twin runs: " + err).c_str());
+    }
 }
 
 static void test_fused_projection_pair() {
@@ -5947,7 +6238,7 @@ static void test_llama_variants() {
         v.arch = "seed_oss";
         v.seed_oss_norm = true;
         const std::string f = "kraken-variant-seedoss.gguf";
-        CHECK(build_variant_model(f, v), "wrote the seed_oss file (attn_post_norm)");
+        CHECK(build_variant_model(f, v), "wrote the seed_oss file (post_attention_norm)");
         std::vector<f32> lg;
         if (variant_logits(f, lg, err)) {
             // Its layout differs from the baseline in two ways (the renamed
@@ -5960,8 +6251,8 @@ static void test_llama_variants() {
             CHECK(peak > 0.0f && peak < 1e6f,
                   "seed_oss loads and produces finite, non-zero logits");
         } else {
-            CHECK(false, ("seed_oss runs with its ffn norm named attn_post_norm: " +
-                          err).c_str());
+            CHECK(false, ("seed_oss runs with its ffn norm named "
+                          "post_attention_norm: " + err).c_str());
         }
         // The control: the same file with the norm renamed to `ffn_norm` is
         // llama's layout plus a bias, and it must load too. If only one of the
@@ -6354,28 +6645,31 @@ static void test_load_verdict() {
 
     // An arch refusal and a gap tensor are *independent* causes, and both have
     // to be reported: this file would be refused for its tensor alone even if
-    // its arch were supported.
+    // its arch were supported. k2-horizon is the case now -- its attention
+    // values are a routed expert set, and the arch itself is still refused.
+    // (muse-glimmer used to stand here and is supported now: the gate flag it
+    // named as a gap is `ArchSpec::attn_gate`, which the engine runs.)
     {
         const std::string path = build_verdict_fixture(
-            "muse-glimmer", "muse-glimmer", "blk.0.attn_gate.weight", 0, 0);
-        CHECK(!path.empty(), "wrote a muse-glimmer fixture");
+            "k2-horizon", "k2-horizon", "blk.0.attn_v_exps.weight", 0, 0);
+        CHECK(!path.empty(), "wrote a k2-horizon fixture");
         Gguf g;
         std::string err;
         CHECK(g.load(path, &err), "the fixture loads");
         const ModelVerdict v = assess_model(g);
-        CHECK(!v.runnable, "muse-glimmer is refused");
+        CHECK(!v.runnable, "k2-horizon is refused");
         CHECK(v.blockers.size() >= 2,
-              "its arch and its gate tensor are separate causes");
+              "its arch and its routed-value tensor are separate causes");
         bool arch_reason = false, gate_reason = false;
         for (const std::string &b : v.blockers) {
-            if (b.find("attention output gate") != std::string::npos) arch_reason = true;
+            if (b.find("routed expert set") != std::string::npos) arch_reason = true;
             if (b.find("does not implement") != std::string::npos) gate_reason = true;
         }
         CHECK(arch_reason && gate_reason, "both causes are named");
         Model m;
         std::string lerr;
         CHECK(!m.load(*cpu, path, &lerr), "the loader refuses the file");
-        CHECK(lerr.find("muse-glimmer") != std::string::npos,
+        CHECK(lerr.find("k2-horizon") != std::string::npos,
               "and its error names the arch");
         made.push_back(path);
     }
@@ -21263,6 +21557,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_gemma4_forward)
     TEST_GROUP(test_llama_variants)
     TEST_GROUP(test_fused_projection_pair)
+    TEST_GROUP(test_attention_gate_families)
     TEST_GROUP(test_lfm2_dense)
     TEST_GROUP(test_qwen2moe)
     TEST_GROUP(test_arch_table)
