@@ -7181,6 +7181,128 @@ static void test_q2_0_dialect() {
     }
 }
 
+// D8 -- the dense relu^2 arm does not take the row-scaled store.
+//
+// The silu arm can scale each row of the gated intermediate by a power of two
+// inside `silu_mul`, because the `ffn_sub_norm` that follows is an RMSNorm and
+// divides the scale straight back out. There is no relu_sqr+mul+row-max kernel,
+// so the relu^2 arm stores `relu(gate)^2 * up` unscaled -- and relu^2 is
+// QUADRATIC in the gate, so it reaches the f16 activation store with larger
+// magnitudes than the arm the guard was written for.
+//
+// This arm pins the three things that make it a RANGE guard rather than a
+// function: (1) the product really does leave f16 on a row of ordinary size,
+// (2) a power-of-two row scale is exact in f16, so the guard would spend no
+// precision, and (3) an RMSNorm over the scaled row is the same row, so the
+// arm's OUTPUT cannot change -- only its headroom. What is left open is the
+// device-side store, which cannot be exercised without HIP: recorded in the
+// TODOs as `[~]` rather than claimed fixed.
+static void test_relu_sqr_row_scale() {
+    const i64 n = 256;
+    std::vector<f32> gate(static_cast<size_t>(n)), up(static_cast<size_t>(n));
+    std::vector<f32> prod(static_cast<size_t>(n));
+    for (i64 i = 0; i < n; i++) {
+        // Ordinary-magnitude gate leg (1e3..4e3, both signs) and up leg.
+        const f32 g = (1.0f + 0.5f * static_cast<f32>(i % 7)) * 1e3f;
+        gate[static_cast<size_t>(i)] = (i % 2) ? -g : g;
+        up[static_cast<size_t>(i)] = 0.5f + 0.25f * static_cast<f32>(i % 5);
+    }
+    auto relu_sqr_mul = [&](const std::vector<f32> &g, const std::vector<f32> &u,
+                            std::vector<f32> &out) {
+        for (i64 i = 0; i < n; i++) {
+            const f32 r = std::max(0.0f, g[static_cast<size_t>(i)]);
+            out[static_cast<size_t>(i)] = r * r * u[static_cast<size_t>(i)];
+        }
+    };
+    relu_sqr_mul(gate, up, prod);
+
+    f32 peak = 0.0f;
+    for (f32 v : prod) peak = std::max(peak, std::fabs(v));
+    std::fprintf(stderr, "[d8] relu^2 gated row peak = %g (f16 max 65504)\n",
+                 static_cast<double>(peak));
+    CHECK(peak > 65504.0f,
+          "relu(gate)^2 * up leaves the f16 range on a row of this size");
+
+    // (1) What the store would do without a scale: count the saturated lanes.
+    auto saturated = [&](const std::vector<f32> &x, f32 scale) {
+        int k = 0;
+        for (f32 v : x) {
+            const f32 q = fp16_to_fp32(fp32_to_fp16(v * scale));
+            if (std::fabs(q) >= 65504.0f) k++;
+        }
+        return k;
+    };
+    const int sat_plain = saturated(prod, 1.0f);
+    CHECK(sat_plain > 0,
+          "and an unscaled f16 store clamps it -- the guard's reason to exist");
+
+    // (2) The smallest power-of-two scale that brings the row inside f16, and
+    //     the claim that the divide spends no precision: the scaled value is
+    //     exactly representable, so f16 stores the same mantissa.
+    f32 scale = 1.0f;
+    while (peak * scale >= 65504.0f) scale *= 0.5f;
+    const int sat_scaled = saturated(prod, scale);
+    CHECK(sat_scaled == 0, "a power-of-two row scale brings every lane into f16");
+    {
+        // "Spends no precision" is a claim about a lane the f16 store can hold
+        // at all, so it is measured on the SAME shape at magnitudes that fit:
+        // a scale of 2^-k moves only the exponent, which f16 tracks with the
+        // same relative spacing, so the stored mantissa is the unscaled one.
+        std::vector<f32> small(static_cast<size_t>(n));
+        relu_sqr_mul(std::vector<f32>(gate.size(), 3.0f),
+                     std::vector<f32>(up.size(), 1.5f), small);
+        auto mantissa_preserved = [&](const std::vector<f32> &x, f32 s) {
+            for (f32 v : x) {
+                const f32 back = fp16_to_fp32(fp32_to_fp16(v * s));
+                const f32 ref = fp16_to_fp32(fp32_to_fp16(v)) * s;
+                if (back != ref) return false;
+            }
+            return true;
+        };
+        f32 small_peak = 0.0f;
+        for (f32 v : small) small_peak = std::max(small_peak, std::fabs(v));
+        CHECK(small_peak > 0.0f && small_peak < 65504.0f,
+              "the in-range arm of the same product fits f16 unscaled");
+        CHECK(mantissa_preserved(small, 0.25f),
+              "a power-of-two row scale only moves the exponent: the stored "
+              "mantissa is the unscaled one");
+        CHECK(!mantissa_preserved(small, 0.25f * 0.9f),
+              "control: a non-power-of-two scale does not, so this arm can "
+              "fail");
+    }
+
+    // (3) The sub-norm that consumes the row is scale-invariant, so the arm's
+    //     output cannot depend on the guard.
+    // The norm is computed in f64 on both sides, so the comparison is about
+    // the scale and not about the order an f32 sum happened to take.
+    auto rmsnorm_ref = [&](const std::vector<f32> &x) {
+        f64 ss = 0.0;
+        for (f32 v : x) ss += static_cast<f64>(v) * static_cast<f64>(v);
+        const f64 rms = std::sqrt(ss / static_cast<f64>(n) + 1e-5);
+        std::vector<f32> out(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; i++)
+            out[static_cast<size_t>(i)] =
+                static_cast<f32>(static_cast<f64>(x[static_cast<size_t>(i)]) / rms);
+        return out;
+    };
+    {
+        const std::vector<f32> a = rmsnorm_ref(prod);
+        std::vector<f32> scaled(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; i++)
+            scaled[static_cast<size_t>(i)] = prod[static_cast<size_t>(i)] * scale;
+        const std::vector<f32> c = rmsnorm_ref(scaled);
+        f32 md = 0.0f;
+        for (i64 i = 0; i < n; i++)
+            md = std::max(md, std::fabs(c[static_cast<size_t>(i)] -
+                                        a[static_cast<size_t>(i)]));
+        std::fprintf(stderr, "[d8] rmsnorm(row) vs rmsnorm(row*2^-k): md=%g\n",
+                     static_cast<double>(md));
+        CHECK(md < 1e-6f,
+              "RMSNorm of the row and of the same row scaled by 2^-k agree, so "
+              "the guard is a range transform and not part of the function");
+    }
+}
+
 static void test_q8_activation_domain() {
     const i64 n = 512;
     std::vector<f32> x(static_cast<size_t>(n));
@@ -23793,6 +23915,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_i2_s_embedding)
     TEST_GROUP(test_refused_formats)
     TEST_GROUP(test_q2_0_dialect)
+    TEST_GROUP(test_relu_sqr_row_scale)
     TEST_GROUP(test_q8_activation_domain)
     TEST_GROUP(test_trit_sign_extreme)
     TEST_GROUP(test_q2code_dot)

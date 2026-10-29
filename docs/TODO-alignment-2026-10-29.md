@@ -107,7 +107,7 @@ that is known to be a change. `test_i2_s_model` now carries that control.
 
 | id | pri | class | item | state |
 |---|---|---|---|---|
-| D8 | P3 | CONFIRMED (code path), SUSPECTED (impact) | the dense relu^2 arm does not apply `row_scaled` (there is no relu_sqr+mul+row-max kernel). Mathematically identical -- the sub-norm divides the scale back in -- but relu^2 is quadratic, so this arm reaches the f16 store with larger magnitudes than silu | documented at the arm; no fixture needed as it is a range guard, not a function |
+| D8 | P3 | CONFIRMED (code path), MEASURED (range), device-side OPEN | the dense relu^2 arm does not apply `row_scaled`: there is no relu_sqr+mul+row-max kernel, so `relu(gate)^2 * up` is stored unscaled. `test_relu_sqr_row_scale` measures what that costs: on a 256-wide row of ordinary size the product peaks at **2.4e7**, 366x f16's 65504, and every one of those lanes clamps in an f16 store; a power-of-two row scale brings all of them in, moves only the exponent (the stored mantissa is the unscaled one -- pinned, with a non-power-of-two control that fails), and the `ffn_sub_norm` that follows is an RMSNorm, so `norm(x) == norm(x*2^-k)` to md 0. The arm's OUTPUT therefore cannot depend on the guard. | pinned by `test_relu_sqr_row_scale` (7 checks). What is still open is the device store itself: the CPU reference runs f32 activations and cannot saturate, and HIP is not available in this environment, so a kernel is neither needed-not-written here nor verifiable. `[~]` in the routed list for that reason |
 | D9 | P2 | CONFIRMED, **fixed** | a *ternary* file whose `general.architecture` is `llama` (the HF1BitLLM Llama3-8B-1.58 and Falcon3-*-1.58bit exports) got SubLN from the tensor set but **silu**, not relu^2, because the activation is keyed on the arch row: half the family's graph. Fixed by a narrow rule in `Model::load` -- generic `llama` name + a SubLN pair on the first block + ternary weights (`dtype_is_ternary`: TQ1_0/TQ2_0/I2_S/Q1_0, NOT Q2_0/PQ2_0 whose ladder reaches +2) -- which sets `ffn_relu_sqr`, exactly as the `bitnet-b1.58` row does. | `test_ternary_llama_arch`: the llama-named file's logits are **bit-identical** to the same weights under `bitnet-b1.58` (md 0); SubLN alone (f16) and ternary alone (no SubLN) both stay silu. Negative control observed: rule disabled -> the flag and the bit-identity both fail (14/16) |
 
 Two integrity guards added while auditing:
@@ -198,7 +198,15 @@ open on purpose.
       backed the "logits are scale-blind" open item was found to be all-zero
       (its ternary cutoff sat on the generator's largest magnitude); the
       section above records the cause and the new measurement.
-- [ ] **D8 (P3)** the dense relu^2 arm skips the row-scale range guard.
+- [~] **D8 (P3)** the dense relu^2 arm skips the row-scale range guard.
+      Classified, not "fixed": `test_relu_sqr_row_scale` (7 checks) measures
+      the product's peak (2.4e7 on a 256-wide row of ordinary size, vs f16's
+      65504 -- every lane clamps unscaled), shows a power-of-two row scale
+      brings all of them in and moves only the exponent, and shows the
+      `ffn_sub_norm` behind it is scale-invariant (md 0), so the guard is a
+      range transform and not part of the function. The guard itself still
+      needs a relu_sqr+mul+row-max kernel, and the only backend where it can
+      matter (f16 activations) is HIP, which is not verifiable here.
 - [ ] **B3b (P2)** a windowed layer cannot carry its own linear rope scale.
 - [ ] **B4 (P2)** a real gemma4 fixture (per-layer embeddings + shared KV +
       two-branch MoE).
