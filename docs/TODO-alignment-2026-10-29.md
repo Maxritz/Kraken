@@ -28,8 +28,8 @@ Status legend: **todo** · **done** · **blocked (why)**
 |----|---|------|--------|---------------|
 | B1b | P2 | isolate the MiniCPM3 head-input multiply numerically (config + finiteness is not the same as "the logits move by exactly 8.0") | todo | two files of one arch that differ only in the constant |
 | B2b | P2 | same for the FFN-side residual scale | todo | FFN-branch A/B on the minicpm3 fixture |
-| B3b | P2 | linear (non-YaRN) rope scaling on a windowed half: the factor rides one stack-wide `mc.rope_scale`, so a windowed layer cannot carry its own 1.0 | todo | needs a per-layer rope scale; no family in the table pairs linear scaling with a window today |
-| B4 | P2 | a real `gemma4` fixture (per-layer embeddings + shared-KV + two-branch MoE) so the row is graph-tested, not row-tested | todo | `test_gemma4_*` runs the file end to end and pins the 1.0 attention scale |
+| B3b | P2 | linear (non-YaRN) rope scaling on a windowed half: the factor rides one stack-wide `mc.rope_scale`, so a windowed layer cannot carry its own 1.0 | **fixed** | `ModelConfig::rope_scale_layer` + `Model::rope_scale_at(l)`, resolved in `Model::load` for a family whose windowed layers rotate with plain rope (`ArchSpec::swa_plain_rope`: olmo2, mellum) when the file scales linearly and declares a window; the four engine rope sites now pass the layer's own divisor. YaRN leaves the vector empty (its factor is already in the table), as does any file with no window. `test_windowed_rope_scale` (18 checks): the config arm (layers 0..2 -> 1.0, layer 3 -> 2.0), the two "nothing else changes" twins (no window, YaRN), and the rotation itself -- `attn.q` reproduces a hand rotation at position/1.0 (md 9.5e-7) and NOT at position/2.0 (md 3.76). Negative control observed: with the stack-wide value restored the match inverts (pos/2 md 8.3e-7, pos/1 md 3.76), 16/18 |
+| B4 | P2 | a real `gemma4` fixture (per-layer embeddings + shared-KV + two-branch MoE) so the row is graph-tested, not row-tested | **fixed** | `build_gemma4_model` (16-wide, 4 layers, 2 shared-KV, per-layer embedding table, routed two-branch variant) runs end to end in `test_gemma4_forward`; the attention scale is now pinned on the real file rather than on `llama` lookalikes: `mc.attn_scale == 1.0` from the row, and a twin stating 1/sqrt(head_dim) = 0.3536 moves the three-token logits row by **0.3058**. Negative control observed: row constant removed -> both arms fail (42/44) |
 | B5 | P2 | forward fixtures for `minicpm`, `minicpm`-v1 scales, `olmoe`, `qwen3moe`, `nemotron_h*`, and the `parallel_residual` graph A/B for gptneox/phi2 | todo | one group per family; the A/B moves the logits |
 | B6 | P2 | gemma2/gemma3 **27B** use `1/√(n_embd/n_head)` rather than `1/√head_dim`; only the model type says which, and metadata does not carry it | todo | either a size-keyed rule with a fixture, or a documented limitation |
 | B7 | P1 | DeepSeek's YaRN `mscale²` attention scale (`attn_factor*(1+0.1*log_mul*ln(factor))`, squared, over √key_length; the file's `yarn_log_multiplier` is divided by 0.1 first). The inputs are read (`rope_yarn_factor`/`rope_yarn_log_mul`) and not applied | todo | a deepseek2/V4 YaRN fixture whose scores match the formula |
@@ -72,26 +72,43 @@ row follows the paper and the reference the weights were trained against
 (squared ReLU), recorded here because a later reader will find the llama.cpp
 line and think the flag is a mistake.
 
-### Open, NEEDS VERIFICATION: the synthetic fixtures' logits are scale-blind
+### RESOLVED 2026-10-29: the synthetic fixtures' logits were scale-blind
 
 Measured while testing I2_S: for the synthetic 2-layer BitNet fixture, the
-two-token logits are **bitwise identical** across (a) I2_S weights with
+two-token logits were **bitwise identical** across (a) I2_S weights with
 `gs = 0.125`, (b) the same weights as F16 at 0.125, and (c) the same weights as
-F16 at 1.0 -- `max|a-b| = max|a-c| = max|b-c| = 0` over all 260 logits. So a
-whole-model logits A/B cannot validate a weight scale in these fixtures, and
-the I2_S scale is pinned by a descriptor probe (dtype + `gs`) plus the byte-
-level code test instead. Hypothesis (unverified): the response is dominated by
-the tied head over `token_embd` and the layer contribution rounds away in f16
-activations. Consequence: any future "the scales are applied" claim that rests
-on a logits comparison in a synthetic fixture needs a fixture that is first
-shown to move when a weight scale moves.
+F16 at 1.0 -- `max|a-b| = max|a-c| = max|b-c| = 0` over all 260 logits, which
+made a whole-model logits A/B unable to validate a weight scale in it. That was
+recorded with an unverified hypothesis ("the response is dominated by the tied
+head and the layer contribution rounds away").
+
+**The cause was the fixture, not the engine.** `build_bitnet_file`'s ternary
+cutoff was `t > 0.15f`, and its value generator emits at most
+`(11 mod 11 - 5) * 0.03f`: the largest magnitude is `5 * 0.03f`, which rounds to
+`0.14999999` -- *below* `0.15f`. So neither branch of the cutoff ever fired and
+**every matrix in the fixture was all zero**. The blocks were inert; the logits
+came from the tied head over `token_embd` alone, and no weight scale could move
+them. The hypothesis is therefore refuted: nothing "rounded away", nothing was
+ever there.
+
+Fixed at the fixture (cutoff 0.14, so ~18% of entries are +-1) and the arm now
+asserts the two things it could not before:
+
+| pair | measured `max|a-b|` | meaning |
+|---|---|---|
+| I2_S 0.125 vs F16 0.125 (same weights) | **0.0138** on a peak of 2.03 | the decode is exact, the PATHS are not: a 256-wide I2_S matmul takes the fused int8 kernel, which quantises the activation, while F16 runs f16 math |
+| I2_S 0.125 vs F16 1.0 (8x the scale) | **0.0301** | a weight scale now moves the logits by more than the encoding difference, so the fixture can distinguish one |
+
+Consequence kept: any "the scale is applied" claim that rests on a logits
+comparison in a synthetic fixture has to show the fixture moves for a change
+that is known to be a change. `test_i2_s_model` now carries that control.
 
 ### Audit pass over the BitNet/2-bit work (goli-mat-de, before the commit)
 
 | id | pri | class | item | state |
 |---|---|---|---|---|
-| D8 | P3 | CONFIRMED (code path), SUSPECTED (impact) | the dense relu^2 arm does not apply `row_scaled` (there is no relu_sqr+mul+row-max kernel). Mathematically identical -- the sub-norm divides the scale back in -- but relu^2 is quadratic, so this arm reaches the f16 store with larger magnitudes than silu | documented at the arm; no fixture needed as it is a range guard, not a function |
-| D9 | P2 | NEEDS VERIFICATION | a *ternary* file whose `general.architecture` is `llama` (the HF1BitLLM Llama3-8B-1.58 and Falcon3-*-1.58bit exports may well be) gets SubLN from the tensor set but **silu**, not relu^2, because the inference is keyed on the arch row. No file of that shape was available to check, and inferring relu^2 from the presence of `ffn_sub_norm` alone would change the graph of every family that happens to carry one | open; needs one real file's metadata |
+| D8 | P3 | CONFIRMED (code path), MEASURED (range), device-side OPEN | the dense relu^2 arm does not apply `row_scaled`: there is no relu_sqr+mul+row-max kernel, so `relu(gate)^2 * up` is stored unscaled. `test_relu_sqr_row_scale` measures what that costs: on a 256-wide row of ordinary size the product peaks at **2.4e7**, 366x f16's 65504, and every one of those lanes clamps in an f16 store; a power-of-two row scale brings all of them in, moves only the exponent (the stored mantissa is the unscaled one -- pinned, with a non-power-of-two control that fails), and the `ffn_sub_norm` that follows is an RMSNorm, so `norm(x) == norm(x*2^-k)` to md 0. The arm's OUTPUT therefore cannot depend on the guard. | pinned by `test_relu_sqr_row_scale` (7 checks). What is still open is the device store itself: the CPU reference runs f32 activations and cannot saturate, and HIP is not available in this environment, so a kernel is neither needed-not-written here nor verifiable. `[~]` in the routed list for that reason |
+| D9 | P2 | CONFIRMED, **fixed** | a *ternary* file whose `general.architecture` is `llama` (the HF1BitLLM Llama3-8B-1.58 and Falcon3-*-1.58bit exports) got SubLN from the tensor set but **silu**, not relu^2, because the activation is keyed on the arch row: half the family's graph. Fixed by a narrow rule in `Model::load` -- generic `llama` name + a SubLN pair on the first block + ternary weights (`dtype_is_ternary`: TQ1_0/TQ2_0/I2_S/Q1_0, NOT Q2_0/PQ2_0 whose ladder reaches +2) -- which sets `ffn_relu_sqr`, exactly as the `bitnet-b1.58` row does. | `test_ternary_llama_arch`: the llama-named file's logits are **bit-identical** to the same weights under `bitnet-b1.58` (md 0); SubLN alone (f16) and ternary alone (no SubLN) both stay silu. Negative control observed: rule disabled -> the flag and the bit-identity both fail (14/16) |
 
 Two integrity guards added while auditing:
 - `gguf.cpp` refuses an I2_S tensor whose 32-byte tail falls outside the shard
@@ -125,3 +142,90 @@ dominated by the tied head), not of the engine.
 | id | pri | class | item | state |
 |---|---|---|---|---|
 | D11 | **P1** | CONFIRMED | **I2_S has two dialects.** `convert-hf-to-gguf-bitnet.py` writes code = value + 1 and zero-fills the 28 tail bytes after its f32 scale; `convert-ms-to-gguf-bitnet.py` writes code = value + 2 and permutes the payload into that build's tile layout (`preprocess_weights`, constants from its own `build/kcfg.ini`). Decoding the second as the first is silently wrong -- measured: the ms file loaded with verdict `runnable` and produced `prefill-hash 28eaece7b3a5a08f` against `c21ca3e304853383` for the same weights, with no warning | **fixed**: `i2s_tail_is_ms_converter()` (one predicate, used by the loader AND the verdict) refuses it by name; `test_i2_s_ms_dialect_refused` pins both tails and the three non-signatures (zero, short, unknown) |
+
+## Remaining work — routed 2026-10-29 (branch `arena/7e9ab449-kraken-x`)
+
+Every open item from the two ledgers above, in execution order. `[x]` means the
+closing check runs and passes; `[~]` means classified with evidence and left
+open on purpose.
+
+- [x] **B7 (P1)** DeepSeek V2/V3 YaRN `mscale^2` attention scale.
+      `deepseek_yarn_mscale`/`deepseek_kq_scale` + `ModelConfig::mla_kq_mscale`,
+      consumed by `mla_forward`. The old code's argument -- "the reference's
+      mscale is built from `rope.freq_scale`, and when that is 1.0 the whole
+      correction is 1.0" -- was false: on a YaRN file `rope_freq_scale` IS
+      1/factor (llama-model.cpp:1516-1518). `test_deepseek_yarn_mscale` pins the
+      closed form against the reference's own chain; `test_mla_yarn_file` pins
+      the two keys, the multiplier on the config, and an A/B where two files
+      differ **only** in `yarn_log_multiplier` (negative control: maxdiff was
+      exactly 0 before the fix, 0.1019 after).
+- [x] **B6 (P2)** gemma2/gemma3 27B use `1/sqrt(n_embd/n_head)`, not
+      `1/sqrt(head_dim)`. `ArchSpec::attn_scale_embd_per_head_layers` (46 for
+      gemma2, 62 for gemma3) resolved in the loader; a stated `.attention.scale`
+      still wins. `test_gemma_27b_scale` (14 checks) separates the two formulas
+      with a 16-wide-head fixture, pins the off-by-one, and both cross-counts
+      (gemma3 at 46 is not gemma3's 27B). Negative control observed: 3 arms
+      fail with the rule disabled.
+- [x] **B1b/B2b (P2)** isolate the MiniCPM3 scales numerically instead of
+      asserting "config read + the run is finite". `head_compute` dumps
+      `head.pre` (the normed row) and `head.in` (what the head reads) around
+      `lm_head_scale`; `dense_ffn`'s residual-scale arm dumps `ffn.pre` (the
+      down projection as computed) and `attn.down` (after the multiply).
+      `test_minicpm3_scale_arithmetic` (11 checks) asserts
+      `head.in == head.pre * 8` and `attn.down == ffn.pre * 0.7` on all four
+      layers to f32 precision, and that the head factor is applied ONCE (a
+      `head.pre * 64` arm is rejected). Negative control observed: with both
+      multiplies removed the two arms fail (head worst 11.45 vs peak 13.09,
+      FFN worst 1.88 vs peak 4.38), 9/11; restored, 11/11.
+- [x] **D6 (P2)** TL2 vs Q2_0 on ggml id 42: refuse the fork dialect by name
+      instead of decoding it as Q2_0. `Gguf::parse_shard` now resolves the id
+      per file from the tensors' own strides (34 B per 128 values = Q2_0,
+      18 B per 64 = Q2_0_64, so an upstream-made file declaring 42 is retyped
+      rather than mis-strided), tolerates `general.alignment` slack, and
+      refuses a file that votes both ways or whose stride fits neither -- that
+      refusal names TL2 and both layouts. `test_q2_0_dialect` (19 checks,
+      5 files). Negative control observed: with the resolver disabled 8 arms
+      fail, 11/19. TL1 (id 38) was already named and refused by
+      `test_refused_formats`.
+- [x] **D9 (P2)** a ternary file whose `general.architecture` is `llama` gets
+      SubLN from its tensors but silu, not relu^2. Fixed in `Model::load`
+      (generic name + SubLN pair + `dtype_is_ternary`), which is the narrow
+      rule the ledger asked for: either half alone is not evidence.
+      `test_ternary_llama_arch` (16 checks) pins the predicate's boundary
+      (Q2_0/PQ2_0 excluded), a bit-identical logits match against the
+      `bitnet-b1.58` row, and both negatives. Negative control observed: rule
+      disabled -> 2 arms fail, 14/16. While building it, the fixture that
+      backed the "logits are scale-blind" open item was found to be all-zero
+      (its ternary cutoff sat on the generator's largest magnitude); the
+      section above records the cause and the new measurement.
+- [~] **D8 (P3)** the dense relu^2 arm skips the row-scale range guard.
+      Classified, not "fixed": `test_relu_sqr_row_scale` (7 checks) measures
+      the product's peak (2.4e7 on a 256-wide row of ordinary size, vs f16's
+      65504 -- every lane clamps unscaled), shows a power-of-two row scale
+      brings all of them in and moves only the exponent, and shows the
+      `ffn_sub_norm` behind it is scale-invariant (md 0), so the guard is a
+      range transform and not part of the function. The guard itself still
+      needs a relu_sqr+mul+row-max kernel, and the only backend where it can
+      matter (f16 activations) is HIP, which is not verifiable here.
+- [x] **B3b (P2)** a windowed layer cannot carry its own linear rope scale.
+      `ModelConfig::rope_scale_layer` + `Model::rope_scale_at(l)`, resolved for
+      `swa_plain_rope` families with a window and a linear factor; the four rope
+      call sites consume it. `test_windowed_rope_scale` (18 checks) pins the
+      resolution, both "nothing else changes" twins, and the rotation itself
+      (hand rotation at pos/1.0 matches to 9.5e-7; pos/2.0 misses by 3.76).
+      Negative control observed: stack-wide value restored -> the match
+      inverts, 16/18.
+- [x] **B4 (P2)** a real gemma4 fixture (per-layer embeddings + shared KV +
+      two-branch MoE). Already built; what was missing was A1's evidence on the
+      family itself. `test_gemma4_forward` now pins `attn_scale == 1.0` on the
+      real file and shows a twin stating 1/sqrt(head_dim) moves the logits by
+      0.3058. Negative control observed: row constant removed -> 2 arms fail,
+      42/44.
+      Fixture trap recorded at the arm: a ONE-token prompt cannot see the
+      attention scale at all (softmax over one key cancels it exactly), which
+      is why the A/B uses three tokens.
+- [ ] **B5 (P2)** forward fixtures for minicpm / olmoe / qwen3moe /
+      nemotron_h*, and the `parallel_residual` graph A/B.
+- [ ] **C1 (P1, blocked)** DeepSeek-V4 compressed attention: a feature, not a
+      defect. The rows are `Partial` and the engine refuses a non-zero
+      `compress_ratio` by name.

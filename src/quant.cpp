@@ -1754,6 +1754,19 @@ bool dtype_supported(DType t) {
     }
 }
 
+// The three-state formats. See the declaration for why Q2_0/PQ2_0 are not
+// here: their ladder is {-1, 0, +1, +2}, so a Q2_0 file can be an ordinary
+// model quantized to 2 bits and says nothing about the FFN activation.
+bool dtype_is_ternary(DType t) {
+    switch (t) {
+        case DType::TQ1_0:
+        case DType::TQ2_0:
+        case DType::I2_S:
+        case DType::Q1_0: return true;
+        default: return false;
+    }
+}
+
 int dtype_block_size(DType t) {
     switch (t) {
         case DType::F32:

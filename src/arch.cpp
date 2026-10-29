@@ -695,6 +695,9 @@ constexpr ArchSpec kTable[] = {
                "validated against a gemma2 file in this collection",
                2, true);
         s.post_branch_norm = true;
+        // 27B: the reference multiplies the query by 1/sqrt(n_embd/n_head)
+        // instead of 1/sqrt(head_dim) (gemma2.cpp:14-27).
+        s.attn_scale_embd_per_head_layers = 46;
         return s;
     }(),
     // Gemma 3: QK-norm, GeGLU, embedding scaling, a final-logit softcap and a
@@ -710,6 +713,9 @@ constexpr ArchSpec kTable[] = {
                "file in this collection",
                6, true);
         s.post_branch_norm = true;
+        // 27B: same 1/sqrt(n_embd/n_head) rule, keyed on the reference's own
+        // discriminator (gemma3.cpp:24, n_layer == 62).
+        s.attn_scale_embd_per_head_layers = 62;
         return s;
     }(),
     // Gemma 4 (E-series) as the files in the collection declare it: 42 layers,

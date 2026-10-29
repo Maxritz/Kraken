@@ -63,6 +63,40 @@ const char *mla_layout_name(MlaLayout l) {
     return "none";
 }
 
+// B7: DeepSeek V2/V3's YaRN attention scale.
+//
+// Reference chain, quoted because the simplification is not obvious:
+//   llama.cpp llama-context.cpp:269-300 (cparams.yarn_attn_factor)
+//     get_mscale(s, m) = s <= 1 ? 1 : 0.1*m*log(s) + 1
+//     factor           = 1/rope_freq_scale                       (40 here)
+//     attn_factor      = get_mscale(f, mscale)/get_mscale(f, mscale_all)
+//                        * 1/(1 + 0.1*log(f))                    (cancel step)
+//   llama.cpp models/deepseek2.cpp:431-437
+//     attn_factor_org  = attn_factor * (1 + 0.1*log(f))           == 1 here
+//     mscale           = attn_factor_org * (1 + 0.1*log_mul_all*log(f))
+//     kq_scale         = mscale^2 / sqrt(n_embd_head_k)
+//
+// The first branch is exactly 1 for every deepseek2 file: when
+// mscale_all != 1 the reference sets mscale = mscale_all, and when it is 1 the
+// two get_mscale calls are the same call. So the whole chain is
+//   1 * (1 + 0.1*mscale_all_dim*ln(factor))  squared  over sqrt(key_length),
+// and mscale_all_dim is the file's `yarn_log_multiplier` / 0.1.
+f32 deepseek_yarn_mscale(f32 factor, f32 log_mul) {
+    // No YaRN, no key, or a factor that does not scale: the reference's own
+    // guard is `scale <= 1 -> 1`, and an absent key is a zero log_mul, which
+    // makes the parenthesis exactly 1 anyway.
+    if (!(factor > 1.0f) || !(log_mul > 0.0f) || !std::isfinite(factor) ||
+        !std::isfinite(log_mul))
+        return 1.0f;
+    return 1.0f + log_mul * std::log(factor);   // log_mul = 0.1*mscale_all_dim
+}
+
+f32 deepseek_kq_scale(f32 factor, f32 log_mul, i32 key_length) {
+    const f32 m = deepseek_yarn_mscale(factor, log_mul);
+    const f32 base = 1.0f / std::sqrt(static_cast<f32>(std::max<i32>(1, key_length)));
+    return m * m * base;
+}
+
 // Load-phase timeline (KRK_PHASE=1). The engine reports one "load N ms" line,
 // which cannot say whether the time went to the mapping, the metadata, the
 // embedding, the per-layer loop, or the transfers -- and the answer decides
@@ -461,6 +495,39 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // BitNet's dense FFN both build LLM_FFN_RELU_SQR / squared_relu, and any
     // other family that does would have had to be added to this line by hand.
     cfg_.ffn_relu_sqr = aspec.ffn_relu_sqr;
+    // ... but the schema is only as good as the name in the file, and a b1.58
+    // checkpoint re-exported under a generic one runs a graph nobody trained.
+    // HF1BitLLM's Llama3-8B-1.58, the Falcon3-*-1.58bit exports and the
+    // Ternary-Bonsai re-exports are all llama-shaped; a converter that leaves
+    // `general.architecture = llama` gets llama's row, so the SubLN pair is
+    // read from the tensors (the two extra norms ARE applied -- they are
+    // looked up by name) while the FFN runs SILU. That is neither family: the
+    // norms change the graph and the activation is what the weights were
+    // trained against.
+    //
+    // The trigger is narrow on purpose, because either half alone is not
+    // evidence: SubLN is not (any family may ship a sub-norm, and inferring
+    // squared ReLU from it would rewrite the graph of every such file), and a
+    // ternary FORMAT is not either (an ordinary llama quantized to TQ2_0 is
+    // still a silu model). Together they identify a b1.58 export, whose own
+    // reference graph is `ffn_sub_norm(squared_relu(gate) * up)` -- and the
+    // first block is enough, because no producer mixes a SubLN pair with an
+    // unquantized FFN layer by layer.
+    //
+    // Only the `llama` name is inferred. Any other generic name would need a
+    // file of that shape to prove the same rule holds, and no such file is in
+    // circulation today; this is where that would be extended.
+    if (!cfg_.ffn_relu_sqr && a == "llama") {
+        const GgufTensor *sa =
+            gguf_.tensor(blk_key("blk.%d.attn_sub_norm.weight", 0));
+        const GgufTensor *sf =
+            gguf_.tensor(blk_key("blk.%d.ffn_sub_norm.weight", 0));
+        const GgufTensor *tg = gguf_.tensor(blk_key("blk.%d.ffn_gate.weight", 0));
+        const GgufTensor *tu = gguf_.tensor(blk_key("blk.%d.ffn_up.weight", 0));
+        const bool ternary = (tg && dtype_is_ternary(tg->type)) ||
+                             (tu && dtype_is_ternary(tu->type));
+        if (sa && sf && ternary) cfg_.ffn_relu_sqr = true;
+    }
     // Tri-state: -1 keeps the engine's legacy always-normalize for files that
     // do not declare it (see ModelConfig::expert_w_norm).
     cfg_.expert_w_norm =
@@ -601,9 +668,30 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     if (aspec.embd_scale > 0.0f) cfg_.embd_scale = aspec.embd_scale;
     if (const f64 es = gguf_.get_f64(key(".embedding_scale"), 0.0); es > 0.0)
         cfg_.embd_scale = static_cast<f32>(es);
-    if (aspec.attn_scale > 0.0f) cfg_.attn_scale = aspec.attn_scale;
-    if (const f64 as = gguf_.get_f64(key(".attention.scale"), 0.0); as > 0.0)
+    // Whether the attention scale was STATED (by the row or by the file), which
+    // is what the size-keyed rule below defers to.
+    bool attn_scale_stated = false;
+    if (aspec.attn_scale > 0.0f) {
+        cfg_.attn_scale = aspec.attn_scale;
+        attn_scale_stated = true;
+    }
+    if (const f64 as = gguf_.get_f64(key(".attention.scale"), 0.0); as > 0.0) {
         cfg_.attn_scale = static_cast<f32>(as);
+        attn_scale_stated = true;
+    }
+    // gemma2/gemma3 at their 27B size: the reference scales the query by
+    // 1/sqrt(n_embd/n_head) rather than 1/sqrt(head_dim) (gemma2.cpp:14-27,
+    // gemma3.cpp:24), and the ONLY discriminator it has is the layer count --
+    // the HF `query_pre_attn_scalar` that would say it is not in the GGUF.
+    // Below the stated scale so an explicit `.attention.scale` still wins, and
+    // skipped entirely when the file's head geometry cannot express it.
+    if (!attn_scale_stated && aspec.attn_scale_embd_per_head_layers > 0 &&
+        cfg_.n_layer == aspec.attn_scale_embd_per_head_layers &&
+        cfg_.n_embd > 0 && cfg_.n_head > 0) {
+        cfg_.attn_scale =
+            1.0f / std::sqrt(static_cast<f32>(cfg_.n_embd) /
+                             static_cast<f32>(cfg_.n_head));
+    }
     if (aspec.lm_head_scale_base > 0.0f && cfg_.n_embd > 0)
         cfg_.lm_head_scale =
             aspec.lm_head_scale_base / static_cast<f32>(cfg_.n_embd);
@@ -3918,14 +4006,16 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // kernel exactly what it was (a position times a frequency) and keeps the
     // position-scaling path free for the linear scaling it already implements.
     //
-    // The magnitude half of YaRN is deliberately left out: its mscale is
-    // 1 + 0.1*ln(factor) applied to cos/sin, and the reference driver
-    // (llama.cpp's llama_context) pre-divides the checkpoint's
-    // `yarn_attn_factor` by exactly that before handing it to the rope op. For
-    // a checkpoint whose yarn_attn_factor is 1 the two cancel and the attention
-    // scale is plain 1/sqrt(head_dim), which is what rope_attn_scale staying at
-    // 1.0 means; a checkpoint that asks for something else would need the
-    // mscale folded into the attention scale instead.
+    // The magnitude half of YaRN is not applied to the ROTATION: its mscale is
+    // 1 + 0.1*ln(factor) on cos/sin, and the reference driver (llama.cpp's
+    // llama_context) pre-divides the checkpoint's `yarn_attn_factor` by exactly
+    // that before handing it to the rope op, so the rotation stays at unity and
+    // rope_attn_scale staying at 1.0 is right. Where the magnitude does land is
+    // the ATTENTION SCALE: for the DeepSeek MLA rows the reference folds a
+    // second factor, mscale = 1 + 0.1*mscale_all_dim*ln(factor), into the score
+    // scale as mscale^2/sqrt(key_length). That is B7: it is resolved into
+    // ModelConfig::mla_kq_mscale here and consumed by mla_forward, and leaving
+    // it out cost a factor-40 file 36.6% of its score amplitude.
     //
     // Folding the factor in also means rope_scale must go back to 1.0: the
     // interpolated frequency already carries the 1/factor, and the kernel
@@ -3980,6 +4070,14 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         cfg_.rope_yarn_factor = factor;
         cfg_.rope_yarn_log_mul = static_cast<f32>(
             gguf_.get_f64(key(".rope.scaling.yarn_log_multiplier"), 0.0));
+        // B7. The mscale MULTIPLIER only (1.0 when the file does not ask for
+        // any), resolved once from the file's own numbers so the engine has no
+        // second opinion and a test can read it off the config. TheMLA path
+        // squares it and divides by sqrt(key_length); only the V2/V3 path
+        // (mla_forward) consumes it, because deepseek4/41 pass a plain
+        // 1/sqrt(n_embd_head) in the reference.
+        cfg_.mla_kq_mscale = deepseek_yarn_mscale(cfg_.rope_yarn_factor,
+                                                  cfg_.rope_yarn_log_mul);
         const i32 orig = static_cast<i32>(gguf_.get_i64(
             key(".rope.scaling.original_context_length"), cfg_.n_ctx_train));
         const f32 beta_fast = static_cast<f32>(
@@ -4011,13 +4109,29 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // one over the same dimensions and the same base. On an unscaled file the
     // two tables are identical, so nothing is built and nothing changes.
     //
-    // Linear (non-YaRN) scaling is NOT covered: that factor multiplies the
-    // position inside the kernel through one stack-wide `mc.rope_scale`, so a
-    // windowed layer cannot carry its own 1.0 without a per-layer scale. No
-    // family in this table pairs linear scaling with a window today.
     if (cfg_.swa_window > 0 && !swa_own_rope && aspec.swa_plain_rope &&
         cfg_.rope_yarn)
         build_inv_freq(inv_freq_swa_, cfg_.rope_dim, cfg_.rope_base);
+    // Linear (non-YaRN) scaling is not a frequency table at all: the factor
+    // divides the POSITION inside the kernel, so it rides one stack-wide
+    // `cfg_.rope_scale` and a windowed layer could not carry its own 1.0. It
+    // is resolved per layer here instead, once, from the same statement the
+    // plain table above rests on -- the reference passes these layers
+    // `ext_factor = 0` and a SWA freq scale of 1, whichever kind of scaling the
+    // full layers use. YaRN never reaches this: its factor is folded into the
+    // table and `cfg_.rope_scale` is set back to 1.0 before this point, so a
+    // YaRN file leaves the vector empty and costs nothing.
+    //
+    // A family with no window, or a file that declares no window, keeps the
+    // stack-wide value: nothing here is a guess about a mixture the file does
+    // not have.
+    if (cfg_.swa_window > 0 && aspec.swa_plain_rope && cfg_.rope_scale != 1.0f &&
+        !cfg_.rope_yarn) {
+        cfg_.rope_scale_layer.assign(static_cast<size_t>(cfg_.n_layer),
+                                     cfg_.rope_scale);
+        for (i32 l = 0; l < cfg_.n_layer; l++)
+            if (is_swa(l)) cfg_.rope_scale_layer[static_cast<size_t>(l)] = 1.0f;
+    }
     if (cfg_.rope_neox)
         KRK_INFO("rope pairing: NeoX half-split (channel j with j + %d)",
                  cfg_.rope_dim / 2);

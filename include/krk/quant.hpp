@@ -119,7 +119,11 @@ enum class DType : i32 {
     //          byte-identical to upstream llama.cpp's Q2_0. A file made by
     //          upstream declares 42 but measures 2.25 bpw (the Swift
     //          Qwen3.8-Flash shards do).
-    // Both are decoded here; Model::load picks between them per file.
+    // Both are decoded here. Neither the id nor the file's metadata says
+    // which one a tensor is: the STRIDE does, and Gguf::parse_shard resolves it
+    // per file from the tensor offsets (gguf.cpp, "which 2-bit dialect"). A
+    // stride that fits neither is refused by name -- id 42 is also the BitNet
+    // fork's TL2, and guessing its block layout decodes a different model.
     Q1_0 = 41,
     Q2_0 = 42,
     Q2_0_64 = 48,
@@ -169,6 +173,14 @@ const char *dtype_name(DType t);
 
 // True when this engine can dequantize and multiply against the format.
 bool dtype_supported(DType t);
+
+// True for a THREE-state (BitNet b1.58-style) weight format: every value is
+// exactly {-d, 0, +d}. That covers TQ1_0/TQ2_0 (the {-1,0,+1} trit ladder),
+// I2_S (microSoft's own 2-bit ternary) and Q1_0 (1-bit binary {-d, +d}, the
+// BitNet 1-bit exports). It deliberately does NOT cover Q2_0/PQ2_0: their code
+// ladder reaches +2d, so they are 2-BIT CODE formats that can quantize any
+// model, not evidence of a b1.58 checkpoint.
+bool dtype_is_ternary(DType t);
 
 // Elements per quantization block (1 for the float formats).
 int dtype_block_size(DType t);

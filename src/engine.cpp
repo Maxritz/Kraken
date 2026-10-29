@@ -2903,7 +2903,7 @@ bool Engine::qsa_select_block(const LayerWeights &L, i32 l, i32 n, i64 pos0,
     cfg.n_rot = mc.rope_dim > 0 ? mc.rope_dim : 0;
     cfg.inv_freq = model_.inv_freq_at(l).empty() ? nullptr
                                                 : model_.inv_freq_at(l).data();
-    cfg.rope_scale = mc.rope_scale;
+    cfg.rope_scale = model_.rope_scale_at(l);
     cfg.rope_neox = mc.rope_neox;
 
     const i32 n_blocks =
@@ -3041,8 +3041,14 @@ void Engine::head_compute(i32 row) {
     // head: the block's output (the embeddings a caller may ask for) keeps the
     // unscaled normed row, which is what `res->t_embd` holds in the reference
     // too.
+    // Both sides of the multiply are dumped, so a trace can show the factor
+    // itself rather than only that the head ran: `head.pre` is the normed row
+    // the head would read on a family without the scale, `head.in` is what it
+    // actually reads. test_minicpm3_scale_arithmetic compares the two.
+    dump_row("head.pre", -1, xn, n_embd_, 1);
     if (mc.lm_head_scale != 1.0f)
         be_->scale_act(xn, mc.lm_head_scale, 1, n_embd_, n_embd_);
+    dump_row("head.in", -1, xn, n_embd_, 1);
     logit_head(xn);
 }
 
@@ -3303,7 +3309,7 @@ bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
         // these archs under LLAMA_ROPE_TYPE_NONE for the same reason.
         if (!mc.learned_pos && mc.alibi_max_bias <= 0.0f)
             be_->rope(ws_q_, ws_k_, lh, lkvh, hd, n, pos0,
-                      model_.inv_freq_at(l).data(), mc.rope_scale,
+                      model_.inv_freq_at(l).data(), model_.rope_scale_at(l),
                       model_.rope_frac_at(l), mc.rope_neox);
 
         kbase = const_cast<void *>(kvt_k_.base(l));
@@ -3840,7 +3846,8 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
               be_->attn_fused_chain(ws_attn_, ws_q_, kbase, vbase,
                                       ws_k_, ws_v_, d,
                                       model_.inv_freq_at(l).data(),
-                                      mc.rope_scale, model_.rope_frac_at(l),
+                                      model_.rope_scale_at(l),
+                                      model_.rope_frac_at(l),
                                       mc.qk_norm ? L.q_norm : nullptr,
                                       mc.qk_norm ? L.k_norm : nullptr,
                                       mc.rms_eps, mc.qk_norm_wide,
@@ -3877,7 +3884,8 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                 !(mc.rope_swa_only && !model_.is_swa(l));
             if (layer_rotates)
                 be_->rope(ws_q_, ws_k_, lh, lkvh, d.hd,
-                          n, pos0, model_.inv_freq_at(l).data(), mc.rope_scale,
+                          n, pos0, model_.inv_freq_at(l).data(),
+                          model_.rope_scale_at(l),
                           model_.rope_frac_at(l), mc.rope_neox);
             // A shared-KV layer appends nothing: the layer that owns this
             // plane wrote these rows already, and a second write would put the
@@ -4791,8 +4799,8 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
     if (!no_rope)
         be_->rope(ws_q_, ws_k_, nh, nkv, hd, 1,
                   static_cast<i64>(pos) * rope_scale + rope_off,
-                  model_.inv_freq_at(rope_layer).data(), mc.rope_scale, frac,
-                  mc.rope_neox);
+                  model_.inv_freq_at(rope_layer).data(),
+                  model_.rope_scale_at(rope_layer), frac, mc.rope_neox);
     be_->kv_append(mtp_kv_k_, mtp_kv_v_, ws_k_, ws_v_, d);
     be_->attention(ws_attn_, ws_q_, mtp_kv_k_, mtp_kv_v_, d);
     if (packed) {
@@ -5202,8 +5210,13 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
         // carry a multiply: this is the gemm + scale + add the reference does,
         // gated on the flag so every other family keeps the fold.
         gemm_w(ws_x2_, gn, L.wdown, n_embd_, n_ff_, n);
-        if (dmc.attn_out_scale != 1.0f)
+        // The branch as projected, before the residual scale -- the other side
+        // of the multiply, so a trace can prove the factor is applied ONCE and
+        // with the value the config says (test_minicpm3_scale_arithmetic).
+        if (dmc.attn_out_scale != 1.0f) {
+            dump_row("ffn.pre", l, ws_x2_, n_embd_, n);
             be_->scale_act(ws_x2_, dmc.attn_out_scale, n, n_embd_, n_embd_);
+        }
         dump_row("attn.down", l, ws_x2_, n_embd_, n);
         be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
     } else {
@@ -7105,23 +7118,22 @@ bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     // over the whole per-head key, nope + rope -- and not plain 1/sqrt(qk)
     // either on a YaRN file.
     //
-    // DeepSeek multiplies its query and key by an mscale of its own
-    // (rope.scaling.yarn_log_multiplier), which llama.cpp deepseek2 folds into
-    // the attention scale instead of into the rope (the rope's magnitude is
-    // pre-divided by exactly the same factor, so the rotation stays at unity
-    // and only the score changes -- see TAG_DEEPSEEK2_YARN_LOG_MUL_FIX). On
-    // the V2-Lite file that is mscale = 1.0261 and a scale 5.3% above
-    // 1/sqrt(192): small enough that a short greedy run agrees for a few tokens
-    // and then picks a different word, which is exactly how it showed up.
-    // MEASURED, not derived: with the mscale^2 factor this engine's first
-    // greedy token on the Coder-V2-Lite file differs from llama.cpp's, and with
-    // plain 1/sqrt(key_length) it matches. That is the one number this couldn't
-    // be reasoned out of -- llama.cpp's deepseek2 kq_scale reads
-    // mscale^2/sqrt(key_length), but its mscale is built from
-    // rope.freq_scale, and when that is 1.0 the whole correction is 1.0 too.
-    // The file's factor of 40 is applied to the FREQUENCIES (folded into
-    // inv_freq above), not to this scale, and the text is the witness.
-    d.scale = 1.0f / std::sqrt(static_cast<f32>(qk));
+    // This used to be plain 1/sqrt(qk), on a written-down argument that the
+    // reference's mscale "is built from rope.freq_scale, and when that is 1.0
+    // the whole correction is 1.0 too". The premise is false for a YaRN file:
+    // rope_freq_scale IS 1/factor on one (llama-model.cpp:1516-1518 sets
+    // rope_freq_scale_train = 1/ropescale, llama-context.cpp:227 adopts it when
+    // the caller does not override), so on a factor-40 DeepSeek file the
+    // parenthesis is 1 + 0.1*mscale_all_dim*ln(40) = 1.369 and the score scale
+    // is 1.874x the plain one -- a 36.6% amplitude error on every score, which
+    // reads as fluent text with a different word a few tokens in.
+    //
+    // The loader resolves the multiplier once (ModelConfig::mla_kq_mscale, see
+    // deepseek_yarn_mscale for the full chain); this path is the V2/V3 one and
+    // is the only consumer, because deepseek4/deepseek41 pass plain
+    // 1/sqrt(n_embd_head) in the reference.
+    const f32 mscale = mc.mla_kq_mscale;
+    d.scale = mscale * mscale / std::sqrt(static_cast<f32>(qk));
     d.eps = mc.rms_eps;
     // The file's own rotary table, YaRN already folded into the frequencies by
     // the loader. The kernel rotates the q rope half and each cache row's key
@@ -7231,8 +7243,11 @@ bool Engine::mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     // One row: K and V are the same latent, so the stride IS the row.
     sd.pos_stride = d;
     // The score is a dot over the whole latent, so this is 1/sqrt(key_length)
-    // and nothing else. The mscale correction belongs to the lite family's
-    // YaRN files and is deliberately NOT applied here.
+    // and nothing else. The mscale correction belongs to the lite (V2/V3)
+    // family's YaRN files and is deliberately NOT applied here: the reference's
+    // deepseek4/deepseek41 models pass a plain 1/sqrt(n_embd_head) too
+    // (src/models/deepseek4.cpp:1195-1206, deepseek41.cpp:427). Applying
+    // mla_forward's mscale here would make a V4 file 1.87x too hot.
     sd.scale = 1.0f / std::sqrt(static_cast<f32>(d));
     sd.eps = mc.rms_eps;
     sd.window = mc.dsv4_window > 0 ? mc.dsv4_window : 0;

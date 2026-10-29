@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <chrono>
 #include <fstream>
+#include <sstream>
 #include <functional>
 
 #if defined(_WIN32)
@@ -5154,7 +5155,8 @@ static void test_dsv4_compressed_attention() {
 // contribution" and they must agree; 3 and 4 must move the answer.
 static bool build_gemma4_model(const std::string &path, int n_layer, int n_kv_shared,
                                f32 v_scale, f32 out_scale, bool zero_ple,
-                               bool routed = false, int routed_mode = 0) {
+                               bool routed = false, int routed_mode = 0,
+                               f32 attn_scale_key = 0.0f) {
     const int n_embd = 16, n_head = 2, n_kv = 1, hd = 8, n_ff = 32, vocab = 260;
     const int ctx = 64;
     const int npl = 4;  // embedding_length_per_layer_input
@@ -5174,6 +5176,8 @@ static bool build_gemma4_model(const std::string &path, int n_layer, int n_kv_sh
     b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
     b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
     b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-6f);
+    if (attn_scale_key > 0.0f)
+        b.meta_f32(arch + ".attention.scale", attn_scale_key);
     b.meta_f32(arch + ".rope.freq_base", 10000.0f);
     b.meta_u32(arch + ".vocab_size", static_cast<u32>(vocab));
     b.meta_u32(arch + ".embedding_length_per_layer_input", static_cast<u32>(npl));
@@ -5331,6 +5335,16 @@ static void test_gemma4_forward() {
                   "the norm is repeated per layer for the grouped kernel");
             CHECK(std::fabs(mc.embd_scale - std::sqrt(16.0f)) < 1e-6f,
                   "the embedding scale is sqrt(n_embd)");
+            // B4 / A1: the row's attention scale on a REAL file of the family.
+            // The fixture writes no `attention.scale`, so this is the row's
+            // constant reaching the config -- 1.0, the reference's
+            // `self.scaling`, not the 1/sqrt(head_dim) the engine defaults to
+            // when a file states nothing (1/sqrt(8) = 0.3536 on this fixture).
+            CHECK_NEAR(mc.attn_scale, 1.0f, 1e-6f,
+                       "gemma4's row supplies attn_scale 1.0 to a real file");
+            CHECK(std::fabs(mc.attn_scale - 1.0f / std::sqrt(8.0f)) > 0.1f,
+                  "... which is NOT the engine's 1/sqrt(head_dim) default, so "
+                  "the two are distinguishable on this fixture");
             // Shared-KV tail: start = 4 - 2 = 2, and the rule pairs a layer
             // with the layer `period` steps back (1 for a full layer, 2 for a
             // windowed one). No window here, so both tail layers read layer 1.
@@ -5352,6 +5366,87 @@ static void test_gemma4_forward() {
 
     std::vector<f32> base_lg;
     std::string err;
+    // The graph, not just the config: a twin that STATES 1/sqrt(head_dim) is
+    // the same weights with a different score scale, so its logits must move.
+    // Without this arm "the row is 1.0" would only be a claim about a field.
+    //
+    // The prompt has to be more than one token. `gemma4_logits` above runs
+    // "the" alone, and at position 0 the softmax is over ONE key, where the
+    // score scale cancels exactly -- measured: two files whose attn.out rows
+    // differ by 1% still produce identical prefill logits and different text.
+    // So this arm runs a three-token prompt and reads the row at position 2.
+    auto three_token_logits = [&](const std::string &p, std::vector<f32> &lg) {
+        Backend *be = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = p;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            std::string lerr;
+            if (e.init(be, c, &lerr)) {
+                GenerateParams gp;
+                gp.prompt = "the the the";
+                gp.max_tokens = 1;
+                GenerateResult r;
+                if (e.generate(gp, &r)) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    lg.assign(e.last_logits(), e.last_logits() + nv);
+                    ok = true;
+                } else {
+                    err = lerr;
+                }
+            } else {
+                err = lerr;
+            }
+        }
+        delete be;
+        return ok;
+    };
+    {
+        const std::string twin = "kraken-gemma4-ple-scaled.gguf";
+        CHECK(build_gemma4_model(twin, 4, 2, 1.0f, 0.75f, false, false, 0,
+                                 static_cast<f32>(1.0 / std::sqrt(8.0))),
+              "wrote the same gemma4 file with attention.scale stated as "
+              "1/sqrt(head_dim)");
+        f32 twin_scale = -1.0f;
+        bool twin_ok = false;
+        {
+            Backend *tb = make_cpu_backend();
+            {
+                Engine te;
+                EngineConfig tc;
+                tc.model_path = twin;
+                tc.n_ctx = 64;
+                tc.prefill_chunk = 8;
+                if (te.init(tb, tc, &err)) {
+                    twin_ok = true;
+                    twin_scale = te.model().cfg().attn_scale;
+                }
+            }
+            delete tb;
+        }
+        std::fprintf(stderr, "[b4] twin attn_scale = %g\n",
+                     static_cast<double>(twin_scale));
+        CHECK(twin_ok && std::fabs(twin_scale - 1.0f / std::sqrt(8.0f)) < 1e-6f,
+              "the twin's stated scale reaches its config");
+        std::vector<f32> row_a, row_b;
+        const bool ra = three_token_logits(base_file, row_a);
+        const bool rb = three_token_logits(twin, row_b);
+        if (ra && rb && row_a.size() == row_b.size() && !row_a.empty()) {
+            f32 md = 0.0f;
+            for (size_t i = 0; i < row_a.size(); i++)
+                md = std::max(md, std::fabs(row_a[i] - row_b[i]));
+            std::fprintf(stderr, "[b4] attn_scale 1.0 vs 1/sqrt(8): md=%g\n",
+                         static_cast<double>(md));
+            CHECK(md > 1e-4f,
+                  "the row's 1.0 is what the graph multiplies with: stating "
+                  "1/sqrt(head_dim) instead moves a three-token logits row");
+        } else {
+            CHECK(false, ("the scaled twin runs: " + err).c_str());
+        }
+    }
     CHECK(gemma4_logits(base_file, base_lg, err),
           "the base fixture produces logits");
     if (base_lg.empty()) return;
@@ -5936,15 +6031,26 @@ struct SchemaSpec {
     f32 embd_scale_key = 0.0f;   // <arch>.embedding_scale
     i32 swa_window = 0;          // 0 => no `<arch>.attention.sliding_window`
     bool yarn = false;           // <arch>.rope.scaling.type = yarn (factor 8)
+    // <arch>.rope.scaling.type = linear with this factor. Linear scaling is a
+    // POSITION divisor, so unlike YaRN it survives on the config and is what a
+    // windowed layer would have to override (B3b).
+    f32 linear_scale = 0.0f;
     // BitNet's SubLN pair: attn_sub_norm (n_embd) + ffn_sub_norm (n_ff).
     bool sub_norms = false;
     // BitNet's head is TIED: llama.cpp builds the logits from `tok_embd` and
     // the file carries no `output.weight` at all.
     bool write_out_weight = true;
+    // gemma2/gemma3's 27B attention-scale rule is keyed on the LAYER COUNT, so
+    // a fixture has to be able to say how many layers it has.
+    i32 n_layer = 2;
+    // Head width, when it must differ from n_embd/n_head -- which is what tells
+    // gemma's 27B rule apart from the ordinary 1/sqrt(head_dim).
+    i32 hd = 8;
 };
 
 static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
-    const int n_embd = 32, n_layer = 2, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int n_embd = 32, n_layer = v.n_layer, n_head = 4, n_kv = 2,
+              hd = v.hd, n_ff = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
     const int vocab = 260, ctx = 64;
     const std::string &arch = v.arch;
@@ -5974,6 +6080,10 @@ static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
         b.meta_str(arch + ".rope.scaling.type", "yarn");
         b.meta_f32(arch + ".rope.scaling.factor", 8.0f);
         b.meta_u32(arch + ".rope.scaling.original_context_length", 64);
+    }
+    if (v.linear_scale > 0.0f && !v.yarn) {
+        b.meta_str(arch + ".rope.scaling.type", "linear");
+        b.meta_f32(arch + ".rope.scaling.factor", v.linear_scale);
     }
     add_spm_vocab(b, vocab, -1);
 
@@ -6514,12 +6624,18 @@ std::vector<u8> i2s_pack(const std::vector<f32> &tern_unit, f32 scale,
 // matmul weight ternary. `as_i2s` decides whether those weights are stored in
 // I2_S (with `scale` in the tail) or as F16 holding scale*ternary, which is
 // the same matrix either way.
+// `as_arch` writes the SAME weights under another `general.architecture`, which
+// is how a b1.58 checkpoint re-exported as `llama` is reproduced here (D9).
+// `with_sub_norms` drops the SubLN pair, the arm that proves a ternary FORMAT
+// on its own says nothing about the activation.
 bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale,
-                       f32 embd_i2s_scale = 0.0f, bool ms_tail = false) {
+                       f32 embd_i2s_scale = 0.0f, bool ms_tail = false,
+                       const char *as_arch = "bitnet-b1.58",
+                       bool with_sub_norms = true) {
     const int n_embd = 256, n_layer = 2, n_head = 8, n_kv = 8, hd = 32;
     const int n_ff = 256, vocab = 260, ctx = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;   // 256 / 256
-    const std::string arch = "bitnet-b1.58";
+    const std::string arch = as_arch;
     GgufBuilder b;
     b.meta_str("general.architecture", arch);
     b.meta_str("general.name", "kraken-bitnet-i2s");
@@ -6543,12 +6659,22 @@ bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale,
     };
     // One ternary matrix, identical for both encodings: the ternary value is a
     // function of the element's position only.
+    //
+    // The cutoff is 0.14, not the 0.15 this fixture used to carry. `wv` emits
+    // (m mod 11 - 5) * 0.03, i.e. at most +-0.15 in f32 -- and 5 * 0.03f rounds
+    // to 0.14999999, which is BELOW 0.15f. So the old cutoff excluded the
+    // largest magnitude the generator can produce and every matrix in this
+    // fixture was ALL ZERO: the layers were inert, the logits came straight
+    // from the tied head, and no weight scale could move them. That is the
+    // whole of the "the synthetic fixtures' logits are scale-blind" entry in
+    // docs/TODO-alignment-2026-10-29.md; with a cutoff that actually cuts,
+    // ~18% of the entries are +-1 and the fixture has a graph.
     auto matmul = [&](const std::string &nm, const std::vector<u64> &ne, i64 base) {
         const size_t n = static_cast<size_t>(ne[0] * ne[1]);
         std::vector<f32> tern(n);
         for (size_t i = 0; i < n; i++) {
             const f32 t = wv(base + static_cast<i64>(i));
-            tern[i] = t > 0.15f ? 1.0f : (t < -0.15f ? -1.0f : 0.0f);
+            tern[i] = t > 0.14f ? 1.0f : (t < -0.14f ? -1.0f : 0.0f);
         }
         if (as_i2s) {
             const std::vector<u8> packed = i2s_pack(tern, scale, ms_tail);
@@ -6583,9 +6709,9 @@ bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale,
         for (int i = 0; i < n_ff; i++)
             sf[static_cast<size_t>(i)] = 0.5f + 0.04f * static_cast<f32>(i % 7);
         b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
-        b.tensor_f32(p + "attn_sub_norm.weight", {u64(n_embd)}, sa);
+        if (with_sub_norms) b.tensor_f32(p + "attn_sub_norm.weight", {u64(n_embd)}, sa);
         b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
-        b.tensor_f32(p + "ffn_sub_norm.weight", {u64(n_ff)}, sf);
+        if (with_sub_norms) b.tensor_f32(p + "ffn_sub_norm.weight", {u64(n_ff)}, sf);
         matmul(p + "attn_q.weight", {u64(n_embd), u64(q_dim)}, base + 100);
         matmul(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)}, base + 200);
         matmul(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)}, base + 300);
@@ -6663,15 +6789,25 @@ static void test_i2_s_model() {
         CHECK(std::fabs(L.wgate.gs - scale) < 1e-7f, "on every matmul weight");
     }, err);
 
-    // A run smoke test, and NOTHING MORE: the two-token logits of this
-    // synthetic model are identical (md = 0, bitwise) for I2_S at 0.125, the
-    // same weights as F16 at 0.125, and the same weights at 8x -- measured, on
-    // all three pairs -- so logits cannot distinguish a weight scale here. The
-    // scale is pinned by the descriptor probe above and the codes by
-    // test_i2_s_layout; claiming this arm proves the scale would be claiming a
-    // check that cannot fail. Recorded as an open fixture question in
-    // docs/TODO-alignment-2026-10-29.md rather than asserted.
-    std::vector<f32> a, b;
+    // A run smoke test that now MEANS something. This fixture used to decode
+    // every ternary matrix to zero (the cutoff sat exactly on the generator's
+    // largest magnitude, see `matmul`), so the logits came from the tied head
+    // alone and no weight scale could move them -- which is why the arm could
+    // only assert "it runs". With a cutoff that cuts:
+    //   * I2_S at 0.125 and the same weights as F16 at 0.125 hold the SAME
+    //     values (the codes are +-1 and the scale is a power of two, so the
+    //     decode is exact), so those two logits must be identical;
+    //   * the same weights at 1.0 are 8x larger, so those logits must move.
+    // The second pair is the fixture's own sanity check: a logits A/B in this
+    // suite is only allowed to claim something once the fixture moves for a
+    // change that is known to be a change.
+    auto maxdiff = [](const std::vector<f32> &x, const std::vector<f32> &y) {
+        f32 md = 0.0f;
+        for (size_t i = 0; i < std::min(x.size(), y.size()); i++)
+            md = std::max(md, std::fabs(x[i] - y[i]));
+        return md;
+    };
+    std::vector<f32> a, b, c;
     if (!variant_logits("kraken-i2s.gguf", a, err)) {
         CHECK(false, ("the I2_S file LOADS and generates: " + err).c_str());
         return;
@@ -6681,6 +6817,36 @@ static void test_i2_s_model() {
           "the same weights as F16 are writable");
     CHECK(variant_logits("kraken-i2s-ref.gguf", b, err) && b.size() == a.size(),
           "and that reference runs too (the pair is well-formed)");
+    f32 peak = 0.0f;
+    for (f32 v : a) peak = std::max(peak, std::fabs(v));
+    CHECK(peak > 0.0f, "the logits are not all zero");
+    if (!a.empty() && a.size() == b.size()) {
+        const f32 md_same = maxdiff(a, b);
+        std::fprintf(stderr, "[i2s-scale] md(0.125 vs f16 0.125) = %g\n",
+                     static_cast<double>(md_same));
+        // Not bitwise at this width: a 256-inner-dim I2_S matmul takes the
+        // fused int8 kernel, which quantises the ACTIVATION, while the F16 file
+        // runs f16 math. The decode is exact (codes +-1, scale a power of two);
+        // the paths are not. Measured 0.0138 on a peak of 2.03, against 0.0301
+        // for the 8x-scale pair below -- the scale's effect is the larger one,
+        // which is the whole point of the pair.
+        CHECK(md_same < 0.02f,
+              "I2_S at 0.125 and the same weights as F16 at 0.125 agree to the "
+              "int8 activation quantisation, so the codes decode to the same "
+              "weights");
+    }
+    CHECK(build_bitnet_file("kraken-i2s-ref-1.gguf", false, 1.0f),
+          "wrote the same weights as F16 at 1.0 (8x the scale)");
+    if (variant_logits("kraken-i2s-ref-1.gguf", c, err) && c.size() == a.size()) {
+        const f32 md = maxdiff(a, c);
+        std::fprintf(stderr, "[i2s-scale] md(0.125 vs 1.0) = %g\n",
+                     static_cast<double>(md));
+        CHECK(md > 0.02f,
+              "an 8x weight scale MOVES the logits by more than the encoding "
+              "difference, so this fixture can distinguish a scale at all");
+    } else {
+        CHECK(false, ("the 8x reference runs: " + err).c_str());
+    }
 }
 
 // I2_S embeddings. A lookup table has no projection to ride, so the scale has
@@ -6861,6 +7027,115 @@ static void test_bitnet_family() {
     }
 }
 
+// D9 -- a b1.58 checkpoint whose `general.architecture` is `llama`.
+//
+// The SubLN pair is read from the tensors, so such a file already gets the two
+// extra norms; the FFN activation comes from the arch row, so it ran SILU. Half
+// the family is worse than none of it: the norms change the graph and the
+// activation is what the weights were trained against. The rule that fixes it
+// is narrow -- SubLN present AND ternary weights AND the generic `llama` name
+// -- and each arm below removes one leg of it.
+static void test_ternary_llama_arch() {
+    // ---- the format predicate the rule stands on -------------------------
+    CHECK(dtype_is_ternary(DType::I2_S) && dtype_is_ternary(DType::TQ1_0) &&
+              dtype_is_ternary(DType::TQ2_0) && dtype_is_ternary(DType::Q1_0),
+          "I2_S / TQ1_0 / TQ2_0 / Q1_0 are the three-state formats");
+    CHECK(!dtype_is_ternary(DType::Q2_0) && !dtype_is_ternary(DType::PQ2_0),
+          "Q2_0 and PQ2_0 are NOT: their ladder reaches +2, so they quantize "
+          "any model and say nothing about the activation");
+    CHECK(!dtype_is_ternary(DType::F16) && !dtype_is_ternary(DType::F32),
+          "and the float formats are not ternary either");
+
+    std::string err;
+
+    // ---- (1) the rule fires ---------------------------------------------
+    const std::string as_llama = "kraken-b158-as-llama.gguf";
+    CHECK(build_bitnet_file(as_llama, /*as_i2s=*/true, 0.125f, 0.0f, false,
+                            "llama"),
+          "wrote a b1.58 checkpoint whose arch name is llama");
+    {
+        bool ok = false;
+        if (schema_cfg(as_llama, [&](const Model &m) {
+                const ModelConfig &c = m.cfg();
+                ok = true;
+                CHECK(c.ffn_relu_sqr,
+                      "SubLN + ternary weights under `llama` gets squared ReLU");
+                CHECK(m.layers().size() == 2 && m.layers()[0].attn_sub_norm &&
+                          m.layers()[0].ffn_sub_norm,
+                      "... with the SubLN pair still applied");
+            }, err)) {
+            CHECK(ok, "the llama-named b1.58 file loads");
+        } else {
+            CHECK(false, ("the llama-named b1.58 file loads: " + err).c_str());
+        }
+    }
+
+    // ---- (2) the graph is the FAMILY's, not a lookalike -------------------
+    // Same weights, same shapes, one metadata byte apart: the logits have to be
+    // identical, or "squared ReLU was applied" is only a claim about a flag.
+    {
+        const std::string as_bitnet = "kraken-b158-as-bitnet.gguf";
+        CHECK(build_bitnet_file(as_bitnet, true, 0.125f),
+              "wrote the same weights under the family's own name");
+        std::vector<f32> lg_llama, lg_bitnet;
+        const bool a = variant_logits(as_llama, lg_llama, err);
+        if (!a) CHECK(false, ("the llama-named run: " + err).c_str());
+        const bool b = variant_logits(as_bitnet, lg_bitnet, err);
+        if (!b) CHECK(false, ("the family-named run: " + err).c_str());
+        if (a && b && !lg_llama.empty()) {
+            f32 md = 0.0f;
+            const size_t n = std::min(lg_llama.size(), lg_bitnet.size());
+            for (size_t i = 0; i < n; i++)
+                md = std::max(md, std::fabs(lg_llama[i] - lg_bitnet[i]));
+            CHECK(n > 0 && md == 0.0f,
+                  "the llama-named file produces the family's logits bit for "
+                  "bit, so the inferred graph is the trained one");
+        }
+    }
+
+    // ---- (3) SubLN alone is not evidence ---------------------------------
+    // The same SubLN pair over f16 weights is an ordinary llama that happens to
+    // ship sub-norms: rewriting its activation would be the overreach the rule
+    // is written to avoid.
+    {
+        const std::string path = "kraken-subn-lama-f16.gguf";
+        CHECK(build_bitnet_file(path, /*as_i2s=*/false, 0.125f, 0.0f, false,
+                                "llama"),
+              "wrote a SubLN llama whose weights are f16");
+        bool ok = false;
+        if (schema_cfg(path, [&](const Model &m) {
+                ok = true;
+                CHECK(!m.cfg().ffn_relu_sqr,
+                      "SubLN without ternary weights keeps SILU");
+                CHECK(m.layers()[0].ffn_sub_norm != nullptr,
+                      "and the sub-norm is still loaded -- only the activation "
+                      "is left alone");
+            }, err)) {
+            CHECK(ok, "the f16 SubLN file loads");
+        } else {
+            CHECK(false, ("the f16 SubLN file loads: " + err).c_str());
+        }
+    }
+
+    // ---- (4) ternary alone is not evidence -------------------------------
+    {
+        const std::string path = "kraken-ternary-plain-llama.gguf";
+        CHECK(build_bitnet_file(path, true, 0.125f, 0.0f, false, "llama",
+                                /*with_sub_norms=*/false),
+              "wrote a ternary llama with no sub-norms");
+        bool ok = false;
+        if (schema_cfg(path, [&](const Model &m) {
+                ok = true;
+                CHECK(!m.cfg().ffn_relu_sqr,
+                      "a ternary llama with no SubLN pair stays SILU");
+            }, err)) {
+            CHECK(ok, "the ternary non-SubLN file loads");
+        } else {
+            CHECK(false, ("the ternary non-SubLN file loads: " + err).c_str());
+        }
+    }
+}
+
 // TQ2_0 / PQ2_0 / Q2_0 / Q2_0_64 are 2-bit CODE formats: value = (q - 1) * d,
 // so the ladder is {-1, 0, +1, +2} and q = 3 must decode as +2. These arms pin
 // the new int8 kernels against the scalar/dequant reference on every code
@@ -6896,6 +7171,441 @@ static void test_refused_formats() {
           "I2_S accepts a row width that is a multiple of 128");
     CHECK(!dtype_row_aligned(DType::I2_S, 96) && !dtype_row_aligned(DType::I2_S, 1),
           "and rejects one that is not (its block would be shared with the next row)");
+}
+
+// D6 -- ggml id 42 is two block layouts and a fork's name. The id cannot say
+// which one a file holds, but the file's own STRIDES can: the distance from a
+// tensor's offset to the next one is exactly what its producer thought the
+// block was. These arms pin all three outcomes the resolver can reach -- Q2_0
+// (2.125 bpw), Q2_0_64 (2.25 bpw, what upstream-made files declaring 42
+// measure), and a refusal that names the fork's TL2 -- plus the alignment
+// slack a real producer leaves between tensors.
+//
+// 8192 values is the size the two hypotheses are told apart at: 64 blocks of
+// 34 = 2176 bytes against 128 blocks of 18 = 2304, i.e. 128 bytes apart, more
+// than one 32-byte alignment unit. On a small tensor both fit and the id's own
+// meaning wins on purpose (documented at the resolver) -- an arm that "proved"
+// otherwise would be pinning an ambiguity as a rule.
+static void test_q2_0_dialect() {
+    auto write_one = [](const std::string &path, u64 ne, size_t payload,
+                        bool with_tail) {
+        GgufBuilder b;
+        b.meta_str("general.architecture", "llama");
+        b.meta_u32("general.alignment", 32);
+        const std::vector<u8> zero(payload, 0);
+        b.tensor_raw("blk.0.attn_q.weight", 42, {ne}, zero.data(), zero.size());
+        if (with_tail) {
+            const std::vector<f32> one(4, 0.5f);
+            b.tensor_f32("tail.weight", {2, 2}, one);
+        }
+        return b.write(path);
+    };
+
+    // (1) 64 blocks of 34 bytes: exactly Q2_0. 2176 is 32-aligned, so the
+    //     stride is the payload itself and nothing else can explain it.
+    {
+        const std::string path = "kraken-q2-0-wide.gguf";
+        CHECK(write_one(path, 8192, 2176, false), "wrote a 2.125 bpw id-42 file");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), ("the 2.125 bpw file reads: " + err).c_str());
+        const GgufTensor *t = g.tensor("blk.0.attn_q.weight");
+        CHECK(t && t->type == DType::Q2_0,
+              "a stride of 34 bytes per 128 values resolves as Q2_0");
+        CHECK(t && t->type_id == 42u, "and the file's id is left as it was");
+    }
+    // (2) 128 blocks of 18 bytes: upstream's Q2_0_64 behind the same id. Its
+    //     stride is 128 bytes past what Q2_0 would need, so this is not an
+    //     alignment accident.
+    {
+        const std::string path = "kraken-q2-0-64.gguf";
+        CHECK(write_one(path, 8192, 2304, false),
+              "wrote a 2.25 bpw file that still declares id 42");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), ("the 2.25 bpw file reads: " + err).c_str());
+        const GgufTensor *t = g.tensor("blk.0.attn_q.weight");
+        CHECK(t && t->type == DType::Q2_0_64,
+              "a stride of 18 bytes per 64 values RETYPES the tensor to Q2_0_64");
+        CHECK(t && t->n_bytes == 2304,
+              "and its payload is the 2.25 bpw size, not 2176");
+    }
+    // (3) A stride that is neither: this is the shape the fork's TL2 would
+    //     have to have, and it must be refused by name instead of decoded at
+    //     whatever 2-bit layout happens to come first.
+    {
+        const std::string path = "kraken-q2-0-tl2.gguf";
+        CHECK(write_one(path, 8192, 2240, false),
+              "wrote an id-42 file with a stride that fits no known block");
+        Gguf g;
+        std::string err;
+        const bool loaded = g.load(path, &err);
+        CHECK(!loaded, "the file is refused");
+        CHECK(err.find("TL2") != std::string::npos,
+              "and the refusal names the fork's TL2");
+        CHECK(err.find("Q2_0_64") != std::string::npos,
+              "with both block layouts in the message, so it is actionable");
+        CHECK(err.find("blk.0.attn_q.weight") != std::string::npos,
+              "and it names the tensor it gave up on");
+    }
+    // (4) Both dialects in one file: refused, because no producer emits a
+    //     stack whose tensors disagree about their own block size.
+    {
+        const std::string path = "kraken-q2-0-mixed.gguf";
+        GgufBuilder b;
+        b.meta_str("general.architecture", "llama");
+        b.meta_u32("general.alignment", 32);
+        const std::vector<u8> a(2176, 0), c(2304, 0);
+        b.tensor_raw("blk.0.attn_q.weight", 42, {8192}, a.data(), a.size());
+        b.tensor_raw("blk.1.attn_q.weight", 42, {8192}, c.data(), c.size());
+        CHECK(b.write(path), "wrote a file with one tensor of each dialect");
+        Gguf g;
+        std::string err;
+        CHECK(!g.load(path, &err), "the mixed file is refused");
+        CHECK(err.find("incompatible") != std::string::npos,
+              "and the message is about the two strides disagreeing");
+    }
+    // (5) A real producer pads each tensor to general.alignment, so a stride
+    //     is payload + < 32 bytes. 66 blocks of 34 = 2244, so the next tensor
+    //     starts at 2272: 28 bytes of slack, and that must still resolve as
+    //     Q2_0. (2376 would be the 2.25 bpw size, so there is no room for the
+    //     other reading either.)
+    {
+        const std::string path = "kraken-q2-0-padded.gguf";
+        CHECK(write_one(path, 8448, 2244, true),
+              "wrote a 2.125 bpw file whose tensors are 32-byte aligned");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), ("the padded file reads: " + err).c_str());
+        const GgufTensor *t = g.tensor("blk.0.attn_q.weight");
+        CHECK(t && t->type == DType::Q2_0,
+              "alignment padding inside the stride still resolves as Q2_0");
+    }
+}
+
+// D8 -- the dense relu^2 arm does not take the row-scaled store.
+//
+// The silu arm can scale each row of the gated intermediate by a power of two
+// inside `silu_mul`, because the `ffn_sub_norm` that follows is an RMSNorm and
+// divides the scale straight back out. There is no relu_sqr+mul+row-max kernel,
+// so the relu^2 arm stores `relu(gate)^2 * up` unscaled -- and relu^2 is
+// QUADRATIC in the gate, so it reaches the f16 activation store with larger
+// magnitudes than the arm the guard was written for.
+//
+// This arm pins the three things that make it a RANGE guard rather than a
+// function: (1) the product really does leave f16 on a row of ordinary size,
+// (2) a power-of-two row scale is exact in f16, so the guard would spend no
+// precision, and (3) an RMSNorm over the scaled row is the same row, so the
+// arm's OUTPUT cannot change -- only its headroom. What is left open is the
+// device-side store, which cannot be exercised without HIP: recorded in the
+// TODOs as `[~]` rather than claimed fixed.
+// B3b -- linear rope scaling on a hybrid stack.
+//
+// YaRN is folded into the frequency table at load, so the windowed half of a
+// stack can be given its own plain table (that is what `inv_freq_swa_` is).
+// Linear scaling is not a table: the factor DIVIDES THE POSITION inside the
+// kernel, and it rode one stack-wide `mc.rope_scale`, so on a family whose
+// windowed layers rotate with plain rope (`ArchSpec::swa_plain_rope`: olmo2,
+// mellum) those layers rotated every position by the full layers' factor.
+//
+// Two arms: the config resolves a per-layer divisor (and only for that shape),
+// and the windowed layer's rotation is checked against the arithmetic it is
+// supposed to perform -- position / 1.0 -- with position / 2.0 as the control,
+// since that is exactly what the stack-wide value used to do.
+static void test_windowed_rope_scale() {
+    // olmo2's window pattern is `il % 4 < 3`: layers 0..2 windowed, layer 3
+    // full. Four layers is the smallest stack that has both kinds.
+    SchemaSpec v;
+    v.arch = "olmo2";
+    v.n_layer = 4;
+    v.swa_window = 8;
+    v.linear_scale = 2.0f;
+    v.post_norms = true;      // post_branch_norm
+    v.q_norm_w = 8;           // per-head qk norms (head_dim wide)
+    v.k_norm_w = 8;
+    const std::string path = "kraken-olmo2-linscale.gguf";
+    CHECK(build_schema_model(path, v), "wrote an olmo2 file, linear rope x2");
+    std::string err;
+
+    // ---- (1) the config resolves the divisor per layer --------------------
+    {
+        bool ok = false;
+        if (schema_cfg(path, [&](const Model &m) {
+                const ModelConfig &c = m.cfg();
+                ok = true;
+                CHECK_NEAR(c.rope_scale, 2.0f, 1e-6f,
+                           "the file's linear factor is on the config");
+                CHECK(c.rope_scale_layer.size() == 4,
+                      "and it is resolved per layer, because the family's "
+                      "windowed half rotates with plain rope");
+                if (c.rope_scale_layer.size() == 4) {
+                    CHECK(m.rope_scale_at(0) == 1.0f && m.rope_scale_at(2) == 1.0f,
+                          "the three windowed layers divide the position by 1.0");
+                    CHECK_NEAR(m.rope_scale_at(3), 2.0f, 1e-6f,
+                               "and the full layer keeps the file's factor");
+                }
+            }, err)) {
+            CHECK(ok, "the olmo2 linear-scale file loads");
+        } else {
+            CHECK(false, ("the olmo2 linear-scale file loads: " + err).c_str());
+        }
+    }
+    // ---- (2) nothing else gets a per-layer vector -------------------------
+    {
+        // No window: every layer keeps the factor. A file that declares no
+        // window must not be handed a mixture it does not have.
+        SchemaSpec w = v;
+        w.swa_window = 0;
+        w.arch = "olmo2";
+        const std::string p2 = "kraken-olmo2-linscale-nowin.gguf";
+        CHECK(build_schema_model(p2, w), "wrote the same file with no window");
+        bool ok = false;
+        if (schema_cfg(p2, [&](const Model &m) {
+                ok = true;
+                CHECK(m.cfg().rope_scale_layer.empty(),
+                      "no window -> no per-layer scale");
+                CHECK_NEAR(m.rope_scale_at(0), 2.0f, 1e-6f,
+                           "so even layer 0 rotates at position / 2");
+            }, err)) {
+            CHECK(ok, "the windowless twin loads");
+        } else {
+            CHECK(false, ("the windowless twin loads: " + err).c_str());
+        }
+        // YaRN: its factor is already inside the table and rope_scale is set
+        // back to 1.0, so there is nothing left to divide.
+        SchemaSpec y = v;
+        y.yarn = true;
+        y.linear_scale = 0.0f;
+        const std::string p3 = "kraken-olmo2-yarn.gguf";
+        CHECK(build_schema_model(p3, y), "wrote the YaRN twin");
+        bool ok3 = false;
+        if (schema_cfg(p3, [&](const Model &m) {
+                ok3 = true;
+                CHECK(m.cfg().rope_scale_layer.empty(),
+                      "a YaRN file leaves the per-layer vector empty: its "
+                      "factor lives in the frequency table");
+                CHECK_NEAR(m.rope_scale_at(0), 1.0f, 1e-6f,
+                           "and every layer's divisor is 1.0");
+            }, err)) {
+            CHECK(ok3, "the YaRN twin loads");
+        } else {
+            CHECK(false, ("the YaRN twin loads: " + err).c_str());
+        }
+    }
+    // ---- (3) the windowed layer's rotation, checked arithmetically --------
+    // `attn.qk` is the query row after the qk-norm and before the rotation,
+    // `attn.q` is the same row after it. With a 4-token prefill the dumped row
+    // is the last token, at position 3, so the expected angle is
+    // 3 * inv_freq[i] / scale -- and the only question is which scale.
+    const std::string dump = "krk-olmo2-linscale.txt";
+    std::remove(dump.c_str());
+    set_env_var("KRK_DUMP", dump);
+    i32 prompt_tokens = 0;
+    {
+        Backend *be = make_cpu_backend();
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            if (e.init(be, c, &err)) {
+                GenerateParams gp;
+                gp.prompt = "the the the the";
+                gp.max_tokens = 1;
+                GenerateResult r;
+                if (e.generate(gp, &r)) prompt_tokens = r.prompt_tokens;
+            } else {
+                CHECK(false, ("the dump arm loads: " + err).c_str());
+            }
+        }
+        delete be;
+    }
+    clear_env_var("KRK_DUMP");
+    std::fprintf(stderr, "[b3b] prompt_tokens=%d\n", prompt_tokens);
+    CHECK(prompt_tokens > 1, "the prefill is more than one token");
+
+    std::map<std::string, std::vector<f32>> d;
+    {
+        std::ifstream f(dump);
+        std::string line;
+        while (std::getline(f, line)) {
+            std::istringstream is(line);
+            std::string name, ltag, ntag;
+            if (!(is >> name >> ltag >> ntag)) continue;
+            if (ltag.size() < 2 || ltag[0] != 'L' || ntag.compare(0, 2, "n=") != 0)
+                continue;
+            const int layer = std::atoi(ltag.c_str() + 1);
+            std::vector<f32> vals;
+            f32 x = 0.0f;
+            while (is >> x) vals.push_back(x);
+            const std::string k = name + "@" + std::to_string(layer);
+            // FIRST occurrence wins: the prefill pass writes every stage once
+            // at position 3, and the decode step after it would overwrite the
+            // keys with position 4.
+            if (d.find(k) == d.end()) d[k] = vals;
+        }
+    }
+    auto pre = d.find("attn.qk@0");
+    auto post = d.find("attn.q@0");
+    CHECK(pre != d.end() && post != d.end(),
+          "the windowed layer dumped both sides of its rotation");
+    if (pre != d.end() && post != d.end() && pre->second.size() == post->second.size() &&
+        pre->second.size() == 32) {
+        const i32 hd = 8, nh = 4;
+        std::vector<f32> inv(4);
+        for (i32 i = 0; i < 4; i++)
+            inv[static_cast<size_t>(i)] =
+                std::pow(10000.0f, -2.0f * static_cast<f32>(i) / 8.0f);
+        // olmo2 pairs like NeoX: channel j with j + rope_dim/2.
+        auto rotate = [&](f32 pos) {
+            std::vector<f32> y = pre->second;
+            for (i32 h = 0; h < nh; h++) {
+                for (i32 i = 0; i < hd / 2; i++) {
+                    const f32 th = pos * inv[static_cast<size_t>(i)];
+                    const f32 cs = std::cos(th), sn = std::sin(th);
+                    const size_t a = static_cast<size_t>(h * hd + i);
+                    const size_t b = a + static_cast<size_t>(hd / 2);
+                    const f32 x0 = pre->second[a], x1 = pre->second[b];
+                    y[a] = x0 * cs - x1 * sn;
+                    y[b] = x0 * sn + x1 * cs;
+                }
+            }
+            return y;
+        };
+        auto maxdiff = [&](const std::vector<f32> &g) {
+            f32 md = 0.0f;
+            for (size_t i = 0; i < g.size(); i++)
+                md = std::max(md, std::fabs(g[i] - post->second[i]));
+            return md;
+        };
+        f32 peak = 0.0f;
+        for (f32 x : post->second) peak = std::max(peak, std::fabs(x));
+        // The dumped row is the LAST row of the prefill, so its position is
+        // one less than the prompt length -- counted, not assumed.
+        const f32 pos = static_cast<f32>(prompt_tokens - 1);
+        const f32 md_unscaled = maxdiff(rotate(pos));          // position / 1.0
+        const f32 md_scaled = maxdiff(rotate(pos * 0.5f));     // position / 2.0
+        std::fprintf(stderr,
+                     "[b3b] windowed layer: md(pos/1.0)=%g md(pos/2.0)=%g "
+                     "peak=%g\n",
+                     static_cast<double>(md_unscaled),
+                     static_cast<double>(md_scaled), static_cast<double>(peak));
+        CHECK(peak > 0.0f && md_unscaled <= 1e-5f * peak,
+              "the windowed layer rotates at position / 1.0, not the file's "
+              "stack-wide factor");
+        CHECK(md_scaled > 100.0f * md_unscaled,
+              "control: rotating at position / 2.0 -- what the stack-wide value "
+              "did -- does NOT reproduce the row, so the arm can fail");
+    } else {
+        CHECK(false, "the two dumped rows have the expected shape");
+    }
+}
+
+static void test_relu_sqr_row_scale() {
+    const i64 n = 256;
+    std::vector<f32> gate(static_cast<size_t>(n)), up(static_cast<size_t>(n));
+    std::vector<f32> prod(static_cast<size_t>(n));
+    for (i64 i = 0; i < n; i++) {
+        // Ordinary-magnitude gate leg (1e3..4e3, both signs) and up leg.
+        const f32 g = (1.0f + 0.5f * static_cast<f32>(i % 7)) * 1e3f;
+        gate[static_cast<size_t>(i)] = (i % 2) ? -g : g;
+        up[static_cast<size_t>(i)] = 0.5f + 0.25f * static_cast<f32>(i % 5);
+    }
+    auto relu_sqr_mul = [&](const std::vector<f32> &g, const std::vector<f32> &u,
+                            std::vector<f32> &out) {
+        for (i64 i = 0; i < n; i++) {
+            const f32 r = std::max(0.0f, g[static_cast<size_t>(i)]);
+            out[static_cast<size_t>(i)] = r * r * u[static_cast<size_t>(i)];
+        }
+    };
+    relu_sqr_mul(gate, up, prod);
+
+    f32 peak = 0.0f;
+    for (f32 v : prod) peak = std::max(peak, std::fabs(v));
+    std::fprintf(stderr, "[d8] relu^2 gated row peak = %g (f16 max 65504)\n",
+                 static_cast<double>(peak));
+    CHECK(peak > 65504.0f,
+          "relu(gate)^2 * up leaves the f16 range on a row of this size");
+
+    // (1) What the store would do without a scale: count the saturated lanes.
+    auto saturated = [&](const std::vector<f32> &x, f32 scale) {
+        int k = 0;
+        for (f32 v : x) {
+            const f32 q = fp16_to_fp32(fp32_to_fp16(v * scale));
+            if (std::fabs(q) >= 65504.0f) k++;
+        }
+        return k;
+    };
+    const int sat_plain = saturated(prod, 1.0f);
+    CHECK(sat_plain > 0,
+          "and an unscaled f16 store clamps it -- the guard's reason to exist");
+
+    // (2) The smallest power-of-two scale that brings the row inside f16, and
+    //     the claim that the divide spends no precision: the scaled value is
+    //     exactly representable, so f16 stores the same mantissa.
+    f32 scale = 1.0f;
+    while (peak * scale >= 65504.0f) scale *= 0.5f;
+    const int sat_scaled = saturated(prod, scale);
+    CHECK(sat_scaled == 0, "a power-of-two row scale brings every lane into f16");
+    {
+        // "Spends no precision" is a claim about a lane the f16 store can hold
+        // at all, so it is measured on the SAME shape at magnitudes that fit:
+        // a scale of 2^-k moves only the exponent, which f16 tracks with the
+        // same relative spacing, so the stored mantissa is the unscaled one.
+        std::vector<f32> small(static_cast<size_t>(n));
+        relu_sqr_mul(std::vector<f32>(gate.size(), 3.0f),
+                     std::vector<f32>(up.size(), 1.5f), small);
+        auto mantissa_preserved = [&](const std::vector<f32> &x, f32 s) {
+            for (f32 v : x) {
+                const f32 back = fp16_to_fp32(fp32_to_fp16(v * s));
+                const f32 ref = fp16_to_fp32(fp32_to_fp16(v)) * s;
+                if (back != ref) return false;
+            }
+            return true;
+        };
+        f32 small_peak = 0.0f;
+        for (f32 v : small) small_peak = std::max(small_peak, std::fabs(v));
+        CHECK(small_peak > 0.0f && small_peak < 65504.0f,
+              "the in-range arm of the same product fits f16 unscaled");
+        CHECK(mantissa_preserved(small, 0.25f),
+              "a power-of-two row scale only moves the exponent: the stored "
+              "mantissa is the unscaled one");
+        CHECK(!mantissa_preserved(small, 0.25f * 0.9f),
+              "control: a non-power-of-two scale does not, so this arm can "
+              "fail");
+    }
+
+    // (3) The sub-norm that consumes the row is scale-invariant, so the arm's
+    //     output cannot depend on the guard.
+    // The norm is computed in f64 on both sides, so the comparison is about
+    // the scale and not about the order an f32 sum happened to take.
+    auto rmsnorm_ref = [&](const std::vector<f32> &x) {
+        f64 ss = 0.0;
+        for (f32 v : x) ss += static_cast<f64>(v) * static_cast<f64>(v);
+        const f64 rms = std::sqrt(ss / static_cast<f64>(n) + 1e-5);
+        std::vector<f32> out(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; i++)
+            out[static_cast<size_t>(i)] =
+                static_cast<f32>(static_cast<f64>(x[static_cast<size_t>(i)]) / rms);
+        return out;
+    };
+    {
+        const std::vector<f32> a = rmsnorm_ref(prod);
+        std::vector<f32> scaled(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; i++)
+            scaled[static_cast<size_t>(i)] = prod[static_cast<size_t>(i)] * scale;
+        const std::vector<f32> c = rmsnorm_ref(scaled);
+        f32 md = 0.0f;
+        for (i64 i = 0; i < n; i++)
+            md = std::max(md, std::fabs(c[static_cast<size_t>(i)] -
+                                        a[static_cast<size_t>(i)]));
+        std::fprintf(stderr, "[d8] rmsnorm(row) vs rmsnorm(row*2^-k): md=%g\n",
+                     static_cast<double>(md));
+        CHECK(md < 1e-6f,
+              "RMSNorm of the row and of the same row scaled by 2^-k agree, so "
+              "the guard is a range transform and not part of the function");
+    }
 }
 
 static void test_q8_activation_domain() {
@@ -7150,6 +7860,118 @@ static void test_q2code_dot() {
         CHECK(rows_ok, "the eight-row kernel agrees with eight single-row dots");
         (void)names[ti];
     }
+}
+
+// B6 -- gemma2/gemma3's 27B attention scale.
+//
+// The reference scales the query by 1/sqrt(n_embd/n_head) on the 27B size and
+// by 1/sqrt(head_dim) on every other, and it decides which by the LAYER COUNT
+// (gemma2.cpp:14-27 switches on n_layer(): 26 = 2B, 42 = 9B, 46 = 27B;
+// gemma3.cpp:24: 62 = 27B). The HF `query_pre_attn_scalar` that says it in the
+// original config does not survive conversion, so the layer count is not a
+// proxy -- it is the only discriminator the format has.
+//
+// At 27B the two differ by 6% (1/sqrt(144) = 0.08333 against 1/sqrt(128) =
+// 0.08839), which is not a rounding difference but is small enough to read as
+// "a slightly different model".
+static void test_gemma_27b_scale() {
+    // ---- the table ---------------------------------------------------
+    {
+        const ArchSpec *g2 = arch_lookup("gemma2");
+        const ArchSpec *g3 = arch_lookup("gemma3");
+        CHECK(g2 && g2->attn_scale_embd_per_head_layers == 46,
+              "gemma2 switches at 46 layers, as the reference does");
+        CHECK(g3 && g3->attn_scale_embd_per_head_layers == 62,
+              "gemma3 at 62");
+        const ArchSpec *g1 = arch_lookup("gemma");
+        const ArchSpec *l = arch_lookup("llama");
+        CHECK(g1 && g1->attn_scale_embd_per_head_layers == 0,
+              "gemma1 has no such size rule");
+        CHECK(l && l->attn_scale_embd_per_head_layers == 0,
+              "and neither does any ordinary family");
+    }
+
+    auto scale_of = [&](const char *arch, i32 layers, f32 stated,
+                        const char *path) -> f32 {
+        SchemaSpec v;
+        v.arch = arch;
+        v.n_layer = layers;
+        v.attn_scale_key = stated;
+        // gemma2/gemma3 normalize each branch's OUTPUT, and the loader refuses
+        // a file of the family that does not carry the pair.
+        v.post_norms = true;
+        // gemma2/3 carry per-head QK-norm; the loader refuses a file of the
+        // family without it.
+        v.q_norm_w = 8;
+        v.k_norm_w = 8;
+        if (!build_schema_model(path, v)) return -1.0f;
+        f32 got = -2.0f;
+        std::string err;
+        if (!schema_cfg(path, [&](const Model &m) { got = m.cfg().attn_scale; }, err))
+            std::fprintf(stderr, "[b6] %s refused: %s\n", path, err.c_str());
+        return got;
+    };
+
+    // 46 layers: n_embd/n_head = 32/4 = 8 -> 1/sqrt(8).
+    const f32 s27 = scale_of("gemma2", 46, 0.0f, "kraken-gemma2-27b.gguf");
+    CHECK_NEAR(s27, 1.0f / std::sqrt(8.0f), 1e-6,
+               "a 46-layer gemma2 uses 1/sqrt(n_embd/n_head)");
+    // The arm above cannot, on its own, tell 1/sqrt(n_embd/n_head) from
+    // 1/sqrt(head_dim): both are 8 in that miniature. So one fixture declares
+    // a head_dim of 16 against the same n_embd/n_head of 8, and the 27B rule
+    // has to follow n_embd/n_head (= 1/sqrt(8) = 0.3536) and NOT the head
+    // (= 1/sqrt(16) = 0.25).
+    {
+        SchemaSpec v;
+        v.arch = "gemma2";
+        v.n_layer = 46;
+        v.hd = 16;
+        v.post_norms = true;
+        v.q_norm_w = 16;
+        v.k_norm_w = 16;
+        CHECK(build_schema_model("kraken-gemma2-27b-hd.gguf", v),
+              "wrote a 46-layer gemma2 file with a 16-wide head");
+        f32 got = -2.0f;
+        std::string err;
+        if (schema_cfg("kraken-gemma2-27b-hd.gguf",
+                       [&](const Model &m) { got = m.cfg().attn_scale; }, err))
+            CHECK_NEAR(got, 1.0f / std::sqrt(8.0f), 1e-6,
+                       "the 27B rule follows n_embd/n_head, not the head width");
+        else
+            CHECK(false, ("the 16-wide-head gemma2 loads: " + err).c_str());
+        // and the same file at 26 layers keeps the head-width default, so the
+        // two arms differ for the right reason
+        SchemaSpec w2 = v;
+        w2.n_layer = 26;
+        CHECK(build_schema_model("kraken-gemma2-2b-hd.gguf", w2),
+              "the same file at 26 layers");
+        f32 got2 = -2.0f;
+        if (schema_cfg("kraken-gemma2-2b-hd.gguf",
+                       [&](const Model &m) { got2 = m.cfg().attn_scale; }, err))
+            CHECK(got2 == 0.0f,
+                  "... keeps the default, so the engine uses 1/sqrt(head_dim)=0.25");
+        else
+            CHECK(false, ("the 26-layer 16-wide-head file loads: " + err).c_str());
+    }
+    // 26 layers: the rule does not fire, so the scale stays at the family
+    // default (0 => the engine's 1/sqrt(head_dim)).
+    const f32 s2b = scale_of("gemma2", 26, 0.0f, "kraken-gemma2-2b.gguf");
+    CHECK(s2b == 0.0f,
+          "a 26-layer gemma2 keeps the default (the engine uses 1/sqrt(head_dim))");
+    // 45 layers is NOT the 27B: an off-by-one must not apply the rule.
+    const f32 s45 = scale_of("gemma2", 45, 0.0f, "kraken-gemma2-45.gguf");
+    CHECK(s45 == 0.0f, "and 45 layers is not 46");
+    // gemma3's count is its own, not gemma2's.
+    const f32 s3 = scale_of("gemma3", 62, 0.0f, "kraken-gemma3-27b.gguf");
+    CHECK_NEAR(s3, 1.0f / std::sqrt(8.0f), 1e-6,
+               "a 62-layer gemma3 uses it too");
+    const f32 s3b = scale_of("gemma3", 46, 0.0f, "kraken-gemma3-46.gguf");
+    CHECK(s3b == 0.0f, "and 46 is gemma2's count, not gemma3's");
+    // A file that STATES its scale wins over the size rule: the rule is a
+    // default, and the key is the same statement made explicitly.
+    const f32 sx = scale_of("gemma2", 46, 0.25f, "kraken-gemma2-27b-stated.gguf");
+    CHECK_NEAR(sx, 0.25f, 1e-7,
+               "an explicit attention.scale overrides the 27B rule");
 }
 
 static void test_family_scales() {
@@ -17817,6 +18639,72 @@ static void test_mla_lite() {
 //     rewiring heads 0..hpg-1 must leave the answer bit-for-bit unchanged,
 //     which an off-by-one group stride cannot survive;
 //   * the window excludes keys by POSITION, not by array index.
+// B7 -- DeepSeek's YaRN attention scale.
+//
+// The number is not a tuning constant, it is arithmetic the reference performs
+// in three places, so it is pinned twice: against the closed form (which is
+// what the reference's chain collapses to) and against a file, where the loader
+// has to read the two keys and the engine has to use the result.
+//
+// Plain 1/sqrt(key_length) on a factor-40 file is 1.874x too small -- a 36.6%
+// amplitude error on every attention score. It does not produce garbage; it
+// produces fluent text that diverges a few tokens in, which is why it survived
+// this long.
+static void test_deepseek_yarn_mscale() {
+    // ---- the closed form, against the reference's chain ---------------
+    // llama.cpp: get_mscale(f, m) = 0.1*m*ln(f) + 1 for f > 1, else 1;
+    // attn_factor = get_mscale(f,mscale)/get_mscale(f,mscale_all)
+    //               * 1/(1+0.1*ln f);  mscale = attn_factor*(1+0.1*ln f)
+    //               * (1 + 0.1*mscale_all*ln f);  kq = mscale^2/sqrt(k).
+    // For deepseek2 the first ratio is exactly 1, so the whole thing is
+    // kq = (1 + log_mul*ln(f))^2 / sqrt(k) with log_mul = 0.1*mscale_all_dim.
+    auto reference = [](f32 f, f32 mscale_all, i32 k) {
+        auto get_mscale = [](f32 scale, f32 m) {
+            return scale <= 1.0f ? 1.0f : 0.1f * m * std::log(scale) + 1.0f;
+        };
+        const f32 factor = f;
+        // the deepseek2 branch: mscale == mscale_all, so the ratio is 1
+        const f32 attn = (get_mscale(factor, mscale_all) /
+                          get_mscale(factor, mscale_all)) *
+                         (1.0f / (1.0f + 0.1f * std::log(factor)));
+        const f32 attn_org = attn * (1.0f + 0.1f * std::log(factor));
+        const f32 mscale = attn_org * (1.0f + 0.1f * mscale_all * std::log(factor));
+        return mscale * mscale / std::sqrt(static_cast<f32>(k));
+    };
+    // mscale_all_dim = 1.0 is what DeepSeek-V2/V3 ship, and the converter
+    // writes 0.1*1.0 = 0.1 as the key.
+    CHECK_NEAR(krk::deepseek_kq_scale(40.0f, 0.1f, 192),
+               reference(40.0f, 1.0f, 192), 1e-6,
+               "a V2/V3 file at factor 40 matches the reference's chain");
+    CHECK_NEAR(krk::deepseek_yarn_mscale(40.0f, 0.1f), 1.36889f, 1e-4,
+               "and the multiplier is 1 + 0.1*ln(40) = 1.3689");
+    CHECK_NEAR(krk::deepseek_kq_scale(40.0f, 0.1f, 192) * std::sqrt(192.0f),
+               1.87385f, 1e-4,
+               "... squared: the score scale is 1.874x the plain one");
+    // mscale_all_dim = 0.5 (a file that asks for a different magnitude)
+    CHECK_NEAR(krk::deepseek_kq_scale(40.0f, 0.05f, 192),
+               reference(40.0f, 0.5f, 192), 1e-6,
+               "a different mscale_all_dim follows the same chain");
+
+    // ---- the cases that must stay EXACTLY plain ---------------
+    CHECK(krk::deepseek_yarn_mscale(1.0f, 0.1f) == 1.0f,
+          "factor 1 is not a scaling, and gets a multiplier of exactly 1");
+    CHECK(krk::deepseek_yarn_mscale(40.0f, 0.0f) == 1.0f,
+          "a file with no yarn_log_multiplier gets exactly 1");
+    CHECK(krk::deepseek_kq_scale(40.0f, 0.0f, 192) ==
+              1.0f / std::sqrt(192.0f),
+          "and its scale is bit-exactly 1/sqrt(key_length)");
+    CHECK(krk::deepseek_kq_scale(1.0f, 0.1f, 128) ==
+              1.0f / std::sqrt(128.0f),
+          "so is a non-YaRN file's");
+    CHECK(krk::deepseek_yarn_mscale(std::numeric_limits<f32>::quiet_NaN(), 0.1f)
+              == 1.0f,
+          "a non-finite factor does not poison the scale");
+    CHECK(krk::deepseek_yarn_mscale(40.0f,
+                                    std::numeric_limits<f32>::infinity()) == 1.0f,
+          "and neither does a non-finite multiplier");
+}
+
 static void test_mla_shared() {
     krk::MlaSharedGeometry g;
     g.n_embd = 16;
@@ -18881,6 +19769,12 @@ struct MlaFix {
     // so this is the file the forward's own range check exists for: it must
     // refuse the run instead of indexing an expert bank out of bounds.
     bool hash_id_oob = false;
+    // B7: write the YaRN metadata the reference builds the MLA score scale
+    // from. `yarn_factor` is `rope.scaling.factor` (0 = no scaling key at
+    // all), `yarn_log_mul` is `rope.scaling.yarn_log_multiplier` exactly as
+    // the converter writes it, i.e. 0.1*mscale_all_dim.
+    f32 yarn_factor = 0.0f;
+    f32 yarn_log_mul = 0.0f;
 };
 
 // 261, not 260: add_spm_vocab always writes 3 specials + 256 byte pieces + the
@@ -18927,6 +19821,17 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
     b.meta_u32(arch + ".rope.dimension_count", static_cast<u32>(kMlaRope));
     b.meta_f32(arch + ".rope.freq_base", 10000.0f);
     b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    if (f.yarn_factor > 0.0f) {
+        // A real DeepSeek file: type yarn, factor 40, and the log multiplier
+        // the converter derives from mscale_all_dim. `original_context_length`
+        // is what the frequency correction ramps around.
+        b.meta_str(arch + ".rope.scaling.type", "yarn");
+        b.meta_f32(arch + ".rope.scaling.factor", f.yarn_factor);
+        b.meta_u32(arch + ".rope.scaling.original_context_length", 32);
+        b.meta_f32(arch + ".rope.scaling.yarn_log_multiplier", f.yarn_log_mul);
+        b.meta_f32(arch + ".rope.scaling.yarn_beta_fast", 32.0f);
+        b.meta_f32(arch + ".rope.scaling.yarn_beta_slow", 1.0f);
+    }
     // The V2/V3 class compresses the KV into a latent of kv_lora_rank and keeps
     // the decoupled rope key beside it. V4 has no kv_lora_rank: its latent is
     // key_length wide and the rope is its tail.
@@ -19163,6 +20068,155 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
 // so a fixture that loads is what proves they reach ModelConfig. The multiplies
 // themselves are covered by the generic arms in test_family_scales (embedding)
 // and by wiring that is visible here (the two that have no file key).
+// B1b / B2b -- the MiniCPM3 constants, isolated NUMERICALLY.
+//
+// "the config says 256/n_embd and the run is finite" does not prove the engine
+// multiplies by that number, once, at the right place. These two do, because
+// the engine can dump both sides of each multiply: `head.pre`/`head.in` around
+// the head-input scale and `ffn.pre`/`attn.down` around the FFN residual scale.
+//
+// The relation asserted is exact arithmetic on the same f32 row, so the only
+// slack is printf's 7 significant digits (1e-6 relative).
+static void test_minicpm3_scale_arithmetic() {
+    // A reader for KRK_DUMP's "<stage> L<layer> n=<rows> v v v ..." lines.
+    // The `n=` field is the ROW count, not the width: one line carries
+    // rows*width values, so the values are read to end of line rather than to
+    // a count. Reading `n` values and stopping left the cursor inside the
+    // first line and the parse stalled there -- the arm then failed for a
+    // reason that had nothing to do with the scale.
+    auto read_dump = [](const std::string &path,
+                        std::map<std::string, std::vector<f32>> &out) {
+        std::ifstream f(path);
+        if (!f) return false;
+        std::string line;
+        while (std::getline(f, line)) {
+            std::istringstream is(line);
+            std::string name, ltag, ntag;
+            if (!(is >> name >> ltag >> ntag)) continue;
+            if (ltag.size() < 2 || ltag[0] != 'L' ||
+                ntag.compare(0, 2, "n=") != 0)
+                continue;
+            const int layer = std::atoi(ltag.c_str() + 1);
+            std::vector<f32> vals;
+            f32 v = 0.0f;
+            while (is >> v) vals.push_back(v);
+            // Layer -1 (the head) and layer 0 share a key only if the stage
+            // name is shared, which it is not.
+            out[std::string(name) + "@" + std::to_string(layer)] = vals;
+        }
+        return !out.empty();
+    };
+
+    MlaFix f;
+    f.kind = MlaFixKind::Legacy;
+    f.q_lora = true;
+    f.n_layer = 4;
+    const std::string path = "kraken-minicpm3-arith.gguf";
+    CHECK(build_mla_fixture(path, f, "minicpm3"),
+          "wrote a MiniCPM3 file for the arithmetic arm");
+
+    const std::string dump = "krk-minicpm3-dump.txt";
+    std::remove(dump.c_str());
+    set_env_var("KRK_DUMP", dump);
+    f32 head_scale = 0.0f, res_scale = 0.0f;
+    std::vector<f32> lg;
+    std::string err;
+    bool ran = false;
+    {
+        Backend *be = make_cpu_backend();
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            if (e.init(be, c, &err)) {
+                head_scale = e.model().cfg().lm_head_scale;
+                res_scale = e.model().cfg().attn_out_scale;
+                GenerateParams gp;
+                gp.prompt = "the";
+                gp.max_tokens = 2;
+                GenerateResult r;
+                ran = e.generate(gp, &r);
+                if (ran) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    lg.assign(e.last_logits(), e.last_logits() + nv);
+                }
+            }
+        }
+        delete be;
+    }
+    clear_env_var("KRK_DUMP");
+    CHECK(ran, ("the arithmetic run completes: " + err).c_str());
+    CHECK_NEAR(head_scale, 8.0f, 1e-6, "256/32 = 8 is the head-input factor");
+    CHECK_NEAR(res_scale, 0.7f, 1e-6, "1.4/sqrt(4) = 0.7 is the residual factor");
+
+    std::map<std::string, std::vector<f32>> d;
+    CHECK(read_dump(dump, d), "the run wrote a stage dump");
+    if (d.empty()) return;
+
+    // ---- B1b: the head input is exactly `head.pre * lm_head_scale` -------
+    {
+        auto pre = d.find("head.pre@-1");
+        auto in = d.find("head.in@-1");
+        CHECK(pre != d.end() && in != d.end(),
+              "both sides of the head multiply were dumped");
+        if (pre != d.end() && in != d.end() &&
+            pre->second.size() == in->second.size() && !in->second.empty()) {
+            f32 worst = 0.0f, peak = 0.0f;
+            bool applied_twice = true;
+            for (size_t i = 0; i < in->second.size(); i++) {
+                const f32 want = pre->second[i] * head_scale;
+                worst = std::max(worst, std::fabs(in->second[i] - want));
+                peak = std::max(peak, std::fabs(want));
+                if (std::fabs(in->second[i] - pre->second[i] * head_scale *
+                                                        head_scale) > 1e-6f * peak)
+                    applied_twice = false;
+            }
+            std::fprintf(stderr, "[b1b] head scale: worst=%g peak=%g\n",
+                         static_cast<double>(worst), static_cast<double>(peak));
+            CHECK(peak > 0.0f && worst <= 1e-5f * peak,
+                  "the head input is head.pre * 8, to f32 precision");
+            CHECK(!applied_twice,
+                  "... and NOT head.pre * 64, so the factor is applied once");
+        }
+    }
+    // ---- B2b: the FFN branch is exactly `ffn.pre * attn_out_scale` -------
+    {
+        int layers_checked = 0;
+        bool all = true;
+        f32 worst = 0.0f, peak = 0.0f;
+        for (int l = 0; l < 4; l++) {
+            auto pre = d.find("ffn.pre@" + std::to_string(l));
+            auto post = d.find("attn.down@" + std::to_string(l));
+            if (pre == d.end() || post == d.end()) continue;
+            if (pre->second.size() != post->second.size()) { all = false; continue; }
+            layers_checked++;
+            for (size_t i = 0; i < post->second.size(); i++) {
+                const f32 want = pre->second[i] * res_scale;
+                worst = std::max(worst, std::fabs(post->second[i] - want));
+                peak = std::max(peak, std::fabs(want));
+            }
+        }
+        std::fprintf(stderr,
+                     "[b2b] ffn residual: %d layers, worst=%g peak=%g\n",
+                     layers_checked, static_cast<double>(worst),
+                     static_cast<double>(peak));
+        CHECK(layers_checked == 4, "every layer dumped both sides of its FFN scale");
+        CHECK(all && peak > 0.0f && worst <= 1e-5f * peak,
+              "each layer's residual contribution is ffn.pre * 0.7");
+    }
+    // The logits are the head's linear output, so they are 8x what a family
+    // without the head scale would produce. That is checkable without a second
+    // run only through the dump above; here it is enough that the run was
+    // finite and non-degenerate, which the peak pins.
+    if (!lg.empty()) {
+        f32 peak = 0.0f;
+        for (f32 v : lg) peak = std::max(peak, std::fabs(v));
+        CHECK(peak > 0.0f && peak < 1e6f, "and the logits are finite");
+    }
+}
+
 static void test_minicpm3_scales() {
     MlaFix f;
     f.kind = MlaFixKind::Legacy;
@@ -19206,6 +20260,130 @@ static void test_minicpm3_scales() {
         } else {
             CHECK(false, ("a MiniCPM3 run: " + err).c_str());
         }
+    }
+}
+
+// B7 at the FILE level: the loader has to read the two keys, and the engine has
+// to use the result. The config arm proves the first; the run A/B proves the
+// second, because a multiplier written onto a config that nothing consumes is
+// exactly the state this defect was in.
+static void test_mla_yarn_file() {
+    std::string err;
+    auto logs = [&](const char *path, std::vector<f32> &lg) {
+        Backend *be = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            if (e.init(be, c, &err)) {
+                GenerateParams gp;
+                gp.prompt = "the";
+                gp.max_tokens = 2;
+                GenerateResult r;
+                ok = e.generate(gp, &r);
+                if (ok) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    lg.assign(e.last_logits(), e.last_logits() + nv);
+                }
+            }
+        }
+        delete be;
+        return ok;
+    };
+
+    // 1. no scaling: the multiplier is exactly 1 and the scale is plain.
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Legacy;
+        CHECK(build_mla_fixture("kraken-mla-plain.gguf", f),
+              "wrote a deepseek2 file with no rope scaling");
+        bool ok = false;
+        if (schema_cfg("kraken-mla-plain.gguf", [&](const Model &m) {
+                ok = true;
+                CHECK(m.cfg().mla_kq_mscale == 1.0f,
+                      "no yarn_log_multiplier -> a multiplier of exactly 1");
+            }, err)) {
+            CHECK(ok, "the plain file loads");
+        } else {
+            CHECK(false, ("the plain file loads: " + err).c_str());
+        }
+    }
+
+    // 2. a real V2/V3 Yaml file: factor 40, mscale_all_dim 1.0.
+    std::vector<f32> plain_lg, yarn_lg;
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Legacy;
+        f.yarn_factor = 40.0f;
+        f.yarn_log_mul = 0.1f;
+        CHECK(build_mla_fixture("kraken-mla-yarn.gguf", f),
+              "wrote a deepseek2 file with YaRN factor 40");
+        bool ok = false;
+        if (schema_cfg("kraken-mla-yarn.gguf", [&](const Model &m) {
+                ok = true;
+                const ModelConfig &c = m.cfg();
+                std::fprintf(stderr,
+                             "[b7] factor=%g log_mul=%g mscale=%g qk=%d\n",
+                             static_cast<double>(c.rope_yarn_factor),
+                             static_cast<double>(c.rope_yarn_log_mul),
+                             static_cast<double>(c.mla_kq_mscale),
+                             c.mla_qk_nope + c.mla_qk_rope);
+                CHECK(c.rope_yarn && c.rope_yarn_factor == 40.0f,
+                      "the loader reads rope.scaling.factor");
+                CHECK(std::fabs(c.rope_yarn_log_mul - 0.1f) < 1e-7f,
+                      "and rope.scaling.yarn_log_multiplier");
+                CHECK_NEAR(c.mla_kq_mscale, 1.36889f, 1e-4,
+                           "so the multiplier is 1 + 0.1*ln(40)");
+            }, err)) {
+            CHECK(ok, "the YaRN file loads");
+        } else {
+            CHECK(false, ("the YaRN file loads: " + err).c_str());
+        }
+        CHECK(logs("kraken-mla-yarn.gguf", yarn_lg), "and it generates");
+    }
+    CHECK(logs("kraken-mla-plain.gguf", plain_lg), "the plain file generates");
+
+    // 3. The arm that isolates the SCALE from the rope. `yarn_log_multiplier`
+    //    feeds nothing but mscale -- the frequency correction is built from
+    //    factor/original_context/beta, not from it -- so two files identical
+    //    except for that key differ ONLY in the attention scale. When the
+    //    engine ignored the multiplier these were bit-identical (measured:
+    //    maxdiff = 0), and when it applies it they are not.
+    std::vector<f32> yarn_half_lg;
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Legacy;
+        f.yarn_factor = 40.0f;      // same rope as above
+        f.yarn_log_mul = 0.05f;     // mscale_all_dim = 0.5, so mscale = 1.1845
+        CHECK(build_mla_fixture("kraken-mla-yarn2.gguf", f),
+              "wrote the same rope with half the log multiplier");
+        CHECK(logs("kraken-mla-yarn2.gguf", yarn_half_lg), "and it generates");
+    }
+    if (!yarn_lg.empty() && !yarn_half_lg.empty()) {
+        f32 md = 0.0f, peak = 0.0f;
+        for (size_t i = 0; i < std::min(yarn_lg.size(), yarn_half_lg.size()); i++) {
+            md = std::max(md, std::fabs(yarn_lg[i] - yarn_half_lg[i]));
+            peak = std::max(peak, std::fabs(yarn_lg[i]));
+        }
+        std::fprintf(stderr, "[b7] log_mul 0.1 vs 0.05: maxdiff=%g peak=%g\n",
+                     static_cast<double>(md), static_cast<double>(peak));
+        CHECK(md > 0.0f,
+              "the multiplier ALONE changes the logits (the rope is identical)");
+        CHECK(peak > 0.05f, "and the logits are not degenerate");
+    }
+    // The plain-vs-YaRN pair is a different claim -- the rope correction
+    // itself -- kept because a file whose frequencies changed but whose scores
+    // did not would mean the loader dropped half the scaling.
+    if (!plain_lg.empty() && !yarn_lg.empty()) {
+        f32 md = 0.0f;
+        for (size_t i = 0; i < std::min(plain_lg.size(), yarn_lg.size()); i++)
+            md = std::max(md, std::fabs(plain_lg[i] - yarn_lg[i]));
+        std::fprintf(stderr, "[b7] plain vs yarn: maxdiff=%g\n",
+                     static_cast<double>(md));
+        CHECK(md > 1e-5f, "and an unscaled file differs from a YaRN one");
     }
 }
 
@@ -23032,13 +24210,18 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_fused_projection_pair)
     TEST_GROUP(test_attention_gate_families)
     TEST_GROUP(test_norm_schema_shapes)
+    TEST_GROUP(test_gemma_27b_scale)
     TEST_GROUP(test_family_scales)
     TEST_GROUP(test_bitnet_family)
+    TEST_GROUP(test_ternary_llama_arch)
     TEST_GROUP(test_i2_s_layout)
     TEST_GROUP(test_i2_s_model)
     TEST_GROUP(test_i2_s_ms_dialect_refused)
     TEST_GROUP(test_i2_s_embedding)
     TEST_GROUP(test_refused_formats)
+    TEST_GROUP(test_q2_0_dialect)
+    TEST_GROUP(test_windowed_rope_scale)
+    TEST_GROUP(test_relu_sqr_row_scale)
     TEST_GROUP(test_q8_activation_domain)
     TEST_GROUP(test_trit_sign_extreme)
     TEST_GROUP(test_q2code_dot)
@@ -23089,10 +24272,13 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_qwen4exp_ple)
     TEST_GROUP(test_mla_absorb)
     TEST_GROUP(test_mla_lite)
+    TEST_GROUP(test_minicpm3_scale_arithmetic)
     TEST_GROUP(test_minicpm3_scales)
     TEST_GROUP(test_mla_backend)
     TEST_GROUP(test_npu_backend)
     TEST_GROUP(test_mla_loader)
+    TEST_GROUP(test_deepseek_yarn_mscale)
+    TEST_GROUP(test_mla_yarn_file)
     TEST_GROUP(test_mla_shared)
     TEST_GROUP(test_dsv4_hash_route)
     TEST_GROUP(test_dsv4_whole_graph)

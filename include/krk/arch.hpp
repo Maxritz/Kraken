@@ -393,6 +393,22 @@ struct ArchSpec {
     // families that read that key (dflash, granite, ...) use the identical
     // "0 = default" convention.
     float attn_scale = 0.0f;
+    // The layer count at which the reference switches this family's attention
+    // scale from 1/sqrt(head_dim) to 1/sqrt(n_embd/n_head), or 0 for "never".
+    //
+    // gemma2 and gemma3 both do this for their 27B size and for nothing else,
+    // and the reference keys it on the layer count -- gemma2.cpp:14-27 switches
+    // on `n_layer()` (26 = 2B, 42 = 9B, 46 = 27B) and gemma3.cpp:24 does the
+    // same (62 = 27B) -- because the HF config's `query_pre_attn_scalar` (256
+    // for the small sizes, 144 for 27B) is NOT carried in the GGUF. The rule
+    // has to live somewhere, and matching the reference's own discriminator is
+    // better than inventing one: a filesystem- or size-based guess would apply
+    // the 27B scale to whatever happened to weigh the same.
+    //
+    // 1/sqrt(144) = 0.0833 against 1/sqrt(128) = 0.0884 for gemma2-27B, a 6%
+    // amplitude error on every score -- small enough to read as "a slightly
+    // different model" rather than as a bug.
+    int attn_scale_embd_per_head_layers = 0;
 
     // The multiplier applied to the token embedding before layer 0, for a
     // family whose reference scales the embedding row by a CONSTANT of its own
