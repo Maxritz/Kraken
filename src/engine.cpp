@@ -1534,6 +1534,21 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                 comp_score_.assign(static_cast<size_t>(max_blocks), 0.0f);
                 comp_sel_.assign(
                     static_cast<size_t>(mc.idx_top_k > 0 ? mc.idx_top_k : 1), 0);
+                // Reported, not hidden: the pooled stream is charged to the
+                // context, so a 128K V4-Flash context is 67 MiB a layer here and
+                // a budget has to see it before the first token.
+                i64 pooled_bytes = 0, n_comp = 0;
+                for (i32 i = 0; i < mc.n_layer; i++) {
+                    const size_t k = static_cast<size_t>(i);
+                    pooled_bytes += static_cast<i64>(
+                        (comp_pooled_[k].size() + idx_key_[k].size()) *
+                        sizeof(f32));
+                    if (comp_ratio_[k] != 0) n_comp++;
+                }
+                KRK_INFO("compressed attention: %lld layer(s) pooled, %.1f MiB of "
+                         "host pooled keys (n_ctx / ratio rows of kv_lora)",
+                         static_cast<long long>(n_comp),
+                         static_cast<f64>(pooled_bytes) / 1048576.0);
             }
         }
     }
