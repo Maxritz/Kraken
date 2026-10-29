@@ -76,13 +76,16 @@ table, refused with a reason. `—` = not in the table yet.
 | Command-A | `command-r` | — | llama's tensors + **LayerNorm** (no bias) + a logit scale; the main forward is RMSNorm-only |
 | LLaMA-4 | `llama4` | — | `build_llama` + no-rope layers, QK norm, shared-expert bank |
 | Nanbeige 4.2 | `nanbeige` | — | `build_llama` + `n_loops` layer looping |
+| OLMo 1/2 7B/1B | `olmo`, `olmo2` | ✓ | `olmo` is llama's block verbatim; `olmo2` adds branch post norms, NeoX rope, QK norm |
+| XVERSE | `xverse` | ✓ | llama's block verbatim |
+| Seed-OSS | `seed_oss` | ✓ | its FFN pre-norm is named `attn_post_norm` (loader fallback) |
+| SmolLM3 | `smollm3` | ✓ | NoPE: every 4th layer rotates nothing |
 | Hunyuan-MoE | `hunyuan-moe` | — | shared expert + QK norm |
 | Ernie 4.5 / 4.5-MoE | `ernie4_5`, `ernie4_5-moe` | — | shared-expert bank |
 | grok-2 | `grok` | — | attn/ffn out norms + layer-out norm |
 | Ling/Ring (Bailing-MoE2) | `bailingmoe2` | — | fused qkv + NextN tensors |
 | Ling-3.0 (+vision) | `bailingmoe3` | — | MLA + delta-net mixers |
 | dots.llm1 | `dots1` | — | QK norms + shared expert |
-| Seed-OSS | `seed_oss` | — | branch post norm |
 | Step-3.5-Flash | `step35` | — | attn gate + shared expert + NextN |
 | Qwen3-Next | `qwen3next` | — | SSM + attention hybrid |
 | Mistral 3 / Mistral 4 / ministral3 | `mistral3`, `mistral4` | — | llama + attention temperature (mistral3) |
@@ -100,14 +103,15 @@ Counts at `1c5ea12`: **100** arch strings upstream, **52** in this table
 ## Order to close the gap
 
 1. **Aliases onto graphs already implemented** — cheapest, and each one is a
-   test away: `seed_oss`, `smollm3`, `olmo`, `openelm`, `plamo`, `codeshell`,
-   `jais`, `orion`, `xverse`, `deci`, `granite`, `granitemoe`.
+   test away. Done this pass: `olmo`, `olmo2`, `xverse`, `seed_oss`, `smollm3`.
+   Left: `openelm` (fused qkv + QK norm), `plamo`, `codeshell` (GELU MLP),
+   `jais` (fused qkv, **no rope at all**), `orion`, `deci`, `granite`.
 2. **Families whose extra tensors are already bound** — `qwen2moe` and `lfm2`
    went in this pass; next are `hunyuan-moe`, `dots1`, `ernie4_5(-moe)`,
    `bailingmoe2`, `cohere2_moe`, `mimo2`, `grok`.
 3. **Families needing one new graph step** — `command-r` (LayerNorm in the main
    forward + logit scale), `mistral3` (attention temperature), `nanbeige`
-   (`n_loops`), `llama4` (no-rope layers), `smollm3`/`seedoss` (post norms).
+   (`n_loops`), `llama4` (per-layer no-rope), `refact`/`jais` (no rope), `starcoder2`/`codeshell` (GELU MLP).
 4. **Families needing a new block type** — `step35`, `qwen3next` (SSM hybrid),
    `bailingmoe3`, `glm5next`, `glm-dsa`, `openpangu`, `raon1`, `flint`.
 

@@ -509,6 +509,8 @@ struct ModelConfig {
     // detached router input, not the generic MoE block (gemma4). Mirrors
     // `ArchSpec::moe_two_branch`.
     bool moe_two_branch = false;
+    // Every Nth layer skips rotary (SmolLM3); 0 rotates every layer.
+    i32 no_rope_step = 0;
     // Phase of the pattern: is_swa(l) == ((l + swa_phase) % swa_period) != 0.
     // 0 is the historical (full layer first) reading; 1 flips the pair so the
     // *windowed* layer comes first (gpt-oss).

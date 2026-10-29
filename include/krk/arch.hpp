@@ -343,6 +343,12 @@ struct ArchSpec {
     // result straight back, so a routed file of this family through it is a
     // fluent wrong model rather than a failure.
     bool moe_two_branch = false;
+    // Every `no_rope_layer_step`-th layer skips rotary entirely (SmolLM3's NoPE
+    // layers: `(l + 1) % 4 != 0` in the reference). 0 = every layer rotates.
+    // A skipped layer still attends normally -- it simply carries no explicit
+    // position signal, which is the point of the pattern, so running rope there
+    // anyway would be a wrong answer that decodes fluently.
+    int no_rope_layer_step = 0;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

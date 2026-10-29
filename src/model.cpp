@@ -355,6 +355,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // muse-glimmer states its own 1e-8 for these two norms.
     cfg_.post_branch_norm = aspec.post_branch_norm;
     cfg_.moe_two_branch = aspec.moe_two_branch;
+    cfg_.no_rope_step = aspec.no_rope_layer_step;
     // Stored as given; 0 means "the model's rms_eps", resolved by the engine at
     // the call -- the gemma eps override is applied further down, AFTER this
     // point, so resolving it here would capture the pre-override value.
@@ -1981,8 +1982,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // Qwen3.5 renamed the post-attention norm; when the classic key is
         // absent this is the same role (norm before the FFN), so accept either
         // rather than rejecting a checkpoint that spells it differently.
+        // Seed-OSS spells it a third way (`attn_post_norm`, which reads like the
+        // gemma BRANCH norm above but is the FFN's input norm -- its graph is
+        // `ffn(norm(x + attn_out))`, with the attention branch itself
+        // unnormalized). The two spellings cannot both be present on one file,
+        // and a family that carries the gemma branch norm declares it above.
         if (!L.ffn_norm)
             L.ffn_norm = upload_f32(blk_key("blk.%d.post_attention_norm.weight", l));
+        if (!L.ffn_norm && !cfg_.post_branch_norm)
+            L.ffn_norm = upload_f32(blk_key("blk.%d.attn_post_norm.weight", l));
         // nemotron_h / nemotron_h_moe have no second norm at all: the converter
         // applies attn_norm before BOTH sub-blocks (the file carries one norm
         // per layer and the graph reads it twice), so the FFN consumes
