@@ -163,6 +163,30 @@ struct LayerWeights {
     QuantTensor hc_attn_down, hc_attn_up, hc_attn_inject;
     f32 *hc_ffn_norm = nullptr;
     QuantTensor hc_ffn_down, hc_ffn_up, hc_ffn_inject;
+    // ---- DeepSeek-V4.1's hyper-connections: the SINKHORN mixer -------------
+    // A DIFFERENT mixer from the qwen4exp triple above, and a file carries one
+    // or the other -- never both, which the loader enforces. `hc_*_fn` is the
+    // full-rank [hc*n_embd -> (2+hc)*hc] projection that emits all three
+    // pieces at once, `hc_*_base` its [mix_dim] bias and `hc_*_scale` the [3]
+    // per-piece gains. See hc_sinkhorn_* in krk/hc.hpp for the algebra and
+    // hc_sinkhorn_split() for the layout trap (the file's comb block is
+    // dst-fastest, the host code keeps dst-major rows).
+    QuantTensor hc_attn_fn, hc_ffn_fn;
+    f32 *hc_attn_base = nullptr;   // f32 [mix_dim]
+    f32 *hc_ffn_base = nullptr;
+    f32 *hc_attn_scale = nullptr;  // f32 [3]
+    f32 *hc_ffn_scale = nullptr;
+    // ---- Engram (V4.1): conditional memory ---------------------------------
+    // `engram_kv` maps the gathered n-gram rows to (hc + 1) blocks of n_embd
+    // -- the first `hc` are the per-lane keys, the last is the value that gets
+    // added. `engram_gate` is [n_embd, hc]. Both only on the layers
+    // `ple.layers` names.
+    QuantTensor engram_kv;
+    // The gate is applied ELEMENTWISE to a product of two norms, so it has to
+    // be f32: the reference casts a quantized gate to F32 for that reason
+    // ("quantized copy has no binary-op kernel", deepseek41.cpp). Loaded as a
+    // dequantized weight rather than kept in its file type.
+    f32 *engram_gate = nullptr;
     bool ple = false;
     QuantTensor ple_key, ple_value, ple_conv1d;
     f32 *ple_norm_key = nullptr;
@@ -697,6 +721,23 @@ struct ModelConfig {
     bool hc = false;
     i32 hc_n = 0;
     i32 hc_low_rank = 0;
+    // ---- V4.1's variant of the same idea ---------------------------------
+    // `hc_sinkhorn` says the mixer is the (2+hc)*hc one above rather than
+    // qwen4exp's low-rank bottleneck. `single_pass` is V4.1's lag: a sub-block
+    // collapses with the pre-mix computed ONE SUB-LAYER EARLIER. With it off,
+    // each sub-block computes and uses its own pre-mix (which is what an
+    // ablation export looks like). `no_hc_head` says the file has no head
+    // mixer at all -- V4.1 collapses the final lane stack with the LAST FFN's
+    // pre-mix, and the presence or absence of hc_head_fn is what says which.
+    bool hc_sinkhorn = false;
+    bool hc_single_pass = false;
+    bool hc_no_head = false;
+    i32 hc_sinkhorn_iters = 0;
+    f32 hc_eps = 0.0f;
+    // Engram's token map: `engram.token_map[token]` is the id the hash uses,
+    // and a token outside it is DEAD (see krk/engram.hpp).
+    std::vector<u32> engram_token_map;
+    i64 engram_pad_id = 0;
     bool ple = false;
     i32 ple_ngram = 0;
     i32 ple_heads_per_ngram = 0;
@@ -707,6 +748,16 @@ struct ModelConfig {
     std::vector<i64> ple_head_offsets;  // [n_heads]
     std::vector<i64> ple_head_vocab_sizes;
     std::vector<i32> ple_layers;        // layer indices carrying a PLE module
+
+    // Is layer `l` one of the layers `ple.layers` names? Used by the loader for
+    // both families' per-layer modules, because the LIST is the authority -- a
+    // layer carrying the tensors but absent from the list is a malformed file,
+    // not a layer to run (see the check in Model::load).
+    bool dsv4_engram_layer(i32 l) const {
+        for (i32 v : ple_layers)
+            if (v == l) return true;
+        return false;
+    }
     bool qsa = false;
     // ---- MLA (DeepSeek-V2/V3/V4) --------------------------------------
     // The latent geometry, read off the file's own attention metadata. The
@@ -1307,7 +1358,14 @@ public:
     const f32 *hc_head_norm() const { return hc_head_norm_; }
     // qwen4exp's PLE table is a pointer into the mapping, not an upload: the
     // accessors exist so a test can assert the loader found it and sized one row.
+    const QuantTensor &hc_head_fn() const { return hc_head_fn_; }
+    const f32 *hc_head_base() const { return hc_head_base_; }
+    const f32 *hc_head_scale() const { return hc_head_scale_; }
     const u8 *ple_table() const { return ple_table_; }
+    // Row count of the shared per-layer table. The gather needs it to refuse an
+    // id past the end (krk/engram.cpp's gather zeroes such a row), and it is
+    // the file's own ne[1], not derived from the head ranges.
+    u64 ple_table_rows() const { return ple_table_rows_; }
     // The file's own type for one row of the table: the gather dequantizes one
     // row at a time out of the mapping, so the stride and the type travel
     // together.
@@ -1590,8 +1648,15 @@ private:
     // must never be uploaded. `ple_row_bytes` is one row's stride.
     f32 *hc_head_norm_ = nullptr;
     QuantTensor hc_head_down_, hc_head_up_;
+    // V4.1's head mixer: hc_head_fn {hc*n_embd -> hc}, base [hc], scale [1].
+    // Absent on a single-pass file, where the last FFN's pre-mix collapses the
+    // stack instead -- that absence is what hc_no_head records.
+    QuantTensor hc_head_fn_;
+    f32 *hc_head_base_ = nullptr;
+    f32 *hc_head_scale_ = nullptr;
     const u8 *ple_table_ = nullptr;
     u64 ple_row_bytes_ = 0;
+    u64 ple_table_rows_ = 0;
     DType ple_table_type_ = DType::F32;
     std::vector<f32> inv_freq_;
     std::vector<f32> inv_freq_swa_;

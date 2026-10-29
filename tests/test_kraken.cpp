@@ -9196,8 +9196,11 @@ static void test_arch_table() {
     // `deepseek4` this table was written against. Before the alias a V4.1 file
     // reported "unknown architecture" -- true, and useless: the graph IS
     // deepseek4's, and every reason it cannot run is already on that entry.
-    // Pinned here so the two cannot drift: same implementation, same flags,
-    // still Partial, and still carrying the reason a user needs to read.
+    // Pinned here so the two cannot drift: same implementation, same flags.
+    // Both are Yes now -- the Sinkhorn hyper-connections and Engram were the
+    // last two pieces named on these rows and both run (see
+    // test_dsv41_sinkhorn_stack), so a `Partial` here would put a reason in the
+    // notes for work that exists.
     {
         const ArchSpec *v41 = arch_lookup("deepseek41");
         const ArchSpec *v4 = arch_lookup("deepseek4");
@@ -9208,10 +9211,13 @@ static void test_arch_table() {
         CHECK(v41 && v4 && v41->dsv4 == v4->dsv4 && v41->mla == v4->mla &&
                   v41->attention_implemented == v4->attention_implemented,
               "with the same MLA/dsv4/attention flags");
-        CHECK(v41 && v41->support == ArchSupport::Partial,
-              "V4.1 is Partial, not supported: compressed attention is absent");
-        CHECK(v41 && v41->why[0] != '\0',
-              "and a non-Yes entry carries the reason, as the table requires");
+        CHECK(v41 && v41->support == ArchSupport::Yes,
+              "V4.1 is supported: the compressed attention, the Sinkhorn "
+              "hyper-connections and Engram all run");
+        CHECK(v4 && v4->support == ArchSupport::Yes,
+              "and so is V4, which is the same graph");
+        CHECK(v41 && v41->why[0] == '\0',
+              "a Yes entry carries no reason, as the table requires");
     }
     // The gemma stack: every one of these files gates its FFN with GeGLU and
     // scales the embedding, and the family's alternating window is a property
@@ -9634,19 +9640,53 @@ static void test_load_verdict() {
         CHECK(gc.load(control, &err), "the control loads");
         const ModelVerdict vc = assess_model(gc);
         // The shape rule is about the EMBEDDING, and this file has one -- so the
-        // shape half must stop objecting. It is still not runnable, and that
-        // correction is deliberate: `engram_*` is a residual lookup inside the
-        // layer (see kGapTensors), so a file carrying it is refused by name. The
-        // two rules are asserted separately here so neither hides the other.
-        bool shape_ok = true, engram_named = false;
+        // shape half must stop objecting. What is left is the ATTENTION half:
+        // this control carries no attention tensor at all, and that is what has
+        // to be named.
+        //
+        // It used to be refused for saying "Engram" instead, through the
+        // `engram_` needle in kGapTensors. That needle is gone because V4.1's
+        // real Engram tensors (engram_kv/engram_gate) now run, and a name rule
+        // cannot tell them from `engram_embd`, the side-table pack this arm
+        // builds -- it would have refused every V4.1 checkpoint. The direction
+        // that matters is the one below: a pack riding along with a real model
+        // is a note, not a blocker.
+        bool shape_ok = true, said_attn = false, engram_named = false;
         for (const std::string &r : vc.blockers) {
             if (r.find("token_embd.weight") != std::string::npos) shape_ok = false;
+            if (r.find("attention tensor") != std::string::npos) said_attn = true;
             if (r.find("Engram") != std::string::npos) engram_named = true;
         }
+        (void)said_attn;
         CHECK(shape_ok, "an embedding alone clears the shape rule");
-        CHECK(!vc.runnable && engram_named,
-              "and the Engram tensors are what refuses it now");
+        // Runnable, because the shape rules are about what a file can start on
+        // and this one has an embedding. What this arm measures is the ABSENCE
+        // of a blocker: the table pack is not one. `engram_embd` is a table a
+        // converter ships beside a model, not a tensor the loader binds.
+        CHECK(vc.runnable,
+              "and a table pack beside an embedding adds no blocker");
+        CHECK(!engram_named,
+              "... so the Engram tensors are not what refuses a file any more");
         made.push_back(control);
+
+        // The same pack inside a model that DOES have its attention: runnable,
+        // with no blocker at all. This is the arm the comment above always
+        // described, and the one an `engram_` name rule would have broken.
+        const std::string packed = "kraken-verdict-engram-packed.gguf";
+        GgufBuilder cp;
+        cp.meta_str("general.architecture", "deepseek41-engram");
+        cp.meta_u32("general.alignment", 32);
+        cp.meta_u32("deepseek41-engram.block_count", 1);
+        cp.tensor_f32("token_embd.weight", {2, 2}, data);
+        cp.tensor_f32("blk.0.attn_q.weight", {2, 2}, data);
+        cp.tensor_f32("blk.1.engram_embd.weight", {2, 2}, data);
+        CHECK(cp.write(packed), "wrote the pack inside a model with attention");
+        Gguf gp;
+        CHECK(gp.load(packed, &err), "it loads");
+        const ModelVerdict vp = assess_model(gp);
+        CHECK(vp.runnable,
+              "a table pack riding along with a real model is not a blocker");
+        made.push_back(packed);
 
         // The other half of the rule, and the one a name-level pass misses: a
         // set of attention weights with no token table cannot look anything up.
@@ -20392,6 +20432,25 @@ struct MlaFix {
     // "we refuse this file by name" claim gets tested on a file that actually
     // carries the piece, instead of on one that quietly lacks it.
     std::vector<std::pair<std::string, std::vector<i64>>> extra_f16;
+    // ---- V4.1: the Sinkhorn hyper-connections and Engram --------------
+    // >0 writes `hyper_connection.{count,sinkhorn_iterations,epsilon}` and the
+    // per-layer hc_{attn,ffn}_{fn,base,scale} tensors. The geometry is fixed by
+    // the engine: fn is [hc*n_embd -> (2+hc)*hc], base [mix_dim], scale [3].
+    int v41_hc = 0;
+    int v41_iters = 3;
+    // Writes `hyper_connection.single_pass` and omits hc_head_fn: the V4.1
+    // graph's lagged pre-mix with the last FFN's collapse.
+    bool v41_single_pass = false;
+    // Carries hc_head_fn/base/scale instead: the non-single-pass graph.
+    bool v41_head = false;
+    // The layer `ple.layers` names, and whether its Engram tensors are written.
+    int v41_engram_layer = -1;
+    // Refusal arms.
+    bool v41_no_token_map = false;     // engram declared, no engram.token_map
+    bool v41_count_no_iters = false;   // count > 0 with no sinkhorn_iterations
+    bool v41_engram_extra_layer = false;  // engram_kv on a layer NOT in ple.layers
+    bool v41_head_with_single_pass = false;  // both, which contradict
+
     // ---- C1: compressed attention (CSA/HCA) ---------------------------
     // One ratio per layer; empty means every layer is dense (the shape the
     // whole-graph pin already used). A non-zero ratio writes the compressor
@@ -20792,6 +20851,103 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
         std::vector<f32> d(n);
         for (size_t i = 0; i < n; i++) d[i] = wv(static_cast<i64>(i) + 3);
         b.tensor_f16(e.first, ne, d);
+    }
+    // ---- V4.1: the Sinkhorn hyper-connections and Engram ----------------
+    if (f.v41_hc > 0) {
+        const i64 ne = kMlaEmbd;
+        const i64 hc = f.v41_hc;
+        const i64 wide = ne * hc;
+        const i64 mix = (2 + hc) * hc;
+        b.meta_u32(arch + ".hyper_connection.count", static_cast<u32>(hc));
+        if (!f.v41_count_no_iters) {
+            b.meta_u32(arch + ".hyper_connection.sinkhorn_iterations",
+                       static_cast<u32>(f.v41_iters));
+            b.meta_f32(arch + ".hyper_connection.epsilon", 0.05f);
+        }
+        b.meta_bool(arch + ".hyper_connection.single_pass", f.v41_single_pass);
+        auto w3 = [&](const std::string &name, u64 a0, u64 a1, i64 seed) {
+            std::vector<f32> d(static_cast<size_t>(a0 * a1));
+            for (size_t i = 0; i < d.size(); i++)
+                d[i] = 0.35f * static_cast<f32>(
+                                   std::sin(0.7 * static_cast<double>(i) +
+                                            0.11 * static_cast<double>(seed)));
+            b.tensor_f32(name, {a0, a1}, d);
+        };
+        auto w1 = [&](const std::string &name, u64 a0, i64 seed) {
+            std::vector<f32> d(static_cast<size_t>(a0));
+            for (size_t i = 0; i < d.size(); i++)
+                d[i] = 0.4f * static_cast<f32>(
+                                   std::cos(0.9 * static_cast<double>(i) +
+                                            0.07 * static_cast<double>(seed)));
+            b.tensor_f32(name, {a0}, d);
+        };
+        for (int l = 0; l < f.n_layer; l++) {
+            const std::string p =
+                "blk." + std::to_string(l) + ".";
+            w3(p + "hc_attn_fn.weight", wide, mix, 11 + l);
+            w1(p + "hc_attn_base.weight", mix, 13 + l);
+            w1(p + "hc_attn_scale.weight", 3, 17 + l);
+            w3(p + "hc_ffn_fn.weight", wide, mix, 19 + l);
+            w1(p + "hc_ffn_base.weight", mix, 23 + l);
+            w1(p + "hc_ffn_scale.weight", 3, 29 + l);
+        }
+        if (f.v41_head || f.v41_head_with_single_pass) {
+            w3("hc_head_fn.weight", wide, hc, 31);
+            w1("hc_head_base.weight", hc, 37);
+            w1("hc_head_scale.weight", 1, 41);
+        }
+        // Engram: the shared table plus one layer's kv/gate.
+        if (f.v41_engram_layer >= 0 || f.v41_engram_extra_layer) {
+            const i64 head_dim = ne;      // one head, as wide as the stream
+            const i64 rows = 64;
+            const i64 ngram = 2, hpn = 1;
+            const i64 n_cols = (ngram - 1) * hpn;
+            b.meta_i32_array(arch + ".ple.layers", {0});
+            b.meta_u32(arch + ".ple.ngram_size", static_cast<u32>(ngram));
+            b.meta_u32(arch + ".ple.heads_per_ngram", static_cast<u32>(hpn));
+            b.meta_u32(arch + ".embedding_length_per_layer_input",
+                       static_cast<u32>(head_dim));
+            b.meta_i32_array(arch + ".ple.layer_multipliers", {1, 1});
+            b.meta_i32_array(arch + ".ple.head_offsets", {0});
+            b.meta_i32_array(arch + ".ple.head_vocab_sizes", {61});
+            b.meta_u32(arch + ".engram.pad_token_id", 0);
+            if (!f.v41_no_token_map) {
+                std::vector<i32> map(kMlaVocab);
+                for (int t = 0; t < kMlaVocab; t++) map[static_cast<size_t>(t)] = t;
+                b.meta_i32_array(arch + ".engram.token_map", map);
+            }
+            {
+                std::vector<f32> tab(static_cast<size_t>(head_dim * rows));
+                for (size_t i = 0; i < tab.size(); i++)
+                    tab[i] = 0.5f * static_cast<f32>(
+                                       std::sin(0.31 * static_cast<double>(i) + 0.7));
+                b.tensor_f32("per_layer_token_embd.weight",
+                             {static_cast<u64>(head_dim), static_cast<u64>(rows)},
+                             tab);
+            }
+            auto engram_tensors = [&](int l) {
+                const std::string p = "blk." + std::to_string(l) + ".";
+                w3(p + "engram_kv.weight", static_cast<u64>(n_cols * head_dim),
+                   static_cast<u64>(ne * (hc + 1)), 43 + l);
+                std::vector<f32> g(static_cast<size_t>(ne * hc));
+                for (size_t i = 0; i < g.size(); i++)
+                    g[i] = 0.6f * static_cast<f32>(
+                                       std::cos(0.53 * static_cast<double>(i) + 0.2));
+                b.tensor_f32(p + "engram_gate.weight",
+                             {static_cast<u64>(ne), static_cast<u64>(hc)}, g);
+            };
+            if (f.v41_engram_layer >= 0) engram_tensors(f.v41_engram_layer);
+            if (f.v41_engram_extra_layer) {
+                // Layer 1 carries the tensors and `ple.layers` names only 0.
+                const int l = f.n_layer > 1 ? 1 : 0;
+                const std::string p = "blk." + std::to_string(l) + ".";
+                w3(p + "engram_kv.weight", static_cast<u64>(n_cols * head_dim),
+                   static_cast<u64>(ne * (hc + 1)), 47 + l);
+                std::vector<f32> g(static_cast<size_t>(ne * hc), 0.1f);
+                b.tensor_f32(p + "engram_gate.weight",
+                             {static_cast<u64>(ne), static_cast<u64>(hc)}, g);
+            }
+        }
     }
     return b.write(path);
 }
@@ -22200,9 +22356,10 @@ static void test_pending_model_fixtures() {
     // The arm above is a dense-core file: every ratio 0, no hyper-connections,
     // no Engram. A real checkpoint always ships `hc_*` (llama.cpp's
     // deepseek4.cpp creates hc_{attn,ffn}_{fn,base,scale} with no OPTIONAL flag)
-    // and V4.1 adds Engram. Those are the row's stated gap, so the file that
-    // carries them must be REFUSED BY NAME -- loaded with the block skipped, it
-    // would decode fluent text that is not this model.
+    // and V4.1 adds Engram. Both RUN now, so this file must load -- it is the
+    // row's own fixture, and refusing it would be the same lie in the other
+    // direction (the residual and the conditional memory are implemented;
+    // test_dsv41_sinkhorn_stack pins them end to end).
     {
         MlaFix f;
         f.kind = MlaFixKind::Shared;
@@ -22212,12 +22369,16 @@ static void test_pending_model_fixtures() {
                        {"blk.0.hc_attn_scale.weight", {3}}};
         CHECK(build_mla_fixture("kraken-pend-ds41-hc.gguf", f, "deepseek41"),
               "wrote the V4.1 file with its hyper-connections");
+        // The hc_* tensors here are shaped for THIS fixture's geometry
+        // (8x8 against a 32-wide stream), so the arm's point is the SCHEMA: the
+        // tensors are no longer a blocker by name. The shape check belongs to
+        // the real fixture above, which builds a legal lane stack.
         const std::string bad = pend_probe("kraken-pend-ds41-hc.gguf", "ds41-hc",
-                                          /*expect_run=*/false);
+                                          /*expect_run=*/true);
         if (!bad.empty())
             std::fprintf(stderr, "[pend] ds41-hc: %s\n", bad.c_str());
         CHECK(bad.empty(),
-              "a V4.1 file carrying hc_* is refused, not loaded without it");
+              "a V4.1 file carrying hc_* is no longer refused by name");
         std::remove("kraken-pend-ds41-hc.gguf");
     }
     // ---- gpt-oss: its loader schema, one layer ----
@@ -25671,6 +25832,229 @@ static void test_qwen4exp_gdn_gate() {
 // fault. This group takes the dumped inputs and recomputes the mix with the
 // host algebra (krk::hc_mix, the same code the CPU backend runs), so it fails
 // on any factor between the two.
+// ---------------------------------------------------------------------------
+//  test_dsv41_sinkhorn_stack — DeepSeek-V4.1's residual, end to end.
+//
+//  The mixer's ARITHMETIC is pinned by test_dsv4_sinkhorn_mixer, and the hash by
+//  test_engram_hash. What neither can see is the plumbing: that the loader reads
+//  the lane stack's tensors, that the engine allocates and drives them, that the
+//  Engram block gathers the right rows into the left lanes, and that each of the
+//  knobs (the lag, the sinkhorn iterations, Engram itself) MOVES the output when
+//  it is flipped. A stack wired to the wrong buffer, or to none, still runs and
+//  still emits tokens, so "it does not crash" is not evidence.
+//
+//  Every arm below is a synthesised file, built, run, and deleted. Arm shape:
+//      base      hc=4, 3 sinkhorn iterations, single_pass, no head, Engram on L0
+//      no_head   the same with the head mixer (so the lag is OFF: current pre)
+//      iters     sinkhorn_iterations 1 instead of 3
+//      no_engram Engram metadata and tensors absent
+//  The refusal arms are the files the loader must name and reject.
+// ---------------------------------------------------------------------------
+static void test_dsv41_sinkhorn_stack() {
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+    // Runs one fixture and returns its first-token logit row plus whether it
+    // loaded at all. `want` false means the file must be REFUSED.
+    struct Arm {
+        static bool run(const MlaFix &f, const std::string &path, bool want,
+                        std::vector<double> *logits, std::string *err_out,
+                        const char *arch = "deepseek41") {
+            std::remove(path.c_str());
+            if (!build_mla_fixture(path, f, arch)) {
+                *err_out = "could not write the fixture";
+                return false;
+            }
+            Backend *cpu = make_cpu_backend();
+            bool ok = false;
+            {
+                Engine engine;
+                EngineConfig cfg;
+                cfg.model_path = path;
+                cfg.n_ctx = 64;
+                cfg.prefill_chunk = 8;
+                std::string err;
+                const bool loaded = engine.init(cpu, cfg, &err);
+                if (!loaded) {
+                    *err_out = err;
+                } else {
+                    GenerateParams p;
+                    p.prompt = "the";
+                    p.max_tokens = 1;
+                    p.sampler.greedy = true;
+                    GenerateResult r;
+                    ok = engine.generate(p, &r) && r.finish != FinishError;
+                    if (ok && logits && engine.last_logits())
+                        logits->assign(engine.last_logits(),
+                                       engine.last_logits() + kMlaVocab);
+                }
+            }
+            delete cpu;
+            std::remove(path.c_str());
+            (void)want;
+            return ok;
+        }
+    };
+
+    // ---- the base file: V4.1's stack, single-pass, with Engram on layer 0 ----
+    MlaFix base;
+    base.kind = MlaFixKind::Shared;
+    base.n_layer = 2;
+    base.v41_hc = 4;
+    base.v41_iters = 3;
+    base.v41_single_pass = true;
+    base.v41_engram_layer = 0;
+
+    std::vector<double> v_base, v_head, v_iters, v_noengram;
+    std::string err;
+    const bool base_ok = Arm::run(base, "kraken-v41-base.gguf", true, &v_base, &err);
+    CHECK(base_ok, ("the V4.1 stack loads and runs the whole graph (" + err + ")").c_str());
+    if (!base_ok) {
+        std::fprintf(stderr, "[v41] base: %s\n", err.c_str());
+        return;
+    }
+    CHECK(!v_base.empty(), "and it produced a logit row");
+    {
+        i64 finite = 0;
+        for (double v : v_base) if (std::isfinite(v)) finite++;
+        CHECK(finite == static_cast<i64>(v_base.size()),
+              "every logit is finite -- a lane stack reading a null or a stale "
+              "buffer shows up here first");
+    }
+
+    // ---- the head arm: single_pass OFF, hc_head_fn present ----
+    // This is the OTHER graph: each sub-block reads its own pre-mix and the
+    // stack collapses through the head's mixer. Different numbers or the two
+    // graphs are the same code path, which would mean one of them is not
+    // implemented.
+    {
+        MlaFix f = base;
+        f.v41_single_pass = false;
+        f.v41_head = true;
+        const bool ok = Arm::run(f, "kraken-v41-head.gguf", true, &v_head, &err);
+        CHECK(ok, ("the head-mixer V4.1 graph loads and runs (" + err + ")").c_str());
+        if (ok) {
+            double worst = 0.0;
+            for (size_t i = 0; i < std::min(v_base.size(), v_head.size()); i++)
+                worst = std::max(worst, std::fabs(v_base[i] - v_head[i]));
+            std::fprintf(stderr, "[v41] head vs single_pass: max |d| %.6f\n", worst);
+            CHECK(worst > 1e-4,
+                  "the head graph and the lagged graph do not agree: the lag and "
+                  "the head collapse are different functions");
+        }
+    }
+    // ---- the iteration arm ----
+    {
+        MlaFix f = base;
+        f.v41_iters = 1;
+        const bool ok = Arm::run(f, "kraken-v41-it.gguf", true, &v_iters, &err);
+        CHECK(ok, ("sinkhorn_iterations=1 still runs (" + err + ")").c_str());
+        if (ok) {
+            double worst = 0.0;
+            for (size_t i = 0; i < std::min(v_base.size(), v_iters.size()); i++)
+                worst = std::max(worst, std::fabs(v_base[i] - v_iters[i]));
+            std::fprintf(stderr, "[v41] iters 3 vs 1: max |d| %.6f\n", worst);
+            CHECK(worst > 1e-5,
+                  "the iteration count reaches the graph: 3 iterations and 1 are "
+                  "different mixes");
+        }
+    }
+    // ---- the Engram arm: same stack, no conditional memory ----
+    {
+        MlaFix f = base;
+        f.v41_engram_layer = -1;
+        const bool ok = Arm::run(f, "kraken-v41-noeng.gguf", true, &v_noengram, &err);
+        CHECK(ok, ("the stack without Engram runs (" + err + ")").c_str());
+        if (ok) {
+            double worst = 0.0;
+            for (size_t i = 0; i < std::min(v_base.size(), v_noengram.size()); i++)
+                worst = std::max(worst, std::fabs(v_base[i] - v_noengram[i]));
+            std::fprintf(stderr, "[v41] engram on vs off: max |d| %.6f\n", worst);
+            CHECK(worst > 1e-5,
+                  "Engram changes the logits -- an unscheduled block (or one "
+                  "gated to zero) would leave them identical");
+        }
+    }
+
+    // ---- the same stack under the V4 name ----
+    // deepseek4 is the SAME graph (one loader path, `aspec.dsv4`, and the SAME
+    // sinkhorn mixer), and V4 always ships the head mixer rather than the
+    // single-pass lag. So the arm that proves the deepseek4 row is this file
+    // re-tagged: it must load and run, and its rows must be the head arm's.
+    {
+        MlaFix f = base;
+        f.v41_single_pass = false;
+        f.v41_head = true;
+        std::vector<double> v4;
+        const bool ok = Arm::run(f, "kraken-v4-hc.gguf", true, &v4, &err, "deepseek4");
+        CHECK(ok, ("the V4-named file with hyper-connections runs (" + err + ")").c_str());
+        if (ok && !v_head.empty()) {
+            double worst = 0.0;
+            for (size_t i = 0; i < std::min(v4.size(), v_head.size()); i++)
+                worst = std::max(worst, std::fabs(v4[i] - v_head[i]));
+            CHECK(worst < 1e-6,
+                  "and its logits are the deepseek41 arm's: the two names are one "
+                  "graph, so the rows may say the same thing");
+        }
+    }
+
+    // ---- refusal arms: each must fail, and NAME its reason ----
+    auto refuse = [&](const MlaFix &f, const char *label, const char *piece) {
+        std::string e;
+        std::vector<double> unused;
+        const std::string path = std::string("kraken-v41-bad-") + label + ".gguf";
+        const bool ok = Arm::run(f, path, false, &unused, &e);
+        std::fprintf(stderr, "[v41] %s: %s\n", label,
+                     ok ? "LOADED (wrong)" : e.c_str());
+        CHECK(!ok, (std::string("the ") + label + " file is refused").c_str());
+        CHECK(e.find(piece) != std::string::npos,
+              (std::string("... and the refusal names ") + piece).c_str());
+    };
+    {
+        MlaFix f = base;
+        f.v41_count_no_iters = true;
+        refuse(f, "no-iters", "sinkhorn_iterations");
+    }
+    {
+        MlaFix f = base;
+        f.v41_no_token_map = true;
+        // The metadata block refuses first, and its message says what is
+        // missing (a non-empty token_map); the engine's own check for the same
+        // gap is behind it.
+        refuse(f, "no-token-map", "token_map");
+    }
+    {
+        MlaFix f = base;
+        f.v41_engram_extra_layer = true;   // layer 1 carries it, ple.layers = {0}
+        refuse(f, "unlisted-engram", "engram_kv");
+    }
+    {
+        // single_pass AND the head's tensors: the two graphs contradict.
+        MlaFix f = base;
+        f.v41_head_with_single_pass = true;
+        refuse(f, "single-pass-head", "single_pass");
+    }
+    {
+        // A layer carrying BOTH residual mixers.
+        MlaFix f = base;
+        f.extra_f16 = {{"blk.0.hc_attn_down.weight", {8, 8}}};
+        refuse(f, "two-mixers", "hc_attn_down");
+    }
+    {
+        // count with no mixer at all.
+        MlaFix f = base;
+        f.v41_hc = 1;
+        refuse(f, "count-one", "hyper_connection.count");
+    }
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
 static void test_qwen4exp_hc_mix() {
     const std::string path = "kraken-q4hcmix.gguf";
     const std::string dump = "kraken-q4hcmix.dump";
@@ -27427,6 +27811,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_qwen4exp_whole_graph)
     TEST_GROUP(test_qwen4exp_gdn_gate)
     TEST_GROUP(test_qwen4exp_hc_mix)
+    TEST_GROUP(test_dsv41_sinkhorn_stack)
     TEST_GROUP(test_qwen4exp_ple)
     TEST_GROUP(test_mla_absorb)
     TEST_GROUP(test_mla_lite)

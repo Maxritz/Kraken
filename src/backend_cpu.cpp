@@ -2119,6 +2119,49 @@ public:
     // pins hc.cpp's arithmetic, and a second copy here would be a second thing
     // to keep in step.
     bool hc_supported() const override { return true; }
+    // V4.1's Sinkhorn mixer: the host functions in src/hc.cpp ARE the
+    // reference, so the CPU backend is a thin passthrough. f32 activations
+    // only -- a backend whose lanes are f16 has to convert, and the pointer
+    // checks here say so rather than reinterpreting f16 bytes as f32 (the
+    // exact bug hc_combine's comment records).
+    bool hc_sinkhorn_supported() const override { return true; }
+    void hc_sk_split(void *pre, void *post, void *comb, const void *mixes,
+                     const f32 *scale, const f32 *base, i64 n_tok, i64 hc,
+                     i64 iters, f32 eps) override {
+        HcSinkhornGeometry g;
+        g.n_embd = 1;   // the split does not need the embedding width
+        g.hc = static_cast<i32>(hc);
+        g.sinkhorn_iters = static_cast<i32>(iters);
+        g.eps = eps;
+        hc_sinkhorn_split(static_cast<f32 *>(pre), static_cast<f32 *>(post),
+                          static_cast<f32 *>(comb),
+                          static_cast<const f32 *>(mixes), scale, base,
+                          static_cast<i32>(n_tok), g);
+    }
+    void hc_sk_pre(void *out, const void *lanes, const void *pre, i64 n_tok,
+                   i64 hc, i64 ne) override {
+        HcSinkhornGeometry g;
+        g.n_embd = static_cast<i32>(ne);
+        g.hc = static_cast<i32>(hc);
+        g.sinkhorn_iters = 1;
+        g.eps = 1e-6f;
+        hc_sinkhorn_pre(static_cast<f32 *>(out), static_cast<const f32 *>(lanes),
+                        static_cast<const f32 *>(pre), static_cast<i32>(n_tok), g);
+    }
+    void hc_sk_post(void *lanes_out, const void *lanes_in, const void *block_out,
+                    const void *post, const void *comb, i64 n_tok, i64 hc,
+                    i64 ne) override {
+        HcSinkhornGeometry g;
+        g.n_embd = static_cast<i32>(ne);
+        g.hc = static_cast<i32>(hc);
+        g.sinkhorn_iters = 1;
+        g.eps = 1e-6f;
+        hc_sinkhorn_post(static_cast<f32 *>(lanes_out),
+                         static_cast<const f32 *>(lanes_in),
+                         static_cast<const f32 *>(block_out),
+                         static_cast<const f32 *>(post), static_cast<const f32 *>(comb),
+                         static_cast<i32>(n_tok), g);
+    }
 
     void hc_init(void *lanes, const void *x, i64 n_tok, i64 hc, i64 ne) override {
         npu_flush_();

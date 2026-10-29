@@ -184,6 +184,13 @@ void hc_sinkhorn_split(f32 *pre, f32 *post, f32 *comb, const f32 *mixes,
     }
 }
 
+void hc_head_pre(f32 *out, const f32 *mixes, const f32 *scale, const f32 *base,
+                 i32 hc, f32 eps) {
+    if (!out || !mixes || !scale || !base || hc <= 0) return;
+    for (i32 c = 0; c < hc; c++)
+        out[c] = sigmoid(mixes[c] * scale[0] + base[c]) + eps;
+}
+
 void hc_sinkhorn_post(f32 *lanes_out, const f32 *lanes_in, const f32 *block_out,
                       const f32 *post, const f32 *comb, i32 n,
                       const HcSinkhornGeometry &g) {

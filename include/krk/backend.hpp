@@ -1586,6 +1586,40 @@ public:
                             i64 n_tok, i64 hc, i64 ne) {
         (void)res; (void)block_out; (void)inject; (void)n_tok; (void)hc; (void)ne;
     }
+    // ---- DeepSeek-V4.1's Sinkhorn hyper-connections ----------------------
+    // A different mixer on the same lane stack, so it is a different pair of
+    // ops rather than a flag on the ones above: there is no bottleneck and no
+    // per-lane gamma, there is one projection that emits (2+hc)*hc numbers and
+    // a doubly-stochastic matrix that REPLACES every lane instead of adding to
+    // it. A backend that does not implement these says so through
+    // hc_sinkhorn_supported() rather than running the qwen4exp mixer, which
+    // would mix the lanes with the wrong function and still decode.
+    virtual bool hc_sinkhorn_supported() const { return false; }
+    // Splits one batch's `mixes` [n, mix_dim] into pre [n, hc], post [n, hc] and
+    // comb [n, hc, hc], applying `scale` [3] and `base` [mix_dim] exactly as the
+    // reference does (see hc_sinkhorn_split). The sinkhorn normalisation runs
+    // inside this call, so the whole mixer's arithmetic is one op.
+    virtual void hc_sk_split(void *pre, void *post, void *comb, const void *mixes,
+                             const f32 *scale, const f32 *base, i64 n_tok, i64 hc,
+                             i64 iters, f32 eps) {
+        (void)pre; (void)post; (void)comb; (void)mixes; (void)scale; (void)base;
+        (void)n_tok; (void)hc; (void)iters; (void)eps;
+    }
+    // out[t, e] = sum_c lanes[t, c, e] * pre[t, c]: the collapse a sub-block
+    // reads. Also the head's only step -- V4.1 has no head mixer.
+    virtual void hc_sk_pre(void *out, const void *lanes, const void *pre, i64 n_tok,
+                           i64 hc, i64 ne) {
+        (void)out; (void)lanes; (void)pre; (void)n_tok; (void)hc; (void)ne;
+    }
+    // lanes_out[t,d,e] = block_out[t,e]*post[t,d] + sum_s lanes_in[t,s,e]*comb[t,d,s].
+    // REPLACES the lanes; lanes_out may not alias lanes_in.
+    virtual void hc_sk_post(void *lanes_out, const void *lanes_in,
+                            const void *block_out, const void *post,
+                            const void *comb, i64 n_tok, i64 hc, i64 ne) {
+        (void)lanes_out; (void)lanes_in; (void)block_out; (void)post; (void)comb;
+        (void)n_tok; (void)hc; (void)ne;
+    }
+
     // x <- x * sigmoid(x), in place: the mixer's low-rank nonlinearity, and NOT
     // silu_mul() (which needs a second operand) nor sigmoid_act() (which drops
     // the x factor).
