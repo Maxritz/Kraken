@@ -66,6 +66,23 @@ struct LayerWeights {
     QuantTensor wup_fused;
     f32 *qkv_bias = nullptr;  // f32 [3*n_embd]
     QuantTensor wq, wk, wv, wo;
+    // ---- MoVA: the attention VALUES are a routed expert set (k2-horizon) ----
+    // This family has no `attn_v.weight`. V is built from the same mix of the
+    // block input that Q and K come from, but through a router of its own:
+    //
+    //   gate    = attn_v_gate @ x                    [n_value_expert]
+    //   probs   = softmax or sigmoid(gate)
+    //   sel     = top-k(probs + attn_v_gate_b)       (bias shifts SELECTION only)
+    //   V       = sum_k probs[sel_k] * silu(W_sel_k @ x)
+    //
+    // so a layer carrying this cannot take the wv path at all, and a file with
+    // both is malformed rather than one of them being redundant. `attn_v_exps`
+    // is resident -- n_value_expert is a handful, not the 128/256 of the FFN
+    // bank -- so it is a plain 3-D tensor, [n_embd, kvw, n_value_expert], not
+    // an ExpertSource.
+    QuantTensor attn_v_gate;      // [n_embd -> n_value_expert]
+    f32 *attn_v_gate_b = nullptr; // f32 [n_value_expert], optional, HOST
+    QuantTensor attn_v_exps;      // [n_embd -> kvw*n_value_expert]
     f32 *q_bias = nullptr; // optional [n_head*hd]
     f32 *k_bias = nullptr; // optional [n_kv*hd]
     f32 *v_bias = nullptr; // optional [n_kv*hd]
@@ -663,6 +680,20 @@ struct ModelConfig {
     // embedding table, `qsa_ratio` the per-layer block size of the QSA indexer
     // (0 on a layer without one), and `no_out_norm` says the final mixer
     // carries the norm -- there is no output_norm.weight in the file.
+    // ---- MoVA (k2-horizon): a routed set of attention values ---------------
+    // `n_value_expert` > 0 means every MoE layer builds V by routing to
+    // `n_value_expert_used` of them instead of projecting with attn_v.weight.
+    // Read from `<arch>.attention.value_expert_count` / `.value_expert_used_count`.
+    i32 n_value_expert = 0;
+    i32 n_value_expert_used = 0;
+    // ---- k2-horizon's GROUPED RMS norm -------------------------------------
+    // `<arch>.attention.group_norm_groups`: the norm divides the row into this
+    // many equal groups and takes the RMS over each GROUP, not over the whole
+    // row, then applies one elementwise weight across all of it. 1 (or 0, the
+    // absent key) is the ordinary norm and must keep the fast path.
+    i32 n_norm_groups = 1;
+    // Router gating for the value experts; shares the FFN's convention
+    // (`router_sigmoid`), because llama.cpp reads one `expert_gating_func`.
     bool hc = false;
     i32 hc_n = 0;
     i32 hc_low_rank = 0;

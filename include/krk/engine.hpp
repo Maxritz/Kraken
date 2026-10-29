@@ -1455,6 +1455,19 @@ private:
     // KRK_DEVICE_SOFTMAX=1, so "is the device path available" stays a runtime
     // question rather than a different allocation path with a null to forget.
     void *ws_routerp_ = nullptr;
+    // ---- MoVA (k2-horizon): the value router ------------------------------
+    // `ws_vgate_` is the router's logits [chunk, n_value_expert] and
+    // `ws_vexp_` one routed expert's output [chunk, kvw], accumulated into
+    // ws_v_ in selection order. Both null on every family without value
+    // experts, so nothing is allocated and no pointer is dereferenced.
+    void *ws_vgate_ = nullptr;
+    void *ws_vexp_ = nullptr;
+    // The router probabilities for one token, host-side, like router_host_.
+    std::vector<f32> vgate_host_;
+    // Builds V by routing (k2-horizon). Returns false only on a backend
+    // failure; a layer WITHOUT value experts must not call it.
+    bool mova_value(const LayerWeights &L, i32 l, const void *xn, i32 n,
+                    i64 kvw, bool sigmoid_gate);
     std::vector<f32> dev_probs_; // its host copy, for the drift comparison
     u64 ds_rows_ = 0;            // rows compared
     u64 ds_diff_ = 0;            // elements whose f32 bits differ

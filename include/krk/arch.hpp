@@ -186,6 +186,13 @@ struct ArchSpec {
     // value set, a softcap, a per-layer head geometry) keeps its own
     // mechanism: the arch table's `why` and the tensor gap map.
     bool attention_implemented = true;
+    // `attn_gate.weight` is REQUIRED when the family's graph has no way to run
+    // without it (laguna: the gate multiplies every attention output) and
+    // OPTIONAL when the reference marks the tensor NOT_REQUIRED (k2-horizon:
+    // an ablated export legitimately drops it, and llama.cpp runs that file
+    // ungated). One boolean, set per row from the reference's own flags --
+    // a name list here would be the same mistake the attn_gate gap entry made.
+    bool attn_gate_optional = false;
     // ---- per-branch post norms (gemma2/3/4, muse-glimmer) -----------------
     // The layer does not add the sub-block's raw output to the residual: it
     // RMS-norms it first, with that branch's own weight, and adds the NORMALIZED

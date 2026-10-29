@@ -598,6 +598,31 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // Qwen2-MoE / Qwen3-MoE (and the other `*moe` archs) describe routed
     // experts with these keys; a dense model simply has n_expert == 0.
     cfg_.n_expert = static_cast<i32>(gguf_.get_i64(key(".expert_count"), 0));
+    // MoVA (k2-horizon): a routed expert set for the attention VALUES. Absent
+    // on every other family, and 0 is what keeps their graph untouched.
+    cfg_.n_value_expert =
+        static_cast<i32>(gguf_.get_i64(key(".attention.value_expert_count"), 0));
+    cfg_.n_value_expert_used = static_cast<i32>(
+        gguf_.get_i64(key(".attention.value_expert_used_count"),
+                      cfg_.n_value_expert > 0 ? 1 : 0));
+    // k2-horizon's grouped norm. 0 (absent) and 1 are the ordinary rmsnorm and
+    // MUST keep the same arithmetic -- the group count only says how the row is
+    // divided, and one group is the whole row.
+    cfg_.n_norm_groups = static_cast<i32>(
+        gguf_.get_i64(key(".attention.group_norm_groups"),
+                      gguf_.get_i64(key(".attention.groupnorm_groups"), 1)));
+    if (cfg_.n_norm_groups <= 0) cfg_.n_norm_groups = 1;
+    if (cfg_.n_value_expert > 0) {
+        if (cfg_.n_value_expert_used <= 0 ||
+            cfg_.n_value_expert_used > cfg_.n_value_expert) {
+            if (err)
+                *err = "arch '" + a + "': attention.value_expert_used_count (" +
+                       std::to_string(cfg_.n_value_expert_used) +
+                       ") is not in 1..value_expert_count (" +
+                       std::to_string(cfg_.n_value_expert) + ")";
+            return false;
+        }
+    }
     cfg_.n_expert_used = static_cast<i32>(
         gguf_.get_i64(key(".expert_used_count"), cfg_.n_expert > 0 ? 1 : 0));
     cfg_.n_ff_exp = static_cast<i32>(gguf_.get_i64(key(".expert_feed_forward_length"), 0));
@@ -3200,7 +3225,40 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             } else {
                 L.wq = need(blk_key("blk.%d.attn_q.weight", l));
                 L.wk = need(blk_key("blk.%d.attn_k.weight", l));
-                L.wv = need(blk_key("blk.%d.attn_v.weight", l));
+                // MoVA (k2-horizon): this layer's V is a routed expert set, and
+                // there is no attn_v.weight to read. Both are loaded, not just
+                // the one the arch implies, because a file decides per LAYER --
+                // k2-horizon routes V only on its MoE layers and projects it
+                // with wv on the dense ones, so one layer of each kind is the
+                // normal shape and asking the arch alone would get half the
+                // stack wrong.
+                const GgufTensor *vx = gguf_.tensor(blk_key("blk.%d.attn_v_exps.weight", l));
+                if (vx) {
+                    L.attn_v_gate = need(blk_key("blk.%d.attn_v_gate.weight", l));
+                    L.attn_v_gate_b = upload_f32(blk_key("blk.%d.attn_v_gate.bias", l));
+                    L.attn_v_exps = upload_raw(vx, vx->type);
+                    if (L.attn_v_exps.n_out %
+                            std::max<i64>(1, static_cast<i64>(cfg_.n_value_expert)) != 0) {
+                        if (err)
+                            *err = "blk." + std::to_string(l) +
+                                   ".attn_v_exps.weight is " +
+                                   std::to_string(L.attn_v_exps.n_out) +
+                                   " rows wide, not a multiple of attention."
+                                   "value_expert_count (" +
+                                   std::to_string(cfg_.n_value_expert) + ")";
+                        return false;
+                    }
+                    if (gguf_.tensor(blk_key("blk.%d.attn_v.weight", l)) != nullptr) {
+                        if (err)
+                            *err = "blk." + std::to_string(l) +
+                                   " carries BOTH attn_v.weight and attn_v_exps."
+                                   "weight; its attention values are either a "
+                                   "projection or a routed set, not both";
+                        return false;
+                    }
+                } else {
+                    L.wv = need(blk_key("blk.%d.attn_v.weight", l));
+                }
             }
             L.wo = need(blk_key("blk.%d.attn_output.weight", l));
             // Attention-output bias (gpt-oss). One f32 per output channel,
@@ -3219,8 +3277,23 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // laguna's per-head output gate is a projection of its own off the
             // same hidden state q/k/v read — not a slice of attn_q — so it is a
             // weight like any other and is uploaded with them.
-            if (cfg_.attn_gate)
-                L.wattn_gate = need(blk_key("blk.%d.attn_gate.weight", l));
+            if (cfg_.attn_gate) {
+                // Required or optional per the FAMILY's own schema flag, not by
+                // arch name: see ArchSpec::attn_gate_optional.
+                const std::string gk = blk_key("blk.%d.attn_gate.weight", l);
+                if (aspec.attn_gate_optional) {
+                    // `upload_raw(nullptr, ...)` is a null dereference, not a
+                    // null QuantTensor: the OPTIONAL path has to test the
+                    // tensor before uploading it. (Measured: the first version
+                    // of this line crashed the loader on a k2-horizon fixture
+                    // with no gate, which is exactly the file the flag exists
+                    // to admit.)
+                    const GgufTensor *gt = gguf_.tensor(gk);
+                    L.wattn_gate = gt ? with_sidecar_scale(upload_raw(gt, gt->type), gk)
+                                      : QuantTensor{};
+                } else
+                    L.wattn_gate = need(gk);
+            }
         } else {
             // A recurrent nemotron layer that is neither mamba-2 nor
             // attention: a pure-MoE block. Nothing to upload here.
@@ -3708,9 +3781,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             const i64 lkv_dim = kv_dim_at(l);
             const i64 expect_q = aspec.q_output_gate ? 2 * lq_dim : lq_dim;
             const bool layer_has_attn = L.wq.present();
+            // MoVA: a layer whose V is a routed expert set has no attn_v to
+            // measure. The bank is the thing to check instead, and it must be
+            // exactly n_value_expert blocks of the declared KV width -- a bank
+            // of the wrong width is the same class of wrong as a mismatched wv,
+            // and it would otherwise be read as rows of the right shape for the
+            // wrong expert count.
+            i64 v_out = L.wv.n_out;
+            if (L.attn_v_exps.present()) {
+                const i64 nve = static_cast<i64>(cfg_.n_value_expert);
+                v_out = nve > 0 ? L.attn_v_exps.n_out / nve : -1;
+            }
             if (layer_has_attn &&
                 (L.wq.n_out != expect_q || L.wk.n_out != lkv_dim ||
-                 L.wv.n_out != lkv_dim || L.wo.n_in != lq_dim)) {
+                 v_out != lkv_dim || L.wo.n_in != lq_dim)) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
                            " attention tensors disagree with the declared head geometry";

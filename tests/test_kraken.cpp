@@ -60,6 +60,9 @@
 #include "krk/expert_cpu.hpp"
 #include "krk/gguf.hpp"
 #include "krk/hc.hpp"
+#include "krk/mova.hpp"
+#include "krk/diffusion.hpp"
+#include "krk/engram.hpp"
 #include "krk/mla.hpp"
 #include "krk/mla_shared.hpp"
 #include "krk/dsv4_route.hpp"
@@ -9301,8 +9304,11 @@ static void test_arch_tensor_maps() {
           "the delta net's own gate is not a gap");
     CHECK(arch_tensor_gap("blk.7.attn_gate.weight", ArchShape::Moe) != nullptr,
           "a dense attention output gate is a gap");
-    CHECK(arch_tensor_gap("blk.7.attn_v_gate.bias", ArchShape::Moe) != nullptr,
-          "a gate on attention values is a gap");
+    // NOT a gap any more: attn_v_gate/attn_v_exps are MoVA, which the engine
+    // runs (Engine::mova_value). A gap entry for a served feature refuses every
+    // file of the family it belongs to.
+    CHECK(arch_tensor_gap("blk.7.attn_v_gate.bias", ArchShape::Moe) == nullptr,
+          "a gate on attention values is served, not a gap");
     CHECK(arch_tensor_gap("blk.2.attn_kv_a.weight", ArchShape::Moe) != nullptr,
           "MLA compression is a gap");
     CHECK(arch_tensor_gap("blk.2.ssm_out.weight", ArchShape::Dense) != nullptr,
@@ -9447,20 +9453,13 @@ static void test_load_verdict() {
         std::string err;
         CHECK(g.load(path, &err), "the fixture loads");
         const ModelVerdict v = assess_model(g);
-        CHECK(!v.runnable, "k2-horizon is refused");
-        CHECK(v.blockers.size() >= 2,
-              "its arch and its routed-value tensor are separate causes");
-        bool arch_reason = false, gate_reason = false;
-        for (const std::string &b : v.blockers) {
-            if (b.find("routed expert set") != std::string::npos) arch_reason = true;
-            if (b.find("does not implement") != std::string::npos) gate_reason = true;
-        }
-        CHECK(arch_reason && gate_reason, "both causes are named");
-        Model m;
-        std::string lerr;
-        CHECK(!m.load(*cpu, path, &lerr), "the loader refuses the file");
-        CHECK(lerr.find("k2-horizon") != std::string::npos,
-              "and its error names the arch");
+        // k2-horizon is runnable: MoVA (the routed attention values) and the
+        // grouped norm are both implemented, so the file carrying an
+        // attn_v_exps bank must NOT be blocked for it. The tensor-level check
+        // is the one that used to refuse every file of this family.
+        CHECK(v.runnable, "k2-horizon is runnable, routed values and all");
+        CHECK(arch_tensor_gap("blk.0.attn_v_exps.weight", ArchShape::Moe) == nullptr,
+              "and the routed-value tensor is no longer a gap");
         made.push_back(path);
     }
 
@@ -22254,12 +22253,24 @@ static void test_pending_model_refusals() {
               (std::string(label) + "'s fixture is removed").c_str());
     };
 
-    // ---- k2-horizon: the VALUES are a routed expert set ----
+    // ---- k2-horizon: SERVED, not refused ----
+    // It used to be the arm above: a file of this family was refused because
+    // the attention VALUES are a routed expert set. That is Engine::mova_value
+    // now, and the grouped norm is Backend::rmsnorm_bands, so the refusal would
+    // be a lie. The row's own fixture (test_k2_horizon_mova) pins the graph; the
+    // check here is only that the VERDICT agrees the file is runnable, because a
+    // refusal in the verdict layer stops a file before the loader is even asked.
     {
         MoeSpec m;
         m.arch = "k2-horizon";
         CHECK(build_tiny_moe_model("kraken-pend-k2.gguf", m), "wrote k2-horizon");
-        arm("kraken-pend-k2.gguf", "k2-horizon", "attention values");
+        Gguf g;
+        std::string verr;
+        CHECK(g.load("kraken-pend-k2.gguf", &verr), "the k2-horizon fixture loads");
+        const ModelVerdict v = assess_model(g);
+        CHECK(v.runnable,
+              "a k2-horizon file is runnable: MoVA and the grouped norm are served");
+        std::remove("kraken-pend-k2.gguf");
     }
     // ---- minimax-m3: block-sparse throughout, multimodal, DSpark head ----
     {
@@ -23027,6 +23038,728 @@ static void test_dsv4_sinkhorn_mixer() {
             md = std::max(md, std::fabs(lanes2[i] - (lanes[i] + 0.25f)));
         std::fprintf(stderr, "[hc] post identity max|d| %.9f\n", (double)md);
         CHECK(md < 1e-6f, "an identity comb with post 1 is a residual add");
+    }
+}
+
+// ---- MoVA: the attention values are a routed expert set (k2-horizon) ------
+//
+// Two halves. The first pins the routing RULE on its own -- bias selects and
+// never mixes, silu lands on each expert's output before its weight, the
+// renormalisation is over the selected probabilities -- with an independent
+// oracle and arms that remove each rule. The second builds a k2-horizon file
+// that carries the bank and a grouped norm, and pins the whole graph, because a
+// router that passes its own unit test and is wired to the wrong buffer still
+// decodes fluently.
+static void test_mova_router() {
+    const i32 nv = 6, k = 3;
+    // Logits spread far enough apart that the top-k is decided by them alone,
+    // plus one near-tie to exercise the lower-id rule.
+    const f32 logits[nv] = {1.4f, -0.7f, 2.2f, 0.3f, 2.2f, -2.0f};
+    const f32 bias[nv] = {0.0f, 0.0f, 0.0f, 1.5f, 0.0f, 0.0f};
+
+    // ---- an independent re-derivation of the reference order ----
+    auto sig = [](f32 x) { return 1.0f / (1.0f + std::exp(-x)); };
+    auto ref_route = [&](bool use_bias, bool renorm, i32 *sel, f32 *w) {
+        f32 mx = logits[0];
+        for (i32 e = 1; e < nv; e++) mx = std::max(mx, logits[e]);
+        f32 p[nv], sum = 0.0f;
+        for (i32 e = 0; e < nv; e++) { p[e] = std::exp(logits[e] - mx); sum += p[e]; }
+        for (i32 e = 0; e < nv; e++) p[e] /= sum;
+        for (i32 j = 0; j < k; j++) {
+            i32 best = -1; f32 bs = 0.0f;
+            for (i32 e = 0; e < nv; e++) {
+                bool taken = false;
+                for (i32 q = 0; q < j; q++) if (sel[q] == e) taken = true;
+                if (taken) continue;
+                const f32 sc = p[e] + (use_bias ? bias[e] : 0.0f);
+                if (best < 0 || sc > bs) { best = e; bs = sc; }
+            }
+            sel[j] = best; w[j] = p[best];
+        }
+        if (renorm) {
+            f32 t = 0.0f;
+            for (i32 j = 0; j < k; j++) t += w[j];
+            for (i32 j = 0; j < k; j++) w[j] /= t;
+        }
+    };
+
+    i32 sel[k], rsel[k];
+    f32 w[k], rw[k];
+    MovaRoute::route(sel, w, logits, bias, nv, k, /*sigmoid=*/false, /*renorm=*/true);
+    ref_route(/*use_bias=*/true, /*renorm=*/true, rsel, rw);
+    bool same = true;
+    f32 wd = 0.0f;
+    for (i32 j = 0; j < k; j++) {
+        if (sel[j] != rsel[j]) same = false;
+        wd = std::max(wd, std::fabs(w[j] - rw[j]));
+    }
+    std::fprintf(stderr, "[mova] route sel %d %d %d  w %.6f %.6f %.6f\n", sel[0],
+                 sel[1], sel[2], (double)w[0], (double)w[1], (double)w[2]);
+    CHECK(same, "the route matches an independent re-derivation");
+    CHECK(wd < 1e-6f, "and so do its weights");
+    // The bias is what puts expert 3 in: on logits alone it is 4th.
+    CHECK(sel[0] == 3 || sel[1] == 3 || sel[2] == 3,
+          "the selection bias promotes expert 3 into the route");
+
+    // ---- arm: the bias also added to the MIXING weights ----
+    // The exact mistake the header warns about. It is not just a different
+    // number -- the mixture is no longer convex, so the values are scaled by
+    // something that does not sum to 1.
+    {
+        i32 s2[k]; f32 w2[k];
+        MovaRoute::route(s2, w2, logits, nullptr, nv, k, false, true);
+        f32 sum = 0.0f;
+        for (i32 j = 0; j < k; j++) sum += w2[j];
+        f32 sum_biased = 0.0f;
+        i32 s3[k]; f32 w3[k];
+        MovaRoute::route(s3, w3, logits, bias, nv, k, false, /*renorm=*/false);
+        for (i32 j = 0; j < k; j++) sum_biased += w3[j];
+        std::fprintf(stderr, "[mova] arms: renorm sum %.6f  un-normalised sum %.6f\n",
+                     (double)sum, (double)sum_biased);
+        CHECK(std::fabs(sum - 1.0f) < 1e-5f,
+              "a renormalised route is a convex mixture");
+        CHECK(sum_biased < 1.0f - 1e-3f,
+              "and without the renorm it is not -- which is what the flag buys");
+    }
+
+    // ---- arm: silu after the sum instead of before ----
+    // The other cheap mistake. With two experts whose outputs have opposite
+    // signs the two orders differ, so this measures rather than asserts.
+    {
+        const i32 n_in = 3, n_out = 2;
+        f32 exps[2 * n_out * n_in] = {
+            // expert 0
+            1.0f, 0.0f, 0.0f,   0.0f, 1.0f, 0.0f,
+            // expert 1
+            -1.0f, 0.0f, 0.0f,  0.0f, 0.0f, 1.0f,
+        };
+        const f32 x[n_in] = {2.0f, -3.0f, 0.5f};
+        const i32 sel2[2] = {0, 1};
+        const f32 w2[2] = {0.5f, 0.5f};
+        f32 out[n_out], scratch[n_out];
+        CHECK(MovaRoute::mix(out, scratch, sel2, w2, 2, x, n_in, exps, n_out),
+              "the mixture runs");
+        // Oracle: sum_j w_j * silu(row_j . x), written out with the reference's
+        // silu so an error in MovaRoute::silu shows up too.
+        f32 oracle[n_out];
+        for (i32 o = 0; o < n_out; o++) oracle[o] = 0.0f;
+        for (i32 j = 0; j < 2; j++)
+            for (i32 o = 0; o < n_out; o++) {
+                f32 acc = 0.0f;
+                for (i32 i = 0; i < n_in; i++)
+                    acc += exps[(j * n_out + o) * n_in + i] * x[i];
+                oracle[o] += w2[j] * (acc * sig(acc));
+            }
+        f32 md = 0.0f;
+        for (i32 o = 0; o < n_out; o++) md = std::max(md, std::fabs(out[o] - oracle[o]));
+        std::fprintf(stderr, "[mova] mix max|d| %.9f  out %.6f %.6f\n", (double)md,
+                     (double)out[0], (double)out[1]);
+        CHECK(md < 1e-6f, "the mixture matches silu-then-weight-then-sum");
+        // The wrong order: silu applied to the WEIGHTED SUM.
+        f32 wrong[n_out];
+        for (i32 o = 0; o < n_out; o++) {
+            f32 acc = 0.0f;
+            for (i32 j = 0; j < 2; j++)
+                for (i32 i = 0; i < n_in; i++)
+                    acc += w2[j] * exps[(j * n_out + o) * n_in + i] * x[i];
+            wrong[o] = acc * sig(acc);
+        }
+        f32 wdiff = std::max(std::fabs(out[0] - wrong[0]),
+                             std::fabs(out[1] - wrong[1]));
+        std::fprintf(stderr, "[mova] arms: silu-after-sum max|d| %.6f\n",
+                     (double)wdiff);
+        CHECK(wdiff > 1e-3f, "silu after the sum is a different mixture");
+    }
+
+    // ---- the degenerate route: k == n_value_expert visits every expert ----
+    {
+        i32 s2[nv]; f32 w2[nv];
+        MovaRoute::route(s2, w2, logits, bias, nv, nv, false, false);
+        i32 count[nv] = {0, 0, 0, 0, 0, 0};
+        for (i32 j = 0; j < nv; j++) count[s2[j]]++;
+        bool once_each = true;
+        for (i32 e = 0; e < nv; e++) if (count[e] != 1) once_each = false;
+        CHECK(once_each, "a full route names every expert exactly once");
+    }
+}
+
+// ---- k2-horizon: the whole graph, with MoVA and a grouped norm ------------
+//
+// test_mova_router pins the RULE. This pins the WIRING: a two-layer k2-horizon
+// file that carries `attn_v_gate` (+ bias) and `attn_v_exps` instead of
+// `attn_v.weight`, and declares `attention.group_norm_groups = 2`. Both are
+// things a file can carry and the engine could quietly ignore -- the grouped
+// norm would run ungrouped and the bank would be replaced by a projection, and
+// the model would still emit fluent text.
+//
+// Three arms, each removing one piece, must move the pinned row:
+//   * no value-expert bank      -> V falls back to attn_v.weight
+//   * group_norm_groups = 1     -> every norm site is ungrouped
+//   * no attn_v_gate.bias       -> the route is chosen without it
+static bool build_k2_horizon_model(const std::string &path, bool vbank, i32 groups,
+                                   bool vgate_bias) {
+    const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int n_layer = 2, n_expert = 4, n_used = 2, n_ff_exp = 32;
+    const int nv = 4, nv_used = 2, vocab = 264, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string arch = "k2-horizon";
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-k2-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", (u32)n_layer);
+    b.meta_u32(arch + ".context_length", (u32)ctx);
+    b.meta_u32(arch + ".embedding_length", (u32)n_embd);
+    b.meta_u32(arch + ".feed_forward_length", (u32)n_ff);
+    b.meta_u32(arch + ".attention.head_count", (u32)n_head);
+    b.meta_u32(arch + ".attention.head_count_kv", (u32)n_kv);
+    b.meta_u32(arch + ".attention.key_length", (u32)hd);
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".expert_count", (u32)n_expert);
+    b.meta_u32(arch + ".expert_used_count", (u32)n_used);
+    b.meta_u32(arch + ".expert_feed_forward_length", (u32)n_ff_exp);
+    if (groups > 1) b.meta_u32(arch + ".attention.group_norm_groups", (u32)groups);
+    if (vbank) {
+        b.meta_u32(arch + ".attention.value_expert_count", (u32)nv);
+        b.meta_u32(arch + ".attention.value_expert_used_count", (u32)nv_used);
+    }
+    add_spm_vocab(b, vocab);
+    auto rnd = [](i64 i) {
+        u64 z = (u64)i * 0x9E3779B97F4A7C15ull + 0x51ED2701ull;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z = z ^ (z >> 31);
+        return (f32)((z >> 40) & 0xFFFFFF) / 8388608.0f - 1.0f;
+    };
+    auto vec = [&](size_t n, i64 base, f32 amp) {
+        std::vector<f32> v(n);
+        for (size_t k = 0; k < n; k++) v[k] = amp * rnd(base + (i64)k);
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    b.tensor_f16("token_embd.weight", {(u64)n_embd, (u64)vocab}, vec((size_t)n_embd * vocab, 1, 0.30f));
+    b.tensor_f16("output_norm.weight", {(u64)n_embd}, ones(n_embd));
+    b.tensor_f16("output.weight", {(u64)n_embd, (u64)vocab}, vec((size_t)n_embd * vocab, 2, 0.30f));
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        b.tensor_f32(p + "attn_norm.weight", {(u64)n_embd}, ones(n_embd));
+        b.tensor_f16(p + "attn_q.weight", {(u64)n_embd, (u64)q_dim}, vec((size_t)n_embd * q_dim, 10 + l, 0.30f));
+        b.tensor_f16(p + "attn_k.weight", {(u64)n_embd, (u64)kv_dim}, vec((size_t)n_embd * kv_dim, 20 + l, 0.30f));
+        if (vbank) {
+            b.tensor_f16(p + "attn_v_gate.weight", {(u64)n_embd, (u64)nv},
+                         vec((size_t)n_embd * nv, 30 + l, 0.30f));
+            if (vgate_bias) {
+                b.tensor_f32(p + "attn_v_gate.bias", {(u64)nv},
+                             vec((size_t)nv, 40 + l, 0.30f));
+            }
+            // [n_embd, kv_dim, n_value_expert]: the bank the router indexes.
+            b.tensor_f16(p + "attn_v_exps.weight",
+                         {(u64)n_embd, (u64)kv_dim, (u64)nv},
+                         vec((size_t)n_embd * kv_dim * nv, 50 + l, 0.30f));
+        } else {
+            b.tensor_f16(p + "attn_v.weight", {(u64)n_embd, (u64)kv_dim},
+                         vec((size_t)n_embd * kv_dim, 50 + l, 0.30f));
+        }
+        b.tensor_f16(p + "attn_output.weight", {(u64)q_dim, (u64)n_embd},
+                     vec((size_t)q_dim * n_embd, 60 + l, 0.30f));
+        b.tensor_f32(p + "ffn_norm.weight", {(u64)n_embd}, ones(n_embd));
+        b.tensor_f16(p + "ffn_gate_inp.weight", {(u64)n_embd, (u64)n_expert},
+                     vec((size_t)n_embd * n_expert, 70 + l, 0.30f));
+        const size_t gsz = (size_t)n_embd * n_ff_exp;
+        std::vector<f32> gate(gsz * n_expert), up(gsz * n_expert), down(gsz * n_expert);
+        for (int e = 0; e < n_expert; e++) {
+            const i64 bump = (i64)e * 7919;
+            for (size_t k = 0; k < gsz; k++) {
+                gate[(size_t)e * gsz + k] = 0.30f * rnd(80 + l * 1000 + (i64)k + bump);
+                up[(size_t)e * gsz + k] = 0.30f * rnd(90 + l * 1000 + (i64)k + bump);
+            }
+            for (size_t k = 0; k < gsz; k++)
+                down[(size_t)e * gsz + k] = 0.30f * rnd(100 + l * 1000 + (i64)k + bump);
+        }
+        b.tensor_f16(p + "ffn_gate_exps.weight", {(u64)n_embd, (u64)n_ff_exp, (u64)n_expert}, gate);
+        b.tensor_f16(p + "ffn_up_exps.weight", {(u64)n_embd, (u64)n_ff_exp, (u64)n_expert}, up);
+        b.tensor_f16(p + "ffn_down_exps.weight", {(u64)n_ff_exp, (u64)n_embd, (u64)n_expert}, down);
+    }
+    const bool w = b.write(path);
+    return w;
+}
+
+static void test_k2_horizon_mova() {
+    auto run = [&](const std::string &file, i32 max_tokens, RowPin *pin,
+                   std::vector<i32> *toks) -> bool {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = file;
+            cfg.n_ctx = 64;
+            std::string err;
+            if (!engine.init(cpu, cfg, &err))
+                std::fprintf(stderr, "  (k2-horizon init: %s)\n", err.c_str());
+            else {
+                GenerateParams gp;
+                gp.prompt = "the quick brown fox";
+                gp.max_tokens = max_tokens;
+                gp.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(gp, &r) && r.finish != FinishError;
+                if (ok) {
+                    const f32 *lg = engine.last_logits();
+                    const i32 nv2 = engine.model().cfg().n_vocab;
+                    if (pin && lg && nv2 > 0) *pin = row_pin(lg, nv2);
+                    if (toks) *toks = r.tokens;
+                }
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    // ---- the file's own schema is read, not guessed ----
+    CHECK(build_k2_horizon_model("kraken-k2-full.gguf", true, 2, true),
+          "wrote a two-layer k2-horizon file with a value bank and a grouped norm");
+    {
+        Backend *cpu = make_cpu_backend();
+        {
+            Model m;
+            std::string err;
+            if (m.load(*cpu, "kraken-k2-full.gguf", &err)) {
+                CHECK(m.cfg().n_value_expert == 4 && m.cfg().n_value_expert_used == 2,
+                      "the value experts are read off the file");
+                CHECK(m.cfg().n_norm_groups == 2, "and so is the group count");
+                CHECK(m.layers()[0].attn_v_exps.present(),
+                      "the bank is resident");
+                CHECK(!m.layers()[0].wv.present(),
+                      "and no attn_v projection was invented for it");
+            } else {
+                CHECK(false, ("the k2-horizon file loads: " + err).c_str());
+            }
+            m.unload();
+        }
+        delete cpu;
+    }
+
+    RowPin pin_full;
+    std::vector<i32> toks;
+    CHECK(run("kraken-k2-full.gguf", 4, &pin_full, &toks),
+          "the whole graph runs at depth");
+    CHECK(!toks.empty(), "and produces a greedy sequence");
+    std::fprintf(stderr, "[k2] pinned %s\n", pin_str(pin_full).c_str());
+    {
+        RowPin again;
+        CHECK(run("kraken-k2-full.gguf", 4, &again, nullptr), "the run repeats");
+        CHECK(pin_close(pin_full, again),
+              "and two runs of one file agree");
+    }
+
+    // ---- the arms ----
+    struct Arm { const char *name; bool vbank; i32 groups; bool bias; };
+    const Arm arms[] = {
+        {"value_bank", false, 2, true},     // V by projection instead of routing
+        {"norm_groups", true, 1, true},     // every norm ungrouped
+        {"v_gate_bias", true, 2, false},    // the route chosen without its bias
+    };
+    for (const Arm &a : arms) {
+        const std::string path = std::string("kraken-k2-") + a.name + ".gguf";
+        CHECK(build_k2_horizon_model(path, a.vbank, a.groups, a.bias),
+              (std::string("wrote the ") + a.name + " arm").c_str());
+        RowPin pin;
+        const bool ok = run(path, 4, &pin, nullptr);
+        CHECK(ok, (std::string("the ") + a.name + " arm runs").c_str());
+        if (ok)
+            std::fprintf(stderr, "[k2] without %-12s %s\n", a.name,
+                         pin_close(pin_full, pin) ? "UNCHANGED" : "moved");
+        if (ok)
+            CHECK(!pin_close(pin_full, pin),
+                  (std::string("removing ") + a.name + " moves the pinned row")
+                      .c_str());
+        std::remove(path.c_str());
+    }
+
+    // ---- a different prompt is a different row ----
+    {
+        Backend *cpu = make_cpu_backend();
+        RowPin pin2;
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = "kraken-k2-full.gguf";
+            cfg.n_ctx = 64;
+            std::string err;
+            if (engine.init(cpu, cfg, &err)) {
+                GenerateParams gp;
+                gp.prompt = "pack my box";
+                gp.max_tokens = 4;
+                gp.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(gp, &r);
+                if (ok) pin2 = row_pin(engine.last_logits(), engine.model().cfg().n_vocab);
+            }
+        }
+        delete cpu;
+        CHECK(ok, "a second prompt runs");
+        CHECK(!pin_close(pin_full, pin2), "and lands on a different row");
+    }
+    std::remove("kraken-k2-full.gguf");
+}
+
+// ---- the block-diffusion sampler (diffuse / LLaDA2.x) ---------------------
+//
+// The schedule is driven by a FORWARD THE TEST OWNS, so every commitment is
+// predictable: the fake model gives position t a sharp peak on token (t % 5) at
+// the LAST block it was asked about and a flat distribution everywhere else.
+// That means "who gets committed" is decided by the schedule and the confidence
+// order, which is exactly what is under test -- not by a real model's opinion.
+static void test_diffusion_sampler() {
+    // ---- the transfer plan: base plus remainder, never flat ----
+    {
+        i32 plan[8];
+        diffusion_transfer_plan(plan, 10, 3);
+        // 10 masks over 3 steps: 4, 3, 3. A flat 10/3 = 3 leaves one behind.
+        const bool ok = plan[0] == 4 && plan[1] == 3 && plan[2] == 3;
+        std::fprintf(stderr, "[dllm] transfer 10/3 = %d %d %d\n", plan[0], plan[1],
+                     plan[2]);
+        CHECK(ok, "transfer is base plus remainder, remainder first");
+        i32 total = 0;
+        for (i32 k = 0; k < 3; k++) total += plan[k];
+        CHECK(total == 10, "and it sums to exactly the block's mask count");
+
+        diffusion_transfer_plan(plan, 4, 4);
+        CHECK(plan[0] == 1 && plan[3] == 1, "an exact division is flat");
+        diffusion_transfer_plan(plan, 3, 8);
+        total = 0;
+        for (i32 k = 0; k < 8; k++) total += plan[k];
+        CHECK(total == 3, "more steps than masks still commits every mask");
+        CHECK(plan[0] == 1 && plan[1] == 1 && plan[2] == 1 && plan[3] == 0,
+              "and the extra steps commit nothing rather than something");
+    }
+
+    // ---- the loop, on a model with a known answer ----
+    // peak(t) = t % 5, and the peak is sharp (logit 20 vs 0) so softmax
+    // confidence is ~1.0 for the argmax of every position: ties across
+    // positions are then broken by POSITION, which is the documented rule.
+    const i32 n_vocab = 8;
+    auto make_forward = [&](i32 *calls, i32 peak_shift = 0) {
+        return [&, peak_shift, calls](const i32 *toks, i32 n_tok, f32 *logits) {
+            (*calls)++;
+            for (i32 t = 0; t < n_tok; t++) {
+                (void)toks;
+                f32 *row = logits + static_cast<i64>(t) * n_vocab;
+                for (i32 v = 0; v < n_vocab; v++) row[v] = 0.0f;
+                const i32 peak = ((t + peak_shift) % 5) + 1;   // never the mask id 0
+                row[peak] = 20.0f;
+            }
+            return true;
+        };
+    };
+
+    DiffusionParams p;
+    p.gen_length = 8;
+    p.block_length = 4;
+    p.steps = 2;              // 2 blocks x 2 steps = 4 forwards
+    p.mask_id = 0;
+    i32 calls = 0;
+    std::vector<i32> seq;
+    const i32 prompt_len = 3;
+    const i32 fwd = diffusion_generate(seq, prompt_len, n_vocab, p,
+                                       make_forward(&calls));
+    std::fprintf(stderr, "[dllm] forwards %d (calls %d)  seq:", fwd, calls);
+    for (i32 t = prompt_len; t < (i32)seq.size(); t++) std::fprintf(stderr, " %d", seq[t]);
+    std::fprintf(stderr, "\n");
+    CHECK(fwd == 4 && calls == 4,
+          "the forward runs steps x blocks times -- 2 blocks of 2 steps");
+    CHECK(seq.size() == (size_t)(prompt_len + p.gen_length),
+          "the sequence is the prompt plus gen_length tokens");
+    bool any_mask = false;
+    for (i32 t = prompt_len; t < (i32)seq.size(); t++)
+        if (seq[t] == p.mask_id) any_mask = true;
+    CHECK(!any_mask, "and nothing is left masked: the block completes");
+
+    // ---- every position got the token the model peaked on ----
+    // The fake's peak for position t is ((t % 5) + 1). It is the same at every
+    // step, so WHICH step committed a position cannot change the value -- what
+    // the schedule decides is only who is committed when.
+    {
+        bool ok = true;
+        for (i32 t = prompt_len; t < (i32)seq.size(); t++)
+            if (seq[t] != ((t % 5) + 1)) ok = false;
+        CHECK(ok, "every committed token is the model's argmax for its position");
+    }
+
+    // ---- arm: candidates restricted to the current block ----
+    // If a later block's positions were candidates in an earlier block, the
+    // first block's steps would commit them too. Measured by giving each
+    // position a DIFFERENT peak per forward and seeing which block's value wins:
+    // with the restriction, a position can only be written by its own block.
+    {
+        i32 n_calls = 0;
+        std::vector<i32> s2;
+        // Forward number k peaks every position on k+1, so the value a position
+        // ends up with names the block (really the step) that committed it.
+        auto fwd_n = [&](const i32 *, i32 n_tok, f32 *lg) {
+            n_calls++;
+            for (i32 t = 0; t < n_tok; t++) {
+                f32 *row = lg + static_cast<i64>(t) * n_vocab;
+                for (i32 v = 0; v < n_vocab; v++) row[v] = 0.0f;
+                row[1 + (n_calls % 5)] = 20.0f;
+            }
+            return true;
+        };
+        DiffusionParams q = p;
+        q.gen_length = 4;
+        q.block_length = 4;
+        q.steps = 2;
+        diffusion_generate(s2, 2, n_vocab, q, fwd_n);
+        // Both steps ran inside the ONE block, and each committed 2 of the 4
+        // masks, so the first two positions carry step 1's token and the last
+        // two step 2's.
+        std::fprintf(stderr, "[dllm] block-order seq: %d %d %d %d (peaks 1,2)\n",
+                     s2[2], s2[3], s2[4], s2[5]);
+        const i32 first = 1 + (1 % 5), second = 1 + (2 % 5);
+        CHECK(s2[2] == first && s2[3] == first,
+              "the first step commits the highest-confidence two");
+        CHECK(s2[4] == second && s2[5] == second,
+              "and the second step commits the rest, from ITS logits");
+    }
+
+    // ---- arm: a committed token is never re-decided ----
+    // The fake is given a peak that CHANGES every call. A sampler that re-scores
+    // committed positions would let a later step overwrite an earlier one; the
+    // reference does not, and neither does this one.
+    {
+        i32 n_calls = 0;
+        std::vector<i32> s3;
+        auto fwd_alt = [&](const i32 *toks, i32 n_tok, f32 *lg) {
+            n_calls++;
+            for (i32 t = 0; t < n_tok; t++) {
+                f32 *row = lg + static_cast<i64>(t) * n_vocab;
+                for (i32 v = 0; v < n_vocab; v++) row[v] = 0.0f;
+                // A committed token keeps its value in `toks`; the fake makes
+                // the CURRENT answer depend on the call count instead.
+                row[1 + (n_calls % 5)] = 20.0f;
+                (void)toks;
+            }
+            return true;
+        };
+        DiffusionParams q = p;
+        q.gen_length = 4;
+        q.block_length = 4;
+        q.steps = 4;              // one mask per step
+        diffusion_generate(s3, 1, n_vocab, q, fwd_alt);
+        std::fprintf(stderr, "[dllm] no-rewrite seq: %d %d %d %d\n", s3[1], s3[2],
+                     s3[3], s3[4]);
+        bool ok = true;
+        for (i32 k = 0; k < 4; k++)
+            if (s3[1 + k] != 1 + ((k + 1) % 5)) ok = false;
+        CHECK(ok, "each step commits a fresh position, never rewriting one");
+    }
+
+    // ---- arm: the block schedule is semi-autoregressive ----
+    // Block 0 must be finished before block 1 is touched. With 2 steps per
+    // block, forward 1 and 2 belong to block 0; if block 1 were a candidate in
+    // them, positions 4..7 would carry block 0's values.
+    {
+        i32 n_calls = 0;
+        std::vector<i32> s4;
+        auto fwd_blk = [&](const i32 *, i32 n_tok, f32 *lg) {
+            n_calls++;
+            const i32 block = n_calls <= 2 ? 0 : 1;
+            for (i32 t = 0; t < n_tok; t++) {
+                f32 *row = lg + static_cast<i64>(t) * n_vocab;
+                for (i32 v = 0; v < n_vocab; v++) row[v] = 0.0f;
+                row[1 + block] = 20.0f;      // token 1 = block 0, token 2 = block 1
+            }
+            return true;
+        };
+        diffusion_generate(s4, 0 + 2, n_vocab, p, fwd_blk);
+        bool b0 = true, b1 = true;
+        // forward 1 and 2 peak token 1 (block 0); 3 and 4 peak token 2.
+        for (i32 t = 2; t < 6; t++) if (s4[t] != 1) b0 = false;
+        for (i32 t = 6; t < 10; t++) if (s4[t] != 2) b1 = false;
+        std::fprintf(stderr, "[dllm] blocks seq:");
+        for (i32 t = 2; t < 10; t++) std::fprintf(stderr, " %d", s4[t]);
+        std::fprintf(stderr, "\n");
+        CHECK(b0, "block 0's four positions carry block 0's answer");
+        CHECK(b1, "and block 1's carry block 1's");
+    }
+
+    // ---- a malformed schedule is refused, not run ----
+    {
+        std::vector<i32> s5;
+        DiffusionParams bad = p;
+        bad.block_length = 0;
+        i32 c2 = 0;
+        CHECK(diffusion_generate(s5, 3, n_vocab, bad, make_forward(&c2)) == -1,
+              "a zero block length is refused");
+        bad = p;
+        bad.steps = 0;
+        CHECK(diffusion_generate(s5, 3, n_vocab, bad, make_forward(&c2)) == -1,
+              "and so is a zero step count");
+    }
+}
+
+// ---- Engram: DeepSeek-V4.1's n-gram hash --------------------------------
+//
+// The hash is the whole interface between an Engram layer and its table, and
+// four of its rules are silent-wrong-answer if missed. Each gets an arm that
+// removes it and is measured:
+//   * rolling accumulation across shifts (vs recomputing per column),
+//   * one fewer column group than there are shifts (the token itself emits
+//     nothing -- it only seeds the running hash),
+//   * a dead shift poisons every LONGER shift, substituting the pad id,
+//   * a row past the table gathers zeros rather than the next tensor's bytes.
+static void test_engram_hash() {
+    // A 3-gram, 2 heads per n-gram -> 2 shifts x 2 heads = 4 columns.
+    const i32 n_gram = 3, hpn = 2;
+    const u64 mult[n_gram] = {0x9E3779B97F4A7C15ull, 0xD6E8FEB86659FD93ull,
+                              0xA24BAED4963EE407ull};
+    const u32 offs[4] = {1000, 2000, 3000, 4000};
+    const u32 primes[4] = {97, 101, 103, 107};
+    EngramModule m;
+    m.mult = mult;
+    m.offsets = offs;
+    m.vocab_sizes = primes;
+    m.n_gram = n_gram;
+    m.heads_per_ngram = hpn;
+    CHECK(m.valid() && m.n_cols() == 4,
+          "a 3-gram with 2 heads per n-gram has 4 columns, not 6");
+
+    // A token map that is the identity, so a raw token id IS its mapped id.
+    std::vector<u32> tokmap(64);
+    for (i32 i = 0; i < 64; i++) tokmap[(size_t)i] = (u32)i;
+    const i64 pad = 7;   // whatever the file says; the hash only substitutes it
+
+    i32 ids[4];
+    const i32 prev[2] = {11, 12};      // oldest first: window is 11 12 42
+    CHECK(engram_hash(ids, m, tokmap.data(), (i64)tokmap.size(), pad, 42, prev, 2),
+          "the hash runs");
+    std::fprintf(stderr, "[engram] ids %d %d %d %d\n", ids[0], ids[1], ids[2], ids[3]);
+
+    // ---- an independent re-derivation, in the reference's own order ----
+    {
+        // `prev` is OLDEST FIRST, so shift 1 (the nearest token) is prev[1]=12
+        // and shift 2 is prev[0]=11. Reading it the other way round is the
+        // mirror image of the same mistake the hash's own docs warn about.
+        u64 toks[3] = {42ull, 12ull, 11ull};
+        u64 roll = toks[0] * mult[0];
+        u32 ref[4];
+        for (i32 o = 1; o < n_gram; o++) {
+            roll ^= toks[o] * mult[o];
+            for (i32 h = 0; h < hpn; h++) {
+                const i32 col = (o - 1) * hpn + h;
+                ref[col] = (u32)(roll % primes[col] + (u64)offs[col]);
+            }
+        }
+        bool same = true;
+        for (i32 c = 0; c < 4; c++)
+            if (ids[c] != (i32)ref[c]) same = false;
+        CHECK(same, "the ids match an independent re-derivation");
+        // And they are inside each column's own bucket range.
+        bool in_range = true;
+        for (i32 c = 0; c < 4; c++)
+            if (ids[c] < (i32)offs[c] ||
+                ids[c] >= (i32)(offs[c] + primes[c]))
+                in_range = false;
+        CHECK(in_range, "and every id lands inside its column's bucket range");
+    }
+
+    // ---- arm: NOT rolling (each column hashed from its own shift only) ----
+    // The obvious wrong reading, and it produces ids that are all still IN
+    // RANGE -- so nothing downstream complains.
+    {
+        u64 toks[3] = {42ull, 11ull, 12ull};
+        u32 nb[4];
+        for (i32 o = 1; o < n_gram; o++)
+            for (i32 h = 0; h < hpn; h++) {
+                const i32 col = (o - 1) * hpn + h;
+                const u64 solo = toks[o] * mult[o];
+                nb[col] = (u32)(solo % primes[col] + (u64)offs[col]);
+            }
+        i32 ndiff = 0;
+        for (i32 c = 0; c < 4; c++) if (ids[c] != (i32)nb[c]) ndiff++;
+        std::fprintf(stderr, "[engram] arms: non-rolling differs in %d of 4 ids\n",
+                     ndiff);
+        CHECK(ndiff == 4, "a non-rolling hash gives a different id in every column");
+    }
+
+    // ---- arm: a dead shift poisons every longer shift ----
+    // Position 0 of a sequence has NO previous tokens: both shifts are dead, so
+    // every id must be the pad id's hash. Half a window (one live shift, one
+    // pad) must differ from a full one.
+    {
+        i32 at0[4], half[4];
+        CHECK(engram_hash(at0, m, tokmap.data(), (i64)tokmap.size(), pad, 42,
+                          nullptr, 0),
+              "the first position hashes");
+        const i32 p1[2] = {11, 12};
+        CHECK(engram_hash(half, m, tokmap.data(), (i64)tokmap.size(), pad, 42, p1, 1),
+              "a half window hashes");
+        // At position 0 both shifts are pad; the 3-gram is (42, pad, pad).
+        u64 toks[3] = {42ull, pad, pad};
+        u64 roll = toks[0] * mult[0];
+        i32 want[4];
+        for (i32 o = 1; o < n_gram; o++) {
+            roll ^= toks[o] * mult[o];
+            for (i32 h = 0; h < hpn; h++) {
+                const i32 col = (o - 1) * hpn + h;
+                want[col] = (i32)(roll % primes[col] + (u64)offs[col]);
+            }
+        }
+        bool ok = true;
+        for (i32 c = 0; c < 4; c++) if (at0[c] != want[c]) ok = false;
+        CHECK(ok, "an empty window hashes as the pad id in every shift, not as 0");
+        bool differs = at0[0] != half[0] || at0[2] != half[2];
+        CHECK(differs, "and a half window differs from it -- the pad is not a no-op");
+    }
+
+    // ---- arm: the token itself emits no column ----
+    // If the loop started at o = 0 there would be n_gram*heads = 6 columns; the
+    // module says 4 and the ids must be the (n_gram-1) groups only.
+    CHECK(m.n_cols() == 4, "the token itself seeds the hash and emits nothing");
+
+    // ---- the gather ----
+    {
+        const i64 row_bytes = 2, n_rows = 8;
+        std::vector<u8> table((size_t)(n_rows * row_bytes));
+        for (i64 r = 0; r < n_rows; r++) {
+            table[(size_t)(r * row_bytes)] = (u8)(0x10 + r);
+            table[(size_t)(r * row_bytes + 1)] = (u8)(0x20 + r);
+        }
+        const i32 want[4] = {3, 5, 9, 1};   // 9 is past the table
+        std::vector<u8> out(4 * row_bytes, 0xEE);
+        engram_gather(out.data(), table.data(), n_rows, row_bytes, want, 1, 4);
+        bool ok = true;
+        ok = ok && out[0] == 0x13 && out[1] == 0x23;      // row 3
+        ok = ok && out[2] == 0x15 && out[3] == 0x25;      // row 5
+        ok = ok && out[4] == 0 && out[5] == 0;           // row 9: zeroed
+        ok = ok && out[6] == 0x11 && out[7] == 0x21;      // row 1
+        std::fprintf(stderr, "[engram] gather %02x%02x %02x%02x %02x%02x %02x%02x\n",
+                     out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
+        CHECK(ok, "the gather copies rows and zeroes one past the table");
+    }
+
+    // ---- a malformed module is refused, not run ----
+    {
+        i32 ids2[4];
+        EngramModule bad = m;
+        bad.vocab_sizes = nullptr;
+        CHECK(!engram_hash(ids2, bad, tokmap.data(), (i64)tokmap.size(), pad, 1,
+                           nullptr, 0),
+              "a module with no bucket counts is refused");
+        bad = m;
+        bad.n_gram = 1;                       // no shifts, no columns
+        CHECK(!engram_hash(ids2, bad, tokmap.data(), (i64)tokmap.size(), pad, 1,
+                           nullptr, 0),
+              "and so is a 1-gram, which has nothing to hash");
+        const u32 zero_prime[4] = {97, 0, 103, 107};
+        bad = m;
+        bad.vocab_sizes = zero_prime;
+        CHECK(!engram_hash(ids2, bad, tokmap.data(), (i64)tokmap.size(), pad, 1,
+                           nullptr, 0),
+              "a zero bucket count traps the hash and is refused");
     }
 }
 
@@ -26636,6 +27369,10 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_pending_model_fixtures)
     TEST_GROUP(test_pending_model_refusals)
     TEST_GROUP(test_yes_row_fixtures)
+    TEST_GROUP(test_engram_hash)
+    TEST_GROUP(test_diffusion_sampler)
+    TEST_GROUP(test_k2_horizon_mova)
+    TEST_GROUP(test_mova_router)
     TEST_GROUP(test_dsv4_sinkhorn_mixer)
     TEST_GROUP(test_gpt_oss_whole_graph)
     TEST_GROUP(test_dflash_qwen35_spelling)

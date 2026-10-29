@@ -968,7 +968,19 @@ constexpr ArchSpec kTable[] = {
     //
     // What it does NOT cover is Engram (a token-hash conditional-memory lookup,
     // 196 B parameters) and the 4-wide Sinkhorn hyper-connections, whose `hc_*`
-    // tensors are a DIFFERENT mixer from the one qwen4exp runs. A checkpoint
+    // tensors are a DIFFERENT mixer from the one qwen4exp runs.
+    //
+    // Both now have their ALGEBRA implemented and pinned, with the loader and
+    // the forward still to wire:
+    //   * hc_*: src/hc.cpp's hc_sinkhorn_* (the (2+hc)*hc split, the doubly
+    //     stochastic sinkhorn in the reference's order, the dst-major/file
+    //     index transposition) -- test_dsv4_sinkhorn_mixer.
+    //   * engram_*: src/engram.cpp's rolling n-gram hash, the shared
+    //     per_layer_tok_embd gather and the dead-shift/pad rule --
+    //     test_engram_hash.
+    // What is missing is the part that makes them RUN in a forward: the loader
+    // does not read the tensors yet, so a file carrying either is still refused
+    // by name, and the lane stack for this family is not wired. A checkpoint
     // that carries either is refused by name through the gap map rather than
     // loaded with the block skipped. A dense-core file -- every ratio 0, no
     // hc_*/engram_* -- loads and generates end to end
@@ -1150,10 +1162,27 @@ constexpr ArchSpec kTable[] = {
     // than it is, and a wrong diagnosis costs the next person a kernel to write.
     // The real gap is the routed expert set on the attention values, and only
     // that.
-    {"k2-horizon", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "k2-horizon",
-     "attention values are a routed expert set of their own "
-     "(attn_v_exps/attn_v_gate); that is not implemented",
-     false, false, false, false, true, false},
+    //   * MoVA: the attention VALUES are a routed expert set of their own
+    //     (`attn_v_gate` + its optional bias + `attn_v_exps`), which is
+    //     Engine::mova_value -- selection on the BIASED probability, mixing with
+    //     the UNBIASED one, silu on each expert's output before the weight.
+    //   * a GROUPED RMS norm (`attention.group_norm_groups`): the reduction is
+    //     over each band of the row, the weight is elementwise over the whole
+    //     row. That is Backend::rmsnorm_bands, and it is NOT rmsnorm_grouped,
+    //     which takes a separate weight vector per group.
+    // Both are implemented and both are refused BY CAPABILITY on a backend that
+    // lacks the op, so a device path cannot silently run the ungrouped norm.
+    // What is left is the vision tower on the multimodal checkpoints; the text
+    // stack runs end to end and test_k2_horizon_mova pins it.
+    [] {
+        ArchSpec s{"k2-horizon", ArchShape::Moe, ArchSupport::Yes,
+                   ArchRole::Target, "k2-horizon", "", false, false, false,
+                   false, true, false};
+        // llama.cpp marks k2-horizon's wqkv_gate TENSOR_NOT_REQUIRED, so an
+        // ablated export is a legitimate file and must load ungated.
+        s.attn_gate_optional = true;
+        return s;
+    }(),
     // MiniMax's sparse-attention MoE. Listed rather than left to the fallback
     // because the fallback reads an unlisted file against llama defaults, and a
     // 428B MoE is the last model that should be run through a schema nobody
@@ -1233,10 +1262,22 @@ constexpr ArchSpec kTable[] = {
     // schema read off LLaDA2.2-flash and the reference decoding loop. The three
     // pieces this engine lacks are named here; the bidirectionality itself is
     // already reachable (the attention op has always taken a causal flag).
+    // The SAMPLER is done: src/diffusion.cpp is the reference's block schedule
+    // (base-plus-remainder transfer, candidates restricted to this block and to
+    // masked positions, confidence top-k, no rewriting of committed tokens), and
+    // test_diffusion_sampler drives it with a forward the test owns so every
+    // commitment is predictable. What is NOT done is everything around it: the
+    // `diffuse.*` loader schema (fused attn_qkv split, post_attn_norm mapped to
+    // the pre-FFN norm, moe_gate/moe_experts_* onto the MoE slots), the
+    // group-limited routing rule with its selection bias, and the cacheless
+    // bidirectional forward wired into Engine::generate. The row stays No and
+    // says so, in that order -- docs/LLaDA.md is the plan and now has one item
+    // fewer on it.
     {"diffuse", ArchShape::Diffusion, ArchSupport::No, ArchRole::Target, "diffuse",
-     "block-diffusion sampling, fused attn_qkv/qk-norm/post-attn-norm loading and "
-     "group-limited expert routing with a routing bias are not implemented yet "
-     "(docs/LLaDA.md)",
+     "the block-diffusion sampler runs (src/diffusion.cpp, pinned by "
+     "test_diffusion_sampler); the diffuse.* loader schema, the group-limited "
+     "expert routing with its bias, and the cacheless bidirectional forward in "
+     "Engine::generate are not implemented yet (docs/LLaDA.md)",
      true, false, false, false},
 };
 
@@ -1303,9 +1344,12 @@ constexpr GapTensor kGapTensors[] = {
     // but a repack that inlines them is still a V4.1 file, and the lookup is
     // part of the layer it sits in -- not a side table the engine may skip.
     {"engram_", "Engram conditional memory (engram_*)", false},
-    {"attn_v_exps.weight", "routed experts on the attention values (attn_v_exps)",
-     false},
-    {"attn_v_gate.", "a gate on the attention values (attn_v_gate)", false},
+    // SERVED, not gaps: attn_v_exps/attn_v_gate are MoVA, implemented by
+    // Engine::mova_value (see the k2-horizon row). They were the row's whole
+    // stated reason for No, and a refusal for a feature the engine now runs is
+    // worse than no entry at all -- it would refuse every k2-horizon file. The
+    // one thing that still refuses is a backend without the grouped-norm op,
+    // which is a capability check at init and not a tensor name.
     {"attn_kv_a.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false,
      GapTensor::Served::ByMlaFlag},
     {"attn_kv_b.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false,
