@@ -62,6 +62,7 @@
 #include "krk/hc.hpp"
 #include "krk/mova.hpp"
 #include "krk/diffusion.hpp"
+#include "krk/engram.hpp"
 #include "krk/mla.hpp"
 #include "krk/mla_shared.hpp"
 #include "krk/dsv4_route.hpp"
@@ -23600,6 +23601,168 @@ static void test_diffusion_sampler() {
     }
 }
 
+// ---- Engram: DeepSeek-V4.1's n-gram hash --------------------------------
+//
+// The hash is the whole interface between an Engram layer and its table, and
+// four of its rules are silent-wrong-answer if missed. Each gets an arm that
+// removes it and is measured:
+//   * rolling accumulation across shifts (vs recomputing per column),
+//   * one fewer column group than there are shifts (the token itself emits
+//     nothing -- it only seeds the running hash),
+//   * a dead shift poisons every LONGER shift, substituting the pad id,
+//   * a row past the table gathers zeros rather than the next tensor's bytes.
+static void test_engram_hash() {
+    // A 3-gram, 2 heads per n-gram -> 2 shifts x 2 heads = 4 columns.
+    const i32 n_gram = 3, hpn = 2;
+    const u64 mult[n_gram] = {0x9E3779B97F4A7C15ull, 0xD6E8FEB86659FD93ull,
+                              0xA24BAED4963EE407ull};
+    const u32 offs[4] = {1000, 2000, 3000, 4000};
+    const u32 primes[4] = {97, 101, 103, 107};
+    EngramModule m;
+    m.mult = mult;
+    m.offsets = offs;
+    m.vocab_sizes = primes;
+    m.n_gram = n_gram;
+    m.heads_per_ngram = hpn;
+    CHECK(m.valid() && m.n_cols() == 4,
+          "a 3-gram with 2 heads per n-gram has 4 columns, not 6");
+
+    // A token map that is the identity, so a raw token id IS its mapped id.
+    std::vector<u32> tokmap(64);
+    for (i32 i = 0; i < 64; i++) tokmap[(size_t)i] = (u32)i;
+    const i64 pad = 7;   // whatever the file says; the hash only substitutes it
+
+    i32 ids[4];
+    const i32 prev[2] = {11, 12};      // oldest first: window is 11 12 42
+    CHECK(engram_hash(ids, m, tokmap.data(), (i64)tokmap.size(), pad, 42, prev, 2),
+          "the hash runs");
+    std::fprintf(stderr, "[engram] ids %d %d %d %d\n", ids[0], ids[1], ids[2], ids[3]);
+
+    // ---- an independent re-derivation, in the reference's own order ----
+    {
+        // `prev` is OLDEST FIRST, so shift 1 (the nearest token) is prev[1]=12
+        // and shift 2 is prev[0]=11. Reading it the other way round is the
+        // mirror image of the same mistake the hash's own docs warn about.
+        u64 toks[3] = {42ull, 12ull, 11ull};
+        u64 roll = toks[0] * mult[0];
+        u32 ref[4];
+        for (i32 o = 1; o < n_gram; o++) {
+            roll ^= toks[o] * mult[o];
+            for (i32 h = 0; h < hpn; h++) {
+                const i32 col = (o - 1) * hpn + h;
+                ref[col] = (u32)(roll % primes[col] + (u64)offs[col]);
+            }
+        }
+        bool same = true;
+        for (i32 c = 0; c < 4; c++)
+            if (ids[c] != (i32)ref[c]) same = false;
+        CHECK(same, "the ids match an independent re-derivation");
+        // And they are inside each column's own bucket range.
+        bool in_range = true;
+        for (i32 c = 0; c < 4; c++)
+            if (ids[c] < (i32)offs[c] ||
+                ids[c] >= (i32)(offs[c] + primes[c]))
+                in_range = false;
+        CHECK(in_range, "and every id lands inside its column's bucket range");
+    }
+
+    // ---- arm: NOT rolling (each column hashed from its own shift only) ----
+    // The obvious wrong reading, and it produces ids that are all still IN
+    // RANGE -- so nothing downstream complains.
+    {
+        u64 toks[3] = {42ull, 11ull, 12ull};
+        u32 nb[4];
+        for (i32 o = 1; o < n_gram; o++)
+            for (i32 h = 0; h < hpn; h++) {
+                const i32 col = (o - 1) * hpn + h;
+                const u64 solo = toks[o] * mult[o];
+                nb[col] = (u32)(solo % primes[col] + (u64)offs[col]);
+            }
+        i32 ndiff = 0;
+        for (i32 c = 0; c < 4; c++) if (ids[c] != (i32)nb[c]) ndiff++;
+        std::fprintf(stderr, "[engram] arms: non-rolling differs in %d of 4 ids\n",
+                     ndiff);
+        CHECK(ndiff == 4, "a non-rolling hash gives a different id in every column");
+    }
+
+    // ---- arm: a dead shift poisons every longer shift ----
+    // Position 0 of a sequence has NO previous tokens: both shifts are dead, so
+    // every id must be the pad id's hash. Half a window (one live shift, one
+    // pad) must differ from a full one.
+    {
+        i32 at0[4], half[4];
+        CHECK(engram_hash(at0, m, tokmap.data(), (i64)tokmap.size(), pad, 42,
+                          nullptr, 0),
+              "the first position hashes");
+        const i32 p1[2] = {11, 12};
+        CHECK(engram_hash(half, m, tokmap.data(), (i64)tokmap.size(), pad, 42, p1, 1),
+              "a half window hashes");
+        // At position 0 both shifts are pad; the 3-gram is (42, pad, pad).
+        u64 toks[3] = {42ull, pad, pad};
+        u64 roll = toks[0] * mult[0];
+        i32 want[4];
+        for (i32 o = 1; o < n_gram; o++) {
+            roll ^= toks[o] * mult[o];
+            for (i32 h = 0; h < hpn; h++) {
+                const i32 col = (o - 1) * hpn + h;
+                want[col] = (i32)(roll % primes[col] + (u64)offs[col]);
+            }
+        }
+        bool ok = true;
+        for (i32 c = 0; c < 4; c++) if (at0[c] != want[c]) ok = false;
+        CHECK(ok, "an empty window hashes as the pad id in every shift, not as 0");
+        bool differs = at0[0] != half[0] || at0[2] != half[2];
+        CHECK(differs, "and a half window differs from it -- the pad is not a no-op");
+    }
+
+    // ---- arm: the token itself emits no column ----
+    // If the loop started at o = 0 there would be n_gram*heads = 6 columns; the
+    // module says 4 and the ids must be the (n_gram-1) groups only.
+    CHECK(m.n_cols() == 4, "the token itself seeds the hash and emits nothing");
+
+    // ---- the gather ----
+    {
+        const i64 row_bytes = 2, n_rows = 8;
+        std::vector<u8> table((size_t)(n_rows * row_bytes));
+        for (i64 r = 0; r < n_rows; r++) {
+            table[(size_t)(r * row_bytes)] = (u8)(0x10 + r);
+            table[(size_t)(r * row_bytes + 1)] = (u8)(0x20 + r);
+        }
+        const i32 want[4] = {3, 5, 9, 1};   // 9 is past the table
+        std::vector<u8> out(4 * row_bytes, 0xEE);
+        engram_gather(out.data(), table.data(), n_rows, row_bytes, want, 1, 4);
+        bool ok = true;
+        ok = ok && out[0] == 0x13 && out[1] == 0x23;      // row 3
+        ok = ok && out[2] == 0x15 && out[3] == 0x25;      // row 5
+        ok = ok && out[4] == 0 && out[5] == 0;           // row 9: zeroed
+        ok = ok && out[6] == 0x11 && out[7] == 0x21;      // row 1
+        std::fprintf(stderr, "[engram] gather %02x%02x %02x%02x %02x%02x %02x%02x\n",
+                     out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
+        CHECK(ok, "the gather copies rows and zeroes one past the table");
+    }
+
+    // ---- a malformed module is refused, not run ----
+    {
+        i32 ids2[4];
+        EngramModule bad = m;
+        bad.vocab_sizes = nullptr;
+        CHECK(!engram_hash(ids2, bad, tokmap.data(), (i64)tokmap.size(), pad, 1,
+                           nullptr, 0),
+              "a module with no bucket counts is refused");
+        bad = m;
+        bad.n_gram = 1;                       // no shifts, no columns
+        CHECK(!engram_hash(ids2, bad, tokmap.data(), (i64)tokmap.size(), pad, 1,
+                           nullptr, 0),
+              "and so is a 1-gram, which has nothing to hash");
+        const u32 zero_prime[4] = {97, 0, 103, 107};
+        bad = m;
+        bad.vocab_sizes = zero_prime;
+        CHECK(!engram_hash(ids2, bad, tokmap.data(), (i64)tokmap.size(), pad, 1,
+                           nullptr, 0),
+              "a zero bucket count traps the hash and is refused");
+    }
+}
+
 // ---- every `Yes` row: a file of its family, built from its own flags ------
 //
 // The same bargain as the pending pass, turned on the rows that already claim
@@ -27206,6 +27369,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_pending_model_fixtures)
     TEST_GROUP(test_pending_model_refusals)
     TEST_GROUP(test_yes_row_fixtures)
+    TEST_GROUP(test_engram_hash)
     TEST_GROUP(test_diffusion_sampler)
     TEST_GROUP(test_k2_horizon_mova)
     TEST_GROUP(test_mova_router)

@@ -968,7 +968,19 @@ constexpr ArchSpec kTable[] = {
     //
     // What it does NOT cover is Engram (a token-hash conditional-memory lookup,
     // 196 B parameters) and the 4-wide Sinkhorn hyper-connections, whose `hc_*`
-    // tensors are a DIFFERENT mixer from the one qwen4exp runs. A checkpoint
+    // tensors are a DIFFERENT mixer from the one qwen4exp runs.
+    //
+    // Both now have their ALGEBRA implemented and pinned, with the loader and
+    // the forward still to wire:
+    //   * hc_*: src/hc.cpp's hc_sinkhorn_* (the (2+hc)*hc split, the doubly
+    //     stochastic sinkhorn in the reference's order, the dst-major/file
+    //     index transposition) -- test_dsv4_sinkhorn_mixer.
+    //   * engram_*: src/engram.cpp's rolling n-gram hash, the shared
+    //     per_layer_tok_embd gather and the dead-shift/pad rule --
+    //     test_engram_hash.
+    // What is missing is the part that makes them RUN in a forward: the loader
+    // does not read the tensors yet, so a file carrying either is still refused
+    // by name, and the lane stack for this family is not wired. A checkpoint
     // that carries either is refused by name through the gap map rather than
     // loaded with the block skipped. A dense-core file -- every ratio 0, no
     // hc_*/engram_* -- loads and generates end to end
