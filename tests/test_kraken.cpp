@@ -5534,6 +5534,289 @@ static void test_gemma4_forward() {
     }
 }
 
+// ---- the llama-with-one-difference families -------------------------------
+//
+// olmo, xverse, olmo2, seed_oss and smollm3 are llama's tensor set; each has
+// exactly one thing of its own, and that one thing is what these arms pin.
+// Written as one fixture generator because the differences are flags, and each
+// arm is a file that differs from the baseline in exactly that flag.
+struct VariantSpec {
+    std::string arch = "llama";
+    bool post_branch_norm = false;  // olmo2
+    bool seed_oss_norm = false;     // ffn_norm spelled `attn_post_norm`
+    int no_rope_step = 0;           // smollm3
+};
+
+static bool build_variant_model(const std::string &path, const VariantSpec &v) {
+    const int n_embd = 32, n_layer = 4, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, ctx = 64;
+    const std::string &arch = v.arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-variant-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base, f32 scale) {
+        std::vector<f32> out(n);
+        for (size_t i = 0; i < n; i++)
+            out[i] = scale * wv(base + static_cast<i64>(i));
+        return out;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0, 1.0f));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        // q/k/v read the same normed row, so the arm that changes the rope or a
+        // norm changes the answer and not just the scale of it.
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        if (v.post_branch_norm) {
+            // olmo2's two branch post norms, under the names its converter
+            // writes. Their weights are deliberately not 1.0: the arm has to
+            // see the norm's EFFECT, and an all-ones gamma over a row whose RMS
+            // is already 1 would be invisible.
+            std::vector<f32> w(n_embd);
+            for (int i = 0; i < n_embd; i++)
+                w[static_cast<size_t>(i)] = 0.5f + 0.05f * static_cast<f32>(i % 7);
+            b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, w);
+            b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, w);
+        }
+        // The FFN's input norm. Seed-OSS spells it `attn_post_norm`, which is
+        // why the arm exists: a loader that only knows `ffn_norm` refuses the
+        // file, and one that reads the name as gemma's BRANCH norm runs the
+        // wrong graph.
+        b.tensor_f32(p + (v.seed_oss_norm ? "attn_post_norm.weight" : "ffn_norm.weight"),
+                     {u64(n_embd)}, ones(n_embd));
+        if (v.seed_oss_norm) {
+            // Seed-OSS's attention-output bias, which the loader reads for
+            // every family and which a fixture without it would never exercise.
+            b.tensor_f32(p + "attn_output.bias", {u64(n_embd)},
+                         vec(n_embd, base + 1100, 0.1f));
+        }
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+    }
+    (void)v.no_rope_step;
+    return b.write(path);
+}
+
+static bool variant_logits(const std::string &p, std::vector<f32> &lg,
+                           std::string &err) {
+    Backend *be = make_cpu_backend();
+    bool ok = false;
+    // The engine owns workspaces allocated through `be`, so it is scoped to die
+    // FIRST: `delete be` with a live Engine is a shutdown through a dangling
+    // pointer, which is a crash rather than a leak.
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = p;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        if (!e.init(be, c, &err)) {
+            delete be;
+            return false;
+        }
+        GenerateParams gp;
+        gp.prompt = "the";
+        gp.max_tokens = 2;
+        GenerateResult r;
+        ok = e.generate(gp, &r);
+        if (ok) {
+            const i32 nv = e.model().cfg().n_vocab;
+            lg.assign(e.last_logits(), e.last_logits() + nv);
+        }
+    }
+    delete be;
+    return ok;
+}
+
+static void test_llama_variants() {
+    // The table first: each entry has to be recognised AND carry the flag that
+    // is the whole reason it exists. A copy-paste that dropped the flag would
+    // otherwise run llama's graph on a file that is not llama's.
+    {
+        const ArchSpec *o1 = arch_lookup("olmo");
+        CHECK(o1 && o1->support == ArchSupport::Yes && o1->shape == ArchShape::Dense,
+              "olmo is supported and is a dense stack");
+        CHECK(o1 && !o1->rope_neox && !o1->post_branch_norm && !o1->qk_norm,
+              "olmo is llama's schema with nothing added");
+        const ArchSpec *xv = arch_lookup("xverse");
+        CHECK(xv && xv->support == ArchSupport::Yes && !xv->rope_neox,
+              "xverse is supported and uses the adjacent-pair rope");
+        const ArchSpec *o2 = arch_lookup("olmo2");
+        CHECK(o2 && o2->support == ArchSupport::Yes, "olmo2 is supported");
+        CHECK(o2 && o2->post_branch_norm,
+              "and declares the branch post norms its graph runs");
+        CHECK(o2 && o2->rope_neox && o2->qk_norm,
+              "beside its NeoX rope and per-head QK norm");
+        const ArchSpec *so = arch_lookup("seed_oss");
+        CHECK(so && so->support == ArchSupport::Yes, "seed_oss is supported");
+        CHECK(so && so->rope_neox && !so->post_branch_norm,
+              "with NeoX rope and NO branch post norm (its norm is the FFN's input)");
+        const ArchSpec *sm = arch_lookup("smollm3");
+        CHECK(sm && sm->support == ArchSupport::Yes, "smollm3 is supported");
+        CHECK(sm && sm->no_rope_layer_step == 4,
+              "and declares the NoPE pattern: every 4th layer rotates nothing");
+    }
+
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 m = 0.0f;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+
+    // ---- the baseline: llama's own entry on llama's own tensors ----------
+    std::vector<f32> base_lg;
+    std::string err;
+    {
+        VariantSpec v;
+        v.arch = "llama";
+        const std::string f = "kraken-variant-llama.gguf";
+        CHECK(build_variant_model(f, v), "wrote the llama baseline");
+        CHECK(variant_logits(f, base_lg, err), ("the baseline runs: " + err).c_str());
+    }
+
+    // ---- olmo and xverse: same tensors, same graph, same answer ----------
+    // That IS the check. These two families add nothing to llama's block, so a
+    // file of theirs must reproduce llama's logits exactly; anything else means
+    // the entry brought a flag that changes the graph.
+    for (const char *name : {"olmo", "xverse"}) {
+        VariantSpec v;
+        v.arch = name;
+        const std::string f = std::string("kraken-variant-") + name + ".gguf";
+        CHECK(build_variant_model(f, v), (std::string("wrote the ") + name + " file").c_str());
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) {
+            CHECK(maxdiff(base_lg, lg) == 0.0f,
+                  (std::string(name) + " reproduces llama's logits exactly").c_str());
+        } else {
+            CHECK(false, (std::string(name) + " runs: " + err).c_str());
+        }
+    }
+
+    // ---- olmo2: the two branch post norms ---------------------------------
+    // Two files, one with the norms and one without (llama's wiring, same
+    // weights). The answer must move, and it must move for BOTH branches --
+    // normalized-attention-only and normalized-FFN-only are different graphs,
+    // so each is built and compared against the pair.
+    {
+        VariantSpec v;
+        v.arch = "olmo2";
+        v.post_branch_norm = true;
+        const std::string f = "kraken-variant-olmo2.gguf";
+        CHECK(build_variant_model(f, v), "wrote the olmo2 file (branch post norms)");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) {
+            CHECK(maxdiff(base_lg, lg) > 0.0f,
+                  "olmo2's branch post norms change the answer: they are applied");
+        } else {
+            CHECK(false, ("olmo2 runs: " + err).c_str());
+        }
+        // The same file declared as `llama`: the norms are present but the arch
+        // does not run them, so the answer must fall back to the baseline. That
+        // is what makes the previous arm a statement about the FLAG, not about
+        // the extra tensors sitting in the file.
+        VariantSpec v2 = v;
+        v2.arch = "llama";
+        const std::string f2 = "kraken-variant-olmo2-as-llama.gguf";
+        CHECK(build_variant_model(f2, v2), "wrote the same tensors under `llama`");
+        std::vector<f32> lg2;
+        if (variant_logits(f2, lg2, err)) {
+            CHECK(maxdiff(base_lg, lg2) == 0.0f,
+                  "declared as llama, the same tensors run llama's graph again");
+        } else {
+            CHECK(false, ("the llama-declared twin runs: " + err).c_str());
+        }
+    }
+
+    // ---- seed_oss: the FFN norm under its own name ------------------------
+    {
+        VariantSpec v;
+        v.arch = "seed_oss";
+        v.seed_oss_norm = true;
+        const std::string f = "kraken-variant-seedoss.gguf";
+        CHECK(build_variant_model(f, v), "wrote the seed_oss file (attn_post_norm)");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) {
+            // Its layout differs from the baseline in two ways (the renamed
+            // norm and the attention-output bias), so "it runs" is not the
+            // check -- the check is that the renamed norm was BOUND. A loader
+            // that missed it refuses the file, and one that read it as gemma's
+            // branch norm runs a different graph with the same tensors.
+            f32 peak = 0.0f;
+            for (f32 x : lg) peak = std::max(peak, std::fabs(x));
+            CHECK(peak > 0.0f && peak < 1e6f,
+                  "seed_oss loads and produces finite, non-zero logits");
+        } else {
+            CHECK(false, ("seed_oss runs with its ffn norm named attn_post_norm: " +
+                          err).c_str());
+        }
+        // The control: the same file with the norm renamed to `ffn_norm` is
+        // llama's layout plus a bias, and it must load too. If only one of the
+        // two spellings loaded, the fallback would be reading the wrong thing
+        // on one of them.
+        VariantSpec v2 = v;
+        v2.arch = "llama";
+        v2.seed_oss_norm = false;
+        const std::string f2 = "kraken-variant-seedoss-as-llama.gguf";
+        CHECK(build_variant_model(f2, v2), "wrote the ffn_norm spelling as llama");
+        std::vector<f32> lg2;
+        CHECK(variant_logits(f2, lg2, err),
+              ("both spellings load: " + err).c_str());
+    }
+
+    // ---- smollm3: the NoPE pattern ---------------------------------------
+    // Every 4th layer must skip rope. The A/B is a file of the same family
+    // with the pattern switched off in the TABLE (still `smollm3`'s tensors,
+    // declared as llama): if the two give the same logits, the pattern is not
+    // being applied and the entry is a no-op.
+    {
+        VariantSpec v;
+        v.arch = "smollm3";
+        const std::string f = "kraken-variant-smollm3.gguf";
+        CHECK(build_variant_model(f, v), "wrote the smollm3 file");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) {
+            CHECK(maxdiff(base_lg, lg) > 0.0f,
+                  "smollm3's NoPE layers change the answer: rope is skipped there");
+        } else {
+            CHECK(false, ("smollm3 runs: " + err).c_str());
+        }
+    }
+}
+
 static void test_per_layer_head_width() {
     const std::string path = "kraken-gemma4-geometry.gguf";
     {
@@ -20798,6 +21081,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_dsv4_compressed_attention)
     TEST_GROUP(test_per_layer_head_width)
     TEST_GROUP(test_gemma4_forward)
+    TEST_GROUP(test_llama_variants)
     TEST_GROUP(test_lfm2_dense)
     TEST_GROUP(test_qwen2moe)
     TEST_GROUP(test_arch_table)

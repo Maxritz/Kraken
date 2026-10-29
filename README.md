@@ -1463,6 +1463,43 @@ measures the FFN and not the arch string.
 
 `kraken-tests` 5974/5974.
 
+### Five families that are llama with one thing: olmo, xverse, olmo2, seed_oss, smollm3
+
+Read against their own builders (`src/models/*.cpp` at llama.cpp `f5222f25`)
+rather than against their names, five more arch strings turned out to be llama's
+tensor set with exactly one difference each — which is a flag, not a graph:
+
+| family | the one thing | what it costs |
+|---|---|---|
+| `olmo` | nothing | an entry. NORM rope, ungated silu FFN, no biases |
+| `xverse` | nothing (partial rotary is per *file* metadata) | an entry |
+| `olmo2` | a post norm on **each** branch, NeoX rope, per-head QK norm | `post_branch_norm` + `rope_neox` + `qk_norm` |
+| `seed_oss` | its FFN input norm is spelled `attn_post_norm` | a loader fallback |
+| `smollm3` | every 4th layer rotates nothing (NoPE) | a per-layer rope gate |
+
+Two of those would have been *wrong answers*, not failures. **`seed_oss`** names
+its FFN pre-norm `attn_post_norm`, which reads exactly like gemma's branch post
+norm; the loader's fallback for that key is what makes the family run
+`ffn(norm(x + attn_out))` instead of post-norming the attention branch with it.
+**`smollm3`** has NoPE layers — `(l + 1) % 4 != 0` is when the reference applies
+rope — so rotating them anyway produces a fluent model that is not the model.
+Both now come from the arch entry (`no_rope_layer_step`), and the skip is in the
+forward, before the cache is written.
+
+`test_llama_variants` pins all five through real files. `olmo` and `xverse` must
+reproduce `llama`'s logits **exactly** — that is the check, since anything else
+means the entry brought a flag that changes the graph. `olmo2`'s branch norms
+move the answer, and the *same tensors* declared as `llama` fall back to the
+baseline, which is what makes the first arm a statement about the flag rather
+than about the extra tensors sitting in the file. `seed_oss` loads with its norm
+under either spelling. `smollm3` differs from a file of its own tensors declared
+as llama, which is the only way to see the NoPE pattern from the outside.
+
+One fixture bug worth recording, because the test caught it and the code did
+not: the new `variant_logits` helper deleted the backend while the `Engine` was
+still alive, and `Engine::~Engine` frees its workspaces *through that backend* —
+a shutdown through a dangling pointer. The engine is scoped to die first now.
+
 ### Fused projections: Phi-3 / Phi-4
 
 `phi3` is now a supported architecture. Phi-3 and Phi-4 store two fused

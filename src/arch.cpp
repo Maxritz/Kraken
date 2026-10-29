@@ -430,6 +430,54 @@ constexpr ArchSpec kTable[] = {
     // so the entry is the qwen2 flags plus the MoE shape.
     {"qwen2moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "qwen2", "",
      false, false, true, false, false, true, 0, false, /*expert_w_norm=*/0},
+    // ---- llama's schema with a piece renamed, a flag, or a scalar ---------
+    // Five families whose graphs are llama's, each with one thing of its own.
+    // The reference is `src/models/*.cpp` at llama.cpp f5222f25; every claim
+    // below is read off that family's own builder, not inferred from the name.
+    //
+    // OLMo (allenai OLMo-1/2 7B/1B): llama's tensors, llama's NORM rope
+    // pairing, an ungated-silu FFN and no biases anywhere. Nothing to add.
+    {"olmo", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
+     false, false, false, false},
+    // XVERSE: the same, and the same rope pairing. Its 40B/65B checkpoints
+    // carry a partial-rotary `rope.dimension_count`, which is read per model
+    // rather than per arch.
+    {"xverse", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
+     false, false, false, false},
+    // OLMo 2/3: per-head QK norm (head-width weights, the qwen3 shape) and the
+    // NEOX rope pairing, and -- the part that is not llama -- a post norm on
+    // EACH branch before it is added:
+    //     x += attn_post_norm(attn(attn_norm(x)))
+    //     x += ffn_post_norm(ffn(ffn_norm(x)))
+    // which is gemma2/3's `post_branch_norm` with different tensor names
+    // (`post_attention_norm` / `post_ffw_norm`, which the loader already binds
+    // under that flag) and OLMo's own rope.
+    [] {
+        ArchSpec s{"olmo2", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+                   "llama", "", /*qk_norm=*/true, /*q_output_gate=*/false,
+                   /*qkv_bias=*/false, /*gemma_norm=*/false,
+                   /*attn_gate=*/false, /*rope_neox=*/true};
+        s.post_branch_norm = true;
+        return s;
+    }(),
+    // Seed-OSS: NEOX rope, silu FFN, an `attn_output.bias`, and its FFN input
+    // norm named `attn_post_norm` -- the reference computes
+    // `ffn(build_norm(x + attn_out, attn_post_norm))`, i.e. that tensor is the
+    // FFN's PRE norm and the attention branch is not post-normed at all. The
+    // name reads like gemma's branch norm, so the loader's fallback for it is
+    // what makes this family run the right graph instead of a plausible one.
+    {"seed_oss", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
+     false, false, false, false, false, true},
+    // SmolLM3: llama's schema and rope pairing plus a NoPE pattern -- every
+    // fourth layer rotates nothing (`n_no_rope_layer_step = 4` in the
+    // reference; `(l + 1) % 4 != 0` is when rope runs) -- and an
+    // `attn_output.bias`, which the loader reads for every family.
+    [] {
+        ArchSpec s{"smollm3", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+                   "llama", "", false, false, false, false};
+        s.no_rope_layer_step = 4;
+        return s;
+    }(),
     // OLMoE: llama-shaped attention whose QK norm is WIDE -- the weight spans
     // n_head*hd, one RMS over the whole projected row, not one per head -- and a
     // top-8 softmax MoE that uses the router probabilities as they come out of

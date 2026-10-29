@@ -3814,9 +3814,16 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // fused arm's copy of it lives in registers and never lands
             // in this buffer, so this row covers the separate chain only.
             dump_row("attn.qk", l, ws_q_, lq, n);
-            be_->rope(ws_q_, ws_k_, lh, lkvh, d.hd,
-                      n, pos0, model_.inv_freq_at(l).data(), mc.rope_scale,
-                      model_.rope_frac_at(l), mc.rope_neox);
+            // smollm3's NoPE layers rotate nothing: the pattern is part of the
+            // architecture (every 4th layer), so skipping it here is what the
+            // file was trained with. Rotating anyway is a wrong answer that
+            // still decodes.
+            const bool layer_rotates =
+                !(mc.no_rope_step > 0 && ((l + 1) % mc.no_rope_step) == 0);
+            if (layer_rotates)
+                be_->rope(ws_q_, ws_k_, lh, lkvh, d.hd,
+                          n, pos0, model_.inv_freq_at(l).data(), mc.rope_scale,
+                          model_.rope_frac_at(l), mc.rope_neox);
             // A shared-KV layer appends nothing: the layer that owns this
             // plane wrote these rows already, and a second write would put the
             // token at two positions in one cache.
