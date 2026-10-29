@@ -14674,7 +14674,8 @@ static PrefillProbe run_prefill_hash(const std::string &exe,
 // for byte what the good fixture has, so a row that moves here moved because
 // the mixer's own arithmetic contributed something different to the residual.
 static bool build_lfm2_gate_model(const std::string &path, int ctx = 64,
-                                  bool bad_tap = false) {
+                                  bool bad_tap = false,
+                                  f32 norm_bias = 0.0f) {
     const int n_embd = 64, n_layer = 3, n_head = 4, hd = 16, n_kv = 2;
     const int n_ff = 64, n_exp = 8, n_used = 3, ff_exp = 32;
     const int vocab = 261;
@@ -14718,6 +14719,16 @@ static bool build_lfm2_gate_model(const std::string &path, int ctx = 64,
         const std::string p = "blk." + std::to_string(l) + ".";
         b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
         b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        // LFM2's norms carry a bias (llama.cpp's lfm2.cpp:60/68 creates
+        // `attn_norm.bias` and `ffn_norm.bias` with no OPTIONAL flag). Written
+        // only when asked, so a twin pair measures whether the engine reads it
+        // rather than assuming either way.
+        if (norm_bias != 0.0f) {
+            b.tensor_f32(p + "attn_norm.bias", {u64(n_embd)},
+                         std::vector<f32>(n_embd, norm_bias));
+            b.tensor_f32(p + "ffn_norm.bias", {u64(n_embd)},
+                         std::vector<f32>(n_embd, norm_bias));
+        }
         if (l < 2) {
             b.tensor_f16(p + "shortconv.in_proj.weight",
                          {u64(n_embd), u64(3 * n_embd)},
@@ -22419,6 +22430,36 @@ static void test_yes_row_fixtures() {
         }
         std::remove("kraken-row-phimoe-b0.gguf");
         std::remove("kraken-row-phimoe-b5.gguf");
+    }
+        // ---- lfm2moe, and the bias its norms carry ----
+    // Measured because it is the same question as Phi-MoE above: llama.cpp's
+    // lfm2.cpp creates `attn_norm.bias`/`ffn_norm.bias` on every layer, and the
+    // row says nothing about them.
+    {
+        CHECK(build_lfm2_gate_model("kraken-row-lfm2-b0.gguf", 64, false, 0.0f),
+              "wrote lfm2 A");
+        CHECK(build_lfm2_gate_model("kraken-row-lfm2-b5.gguf", 64, false, 0.5f),
+              "wrote lfm2 B");
+        std::vector<f32> l0, l1;
+        std::string e0, e1;
+        const bool ok0 = variant_logits("kraken-row-lfm2-b0.gguf", l0, e0);
+        const bool ok1 = variant_logits("kraken-row-lfm2-b5.gguf", l1, e1);
+        if (!ok0) std::fprintf(stderr, "[row] lfm2 A: %s\n", e0.c_str());
+        if (!ok1) std::fprintf(stderr, "[row] lfm2 B: %s\n", e1.c_str());
+        CHECK(ok0 && ok1, "both lfm2 twins run");
+        if (ok0 && ok1 && l0.size() == l1.size()) {
+            f32 md = 0.0f, peak = 0.0f;
+            for (size_t i = 0; i < l0.size(); i++) {
+                md = std::max(md, std::fabs(l0[i] - l1[i]));
+                peak = std::max(peak, std::fabs(l0[i]));
+            }
+            std::fprintf(stderr, "[row] lfm2 norm bias: md %.8g at peak %.6g\n",
+                         static_cast<double>(md), static_cast<double>(peak));
+            CHECK(md > 1e-4f,
+                  "the LFM2 norm bias reaches the graph");
+        }
+        std::remove("kraken-row-lfm2-b0.gguf");
+        std::remove("kraken-row-lfm2-b5.gguf");
     }
     // ---- qwen35: the dense sibling of the gated delta net above ----
     // Every full-attention-interval'th layer attends (with the packed per-head
