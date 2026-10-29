@@ -22785,6 +22785,251 @@ static void test_gpt_oss_whole_graph() {
     std::remove("kraken-gptoss-full.gguf");
 }
 
+// ---- DeepSeek-V4.1's Sinkhorn hyper-connections ---------------------------
+//
+// The mixer itself, before any file is built: hc_sinkhorn_split() turns one
+// `mixes` row into (pre, post, comb) and comb has to end up doubly stochastic,
+// because that is what stops a 60-sublayer lane stack from drifting in scale.
+//
+// The oracle here is an INDEPENDENT re-derivation of the reference order written
+// straight from llama.cpp's build_hc_mixes/build_hc_sinkhorn (softmax over dst,
+// +eps, then sources-only, then (iters-1) x destinations-then-sources), so a
+// transposed layout or a swapped first pass shows up as a number and not as a
+// comment. Two arms then remove one rule each and must move the result:
+//   * destinations normalised before sources on the first pass,
+//   * eps dropped from the normalisers (kept only after the softmax).
+static void test_dsv4_sinkhorn_mixer() {
+    const i32 hc = 4, ne = 6;
+    const i32 iters = 3;
+    const f32 eps = 0.05f;
+    HcSinkhornGeometry g;
+    g.n_embd = ne;
+    g.hc = hc;
+    g.sinkhorn_iters = iters;
+    g.eps = eps;
+    CHECK(g.valid(), "the geometry is a mixer");
+    CHECK(g.mix_dim() == (2 + hc) * hc, "mix_dim is (2+hc)*hc, the reference's");
+
+    // A mixes row with a spread of magnitudes, positive and negative, so a
+    // missing scale or a missing eps cannot hide in a symmetric case.
+    std::vector<f32> mix(static_cast<size_t>(g.mix_dim()));
+    for (size_t i = 0; i < mix.size(); i++)
+        mix[i] = 1.7f * std::sin(0.9f * static_cast<f32>(i) + 0.3f);
+    const f32 scale[3] = {1.3f, 0.8f, 1.1f};
+    std::vector<f32> base(static_cast<size_t>(g.mix_dim()));
+    for (size_t i = 0; i < base.size(); i++)
+        base[i] = 0.4f * std::cos(0.5f * static_cast<f32>(i)) - 0.1f;
+
+    std::vector<f32> pre(hc), post(hc), comb(static_cast<size_t>(hc) * hc, 0.0f);
+    hc_sinkhorn_split(pre.data(), post.data(), comb.data(), mix.data(), scale,
+                      base.data(), 1, g);
+
+    // ---- the same thing again, independently, in the FILE's layout ----
+    // dst-major rows, as in hc.cpp; written out longhand on purpose.
+    auto sig = [](f32 x) { return 1.0f / (1.0f + std::exp(-x)); };
+    std::vector<f32> ref_pre(hc), ref_post(hc), ref_comb(static_cast<size_t>(hc) * hc, 0.0f);
+    for (i32 c = 0; c < hc; c++) {
+        ref_pre[c] = sig(mix[c] * scale[0] + base[c]) + eps;
+        ref_post[c] = 2.0f * sig(mix[hc + c] * scale[1] + base[hc + c]);
+    }
+    for (i32 d = 0; d < hc; d++)
+        for (i32 s = 0; s < hc; s++) {
+            const i64 k = d + static_cast<i64>(hc) * s;   // file index: dim0=dst
+            ref_comb[static_cast<size_t>(d) * hc + s] =
+                mix[2 * hc + k] * scale[2] + base[2 * hc + k];
+        }
+    // softmax over dst, per src
+    for (i32 s = 0; s < hc; s++) {
+        f32 mx = -1e30f, sum = 0.0f;
+        for (i32 d = 0; d < hc; d++)
+            mx = std::max(mx, ref_comb[static_cast<size_t>(d) * hc + s]);
+        for (i32 d = 0; d < hc; d++) {
+            f32 &v = ref_comb[static_cast<size_t>(d) * hc + s];
+            v = std::exp(v - mx);
+            sum += v;
+        }
+        for (i32 d = 0; d < hc; d++) ref_comb[static_cast<size_t>(d) * hc + s] /= sum;
+    }
+    for (auto &v : ref_comb) v += eps;
+    auto over_src = [&](std::vector<f32> &m) {
+        for (i32 d = 0; d < hc; d++) {
+            f32 sum = 0.0f;
+            for (i32 s = 0; s < hc; s++) sum += m[static_cast<size_t>(d) * hc + s];
+            for (i32 s = 0; s < hc; s++) m[static_cast<size_t>(d) * hc + s] /= (sum + eps);
+        }
+    };
+    auto over_dst = [&](std::vector<f32> &m) {
+        for (i32 s = 0; s < hc; s++) {
+            f32 sum = 0.0f;
+            for (i32 d = 0; d < hc; d++) sum += m[static_cast<size_t>(d) * hc + s];
+            for (i32 d = 0; d < hc; d++) m[static_cast<size_t>(d) * hc + s] /= (sum + eps);
+        }
+    };
+    over_src(ref_comb);
+    for (i32 it = 1; it < iters; it++) {
+        over_dst(ref_comb);
+        over_src(ref_comb);
+    }
+
+    f32 dp = 0.0f, dq = 0.0f, dc = 0.0f;
+    for (i32 c = 0; c < hc; c++) {
+        dp = std::max(dp, std::fabs(pre[c] - ref_pre[c]));
+        dq = std::max(dq, std::fabs(post[c] - ref_post[c]));
+    }
+    for (size_t i = 0; i < comb.size(); i++)
+        dc = std::max(dc, std::fabs(comb[i] - ref_comb[i]));
+    std::fprintf(stderr, "[hc] pre max|d| %.9f  post max|d| %.9f  comb max|d| %.9f\n",
+                 (double)dp, (double)dq, (double)dc);
+    CHECK(dp < 1e-6f, "pre matches the reference pre-mix");
+    CHECK(dq < 1e-6f, "post matches the reference post-mix");
+    CHECK(dc < 1e-6f, "comb matches the reference sinkhorn");
+
+    // ---- the property the sinkhorn exists for: comb is doubly stochastic ----
+    f32 worst_row = 0.0f, worst_col = 0.0f;
+    for (i32 d = 0; d < hc; d++) {
+        f32 rs = 0.0f;
+        for (i32 s = 0; s < hc; s++) rs += comb[static_cast<size_t>(d) * hc + s];
+        worst_row = std::max(worst_row, std::fabs(rs - 1.0f));
+    }
+    for (i32 s = 0; s < hc; s++) {
+        f32 cs = 0.0f;
+        for (i32 d = 0; d < hc; d++) cs += comb[static_cast<size_t>(d) * hc + s];
+        worst_col = std::max(worst_col, std::fabs(cs - 1.0f));
+    }
+    std::fprintf(stderr, "[hc] comb row-sum err %.6f  col-sum err %.6f (eps %.3f, %d pass(es))\n",
+                 (double)worst_row, (double)worst_col, (double)eps, iters);
+    // eps is added at every step, so the sums land within it rather than on 1.
+    CHECK(worst_row < 4.0f * eps, "every destination row sums to 1 within eps");
+    CHECK(worst_col < 4.0f * eps, "every source column sums to 1 within eps");
+
+    // ---- arm 1: destinations before sources on the first pass ----
+    {
+        std::vector<f32> m = ref_comb;
+        for (i32 s = 0; s < hc; s++) {   // rebuild the pre-normalised matrix
+            for (i32 d = 0; d < hc; d++) {
+                const i64 k = d + static_cast<i64>(hc) * s;
+                m[static_cast<size_t>(d) * hc + s] =
+                    mix[2 * hc + k] * scale[2] + base[2 * hc + k];
+            }
+        }
+        for (i32 s = 0; s < hc; s++) {
+            f32 mx = -1e30f, sum = 0.0f;
+            for (i32 d = 0; d < hc; d++)
+                mx = std::max(mx, m[static_cast<size_t>(d) * hc + s]);
+            for (i32 d = 0; d < hc; d++) {
+                f32 &v = m[static_cast<size_t>(d) * hc + s];
+                v = std::exp(v - mx);
+                sum += v;
+            }
+            for (i32 d = 0; d < hc; d++) m[static_cast<size_t>(d) * hc + s] /= sum;
+        }
+        for (auto &v : m) v += eps;
+        over_dst(m);                      // WRONG order on purpose
+        for (i32 it = 1; it < iters; it++) {
+            over_dst(m);
+            over_src(m);
+        }
+        f32 md = 0.0f;
+        for (size_t i = 0; i < comb.size(); i++)
+            md = std::max(md, std::fabs(comb[i] - m[i]));
+        std::fprintf(stderr, "[hc] arms: first-pass-dst max|d| %.6f\n", (double)md);
+        CHECK(md > 1e-3f, "normalising destinations before sources moves the matrix");
+    }
+
+    // ---- arm 2: the normalisers without eps in their denominators ----
+    // The same matrix and the same pass order, with the one rule removed that
+    // "eps is added inside every normaliser". The reference adds it there for a
+    // reason: a row that has underflowed to zero would otherwise divide by
+    // zero. Dropping it changes the matrix, which is what makes the rule
+    // testable rather than a comment.
+    {
+        auto over_src_ne = [&](std::vector<f32> &m) {
+            for (i32 d = 0; d < hc; d++) {
+                f32 sum = 0.0f;
+                for (i32 s = 0; s < hc; s++) sum += m[static_cast<size_t>(d) * hc + s];
+                for (i32 s = 0; s < hc; s++) m[static_cast<size_t>(d) * hc + s] /= sum;
+            }
+        };
+        auto over_dst_ne = [&](std::vector<f32> &m) {
+            for (i32 s = 0; s < hc; s++) {
+                f32 sum = 0.0f;
+                for (i32 d = 0; d < hc; d++) sum += m[static_cast<size_t>(d) * hc + s];
+                for (i32 d = 0; d < hc; d++) m[static_cast<size_t>(d) * hc + s] /= sum;
+            }
+        };
+        // Rebuild the post-softmax(+eps) matrix exactly as hc_sinkhorn_split does.
+        std::vector<f32> m(static_cast<size_t>(hc) * hc, 0.0f);
+        for (i32 d = 0; d < hc; d++)
+            for (i32 s = 0; s < hc; s++) {
+                const i64 k = static_cast<i64>(d) + static_cast<i64>(hc) * s;
+                m[static_cast<size_t>(d) * hc + s] =
+                    mix[2 * hc + k] * scale[2] + base[2 * hc + k];
+            }
+        for (i32 s = 0; s < hc; s++) {          // softmax over dst
+            f32 mx = -1e30f, sum = 0.0f;
+            for (i32 d = 0; d < hc; d++)
+                mx = std::max(mx, m[static_cast<size_t>(d) * hc + s]);
+            for (i32 d = 0; d < hc; d++) {
+                f32 &v = m[static_cast<size_t>(d) * hc + s];
+                v = std::exp(v - mx);
+                sum += v;
+            }
+            for (i32 d = 0; d < hc; d++) m[static_cast<size_t>(d) * hc + s] /= sum;
+        }
+        for (auto &v : m) v += eps;
+        over_src_ne(m);
+        for (i32 it = 1; it < iters; it++) {
+            over_dst_ne(m);
+            over_src_ne(m);
+        }
+        f32 md = 0.0f;
+        for (size_t i = 0; i < comb.size(); i++)
+            md = std::max(md, std::fabs(comb[i] - m[i]));
+        std::fprintf(stderr, "[hc] arms: eps-outside-normaliser max|d| %.6f\n",
+                     (double)md);
+        CHECK(md > 1e-4f, "eps inside the normalisers is load-bearing, not cosmetic");
+    }
+
+    // ---- pre collapses, post scatters: the two ends of a sub-block ----
+    {
+        const i32 n = 2;
+        std::vector<f32> lanes(static_cast<size_t>(n) * hc * ne);
+        for (size_t i = 0; i < lanes.size(); i++)
+            lanes[i] = 0.1f * static_cast<f32>(i % 13) - 0.6f;
+        std::vector<f32> p1(static_cast<size_t>(n) * hc, 1.0f);
+        std::vector<f32> out(static_cast<size_t>(n) * ne, 0.0f);
+        hc_sinkhorn_pre(out.data(), lanes.data(), p1.data(), n, g);
+        f32 md = 0.0f;
+        for (i32 t = 0; t < n; t++)
+            for (i32 e = 0; e < ne; e++) {
+                f32 sum = 0.0f;
+                for (i32 c = 0; c < hc; c++)
+                    sum += lanes[(static_cast<i64>(t) * hc + c) * ne + e];
+                md = std::max(md, std::fabs(out[static_cast<size_t>(t) * ne + e] - sum));
+            }
+        CHECK(md < 1e-6f, "an all-ones pre-mix is the sum of the lanes");
+
+        // comb = identity, post = 1: every lane keeps its own value and gains one
+        // copy of the block output.
+        std::vector<f32> ident(static_cast<size_t>(hc) * hc, 0.0f);
+        for (i32 c = 0; c < hc; c++) ident[static_cast<size_t>(c) * hc + c] = 1.0f;
+        std::vector<f32> ones(static_cast<size_t>(n) * hc, 1.0f);
+        std::vector<f32> bo(static_cast<size_t>(n) * ne, 0.25f);
+        std::vector<f32> lanes2(static_cast<size_t>(n) * hc * ne);
+        std::vector<f32> idn(static_cast<size_t>(n) * hc * hc);
+        for (i32 t = 0; t < n; t++)
+            std::copy(ident.begin(), ident.end(),
+                      idn.begin() + static_cast<i64>(t) * hc * hc);
+        hc_sinkhorn_post(lanes2.data(), lanes.data(), bo.data(), ones.data(),
+                         idn.data(), n, g);
+        md = 0.0f;
+        for (size_t i = 0; i < lanes.size(); i++)
+            md = std::max(md, std::fabs(lanes2[i] - (lanes[i] + 0.25f)));
+        std::fprintf(stderr, "[hc] post identity max|d| %.9f\n", (double)md);
+        CHECK(md < 1e-6f, "an identity comb with post 1 is a residual add");
+    }
+}
+
 // ---- every `Yes` row: a file of its family, built from its own flags ------
 //
 // The same bargain as the pending pass, turned on the rows that already claim
@@ -26391,6 +26636,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_pending_model_fixtures)
     TEST_GROUP(test_pending_model_refusals)
     TEST_GROUP(test_yes_row_fixtures)
+    TEST_GROUP(test_dsv4_sinkhorn_mixer)
     TEST_GROUP(test_gpt_oss_whole_graph)
     TEST_GROUP(test_dflash_qwen35_spelling)
     TEST_GROUP(test_minicpm_embedding_scale_forward)
