@@ -3605,6 +3605,109 @@ void dot_q8_0_q8_x8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
         out[static_cast<i64>(r) * out_stride] = _mm512_reduce_add_ps(acc[r]);
 }
 
+// ---- eight-row q8_0 GEMM with a hoisted scale table ------------------------
+//
+// What the uop count of dot_q8_0_q8_x8_vnni says. Per 512 MACs (two 32-blocks
+// against eight activation rows) that kernel issues roughly 110 uops, of which
+// eight are vpdpbusd. The other ~102 are:
+//
+//   * ~10 to pluck the two f16 block halves out of the row and convert them
+//     (_mm_setr_epi16 fished byte by byte, vcvtph2ps, two shuffles) -- per
+//     block pair, and the SAME bytes for every activation row;
+//   * 7 per row to build the [d0*dx x8, d1*dx x8] scale vector: two f32 loads,
+//     two multiplies, two broadcasts, one insert;
+//   * 1 per row to convert int32 to float, 1 to multiply-add.
+//
+// The first two are independent of the activation row, so they can be paid once
+// per row TILE instead of once per row. That is what this table does: for each
+// block pair and each of the eight rows it stores the two finished scale
+// products, 32 bytes per row per block pair. (Storing the finished 512-bit
+// vector instead costs 64 bytes per row per block pair -- more traffic than the
+// 64 bytes of activation the row already streams -- and measured 5.5x slower.
+// Eight bytes per row is the whole point.)
+//
+// This leaves ~6 uops per row per block pair against 12, and drops the header
+// to two vector loads.
+void build_q8_0_scales8(const u8 *w, const f32 *dx, i64 dstride, i64 n,
+                        f32 *tab) {
+    const i64 npair = (n / 32) / 2;
+    for (i64 p = 0; p < npair; p++) {
+        const u8 *wp = w + p * 68;
+        const __m128i two = _mm_setr_epi16(
+            static_cast<short>(wp[0] | (static_cast<u16>(wp[1]) << 8)),
+            static_cast<short>(wp[34] | (static_cast<u16>(wp[35]) << 8)), 0, 0, 0,
+            0, 0, 0);
+        const __m128 d2 = _mm_cvtph_ps(two);
+        const f32 d0 = _mm_cvtss_f32(d2);
+        const f32 d1 = _mm_cvtss_f32(_mm_shuffle_ps(d2, d2, 0x55));
+        f32 *t = tab + p * 16;
+        for (i32 r = 0; r < 8; r++) {
+            const f32 *xr = dx + static_cast<i64>(r) * dstride + p * 2;
+            t[r * 2] = d0 * xr[0];
+            t[r * 2 + 1] = d1 * xr[1];
+        }
+    }
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
+void dot_q8_0_q8_tab8_vnni(const u8 *w, const i8 *xq, i64 n, i64 rstride,
+                           f32 *out, i64 out_stride, const f32 *tab) {
+    const i64 nb = n / 32;
+    const __m512i zero = _mm512_setzero_si512();
+    __m512 acc[8];
+    for (i32 r = 0; r < 8; r++) acc[r] = _mm512_setzero_ps();
+    i64 p = 0;
+    for (i64 b = 0; b + 2 <= nb; b += 2, w += 68, p++) {
+        const __m256i lo =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i hi =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 36));
+        const __m512i wv = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+        const __mmask64 neg = _mm512_cmp_epi8_mask(wv, zero, _MM_CMPINT_LT);
+        const __m512i mag = _mm512_mask_sub_epi8(wv, neg, zero, wv);
+        const f32 *t = tab + p * 16;
+        for (i32 r = 0; r < 8; r++) {
+            const __m512i xv = _mm512_loadu_si512(reinterpret_cast<const void *>(
+                xq + static_cast<i64>(r) * rstride + b * 32));
+            const __m512i xb = _mm512_mask_sub_epi8(xv, neg, zero, xv);
+            const __m512i iv = _mm512_dpbusd_epi32(zero, mag, xb);
+            const __m512 sc = _mm512_castsi512_ps(_mm512_inserti64x4(
+                _mm512_castps_si512(_mm512_castps256_ps512(
+                    _mm256_broadcast_ss(t + r * 2))),
+                _mm256_castps_si256(_mm256_broadcast_ss(t + r * 2 + 1)), 1));
+            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iv), sc, acc[r]);
+        }
+    }
+    for (i32 r = 0; r < 8; r++)
+        out[static_cast<i64>(r) * out_stride] = _mm512_reduce_add_ps(acc[r]);
+}
+
+// Public feature probe. Defined here, outside the anonymous namespace that
+// holds cpu_has_vnni(), so callers in other translation units can ask without
+// the name collision that a bare re-declaration of cpu_has_vnni() causes.
+bool q8_0_tab_supported(void) {
+#if defined(KRK_DOT_AVX512)
+    return cpu_has_vnni();
+#else
+    return false;
+#endif
+}
+
+// Table entry. Falls back to the no-table kernel whenever the table cannot be
+// used, so the result is identical on every host.
+void dot_q8_0_q8_tab8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                      i64 rstride, i64 dstride, f32 *out, i64 out_stride,
+                      const f32 *tab) {
+#if defined(KRK_DOT_AVX512)
+    if (tab != nullptr && cpu_has_vnni() && ((n / 32) & 1) == 0) {
+        dot_q8_0_q8_tab8_vnni(w, xq, n, rstride, out, out_stride, tab);
+        return;
+    }
+#endif
+    (void)tab;
+    dot_q8_0_q8_x8(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+
 // One rung, named explicitly. -1 = scalar, 1 = avx2, 2 = avx512bw, 3 = vnni.
 // Falls through to whatever the host can actually run, so asking for an absent
 // rung is never a crash. Exposed for tools/ta_q80_tiers.cpp; production code
