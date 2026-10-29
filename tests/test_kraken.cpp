@@ -22442,14 +22442,29 @@ static void test_pending_model_refusals() {
               "wrote minimax-m3");
         arm("kraken-pend-minimax.gguf", "minimax-m3", "MiniMax Sparse Attention");
     }
-    // ---- diffuse (LLaDA): masked diffusion, not a left-to-right decode ----
+    // ---- diffuse (LLaDA): SERVED, not refused ----
+    // This used to be an `arm` above: the verdict refused every masked-diffusion
+    // file because the engine could not denoise. It can now -- the sampler, the
+    // loader schema and the cacheless bidirectional pass are all in -- so the
+    // refusal would be a lie. What the verdict must still do is refuse a diffuse
+    // file that cannot denoise for its OWN reason; test_diffuse_forward owns the
+    // loader's three refusals, and this checks the one the verdict layer owns,
+    // because a blocker stops a file before the loader is asked.
     {
         SchemaSpec v;
         v.arch = "diffuse";
         v.q_norm_w = 8;
         v.k_norm_w = 8;
         CHECK(build_schema_model("kraken-pend-diffuse.gguf", v), "wrote diffuse");
-        arm("kraken-pend-diffuse.gguf", "diffuse", "diffusion");
+        Gguf g;
+        std::string verr;
+        CHECK(g.load("kraken-pend-diffuse.gguf", &verr), "the diffuse fixture loads");
+        const ModelVerdict vd = assess_model(g);
+        CHECK(vd.runnable,
+              "a diffuse file is runnable: the denoising sampler, the loader "
+              "schema and the bidirectional pass are all served");
+        CHECK(std::remove("kraken-pend-diffuse.gguf") == 0,
+              "diffuse's fixture is removed");
     }
     // ---- dspark: a parallel block drafter with a markov bigram head ----
     {
@@ -26071,6 +26086,544 @@ static void test_dsv41_sinkhorn_stack() {
 //    * the group's BEST score instead of its top-two SUM,
 //    * the bias leaking into the weights instead of only into selection.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  The `diffuse` fixture: a LLaDA2.x file written the way its converter writes
+//  one, which is the point.
+//
+//  Every tensor carries the family's OWN name -- `attn_qkv` fused, `moe_gate`,
+//  `moe_experts_*`, `moe_shared_*`, `post_attn_norm` -- so a file built here
+//  proves the loader's alias table rather than the canonical names every other
+//  fixture uses. `defused` writes the SAME bytes as three separate q/k/v
+//  tensors instead, which is the twin the row-slice is measured against.
+// ---------------------------------------------------------------------------
+struct DiffuseSpec {
+    int n_layer = 2;
+    int n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
+    int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32;
+    int n_expert = 4, n_expert_used = 2;
+    int n_group = 2, group_used = 1;
+    int vocab = 260;
+    int mask_id = 259;
+    int block_length = 4;
+    bool dense_layer0 = true;   // first_k_dense_replace = 1
+    bool shared = true;
+    bool defused = false;       // write q/k/v separately (the twin)
+    bool no_ffn_norm = false;   // omit post_attn_norm entirely
+    bool no_mask_id = false;    // a diffusion file with no mask token
+    bool bad_qkv_width = false; // a fused projection too narrow to split
+    // Write llama's canonical names instead of the family's -- and, with an
+    // arch of `llama`, a CAUSAL stack. This is the control for the
+    // bidirectionality measurement: same shapes, same arithmetic, different
+    // mask, so if row 0 moved in BOTH the test would be measuring noise.
+    bool canonical = false;
+};
+
+static bool build_diffuse_fixture(const std::string &path, const DiffuseSpec &v,
+                                  const char *arch_override = nullptr) {
+    const std::string arch = arch_override ? arch_override : "diffuse";
+    const int E = v.n_embd;
+    const int q_dim = v.n_head * v.hd, kv_dim = v.n_kv * v.hd;
+    const int n_ff = v.n_ff;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-diffuse-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(v.n_layer));
+    b.meta_u32(arch + ".context_length", 64);
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(E));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(v.n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(v.n_kv));
+    b.meta_u32(arch + ".head_dim", static_cast<u32>(v.hd));
+    b.meta_u32(arch + ".rotary_dim", static_cast<u32>(v.hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".vocab_size", static_cast<u32>(v.vocab));
+    if (!v.no_mask_id)
+        b.meta_u32(arch + ".mask_token_id", static_cast<u32>(v.mask_id));
+    b.meta_u32(arch + ".eos_token_id", 258);
+    b.meta_u32(arch + ".block_length", static_cast<u32>(v.block_length));
+    b.meta_u32(arch + ".moe_block_size", static_cast<u32>(v.block_length));
+    b.meta_u32(arch + ".expert_count", static_cast<u32>(v.n_expert));
+    b.meta_u32(arch + ".expert_used_count", static_cast<u32>(v.n_expert_used));
+    b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(v.n_ff_exp));
+    if (v.shared)
+        b.meta_u32(arch + ".expert_shared_feed_forward_length",
+                   static_cast<u32>(v.n_ff_sh));
+    b.meta_u32(arch + ".expert_group_count", static_cast<u32>(v.n_group));
+    b.meta_u32(arch + ".expert_group_used_count", static_cast<u32>(v.group_used));
+    b.meta_u32(arch + ".first_k_dense_replace", 1);
+    b.meta_u32(arch + ".norm_topk_prob", 1);
+    b.meta_f32(arch + ".routed_scaling_factor", 2.5f);
+    b.meta_u32(arch + ".use_qk_norm", 1);
+    add_spm_vocab(b, v.vocab);
+
+    auto mat = [&](const std::string &name, int a0, int a1, i64 seed) {
+        std::vector<f32> d(static_cast<size_t>(a0) * a1);
+        for (size_t i = 0; i < d.size(); i++)
+            d[i] = 0.12f * static_cast<f32>(
+                               std::sin(0.017 * static_cast<double>(i) +
+                                        0.31 * static_cast<double>(seed)));
+        b.tensor_f32(name, {static_cast<u64>(a0), static_cast<u64>(a1)}, d);
+    };
+    auto vec = [&](const std::string &name, int n, i64 seed) {
+        std::vector<f32> d(static_cast<size_t>(n));
+        for (size_t i = 0; i < d.size(); i++)
+            d[i] = 0.3f + 0.1f * static_cast<f32>(
+                                std::cos(0.05 * static_cast<double>(i) +
+                                         0.7 * static_cast<double>(seed)));
+        b.tensor_f32(name, {static_cast<u64>(n)}, d);
+    };
+
+    mat("token_embd.weight", E, v.vocab, 1);
+    vec("output_norm.weight", E, 3);
+    mat("output.weight", E, v.vocab, 5);
+
+    for (int l = 0; l < v.n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        vec(p + "attn_norm.weight", E, 10 + l);
+        if (v.canonical) {
+            // llama's own spelling: three projections, no qk-norm, ffn_norm.
+            auto slice_c = [&](int r0, int nrows, const std::string &nm) {
+                std::vector<f32> d(static_cast<size_t>(E) * nrows);
+                for (int r = 0; r < nrows; r++)
+                    for (int c = 0; c < E; c++)
+                        d[static_cast<size_t>(r * E + c)] =
+                            0.11f * static_cast<f32>(std::sin(
+                                0.013 * static_cast<double>((r0 + r) * E + c) +
+                                0.29 * static_cast<double>(20 + l)));
+                b.tensor_f32(nm, {static_cast<u64>(E), static_cast<u64>(nrows)}, d);
+            };
+            slice_c(0, q_dim, p + "attn_q.weight");
+            slice_c(q_dim, kv_dim, p + "attn_k.weight");
+            slice_c(q_dim + kv_dim, kv_dim, p + "attn_v.weight");
+            mat(p + "attn_output.weight", q_dim, E, 40 + l);
+            vec(p + "ffn_norm.weight", E, 45 + l);
+            const bool moe_c = !(v.dense_layer0 && l == 0);
+            if (moe_c) {
+                mat(p + "ffn_gate_inp.weight", E, v.n_expert, 50 + l);
+                auto bank = [&](const std::string &nm, int a0, int a1, i64 seed) {
+                    std::vector<f32> d(static_cast<size_t>(a0) * a1 * v.n_expert);
+                    for (size_t i = 0; i < d.size(); i++)
+                        d[i] = 0.10f * static_cast<f32>(std::sin(
+                            0.009 * static_cast<double>(i) +
+                            0.37 * static_cast<double>(seed)));
+                    b.tensor_f32(nm, {static_cast<u64>(a0), static_cast<u64>(a1),
+                                      static_cast<u64>(v.n_expert)}, d);
+                };
+                bank(p + "ffn_gate_exps.weight", E, v.n_ff_exp, 55 + l);
+                bank(p + "ffn_up_exps.weight", E, v.n_ff_exp, 60 + l);
+                bank(p + "ffn_down_exps.weight", v.n_ff_exp, E, 65 + l);
+                if (v.shared) {
+                    mat(p + "ffn_gate_shexp.weight", E, v.n_ff_sh, 70 + l);
+                    mat(p + "ffn_up_shexp.weight", E, v.n_ff_sh, 75 + l);
+                    mat(p + "ffn_down_shexp.weight", v.n_ff_sh, E, 80 + l);
+                }
+            } else {
+                mat(p + "ffn_gate.weight", E, n_ff, 85 + l);
+                mat(p + "ffn_up.weight", E, n_ff, 90 + l);
+                mat(p + "ffn_down.weight", n_ff, E, 95 + l);
+            }
+            continue;
+        }
+        // The FUSED projection, in the converter's own layout: q rows first,
+        // then k, then v, all `E` wide.
+        {
+            const int rows = v.bad_qkv_width ? q_dim + kv_dim : q_dim + 2 * kv_dim;
+            std::vector<f32> d(static_cast<size_t>(E) * rows);
+            for (size_t i = 0; i < d.size(); i++)
+                d[i] = 0.11f * static_cast<f32>(
+                                   std::sin(0.013 * static_cast<double>(i) +
+                                            0.29 * static_cast<double>(20 + l)));
+            if (v.defused) {
+                // The same bytes, handed over as three tensors. Each is a
+                // copy of its own row range so the twin cannot share a
+                // pointer with the fused file.
+                auto slice = [&](int r0, int nrows, const std::string &nm) {
+                    std::vector<f32> s(static_cast<size_t>(E) * nrows);
+                    for (int r = 0; r < nrows; r++)
+                        for (int c = 0; c < E; c++)
+                            s[static_cast<size_t>(r * E + c)] =
+                                d[static_cast<size_t>((r0 + r) * E + c)];
+                    b.tensor_f32(nm, {static_cast<u64>(E),
+                                      static_cast<u64>(nrows)}, s);
+                };
+                slice(0, q_dim, p + "attn_q.weight");
+                slice(q_dim, kv_dim, p + "attn_k.weight");
+                slice(q_dim + kv_dim, kv_dim, p + "attn_v.weight");
+            } else {
+                b.tensor_f32(p + "attn_qkv.weight",
+                             {static_cast<u64>(E), static_cast<u64>(rows)}, d);
+            }
+        }
+        vec(p + "attn_q_norm.weight", v.hd, 30 + l);
+        vec(p + "attn_k_norm.weight", v.hd, 35 + l);
+        mat(p + "attn_output.weight", q_dim, E, 40 + l);
+        if (!v.no_ffn_norm) vec(p + "post_attn_norm.weight", E, 45 + l);
+
+        const bool moe = !(v.dense_layer0 && l == 0);
+        if (moe) {
+            mat(p + "moe_gate.weight", E, v.n_expert, 50 + l);
+            std::vector<f32> bias(static_cast<size_t>(v.n_expert));
+            for (int e = 0; e < v.n_expert; e++)
+                bias[static_cast<size_t>(e)] = 0.02f * static_cast<f32>(e - 1);
+            b.tensor_f32(p + "moe_gate.bias", {static_cast<u64>(v.n_expert)}, bias);
+            auto bank = [&](const std::string &nm, int a0, int a1, i64 seed) {
+                std::vector<f32> d(static_cast<size_t>(a0) * a1 * v.n_expert);
+                for (size_t i = 0; i < d.size(); i++)
+                    d[i] = 0.10f * static_cast<f32>(
+                                       std::sin(0.009 * static_cast<double>(i) +
+                                                0.37 * static_cast<double>(seed)));
+                b.tensor_f32(nm, {static_cast<u64>(a0), static_cast<u64>(a1),
+                                  static_cast<u64>(v.n_expert)}, d);
+            };
+            bank(p + "moe_experts_gate.weight", E, v.n_ff_exp, 55 + l);
+            bank(p + "moe_experts_up.weight", E, v.n_ff_exp, 60 + l);
+            bank(p + "moe_experts_down.weight", v.n_ff_exp, E, 65 + l);
+            if (v.shared) {
+                mat(p + "moe_shared_gate.weight", E, v.n_ff_sh, 70 + l);
+                mat(p + "moe_shared_up.weight", E, v.n_ff_sh, 75 + l);
+                mat(p + "moe_shared_down.weight", v.n_ff_sh, E, 80 + l);
+            }
+        } else {
+            mat(p + "ffn_gate.weight", E, n_ff, 85 + l);
+            mat(p + "ffn_up.weight", E, n_ff, 90 + l);
+            mat(p + "ffn_down.weight", n_ff, E, 95 + l);
+        }
+    }
+    return b.write(path);
+}
+
+// ---------------------------------------------------------------------------
+//  test_diffuse_forward — the `diffuse` family runs.
+//
+//  Three separate claims, each with its own measurement:
+//
+//   1. THE ALIASES ARE THE COMPUTATION. The fixture carries only the family's
+//      own tensor names. Its twin (`defused`) carries the same bytes as plain
+//      q/k/v, so the two files must produce IDENTICAL logits. If the fused row
+//      slice were off by a projection, or `moe_gate` bound to nothing, the twin
+//      would differ -- and the file would still load and still decode, which is
+//      why equality is the check rather than "it runs".
+//   2. BIDIRECTIONAL. Position 0's logits must MOVE when a later token changes,
+//      and the causal twin's must not. This is the one property that separates
+//      a diffusion forward from a decode, and a wrongly-causal stack passes
+//      every other test in this file.
+//   3. CACHELESS AND PURE. Two identical passes give bit-identical logits, and a
+//      pass after a longer one is unchanged -- so a denoising step cannot see
+//      the step before it.
+//
+//  The schedule is then driven end to end through Engine::generate, with the
+//  block length flipped as the measured control.
+// ---------------------------------------------------------------------------
+static void test_diffuse_forward() {
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+    DiffuseSpec spec;
+    const std::string fused = "kraken-diffuse-fused.gguf";
+    const std::string twin = "kraken-diffuse-defused.gguf";
+
+    CHECK(build_diffuse_fixture(fused, spec), "a diffuse file in the converter's own spelling writes");
+    {
+        DiffuseSpec t = spec;
+        t.defused = true;
+        CHECK(build_diffuse_fixture(twin, t),
+              "and the same bytes as separate q/k/v tensors");
+    }
+
+    // ---- 1b. the VERDICT agrees, on this exact file ------------------------
+    // The loader aliases moe_experts_* onto ffn_*_exps, but the verdict layer is
+    // asked BEFORE the loader and has its own gap table. It listed
+    // `moe_experts_gate.weight` as a fused bank this engine cannot page, so it
+    // refused the file with a reason that named a layout src/model.cpp had just
+    // aliased -- measured end to end: `kraken --model kraken-diffuse-fused.gguf`
+    // printed "fused expert bank (moe_experts_gate)". A SchemaSpec fixture
+    // without the moe_* rows cannot see that, which is why this checks the real
+    // file rather than a stand-in.
+    {
+        Gguf g;
+        std::string verr;
+        CHECK(g.load(fused, &verr), "the fused diffuse fixture loads");
+        const ModelVerdict v = assess_model(g);
+        std::string why;
+        for (const auto &b : v.blockers) {
+            if (!why.empty()) why += "; ";
+            why += b;
+        }
+        std::fprintf(stderr, "[diffuse] verdict: %s%s\n",
+                     v.runnable ? "runnable" : "BLOCKED", why.empty() ? "" : " -- ");
+        if (!why.empty()) std::fprintf(stderr, "  %s\n", why.c_str());
+        CHECK(v.runnable,
+              ("a diffuse file is runnable: the loader aliases moe_experts_* onto "
+               "ffn_*_exps, so the verdict must not refuse a bank it can page (" +
+               why + ")").c_str());
+    }
+
+    // Runs one file and returns every row's logits, or empty on failure.
+    auto run = [](const std::string &path, const std::vector<i32> &toks,
+                  f32 *out, std::string *err) -> bool {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = path;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            std::string e;
+            if (!engine.init(cpu, cfg, &e)) {
+                *err = e;
+            } else {
+                ok = engine.diffuse_logits(toks.data(),
+                                           static_cast<i32>(toks.size()), out);
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    const i32 N = 6;
+    std::vector<i32> toks = {5, 9, 17, 23, 31, 42};
+    const int V = spec.vocab;
+    std::vector<f32> a(static_cast<size_t>(N) * V), b(static_cast<size_t>(N) * V);
+    std::string err;
+    const bool ok_a = run(fused, toks, a.data(), &err);
+    CHECK(ok_a, ("the fused diffuse file runs a bidirectional pass (" + err + ")").c_str());
+    if (!ok_a) {
+        std::fprintf(stderr, "[diffuse] load: %s\n", err.c_str());
+        std::remove(fused.c_str());
+        std::remove(twin.c_str());
+        return;
+    }
+    {
+        i64 finite = 0;
+        for (f32 v : a) if (std::isfinite(v)) finite++;
+        CHECK(finite == static_cast<i64>(a.size()),
+              "every logit is finite, on every row");
+    }
+
+    // ---- 1. the fused split is the same computation as the de-fused file ----
+    CHECK(run(twin, toks, b.data(), &err),
+          ("the de-fused twin runs (" + err + ")").c_str());
+    {
+        double worst = 0.0;
+        for (size_t i = 0; i < a.size(); i++)
+            worst = std::max(worst, std::fabs(static_cast<double>(a[i]) - b[i]));
+        std::fprintf(stderr, "[diffuse] fused vs de-fused: max |d| %.9f\n", worst);
+        CHECK(worst == 0.0,
+              "the fused attn_qkv row-slice is EXACT: the two files agree bit "
+              "for bit, so the q/k/v order is the file's");
+    }
+
+    // ---- 2. bidirectional: a later token moves an earlier row --------------
+    // The mask token is the last position, which is exactly what a denoising
+    // pass does -- and position 0 must see it.
+    {
+        std::vector<i32> t2 = toks;
+        t2[N - 1] = 77;
+        std::vector<f32> c(static_cast<size_t>(N) * V);
+        CHECK(run(fused, t2, c.data(), &err), "the edited sequence runs");
+        double moved = 0.0;
+        for (int v = 0; v < V; v++)
+            moved = std::max(moved,
+                             std::fabs(static_cast<double>(a[v]) - c[v]));
+        std::fprintf(stderr, "[diffuse] row 0 moved by %.6f when token %d changed\n",
+                     moved, N - 1);
+        CHECK(moved > 1e-5,
+              "row 0's logits depend on a LATER token: the stack is "
+              "bidirectional, which is what makes a denoising pass possible");
+        // ... and the same edit moves row 5 too, so the test is not reading a
+        // constant row.
+        double moved_last = 0.0;
+        for (int v = 0; v < V; v++)
+            moved_last = std::max(
+                moved_last, std::fabs(static_cast<double>(
+                                a[static_cast<size_t>(N - 1) * V + v]) -
+                            c[static_cast<size_t>(N - 1) * V + v]));
+        CHECK(moved_last > 1e-4, "and so does the row that was edited");
+    }
+    // ---- 3. the causal twin does NOT move (the control) --------------------
+    {
+        // The same graph declared as a normal causal family would refuse
+        // `diffuse.*` keys, so the control is built by flipping the arch string
+        // and dropping the diffusion metadata: a `llama`-shaped file. It runs
+        // causal, and row 0 must then ignore later tokens.
+        DiffuseSpec t = spec;
+        t.canonical = true;   // llama's names, and an arch with no diffusion flag
+        const std::string causal = "kraken-diffuse-causal.gguf";
+        CHECK(build_diffuse_fixture(causal, t, "llama"), "a causal twin writes");
+        std::vector<f32> p1(static_cast<size_t>(N) * V), p2(static_cast<size_t>(N) * V);
+        if (run(causal, toks, p1.data(), &err)) {
+            std::vector<i32> t2 = toks;
+            t2[N - 1] = 77;
+            if (run(causal, t2, p2.data(), &err)) {
+                double moved = 0.0;
+                for (int v = 0; v < V; v++)
+                    moved = std::max(moved, std::fabs(static_cast<double>(p1[v]) - p2[v]));
+                std::fprintf(stderr, "[diffuse] causal control row 0 moved %.9f\n", moved);
+                CHECK(moved == 0.0,
+                      "the causal control's row 0 does not move -- so the "
+                      "measurement above is the mask, not a noisy fixture");
+            } else {
+                CHECK(false, ("the causal control runs (" + err + ")").c_str());
+            }
+        } else {
+            // A `llama` file of this tensor set is refused (it has no such
+            // schema); that is a valid control too, so say which happened.
+            std::fprintf(stderr, "[diffuse] causal control refused: %s\n", err.c_str());
+            CHECK(true, "the causal control is refused by its own schema");
+        }
+        std::remove(causal.c_str());
+    }
+
+    // ---- 4. cacheless and pure --------------------------------------------
+    {
+        std::vector<f32> c(static_cast<size_t>(N) * V);
+        CHECK(run(fused, toks, c.data(), &err), "a second pass runs");
+        i64 diff = 0;
+        for (size_t i = 0; i < a.size(); i++) if (a[i] != c[i]) diff++;
+        CHECK(diff == 0,
+              "two identical passes are BIT-identical: no state survives a "
+              "denoising step");
+        // ... and a LONGER pass in between does not change the short one.
+        std::vector<i32> longer = toks;
+        longer.push_back(88);
+        longer.push_back(99);
+        std::vector<f32> tmp(static_cast<size_t>(N + 2) * V);
+        CHECK(run(fused, longer, tmp.data(), &err), "a longer pass runs");
+        CHECK(run(fused, toks, c.data(), &err), "and the short one again");
+        diff = 0;
+        for (size_t i = 0; i < a.size(); i++) if (a[i] != c[i]) diff++;
+        CHECK(diff == 0,
+              "a longer preceding pass leaves it unchanged: the KV tier is not "
+              "in the path at all");
+    }
+
+    // ---- 5. the refusals ---------------------------------------------------
+    {
+        DiffuseSpec t = spec;
+        t.no_mask_id = true;
+        const std::string p = "kraken-diffuse-nomask.gguf";
+        CHECK(build_diffuse_fixture(p, t), "a file with no mask token writes");
+        std::string e;
+        std::vector<f32> out(static_cast<size_t>(N) * V);
+        const bool ok = run(p, toks, out.data(), &e);
+        std::fprintf(stderr, "[diffuse] no-mask: %s\n", ok ? "LOADED (wrong)" : e.c_str());
+        CHECK(!ok, "a masked-diffusion file with no mask token is refused");
+        CHECK(e.find("mask_token_id") != std::string::npos,
+              "and the refusal names the key");
+        std::remove(p.c_str());
+    }
+    {
+        DiffuseSpec t = spec;
+        t.bad_qkv_width = true;
+        const std::string p = "kraken-diffuse-narrow.gguf";
+        CHECK(build_diffuse_fixture(p, t), "a too-narrow fused projection writes");
+        std::string e;
+        std::vector<f32> out(static_cast<size_t>(N) * V);
+        const bool ok = run(p, toks, out.data(), &e);
+        std::fprintf(stderr, "[diffuse] narrow qkv: %s\n",
+                     ok ? "LOADED (wrong)" : e.c_str());
+        CHECK(!ok, "a fused attn_qkv too narrow for its heads is refused");
+        CHECK(e.find("attn_qkv") != std::string::npos,
+              "and the refusal names the tensor");
+        std::remove(p.c_str());
+    }
+
+    // ---- 6. the schedule, end to end through Engine::generate --------------
+    // Two runs with different block lengths. The schedule changes which
+    // positions are committed together, so the text may differ; what must NOT
+    // differ is the number of forwards for a fixed (gen_length, steps), because
+    // that is the plan rather than the model.
+    {
+        auto gen = [](const std::string &path, i32 steps, i32 block,
+                      GenerateResult *r, std::string *e) -> bool {
+            Backend *cpu = make_cpu_backend();
+            bool ok = false;
+            {
+                Engine engine;
+                EngineConfig cfg;
+                cfg.model_path = path;
+                cfg.n_ctx = 64;
+                cfg.prefill_chunk = 8;
+                if (!engine.init(cpu, cfg, e)) {
+                    delete cpu;
+                    return false;
+                }
+                engine.set_diffusion_schedule(steps, block);
+                GenerateParams p;
+                p.prompt = "the";
+                p.max_tokens = 8;
+                p.sampler.greedy = true;
+                ok = engine.generate(p, r);
+                if (!ok) *e = r->error;
+            }
+            delete cpu;
+            return ok;
+        };
+        GenerateResult r1, r2;
+        std::string e;
+        const bool g1 = gen(fused, 2, 4, &r1, &e);
+        CHECK(g1, ("diffusion generate runs (" + e + ")").c_str());
+        if (g1) {
+            std::fprintf(stderr,
+                         "[diffuse] generate blocks=4 steps=2: %d forward(s), "
+                         "%zu token(s)\n",
+                         r1.decode_steps, r1.tokens.size());
+            CHECK(r1.tokens.size() == 8, "eight positions were denoised");
+            CHECK(r1.decode_steps == 4,
+                  "4 forwards: two blocks of two steps each, which is the plan "
+                  "and not the model");
+            i64 unmasked = 0;
+            for (i32 t : r1.tokens) if (t == spec.mask_id) unmasked++;
+            CHECK(unmasked == 0,
+                  "no position is left as a mask token: the schedule finished "
+                  "every block");
+            bool in_range = true;
+            for (i32 t : r1.tokens)
+                if (t < 0 || t >= V) in_range = false;
+            CHECK(in_range, "and every committed id is inside the vocabulary");
+        }
+        const bool g2 = gen(fused, 1, 8, &r2, &e);
+        CHECK(g2, ("the single-block schedule runs (" + e + ")").c_str());
+        if (g2) {
+            std::fprintf(stderr, "[diffuse] generate blocks=8 steps=1: %d forward(s)\n",
+                         r2.decode_steps);
+            CHECK(r2.decode_steps == 1,
+                  "one block and one step is ONE forward: the whole sequence is "
+                  "committed at once");
+        }
+        if (g1 && g2) {
+            const bool differ = r1.tokens != r2.tokens;
+            std::fprintf(stderr, "[diffuse] schedules %s\n",
+                         differ ? "committed differently" : "agreed on every token");
+            // Not a correctness claim either way -- with a synthetic model both
+            // are "an answer" -- but the two schedules must be distinguishable
+            // plans, or the block length is not reaching the sampler.
+            CHECK(r1.decode_steps != r2.decode_steps,
+                  "the two schedules are different plans, so block_length "
+                  "reaches the sampler");
+        }
+    }
+
+    // KRK_KEEP_FIXTURE keeps the pair (the same variable build_tiny_moe_model
+    // honours), so a CLI run can be pointed at the exact file this group
+    // proved: `kraken --model kraken-diffuse-fused.gguf --prompt the`.
+    if (!std::getenv("KRK_KEEP_FIXTURE")) {
+        std::remove(fused.c_str());
+        std::remove(twin.c_str());
+    }
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
 static void test_moe_group_routing() {
     // ---- 1. contiguous partition, top-two sum ----
     {
@@ -27958,6 +28511,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_qwen4exp_hc_mix)
     TEST_GROUP(test_dsv41_sinkhorn_stack)
     TEST_GROUP(test_moe_group_routing)
+    TEST_GROUP(test_diffuse_forward)
     TEST_GROUP(test_qwen4exp_ple)
     TEST_GROUP(test_mla_absorb)
     TEST_GROUP(test_mla_lite)

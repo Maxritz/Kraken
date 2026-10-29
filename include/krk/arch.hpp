@@ -186,6 +186,18 @@ struct ArchSpec {
     // value set, a softcap, a per-layer head geometry) keeps its own
     // mechanism: the arch table's `why` and the tensor gap map.
     bool attention_implemented = true;
+    // ---- masked diffusion (LLaDA2.x, `diffuse`) ---------------------------
+    // The block is llama's: an RMSNorm, GQA, a gated MLP or a routed MoE. What
+    // differs is the MASK -- attention is BIDIRECTIONAL, because a denoising
+    // pass sees the whole sequence at once -- and the generation schedule,
+    // which is src/diffusion.cpp's, not a decode loop. One flag, because
+    // nothing else about the graph changes and a file with half of it does not
+    // exist.
+    //
+    // The fused `attn_qkv` the family's converter writes is NOT part of this
+    // flag: it is resolved by row-slicing at load (Gguf::add_row_slice), so the
+    // engine sees ordinary q/k/v.
+    bool diffusion = false;
     // `attn_gate.weight` is REQUIRED when the family's graph has no way to run
     // without it (laguna: the gate multiplies every attention output) and
     // OPTIONAL when the reference marks the tensor NOT_REQUIRED (k2-horizon:

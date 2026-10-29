@@ -40,6 +40,12 @@ struct Args {
     std::string draft_head;
     int draft_head_prime = 256; // positions a round primes the head over
     int max_tokens = 256;
+    // Masked-diffusion schedule (`diffuse` / LLaDA2.x). 0 leaves whatever the
+    // FILE declares, which is the model author's own number and the right
+    // default; these exist because a denoising budget is a runtime knob -- more
+    // steps buy quality on a hard block and cost forwards in a straight line.
+    int diffuse_steps = 0;
+    int diffuse_block = 0;
     int ctx = 4096;
     // 512, not 256: a 4096-token prefill of the 35B-A3B measured 397.1 tok/s at
     // 256 and 462.6 at 512 (+16.5%), and the reason is structural rather than
@@ -148,6 +154,14 @@ void usage() {
         "  --max-tokens N        tokens to generate (default 256)\n"
         "  --ctx N               KV capacity in tokens (default 4096)\n"
         "  --chunk N             prefill batch size (default 512)\n"
+        "  --diffusion-steps N   denoising steps per block, diffuse models only\n"
+        "                        (default: the file's diffuse.steps, else 8)\n"
+        "  --diffusion-block N   tokens committed per denoising block (default: the\n"
+        "                        file's diffuse.block_length, else --max-tokens)\n\n"
+        "  A masked-diffusion file (general.architecture = diffuse) does not decode\n"
+        "  left to right: every step runs ONE bidirectional, cacheless pass over\n"
+        "  prompt + --max-tokens and the whole sequence must fit in --ctx, so --chunk\n"
+        "  does not apply to it.\n"
         "  --kv-quant f16|int8   K/V cache format (default f16). int8 stores each\n"
         "                        row as bytes plus one f32 scale per 32 values, 1.8x\n"
         "                        smaller; both backends implement it, and on the card\n"
@@ -508,6 +522,23 @@ bool parse(int argc, char **argv, Args *a) {
             }
         }
         else if (f == "--chunk") a->chunk = next_i("--chunk");
+        // Refused rather than clamped: a schedule is the whole quality knob, and
+        // silently substituting a number would make a benchmark of "steps 0" run
+        // some other schedule without saying so.
+        else if (f == "--diffusion-steps") {
+            a->diffuse_steps = next_i("--diffusion-steps");
+            if (a->diffuse_steps < 0) {
+                std::fprintf(stderr, "kraken: --diffusion-steps must be >= 0\n");
+                return false;
+            }
+        }
+        else if (f == "--diffusion-block") {
+            a->diffuse_block = next_i("--diffusion-block");
+            if (a->diffuse_block < 0) {
+                std::fprintf(stderr, "kraken: --diffusion-block must be >= 0\n");
+                return false;
+            }
+        }
         // Prefill GEMM policy. The default is the 'exact' grid, because
         // test_prefill_chunk_bitexact asserts that a prefill reproduces DECODE's
         // association byte for byte at every chunk size, and the throughput-first
@@ -1693,6 +1724,10 @@ int main(int argc, char **argv) {
         // whole job is to print one line and stop. `exit` skips that unwind.
         std::exit(1);
     }
+    // The denoising schedule, set after init so it survives the load either way;
+    // 0/0 leaves the file's own numbers untouched.
+    if (a.diffuse_steps || a.diffuse_block)
+        engine.set_diffusion_schedule(a.diffuse_steps, a.diffuse_block);
     // Wall time of the load, and this process's uptime at the same moment: the
     // benchmark reports both so start-to-end is a number it prints rather than
     // one the reader has to reconstruct from KRK_PHASE.

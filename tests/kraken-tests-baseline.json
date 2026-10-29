@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-29T16:22:14Z",
-  "recorded_commit": "dd1ba4f",
-  "totals": {"groups": 162, "passed": 7160, "run": 7160, "exit": 0},
+  "recorded_utc": "2026-10-29T18:34:37Z",
+  "recorded_commit": "99204ef",
+  "totals": {"groups": 163, "passed": 7192, "run": 7192, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -121,6 +121,7 @@
     {"name": "test_qwen4exp_hc_mix", "status": "pass", "passed": 7, "run": 7},
     {"name": "test_dsv41_sinkhorn_stack", "status": "pass", "passed": 23, "run": 23},
     {"name": "test_moe_group_routing", "status": "pass", "passed": 19, "run": 19},
+    {"name": "test_diffuse_forward", "status": "pass", "passed": 32, "run": 32},
     {"name": "test_qwen4exp_ple", "status": "pass", "passed": 16, "run": 16},
     {"name": "test_mla_absorb", "status": "pass", "passed": 36, "run": 36},
     {"name": "test_mla_lite", "status": "pass", "passed": 57, "run": 57},

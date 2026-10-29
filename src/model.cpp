@@ -567,6 +567,103 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.expert_w_scale =
         static_cast<f32>(gguf_.get_f64(key(".expert_weights_scale"), 1.0));
 
+    // ---- masked diffusion: the family's own tensor names ------------------
+    // LLaDA2.x's converter writes the routed FFN as `moe_gate` / `moe_experts_*`
+    // / `moe_shared_*` where every other family in this engine uses
+    // `ffn_gate_inp` / `ffn_{gate,up,down}_exps` / `ffn_{gate,up,down}_shexp`.
+    // The COMPUTATION is identical -- one router, a routed bank, one dense
+    // shared expert -- so the difference is a name, and the fix is a name: the
+    // aliases below are directory entries pointing at the same bytes, which
+    // every existing lookup already resolves.
+    //
+    // The fused `attn_qkv` is the one place a name is not enough, because the
+    // three projections have to come out separately. Row-slicing is exact
+    // (dequantize one row at a time, no copy of the bank): q is the first
+    // n_head*hd rows of the OUTPUT, k the next n_kv*hd, v the last. Getting the
+    // order wrong is silent -- every projection has the right shape, the
+    // attention runs, and the model decodes text from three transposed
+    // matrices -- so the split is pinned by a test that reads the slices back.
+    if (aspec.diffusion) {
+        const i64 e = cfg_.n_embd;
+        const i64 nh = cfg_.n_head;
+        const i64 nkv = cfg_.n_head_kv;
+        const i64 hd = cfg_.head_dim > 0 ? cfg_.head_dim : (nh > 0 ? e / nh : 0);
+        if (nh > 0 && nkv > 0 && hd > 0) {
+            const i64 qw = nh * hd, kw = nkv * hd;
+            for (i32 l = 0; l < cfg_.n_layer; l++) {
+                const std::string fused = blk_key("blk.%d.attn_qkv.weight", l);
+                if (!gguf_.tensor(fused)) continue;
+                // The file's own q/k/v win, so a repack that de-fused already
+                // is read as it stands.
+                if (!gguf_.add_row_slice(blk_key("blk.%d.attn_q.weight", l), fused,
+                                         0, qw, e) ||
+                    !gguf_.add_row_slice(blk_key("blk.%d.attn_k.weight", l), fused,
+                                         qw, kw, e) ||
+                    !gguf_.add_row_slice(blk_key("blk.%d.attn_v.weight", l), fused,
+                                         qw + kw, kw, e)) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) +
+                               ": the fused attn_qkv.weight is not wide enough for "
+                               "" + std::to_string(nh) + "x" + std::to_string(hd) +
+                               " queries and " + std::to_string(nkv) + "x" +
+                               std::to_string(hd) + " keys/values over a " +
+                               std::to_string(e) + "-wide embedding";
+                    return false;
+                }
+                // A fused projection's bias is fused too (3*n_embd on gpt-2's
+                // shape); slice it the same way so the adder sees one vector
+                // per projection.
+                const std::string fb = blk_key("blk.%d.attn_qkv.bias", l);
+                if (gguf_.tensor(fb)) {
+                    const GgufTensor *b = gguf_.tensor(fb);
+                    if (static_cast<i64>(b->ne[0]) == qw + 2 * kw) {
+                        // A 1-D bias is not a row-slice source; the loader's
+                        // bias path reads ne[0] elements from `data`, so the
+                        // three views are offset pointers of the right length.
+                        for (i32 part = 0; part < 3; part++) {
+                            const i64 off = part == 0 ? 0 : (part == 1 ? qw : qw + kw);
+                            const i64 len = part == 0 ? qw : kw;
+                            const std::string to = blk_key(
+                                part == 0 ? "blk.%d.attn_q.bias"
+                                          : (part == 1 ? "blk.%d.attn_k.bias"
+                                                       : "blk.%d.attn_v.bias"), l);
+                            GgufTensor v = *b;
+                            v.name = to;
+                            const size_t esz = 4;   // the bias is f32 in every
+                                                    // converter that writes it
+                            v.data = b->data + static_cast<size_t>(off) * esz;
+                            v.ne[0] = static_cast<u64>(len);
+                            v.n_elements = len;
+                            v.n_bytes = static_cast<size_t>(len) * esz;
+                            gguf_.add_tensor_entry(std::move(v));
+                        }
+                    }
+                }
+            }
+        }
+        // The FFN's non-MoE name map, applied per layer only where the target
+        // does not already exist.
+        for (i32 l = 0; l < cfg_.n_layer; l++) {
+            const std::pair<const char *, const char *> map[] = {
+                {"blk.%d.moe_gate.weight", "blk.%d.ffn_gate_inp.weight"},
+                {"blk.%d.moe_gate.bias", "blk.%d.ffn_gate_inp.bias"},
+                {"blk.%d.moe_experts_gate.weight", "blk.%d.ffn_gate_exps.weight"},
+                {"blk.%d.moe_experts_up.weight", "blk.%d.ffn_up_exps.weight"},
+                {"blk.%d.moe_experts_down.weight", "blk.%d.ffn_down_exps.weight"},
+                {"blk.%d.moe_shared_gate.weight", "blk.%d.ffn_gate_shexp.weight"},
+                {"blk.%d.moe_shared_up.weight", "blk.%d.ffn_up_shexp.weight"},
+                {"blk.%d.moe_shared_down.weight", "blk.%d.ffn_down_shexp.weight"},
+                {"blk.%d.post_attn_norm.weight", "blk.%d.ffn_norm.weight"},
+            };
+            for (const auto &m : map)
+                gguf_.add_alias(blk_key(m.second, l), blk_key(m.first, l));
+        }
+        // A fused expert bank trips the gap map ("a fused expert bank"), and
+        // that is the honest answer: the aliases above bind the per-expert
+        // spelling only, and a bank this engine cannot page is still a gap.
+        // Nothing here pretends otherwise.
+    }
+
     cfg_.tied_embeddings = (gguf_.tensor("output.weight") == nullptr);
 
     // ---- chat template ---------------------------------------------------
@@ -905,6 +1002,62 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         if (const std::vector<i32> *sec = gguf_.get_i32_array(key(".rope.dimension_sections"))) {
             for (size_t i = 0; i < sec->size() && i < 4; i++)
                 cfg_.rope_sections[i] = (*sec)[i];
+        }
+    }
+
+    // ---- masked diffusion (LLaDA2.x) -------------------------------------
+    // The stack is llama's; what the family adds is the MASK (bidirectional
+    // attention) and the schedule the sampler runs. Both are the file's own
+    // numbers, read rather than defaulted: a wrong block length changes which
+    // tokens are committed together, which changes the text.
+    //
+    // The names are the LLaDA2.x converter's own (`diffuse.block_length`,
+    // `diffuse.mask_token_id`, `diffuse.moe_block_size`), with llama.cpp's
+    // generic spellings accepted as fallbacks so a repack that used them is
+    // still read correctly rather than silently taking the defaults below.
+    if (aspec.diffusion) {
+        cfg_.diffusion = true;
+        cfg_.diffuse_mask_id = static_cast<i32>(gguf_.get_i64(
+            key(".mask_token_id"),
+            gguf_.get_i64(key(".mask_token_index"), -1)));
+        cfg_.diffuse_block_length = static_cast<i32>(
+            gguf_.get_i64(key(".block_length"), 0));
+        cfg_.diffuse_moe_block_size = static_cast<i32>(
+            gguf_.get_i64(key(".moe_block_size"), 0));
+        cfg_.diffuse_steps = static_cast<i32>(gguf_.get_i64(key(".steps"), 0));
+        // A masked-diffusion model with no mask token cannot denoise: the
+        // sequence starts as masks, and every schedule step looks for them.
+        if (cfg_.diffuse_mask_id < 0) {
+            if (err)
+                *err = "arch '" + a +
+                       "': a masked-diffusion file must declare its mask token "
+                       "(mask_token_id); without one there is nothing to "
+                       "denoise";
+            return false;
+        }
+        // A block length is the schedule's unit. 0 is accepted and means "one
+        // block, the whole generation" -- the degenerate but legal arm -- and
+        // is what the sampler is told, not a silent default.
+        if (cfg_.diffuse_block_length < 0) {
+            if (err)
+                *err = "arch '" + a + "': block_length is " +
+                       std::to_string(cfg_.diffuse_block_length) +
+                       ", which is not a schedule";
+            return false;
+        }
+        // The mask token has to be a row of the embedding, or the first pass
+        // of every generation reads outside it.
+        // `vocab_size` when the file states it, otherwise 0 ("unknown, do not
+        // check"): a repack may omit it, and the embedding's own row count is
+        // not readable yet -- this block runs before any tensor is bound.
+        const i64 vocab_rows = gguf_.get_i64(key(".vocab_size"), 0);
+        if (vocab_rows > 0 && cfg_.diffuse_mask_id >= vocab_rows) {
+            if (err)
+                *err = "arch '" + a + "': mask_token_id " +
+                       std::to_string(cfg_.diffuse_mask_id) +
+                       " is past the file's vocab_size (" +
+                       std::to_string(vocab_rows) + ")";
+            return false;
         }
     }
 
