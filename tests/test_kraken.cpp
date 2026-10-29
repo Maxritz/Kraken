@@ -5941,10 +5941,17 @@ struct SchemaSpec {
     // BitNet's head is TIED: llama.cpp builds the logits from `tok_embd` and
     // the file carries no `output.weight` at all.
     bool write_out_weight = true;
+    // gemma2/gemma3's 27B attention-scale rule is keyed on the LAYER COUNT, so
+    // a fixture has to be able to say how many layers it has.
+    i32 n_layer = 2;
+    // Head width, when it must differ from n_embd/n_head -- which is what tells
+    // gemma's 27B rule apart from the ordinary 1/sqrt(head_dim).
+    i32 hd = 8;
 };
 
 static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
-    const int n_embd = 32, n_layer = 2, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int n_embd = 32, n_layer = v.n_layer, n_head = 4, n_kv = 2,
+              hd = v.hd, n_ff = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
     const int vocab = 260, ctx = 64;
     const std::string &arch = v.arch;
@@ -7150,6 +7157,118 @@ static void test_q2code_dot() {
         CHECK(rows_ok, "the eight-row kernel agrees with eight single-row dots");
         (void)names[ti];
     }
+}
+
+// B6 -- gemma2/gemma3's 27B attention scale.
+//
+// The reference scales the query by 1/sqrt(n_embd/n_head) on the 27B size and
+// by 1/sqrt(head_dim) on every other, and it decides which by the LAYER COUNT
+// (gemma2.cpp:14-27 switches on n_layer(): 26 = 2B, 42 = 9B, 46 = 27B;
+// gemma3.cpp:24: 62 = 27B). The HF `query_pre_attn_scalar` that says it in the
+// original config does not survive conversion, so the layer count is not a
+// proxy -- it is the only discriminator the format has.
+//
+// At 27B the two differ by 6% (1/sqrt(144) = 0.08333 against 1/sqrt(128) =
+// 0.08839), which is not a rounding difference but is small enough to read as
+// "a slightly different model".
+static void test_gemma_27b_scale() {
+    // ---- the table ---------------------------------------------------
+    {
+        const ArchSpec *g2 = arch_lookup("gemma2");
+        const ArchSpec *g3 = arch_lookup("gemma3");
+        CHECK(g2 && g2->attn_scale_embd_per_head_layers == 46,
+              "gemma2 switches at 46 layers, as the reference does");
+        CHECK(g3 && g3->attn_scale_embd_per_head_layers == 62,
+              "gemma3 at 62");
+        const ArchSpec *g1 = arch_lookup("gemma");
+        const ArchSpec *l = arch_lookup("llama");
+        CHECK(g1 && g1->attn_scale_embd_per_head_layers == 0,
+              "gemma1 has no such size rule");
+        CHECK(l && l->attn_scale_embd_per_head_layers == 0,
+              "and neither does any ordinary family");
+    }
+
+    auto scale_of = [&](const char *arch, i32 layers, f32 stated,
+                        const char *path) -> f32 {
+        SchemaSpec v;
+        v.arch = arch;
+        v.n_layer = layers;
+        v.attn_scale_key = stated;
+        // gemma2/gemma3 normalize each branch's OUTPUT, and the loader refuses
+        // a file of the family that does not carry the pair.
+        v.post_norms = true;
+        // gemma2/3 carry per-head QK-norm; the loader refuses a file of the
+        // family without it.
+        v.q_norm_w = 8;
+        v.k_norm_w = 8;
+        if (!build_schema_model(path, v)) return -1.0f;
+        f32 got = -2.0f;
+        std::string err;
+        if (!schema_cfg(path, [&](const Model &m) { got = m.cfg().attn_scale; }, err))
+            std::fprintf(stderr, "[b6] %s refused: %s\n", path, err.c_str());
+        return got;
+    };
+
+    // 46 layers: n_embd/n_head = 32/4 = 8 -> 1/sqrt(8).
+    const f32 s27 = scale_of("gemma2", 46, 0.0f, "kraken-gemma2-27b.gguf");
+    CHECK_NEAR(s27, 1.0f / std::sqrt(8.0f), 1e-6,
+               "a 46-layer gemma2 uses 1/sqrt(n_embd/n_head)");
+    // The arm above cannot, on its own, tell 1/sqrt(n_embd/n_head) from
+    // 1/sqrt(head_dim): both are 8 in that miniature. So one fixture declares
+    // a head_dim of 16 against the same n_embd/n_head of 8, and the 27B rule
+    // has to follow n_embd/n_head (= 1/sqrt(8) = 0.3536) and NOT the head
+    // (= 1/sqrt(16) = 0.25).
+    {
+        SchemaSpec v;
+        v.arch = "gemma2";
+        v.n_layer = 46;
+        v.hd = 16;
+        v.post_norms = true;
+        v.q_norm_w = 16;
+        v.k_norm_w = 16;
+        CHECK(build_schema_model("kraken-gemma2-27b-hd.gguf", v),
+              "wrote a 46-layer gemma2 file with a 16-wide head");
+        f32 got = -2.0f;
+        std::string err;
+        if (schema_cfg("kraken-gemma2-27b-hd.gguf",
+                       [&](const Model &m) { got = m.cfg().attn_scale; }, err))
+            CHECK_NEAR(got, 1.0f / std::sqrt(8.0f), 1e-6,
+                       "the 27B rule follows n_embd/n_head, not the head width");
+        else
+            CHECK(false, ("the 16-wide-head gemma2 loads: " + err).c_str());
+        // and the same file at 26 layers keeps the head-width default, so the
+        // two arms differ for the right reason
+        SchemaSpec w2 = v;
+        w2.n_layer = 26;
+        CHECK(build_schema_model("kraken-gemma2-2b-hd.gguf", w2),
+              "the same file at 26 layers");
+        f32 got2 = -2.0f;
+        if (schema_cfg("kraken-gemma2-2b-hd.gguf",
+                       [&](const Model &m) { got2 = m.cfg().attn_scale; }, err))
+            CHECK(got2 == 0.0f,
+                  "... keeps the default, so the engine uses 1/sqrt(head_dim)=0.25");
+        else
+            CHECK(false, ("the 26-layer 16-wide-head file loads: " + err).c_str());
+    }
+    // 26 layers: the rule does not fire, so the scale stays at the family
+    // default (0 => the engine's 1/sqrt(head_dim)).
+    const f32 s2b = scale_of("gemma2", 26, 0.0f, "kraken-gemma2-2b.gguf");
+    CHECK(s2b == 0.0f,
+          "a 26-layer gemma2 keeps the default (the engine uses 1/sqrt(head_dim))");
+    // 45 layers is NOT the 27B: an off-by-one must not apply the rule.
+    const f32 s45 = scale_of("gemma2", 45, 0.0f, "kraken-gemma2-45.gguf");
+    CHECK(s45 == 0.0f, "and 45 layers is not 46");
+    // gemma3's count is its own, not gemma2's.
+    const f32 s3 = scale_of("gemma3", 62, 0.0f, "kraken-gemma3-27b.gguf");
+    CHECK_NEAR(s3, 1.0f / std::sqrt(8.0f), 1e-6,
+               "a 62-layer gemma3 uses it too");
+    const f32 s3b = scale_of("gemma3", 46, 0.0f, "kraken-gemma3-46.gguf");
+    CHECK(s3b == 0.0f, "and 46 is gemma2's count, not gemma3's");
+    // A file that STATES its scale wins over the size rule: the rule is a
+    // default, and the key is the same statement made explicitly.
+    const f32 sx = scale_of("gemma2", 46, 0.25f, "kraken-gemma2-27b-stated.gguf");
+    CHECK_NEAR(sx, 0.25f, 1e-7,
+               "an explicit attention.scale overrides the 27B rule");
 }
 
 static void test_family_scales() {
@@ -23239,6 +23358,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_fused_projection_pair)
     TEST_GROUP(test_attention_gate_families)
     TEST_GROUP(test_norm_schema_shapes)
+    TEST_GROUP(test_gemma_27b_scale)
     TEST_GROUP(test_family_scales)
     TEST_GROUP(test_bitnet_family)
     TEST_GROUP(test_i2_s_layout)

@@ -142,8 +142,13 @@ open on purpose.
       the two keys, the multiplier on the config, and an A/B where two files
       differ **only** in `yarn_log_multiplier` (negative control: maxdiff was
       exactly 0 before the fix, 0.1019 after).
-- [ ] **B6 (P2)** gemma2/gemma3 27B use `1/sqrt(n_embd/n_head)`, not
-      `1/sqrt(head_dim)`; only the model type says which.
+- [x] **B6 (P2)** gemma2/gemma3 27B use `1/sqrt(n_embd/n_head)`, not
+      `1/sqrt(head_dim)`. `ArchSpec::attn_scale_embd_per_head_layers` (46 for
+      gemma2, 62 for gemma3) resolved in the loader; a stated `.attention.scale`
+      still wins. `test_gemma_27b_scale` (14 checks) separates the two formulas
+      with a 16-wide-head fixture, pins the off-by-one, and both cross-counts
+      (gemma3 at 46 is not gemma3's 27B). Negative control observed: 3 arms
+      fail with the rule disabled.
 - [ ] **B1b/B2b (P2)** isolate the MiniCPM3 scales numerically instead of
       asserting "config read + the run is finite".
 - [ ] **D6 (P2)** TL2 vs Q2_0 on ggml id 42: refuse the fork dialect by name

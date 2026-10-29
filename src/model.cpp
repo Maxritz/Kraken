@@ -635,9 +635,30 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     if (aspec.embd_scale > 0.0f) cfg_.embd_scale = aspec.embd_scale;
     if (const f64 es = gguf_.get_f64(key(".embedding_scale"), 0.0); es > 0.0)
         cfg_.embd_scale = static_cast<f32>(es);
-    if (aspec.attn_scale > 0.0f) cfg_.attn_scale = aspec.attn_scale;
-    if (const f64 as = gguf_.get_f64(key(".attention.scale"), 0.0); as > 0.0)
+    // Whether the attention scale was STATED (by the row or by the file), which
+    // is what the size-keyed rule below defers to.
+    bool attn_scale_stated = false;
+    if (aspec.attn_scale > 0.0f) {
+        cfg_.attn_scale = aspec.attn_scale;
+        attn_scale_stated = true;
+    }
+    if (const f64 as = gguf_.get_f64(key(".attention.scale"), 0.0); as > 0.0) {
         cfg_.attn_scale = static_cast<f32>(as);
+        attn_scale_stated = true;
+    }
+    // gemma2/gemma3 at their 27B size: the reference scales the query by
+    // 1/sqrt(n_embd/n_head) rather than 1/sqrt(head_dim) (gemma2.cpp:14-27,
+    // gemma3.cpp:24), and the ONLY discriminator it has is the layer count --
+    // the HF `query_pre_attn_scalar` that would say it is not in the GGUF.
+    // Below the stated scale so an explicit `.attention.scale` still wins, and
+    // skipped entirely when the file's head geometry cannot express it.
+    if (!attn_scale_stated && aspec.attn_scale_embd_per_head_layers > 0 &&
+        cfg_.n_layer == aspec.attn_scale_embd_per_head_layers &&
+        cfg_.n_embd > 0 && cfg_.n_head > 0) {
+        cfg_.attn_scale =
+            1.0f / std::sqrt(static_cast<f32>(cfg_.n_embd) /
+                             static_cast<f32>(cfg_.n_head));
+    }
     if (aspec.lm_head_scale_base > 0.0f && cfg_.n_embd > 0)
         cfg_.lm_head_scale =
             aspec.lm_head_scale_base / static_cast<f32>(cfg_.n_embd);
