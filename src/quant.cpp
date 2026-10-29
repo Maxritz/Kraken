@@ -4457,6 +4457,22 @@ void dot_wide_dispatch(const void *w, const f32 *x, i64 n, i64 rows, f32 *out,
 } // namespace
 #endif
 
+// One row, one activation vector, widest the host can do. This is the DECODE
+// shape: one token, so there is no tile to share a weight read across and the
+// only lever left is lanes. It is exported because BackgroundCpu::gemm reaches
+// its rows == 1 arm from outside this anonymous scope.
+f32 vec_dot_wide1(DType t, const void *w, const f32 *x, i64 n) {
+#if defined(KRK_DOT_AVX512)
+    if ((t == DType::F32 || t == DType::F16) && vec_dot_wide() &&
+        cpu_has_avx512bw()) {
+        const u8 *wb = static_cast<const u8 *>(w);
+        return t == DType::F16 ? vec_dot_wide_row<true>(wb, x, n)
+                               : vec_dot_wide_row<false>(wb, x, n);
+    }
+#endif
+    return vec_dot(t, w, x, n);
+}
+
 // Every block format without a hand-written kernel, tiled the same way: decode
 // a block ONCE and multiply it against kTileRows activation rows. This is the
 // path that carries K-quants (Q4_K/Q5_K/Q6_K), iq-quants and the rest of a real

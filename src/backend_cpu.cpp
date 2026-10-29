@@ -1073,7 +1073,10 @@ public:
                         const f32 *xr = xf + r * n_in;
                         const u8 *wrow = static_cast<const u8 *>(w) +
                                          static_cast<size_t>(o) * row_bytes;
-                        of[f] = vec_dot(wt, wrow, xr, n_in);
+                        // The decode shape. vec_dot_wide1 is vec_dot unless
+                        // the wide tier is on, so the default path is byte for
+                        // byte what it was.
+                        of[f] = vec_dot_wide1(wt, wrow, xr, n_in);
                         if (++o >= n_out) {
                             o = 0;
                             ++r;

@@ -276,6 +276,11 @@ bool vec_dot_int8();
 // vec_dot_fast() on purpose: fast keeps the tiled path bit-identical to
 // vec_dot, and a wider accumulator count cannot. Off by default.
 bool vec_dot_wide();
+
+// One row's dot product at the widest width the host can run, for the decode
+// shape (single token, nothing to tile). Falls back to vec_dot() -- same bits --
+// when the wide tier is off or the format has no wide kernel.
+f32 vec_dot_wide1(DType t, const void *w, const f32 *x, i64 n);
 void set_vec_dot_wide(bool on);
 // The pieces the GEMM needs; xq is n int8 and dx is n/32 scales.
 void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx);
