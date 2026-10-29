@@ -582,6 +582,13 @@ public:
     int tokenize_prompt(const std::string &prompt, std::vector<i32> &ids) const;
     // Debug: logits from the most recent forward (n_vocab floats).
     const f32 *last_logits() const { return logits_host_; }
+    // Non-fatal: the tokenizer declares more pieces than token_embd.weight has
+    // rows, so some ids the tokenizer can emit have no embedding row. Empty on
+    // a consistent file. The engine still runs -- sampling is over the table's
+    // own row count, so only a PROMPT token can land in the gap, and it is
+    // mapped to a zero row -- but a real file with this shape is truncated and
+    // should say so out loud.
+    const std::string &vocab_note() const { return vocab_note_; }
     // Test hook: the resident plane a layer's attention reads, as the cache
     // handed it to the kernels. `which` is 0 for K and 1 for V. A shared-KV
     // layer returns the SAME pointer as the layer it shares with (that aliasing
@@ -752,6 +759,7 @@ private:
     // forward_core returns false and the next error surface prefers this
     // over the generic KV message. Cleared at each forward_core entry.
     std::string forward_error_;
+    std::string vocab_note_;
     // The dense (non-MoE) SwiGLU FFN both layer shapes share: gate/up on one
     // fused launch, silu, down, residual. Shared because the recurrent path's
     // copy was the stale one and had drifted off the fused group.

@@ -72,4 +72,88 @@ void hc_mix(f32 *mixed, const f32 *xn, const f32 *gate, i32 n,
 void hc_combine(f32 *res, const f32 *block_out, const f32 *inject, i32 n,
                 const HcGeometry &g);
 
+
+
+// ============================================================================
+//  DeepSeek-V4.1's hyper-connections: the same lane stack, a DIFFERENT mixer.
+//
+//  V4.1 carries `hc` lanes too (4) and mixes them per sub-block, but nothing
+//  about the mixer is qwen4exp's. There is no low-rank bottleneck and no
+//  per-lane gamma: one full-rank projection reads the whole flattened stack and
+//  emits `hc_mix_dim = (2 + hc) * hc` numbers per token, which split into three
+//  pieces that play three different roles.
+//
+//      flat  = reshape(lanes, hc * n_embd)              (token-major)
+//      fmix  = rms_norm(flat)                           (one norm, no weight)
+//      mix   = hc_fn^T @ fmix                           (hc*n_embd -> (2+hc)*hc)
+//
+//      pre[c]        = sigmoid(mix[c] * scale[0] + base[c]) + eps
+//      post[c]       = sigmoid(mix[hc+c] * scale[1] + base[hc+c]) * 2
+//      comb[d][s]    = sinkhorn(mix[2hc + d*hc + s] * scale[2] + base[2hc + d*hc + s])
+//
+//  `pre` collapses the lanes to the row a sub-block reads. `post` and `comb`
+//  scatter the block's output back: lane d becomes
+//
+//      lanes'[d] = block_out * post[d] + sum_s lanes[s] * comb[d][s]
+//
+//  so a sub-block does not ADD to a residual -- it REPLACES every lane with a
+//  mix of all of them plus a gated copy of its own output. That is why the
+//  block's input can be collapsed with a pre-mix computed one sub-layer earlier
+//  (V4.1's "single-pass mHC") without the lanes themselves lagging: post and
+//  comb are always from the current state.
+//
+//  The sinkhorn is the part worth pinning: `comb` must stay a doubly stochastic
+//  matrix, because that is what keeps the lane stack's scale from drifting over
+//  60 sub-layers. Its definition, in this order and no other:
+//
+//      comb = softmax_over_d(comb) + eps
+//      comb /= (sum_s comb + eps)                       ("column" normalisation)
+//      repeat iters-1 times: comb /= (sum_d comb + eps); comb /= (sum_s + eps)
+//
+//  The eps is added at every step, including inside each normaliser, and the
+//  first pass is columns only -- not rows. Getting that order wrong still
+//  produces a matrix whose rows sum to ~1, so it decodes, and it is not this
+//  model. The reference for all of it is llama.cpp's deepseek4.cpp
+//  (build_hc_mixes / build_hc_sinkhorn / build_hc_post) and the DeepSeek-V4.1
+//  inference code it was written against.
+// ============================================================================
+
+// Everything the mixer needs that is not a tensor.
+struct HcSinkhornGeometry {
+    i32 n_embd = 0;
+    i32 hc = 0;                 // lanes (V4.1 asserts 4)
+    i32 sinkhorn_iters = 0;     // > 0; 1 means "columns once"
+    f32 eps = 0.0f;
+
+    i64 lane_width() const { return static_cast<i64>(n_embd) * hc; }
+    i64 mix_dim() const { return static_cast<i64>(2 + hc) * hc; }
+    bool valid() const {
+        return n_embd > 0 && hc > 1 && sinkhorn_iters > 0 && eps > 0.0f;
+    }
+};
+
+// The three pieces one `mixes` row splits into. `pre`/`post` are [n, hc];
+// `comb` is [n, hc, hc] with dst-major rows (comb[t*hc*hc + d*hc + s] is the
+// weight lane d puts on source lane s). `mixes` is [n, mix_dim], `scale` is
+// [3] and `base` is [mix_dim].
+void hc_sinkhorn_split(f32 *pre, f32 *post, f32 *comb, const f32 *mixes,
+                       const f32 *scale, const f32 *base, i32 n,
+                       const HcSinkhornGeometry &g);
+
+// lanes'[d] = block_out * post[d] + sum_s lanes[s] * comb[d][s], for every token.
+// `lanes_in` and `lanes_out` are [n, hc, n_embd] and MAY NOT alias: every lane
+// of the output reads every lane of the input.
+void hc_sinkhorn_post(f32 *lanes_out, const f32 *lanes_in, const f32 *block_out,
+                      const f32 *post, const f32 *comb, i32 n,
+                      const HcSinkhornGeometry &g);
+
+// out[t, e] = sum_c lanes[t, c, e] * pre[t, c] -- the collapse a sub-block reads,
+// and the same call the head makes on the last pre-mix (V4.1 has no head mixer).
+void hc_sinkhorn_pre(f32 *out, const f32 *lanes, const f32 *pre, i32 n,
+                     const HcSinkhornGeometry &g);
+
+// The sinkhorn normalisation itself, exposed because it is the piece with an
+// order to get wrong: normalises one [hc, hc] matrix in place.
+void hc_sinkhorn_normalise(f32 *m, i32 hc, i32 iters, f32 eps);
+
 } // namespace krk

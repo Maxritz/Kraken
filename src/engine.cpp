@@ -1170,6 +1170,38 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         be_ = nullptr;
         return false;
     }
+    // The tokenizer's piece list and the embedding table are two independent
+    // statements about the vocabulary, and nothing above compares them.
+    // `cfg_.n_vocab` is the TABLE's row count (Model::load takes it from
+    // token_embd.weight's ne[1]); `tok_.n_vocab()` is the PIECE count. When the
+    // pieces outnumber the rows, the tokenizer can hand `embed()` an id that has
+    // no row, and the row it read instead was whatever the heap held past the
+    // table: measured on a 260-row table with 261 pieces, AddressSanitizer
+    // reported a READ of size 2 exactly 0 bytes to the right of the 16640-byte
+    // token_embd region (quant.cpp dequant_row <- backend_cpu embed <-
+    // forward_core). The visible symptom was not a crash: the same file, same
+    // prompt, run twice in one process, decoded DIFFERENT tokens, because the
+    // garbage row changed with the heap.
+    //
+    // WHICH fix, and why not the obvious one. Refusing the file is what this
+    // engine does for a tensor set it cannot honour, and it is wrong here: 41
+    // groups of this suite's own fixtures declare a 261-piece tokenizer over a
+    // table of 64 or 260 rows (add_spm_vocab always writes 261 entries before
+    // padding), and every one of them runs correctly, because sampling draws
+    // from the table's row count and never produces an id in the gap -- only a
+    // PROMPT token can. Refusing them would reject files that are fine in
+    // practice. So the id is bounds-checked where it is used (CpuBackend::embed
+    // writes a zero row instead of reading past the table), and the mismatch is
+    // reported here, once, naming both counts.
+    if (tok_.n_vocab() > model_.cfg().n_vocab) {
+        vocab_note_ = "the tokenizer declares " +
+                      std::to_string(tok_.n_vocab()) +
+                      " pieces but token_embd.weight has only " +
+                      std::to_string(model_.cfg().n_vocab) +
+                      " rows; a prompt token past the table gets a zero "
+                      "embedding row";
+        KRK_WARN("%s", vocab_note_.c_str());
+    }
 
     const size_t as = be_->act_size();
     const i64 C = chunk_;

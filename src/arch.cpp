@@ -1124,12 +1124,20 @@ constexpr ArchSpec kTable[] = {
     //   * the window pattern was laguna's (full layer first, period 4).
     // The shape is Moe; qk_norm and rope_neox are true here because the file
     // carries per-head q/k norms and rotates with the half-split pairing.
-    {"gpt-oss", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target,
-     "gpt-oss",
-     "the loader reads its whole schema (sinks, attention-output bias, "
-     "per-expert FFN biases, the logit-side router bias, the alternating "
-     "window and the one-base YaRN rope); coherence at depth is not yet "
-     "pinned against a CPU oracle",
+    //
+    // Yes, and the last gap is closed rather than waved through: the row used
+    // to say "coherence at depth is not yet pinned against a CPU oracle", and
+    // test_gpt_oss_whole_graph is that oracle. It builds a four-layer file
+    // carrying every tensor listed above, pins the logits row after four greedy
+    // tokens, and then REMOVES each piece in turn (sinks, attn_output.bias,
+    // ffn_gate_inp.bias, the per-expert FFN biases, the window): every removal
+    // moves the pinned row, so the pin is a measurement of the whole graph and
+    // not of a subset that happens to decode. It also pins the two properties a
+    // depth test needs to mean anything -- the same file pinned twice is the
+    // same row, and one token per prefill chunk gives that row again, bit for
+    // bit, at 1, 2, 3 and 4 generated tokens.
+    {"gpt-oss", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "gpt-oss",
+     "",
      false, false, false, false, false, true, 2, true, 0, true},
     // MoVA: the attention *values* are a routed expert set of their own, on top
     // of an attention output gate.
