@@ -6235,6 +6235,16 @@ struct SchemaSpec {
     // Head width, when it must differ from n_embd/n_head -- which is what tells
     // gemma's 27B rule apart from the ordinary 1/sqrt(head_dim).
     i32 hd = 8;
+    // The two softcaps the gemma family states in its metadata: the one inside
+    // attention (gemma2) and the one on the head (gemma1/2/3). 0 writes no key.
+    f32 attn_softcap = 0.0f;    // <arch>.attention.logit_softcapping
+    f32 final_softcap = 0.0f;   // <arch>.final_logit_softcapping
+    // gemma's attention scale is an explicit key when the file states one.
+    bool write_arch_keys = false;
+    // Tensors a real file of this family carries that the schema builder does
+    // not write -- name and shape. Same purpose as MlaFix::extra_f16: a
+    // "refused by name" claim is tested on a file that carries the piece.
+    std::vector<std::pair<std::string, std::vector<i64>>> extra_f16;
 };
 
 static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
@@ -6258,6 +6268,10 @@ static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
     b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
     b.meta_f32(arch + ".rope.freq_base", 10000.0f);
     if (v.clamp_kqv > 0.0f) b.meta_f32(arch + ".attention.clamp_kqv", v.clamp_kqv);
+    if (v.attn_softcap > 0.0f)
+        b.meta_f32(arch + ".attention.logit_softcapping", v.attn_softcap);
+    if (v.final_softcap > 0.0f)
+        b.meta_f32(arch + ".final_logit_softcapping", v.final_softcap);
     if (v.attn_scale_key > 0.0f)
         b.meta_f32(arch + ".attention.scale", v.attn_scale_key);
     if (v.embd_scale_key > 0.0f)
@@ -6335,6 +6349,15 @@ static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
                      vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
         b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
                      vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+    }
+    for (const auto &e : v.extra_f16) {
+        std::vector<u64> ne;
+        size_t n = 1;
+        for (i64 d : e.second) {
+            ne.push_back(static_cast<u64>(d));
+            n *= static_cast<size_t>(d);
+        }
+        b.tensor_f16(e.first, ne, std::vector<f32>(n, 0.02f));
     }
     return b.write(path);
 }
@@ -9183,7 +9206,16 @@ static void test_arch_table() {
         CHECK(s->gelu_ffn,
               "a gemma stack gates its FFN with GeGLU, not SwiGLU");
         CHECK(s->gemma_norm, "and scales the embedding by sqrt(n_embd)");
-        CHECK(s->qk_norm, "and carries QK-norm tensors");
+        // Gemma 3 and 4 carry `attn_q_norm`/`attn_k_norm`; Gemma 1 and 2 do
+        // NOT -- llama.cpp's gemma.cpp and gemma2.cpp create attn_norm,
+        // ffn_norm and (on gemma2) the branch post norms, and no QK-norm. A
+        // flag that said otherwise refused every real Gemma 1/2 file for a
+        // tensor its converter never writes.
+        const bool wants_qk = std::string(g) == "gemma3" ||
+                              std::string(g) == "gemma4";
+        CHECK(s->qk_norm == wants_qk,
+              wants_qk ? "and carries QK-norm tensors (gemma3, gemma4)"
+                       : "and carries NO QK-norm (gemma, gemma2)");
     }
     // The window pattern is the arch's, and it is the one thing that made
     // gemma3 look unimplemented after the kernel learned windows: period 6 with
@@ -9587,8 +9619,19 @@ static void test_load_verdict() {
         Gguf gc;
         CHECK(gc.load(control, &err), "the control loads");
         const ModelVerdict vc = assess_model(gc);
-        CHECK(vc.runnable, "an embedding alone clears the shape rule");
-        CHECK(vc.blockers.empty(), "and nothing else objects");
+        // The shape rule is about the EMBEDDING, and this file has one -- so the
+        // shape half must stop objecting. It is still not runnable, and that
+        // correction is deliberate: `engram_*` is a residual lookup inside the
+        // layer (see kGapTensors), so a file carrying it is refused by name. The
+        // two rules are asserted separately here so neither hides the other.
+        bool shape_ok = true, engram_named = false;
+        for (const std::string &r : vc.blockers) {
+            if (r.find("token_embd.weight") != std::string::npos) shape_ok = false;
+            if (r.find("Engram") != std::string::npos) engram_named = true;
+        }
+        CHECK(shape_ok, "an embedding alone clears the shape rule");
+        CHECK(!vc.runnable && engram_named,
+              "and the Engram tensors are what refuses it now");
         made.push_back(control);
 
         // The other half of the rule, and the one a name-level pass misses: a
@@ -20276,6 +20319,11 @@ struct MlaFix {
     // the converter writes it, i.e. 0.1*mscale_all_dim.
     f32 yarn_factor = 0.0f;
     f32 yarn_log_mul = 0.0f;
+    // Tensors a real file of this family carries that the fixture's own builder
+    // does not write -- name and shape, filled with a fixed pattern. It is how a
+    // "we refuse this file by name" claim gets tested on a file that actually
+    // carries the piece, instead of on one that quietly lacks it.
+    std::vector<std::pair<std::string, std::vector<i64>>> extra_f16;
     // ---- C1: compressed attention (CSA/HCA) ---------------------------
     // One ratio per layer; empty means every layer is dense (the shape the
     // whole-graph pin already used). A non-zero ratio writes the compressor
@@ -20665,6 +20713,17 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
             w2(p + "ffn_down.weight", static_cast<u64>(kMlaFF),
                static_cast<u64>(kMlaEmbd), 620 + l);
         }
+    }
+    for (const auto &e : f.extra_f16) {
+        std::vector<u64> ne;
+        size_t n = 1;
+        for (i64 d : e.second) {
+            ne.push_back(static_cast<u64>(d));
+            n *= static_cast<size_t>(d);
+        }
+        std::vector<f32> d(n);
+        for (size_t i = 0; i < n; i++) d[i] = wv(static_cast<i64>(i) + 3);
+        b.tensor_f16(e.first, ne, d);
     }
     return b.write(path);
 }
@@ -21604,6 +21663,405 @@ static void test_dsv4_hash_route() {
 // head can argmax one token and stop, and this repo has already been bitten by a
 // gate that compared only the sampled token (the attention rewrite produced the
 // same first token from two different kernels).
+// ---- the pending-model fixtures -------------------------------------------
+//
+// Every architecture string the table lists and the engine could not run had a
+// REASON: either a missing graph piece, or a row that was never run. This pair
+// of groups turns each of those reasons into a file built from the family's own
+// definition, so the claim is measured rather than inherited:
+//
+//   * `test_pending_model_fixtures` -- the families that now RUN. Each file is
+//     built from the tensor list the reference declares for that family, taken
+//     through verify -> load -> generate, and then DELETED, so the suite leaves
+//     no fixture zoo behind and every arm is self-contained.
+//   * `test_pending_model_refusals` -- the families that still cannot run. The
+//     point is not that a refusal happens (an unknown arch string is refused
+//     too); it is that the refusal names the piece that is missing, comes from
+//     the ROW rather than from a name-level fallback, and is the same answer the
+//     loader gives.
+//
+// Both groups share one probe so a family is never measured two ways.
+static std::string pend_probe(const std::string &path, const char *label,
+                              bool expect_run) {
+    std::string err;
+    Gguf g;
+    std::string outcome;
+    if (!g.load(path, &err)) return "gguf load failed: " + err;
+    const ModelVerdict v = assess_model(g);
+    if (v.runnable != expect_run)
+        outcome += std::string("verdict ") + (v.runnable ? "runnable" : "refused") +
+                   " but expected the opposite; ";
+    // A refusal that came from an UNKNOWN arch proves nothing about the row, so
+    // the row is checked directly: `known` and a non-empty why.
+    if (!expect_run) {
+        if (!v.known) outcome += "the arch is not in the table; ";
+        if (v.spec && v.spec->why && !v.spec->why[0])
+            outcome += "the row carries no reason; ";
+        if (v.blockers.empty()) outcome += "no blocker was recorded; ";
+    }
+    if (v.runnable && !v.blockers.empty())
+        outcome += "runnable with blockers recorded; ";
+    Backend *cpu = make_cpu_backend();
+    {
+        Model m;
+        std::string e2;
+        const bool ok = m.load(*cpu, path, &e2);
+        if (ok != expect_run)
+            outcome += std::string("model.load=") + (ok ? "1" : "0") +
+                       " (" + e2 + "); ";
+        if (ok) m.unload();
+    }
+    bool generated = false;
+    if (expect_run) {
+        Engine e;
+        EngineConfig c;
+        c.model_path = path;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        std::string e3;
+        if (!e.init(cpu, c, &e3)) {
+            outcome += "engine.init failed: " + e3 + "; ";
+        } else {
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 2;
+            GenerateResult r;
+            generated = e.generate(gp, &r);
+            if (!generated) {
+                outcome += "generate failed; ";
+            } else {
+                f32 peak = 0.0f;
+                const i32 nv = e.model().cfg().n_vocab;
+                for (i32 i = 0; i < nv; i++)
+                    peak = std::max(peak, std::fabs(e.last_logits()[i]));
+                if (!(peak > 0.0f) || !(peak < 1e6f))
+                    outcome += "the logits are not finite; ";
+            }
+        }
+    }
+    delete cpu;
+    return outcome;
+}
+
+static void test_pending_model_fixtures() {
+    auto arm = [](const std::string &path, const char *label) {
+        const std::string bad = pend_probe(path, label, /*expect_run=*/true);
+        if (!bad.empty())
+            std::fprintf(stderr, "[pend] %s: %s\n", label, bad.c_str());
+        CHECK(bad.empty(), (std::string(label) +
+                            " runs end to end from its own definition").c_str());
+        // Test and DELETE: the suite leaves no fixture zoo behind, and every arm
+        // builds what it measures.
+        CHECK(std::remove(path.c_str()) == 0,
+              (std::string(label) + "'s fixture is removed").c_str());
+    };
+
+    // ---- gemma: llama's block + embedding scale + GeGLU + both softcaps ----
+    // llama.cpp's gemma.cpp creates attn_norm, ffn_norm and output_norm and NO
+    // QK-norm. The row said otherwise for the whole family, which refused every
+    // real Gemma 1 file for a tensor its converter never writes; the control
+    // for that fix is below, on gemma2.
+    {
+        SchemaSpec v;
+        v.arch = "gemma";
+        v.final_softcap = 30.0f;
+        CHECK(build_schema_model("kraken-pend-gemma.gguf", v), "wrote gemma");
+        arm("kraken-pend-gemma.gguf", "gemma");
+        // The family constant, checked where it is applied: Gemma scales the
+        // embedding by sqrt(n_embd) before layer 0, and a run without it has a
+        // residual that grows with depth rather than holding.
+        SchemaSpec c2;
+        c2.arch = "gemma";
+        c2.final_softcap = 30.0f;
+        CHECK(build_schema_model("kraken-pend-gemma-cfg.gguf", c2), "wrote gemma");
+        std::string err;
+        f32 embd = 0.0f, cap = 0.0f;
+        if (schema_cfg("kraken-pend-gemma-cfg.gguf",
+                       [&](const Model &m) {
+                           embd = m.cfg().embd_scale;
+                           cap = m.cfg().logit_softcap;
+                       },
+                       err)) {
+            CHECK_NEAR(embd, std::sqrt(32.0f), 1e-4f,
+                       "gemma scales the embedding by sqrt(n_embd)");
+            CHECK_NEAR(cap, 30.0f, 1e-6f,
+                       "and the file's final-logit softcap reaches the config");
+        } else {
+            CHECK(false, ("the gemma config arm loads: " + err).c_str());
+        }
+        std::remove("kraken-pend-gemma-cfg.gguf");
+    }
+    // ---- gemma2: the same plus branch norms, a window and the SCORE cap ----
+    // Partial, and that is not stale: the attention-logit softcap is applied by
+    // the reference attention only, so a HIP build refuses. The row must still
+    // say so, or a Partial would read as "closed everywhere".
+    {
+        SchemaSpec v;
+        v.arch = "gemma2";
+        v.post_norms = true;
+        v.swa_window = 1024;
+        v.attn_softcap = 50.0f;
+        v.final_softcap = 30.0f;
+        CHECK(build_schema_model("kraken-pend-gemma2.gguf", v), "wrote gemma2");
+        arm("kraken-pend-gemma2.gguf", "gemma2");
+        const ArchSpec *row = arch_lookup("gemma2");
+        CHECK(row && row->support == ArchSupport::Partial &&
+                  std::string(row->why).find("softcap") != std::string::npos,
+              "gemma2 stays Partial and still names the softcap the HIP "
+              "kernels do not apply");
+        CHECK(row && !row->qk_norm,
+              "and the row carries no QK-norm, which is what real Gemma 2 "
+              "files are");
+    }
+    // ---- gemma3: gemma2's branches plus per-head QK-norm, no score cap ----
+    {
+        SchemaSpec v;
+        v.arch = "gemma3";
+        v.post_norms = true;
+        v.q_norm_w = 8;
+        v.k_norm_w = 8;
+        v.swa_window = 1024;
+        v.final_softcap = 30.0f;
+        CHECK(build_schema_model("kraken-pend-gemma3.gguf", v), "wrote gemma3");
+        arm("kraken-pend-gemma3.gguf", "gemma3");
+        const ArchSpec *row = arch_lookup("gemma3");
+        CHECK(row && row->qk_norm,
+              "gemma3 is the gemma that DOES declare the QK norms");
+    }
+    // ---- the two Qwen vision families: the TEXT tower is the schema ----
+    // Both stay Partial because the vision tower and the projector are tensors
+    // this engine never reads -- but the text half is a real graph, and a
+    // text-only file of either family has to run or the row is a bluff.
+    {
+        SchemaSpec v;
+        v.arch = "qwen2vl";
+        CHECK(build_schema_model("kraken-pend-qwen2vl.gguf", v), "wrote qwen2vl");
+        // Measured, and worth writing down because the opposite was expected:
+        // the vision note is the ROW's `why` (a Partial row contributes its
+        // reason as a note), so it appears for a text-only file too. It is
+        // arch-level disclosure, not tensor-level -- conservative, never silent,
+        // and for once the conservative direction is the cheap one: a repack can
+        // move the tower into a sibling GGUF and the note still holds.
+        Gguf g;
+        std::string err;
+        CHECK(g.load("kraken-pend-qwen2vl.gguf", &err), "re-read plain qwen2vl");
+        const ModelVerdict pv = assess_model(g);
+        bool said_vision = false;
+        for (const std::string &n : pv.notes)
+            if (n.find("vision") != std::string::npos) said_vision = true;
+        CHECK(said_vision,
+              "the vision caveat is arch-level: a text-only qwen2vl file "
+              "carries it too");
+        arm("kraken-pend-qwen2vl.gguf", "qwen2vl");
+    }
+    // ---- the same two families WITH their vision tower ----
+    // A real qwen2vl/qwen3vl file carries `v.blk.*` blocks and a `mm.*`
+    // projector. Neither is read by the text path, so the question this arm
+    // answers is whether the file is refused, run as a text model, or -- the
+    // failure the deepseek41 arm above caught -- loaded with the block silently
+    // dropped. Checked here because the rows are `Partial` on exactly that.
+    {
+        SchemaSpec v;
+        v.arch = "qwen2vl";
+        v.extra_f16 = {{"v.blk.0.attn_q.weight", {32, 32}},
+                       {"v.blk.0.ffn_up.weight", {32, 64}},
+                       {"mm.0.weight", {32, 32}},
+                       {"mm.2.weight", {32, 32}}};
+        CHECK(build_schema_model("kraken-pend-qwen2vl-mm.gguf", v),
+              "wrote qwen2vl with a vision tower");
+        std::string err;
+        ModelVerdict vd;
+        if (schema_cfg("kraken-pend-qwen2vl-mm.gguf",
+                       [&](const Model &) {}, err)) {
+            Gguf g;
+            CHECK(g.load("kraken-pend-qwen2vl-mm.gguf", &err),
+                  "re-read the multimodal file");
+            vd = assess_model(g);
+        }
+        bool names_vision = false;
+        for (const std::string &r : vd.notes)
+            if (r.find("vision") != std::string::npos) names_vision = true;
+        // The text tower runs and the vision half is DISCLOSED. That is what
+        // `Partial` buys here: a multimodal file is not refused, because the
+        // text path is real, and it is not silent, because an image prompt would
+        // be ignored and the note says so.
+        CHECK(vd.runnable, "a multimodal qwen2vl file is not refused");
+        CHECK(names_vision,
+              "and the vision tower it cannot read is named in the report");
+        bool ignored_v_blk = true;
+        for (const std::string &b2 : vd.blockers)
+            if (b2.find("v.blk") != std::string::npos) ignored_v_blk = false;
+        CHECK(ignored_v_blk,
+              "the vision tensors are left behind rather than refused as a "
+              "malformed text graph");
+        std::remove("kraken-pend-qwen2vl-mm.gguf");
+    }
+    {
+        SchemaSpec v;
+        v.arch = "qwen3vl";
+        v.q_norm_w = 8;
+        v.k_norm_w = 8;
+        CHECK(build_schema_model("kraken-pend-qwen3vl.gguf", v), "wrote qwen3vl");
+        arm("kraken-pend-qwen3vl.gguf", "qwen3vl");
+    }
+    // ---- deepseek41: the V4 graph with a dense core ----
+    // A real V4.1 checkpoint is 343B-763B and carries Engram and the
+    // hyper-connections, but the stack itself is deepseek4's -- which now runs
+    // the compressed attention too. A dense-core file of this arch string is
+    // the arm that proves the alias is a schema and not a name.
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Shared;
+        f.n_layer = 2;
+        CHECK(build_mla_fixture("kraken-pend-ds41.gguf", f, "deepseek41"),
+              "wrote deepseek41");
+        arm("kraken-pend-ds41.gguf", "deepseek41");
+    }
+    // ---- deepseek41 with the tensors a REAL V4.1 file carries ----
+    // The arm above is a dense-core file: every ratio 0, no hyper-connections,
+    // no Engram. A real checkpoint always ships `hc_*` (llama.cpp's
+    // deepseek4.cpp creates hc_{attn,ffn}_{fn,base,scale} with no OPTIONAL flag)
+    // and V4.1 adds Engram. Those are the row's stated gap, so the file that
+    // carries them must be REFUSED BY NAME -- loaded with the block skipped, it
+    // would decode fluent text that is not this model.
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Shared;
+        f.n_layer = 2;
+        f.extra_f16 = {{"blk.0.hc_attn_fn.weight", {8, 8}},
+                       {"blk.0.hc_attn_base.weight", {8}},
+                       {"blk.0.hc_attn_scale.weight", {3}}};
+        CHECK(build_mla_fixture("kraken-pend-ds41-hc.gguf", f, "deepseek41"),
+              "wrote the V4.1 file with its hyper-connections");
+        const std::string bad = pend_probe("kraken-pend-ds41-hc.gguf", "ds41-hc",
+                                          /*expect_run=*/false);
+        if (!bad.empty())
+            std::fprintf(stderr, "[pend] ds41-hc: %s\n", bad.c_str());
+        CHECK(bad.empty(),
+              "a V4.1 file carrying hc_* is refused, not loaded without it");
+        std::remove("kraken-pend-ds41-hc.gguf");
+    }
+    // ---- gpt-oss: its loader schema, one layer ----
+    {
+        MoeSpec m;
+        m.arch = "gpt-oss";
+        CHECK(build_tiny_moe_model("kraken-pend-gptoss.gguf", m), "wrote gpt-oss");
+        arm("kraken-pend-gptoss.gguf", "gpt-oss");
+    }
+}
+
+static void test_pending_model_refusals() {
+    auto arm = [](const std::string &path, const char *label, const char *piece) {
+        const std::string bad = pend_probe(path, label, /*expect_run=*/false);
+        if (!bad.empty())
+            std::fprintf(stderr, "[pend] %s: %s\n", label, bad.c_str());
+        CHECK(bad.empty(),
+              (std::string(label) + " is refused for its own reason").c_str());
+        // The refusal must NAME the missing piece. A blocker that says only
+        // "not supported" costs the next person the same investigation again.
+        Gguf g;
+        std::string err;
+        if (!g.load(path, &err)) {
+            CHECK(false, ("re-read " + std::string(label) + ": " + err).c_str());
+            return;
+        }
+        const ModelVerdict v = assess_model(g);
+        bool named = false;
+        for (const auto &b : v.blockers)
+            if (b.find(piece) != std::string::npos) named = true;
+        CHECK(named, (std::string(label) + "'s refusal names " + piece).c_str());
+        CHECK(std::remove(path.c_str()) == 0,
+              (std::string(label) + "'s fixture is removed").c_str());
+    };
+
+    // ---- k2-horizon: the VALUES are a routed expert set ----
+    {
+        MoeSpec m;
+        m.arch = "k2-horizon";
+        CHECK(build_tiny_moe_model("kraken-pend-k2.gguf", m), "wrote k2-horizon");
+        arm("kraken-pend-k2.gguf", "k2-horizon", "attention values");
+    }
+    // ---- minimax-m3: block-sparse throughout, multimodal, DSpark head ----
+    {
+        MoeSpec m;
+        m.arch = "minimax-m3";
+        CHECK(build_tiny_moe_model("kraken-pend-minimax.gguf", m),
+              "wrote minimax-m3");
+        arm("kraken-pend-minimax.gguf", "minimax-m3", "MiniMax Sparse Attention");
+    }
+    // ---- diffuse (LLaDA): masked diffusion, not a left-to-right decode ----
+    {
+        SchemaSpec v;
+        v.arch = "diffuse";
+        v.q_norm_w = 8;
+        v.k_norm_w = 8;
+        CHECK(build_schema_model("kraken-pend-diffuse.gguf", v), "wrote diffuse");
+        arm("kraken-pend-diffuse.gguf", "diffuse", "diffusion");
+    }
+    // ---- dspark: a parallel block drafter with a markov bigram head ----
+    {
+        GgufBuilder b;
+        const std::string a = "dspark";
+        b.meta_str("general.architecture", a);
+        b.meta_str("general.name", "kraken-pend-dspark");
+        b.meta_u32("general.alignment", 32);
+        b.meta_u32(a + ".block_count", 1);
+        b.meta_u32(a + ".block_size", 4);
+        b.meta_u32(a + ".embedding_length", 32);
+        b.meta_u32(a + ".attention.head_count", 4);
+        b.meta_u32(a + ".attention.key_length", 8);
+        auto vec = [](size_t n, i64 base) {
+            std::vector<f32> v(n);
+            for (size_t i = 0; i < n; i++)
+                v[i] = wv(base + static_cast<i64>(i) * 0.01);
+            return v;
+        };
+        b.tensor_f16("fc.weight", {32, 32}, vec(32 * 32, 1));
+        b.tensor_f16("blk.0.attn_q.weight", {32, 32}, vec(32 * 32, 2));
+        b.tensor_f16("blk.0.attn_k.weight", {32, 32}, vec(32 * 32, 3));
+        b.tensor_f16("blk.0.attn_v.weight", {32, 32}, vec(32 * 32, 4));
+        b.tensor_f16("blk.0.attn_output.weight", {32, 32}, vec(32 * 32, 5));
+        b.tensor_f16("markov.w1.weight", {32, 8}, vec(32 * 8, 6));
+        b.tensor_f16("markov.w2.weight", {8, 32}, vec(8 * 32, 7));
+        b.tensor_f16("confidence.proj.weight", {32, 1}, vec(32, 8));
+        CHECK(b.write("kraken-pend-dspark.gguf"), "wrote dspark");
+        arm("kraken-pend-dspark.gguf", "dspark", "markov");
+    }
+    // ---- deepseek4-dspark: an MTP extract, not a model ----
+    {
+        GgufBuilder b;
+        const std::string a = "deepseek4-dspark";
+        b.meta_str("general.architecture", a);
+        b.meta_str("general.name", "kraken-pend-mtp");
+        b.meta_u32("general.alignment", 32);
+        b.meta_u32(a + ".block_count", 1);
+        auto vec = [](size_t n, i64 base) {
+            std::vector<f32> v(n);
+            for (size_t i = 0; i < n; i++)
+                v[i] = wv(base + static_cast<i64>(i) * 0.01);
+            return v;
+        };
+        b.tensor_f16("mtp.fc_embedding.weight", {32, 32}, vec(32 * 32, 1));
+        b.tensor_f32("mtp.pre_fc_norm_embedding.weight", {32}, vec(32, 2));
+        CHECK(b.write("kraken-pend-mtp.gguf"), "wrote the MTP extract");
+        arm("kraken-pend-mtp.gguf", "deepseek4-dspark",
+            "multi-token-prediction head");
+    }
+    // ---- qwen4-mtp: a head set for a target this engine does not run ----
+    {
+        GgufBuilder b;
+        const std::string a = "qwen4-mtp";
+        b.meta_str("general.architecture", a);
+        b.meta_str("general.name", "kraken-pend-qwen4mtp");
+        b.meta_u32("general.alignment", 32);
+        b.meta_u32(a + ".block_count", 1);
+        b.tensor_f16("mtp.fc_embedding.weight", {32, 32},
+                     std::vector<f32>(32 * 32, 0.01f));
+        CHECK(b.write("kraken-pend-qwen4mtp.gguf"), "wrote qwen4-mtp");
+        arm("kraken-pend-qwen4mtp.gguf", "qwen4-mtp", "qwen4exp target");
+    }
+}
+
 // C1 -- DeepSeek-V4 compressed attention, END TO END.
 //
 // The arithmetic was already pinned (test_dsv4_compressed_attention: the state
@@ -25064,6 +25522,8 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_trit_sign_extreme)
     TEST_GROUP(test_q2code_dot)
     TEST_GROUP(test_arch_row_pins)
+    TEST_GROUP(test_pending_model_fixtures)
+    TEST_GROUP(test_pending_model_refusals)
     TEST_GROUP(test_minicpm_embedding_scale_forward)
     TEST_GROUP(test_olmoe_expert_weight_forward)
     TEST_GROUP(test_qwen3moe_forward)

@@ -25,9 +25,29 @@ adds six of the GGUF spec's own "known values" architectures — `mpt` and
 `bloom` bring ALiBi, `falcon` a parallel branch with two norms — see
 `docs/ALIBI-AND-MPT-BLOOM.md`.
 
+**Update (2026-10-29):** every recognised-but-pending family now has a fixture
+built from its own definition, run once, and deleted again —
+`test_pending_model_fixtures` (gemma, gemma2, gemma3, qwen2vl, qwen3vl,
+deepseek41, gpt-oss) and `test_pending_model_refusals` (k2-horizon, minimax-m3,
+diffuse, dspark, deepseek4-dspark, qwen4-mtp). `gemma` and `gemma3` are `Yes` as
+a result; `gemma2` stays `Partial` for one measured reason (its attention-logit
+softcap is applied by the reference attention only, so a HIP build refuses it by
+capability); `qwen2vl`/`qwen3vl` stay `Partial` because their vision towers are
+not read while their text halves run; `deepseek41` runs its whole graph on a
+dense-core file. The six still-refused families are refused BY NAME, and the
+test asserts the name is in the message.
+
+That pass also closed two holes it found. `gemma`'s QK-norm was a family
+constant, so every real Gemma-1/2 file was refused for `attn_q_norm.weight` — a
+tensor llama.cpp's gemma.cpp/gemma2.cpp never create; it is a per-row flag now.
+And a `deepseek41` file carrying V4.1's `hc_*` Sinkhorn hyper-connections or
+`engram_*` tensors used to LOAD with no blocker at all, i.e. run the graph
+without the residual it was trained with; both are `kGapTensors` entries now and
+refused by name.
+
 Verified arch strings in `src/arch.cpp` — KNOWN and read, which is not the same
 as running: `deepseek4-dspark`, `qwen4-mtp`, `dspark`, `k2-horizon`,
-`minimax-m3`, `muse-glimmer`, `spark2_5` and `diffuse` are recognised and still
+`minimax-m3` and `diffuse` are recognised and still
 refused, each with its own named reason (`Assess`, `--inspect`). `gemma4` ran the
 whole dense graph in this pass (below). A recognised
 arch is how a refusal names the graph it read instead of shrugging. The full
