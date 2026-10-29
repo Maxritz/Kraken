@@ -88,6 +88,65 @@ inline void par_for(i64 n, i64 grain, f64 est_flops, F &&body) {
     Pool::get().run(n, grain, split, std::forward<F>(body));
 }
 
+#if defined(KRK_DOT_AVX2)
+// ---- vector transcendentals for the elementwise stages ---------------------
+//
+// `silu_mul` was 7.6% of a run and 13 ms of a 134 ms prefill: a scalar loop
+// calling std::exp once per element. exp is ~20 ns of latency and nothing in
+// that loop could overlap it, so the FFN activation cost more than the GEMM
+// that feeds it.
+//
+// exp here is the Cephes polynomial evaluated eight at a time, with 2^n folded
+// in by adding to the exponent field. Its relative error is ~1e-7 -- larger
+// than a correctly-rounded libm exp, which is why this lives behind the WIDE
+// tier and not in the reference path: the default build still calls std::exp
+// and still produces the bits the golden hashes pin.
+#define KRK_EXP_POLY(dst, x)                                                  \
+    do {                                                                      \
+        const __m256 _hi = _mm256_set1_ps(88.3762626647949f);                 \
+        const __m256 _lo = _mm256_set1_ps(-87.3365478515625f);                \
+        const __m256 _l2e = _mm256_set1_ps(1.44269504088896341f);             \
+        __m256 y = _mm256_min_ps(_mm256_max_ps((x), _lo), _hi);               \
+        __m256 fx = _mm256_floor_ps(_mm256_fmadd_ps(y, _l2e,                 \
+                                                    _mm256_set1_ps(0.5f)));   \
+        y = _mm256_fnmadd_ps(fx, _mm256_set1_ps(0.693359375f), y);            \
+        y = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f), y);         \
+        const __m256 z = _mm256_mul_ps(y, y);                                 \
+        __m256 p = _mm256_set1_ps(1.9875691500e-4f);                          \
+        p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(1.3981999507e-3f));          \
+        p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(8.3334519073e-3f));          \
+        p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(4.1665795894e-2f));          \
+        p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(1.6666665459e-1f));          \
+        p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(5.0000001201e-1f));          \
+        p = _mm256_fmadd_ps(p, z, _mm256_add_ps(y, _mm256_set1_ps(1.0f)));    \
+        const __m256i n = _mm256_cvtps_epi32(fx);                             \
+        const __m256i e2 = _mm256_slli_epi32(_mm256_add_epi32(                \
+                                                n, _mm256_set1_epi32(127)),   \
+                                            23);                              \
+        (dst) = _mm256_mul_ps(p, _mm256_castsi256_ps(e2));                    \
+    } while (0)
+
+__attribute__((target("avx2,fma"))) void silu_mul_avx2(f32 *o, const f32 *g,
+                                                      const f32 *u, i64 n) {
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    i64 i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 x = _mm256_loadu_ps(g + i);
+        __m256 e;
+        // exp(-x), evaluated on -x directly: one negation of the sign bit beats
+        // a reciprocal and keeps the accuracy of the polynomial.
+        KRK_EXP_POLY(e, _mm256_xor_ps(x, sign));
+        const __m256 silu = _mm256_div_ps(x, _mm256_add_ps(one, e));
+        _mm256_storeu_ps(o + i, _mm256_mul_ps(silu, _mm256_loadu_ps(u + i)));
+    }
+    for (; i < n; i++) {
+        const f32 x = g[i];
+        o[i] = (x / (1.0f + std::exp(-x))) * u[i];
+    }
+}
+#endif // KRK_DOT_AVX2
+
 void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps,
                   const i32 *row_exp = nullptr) {
     // Rows are independent and each row keeps its own reduction.
@@ -1936,6 +1995,14 @@ public:
         f32 *o = static_cast<f32 *>(out);
         const f32 *g = static_cast<const f32 *>(gate);
         const f32 *u = static_cast<const f32 *>(up);
+#if defined(KRK_DOT_AVX2)
+        if (vec_dot_wide() && cpu_has_avx2()) {
+            // Grain 4096 rather than 8192: these blocks are now cheap enough
+            // that 8192 leaves one thread holding most of a 4096-wide row.
+            par_for(n, 2048, 2.0 * static_cast<f64>(n),
+                    [&](i64 b, i64 e) { silu_mul_avx2(o + b, g + b, u + b, e - b); });
+        } else
+#endif
         par_for(n, 8192, 2.0 * static_cast<f64>(n),
                 [&](i64 b, i64 e) {
                     for (i64 i = b; i < e; i++) {

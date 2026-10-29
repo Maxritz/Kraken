@@ -1864,6 +1864,15 @@ bool dtype_row_aligned(DType t, i64 n) {
     return bs <= 1 || (n % bs) == 0;
 }
 
+#if defined(KRK_DOT_AVX2)
+// Wide row conversion, defined below the ISA probes (it asks the CPU what it
+// can run). False means "this host cannot", and the caller keeps its scalar
+// loop -- so the wide form is an accelerator, never a second code path that can
+// disagree.
+static bool dequant_f16_wide(const u16 *h, f32 *out, i64 n);
+static bool dequant_bf16_wide(const u16 *h, f32 *out, i64 n);
+#endif
+
 void dequant_row(DType t, const void *src, f32 *out, i64 n) {
     const u8 *p = static_cast<const u8 *>(src);
     if (t == DType::F32) {
@@ -1872,11 +1881,25 @@ void dequant_row(DType t, const void *src, f32 *out, i64 n) {
     }
     if (t == DType::F16) {
         const u16 *h = static_cast<const u16 *>(src);
+        // Wide and EXACT: _mm256_cvtph_ps is an IEEE half-to-single
+        // conversion, so it returns bit for bit what fp16_to_fp32() returns for
+        // every finite value. No accuracy budget is spent here, which is why
+        // this needs no tier. It is the same defect vec_dot had (an out-of-line
+        // call per weight element, docs/BENCH-CPU-DOT.md) surviving in the one
+        // place nobody profiled: the embedding gather, 4.9 ms per call.
+#if defined(KRK_DOT_AVX2)
+        if (dequant_f16_wide(h, out, n)) return;
+#endif
         for (i64 i = 0; i < n; i++) out[i] = fp16_to_fp32(h[i]);
         return;
     }
     if (t == DType::BF16) {
         const u16 *h = static_cast<const u16 *>(src);
+        // bf16 to f32 is a shift, exactly, so a whole vector is one instruction
+        // pair with no rounding to argue about.
+#if defined(KRK_DOT_AVX2)
+        if (dequant_bf16_wide(h, out, n)) return;
+#endif
         for (i64 i = 0; i < n; i++) out[i] = bf16_to_fp32(h[i]);
         return;
     }
@@ -2945,6 +2968,40 @@ bool env_dot_avx2() {
     return e[0] != '0';
 }
 } // namespace
+
+#if defined(KRK_DOT_AVX2)
+// The wide row conversions. They live here, below the probes, because they ask
+// the CPU; the caller above only needs to know whether the work was done.
+static bool dequant_f16_wide(const u16 *h, f32 *out, i64 n) {
+    if (!cpu_has_avx2()) return false;
+    i64 i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m128i h8 = _mm_loadu_si128(
+            reinterpret_cast<const __m128i *>(h + i));
+        _mm256_storeu_ps(out + i, _mm256_cvtph_ps(h8));
+    }
+    for (; i < n; i++) out[i] = fp16_to_fp32(h[i]);
+    return true;
+}
+
+static bool dequant_bf16_wide(const u16 *h, f32 *out, i64 n) {
+    if (!cpu_has_avx2()) return false;
+    i64 i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m128i h8 = _mm_loadu_si128(
+            reinterpret_cast<const __m128i *>(h + i));
+        // Zero-extend each 16-bit lane to 32 and shift it into the f32
+        // exponent field: bf16 IS the top half of f32, so this is the
+        // conversion itself and not an approximation of it.
+        const __m256i w = _mm256_cvtepu16_epi32(h8);
+        _mm256_storeu_ps(out + i,
+                         _mm256_castsi256_ps(_mm256_slli_epi32(w, 16)));
+    }
+    for (; i < n; i++) out[i] = bf16_to_fp32(h[i]);
+    return true;
+}
+#endif
+
 
 // The kernels live in the anonymous namespace above; these are the names the
 // backend links against. Without AVX2 there is no int8 kernel and the flag is
