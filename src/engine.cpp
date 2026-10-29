@@ -2,6 +2,7 @@
 // contiguous KV cache, streaming output and stop-string handling.
 #include "krk/engine.hpp"
 #include "krk/mova.hpp"
+#include "krk/diffusion.hpp"
 #include "krk/engram.hpp"
 #include "krk/moe_route.hpp"
 #include "krk/hc.hpp"
@@ -1160,6 +1161,26 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     if (kv_cap_ <= 0) kv_cap_ = 2048;
 
     chunk_ = std::max<i32>(1, std::min<i32>(cfg_.prefill_chunk, 1024));
+    // ---- the diffusion sequence length ------------------------------------
+    // A masked-diffusion pass cannot be chunked: the whole sequence is denoised
+    // at once and every position reads every other, so a chunk boundary would
+    // put tokens outside the model's view. The workspace is therefore sized for
+    // the LONGEST pass this engine will run, and the pass length is bounded here
+    // rather than at the call site -- a request that needs more is refused with
+    // a number instead of overrunning an activation buffer (measured: a
+    // 9-token pass against an 8-row workspace corrupted the heap and died in
+    // free()).
+    if (mc.diffusion) {
+        diffuse_max_tokens_ = std::min<i32>(
+            static_cast<i32>(std::min<i64>(kv_cap_, 4096)),
+            std::max<i32>(chunk_, static_cast<i32>(cfg_.n_ctx)));
+        if (diffuse_max_tokens_ <= 0)
+            diffuse_max_tokens_ = std::max<i32>(1, chunk_);
+        chunk_ = diffuse_max_tokens_;
+        KRK_INFO("diffusion: the whole sequence is one pass, so the workspace is "
+                 "sized for %d token(s) and a longer request is refused",
+                 diffuse_max_tokens_);
+    }
 
     // ---- multi-head latent attention: what this build can actually run ----
     //
@@ -3867,6 +3888,14 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     // every other family, which is the arithmetic that existed before the field
     // did.
     d.softcap = mc.attn_softcap;
+    // ---- the mask ---------------------------------------------------------
+    // A masked-diffusion file is BIDIRECTIONAL: every denoising pass is one
+    // chunk over the whole sequence, and a position may read the ones after it.
+    // This flag is the whole of the difference -- the op has always taken it,
+    // and both backends compute `n_keys = causal ? pos + 1 : pos0 + n_tok` -- so
+    // it is read from the MODEL rather than chosen at a call site, and a diffuse
+    // stack cannot run causal on one layer and not another.
+    d.causal = !mc.diffusion;
 
     // One dump hook per stage, taking the row this call will predict from (the
     // last one): a CPU run and a HIP run of the same prompt then differ at
@@ -4209,8 +4238,24 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // address one plane -- the aliasing llama.cpp implements by pointing
         // two layers' cache tensors at the same buffer.
         const i32 kv_src = model_.kv_source_layer(l);
-        void *kbase = kvt_k_.base(kv_src);
-        void *vbase = kvt_v_.base(kv_src);
+        // ---- the cacheless pass --------------------------------------------
+        // A masked-diffusion forward is one full-sequence chunk that is thrown
+        // away when it ends: the next denoising step rewrites every position.
+        // So a diffuse layer appends nothing and reads only the K/V it just
+        // projected -- `ws_k_`/`ws_v_` ARE this chunk's cache, with pos_stride
+        // one row and layer_stride 0 because the buffer holds one layer's
+        // chunk. Keeping the KV tier in the path would make the pass read a
+        // previous step's rows at the same positions, which silently mixes
+        // denoising steps that the schedule believes are independent.
+        void *kbase = nullptr;
+        void *vbase = nullptr;
+        if (mc.diffusion) {
+            kbase = ws_k_;
+            vbase = ws_v_;
+        } else {
+            kbase = kvt_k_.base(kv_src);
+            vbase = kvt_v_.base(kv_src);
+        }
         // A model may have no KV on this layer; only a missing pointer for a
         // KV-carrying layer is a resource refusal. Do not turn a valid null pair
         // on recurrent/pure-FFN blocks into a request failure.
@@ -4298,8 +4343,10 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                           model_.rope_frac_at(l), mc.rope_neox);
             // A shared-KV layer appends nothing: the layer that owns this
             // plane wrote these rows already, and a second write would put the
-            // token at two positions in one cache.
-            if (kv_src == l) be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
+            // token at two positions in one cache. A DIFFUSE layer appends
+            // nothing either, for the reason given where kbase is resolved.
+            if (kv_src == l && !mc.diffusion)
+                be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
             if (qsa_sel)
                 qsa_attention(l, n, d);
             else
@@ -5633,6 +5680,110 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
                       ws_x2_, L.wdown.gs);
         dump_row("attn.down", l, ws_x2_, n_embd_, n);
     }
+}
+
+bool Engine::generate_diffusion(const GenerateParams &p, GenerateResult *res,
+                                const std::vector<i32> &ids) {
+    const ModelConfig &mc = model_.cfg();
+    const i32 gen_length = p.max_tokens > 0 ? p.max_tokens : 32;
+    // The file's own schedule, with the caller's override on top. A block
+    // length of 0 means one block over the whole generation, which is the
+    // reference's degenerate-but-legal arm rather than a missing value.
+    const i32 block = diffuse_block_ > 0
+                          ? diffuse_block_
+                          : (mc.diffuse_block_length > 0 ? mc.diffuse_block_length
+                                                         : gen_length);
+    // Steps per BLOCK. The reference divides the user's total by the block
+    // count; a default of one step per block is the fastest schedule that still
+    // commits every position, and every step is a full-sequence forward.
+    const i32 steps = diffuse_steps_ > 0
+                          ? diffuse_steps_
+                          : std::max<i32>(1, block > 0 ? std::min<i32>(block, 8)
+                                                       : 1);
+    if (block <= 0 || gen_length <= 0) {
+        res->error = "diffusion: gen_length/block_length are not a schedule (" +
+                     std::to_string(gen_length) + "/" + std::to_string(block) + ")";
+        res->finish = FinishError;
+        return false;
+    }
+
+    DiffusionParams dp;
+    dp.gen_length = gen_length;
+    dp.block_length = block;
+    dp.steps = steps;
+    dp.mask_id = mc.diffuse_mask_id;
+    // The EOS rule rides the file's own end-of-text ids, and only under greedy:
+    // a sampled run keeps the sampler's answer rather than truncating on it.
+    dp.eos_id = p.sampler.greedy ? tok_.eos() : -1;
+    // The reference forces EOS off at positions that must not end the sequence
+    // (a block that still has unfilled positions before it). Same switch, same
+    // reason: an early EOS in the middle of a denoised block truncates a
+    // sentence the model was still filling in.
+    dp.eos_forbid_prefix = true;
+
+    std::vector<i32> seq = ids;
+    seq.resize(ids.size() + static_cast<size_t>(gen_length), dp.mask_id);
+    const i32 prompt_len = static_cast<i32>(ids.size());
+    const i32 n_vocab = n_vocab_;
+    std::vector<f32> logits(static_cast<size_t>(seq.size()) * n_vocab);
+
+    const Timer timer;
+    const i32 forwards = krk::diffusion_generate(
+        seq, prompt_len, n_vocab, dp,
+        [&](const i32 *toks, i32 n_tok, f32 *out) {
+            return diffuse_forward(toks, n_tok, 0, out);
+        });
+    if (forwards < 0) {
+        res->error = "diffusion: the schedule was refused (gen_length, "
+                     "block_length and steps do not describe a plan)";
+        res->finish = FinishError;
+        return false;
+    }
+    res->decode_ms = timer.ms();
+    res->decode_steps = forwards;
+    // A dLLM's "time to first token" is the prompt pass; every later number is
+    // per-step, because one step commits many tokens at once.
+    res->prefill_ms = 0;
+    res->tokens.assign(seq.begin() + prompt_len, seq.end());
+    // The EOS rule: a diffused block can commit EOS at an interior position
+    // only when the schedule allowed it, so truncation is by the token itself.
+    if (dp.eos_id >= 0) {
+        for (size_t i = 0; i < res->tokens.size(); i++) {
+            if (res->tokens[i] == dp.eos_id) {
+                res->tokens.resize(i);
+                res->finish = FinishStop;
+                break;
+            }
+        }
+    }
+    // Literal text, through the same detokenizer the decode loop uses.
+    if (!res->tokens.empty())
+        res->text = tok_.decode(res->tokens.data(), res->tokens.size());
+    return true;
+}
+
+bool Engine::diffuse_forward(const i32 *toks, i32 n, i32 pos0, f32 *logits) {
+    if (!toks || n <= 0 || !logits) return false;
+    // Refused by NUMBER, not by overrun: see diffuse_max_tokens_ at init.
+    if (diffuse_max_tokens_ > 0 && n > diffuse_max_tokens_) {
+        forward_error_ = "diffusion: a denoising pass over " + std::to_string(n) +
+                         " tokens exceeds the " +
+                         std::to_string(diffuse_max_tokens_) +
+                         " this engine sized its workspace for (prompt + "
+                         "gen_length must fit in n_ctx)";
+        KRK_ERROR("%s", forward_error_.c_str());
+        return false;
+    }
+    if (!forward_core(toks, n, pos0, LogitsNone)) return false;
+    for (i32 r = 0; r < n; r++) {
+        // head_compute reads the FINAL residual row, which forward_core leaves
+        // in ws_x_ -- it only overwrites ws_xn_ (the normed copy), so a second
+        // row's head does not disturb the first row's.
+        head_compute(r);
+        be_->download_f32(logits + static_cast<i64>(r) * n_vocab_, ws_logits_,
+                          n_vocab_);
+    }
+    return true;
 }
 
 bool Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
@@ -13303,6 +13454,15 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
                  static_cast<long long>(kv_cap_));
     }
     res->prompt_tokens = static_cast<i32>(ids.size());
+
+    // ---- masked diffusion: a different generation, not a different model ---
+    // A `diffuse` file is denoised, not decoded: the sequence starts as
+    // `[prompt | MASK ...]` and each step is ONE bidirectional forward over the
+    // whole thing (src/diffusion.cpp). Every path below this point assumes a
+    // causal decode loop -- KV prefix reuse, the speculative drafters, the
+    // per-token stop check -- so the branch is taken here, before any of them,
+    // and none of them has to know the family exists.
+    if (model_.cfg().diffusion) return generate_diffusion(p, res, ids);
 
     // ---- KV prefix reuse ---------------------------------------------------
     // The rows [0, reuse) already hold exactly these tokens at these positions,

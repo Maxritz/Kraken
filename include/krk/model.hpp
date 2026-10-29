@@ -884,6 +884,18 @@ struct ModelConfig {
     i32 n_dense_lead = 0;
 
     // Mixture-of-Experts geometry (is_moe == false for dense models).
+    // ---- masked diffusion (LLaDA2.x, `diffuse`) ---------------------------
+    // `diffusion` says the stack is BIDIRECTIONAL: every forward is a denoising
+    // pass over the whole sequence, so attention has no causal mask and no KV
+    // row is reused between steps. The rest is the file's own schedule, read
+    // rather than defaulted, because a wrong block length changes which tokens
+    // are committed together and therefore the output text.
+    bool diffusion = false;
+    i32 diffuse_mask_id = -1;    // `diffuse.mask_token_id`
+    i32 diffuse_block_length = 0;
+    i32 diffuse_steps = 0;       // 0 = the sampler's default
+    i32 diffuse_moe_block_size = 0;
+
     bool is_moe = false;
     // Group-limited selection (DeepSeek-V3 / MiniMax / LLaDA2's Block Routing):
     // experts are contiguous blocks of `n_expert_group`, only the

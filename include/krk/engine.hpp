@@ -595,6 +595,20 @@ public:
     // is the feature), and a test can also read the rows to check what the
     // value norm did to them.
     const void *kv_plane_debug(i32 which, i32 layer);
+    // Test/CLI override for the diffusion schedule. 0 leaves the file's own
+    // number, which is what every real run uses; a test flips it to prove the
+    // block length reaches the sampler.
+    void set_diffusion_schedule(i32 steps, i32 block_length) {
+        diffuse_steps_ = steps;
+        diffuse_block_ = block_length;
+    }
+    // Test hook / embedding access, diffuse only: one bidirectional, cacheless
+    // pass over `n` tokens at position 0, every row's logits downloaded into
+    // `logits[n * n_vocab()]`. This is the same call the denoising sampler makes,
+    // so a test that pins its output pins the generation path.
+    bool diffuse_logits(const i32 *toks, i32 n, f32 *logits) {
+        return diffuse_forward(toks, n, 0, logits);
+    }
     // Test hook, qwen4exp only: the hyper-connection lane stack after the last
     // forward pass, as f32 host rows [n_tok, hc, n_embd], or nullptr when the
     // file carries no lane stack (or the backend keeps it on device only). The
@@ -799,6 +813,24 @@ private:
     // read the same ws_logits_ buffer, and a bias applied after the download
     // would leave the device argmax choosing from a different distribution.
     void logit_head(const void *xn);
+    // One mask-diffusion denoising pass: a full, cacheless, BIDIRECTIONAL
+    // forward over `n` tokens at `pos0`, writing `n * n_vocab()` logits
+    // row-major. Every row's head runs, because the sampler scores every masked
+    // position at once -- `forward()` projects only the last row, which is a
+    // decode-loop assumption a denoising step does not make.
+    //
+    // The KV tier is not touched: no append, no read, and kv_pos_ is left alone
+    // (see the kbase resolution in forward_core). Two calls with the same tokens
+    // therefore give bit-identical logits, which is what makes a denoising step
+    // a pure function of its input.
+    bool diffuse_forward(const i32 *toks, i32 n, i32 pos0, f32 *logits);
+    // The block-diffusion generation loop: prompt + masks, then the schedule in
+    // src/diffusion.cpp driven by diffuse_forward. `max_tokens` is gen_length,
+    // and the block length / step budget come from the file (or the knobs the
+    // caller set), because they are the model's own schedule.
+    bool generate_diffusion(const GenerateParams &p, GenerateResult *res,
+                            const std::vector<i32> &ids);
+
     // ---- qwen4exp hyper-connections --------------------------------------
     // The lane stack replaces the single residual stream: each sub-block is
     // bracketed by a mix (lanes -> one row, left in ws_xn_ AND ws_x_) and a
@@ -1438,6 +1470,12 @@ private:
     void *ws_ffn_lat_ = nullptr;  // [chunk, latent]
     void *ws_xlat_out_ = nullptr; // [chunk, n_embd]
     f32 *logits_host_ = nullptr;
+    // Diffusion schedule overrides (see set_diffusion_schedule).
+    i32 diffuse_steps_ = 0;
+    i32 diffuse_block_ = 0;
+    // The longest denoising pass this engine's workspaces can hold. Set at init
+    // for a diffusion model, 0 otherwise.
+    i32 diffuse_max_tokens_ = 0;
     H2dProbe h2d_probe_;
     H2dProbeTally h2d_tally_;
     std::vector<i32> tok_scratch_;

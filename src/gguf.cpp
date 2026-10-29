@@ -473,6 +473,53 @@ const GgufValue *Gguf::find(const std::string &key) const {
     return nullptr;
 }
 
+bool Gguf::add_alias(const std::string &to, const std::string &from) {
+    if (to.empty() || from.empty()) return false;
+    const GgufTensor *src = tensor(from);
+    if (!src) return false;
+    if (tensor(to)) return true;   // the file's own spelling wins
+    GgufTensor t = *src;
+    t.name = to;
+    tensors_.push_back(std::move(t));
+    return true;
+}
+
+bool Gguf::add_row_slice(const std::string &to, const std::string &from,
+                         i64 row0, i64 rows, i64 n_in) {
+    if (to.empty() || from.empty()) return false;
+    const GgufTensor *src = tensor(from);
+    if (!src) return false;
+    if (tensor(to)) return true;
+    if (row0 < 0 || rows <= 0 || n_in <= 0) return false;
+    if (n_in != static_cast<i64>(src->ne[0])) return false;
+    // Total rows as the loader reads them: ne[1] for a matrix, and the packed
+    // element count over the row width for anything wider (a 3-D expert bank is
+    // not a row-slice source, so this only ever sees 1-D and 2-D).
+    const i64 total = src->n_dims >= 2
+                          ? static_cast<i64>(src->ne[1])
+                          : (n_in > 0 ? src->n_elements / n_in : 0);
+    if (row0 + rows > total) return false;
+    const size_t rb = dtype_row_bytes(src->type, static_cast<u64>(n_in));
+    if (rb == 0) return false;
+    GgufTensor t = *src;
+    t.name = to;
+    t.data = src->data + static_cast<size_t>(row0) * rb;
+    t.ne[0] = static_cast<u64>(n_in);
+    t.ne[1] = static_cast<u64>(rows);
+    t.n_dims = 2;
+    t.n_elements = n_in * rows;
+    t.n_bytes = static_cast<u64>(rb) * static_cast<u64>(rows);
+    tensors_.push_back(std::move(t));
+    return true;
+}
+
+bool Gguf::add_tensor_entry(GgufTensor t) {
+    if (t.name.empty() || !t.data) return false;
+    if (tensor(t.name)) return false;
+    tensors_.push_back(std::move(t));
+    return true;
+}
+
 const GgufTensor *Gguf::tensor(const std::string &name) const {
     for (const auto &t : tensors_)
         if (t.name == name) return &t;

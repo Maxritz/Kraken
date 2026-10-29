@@ -1249,29 +1249,27 @@ constexpr ArchSpec kTable[] = {
         return s;
     }(),
     // LLaDA-family masked-diffusion model: bidirectional attention over the
-    // whole sequence, a block denoising schedule, and MoE expert routing with
-    // group-limited selection and a routing bias. See docs/LLaDA.md for the
-    // schema read off LLaDA2.2-flash and the reference decoding loop. The three
-    // pieces this engine lacks are named here; the bidirectionality itself is
-    // already reachable (the attention op has always taken a causal flag).
-    // The SAMPLER is done: src/diffusion.cpp is the reference's block schedule
-    // (base-plus-remainder transfer, candidates restricted to this block and to
-    // masked positions, confidence top-k, no rewriting of committed tokens), and
-    // test_diffusion_sampler drives it with a forward the test owns so every
-    // commitment is predictable. What is NOT done is everything around it: the
-    // `diffuse.*` loader schema (fused attn_qkv split, post_attn_norm mapped to
-    // the pre-FFN norm, moe_gate/moe_experts_* onto the MoE slots), the
-    // group-limited routing rule with its selection bias, and the cacheless
-    // bidirectional forward wired into Engine::generate. The row stays No and
-    // says so, in that order -- docs/LLaDA.md is the plan and now has one item
-    // fewer on it.
-    {"diffuse", ArchShape::Diffusion, ArchSupport::No, ArchRole::Target, "diffuse",
-     "the block-diffusion sampler runs (src/diffusion.cpp, pinned by "
-     "test_diffusion_sampler) and so does the group-limited expert selection "
-     "its Block Routing needs (krk/moe_route.hpp, test_moe_group_routing); the "
-     "diffuse.* loader schema and the cacheless bidirectional forward in "
-     "Engine::generate are not implemented yet (docs/LLaDA.md)",
-     true, false, false, false},
+    // whole sequence plus a block denoising schedule, with MoE routing that
+    // groups its experts and biases its selection. docs/LLaDA.md records the
+    // schema read off LLaDA2.2-flash and the reference decoding loop.
+    //
+    // All four pieces of that plan now run: the sampler (src/diffusion.cpp),
+    // the group-limited routing (krk/moe_route.hpp), the `diffuse.*` loader
+    // schema (fused attn_qkv row-sliced to q/k/v, post_attn_norm as the pre-FFN
+    // norm, moe_gate/moe_experts_*/moe_shared_* aliased onto the canonical
+    // names) and the cacheless bidirectional forward (one full pass per
+    // denoising step, causal=false, no KV reuse).
+    [] {
+        // An aggregate here would set the FIRST four flags (qk_norm and
+        // friends) and leave `diffusion` at its default, which is exactly the
+        // silent-no-op this row cannot afford: the file would load as a causal
+        // stack and decode plausible text from the wrong mask.
+        ArchSpec d{"diffuse", ArchShape::Diffusion, ArchSupport::Yes,
+                   ArchRole::Target, "diffuse", "", false, false, false, false};
+        d.diffusion = true;
+        d.attention_implemented = true;
+        return d;
+    }(),
 };
 
 // Tensor names that imply an unimplemented computation, with the piece they
@@ -1298,7 +1296,10 @@ struct GapTensor {
         ByAttnGateFlag,
         ByMlaFlag,
         ByGpt2Flag,
-        ByFusedQkvFlag
+        ByFusedQkvFlag,
+        // A masked-diffusion file writes its expert bank under the family's own
+        // `moe_*` spelling and the loader aliases it onto the canonical rows.
+        ByDiffusionFlag
     };
     Served served = Served::Never;
 };
@@ -1367,7 +1368,16 @@ constexpr GapTensor kGapTensors[] = {
     // Engine::moe_ffn's `eligible` mask, pinned by test_moe_group_routing), so
     // a file that declares `expert_group_count` routes correctly instead of
     // being refused for the rule.
-    {"moe_experts_gate.weight", "a fused expert bank (moe_experts_gate)", false},
+    //
+    // `diffuse` is the exception, and only for the NAME: its converter writes
+    // every routed FFN row as `moe_experts_{gate,up,down}` over a canonical
+    // `[n_embd, n_ff_exp, n_expert]` layout, which is the per-expert bank this
+    // engine already pages -- so src/model.cpp aliases the eight names onto the
+    // canonical ones and there is nothing fused to be missing. Before that
+    // alias existed this entry was right; after it, it refused a file end to end
+    // with a reason that named a layout the loader had just handled.
+    {"moe_experts_gate.weight", "a fused expert bank (moe_experts_gate)", false,
+     GapTensor::Served::ByDiffusionFlag},
 };
 
 // Head tensors that can ride along inside a target. Not gaps: the model runs,
@@ -1454,6 +1464,9 @@ const char *arch_tensor_gap(std::string_view tensor_name, ArchShape shape,
             continue;
         if (g.served == GapTensor::Served::ByFusedQkvFlag &&
             arch_spec(arch).fused_qkv)
+            continue;
+        if (g.served == GapTensor::Served::ByDiffusionFlag &&
+            arch_spec(arch).diffusion)
             continue;
         if (has(tensor_name, g.needle)) return g.gap;
     }

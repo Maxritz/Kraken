@@ -121,6 +121,35 @@ public:
     const GgufValue *find(const std::string &key) const;
     const GgufTensor *tensor(const std::string &name) const;
 
+    // ---- name resolution for a family that spells the same tensor differently
+    //
+    // A converter is free to call a tensor whatever the model author called it.
+    // The loader binds CANONICAL names (llama.cpp's), so a file that writes
+    // `moe_gate.weight` for the router would otherwise be read as a file with no
+    // router at all -- every block would load, the FFN would run dense, and the
+    // model would decode fluent text that is not the checkpoint's.
+    //
+    // These two add a SECOND directory entry pointing at the same bytes, so
+    // every existing lookup path resolves it with no change. An alias is only
+    // added when the target is absent (the file's own spelling always wins), and
+    // a row slice is only added when the source is present and the requested
+    // rows fit inside it -- a bad request returns false and the caller refuses
+    // by name rather than binding half a projection.
+    //
+    // Both are load-time only: they append to the directory vector, which
+    // `tensor()` scans linearly, so a caller must not hold pointers into
+    // `tensors()` across a call.
+    bool add_alias(const std::string &to, const std::string &from);
+    // `to` = rows [row0, row0 + rows) of `from`, still `n_in` wide. The row
+    // stride is the source's own `dtype_row_bytes(type, n_in)`, so this is
+    // offset arithmetic on a packed matrix -- no dequantize and no copy.
+    bool add_row_slice(const std::string &to, const std::string &from, i64 row0,
+                       i64 rows, i64 n_in);
+    // Appends a directory entry built by the caller (a contiguous span of an
+    // existing tensor, e.g. one third of a fused bias). Refused when the name is
+    // already taken, so the file's own spelling always wins.
+    bool add_tensor_entry(GgufTensor t);
+
     std::string get_str(const std::string &key, const std::string &def = {}) const;
     i64 get_i64(const std::string &key, i64 def = 0) const;
     f64 get_f64(const std::string &key, f64 def = 0) const;
