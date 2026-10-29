@@ -160,8 +160,16 @@ open on purpose.
       `head.pre * 64` arm is rejected). Negative control observed: with both
       multiplies removed the two arms fail (head worst 11.45 vs peak 13.09,
       FFN worst 1.88 vs peak 4.38), 9/11; restored, 11/11.
-- [ ] **D6 (P2)** TL2 vs Q2_0 on ggml id 42: refuse the fork dialect by name
-      instead of decoding it as Q2_0.
+- [x] **D6 (P2)** TL2 vs Q2_0 on ggml id 42: refuse the fork dialect by name
+      instead of decoding it as Q2_0. `Gguf::parse_shard` now resolves the id
+      per file from the tensors' own strides (34 B per 128 values = Q2_0,
+      18 B per 64 = Q2_0_64, so an upstream-made file declaring 42 is retyped
+      rather than mis-strided), tolerates `general.alignment` slack, and
+      refuses a file that votes both ways or whose stride fits neither -- that
+      refusal names TL2 and both layouts. `test_q2_0_dialect` (19 checks,
+      5 files). Negative control observed: with the resolver disabled 8 arms
+      fail, 11/19. TL1 (id 38) was already named and refused by
+      `test_refused_formats`.
 - [ ] **D9 (P2)** a ternary file whose `general.architecture` is `llama` gets
       SubLN from its tensors but silu, not relu^2.
 - [ ] **D8 (P3)** the dense relu^2 arm skips the row-scale range guard.

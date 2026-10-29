@@ -6906,6 +6906,116 @@ static void test_refused_formats() {
           "and rejects one that is not (its block would be shared with the next row)");
 }
 
+// D6 -- ggml id 42 is two block layouts and a fork's name. The id cannot say
+// which one a file holds, but the file's own STRIDES can: the distance from a
+// tensor's offset to the next one is exactly what its producer thought the
+// block was. These arms pin all three outcomes the resolver can reach -- Q2_0
+// (2.125 bpw), Q2_0_64 (2.25 bpw, what upstream-made files declaring 42
+// measure), and a refusal that names the fork's TL2 -- plus the alignment
+// slack a real producer leaves between tensors.
+//
+// 8192 values is the size the two hypotheses are told apart at: 64 blocks of
+// 34 = 2176 bytes against 128 blocks of 18 = 2304, i.e. 128 bytes apart, more
+// than one 32-byte alignment unit. On a small tensor both fit and the id's own
+// meaning wins on purpose (documented at the resolver) -- an arm that "proved"
+// otherwise would be pinning an ambiguity as a rule.
+static void test_q2_0_dialect() {
+    auto write_one = [](const std::string &path, u64 ne, size_t payload,
+                        bool with_tail) {
+        GgufBuilder b;
+        b.meta_str("general.architecture", "llama");
+        b.meta_u32("general.alignment", 32);
+        const std::vector<u8> zero(payload, 0);
+        b.tensor_raw("blk.0.attn_q.weight", 42, {ne}, zero.data(), zero.size());
+        if (with_tail) {
+            const std::vector<f32> one(4, 0.5f);
+            b.tensor_f32("tail.weight", {2, 2}, one);
+        }
+        return b.write(path);
+    };
+
+    // (1) 64 blocks of 34 bytes: exactly Q2_0. 2176 is 32-aligned, so the
+    //     stride is the payload itself and nothing else can explain it.
+    {
+        const std::string path = "kraken-q2-0-wide.gguf";
+        CHECK(write_one(path, 8192, 2176, false), "wrote a 2.125 bpw id-42 file");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), ("the 2.125 bpw file reads: " + err).c_str());
+        const GgufTensor *t = g.tensor("blk.0.attn_q.weight");
+        CHECK(t && t->type == DType::Q2_0,
+              "a stride of 34 bytes per 128 values resolves as Q2_0");
+        CHECK(t && t->type_id == 42u, "and the file's id is left as it was");
+    }
+    // (2) 128 blocks of 18 bytes: upstream's Q2_0_64 behind the same id. Its
+    //     stride is 128 bytes past what Q2_0 would need, so this is not an
+    //     alignment accident.
+    {
+        const std::string path = "kraken-q2-0-64.gguf";
+        CHECK(write_one(path, 8192, 2304, false),
+              "wrote a 2.25 bpw file that still declares id 42");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), ("the 2.25 bpw file reads: " + err).c_str());
+        const GgufTensor *t = g.tensor("blk.0.attn_q.weight");
+        CHECK(t && t->type == DType::Q2_0_64,
+              "a stride of 18 bytes per 64 values RETYPES the tensor to Q2_0_64");
+        CHECK(t && t->n_bytes == 2304,
+              "and its payload is the 2.25 bpw size, not 2176");
+    }
+    // (3) A stride that is neither: this is the shape the fork's TL2 would
+    //     have to have, and it must be refused by name instead of decoded at
+    //     whatever 2-bit layout happens to come first.
+    {
+        const std::string path = "kraken-q2-0-tl2.gguf";
+        CHECK(write_one(path, 8192, 2240, false),
+              "wrote an id-42 file with a stride that fits no known block");
+        Gguf g;
+        std::string err;
+        const bool loaded = g.load(path, &err);
+        CHECK(!loaded, "the file is refused");
+        CHECK(err.find("TL2") != std::string::npos,
+              "and the refusal names the fork's TL2");
+        CHECK(err.find("Q2_0_64") != std::string::npos,
+              "with both block layouts in the message, so it is actionable");
+        CHECK(err.find("blk.0.attn_q.weight") != std::string::npos,
+              "and it names the tensor it gave up on");
+    }
+    // (4) Both dialects in one file: refused, because no producer emits a
+    //     stack whose tensors disagree about their own block size.
+    {
+        const std::string path = "kraken-q2-0-mixed.gguf";
+        GgufBuilder b;
+        b.meta_str("general.architecture", "llama");
+        b.meta_u32("general.alignment", 32);
+        const std::vector<u8> a(2176, 0), c(2304, 0);
+        b.tensor_raw("blk.0.attn_q.weight", 42, {8192}, a.data(), a.size());
+        b.tensor_raw("blk.1.attn_q.weight", 42, {8192}, c.data(), c.size());
+        CHECK(b.write(path), "wrote a file with one tensor of each dialect");
+        Gguf g;
+        std::string err;
+        CHECK(!g.load(path, &err), "the mixed file is refused");
+        CHECK(err.find("incompatible") != std::string::npos,
+              "and the message is about the two strides disagreeing");
+    }
+    // (5) A real producer pads each tensor to general.alignment, so a stride
+    //     is payload + < 32 bytes. 66 blocks of 34 = 2244, so the next tensor
+    //     starts at 2272: 28 bytes of slack, and that must still resolve as
+    //     Q2_0. (2376 would be the 2.25 bpw size, so there is no room for the
+    //     other reading either.)
+    {
+        const std::string path = "kraken-q2-0-padded.gguf";
+        CHECK(write_one(path, 8448, 2244, true),
+              "wrote a 2.125 bpw file whose tensors are 32-byte aligned");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), ("the padded file reads: " + err).c_str());
+        const GgufTensor *t = g.tensor("blk.0.attn_q.weight");
+        CHECK(t && t->type == DType::Q2_0,
+              "alignment padding inside the stride still resolves as Q2_0");
+    }
+}
+
 static void test_q8_activation_domain() {
     const i64 n = 512;
     std::vector<f32> x(static_cast<size_t>(n));
@@ -23516,6 +23626,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_i2_s_ms_dialect_refused)
     TEST_GROUP(test_i2_s_embedding)
     TEST_GROUP(test_refused_formats)
+    TEST_GROUP(test_q2_0_dialect)
     TEST_GROUP(test_q8_activation_domain)
     TEST_GROUP(test_trit_sign_extreme)
     TEST_GROUP(test_q2code_dot)
