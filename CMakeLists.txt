@@ -113,6 +113,7 @@ set(KRK_CORE_SOURCES
     src/mla_shared.cpp
     src/dsv4_route.cpp
     src/mova.cpp
+    src/moe_route.cpp
     src/diffusion.cpp
     src/engram.cpp
     src/ple.cpp

@@ -1503,6 +1503,10 @@ private:
     // Per-call scratch for the hash's narrowed constants (the file stores them
     // as i64; see the comment in Engine::engram_block).
     std::vector<u32> eng_off_, eng_vocab_;
+    // Per-token scratch for the group-limited route: one flag per expert.
+    // Sized at init from the file's own expert count, and empty when the file
+    // declares no groups (which is what makes the route skip the mask).
+    std::vector<u8> moe_group_keep_;
     // The last `n_gram-1` token ids of the sequence, oldest first, kept across
     // forward calls: the n-gram window of the first tokens of a chunk reaches
     // back past the chunk. -1 marks a position before the sequence start, which

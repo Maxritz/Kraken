@@ -641,6 +641,41 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (v > mx) mx = v;
         if (mx > 0) cfg_.n_expert_used = mx;
     }
+    // Group-limited selection. Read generically -- the keys are llama.cpp's
+    // (`expert_group_count` / `expert_group_used_count`) and every family that
+    // groups its experts declares them -- and validated here rather than at the
+    // first route: a partition that does not divide is not a partition, and a
+    // router that silently used `n_expert / n_group` on 257 experts would leave
+    // one expert unreachable and a different set selected.
+    cfg_.n_expert_group = static_cast<i32>(
+        gguf_.get_i64(key(".expert_group_count"), 0));
+    cfg_.n_expert_group_used = static_cast<i32>(
+        gguf_.get_i64(key(".expert_group_used_count"), 0));
+    if (cfg_.n_expert_group > 1) {
+        if (cfg_.n_expert <= 0 || cfg_.n_expert_group > cfg_.n_expert ||
+            cfg_.n_expert % cfg_.n_expert_group != 0 ||
+            cfg_.n_expert_group_used <= 0 ||
+            cfg_.n_expert_group_used > cfg_.n_expert_group) {
+            if (err)
+                *err = "arch '" + a + "': expert_group_count=" +
+                       std::to_string(cfg_.n_expert_group) + " over " +
+                       std::to_string(cfg_.n_expert) + " expert(s), used=" +
+                       std::to_string(cfg_.n_expert_group_used) +
+                       " is not a partition (the count must divide the experts, "
+                       "and the used count must be within it)";
+            return false;
+        }
+    } else if (cfg_.n_expert_group_used > 0) {
+        // Used without a count is a half-declared grouping: honouring it would
+        // mean one group, so the file would route plain top-k while claiming
+        // otherwise.
+        if (err)
+            *err = "arch '" + a + "': expert_group_used_count is " +
+                   std::to_string(cfg_.n_expert_group_used) +
+                   " but expert_group_count is missing, so there is no "
+                   "partition to select from";
+        return false;
+    }
     if (const std::vector<i32> *ff_arr =
             gguf_.get_i32_array(key(".expert_feed_forward_length"))) {
         i32 mx = 0;

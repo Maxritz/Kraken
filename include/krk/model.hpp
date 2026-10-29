@@ -885,6 +885,13 @@ struct ModelConfig {
 
     // Mixture-of-Experts geometry (is_moe == false for dense models).
     bool is_moe = false;
+    // Group-limited selection (DeepSeek-V3 / MiniMax / LLaDA2's Block Routing):
+    // experts are contiguous blocks of `n_expert_group`, only the
+    // `n_expert_group_used` best groups stay eligible for the top-k. 0 or 1
+    // means "no grouping", and the mask helper is then a no-op. See
+    // krk/moe_route.hpp for the rule and the three ways to get it wrong.
+    i32 n_expert_group = 0;
+    i32 n_expert_group_used = 0;
     i32 n_expert = 0;        // routed experts per MoE layer (the CAP)
     i32 n_expert_used = 0;   // top-k experts activated per token
     i32 n_ff_exp = 0;        // routed-expert hidden width

@@ -1267,8 +1267,9 @@ constexpr ArchSpec kTable[] = {
     // fewer on it.
     {"diffuse", ArchShape::Diffusion, ArchSupport::No, ArchRole::Target, "diffuse",
      "the block-diffusion sampler runs (src/diffusion.cpp, pinned by "
-     "test_diffusion_sampler); the diffuse.* loader schema, the group-limited "
-     "expert routing with its bias, and the cacheless bidirectional forward in "
+     "test_diffusion_sampler) and so does the group-limited expert selection "
+     "its Block Routing needs (krk/moe_route.hpp, test_moe_group_routing); the "
+     "diffuse.* loader schema and the cacheless bidirectional forward in "
      "Engine::generate are not implemented yet (docs/LLaDA.md)",
      true, false, false, false},
 };
@@ -1359,8 +1360,14 @@ constexpr GapTensor kGapTensors[] = {
     // under the plain top-k rule, silently.
     {"moe_gate_bias.weight", "a routed-expert selection bias (moe_gate_bias)",
      false},
-    {"moe_experts_gate.weight", "group-limited expert routing (moe_gate/n_group)",
-     false},
+    // A FUSED expert bank (one 3-D tensor holding every expert's gate rows).
+    // The loader pages experts by their own per-expert tensors, so this layout
+    // is a gap -- and only the layout is: the group-limited SELECTION rule the
+    // entry used to name with it is implemented now (krk/moe_route.hpp,
+    // Engine::moe_ffn's `eligible` mask, pinned by test_moe_group_routing), so
+    // a file that declares `expert_group_count` routes correctly instead of
+    // being refused for the rule.
+    {"moe_experts_gate.weight", "a fused expert bank (moe_experts_gate)", false},
 };
 
 // Head tensors that can ride along inside a target. Not gaps: the model runs,

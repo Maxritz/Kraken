@@ -3,6 +3,7 @@
 #include "krk/engine.hpp"
 #include "krk/mova.hpp"
 #include "krk/engram.hpp"
+#include "krk/moe_route.hpp"
 #include "krk/hc.hpp"
 #include "krk/dsv4_compress.hpp"
 #include "krk/arch.hpp"
@@ -1941,6 +1942,8 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         if (!check_alloc(ws_scale_, "ws_scale")) return false;
         router_host_.resize(static_cast<size_t>(C) * static_cast<size_t>(mc.n_expert));
         moe_prob_.resize(static_cast<size_t>(mc.n_expert));
+        if (mc.n_expert_group > 1)
+            moe_group_keep_.assign(static_cast<size_t>(mc.n_expert), 1);
         moe_logit_.resize(static_cast<size_t>(mc.n_expert));
         moe_sel_.resize(static_cast<size_t>(C) * static_cast<size_t>(k));
         // Only sized when a scan is actually requested: [n_layer * n_expert]
@@ -10636,6 +10639,41 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 return moe_prob_[static_cast<size_t>(e)] +
                        ((rb && !pre_bias) ? rb[static_cast<size_t>(e)] : 0.0f);
             };
+            // ---- group-limited selection ----------------------------------
+            // DeepSeek-V3's rule (llama-graph.cpp, "select top n_group_used
+            // expert groups"): the experts are contiguous groups, a group scores
+            // as the sum of its best two SELECTION scores, only the best
+            // `group_used` groups stay eligible, and the top-k runs over the
+            // survivors. The bias is already inside sel_score (it is a selection
+            // score), and the WEIGHTS stay the unbiased probabilities -- which is
+            // why this masks the eligibility and never touches moe_prob_.
+            //
+            // Masked experts are made unselectable rather than re-sorted: the
+            // loop below picks the best available score, so a -inf here is
+            // enough and every downstream index stays the file's own.
+            u8 *group_keep = moe_group_keep_.empty() ? nullptr
+                                                    : moe_group_keep_.data();
+            bool grouped = false;
+            if (mc.n_expert_group > 1 && group_keep) {
+                std::vector<f32> sels(static_cast<size_t>(ne));
+                for (i32 e = 0; e < ne; e++) sels[static_cast<size_t>(e)] = sel_score(e);
+                if (!krk::moe_group_mask_or_all(moe_group_keep_.data(),
+                                                sels.data(), ne,
+                                                mc.n_expert_group,
+                                                mc.n_expert_group_used)) {
+                    forward_error_ = "layer " + std::to_string(layer) +
+                                     ": the group-limited route refused its own "
+                                     "partition (ne=" + std::to_string(ne) +
+                                     ", groups=" +
+                                     std::to_string(mc.n_expert_group) + ", used=" +
+                                     std::to_string(mc.n_expert_group_used) + ")";
+                    return false;
+                }
+                grouped = true;
+            }
+            auto eligible = [&](i32 e) {
+                return !grouped || group_keep[static_cast<size_t>(e)] != 0;
+            };
 
             i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
             f32 *wt = moe_wt_.data() + static_cast<size_t>(t) * k;
@@ -10701,6 +10739,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 // the arithmetic below reduces to the loop it replaced.
                 f32 top = -1.0f;
                 for (i32 e = 0; e < ne; e++) {
+                    if (!eligible(e)) continue;
                     bool taken = false;
                     for (i32 p = 0; p < s; p++)
                         if (sel[p] == e) { taken = true; break; }
@@ -10713,6 +10752,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 f32 bestp = -1.0f;
                 int best_rank = -1;
                 for (i32 e = 0; e < ne; e++) {
+                    if (!eligible(e)) continue;
                     bool taken = false;
                     for (i32 p = 0; p < s; p++)
                         if (sel[p] == e) { taken = true; break; }

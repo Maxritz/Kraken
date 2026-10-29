@@ -63,6 +63,7 @@
 #include "krk/mova.hpp"
 #include "krk/diffusion.hpp"
 #include "krk/engram.hpp"
+#include "krk/moe_route.hpp"
 #include "krk/mla.hpp"
 #include "krk/mla_shared.hpp"
 #include "krk/dsv4_route.hpp"
@@ -26055,6 +26056,150 @@ static void test_dsv41_sinkhorn_stack() {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+//  test_moe_group_routing — group-limited expert selection.
+//
+//  The rule (llama-graph.cpp "select top n_group_used expert groups", and
+//  modeling_deepseek.py L440-L457): experts are CONTIGUOUS groups of
+//  n_expert/n_group; a group scores as the sum of its two best selection
+//  scores; only the best `group_used` groups stay eligible and the top-k runs
+//  over the survivors.
+//
+//  Three ways to get it wrong, and each is measured here because each still
+//  routes a full top-k and still decodes:
+//    * modulo grouping instead of contiguous,
+//    * the group's BEST score instead of its top-two SUM,
+//    * the bias leaking into the weights instead of only into selection.
+// ---------------------------------------------------------------------------
+static void test_moe_group_routing() {
+    // ---- 1. contiguous partition, top-two sum ----
+    {
+        const i32 ne = 8, ng = 4, used = 2;   // 2 experts per group
+        // Selection scores chosen so the answer is not the obvious one:
+        // group 0 = {9, 1} sums 10, group 1 = {6, 5} sums 11, group 2 = {8, 8}
+        // sums 16, group 3 = {0, 0} sums 0. Top two groups: 2 and 1.
+        const f32 sel[8] = {9.0f, 1.0f, 6.0f, 5.0f, 8.0f, 8.0f, 0.0f, 0.0f};
+        u8 keep[8] = {0};
+        CHECK(krk::moe_group_mask(keep, sel, ne, ng, used),
+              "a legal partition is accepted");
+        const u8 want[8] = {0, 0, 1, 1, 1, 1, 0, 0};
+        bool same = true;
+        for (i32 e = 0; e < ne; e++) if (keep[e] != want[e]) same = false;
+        CHECK(same, "the two best groups survive, contiguously");
+        // The measured failure for a BEST-score rule: group 0 has the highest
+        // single score (9) and would be selected in place of group 1.
+        CHECK(keep[0] == 0 && keep[1] == 0,
+              "the highest SINGLE score does not win: group 0 (9 + 1) loses to "
+              "group 1 (6 + 5), which is what the top-two sum means");
+        // And for a modulo rule, group 0 would be experts {0, 4} (scores 9, 8).
+        CHECK(keep[4] == 1 && keep[0] == 0,
+              "the partition is contiguous, not strided: expert 4 is in group 2, "
+              "not with expert 0");
+    }
+    // ---- 2. group_used == n_group is the identity ----
+    {
+        const i32 ne = 6, ng = 3;
+        const f32 sel[6] = {-5.0f, 1.0f, 9.0f, 2.0f, 3.0f, -1.0f};
+        u8 keep[6] = {0};
+        CHECK(krk::moe_group_mask(keep, sel, ne, ng, ng),
+              "keeping every group is legal");
+        bool all = true;
+        for (i32 e = 0; e < ne; e++) if (!keep[e]) all = false;
+        CHECK(all, "and keeps every expert, so a grouped file with "
+                   "group_used == group_count routes plain top-k");
+    }
+    // ---- 3. one expert per group: the top-two sum degenerates to the score ----
+    {
+        const i32 ne = 4, ng = 4;
+        const f32 sel[4] = {1.0f, 7.0f, 3.0f, 5.0f};
+        u8 keep[4] = {0};
+        CHECK(krk::moe_group_mask(keep, sel, ne, ng, 1),
+              "a one-expert partition is legal");
+        CHECK(keep[1] == 1 && keep[0] == 0 && keep[2] == 0 && keep[3] == 0,
+              "and with one expert per group the best SCORE wins -- a top-two "
+              "sum that added -inf for the missing second would select nothing");
+    }
+    // ---- 4. ties go to the lower group ----
+    {
+        const i32 ne = 4, ng = 2;
+        const f32 sel[4] = {2.0f, 2.0f, 2.0f, 2.0f};
+        u8 keep[4] = {0};
+        CHECK(krk::moe_group_mask(keep, sel, ne, ng, 1), "ties are legal");
+        CHECK(keep[0] == 1 && keep[1] == 1 && keep[2] == 0 && keep[3] == 0,
+              "an exact tie keeps the LOWER group index, as an argsort does");
+    }
+    // ---- 5. the refusals: a partition that is not one ----
+    {
+        u8 keep[8] = {0};
+        const f32 sel[8] = {0};
+        CHECK(!krk::moe_group_mask(keep, sel, 7, 2, 1),
+              "7 experts in 2 groups is refused, not floored to 3");
+        CHECK(!krk::moe_group_mask(keep, sel, 8, 3, 1),
+              "8 experts in 3 groups is refused");
+        CHECK(!krk::moe_group_mask(keep, sel, 8, 4, 5),
+              "using more groups than exist is refused");
+        CHECK(!krk::moe_group_mask(keep, sel, 8, 4, 0),
+              "using zero groups is refused");
+        CHECK(!krk::moe_group_mask(keep, sel, 4, 8, 1),
+              "more groups than experts is refused");
+        // ... and the no-op wrapper is what a caller uses when it does not know
+        // whether the file groups at all.
+        CHECK(krk::moe_group_mask_or_all(keep, sel, 8, 0, 0),
+              "no grouping is not an error");
+        bool all = true;
+        for (i32 e = 0; e < 8; e++) if (!keep[e]) all = false;
+        CHECK(all, "and keeps every expert");
+    }
+    // ---- 6. an independent oracle over random scores ----
+    // The same rule written out longhand, compared on 200 random vectors. This
+    // is what catches an index that is off by a group rather than by an expert.
+    {
+        u32 seed = 12345u;
+        auto rnd = [&]() {
+            seed = seed * 1664525u + 1013904223u;
+            return static_cast<f32>((seed >> 8) & 0xffff) / 65535.0f;
+        };
+        i64 bad = 0, cases = 0;
+        for (i32 ng = 2; ng <= 8; ng++) {
+            const i32 per = 3;
+            const i32 ne = ng * per;
+            for (i32 used = 1; used <= ng; used++) {
+                std::vector<f32> sel(static_cast<size_t>(ne));
+                for (i32 e = 0; e < ne; e++) sel[static_cast<size_t>(e)] = rnd();
+                std::vector<u8> keep(static_cast<size_t>(ne), 0);
+                if (!krk::moe_group_mask(keep.data(), sel.data(), ne, ng, used)) {
+                    bad++;
+                    continue;
+                }
+                // oracle: score each group by its two largest, sort the groups
+                // by (score desc, index asc), keep the first `used`.
+                std::vector<std::pair<f64, i32>> gs;
+                for (i32 g = 0; g < ng; g++) {
+                    std::vector<f32> v(sel.begin() + g * per, sel.begin() + (g + 1) * per);
+                    std::sort(v.begin(), v.end(), std::greater<f32>());
+                    gs.emplace_back(static_cast<f64>(v[0]) + v[1], g);
+                }
+                std::sort(gs.begin(), gs.end(), [](const auto &a, const auto &b) {
+                    if (a.first != b.first) return a.first > b.first;
+                    return a.second < b.second;
+                });
+                std::vector<u8> want(static_cast<size_t>(ne), 0);
+                for (i32 s = 0; s < used; s++)
+                    for (i32 i = 0; i < per; i++)
+                        want[static_cast<size_t>(gs[static_cast<size_t>(s)].second * per + i)] = 1;
+                cases++;
+                for (i32 e = 0; e < ne; e++)
+                    if (keep[static_cast<size_t>(e)] != want[static_cast<size_t>(e)]) bad++;
+            }
+        }
+        std::fprintf(stderr, "[moe] group oracle: %lld case(s), %lld disagreement(s)\n",
+                     static_cast<long long>(cases), static_cast<long long>(bad));
+        // (groups 2..8) x (used 1..groups) = 2+3+...+8 = 35 combinations.
+        CHECK(cases == 35, "35 (groups, used) combinations were compared");
+        CHECK(bad == 0, "and every one agrees with the longhand oracle");
+    }
+}
+
 static void test_qwen4exp_hc_mix() {
     const std::string path = "kraken-q4hcmix.gguf";
     const std::string dump = "kraken-q4hcmix.dump";
@@ -27812,6 +27957,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_qwen4exp_gdn_gate)
     TEST_GROUP(test_qwen4exp_hc_mix)
     TEST_GROUP(test_dsv41_sinkhorn_stack)
+    TEST_GROUP(test_moe_group_routing)
     TEST_GROUP(test_qwen4exp_ple)
     TEST_GROUP(test_mla_absorb)
     TEST_GROUP(test_mla_lite)
