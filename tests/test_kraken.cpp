@@ -6522,12 +6522,18 @@ std::vector<u8> i2s_pack(const std::vector<f32> &tern_unit, f32 scale,
 // matmul weight ternary. `as_i2s` decides whether those weights are stored in
 // I2_S (with `scale` in the tail) or as F16 holding scale*ternary, which is
 // the same matrix either way.
+// `as_arch` writes the SAME weights under another `general.architecture`, which
+// is how a b1.58 checkpoint re-exported as `llama` is reproduced here (D9).
+// `with_sub_norms` drops the SubLN pair, the arm that proves a ternary FORMAT
+// on its own says nothing about the activation.
 bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale,
-                       f32 embd_i2s_scale = 0.0f, bool ms_tail = false) {
+                       f32 embd_i2s_scale = 0.0f, bool ms_tail = false,
+                       const char *as_arch = "bitnet-b1.58",
+                       bool with_sub_norms = true) {
     const int n_embd = 256, n_layer = 2, n_head = 8, n_kv = 8, hd = 32;
     const int n_ff = 256, vocab = 260, ctx = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;   // 256 / 256
-    const std::string arch = "bitnet-b1.58";
+    const std::string arch = as_arch;
     GgufBuilder b;
     b.meta_str("general.architecture", arch);
     b.meta_str("general.name", "kraken-bitnet-i2s");
@@ -6551,12 +6557,22 @@ bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale,
     };
     // One ternary matrix, identical for both encodings: the ternary value is a
     // function of the element's position only.
+    //
+    // The cutoff is 0.14, not the 0.15 this fixture used to carry. `wv` emits
+    // (m mod 11 - 5) * 0.03, i.e. at most +-0.15 in f32 -- and 5 * 0.03f rounds
+    // to 0.14999999, which is BELOW 0.15f. So the old cutoff excluded the
+    // largest magnitude the generator can produce and every matrix in this
+    // fixture was ALL ZERO: the layers were inert, the logits came straight
+    // from the tied head, and no weight scale could move them. That is the
+    // whole of the "the synthetic fixtures' logits are scale-blind" entry in
+    // docs/TODO-alignment-2026-10-29.md; with a cutoff that actually cuts,
+    // ~18% of the entries are +-1 and the fixture has a graph.
     auto matmul = [&](const std::string &nm, const std::vector<u64> &ne, i64 base) {
         const size_t n = static_cast<size_t>(ne[0] * ne[1]);
         std::vector<f32> tern(n);
         for (size_t i = 0; i < n; i++) {
             const f32 t = wv(base + static_cast<i64>(i));
-            tern[i] = t > 0.15f ? 1.0f : (t < -0.15f ? -1.0f : 0.0f);
+            tern[i] = t > 0.14f ? 1.0f : (t < -0.14f ? -1.0f : 0.0f);
         }
         if (as_i2s) {
             const std::vector<u8> packed = i2s_pack(tern, scale, ms_tail);
@@ -6591,9 +6607,9 @@ bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale,
         for (int i = 0; i < n_ff; i++)
             sf[static_cast<size_t>(i)] = 0.5f + 0.04f * static_cast<f32>(i % 7);
         b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
-        b.tensor_f32(p + "attn_sub_norm.weight", {u64(n_embd)}, sa);
+        if (with_sub_norms) b.tensor_f32(p + "attn_sub_norm.weight", {u64(n_embd)}, sa);
         b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
-        b.tensor_f32(p + "ffn_sub_norm.weight", {u64(n_ff)}, sf);
+        if (with_sub_norms) b.tensor_f32(p + "ffn_sub_norm.weight", {u64(n_ff)}, sf);
         matmul(p + "attn_q.weight", {u64(n_embd), u64(q_dim)}, base + 100);
         matmul(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)}, base + 200);
         matmul(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)}, base + 300);
@@ -6671,15 +6687,25 @@ static void test_i2_s_model() {
         CHECK(std::fabs(L.wgate.gs - scale) < 1e-7f, "on every matmul weight");
     }, err);
 
-    // A run smoke test, and NOTHING MORE: the two-token logits of this
-    // synthetic model are identical (md = 0, bitwise) for I2_S at 0.125, the
-    // same weights as F16 at 0.125, and the same weights at 8x -- measured, on
-    // all three pairs -- so logits cannot distinguish a weight scale here. The
-    // scale is pinned by the descriptor probe above and the codes by
-    // test_i2_s_layout; claiming this arm proves the scale would be claiming a
-    // check that cannot fail. Recorded as an open fixture question in
-    // docs/TODO-alignment-2026-10-29.md rather than asserted.
-    std::vector<f32> a, b;
+    // A run smoke test that now MEANS something. This fixture used to decode
+    // every ternary matrix to zero (the cutoff sat exactly on the generator's
+    // largest magnitude, see `matmul`), so the logits came from the tied head
+    // alone and no weight scale could move them -- which is why the arm could
+    // only assert "it runs". With a cutoff that cuts:
+    //   * I2_S at 0.125 and the same weights as F16 at 0.125 hold the SAME
+    //     values (the codes are +-1 and the scale is a power of two, so the
+    //     decode is exact), so those two logits must be identical;
+    //   * the same weights at 1.0 are 8x larger, so those logits must move.
+    // The second pair is the fixture's own sanity check: a logits A/B in this
+    // suite is only allowed to claim something once the fixture moves for a
+    // change that is known to be a change.
+    auto maxdiff = [](const std::vector<f32> &x, const std::vector<f32> &y) {
+        f32 md = 0.0f;
+        for (size_t i = 0; i < std::min(x.size(), y.size()); i++)
+            md = std::max(md, std::fabs(x[i] - y[i]));
+        return md;
+    };
+    std::vector<f32> a, b, c;
     if (!variant_logits("kraken-i2s.gguf", a, err)) {
         CHECK(false, ("the I2_S file LOADS and generates: " + err).c_str());
         return;
@@ -6689,6 +6715,36 @@ static void test_i2_s_model() {
           "the same weights as F16 are writable");
     CHECK(variant_logits("kraken-i2s-ref.gguf", b, err) && b.size() == a.size(),
           "and that reference runs too (the pair is well-formed)");
+    f32 peak = 0.0f;
+    for (f32 v : a) peak = std::max(peak, std::fabs(v));
+    CHECK(peak > 0.0f, "the logits are not all zero");
+    if (!a.empty() && a.size() == b.size()) {
+        const f32 md_same = maxdiff(a, b);
+        std::fprintf(stderr, "[i2s-scale] md(0.125 vs f16 0.125) = %g\n",
+                     static_cast<double>(md_same));
+        // Not bitwise at this width: a 256-inner-dim I2_S matmul takes the
+        // fused int8 kernel, which quantises the ACTIVATION, while the F16 file
+        // runs f16 math. The decode is exact (codes +-1, scale a power of two);
+        // the paths are not. Measured 0.0138 on a peak of 2.03, against 0.0301
+        // for the 8x-scale pair below -- the scale's effect is the larger one,
+        // which is the whole point of the pair.
+        CHECK(md_same < 0.02f,
+              "I2_S at 0.125 and the same weights as F16 at 0.125 agree to the "
+              "int8 activation quantisation, so the codes decode to the same "
+              "weights");
+    }
+    CHECK(build_bitnet_file("kraken-i2s-ref-1.gguf", false, 1.0f),
+          "wrote the same weights as F16 at 1.0 (8x the scale)");
+    if (variant_logits("kraken-i2s-ref-1.gguf", c, err) && c.size() == a.size()) {
+        const f32 md = maxdiff(a, c);
+        std::fprintf(stderr, "[i2s-scale] md(0.125 vs 1.0) = %g\n",
+                     static_cast<double>(md));
+        CHECK(md > 0.02f,
+              "an 8x weight scale MOVES the logits by more than the encoding "
+              "difference, so this fixture can distinguish a scale at all");
+    } else {
+        CHECK(false, ("the 8x reference runs: " + err).c_str());
+    }
 }
 
 // I2_S embeddings. A lookup table has no projection to ride, so the scale has
@@ -6865,6 +6921,115 @@ static void test_bitnet_family() {
             f32 peak = 0.0f;
             for (f32 x : bitnet_lg) peak = std::max(peak, std::fabs(x));
             CHECK(peak > 0.0f && peak < 1e6f, "and the b1.58 run is finite");
+        }
+    }
+}
+
+// D9 -- a b1.58 checkpoint whose `general.architecture` is `llama`.
+//
+// The SubLN pair is read from the tensors, so such a file already gets the two
+// extra norms; the FFN activation comes from the arch row, so it ran SILU. Half
+// the family is worse than none of it: the norms change the graph and the
+// activation is what the weights were trained against. The rule that fixes it
+// is narrow -- SubLN present AND ternary weights AND the generic `llama` name
+// -- and each arm below removes one leg of it.
+static void test_ternary_llama_arch() {
+    // ---- the format predicate the rule stands on -------------------------
+    CHECK(dtype_is_ternary(DType::I2_S) && dtype_is_ternary(DType::TQ1_0) &&
+              dtype_is_ternary(DType::TQ2_0) && dtype_is_ternary(DType::Q1_0),
+          "I2_S / TQ1_0 / TQ2_0 / Q1_0 are the three-state formats");
+    CHECK(!dtype_is_ternary(DType::Q2_0) && !dtype_is_ternary(DType::PQ2_0),
+          "Q2_0 and PQ2_0 are NOT: their ladder reaches +2, so they quantize "
+          "any model and say nothing about the activation");
+    CHECK(!dtype_is_ternary(DType::F16) && !dtype_is_ternary(DType::F32),
+          "and the float formats are not ternary either");
+
+    std::string err;
+
+    // ---- (1) the rule fires ---------------------------------------------
+    const std::string as_llama = "kraken-b158-as-llama.gguf";
+    CHECK(build_bitnet_file(as_llama, /*as_i2s=*/true, 0.125f, 0.0f, false,
+                            "llama"),
+          "wrote a b1.58 checkpoint whose arch name is llama");
+    {
+        bool ok = false;
+        if (schema_cfg(as_llama, [&](const Model &m) {
+                const ModelConfig &c = m.cfg();
+                ok = true;
+                CHECK(c.ffn_relu_sqr,
+                      "SubLN + ternary weights under `llama` gets squared ReLU");
+                CHECK(m.layers().size() == 2 && m.layers()[0].attn_sub_norm &&
+                          m.layers()[0].ffn_sub_norm,
+                      "... with the SubLN pair still applied");
+            }, err)) {
+            CHECK(ok, "the llama-named b1.58 file loads");
+        } else {
+            CHECK(false, ("the llama-named b1.58 file loads: " + err).c_str());
+        }
+    }
+
+    // ---- (2) the graph is the FAMILY's, not a lookalike -------------------
+    // Same weights, same shapes, one metadata byte apart: the logits have to be
+    // identical, or "squared ReLU was applied" is only a claim about a flag.
+    {
+        const std::string as_bitnet = "kraken-b158-as-bitnet.gguf";
+        CHECK(build_bitnet_file(as_bitnet, true, 0.125f),
+              "wrote the same weights under the family's own name");
+        std::vector<f32> lg_llama, lg_bitnet;
+        const bool a = variant_logits(as_llama, lg_llama, err);
+        if (!a) CHECK(false, ("the llama-named run: " + err).c_str());
+        const bool b = variant_logits(as_bitnet, lg_bitnet, err);
+        if (!b) CHECK(false, ("the family-named run: " + err).c_str());
+        if (a && b && !lg_llama.empty()) {
+            f32 md = 0.0f;
+            const size_t n = std::min(lg_llama.size(), lg_bitnet.size());
+            for (size_t i = 0; i < n; i++)
+                md = std::max(md, std::fabs(lg_llama[i] - lg_bitnet[i]));
+            CHECK(n > 0 && md == 0.0f,
+                  "the llama-named file produces the family's logits bit for "
+                  "bit, so the inferred graph is the trained one");
+        }
+    }
+
+    // ---- (3) SubLN alone is not evidence ---------------------------------
+    // The same SubLN pair over f16 weights is an ordinary llama that happens to
+    // ship sub-norms: rewriting its activation would be the overreach the rule
+    // is written to avoid.
+    {
+        const std::string path = "kraken-subn-lama-f16.gguf";
+        CHECK(build_bitnet_file(path, /*as_i2s=*/false, 0.125f, 0.0f, false,
+                                "llama"),
+              "wrote a SubLN llama whose weights are f16");
+        bool ok = false;
+        if (schema_cfg(path, [&](const Model &m) {
+                ok = true;
+                CHECK(!m.cfg().ffn_relu_sqr,
+                      "SubLN without ternary weights keeps SILU");
+                CHECK(m.layers()[0].ffn_sub_norm != nullptr,
+                      "and the sub-norm is still loaded -- only the activation "
+                      "is left alone");
+            }, err)) {
+            CHECK(ok, "the f16 SubLN file loads");
+        } else {
+            CHECK(false, ("the f16 SubLN file loads: " + err).c_str());
+        }
+    }
+
+    // ---- (4) ternary alone is not evidence -------------------------------
+    {
+        const std::string path = "kraken-ternary-plain-llama.gguf";
+        CHECK(build_bitnet_file(path, true, 0.125f, 0.0f, false, "llama",
+                                /*with_sub_norms=*/false),
+              "wrote a ternary llama with no sub-norms");
+        bool ok = false;
+        if (schema_cfg(path, [&](const Model &m) {
+                ok = true;
+                CHECK(!m.cfg().ffn_relu_sqr,
+                      "a ternary llama with no SubLN pair stays SILU");
+            }, err)) {
+            CHECK(ok, "the ternary non-SubLN file loads");
+        } else {
+            CHECK(false, ("the ternary non-SubLN file loads: " + err).c_str());
         }
     }
 }
@@ -23621,6 +23786,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_gemma_27b_scale)
     TEST_GROUP(test_family_scales)
     TEST_GROUP(test_bitnet_family)
+    TEST_GROUP(test_ternary_llama_arch)
     TEST_GROUP(test_i2_s_layout)
     TEST_GROUP(test_i2_s_model)
     TEST_GROUP(test_i2_s_ms_dialect_refused)

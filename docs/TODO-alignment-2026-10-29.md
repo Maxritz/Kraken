@@ -72,26 +72,43 @@ row follows the paper and the reference the weights were trained against
 (squared ReLU), recorded here because a later reader will find the llama.cpp
 line and think the flag is a mistake.
 
-### Open, NEEDS VERIFICATION: the synthetic fixtures' logits are scale-blind
+### RESOLVED 2026-10-29: the synthetic fixtures' logits were scale-blind
 
 Measured while testing I2_S: for the synthetic 2-layer BitNet fixture, the
-two-token logits are **bitwise identical** across (a) I2_S weights with
+two-token logits were **bitwise identical** across (a) I2_S weights with
 `gs = 0.125`, (b) the same weights as F16 at 0.125, and (c) the same weights as
-F16 at 1.0 -- `max|a-b| = max|a-c| = max|b-c| = 0` over all 260 logits. So a
-whole-model logits A/B cannot validate a weight scale in these fixtures, and
-the I2_S scale is pinned by a descriptor probe (dtype + `gs`) plus the byte-
-level code test instead. Hypothesis (unverified): the response is dominated by
-the tied head over `token_embd` and the layer contribution rounds away in f16
-activations. Consequence: any future "the scales are applied" claim that rests
-on a logits comparison in a synthetic fixture needs a fixture that is first
-shown to move when a weight scale moves.
+F16 at 1.0 -- `max|a-b| = max|a-c| = max|b-c| = 0` over all 260 logits, which
+made a whole-model logits A/B unable to validate a weight scale in it. That was
+recorded with an unverified hypothesis ("the response is dominated by the tied
+head and the layer contribution rounds away").
+
+**The cause was the fixture, not the engine.** `build_bitnet_file`'s ternary
+cutoff was `t > 0.15f`, and its value generator emits at most
+`(11 mod 11 - 5) * 0.03f`: the largest magnitude is `5 * 0.03f`, which rounds to
+`0.14999999` -- *below* `0.15f`. So neither branch of the cutoff ever fired and
+**every matrix in the fixture was all zero**. The blocks were inert; the logits
+came from the tied head over `token_embd` alone, and no weight scale could move
+them. The hypothesis is therefore refuted: nothing "rounded away", nothing was
+ever there.
+
+Fixed at the fixture (cutoff 0.14, so ~18% of entries are +-1) and the arm now
+asserts the two things it could not before:
+
+| pair | measured `max|a-b|` | meaning |
+|---|---|---|
+| I2_S 0.125 vs F16 0.125 (same weights) | **0.0138** on a peak of 2.03 | the decode is exact, the PATHS are not: a 256-wide I2_S matmul takes the fused int8 kernel, which quantises the activation, while F16 runs f16 math |
+| I2_S 0.125 vs F16 1.0 (8x the scale) | **0.0301** | a weight scale now moves the logits by more than the encoding difference, so the fixture can distinguish one |
+
+Consequence kept: any "the scale is applied" claim that rests on a logits
+comparison in a synthetic fixture has to show the fixture moves for a change
+that is known to be a change. `test_i2_s_model` now carries that control.
 
 ### Audit pass over the BitNet/2-bit work (goli-mat-de, before the commit)
 
 | id | pri | class | item | state |
 |---|---|---|---|---|
 | D8 | P3 | CONFIRMED (code path), SUSPECTED (impact) | the dense relu^2 arm does not apply `row_scaled` (there is no relu_sqr+mul+row-max kernel). Mathematically identical -- the sub-norm divides the scale back in -- but relu^2 is quadratic, so this arm reaches the f16 store with larger magnitudes than silu | documented at the arm; no fixture needed as it is a range guard, not a function |
-| D9 | P2 | NEEDS VERIFICATION | a *ternary* file whose `general.architecture` is `llama` (the HF1BitLLM Llama3-8B-1.58 and Falcon3-*-1.58bit exports may well be) gets SubLN from the tensor set but **silu**, not relu^2, because the inference is keyed on the arch row. No file of that shape was available to check, and inferring relu^2 from the presence of `ffn_sub_norm` alone would change the graph of every family that happens to carry one | open; needs one real file's metadata |
+| D9 | P2 | CONFIRMED, **fixed** | a *ternary* file whose `general.architecture` is `llama` (the HF1BitLLM Llama3-8B-1.58 and Falcon3-*-1.58bit exports) got SubLN from the tensor set but **silu**, not relu^2, because the activation is keyed on the arch row: half the family's graph. Fixed by a narrow rule in `Model::load` -- generic `llama` name + a SubLN pair on the first block + ternary weights (`dtype_is_ternary`: TQ1_0/TQ2_0/I2_S/Q1_0, NOT Q2_0/PQ2_0 whose ladder reaches +2) -- which sets `ffn_relu_sqr`, exactly as the `bitnet-b1.58` row does. | `test_ternary_llama_arch`: the llama-named file's logits are **bit-identical** to the same weights under `bitnet-b1.58` (md 0); SubLN alone (f16) and ternary alone (no SubLN) both stay silu. Negative control observed: rule disabled -> the flag and the bit-identity both fail (14/16) |
 
 Two integrity guards added while auditing:
 - `gguf.cpp` refuses an I2_S tensor whose 32-byte tail falls outside the shard
@@ -170,8 +187,17 @@ open on purpose.
       5 files). Negative control observed: with the resolver disabled 8 arms
       fail, 11/19. TL1 (id 38) was already named and refused by
       `test_refused_formats`.
-- [ ] **D9 (P2)** a ternary file whose `general.architecture` is `llama` gets
-      SubLN from its tensors but silu, not relu^2.
+- [x] **D9 (P2)** a ternary file whose `general.architecture` is `llama` gets
+      SubLN from its tensors but silu, not relu^2. Fixed in `Model::load`
+      (generic name + SubLN pair + `dtype_is_ternary`), which is the narrow
+      rule the ledger asked for: either half alone is not evidence.
+      `test_ternary_llama_arch` (16 checks) pins the predicate's boundary
+      (Q2_0/PQ2_0 excluded), a bit-identical logits match against the
+      `bitnet-b1.58` row, and both negatives. Negative control observed: rule
+      disabled -> 2 arms fail, 14/16. While building it, the fixture that
+      backed the "logits are scale-blind" open item was found to be all-zero
+      (its ternary cutoff sat on the generator's largest magnitude); the
+      section above records the cause and the new measurement.
 - [ ] **D8 (P3)** the dense relu^2 arm skips the row-scale range guard.
 - [ ] **B3b (P2)** a windowed layer cannot carry its own linear rope scale.
 - [ ] **B4 (P2)** a real gemma4 fixture (per-layer embeddings + shared KV +

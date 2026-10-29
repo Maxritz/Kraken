@@ -495,6 +495,39 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // BitNet's dense FFN both build LLM_FFN_RELU_SQR / squared_relu, and any
     // other family that does would have had to be added to this line by hand.
     cfg_.ffn_relu_sqr = aspec.ffn_relu_sqr;
+    // ... but the schema is only as good as the name in the file, and a b1.58
+    // checkpoint re-exported under a generic one runs a graph nobody trained.
+    // HF1BitLLM's Llama3-8B-1.58, the Falcon3-*-1.58bit exports and the
+    // Ternary-Bonsai re-exports are all llama-shaped; a converter that leaves
+    // `general.architecture = llama` gets llama's row, so the SubLN pair is
+    // read from the tensors (the two extra norms ARE applied -- they are
+    // looked up by name) while the FFN runs SILU. That is neither family: the
+    // norms change the graph and the activation is what the weights were
+    // trained against.
+    //
+    // The trigger is narrow on purpose, because either half alone is not
+    // evidence: SubLN is not (any family may ship a sub-norm, and inferring
+    // squared ReLU from it would rewrite the graph of every such file), and a
+    // ternary FORMAT is not either (an ordinary llama quantized to TQ2_0 is
+    // still a silu model). Together they identify a b1.58 export, whose own
+    // reference graph is `ffn_sub_norm(squared_relu(gate) * up)` -- and the
+    // first block is enough, because no producer mixes a SubLN pair with an
+    // unquantized FFN layer by layer.
+    //
+    // Only the `llama` name is inferred. Any other generic name would need a
+    // file of that shape to prove the same rule holds, and no such file is in
+    // circulation today; this is where that would be extended.
+    if (!cfg_.ffn_relu_sqr && a == "llama") {
+        const GgufTensor *sa =
+            gguf_.tensor(blk_key("blk.%d.attn_sub_norm.weight", 0));
+        const GgufTensor *sf =
+            gguf_.tensor(blk_key("blk.%d.ffn_sub_norm.weight", 0));
+        const GgufTensor *tg = gguf_.tensor(blk_key("blk.%d.ffn_gate.weight", 0));
+        const GgufTensor *tu = gguf_.tensor(blk_key("blk.%d.ffn_up.weight", 0));
+        const bool ternary = (tg && dtype_is_ternary(tg->type)) ||
+                             (tu && dtype_is_ternary(tu->type));
+        if (sa && sf && ternary) cfg_.ffn_relu_sqr = true;
+    }
     // Tri-state: -1 keeps the engine's legacy always-normalize for files that
     // do not declare it (see ModelConfig::expert_w_norm).
     cfg_.expert_w_norm =
