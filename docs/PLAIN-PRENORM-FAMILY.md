@@ -93,12 +93,18 @@ three as a *test* — it has no biases, so it cannot exercise the split; gptneox
 and phi2 both carry a fused QKV bias and both match, which is the case that
 matters.
 
-The `parallel_residual` flag was checked to change the graph rather than being
-ignored: forcing it off on the gptneox file moves the top logits from
-`73=1.19381011 / 24=1.17630696` to `42=1.18604207 / 70=1.15634584`.
+The `parallel_residual` flag was checked BY HAND to change the graph rather than
+being ignored: forcing it off on a gptneox file moved the top logits from
+`73=1.19381011 / 24=1.17630696` to `42=1.18604207 / 70=1.15634584`. That record
+is not reproducible from the repository -- no gptneox or phi2 fixture exists in
+`kraken-tests`, and the plain-family loop covers mpt/bloom/falcon only -- so what
+the suite pins today is the ROW (`test_arch_row_pins` asserts gptneox's
+`parallel_residual`, `fused_qkv`, `ln_bias`, `no_gate_ffn` and `rope_neox`), not
+the graph. A file-level A/B for `parallel_residual` is still owed;
+see `docs/TODO-alignment-2026-10-29.md` (B5).
 
 `kraken-inspect` reports all three as `supported (dense)` / `runnable`;
-`kraken-tests` **4954/4954**.
+`kraken-tests` **6566/6566** (2026-10-29).
 
 ## A fixture bug worth recording
 

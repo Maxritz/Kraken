@@ -5921,9 +5921,21 @@ struct SchemaSpec {
     bool write_out_norm = true;  // output_norm.weight
     i32 q_norm_w = 0;            // 0 => no attn_q_norm.weight
     i32 k_norm_w = 0;            // 0 => no attn_k_norm.weight
+    // Layer 1's norm widths, when they differ from layer 0's. 0 keeps layer 0's
+    // width, which is what every real file does; a file that MIXES the two
+    // conventions is the arm that proves the engine refuses rather than letting
+    // the last layer rewrite the convention for the whole stack.
+    i32 q_norm_w_l1 = 0;
+    i32 k_norm_w_l1 = 0;
     bool post_norms = false;     // post_attention_norm + post_ffw_norm
     f32 clamp_kqv = 0.0f;        // 0 => `attention.clamp_kqv` absent
     f32 q_scale = 1.0f;          // magnitude of the query projection
+    // File-level scalars. 0 writes no key at all, which is the arm the
+    // "absent means the family default" behaviour is measured against.
+    f32 attn_scale_key = 0.0f;   // <arch>.attention.scale
+    f32 embd_scale_key = 0.0f;   // <arch>.embedding_scale
+    i32 swa_window = 0;          // 0 => no `<arch>.attention.sliding_window`
+    bool yarn = false;           // <arch>.rope.scaling.type = yarn (factor 8)
 };
 
 static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
@@ -5946,6 +5958,18 @@ static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
     b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
     b.meta_f32(arch + ".rope.freq_base", 10000.0f);
     if (v.clamp_kqv > 0.0f) b.meta_f32(arch + ".attention.clamp_kqv", v.clamp_kqv);
+    if (v.attn_scale_key > 0.0f)
+        b.meta_f32(arch + ".attention.scale", v.attn_scale_key);
+    if (v.embd_scale_key > 0.0f)
+        b.meta_f32(arch + ".embedding_scale", v.embd_scale_key);
+    if (v.swa_window > 0)
+        b.meta_u32(arch + ".attention.sliding_window",
+                   static_cast<u32>(v.swa_window));
+    if (v.yarn) {
+        b.meta_str(arch + ".rope.scaling.type", "yarn");
+        b.meta_f32(arch + ".rope.scaling.factor", 8.0f);
+        b.meta_u32(arch + ".rope.scaling.original_context_length", 64);
+    }
     add_spm_vocab(b, vocab, -1);
 
     auto vec = [](size_t n, i64 base, f32 scale) {
@@ -5982,10 +6006,12 @@ static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
             b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
             b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, ones(n_embd));
         }
-        if (v.q_norm_w > 0)
-            b.tensor_f32(p + "attn_q_norm.weight", {u64(v.q_norm_w)}, ones(v.q_norm_w));
-        if (v.k_norm_w > 0)
-            b.tensor_f32(p + "attn_k_norm.weight", {u64(v.k_norm_w)}, ones(v.k_norm_w));
+        const i32 qw = (l == 1 && v.q_norm_w_l1 != 0) ? v.q_norm_w_l1 : v.q_norm_w;
+        const i32 kw = (l == 1 && v.k_norm_w_l1 != 0) ? v.k_norm_w_l1 : v.k_norm_w;
+        if (qw > 0)
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(qw)}, ones(qw));
+        if (kw > 0)
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(kw)}, ones(kw));
         b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
                      vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
         b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
@@ -6398,6 +6424,317 @@ static void test_norm_schema_shapes() {
         } else {
             CHECK(false, ("the muse-glimmer phase file loads: " + err).c_str());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The scale stack and the window phase.
+//
+// Two kinds of arm live here, and the difference matters: a ROW assertion says
+// the arch table declares a constant, a FILE A/B says the engine applies it.
+// Only the second can catch the defect this group was written for -- gemma4's
+// attention scale was documented on ModelConfig, read by the engine's
+// `attn_scale_at`, and named in a comment, while nothing ever assigned it, so
+// every gemma4 file ran at 1/sqrt(head_dim).
+// ---------------------------------------------------------------------------
+static void test_family_scales() {
+    auto peak_of = [](const std::vector<f32> &v) {
+        f32 p = 0.0f;
+        for (f32 x : v) p = std::max(p, std::fabs(x));
+        return p;
+    };
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 m = 0.0f;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+    std::string err;
+
+    // ---- (1) the rows that carry a scale constant ------------------------
+    // These are the constants a file cannot supply and the engine cannot
+    // derive: they exist only in the arch table, so a row that loses one is
+    // silent everywhere else.
+    {
+        const ArchSpec *g4 = arch_lookup("gemma4");
+        CHECK(g4 && g4->support == ArchSupport::Yes, "gemma4 is a supported row");
+        CHECK(g4 && g4->attn_scale == 1.0f,
+              "gemma4 declares attn_scale 1.0 (the reference's self.scaling)");
+        const ArchSpec *mc = arch_lookup("minicpm");
+        CHECK(mc && mc->embd_scale == 12.0f,
+              "minicpm declares scale_emb = 12.0 on its embedding");
+        const ArchSpec *mc3 = arch_lookup("minicpm3");
+        CHECK(mc3 && mc3->embd_scale == 12.0f,
+              "minicpm3 declares the same 12.0 embedding scale");
+        CHECK(mc3 && mc3->lm_head_scale_base == 256.0f,
+              "... and a 256-wide head-input scale base (n_embd_base)");
+        CHECK(mc3 && mc3->residual_scale_ffn,
+              "... and scales the FFN branch's output too, not only attention");
+        const ArchSpec *me = arch_lookup("mellum");
+        CHECK(me && me->swa_period == 4 && me->swa_window_first,
+              "mellum's window is period 4 with the WINDOWED layer first "
+              "(dense_first = false)");
+        CHECK(me && me->swa_plain_rope,
+              "... and its windowed layers rotate with plain rope");
+        const ArchSpec *o2 = arch_lookup("olmo2");
+        CHECK(o2 && o2->swa_plain_rope,
+              "olmo2's windowed layers rotate with plain rope as well "
+              "(rope_freq_scale_train_swa = 1.0)");
+    }
+
+    // ---- (2) `<arch>.attention.scale` is applied ------------------------
+    // Three files of one family, differing only in the key: absent, the value
+    // the default already computes, and 4.0. The first two must be the same
+    // answer bit for bit (the key states what the engine already does) and the
+    // third must differ -- which is what makes this an application test rather
+    // than a "the key was parsed" test.
+    auto scale_arm = [&](f32 key, bool present, const char *nm) {
+        SchemaSpec v;
+        v.arch = "llama";
+        if (present) v.attn_scale_key = key;
+        const std::string f = nm;
+        CHECK(build_schema_model(f, v), "wrote an attention.scale arm");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) return lg;
+        CHECK(false, ("the attention.scale arm runs: " + err).c_str());
+        return std::vector<f32>();
+    };
+    {
+        // head_dim is 8 on the schema fixture, so the default is 1/sqrt(8).
+        const f32 def = static_cast<f32>(1.0 / std::sqrt(8.0));
+        const std::vector<f32> none = scale_arm(0.0f, false, "kraken-scale-as-none.gguf");
+        const std::vector<f32> same = scale_arm(def, true, "kraken-scale-as-same.gguf");
+        const std::vector<f32> four = scale_arm(4.0f, true, "kraken-scale-as-four.gguf");
+        if (!none.empty() && !same.empty() && !four.empty()) {
+            CHECK(maxdiff(none, same) == 0.0f,
+                  "a file that states the default attention scale is the same "
+                  "answer as one that states none");
+            CHECK(maxdiff(four, none) > 1e-4f,
+                  "a stated attention scale of 4.0 changes the answer, so the "
+                  "key is applied rather than parsed");
+        }
+    }
+
+    // ---- (3) `<arch>.embedding_scale` is applied ------------------------
+    // Same shape: absent vs 1.0 must agree exactly (a 1.0 multiply is skipped),
+    // absent vs 12.0 must not. 12.0 is MiniCPM's own constant, and the
+    // reference applies it through the generic embedding scale.
+    auto embd_arm = [&](f32 key, bool present, const char *nm) {
+        SchemaSpec v;
+        v.arch = "llama";
+        if (present) v.embd_scale_key = key;
+        const std::string f = nm;
+        CHECK(build_schema_model(f, v), "wrote an embedding_scale arm");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) return lg;
+        CHECK(false, ("the embedding_scale arm runs: " + err).c_str());
+        return std::vector<f32>();
+    };
+    {
+        const std::vector<f32> none = embd_arm(0.0f, false, "kraken-emb-none.gguf");
+        const std::vector<f32> one = embd_arm(1.0f, true, "kraken-emb-one.gguf");
+        const std::vector<f32> twelve = embd_arm(12.0f, true, "kraken-emb-twelve.gguf");
+        if (!none.empty() && !one.empty() && !twelve.empty()) {
+            CHECK(maxdiff(none, one) == 0.0f,
+                  "an embedding scale of 1.0 is the same answer as no key");
+            CHECK(maxdiff(twelve, none) > 1e-4f,
+                  "an embedding scale of 12.0 changes the answer, so the "
+                  "MiniCPM constant is applied by the engine");
+            CHECK(peak_of(twelve) < 1e6f,
+                  "... and the scaled run stays finite");
+        }
+    }
+
+    // ---- (4) the windowed half of a hybrid stack ------------------------
+    // One mellum file, no pattern array in the metadata: the phase has to come
+    // from the row. `is_swa(0)` is the assertion that would have caught the
+    // flipped phase -- the wheel was written as "period 4, full layer first",
+    // which put the FULL layer at index 0.
+    {
+        SchemaSpec v;
+        v.arch = "mellum";
+        v.q_norm_w = 8;   // the row declares per-head QK-norm
+        v.k_norm_w = 8;
+        v.swa_window = 16;
+        const std::string f = "kraken-mellum-phase.gguf";
+        CHECK(build_schema_model(f, v), "wrote a mellum file with no pattern array");
+        bool ok = false, swa0 = false, swa2 = false, swa3 = false;
+        if (schema_cfg(f, [&](const Model &m) {
+                ok = true;
+                swa0 = m.is_swa(0);
+                swa2 = m.is_swa(2);
+                swa3 = m.is_swa(3);
+            }, err)) {
+            CHECK(ok && swa0 && swa2 && !swa3,
+                  "mellum: layers 0..2 are windowed and layer 3 is full, which "
+                  "is load_swa_pattern's dense_first = false");
+        } else {
+            CHECK(false, ("the mellum phase file loads: " + err).c_str());
+        }
+    }
+
+    // ---- (5) a scaled file keeps the windowed half's rope plain ---------
+    // A YaRN file: the full layers' table is interpolated and the windowed
+    // layers' table is not (the reference passes ext_factor = 0 there). The
+    // control is the same file without the scaling: one table for both kinds.
+    {
+        auto rope_pair = [&](bool yarn, const char *nm, bool &loaded,
+                             bool &differ) {
+            SchemaSpec v;
+            v.arch = "mellum";
+            v.q_norm_w = 8;
+            v.k_norm_w = 8;
+            v.swa_window = 16;
+            v.yarn = yarn;
+            const std::string f = nm;
+            loaded = false;
+            differ = false;
+            CHECK(build_schema_model(f, v), "wrote a mellum rope arm");
+            schema_cfg(f, [&](const Model &m) {
+                if (m.inv_freq_at(0).size() != m.inv_freq_at(3).size()) return;
+                for (size_t i = 0; i < m.inv_freq_at(0).size(); i++)
+                    if (m.inv_freq_at(0)[i] != m.inv_freq_at(3)[i]) differ = true;
+                loaded = true;
+            }, err);
+        };
+        bool yl = false, yd = false, pl = false, pd = false;
+        rope_pair(true, "kraken-mellum-yarn.gguf", yl, yd);
+        rope_pair(false, "kraken-mellum-plain.gguf", pl, pd);
+        CHECK(yl && yd,
+              "a YaRN mellum file rotates its windowed layers with a table of "
+              "their own (plain), not the interpolated one");
+        CHECK(pl && !pd,
+              "and an unscaled file keeps ONE table for both kinds of layer");
+    }
+
+    // ---- (6) the QK-norm convention is decided per STACK ---------------
+    // Mixed branch widths cannot be expressed by one flag, and used to be
+    // resolved by whichever tensor was read last. Refused, naming both.
+    {
+        SchemaSpec v;
+        v.arch = "olmo2";
+        v.q_norm_w = 32;   // whole query row
+        v.k_norm_w = 8;    // per head: a different convention on the same layer
+        v.post_norms = true;
+        const std::string f = "kraken-norm-mixed-branch.gguf";
+        CHECK(build_schema_model(f, v), "wrote a file with mixed QK-norm widths");
+        std::string lerr;
+        const bool loaded = schema_cfg(f, [](const Model &) {}, lerr);
+        CHECK(!loaded, "a layer whose q norm is wide and k norm is per head is "
+                       "refused");
+        CHECK(lerr.find("attn_q_norm") != std::string::npos &&
+                  lerr.find("attn_k_norm") != std::string::npos,
+              "and the refusal names both tensors");
+    }
+    {
+        SchemaSpec v;
+        v.arch = "olmo2";
+        v.q_norm_w = 32;
+        v.k_norm_w = 16;
+        v.q_norm_w_l1 = 8;   // layer 1 switches to the per-head convention
+        v.k_norm_w_l1 = 8;
+        v.post_norms = true;
+        const std::string f = "kraken-norm-mixed-layer.gguf";
+        CHECK(build_schema_model(f, v), "wrote a file that changes convention "
+                                        "between layers");
+        std::string lerr;
+        const bool loaded = schema_cfg(f, [](const Model &) {}, lerr);
+        CHECK(!loaded, "a stack that changes QK-norm convention mid-way is "
+                       "refused rather than read with the last layer's rule");
+        CHECK(lerr.find("layer 1") != std::string::npos,
+              "and the refusal names the layer that disagrees");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row pins for the families that had no test at all.
+//
+// A row is a set of claims about a schema; most of them are flags that decide
+// a graph, and a wrong flag does not fail -- it decodes. These assertions are
+// the cheap half of coverage (the expensive half is a fixture per family, see
+// docs/TODO-alignment-2026-10-29.md B4/B5): they pin the flag, not the graph.
+// ---------------------------------------------------------------------------
+static void test_arch_row_pins() {
+    auto yes = [](const char *n) {
+        const ArchSpec *s = arch_lookup(n);
+        return s && s->support == ArchSupport::Yes;
+    };
+    CHECK(yes("gptneox"), "gptneox is a supported row");
+    CHECK(yes("phi2"), "phi2 is a supported row");
+    CHECK(yes("olmoe"), "olmoe is a supported row");
+    CHECK(yes("qwen3moe"), "qwen3moe is a supported row");
+    CHECK(yes("nemotron_h") && yes("nemotron_h_moe"),
+          "both nemotron hybrid rows are supported");
+    CHECK(yes("qwen35-dflash-draft"), "the dflash draft row is supported");
+
+    // GPT-NeoX: the parallel residual is the graph, together with a fused
+    // Q|K|V row, LayerNorm-with-bias and an ungated GELU MLP. RoPE, so the
+    // learned-position flag must stay off -- those two together would add a
+    // position signal twice.
+    {
+        const ArchSpec *s = arch_lookup("gptneox");
+        CHECK(s && s->parallel_residual,
+              "gptneox summed the attention and the FFN from ONE normed row");
+        CHECK(s && s->fused_qkv && s->ln_bias && s->no_gate_ffn,
+              "... with a fused Q|K|V, LayerNorm biases and an ungated GELU MLP");
+        CHECK(s && s->rope_neox && !s->learned_pos,
+              "... and a NeoX rotary with no learned position table");
+        const ArchSpec *j = arch_lookup("gptj");
+        CHECK(j && !j->parallel_residual && j->fused_qkv && j->ln_bias,
+              "gptj differs from gptneox in exactly the residual shape");
+    }
+    // Phi-2: fused Q|K|V and LayerNorm, GELU MLP, NORM-paired partial rotary.
+    {
+        const ArchSpec *s = arch_lookup("phi2");
+        CHECK(s && s->fused_qkv && s->ln_bias && s->no_gate_ffn,
+              "phi2 is the fused-QKV / LayerNorm / GELU shape");
+        CHECK(s && !s->rope_neox && !s->parallel_residual,
+              "... with the NORM rope pairing and a sequential residual");
+    }
+    // OLMoE: wide QK norms and UNNORMALIZED top-k weights (norm_w = false in
+    // the reference); reading it with the legacy always-normalize would scale
+    // every expert contribution by 1/sum(w).
+    {
+        const ArchSpec *s = arch_lookup("olmoe");
+        CHECK(s && s->qk_norm, "olmoe declares the QK norms");
+        CHECK(s && s->expert_w_norm == 0,
+              "olmoe's top-k weights are used as the softmax emitted them");
+        CHECK(s && !s->rope_neox, "... with the NORM rope pairing");
+    }
+    // Qwen3-MoE: per-head QK-norm and NeoX rope, like qwen3.
+    {
+        const ArchSpec *s = arch_lookup("qwen3moe");
+        CHECK(s && s->qk_norm && s->rope_neox,
+              "qwen3moe keeps qwen3's norms and rope pairing");
+        CHECK(s && s->shape == ArchShape::Moe, "... and is a routed stack");
+    }
+    // Nemotron's shapes: a hybrid mamba stack, and its MoE sibling. The mixer
+    // is chosen per layer from the tensors, so the row only has to say the
+    // shape -- a Dense row here would size workspaces for a dense FFN.
+    {
+        const ArchSpec *h = arch_lookup("nemotron_h");
+        const ArchSpec *m = arch_lookup("nemotron_h_moe");
+        CHECK(h && h->shape == ArchShape::Recurrent,
+              "nemotron_h is a recurrent hybrid");
+        CHECK(m && m->shape == ArchShape::RecurrentMoe,
+              "nemotron_h_moe is a recurrent hybrid with routed experts");
+    }
+    // The draft row is a head set, not a model: Role says so, which is what
+    // keeps `kraken-tests` from ever treating it as a target.
+    {
+        const ArchSpec *d = arch_lookup("qwen35-dflash-draft");
+        CHECK(d && d->role == ArchRole::Draft,
+              "qwen35-dflash-draft is a draft/head row, not a target");
+        CHECK(d && std::string_view(d->family ? d->family : "") == "dflash",
+              "... and shares the dflash loader");
+    }
+    // MiniCPM (v1/v2) is llama's schema: if any of these flags flips, the
+    // family silently becomes something else.
+    {
+        const ArchSpec *s = arch_lookup("minicpm");
+        CHECK(s && std::string_view(s->family ? s->family : "") == "llama",
+              "minicpm reads as the llama schema");
+        CHECK(s && !s->rope_neox, "... with the NORM rope pairing");
     }
 }
 
@@ -18104,6 +18441,59 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
     return b.write(path);
 }
 
+// MiniCPM3's scale stack, read off a real file of the family: the MLA V2-Lite
+// layout (`attn_q_a`/`attn_q_b` with `attn_kv_a_mqa`/`attn_kv_b`) under THIS
+// arch name. The row is the only place the three constants live -- 12.0 on the
+// embedding, 1.4/sqrt(n_layer) on both branches, 256/n_embd before the head --
+// so a fixture that loads is what proves they reach ModelConfig. The multiplies
+// themselves are covered by the generic arms in test_family_scales (embedding)
+// and by wiring that is visible here (the two that have no file key).
+static void test_minicpm3_scales() {
+    MlaFix f;
+    f.kind = MlaFixKind::Legacy;
+    f.q_lora = true;   // the pairing MiniCPM3 ships: q trunk + legacy KV
+    f.n_layer = 4;     // so 1.4/sqrt(4) is not 1.0 by accident
+    const std::string path = "kraken-minicpm3-scales.gguf";
+    CHECK(build_mla_fixture(path, f, "minicpm3"),
+          "wrote a MiniCPM3 file (MLA V2-Lite layout, 4 layers)");
+    std::string err;
+    bool ok = false;
+    if (schema_cfg(path, [&](const Model &m) {
+            const ModelConfig &c = m.cfg();
+            ok = true;
+            CHECK(c.embd_scale == 12.0f,
+                  "minicpm3's embedding scale is 12.0 on the config");
+            CHECK(c.lm_head_scale == 256.0f / static_cast<f32>(c.n_embd),
+                  "and the head-input scale is n_embd_base/n_embd (256/32)");
+            CHECK(c.residual_scale_ffn,
+                  "and the residual scale applies to the FFN branch too");
+            CHECK(std::fabs(c.attn_out_scale - 1.4f / 2.0f) < 1e-6f,
+                  "and 1.4/sqrt(n_layer) reaches the attention branch");
+            CHECK(c.mla && c.rope_neox,
+                  "... on the family's MLA schema with the NeoX pairing");
+        }, err)) {
+        CHECK(ok, "the MiniCPM3 file loads");
+    } else {
+        CHECK(false, ("the MiniCPM3 file loads: " + err).c_str());
+    }
+    // A forward through both scaled branches. The FFN-side residual scale
+    // cannot use the folded store, so this is the arm that proves the
+    // gemm + scale + add path adds the branch ONCE: a double add on a 4-layer
+    // stack grows the residual by ~2x per layer and the logits leave f16 range,
+    // which is what the peak bound catches.
+    {
+        std::vector<f32> lg;
+        if (variant_logits(path, lg, err)) {
+            f32 peak = 0.0f;
+            for (f32 x : lg) peak = std::max(peak, std::fabs(x));
+            CHECK(peak > 0.0f && peak < 1e6f,
+                  "a MiniCPM3 run is finite through both scaled branches");
+        } else {
+            CHECK(false, ("a MiniCPM3 run: " + err).c_str());
+        }
+    }
+}
+
 static void test_mla_loader() {
     // The hatch is a LOADER switch and is off for the first arm on purpose:
     // without it a refused schema is refused before a tensor is read.
@@ -21927,6 +22317,8 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_fused_projection_pair)
     TEST_GROUP(test_attention_gate_families)
     TEST_GROUP(test_norm_schema_shapes)
+    TEST_GROUP(test_family_scales)
+    TEST_GROUP(test_arch_row_pins)
     TEST_GROUP(test_lfm2_dense)
     TEST_GROUP(test_qwen2moe)
     TEST_GROUP(test_arch_table)
@@ -21973,6 +22365,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_qwen4exp_ple)
     TEST_GROUP(test_mla_absorb)
     TEST_GROUP(test_mla_lite)
+    TEST_GROUP(test_minicpm3_scales)
     TEST_GROUP(test_mla_backend)
     TEST_GROUP(test_npu_backend)
     TEST_GROUP(test_mla_loader)

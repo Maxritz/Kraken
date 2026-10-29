@@ -640,8 +640,9 @@ int main(int argc, char **argv) {
     const i64 n_embd = c.n_embd, n_ff = c.n_ff;
     const i64 q_dim = mc.q_dim(), kv_dim = mc.kv_dim();
     const f32 scale =
-        static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(c.head_dim))) *
-        c.rope_attn_scale;
+        c.attn_scale > 0.0f
+            ? c.attn_scale
+            : static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(c.head_dim)));
 
     std::vector<i32> toks = {1, 4821, 13, 278};
 

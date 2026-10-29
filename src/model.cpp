@@ -576,6 +576,34 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // it; this is the read.
         cfg_.embd_scale = std::sqrt(static_cast<f32>(cfg_.n_embd));
     }
+    // ---- the family's own scale constants ---------------------------------
+    // Three scalars that are a property of the family rather than of the file,
+    // each one a multiply the reference performs and this engine did not:
+    //
+    //   embd_scale      the token embedding's multiplier before layer 0
+    //                   (MiniCPM's `scale_emb = 12.0`; llama.cpp applies any
+    //                   nonzero `f_embedding_scale` in build_inp_embd).
+    //   attn_scale      the q·k multiplier when it is not 1/sqrt(head_dim)
+    //                   (gemma4's `self.scaling = 1.0`).
+    //   lm_head_scale   the multiplier between the final norm and the head
+    //                   (MiniCPM3's `n_embd_base/n_embd`, 256/n_embd).
+    //
+    // `0` in the arch table means "the family has no such constant", and the
+    // file may state its own where the reference allows it: `<arch>.embedding_scale`
+    // and `<arch>.attention.scale` override the row. Both are read with the
+    // reference's own "absent or zero means default" convention. A file that
+    // states one on a family whose row has none is still honoured -- the key
+    // is the same statement, and a converter that writes it means it.
+    if (aspec.embd_scale > 0.0f) cfg_.embd_scale = aspec.embd_scale;
+    if (const f64 es = gguf_.get_f64(key(".embedding_scale"), 0.0); es > 0.0)
+        cfg_.embd_scale = static_cast<f32>(es);
+    if (aspec.attn_scale > 0.0f) cfg_.attn_scale = aspec.attn_scale;
+    if (const f64 as = gguf_.get_f64(key(".attention.scale"), 0.0); as > 0.0)
+        cfg_.attn_scale = static_cast<f32>(as);
+    if (aspec.lm_head_scale_base > 0.0f && cfg_.n_embd > 0)
+        cfg_.lm_head_scale =
+            aspec.lm_head_scale_base / static_cast<f32>(cfg_.n_embd);
+    cfg_.residual_scale_ffn = aspec.residual_scale_ffn;
     // The two gemma4 features the forward has to run. Declared by the arch, so
     // a file is never asked for tensors its family does not carry.
     cfg_.per_layer_embd = aspec.per_layer_embd;
@@ -1946,6 +1974,13 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     };
 
     layers_.resize(static_cast<size_t>(cfg_.n_layer));
+    // The QK-norm width convention is a property of the STACK, not of a layer:
+    // ModelConfig carries one `qk_norm_wide` and the engine reads it for every
+    // layer's norm. It is therefore decided ONCE, by the first layer whose
+    // widths are readable, and a later layer that disagrees is refused rather
+    // than allowed to rewrite the convention for the layers already loaded.
+    bool qk_wide_decided = false;
+    i32 qk_wide_layer = -1;
     for (i32 l = 0; l < cfg_.n_layer; l++) {
         LayerWeights &L = layers_[static_cast<size_t>(l)];
         stream_cur_ = layer_streamed(l);
@@ -3516,7 +3551,6 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         L.q_bias = upload_f32(blk_key("blk.%d.attn_q.bias", l));
         L.k_bias = upload_f32(blk_key("blk.%d.attn_k.bias", l));
         L.v_bias = upload_f32(blk_key("blk.%d.attn_v.bias", l));
-        cfg_.has_bias = cfg_.has_bias || (L.q_bias != nullptr);
 
         L.q_norm = upload_f32(blk_key("blk.%d.attn_q_norm.weight", l));
         L.k_norm = upload_f32(blk_key("blk.%d.attn_k_norm.weight", l));
@@ -3564,13 +3598,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             const i64 per_head = cfg_.head_dim;
             const i64 q_row = static_cast<i64>(cfg_.n_head) * cfg_.head_dim;
             const i64 k_row = static_cast<i64>(cfg_.n_head_kv) * cfg_.head_dim;
-            cfg_.qk_norm_wide = false;
+            bool wide[2] = {false, false};
+            bool have[2] = {false, false};
             for (int i = 0; i < 2; i++) {
                 const char *nm = i == 0 ? "blk.%d.attn_q_norm.weight"
                                         : "blk.%d.attn_k_norm.weight";
                 const std::string name = blk_key(nm, l);
                 const GgufTensor *t = gguf_.tensor(name);
                 if (!t) continue;
+                have[i] = true;
                 const i64 w = t->n_elements;
                 const i64 row = i == 0 ? q_row : k_row;
                 // The two wide spellings are the same statement -- "one RMS over
@@ -3581,7 +3617,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 // head counts) both resolve to the same branch.
                 if (w == per_head) continue;
                 if (w == row || w == cfg_.n_embd) {
-                    cfg_.qk_norm_wide = true;
+                    wide[i] = true;
                     continue;
                 }
                 if (err)
@@ -3594,6 +3630,47 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                                   static_cast<long long>(row),
                                   static_cast<long long>(cfg_.n_embd));
                 return false;
+            }
+            // Both branch norms must agree: the engine has one flag per layer
+            // and it widens q and k together. A file whose query norm is over
+            // the whole row and whose key norm is per head is a schema this
+            // engine cannot express, and running it would apply one
+            // convention to a tensor written for the other -- silently, on
+            // every layer.
+            if (have[0] && have[1] && wide[0] != wide[1]) {
+                if (err)
+                    *err = format("layer %d: attn_q_norm is %s but attn_k_norm "
+                                  "is %s; this engine widens both branches or "
+                                  "neither, so this file's QK-norm convention "
+                                  "cannot be expressed",
+                                  static_cast<int>(l),
+                                  wide[0] ? "wide (whole projected row)"
+                                          : "per head",
+                                  wide[1] ? "wide (whole projected row)"
+                                          : "per head");
+                return false;
+            }
+            const bool w = have[0] ? wide[0] : wide[1];
+            if (have[0] || have[1]) {
+                if (!qk_wide_decided) {
+                    qk_wide_decided = true;
+                    qk_wide_layer = l;
+                    cfg_.qk_norm_wide = w;
+                } else if (cfg_.qk_norm_wide != w) {
+                    if (err)
+                        *err = format("layer %d normalizes QK %s while layer %d "
+                                      "normalizes it %s; the convention is "
+                                      "carried once for the whole stack, so the "
+                                      "two halves would run the wrong one",
+                                      static_cast<int>(l),
+                                      w ? "over the whole projected row"
+                                        : "per head",
+                                      static_cast<int>(qk_wide_layer),
+                                      cfg_.qk_norm_wide
+                                          ? "over the whole projected row"
+                                          : "per head");
+                    return false;
+                }
             }
         }
     }
@@ -3796,6 +3873,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // the full-layer table -- YaRN included, which is what gpt-oss needs.
     if (cfg_.swa_window > 0 && swa_own_rope)
         build_inv_freq(inv_freq_swa_, cfg_.rope_dim_swa, cfg_.rope_base_swa);
+    // A family whose reference passes `ext_factor = 0` on its windowed layers
+    // (mellum, olmo2) never folds the full layers' YaRN into that half of the
+    // stack. A file that states its own SWA base is already covered above; when
+    // it does not and the full table IS scaled, the windowed table is the plain
+    // one over the same dimensions and the same base. On an unscaled file the
+    // two tables are identical, so nothing is built and nothing changes.
+    //
+    // Linear (non-YaRN) scaling is NOT covered: that factor multiplies the
+    // position inside the kernel through one stack-wide `mc.rope_scale`, so a
+    // windowed layer cannot carry its own 1.0 without a per-layer scale. No
+    // family in this table pairs linear scaling with a window today.
+    if (cfg_.swa_window > 0 && !swa_own_rope && aspec.swa_plain_rope &&
+        cfg_.rope_yarn)
+        build_inv_freq(inv_freq_swa_, cfg_.rope_dim, cfg_.rope_base);
     if (cfg_.rope_neox)
         KRK_INFO("rope pairing: NeoX half-split (channel j with j + %d)",
                  cfg_.rope_dim / 2);
