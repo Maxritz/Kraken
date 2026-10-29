@@ -44,3 +44,9 @@ Status legend: **todo** · **done** · **blocked (why)**
   `scale_lmhead = 256/n_embd`), so all three were defects for that row.
 - A row that becomes `Yes` needs a fixture before it can be called verified;
   A5 pins flags, not graphs.
+- **Negative control, run once on 2026-10-29:** with the two defects put back
+  (mellum's `swa_window_first` reverted to false, and the `.attention.scale`
+  read removed) `test_family_scales` reports 29/32 -- `is_swa(0)` fails, the
+  row pin fails, and "a stated attention scale of 4.0 changes the answer" fails.
+  Reverted; the suite is 6566/6566 with the fixes in place. These arms were
+  observed to fail, not assumed to.
