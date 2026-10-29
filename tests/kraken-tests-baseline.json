@@ -1,8 +1,8 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-29T14:09:54Z",
-  "recorded_commit": "1b80c79",
+  "recorded_utc": "2026-10-29T14:51:10Z",
+  "recorded_commit": "60ba39b",
   "totals": {"groups": 156, "passed": 7058, "run": 7058, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
