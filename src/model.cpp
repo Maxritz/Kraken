@@ -439,6 +439,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.fused_qkv = aspec.fused_qkv;
     cfg_.fused_gate_up = aspec.fused_gate_up;
     cfg_.ln_bias = aspec.ln_bias;
+    cfg_.norm_bias = aspec.norm_bias;
     cfg_.learned_pos = aspec.learned_pos;
     cfg_.parallel_residual = aspec.parallel_residual;
     // The residual SHAPE as an A/B arm, for the same reason KRK_ROPE_NEOX is
@@ -1861,7 +1862,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (err) *err = "output_norm.weight is missing";
             return false;
         }
-        if (cfg_.ln_bias) {
+        if (cfg_.ln_bias || cfg_.norm_bias) {
             // The final LayerNorm's bias. Without it the last hidden row keeps
             // its mean, which shifts every logit by a constant per row -- and
             // a constant on the LOGIT axis does not divide out of a softmax
@@ -2300,7 +2301,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // then the FFN's norm is attn_norm, which the fallback below aliases.
         L.attn_norm_2 = upload_f32(blk_key("blk.%d.attn_norm_2.weight", l));
         L.attn_norm_2_bias = upload_f32(blk_key("blk.%d.attn_norm_2.bias", l));
-        if (cfg_.ln_bias) {
+        if (cfg_.ln_bias || cfg_.norm_bias) {
             // LayerNorm, so each pre-norm has a bias beside its weight. A
             // LayerNorm run without its bias is a different function, not a
             // rounding difference: every row keeps its mean instead of being

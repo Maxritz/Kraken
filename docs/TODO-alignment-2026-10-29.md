@@ -52,13 +52,45 @@ ways:
 | `deepseek4-dspark` | No | refused, names the multi-token-prediction head shard | **No** |
 | `qwen4-mtp` | No | refused, names the qwen4exp target it belongs to | **No** |
 
+### `Yes` rows with no file behind them (same pass, second half)
+
+A `Partial` with a measured reason is a weaker claim than `Yes` — but a `Yes`
+with no file behind it is weaker still. Sweeping the suite and collecting every
+arch string the loaders actually saw found **13 `Yes` rows that no group had
+ever loaded**:
+
+| row | family definition (llama.cpp) | now |
+|-----|-------------------------------|-----|
+| `phi3` | one fused `attn_qkv` row, one fused gate|up `ffn_up` (`phi3.cpp:52`) | built, loads, generates |
+| `phi3moe`, `phimoe` | `phimoe.cpp`: the same attention, SEPARATE `ffn_gate_exps`/`ffn_up_exps`, biases on every norm | built, loads, generates |
+| `chatglm` | llama's split q/k/v with the fused gate|up MLP | built, loads, generates |
+| `glm4` | the same MLP plus a norm on each branch's output | built, loads, generates |
+| `glm4moe` | `glm4-moe.cpp`: post-norms, per-head QK-norm, q/k/v biases, shared expert | built, loads, generates |
+| `qwen3` | llama's block plus a per-head QK-norm | built, loads, generates |
+| `laguna` | per-head QK-norm, a separate softplus attention gate, NeoX pairing, routed FFN | built, loads, generates |
+| `gpt2` | LayerNorm with biases, learned absolute positions, fused q|k|v, no gate tensor | built, loads, generates |
+| `qwen35` | the dense sibling of the gated delta net stack | built, loads, generates |
+| `qwen35-dflash-draft` | the third spelling of the dflash head set (own metadata prefix, poolside's underscore tensor names) | built, loads, drafts the same rows as the canonical set |
+| `dflash`, `dflash-draft` | already exercised by `test_dflash_*` — the sweep simply does not see them because they load through `src/dflash.cpp`, not `Model::load` | measured: 10 / 1 / 1 drafter loads |
+
+`build_row_fixture` writes the tensor set the **row's own flags** imply
+(`fused_qkv`, `qk_norm`, `qkv_bias`, `attn_gate`, `post_branch_norm`,
+`fused_gate_up`, `gpt2_style`, `ln_bias`, `norm_bias`) rather than a hand-written
+list per name, so this group checks the row against the loader in both
+directions: a row that declares a tensor its family does not carry fails just as
+loudly as a loader that cannot read one it does.
+
+Re-measured after the pass: **48 `Yes` rows, 0 without a file** (the three draft
+rows show up in the dflash loader's own line).
+
 ### Defects this pass found
 
 | ID | P | Item | Closing check |
 |----|---|------|---------------|
 | D1 | **P0** | `gemma_spec` set `qk_norm` for the whole family, so a real Gemma-1 or Gemma-2 file was refused for `attn_q_norm.weight` — a tensor llama.cpp's gemma.cpp/gemma2.cpp never create. Every Gemma 1/2 checkpoint was rejected by a constant, not by a graph. | per-row flag; `test_arch_table` now asserts true for gemma3/gemma4 and false for gemma/gemma2. Control observed: with `qk_norm=true` restored, the gemma2 fixture is refused with "layer 0 is missing attn_q_norm.weight, which arch 'gemma2' declares" |
 | D2 | **P0** | A `deepseek41` file carrying V4.1's `hc_attn_fn`/`hc_attn_base`/`hc_attn_scale` tensors LOADED with `model.load=1` and no blocker recorded — the row promised "refused by name, not mis-loaded", and the loader silently dropped the residual the whole stack runs through. Engram had the same hole (`engram_*` was a note, not a gap). | `kGapTensors` entries for the six Sinkhorn stems and `engram_`; `test_pending_model_fixtures` ds41-hc arm asserts the refusal, and `test_load_verdict`'s Engram control now asserts the shape rule is cleared while Engram refuses. Control observed: before the entries, the same arm printed "verdict runnable but expected the opposite; no blocker was recorded; model.load=1" |
-| D3 | P3 | The vision caveat on `qwen2vl`/`qwen3vl` is the ROW's reason, so a text-only file carries it too. | NOT A DEFECT — conservative and never silent; measured and asserted in the qwen2vl arm so it cannot be mistaken for tensor-level detection later |
+| D3 | **P1** | `phimoe`/`phi3moe` never read the bias on their RMSNorms. llama.cpp's phimoe.cpp creates `attn_norm.bias`, `ffn_norm.bias` and `output_norm.bias` with no OPTIONAL flag and its graph adds them after the norm; this engine read every one of them only under `ArchSpec::ln_bias`, which ALSO selects the LayerNorm forward, so the family could not simply take that flag. Every real Phi-MoE checkpoint loaded and decoded with three biases per layer dropped — fluent, wrong, and silent. | `ArchSpec::norm_bias` + `ModelConfig::norm_bias` upload the three vectors, and `Engine::norm_bias_add` applies them after the RMSNorm at the attention pre-norm, the FFN pre-norm (both the fused add_rmsnorm and the pure-MoE branch) and the head. Measured on a twin pair that differs ONLY in those vectors: **md 0.078218743 at peak 2.34401** after the fix, **md exactly 0** before it (control observed — the first run of this very arm printed `md 0 at peak 2.34401`) |
+| D4 | P3 | The vision caveat on `qwen2vl`/`qwen3vl` is the ROW's reason, so a text-only file carries it too. | NOT A DEFECT — conservative and never silent; measured and asserted in the qwen2vl arm so it cannot be mistaken for tensor-level detection later |
 
 ## Open
 

@@ -316,6 +316,9 @@ constexpr ArchSpec phi3moe_spec() {
                "phi3", "", false, false, false, false};
     s.fused_qkv = true;
     s.fused_gate_up = true;
+    // Phi-MoE carries a bias on every RMSNorm (llama.cpp phimoe.cpp creates
+    // attn_norm.bias / ffn_norm.bias / output_norm.bias with no OPTIONAL flag).
+    s.norm_bias = true;
     return s;
 }
 
@@ -383,6 +386,9 @@ constexpr ArchSpec phimoe_spec() {
                "phi3", "", false, false, false, false};
     s.fused_qkv = true;
     s.fused_gate_up = true;
+    // Phi-MoE carries a bias on every RMSNorm (llama.cpp phimoe.cpp creates
+    // attn_norm.bias / ffn_norm.bias / output_norm.bias with no OPTIONAL flag).
+    s.norm_bias = true;
     return s;
 }
 

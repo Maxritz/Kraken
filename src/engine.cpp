@@ -2567,6 +2567,12 @@ void Engine::shutdown() {
     be_ = nullptr;
 }
 
+void Engine::norm_bias_add(f32 *dst, const f32 *bias, i32 n_tok, i64 width) {
+    if (!model_.cfg().norm_bias || !bias || !dst) return;
+    for (i32 t = 0; t < n_tok; t++)
+        be_->add_inplace(dst + static_cast<i64>(t) * width, bias, width);
+}
+
 void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
                       i64 rows, const f32 *row_scale) {
     if (dump_path_.empty() || rows <= 0) return;
@@ -3129,6 +3135,7 @@ void Engine::head_compute(i32 row) {
         const void *src = act_at(ws_x_, as, static_cast<i64>(row) * n_embd_);
         be_->rmsnorm(ws_xn_, src, model_.out_norm(), 1, n_embd_, mc.rms_eps,
                      static_cast<const i32 *>(ws_rexp_) + row);
+        norm_bias_add(static_cast<f32 *>(ws_xn_), model_.out_norm_bias(), 1, n_embd_);
     }
     void *xn = ws_xn_;
     if (model_.had().head_folded) {
@@ -3704,6 +3711,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         } else {
             be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, n, n_embd_, mc.rms_eps,
                          static_cast<const i32 *>(ws_rexp_));
+            norm_bias_add(static_cast<f32 *>(ws_xn_), L.attn_norm_bias, n, n_embd_);
         }
 
         if (L.gdn) {
@@ -3740,6 +3748,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                 } else {
                     be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_,
                                  mc.rms_eps, static_cast<const i32 *>(ws_rexp_));
+                    norm_bias_add(static_cast<f32 *>(ws_xn_), L.ffn_norm_bias, n, n_embd_);
                 }
                 dump_row("ffn.pre", l, ws_xn_, n_embd_, n);
                 if (L.moe) {
@@ -4162,6 +4171,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         } else {
             be_->add_rmsnorm(ws_xn_, ws_x_, ws_x2_, L.ffn_norm, n, n_embd_,
                              mc.rms_eps, static_cast<const i32 *>(ws_rexp_));
+            norm_bias_add(static_cast<f32 *>(ws_xn_), L.ffn_norm_bias, n, n_embd_);
         }
         } else {
             // Pure-MoE block: no attention to fold in, so the FFN input norm
@@ -4172,6 +4182,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             } else {
                 be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps,
                              static_cast<const i32 *>(ws_rexp_));
+                norm_bias_add(static_cast<f32 *>(ws_xn_), L.ffn_norm_bias, n, n_embd_);
             }
             dump_row("ffn.pre", l, ws_xn_, n_embd_, n);
         }

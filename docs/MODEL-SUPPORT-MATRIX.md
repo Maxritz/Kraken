@@ -37,6 +37,19 @@ not read while their text halves run; `deepseek41` runs its whole graph on a
 dense-core file. The six still-refused families are refused BY NAME, and the
 test asserts the name is in the message.
 
+Its second half did the same for the rows that already claimed `Yes`: 13 of
+them had never had a file of their family through a loader. `test_yes_row_fixtures`
+now builds one per row from the tensor set that row's own flags imply —
+`phi3`, `phi3moe`, `phimoe`, `chatglm`, `glm4`, `glm4moe`, `qwen3`, `laguna`,
+`gpt2`, `qwen35` — and `test_dflash_qwen35_spelling` covers the third dflash
+prefix. Re-measured after: 48 `Yes` rows, none without a file.
+
+That half also found a silent mis-load: `phimoe`/`phi3moe` files carry a bias on
+every RMSNorm and this engine read them only under the LayerNorm flag, so every
+real Phi-MoE checkpoint ran with three bias vectors per layer dropped (measured:
+two files differing only in those vectors gave `md` exactly 0). They are applied
+now (`ArchSpec::norm_bias`), and the same pair moves the logits by 0.0782.
+
 That pass also closed two holes it found. `gemma`'s QK-norm was a family
 constant, so every real Gemma-1/2 file was refused for `attn_q_norm.weight` — a
 tensor llama.cpp's gemma.cpp/gemma2.cpp never create; it is a per-row flag now.
