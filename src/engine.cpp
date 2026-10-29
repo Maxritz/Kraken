@@ -3264,6 +3264,18 @@ bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
             if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, kvw, n);
             if (L.v_bias) be_->add_bias_rows(ws_v_, L.v_bias, kvw, n);
         }
+        // The same bound the llama-schema path applies (OLMo-1's
+        // `attention.clamp_kqv`, see forward_core). No family that takes THIS
+        // path declares one today -- it is gpt2/gptneox/gptj/phi2 -- but the
+        // loader reads the key off the file rather than off the path, so
+        // leaving it out here would be the silent drop this engine refuses to
+        // make: a bound read and not applied.
+        if (mc.attn_clamp_kqv > 0.0f) {
+            const f32 c = mc.attn_clamp_kqv;
+            be_->clamp_act(ws_q_, -c, c, static_cast<i64>(n) * lq);
+            be_->clamp_act(ws_k_, -c, c, static_cast<i64>(n) * kvw);
+            be_->clamp_act(ws_v_, -c, c, static_cast<i64>(n) * kvw);
+        }
 
         // Per-head QK-norm, when the file carries the weights. Some MPT
         // exports do and some do not; the loader sets mc.qk_norm from the
@@ -3732,6 +3744,20 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             be_->add_bias_rows(ws_k_, L.qkv_bias + lq, lkv, n);
             be_->add_bias_rows(ws_v_, L.qkv_bias + lq + lkv, lkv, n);
         }
+        // OLMo-1 bounds the three attention projections: `attention.clamp_kqv`
+        // (8.0 in every OLMo-1 config) clamps q, k and v to [-c, +c] here,
+        // after the projection and its bias and BEFORE the rotary -- the
+        // reference's order, and the clamp is inside the rotation's input, so
+        // applying it on the rotated values is a different function. The
+        // loader refuses a file that declares a positive clamp on a backend
+        // without clamp_act(), so reaching this branch with a bound means the
+        // kernel exists; nothing at all runs at 0, which is every other family.
+        if (mc.attn_clamp_kqv > 0.0f) {
+            const f32 c = mc.attn_clamp_kqv;
+            be_->clamp_act(q_out, -c, c, static_cast<i64>(n) * lq);
+            be_->clamp_act(ws_k_, -c, c, static_cast<i64>(n) * lkv);
+            be_->clamp_act(ws_v_, -c, c, static_cast<i64>(n) * lkv);
+        }
         // QSA: the indexer's own projections and its block selection, computed
         // from the same normed input q/k/v read and BEFORE rope touches
         // anything (the indexer rotates pooled keys and its own queries, not
@@ -4148,6 +4174,15 @@ void Engine::logit_head(const void *xn) {
     // sees the host copy.
     if (const f32 *b = model_.out_bias())
         be_->add_bias_rows(ws_logits_, b, n_vocab_, 1);
+    // muse-glimmer's `<arch>.logit_scale`: the reference scales the head's
+    // output and THEN applies the final-logit softcap, so the composed function
+    // is cap*tanh(s*x/cap) -- not s*cap*tanh(x/cap), which is what an
+    // after-the-cap multiply would produce, and not x, which is what ignoring
+    // the key produced. Every logits consumer reads this buffer (the host
+    // download, the device top-k, the speculative verifier and the draft
+    // comparisons), so the scale lands once, here, on the device.
+    if (const f32 s = model_.cfg().logit_scale; s != 1.0f)
+        be_->scale_act(ws_logits_, s, 1, n_vocab_, n_vocab_);
 }
 
 void Engine::gemm_residual(void *dst, const void *x, const void *w, DType wt,

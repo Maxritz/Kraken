@@ -1545,6 +1545,27 @@ all. It is now checked for every layer that carries a gate. And the eps the post
 norms run at is now read from the file's own `post_norm_epsilon` when it states
 one, instead of being the arch's constant only.
 
+A later audit of the row against the reference — every flag re-read at
+`src/models/muse-glimmer.cpp`, not against the family's name — found three more,
+and they are the reason that page exists:
+
+* **`<arch>.logit_scale` was never read.** The reference requires the key and
+  scales the head's output *before* the final-logit softcap, so the composed
+  function is `cap*tanh(s*x/cap)`; this engine ran `cap*tanh(x/cap)`. The key is
+  now read per file and applied once in `Engine::logit_head`, on the buffer every
+  consumer reads.
+* **The window was on the wrong layers.** `load_swa_pattern(ml, 4)` defaults to
+  `dense_first = false` — layers 0..2 windowed, layer 3 full — and the loader's
+  own default is laguna's opposite. Since this family rotates *only* on its
+  windowed layers, one missing flag was wrong twice: the mask and the rotary.
+* **A file with no window declared no rotary at all**: no window means every
+  layer is "full", and `rope_swa_only` then skips the rotation everywhere. The
+  reference requires `attention.sliding_window` here, and so does the loader now.
+
+See `docs/AUDIT-schema-rows-2026-10-29.md` for the same treatment of every row
+the table calls supported — seven defects in total, four of them in rows that had
+been reported as done.
+
 ### The fused-projection pair: qwen and internlm2
 
 `qwen` (Qwen1) and `internlm2` store **one** `attn_qkv` row of `Q | K | V`, so the

@@ -278,6 +278,36 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         static_cast<f32>(gguf_.get_f64(key(".final_logit_softcapping"), 0.0));
     cfg_.attn_softcap =
         static_cast<f32>(gguf_.get_f64(key(".attention.logit_softcapping"), 0.0));
+    // muse-glimmer scales the head's output before the softcap with its own
+    // `logit_scale` (llama.cpp reads LLM_KV_LOGIT_SCALE for that family alone,
+    // without an optional flag). Read here, applied in Engine::logit_head, and
+    // skipped entirely at 1.0 -- which is what every file that does not carry
+    // the key gets.
+    cfg_.logit_scale =
+        static_cast<f32>(gguf_.get_f64(key(".logit_scale"), 1.0));
+    if (!(cfg_.logit_scale > 0.0f)) {
+        // A zero or negative scale is not a bound, it is a different function
+        // (and a negative one reorders the vocabulary). No family declares one,
+        // so a file that does is either mis-converted or not this schema.
+        if (err)
+            *err = "arch '" + a + "': logit_scale must be positive, got " +
+                   std::to_string(static_cast<double>(cfg_.logit_scale));
+        return false;
+    }
+    // OLMo-1's attention clamp (`attention.clamp_kqv`, `clip_qkv` on the HF
+    // side). Applied to q/k/v after the projection and before the rotary; 0
+    // means the file declares none.
+    cfg_.attn_clamp_kqv =
+        static_cast<f32>(gguf_.get_f64(key(".attention.clamp_kqv"), 0.0));
+    if (cfg_.attn_clamp_kqv > 0.0f && !be_->clamp_supported()) {
+        if (err)
+            *err = "arch '" + a + "': attention.clamp_kqv=" +
+                   std::to_string(static_cast<double>(cfg_.attn_clamp_kqv)) +
+                   " bounds the attention projections, and this backend has no "
+                   "clamp kernel; running it unclamped would decode a different "
+                   "model";
+        return false;
+    }
     {
         const std::string st = gguf_.get_str(key(".rope.scaling.type"), "");
         if (st == "none" || st.empty()) cfg_.rope_scale = 1.0f;
@@ -356,6 +386,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // `post_norm_eps` 0 means "use the model's rms_eps", which is the gemma case;
     // muse-glimmer states its own 1e-8 for these two norms.
     cfg_.post_branch_norm = aspec.post_branch_norm;
+    cfg_.noweight_norm = aspec.noweight_norm;
     cfg_.moe_two_branch = aspec.moe_two_branch;
     cfg_.no_rope_step = aspec.no_rope_layer_step;
     // Stored as given; 0 means "the model's rms_eps", resolved by the engine at
@@ -383,6 +414,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     cfg_.alibi_max_bias = static_cast<f32>(gguf_.get_f64(
         key(".attention.max_alibi_bias"), aspec.alibi_max_bias));
     cfg_.rope_swa_only = aspec.rope_swa_only;
+    // A family that rotates ONLY on its windowed layers depends on the window
+    // for its ROTATION as well as its mask. With no window declared, `is_swa()`
+    // is false everywhere, so every layer would take the full-attention path
+    // and skip the rotary -- a different model twice over, and silent. The
+    // reference requires `attention.sliding_window` on muse-glimmer (get_key
+    // with no optional flag), so a file without it is mis-converted or is not
+    // this schema.
+    if (cfg_.rope_swa_only && cfg_.swa_window <= 0) {
+        if (err)
+            *err = "arch '" + a + "' rotates only on its sliding-window layers, "
+                   "and this file declares no attention.sliding_window: every "
+                   "layer would run as full attention with no rotary at all";
+        return false;
+    }
     // RoPE's pair convention is a property of the export, so it comes from
     // the arch table rather than from the tensors. KRK_ROPE_NEOX=0/1 forces
     // it, for bisecting a file that disagrees with llama.cpp: with the wrong
@@ -1523,7 +1568,10 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             out_norm_ = upload_f32("token_embd_norm.weight");
             if (out_norm_) lp.mark("  token_embd_norm upload (no output_norm)");
         }
-        if (!out_norm_) {
+        // OLMo-1 normalizes the last row with no weight either, and its tensor
+        // list creates no `output_norm` (`src/models/olmo.cpp`), so the null is
+        // the file's shape rather than a truncated download.
+        if (!out_norm_ && !cfg_.noweight_norm) {
             if (err) *err = "output_norm.weight is missing";
             return false;
         }
@@ -2012,7 +2060,14 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // the hyper-connection mixer's own grouped norm instead, and requiring
         // one here would refuse a file whose norms are all present under the
         // names the mixer uses.
-        if (!cfg_.hc && (!L.attn_norm || !L.ffn_norm)) {
+        // OLMo-1 has no norm tensors at all: its reference normalizes with a
+        // NULL weight in all three places, so a complete file of that family
+        // carries no `attn_norm` and no `ffn_norm`. Requiring one refused every
+        // such checkpoint; the two null pointers below become weightless RMS
+        // norms in the engine (Backend::rmsnorm's null-weight case), which is
+        // the arithmetic the reference runs.
+        if (!cfg_.hc && !cfg_.noweight_norm &&
+            (!L.attn_norm || !L.ffn_norm)) {
             if (err) *err = "layer " + std::to_string(l) + " is missing its norm weights";
             return false;
         }
@@ -3465,18 +3520,50 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
         L.q_norm = upload_f32(blk_key("blk.%d.attn_q_norm.weight", l));
         L.k_norm = upload_f32(blk_key("blk.%d.attn_k_norm.weight", l));
+        // A row that declares QK-norm names a computation, so a file of that
+        // family that does not carry the tensors is missing them, not opting
+        // out of them. The upload above is optional by design -- an undeclared
+        // arch with a per-head norm tensor is read for free -- but when the
+        // ARCH says the norm is there and the tensor is not, the engine would
+        // run the layer with no norm at all and answer plausibly. Refuse instead
+        // and name the tensor.
+        // Only a layer that actually ATTENDS: on a hybrid stack the recurrent
+        // half (lfm2's shortconv, qwen35's delta net) carries no query
+        // projection and no QK norm, and demanding one there would refuse a
+        // complete file. The projection is uploaded above, so the question is
+        // the layer's, not the arch's.
+        const bool layer_attends = L.wq.present() || L.wqkv_fused.present();
+        if (aspec.qk_norm && layer_attends && (!L.q_norm || !L.k_norm)) {
+            if (err)
+                *err = "layer " + std::to_string(l) + " is missing " +
+                       (L.q_norm ? "attn_k_norm" : "attn_q_norm") +
+                       ".weight, which arch '" + a + "' declares; the layer "
+                       "would run with an unnormalized " +
+                       (L.q_norm ? "key" : "query") + " row";
+            return false;
+        }
         if (L.q_norm || L.k_norm) cfg_.qk_norm = true;
         // Qwen3/Gemma3 store the QK-norm weight as one head (head_dim wide);
         // OLMoE stores it across the whole projected row (n_embd wide) because
-        // its reference applies the norm before splitting into heads. Nothing
-        // in the schema says which, and the mistake is invisible in the output:
-        // the model still loads, still answers, just wrongly -- and wrongly on
-        // the CPU reference too, because both backends call the same op. So
-        // decide from the stored width, and refuse a width that is neither
-        // rather than reading it as whichever happened to fit.
-        if (cfg_.qk_norm && cfg_.n_embd > 0 && cfg_.head_dim > 0 &&
-            cfg_.n_embd != cfg_.head_dim) {
-            const i64 wide = cfg_.n_embd, per_head = cfg_.head_dim;
+        // its reference applies the norm before splitting into heads; OLMo-2
+        // stores TWO different row widths on one stack -- `attn_q_norm` over
+        // n_head*n_embd_head and `attn_k_norm` over n_head_kv*n_embd_head, the
+        // key row being narrower than the query row on every GQA file.
+        //
+        // Nothing in the schema says which, and the mistake is invisible in the
+        // output: the model still loads, still answers, just wrongly -- and
+        // wrongly on the CPU reference too, because both backends call the same
+        // op. So decide from the stored width, and refuse a width that is none
+        // of the three rather than reading it as whichever happened to fit.
+        //
+        // Each branch's row is its OWN width. This check used `n_embd` for both
+        // and refused anything else, which rejected every GQA olmo2/olmo3 file
+        // (1024-wide key norm against a 4096-wide embedding) with an error that
+        // read like a corrupt file.
+        if (cfg_.qk_norm && cfg_.head_dim > 0) {
+            const i64 per_head = cfg_.head_dim;
+            const i64 q_row = static_cast<i64>(cfg_.n_head) * cfg_.head_dim;
+            const i64 k_row = static_cast<i64>(cfg_.n_head_kv) * cfg_.head_dim;
             cfg_.qk_norm_wide = false;
             for (int i = 0; i < 2; i++) {
                 const char *nm = i == 0 ? "blk.%d.attn_q_norm.weight"
@@ -3485,17 +3572,28 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 const GgufTensor *t = gguf_.tensor(name);
                 if (!t) continue;
                 const i64 w = t->n_elements;
-                if (w == wide) cfg_.qk_norm_wide = true;
-                else if (w != per_head) {
-                    if (err)
-                        *err = format("%s is %lld wide, which is neither "
-                                      "head_dim (%lld) nor the full row (%lld); "
-                                      "this engine does not know how to apply it",
-                                      name.c_str(), static_cast<long long>(w),
-                                      static_cast<long long>(per_head),
-                                      static_cast<long long>(wide));
-                    return false;
+                const i64 row = i == 0 ? q_row : k_row;
+                // The two wide spellings are the same statement -- "one RMS over
+                // this projection's whole row" -- and the row IS n_embd on every
+                // stack where n_head * head_dim == n_embd. Accept both so a
+                // converted file that stores the embedding width (OLMoE) and one
+                // that stores the projected width (OLMo-2, laguna's per-layer
+                // head counts) both resolve to the same branch.
+                if (w == per_head) continue;
+                if (w == row || w == cfg_.n_embd) {
+                    cfg_.qk_norm_wide = true;
+                    continue;
                 }
+                if (err)
+                    *err = format("%s is %lld wide, which is none of head_dim "
+                                  "(%lld), this branch's projected row (%lld) or "
+                                  "the embedding width (%lld); this engine does "
+                                  "not know how to apply it",
+                                  name.c_str(), static_cast<long long>(w),
+                                  static_cast<long long>(per_head),
+                                  static_cast<long long>(row),
+                                  static_cast<long long>(cfg_.n_embd));
+                return false;
             }
         }
     }
@@ -3753,10 +3851,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                  cfg_.ssm_d_conv, cfg_.rope_dim, cfg_.head_dim);
     }
     if (cfg_.swa_window > 0) {
-        KRK_INFO("hybrid attention: %d of every %d layers attend fully, the rest "
-                 "within %d tokens; rope %d/%d dims at base %.0f on the windowed "
-                 "layers",
-                 cfg_.swa_period - 1, cfg_.swa_period, cfg_.swa_window,
+        // The pattern is `is_swa(l) = (l + phase) % period != 0`, i.e. exactly
+        // ONE full layer per period and `period - 1` windowed ones. This line
+        // printed the complement (`period - 1` layers "attend fully"), which is
+        // backwards for every family: muse-glimmer reads as a stack that is
+        // mostly full attention when 3 of its 4 layers are windowed.
+        KRK_INFO("hybrid attention: 1 of every %d layers attends fully, the "
+                 "rest within %d tokens; rope %d/%d dims at base %.0f on the "
+                 "windowed layers",
+                 cfg_.swa_period, cfg_.swa_window,
                  cfg_.rope_dim_swa, cfg_.head_dim,
                  static_cast<f64>(cfg_.rope_base_swa));
     }

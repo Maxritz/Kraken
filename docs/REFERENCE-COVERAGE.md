@@ -63,7 +63,7 @@ table, refused with a reason. `—` = not in the table yet.
 | DeepSeek-V3 | `deepseek2` | ✓ | MLA |
 | DeepSeek-V4 / V4-Flash-Vision-Exp / V4.1 | `deepseek4`, `deepseek41` | △ | compressed attention + sparse indexer read; streams/multi-sequence open |
 | Kimi-2 / K2-Horizon | `k2-horizon` | No | table entry, refused |
-| Muse-Glimmer | `muse-glimmer` | ✓ | weightless embedding norm, per-element sigmoid gate, branch post norms at 1e-8, rope on the windowed layers only |
+| Muse-Glimmer | `muse-glimmer` | ✓ | weightless embedding norm, per-element sigmoid gate, branch post norms at 1e-8, rope on the windowed layers only, `<arch>.logit_scale` before the softcap, window on layers 0..2 of every 4 |
 | DSpark / DFlash | `dspark`, `dflash` | No / ✓ | `dflash` + `dflash-draft` run |
 | MiniMax-M3 | `minimax-m3` | No | table entry, refused |
 | Spark 2.5 | `spark2_5` | ✓ | fused `attn_qkv` row + per-head sigmoid gate |
@@ -76,7 +76,7 @@ table, refused with a reason. `—` = not in the table yet.
 | Command-A | `command-r` | — | llama's tensors + **LayerNorm** (no bias) + a logit scale; the main forward is RMSNorm-only |
 | LLaMA-4 | `llama4` | — | `build_llama` + no-rope layers, QK norm, shared-expert bank |
 | Nanbeige 4.2 | `nanbeige` | — | `build_llama` + `n_loops` layer looping |
-| OLMo 1/2 7B/1B | `olmo`, `olmo2` | ✓ | `olmo` is llama's block verbatim; `olmo2` adds branch post norms, NeoX rope, QK norm |
+| OLMo 1/2 7B/1B | `olmo`, `olmo2` | ✓ | `olmo` is llama's block with WEIGHTLESS norms (no norm tensors at all) and `attention.clamp_kqv`; `olmo2` adds branch post norms, NeoX rope, and WIDE q/k norms of two different widths |
 | XVERSE | `xverse` | ✓ | llama's block verbatim |
 | Seed-OSS | `seed_oss` | ✓ | its FFN pre-norm is named `attn_post_norm` (loader fallback) |
 | SmolLM3 | `smollm3` | ✓ | NoPE: every 4th layer rotates nothing |
@@ -123,3 +123,14 @@ Counts at `1c5ea12`: **100** arch strings upstream, **52** in this table
 Every step-1 and step-2 family can be pinned the way `test_lfm2_dense` and
 `test_qwen2moe` are: a synthetic fixture, a forward, and an A/B that moves when
 the family's own piece is wrong.
+
+## Row audit, 2026-10-29
+
+Every ✓ row in the table above was re-read against its reference builder; the
+findings, the seven defects they turned up and the tests that now pin them are in
+[`AUDIT-schema-rows-2026-10-29.md`](AUDIT-schema-rows-2026-10-29.md). The short
+version: `olmo` was refused on every real file (weightless norms) and ignored a
+clamp, `olmo2` was refused on every GQA file (key-norm width), `muse-glimmer` lost
+its `logit_scale` and windowed the wrong layers, and a declared QK-norm with no
+tensors ran un-normalized. `spark2_5`, `lfm2`, `qwen2moe`, `seed_oss`, `smollm3`,
+`qwen`, `internlm2`, `xverse`, `gemma4`, `laguna` and `gpt-oss` came out clean.

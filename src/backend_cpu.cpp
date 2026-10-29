@@ -2169,6 +2169,21 @@ public:
                 });
     }
 
+    // OLMo-1's attention clamp: q, k and v are bounded after the projection and
+    // before the rotary, so the bound is on the pre-rope rows. Elementwise and
+    // branch-free; the CPU reference is the oracle for the device kernels.
+    bool clamp_supported() const override { return true; }
+    void clamp_act(void *x, f32 lo, f32 hi, i64 n) override {
+        npu_flush_();
+        f32 *p = static_cast<f32 *>(x);
+        par_for(n, 1, static_cast<f64>(n), [&](i64 b, i64 e) {
+            for (i64 i = b; i < e; i++) {
+                const f32 v = p[i];
+                p[i] = v < lo ? lo : (v > hi ? hi : v);
+            }
+        });
+    }
+
     void mul_slice(void *a, const void *b, i64 rows, i64 width, i64 stride,
                    i64 off) override {
         npu_flush_();

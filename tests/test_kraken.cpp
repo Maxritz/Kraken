@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <chrono>
 #include <fstream>
+#include <functional>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -5545,6 +5546,12 @@ struct VariantSpec {
     bool post_branch_norm = false;  // olmo2
     bool seed_oss_norm = false;     // ffn_norm spelled `attn_post_norm`
     int no_rope_step = 0;           // smollm3
+    // olmo2's two WIDE QK norms, at the widths its reference creates:
+    // q over n_head*hd and k over n_head_kv*hd. A complete olmo2 file carries
+    // them (the reference's create_tensor is mandatory), and since the loader
+    // now refuses a qk_norm-declaring arch without them, a fixture that omitted
+    // them was not a complete file of the family.
+    bool qk_norm = false;
 };
 
 static bool build_variant_model(const std::string &path, const VariantSpec &v) {
@@ -5596,6 +5603,10 @@ static bool build_variant_model(const std::string &path, const VariantSpec &v) {
                      vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f));
         b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
                      vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        if (v.qk_norm) {
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(q_dim)}, ones(q_dim));
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(kv_dim)}, ones(kv_dim));
+        }
         if (v.post_branch_norm) {
             // olmo2's two branch post norms, under the names its converter
             // writes. Their weights are deliberately not 1.0: the arm has to
@@ -5772,9 +5783,18 @@ struct GateSpec {
     bool fused_qkv = false;     // spark2_5
     f32 gate = 1.0f;            // value written into attn_gate.weight
     f32 embd_scale = 1.0f;      // muse-glimmer's weightless embd RMS is scale-free
-    std::vector<i32> swa_pattern;  // empty => no window declared
+    std::vector<i32> swa_pattern;  // empty => no per-layer pattern declared
+    // The window WIDTH on its own. A file may state `attention.sliding_window`
+    // and leave the per-layer pattern to the arch's default -- muse-glimmer's
+    // reference calls `load_swa_pattern(ml, 4)`, which only reads the array when
+    // the file has one -- so the two keys are separately settable here.
+    i32 swa_window = 0;
     bool post_norms = false;    // muse-glimmer's two branch norms
     bool qk_norm = false;
+    // `<arch>.logit_scale`, written only when positive. muse-glimmer's reference
+    // requires the key; 0 here means "the file does not carry it", which is
+    // every other family (and the loader's 1.0 default).
+    f32 logit_scale = 0.0f;
 };
 
 static bool build_gate_model(const std::string &path, const GateSpec &v) {
@@ -5796,10 +5816,13 @@ static bool build_gate_model(const std::string &path, const GateSpec &v) {
     b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
     b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
     b.meta_f32(arch + ".rope.freq_base", 10000.0f);
-    if (!v.swa_pattern.empty()) {
-        b.meta_u32(arch + ".attention.sliding_window", 16);
-        b.meta_i32_array(arch + ".attention.sliding_window_pattern", v.swa_pattern);
+    if (v.swa_window > 0 || !v.swa_pattern.empty()) {
+        b.meta_u32(arch + ".attention.sliding_window",
+                   v.swa_window > 0 ? static_cast<u32>(v.swa_window) : 16u);
+        if (!v.swa_pattern.empty())
+            b.meta_i32_array(arch + ".attention.sliding_window_pattern", v.swa_pattern);
     }
+    if (v.logit_scale > 0.0f) b.meta_f32(arch + ".logit_scale", v.logit_scale);
     add_spm_vocab(b, vocab, -1);
 
     auto vec = [](size_t n, i64 base, f32 scale) {
@@ -5867,6 +5890,133 @@ static bool build_gate_model(const std::string &path, const GateSpec &v) {
                      vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
     }
     return b.write(path);
+}
+
+// ---- the norm schema: width, presence, and the scalars around the head -----
+//
+// A review of the families this table already called supported turned up four
+// places where the ROW was the bug rather than the file. Each has a fixture
+// here, because none of them is visible in a log line:
+//
+//   * olmo2 declares two WIDE QK norms of DIFFERENT widths on one stack
+//     (`attn_q_norm` = n_head*n_embd_head, `attn_k_norm` = n_head_kv*n_embd_head).
+//     The loader's width check knew only head_dim and n_embd, so every GQA file
+//     of the family was refused as if the tensor were corrupt.
+//   * olmo (v1) has no norm TENSORS at all -- three weightless RMS norms -- and
+//     the loader required `attn_norm`/`ffn_norm`, so it refused every complete
+//     OLMo-1 checkpoint.
+//   * olmo (v1) also bounds q/k/v with `attention.clamp_kqv`, which the engine
+//     did not implement: accepting the file without the bound would decode a
+//     different model, so the loader reads the key and the backend must have
+//     the kernel.
+//   * a row that declares QK-norm over a file that lacks the tensors ran
+//     unnormed (silent, plausible, wrong) instead of refusing.
+//
+// The builder is deliberately the same llama shape as `build_fused_model`, with
+// the norm tensors made optional, so each arm differs from a working file by
+// exactly the piece it is about.
+struct SchemaSpec {
+    std::string arch = "olmo2";
+    bool write_norms = true;     // attn_norm + ffn_norm per layer
+    bool write_out_norm = true;  // output_norm.weight
+    i32 q_norm_w = 0;            // 0 => no attn_q_norm.weight
+    i32 k_norm_w = 0;            // 0 => no attn_k_norm.weight
+    bool post_norms = false;     // post_attention_norm + post_ffw_norm
+    f32 clamp_kqv = 0.0f;        // 0 => `attention.clamp_kqv` absent
+    f32 q_scale = 1.0f;          // magnitude of the query projection
+};
+
+static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
+    const int n_embd = 32, n_layer = 2, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, ctx = 64;
+    const std::string &arch = v.arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-norm-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    if (v.clamp_kqv > 0.0f) b.meta_f32(arch + ".attention.clamp_kqv", v.clamp_kqv);
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base, f32 scale) {
+        std::vector<f32> out(n);
+        for (size_t i = 0; i < n; i++)
+            out[i] = scale * wv(base + static_cast<i64>(i));
+        return out;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0, 1.0f));
+    if (v.write_out_norm)
+        b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        if (v.write_norms) {
+            b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+            b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        }
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, base + 100, v.q_scale));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        if (v.post_norms) {
+            b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
+            b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, ones(n_embd));
+        }
+        if (v.q_norm_w > 0)
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(v.q_norm_w)}, ones(v.q_norm_w));
+        if (v.k_norm_w > 0)
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(v.k_norm_w)}, ones(v.k_norm_w));
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+    }
+    return b.write(path);
+}
+
+// Load a file and hand its ModelConfig to `fn`, without generating. Returns
+// false (with `err`) when the loader refuses it -- which is half of what these
+// arms assert, so it is not an error path here.
+static bool schema_cfg(const std::string &p,
+                       const std::function<void(const Model &)> &fn,
+                       std::string &err) {
+    Backend *be = make_cpu_backend();
+    bool ok = false;
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = p;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        if (e.init(be, c, &err)) {
+            fn(e.model());
+            ok = true;
+        }
+    }
+    delete be;
+    return ok;
 }
 
 static void test_attention_gate_families() {
@@ -6008,6 +6158,10 @@ static void test_attention_gate_families() {
         v.wide_gate = false;  // per-head width on a family that needs per-element
         v.post_norms = true;
         v.qk_norm = true;
+        // The window is declared so the loader gets as far as the gate: a
+        // rope_swa_only family with no window is refused earlier, and that
+        // refusal is arm (7) of test_norm_schema_shapes, not this one.
+        v.swa_window = 16;
         const std::string f = "kraken-gate-muse-narrow.gguf";
         CHECK(build_gate_model(f, v), "wrote a muse-glimmer file with a per-head gate");
         Backend *be = make_cpu_backend();
@@ -6041,6 +6195,209 @@ static void test_attention_gate_families() {
                   "rope on the windowed layers only: the pattern changes the answer");
         else
             CHECK(false, ("the all-windowed twin runs: " + err).c_str());
+    }
+}
+
+static void test_norm_schema_shapes() {
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 m = 0.0f;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+    auto peak_of = [](const std::vector<f32> &v) {
+        f32 p = 0.0f;
+        for (f32 x : v) p = std::max(p, std::fabs(x));
+        return p;
+    };
+    std::string err;
+
+    // ---- (1) olmo2: two WIDE norms, one stack, two widths ----------------
+    // q is normalized over n_head*hd (= n_embd on this fixture) and k over
+    // n_head_kv*hd (= 16 against an embedding of 32). The second width is the
+    // one the loader refused, and refusing it refused every GQA olmo2 file.
+    std::vector<f32> olmo2_lg;
+    {
+        SchemaSpec v;
+        v.arch = "olmo2";
+        v.q_norm_w = 32;  // n_head * hd
+        v.k_norm_w = 16;  // n_head_kv * hd -- neither head_dim nor n_embd
+        v.post_norms = true;
+        const std::string f = "kraken-norm-olmo2.gguf";
+        CHECK(build_schema_model(f, v), "wrote the olmo2 GQA file");
+        if (variant_logits(f, olmo2_lg, err))
+            CHECK(peak_of(olmo2_lg) > 0.0f && peak_of(olmo2_lg) < 1e6f,
+                  "olmo2's key norm -- n_head_kv*head_dim wide -- loads and runs");
+        else
+            CHECK(false, ("olmo2 loads: " + err).c_str());
+        bool wide = false;
+        if (schema_cfg(f, [&](const Model &m) { wide = m.cfg().qk_norm_wide; }, err))
+            CHECK(wide, "... and both norms run over their branch's whole row, "
+                        "not per head");
+    }
+    // The width check still discriminates: 24 is not a head (8), not the query
+    // row (32) and not the key row (16), and must be refused naming the tensor
+    // rather than read as whichever is closest.
+    {
+        SchemaSpec v;
+        v.arch = "olmo2";
+        v.q_norm_w = 32;
+        v.k_norm_w = 24;
+        v.post_norms = true;
+        const std::string f = "kraken-norm-olmo2-bad.gguf";
+        CHECK(build_schema_model(f, v), "wrote the olmo2 file with a 24-wide k norm");
+        std::string lerr;
+        const bool loaded = schema_cfg(f, [](const Model &) {}, lerr);
+        CHECK(!loaded, "a QK-norm width that fits no branch is refused");
+        CHECK(lerr.find("attn_k_norm") != std::string::npos,
+              "and the refusal names the tensor");
+    }
+
+    // ---- (2) olmo v1: no norm tensors at all -----------------------------
+    // Three weightless RMS norms: `attn_norm`, `ffn_norm` and `output_norm` do
+    // not exist in the file, and the layer must still load and run.
+    std::vector<f32> olmo_lg;
+    {
+        SchemaSpec v;
+        v.arch = "olmo";
+        v.write_norms = false;
+        v.write_out_norm = false;
+        v.clamp_kqv = 8.0f;
+        v.q_scale = 8.0f;
+        const std::string f = "kraken-norm-olmo.gguf";
+        CHECK(build_schema_model(f, v), "wrote the OLMo-1 file with no norm tensors");
+        if (variant_logits(f, olmo_lg, err))
+            CHECK(peak_of(olmo_lg) > 0.0f && peak_of(olmo_lg) < 1e6f,
+                  "OLMo-1's weightless norms load and run with no norm weights");
+        else
+            CHECK(false, ("OLMo-1 loads: " + err).c_str());
+    }
+
+    // ---- (3) olmo v1: `attention.clamp_kqv` is part of the model ---------
+    // Same weights, three files: clamped at 8, clamped at 1e9 (a bound nothing
+    // reaches) and no key at all. The first must differ from the other two, and
+    // the other two must agree exactly -- which is what makes this a clamp and
+    // not a scale.
+    std::vector<f32> c8, cbig, cnone;
+    {
+        auto write = [&](const char *nm, f32 clamp) {
+            SchemaSpec v;
+            v.arch = "olmo";
+            v.write_norms = false;
+            v.write_out_norm = false;
+            v.clamp_kqv = clamp;
+            v.q_scale = 8.0f;
+            const std::string f = nm;
+            CHECK(build_schema_model(f, v), "wrote an OLMo-1 clamp arm");
+            std::vector<f32> lg;
+            if (variant_logits(f, lg, err)) return lg;
+            CHECK(false, ("the OLMo-1 clamp arm runs: " + err).c_str());
+            return std::vector<f32>();
+        };
+        c8 = write("kraken-norm-olmo-c8.gguf", 8.0f);
+        cbig = write("kraken-norm-olmo-cbig.gguf", 1.0e9f);
+        cnone = write("kraken-norm-olmo-cnone.gguf", 0.0f);
+    }
+    if (!c8.empty() && !cbig.empty() && !cnone.empty()) {
+        CHECK(maxdiff(cbig, cnone) == 0.0f,
+              "an unreachable clamp and no clamp at all are the same file's answer");
+        CHECK(maxdiff(c8, cbig) > 1e-3f,
+              "a 8.0 clamp on q/k/v changes the answer, so it is applied and "
+              "applied before the rotary");
+    }
+
+    // ---- (4) a declared QK-norm with no tensors is a refusal -------------
+    {
+        SchemaSpec v;
+        v.arch = "qwen3";  // the row declares per-head QK-norm
+        const std::string f = "kraken-norm-qwen3-nonorm.gguf";
+        CHECK(build_schema_model(f, v), "wrote a qwen3 file without its QK norms");
+        std::string lerr;
+        const bool loaded = schema_cfg(f, [](const Model &) {}, lerr);
+        CHECK(!loaded, "a qwen3 file with no attn_q_norm/attn_k_norm is refused");
+        CHECK(lerr.find("attn_q_norm") != std::string::npos,
+              "and the refusal names the missing norm");
+    }
+
+    // ---- (5) muse-glimmer: `<arch>.logit_scale` is applied ---------------
+    // The reference scales the head's output BEFORE the final-logit softcap.
+    // Two files that differ only in the key (1 vs 2) must differ by exactly a
+    // factor of two on the logits -- exact in f16, which is what the head
+    // buffer holds.
+    {
+        auto run = [&](f32 scale, const char *nm) {
+            GateSpec v;
+            v.arch = "muse-glimmer";
+            v.wide_gate = true;
+            v.post_norms = true;
+            v.qk_norm = true;
+            v.swa_pattern = {1, 0, 1, 0};
+            v.logit_scale = scale;
+            const std::string f = nm;
+            CHECK(build_gate_model(f, v), "wrote a muse-glimmer logit_scale arm");
+            std::vector<f32> lg;
+            if (variant_logits(f, lg, err)) return lg;
+            CHECK(false, ("the logit_scale arm runs: " + err).c_str());
+            return std::vector<f32>();
+        };
+        const std::vector<f32> s1 = run(1.0f, "kraken-norm-muse-s1.gguf");
+        const std::vector<f32> s2 = run(2.0f, "kraken-norm-muse-s2.gguf");
+        if (!s1.empty() && !s2.empty()) {
+            std::vector<f32> twice(s1.size());
+            for (size_t i = 0; i < s1.size(); i++) twice[i] = 2.0f * s1[i];
+            CHECK(maxdiff(s2, twice) == 0.0f,
+                  "logit_scale multiplies the head's output: 2.0 is exactly "
+                  "twice 1.0");
+            CHECK(peak_of(s1) > 0.0f, "and the head's output is not all zeros");
+        }
+    }
+
+    // ---- (6) muse-glimmer: which layers the window falls on -------------
+    // The reference builds the pattern with `load_swa_pattern(ml, 4)`, whose
+    // default is dense_first = false: layers 0..2 windowed, layer 3 full. This
+    // family rotates ONLY on its windowed layers, so the phase decides both the
+    // mask and the rotation -- the opposite phase is a different model, not a
+    // different rounding.
+    {
+        // The same family with NO window at all: it rotates only on the
+        // windowed layers, so a file that declares no window has no layer that
+        // rotates and none that masks. That is a refusal, not a default.
+        {
+            GateSpec nv;
+            nv.arch = "muse-glimmer";
+            nv.wide_gate = true;
+            nv.post_norms = true;
+            nv.qk_norm = true;
+            const std::string nf = "kraken-norm-muse-nowin.gguf";
+            CHECK(build_gate_model(nf, nv), "wrote a muse-glimmer file with no window");
+            std::string werr;
+            const bool wloaded = schema_cfg(nf, [](const Model &) {}, werr);
+            CHECK(!wloaded, "a file with no window is refused on a family that "
+                            "rotates only on its windowed layers");
+            CHECK(werr.find("sliding_window") != std::string::npos,
+                  "and the refusal names the missing window key");
+        }
+        GateSpec v;
+        v.arch = "muse-glimmer";
+        v.wide_gate = true;
+        v.post_norms = true;
+        v.qk_norm = true;
+        v.swa_window = 16;  // the width only: no per-layer array in the file
+        const std::string f = "kraken-norm-muse-phase.gguf";
+        CHECK(build_gate_model(f, v), "wrote a muse-glimmer file with no pattern array");
+        bool ok = false, swa0 = false, swa2 = false, swa3 = false;
+        if (schema_cfg(f, [&](const Model &m) {
+                ok = true;
+                swa0 = m.is_swa(0);
+                swa2 = m.is_swa(2);
+                swa3 = m.is_swa(3);
+            }, err)) {
+            CHECK(ok && swa0 && swa2 && !swa3,
+                  "with no pattern array the window is on layers 0..2 and the "
+                  "full layer is the last -- dense_first = false");
+        } else {
+            CHECK(false, ("the muse-glimmer phase file loads: " + err).c_str());
+        }
     }
 }
 
@@ -6141,7 +6498,10 @@ static void test_llama_variants() {
         CHECK(o1 && o1->support == ArchSupport::Yes && o1->shape == ArchShape::Dense,
               "olmo is supported and is a dense stack");
         CHECK(o1 && !o1->rope_neox && !o1->post_branch_norm && !o1->qk_norm,
-              "olmo is llama's schema with nothing added");
+              "olmo is llama's schema with no extra rope or branch norm");
+        CHECK(o1 && o1->noweight_norm,
+              "... and its norms are WEIGHTLESS -- the file carries no norm "
+              "tensors at all, which is what the flag tells the loader");
         const ArchSpec *xv = arch_lookup("xverse");
         CHECK(xv && xv->support == ArchSupport::Yes && !xv->rope_neox,
               "xverse is supported and uses the adjacent-pair rope");
@@ -6150,7 +6510,7 @@ static void test_llama_variants() {
         CHECK(o2 && o2->post_branch_norm,
               "and declares the branch post norms its graph runs");
         CHECK(o2 && o2->rope_neox && o2->qk_norm,
-              "beside its NeoX rope and per-head QK norm");
+              "beside its NeoX rope and its WIDE q/k norms");
         const ArchSpec *so = arch_lookup("seed_oss");
         CHECK(so && so->support == ArchSupport::Yes, "seed_oss is supported");
         CHECK(so && so->rope_neox && !so->post_branch_norm,
@@ -6206,6 +6566,7 @@ static void test_llama_variants() {
         VariantSpec v;
         v.arch = "olmo2";
         v.post_branch_norm = true;
+        v.qk_norm = true;
         const std::string f = "kraken-variant-olmo2.gguf";
         CHECK(build_variant_model(f, v), "wrote the olmo2 file (branch post norms)");
         std::vector<f32> lg;
@@ -6221,6 +6582,13 @@ static void test_llama_variants() {
         // the extra tensors sitting in the file.
         VariantSpec v2 = v;
         v2.arch = "llama";
+        // The QK-norm tensors come OUT for this twin. They are not what this
+        // arm is about (the branch post norms are), and the loader reads a
+        // per-head QK norm even on an arch that does not declare one -- by
+        // design, so an unlisted variant still gets its file's own graph. Left
+        // in, they would make the twin differ from the baseline for the right
+        // reason and fail the claim below for the wrong one.
+        v2.qk_norm = false;
         const std::string f2 = "kraken-variant-olmo2-as-llama.gguf";
         CHECK(build_variant_model(f2, v2), "wrote the same tensors under `llama`");
         std::vector<f32> lg2;
@@ -21558,6 +21926,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_llama_variants)
     TEST_GROUP(test_fused_projection_pair)
     TEST_GROUP(test_attention_gate_families)
+    TEST_GROUP(test_norm_schema_shapes)
     TEST_GROUP(test_lfm2_dense)
     TEST_GROUP(test_qwen2moe)
     TEST_GROUP(test_arch_table)

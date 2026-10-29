@@ -1495,6 +1495,20 @@ public:
     }
     virtual void mul_act(void *a, const void *b, i64 n) { (void)a; (void)b; (void)n; }
 
+    // x[i] <- min(hi, max(lo, x[i])) over n elements, in place.
+    //
+    // OLMo-1 bounds the three attention projections this way: its loader reads
+    // `attention.clamp_kqv` (8.0 in every OLMo-1 config) and its graph clamps q,
+    // k and v after the projection and before the rotary. The bound is part of
+    // the model -- a layer that skips it sees activations several times larger
+    // on some tokens and still decodes fluent text -- so a backend that cannot
+    // express it must SAY SO rather than silently leaving it out: the loader
+    // asks clamp_supported() before accepting a file that declares one.
+    virtual bool clamp_supported() const { return false; }
+    virtual void clamp_act(void *x, f32 lo, f32 hi, i64 n) {
+        (void)x; (void)lo; (void)hi; (void)n;
+    }
+
     // a[r][0..width) *= b[r*stride + off .. + width), for `rows` dense rows of
     // `a`. This is `mul_act` with the second operand taken from one slice of a
     // strided row, which is what a per-layer block of a model-projected table

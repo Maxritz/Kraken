@@ -360,6 +360,20 @@ struct ArchSpec {
     // position signal, which is the point of the pattern, so running rope there
     // anyway would be a wrong answer that decodes fluently.
     int no_rope_layer_step = 0;
+    // Every norm in the stack is WEIGHTLESS -- RMS without a gamma -- and the
+    // file therefore carries no `attn_norm`, `ffn_norm` or `output_norm` tensor
+    // at all. OLMo-1 is this shape: its reference builder calls
+    // `build_norm(inpL, NULL, NULL, LLM_NORM)` in all three places, so the
+    // multiply is dropped rather than reading a fabricate-able vector of ones.
+    //
+    // This is not `embd_rms_noweight`, which normalizes the EMBEDDING before
+    // layer 0 and leaves every block norm weighted. It is also not "a norm
+    // whose weights happen to be 1": a file of this family has no tensor to
+    // read, so a loader that required one refused every complete checkpoint,
+    // and a loader that substituted ones would run a graph the family does not
+    // have. The engine passes the null weight straight to Backend::rmsnorm,
+    // whose contract already carries the weightless case (gemma4's value norm).
+    bool noweight_norm = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.
