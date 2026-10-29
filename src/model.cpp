@@ -4109,13 +4109,29 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // one over the same dimensions and the same base. On an unscaled file the
     // two tables are identical, so nothing is built and nothing changes.
     //
-    // Linear (non-YaRN) scaling is NOT covered: that factor multiplies the
-    // position inside the kernel through one stack-wide `mc.rope_scale`, so a
-    // windowed layer cannot carry its own 1.0 without a per-layer scale. No
-    // family in this table pairs linear scaling with a window today.
     if (cfg_.swa_window > 0 && !swa_own_rope && aspec.swa_plain_rope &&
         cfg_.rope_yarn)
         build_inv_freq(inv_freq_swa_, cfg_.rope_dim, cfg_.rope_base);
+    // Linear (non-YaRN) scaling is not a frequency table at all: the factor
+    // divides the POSITION inside the kernel, so it rides one stack-wide
+    // `cfg_.rope_scale` and a windowed layer could not carry its own 1.0. It
+    // is resolved per layer here instead, once, from the same statement the
+    // plain table above rests on -- the reference passes these layers
+    // `ext_factor = 0` and a SWA freq scale of 1, whichever kind of scaling the
+    // full layers use. YaRN never reaches this: its factor is folded into the
+    // table and `cfg_.rope_scale` is set back to 1.0 before this point, so a
+    // YaRN file leaves the vector empty and costs nothing.
+    //
+    // A family with no window, or a file that declares no window, keeps the
+    // stack-wide value: nothing here is a guess about a mixture the file does
+    // not have.
+    if (cfg_.swa_window > 0 && aspec.swa_plain_rope && cfg_.rope_scale != 1.0f &&
+        !cfg_.rope_yarn) {
+        cfg_.rope_scale_layer.assign(static_cast<size_t>(cfg_.n_layer),
+                                     cfg_.rope_scale);
+        for (i32 l = 0; l < cfg_.n_layer; l++)
+            if (is_swa(l)) cfg_.rope_scale_layer[static_cast<size_t>(l)] = 1.0f;
+    }
     if (cfg_.rope_neox)
         KRK_INFO("rope pairing: NeoX half-split (channel j with j + %d)",
                  cfg_.rope_dim / 2);

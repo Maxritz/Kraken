@@ -2903,7 +2903,7 @@ bool Engine::qsa_select_block(const LayerWeights &L, i32 l, i32 n, i64 pos0,
     cfg.n_rot = mc.rope_dim > 0 ? mc.rope_dim : 0;
     cfg.inv_freq = model_.inv_freq_at(l).empty() ? nullptr
                                                 : model_.inv_freq_at(l).data();
-    cfg.rope_scale = mc.rope_scale;
+    cfg.rope_scale = model_.rope_scale_at(l);
     cfg.rope_neox = mc.rope_neox;
 
     const i32 n_blocks =
@@ -3309,7 +3309,7 @@ bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
         // these archs under LLAMA_ROPE_TYPE_NONE for the same reason.
         if (!mc.learned_pos && mc.alibi_max_bias <= 0.0f)
             be_->rope(ws_q_, ws_k_, lh, lkvh, hd, n, pos0,
-                      model_.inv_freq_at(l).data(), mc.rope_scale,
+                      model_.inv_freq_at(l).data(), model_.rope_scale_at(l),
                       model_.rope_frac_at(l), mc.rope_neox);
 
         kbase = const_cast<void *>(kvt_k_.base(l));
@@ -3846,7 +3846,8 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
               be_->attn_fused_chain(ws_attn_, ws_q_, kbase, vbase,
                                       ws_k_, ws_v_, d,
                                       model_.inv_freq_at(l).data(),
-                                      mc.rope_scale, model_.rope_frac_at(l),
+                                      model_.rope_scale_at(l),
+                                      model_.rope_frac_at(l),
                                       mc.qk_norm ? L.q_norm : nullptr,
                                       mc.qk_norm ? L.k_norm : nullptr,
                                       mc.rms_eps, mc.qk_norm_wide,
@@ -3883,7 +3884,8 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                 !(mc.rope_swa_only && !model_.is_swa(l));
             if (layer_rotates)
                 be_->rope(ws_q_, ws_k_, lh, lkvh, d.hd,
-                          n, pos0, model_.inv_freq_at(l).data(), mc.rope_scale,
+                          n, pos0, model_.inv_freq_at(l).data(),
+                          model_.rope_scale_at(l),
                           model_.rope_frac_at(l), mc.rope_neox);
             // A shared-KV layer appends nothing: the layer that owns this
             // plane wrote these rows already, and a second write would put the
@@ -4797,8 +4799,8 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
     if (!no_rope)
         be_->rope(ws_q_, ws_k_, nh, nkv, hd, 1,
                   static_cast<i64>(pos) * rope_scale + rope_off,
-                  model_.inv_freq_at(rope_layer).data(), mc.rope_scale, frac,
-                  mc.rope_neox);
+                  model_.inv_freq_at(rope_layer).data(),
+                  model_.rope_scale_at(rope_layer), frac, mc.rope_neox);
     be_->kv_append(mtp_kv_k_, mtp_kv_v_, ws_k_, ws_v_, d);
     be_->attention(ws_attn_, ws_q_, mtp_kv_k_, mtp_kv_v_, d);
     if (packed) {

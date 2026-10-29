@@ -420,6 +420,13 @@ struct ModelConfig {
     i32 n_ctx_train = 0;
     f32 rope_base = 10000.0f;
     f32 rope_scale = 1.0f;      // position scaling for linear RoPE
+    // Per-layer position divisor, when the stack's windowed half rotates with
+    // plain rope (ArchSpec::swa_plain_rope) and the file scales linearly.
+    // Linear scaling divides the POSITION, so unlike the frequency tables it
+    // cannot be re-derived per layer kind from one stack-wide value: the
+    // windowed layers would rotate every position by the full layer's factor.
+    // Empty means "use rope_scale everywhere", which is every other stack.
+    std::vector<f32> rope_scale_layer;
     // NOTE: there is deliberately no `rope_attn_scale` here. The YaRN
     // magnitude (mscale) is NOT folded into the attention scale by this
     // engine: the frequency half of YaRN is folded into the table (see
@@ -1103,6 +1110,15 @@ public:
     }
     f32 rope_frac_at(i32 layer) const {
         return is_swa(layer) ? cfg_.rope_frac_swa : cfg_.rope_frac;
+    }
+    // The position divisor this layer rotates with. See
+    // ModelConfig::rope_scale_layer: empty means the stack-wide value, which
+    // is what every family without a window -- and every stack whose file
+    // scales by YaRN, whose factor is already inside the table -- uses.
+    f32 rope_scale_at(i32 layer) const {
+        if (layer >= 0 && static_cast<size_t>(layer) < cfg_.rope_scale_layer.size())
+            return cfg_.rope_scale_layer[static_cast<size_t>(layer)];
+        return cfg_.rope_scale;
     }
     i64 n_ff() const { return cfg_.n_ff; }
     i64 n_embd() const { return cfg_.n_embd; }

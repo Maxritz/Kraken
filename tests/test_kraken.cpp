@@ -5937,6 +5937,10 @@ struct SchemaSpec {
     f32 embd_scale_key = 0.0f;   // <arch>.embedding_scale
     i32 swa_window = 0;          // 0 => no `<arch>.attention.sliding_window`
     bool yarn = false;           // <arch>.rope.scaling.type = yarn (factor 8)
+    // <arch>.rope.scaling.type = linear with this factor. Linear scaling is a
+    // POSITION divisor, so unlike YaRN it survives on the config and is what a
+    // windowed layer would have to override (B3b).
+    f32 linear_scale = 0.0f;
     // BitNet's SubLN pair: attn_sub_norm (n_embd) + ffn_sub_norm (n_ff).
     bool sub_norms = false;
     // BitNet's head is TIED: llama.cpp builds the logits from `tok_embd` and
@@ -5982,6 +5986,10 @@ static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
         b.meta_str(arch + ".rope.scaling.type", "yarn");
         b.meta_f32(arch + ".rope.scaling.factor", 8.0f);
         b.meta_u32(arch + ".rope.scaling.original_context_length", 64);
+    }
+    if (v.linear_scale > 0.0f && !v.yarn) {
+        b.meta_str(arch + ".rope.scaling.type", "linear");
+        b.meta_f32(arch + ".rope.scaling.factor", v.linear_scale);
     }
     add_spm_vocab(b, vocab, -1);
 
@@ -7197,6 +7205,209 @@ static void test_q2_0_dialect() {
 // arm's OUTPUT cannot change -- only its headroom. What is left open is the
 // device-side store, which cannot be exercised without HIP: recorded in the
 // TODOs as `[~]` rather than claimed fixed.
+// B3b -- linear rope scaling on a hybrid stack.
+//
+// YaRN is folded into the frequency table at load, so the windowed half of a
+// stack can be given its own plain table (that is what `inv_freq_swa_` is).
+// Linear scaling is not a table: the factor DIVIDES THE POSITION inside the
+// kernel, and it rode one stack-wide `mc.rope_scale`, so on a family whose
+// windowed layers rotate with plain rope (`ArchSpec::swa_plain_rope`: olmo2,
+// mellum) those layers rotated every position by the full layers' factor.
+//
+// Two arms: the config resolves a per-layer divisor (and only for that shape),
+// and the windowed layer's rotation is checked against the arithmetic it is
+// supposed to perform -- position / 1.0 -- with position / 2.0 as the control,
+// since that is exactly what the stack-wide value used to do.
+static void test_windowed_rope_scale() {
+    // olmo2's window pattern is `il % 4 < 3`: layers 0..2 windowed, layer 3
+    // full. Four layers is the smallest stack that has both kinds.
+    SchemaSpec v;
+    v.arch = "olmo2";
+    v.n_layer = 4;
+    v.swa_window = 8;
+    v.linear_scale = 2.0f;
+    v.post_norms = true;      // post_branch_norm
+    v.q_norm_w = 8;           // per-head qk norms (head_dim wide)
+    v.k_norm_w = 8;
+    const std::string path = "kraken-olmo2-linscale.gguf";
+    CHECK(build_schema_model(path, v), "wrote an olmo2 file, linear rope x2");
+    std::string err;
+
+    // ---- (1) the config resolves the divisor per layer --------------------
+    {
+        bool ok = false;
+        if (schema_cfg(path, [&](const Model &m) {
+                const ModelConfig &c = m.cfg();
+                ok = true;
+                CHECK_NEAR(c.rope_scale, 2.0f, 1e-6f,
+                           "the file's linear factor is on the config");
+                CHECK(c.rope_scale_layer.size() == 4,
+                      "and it is resolved per layer, because the family's "
+                      "windowed half rotates with plain rope");
+                if (c.rope_scale_layer.size() == 4) {
+                    CHECK(m.rope_scale_at(0) == 1.0f && m.rope_scale_at(2) == 1.0f,
+                          "the three windowed layers divide the position by 1.0");
+                    CHECK_NEAR(m.rope_scale_at(3), 2.0f, 1e-6f,
+                               "and the full layer keeps the file's factor");
+                }
+            }, err)) {
+            CHECK(ok, "the olmo2 linear-scale file loads");
+        } else {
+            CHECK(false, ("the olmo2 linear-scale file loads: " + err).c_str());
+        }
+    }
+    // ---- (2) nothing else gets a per-layer vector -------------------------
+    {
+        // No window: every layer keeps the factor. A file that declares no
+        // window must not be handed a mixture it does not have.
+        SchemaSpec w = v;
+        w.swa_window = 0;
+        w.arch = "olmo2";
+        const std::string p2 = "kraken-olmo2-linscale-nowin.gguf";
+        CHECK(build_schema_model(p2, w), "wrote the same file with no window");
+        bool ok = false;
+        if (schema_cfg(p2, [&](const Model &m) {
+                ok = true;
+                CHECK(m.cfg().rope_scale_layer.empty(),
+                      "no window -> no per-layer scale");
+                CHECK_NEAR(m.rope_scale_at(0), 2.0f, 1e-6f,
+                           "so even layer 0 rotates at position / 2");
+            }, err)) {
+            CHECK(ok, "the windowless twin loads");
+        } else {
+            CHECK(false, ("the windowless twin loads: " + err).c_str());
+        }
+        // YaRN: its factor is already inside the table and rope_scale is set
+        // back to 1.0, so there is nothing left to divide.
+        SchemaSpec y = v;
+        y.yarn = true;
+        y.linear_scale = 0.0f;
+        const std::string p3 = "kraken-olmo2-yarn.gguf";
+        CHECK(build_schema_model(p3, y), "wrote the YaRN twin");
+        bool ok3 = false;
+        if (schema_cfg(p3, [&](const Model &m) {
+                ok3 = true;
+                CHECK(m.cfg().rope_scale_layer.empty(),
+                      "a YaRN file leaves the per-layer vector empty: its "
+                      "factor lives in the frequency table");
+                CHECK_NEAR(m.rope_scale_at(0), 1.0f, 1e-6f,
+                           "and every layer's divisor is 1.0");
+            }, err)) {
+            CHECK(ok3, "the YaRN twin loads");
+        } else {
+            CHECK(false, ("the YaRN twin loads: " + err).c_str());
+        }
+    }
+    // ---- (3) the windowed layer's rotation, checked arithmetically --------
+    // `attn.qk` is the query row after the qk-norm and before the rotation,
+    // `attn.q` is the same row after it. With a 4-token prefill the dumped row
+    // is the last token, at position 3, so the expected angle is
+    // 3 * inv_freq[i] / scale -- and the only question is which scale.
+    const std::string dump = "krk-olmo2-linscale.txt";
+    std::remove(dump.c_str());
+    set_env_var("KRK_DUMP", dump);
+    i32 prompt_tokens = 0;
+    {
+        Backend *be = make_cpu_backend();
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            if (e.init(be, c, &err)) {
+                GenerateParams gp;
+                gp.prompt = "the the the the";
+                gp.max_tokens = 1;
+                GenerateResult r;
+                if (e.generate(gp, &r)) prompt_tokens = r.prompt_tokens;
+            } else {
+                CHECK(false, ("the dump arm loads: " + err).c_str());
+            }
+        }
+        delete be;
+    }
+    clear_env_var("KRK_DUMP");
+    std::fprintf(stderr, "[b3b] prompt_tokens=%d\n", prompt_tokens);
+    CHECK(prompt_tokens > 1, "the prefill is more than one token");
+
+    std::map<std::string, std::vector<f32>> d;
+    {
+        std::ifstream f(dump);
+        std::string line;
+        while (std::getline(f, line)) {
+            std::istringstream is(line);
+            std::string name, ltag, ntag;
+            if (!(is >> name >> ltag >> ntag)) continue;
+            if (ltag.size() < 2 || ltag[0] != 'L' || ntag.compare(0, 2, "n=") != 0)
+                continue;
+            const int layer = std::atoi(ltag.c_str() + 1);
+            std::vector<f32> vals;
+            f32 x = 0.0f;
+            while (is >> x) vals.push_back(x);
+            const std::string k = name + "@" + std::to_string(layer);
+            // FIRST occurrence wins: the prefill pass writes every stage once
+            // at position 3, and the decode step after it would overwrite the
+            // keys with position 4.
+            if (d.find(k) == d.end()) d[k] = vals;
+        }
+    }
+    auto pre = d.find("attn.qk@0");
+    auto post = d.find("attn.q@0");
+    CHECK(pre != d.end() && post != d.end(),
+          "the windowed layer dumped both sides of its rotation");
+    if (pre != d.end() && post != d.end() && pre->second.size() == post->second.size() &&
+        pre->second.size() == 32) {
+        const i32 hd = 8, nh = 4;
+        std::vector<f32> inv(4);
+        for (i32 i = 0; i < 4; i++)
+            inv[static_cast<size_t>(i)] =
+                std::pow(10000.0f, -2.0f * static_cast<f32>(i) / 8.0f);
+        // olmo2 pairs like NeoX: channel j with j + rope_dim/2.
+        auto rotate = [&](f32 pos) {
+            std::vector<f32> y = pre->second;
+            for (i32 h = 0; h < nh; h++) {
+                for (i32 i = 0; i < hd / 2; i++) {
+                    const f32 th = pos * inv[static_cast<size_t>(i)];
+                    const f32 cs = std::cos(th), sn = std::sin(th);
+                    const size_t a = static_cast<size_t>(h * hd + i);
+                    const size_t b = a + static_cast<size_t>(hd / 2);
+                    const f32 x0 = pre->second[a], x1 = pre->second[b];
+                    y[a] = x0 * cs - x1 * sn;
+                    y[b] = x0 * sn + x1 * cs;
+                }
+            }
+            return y;
+        };
+        auto maxdiff = [&](const std::vector<f32> &g) {
+            f32 md = 0.0f;
+            for (size_t i = 0; i < g.size(); i++)
+                md = std::max(md, std::fabs(g[i] - post->second[i]));
+            return md;
+        };
+        f32 peak = 0.0f;
+        for (f32 x : post->second) peak = std::max(peak, std::fabs(x));
+        // The dumped row is the LAST row of the prefill, so its position is
+        // one less than the prompt length -- counted, not assumed.
+        const f32 pos = static_cast<f32>(prompt_tokens - 1);
+        const f32 md_unscaled = maxdiff(rotate(pos));          // position / 1.0
+        const f32 md_scaled = maxdiff(rotate(pos * 0.5f));     // position / 2.0
+        std::fprintf(stderr,
+                     "[b3b] windowed layer: md(pos/1.0)=%g md(pos/2.0)=%g "
+                     "peak=%g\n",
+                     static_cast<double>(md_unscaled),
+                     static_cast<double>(md_scaled), static_cast<double>(peak));
+        CHECK(peak > 0.0f && md_unscaled <= 1e-5f * peak,
+              "the windowed layer rotates at position / 1.0, not the file's "
+              "stack-wide factor");
+        CHECK(md_scaled > 100.0f * md_unscaled,
+              "control: rotating at position / 2.0 -- what the stack-wide value "
+              "did -- does NOT reproduce the row, so the arm can fail");
+    } else {
+        CHECK(false, "the two dumped rows have the expected shape");
+    }
+}
+
 static void test_relu_sqr_row_scale() {
     const i64 n = 256;
     std::vector<f32> gate(static_cast<size_t>(n)), up(static_cast<size_t>(n));
@@ -23915,6 +24126,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_i2_s_embedding)
     TEST_GROUP(test_refused_formats)
     TEST_GROUP(test_q2_0_dialect)
+    TEST_GROUP(test_windowed_rope_scale)
     TEST_GROUP(test_relu_sqr_row_scale)
     TEST_GROUP(test_q8_activation_domain)
     TEST_GROUP(test_trit_sign_extreme)

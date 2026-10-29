@@ -28,7 +28,7 @@ Status legend: **todo** · **done** · **blocked (why)**
 |----|---|------|--------|---------------|
 | B1b | P2 | isolate the MiniCPM3 head-input multiply numerically (config + finiteness is not the same as "the logits move by exactly 8.0") | todo | two files of one arch that differ only in the constant |
 | B2b | P2 | same for the FFN-side residual scale | todo | FFN-branch A/B on the minicpm3 fixture |
-| B3b | P2 | linear (non-YaRN) rope scaling on a windowed half: the factor rides one stack-wide `mc.rope_scale`, so a windowed layer cannot carry its own 1.0 | todo | needs a per-layer rope scale; no family in the table pairs linear scaling with a window today |
+| B3b | P2 | linear (non-YaRN) rope scaling on a windowed half: the factor rides one stack-wide `mc.rope_scale`, so a windowed layer cannot carry its own 1.0 | **fixed** | `ModelConfig::rope_scale_layer` + `Model::rope_scale_at(l)`, resolved in `Model::load` for a family whose windowed layers rotate with plain rope (`ArchSpec::swa_plain_rope`: olmo2, mellum) when the file scales linearly and declares a window; the four engine rope sites now pass the layer's own divisor. YaRN leaves the vector empty (its factor is already in the table), as does any file with no window. `test_windowed_rope_scale` (18 checks): the config arm (layers 0..2 -> 1.0, layer 3 -> 2.0), the two "nothing else changes" twins (no window, YaRN), and the rotation itself -- `attn.q` reproduces a hand rotation at position/1.0 (md 9.5e-7) and NOT at position/2.0 (md 3.76). Negative control observed: with the stack-wide value restored the match inverts (pos/2 md 8.3e-7, pos/1 md 3.76), 16/18 |
 | B4 | P2 | a real `gemma4` fixture (per-layer embeddings + shared-KV + two-branch MoE) so the row is graph-tested, not row-tested | todo | `test_gemma4_*` runs the file end to end and pins the 1.0 attention scale |
 | B5 | P2 | forward fixtures for `minicpm`, `minicpm`-v1 scales, `olmoe`, `qwen3moe`, `nemotron_h*`, and the `parallel_residual` graph A/B for gptneox/phi2 | todo | one group per family; the A/B moves the logits |
 | B6 | P2 | gemma2/gemma3 **27B** use `1/√(n_embd/n_head)` rather than `1/√head_dim`; only the model type says which, and metadata does not carry it | todo | either a size-keyed rule with a fixture, or a documented limitation |
@@ -207,7 +207,14 @@ open on purpose.
       range transform and not part of the function. The guard itself still
       needs a relu_sqr+mul+row-max kernel, and the only backend where it can
       matter (f16 activations) is HIP, which is not verifiable here.
-- [ ] **B3b (P2)** a windowed layer cannot carry its own linear rope scale.
+- [x] **B3b (P2)** a windowed layer cannot carry its own linear rope scale.
+      `ModelConfig::rope_scale_layer` + `Model::rope_scale_at(l)`, resolved for
+      `swa_plain_rope` families with a window and a linear factor; the four rope
+      call sites consume it. `test_windowed_rope_scale` (18 checks) pins the
+      resolution, both "nothing else changes" twins, and the rotation itself
+      (hand rotation at pos/1.0 matches to 9.5e-7; pos/2.0 misses by 3.76).
+      Negative control observed: stack-wide value restored -> the match
+      inverts, 16/18.
 - [ ] **B4 (P2)** a real gemma4 fixture (per-layer embeddings + shared KV +
       two-branch MoE).
 - [ ] **B5 (P2)** forward fixtures for minicpm / olmoe / qwen3moe /
