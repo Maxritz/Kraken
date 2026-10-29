@@ -29,7 +29,7 @@ Status legend: **todo** · **done** · **blocked (why)**
 | B1b | P2 | isolate the MiniCPM3 head-input multiply numerically (config + finiteness is not the same as "the logits move by exactly 8.0") | todo | two files of one arch that differ only in the constant |
 | B2b | P2 | same for the FFN-side residual scale | todo | FFN-branch A/B on the minicpm3 fixture |
 | B3b | P2 | linear (non-YaRN) rope scaling on a windowed half: the factor rides one stack-wide `mc.rope_scale`, so a windowed layer cannot carry its own 1.0 | **fixed** | `ModelConfig::rope_scale_layer` + `Model::rope_scale_at(l)`, resolved in `Model::load` for a family whose windowed layers rotate with plain rope (`ArchSpec::swa_plain_rope`: olmo2, mellum) when the file scales linearly and declares a window; the four engine rope sites now pass the layer's own divisor. YaRN leaves the vector empty (its factor is already in the table), as does any file with no window. `test_windowed_rope_scale` (18 checks): the config arm (layers 0..2 -> 1.0, layer 3 -> 2.0), the two "nothing else changes" twins (no window, YaRN), and the rotation itself -- `attn.q` reproduces a hand rotation at position/1.0 (md 9.5e-7) and NOT at position/2.0 (md 3.76). Negative control observed: with the stack-wide value restored the match inverts (pos/2 md 8.3e-7, pos/1 md 3.76), 16/18 |
-| B4 | P2 | a real `gemma4` fixture (per-layer embeddings + shared-KV + two-branch MoE) so the row is graph-tested, not row-tested | todo | `test_gemma4_*` runs the file end to end and pins the 1.0 attention scale |
+| B4 | P2 | a real `gemma4` fixture (per-layer embeddings + shared-KV + two-branch MoE) so the row is graph-tested, not row-tested | **fixed** | `build_gemma4_model` (16-wide, 4 layers, 2 shared-KV, per-layer embedding table, routed two-branch variant) runs end to end in `test_gemma4_forward`; the attention scale is now pinned on the real file rather than on `llama` lookalikes: `mc.attn_scale == 1.0` from the row, and a twin stating 1/sqrt(head_dim) = 0.3536 moves the three-token logits row by **0.3058**. Negative control observed: row constant removed -> both arms fail (42/44) |
 | B5 | P2 | forward fixtures for `minicpm`, `minicpm`-v1 scales, `olmoe`, `qwen3moe`, `nemotron_h*`, and the `parallel_residual` graph A/B for gptneox/phi2 | todo | one group per family; the A/B moves the logits |
 | B6 | P2 | gemma2/gemma3 **27B** use `1/√(n_embd/n_head)` rather than `1/√head_dim`; only the model type says which, and metadata does not carry it | todo | either a size-keyed rule with a fixture, or a documented limitation |
 | B7 | P1 | DeepSeek's YaRN `mscale²` attention scale (`attn_factor*(1+0.1*log_mul*ln(factor))`, squared, over √key_length; the file's `yarn_log_multiplier` is divided by 0.1 first). The inputs are read (`rope_yarn_factor`/`rope_yarn_log_mul`) and not applied | todo | a deepseek2/V4 YaRN fixture whose scores match the formula |
@@ -215,8 +215,15 @@ open on purpose.
       (hand rotation at pos/1.0 matches to 9.5e-7; pos/2.0 misses by 3.76).
       Negative control observed: stack-wide value restored -> the match
       inverts, 16/18.
-- [ ] **B4 (P2)** a real gemma4 fixture (per-layer embeddings + shared KV +
-      two-branch MoE).
+- [x] **B4 (P2)** a real gemma4 fixture (per-layer embeddings + shared KV +
+      two-branch MoE). Already built; what was missing was A1's evidence on the
+      family itself. `test_gemma4_forward` now pins `attn_scale == 1.0` on the
+      real file and shows a twin stating 1/sqrt(head_dim) moves the logits by
+      0.3058. Negative control observed: row constant removed -> 2 arms fail,
+      42/44.
+      Fixture trap recorded at the arm: a ONE-token prompt cannot see the
+      attention scale at all (softmax over one key cancels it exactly), which
+      is why the A/B uses three tokens.
 - [ ] **B5 (P2)** forward fixtures for minicpm / olmoe / qwen3moe /
       nemotron_h*, and the `parallel_residual` graph A/B.
 - [ ] **C1 (P1, blocked)** DeepSeek-V4 compressed attention: a feature, not a

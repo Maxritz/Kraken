@@ -5155,7 +5155,8 @@ static void test_dsv4_compressed_attention() {
 // contribution" and they must agree; 3 and 4 must move the answer.
 static bool build_gemma4_model(const std::string &path, int n_layer, int n_kv_shared,
                                f32 v_scale, f32 out_scale, bool zero_ple,
-                               bool routed = false, int routed_mode = 0) {
+                               bool routed = false, int routed_mode = 0,
+                               f32 attn_scale_key = 0.0f) {
     const int n_embd = 16, n_head = 2, n_kv = 1, hd = 8, n_ff = 32, vocab = 260;
     const int ctx = 64;
     const int npl = 4;  // embedding_length_per_layer_input
@@ -5175,6 +5176,8 @@ static bool build_gemma4_model(const std::string &path, int n_layer, int n_kv_sh
     b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
     b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
     b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-6f);
+    if (attn_scale_key > 0.0f)
+        b.meta_f32(arch + ".attention.scale", attn_scale_key);
     b.meta_f32(arch + ".rope.freq_base", 10000.0f);
     b.meta_u32(arch + ".vocab_size", static_cast<u32>(vocab));
     b.meta_u32(arch + ".embedding_length_per_layer_input", static_cast<u32>(npl));
@@ -5332,6 +5335,16 @@ static void test_gemma4_forward() {
                   "the norm is repeated per layer for the grouped kernel");
             CHECK(std::fabs(mc.embd_scale - std::sqrt(16.0f)) < 1e-6f,
                   "the embedding scale is sqrt(n_embd)");
+            // B4 / A1: the row's attention scale on a REAL file of the family.
+            // The fixture writes no `attention.scale`, so this is the row's
+            // constant reaching the config -- 1.0, the reference's
+            // `self.scaling`, not the 1/sqrt(head_dim) the engine defaults to
+            // when a file states nothing (1/sqrt(8) = 0.3536 on this fixture).
+            CHECK_NEAR(mc.attn_scale, 1.0f, 1e-6f,
+                       "gemma4's row supplies attn_scale 1.0 to a real file");
+            CHECK(std::fabs(mc.attn_scale - 1.0f / std::sqrt(8.0f)) > 0.1f,
+                  "... which is NOT the engine's 1/sqrt(head_dim) default, so "
+                  "the two are distinguishable on this fixture");
             // Shared-KV tail: start = 4 - 2 = 2, and the rule pairs a layer
             // with the layer `period` steps back (1 for a full layer, 2 for a
             // windowed one). No window here, so both tail layers read layer 1.
@@ -5353,6 +5366,87 @@ static void test_gemma4_forward() {
 
     std::vector<f32> base_lg;
     std::string err;
+    // The graph, not just the config: a twin that STATES 1/sqrt(head_dim) is
+    // the same weights with a different score scale, so its logits must move.
+    // Without this arm "the row is 1.0" would only be a claim about a field.
+    //
+    // The prompt has to be more than one token. `gemma4_logits` above runs
+    // "the" alone, and at position 0 the softmax is over ONE key, where the
+    // score scale cancels exactly -- measured: two files whose attn.out rows
+    // differ by 1% still produce identical prefill logits and different text.
+    // So this arm runs a three-token prompt and reads the row at position 2.
+    auto three_token_logits = [&](const std::string &p, std::vector<f32> &lg) {
+        Backend *be = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = p;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            std::string lerr;
+            if (e.init(be, c, &lerr)) {
+                GenerateParams gp;
+                gp.prompt = "the the the";
+                gp.max_tokens = 1;
+                GenerateResult r;
+                if (e.generate(gp, &r)) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    lg.assign(e.last_logits(), e.last_logits() + nv);
+                    ok = true;
+                } else {
+                    err = lerr;
+                }
+            } else {
+                err = lerr;
+            }
+        }
+        delete be;
+        return ok;
+    };
+    {
+        const std::string twin = "kraken-gemma4-ple-scaled.gguf";
+        CHECK(build_gemma4_model(twin, 4, 2, 1.0f, 0.75f, false, false, 0,
+                                 static_cast<f32>(1.0 / std::sqrt(8.0))),
+              "wrote the same gemma4 file with attention.scale stated as "
+              "1/sqrt(head_dim)");
+        f32 twin_scale = -1.0f;
+        bool twin_ok = false;
+        {
+            Backend *tb = make_cpu_backend();
+            {
+                Engine te;
+                EngineConfig tc;
+                tc.model_path = twin;
+                tc.n_ctx = 64;
+                tc.prefill_chunk = 8;
+                if (te.init(tb, tc, &err)) {
+                    twin_ok = true;
+                    twin_scale = te.model().cfg().attn_scale;
+                }
+            }
+            delete tb;
+        }
+        std::fprintf(stderr, "[b4] twin attn_scale = %g\n",
+                     static_cast<double>(twin_scale));
+        CHECK(twin_ok && std::fabs(twin_scale - 1.0f / std::sqrt(8.0f)) < 1e-6f,
+              "the twin's stated scale reaches its config");
+        std::vector<f32> row_a, row_b;
+        const bool ra = three_token_logits(base_file, row_a);
+        const bool rb = three_token_logits(twin, row_b);
+        if (ra && rb && row_a.size() == row_b.size() && !row_a.empty()) {
+            f32 md = 0.0f;
+            for (size_t i = 0; i < row_a.size(); i++)
+                md = std::max(md, std::fabs(row_a[i] - row_b[i]));
+            std::fprintf(stderr, "[b4] attn_scale 1.0 vs 1/sqrt(8): md=%g\n",
+                         static_cast<double>(md));
+            CHECK(md > 1e-4f,
+                  "the row's 1.0 is what the graph multiplies with: stating "
+                  "1/sqrt(head_dim) instead moves a three-token logits row");
+        } else {
+            CHECK(false, ("the scaled twin runs: " + err).c_str());
+        }
+    }
     CHECK(gemma4_logits(base_file, base_lg, err),
           "the base fixture produces logits");
     if (base_lg.empty()) return;
