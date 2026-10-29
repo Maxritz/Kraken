@@ -100,3 +100,28 @@ Two integrity guards added while auditing:
 - the loader refuses an I2_S matmul whose inner dimension is not a multiple of
   128: the payload is one flat run, so such a row shares its block with the
   next one and a row-strided read decodes the padding as weights.
+
+## A real GGUF on disk (2026-10-29, third pass)
+
+Unit tests only ever proved the fixtures. This pass writes an actual file with
+`tools/make_bitnet_gguf.py` and runs the actual binaries on it.
+
+| check | command | result |
+|---|---|---|
+| the container is well formed | stock `gguf` Python reader on the F16 twin | 46 tensors, 22 KVs, `bitnet-b1.58` |
+| I2_S payload + tail abut exactly | manual parse of the tensor table | 28 I2_S tensors, each `n/4 + 32` bytes, every tensor starting exactly where the previous one ends |
+| the arch is recognised | `kraken-inspect` | `arch bitnet-b1.58 -- supported (dense)`, `verdict runnable`, `I2_S 28 tensors 640.0 KiB` |
+| it runs | `kraken --prompt "the cat" --max-tokens 12 --greedy` | rc=0, prefill 1411 tok/s, decode 1296 tok/s on 4x256 |
+| **the decode is right** | `--prefill-hash --cpu` on I2_S vs the same weights as F16 | **identical**: `prefill-hash 46e6872153233e0e logits 7f4d5428a5edbef0` on a 4x384 file (width chosen so both sides take the dequant path; the codes are +-1 and the scale is a power of two, so every product is exact and the sums run in the same order) |
+| the scale is applied | `--prefill-hash` at 0.0625 vs 0.125 | different (`c21ca3e3...` / first token 57 vs `79bab1f7...` / first token 204) |
+
+That last row also closes the "fixtures are scale-blind" question from the
+previous PR: on a 4-layer file the whole-model logits DO move with the weight
+scale. The blindness was a property of the 2-layer fixture (its logits are
+dominated by the tied head), not of the engine.
+
+### New defect found by running a file rather than a fixture
+
+| id | pri | class | item | state |
+|---|---|---|---|---|
+| D11 | **P1** | CONFIRMED | **I2_S has two dialects.** `convert-hf-to-gguf-bitnet.py` writes code = value + 1 and zero-fills the 28 tail bytes after its f32 scale; `convert-ms-to-gguf-bitnet.py` writes code = value + 2 and permutes the payload into that build's tile layout (`preprocess_weights`, constants from its own `build/kcfg.ini`). Decoding the second as the first is silently wrong -- measured: the ms file loaded with verdict `runnable` and produced `prefill-hash 28eaece7b3a5a08f` against `c21ca3e304853383` for the same weights, with no warning | **fixed**: `i2s_tail_is_ms_converter()` (one predicate, used by the loader AND the verdict) refuses it by name; `test_i2_s_ms_dialect_refused` pins both tails and the three non-signatures (zero, short, unknown) |

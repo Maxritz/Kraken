@@ -341,6 +341,17 @@ void dot_q2_0_64_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 void dot_i2_s_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);
 f32 dot_i2_s_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+
+// Was this I2_S tensor written by microsoft/BitNet's convert-ms-to-gguf-bitnet.py
+// rather than by convert-hf-to-gguf-bitnet.py? The two dialects store the same
+// nominal format and differ in TWO ways that both corrupt a decode: the code
+// offset (value + 2 instead of value + 1, so code 0 never occurs) and a payload
+// permuted into that converter's own tile layout. The only difference the
+// container carries is the 32-byte tail: the hf converter zero-fills the 28
+// bytes after its f32 scale, the ms converter writes np.tile(scale, 8) -- eight
+// identical f32s. Reading it here means the verdict and the loader cannot
+// disagree about which files are decodable.
+bool i2s_tail_is_ms_converter(const void *tail, size_t tail_bytes);
 f32 dot_tq2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 f32 dot_pq2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 f32 dot_q2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);

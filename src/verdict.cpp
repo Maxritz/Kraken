@@ -349,12 +349,20 @@ ModelVerdict assess_model(const Gguf &g) {
     // Quantization formats this build cannot dequantize, and rows that are not
     // a whole number of blocks (an exotic producer, or a corrupt file).
     std::vector<std::string> bad_formats;
+    std::string ms_i2s;   // first I2_S tensor from the ms converter, if any
     for (const GgufTensor &t : g.tensors()) {
         if (!dtype_supported(t.type)) {
             const std::string name = named_dtype(t);
             if (std::find(bad_formats.begin(), bad_formats.end(), name) ==
                 bad_formats.end())
                 bad_formats.push_back(name);
+        } else if (t.type == DType::I2_S &&
+                   i2s_tail_is_ms_converter(t.tail, t.tail_bytes)) {
+            // One line, not one per tensor: forty layers of the same dialect are
+            // one cause. The name is kept so the reader can see it is the
+            // weights and not a stray table.
+            if (ms_i2s.empty()) ms_i2s = t.name;
+        } else if (false) {
         } else if (t.n_dims >= 1 &&
                    !dtype_row_aligned(t.type, static_cast<i64>(t.ne[0]))) {
             add_unique(v.blockers, "tensor '" + t.name +
@@ -366,6 +374,16 @@ ModelVerdict assess_model(const Gguf &g) {
         add_unique(v.blockers,
                    "uses quantization " + f +
                        ", which this build cannot dequantize");
+    // The tail IS the format's signature -- 32 bytes, not a payload -- and the
+    // only thing that separates the two I2_S dialects. Saying "runnable" here
+    // sends the reader to a load that can only refuse, and the two halves of
+    // the engine disagreeing about a file is the fault this pass prevents.
+    if (!ms_i2s.empty())
+        add_unique(v.blockers,
+                   "I2_S weights are in the convert-ms-to-gguf-bitnet.py dialect "
+                   "(first: '" + ms_i2s + "', whose 32-byte tail is eight copies "
+                   "of one f32); that converter stores code = value + 2 and "
+                   "permutes the payload, so this build cannot decode it");
 
     v.runnable = v.blockers.empty();
     return v;

@@ -1612,6 +1612,20 @@ f32 dot_i2_s_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     return i2_s_q8_internal(w, xq, dx, n);
 }
 
+// PUBLIC, and outside the file's anonymous namespace on purpose: the verdict
+// pass asks the same question as the loader, and two copies of this rule is
+// how a container ends up called "runnable" by one half of the engine and
+// refused by the other.
+bool i2s_tail_is_ms_converter(const void *tail, size_t tail_bytes) {
+    if (!tail || tail_bytes < 32) return false;
+    const u8 *t = static_cast<const u8 *>(tail);
+    static const u8 kZero[4] = {0, 0, 0, 0};
+    if (std::memcmp(t, kZero, 4) == 0) return false;   // all-zero tail: no scale
+    for (size_t i = 4; i < 32; i += 4)
+        if (std::memcmp(t + i, t, 4) != 0) return false;
+    return true;   // eight identical f32s: np.tile(scale, 8)
+}
+
 f32 dot_tq2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     return tq2_0_q8_internal(w, xq, dx, n);
 }

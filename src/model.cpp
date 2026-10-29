@@ -1253,6 +1253,39 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // field exists to prevent.
         if (t->type == DType::I2_S) {
             QuantTensor q = upload_raw(t, DType::I2_S);
+            // TWO I2_S dialects exist in the wild and they are not
+            // interchangeable. quantize_to_i2_s (convert-hf-to-gguf-bitnet.py)
+            // packs 128 values per 32 bytes in element order, stores
+            // code = value + 1, and zero-fills the 28 bytes of the tail after
+            // its f32 scale. The ms converter (transform_to_i2 +
+            // preprocess_weights in convert-ms-to-gguf-bitnet.py) stores
+            // code = value + 2 -- so code 0 never occurs -- permutes the
+            // payload into that build's tile layout using constants from its
+            // own build/kcfg.ini, and writes np.tile(scale, 8) as the tail:
+            // EIGHT identical f32s.
+            //
+            // That tail is the only difference the container carries, and it is
+            // enough to tell them apart. It has to be checked: decoding an ms
+            // file as the hf dialect gives every weight the wrong code offset
+            // AND the wrong element, and nothing in the file says so. Measured
+            // on a synthetic ms-dialect file before this check existed: it
+            // loaded with verdict "runnable" and produced different logits
+            // (prefill-hash 28eaece7b3a5a08f against c21ca3e304853383 for the
+            // same weights in the hf dialect) with no warning at all.
+            if (i2s_tail_is_ms_converter(t->tail, t->tail_bytes)) {
+                {
+                    if (e)
+                        *e = "I2_S weight '" + name + "' was written by "
+                             "microsoft/BitNet's convert-ms-to-gguf-bitnet.py "
+                             "(its 32-byte tail is eight copies of one f32): that "
+                             "converter stores code = value + 2 and permutes the "
+                             "payload into its own tile layout, which this build "
+                             "cannot invert. Refusing rather than decoding it as "
+                             "the convert-hf-to-gguf-bitnet.py layout, which "
+                             "loads and is silently wrong";
+                    return {};
+                }
+            }
             // gguf.cpp has already checked that the tail is inside the mapping.
             f32 gs = 1.0f;
             if (t->tail && t->tail_bytes >= 4) gs = reinterpret_cast<const f32 *>(t->tail)[0];

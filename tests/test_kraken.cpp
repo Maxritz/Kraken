@@ -6489,7 +6489,8 @@ namespace {
 
 // Packs a ternary {-1,0,+1} matrix (row-major, n a multiple of 128) into
 // I2_S bytes plus the 32-byte tail holding `scale` as f32 at [0..3].
-std::vector<u8> i2s_pack(const std::vector<f32> &tern_unit, f32 scale) {
+std::vector<u8> i2s_pack(const std::vector<f32> &tern_unit, f32 scale,
+                        bool ms_tail = false) {
     const size_t n = tern_unit.size();
     std::vector<u8> out(n / 4 + 32, 0);
     for (size_t blk = 0; blk * 128 < n; blk++)
@@ -6501,6 +6502,11 @@ std::vector<u8> i2s_pack(const std::vector<f32> &tern_unit, f32 scale) {
                     static_cast<u8>(code << (6 - 2 * l));
             }
     std::memcpy(out.data() + n / 4, &scale, 4);
+    if (ms_tail) {
+        // np.tile(scale, 8): the ms converter's tail, eight identical f32s.
+        for (int i = 1; i < 8; i++)
+            std::memcpy(out.data() + n / 4 + static_cast<size_t>(i) * 4, &scale, 4);
+    }
     return out;
 }
 
@@ -6509,7 +6515,7 @@ std::vector<u8> i2s_pack(const std::vector<f32> &tern_unit, f32 scale) {
 // I2_S (with `scale` in the tail) or as F16 holding scale*ternary, which is
 // the same matrix either way.
 bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale,
-                       f32 embd_i2s_scale = 0.0f) {
+                       f32 embd_i2s_scale = 0.0f, bool ms_tail = false) {
     const int n_embd = 256, n_layer = 2, n_head = 8, n_kv = 8, hd = 32;
     const int n_ff = 256, vocab = 260, ctx = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;   // 256 / 256
@@ -6545,7 +6551,7 @@ bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale,
             tern[i] = t > 0.15f ? 1.0f : (t < -0.15f ? -1.0f : 0.0f);
         }
         if (as_i2s) {
-            const std::vector<u8> packed = i2s_pack(tern, scale);
+            const std::vector<u8> packed = i2s_pack(tern, scale, ms_tail);
             b.tensor_raw(nm, 36, ne, packed.data(), packed.size());
         } else {
             std::vector<f32> vals(n);
@@ -6681,6 +6687,58 @@ static void test_i2_s_model() {
 // to be folded in when the table is materialized -- and if it is dropped the
 // values are 1.0 instead of 0.25, which no shape check and no "it loaded"
 // message can tell you apart. Hence a value assertion on the table itself.
+// The two I2_S dialects are distinguished ONLY by their 32-byte tail, and the
+// difference is not cosmetic: the ms converter stores code = value + 2 (so code
+// 0 never occurs) and permutes the payload into its own tile layout, using
+// constants from that build's kcfg.ini. Decoding one as the other produced a
+// file that loaded "runnable", generated text, and was wrong -- measured on a
+// synthetic ms-dialect file, with no warning at all. So the tail is read as a
+// signature and the file is refused instead.
+static void test_i2_s_ms_dialect_refused() {
+    std::string err;
+    CHECK(build_bitnet_file("kraken-i2s-ms.gguf", true, 0.125f, 0.0f, true),
+          "wrote a file with the ms converter's tiled tail");
+    const bool loaded = schema_cfg("kraken-i2s-ms.gguf",
+                                   [](const Model &) {}, err);
+    CHECK(!loaded, "the ms-dialect file is REFUSED rather than decoded as hf");
+    CHECK(err.find("convert-ms-to-gguf") != std::string::npos,
+          "and the message names the converter that wrote it");
+    // The refusal can come from either pass -- the verdict blocker or the
+    // loader -- so the assertion is on the REASON both carry, not on one
+    // pass's wording.
+    CHECK(err.find("value + 2") != std::string::npos,
+          "and says why it cannot be decoded (the code offset differs)");
+
+    // The predicate itself, on both tails, so the loader and the verdict are
+    // pinned to the same rule rather than to two copies of it.
+    {
+        f32 one = 1.0f;
+        u8 hf[32] = {0}, ms[32] = {0};
+        std::memcpy(hf, &one, 4);
+        for (int i = 0; i < 8; i++) std::memcpy(ms + i * 4, &one, 4);
+        CHECK(!i2s_tail_is_ms_converter(hf, sizeof(hf)),
+              "an hf tail (scale then 28 zero bytes) is not the ms dialect");
+        CHECK(i2s_tail_is_ms_converter(ms, sizeof(ms)),
+              "eight identical f32s is the ms dialect");
+        CHECK(!i2s_tail_is_ms_converter(nullptr, 32) &&
+                  !i2s_tail_is_ms_converter(hf, 4),
+              "a missing or short tail is not classified as ms");
+        u8 mixed[32];
+        std::memcpy(mixed, &one, 4);
+        std::memset(mixed + 4, 7, 28);
+        CHECK(!i2s_tail_is_ms_converter(mixed, sizeof(mixed)),
+              "and neither is a tail that is neither signature (unknown "
+              "producer): only exact tile(scale, 8) refuses");
+    }
+    // The hf dialect of the same weights still loads: the check must not be
+    // "any I2_S file is refused".
+    CHECK(build_bitnet_file("kraken-i2s-hf2.gguf", true, 0.125f, 0.0f, false),
+          "wrote the hf twin");
+    std::string err2;
+    CHECK(schema_cfg("kraken-i2s-hf2.gguf", [](const Model &) {}, err2),
+          "and the hf dialect still loads");
+}
+
 static void test_i2_s_embedding() {
     std::string err;
     CHECK(build_bitnet_file("kraken-i2s-table.gguf", true, 0.125f, 0.25f),
@@ -22978,6 +23036,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_bitnet_family)
     TEST_GROUP(test_i2_s_layout)
     TEST_GROUP(test_i2_s_model)
+    TEST_GROUP(test_i2_s_ms_dialect_refused)
     TEST_GROUP(test_i2_s_embedding)
     TEST_GROUP(test_refused_formats)
     TEST_GROUP(test_q8_activation_domain)
