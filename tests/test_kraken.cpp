@@ -2601,6 +2601,14 @@ static void add_spm_vocab(GgufBuilder &b, int vocab, int mask_id) {
 
 struct MoeSpec {
     bool dense = false;   // emit the dense twin instead of a MoE model
+    // The arch the file declares. Empty keeps the qwen2 / qwen2moe pair the
+    // existing arms compare; B5 writes olmoe / qwen3moe through the same body,
+    // because those rows are the same graph with different flags.
+    std::string arch;
+    // Per-head q/k norm width, 0 = none. qwen3moe and olmoe both declare it on
+    // their rows, so a fixture of either family has to carry the tensors or the
+    // loader refuses it by name.
+    int qk_norm = 0;
     int n_expert = 4;
     int n_expert_used = 2;
     bool shared = true;   // Qwen2-MoE style always-on shared expert
@@ -2621,7 +2629,9 @@ static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
     // to get the same pairing. Written as `llama` this fixture compared a
     // NeoX-rope MoE layer against an adjacent-pair dense one and the tokens
     // could only differ (`test_moe_matches_dense_twin`).
-    const std::string arch = s.dense ? "qwen2" : "qwen2moe";
+    const std::string arch = !s.arch.empty()
+                                 ? s.arch
+                                 : (s.dense ? "qwen2" : "qwen2moe");
 
     GgufBuilder b;
     b.meta_str("general.architecture", arch);
@@ -2667,6 +2677,18 @@ static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
                  vec(static_cast<size_t>(n_embd) * kv_dim, 300));
     b.tensor_f16("blk.0.attn_output.weight", {u64(q_dim), u64(n_embd)},
                  vec(static_cast<size_t>(q_dim) * n_embd, 400));
+    if (s.qk_norm > 0) {
+        // A per-head QK norm over the ROW's own head slice; the values are not
+        // ones, so a layer that runs it and a layer that does not cannot agree.
+        std::vector<f32> qn(static_cast<size_t>(s.qk_norm)),
+            kn(static_cast<size_t>(s.qk_norm));
+        for (int i = 0; i < s.qk_norm; i++) {
+            qn[static_cast<size_t>(i)] = 0.5f + 0.05f * static_cast<f32>(i % 5);
+            kn[static_cast<size_t>(i)] = 0.6f + 0.04f * static_cast<f32>(i % 7);
+        }
+        b.tensor_f32("blk.0.attn_q_norm.weight", {u64(s.qk_norm)}, qn);
+        b.tensor_f32("blk.0.attn_k_norm.weight", {u64(s.qk_norm)}, kn);
+    }
 
     if (s.dense) {
         b.tensor_f16("blk.0.ffn_gate.weight", {u64(n_embd), u64(n_ff)},
@@ -3637,6 +3659,173 @@ static bool build_tiny_gdn_model(const std::string &path, int n_layer,
         // The Qwen3.5 shared-expert gate: one row per token.
         b.tensor_f32(p + "ffn_gate_inp_shexp.weight", {u64(n_embd)},
                      vec(static_cast<size_t>(n_embd), 2900));
+    }
+    return b.write(path);
+}
+
+// ---- nemotron_h / nemotron_h_moe: the Mamba-2 block ------------------------
+//
+// This is NOT the gated delta net above: a different recurrence, a different
+// state (one [head][p][s] matrix per layer, not a per-channel vector), a
+// different fusion (one `ssm_in` row emitting z | xBC | dt, so the SPLIT of the
+// weight is part of the graph), and a grouped RMSNorm after the SiLU gate.
+// Dense and MoE differ only in what follows the mixer: a relu^2 gated MLP on
+// every layer, or routed experts with a shared leg on the attention layers and
+// no MLP at all on the SSM ones.
+//
+// `a_scale` multiplies the A parameter. A file is the only place that scalar
+// lives, so a twin built with a_scale = 0 is the same model with its recurrent
+// memory removed -- the A/B that says the scan is in the path rather than an
+// allocation nobody reads.
+static bool build_tiny_nemotron_model(const std::string &path, const char *arch,
+                                      bool moe, f32 a_scale) {
+    const int n_layer = 4, n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
+    const int d_state = 8, n_group = 2, dt_rank = 4, conv_k = 4;
+    const int inner = 16;                  // ssm.inner_size
+    const int key_dim = n_group * d_state; // ssm.group_count * d_state
+    const int conv_dim = inner + 2 * key_dim;
+    const int in_w = conv_dim + inner + dt_rank; // [xBC | z | dt]
+    const int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32, n_expert = 4;
+    const int vocab = 260, ctx = 64, rope_dim = 4, interval = 4;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string a = arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", a);
+    b.meta_str("general.name", std::string("kraken-") + a + "-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(a + ".block_count", u32(n_layer));
+    b.meta_u32(a + ".context_length", u32(ctx));
+    b.meta_u32(a + ".embedding_length", u32(n_embd));
+    b.meta_u32(a + ".feed_forward_length", u32(n_ff));
+    b.meta_u32(a + ".attention.head_count", u32(n_head));
+    b.meta_u32(a + ".attention.head_count_kv", u32(n_kv));
+    b.meta_u32(a + ".attention.key_length", u32(hd));
+    b.meta_f32(a + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(a + ".rope.freq_base", 10000.0f);
+    b.meta_u32(a + ".rope.dimension_count", u32(rope_dim));
+    b.meta_u32(a + ".ssm.conv_kernel", u32(conv_k));
+    b.meta_u32(a + ".ssm.state_size", u32(d_state));
+    b.meta_u32(a + ".ssm.time_step_rank", u32(dt_rank));
+    b.meta_u32(a + ".ssm.group_count", u32(n_group));
+    b.meta_u32(a + ".ssm.inner_size", u32(inner));
+    b.meta_u32(a + ".full_attention_interval", u32(interval));
+    if (moe) {
+        b.meta_u32(a + ".expert_count", u32(n_expert));
+        b.meta_u32(a + ".expert_used_count", 2);
+        b.meta_u32(a + ".expert_feed_forward_length", u32(n_ff_exp));
+        b.meta_u32(a + ".expert_shared_feed_forward_length", u32(n_ff_sh));
+    }
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(size_t(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    // One live output row, random, so the winning id is a function of the
+    // recurrent state (the delta-net fixture's reasoning, and it applies twice
+    // here: a constant row would make every scan defect look like a pass).
+    {
+        std::vector<f32> head(size_t(n_embd) * vocab, 0.0f);
+        const size_t live = 7;
+        const std::vector<f32> row = vec(size_t(n_embd), 4242);
+        for (int r = 0; r < n_embd; r++)
+            head[size_t(r) * vocab + live] = row[size_t(r)];
+        b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)}, head);
+    }
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        // The converter writes ONE norm per layer on this family and the graph
+        // reads it before both sub-blocks; carrying the second one anyway keeps
+        // the fixture honest about which the loader picks.
+        b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
+
+        if (((l + 1) % interval) != 0) {
+            // ---- Mamba-2 SSM block ----
+            b.tensor_f16(p + "ssm_in.weight", {u64(n_embd), u64(in_w)},
+                         vec(size_t(n_embd) * in_w, 100));
+            {
+                // File order: GGUF ne[0] is the tap axis, so channel c's taps are
+                // contiguous. Distinct per (tap, channel) so a transposed read
+                // cannot match.
+                std::vector<f32> kern(size_t(conv_k) * conv_dim);
+                for (i64 c = 0; c < conv_dim; c++)
+                    for (i64 j = 0; j < conv_k; j++)
+                        kern[size_t(c * conv_k + j)] =
+                            static_cast<f32>(1 + j * 10 + c * 100);
+                b.tensor_f32(p + "ssm_conv1d.weight", {u64(conv_k), u64(conv_dim)},
+                             kern);
+            }
+            b.tensor_f32(p + "ssm_conv1d.bias", {u64(conv_dim)},
+                         vec(size_t(conv_dim), 300));
+            b.tensor_f32(p + "ssm_dt.bias", {u64(dt_rank)}, vec(size_t(dt_rank), 400));
+            {
+                std::vector<f32> av(static_cast<size_t>(dt_rank));
+                for (int h = 0; h < dt_rank; h++)
+                    av[size_t(h)] = a_scale * (-0.5f - 0.1f * h);
+                b.tensor_f32(p + "ssm_a", {u64(dt_rank)}, av);
+            }
+            b.tensor_f32(p + "ssm_d", {u64(inner)}, vec(size_t(inner), 500));
+            // The grouped norm carries one vector of inner/n_group per group;
+            // the kernel reads `inner` elements, so a d_state-wide vector here
+            // would be read past its end.
+            b.tensor_f32(p + "ssm_norm.weight", {u64(inner)}, ones(inner));
+            b.tensor_f16(p + "ssm_out.weight", {u64(inner), u64(n_embd)},
+                         vec(size_t(inner) * n_embd, 700));
+        } else {
+            // ---- attention ----
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                         vec(size_t(n_embd) * q_dim, 100));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(size_t(n_embd) * kv_dim, 200));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(size_t(n_embd) * kv_dim, 300));
+            b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                         vec(size_t(q_dim) * n_embd, 400));
+        }
+
+        if (!moe) {
+            // relu^2 gated MLP on every layer (ArchSpec::ffn_relu_sqr).
+            b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                         vec(size_t(n_embd) * n_ff, 900));
+            b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                         vec(size_t(n_embd) * n_ff, 1300));
+            b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                         vec(size_t(n_ff) * n_embd, 1700));
+        } else if (((l + 1) % interval) == 0) {
+            // Routed experts on the ATTENTION layers only: the SSM blocks of
+            // this family carry no feed-forward of any kind, which is why the
+            // loader's dense-FFN requirement is keyed on the tensors.
+            b.tensor_f16(p + "ffn_gate_inp.weight", {u64(n_embd), u64(n_expert)},
+                         vec(size_t(n_embd) * n_expert, 900));
+            const size_t gsz = size_t(n_embd) * n_ff_exp;
+            const size_t dsz = size_t(n_ff_exp) * n_embd;
+            std::vector<f32> up(gsz * n_expert), down(dsz * n_expert);
+            for (size_t e = 0; e < size_t(n_expert); e++) {
+                const i64 bump = static_cast<i64>(e) * 7919;
+                for (size_t k = 0; k < gsz; k++)
+                    up[e * gsz + k] = wv(1300 + static_cast<i64>(k) + bump);
+                for (size_t k = 0; k < dsz; k++)
+                    down[e * dsz + k] = wv(1700 + static_cast<i64>(k) + bump);
+            }
+            b.tensor_f16(p + "ffn_up_exps.weight",
+                         {u64(n_embd), u64(n_ff_exp), u64(n_expert)}, up);
+            b.tensor_f16(p + "ffn_down_exps.weight",
+                         {u64(n_ff_exp), u64(n_embd), u64(n_expert)}, down);
+            // The shared leg: up/down only, the way this family spells it.
+            b.tensor_f16(p + "ffn_up_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                         vec(size_t(n_embd) * n_ff_sh, 2100));
+            b.tensor_f16(p + "ffn_down_shexp.weight", {u64(n_ff_sh), u64(n_embd)},
+                         vec(size_t(n_ff_sh) * n_embd, 2500));
+        }
     }
     return b.write(path);
 }
@@ -8273,6 +8462,318 @@ static void test_arch_row_pins() {
               "minicpm reads as the llama schema");
         CHECK(s && !s->rope_neox, "... with the NORM rope pairing");
     }
+}
+
+// B5 -- a FORWARD per family that had only a row pin.
+//
+// A row pin says a flag exists; it cannot say the flag reaches a multiply. Each
+// group below is a file of the family that loads, generates, and is paired with
+// a run that differs in ONE thing the row states -- the family's scale, the
+// top-k weight rule, the QK norm, the residual shape, the recurrent state -- so
+// the difference in the logits is that flag and not a different weight set.
+// ONE GROUP PER FAMILY, so a failure names the family without a label to read.
+static f32 fwd_maxdiff(const std::vector<f32> &a, const std::vector<f32> &b) {
+    f32 m = 0.0f;
+    const size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(a[i] - b[i]));
+    return m;
+}
+static f32 fwd_peak(const std::vector<f32> &v) {
+    f32 p = 0.0f;
+    for (f32 x : v) p = std::max(p, std::fabs(x));
+    return p;
+}
+
+// ---- (1) minicpm: scale_emb = 12.0 ----------------------------------------
+// The row applies ONE constant: llama.cpp multiplies the embedding row by
+// `f_embedding_scale`, and 12.0 is this family's default. The twin is the same
+// bytes under `llama`, whose row applies nothing -- so a run that drops the
+// scale still generates plausible text from a different model.
+static void test_minicpm_embedding_scale_forward() {
+    std::string err;
+    SchemaSpec v;
+    v.arch = "minicpm";
+    v.n_layer = 2;
+    const std::string f = "kraken-fwd-minicpm.gguf";
+    CHECK(build_schema_model(f, v), "wrote a minicpm file");
+    SchemaSpec l = v;
+    l.arch = "llama";
+    const std::string twin = "kraken-fwd-minicpm-as-llama.gguf";
+    CHECK(build_schema_model(twin, l), "wrote the same weights as llama");
+    bool ok = false;
+    if (schema_cfg(f, [&](const Model &m) {
+            ok = true;
+            CHECK_NEAR(m.cfg().embd_scale, 12.0f, 1e-6f,
+                       "minicpm's 12.0 embedding scale is on the config");
+        }, err)) {
+        CHECK(ok, "the minicpm file loads");
+    } else {
+        CHECK(false, ("the minicpm file loads: " + err).c_str());
+    }
+    std::vector<f32> a, b;
+    if (variant_logits(f, a, err) && variant_logits(twin, b, err) &&
+        !a.empty() && a.size() == b.size()) {
+        std::fprintf(stderr, "[b5] minicpm vs llama: md=%g\n",
+                     static_cast<double>(fwd_maxdiff(a, b)));
+        CHECK(fwd_peak(a) > 0.0f && fwd_peak(a) < 1e6f,
+              "and a minicpm run is finite");
+        CHECK(fwd_maxdiff(a, b) > 1e-4f,
+              "12x on the embedding moves the logits, so the scale is applied "
+              "and not merely parsed");
+    } else {
+        CHECK(false, ("the minicpm pair runs: " + err).c_str());
+    }
+}
+
+// ---- (2) olmoe: the top-k weights are NOT renormalized --------------------
+// olmoe's row says the softmax weights are used as emitted (norm_w = false in
+// the reference). A file cannot state that, so the only way to measure it on
+// one file is the A/B hatch -- same weights, same file, the rule forced on.
+static void test_olmoe_expert_weight_forward() {
+    std::string err;
+    MoeSpec s;
+    s.arch = "olmoe";
+    s.qk_norm = 8;
+    s.shared = false;       // olmoe has no always-on shared expert
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.varied = true;
+    const std::string f = "kraken-fwd-olmoe.gguf";
+    CHECK(build_tiny_moe_model(f, s), "wrote an olmoe file");
+    bool ok = false;
+    if (schema_cfg(f, [&](const Model &m) {
+            ok = true;
+            CHECK(m.cfg().qk_norm, "olmoe declares the QK norms");
+            CHECK(m.cfg().expert_w_norm == 0,
+                  "and its top-k weights are used as the softmax emitted them");
+            CHECK(!m.cfg().rope_neox, "... with the NORM rope pairing");
+        }, err)) {
+        CHECK(ok, "the olmoe file loads");
+    } else {
+        CHECK(false, ("the olmoe file loads: " + err).c_str());
+    }
+    std::vector<f32> a, b;
+    if (variant_logits(f, a, err)) {
+        CHECK(fwd_peak(a) > 0.0f && fwd_peak(a) < 1e6f, "an olmoe run is finite");
+        set_env_var("KRK_EXPERT_W_NORM", "1");
+        const bool rb = variant_logits(f, b, err);
+        clear_env_var("KRK_EXPERT_W_NORM");
+        if (rb && a.size() == b.size()) {
+            std::fprintf(stderr, "[b5] olmoe norm_w 0 vs 1: md=%g\n",
+                         static_cast<double>(fwd_maxdiff(a, b)));
+            CHECK(fwd_maxdiff(a, b) > 1e-4f,
+                  "renormalizing the top-k weights moves the logits, so the "
+                  "row's rule is applied");
+        } else {
+            CHECK(false, ("the renormalized olmoe run: " + err).c_str());
+        }
+    } else {
+        CHECK(false, ("the olmoe run: " + err).c_str());
+    }
+}
+
+// ---- (3) qwen3moe: per-head QK norm on a routed stack ---------------------
+// qwen3moe is qwen3's block with the FFN replaced by experts: NeoX pairing,
+// per-head QK norms. The norm is switched off on the SAME file
+// (KRK_QK_NORM=0), not compared against qwen2moe: those two rows differ in the
+// top-k weight rule as well. Measured, the pair's 1.24 is 0.726 norm and 0.556
+// everything else -- with the norm forced off on both files the same pair still
+// differs by 0.556, which is the weight rule and not the norm.
+static void test_qwen3moe_forward() {
+    std::string err;
+    MoeSpec s;
+    s.arch = "qwen3moe";
+    s.qk_norm = 8;
+    s.shared = false;
+    const std::string f = "kraken-fwd-qwen3moe.gguf";
+    CHECK(build_tiny_moe_model(f, s), "wrote a qwen3moe file");
+    bool ok = false;
+    if (schema_cfg(f, [&](const Model &m) {
+            ok = true;
+            CHECK(m.cfg().qk_norm, "qwen3moe declares the QK norms");
+            CHECK(m.cfg().rope_neox, "... with the NeoX rope pairing");
+            CHECK(m.cfg().n_expert == 4, "and four experts");
+        }, err)) {
+        CHECK(ok, "the qwen3moe file loads");
+    } else {
+        CHECK(false, ("the qwen3moe file loads: " + err).c_str());
+    }
+    std::vector<f32> normed, plain;
+    if (variant_logits(f, normed, err)) {
+        CHECK(fwd_peak(normed) > 0.0f && fwd_peak(normed) < 1e6f,
+              "a qwen3moe run is finite");
+        set_env_var("KRK_QK_NORM", "0");
+        const bool rp = variant_logits(f, plain, err);
+        clear_env_var("KRK_QK_NORM");
+        if (rp && normed.size() == plain.size()) {
+            std::fprintf(stderr, "[b5] qwen3moe qk_norm 1 vs 0: md=%g\n",
+                         static_cast<double>(fwd_maxdiff(normed, plain)));
+            CHECK(fwd_maxdiff(normed, plain) > 1e-4f,
+                  "the per-head QK norm moves the logits, so the row's flag "
+                  "reaches the graph");
+        } else {
+            CHECK(false, ("the unnormed qwen3moe run: " + err).c_str());
+        }
+    } else {
+        CHECK(false, ("the qwen3moe run: " + err).c_str());
+    }
+}
+
+// ---- (4) the parallel residual: gptneox and phi2 -------------------------
+// Two graphs: parallel sums attn and ffn from ONE normed row; sequential
+// re-norms the stream after attention. Same weights, same file, one env
+// switch -- the same kind of hatch KRK_ROPE_NEOX is.
+static void residual_arm(const char *arch, const char *nm) {
+    std::string err;
+    PlainSpec p;
+    p.arch = arch;
+    p.split_qkv = false;    // the fused Q|K|V row
+    p.alibi_key = false;
+    p.biases = true;
+    const std::string f = nm;
+    CHECK(build_tiny_plain_model(f, p),
+          "wrote a plain-family file for the residual A/B");
+    bool par = false, ok = false;
+    if (schema_cfg(f, [&](const Model &m) {
+            ok = true;
+            par = m.cfg().parallel_residual;
+        }, err)) {
+        CHECK(ok, "the plain-family file loads");
+    } else {
+        CHECK(false, ("the plain-family file loads: " + err).c_str());
+    }
+    std::vector<f32> seq, parallel;
+    set_env_var("KRK_PARALLEL_RESIDUAL", "0");
+    const bool rs = variant_logits(f, seq, err);
+    clear_env_var("KRK_PARALLEL_RESIDUAL");
+    set_env_var("KRK_PARALLEL_RESIDUAL", "1");
+    const bool rp = variant_logits(f, parallel, err);
+    clear_env_var("KRK_PARALLEL_RESIDUAL");
+    if (rs && rp && !seq.empty() && seq.size() == parallel.size()) {
+        const f32 md = fwd_maxdiff(seq, parallel);
+        std::fprintf(stderr, "[b5] %s residual 0 vs 1: md=%g row=%d\n", arch,
+                     static_cast<double>(md), par ? 1 : 0);
+        CHECK(fwd_peak(seq) > 0.0f && fwd_peak(seq) < 1e6f,
+              "and a run of the file is finite");
+        CHECK(md > 1e-4f,
+              "the residual shape moves the logits, so the row's flag is the "
+              "graph and not a comment");
+    } else {
+        CHECK(false, ("the residual A/B runs: " + err).c_str());
+    }
+    // The row's own answer, checked against the family's statement rather than
+    // against the hatch.
+    const ArchSpec *spec = arch_lookup(arch);
+    CHECK(spec && par == spec->parallel_residual,
+          "the file's residual shape is the row's");
+}
+static void test_gptneox_forward() {
+    residual_arm("gptneox", "kraken-fwd-gptneox.gguf");
+}
+static void test_phi2_forward() {
+    residual_arm("phi2", "kraken-fwd-phi2.gguf");
+}
+
+// ---- (5) nemotron_h / nemotron_h_moe: the Mamba-2 block -------------------
+// Both rows run the SAME mixer with different things after it, so one builder
+// covers them and each gets its own group. Three measurements per family:
+//   * the layer kinds the loader derives (3 mamba-2 + 1 attention, from the
+//     tensors rather than from the interval alone);
+//   * the A/B -- the same file with A = 0, which is the recurrent memory
+//     removed, so a scan that never ran would show md = 0;
+//   * the chunking invariance -- one token per prefill chunk against eight,
+//     which is where the conv window and the [head][p][s] state have to
+//     survive a boundary.
+static void nemotron_arm(const char *arch, bool moe, const char *nm) {
+    const std::string f = nm;
+    const std::string twin = std::string(nm) + ".a0.gguf";
+    CHECK(build_tiny_nemotron_model(f, arch, moe, 1.0f),
+          "wrote the mamba-2 fixture");
+    CHECK(build_tiny_nemotron_model(twin, arch, moe, 0.0f),
+          "and its A = 0 twin");
+    {
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string e;
+        if (m.load(*cpu, f, &e)) {
+            CHECK(m.cfg().recurrent,
+                  "the hybrid stack declares itself recurrent");
+            CHECK(m.recurrent_layers() == 3,
+                  "three of four layers are mamba-2 (every 4th attends)");
+            CHECK(!m.layers()[0].wq.present() && m.layers()[3].wq.present(),
+                  "layer 0 carries ssm_in and no attention, layer 3 the "
+                  "reverse");
+            CHECK(m.layers()[0].ssm_norm != nullptr && m.layers()[0].ssm_a &&
+                      m.layers()[0].ssm_dt,
+                  "and its state parameters are resident");
+        } else {
+            CHECK(false, ("the mamba-2 file loads: " + e).c_str());
+        }
+        m.unload();
+        delete cpu;
+    }
+    std::string err;
+    std::vector<f32> a, b;
+    if (variant_logits(f, a, err) && !a.empty()) {
+        CHECK(fwd_peak(a) > 0.0f && fwd_peak(a) < 1e6f, "a mamba-2 run is finite");
+        if (variant_logits(twin, b, err) && a.size() == b.size()) {
+            std::fprintf(stderr, "[b5] %s A=1 vs A=0: md=%g\n", arch,
+                         static_cast<double>(fwd_maxdiff(a, b)));
+            CHECK(fwd_maxdiff(a, b) > 1e-4f,
+                  "the recurrent state is in the path: removing A moves the "
+                  "logits");
+        } else {
+            CHECK(false, ("the A = 0 twin runs: " + err).c_str());
+        }
+    } else {
+        CHECK(false, ("the mamba-2 run: " + err).c_str());
+    }
+    // Chunking invariance: the conv window and the scan state are carried
+    // between prefill chunks, so 1 token per chunk and 8 must agree.
+    auto logits_at_chunk = [&](i32 chunk, std::vector<f32> &out) {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = f;
+            c.n_ctx = 64;
+            c.prefill_chunk = chunk;
+            std::string e2;
+            if (e.init(cpu, c, &e2)) {
+                GenerateParams gp;
+                gp.prompt = "the";
+                gp.max_tokens = 2;
+                GenerateResult r;
+                ok = e.generate(gp, &r);
+                if (ok) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    out.assign(e.last_logits(), e.last_logits() + nv);
+                }
+            } else {
+                err = e2;
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+    std::vector<f32> c1, c8;
+    if (logits_at_chunk(1, c1) && logits_at_chunk(8, c8) &&
+        c1.size() == c8.size()) {
+        std::fprintf(stderr, "[b5] %s chunk 1 vs 8: md=%g\n", arch,
+                     static_cast<double>(fwd_maxdiff(c1, c8)));
+        CHECK(fwd_maxdiff(c1, c8) < 1e-4f,
+              "one token per prefill chunk and eight agree, so the conv window "
+              "and the scan state cross the boundary intact");
+    } else {
+        CHECK(false, ("both chunkings run: " + err).c_str());
+    }
+}
+static void test_nemotron_h_forward() {
+    nemotron_arm("nemotron_h", false, "kraken-fwd-nemotron_h.gguf");
+}
+static void test_nemotron_h_moe_forward() {
+    nemotron_arm("nemotron_h_moe", true, "kraken-fwd-nemotron_h_moe.gguf");
 }
 
 static void test_fused_projection_pair() {
@@ -19775,6 +20276,32 @@ struct MlaFix {
     // the converter writes it, i.e. 0.1*mscale_all_dim.
     f32 yarn_factor = 0.0f;
     f32 yarn_log_mul = 0.0f;
+    // ---- C1: compressed attention (CSA/HCA) ---------------------------
+    // One ratio per layer; empty means every layer is dense (the shape the
+    // whole-graph pin already used). A non-zero ratio writes the compressor
+    // tables, and a 4 also writes the lightning indexer's.
+    std::vector<i32> ratios;
+    // The indexer's geometry. Its pooled key must be at least as wide as the
+    // rotary tail, which is rope.dimension_count (4 here).
+    int idx_heads = 0;
+    int idx_head = 0;
+    int idx_top_k = 0;
+    // Declare the ratio and write NO compressor tables: the loader must refuse
+    // the file and name the missing tensor rather than run it dense.
+    bool comp_no_tables = false;
+    // Same weights, dense metadata: the A/B that says the pooled stream is what
+    // moved the logits.
+    bool comp_tables_only = false;   // tables present, every ratio 0
+    // The declared context. The engine caps n_ctx at it, so an HCA arm (ratio
+    // 128) needs a file that says it can hold more than one block.
+    int ctx = 64;
+    // A FULL output head with the special-token columns zeroed. The fixture is
+    // otherwise tied to its embedding, and a tied head on this vocabulary emits
+    // EOS after ~20 tokens -- which is shorter than the 128 a block needs -- so
+    // a long arm would stop before it ever pooled anything. Every column stays
+    // random, so the logits are still a function of the hidden state; only the
+    // three specials are made unreachable.
+    bool live_head = false;
 };
 
 // 261, not 260: add_spm_vocab always writes 3 specials + 256 byte pieces + the
@@ -19812,7 +20339,7 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
     b.meta_str("general.name", "kraken-mla-test");
     b.meta_u32("general.alignment", 32);
     b.meta_u32(arch + ".block_count", static_cast<u32>(f.n_layer));
-    b.meta_u32(arch + ".context_length", 64);
+    b.meta_u32(arch + ".context_length", static_cast<u32>(f.ctx));
     b.meta_u32(arch + ".embedding_length", static_cast<u32>(kMlaEmbd));
     b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(kMlaFF));
     b.meta_u32(arch + ".attention.head_count", static_cast<u32>(kMlaHead));
@@ -19851,7 +20378,18 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
         b.meta_u32(arch + ".attention.sliding_window", 128);
         b.meta_u32(arch + ".hash_layer_count", 1);
         b.meta_f32(arch + ".attention.compress_rope_freq_base", 10000.0f);
+        if (f.idx_head > 0 && !f.comp_tables_only) {
+            b.meta_u32(arch + ".attention.indexer.head_count",
+                       static_cast<u32>(f.idx_heads));
+            b.meta_u32(arch + ".attention.indexer.key_length",
+                       static_cast<u32>(f.idx_head));
+            b.meta_u32(arch + ".attention.indexer.top_k",
+                       static_cast<u32>(f.idx_top_k));
+        }
         std::vector<i32> ratios(static_cast<size_t>(f.n_layer), 0);
+        if (!f.comp_tables_only && !f.ratios.empty())
+            for (size_t i = 0; i < ratios.size() && i < f.ratios.size(); i++)
+                ratios[i] = f.ratios[i];
         b.meta_i32_array(arch + ".attention.compress_ratios", ratios);
         // The hash route is a ROUTED-expert route, so the layer is a MoE one.
         b.meta_u32(arch + ".expert_count", static_cast<u32>(kMlaExpert));
@@ -19898,6 +20436,19 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
     w2("token_embd.weight", static_cast<u64>(kMlaEmbd),
        static_cast<u64>(kMlaVocab), 1);
     ones("output_norm.weight", static_cast<u64>(kMlaEmbd));
+    if (f.live_head) {
+        std::vector<f32> head(static_cast<size_t>(kMlaEmbd) * kMlaVocab);
+        for (i64 o = 0; o < kMlaVocab; o++)
+            for (i64 i = 0; i < kMlaEmbd; i++)
+                head[static_cast<size_t>(i * kMlaVocab + o)] =
+                    wv(9000 + i + o * 3);
+        for (i64 i = 0; i < kMlaEmbd; i++)
+            for (i64 o = 0; o < 3; o++)
+                head[static_cast<size_t>(i * kMlaVocab + o)] = 0.0f;
+        b.tensor_f16("output.weight",
+                     {static_cast<u64>(kMlaEmbd), static_cast<u64>(kMlaVocab)},
+                     head);
+    }
 
     const u64 nope = static_cast<u64>(kMlaKeyLen - kMlaRope);
     for (int l = 0; l < f.n_layer; l++) {
@@ -19947,6 +20498,63 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
             w2(p + "attn_output_b.weight",
                static_cast<u64>(kMlaOLora) * static_cast<u64>(kMlaOGroups),
                static_cast<u64>(kMlaEmbd), 500 + l);
+            // ---- the CSA/HCA compressor for this layer ------------------
+            const i32 ratio = (l < static_cast<int>(f.ratios.size()))
+                                  ? f.ratios[static_cast<size_t>(l)]
+                                  : 0;
+            if (ratio != 0 && !f.comp_no_tables) {
+                const u64 coff = ratio == 4 ? 2 : 1;
+                const u64 sw = coff * static_cast<u64>(kMlaKeyLen);
+                w2(p + "attn_compressor_wkv.weight",
+                   static_cast<u64>(kMlaEmbd), sw, 700 + l);
+                w2(p + "attn_compressor_wgate.weight",
+                   static_cast<u64>(kMlaEmbd), sw, 720 + l);
+                // [sw, ratio]: one APE column per position in the block. The
+                // values differ per column so a pool that read column 0 for
+                // every token cannot match one that reads pos % ratio.
+                {
+                    std::vector<f32> ape(static_cast<size_t>(sw) *
+                                         static_cast<size_t>(ratio));
+                    for (size_t i = 0; i < ape.size(); i++)
+                        ape[i] = 0.01f * static_cast<f32>((i % 7) + 1) *
+                                 static_cast<f32>((i / sw) + 1);
+                    b.tensor_f16(p + "attn_compressor_ape.weight",
+                                 {sw, static_cast<u64>(ratio)}, ape);
+                }
+                std::vector<f32> cn(static_cast<size_t>(kMlaKeyLen));
+                for (size_t i = 0; i < cn.size(); i++)
+                    cn[i] = 0.9f + 0.01f * static_cast<f32>(i);
+                b.tensor_f16(p + "attn_compressor_norm.weight",
+                             {static_cast<u64>(kMlaKeyLen)}, cn);
+                if (ratio == 4) {
+                    // The lightning indexer: a query from the SAME q_lora trunk
+                    // through its own q_b, a per-block weight from the input
+                    // row, and its own two-wide overlapping compressor.
+                    const u64 ih = static_cast<u64>(f.idx_head);
+                    const u64 inh = static_cast<u64>(f.idx_heads);
+                    w2(p + "indexer_proj.weight", static_cast<u64>(kMlaEmbd),
+                       inh, 740 + l);
+                    w2(p + "indexer_attn_q_b.weight",
+                       static_cast<u64>(kMlaQLora), inh * ih, 760 + l);
+                    w2(p + "indexer_compressor_wkv.weight",
+                       static_cast<u64>(kMlaEmbd), 2 * ih, 780 + l);
+                    w2(p + "indexer_compressor_wgate.weight",
+                       static_cast<u64>(kMlaEmbd), 2 * ih, 800 + l);
+                    {
+                        std::vector<f32> iape(static_cast<size_t>(2 * ih) * 4);
+                        for (size_t i = 0; i < iape.size(); i++)
+                            iape[i] = 0.02f * static_cast<f32>((i % 5) + 1) *
+                                      static_cast<f32>((i / (2 * ih)) + 1);
+                        b.tensor_f16(p + "indexer_compressor_ape.weight",
+                                     {2 * ih, 4}, iape);
+                    }
+                    std::vector<f32> inorm(static_cast<size_t>(ih));
+                    for (size_t i = 0; i < inorm.size(); i++)
+                        inorm[i] = 0.8f + 0.02f * static_cast<f32>(i);
+                    b.tensor_f16(p + "indexer_compressor_norm.weight", {ih},
+                                 inorm);
+                }
+            }
         } else {
             // The compressed latent with the decoupled rope key beside it.
             w2(p + "attn_kv_a_mqa.weight", static_cast<u64>(kMlaEmbd),
@@ -20996,6 +21604,190 @@ static void test_dsv4_hash_route() {
 // head can argmax one token and stop, and this repo has already been bitten by a
 // gate that compared only the sampled token (the attention rewrite produced the
 // same first token from two different kernels).
+// C1 -- DeepSeek-V4 compressed attention, END TO END.
+//
+// The arithmetic was already pinned (test_dsv4_compressed_attention: the state
+// row, the APE column, the per-channel pool, the overlap halves, the compression
+// rope, the indexer's relu-weighting and the top-k). What that could not say is
+// that the ENGINE runs it: the loader refused `compress_ratios != 0` by name
+// because nothing read the tables. This group is a V4 file whose layer 0 is CSA
+// (ratio 4, indexer) and layer 1 is HCA (ratio 128) -- both real shapes, both
+// through the same builder the whole-graph pin uses.
+//
+// The A/B is the SAME weights with every ratio 0: the compressor tables are
+// still in the file (unread), so the only difference in the run is whether the
+// pooled keys take part. The logits must move, in both directions: with the
+// ratios on and with them off.
+static void test_dsv4_compressed_end_to_end() {
+    auto run = [](const std::string &path, const char *prompt, int max_tokens,
+                  int n_ctx, std::vector<f32> &lg, std::string &err) {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = n_ctx;
+            c.prefill_chunk = 8;
+            if (!e.init(cpu, c, &err)) {
+                delete cpu;
+                return false;
+            }
+            GenerateParams gp;
+            gp.prompt = prompt;
+            gp.max_tokens = max_tokens;
+            GenerateResult r;
+            ok = e.generate(gp, &r);
+            if (ok) {
+                const i32 nv = e.model().cfg().n_vocab;
+                lg.assign(e.last_logits(), e.last_logits() + nv);
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    MlaFix f;
+    f.kind = MlaFixKind::Shared;
+    f.n_layer = 2;
+    f.ratios = {4, 128};       // layer 0 CSA, layer 1 HCA
+    f.idx_heads = 2;
+    f.idx_head = 8;
+    f.idx_top_k = 2;
+    f.ctx = 192;
+    const std::string csa = "kraken-dsv4-csa.gguf";
+    CHECK(build_mla_fixture(csa, f), "wrote a V4 file with CSA + HCA layers");
+
+    // The same weights, every ratio 0. The compressor tables are still there.
+    MlaFix dense = f;
+    dense.comp_tables_only = true;
+    const std::string plain = "kraken-dsv4-csa-dense.gguf";
+    CHECK(build_mla_fixture(plain, dense), "wrote the same weights without it");
+
+    {
+        // The engine no longer refuses the file, and the ratios reached the
+        // config: this is the shape that used to stop at init.
+        Backend *cpu = make_cpu_backend();
+        // The engine owns workspaces allocated through `be`, so it is scoped to
+        // die FIRST: `delete cpu` with a live Engine is a shutdown through a
+        // dangling pointer, which is a crash rather than a leak.
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = csa;
+            c.n_ctx = 192;
+            std::string err;
+            const bool ok = e.init(cpu, c, &err);
+            CHECK(ok, ("a file with compress ratios initialises: " + err).c_str());
+            if (ok) {
+                const ModelConfig &mc = e.model().cfg();
+                CHECK(mc.dsv4_ratio.size() >= 2 && mc.dsv4_ratio[0] == 4 &&
+                          mc.dsv4_ratio[1] == 128,
+                      "the per-layer ratios are the file's");
+                CHECK(mc.idx_n_head == 2 && mc.idx_head_dim == 8 &&
+                          mc.idx_top_k == 2,
+                      "and so is the indexer's geometry");
+                CHECK(e.model().layers()[0].comp_wkv.size() ==
+                          static_cast<size_t>(kMlaEmbd) * 2 * kMlaKeyLen,
+                      "the CSA layer's compressor tables are resident "
+                      "(two-wide)");
+                CHECK(e.model().layers()[1].comp_wkv.size() ==
+                          static_cast<size_t>(kMlaEmbd) * kMlaKeyLen,
+                      "the HCA layer's are one-wide");
+                CHECK(e.model().layers()[0].idx_q_b.size() ==
+                          static_cast<size_t>(kMlaQLora) * f.idx_heads *
+                              f.idx_head,
+                      "and its indexer's query table, sized by the indexer's "
+                      "own geometry");
+            }
+        }
+        delete cpu;
+    }
+
+    std::string err;
+    std::vector<f32> a, b;
+    // Five prompt rows and four generated ones: block 0 ends at position 3 and
+    // block 1 at 7, so the last rows read a pooled key that an earlier row
+    // completed -- the pool is exercised, not merely allocated.
+    const bool ra = run(csa, "the the the the", 4, 192, a, err);
+    const bool rb = run(plain, "the the the the", 4, 192, b, err);
+    CHECK(ra, ("the CSA run completes: " + err).c_str());
+    CHECK(rb, ("the dense run completes: " + err).c_str());
+    if (ra && rb && a.size() == b.size()) {
+        f32 pa = 0.0f;
+        for (f32 v : a) pa = std::max(pa, std::fabs(v));
+        const f32 md = fwd_maxdiff(a, b);
+        std::fprintf(stderr, "[c1] csa+hca vs dense: md=%g peak=%g\n",
+                     static_cast<double>(md), static_cast<double>(pa));
+        CHECK(pa > 0.0f && pa < 1e6f, "and its logits are finite");
+        CHECK(md > 1e-4f,
+              "the pooled keys take part: the same weights with the ratios off "
+              "do not produce these logits");
+    }
+
+    // ---- HCA alone, long enough to complete a 128-token block -----------
+    MlaFix h = f;
+    h.ratios = {128, 0};
+    h.ctx = 192;
+    h.live_head = true;
+    const std::string hca = "kraken-dsv4-hca.gguf";
+    CHECK(build_mla_fixture(hca, h), "wrote an HCA file");
+    MlaFix hd = h;
+    hd.comp_tables_only = true;
+    const std::string hplain = "kraken-dsv4-hca-dense.gguf";
+    CHECK(build_mla_fixture(hplain, hd), "and its ratio-0 twin");
+    std::vector<f32> c, d;
+    // 1 + 3 prompt tokens, then 130 generated ones: position 127 completes the
+    // first block, and every row after it reads that pooled key.
+    const bool rc = run(hca, "the the the", 130, 192, c, err);
+    const bool rd = run(hplain, "the the the", 130, 192, d, err);
+    CHECK(rc, ("the HCA run completes: " + err).c_str());
+    CHECK(rd, ("the HCA dense run completes: " + err).c_str());
+    if (rc && rd && c.size() == d.size()) {
+        f32 pc = 0.0f;
+        for (f32 v : c) pc = std::max(pc, std::fabs(v));
+        const f32 md = fwd_maxdiff(c, d);
+        std::fprintf(stderr, "[c1] hca vs dense (130 tokens): md=%g peak=%g\n",
+                     static_cast<double>(md), static_cast<double>(pc));
+        CHECK(pc > 0.0f && pc < 1e6f, "an HCA run past a block is finite");
+        CHECK(md > 1e-4f,
+              "a completed 128-token block changes the answer, so the dense "
+              "branch of the compressor is wired too");
+    }
+
+    // ---- what the loader still refuses, by name -------------------------
+    MlaFix no_tables = f;
+    no_tables.comp_no_tables = true;
+    const std::string nt = "kraken-dsv4-csa-no-tables.gguf";
+    CHECK(build_mla_fixture(nt, no_tables), "wrote a ratio with no tables");
+    {
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string e2;
+        const bool ok = m.load(*cpu, nt, &e2);
+        CHECK(!ok, "a compressed layer with no compressor tables is refused");
+        CHECK(e2.find("attn_compressor_wkv") != std::string::npos,
+              ("and the refusal names the tensor: " + e2).c_str());
+        m.unload();
+        delete cpu;
+    }
+    MlaFix no_idx = f;
+    no_idx.idx_head = 0;   // a CSA ratio with no indexer geometry
+    const std::string ni = "kraken-dsv4-csa-no-indexer.gguf";
+    CHECK(build_mla_fixture(ni, no_idx), "wrote a CSA ratio with no indexer");
+    {
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string e2;
+        const bool ok = m.load(*cpu, ni, &e2);
+        CHECK(!ok, "and a CSA ratio with no indexer geometry is refused");
+        CHECK(e2.find("indexer") != std::string::npos,
+              ("the refusal names the indexer: " + e2).c_str());
+        m.unload();
+        delete cpu;
+    }
+}
+
 static void test_dsv4_whole_graph() {
     const std::string path = "../kraken-dsv4whole.gguf";  // DEBUG path
     const std::string shifted = "kraken-dsv4whole-shift.gguf";
@@ -24226,6 +25018,14 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_trit_sign_extreme)
     TEST_GROUP(test_q2code_dot)
     TEST_GROUP(test_arch_row_pins)
+    TEST_GROUP(test_minicpm_embedding_scale_forward)
+    TEST_GROUP(test_olmoe_expert_weight_forward)
+    TEST_GROUP(test_qwen3moe_forward)
+    TEST_GROUP(test_gptneox_forward)
+    TEST_GROUP(test_phi2_forward)
+    TEST_GROUP(test_nemotron_h_forward)
+    TEST_GROUP(test_nemotron_h_moe_forward)
+    TEST_GROUP(test_dsv4_compressed_end_to_end)
     TEST_GROUP(test_lfm2_dense)
     TEST_GROUP(test_qwen2moe)
     TEST_GROUP(test_arch_table)

@@ -1,6 +1,7 @@
 // engine.cpp — prefill (batched) + decode (single token) with a paged-free
 // contiguous KV cache, streaming output and stop-string handling.
 #include "krk/engine.hpp"
+#include "krk/dsv4_compress.hpp"
 #include "krk/arch.hpp"
 #include "krk/dflash.hpp"
 #include "krk/host_time.hpp"
@@ -1109,16 +1110,24 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // the dense core over such a layer would attend the raw prefix instead --
         // a plausible answer from a graph the file does not describe, which is
         // the one failure mode this engine refuses rather than approximates.
-        if (mla_shared)
+        // A non-zero compress ratio is a layer whose attention reads the CSA/HCA
+        // compressor's pooled keys as well as the raw window. That path runs
+        // (Engine::mla_shared_forward_compressed), but the compressed attention
+        // op is a REFERENCE implementation: it is host f32 arithmetic over two
+        // row families and only the CPU backend says it can run it. A device
+        // that cannot must refuse rather than attend the raw prefix -- a
+        // plausible answer from a graph the file does not describe.
+        if (mla_shared) {
+            bool any_comp = false;
             for (size_t i = 0; i < mc.dsv4_ratio.size(); i++)
-                if (mc.dsv4_ratio[i] != 0)
-                    return refuse_mla(
-                        "MLA layout 'shared-latent': layer " +
-                        std::to_string(i) + " declares a compress ratio of " +
-                        std::to_string(mc.dsv4_ratio[i]) +
-                        " and the compressed-attention path (attn_compressor_*) "
-                        "is not implemented; a run would attend the raw prefix "
-                        "instead of the pooled one");
+                if (mc.dsv4_ratio[i] != 0) any_comp = true;
+            if (any_comp && !be_->mla_shared_compressed_supported())
+                return refuse_mla(
+                    "MLA layout 'shared-latent': the file declares non-zero "
+                    "compress ratios and this backend has no compressed "
+                    "attention (it runs the two row families on hardware only "
+                    "the CPU reference implements)");
+        }
         if (mla_shared ? !be_->mla_shared_supported() : !be_->mla_supported()) {
             return refuse_mla(
                 std::string("the selected backend has no ") +
@@ -1449,6 +1458,83 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             ws_mlay_ = alloc(static_cast<size_t>(C) *
                              static_cast<size_t>(gout) * sizeof(f32));
             if (!check_alloc(ws_mlay_, "ws_mlay")) return false;
+
+            // ---- the compressed streams (CSA/HCA) ------------------------
+            // Allocated only when the FILE compresses something: a dense-core V4
+            // file pays nothing for a feature it does not use. The blocks are
+            // sized by the context, not the chunk -- a pooled key lives for the
+            // whole run, because it summarizes positions the window has already
+            // passed.
+            comp_ratio_.assign(static_cast<size_t>(mc.n_layer), 0);
+            bool any_comp = false;
+            for (i32 i = 0; i < mc.n_layer; i++) {
+                const size_t k = static_cast<size_t>(i);
+                const i32 r = k < mc.dsv4_ratio.size() ? mc.dsv4_ratio[k] : 0;
+                comp_ratio_[k] = r;
+                if (r != 0) any_comp = true;
+            }
+            if (any_comp) {
+                const i64 hd = mc.mla_kv_lora;
+                const i64 rope = mc.mla_qk_rope;
+                comp_inv_freq_.assign(static_cast<size_t>(rope / 2), 0.0f);
+                dsv4_comp_inv_freq(comp_inv_freq_.data(),
+                                   static_cast<i32>(rope),
+                                   mc.dsv4_compress_rope_base);
+                comp_state_kv_.resize(static_cast<size_t>(mc.n_layer));
+                comp_state_sc_.resize(static_cast<size_t>(mc.n_layer));
+                comp_pooled_.resize(static_cast<size_t>(mc.n_layer));
+                comp_kpos_.resize(static_cast<size_t>(mc.n_layer));
+                idx_state_kv_.resize(static_cast<size_t>(mc.n_layer));
+                idx_state_sc_.resize(static_cast<size_t>(mc.n_layer));
+                idx_key_.resize(static_cast<size_t>(mc.n_layer));
+                comp_nblocks_.assign(static_cast<size_t>(mc.n_layer), 0);
+                i64 pool_rows = 0, state_w = 0, max_blocks = 0;
+                for (i32 i = 0; i < mc.n_layer; i++) {
+                    const size_t k = static_cast<size_t>(i);
+                    const i32 r = comp_ratio_[k];
+                    if (r == 0) continue;
+                    const i64 coff = r == kDsv4CsaRatio ? 2 : 1;
+                    const i64 blocks = static_cast<i64>(cfg.n_ctx) / r + 2;
+                    comp_state_kv_[k].assign(
+                        static_cast<size_t>(2 * r * coff * hd), 0.0f);
+                    comp_state_sc_[k].assign(
+                        static_cast<size_t>(2 * r * coff * hd), 0.0f);
+                    comp_pooled_[k].assign(
+                        static_cast<size_t>(blocks * hd), 0.0f);
+                    comp_kpos_[k].assign(static_cast<size_t>(blocks), 0);
+                    if (r == kDsv4CsaRatio) {
+                        if (mc.idx_head_dim <= 0 || mc.idx_n_head <= 0) {
+                            KRK_ERROR("compressed attention: a CSA layer needs "
+                                      "the indexer's geometry and the file has "
+                                      "none");
+                            return false;
+                        }
+                        idx_state_kv_[k].assign(
+                            static_cast<size_t>(2 * r * 2 * mc.idx_head_dim),
+                            0.0f);
+                        idx_state_sc_[k].assign(
+                            static_cast<size_t>(2 * r * 2 * mc.idx_head_dim),
+                            0.0f);
+                        idx_key_[k].assign(
+                            static_cast<size_t>(blocks * mc.idx_head_dim), 0.0f);
+                    }
+                    pool_rows = std::max(pool_rows, coff * r);
+                    state_w = std::max(state_w, coff * hd);
+                    max_blocks = std::max(max_blocks, blocks);
+                }
+                comp_pool_kv_.assign(static_cast<size_t>(pool_rows * state_w), 0.0f);
+                comp_pool_sc_.assign(static_cast<size_t>(pool_rows * state_w), 0.0f);
+                comp_row_kv_.assign(static_cast<size_t>(state_w), 0.0f);
+                comp_row_sc_.assign(static_cast<size_t>(state_w), 0.0f);
+                comp_idx_kv_.assign(static_cast<size_t>(2 * mc.idx_head_dim), 0.0f);
+                comp_idx_sc_.assign(static_cast<size_t>(2 * mc.idx_head_dim), 0.0f);
+                comp_iq_.assign(
+                    static_cast<size_t>(mc.idx_n_head) * mc.idx_head_dim, 0.0f);
+                comp_iw_.assign(static_cast<size_t>(mc.idx_n_head), 0.0f);
+                comp_score_.assign(static_cast<size_t>(max_blocks), 0.0f);
+                comp_sel_.assign(
+                    static_cast<size_t>(mc.idx_top_k > 0 ? mc.idx_top_k : 1), 0);
+            }
         }
     }
     // The widest FFN a layer can ask for: dense, routed expert, or shared expert.
@@ -7065,8 +7151,16 @@ bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     // head count into a grouped output projection, so there is no per-head
     // table to absorb. Dispatch here so the layer loop and everything after it
     // (residual add, FFN, dumps) stay one path.
-    if (model_.cfg().mla_layout == MlaLayout::Shared)
+    if (model_.cfg().mla_layout == MlaLayout::Shared) {
+        // A layer the file compresses runs the two-row-family path; every other
+        // layer of the same file runs the dense one. The braces are not style:
+        // without them the inner `if` swallows the dense call and every LAYOUT
+        // lands in the shared path, which the minicpm3 groups caught.
+        if (l >= 0 && static_cast<size_t>(l) < comp_ratio_.size() &&
+            comp_ratio_[static_cast<size_t>(l)] != 0)
+            return mla_shared_forward_compressed(L, l, n, pos0);
         return mla_shared_forward(L, l, n, pos0);
+    }
     KRK_TRACE_COMP("mla-forward");
     const ModelConfig &mc = model_.cfg();
     const i64 nh = model_.n_head_at(l);
@@ -7282,6 +7376,348 @@ bool Engine::mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
 
     // 4. the grouped low-rank output: this IS the layer's attention result, so
     //    it lands in ws_x2_ where the ordinary path keeps `wo`'s output.
+    be_->mla_shared_output(ws_x2_, ws_mlaa_, ws_mlay_, L.wo_a16.data,
+                           L.wo_b16.data, sd);
+    dump_row("attn.proj", l, ws_x2_, n_embd_, n);
+    return true;
+}
+
+// DeepSeek-V4 COMPRESSED attention (CSA/HCA): the shared-latent layer with a
+// second row family in the attention.
+//
+// What is different from mla_shared_forward, and only this:
+//
+//   1. Every token's input row is also projected into a compressor STATE row
+//      (`dsv4_comp_state`: Wkv x | Wgate x + APE[pos % ratio]). The rows are
+//      kept per layer in a two-block ring, because the pool reads the previous
+//      block and the current one.
+//   2. When a token completes a block, the block is pooled into ONE key
+//      (`dsv4_comp_pool`: a per-channel softmax over the block's rows, then the
+//      weighted sum, then the norm) and stored with the block's FIRST token as
+//      its position. A pooled key is visible to every later token -- it
+//      summarizes positions the sliding window has already passed -- but NOT to
+//      the tokens of its own block, which is why the pool runs AFTER this row's
+//      attention and not before.
+//   3. The attention reads both families: the raw window and the pooled keys.
+//      HCA (ratio 128) reads all of them; CSA (ratio 4) runs the lightning
+//      indexer over its own pooled keys and reads the top-k. Per ROW, so the
+//      loop is per token on a CSA layer even during prefill -- a selection is a
+//      property of the query, and one shared set for a whole chunk would
+//      attend blocks that a later row's indexer never chose.
+//
+// Everything else -- the query trunk, the latent write, the grouped output --
+// is the dense path's code, unchanged, because the file says the layer is the
+// same layer (deepseek4.cpp builds one graph with a conditional block).
+//
+// The arithmetic here is HOST f32 through the oracle in src/dsv4_compress.cpp:
+// the tables it needs are small and the compressor is a scalar routine, and
+// this path is gated on `mla_shared_compressed_supported()`, which only the CPU
+// reference answers true for. A device backend that implements it later
+// replaces these calls with kernels; the oracle stays the definition.
+bool Engine::mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
+                                           i32 pos0) {
+    KRK_TRACE_COMP("mla-shared-forward-compressed");
+    const ModelConfig &mc = model_.cfg();
+    const size_t li = static_cast<size_t>(l);
+    if (li >= comp_ratio_.size() || comp_ratio_[li] == 0) {
+        KRK_ERROR("mla-shared-compressed: layer %d carries no compress ratio",
+                  static_cast<int>(l));
+        return false;
+    }
+    if (!be_->mla_shared_compressed_supported()) {
+        KRK_ERROR("mla-shared-compressed: layer %d needs the compressed-"
+                  "attention op and this backend does not implement it",
+                  static_cast<int>(l));
+        return false;
+    }
+    const i32 ratio = comp_ratio_[li];
+    const i64 nh = model_.n_head_at(l);
+    const i64 d = mc.mla_kv_lora;
+    const i64 ql = mc.mla_q_lora;
+    const i64 rope = mc.mla_qk_rope;
+    const i64 gout = static_cast<i64>(mc.dsv4_o_groups) *
+                     static_cast<i64>(mc.dsv4_o_lora);
+    if (ql <= 0 || d <= 0 || gout <= 0 || !L.wq_a16.present() ||
+        !L.wq_b16.present() || !L.wkv16.present() || !L.wo_a16.present() ||
+        !L.wo_b16.present() || !L.wq_a_norm || !L.wkv_norm) {
+        KRK_ERROR("mla-shared-compressed: layer %d is missing its staged tables",
+                  static_cast<int>(l));
+        return false;
+    }
+    if (L.comp_wkv.empty() || L.comp_wgate.empty() || L.comp_ape.empty() ||
+        L.comp_norm.empty()) {
+        KRK_ERROR("mla-shared-compressed: layer %d declares ratio %d and carries "
+                  "no compressor tables",
+                  static_cast<int>(l), static_cast<int>(ratio));
+        return false;
+    }
+    void *kbase = kvt_k_.base(l);
+    if (!kbase) {
+        KRK_ERROR("mla-shared-compressed: no resident KV slot for layer %d",
+                  static_cast<int>(l));
+        return false;
+    }
+    const i64 coff = ratio == kDsv4CsaRatio ? 2 : 1;
+    const i64 sw = coff * d;
+    const i64 ih = mc.idx_head_dim;
+    const i64 inh = mc.idx_n_head;
+    const bool csa = ratio == kDsv4CsaRatio;
+
+    Dsv4Compressor cc;
+    cc.ratio = ratio;
+    cc.n_embd = n_embd_;
+    cc.hd = static_cast<i32>(d);
+    cc.rope = static_cast<i32>(rope);
+    cc.rope_base = mc.dsv4_compress_rope_base;
+    cc.eps = mc.rms_eps;
+    cc.wkv = L.comp_wkv.data();
+    cc.wgate = L.comp_wgate.data();
+    cc.ape = L.comp_ape.data();
+    cc.norm = L.comp_norm.data();
+    if (!cc.valid()) {
+        KRK_ERROR("mla-shared-compressed: layer %d's compressor descriptor does "
+                  "not validate (ratio %d, latent %lld, rope %lld)",
+                  static_cast<int>(l), static_cast<int>(ratio),
+                  static_cast<long long>(d), static_cast<long long>(rope));
+        return false;
+    }
+    // The indexer's own compressor: ALWAYS the two-wide overlapping one, and its
+    // pooled key is idx_head wide with the same rotary tail.
+    Dsv4Compressor ic;
+    if (csa) {
+        if (L.idx_proj.empty() || L.idx_q_b.empty() || L.idx_wkv.empty() ||
+            L.idx_wgate.empty() || L.idx_ape.empty() || L.idx_norm.empty() ||
+            ih <= 0 || inh <= 0 || rope > ih) {
+            KRK_ERROR("mla-shared-compressed: layer %d is CSA (ratio 4) and its "
+                      "indexer tables do not match the declared geometry",
+                      static_cast<int>(l));
+            return false;
+        }
+        ic.ratio = kDsv4CsaRatio;
+        ic.n_embd = n_embd_;
+        ic.hd = static_cast<i32>(ih);
+        ic.rope = static_cast<i32>(rope);
+        ic.rope_base = mc.dsv4_compress_rope_base;
+        ic.eps = mc.rms_eps;
+        ic.wkv = L.idx_wkv.data();
+        ic.wgate = L.idx_wgate.data();
+        ic.ape = L.idx_ape.data();
+        ic.norm = L.idx_norm.data();
+        if (!ic.valid()) {
+            KRK_ERROR("mla-shared-compressed: layer %d's indexer compressor does "
+                      "not validate",
+                      static_cast<int>(l));
+            return false;
+        }
+    }
+
+    MlaSharedDesc sd;
+    sd.n_head = nh;
+    sd.kv_lora = d;
+    sd.qk_rope = rope;
+    sd.o_groups = mc.dsv4_o_groups;
+    sd.o_lora = mc.dsv4_o_lora;
+    sd.n_embd = n_embd_;
+    sd.n_tok = n;
+    sd.pos0 = pos0;
+    sd.pos_stride = d;
+    sd.scale = 1.0f / std::sqrt(static_cast<f32>(d));
+    sd.eps = mc.rms_eps;
+    sd.window = mc.dsv4_window > 0 ? mc.dsv4_window : 0;
+    sd.inv_freq = model_.inv_freq_at(l).data();
+    sd.sinks = L.sinks;
+
+    // The query trunk is the dense path's, row for row.
+    gemm_w(ws_mla_, ws_xn_, L.wkv16, d, n_embd_, n);
+    gemm_w(ws_mlaqn_, ws_xn_, L.wq_a16, ql, n_embd_, n);
+    be_->rmsnorm(ws_mlaqn_, ws_mlaqn_, L.wq_a_norm, n, ql, mc.rms_eps, nullptr);
+    gemm_w(ws_q_, ws_mlaqn_, L.wq_b16, nh * d, ql, n);
+    dump_row("mla.q", l, ws_q_, nh * d, n);
+
+    const size_t as = be_->act_size();
+    const f32 *host_xn = static_cast<const f32 *>(ws_xn_);
+    const f32 *host_ql = static_cast<const f32 *>(ws_mlaqn_);
+    const f32 *host_q = static_cast<const f32 *>(ws_q_);
+    f32 *pooled = comp_pooled_[li].data();
+    i64 *kpos = comp_kpos_[li].data();
+    const i64 prows = coff * ratio;
+    const f32 iw_scale = csa ? 1.0f / std::sqrt(static_cast<f32>(ih * inh)) : 0.0f;
+
+    for (i32 t = 0; t < n; t++) {
+        const i64 pos = pos0 + t;
+        MlaSharedDesc one = sd;
+        one.n_tok = 1;
+        one.pos0 = pos;
+        // 1. the latent row, written before it is read: row pos is visible to
+        //    itself, exactly as in the dense path.
+        be_->mla_shared_latent(
+            kbase,
+            static_cast<const char *>(ws_mla_) + static_cast<size_t>(t) * d * as,
+            L.wkv_norm, one);
+        // 2. this token's state rows, into the ring slot for its position.
+        const f32 *xrow = host_xn + static_cast<size_t>(t) * n_embd_;
+        const i32 pinb = static_cast<i32>(pos % ratio);
+        const i64 slot = (coff == 1) ? pinb : ((pos / ratio) % 2) * ratio + pinb;
+        if (!dsv4_comp_state(cc, xrow, pinb, comp_row_kv_.data(),
+                             comp_row_sc_.data())) {
+            KRK_ERROR("mla-shared-compressed: layer %d state row at pos %lld",
+                      static_cast<int>(l), static_cast<long long>(pos));
+            return false;
+        }
+        std::memcpy(comp_state_kv_[li].data() + slot * sw, comp_row_kv_.data(),
+                    static_cast<size_t>(sw) * sizeof(f32));
+        std::memcpy(comp_state_sc_[li].data() + slot * sw, comp_row_sc_.data(),
+                    static_cast<size_t>(sw) * sizeof(f32));
+        if (csa) {
+            const i64 islot =
+                ((pos / ratio) % 2) * ratio + pinb;  // always two-wide
+            if (!dsv4_comp_state(ic, xrow, pinb, comp_idx_kv_.data(),
+                                 comp_idx_sc_.data())) {
+                KRK_ERROR("mla-shared-compressed: layer %d indexer state at pos "
+                          "%lld",
+                          static_cast<int>(l), static_cast<long long>(pos));
+                return false;
+            }
+            std::memcpy(idx_state_kv_[li].data() + islot * 2 * ih,
+                        comp_idx_kv_.data(),
+                        static_cast<size_t>(2 * ih) * sizeof(f32));
+            std::memcpy(idx_state_sc_[li].data() + islot * 2 * ih,
+                        comp_idx_sc_.data(),
+                        static_cast<size_t>(2 * ih) * sizeof(f32));
+        }
+        // 3. the attention for THIS row, over the raw window and the pooled
+        //    keys of the blocks that are already complete.
+        i64 nb = comp_nblocks_[li];
+        const i32 *sel = nullptr;
+        i64 nsel = 0;
+        if (csa && nb > 0) {
+            // The indexer: q from the q_lora trunk through its own q_b, roped on
+            // the tail at THIS position with the compression base; weights from
+            // the raw input row; score = sum_h relu(q_h . k_b) * w_h over the
+            // pooled indexer keys, then the top-k blocks.
+            std::fill(comp_iq_.begin(), comp_iq_.end(), 0.0f);
+            const f32 *qlrow = host_ql + static_cast<size_t>(t) * ql;
+            for (i64 k2 = 0; k2 < ql; k2++) {
+                const f32 qk = qlrow[k2];
+                if (qk == 0.0f) continue;
+                const f32 *wrow = &L.idx_q_b[static_cast<size_t>(k2 * inh * ih)];
+                for (i64 c = 0; c < inh * ih; c++)
+                    comp_iq_[static_cast<size_t>(c)] += qk * wrow[c];
+            }
+            for (i64 h2 = 0; h2 < inh; h2++)
+                dsv4_comp_rope(&comp_iq_[static_cast<size_t>(h2 * ih)],
+                               static_cast<i32>(ih), static_cast<i32>(rope), pos,
+                               mc.dsv4_compress_rope_base);
+            for (i64 h2 = 0; h2 < inh; h2++) {
+                f32 s2 = 0.0f;
+                for (i64 k2 = 0; k2 < n_embd_; k2++)
+                    s2 += xrow[k2] * L.idx_proj[static_cast<size_t>(k2 * inh + h2)];
+                comp_iw_[static_cast<size_t>(h2)] = s2 * iw_scale;
+            }
+            if (!dsv4_indexer_scores(static_cast<i32>(inh), static_cast<i32>(ih),
+                                     comp_iq_.data(), idx_key_[li].data(),
+                                     comp_iw_.data(), nullptr,
+                                     static_cast<i32>(nb), comp_score_.data())) {
+                KRK_ERROR("mla-shared-compressed: layer %d indexer scores",
+                          static_cast<int>(l));
+                return false;
+            }
+            i32 kk = mc.idx_top_k > 0 ? mc.idx_top_k : 1;
+            if (kk > nb) kk = static_cast<i32>(nb);
+            dsv4_top_k(comp_sel_.data(), kk, comp_score_.data(),
+                       static_cast<i32>(nb));
+            sel = comp_sel_.data();
+            nsel = kk;
+        }
+        be_->mla_shared_attention_compressed(
+            static_cast<char *>(ws_mlaa_) +
+                static_cast<size_t>(t) * nh * d * sizeof(f32),
+            host_q + static_cast<size_t>(t) * nh * d, kbase, pooled, kpos, nb,
+            sel, nsel, one, comp_inv_freq_.data());
+        // 4. if this token completes a block, pool it -- AFTER this row's
+        //    attention, so a pooled key summarizes a block that is entirely
+        //    behind the query and never contributes to its own block.
+        if (pinb == ratio - 1) {
+            const i64 b = pos / ratio;
+            for (i64 k2 = 0; k2 < prows; k2++) {
+                const bool cur_half = (coff == 1) || (k2 >= ratio);
+                i64 src;
+                if (coff == 1) {
+                    src = k2;
+                } else if (cur_half) {
+                    src = (b % 2) * ratio + (k2 - ratio);
+                } else if (b == 0) {
+                    // No previous block: the reference appends a ZERO value row
+                    // with an -inf score (dsv4_append_zero_row in deepseek4.cpp),
+                    // i.e. the half contributes nothing and its softmax weight
+                    // is exactly 0. A zero score row instead would give the
+                    // missing block a uniform share of the pool.
+                    for (i64 i = 0; i < sw; i++) {
+                        comp_pool_kv_[static_cast<size_t>(k2 * sw + i)] = 0.0f;
+                        comp_pool_sc_[static_cast<size_t>(k2 * sw + i)] =
+                            -INFINITY;
+                    }
+                    continue;
+                } else {
+                    src = ((b - 1) % 2) * ratio + k2;
+                }
+                std::memcpy(&comp_pool_kv_[static_cast<size_t>(k2 * sw)],
+                            comp_state_kv_[li].data() + src * sw,
+                            static_cast<size_t>(sw) * sizeof(f32));
+                std::memcpy(&comp_pool_sc_[static_cast<size_t>(k2 * sw)],
+                            comp_state_sc_[li].data() + src * sw,
+                            static_cast<size_t>(sw) * sizeof(f32));
+            }
+            if (!dsv4_comp_pool(cc, comp_pool_kv_.data(), comp_pool_sc_.data(),
+                                pooled + nb * d)) {
+                KRK_ERROR("mla-shared-compressed: layer %d pool of block %lld",
+                          static_cast<int>(l), static_cast<long long>(b));
+                return false;
+            }
+            kpos[nb] = pos - ratio + 1;
+            if (csa) {
+                for (i64 k2 = 0; k2 < 2 * ratio; k2++) {
+                    const bool cur_half = k2 >= ratio;
+                    i64 src;
+                    if (cur_half) {
+                        src = (b % 2) * ratio + (k2 - ratio);
+                    } else if (b == 0) {
+                        for (i64 i = 0; i < 2 * ih; i++) {
+                            comp_pool_kv_[static_cast<size_t>(k2 * 2 * ih + i)] =
+                                0.0f;
+                            comp_pool_sc_[static_cast<size_t>(k2 * 2 * ih + i)] =
+                                -INFINITY;
+                        }
+                        continue;
+                    } else {
+                        src = ((b - 1) % 2) * ratio + k2;
+                    }
+                    std::memcpy(&comp_pool_kv_[static_cast<size_t>(k2 * 2 * ih)],
+                                idx_state_kv_[li].data() + src * 2 * ih,
+                                static_cast<size_t>(2 * ih) * sizeof(f32));
+                    std::memcpy(&comp_pool_sc_[static_cast<size_t>(k2 * 2 * ih)],
+                                idx_state_sc_[li].data() + src * 2 * ih,
+                                static_cast<size_t>(2 * ih) * sizeof(f32));
+                }
+                f32 *iout = &idx_key_[li][static_cast<size_t>(nb * ih)];
+                if (!dsv4_comp_pool(ic, comp_pool_kv_.data(),
+                                    comp_pool_sc_.data(), iout)) {
+                    KRK_ERROR("mla-shared-compressed: layer %d indexer pool of "
+                              "block %lld",
+                              static_cast<int>(l), static_cast<long long>(b));
+                    return false;
+                }
+                // Stored ROTATED at the block's first token: the score is an
+                // ordinary dot against the roped query, and the angle must
+                // survive from the write to every later read.
+                dsv4_comp_rope(iout, static_cast<i32>(ih), static_cast<i32>(rope),
+                               kpos[nb], mc.dsv4_compress_rope_base);
+            }
+            comp_nblocks_[li] = nb + 1;
+        }
+    }
+    kvt_k_.end_layer(l);
+    // 5. the grouped low-rank output, the dense path's final step.
     be_->mla_shared_output(ws_x2_, ws_mlaa_, ws_mlay_, L.wo_a16.data,
                            L.wo_b16.data, sd);
     dump_row("attn.proj", l, ws_x2_, n_embd_, n);

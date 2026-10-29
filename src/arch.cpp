@@ -888,24 +888,23 @@ constexpr ArchSpec kTable[] = {
     // softmax mass and contributes no value of its own, which the kernel and the
     // host oracle both already carried.
     //
-    // The CSA/HCA compressors are now IMPLEMENTED as arithmetic --
-    // include/krk/dsv4_compress.hpp (state row with APE, per-channel softmax
-    // pool, the overlap halves, the compression-base rope) and
-    // mla_shared_forward_compressed() in include/krk/mla_shared.hpp (raw rows and
-    // pooled rows in one attention, windowed and always-visible respectively),
-    // both pinned by test_dsv4_compressed_attention. What is NOT done is the
-    // engine's half: the per-layer state rows and pooled keys need a second KV
-    // stream and a load arm for attn_compressor_*/indexer_* tensors. Until that
-    // lands, a file whose attention.compress_ratios is non-zero is still refused
-    // at Engine::init and by the loader's gap map -- the refusal is about the
-    // wiring, not about unknown maths.
-    // A dense-core file (all ratios 0) IS this graph, and
-    // test_dsv4_whole_graph pins it end to end.
+    // The CSA/HCA compressors RUN: the loader reads the per-layer
+    // attn_compressor_* tables (and the indexer's on ratio-4 layers), the engine
+    // keeps the per-token state rows and the pooled keys, and the attention
+    // reads both row families (Engine::mla_shared_forward_compressed,
+    // test_dsv4_compressed_end_to_end). The arithmetic is the oracle in
+    // src/dsv4_compress.cpp -- the state row with APE, the per-channel softmax
+    // pool, the overlapping halves, the compression-base rope, the indexer's
+    // relu-weighting and top-k -- which is a HOST f32 reference, so the
+    // compressed path answers on backends that implement the two-row-family
+    // attention op (the CPU reference) and is refused BY CAPABILITY elsewhere.
+    // What is still missing on this row: Engram conditional memory and the
+    // 4-wide hyper-connections. A dense-core file (all ratios 0) is the same
+    // graph without the second row family, and test_dsv4_whole_graph pins it.
     {"deepseek4", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target, "deepseek4",
-     "shared-latent MLA, the grouped output, the attention sinks and the "
-     "tid2eid hash route run; compressed attention (attn_compressor_*) and the "
-     "sparse indexer do not, so a file with a non-zero compress_ratios is "
-     "refused",
+     "shared-latent MLA, the grouped output, the attention sinks, the tid2eid "
+     "hash route and the CSA/HCA compressors with the lightning indexer run on "
+     "the CPU reference; Engram and the hyper-connections do not",
      /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,

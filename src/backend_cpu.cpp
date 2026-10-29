@@ -1727,6 +1727,115 @@ public:
                 });
     }
 
+    // The compressed variant: the same score/softmax/accumulate, over TWO row
+    // families. Raw rows are windowed and roped at their own position; pooled
+    // rows are always visible and roped at the block's first token with the
+    // compression table. Both contribute their UNROTATED row as the value,
+    // exactly as the dense path does -- the pooled row is already the normed
+    // pool, so the only difference on the value side is where it came from.
+    //
+    // The two tables are passed rather than looked up: the compression base is
+    // a per-FILE property (attention.compress_rope_freq_base) and the attention
+    // base is per-layer, so a kernel that used one table for both would be
+    // right on neither.
+    bool mla_shared_compressed_supported() const override { return true; }
+    void mla_shared_attention_compressed(void *a, const void *q,
+                                         const void *cache, const void *pooled,
+                                         const i64 *pooled_pos, i64 n_pooled,
+                                         const i32 *sel, i64 n_sel,
+                                         const MlaSharedDesc &d,
+                                         const f32 *compress_inv_freq) override {
+        npu_flush_();
+        f32 *af = static_cast<f32 *>(a);
+        const f32 *qf = static_cast<const f32 *>(q);
+        const f32 *cf = static_cast<const f32 *>(cache);
+        const f32 *pf = static_cast<const f32 *>(pooled);
+        const i64 nh = d.n_head, kv = d.kv_lora, rope = d.qk_rope;
+        const i64 base = kv - rope;
+        const i64 nsel = sel ? n_sel : n_pooled;
+        const i64 units = d.n_tok * nh;
+        par_for(units, 1,
+                8.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * kv,
+                [&](i64 b, i64 e) {
+                    std::vector<f32> qr(static_cast<size_t>(kv));
+                    std::vector<f32> kr(static_cast<size_t>(kv));
+                    std::vector<f32> p;
+                    for (i64 u = b; u < e; u++) {
+                        const i64 r = u / nh;
+                        const i64 h = u - r * nh;
+                        const i64 pos = d.pos0 + r;
+                        const f32 *qrow = qf + r * (nh * kv) + h * kv;
+                        for (i64 i = 0; i < kv; i++) qr[static_cast<size_t>(i)] = qrow[i];
+                        for (i64 i = 0; i + 1 < rope; i += 2) {
+                            const f32 th =
+                                static_cast<f32>(pos) * d.inv_freq[i / 2];
+                            const f32 cs = std::cos(th), sn = std::sin(th);
+                            const f32 x0 = qr[static_cast<size_t>(base + i)];
+                            const f32 x1 = qr[static_cast<size_t>(base + i + 1)];
+                            qr[static_cast<size_t>(base + i)] = x0 * cs - x1 * sn;
+                            qr[static_cast<size_t>(base + i + 1)] = x0 * sn + x1 * cs;
+                        }
+                        const i64 t_lo =
+                            d.window > 0 ? std::max<i64>(0, pos - d.window + 1) : 0;
+                        const i64 nk = pos - t_lo + 1;
+                        const i64 nkeys = nk + nsel;
+                        p.assign(static_cast<size_t>(nkeys), 0.0f);
+                        f32 mx = d.sinks ? d.sinks[h] : -1e30f;
+                        auto score_row = [&](const f32 *c, i64 keypos,
+                                             const f32 *freq) {
+                            for (i64 i = 0; i < kv; i++)
+                                kr[static_cast<size_t>(i)] = c[i];
+                            for (i64 i = 0; i + 1 < rope; i += 2) {
+                                const f32 th = static_cast<f32>(keypos) * freq[i / 2];
+                                const f32 cs = std::cos(th), sn = std::sin(th);
+                                const f32 x0 = kr[static_cast<size_t>(base + i)];
+                                const f32 x1 = kr[static_cast<size_t>(base + i + 1)];
+                                kr[static_cast<size_t>(base + i)] = x0 * cs - x1 * sn;
+                                kr[static_cast<size_t>(base + i + 1)] = x0 * sn + x1 * cs;
+                            }
+                            f32 s = 0.0f;
+                            for (i64 i = 0; i < kv; i++)
+                                s += qr[static_cast<size_t>(i)] * kr[static_cast<size_t>(i)];
+                            return s * d.scale;
+                        };
+                        for (i64 t = t_lo; t <= pos; t++) {
+                            const f32 s = score_row(cf + t * d.pos_stride, t,
+                                                    d.inv_freq);
+                            p[static_cast<size_t>(t - t_lo)] = s;
+                            if (s > mx) mx = s;
+                        }
+                        for (i64 j = 0; j < nsel; j++) {
+                            const i64 blk = sel ? sel[j] : j;
+                            const f32 s = score_row(pf + blk * kv,
+                                                    pooled_pos[blk],
+                                                    compress_inv_freq);
+                            p[static_cast<size_t>(nk + j)] = s;
+                            if (s > mx) mx = s;
+                        }
+                        f32 sum = 0.0f;
+                        if (d.sinks) sum = std::exp(d.sinks[h] - mx);
+                        for (i64 t = 0; t < nkeys; t++) {
+                            const f32 ex = std::exp(p[static_cast<size_t>(t)] - mx);
+                            p[static_cast<size_t>(t)] = ex;
+                            sum += ex;
+                        }
+                        f32 *out = af + r * (nh * kv) + h * kv;
+                        for (i64 i = 0; i < kv; i++) {
+                            f32 acc = 0.0f;
+                            for (i64 t = 0; t < nk; t++)
+                                acc += p[static_cast<size_t>(t)] / sum *
+                                       cf[(t_lo + t) * d.pos_stride + i];
+                            for (i64 j = 0; j < nsel; j++) {
+                                const i64 blk = sel ? sel[j] : j;
+                                acc += p[static_cast<size_t>(nk + j)] / sum *
+                                       pf[blk * kv + i];
+                            }
+                            out[i] = acc;
+                        }
+                    }
+                });
+    }
+
     void mla_shared_output(void *out, const void *a, void *scratch,
                            const void *wo_a, const void *wo_b,
                            const MlaSharedDesc &d) override {

@@ -279,6 +279,29 @@ struct LayerWeights {
     QuantTensor wo_a16;        // [heads_per_group*key_length, o_groups*o_lora]
     QuantTensor wo_b16;        // [o_groups*o_lora, n_embd]
 
+    // ---- DeepSeek-V4 compressed attention (CSA/HCA), optional -----------
+    // Host f32 copies, in the file's [in, out] order. The state rows and the
+    // pool are computed by the host oracle in src/dsv4_compress.cpp -- they are
+    // per-token projections of the layer's input, not GEMM operands the engine
+    // tiles, and the tables are small (on V4-Flash: 4096x1024 for the CSA
+    // wkv/wgate pair against 67 MiB for the query trunk alone). A layer with
+    // compress_ratio 0 carries none of them.
+    //
+    // `comp_*` is the attention's own compressor. `idx_*` is the lightning
+    // indexer's, which exists only on CSA layers and is always TWO-wide (its
+    // pool is the overlapping one) -- that is the reference's own shape, not a
+    // choice this engine makes.
+    std::vector<f32> comp_wkv;    // [n_embd, coff*hd]
+    std::vector<f32> comp_wgate;  // [n_embd, coff*hd]
+    std::vector<f32> comp_ape;    // [coff*hd, ratio]
+    std::vector<f32> comp_norm;   // [hd]
+    std::vector<f32> idx_proj;    // [n_embd, idx_n_head]
+    std::vector<f32> idx_q_b;     // [q_lora, idx_n_head*idx_head]
+    std::vector<f32> idx_wkv;     // [n_embd, 2*idx_head]
+    std::vector<f32> idx_wgate;   // [n_embd, 2*idx_head]
+    std::vector<f32> idx_ape;     // [2*idx_head, ratio]
+    std::vector<f32> idx_norm;    // [idx_head]
+
     // The hash route's expert-id table (DeepSeek-V4): `ffn_gate_tid2eid.weight`
     // is an INT32 tensor -- ggml type 26 -- holding one row per selected
     // expert and one column per token id. It is DATA, not a weight: it is
