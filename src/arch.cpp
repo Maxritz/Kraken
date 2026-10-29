@@ -297,20 +297,42 @@ constexpr ArchSpec minicpm3_spec() {
     s.mla = true;
     s.rope_neox = true;      // llama.cpp lists minicpm3 under LLAMA_ROPE_TYPE_NEOX
     s.residual_depth = 1.4f; // scale_depth in the reference graph
+    // The reference scales the ATTENTION result AND the FFN result by
+    // `scale_depth/sqrt(n_layer)` (`cur = ggml_scale(cur, scale_res)` twice);
+    // `residual_depth` alone only covers the first. A stack that scales one
+    // branch and not the other doubles the FFN's share of every residual.
+    s.residual_scale_ffn = true;
+    // `inpL = ggml_scale(ctx0, inpL, 12.0f)` before layer 0, and
+    // `cur = ggml_scale(ctx0, cur, float(n_embd_base)/float(n_embd))` between
+    // the final norm and `output`, with n_embd_base hard-coded 256 in the
+    // reference (src/models/minicpm3.cpp:65) -- it is not metadata.
+    s.embd_scale = 12.0f;
+    s.lm_head_scale_base = 256.0f;
     return s;
 }
 
 // ---- mellum ----------------------------------------------------------------
 // Mellum is qwen3-MoE's schema: RMSNorm, per-head q/k norm, NeoX rotary, a
 // router plus routed experts. It differs in declaring a sliding window on a
-// 4-layer pattern (llama.cpp calls load_swa_pattern(ml, 4), i.e. period 4 with
-// the full-attention layer first -- this engine's historical default, so
-// swa_period only has to name the period).
+// 4-layer pattern: `load_swa_pattern(ml, 4)` with the default
+// `dense_first = false`, i.e. `il % 4 < 3` -- layers 0..2 windowed and layer 3
+// full (`set_swa_pattern`, llama-hparams.cpp:13). This row said the opposite
+// ("period 4 with the full-attention layer first -- this engine's historical
+// default"), which put the full layer at index 0 and the window on 1..3: a
+// different mask on 3 of every 4 layers. The phase is the flag, not the
+// default, so it is named here.
+//
+// The windowed layers also rotate with PLAIN rope: the reference passes
+// `ext_factor = 0` and a SWA freq scale of 1 on them (src/models/mellum.cpp's
+// per-layer YaRN factors), so a scaled file must not fold its scaling into
+// this half of the stack.
 constexpr ArchSpec mellum_spec() {
     ArchSpec s{"mellum", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target,
                "qwen3", "", true, false, false, false};
     s.rope_neox = true;
     s.swa_period = 4;
+    s.swa_window_first = true;
+    s.swa_plain_rope = true;
     return s;
 }
 
@@ -335,6 +357,13 @@ constexpr ArchSpec phimoe_spec() {
 constexpr ArchSpec minicpm_spec() {
     ArchSpec s{"minicpm", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
                "llama", "", false, false, false, false};
+    // `hparams.f_embedding_scale = 12.0f` (src/models/minicpm.cpp:5) is the
+    // one scale this family APPLIES: llama.cpp's build_inp_embd multiplies the
+    // embedding row by any nonzero `f_embedding_scale`, and 12.0 is that
+    // family's default. Its `residual_scale`/`logit_scale` are read into
+    // hparams and never used by any graph in the reference either, so this
+    // engine not applying them is the same function, not a gap.
+    s.embd_scale = 12.0f;
     return s;
 }
 
@@ -516,6 +545,10 @@ constexpr ArchSpec kTable[] = {
                    /*attn_gate=*/false, /*rope_neox=*/true};
         s.post_branch_norm = true;
         s.swa_window_first = true;
+        // `hparams.rope_freq_scale_train_swa = 1.0` and an `ext_factor` of 0
+        // on the windowed layers (src/models/olmo2.cpp:11-12, :120): the
+        // windowed half of the stack never carries the full layers' scaling.
+        s.swa_plain_rope = true;
         return s;
     }(),
     // Seed-OSS: NEOX rope, silu FFN, an `attn_output.bias`, and its FFN input
@@ -696,6 +729,12 @@ constexpr ArchSpec kTable[] = {
         // renormalized after selection, the opposite of qwen2moe's
         // un-normalized softmax.
         s.expert_w_norm = 1;
+        // `hparams.f_attention_scale = 1.0f; // Gemma4 uses self.scaling = 1.0
+        // (no pre-attn scaling)` -- the reference passes that value where every
+        // other family passes 1/sqrt(head_dim). On this stack's 512-wide heads
+        // the default is 22x colder, and the softmax is flat enough that the
+        // answer is plausible text rather than a failure.
+        s.attn_scale = 1.0f;
         return s;
     }(),
 

@@ -18,7 +18,7 @@ code, the README, or `docs/`.
   contradicting the README. `build_check.sh` requires it current for the same
   reason.
 - The gate suite is six things, not one: `sh scripts/build_check.sh`, ninja
-  rc=0 with 0 `error:` lines, `kraken-tests` 4521/4521, `sh
+  rc=0 with 0 `error:` lines, `kraken-tests` 6566/6566, `sh
   scripts/kraken_tests_baseline_check.sh` (names the groups that newly broke
   against the recorded baseline), `kraken-bench --gate` rc=0, and a coherence
   spot check on three models, one per shape, run as:
@@ -126,10 +126,11 @@ code, the README, or `docs/`.
   groups. 4431 -> 4497 when the LFM2.5 shortconv group landed (95 groups), and
   4497 -> 4508 when that group grew its recorded-row pin (24 -> 35 checks), and
   4508 -> 4521 when `test_expert_cache_warm_tier` grew from 77 to 90 for the
-  `KRK_EXPERT_WARM_MAP` arm. Read the count off the run (`4521/4521 checks
+  `KRK_EXPERT_WARM_MAP` arm, and 4528 -> 6566 in 95 -> 125 groups by 2026-10-29
+  (the schema-row and family-scale work). Read the count off the run (`6566/6566 checks
   passed`) rather than trusting the number written here, which is only the last
   one seen.
-- **`kraken-tests` runs each of its 95 groups in its own child process, several
+- **`kraken-tests` runs each of its 125 groups in its own child process, several
   at a time.** A fastfail, an access violation or an abort inside one group used
   to end the run before the `%d/%d checks passed` line, which is how a single
   `std::fclose(NULL)` in a KV-tier test hid eight real failures for a whole
@@ -844,7 +845,7 @@ code, the README, or `docs/`.
   Red construction: disabling the wide scaled path fails **26 of 32**, both wide
   cases reporting `scaled clips=6912` while the narrow register case stays green,
   so the arm is specific to the path it names rather than counting a failure.
-  Gate: `kraken-tests` 4528/4528 in 95 groups, `scripts/build_check.sh` 0 failed,
+  Gate: `kraken-tests` 6566/6566 in 125 groups, `scripts/build_check.sh` 0 failed,
   the baseline check `no regression`, `kraken-bench --bitexact` rc=0, the
   coherence check PASS on all three shapes (Qwen3-4B-Q8_0 dense, Qwen3.5-9B-Q4_K_M
   recurrent, Qwen3-30B-A3B i1-Q2_K MoE, `1 coherent, 0 not` each), and `bench --gate` green

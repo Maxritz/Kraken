@@ -1650,9 +1650,12 @@ sets all four so GPT-2 is unchanged, and `Engine::plain_forward` covers all four
 architectures.
 
 `gptneox` reads the fused QKV **as row views** of one weight, so fused and split
-layouts are bit-identical on the same weights — verified for all three, with
-`parallel_residual` separately checked to change the graph rather than being
-ignored. See [docs/PLAIN-PRENORM-FAMILY.md](docs/PLAIN-PRENORM-FAMILY.md), which
+layouts are bit-identical on the same weights — verified for all three. The
+`parallel_residual` graph difference itself was checked by hand on a real file,
+not by the suite: no gptneox/phi2 fixture exists, so `kraken-tests` pins the row
+flags (`test_arch_row_pins`) and the file-level A/B is still owed
+(`docs/TODO-alignment-2026-10-29.md`, B5). See
+[docs/PLAIN-PRENORM-FAMILY.md](docs/PLAIN-PRENORM-FAMILY.md), which
 also records two loader bugs this found (`output_norm.bias` wrongly *required*,
 so complete GPT-J files were refused; and `layer_norm_epsilon` never read).
 

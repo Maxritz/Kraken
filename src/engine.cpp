@@ -3029,12 +3029,20 @@ void Engine::head_compute(i32 row) {
         be_->rmsnorm(ws_xn_, src, model_.out_norm(), 1, n_embd_, mc.rms_eps,
                      static_cast<const i32 *>(ws_rexp_) + row);
     }
-    const QuantTensor &head = model_.out_head();
-    const void *xn = ws_xn_;
+    void *xn = ws_xn_;
     if (model_.had().head_folded) {
         had_xform(ws_had_, ws_xn_, 1, n_embd_, false, false);
         xn = ws_had_;
     }
+    // MiniCPM3 scales the normed row between `output_norm` and `output`
+    // (`cur = ggml_scale(ctx0, cur, float(n_embd_base)/float(n_embd))` with
+    // n_embd_base hard-coded 256 in the reference). Applied here, on the row
+    // the head reads, so the order is the reference's -- and only to the
+    // head: the block's output (the embeddings a caller may ask for) keeps the
+    // unscaled normed row, which is what `res->t_embd` holds in the reference
+    // too.
+    if (mc.lm_head_scale != 1.0f)
+        be_->scale_act(xn, mc.lm_head_scale, 1, n_embd_, n_embd_);
     logit_head(xn);
 }
 
@@ -3465,10 +3473,9 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     // no pre-attention scaling (gemma4: f_attention_scale = 1.0) says so in the
     // file rather than being approximated by the default 1/sqrt(hd).
     auto attn_scale_at = [&](i32 layer) -> f32 {
-        if (mc.attn_scale > 0.0f) return mc.attn_scale * mc.rope_attn_scale;
+        if (mc.attn_scale > 0.0f) return mc.attn_scale;
         return static_cast<f32>(1.0 / std::sqrt(
-                   static_cast<f64>(model_.head_dim_at(layer)))) *
-               mc.rope_attn_scale;
+            static_cast<f64>(model_.head_dim_at(layer))));
     };
     d.scale = attn_scale_at(0);
     // gemma2's bound on the attention logits, applied inside attention. 0 on
@@ -4695,8 +4702,7 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
     d.pos_stride = kvw;
     d.layer = 0;
     d.window = 0;
-    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(hd))) *
-              mc.rope_attn_scale;
+    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(hd)));
     d.softcap = mc.attn_softcap;
     // ---- which rotary, over how much of the head, over what window --------
     // The block inherits the stack's rotary, and on a hybrid that inheritance
@@ -4814,7 +4820,6 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
         if (hsplit) be_->sync();
         const u64 th0 = now_us();
         be_->rmsnorm(ws_xn_, ws_x_, m.shared_head_norm, 1, n_embd_, mc.rms_eps);
-        const QuantTensor &head = model_.out_head();
         logit_head(ws_xn_);
         if (hsplit) {
             be_->sync();
@@ -5169,6 +5174,17 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
         // residual store, because it has no residual to store into.
         gemm_w(dst, gn, L.wdown, n_embd_, n_ff_, n);
         dump_row("attn.down", l, dst, n_embd_, n);
+    } else if (dmc.residual_scale_ffn) {
+        // MiniCPM3 scales the FFN result by `scale_depth/sqrt(n_layer)` before
+        // it joins the residual, exactly as it scales the attention result.
+        // The folded store writes straight into the residual, so it cannot
+        // carry a multiply: this is the gemm + scale + add the reference does,
+        // gated on the flag so every other family keeps the fold.
+        gemm_w(ws_x2_, gn, L.wdown, n_embd_, n_ff_, n);
+        if (dmc.attn_out_scale != 1.0f)
+            be_->scale_act(ws_x2_, dmc.attn_out_scale, n, n_embd_, n_embd_);
+        dump_row("attn.down", l, ws_x2_, n_embd_, n);
+        be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
     } else {
         gemm_residual(ws_x_, gn, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n,
                       ws_x2_, L.wdown.gs);

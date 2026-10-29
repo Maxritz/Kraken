@@ -1173,13 +1173,6 @@ public:
         (void)dst; (void)src; (void)idx; (void)n_rows; (void)row_bytes;
     }
 
-    // One sink logit per query head, entered into the softmax denominator
-    // at the row's running max with no value term (V4 report Eq. 27).
-    // Called between the scores/online-max advance and the accumulation,
-    // i.e. after the newest key row has been applied. An implementation
-    // must be a no-op for a null `sinks`.
-    virtual void attention_sink(void *, const void *, i64, i64, i64, i64) {}
-
     // RoPE + KV append + decode attention as ONE launch (the
     // single-query-token decode row only): rotates q in registers,
     // ropes k straight into its cache slot, copies v beside it and

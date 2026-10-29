@@ -374,6 +374,57 @@ struct ArchSpec {
     // have. The engine passes the null weight straight to Backend::rmsnorm,
     // whose contract already carries the weightless case (gemma4's value norm).
     bool noweight_norm = false;
+    // ---- members added after every positional row --------------------------
+    // The rows above are positional aggregate initializers, so a member added
+    // in the middle silently shifts every field after it. These are written by
+    // name, after the row is built, and must stay last.
+
+    // The multiplier on the q·k score before the softmax, when the family does
+    // not use `1/sqrt(head_dim)`. 0 keeps the per-layer default, which is the
+    // reference's own `f_attention_scale == 0 ? 1/sqrt(n_embd_head) : ...`
+    // convention -- the same test every family in llama.cpp's tree makes.
+    //
+    // gemma4 is the family that needs it nonzero: its reference sets
+    // `f_attention_scale = 1.0` ("Gemma4 uses self.scaling = 1.0 (no pre-attn
+    // scaling)"), and 1/sqrt(512) instead of 1.0 is a 22x colder attention
+    // distribution on every layer -- a fluent wrong answer, not a failure.
+    //
+    // A file that states `<arch>.attention.scale` overrides this; the several
+    // families that read that key (dflash, granite, ...) use the identical
+    // "0 = default" convention.
+    float attn_scale = 0.0f;
+
+    // The multiplier applied to the token embedding before layer 0, for a
+    // family whose reference scales the embedding row by a CONSTANT of its own
+    // rather than by sqrt(n_embd). MiniCPM's `scale_emb = 12.0` is that
+    // constant, and it is not cosmetic: llama.cpp applies it through the
+    // generic `f_embedding_scale` in `build_inp_embd`, so a stack run without
+    // it enters layer 0 at 1/12 the magnitude the model was trained on.
+    //
+    // 0 means "no family constant". `<arch>.embedding_scale` overrides it (and
+    // gemma's sqrt(n_embd) keeps its own path; the two never apply together).
+    float embd_scale = 0.0f;
+
+    // The numerator of the head-input scale MiniCPM3 applies between its final
+    // norm and `output` (`scale_lmhead = n_embd_base / n_embd`, with
+    // `n_embd_base` hard-coded to 256 in the reference -- it is not metadata).
+    // 0 disables it. Applied in Engine::head_compute, after the norm, which is
+    // the reference's order.
+    float lm_head_scale_base = 0.0f;
+
+    // The residual scale (`residual_scale` / `scale_depth/sqrt(n_layer)`) also
+    // applies to the FFN branch's output, not only the attention branch's.
+    // MiniCPM3 scales BOTH (`cur = ggml_scale(cur, scale_res)` runs on the
+    // attention result and again on the FFN result). false keeps the
+    // attention-only behaviour every other family has.
+    bool residual_scale_ffn = false;
+
+    // The windowed layers of a hybrid stack rotate with PLAIN rope even when
+    // the full layers are scaled: the reference passes `ext_factor = 0` and a
+    // SWA freq scale of 1 on those layers (mellum, olmo2, gpt-oss). This
+    // matters only for a file whose full layers ARE scaled (a YaRN or linear
+    // file); on a plain file the two tables are identical and nothing changes.
+    bool swa_plain_rope = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

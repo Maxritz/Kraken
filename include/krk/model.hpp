@@ -405,7 +405,16 @@ struct ModelConfig {
     i32 n_ctx_train = 0;
     f32 rope_base = 10000.0f;
     f32 rope_scale = 1.0f;      // position scaling for linear RoPE
-    f32 rope_attn_scale = 1.0f; // YaRN mscale (1.0 when unused)
+    // NOTE: there is deliberately no `rope_attn_scale` here. The YaRN
+    // magnitude (mscale) is NOT folded into the attention scale by this
+    // engine: the frequency half of YaRN is folded into the table (see
+    // Model::load's build_yarn), and the magnitude half is left out on the
+    // measurement that a converted checkpoint's `yarn_attn_factor` already
+    // cancels it. A field that nothing assigns is a promise the graph does not
+    // keep, so the multiply is gone rather than carried at 1.0. The DeepSeek
+    // family's `mscale^2` correction is tracked separately (docs/TODO-
+    // alignment-2026-10-29.md, B7) because it needs the file's
+    // `yarn_log_multiplier` and is not a constant.
     f32 rope_frac = 1.0f;       // fraction of head dims rotated (Phi partial RoPE)
     f32 rms_eps = 1e-5f;
     // Gemma 2/3/4 bound the output logits with cap * tanh(logit / cap). The
@@ -435,8 +444,16 @@ struct ModelConfig {
     // [-c, +c] after the projection and the bias, before the rotary. 0 means
     // the file declares no clamp, which is every other family.
     f32 attn_clamp_kqv = 0.0f;
+    // The head-input multiplier: MiniCPM3 scales the normed row by
+    // `n_embd_base/n_embd` (256/n_embd) between the final norm and `output`.
+    // Applied in Engine::head_compute, which is the reference's order. 1.0
+    // skips it.
+    f32 lm_head_scale = 1.0f;
+    // The layer's residual scale also applies to the FFN branch's output, not
+    // only the attention branch's (MiniCPM3 scales both). false is the
+    // attention-only shape every other family has.
+    bool residual_scale_ffn = false;
     bool tied_embeddings = false;
-    bool has_bias = false;
     bool qk_norm = false;
     // OLMoE and its relatives normalize Q/K *before* the head split: one RMS
     // over the whole projected [n_embd] row, weight width n_embd. Qwen3 and
@@ -563,6 +580,12 @@ struct ModelConfig {
     // 1/sqrt(head_dim). gemma4 sets f_attention_scale = 1.0 and applies no
     // pre-attention scaling at all, which is not expressible by tweaking the
     // default. 0 means "unset, use the default".
+    //
+    // Set from ArchSpec::attn_scale and overridden by `<arch>.attention.scale`
+    // when the file states one, with the reference's own "0 = default"
+    // convention. Both halves were missing until 2026-10-29: Engine's
+    // helper already read this field and its comment already named gemma4,
+    // but nothing ever ASSIGNED it, so every gemma4 file ran at 1/sqrt(512).
     f32 attn_scale = 0.0f;
     std::vector<i32> n_head_layer;
     // Same idea for the KV side: a per-layer array (nemotron_h_moe: 2 on its
@@ -684,14 +707,17 @@ struct ModelConfig {
     // whether `rope_scale` has already been folded into `inv_freq` and must be
     // left at 1.0 for the rotation op.
     bool rope_yarn = false;
-    // The file's rope.scaling.factor and rope.scaling.yarn_log_multiplier, kept
-    // because MLA's softmax scale is built from them: DeepSeek's mscale is
-    // 1 + 0.1 * log_mul * ln(factor), and the attention scale is mscale^2 /
-    // sqrt(key_length) (llama.cpp deepseek2, TAG_DEEPSEEK2_YARN_LOG_MUL_FIX).
-    // A 5% scale error here does not look like a bug in any single token -- it
-    // looks like a model that answers in the right voice and picks a different
-    // word a few steps in, which is why it has to be read rather than assumed
-    // to be 1.0. Defaults are the no-YaRN values (1.0 and 0.0).
+    // The file's rope.scaling.factor and rope.scaling.yarn_log_multiplier.
+    // They are the INPUTS of DeepSeek's MLA softmax scale -- mscale =
+    // attn_factor * (1 + 0.1 * log_mul * ln(factor)) and the attention scale is
+    // mscale^2 / sqrt(key_length) (llama.cpp src/models/deepseek2.cpp:433-437,
+    // TAG_DEEPSEEK2_YARN_LOG_MUL_FIX, where the stored key is first divided by
+    // 0.1) -- and that correction is NOT applied yet: the MLA paths still use
+    // plain 1/sqrt(qk). Read here so the number is on the config and testable;
+    // tracked as B7 in docs/TODO-alignment-2026-10-29.md. A 5% scale error here
+    // does not look like a bug in any single token -- it looks like a model
+    // that answers in the right voice and picks a different word a few steps
+    // in, which is why it is recorded rather than silently defaulted.
     f32 rope_yarn_factor = 1.0f;
     f32 rope_yarn_log_mul = 0.0f;
     // 1 = sum-normalize the selected expert weights, 0 = keep the raw
@@ -702,7 +728,11 @@ struct ModelConfig {
     i32 expert_w_norm = -1;
     f32 expert_w_scale = 1.0f;
     // Leading layers whose FFN is dense rather than MoE
-    // (`leading_dense_block_count`).
+    // (`leading_dense_block_count`). REPORTED, not consumed: the layer loop
+    // dispatches on the tensors a layer actually carries (`ffn_gate_inp`
+    // present or not), so a mixed stack needs no rule -- see the glm4moe row
+    // in src/arch.cpp. Kept because it is a file fact the loader proves it read
+    // (test_lfm2moe checks it) and a diagnostic worth printing.
     i32 n_dense_lead = 0;
 
     // Mixture-of-Experts geometry (is_moe == false for dense models).
