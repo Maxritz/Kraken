@@ -852,6 +852,23 @@ void deq_tq1_0(const u8 *b, f32 *y, i64 nblk) {
     }
 }
 
+// I2_S (ggml id 36): 128 values in 32 bytes, planar with the HIGH pair first:
+// byte i carries element i in bits 7..6, i+32 in 5..4, i+64 in 3..2, i+96 in
+// 1..0, and the value is code-1. The block has NO scale of its own -- the
+// tensor-wide f32 lives in a 32-byte tail after the payload
+// (GgufTensor::tail -> QuantTensor::gs), so the decoder here is scale-free and
+// callers that bypass gemm_w() must apply gs themselves.
+// Authority: quantize_to_i2_s in microsoft/BitNet utils/convert-hf-to-gguf-bitnet.py.
+void deq_i2_s(const u8 *b, f32 *y, i64 nblk) {
+    for (i64 i = 0; i < nblk; i++, b += 32, y += 128) {
+        for (int j = 0; j < 32; j++)
+            for (int l = 0; l < 4; l++) {
+                const int code = (b[j] >> (6 - 2 * l)) & 3;
+                y[j + l * 32] = static_cast<f32>(code - 1);
+            }
+    }
+}
+
 void deq_tq2_0(const u8 *b, f32 *y, i64 nblk) {
     for (i64 i = 0; i < nblk; i++, b += 66, y += 256) {
         const f32 d = fp16_to_fp32(static_cast<u16>(b[64] | (b[65] << 8)));
@@ -1200,8 +1217,21 @@ static inline i32 ternary_chunk_sum(const i8 *xv, const i8 *tv,
                                     const __m256i ones8, const __m256i ones16) {
     const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(xv));
     const __m256i t = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(tv));
-    const __m256i sx = _mm256_sign_epi8(x, t);
-    __m256i pr = _mm256_maddubs_epi16(ones8, sx);
+    // sum(t*x) split into its positive and negative halves:
+    //   maddubs(+1 where t>0, x) - maddubs(+1 where t<0, x)
+    // Both operands are exact: the unsigned side is only ever 0 or 1, and the
+    // SIGNED side is x itself, never -x. That matters for exactly one input:
+    // x = -128, whose negation does not exist in int8, so the obvious
+    // `_mm256_sign_epi8(x, t)` reads it back as -128 and flips that element's
+    // contribution (see test_trit_sign_extreme -- 128 per hit, and a q8
+    // activation does emit -128). Pair products stay under 512 in magnitude,
+    // so there is no maddubs saturation and the subtraction cannot overflow
+    // i16 either.
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i mp = _mm256_and_si256(_mm256_cmpgt_epi8(t, zero), ones8);
+    const __m256i mn = _mm256_and_si256(_mm256_cmpgt_epi8(zero, t), ones8);
+    __m256i pr = _mm256_sub_epi16(_mm256_maddubs_epi16(mp, x),
+                                  _mm256_maddubs_epi16(mn, x));
     pr = _mm256_madd_epi16(pr, ones16);
     alignas(32) i32 l[8];
     _mm256_store_si256(reinterpret_cast<__m256i *>(l), pr);
@@ -1278,6 +1308,202 @@ f32 ptq1_0_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     return ternary_dot_1(w, xq, dx, n, 128, 28, unpack_ptq1_trits);
 }
 
+// ---------------------------------------------------------------------------
+// 2-bit CODE blocks: TQ2_0 (256 values / 66 B), PQ2_0 and Q2_0 (128 / 34 B),
+// Q2_0_64 (64 / 18 B).
+//
+// All four store a 2-bit code per weight and decode it as `(q - 1) * d`, i.e.
+// the value ladder is {-1, 0, +1, +2} -- NOT the trit ladder {-1, 0, +1} that
+// TQ1_0/PTQ1_0 hold. BitNet's own encoder only ever emits q in {0,1,2}, but a
+// file that carries q = 3 is still a legal 2-bit block and must decode as +2,
+// which is exactly the case a "reuse the ternary kernel" shortcut would drop.
+//
+// So the kernel computes `sum (q-1)*x` for the whole code range in one pass:
+//
+//   p  = max(v, 0)        (u8, 0..2)
+//   n  = max(-v, 0)       (u8, 0..1)
+//   sum(p * x) - sum(n * x) = sum(v * x)   -- exact, including v = 2
+//
+// maddubs takes an UNSIGNED first operand, which is why the magnitude rides in
+// p/n and x stays untouched on the signed side. The pinned products are exact
+// integers, so only the f32 accumulation order can differ from the scalar path
+// (see the contract on set_vec_dot_fast: values identical, summation order
+// free). Negating x instead -- the `sign_epi8(x, v)` trick -- is wrong at
+// x = -128, which has no int8 negation; see test_trit_sign_extreme.
+static inline i32 q2_chunk_sum(const i8 *xv, const i8 *pv, const i8 *nv,
+                               const __m256i ones16) {
+    const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(xv));
+    const __m256i p = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(pv));
+    const __m256i n = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(nv));
+    // Same split as the trit kernel: sum(v*x) = sum over v>0 minus sum over
+    // v<0, with the magnitude (0..2) on the unsigned operand and x untouched
+    // on the signed one, so x = -128 stays exact.
+    __m256i pr = _mm256_sub_epi16(_mm256_maddubs_epi16(p, x),
+                                  _mm256_maddubs_epi16(n, x));
+    pr = _mm256_madd_epi16(pr, ones16);
+    alignas(32) i32 l[8];
+    _mm256_store_si256(reinterpret_cast<__m256i *>(l), pr);
+    return l[0] + l[1] + l[2] + l[3] + l[4] + l[5] + l[6] + l[7];
+}
+
+// TQ2_0: 64 qs bytes = TWO planes of 32 bytes, each spanning 128 values. Byte
+// j in the first half carries elements j, j+32, j+64, j+96; byte j+32 carries
+// j+128 .. j+224. That is `deq_tq2_0`'s `y[j*4 + l*32 + m]` for j in {0,32},
+// and getting it wrong here writes past the buffer and decodes the second
+// half of every block from the wrong bytes -- which is what the differential
+// test against dequant_row() caught (it segfaulted on the overflow first).
+static inline f32 unpack_tq2_codes(const u8 *w, i8 *v, i8 *a) {
+    for (int j = 0; j < 64; j++)
+        for (int l = 0; l < 4; l++) {
+            const i32 q = (w[j] >> (l * 2)) & 3;
+            const int idx = (j >> 5) * 128 + (j & 31) + l * 32;
+            v[idx] = static_cast<i8>(q > 0 ? q - 1 : 0);   // p = max(q-1, 0)
+            a[idx] = static_cast<i8>(q == 0 ? 1 : 0);      // n = max(1-q, 0)
+        }
+    return fp16_to_fp32(static_cast<u16>(w[64] | (w[65] << 8)));
+}
+
+// PQ2_0 / Q2_0 (128 values, 32 qs bytes) and Q2_0_64 (64 values, 16 bytes):
+// byte-major, four codes per byte, low pair first -- elements 4i .. 4i+3 come
+// out of qs[i] at shifts 0, 2, 4, 6.
+static inline f32 unpack_q2_codes_128(const u8 *w, i8 *v, i8 *a) {
+    for (int i = 0; i < 32; i++)
+        for (int s = 0; s < 4; s++) {
+            const i32 q = (w[2 + i] >> (s * 2)) & 3;
+            v[i * 4 + s] = static_cast<i8>(q > 0 ? q - 1 : 0);
+            a[i * 4 + s] = static_cast<i8>(q == 0 ? 1 : 0);
+        }
+    return fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+}
+
+static inline f32 unpack_q2_codes_64(const u8 *w, i8 *v, i8 *a) {
+    for (int i = 0; i < 16; i++)
+        for (int s = 0; s < 4; s++) {
+            const i32 q = (w[2 + i] >> (s * 2)) & 3;
+            v[i * 4 + s] = static_cast<i8>(q > 0 ? q - 1 : 0);
+            a[i * 4 + s] = static_cast<i8>(q == 0 ? 1 : 0);
+        }
+    return fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+}
+
+static void q2code_dot_x8_impl(const u8 *w, const i8 *xq, const f32 *dx,
+                               i64 n, i64 rstride, i64 dstride, f32 *out,
+                               i64 out_stride, i64 B, i64 BLK,
+                               f32 (*unpack)(const u8 *, i8 *, i8 *)) {
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const i64 chunks = B / 32;
+    f32 acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    alignas(32) i8 cv[256];
+    alignas(32) i8 ca[256];
+    for (i64 nb = 0; nb < n / B; nb++, w += BLK) {
+        const f32 d = unpack(w, cv, ca);
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * B;
+            const f32 *dr = dx + static_cast<i64>(r) * dstride + nb * chunks;
+            f32 a = 0.0f;
+            for (i64 c = 0; c < chunks; c++)
+                a = std::fma(dr[c],
+                             static_cast<f32>(q2_chunk_sum(xr + c * 32,
+                                                           cv + c * 32,
+                                                           ca + c * 32, ones16)),
+                             a);
+            acc[r] = std::fma(d, a, acc[r]);
+        }
+    }
+    for (int r = 0; r < 8; r++) out[static_cast<i64>(r) * out_stride] = acc[r];
+}
+
+static f32 q2code_dot_1(const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 B,
+                        i64 BLK, f32 (*unpack)(const u8 *, i8 *, i8 *)) {
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const i64 chunks = B / 32;
+    f32 acc = 0.0f;
+    alignas(32) i8 cv[256];
+    alignas(32) i8 ca[256];
+    for (i64 nb = 0; nb < n / B; nb++, w += BLK) {
+        const f32 d = unpack(w, cv, ca);
+        f32 a = 0.0f;
+        for (i64 c = 0; c < chunks; c++)
+            a = std::fma(dx[nb * chunks + c],
+                         static_cast<f32>(q2_chunk_sum(xq + nb * B + c * 32,
+                                                       cv + c * 32, ca + c * 32,
+                                                       ones16)),
+                         a);
+        acc = std::fma(d, a, acc);
+    }
+    return acc;
+}
+
+void tq2_0_q8_x8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                          i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    q2code_dot_x8_impl(w, xq, dx, n, rstride, dstride, out, out_stride, 256, 66,
+                       unpack_tq2_codes);
+}
+
+void pq2_0_q8_x8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                          i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    q2code_dot_x8_impl(w, xq, dx, n, rstride, dstride, out, out_stride, 128, 34,
+                       unpack_q2_codes_128);
+}
+
+void q2_0_q8_x8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                         i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    q2code_dot_x8_impl(w, xq, dx, n, rstride, dstride, out, out_stride, 128, 34,
+                       unpack_q2_codes_128);
+}
+
+void q2_0_64_q8_x8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                            i64 rstride, i64 dstride, f32 *out,
+                            i64 out_stride) {
+    q2code_dot_x8_impl(w, xq, dx, n, rstride, dstride, out, out_stride, 64, 18,
+                       unpack_q2_codes_64);
+}
+
+// I2_S: planar 32-byte blocks, high pair first, and NO per-block delta (the
+// scale is per tensor and applied by gemm_w as gs). The kernel therefore
+// returns sum((code-1) * x) unscaled -- exactly what the other code kernels
+// return with d folded out -- and the caller's gs supplies the magnitude.
+//
+// The plane order is the one difference from TQ2_0's block, which is the same
+// 32-byte planar shape with the LOW pair first; reading the two the same way
+// swaps element i with i+96, which no differential test against the reference
+// decoder can catch if both sides share the mistake. It is pinned against the
+// converter's `q[:,0,:]<<6 | q[:,1,:]<<4 | q[:,2,:]<<2 | q[:,3,:]` in
+// test_i2_s_layout.
+static inline f32 unpack_i2_s_codes(const u8 *w, i8 *v, i8 *a) {
+    for (int j = 0; j < 32; j++)
+        for (int l = 0; l < 4; l++) {
+            const i32 q = (w[j] >> (6 - 2 * l)) & 3;
+            const int idx = j + l * 32;
+            v[idx] = static_cast<i8>(q > 0 ? q - 1 : 0);
+            a[idx] = static_cast<i8>(q == 0 ? 1 : 0);
+        }
+    return 1.0f;   // per-tensor scale lives in the tensor tail, not here
+}
+
+void i2_s_q8_x8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                         i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    q2code_dot_x8_impl(w, xq, dx, n, rstride, dstride, out, out_stride, 128, 32,
+                       unpack_i2_s_codes);
+}
+
+f32 i2_s_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return q2code_dot_1(w, xq, dx, n, 128, 32, unpack_i2_s_codes);
+}
+
+f32 tq2_0_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return q2code_dot_1(w, xq, dx, n, 256, 66, unpack_tq2_codes);
+}
+f32 pq2_0_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return q2code_dot_1(w, xq, dx, n, 128, 34, unpack_q2_codes_128);
+}
+f32 q2_0_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return q2code_dot_1(w, xq, dx, n, 128, 34, unpack_q2_codes_128);
+}
+f32 q2_0_64_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return q2code_dot_1(w, xq, dx, n, 64, 18, unpack_q2_codes_64);
+}
+
 // One whole block of `t` decoded into buf (>= block_size floats).
 void dequant_block(DType t, const u8 *p, f32 *buf) {
     switch (t) {
@@ -1309,6 +1535,7 @@ void dequant_block(DType t, const u8 *p, f32 *buf) {
         case DType::ROCMFP4_FAST: deq_rocmfp4_fast(p, buf, 1); break;
         case DType::TQ1_0: deq_tq1_0(p, buf, 1); break;
         case DType::TQ2_0: deq_tq2_0(p, buf, 1); break;
+        case DType::I2_S: deq_i2_s(p, buf, 1); break;
         case DType::IQ2_S: deq_iq2_s(p, buf, 1); break;
         case DType::IQ3_XXS: deq_iq3_xxs(p, buf, 1); break;
         case DType::IQ1_S: deq_iq1_s(p, buf, 1); break;
@@ -1349,6 +1576,43 @@ f32 dot_tq1_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 
 f32 dot_ptq1_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     return ptq1_0_q8_internal(w, xq, dx, n);
+}
+
+void dot_tq2_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                     i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    tq2_0_q8_x8_internal(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+void dot_pq2_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                     i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    pq2_0_q8_x8_internal(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+void dot_q2_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    q2_0_q8_x8_internal(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+void dot_q2_0_64_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                       i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    q2_0_64_q8_x8_internal(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+void dot_i2_s_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    i2_s_q8_x8_internal(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+f32 dot_i2_s_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return i2_s_q8_internal(w, xq, dx, n);
+}
+
+f32 dot_tq2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return tq2_0_q8_internal(w, xq, dx, n);
+}
+f32 dot_pq2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return pq2_0_q8_internal(w, xq, dx, n);
+}
+f32 dot_q2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return q2_0_q8_internal(w, xq, dx, n);
+}
+f32 dot_q2_0_64_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    return q2_0_64_q8_internal(w, xq, dx, n);
 }
 
 void dot_q3_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
@@ -1407,6 +1671,7 @@ const char *dtype_name(DType t) {
         case DType::ROCMFP4_FAST: return "Q4_0_ROCMFP4_FAST";
         case DType::TQ1_0: return "TQ1_0";
         case DType::TQ2_0: return "TQ2_0";
+        case DType::I2_S: return "I2_S";
         case DType::PQ2_0: return "PQ2_0";
         case DType::PTQ1_0: return "PTQ1_0";
         case DType::Q6_0_ROCMFPX: return "Q6_0_ROCMFPX";
@@ -1449,6 +1714,7 @@ bool dtype_supported(DType t) {
         case DType::ROCMFP4_FAST:
         case DType::TQ1_0:
         case DType::TQ2_0:
+        case DType::I2_S:
         case DType::Q1_0:
         case DType::Q2_0:
         case DType::Q2_0_64:
@@ -1486,6 +1752,7 @@ int dtype_block_size(DType t) {
         case DType::TQ1_0:
         case DType::TQ2_0: return 256;
         case DType::Q1_0: return 128;
+        case DType::I2_S: return 128;
         case DType::Q2_0: return 128;
         case DType::PQ2_0: return 128;
         case DType::PTQ1_0: return 128;
@@ -1529,6 +1796,7 @@ int dtype_block_bytes(DType t) {
         case DType::IQ2_S: return 82;    // 2 + QK_K/4 + QK_K/16
         case DType::IQ1_M: return 56;    // QK_K/8 + QK_K/16 + QK_K/32
         case DType::Q1_0: return 18;     // 2 + QK1_0/8, QK1_0 = 128
+        case DType::I2_S: return 32;     // 128/4; the f32 scale is per TENSOR, in the tail
         case DType::Q2_0: return 34;     // 2 + QK2_0/4, QK2_0 = 128 (llama-dx)
         case DType::Q2_0_64: return 18;  // 2 + 64/4, upstream's own Q2_0
         case DType::IQ4_XS: return 136;

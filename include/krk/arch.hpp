@@ -425,6 +425,20 @@ struct ArchSpec {
     // matters only for a file whose full layers ARE scaled (a YaRN or linear
     // file); on a plain file the two tables are identical and nothing changes.
     bool swa_plain_rope = false;
+
+    // The gated FFN's activation is SQUARED ReLU over the gate leg, not silu:
+    // `relu(gate)^2 * up`. BitNet b1.58 trains this way (the paper replaces
+    // GELU with squared ReLU, Primer-style; Microsoft's own reference builds
+    // `inner = ffn_sub_norm(squared_relu(x1) * x3)` in gpu/model.py:195), and
+    // nemotron's expert banks are built with LLM_FFN_RELU_SQR.
+    //
+    // It was a hard-coded arch-name test in the loader before this flag, so a
+    // family that has the same graph but a name the test did not list ran
+    // `silu(gate)*up` instead: the two agree near zero and differ in the tail,
+    // which decodes as fluent-but-wrong text rather than as a failure. The
+    // dense FFN had no relu^2 arm at all, so even nemotron's DENSE layers (and
+    // every BitNet layer) ran swiglu.
+    bool ffn_relu_sqr = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

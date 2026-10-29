@@ -66,6 +66,25 @@ enum class DType : i32 {
     // zero-block skipping).
     TQ1_0 = 34,
     TQ2_0 = 35,
+    // I2_S (ggml id 36): microsoft/BitNet's OWN 2-bit ternary format, and the
+    // one the released `ggml-model-i2_s.gguf` files are built in -- so this id
+    // is the difference between "Kraken runs BitNet" and "Kraken refuses the
+    // only BitNet file in circulation".
+    //
+    // 128 values per 32-byte block, 2 bits each, code = value + 1 in {0,1,2}
+    // for {-1,0,+1}: byte i of a block holds element i in bits 7..6, i+32 in
+    // 5..4, i+64 in 3..2, i+96 in 1..0. That is the SAME planar traversal as
+    // TQ2_0's first half, with the HIGH pair first rather than the low one.
+    //
+    // The scale is the odd part: it is NOT in the block. Each I2_S tensor ends
+    // with a 32-byte tail whose first four bytes are one f32 for the WHOLE
+    // tensor, so the quantized payload is n/4 bytes and the geometry here is
+    // 128/32 with the tail read separately (GgufTensor::tail -> QuantTensor::gs).
+    // Authority: quantize_to_i2_s in microsoft/BitNet
+    // utils/convert-hf-to-gguf-bitnet.py (the reshape (n_blocks,4,32) and the
+    // <<6/<<4/<<2/<<0 pack), and CQuantizeI2S in that fork's quantization
+    // code. Refusing this id was a P1 gap: every official BitNet GGUF is I2_S.
+    I2_S = 36,
     // MXFP4 (ggml id 39): 32-value blocks of E2M1 codes behind one E8M0
     // exponent byte. The value table is doubled, so the scale is used at
     // half strength (ggml_e8m0_to_fp32_half).
@@ -291,6 +310,28 @@ void dot_ptq1_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                       i64 rstride, i64 dstride, f32 *out, i64 out_stride);
 f32 dot_tq1_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 f32 dot_ptq1_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+
+// 2-bit CODE blocks (TQ2_0, PQ2_0, Q2_0, Q2_0_64): value = (q - 1) * d, so the
+// ladder is {-1, 0, +1, +2}. Same shape as the trit kernels above -- an exact
+// integer dot per 32-value chunk, scaled by the block's d and the activation's
+// per-chunk scale -- but the magnitude rides in |v| so q = 3 stays exact.
+void dot_tq2_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+void dot_pq2_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+void dot_q2_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+void dot_q2_0_64_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                       i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+// I2_S: the same exact p/n integer kernel over 128-value planar blocks, with
+// NO per-block delta (the tensor's gs is applied by the caller).
+void dot_i2_s_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+f32 dot_i2_s_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_tq2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_pq2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_q2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_q2_0_64_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 
 void dot_q6_K_q8_sq4_x8(const u8 *w, const i8 *xq, const f32 *dx,
                         const i32 *sq4, i64 n, i64 rstride, i64 dstride,

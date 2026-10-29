@@ -5084,6 +5084,13 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
     // a family whose graph is otherwise a copy of the SwiGLU one.
     const ModelConfig &dmc = model_.cfg();
     const bool gelu = dmc.gelu_ffn;
+    // BitNet's squared ReLU. It is a THIRD activation over the same gate/up
+    // pair, and until now only the routed-expert paths had an arm for it -- a
+    // dense BitNet layer (every layer of every b1.58 file) ran silu(gate)*up.
+    // The reference builds `squared_relu(x1) * x3`: relu^2 of the GATE leg,
+    // multiplied by the up leg, so it is gelu's shape with a different
+    // function and cannot be folded into the silu epilogue.
+    const bool relu_sqr = dmc.ffn_relu_sqr;
     // BitNet's SubLN normalises this row, and an RMSNorm reads a row's
     // direction and never its size, so the store's absolute scale does not reach
     // the model. That is what makes the row-scaled store safe here, and it is
@@ -5122,7 +5129,7 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
         const void *wgu[2] = {wgate.data, wup.data};
         const i64 ngu[2] = {n_ff_, n_ff_};
         be_->gemm_group(gu, xn, wgu, wgate.type, ngu, n_embd_, 2, n,
-                        !gelu && !row_scaled, &silu_done);
+                        !gelu && !relu_sqr && !row_scaled, &silu_done);
     } else {
         gemm_w(ws_gate_, xn, wgate, n_ff_, n_embd_, n);
         gemm_w(ws_up_, xn, wup, n_ff_, n_embd_, n);
@@ -5130,6 +5137,11 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
     if (!silu_done) {
         if (gelu) {
             be_->gelu_act(ws_gate_, n * n_ff_);
+            be_->mul_act(ws_gate_, ws_up_, n * n_ff_);
+        } else if (relu_sqr) {
+            // relu(gate)^2 * up. relu_sqr_act is in place on the gate, then the
+            // up leg multiplies -- the same two launches GeGLU takes.
+            be_->relu_sqr_act(ws_gate_, n * n_ff_);
             be_->mul_act(ws_gate_, ws_up_, n * n_ff_);
         } else {
             be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_,

@@ -720,19 +720,35 @@ public:
         // eight-row sharing.
         if ((wt == DType::Q4_K || wt == DType::Q6_K || wt == DType::Q8_0 ||
              wt == DType::TQ1_0 || wt == DType::PTQ1_0 ||
+             wt == DType::TQ2_0 || wt == DType::PQ2_0 || wt == DType::Q2_0 ||
+             wt == DType::Q2_0_64 || wt == DType::I2_S ||
              wt == DType::Q2_K || wt == DType::Q3_K) &&
             n_in > 0 && (n_in % 256) == 0 && rows > 0 && vec_dot_int8()) {
             const bool q6 = wt == DType::Q6_K;
             const bool q80 = wt == DType::Q8_0;
             const bool tq1 = wt == DType::TQ1_0;
             const bool ptq1 = wt == DType::PTQ1_0;
+            // The 2-bit CODE families. They are NOT trits: the ladder is
+            // {-1,0,+1,+2}, so they get their own kernel (which stays exact for
+            // q = 3) rather than the trit one. Their d is one f16 per block and
+            // their codes carry no dmin, so like the trits they need no sum(x)
+            // sidecar.
+            const bool tq2 = wt == DType::TQ2_0;
+            // I2_S rides the same code kernel: 128-value planar blocks, no
+            // per-block delta (its one f32 is per TENSOR, folded in as gs), so
+            // like the trits it needs no sum(x) sidecar.
+            const bool i2s = wt == DType::I2_S;
+            const bool pq2 = wt == DType::PQ2_0;
+            const bool q20 = wt == DType::Q2_0;
+            const bool q20_64 = wt == DType::Q2_0_64;
             const bool q3k = wt == DType::Q3_K;
             const bool q2k = wt == DType::Q2_K;
             // Only Q4_K reads the per-32 `xs` sidecar. Q8_0 and the ternary
             // formats need no sum of the activation at all, and Q2_K/Q3_K take
             // their sums per 16-value sub-block inside the kernel -- where the
             // bytes are already in registers -- so none of them allocates it.
-            const bool none_aux = q80 || tq1 || ptq1 || q2k || q3k;
+            const bool none_aux = q80 || tq1 || ptq1 || tq2 || pq2 || q20 ||
+                                  q20_64 || i2s || q2k || q3k;
             const i64 nb = n_in / 32;
             // Owned by the CALLING thread and captured by value below. These
             // were thread_local, which looks like a free optimisation and is a
@@ -831,6 +847,21 @@ public:
                 else if (ptq1)
                     dot_ptq1_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
                                      n_in, nb, of + r * n_out + o, n_out);
+                else if (tq2)
+                    dot_tq2_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                    n_in, nb, of + r * n_out + o, n_out);
+                else if (i2s)
+                    dot_i2_s_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in,
+                                   nb, of + r * n_out + o, n_out);
+                else if (pq2)
+                    dot_pq2_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                    n_in, nb, of + r * n_out + o, n_out);
+                else if (q20)
+                    dot_q2_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                   n_in, nb, of + r * n_out + o, n_out);
+                else if (q20_64)
+                    dot_q2_0_64_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                      n_in, nb, of + r * n_out + o, n_out);
                 else if (q80)
                     dot_q8_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in,
                                    nb, of + r * n_out + o, n_out);
@@ -852,6 +883,16 @@ public:
                     return dot_tq1_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
                 if (ptq1)
                     return dot_ptq1_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (tq2)
+                    return dot_tq2_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (i2s)
+                    return dot_i2_s_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (pq2)
+                    return dot_pq2_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q20)
+                    return dot_q2_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q20_64)
+                    return dot_q2_0_64_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
                 if (q80)
                     return dot_q8_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
                 if (q6)

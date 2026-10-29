@@ -456,7 +456,11 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         nemotron_h ? 2 : (aspec.router_gating > 0 ? aspec.router_gating : 1);
     cfg_.router_sigmoid = static_cast<i32>(
         gguf_.get_i64(key(".expert_gating_func"), gating_default)) == 2;
-    cfg_.ffn_relu_sqr = nemotron_h;
+    // The FFN activation is a property of the SCHEMA, so it comes from the arch
+    // row rather than from a name test here: `nemotron_h`'s expert banks and
+    // BitNet's dense FFN both build LLM_FFN_RELU_SQR / squared_relu, and any
+    // other family that does would have had to be added to this line by hand.
+    cfg_.ffn_relu_sqr = aspec.ffn_relu_sqr;
     // Tri-state: -1 keeps the engine's legacy always-normalize for files that
     // do not declare it (see ModelConfig::expert_w_norm).
     cfg_.expert_w_norm =
@@ -1239,6 +1243,30 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             q.n_out = n_out;
             weight_bytes_ += t->n_elements * 2;
             return with_sidecar_scale(q, name);
+        }
+        // I2_S: the one format whose scale is neither in the block nor a
+        // `<tensor>.scale` sidecar, but a 32-byte tail appended to the TENSOR.
+        // It goes into the same per-tensor field every other scaled weight
+        // uses (gs), so gemm_w folds it in once, above every projection --
+        // and a format that forgot it would run a whole model 100x too small
+        // while looking perfectly healthy, which is exactly the failure this
+        // field exists to prevent.
+        if (t->type == DType::I2_S) {
+            QuantTensor q = upload_raw(t, DType::I2_S);
+            // gguf.cpp has already checked that the tail is inside the mapping.
+            f32 gs = 1.0f;
+            if (t->tail && t->tail_bytes >= 4) gs = reinterpret_cast<const f32 *>(t->tail)[0];
+            if (!(gs > 0.0f) || !std::isfinite(gs)) {
+                if (e)
+                    *e = "I2_S weight '" + name + "' has a scale of " +
+                         std::to_string(static_cast<double>(gs)) +
+                         " in its 32-byte tail; a zero or non-finite scale is a "
+                         "corrupt file, not a weight";
+                return {};
+            }
+            q.gs = gs;
+            if (q.gs != 1.0f && q.n_in > max_scaled_in_) max_scaled_in_ = q.n_in;
+            return q;
         }
         return with_sidecar_scale(upload_raw(t, t->type), name);
     };

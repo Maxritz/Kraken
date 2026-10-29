@@ -68,6 +68,13 @@ struct GgufTensor {
     const u8 *data = nullptr;
     i64 n_elements = 0;
     size_t n_bytes = 0;
+    // I2_S stores its one scale in a 32-byte tail AFTER the payload, so the
+    // payload size (`n_bytes`) deliberately excludes it and this points at it.
+    // Null for every other type. The loader reads the f32 at [0..3] into
+    // QuantTensor::gs; a missing tail is a corrupt file, refused in gguf.cpp
+    // rather than read past the mapping.
+    const u8 *tail = nullptr;
+    size_t tail_bytes = 0;
     // Which shard `data` points into. 0 for a single-file model. The weight
     // pull path needs this: it converts a pointer back to a file offset with
     // `src - shard_base`, and each shard has its own base.

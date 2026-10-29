@@ -155,6 +155,35 @@ constexpr ArchSpec phi2_spec() {
     return s;
 }
 
+// ---- bitnet-b1.58 ---------------------------------------------------------
+// BitNet b1.58 is llama's block with two graph differences:
+//
+//   * SQUARED ReLU in the FFN, `relu(gate)^2 * up`. The BitNet paper replaces
+//     the activation with squared ReLU (Primer-style) for every b1.58 model,
+//     and Microsoft's own reference graph says so directly:
+//     `inner = self.ffn_sub_norm(squared_relu(x1) * x3)` (microsoft/BitNet
+//     gpu/model.py:165-195). llama.cpp's src/models/bitnet.cpp passes
+//     LLM_FFN_SILU there -- a fidelity gap in that port, not a second
+//     convention in the files: the weights are trained against relu^2.
+//   * a SECOND RMSNorm per sub-block (SubLN) on the sub-block's INTERMEDIATE
+//     output: `attn_norm -> attn -> attn_sub_norm -> wo` and
+//     `ffn_norm -> gate/up -> relu^2 -> ffn_sub_norm -> down`
+//     (llama.cpp src/models/bitnet.cpp:59-63,110-118). Those two tensors are
+//     read when present (LayerWeights::attn_sub_norm), so this row needs no
+//     flag for them -- but a file that lacks them is not a BitNet file, and
+//     the fixture in the suite carries both.
+//
+// Everything else is llama's: RMSNorm, NORM rope pairing, no biases, GQA. The
+// head is TIED on the b1.58 files (llama.cpp builds the logits straight from
+// `model.tok_embd`, with no `output.weight`), which the loader already handles
+// from the tensor's absence.
+constexpr ArchSpec bitnet_spec() {
+    ArchSpec s{"bitnet-b1.58", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "bitnet", "", false, false, false, false};
+    s.ffn_relu_sqr = true;
+    return s;
+}
+
 // MPT: LayerNorm with a bias, a fused `attn_qkv` WITH a bias, an ungated GELU
 // MLP with biases on both projections, and ALiBi in place of any position
 // embedding -- `attention.max_alibi_bias` from the file, with an OPTIONAL
@@ -417,6 +446,7 @@ constexpr ArchSpec kTable[] = {
     gptneox_spec(),
     gptj_spec(),
     phi2_spec(),
+    bitnet_spec(),
     mpt_spec(),
     bloom_spec(),
     falcon_spec(),
@@ -910,10 +940,15 @@ constexpr ArchSpec kTable[] = {
      false, false, false, false},
     // Hybrid Mamba/attention stacks: the mamba blocks are not the gated delta
     // net this engine implements (different recurrence, different state).
-    {"nemotron_h", ArchShape::Recurrent, ArchSupport::Yes, ArchRole::Target,
-     "nemotron_h",
-     "",
-     false, false, false, false},
+    [] {
+        ArchSpec s{"nemotron_h", ArchShape::Recurrent, ArchSupport::Yes,
+                   ArchRole::Target, "nemotron_h", "", false, false, false,
+                   false};
+        // Its expert banks are built with LLM_FFN_RELU_SQR (gated by
+        // relu^2, not silu). See ArchSpec::ffn_relu_sqr.
+        s.ffn_relu_sqr = true;
+        return s;
+    }(),
     // Nemotron MoE: alternating Mamba-2 SSM blocks + shared experts.
     // The SSM blocks are loaded by Model::load - the per-layer ssm_* upload,
     // keyed on the tensors a layer actually carries - and run by the mamba2_ssd
@@ -922,10 +957,13 @@ constexpr ArchSpec kTable[] = {
     //   - Even layers: ssm_in, ssm_out, ssm_conv1d, ssm_a, ssm_d, ssm_dt, ssm_norm
     //   - Odd layers: ffn_up_shexp, ffn_down_shexp (shared experts, NVFP4)
     // This is different from GDN: no gate, simpler SSM, different tensor layout.
-    {"nemotron_h_moe", ArchShape::RecurrentMoe, ArchSupport::Yes, ArchRole::Target,
-     "nemotron_h",
-     "",
-     false, false, false, false, false, true},
+    [] {
+        ArchSpec s{"nemotron_h_moe", ArchShape::RecurrentMoe, ArchSupport::Yes,
+                   ArchRole::Target, "nemotron_h", "", false, false, false,
+                   false, false, true};
+        s.ffn_relu_sqr = true;
+        return s;
+    }(),
     // ---- speculative head sets -------------------------------------------
     // An MTP head set, extracted by tools/mtp_extract.py: the `mtp.*` tensors a
     // checkpoint ships beside its own weights -- a norm pair, two input
