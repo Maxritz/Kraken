@@ -942,14 +942,14 @@ constexpr ArchSpec kTable[] = {
     // relu-weighting and top-k -- which is a HOST f32 reference, so the
     // compressed path answers on backends that implement the two-row-family
     // attention op (the CPU reference) and is refused BY CAPABILITY elsewhere.
-    // What is still missing on this row: Engram conditional memory and the
-    // 4-wide hyper-connections. A dense-core file (all ratios 0) is the same
-    // graph without the second row family, and test_dsv4_whole_graph pins it.
-    {"deepseek4", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target, "deepseek4",
-     "shared-latent MLA, the grouped output, the attention sinks, the tid2eid "
-     "hash route and the CSA/HCA compressors with the lightning indexer run on "
-     "the CPU reference; Engram and the Sinkhorn hyper-connections do not, and "
-     "a file carrying either is refused by name rather than run without it",
+    // The 4-wide Sinkhorn hyper-connections run too: the loader reads
+    // hc_{attn,ffn}_{fn,base,scale}, the engine drives the lane stack with the
+    // (2+hc)*hc mixer, the doubly-stochastic scatter and the head's own mixer,
+    // and test_dsv41_sinkhorn_stack pins the whole residual end to end. A
+    // dense-core file (all ratios 0) is the same graph without the second row
+    // family, and test_dsv4_whole_graph pins it.
+    {"deepseek4", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "deepseek4",
+     "",
      /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
@@ -961,37 +961,29 @@ constexpr ArchSpec kTable[] = {
     // for this family, which is `deepseek41` rather than `deepseek4`. A file
     // carrying the V4.1 name was previously "unknown architecture" -- the
     // least useful answer available, because the reasons it cannot run are
-    // specific and already enumerated on the entry above (compressed
-    // attention, the sparse indexer, attn_sinks, hyper-connections). Mapping
-    // the name onto the implementation inherits every one of those refusals
-    // instead of replacing them with a shrug.
+    // specific -- so the name maps onto the implementation.
     //
-    // What it does NOT cover is Engram (a token-hash conditional-memory lookup,
-    // 196 B parameters) and the 4-wide Sinkhorn hyper-connections, whose `hc_*`
-    // tensors are a DIFFERENT mixer from the one qwen4exp runs.
+    // What V4.1 adds over V4 now runs as well:
+    //   * the Sinkhorn hyper-connections (hc_{attn,ffn}_{fn,base,scale}): the
+    //     (2+hc)*hc split with the doubly-stochastic comb, driven by
+    //     Engine::hc_sk_enter/hc_sk_leave. src/hc.cpp holds the algebra and
+    //     test_dsv4_sinkhorn_mixer pins it; the loader, the lane-stack wiring,
+    //     the single-pass lag (the attention reads the PREVIOUS layer's FFN
+    //     pre-mix, the first layer the identity) and the no-head collapse are
+    //     pinned by test_dsv41_sinkhorn_stack.
+    //   * Engram: Engine::engram_block runs the rolling n-gram hash
+    //     (src/engram.cpp), gathers the shared per_layer_token_embd rows out of
+    //     the mapping, projects them through engram_kv and adds the gated value
+    //     to every lane. test_engram_hash pins the hash; the same stack test
+    //     pins the block, and measures that turning it off moves the logits.
     //
-    // Both now have their ALGEBRA implemented and pinned, with the loader and
-    // the forward still to wire:
-    //   * hc_*: src/hc.cpp's hc_sinkhorn_* (the (2+hc)*hc split, the doubly
-    //     stochastic sinkhorn in the reference's order, the dst-major/file
-    //     index transposition) -- test_dsv4_sinkhorn_mixer.
-    //   * engram_*: src/engram.cpp's rolling n-gram hash, the shared
-    //     per_layer_tok_embd gather and the dead-shift/pad rule --
-    //     test_engram_hash.
-    // What is missing is the part that makes them RUN in a forward: the loader
-    // does not read the tensors yet, so a file carrying either is still refused
-    // by name, and the lane stack for this family is not wired. A checkpoint
-    // that carries either is refused by name through the gap map rather than
-    // loaded with the block skipped. A dense-core file -- every ratio 0, no
-    // hc_*/engram_* -- loads and generates end to end
-    // (`test_pending_model_fixtures` builds one from this row's tensor list).
-    {"deepseek41", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target,
+    // Neither is a name-blocker any more. What still refuses is a file that
+    // declares one and does not carry it (a missing hc_* tensor, an Engram
+    // layer with no token_map), and a backend without the sinkhorn ops, both
+    // by name at load/init.
+    {"deepseek41", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target,
      "deepseek4",
-     "recognised as the deepseek4 graph: shared-latent MLA, the grouped "
-     "output, the attention sinks, the tid2eid hash route and the CSA/HCA "
-     "compressors with the lightning indexer all run; Engram conditional memory "
-     "and the 4-wide hyper-connections do not, so a V4.1 checkpoint that "
-     "carries hc_* or engram_* tensors is refused by name, not mis-loaded",
+     "",
      /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
@@ -1275,8 +1267,9 @@ constexpr ArchSpec kTable[] = {
     // fewer on it.
     {"diffuse", ArchShape::Diffusion, ArchSupport::No, ArchRole::Target, "diffuse",
      "the block-diffusion sampler runs (src/diffusion.cpp, pinned by "
-     "test_diffusion_sampler); the diffuse.* loader schema, the group-limited "
-     "expert routing with its bias, and the cacheless bidirectional forward in "
+     "test_diffusion_sampler) and so does the group-limited expert selection "
+     "its Block Routing needs (krk/moe_route.hpp, test_moe_group_routing); the "
+     "diffuse.* loader schema and the cacheless bidirectional forward in "
      "Engine::generate are not implemented yet (docs/LLaDA.md)",
      true, false, false, false},
 };
@@ -1324,26 +1317,17 @@ constexpr GapTensor kGapTensors[] = {
     // over the attention result before wo.
     {"attn_gate.weight", "an attention output gate (attn_gate)", true,
      GapTensor::Served::ByAttnGateFlag},
-    // DeepSeek-V4.1's four-lane Sinkhorn hyper-connections. These names are
-    // V4.1's own and are NOT qwen4exp's mixer, which this engine does load
-    // (hc_attn_{norm,down,up,inject}), so the needles are the six tensor stems
-    // rather than a bare `hc_` prefix. A file carrying them is a residual the
-    // whole stack runs through: loading it without the block would decode a
-    // model whose residual is not the one it was trained with, which is the
-    // "mis-loaded" failure the deepseek41 row promised not to make. Measured
-    // before this entry existed: the same fixture loaded with model.load=1 and
-    // no blocker at all (`test_pending_model_fixtures`, ds41-hc arm).
-    {"hc_attn_fn.", "Sinkhorn hyper-connections (hc_attn_fn/hc_ffn_fn)", false},
-    {"hc_ffn_fn.", "Sinkhorn hyper-connections (hc_attn_fn/hc_ffn_fn)", false},
-    {"hc_attn_base.", "Sinkhorn hyper-connections (hc_attn_base/hc_ffn_base)", false},
-    {"hc_ffn_base.", "Sinkhorn hyper-connections (hc_attn_base/hc_ffn_base)", false},
-    {"hc_attn_scale.", "Sinkhorn hyper-connections (hc_attn_scale/hc_ffn_scale)", false},
-    {"hc_ffn_scale.", "Sinkhorn hyper-connections (hc_attn_scale/hc_ffn_scale)", false},
-    // Engram: a token-hash conditional-memory lookup whose result is injected
-    // into the residual. V4.1-Flash usually ships the tables as their own GGUF,
-    // but a repack that inlines them is still a V4.1 file, and the lookup is
-    // part of the layer it sits in -- not a side table the engine may skip.
-    {"engram_", "Engram conditional memory (engram_*)", false},
+    // DeepSeek-V4.1's Sinkhorn hyper-connections and Engram used to be named
+    // here, and their removal is the point of this comment: a refusal for a
+    // feature the engine runs is worse than no entry at all, because it sends
+    // the next reader looking for code that already exists. Both are wired
+    // now -- the loader reads hc_{attn,ffn}_{fn,base,scale} and
+    // engram_{kv,gate}, Engine::hc_sk_enter/hc_sk_leave drive the lane stack
+    // (including the single-pass lag and the no-head collapse) and
+    // Engine::engram_block runs the hash/gather/gate -- and both are pinned
+    // end to end by test_dsv41_sinkhorn_stack, which also measures that each
+    // knob moves the logits. A backend without the sinkhorn ops is refused by
+    // CAPABILITY at Engine::init, not by a tensor name.
     // SERVED, not gaps: attn_v_exps/attn_v_gate are MoVA, implemented by
     // Engine::mova_value (see the k2-horizon row). They were the row's whole
     // stated reason for No, and a refusal for a feature the engine now runs is
@@ -1376,8 +1360,14 @@ constexpr GapTensor kGapTensors[] = {
     // under the plain top-k rule, silently.
     {"moe_gate_bias.weight", "a routed-expert selection bias (moe_gate_bias)",
      false},
-    {"moe_experts_gate.weight", "group-limited expert routing (moe_gate/n_group)",
-     false},
+    // A FUSED expert bank (one 3-D tensor holding every expert's gate rows).
+    // The loader pages experts by their own per-expert tensors, so this layout
+    // is a gap -- and only the layout is: the group-limited SELECTION rule the
+    // entry used to name with it is implemented now (krk/moe_route.hpp,
+    // Engine::moe_ffn's `eligible` mask, pinned by test_moe_group_routing), so
+    // a file that declares `expert_group_count` routes correctly instead of
+    // being refused for the rule.
+    {"moe_experts_gate.weight", "a fused expert bank (moe_experts_gate)", false},
 };
 
 // Head tensors that can ride along inside a target. Not gaps: the model runs,

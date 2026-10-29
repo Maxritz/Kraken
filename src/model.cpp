@@ -641,6 +641,41 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (v > mx) mx = v;
         if (mx > 0) cfg_.n_expert_used = mx;
     }
+    // Group-limited selection. Read generically -- the keys are llama.cpp's
+    // (`expert_group_count` / `expert_group_used_count`) and every family that
+    // groups its experts declares them -- and validated here rather than at the
+    // first route: a partition that does not divide is not a partition, and a
+    // router that silently used `n_expert / n_group` on 257 experts would leave
+    // one expert unreachable and a different set selected.
+    cfg_.n_expert_group = static_cast<i32>(
+        gguf_.get_i64(key(".expert_group_count"), 0));
+    cfg_.n_expert_group_used = static_cast<i32>(
+        gguf_.get_i64(key(".expert_group_used_count"), 0));
+    if (cfg_.n_expert_group > 1) {
+        if (cfg_.n_expert <= 0 || cfg_.n_expert_group > cfg_.n_expert ||
+            cfg_.n_expert % cfg_.n_expert_group != 0 ||
+            cfg_.n_expert_group_used <= 0 ||
+            cfg_.n_expert_group_used > cfg_.n_expert_group) {
+            if (err)
+                *err = "arch '" + a + "': expert_group_count=" +
+                       std::to_string(cfg_.n_expert_group) + " over " +
+                       std::to_string(cfg_.n_expert) + " expert(s), used=" +
+                       std::to_string(cfg_.n_expert_group_used) +
+                       " is not a partition (the count must divide the experts, "
+                       "and the used count must be within it)";
+            return false;
+        }
+    } else if (cfg_.n_expert_group_used > 0) {
+        // Used without a count is a half-declared grouping: honouring it would
+        // mean one group, so the file would route plain top-k while claiming
+        // otherwise.
+        if (err)
+            *err = "arch '" + a + "': expert_group_used_count is " +
+                   std::to_string(cfg_.n_expert_group_used) +
+                   " but expert_group_count is missing, so there is no "
+                   "partition to select from";
+        return false;
+    }
     if (const std::vector<i32> *ff_arr =
             gguf_.get_i32_array(key(".expert_feed_forward_length"))) {
         i32 mx = 0;
@@ -1020,6 +1055,142 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (const std::vector<i32> *cr =
                     gguf_.get_i32_array(key(".attention.compress_ratios"))) {
                 cfg_.qsa_ratio = *cr;
+            }
+        }
+    }
+    // ---- DeepSeek-V4.1: the Sinkhorn hyper-connections -------------------
+    // `hyper_connection.count` selects the LANE STACK (it is a different MIXER
+    // from qwen4exp's, not a different count), so it sets hc_sinkhorn rather
+    // than reusing the low-rank geometry the block above reads. Which mixer a
+    // file carries is decided by what its metadata says: a file with
+    // `sinkhorn_iterations` has V4.1's, a file with `low_rank` has qwen4exp's,
+    // and a file with neither declares lanes it never uses -- a shape that
+    // would run as an identity mixer and decode, so it is refused.
+    if (aspec.dsv4) {
+        const i64 hc_count = gguf_.get_i64(key(".hyper_connection.count"), 0);
+        const i64 sink_iters =
+            gguf_.get_i64(key(".hyper_connection.sinkhorn_iterations"), 0);
+        if (hc_count > 0 && sink_iters > 0) {
+            cfg_.hc = true;
+            cfg_.hc_sinkhorn = true;
+            cfg_.hc_n = static_cast<i32>(hc_count);
+            cfg_.hc_sinkhorn_iters = static_cast<i32>(sink_iters);
+            cfg_.hc_eps = static_cast<f32>(
+                static_cast<f32>(gguf_.get_f64(key(".hyper_connection.epsilon"), 0.0)));
+            cfg_.hc_single_pass =
+                gguf_.get_i64(key(".hyper_connection.single_pass"), 0) != 0;
+            if (cfg_.hc_n <= 1 || cfg_.hc_sinkhorn_iters <= 0 || cfg_.hc_eps <= 0.0f) {
+                if (err)
+                    *err = "arch '" + a + "': hyper_connection.count=" +
+                           std::to_string(cfg_.hc_n) + ", sinkhorn_iterations=" +
+                           std::to_string(cfg_.hc_sinkhorn_iters) + ", epsilon=" +
+                           std::to_string(static_cast<double>(cfg_.hc_eps)) +
+                           " is not a Sinkhorn mixer (count > 1, iterations > 0, "
+                           "epsilon > 0 are all required)";
+                return false;
+            }
+            // No head mixer is a DECLARED absence in V4.1, not a missing tensor:
+            // the file that carries hc_head_fn uses it, the file that does not
+            // collapses with the last FFN's pre-mix. Decided from the tensors
+            // rather than from another metadata key, so a repack that adds the
+            // head is read correctly without a schema change.
+            const bool has_head_tensor =
+                gguf_.tensor("hc_head_fn.weight") != nullptr ||
+                gguf_.tensor("blk.0.hc_head_fn.weight") != nullptr;
+            cfg_.hc_no_head = !has_head_tensor;
+            // The two ways of saying it must agree. single_pass MEANS "no head
+            // mixer, lagged pre-mix" in the reference graph (llama-hparams.h:
+            // "DeepSeek-V4.1 DSpark draft: lagged pre-mix, no hc_head"), and a
+            // file that claims it while carrying the head's tensors would run
+            // one of the two graphs and silently ignore the other's weights.
+            if (cfg_.hc_single_pass && has_head_tensor) {
+                if (err)
+                    *err = "arch '" + a +
+                           "': hyper_connection.single_pass is set but the file "
+                           "carries hc_head_fn, so the head mixer would be "
+                           "loaded and never run";
+                return false;
+            }
+        } else if (hc_count > 0) {
+            if (err)
+                *err = "arch '" + a + "': hyper_connection.count is " +
+                       std::to_string(hc_count) +
+                       " but no sinkhorn_iterations and no low_rank, so the "
+                       "file declares lanes no mixer can drive";
+            return false;
+        }
+        // ---- Engram ------------------------------------------------------
+        // V4.1's Engram is the PLE hash WITHOUT the conv module: the same
+        // n-gram machinery, a shared `per_layer_tok_embd` table, and per-layer
+        // engram_kv/engram_gate instead of ple_* projections. So it reuses the
+        // ple_* metadata slots and skips the conv requirement that the qwen4exp
+        // block above imposes.
+        const std::vector<i32> *elayers = gguf_.get_i32_array(key(".ple.layers"));
+        if (elayers && !elayers->empty()) {
+            cfg_.ple = true;
+            cfg_.ple_layers = *elayers;
+            cfg_.ple_ngram = static_cast<i32>(gguf_.get_i64(key(".ple.ngram_size"), 0));
+            cfg_.ple_heads_per_ngram =
+                static_cast<i32>(gguf_.get_i64(key(".ple.heads_per_ngram"), 0));
+            cfg_.ple_head_dim = static_cast<i32>(
+                gguf_.get_i64(key(".embedding_length_per_layer_input"), 0));
+            if (!gguf_.get_i64_array(key(".ple.layer_multipliers"),
+                                     &cfg_.ple_multipliers))
+                cfg_.ple_multipliers.clear();
+            if (!gguf_.get_i64_array(key(".ple.head_offsets"),
+                                     &cfg_.ple_head_offsets))
+                cfg_.ple_head_offsets.clear();
+            if (!gguf_.get_i64_array(key(".ple.head_vocab_sizes"),
+                                     &cfg_.ple_head_vocab_sizes))
+                cfg_.ple_head_vocab_sizes.clear();
+            cfg_.engram_pad_id = gguf_.get_i64(key(".engram.pad_token_id"), 0);
+            const std::vector<i32> *map = gguf_.get_i32_array(key(".engram.token_map"));
+            if (map) {
+                cfg_.engram_token_map.assign(map->begin(), map->end());
+            } else {
+                // u32 in the file can exceed i32; read them wide.
+                std::vector<i64> wide;
+                if (gguf_.get_i64_array(key(".engram.token_map"), &wide))
+                    for (i64 v : wide) cfg_.engram_token_map.push_back((u32)v);
+            }
+            const i32 n_cols = (cfg_.ple_ngram - 1) * cfg_.ple_heads_per_ngram;
+            if (cfg_.ple_ngram < 2 || cfg_.ple_heads_per_ngram <= 0 ||
+                cfg_.ple_head_dim <= 0 || n_cols <= 0 ||
+                static_cast<i32>(cfg_.ple_head_offsets.size()) < n_cols ||
+                static_cast<i32>(cfg_.ple_head_vocab_sizes.size()) < n_cols ||
+                static_cast<i32>(cfg_.ple_multipliers.size()) < cfg_.ple_ngram ||
+                cfg_.engram_token_map.empty() ||
+                cfg_.engram_pad_id < 0 ||
+                cfg_.engram_pad_id >=
+                    static_cast<i64>(cfg_.engram_token_map.size())) {
+                if (err)
+                    *err = "arch '" + a + "': the Engram metadata is incomplete or "
+                           "inconsistent (needs ngram>=2, heads_per_ngram, "
+                           "embedding_length_per_layer_input, one multiplier per "
+                           "shift, one offset and bucket count per column, a "
+                           "non-empty token_map, and pad_token_id inside it)";
+                return false;
+            }
+            for (size_t k = 0; k < cfg_.ple_layers.size(); k++) {
+                const i32 l = cfg_.ple_layers[k];
+                if (l < 0 || l >= cfg_.n_layer || (k > 0 && l <= cfg_.ple_layers[k - 1])) {
+                    if (err)
+                        *err = "arch '" + a + "': Engram layer " + std::to_string(l) +
+                               " is out of range or out of order (the list must be "
+                               "increasing, one module per named layer)";
+                    return false;
+                }
+            }
+            for (i32 c = 0; c < n_cols; c++) {
+                const i64 pr = cfg_.ple_head_vocab_sizes[static_cast<size_t>(c)];
+                const i64 off = cfg_.ple_head_offsets[static_cast<size_t>(c)];
+                if (pr < 2 || off < 0 || off + pr > 2147483647LL) {
+                    if (err)
+                        *err = "arch '" + a + "': Engram column " + std::to_string(c) +
+                               " has a bucket count/offset outside what an int32 row "
+                               "id can address";
+                    return false;
+                }
             }
         }
     }
@@ -2015,6 +2186,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         }
         ple_table_ = t->data;
         ple_table_type_ = t->type;
+        ple_table_rows_ = n_rows;
         // BYTES for one row, in the file's own type: the gather reads the row
         // straight out of the mapping, so an f16 or quantized table moves
         // half (or a quarter) as many bytes as an f32 one and the stride has
@@ -2027,6 +2199,29 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                  static_cast<unsigned long long>(n_rows), cfg_.ple_head_dim,
                  static_cast<unsigned long long>(ple_row_bytes_),
                  (cfg_.ple_ngram - 1) * cfg_.ple_heads_per_ngram);
+    }
+
+    // ---- V4.1's head mixer ---------------------------------------------
+    // Model-level, like qwen4exp's: {hc*n_embd -> hc}, one bias and one scale.
+    // The absence of hc_head_fn is what the metadata block turned into
+    // hc_no_head, so a file that declares it and does not carry it is refused
+    // there rather than loaded into a null.
+    if (cfg_.hc_sinkhorn && !cfg_.hc_no_head) {
+        std::string e;
+        hc_head_fn_ = upload_weight("hc_head_fn.weight", false, &e);
+        if (!hc_head_fn_.present()) {
+            if (err) *err = "hc_head_fn.weight is missing: " + e;
+            return false;
+        }
+        hc_head_base_ = upload_f32("hc_head_base.weight");
+        hc_head_scale_ = upload_f32("hc_head_scale.weight");
+        if (!hc_head_base_ || !hc_head_scale_) {
+            if (err)
+                *err = "hc_head_base/hc_head_scale are missing, so the head "
+                       "mixer's affine is undefined";
+            return false;
+        }
+        lp.mark("  hc_head upload");
     }
 
     lp.mark("token_embd + output head");
@@ -3300,8 +3495,43 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             KRK_WARN("layer %d has no attention tensors; running as a pure FFN block", l);
         }
 
+        // ---- DeepSeek-V4.1: the Sinkhorn mixers ---------------------------
+        // A different mixer from qwen4exp's below, so it is a different branch.
+        // The three tensors per sub-block are all the mixer needs: `fn` emits
+        // (2+hc)*hc numbers, `base` gives each one a bias and `scale` a gain.
+        if (cfg_.hc_sinkhorn) {
+            const i64 wide = static_cast<i64>(cfg_.n_embd) * cfg_.hc_n;
+            const i64 mix = (2 + static_cast<i64>(cfg_.hc_n)) * cfg_.hc_n;
+            L.hc_attn_fn = need(blk_key("blk.%d.hc_attn_fn.weight", l));
+            L.hc_ffn_fn = need(blk_key("blk.%d.hc_ffn_fn.weight", l));
+            L.hc_attn_base = upload_f32(blk_key("blk.%d.hc_attn_base.weight", l));
+            L.hc_ffn_base = upload_f32(blk_key("blk.%d.hc_ffn_base.weight", l));
+            L.hc_attn_scale = upload_f32(blk_key("blk.%d.hc_attn_scale.weight", l));
+            L.hc_ffn_scale = upload_f32(blk_key("blk.%d.hc_ffn_scale.weight", l));
+            // A file that carries BOTH mixers is not a superset -- the residual
+            // is one thing, so refuse rather than pick one.
+            if (gguf_.tensor(blk_key("blk.%d.hc_attn_down.weight", l)) != nullptr) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " carries both hc_attn_down (qwen4exp's low-rank mixer) "
+                           "and hc_attn_fn (V4.1's Sinkhorn mixer); a layer has "
+                           "one residual mixer, not two";
+                return false;
+            }
+            if (!L.hc_attn_base || !L.hc_ffn_base || !L.hc_attn_scale ||
+                !L.hc_ffn_scale || L.hc_attn_fn.n_in != wide ||
+                L.hc_attn_fn.n_out != mix || L.hc_ffn_fn.n_in != wide ||
+                L.hc_ffn_fn.n_out != mix) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           ": Sinkhorn hyper-connection tensors disagree with " +
+                           std::to_string(wide) + " -> " + std::to_string(mix) +
+                           " (" + std::to_string(cfg_.hc_n) + " lanes)";
+                return false;
+            }
+        }
         // ---- qwen4exp: the two hyper-connection mixers ---------------------
-        if (cfg_.hc) {
+        if (cfg_.hc && !cfg_.hc_sinkhorn) {
             L.hc_attn_norm = upload_f32(blk_key("blk.%d.hc_attn_norm.weight", l));
             L.hc_attn_down = need(blk_key("blk.%d.hc_attn_down.weight", l));
             L.hc_attn_up = need(blk_key("blk.%d.hc_attn_up.weight", l));
@@ -3327,6 +3557,48 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                            " lanes)";
                 return false;
             }
+        }
+        // ---- Engram (V4.1): conditional memory ---------------------------
+        // Only on the layers `ple.layers` names. `engram_kv` maps the gathered
+        // n-gram rows (n_cols * ple_head_dim wide) to (hc+1) blocks of n_embd:
+        // the first `hc` are the per-lane keys the gate scores against, the
+        // last is the value that gets added. `engram_gate` is [n_embd, hc].
+        // Gated on the V4.1 mixer as well as the layer list: qwen4exp's PLE
+        // layers reuse the SAME `ple.layers` metadata and are NOT Engram
+        // layers, so without this a qwen4exp file with a PLE block would be
+        // asked for engram_kv. (Measured: test_qwen4exp_schema's 4/5.)
+        if (cfg_.hc_sinkhorn && cfg_.dsv4_engram_layer(l)) {
+            L.engram_kv = need(blk_key("blk.%d.engram_kv.weight", l));
+            L.engram_gate = upload_f32(blk_key("blk.%d.engram_gate.weight", l));
+            const i64 n_cols =
+                (static_cast<i64>(cfg_.ple_ngram) - 1) * cfg_.ple_heads_per_ngram;
+            const i64 rows = n_cols * cfg_.ple_head_dim;
+            const i64 want_out =
+                static_cast<i64>(cfg_.n_embd) * (cfg_.hc_n + 1);
+            const GgufTensor *gt =
+                gguf_.tensor(blk_key("blk.%d.engram_gate.weight", l));
+            if (L.engram_kv.n_in != rows || L.engram_kv.n_out != want_out ||
+                !L.engram_gate || !gt ||
+                gt->n_elements !=
+                    static_cast<i64>(cfg_.n_embd) * cfg_.hc_n) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           ": Engram tensors disagree with the declared geometry "
+                           "(engram_kv should be " + std::to_string(rows) + " -> " +
+                           std::to_string(want_out) + ", engram_gate " +
+                           std::to_string(cfg_.n_embd) + " -> " +
+                           std::to_string(cfg_.hc_n) + ")";
+                return false;
+            }
+        } else if (cfg_.hc_sinkhorn &&
+                   gguf_.tensor(blk_key("blk.%d.engram_kv.weight", l)) != nullptr) {
+            // A layer carrying Engram tensors but NOT named in ple.layers would
+            // run with the block skipped -- the silent drop this engine refuses.
+            if (err)
+                *err = "layer " + std::to_string(l) +
+                       " carries engram_kv but is not in ple.layers, so its "
+                       "conditional memory would be skipped";
+            return false;
         }
         // A layer's QSA indexer is keyed on its own compress ratio.
         if (cfg_.qsa && l < static_cast<i32>(cfg_.qsa_ratio.size()))
@@ -3358,7 +3630,10 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 return false;
             }
         }
-        if (cfg_.ple) {
+        // qwen4exp's PLE block: a conv module plus two projections. V4.1's
+        // Engram reuses the ple_* METADATA but has engram_kv/engram_gate
+        // instead, so it must not be asked for the conv it does not ship.
+        if (cfg_.ple && !cfg_.hc_sinkhorn) {
             for (i32 pl : cfg_.ple_layers) {
                 if (pl != l) continue;
                 L.ple = true;

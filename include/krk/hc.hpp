@@ -143,6 +143,15 @@ void hc_sinkhorn_split(f32 *pre, f32 *post, f32 *comb, const f32 *mixes,
 // lanes'[d] = block_out * post[d] + sum_s lanes[s] * comb[d][s], for every token.
 // `lanes_in` and `lanes_out` are [n, hc, n_embd] and MAY NOT alias: every lane
 // of the output reads every lane of the input.
+// The HEAD's pre-mix, which is the same three steps the sub-block mixer
+// applies to the first hc numbers of its output, with its own weights:
+//   out[c] = sigmoid(mixes[c] * scale[0] + base[c]) + eps
+// `scale` is one value (the reference views a [1] tensor), hence scale[0] only.
+// Used when the file carries hc_head_fn; a single-pass file has none and
+// collapses with the last FFN's pre-mix instead.
+void hc_head_pre(f32 *out, const f32 *mixes, const f32 *scale, const f32 *base,
+                 i32 hc, f32 eps);
+
 void hc_sinkhorn_post(f32 *lanes_out, const f32 *lanes_in, const f32 *block_out,
                       const f32 *post, const f32 *comb, i32 n,
                       const HcSinkhornGeometry &g);

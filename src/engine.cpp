@@ -2,6 +2,9 @@
 // contiguous KV cache, streaming output and stop-string handling.
 #include "krk/engine.hpp"
 #include "krk/mova.hpp"
+#include "krk/engram.hpp"
+#include "krk/moe_route.hpp"
+#include "krk/hc.hpp"
 #include "krk/dsv4_compress.hpp"
 #include "krk/arch.hpp"
 #include "krk/dflash.hpp"
@@ -903,6 +906,21 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     }
     if (model_.cfg().hc) {
         const ModelConfig &hcc = model_.cfg();
+        // V4.1's mixer is not qwen4exp's, so its capability is asked
+        // separately: a backend with hc_mix but no sinkhorn split would mix
+        // the lanes with the wrong function and still decode.
+        if (hcc.hc_sinkhorn) {
+            if (!be_->hc_sinkhorn_supported()) {
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': this backend has no hyper-connection SINKHORN "
+                           "kernels, so the V4.1 lane stack cannot be run on it";
+                return false;
+            }
+            // `low_rank` is the MIXER's width here -- (2+hc)*hc, the fn
+            // projection's output -- not a bottleneck. Nothing downsamples.
+            hc_ = HcGeometry{hcc.n_embd, hcc.hc_n, (2 + hcc.hc_n) * hcc.hc_n};
+        } else {
         if (!be_->hc_supported()) {
             if (err)
                 *err = "arch '" + hcc.arch +
@@ -937,7 +955,8 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // The per-layer embedding block. It writes into the lane stack, so it
         // only makes sense on this family, and its gathered row has to be as
         // wide as the stream its key projection reads.
-        if (hcc.ple) {
+        }   // end of the qwen4exp mixer's checks
+        if (hcc.ple && !hcc.hc_sinkhorn) {
             ple_ = PleConfig{};
             ple_.ngram = hcc.ple_ngram;
             ple_.heads_per_ngram = hcc.ple_heads_per_ngram;
@@ -985,6 +1004,64 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                      ple_.n_heads(), ple_.head_dim, ple_.ngram,
                      ple_.conv_kernel, ple_.ngram,
                      static_cast<long long>(ple_hist_));
+        }
+        // ---- Engram (V4.1) -----------------------------------------------
+        // The hash needs the table and a token map; both are absent on a file
+        // that declares no Engram layers, and on one that declares them a
+        // missing map would hash the raw token ids (a different function that
+        // still produces in-range rows).
+        if (hcc.ple && hcc.hc_sinkhorn) {
+            if (!model_.ple_table() || model_.ple_row_bytes() == 0) {
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': Engram layers are declared but "
+                           "per_layer_tok_embd is not in the file";
+                return false;
+            }
+            if (hcc.engram_token_map.empty()) {
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': Engram is declared but engram.token_map is "
+                           "missing, so the hashes would not match the "
+                           "checkpoint's";
+                return false;
+            }
+            for (i32 v : hcc.ple_layers)
+                if (v < 0 || v >= static_cast<i32>(model_.layers().size())) {
+                    if (err)
+                        *err = "arch '" + hcc.arch + "': ple.layers names layer " +
+                               std::to_string(v) + " but the file has " +
+                               std::to_string(model_.layers().size());
+                    return false;
+                }
+            const i64 n_cols = (hcc.ple_ngram - 1) * hcc.ple_heads_per_ngram;
+            const i64 head_dim = hcc.ple_head_dim;
+            if (head_dim * n_cols <= 0) {
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': Engram geometry is empty (ngram " +
+                           std::to_string(hcc.ple_ngram) + ", heads/ngram " +
+                           std::to_string(hcc.ple_heads_per_ngram) +
+                           ", head_dim " + std::to_string(head_dim) + ")";
+                return false;
+            }
+            if (model_.ple_row_bytes() != static_cast<u64>(head_dim) * 4 &&
+                model_.ple_row_bytes() != static_cast<u64>(head_dim) * 2) {
+                // The gather reads one head's row at a time and dequantizes it
+                // through the file's dtype; a row has to BE one head's width or
+                // the stride walks off the row.
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': per_layer_tok_embd rows are " +
+                           std::to_string(model_.ple_row_bytes()) +
+                           " bytes, not one head of " + std::to_string(head_dim) +
+                           " elements in f32/f16";
+                return false;
+            }
+            KRK_INFO("engram: %zu layer(s), %lld column(s) of %lld per token, "
+                     "%d-gram hash",
+                     hcc.ple_layers.size(), static_cast<long long>(n_cols),
+                     static_cast<long long>(head_dim), hcc.ple_ngram);
         }
         if (hcc.qsa) {
             // The indexer SELECTS: each full-attention layer pools its raw
@@ -1400,6 +1477,69 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             return false;
         if (!halloc(ws_hc_n_, static_cast<size_t>(C * wide) * as, "ws_hc_n"))
             return false;
+        if (model_.cfg().hc_sinkhorn) {
+            // V4.1: the mixer's output, its three pieces, the block's own
+            // output and the scatattered stack. No bottleneck, no per-lane
+            // injection, no gamma -- those are the other mixer's buffers.
+            const i64 hc = hc_.hc;
+            const i64 mix_dim = (2 + hc) * hc;
+            if (!halloc(ws_hc_fn_, static_cast<size_t>(C * mix_dim) * as,
+                        "ws_hc_fn"))
+                return false;
+            if (!halloc(ws_hc_pre_, static_cast<size_t>(C * hc) * 4, "ws_hc_pre"))
+                return false;
+            if (!halloc(ws_hc_post_, static_cast<size_t>(C * hc) * 4, "ws_hc_post"))
+                return false;
+            if (!halloc(ws_hc_comb_, static_cast<size_t>(C * hc * hc) * 4,
+                        "ws_hc_comb"))
+                return false;
+            if (!halloc(ws_hc_out_, static_cast<size_t>(C * n_embd_) * as,
+                        "ws_hc_out"))
+                return false;
+            if (!halloc(ws_hc_new_, static_cast<size_t>(C * wide) * as,
+                        "ws_hc_new"))
+                return false;
+            if (!halloc(ws_hc_pre_attn_, static_cast<size_t>(C * hc) * 4,
+                        "ws_hc_pre_attn"))
+                return false;
+            if (!halloc(ws_hc_pre_prev_, static_cast<size_t>(C * hc) * 4,
+                        "ws_hc_pre_prev"))
+                return false;
+            if (!model_.cfg().hc_no_head) {
+                // The head's mixer emits just the pre vector [hc].
+                if (!halloc(ws_hc_head_, static_cast<size_t>(C * hc) * 4,
+                            "ws_hc_head"))
+                    return false;
+            }
+            // The identity pre-mix, allocated either way: the lagged graph uses
+            // it at the first layer, and that is exactly the graph with no head.
+            if (!halloc(ws_hc_one_, static_cast<size_t>(C * hc) * 4,
+                        "ws_hc_one"))
+                return false;
+            // The saved collapse (the sub-block's input before its norm), which
+            // hc_sk_leave() subtracts back out of the block's output.
+            if (!halloc(ws_hc_mix_, static_cast<size_t>(C * n_embd_) * as,
+                        "ws_hc_mix"))
+                return false;
+            // Engram's gathered rows and the per-layer hash ids. The ids are a
+            // host vector because engram_hash is a host function (the hash is
+            // integer arithmetic over the token window, and the reference
+            // computes it on the CPU too).
+            if (model_.cfg().ple) {
+                const i64 n_cols =
+                    (model_.cfg().ple_ngram - 1) * model_.cfg().ple_heads_per_ngram;
+                if (!halloc(ws_eng_kv_,
+                            static_cast<size_t>(C * n_embd_ * (hc + 1)) * as,
+                            "ws_eng_kv"))
+                    return false;
+                if (!halloc(ws_eng_rows_,
+                            static_cast<size_t>(C * n_cols *
+                                                model_.cfg().ple_head_dim) * as,
+                            "ws_eng_rows"))
+                    return false;
+                eng_ids_.resize(static_cast<size_t>(C) * n_cols);
+            }
+        } else {
         if (!halloc(ws_hc_g_, static_cast<size_t>(C * wide) * as, "ws_hc_g"))
             return false;
         if (!halloc(ws_hc_lo_, static_cast<size_t>(C * hc_.low_rank) * as,
@@ -1411,6 +1551,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         if (!halloc(ws_hc_mix_, static_cast<size_t>(C * n_embd_) * as,
                     "ws_hc_mix"))
             return false;
+        }
         // The PLE block's buffers, allocated here too because they are only
         // reachable when the lane stack is.
         if (ple_active_) {
@@ -1801,6 +1942,8 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         if (!check_alloc(ws_scale_, "ws_scale")) return false;
         router_host_.resize(static_cast<size_t>(C) * static_cast<size_t>(mc.n_expert));
         moe_prob_.resize(static_cast<size_t>(mc.n_expert));
+        if (mc.n_expert_group > 1)
+            moe_group_keep_.assign(static_cast<size_t>(mc.n_expert), 1);
         moe_logit_.resize(static_cast<size_t>(mc.n_expert));
         moe_sel_.resize(static_cast<size_t>(C) * static_cast<size_t>(k));
         // Only sized when a scan is actually requested: [n_layer * n_expert]
@@ -2858,6 +3001,24 @@ void Engine::hc_enter(const f32 *norm_w, const QuantTensor &down,
     be_->copy_act(ws_x_, ws_hc_mix_, static_cast<i64>(n) * ne);
 }
 
+void Engine::hc_begin(const LayerWeights &L, bool attn, i32 n) {
+    if (model_.cfg().hc_sinkhorn) {
+        hc_sk_enter(L, attn, n);
+        return;
+    }
+    if (attn)
+        hc_enter(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, n);
+    else
+        hc_enter(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, n);
+}
+
+void Engine::hc_end(i32 n) {
+    if (model_.cfg().hc_sinkhorn)
+        hc_sk_leave(LayerWeights{}, false, n);
+    else
+        hc_leave(n);
+}
+
 void Engine::hc_leave(i32 n) {
     const i64 ne = n_embd_;
     const i64 hc = hc_.hc;
@@ -3189,8 +3350,47 @@ const f32 *Engine::ple_debug_terms(f32 **conv_in, f32 **conv_out,
 void Engine::head_compute(i32 row) {
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
-    if (hc_active_) {
-        // This family's final mixer IS its output norm -- there is no
+    if (hc_active_ && mc.hc_sinkhorn) {
+        // V4.1 has an output_norm, so the lane stack is collapsed to one row
+        // and then normalized like any other family. WHICH pre does the
+        // collapsing is the whole of single-pass mHC: a file with no head
+        // mixer collapses with the last FFN's pre-mix (and the head's own
+        // mixer, when the file has one, is that pre-mix computed from the
+        // finished stack).
+        const i32 hc = hc_.hc;
+        const i64 ne = n_embd_;
+        const void *pre = nullptr;
+        if (!mc.hc_no_head) {
+            // One row through the head's mixer: norm the flat stack, project
+            // to hc numbers, affine, sigmoid + eps -- the same three steps the
+            // sub-block mixer's `pre` takes, with its own weights.
+            const f32 *lanes =
+                static_cast<const f32 *>(ws_hc_) + static_cast<i64>(row) * hc * ne;
+            be_->rmsnorm(ws_hc_n_, lanes, nullptr, 1, hc * ne, mc.rms_eps);
+            gemm_w(ws_hc_fn_, ws_hc_n_, model_.hc_head_fn(), hc, hc * ne, 1);
+            hc_head_pre(static_cast<f32 *>(ws_hc_head_),
+                        static_cast<const f32 *>(ws_hc_fn_), model_.hc_head_scale(),
+                        model_.hc_head_base(), hc, mc.hc_eps);
+            pre = ws_hc_head_;
+        } else {
+            pre = static_cast<const f32 *>(ws_hc_pre_prev_) +
+                  static_cast<i64>(row) * hc;
+            if (!hc_pre_valid_) {
+                // A stack with no layers: lane 0 is the embedding itself.
+                pre = nullptr;
+            }
+        }
+        const f32 *lanes =
+            static_cast<const f32 *>(ws_hc_) + static_cast<i64>(row) * hc * ne;
+        if (pre) {
+            be_->hc_sk_pre(ws_hc_out_, lanes, pre, 1, hc, ne);
+        } else {
+            be_->copy_act(ws_hc_out_, lanes, ne);
+        }
+        be_->rmsnorm(ws_xn_, ws_hc_out_, model_.out_norm(), 1, n_embd_, mc.rms_eps);
+        norm_bias_add(static_cast<f32 *>(ws_xn_), model_.out_norm_bias(), 1, n_embd_);
+    } else if (hc_active_) {
+        // qwen4exp: this family's final mixer IS its output norm -- there is no
         // output_norm.weight in the file -- so the wide row is mixed through
         // the head bottleneck instead of normalized, and the result lands in
         // ws_xn_ at row 0 (one row is mixed at a time).
@@ -3631,7 +3831,13 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     // embedding row. That is the invariant everything downstream is checked
     // against -- with every lane equal in and a zero injection, the mix is
     // exactly `xn * sigmoid(gate)` and the lanes stay bit-equal out.
-    if (hc_active_) be_->hc_init(ws_hc_, ws_x_, n, hc_.hc, n_embd_);
+    if (hc_active_) {
+        // The reference's hc_init: hc identical copies of the embedding row
+        // (deepseek41.cpp repeats it into n_embd x hc x nt). That is also what
+        // makes the single-pass identity collapse at layer 0 a no-op in value.
+        be_->hc_init(ws_hc_, ws_x_, n, hc_.hc, n_embd_);
+        hc_pre_valid_ = false;
+    }
 
     AttnDesc d;
     d.n_head = mc.n_head;
@@ -3767,12 +3973,17 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // The PLE block writes into the lane stack, so it runs before the
         // layer's mixer reads it -- the reference's build_ple, then build_hc_mix.
         if (ple_active_ && L.ple) ple_block(L, l, n, pos0);
+        // Engram likewise: the reference adds its gated value to every lane
+        // BEFORE the layer's mixes are computed from the stack
+        // (deepseek41.cpp: build_engram, then build_hc_mixes).
+        if (mc.hc_sinkhorn && !mc.ple_layers.empty() && L.engram_kv.present()) {
+            if (!engram_block(L, l, toks, pos0, n)) return false;
+        }
 
         if (hc_active_) {
             // No plain pre-norm on this family: the mixer is the block's input,
             // and the injection it also produces is what weights the combine.
-            hc_enter(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
-                     L.hc_attn_inject, n);
+            hc_begin(L, true, n);
         } else {
             // k2-horizon divides the row into `n_norm_groups` bands and takes
             // the RMS over each band, scaling the whole row by ONE weight. Every
@@ -3813,11 +4024,10 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // its output): promote it onto the lanes before the FFN mixes them
             // again. Unconditional -- a layer that skips its FFN still has to
             // scatter the block output it did produce.
-            if (hc_active_) hc_leave(n);
+            if (hc_active_) hc_end(n);
             if (!L.nemotron_ssm || L.moe || L.wgate.present()) {
                 if (hc_active_) {
-                    hc_enter(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
-                             L.hc_ffn_inject, n);
+                    hc_begin(L, false, n);
                 } else {
                     if (mc.n_norm_groups > 1)
                         be_->rmsnorm_bands(ws_xn_, ws_x_, L.ffn_norm, n,
@@ -3833,7 +4043,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                 } else {
                     dense_ffn(L, l, n);
                 }
-                if (hc_active_) hc_leave(n);
+                if (hc_active_) hc_end(n);
             }
             // The residual leaving a recurrent (or skipped) block: on a stack
             // where the recurrent half is stubbed out this is the only place to
@@ -4254,9 +4464,8 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // sum happens on its own, the combine scatters, and the FFN gets a
             // fresh mix -- three launches where the narrow path pays one.
             be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
-            hc_leave(n);
-            hc_enter(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
-                     L.hc_ffn_inject, n);
+            hc_end(n);
+            hc_begin(L, false, n);
         } else {
             be_->add_rmsnorm(ws_xn_, ws_x_, ws_x2_, L.ffn_norm, n, n_embd_,
                              mc.rms_eps, static_cast<const i32 *>(ws_rexp_));
@@ -4266,8 +4475,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // Pure-MoE block: no attention to fold in, so the FFN input norm
             // is applied straight to the residual.
             if (hc_active_) {
-                hc_enter(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
-                         L.hc_ffn_inject, n);
+                hc_begin(L, false, n);
             } else {
                 be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps,
                              static_cast<const i32 *>(ws_rexp_));
@@ -4301,7 +4509,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // of bug the attention gate above had.
             dense_ffn(L, l, n);
         }
-        if (hc_active_) hc_leave(n);
+        if (hc_active_) hc_end(n);
         // ---- the per-layer embedding residual (gemma4) -------------------
         // After the FFN and BEFORE the layer's output scale, which is the
         // order the reference's graph has: the block's own output includes
@@ -5431,6 +5639,17 @@ bool Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
     KRK_TRACE_COMP(n > 1 ? "prefill-forward" : "decode-forward");
     if (!forward_core(toks, n, pos0, want_logits ? LogitsLast : LogitsNone))
         return false;
+    // The Engram window: keep the last n_gram-1 token ids of the sequence so a
+    // chunk's first token can see across the boundary. Updated once per pass,
+    // after the pass, because the whole chunk's windows are read from it (and
+    // from the chunk itself) before this runs.
+    if (model_.cfg().ple && model_.cfg().hc_sinkhorn && toks && n > 0) {
+        const size_t keep = static_cast<size_t>(model_.cfg().ple_ngram - 1);
+        eng_hist_.insert(eng_hist_.end(), toks, toks + n);
+        if (eng_hist_.size() > keep)
+            eng_hist_.erase(eng_hist_.begin(),
+                            eng_hist_.end() - static_cast<ptrdiff_t>(keep));
+    }
     kv_pos_ = std::max<i64>(kv_pos_, static_cast<i64>(pos0) + n);
     // The KV tier promotes rows as the context grows, so the pool's budget is
     // re-derived from a live reading: every prefill, and every 16 decode rows
@@ -9723,6 +9942,250 @@ bool Engine::moe_decode_batch(const LayerWeights &L, i32 layer, i32 k, i32 ne,
     return true;
 }
 
+// ---- Engram (V4.1): conditional memory, before the layer's mixer ---------
+//
+// llama.cpp's build_engram, in the same order. The rows are gathered ON THE
+// HOST out of the mmap'd shared table (they are the file's own bytes, and a
+// token touches n_cols of them), dequantized into the lane-width buffer, and
+// then everything downstream is ordinary matmuls:
+//
+//   rows  = table[hash(window of n_gram tokens)]     [n, n_cols*head_dim]
+//   kv    = engram_kv @ rows                         [n, n_embd*(hc+1)]
+//   key   = kv[:, 0 : hc*n_embd]                     [n, hc, n_embd]
+//   value = kv[:, hc*n_embd : ]                      [n, n_embd]
+//   gate  = sigmoid(sign(dot)*sqrt(|dot|))           [n, hc]
+//   dot_c = sum_e rmsnorm(x)[e] * rmsnorm(key_c)[e] * engram_gate[e, c] / sqrt(ne)
+//   lanes += value[c] * gate[c]                      (broadcast over lanes)
+//
+// The gate is the reference's signed square root: sigmoid(copysign(sqrt(|d|), d))
+// with |d| clamped at 1e-6, so a dot of exactly 0 gates to 0.5 and a large one
+// saturates. sign(0) is +1, which is what `dot >= 0` encodes.
+bool Engine::engram_block(const LayerWeights &L, i32 l, const i32 *toks, i64 pos0,
+                          i32 n) {
+    const ModelConfig &mc = model_.cfg();
+    const i64 ne = n_embd_;
+    const i64 hc = mc.hc_n;
+    const i64 head_dim = mc.ple_head_dim;
+    const i32 n_cols = (mc.ple_ngram - 1) * mc.ple_heads_per_ngram;
+    if (!mc.ple || !L.engram_kv.present() || !ws_eng_rows_ || !model_.ple_table())
+        return false;
+    EngramModule mod;
+    // The module index is the layer's position in ple.layers -- NOT the layer
+    // number. A model whose Engram layers are 0, 4 and 8 uses modules 0, 1, 2.
+    i32 e = 0;
+    for (size_t k = 0; k < mc.ple_layers.size(); k++)
+        if (mc.ple_layers[k] == l) { e = static_cast<i32>(k); break; }
+    // The file's arrays are i64; the hash wants u64 multipliers and u32
+    // offsets/sizes. Reinterpreting the i64 pointers would read the wrong
+    // elements (u32 x 2 against an i64 stride), so the two narrow arrays are
+    // copied per call -- n_cols entries, not a per-token cost that matters, and
+    // the VALUES are what the file declared.
+    mod.mult = reinterpret_cast<const u64 *>(
+        mc.ple_multipliers.data() + static_cast<i64>(e) * mc.ple_ngram);
+    eng_off_.resize(static_cast<size_t>(n_cols));
+    eng_vocab_.resize(static_cast<size_t>(n_cols));
+    for (i64 c = 0; c < n_cols; c++) {
+        const i64 off = mc.ple_head_offsets[static_cast<size_t>(e * n_cols + c)];
+        const i64 voc = mc.ple_head_vocab_sizes[static_cast<size_t>(e * n_cols + c)];
+        eng_off_[static_cast<size_t>(c)] = static_cast<u32>(off);
+        eng_vocab_[static_cast<size_t>(c)] = static_cast<u32>(voc);
+    }
+    mod.offsets = eng_off_.data();
+    mod.vocab_sizes = eng_vocab_.data();
+    mod.n_gram = mc.ple_ngram;
+    mod.heads_per_ngram = mc.ple_heads_per_ngram;
+    if (!mod.valid()) return false;
+
+    const i64 pad = static_cast<i64>(mc.engram_token_map[static_cast<size_t>(mc.engram_pad_id)]);
+    std::vector<i32> window;
+    const i64 n_prev = mc.ple_ngram - 1;
+    // The ring is one window long and holds the tokens BEFORE pos0; a chunk
+    // longer than the window only ever reaches one window back, so no more is
+    // kept. A short first pass leaves it short; the reads below are bounds
+    // checked against the sequence start, not against the ring's size.
+    const i64 hist = static_cast<i64>(eng_hist_.size());
+    for (i32 t = 0; t < n; t++) {
+        const i64 pos = pos0 + t;
+        // The window is the n_gram-1 tokens BEFORE this one, oldest first. Only
+        // the ones that exist are passed; the hash treats the rest as dead and
+        // substitutes the pad id (which degrades the n-gram, not the row).
+        window.clear();
+        for (i64 s = n_prev; s >= 1; s--) {
+            if (pos - s < 0) {
+                window.push_back(-1);           // before the sequence start
+            } else if (t - s >= 0) {
+                window.push_back(toks[t - s]);  // inside this chunk
+            } else {
+                // Before the chunk: the ring, oldest first.
+                const i64 k = hist + (t - s);
+                window.push_back(k >= 0 ? eng_hist_[static_cast<size_t>(k)] : -1);
+            }
+        }
+        if (!engram_hash(eng_ids_.data() + static_cast<i64>(t) * n_cols, mod,
+                         mc.engram_token_map.data(),
+                         static_cast<i64>(mc.engram_token_map.size()), pad,
+                         toks[t], window.data(), n_prev))
+            return false;
+    }
+    // The gather: rows come straight out of the mapping, so the stride is the
+    // file's own row bytes and the buffer is f32 after dequant.
+    const i64 row_bytes = static_cast<i64>(model_.ple_row_bytes());
+    std::vector<u8> raw(static_cast<size_t>(n) * n_cols * row_bytes);
+    engram_gather(raw.data(), static_cast<const u8 *>(model_.ple_table()),
+                  static_cast<i64>(model_.ple_table_rows()), row_bytes,
+                  eng_ids_.data(), n, n_cols);
+    f32 *rows = static_cast<f32 *>(ws_eng_rows_);
+    for (i32 t = 0; t < n; t++)
+        for (i32 c = 0; c < n_cols; c++)
+            dequant_row(model_.ple_table_type(),
+                        raw.data() + (static_cast<i64>(t) * n_cols + c) * row_bytes,
+                        rows + (static_cast<i64>(t) * n_cols + c) * head_dim,
+                        head_dim);
+
+    // kv = engram_kv @ rows, then the split: hc key blocks and one value block.
+    const i64 kvw = n_cols * head_dim;
+    gemm_w(ws_eng_kv_, ws_eng_rows_, L.engram_kv, ne * (hc + 1), kvw, n);
+    // gate: the signed square root, from the dot of the normed input against
+    // each normed key block, scaled by engram_gate and 1/sqrt(ne).
+    be_->rmsnorm(ws_hc_n_, ws_x_, nullptr, n, ne, mc.rms_eps);
+    for (i32 t = 0; t < n; t++) {
+        const f32 *xn = static_cast<const f32 *>(ws_hc_n_) + static_cast<i64>(t) * ne;
+        const f32 *kv = static_cast<const f32 *>(ws_eng_kv_) +
+                        static_cast<i64>(t) * ne * (hc + 1);
+        const f32 *vb = kv + hc * ne;
+        for (i64 c = 0; c < hc; c++) {
+            const f32 *key = kv + c * ne;
+            // rmsnorm of the KEY block, computed here because it is one short
+            // row and a kernel launch would cost more than the loop.
+            f64 ss = 0.0;
+            for (i64 i = 0; i < ne; i++) ss += (f64)key[i] * key[i];
+            const f32 kinv = 1.0f / std::sqrt((f32)(ss / ne) + mc.rms_eps);
+            f32 dot = 0.0f;
+            for (i64 i = 0; i < ne; i++)
+                // The file's engram_gate is ne={n_embd, hc}: hc ROWS of
+                // n_embd, so element (e, c) is at c*n_embd + e -- the same
+                // transposition trap hc_norm_lanes' gamma has.
+                dot += xn[i] * (key[i] * kinv) * L.engram_gate[c * ne + i];
+            dot *= 1.0f / std::sqrt((f32)ne);
+            const f32 mag = std::sqrt(std::max(std::fabs(dot), 1e-6f));
+            const f32 sign = dot >= 0.0f ? 1.0f : -1.0f;
+            const f32 g = 1.0f / (1.0f + std::exp(-(mag * sign)));
+            // lanes[c] += value * gate[c]
+            f32 *lane = static_cast<f32 *>(ws_hc_) + (static_cast<i64>(t) * hc + c) * ne;
+            for (i64 i = 0; i < ne; i++) lane[i] += vb[i] * g;
+        }
+    }
+    return true;
+}
+
+// ---- DeepSeek-V4.1: the Sinkhorn lane stack ------------------------------
+//
+// The same residual SHAPE as qwen4exp -- `hc` lanes of n_embd, token-major --
+// and a completely different mixer. There is no bottleneck and no per-lane
+// gamma: one projection over the flattened, weightlessly normed stack emits
+// (2+hc)*hc numbers, which split into
+//
+//   pre[c]     the collapse the sub-block reads            (sigmoid, +eps)
+//   post[c]    the gain on the block's own output          (2*sigmoid)
+//   comb[d][s] the doubly-stochastic mix of the lanes      (sinkhorn)
+//
+// and the sub-block does not ADD to the residual, it REPLACES every lane:
+//
+//   lanes'[d] = block_out * post[d] + sum_s lanes[s] * comb[d][s]
+//
+// The split and the scatter are single backend ops (hc_sk_split / hc_sk_pre /
+// hc_sk_post) rather than loops here, because the sinkhorn's arithmetic order
+// is the thing the reference specifies and src/hc.cpp is where it is written
+// down and tested. This function is only the plumbing.
+bool Engine::hc_sk_enter(const LayerWeights &L, bool attn, i32 n) {
+    const i64 ne = n_embd_;
+    const i64 hc = hc_.hc;
+    const i64 wide = hc * ne;
+    const i64 mix_dim = (2 + hc) * hc;
+    const QuantTensor &fn = attn ? L.hc_attn_fn : L.hc_ffn_fn;
+    const f32 *base = attn ? L.hc_attn_base : L.hc_ffn_base;
+    const f32 *scale = attn ? L.hc_attn_scale : L.hc_ffn_scale;
+    // One norm over the whole flattened stack and NO weight: `ggml_rms_norm(
+    // flat)` in the reference. Passing a gamma here would be a different
+    // function, and the family has no gamma to pass.
+    be_->rmsnorm(ws_hc_n_, ws_hc_, nullptr, n, wide, model_.cfg().rms_eps);
+    gemm_w(ws_hc_fn_, ws_hc_n_, fn, mix_dim, wide, n);
+    be_->hc_sk_split(ws_hc_pre_, ws_hc_post_, ws_hc_comb_, ws_hc_fn_, scale, base,
+                     n, hc, model_.cfg().hc_sinkhorn_iters, model_.cfg().hc_eps);
+    // WHICH pre the collapse uses is the single-pass lag. In the reference's
+    // V4.1 graph each sub-block computes its own mixes but the ATTENTION reads
+    // the pre-mix its PREVIOUS layer's FFN produced (`pre_prev`), and the first
+    // layer's attention reads lane 0 -- the identity. With the lag off every
+    // sub-block reads the pre it just computed. Both are one op; only the
+    // pointer differs.
+    const bool lag = model_.cfg().hc_no_head;
+    const void *pre_use = ws_hc_pre_;
+    if (lag) {
+        if (attn) {
+            if (hc_pre_valid_) {
+                pre_use = ws_hc_pre_prev_;
+            } else {
+                // Layer 0: the identity collapse, written as a one-hot pre
+                // rather than a strided copy, so it is the same op.
+                f32 *one = static_cast<f32 *>(ws_hc_pre_attn_);
+                be_->fill0(one, static_cast<size_t>(n) * hc * 4);
+                for (i32 t = 0; t < n; t++)
+                    one[static_cast<i64>(t) * hc] = 1.0f;
+                pre_use = ws_hc_pre_attn_;
+            }
+            // Hand THIS attention's pre to the layer's FFN, which reads it in
+            // place of its own. Saved before the collapse so the one-hot above
+            // is overwritten by the real one.
+            if (hc_pre_valid_) {
+                be_->copy_act(ws_hc_pre_attn_, ws_hc_pre_,
+                              static_cast<i64>(n) * hc * 4);
+            } else {
+                // Still the identity collapse: the FFN of layer 0 reads
+                // attn_mix.pre, which IS the fresh pre, so save it over the
+                // one-hot -- but only AFTER the collapse read it.
+                be_->hc_sk_pre(ws_xn_, ws_hc_, pre_use, n, hc, ne);
+                be_->copy_act(ws_x_, ws_xn_, static_cast<i64>(n) * ne);
+                be_->copy_act(ws_hc_pre_attn_, ws_hc_pre_,
+                              static_cast<i64>(n) * hc * 4);
+                return true;
+            }
+        } else {
+            // The FFN reads the ATTENTION's pre, not its own.
+            pre_use = ws_hc_pre_attn_;
+        }
+    }
+    be_->hc_sk_pre(ws_xn_, ws_hc_, pre_use, n, hc, ne);
+    be_->copy_act(ws_x_, ws_xn_, static_cast<i64>(n) * ne);
+    // Whatever pre this sub-block should hand on: the attention's goes to this
+    // layer's FFN, the FFN's to the next layer's attention (and the final
+    // collapse).
+    if (lag) {
+        if (attn) {
+            be_->copy_act(ws_hc_pre_attn_, ws_hc_pre_, static_cast<i64>(n) * hc * 4);
+        } else {
+            be_->copy_act(ws_hc_pre_prev_, ws_hc_pre_, static_cast<i64>(n) * hc * 4);
+            hc_pre_valid_ = true;
+        }
+    }
+    return true;
+}
+
+void Engine::hc_sk_leave(const LayerWeights &L, bool attn, i32 n) {
+    (void)attn;
+    const i64 ne = n_embd_;
+    const i64 hc = hc_.hc;
+    // ws_x_ is `pre-mix + block_out`, so the block's own output is that minus
+    // the pre-mix -- exact, and it never mixes a residual sum into the lanes
+    // the scatter reads.
+    be_->copy_act(ws_hc_out_, ws_x_, static_cast<i64>(n) * ne);
+    be_->axpy(ws_hc_out_, ws_xn_, -1.0f, static_cast<i64>(n) * ne);
+    // lanes_out may not alias lanes_in, which is why the scatter reads ws_hc_
+    // and writes ws_hc_new_ before the copy back.
+    be_->hc_sk_post(ws_hc_new_, ws_hc_, ws_hc_out_, ws_hc_post_, ws_hc_comb_, n,
+                    hc, ne);
+    be_->copy_act(ws_hc_, ws_hc_new_, static_cast<i64>(n) * hc * ne);
+}
+
 // ---- MoVA: the attention VALUES are a routed expert set (k2-horizon) ------
 //
 // This is llama.cpp's build_routed_value, in the same order, because every step
@@ -10176,6 +10639,41 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 return moe_prob_[static_cast<size_t>(e)] +
                        ((rb && !pre_bias) ? rb[static_cast<size_t>(e)] : 0.0f);
             };
+            // ---- group-limited selection ----------------------------------
+            // DeepSeek-V3's rule (llama-graph.cpp, "select top n_group_used
+            // expert groups"): the experts are contiguous groups, a group scores
+            // as the sum of its best two SELECTION scores, only the best
+            // `group_used` groups stay eligible, and the top-k runs over the
+            // survivors. The bias is already inside sel_score (it is a selection
+            // score), and the WEIGHTS stay the unbiased probabilities -- which is
+            // why this masks the eligibility and never touches moe_prob_.
+            //
+            // Masked experts are made unselectable rather than re-sorted: the
+            // loop below picks the best available score, so a -inf here is
+            // enough and every downstream index stays the file's own.
+            u8 *group_keep = moe_group_keep_.empty() ? nullptr
+                                                    : moe_group_keep_.data();
+            bool grouped = false;
+            if (mc.n_expert_group > 1 && group_keep) {
+                std::vector<f32> sels(static_cast<size_t>(ne));
+                for (i32 e = 0; e < ne; e++) sels[static_cast<size_t>(e)] = sel_score(e);
+                if (!krk::moe_group_mask_or_all(moe_group_keep_.data(),
+                                                sels.data(), ne,
+                                                mc.n_expert_group,
+                                                mc.n_expert_group_used)) {
+                    forward_error_ = "layer " + std::to_string(layer) +
+                                     ": the group-limited route refused its own "
+                                     "partition (ne=" + std::to_string(ne) +
+                                     ", groups=" +
+                                     std::to_string(mc.n_expert_group) + ", used=" +
+                                     std::to_string(mc.n_expert_group_used) + ")";
+                    return false;
+                }
+                grouped = true;
+            }
+            auto eligible = [&](i32 e) {
+                return !grouped || group_keep[static_cast<size_t>(e)] != 0;
+            };
 
             i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
             f32 *wt = moe_wt_.data() + static_cast<size_t>(t) * k;
@@ -10241,6 +10739,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 // the arithmetic below reduces to the loop it replaced.
                 f32 top = -1.0f;
                 for (i32 e = 0; e < ne; e++) {
+                    if (!eligible(e)) continue;
                     bool taken = false;
                     for (i32 p = 0; p < s; p++)
                         if (sel[p] == e) { taken = true; break; }
@@ -10253,6 +10752,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 f32 bestp = -1.0f;
                 int best_rank = -1;
                 for (i32 e = 0; e < ne; e++) {
+                    if (!eligible(e)) continue;
                     bool taken = false;
                     for (i32 p = 0; p < s; p++)
                         if (sel[p] == e) { taken = true; break; }

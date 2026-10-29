@@ -808,6 +808,12 @@ private:
     void hc_enter(const f32 *norm_w, const QuantTensor &down,
                   const QuantTensor &up, const QuantTensor &inject, i32 n);
     void hc_leave(i32 n);
+    // The sub-block boundary, dispatching on which mixer the file declares.
+    // Every layer-loop call site goes through these two, so a family cannot
+    // end up half-wired: either the whole residual path is one mixer or the
+    // other, chosen by the metadata and checked at init.
+    void hc_begin(const LayerWeights &L, bool attn, i32 n);
+    void hc_end(i32 n);
     // The head's mixer: row `row` of the lane stack -> one f32 row in ws_xn_.
     // There is no injection (nothing is scattered back) and no output_norm --
     // this mixer IS the final norm on this family.
@@ -1460,6 +1466,58 @@ private:
     // `ws_vexp_` one routed expert's output [chunk, kvw], accumulated into
     // ws_v_ in selection order. Both null on every family without value
     // experts, so nothing is allocated and no pointer is dereferenced.
+    // ---- V4.1's Sinkhorn lane stack --------------------------------------
+    // `ws_hc_fn_` is the mixer projection's output [chunk, mix_dim] and the
+    // three pieces it splits into: pre/post [chunk, hc] and comb
+    // [chunk, hc, hc]. `ws_hc_out_` is the block's own output (ws_x_ minus the
+    // pre-mix) and `ws_hc_new_` the lane stack after a scatter, because
+    // hc_sk_post reads every lane of its input.
+    void *ws_hc_fn_ = nullptr;
+    void *ws_hc_pre_ = nullptr;
+    void *ws_hc_post_ = nullptr;
+    void *ws_hc_comb_ = nullptr;
+    void *ws_hc_out_ = nullptr;
+    void *ws_hc_new_ = nullptr;
+    // Single-pass mHC keeps TWO pre-mix vectors: the attention block reads the
+    // PREVIOUS layer's FFN pre-mix, so `ws_hc_pre_attn_` holds this sub-block's
+    // attention pre (which its FFN reads) and `ws_hc_pre_prev_` holds the FFN's
+    // (which the next layer's attention reads, and the final collapse uses).
+    void *ws_hc_pre_attn_ = nullptr;
+    void *ws_hc_pre_prev_ = nullptr;
+    // False until a layer's FFN has produced a pre-mix: the first layer's
+    // attention collapses with the identity (lane 0) instead.
+    bool hc_pre_valid_ = false;
+    // The head's own mixer, [C, hc] and [C, hc*hc] -- only a file that carries
+    // hc_head_fn has one; single-pass files collapse with the last pre-mix.
+    void *ws_hc_head_ = nullptr;
+    // The identity pre-mix (one-hot lane 0), which the first layer's attention
+    // collapses with when the lag is on.
+    void *ws_hc_one_ = nullptr;
+    // Engram's gathered rows [chunk, n_cols, ple_head_dim] and the per-layer
+    // hash ids [chunk, n_cols].
+    void *ws_eng_rows_ = nullptr;
+    // Engram's kv projection output: [chunk, n_embd*(hc+1)] -- hc key blocks
+    // and one value block, in that order.
+    void *ws_eng_kv_ = nullptr;
+    std::vector<i32> eng_ids_;
+    // Per-call scratch for the hash's narrowed constants (the file stores them
+    // as i64; see the comment in Engine::engram_block).
+    std::vector<u32> eng_off_, eng_vocab_;
+    // Per-token scratch for the group-limited route: one flag per expert.
+    // Sized at init from the file's own expert count, and empty when the file
+    // declares no groups (which is what makes the route skip the mask).
+    std::vector<u8> moe_group_keep_;
+    // The last `n_gram-1` token ids of the sequence, oldest first, kept across
+    // forward calls: the n-gram window of the first tokens of a chunk reaches
+    // back past the chunk. -1 marks a position before the sequence start, which
+    // the hash treats as dead (the n-gram degrades, the row does not vanish).
+    std::vector<i32> eng_hist_;
+    // The Sinkhorn sub-block boundary. `attn` picks the attn/ffn mixer.
+    bool hc_sk_enter(const LayerWeights &L, bool attn, i32 n);
+    void hc_sk_leave(const LayerWeights &L, bool attn, i32 n);
+    // The Engram block for layer `l`, before its hyper-connection mixer.
+    bool engram_block(const LayerWeights &L, i32 l, const i32 *toks, i64 pos0,
+                      i32 n);
     void *ws_vgate_ = nullptr;
     void *ws_vexp_ = nullptr;
     // The router probabilities for one token, host-side, like router_host_.
