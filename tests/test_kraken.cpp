@@ -6821,6 +6821,25 @@ static void test_bitnet_family() {
 // -128 has no negation in int8, so any sign trick on it flips. Nothing pinned
 // that clamp; if a future quantiser emitted the full int8 range, those kernels
 // would go quietly wrong on saturated values instead.
+// The formats this build NAMES but does not decode. A refusal that says
+// "UNKNOWN (type id 38)" tells the user nothing they can act on; the point of
+// naming TL1 is that the message can.
+static void test_refused_formats() {
+    CHECK(dtype_name(DType::TL1) == std::string("TL1"),
+          "TL1 (id 38) has a name, so a refusal can name it");
+    CHECK(!dtype_supported(DType::TL1), "and it is not claimed as supported");
+    CHECK(dtype_block_bytes(DType::TL1) == 0,
+          "with no block geometry, so gguf marks it unknown and never decodes it");
+    CHECK(static_cast<i32>(DType::TL1) == 38, "the id is the reference's own");
+    // I2_S rows have to be independently addressable: its payload is one flat
+    // run of 32-byte blocks with a single tail, so a 96-wide row cannot be
+    // decoded from a row stride.
+    CHECK(dtype_row_aligned(DType::I2_S, 128) && dtype_row_aligned(DType::I2_S, 256),
+          "I2_S accepts a row width that is a multiple of 128");
+    CHECK(!dtype_row_aligned(DType::I2_S, 96) && !dtype_row_aligned(DType::I2_S, 1),
+          "and rejects one that is not (its block would be shared with the next row)");
+}
+
 static void test_q8_activation_domain() {
     const i64 n = 512;
     std::vector<f32> x(static_cast<size_t>(n));
@@ -22960,6 +22979,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_i2_s_layout)
     TEST_GROUP(test_i2_s_model)
     TEST_GROUP(test_i2_s_embedding)
+    TEST_GROUP(test_refused_formats)
     TEST_GROUP(test_q8_activation_domain)
     TEST_GROUP(test_trit_sign_extreme)
     TEST_GROUP(test_q2code_dot)

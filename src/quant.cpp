@@ -1682,6 +1682,7 @@ const char *dtype_name(DType t) {
         case DType::TQ1_0: return "TQ1_0";
         case DType::TQ2_0: return "TQ2_0";
         case DType::I2_S: return "I2_S";
+        case DType::TL1: return "TL1";
         case DType::PQ2_0: return "PQ2_0";
         case DType::PTQ1_0: return "PTQ1_0";
         case DType::Q6_0_ROCMFPX: return "Q6_0_ROCMFPX";

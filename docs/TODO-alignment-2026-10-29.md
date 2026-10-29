@@ -85,3 +85,18 @@ the tied head over `token_embd` and the layer contribution rounds away in f16
 activations. Consequence: any future "the scales are applied" claim that rests
 on a logits comparison in a synthetic fixture needs a fixture that is first
 shown to move when a weight scale moves.
+
+### Audit pass over the BitNet/2-bit work (goli-mat-de, before the commit)
+
+| id | pri | class | item | state |
+|---|---|---|---|---|
+| D8 | P3 | CONFIRMED (code path), SUSPECTED (impact) | the dense relu^2 arm does not apply `row_scaled` (there is no relu_sqr+mul+row-max kernel). Mathematically identical -- the sub-norm divides the scale back in -- but relu^2 is quadratic, so this arm reaches the f16 store with larger magnitudes than silu | documented at the arm; no fixture needed as it is a range guard, not a function |
+| D9 | P2 | NEEDS VERIFICATION | a *ternary* file whose `general.architecture` is `llama` (the HF1BitLLM Llama3-8B-1.58 and Falcon3-*-1.58bit exports may well be) gets SubLN from the tensor set but **silu**, not relu^2, because the inference is keyed on the arch row. No file of that shape was available to check, and inferring relu^2 from the presence of `ffn_sub_norm` alone would change the graph of every family that happens to carry one | open; needs one real file's metadata |
+
+Two integrity guards added while auditing:
+- `gguf.cpp` refuses an I2_S tensor whose 32-byte tail falls outside the shard
+  (the alternative is reading past the mapping and getting a scale of 4.6e-41,
+  i.e. an all-zero model that still runs).
+- the loader refuses an I2_S matmul whose inner dimension is not a multiple of
+  128: the payload is one flat run, so such a row shares its block with the
+  next one and a row-strided read decodes the padding as weights.

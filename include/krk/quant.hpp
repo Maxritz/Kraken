@@ -88,6 +88,19 @@ enum class DType : i32 {
     // MXFP4 (ggml id 39): 32-value blocks of E2M1 codes behind one E8M0
     // exponent byte. The value table is doubled, so the scale is used at
     // half strength (ggml_e8m0_to_fp32_half).
+    // TL1 (ggml id 38) is BitNet's LUT-based ternary format: the id exists in
+    // the reference header (include/ggml.h in the BitNet submodule's
+    // llama.cpp), but the values are decoded through a lookup table this build
+    // does not carry, and no released file uses it. It is NAMED here only so
+    // that a refusal says "TL1" instead of "UNKNOWN (type id 38)"; it is not
+    // supported (dtype_block_bytes -> 0), so the loader refuses it by name.
+    //
+    // The fork's TL2 is id 42, which COLLIDES with Q2_0: both are 2-bit over
+    // 128 or 64 values with an f16 delta, and only the tensor's own measured
+    // bytes per value say which one a file holds (see Q2_0/Q2_0_64 below).
+    // That is a geometry resolution, not a name resolution -- the file does
+    // not carry the difference anywhere else.
+    TL1 = 38,
     MXFP4 = 39,
     NVFP4 = 40,
     // BitNet's own 1-bit and 2-bit ternary formats (ids 41/42), distinct from

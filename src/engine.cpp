@@ -5141,6 +5141,15 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
         } else if (relu_sqr) {
             // relu(gate)^2 * up. relu_sqr_act is in place on the gate, then the
             // up leg multiplies -- the same two launches GeGLU takes.
+            //
+            // `row_scaled` is NOT applied on this arm: there is no
+            // relu_sqr+mul+row-max kernel, and the scale is a numerical guard
+            // (it divides a row by its max and the sub-norm below divides it
+            // back in), not part of the function -- `ffn_rowscale_on()` off
+            // already runs every arm unscaled. What it does buy is f16 headroom,
+            // and relu^2 is quadratic, so this arm reaches the store with larger
+            // magnitudes than the silu one. Recorded in the TODO as a
+            // range-only difference, not a correctness one.
             be_->relu_sqr_act(ws_gate_, n * n_ff_);
             be_->mul_act(ws_gate_, ws_up_, n * n_ff_);
         } else {

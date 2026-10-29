@@ -1264,6 +1264,21 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                          "corrupt file, not a weight";
                 return {};
             }
+            // An I2_S tensor is ONE flat payload: the converter pads the
+            // whole tensor to a multiple of 128, so a row whose width is not a
+            // multiple of 128 shares its last block with the next row and no
+            // row-strided read can decode it. The table path refuses that
+            // shape already; so must this one, instead of decoding the shared
+            // block as if its padding were weights.
+            if (!dtype_row_aligned(DType::I2_S, q.n_in)) {
+                if (e)
+                    *e = "I2_S weight '" + name + "' has an inner dimension of " +
+                         std::to_string(static_cast<long long>(q.n_in)) +
+                         ", which is not a multiple of 128; an I2_S tensor is a "
+                         "single flat payload, so its rows are not independently "
+                         "addressable";
+                return {};
+            }
             q.gs = gs;
             if (q.gs != 1.0f && q.n_in > max_scaled_in_) max_scaled_in_ = q.n_in;
             return q;
