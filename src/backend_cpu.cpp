@@ -1001,6 +1001,41 @@ public:
                 return dot_q4_K_q8_sx(wr, xqp + r * n_in, xdp + r * nb,
                                       xsp + r * nb, n_in);
             };
+            // q8_0 with VNNI gets a hoisted scale table: the two f16 block
+            // halves and the seven uops that turn them into a per-row scale
+            // vector do not depend on the output row, so they are paid once per
+            // row tile instead of once per (row, column). See the comment on
+            // build_q8_0_scales8. Off unless the kernel can use it, so every
+            // other tier is untouched.
+            const bool use_tab = q80 && n_in > 0 && (n_in / 32) >= 2 &&
+                                 ((n_in / 32) & 1) == 0 && q8_0_tab_supported();
+            std::vector<f32> sctab;
+            if (use_tab)
+                sctab.assign(static_cast<size_t>((n_in / 64) * 16), 0.0f);
+        // Decode, q8_0, VNNI: four output rows per call. Each is an
+        // independent weight stream, so a thread keeps four in flight instead
+        // of one, which is what this kernel is short of (see the comment on
+        // dot_q8_0_q8_x4_gemv). Falls through to the per-element path for every
+        // other tier, so nothing else changes.
+        if (rows == 1 && q80 && n_in > 0 && (n_in % 64) == 0 && n_out >= 4 &&
+            ((n_in / 32) & 1) == 0) {
+            const i32 kw = q8_0_gemv_width();
+            const i64 n4 = n_out - n_out % kw;
+            const i64 g4 = std::max<i64>(1, std::min<i64>(1024, (n4 / kw) / 16));
+            par_for(n4 / kw, g4, 2.0 * static_cast<f64>(n4) * n_in,
+                    [&](i64 b, i64 e) {
+                        for (i64 g = b; g < e; g++) {
+                            const i64 o = g * kw;
+                            dot_q8_0_q8_r1xN(
+                                wb + static_cast<size_t>(o) * row_bytes,
+                                row_bytes, xqp, xdp, n_in, nb, of + o, 1, kw);
+                        }
+                    });
+            for (i64 o = n4; o < n_out; o++)
+                of[o] = dot_q8_0_q8(wb + static_cast<size_t>(o) * row_bytes,
+                                    xqp, xdp, n_in);
+            return;
+        }
             if (nc > 0) {
                 // One row tile at a time, every column in the block against it.
                 // The activation pointers for the tile are hoisted out of the
@@ -1010,10 +1045,23 @@ public:
                     for (i64 c = cb; c < ce; c++) {
                         const i64 o0 = c * nc;
                         const i64 o1 = std::min<i64>(n_out, o0 + nc);
-                        for (i64 r = 0; r < rows8; r += 8)
-                            for (i64 o = o0; o < o1; o++)
-                                dot8(wb + static_cast<size_t>(o) * row_bytes, r,
-                                     o);
+                        for (i64 r = 0; r < rows8; r += 8) {
+                            if (use_tab)
+                                build_q8_0_scales8(
+                                    wb + static_cast<size_t>(o0) * row_bytes,
+                                    xdp + r * nb, nb, n_in, sctab.data());
+                            for (i64 o = o0; o < o1; o++) {
+                                const u8 *wr =
+                                    wb + static_cast<size_t>(o) * row_bytes;
+                                if (use_tab)
+                                    dot_q8_0_q8_tab8(
+                                        wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                        n_in, nb, of + r * n_out + o, n_out,
+                                        sctab.data());
+                                else
+                                    dot8(wr, r, o);
+                            }
+                        }
                         for (i64 r = rows8; r < rows; r++)
                             for (i64 o = o0; o < o1; o++)
                                 of[r * n_out + o] =
