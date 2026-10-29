@@ -352,6 +352,41 @@ bool FileReader::at(size_t off, void *dst, size_t len) {
 }
 
 // See the header: a cold mapping faults per page, read() does not.
+bool MappedFile::advise_willneed(size_t off, size_t len) const {
+    if (!data_ || size_ == 0) return false;
+    if (off >= size_) return false;
+    if (len > size_ - off) len = size_ - off;
+#if defined(_WIN32)
+    // PrefetchVirtualMemory takes page-rounded address+size and is the direct
+    // analogue of MADV_WILLNEED. Available from Windows 8; resolved dynamically
+    // so a build does not fail on an SDK that predates it.
+    using PFN_pvm = BOOL(WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static PFN_pvm pvm = []() -> PFN_pvm {
+        HMODULE k = GetModuleHandleA("kernel32.dll");
+        return k ? reinterpret_cast<PFN_pvm>(
+                       reinterpret_cast<void *>(GetProcAddress(k, "PrefetchVirtualMemory")))
+                 : nullptr;
+    }();
+    if (!pvm) return false;
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const size_t pg = si.dwPageSize ? si.dwPageSize : 4096;
+    const size_t mask = pg - 1;
+    const size_t a = off & ~mask;
+    size_t b = (off + len + mask) & ~mask;
+    if (b > size_) b = size_;
+    if (b <= a) return false;
+    WIN32_MEMORY_RANGE_ENTRY e;
+    e.VirtualAddress = const_cast<u8 *>(data_) + a;
+    e.NumberOfBytes = b - a;
+    return pvm(GetCurrentProcess(), 1, &e, 0) != FALSE;
+#else
+    static_cast<void>(off);
+    static_cast<void>(len);
+    return false;
+#endif
+}
+
 bool MappedFile::read_at(size_t off, void *dst, size_t len) const {
     if (!native_handle_) return false;
     if (off > size_ || len > size_ - off) return false;
@@ -459,6 +494,28 @@ bool MappedFile::read_at(size_t off, void *dst, size_t len) const {
         got += static_cast<size_t>(n);
     }
     return true;
+}
+
+bool MappedFile::advise_willneed(size_t off, size_t len) const {
+    if (!data_ || size_ == 0) return false;
+    if (off >= size_) return false;
+    if (len > size_ - off) len = size_ - off;
+#if defined(MADV_WILLNEED)
+    // Page-align outwards: madvise rejects a range that is not page-aligned on
+    // some kernels, and rounding IN (dropping the partial head) is the bug that
+    // would silently skip the first tensor of a file.
+    const size_t pg = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t mask = pg - 1;
+    const size_t a = off & ~mask;
+    size_t b = (off + len + mask) & ~mask;
+    if (b > size_) b = size_;
+    if (b <= a) return false;
+    return ::madvise(const_cast<u8 *>(data_) + a, b - a, MADV_WILLNEED) == 0;
+#else
+    static_cast<void>(off);
+    static_cast<void>(len);
+    return false;
+#endif
 }
 
 #endif
