@@ -1,13 +1,14 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-29T18:34:37Z",
-  "recorded_commit": "99204ef",
-  "totals": {"groups": 163, "passed": 7192, "run": 7192, "exit": 0},
+  "recorded_utc": "2026-10-30T22:46:31Z",
+  "recorded_commit": "5b0da40",
+  "totals": {"groups": 164, "passed": 7200, "run": 7200, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
     {"name": "test_q8_0_layout", "status": "pass", "passed": 32, "run": 32},
+    {"name": "test_q8_0_scale_array_row_keyed", "status": "pass", "passed": 8, "run": 8},
     {"name": "test_vec_dot_fast_opt_in", "status": "pass", "passed": 4, "run": 4},
     {"name": "test_gemm_batched_bit_identical", "status": "pass", "passed": 100, "run": 100},
     {"name": "test_vec_dot_avx2_matches_fast", "status": "pass", "passed": 2, "run": 2},

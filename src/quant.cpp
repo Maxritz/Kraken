@@ -3628,58 +3628,112 @@ void dot_q8_0_q8_x8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 //
 // This leaves ~6 uops per row per block pair against 12, and drops the header
 // to two vector loads.
-void build_q8_0_scales8(const u8 *w, const f32 *dx, i64 dstride, i64 n,
-                        f32 *tab) {
+// Build the f32 block-scale PAIRS for `nrows` consecutive output rows.
+//
+// out[(o * npair + p) * 2 + {0,1}] = the f16 block scales of row o, blocks 2p
+// and 2p+1, converted to f32 once.
+//
+// WHY THIS IS KEYED BY OUTPUT ROW, AND WHY THE PREVIOUS TABLE WAS WRONG.
+// An earlier version of this code built ONE table per row tile from output row
+// o0 and used it for every output row in the column block. That is only valid
+// if a matrix's q8_0 block scales are the same on every row; they are not (each
+// 32-value block carries the scale of its own values). Measured with rows whose
+// scales differ, the table path disagreed with dot_q8_0_q8_x8 by up to 8.3e-01
+// relative -- 83% -- while the full test suite and the fixture both still ran,
+// because a synthetic fixture's logits are never compared against the pre-change
+// engine. The scales are a function of the OUTPUT ROW and the block, so the
+// table is indexed by both and built once per column block.
+//
+// The activation scale dx is the other factor and it is NOT hoistable: it
+// depends on the activation row, so the product is formed inside the row loop.
+// What this removes from the inner loop is the byte pluck and the f16 convert:
+// ~7 uops per (output row, block pair), once, instead of per row tile.
+void build_q8_0_wscales(const u8 *w, i64 row_bytes, i64 nrows, i64 n, f32 *out) {
     const i64 npair = (n / 32) / 2;
-    for (i64 p = 0; p < npair; p++) {
-        const u8 *wp = w + p * 68;
-        const __m128i two = _mm_setr_epi16(
-            static_cast<short>(wp[0] | (static_cast<u16>(wp[1]) << 8)),
-            static_cast<short>(wp[34] | (static_cast<u16>(wp[35]) << 8)), 0, 0, 0,
-            0, 0, 0);
-        const __m128 d2 = _mm_cvtph_ps(two);
-        const f32 d0 = _mm_cvtss_f32(d2);
-        const f32 d1 = _mm_cvtss_f32(_mm_shuffle_ps(d2, d2, 0x55));
-        f32 *t = tab + p * 16;
-        for (i32 r = 0; r < 8; r++) {
-            const f32 *xr = dx + static_cast<i64>(r) * dstride + p * 2;
-            t[r * 2] = d0 * xr[0];
-            t[r * 2 + 1] = d1 * xr[1];
+    for (i64 o = 0; o < nrows; o++) {
+        const u8 *wr = w + o * row_bytes;
+        f32 *dst = out + o * npair * 16;
+        for (i64 p = 0; p < npair; p++) {
+            const u8 *wp = wr + p * 68;
+            const f32 d0 =
+                fp16_to_fp32(static_cast<u16>(wp[0] | (static_cast<u16>(wp[1]) << 8)));
+            const f32 d1 = fp16_to_fp32(
+                static_cast<u16>(wp[34] | (static_cast<u16>(wp[35]) << 8)));
+            f32 *v = dst + p * 16;
+            for (i32 i = 0; i < 8; i++) v[i] = d0;
+            for (i32 i = 8; i < 16; i++) v[i] = d1;
+        }
+    }
+}
+
+// Same shape for the activation side, so the inner loop has no scale build at
+// all: out[(r*npair + p)*16 + {0..7}] = dx[r][2p], + {8..15} = dx[r][2p+1].
+void build_q8_0_xscales(const f32 *dx, i64 dstride, i64 nrows, i64 n, f32 *out) {
+    const i64 npair = (n / 32) / 2;
+    for (i64 r = 0; r < nrows; r++) {
+        const f32 *dr = dx + r * dstride;
+        f32 *dst = out + r * npair * 16;
+        for (i64 p = 0; p < npair; p++) {
+            f32 *v = dst + p * 16;
+            for (i32 i = 0; i < 8; i++) v[i] = dr[2 * p];
+            for (i32 i = 8; i < 16; i++) v[i] = dr[2 * p + 1];
         }
     }
 }
 
 __attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
-void dot_q8_0_q8_tab8_vnni(const u8 *w, const i8 *xq, i64 n, i64 rstride,
-                           f32 *out, i64 out_stride, const f32 *tab) {
+void dot_q8_0_q8_wsc8_vnni(const u8 *w, const i8 *xq, i64 n, i64 rstride,
+                           f32 *out, i64 out_stride, const f32 *wsc,
+                           const f32 *xsc) {
     const i64 nb = n / 32;
+    const i64 npair = nb / 2;
     const __m512i zero = _mm512_setzero_si512();
     __m512 acc[8];
     for (i32 r = 0; r < 8; r++) acc[r] = _mm512_setzero_ps();
-    i64 p = 0;
-    for (i64 b = 0; b + 2 <= nb; b += 2, w += 68, p++) {
+    for (i64 p = 0; p < npair; p++, w += 68) {
         const __m256i lo =
             _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
         const __m256i hi =
             _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 36));
         const __m512i wv = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
         const __mmask64 neg = _mm512_cmp_epi8_mask(wv, zero, _MM_CMPINT_LT);
+        // Unsigned magnitude, -128 included (a masked subtract, not abs_epi8).
         const __m512i mag = _mm512_mask_sub_epi8(wv, neg, zero, wv);
-        const f32 *t = tab + p * 16;
+        // Both operands' scales arrive already expanded to the sixteen lanes
+        // that use them, so the whole per-row scale chain is one load + one
+        // multiply. This is the load-time repack, done on the axis that is
+        // legal -- keyed by the OUTPUT row, never shared across rows.
+        const __m512 wsv = _mm512_loadu_ps(wsc + p * 16);
         for (i32 r = 0; r < 8; r++) {
             const __m512i xv = _mm512_loadu_si512(reinterpret_cast<const void *>(
-                xq + static_cast<i64>(r) * rstride + b * 32));
+                xq + static_cast<i64>(r) * rstride + p * 64));
             const __m512i xb = _mm512_mask_sub_epi8(xv, neg, zero, xv);
             const __m512i iv = _mm512_dpbusd_epi32(zero, mag, xb);
-            const __m512 sc = _mm512_castsi512_ps(_mm512_inserti64x4(
-                _mm512_castps_si512(_mm512_castps256_ps512(
-                    _mm256_broadcast_ss(t + r * 2))),
-                _mm256_castps_si256(_mm256_broadcast_ss(t + r * 2 + 1)), 1));
-            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iv), sc, acc[r]);
+            const __m512 xsv =
+                _mm512_loadu_ps(xsc + (static_cast<i64>(r) * npair + p) * 16);
+            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iv),
+                                     _mm512_mul_ps(wsv, xsv), acc[r]);
         }
     }
     for (i32 r = 0; r < 8; r++)
         out[static_cast<i64>(r) * out_stride] = _mm512_reduce_add_ps(acc[r]);
+}
+
+// Falls back to the no-table kernel on any host that cannot run the VNNI form,
+// so the answer is the same everywhere.
+void dot_q8_0_q8_wsc8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                      i64 rstride, i64 dstride, f32 *out, i64 out_stride,
+                      const f32 *wsc, const f32 *xsc) {
+#if defined(KRK_DOT_AVX512)
+    if (wsc != nullptr && xsc != nullptr && cpu_has_vnni() &&
+        ((n / 32) & 1) == 0) {
+        dot_q8_0_q8_wsc8_vnni(w, xq, n, rstride, out, out_stride, wsc, xsc);
+        return;
+    }
+#endif
+    (void)wsc;
+    (void)xsc;
+    dot_q8_0_q8_x8(w, xq, dx, n, rstride, dstride, out, out_stride);
 }
 
 // ---- four output rows against one activation row (decode) -----------------
@@ -3792,7 +3846,7 @@ i32 q8_0_gemv_width(void) {
 void dot_q8_0_q8_r1xN(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
                       i64 n, i64 dstride, f32 *out, i64 out_stride, i32 kc) {
 #if defined(KRK_DOT_AVX512)
-    if (q8_0_tab_supported() && ((n / 32) & 1) == 0 && (n / 32) >= 2) {
+    if (q8_0_wsc_supported() && ((n / 32) & 1) == 0 && (n / 32) >= 2) {
         if (g_pf_ahead < 0) g_pf_ahead = pf_ahead_init();
         switch (kc) {
             case 1:
@@ -3816,27 +3870,12 @@ void dot_q8_0_q8_r1xN(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
 // Public feature probe. Defined here, outside the anonymous namespace that
 // holds cpu_has_vnni(), so callers in other translation units can ask without
 // the name collision that a bare re-declaration of cpu_has_vnni() causes.
-bool q8_0_tab_supported(void) {
+bool q8_0_wsc_supported(void) {
 #if defined(KRK_DOT_AVX512)
     return cpu_has_vnni();
 #else
     return false;
 #endif
-}
-
-// Table entry. Falls back to the no-table kernel whenever the table cannot be
-// used, so the result is identical on every host.
-void dot_q8_0_q8_tab8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
-                      i64 rstride, i64 dstride, f32 *out, i64 out_stride,
-                      const f32 *tab) {
-#if defined(KRK_DOT_AVX512)
-    if (tab != nullptr && cpu_has_vnni() && ((n / 32) & 1) == 0) {
-        dot_q8_0_q8_tab8_vnni(w, xq, n, rstride, out, out_stride, tab);
-        return;
-    }
-#endif
-    (void)tab;
-    dot_q8_0_q8_x8(w, xq, dx, n, rstride, dstride, out, out_stride);
 }
 
 // One rung, named explicitly. -1 = scalar, 1 = avx2, 2 = avx512bw, 3 = vnni.

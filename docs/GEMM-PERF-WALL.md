@@ -367,21 +367,74 @@ The remaining 2.5x is now itemised, per 512 MACs, in the shipped GEMM:
   row = 24;
 * the block header, once per block pair.
 
-The scale build was removed from the GEMM on the same day by hoisting it into a
-per-tile table (16.4% -> 22.4% of the int8 peak, prefill 710 -> 940 tok/s on the
-95 MiB fixture; see the commit). The sign flip is the floor: `vpdpbusd` takes
-one unsigned operand, the weight magnitude is it, so the activation must be
-sign-flipped per (row, block) and there is no cheaper form than the masked
-subtract.
+### Correction, 2026-10-31: the per-tile table was wrong, and it was not 1.5x
+
+The paragraph above used to say the scale build had been hoisted into a per-tile
+table and that this took prefill from 710 to 940 tok/s. **Both halves of that
+were wrong and both are withdrawn.**
+
+The table was built from the first output row of each row tile and then reused
+for the other seven. q8_0 block scales are per row, so that is only correct when
+every row of the matrix happens to share them. It does not. A row-scale-varying
+fixture (`tests/test_kraken.cpp`, `test_q8_0_scale_array_row_keyed`) disagrees
+with the reference kernel by up to **8.3e-01 relative on row 7** while agreeing
+exactly on row 0. The suite did not catch it because the fixture never compared
+the fast path against the reference kernel; it does now, and the negative
+control (`build_q8_0_wscales` over one row fed to all eight) is observed at
+8.257e-01.
+
+The 1.5x was measured on that kernel, i.e. on a kernel doing one eighth of the
+scale work and the wrong answer. Measured properly, in one process, three runs:
+
+| arm | GMAC/s | of C |
+|---|---:|---:|
+| E `dot_q8_0_q8_x8`, pre-table | 32.9 / 34.9 / 35.3 | 44% |
+| T the compact per-row table (first fix attempt) | 36.9 / 39.5 / 40.8 | 47-53% |
+| **T expanded per-row scales, shipped** | **44.4 / 45.4 / 48.7** | **57-64%** |
+
+So the compact table is **~1.1x**, not 1.5x, and it was not worth its own bug.
+
+### What does work: expand both scale factors to the lanes that use them
+
+The inner loop's real cost was never the MAC and never the sign flip alone --
+it was building `[d0*dx x8, d1*dx x8]` per (row, block pair): two f32 loads, two
+multiplies, two broadcasts and an insert, seven uops per 64 MACs. Both factors
+are known before the loop starts. Expand each to the sixteen lanes that consume
+it and the whole chain becomes one load and one multiply:
+
+* `build_q8_0_wscales` -> `wsc[(o*npair + p)*16 + {0..7}] = d(2p)`, `+{8..15} = d(2p+1)`,
+  per **output row**, built once per column block and reused across every
+  activation row tile;
+* `build_q8_0_xscales` -> the same for the activation side, built once per
+  act-row tile and shared by every output row.
+
+The inner loop is then load, `vpdpbusd`, `vcvtdq2ps`, `vmulps`, `vfmadd`:
+**5 uops per 64 MACs**, the same shape as the V1 ceiling. Measured 65-69 GMAC/s
+standalone, 44-49 GMAC/s through the engine with the activation array rebuilt per
+row tile, against 33-35 before. **1.30-1.40x on the kernel**, and end-to-end on
+the 95 MiB dense fixture **prefill 832 -> 928 tok/s (+11.6%, four runs)**; decode
+is unaffected because it never used this kernel.
+
+Two things this corrects in the itemisation above: the per-row scale vector was
+not ~24 uops per 512 MACs but the dominant term, and the "sign flip is the
+floor" claim stands unchanged -- `vpdpbssd` (signed x signed bytes) is
+AVX-VNNI-INT8, not AVX512_VNNI, so it is absent on this host and the masked
+subtract stays.
+
+Cost: the expanded arrays are 1 byte per weight per array. They are built once
+per column block / row tile and live in L2-L3; measured they win, and the same
+repack stored as f16 (0.5 B/weight) measured slightly slower (66.2 vs 68.4), so
+the kernel is still uop-bound rather than traffic-bound at this size.
 
 **Conclusion, stated as a fraction of something real.** On this 2-vCPU host the
-achievable mix ceiling is ~80 GMAC/s per thread; the engine reaches 34. For the
+achievable mix ceiling is ~80-89 GMAC/s per thread; the engine now reaches 44-49
+(52-60% of V1), up from 33-35. For the
 30B-A3B target -- 200 tok/s at 3.3 GMAC/token, i.e. 660 GMAC/s -- a 4-core box
 at 2.6 GHz needs 165 GMAC/s per core, which is 55% of int8 peak. The engine is
-at 22%, and the harness shows 55% is reachable only by removing the per-row
-scale vector as well as keeping the MAC at one instruction per 64 values. That
-is the shape of the remaining work, and it is a factor of 2.5, not a factor of
-10.
+at 52-60% of its own mix ceiling, so the prefill GEMM is now within ~1.7x of the
+instruction mix it runs and the next term is structural -- fewer instructions per
+64 MACs (wider tiles, more activation rows per weight load), not a cheaper
+per-block tail. That is still a factor of ~1.7, not a factor of 10.
 
 ## Where the decode GEMV's time goes (measured 2026-10-30)
 

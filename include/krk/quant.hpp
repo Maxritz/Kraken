@@ -322,25 +322,30 @@ f32 dot_q8_0_q8_scalar(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 f32 dot_q8_0_q8_bw(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 f32 dot_q8_0_q8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 
-// Eight-row q8_0 GEMM with a caller-owned scale table. `tab` holds 16 floats
-// per 64-element block pair (2 per row), built once per row tile with
-// build_q8_0_scales8() and reused across every output row of the matrix. Pass
-// nullptr to get the no-table kernel. Bit-identical to dot_q8_0_q8_x8.
-// Four output rows of a q8_0 GEMV against one activation row at a time, to
-// keep four weight streams in flight per thread. Identical values to calling
+// Four output rows of a q8_0 GEMV against one activation row at a time, to keep
+// four weight streams in flight per thread. Identical values to calling
 // dot_q8_0_q8() four times.
 void dot_q8_0_q8_r1xN(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
                       i64 n, i64 dstride, f32 *out, i64 out_stride, i32 kc);
 i32 q8_0_gemv_width(void);
 
-// True when dot_q8_0_q8_tab8() can use its table on this host.
-bool q8_0_tab_supported(void);
+// True when dot_q8_0_q8_wsc8() can use its preloaded scales on this host.
+bool q8_0_wsc_supported(void);
 
-void build_q8_0_scales8(const u8 *w, const f32 *dx, i64 dstride, i64 n,
-                        f32 *tab);
-void dot_q8_0_q8_tab8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+// Per-output-row f32 block scales, EXPANDED to the sixteen lanes that consume
+// them: out[(o*npair + p)*16 + {0..7}] = scale of block 2p, +{8..15} = block
+// 2p+1. npair = (n/32)/2. Built once per column block by the GEMM and reused
+// across every activation row tile, which is only sound because it is keyed by
+// the OUTPUT row -- an earlier version keyed it by the row TILE and was wrong
+// by up to 83% on matrices whose rows have different scales.
+// build_q8_0_xscales() does the same for the activation side.
+void build_q8_0_wscales(const u8 *w, i64 row_bytes, i64 nrows, i64 n,
+                        f32 *out);
+void build_q8_0_xscales(const f32 *dx, i64 dstride, i64 nrows, i64 n,
+                        f32 *out);
+void dot_q8_0_q8_wsc8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                       i64 rstride, i64 dstride, f32 *out, i64 out_stride,
-                      const f32 *tab);
+                      const f32 *wsc, const f32 *xsc);
 
 void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);

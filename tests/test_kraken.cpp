@@ -463,6 +463,67 @@ static void test_q4_0_layout() {
     }
 }
 
+// The shipped q8_0 GEMM keeps a side array of f32 block scales, built once per
+// COLUMN BLOCK and reused by every activation row tile (build_q8_0_wscales +
+// dot_q8_0_q8_wsc8). An earlier version built that side array from the FIRST
+// output row of each tile and reused it for all eight, which is only sound when
+// every row happens to share scales. Nothing in the suite caught it: the fixture
+// never compared the fast path against the reference kernel. This test does, on
+// a matrix whose rows deliberately have different scales, so the class of bug
+// cannot merge again.
+static void test_q8_0_scale_array_row_keyed() {
+    const int n_in = 256;   // 8 blocks, 4 block pairs
+    const int n_out = 8;    // exactly one eight-row tile: the grouping that broke
+    const int nb = n_in / 32;
+    const int row_bytes = nb * 34;
+    std::vector<u8> w(static_cast<size_t>(n_out) * row_bytes);
+    std::vector<f32> x(static_cast<size_t>(n_in));
+    std::vector<i8> xq(static_cast<size_t>(n_in));
+    for (int i = 0; i < n_in; i++) {
+        x[i] = 0.01f * static_cast<f32>((i * 37) % 19 - 9);
+        xq[i] = static_cast<i8>((i * 13) % 41 - 20);
+    }
+    // Scales that depend on BOTH the row and the block: no row shares a scale
+    // with another, so any reuse across rows shows up immediately.
+    for (int o = 0; o < n_out; o++) {
+        for (int b = 0; b < nb; b++) {
+            u8 *blk = w.data() + static_cast<size_t>(o) * row_bytes + b * 34;
+            const f32 sc = 0.005f * static_cast<f32>(o + 1) +
+                           0.001f * static_cast<f32>(b);
+            const u16 h = fp32_to_fp16(sc);
+            blk[0] = static_cast<u8>(h & 0xFF);
+            blk[1] = static_cast<u8>(h >> 8);
+            for (int j = 0; j < 32; j++)
+                blk[2 + j] = static_cast<u8>(
+                    static_cast<i8>(((o * 7 + b * 5 + j * 11) % 233) - 116));
+        }
+    }
+    // The x8 kernels always write eight output rows at out + r*out_stride, so
+    // the buffer has to hold them; row 0 of each call lands on index `o`.
+    std::vector<f32> dx(static_cast<size_t>(nb)),
+        ref(static_cast<size_t>(n_out) * 8), got(static_cast<size_t>(n_out) * 8);
+    for (int b = 0; b < nb; b++) dx[b] = 0.02f * static_cast<f32>(b + 1);
+    for (int o = 0; o < n_out; o++)
+        dot_q8_0_q8_x8(w.data() + static_cast<size_t>(o) * row_bytes, xq.data(),
+                       dx.data(), n_in, n_in, nb, ref.data() + o, n_out);
+    if (!q8_0_wsc_supported()) return;  // nothing to compare on a non-VNNI host
+    const i64 npair = nb / 2;
+    std::vector<f32> wsc(static_cast<size_t>(n_out * npair * 16));
+    build_q8_0_wscales(w.data(), row_bytes, n_out, n_in, wsc.data());
+    std::vector<f32> xsc(static_cast<size_t>(8 * npair * 16));
+    build_q8_0_xscales(dx.data(), nb, 8, n_in, xsc.data());
+    for (int o = 0; o < n_out; o++)
+        dot_q8_0_q8_wsc8(w.data() + static_cast<size_t>(o) * row_bytes, xq.data(),
+                         dx.data(), n_in, n_in, nb, got.data() + o, n_out,
+                         wsc.data() + o * npair * 16, xsc.data());
+    for (int o = 0; o < n_out; o++) {
+        const f32 den = std::max(1e-6f, std::fabs(ref[o]));
+        CHECK_NEAR(got[o], ref[o], 1e-5f * den,
+                   "q8_0 scale array must match the reference on every row, not "
+                   "just row 0 of a tile");
+    }
+}
+
 static void test_q8_0_layout() {
     u8 blk[34];
     const u16 half = fp32_to_fp16(0.5f);
@@ -28398,6 +28459,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_quant_geometry)
     TEST_GROUP(test_q4_0_layout)
     TEST_GROUP(test_q8_0_layout)
+    TEST_GROUP(test_q8_0_scale_array_row_keyed)
     TEST_GROUP(test_vec_dot_fast_opt_in)
     TEST_GROUP(test_gemm_batched_bit_identical)
     TEST_GROUP(test_vec_dot_avx2_matches_fast)
