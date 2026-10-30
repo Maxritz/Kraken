@@ -403,7 +403,20 @@ def build(path, n_embd, n_layer, n_head, n_kv, hd, n_ff, vocab, ctx, fmt, seed,
         arch = schema
     s_fused_ffn = schema in ("chatglm", "glm4")
     s_post_norms = schema in ("glm4", "glm4moe")
-    s_qk_norm = schema in ("mellum", "qwen38", "glm4moe") or qk_norm
+    # qwen3moe is in this set because the ENGINE's arch row for it declares
+    # per-head q/k norms, so a qwen3moe file without them is refused at load
+    # ("layer 0 is missing attn_q_norm.weight"). It was not, which meant the
+    # tool's own default MoE file -- --experts with no --schema, i.e. arch
+    # qwen3moe -- could not be loaded by the engine that asked for it. Qwen3's
+    # real MoE checkpoints carry both, so the arch row is the right side of
+    # this and the generator was the wrong one.
+    # Keyed on `arch`, not `schema`: the MoE path defaults arch to "qwen3moe"
+    # while leaving schema unset, so a check against `schema` alone emitted no
+    # q/k norms for it and the engine refused its own default MoE fixture
+    # ("layer 0 is missing attn_q_norm.weight"). Qwen3's real MoE checkpoints
+    # carry both, so the arch row is right and the generator was wrong.
+    s_qk_norm = (schema in ("mellum", "qwen38", "glm4moe") or
+                 arch == "qwen3moe" or qk_norm)
     s_qkv_bias = schema in ("qwen2vl", "glm4moe")
     s_wo_bias = schema == "phimoe"
     s_out_bias = schema == "phimoe"

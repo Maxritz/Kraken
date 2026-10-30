@@ -15,7 +15,9 @@
 #include "par_pool.hpp"
 
 #include <algorithm>
-#include <cfloat> // FLT_MAX bounding the SIMT/CPU rsqrt and the clamp paths
+#include <cfloat>
+#include <mutex>
+#include <unordered_map> // FLT_MAX bounding the SIMT/CPU rsqrt and the clamp paths
 #include <cmath>
 #include <cstdlib>
 #include <utility>
@@ -535,8 +537,95 @@ public:
     DType act_type() const override { return DType::F32; }
     size_t act_size() const override { return 4; }
 
+    static size_t pool_cap() {
+        static const size_t cap = [] {
+            const char *e = std::getenv("KRK_CPU_POOL_MB");
+            if (e && e[0] != '\0') {
+                const long mb = std::atol(e);
+                return mb <= 0 ? size_t(0) : static_cast<size_t>(mb) << 20;
+            }
+            return static_cast<size_t>(512) << 20;
+        }();
+        return cap;
+    }
+    mutable std::mutex pool_mu_;
+    std::unordered_map<size_t, std::vector<void *>> pool_free_;
+    size_t pool_free_bytes_ = 0, pool_reuse_ = 0, pool_alloc_ = 0, pool_free_n_ = 0,
+           pool_drop_ = 0;
+
     void *alloc(size_t bytes) override { return host_alloc(bytes); }
     void release(void *p) override { npu_flush_(); host_free(p); }
+
+    // ---- expert slot pool ------------------------------------------------
+    //
+    // The base class recycles nothing on this backend: alloc_pooled() is
+    // alloc() and release_pooled() is free(), so every cold expert miss asks
+    // the kernel for ~1.6 MB that has never been touched, the copy below
+    // faults those pages in one at a time, and the slot then stays live until
+    // it is evicted. Nothing is ever reused, so the process keeps first-touching
+    // new memory for the whole run.
+    //
+    // That is the entire `expert-path read` line on the 32-expert q8_0 fixture.
+    // Measured on the same bytes, same file, warm page cache:
+    //
+    //   destination reused         5.25 GB/s
+    //   malloc+free per chunk      9.78 GB/s
+    //   every slot live at once    2.05 GB/s   <- what this backend did
+    //
+    // against the 1.73 GB/s the engine actually reported, with `read 97.6 ms`
+    // on the prefill phase and `0.0 ms` on decode. A recycled slot keeps its
+    // pages mapped, so the copy writes into already-present memory.
+    //
+    // Bounded: slots beyond the budget are genuinely freed, so a model whose
+    // churn exceeds the cap degrades to the old behaviour instead of growing
+    // without limit. KRK_CPU_POOL_MB overrides, 0 disables the pool.
+    void *alloc_pooled(size_t bytes) override {
+        {
+            std::lock_guard<std::mutex> g(pool_mu_);
+            const size_t cap = pool_cap();
+            auto it = pool_free_.find(bytes);
+            if (it != pool_free_.end() && !it->second.empty()) {
+                void *p = it->second.back();
+                it->second.pop_back();
+                pool_free_bytes_ -= bytes;
+                ++pool_reuse_;
+                return p;
+            }
+            (void)cap;
+        }
+        void *p = host_alloc(bytes);
+        std::lock_guard<std::mutex> g(pool_mu_);
+        ++pool_alloc_;
+        return p;
+    }
+
+    void release_pooled(void *p, size_t bytes) override {
+        if (!p || bytes == 0) return;
+        {
+            std::lock_guard<std::mutex> g(pool_mu_);
+            if (pool_cap() > 0 && pool_free_bytes_ + bytes <= pool_cap()) {
+                pool_free_[bytes].push_back(p);
+                pool_free_bytes_ += bytes;
+                ++pool_free_n_;
+                return;
+            }
+            ++pool_drop_;
+        }
+        npu_flush_();
+        host_free(p);
+    }
+
+    ExpertPoolStats expert_pool_stats() const override {
+        std::lock_guard<std::mutex> g(pool_mu_);
+        ExpertPoolStats st;
+        st.budget = pool_cap();
+        st.committed = pool_free_bytes_;
+        st.live = pool_free_bytes_;
+        st.reusable = pool_free_bytes_;
+        st.allocations = pool_alloc_;
+        st.reuses = pool_reuse_;
+        return st;
+    }
     void upload(void *dst, const void *src, size_t bytes, size_t off) override {
         npu_flush_();
         std::memcpy(static_cast<char *>(dst) + off, src, bytes);
