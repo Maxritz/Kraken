@@ -105,6 +105,56 @@ __attribute__((target("avx512f,avx512bw,avx512vl"))) static double run(int mode,
     return static_cast<double>(kIters) * static_cast<double>(rows) * 64.0 / best / 1e9;
 }
 
+// The ceiling for the instruction mix this engine actually ships. A-D all
+// measure the maddubs + madd pair, which needs TWO instructions per 64 MACs;
+// the production q8_0 kernel uses vpdpbusd, which needs ONE. Comparing the
+// production kernel against a maddubs ceiling therefore flatters it, and the
+// first run of this tool did exactly that (E read 105% of C, which cannot be a
+// fraction of anything meaningful).
+//
+// Same body, same guard against hoisting: operands walk two L1-resident
+// buffers, each bumped by the iteration counter, the scale vector is built from
+// a runtime value, and the sink is volatile.
+__attribute__((target("avx512f,avx512bw,avx512vnni"))) static double run_vnni(
+    int rows, f32 scale, int tail) {
+    __m512i iacc[8];
+    __m512 facc[8];
+    const __m512 dv = _mm512_set1_ps(scale);
+    for (int r = 0; r < 8; r++) {
+        iacc[r] = _mm512_setzero_si512();
+        facc[r] = _mm512_setzero_ps();
+    }
+    constexpr long kIters = 60000;
+    double best = 1e30;
+    for (int rep = 0; rep < 5; rep++) {
+        const double t0 = now_s();
+        for (long i = 0; i < kIters; i++) {
+            const unsigned char *w = g_w + ((i * 544) & 8191);
+            const signed char *a = g_a + ((i * 256) & 4095);
+            for (int r = 0; r < rows; r++) {
+                const __m512i wv = _mm512_loadu_si512(w + r * 68);
+                const __m512i av = _mm512_loadu_si512(a + r * 32);
+                const __m512i p32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(),
+                                                        wv, av);
+                if (tail)
+                    facc[r] = _mm512_fmadd_ps(dv, _mm512_cvtepi32_ps(p32),
+                                              facc[r]);
+                else
+                    iacc[r] = _mm512_add_epi32(iacc[r], p32);
+            }
+        }
+        const double dt = now_s() - t0;
+        if (dt < best) best = dt;
+        volatile double sink = 0.0;
+        for (int r = 0; r < 8; r++)
+            sink += tail ? static_cast<double>(_mm512_reduce_add_ps(facc[r]))
+                         : static_cast<double>(_mm512_reduce_add_epi32(iacc[r]));
+        (void)sink;
+    }
+    return static_cast<double>(kIters) * static_cast<double>(rows) * 64.0 /
+           best / 1e9;
+}
+
 // The shipped kernel on a realistically shaped problem, measured in the same
 // process as the ceiling above: a 1.67 MB weight matrix (n_out x 816 B for 768
 // inputs) and 512 activation rows. Reporting the two together is the only way
@@ -270,6 +320,20 @@ int main(int argc, char **argv) {
     std::printf("%-42s %7.2f %6.0f%%  <- the in-engine probe's loop shape\n",
                 "P  probe shape (one operand, eight multipliers)", probe_shape(),
                 100.0 * probe_shape() / c);
+    if (__builtin_cpu_supports("avx512vnni")) {
+        const double v0 = run_vnni(8, scale, 0);
+        const double v1 = run_vnni(8, scale, 1);
+        std::printf("%-42s %7.2f %6.0f%%  <- vpdpbusd, integer only\n",
+                    "V0 VNNI registers only", v0, 100.0 * v0 / c);
+        std::printf("%-42s %7.2f %6.0f%%  <- the mix the engine ships\n",
+                    "V1 VNNI + loads + int->float tail", v1, 100.0 * v1 / c);
+        const double e0 = shipped(768, 2048, 512);
+        std::printf("%-42s %7.2f %6.0f%%  <- E as a fraction of the VNNI ceiling\n",
+                    "E  production kernel, of V1", e0, 100.0 * e0 / v1);
+    } else {
+        std::printf("%-42s    n/a  (no avx512vnni on this host)\n",
+                    "V  VNNI ceiling");
+    }
     const double f = no_scale_chain(768, 2048, 512, scale);
     std::printf("%-42s %7.2f %6.0f%%  <- same body, no scale chain\n",
                 "F  E without the per-block scale chain", f, 100.0 * f / c);

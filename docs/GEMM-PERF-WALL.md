@@ -337,3 +337,87 @@ change that gives a row one scale instead of one per 32 values.
 The remaining smaller rungs are not worth chasing: the per-block activation
 flip is 3.4%, the two-load weight assembly 1.5%, and the sign mask and magnitude
 formation approximately nothing.
+
+## Re-measured 2026-10-30, with VNNI and after the scale table
+
+The paragraph above ends "cannot be removed without either VNNI (absent here) or
+a format change". VNNI is *not* absent on this host, and the comparison that
+said the tail was unremovable was being made against the wrong ceiling. Two
+corrections, both from `tools/bench_isa_ceiling.cpp` in one process:
+
+| variant | GMAC/s | of C |
+|---|---:|---:|
+| C loads + int->float tail (maddubs pair) | 70.7-76.2 | 100% |
+| **V0 VNNI, registers only** | **86.4-93.2** | 122% |
+| **V1 VNNI + loads + int->float tail** | **78.2-80.6** | 111% |
+| E production kernel, 768x2048x512 | 32.2 | **40% of V1** |
+
+So the number the kernel should be judged against is **V1, the exact
+instruction mix it ships**, not the maddubs ceiling. Against V1 the production
+kernel is at 40%, not at 105% as the first comparison suggested (105% of a
+ceiling cheaper than the kernel's own instruction mix is not a fraction of
+anything).
+
+The remaining 2.5x is now itemised, per 512 MACs, in the shipped GEMM:
+
+* 8 `vpdpbusd` -- the MACs themselves;
+* one activation load, one masked sign flip, one `vcvtdq2ps`, one `vfmadd`
+  per row = 32;
+* the scale vector, `[d0*dx x8, d1*dx x8]`, two broadcasts plus an insert per
+  row = 24;
+* the block header, once per block pair.
+
+The scale build was removed from the GEMM on the same day by hoisting it into a
+per-tile table (16.4% -> 22.4% of the int8 peak, prefill 710 -> 940 tok/s on the
+95 MiB fixture; see the commit). The sign flip is the floor: `vpdpbusd` takes
+one unsigned operand, the weight magnitude is it, so the activation must be
+sign-flipped per (row, block) and there is no cheaper form than the masked
+subtract.
+
+**Conclusion, stated as a fraction of something real.** On this 2-vCPU host the
+achievable mix ceiling is ~80 GMAC/s per thread; the engine reaches 34. For the
+30B-A3B target -- 200 tok/s at 3.3 GMAC/token, i.e. 660 GMAC/s -- a 4-core box
+at 2.6 GHz needs 165 GMAC/s per core, which is 55% of int8 peak. The engine is
+at 22%, and the harness shows 55% is reachable only by removing the per-row
+scale vector as well as keeping the MAC at one instruction per 64 values. That
+is the shape of the remaining work, and it is a factor of 2.5, not a factor of
+10.
+
+## Where the decode GEMV's time goes (measured 2026-10-30)
+
+The decode kernel is not memory-bound and it is not MAC-bound -- it is
+**uop-bound**, and the byte rate says so. On a 71 MB q8_0 matrix (larger than the
+54 MB L3, so it streams):
+
+| variant | ms | GB/s |
+|---|---:|---:|
+| full kernel | 5.50 | 13.0 |
+| bare: load + vpdpbusd + convert | 3.05 | 23.4 |
+| no sign flip | 4.22 | 16.9 |
+| no f32 scale path | 2.73 | 26.1 |
+| *pure streaming read of the same bytes* | *2.80* | *25.5* |
+
+So the ceiling is ~26 GB/s, the core loop already reaches it, and the whole gap
+is the work around the MAC: **the scale path is ~49% of the time and the
+per-row sign flip ~23%**. Two conclusions that cost nothing to remember:
+
+* anything that removes uops from this loop is worth ~1.3x, because there is
+  only 1.9x of headroom in total;
+* the sign flip is structural (see this document's opening: `vpdpbusd` takes one
+  unsigned operand and the weight magnitude must be it), so the scale path is
+  where the headroom actually is.
+
+The first cut taken from that: both f16 block halves now arrive in ONE 32-bit
+load and are converted by a single `vcvtph2ps`, and the per-block-pair scale
+vector is built with one broadcast plus one `vpermps` instead of two broadcasts
+plus an insert. Interleaved A/B, four pairs, same bytes and same process:
+
+| | ms | GB/s |
+|---|---:|---:|
+| before | 4.47-5.05 | 14.1-15.9 |
+| after | 3.50-3.96 | 18.0-20.4 |
+
+1.28x, and the kernel is now at ~70% of its own memory roofline. What remains is
+the per-block-pair scale vector itself; the way to remove it is a layout that
+stores a row's 32 f16 scales contiguously so one load and one convert yields all
+of them, which is a load-time transform and not a kernel change.
