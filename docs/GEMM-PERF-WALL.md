@@ -421,3 +421,71 @@ plus an insert. Interleaved A/B, four pairs, same bytes and same process:
 the per-block-pair scale vector itself; the way to remove it is a layout that
 stores a row's 32 f16 scales contiguously so one load and one convert yields all
 of them, which is a load-time transform and not a kernel change.
+
+## Correction: the decode scale path is 1.4x of ceiling, not 49%
+
+An earlier section of this document credited the per-row scale build with ~49% of
+the decode GEMV, from an ablation that read 2.73 ms with the "f32 scale tail" off
+against 5.50 ms on. That attribution was wrong: that arm removed the
+int-to-float convert and the multiply-add as well as the scale build, and the
+three were counted as one.
+
+`tools/bench_gemv_scale.cpp` separates them properly by measuring the bound
+instead of a mutilation -- `V1` hoists the scale vector out of the loop entirely,
+which is not implementable (the scale depends on the row and block pair) and is
+therefore the most any scale work can ever be worth:
+
+| | busy host | quiet host |
+|---|---:|---:|
+| V0 shipped | 14.0-16.4 GB/s | 19.7-24.7 GB/s |
+| V1 scale hoisted (absolute bound) | 19.1-22.5 | 21.3-27.2 |
+| V3 prebuilt f16 scale table | 17.7-19.0 | 21.5-25.6 |
+
+So the whole scale build is worth **1.13x on a quiet host and 1.4x on a busy
+one**, and the best realistic table is 1.08-1.19x. The kernel is otherwise at the
+memory floor: with the scale work removed it runs at ~27 GB/s against a measured
+25.5 GB/s pure stream read of the same bytes.
+
+That closes this kernel as a target. Any further decode throughput has to come
+from moving fewer bytes per token, not from cheaper instructions per byte -- see
+`docs/KINDI-GEMV-COMPARISON.md` for the same conclusion reached from a different
+direction.
+
+## Prefill: the same fix was already applied, and here is what is left
+
+The decode GEMV analysis above does not transfer to prefill, and it is worth
+being precise about why. Prefill is a batched GEMM: each weight block is decoded
+once and reused across every row in the tile, so weight traffic is amortised by
+the row count and the loop is **instruction-bound**. A change that removes uops
+can therefore pay far more here than in decode — and it did.
+
+`tools/bench_isa_ceiling.cpp` now measures the kernel the GEMM path actually
+ships (`T`: `build_q8_0_scales8` + `dot_q8_0_q8_tab8`) alongside the kernel that
+predates the scale table (`E`: `dot_q8_0_q8_x8`). That distinction matters,
+because `E` is what the earlier "40% of the mix ceiling" figure was measured on,
+and the engine has not called `E` since the table landed. Four runs, same
+process, same shape (768 x 2048 x 512):
+
+| | GMAC/s | of the maddubs ceiling C |
+|---|---:|---:|
+| E kernel before the scale table | 30.3-40.2 | 49-63% |
+| **T shipped, with the per-tile scale table** | **43.9-62.1** | **75-91%** |
+| V1 the VNNI mix ceiling | 56.3-83.8 | 106-131% |
+
+Same-run ratios, which is the only comparison the host's noise permits:
+
+* **the table is worth 1.45x / 1.47x / 1.52x / 1.56x on prefill** — consistently
+  larger than the 1.08-1.19x it is worth on decode, exactly as an
+  instruction-bound loop should behave;
+* the shipped GEMM is at **67-105% of V1** (median ~76%), not the 40% that was
+  reported against the pre-table kernel.
+
+The residual gap to V1 is one table load plus eight `vpermps` per block pair,
+about nine uops per 512 MACs, which is the price of not rebuilding the scale
+vector. Removing it needs a layout where a row's 32 block scales are contiguous
+so one load and one convert produce all of them. That is the same load-time
+repack the decode section points at, and it is the last structural change
+available in either kernel.
+
+**Conclusion for prefill: the fix is already in and is worth ~1.5x; the kernel is
+within ~1.3x of its ceiling; there is no second scale win to collect.**

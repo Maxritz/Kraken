@@ -35,6 +35,8 @@ using krk::u32;
 using krk::i8;
 using krk::quantize_q8_row;
 using krk::dot_q8_0_q8_x8;
+using krk::dot_q8_0_q8_tab8;
+using krk::build_q8_0_scales8;
 
 #include <cstdio>
 #include <cstdlib>
@@ -206,6 +208,64 @@ static double shipped(i64 n_in, i64 n_out, i64 rows) {
     return macs / best / 1e9;
 }
 
+// The kernel the GEMM path ACTUALLY ships: the eight-row tile fed from a
+// per-row-tile scale table (build_q8_0_scales8 + dot_q8_0_q8_tab8), which is
+// what backend_cpu.cpp calls. `shipped()` below still drives
+// dot_q8_0_q8_x8, the kernel that predates the table, so reporting that one as
+// "the production kernel" understates the engine by the whole table win and
+// made an earlier version of this comment claim 40% of the ceiling when the
+// real figure is much closer to it.
+static double shipped_tab(i64 n_in, i64 n_out, i64 rows) {
+    const i64 nb = n_in / 32;
+    const i64 row_bytes = nb * 34;
+    std::vector<u8> w(static_cast<size_t>(n_out * row_bytes));
+    u32 st = 12345;
+    for (auto &b : w) {
+        st = st * 1664525u + 1013904223u;
+        b = static_cast<u8>(st >> 24);
+    }
+    for (i64 o = 0; o < n_out; o++)
+        for (i64 b = 0; b < nb; b++) {
+            const u16 d = static_cast<u16>(0x2000 + ((o * 31 + b * 7) & 0x1fff));
+            w[static_cast<size_t>(o * row_bytes + b * 34)] = static_cast<u8>(d & 0xff);
+            w[static_cast<size_t>(o * row_bytes + b * 34 + 1)] = static_cast<u8>(d >> 8);
+        }
+    std::vector<f32> xf(static_cast<size_t>(rows * n_in));
+    for (auto &v : xf) {
+        st = st * 1664525u + 1013904223u;
+        v = static_cast<f32>(st >> 8) / 16777216.0f * 6.0f - 3.0f;
+    }
+    std::vector<i8> xq(static_cast<size_t>(rows * n_in));
+    std::vector<f32> xd(static_cast<size_t>(rows * nb));
+    for (i64 r = 0; r < rows; r++)
+        quantize_q8_row(xf.data() + r * n_in, n_in, xq.data() + r * n_in,
+                        xd.data() + r * nb);
+    std::vector<f32> out(static_cast<size_t>(rows * n_out));
+    std::vector<f32> tab(static_cast<size_t>((n_in / 64) * 16));
+    double best = 1e30;
+    for (int rep = 0; rep < 5; rep++) {
+        const double t0 = now_s();
+        for (i64 r = 0; r + 8 <= rows; r += 8)
+            for (i64 o = 0; o < n_out; o++) {
+                // One table build per row tile, as the backend does it.
+                if (o == 0)
+                    build_q8_0_scales8(w.data(), xd.data() + r * nb, nb, n_in,
+                                       tab.data());
+                dot_q8_0_q8_tab8(w.data() + static_cast<size_t>(o) * row_bytes,
+                                 xq.data() + r * n_in, xd.data() + r * nb, n_in,
+                                 n_in, nb, out.data() + r * n_out + o, n_out,
+                                 tab.data());
+            }
+        const double dt = now_s() - t0;
+        if (dt < best) best = dt;
+    }
+    const double macs = static_cast<double>(rows / 8 * 8) *
+                        static_cast<double>(n_out) * static_cast<double>(n_in);
+    volatile double sink = out[0];
+    (void)sink;
+    return macs / best / 1e9;
+}
+
 // The shipped kernel body over the same 1.67 MB matrix, with the per-block
 // scale load and its dependency chain removed but the scale itself still a
 // runtime value, so nothing can be hoisted or folded away. F vs E is the cost
@@ -327,9 +387,9 @@ int main(int argc, char **argv) {
                     "V0 VNNI registers only", v0, 100.0 * v0 / c);
         std::printf("%-42s %7.2f %6.0f%%  <- the mix the engine ships\n",
                     "V1 VNNI + loads + int->float tail", v1, 100.0 * v1 / c);
-        const double e0 = shipped(768, 2048, 512);
-        std::printf("%-42s %7.2f %6.0f%%  <- E as a fraction of the VNNI ceiling\n",
-                    "E  production kernel, of V1", e0, 100.0 * e0 / v1);
+        const double e0 = shipped_tab(768, 2048, 512);
+        std::printf("%-42s %7.2f %6.0f%%  <- SHIPPED GEMM as a fraction of V1\n",
+                    "T  production kernel, of V1", e0, 100.0 * e0 / v1);
     } else {
         std::printf("%-42s    n/a  (no avx512vnni on this host)\n",
                     "V  VNNI ceiling");
@@ -338,8 +398,12 @@ int main(int argc, char **argv) {
     std::printf("%-42s %7.2f %6.0f%%  <- same body, no scale chain\n",
                 "F  E without the per-block scale chain", f, 100.0 * f / c);
     const double e = shipped(768, 2048, 512);
-    std::printf("%-42s %7.2f %6.0f%%  <- shipped dot_q8_0_q8_x8\n",
-                "E  production kernel, 768x2048x512", e, 100.0 * e / c);
+    std::printf("%-42s %7.2f %6.0f%%  <- dot_q8_0_q8_x8, pre-table\n",
+                "E  kernel before the scale table", e, 100.0 * e / c);
+    const double et = shipped_tab(768, 2048, 512);
+    std::printf("%-42s %7.2f %6.0f%%  <- what the GEMM path ships now\n",
+                "T  production kernel WITH the scale table", et,
+                100.0 * et / c);
     std::printf("  (probe sink %d)\n", sink_value());
     std::free(g_w);
     std::free(g_a);

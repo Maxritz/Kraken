@@ -592,6 +592,16 @@ target_link_libraries(kraken-q80-gemm-bench PRIVATE krk_core)
 add_executable(kraken-isa-ceiling tools/bench_isa_ceiling.cpp)
 target_link_libraries(kraken-isa-ceiling PRIVATE krk_core)
 
+# How much of the q8_0 decode GEMV is its scale handling, and does a prebuilt
+# scale table reach that ceiling? The shipped kernel against a hoisted-scale
+# bound and two table widths, in one process on weights larger than L3.
+add_executable(kraken-gemv-scale tools/bench_gemv_scale.cpp)
+target_link_libraries(kraken-gemv-scale PRIVATE krk_core)
+
+# Is a ternary format actually faster for a CPU decode GEMV? q8_0 against the
+# LUT shape and a VNNI-native bit-plane decode, each reading its own format.
+add_executable(kraken-ternary-gemv tools/bench_ternary_gemv.cpp)
+
 # Every block count, odd ones included: the 512-bit Q8_0 kernel advances two
 # blocks per iteration, so an odd count depends on the dispatcher refusing it.
 add_executable(kraken-q80-odd tools/ta_q80_odd.cpp)
