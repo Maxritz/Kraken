@@ -1196,7 +1196,21 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     // and load-time warmup is neither. Printed only when a phase ran, so a
     // run with no promotion in one of them does not grow a line of zeros.
     const f64 pf_prom = ec.prefill_promote_ms(), dc_prom = ec.decode_promote_ms();
-    if (pf_prom > 0.0 || dc_prom > 0.0) {
+    // Printed when ANY of the five stages cost time, not only a promotion.
+    // The condition used to be the two promotion clocks, which are exactly the
+    // two that are ZERO on a pure-CPU run: there the whole expert-path cost is
+    // `read` (the mapping faulting in and copying to the slot, see
+    // ExpertCache::acquire), and the run that most needs the split -- which
+    // side of prefill/decode the file reads belong to -- was the one that never
+    // printed it. Observed on the 32-expert q8_0 fixture: merged
+    // `read 101.5 ms` against a 65.2 ms decode, with no split line at all.
+    const bool any_expert_cost =
+        pf_prom > 0.0 || dc_prom > 0.0 || ec.prefill_read_ms() > 0.0 ||
+        ec.decode_read_ms() > 0.0 || ec.prefill_xfer_ms() > 0.0 ||
+        ec.decode_xfer_ms() > 0.0 || ec.prefill_room_ms() > 0.0 ||
+        ec.decode_room_ms() > 0.0 || ec.prefill_alloc_ms() > 0.0 ||
+        ec.decode_alloc_ms() > 0.0;
+    if (any_expert_cost) {
         std::fprintf(out,
                      "[stats ] expert-path split  prefill: read %7.1f | room %7.1f | "
                      "alloc %7.1f | xfer %7.1f | promote %7.1f ms\n"
