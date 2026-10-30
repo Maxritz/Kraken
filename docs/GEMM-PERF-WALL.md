@@ -382,3 +382,42 @@ at 22%, and the harness shows 55% is reachable only by removing the per-row
 scale vector as well as keeping the MAC at one instruction per 64 values. That
 is the shape of the remaining work, and it is a factor of 2.5, not a factor of
 10.
+
+## Where the decode GEMV's time goes (measured 2026-10-30)
+
+The decode kernel is not memory-bound and it is not MAC-bound -- it is
+**uop-bound**, and the byte rate says so. On a 71 MB q8_0 matrix (larger than the
+54 MB L3, so it streams):
+
+| variant | ms | GB/s |
+|---|---:|---:|
+| full kernel | 5.50 | 13.0 |
+| bare: load + vpdpbusd + convert | 3.05 | 23.4 |
+| no sign flip | 4.22 | 16.9 |
+| no f32 scale path | 2.73 | 26.1 |
+| *pure streaming read of the same bytes* | *2.80* | *25.5* |
+
+So the ceiling is ~26 GB/s, the core loop already reaches it, and the whole gap
+is the work around the MAC: **the scale path is ~49% of the time and the
+per-row sign flip ~23%**. Two conclusions that cost nothing to remember:
+
+* anything that removes uops from this loop is worth ~1.3x, because there is
+  only 1.9x of headroom in total;
+* the sign flip is structural (see this document's opening: `vpdpbusd` takes one
+  unsigned operand and the weight magnitude must be it), so the scale path is
+  where the headroom actually is.
+
+The first cut taken from that: both f16 block halves now arrive in ONE 32-bit
+load and are converted by a single `vcvtph2ps`, and the per-block-pair scale
+vector is built with one broadcast plus one `vpermps` instead of two broadcasts
+plus an insert. Interleaved A/B, four pairs, same bytes and same process:
+
+| | ms | GB/s |
+|---|---:|---:|
+| before | 4.47-5.05 | 14.1-15.9 |
+| after | 3.50-3.96 | 18.0-20.4 |
+
+1.28x, and the kernel is now at ~70% of its own memory roofline. What remains is
+the per-block-pair scale vector itself; the way to remove it is a layout that
+stores a row's 32 f16 scales contiguously so one load and one convert yields all
+of them, which is a load-time transform and not a kernel change.

@@ -3717,6 +3717,10 @@ __attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
 void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
                          i64 n, f32 *out, i64 out_stride) {
     const i64 nb = n / 32;
+    // [0 x8, 1 x8]: replicate the first pair of lanes across each 256-bit half,
+    // which is the shape a q8_0 block pair needs (two scales, eight lanes each).
+    const __m512i k_pair_lanes = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
+                                                   1, 1, 1, 1, 1, 1);
     __m512 acc[kC];
     for (i32 c = 0; c < kC; c++) acc[c] = _mm512_setzero_ps();
     i64 p = 0;
@@ -3735,13 +3739,21 @@ void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
             if (g_pf_ahead > 0)
                 _mm_prefetch(reinterpret_cast<const char *>(wp + g_pf_ahead * 68),
                              _MM_HINT_T0);
-            const __m128i two = _mm_setr_epi16(
-                static_cast<short>(wp[0] | (static_cast<u16>(wp[1]) << 8)),
-                static_cast<short>(wp[34] | (static_cast<u16>(wp[35]) << 8)), 0,
-                0, 0, 0, 0, 0);
-            const __m128 d2 = _mm_cvtph_ps(two);
-            const f32 d0 = _mm_cvtss_f32(d2);
-            const f32 d1 = _mm_cvtss_f32(_mm_shuffle_ps(d2, d2, 0x55));
+            // Both f16 block halves arrive in ONE 32-bit load: the two bytes at
+            // wp[0..1] and the two at wp[34..35], packed into lanes 0 and 1 of
+            // an epi32. vcvtph2ps then converts both at once, so the pair
+            // costs a load and a convert instead of two byte-by-byte
+            // assemblies, and the scale vector is one broadcast and one
+            // permute instead of two broadcasts and an insert.
+            const u32 s01 = static_cast<u32>(wp[0]) |
+                            (static_cast<u32>(wp[1]) << 8) |
+                            (static_cast<u32>(wp[34]) << 16) |
+                            (static_cast<u32>(wp[35]) << 24);
+            const __m128 d2 = _mm_cvtph_ps(_mm_cvtsi32_si128(
+                static_cast<int>(s01)));
+            const __m128 dd = _mm_mul_ps(d2, _mm_setr_ps(sx0, sx1, 0.0f, 0.0f));
+            const __m512 sc = _mm512_permutexvar_ps(
+                k_pair_lanes, _mm512_broadcast_f32x4(dd));
             const __m256i lo =
                 _mm256_loadu_si256(reinterpret_cast<const __m256i *>(wp + 2));
             const __m256i hi =
@@ -3756,12 +3768,6 @@ void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
                 xv, neg, _mm512_setzero_si512(), xv);
             const __m512i iv = _mm512_dpbusd_epi32(_mm512_setzero_si512(), mag,
                                                    xb);
-            const f32 s0 = d0 * sx0;
-            const f32 s1 = d1 * sx1;
-            const __m512 sc = _mm512_castsi512_ps(_mm512_inserti64x4(
-                _mm512_castps_si512(
-                    _mm512_castps256_ps512(_mm256_broadcast_ss(&s0))),
-                _mm256_castps_si256(_mm256_broadcast_ss(&s1)), 1));
             acc[c] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iv), sc, acc[c]);
         }
     }
