@@ -337,3 +337,48 @@ change that gives a row one scale instead of one per 32 values.
 The remaining smaller rungs are not worth chasing: the per-block activation
 flip is 3.4%, the two-load weight assembly 1.5%, and the sign mask and magnitude
 formation approximately nothing.
+
+## Re-measured 2026-10-30, with VNNI and after the scale table
+
+The paragraph above ends "cannot be removed without either VNNI (absent here) or
+a format change". VNNI is *not* absent on this host, and the comparison that
+said the tail was unremovable was being made against the wrong ceiling. Two
+corrections, both from `tools/bench_isa_ceiling.cpp` in one process:
+
+| variant | GMAC/s | of C |
+|---|---:|---:|
+| C loads + int->float tail (maddubs pair) | 70.7-76.2 | 100% |
+| **V0 VNNI, registers only** | **86.4-93.2** | 122% |
+| **V1 VNNI + loads + int->float tail** | **78.2-80.6** | 111% |
+| E production kernel, 768x2048x512 | 32.2 | **40% of V1** |
+
+So the number the kernel should be judged against is **V1, the exact
+instruction mix it ships**, not the maddubs ceiling. Against V1 the production
+kernel is at 40%, not at 105% as the first comparison suggested (105% of a
+ceiling cheaper than the kernel's own instruction mix is not a fraction of
+anything).
+
+The remaining 2.5x is now itemised, per 512 MACs, in the shipped GEMM:
+
+* 8 `vpdpbusd` -- the MACs themselves;
+* one activation load, one masked sign flip, one `vcvtdq2ps`, one `vfmadd`
+  per row = 32;
+* the scale vector, `[d0*dx x8, d1*dx x8]`, two broadcasts plus an insert per
+  row = 24;
+* the block header, once per block pair.
+
+The scale build was removed from the GEMM on the same day by hoisting it into a
+per-tile table (16.4% -> 22.4% of the int8 peak, prefill 710 -> 940 tok/s on the
+95 MiB fixture; see the commit). The sign flip is the floor: `vpdpbusd` takes
+one unsigned operand, the weight magnitude is it, so the activation must be
+sign-flipped per (row, block) and there is no cheaper form than the masked
+subtract.
+
+**Conclusion, stated as a fraction of something real.** On this 2-vCPU host the
+achievable mix ceiling is ~80 GMAC/s per thread; the engine reaches 34. For the
+30B-A3B target -- 200 tok/s at 3.3 GMAC/token, i.e. 660 GMAC/s -- a 4-core box
+at 2.6 GHz needs 165 GMAC/s per core, which is 55% of int8 peak. The engine is
+at 22%, and the harness shows 55% is reachable only by removing the per-row
+scale vector as well as keeping the MAC at one instruction per 64 values. That
+is the shape of the remaining work, and it is a factor of 2.5, not a factor of
+10.

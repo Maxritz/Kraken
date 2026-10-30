@@ -3706,6 +3706,12 @@ void dot_q8_0_q8_tab8_vnni(const u8 *w, const i8 *xq, i64 n, i64 rstride,
 // decode GEMM: 234 us/op at one stream, 138 at two, 139 at four, 123 at eight,
 // 128 at sixteen. The whole gain is in 1 -> 2 and it is 1.7x; eight is where the
 // curve tops out, so eight is the default.
+static i64 g_pf_ahead = -1;
+static i64 pf_ahead_init() {
+    const char *e = std::getenv("KRK_CPU_GEMV_PF");
+    return (e && e[0] != '\0') ? std::atoll(e) : 16;
+}
+
 template <i32 kC>
 __attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
 void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
@@ -3721,6 +3727,14 @@ void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
         const f32 sx1 = dx[b + 1];
         for (i32 c = 0; c < kC; c++) {
             const u8 *wp = w + static_cast<i64>(c) * wstride + p * 68;
+            // Eight rows in flight is eight streams per thread; sixteen once
+            // both threads are running. That is at the edge of what the
+            // hardware prefetcher tracks, so ask for the row a few block pairs
+            // ahead explicitly. KRK_CPU_GEMV_PF=0 turns it off, which is the
+            // arm this was measured with.
+            if (g_pf_ahead > 0)
+                _mm_prefetch(reinterpret_cast<const char *>(wp + g_pf_ahead * 68),
+                             _MM_HINT_T0);
             const __m128i two = _mm_setr_epi16(
                 static_cast<short>(wp[0] | (static_cast<u16>(wp[1]) << 8)),
                 static_cast<short>(wp[34] | (static_cast<u16>(wp[35]) << 8)), 0,
@@ -3773,6 +3787,7 @@ void dot_q8_0_q8_r1xN(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
                       i64 n, i64 dstride, f32 *out, i64 out_stride, i32 kc) {
 #if defined(KRK_DOT_AVX512)
     if (q8_0_tab_supported() && ((n / 32) & 1) == 0 && (n / 32) >= 2) {
+        if (g_pf_ahead < 0) g_pf_ahead = pf_ahead_init();
         switch (kc) {
             case 1:
                 out[0] = _mm512_reduce_add_ps(_mm512_setzero_ps());
