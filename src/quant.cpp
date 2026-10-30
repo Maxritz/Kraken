@@ -3783,6 +3783,7 @@ void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
             _mm512_loadu_si512(reinterpret_cast<const void *>(xq + b * 32));
         const f32 sx0 = dx[b];
         const f32 sx1 = dx[b + 1];
+
         for (i32 c = 0; c < kC; c++) {
             const u8 *wp = w + static_cast<i64>(c) * wstride + p * 68;
             // Eight rows in flight is eight streams per thread; sixteen once
@@ -3805,9 +3806,16 @@ void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
                             (static_cast<u32>(wp[35]) << 24);
             const __m128 d2 = _mm_cvtph_ps(_mm_cvtsi32_si128(
                 static_cast<int>(s01)));
-            const __m128 dd = _mm_mul_ps(d2, _mm_setr_ps(sx0, sx1, 0.0f, 0.0f));
+            // Measured 2026-10-31: replacing this chain with a pre-expanded
+            // activation-scale array (one 64 B load and one multiply, no
+            // permute) is NOT faster -- 75.2 vs 78.6 us/op medians, four runs,
+            // same binary. The decode loop is at its memory-level-parallelism
+            // limit, not its uop limit, so trading three uops for a 64-byte
+            // load per (row, block pair) is a loss. Left as it is on purpose.
             const __m512 sc = _mm512_permutexvar_ps(
-                k_pair_lanes, _mm512_broadcast_f32x4(dd));
+                k_pair_lanes,
+                _mm512_broadcast_f32x4(
+                    _mm_mul_ps(d2, _mm_setr_ps(sx0, sx1, 0.0f, 0.0f))));
             const __m256i lo =
                 _mm256_loadu_si256(reinterpret_cast<const __m256i *>(wp + 2));
             const __m256i hi =

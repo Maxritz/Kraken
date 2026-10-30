@@ -436,6 +436,34 @@ instruction mix it runs and the next term is structural -- fewer instructions pe
 64 MACs (wider tiles, more activation rows per weight load), not a cheaper
 per-block tail. That is still a factor of ~1.7, not a factor of 10.
 
+## The decode table: measured, and it is not there (2026-10-31)
+
+The second open item after #81 was "the decode table" -- the same load-time
+repack as prefill, applied to the decode GEMV. It was tried on the axis that
+works for prefill: expand the *activation* scales to the sixteen lanes that
+consume them, once per token, and share that array across every output row of
+the tensor; the weight side stays compact. Two shapes were built -- one with a
+runtime test in the loop, one specialised at compile time so the loop has no
+test at all -- and both were measured against the shipped kernel in the same
+binary (`KRK_CPU_GEMV_XSC`), on the q8_0 fixture, four runs each:
+
+| kernel | us/op medians | note |
+|---|---:|---|
+| shipped | 78.6 | scale chain per (row, pair) |
+| pre-expanded activation scales | 75.2 | 3 uops saved, one 64 B load added |
+
+**No win, and a slight loss.** The three uops saved per (row, block pair) are
+worth less than the 64-byte load they cost, because the decode loop is not at
+its uop limit -- itemising it, the loop is at its memory-level-parallelism
+limit, which is why 1 -> 8 streams is 1.7x and 8 -> 16 streams is nothing. The
+change was reverted; the comment at the site records the measurement so it is
+not re-attempted blind.
+
+So "the decode table" has no content: for prefill the table was worth having
+because one output row's scales are reused across eight *activation* rows; in
+decode there is one activation row and the scales are consumed once. What is
+left in decode is the stream count and the residency story, not the arithmetic.
+
 ## Where the decode GEMV's time goes (measured 2026-10-30)
 
 The decode kernel is not memory-bound and it is not MAC-bound -- it is
