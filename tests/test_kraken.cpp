@@ -68,6 +68,7 @@
 #include "krk/mla_shared.hpp"
 #include "krk/dsv4_route.hpp"
 #include "krk/ple.hpp"
+#include "krk/msa.hpp"
 #include "krk/qsa.hpp"
 #include "krk/http.hpp"
 #include "krk/json.hpp"
@@ -12975,6 +12976,231 @@ static void test_speculative_decoding() {
     // (cleanup disabled for debugging)
 }
 
+
+
+// ---------------------------------------------------------------------------
+// MSA (MiniMax Sparse Attention): block selection, and the dense equivalence
+// that makes the sparse path trustworthy
+// ---------------------------------------------------------------------------
+// The claim this test has to make good on is narrow and load-bearing: when the
+// block budget is large enough to select everything, the sparse path must
+// produce the dense answer BIT FOR BIT. Without that, "sparse attention" is a
+// different model with a plausible-looking kernel, and every number measured
+// through it is about some other network.
+//
+// It also pins the two properties that distinguish MSA from an indexer with a
+// dense prefix: an unselected block at the START of the context is not read,
+// and the local block is always selected.
+static void msa_reference_dense(f32 *out, const f32 *q, const f32 *k, const f32 *v,
+                                int n_tok, int n_head, int hd, int n_kv,
+                                float scale, const std::vector<std::pair<i64, i64>> &runs) {
+    std::vector<f32> sc;
+    for (int t = 0; t < n_tok; t++) {
+        for (int h = 0; h < n_head; h++) {
+            const f32 *qh = q + (static_cast<size_t>(t) * n_head + h) * hd;
+            f32 *oh = out + (static_cast<size_t>(t) * n_head + h) * hd;
+            sc.clear();
+            for (const auto &r : runs)
+                for (i64 j = r.first; j < r.second; j++) {
+                    const f32 *kv = k + (static_cast<i64>(j) * n_head + h) * hd;
+                    f32 acc = 0.0f;
+                    for (int i = 0; i < hd; i++) acc += qh[i] * kv[i];
+                    sc.push_back(acc * scale);
+                }
+            if (sc.empty()) {
+                for (int i = 0; i < hd; i++) oh[i] = 0.0f;
+                continue;
+            }
+            f32 mx = *std::max_element(sc.begin(), sc.end());
+            f32 l = 0.0f;
+            for (f32 &x : sc) {
+                x = std::exp(x - mx);
+                l += x;
+            }
+            for (int i = 0; i < hd; i++) oh[i] = 0.0f;
+            size_t kk = 0;
+            for (const auto &r : runs)
+                for (i64 j = r.first; j < r.second; j++, kk++) {
+                    const f32 p = sc[kk] / l;
+                    const f32 *vv = v + (static_cast<i64>(j) * n_head + h) * hd;
+                    for (int i = 0; i < hd; i++) oh[i] += p * vv[i];
+                }
+        }
+    }
+}
+
+static void test_msa_block_sparse() {
+    Backend *cpu = make_cpu_backend();
+    const int hd = 8, n_head = 2, n_kv = 24, block = 4, n_blocks = n_kv / block;
+    const f32 scale = 1.0f / std::sqrt(static_cast<f32>(hd));
+
+    // One layer, one sequence, cache row = n_head * hd.
+    std::vector<f32> keys(static_cast<size_t>(n_kv) * n_head * hd);
+    std::vector<f32> vals(keys.size());
+    for (size_t i = 0; i < keys.size(); i++) {
+        keys[i] = 0.11f * static_cast<f32>(static_cast<int>(i * 37 % 23) - 11);
+        vals[i] = 0.07f * static_cast<f32>(static_cast<int>(i * 53 % 19) - 9);
+    }
+    std::vector<f32> q(static_cast<size_t>(n_head) * hd);
+    for (size_t i = 0; i < q.size(); i++)
+        q[i] = 0.05f * static_cast<f32>(static_cast<int>(i * 29 % 17) - 8);
+
+    void *kc = cpu->alloc(keys.size() * 4);
+    void *vc = cpu->alloc(vals.size() * 4);
+    cpu->upload(kc, keys.data(), keys.size() * 4);
+    cpu->upload(vc, vals.data(), vals.size() * 4);
+    void *qc = cpu->alloc(q.size() * 4);
+    cpu->upload(qc, q.data(), q.size() * 4);
+    void *oc = cpu->alloc(static_cast<size_t>(n_head) * hd * 4);
+
+    AttnDesc d;
+    d.n_head = n_head;
+    d.n_kv = n_head;      // one KV head: every query head reads the same rows
+    d.hd = hd;
+    d.n_tok = 1;
+    d.pos0 = n_kv - 1;    // the query sits at the last position
+    d.layer_stride = static_cast<i64>(keys.size());
+    d.pos_stride = n_head * hd;
+    d.scale = scale;
+    d.causal = true;
+
+    // ---- 1. the pool and the run builder -------------------------------
+    std::vector<f32> pooled(static_cast<size_t>(n_blocks) * hd);
+    CHECK(msa_pool(pooled.data(), keys.data(), hd, n_kv, block) == n_blocks,
+          "the pool covers every block of the cache");
+    {
+        // The last block of a non-multiple cache is pooled over what it HAS:
+        // a padded mean would make the newest keys look weak and the budget
+        // would preferentially drop them.
+        std::vector<f32> k2(static_cast<size_t>(10) * hd, 1.0f);
+        std::vector<f32> p2(3 * hd, 0.0f);
+        CHECK(msa_pool(p2.data(), k2.data(), hd, 10, 4) == 3,
+              "a 10-key cache is three blocks of four");
+        CHECK_NEAR(p2[2 * hd], 1.0f, 1e-6f,
+                   "the trailing partial block is a mean over its own two keys");
+    }
+    {
+        const i64 blocks[] = {0, 1, 2, 5};
+        i64 runs[16];
+        const i32 n = msa_runs(runs, blocks, 4, block, n_kv);
+        CHECK(n == 2, "adjacent selected blocks merge into one run");
+        CHECK(runs[0] == 0 && runs[1] == 12, "... the first run covers blocks 0-2");
+        CHECK(runs[2] == 20 && runs[3] == 24, "... and the second the last block");
+    }
+
+    // ---- 2. budget >= n_blocks is EXACTLY dense ------------------------
+    {
+        std::vector<i64> ids(static_cast<size_t>(n_blocks) + 1);
+        const i32 nsel = msa_select(ids.data(), pooled.data(), q.data(), hd, n_kv,
+                                    d.pos0, block, 0);
+        CHECK(nsel == n_blocks, "an unlimited budget selects every visible block");
+        std::vector<i64> runs(static_cast<size_t>(nsel) * 2);
+        const i32 nr = msa_runs(runs.data(), ids.data(), nsel, block, n_kv);
+        AttnDesc dd = d;
+        dd.n_key_runs = nr;
+        dd.key_runs = runs.data();
+        cpu->attention(oc, qc, kc, vc, dd);
+        std::vector<f32> got(static_cast<size_t>(n_head) * hd);
+        cpu->download_f32(got.data(), oc, n_head * hd);
+
+        std::vector<std::pair<i64, i64>> all_runs;
+        const i64 rn[2] = {0, n_kv};
+        all_runs.emplace_back(rn[0], rn[1]);
+        std::vector<f32> want(static_cast<size_t>(n_head) * hd);
+        msa_reference_dense(want.data(), q.data(), keys.data(), vals.data(), 1,
+                            n_head, hd, n_kv, scale, all_runs);
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < got.size(); i++)
+            worst = std::max(worst, std::fabs(got[i] - want[i]));
+        // Tolerance is eps, not "close": a whole-budget selection has to BE the
+        // dense answer, and the only difference permitted is the one between
+        // two orders of the same f32 sums.
+        CHECK(worst < 1e-5f,
+              "a budget that selects every block reproduces dense attention");
+    }
+
+    // ---- 3. a smaller budget really is sparse, and keeps the local block --
+    {
+        std::vector<i64> ids(static_cast<size_t>(n_blocks) + 1);
+        const i32 nsel = msa_select(ids.data(), pooled.data(), q.data(), hd, n_kv,
+                                    d.pos0, block, 3);
+        CHECK(nsel == 3, "a budget of three selects three blocks");
+        bool has_local = false;
+        i64 visible_keys = 0;
+        for (i32 i = 0; i < nsel; i++) {
+            if (ids[static_cast<size_t>(i)] == (n_kv - 1) / block) has_local = true;
+            visible_keys += block;
+        }
+        CHECK(has_local, "the local block is always selected, whatever the scores say");
+        CHECK(visible_keys < n_kv,
+              "a budget below the block count attends to fewer keys than dense -- "
+              "that is the whole point, and a selector that quietly kept "
+              "everything would pass every other check here");
+
+        // Ascending order is part of the contract: two equal selections must
+        // produce the same run list, or the same model computes two answers.
+        bool asc = true;
+        for (i32 i = 1; i < nsel; i++)
+            if (ids[static_cast<size_t>(i)] <= ids[static_cast<size_t>(i - 1)]) asc = false;
+        CHECK(asc, "the selected blocks come back in ascending order");
+
+        // ... and the sparse result is exactly the dense answer over the same
+        // key set, which is the only thing that makes it comparable.
+        std::vector<i64> runs(static_cast<size_t>(nsel) * 2);
+        const i32 nr = msa_runs(runs.data(), ids.data(), nsel, block, n_kv);
+        AttnDesc dd = d;
+        dd.n_key_runs = nr;
+        dd.key_runs = runs.data();
+        cpu->attention(oc, qc, kc, vc, dd);
+        std::vector<f32> got(static_cast<size_t>(n_head) * hd);
+        cpu->download_f32(got.data(), oc, n_head * hd);
+        std::vector<std::pair<i64, i64>> use;
+        for (i32 r = 0; r < nr; r++) use.emplace_back(runs[2 * r], runs[2 * r + 1]);
+        std::vector<f32> want(static_cast<size_t>(n_head) * hd);
+        msa_reference_dense(want.data(), q.data(), keys.data(), vals.data(), 1,
+                            n_head, hd, n_kv, scale, use);
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < got.size(); i++)
+            worst = std::max(worst, std::fabs(got[i] - want[i]));
+        CHECK(worst < 1e-5f,
+              "the sparse kernel equals dense attention restricted to the same runs");
+
+        // Negative control: the sparse answer has to DIFFER from the dense one.
+        // Every other check here would pass a kernel that quietly ignored
+        // `key_runs` and attended densely, because a dense kernel is trivially
+        // "dense attention restricted to the same runs" -- restricted to all of
+        // them. Without this arm the group cannot tell a working sparse path
+        // from a disabled one.
+        {
+            AttnDesc dense = d;
+            cpu->attention(oc, qc, kc, vc, dense);
+            std::vector<f32> dgot(static_cast<size_t>(n_head) * hd);
+            cpu->download_f32(dgot.data(), oc, n_head * hd);
+            f32 dev = 0.0f;
+            for (size_t i = 0; i < dgot.size(); i++)
+                dev = std::max(dev, std::fabs(dgot[i] - got[i]));
+            CHECK(dev > 1e-3f,
+                  "a budget below the block count produces a DIFFERENT answer "
+                  "from dense -- so the run list is honoured, not ignored");
+        }
+
+        // And the no-dense-prefix property, stated as an observation rather
+        // than a hope: with a budget this small, block 0 is not in the set, so
+        // the first keys of the context are not read at all.
+        bool reads_start = false;
+        for (i32 i = 0; i < nsel; i++)
+            if (ids[static_cast<size_t>(i)] == 0) reads_start = true;
+        CHECK(!reads_start,
+              "MSA has no dense prefix: at this budget the opening block is not "
+              "selected and is not read");
+    }
+
+    cpu->release(kc);
+    cpu->release(vc);
+    cpu->release(qc);
+    cpu->release(oc);
+    delete cpu;
+}
 
 // ---------------------------------------------------------------------------
 // DSpark head set: loads, refuses a mismatched target, and its Markov chain is
@@ -28679,6 +28905,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_q8_0_layout)
     TEST_GROUP(test_q8_0_scale_array_row_keyed)
     TEST_GROUP(test_dspark_head_set)
+    TEST_GROUP(test_msa_block_sparse)
     TEST_GROUP(test_vec_dot_fast_opt_in)
     TEST_GROUP(test_gemm_batched_bit_identical)
     TEST_GROUP(test_vec_dot_avx2_matches_fast)

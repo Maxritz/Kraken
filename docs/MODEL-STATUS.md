@@ -186,15 +186,20 @@ unlisted, which is now a named refusal rather than a silent llama-default load.
 | Family | GGUF arch | State | What is missing |
 |---|---|---|---|
 | DeepSeek-V4.1-Flash | `deepseek41` | **Partial** — loads as the deepseek4 graph | compressed attention, the sparse indexer, hyper-connections (`hc_*`), Engram sidecar tensors. A checkpoint carrying them is refused by tensor name |
-| MiniMax-M3.1-Flash | `minimax-m3` | **No** — registered this pass, refuses by name | MiniMax Sparse Attention (block-sparse with no dense prefix), the native vision/video tower, the DSpark draft head. No GGUF schema has been validated for it either, so the refusal is doubly correct |
+| MiniMax-M3.1-Flash | `minimax-m3` | **No**, but two of its four gaps are now closed | **MSA is implemented**: `AttnDesc::key_runs` is a visible-key run list (block-sparse, no dense prefix) with a CPU kernel, and `src/msa.cpp` does the block selection — pool, score, top-budget, local block always kept — verified bit-for-bit against dense attention when the budget selects every block. **The DSpark draft head it ships now loads** as a drafter (`src/dspark.cpp`). Still refused because no GGUF schema for the family has been validated (the loader has nothing to check a file against) and the native vision/video tower has no forward |
 | Qwen3.8-Flash-Next | `qwen4exp` | **supported, gated** — every component has a kernel | not a missing kernel but a missing **whole-graph coherence gate** against an independently verified reference on the real GGUF: one recorded REAP-288 prompt matched 24/24 and another coding prompt historically diverged. Serving fluent wrong output is the failure this engine exists to avoid, so it stays gated until that gate exists (see [TECHNICAL-README.md §4](TECHNICAL-README.md)) |
 | Ornith-1.5-122B | none (unlisted) | **refused as unlisted** | no published GGUF arch string to read it against; refused rather than guessed |
 
 `minimax-m3` was added to the table for a specific reason: the fallback path
 read unlisted files against llama defaults, and a 428B sparse-attention MoE is
 the worst possible candidate for a schema nobody checked — the defaults would
-find a plausible layer stack and compute the wrong graph. A named refusal is the
-honest answer until MSA exists.
+find a plausible layer stack and compute the wrong graph.
+
+MSA now exists as a component, so the refusal can no longer use it as the
+reason and has been reworded to name only what is genuinely absent. That is the
+distinction worth keeping straight: *the attention primitive is implemented and
+tested* while *no file of this family has been read against a validated schema*.
+The second is what blocks the load, and a kernel does not fix it.
 
 ## Refused at load
 

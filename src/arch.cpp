@@ -1194,11 +1194,24 @@ constexpr ArchSpec kTable[] = {
     // full-attention layers, so there is no dense prefix to fall back on and
     // the attention op's causal/window masks cannot express it. The model is
     // natively multimodal, so a vision/video tower feeds the token stream. And
-    // it ships a DSpark draft head, which this engine can load as a draft file
-    // against a matching target but which has nothing to attach to here.
+    // it ships a DSpark draft head, which this engine now loads (src/dspark.cpp)
+    // but which has nothing to attach to here.
+    //
+    // Updated after the MSA work: the ATTENTION half of the first gap is
+    // implemented. `AttnDesc::key_runs` is a sparse visible-key run list, the
+    // CPU backend has a kernel for it, and src/msa.cpp does the block selection
+    // (pool, score, top-budget, local block always kept, NO dense prefix). What
+    // is still missing is not a kernel: no GGUF schema for this family has been
+    // validated, so the loader cannot say what tensors to read, and the vision
+    // tower has no forward at all. Still No -- but the reason now names only
+    // what is actually absent, instead of three things of which one is done.
     {"minimax-m3", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "minimax-m3",
-     "MiniMax Sparse Attention (block-sparse, no dense prefix), a native "
-     "vision/video tower and a DSpark draft head are not implemented",
+     "no validated GGUF schema for this family, so the loader has nothing to "
+     "check a file against, and the native vision/video tower has no forward. "
+     "MiniMax Sparse Attention is itself implemented (AttnDesc::key_runs plus "
+     "the block selection in src/msa.cpp: block-sparse with no dense prefix, "
+     "verified against dense attention when the budget selects every block), "
+     "and the DSpark draft head it ships now loads as a drafter",
      false, false, false, false},
     // muse-glimmer (dense): four pieces of its own around llama's block, read
     // off llama.cpp's src/models/muse-glimmer.cpp.

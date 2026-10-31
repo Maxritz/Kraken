@@ -221,6 +221,25 @@ struct AttnDesc {
     // and sees the whole context normally. -1 (the default) masks nothing and
     // every existing model's arithmetic is unchanged.
     i64 skip_from = -1;
+
+    // ---- block-sparse key selection (MiniMax MSA) -------------------------
+    // When `key_runs` is set the visible keys are the UNION of the half-open
+    // runs [key_runs[2r], key_runs[2r+1]) listed for this call, each clamped to
+    // [0, n_keys), with the causal and window bounds still applied on top. That
+    // is block-sparse attention with NO dense prefix: a run list that omits the
+    // early blocks omits them completely, which is the property that separates
+    // MSA from an indexer that always keeps the head of the context.
+    //
+    // One call carries one run list, so a prefill that selects per query BLOCK
+    // issues one call per block. That is a deliberate trade: the alternative is
+    // a per-row run table threaded through every attention path in both
+    // backends, and the runs are exactly the thing a caller can batch.
+    //
+    // nullptr (the default) is the dense path, untouched. A backend that does
+    // not implement the sparse path must refuse rather than run it densely --
+    // silently attending to Every key is a different model, not a slower one.
+    i64 n_key_runs = 0;
+    const i64 *key_runs = nullptr;  // [n_key_runs][2], lo/hi per run
 };
 
 // ---------------------------------------------------------------------------

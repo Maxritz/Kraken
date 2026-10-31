@@ -570,3 +570,57 @@ available in either kernel.
 
 **Conclusion for prefill: the fix is already in and is worth ~1.5x; the kernel is
 within ~1.3x of its ceiling; there is no second scale win to collect.**
+
+## The prefill GEMM is at its own ceiling (measured 2026-10-31)
+
+The item after #82 was "reduce the uops per 64 MACs". Before writing any, the
+arms were built in `tools/bench_isa_ceiling.cpp` and measured in one process.
+All numbers are GMAC/s on the 2-vCPU Xeon (this host's absolute rate drifts by
+up to 3x between sessions; only same-process ratios mean anything).
+
+| arm | what it changes | vs C |
+|---|---|---:|
+| W the shipped kernel | expanded per-row scales, 8 activation rows | 101-161% |
+| V1 the mix ceiling | same instruction mix, no scale chain at all | 100-122% |
+| O2 / O4 | 2 / 4 OUTPUT rows per call, to amortise the activation load | 76-149% |
+| G2 / G4 | one scale per 128 / 256 weights (LOSSLESS: NO) | 111-168% / 140-193% |
+
+**The shipped kernel is already at the V1 ceiling.** W and V1 land within noise
+of each other in every run, which means the uop count is no longer the binding
+constraint at this shape: what is left is the instruction mix itself, and the
+mix is 5 uops per 64 MACs minimum for q8_0 with `vpdpbusd` (one activation
+load, one masked sign flip, one `vpdpbusd`, one `vcvtdq2ps`, one `vfmadd`).
+
+Three things were measured and rejected rather than argued about:
+
+* **Output-row tiling does not pay.** O2/O4 were built twice -- once with the
+  weight loads inside the row loop (wrong: 27-38), and once correctly hoisted
+  (26-48 against W's 30-50). Halving the activation load per MAC does not pay
+  for the sixteen accumulators it costs. Register pressure eats the saving.
+* **A longer scale group would be worth only 1.19x, and it is lossy.** G4
+  (one scale per 256 weights) reaches 58-60 against W's 49-50: 1.19x. It is the
+  only arm that beat the ceiling, and it can only be bought by requantising the
+  weights at load time to a scale group q8_0 does not have -- a different
+  model, not a faster kernel. Not worth it, and it would break the rule that the
+  engine computes the file's own arithmetic.
+* **`vpdpbssd` is not available.** The sign split costs two uops per block pair
+  (a compare and a masked subtract) and signed x signed would remove both. It
+  is AVX-VNNI-INT8, not AVX512_VNNI, and this host does not have it. Checked
+  against the compiler's own headers, not assumed.
+
+So the honest statement of the remaining gap to the 200 tok/s target is not
+"uops per 64 MACs" -- that is spent. On an AVX-512 core with no AMX the q8_0
+GEMM tops out at ~5 uops per 64 MACs and this engine is there. The next real
+lever is a format whose scale group is longer than 32 *by construction*
+(q4_0 with 32-value groups has the same problem; a 256-group format does not),
+and that is a format decision, not a kernel one.
+
+### One redundant computation removed
+
+`build_q8_0_xscales` was being called inside the column-block loop, so the
+activation-scale array was rebuilt once per column block for a result that does
+not depend on the block at all. It is now built once per call
+(`KRK_CPU_XSC_HOIST=0` restores the old shape as the control). End-to-end the
+effect is under the noise floor on this host -- the rebuild is small next to the
+GEMM it feeds -- but it was free to fix and it is now proportional to the work,
+not to the block count.
