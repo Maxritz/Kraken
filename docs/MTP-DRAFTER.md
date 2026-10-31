@@ -1,5 +1,13 @@
 # An MTP drafter: the artifact, the wiring, and what actually blocks it
 
+> **Superseded in part, 2026-10-31.** Sections 2 and 3 describe the state on
+> 2026-10-09 and are kept for the measurements. Since then the `qwen4exp` target
+> family runs, the `qwen4-mtp` block runs on the device, and `--mtp-spec` drafts
+> a chained proposal from it: see `docs/PLAN-mtp-and-prefill.md` steps 1.1-1.8
+> and `docs/MTP-HEAD-SCHEMA.md`. The row stays `Partial` for one reason only --
+> no real checkpoint has been run through it, so acceptance and tokens/s on real
+> weights are unmeasured.
+
 Status, 2026-10-09. Three asks were on the table — extract the `mtp.*` tensors a
 checkpoint ships, load them, and verify proposals through the existing `--draft`
 loop. One is done, one is recognized-but-refused with a named reason, and the
