@@ -438,19 +438,53 @@ gains 13% (150 -> 170 tok/s) while the wave does not move (1.11x -> 1.01x), whic
 is consistent: the fast Q8_0 kernel changes the rate of a GEMV, not the number of
 calls.
 
-What the same table does say the wave's time goes to, on this fixture:
+**Routing is not the next lever -- and the "30% of decode" reading of it was a
+misread.** The `[stats ] components` table nests: `routing` contains the expert
+phase, and the table says so in its own footer (`nested excess ... spans nest`).
+Read flat it puts routing at 30.7% of decode and 121 us per op. The `KRK_TIME_HOST`
+spans, which do not nest that way, put the same run at:
 
-| component | phase | ops | host ms | % of decode |
-|---|---|---|---|---|
-| decode | decode | 330 | 977.6 | 48.1% |
-| routing | decode | 5160 | 623.5 | 30.7% |
-| experts | decode | 1032 | 430.4 | 21.2% |
+| span | calls | ms | ms/call |
+|---|---|---|---|
+| `moe.route.batch` | 288 | 431.0 | 1.497 |
+| `moe.route.rest.batch` (its child) | 288 | 428.3 | 1.487 |
+| `moe.experts.batch` (child of that) | 288 | 427.2 | 1.483 |
+| `moe.route.gemm.batch` | 288 | 2.2 | 0.008 |
+| `moe.route.fetch.batch` | 288 | 0.1 | 0.000 |
 
-Routing at ~121 µs per op -- a 768x8 router GEMM, a softmax over 8 values, a
-top-k and a plan build -- is the next thing to look at, and the expert-cache
-staging inside that phase (`stage_batch`/`promote_batch`, which copies expert
-weights into the HOT tier per layer) is the first suspect. That is a measurement
-to make, not a kernel to write.
+So the router GEMM is **0.5%** of the routing span and the logits readback is
+0.02%; everything left of the span after removing the expert phase is the
+softmax, the top-k and the plan build, and together they are **~1.5 ms over 288
+layer-visits = 5 us each**. Routing is not where a decode step goes, in either
+direction: at 5 us it is not worth a change, and the 121 us figure it replaced was
+an artifact of adding the experts in twice. Prefill stages are the same shape
+(`routing` 34.4% against `experts` 34.1% of that phase -- again one contains the
+other).
+
+**What the time IS.** Every remaining row is a GEMM at **~5 GMAC/s**, which on
+AVX-512 VNNI is 3-5% of what the instruction can do. Two facts bound it: `r1` and
+`rN` run at the same rate (so it is not a per-call dispatch cost), and
+`KRK_CPU_Q80_WSC=1` moves the serial arm 13% (150 -> 170 tok/s on the Q8_0 bench)
+without moving the wave, so the fast int8 kernel is a rate change on a GEMV.
+
+**Is 5 GMAC/s a defect? Measured: no.** A Q8_0 decode GEMV reads ~1.06 bytes per
+MAC, so 5 GMAC/s is ~5 GB/s of weight streaming, and `tools/bench_gemv_scale`
+(shipped path, 71.3 MB of weights, n_in 4096) measures this host at:
+
+| pass | shipped V0 | scale-hoisted bound V1 |
+|---|---|---|
+| first | 11.82 ms = 6.03 GB/s | 6.07 ms = 11.74 GB/s |
+| again | 5.02 ms = 14.21 GB/s | 2.88 ms = 24.78 GB/s |
+
+Two passes of the same binary differ by 2.4x, which is the host's contended state,
+not the kernel's. The fixture's 5 GB/s is inside that range, so there is **no
+evidence of a 4x engine defect** here -- and the earlier claim that the expert
+phase runs "at a fraction of what the instruction can do" says nothing about
+whether *this box* can do better. What the table does say is where the headroom
+lives if there is one: V1 is the hard bound on removing the scale work entirely
+(1.96x on the first pass, 1.74x on the second), and the realistic V2 table is
+1.80x/1.86x of V0. That is a kernel-and-repack project measured by this tool, not
+by another engine table read.
 
 ### B3 -- A trace file carries no identity -- DONE
 
