@@ -405,14 +405,14 @@ tolerates -- the same missing artifact that keeps `qwen4-mtp` at `Partial`.
 Neither item shares a line of code with the other; the order above is about risk,
 not dependency.
 
-**What is left, in order, and each one needs something this workspace does not
-have:** (1) run `scripts/mtp_spec_gate.sh` on a real `qwen4exp` trunk plus its
-`qwen4exp-mtp` head and record the table in *1.8's runbook* -- that is what moves
-`qwen4-mtp` from `Partial` to `Yes`; (2) the same run on a `deepseek4` trunk plus
-its dspark nextn block -- the body is wired now (`test_mtp_sidecar_mla`, 19/19),
-so what is left for its row is the artifact and its acceptance number;
-(3) the prefill format only reopens with an artifact that quantifies q8_0's
-headroom.
+**What is left of items 1 and 4:** (1) run `scripts/mtp_spec_gate.sh` on a real
+`qwen4exp` trunk plus its `qwen4exp-mtp` head and record the table in *1.8's
+runbook* -- that is what moves `qwen4-mtp` from `Partial` to `Yes`; (2) the same
+run on a `deepseek4` trunk plus its dspark nextn block -- the body is wired now
+(`test_mtp_sidecar_mla`, 22/22), so what is left for its row is the artifact and
+its acceptance number; (3) the prefill format only reopens with an artifact that
+quantifies q8_0's headroom. Everything open in the project, split by what it
+waits on, is [PLAN-remaining.md](PLAN-remaining.md).
 
 ---
 
