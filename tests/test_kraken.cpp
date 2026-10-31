@@ -121,7 +121,8 @@ static void note_progress() {
         if ((cond) && checks_should_pass()) {                                       \
             g_passed++;                                                             \
         } else {                                                                    \
-            std::fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, msg);      \
+            std::fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__,          \
+                         std::string(msg).c_str());                                 \
         }                                                                           \
         note_progress();                                                            \
     } while (0)
@@ -134,7 +135,7 @@ static void note_progress() {
             g_passed++;                                                             \
         } else {                                                                    \
             std::fprintf(stderr, "FAIL %s:%d  %s (%g vs %g)\n", __FILE__, __LINE__, \
-                         msg, _a, _b);                                              \
+                         std::string(msg).c_str(), _a, _b);                         \
         }                                                                           \
         note_progress();                                                            \
     } while (0)
@@ -712,6 +713,128 @@ static void test_gemm_batched_bit_identical() {
             }
         }
     }
+    // ---- the q8_0 prefill kernels that differ in uops, not in arithmetic ---
+    //
+    // The backend can run the no-table x8 kernel or the 16-lane scale-table one
+    // (the default, KRK_CPU_Q80_WSC=0 selects the other). They are two spellings
+    // of one dot product: the table holds the same two f32 the kernel would
+    // decode from the row header. So the assertion is BYTE equality on every
+    // (row, output) cell -- a kernel that is faster because it reassociated the
+    // sum is a different model, and on a real file that reads as a slightly
+    // worse token.
+    //
+    // A third spelling, the compact pair table, was measured at 44.5-45.9
+    // GMAC/s against this one's 48.1-49.1 and was rejected; it lives in
+    // tools/bench_q80_gemm.cpp, where it is checked byte-identical to x8 every
+    // run. Nothing that is not shipping belongs in this list.
+    {
+        constexpr i64 nk = 512; // 16 blocks: a whole number of block pairs
+        constexpr i64 nrows_k = 8;
+        const i64 nbk = nk / 32, npair_k = nbk / 2;
+        const i64 rb = dtype_row_bytes(DType::Q8_0, nk);
+        std::vector<u8> w8(static_cast<size_t>(n_out) * static_cast<size_t>(rb));
+        for (i64 o = 0; o < n_out; o++) {
+            for (i64 b = 0; b < nbk; b++) {
+                u8 *p = w8.data() + static_cast<size_t>(o) * static_cast<size_t>(rb) +
+                        static_cast<size_t>(b) * 34;
+                // Scales that differ per block AND per row: a kernel that
+                // shares one row's header across the tile is wrong by up to
+                // 83% and still runs (build_q8_0_wscales records that).
+                const u16 dh = fp32_to_fp16(0.004f + 0.0007f *
+                                                       static_cast<f32>(b + 3 * o));
+                p[0] = static_cast<u8>(dh & 0xFF);
+                p[1] = static_cast<u8>(dh >> 8);
+                for (int i = 0; i < 32; i++)
+                    p[2 + i] = static_cast<u8>(
+                        static_cast<i8>(static_cast<i32>(rnd() % 255) - 127));
+            }
+        }
+        std::vector<f32> xf(static_cast<size_t>(nrows_k) * static_cast<size_t>(nk));
+        for (auto &v : xf)
+            v = static_cast<f32>(static_cast<i32>(rnd() % 2001) - 1000) / 1000.0f;
+        std::vector<i8> xq(xf.size());
+        std::vector<f32> xd(static_cast<size_t>(nrows_k) * static_cast<size_t>(nbk));
+        for (i64 r = 0; r < nrows_k; r++)
+            quantize_q8_row(xf.data() + r * nk, nk, xq.data() + r * nk,
+                            xd.data() + r * nbk);
+        std::vector<f32> wsc(static_cast<size_t>(n_out * npair_k) * 16);
+        std::vector<f32> xsc(static_cast<size_t>(nrows_k * npair_k) * 16);
+        build_q8_0_wscales(w8.data(), rb, n_out, nk, wsc.data());
+        build_q8_0_xscales(xd.data(), nbk, nrows_k, nk, xsc.data());
+        std::vector<f32> ka(static_cast<size_t>(nrows_k * n_out));
+        std::vector<f32> kb(ka.size());
+        for (i64 o = 0; o < n_out; o++) {
+            const u8 *wr = w8.data() + static_cast<size_t>(o) * static_cast<size_t>(rb);
+            dot_q8_0_q8_x8(wr, xq.data(), xd.data(), nk, nk, nbk, ka.data() + o,
+                           n_out);
+            dot_q8_0_q8_wsc8(wr, xq.data(), xd.data(), nk, nk, nbk, kb.data() + o,
+                             n_out,
+                             wsc.data() + static_cast<size_t>(o * npair_k) * 16,
+                             xsc.data());
+        }
+        CHECK(std::memcmp(ka.data(), kb.data(), ka.size() * sizeof(f32)) == 0,
+              "the 16-lane scale-table kernel is the no-table kernel, bit for bit");
+    }
+
+    // ---- the two q8_0 x8 prefill kernels the engine can pick --------------
+    // They differ in uops, not in arithmetic: the 16-lane table holds the same
+    // two f32 the kernel would decode from the row header. So byte equality is
+    // the gate -- a kernel that is faster because it reassociated the sum is a
+    // different model, and on a real file that reads as a slightly worse token.
+    // Without this, "the table is free" is a claim about speed that nothing
+    // pins to the same arithmetic.
+    //
+    // A third kernel (the pair table) was measured slower and lives in
+    // tools/bench_q80_gemm.cpp, which checks it byte-identical to x8 every run;
+    // it is deliberately not referenced here, because the suite is about what
+    // ships.
+    {
+        constexpr i64 nk = 512;      // 16 blocks = 8 block pairs
+        constexpr i64 nrows_k = 8;   // the tile the kernels are built around
+        constexpr i64 nout_k = 16;
+        const i64 nbk = nk / 32, npair_k = nbk / 2;
+        const i64 rb = nk + 2 * nbk; // q8_0 block: 2-byte header + 32 weights
+        std::vector<u8> wk(static_cast<size_t>(nout_k) * static_cast<size_t>(rb));
+        for (i64 o = 0; o < nout_k; o++) {
+            for (i64 b = 0; b < nbk; b++) {
+                u8 *p = wk.data() + static_cast<size_t>(o * rb) +
+                        static_cast<size_t>(b * 34);
+                const u16 dh = fp32_to_fp16(0.004f + 0.0007f *
+                                                       static_cast<f32>(b + 3 * o));
+                p[0] = static_cast<u8>(dh & 0xFF);
+                p[1] = static_cast<u8>(dh >> 8);
+                for (int i = 0; i < 32; i++)
+                    p[2 + i] = static_cast<u8>(
+                        static_cast<i8>(static_cast<i32>(rnd() % 255) - 127));
+            }
+        }
+        std::vector<f32> xf(static_cast<size_t>(nrows_k) * static_cast<size_t>(nk));
+        for (auto &v : xf)
+            v = static_cast<f32>(static_cast<i32>(rnd() % 2001) - 1000) / 1000.0f;
+        std::vector<i8> xq(xf.size());
+        std::vector<f32> xd(static_cast<size_t>(nrows_k) * static_cast<size_t>(nbk));
+        for (i64 r = 0; r < nrows_k; r++)
+            quantize_q8_row(xf.data() + r * nk, nk, xq.data() + r * nk,
+                            xd.data() + r * nbk);
+        std::vector<f32> wsc(static_cast<size_t>(nout_k * npair_k) * 16);
+        std::vector<f32> xsc(static_cast<size_t>(nrows_k * npair_k) * 16);
+        build_q8_0_wscales(wk.data(), rb, nout_k, nk, wsc.data());
+        build_q8_0_xscales(xd.data(), nbk, nrows_k, nk, xsc.data());
+        const size_t cells = static_cast<size_t>(nrows_k * nout_k);
+        std::vector<f32> kx8(cells, 0.0f), kwsc(cells, 0.0f);
+        for (i64 o = 0; o < nout_k; o++) {
+            const u8 *wr = wk.data() + static_cast<size_t>(o) * static_cast<size_t>(rb);
+            dot_q8_0_q8_x8(wr, xq.data(), xd.data(), nk, nk, nbk, kx8.data() + o,
+                           nout_k);
+            dot_q8_0_q8_wsc8(wr, xq.data(), xd.data(), nk, nk, nbk, kwsc.data() + o,
+                             nout_k,
+                             wsc.data() + static_cast<size_t>(o * npair_k) * 16,
+                             xsc.data());
+        }
+        CHECK(std::memcmp(kx8.data(), kwsc.data(), cells * sizeof(f32)) == 0,
+              "the 16-lane table kernel is the no-table kernel, bit for bit");
+    }
+
     set_vec_dot_fast(false);
     set_vec_dot_avx2(false);
 }
@@ -17488,6 +17611,331 @@ static int server_proc_wait_port(const ServerProc &sp, int timeout_ms) {
     return -1;
 }
 
+// ---------------------------------------------------------------------------
+// test_cancel_and_prefix -- B2.1 (cancellation stops the work) and B2.2 (the
+// cache entry is the whole run, not just its prompt).
+//
+// Both arms observe something the engine did NOT do. Cancellation: the run stops
+// before max_tokens and the partial text is a prefix of the uncancelled run.
+// Prefix: the second request's `cached_tokens` covers the first request's
+// GENERATED tokens, which is exactly the part the old prompt-only record could
+// not claim.
+// ---------------------------------------------------------------------------
+static void test_cancel_and_prefix() {
+    if (!build_tiny_model(kTestModelPath, false)) {
+        CHECK(false, "cancel test: build_tiny_model failed");
+        return;
+    }
+    Backend *cpu = make_cpu_backend();
+    Engine engine;
+    EngineConfig cfg;
+    cfg.model_path = kTestModelPath;
+    cfg.n_ctx = 64;
+    cfg.prefill_chunk = 4;
+    std::string err;
+    if (!engine.init(cpu, cfg, &err)) {
+        std::fprintf(stderr, "  (cancel fixture: %s)\n", err.c_str());
+        CHECK(false, "cancel test: engine initialises");
+        delete cpu;
+        return;
+    }
+
+    // ---- the uncancelled run: the yardstick both arms compare against ------
+    GenerateParams p;
+    p.prompt = "the";
+    p.max_tokens = 12;
+    p.sampler.greedy = true;
+    p.sampler.repeat_penalty = 1.0f;
+    GenerateResult full;
+    CHECK(engine.generate(p, &full), "cancel test: the uncancelled run completes");
+    CHECK(!full.cancelled, "cancel test: a run with no flag set is not marked cancelled");
+    CHECK(full.generated > 3, "cancel test: the yardstick run is longer than the cancel point");
+
+    // ---- B2.1(a): cancel from inside the stream, mid-decode -----------------
+    struct CancelAfter {
+        std::atomic<bool> *flag;
+        int limit;
+        int seen;
+    };
+    auto cancel_sink = [](void *user, const char *text, i32 token, bool done) {
+        CancelAfter *c = static_cast<CancelAfter *>(user);
+        (void)text;
+        (void)token;
+        if (done) return;
+        // Trip the flag exactly when the limit-th delta goes out: the very next
+        // token the engine accepts is the one that must not be accepted.
+        if (++c->seen >= c->limit) c->flag->store(true, std::memory_order_relaxed);
+    };
+    {
+        std::atomic<bool> flag{false};
+        CancelAfter after{&flag, 3, 0};
+        p.sink.fn = cancel_sink;
+        p.sink.user = &after;
+        p.cancel = &flag;
+        GenerateResult part;
+        const bool ok = engine.generate(p, &part);
+        p.sink = StreamSink{};
+        p.cancel = nullptr;
+        CHECK(ok, "cancel: a cancelled run still returns success, not an error");
+        CHECK(part.cancelled, "cancel: the result says the run was cancelled");
+        CHECK(part.generated == 3,
+              "cancel: no token is accepted after the flag is raised (3 deltas -> 3 "
+              "tokens, the 4th is dropped)");
+        CHECK(part.generated < full.generated,
+              "cancel: and it stopped short of max_tokens instead of finishing the run");
+        CHECK(full.text.rfind(part.text, 0) == 0,
+              "cancel: the partial text is a prefix of the uncancelled run");
+    }
+
+    // ---- B2.1(b): cancel during prefill, before a single token exists ------
+    {
+        std::atomic<bool> flag{true}; // raised before the call
+        p.prompt = std::string(64, 'a') + " the"; // > one 4-row prefill chunk
+        p.cancel = &flag;
+        GenerateResult none;
+        const bool ok = engine.generate(p, &none);
+        p.cancel = nullptr;
+        p.prompt = "the";
+        CHECK(ok && none.cancelled, "cancel: a flag raised before the run cancels it");
+        CHECK(none.generated == 0, "cancel: and no token is generated");
+        CHECK(none.text.empty(), "cancel: with no text to report");
+        CHECK(engine.kv_pos() == 0,
+              "cancel: the KV cursor reflects the rows the cancelled prefill never wrote");
+    }
+
+    // ---- B2.2: the cache entry includes the generated rows -----------------
+    struct NullConn : HttpConn {
+        bool write_raw(const char *, size_t) override { return true; }
+    };
+    NullConn conn;
+    std::mutex mu;
+    OpenAiService svc(&engine, 0.0f, &mu);
+
+    auto post = [&](const std::string &prompt, HttpResponse *res) {
+        HttpRequest req;
+        req.method = "POST";
+        req.path = "/v1/completions";
+        req.body = std::string("{\"prompt\":") + JsonValue(prompt).dump() +
+                   ",\"max_tokens\":6,\"temperature\":0}";
+        return svc.handle(req, *res, conn);
+    };
+    // usage.<a>[.<b>[.<c>]] as an integer. Three levels because the cached-token
+    // count lives at usage.prompt_tokens_details.cached_tokens.
+    auto field = [](const HttpResponse &res, const char *a, const char *b,
+                    const char *c, i64 *out) {
+        JsonValue j;
+        std::string e;
+        if (!json_parse(res.body, &j, &e)) return false;
+        const JsonValue *x = j.find(a);
+        if (b) x = x ? x->find(b) : nullptr;
+        if (c) x = x ? x->find(c) : nullptr;
+        if (!x || !x->is_number()) return false;
+        *out = static_cast<i64>(x->as_number());
+        return true;
+    };
+    auto text_of = [](const HttpResponse &res, std::string *out) {
+        JsonValue j;
+        std::string e;
+        if (!json_parse(res.body, &j, &e)) return false;
+        const JsonValue *c = j.find("choices");
+        if (!c || !c->is_array() || c->items().empty()) return false;
+        const JsonValue *t = c->items()[0].find("text");
+        if (!t || !t->is_string()) return false;
+        *out = t->as_string();
+        return true;
+    };
+
+    HttpResponse res1, res2;
+    i64 p1 = 0, g1 = 0, cached1 = -1, cached2 = -1, p2 = 0;
+    CHECK(post("the", &res1) && res1.status == 200, "prefix: first request answers 200");
+    std::string text1;
+    CHECK(field(res1, "usage", "prompt_tokens", nullptr, &p1), "prefix: first usage has prompt_tokens");
+    CHECK(field(res1, "usage", "completion_tokens", nullptr, &g1),
+          "prefix: first usage has completion_tokens");
+    CHECK(text_of(res1, &text1) && !text1.empty(), "prefix: first request generated text");
+    // A first request has nothing behind it to reuse, and says so.
+    CHECK(field(res1, "usage", "prompt_tokens_details", "cached_tokens", &cached1) && cached1 == 0,
+          "prefix: a cold request reports 0 cached tokens");
+
+    // Turn two: the first turn's prompt AND its answer, plus a new word. The
+    // answer's rows are rows the cache already holds, so only the tail is new.
+    const std::string prompt2 = "the" + text1 + " and";
+    CHECK(post(prompt2, &res2) && res2.status == 200, "prefix: continuation answers 200");
+    CHECK(field(res2, "usage", "prompt_tokens", nullptr, &p2), "prefix: second usage has prompt_tokens");
+    CHECK(field(res2, "usage", "prompt_tokens_details", "cached_tokens", &cached2),
+          "prefix: second usage has cached_tokens");
+    // The fixture's own yardstick, in token ids rather than in prose: how much
+    // of the second prompt is literally the first request's prompt plus the
+    // tokens it generated. The tiny model writes arbitrary BYTES, so the text
+    // trip through the tokenizer can lose the tail (an invalid UTF-8 byte comes
+    // back as a replacement character); measuring the ids says whether the
+    // fixture is strong enough to discriminate, instead of letting a weak
+    // fixture pass as a code change.
+    // A greedy run is deterministic, so the server's six tokens are the first
+    // six the yardstick run produced: the expected run -- prompt ids plus
+    // generated ids -- is known exactly, without trusting a text round trip.
+    std::vector<i32> ids1, ids2, expected;
+    engine.tokenizer().encode("the", ids1, true);
+    engine.tokenizer().encode(prompt2, ids2, true);
+    expected = ids1;
+    for (size_t i = 0; i < full.tokens.size() && i < static_cast<size_t>(g1); i++)
+        expected.push_back(full.tokens[i]);
+    i64 common = 0;
+    while (common < static_cast<i64>(expected.size()) &&
+           common < static_cast<i64>(ids2.size()) &&
+           expected[static_cast<size_t>(common)] == ids2[static_cast<size_t>(common)])
+        common++;
+
+    char pf[240];
+    std::snprintf(pf, sizeof pf,
+                  "[p1=%lld g1=%lld cached1=%lld p2=%lld cached2=%lld text1=%zu chars "
+                  "common_prompt_tokens=%lld]",
+                  static_cast<long long>(p1), static_cast<long long>(g1),
+                  static_cast<long long>(cached1), static_cast<long long>(p2),
+                  static_cast<long long>(cached2), text1.size(),
+                  static_cast<long long>(common));
+    CHECK(common > static_cast<i64>(ids1.size()),
+          std::string("prefix fixture: the answer re-encodes into the continuation past "
+                      "the bare prompt, so the arm can discriminate ") + pf);
+    CHECK(cached2 == std::min<i64>(common, static_cast<i64>(ids2.size()) - 1),
+          std::string("prefix: the reuse claim is exactly the longest prefix the cache "
+                      "and the new prompt share -- no over-claim, nothing left on the "
+                      "table ") + pf);
+    // The discriminating assertion. The old record held the prompt's ids only,
+    // so it could never claim more than p1 tokens; anything above p1 is a row
+    // this run generated and the next one is reusing.
+    CHECK(cached2 > p1,
+          std::string("prefix: the second request reused rows the FIRST request "
+                      "generated, not only its prompt ") + pf);
+    CHECK(cached2 <= p2 - 1,
+          std::string("prefix: and it never claims more than the rows that exist (the "
+                      "sampled row is always re-prefilled) ") + pf);
+
+    // ~Engine's shutdown() still talks to the backend, so it must run first.
+    engine.shutdown();
+    delete cpu;
+    std::remove(kTestModelPath);
+}
+
+// ---------------------------------------------------------------------------
+// test_http_listener_lifetime -- B4.
+//
+// What is being observed: who closes the listening descriptor, and that stop()
+// from another thread cannot make run() act on a number the kernel may already
+// have handed out. The arms:
+//   1. a listener whose run() is stopped from a second thread while requests
+//      are in flight returns, and its descriptor is really closed (the same port
+//      binds again);
+//   2. stop() before run() closes the descriptor too -- there is no path where
+//      one is closed twice and none where one is leaked;
+//   3. run() after stop() returns immediately instead of accepting on a dead
+//      number (the old loop spun on accept() of a closed fd).
+// ---------------------------------------------------------------------------
+static void test_http_listener_lifetime() {
+    auto handler = [](const HttpRequest &req, HttpResponse &res, HttpConn &) {
+        res.status = 200;
+        res.content_type = "application/json";
+        res.body = std::string("{\"path\":\"") + req.path + "\"}";
+        return true;
+    };
+
+    // ---- 1: stop from another thread with requests in flight --------------
+    {
+        HttpServer server;
+        std::string err;
+        CHECK(server.listen("127.0.0.1", 0, &err),
+              std::string("lifecycle: listener binds (") + err + ")");
+        const int port = server.port();
+        CHECK(port > 0, "lifecycle: ephemeral port assigned");
+        std::atomic<int> served{0};
+        std::thread accept_thread([&] {
+            server.run([&served, handler](const HttpRequest &req, HttpResponse &res,
+                                          HttpConn &conn) {
+                served++;
+                return handler(req, res, conn);
+            });
+        });
+        // Let the loop reach its poll() before the requests and the stop race it.
+        for (int i = 0; i < 100 && !server.running(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        int ok_requests = 0;
+        for (int i = 0; i < 3; i++) {
+            int status = 0;
+            std::string body;
+            if (http_request(port, "GET", "/health", "", &status, &body) && status == 200)
+                ok_requests++;
+        }
+        CHECK(ok_requests == 3, "lifecycle: the listener answers before the stop");
+        // stop() from this thread while run() is parked in poll(). It must
+        // return, and it must not close the descriptor out from under the loop.
+        server.stop();
+        bool joined = false;
+        for (int i = 0; i < 300; i++) {
+            if (!server.running()) {
+                joined = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(joined, "lifecycle: stop() makes run() return");
+        accept_thread.join();
+        CHECK(!server.running(), "lifecycle: the server reports itself stopped");
+        CHECK(served.load() == 3, "lifecycle: the handler saw every request");
+
+        // The descriptor is closed, so the same port binds again immediately.
+        // A leaked (or double-closed) descriptor shows up here: leaked -> bind
+        // fails with EADDRINUSE, double-closed -> the second close hit whatever
+        // descriptor the kernel had recycled into that number.
+        HttpServer again;
+        const bool rebound = again.listen("127.0.0.1", port, &err);
+        CHECK(rebound, std::string("lifecycle: the port is free again, so the "
+                                   "descriptor was closed exactly once (") + err + ")");
+        CHECK(again.port() == port, "lifecycle: the rebind took the port that was asked for");
+        again.stop();
+    }
+
+    // ---- 2: stop() with no run() at all ----------------------------------
+    {
+        HttpServer server;
+        std::string err;
+        CHECK(server.listen("127.0.0.1", 0, &err), "lifecycle: second listener binds");
+        server.stop();
+        CHECK(!server.running(), "lifecycle: stop() on a never-started server is harmless");
+        server.stop(); // idempotent: the second call has nothing to close
+        CHECK(true, "lifecycle: stop() is idempotent");
+    }
+
+    // ---- 3: run() after stop() returns instead of accepting --------------
+    {
+        HttpServer server;
+        std::string err;
+        CHECK(server.listen("127.0.0.1", 0, &err), "lifecycle: third listener binds");
+        const int port = server.port();
+        server.stop();
+        std::atomic<bool> returned{false};
+        std::thread t([&] {
+            server.run(handler);
+            returned.store(true);
+        });
+        bool done = false;
+        for (int i = 0; i < 200; i++) {
+            if (returned.load()) {
+                done = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(done, "lifecycle: run() after stop() returns instead of spinning");
+        // Nothing is listening any more: a request fails to connect.
+        int status = 0;
+        std::string body;
+        CHECK(!http_request(port, "GET", "/health", "", &status, &body) || status == 0,
+              "lifecycle: the stopped listener does not answer");
+        t.join();
+        CHECK(returned.load(), "lifecycle: the run() thread is joined, not detached");
+    }
+}
+
 static void test_http_server() {
     if (!build_tiny_model(kTestModelPath, false)) {
         CHECK(false, "http test: build_tiny_model failed");
@@ -22461,6 +22909,171 @@ static void test_mtp_sidecar_mla() {
     std::remove(trunk.c_str());
     std::remove(side.c_str());
     delete cpu;
+}
+
+//  test_dump_identity — a KRK_DUMP file says which run wrote it, and ends.
+//
+//  The dump appends, and every A/B in this project is read off two of those
+//  files: a `--cpu` run and a device run, a target and a drafter, a chunked
+//  prefill and a single-shot one. Nothing in the file used to identify the run,
+//  so two runs became one file with two interleaved sets of stage names and no
+//  way to tell where the first ended -- or that it never did.
+//
+//  The arms below are all cheap and all fail on a real defect:
+//    1. one run writes exactly one header and one end marker;
+//    2. the end marker's line count equals the stage lines it encloses (the
+//       count is the only thing that would notice a dump that stopped early);
+//    3. a second run into the same file is separable and adds no warning;
+//    4. a file whose last line is missing (a killed run) is reported by the
+//       next run's warning, naming the pid.
+static void test_dump_identity() {
+    const std::string path = "kraken-dump-identity.gguf";
+    const std::string dump = "kraken-dump-identity.txt";
+    std::remove(path.c_str());
+    std::remove(dump.c_str());
+    if (!build_tiny_model(path, false)) {
+        CHECK(false, "wrote the tiny model the dump arms run on");
+        return;
+    }
+    // One generation, one engine: the run the file has to describe.
+    auto run = [&](const char *env_dump) -> bool {
+        if (env_dump)
+            set_env_var("KRK_DUMP", env_dump);
+        else
+            clear_env_var("KRK_DUMP");
+        Backend *be = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            std::string err;
+            if (!e.init(be, c, &err)) {
+                CHECK(false, ("the dump arm loads: " + err).c_str());
+            } else {
+                GenerateParams p;
+                p.prompt = "the";
+                p.max_tokens = 2;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                ok = e.generate(p, &r) && r.finish != FinishError;
+            }
+        }
+        delete be;
+        clear_env_var("KRK_DUMP");
+        return ok;
+    };
+    struct Seen {
+        int begin = 0, end = 0, warn = 0, stages = 0;
+        long long declared = -1;
+        long long pid = -1;
+        int stages_in_last = 0;
+        bool saw_stage_before_begin = false;
+    };
+    auto starts = [](const std::string &l, const char *p) {
+        return l.rfind(p, 0) == 0;
+    };
+    auto scan = [&starts](const std::string &file) {
+        Seen v;
+        std::ifstream f(file);
+        std::string line;
+        int in_run = 0;
+        while (std::getline(f, line)) {
+            if (starts(line, "# kraken-dump v1 begin")) {
+                v.begin++;
+                in_run = 1;
+                v.stages_in_last = 0;
+                continue;
+            }
+            if (starts(line, "# kraken-dump v1 end")) {
+                v.end++;
+                in_run = 0;
+                // lines=<n> is the last field of the marker.
+                const size_t at = line.find("lines=");
+                if (at != std::string::npos)
+                    v.declared = std::atoll(line.c_str() + at + 6);
+                continue;
+            }
+            if (starts(line, "# kraken-dump v1 warn")) {
+                v.warn++;
+                const size_t at = line.find("pid=");
+                if (at != std::string::npos) v.pid = std::atoll(line.c_str() + at + 4);
+                continue;
+            }
+            if (line.empty() || line[0] == '#') continue;
+            if (!in_run) v.saw_stage_before_begin = true;
+            v.stages++;
+            v.stages_in_last++;
+        }
+        return v;
+    };
+
+    // ---- 1 + 2: one run, one header, one end marker, an honest count ------
+    CHECK(run(dump.c_str()), "the first run completes with the dump on");
+    {
+        const Seen v = scan(dump);
+        char seen1[160];
+        std::snprintf(seen1, sizeof seen1,
+                      "[begin=%d end=%d warn=%d stages=%d declared=%lld]", v.begin,
+                      v.end, v.warn, v.stages, static_cast<long long>(v.declared));
+        CHECK(v.begin == 1, std::string("one run writes one header ") + seen1);
+        CHECK(v.end == 1, "and one end marker");
+        CHECK(v.warn == 0, "and no warning: it ended");
+        CHECK(v.stages > 0, "the run dumped stage lines");
+        CHECK(v.declared == v.stages,
+              "the end marker's count is the number of stage lines it encloses");
+        CHECK(!v.saw_stage_before_begin,
+              "no stage line precedes the header (the file starts with it)");
+    }
+
+    // ---- 3: a second run into the same file is separable ------------------
+    CHECK(run(dump.c_str()), "the second run completes into the same file");
+    {
+        const Seen v = scan(dump);
+        char seen2[160];
+        std::snprintf(seen2, sizeof seen2,
+                      "[begin=%d end=%d warn=%d stages=%d declared=%lld]", v.begin,
+                      v.end, v.warn, v.stages, static_cast<long long>(v.declared));
+        CHECK(v.begin == 2 && v.end == 2,
+              "two runs are two headers and two end markers");
+        CHECK(v.warn == 0, "a run that ended is not warned about");
+        CHECK(v.declared == v.stages_in_last,
+              std::string("the second marker counts only its own stage lines ") + seen2);
+    }
+
+    // ---- 4: a run that never ended is named by the next one ---------------
+    {
+        // Cut the last line: what a killed process leaves behind. It is the
+        // end marker, so the file now ends mid-run.
+        std::ifstream in(dump);
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in, line)) lines.push_back(line);
+        in.close();
+        CHECK(lines.size() > 1, "the dump has more than one line to cut");
+        if (!lines.empty()) lines.pop_back();
+        std::ofstream out(dump, std::ios::trunc);
+        for (const auto &l : lines) out << l << "\n";
+    }
+    CHECK(run(dump.c_str()), "the third run completes after a truncated file");
+    {
+        const Seen v = scan(dump);
+        char seen3[160];
+        std::snprintf(seen3, sizeof seen3, "[begin=%d end=%d warn=%d pid=%lld]", v.begin,
+                      v.end, v.warn, static_cast<long long>(v.pid));
+        CHECK(v.begin == 3, std::string("the third run still writes its own header ") + seen3);
+        CHECK(v.warn == 1,
+              std::string("and exactly one warning about the run that did not end ") + seen3);
+        CHECK(v.end == 2,
+              "two end markers: the cut one and the new one, so the truncated "
+              "run is not silently counted as complete");
+        CHECK(v.pid > 0, "the warning names the pid it came from");
+    }
+
+    std::remove(dump.c_str());
+    std::remove(path.c_str());
 }
 
 static void test_minicpm3_scale_arithmetic() {
@@ -30401,6 +31014,8 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_msa_block_sparse)
     TEST_GROUP(test_vec_dot_fast_opt_in)
     TEST_GROUP(test_gemm_batched_bit_identical)
+    TEST_GROUP(test_dump_identity)
+    TEST_GROUP(test_cancel_and_prefix)
     TEST_GROUP(test_vec_dot_avx2_matches_fast)
     TEST_GROUP(test_q5_0_high_bit_layout)
     TEST_GROUP(test_kquant_roundtrip_shape)
@@ -30554,6 +31169,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_dflash_laguna_spelling)
     TEST_GROUP(test_json)
     TEST_GROUP(test_http_server)
+    TEST_GROUP(test_http_listener_lifetime)
     TEST_GROUP(test_par_pool_covers_every_block)
     TEST_GROUP(test_kv_quant_int8)
     TEST_GROUP(test_kv_tier_per_layer_widths)

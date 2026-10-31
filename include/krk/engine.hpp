@@ -4,6 +4,7 @@
 #ifndef KRK_ENGINE_HPP
 #define KRK_ENGINE_HPP
 
+#include <atomic>
 #include <map>
 #include <string>
 #include <utility>
@@ -293,6 +294,14 @@ struct GenerateParams {
     // also prints per token, which serialises the run and confounds any test of
     // it -- hence a flag that changes one variable and not the other.
     bool sample_host = false;
+
+    // Cooperative cancellation. Tested once per generated token and once per
+    // prefill chunk, so a dropped HTTP connection stops a long decode instead
+    // of decoding to the end into a dead socket. nullptr (the default) means
+    // "never cancel"; the engine only ever reads the flag, so a request-local
+    // std::atomic<bool> owned by the caller is sufficient and no lock is added
+    // to the token loop.
+    const std::atomic<bool> *cancel = nullptr;
 };
 
 enum Finish : int {
@@ -319,6 +328,11 @@ struct GenerateResult {
     // that prefilled the whole prompt.
     i32 reused_tokens = 0;
     i32 generated = 0;
+    // Set when GenerateParams::cancel stopped the run. `finish` is FinishStop in
+    // that case (there is no OpenAI "cancelled" finish reason), so this is the
+    // flag a server or a test reads to tell "the model ended" from "the caller
+    // hung up". `generated`/`tokens`/`text` hold the partial result either way.
+    bool cancelled = false;
     f64 prefill_ms = 0;
     f64 decode_ms = 0;
     // How many decode steps decode_ms actually covers. It is NOT `generated`:
@@ -712,6 +726,12 @@ private:
     // decode), or every row (speculative verification).
     bool forward(const i32 *toks, i32 n, i32 pos0, bool want_logits);
     bool forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode);
+
+    // Cooperative cancellation (see GenerateParams::cancel). Read once per
+    // prefill chunk and once per generated token; the decode loops stop through
+    // TokenEmitter, the prefill loops through mark_cancelled().
+    bool cancel_requested(const GenerateParams &p) const;
+    void mark_cancelled(const GenerateParams &p, GenerateResult *res, i64 held);
     // GPT-2 runs its own loop rather than threading four family-specific
     // branches through forward_core: LayerNorm with a bias, learned absolute
     // positions, a fused attn_qkv whose row is Q|K|V, and an ungated GELU MLP.
@@ -757,6 +777,8 @@ private:
     // HIP run of the same prompt then differ at exactly one line per stage.
     // `row_scale` (nullable) is a per-row f32 multiplier the row was stored
     // divided by; it is applied on the host so the trace shows true scale.
+    void dump_open();
+    void dump_close();
     void dump_row(const char *what, i32 layer, const void *buf, i64 width, i64 rows,
                   const f32 *row_scale = nullptr);
     // Folds every row of `buf` into the prefill trace hash. The row-local
@@ -1699,6 +1721,11 @@ private:
     // KRK_DUMP destination (see Engine::init): empty means the per-stage dump
     // hook in forward_core is inert.
     std::string dump_path_;
+    // The dump file's per-run bookkeeping: one header, one end marker, and the
+    // number of stage lines between them. See Engine::dump_open().
+    bool dump_open_ = false;
+    bool dump_closed_ = false;
+    i64 dump_lines_ = 0;
     // -1 = the architecture's own delta-net gate (silu on qwen3.5, sigmoid on
     // qwen4exp), 0 = force silu, 1 = force sigmoid (KRK_GDN_GATE).
     i32 gdn_gate_ = -1;

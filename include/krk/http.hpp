@@ -75,18 +75,34 @@ public:
     // Blocking accept loop. Returns when stop() is called (from any thread).
     void run(HttpHandler handler);
 
-    // Shuts the listener down and unblocks run(). Not instant: the OS may
-    // still hold the socket for a moment.
+    // Shuts the listener down and unblocks run(). stop() does NOT close the
+    // descriptor: the thread inside run() owns it from the moment it starts and
+    // closes it on the way out, so no thread ever closes a descriptor another
+    // thread may be blocked accepting on (the kernel can recycle that number
+    // into an unrelated socket, and the accept then hands out somebody else's
+    // connection). Bounded at one poll interval, not "not instant".
     void stop();
 
     bool running() const { return running_.load(); }
 
 private:
     void serve_client(int fd, HttpHandler handler);
+    // Closes the listening descriptor if this thread wins the exchange.
+    bool take_and_close_listener();
 
-    int listen_fd_ = -1;
+    // The listening descriptor. Written by listen() and by run()'s exit path
+    // (compare-exchange, so exactly one of run()/stop() is the closer);
+    // read by the accept loop once per iteration. It is atomic because
+    // stop() reads it from another thread while that loop is running -- as a
+    // plain int that read was a data race under TSAN, and the "value observed
+    // after close" is a descriptor number the OS may already have reused.
+    std::atomic<int> listen_fd_{-1};
     int port_ = -1;
     std::atomic<bool> running_{false};
+    // Set by stop(), read by run(): the loop polls for readability with a
+    // bounded wait so it can notice this within one poll interval instead of
+    // needing the descriptor to be closed underneath it.
+    std::atomic<bool> stop_requested_{false};
 #ifdef _WIN32
     void *wsa_ = nullptr;
 #endif

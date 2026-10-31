@@ -1053,6 +1053,23 @@ public:
                       i64 pos0, const f32 *inv_freq, f32 scale, f32 frac,
                       bool neox) = 0;
 
+    // Per-row rotary positions, for a forward that carries rows from different
+    // sequences (the batching case AttnDesc::row_pos exists for). Row t is
+    // rotated at row_pos[t]; everything else is rope()'s contract.
+    //
+    // Returns false when the backend does not implement it. A caller must then
+    // rope ONE SEQUENCE AT A TIME -- never fall back to `pos0 + t`, which
+    // rotates rows at the wrong positions and stays finite while doing it. The
+    // default is false on purpose: a backend that has not thought about
+    // multi-sequence rows should refuse the batch, not silently mis-rotate it.
+    virtual bool rope_rows(void *q, void *k, i64 n_head, i64 n_kv, i64 hd,
+                           i64 n_tok, const i64 *row_pos, const f32 *inv_freq,
+                           f32 scale, f32 frac, bool neox) {
+        (void)q; (void)k; (void)n_head; (void)n_kv; (void)hd; (void)n_tok;
+        (void)row_pos; (void)inv_freq; (void)scale; (void)frac; (void)neox;
+        return false;
+    }
+
     // Per-head RMSNorm on q/k (Qwen3, Gemma3). No-op when w == nullptr.
     // `wide` selects OLMoE's convention: one RMS over the whole projected row
     // (n_head * hd), the weight spanning the row. False is the Qwen3/Gemma3

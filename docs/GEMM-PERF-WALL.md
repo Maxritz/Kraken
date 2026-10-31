@@ -350,7 +350,23 @@ corrections, both from `tools/bench_isa_ceiling.cpp` in one process:
 | C loads + int->float tail (maddubs pair) | 70.7-76.2 | 100% |
 | **V0 VNNI, registers only** | **86.4-93.2** | 122% |
 | **V1 VNNI + loads + int->float tail** | **78.2-80.6** | 111% |
-| E production kernel, 768x2048x512 | 32.2 | **40% of V1** |
+| E the PRE-TABLE kernel (`dot_q8_0_q8_x8`), 768x2048x512 | 32.2 | **40% of V1** |
+
+> **Correction, same day.** `E` is not the production kernel: the engine has
+> called the 16-lane scale-table kernel (`dot_q8_0_q8_wsc8`) since the table
+> landed. In one process, interleaved, `kraken-q80-gemm-bench` (768x2048x512,
+> nc=128, best of five, four runs) measures **wsc8 at 1.40x `E`** -- 48.1-49.1
+> against 34.0-35.7 GMAC/s. The paragraph below is kept because its argument
+> (judge against V1, not against the maddubs ceiling) is right; its 40% is about
+> the pre-table kernel.
+>
+> **And the ratio to V1 cannot be stated more precisely than "within the noise
+> floor".** `kraken-isa-ceiling` measures the shipped kernel `T` against `V1` in
+> ONE process and gets **70% in one call and 110% in the next**, same function,
+> same data. This host's run-to-run spread for identical code is up to 1.5x, so
+> every absolute GMAC/s number in this file is a same-session ratio and nothing
+> else. That is also why "40% of V1" (a cross-session comparison against the
+> wrong kernel) should never have been quoted.
 
 So the number the kernel should be judged against is **V1, the exact
 instruction mix it ships**, not the maddubs ceiling. Against V1 the production
@@ -557,7 +573,8 @@ Same-run ratios, which is the only comparison the host's noise permits:
 
 * **the table is worth 1.45x / 1.47x / 1.52x / 1.56x on prefill** — consistently
   larger than the 1.08-1.19x it is worth on decode, exactly as an
-  instruction-bound loop should behave;
+  instruction-bound loop should behave (re-measured 2026-10-31 as 1.38-1.41x
+  with both kernels timed back to back in one process);
 * the shipped GEMM is at **67-105% of V1** (median ~76%), not the 40% that was
   reported against the pre-table kernel.
 
@@ -699,3 +716,63 @@ can be re-run instead of re-argued, and every prototype is checked against
 dequant-then-f32 before its speed is quoted (g4 1.1e-6, g4-with-per-32-activation
 2.8e-7, s4 8.5e-4 -- the last is the s-layout's own sub-scale truncation, which
 is another reason it is out).
+
+## pv8, the compact pair table: built, measured, REJECTED (2026-10-31)
+
+The last structural idea the sections above leave open is a repack of the scale
+path: hoist the weight row's two f16 scales per block pair out of the loop, so
+the per-(row, block pair) chain is one 64-bit load, one 128-bit multiply, one
+broadcast and one permute instead of five uops plucking a header, converting it
+and shuffling it twice. `build_q8_0_wpairs` cost 8 B per output row per block
+pair (0.125 B per weight value, +12 % weight traffic) and the kernel that reads
+it is **byte-identical to x8 on every cell** -- it is the same arithmetic in the
+same order, so a win would have been free and a loss is unambiguous.
+
+`kraken-q80-gemm-bench 768 2048 512`, nc=128, best of five, four runs, GMAC/s:
+
+| kernel | r1 | r2 | r3 | r4 |
+|---|---:|---:|---:|---:|
+| x8, no table | 33.99 | 35.69 | 34.05 | 34.49 |
+| **wsc8 16-lane tables (ships)** | **48.70** | **48.95** | **48.12** | **49.05** |
+| pv8 pair table | 44.56 | 45.87 | 44.47 | 45.60 |
+| wsc8 + tree reduce (sum order changed) | -- | 47.11 | 46.14 | 49.01 |
+
+**It loses by 7-9 %.** The five uops it deletes were already hidden behind the
+pair loop (which is the same thing L1 in the ablation table says: the activation
+scale chain is free), while the table it adds is a load in the critical path per
+row. So the uop count of the scale family is not the binding constraint at this
+shape, and there is no repack left: the kernel is at the 5-uops-per-64-MAC floor
+of the instruction mix (one activation load, one masked sign flip, `vpdpbusd`,
+`vcvtdq2ps`, `vfmadd`), and what remains between it and V1 is the mix itself.
+
+The kernel now lives in `tools/bench_q80_gemm.cpp` -- the bench that measures it
+-- and not in `src/quant.cpp`, because a measured-and-rejected candidate is not
+shipped code. The bench prints `identical: x8 vs pv8` on every run, so the
+identity claim in the paragraph above is checked by the artifact that reports the
+loss.
+
+### The `W` arm is not a shippable 1.38x
+
+`kraken-isa-ceiling`'s `W` arm prints 1.38x over `T` (60.7 against 44.0 GMAC/s in
+one process, 2026-10-31). It is a harness artifact, and saying so matters more
+than the number: `W`'s ACTIVATION scale table is built from constants
+(`e0 = 0.011f + ...`) outside the timed loop, while `T` calls
+`build_q8_0_xscales` per row tile INSIDE it. So `W` prices a kernel that does not
+need an activation scale at all -- which is L1, the rung the ablation already
+showed is free. The only legal form of the idea is hoisting the per-tile build,
+which the backend already does (`KRK_CPU_XSC_HOIST`), and its effect is under the
+noise floor.
+
+### What B1 closes as
+
+| claim | evidence |
+|---|---|
+| the engine ships the table kernel; the "40% / 32.2 GMAC/s" numbers are the pre-table one | `src/backend_cpu.cpp` calls `dot_q8_0_q8_wsc8` when `q8_0_wsc_supported()`; `bench_q80_ablate` L0 and `bench_isa_ceiling` E both drive `dot_q8_0_q8_x8` |
+| the table is worth ~1.4x, measured interleaved in one process | `bench_q80_gemm` 4-column sweep, four runs |
+| no remaining legal repack pays | pv8, bit-identical, 0.93x |
+| the distance to V1 is unresolvable here | T/V1 = 70% and 110% in one process, same function |
+| the target is arithmetic, not a kernel | 48-49 GMAC/s is ~16 tok/s of prefill per core at ~3 GMAC/token; four cores ~64 against a 200 target |
+
+**Conclusion: B1 is measured and closed with no legal win.** The next lever is a
+format whose scale group is longer than 32 by construction -- a different model's
+arithmetic, not a faster kernel for this one.
