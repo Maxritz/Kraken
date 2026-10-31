@@ -23,44 +23,59 @@ std::string blk_key(const char *fmt, i32 layer) {
     return std::string(buf);
 }
 
-// A routed-expert trio is read through ONE format, not three.
+// The routed-expert trio: `gate` and `up` are read through one format, `down`
+// is read through its own.
 //
-// `gemm_group` takes a single weight type and every matrix in the launch shares
-// it (`wts` exists, but the expert call sites do not pass one -- the bank is one
-// launch of N routes), and the expert cache sizes a fetch from the tensor's
-// format once. So a checkpoint that stores, say, `ffn_gate_exps` as Q8_0 and
-// `ffn_up_exps` as F16 would be walked with the gate's block size: the up
-// matrix's rows would be read at the wrong stride and every routing that picked
-// an expert would compute a plausible-looking wrong answer. Nothing downstream
-// can tell -- the shapes agree, so every existing check passes.
+// `gate` and `up` share one activation and one fused epilogue, so a pair that
+// stored, say, `ffn_gate_exps` as Q8_0 and `ffn_up_exps` as F16 would be walked
+// with the gate's block size: the up matrix's rows would be read at the wrong
+// stride and every routing that picked an expert would compute a
+// plausible-looking wrong answer. Nothing downstream can tell -- the shapes
+// agree, so every existing check passes. That pair stays pinned.
 //
-// This is not hypothetical: hybrid checkpoints are normal. DeepSeek-V4-Flash's
+// `down` does NOT, and pinning it was over-strict. It is a separate launch at
+// every site that reads it -- `gemm(..., re->down.data, re->down.type, ...)` in
+// the per-expert path, and its own `gemm_group` carrying `dts[]` in the batched
+// one -- over a different activation (the silu'd product, not the block input).
+// The cache does not join the three either: `ExpertSource::per_expert()` is
+// `n_bytes / n_expert` per tensor, the promotion allocates and copies
+// `slice[0..2]` per tensor, and `*to[i] = *from[i]` carries each slice's own
+// `type`. So a Q6_K `down` beside a Q4_K `gate` is read at its own stride by
+// construction.
+//
+// That is not a corner case: it is what `llama-quantize`'s Q4_K_M recipe
+// writes. It bumps `ffn_down_exps` to Q6_K on a subset of layers and leaves
+// gate/up at Q4_K, so refusing the trio refused stock output -- measured on
+// `micro-qwen4exp-realqsa-Q4_K_M.gguf`, where `down` is Q6_K on blk.0/3/6/9 and
+// Q4_K elsewhere. The refusal now names only the pair that can be wrong.
+//
+// A gate/up pair that cannot be run must say so, with the two format names,
+// rather than run and be wrong. The precedent is real: DeepSeek-V4-Flash's
 // NVFP4 release keeps the trunk experts in ModelOpt NVFP4 and the MTP draft's
 // experts in FP8/MXFP4, and the vLLM port that let the draft inherit the
 // trunk's quant config lost its whole speculative gain to it (acceptance fell
 // to ~1.0-1.15 tokens/step, 16.7 tok/s; on its own path, 70% acceptance and
-// 45.4 tok/s). A mixed-trio file we cannot run must say so, with the two format
-// names, rather than run and be wrong.
+// 45.4 tok/s).
 //
-// `g` may be null: an ungated bank (nemotron_h_moe) has no `ffn_gate_exps`.
+// `g` may be null: an ungated bank (nemotron_h_moe) has no `ffn_gate_exps`, and
+// then there is no pair to pin.
 bool expert_formats_agree(const GgufTensor *g, const GgufTensor *up,
                           const GgufTensor *dn, const std::string &where,
                           std::string *err) {
-    const GgufTensor *first = g ? g : up;
-    if (!first) return true;
-    for (const GgufTensor *t : {g, up, dn}) {
-        if (!t || t->type == first->type) continue;
-        if (err)
-            *err = where + ": the routed experts mix formats -- '" + first->name +
-                   "' is " + dtype_name(first->type) + " and '" + t->name +
-                   "' is " + dtype_name(t->type) +
-                   ". A bank is read as one launch in one format, so the mixed "
-                   "matrices would be walked at the wrong stride and answer "
-                   "wrongly. Re-quantize the experts to one type, or load this "
-                   "file in an engine that indexes per-matrix formats";
-        return false;
-    }
-    return true;
+    // `dn` is deliberately not compared: see the note above.
+    (void)dn;
+    if (!g || !up || g->type == up->type) return true;
+    if (err)
+        *err = where + ": the routed experts mix formats -- '" + g->name +
+               "' is " + dtype_name(g->type) + " and '" + up->name +
+               "' is " + dtype_name(up->type) +
+               ". gate and up share one activation and one fused epilogue, so "
+               "the pair is walked in a single format and a mismatch would be "
+               "read at the wrong stride and answer wrongly. Re-quantize those "
+               "two to one type ('ffn_down_exps' may differ -- it is its own "
+               "launch, which is why llama-quantize's Q4_K_M recipe ships a "
+               "Q6_K down beside a Q4_K gate)";
+    return false;
 }
 
 // An NVFP4 bank without its per-tensor global scale is 1.0 by construction (see

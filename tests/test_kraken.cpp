@@ -2161,6 +2161,8 @@ static bool build_sized_model(const std::string &path, int n_embd, int n_ff,
                               int mask_id = -1);
 static void set_env_var(const char *name, const std::string &value);
 static void clear_env_var(const char *name);
+static bool plain_logits_of(const std::string &path, std::vector<f32> &lg,
+                            std::string &err);
 // The prefill-chunk gate drives the CLI that sits beside this binary.
 static std::string self_path();
 
@@ -31746,7 +31748,22 @@ static void test_batch_throughput() {
 //
 // The check is fail-closed at load, with the two format names, and this test is
 // its negative control: the SAME stack with a uniform trio must still load.
-static bool build_mixed_expert_model(const std::string &path, bool mixed) {
+//
+// `down` is NOT part of the pinned pair -- it is its own launch carrying its own
+// type, all the way through the expert cache -- so `mixed_down` writes the shape
+// llama-quantize's Q4_K_M recipe writes (a gate/up pair in one format, a `down`
+// in another) and that one must LOAD. Both arms are needed: without the gate/up
+// arm below, the guard could be deleted outright and nothing would notice;
+// without this one, the relaxation it is allowed to make is untested.
+//
+// The load arm's `down` is Q8_0 rather than the Q6_K a real recipe would pick,
+// because a fixture only has to differ; the Q6_K case is covered by the file
+// that found this, `micro-qwen4exp-realqsa-Q4_K_M.gguf` (Q6_K down on blk
+// 0/3/6/9, Q4_K gate/up), which loads and builds its workspaces now. The stride
+// arm's Q8_0 is exact on purpose: d = 1.0 makes a block dequantise to its codes
+// with no rounding, which is what lets it demand bit-identical logits.
+static bool build_mixed_expert_model(const std::string &path, bool mixed,
+                                     int down_mode = 0) {
     const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
     const int n_layer = 1, n_expert = 4, n_used = 2, n_ff_exp = 32;
     const int vocab = 264, ctx = 64;
@@ -31822,8 +31839,45 @@ static bool build_mixed_expert_model(const std::string &path, bool mixed) {
                      {(u64)n_embd, (u64)n_ff_exp, (u64)ne}, q8.data(),
                      q8.size());
     }
-    b.tensor_f16(p + "ffn_down_exps.weight",
-                 {(u64)n_ff_exp, (u64)n_embd, (u64)ne}, down);
+    // down_mode: 0 = F16 (the uniform trio), 1 = the other format with a zero
+    // payload (the load arm), 2 and 3 = the SAME matrix written as Q8_0 codes
+    // and as F16 (the stride arm).
+    const size_t dn_elems = (size_t)n_ff_exp * n_embd * ne;
+    if (down_mode == 0) {
+        b.tensor_f16(p + "ffn_down_exps.weight",
+                     {(u64)n_ff_exp, (u64)n_embd, (u64)ne}, down);
+    } else {
+        // `d = 1.0` makes a Q8_0 block dequantise EXACTLY to its int8 codes, so
+        // modes 2 and 3 describe one matrix in two encodings: same values, no
+        // rounding, and therefore the same answer iff the reader takes each
+        // matrix's stride from its own type.
+        const bool exact = down_mode >= 2;
+        std::vector<f32> vals;
+        if (exact) {
+            vals.resize(dn_elems);
+            for (size_t k = 0; k < dn_elems; k++)
+                vals[k] = static_cast<f32>(static_cast<int>(k % 9) - 4);
+        }
+        if (down_mode == 3) {
+            b.tensor_f16(p + "ffn_down_exps.weight",
+                         {(u64)n_ff_exp, (u64)n_embd, (u64)ne}, vals);
+        } else {
+            const size_t nblocks = dn_elems / 32;
+            std::vector<u8> q8d(nblocks * 34, 0);
+            for (size_t i = 0; i < nblocks; i++) {
+                const u16 d = 0x3C00; // f16 1.0
+                std::memcpy(&q8d[i * 34], &d, 2);
+                if (!exact) continue;
+                for (size_t j = 0; j < 32; j++) {
+                    const int code = static_cast<int>(vals[i * 32 + j]);
+                    q8d[i * 34 + 2 + j] = static_cast<u8>(static_cast<i8>(code));
+                }
+            }
+            b.tensor_raw(p + "ffn_down_exps.weight", 8,
+                         {(u64)n_ff_exp, (u64)n_embd, (u64)ne}, q8d.data(),
+                         q8d.size());
+        }
+    }
     return b.write(path);
 }
 
@@ -31831,8 +31885,17 @@ static void test_mixed_expert_formats() {
     Backend *cpu = make_cpu_backend();
     const std::string good = "mixed_expert_ok.gguf";
     const std::string bad = "mixed_expert_bad.gguf";
+    const std::string down_only = "mixed_expert_down.gguf";
+    const std::string stride_q8 = "mixed_expert_down_q8.gguf";
+    const std::string stride_f16 = "mixed_expert_down_f16.gguf";
     CHECK(build_mixed_expert_model(good, false), "wrote the uniform-trio file");
     CHECK(build_mixed_expert_model(bad, true), "wrote the mixed-trio file");
+    CHECK(build_mixed_expert_model(down_only, false, 1),
+          "wrote the gate/up-uniform, down-different file");
+    CHECK(build_mixed_expert_model(stride_q8, false, 2),
+          "wrote the down-as-Q8_0-codes file");
+    CHECK(build_mixed_expert_model(stride_f16, false, 3),
+          "wrote the same numbers as F16");
 
     // The control: same stack, all three banks F16. It must still load, or the
     // check is refusing a legitimate file rather than a broken one.
@@ -31860,8 +31923,66 @@ static void test_mixed_expert_formats() {
               ("and both formats: " + e).c_str());
         m.unload();
     }
+    // The relaxation: gate and up agree, `down` does not. This must LOAD -- it
+    // is the shape llama-quantize's Q4_K_M recipe ships for every MoE family it
+    // touches, so refusing it refused stock output.
+    {
+        Model m;
+        std::string e;
+        const bool ok = m.load(*cpu, down_only, &e);
+        CHECK(ok, ("a trio whose `down` differs still loads: " + e).c_str());
+        m.unload();
+    }
+    // The stride, MEASURED rather than argued. Both files below describe one
+    // down matrix -- the same small integers, written as Q8_0 codes behind a
+    // d = 1.0 block scale and as F16 -- so a reader that takes each matrix's
+    // stride from its own type must give the same answer. A reader that walked
+    // `down` with the gate's format would read every row after the first at an
+    // offset that drifts, which is the failure the old guard was built on and
+    // the one this relaxation is allowed to make only because it cannot happen.
+    {
+        std::vector<f32> a_lg, b_lg;
+        std::string ea, eb;
+        const bool ok_a = plain_logits_of(stride_f16, a_lg, ea);
+        const bool ok_b = plain_logits_of(stride_q8, b_lg, eb);
+        if (!ok_a) std::fprintf(stderr, "  (f16 twin: %s)\n", ea.c_str());
+        if (!ok_b) std::fprintf(stderr, "  (q8 down: %s)\n", eb.c_str());
+        CHECK(ok_a && ok_b, "both encodings of the same `down` load and run");
+        if (ok_a && ok_b) {
+            size_t a_arg = 0, b_arg = 0;
+            for (size_t i = 1; i < a_lg.size(); i++)
+                if (a_lg[i] > a_lg[a_arg]) a_arg = i;
+            for (size_t i = 1; i < b_lg.size(); i++)
+                if (b_lg[i] > b_lg[b_arg]) b_arg = i;
+            CHECK(a_arg == b_arg, "the Q8_0 down picks the same next token");
+            // NaN-aware on purpose: `std::max(worst, NaN)` returns `worst`, so a
+            // row of NaN on one side would have compared as identical. Measured
+            // -- the red construction below produces exactly that and this arm
+            // reported "differ by 0" until the comparison was written this way.
+            f32 worst = 0.0f;
+            const size_t n = std::min(a_lg.size(), b_lg.size());
+            for (size_t i = 0; i < n; i++) {
+                const f32 d = std::fabs(a_lg[i] - b_lg[i]);
+                if (!(d <= worst)) worst = d;
+            }
+            // EXACT, and it can be: d = 1.0 makes each Q8_0 block dequantise to
+            // its integer codes with no rounding, an integer below 2^11 is exact
+            // in f16, so the two files carry one matrix bit for bit and the same
+            // kernel sequence must produce the same logits. A stride read from
+            // the wrong type is not a rounding error -- measured, it moves them.
+            if (worst != 0.0f)
+                std::fprintf(stderr,
+                             "  (down stride arm: logits differ by %.4g)\n",
+                             static_cast<double>(worst));
+            CHECK(worst == 0.0f,
+                  "and its logits match the same numbers stored as F16");
+        }
+    }
     std::remove(good.c_str());
     std::remove(bad.c_str());
+    std::remove(down_only.c_str());
+    std::remove(stride_q8.c_str());
+    std::remove(stride_f16.c_str());
     delete cpu;
 }
 
