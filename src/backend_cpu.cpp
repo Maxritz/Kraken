@@ -1107,6 +1107,14 @@ public:
                                  (n_in / 32) >= 2 && ((n_in / 32) & 1) == 0 &&
                                  q8_0_wsc_supported();
             const i64 npair = (n_in / 32) / 2;
+            // KRK_CPU_XSC_HOIST=0 rebuilds the activation-scale array inside the
+            // column loop, which is the shape this had before the hoist. Only
+            // there to keep the comparison measurable.
+            static const bool xsc_hoist = [] {
+                const char *e = std::getenv("KRK_CPU_XSC_HOIST");
+                return !(e != nullptr && e[0] == '0');
+            }();
+            std::vector<f32> xsc_all;
         // Decode, q8_0, VNNI: four output rows per call. Each is an
         // independent weight stream, so a thread keeps four in flight instead
         // of one, which is what this kernel is short of (see the comment on
@@ -1145,7 +1153,17 @@ public:
                     // row -- see build_q8_0_wscales. Built this way the inner
                     // loop has no scale build at all: it is load, vpdpbusd,
                     // vcvtdq2ps, vmulps, vfmadd.
-                    std::vector<f32> wsc, xsc;
+                    std::vector<f32> wsc;
+                    // Activation scales for EVERY row of the call, built once.
+                    // They do not depend on the column block, so building them
+                    // inside the column loop below would repeat the work once
+                    // per block -- n_out/nc times -- for a result that is
+                    // already in hand. Sized rows8 * npair * 16 floats, which is
+                    // one byte per activation element.
+                    if (use_wsc && xsc_hoist) {
+                        xsc_all.resize(static_cast<size_t>(rows8 * npair * 16));
+                        build_q8_0_xscales(xdp, nb, rows8, n_in, xsc_all.data());
+                    }
                     for (i64 c = cb; c < ce; c++) {
                         const i64 o0 = c * nc;
                         const i64 o1 = std::min<i64>(n_out, o0 + nc);
@@ -1156,12 +1174,10 @@ public:
                                 row_bytes, o1 - o0, n_in, wsc.data());
                         }
                         for (i64 r = 0; r < rows8; r += 8) {
-                            if (use_wsc) {
-                                // Activation scales for these eight rows, once
-                                // per row tile -- shared by every output row.
-                                xsc.resize(static_cast<size_t>(8 * npair * 16));
+                            if (use_wsc && !xsc_hoist) {
+                                xsc_all.resize(static_cast<size_t>(8 * npair * 16));
                                 build_q8_0_xscales(xdp + r * nb, nb, 8, n_in,
-                                                   xsc.data());
+                                                   xsc_all.data());
                             }
                             for (i64 o = o0; o < o1; o++) {
                                 const u8 *wr =
@@ -1171,7 +1187,8 @@ public:
                                         wr, xqp + r * n_in, xdp + r * nb, n_in,
                                         n_in, nb, of + r * n_out + o, n_out,
                                         wsc.data() + (o - o0) * npair * 16,
-                                        xsc.data());
+                                        xsc_all.data() +
+                                            (xsc_hoist ? r * npair * 16 : 0));
                                 else
                                     dot8(wr, r, o);
                             }
@@ -1387,6 +1404,94 @@ public:
                 });
     }
 
+    // ---- block-sparse rows (MSA) -----------------------------------------
+    // A separate body on purpose. Threading a run list through attn_range would
+    // touch the one function every model's attention reads, to serve one family
+    // that no other path uses; this way a run that sets no key_runs executes
+    // exactly the instructions it did before.
+    //
+    // The arithmetic is the scalar reference shape: score over the visible keys
+    // in run order, one softmax over all of them, then the weighted sum. Run
+    // order is the caller's order, so the same runs always produce the same
+    // bits -- a selected-block set has no canonical order and inventing one
+    // would make two equal selections disagree in the last place.
+    void attn_sparse_rows(void *out, const void *q, const void *kcache,
+                          const void *vcache, const AttnDesc &d) {
+        const i64 hd = d.hd, nh = d.n_head, nkv = d.n_kv, nt = d.n_tok;
+        const f32 *qp = static_cast<const f32 *>(q);
+        f32 *op = static_cast<f32 *>(out);
+        std::vector<f32> sc;
+        for (i64 t = 0; t < nt; t++) {
+            const i64 pos = attn_pos(d, t);
+            const i64 n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
+            const i64 j_lo = d.window > 0 ? std::max<i64>(0, n_keys - d.window) : 0;
+            // Resolve the runs once per row: clamp, intersect with the window,
+            // drop empties. What survives is the exact key set.
+            std::vector<std::pair<i64, i64>> runs;
+            runs.reserve(static_cast<size_t>(d.n_key_runs));
+            for (i64 r = 0; r < d.n_key_runs; r++) {
+                const i64 lo = std::max(d.key_runs[2 * r + 0], j_lo);
+                const i64 hi = std::min(d.key_runs[2 * r + 1], n_keys);
+                if (hi > lo) runs.emplace_back(lo, hi);
+            }
+            i64 n_vis = 0;
+            for (const auto &r : runs) n_vis += r.second - r.first;
+            for (i64 h = 0; h < nh; h++) {
+                const f32 *qh = qp + (t * nh + h) * hd;
+                const i64 kh = h / (nh / nkv);
+                f32 *oh = op + (t * nh + h) * hd;
+                if (n_vis <= 0) {
+                    for (i64 i = 0; i < hd; i++) oh[i] = 0.0f;
+                    continue;
+                }
+                sc.assign(static_cast<size_t>(n_vis), 0.0f);
+                i64 k = 0;
+                f32 mx = -INFINITY;
+                for (const auto &rn : runs) {
+                    for (i64 j = rn.first; j < rn.second; j++, k++) {
+                        const char *kb = static_cast<const char *>(kcache);
+                        const i64 off = (d.layer * d.layer_stride +
+                                         (attn_kv_base(d, t) + j) * d.pos_stride +
+                                         kh * hd);
+                        const f32 *kv = reinterpret_cast<const f32 *>(kb + off * 4);
+                        f32 s = 0.0f;
+                        for (i64 i = 0; i < hd; i++) s += qh[i] * kv[i];
+                        s *= d.scale;
+                        if (d.softcap > 0.0f)
+                            s = d.softcap * std::tanh(s / d.softcap);
+                        sc[static_cast<size_t>(k)] = s;
+                        if (s > mx) mx = s;
+                    }
+                }
+                f32 l = 0.0f;
+                if (d.sinks) {
+                    const f32 sk = d.sinks[h];
+                    if (sk != 0.0f) l = std::exp(sk - mx);
+                }
+                for (i64 i = 0; i < n_vis; i++) {
+                    const f32 e = std::exp(sc[static_cast<size_t>(i)] - mx);
+                    sc[static_cast<size_t>(i)] = e;
+                    l += e;
+                }
+                for (i64 i = 0; i < hd; i++) oh[i] = 0.0f;
+                if (l <= 0.0f) continue;
+                const f32 inv = 1.0f / l;
+                k = 0;
+                for (const auto &rn : runs) {
+                    for (i64 j = rn.first; j < rn.second; j++, k++) {
+                        const f32 p = sc[static_cast<size_t>(k)] * inv;
+                        const char *vb = static_cast<const char *>(vcache);
+                        const i64 off = (d.layer * d.layer_stride +
+                                         (attn_kv_base(d, t) + j) * d.pos_stride +
+                                         kh * hd);
+                        const f32 *vv = reinterpret_cast<const f32 *>(vb + off * 4);
+                        for (i64 i = 0; i < hd; i++) oh[i] += p * vv[i];
+                    }
+                }
+            }
+        }
+    }
+
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {
         // Attention is a GEMM pair -- QK^T then AV -- over the cached keys, so
@@ -1400,6 +1505,21 @@ public:
         // npu_flush_ first: q is usually the output of a GEMM still queued on
         // the device, and the gather below reads it on the host.
         npu_flush_();
+        // Block-sparse (MSA) before anything else: the NPU hand-off and the
+        // gather path both assume a contiguous key range, so an MSA call is
+        // taken here rather than being handed to a kernel that would read it
+        // densely. An int8 cache is a different layout altogether and is
+        // refused rather than reinterpreted.
+        if (d.key_runs != nullptr && d.n_key_runs > 0) {
+            if (d.kv_int8) {
+                KRK_WARN("block-sparse attention with an int8 cache is not "
+                         "implemented; refusing rather than attending densely");
+                std::memset(out, 0, static_cast<size_t>(d.n_tok) * d.n_head * d.hd * 4);
+                return;
+            }
+            attn_sparse_rows(out, q, kcache, vcache, d);
+            return;
+        }
         if (npu_) {
             // Everything that can make this call unrepresentable is handed over
             // rather than tested here, so the decision, the counting and the

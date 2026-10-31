@@ -1039,9 +1039,19 @@ the suspect. Fix = take dequant off the critical path: double-buffered LDS, a
 - **LLaDA / diffusion (DLLM)** — loader schema (fused `attn_qkv`, group-limited
   routing + gate bias) and the block-diffusion sampler; research and tensor map
   already in [docs/LLaDA.md](LLaDA.md).
-- **MTP / dflash / dspark draft blocks** — currently skipped with a note; the
-  verdict counts them (`mtp_blocks`), so the next step is to load them as a
-  draft head and wire them into the existing speculative loop.
+- **dspark draft blocks** — done: `src/dspark.cpp` loads the `dspark` schema and
+  the speculative loop drives it through `DraftBlock`, with the block decode,
+  the Markov bigram head and the confidence head, all verified by
+  `test_dspark_head_set`. What is left is the same thing that is left for the
+  rest of the family: no public checkpoint has been validated against the
+  loader, so the arch entry is Partial and says so.
+- **MTP / `qwen4-mtp` / `deepseek4-dspark` shards** — still refused, and for a
+  reason a loader cannot fix: a `qwen4-mtp` block is gated attention plus a QSA
+  indexer plus hyper-connections plus a 512-expert MoE, none of which has a
+  forward here. This is a block-porting job, not a schema job.
+- **minimax-m3** — MSA (`AttnDesc::key_runs` + `src/msa.cpp`) is implemented and
+  tested against dense; the load is still blocked on there being no validated
+  GGUF schema for the family and no vision/video tower.
 - **Architecture pass over every file in the model folders** — the inventory is
   at 44 runnable of 87; the refused ones need either a named dequantizer
   (quant type #100/#101/#102/#104/#107/#142/#143 are all implemented) or a

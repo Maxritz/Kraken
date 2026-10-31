@@ -413,6 +413,206 @@ tiled_expanded16(i64 n_in, i64 n_out, i64 rows) {
     return macs / best / 1e9;
 }
 
+// Output-row tiling. The eight-row tile re-loads the activation block and its
+// expanded scale once per OUTPUT row, and the activation load is the one piece
+// of per-(row, block pair) work that does not depend on the weight -- so two
+// output rows per call halve it. The masked sign split cannot be shared (its
+// mask IS the weight sign), so what is amortised is the load and nothing else;
+// that is the whole hypothesis and the measurement is here to check it paid
+// for the sixteen accumulators it costs.
+template <int kO>
+__attribute__((target("avx512f,avx512bw,avx512vnni,f16c"))) static double
+tiled_orrow(i64 n_in, i64 n_out, i64 rows) {
+    const i64 nb = n_in / 32;
+    const i64 row_bytes = nb * 34;
+    std::vector<u8> w(static_cast<size_t>(n_out * row_bytes));
+    u32 st = 12345;
+    for (auto &b : w) {
+        st = st * 1664525u + 1013904223u;
+        b = static_cast<u8>(st >> 24);
+    }
+    for (i64 o = 0; o < n_out; o++)
+        for (i64 b = 0; b < nb; b++) {
+            const u16 d = static_cast<u16>(0x2000 + ((o * 31 + b * 7) & 0x1fff));
+            w[static_cast<size_t>(o * row_bytes + b * 34)] = static_cast<u8>(d & 0xff);
+            w[static_cast<size_t>(o * row_bytes + b * 34 + 1)] = static_cast<u8>(d >> 8);
+        }
+    std::vector<i8> xq(static_cast<size_t>(rows * n_in));
+    for (auto &v : xq) {
+        st = st * 1664525u + 1013904223u;
+        v = static_cast<i8>(st >> 24);
+    }
+    std::vector<f32> xd(static_cast<size_t>(rows * nb), 0.01f);
+    const i64 npair = nb / 2;
+    std::vector<f32> wsc(static_cast<size_t>(n_out * npair * 16));
+    build_q8_0_wscales(w.data(), row_bytes, n_out, n_in, wsc.data());
+    std::vector<f32> xsc(static_cast<size_t>(8 * npair * 16));
+    std::vector<f32> out(static_cast<size_t>(rows * n_out));
+    double best = 1e30;
+    for (int rep = 0; rep < 5; rep++) {
+        const double t0 = now_s();
+        for (i64 r = 0; r + 8 <= rows; r += 8) {
+            build_q8_0_xscales(xd.data() + r * nb, nb, 8, n_in, xsc.data());
+            for (i64 o = 0; o + kO <= n_out; o += kO) {
+                __m512 acc[kO][8];
+                for (int k = 0; k < kO; k++)
+                    for (int i = 0; i < 8; i++) acc[k][i] = _mm512_setzero_ps();
+                const u8 *wp[kO];
+                const f32 *wsp[kO];
+                for (int k = 0; k < kO; k++) {
+                    wp[k] = w.data() + static_cast<size_t>(o + k) * row_bytes;
+                    wsp[k] = wsc.data() + (o + k) * npair * 16;
+                }
+                for (i64 p = 0; p < npair; p++) {
+                    // Weight side first, once per pair and held across the row
+                    // loop: two loads, an insert, a compare and a masked
+                    // subtract per output row, kO times per 512*kO MACs.
+                    __m512 wsv[kO];
+                    __m512i mag[kO];
+                    __mmask64 neg[kO];
+                    for (int k = 0; k < kO; k++) {
+                        const u8 *wq = wp[k] + p * 68;
+                        const __m256i lo = _mm256_loadu_si256(
+                            reinterpret_cast<const __m256i *>(wq + 2));
+                        const __m256i hi = _mm256_loadu_si256(
+                            reinterpret_cast<const __m256i *>(wq + 36));
+                        const __m512i wv = _mm512_inserti64x4(
+                            _mm512_castsi256_si512(lo), hi, 1);
+                        neg[k] = _mm512_cmp_epi8_mask(wv, _mm512_setzero_si512(),
+                                                      _MM_CMPINT_LT);
+                        mag[k] = _mm512_mask_sub_epi8(wv, neg[k],
+                                                      _mm512_setzero_si512(), wv);
+                        wsv[k] = _mm512_loadu_ps(wsp[k] + p * 16);
+                    }
+                    for (int i = 0; i < 8; i++) {
+                        const __m512i xv = _mm512_loadu_si512(
+                            reinterpret_cast<const void *>(
+                                xq.data() + (r + i) * n_in + p * 64));
+                        const __m512 xsv =
+                            _mm512_loadu_ps(xsc.data() + (i * npair + p) * 16);
+                        for (int k = 0; k < kO; k++) {
+                            const __m512i xb = _mm512_mask_sub_epi8(
+                                xv, neg[k], _mm512_setzero_si512(), xv);
+                            const __m512i iv = _mm512_dpbusd_epi32(
+                                _mm512_setzero_si512(), mag[k], xb);
+                            acc[k][i] = _mm512_fmadd_ps(
+                                _mm512_cvtepi32_ps(iv),
+                                _mm512_mul_ps(wsv[k], xsv), acc[k][i]);
+                        }
+                    }
+                }
+                for (int k = 0; k < kO; k++)
+                    for (int i = 0; i < 8; i++)
+                        out[static_cast<size_t>((r + i) * n_out + o + k)] =
+                            _mm512_reduce_add_ps(acc[k][i]);
+            }
+        }
+        const double dt = now_s() - t0;
+        if (dt < best) best = dt;
+    }
+    const double macs = static_cast<double>(rows / 8 * 8) *
+                        static_cast<double>(n_out / kO * kO) *
+                        static_cast<double>(n_in);
+    volatile double sink = out[0];
+    (void)sink;
+    return macs / best / 1e9;
+}
+
+// What a longer scale group would buy, measured before anyone builds it.
+// q8_0 applies the int->float tail once per 32 weights because that is where its
+// f16 scale sits. Sum kQ block pairs into ONE int accumulator and apply one
+// scale for the group, and the tail drops from 3 uops per 64 MACs to 3 per
+// 64*kQ. Lossy: the group must share a scale, which q8_0 does not. This arm
+// exists to size the prize, not to ship.
+template <int kQ>
+__attribute__((target("avx512f,avx512bw,avx512vnni,f16c"))) static double
+tiled_groupscale(i64 n_in, i64 n_out, i64 rows) {
+    const i64 nb = n_in / 32;
+    const i64 row_bytes = nb * 34;
+    std::vector<u8> w(static_cast<size_t>(n_out * row_bytes));
+    u32 st = 12345;
+    for (auto &b : w) {
+        st = st * 1664525u + 1013904223u;
+        b = static_cast<u8>(st >> 24);
+    }
+    for (i64 o = 0; o < n_out; o++)
+        for (i64 b = 0; b < nb; b++) {
+            const u16 d = static_cast<u16>(0x2000 + ((o * 31 + b * 7) & 0x1fff));
+            w[static_cast<size_t>(o * row_bytes + b * 34)] = static_cast<u8>(d & 0xff);
+            w[static_cast<size_t>(o * row_bytes + b * 34 + 1)] = static_cast<u8>(d >> 8);
+        }
+    std::vector<i8> xq(static_cast<size_t>(rows * n_in));
+    for (auto &v : xq) {
+        st = st * 1664525u + 1013904223u;
+        v = static_cast<i8>(st >> 24);
+    }
+    std::vector<f32> xd(static_cast<size_t>(rows * nb), 0.01f);
+    const i64 npair = nb / 2;
+    const i64 ngrp = npair / kQ;
+    std::vector<f32> wsg(static_cast<size_t>(n_out * ngrp * 16));
+    for (i64 o = 0; o < n_out; o++)
+        for (i64 g = 0; g < ngrp; g++)
+            for (int i = 0; i < 16; i++)
+                wsg[static_cast<size_t>((o * ngrp + g) * 16 + i)] = 0.011f;
+    std::vector<f32> xsg(static_cast<size_t>(8 * ngrp * 16), 0.013f);
+    std::vector<f32> out(static_cast<size_t>(rows * n_out));
+    double best = 1e30;
+    for (int rep = 0; rep < 5; rep++) {
+        const double t0 = now_s();
+        for (i64 r = 0; r + 8 <= rows; r += 8)
+            for (i64 o = 0; o < n_out; o++) {
+                const u8 *wr = w.data() + static_cast<size_t>(o) * row_bytes;
+                const f32 *wsr = wsg.data() + o * ngrp * 16;
+                __m512 acc[8];
+                for (int i = 0; i < 8; i++) acc[i] = _mm512_setzero_ps();
+                for (i64 g = 0; g < ngrp; g++) {
+                    __m512i iacc[8];
+                    for (int i = 0; i < 8; i++) iacc[i] = _mm512_setzero_si512();
+                    for (int q = 0; q < kQ; q++) {
+                        const u8 *wp = wr + (g * kQ + q) * 68;
+                        const __m256i lo = _mm256_loadu_si256(
+                            reinterpret_cast<const __m256i *>(wp + 2));
+                        const __m256i hi = _mm256_loadu_si256(
+                            reinterpret_cast<const __m256i *>(wp + 36));
+                        const __m512i wv = _mm512_inserti64x4(
+                            _mm512_castsi256_si512(lo), hi, 1);
+                        const __mmask64 neg = _mm512_cmp_epi8_mask(
+                            wv, _mm512_setzero_si512(), _MM_CMPINT_LT);
+                        const __m512i mag = _mm512_mask_sub_epi8(
+                            wv, neg, _mm512_setzero_si512(), wv);
+                        for (int i = 0; i < 8; i++) {
+                            const __m512i xv = _mm512_loadu_si512(
+                                reinterpret_cast<const void *>(
+                                    xq.data() + (r + i) * n_in +
+                                    (g * kQ + q) * 64));
+                            const __m512i xb = _mm512_mask_sub_epi8(
+                                xv, neg, _mm512_setzero_si512(), xv);
+                            iacc[i] = _mm512_dpbusd_epi32(iacc[i], mag, xb);
+                        }
+                    }
+                    const __m512 wsv = _mm512_loadu_ps(wsr + g * 16);
+                    for (int i = 0; i < 8; i++) {
+                        const __m512 xsv =
+                            _mm512_loadu_ps(xsg.data() + (i * ngrp + g) * 16);
+                        acc[i] = _mm512_fmadd_ps(
+                            _mm512_cvtepi32_ps(iacc[i]),
+                            _mm512_mul_ps(wsv, xsv), acc[i]);
+                    }
+                }
+                for (int i = 0; i < 8; i++)
+                    out[static_cast<size_t>((r + i) * n_out + o)] =
+                        _mm512_reduce_add_ps(acc[i]);
+            }
+        const double dt = now_s() - t0;
+        if (dt < best) best = dt;
+    }
+    const double macs = static_cast<double>(rows / 8 * 8) *
+                        static_cast<double>(n_out) * static_cast<double>(n_in);
+    volatile double sink = out[0];
+    (void)sink;
+    return macs / best / 1e9;
+}
+
 // The kernel the GEMM path ACTUALLY ships: the eight-row tile fed from a
 // per-OUTPUT-ROW f32 scale array (build_q8_0_wscales + dot_q8_0_q8_wsc8), which
 // is what backend_cpu.cpp calls. `shipped()` below still drives
@@ -613,6 +813,18 @@ int main(int argc, char **argv) {
                 100.0 * et / c);
     const double wb = tiled_expanded(768, 2048, 512);
     const double wb2 = tiled_expanded16(768, 2048, 512);
+    const double g2 = tiled_groupscale<2>(768, 2048, 512);
+    const double g4 = tiled_groupscale<4>(768, 2048, 512);
+    std::printf("%-42s %7.2f %6.0f%%\n", "G2 scale per 128 weights (LOSSLESS NO)",
+                g2, 100.0 * g2 / c);
+    std::printf("%-42s %7.2f %6.0f%%\n", "G4 scale per 256 weights (LOSSLESS NO)",
+                g4, 100.0 * g4 / c);
+    const double o2 = tiled_orrow<2>(768, 2048, 512);
+    const double o4 = tiled_orrow<4>(768, 2048, 512);
+    std::printf("%-42s %7.2f %6.0f%%\n", "O2 two output rows per call", o2,
+                100.0 * o2 / c);
+    std::printf("%-42s %7.2f %6.0f%%\n", "O4 four output rows per call", o4,
+                100.0 * o4 / c);
     std::printf("%-42s %7.2f %6.0f%%\n", "W2 repacked, f16 scales (half traffic)",
                 wb2, 100.0 * wb2 / c);
     std::printf("%-42s %7.2f %6.0f%%  <- expanded scales, no per-row scale build\n",

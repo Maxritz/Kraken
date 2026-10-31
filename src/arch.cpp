@@ -1072,21 +1072,29 @@ constexpr ArchSpec kTable[] = {
     {"dflash-draft", ArchShape::Dense, ArchSupport::Yes, ArchRole::Draft,
      "dflash", "",
      true, false, false, false, true, true},
-    // DSpark is a different head family (Markov/diffusion heads over the
-    // target's nextn state) that nothing here reads yet, so it stays refused
-    // rather than being claimed by the DFlash loader.
+    // DSpark: a parallel BLOCK drafter, served by src/dspark.cpp. It is not a
+    // model and not a DFlash head set -- different block maths, two extra heads
+    // -- but it answers the same six questions the speculative loop asks, so it
+    // plugs in through DraftBlock beside DFlash.
     //
-    // The message describes the schema the files actually carry, not a
-    // `dspark.*` prefix: `fc.weight` over the target-layer stack, a `blk.N`
+    // The schema it reads: `fc.weight` over the target-layer stack, a `blk.N`
     // stack whose attention is non-causal over a draft block of
-    // `dspark.block_size` rows, `markov.w1/w2` (a rank-256 bigram head) and
-    // `confidence.proj`. The block count is per file (5 and 6 on this box), so
-    // it is not stated here. What is missing is the forward, not a tensor.
-    {"dspark", ArchShape::Dense, ArchSupport::No, ArchRole::Draft, "qwen35",
-     "a dspark draft-block head set: fc over the target-layer stack, a blk.N "
-     "stack with non-causal attention over a block of draft rows, a markov "
-     "bigram head and a confidence head -- a parallel block drafter, which this "
-     "engine does not implement (dflash, its one-block cousin, is served)",
+    // `dspark.block_size` rows, `markov.w1/w2` (the rank-256 bigram head) and
+    // `confidence.proj`.
+    //
+    // Partial, and the gap is stated rather than papered over: no public GGUF
+    // for this family has been validated here, so the tensor-name spelling is
+    // the `blk.N.*` convention the block loaders already use and both spellings
+    // of each name are tried. A file that carries tensors this loader does not
+    // know is refused by tensor name (see the refused-tensor table), which is
+    // the same gate every other partial architecture passes through. The two
+    // side heads are optional and announce themselves in the load report, so a
+    // file without them still drafts, just without the Markov chain.
+    {"dspark", ArchShape::Dense, ArchSupport::Partial, ArchRole::Draft, "qwen35",
+     "a dspark draft-block head set is served (block decode, Markov bigram head "
+     "and confidence head), but no public checkpoint of this family has been "
+     "validated against this loader, so a file carrying tensors outside the "
+     "blk.N/fc/markov/confidence schema is refused by name",
      false, false, false, false},
     // Laguna (poolside): MoE with a sigmoid router, a per-expert selection
     // bias added to the probabilities before the top-k, a per-head softplus
@@ -1186,11 +1194,24 @@ constexpr ArchSpec kTable[] = {
     // full-attention layers, so there is no dense prefix to fall back on and
     // the attention op's causal/window masks cannot express it. The model is
     // natively multimodal, so a vision/video tower feeds the token stream. And
-    // it ships a DSpark draft head, which this engine can load as a draft file
-    // against a matching target but which has nothing to attach to here.
+    // it ships a DSpark draft head, which this engine now loads (src/dspark.cpp)
+    // but which has nothing to attach to here.
+    //
+    // Updated after the MSA work: the ATTENTION half of the first gap is
+    // implemented. `AttnDesc::key_runs` is a sparse visible-key run list, the
+    // CPU backend has a kernel for it, and src/msa.cpp does the block selection
+    // (pool, score, top-budget, local block always kept, NO dense prefix). What
+    // is still missing is not a kernel: no GGUF schema for this family has been
+    // validated, so the loader cannot say what tensors to read, and the vision
+    // tower has no forward at all. Still No -- but the reason now names only
+    // what is actually absent, instead of three things of which one is done.
     {"minimax-m3", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "minimax-m3",
-     "MiniMax Sparse Attention (block-sparse, no dense prefix), a native "
-     "vision/video tower and a DSpark draft head are not implemented",
+     "no validated GGUF schema for this family, so the loader has nothing to "
+     "check a file against, and the native vision/video tower has no forward. "
+     "MiniMax Sparse Attention is itself implemented (AttnDesc::key_runs plus "
+     "the block selection in src/msa.cpp: block-sparse with no dense prefix, "
+     "verified against dense attention when the budget selects every block), "
+     "and the DSpark draft head it ships now loads as a drafter",
      false, false, false, false},
     // muse-glimmer (dense): four pieces of its own around llama's block, read
     // off llama.cpp's src/models/muse-glimmer.cpp.

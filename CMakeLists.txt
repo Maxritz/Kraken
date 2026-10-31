@@ -120,6 +120,8 @@ set(KRK_CORE_SOURCES
     src/qsa.cpp
     src/model.cpp
     src/dflash.cpp
+    src/dspark.cpp
+    src/msa.cpp
     src/draft_head.cpp
     src/expert_cache.cpp
     src/expert_cpu.cpp

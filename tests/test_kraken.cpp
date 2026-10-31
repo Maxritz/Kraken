@@ -68,6 +68,7 @@
 #include "krk/mla_shared.hpp"
 #include "krk/dsv4_route.hpp"
 #include "krk/ple.hpp"
+#include "krk/msa.hpp"
 #include "krk/qsa.hpp"
 #include "krk/http.hpp"
 #include "krk/json.hpp"
@@ -12973,6 +12974,449 @@ static void test_speculative_decoding() {
     }
 
     // (cleanup disabled for debugging)
+}
+
+
+
+// ---------------------------------------------------------------------------
+// MSA (MiniMax Sparse Attention): block selection, and the dense equivalence
+// that makes the sparse path trustworthy
+// ---------------------------------------------------------------------------
+// The claim this test has to make good on is narrow and load-bearing: when the
+// block budget is large enough to select everything, the sparse path must
+// produce the dense answer BIT FOR BIT. Without that, "sparse attention" is a
+// different model with a plausible-looking kernel, and every number measured
+// through it is about some other network.
+//
+// It also pins the two properties that distinguish MSA from an indexer with a
+// dense prefix: an unselected block at the START of the context is not read,
+// and the local block is always selected.
+static void msa_reference_dense(f32 *out, const f32 *q, const f32 *k, const f32 *v,
+                                int n_tok, int n_head, int hd, int n_kv,
+                                float scale, const std::vector<std::pair<i64, i64>> &runs) {
+    std::vector<f32> sc;
+    for (int t = 0; t < n_tok; t++) {
+        for (int h = 0; h < n_head; h++) {
+            const f32 *qh = q + (static_cast<size_t>(t) * n_head + h) * hd;
+            f32 *oh = out + (static_cast<size_t>(t) * n_head + h) * hd;
+            sc.clear();
+            for (const auto &r : runs)
+                for (i64 j = r.first; j < r.second; j++) {
+                    const f32 *kv = k + (static_cast<i64>(j) * n_head + h) * hd;
+                    f32 acc = 0.0f;
+                    for (int i = 0; i < hd; i++) acc += qh[i] * kv[i];
+                    sc.push_back(acc * scale);
+                }
+            if (sc.empty()) {
+                for (int i = 0; i < hd; i++) oh[i] = 0.0f;
+                continue;
+            }
+            f32 mx = *std::max_element(sc.begin(), sc.end());
+            f32 l = 0.0f;
+            for (f32 &x : sc) {
+                x = std::exp(x - mx);
+                l += x;
+            }
+            for (int i = 0; i < hd; i++) oh[i] = 0.0f;
+            size_t kk = 0;
+            for (const auto &r : runs)
+                for (i64 j = r.first; j < r.second; j++, kk++) {
+                    const f32 p = sc[kk] / l;
+                    const f32 *vv = v + (static_cast<i64>(j) * n_head + h) * hd;
+                    for (int i = 0; i < hd; i++) oh[i] += p * vv[i];
+                }
+        }
+    }
+}
+
+static void test_msa_block_sparse() {
+    Backend *cpu = make_cpu_backend();
+    const int hd = 8, n_head = 2, n_kv = 24, block = 4, n_blocks = n_kv / block;
+    const f32 scale = 1.0f / std::sqrt(static_cast<f32>(hd));
+
+    // One layer, one sequence, cache row = n_head * hd.
+    std::vector<f32> keys(static_cast<size_t>(n_kv) * n_head * hd);
+    std::vector<f32> vals(keys.size());
+    for (size_t i = 0; i < keys.size(); i++) {
+        keys[i] = 0.11f * static_cast<f32>(static_cast<int>(i * 37 % 23) - 11);
+        vals[i] = 0.07f * static_cast<f32>(static_cast<int>(i * 53 % 19) - 9);
+    }
+    std::vector<f32> q(static_cast<size_t>(n_head) * hd);
+    for (size_t i = 0; i < q.size(); i++)
+        q[i] = 0.05f * static_cast<f32>(static_cast<int>(i * 29 % 17) - 8);
+
+    void *kc = cpu->alloc(keys.size() * 4);
+    void *vc = cpu->alloc(vals.size() * 4);
+    cpu->upload(kc, keys.data(), keys.size() * 4);
+    cpu->upload(vc, vals.data(), vals.size() * 4);
+    void *qc = cpu->alloc(q.size() * 4);
+    cpu->upload(qc, q.data(), q.size() * 4);
+    void *oc = cpu->alloc(static_cast<size_t>(n_head) * hd * 4);
+
+    AttnDesc d;
+    d.n_head = n_head;
+    d.n_kv = n_head;      // one KV head: every query head reads the same rows
+    d.hd = hd;
+    d.n_tok = 1;
+    d.pos0 = n_kv - 1;    // the query sits at the last position
+    d.layer_stride = static_cast<i64>(keys.size());
+    d.pos_stride = n_head * hd;
+    d.scale = scale;
+    d.causal = true;
+
+    // ---- 1. the pool and the run builder -------------------------------
+    std::vector<f32> pooled(static_cast<size_t>(n_blocks) * hd);
+    CHECK(msa_pool(pooled.data(), keys.data(), hd, n_kv, block) == n_blocks,
+          "the pool covers every block of the cache");
+    {
+        // The last block of a non-multiple cache is pooled over what it HAS:
+        // a padded mean would make the newest keys look weak and the budget
+        // would preferentially drop them.
+        std::vector<f32> k2(static_cast<size_t>(10) * hd, 1.0f);
+        std::vector<f32> p2(3 * hd, 0.0f);
+        CHECK(msa_pool(p2.data(), k2.data(), hd, 10, 4) == 3,
+              "a 10-key cache is three blocks of four");
+        CHECK_NEAR(p2[2 * hd], 1.0f, 1e-6f,
+                   "the trailing partial block is a mean over its own two keys");
+    }
+    {
+        const i64 blocks[] = {0, 1, 2, 5};
+        i64 runs[16];
+        const i32 n = msa_runs(runs, blocks, 4, block, n_kv);
+        CHECK(n == 2, "adjacent selected blocks merge into one run");
+        CHECK(runs[0] == 0 && runs[1] == 12, "... the first run covers blocks 0-2");
+        CHECK(runs[2] == 20 && runs[3] == 24, "... and the second the last block");
+    }
+
+    // ---- 2. budget >= n_blocks is EXACTLY dense ------------------------
+    {
+        std::vector<i64> ids(static_cast<size_t>(n_blocks) + 1);
+        const i32 nsel = msa_select(ids.data(), pooled.data(), q.data(), hd, n_kv,
+                                    d.pos0, block, 0);
+        CHECK(nsel == n_blocks, "an unlimited budget selects every visible block");
+        std::vector<i64> runs(static_cast<size_t>(nsel) * 2);
+        const i32 nr = msa_runs(runs.data(), ids.data(), nsel, block, n_kv);
+        AttnDesc dd = d;
+        dd.n_key_runs = nr;
+        dd.key_runs = runs.data();
+        cpu->attention(oc, qc, kc, vc, dd);
+        std::vector<f32> got(static_cast<size_t>(n_head) * hd);
+        cpu->download_f32(got.data(), oc, n_head * hd);
+
+        std::vector<std::pair<i64, i64>> all_runs;
+        const i64 rn[2] = {0, n_kv};
+        all_runs.emplace_back(rn[0], rn[1]);
+        std::vector<f32> want(static_cast<size_t>(n_head) * hd);
+        msa_reference_dense(want.data(), q.data(), keys.data(), vals.data(), 1,
+                            n_head, hd, n_kv, scale, all_runs);
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < got.size(); i++)
+            worst = std::max(worst, std::fabs(got[i] - want[i]));
+        // Tolerance is eps, not "close": a whole-budget selection has to BE the
+        // dense answer, and the only difference permitted is the one between
+        // two orders of the same f32 sums.
+        CHECK(worst < 1e-5f,
+              "a budget that selects every block reproduces dense attention");
+    }
+
+    // ---- 3. a smaller budget really is sparse, and keeps the local block --
+    {
+        std::vector<i64> ids(static_cast<size_t>(n_blocks) + 1);
+        const i32 nsel = msa_select(ids.data(), pooled.data(), q.data(), hd, n_kv,
+                                    d.pos0, block, 3);
+        CHECK(nsel == 3, "a budget of three selects three blocks");
+        bool has_local = false;
+        i64 visible_keys = 0;
+        for (i32 i = 0; i < nsel; i++) {
+            if (ids[static_cast<size_t>(i)] == (n_kv - 1) / block) has_local = true;
+            visible_keys += block;
+        }
+        CHECK(has_local, "the local block is always selected, whatever the scores say");
+        CHECK(visible_keys < n_kv,
+              "a budget below the block count attends to fewer keys than dense -- "
+              "that is the whole point, and a selector that quietly kept "
+              "everything would pass every other check here");
+
+        // Ascending order is part of the contract: two equal selections must
+        // produce the same run list, or the same model computes two answers.
+        bool asc = true;
+        for (i32 i = 1; i < nsel; i++)
+            if (ids[static_cast<size_t>(i)] <= ids[static_cast<size_t>(i - 1)]) asc = false;
+        CHECK(asc, "the selected blocks come back in ascending order");
+
+        // ... and the sparse result is exactly the dense answer over the same
+        // key set, which is the only thing that makes it comparable.
+        std::vector<i64> runs(static_cast<size_t>(nsel) * 2);
+        const i32 nr = msa_runs(runs.data(), ids.data(), nsel, block, n_kv);
+        AttnDesc dd = d;
+        dd.n_key_runs = nr;
+        dd.key_runs = runs.data();
+        cpu->attention(oc, qc, kc, vc, dd);
+        std::vector<f32> got(static_cast<size_t>(n_head) * hd);
+        cpu->download_f32(got.data(), oc, n_head * hd);
+        std::vector<std::pair<i64, i64>> use;
+        for (i32 r = 0; r < nr; r++) use.emplace_back(runs[2 * r], runs[2 * r + 1]);
+        std::vector<f32> want(static_cast<size_t>(n_head) * hd);
+        msa_reference_dense(want.data(), q.data(), keys.data(), vals.data(), 1,
+                            n_head, hd, n_kv, scale, use);
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < got.size(); i++)
+            worst = std::max(worst, std::fabs(got[i] - want[i]));
+        CHECK(worst < 1e-5f,
+              "the sparse kernel equals dense attention restricted to the same runs");
+
+        // Negative control: the sparse answer has to DIFFER from the dense one.
+        // Every other check here would pass a kernel that quietly ignored
+        // `key_runs` and attended densely, because a dense kernel is trivially
+        // "dense attention restricted to the same runs" -- restricted to all of
+        // them. Without this arm the group cannot tell a working sparse path
+        // from a disabled one.
+        {
+            AttnDesc dense = d;
+            cpu->attention(oc, qc, kc, vc, dense);
+            std::vector<f32> dgot(static_cast<size_t>(n_head) * hd);
+            cpu->download_f32(dgot.data(), oc, n_head * hd);
+            f32 dev = 0.0f;
+            for (size_t i = 0; i < dgot.size(); i++)
+                dev = std::max(dev, std::fabs(dgot[i] - got[i]));
+            CHECK(dev > 1e-3f,
+                  "a budget below the block count produces a DIFFERENT answer "
+                  "from dense -- so the run list is honoured, not ignored");
+        }
+
+        // And the no-dense-prefix property, stated as an observation rather
+        // than a hope: with a budget this small, block 0 is not in the set, so
+        // the first keys of the context are not read at all.
+        bool reads_start = false;
+        for (i32 i = 0; i < nsel; i++)
+            if (ids[static_cast<size_t>(i)] == 0) reads_start = true;
+        CHECK(!reads_start,
+              "MSA has no dense prefix: at this budget the opening block is not "
+              "selected and is not read");
+    }
+
+    cpu->release(kc);
+    cpu->release(vc);
+    cpu->release(qc);
+    cpu->release(oc);
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
+// DSpark head set: loads, refuses a mismatched target, and its Markov chain is
+// real
+// ---------------------------------------------------------------------------
+// DSpark is a parallel block drafter served by src/dspark.cpp. Its weights are
+// borrowed at run time (the target's embedding and head), so the three things a
+// fixture can prove are the three things the loader decides:
+//
+//   1. a head set whose fusion width matches the target loads;
+//   2. the same file against a target of a DIFFERENT width is refused, naming
+//      both widths -- not resized, and not loaded to draft against noise;
+//   3. the Markov head actually conditions row k on the token chosen at row k-1,
+//      which is the one claim that separates a block drafter from a bag of
+//      independent rows.
+//
+// (3) is checked as an invariant the kernel cannot satisfy by accident:
+// markov_prev()[k] is the token the recurrence walked at row k, and it must be
+// the argmax of the row the block emitted for k-1. Turning the head off must
+// change at least one proposed row, or the head is not being applied at all.
+static f32 ds_w(int i) { return 0.15f * static_cast<f32>((i * 29) % 13 - 6); }
+
+static bool build_dspark_head_set(const std::string &path, int n_embd,
+                                  int n_target_layers, bool with_markov,
+                                  bool with_conf, int *n_embd_enc_out) {
+    const int n_layer = 1, n_head = 4, n_kv = 2, hd = 8, n_ff = 32;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, block_size = 4, rank = 8;
+    const int n_embd_enc = n_target_layers * n_embd;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", "dspark");
+    b.meta_str("general.name", "kraken-dspark-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("dspark.block_count", n_layer);
+    b.meta_u32("dspark.context_length", 64);
+    b.meta_u32("dspark.embedding_length", n_embd);
+    b.meta_u32("dspark.feed_forward_length", n_ff);
+    b.meta_u32("dspark.attention.head_count", n_head);
+    b.meta_u32("dspark.attention.head_count_kv", n_kv);
+    b.meta_u32("dspark.attention.key_length", hd);
+    b.meta_f32("dspark.attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_u32("dspark.vocab_size", vocab);
+    b.meta_f32("dspark.rope.freq_base", 10000.0f);
+    b.meta_u32("dspark.rope.dimension_count", hd);
+    b.meta_u32("dspark.block_size", block_size);
+    b.meta_u32("dspark.mask_token_id", 12);
+    b.meta_bool("dspark.attention.causal", false);
+    b.meta_u32("dspark.encoder.embd", n_embd_enc);
+    b.meta_bool("dspark.markov.enabled", true);
+    b.meta_u32("dspark.markov.rank", rank);
+    // Capture ids are the target's own layer numbering for `build_sized_model`:
+    // a one-layer target can supply id 0 (the input of layer 0) and id 1 (the
+    // pre-final-norm state, equal to its layer count).
+    std::vector<i32> tl;
+    for (int i = 0; i < n_target_layers; i++) tl.push_back(i == 0 ? 0 : 1);
+    b.meta_i32_array("dspark.target_layers", tl);
+
+    auto mat = [&](const std::string &nm, int rows, int cols, int seed) {
+        std::vector<f32> v(static_cast<size_t>(rows) * cols);
+        for (size_t i = 0; i < v.size(); i++)
+            v[i] = ds_w(static_cast<int>(i) + seed * 977);
+        // ne = [cols, rows]: the contraction is over the inner (column) axis.
+        b.tensor_f16(nm, {static_cast<u64>(cols), static_cast<u64>(rows)}, v);
+    };
+    mat("fc", n_embd, n_embd_enc, 1);
+    mat("output_norm", 1, n_embd, 2);
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        mat(p + "attn_norm", 1, n_embd, 3 + l);
+        mat(p + "ffn_norm", 1, n_embd, 4 + l);
+        mat(p + "attn_q", q_dim, n_embd, 5 + l);
+        mat(p + "attn_k", kv_dim, n_embd, 6 + l);
+        mat(p + "attn_v", kv_dim, n_embd, 7 + l);
+        mat(p + "attn_output", n_embd, q_dim, 8 + l);
+        mat(p + "attn_q_norm", 1, hd, 9 + l);
+        mat(p + "attn_k_norm", 1, hd, 10 + l);
+        mat(p + "ffn_gate", n_ff, n_embd, 11 + l);
+        mat(p + "ffn_up", n_ff, n_embd, 12 + l);
+        mat(p + "ffn_down", n_embd, n_ff, 13 + l);
+    }
+    if (with_markov) {
+        mat("markov.w1", rank, n_embd, 20);
+        mat("markov.w2", vocab, rank, 21);
+    }
+    if (with_conf) mat("confidence.proj", 1, n_embd, 22);
+    if (n_embd_enc_out) *n_embd_enc_out = n_embd_enc;
+    return b.write(path);
+}
+
+static void test_dspark_head_set() {
+    const std::string target = std::string("kraken-dspark-target.gguf");
+    const std::string head = std::string("kraken-dspark.gguf");
+    if (!build_sized_model(target, 32, 64, 12) ||
+        !build_dspark_head_set(head, 32, 2, true, true, nullptr)) {
+        CHECK(false, "wrote the dspark head set and its target");
+        return;
+    }
+    auto *cpu = make_cpu_backend();
+    {
+        Model tm;
+        std::string err;
+        if (!tm.load(*cpu, target, &err)) {
+            CHECK(false, "loaded the dspark target fixture");
+            delete cpu;
+            return;
+        }
+        const ModelConfig &tc = tm.cfg();
+
+        // ---- 1. the matching pair loads --------------------------------
+        {
+            DsparkDraft d;
+            const bool ok = d.load(*cpu, head, 8, 64, tc.n_embd, tc.n_layer,
+                                   tc.n_vocab, &err);
+            CHECK(ok, "a dspark head set whose fusion width matches the target "
+                      "loads");
+            if (ok) {
+                CHECK(d.block_size() == 4, "block size is read from the file");
+                CHECK(!d.causal(), "the block is non-causal, as the schema says");
+                CHECK(d.target_layers().size() == 2,
+                      "two capture slots, in the order the file lists them");
+                CHECK(d.has_markov() && d.markov_rank() == 8,
+                      "the Markov head is loaded at the rank the file declares");
+                CHECK(d.has_confidence(), "the confidence head is loaded");
+                CHECK(d.describe().find("none") == std::string::npos,
+                      "the run report names the heads rather than saying nothing");
+                d.unload();
+            }
+        }
+
+        // ---- 2. a target of the wrong width is refused, not resized ----
+        {
+            DsparkDraft d;
+            // 40-wide features against a 32-wide target: the only value fc can
+            // have that this target can feed is n_aux * 32.
+            const std::string bad = std::string("kraken-dspark-wide.gguf");
+            if (!build_dspark_head_set(bad, 40, 2, true, true, nullptr)) {
+                CHECK(false, "wrote the mismatched dspark head set");
+            } else {
+                err.clear();
+                const bool ok = d.load(*cpu, bad, 8, 64, tc.n_embd, tc.n_layer,
+                                       tc.n_vocab, &err);
+                CHECK(!ok, "a dspark head set built for a wider target is a "
+                           "refusal, not a resize");
+                CHECK(err.find("80") != std::string::npos &&
+                          err.find("32") != std::string::npos,
+                      "the refusal names both widths, so the pair can be fixed "
+                      "without guessing");
+                d.unload();
+                std::remove(bad.c_str());
+            }
+        }
+
+        // ---- 3. the Markov chain is real -------------------------------
+        {
+            DsparkDraft d;
+            if (!d.load(*cpu, head, 8, 64, tc.n_embd, tc.n_layer, tc.n_vocab,
+                        &err)) {
+                CHECK(false, "reloaded the dspark head set for the chain test");
+            } else {
+                const QuantTensor &embd = tm.tok_embd();
+                const QuantTensor &outhead = tm.out_head();
+                const i32 vocab = tc.n_vocab;
+                std::vector<f32> rows_on(static_cast<size_t>(8) * vocab, 0.0f);
+                CHECK(d.capture_slot(0) != nullptr && d.capture_slot(1) != nullptr,
+                      "both capture slots exist, one per declared target layer");
+                const i32 n_on = d.draft_block(embd, outhead, vocab, 7, 3, 4,
+                                               rows_on.data());
+                CHECK(n_on == 3, "a block of 4 rows proposes block_size-1 = 3 "
+                                 "candidates");
+                if (n_on >= 2) {
+                    // markov_prev()[k] is the token the recurrence walked at row
+                    // k, and row k's predecessor is the argmax of row k-1.
+                    const std::vector<i32> &prev = d.markov_prev();
+                    CHECK(prev.size() >= 3, "the Markov walk recorded one entry "
+                                            "per candidate row");
+                    CHECK(prev[1] == 7, "row 1's partner is the last committed "
+                                        "token the block was opened with");
+                    i32 am = 0;
+                    for (i32 v = 1; v < vocab; v++)
+                        if (rows_on[static_cast<size_t>(v)] >
+                            rows_on[static_cast<size_t>(am)])
+                            am = v;
+                    CHECK(prev[2] == am,
+                          "row 2's partner is the token chosen at row 1 -- the "
+                          "chain is walked, not assumed");
+                }
+                std::vector<f32> rows_off(static_cast<size_t>(8) * vocab, 0.0f);
+                setenv("KRK_DSPARK_MARKOV", "0", 1);
+                DsparkDraft d2;
+                const bool ok2 = d2.load(*cpu, head, 8, 64, tc.n_embd, tc.n_layer,
+                                         tc.n_vocab, &err);
+                unsetenv("KRK_DSPARK_MARKOV");
+                if (ok2) {
+                    const i32 n_off = d2.draft_block(embd, outhead, vocab, 7, 3,
+                                                     4, rows_off.data());
+                    bool differs = false;
+                    if (n_off == n_on)
+                        for (size_t i = 0; i < rows_off.size(); i++)
+                            if (rows_off[i] != rows_on[i] &&
+                                std::fabs(rows_off[i] - rows_on[i]) > 1e-6f) {
+                                differs = true;
+                                break;
+                            }
+                    CHECK(differs, "turning the Markov head off changes the "
+                                   "block -- the head is applied, not loaded and "
+                                   "ignored");
+                    d2.unload();
+                }
+                d.unload();
+            }
+        }
+    }
+    delete cpu;
+    std::remove(head.c_str());
+    std::remove(target.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -28460,6 +28904,8 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_q4_0_layout)
     TEST_GROUP(test_q8_0_layout)
     TEST_GROUP(test_q8_0_scale_array_row_keyed)
+    TEST_GROUP(test_dspark_head_set)
+    TEST_GROUP(test_msa_block_sparse)
     TEST_GROUP(test_vec_dot_fast_opt_in)
     TEST_GROUP(test_gemm_batched_bit_identical)
     TEST_GROUP(test_vec_dot_avx2_matches_fast)

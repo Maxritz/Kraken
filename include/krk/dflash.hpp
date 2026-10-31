@@ -53,6 +53,7 @@
 #include <vector>
 
 #include "krk/backend.hpp"
+#include "krk/draft_block.hpp"
 #include "krk/expert_cache.hpp"
 #include "krk/gguf.hpp"
 #include "krk/model.hpp"
@@ -65,10 +66,10 @@ namespace krk {
 // does not have to re-derive the list.
 bool dflash_arch(std::string_view arch);
 
-class DflashDraft {
+class DflashDraft : public DraftBlock {
 public:
     DflashDraft() = default;
-    ~DflashDraft();
+    ~DflashDraft() override;
     DflashDraft(const DflashDraft &) = delete;
     DflashDraft &operator=(const DflashDraft &) = delete;
 
@@ -84,16 +85,14 @@ public:
     bool load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
               i32 target_embd, i32 target_layer_count, i32 target_vocab,
               std::string *err);
-    void unload();
-
     // ---- what the target side needs to drive this -------------------------
     // Capture ids, in the target's own layer numbering: id l means "the
     // residual stream entering block l", and an id equal to the target's layer
     // count means the pre-final-norm state. Both are what `forward_core` has in
     // ws_x_ at those two moments.
-    const std::vector<i32> &target_layers() const { return target_layers_; }
+    const std::vector<i32> &target_layers() const override { return target_layers_; }
     i32 n_aux() const { return static_cast<i32>(target_layers_.size()); }
-    i32 block_size() const { return block_size_; }
+    i32 block_size() const override { return block_size_; }
     i32 mask_id() const { return mask_id_; }
     // Where block row 0 sits relative to the next free position: the knob a
     // run has to report, because it decides which position each draft row is
@@ -103,7 +102,7 @@ public:
     i32 n_embd_enc() const { return n_embd_enc_; }
     i32 n_layer() const { return cfg_.n_layer; }
     i64 chunk() const { return chunk_; }
-    i64 kv_capacity() const { return kv_cap_; }
+    i64 kv_capacity() const override { return kv_cap_; }
     bool causal() const { return causal_; }
     const std::string &name() const { return cfg_.name; }
     const std::string &arch() const { return cfg_.arch; }
@@ -118,14 +117,14 @@ public:
     // ---- the capture buffer ----------------------------------------------
     // [n_aux][chunk][n_embd], layer-major, so the target fills one aux slot with
     // a single contiguous copy and the assembly below reads it back the same way.
-    void *capture_slot(i32 aux) const;
+    void *capture_slot(i32 aux) const override;
     i64 capture_stride() const { return chunk_ * cfg_.n_embd; }
 
     // ---- step 1 + 2: fuse the captured features and inject their K/V ------
     // `n` tokens at positions pos0..pos0+n-1, which is the shape of one target
     // forward call: a prefill chunk, a speculative verification block, or a
     // single decode row.
-    bool commit(i32 pos0, i32 n);
+    bool commit(i32 pos0, i32 n) override;
 
     // dst = x * W^T with the weight's NVFP4 global scale (QuantTensor::gs).
     //
@@ -150,7 +149,12 @@ public:
     // greedy speculation window expects. Returns the number of rows written.
     i32 draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_head,
                     i32 n_vocab, i32 id_last, i32 n_draft, i32 pos,
-                    f32 *rows_out);
+                    f32 *rows_out) override;
+
+    // ---- DraftBlock ------------------------------------------------------
+    void unload() override;
+    std::string describe() const override;
+    const char *kind() const override { return "dflash"; }
 
 private:
     bool load_weights(std::string *err);

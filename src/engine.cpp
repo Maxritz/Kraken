@@ -6731,6 +6731,45 @@ bool Engine::load_dflash(const std::string &path, std::string *err) {
     }
     if (dflash_) return true;
     const ModelConfig &tc = model_.cfg();
+    // Two head-set schemas answer the same six questions, so the caller does
+    // not branch on which one a path names -- the FILE says, and this reads it.
+    // DSpark's block is decoded differently (non-causal, plus the Markov and
+    // confidence heads) but the loop above only ever sees DraftBlock.
+    std::string darch;
+    {
+        Gguf probe;
+        std::string perr;
+        if (probe.load(path, &perr))
+            darch = probe.get_str("general.architecture", "");
+    }
+    if (dspark_arch(darch)) {
+        DsparkDraft *sp = new DsparkDraft();
+        if (!sp->load(*be_, path, chunk_, kv_cap_, tc.n_embd, tc.n_layer,
+                      n_vocab_, err)) {
+            delete sp;
+            return false;
+        }
+        if (sp->mask_id() < 0 || sp->mask_id() >= n_vocab_) {
+            if (err)
+                *err = format("DSpark mask token %d is outside the target's "
+                              "vocabulary (%d) -- this head set is for a "
+                              "different target",
+                              sp->mask_id(), n_vocab_);
+            delete sp;
+            return false;
+        }
+        dflash_ = sp;
+        if (draft_tokens_ <= 0) draft_tokens_ = 4;
+        KRK_INFO("dspark drafter loaded: %s -- %d captured layers, block size %d, "
+                 "speculative window %d",
+                 sp->describe().c_str(), static_cast<i32>(sp->target_layers().size()),
+                 sp->block_size(),
+                 std::min<i32>(draft_tokens_, sp->block_size() - 1));
+        if (!sp->has_markov())
+            KRK_INFO("dspark: no Markov head in this file, so the block's rows "
+                     "are independent after the transformer pass");
+        return true;
+    }
     DflashDraft *d = new DflashDraft();
     if (!d->load(*be_, path, chunk_, kv_cap_, tc.n_embd, tc.n_layer, n_vocab_,
                  err)) {
@@ -7420,9 +7459,10 @@ bool Engine::load_draft(const std::string &path, std::string *err) {
     {
         Gguf probe;
         std::string perr;
-        if (probe.load(path, &perr) &&
-            dflash_arch(probe.get_str("general.architecture", "")))
-            return load_dflash(path, err);
+        if (probe.load(path, &perr)) {
+            const std::string a = probe.get_str("general.architecture", "");
+            if (dflash_arch(a) || dspark_arch(a)) return load_dflash(path, err);
+        }
     }
 
     // The draft shares this engine's backend: one device, interleaved kernels,
