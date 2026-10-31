@@ -1057,6 +1057,28 @@ struct MtpBlock {
     // then point at the two plane views of it (see Gguf::add_expert_plane_slice)
     // and this is the underlying tensor.
     const GgufTensor *exps_gate_up = nullptr;
+
+    // ---- the deepseek4 ISA form: the nextn block is a TRUNK LAYER ----------
+    // `deepseek4.cpp`'s graph_mtp is not a llama-style block with a latent
+    // attention bolted beside it. It is one more layer of the same stack: the
+    // merged row (eh_proj of [embedding | hidden], per lane) runs the block's
+    // OWN shared-latent attention between the stack's two sinkhorn
+    // hyper-connection mixers, then its own MoE between the next pair, and only
+    // then the head mixer. Its tensor set is a trunk layer's plus the
+    // `nextn.*` adapters, which is why the weights are loaded into a
+    // LayerWeights: the engine then runs the trunk's own
+    // `mla_shared_forward`/`moe_ffn`/`hc_begin` over them instead of a second
+    // copy of that arithmetic that can drift from the first.
+    bool dspark = false;
+    LayerWeights dspark_layer;
+    // The index the block RUNS under: the trunk's layer count, which is the KV
+    // slot its latent rows are written to and the layer `n_head_at` and the
+    // rotary table fall back from. `layer` above is the file's block index,
+    // which a sidecar may number differently.
+    i32 run_layer = -1;
+    // `nextn.shared_head_head` when the block has a head of its own. Absent
+    // (the usual case) means the trunk's `output.weight` is the head.
+    QuantTensor shared_head_head;
 };
 
 // One dense tensor that is NOT resident: its source in the GGUF mapping and
@@ -1696,6 +1718,13 @@ private:
     // trunk being broken.
     bool load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
                              std::string *err);
+    // The `deepseek4-dspark` body: a nextn block whose attention is the
+    // trunk's latent one. Split from load_mtp_block_from because it shares
+    // nothing with the llama-style block except the `blk.<n>.` prefix -- a
+    // different attention, a different FFN and a hyper-connection pair instead
+    // of a residual row.
+    bool load_dspark_mtp_from(const Gguf &g, i32 l, const std::string &origin,
+                              std::string *err);
     // The HF `mtp.*` form (qwen4exp/qwen4-mtp). Takes a mutable Gguf because
     // the fused `gate_up_proj` is split into its two plane views by appending
     // directory entries -- offset arithmetic, no copy. Returns false with the

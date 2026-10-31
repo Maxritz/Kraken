@@ -4202,17 +4202,36 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   a family-only rule would accept a whole model as a drafter, and the existing
   `test_mtp_sidecar` arm caught exactly that (it went red the moment the rule
   was widened to family alone). Two arms pin it now: `test_mtp_sidecar` (17/17,
-  qwen2 still refused by name) and `test_mtp_sidecar_mla` (9/9, a dspark head
-  set reaches the block loader).
-- **`deepseek4-dspark`'s block is MLA, and the loader said "no attn_q".** The
-  nextn layer in upstream `src/models/deepseek4.cpp` is built from the trunk's
-  own attention -- `attn_q_a`/`attn_q_b`, `attn_kv_a_mqa`/`attn_kv_b` for the
-  V3-class spelling, the shared latent for V4 -- plus `nextn.eh_proj`/`enorm`/
-  `hnorm`/`shared_head_norm`. It is NOT a second hyper-connection block, so
-  item 1's qwen4exp port does not apply; what it needs is the trunk's MLA
-  attention body inside `MtpBlock` (reuse, not a new family). Until then the
-  loader refuses it by naming MLA and the four tensors it found, because "no
-  readable blk.N.attn_q.weight" sends a reader hunting for a missing tensor when
-  the attention BODY is what is missing. General rule: a refusal should name the
-  thing that is absent, and when a family spells the same layer differently, the
-  spelling is the finding.
+  qwen2 still refused by name) and `test_mtp_sidecar_mla` (19/19, a dspark head
+  set loads, drafts and emits the plain greedy text).
+- **`deepseek4-dspark`'s block is a whole STACK LAYER, and it had no attention
+  the loader could name.** The nextn layer in upstream
+  `src/models/deepseek4.cpp` (`graph_mtp`) runs the trunk's own shared-latent
+  attention between `hc_pre`/`hc_post`, then its MoE between the next pair, then
+  `hc_head` -- i.e. a deepseek4 layer at `il = n_layer`, with `nextn.eh_proj`/
+  `enorm`/`hnorm`/`shared_head_norm` on the front. An earlier note here said it
+  was "not a second hyper-connection block"; that was wrong in the direction
+  that looks cheap and is not: it *is* one, because it is a stack block.
+  `MtpBlock` carries the weights as a `LayerWeights` (`dspark_layer`) and the
+  engine runs `mla_forward` + `moe_ffn` between `hc_begin`/`hc_end` over them,
+  so there is exactly one implementation of that arithmetic in the tree. Two
+  things the wiring needs that are easy to miss: the block writes its OWN latent
+  rows and so needs a KV slot PAST the stack (`Engine::init` charges index
+  `n_layer`; sharing a layer's plane overwrites that layer's history), and the
+  lane capture (`mtp_lanes_`) has to be allocated for this form too -- it was
+  gated on the low-rank head. A compressed (`compress_ratio != 0`) or
+  hash-routed nextn block is refused by name: this body builds neither pooled
+  keys nor a `tid2eid` route. General rule, still: a refusal should name the
+  thing that is absent -- and when a family spells the same layer differently,
+  the spelling is the finding.
+- **Five speculative loops emitted the drafter's own EOS and ran on past it.**
+  The plain decode loop tests `tok_.eos()` BEFORE `emit.accept(t)`; the
+  speculative loops each grew their own copy of that rule, and four of the five
+  copies checked the *bonus* token only -- an accepted proposal equal to EOS was
+  emitted as text and the run continued (observed: a fixture emitted token 2
+  (`</s>`) mid-stream and then three more tokens). The MTP proposer did not
+  filter it at propose time either, so it was reachable from a correct head.
+  All five loops (generic, MTP, rollback, replay, dflash) now stop before
+  emitting, and the proposers drop an EOS proposal the way the generic proposer
+  always has. General rule: a rule that lives in five copied blocks is five
+  rules -- when one is fixed, grep for its siblings in the same commit.

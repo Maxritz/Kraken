@@ -22116,106 +22116,254 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
 //
 // The relation asserted is exact arithmetic on the same f32 row, so the only
 // slack is printf's 7 significant digits (1e-6 relative).
-// ---- a deepseek4-dspark head set: MLA, and the refusal that says so ---------
+// ---- a deepseek4-dspark head set: the trunk's own layer, one block on ------
 //
-// A `deepseek4-dspark` file is deepseek4's nextn block, and a deepseek4 block
-// is MLA: `attn_q_a`/`attn_q_b` with `attn_kv_a_mqa`/`attn_kv_b` (or the shared
-// latent of V4), never `attn_q`/`attn_k`/`attn_v`. Two things stood between such
-// a file and a useful answer:
+// A dspark nextn block is not a llama-style block with a latent attention
+// bolted beside it: `deepseek4.cpp`'s graph_mtp runs it as ONE MORE LAYER of
+// the stack, so its tensor set is a trunk layer's (shared-latent MLA, the
+// Sinkhorn hyper-connection pair, the MoE beside a shared expert) plus the
+// `nextn.*` adapters. This fixture is that set, and the arms below pin the
+// three things a loader can get wrong without the run looking wrong:
 //
-//   1. The sidecar loader compared `general.architecture` with the trunk's
-//      string, so a head set -- always named for the head, not the trunk -- was
-//      refused as "another family" before anything looked at its tensors. It
-//      compares the table's FAMILY now, which is the schema the file is read
-//      against and the thing that refusal was always about.
-//   2. With the family check passed, the block loader reported "no readable
-//      blk.N.attn_q.weight", which sends a reader hunting for a missing tensor
-//      instead of a missing attention body. It names MLA now.
-//
-// The block itself still cannot run: wiring the trunk's MLA attention into
-// MtpBlock is what `deepseek4-dspark` needs, and this group pins the frontier
-// rather than claiming it.
-static std::string build_mtp_sidecar_mla(const std::string &path, int block) {
+//   1. the block LOADS, into a LayerWeights, past the stack's own layers;
+//   2. a trunk that is not the shared-latent stack is refused BY NAME -- the
+//      block's arithmetic is that stack's, so there is nothing to run it on;
+//   3. the block RUNS: the spec arm drafts from it and the text is the plain
+//      greedy text, because verification keeps correctness even when the
+//      drafter is worthless.
+static std::string build_dspark_mtp_sidecar(const std::string &path, int block,
+                                            int kv_cols, bool with_hc) {
     GgufBuilder b;
     b.meta_str("general.architecture", "deepseek4-dspark");
     b.meta_u32("general.alignment", 32);
     b.meta_u32("deepseek4-dspark.block_count", static_cast<u32>(block + 1));
-    auto w2 = [&](const std::string &name, u64 a, u64 c, int seed) {
-        std::vector<f32> v(static_cast<size_t>(a * c));
+    const int ne = kMlaEmbd, ql = kMlaQLora, d = kMlaKeyLen;
+    const int q_head = kMlaHead * kMlaKeyLen;
+    const int ng = kMlaOGroups, ol = kMlaOLora, gout = ng * ol;
+    const int hc = 2, wide = hc * ne, mix = (2 + hc) * hc;
+    // Small, signed, and different per tensor: a block whose weights are all
+    // 1.0 would run every width check and produce the same row whatever the
+    // graph order was.
+    auto f16m = [&](const std::string &name, int rows, int cols, int seed) {
+        std::vector<f32> v(static_cast<size_t>(rows) * cols);
         for (size_t i = 0; i < v.size(); i++)
-            v[i] = 0.02f * static_cast<f32>((static_cast<int>((i + seed) % 17)) - 8);
-        b.tensor_f16(name, {a, c}, v);
+            v[i] = 0.05f *
+                   (static_cast<f32>((static_cast<int>((i + seed) % 13)) - 6) / 6.0f);
+        b.tensor_f16(name, {static_cast<u64>(cols), static_cast<u64>(rows)}, v);
     };
-    auto ones = [&](const std::string &name, u64 n) {
-        b.tensor_f32(name, {n}, std::vector<f32>(static_cast<size_t>(n), 1.0f));
+    auto f16_3d = [&](const std::string &name, int d0, int d1, int d2, int seed) {
+        std::vector<f32> v(static_cast<size_t>(d0) * d1 * d2);
+        for (size_t i = 0; i < v.size(); i++)
+            v[i] = 0.05f *
+                   (static_cast<f32>((static_cast<int>((i + seed) % 11)) - 5) / 5.0f);
+        b.tensor_f16(name, {static_cast<u64>(d0), static_cast<u64>(d1),
+                            static_cast<u64>(d2)}, v);
+    };
+    auto gain = [&](const std::string &name, int n, f32 value) {
+        b.tensor_f32(name, {static_cast<u64>(n)},
+                     std::vector<f32>(static_cast<size_t>(n), value));
     };
     const std::string k = "blk." + std::to_string(block) + ".";
-    // The latent attention, exactly as a deepseek4 file spells it.
-    w2(k + "attn_q_a.weight", u64(kMlaEmbd), u64(kMlaQLora), 3);
-    ones(k + "attn_q_a_norm.weight", u64(kMlaQLora));
-    w2(k + "attn_q_b.weight", u64(kMlaQLora), u64(kMlaHead * kMlaKeyLen), 5);
-    w2(k + "attn_kv_a_mqa.weight", u64(kMlaEmbd), u64(kMlaKvLora + kMlaRope), 7);
-    ones(k + "attn_kv_a_norm.weight", u64(kMlaKvLora));
-    w2(k + "attn_kv_b.weight", u64(kMlaKvLora), u64(kMlaHead * (kMlaKeyLen + kMlaValLen)), 9);
-    w2(k + "attn_output.weight", u64(kMlaHead * kMlaValLen), u64(kMlaEmbd), 11);
-    // The nextn half, which is the part this engine already knows how to run.
-    w2(k + "nextn.eh_proj.weight", u64(2 * kMlaEmbd), u64(kMlaEmbd), 13);
-    w2(k + "ffn_gate.weight", u64(kMlaEmbd), u64(kMlaFF), 15);
-    w2(k + "ffn_up.weight", u64(kMlaEmbd), u64(kMlaFF), 17);
-    w2(k + "ffn_down.weight", u64(kMlaFF), u64(kMlaEmbd), 19);
-    ones(k + "attn_norm.weight", u64(kMlaEmbd));
-    ones(k + "post_attention_norm.weight", u64(kMlaEmbd));
-    ones(k + "nextn.enorm.weight", u64(kMlaEmbd));
-    ones(k + "nextn.hnorm.weight", u64(kMlaEmbd));
-    ones(k + "nextn.shared_head_norm.weight", u64(kMlaEmbd));
+    // ---- the trunk's own latent attention ---------------------------------
+    f16m(k + "attn_q_a.weight", ql, ne, 3);
+    gain(k + "attn_q_a_norm.weight", ql, 1.0f);
+    f16m(k + "attn_q_b.weight", q_head, ql, 5);
+    f16m(k + "attn_kv.weight", kv_cols > 0 ? kv_cols : d, ne, 7);
+    gain(k + "attn_kv_a_norm.weight", d, 1.0f);
+    f16m(k + "attn_output_a.weight", gout, q_head / ng, 9);
+    f16m(k + "attn_output_b.weight", ne, gout, 11);
+    b.tensor_f32(k + "attn_sinks.weight", {static_cast<u64>(kMlaHead)},
+                 std::vector<f32>(static_cast<size_t>(kMlaHead), 0.25f));
+    // ---- the Sinkhorn hyper-connection pair ------------------------------
+    if (with_hc) {
+        f16m(k + "hc_attn_fn.weight", mix, wide, 13);
+        gain(k + "hc_attn_base.weight", mix, 0.1f);
+        gain(k + "hc_attn_scale.weight", 3, 1.0f);
+        f16m(k + "hc_ffn_fn.weight", mix, wide, 17);
+        gain(k + "hc_ffn_base.weight", mix, 0.1f);
+        gain(k + "hc_ffn_scale.weight", 3, 1.0f);
+    }
+    // ---- the MoE, the same shape a stack layer's bank has ----------------
+    f16m(k + "ffn_gate_inp.weight", kMlaExpert, ne, 19);
+    f16_3d(k + "ffn_gate_exps.weight", ne, kMlaFFExp, kMlaExpert, 21);
+    f16_3d(k + "ffn_up_exps.weight", ne, kMlaFFExp, kMlaExpert, 23);
+    f16_3d(k + "ffn_down_exps.weight", kMlaFFExp, ne, kMlaExpert, 25);
+    // ---- the nextn adapters ---------------------------------------------
+    f16m(k + "nextn.eh_proj.weight", ne, 2 * ne, 27);
+    gain(k + "nextn.enorm.weight", ne, 1.0f);
+    gain(k + "nextn.hnorm.weight", ne, 1.0f);
+    gain(k + "nextn.shared_head_norm.weight", ne, 1.0f);
     if (!b.write(path)) return std::string();
     return path;
 }
 
 static void test_mtp_sidecar_mla() {
     Backend *cpu = make_cpu_backend();
-    const std::string trunk = "kraken-mtp-mla-trunk.gguf";
+    const std::string trunk = "kraken-dspark-mtp-trunk.gguf";
+    const std::string side = "kraken-dspark-mtp-side.gguf";
     MlaFix f;
     f.kind = MlaFixKind::Shared; // the V4 shared-latent schema, arch deepseek4
-    CHECK(build_mla_fixture(trunk, f), "wrote a deepseek4 trunk");
+    f.n_layer = 1;
+    f.v41_hc = 2;      // Sinkhorn lanes, the pair the block runs between
+    f.v41_iters = 3;
+    f.v41_head = true; // the stack's head mixer
+    CHECK(build_mla_fixture(trunk, f),
+          "wrote a shared-latent deepseek4 trunk with Sinkhorn lanes");
+    CHECK(!build_dspark_mtp_sidecar(side, 1, 0, true).empty(),
+          "wrote a deepseek4-dspark head set");
 
-    const std::string side = build_mtp_sidecar_mla("kraken-mtp-mla-side.gguf", 1);
-    CHECK(!side.empty(), "wrote a deepseek4-dspark head set");
+    // ---- 1. it loads, as a layer past the stack ---------------------------
     {
         Model m;
         std::string err;
         m.set_mtp_load(true);
         m.set_mtp_path(side);
         const bool ok = m.load(*cpu, trunk, &err);
-        std::fprintf(stderr, "  [mla  ] %s\n", err.c_str());
-        CHECK(!ok, "an MLA head set is refused, not half-loaded");
-        CHECK(err.find("MLA") != std::string::npos,
-              "the refusal names MLA as the reason");
-        CHECK(err.find("attn_q_a") != std::string::npos,
-              "... and names the tensors it found instead of q/k/v");
-        CHECK(err.find("another family") == std::string::npos,
-              "a head set whose arch names its family is NOT refused as a stranger");
-        CHECK(m.mtp().present == false, "and no half-built block is left behind");
+        std::fprintf(stderr, "  [dsp  ] %s\n",
+                     ok ? "loaded" : ("refused: " + err).c_str());
+        CHECK(ok, "a dspark head set beside its own stack loads");
+        CHECK(m.mtp().present && m.mtp().dspark,
+              "the block is the stack-layer form, not the llama-style block");
+        CHECK(m.mtp().run_layer == m.cfg().n_layer,
+              "it runs as the layer PAST the stack, which is the KV slot its "
+              "latent rows go to");
+        CHECK(m.mtp().dspark_layer.mla, "its attention is the trunk's latent one");
+        CHECK(m.mtp().dspark_layer.wq_a16.present() &&
+                  m.mtp().dspark_layer.wkv16.present() &&
+                  m.mtp().dspark_layer.wo_b16.present(),
+              "the five shared-latent tables are staged f16, as the trunk's are");
+        CHECK(m.mtp().n_expert == kMlaExpert && m.mtp().n_ff_exp == kMlaFFExp,
+              "the routed bank is the block's own, at the geometry it declares");
     }
-    // The control: the same tensors behind a trunk of ANOTHER family are still
-    // refused as a stranger, so the family comparison was widened and not
-    // removed.
+
+    // ---- 2. a trunk that is not the shared-latent stack is refused -------
     {
-        const std::string other = "kraken-mtp-mla-other.gguf";
-        if (build_sized_model(other, 32, 64, -1)) {
+        const std::string lite = "kraken-dspark-mtp-lite.gguf";
+        MlaFix g;
+        g.kind = MlaFixKind::Legacy; // V2-Lite: no grouped output, no lanes
+        g.q_lora = true;
+        // Under THIS arch name: the family check passes, so the refusal under
+        // test is the layout one. Built as `deepseek2` it is refused as a
+        // stranger first, which is a different (and also correct) refusal.
+        if (build_mla_fixture(lite, g, "deepseek4")) {
             Model m;
             std::string err;
             m.set_mtp_load(true);
             m.set_mtp_path(side);
-            CHECK(!m.load(*cpu, other, &err), "a deepseek4 head set is refused "
-                                             "beside a llama trunk");
-            CHECK(err.find("another family") != std::string::npos,
-                  "... for the family reason");
+            const bool ok = m.load(*cpu, lite, &err);
+            std::fprintf(stderr, "  [dsp2 ] %s\n", err.c_str());
+            // Two layers of one rule: a file of another FAMILY is refused as a
+            // stranger (the `deepseek2` build above), and a `deepseek4` file
+            // whose metadata does not describe the V4 stack is refused by the
+            // metadata check. A trunk that got past both IS the shared-latent
+            // stack, which is why `load_dspark_mtp_from`'s own layout test is
+            // defensive rather than the check this arm can reach.
+            CHECK(!ok, "a dspark block beside a lite-layout trunk is refused");
+            CHECK(err.find("deepseek4") != std::string::npos &&
+                      err.find("V4 metadata") != std::string::npos,
+                  "and the refusal names the trunk's own metadata, not a tensor "
+                  "of the block");
+            std::remove(lite.c_str());
         }
     }
+
+    // ---- 3. a block without its mixers is refused, by name ---------------
+    {
+        const std::string nohc = "kraken-dspark-mtp-nohc.gguf";
+        if (!build_dspark_mtp_sidecar(nohc, 1, 0, false).empty()) {
+            Model m;
+            std::string err;
+            m.set_mtp_load(true);
+            m.set_mtp_path(nohc);
+            const bool ok = m.load(*cpu, trunk, &err);
+            std::fprintf(stderr, "  [dsp3 ] %s\n", err.c_str());
+            CHECK(!ok, "a block with no hyper-connection pair is refused");
+            CHECK(err.find("hc_attn_fn") != std::string::npos,
+                  "the refusal names the missing mixer");
+            std::remove(nohc.c_str());
+        }
+    }
+
+    // ---- 4. a latent one column short is refused with both numbers -------
+    {
+        const std::string narrow = "kraken-dspark-mtp-narrow.gguf";
+        if (!build_dspark_mtp_sidecar(narrow, 1, kMlaKeyLen - 1, true).empty()) {
+            Model m;
+            std::string err;
+            m.set_mtp_load(true);
+            m.set_mtp_path(narrow);
+            const bool ok = m.load(*cpu, trunk, &err);
+            std::fprintf(stderr, "  [dsp4 ] %s\n", err.c_str());
+            CHECK(!ok, "an attn_kv of the wrong width is refused, not reshaped");
+            CHECK(err.find("attn_kv") != std::string::npos,
+                  "the refusal names the tensor");
+            CHECK(err.find(std::to_string(kMlaKeyLen - 1)) != std::string::npos &&
+                      err.find(std::to_string(kMlaKeyLen)) != std::string::npos,
+                  "... and both widths, so the file can be fixed without a guess");
+            std::remove(narrow.c_str());
+        }
+    }
+
+    // ---- 5. it RUNS: the block drafts, the text is the plain text --------
+    // A drafter is correct when the ACCEPTED tokens are the target's own. The
+    // block here is a random-weight layer, so most proposals will be rejected;
+    // what this arm proves is that the body runs end to end (proposals > 0),
+    // and that a wrong drafter costs nothing but speed (the text is equal).
+    {
+        auto run = [&](bool spec, std::vector<i32> *out, u64 *prop, u64 *acc,
+                       int *finish) {
+            Backend *be = make_cpu_backend();
+            bool ok = false;
+            {
+                Engine engine;
+                EngineConfig c;
+                c.model_path = trunk;
+                c.n_ctx = 64;
+                c.prefill_chunk = 8;
+                c.mtp_spec = spec;
+                if (spec) c.mtp_path = side;
+                std::string err;
+                if (!engine.init(be, c, &err)) {
+                    if (!err.empty()) std::fprintf(stderr, "  [dsp5 ] %s\n", err.c_str());
+                } else {
+                    GenerateParams p;
+                    p.prompt = "the";
+                    p.max_tokens = 6;
+                    p.sampler.greedy = true;
+                    GenerateResult r;
+                    ok = engine.generate(p, &r) && r.finish != FinishError;
+                    if (!ok && !r.error.empty())
+                        std::fprintf(stderr, "  [dsp5 ] %s\n", r.error.c_str());
+                    *out = r.tokens;
+                    *finish = r.finish;
+                    if (prop) *prop = engine.draft_proposed();
+                    if (acc) *acc = engine.draft_accepted();
+                }
+            }
+            delete be;
+            return ok;
+        };
+        std::vector<i32> plain, spec;
+        u64 prop = 0, acc = 0;
+        int fplain = -1, fspec = -1;
+        const bool okp = run(false, &plain, nullptr, nullptr, &fplain);
+        const bool oks = run(true, &spec, &prop, &acc, &fspec);
+        CHECK(okp, "the plain arm completes on the dspark trunk");
+        CHECK(oks, "the spec arm completes with the dspark block drafting");
+        std::fprintf(stderr,
+                     "  [dsp5 ] plain %zu token(s) finish %d | spec %zu token(s) "
+                     "finish %d, %llu proposed %llu accepted\n",
+                     plain.size(), fplain, spec.size(), fspec,
+                     static_cast<unsigned long long>(prop),
+                     static_cast<unsigned long long>(acc));
+        CHECK(prop > 0, "the block PROPOSES, which is the body running");
+        CHECK(spec == plain,
+              "and the emitted tokens are the plain greedy ones: verification "
+              "keeps a wrong drafter from costing correctness");
+    }
+
     std::remove(trunk.c_str());
     std::remove(side.c_str());
-    std::remove("kraken-mtp-mla-other.gguf");
     delete cpu;
 }
 

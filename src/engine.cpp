@@ -2091,6 +2091,20 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         const char *why = nullptr;
         if (!m.present)
             why = "the file's nextn block is not loaded";
+        else if (m.dspark) {
+            // A dspark block is one of the trunk's own layers: its geometry IS
+            // the trunk's (the loader refuses anything else), so the questions
+            // left are whether the stack builds the lane stack it runs on and
+            // whether its FFN fits the workspaces.
+            if (!hc_active_ || !mc.hc_sinkhorn)
+                why = "the head is a dspark stack layer and this trunk builds "
+                      "no Sinkhorn lane stack";
+            else if (m.n_ff_exp > ff_ws || m.n_ff_shexp > ff_ws)
+                why = "the block's FFN is wider than the FFN workspaces";
+            else if (m.n_expert > 0 && (!mc.is_moe || m.n_expert > mc.n_expert))
+                why = "the block's expert geometry does not fit the MoE "
+                      "workspaces";
+        }
         else if (m.wq.n_out != bq && m.wq.n_out != 2 * bq)
             why = "the query projection is neither q nor 2*q wide";
         else if (m.wq.n_out == 2 * bq && q_proj_ != 2 * q_dim_)
@@ -2127,11 +2141,15 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             // the mixed row is already the collapse, and the block's prefix is
             // defined on all hc lanes. Sized from the head's own lane count so
             // a head that disagrees is refused rather than over-reading.
-            if (m.hf && m.n_lane > 0) {
+            // A dspark block reads the same lane stack (it IS a stack layer),
+            // so it needs the capture as much as the low-rank head does; its
+            // lane count is the trunk's `hc_n`.
+            const i32 lane_n = m.dspark ? mc.hc_n : m.n_lane;
+            if ((m.hf && m.n_lane > 0) || (m.dspark && lane_n > 0)) {
                 mtp_lanes_ = alloc(static_cast<size_t>(kv_cap_) *
-                                   static_cast<size_t>(m.n_lane) *
+                                   static_cast<size_t>(lane_n) *
                                    static_cast<size_t>(n_embd_) * as);
-                mtp_chain_ = alloc(static_cast<size_t>(m.n_lane) *
+                mtp_chain_ = alloc(static_cast<size_t>(lane_n) *
                                    static_cast<size_t>(n_embd_) * as);
             }
             mtp_h_ = alloc(static_cast<size_t>(n_embd_) * as);
@@ -2142,7 +2160,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             mtp_rep_ = alloc(sizeof(i32));
             if (!mtp_kv_k_ || !mtp_kv_v_ || !mtp_hidden_ || !mtp_h_ || !mtp_e_ ||
                 !mtp_cat_ || !mtp_gate_ || !mtp_sgate_ || !mtp_rep_ ||
-                (m.hf && (!mtp_lanes_ || !mtp_chain_))) {
+                ((m.hf || m.dspark) && (!mtp_lanes_ || !mtp_chain_))) {
                 for (void **p : {&mtp_kv_k_, &mtp_kv_v_, &mtp_hidden_, &mtp_h_,
                                  &mtp_e_, &mtp_cat_, &mtp_gate_, &mtp_sgate_,
                                  &mtp_rep_, &mtp_lanes_, &mtp_chain_})
@@ -2386,13 +2404,28 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // 208 MiB at --ctx 4096 for the 24 MiB its KV can occupy -- 8.67x. It
         // is not only a reporting number: it is what the flat-or-tiered test in
         // KvTierCache::init compares a budget against.
-        std::vector<size_t> kv_len(static_cast<size_t>(mc.n_layer), 0);
+        // The dspark nextn block is a stack layer and writes its OWN latent row
+        // per position, so it gets a slot past the stack: that is the layer
+        // index it runs under, and sharing a trunk layer's plane would overwrite
+        // that layer's history with rows built from a different attention.
+        const i32 mtp_kv = model_.mtp().dspark ? 1 : 0;
+        std::vector<size_t> kv_len(static_cast<size_t>(mc.n_layer + mtp_kv), 0);
         size_t kv_plane = 0;
         for (i32 l = 0; l < mc.n_layer; l++) {
             if (!model_.layer_has_kv(l)) continue;
             const size_t b = static_cast<size_t>(kv_cap_) *
                              be_->kv_row_bytes(model_.kv_dim_at(l), kvq);
             kv_len[static_cast<size_t>(l)] = b;
+            kv_plane += b;
+        }
+        if (mtp_kv) {
+            // One row per position: the shared latent (rope in its tail), which
+            // is what `mla_shared_latent` writes and `mla_shared_attention`
+            // reads. `kv_dim_at` cannot answer for this index (it is not a stack
+            // layer), so the width comes from the config the same way.
+            const size_t b = static_cast<size_t>(kv_cap_) *
+                             be_->kv_row_bytes(mc.mla_kv_lora, kvq);
+            kv_len[static_cast<size_t>(mc.n_layer)] = b;
             kv_plane += b;
         }
         const size_t kv_total = kv_plane * 2u;
@@ -2461,12 +2494,12 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // The plane tag is not decoration: both caches share one cold
         // directory, so without it they spill to the same file name and a
         // restore returns the other plane's KV.
-        if (!kvt_k_.init(be_, mc.n_layer, kv_len, hot / 2u, warm / 2u,
+        if (!kvt_k_.init(be_, mc.n_layer + mtp_kv, kv_len, hot / 2u, warm / 2u,
                          cfg_.kv_cold_dir, "k", err)) {
             shutdown();
             return false;
         }
-        if (!kvt_v_.init(be_, mc.n_layer, kv_len, hot / 2u, warm / 2u,
+        if (!kvt_v_.init(be_, mc.n_layer + mtp_kv, kv_len, hot / 2u, warm / 2u,
                          cfg_.kv_cold_dir, "v", err)) {
             shutdown();
             return false;
@@ -5666,6 +5699,152 @@ bool Engine::mtp_hf_block_forward(const MtpBlock &m, i32 pos, bool want_logits,
     return true;
 }
 
+// The deepseek4 (dspark) block: one more layer of the trunk.
+//
+// `deepseek4.cpp`'s graph_mtp, in its own order:
+//
+//   x   = eh_proj(RMS([e | h_lane]))            per lane, hc lanes
+//   x   = hc_pre(attn) -> MLA attention -> hc_post
+//   x   = hc_pre(ffn)  -> MoE + shexp   -> hc_post
+//   out = head(hc_head(x))
+//
+// Every step is an op the stack already has (`mla_shared_forward`, `moe_ffn`,
+// `hc_begin`/`hc_end`, `head_compute`'s collapse), which is the whole reason
+// the block's weights are a LayerWeights: this function is wiring, not
+// arithmetic, and there is no second copy of the latent attention in it to
+// disagree with the trunk's.
+//
+// What it does NOT do, because the reference does not:
+//   * no plain pre-norm -- on a hyper-connection stack the mixer IS the
+//     block's input (the same rule the trunk's own layers follow);
+//   * no hash routing -- the reference asserts the block sits past the hash
+//     layers, so its route is the ordinary sqrt-softplus one;
+//   * no separate KV plane per proposal -- the block writes its latent rows at
+//     the same positions the trunk does, into the slot past the stack.
+bool Engine::mtp_dspark_forward(const MtpBlock &m, i32 pos, bool want_logits,
+                               bool from_chain) {
+    const ModelConfig &mc = model_.cfg();
+    const size_t as = be_->act_size();
+    const i64 ne = n_embd_;
+    const LayerWeights &L = m.dspark_layer;
+    const i32 l = m.run_layer;
+    const i64 hc = hc_.hc;
+    const i64 wide = hc * ne;
+    if (!L.mla || l < 0) {
+        forward_error_ = "the dspark block has no latent attention to run";
+        return false;
+    }
+    if (!hc_active_) {
+        forward_error_ =
+            "the head is a dspark stack layer and this trunk builds no lane "
+            "stack -- its lanes are the trunk's residual lanes, not rows this "
+            "block may invent";
+        return false;
+    }
+    if (!m.eh_proj.present() || !m.enorm || !m.hnorm) {
+        forward_error_ = "the dspark block's dense prefix is incomplete";
+        return false;
+    }
+    if (!mtp_e_ || !mtp_lanes_ || !mtp_cat_ || !ws_hc_ || !ws_x2_) {
+        forward_error_ = "the block's workspaces are not allocated";
+        return false;
+    }
+    if (static_cast<i64>(m.n_embd) != ne) {
+        forward_error_ = "the block is " + std::to_string(m.n_embd) +
+                         " wide and this trunk is " + std::to_string(ne);
+        return false;
+    }
+
+    // ---- the block's input: (embedding, hidden) per lane ------------------
+    // The lane stack is the trunk's own at this position (captured by the
+    // stack's passes) or, for the second and later proposals of one round, the
+    // stack this block produced last. `h_norm` is ONE gain over the [n_embd]
+    // row of each lane -- the reference norms the reshaped [n_embd, hc] stack
+    // with a single [n_embd] gamma -- and the concat puts the embedding FIRST,
+    // which is `concat(e_norm, h_norm, dim0)` and therefore the column order of
+    // eh_proj.
+    const void *lane_src = from_chain && mtp_chain_
+                               ? mtp_chain_
+                               : act_at(mtp_lanes_, as, mtp_capture_row(pos) * wide);
+    be_->copy_act(ws_hc_, lane_src, wide);
+    u8 *cat = static_cast<u8 *>(mtp_cat_);
+    void *cat_e = cat;
+    void *cat_h = cat + static_cast<size_t>(ne) * as;
+    be_->rmsnorm(cat_e, mtp_e_, m.enorm, 1, ne, mc.rms_eps);
+    for (i64 li = 0; li < hc; li++) {
+        void *lane = act_at(ws_hc_, as, li * ne);
+        be_->rmsnorm(cat_h, lane, m.hnorm, 1, ne, mc.rms_eps);
+        gemm_w(lane, mtp_cat_, m.eh_proj, ne, 2 * ne, 1);
+    }
+    be_->fill0(mtp_rep_, sizeof(i32));
+
+    // ---- attention, between the block's own mixers ------------------------
+    hc_begin(L, true, 1);
+    if (!mla_forward(L, l, 1, pos)) return false;
+    // The residual is the trunk's own sequence for an hc layer: sum the block
+    // output into the mixed row, scatter into the lanes, mix the FFN's pre.
+    be_->add_inplace(ws_x_, ws_x2_, ne);
+    hc_end(1);
+
+    // ---- FFN, between the next pair ---------------------------------------
+    hc_begin(L, false, 1);
+    if (!moe_ffn(L, l, 1)) return false;
+    hc_end(1);
+
+    // The stack the NEXT proposal of this round starts from: the lane stack
+    // after both mixers, which is the reference's `t_h_nextn` one step on.
+    if (mtp_chain_) be_->copy_act(mtp_chain_, ws_hc_, wide);
+
+    if (!want_logits) return true;
+
+    // ---- the head ---------------------------------------------------------
+    // The lane stack is collapsed to one row by the STACK's head mixer and then
+    // normalized with the block's own `shared_head_norm`, which is what
+    // `graph_mtp` builds (`hc_head` -> `shared_head_norm`). A file that states
+    // no head mixer collapses with the last pre-mix instead -- V4.1's
+    // single-pass form -- and the trunk's own `head_compute` already carries
+    // both rules, so this reads the same two shapes it does.
+    const void *pre = nullptr;
+    if (!mc.hc_no_head) {
+        if (!model_.hc_head_fn().present()) {
+            forward_error_ = "the file has no hc_head_fn, so the lane stack has "
+                             "no head mixer to collapse it with";
+            return false;
+        }
+        be_->rmsnorm(ws_hc_n_, ws_hc_, nullptr, 1, wide, mc.rms_eps);
+        gemm_w(ws_hc_fn_, ws_hc_n_, model_.hc_head_fn(), hc, wide, 1);
+        hc_head_pre(static_cast<f32 *>(ws_hc_head_),
+                    static_cast<const f32 *>(ws_hc_fn_), model_.hc_head_scale(),
+                    model_.hc_head_base(), static_cast<i32>(hc), mc.hc_eps);
+        pre = ws_hc_head_;
+    } else {
+        pre = static_cast<const f32 *>(ws_hc_pre_prev_);
+        if (!hc_pre_valid_) pre = nullptr;
+    }
+    if (pre)
+        be_->hc_sk_pre(ws_hc_out_, ws_hc_, pre, 1, static_cast<i32>(hc), ne);
+    else
+        be_->copy_act(ws_hc_out_, ws_hc_, ne);
+    const f32 *hn = m.shared_head_norm ? m.shared_head_norm : model_.out_norm();
+    be_->rmsnorm(ws_xn_, ws_hc_out_, hn, 1, ne, mc.rms_eps);
+    norm_bias_add(static_cast<f32 *>(ws_xn_), model_.out_norm_bias(), 1, ne);
+    const void *xn = ws_xn_;
+    if (model_.had().head_folded) {
+        had_xform(ws_had_, ws_xn_, 1, ne, false, false);
+        xn = ws_had_;
+    }
+    // A block with a head of its own uses it; the usual file has none and the
+    // trunk's `output.weight` IS the head (the reference's shared_head_head
+    // fallback). The block's own head gets no trunk `output.bias`/logit_scale:
+    // those belong to the tensor they were loaded beside.
+    if (m.shared_head_head.present()) {
+        gemm_w(ws_logits_, xn, m.shared_head_head, n_vocab_, ne, 1);
+        return true;
+    }
+    logit_head(xn);
+    return true;
+}
+
 bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits,
                                bool from_chain) {
     // The two head shapes are two different blocks, not two spellings of one:
@@ -5674,6 +5853,9 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits,
     // One entry point, so every caller (the probe, the re-feed, the proposer)
     // reaches the right forward without knowing which kind it loaded.
     if (m.hf) return mtp_hf_block_forward(m, pos, want_logits, from_chain);
+    // A dspark block is a stack layer, not a llama-style block with a latent
+    // attention bolted on: it has its own body (which is the trunk's).
+    if (m.dspark) return mtp_dspark_forward(m, pos, want_logits, from_chain);
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
     const i64 hd = m.head_dim;

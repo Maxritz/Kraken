@@ -5139,19 +5139,33 @@ bool Model::load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
         // than a missing attention body.
         const bool mla = tensor(key(".attn_q_a.weight")) ||
                          tensor(key(".attn_q_b.weight")) ||
+                         tensor(key(".attn_kv_a.weight")) ||
                          tensor(key(".attn_kv_a_mqa.weight")) ||
-                         tensor(key(".attn_kv_b.weight"));
+                         tensor(key(".attn_kv_b.weight")) ||
+                         tensor(key(".attn_kv.weight"));
+        // A deepseek4 nextn block IS a stack layer: its attention is the trunk's
+        // latent one and its FFN the trunk's MoE, wrapped in the stack's own
+        // hyper-connection mixers. It has its own loader because it shares
+        // nothing with the llama-style block above except the `blk.<n>.` prefix.
+        if (mla) {
+            if (cfg_.mla_layout != MlaLayout::Shared || cfg_.n_layer <= 0) {
+                if (err)
+                    *err = origin + ": the nextn block is MLA (" +
+                           key(".attn_q_a") + "/" + key(".attn_q_b") + ", " +
+                           key(".attn_kv") + "), a latent attention that runs on "
+                           "the shared-latent deepseek4 stack it belongs to -- "
+                           "this trunk is " + mla_layout_name(cfg_.mla_layout) +
+                           " with " + std::to_string(cfg_.n_layer) +
+                           " layer(s), so the block's arithmetic has no trunk to "
+                           "run on";
+                return false;
+            }
+            return load_dspark_mtp_from(g, l, origin, err);
+        }
         if (err) {
-            *err = mla
-                       ? origin + ": the nextn block is MLA (" + key(".attn_q_a") +
-                             "/" + key(".attn_q_b") + ", " + key(".attn_kv_a_mqa") +
-                             "/" + key(".attn_kv_b") +
-                             "), a latent attention this sidecar loader does not "
-                             "run -- it reads llama-style q/k/v blocks only. The "
-                             "block needs the trunk's MLA attention body wired "
-                             "into MtpBlock (deepseek4-dspark, plan item 1)"
-                       : origin + " has no readable " + key(".attn_q.weight") +
-                             " for its nextn block";
+            *err = origin + " has no readable " + key(".attn_q.weight") +
+                   " for its nextn block, and no latent attention either (" +
+                   key(".attn_q_a") + "/" + key(".attn_kv") + ")";
         }
         return false;
     }
@@ -5426,6 +5440,374 @@ bool Model::load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
                                                            : "MISSING",
                  static_cast<f64>(m.bytes) / 1048576.0);
     }
+    return true;
+}
+
+// ---- the deepseek4-dspark nextn block ------------------------------------
+//
+// `deepseek4.cpp`'s graph_mtp builds the nextn block as ONE MORE LAYER of the
+// trunk, and its tensor set says so: a `blk.<n_layer>.*` layer carrying the
+// shared-latent attention (`attn_q_a`/`attn_q_a_norm`/`attn_q_b`, `attn_kv`,
+// `attn_kv_a_norm`, `attn_output_a`/`attn_output_b`), the Sinkhorn
+// hyper-connection pair (`hc_attn_*`, `hc_ffn_*`), the MoE beside a shared
+// expert, and the `nextn.*` adapters that turn (embedding, hidden) into that
+// layer's input.
+//
+// The weights therefore load into a LayerWeights and the engine runs its OWN
+// layer ops over them (`mla_shared_forward`, `moe_ffn`, `hc_begin`/`hc_end`).
+// A second MLA body living inside MtpBlock is how two copies of one arithmetic
+// drift, and the drift reads as a mediocre drafter rather than as a bug.
+//
+// Every refusal below is a refusal rather than a fallback, because each of
+// these files still decodes if the piece is skipped:
+//   * a trunk that is not shared-latent V4 -- the block's ops ARE that
+//     stack's (grouped output, rope in the latent's tail, Sinkhorn mixers);
+//   * a block with no `hc_attn_fn`/`hc_ffn_fn` -- the mixers are the block's
+//     input and its output combine, so a block without them is another graph;
+//   * a width that disagrees with the trunk's config, with both numbers named.
+bool Model::load_dspark_mtp_from(const Gguf &g, i32 l, const std::string &origin,
+                                 std::string *err) {
+    const auto key = [&](const char *sfx) {
+        return std::string("blk.") + std::to_string(l) + sfx;
+    };
+    const auto T = [&](const char *sfx) { return g.tensor(key(sfx)); };
+    const ModelConfig &mc = cfg_;
+    const i64 ne = mc.n_embd;
+    const i64 ql = mc.mla_q_lora;
+    const i64 d = mc.mla_kv_lora;
+    const i64 ng = mc.dsv4_o_groups;
+    const i64 ol = mc.dsv4_o_lora;
+    const i64 gout = ng * ol;
+    const i64 hc = mc.hc_n;
+    const i64 mix_dim = (2 + hc) * hc;
+    const i64 q_head = static_cast<i64>(mc.n_head) * d;
+    const i64 woa_in = q_head / ng;
+    auto fail = [&](const std::string &why) {
+        if (err) *err = origin + ": " + why;
+        return false;
+    };
+
+    // ---- the trunk this block belongs to ----------------------------------
+    if (mc.mla_layout != MlaLayout::Shared || ql <= 0 || d <= 0 || ng <= 0 ||
+        ol <= 0) {
+        return fail(key(".attn_q_a") + "/" + key(".attn_q_b") +
+                    " is the shared-latent attention of a deepseek4 nextn block, "
+                    "and this trunk runs " + mla_layout_name(mc.mla_layout) +
+                    " attention without the grouped output that block's "
+                    "arithmetic needs (q_lora " + std::to_string(ql) +
+                    ", latent " + std::to_string(d) + ", o_groups " +
+                    std::to_string(ng) + " x o_lora " + std::to_string(ol) +
+                    ") -- a dspark head belongs to a shared-latent deepseek4 "
+                    "stack");
+    }
+    if (!mc.hc_sinkhorn || hc <= 0) {
+        return fail(key(".hc_attn_fn") + " and " + key(".hc_ffn_fn") +
+                    " wrap the block's attention and FFN in Sinkhorn "
+                    "hyper-connections, and this trunk has none (lanes " +
+                    std::to_string(hc) + ") -- the block's input is a lane "
+                    "stack the trunk never builds");
+    }
+    if (d != mc.mla_qk_nope + mc.mla_qk_rope) {
+        return fail("the trunk's latent is " + std::to_string(d) +
+                    " wide and its nope+rope is " + std::to_string(
+                        mc.mla_qk_nope + mc.mla_qk_rope) +
+                    " -- the block's k/v row would not be the trunk's");
+    }
+    // The block runs as layer `n_layer`, and two of the trunk's per-layer rules
+    // would change its graph if they reached it:
+    //   * a compressed layer (CSA/HCA) reads pooled keys this body does not
+    //     build, so a non-zero ratio at that index is a different attention;
+    //   * a hash layer takes its experts from `ffn_gate_tid2eid`, and the block
+    //     carries no such table -- the reference asserts the nextn block sits
+    //     PAST the hash layers.
+    if (static_cast<size_t>(mc.n_layer) < mc.dsv4_ratio.size() &&
+        mc.dsv4_ratio[static_cast<size_t>(mc.n_layer)] != 0)
+        return fail("the trunk's compress ratio at layer " +
+                    std::to_string(mc.n_layer) + " is " +
+                    std::to_string(mc.dsv4_ratio[static_cast<size_t>(mc.n_layer)]) +
+                    " and the nextn block's attention is the dense latent one -- "
+                    "a compressed nextn block would read pooled keys this body "
+                    "does not build");
+    if (mc.n_layer < mc.dsv4_hash_layers)
+        return fail("the trunk routes its first " +
+                    std::to_string(mc.dsv4_hash_layers) +
+                    " layer(s) by token-id table and the nextn block runs as "
+                    "layer " + std::to_string(mc.n_layer) +
+                    " -- a hash nextn block would need " +
+                    key(".ffn_gate_tid2eid.weight") + ", which the reference "
+                    "asserts it does not have");
+
+    // ---- the tensors the body cannot run without --------------------------
+    const char *kReq[][1] = {
+        {".attn_q_a.weight"},          {".attn_q_a_norm.weight"},
+        {".attn_q_b.weight"},          {".attn_kv.weight"},
+        {".attn_kv_a_norm.weight"},    {".attn_output_a.weight"},
+        {".attn_output_b.weight"},     {".nextn.eh_proj.weight"},
+        {".nextn.enorm.weight"},       {".nextn.hnorm.weight"},
+        {".nextn.shared_head_norm.weight"},
+        {".hc_attn_fn.weight"},        {".hc_attn_base.weight"},
+        {".hc_attn_scale.weight"},     {".hc_ffn_fn.weight"},
+        {".hc_ffn_base.weight"},       {".hc_ffn_scale.weight"},
+    };
+    for (const auto &r : kReq)
+        if (!T(r[0]))
+            return fail("a dspark nextn block needs " + key(r[0]) +
+                        " and this file does not carry it");
+    // ---- shapes, against the trunk's geometry -----------------------------
+    auto check2 = [&](const char *what, const GgufTensor *t, i64 n_in,
+                      i64 n_out) {
+        if (t && static_cast<i64>(t->ne[0]) == n_in &&
+            static_cast<i64>(t->ne[1]) == n_out)
+            return true;
+        return fail(std::string("the nextn block's ") + what + " is " +
+                    (t ? std::to_string(t->ne[0]) + " x " +
+                             std::to_string(t->ne[1])
+                       : std::string("missing")) +
+                    " and this trunk's geometry says " + std::to_string(n_in) +
+                    " x " + std::to_string(n_out));
+    };
+    if (!check2("attn_q_a", T(".attn_q_a.weight"), ne, ql) ||
+        !check2("attn_q_b", T(".attn_q_b.weight"), ql, q_head) ||
+        !check2("attn_kv", T(".attn_kv.weight"), ne, d) ||
+        !check2("attn_output_a", T(".attn_output_a.weight"), woa_in, gout) ||
+        !check2("attn_output_b", T(".attn_output_b.weight"), gout, ne) ||
+        !check2("nextn.eh_proj", T(".nextn.eh_proj.weight"), 2 * ne, ne) ||
+        !check2("hc_attn_fn", T(".hc_attn_fn.weight"), hc * ne, mix_dim) ||
+        !check2("hc_ffn_fn", T(".hc_ffn_fn.weight"), hc * ne, mix_dim))
+        return false;
+    // `hnorm` is ONE [n_embd] gain broadcast over the lanes: the reference
+    // norms the whole [n_embd, hc] stack with it. A file that carries hc*n_embd
+    // values is a per-lane gain, which is qwen4exp's low-rank head rather than
+    // this one, and reading it as a broadcast would mix lanes.
+    if (T(".nextn.hnorm.weight")->n_elements != static_cast<u64>(ne))
+        return fail("nextn.hnorm carries " +
+                    std::to_string(T(".nextn.hnorm.weight")->n_elements) +
+                    " values and this block's hnorm is one " +
+                    std::to_string(ne) + "-wide gain broadcast over its " +
+                    std::to_string(hc) + " lanes");
+
+    // ---- the routed bank ---------------------------------------------------
+    const GgufTensor *tgi = T(".ffn_gate_inp.weight");
+    const GgufTensor *tge = T(".ffn_gate_exps.weight");
+    const GgufTensor *tue = T(".ffn_up_exps.weight");
+    const GgufTensor *tde = T(".ffn_down_exps.weight");
+    if (!tgi || !tge || !tue || !tde)
+        return fail("the dspark block's FFN is the routed bank beside a shared "
+                    "expert, and this file is missing " +
+                    std::string(!tgi ? key(".ffn_gate_inp.weight") : "") +
+                    std::string(!tge ? key(".ffn_gate_exps.weight") : "") +
+                    std::string(!tue ? key(".ffn_up_exps.weight") : "") +
+                    std::string(!tde ? key(".ffn_down_exps.weight") : ""));
+    const i32 n_expert = static_cast<i32>(tge->ne[2]);
+    const i64 n_ff_exp = static_cast<i64>(tge->ne[1]);
+    if (mc.n_expert > 0 && n_expert != mc.n_expert)
+        return fail("the block routes over " + std::to_string(n_expert) +
+                    " experts and this trunk has " +
+                    std::to_string(mc.n_expert) +
+                    " -- the block's router row and the stack's are different "
+                    "matrices");
+    if (mc.n_ff_exp > 0 && n_ff_exp != mc.n_ff_exp)
+        return fail("the block's experts are " + std::to_string(n_ff_exp) +
+                    " wide and this trunk's are " +
+                    std::to_string(mc.n_ff_exp));
+    if (!check2("ffn_gate_exps", tge, ne, n_ff_exp) ||
+        !check2("ffn_up_exps", tue, ne, n_ff_exp) ||
+        !check2("ffn_down_exps", tde, n_ff_exp, ne) ||
+        !check2("ffn_gate_inp", tgi, ne, n_expert))
+        return false;
+
+    // ---- uploads -----------------------------------------------------------
+    MtpBlock &m = mtp_;
+    LayerWeights &L = m.dspark_layer;
+    static const char *kW = ".weight";
+    const size_t wn = std::strlen(kW);
+    const auto upload_q = [&](const GgufTensor *t, QuantTensor *out) {
+        if (!t) return false;
+        if (!dtype_supported(t->type)) {
+            if (err)
+                *err = origin + ": " + t->name + " uses unsupported format " +
+                       dtype_name(t->type) + " (type id " +
+                       std::to_string(t->type_id) + ")";
+            return false;
+        }
+        out->data = be_->alloc(t->n_bytes);
+        if (!out->data) return false;
+        be_->upload(out->data, t->data, t->n_bytes);
+        out->type = t->type;
+        out->n_in = static_cast<i64>(t->ne[0]);
+        out->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
+        const std::string base =
+            t->name.size() > wn && t->name.compare(t->name.size() - wn, wn, kW) == 0
+                ? t->name.substr(0, t->name.size() - wn)
+                : t->name;
+        out->gs = 1.0f;
+        if (const GgufTensor *s = g.tensor(base + ".scale")) {
+            if (s->data && s->n_elements >= 1 && s->type == DType::F32) {
+                out->gs = reinterpret_cast<const f32 *>(s->data)[0];
+                if (out->gs != 1.0f && out->n_in > max_scaled_in_)
+                    max_scaled_in_ = out->n_in;
+            }
+        }
+        m.bytes += static_cast<size_t>(t->n_bytes);
+        return true;
+    };
+    const auto upload_f = [&](const GgufTensor *t) -> f32 * {
+        if (!t) return nullptr;
+        const i64 n = t->n_elements;
+        f32 *host = static_cast<f32 *>(host_alloc(static_cast<size_t>(n) * 4));
+        if (!host) return nullptr;
+        dequant_row(t->type, t->data, host, n);
+        f32 *dev = static_cast<f32 *>(be_->alloc(static_cast<size_t>(n) * 4));
+        if (dev) be_->upload(dev, host, static_cast<size_t>(n) * 4);
+        host_free(host);
+        m.bytes += static_cast<size_t>(n) * 4;
+        return dev;
+    };
+
+    L.mla = true;
+    bool ok = upload_q(T(".attn_q_a.weight"), &L.wq_a) &&
+              upload_q(T(".attn_q_b.weight"), &L.wq_b) &&
+              upload_q(T(".attn_kv.weight"), &L.wkv) &&
+              upload_q(T(".attn_output_a.weight"), &L.wo_a) &&
+              upload_q(T(".attn_output_b.weight"), &L.wo_b) &&
+              upload_q(T(".hc_attn_fn.weight"), &L.hc_attn_fn) &&
+              upload_q(T(".hc_ffn_fn.weight"), &L.hc_ffn_fn) &&
+              upload_q(T(".nextn.eh_proj.weight"), &m.eh_proj) &&
+              upload_q(tgi, &L.router);
+    if (!ok)
+        return fail("a weight upload failed (device allocation refused)");
+    L.wq_a_norm = upload_f(T(".attn_q_a_norm.weight"));
+    L.wkv_norm = upload_f(T(".attn_kv_a_norm.weight"));
+    L.attn_norm = upload_f(T(".attn_norm.weight"));
+    L.ffn_norm = upload_f(T(".ffn_norm.weight"));
+    L.hc_attn_base = upload_f(T(".hc_attn_base.weight"));
+    L.hc_ffn_base = upload_f(T(".hc_ffn_base.weight"));
+    L.hc_attn_scale = upload_f(T(".hc_attn_scale.weight"));
+    L.hc_ffn_scale = upload_f(T(".hc_ffn_scale.weight"));
+    L.sinks = upload_f(T(".attn_sinks.weight"));
+    m.enorm = upload_f(T(".nextn.enorm.weight"));
+    m.hnorm = upload_f(T(".nextn.hnorm.weight"));
+    m.shared_head_norm = upload_f(T(".nextn.shared_head_norm.weight"));
+    if (!L.wq_a_norm || !L.wkv_norm || !L.hc_attn_base || !L.hc_ffn_base ||
+        !L.hc_attn_scale || !L.hc_ffn_scale || !m.enorm || !m.hnorm ||
+        !m.shared_head_norm)
+        return fail("a 1-D weight of the nextn block could not be uploaded");
+    if (T(".hc_attn_scale.weight")->n_elements < 3)
+        return fail("hc_attn_scale carries " +
+                    std::to_string(T(".hc_attn_scale.weight")->n_elements) +
+                    " values and the Sinkhorn mixer has three (pre, post, "
+                    "combine)");
+    if (T(".nextn.shared_head_head.weight"))
+        if (!upload_q(T(".nextn.shared_head_head.weight"), &m.shared_head_head))
+            return fail("the block's own head could not be uploaded");
+
+    // ---- the shared expert beside the bank --------------------------------
+    L.moe = true;
+    L.experts.gate = tge;
+    L.experts.up = tue;
+    L.experts.down = tde;
+    L.experts.gate_scale = g.tensor(key(".ffn_gate_exps.scale"));
+    L.experts.up_scale = g.tensor(key(".ffn_up_exps.scale"));
+    L.experts.down_scale = g.tensor(key(".ffn_down_exps.scale"));
+    L.experts.n_expert = n_expert;
+    L.experts.n_embd = ne;
+    L.experts.n_ff_exp = n_ff_exp;
+    if (const GgufTensor *t = T(".ffn_gate_shexp.weight"))
+        if (!upload_q(t, &L.shexp_gate))
+            return fail("the shared expert's gate could not be uploaded");
+    if (const GgufTensor *t = T(".ffn_up_shexp.weight"))
+        if (!upload_q(t, &L.shexp_up))
+            return fail("the shared expert's up projection could not be uploaded");
+    if (const GgufTensor *t = T(".ffn_down_shexp.weight"))
+        if (!upload_q(t, &L.shexp_down))
+            return fail("the shared expert's down projection could not be uploaded");
+    if (mc.n_ff_shexp > 0 && L.shexp_up.present() &&
+        L.shexp_up.n_out != mc.n_ff_shexp)
+        return fail("the block's shared expert is " +
+                    std::to_string(L.shexp_up.n_out) + " wide and this trunk's is " +
+                    std::to_string(mc.n_ff_shexp) +
+                    " -- the workspace it runs in is the trunk's");
+    // The selection bias sits beside the router under two spellings; HOST f32,
+    // exactly as a stack layer keeps it, because the top-k that reads it runs on
+    // the host thread.
+    for (const char *sfx : {".exp_probs_b.bias", ".ffn_exp_probs_b.bias"}) {
+        if (const GgufTensor *t = T(sfx)) {
+            L.router_bias = static_cast<f32 *>(
+                host_alloc(static_cast<size_t>(n_expert) * 4));
+            if (L.router_bias) dequant_row(t->type, t->data, L.router_bias, n_expert);
+            break;
+        }
+    }
+
+    // ---- the f16 staging the shared-latent ops read -----------------------
+    // The five tables are re-read as f16 once, for the same reason the trunk
+    // stages its own: the grouped output and the absorbed score are per-group
+    // slices of a matrix `gemm()` cannot address at the file's own layout. The
+    // staging IS the weight the kernels read, so it happens here and not on the
+    // first forward.
+    const auto stage16 = [&](const char *what, QuantTensor &dst,
+                             const GgufTensor *t, i64 n_in, i64 n_out) {
+        const i64 nelem = n_in * n_out;
+        const size_t rb = dtype_row_bytes(t->type, n_in);
+        std::vector<f32> row(static_cast<size_t>(n_in));
+        std::vector<u16> half(static_cast<size_t>(nelem));
+        const u8 *src = static_cast<const u8 *>(t->data);
+        for (i64 r = 0; r < n_out; r++) {
+            dequant_row(t->type, src + static_cast<size_t>(r) * rb, row.data(),
+                        n_in);
+            for (i64 i = 0; i < n_in; i++)
+                half[static_cast<size_t>(r * n_in + i)] =
+                    fp32_to_fp16(row[static_cast<size_t>(i)]);
+        }
+        void *dev = be_->alloc(static_cast<size_t>(nelem) * 2);
+        if (!dev) {
+            if (err)
+                *err = origin + ": could not allocate " +
+                       std::to_string(nelem * 2 / 1048576u) + " MiB for the '" +
+                       what + "' f16 staging";
+            return false;
+        }
+        be_->upload(dev, half.data(), static_cast<size_t>(nelem) * 2);
+        dst.data = dev;
+        dst.type = DType::F16;
+        dst.n_in = n_in;
+        dst.n_out = n_out;
+        m.bytes += static_cast<size_t>(nelem) * 2;
+        return true;
+    };
+    if (!stage16("attn_q_a", L.wq_a16, T(".attn_q_a.weight"), ne, ql) ||
+        !stage16("attn_q_b", L.wq_b16, T(".attn_q_b.weight"), ql, q_head) ||
+        !stage16("attn_kv", L.wkv16, T(".attn_kv.weight"), ne, d) ||
+        !stage16("attn_output_a", L.wo_a16, T(".attn_output_a.weight"), woa_in,
+                 gout) ||
+        !stage16("attn_output_b", L.wo_b16, T(".attn_output_b.weight"), gout, ne))
+        return false;
+
+    // ---- the block's own numbers ------------------------------------------
+    m.dspark = true;
+    m.layer = l;
+    m.run_layer = cfg_.n_layer;
+    m.n_embd = static_cast<i32>(ne);
+    m.n_head = mc.n_head;
+    m.n_head_kv = mc.n_head_kv;
+    m.head_dim = static_cast<i32>(d);
+    m.n_expert = n_expert;
+    m.n_expert_used = mc.n_expert_used;
+    m.n_ff_exp = static_cast<i32>(n_ff_exp);
+    m.n_ff_shexp = static_cast<i32>(L.shexp_up.present() ? L.shexp_up.n_out : 0);
+    m.exps_gate = tge;
+    m.exps_up = tue;
+    m.exps_down = tde;
+    m.present = true;
+    KRK_INFO("nextn (MTP) block %d is a dspark stack layer: shared-latent MLA "
+             "%d head(s) x %d, %d expert(s) top-%d of %d-wide FFN%s, Sinkhorn %d "
+             "lane(s), eh_proj %lldx%lld, %.1f MiB resident, experts left in the "
+             "file",
+             l, m.n_head, m.head_dim, m.n_expert, m.n_expert_used, m.n_ff_exp,
+             m.n_ff_shexp > 0 ? " + shared expert" : "",
+             static_cast<i32>(hc), static_cast<long long>(m.eh_proj.n_in),
+             static_cast<long long>(m.eh_proj.n_out),
+             static_cast<f64>(m.bytes) / 1048576.0);
     return true;
 }
 
@@ -5910,6 +6292,23 @@ void Model::unload() {
                    mtp_.shared_head_norm})
         if (f) be_->release(f);
     if (mtp_.router_bias) host_free(mtp_.router_bias);
+    // The dspark body's weights live in a LayerWeights (they are a trunk
+    // layer's), so they are released through the same field list every stack
+    // layer uses -- a field added there is freed here without a second edit.
+    if (mtp_.dspark) {
+        for (QuantTensor *q : qt_fields(mtp_.dspark_layer))
+            if (q->present()) be_->release(q->data);
+        for (f32 *f : {mtp_.dspark_layer.attn_norm, mtp_.dspark_layer.ffn_norm,
+                       mtp_.dspark_layer.wq_a_norm, mtp_.dspark_layer.wkv_norm,
+                       mtp_.dspark_layer.hc_attn_base, mtp_.dspark_layer.hc_ffn_base,
+                       mtp_.dspark_layer.hc_attn_scale,
+                       mtp_.dspark_layer.hc_ffn_scale, mtp_.dspark_layer.sinks})
+            if (f) be_->release(f);
+        if (mtp_.dspark_layer.router_bias)
+            host_free(mtp_.dspark_layer.router_bias);
+        if (mtp_.shared_head_head.present())
+            be_->release(mtp_.shared_head_head.data);
+    }
     mtp_ = MtpBlock{};
     tok_embd_ = {};
     out_head_ = {};
