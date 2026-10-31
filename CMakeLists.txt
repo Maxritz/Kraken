@@ -628,6 +628,25 @@ target_link_libraries(kraken-q80-ablate PRIVATE krk_core)
 add_executable(kraken-attn-multiseq tools/ta_attn_multiseq.cpp)
 target_link_libraries(kraken-attn-multiseq PRIVATE krk_core)
 
+# B4's ThreadSanitizer arm: the listener's descriptor ownership under a
+# concurrent stop(). EXCLUDE_FROM_ALL because -fsanitize=thread is a different
+# instrumented runtime from the rest of the build, so it is asked for by name:
+#   cmake --build build-tests --target kraken-tsan-http-listen
+#   ./build-tests/kraken-tsan-http-listen
+# src/http.cpp, json.cpp and common.cpp are compiled into this target again on
+# purpose: a sanitizer build only sees races in objects that carry the
+# instrumentation, and linking an uninstrumented http.cpp would test nothing.
+if(NOT MSVC)
+    add_executable(kraken-tsan-http-listen EXCLUDE_FROM_ALL
+                   tools/tsan_http_listen.cpp
+                   src/http.cpp src/json.cpp src/common.cpp)
+    target_include_directories(kraken-tsan-http-listen PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(kraken-tsan-http-listen PRIVATE
+                           -fsanitize=thread -g -O1)
+    target_link_options(kraken-tsan-http-listen PRIVATE -fsanitize=thread)
+endif()
+
 # Every rung of the Q8_0 kernel ladder on whatever host runs it: VNNI, AVX-512BW,
 # AVX2, scalar. Absent rungs are reported, not skipped silently.
 add_executable(kraken-kquant-dot tools/ta_kquant_dot.cpp)

@@ -2,7 +2,9 @@
 //
 // The engine is single-sequence, so generation is serialized behind the
 // shared mutex; connections are handled concurrently, generation is not.
-// Each request rolls the KV cache back to 0 so no state leaks between calls.
+// The KV cache is carried between requests deliberately: each request rolls it
+// back to the longest prefix it shares with what the cache already holds (see
+// note_kv below), which is what makes a second chat turn cheap.
 #include "krk/server.hpp"
 #include "krk/host_time.hpp"
 #include "krk/webui.hpp"
@@ -157,6 +159,7 @@ std::string model_display_name(const ModelConfig &cfg) {
 
 struct StreamState {
     HttpConn *conn = nullptr;
+    std::atomic<bool> *cancel = nullptr; // raised when a write proves the peer is gone
     bool chat = false;
     std::string id;
     std::string model;
@@ -190,7 +193,12 @@ void stream_cb(void *user, const char *text, i32 token, bool done) {
     delta.set("content", std::string(text));
     const JsonValue ev =
         chunk_event(st, std::move(delta), JsonValue(nullptr));
-    if (!http_sse_event(*st->conn, ev.dump())) st->failed = true;
+    if (!http_sse_event(*st->conn, ev.dump())) {
+        st->failed = true;
+        // The peer is gone. Tell the engine: the alternative is decoding the
+        // remaining max_tokens into a socket nobody is reading.
+        if (st->cancel) st->cancel->store(true, std::memory_order_relaxed);
+    }
 }
 
 // Per-request timing. The server printed none at all before this, so a slow
@@ -415,19 +423,38 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
                   static_cast<long long>(reuse), prompt_ids.size());
     // A request that fails must not leave a cache entry behind: the rows it
     // wrote are not the ones a later request would assume they are.
+    //
+    // On success the entry is the whole run, prompt AND accepted tokens, cut to
+    // kv_pos. The cut is the honest part: a decode step writes the row for the
+    // token it CONSUMED, so after G tokens the cache holds prompt + (G-1) rows
+    // and the last token has no row yet. Recording prompt + r.tokens and then
+    // trimming to kv_pos keeps the claim exactly equal to the rows that exist,
+    // which is what makes the next turn's skip a skip and not a guess.
     auto note_kv = [&](bool ok) {
         if (!ok) {
             prefix_ids_.clear();
             return;
         }
         const i64 held = engine_->kv_pos();
-        if (held < static_cast<i64>(prompt_ids.size()))
-            prompt_ids.resize(static_cast<size_t>(held));
-        prefix_ids_ = prompt_ids;
+        std::vector<i32> run = prompt_ids;
+        run.insert(run.end(), r.tokens.begin(), r.tokens.end());
+        if (held < static_cast<i64>(run.size()))
+            run.resize(static_cast<size_t>(std::max<i64>(0, held)));
+        prefix_ids_.swap(run);
     };
+
+    // Cancellation: a dropped streaming client must stop the decode instead of
+    // paying for the rest of it into a closed socket. The write is the only
+    // place a disconnect is observable -- TCP gives no notification for a peer
+    // that vanished -- so a failed SSE event raises this flag and the token loop
+    // stops at the next token. Non-streaming requests get the flag too (it
+    // simply never rises: their single write happens after generation).
+    std::atomic<bool> cancel_flag{false};
+    p.cancel = &cancel_flag;
 
     if (stream) {
         StreamState st;
+        st.cancel = &cancel_flag;
         st.conn = &conn;
         st.chat = chat;
         st.id = id;
@@ -436,6 +463,11 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
         p.sink.user = &st;
         http_sse_begin(conn);
         const bool ok = engine_->generate(p, &r);
+        if (r.cancelled) {
+            KRK_INFO("request %s: client closed the stream after %d token(s); "
+                     "decode stopped early",
+                     id.c_str(), r.generated);
+        }
         if (!st.failed) {
             if (ok) {
                 const JsonValue ev =
@@ -452,13 +484,18 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
         }
         res.status = ok ? 200 : (r.finish == FinishError ? 503 : 500);
         res.content_type = "text/event-stream";
-        note_kv(ok);
+        // A cancelled run leaves the KV holding a MIXTURE: rows [0, i) of this
+        // prompt and rows >= i from the previous run. `ok` is true for it (the
+        // run stopped as asked), so the record must be dropped on the flag and
+        // not on the return value -- otherwise the next request would claim
+        // rows whose tokens are not what it thinks they are.
+        note_kv(ok && !r.cancelled);
         report_request_time(r);
         return true;
     }
 
     const bool ok = engine_->generate(p, &r);
-    note_kv(ok);
+    note_kv(ok && !r.cancelled);
     if (!ok) {
         const bool resource_error = r.finish == FinishError;
         const std::string message = r.error.empty() ? "generation failed" : r.error;

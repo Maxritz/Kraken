@@ -2,6 +2,7 @@
 #include "krk/http.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <thread>
 
@@ -21,6 +22,8 @@ constexpr socket_t kInvalidSocket = INVALID_SOCKET;
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 using socket_t = int;
@@ -239,6 +242,50 @@ std::string http_url_decode(const std::string &s) {
     return out;
 }
 
+// Bounded wait for a listening socket to become readable. The accept loop uses
+// it instead of a blocking accept(): the loop must be able to notice stop() and
+// return, and closing the descriptor underneath a blocked accept() is exactly
+// the use-after-free B4 removed. Returns false on timeout, on error, and when
+// the wait was interrupted -- the caller re-tests its own stop flag either way.
+bool wait_readable(socket_t s, int ms) {
+#ifdef _WIN32
+    WSAPOLLFD p{};
+    p.fd = s;
+    p.events = POLLRDNORM;
+    return ::WSAPoll(&p, 1, ms) > 0;
+#else
+    pollfd p{};
+    p.fd = s;
+    p.events = POLLIN;
+    const int r = ::poll(&p, 1, ms);
+    return r > 0 && (p.revents & (POLLIN | POLLERR | POLLHUP)) != 0;
+#endif
+}
+
+// The listener is non-blocking so accept() can never park after poll() said
+// readable (a reset connection between the two is real). Accepted sockets are
+// put back into blocking mode explicitly instead of relying on neither POSIX
+// nor Winsock documenting inheritance the same way -- recv() in serve_client
+// has to block.
+bool set_nonblocking(socket_t s, bool on) {
+#ifdef _WIN32
+    u_long mode = on ? 1 : 0;
+    return ::ioctlsocket(s, FIONBIO, &mode) == 0;
+#else
+    const int fl = ::fcntl(s, F_GETFL, 0);
+    if (fl < 0) return false;
+    return ::fcntl(s, F_SETFL, on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK)) == 0;
+#endif
+}
+
+bool would_block() {
+#ifdef _WIN32
+    return ::WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // HttpServer
 // ---------------------------------------------------------------------------
@@ -270,13 +317,14 @@ bool HttpServer::listen(const std::string &host, int port, std::string *err) {
         return false;
     }
 #endif
-    listen_fd_ = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
-    if (listen_fd_ == static_cast<int>(kInvalidSocket)) {
+    listen_fd_.store(static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0)));
+    if (listen_fd_.load() == static_cast<int>(kInvalidSocket)) {
         if (err) *err = "socket() failed";
         return false;
     }
+    const socket_t lsock = static_cast<socket_t>(listen_fd_.load());
     int one = 1;
-    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&one),
+    ::setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&one),
                  sizeof(one));
 
     sockaddr_in addr{};
@@ -287,28 +335,35 @@ bool HttpServer::listen(const std::string &host, int port, std::string *err) {
     } else {
         if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
             if (err) *err = "invalid host '" + host + "'";
-            close_socket(listen_fd_);
-            listen_fd_ = -1;
+            close_socket(lsock);
+            listen_fd_.store(-1);
             return false;
         }
     }
-    if (::bind(listen_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+    if (::bind(lsock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
         if (err) *err = format("bind to %s:%d failed", host.c_str(), port);
-        close_socket(listen_fd_);
-        listen_fd_ = -1;
+        close_socket(lsock);
+        listen_fd_.store(-1);
         return false;
     }
-    if (::listen(listen_fd_, 16) != 0) {
+    if (::listen(lsock, 16) != 0) {
         if (err) *err = "listen() failed";
-        close_socket(listen_fd_);
-        listen_fd_ = -1;
+        close_socket(lsock);
+        listen_fd_.store(-1);
+        return false;
+    }
+
+    if (!set_nonblocking(lsock, true)) {
+        if (err) *err = "could not make the listener non-blocking";
+        close_socket(lsock);
+        listen_fd_.store(-1);
         return false;
     }
 
     // discover the bound port (ephemeral case)
     sockaddr_in bound{};
     socklen_t blen = sizeof(bound);
-    if (::getsockname(listen_fd_, reinterpret_cast<sockaddr *>(&bound), &blen) == 0) {
+    if (::getsockname(lsock, reinterpret_cast<sockaddr *>(&bound), &blen) == 0) {
         port_ = ntohs(bound.sin_port);
     } else {
         port_ = port;
@@ -469,46 +524,77 @@ void HttpServer::serve_client(int fd, HttpHandler handler) {
     close_socket(s);
 }
 
+// How long one poll waits before the loop re-tests its stop flag. It also
+// bounds how long stop() waits for the owner to close the descriptor.
+constexpr int kPollMs = 100;
+
+// Closes the descriptor if this thread is the one that took ownership of it.
+// compare_exchange, not load-then-close: two closers is the bug.
+bool HttpServer::take_and_close_listener() {
+    int fd = listen_fd_.load();
+    while (fd >= 0) {
+        if (listen_fd_.compare_exchange_weak(fd, -1)) {
+            close_socket(static_cast<socket_t>(fd));
+            return true;
+        }
+    }
+    return false;
+}
+
 void HttpServer::run(HttpHandler handler) {
+    // This thread owns the descriptor for the whole loop: it is the only place
+    // it is closed between here and the end of run(). Everything below reads it
+    // from this one local, so a concurrent stop() cannot change the number under
+    // a blocking call.
+    const int fd = listen_fd_.load();
+    if (fd < 0) return;
+    stop_requested_.store(false);
     running_.store(true);
-    while (running_.load()) {
+    while (!stop_requested_.load(std::memory_order_acquire)) {
+        // Bounded wait instead of a blocking accept: the loop has to be able to
+        // observe stop_requested_ on its own, because the alternative -- close
+        // the fd from stop() to unblock accept -- is the fd-reuse race.
+        if (!wait_readable(static_cast<socket_t>(fd), kPollMs)) continue;
         sockaddr_in peer{};
         socklen_t plen = sizeof(peer);
 #ifdef _WIN32
-        const SOCKET c = ::accept(listen_fd_, reinterpret_cast<sockaddr *>(&peer), &plen);
+        const SOCKET c = ::accept(static_cast<SOCKET>(fd),
+                                  reinterpret_cast<sockaddr *>(&peer), &plen);
         const bool failed = c == INVALID_SOCKET;
 #else
-        const int c = static_cast<int>(::accept(listen_fd_, reinterpret_cast<sockaddr *>(&peer), &plen));
+        const int c = static_cast<int>(
+            ::accept(fd, reinterpret_cast<sockaddr *>(&peer), &plen));
         const bool failed = c < 0;
 #endif
         if (failed) {
-            if (!running_.load()) break; // stop() closed the socket
+            if (stop_requested_.load()) break;
+            if (would_block()) continue; // poll raced a reset: nothing to take
             // transient error: brief backoff and continue
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
+        set_nonblocking(static_cast<socket_t>(c), false);
         std::thread(&HttpServer::serve_client, this, static_cast<int>(c), handler)
             .detach();
     }
+    take_and_close_listener();
     running_.store(false);
 }
 
 void HttpServer::stop() {
-    bool expected = true;
-    if (!running_.compare_exchange_strong(expected, false)) {
-        if (listen_fd_ < 0) return;
-    }
-    if (listen_fd_ >= 0) {
-        ::shutdown(listen_fd_,
-#ifdef _WIN32
-                   SD_BOTH
-#else
-                   SHUT_RDWR
-#endif
-        );
-        close_socket(listen_fd_);
-        listen_fd_ = -1;
-    }
+    // Flag only: stop() never touches the descriptor number, so there is no
+    // window in which it acts on a descriptor run() has already closed and the
+    // kernel has handed to someone else. The loop's poll is bounded, so this
+    // still returns within ~100 ms.
+    stop_requested_.store(true);
+    // Give the owner one poll interval plus slack to close it. If run() was
+    // never started (or already returned) nobody else will, and the exchange
+    // below closes it exactly once. If the loop is still inside a client
+    // dispatch it may take longer than this -- then it closes the descriptor
+    // itself and this call leaves it alone rather than racing it.
+    for (int i = 0; i < 200 && running_.load(); i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (!running_.load()) take_and_close_listener();
 #ifdef _WIN32
     winsock_free(wsa_);
     wsa_ = nullptr;

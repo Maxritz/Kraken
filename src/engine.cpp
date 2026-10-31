@@ -18,6 +18,8 @@
 #include "krk/qsa.hpp" // the QSA indexer's host maths (pool / score / top-k)
 #include "par_pool.hpp"
 
+#include <ctime>
+
 #if defined(_WIN32)
 // A hard ceiling on this process's working set. The host policy plans in bytes,
 // but a plan is not an enforcement: the mapping is read page by page and Windows
@@ -509,9 +511,25 @@ public:
         }
     }
 
+    // True once the caller's cancellation flag is set. Read once per token and
+    // once per prefill chunk; relaxed is right because the only ordering the
+    // engine needs is "the flag was observed", and the work it stops is
+    // abandoned, not published.
+    bool cancelled() const {
+        return p_.cancel && p_.cancel->load(std::memory_order_relaxed);
+    }
+
     // Records one accepted token and returns true if it completed a stop
-    // string, in which case the caller must stop generating.
+    // string OR the run was cancelled, in which case the caller must stop
+    // generating. Folding cancellation into the same return is deliberate: every
+    // decode loop -- plain, draft-head, MTP and the two DFlash ones -- already
+    // handles "true" correctly (roll back the KV, finish), and a sixth copy of
+    // that handling is how the EOS defect happened five times over.
     bool accept(i32 token) {
+        if (cancelled()) {
+            res_->cancelled = true;
+            return true;
+        }
         const std::string piece = tok_.decode(&token, 1);
         res_->tokens.push_back(token);
         res_->text += piece;
@@ -722,6 +740,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // the hot path's *shape*, not its math: nothing here is compiled out, it
     // just does nothing unless the variable is set.
     if (const char *dump = std::getenv("KRK_DUMP")) dump_path_ = dump;
+    if (!dump_path_.empty()) dump_open();
     // KRK_DUMP_ROUTE=1: one line per (layer, token) with the selected
     // experts and their mix weights -- the router is the half of a MoE
     // mismatch that moe.sum cannot show.
@@ -2782,6 +2801,9 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
 }
 
 void Engine::shutdown() {
+    // The dump's end marker, before anything else: a run that ends by crashing
+    // in a later teardown still leaves the line that says it produced N rows.
+    dump_close();
     if (moe_predict_enabled_) {
         const u64 candidates = moe_predictor_.candidates();
         const u64 hits = moe_predictor_.candidate_hits();
@@ -2929,6 +2951,113 @@ void Engine::norm_bias_add(f32 *dst, const f32 *bias, i32 n_tok, i64 width) {
         be_->add_inplace(dst + static_cast<i64>(t) * width, bias, width);
 }
 
+// ---- the dump file's own identity -----------------------------------------
+//
+// KRK_DUMP appends, so a second run's stages land in the same file as the
+// first's, and until now nothing in the file said which run a line belonged to
+// or whether the earlier run ever finished. Every "A/B on the same prompt"
+// comparison in this project reads these files, including the target/drafter
+// pairs the MTP work depends on -- and a target run and a draft run write the
+// same stage names. So each run now opens with a header and closes with an end
+// marker, and a file whose previous run left no end marker says so in a
+// warning line rather than pretending the two runs are one.
+namespace {
+// The last newline-terminated line of a file, "" when it is empty or cannot be
+// read. Deliberately dull: read the tail, drop one trailing newline, take what
+// follows the previous one. A file killed mid-line has no trailing newline, so
+// the partial line IS returned -- which is exactly the case the header reports.
+std::string dump_tail_line(const std::string &path) {
+    std::FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return std::string();
+    if (std::fseek(f, 0, SEEK_END) != 0) {
+        std::fclose(f);
+        return std::string();
+    }
+    const long sz = std::ftell(f);
+    if (sz <= 0) {
+        std::fclose(f);
+        return std::string();
+    }
+    const long want = sz < 8192 ? sz : 8192;
+    std::string buf(static_cast<size_t>(want), '\0');
+    std::fseek(f, sz - want, SEEK_SET);
+    const size_t got = std::fread(&buf[0], 1, static_cast<size_t>(want), f);
+    std::fclose(f);
+    buf.resize(got);
+    if (!buf.empty() && buf.back() == '\n') buf.pop_back();
+    const size_t nl = buf.rfind('\n');
+    return nl == std::string::npos ? buf : buf.substr(nl + 1);
+}
+
+// The mode KRK_DUMP_FULL asks for, read once. It lived as a function-static
+// inside dump_row; the header needs the same answer before the first row is
+// written, so it is a file-local function and both callers read one value.
+bool dump_full_mode() {
+    static const bool full = [] {
+        const char *e = std::getenv("KRK_DUMP_FULL");
+        return e && e[0] != '0';
+    }();
+    return full;
+}
+
+// getpid(): unistd.h on POSIX, process.h on Windows. The value only has to
+// separate two runs of the same command, and the tests compare inequality.
+#if defined(_WIN32)
+#include <process.h>
+long long dump_pid() { return static_cast<long long>(_getpid()); }
+#else
+#include <unistd.h>
+long long dump_pid() { return static_cast<long long>(::getpid()); }
+#endif
+} // namespace
+
+void Engine::dump_open() {
+    if (dump_path_.empty() || dump_open_) return;
+    dump_open_ = true;
+    dump_lines_ = 0;
+    const std::string prev = dump_tail_line(dump_path_);
+    std::FILE *f = std::fopen(dump_path_.c_str(), "a");
+    if (!f) return;
+    const long long now = static_cast<long long>(std::time(nullptr));
+    long fsz = -1;
+    if (std::FILE *mf = std::fopen(cfg_.model_path.c_str(), "rb")) {
+        if (std::fseek(mf, 0, SEEK_END) == 0) fsz = std::ftell(mf);
+        std::fclose(mf);
+    }
+    // The warning goes BEFORE the header: a reader that wants "the run that
+    // starts at this line" must not have to skip past a line about the last
+    // one, and a truncation reported after its own run reads as that run's.
+    // starts-with, not compare(0, N, ...): the literals below are the only
+    // place the tag is spelled, and a hard-coded length here would silently
+    // stop matching the day one of them changed.
+    if (!prev.empty() && prev.rfind("# kraken-dump v1 end", 0) != 0) {
+        std::fprintf(f,
+                     "# kraken-dump v1 warn pid=%lld: the previous run in this "
+                     "file left no end marker (truncated or killed)\n",
+                     dump_pid());
+    }
+    std::fprintf(f,
+                 "# kraken-dump v1 begin pid=%lld t=%lld model=%s bytes=%ld "
+                 "ctx=%d chunk=%d mode=%s\n",
+                 dump_pid(), now,
+                 cfg_.model_path.empty() ? "-" : cfg_.model_path.c_str(), fsz,
+                 static_cast<int>(cfg_.n_ctx), static_cast<int>(cfg_.prefill_chunk),
+                 dump_full_mode() ? "full" : "row");
+    std::fclose(f);
+}
+
+void Engine::dump_close() {
+    if (dump_path_.empty() || !dump_open_ || dump_closed_) return;
+    dump_closed_ = true;
+    std::FILE *f = std::fopen(dump_path_.c_str(), "a");
+    if (!f) return;
+    std::fprintf(f, "# kraken-dump v1 end pid=%lld t=%lld lines=%lld\n",
+                 dump_pid(),
+                 static_cast<long long>(std::time(nullptr)),
+                 static_cast<long long>(dump_lines_));
+    std::fclose(f);
+}
+
 void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
                       i64 rows, const f32 *row_scale) {
     if (dump_path_.empty() || rows <= 0) return;
@@ -2947,10 +3076,7 @@ void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
     // trace prints stays finite. That is exactly how the nemotron NaN hid --
     // finite q and k on the printed row, all-NaN attn.out -- and this mode is
     // what makes the difference visible in one run.
-    static const bool full = [] {
-        const char *e = std::getenv("KRK_DUMP_FULL");
-        return e && e[0] != '0';
-    }();
+    const bool full = dump_full_mode();
     i64 row0 = rows - 1;
     if (const char *rs = std::getenv("KRK_DUMP_ROW")) {
         const long long v = std::atoll(rs);
@@ -3014,6 +3140,7 @@ void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
                      static_cast<long long>(bad_rows),
                      static_cast<long long>(first), peak, rms);
         std::fclose(f);
+        dump_lines_++;
         return;
     }
     std::fprintf(f, "%s L%02d n=%lld", what, layer, static_cast<long long>(rows));
@@ -3021,6 +3148,7 @@ void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
         std::fprintf(f, " %.7g", vals[static_cast<size_t>(i)]);
     std::fputc('\n', f);
     std::fclose(f);
+    dump_lines_++;
 }
 
 void Engine::trace_rows(const char *what, i32 layer, const void *buf,
@@ -7727,6 +7855,11 @@ bool Engine::generate_speculative_head(const GenerateParams &p, GenerateResult *
     expert_phase(ExpertCache::PhasePrefill);
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            *prefill_ms = prefill_timer.ms();
+            return true;
+        }
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
@@ -12881,6 +13014,11 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
     expert_phase(ExpertCache::PhasePrefill);
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            *prefill_ms = prefill_timer.ms();
+            return true;
+        }
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
@@ -13332,6 +13470,11 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
     expert_phase(ExpertCache::PhasePrefill);
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            *prefill_ms = prefill_timer.ms();
+            return true;
+        }
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
@@ -13342,6 +13485,11 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         }
     }
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            *prefill_ms = prefill_timer.ms();
+            return true;
+        }
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
@@ -13684,6 +13832,11 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
     expert_phase(ExpertCache::PhasePrefill);
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            *prefill_ms = prefill_timer.ms();
+            return true;
+        }
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
@@ -14192,6 +14345,32 @@ void Engine::expert_phase(ExpertCache::Phase p) {
     if (draft_) draft_->model_.experts().set_phase(p);
 }
 
+// ---- cooperative cancellation ------------------------------------------------
+//
+// Not a separate flag in the decode loop: both helpers are read from the points
+// where the loop can spend real time -- once per prefill chunk and once per
+// generated token (inside TokenEmitter::accept, which every decode path already
+// funnels through). Checking only in the token loop would leave a 100k-token
+// prefill running to the end for a client that hung up two seconds in.
+bool Engine::cancel_requested(const GenerateParams &p) const {
+    return p.cancel && p.cancel->load(std::memory_order_relaxed);
+}
+
+// Records a run stopped by the caller DURING PREFILL (the decode loops stop
+// through TokenEmitter::accept instead, so this never double-closes a stream).
+// `held` is how many prompt rows the KV actually received; the cursor is set to
+// exactly that, so a rollback-based prefix reuse after a cancelled run still
+// describes rows that exist. The finish reason is FinishStop because OpenAI has
+// no "cancelled" reason -- the distinguishing fact is GenerateResult::cancelled.
+void Engine::mark_cancelled(const GenerateParams &p, GenerateResult *res, i64 held) {
+    res->cancelled = true;
+    res->finish = FinishStop;
+    kv_pos_ = std::max<i64>(0, held);
+    p.sink.emit(nullptr, -1, true);
+    KRK_DEBUG("run cancelled by the caller after %lld prompt row(s) and %d generated token(s)",
+              static_cast<long long>(kv_pos_), res->generated);
+}
+
 bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     KRK_TRACE_COMP("generate");
     if (!be_ || n_vocab_ <= 0) return false;
@@ -14359,6 +14538,11 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     const Timer prefill_timer;
     for (i64 i = res->reused_tokens; i < static_cast<i64>(ids.size());
          i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            res->prefill_ms = prefill_timer.ms();
+            return true;
+        }
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());

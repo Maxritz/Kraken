@@ -1,7 +1,9 @@
 # Remaining work, split by what it waits on
 
-Status 2026-10-31, `main` = `404d870` (PR #87 merged). Gate at that commit:
-**7344/7344 checks, 172 groups, tool 18/18, proof 17/17, exit 0**.
+Status 2026-10-31, `main` = `33189b5` (PR #88 merged). Gate on this branch:
+**7401/7401 checks, 175 groups, tool 18/18, proof 17/17, exit 0**, baseline
+re-recorded at `2026-10-31T15:34:15Z` (three groups are new: `test_dump_identity`,
+`test_cancel_and_prefix`, `test_http_listener_lifetime`).
 
 This file indexes what is still open. It replaces the "what is left" paragraph in
 [PLAN-mtp-and-prefill.md](PLAN-mtp-and-prefill.md), which remains the record of
@@ -131,94 +133,206 @@ tests the product promise**; everything else tests machinery.
 
 ## B. Waits on code and a measurement here
 
-### B1 -- CPU GEMM: the production kernel is at 40 % of its own instruction mix
+### B1 -- CPU GEMM: **measured, no legal win; the kernel stays wsc8**
 
-This is the item that decides the throughput target (200+ tok/s prefill, 7-8
-tok/s decode, 30B-A3B, 4-core AVX-512). The measurement is already in the tree
-and it is unambiguous:
+Status 2026-10-31. The premise this item was written on -- "the production kernel
+is at 40 % of V1" -- is **wrong for this host**, and the correction is the first
+result:
 
-| what | GMAC/s | of V1 |
-|---|---:|---:|
-| production q8_0 GEMM, 768x2048x512, one thread (GEMM bench) | 32.2 | **40 %** |
-| the same kernel inside the ablation, its own L0 | 24.54 | 30 % |
-| V1 -- the exact instruction mix it ships, clean harness | 78.2-80.6 | 100 % |
+* `32.2 GMAC/s` is what the **ablation harness** reports for its own L0 arm, i.e.
+  the no-table `dot_q8_0_q8_x8`, not what the engine calls. The engine has called
+  the 16-lane scale-table kernel (`dot_q8_0_q8_wsc8`) since the table landed.
+* In `kraken-q80-gemm-bench` on this host, same process, same shape
+  (768x2048x512, nc=128, best of five, four runs): **wsc8 48.1-49.1 GMAC/s**
+  against **x8 34.0-35.7**. The shipping kernel is therefore at **~60 % of V1**,
+  not 40 %.
 
-The same kernel reads 24.54 and 32.2 in two harnesses -- 1.3x apart, which is why
-the first step re-baselines in one process. The 2.5x to V1 is a **kernel
-implementation** gap, not an instruction-mix gap: the same mix runs 2.5x faster
-when the harness is clean. The ablation prices the two big rungs at **+34.5 %**
-(constant weight scale, 33.01) and **+24.4 %** (integer accumulate, 30.54) --
-and both are marked WRONG, because each is a *format* change, which A6 closed.
-So they price work that is not shippable; the shippable target is the 2.5x
-between the production kernel and its own mix.
+| kernel | r1 | r2 | r3 | r4 |
+|---|---:|---:|---:|---:|
+| x8, no table (the pre-change kernel) | 33.99 | 35.69 | 34.05 | 34.49 |
+| **wsc8 16-lane tables (SHIPS)** | **48.70** | **48.95** | **48.12** | **49.05** |
+| pv8 pair table (the one remaining repack idea) | 44.56 | 45.87 | 44.47 | 45.60 |
+| wsc8 + tree reduce (changes the sum order) | -- | 47.11 | 46.14 | 49.01 |
 
-**Steps, in this order:**
+**pv8 was the last shippable idea and it lost.** It cut the per-(row, block pair)
+scale chain from five uops to three by hoisting the weight row's two f16 scales
+into a compact table, which is precisely the "repack the scale path" family the
+plan pointed at. It is **byte-identical to x8** on every cell
+(`identical: x8 vs pv8 yes`, every run) and it is **7-9 % slower than the kernel
+it would replace**, because the loop was never bound by those five uops: at this
+shape the activation load, the masked sign flip, `vpdpbusd`, `vcvtdq2ps` and
+`vfmadd` are the floor (5 uops / 64 MACs), and pv8 adds a table load to that
+floor while removing uops that were already hidden behind the pair loop.
 
-1. **Re-run the ablation on this node** (`kraken-q80-ablate`) and record L0..L7
-   in one process, so the baseline is current. *Done when:* the table is in
-   GEMM-PERF-WALL.md with the date and the host.
-2. **Diff the production kernel against the V1 harness** for one shape: which
-   ops exist in production that the harness does not have, and which is dominant.
-   *Done when:* each extra op is attributed a GMAC/s cost by removing it in an
-   ablation rung -- the same method that produced the L-table.
-3. **Fix the single largest term.** *Done when:* the shape moves >= 10 % with
-   `--prefill-hash` identical and `KRK_CPU_DOT_INT8=0` still exact.
-4. **Re-project, do not assume:** `tok/s = GMAC/s(shape) / (active MAC/token)`.
-   At 32.2 GMAC/s a 30B-A3B-class token (~3 GMAC) is ~10 tok/s single-thread;
-   the target needs ~4x on the kernel plus the core count. *Done when:* the
-   projection, its inputs and the measured numbers are one table.
+The two rungs that DO pay are **format-class** changes, and A6 closed that door:
+L2 (constant weight scale) 135 % of L0 and L7 (integer accumulate) 124 %, both
+marked WRONG because each is a different arithmetic than the file's.
 
-**Cost:** 2-3 sessions; the first step is an afternoon and it either finds a
-dominant term or records that the gap is spread out (also a result).
+**Disposition.** `src/quant.cpp` is unchanged; the shipping kernel is wsc8 with
+the x8 fallback and the runtime VNNI dispatch. pv8's kernel and its two table
+builders were **moved out of the library into `tools/bench_q80_gemm.cpp`**, where
+the four-column comparison and the byte-identity check reproduce the result; a
+kernel that was measured and rejected does not belong in the shipped path. The
+test suite keeps the x8-vs-wsc8 byte-identity arm (the two kernels that ship) and
+no longer references pv8: a suite that asserts something about a candidate that
+is not in the build is testing nothing.
+
+*Done when* (restated, and now true): the kernel's distance to its own ceiling is
+measured on this host, every remaining repack idea is either measured worse or
+classified as a format change, and the file the engine calls is the file the
+numbers are about.
+
+**What this means for the target.** Do the arithmetic with the number this node
+measures, not the one the plan assumed. A 30B-A3B-class token is ~3 GMAC; at
+48-49 GMAC/s that is **~16 tok/s of prefill per core**, so four cores project to
+**~64 tok/s**, not 200. The kernel is at the V1 mix ceiling (see
+[GEMM-PERF-WALL.md](GEMM-PERF-WALL.md), "The prefill GEMM is at its own
+ceiling"), so no legal kernel change closes the 3x: it needs a format whose scale
+group is longer than 32 by construction (a format decision, A6-adjacent) or
+hardware with AMX-class MACs. Stating the projection is the point of B1.4; a
+projection that assumed the 40 % premise would have promised 300.
 
 ### B2 -- The server runs one generation at a time
 
-`src/server.cpp` (508 lines): connections are concurrent, **generate() is
-serialised by one mutex**; there is a single-session linear prefix reuse
-(`reusable_prefix`, "this is not an approximation of the prefix, it IS the
-prefix") and no radix tree, no cancellation, no continuous batching.
+`src/server.cpp`: connections are concurrent, **generate() is serialised by one
+mutex**; prefix reuse is a single-session linear record and there is no
+continuous batching.
 
-**Order, smallest first:**
+**B2.1 cancellation -- DONE.** `GenerateParams::cancel` is a
+`const std::atomic<bool>*` the loops read once per prefill chunk and once per
+generated token. The decode side is one check inside
+`TokenEmitter::accept`, so all five decode paths (plain, draft-head, MTP, the two
+DFlash ones) inherit it instead of growing a sixth copy of the stop handling; the
+prefill side is one guard at the top of each chunk loop, which also sets the KV
+cursor to the rows that were actually written so a cancelled prefill cannot leave
+a cache claim above them. `GenerateResult::cancelled` distinguishes "the caller
+hung up" from "the model ended", because `finish` stays `FinishStop` (OpenAI has
+no cancelled reason).
 
-1. **Cancellation** -- a flag the token loop checks, so a dropped connection
-   stops the work instead of finishing it. *Done when:* a test cancels mid-decode
-   and the server reports the partial token count.
-2. **Prefix reuse across requests** -- the linear prefix becomes a tree keyed by
-   token ids, with the KV cut back to the longest common prefix. *Done when:*
-   two requests sharing the first N tokens prefill only the remainder, measured
-   by `[stats ] prefill` on both.
-3. **Continuous batching** -- several sequences in one forward. This is the one
-   that needs engine work (per-sequence KV slots, one scheduler). *Done when:*
-   4 concurrent requests hold aggregate tok/s above one-at-a-time, with each
-   response identical to its solo run.
+The server raises the flag from the only place a disconnect is observable: a
+failed SSE write in `stream_cb`. A client that closes its tab now stops the
+decode at the next token instead of paying for the rest of `max_tokens` into a
+dead socket. `note_kv` drops the prefix record on a cancelled run: the KV then
+holds a *mixture* of this prompt's first rows and the previous run's tail, and a
+record that claimed otherwise would answer from the wrong row.
 
-### B3 -- A trace file carries no identity
+*Test:* `test_cancel_and_prefix` arms 1-2 (24 checks). A sink trips the flag on
+the third delta: `generated == 3`, `cancelled`, and the partial text is a prefix
+of the uncancelled run. A flag raised before the call: `generated == 0`,
+`kv_pos() == 0`.
 
-`Engine::dump_row` opens the dump path with `"a"` per call: no header, no model
-or request id, no end marker, and no truncation report. Two runs -- or a target
-and a drafter -- append into one file and cannot be told apart afterwards. Every
-"A/B on the same prompt" comparison in this project depends on reading those
-files.
+**B2.2 prefix reuse across requests -- DONE, as the run and not the prompt.** The
+record was the last request's *prompt* ids, although the KV holds its *generated*
+rows too. It is now prompt ids + accepted tokens cut to `engine_->kv_pos()`, which
+is exactly the set of rows that exist (the cut matters: a decode step writes the
+row for the token it consumed, so after G tokens the cache holds prompt + G - 1
+rows and the last token has no row). A second chat turn -- whose prompt is the
+first turn's prompt plus that turn's answer -- now prefills only the new
+question. The response reports it as `usage.prompt_tokens_details.cached_tokens`.
 
-**How:** one header line per run (model path + size + mtime, chunk, ctx, the
-dump mode), one line per stage as now, an explicit end marker with the line
-count, and a refusal to append to a file whose last run did not end.
+*Why not a radix tree (the plan's "how", not its done-when).* With **one** KV
+region the longest prefix a request can reuse is the one physically in the cache,
+and the linear record already finds every token of it; a tree only beats a linear
+record when several branches are kept alive at once, which needs per-sequence KV
+slots -- that is B2.3, and the tree should land with it, not before it. The
+done-when the plan set is met and measured: the second request's `cached_tokens`
+covers rows the first request generated.
 
-*Done when:* two runs into one file are separable by header, and a truncated run
-is detected (a test writes half a file and reads it back).
+*Test:* `test_cancel_and_prefix` arm 3. It also measures the fixture in token ids
+(the tiny model writes arbitrary bytes, so the text trip through the tokenizer
+loses the tail) and asserts the claim equals the longest prefix the record and
+the new prompt share -- no over-claim, nothing left on the table.
 
-### B4 -- TSAN: the listen descriptor's lifetime
+**B2.3 continuous batching -- OPEN, and it is an engine change.** The enabling
+interface exists: `AttnDesc::row_pos` / `row_kv_base` are implemented in the CPU
+attention path and pinned by `kraken-attn-multiseq` (per-row position and per-row
+KV region for rows from different sequences). What is missing:
 
-Reported: a race on the listen descriptor, and a stale sanitizer baseline. An
-atomic descriptor alone does not settle close/reuse ownership.
+1. `Backend::rope` takes a scalar `pos0` -- a batch whose rows are at different
+   positions needs the per-row table, and that is a new backend entry point with
+   a capability query, because the HIP/NPU backends cannot silently inherit it.
+2. `kv_append` still writes at `pos0 + t` and ignores `row_kv_base` (both the f32
+   and the int8 arm), so a batched decode would overwrite another sequence's row.
+3. The engine has one `kv_pos_` and one KV region; batching needs N regions
+   (`region = layer_stride * n_layer`, base per row) and a per-slot cursor.
+4. The server needs a scheduler that admits, prefills one at a time and
+   decode-batches the active set, with per-sequence sampler state.
 
-**How:** design the shutdown lifetime first (who owns the fd, who may close it),
-then verify under `-fsanitize=thread` with a repeated start/stop test.
+Items 1 and 2 are small and testable on their own (`kraken-attn-multiseq` already
+proves the contract for attention). Item 3 is the one that decides whether this
+ships for MLA models too: the dense/GQA path is row-independent, but
+`mla_attention`/`mla_shared_attention*` and the compressed/indexer variants each
+own their cache addressing, so a batched MLA decode is a separate piece of work.
+*Done when:* 4 concurrent requests hold aggregate tok/s above one-at-a-time with
+each response identical to its solo run.
 
-*Done when:* the sanitizer is clean for 100 start/stop cycles and the baseline
-file is re-recorded.
+### B3 -- A trace file carries no identity -- DONE
 
----
+`Engine::dump_row` appended stage lines with no header, no run identity and no
+end marker, so two runs in one file could not be told apart -- and every "A/B on
+the same prompt" comparison in this project reads those files.
+
+**What the file carries now**, one run per block:
+
+```
+# kraken-dump v1 warn pid=<pid>: the previous run in this file left no end marker ...
+# kraken-dump v1 begin pid=<pid> t=<unix> model=<path> bytes=<size> ctx=<n> chunk=<n> mode=<full|row>
+<stage lines as before; in KRK_DUMP_FULL the %s L%02d N=... line>
+# kraken-dump v1 end pid=<pid> t=<unix> lines=<stage lines this run wrote>
+```
+
+The `warn` line appears only when the file's last line is not an end marker, i.e.
+when the previous run was killed or truncated, and it names the pid that left the
+file in that state. Every marker is `#`-prefixed, so the existing readers (which
+skip on the `<name> L<nn> n=` prefix) are unaffected. `dump_open()` runs at init,
+`dump_close()` is the first statement of `shutdown()`, and both are idempotent.
+
+*Test:* `test_dump_identity`, **17/17** -- three runs into one file: 1 header/1
+end per run, `lines=` equal to the stage lines it encloses (36, then 36 for the
+second run while the file holds 72), a truncated file detected by exactly one
+warning whose pid is live and positive, and the cut run not counted as complete.
+
+### B4 -- TSAN: the listen descriptor's lifetime -- DONE
+
+The defect, confirmed: `stop()` computed `listen_fd_` (a plain `int`) and joined
+the loop on `running_`, then `shutdown()`+`close()`d the descriptor, while
+`run()`'s accept loop read `listen_fd_` **once per iteration**. That is a data
+race on the field, and a worse hazard underneath it: the number could be closed
+by one thread and handed by the kernel to another thread's `socket()` before the
+accept loop loaded it again, so `accept()` could take a connection from a
+different subsystem entirely.
+
+**The ownership rule now in the code.** The descriptor belongs to the thread
+inside `run()` from the moment it starts until it returns; that thread is the
+only one that closes it after `listen()`. `stop()` raises a flag and returns --
+it never touches the number, so there is no window in which it acts on a
+descriptor somebody else already closed. The loop waits for readability with a
+bounded `poll()` (100 ms) instead of blocking in `accept()`, so it notices the
+flag without needing the socket shut down underneath it; the listener is
+non-blocking so a reset connection between `poll()` and `accept()` cannot park
+it, and `EAGAIN` is a `continue`. The close itself is a
+`compare_exchange_weak(fd, -1)`, so of `run()`'s exit path and `stop()`'s
+"nobody ever ran" path exactly one closes it. Accepted sockets are explicitly
+put back into blocking mode rather than relying on neither POSIX nor Winsock
+documenting inheritance the same way.
+
+*Verification, with the negative control.* `tools/tsan_http_listen.cpp` drives 12
+start/stop cycles with four concurrent clients and `stop()` racing the accept
+loop, built with `-fsanitize=thread` (`target kraken-tsan-http-listen`).
+
+| build | TSan result |
+|---|---|
+| pre-B4 `src/http.cpp` (`git show 33189b5:src/http.cpp`) | **data race**: `stop()` http.cpp:510 vs `run()` http.cpp:481 |
+| post-B4 `src/http.cpp` | **clean**, three runs, 39-46 of 48 responses answered |
+| `test_http_listener_lifetime` | **15/15**, three consecutive runs |
+
+The harness was written against the old header first and it reported the race on
+the `listen_fd_` write/close against the `accept()` read -- that is the negative
+control, not an argument. The in-suite group covers the same properties without a
+sanitizer: the loop returns after `stop()` from another thread, the port binds
+again (so the descriptor was closed exactly once), `stop()` before `run()` closes
+it, a second `stop()` is a no-op, and `run()` after `stop()` returns instead of
+accepting on a dead number.
 
 ## C. Closed -- do not reopen
 
@@ -233,21 +347,25 @@ file is re-recorded.
 
 ## The list, in the order it should run
 
-1. **A1** -- run the spec gate on a real `qwen4exp` trunk + head; move `qwen4-mtp`. *(needs files)*
-2. **A2** -- same for `deepseek4` + dspark; move `deepseek4-dspark`. *(needs files)*
-3. **A7** -- the 30B-A3B run on 16/24/32 GB of RAM; the only end-to-end test of the product promise. *(needs a file and a box)*
-4. **B1.1** -- re-run `kraken-q80-ablate`, record L0..L7 on this node. *(now)*
-5. **B1.2** -- attribute the 2.5x between the production kernel and V1 op by op. *(now)*
-6. **B1.3** -- fix the dominant term; gate on `--prefill-hash` identity. *(now)*
-7. **B1.4** -- the projection table: GMAC/s -> tok/s at 2 and 4 cores, against 200/7-8. *(now)*
-8. **B3** -- trace identity and truncation reporting; it is what every A/B above is read through. *(now, small)*
-9. **B2.1** -- server cancellation. *(now)*
-10. **B2.2** -- prefix reuse across requests. *(now)*
-11. **B2.3** -- continuous batching. *(now, largest)*
-12. **B4** -- TSAN lifetime. *(now)*
-13. **A3** -- DFlash2 head on its own pairing, then upstream logits. *(needs files)*
-14. **A5** -- OLMoE against an independent oracle. *(needs a file and an oracle run)*
-15. **A4** -- `gemma2` (and the vision rows, if wanted) on real files. *(needs files)*
+Status is per bucket as of 2026-10-31.
 
-Items 1-3 and 13-15 cannot be started in this workspace; 4-12 can, and 8 is the
-cheapest one that makes everything else measurable.
+| # | step | state |
+|---|---|---|
+| 1 | **A1** -- spec gate on a real `qwen4exp` trunk + head; move `qwen4-mtp` | *needs files* |
+| 2 | **A2** -- same for `deepseek4` + dspark; move `deepseek4-dspark` | *needs files* |
+| 3 | **A7** -- the 30B-A3B run on 16/24/32 GB; the only end-to-end test of the promise | *needs a file and a box* |
+| 4 | **B1.1-B1.2** -- L0..L7 recorded on this node, gap attributed op by op | **done** |
+| 5 | **B1.3** -- fix the dominant term | **closed by measurement**: the dominant term is the instruction mix; pv8 (the last repack) is 7-9 % slower. See *B1* |
+| 6 | **B1.4** -- GMAC/s -> tok/s projection | **done** (numbers under *B1*): 48-49 GMAC/s is ~16 tok/s of prefill per core at ~3 GMAC/token, so 4 cores is ~64, and the gap to 200 is arithmetic no kernel change closes |
+| 7 | **B2.1** -- server cancellation | **done**, `test_cancel_and_prefix` |
+| 8 | **B2.2** -- prefix reuse across requests (the record is the run, not the prompt) | **done**, same group |
+| 9 | **B2.3** -- continuous batching | **open**: the four pieces are listed under *B2*; 1-2 are small, 3-4 are the work |
+| 10 | **B3** -- trace identity and truncation reporting | **done**, `test_dump_identity` 17/17 |
+| 11 | **B4** -- TSAN listen-descriptor lifetime | **done**, `kraken-tsan-http-listen` clean, old code reproduces the race |
+| 12 | **A3** -- DFlash2 head on its own pairing, then upstream logits | *needs files* |
+| 13 | **A5** -- OLMoE against an independent oracle | *needs a file and an oracle run* |
+| 14 | **A4** -- `gemma2` (and the vision rows, if wanted) on real files | *needs files* |
+
+**What a session without files can still move:** B2.3, and then only item 3-4 of
+it. Everything else in the table either needs a checkpoint or is closed by a
+measurement that now exists.
