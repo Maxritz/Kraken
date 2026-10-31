@@ -12727,13 +12727,20 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
                           static_cast<f64>(draft_proposed_)
                     : 0.0;
             KRK_INFO("mtp spec: %llu round(s), %llu of %llu proposals kept "
-                     "(%.1f%%), %.2f token(s)/round | propose %.0f ms | verify "
+                     "(%.1f%%), step-1 %llu of %llu (%.1f%%), %.2f "
+                     "token(s)/round | propose %.0f ms | verify "
                      "%.0f ms | snapshot %.0f ms | refeed %.0f ms | block "
                      "experts %.0f ms, %llu of %llu promoted | second forward "
                      "%.0f ms over %llu round(s)",
                      static_cast<unsigned long long>(spec_steps_),
                      static_cast<unsigned long long>(draft_accepted_),
                      static_cast<unsigned long long>(draft_proposed_), rate,
+                     static_cast<unsigned long long>(step1_hits_),
+                     static_cast<unsigned long long>(step1_tries_),
+                     step1_tries_ > 0
+                         ? 100.0 * static_cast<f64>(step1_hits_) /
+                               static_cast<f64>(step1_tries_)
+                         : 0.0,
                      spec_steps_ > 0
                          ? static_cast<f64>(res->generated) /
                                static_cast<f64>(spec_steps_)
@@ -12909,6 +12916,13 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
         timed_decode_steps++;
 
         // ---- pre-check: the target must agree with proposal 0 -------------
+        // Step-1 acceptance is this comparison, and only this comparison: a
+        // round whose chain stopped at d == 0 made no step-1 claim, so it is
+        // counted as neither a hit nor a try.
+        if (d > 0) {
+            step1_tries_++;
+            if (first == prop[0]) step1_hits_++;
+        }
         if (d == 0 || first != prop[0]) {
             if (spec_trace())
                 std::fprintf(stderr,

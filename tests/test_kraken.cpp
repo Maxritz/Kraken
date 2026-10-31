@@ -26186,7 +26186,7 @@ static void test_mtp_hf_spec_chain() {
 
     // One run, greedy, either plain or drafting from `hp`.
     auto run = [&](const std::string &hp, bool spec, std::vector<i32> *out, u64 *acc,
-                   u64 *prop, int *finish, f64 *ms_out) {
+                   u64 *prop, int *finish, f64 *ms_out, u64 *s1h, u64 *s1t) {
         Backend *cpu = make_cpu_backend();
         bool ok = false;
         {
@@ -26218,6 +26218,8 @@ static void test_mtp_hf_spec_chain() {
                 *finish = r.finish;
                 if (acc) *acc = engine.draft_accepted();
                 if (prop) *prop = engine.draft_proposed();
+                if (s1h) *s1h = engine.step1_hits();
+                if (s1t) *s1t = engine.step1_tries();
             }
         }
         delete cpu;
@@ -26233,22 +26235,29 @@ static void test_mtp_hf_spec_chain() {
     u64 acc = 0, prop = 0, bacc = 0, bprop = 0;
     int fin_plain = -1, fin_spec = -1, fin_bad = -1;
     f64 ms_plain = 0, ms_spec = 0, ms_bad = 0;
-    CHECK(run(std::string(), false, &plain, nullptr, nullptr, &fin_plain, &ms_plain),
+    u64 s1h = 0, s1t = 0, b1h = 0, b1t = 0;
+    CHECK(run(std::string(), false, &plain, nullptr, nullptr, &fin_plain, &ms_plain,
+              nullptr, nullptr),
           "the plain greedy run finishes");
-    CHECK(run(head, true, &spec, &acc, &prop, &fin_spec, &ms_spec),
+    CHECK(run(head, true, &spec, &acc, &prop, &fin_spec, &ms_spec, &s1h, &s1t),
           "the drafting run finishes");
     CHECK(!plain.empty(), "the plain run produced tokens");
-    CHECK(run(head_bad, true, &bad_toks, &bacc, &bprop, &fin_bad, &ms_bad),
+    CHECK(run(head_bad, true, &bad_toks, &bacc, &bprop, &fin_bad, &ms_bad, &b1h, &b1t),
           "the control-drafting run finishes");
     std::fprintf(stderr,
                  "[mtp7 ] chain: plain %d finish, %zu token(s); pass-through "
-                 "%d finish, %zu token(s), %llu of %llu kept; live attention "
-                 "%d finish, %zu token(s), %llu of %llu kept\n",
+                 "%d finish, %zu token(s), %llu of %llu kept, step-1 %llu of "
+                 "%llu; live attention %d finish, %zu token(s), %llu of %llu "
+                 "kept, step-1 %llu of %llu\n",
                  fin_plain, plain.size(), fin_spec, spec.size(),
                  static_cast<unsigned long long>(acc),
-                 static_cast<unsigned long long>(prop), fin_bad, bad_toks.size(),
+                 static_cast<unsigned long long>(prop),
+                 static_cast<unsigned long long>(s1h),
+                 static_cast<unsigned long long>(s1t), fin_bad, bad_toks.size(),
                  static_cast<unsigned long long>(bacc),
-                 static_cast<unsigned long long>(bprop));
+                 static_cast<unsigned long long>(bprop),
+                 static_cast<unsigned long long>(b1h),
+                 static_cast<unsigned long long>(b1t));
     // Wall time, printed and NOT gated: this fixture is a two-layer trunk with a
     // one-layer head and an eight-token output, so the number says only which
     // order of magnitude the round overhead is in. The gate lives on the real
@@ -26276,10 +26285,17 @@ static void test_mtp_hf_spec_chain() {
     // target's own token, so a rejection means the chain's first row is wrong.
     CHECK(acc * 2 >= prop,
           "at least half of the proposals are accepted by a pass-through head");
+    // The plan's gate is stated AT STEP 1, and that is a different measurement:
+    // the block's first proposal against the target's own token. A pass-through
+    // head cannot miss it -- if it ever does, the chain's first row is wrong.
+    CHECK(s1t > 0 && s1h == s1t,
+          "every round's first proposal was the target's own token");
     CHECK(bad_toks == plain,
           "a wrong drafter cannot change the text the target verifies");
     CHECK(bprop > 0, "the control head proposed too");
     CHECK(bacc * 2 < bprop, "the control head's proposals are mostly rejected");
+    CHECK(b1t > 0 && b1h * 2 < b1t,
+          "the control's first proposal is usually the wrong token");
 
     std::remove(trunk.c_str());
     std::remove(head.c_str());

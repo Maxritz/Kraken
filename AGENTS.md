@@ -4126,3 +4126,33 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   `sum(per_expert(gate)+per_expert(up)+per_expert(down)) / n_layer` from the
   tensor table (`tools/gguf_tensors.py`), not from the layer-0 field.
 - **A batched decode must resolve only the experts it can KEEP resident, and nothing checked that.** `moe_decode_batch` resolves every routed expert before the first launch, then launches; `ExpertCache::acquire` evicts when the budget cannot hold the routed set, so with a one-slot cache the second resolve hands back the cell the first expert was in. Both experts then multiply ONE expert's weights: finite, plausible, no refusal, and it reaches the sampler. Measured on the synthetic 4-expert fixture: one slot decoded `5 4 5 4 5 4` where a large cache decoded `5 5 4 5 4 5`, and `KRK_MOE_BATCH=0` returned `test_moe_schema_and_laziness` to 32/32 -- that arm is what named the path. Two guards now sit in `moe_decode_batch`: `capacity_slots() >= distinct routed experts` before any acquire (the semantic condition), and all pairwise slice-pointer distinctness after the resolve, 3 slices against 3 slices per expert pair, because a tiered cache can hand expert 2 the cell expert 1 used for a DIFFERENT slice and a same-field comparison misses it -- that shape decoded `5 0 0 0 0 0` at `--expert-cache-slots 1 --expert-warm-mb 64`. Result: 32/32 in a child process and under `KRK_TEST_INPROC=1`, four consecutive runs (suite 3870/3870). `Engine::moe_batch_layers()` / `moe_batch_skips()` expose the counters, and `test_moe_batch_fallback` pins BOTH arms: with 2 experts routed and 1 slot, zero layers batched and the per-expert loop ran; with room for the routed set the batch does compute layers. The roomy arm exists so a guard that refuses unconditionally cannot pass. The general rule: a batch whose members are acquired up front needs a residency guarantee; "the cache will sort it out" is a silent wrong answer, not a fallback.
+- **A speculative round emitted the end token and ran on past it, in all three
+  speculative families.** The plain decode loop tests `next1 == tok_.eos()`
+  *before* `emit.accept`, so the end token is never written. A round writes its
+  accepted proposals in a loop that had no such test, and the proposers
+  disagreed about whether an end-token proposal was legal: the draft-head path
+  breaks on it, the MTP and DFlash paths did not. Measured on the qwen4exp MTP
+  fixture (`test_mtp_hf_spec_chain`): the block proposed `</s>` at position 34,
+  verification agreed, the loop emitted it, and the run produced
+  `8 3 3 3 3 3 3 3 2 3 3 3` where plain greedy produced
+  `8 3 3 3 3 3 3 3` and stopped -- same first eight tokens, three extra after
+  the end, `finish=length` instead of `finish=eos`. Two-sided fix, in **all
+  five** speculative loops (draft-head greedy, MTP greedy, MTP sampled, DFlash
+  greedy, DFlash sampled): proposals drop an end token before they are stored
+  (`draft_proposed_` no longer counts them), and the accept loops end the run
+  with `FinishEos` if one ever arrives anyway. The group checks the `finish`
+  code, not only the text: the text comparison alone passed the moment the
+  trailing `2` happened to be trimmed. General rule: a verification loop's
+  emission is the plain loop's emission, and every stop condition the plain
+  loop has -- the end token first among them -- has to exist in the round.
+- **Step-1 acceptance is not `draft_accepted/draft_proposed`.** The plan gates
+  the MTP head on "acceptance ≥ 0.6 at step 1", and the aggregate ratio cannot
+  answer it: it mixes steps 2..k, where a chain that stopped early is not
+  evidence about the head, and a pre-check miss is counted as a rejected
+  proposal in some paths. `Engine::step1_hits()/step1_tries()` count one thing
+  -- a round that proposed at all, and whether proposal 0 equalled the target's
+  own greedy token -- and the `mtp spec:` line prints it. On the synthetic
+  fixtures the two arms separate as they should: **3 of 3** for the pass-through
+  head, **0 of 9** for the live-attention control that proposes the wrong token
+  on purpose. A counter that just returned `hits == tries` would pass the first
+  arm and fail the second, which is why the group asserts both.

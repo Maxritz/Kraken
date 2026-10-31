@@ -89,7 +89,9 @@ next token for **≥ 60 %** of cells on greedy text. That is the only cheap orac
 a wrong pairing or a wrong norm runs, drafts and is rejected every time.
 
 **1.7 — Proposer + the speed gate** (½ session) — **done on the synthetic gate,
-speed half BLOCKED on an artifact** (see 1.7's gate below)
+speed half BLOCKED on an artifact** (see 1.7's gate below). The measurement
+itself is no longer prose: `scripts/mtp_spec_gate.sh` runs both arms and fails
+on either half.
 `--mtp-spec` with per-step acceptance and wall time. The chain is a buffer, not
 an API change: `Engine::mtp_chain_` holds `[n_lane * n_embd]`, the head's forward
 copies it in when it is proposing from its own previous step and writes it back
@@ -98,10 +100,13 @@ after the final mixer, and the proposer asks for it on `d > 0`.
 decode on the same prompt. A drafter that is accepted but costs more than it
 saves is a regression with a good story.
 
-**1.8 — Rows, docs, suite** (½ session)
-`qwen4-mtp` becomes `Yes` (Draft role), `deepseek4-dspark` follows only if its
-own attention is wired (same interface, different block — reuse, do not share
-code); new group `test_mtp_head_qwen4`; baseline re-recorded.
+**1.8 — Rows, docs, suite, and the measurement that is left** (½ session)
+`qwen4-mtp` becomes `Yes` (Draft role) **on evidence from a real artifact**,
+`deepseek4-dspark` follows only if its own attention is wired (same interface,
+different block — reuse, do not share code); the groups exist; the baseline is
+re-recorded. The half that cannot be done here is the run: no checkpoint is in
+this workspace, so the row stays `Partial` and the run is the gate. Turns into
+one command once a file is on disk — see *1.8's runbook* below.
 
 **Total:** 5-7 sessions, of which 1.6 is 60 % of it.
 
@@ -116,7 +121,7 @@ code); new group `test_mtp_head_qwen4`; baseline re-recorded.
 | 1.5 | **done** | `include/krk/mtp_forward.hpp` + `src/mtp_head.cpp` (`mtp_host_prefix_load`, `mtp_dense_prefix`), group `test_mtp_head_prefix`: 18/18 |
 | 1.6 | **done** | `Engine::mtp_hf_block_forward` + `mtp_attn_body` (the attention body factored out of the llama-style block so the two shapes cannot drift); group `test_mtp_hf_block_qwen4`: 17/17 |
 | 1.7 | **done** (synthetic); speed unmeasured | `mtp_chain_` + `from_chain` on both block forwards; `--mtp-spec` no longer refuses this head; group `test_mtp_hf_spec_chain`: 16/16 — identical text to plain greedy on 8/8 tokens, **7 of 12** proposals kept by the pass-through head, **0 of 36** by the live-attention control. Found and fixed on the way: a round emitted the block's own EOS proposal and ran on past it |
-| 1.8 | open | the arch row is still `Partial` (runs, predicts and now chains; unmeasured on a real artifact); baseline re-recorded at 171 groups |
+| 1.8 | **partly** | step-1 acceptance is reported by the engine (`step1_hits()/step1_tries()`) and gated by the group; `scripts/mtp_spec_gate.sh` turns the real check into one command; the arch row stays `Partial` because no checkpoint has been run; baseline re-recorded at 171 groups |
 
 **1.5's gate in this file was wrong, and is corrected here.** It read "scaling
 `R` by 0.5/2 scales `h` linearly". It cannot: the prefix RMS-normalises `h`
@@ -243,6 +248,57 @@ One fixture trap, recorded so it is not re-learned: the trunk and the head were
 both built as `kraken-mtp-hf-spec.gguf`, and the head overwrote the trunk, which
 the loader then refused with "missing core geometry" for a file it had just
 written. Test fixtures that share a directory need distinct names.
+
+**1.8's runbook: what the real artifact has to produce.**
+
+The gate is two numbers and both now come out of the run. The engine reports
+step-1 acceptance in its own summary line, because "acceptance ≥ 0.6 at step 1"
+was unanswerable from `draft_accepted/draft_proposed` — that ratio mixes steps
+2..k, where a short chain is not evidence about the head:
+
+```
+[info ] mtp spec: 5 round(s), 7 of 12 proposals kept (58.3%), step-1 3 of 3
+        (100.0%), 2.40 token(s)/round | propose ... | verify ... | ...
+```
+
+`Engine::step1_hits()` / `step1_tries()` expose the same two counts, and
+`test_mtp_hf_spec_chain` pins them on both arms: **3 of 3** for the pass-through
+head, **0 of 9** for the live-attention control. A counter that always read
+`hits == tries` would pass the first and fail the second, which is why both are
+asserted.
+
+The measurement itself:
+
+```
+scripts/mtp_spec_gate.sh <trunk.gguf> <mtp.gguf> 128 "<prompt>"
+```
+
+It runs the same prompt, greedy, one seed, with and without `--mtp --mtp-spec`,
+parses `[stats ] decode ... tok/s` from both runs and the `step-1 H of T (P%)`
+field from the spec run, prints the ratio and exits non-zero if either half of
+the gate fails. It is checked here against a stand-in binary that prints canned
+stats: the passing case (step-1 3/3, 120 against 60 tok/s) exits **0**, the
+failing one (step-1 2/9, 60 against 120) exits **1** and names both halves. What
+it cannot do is prove a real head accepts; that needs the 889 MB
+`mtp-q2_0.gguf` (or any `qwen4exp-mtp` set) and a matching `qwen4exp` trunk.
+
+What to record when it runs, in this file, before the arch row moves:
+
+| field | where it comes from |
+|---|---|
+| step-1 acceptance, hits/tries | the `mtp spec:` line |
+| proposals kept, aggregate | the same line |
+| tokens/round | the same line |
+| decode tok/s plain vs `--mtp-spec` | `[stats ] decode` in both logs |
+| the text, both arms | must be identical under `--greedy`, as the synthetic group demands |
+| the head's tensors as loaded | `--mtp-probe`'s log line, so a schema mismatch is visible before any speed number |
+
+If step-1 acceptance lands under 60 % on a real head, the causes are ordered by
+what this project has already measured: the paired-token convention (the head is
+fed trunk residual `i` and token `i+1`, and an off-by-one pairing drafts a token
+that is always one behind), the per-stream `hnorm` switch (`KRK_MTP_HNORM`), and
+the dense-vs-indexed attention choice of 1.6(b). All three are switches or one
+line in the loader, and all three were built to be testable in isolation.
 
 ---
 

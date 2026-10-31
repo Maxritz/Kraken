@@ -521,6 +521,14 @@ public:
     f64 draft_sampled_expected() const { return draft_sampled_e_; }
     u64 draft_sampled_n() const { return draft_sampled_n_; }
     u64 spec_steps() const { return spec_steps_; }
+    // Step-1 acceptance: of the rounds that proposed at all, how many had the
+    // block's FIRST proposal equal the target's own greedy token. This is the
+    // number the plan's gate is stated in ("acceptance >= 0.6 at step 1"), and
+    // it is not the same as draft_accepted()/draft_proposed(): the aggregate
+    // mixes in steps 2..k, where a shorter chain this round is not evidence
+    // about the head.
+    u64 step1_hits() const { return step1_hits_; }
+    u64 step1_tries() const { return step1_tries_; }
 
     // KV tier telemetry, summed over the K and V planes. The counters existed
     // in KvTierCache but nothing read them after startup, so a run could page
@@ -1103,6 +1111,7 @@ private:
     f64 draft_sampled_e_ = 0.0;
     u64 draft_sampled_n_ = 0;
     u64 spec_steps_ = 0;
+    u64 step1_hits_ = 0, step1_tries_ = 0;
 
     i64 q_dim_ = 0, kv_dim_ = 0, n_embd_ = 0, n_ff_ = 0, n_vocab_ = 0;
     // Row width of the attention query buffer: Qwen3.5 packs a per-head output
