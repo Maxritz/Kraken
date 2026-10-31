@@ -40,7 +40,9 @@
 #include <cstring>
 #include <ctime>
 #include <vector>
+#include <algorithm>
 #include "krk/common.hpp"
+#include "krk/quant.hpp"
 
 using krk::f32; using krk::i8; using krk::i64; using krk::u8; using krk::u16; using krk::u32;
 static double now_s(){ timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+1e-9*t.tv_nsec; }
@@ -167,13 +169,66 @@ static void v3(i64 n_out){
     }
 }
 
-template <typename F> static void run(const char* nm, F f, i64 n_out){
-    double best=1e30;
-    for(int r=0;r<3;r++){ double t0=now_s(); f(n_out); double dt=now_s()-t0; if(dt<best)best=dt; }
-    std::printf("%-34s %7.2f ms  %6.2f GB/s\n",nm,best*1e3,(double)n_out*WS/best/1e9);
+// V4: V0's algorithm with the four byte-plucks replaced by two u16 loads.
+// Same scale bytes, same cache line, same arithmetic order -- only the way the
+// 32-bit f16 pair is assembled changes. This is the arm that tests whether the
+// win V2/V3 show is the SCALE TABLE (extra traffic, extra memory) or just the
+// uop chain that assembles it (no traffic, no memory).
+__attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
+static void v4(i64 n_out){
+    const __m512i kl = _mm512_setr_epi32(0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1);
+    for(i64 o=0;o+8<=n_out;o+=8){
+        __m512 acc[8]; for(int c=0;c<8;c++) acc[c]=_mm512_setzero_ps();
+        for(i64 b=0;b+2<=NB;b+=2){
+            const i64 p=b/2;
+            const __m512i xv=_mm512_loadu_si512((const void*)(XQ+b*32));
+            const f32 sx0=XD[b], sx1=XD[b+1];
+            for(int c=0;c<8;c++){
+                const u8* wp=W+(o+c)*WS+p*68;
+                const u32 s01=(u32)(*(const u16*)(wp)) |
+                              ((u32)(*(const u16*)(wp+34))<<16);
+                const __m128 d2=_mm_cvtph_ps(_mm_cvtsi32_si128((int)s01));
+                const __m128 dd=_mm_mul_ps(d2,_mm_setr_ps(sx0,sx1,0,0));
+                const __m512 sc=_mm512_permutexvar_ps(kl,_mm512_broadcast_f32x4(dd));
+                const __m256i lo=_mm256_loadu_si256((const __m256i*)(wp+2));
+                const __m256i hi=_mm256_loadu_si256((const __m256i*)(wp+36));
+                const __m512i wv=_mm512_inserti64x4(_mm512_castsi256_si512(lo),hi,1);
+                const __mmask64 ng=_mm512_cmp_epi8_mask(wv,_mm512_setzero_si512(),_MM_CMPINT_LT);
+                const __m512i mag=_mm512_mask_sub_epi8(wv,ng,_mm512_setzero_si512(),wv);
+                const __m512i xb=_mm512_mask_sub_epi8(xv,ng,_mm512_setzero_si512(),xv);
+                const __m512i iv=_mm512_dpbusd_epi32(_mm512_setzero_si512(),mag,xb);
+                acc[c]=_mm512_fmadd_ps(_mm512_cvtepi32_ps(iv),sc,acc[c]);
+            }
+        }
+        for(int c=0;c<8;c++) OUT[o+c]=_mm512_reduce_add_ps(acc[c]);
+    }
 }
 
+// V5: the kernel that actually SHIPS (dot_q8_0_q8_r1xN, the engine's decode
+// path). The arms above are copies kept inside this tool; this one calls into
+// quant.cpp, so a change to the shipped pluck cannot leave the tool measuring
+// an older body than the one users run.
 __attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
+static void v5_shipped(i64 n_out){
+    const int kc = krk::q8_0_gemv_width();
+    for(i64 o=0;o+kc<=n_out;o+=kc)
+        krk::dot_q8_0_q8_r1xN(W+o*WS, WS, XQ, XD, NIN, NIN, OUT+o, 1, kc);
+}
+
+// ---- the measurement harness ----------------------------------------------
+// Every arm is run once per ROUND, in an order that rotates with the round, and
+// the number reported is the MEDIAN of the rounds. Both halves matter on this
+// box: the weights are 71 MB against a 54 MB L3, so the first arm of a process
+// measures a cold cache (measured: V0 10.10 GB/s cold against 18.26 warm in the
+// same run), and a fixed order would charge that to whichever arm ran first.
+// The earlier fixed order did exactly that, which is why its V0/V2/V4 verdicts
+// disagreed between runs.
+static double median(std::vector<double> v){
+    std::sort(v.begin(), v.end());
+    const size_t n=v.size();
+    return n==0 ? 0.0 : (n&1 ? v[n/2] : 0.5*(v[n/2-1]+v[n/2]));
+}
+
 int main(int argc,char**argv){
     NIN=argc>1?atoll(argv[1]):4096; const i64 n_out=argc>2?atoll(argv[2]):16384;
     NB=NIN/32; WS=NB*34;
@@ -185,33 +240,63 @@ int main(int argc,char**argv){
     for(i64 i=0;i<NIN;i++)XQ[i]=(i8)((i*37)%251-125);
     for(i64 b=0;b<NB;b++)XD[b]=0.013f+0.001f*(b%7);
     OUT=(f32*)aligned_alloc(64,(size_t)n_out*4);
-    // the prebuilt table, exactly what a load-time repack would produce
     const i64 npair=NB/2; NP=npair;
     TABF=(f32*)aligned_alloc(64,(size_t)(n_out/8)*npair*16*4);
     for(i64 o=0;o+8<=n_out;o+=8) for(i64 p=0;p<npair;p++){
         f32* t=TABF+((o>>3)*npair+p)*16;
         for(int c=0;c<8;c++){ const u8* wp=W+(o+c)*WS+p*68;
-            const u32 s=(u32)wp[0]|((u32)wp[1]<<8);
-            // decode f16 -> f32 the same way the kernel does
-            __m128 a=_mm_cvtph_ps(_mm_cvtsi32_si128((int)s));
+            const u32 ss=(u32)wp[0]|((u32)wp[1]<<8);
+            __m128 a=_mm_cvtph_ps(_mm_cvtsi32_si128((int)ss));
             t[2*c]=_mm_cvtss_f32(a);
             __m128 bb=_mm_cvtph_ps(_mm_cvtsi32_si128((int)((u32)wp[34]|((u32)wp[35]<<8))));
             t[2*c+1]=_mm_cvtss_f32(bb);
         }
     }
-    std::printf("weights %.1f MB, n_in %lld, n_out %lld, table %.1f MB\n",
-                (double)(n_out*WS)/1e6,(long long)NIN,(long long)n_out,(double)(n_out/8)*npair*64/1e6);
-    run("V0 shipped",            v0, n_out);
-    run("V1 scale hoisted (bound)", v1, n_out);
-    run("V2 prebuilt table",     v2, n_out);
-    // f16 copy of the same table
     TABH=(u16*)aligned_alloc(64,(size_t)(n_out/8)*npair*16*2);
     for(i64 i=0;i<(n_out/8)*npair*16;i++){
         f32 v=TABF[i]; __m128 a=_mm_set_ss(v);
         TABH[i]=(u16)_mm_extract_epi16(_mm_cvtps_ph(a,0),0);
     }
-    run("V3 f16 table",          v3, n_out);
-    run("V0 again",              v0, n_out);
-    run("V1 again",              v1, n_out);
+    std::printf("weights %.1f MB, n_in %lld, n_out %lld\n",
+                (double)(n_out*WS)/1e6,(long long)NIN,(long long)n_out);
+    std::printf("  f16 sidecar (V3) %.1f MB = +%.1f%% of the weights; "
+                "f32 table (V2) %.1f MB = +%.1f%%\n",
+                (double)(n_out/8)*npair*32/1e6,
+                100.0*((double)(n_out/8)*npair*32/(double)(n_out*WS)),
+                (double)(n_out/8)*npair*64/1e6,
+                100.0*((double)(n_out/8)*npair*64/(double)(n_out*WS)));
+
+    struct Arm { const char *nm; void (*fn)(i64); };
+    const Arm arms[] = {
+        {"V0 shipped",             v0},
+        {"V1 scale hoisted (bound)", v1},
+        {"V2 f32 table",           v2},
+        {"V3 f16 table",           v3},
+        {"V4 two-load pluck",      v4},
+        {"V5 shipped r1xN",        v5_shipped},
+    };
+    const int na = sizeof(arms)/sizeof(arms[0]);
+    const int rounds = argc>3 ? atoi(argv[3]) : 9;
+    std::vector<std::vector<double>> gbs(static_cast<size_t>(na));
+    // One untimed pass of every arm first: the tables and the weight stream are
+    // cold in a fresh process, and a measurement of the cold state is not the
+    // measurement any of these arms is competing on.
+    for (int a=0;a<na;a++) arms[a].fn(n_out);
+    for (int r=0;r<rounds;r++){
+        for (int k=0;k<na;k++){
+            const int a=(k+r)%na;   // rotated: no arm keeps a fixed position
+            double t0=now_s(); arms[a].fn(n_out); double dt=now_s()-t0;
+            gbs[static_cast<size_t>(a)].push_back((double)n_out*WS/dt/1e9);
+        }
+    }
+    const double base = median(gbs[0]);
+    std::printf("%-26s %10s %10s %8s\n","arm","median GB/s","min GB/s","vs V0");
+    for (int a=0;a<na;a++){
+        std::vector<double> v=gbs[static_cast<size_t>(a)];
+        const double md=median(v);
+        double mn=1e30; for(double x:v) if(x<mn)mn=x;
+        std::printf("%-26s %10.2f %10.2f %7.2fx\n",arms[a].nm,md,mn,
+                    base>0?md/base:0.0);
+    }
     return 0;
 }
