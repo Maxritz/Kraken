@@ -108,10 +108,23 @@ code); new group `test_mtp_head_qwen4`; baseline re-recorded.
 | 1.2 | **done** | `MtpBlock` gained `hf`, `n_lane`, `n_hc_rank`, `n_index_head`, `index_dim`, `HcMixer{hc_attn,hc_ffn,hc_head}`, `fc_embedding`/`fc_hidden`/`eh_proj_split`, `index_{q,k}`+norms, `exps_gate_up` |
 | 1.3 | **done** | `Model::load_mtp_hf_block` (src/mtp_head.cpp) + `test_mtp_head_qwen4`: a synthetic 31-tensor file loads, and the wrong-width bank / half-written prefix / mismatched `down_proj` are refused by tensor name |
 | 1.4 | **done** | `Gguf::add_expert_plane_slice` + `GgufTensor::plane_stride`/`plane()`; the expert path reads through `plane()` in all five places it used to compute `data + expert * per`. `test_mtp_head_qwen4` compares **every** expert's gate and up view against the source rows with `memcmp`, not a sample |
-| 1.5 | open | |
+| 1.5 | **done** | `include/krk/mtp_forward.hpp` + `src/mtp_head.cpp` (`mtp_host_prefix_load`, `mtp_dense_prefix`), group `test_mtp_head_prefix`: 18/18 |
 | 1.6 | open | |
 | 1.7 | open | |
 | 1.8 | partly | the arch row is `Partial` (loads and validates, cannot propose); `test_mtp_head_qwen4` exists; the baseline is not re-recorded until the forward lands |
+
+**1.5's gate in this file was wrong, and is corrected here.** It read "scaling
+`R` by 0.5/2 scales `h` linearly". It cannot: the prefix RMS-normalises `h`
+before the projection, so scaling `R` leaves the result *invariant*, not linear.
+The invariant that actually holds -- and that the group now checks -- is scale
+invariance to 1e-4. The other two gates stand as written: outputs finite, and
+the two `hnorm` modes differ on a recorded input.
+
+The strongest check in that group is not on the list above: the fused `eh_proj`
+and the `fc_embedding` + `fc_hidden` pair are the same matrix split by column, so
+the group builds both spellings from one matrix and requires the two computations
+to agree element-for-element. A concat order of `[h | e]`, or a gamma applied
+per-lane in one form and not the other, fails it.
 
 Two deviations, both deliberate:
 

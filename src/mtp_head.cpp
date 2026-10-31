@@ -34,11 +34,13 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "krk/gguf.hpp"
+#include "krk/mtp_forward.hpp"
 #include "krk/model.hpp"
 #include "krk/quant.hpp"
 
@@ -556,6 +558,157 @@ bool Model::load_mtp_hf_block(Gguf &g, const std::string &origin,
              split ? "fc_embedding+fc_hidden" : "fused eh_proj",
              static_cast<f64>(m.bytes) / 1048576.0,
              static_cast<long long>(gu->n_bytes) / 1048576LL);
+    return true;
+}
+
+
+// ---- step 1.5: the dense prefix, host f32 ----------------------------------
+
+namespace {
+
+// Dequantize one dst-major row of `t` (row `o`, `n_in` wide) into `dst`.
+void row_of(const GgufTensor *t, i64 o, i64 n_in, f32 *dst) {
+    const size_t rb = dtype_row_bytes(t->type, static_cast<u64>(n_in));
+    dequant_row(t->type, t->data + static_cast<size_t>(o) * rb, dst, n_in);
+}
+
+}  // namespace
+
+bool mtp_host_prefix_load(const Gguf &g, i32 n_embd, i32 n_lane, f32 eps,
+                          MtpHostPrefix *out, std::string *err) {
+    if (!out) return false;
+    const auto fail = [&](const std::string &m) {
+        if (err) *err = m;
+        return false;
+    };
+    if (n_embd <= 0 || n_lane <= 0)
+        return fail("the prefix needs a width and a lane count");
+    out->n_embd = n_embd;
+    out->n_lane = n_lane;
+    out->eps = eps;
+
+    const GgufTensor *en = g.tensor("mtp.pre_fc_norm_embedding.weight");
+    const GgufTensor *hn = g.tensor("mtp.pre_fc_norm_hidden.weight");
+    if (!en || !hn)
+        return fail("the head has no pre_fc_norm_{embedding,hidden}.weight");
+    if (static_cast<i64>(en->n_elements) != n_embd)
+        return fail("pre_fc_norm_embedding is " +
+                    std::to_string(en->n_elements) + " wide, not " +
+                    std::to_string(n_embd));
+    if (static_cast<i64>(hn->n_elements) != static_cast<i64>(n_embd) * n_lane)
+        return fail("pre_fc_norm_hidden is " +
+                    std::to_string(hn->n_elements) + " wide, not " +
+                    std::to_string(static_cast<i64>(n_embd) * n_lane) +
+                    " (one gamma per lane)");
+    out->enorm.assign(static_cast<size_t>(n_embd), 0.0f);
+    out->hnorm.assign(static_cast<size_t>(n_embd) * static_cast<size_t>(n_lane),
+                      0.0f);
+    dequant_row(en->type, en->data, out->enorm.data(), n_embd);
+    dequant_row(hn->type, hn->data, out->hnorm.data(),
+                static_cast<i64>(n_embd) * n_lane);
+
+    const GgufTensor *ep = g.tensor("mtp.eh_proj.weight");
+    const GgufTensor *fe = g.tensor("mtp.fc_embedding.weight");
+    const GgufTensor *fh = g.tensor("mtp.fc_hidden.weight");
+    if (ep) {
+        out->split = false;
+        out->eh_proj = ep;
+        out->fc_embedding = out->fc_hidden = nullptr;
+        if (static_cast<i64>(ep->ne[0]) != 2 * static_cast<i64>(n_embd) ||
+            static_cast<i64>(ep->ne[1]) != n_embd)
+            return fail("eh_proj is [" + std::to_string(ep->ne[0]) + ", " +
+                        std::to_string(ep->ne[1]) + "], not [" +
+                        std::to_string(2 * n_embd) + ", " +
+                        std::to_string(n_embd) + "]");
+    } else if (fe && fh) {
+        out->split = true;
+        out->eh_proj = nullptr;
+        out->fc_embedding = fe;
+        out->fc_hidden = fh;
+        for (const GgufTensor *t : {fe, fh})
+            if (static_cast<i64>(t->ne[0]) != n_embd ||
+                static_cast<i64>(t->ne[1]) != n_embd)
+                return fail(t->name + " is [" + std::to_string(t->ne[0]) +
+                            ", " + std::to_string(t->ne[1]) + "], not [" +
+                            std::to_string(n_embd) + ", " +
+                            std::to_string(n_embd) + "]");
+    } else {
+        return fail("the head has neither eh_proj nor the fc_embedding + "
+                    "fc_hidden pair");
+    }
+    return true;
+}
+
+bool mtp_dense_prefix(const MtpHostPrefix &w, const f32 *embed, const f32 *R,
+                      bool per_stream, f32 *x, std::string *err) {
+    const auto fail = [&](const std::string &m) {
+        if (err) *err = m;
+        return false;
+    };
+    if (!w.ready()) return fail("the prefix's weights are not loaded");
+    if (!embed || !R || !x) return fail("the prefix needs embed, R and x");
+    const i64 n = w.n_embd;
+    const i32 lanes = w.n_lane;
+
+    // e = rms(embed) * enorm, the same on every lane (`ggml_repeat_4d` in the
+    // reference): the proposed token's embedding is one vector, not one per
+    // residual stream.
+    std::vector<f32> e(static_cast<size_t>(n), 0.0f);
+    {
+        f64 ss = 0.0;
+        for (i64 i = 0; i < n; i++) ss += static_cast<f64>(embed[i]) * embed[i];
+        const f32 inv = 1.0f / std::sqrt(static_cast<f32>(ss / static_cast<f64>(n)) + w.eps);
+        for (i64 i = 0; i < n; i++) e[static_cast<size_t>(i)] = embed[i] * inv * w.enorm[static_cast<size_t>(i)];
+    }
+
+    // h = rms over the lanes (either per stream, or one over all of them) with
+    // the concatenated [lanes * n_embd] gamma.
+    const i64 hn = n * lanes;
+    std::vector<f32> h(static_cast<size_t>(hn), 0.0f);
+    if (per_stream) {
+        for (i32 l = 0; l < lanes; l++) {
+            const f32 *rl = R + static_cast<i64>(l) * n;
+            f32 *hl = h.data() + static_cast<i64>(l) * n;
+            f64 ss = 0.0;
+            for (i64 i = 0; i < n; i++) ss += static_cast<f64>(rl[i]) * rl[i];
+            const f32 inv = 1.0f / std::sqrt(static_cast<f32>(ss / static_cast<f64>(n)) + w.eps);
+            for (i64 i = 0; i < n; i++)
+                hl[i] = rl[i] * inv * w.hnorm[static_cast<size_t>(static_cast<i64>(l) * n + i)];
+        }
+    } else {
+        f64 ss = 0.0;
+        for (i64 i = 0; i < hn; i++) ss += static_cast<f64>(R[i]) * R[i];
+        const f32 inv = 1.0f / std::sqrt(static_cast<f32>(ss / static_cast<f64>(hn)) + w.eps);
+        for (i64 i = 0; i < hn; i++) h[static_cast<size_t>(i)] = R[i] * inv * w.hnorm[static_cast<size_t>(i)];
+    }
+
+    // x_lane = W * cat([e | h_lane]).
+    std::vector<f32> row(static_cast<size_t>(w.split ? n : 2 * n), 0.0f);
+    for (i32 l = 0; l < lanes; l++) {
+        const f32 *hl = h.data() + static_cast<i64>(l) * n;
+        f32 *xl = x + static_cast<i64>(l) * n;
+        if (!w.split) {
+            // One row of the fused matrix: the first n columns multiply e, the
+            // second n multiply this lane's h. That is the column order of
+            // `ggml_concat(e_norm, h_norm)`.
+            for (i64 o = 0; o < n; o++) {
+                row_of(w.eh_proj, o, 2 * n, row.data());
+                f64 acc = 0.0;
+                for (i64 i = 0; i < n; i++) acc += static_cast<f64>(row[static_cast<size_t>(i)]) * e[static_cast<size_t>(i)];
+                for (i64 i = 0; i < n; i++) acc += static_cast<f64>(row[static_cast<size_t>(n + i)]) * hl[i];
+                xl[o] = static_cast<f32>(acc);
+            }
+        } else {
+            for (i64 o = 0; o < n; o++) {
+                row_of(w.fc_embedding, o, n, row.data());
+                f64 acc = 0.0;
+                for (i64 i = 0; i < n; i++) acc += static_cast<f64>(row[static_cast<size_t>(i)]) * e[static_cast<size_t>(i)];
+                row_of(w.fc_hidden, o, n, row.data());
+                for (i64 i = 0; i < n; i++) acc += static_cast<f64>(row[static_cast<size_t>(i)]) * hl[i];
+                xl[o] = static_cast<f32>(acc);
+            }
+        }
+    }
     return true;
 }
 

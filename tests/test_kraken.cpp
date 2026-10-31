@@ -59,6 +59,7 @@
 #include "krk/engine.hpp"
 #include "krk/expert_cpu.hpp"
 #include "krk/gguf.hpp"
+#include "krk/mtp_forward.hpp"
 #include "krk/hc.hpp"
 #include "krk/mova.hpp"
 #include "krk/diffusion.hpp"
@@ -18997,6 +18998,142 @@ static void test_mtp_head_qwen4() {
     delete cpu;
 }
 
+// ---- step 1.5: the MTP dense prefix on the host -----------------------------
+//
+// The prefix is where the two ways of getting this block wrong are cheapest to
+// catch: the concat order (e before h) and the norm contract (per lane, one
+// concatenated gamma). Both are checked against the two SPELLINGS of the same
+// function -- the fused `eh_proj` and the `fc_embedding` + `fc_hidden` pair are
+// the same matrix split by column -- so the check is not "does it run", it is
+// "do the two forms agree to float".
+static std::string build_prefix_head(const std::string &tag, int n_embd, int lanes,
+                                     bool split) {
+    const std::string path = std::string("kraken-mtp-prefix-") + tag + ".gguf";
+    GgufBuilder b;
+    b.meta_str("general.architecture", "qwen4exp-mtp");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("qwen4exp-mtp.block_count", 1);
+    // One matrix, [n_embd] output rows of 2*n_embd; the split form stores its
+    // two column halves, so the values are identical by construction.
+    std::vector<f32> m(static_cast<size_t>(n_embd) * 2 * n_embd);
+    for (size_t i = 0; i < m.size(); i++)
+        m[i] = 0.01f * static_cast<f32>((static_cast<int>(i + 3 * 31) % 17) - 8);
+    std::vector<f32> en(static_cast<size_t>(n_embd)), hn(static_cast<size_t>(n_embd) * lanes);
+    for (size_t i = 0; i < en.size(); i++) en[i] = 0.5f + 0.01f * static_cast<f32>(i % 7);
+    for (size_t i = 0; i < hn.size(); i++) hn[i] = 0.25f + 0.01f * static_cast<f32>(i % 11);
+    b.tensor_f32("mtp.pre_fc_norm_embedding.weight", {u64(n_embd)}, en);
+    b.tensor_f32("mtp.pre_fc_norm_hidden.weight", {u64(n_embd * lanes)}, hn);
+    if (!split) {
+        b.tensor_f16("mtp.eh_proj.weight", {u64(2 * n_embd), u64(n_embd)}, m);
+    } else {
+        std::vector<f32> fe(m.size() / 2), fh(m.size() / 2);
+        for (int o = 0; o < n_embd; o++)
+            for (int i = 0; i < n_embd; i++) {
+                fe[static_cast<size_t>(o) * n_embd + i] =
+                    m[static_cast<size_t>(o) * 2 * n_embd + i];
+                fh[static_cast<size_t>(o) * n_embd + i] =
+                    m[static_cast<size_t>(o) * 2 * n_embd + n_embd + i];
+            }
+        b.tensor_f16("mtp.fc_embedding.weight", {u64(n_embd), u64(n_embd)}, fe);
+        b.tensor_f16("mtp.fc_hidden.weight", {u64(n_embd), u64(n_embd)}, fh);
+    }
+    if (!b.write(path)) return std::string();
+    return path;
+}
+
+static void test_mtp_head_prefix() {
+    const int n_embd = 32, lanes = 4;
+    const std::string fused = build_prefix_head("fused", n_embd, lanes, false);
+    const std::string split = build_prefix_head("split", n_embd, lanes, true);
+    CHECK(!fused.empty() && !split.empty(), "wrote both spellings of the prefix");
+
+    std::vector<f32> embed(static_cast<size_t>(n_embd));
+    std::vector<f32> R(static_cast<size_t>(n_embd) * lanes);
+    for (size_t i = 0; i < embed.size(); i++)
+        embed[i] = 0.3f * static_cast<f32>((static_cast<int>(i) % 13) - 6);
+    for (size_t i = 0; i < R.size(); i++)
+        R[i] = 0.2f * static_cast<f32>((static_cast<int>(i) % 19) - 9);
+
+    std::vector<f32> xa(static_cast<size_t>(n_embd) * lanes);
+    std::vector<f32> xb(xa.size());
+    std::vector<f32> xc(xa.size());
+    std::vector<f32> xg(xa.size());
+
+    {
+        Gguf g;
+        std::string err;
+        CHECK(g.load(fused, &err), "the fused head re-reads");
+        MtpHostPrefix w;
+        CHECK(mtp_host_prefix_load(g, n_embd, lanes, 1e-5f, &w, &err),
+              "the fused prefix loads");
+        CHECK(w.ready() && w.n_lane == lanes && !w.split,
+              "the fused form is reported as fused");
+        std::string perr;
+        CHECK(mtp_dense_prefix(w, embed.data(), R.data(), true, xa.data(), &perr),
+              "the prefix runs in per-stream mode");
+        CHECK(mtp_dense_prefix(w, embed.data(), R.data(), false, xg.data(), &perr),
+              "the prefix runs in one-RMS mode");
+        bool finite = true;
+        for (f32 v : xa)
+            if (!std::isfinite(v)) finite = false;
+        CHECK(finite, "every prefix output is finite");
+
+        // The two norm modes must DIFFER: a switch that changes nothing means
+        // the per-lane reshape was dropped, and the artifact's acceptance rate
+        // would then be the only thing that ever noticed.
+        f32 md = 0.0f;
+        for (size_t i = 0; i < xa.size(); i++)
+            md = std::max(md, std::fabs(xa[i] - xg[i]));
+        CHECK(md > 1e-4f, "per-stream and one-RMS modes differ");
+
+        // RMS normalisation is scale-invariant, so doubling the trunk's residual
+        // must not change the prefix. (The plan said "scaling R scales h
+        // linearly"; that is wrong for an RMS-normed input and the invariant
+        // that actually holds is this one.)
+        std::vector<f32> R2(R.size());
+        for (size_t i = 0; i < R.size(); i++) R2[i] = 2.0f * R[i];
+        CHECK(mtp_dense_prefix(w, embed.data(), R2.data(), true, xb.data(), &perr),
+              "the prefix runs on a scaled residual");
+        f32 ms = 0.0f;
+        for (size_t i = 0; i < xa.size(); i++)
+            ms = std::max(ms, std::fabs(xa[i] - xb[i]));
+        CHECK(ms < 1e-4f, "the prefix is invariant to scaling the residual");
+    }
+    {
+        Gguf g;
+        std::string err;
+        CHECK(g.load(split, &err), "the split head re-reads");
+        MtpHostPrefix w;
+        CHECK(mtp_host_prefix_load(g, n_embd, lanes, 1e-5f, &w, &err),
+              "the split prefix loads");
+        CHECK(w.ready() && w.split, "the split form is reported as split");
+        std::string perr;
+        CHECK(mtp_dense_prefix(w, embed.data(), R.data(), true, xc.data(), &perr),
+              "the split prefix runs");
+        // fc([e|h]) == fc_embedding(e) + fc_hidden(h): the two spellings are the
+        // same matrix split by column, so they must agree element for element.
+        f32 md = 0.0f;
+        for (size_t i = 0; i < xa.size(); i++)
+            md = std::max(md, std::fabs(xa[i] - xc[i]));
+        CHECK(md < 1e-4f, "the fused and split prefixes compute the same thing");
+    }
+    // A norm of the wrong width is refused, naming it: a head whose lanes are
+    // four but whose gamma is one lane long would scale lane 0 four times.
+    {
+        Gguf g;
+        std::string err;
+        CHECK(g.load(fused, &err), "re-read for the refusal");
+        MtpHostPrefix w;
+        CHECK(!mtp_host_prefix_load(g, n_embd, lanes + 1, 1e-5f, &w, &err),
+              "a lane count the gamma does not match is refused");
+        CHECK(err.find("pre_fc_norm_hidden") != std::string::npos,
+              "the refusal names the norm that disagrees");
+    }
+
+    std::remove(fused.c_str());
+    std::remove(split.c_str());
+}
+
 struct TestGroup {
     const char *name;
     void (*fn)();
@@ -29523,6 +29660,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_draft_head)
     TEST_GROUP(test_mtp_sidecar)
     TEST_GROUP(test_mtp_head_qwen4)
+    TEST_GROUP(test_mtp_head_prefix)
     TEST_GROUP(test_expert_warmup)
     TEST_GROUP(test_expert_index_adapt)
     TEST_GROUP(test_hc_lanes)
