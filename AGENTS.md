@@ -4156,3 +4156,38 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   head, **0 of 9** for the live-attention control that proposes the wrong token
   on purpose. A counter that just returned `hits == tries` would pass the first
   arm and fail the second, which is why the group asserts both.
+- **A longer scale group only pays if BOTH sides of the GEMM are quantised over
+  it, and that is where its error comes from.** The plan for the prefill format
+  was "make the weight format carry a 128-value scale run"; the kernel measured
+  otherwise. The shipped kernel's per-64-value cost is the scale-VECTOR build
+  (two broadcasts and an insert), and one broadcast per group is only possible
+  when `d_w * d_x` is a single scalar, i.e. when the weight and the activation
+  share the run. Measured at 768x2048x512, best-of-5 in-process, two runs
+  (GMAC/s): shipped q8_0 30.05/29.17; 128-value weight group with per-32
+  activations **24.18/23.55 (0.80x, slower)**; the same weights with per-128
+  activations **43.64/41.49 (1.43x)**; the per-32-exponent variant with per-128
+  activations 29.58/29.53 (**1.00x**). The error that buys: 1.25x q8_0's on the
+  weight side (max scale 7.40e-3 against q8_0's 5.94e-3 RMS, gauss rows) and
+  1.16x on the activation side. Two escape routes were tested and both failed:
+  a least-squares scale instead of max (7.38e-3, no better on any of three row
+  shapes -- the outlier-wastes-range hypothesis is false on these rows), and a
+  power-of-two exponent per 32-value block (7.2e-3: a ladder can only land on
+  `anchor/2^e`, so the grid is up to 2x coarser than the block's ideal one, and
+  2, 4 and 8 exponent bits all measure within noise -- the limit is ladder
+  GRANULARITY, not range). Verdict: does not ship; the gate's error half fails
+  even though its speed half passes. Bench: `tools/bench_prefill_fmt.cpp`
+  (`kraken-prefill-fmt-bench`), which checks every prototype against
+  dequant-then-f32 before quoting its speed -- g4 1.1e-6, g4 with per-32
+  activations 2.8e-7, s4 8.5e-4.
+- **A prototype kernel's own harness can produce the failure that its format
+  then gets blamed for.** Three worth recording from one afternoon: `#ifdef
+  __AVX512F__` silently deleted all three prototype kernels from a baseline-ISA
+  build (the tool printed the shipped kernel and nothing else -- attribute the
+  functions and dispatch on `__builtin_cpu_supports` instead); `floor(log2(r))`
+  for the per-block exponent is off by one whenever the ratio sits within an
+  f16-ulp of 1.0, which halved the scale and saturated every block (select the
+  finest exponent that FITS instead); and the correctness check compared the
+  s-layout's bytes against the g4 reference, reporting a 3e-2 failure that was
+  the harness's (each kernel must be checked against its own dequantised
+  weights). The s4 dot still fails 1e-5 -- 8.5e-4 -- and that one is the format:
+  merging blocks onto a common scale truncates the per-lane partial sums.

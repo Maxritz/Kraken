@@ -1,10 +1,12 @@
 # Two open items, split into steps that can each be gated
 
-Status 2026-10-31, after PR #84. Everything below assumes `main` at `5dae3b8`.
+Status 2026-10-31, after PR #85. Everything below assumes `main` at `49dfb25`.
 
-**Progress:** steps **1.1-1.4 are done** (see *Item 1 status* at the end of that
-section). 1.5-1.7 are done (1.7's speed half needs an artifact); item 4 has not
-started.
+**Progress:** item 1 is **done through 1.8** as far as a workspace without a
+checkpoint allows -- the block runs, drafts a chain, and its step-1 acceptance is
+reported and gated; what is left is the real-artifact run. Item 4 is **closed**:
+4.1 and 4.4 were measured and the format does not ship (1.43x speed, 1.25x
+error), so 4.2/4.3/4.5 should not start.
 
 The point of this file is that each step has a **done-when** that can fail. A step
 that cannot fail is not a step, it is a description.
@@ -316,7 +318,9 @@ line in the loader, and all three were built to be testable in isolation.
 
 ### Steps
 
-**4.1 — Settle the layout on paper and in a bench, before engine code** (½ session)
+**4.1 — Settle the layout on paper and in a bench, before engine code** — **done,
+verdict: reject** (`tools/bench_prefill_fmt.cpp`, table in
+docs/GEMM-PERF-WALL.md)
 Two candidates, both measured with the existing `tools/bench_q80_gemm.cpp`
 harness as a dequantised reference first:
  * **(a)** `q8_0_g4`: one f16 scale per 128 values (the known 1.19×, known lossy);
@@ -342,7 +346,8 @@ via `KRK_CPU_Q80_KERNEL`.
 *Done when:* bit-comparable to dequant-then-f32 within 1e-5 on a 64-row sweep,
 and the scalar path agrees with the vector path.
 
-**4.4 — Measure, then decide** (½ session)
+**4.4 — Measure, then decide** — **done with 4.1: speed gate passes (1.43x),
+error gate fails (1.25x weights x ~1.16x activations), so it does not ship**
 A/B against W on 768×2048×512, best-of-5, median and spread, two runs.
 *Done when:* **≥ 1.15×** over W **and** the synthetic model's logits move no more
 than q8_0's already do. Missing the gate means the format does not ship and the
@@ -354,6 +359,38 @@ covers load + generate + the error bound, docs updated.
 
 **Total:** 2-3 sessions, with a real chance step 4.1 or 4.4 fails the gate.
 
+### Item 4 outcome (measured, 2026-10-31)
+
+4.1 and 4.4 were run together because the bench that settles the layout also
+measures the kernel. Both candidates exist as kernels now:
+
+| kernel, 768x2048x512, best-of-5, two runs | run A | run B |
+|---|---:|---:|
+| q8_0 (shipped) | 30.05 | 29.17 |
+| 128-group weights, per-32 activations | 24.18 | 23.55 |
+| **128-group weights, per-128 activations** | **43.64** | **41.49** |
+| 128-group weights + per-32 exponents, per-128 activations | 29.58 | 29.53 |
+
+**The speed belongs to the activation group.** The shipped kernel's per-64-value
+cost is the scale-VECTOR build, and one broadcast per group is possible only when
+`d_w * d_x` is a single number, i.e. when both sides share the run. Lengthening
+the weight group alone is 0.80x. That is a correction to this plan, which
+assumed the weight format was the thing carrying the longer run.
+
+**The error is 1.25x (weights) x 1.16x (activations)**, and neither escape route
+survives measurement: least squares does not beat the max scale on any of the
+three row shapes (7.38e-3 against 7.40e-3), and the per-32 exponent ladder stays
+at the long-group error (7.2e-3) because a power-of-two ladder is up to 2x
+coarser than the block's ideal grid no matter how many bits it carries.
+
+So 4.2 (the `Q8_0_S4` dtype), 4.3 (its kernel in the backend) and 4.5 (loader
+wiring) are **not started and should not be**: they would add a format that is
+1.00x in speed, worse in error, and not portable. The numbers are in
+docs/GEMM-PERF-WALL.md with the three hypotheses this refuted, and the bench is
+in the tree so the decision can be re-run rather than re-argued. What would
+reopen it: a real artifact showing q8_0's error is far below what the model
+tolerates -- the same missing artifact that keeps `qwen4-mtp` at `Partial`.
+
 ---
 
 ## Order
@@ -362,7 +399,14 @@ covers load + generate + the error bound, docs updated.
    can see cheaply, and they unblock 1.6.
 2. **4.1** in parallel is legitimate — it is a bench, no engine code.
 3. **1.6** next, because it is the only step that turns into tokens/s.
-4. **4.2 → 4.5** last.
+4. **4.2 → 4.5** last -- and, as measured, not at all: 4.1+4.4 closed the item.
 
 Neither item shares a line of code with the other; the order above is about risk,
 not dependency.
+
+**What is left, in order, and each one needs something this workspace does not
+have:** (1) run `scripts/mtp_spec_gate.sh` on a real `qwen4exp` trunk plus its
+`qwen4exp-mtp` head and record the table in *1.8's runbook* -- that is what moves
+`qwen4-mtp` from `Partial` to `Yes`; (2) wire `deepseek4-dspark`'s own attention
+(markov tensors, `conf_proj`) before its row can move; (3) the prefill format
+only reopens with an artifact that quantifies q8_0's headroom.
