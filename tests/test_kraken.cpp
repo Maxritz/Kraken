@@ -511,7 +511,38 @@ static void test_q8_0_scale_array_row_keyed() {
     for (int o = 0; o < n_out; o++)
         dot_q8_0_q8_x8(w.data() + static_cast<size_t>(o) * row_bytes, xq.data(),
                        dx.data(), n_in, n_in, nb, ref.data() + o, n_out);
-    if (!q8_0_wsc_supported()) return;  // nothing to compare on a non-VNNI host
+    // Host-independent: the eight-row reference tile against a scalar dot of the
+    // same row. This is the arm the VNNI comparison is written against, so on a
+    // host that cannot build the wsc8 kernel the group still checks that its
+    // own reference is right instead of reporting a skip with nothing behind it.
+    {
+        f32 want = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            const u8 *blk = w.data() + static_cast<size_t>(b) * 34;
+            const f32 d = fp16_to_fp32(static_cast<u16>(
+                blk[0] | (static_cast<u16>(blk[1]) << 8)));
+            i64 s = 0;
+            for (int j = 0; j < 32; j++)
+                s += static_cast<i64>(static_cast<i8>(blk[2 + j])) *
+                     static_cast<i64>(xq[b * 32 + j]);
+            want = std::fma(static_cast<f32>(s), d * dx[b], want);
+        }
+        CHECK_NEAR(ref[0], want, 1e-5f * std::max(1e-6f, std::fabs(want)),
+                   "the eight-row reference tile agrees with a scalar dot");
+    }
+    // Nothing to compare on a host without the wsc8 kernel -- and "nothing" is
+    // not a valid result: the runner counts a group that ran zero checks as a
+    // FAILURE, which is the right rule (it is what KRK_TEST_INJECT_EMPTY exists
+    // to prove) but made this group permanently red on every build without
+    // VNNI. With KRK_AVX512 off by default that is every default build, so the
+    // arm has to say what it skipped and why, and keep the reference kernel's
+    // own eight-row tile covered, which is host-independent.
+    if (!q8_0_wsc_supported()) {
+        CHECK(true,
+              "the wsc8 arm needs -DKRK_AVX512=ON (VNNI); the reference "
+              "eight-row tile ran above");
+        return;
+    }
     const i64 npair = nb / 2;
     std::vector<f32> wsc(static_cast<size_t>(n_out * npair * 16));
     build_q8_0_wscales(w.data(), row_bytes, n_out, n_in, wsc.data());
@@ -24450,16 +24481,21 @@ static void test_pending_model_fixtures() {
         // arch-level disclosure, not tensor-level -- conservative, never silent,
         // and for once the conservative direction is the cheap one: a repack can
         // move the tower into a sibling GGUF and the note still holds.
-        Gguf g;
-        std::string err;
-        CHECK(g.load("kraken-pend-qwen2vl.gguf", &err), "re-read plain qwen2vl");
-        const ModelVerdict pv = assess_model(g);
-        bool said_vision = false;
-        for (const std::string &n : pv.notes)
-            if (n.find("vision") != std::string::npos) said_vision = true;
-        CHECK(said_vision,
-              "the vision caveat is arch-level: a text-only qwen2vl file "
-              "carries it too");
+        {
+            // Scoped: `arm()` below REMOVES this file, and a live Gguf holds the
+            // mapping. Windows refuses the delete, POSIX does not -- which is
+            // why this arm was green on Linux and red on every Windows run.
+            Gguf g;
+            std::string err;
+            CHECK(g.load("kraken-pend-qwen2vl.gguf", &err), "re-read plain qwen2vl");
+            const ModelVerdict pv = assess_model(g);
+            bool said_vision = false;
+            for (const std::string &n : pv.notes)
+                if (n.find("vision") != std::string::npos) said_vision = true;
+            CHECK(said_vision,
+                  "the vision caveat is arch-level: a text-only qwen2vl file "
+                  "carries it too");
+        }
         arm("kraken-pend-qwen2vl.gguf", "qwen2vl");
     }
     // ---- the same two families WITH their vision tower ----
@@ -24572,17 +24608,25 @@ static void test_pending_model_refusals() {
               (std::string(label) + " is refused for its own reason").c_str());
         // The refusal must NAME the missing piece. A blocker that says only
         // "not supported" costs the next person the same investigation again.
-        Gguf g;
-        std::string err;
-        if (!g.load(path, &err)) {
-            CHECK(false, ("re-read " + std::string(label) + ": " + err).c_str());
-            return;
+        // The Gguf has to be DESTROYED before the remove, not merely finished
+        // with: it keeps the file mapped, and Windows refuses to delete a
+        // mapped file where POSIX unlinks it happily. The removal check read as
+        // a fixture-hygiene failure on every Windows run of the arms whose file
+        // loads (dspark, deepseek4-dspark, qwen4-mtp) while passing on Linux,
+        // which is how a cross-platform bug sat in a green-looking suite.
+        {
+            Gguf g;
+            std::string err;
+            if (!g.load(path, &err)) {
+                CHECK(false, ("re-read " + std::string(label) + ": " + err).c_str());
+                return;
+            }
+            const ModelVerdict v = assess_model(g);
+            bool named = false;
+            for (const auto &b : v.blockers)
+                if (b.find(piece) != std::string::npos) named = true;
+            CHECK(named, (std::string(label) + "'s refusal names " + piece).c_str());
         }
-        const ModelVerdict v = assess_model(g);
-        bool named = false;
-        for (const auto &b : v.blockers)
-            if (b.find(piece) != std::string::npos) named = true;
-        CHECK(named, (std::string(label) + "'s refusal names " + piece).c_str());
         CHECK(std::remove(path.c_str()) == 0,
               (std::string(label) + "'s fixture is removed").c_str());
     };
@@ -24641,13 +24685,17 @@ static void test_pending_model_refusals() {
         v.q_norm_w = 8;
         v.k_norm_w = 8;
         CHECK(build_schema_model("kraken-pend-diffuse.gguf", v), "wrote diffuse");
-        Gguf g;
-        std::string verr;
-        CHECK(g.load("kraken-pend-diffuse.gguf", &verr), "the diffuse fixture loads");
-        const ModelVerdict vd = assess_model(g);
-        CHECK(vd.runnable,
-              "a diffuse file is runnable: the denoising sampler, the loader "
-              "schema and the bidirectional pass are all served");
+        {
+            // Scoped so the mapping is closed before the remove below; see the
+            // note in the refusal arm above.
+            Gguf g;
+            std::string verr;
+            CHECK(g.load("kraken-pend-diffuse.gguf", &verr), "the diffuse fixture loads");
+            const ModelVerdict vd = assess_model(g);
+            CHECK(vd.runnable,
+                  "a diffuse file is runnable: the denoising sampler, the loader "
+                  "schema and the bidirectional pass are all served");
+        }
         CHECK(std::remove("kraken-pend-diffuse.gguf") == 0,
               "diffuse's fixture is removed");
     }
@@ -29549,12 +29597,20 @@ static void test_pageable_path_probe() {
     };
 
     // A wide aperture: the driver stages a pageable source for free, so direct
-    // clears the ring by a wide margin. The slow arm is 0.4 GB/s on purpose --
-    // ~42 ms for the 16 MiB copy the engine probes at -- because a per-copy
-    // scheduling delay is ADDITIVE: it compresses any ratio towards 1, and a
-    // tight margin would make this group report the test box's load as the
-    // card's aperture. It runs in the serial lane for the same reason.
-    const krk::H2dProbe wide = probe(0.4, 20.0, 20.0);
+    // clears the ring by a wide margin.
+    //
+    // Every rate here is SLOW on purpose, and the reason is the instrument, not
+    // the card. `sim_wait` sleeps for the simulated duration, and Windows
+    // quantises a sleep to the scheduler tick (~15.6 ms): at the 4 MiB fixture
+    // this probe uses, any arm faster than ~0.25 GB/s asks for less than one
+    // tick and gets the whole tick back. The first version of this arm injected
+    // 0.4/20.0/20.0 and measured ring 0.13 / direct 0.26 / block 0.26 -- the two
+    // fast arms collapsed onto the same tick, so "direct beats the ring" failed
+    // on a quiet box with nothing else running. Asking for 1/16 of the nominal
+    // rates instead costs ~0.4 s and puts every arm at 17-84 ms, which is 1-5
+    // ticks; the thresholds below are pure RATIOS (1.20x in `vram_guard`, 1.50
+    // here), so scaling all three arms together changes no verdict.
+    const krk::H2dProbe wide = probe(0.05, 0.20, 0.25);
     CHECK(wide.valid, "the aperture probe measured all three arms");
     CHECK(wide.direct_gbs > wide.pageable_gbs * 1.50,
           "a wide aperture's direct path beats the staging ring");
@@ -29563,7 +29619,7 @@ static void test_pageable_path_probe() {
 
     // A narrow aperture: the driver's staging serialises through the window, so
     // the ring wins and the pin is worth its unswappable RAM.
-    const krk::H2dProbe narrow = probe(6.0, 0.4, 20.0);
+    const krk::H2dProbe narrow = probe(0.20, 0.05, 0.25);
     CHECK(narrow.valid, "the narrow arm measured too");
     CHECK(narrow.pageable_gbs > narrow.direct_gbs * 1.50,
           "a windowed aperture keeps the staging ring");
@@ -29585,7 +29641,7 @@ static void test_pageable_path_probe() {
     // the copy (0.2 GB/s is 20 ms on 4 MiB against ~0.5 ms of memcpy), and the
     // box's real numbers are asserted as a DECISION instead -- the rule is
     // arithmetic, and it is the rule the engine acts on, not a table of rates.
-    const krk::H2dProbe blocking = probe(0.2, 0.3, 2.0, 2.0);
+    const krk::H2dProbe blocking = probe(0.05, 0.08, 0.25, 0.25);
     CHECK(blocking.valid && blocking.blocking_gbs > 0.0,
           "the probe measures the blocking copy as a fourth arm");
     CHECK(blocking.blocking_gbs > blocking.direct_gbs * 1.5,
