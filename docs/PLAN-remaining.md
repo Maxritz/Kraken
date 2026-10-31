@@ -469,22 +469,59 @@ without moving the wave, so the fast int8 kernel is a rate change on a GEMV.
 
 **Is 5 GMAC/s a defect? Measured: no.** A Q8_0 decode GEMV reads ~1.06 bytes per
 MAC, so 5 GMAC/s is ~5 GB/s of weight streaming, and `tools/bench_gemv_scale`
-(shipped path, 71.3 MB of weights, n_in 4096) measures this host at:
+(shipped path, 71.3 MB of weights, n_in 4096, larger than the 54 MB L3) measures
+this host's shipped kernel at 15-23 GB/s depending on how busy the box is. The
+fixture's 5 GB/s is inside that range, so there is **no evidence of a 4x engine
+defect** here -- and the earlier claim that the expert phase runs "at a fraction
+of what the instruction can do" says nothing about whether *this box* can do
+better.
 
-| pass | shipped V0 | scale-hoisted bound V1 |
-|---|---|---|
-| first | 11.82 ms = 6.03 GB/s | 6.07 ms = 11.74 GB/s |
-| again | 5.02 ms = 14.21 GB/s | 2.88 ms = 24.78 GB/s |
+**The tool was measuring itself, and it was order-biased.** Its first revision
+ran each arm to completion once, in a fixed order: with 71.3 MB of weights against
+a 54 MB L3, whichever arm ran first measured a cold stream (V0 10.10 GB/s cold
+against 18.26 warm, same process). The verdicts therefore disagreed between runs
+and a previous note quoted `1.80x/1.86x` for the f32 table by pairing a first-pass
+ratio with a second-pass one. The harness now runs every arm once per round in a
+rotation that moves with the round and reports the MEDIAN, with one untimed warm
+pass first. Under it the arms are stable, and the answer is not the table:
 
-Two passes of the same binary differ by 2.4x, which is the host's contended state,
-not the kernel's. The fixture's 5 GB/s is inside that range, so there is **no
-evidence of a 4x engine defect** here -- and the earlier claim that the expert
-phase runs "at a fraction of what the instruction can do" says nothing about
-whether *this box* can do better. What the table does say is where the headroom
-lives if there is one: V1 is the hard bound on removing the scale work entirely
-(1.96x on the first pass, 1.74x on the second), and the realistic V2 table is
-1.80x/1.86x of V0. That is a kernel-and-repack project measured by this tool, not
-by another engine table read.
+| arm | extra memory | median GB/s | vs shipped |
+|---|---|---|---|
+| V0 shipped (byte-pluck) | — | 20.5 | 1.00x |
+| V1 scale work removed entirely (bound, not implementable) | — | 25.3 | 1.23x |
+| V2 f32 scale table | +11.8% | 21.9 | 1.07x |
+| V3 f16 scale table | +5.9% | 23.5 | 1.14x |
+| **V4 two-load pluck** | **0** | **23.0** | **1.12x** |
+
+So the prebuilt tables buy **less** than simply assembling the same scale bytes
+better: V4 replaces four byte loads and three shift-ors with two 16-bit loads and
+one shift, touches no new memory, and reaches most of the 1.23x bound. It is what
+ships. (Corrected: the earlier "+94% memory" figure for the f32 table was wrong by
+a factor of eight -- 64 B per 8-row tile per block pair is 8 B per row per pair,
+i.e. +11.8% of the weights, which the tool now prints.)
+
+**The prefetch distance was 16 and should be 8.** V4 explained only part of it, so
+the tool grew a V5 arm that calls the REAL kernel (`dot_q8_0_q8_r1xN`) instead of a
+copy kept inside the tool -- a measurement that cannot drift from the shipped
+body. V5 then showed no gain, which pointed at the one thing the tool's copies do
+not have: the explicit prefetch. One variable, five processes per setting, medians
+of nine interleaved rounds inside each:
+
+| `KRK_CPU_GEMV_PF` | 0 | 6 | **8** | 12 | 16 (was default) | 32 |
+|---|---|---|---|---|---|---|
+| V5 GB/s | 17.9 | 21.5 | **21.8-22.5** | 20.8 | 17.2-19.4 | 14.0 |
+
+The prefetch is worth having (PF=0 is ~20% behind) and a 16-block distance was
+16% behind the 8-block one: far enough ahead that the lines are evicted again
+before the stream arrives. The default is now 8, which also matches the width of
+the tile the loop is built around, and `KRK_CPU_GEMV_PF` still overrides it.
+
+**Together, on the shipped kernel, 1.17x-1.24x** (V5 against the old byte-pluck
+copy, four runs). Stated with its limit: the engine's own 768-wide benchmark
+fixture is L2-resident and shows **no** change, because neither prefetch distance
+nor scale assembly matters when the weights are already in cache. The win is at
+the shape a real model has -- n_in 4096, weights larger than L3 -- which is the
+shape this tool measures.
 
 ### B3 -- A trace file carries no identity -- DONE
 

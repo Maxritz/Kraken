@@ -3761,9 +3761,22 @@ void dot_q8_0_q8_wsc8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 // 128 at sixteen. The whole gain is in 1 -> 2 and it is 1.7x; eight is where the
 // curve tops out, so eight is the default.
 static i64 g_pf_ahead = -1;
+// The DISTANCE is 8 block pairs (544 bytes ahead), not 16. Measured with
+// tools/bench_gemv_scale's V5 arm, which calls this kernel directly, 71.3 MB of
+// weights against a 54 MB L3, five processes per setting, medians of nine
+// interleaved rounds inside each:
+//
+//     PF=0   17.93 GB/s      PF=8   22.48 GB/s      PF=32  14.0 GB/s
+//     PF=6   21.5            PF=16  19.39 (was the default)
+//
+// So the prefetch is worth having (PF=0 is 20% behind PF=8) and a 16-block
+// distance was 16% behind the 8-block one -- far enough ahead that the lines it
+// pulls have been evicted again by the time the stream reaches them. Distance 6
+// and 8 are the plateau; 8 is the default because it also matches the width of
+// the tile this loop is built around. KRK_CPU_GEMV_PF still overrides it.
 static i64 pf_ahead_init() {
     const char *e = std::getenv("KRK_CPU_GEMV_PF");
-    return (e && e[0] != '\0') ? std::atoll(e) : 16;
+    return (e && e[0] != '\0') ? std::atoll(e) : 8;
 }
 
 template <i32 kC>
@@ -3794,16 +3807,32 @@ void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
             if (g_pf_ahead > 0)
                 _mm_prefetch(reinterpret_cast<const char *>(wp + g_pf_ahead * 68),
                              _MM_HINT_T0);
-            // Both f16 block halves arrive in ONE 32-bit load: the two bytes at
+            // Both f16 block halves arrive in ONE 32-bit value: the two bytes at
             // wp[0..1] and the two at wp[34..35], packed into lanes 0 and 1 of
             // an epi32. vcvtph2ps then converts both at once, so the pair
             // costs a load and a convert instead of two byte-by-byte
             // assemblies, and the scale vector is one broadcast and one
             // permute instead of two broadcasts and an insert.
-            const u32 s01 = static_cast<u32>(wp[0]) |
-                            (static_cast<u32>(wp[1]) << 8) |
-                            (static_cast<u32>(wp[34]) << 16) |
-                            (static_cast<u32>(wp[35]) << 24);
+            //
+            // The halves are gathered as two 16-bit loads rather than four byte
+            // loads with shifts and ors. That is the whole of the change and it
+            // is worth ~1.14x on the decode GEMV: measured by
+            // tools/bench_gemv_scale, which now runs its arms interleaved and
+            // reports medians, in four runs -- 1.12x, 1.08x, 1.32x, 1.16x against
+            // the byte-pluck form, with the "scale work gone entirely" bound at
+            // 1.22x-1.45x. Notably this beats both table arms (an f16 sidecar at
+            // +5.9% of the weights scored 1.07x-1.28x, an f32 table at +11.8%
+            // scored 1.01x-1.20x), so what was missing was never the table.
+            //
+            // memcpy, not a cast: the block stride is 68 bytes, so these two
+            // loads are unaligned by construction and a reinterpret_cast would
+            // be undefined behaviour that UBSan reports and a sanitizer-free
+            // build silently accepts.
+            u16 s_lo, s_hi;
+            std::memcpy(&s_lo, wp, 2);
+            std::memcpy(&s_hi, wp + 34, 2);
+            const u32 s01 = static_cast<u32>(s_lo) |
+                            (static_cast<u32>(s_hi) << 16);
             const __m128 d2 = _mm_cvtph_ps(_mm_cvtsi32_si128(
                 static_cast<int>(s01)));
             // Measured 2026-10-31: replacing this chain with a pre-expanded
