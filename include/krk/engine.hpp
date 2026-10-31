@@ -1044,7 +1044,12 @@ private:
     // own attention runs against its own KV plane (written at `pos`), and its
     // routed + shared experts run through the model's ExpertCache. With
     // want_logits the shared head writes ws_logits_ for position pos + 1.
-    bool mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits);
+    // `from_chain` feeds the block its OWN previous output instead of the
+    // trunk's captured row: that is what a second proposal in the same round
+    // is built on, and for a hyper-connection head the carried state is the
+    // whole lane stack, not one row.
+    bool mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits,
+                           bool from_chain = false);
     // The block's attention, shared by both head shapes. Split out so the two
     // forms cannot drift: q/k/v, the packed query gate, the per-head QK norm,
     // the rotary and the KV append are one body, and only the thing that
@@ -1052,7 +1057,8 @@ private:
     bool mtp_attn_body(const MtpBlock &m, i32 pos, bool norm_first, i32 window);
     // The qwen4exp form: hyper-connection lanes around attention and around the
     // MoE, with the trunk's own head at the end.
-    bool mtp_hf_block_forward(const MtpBlock &m, i32 pos, bool want_logits);
+    bool mtp_hf_block_forward(const MtpBlock &m, i32 pos, bool want_logits,
+                              bool from_chain);
     // The block's routed + shared expert FFN. Same residency path as a stack
     // layer, keyed on the block's own index, so its experts page in and out of
     // the same budget as everything else.
@@ -1161,6 +1167,10 @@ private:
     // hyper-connection head's prefix actually reads. Zero unless the loaded
     // head is the HF form on a trunk that has the lanes.
     void *mtp_lanes_ = nullptr;
+    // [hc*n_embd]: the lane stack the block produced last, which is the input
+    // to its next proposal in the same round. The hyper-connection form of
+    // `mtp_h_`, which is one row because that block's residual is one row.
+    void *mtp_chain_ = nullptr;
     void *mtp_h_ = nullptr;      // one hidden row, the block's hnorm input
     void *mtp_e_ = nullptr;      // one embedding row, the block's enorm input
     void *mtp_cat_ = nullptr;    // [2, n_embd] the eh_proj input

@@ -188,15 +188,15 @@ not caught, so each is a named refusal:
 
 ## Status
 
-Steps 1.1–1.6 are done: this table, the extended `MtpBlock`, the loader in
+Steps 1.1–1.7 are done: this table, the extended `MtpBlock`, the loader in
 `src/mtp_head.cpp`, the fused-bank views, the host prefix
-(`mtp_dense_prefix`), and the block itself on the device
+(`mtp_dense_prefix`), the block itself on the device
 (`Engine::mtp_hf_block_forward` — hyper-connection around attention and around
-the MoE, its own KV, the trunk's head).
+the MoE, its own KV, the trunk's head), and the chained proposal:
+`Engine::mtp_chain_` hands the block's own `[n_lane * n_embd]` lane stack back
+to its next step, so `--mtp-spec` drafts a chain instead of refusing. Group
+`test_mtp_hf_spec_chain` holds it to plain greedy's text, token for token, with
+a live-attention control that accepts 0 of 36 and still verifies the same text.
 
-What is **not** done is 1.7, the chained proposal: a hyper-connection head
-carries the whole 4-lane stack into its next draft, and the proposer still
-carries one 2560-wide row (`mtp_h_`), so `--mtp-spec` turns itself off with a
-warning when this head is loaded and `--mtp-probe` keeps working. The arch row is
-`Partial` for exactly that reason: it runs and predicts, it cannot yet draft a
-chain, and it has not been measured against a real artifact.
+The arch row stays `Partial` for the one thing left: no real checkpoint has been
+run through it, so acceptance and tokens/s are unmeasured (plan 1.8).

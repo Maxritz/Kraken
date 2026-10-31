@@ -26146,6 +26146,150 @@ static bool run_hf_probe(const std::string &trunk, const std::string &head,
     return ok;
 }
 
+// ---- step 1.7: the chained proposal ----------------------------------------
+//
+// A hyper-connection head carries the WHOLE lane stack into its next proposal,
+// so the proposer has to carry that and not one row. There is no checkpoint, so
+// the gate is a property no approximation can fake: with a pass-through head
+// (attention and MoE zero, prefix the identity on the hidden half) the block's
+// first proposal IS the target's own greedy token, so every round must accept
+// it, and speculative decoding must produce text IDENTICAL to plain greedy.
+//
+// That is the same rule the DFlash paths are held to, and it is the only one
+// that separates "the drafter is wired right" from "the drafter is fast": a
+// chain fed the wrong state still emits fluent text through the target's
+// verification, it just stops accepting.
+static void test_mtp_hf_spec_chain() {
+    // NOT "kraken-mtp-hf-spec.gguf": that is exactly what the head builder names
+    // its file, and the trunk was silently overwritten by it (the loader then
+    // reported "missing core geometry" for a file it had just written itself).
+    const std::string trunk = "kraken-mtp-spec-trunk.gguf";
+    CHECK(build_tiny_q4_model(trunk, 0, 0, 0, true, false, true),
+          "wrote the four-lane trunk for the chain test");
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+    MtpHfSpec2 s;
+    const std::string head = build_mtp_hf_passthrough("spec", s);
+    // The negative control: the SAME head with a live attention output, so its
+    // proposals stop being the target's own token. Verification must still
+    // produce the plain text -- a wrong drafter costs speed, never correctness
+    // -- and the acceptance must collapse. Without this arm the equality above
+    // would be non-vacuous only by argument, not by measurement.
+    MtpHfSpec2 bad;
+    bad.live_attn = true;
+    const std::string head_bad = build_mtp_hf_passthrough("specbad", bad);
+    CHECK(!head.empty(), "wrote the pass-through head");
+    CHECK(!head_bad.empty(), "wrote the live-attention control head");
+
+    // One run, greedy, either plain or drafting from `hp`.
+    auto run = [&](const std::string &hp, bool spec, std::vector<i32> *out, u64 *acc,
+                   u64 *prop, int *finish, f64 *ms_out) {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = trunk;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            cfg.mtp_spec = spec;
+            if (spec) cfg.mtp_path = hp;
+            std::string err;
+            if (!engine.init(cpu, cfg, &err)) {
+                if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+            } else {
+                GenerateParams p;
+                p.prompt = "aaaa bbbb cccc dddd eeee";
+                p.max_tokens = 12;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                const auto t0 = std::chrono::steady_clock::now();
+                ok = engine.generate(p, &r) && r.finish != FinishError;
+                const f64 ms = std::chrono::duration<f64, std::milli>(
+                                   std::chrono::steady_clock::now() - t0)
+                                   .count();
+                if (ms_out) *ms_out = ms;
+                if (!ok && !r.error.empty())
+                    std::fprintf(stderr, "  (generate: %s)\n", r.error.c_str());
+                *out = r.tokens;
+                *finish = r.finish;
+                if (acc) *acc = engine.draft_accepted();
+                if (prop) *prop = engine.draft_proposed();
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+    auto show = [](const char *name, const std::vector<i32> &t) {
+        std::string a;
+        for (i32 v : t) a += std::to_string(v) + " ";
+        std::fprintf(stderr, "[mtp7 ] %-16s %s\n", name, a.c_str());
+    };
+
+    std::vector<i32> plain, spec, bad_toks;
+    u64 acc = 0, prop = 0, bacc = 0, bprop = 0;
+    int fin_plain = -1, fin_spec = -1, fin_bad = -1;
+    f64 ms_plain = 0, ms_spec = 0, ms_bad = 0;
+    CHECK(run(std::string(), false, &plain, nullptr, nullptr, &fin_plain, &ms_plain),
+          "the plain greedy run finishes");
+    CHECK(run(head, true, &spec, &acc, &prop, &fin_spec, &ms_spec),
+          "the drafting run finishes");
+    CHECK(!plain.empty(), "the plain run produced tokens");
+    CHECK(run(head_bad, true, &bad_toks, &bacc, &bprop, &fin_bad, &ms_bad),
+          "the control-drafting run finishes");
+    std::fprintf(stderr,
+                 "[mtp7 ] chain: plain %d finish, %zu token(s); pass-through "
+                 "%d finish, %zu token(s), %llu of %llu kept; live attention "
+                 "%d finish, %zu token(s), %llu of %llu kept\n",
+                 fin_plain, plain.size(), fin_spec, spec.size(),
+                 static_cast<unsigned long long>(acc),
+                 static_cast<unsigned long long>(prop), fin_bad, bad_toks.size(),
+                 static_cast<unsigned long long>(bacc),
+                 static_cast<unsigned long long>(bprop));
+    // Wall time, printed and NOT gated: this fixture is a two-layer trunk with a
+    // one-layer head and an eight-token output, so the number says only which
+    // order of magnitude the round overhead is in. The gate lives on the real
+    // artifact (step 1.8); a 12-token run cannot carry a throughput claim.
+    std::fprintf(stderr,
+                 "[mtp7 ] wall: plain %.1f ms | pass-through %.1f ms | live "
+                 "attention %.1f ms\n",
+                 ms_plain, ms_spec, ms_bad);
+    show("plain:", plain);
+    show("pass-through:", spec);
+    show("live attention:", bad_toks);
+
+    CHECK(spec == plain,
+          "drafting from the block produces the same text as plain greedy");
+    // The same end, not just the same prefix: a round that EMITS the end token
+    // runs on past it (this is how the hole showed up -- 8 tokens plus the
+    // end token, finish=length where plain said finish=eos).
+    CHECK(fin_spec == fin_plain && fin_plain == FinishEos,
+          "the drafting run ends on the end token exactly where plain does");
+    CHECK(fin_bad == fin_plain,
+          "the control run ends in the same place too");
+    CHECK(prop > 0, "the round proposed from the block");
+    CHECK(acc > 0, "a pass-through head's proposals are accepted");
+    // Step 1 of a round must always be accepted here: the head reproduces the
+    // target's own token, so a rejection means the chain's first row is wrong.
+    CHECK(acc * 2 >= prop,
+          "at least half of the proposals are accepted by a pass-through head");
+    CHECK(bad_toks == plain,
+          "a wrong drafter cannot change the text the target verifies");
+    CHECK(bprop > 0, "the control head proposed too");
+    CHECK(bacc * 2 < bprop, "the control head's proposals are mostly rejected");
+
+    std::remove(trunk.c_str());
+    std::remove(head.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
 static void test_mtp_hf_block_qwen4() {
     const std::string trunk = "kraken-mtp-hf-block.gguf";
     CHECK(build_tiny_q4_model(trunk, 0, 0, 0, true, false, true),
@@ -29970,6 +30114,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_mtp_head_qwen4)
     TEST_GROUP(test_mtp_head_prefix)
     TEST_GROUP(test_mtp_hf_block_qwen4)
+    TEST_GROUP(test_mtp_hf_spec_chain)
     TEST_GROUP(test_expert_warmup)
     TEST_GROUP(test_expert_index_adapt)
     TEST_GROUP(test_hc_lanes)

@@ -3,7 +3,8 @@
 Status 2026-10-31, after PR #84. Everything below assumes `main` at `5dae3b8`.
 
 **Progress:** steps **1.1-1.4 are done** (see *Item 1 status* at the end of that
-section). 1.5-1.7 are the forward and are untouched; item 4 has not started.
+section). 1.5-1.7 are done (1.7's speed half needs an artifact); item 4 has not
+started.
 
 The point of this file is that each step has a **done-when** that can fail. A step
 that cannot fail is not a step, it is a description.
@@ -87,8 +88,12 @@ expert, the block router on the trunk's gating convention; (d) final mixer,
 next token for **≥ 60 %** of cells on greedy text. That is the only cheap oracle;
 a wrong pairing or a wrong norm runs, drafts and is rejected every time.
 
-**1.7 — Proposer + the speed gate** (½ session)
-`--mtp-spec` with per-step acceptance and wall time.
+**1.7 — Proposer + the speed gate** (½ session) — **done on the synthetic gate,
+speed half BLOCKED on an artifact** (see 1.7's gate below)
+`--mtp-spec` with per-step acceptance and wall time. The chain is a buffer, not
+an API change: `Engine::mtp_chain_` holds `[n_lane * n_embd]`, the head's forward
+copies it in when it is proposing from its own previous step and writes it back
+after the final mixer, and the proposer asks for it on `d > 0`.
 *Done when:* acceptance ≥ 0.6 at step 1 **and** decode wall time below plain
 decode on the same prompt. A drafter that is accepted but costs more than it
 saves is a regression with a good story.
@@ -110,8 +115,8 @@ code); new group `test_mtp_head_qwen4`; baseline re-recorded.
 | 1.4 | **done** | `Gguf::add_expert_plane_slice` + `GgufTensor::plane_stride`/`plane()`; the expert path reads through `plane()` in all five places it used to compute `data + expert * per`. `test_mtp_head_qwen4` compares **every** expert's gate and up view against the source rows with `memcmp`, not a sample |
 | 1.5 | **done** | `include/krk/mtp_forward.hpp` + `src/mtp_head.cpp` (`mtp_host_prefix_load`, `mtp_dense_prefix`), group `test_mtp_head_prefix`: 18/18 |
 | 1.6 | **done** | `Engine::mtp_hf_block_forward` + `mtp_attn_body` (the attention body factored out of the llama-style block so the two shapes cannot drift); group `test_mtp_hf_block_qwen4`: 17/17 |
-| 1.7 | open | `--mtp-spec` turns itself off for this head with a warning: the chain carries a lane stack the proposer does not carry yet |
-| 1.8 | partly | the arch row is `Partial` (runs and predicts, cannot chain, unmeasured on a real artifact); `test_mtp_head_qwen4` and `test_mtp_hf_block_qwen4` exist; the baseline is not re-recorded until the proposer lands |
+| 1.7 | **done** (synthetic); speed unmeasured | `mtp_chain_` + `from_chain` on both block forwards; `--mtp-spec` no longer refuses this head; group `test_mtp_hf_spec_chain`: 16/16 — identical text to plain greedy on 8/8 tokens, **7 of 12** proposals kept by the pass-through head, **0 of 36** by the live-attention control. Found and fixed on the way: a round emitted the block's own EOS proposal and ran on past it |
+| 1.8 | open | the arch row is still `Partial` (runs, predicts and now chains; unmeasured on a real artifact); baseline re-recorded at 171 groups |
 
 **1.5's gate in this file was wrong, and is corrected here.** It read "scaling
 `R` by 0.5/2 scales `h` linearly". It cannot: the prefix RMS-normalises `h`
@@ -177,10 +182,67 @@ sort (`tools/mtp_extract.py` writes no ratio key), so dense is the correct
 behaviour for the artifact — and inventing a budget would be a guess that costs
 acceptance rather than a feature.
 
-What the port still cannot do: chain a second proposal. The reference feeds the
-whole `hc*n_embd` lane stack into the next draft step; the proposer carries one
-`n_embd` row, so `--mtp-spec` turns itself off with a warning and `--mtp-probe`
-keeps working. That is 1.7.
+**1.7's gate: the chain, and the end token it found.**
+
+The reference feeds the whole `hc * n_embd` lane stack into the next draft step.
+`mtp_block_forward(m, pos, want_logits, from_chain)` now takes it from
+`Engine::mtp_chain_` — written after the final mixer, read only for `d > 0` —
+instead of the single `n_embd` row the llama-shaped path folds into `mtp_h_`,
+and the `--mtp-spec` refusal for an HF head is gone.
+
+The gate cannot be an acceptance rate without a checkpoint, so it is the same
+strict property 1.6 used, moved into the loop: a pass-through head's first
+proposal IS the target's token, so `--mtp-spec` must produce text identical to
+plain greedy, end in the same place, and keep its proposals. The control is the
+same head with live attention, which proposes the wrong token on purpose.
+
+| arm | tokens | proposals kept | finish | wall |
+|---|---|---|---|---|
+| plain greedy | `8 3 3 3 3 3 3 3` | — | EOS | 1.1 ms |
+| pass-through head, `--mtp-spec` | `8 3 3 3 3 3 3 3` (identical) | **7 of 12 (58 %)** | EOS | 2.3 ms |
+| live-attention control, `--mtp-spec` | identical | **0 of 36** | EOS | 2.3 ms |
+
+The third row is the one that makes the second mean something: a drafter that is
+wrong 36 times out of 36 still produces the plain text, because verification —
+not the drafter — decides what is emitted. The acceptance is therefore measuring
+the chain, and only the chain. Step-1 acceptance (the pre-check, i.e. whether the
+block's own first proposal matched the target) was **5 of 5 rounds**; the 58 %
+is the aggregate over later steps, where this 2-layer fixture's logits are nearly
+flat and a pass-through row lands on a tie.
+
+The wall column is printed and deliberately NOT gated: a two-layer trunk with a
+one-layer head and an eight-token output measures round overhead, nothing else.
+The speed half of 1.7 needs the real artifact and the command is fixed now:
+
+```
+kraken -m qwen3.8-30b-a3b-q4.gguf --mtp qwen4-mtp.gguf --mtp-spec -n 128        -p "<a 2 KB prompt>" --stats
+```
+
+with `draft head:` report from the run (rounds, kept/proposed, tokens/round) and
+`decode tok/s` against the same command without `--mtp`.
+
+**The defect this gate caught.** A round emitted the end token. The block
+proposed `</s>` at position 34, the target's verification agreed with it, and
+the accept loop wrote it as a normal token — so the run carried on for three
+more tokens and finished on the length instead of the end token:
+
+```
+plain : 8 3 3 3 3 3 3 3            finish=EOS
+spec  : 8 3 3 3 3 3 3 3 2 3 3 3    finish=LENGTH      <- 2 is </s>
+```
+
+The plain decode loop tests the end token *before* emitting it; a speculative
+round has to as well. Both sides are fixed now, in **all five** speculative
+loops (draft-head greedy, MTP greedy, MTP sampled, DFlash greedy, DFlash
+sampled): the propose loops drop an end-token proposal (the MTP and DFlash ones
+did not), and the accept loops end the run with `FinishEos` if one ever reaches
+them anyway. The group checks the finish code, not just the text — text alone
+would have passed with the trailing `2` trimmed by a coincidence.
+
+One fixture trap, recorded so it is not re-learned: the trunk and the head were
+both built as `kraken-mtp-hf-spec.gguf`, and the head overwrote the trunk, which
+the loader then refused with "missing core geometry" for a file it had just
+written. Test fixtures that share a directory need distinct names.
 
 ---
 

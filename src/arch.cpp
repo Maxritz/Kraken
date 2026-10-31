@@ -1037,12 +1037,14 @@ constexpr ArchSpec kTable[] = {
     {"qwen4-mtp", ArchShape::Moe, ArchSupport::Partial, ArchRole::Draft,
      "qwen4exp",
      "an MTP head set for a qwen4exp target: one block with gated attention, a "
-     "QSA indexer, hyper-connections and a 512-expert MoE. It loads, its "
-     "shapes are checked against the trunk, its fused expert bank is split "
-     "into gate/up views with no copy, and the block runs (--mtp-probe "
-     "predicts). It cannot yet chain a proposal -- that carries a lane stack "
-     "the proposer does not carry (plan 1.7) -- and it has not been measured "
-     "against a real artifact",
+     "QSA indexer (loaded and run dense -- a standalone head declares no block "
+     "budget), hyper-connections and a 512-expert MoE. It loads, its shapes "
+     "are checked against the trunk, its fused expert bank is split into "
+     "gate/up views with no copy, and the block runs and drafts: --mtp-probe "
+     "predicts, and --mtp-spec now chains, carrying the whole lane stack from "
+     "one proposal into the next instead of a single row. What is missing is "
+     "the measurement: acceptance and tokens/s against a real checkpoint are "
+     "unmeasured, so the row stays Partial",
      true, true, false, false},
 
     // A head set is not a model: no token embedding, no output head, nothing to
