@@ -256,8 +256,8 @@ covers rows the first request generated.
 loses the tail) and asserts the claim equals the longest prefix the record and
 the new prompt share -- no over-claim, nothing left on the table.
 
-**B2.3 continuous batching -- slots, batched decode and the wave scheduler are
-in; MLA/compressed attention is refused by name (see the end of this section).**
+**B2.3 continuous batching -- DONE. Slots, batched decode, the wave scheduler and
+per-row addressing in the latent-attention family.**
 
 `AttnDesc::row_pos` / `row_kv_base` were already implemented in the CPU attention
 path. This session finished the other two, and `kraken-attn-multiseq` now proves
@@ -312,20 +312,52 @@ B2.3 started using the field. Fixed, and the arm above is what keeps it fixed.
    so a batched request reports `cached_tokens: 0` rather than claiming rows it
    does not hold.
 
-**What is left (4), and why it is refused by name rather than approximated:**
-`mla_attention`, `mla_shared_attention*` and the compressed/indexer variants each
-own their cache addressing, so a row base means nothing to them yet.
-`batch_refusal()` therefore refuses an MLA, compressed, indexer, hyper-connection,
-PLE, recurrent or drafter model -- in words, at startup -- because the failure a
-wrong batch produces is fluent text from the wrong history, not a crash.
+**4. Per-row addressing in the latent-attention family.** `mla_attention`,
+`mla_shared_attention` and `mla_shared_attention_compressed` each own their cache
+addressing, so the per-row tables had to reach them or a DeepSeek-class file
+stays serial. Two pieces:
 
-**Measured.** Both arms are in `test_batch_decode` (52 checks, in the default
+* the descriptors carry `row_pos`/`row_kv_base`, in `MlaDesc` and
+  `MlaSharedDesc` alike. **Both null means `pos0 + t` and region base 0** -- every
+  existing caller is bit-identical, and the CPU kernels resolve the row through
+  one pair of accessors (`mla_pos`, `mla_row_base`) instead of four copies of the
+  arithmetic;
+* the compressed path's *state* is per sequence, not per layer: the compressor
+  ring, the pooled keys and their positions, the indexer's ring and its pooled
+  keys, and the block count. Those buffers are now `n_slots` spans, indexed by the
+  row's slot, and the per-token loop keys the ring (`pos % ratio`, `(pos/ratio)%2`)
+  and every pooled position off **that row's** position rather than `pos0 + t`.
+  Pooling still runs after the row's own attention, which is what keeps a block's
+  pooled key invisible to its own tokens.
+
+The negative control is the refusal itself, and it is measured, not assumed:
+`Backend::mla_multiseq_supported()` defaults to **false**, and `batch_refusal()`
+keeps the MLA line conditional on it. Two arms in `test_batch_decode` wrap the
+CPU backend (which answers true) and force the answer to false: arm 0 keeps
+per-row attention and drops the latent cache, and the wave is refused with the
+latent-specific reason plus a `FinishError` per request; arm 1 drops both, and the
+generic "does not address the KV cache per row" fires. A backend that cannot
+address the latent cache therefore cannot be batched by accident -- the only
+thing that turns it on is a backend that implements the tables.
+
+Refusal stays by name for what genuinely has no per-row form: diffusion,
+recurrent state, block indexers (QSA/MSA), hyper-connections, PLE windows, the MoE
+route predictor, draft heads, learned positions, ALiBi and a paged KV tier.
+
+**Measured.** Both arms are in `test_batch_decode` (86 checks, in the default
 gate) and `test_batch_throughput` (serial group):
 
 * exactness: one wave of four prompts with different `max_tokens` produces each
   sequence's solo tokens, text and finish reason **exactly** -- and so do the
   four concurrent HTTP requests driven through `OpenAiService`, which is also
   what proves the scheduler does not deadlock;
+* exactness across the latent-attention families: the same wave, three slots
+  taken out of four, against a V2-lite fixture (`mla_attention`), a V4
+  shared-latent fixture (`mla_shared_*`) and a V4 CSA+HCA fixture (ratio 4 with
+  its indexer plus ratio 128, i.e. the compressed ring, the pooled keys and the
+  indexer's own pool) produces each sequence's **solo tokens exactly**. These are
+  the arms that fail if any of `row_pos`, `row_kv_base` or the per-slot state is
+  wrong -- the first two produced fluent, wrong text before the fix, not a crash;
 * aggregate throughput, 4 sequences x 24 tokens, 4 layers x 768 wide, 8 experts
   top-2, median of 3:
   - every expert resident (compute-bound): **1.02x** -- parity;
@@ -339,11 +371,12 @@ gate) and `test_batch_throughput` (serial group):
   is a property of the working set, not of the scheduler.
 
 *Done when:* 4 concurrent requests hold aggregate tok/s above one-at-a-time with
-each response identical to its solo run. **Half met, precisely:** the exactness
-half is met and gated; the throughput half is met only where the step is
-transfer-bound (1.08x-1.27x measured), and is parity when every expert is
-resident. The remaining lever is item 4 and the MoE expert-grouping that makes a
-wave share one expert read -- not the scheduler.
+each response identical to its solo run. **Met, with the throughput caveat stated
+in the numbers above:** exactness is met and gated for every family the engine can
+batch; the aggregate win is real only where the step is transfer-bound
+(1.08x-1.27x measured) and is parity when every expert is resident. The remaining
+lever is the MoE expert-grouping that makes a wave share one expert read -- not
+the scheduler and not the attention.
 
 ### B3 -- A trace file carries no identity -- DONE
 

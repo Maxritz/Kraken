@@ -761,6 +761,10 @@ private:
 
     bool rope_chunk(void *q, void *k, i64 lh, i64 lkvh, i64 hd, i32 n, i32 pos0,
                     i32 layer);
+    // Per-row region bases for one layer's KV plane, or null when this pass is
+    // not a batch. Slot s owns [s*kv_cap_, (s+1)*kv_cap_) of the plane, and the
+    // plane's row stride is that layer's own, in that layer's own unit.
+    const i64 *row_kv_bases(i32 n, i64 pos_stride);
 
     // ---- batch row addressing ---------------------------------------------
     // Set only while a batched run is driving the graph. `fwd_row_slot_` gives
