@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-31T13:10:09Z",
-  "recorded_commit": "27ade3a",
-  "totals": {"groups": 171, "passed": 7320, "run": 7320, "exit": 0},
+  "recorded_utc": "2026-10-31T13:46:41Z",
+  "recorded_commit": "fc54994",
+  "totals": {"groups": 172, "passed": 7329, "run": 7329, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -112,6 +112,7 @@
     {"name": "test_expert_dispatch_host_backed", "status": "pass", "passed": 26, "run": 26},
     {"name": "test_draft_head", "status": "pass", "passed": 50, "run": 50},
     {"name": "test_mtp_sidecar", "status": "pass", "passed": 17, "run": 17},
+    {"name": "test_mtp_sidecar_mla", "status": "pass", "passed": 9, "run": 9},
     {"name": "test_mtp_head_qwen4", "status": "pass", "passed": 21, "run": 21},
     {"name": "test_mtp_head_prefix", "status": "pass", "passed": 18, "run": 18},
     {"name": "test_mtp_hf_block_qwen4", "status": "pass", "passed": 17, "run": 17},

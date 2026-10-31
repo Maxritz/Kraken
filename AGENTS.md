@@ -4191,3 +4191,28 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   the harness's (each kernel must be checked against its own dequantised
   weights). The s4 dot still fails 1e-5 -- 8.5e-4 -- and that one is the format:
   merging blocks onto a common scale truncates the per-lane partial sums.
+- **A head set is named for the head, so comparing its `general.architecture`
+  with the trunk's string refuses every one of them.** `--mtp` compared
+  `side_arch != cfg_.arch` and a `deepseek4-dspark` file beside a `deepseek4`
+  trunk (or `qwen4exp-mtp` beside `qwen4exp`) failed as "a head from another
+  family" before a tensor was read -- the same trap the HF `mtp.*` path had
+  already been fixed for, by sniffing tensors. The comparison now forgives a
+  **registered head set** (`ArchRole::Draft`) whose table `family` matches, and
+  keeps refusing a *model* of the same schema: `qwen2` reads against `llama`, so
+  a family-only rule would accept a whole model as a drafter, and the existing
+  `test_mtp_sidecar` arm caught exactly that (it went red the moment the rule
+  was widened to family alone). Two arms pin it now: `test_mtp_sidecar` (17/17,
+  qwen2 still refused by name) and `test_mtp_sidecar_mla` (9/9, a dspark head
+  set reaches the block loader).
+- **`deepseek4-dspark`'s block is MLA, and the loader said "no attn_q".** The
+  nextn layer in upstream `src/models/deepseek4.cpp` is built from the trunk's
+  own attention -- `attn_q_a`/`attn_q_b`, `attn_kv_a_mqa`/`attn_kv_b` for the
+  V3-class spelling, the shared latent for V4 -- plus `nextn.eh_proj`/`enorm`/
+  `hnorm`/`shared_head_norm`. It is NOT a second hyper-connection block, so
+  item 1's qwen4exp port does not apply; what it needs is the trunk's MLA
+  attention body inside `MtpBlock` (reuse, not a new family). Until then the
+  loader refuses it by naming MLA and the four tensors it found, because "no
+  readable blk.N.attn_q.weight" sends a reader hunting for a missing tensor when
+  the attention BODY is what is missing. General rule: a refusal should name the
+  thing that is absent, and when a family spells the same layer differently, the
+  spelling is the finding.

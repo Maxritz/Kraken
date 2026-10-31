@@ -123,6 +123,7 @@ one command once a file is on disk — see *1.8's runbook* below.
 | 1.5 | **done** | `include/krk/mtp_forward.hpp` + `src/mtp_head.cpp` (`mtp_host_prefix_load`, `mtp_dense_prefix`), group `test_mtp_head_prefix`: 18/18 |
 | 1.6 | **done** | `Engine::mtp_hf_block_forward` + `mtp_attn_body` (the attention body factored out of the llama-style block so the two shapes cannot drift); group `test_mtp_hf_block_qwen4`: 17/17 |
 | 1.7 | **done** (synthetic); speed unmeasured | `mtp_chain_` + `from_chain` on both block forwards; `--mtp-spec` no longer refuses this head; group `test_mtp_hf_spec_chain`: 16/16 — identical text to plain greedy on 8/8 tokens, **7 of 12** proposals kept by the pass-through head, **0 of 36** by the live-attention control. Found and fixed on the way: a round emitted the block's own EOS proposal and ran on past it |
+| `deepseek4-dspark` | **frontier named** | its block is the trunk's MLA attention + the nextn fusion; the family check now lets a registered head set through, and the loader refuses MLA by name. See *deepseek4-dspark* below |
 | 1.8 | **partly** | step-1 acceptance is reported by the engine (`step1_hits()/step1_tries()`) and gated by the group; `scripts/mtp_spec_gate.sh` turns the real check into one command; the arch row stays `Partial` because no checkpoint has been run; baseline re-recorded at 171 groups |
 
 **1.5's gate in this file was wrong, and is corrected here.** It read "scaling
@@ -410,3 +411,44 @@ have:** (1) run `scripts/mtp_spec_gate.sh` on a real `qwen4exp` trunk plus its
 `qwen4-mtp` from `Partial` to `Yes`; (2) wire `deepseek4-dspark`'s own attention
 (markov tensors, `conf_proj`) before its row can move; (3) the prefill format
 only reopens with an artifact that quantifies q8_0's headroom.
+
+---
+
+## deepseek4-dspark: what it actually needs (measured 2026-10-31)
+
+The row was written as "an MTP head set that is not a model". Two things about
+it were wrong in ways that hid each other.
+
+**Its block is MLA, not a llama block.** Upstream's `deepseek4.cpp` builds the
+nextn layer out of the trunk's own attention — `attn_q_a`/`attn_q_b`,
+`attn_kv_a_mqa`/`attn_kv_b` on the V3-class spelling, the shared latent on V4 —
+plus `nextn.eh_proj`/`enorm`/`hnorm`/`shared_head_norm`. So it is not a second
+copy of the qwen4exp hyper-connection block (item 1 above), and the port it
+needs is the trunk's MLA attention body inside `MtpBlock`, not a new family of
+tensors. Kraken-x already runs MLA on the trunk (`deepseek4` is `Yes`), so the
+work is reuse, which is what the plan's "reuse, do not share code" meant.
+
+**And it could never load, for a reason that had nothing to do with its block.**
+The sidecar loader compared `general.architecture` with the trunk's *string*, so
+every head set whose name is not its trunk's — which is all of them: this file
+says `deepseek4-dspark`, the trunk says `deepseek4` — was refused as "another
+family" before a single tensor was read. It now forgives a *registered head set*
+(role `Draft`) whose table `family` matches the trunk's, and still refuses a
+model of the same schema (`qwen2` beside `llama`), because pointing `--mtp` at a
+whole model has to keep its error. Measured both ways in `test_mtp_sidecar_mla`
+(9/9) and the existing `test_mtp_sidecar` (17/17).
+
+Past the family check, the block loader now names the real gap instead of a
+missing tensor:
+
+```
+kraken-mtp-mla-side.gguf: the nextn block is MLA (blk.1.attn_q_a/blk.1.attn_q_b,
+blk.1.attn_kv_a_mqa/blk.1.attn_kv_b), a latent attention this sidecar loader
+does not run -- it reads llama-style q/k/v blocks only. The block needs the
+trunk's MLA attention body wired into MtpBlock (deepseek4-dspark, plan item 1)
+```
+
+That is the frontier, and it is one body wide: `MtpBlock` needs the MLA
+attention path (latent q/kv, decoupled rope, absorb-or-not by layout), after
+which the nextn fusion and the trunk's head are the code that already runs. The
+row stays `No` until that lands; the reason it gives is now the true one.

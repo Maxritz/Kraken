@@ -5050,12 +5050,30 @@ bool Model::load_mtp_block(std::string *err) {
             return ok;
         }
         if (!side_arch.empty() && side_arch != cfg_.arch) {
-            if (err)
-                *err = mtp_path_ + " is a '" + side_arch + "' file and this model "
-                       "is '" + cfg_.arch + "' -- a head from another family "
-                       "proposes tokens this trunk would never accept";
-            mtp_gguf_.reset();
-            return false;
+            // A head set has its OWN arch string -- `deepseek4-dspark` beside a
+            // `deepseek4` trunk, `qwen4exp-mtp` beside `qwen4exp` -- so the
+            // comparison that matters is the SCHEMA it is read against, which
+            // is the table's `family`. Comparing the raw strings refused every
+            // head set whose name is not its trunk's, which is all of them.
+            bool side_known = false;
+            const ArchSpec &side = arch_spec(side_arch, &side_known);
+            const ArchSpec &trunk = arch_spec(cfg_.arch);
+            const char *sf = side_known && side.family ? side.family : side_arch.c_str();
+            const char *tf = trunk.family ? trunk.family : cfg_.arch.c_str();
+            // Only a registered HEAD SET is forgiven its own name. A model of
+            // the same schema (`qwen2` reads against `llama`) is still refused:
+            // pointing --mtp at a whole model is a mistake that must keep its
+            // error, and the schema being similar is not the question a head
+            // set answers.
+            const bool head_set = side_known && side.role == ArchRole::Draft;
+            if (!(head_set && std::string(sf) == tf)) {
+                if (err)
+                    *err = mtp_path_ + " is a '" + side_arch + "' file and this model "
+                           "is '" + cfg_.arch + "' -- a head from another family "
+                           "proposes tokens this trunk would never accept";
+                mtp_gguf_.reset();
+                return false;
+            }
         }
         // The block index is the smallest `blk.<n>.` at or past the trunk's own
         // stack. Reading it from the tensors rather than from block_count keeps
@@ -5113,9 +5131,28 @@ bool Model::load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
         // A nextn block without attention is a shape this loader does not know.
         // Refusing here is the honest answer: silently skipping it would make a
         // drafter that drafts from nothing.
-        if (err)
-            *err = origin + " has no readable " + key(".attn_q.weight") +
-                   " for its nextn block";
+        //
+        // MLA is its own answer, and it is the one a real file gives: a
+        // `deepseek4-dspark` head set carries the trunk's latent attention
+        // (`attn_q_a`/`attn_q_b`, `attn_kv_a_mqa`/`attn_kv_b`) instead of q/k/v,
+        // so "no attn_q" would send a reader looking for a missing tensor rather
+        // than a missing attention body.
+        const bool mla = tensor(key(".attn_q_a.weight")) ||
+                         tensor(key(".attn_q_b.weight")) ||
+                         tensor(key(".attn_kv_a_mqa.weight")) ||
+                         tensor(key(".attn_kv_b.weight"));
+        if (err) {
+            *err = mla
+                       ? origin + ": the nextn block is MLA (" + key(".attn_q_a") +
+                             "/" + key(".attn_q_b") + ", " + key(".attn_kv_a_mqa") +
+                             "/" + key(".attn_kv_b") +
+                             "), a latent attention this sidecar loader does not "
+                             "run -- it reads llama-style q/k/v blocks only. The "
+                             "block needs the trunk's MLA attention body wired "
+                             "into MtpBlock (deepseek4-dspark, plan item 1)"
+                       : origin + " has no readable " + key(".attn_q.weight") +
+                             " for its nextn block";
+        }
         return false;
     }
     for (DType t : {tq->type, tk->type, tv->type, to->type}) {

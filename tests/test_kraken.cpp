@@ -22116,6 +22116,109 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
 //
 // The relation asserted is exact arithmetic on the same f32 row, so the only
 // slack is printf's 7 significant digits (1e-6 relative).
+// ---- a deepseek4-dspark head set: MLA, and the refusal that says so ---------
+//
+// A `deepseek4-dspark` file is deepseek4's nextn block, and a deepseek4 block
+// is MLA: `attn_q_a`/`attn_q_b` with `attn_kv_a_mqa`/`attn_kv_b` (or the shared
+// latent of V4), never `attn_q`/`attn_k`/`attn_v`. Two things stood between such
+// a file and a useful answer:
+//
+//   1. The sidecar loader compared `general.architecture` with the trunk's
+//      string, so a head set -- always named for the head, not the trunk -- was
+//      refused as "another family" before anything looked at its tensors. It
+//      compares the table's FAMILY now, which is the schema the file is read
+//      against and the thing that refusal was always about.
+//   2. With the family check passed, the block loader reported "no readable
+//      blk.N.attn_q.weight", which sends a reader hunting for a missing tensor
+//      instead of a missing attention body. It names MLA now.
+//
+// The block itself still cannot run: wiring the trunk's MLA attention into
+// MtpBlock is what `deepseek4-dspark` needs, and this group pins the frontier
+// rather than claiming it.
+static std::string build_mtp_sidecar_mla(const std::string &path, int block) {
+    GgufBuilder b;
+    b.meta_str("general.architecture", "deepseek4-dspark");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("deepseek4-dspark.block_count", static_cast<u32>(block + 1));
+    auto w2 = [&](const std::string &name, u64 a, u64 c, int seed) {
+        std::vector<f32> v(static_cast<size_t>(a * c));
+        for (size_t i = 0; i < v.size(); i++)
+            v[i] = 0.02f * static_cast<f32>((static_cast<int>((i + seed) % 17)) - 8);
+        b.tensor_f16(name, {a, c}, v);
+    };
+    auto ones = [&](const std::string &name, u64 n) {
+        b.tensor_f32(name, {n}, std::vector<f32>(static_cast<size_t>(n), 1.0f));
+    };
+    const std::string k = "blk." + std::to_string(block) + ".";
+    // The latent attention, exactly as a deepseek4 file spells it.
+    w2(k + "attn_q_a.weight", u64(kMlaEmbd), u64(kMlaQLora), 3);
+    ones(k + "attn_q_a_norm.weight", u64(kMlaQLora));
+    w2(k + "attn_q_b.weight", u64(kMlaQLora), u64(kMlaHead * kMlaKeyLen), 5);
+    w2(k + "attn_kv_a_mqa.weight", u64(kMlaEmbd), u64(kMlaKvLora + kMlaRope), 7);
+    ones(k + "attn_kv_a_norm.weight", u64(kMlaKvLora));
+    w2(k + "attn_kv_b.weight", u64(kMlaKvLora), u64(kMlaHead * (kMlaKeyLen + kMlaValLen)), 9);
+    w2(k + "attn_output.weight", u64(kMlaHead * kMlaValLen), u64(kMlaEmbd), 11);
+    // The nextn half, which is the part this engine already knows how to run.
+    w2(k + "nextn.eh_proj.weight", u64(2 * kMlaEmbd), u64(kMlaEmbd), 13);
+    w2(k + "ffn_gate.weight", u64(kMlaEmbd), u64(kMlaFF), 15);
+    w2(k + "ffn_up.weight", u64(kMlaEmbd), u64(kMlaFF), 17);
+    w2(k + "ffn_down.weight", u64(kMlaFF), u64(kMlaEmbd), 19);
+    ones(k + "attn_norm.weight", u64(kMlaEmbd));
+    ones(k + "post_attention_norm.weight", u64(kMlaEmbd));
+    ones(k + "nextn.enorm.weight", u64(kMlaEmbd));
+    ones(k + "nextn.hnorm.weight", u64(kMlaEmbd));
+    ones(k + "nextn.shared_head_norm.weight", u64(kMlaEmbd));
+    if (!b.write(path)) return std::string();
+    return path;
+}
+
+static void test_mtp_sidecar_mla() {
+    Backend *cpu = make_cpu_backend();
+    const std::string trunk = "kraken-mtp-mla-trunk.gguf";
+    MlaFix f;
+    f.kind = MlaFixKind::Shared; // the V4 shared-latent schema, arch deepseek4
+    CHECK(build_mla_fixture(trunk, f), "wrote a deepseek4 trunk");
+
+    const std::string side = build_mtp_sidecar_mla("kraken-mtp-mla-side.gguf", 1);
+    CHECK(!side.empty(), "wrote a deepseek4-dspark head set");
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(side);
+        const bool ok = m.load(*cpu, trunk, &err);
+        std::fprintf(stderr, "  [mla  ] %s\n", err.c_str());
+        CHECK(!ok, "an MLA head set is refused, not half-loaded");
+        CHECK(err.find("MLA") != std::string::npos,
+              "the refusal names MLA as the reason");
+        CHECK(err.find("attn_q_a") != std::string::npos,
+              "... and names the tensors it found instead of q/k/v");
+        CHECK(err.find("another family") == std::string::npos,
+              "a head set whose arch names its family is NOT refused as a stranger");
+        CHECK(m.mtp().present == false, "and no half-built block is left behind");
+    }
+    // The control: the same tensors behind a trunk of ANOTHER family are still
+    // refused as a stranger, so the family comparison was widened and not
+    // removed.
+    {
+        const std::string other = "kraken-mtp-mla-other.gguf";
+        if (build_sized_model(other, 32, 64, -1)) {
+            Model m;
+            std::string err;
+            m.set_mtp_load(true);
+            m.set_mtp_path(side);
+            CHECK(!m.load(*cpu, other, &err), "a deepseek4 head set is refused "
+                                             "beside a llama trunk");
+            CHECK(err.find("another family") != std::string::npos,
+                  "... for the family reason");
+        }
+    }
+    std::remove(trunk.c_str());
+    std::remove(side.c_str());
+    std::remove("kraken-mtp-mla-other.gguf");
+    delete cpu;
+}
+
 static void test_minicpm3_scale_arithmetic() {
     // A reader for KRK_DUMP's "<stage> L<layer> n=<rows> v v v ..." lines.
     // The `n=` field is the ROW count, not the width: one line carries
@@ -30127,6 +30230,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_expert_dispatch_host_backed)
     TEST_GROUP(test_draft_head)
     TEST_GROUP(test_mtp_sidecar)
+    TEST_GROUP(test_mtp_sidecar_mla)
     TEST_GROUP(test_mtp_head_qwen4)
     TEST_GROUP(test_mtp_head_prefix)
     TEST_GROUP(test_mtp_hf_block_qwen4)
