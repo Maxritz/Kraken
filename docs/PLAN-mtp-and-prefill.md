@@ -449,6 +449,13 @@ Every arithmetic step is the trunk's own function. That is the difference that
 matters: a second MLA body inside `MtpBlock` is how two copies of one arithmetic
 drift, and the drift reads as a mediocre drafter rather than as a bug.
 
+The reference's `build_cvec(inpL, il)` at the end of every block is the base
+class's hook, not a deepseek4 tensor: `deepseek4.cpp` calls it in both graphs and
+defines nothing, and its loader registers no `cvec` weights, so with those
+absent it is the identity. That is why neither the trunk nor this block has a
+step for it -- if a future file ever carries the tensors, the trunk is the first
+place it would have to land.
+
 **3. It needed a KV slot past the stack.** The block attends over latent rows
 only it writes, so `Engine::init` charges one more plane
 (`kv_cap * kv_row_bytes(mla_kv_lora)`) at index `n_layer` and `kvt_k_.base(n_layer)`
