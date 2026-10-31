@@ -16,7 +16,9 @@
 #include "krk/expert_cpu.hpp"
 #include "krk/kv_tier.hpp"
 #include "krk/dsv4_route.hpp"
+#include "krk/draft_block.hpp"
 #include "krk/draft_head.hpp"
+#include "krk/dspark.hpp"
 #include "krk/model.hpp"
 #include "krk/sampler.hpp"
 #include "krk/tokenizer.hpp"
@@ -424,7 +426,7 @@ public:
     bool load_dflash(const std::string &path, std::string *err);
     void unload_dflash();
     bool has_dflash() const { return dflash_ != nullptr; }
-    const DflashDraft *dflash() const { return dflash_; }
+    const DraftBlock *dflash() const { return dflash_; }
 
     // Test/diagnostic access to one draft_block call: exactly the speculative
     // loop's block, wrapped so a caller outside the engine (the suite, a probe
@@ -1062,7 +1064,7 @@ private:
     Engine *draft_ = nullptr;
     // The DFlash head set, if `--draft` named one. Shares this engine's backend
     // and this engine's activations; owns its own KV cache and workspaces.
-    DflashDraft *dflash_ = nullptr;
+    DraftBlock *dflash_ = nullptr;
     i32 draft_tokens_ = 0;
     u64 draft_proposed_ = 0;
     u64 draft_accepted_ = 0;

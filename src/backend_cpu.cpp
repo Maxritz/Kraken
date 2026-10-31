@@ -1107,6 +1107,14 @@ public:
                                  (n_in / 32) >= 2 && ((n_in / 32) & 1) == 0 &&
                                  q8_0_wsc_supported();
             const i64 npair = (n_in / 32) / 2;
+            // KRK_CPU_XSC_HOIST=0 rebuilds the activation-scale array inside the
+            // column loop, which is the shape this had before the hoist. Only
+            // there to keep the comparison measurable.
+            static const bool xsc_hoist = [] {
+                const char *e = std::getenv("KRK_CPU_XSC_HOIST");
+                return !(e != nullptr && e[0] == '0');
+            }();
+            std::vector<f32> xsc_all;
         // Decode, q8_0, VNNI: four output rows per call. Each is an
         // independent weight stream, so a thread keeps four in flight instead
         // of one, which is what this kernel is short of (see the comment on
@@ -1145,7 +1153,17 @@ public:
                     // row -- see build_q8_0_wscales. Built this way the inner
                     // loop has no scale build at all: it is load, vpdpbusd,
                     // vcvtdq2ps, vmulps, vfmadd.
-                    std::vector<f32> wsc, xsc;
+                    std::vector<f32> wsc;
+                    // Activation scales for EVERY row of the call, built once.
+                    // They do not depend on the column block, so building them
+                    // inside the column loop below would repeat the work once
+                    // per block -- n_out/nc times -- for a result that is
+                    // already in hand. Sized rows8 * npair * 16 floats, which is
+                    // one byte per activation element.
+                    if (use_wsc && xsc_hoist) {
+                        xsc_all.resize(static_cast<size_t>(rows8 * npair * 16));
+                        build_q8_0_xscales(xdp, nb, rows8, n_in, xsc_all.data());
+                    }
                     for (i64 c = cb; c < ce; c++) {
                         const i64 o0 = c * nc;
                         const i64 o1 = std::min<i64>(n_out, o0 + nc);
@@ -1156,12 +1174,10 @@ public:
                                 row_bytes, o1 - o0, n_in, wsc.data());
                         }
                         for (i64 r = 0; r < rows8; r += 8) {
-                            if (use_wsc) {
-                                // Activation scales for these eight rows, once
-                                // per row tile -- shared by every output row.
-                                xsc.resize(static_cast<size_t>(8 * npair * 16));
+                            if (use_wsc && !xsc_hoist) {
+                                xsc_all.resize(static_cast<size_t>(8 * npair * 16));
                                 build_q8_0_xscales(xdp + r * nb, nb, 8, n_in,
-                                                   xsc.data());
+                                                   xsc_all.data());
                             }
                             for (i64 o = o0; o < o1; o++) {
                                 const u8 *wr =
@@ -1171,7 +1187,8 @@ public:
                                         wr, xqp + r * n_in, xdp + r * nb, n_in,
                                         n_in, nb, of + r * n_out + o, n_out,
                                         wsc.data() + (o - o0) * npair * 16,
-                                        xsc.data());
+                                        xsc_all.data() +
+                                            (xsc_hoist ? r * npair * 16 : 0));
                                 else
                                     dot8(wr, r, o);
                             }

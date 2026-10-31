@@ -12975,6 +12975,224 @@ static void test_speculative_decoding() {
     // (cleanup disabled for debugging)
 }
 
+
+// ---------------------------------------------------------------------------
+// DSpark head set: loads, refuses a mismatched target, and its Markov chain is
+// real
+// ---------------------------------------------------------------------------
+// DSpark is a parallel block drafter served by src/dspark.cpp. Its weights are
+// borrowed at run time (the target's embedding and head), so the three things a
+// fixture can prove are the three things the loader decides:
+//
+//   1. a head set whose fusion width matches the target loads;
+//   2. the same file against a target of a DIFFERENT width is refused, naming
+//      both widths -- not resized, and not loaded to draft against noise;
+//   3. the Markov head actually conditions row k on the token chosen at row k-1,
+//      which is the one claim that separates a block drafter from a bag of
+//      independent rows.
+//
+// (3) is checked as an invariant the kernel cannot satisfy by accident:
+// markov_prev()[k] is the token the recurrence walked at row k, and it must be
+// the argmax of the row the block emitted for k-1. Turning the head off must
+// change at least one proposed row, or the head is not being applied at all.
+static f32 ds_w(int i) { return 0.15f * static_cast<f32>((i * 29) % 13 - 6); }
+
+static bool build_dspark_head_set(const std::string &path, int n_embd,
+                                  int n_target_layers, bool with_markov,
+                                  bool with_conf, int *n_embd_enc_out) {
+    const int n_layer = 1, n_head = 4, n_kv = 2, hd = 8, n_ff = 32;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, block_size = 4, rank = 8;
+    const int n_embd_enc = n_target_layers * n_embd;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", "dspark");
+    b.meta_str("general.name", "kraken-dspark-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("dspark.block_count", n_layer);
+    b.meta_u32("dspark.context_length", 64);
+    b.meta_u32("dspark.embedding_length", n_embd);
+    b.meta_u32("dspark.feed_forward_length", n_ff);
+    b.meta_u32("dspark.attention.head_count", n_head);
+    b.meta_u32("dspark.attention.head_count_kv", n_kv);
+    b.meta_u32("dspark.attention.key_length", hd);
+    b.meta_f32("dspark.attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_u32("dspark.vocab_size", vocab);
+    b.meta_f32("dspark.rope.freq_base", 10000.0f);
+    b.meta_u32("dspark.rope.dimension_count", hd);
+    b.meta_u32("dspark.block_size", block_size);
+    b.meta_u32("dspark.mask_token_id", 12);
+    b.meta_bool("dspark.attention.causal", false);
+    b.meta_u32("dspark.encoder.embd", n_embd_enc);
+    b.meta_bool("dspark.markov.enabled", true);
+    b.meta_u32("dspark.markov.rank", rank);
+    // Capture ids are the target's own layer numbering for `build_sized_model`:
+    // a one-layer target can supply id 0 (the input of layer 0) and id 1 (the
+    // pre-final-norm state, equal to its layer count).
+    std::vector<i32> tl;
+    for (int i = 0; i < n_target_layers; i++) tl.push_back(i == 0 ? 0 : 1);
+    b.meta_i32_array("dspark.target_layers", tl);
+
+    auto mat = [&](const std::string &nm, int rows, int cols, int seed) {
+        std::vector<f32> v(static_cast<size_t>(rows) * cols);
+        for (size_t i = 0; i < v.size(); i++)
+            v[i] = ds_w(static_cast<int>(i) + seed * 977);
+        // ne = [cols, rows]: the contraction is over the inner (column) axis.
+        b.tensor_f16(nm, {static_cast<u64>(cols), static_cast<u64>(rows)}, v);
+    };
+    mat("fc", n_embd, n_embd_enc, 1);
+    mat("output_norm", 1, n_embd, 2);
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        mat(p + "attn_norm", 1, n_embd, 3 + l);
+        mat(p + "ffn_norm", 1, n_embd, 4 + l);
+        mat(p + "attn_q", q_dim, n_embd, 5 + l);
+        mat(p + "attn_k", kv_dim, n_embd, 6 + l);
+        mat(p + "attn_v", kv_dim, n_embd, 7 + l);
+        mat(p + "attn_output", n_embd, q_dim, 8 + l);
+        mat(p + "attn_q_norm", 1, hd, 9 + l);
+        mat(p + "attn_k_norm", 1, hd, 10 + l);
+        mat(p + "ffn_gate", n_ff, n_embd, 11 + l);
+        mat(p + "ffn_up", n_ff, n_embd, 12 + l);
+        mat(p + "ffn_down", n_embd, n_ff, 13 + l);
+    }
+    if (with_markov) {
+        mat("markov.w1", rank, n_embd, 20);
+        mat("markov.w2", vocab, rank, 21);
+    }
+    if (with_conf) mat("confidence.proj", 1, n_embd, 22);
+    if (n_embd_enc_out) *n_embd_enc_out = n_embd_enc;
+    return b.write(path);
+}
+
+static void test_dspark_head_set() {
+    const std::string target = std::string("kraken-dspark-target.gguf");
+    const std::string head = std::string("kraken-dspark.gguf");
+    if (!build_sized_model(target, 32, 64, 12) ||
+        !build_dspark_head_set(head, 32, 2, true, true, nullptr)) {
+        CHECK(false, "wrote the dspark head set and its target");
+        return;
+    }
+    auto *cpu = make_cpu_backend();
+    {
+        Model tm;
+        std::string err;
+        if (!tm.load(*cpu, target, &err)) {
+            CHECK(false, "loaded the dspark target fixture");
+            delete cpu;
+            return;
+        }
+        const ModelConfig &tc = tm.cfg();
+
+        // ---- 1. the matching pair loads --------------------------------
+        {
+            DsparkDraft d;
+            const bool ok = d.load(*cpu, head, 8, 64, tc.n_embd, tc.n_layer,
+                                   tc.n_vocab, &err);
+            CHECK(ok, "a dspark head set whose fusion width matches the target "
+                      "loads");
+            if (ok) {
+                CHECK(d.block_size() == 4, "block size is read from the file");
+                CHECK(!d.causal(), "the block is non-causal, as the schema says");
+                CHECK(d.target_layers().size() == 2,
+                      "two capture slots, in the order the file lists them");
+                CHECK(d.has_markov() && d.markov_rank() == 8,
+                      "the Markov head is loaded at the rank the file declares");
+                CHECK(d.has_confidence(), "the confidence head is loaded");
+                CHECK(d.describe().find("none") == std::string::npos,
+                      "the run report names the heads rather than saying nothing");
+                d.unload();
+            }
+        }
+
+        // ---- 2. a target of the wrong width is refused, not resized ----
+        {
+            DsparkDraft d;
+            // 40-wide features against a 32-wide target: the only value fc can
+            // have that this target can feed is n_aux * 32.
+            const std::string bad = std::string("kraken-dspark-wide.gguf");
+            if (!build_dspark_head_set(bad, 40, 2, true, true, nullptr)) {
+                CHECK(false, "wrote the mismatched dspark head set");
+            } else {
+                err.clear();
+                const bool ok = d.load(*cpu, bad, 8, 64, tc.n_embd, tc.n_layer,
+                                       tc.n_vocab, &err);
+                CHECK(!ok, "a dspark head set built for a wider target is a "
+                           "refusal, not a resize");
+                CHECK(err.find("80") != std::string::npos &&
+                          err.find("32") != std::string::npos,
+                      "the refusal names both widths, so the pair can be fixed "
+                      "without guessing");
+                d.unload();
+                std::remove(bad.c_str());
+            }
+        }
+
+        // ---- 3. the Markov chain is real -------------------------------
+        {
+            DsparkDraft d;
+            if (!d.load(*cpu, head, 8, 64, tc.n_embd, tc.n_layer, tc.n_vocab,
+                        &err)) {
+                CHECK(false, "reloaded the dspark head set for the chain test");
+            } else {
+                const QuantTensor &embd = tm.tok_embd();
+                const QuantTensor &outhead = tm.out_head();
+                const i32 vocab = tc.n_vocab;
+                std::vector<f32> rows_on(static_cast<size_t>(8) * vocab, 0.0f);
+                CHECK(d.capture_slot(0) != nullptr && d.capture_slot(1) != nullptr,
+                      "both capture slots exist, one per declared target layer");
+                const i32 n_on = d.draft_block(embd, outhead, vocab, 7, 3, 4,
+                                               rows_on.data());
+                CHECK(n_on == 3, "a block of 4 rows proposes block_size-1 = 3 "
+                                 "candidates");
+                if (n_on >= 2) {
+                    // markov_prev()[k] is the token the recurrence walked at row
+                    // k, and row k's predecessor is the argmax of row k-1.
+                    const std::vector<i32> &prev = d.markov_prev();
+                    CHECK(prev.size() >= 3, "the Markov walk recorded one entry "
+                                            "per candidate row");
+                    CHECK(prev[1] == 7, "row 1's partner is the last committed "
+                                        "token the block was opened with");
+                    i32 am = 0;
+                    for (i32 v = 1; v < vocab; v++)
+                        if (rows_on[static_cast<size_t>(v)] >
+                            rows_on[static_cast<size_t>(am)])
+                            am = v;
+                    CHECK(prev[2] == am,
+                          "row 2's partner is the token chosen at row 1 -- the "
+                          "chain is walked, not assumed");
+                }
+                std::vector<f32> rows_off(static_cast<size_t>(8) * vocab, 0.0f);
+                setenv("KRK_DSPARK_MARKOV", "0", 1);
+                DsparkDraft d2;
+                const bool ok2 = d2.load(*cpu, head, 8, 64, tc.n_embd, tc.n_layer,
+                                         tc.n_vocab, &err);
+                unsetenv("KRK_DSPARK_MARKOV");
+                if (ok2) {
+                    const i32 n_off = d2.draft_block(embd, outhead, vocab, 7, 3,
+                                                     4, rows_off.data());
+                    bool differs = false;
+                    if (n_off == n_on)
+                        for (size_t i = 0; i < rows_off.size(); i++)
+                            if (rows_off[i] != rows_on[i] &&
+                                std::fabs(rows_off[i] - rows_on[i]) > 1e-6f) {
+                                differs = true;
+                                break;
+                            }
+                    CHECK(differs, "turning the Markov head off changes the "
+                                   "block -- the head is applied, not loaded and "
+                                   "ignored");
+                    d2.unload();
+                }
+                d.unload();
+            }
+        }
+    }
+    delete cpu;
+    std::remove(head.c_str());
+    std::remove(target.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // DFlash head set: loader refused on a mask-id mismatch, by construction
 // ---------------------------------------------------------------------------
@@ -28460,6 +28678,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_q4_0_layout)
     TEST_GROUP(test_q8_0_layout)
     TEST_GROUP(test_q8_0_scale_array_row_keyed)
+    TEST_GROUP(test_dspark_head_set)
     TEST_GROUP(test_vec_dot_fast_opt_in)
     TEST_GROUP(test_gemm_batched_bit_identical)
     TEST_GROUP(test_vec_dot_avx2_matches_fast)

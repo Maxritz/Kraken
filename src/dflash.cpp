@@ -108,6 +108,14 @@ static const GgufTensor *either(const Gguf &g, const char *current,
 
 DflashDraft::~DflashDraft() { unload(); }
 
+std::string DflashDraft::describe() const {
+    return format("dflash %s (%s): %d layers, %d embd, %d/%d heads, ff %d, "
+                  "block %d, mask %d, %s block",
+                  cfg_.name.c_str(), cfg_.arch.c_str(), cfg_.n_layer, cfg_.n_embd,
+                  cfg_.n_head, cfg_.n_head_kv, cfg_.n_ff, block_size_, mask_id_,
+                  causal_ ? "causal" : "non-causal");
+}
+
 void DflashDraft::use_target_out_norm(const f32 *gain) {
     // ALIASED, not copied. The pointer the engine hands over is the backend's own
     // weight handle (device memory on HIP, host memory on the CPU backend), which
