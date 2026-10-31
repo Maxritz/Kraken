@@ -1,10 +1,23 @@
 # KRAKEN — pending work and open issues
 
 Live list of what is unfinished, what is broken, and what is blocked. Ordered
-by severity, not by age. Current pass: 2026-10-11, C1 fixed, Spark rechecked,
-bounded expert prefetch repaired. [Current pending index](AUDIT-pending-index.md)
-and [expert-cache plan](AUDIT-expert-cache-next.md) distinguish open work from
-the historical entries below.
+by severity, not by age. **Current pass: 2026-10-31.** This file is the long
+tail; the authoritative short list is [PLAN-remaining.md](PLAN-remaining.md),
+whose order table is kept current, and [AUDIT-pending-index.md](AUDIT-pending-index.md)
+triages what is open against what is historical. Entries below are dated and are
+NOT re-verified by a later pass -- read the date on the entry, not the file's.
+
+Settled since the 2026-10-11 pass, so the entries below that mention them are
+history rather than work:
+
+| item | evidence |
+|---|---|
+| TSAN listen-descriptor race | B4: ownership redesign, pre-fix code reproduces the race, current tree clean, `test_http_listener_lifetime` 15/15 |
+| continuous batching for MLA / V4 compressed | per-row `row_pos`/`row_kv_base` + per-slot compressor state; `test_batch_decode` runs a wave against MLA-lite, V4 shared-latent and V4 CSA+HCA and matches each solo run exactly |
+| CPU GEMM repack (B1) | closed by measurement: `wsc8` is the best of the arms tried; pv8 is 7-9 % slower |
+| trace identity (B3) | `test_dump_identity` 17/17 |
+| q8_0 decode GEMV prefetch/pluck (PR #94) | default prefetch distance 8; 1.17-1.24x in the kernel harness, engine fixture unchanged |
+| mixed-format routed-expert trio (PR #95) | refused by name in all three loaders; `test_mixed_expert_formats` 7/7 |
 
 Status of each area is in [docs/STATUS.md](STATUS.md); this file is the
 "what still needs doing" view of the same project.
