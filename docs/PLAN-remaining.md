@@ -54,6 +54,27 @@ project measured, and each is a switch or one line:
 
 **Cost:** half a session once the files exist.
 
+**A malformed export is refused by name, not accommodated (checked
+2026-10-31).** llama.cpp [#30696](https://github.com/ggml-org/llama.cpp/issues/30696)
+reports a qwen4exp MTP *draft-only* export -- full `block_count`, only the nextn
+block's tensors, no trunk -- segfaulting `llama-server` inside graph reservation:
+`graph_mtp` asserts the four `nextn.*` tensors and then calls `build_hc_mix` on
+trunk tensors that are null, and the symbol-less crash is what a user sees. Three
+synthetic files cover the same ground here, and all three stop at load with the
+answer in the message:
+
+| file | what it is | `kraken -m` says |
+|---|---|---|
+| `/tmp/mx2/draft_only.gguf` | qwen4exp, `block_count=8`, only `blk.8.nextn.*` | `carries no token embedding ... and no attention tensor: its 4 tensor(s) name no model schema` |
+| `/tmp/mx2/draft_partial.gguf` | the same plus embed/norm/head, still no layer | `arch 'qwen4exp' is a gated delta net but its ssm.* geometry is missing` |
+| `/tmp/mx2/no_layers.gguf` | a qwen2moe header that *would* load, zero `blk.*` tensors | `layer 0 is missing its norm weights` |
+
+Exit is 1 in every case; none crashes. The property is structural rather than
+lucky: the schema check (does this tensor set name a model?) and the per-layer
+required-tensor check both run before anything dereferences a weight pointer, so
+a file that declares layers it does not carry cannot reach a forward. No code
+changed for this -- it is a *verified*, not an assumed, refusal.
+
 ### A2 -- `deepseek4-dspark`: wired, `No` -> `Yes`
 
 **Needed:** a `deepseek4` trunk plus its dspark nextn block, either in-file
@@ -83,6 +104,36 @@ and the mask id are all healthy. Plumbing is excluded; the open branch is
 can produce sharp rows at all; (ii) upstream reference logits for one block on
 this pairing. Either answer moves this: a sharp row means the pairing is wrong,
 reference logits mean the graph is.
+
+**External evidence for the same signature (2026-10-31).** A DGX Spark thread on
+DeepSeek-V4-Flash-0731-DSpark reports the identical shape -- draft acceptance
+`~1.0-1.15` tokens/step, 14-18 tok/s -- and it was **not** the model, the
+hardware, or the pairing. The draft had inherited the *trunk's* quantization
+config (ModelOpt NVFP4), so its FP8/MXFP4 expert blocks were run through the
+NVFP4 dequant path. On its own path: position-0 agreement 89-91%, mean acceptance
+length ~4.5, ~70% acceptance, **45.4 tok/s average** (2.7-3.0x). Two lessons that
+transfer:
+
+1. **Flat acceptance is a weight-path signature before it is a pairing verdict.**
+   Shapes and names agree under a wrong format, so nothing upstream fails -- the
+   head is simply fed weights it cannot decode. A3's "pairing / basis" branch is
+   still the open one, but the next thing to rule out is a *format* mismatch
+   between the head's weights and the path they are read through, not the head's
+   training.
+2. **Fail closed, and say which tensor.** Their fix list is a guard that raises
+   when the draft resolves to the trunk's quant path, plus a weight-coverage
+   check per draft stage. Ours had one fail-open of that class -- see below.
+
+**Closed by this (2026-10-31, code):** a routed-expert trio is read as one launch
+in one format (`gemm_group` takes a single weight type; the expert cache sizes a
+fetch from one format), so a gate/up/down that *mix* formats was walked at the
+wrong stride and answered wrongly with every shape check passing. `qwen2moe` with
+`ffn_gate_exps` F16 and `ffn_up_exps` Q8_0 used to load; it is now refused by
+name, both tensors and both formats (`expert_formats_agree`, `src/model.cpp`, all
+three loaders: trunk, llama-style nextn block, dspark head set). An NVFP4 bank
+with no `.scale` sidecar is still 1.0 by construction -- correct for every other
+format -- and now says so loudly (`warn_unscaled_nvfp4`). Negative control: the
+same stack with a uniform trio loads, `test_mixed_expert_formats` 7/7.
 
 ### A4 -- Partial target rows: `qwen2vl`, `qwen3vl`, `gemma2`
 
