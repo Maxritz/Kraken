@@ -186,20 +186,19 @@ unlisted, which is now a named refusal rather than a silent llama-default load.
 | Family | GGUF arch | State | What is missing |
 |---|---|---|---|
 | DeepSeek-V4.1-Flash | `deepseek41` | **Partial** — loads as the deepseek4 graph | compressed attention, the sparse indexer, hyper-connections (`hc_*`), Engram sidecar tensors. A checkpoint carrying them is refused by tensor name |
-| MiniMax-M3.1-Flash | `minimax-m3` | **No**, but two of its four gaps are now closed | **MSA is implemented**: `AttnDesc::key_runs` is a visible-key run list (block-sparse, no dense prefix) with a CPU kernel, and `src/msa.cpp` does the block selection — pool, score, top-budget, local block always kept — verified bit-for-bit against dense attention when the budget selects every block. **The DSpark draft head it ships now loads** as a drafter (`src/dspark.cpp`). Still refused because no GGUF schema for the family has been validated (the loader has nothing to check a file against) and the native vision/video tower has no forward |
+| MiniMax-M3.1-Flash | `minimax-m3` | **supported** — schema and graph | nothing: the schema is llama.cpp's own (`src/models/minimax-m3.cpp`), the block selector is `Engine::msa_select_block`, and the whole graph prefills and decodes a synthetic file of the family (`test_minimax_m3_msa`). No 428B checkpoint has been run — the file is a fixture — and two deviations are stated rather than hidden: block sets are unioned across group heads, and a prefill chunk wider than 8 rows attends densely |
 | Qwen3.8-Flash-Next | `qwen4exp` | **supported, gated** — every component has a kernel | not a missing kernel but a missing **whole-graph coherence gate** against an independently verified reference on the real GGUF: one recorded REAP-288 prompt matched 24/24 and another coding prompt historically diverged. Serving fluent wrong output is the failure this engine exists to avoid, so it stays gated until that gate exists (see [TECHNICAL-README.md §4](TECHNICAL-README.md)) |
 | Ornith-1.5-122B | none (unlisted) | **refused as unlisted** | no published GGUF arch string to read it against; refused rather than guessed |
 
-`minimax-m3` was added to the table for a specific reason: the fallback path
-read unlisted files against llama defaults, and a 428B sparse-attention MoE is
-the worst possible candidate for a schema nobody checked — the defaults would
-find a plausible layer stack and compute the wrong graph.
+`minimax-m3` matters for a specific reason: the fallback path read unlisted
+files against llama defaults, and a 428B sparse-attention MoE is the worst
+possible candidate for a schema nobody checked. The schema is now read off
+llama.cpp's own loader rather than guessed from safetensors names, and the block
+selector it needs is the MSA work from the release before this one. The
+vision/video tower the earlier note named is **not in the released file**: the
+reference creates no vision tensors for this arch, so refusing the model for it
+would have kept a loadable family off the list.
 
-MSA now exists as a component, so the refusal can no longer use it as the
-reason and has been reworded to name only what is genuinely absent. That is the
-distinction worth keeping straight: *the attention primitive is implemented and
-tested* while *no file of this family has been read against a validated schema*.
-The second is what blocks the load, and a kernel does not fix it.
 
 ## Refused at load
 

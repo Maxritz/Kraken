@@ -56,6 +56,12 @@ struct DraftBlock {
     // The kind, for switches that must tell the two apart (DSpark can resample
     // a row's logits through its Markov head; DFlash has no such head).
     virtual const char *kind() const = 0;
+
+    // Per-row P(this candidate is right), one entry per row of the block that
+    // was just drafted, or null when the drafter has no such head. The loop
+    // stages a proposal only while this says it is worth verifying: a row the
+    // drafter itself does not believe costs a verifier slot and a rollback.
+    virtual const f32 *row_confidence() const { return nullptr; }
 };
 
 } // namespace krk

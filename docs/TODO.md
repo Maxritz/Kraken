@@ -1048,10 +1048,28 @@ the suspect. Fix = take dequant off the critical path: double-buffered LDS, a
 - **MTP / `qwen4-mtp` / `deepseek4-dspark` shards** — still refused, and for a
   reason a loader cannot fix: a `qwen4-mtp` block is gated attention plus a QSA
   indexer plus hyper-connections plus a 512-expert MoE, none of which has a
-  forward here. This is a block-porting job, not a schema job.
-- **minimax-m3** — MSA (`AttnDesc::key_runs` + `src/msa.cpp`) is implemented and
-  tested against dense; the load is still blocked on there being no validated
-  GGUF schema for the family and no vision/video tower.
+  forward here, and its input is `[norm(embed(t)) ; norm(h_prev)]` -- a shape no
+  loader can produce from the file alone, because half of it is the target's
+  own hidden state. This is a block-porting job: `MtpDraft : DraftBlock`, one
+  block forward reading the target's embedding and head the way the DFlash
+  drafter does, plus the `mtp.*` tensor schema from `tools/mtp_extract.py`.
+  It is the next piece of work, not a finished one.
+- **minimax-m3** — **DONE**: the schema is llama.cpp's own
+  (`src/models/minimax-m3.cpp`), the loader binds it, and the block selector
+  runs (`Engine::msa_select_block`, `KRK_MSA=0` for the dense A/B).
+  `test_minimax_m3_msa` proves three things: the file loads and generates, a
+  budget of 2 blocks of 2 CHANGES the tokens (the run list reaches attention),
+  and a budget that covers every block reproduces dense attention bit for bit.
+  Two deviations are stated in the code: block sets are UNIONED across group
+  heads (this engine has one run list per attention call, the reference selects
+  per head), and selection runs for steps of up to 8 rows, so a wide prefill
+  chunk attends densely -- scoring a 512-row chunk against the whole cache on
+  the host costs more than the dense path it would avoid.
+  The vision/video tower this entry used to name does not exist in the released
+  file: the reference's minimax-m3 loader creates no vision tensors.
+- **Prefill, the next lever** — a longer scale group by construction. Measured:
+  G2 ~1.1x, G4 ~1.19x over the shipped q8_0 kernel, and LOSSY at q8_0's group
+  size, so it has to be a new format rather than a requantisation. Not started.
 - **Architecture pass over every file in the model folders** — the inventory is
   at 44 runnable of 87; the refused ones need either a named dequantizer
   (quant type #100/#101/#102/#104/#107/#142/#143 are all implemented) or a

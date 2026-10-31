@@ -2683,6 +2683,18 @@ struct MoeSpec {
     // file would carry it. Empty means the fixture declares no template, which
     // is the builtin-fallback case.
     std::string chat_template;
+    // ---- minimax-m3's block selector ---------------------------------------
+    // When set, the file carries llama.cpp's five `attention.indexer.*` keys
+    // and one indexer per layer; `no_indexer` drops the tensors but keeps the
+    // metadata, which is the shape the loader has to refuse.
+    bool msa = false;
+    bool no_indexer = false;
+    int idx_head_dim = 8;
+    int idx_heads = 2;
+    int idx_top_k = 2;
+    int idx_block = 2;
+    int idx_local = 1;
+    int idx_block_size_key = 1;   // 0 omits attention.indexer.block_size
 };
 
 static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
@@ -2714,6 +2726,21 @@ static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
     b.meta_u32(arch + ".attention.key_length", hd);
     b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
     b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    if (s.msa) {
+        // llama.cpp's minimax-m3 schema, key for key.
+        b.meta_u32(arch + ".attention.indexer.head_count",
+                   static_cast<u32>(s.idx_heads));
+        b.meta_u32(arch + ".attention.indexer.key_length",
+                   static_cast<u32>(s.idx_head_dim));
+        b.meta_u32(arch + ".attention.indexer.top_k", static_cast<u32>(s.idx_top_k));
+        if (s.idx_block_size_key)
+            b.meta_u32(arch + ".attention.indexer.block_size",
+                       static_cast<u32>(s.idx_block));
+        b.meta_u32(arch + ".attention.indexer.local_blocks",
+                   static_cast<u32>(s.idx_local));
+        b.meta_u32(arch + ".expert_shared_count", s.shared ? 1u : 0u);
+        b.meta_u32(arch + ".expert_gating_func", 2u);   // sigmoid, as the reference
+    }
     if (!s.dense) {
         b.meta_u32(arch + ".expert_count", static_cast<u32>(s.n_expert));
         b.meta_u32(arch + ".expert_used_count", static_cast<u32>(s.n_expert_used));
@@ -2756,7 +2783,26 @@ static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
         b.tensor_f32("blk.0.attn_k_norm.weight", {u64(s.qk_norm)}, kn);
     }
 
+    auto idx_tensors = [&]() {
+        if (!s.msa || s.no_indexer) return;
+        b.tensor_f16("blk.0.index_q_proj.weight",
+                     {u64(n_embd), u64(s.idx_heads * s.idx_head_dim)},
+                     vec(static_cast<size_t>(n_embd) * s.idx_heads * s.idx_head_dim, 3300));
+        b.tensor_f16("blk.0.index_k_proj.weight",
+                     {u64(n_embd), u64(s.idx_head_dim)},
+                     vec(static_cast<size_t>(n_embd) * s.idx_head_dim, 3700));
+        std::vector<f32> qn(static_cast<size_t>(s.idx_head_dim)),
+            kn(static_cast<size_t>(s.idx_head_dim));
+        for (int i = 0; i < s.idx_head_dim; i++) {
+            qn[static_cast<size_t>(i)] = 0.7f + 0.03f * static_cast<f32>(i % 3);
+            kn[static_cast<size_t>(i)] = 0.8f + 0.02f * static_cast<f32>(i % 4);
+        }
+        b.tensor_f32("blk.0.index_q_norm.weight", {u64(s.idx_head_dim)}, qn);
+        b.tensor_f32("blk.0.index_k_norm.weight", {u64(s.idx_head_dim)}, kn);
+    };
+
     if (s.dense) {
+        idx_tensors();
         b.tensor_f16("blk.0.ffn_gate.weight", {u64(n_embd), u64(n_ff)},
                      vec(static_cast<size_t>(n_embd) * n_ff, 500));
         b.tensor_f16("blk.0.ffn_up.weight", {u64(n_embd), u64(n_ff)},
@@ -2800,7 +2846,11 @@ static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
                      vec(static_cast<size_t>(n_embd) * n_ff_sh, 2100));
         b.tensor_f16("blk.0.ffn_down_shexp.weight", {u64(n_ff_sh), u64(n_embd)},
                      vec(static_cast<size_t>(n_ff_sh) * n_embd, 2500));
+        if (s.msa)
+            b.tensor_f32("blk.0.ffn_exp_probs_b.bias", {u64(s.n_expert)},
+                         vec(static_cast<size_t>(s.n_expert), 4100));
     }
+    idx_tensors();
     return b.write(path);
 }
 
@@ -13229,64 +13279,88 @@ static bool build_dspark_head_set(const std::string &path, int n_embd,
     const int n_layer = 1, n_head = 4, n_kv = 2, hd = 8, n_ff = 32;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
     const int vocab = 260, block_size = 4, rank = 8;
+    static_assert(rank == 8, "the chain check below reads markov_prev by index");
     const int n_embd_enc = n_target_layers * n_embd;
 
     GgufBuilder b;
-    b.meta_str("general.architecture", "dspark");
+    // A DSpark file is a DFlash file plus the head -- that is what the reference
+    // implementation loads (spiritbuun/buun-llama-cpp, src/models/dflash.cpp),
+    // and what makes the arch string useless for telling them apart.
+    b.meta_str("general.architecture", "dflash");
     b.meta_str("general.name", "kraken-dspark-test");
     b.meta_u32("general.alignment", 32);
-    b.meta_u32("dspark.block_count", n_layer);
-    b.meta_u32("dspark.context_length", 64);
-    b.meta_u32("dspark.embedding_length", n_embd);
-    b.meta_u32("dspark.feed_forward_length", n_ff);
-    b.meta_u32("dspark.attention.head_count", n_head);
-    b.meta_u32("dspark.attention.head_count_kv", n_kv);
-    b.meta_u32("dspark.attention.key_length", hd);
-    b.meta_f32("dspark.attention.layer_norm_rms_epsilon", 1e-5f);
-    b.meta_u32("dspark.vocab_size", vocab);
-    b.meta_f32("dspark.rope.freq_base", 10000.0f);
-    b.meta_u32("dspark.rope.dimension_count", hd);
-    b.meta_u32("dspark.block_size", block_size);
-    b.meta_u32("dspark.mask_token_id", 12);
-    b.meta_bool("dspark.attention.causal", false);
-    b.meta_u32("dspark.encoder.embd", n_embd_enc);
-    b.meta_bool("dspark.markov.enabled", true);
-    b.meta_u32("dspark.markov.rank", rank);
+    b.meta_u32("dflash.block_count", n_layer);
+    b.meta_u32("dflash.context_length", 64);
+    b.meta_u32("dflash.embedding_length", n_embd);
+    b.meta_u32("dflash.feed_forward_length", n_ff);
+    b.meta_u32("dflash.attention.head_count", n_head);
+    b.meta_u32("dflash.attention.head_count_kv", n_kv);
+    b.meta_u32("dflash.attention.key_length", hd);
+    b.meta_f32("dflash.attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_u32("dflash.vocab_size", vocab);
+    b.meta_f32("dflash.rope.freq_base", 10000.0f);
+    b.meta_u32("dflash.rope.dimension_count", hd);
+    b.meta_u32("dflash.block_size", block_size);
+    b.meta_u32("dflash.mask_token_id", 12);
+    b.meta_bool("dflash.dflash.zero_mask_embedding", false);
+    b.meta_u32("dflash.encoder.embd", n_embd_enc);
+    b.meta_bool("dflash.markov.enabled", true);
+    b.meta_u32("dflash.markov.rank", rank);
     // Capture ids are the target's own layer numbering for `build_sized_model`:
     // a one-layer target can supply id 0 (the input of layer 0) and id 1 (the
     // pre-final-norm state, equal to its layer count).
     std::vector<i32> tl;
     for (int i = 0; i < n_target_layers; i++) tl.push_back(i == 0 ? 0 : 1);
-    b.meta_i32_array("dspark.target_layers", tl);
+    b.meta_i32_array("dflash.target_layers", tl);
 
-    auto mat = [&](const std::string &nm, int rows, int cols, int seed) {
+    auto tensor2 = [&](const std::string &nm, int rows, int cols, int seed) {
         std::vector<f32> v(static_cast<size_t>(rows) * cols);
         for (size_t i = 0; i < v.size(); i++)
             v[i] = ds_w(static_cast<int>(i) + seed * 977);
         // ne = [cols, rows]: the contraction is over the inner (column) axis.
         b.tensor_f16(nm, {static_cast<u64>(cols), static_cast<u64>(rows)}, v);
     };
+    // GGUF head sets name every matrix `<name>.weight`; the DFlash loader reads
+    // that spelling and the portable fallbacks. Writing the bare name here would
+    // test a file no converter produces.
+    auto mat = [&](const std::string &nm, int rows, int cols, int seed) {
+        tensor2(nm + ".weight", rows, cols, seed);
+    };
     mat("fc", n_embd, n_embd_enc, 1);
-    mat("output_norm", 1, n_embd, 2);
+    // The DFlash loader wants the decoder-side output norm under its own name
+    // and the encoder-side one under `enc.*`; a 1-D gain, not a 1-row matrix.
+    auto gain = [&](const std::string &nm, int n, int seed) {
+        std::vector<f32> v(static_cast<size_t>(n));
+        for (size_t i = 0; i < v.size(); i++)
+            v[i] = 1.0f + 0.05f * ds_w(static_cast<int>(i) + seed * 977);
+        b.tensor_f32(nm, {static_cast<u64>(n)}, v);
+    };
+    gain("output_norm.weight", n_embd, 2);
+    gain("enc.output_norm.weight", n_embd, 3);
+    // One gain per capture slot, stacked: [n_embd, n_aux], which is what the
+    // fusion applies before `fc`.
+    tensor2("enc.aux_norm.weight", n_target_layers, n_embd, 40);
     for (int l = 0; l < n_layer; l++) {
         const std::string p = "blk." + std::to_string(l) + ".";
-        mat(p + "attn_norm", 1, n_embd, 3 + l);
-        mat(p + "ffn_norm", 1, n_embd, 4 + l);
+        gain(p + "attn_norm.weight", n_embd, 3 + l);
+        gain(p + "ffn_norm.weight", n_embd, 4 + l);
         mat(p + "attn_q", q_dim, n_embd, 5 + l);
         mat(p + "attn_k", kv_dim, n_embd, 6 + l);
         mat(p + "attn_v", kv_dim, n_embd, 7 + l);
         mat(p + "attn_output", n_embd, q_dim, 8 + l);
-        mat(p + "attn_q_norm", 1, hd, 9 + l);
-        mat(p + "attn_k_norm", 1, hd, 10 + l);
+        gain(p + "attn_q_norm.weight", hd, 9 + l);
+        gain(p + "attn_k_norm.weight", hd, 10 + l);
         mat(p + "ffn_gate", n_ff, n_embd, 11 + l);
         mat(p + "ffn_up", n_ff, n_embd, 12 + l);
         mat(p + "ffn_down", n_embd, n_ff, 13 + l);
     }
+    // [rank, n_vocab] in ggml order: ne[0] is the rank, so the vocabulary is
+    // the row count in `tensor2`'s (rows, cols) convention.
     if (with_markov) {
-        mat("markov.w1", rank, n_embd, 20);
-        mat("markov.w2", vocab, rank, 21);
+        mat("markov_w1", vocab, rank, 20);
+        mat("markov_w2", vocab, rank, 21);
     }
-    if (with_conf) mat("confidence.proj", 1, n_embd, 22);
+    if (with_conf) mat("dspark_conf_proj", 1, n_embd + rank, 22);
     if (n_embd_enc_out) *n_embd_enc_out = n_embd_enc;
     return b.write(path);
 }
@@ -13315,11 +13389,14 @@ static void test_dspark_head_set() {
             DsparkDraft d;
             const bool ok = d.load(*cpu, head, 8, 64, tc.n_embd, tc.n_layer,
                                    tc.n_vocab, &err);
-            CHECK(ok, "a dspark head set whose fusion width matches the target "
-                      "loads");
+            CHECK(ok, std::string("a dspark head set whose fusion width matches "
+                                  "the target loads -- " + err).c_str());
             if (ok) {
-                CHECK(d.block_size() == 4, "block size is read from the file");
-                CHECK(!d.causal(), "the block is non-causal, as the schema says");
+
+                CHECK(d.has_markov() && d.markov_rank() == 8,
+                      "the head declares its rank from the w1 table");
+                CHECK(d.base().block_size() == 4,
+                      "the block half is the DFlash drafter's");
                 CHECK(d.target_layers().size() == 2,
                       "two capture slots, in the order the file lists them");
                 CHECK(d.has_markov() && d.markov_rank() == 8,
@@ -13377,16 +13454,36 @@ static void test_dspark_head_set() {
                     const std::vector<i32> &prev = d.markov_prev();
                     CHECK(prev.size() >= 3, "the Markov walk recorded one entry "
                                             "per candidate row");
-                    CHECK(prev[1] == 7, "row 1's partner is the last committed "
+                    CHECK(prev[0] == 7, "row 0 is conditioned on the last committed "
                                         "token the block was opened with");
                     i32 am = 0;
                     for (i32 v = 1; v < vocab; v++)
                         if (rows_on[static_cast<size_t>(v)] >
                             rows_on[static_cast<size_t>(am)])
                             am = v;
-                    CHECK(prev[2] == am,
-                          "row 2's partner is the token chosen at row 1 -- the "
-                          "chain is walked, not assumed");
+                    CHECK(prev[1] == am,
+                          "row 1 is conditioned on the token chosen at row 0 -- "
+                          "the chain is walked, not assumed");
+                    // The confidence head reads the emitted rows' own hidden
+                    // states, which only exist if the block publishes them
+                    // (`download_last_hidden`). A dead publish leaves the vector
+                    // at its neutral 1.0, so require real sigmoid output.
+                    const std::vector<f32> &conf = d.last_confidence();
+                    i32 real = 0, neutral = 0;
+                    f32 lo = 2.0f, hi = -1.0f;
+                    for (f32 c : conf) {
+                        if (c > 0.0f && c < 1.0f) real++;
+                        if (c == 1.0f) neutral++;
+                        lo = std::min(lo, c);
+                        hi = std::max(hi, c);
+                    }
+                    CHECK(!conf.empty() && neutral == 0 && real == (i32)conf.size(),
+                          format("every row carries a sigmoid confidence read "
+                                 "from its hidden state (%d rows, %d neutral)",
+                                 (int)conf.size(), (int)neutral).c_str());
+                    CHECK(conf.empty() || (hi - lo) > 1e-4f,
+                          "the confidences are not one constant -- the head "
+                          "actually reads each row");
                 }
                 std::vector<f32> rows_off(static_cast<size_t>(8) * vocab, 0.0f);
                 setenv("KRK_DSPARK_MARKOV", "0", 1);
@@ -13408,6 +13505,50 @@ static void test_dspark_head_set() {
                     CHECK(differs, "turning the Markov head off changes the "
                                    "block -- the head is applied, not loaded and "
                                    "ignored");
+                    // ---- the arithmetic, not just the effect ---------------
+                    // The reference's chain has NO activation between the two
+                    // Markov tables: bias = w2 @ w1[prev], col = logits + bias.
+                    // Rebuild it with the same seeded values the fixture wrote
+                    // and require the emitted rows to match. rows_off (the same
+                    // block with the head off) supplies the untouched logits, so
+                    // a shift anywhere else in the block cannot fake a pass --
+                    // and a check that a ReLU in the middle would have differed
+                    // keeps this from passing with both sides wrong.
+                    if (n_off == n_on && n_on >= 1) {
+                        const i32 rank = d.markov_rank();
+                        const i32 stride = vocab;
+                        (void)stride;
+                        auto w_at = [&](int sd_, i32 v, i32 j) {
+                            return ds_w(v * rank + j + sd_ * 977);
+                        };
+                        i32 agree = 0, total = 0, relu_visible = 0;
+                        for (i32 r = 0; r + 1 < n_on; r++) {
+                            const i32 prev_tok = d.markov_prev()[static_cast<size_t>(r)];
+                            for (i32 v = 0; v < vocab; v += 29) {
+                                f32 bias = 0.0f, relu = 0.0f;
+                                for (i32 j = 0; j < rank; j++) {
+                                    const f32 w1p = w_at(20, prev_tok, j);
+                                    bias += w_at(21, v, j) * w1p;
+                                    relu += w_at(21, v, j) * std::max(0.0f, w1p);
+                                }
+                                const size_t at =
+                                    static_cast<size_t>(r) * vocab + v;
+                                const f32 got = rows_on[at] - rows_off[at];
+                                total++;
+                                if (std::fabs(got - bias) < 1e-2f) agree++;
+                                if (std::fabs(relu - bias) > 0.1f) relu_visible++;
+                            }
+                        }
+                        CHECK(total > 8 && agree * 4 >= total * 3,
+                              format("each emitted row is its logits plus w2 @ "
+                                     "w1[prev] with nothing applied in between "
+                                     "(%d of %d match, relu would differ at %d)",
+                                     agree, total, relu_visible).c_str());
+                        CHECK(relu_visible > 0,
+                              "a ReLU between the Markov tables would have "
+                              "changed these rows -- the no-activation path is "
+                              "pinned, not merely present");
+                    }
                     d2.unload();
                 }
                 d.unload();
@@ -13417,6 +13558,131 @@ static void test_dspark_head_set() {
     delete cpu;
     std::remove(head.c_str());
     std::remove(target.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// minimax-m3: the schema loads, and the block selector is the arithmetic
+//
+// The file is llama.cpp's own minimax-m3 schema (src/models/minimax-m3.cpp):
+// leading dense layers, a sigmoid router with a scale and a norm, a wide shared
+// expert on swiglu-oai, per-head QK-norm, partial rotary, and the five
+// `attention.indexer.*` keys with one indexer per selecting layer.
+//
+// Three properties, and the third is the one that makes the first two mean
+// something:
+//   1. the file LOADS and generates (a schema nobody can read is not a schema);
+//   2. with a top_k smaller than the block count the selection CHANGES the
+//      tokens -- the run list reaches attention instead of being computed and
+//      dropped;
+//   3. with top_k large enough for every block, the selection reproduces dense
+//      attention BIT FOR BIT. That is the correctness direction that matters:
+//      a selector that drops keys it should keep is wrong, and the only way to
+//      see it without a reference model is to give it nothing to drop.
+// ---------------------------------------------------------------------------
+static void test_minimax_m3_msa() {
+    const std::string sel = std::string("kraken-minimax-sel.gguf");
+    const std::string all = std::string("kraken-minimax-all.gguf");
+    const std::string noidx = std::string("kraken-minimax-noidx.gguf");
+    const std::string noblk = std::string("kraken-minimax-noblk.gguf");
+
+    MoeSpec m;
+    m.arch = "minimax-m3";
+    m.msa = true;
+    m.qk_norm = 8;           // per-head QK-norm, head_dim wide
+    m.n_expert = 4;
+    m.n_expert_used = 2;
+    m.shared = true;
+    m.idx_head_dim = 8;
+    m.idx_heads = 2;
+    m.idx_top_k = 2;
+    m.idx_block = 2;
+    m.idx_local = 1;
+    CHECK(build_tiny_moe_model(sel, m), "wrote the minimax-m3 selecting file");
+    MoeSpec a = m;
+    a.idx_top_k = 4096;      // every block is affordable: the selector must be a no-op
+    CHECK(build_tiny_moe_model(all, a), "wrote the minimax-m3 all-block file");
+    MoeSpec ni = m;
+    ni.no_indexer = true;
+    CHECK(build_tiny_moe_model(noidx, ni), "wrote the indexer-less file");
+    MoeSpec nb = m;
+    nb.idx_block_size_key = 0;
+    CHECK(build_tiny_moe_model(noblk, nb), "wrote the block-size-less file");
+
+    // A prompt long enough that the cache holds more blocks than the budget, and
+    // a prefill chunk of 8 so the DECODE rows (n == 1) are the ones selecting --
+    // a chunk wider than the selector's row cap attends densely by design.
+    auto run = [](const std::string &path, std::vector<i32> &toks, std::string &err) {
+        // The Engine is declared AFTER the backend's owner so it is destroyed
+        // BEFORE it: an Engine that outlives its backend touches freed memory in
+        // its own destructor, which aborts the whole suite rather than the group.
+        std::unique_ptr<Backend> be(make_cpu_backend());
+        Engine e;
+        EngineConfig c;
+        c.model_path = path;
+        c.n_ctx = 128;
+        c.prefill_chunk = 8;
+        if (!e.init(be.get(), c, &err)) return false;
+        GenerateParams gp;
+        for (int i = 0; i < 40; i++) gp.prompt += "tok" + std::to_string(i % 20 + 4) + " ";
+        gp.max_tokens = 8;
+        gp.sampler.greedy = true;
+        GenerateResult r;
+        const bool ok = e.generate(gp, &r);
+        toks = r.tokens;
+        return ok;
+    };
+
+    std::vector<i32> t_sel, t_dense, t_all;
+    std::string err;
+    // KRK_MSA=0 is the same file with the selection bypassed: dense over every
+    // key, which is the arithmetic the selector has to reproduce at full budget.
+    CHECK(run(sel, t_sel, err), "the selecting minimax-m3 file generates");
+    if (!t_sel.empty()) {
+        setenv("KRK_MSA", "0", 1);
+        const bool ok_dense = run(sel, t_dense, err);
+        unsetenv("KRK_MSA");
+        CHECK(ok_dense, "the same file generates with the selector bypassed");
+        CHECK(ok_dense && t_dense != t_sel,
+              "a budget of 2 blocks of 2 changes the tokens: the run list "
+              "reaches attention, it is not computed and dropped");
+        const bool ok_all = run(all, t_all, err);
+        CHECK(ok_all, "the all-block file generates");
+        CHECK(ok_all && t_all == t_dense,
+              "with a budget that covers every block the selector reproduces "
+              "dense attention bit for bit -- it drops nothing it should keep");
+    }
+
+    // ---- the refusals, each naming its own gap ----------------------------
+    {
+        std::unique_ptr<Backend> be(make_cpu_backend());
+        Engine e;
+        EngineConfig c;
+        c.model_path = noidx;
+        c.n_ctx = 64;
+        std::string le;
+        const bool ok = e.init(be.get(), c, &le);
+        CHECK(!ok, "a minimax-m3 file whose selecting layers carry no indexer "
+                   "tensors is refused");
+        CHECK(le.find("indexer") != std::string::npos,
+              "the refusal names the indexer tensors the layer is missing");
+    }
+    {
+        std::unique_ptr<Backend> be(make_cpu_backend());
+        Engine e;
+        EngineConfig c;
+        c.model_path = noblk;
+        c.n_ctx = 64;
+        std::string le;
+        const bool ok = e.init(be.get(), c, &le);
+        CHECK(!ok, "a file that selects by block without declaring the block "
+                   "size is refused rather than run dense");
+        CHECK(le.find("block_size") != std::string::npos,
+              "the refusal names the missing block_size key");
+    }
+    std::remove(sel.c_str());
+    std::remove(all.c_str());
+    std::remove(noidx.c_str());
+    std::remove(noblk.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -22939,13 +23205,26 @@ static void test_pending_model_refusals() {
               "a k2-horizon file is runnable: MoVA and the grouped norm are served");
         std::remove("kraken-pend-k2.gguf");
     }
-    // ---- minimax-m3: block-sparse throughout, multimodal, DSpark head ----
+    // ---- minimax-m3: SERVED ----------------------------------------------
+    // This used to be an `arm` refusal naming MiniMax Sparse Attention. MSA is
+    // implemented (AttnDesc::key_runs plus the block selector in src/engine.cpp)
+    // and the schema is llama.cpp's own, so the verdict must now say runnable --
+    // a refusal here is what would keep a loadable family off the list. The
+    // loader's own refusals are owned by test_minimax_m3_msa.
     {
         MoeSpec m;
         m.arch = "minimax-m3";
         CHECK(build_tiny_moe_model("kraken-pend-minimax.gguf", m),
               "wrote minimax-m3");
-        arm("kraken-pend-minimax.gguf", "minimax-m3", "MiniMax Sparse Attention");
+        Gguf g;
+        std::string verr;
+        CHECK(g.load("kraken-pend-minimax.gguf", &verr),
+              "the minimax-m3 fixture loads");
+        const ModelVerdict v = assess_model(g);
+        CHECK(v.runnable,
+              "a minimax-m3 file is runnable: the block selector, the shared "
+              "experts and swiglu-oai are all served");
+        std::remove("kraken-pend-minimax.gguf");
     }
     // ---- diffuse (LLaDA): SERVED, not refused ----
     // This used to be an `arm` above: the verdict refused every masked-diffusion
@@ -28904,6 +29183,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_q4_0_layout)
     TEST_GROUP(test_q8_0_layout)
     TEST_GROUP(test_q8_0_scale_array_row_keyed)
+    TEST_GROUP(test_minimax_m3_msa)
     TEST_GROUP(test_dspark_head_set)
     TEST_GROUP(test_msa_block_sparse)
     TEST_GROUP(test_vec_dot_fast_opt_in)

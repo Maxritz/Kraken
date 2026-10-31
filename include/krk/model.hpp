@@ -193,6 +193,10 @@ struct LayerWeights {
     f32 *ple_norm_query = nullptr;
     f32 *ple_norm_conv = nullptr;
     i32 qsa_ratio = 0; // > 0 when this layer carries the QSA indexer
+    // minimax-m3: this layer SELECTS its keys by block (MSA) using the same
+    // indexer tensors. Independent of qsa_ratio -- a minimax file has no cell
+    // budget, so `qsa_ratio` is 0 on every one of its layers.
+    bool msa = false;
     QuantTensor idx_q_proj, idx_k_proj;
     f32 *idx_q_norm = nullptr;
     f32 *idx_k_norm = nullptr;
@@ -795,6 +799,17 @@ struct ModelConfig {
     i32 idx_head_dim = 0;
     i32 idx_top_k = 0;
     std::vector<i32> qsa_ratio;         // per layer, 0 = no indexer
+    // ---- minimax-m3: MiniMax Sparse Attention ------------------------------
+    // The same indexer tensors as qwen4exp's QSA, used differently: the keys
+    // are normed and rotated per POSITION, the score is max-pooled over a
+    // fixed-size block of positions, and the top `idx_top_k` BLOCKS are
+    // attended -- with the `idx_local` blocks above the query always kept, so
+    // the recent past is visible whether or not it wins on score. qsa_ratio is
+    // 0 throughout a minimax file (there is no cell budget to compress), so the
+    // two paths are told apart by this flag and not by geometry.
+    bool msa = false;
+    i32 idx_block = 0;      // positions per block (attention.indexer.block_size)
+    i32 idx_local = 0;      // blocks always kept above the query (.local_blocks)
     bool no_out_norm = false;
     // The recurrent layer's output gate is `sigmoid(z)` rather than `silu(z)`.
     // qwen4exp's build_norm_gated is the one numerical difference from Qwen3.5's

@@ -99,6 +99,13 @@ public:
     // a candidate for.
     i32 block_base() const { return block_base_; }
     i32 n_embd() const { return cfg_.n_embd; }
+    // The vocabulary THIS head set was sized for. A drafter borrows the
+    // target's head, so this is the wider of the two (see load()).
+    i64 cfg_n_vocab() const { return cfg_.n_vocab; }
+    // The block's final hidden rows (post output_norm, pre head), downloaded for
+    // a caller that needs them -- the DSpark confidence head reads exactly
+    // these. Returns false when no block has run yet.
+    bool download_last_hidden(f32 *dst, i32 *rows, i32 *width);
     i32 n_embd_enc() const { return n_embd_enc_; }
     i32 n_layer() const { return cfg_.n_layer; }
     i64 chunk() const { return chunk_; }
@@ -238,6 +245,7 @@ private:
     // many block rows are in the cache, so a caller can tell a drafter that is
     // being fed from one that is running on an empty context.
     i64 committed_ = 0;
+    i32 last_block_nt_ = 0;
     i64 blocks_ = 0;
     friend struct DflashStats;
 };

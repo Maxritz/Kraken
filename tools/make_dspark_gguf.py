@@ -76,6 +76,10 @@ class Gguf:
         self.tensor(name, (cols, rows), DT_F32,
                     struct.pack("<%df" % len(vals), *vals))
 
+    def f32_vector(self, name, n, rng_scale, seed):
+        vals = prng(n, seed, rng_scale)
+        self.tensor(name, (n,), DT_F32, struct.pack("<%df" % len(vals), *vals))
+
     def write(self, path):
         infos = b""
         off = 0
@@ -131,9 +135,13 @@ def main():
                     help="width of the target's residual stream (default: --embd)")
     ap.add_argument("--block-size", type=int, default=8)
     ap.add_argument("--rank", type=int, default=256)
+    ap.add_argument("--markov-scale", type=float, default=0.0,
+                    help="write markov_w2.scale when > 0")
     ap.add_argument("--no-markov", action="store_true")
     ap.add_argument("--no-confidence", action="store_true")
     ap.add_argument("--mask-id", type=int, default=12)
+    ap.add_argument("--arch", default="dflash",
+                    help="general.architecture to write (a real DSpark file says dflash)")
     ap.add_argument("--seed", type=int, default=0xD5A2C)
     ap.add_argument("--scale", type=float, default=0.02)
     a = ap.parse_args()
@@ -146,56 +154,86 @@ def main():
     kv_dim = a.kv_heads * hd
 
     g = Gguf()
-    g.string("general.architecture", "dspark")
+    P = a.arch + "."   # metadata travels under the arch string, as in every GGUF
+    # A DSpark file is a DFlash file: the reference loads it with the DFlash
+    # loader and adds the head when `markov_w1` is present. `--arch dspark` also
+    # works; `dflash` is what a real checkpoint carries.
+    g.string("general.architecture", a.arch)
     g.string("general.name", "kraken-dspark-fixture")
-    g.u32("dspark.block_count", a.layers)
-    g.u32("dspark.embedding_length", a.embd)
-    g.u32("dspark.feed_forward_length", a.ff)
-    g.u32("dspark.attention.head_count", a.heads)
-    g.u32("dspark.attention.head_count_kv", a.kv_heads)
-    g.u32("dspark.attention.key_length", hd)
-    g.f32("dspark.attention.layer_norm_rms_epsilon", 1e-6)
-    g.u32("dspark.vocab_size", a.vocab)
-    g.u32("dspark.context_length", 4096)
-    g.u32("dspark.block_size", a.block_size)
-    g.i32("dspark.mask_token_id", a.mask_id)
-    g.boolean("dspark.attention.causal", False)
-    g.f32("dspark.rope.freq_base", 10000.0)
-    g.u32("dspark.rope.dimension_count", hd)
-    g.i32_array("dspark.target_layers", tl)
-    g.u32("dspark.encoder.embd", n_enc)
-    g.boolean("dspark.markov.enabled", not a.no_markov)
-    g.u32("dspark.markov.rank", a.rank)
+    g.u32(P + "block_count", a.layers)
+    g.u32(P + "embedding_length", a.embd)
+    g.u32(P + "feed_forward_length", a.ff)
+    g.u32(P + "attention.head_count", a.heads)
+    g.u32(P + "attention.head_count_kv", a.kv_heads)
+    g.u32(P + "attention.key_length", hd)
+    g.f32(P + "attention.layer_norm_rms_epsilon", 1e-6)
+    g.u32(P + "vocab_size", a.vocab)
+    g.u32(P + "context_length", 4096)
+    g.u32(P + "block_size", a.block_size)
+    g.i32(P + "mask_token_id", a.mask_id)
+    g.boolean(P + "attention.causal", False)
+    g.f32(P + "rope.freq_base", 10000.0)
+    g.u32(P + "rope.dimension_count", hd)
+    g.i32_array(P + "target_layers", tl)
+    g.u32(P + "encoder.embd", n_enc)
+    g.boolean(P + "markov.enabled", not a.no_markov)
+    g.u32(P + "markov.rank", a.rank)
     g.u32("tokenizer.ggml.mask_token_id", a.mask_id)
 
     seed = a.seed
     sd = seed
 
-    def mat(name, rows, cols):
+    def mat(name, rows, cols, seed=None):
         nonlocal sd
+        sd = sd if seed is None else seed
         sd += 7919
         g.f32_matrix(name, rows, cols, a.scale, sd)
 
+    # Every matrix carries the `.weight` suffix a real GGUF uses -- the DFlash
+    # loader reads that spelling, and a fixture without it would test a file no
+    # converter produces.
+    def mat(name, rows, cols, sv=None):
+        nonlocal sd
+        sd = sd if sv is None else sv
+        sd += 7919
+        g.f32_matrix(name + ".weight", rows, cols, a.scale, sd)
+
+    def gain(name, n):
+        # Gain vectors are 1-D and near 1.0: a norm gain of 0 would make the
+        # fixture's residuals vanish and hide a broken block path.
+        g.f32_vector(name, n, 0.05, hash(name) & 0xFFFF)
+
     mat("fc", a.embd, n_enc)
-    mat("output_norm", 1, a.embd)
+    gain("output_norm.weight", a.embd)
+    gain("enc.output_norm.weight", a.embd)
+    # One gain per capture slot, stacked: [n_embd, n_aux] in ggml order.
+    g.f32_matrix("enc.aux_norm.weight", len(tl), a.embd, 0.05, 0x51A7)
     for l in range(a.layers):
         p = "blk.%d." % l
-        mat(p + "attn_norm", 1, a.embd)
-        mat(p + "ffn_norm", 1, a.embd)
+        gain(p + "attn_norm.weight", a.embd)
+        gain(p + "ffn_norm.weight", a.embd)
         mat(p + "attn_q", q_dim, a.embd)
         mat(p + "attn_k", kv_dim, a.embd)
         mat(p + "attn_v", kv_dim, a.embd)
         mat(p + "attn_output", a.embd, q_dim)
-        mat(p + "attn_q_norm", 1, hd)
-        mat(p + "attn_k_norm", 1, hd)
+        gain(p + "attn_q_norm.weight", hd)
+        gain(p + "attn_k_norm.weight", hd)
         mat(p + "ffn_gate", a.ff, a.embd)
         mat(p + "ffn_up", a.ff, a.embd)
         mat(p + "ffn_down", a.embd, a.ff)
+    # The Markov head, in the reference's own spelling: w1 and w2 are both
+    # [rank, n_vocab] tables (ne[0] = rank = the contraction, ne[1] the
+    # vocabulary), and w1 is read with a row gather indexed by the token.
     if not a.no_markov:
-        mat("markov.w1", a.rank, a.embd)
-        mat("markov.w2", a.vocab, a.rank)
+        mat("markov_w1", a.vocab, a.rank, seed + 1)
+        mat("markov_w2", a.vocab, a.rank, seed + 2)
+        if a.markov_scale > 0.0:
+            g.f32_vector("markov_w2.scale", a.vocab, a.markov_scale, seed + 3)
     if not a.no_confidence:
-        mat("confidence.proj", 1, a.embd)
+        # conf = sigmoid(proj . [hidden ; w1_prev] + bias): the contraction is
+        # n_embd + rank wide, as the reference builds it.
+        mat("dspark_conf_proj", 1, a.embd + a.rank, seed + 4)
+        g.f32_vector("dspark_conf_proj.bias", 1, 0.0, seed + 5)
 
     n = g.write(a.out)
     print("wrote %s: %.2f MiB, %d layers, embd %d, %d/%d heads, ff %d, "

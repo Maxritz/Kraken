@@ -28,7 +28,7 @@ adds six of the GGUF spec's own "known values" architectures — `mpt` and
 **Update (2026-10-29):** every recognised-but-pending family now has a fixture
 built from its own definition, run once, and deleted again —
 `test_pending_model_fixtures` (gemma, gemma2, gemma3, qwen2vl, qwen3vl,
-deepseek41, gpt-oss) and `test_pending_model_refusals` (k2-horizon, minimax-m3,
+deepseek41, gpt-oss) and `test_pending_model_refusals` (k2-horizon,
 diffuse, dspark, deepseek4-dspark, qwen4-mtp). `gemma` and `gemma3` are `Yes` as
 a result; `gemma2` stays `Partial` for one measured reason (its attention-logit
 softcap is applied by the reference attention only, so a HIP build refuses it by
@@ -64,14 +64,14 @@ refused by name.
 
 Verified arch strings in `src/arch.cpp` — KNOWN and read, which is not the same
 as running: `deepseek4-dspark`, `qwen4-mtp`, `dspark`, `k2-horizon`,
-`minimax-m3` and `diffuse` are recognised and still
+`diffuse` is recognised and still
 refused, each with its own named reason (`Assess`, `--inspect`). `gemma4` ran the
 whole dense graph in this pass (below). A recognised
 arch is how a refusal names the graph it read instead of shrugging. The full
 list: `llama`, `qwen2`, `qwen3`, `qwen35`,
 `qwen35moe`, `qwen3moe`, `qwen3vl`, `gemma`, `gemma2`, `gemma3`, `gemma4`,
 `deepseek2`, `deepseek4`, `deepseek41`, `gpt-oss`, `gpt2`, `olmoe`, `lfm2`,
-`lfm2moe`, `nemotron_h`, `nemotron_h_moe`, `minimax-m3`, `laguna`, `k2-horizon`,
+`lfm2moe`, `nemotron_h`, `nemotron_h_moe`, `laguna`, `k2-horizon`,
 `muse-glimmer`, `qwen4exp`, `recurrent`, `dflash`, `dspark`, `diffuse`, `mpt`,
 `bloom`, `falcon` (and `gptneox`, `gptj`, `phi2`, `phi3`). Still absent from the
 spec's known-values list: `mamba`, `rwkv` only.

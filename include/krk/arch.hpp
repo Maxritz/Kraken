@@ -484,6 +484,18 @@ struct ArchSpec {
     // dense FFN had no relu^2 arm at all, so even nemotron's DENSE layers (and
     // every BitNet layer) ran swiglu.
     bool ffn_relu_sqr = false;
+    // MiniMax-M3's key selection (MSA): the same indexer tensors as `qsa`, used
+    // as a BLOCK selector instead of a cell budget -- the leading
+    // `n_dense_lead` layers run dense and every layer after them keeps
+    // `indexer.top_k` blocks of `indexer.block_size` positions plus
+    // `indexer.local_blocks` forced ones.
+    //
+    // Declared LAST on purpose. Every row in src/arch.cpp initializes these
+    // flags POSITIONALLY, so a field inserted in the middle silently rebinds
+    // every argument after it -- which is exactly how a first attempt at this
+    // flag turned `no_out_norm` off for qwen4exp and made every qwen4exp load
+    // fail with "output_norm.weight is missing".
+    bool msa = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

@@ -509,6 +509,7 @@ public:
 
     // Speculation telemetry (valid after a run with a draft loaded).
     u64 draft_proposed() const { return draft_proposed_; }
+    u64 confidence_trimmed() const { return conf_kept_; }
     u64 draft_accepted() const { return draft_accepted_; }
     // Mean acceptance a rejection-sampling verifier would report, summed over
     // proposals under the served regime (temp 1.0, top-k 20): the number a
@@ -880,6 +881,17 @@ private:
     // compact buffer: `attention()` has no mask, and the cell list is per
     // QUERY row, so the compact form is the one that needs no new kernel.
     void qsa_attention(i32 l, i32 n, const AttnDesc &d);
+    // ---- minimax-m3 (MSA) -------------------------------------------------
+    // Indexer keys per POSITION (normed and rotated), max-pooled into blocks of
+    // `idx_block_` positions, then the top `idx_top_k_` blocks per group head --
+    // plus the `idx_local_` blocks above the query, which are kept whether or
+    // not they score. The union across group heads becomes a visible-key run
+    // list for AttnDesc, and causal masking trims it per row. Returns false
+    // when nothing is dropped (every visible block fits) and the layer can run
+    // plain dense attention, which is the reference's own shortcut.
+    bool msa_select_block(const LayerWeights &L, i32 l, i32 n, i64 pos0,
+                          const void *xn);
+    void msa_attention(const AttnDesc &d, const void *kbase, const void *vbase);
     // Chooses the expert residency budget from cfg_ and the device.
     // Chooses the device-side expert budget. Returns false with *err set when
     // an explicit --expert-cache-mb cannot fit the card, which is a refusal
@@ -1067,6 +1079,9 @@ private:
     DraftBlock *dflash_ = nullptr;
     i32 draft_tokens_ = 0;
     u64 draft_proposed_ = 0;
+    // Rows the confidence head told the loop to skip. Zero unless a DSpark head
+    // is loaded and KRK_DSPARK_CONF_THRESH is set.
+    u64 conf_kept_ = 0;
     u64 draft_accepted_ = 0;
     f64 draft_sampled_e_ = 0.0;
     u64 draft_sampled_n_ = 0;
@@ -1290,6 +1305,20 @@ private:
         std::vector<f32> score;  // [chunk, blocks]
     };
     bool qsa_active_ = false;
+    // minimax-m3's block selector. Shares the indexer geometry members above
+    // (`qsa_dim_`, `qsa_heads_` are indexer.key_length / head_count) because it
+    // is the same indexer; what differs is the selection, and `msa_active_`
+    // says which one this model runs.
+    bool msa_active_ = false;
+    i32 msa_block_ = 0;   // indexer.block_size, in POSITIONS
+    i32 msa_local_ = 0;   // indexer.local_blocks forced above the query
+    std::vector<i64> msa_runs_;          // [2 * n_blocks] half-open key runs
+    std::vector<i64> msa_keep_;          // per-row selected block ids
+    std::vector<f32> msa_score_;         // [heads, blocks] max-pooled
+    std::vector<i32> msa_block_used_;    // [blocks] 0/1, union across heads
+    std::vector<f32> msa_iq_;            // host [chunk * heads * idx_dim]
+    std::vector<f32> msa_ik_;            // host [chunk * idx_dim]
+    std::vector<i64> msa_last_blocks_;   // last row's blocks (debug hook)
     i32 qsa_dim_ = 0;    // indexer.key_length
     i32 qsa_heads_ = 0;  // indexer.head_count
     i32 qsa_top_k_ = 0;  // indexer.top_k, in CELLS

@@ -65,7 +65,7 @@ table, refused with a reason. `—` = not in the table yet.
 | Kimi-2 / K2-Horizon | `k2-horizon` | No | table entry, refused |
 | Muse-Glimmer | `muse-glimmer` | ✓ | weightless embedding norm, per-element sigmoid gate, branch post norms at 1e-8, rope on the windowed layers only, `<arch>.logit_scale` before the softcap, window on layers 0..2 of every 4 |
 | DSpark / DFlash | `dspark`, `dflash` | No / ✓ | `dflash` + `dflash-draft` run |
-| MiniMax-M3 | `minimax-m3` | No | table entry, refused |
+| MiniMax-M3 | `minimax-m3` | Yes | schema from llama.cpp `src/models/minimax-m3.cpp`; MSA block selector in `Engine::msa_select_block` |
 | Spark 2.5 | `spark2_5` | ✓ | fused `attn_qkv` row + per-head sigmoid gate |
 | MiniCPM5 | `minicpm3` (`minicpm` v1/v2) | ✓ | |
 | Mellum2 | `mellum` | ✓ | |

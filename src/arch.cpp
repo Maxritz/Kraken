@@ -1072,29 +1072,34 @@ constexpr ArchSpec kTable[] = {
     {"dflash-draft", ArchShape::Dense, ArchSupport::Yes, ArchRole::Draft,
      "dflash", "",
      true, false, false, false, true, true},
-    // DSpark: a parallel BLOCK drafter, served by src/dspark.cpp. It is not a
-    // model and not a DFlash head set -- different block maths, two extra heads
-    // -- but it answers the same six questions the speculative loop asks, so it
-    // plugs in through DraftBlock beside DFlash.
+    // DSpark: a parallel BLOCK drafter. It is not a model and not a DFlash head
+    // set -- a DSpark file IS a DFlash file plus two extra heads -- so
+    // src/dspark.cpp OWNS a DflashDraft and adds the chain, exactly as the
+    // reference (spiritbuun/buun-llama-cpp, src/models/dflash.cpp,
+    // build_dspark_markov_head) does. That is why the arch string cannot tell
+    // the two apart and Engine::load_draft decides on the tensors.
     //
-    // The schema it reads: `fc.weight` over the target-layer stack, a `blk.N`
-    // stack whose attention is non-causal over a draft block of
-    // `dspark.block_size` rows, `markov.w1/w2` (the rank-256 bigram head) and
-    // `confidence.proj`.
+    // The schema, read off that reference: `markov_w1.weight` [rank, n_vocab],
+    // `markov_w2.weight` [rank, n_vocab_draft], optional `markov_w2.scale`,
+    // optional `dspark_conf_proj.weight` [n_embd + rank, 1] with
+    // `dspark_conf_proj.bias`, and `dflash.block_size`. The chain is
+    // `bias = w2 @ w1[prev]`, `col = logits + bias`, `prev = argmax(col)` with NO
+    // activation in between -- applied with one there, every proposal is biased
+    // and the block silently proposes the wrong tokens.
     //
-    // Partial, and the gap is stated rather than papered over: no public GGUF
-    // for this family has been validated here, so the tensor-name spelling is
-    // the `blk.N.*` convention the block loaders already use and both spellings
-    // of each name are tried. A file that carries tensors this loader does not
-    // know is refused by tensor name (see the refused-tensor table), which is
-    // the same gate every other partial architecture passes through. The two
-    // side heads are optional and announce themselves in the load report, so a
-    // file without them still drafts, just without the Markov chain.
+    // Verified: the loader's shapes, the activation-free chain (rebuilt on the
+    // host from the fixture's own seeded values and required to match, with a
+    // ReLU variant required to differ -- test_dspark_head_set) and the
+    // confidence head reading [hidden ; w1_prev]. NOT verified: a real
+    // checkpoint, because none is available in this environment. The entry says
+    // Partial for that reason and no other.
     {"dspark", ArchShape::Dense, ArchSupport::Partial, ArchRole::Draft, "qwen35",
-     "a dspark draft-block head set is served (block decode, Markov bigram head "
-     "and confidence head), but no public checkpoint of this family has been "
-     "validated against this loader, so a file carrying tensors outside the "
-     "blk.N/fc/markov/confidence schema is refused by name",
+     "the reference's schema is read (markov_w1/markov_w2, the optional "
+     "markov_w2.scale and dspark_conf_proj pair, dflash.block_size), the "
+     "activation-free chain and the confidence head are verified against a "
+     "fixture, and the confidence is consumed by the loop "
+     "(KRK_DSPARK_CONF_THRESH); no real checkpoint of this family has been run "
+     "here, so a file carrying tensors outside that schema is refused by name",
      false, false, false, false},
     // Laguna (poolside): MoE with a sigmoid router, a per-expert selection
     // bias added to the probabilities before the top-k, a per-head softplus
@@ -1205,14 +1210,35 @@ constexpr ArchSpec kTable[] = {
     // validated, so the loader cannot say what tensors to read, and the vision
     // tower has no forward at all. Still No -- but the reason now names only
     // what is actually absent, instead of three things of which one is done.
-    {"minimax-m3", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "minimax-m3",
-     "no validated GGUF schema for this family, so the loader has nothing to "
-     "check a file against, and the native vision/video tower has no forward. "
-     "MiniMax Sparse Attention is itself implemented (AttnDesc::key_runs plus "
-     "the block selection in src/msa.cpp: block-sparse with no dense prefix, "
-     "verified against dense attention when the budget selects every block), "
-     "and the DSpark draft head it ships now loads as a drafter",
-     false, false, false, false},
+    // MiniMax-M3.1-Flash: MiniMax-M2's GQA (per-head QK-norm, partial rotary,
+    // sigmoid router with a scale and a norm) with DeepSeek-V3's leading-dense +
+    // routed/shared expert FFN on swiglu-oai, and MiniMax Sparse Attention on
+    // every layer after the dense lead.
+    //
+    // The schema below is llama.cpp's own (`src/models/minimax-m3.cpp`,
+    // read 2026-10-31), not a guess from safetensors names: the three
+    // `attention.indexer.*` geometry keys, `attention.indexer.block_size`,
+    // `attention.indexer.local_blocks`, `leading_dense_block_count`,
+    // `expert_shared_count`, and the `index_{q,k}_proj` / `index_{q,k}_norm`
+    // tensors per selecting layer. The 428B model has 60 layers and 23B active.
+    //
+    // The vision/video tower this row used to name is NOT part of the released
+    // file: the reference's minimax-m3 loader creates no vision tensors and its
+    // graph reads only the text stack (`MTP is not in released model weights`
+    // is the file's own comment). Refusing this model for a tower that does not
+    // exist would have kept a loadable family off the list.
+    [] {
+        ArchSpec s{"minimax-m3", ArchShape::Moe, ArchSupport::Yes,
+                   ArchRole::Target, "minimax-m3", "",
+                   /*qk_norm=*/true, /*q_output_gate=*/false, /*qkv_bias=*/false,
+                   /*gemma_norm=*/false};
+        s.attn_gate = false;
+        s.rope_neox = true;
+        s.swiglu_oai = true;
+        s.msa = true;              // key selection is by BLOCK, not by budget
+        s.attention_implemented = true;
+        return s;
+    }(),
     // muse-glimmer (dense): four pieces of its own around llama's block, read
     // off llama.cpp's src/models/muse-glimmer.cpp.
     //   * a WEIGHTLESS RMS norm on the embedding before layer 0 (`build_norm(

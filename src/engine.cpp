@@ -9,6 +9,7 @@
 #include "krk/dsv4_compress.hpp"
 #include "krk/arch.hpp"
 #include "krk/dflash.hpp"
+#include "krk/msa.hpp"
 #include "krk/host_time.hpp"
 #include "krk/h2d_probe.hpp" // the measured promotion path
 #include "krk/vram_guard.hpp"
@@ -905,6 +906,47 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                    "value_expert_count";
         return false;
     }
+    if (model_.cfg().msa) {
+        const ModelConfig &mc = model_.cfg();
+        // minimax-m3: the same indexer, selecting BLOCKS. There is no cell
+        // budget and no per-layer ratio -- the leading layers are dense and
+        // the rest select, so the only geometry is the block size, the
+        // forced local window and the top-k count.
+        if (mc.idx_head_dim <= 0 || mc.idx_n_head <= 0 || mc.idx_top_k <= 0 ||
+            mc.idx_block <= 0) {
+            if (err)
+                *err = "arch '" + mc.arch +
+                       "': the MSA indexer geometry is incomplete (head_count " +
+                       std::to_string(mc.idx_n_head) + ", key_length " +
+                       std::to_string(mc.idx_head_dim) + ", top_k " +
+                       std::to_string(mc.idx_top_k) + ", block_size " +
+                       std::to_string(mc.idx_block) + ")";
+            return false;
+        }
+        // Read per init, NOT cached in a function-local static: the suite runs
+        // several engines in one process and flips this between them, and a
+        // static made the "selection off" arm run with the selection on -- which
+        // is how two different block budgets produced identical tokens.
+        const char *msa_env = std::getenv("KRK_MSA");
+        const bool msa_on = !(msa_env && msa_env[0] == '0');
+        msa_active_ = msa_on;
+        qsa_dim_ = mc.idx_head_dim;
+        qsa_heads_ = mc.idx_n_head;
+        qsa_top_k_ = mc.idx_top_k;
+        msa_block_ = mc.idx_block;
+        msa_local_ = mc.idx_local;
+        qsa_eps_ = mc.rms_eps;
+        i32 n_msa = 0;
+        for (i32 l = 0; l < mc.n_layer; l++)
+            if (l >= mc.n_dense_lead) n_msa++;
+        KRK_INFO("msa: %d layer(s) select blocks of %d positions (top_k %d, "
+                 "local %d, %d head(s) of %d) -- %s", n_msa, mc.idx_block,
+                 mc.idx_top_k, mc.idx_local, mc.idx_n_head, mc.idx_head_dim,
+                 msa_active_ ? "block selection on"
+                             : "SELECTION OFF (KRK_MSA=0): dense over every "
+                               "key, a superset of what the indexer picks");
+    }
+
     if (model_.cfg().hc) {
         const ModelConfig &hcc = model_.cfg();
         // V4.1's mixer is not qwen4exp's, so its capability is asked
@@ -1372,6 +1414,37 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // QSA workspaces. The projections are per-token rows, so they are
     // chunk-sized; the compact K/V pair is as long as the widest cell budget
     // (`top_k + ratio - 1` cells) and is only touched past that budget.
+    if (msa_active_) {
+        // MSA keeps one processed indexer key per POSITION (norm and rotation
+        // are per position, unlike QSA's pooled blocks), so the host state is
+        // the same shape as QSA's raw key cache.
+        const i64 dim = qsa_dim_;
+        ws_qsa_k_ = alloc(static_cast<size_t>(C * dim) * as);
+        if (!check_alloc(ws_qsa_k_, "ws_qsa_k")) return false;
+        ws_qsa_q_ = alloc(static_cast<size_t>(C * qsa_heads_ * dim) * as);
+        if (!check_alloc(ws_qsa_q_, "ws_qsa_q")) return false;
+        qsa_state_.assign(static_cast<size_t>(mc.n_layer), QsaState{});
+        msa_score_.assign(static_cast<size_t>(qsa_heads_) *
+                              static_cast<size_t>(kv_cap_ / std::max(1, msa_block_) + 2),
+                          0.0f);
+        msa_block_used_.assign(static_cast<size_t>(kv_cap_ / std::max(1, msa_block_) + 2),
+                               0);
+        i64 idx_layers = 0, idx_bytes = 0;
+        for (i32 l = 0; l < mc.n_layer; l++) {
+            const auto &L = model_.layers()[static_cast<size_t>(l)];
+            if (!L.msa) continue;
+            QsaState &st = qsa_state_[static_cast<size_t>(l)];
+            st.keys.assign(static_cast<size_t>(kv_cap_ * dim), 0.0f);
+            idx_layers++;
+            idx_bytes += static_cast<i64>(st.keys.size()) * 4;
+        }
+        KRK_INFO("msa indexer: %lld layer(s) keep their keys on the host "
+                 "(%lld MiB), %d blocks of %d positions",
+                 static_cast<long long>(idx_layers),
+                 static_cast<long long>(idx_bytes >> 20), mc.idx_top_k,
+                 msa_block_);
+        msa_runs_.reserve(static_cast<size_t>(kv_cap_ / std::max(1, msa_block_) + 2) * 2);
+    }
     if (qsa_active_) {
         const i64 dim = qsa_dim_;
         const i64 nh = qsa_heads_;
@@ -3330,6 +3403,165 @@ void Engine::qsa_attention(i32 l, i32 n, const AttnDesc &d) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// minimax-m3: MiniMax Sparse Attention
+//
+// The indexer is qwen4exp's (two projections, one gain per dimension, partial
+// rotary), used differently. QSA pools RAW keys into blocks of `ratio` cells
+// and scores the pooled rows, then keeps `top_k + ratio - 1` CELLS. MSA norms
+// and rotates every key at its OWN position, scores query against every
+// position, max-pools those scores into blocks of `block_size`, and keeps
+// `top_k` BLOCKS per group head, with the `local_blocks` above the query forced
+// in. There is no dense prefix: the leading layers are dense and every later
+// layer selects.
+//
+// Two deviations from the reference, both stated rather than hidden:
+//
+//   * It selects per (row, head). This engine has ONE visible-key run list per
+//     attention call, so the block sets of every contributing (row, head) are
+//     UNIONED. A union over a causal mask is a superset of each row's own
+//     selection, so the result is the model's arithmetic over extra keys the
+//     causal mask then removes -- never a missing key.
+//   * Selection runs for a single-token step (decode) and for chunks up to
+//     `kMsaMaxRows`; a longer prefill chunk attends densely. Scoring a chunk
+//     against the whole cache is O(rows * keys * heads * dim) and is exactly
+//     what makes a 1M-token prefill quadratic, so doing it on the host for a
+//     512-row chunk would be slower than the dense path it is meant to avoid.
+//     The reference scores it on the device. This is a real difference in
+//     prefill cost, not in the arithmetic of a decode step, and the run report
+//     says which path each layer took.
+static constexpr i32 kMsaMaxRows = 8;
+
+bool Engine::msa_select_block(const LayerWeights &L, i32 l, i32 n, i64 pos0,
+                              const void *xn) {
+    msa_runs_.clear();
+    if (!msa_active_ || !L.msa || !xn) return false;
+    if (l < 0 || l >= static_cast<i32>(qsa_state_.size())) return false;
+    const ModelConfig &mc = model_.cfg();
+    QsaState &st = qsa_state_[static_cast<size_t>(l)];
+    const i32 dim = qsa_dim_;
+    const i32 nh = qsa_heads_;
+    const i32 blk = msa_block_;
+    const i64 n_kv = pos0 + n;
+    if (dim <= 0 || nh <= 0 || n <= 0 || blk <= 0) return false;
+    if (n_kv * dim > static_cast<i64>(st.keys.size())) return false;
+    if (L.idx_q_norm_h.empty() || L.idx_k_norm_h.empty()) return false;
+
+    // The indexer's own projections, from the same normed input q/k/v read.
+    gemm_w(ws_qsa_k_, xn, L.idx_k_proj, dim, n_embd_, n);
+    gemm_w(ws_qsa_q_, xn, L.idx_q_proj, static_cast<i64>(nh) * dim, n_embd_, n);
+    msa_ik_.resize(static_cast<size_t>(n) * dim);
+    be_->download_f32(msa_ik_.data(), ws_qsa_k_, static_cast<i64>(n) * dim);
+    msa_iq_.resize(static_cast<size_t>(n) * nh * dim);
+    be_->download_f32(msa_iq_.data(), ws_qsa_q_, static_cast<i64>(n) * nh * dim);
+
+    QsaConfig cfg;
+    cfg.n_head = nh;
+    cfg.head_dim = dim;
+    cfg.top_k = qsa_top_k_;
+    cfg.ratio = blk;
+    cfg.eps = qsa_eps_;
+    cfg.n_rot = mc.rope_dim > 0 ? mc.rope_dim : 0;
+    cfg.inv_freq = model_.inv_freq_at(l).empty() ? nullptr
+                                                 : model_.inv_freq_at(l).data();
+    cfg.rope_scale = model_.rope_scale_at(l);
+    cfg.rope_neox = mc.rope_neox;
+
+    // Keys: norm and rotate at each key's own position, then keep them.
+    {
+        std::vector<i64> kpos(static_cast<size_t>(n));
+        for (i32 t = 0; t < n; t++) kpos[static_cast<size_t>(t)] = pos0 + t;
+        qsa_norm_rope(msa_ik_.data(), L.idx_k_norm_h.data(), n, dim, kpos.data(), cfg);
+        std::memcpy(st.keys.data() + pos0 * dim, msa_ik_.data(),
+                    sizeof(f32) * static_cast<size_t>(n) * dim);
+    }
+    // Queries: norm and rotate at their own positions, one row per head.
+    {
+        std::vector<i64> qpos(static_cast<size_t>(n) * nh);
+        for (i32 t = 0; t < n; t++)
+            for (i32 h = 0; h < nh; h++)
+                qpos[static_cast<size_t>(t) * nh + h] = pos0 + t;
+        qsa_norm_rope(msa_iq_.data(), L.idx_q_norm_h.data(), n * nh, dim,
+                      qpos.data(), cfg);
+    }
+
+    const i64 n_blocks = (n_kv + blk - 1) / blk;
+    msa_last_blocks_.clear();
+    // Every block is affordable: the layer is dense by construction, which is
+    // the reference's own shortcut below `top_k + local` blocks.
+    if (n_blocks <= static_cast<i64>(qsa_top_k_ + msa_local_)) return false;
+    if (n > kMsaMaxRows) return false;
+
+    const size_t nb = static_cast<size_t>(n_blocks);
+    msa_block_used_.assign(nb, 0);
+    std::vector<i32> rank(static_cast<size_t>(n_blocks), 0);
+    for (i32 t = 0; t < n; t++) {
+        const i64 q = pos0 + t;
+        const i64 n_vis = std::min<i64>(n_blocks, q / blk + 1);
+        for (i32 h = 0; h < nh; h++) {
+            const f32 *qv = msa_iq_.data() + (static_cast<size_t>(t) * nh + h) *
+                                                 static_cast<size_t>(dim);
+            for (i64 b = 0; b < n_vis; b++) {
+                const i64 j0 = b * blk;
+                const i64 j1 = std::min<i64>(j0 + blk, q + 1);
+                f32 best = -1e30f;
+                for (i64 j = j0; j < j1; j++) {
+                    const f32 *kvp = st.keys.data() + j * dim;
+                    f32 dot = 0.0f;
+                    for (i32 d = 0; d < dim; d++) dot += qv[d] * kvp[d];
+                    best = std::max(best, dot);
+                }
+                msa_score_[static_cast<size_t>(h) * nb + static_cast<size_t>(b)] = best;
+            }
+            // Top-k blocks for this (row, head), then the forced local ones.
+            for (i64 b = 0; b < n_vis; b++) rank[static_cast<size_t>(b)] = 0;
+            for (i32 k = 0; k < qsa_top_k_; k++) {
+                i64 bestb = -1;
+                f32 bestv = -1e30f;
+                for (i64 b = 0; b < n_vis; b++) {
+                    if (rank[static_cast<size_t>(b)]) continue;
+                    const f32 v =
+                        msa_score_[static_cast<size_t>(h) * nb + static_cast<size_t>(b)];
+                    if (v > bestv) { bestv = v; bestb = b; }
+                }
+                if (bestb < 0) break;
+                rank[static_cast<size_t>(bestb)] = 1;
+                msa_block_used_[static_cast<size_t>(bestb)] = 1;
+            }
+            // The local window: the `msa_local_` blocks ending at the query's
+            // own block, always visible. The reference reaches the same set by
+            // biasing their scores so they rank first; forcing them is the same
+            // set with no arithmetic to get wrong.
+            const i64 qb = q / blk;
+            for (i32 k = 0; k <= msa_local_ && qb - k >= 0; k++)
+                msa_block_used_[static_cast<size_t>(qb - k)] = 1;
+        }
+    }
+    // The union as ascending block ids, then the canonical run list.
+    std::vector<i64> blocks;
+    blocks.reserve(nb);
+    for (size_t b = 0; b < nb; b++)
+        if (msa_block_used_[b]) blocks.push_back(static_cast<i64>(b));
+    if (blocks.empty()) return false;
+    msa_last_blocks_ = blocks;
+    msa_runs_.resize(blocks.size() * 2 + 2);
+    const i32 nruns = msa_runs(msa_runs_.data(), blocks.data(),
+                               static_cast<i32>(blocks.size()), blk,
+                               static_cast<i32>(n_kv));
+    msa_runs_.resize(static_cast<size_t>(std::max<i32>(nruns, 0)) * 2);
+    return !msa_runs_.empty();
+}
+
+// Attention over the blocks the selector kept: the same kernel, with the run
+// list filled in. Causal masking still applies, so a run that reaches past a
+// row's position is trimmed by the kernel rather than by a second list.
+void Engine::msa_attention(const AttnDesc &d, const void *kbase, const void *vbase) {
+    AttnDesc dd = d;
+    dd.n_key_runs = static_cast<i32>(msa_runs_.size() / 2);
+    dd.key_runs = msa_runs_.empty() ? nullptr : msa_runs_.data();
+    be_->attention(ws_attn_, ws_q_, kbase, vbase, dd);
+}
+
 const std::vector<i64> &Engine::qsa_debug_cells(i32 layer) const {
     static const std::vector<i64> none;
     if (!qsa_active_ || layer < 0) return none;
@@ -4217,6 +4449,10 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         const bool qsa_sel =
             qsa_active_ && L.qsa_ratio > 0 &&
             qsa_select_block(L, l, n, pos0, xn_proj);
+        // MSA: the block selector, run from the same normed input and at the
+        // same point (before rope touches q/k, which the indexer does not read).
+        const bool msa_sel =
+            msa_active_ && L.msa && msa_select_block(L, l, n, pos0, xn_proj);
 
         d.layer = l;
         // Resolve this layer's residency before it is read or written.
@@ -4349,6 +4585,8 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                 be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
             if (qsa_sel)
                 qsa_attention(l, n, d);
+            else if (msa_sel)
+                msa_attention(d, kbase, vbase);
             else
                 be_->attention(ws_attn_, ws_q_, kbase, vbase, d);
         }
@@ -6735,26 +6973,31 @@ bool Engine::load_dflash(const std::string &path, std::string *err) {
     // not branch on which one a path names -- the FILE says, and this reads it.
     // DSpark's block is decoded differently (non-causal, plus the Markov and
     // confidence heads) but the loop above only ever sees DraftBlock.
-    std::string darch;
+    // A DSpark file is a DFlash file with a markov head, so the ARCH STRING
+    // cannot tell them apart -- the reference implementation loads both with
+    // its DFlash loader and adds the head when `markov_w1` is present. The
+    // decision is therefore made on the tensors, exactly as it is there.
+    bool is_dspark = false;
     {
         Gguf probe;
         std::string perr;
         if (probe.load(path, &perr))
-            darch = probe.get_str("general.architecture", "");
+            is_dspark = dspark_head_set(probe);
     }
-    if (dspark_arch(darch)) {
+    if (is_dspark) {
         DsparkDraft *sp = new DsparkDraft();
         if (!sp->load(*be_, path, chunk_, kv_cap_, tc.n_embd, tc.n_layer,
                       n_vocab_, err)) {
             delete sp;
             return false;
         }
-        if (sp->mask_id() < 0 || sp->mask_id() >= n_vocab_) {
+        const i32 dmask = sp->base().mask_id();
+        if (dmask < 0 || dmask >= n_vocab_) {
             if (err)
                 *err = format("DSpark mask token %d is outside the target's "
                               "vocabulary (%d) -- this head set is for a "
                               "different target",
-                              sp->mask_id(), n_vocab_);
+                              dmask, n_vocab_);
             delete sp;
             return false;
         }
@@ -13079,6 +13322,25 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             continue;
         }
         d = nrows;
+        // A drafter with a confidence head says which of its own rows it
+        // believes. Staging a row it does not believe buys a verifier slot it
+        // will lose and a rollback it will pay for, so the block is cut at the
+        // first row below the threshold -- but never to nothing, because the
+        // first proposal is what makes this a speculative round at all and one
+        // block was already paid for.
+        if (const f32 *conf = dflash_->row_confidence()) {
+            static const f32 thresh = [] {
+                const char *e = std::getenv("KRK_DSPARK_CONF_THRESH");
+                if (!e) return 0.0f;   // unset: the head is reported, not obeyed
+                return static_cast<f32>(std::strtod(e, nullptr));
+            }();
+            if (thresh > 0.0f) {
+                i32 keep = 0;
+                while (keep < d && conf[keep] >= thresh) keep++;
+                conf_kept_ += static_cast<u64>(std::max<i32>(0, d - keep));
+                d = std::max<i32>(1, keep);
+            }
+        }
         for (i32 j = 0; j < d; j++) {
             const f32 *drow = dlogits.data() +
                               static_cast<size_t>(j) *
