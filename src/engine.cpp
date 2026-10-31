@@ -1220,6 +1220,10 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     kv_cap_ = std::min<i64>(cfg_.n_ctx > 0 ? cfg_.n_ctx : mc.n_ctx_train,
                             mc.n_ctx_train > 0 ? mc.n_ctx_train : 32768);
     if (kv_cap_ <= 0) kv_cap_ = 2048;
+    // Slots are sequences served concurrently, each with its own KV region of
+    // kv_cap_ rows. 1 is the historical engine and changes nothing: every plane
+    // is sized for one context and every address is what it always was.
+    n_slots_ = std::max<i32>(1, std::min<i32>(cfg_.n_slots, 16));
 
     chunk_ = std::max<i32>(1, std::min<i32>(cfg_.prefill_chunk, 1024));
     // ---- the diffusion sequence length ------------------------------------
@@ -2433,6 +2437,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         for (i32 l = 0; l < mc.n_layer; l++) {
             if (!model_.layer_has_kv(l)) continue;
             const size_t b = static_cast<size_t>(kv_cap_) *
+                             static_cast<size_t>(n_slots_) *
                              be_->kv_row_bytes(model_.kv_dim_at(l), kvq);
             kv_len[static_cast<size_t>(l)] = b;
             kv_plane += b;
@@ -2443,6 +2448,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             // reads. `kv_dim_at` cannot answer for this index (it is not a stack
             // layer), so the width comes from the config the same way.
             const size_t b = static_cast<size_t>(kv_cap_) *
+                             static_cast<size_t>(n_slots_) *
                              be_->kv_row_bytes(mc.mla_kv_lora, kvq);
             kv_len[static_cast<size_t>(mc.n_layer)] = b;
             kv_plane += b;
@@ -2515,6 +2521,21 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // restore returns the other plane's KV.
         if (!kvt_k_.init(be_, mc.n_layer + mtp_kv, kv_len, hot / 2u, warm / 2u,
                          cfg_.kv_cold_dir, "k", err)) {
+            shutdown();
+            return false;
+        }
+        if (n_slots_ > 1 && kvt_k_.tiered()) {
+            // Page residency is decided per layer over ONE sequence's positions
+            // (see kv_tier.hpp); two sequences writing the same layer at their
+            // own positions would evict each other's pages. Refusing by number
+            // is the only honest answer: the alternative is a batched run whose
+            // KV silently loses rows, which reads as fluent text.
+            if (err)
+                *err = format("n_slots=%d needs the KV cache to fit in memory, "
+                              "but the tier paged it; raise --kv-hot-mb to cover "
+                              "%lld slot(s) or lower --slots",
+                              static_cast<int>(n_slots_),
+                              static_cast<long long>(n_slots_));
             shutdown();
             return false;
         }
@@ -4184,6 +4205,32 @@ bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
     return true;
 }
 
+// Rotary for one chunk of q/k rows.
+//
+// A single-sequence pass rotates row t at pos0 + t. A batched pass carries rows
+// belonging to different sequences, so each row rotates at ITS OWN position; a
+// backend that cannot do that refuses the call rather than rotating everything
+// at one origin, which stays finite and is a different model.
+bool Engine::rope_chunk(void *q, void *k, i64 lh, i64 lkvh, i64 hd, i32 n,
+                        i32 pos0, i32 layer) {
+    const ModelConfig &mc = model_.cfg();
+    const f32 *freq = model_.inv_freq_at(layer).data();
+    const f32 rscale = model_.rope_scale_at(layer);
+    const f32 rfrac = model_.rope_frac_at(layer);
+    if (!fwd_row_pos_) {
+        be_->rope(q, k, lh, lkvh, hd, n, pos0, freq, rscale, rfrac, mc.rope_neox);
+        return true;
+    }
+    if (!be_->rope_rows(q, k, lh, lkvh, hd, n, fwd_row_pos_, freq, rscale, rfrac,
+                        mc.rope_neox)) {
+        forward_error_ =
+            "this backend cannot apply rotary positions per row, which a batched "
+            "forward needs";
+        return false;
+    }
+    return true;
+}
+
 bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     KRK_TRACE_COMP("forward-core");
     forward_error_.clear();
@@ -4428,6 +4475,21 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // chain refuses it and the engine takes the separate chain instead,
         // which is a few extra launches on a sink model and nothing else.
         d.sinks = L.sinks;
+        if (fwd_row_slot_) {
+            // Batching: row t reads and writes the KV region of the sequence it
+            // belongs to, and rotates at that sequence's own position. Slot s
+            // owns rows [s*kv_cap_, (s+1)*kv_cap_) of THIS layer's plane; the
+            // base is built per layer because pos_stride is per layer and, for
+            // an int8 cache, is counted in BYTES -- the same units the append
+            // and the attention add it in.
+            fwd_kv_base_row_.resize(static_cast<size_t>(n));
+            const i64 slot_rows = kv_cap_ * d.pos_stride;
+            for (i32 t = 0; t < n; t++)
+                fwd_kv_base_row_[static_cast<size_t>(t)] =
+                    static_cast<i64>(fwd_row_slot_[t]) * slot_rows;
+            d.row_kv_base = fwd_kv_base_row_.data();
+            d.row_pos = fwd_row_pos_;
+        }
         dump_stage("enter", l);
 
         // The PLE block writes into the lane stack, so it runs before the
@@ -4729,7 +4791,8 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // has to run before the cache and the fused chain carries neither, so
         // those shapes take the separate chain. It is the same arithmetic with
         // one extra launch per such layer.
-        if (!(n == 1 && !packed_gate && d.window == 0 && !mc.attn_gate &&
+        if (!(!fwd_row_slot_ && n == 1 && !packed_gate && d.window == 0 &&
+              !mc.attn_gate &&
               !qsa_sel && kv_src == l && !mc.v_norm_weightless &&
               (fused_neox || !(mc.rope_neox && mc.qk_norm)) &&
               be_->attn_fused_chain(ws_attn_, ws_q_, kbase, vbase,
@@ -4771,11 +4834,9 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             const bool layer_rotates =
                 !(mc.no_rope_step > 0 && ((l + 1) % mc.no_rope_step) == 0) &&
                 !(mc.rope_swa_only && !model_.is_swa(l));
-            if (layer_rotates)
-                be_->rope(ws_q_, ws_k_, lh, lkvh, d.hd,
-                          n, pos0, model_.inv_freq_at(l).data(),
-                          model_.rope_scale_at(l),
-                          model_.rope_frac_at(l), mc.rope_neox);
+            if (layer_rotates &&
+                !rope_chunk(ws_q_, ws_k_, lh, lkvh, d.hd, n, pos0, l))
+                return false;
             // A shared-KV layer appends nothing: the layer that owns this
             // plane wrote these rows already, and a second write would put the
             // token at two positions in one cache. A DIFFUSE layer appends
@@ -4810,14 +4871,19 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // attention that no activation buffer covers, and the row a
         // fused chain writes from inside its own kernel. Width is the
         // whole KV row (n_kv heads), rows = 1 at this step's position.
-        dump_row("attn.kc", l,
-                 static_cast<const u8 *>(kbase) +
-                     pos0 * d.pos_stride * be_->act_size(),
-                 lkv, 1);
-        dump_row("attn.vc", l,
-                 static_cast<const u8 *>(vbase) +
-                     pos0 * d.pos_stride * be_->act_size(),
-                 lkv, 1);
+        // A batched row's cache offset is its own, not pos0's, so these two
+        // dumps are skipped there rather than reading whichever row the scalar
+        // origin happens to name.
+        if (!fwd_row_slot_) {
+            dump_row("attn.kc", l,
+                     static_cast<const u8 *>(kbase) +
+                         pos0 * d.pos_stride * be_->act_size(),
+                     lkv, 1);
+            dump_row("attn.vc", l,
+                     static_cast<const u8 *>(vbase) +
+                         pos0 * d.pos_stride * be_->act_size(),
+                     lkv, 1);
+        }
 
         // laguna's output gate: a separate [n_head] projection of the same
         // attention-norm output q/k/v read, softplus'd, and applied as one
@@ -14770,6 +14836,316 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
                      static_cast<long long>(g_split_steps), g_split_fwd_us / 1e3,
                      g_split_fwd_us / 1e3 / n, g_split_fetch_us / 1e3,
                      g_split_fetch_us / 1e3 / n);
+    }
+    return true;
+}
+
+
+// ---- batched serving -------------------------------------------------------
+
+std::string Engine::batch_refusal() const {
+    if (!be_) return "no backend is attached to this engine";
+    if (!be_->attn_multiseq_supported())
+        return "this backend does not address the KV cache per row";
+    const ModelConfig &mc = model_.cfg();
+    // Every refusal below is a per-SEQUENCE thing that a row cannot carry.
+    // They are named rather than probed because the failure they prevent is
+    // silent: a batch that reads the wrong history still writes fluent text.
+    if (mc.diffusion)
+        return "a masked-diffusion pass denoises one sequence and appends no KV";
+    if (model_.is_recurrent())
+        return "a recurrent model keeps one sequence's delta-rule state";
+    if (mc.mla)
+        return "MLA attention addresses its own cache layout and does not take a "
+               "per-row base yet";
+    if (!comp_nblocks_.empty())
+        return "compressed attention (CSA/HCA) pools keys per sequence";
+    if (qsa_active_ || msa_active_)
+        return "the block indexer selects keys per sequence";
+    if (hc_active_)
+        return "hyper-connection lanes carry one sequence's residual stack";
+    if (ple_active_)
+        return "engine-gram/PLE windows are kept per sequence";
+    if (moe_predict_enabled_)
+        return "the MoE route predictor keeps one sequence's routing history";
+    if (mtp_spec_ || head_ || draft_ || dflash_)
+        return "a draft head verifies one sequence's own proposed tokens";
+    if (mc.gpt2_style || mc.learned_pos)
+        return "learned position embeddings are tabulated per position, not per row";
+    if (mc.alibi_max_bias > 0.0f)
+        return "ALiBi is applied from pos0, which a mixed-row batch does not have";
+    if (kvt_k_.tiered())
+        return "the KV tier pages whole layers for one sequence's positions";
+    return std::string();
+}
+
+namespace {
+// Clears the batch row tables however the batch leaves, including the early
+// returns above: a stale pointer here would address the next forward's rows
+// through a destroyed vector.
+struct BatchRowsGuard {
+    const i32 **slot_slot;
+    const i64 **pos_slot;
+    ~BatchRowsGuard() {
+        *slot_slot = nullptr;
+        *pos_slot = nullptr;
+    }
+};
+} // namespace
+
+bool Engine::generate_batch(const std::vector<GenerateParams> &reqs,
+                            std::vector<GenerateResult> *outs) {
+    KRK_TRACE_COMP("generate-batch");
+    if (!outs) return false;
+    outs->assign(reqs.size(), GenerateResult{});
+    if (!be_ || n_vocab_ <= 0) return false;
+    if (reqs.empty()) return true;
+
+    // A wave of one, or an engine built for one sequence, is the serial path.
+    // Same arithmetic either way, so a caller never has to special-case it.
+    if (reqs.size() == 1 || n_slots_ < 2) {
+        bool ok = true;
+        for (size_t i = 0; i < reqs.size(); i++)
+            ok = generate(reqs[i], &(*outs)[i]) && ok;
+        return ok;
+    }
+    const std::string why = batch_refusal();
+    if (!why.empty()) {
+        for (GenerateResult &r : *outs) {
+            r.finish = FinishError;
+            r.error = why;
+        }
+        KRK_ERROR("batched generation refused: %s", why.c_str());
+        return false;
+    }
+    if (static_cast<i32>(reqs.size()) > n_slots_) {
+        const std::string msg =
+            "a wave of " + std::to_string(reqs.size()) + " request(s) does not fit " +
+            std::to_string(static_cast<long long>(n_slots_)) + " KV slot(s)";
+        for (GenerateResult &r : *outs) {
+            r.finish = FinishError;
+            r.error = msg;
+        }
+        KRK_ERROR("%s", msg.c_str());
+        return false;
+    }
+
+    // The batch is a new set of sequences: the same reset every single-sequence
+    // run does, because the rows below are about to be rewritten.
+    kv_pos_ = 0;
+    mtp_fed_ = 0;
+    if (trace_hash_on_) trace_stage_.clear();
+    if (!comp_nblocks_.empty()) compressed_reset();
+    if (moe_predict_enabled_) moe_predictor_.reset();
+    moe_predict_ids_.clear();
+
+    struct Seq {
+        const GenerateParams *p = nullptr;
+        GenerateResult *res = nullptr;
+        std::vector<i32> ids;      // prompt + accepted tokens
+        std::vector<f32> logits;   // this sequence's logits row
+        Sampler sampler;
+        std::unique_ptr<TokenEmitter> emit;
+        i64 pos = 0;               // next position to append
+        i32 slot = -1;
+        i32 pending = -1;          // token to feed on the next batched step
+        bool active = false;
+        i64 steps = 0;
+        f64 prefill_ms = 0.0;
+    };
+    std::vector<Seq> seqs(reqs.size());
+
+    // ---- tokenize, and give each sequence its slot -------------------------
+    for (size_t i = 0; i < reqs.size(); i++) {
+        Seq &s = seqs[i];
+        s.p = &reqs[i];
+        s.res = &(*outs)[i];
+        s.slot = static_cast<i32>(i);
+        if (tokenize_prompt(reqs[i].prompt, s.ids) < 0) {
+            s.res->finish = FinishError;
+            s.res->error = "prompt could not be tokenized";
+            continue;
+        }
+        if (s.ids.empty()) {
+            s.res->finish = FinishError;
+            s.res->error = "prompt encoded to zero tokens";
+            continue;
+        }
+        if (static_cast<i64>(s.ids.size()) > kv_cap_) {
+            s.ids.resize(static_cast<size_t>(kv_cap_));
+            KRK_WARN("prompt truncated to the %lld-token context (slot %d)",
+                     static_cast<long long>(kv_cap_), static_cast<int>(s.slot));
+        }
+        s.res->prompt_tokens = static_cast<i32>(s.ids.size());
+        s.sampler.reset(reqs[i].sampler);
+        s.sampler.accept(s.ids.data(), static_cast<int>(s.ids.size()));
+        s.emit.reset(new TokenEmitter(reqs[i], tok_, s.sampler, s.res, s.ids));
+        s.logits.assign(static_cast<size_t>(n_vocab_), 0.0f);
+        s.pos = static_cast<i64>(s.ids.size());
+        s.active = true;
+    }
+
+    std::vector<i32> row_slot;
+    std::vector<i64> row_pos;
+    BatchRowsGuard guard{&fwd_row_slot_, &fwd_row_pos_};
+
+    // ---- prefill, one sequence at a time ----------------------------------
+    // A prefill's rows are consecutive positions of ONE sequence, so it cannot
+    // share a pass with another sequence's rows: interleaving them would put
+    // two histories in one chunk for no gain (the GEMM is already n rows wide).
+    // The rows still go through the slot table, which is what puts this
+    // sequence's KV in its own region.
+    expert_phase(ExpertCache::PhasePrefill);
+    krk::HostTime::set_phase(krk::HostTime::kPrefill);
+    for (Seq &s : seqs) {
+        if (!s.active) continue;
+        const Timer pt;
+        fwd_row_slot_ = nullptr;
+        fwd_row_pos_ = nullptr;
+        for (i64 off = 0; off < static_cast<i64>(s.ids.size()); off += chunk_) {
+            if (cancel_requested(*s.p)) {
+                mark_cancelled(*s.p, s.res, off);
+                s.active = false;
+                break;
+            }
+            const i32 n = static_cast<i32>(std::min<i64>(
+                chunk_, static_cast<i64>(s.ids.size()) - off));
+            row_slot.assign(static_cast<size_t>(n), s.slot);
+            row_pos.resize(static_cast<size_t>(n));
+            for (i32 t = 0; t < n; t++) row_pos[static_cast<size_t>(t)] = off + t;
+            fwd_row_slot_ = row_slot.data();
+            fwd_row_pos_ = row_pos.data();
+            const bool last = (off + n) == static_cast<i64>(s.ids.size());
+            if (!forward(s.ids.data() + off, n, static_cast<i32>(off), last)) {
+                s.res->error = forward_failure_error();
+                s.res->finish = FinishError;
+                s.active = false;
+                fwd_row_slot_ = nullptr;
+                fwd_row_pos_ = nullptr;
+                break;
+            }
+        }
+        fwd_row_slot_ = nullptr;
+        fwd_row_pos_ = nullptr;
+        s.prefill_ms = pt.ms();
+        if (!s.active) continue;
+        // The last chunk's row is the prompt's last row, so it is the one the
+        // first decode token comes from. One download per sequence, exactly as
+        // the serial path does it.
+        be_->sync();
+        be_->download_f32(s.logits.data(), ws_logits_, n_vocab_);
+        s.steps = 0;
+    }
+    krk::HostTime::set_phase(krk::HostTime::kDecode);
+    expert_phase(ExpertCache::PhaseDecode);
+
+    // ---- the batched decode loop ------------------------------------------
+    // One forward per step for the whole active set, each row at its own
+    // position in its own KV region. The per-row arithmetic is the same kernels
+    // in the same order as a solo run -- which is why the tokens agree -- and
+    // the weight read is the share.
+    const Timer decode_timer;
+    std::vector<i32> tokens;
+    std::vector<i32> samples;
+    while (true) {
+        const i32 active = static_cast<i32>(std::count_if(
+            seqs.begin(), seqs.end(), [](const Seq &s) { return s.active; }));
+        if (active == 0) break;
+
+        // 1. each active sequence picks its next token from its own row
+        for (Seq &s : seqs) {
+            if (!s.active) continue;
+            const GenerateParams &p = *s.p;
+            const i32 token = s.sampler.sample(s.logits.data(), n_vocab_);
+            if (token == tok_.eos()) {
+                s.res->finish = FinishEos;
+                s.active = false;
+                continue;
+            }
+            // accept() streams the delta and reports a stop string OR the
+            // caller's cancellation; both end this sequence, and both have
+            // already recorded the token.
+            if (s.emit->accept(token)) {
+                s.res->finish = FinishStop;
+                s.active = false;
+                continue;
+            }
+            if (s.res->generated >= p.max_tokens) {
+                s.res->finish = FinishLength;
+                s.active = false;
+                continue;
+            }
+            if (s.pos >= kv_cap_) {
+                s.res->finish = FinishContext;
+                s.active = false;
+                continue;
+            }
+            s.ids.push_back(token);
+            s.pending = token;
+        }
+
+        // 2. one forward for whatever is still active
+        tokens.clear();
+        samples.clear();
+        row_slot.clear();
+        row_pos.clear();
+        for (Seq &s : seqs) {
+            if (!s.active) continue;
+            tokens.push_back(s.pending);
+            row_slot.push_back(s.slot);
+            row_pos.push_back(s.pos);
+            samples.push_back(static_cast<i32>(&s - seqs.data()));
+        }
+        if (tokens.empty()) break;
+        fwd_row_slot_ = row_slot.data();
+        fwd_row_pos_ = row_pos.data();
+        const bool ok = forward(tokens.data(), static_cast<i32>(tokens.size()), 0,
+                                false);
+        fwd_row_slot_ = nullptr;
+        fwd_row_pos_ = nullptr;
+        if (!ok) {
+            const std::string msg = forward_failure_error();
+            for (Seq &s : seqs) {
+                if (!s.active) continue;
+                s.res->error = msg;
+                s.res->finish = FinishError;
+                s.active = false;
+            }
+            break;
+        }
+        // Rows are read out one at a time: head_compute projects row r from
+        // the final residual, and the row lands in the same workspace buffer
+        // for every row, so the copy has to happen between them.
+        for (size_t r = 0; r < samples.size(); r++) {
+            Seq &s = seqs[static_cast<size_t>(samples[r])];
+            head_compute(static_cast<i32>(r));
+            be_->sync();
+            be_->download_f32(s.logits.data(), ws_logits_, n_vocab_);
+            s.pos++;
+            s.steps++;
+        }
+    }
+
+    // Every sequence ends with its stream closed, whether it stopped, hit the
+    // limit, or was cancelled -- the same contract the serial loop has.
+    for (Seq &s : seqs) {
+        if (s.emit) s.emit->finish(s.res->finish == FinishStop);
+    }
+    kv_pos_ = 0;
+    for (Seq &s : seqs) kv_pos_ = std::max(kv_pos_, s.pos);
+
+    const f64 total_ms = decode_timer.ms();
+    for (Seq &s : seqs) {
+        if (!s.res->tokens.empty() || !s.res->text.empty() || s.res->generated > 0)
+            s.res->text = tok_.decode(s.res->tokens.data(),
+                                      static_cast<int>(s.res->tokens.size()));
+        s.res->prefill_ms = s.prefill_ms;
+        s.res->decode_ms = total_ms;
+        s.res->decode_steps = s.steps;
+        if (s.res->finish == FinishError) continue;
+        KRK_DEBUG("slot %d: %d prompt + %d generated token(s), %lld batched step(s)",
+                  static_cast<int>(s.slot), s.res->prompt_tokens, s.res->generated,
+                  static_cast<long long>(s.steps));
     }
     return true;
 }

@@ -35,7 +35,16 @@ struct EngineConfig {
     // where NAME is a builtin, or a path to a .jinja file). Empty keeps the
     // file's own, which is what a file that carries one should always get.
     std::string chat_template;
-    i32 n_ctx = 4096;        // KV capacity (tokens)
+    i32 n_ctx = 4096;        // KV capacity (tokens), PER SLOT
+    // How many sequences the KV cache holds at once. 1 (the default) is the
+    // single-sequence engine every other path assumes, and costs nothing: the
+    // planes are sized for one context exactly as before. N > 1 sizes every
+    // layer's plane for N slots -- KV grows N-fold, because each sequence needs
+    // its own context -- and enables Engine::generate_batch(), which decodes N
+    // sequences in ONE forward pass. Requires a KV cache that fits: a tiered,
+    // paged cache is refused, because page residency is decided per layer over
+    // one sequence's positions.
+    i32 n_slots = 1;
     // Prompt tokens per batched forward. 512 because the routed expert set is
     // re-read once per chunk: 35B-A3B at a 4096-token prompt measured 397.1
     // tok/s at 256 against 462.6 at 512, and the exact-rung hashes agree at
@@ -384,6 +393,29 @@ public:
     ~Engine();
 
     bool init(Backend *be, const EngineConfig &cfg, std::string *err);
+
+    // ---- batched serving (EngineConfig::n_slots > 1) ----------------------
+    //
+    // Sequences the cache can hold at once.
+    i32 n_slots() const { return n_slots_; }
+    // Empty when this engine and model can decode a batch, else the reason -- a
+    // sentence naming the feature, the way every other refusal in this engine
+    // reads. Conservative on purpose: a batch carries rows from different
+    // sequences, so any graph whose attention or state is per SEQUENCE rather
+    // than per ROW has to be excluded by name.
+    std::string batch_refusal() const;
+    // Decode len(reqs) sequences together: one forward pass per step for the
+    // whole set, each sequence with its own KV region and its own position.
+    // Per-row arithmetic is identical to a solo run (same kernels, same order),
+    // which is what makes the outputs comparable token for token; the only
+    // sharing is the weight read, and that is the point.
+    //
+    // Prefill stays one sequence at a time, into its own slot: a prefill's rows
+    // are consecutive positions of ONE sequence, and interleaving two prefills
+    // would put two sequences' rows in one chunk for no gain (the GEMM is
+    // already n rows wide).
+    bool generate_batch(const std::vector<GenerateParams> &reqs,
+                        std::vector<GenerateResult> *outs);
     bool moe_prediction_enabled() const { return moe_predict_enabled_; }
     u64 moe_predictions_issued() const { return moe_predictor_.predictions_issued(); }
     u64 moe_prediction_candidates() const { return moe_predictor_.candidates(); }
@@ -726,6 +758,21 @@ private:
     // decode), or every row (speculative verification).
     bool forward(const i32 *toks, i32 n, i32 pos0, bool want_logits);
     bool forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode);
+
+    bool rope_chunk(void *q, void *k, i64 lh, i64 lkvh, i64 hd, i32 n, i32 pos0,
+                    i32 layer);
+
+    // ---- batch row addressing ---------------------------------------------
+    // Set only while a batched run is driving the graph. `fwd_row_slot_` gives
+    // each row its KV region (slot s owns rows [s*kv_cap_, (s+1)*kv_cap_) of
+    // every layer's plane) and `fwd_row_pos_` its own position; null means the
+    // historical single-region, consecutive-from-pos0 addressing. The base is
+    // recomputed per layer because a layer's row stride differs per layer (an
+    // integer KV row carries its scale block on top of the f32 one).
+    const i32 *fwd_row_slot_ = nullptr;
+    const i64 *fwd_row_pos_ = nullptr;
+    std::vector<i64> fwd_kv_base_row_;
+    i32 n_slots_ = 1;
 
     // Cooperative cancellation (see GenerateParams::cancel). Read once per
     // prefill chunk and once per generated token; the decode loops stop through

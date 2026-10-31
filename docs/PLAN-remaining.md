@@ -256,8 +256,8 @@ covers rows the first request generated.
 loses the tail) and asserts the claim equals the longest prefix the record and
 the new prompt share -- no over-claim, nothing left on the table.
 
-**B2.3 continuous batching -- OPEN. The three ops that are NOT row-independent
-now honour the per-row tables; the engine and the scheduler are what is left.**
+**B2.3 continuous batching -- slots, batched decode and the wave scheduler are
+in; MLA/compressed attention is refused by name (see the end of this section).**
 
 `AttnDesc::row_pos` / `row_kv_base` were already implemented in the CPU attention
 path. This session finished the other two, and `kraken-attn-multiseq` now proves
@@ -283,26 +283,67 @@ every other path uses `row_kv_base + j * pos_stride`. It was harmless only
 because no caller sets `row_kv_base` yet -- i.e. it would have failed exactly when
 B2.3 started using the field. Fixed, and the arm above is what keeps it fixed.
 
-What is left, in order:
+**What the engine does now (1-3 done):**
 
-1. **N KV regions in the engine.** One `kv_pos_` and one region today; batching
-   needs `region = layer_stride * n_layer`, a per-row base, and a per-slot
-   cursor. This is the invasive one: `kv_pos_` is read by the KV tier, the dump
-   header, health, prefix reuse and the speculative paths.
-2. **A batched decode step** -- one `forward` with K rows, per-row
-   (token, position, slot base), K logit rows, per-sequence sampler state.
-3. **A scheduler in the server** that admits, prefills one at a time (a prefill
-   of sequence s is just rows 0..n-1 at slot s) and decode-batches the active
-   set, streaming each sequence's deltas to its own connection.
-4. **MLA/compressed attention for the batched case.** The dense/GQA path is
-   row-independent once the cache base is per row; `mla_attention`,
-   `mla_shared_attention*` and the compressed/indexer variants each own their
-   cache addressing, so they need the same treatment before a deepseek-class
-   model can be batched.
+1. **N KV regions.** `EngineConfig::n_slots` (1 by default, `--slots N` on the
+   server) sizes every layer's plane for N contexts and adds a per-row slot
+   table: slot `s` owns rows `[s*kv_cap_, (s+1)*kv_cap_)`, and row `t` addresses
+   its own region through `AttnDesc::row_kv_base`/`row_pos` -- the fields the
+   kernel side already had. The base is built per layer, in that layer's own
+   units, because `pos_stride` is per layer and counts BYTES on an int8 cache.
+   `kv_pos_` stays the single-sequence cursor: nothing in a batched pass reads
+   it, and the batch leaves it at the furthest slot's position.
+2. **A batched decode step.** `Engine::generate_batch()` prefills one sequence at
+   a time (a prefill's rows are consecutive positions of ONE sequence) and then
+   decodes the whole active set in one `forward` of K rows, each row at its own
+   position, reading its own logits row and sampling with its own `Sampler` and
+   `TokenEmitter`. A sequence that stops is dropped from the next step without
+   disturbing the others. Per-row arithmetic is the same kernels in the same
+   order as a solo run, which is what makes the tokens identical rather than
+   merely similar (see the test below).
+3. **A scheduler in the server.** `OpenAiService` starts a scheduler thread when
+   the engine has more than one slot and `batch_refusal()` is empty. Connections
+   queue a request and wait; the thread takes up to `n_slots` of them, decodes
+   them in one pass, and each connection streams its own deltas from its own
+   sink. A request that arrives during a pass waits for the next one -- it is a
+   wave scheduler, not iteration-level admission, and the doc says so because
+   the difference is visible under load. Prefix reuse stays a serial-mode
+   feature: with one region per sequence there is no "the cache" to cut back to,
+   so a batched request reports `cached_tokens: 0` rather than claiming rows it
+   does not hold.
+
+**What is left (4), and why it is refused by name rather than approximated:**
+`mla_attention`, `mla_shared_attention*` and the compressed/indexer variants each
+own their cache addressing, so a row base means nothing to them yet.
+`batch_refusal()` therefore refuses an MLA, compressed, indexer, hyper-connection,
+PLE, recurrent or drafter model -- in words, at startup -- because the failure a
+wrong batch produces is fluent text from the wrong history, not a crash.
+
+**Measured.** Both arms are in `test_batch_decode` (52 checks, in the default
+gate) and `test_batch_throughput` (serial group):
+
+* exactness: one wave of four prompts with different `max_tokens` produces each
+  sequence's solo tokens, text and finish reason **exactly** -- and so do the
+  four concurrent HTTP requests driven through `OpenAiService`, which is also
+  what proves the scheduler does not deadlock;
+* aggregate throughput, 4 sequences x 24 tokens, 4 layers x 768 wide, 8 experts
+  top-2, median of 3:
+  - every expert resident (compute-bound): **1.02x** -- parity;
+  - a squeezed expert budget (transfer-bound, the state a 4 GB-on-disk model is
+    always in): **1.08x-1.27x** across runs.
+
+  So batching on this hardware buys in proportion to how memory-bound a step is,
+  and is neutral when it is not. That is the honest reading of the number, and
+  it is why the gate asserts "not slower" (0.95x) rather than "faster": the arm
+  that would be a defect is batching costing throughput, and the size of the win
+  is a property of the working set, not of the scheduler.
 
 *Done when:* 4 concurrent requests hold aggregate tok/s above one-at-a-time with
-each response identical to its solo run -- unchanged, and not yet met. The honest
-statement today: the per-op contract is ready and pinned, the engine is not.
+each response identical to its solo run. **Half met, precisely:** the exactness
+half is met and gated; the throughput half is met only where the step is
+transfer-bound (1.08x-1.27x measured), and is parity when every expert is
+resident. The remaining lever is item 4 and the MoE expert-grouping that makes a
+wave share one expert read -- not the scheduler.
 
 ### B3 -- A trace file carries no identity -- DONE
 
@@ -397,13 +438,14 @@ Status is per bucket as of 2026-10-31.
 | 6 | **B1.4** -- GMAC/s -> tok/s projection | **done** (numbers under *B1*): 48-49 GMAC/s is ~16 tok/s of prefill per core at ~3 GMAC/token, so 4 cores is ~64, and the gap to 200 is arithmetic no kernel change closes |
 | 7 | **B2.1** -- server cancellation | **done**, `test_cancel_and_prefix` |
 | 8 | **B2.2** -- prefix reuse across requests (the record is the run, not the prompt) | **done**, same group |
-| 9 | **B2.3** -- continuous batching | **open**: the four pieces are listed under *B2*; 1-2 are small, 3-4 are the work |
+| 9 | **B2.3** -- continuous batching | **partly done**: slots, batched decode and the wave scheduler are in and gated (52 checks); MLA/compressed/indexer models are refused by name; the aggregate win is measured at 1.08x-1.27x transfer-bound, 1.02x resident |
 | 10 | **B3** -- trace identity and truncation reporting | **done**, `test_dump_identity` 17/17 |
 | 11 | **B4** -- TSAN listen-descriptor lifetime | **done**, `kraken-tsan-http-listen` clean, old code reproduces the race |
 | 12 | **A3** -- DFlash2 head on its own pairing, then upstream logits | *needs files* |
 | 13 | **A5** -- OLMoE against an independent oracle | *needs a file and an oracle run* |
 | 14 | **A4** -- `gemma2` (and the vision rows, if wanted) on real files | *needs files* |
 
-**What a session without files can still move:** B2.3, and then only item 3-4 of
-it. Everything else in the table either needs a checkpoint or is closed by a
-measurement that now exists.
+**What a session without files can still move:** B2.3 item 4 -- per-row
+addressing for MLA/compressed attention -- which is the one part of it that is
+refused rather than implemented. Everything else in the table either needs a
+checkpoint or is closed by a measurement that now exists.

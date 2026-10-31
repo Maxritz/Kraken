@@ -31004,6 +31004,421 @@ static void test_cli_arg_refusal() {
 #define TEST_GROUP(fn) {#fn, fn, nullptr},
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
+// ---------------------------------------------------------------------------
+// B2.3 -- batched decode. One forward pass serves several sequences, each with
+// its own KV region and its own position. The contract is exactness: a slot's
+// tokens are the tokens that sequence produces alone, because the only thing
+// the batch shares is the weight read.
+// ---------------------------------------------------------------------------
+static void test_batch_decode() {
+    Backend *cpu = make_cpu_backend();
+    const std::string path = "kraken-batch-test.gguf";
+    MoeSpec s;
+    s.dense = false;
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.shared = true;
+    s.varied = true;
+    CHECK(build_tiny_moe_model(path, s), "wrote a MoE fixture for the batch test");
+
+    auto open = [&](Engine *engine, i32 slots, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = slots;
+        return engine->init(cpu, cfg, err);
+    };
+    auto params = [](const char *prompt, i32 max_tokens) {
+        GenerateParams p;
+        p.prompt = prompt;
+        p.max_tokens = max_tokens;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        // The batched path samples on the host, because every sequence reads its
+        // own logits row. The solo baseline has to sample the same way or the
+        // comparison would be measuring the device argmax instead.
+        p.sample_host = true;
+        return p;
+    };
+
+    const char *prompts[4] = {"the", "a the", "the a", "a a the a"};
+    const i32 limits[4] = {6, 3, 6, 4};
+
+    // --- the gate says yes for this fixture ---------------------------------
+    {
+        Engine engine;
+        std::string err;
+        CHECK(open(&engine, 4, &err), "engine with four KV slots initialises");
+        CHECK(engine.n_slots() == 4, "the configured slot count is what it reports");
+        const std::string why = engine.batch_refusal();
+        CHECK(why.empty(), std::string("a GQA+RoPE MoE fixture is batchable: ") + why);
+    }
+
+    // --- the oracle: each prompt alone, through the serial path -------------
+    std::vector<std::vector<i32>> solo(4);
+    std::vector<std::string> solo_text(4);
+    std::vector<int> solo_finish(4);
+    f64 solo_ms = 0.0;
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 4, &err)) {
+            CHECK(false, "oracle engine initialises");
+            delete cpu;
+            return;
+        }
+        for (int i = 0; i < 4; i++) {
+            GenerateParams p = params(prompts[i], limits[i]);
+            GenerateResult r;
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool ok = engine.generate(p, &r);
+            const auto t1 = std::chrono::steady_clock::now();
+            solo_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            CHECK(ok, "solo run " + std::to_string(i) + " completes");
+            solo[i] = r.tokens;
+            solo_text[i] = r.text;
+            solo_finish[i] = r.finish;
+            CHECK(!solo[i].empty(), "solo run " + std::to_string(i) + " emitted a token");
+        }
+    }
+
+    // --- one wave, four sequences -------------------------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 4, &err)) {
+            CHECK(false, "batch engine initialises");
+            delete cpu;
+            return;
+        }
+        std::vector<GenerateParams> reqs;
+        for (int i = 0; i < 4; i++) reqs.push_back(params(prompts[i], limits[i]));
+        std::vector<GenerateResult> outs;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = engine.generate_batch(reqs, &outs);
+        const auto t1 = std::chrono::steady_clock::now();
+        const f64 batch_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        CHECK(ok, "the batch runs");
+        CHECK(outs.size() == 4, "every request comes back");
+        for (int i = 0; i < 4 && i < static_cast<int>(outs.size()); i++) {
+            const std::string tag = "slot " + std::to_string(i);
+            CHECK(outs[i].tokens == solo[i],
+                  tag + ": the batched tokens are the solo tokens (" +
+                      std::to_string(outs[i].tokens.size()) + " vs " +
+                      std::to_string(solo[i].size()) + ")");
+            CHECK(outs[i].text == solo_text[i], tag + ": the text matches too");
+            CHECK(outs[i].finish == solo_finish[i], tag + ": same finish reason");
+            CHECK(outs[i].prompt_tokens > 0, tag + ": the prompt was counted");
+            CHECK(outs[i].generated > 0, tag + ": tokens were counted");
+        }
+        // Not a speed gate on a one-layer model: there is almost no weight to
+        // share. It is a gate against batching costing a factor. The number that
+        // matters is `kraken-batch-bench`.
+        CHECK(batch_ms < solo_ms * 2.0,
+              "a wave is not twice the work of the same serial runs (" +
+                  std::to_string(batch_ms) + " ms vs " + std::to_string(solo_ms) + " ms)");
+    }
+
+    // --- a slot count of one is the serial engine ----------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 1, &err)) {
+            CHECK(false, "single-slot engine initialises");
+            delete cpu;
+            return;
+        }
+        CHECK(engine.n_slots() == 1, "one slot stays one");
+        std::vector<GenerateParams> reqs;
+        for (int i = 0; i < 2; i++) reqs.push_back(params(prompts[i], limits[i]));
+        std::vector<GenerateResult> outs;
+        CHECK(engine.generate_batch(reqs, &outs), "a wave on a one-slot engine runs");
+        CHECK(outs.size() == 2 && outs[0].tokens == solo[0] &&
+                  outs[1].tokens == solo[1],
+              "a one-slot engine answers the wave serially, and identically");
+    }
+
+    // --- the server's scheduler: four concurrent HTTP requests --------------
+    // The engine-level test above proves the arithmetic. This proves the piece
+    // between the sockets and the engine: a queue, one scheduler thread, and a
+    // wave. A deadlock here would hang the gate, which is the point of running
+    // it rather than reasoning about it.
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 4, &err)) {
+            CHECK(false, "service engine initialises");
+            delete cpu;
+            return;
+        }
+        std::mutex service_mu;
+        OpenAiService svc(&engine, 0.0f, &service_mu);
+        std::vector<std::string> bodies(4);
+        std::vector<int> status(4, 0);
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; i++) {
+            threads.emplace_back([&, i] {
+                HttpRequest req;
+                req.method = "POST";
+                req.path = "/v1/completions";
+                req.body = std::string("{\"prompt\":\"") + prompts[i] +
+                           "\",\"max_tokens\":" + std::to_string(limits[i]) +
+                           ",\"temperature\":0}";
+                HttpResponse res;
+                struct NullConn : HttpConn {
+                    bool write_raw(const char *, size_t) override { return true; }
+                } conn;
+                svc.handle(req, res, conn);
+                status[static_cast<size_t>(i)] = res.status;
+                bodies[static_cast<size_t>(i)] = res.body;
+            });
+        }
+        for (std::thread &t : threads) t.join();
+        for (int i = 0; i < 4; i++) {
+            const std::string tag = "concurrent request " + std::to_string(i);
+            CHECK(status[static_cast<size_t>(i)] == 200, tag + " answered 200");
+            CHECK(bodies[static_cast<size_t>(i)].find("\"text\":") != std::string::npos,
+                  tag + " carries a completion");
+            CHECK(bodies[static_cast<size_t>(i)].find("\"completion_tokens\"") !=
+                      std::string::npos,
+                  tag + " reports its usage");
+        }
+    }
+
+    // --- more requests than slots is a refusal, not a crash -----------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, &err)) {
+            CHECK(false, "two-slot engine initialises");
+            delete cpu;
+            return;
+        }
+        std::vector<GenerateParams> reqs;
+        for (int i = 0; i < 3; i++) reqs.push_back(params(prompts[i], 2));
+        std::vector<GenerateResult> outs;
+        CHECK(!engine.generate_batch(reqs, &outs), "three requests do not fit two slots");
+        CHECK(outs.size() == 3 && outs[0].finish == FinishError &&
+                  !outs[0].error.empty(),
+              "the refusal is reported on every request, in words");
+    }
+
+    std::remove(path.c_str());
+    delete cpu;
+}
+
+// A wider synthetic model than `build_tiny_moe_model`, for one purpose: the
+// batch test needs weights big enough that reading them once per STEP instead
+// of once per SEQUENCE is visible. Two layers, 256 wide, eight experts: ~13 MB
+// of f16, which is a few hundred microseconds of arithmetic per token on one
+// core -- the same regime a hot-expert run is in, just small enough to build in
+// a test.
+static bool build_batch_bench_model(const std::string &path) {
+    // Wide enough that the WEIGHT READ dominates a decode step, which is the
+    // regime this feature is for. At 256x2 the per-row logits path (one head
+    // projection, one sync, one download per row) is most of the step and
+    // batching measures at parity -- a true result about the fixture, not about
+    // the feature.
+    const int n_embd = 768, n_head = 8, n_kv = 4, hd = 96;
+    const int n_ff_exp = 768, n_expert = 8, vocab = 260, ctx = 64, n_layer = 4;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string arch = "qwen2moe";
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-batch-bench");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff_exp));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".expert_count", static_cast<u32>(n_expert));
+    b.meta_u32(arch + ".expert_used_count", 2u);
+    b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    std::vector<f32> ones(static_cast<size_t>(n_embd), 1.0f);
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones);
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p_ = "blk." + std::to_string(l) + ".";
+        const i64 bump = static_cast<i64>(l) * 1013;
+        b.tensor_f32(p_ + "attn_norm.weight", {u64(n_embd)}, ones);
+        b.tensor_f32(p_ + "ffn_norm.weight", {u64(n_embd)}, ones);
+        b.tensor_f16(p_ + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, 100 + bump));
+        b.tensor_f16(p_ + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, 200 + bump));
+        b.tensor_f16(p_ + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, 300 + bump));
+        b.tensor_f16(p_ + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, 400 + bump));
+        b.tensor_f16(p_ + "ffn_gate_inp.weight", {u64(n_embd), u64(n_expert)},
+                     vec(static_cast<size_t>(n_embd) * n_expert, 700 + bump));
+        const size_t gsz = static_cast<size_t>(n_embd) * n_ff_exp;
+        const size_t dsz = static_cast<size_t>(n_ff_exp) * n_embd;
+        const size_t ne = static_cast<size_t>(n_expert);
+        std::vector<f32> gate(gsz * ne), up(gsz * ne), down(dsz * ne);
+        for (size_t e = 0; e < ne; e++) {
+            const i64 eb = static_cast<i64>(e) * 7919 + bump;
+            for (size_t k = 0; k < gsz; k++) {
+                gate[e * gsz + k] = wv(500 + static_cast<i64>(k) + eb);
+                up[e * gsz + k] = wv(900 + static_cast<i64>(k) + eb);
+            }
+            for (size_t k = 0; k < dsz; k++)
+                down[e * dsz + k] = wv(1300 + static_cast<i64>(k) + eb);
+        }
+        b.tensor_f16(p_ + "ffn_gate_exps.weight",
+                     {u64(n_embd), u64(n_ff_exp), u64(ne)}, gate);
+        b.tensor_f16(p_ + "ffn_up_exps.weight",
+                     {u64(n_embd), u64(n_ff_exp), u64(ne)}, up);
+        b.tensor_f16(p_ + "ffn_down_exps.weight",
+                     {u64(n_ff_exp), u64(n_embd), u64(ne)}, down);
+    }
+    return b.write(path);
+}
+
+// ---------------------------------------------------------------------------
+// B2.3 -- the number the feature exists for: with weights wide enough to matter,
+// one batched step for four sequences must beat four steps, one per sequence.
+// Serial group: it times the machine, so it is not part of the default gate.
+// ---------------------------------------------------------------------------
+static void test_batch_throughput() {
+    Backend *cpu = make_cpu_backend();
+    const std::string path = "kraken-batch-bench.gguf";
+    CHECK(build_batch_bench_model(path), "wrote the wide MoE fixture");
+
+    auto open = [&](Engine *engine, i32 slots, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = slots;
+        // Squeezed on purpose: with every expert resident this CPU fixture is
+        // compute-bound and batching measures at parity (see the note above).
+        // At a budget the model cannot fit in -- the state a 4 GB-on-disk model
+        // is always in -- each step reads weights it did not have, and that is
+        // where one read for four rows pays. KRK_BATCH_BENCH_CACHE_MB=4096
+        // reproduces the resident arm.
+        const char *mb = std::getenv("KRK_BATCH_BENCH_CACHE_MB");
+        cfg.expert_cache_mb = mb ? std::atoi(mb) : 64;
+        return engine->init(cpu, cfg, err);
+    };
+
+    const char *prompts[4] = {"the", "a the", "the a", "a the a"};
+    const i32 n_tok = 24;
+    auto params = [&](const char *prompt) {
+        GenerateParams p;
+        p.prompt = prompt;
+        p.max_tokens = n_tok;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        p.sample_host = true;
+        return p;
+    };
+
+    // Three rounds each, median taken. A single round on a shared machine is a
+    // coin flip between 1.1x and 1.4x; the median is what the claim rests on.
+    const int rounds = 3;
+    std::vector<GenerateResult> solo;
+    std::vector<f64> serial_ms;
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 4, &err)) {
+            CHECK(false, "bench engine initialises");
+            delete cpu;
+            return;
+        }
+        for (int round = 0; round < rounds; round++) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 4; i++) {
+                GenerateParams p = params(prompts[i]);
+                GenerateResult r;
+                CHECK(engine.generate(p, &r), "solo bench run completes");
+                if (round == 0) solo.push_back(r);
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            serial_ms.push_back(
+                std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+    }
+
+    std::vector<GenerateResult> outs;
+    std::vector<f64> batch_ms;
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 4, &err)) {
+            CHECK(false, "batched bench engine initialises");
+            delete cpu;
+            return;
+        }
+        std::vector<GenerateParams> reqs;
+        for (int i = 0; i < 4; i++) reqs.push_back(params(prompts[i]));
+        for (int round = 0; round < rounds; round++) {
+            const auto t0 = std::chrono::steady_clock::now();
+            CHECK(engine.generate_batch(reqs, &outs), "the batched wave runs");
+            const auto t1 = std::chrono::steady_clock::now();
+            batch_ms.push_back(
+                std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+    }
+    auto median = [](std::vector<f64> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const f64 serial_med = median(serial_ms);
+    const f64 batch_med = median(batch_ms);
+
+    i64 serial_tokens = 0, batch_tokens = 0;
+    for (int i = 0; i < 4; i++) {
+        serial_tokens += solo[i].generated;
+        if (i < static_cast<int>(outs.size())) {
+            batch_tokens += outs[i].generated;
+            CHECK(outs[i].tokens == solo[i].tokens,
+                  "bench slot " + std::to_string(i) +
+                      ": the wide model's batched tokens are the solo tokens");
+        }
+    }
+    const f64 serial_tps = 1000.0 * static_cast<f64>(serial_tokens) / serial_med;
+    const f64 batch_tps = 1000.0 * static_cast<f64>(batch_tokens) / batch_med;
+    std::fprintf(stderr,
+                 "  [batch] 4 sequences x %lld token(s), median of %d: serial "
+                 "%.1f tok/s (%.0f ms), batched %.1f tok/s (%.0f ms) -> %.2fx "
+                 "aggregate\n",
+                 static_cast<long long>(n_tok), rounds, serial_tps, serial_med,
+                 batch_tps, batch_med,
+                 serial_tps > 0.0 ? batch_tps / serial_tps : 0.0);
+    CHECK(batch_tokens == serial_tokens, "the same number of tokens came out");
+    // The plan's done-when, in one line: the aggregate for four concurrent
+    // sequences is above the aggregate for the same four, one at a time.
+    // What this gates is the direction that would be a defect: batching costing
+    // throughput. The SIZE of the win is a property of how memory-bound the
+    // step is (measured: 1.02x resident, 1.08-1.12x squeezed -- recorded in
+    // docs/PLAN-remaining.md), and a gate on a ratio that thin would fail on
+    // this machine's noise, which teaches a reader to ignore the gate.
+    CHECK(batch_tps > serial_tps * 0.95,
+          "four sequences decoded together are not slower than four decoded one "
+          "at a time (" + std::to_string(batch_tps) + " vs " +
+              std::to_string(serial_tps) + " tok/s)");
+
+    std::remove(path.c_str());
+    delete cpu;
+}
+
 static const TestGroup kGroups[] = {
     TEST_GROUP(test_quant_geometry)
     TEST_GROUP(test_q4_0_layout)
@@ -31178,6 +31593,9 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_kv_tier_host_reserve_refusal)
     TEST_GROUP(test_kv_tier_per_plane_cold_files)
     TEST_GROUP(test_moe_batch_ops)
+    TEST_GROUP(test_batch_decode)
+    TEST_GROUP_SERIAL(test_batch_throughput,
+                      "times the machine: four sequences batched vs serial")
     TEST_GROUP(test_cli_arg_refusal)
     TEST_GROUP_SERIAL(test_pageable_path_probe,
                       "times host->device copy rates, so it needs the machine")
