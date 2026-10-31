@@ -23,6 +23,63 @@ std::string blk_key(const char *fmt, i32 layer) {
     return std::string(buf);
 }
 
+// A routed-expert trio is read through ONE format, not three.
+//
+// `gemm_group` takes a single weight type and every matrix in the launch shares
+// it (`wts` exists, but the expert call sites do not pass one -- the bank is one
+// launch of N routes), and the expert cache sizes a fetch from the tensor's
+// format once. So a checkpoint that stores, say, `ffn_gate_exps` as Q8_0 and
+// `ffn_up_exps` as F16 would be walked with the gate's block size: the up
+// matrix's rows would be read at the wrong stride and every routing that picked
+// an expert would compute a plausible-looking wrong answer. Nothing downstream
+// can tell -- the shapes agree, so every existing check passes.
+//
+// This is not hypothetical: hybrid checkpoints are normal. DeepSeek-V4-Flash's
+// NVFP4 release keeps the trunk experts in ModelOpt NVFP4 and the MTP draft's
+// experts in FP8/MXFP4, and the vLLM port that let the draft inherit the
+// trunk's quant config lost its whole speculative gain to it (acceptance fell
+// to ~1.0-1.15 tokens/step, 16.7 tok/s; on its own path, 70% acceptance and
+// 45.4 tok/s). A mixed-trio file we cannot run must say so, with the two format
+// names, rather than run and be wrong.
+//
+// `g` may be null: an ungated bank (nemotron_h_moe) has no `ffn_gate_exps`.
+bool expert_formats_agree(const GgufTensor *g, const GgufTensor *up,
+                          const GgufTensor *dn, const std::string &where,
+                          std::string *err) {
+    const GgufTensor *first = g ? g : up;
+    if (!first) return true;
+    for (const GgufTensor *t : {g, up, dn}) {
+        if (!t || t->type == first->type) continue;
+        if (err)
+            *err = where + ": the routed experts mix formats -- '" + first->name +
+                   "' is " + dtype_name(first->type) + " and '" + t->name +
+                   "' is " + dtype_name(t->type) +
+                   ". A bank is read as one launch in one format, so the mixed "
+                   "matrices would be walked at the wrong stride and answer "
+                   "wrongly. Re-quantize the experts to one type, or load this "
+                   "file in an engine that indexes per-matrix formats";
+        return false;
+    }
+    return true;
+}
+
+// An NVFP4 bank without its per-tensor global scale is 1.0 by construction (see
+// ExpertWeights::scale_of), which is right for the 255/256 of formats that never
+// carry one and silent for the one that does. That silence is the same failure
+// as above one level down: the weights decode, the arithmetic runs, and every
+// value is off by a factor nothing reports. Not fatal -- a converter that folded
+// the global into the block scales legitimately has none -- so say it loudly
+// once and carry on.
+void warn_unscaled_nvfp4(const GgufTensor *w, const GgufTensor *scale) {
+    if (!w || scale) return;
+    if (w->type != DType::NVFP4) return;
+    KRK_WARN("'%s' is NVFP4 and ships no '%s.scale' -- every code in it is read "
+             "at global scale 1.0. If this file came from a ModelOpt checkpoint "
+             "the scales are part of the encoding and their absence is a "
+             "conversion bug, not a format without them",
+             w->name.c_str(), w->name.c_str());
+}
+
 // Every QuantTensor a layer owns. One list, because two loops have to agree
 // with LayerWeights: the per-tensor release in unload(), and the binding of a
 // streamed entry to the tensor that a promotion re-points. A field added to
@@ -4147,6 +4204,9 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     return false;
                 }
             }
+            if (!expert_formats_agree(g, up, dn, "layer " + std::to_string(l),
+                                      err))
+                return false;
             L.experts.gate = g;
             L.experts.up = up;
             L.experts.down = dn;
@@ -4173,6 +4233,9 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 gguf_.tensor(blk_key("blk.%d.ffn_down_exps.scale", l));
             L.experts.gate_scale = g ? gguf_.tensor(exps_gate + ".scale")
                                      : nullptr;
+            warn_unscaled_nvfp4(g, L.experts.gate_scale);
+            warn_unscaled_nvfp4(up, L.experts.up_scale);
+            warn_unscaled_nvfp4(dn, L.experts.down_scale);
             {
                 const GgufTensor *src = nullptr;
                 if (g && g->n_dims == 3)
@@ -5380,6 +5443,10 @@ bool Model::load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
         m.exps_gate = tensor(key(".ffn_gate_exps.weight"));
         m.exps_up = tensor(key(".ffn_up_exps.weight"));
         m.exps_down = tensor(key(".ffn_down_exps.weight"));
+        if (!expert_formats_agree(m.exps_gate, m.exps_up, m.exps_down,
+                                  "nextn block " + std::to_string(l) + " in " +
+                                      origin, err))
+            return false;
         // An UNGATED expert bank has no gate tensor at all (nemotron_h_moe's
         // nextn block is up/down only), so the bank is whatever of the three is
         // there and the width comes from the tensor that carries it: up/gate put
@@ -5715,6 +5782,12 @@ bool Model::load_dspark_mtp_from(const Gguf &g, i32 l, const std::string &origin
     L.experts.gate_scale = g.tensor(key(".ffn_gate_exps.scale"));
     L.experts.up_scale = g.tensor(key(".ffn_up_exps.scale"));
     L.experts.down_scale = g.tensor(key(".ffn_down_exps.scale"));
+    if (!expert_formats_agree(L.experts.gate, L.experts.up, L.experts.down,
+                              "the dspark head set " + origin, err))
+        return false;
+    warn_unscaled_nvfp4(L.experts.gate, L.experts.gate_scale);
+    warn_unscaled_nvfp4(L.experts.up, L.experts.up_scale);
+    warn_unscaled_nvfp4(L.experts.down, L.experts.down_scale);
     L.experts.n_expert = n_expert;
     L.experts.n_embd = ne;
     L.experts.n_ff_exp = n_ff_exp;

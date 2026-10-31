@@ -31734,6 +31734,137 @@ static void test_batch_throughput() {
     delete cpu;
 }
 
+// ---- a routed expert bank is ONE format ------------------------------------
+//
+// `gemm_group` is handed one weight type for the whole launch and the expert
+// cache sizes a fetch from one format, so a trio that mixes Q8_0 with F16 is
+// walked at the wrong stride: shapes agree, every existing check passes, and the
+// answer is wrong. Hybrid checkpoints are the normal way to get there -- an
+// NVFP4 trunk with FP8 MTP experts is a shipped DeepSeek-V4 file, and the vLLM
+// port that let the draft inherit the trunk's quant config lost its speculative
+// gain entirely to exactly this class of mistake.
+//
+// The check is fail-closed at load, with the two format names, and this test is
+// its negative control: the SAME stack with a uniform trio must still load.
+static bool build_mixed_expert_model(const std::string &path, bool mixed) {
+    const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int n_layer = 1, n_expert = 4, n_used = 2, n_ff_exp = 32;
+    const int vocab = 264, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string arch = "qwen2moe";
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-mixed-expert-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", (u32)n_layer);
+    b.meta_u32(arch + ".context_length", (u32)ctx);
+    b.meta_u32(arch + ".embedding_length", (u32)n_embd);
+    b.meta_u32(arch + ".feed_forward_length", (u32)n_ff);
+    b.meta_u32(arch + ".attention.head_count", (u32)n_head);
+    b.meta_u32(arch + ".attention.head_count_kv", (u32)n_kv);
+    b.meta_u32(arch + ".attention.key_length", (u32)hd);
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".expert_count", (u32)n_expert);
+    b.meta_u32(arch + ".expert_used_count", (u32)n_used);
+    b.meta_u32(arch + ".expert_feed_forward_length", (u32)n_ff_exp);
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t k = 0; k < n; k++)
+            v[k] = 0.05f * static_cast<f32>((base + static_cast<i64>(k)) % 17) -
+                   0.4f;
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {(u64)n_embd, (u64)vocab},
+                 vec((size_t)n_embd * vocab, 1));
+    b.tensor_f16("output_norm.weight", {(u64)n_embd}, ones(n_embd));
+    b.tensor_f16("output.weight", {(u64)n_embd, (u64)vocab},
+                 vec((size_t)n_embd * vocab, 2));
+    const std::string p = "blk.0.";
+    b.tensor_f32(p + "attn_norm.weight", {(u64)n_embd}, ones(n_embd));
+    b.tensor_f32(p + "ffn_norm.weight", {(u64)n_embd}, ones(n_embd));
+    b.tensor_f16(p + "attn_q.weight", {(u64)n_embd, (u64)q_dim},
+                 vec((size_t)n_embd * q_dim, 10));
+    b.tensor_f16(p + "attn_k.weight", {(u64)n_embd, (u64)kv_dim},
+                 vec((size_t)n_embd * kv_dim, 20));
+    b.tensor_f16(p + "attn_v.weight", {(u64)n_embd, (u64)kv_dim},
+                 vec((size_t)n_embd * kv_dim, 30));
+    b.tensor_f16(p + "attn_output.weight", {(u64)q_dim, (u64)n_embd},
+                 vec((size_t)q_dim * n_embd, 40));
+    b.tensor_f16(p + "ffn_gate_inp.weight", {(u64)n_embd, (u64)n_expert},
+                 vec((size_t)n_embd * n_expert, 50));
+
+    const size_t gsz = (size_t)n_embd * n_ff_exp;
+    const size_t ne = (size_t)n_expert;
+    const std::vector<f32> gate = vec(gsz * ne, 1300);
+    const std::vector<f32> up = vec(gsz * ne, 1500);
+    const std::vector<f32> down = vec((size_t)n_ff_exp * n_embd * ne, 1700);
+    b.tensor_f16(p + "ffn_gate_exps.weight", {(u64)n_embd, (u64)n_ff_exp, (u64)ne},
+                 gate);
+    if (!mixed) {
+        b.tensor_f16(p + "ffn_up_exps.weight",
+                     {(u64)n_embd, (u64)n_ff_exp, (u64)ne}, up);
+    } else {
+        // Q8_0: 32 values behind an f16 scale. The CONTENT is irrelevant -- the
+        // load must stop before any of it is read -- so the payload is a
+        // well-formed all-zero block per 32 values.
+        const size_t nblocks = (gsz * ne) / 32;
+        std::vector<u8> q8(nblocks * 34, 0);
+        for (size_t i = 0; i < nblocks; i++) {
+            const u16 d = 0x3C00; // f16 1.0
+            std::memcpy(&q8[i * 34], &d, 2);
+        }
+        b.tensor_raw(p + "ffn_up_exps.weight", 8,
+                     {(u64)n_embd, (u64)n_ff_exp, (u64)ne}, q8.data(),
+                     q8.size());
+    }
+    b.tensor_f16(p + "ffn_down_exps.weight",
+                 {(u64)n_ff_exp, (u64)n_embd, (u64)ne}, down);
+    return b.write(path);
+}
+
+static void test_mixed_expert_formats() {
+    Backend *cpu = make_cpu_backend();
+    const std::string good = "mixed_expert_ok.gguf";
+    const std::string bad = "mixed_expert_bad.gguf";
+    CHECK(build_mixed_expert_model(good, false), "wrote the uniform-trio file");
+    CHECK(build_mixed_expert_model(bad, true), "wrote the mixed-trio file");
+
+    // The control: same stack, all three banks F16. It must still load, or the
+    // check is refusing a legitimate file rather than a broken one.
+    {
+        Model m;
+        std::string e;
+        const bool ok = m.load(*cpu, good, &e);
+        CHECK(ok, ("a uniform routed-expert trio still loads: " + e).c_str());
+        m.unload();
+    }
+    // The refusal: gate F16, up Q8_0. Both names and both formats, so a reader
+    // is told which tensor to re-quantize.
+    {
+        Model m;
+        std::string e;
+        const bool ok = m.load(*cpu, bad, &e);
+        CHECK(!ok, "a routed trio that mixes formats is refused");
+        CHECK(e.find("mix formats") != std::string::npos,
+              ("the refusal says the experts mix formats: " + e).c_str());
+        CHECK(e.find("ffn_up_exps") != std::string::npos &&
+                  e.find("ffn_gate_exps") != std::string::npos,
+              ("and names both tensors: " + e).c_str());
+        CHECK(e.find("Q8_0") != std::string::npos &&
+                  e.find("F16") != std::string::npos,
+              ("and both formats: " + e).c_str());
+        m.unload();
+    }
+    std::remove(good.c_str());
+    std::remove(bad.c_str());
+    delete cpu;
+}
+
 static const TestGroup kGroups[] = {
     TEST_GROUP(test_quant_geometry)
     TEST_GROUP(test_q4_0_layout)
@@ -31912,6 +32043,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP_SERIAL(test_batch_throughput,
                       "times the machine: four sequences batched vs serial")
     TEST_GROUP(test_cli_arg_refusal)
+    TEST_GROUP(test_mixed_expert_formats)
     TEST_GROUP_SERIAL(test_pageable_path_probe,
                       "times host->device copy rates, so it needs the machine")
 };
