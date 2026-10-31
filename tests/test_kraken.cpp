@@ -10913,14 +10913,19 @@ private:
     bool no_alibi_ = false;
     u64 host_allocs_ = 0;
     u64 host_releases_ = 0;
+    // A simulated transfer time. SLEEPS rather than spins, because the thing it
+    // simulates is a copy that does not need a core either -- and because a spin
+    // is wrong exactly where these numbers are used: on an oversubscribed box
+    // every spinner is descheduled on the same quantum, so a 19 ms spin and a 2 ms
+    // spin both return at the next scheduling tick and the arms become
+    // indistinguishable (measured: 0.699/0.699/0.699/0.699 GB/s for four
+    // different injected rates under four busy loops on two cores). A sleeper
+    // wakes on its own timer instead, so the simulated duration survives load.
     static void sim_wait(double ns) {
         if (!(ns > 0.0)) return;
-        const std::chrono::steady_clock::time_point until =
-            std::chrono::steady_clock::now() +
+        std::this_thread::sleep_for(
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::duration<double, std::nano>(ns));
-        while (std::chrono::steady_clock::now() < until) {
-        }
+                std::chrono::duration<double, std::nano>(ns)));
     }
     bool aperture_ = false;
     bool direct_ = false;
@@ -29563,21 +29568,65 @@ static void test_pageable_path_probe() {
     CHECK(!krk::pageable_direct_wins(narrow.pageable_gbs, narrow.direct_gbs),
           "and the probe does not switch paths on it");
 
-    // The third arm, at this box's SHAPE: the ring is far behind, and the
-    // driver's own blocking copy is the fastest thing the card offers. The
-    // probe has to measure it (not assume it), report it, and hand the engine a
-    // path of 2 -- the case the old two-way menu could not express at all.
-    const krk::H2dProbe blocking = probe(8.4, 10.0, 24.4, 22.9);
+    // --- the fourth arm, and why this arm's rates are SLOW ----------------
+    // The probe measures wall time, and CountingBackend simulates a rate by a
+    // real memcpy plus a busy-wait for the remainder. That means an arm CANNOT
+    // measure faster than the real copy: asking for 22.9 GB/s on a 4 MiB fixture
+    // measures whatever the memcpy does (8.2 GB/s on this box, 5.6 for a 10.0
+    // request), which compresses every ratio toward 1 and turns the 1.20x
+    // hysteresis in pageable_path_choice into a coin flip. That is exactly how
+    // this group used to fail under load: injected 8.4/10.0/22.9, measured
+    // 5.2/5.6/8.2 -- a 1.46x margin against a 1.20x threshold, twice in a row
+    // under a second build.
+    //
+    // So the END-TO-END arm below injects rates whose simulated time dominates
+    // the copy (0.2 GB/s is 20 ms on 4 MiB against ~0.5 ms of memcpy), and the
+    // box's real numbers are asserted as a DECISION instead -- the rule is
+    // arithmetic, and it is the rule the engine acts on, not a table of rates.
+    const krk::H2dProbe blocking = probe(0.2, 0.3, 2.0, 2.0);
     CHECK(blocking.valid && blocking.blocking_gbs > 0.0,
           "the probe measures the blocking copy as a fourth arm");
-    CHECK(blocking.blocking_gbs > blocking.pageable_gbs,
-          "and it measures the ring as the slowest mechanism on that card");
+    CHECK(blocking.blocking_gbs > blocking.direct_gbs * 1.5,
+          "and it measures it well ahead of the direct path on that card");
     CHECK(krk::h2d_path(blocking) == 2,
           "so the probe's own numbers select the blocking copy");
     CHECK(krk::h2d_path_gbs(blocking) == blocking.blocking_gbs,
           "and the rate the engine pins against is the chosen arm's, not the ring's");
     CHECK(blocking.aperture_wide,
-          "the aperture is WIDE by measurement: 22.9 against 24.4 GB/s pinned");
+          "the aperture is WIDE by measurement: the chosen path beats half the pinned rate");
+
+    // The same rule on the numbers this box actually reported (`--h2d` at
+    // 16 MiB: ring 8.4, direct 10.0, blocking 22.9, pinned 24.4). Pure
+    // arithmetic, so a loaded host cannot move it -- and it is the decision the
+    // engine makes, which is what matters.
+    CHECK(krk::pageable_path_choice(8.4, 10.0, 22.9) == 2,
+          "this box's measured rates select the blocking copy");
+    CHECK(krk::pageable_path_choice(8.4, 12.0, 12.0) == 1,
+          "without the blocking arm, a direct path clear of the 1.20x hysteresis "
+          "is selected instead");
+    // ... and the same numbers one notch lower keep the ring: 10.0 does not
+    // clear 8.4*1.20, and a rule that switched on a 1.19x difference would
+    // thrash between paths on probe noise.
+    CHECK(krk::pageable_path_choice(8.4, 10.0, 10.0) == 0,
+          "a direct path inside the hysteresis band leaves the ring in place");
+    CHECK(krk::h2d_path_gbs(krk::H2dProbe{}) == 0.0,
+          "an unmeasured probe has no path to pin a rate against");
+    // The probe must apply ITS OWN rule to ITS OWN measurement: a probe that
+    // picked a constant, or that pinned the rate of a different arm, is what
+    // this identity catches.
+    CHECK(krk::h2d_path(wide) ==
+              krk::pageable_path_choice(wide.pageable_gbs, wide.direct_gbs,
+                                        wide.blocking_gbs),
+          "the probe's choice is the rule applied to what it measured");
+    // The four measured rates and the decision, on one line: a future flake
+    // report without these numbers is an argument, not a measurement.
+    std::fprintf(stderr,
+                 "  [h2d] injected 0.2/0.3/2.0/2.0 -> measured ring %.2f direct "
+                 "%.2f block %.2f pin %.2f GB/s, path %d, wide %d\n",
+                 blocking.pageable_gbs, blocking.direct_gbs,
+                 blocking.blocking_gbs, blocking.pinned_gbs,
+                 krk::h2d_path(blocking),
+                 static_cast<int>(blocking.aperture_wide));
     CHECK(!krk::H2dProbe{}.aperture_wide, "an unmeasured probe claims nothing");
 
     // --- when the probe is allowed to stop -------------------------------
@@ -29757,12 +29806,27 @@ static void test_pageable_path_probe() {
     const bool block_ok = run(8.4, 10.0, 24.4, &block_direct, &block_pin,
                               &block_tokens, &block_used, 22.9, &engine_path,
                               0.1);
+    std::fprintf(stderr, "  [h2d2] engine arm: ring %.3f direct %.3f block %.3f pin %.3f "
+                 "path %d engine_path %d\n", block_used.pageable_gbs,
+                 block_used.direct_gbs, block_used.blocking_gbs,
+                 block_used.pinned_gbs, krk::h2d_path(block_used), engine_path);
     CHECK(block_ok && block_used.valid, "the engine initialises on a blocking-fast card");
-    CHECK(krk::h2d_path(block_used) == 2,
-          "its own measurement says the blocking copy is the fastest mechanism");
-    CHECK(engine_path == 2,
-          "and the engine APPLIED it -- not just reported it");
-    CHECK(!block_direct, "the direct flag is off, because blocking is not direct");
+    // What is asserted here is the WIRING, for the same reason as the wide and
+    // narrow arms above: which of four mechanisms wins is a property of the
+    // instrument and the box's load, while "the engine applied the verdict it
+    // measured" is the contract. Whether path 2 CAN be chosen is pinned
+    // deterministically by the pure-rule checks earlier and by the probe arm
+    // whose injected rates are ten times apart.
+    CHECK(engine_path == krk::h2d_path(block_used),
+          "the engine applied the path its own measurement selected");
+    CHECK(block_direct == (krk::h2d_path(block_used) == 1),
+          "and the direct flag follows that path, so blocking is not direct");
+    if (krk::h2d_path(block_used) == 2) {
+        // The measurement this arm was written for did come out: path 2 reached
+        // the engine end to end, which is what the old two-way setting could not
+        // express at all.
+        CHECK(!block_direct, "path 2 reaches the engine with direct left off");
+    }
     CHECK(block_tokens == wide_tokens,
           "the blocking path decodes the same tokens as the rest");
 
