@@ -2,6 +2,9 @@
 
 Status 2026-10-31, after PR #84. Everything below assumes `main` at `5dae3b8`.
 
+**Progress:** steps **1.1-1.4 are done** (see *Item 1 status* at the end of that
+section). 1.5-1.7 are the forward and are untouched; item 4 has not started.
+
 The point of this file is that each step has a **done-when** that can fail. A step
 that cannot fail is not a step, it is a description.
 
@@ -96,6 +99,35 @@ own attention is wired (same interface, different block — reuse, do not share
 code); new group `test_mtp_head_qwen4`; baseline re-recorded.
 
 **Total:** 5-7 sessions, of which 1.6 is 60 % of it.
+
+### Item 1 status
+
+| step | state | evidence |
+|---|---|---|
+| 1.1 | **done** | `docs/MTP-HEAD-SCHEMA.md` — 31 rows, each with shape, format and consumer; the three not-in-the-31 tensors are listed with why |
+| 1.2 | **done** | `MtpBlock` gained `hf`, `n_lane`, `n_hc_rank`, `n_index_head`, `index_dim`, `HcMixer{hc_attn,hc_ffn,hc_head}`, `fc_embedding`/`fc_hidden`/`eh_proj_split`, `index_{q,k}`+norms, `exps_gate_up` |
+| 1.3 | **done** | `Model::load_mtp_hf_block` (src/mtp_head.cpp) + `test_mtp_head_qwen4`: a synthetic 31-tensor file loads, and the wrong-width bank / half-written prefix / mismatched `down_proj` are refused by tensor name |
+| 1.4 | **done** | `Gguf::add_expert_plane_slice` + `GgufTensor::plane_stride`/`plane()`; the expert path reads through `plane()` in all five places it used to compute `data + expert * per`. `test_mtp_head_qwen4` compares **every** expert's gate and up view against the source rows with `memcmp`, not a sample |
+| 1.5 | open | |
+| 1.6 | open | |
+| 1.7 | open | |
+| 1.8 | partly | the arch row is `Partial` (loads and validates, cannot propose); `test_mtp_head_qwen4` exists; the baseline is not re-recorded until the forward lands |
+
+Two deviations, both deliberate:
+
+* **`add_row_slice` was not extended** — a 3-D bank needs a plane stride, not a
+  row offset, so the stride became a field on `GgufTensor` (`plane_stride`) with
+  one `plane(e)` accessor. That is also what a future fused qkv bank needs, and
+  it kept the five existing call sites readable instead of adding an offset
+  parameter to each.
+* **No `dense_prefix` enum** — there are exactly two forms and the struct
+  already carries one of them as a non-empty `QuantTensor`, so `eh_proj_split`
+  (bool) plus the two `fc_*` tensors says the same thing without a third name
+  for a state that cannot occur.
+
+What the port still cannot do: the block has no forward. `--mtp` on a real head
+now loads, validates and reports it (`MTP head ...: 4 lane(s) x 2560, 512
+experts ... fwd=not implemented`), and then nothing drafts. That is 1.5-1.7.
 
 ---
 

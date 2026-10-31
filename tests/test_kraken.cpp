@@ -18761,6 +18761,242 @@ static void test_mtp_sidecar() {
     delete cpu;
 }
 
+// ---- the HF `mtp.*` head (qwen4exp) -----------------------------------------
+//
+// The head set a qwen4exp checkpoint ships beside its trunk: 31 tensors, all
+// `mtp.*`, with four hyper-connection lanes, a QSA indexer and one fused
+// `[2*n_ff_exp, n_embd, n_expert]` routed bank. Shapes here are small on
+// purpose -- every check below is about ARITHMETIC and REFUSAL, not about
+// whether 512 experts fit.
+//
+// The three ways this goes wrong silently, and the check for each:
+//   * the fused bank's two views read the wrong plane (up would be gate):
+//     verified byte-identically against the source rows, per expert;
+//   * a head from another checkpoint loads into workspaces sized for this one:
+//     refused, naming the tensor;
+//   * a half-written dense prefix (fc_embedding without fc_hidden) loads and
+//     computes h from one half of the fusion: refused by name.
+struct MtpHfSpec {
+    int n_embd = 32;
+    int lanes = 4;
+    int rank = 8;
+    int n_expert = 8;
+    int n_ff_exp = 4;      // per-expert FFN width; the fused plane is 2x this
+    int n_index_head = 2;
+    int index_dim = 8;
+    bool split_prefix = false;   // fc_embedding + fc_hidden instead of eh_proj
+    bool omit_fc_hidden = false; // the half-written split export
+    int bank_embd = 0;           // 0 = n_embd; non-zero = a mismatched bank
+};
+
+static std::string build_mtp_hf_head(const std::string &tag, const MtpHfSpec &s,
+                                     int n_head, int n_kv, int head_dim) {
+    const std::string path = std::string("kraken-mtp-hf-") + tag + ".gguf";
+    const int hc_dim = s.lanes * s.n_embd;
+    const int n_ff_shexp = s.n_ff_exp;
+    const int bank_embd = s.bank_embd > 0 ? s.bank_embd : s.n_embd;
+    const int qo = n_head * head_dim;
+    const int ko = n_kv * head_dim;
+    GgufBuilder b;
+    b.meta_str("general.architecture", "qwen4exp-mtp");
+    b.meta_str("general.name", "kraken-mtp-hf-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("qwen4exp-mtp.block_count", 1);
+    auto vec = [](size_t n, int seed) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = 0.01f * static_cast<f32>(
+                               (static_cast<int>(i + seed * 31) % 17) - 8);
+        return v;
+    };
+    auto ones = [](int n) { return std::vector<f32>(static_cast<size_t>(n), 1.0f); };
+    const std::string L = "mtp.layers.0.";
+    // The dense prefix.
+    b.tensor_f32("mtp.pre_fc_norm_embedding.weight", {u64(s.n_embd)}, ones(s.n_embd));
+    b.tensor_f32("mtp.pre_fc_norm_hidden.weight", {u64(hc_dim)}, ones(hc_dim));
+    if (s.split_prefix) {
+        b.tensor_f16("mtp.fc_embedding.weight", {u64(s.n_embd), u64(s.n_embd)},
+                     vec(static_cast<size_t>(s.n_embd) * s.n_embd, 1));
+        if (!s.omit_fc_hidden)
+            b.tensor_f16("mtp.fc_hidden.weight", {u64(s.n_embd), u64(s.n_embd)},
+                         vec(static_cast<size_t>(s.n_embd) * s.n_embd, 2));
+    } else {
+        b.tensor_f16("mtp.eh_proj.weight", {u64(2 * s.n_embd), u64(s.n_embd)},
+                     vec(static_cast<size_t>(2) * s.n_embd * s.n_embd, 3));
+    }
+    // The two hyper-connection mixers and the head mixer.
+    const char *mix[3] = {"hyper_connection_mixer.input", "hyper_connection_mixer.output",
+                          "final"};
+    for (int i = 0; i < 3; i++) {
+        const std::string pre =
+            i < 2 ? "mtp.layers.0." + std::string(mix[i]) : std::string("mtp.final");
+        b.tensor_f32(pre + "_mix_norm_weight", {u64(hc_dim)}, ones(hc_dim));
+        b.tensor_f16(pre + "_mix_weight_down.weight", {u64(hc_dim), u64(s.rank)},
+                     vec(static_cast<size_t>(hc_dim) * s.rank, 4 + i));
+        b.tensor_f16(pre + "_mix_weight_up.weight", {u64(s.rank), u64(hc_dim)},
+                     vec(static_cast<size_t>(s.rank) * hc_dim, 7 + i));
+        if (i < 2)
+            b.tensor_f32(pre + "_mix_inject_weight", {u64(s.lanes)},
+                         ones(s.lanes));
+    }
+    // Attention and its QK norms.
+    b.tensor_f16(L + "self_attn.q_proj.weight", {u64(s.n_embd), u64(qo)},
+                 vec(static_cast<size_t>(s.n_embd) * qo, 10));
+    b.tensor_f16(L + "self_attn.k_proj.weight", {u64(s.n_embd), u64(ko)},
+                 vec(static_cast<size_t>(s.n_embd) * ko, 11));
+    b.tensor_f16(L + "self_attn.v_proj.weight", {u64(s.n_embd), u64(ko)},
+                 vec(static_cast<size_t>(s.n_embd) * ko, 12));
+    b.tensor_f16(L + "self_attn.o_proj.weight", {u64(qo), u64(s.n_embd)},
+                 vec(static_cast<size_t>(qo) * s.n_embd, 13));
+    b.tensor_f32(L + "self_attn.q_norm.weight", {u64(head_dim)}, ones(head_dim));
+    b.tensor_f32(L + "self_attn.k_norm.weight", {u64(head_dim)}, ones(head_dim));
+    // The QSA indexer: four tensors or none.
+    b.tensor_f16(L + "self_attn.indexer.q_proj.weight",
+                 {u64(s.n_embd), u64(s.n_index_head * s.index_dim)},
+                 vec(static_cast<size_t>(s.n_embd) * s.n_index_head * s.index_dim, 14));
+    b.tensor_f16(L + "self_attn.indexer.k_proj.weight",
+                 {u64(s.n_embd), u64(s.index_dim)},
+                 vec(static_cast<size_t>(s.n_embd) * s.index_dim, 15));
+    b.tensor_f32(L + "self_attn.indexer.q_norm.weight", {u64(s.index_dim)},
+                 ones(s.index_dim));
+    b.tensor_f32(L + "self_attn.indexer.k_norm.weight", {u64(s.index_dim)},
+                 ones(s.index_dim));
+    // The MoE: router, one fused bank, shared expert.
+    b.tensor_f16(L + "mlp.gate.weight", {u64(s.n_embd), u64(s.n_expert)},
+                 vec(static_cast<size_t>(s.n_embd) * s.n_expert, 16));
+    // [n_embd, 2*n_ff_exp, n_expert] -- dim0 contiguous, dim1 the rows, which
+    // is the order llama.cpp's create_tensor_gate_up_exps fixes.
+    b.tensor_f16(L + "mlp.experts.gate_up_proj",
+                 {u64(bank_embd), u64(2 * s.n_ff_exp), u64(s.n_expert)},
+                 vec(static_cast<size_t>(2) * s.n_ff_exp * bank_embd * s.n_expert, 17));
+    b.tensor_f16(L + "mlp.experts.down_proj",
+                 {u64(s.n_ff_exp), u64(bank_embd), u64(s.n_expert)},
+                 vec(static_cast<size_t>(s.n_ff_exp) * bank_embd * s.n_expert, 18));
+    b.tensor_f32(L + "mlp.shared_expert_gate.weight", {u64(s.n_embd)}, ones(s.n_embd));
+    b.tensor_f16(L + "mlp.shared_expert.gate_proj.weight",
+                 {u64(s.n_embd), u64(n_ff_shexp)},
+                 vec(static_cast<size_t>(s.n_embd) * n_ff_shexp, 19));
+    b.tensor_f16(L + "mlp.shared_expert.up_proj.weight",
+                 {u64(s.n_embd), u64(n_ff_shexp)},
+                 vec(static_cast<size_t>(s.n_embd) * n_ff_shexp, 20));
+    b.tensor_f16(L + "mlp.shared_expert.down_proj.weight",
+                 {u64(n_ff_shexp), u64(s.n_embd)},
+                 vec(static_cast<size_t>(n_ff_shexp) * s.n_embd, 21));
+    if (!b.write(path)) return std::string();
+    return path;
+}
+
+static void test_mtp_head_qwen4() {
+    Backend *cpu = make_cpu_backend();
+    const std::string trunk = "kraken-mtp-hf-trunk.gguf";
+    CHECK(build_sized_model(trunk, 32, 64, -1), "wrote a trunk for the head");
+    // The trunk's own attention geometry, which the head is checked against.
+    const int n_head = 4, n_kv = 2, head_dim = 8;
+
+    // 1. The fused form loads, and the bank's two views are the right BYTES.
+    MtpHfSpec s;
+    const std::string good = build_mtp_hf_head("fused", s, n_head, n_kv, head_dim);
+    CHECK(!good.empty(), "wrote a 31-tensor fused-prefix head");
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(good);
+        CHECK(m.load(*cpu, trunk, &err), "the HF head loads beside its trunk");
+        if (!err.empty()) std::fprintf(stderr, "  (head: %s)\n", err.c_str());
+        const MtpBlock &b = m.mtp();
+        CHECK(b.present && b.hf, "the block is the HF form");
+        CHECK(b.n_lane == s.lanes, "four hyper-connection lanes are read off hnorm");
+        CHECK(b.n_expert == s.n_expert && b.n_ff_exp == s.n_ff_exp,
+              "the routed geometry comes off the fused bank");
+        CHECK(b.n_hc_rank == s.rank, "the mixer bottleneck is read off down/up");
+        CHECK(b.n_index_head == s.n_index_head && b.index_dim == s.index_dim,
+              "the QSA indexer's own geometry is read off its projections");
+        CHECK(!b.eh_proj_split && b.eh_proj.present(),
+              "the fused eh_proj is the dense prefix");
+        CHECK(b.exps_gate_up && b.exps_gate && b.exps_up,
+              "the fused bank and both plane views are recorded");
+        CHECK(b.exps_gate->ne[1] == u64(s.n_ff_exp) &&
+                  b.exps_up->ne[1] == u64(s.n_ff_exp),
+              "gate and up are half a plane each, not the whole plane");
+        CHECK(b.exps_gate->plane_stride == b.exps_up->plane_stride &&
+                  b.exps_gate->plane_stride == b.exps_gate_up->n_bytes /
+                                                    static_cast<size_t>(s.n_expert),
+              "both views keep the fused bank's plane-to-plane stride");
+        // Per expert, the gate view must read the FIRST half of that expert's
+        // plane and the up view the SECOND. This is the whole reason the stride
+        // exists, so it is checked on the bytes rather than on the arithmetic.
+        const size_t plane_bytes = b.exps_gate_up->n_bytes /
+                                   static_cast<size_t>(s.n_expert);
+        const size_t half = plane_bytes / 2;
+        bool gate_ok = true, up_ok = true;
+        for (int e = 0; e < s.n_expert; e++) {
+            const u8 *base = b.exps_gate_up->data + static_cast<size_t>(e) * plane_bytes;
+            if (std::memcmp(b.exps_gate->plane(e), base, half) != 0) gate_ok = false;
+            if (std::memcmp(b.exps_up->plane(e), base + half, half) != 0) up_ok = false;
+        }
+        CHECK(gate_ok, "gate view = rows [0, n_ff_exp) of every expert plane");
+        CHECK(up_ok, "up view = rows [n_ff_exp, 2*n_ff_exp) of every expert plane");
+        m.unload();
+    }
+
+    // 2. A bank whose inner width is not the trunk's is refused BY NAME: this is
+    //    the head of another checkpoint, and running it would multiply these
+    //    rows against a hidden state of the wrong width.
+    MtpHfSpec bad = s;
+    bad.bank_embd = 40;
+    const std::string wrong = build_mtp_hf_head("wrongwidth", bad, n_head, n_kv, head_dim);
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(wrong);
+        CHECK(!m.load(*cpu, trunk, &err), "a bank of another width is refused");
+        CHECK(err.find("gate_up_proj") != std::string::npos,
+              "the refusal names the tensor that disagrees");
+    }
+
+    // 3. A half-written split prefix is refused, naming the missing half.
+    MtpHfSpec half = s;
+    half.split_prefix = true;
+    half.omit_fc_hidden = true;
+    const std::string splitbad = build_mtp_hf_head("halfprefix", half, n_head, n_kv, head_dim);
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(splitbad);
+        CHECK(!m.load(*cpu, trunk, &err), "fc_embedding without fc_hidden is refused");
+        CHECK(err.find("fc_hidden") != std::string::npos,
+              "the refusal names the missing half of the prefix");
+    }
+
+    // 4. The complete split prefix (the EXL3 spelling) loads and is reported as
+    //    the split form -- the two prefixes are the same function, and which one
+    //    a file carries is a fact the forward has to know.
+    MtpHfSpec sp = s;
+    sp.split_prefix = true;
+    const std::string split = build_mtp_hf_head("splitprefix", sp, n_head, n_kv, head_dim);
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(split);
+        CHECK(m.load(*cpu, trunk, &err), "the split dense prefix loads");
+        const MtpBlock &b = m.mtp();
+        CHECK(b.hf && b.eh_proj_split, "the split form is reported as such");
+        CHECK(b.fc_embedding.present() && b.fc_hidden.present(),
+              "both halves of the split prefix are uploaded");
+    }
+
+    std::remove(trunk.c_str());
+    std::remove(good.c_str());
+    std::remove(wrong.c_str());
+    std::remove(splitbad.c_str());
+    std::remove(split.c_str());
+    delete cpu;
+}
+
 struct TestGroup {
     const char *name;
     void (*fn)();
@@ -29286,6 +29522,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_expert_dispatch_host_backed)
     TEST_GROUP(test_draft_head)
     TEST_GROUP(test_mtp_sidecar)
+    TEST_GROUP(test_mtp_head_qwen4)
     TEST_GROUP(test_expert_warmup)
     TEST_GROUP(test_expert_index_adapt)
     TEST_GROUP(test_hc_lanes)

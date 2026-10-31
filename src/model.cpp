@@ -5038,22 +5038,16 @@ bool Model::load_mtp_block(std::string *err) {
         for (const GgufTensor &t : mtp_gguf_->tensors())
             if (t.name.rfind("mtp.", 0) == 0) ++hf_tensors;
         if (hf_tensors > 0) {
-            // ... and it is the same head this trunk's own block would be, in HF
-            // names and in a shape this loader does not run: `load_mtp_block_from`
-            // expects `blk.N.attn_*` + `blk.N.ffn_*`, while these blocks carry a
-            // hyper-connection mixer, a QSA indexer's attention and their own
-            // routed MoE. Named here so the gap is the file's own -- refusing it
-            // as "not a nextn block" was both wrong and unhelpful.
-            if (err)
-                *err = mtp_path_ + " carries " + std::to_string(hf_tensors) +
-                       " `mtp.*` tensor(s): the same head this trunk's own block "
-                       "would be, in HF names and in a shape this loader does not "
-                       "run (hyper-connection mixer, QSA indexer attention, its own "
-                       "routed MoE). Reading it needs that forward; the verify loop "
-                       "(--mtp-spec) is already here and unchanged. See "
-                       "docs/AUDIT-mtp-drafter.md.";
-            mtp_gguf_.reset();
-            return false;
+            // The HF `mtp.*` form: qwen4exp's head is not a llama block (four
+            // hyper-connection lanes, a QSA indexer with its own KV, its own
+            // 512-expert MoE with the gate and up rows fused into one bank), so
+            // it has its own reader. Shapes are checked against this trunk and
+            // against each other; a head that disagrees is refused by tensor
+            // name. What is NOT here yet is the forward -- see
+            // docs/PLAN-mtp-and-prefill.md steps 1.5-1.7.
+            const bool ok = load_mtp_hf_block(*mtp_gguf_, mtp_path_, err);
+            if (!ok) mtp_gguf_.reset();
+            return ok;
         }
         if (!side_arch.empty() && side_arch != cfg_.arch) {
             if (err)

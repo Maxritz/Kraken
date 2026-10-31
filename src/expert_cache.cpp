@@ -1014,7 +1014,7 @@ bool ExpertCache::warm_fill(const ExpertSource &src, i32 expert, Slot &s) {
         const size_t per = eff[i];
         if (!t || per == 0) continue;
         dst[ndst] = static_cast<char *>(base) + blk.off[i];
-        srcp[ndst] = t->data + static_cast<size_t>(expert) * per;
+        srcp[ndst] = t->plane(expert);
         ndst++;
         bytes += per;
     }
@@ -1776,7 +1776,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
             // buffer, where the bytes are already in RAM.
             MsTimer read_clock(&read_ms_,
                                phase_sink(&pf_read_ms_, &dc_read_ms_));
-            be_->upload(dsts[i]->data, t->data + static_cast<size_t>(e) * per, per);
+            be_->upload(dsts[i]->data, t->plane(e), per);
         }
     }
     {
@@ -2192,7 +2192,7 @@ size_t ExpertCache::touch_layer(const ExpertSource &src, i32 layer,
                     if (!slice[i] || !ts[i] || !ts[i]->data) continue;
                     reqs.push_back(Backend::ReadReq{
                         base + blk.off[i],
-                        ts[i]->data + static_cast<size_t>(id) * slice[i],
+                        ts[i]->plane(id),
                         slice[i]});
                 }
             }
@@ -2436,7 +2436,7 @@ size_t ExpertCache::prefetch_layer(const ExpertSource &src, i32 layer,
                 if (!slice[i]) continue;
                 reqs.push_back(Backend::ReadReq{
                     jb.dst[i],
-                    ts[i]->data + static_cast<size_t>(jb.expert) * slice[i],
+                    ts[i]->plane(jb.expert),
                     slice[i]});
             }
         }
@@ -2592,7 +2592,7 @@ void ExpertCache::pf_worker() {
                 const size_t per = eff[i];
                 if (!t || per == 0) continue;
                 void *p = static_cast<char *>(ent.base) + blk.off[i];
-                const void *mapped = t->data + static_cast<size_t>(e) * per;
+                const void *mapped = t->plane(e);
                 try {
                     // Concurrent: this runs while the main thread decodes, so
                     // the row is marked and is not additive with decode.step.

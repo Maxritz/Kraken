@@ -1034,10 +1034,14 @@ constexpr ArchSpec kTable[] = {
     // forward for. The file also carries no embedding and no head, so it is a
     // head set and not a model under any reading. Claiming it would mean
     // proposing tokens from a block whose forward does not exist.
-    {"qwen4-mtp", ArchShape::Moe, ArchSupport::No, ArchRole::Draft, "qwen4exp",
+    {"qwen4-mtp", ArchShape::Moe, ArchSupport::Partial, ArchRole::Draft,
+     "qwen4exp",
      "an MTP head set for a qwen4exp target: one block with gated attention, a "
-     "QSA indexer, hyper-connections and a 512-expert MoE, which this engine "
-     "does not implement",
+     "QSA indexer, hyper-connections and a 512-expert MoE. It loads, its "
+     "shapes are checked against the trunk and its fused expert bank is split "
+     "into gate/up views with no copy, but the block's forward is not "
+     "implemented yet, so it cannot propose a token "
+     "(docs/PLAN-mtp-and-prefill.md 1.5-1.7)",
      true, true, false, false},
 
     // A head set is not a model: no token embedding, no output head, nothing to

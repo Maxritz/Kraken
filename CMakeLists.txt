@@ -121,6 +121,7 @@ set(KRK_CORE_SOURCES
     src/model.cpp
     src/dflash.cpp
     src/dspark.cpp
+    src/mtp_head.cpp
     src/msa.cpp
     src/draft_head.cpp
     src/expert_cache.cpp

@@ -79,6 +79,25 @@ struct GgufTensor {
     // pull path needs this: it converts a pointer back to a file offset with
     // `src - shard_base`, and each shard has its own base.
     u32 shard = 0;
+    // Bytes from one expert plane to the next, for a bank that is a VIEW into
+    // a wider per-expert plane (see `add_expert_plane_slice`). 0 means packed,
+    // i.e. the stride is `n_bytes / ne[2]` and every existing reader's
+    // `data + expert * per` was already right.
+    //
+    // A fused `gate_up_proj` `[1280, n_embd, n_expert]` is the case that needs
+    // it: the gate rows are 0..639 of every 1280-row plane and the up rows are
+    // 640..1279, so the two views have half a plane of payload each but the
+    // SAME plane-to-plane distance. Without this the second view would read
+    // expert e's gate rows where it wants expert e's up rows.
+    size_t plane_stride = 0;
+    // Where expert `e`'s slice starts, honouring `plane_stride`.
+    const u8 *plane(i64 e) const {
+        if (!data) return nullptr;
+        const size_t stride =
+            plane_stride ? plane_stride
+                         : (n_bytes / (ne[2] ? static_cast<size_t>(ne[2]) : 1));
+        return data + static_cast<size_t>(e) * stride;
+    }
 };
 
 // One file of a split (`split.*`) model, or the whole single-file model.
@@ -152,6 +171,14 @@ public:
     // offset arithmetic on a packed matrix -- no dequantize and no copy.
     bool add_row_slice(const std::string &to, const std::string &from, i64 row0,
                        i64 rows, i64 n_in);
+    // `to` = rows [row0, row0 + rows) of EVERY expert plane of the 3-D bank
+    // `from`, still `n_in` wide. The view keeps the bank's own plane-to-plane
+    // stride (`GgufTensor::plane_stride`), so it is offset arithmetic only --
+    // no copy -- which is what a fused expert bank needs: qwen4exp's MTP block
+    // stores its 512 experts' gate and up rows in one `[1280, n_embd, 512]`
+    // tensor, gate first.
+    bool add_expert_plane_slice(const std::string &to, const std::string &from,
+                                i64 row0, i64 rows, i64 n_in);
     // Appends a directory entry built by the caller (a contiguous span of an
     // existing tensor, e.g. one third of a fused bias). Refused when the name is
     // already taken, so the file's own spelling always wins.
