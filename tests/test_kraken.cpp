@@ -18837,8 +18837,11 @@ static std::string build_mtp_hf_head(const std::string &tag, const MtpHfSpec &s,
         b.tensor_f16(pre + "_mix_weight_up.weight", {u64(s.rank), u64(hc_dim)},
                      vec(static_cast<size_t>(s.rank) * hc_dim, 7 + i));
         if (i < 2)
-            b.tensor_f32(pre + "_mix_inject_weight", {u64(s.lanes)},
-                         ones(s.lanes));
+            // [hc_dim, hc]: a wide -> one-weight-per-lane projection, NOT a
+            // 4-long vector (that reading made the mixer consume 128 rows out
+            // of a 4-element tensor, see src/mtp_head.cpp).
+            b.tensor_f32(pre + "_mix_inject_weight", {u64(hc_dim), u64(s.lanes)},
+                         ones(static_cast<size_t>(hc_dim) * s.lanes));
     }
     // Attention and its QK norms.
     b.tensor_f16(L + "self_attn.q_proj.weight", {u64(s.n_embd), u64(qo)},
@@ -25953,6 +25956,311 @@ static void test_qsa_select() {
 // compared at chunk 1 against chunk 8, i.e. across the exact rows<=8 rung; a
 // wide chunk is checked for shape rather than identity because its projection
 // runs the rows>=9 tile.
+// ---- step 1.6: the qwen4exp block, end to end ------------------------------
+//
+// There is no checkpoint here, so the gate cannot be an acceptance rate. It is
+// something stricter that a synthetic head can be built to satisfy exactly:
+//
+//   A head whose attention output and whose MoE are both identically zero, and
+//   whose dense prefix is the identity on the hidden half, makes the block a
+//   PASS-THROUGH. Its lane stack after the block is the trunk's own lane stack,
+//   so its final mixer produces the trunk's own final row and its argmax must
+//   BE the trunk's argmax -- on every probed position, not 60 % of them.
+//
+// That is worth more than it looks: it exercises the lane capture, the per-lane
+// prefix, both hc_enter/hc_leave pairs, the routing path, the head mixer and the
+// vocabulary head, and it fails if ANY of them is off by a lane, a scale or a
+// position. The negative control below then perturbs one lane's gamma and
+// requires the agreement to break, so the equality cannot be vacuous.
+//
+// The weights are all zero or one on purpose: `ones` exercises the RMS path
+// (a zero row would normalise to zero and hide a wrong gamma), and zero weights
+// are the only values that make "this sub-layer contributes nothing" true by
+// construction rather than by luck.
+
+struct MtpHfSpec2 {
+    int n_embd = 32, lanes = 4, rank = 8, n_expert = 4, n_ff_exp = 64,
+        n_ff_shexp = 32, idx_h = 2, idx_dim = 4;
+    int q_dim = 32, kv_dim = 16, hd = 8;
+    // Control A: a pattern in every lane's gamma. The head mixer RMS-normalises
+    // each lane first, so a uniform per-lane scale cancels and would prove
+    // nothing -- the pattern changes each lane's DIRECTION, which the mixer can
+    // see.
+    bool gamma_pattern = false;
+    // Control B: real (small, deterministic) attention weights instead of
+    // zeros. The block then contributes an actual attention output, which is
+    // the only arm that exercises q/k/v, the rope, the block's own KV and the
+    // output projection as live code.
+    bool live_attn = false;
+    f32 attn_amp = 0.5f;
+    // Control C: a live router and a live routed bank. This is the only arm
+    // that runs the fused `gate_up_proj` end to end -- through the two plane
+    // views, ExpertCache and the scatter -- with values that reach the row.
+    bool live_moe = false;
+};
+
+static std::string build_mtp_hf_passthrough(const std::string &tag,
+                                            const MtpHfSpec2 &s) {
+    const std::string path = std::string("kraken-mtp-hf-") + tag + ".gguf";
+    const int ne = s.n_embd, wide = ne * s.lanes;
+    GgufBuilder b;
+    b.meta_str("general.architecture", "qwen4exp-mtp");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("qwen4exp-mtp.block_count", 1);
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    auto zeros = [](size_t n) { return std::vector<f32>(n, 0.0f); };
+
+    b.tensor_f32("mtp.pre_fc_norm_embedding.weight", {u64(ne)}, ones(ne));
+    {
+        std::vector<f32> hn = ones(static_cast<size_t>(wide));
+        // The control: a PATTERN in one lane's gamma. A uniform per-lane scale
+        // would be invisible here -- the head mixer RMS-normalises each lane
+        // before mixing, so `gamma = 1.5` on a whole lane cancels exactly and
+        // the control would prove nothing. Alternating 1.0 / 2.0 changes the
+        // lane's DIRECTION, which is what the mixer can see.
+        if (s.gamma_pattern)
+            for (size_t i = 0; i < hn.size(); i++)
+                hn[i] = (i % 2) ? 2.0f : 0.5f;
+        b.tensor_f32("mtp.pre_fc_norm_hidden.weight", {u64(wide)}, hn);
+    }
+    // eh_proj: the identity on the HIDDEN half. Row o reads column n+o, so the
+    // block input is exactly `h_lane = rms(R_lane) * hnorm`. The embedding half
+    // is zero, which is what makes this test indifferent to the pairing
+    // convention (which token's embedding is fused in) -- that question is a
+    // separate one and this gate must not silently answer it.
+    {
+        std::vector<f32> w(static_cast<size_t>(ne) * 2 * ne, 0.0f);
+        for (int o = 0; o < ne; o++)
+            w[static_cast<size_t>(o) * 2 * ne + ne + o] = 1.0f;
+        b.tensor_f16("mtp.eh_proj.weight", {u64(2 * ne), u64(ne)}, w);
+    }
+    // Three mixers, all with a zero bottleneck: silu(0) = 0, so every lane's
+    // gate is 0, sigmoid(0) = 0.5, and the sub-block is handed half the mean of
+    // the lanes. The attention and the FFN are zero, so that value never
+    // reaches the residual -- which is what makes the block a pass-through --
+    // while the code path itself is fully exercised.
+    const char *mix[3] = {"mtp.layers.0.hyper_connection_mixer.input",
+                          "mtp.layers.0.hyper_connection_mixer.output",
+                          "mtp.final"};
+    for (int i = 0; i < 3; i++) {
+        const std::string pre = mix[i];
+        b.tensor_f32(pre + "_mix_norm_weight", {u64(wide)}, ones(wide));
+        b.tensor_f16(pre + "_mix_weight_down.weight", {u64(wide), u64(s.rank)},
+                     zeros(static_cast<size_t>(wide) * s.rank));
+        b.tensor_f16(pre + "_mix_weight_up.weight", {u64(s.rank), u64(wide)},
+                     zeros(static_cast<size_t>(s.rank) * wide));
+        if (i < 2)
+            b.tensor_f32(pre + "_mix_inject_weight", {u64(wide), u64(s.lanes)},
+                         zeros(static_cast<size_t>(wide) * s.lanes));
+    }
+    const std::string L = "mtp.layers.0.";
+    // Deterministic small weights for the live-attention arm; all zero for the
+    // pass-through arms.
+    auto attn_w = [&](size_t n) {
+        if (!s.live_attn) return zeros(n);
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = s.attn_amp * static_cast<f32>((static_cast<int>(i % 9)) - 4);
+        return v;
+    };
+    b.tensor_f16(L + "self_attn.q_proj.weight", {u64(ne), u64(s.q_dim)},
+                 attn_w(static_cast<size_t>(ne) * s.q_dim));
+    b.tensor_f16(L + "self_attn.k_proj.weight", {u64(ne), u64(s.kv_dim)},
+                 attn_w(static_cast<size_t>(ne) * s.kv_dim));
+    b.tensor_f16(L + "self_attn.v_proj.weight", {u64(ne), u64(s.kv_dim)},
+                 attn_w(static_cast<size_t>(ne) * s.kv_dim));
+    b.tensor_f16(L + "self_attn.o_proj.weight", {u64(s.q_dim), u64(ne)},
+                 attn_w(static_cast<size_t>(s.q_dim) * ne));
+    b.tensor_f32(L + "self_attn.q_norm.weight", {u64(s.hd)}, ones(s.hd));
+    b.tensor_f32(L + "self_attn.k_norm.weight", {u64(s.hd)}, ones(s.hd));
+    b.tensor_f16(L + "self_attn.indexer.q_proj.weight",
+                 {u64(ne), u64(s.idx_h * s.idx_dim)},
+                 zeros(static_cast<size_t>(ne) * s.idx_h * s.idx_dim));
+    b.tensor_f16(L + "self_attn.indexer.k_proj.weight",
+                 {u64(ne), u64(s.idx_dim)},
+                 zeros(static_cast<size_t>(ne) * s.idx_dim));
+    b.tensor_f32(L + "self_attn.indexer.q_norm.weight", {u64(s.idx_dim)},
+                 ones(s.idx_dim));
+    b.tensor_f32(L + "self_attn.indexer.k_norm.weight", {u64(s.idx_dim)},
+                 ones(s.idx_dim));
+    auto moe_w = [&](size_t n, int seed) {
+        if (!s.live_moe) return zeros(n);
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = 0.05f * static_cast<f32>((static_cast<int>((i + seed) % 11)) - 5);
+        return v;
+    };
+    b.tensor_f16(L + "mlp.gate.weight", {u64(ne), u64(s.n_expert)},
+                 moe_w(static_cast<size_t>(ne) * s.n_expert, 1));
+    b.tensor_f16(L + "mlp.experts.gate_up_proj",
+                 {u64(ne), u64(2 * s.n_ff_exp), u64(s.n_expert)},
+                 moe_w(static_cast<size_t>(ne) * 2 * s.n_ff_exp * s.n_expert, 2));
+    b.tensor_f16(L + "mlp.experts.down_proj",
+                 {u64(s.n_ff_exp), u64(ne), u64(s.n_expert)},
+                 moe_w(static_cast<size_t>(s.n_ff_exp) * ne * s.n_expert, 3));
+    b.tensor_f32(L + "mlp.shared_expert_gate.weight", {u64(ne)},
+                 moe_w(ne, 4));
+    b.tensor_f16(L + "mlp.shared_expert.gate_proj.weight",
+                 {u64(ne), u64(s.n_ff_shexp)},
+                 moe_w(static_cast<size_t>(ne) * s.n_ff_shexp, 5));
+    b.tensor_f16(L + "mlp.shared_expert.up_proj.weight",
+                 {u64(ne), u64(s.n_ff_shexp)},
+                 moe_w(static_cast<size_t>(ne) * s.n_ff_shexp, 6));
+    b.tensor_f16(L + "mlp.shared_expert.down_proj.weight",
+                 {u64(s.n_ff_shexp), u64(ne)},
+                 moe_w(static_cast<size_t>(s.n_ff_shexp) * ne, 7));
+    if (!b.write(path)) return std::string();
+    return path;
+}
+
+// One prefill through a qwen4exp trunk with the head attached, returning the
+// probe. `prompt` is long enough for the lane stack to be worth reading.
+static bool run_hf_probe(const std::string &trunk, const std::string &head,
+                         Engine::MtpProbe *out, std::string *err_out) {
+    Backend *cpu = make_cpu_backend();
+    bool ok = false;
+    {
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = trunk;
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        cfg.mtp_probe = true;
+        cfg.mtp_path = head;
+        std::string err;
+        if (!engine.init(cpu, cfg, &err)) {
+            if (err_out) *err_out = err;
+            if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+        } else {
+            GenerateParams p;
+            p.prompt = "aaaa bbbb cccc dddd eeee";
+            p.max_tokens = 1;
+            p.sampler.greedy = true;
+            GenerateResult r;
+            ok = engine.generate(p, &r) && r.finish != FinishError;
+            *out = engine.last_mtp_probe();
+            if (!out->ok && err_out && err_out->empty()) *err_out = out->note;
+        }
+    }
+    delete cpu;
+    return ok;
+}
+
+static void test_mtp_hf_block_qwen4() {
+    const std::string trunk = "kraken-mtp-hf-block.gguf";
+    CHECK(build_tiny_q4_model(trunk, 0, 0, 0, true, false, true),
+          "wrote a four-lane qwen4exp trunk");
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+    MtpHfSpec2 s;
+    const std::string head = build_mtp_hf_passthrough("pass", s);
+    CHECK(!head.empty(), "wrote a pass-through head");
+
+    // 1. The block runs and reproduces the trunk's own next token. This is the
+    //    gate: a pass-through head must AGREE with the target on every cell,
+    //    and any lane, scale, order or position error breaks the agreement.
+    Engine::MtpProbe mp;
+    std::string err;
+    CHECK(run_hf_probe(trunk, head, &mp, &err), "the trunk runs with the head attached");
+    if (!err.empty()) std::fprintf(stderr, "  (probe: %s)\n", err.c_str());
+    CHECK(mp.ok, "the block's forward ran on the prompt");
+    CHECK(mp.draft_id == mp.target_id,
+          "a pass-through head drafts the trunk's own token");
+    CHECK(mp.target_rank == 1, "and it puts that token first in its own logits");
+    if (mp.ok) {
+        // The size of the two logit gaps, recorded so a later regression is a
+        // number rather than "it used to match".
+        std::fprintf(stderr,
+                     "[mtp6 ] pass-through: draft %d (%.4f) vs target %d (%.4f), "
+                     "delta %.6f\n",
+                     mp.draft_id, static_cast<f64>(mp.draft_logit), mp.target_id,
+                     static_cast<f64>(mp.target_logit),
+                     static_cast<f64>(mp.draft_logit - mp.target_logit));
+    }
+
+    // 2. The negative control: one lane's gamma is 1.5 instead of 1.0, so the
+    //    head mixer is handed four lanes the trunk never produced. The block
+    //    must now DISAGREE (or at least land measurably off), which is what
+    //    says the equality above is caused by the block being wired right and
+    //    not by the comparison being vacuous.
+    MtpHfSpec2 bad = s;
+    bad.gamma_pattern = true;
+    const std::string head_bad = build_mtp_hf_passthrough("passbad", bad);
+    Engine::MtpProbe mp2;
+    std::string err2;
+    CHECK(run_hf_probe(trunk, head_bad, &mp2, &err2),
+          "the perturbed head runs too");
+    CHECK(mp2.ok, "the perturbed block's forward ran");
+    // A pattern in one lane's gamma changes that lane's direction, so the
+    // block's row must move. The margin is bigger than the pass-through arm's
+    // own approximation error (the double RMS, ~4e-2 on this fixture's
+    // activation scale), which is what says the equality above is caused by the
+    // wiring and not by the comparison being insensitive.
+    const f32 moved = std::fabs(mp2.draft_logit - mp.draft_logit);
+    std::fprintf(stderr,
+                 "[mtp6 ] control: patterned gamma in every lane moves the draft "
+                 "logit %.6f -> %.6f (|d| = %.6f), target rank %d, %s\n",
+                 static_cast<f64>(mp.draft_logit), static_cast<f64>(mp2.draft_logit),
+                 static_cast<f64>(moved), mp2.target_rank,
+                 mp2.target_rank == 1 ? "still first" : "pushed off first");
+    CHECK(moved > 0.05f, "a patterned gamma in every lane moves the block's row");
+
+    // 3. Control B: real attention weights. This is the arm that says the
+    //    block's attention is LIVE -- q/k/v, the rope, its own KV plane and the
+    //    output projection -- because a zero-weight attention cannot move the
+    //    row whatever else is wrong with it.
+    MtpHfSpec2 live = s;
+    live.live_attn = true;
+    const std::string head_live = build_mtp_hf_passthrough("passlive", live);
+    Engine::MtpProbe mp3;
+    std::string err3;
+    CHECK(run_hf_probe(trunk, head_live, &mp3, &err3),
+          "the live-attention head runs");
+    CHECK(mp3.ok, "the live-attention block's forward ran");
+    const f32 moved_live = std::fabs(mp3.draft_logit - mp.draft_logit);
+    std::fprintf(stderr,
+                 "[mtp6 ] control: live attention moves the draft logit "
+                 "%.6f -> %.6f (|d| = %.6f), target rank %d\n",
+                 static_cast<f64>(mp.draft_logit), static_cast<f64>(mp3.draft_logit),
+                 static_cast<f64>(moved_live), mp3.target_rank);
+    CHECK(moved_live > moved, "live attention moves the row more than a gamma pattern");
+    CHECK(mp3.target_rank != 1 || moved_live > 0.05f,
+          "a block that attends no longer reproduces the trunk's distribution");
+
+    // 4. Control C: a live routed bank. This is the arm that runs the fused
+    //    `gate_up_proj` through its two plane views and the expert cache with
+    //    values that reach the row; getting the plane stride wrong here reads
+    //    the gate's rows where the up's belong and the row moves differently.
+    MtpHfSpec2 moe = s;
+    moe.live_moe = true;
+    const std::string head_moe = build_mtp_hf_passthrough("passmoe", moe);
+    Engine::MtpProbe mp4;
+    std::string err4;
+    CHECK(!head_moe.empty(), "wrote a live-MoE head");
+    CHECK(run_hf_probe(trunk, head_moe, &mp4, &err4), "the live-MoE head runs");
+    if (!err4.empty()) std::fprintf(stderr, "  (live-moe: %s)\n", err4.c_str());
+    CHECK(mp4.ok, "the live-MoE block's forward ran");
+    const f32 moved_moe = std::fabs(mp4.draft_logit - mp.draft_logit);
+    std::fprintf(stderr,
+                 "[mtp6 ] control: live routed bank moves the draft logit "
+                 "%.6f -> %.6f (|d| = %.6f), target rank %d\n",
+                 static_cast<f64>(mp.draft_logit), static_cast<f64>(mp4.draft_logit),
+                 static_cast<f64>(moved_moe), mp4.target_rank);
+    CHECK(moved_moe > 0.05f, "a live routed bank moves the block's row");
+    std::remove(head_moe.c_str());
+    std::remove(trunk.c_str());
+    std::remove(head.c_str());
+    std::remove(head_bad.c_str());
+    std::remove(head_live.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
 static void test_qwen4exp_qsa() {
     const std::string path = "kraken-q4qsa.gguf";
     CHECK(build_tiny_q4_model(path, 0, 0, 0, true, false, true),
@@ -29661,6 +29969,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_mtp_sidecar)
     TEST_GROUP(test_mtp_head_qwen4)
     TEST_GROUP(test_mtp_head_prefix)
+    TEST_GROUP(test_mtp_hf_block_qwen4)
     TEST_GROUP(test_expert_warmup)
     TEST_GROUP(test_expert_index_adapt)
     TEST_GROUP(test_hc_lanes)

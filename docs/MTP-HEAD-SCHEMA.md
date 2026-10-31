@@ -85,11 +85,11 @@ back with a per-lane weight `2*sigmoid(inject/hc)` (see `src/hc.cpp`,
 | 4 | `%shyper_connection_mixer.input_mix_norm_weight` | `[10240]` | F32 | `MtpBlock::hc_attn.norm` |
 | 5 | `%shyper_connection_mixer.input_mix_weight_down.weight` | `[10240, 320]` | BF16 | `MtpBlock::hc_attn.down` |
 | 6 | `%shyper_connection_mixer.input_mix_weight_up.weight` | `[320, 10240]` | BF16 | `MtpBlock::hc_attn.up` |
-| 7 | `%shyper_connection_mixer.input_mix_inject_weight` | `[4]` | BF16 | `MtpBlock::hc_attn.inject` |
+| 7 | `%shyper_connection_mixer.input_mix_inject_weight` | `[10240, 4]` | BF16 | `MtpBlock::hc_attn.inject` |
 | 8 | `%shyper_connection_mixer.output_mix_norm_weight` | `[10240]` | F32 | `MtpBlock::hc_ffn.norm` |
 | 9 | `%shyper_connection_mixer.output_mix_weight_down.weight` | `[10240, 320]` | BF16 | `MtpBlock::hc_ffn.down` |
 | 10 | `%shyper_connection_mixer.output_mix_weight_up.weight` | `[320, 10240]` | BF16 | `MtpBlock::hc_ffn.up` |
-| 11 | `%shyper_connection_mixer.output_mix_inject_weight` | `[4]` | BF16 | `MtpBlock::hc_ffn.inject` |
+| 11 | `%shyper_connection_mixer.output_mix_inject_weight` | `[10240, 4]` | BF16 | `MtpBlock::hc_ffn.inject` |
 | 12 | `mtp.final_mix_norm_weight` | `[10240]` | F32 | `MtpBlock::hc_head.norm` |
 | 13 | `mtp.final_mix_weight_down.weight` | `[10240, 320]` | BF16 | `MtpBlock::hc_head.down` |
 | 14 | `mtp.final_mix_weight_up.weight` | `[320, 10240]` | BF16 | `MtpBlock::hc_head.up` |
@@ -97,6 +97,15 @@ back with a per-lane weight `2*sigmoid(inject/hc)` (see `src/hc.cpp`,
 The head mixer has no inject: it is followed by the LM head, not by another
 residual. The loader checks all three mixers are the same rank — one block, one
 bottleneck.
+
+**The inject is a projection, not a 4-long vector.** It maps the normalized
+10240-wide lane stack onto one weight per lane (`[hc_dim, hc]`), which is what
+`Engine::hc_enter` consumes: `gemm_w(ws_hc_inj_, ws_hc_n_, inject, hc, wide, n)`.
+The first version of this loader validated it as four numbers, and the mixer then
+read 128 rows out of a 4-element tensor — garbage lanes rather than an error,
+found by the block's own negative control (`test_mtp_hf_block_qwen4`, which
+produced NaN until the shape was fixed). An export that stores the transpose
+(`[hc, hc_dim]`) is the same matrix and is re-oriented at load.
 
 ### Attention (6 tensors)
 
@@ -179,9 +188,15 @@ not caught, so each is a named refusal:
 
 ## Status
 
-Steps 1.1–1.4 are done: this table, the extended `MtpBlock`, the loader in
-`src/mtp_head.cpp`, and the fused-bank views. `--mtp <head.gguf>` on a matching
-trunk now loads, validates and reports the head. What is **not** done is the
-forward (1.5 the host prefix, 1.6 the block on device, 1.7 the proposer), so the
-head cannot yet propose a token, and the arch row is `Partial` for exactly that
-reason.
+Steps 1.1–1.6 are done: this table, the extended `MtpBlock`, the loader in
+`src/mtp_head.cpp`, the fused-bank views, the host prefix
+(`mtp_dense_prefix`), and the block itself on the device
+(`Engine::mtp_hf_block_forward` — hyper-connection around attention and around
+the MoE, its own KV, the trunk's head).
+
+What is **not** done is 1.7, the chained proposal: a hyper-connection head
+carries the whole 4-lane stack into its next draft, and the proposer still
+carries one 2560-wide row (`mtp_h_`), so `--mtp-spec` turns itself off with a
+warning when this head is loaded and `--mtp-probe` keeps working. The arch row is
+`Partial` for exactly that reason: it runs and predicts, it cannot yet draft a
+chain, and it has not been measured against a real artifact.

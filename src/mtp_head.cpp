@@ -363,7 +363,12 @@ bool Model::load_mtp_hf_block(Gguf &g, const std::string &origin,
     }
     m.eh_proj_split = split;
 
-    // The mixers: down is [hc_dim, rank], up [rank, hc_dim], inject [n_lane].
+    // The mixers: down is [hc_dim, rank], up [rank, hc_dim], and the inject is a
+    // wide -> hc projection over the normalized lane stack, [hc_dim, hc]. It is
+    // NOT a per-lane scalar vector: the lane count is the projection's OUTPUT,
+    // and reading it as a 4-long vector makes the mixer read 128 rows out of a
+    // 4-element tensor (garbage lanes rather than an error, which is how this
+    // was found).
     const auto mixer_geom = [&](const char *down, const char *up,
                                 const char *inject) -> i32 {
         const GgufTensor *d = get(down);
@@ -376,7 +381,8 @@ bool Model::load_mtp_hf_block(Gguf &g, const std::string &origin,
             return -2;
         if (inject) {
             const GgufTensor *j = get(inject);
-            if (j && j->n_elements != static_cast<i64>(m.n_lane)) return -3;
+            if (j && static_cast<i64>(j->n_elements) != hc_dim * m.n_lane)
+                return -3;
         }
         return static_cast<i32>(rank);
     };
@@ -389,8 +395,9 @@ bool Model::load_mtp_hf_block(Gguf &g, const std::string &origin,
         if (r == -2)
             return fail(std::string("the ") + what + " mixer's up projection "
                         "does not mirror its down projection");
-        return fail(std::string("the ") + what + " mixer's inject row is not " +
-                    std::to_string(m.n_lane) + " long -- one weight per lane");
+        return fail(std::string("the ") + what + " mixer's inject is not [" +
+                    std::to_string(hc_dim) + ", " + std::to_string(m.n_lane) +
+                    "] -- it projects the lane stack onto one weight per lane");
     };
     if (rank < 0) return why_mixer(rank, "attention");
     const i32 rank_ffn = mixer_geom("hc_ffn_down", "hc_ffn_up", "hc_ffn_inject");
@@ -513,11 +520,40 @@ bool Model::load_mtp_hf_block(Gguf &g, const std::string &origin,
     if (ok && n_index == 4)
         ok = upload_q(get("index_q"), &m.index_q) &&
              upload_q(get("index_k"), &m.index_k);
+    // The inject is `[hc_dim, hc]`: its rows are the lanes, its columns the lane
+    // stack this mixer consumes. An export that stores the transpose is the
+    // same matrix, so it is re-oriented here (4 x 10240 f32 = 160 KB) instead
+    // of being refused -- the two spellings in the wild disagree about which
+    // axis is contiguous, and neither is wrong.
+    const auto upload_inject = [&](const GgufTensor *t, QuantTensor *out) {
+        if (!t) return true;
+        const i64 wid = hc_dim, lan = m.n_lane;
+        if (static_cast<i64>(t->ne[0]) == wid && static_cast<i64>(t->ne[1]) == lan)
+            return upload_q(t, out);
+        if (static_cast<i64>(t->ne[0]) != lan || static_cast<i64>(t->ne[1]) != wid)
+            return false;
+        std::vector<f32> src(static_cast<size_t>(t->n_elements), 0.0f);
+        dequant_row(t->type, t->data, src.data(), t->n_elements);
+        std::vector<f32> dst(src.size(), 0.0f);
+        for (i64 r = 0; r < lan; r++)
+            for (i64 c = 0; c < wid; c++)
+                dst[static_cast<size_t>(r * wid + c)] =
+                    src[static_cast<size_t>(c * lan + r)];
+        out->data = be_->alloc(dst.size() * sizeof(f32));
+        if (!out->data) return false;
+        be_->upload(out->data, dst.data(), dst.size() * sizeof(f32));
+        out->type = DType::F32;
+        out->n_in = wid;
+        out->n_out = lan;
+        out->gs = 1.0f;
+        m.bytes += dst.size() * sizeof(f32);
+        return true;
+    };
     const auto load_mixer = [&](const char *dn_, const char *up,
                                 const char *inj, MtpBlock::HcMixer *dst) {
         if (!ok) return;
         ok = upload_q(get(dn_), &dst->down) && upload_q(get(up), &dst->up);
-        if (ok && inj && get(inj)) ok = upload_q(get(inj), &dst->inject);
+        if (ok && inj) ok = upload_inject(get(inj), &dst->inject);
     };
     load_mixer("hc_attn_down", "hc_attn_up", "hc_attn_inject", &m.hc_attn);
     load_mixer("hc_ffn_down", "hc_ffn_up", "hc_ffn_inject", &m.hc_ffn);
@@ -550,11 +586,11 @@ bool Model::load_mtp_hf_block(Gguf &g, const std::string &origin,
                                         : 0;
     m.present = true;
 
-    KRK_INFO("MTP head %s: %d lane(s) x %d, %d experts top-%d, %d-wide FFN, "
-             "%d-wide indexer, prefix %s, fwd=not implemented (plan 1.5-1.7), "
-             "%.1f MiB resident, %lld MiB of experts left in the file",
-             origin.c_str(), m.n_lane, m.n_embd, m.n_expert, m.n_expert_used,
-             m.n_ff_exp, m.index_dim,
+    KRK_INFO("MTP head %s: %d lane(s) x %d through %d, %d experts top-%d, "
+             "%d-wide FFN, %d-wide indexer, prefix %s, %.1f MiB resident, "
+             "%lld MiB of experts left in the file",
+             origin.c_str(), m.n_lane, m.n_embd, m.n_hc_rank, m.n_expert,
+             m.n_expert_used, m.n_ff_exp, m.index_dim,
              split ? "fc_embedding+fc_hidden" : "fused eh_proj",
              static_cast<f64>(m.bytes) / 1048576.0,
              static_cast<long long>(gu->n_bytes) / 1048576LL);

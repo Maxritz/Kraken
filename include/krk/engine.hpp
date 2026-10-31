@@ -475,6 +475,9 @@ public:
         std::string note; // why it did not run, when ok is false
     };
     MtpProbe mtp_probe_step();
+    // The last probe the generation loop ran, kept so a caller (a test, or an
+    // embedding of the engine) can read the answer instead of parsing the log.
+    const MtpProbe &last_mtp_probe() const { return mtp_last_probe_; }
     bool mtp_probe_enabled() const { return mtp_probe_; }
     bool mtp_spec_active() const { return mtp_spec_; }
     // Admits the nextn block's routed set to VRAM once and pins it. Called from
@@ -1042,6 +1045,14 @@ private:
     // routed + shared experts run through the model's ExpertCache. With
     // want_logits the shared head writes ws_logits_ for position pos + 1.
     bool mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits);
+    // The block's attention, shared by both head shapes. Split out so the two
+    // forms cannot drift: q/k/v, the packed query gate, the per-head QK norm,
+    // the rotary and the KV append are one body, and only the thing that
+    // produced its input row differs (`norm_first`).
+    bool mtp_attn_body(const MtpBlock &m, i32 pos, bool norm_first, i32 window);
+    // The qwen4exp form: hyper-connection lanes around attention and around the
+    // MoE, with the trunk's own head at the end.
+    bool mtp_hf_block_forward(const MtpBlock &m, i32 pos, bool want_logits);
     // The block's routed + shared expert FFN. Same residency path as a stack
     // layer, keyed on the block's own index, so its experts page in and out of
     // the same budget as everything else.
@@ -1133,6 +1144,7 @@ private:
     // which only says the buffers exist: a speculation run allocates the same
     // buffers and must not print probe lines.
     bool mtp_probe_report_ = false;
+    MtpProbe mtp_last_probe_;    // set by the generation loop's probe
     // A hybrid model's delta-rule state has no inverse, so a rejected
     // speculative suffix cannot be rewound through kv_rollback. These hold the
     // pre-verification state (f32, the same size the engine allocated) and the
@@ -1145,6 +1157,10 @@ private:
     void *mtp_kv_k_ = nullptr;
     void *mtp_kv_v_ = nullptr;
     void *mtp_hidden_ = nullptr; // [kv_cap, n_embd] pre-final-norm rows
+    // [kv_cap, hc*n_embd]: the trunk's LANE STACK per position, which is what a
+    // hyper-connection head's prefix actually reads. Zero unless the loaded
+    // head is the HF form on a trunk that has the lanes.
+    void *mtp_lanes_ = nullptr;
     void *mtp_h_ = nullptr;      // one hidden row, the block's hnorm input
     void *mtp_e_ = nullptr;      // one embedding row, the block's enorm input
     void *mtp_cat_ = nullptr;    // [2, n_embd] the eh_proj input

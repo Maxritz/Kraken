@@ -109,9 +109,9 @@ code); new group `test_mtp_head_qwen4`; baseline re-recorded.
 | 1.3 | **done** | `Model::load_mtp_hf_block` (src/mtp_head.cpp) + `test_mtp_head_qwen4`: a synthetic 31-tensor file loads, and the wrong-width bank / half-written prefix / mismatched `down_proj` are refused by tensor name |
 | 1.4 | **done** | `Gguf::add_expert_plane_slice` + `GgufTensor::plane_stride`/`plane()`; the expert path reads through `plane()` in all five places it used to compute `data + expert * per`. `test_mtp_head_qwen4` compares **every** expert's gate and up view against the source rows with `memcmp`, not a sample |
 | 1.5 | **done** | `include/krk/mtp_forward.hpp` + `src/mtp_head.cpp` (`mtp_host_prefix_load`, `mtp_dense_prefix`), group `test_mtp_head_prefix`: 18/18 |
-| 1.6 | open | |
-| 1.7 | open | |
-| 1.8 | partly | the arch row is `Partial` (loads and validates, cannot propose); `test_mtp_head_qwen4` exists; the baseline is not re-recorded until the forward lands |
+| 1.6 | **done** | `Engine::mtp_hf_block_forward` + `mtp_attn_body` (the attention body factored out of the llama-style block so the two shapes cannot drift); group `test_mtp_hf_block_qwen4`: 17/17 |
+| 1.7 | open | `--mtp-spec` turns itself off for this head with a warning: the chain carries a lane stack the proposer does not carry yet |
+| 1.8 | partly | the arch row is `Partial` (runs and predicts, cannot chain, unmeasured on a real artifact); `test_mtp_head_qwen4` and `test_mtp_hf_block_qwen4` exist; the baseline is not re-recorded until the proposer lands |
 
 **1.5's gate in this file was wrong, and is corrected here.** It read "scaling
 `R` by 0.5/2 scales `h` linearly". It cannot: the prefix RMS-normalises `h`
@@ -138,9 +138,49 @@ Two deviations, both deliberate:
   (bool) plus the two `fc_*` tensors says the same thing without a third name
   for a state that cannot occur.
 
-What the port still cannot do: the block has no forward. `--mtp` on a real head
-now loads, validates and reports it (`MTP head ...: 4 lane(s) x 2560, 512
-experts ... fwd=not implemented`), and then nothing drafts. That is 1.5-1.7.
+**1.6's gate, and what replaced it.** The plan asked for `--mtp-probe` on a real
+artifact with an argmax agreement of ≥ 60 %. There is no artifact here, so the
+gate is a synthetic head built to make the answer EXACT: attention output zero,
+MoE zero, prefix the identity on the hidden half. The block is then a
+pass-through — its lane stack after the block is the trunk's own — so its argmax
+must be the trunk's argmax on every probed cell, not 60 % of them.
+`test_mtp_hf_block_qwen4` measures exactly that (`MATCH`, target rank 1) and then
+demands that it can fail:
+
+| arm | draft logit | target's rank in the block's logits |
+|---|---|---|
+| pass-through | 0.6485 | **1 (matches the trunk's token)** |
+| patterned gamma in every lane | 0.5446 | 1 |
+| live attention weights | 0.2630 | **49** |
+| live routed bank | 0.5498 | **25** |
+
+The second arm is deliberately a *pattern*, not a per-lane scale: the head mixer
+RMS-normalises each lane first, so `gamma = 1.5` on a whole lane cancels exactly
+and the control would prove nothing. Both live arms move the row far enough to
+push the trunk's token off first place, which is what says the equality in the
+first row is caused by the wiring and not by the comparison being insensitive.
+
+The pass-through is not exact to the last bit: the prefix's per-lane RMS and the
+mixer's per-lane RMS compose, and `rms(rms(x)) = x / sqrt(r²(1+ε) + ε²)` differs
+from `x / sqrt(r² + ε)` by about `ε(1/r² − 1)/2`. On a real checkpoint, where the
+lanes have unit RMS, that is ε-level; on this fixture's small activations it is
+the 0.042 logit difference in the first row. It is recorded here because it is
+the one place a future reader will look for an exact equality and find 7 %.
+
+**1.6(b) is the reference's own fallback, not a shortcut.** The block runs dense
+attention over its own KV, and the four indexer tensors are loaded, geometry-
+checked and *not* used for selection. That is what llama.cpp's qwen4exp MTP graph
+does: it builds the indexed attention only when `layer.index_k_proj &&
+hparams.dsv4_compress_ratios[il] > 0`, i.e. when the enclosing model declares a
+block budget for that layer. A standalone 31-tensor head declares nothing of the
+sort (`tools/mtp_extract.py` writes no ratio key), so dense is the correct
+behaviour for the artifact — and inventing a budget would be a guess that costs
+acceptance rather than a feature.
+
+What the port still cannot do: chain a second proposal. The reference feeds the
+whole `hc*n_embd` lane stack into the next draft step; the proposer carries one
+`n_embd` row, so `--mtp-spec` turns itself off with a warning and `--mtp-probe`
+keeps working. That is 1.7.
 
 ---
 

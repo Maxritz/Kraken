@@ -1038,10 +1038,11 @@ constexpr ArchSpec kTable[] = {
      "qwen4exp",
      "an MTP head set for a qwen4exp target: one block with gated attention, a "
      "QSA indexer, hyper-connections and a 512-expert MoE. It loads, its "
-     "shapes are checked against the trunk and its fused expert bank is split "
-     "into gate/up views with no copy, but the block's forward is not "
-     "implemented yet, so it cannot propose a token "
-     "(docs/PLAN-mtp-and-prefill.md 1.5-1.7)",
+     "shapes are checked against the trunk, its fused expert bank is split "
+     "into gate/up views with no copy, and the block runs (--mtp-probe "
+     "predicts). It cannot yet chain a proposal -- that carries a lane stack "
+     "the proposer does not carry (plan 1.7) -- and it has not been measured "
+     "against a real artifact",
      true, true, false, false},
 
     // A head set is not a model: no token embedding, no output head, nothing to
