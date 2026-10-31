@@ -2107,6 +2107,15 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             why = "the block has neither routed experts nor a dense FFN";
         else if (m.n_ff_exp > ff_ws || m.n_ff_shexp > ff_ws || m.n_ff > ff_ws)
             why = "the block's FFN is wider than the FFN workspaces";
+        // A hyper-connection head runs on the trunk's own lane stack and
+        // mixers. Without the stack it has no input, and with a different rank
+        // it would read a workspace sized for another bottleneck.
+        else if (m.hf && !hc_active_)
+            why = "the head is a hyper-connection block and this trunk has no "
+                  "lane stack (its lanes are the trunk's residual lanes)";
+        else if (m.hf && (m.n_lane != hc_.hc || m.n_hc_rank != hc_.low_rank))
+            why = "the head's mixers do not match the trunk's hyper-connection "
+                  "geometry";
         if (why) {
             KRK_WARN("mtp probe: off -- %s", why);
         } else {
@@ -2114,6 +2123,17 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             mtp_kv_k_ = alloc(static_cast<size_t>(kv_cap_ * mtp_kv_dim_) * as);
             mtp_kv_v_ = alloc(static_cast<size_t>(kv_cap_ * mtp_kv_dim_) * as);
             mtp_hidden_ = alloc(static_cast<size_t>(kv_cap_ * n_embd_) * as);
+            // A hyper-connection head reads the LANE STACK, not the mixed row:
+            // the mixed row is already the collapse, and the block's prefix is
+            // defined on all hc lanes. Sized from the head's own lane count so
+            // a head that disagrees is refused rather than over-reading.
+            if (m.hf && m.n_lane > 0) {
+                mtp_lanes_ = alloc(static_cast<size_t>(kv_cap_) *
+                                   static_cast<size_t>(m.n_lane) *
+                                   static_cast<size_t>(n_embd_) * as);
+                mtp_chain_ = alloc(static_cast<size_t>(m.n_lane) *
+                                   static_cast<size_t>(n_embd_) * as);
+            }
             mtp_h_ = alloc(static_cast<size_t>(n_embd_) * as);
             mtp_e_ = alloc(static_cast<size_t>(n_embd_) * as);
             mtp_cat_ = alloc(static_cast<size_t>(2 * n_embd_) * as);
@@ -2121,10 +2141,11 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             mtp_sgate_ = alloc(as);
             mtp_rep_ = alloc(sizeof(i32));
             if (!mtp_kv_k_ || !mtp_kv_v_ || !mtp_hidden_ || !mtp_h_ || !mtp_e_ ||
-                !mtp_cat_ || !mtp_gate_ || !mtp_sgate_ || !mtp_rep_) {
+                !mtp_cat_ || !mtp_gate_ || !mtp_sgate_ || !mtp_rep_ ||
+                (m.hf && (!mtp_lanes_ || !mtp_chain_))) {
                 for (void **p : {&mtp_kv_k_, &mtp_kv_v_, &mtp_hidden_, &mtp_h_,
                                  &mtp_e_, &mtp_cat_, &mtp_gate_, &mtp_sgate_,
-                                 &mtp_rep_})
+                                 &mtp_rep_, &mtp_lanes_, &mtp_chain_})
                     if (*p) {
                         be_->release(*p);
                         *p = nullptr;
@@ -4953,6 +4974,17 @@ void Engine::mtp_capture(const i32 *toks, i32 pos0, i32 n) {
     const size_t as = be_->act_size();
     be_->copy_act(act_at(mtp_hidden_, as, static_cast<i64>(pos0) * n_embd_),
                   ws_x_, static_cast<i64>(n) * n_embd_);
+    // The hyper-connection form needs the LANE STACK, and it has to be captured
+    // here: by the time the probe runs, the head has already mixed the lanes
+    // down to the row that goes into the vocabulary projection. A block whose
+    // prefix expects four lanes and is handed the collapse predicts from a
+    // state the model never had -- fluent, and rejected every time.
+    if (mtp_lanes_ && hc_active_)
+        be_->copy_act(act_at(mtp_lanes_, as,
+                             static_cast<i64>(pos0) *
+                                 static_cast<i64>(hc_.hc) * n_embd_),
+                      ws_hc_, static_cast<i64>(n) * static_cast<i64>(hc_.hc) *
+                                  n_embd_);
     for (i32 i = 0; i < n; i++)
         mtp_tok_[static_cast<size_t>(pos0 + i)] = toks[i];
     mtp_captured_ = end;
@@ -5350,40 +5382,30 @@ bool Engine::mtp_ffn(const MtpBlock &m, i32 n) {
     return true;
 }
 
-bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
+// The block's attention, shared by both head shapes. `norm_first` is the whole
+// difference: the llama-style block norms its residual row first and then runs
+// `attn_norm`, while the hyper-connection form has already handed its sub-block
+// the mixed row (its norm lives inside the mixer's per-lane gamma), so it must
+// NOT be normed again -- a second norm there reads as a slightly worse drafter
+// rather than as an error.
+//
+// `window` is the attention window; -1 means "the shape's own default", which
+// is a short one for the llama-style block (its rows are a reconstruction) and
+// the full past for the hyper-connection form (its rows are the trunk's own).
+bool Engine::mtp_attn_body(const MtpBlock &m, i32 pos, bool norm_first, i32 window) {
     const ModelConfig &mc = model_.cfg();
-    const size_t as = be_->act_size();
     const i64 hd = m.head_dim;
     const i64 nh = m.n_head;
     const i64 nkv = m.n_head_kv;
     const i64 q = nh * hd;
     const i64 kvw = nkv * hd;
-    if (!mtp_h_ || !mtp_e_ || !mtp_cat_ || !mtp_gate_ || !mtp_kv_k_ || !mtp_kv_v_)
+    if (q > q_dim_ || kvw > kv_dim_ || !ws_q_ || !ws_k_ || !ws_v_ ||
+        !ws_attn_ || !ws_x2_ || !mtp_gate_ || !mtp_kv_k_ || !mtp_kv_v_)
         return false;
-    if (q > q_dim_ || kvw > kv_dim_ || m.n_ff_exp > model_.n_ff_ws() ||
-        m.n_ff > model_.n_ff_ws())
-        return false;
+    if (norm_first && (!mtp_rep_ || !mtp_e_)) return false;
+    if (norm_first)
+        be_->rmsnorm(ws_xn_, ws_x_, m.attn_norm, 1, n_embd_, mc.rms_eps);
 
-    // DeepSeek's MTP fuses [embedding_norm | hidden_norm]; KRK_MTP_CONCAT=he is
-    // the swapped order, kept as an arm because the concat side is not stated
-    // in the GGUF and an order that is wrong here reads as a mediocre drafter
-    // rather than as an error.
-    static const bool hidden_first = [] {
-        const char *e = std::getenv("KRK_MTP_CONCAT");
-        return e && e[0] == 'h';
-    }();
-    u8 *cat = static_cast<u8 *>(mtp_cat_);
-    const size_t half = static_cast<size_t>(n_embd_) * as;
-    void *cat_h = hidden_first ? static_cast<void *>(cat)
-                               : static_cast<void *>(cat + half);
-    void *cat_e = hidden_first ? static_cast<void *>(cat + half)
-                               : static_cast<void *>(cat);
-    be_->rmsnorm(cat_e, mtp_e_, m.enorm, 1, n_embd_, mc.rms_eps);
-    be_->rmsnorm(cat_h, mtp_h_, m.hnorm, 1, n_embd_, mc.rms_eps);
-    gemm_w(ws_x_, mtp_cat_, m.eh_proj, n_embd_, 2 * n_embd_, 1);
-    be_->fill0(mtp_rep_, sizeof(i32));
-
-    be_->rmsnorm(ws_xn_, ws_x_, m.attn_norm, 1, n_embd_, mc.rms_eps);
     const bool packed = m.wq.n_out == 2 * q;
     if (packed && !ws_qpack_) return false;
     void *qp = packed ? ws_qpack_ : ws_q_;
@@ -5458,7 +5480,12 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
     // extra attended row adds more approximation error than context. A block
     // whose rows ARE the stack's hidden would want the full past back --
     // KRK_MTP_WINDOW=0 restores it, and the window is still per-run overridable.
-    d.window = window_override >= 0 ? window_override : 4;
+    // The shape's own default: a short window for the llama-style block, whose
+    // rows are a reconstruction, and the full past for the hyper-connection
+    // form, whose rows are the trunk's own hidden state. An explicit
+    // KRK_MTP_WINDOW still wins on either.
+    const i32 shape_window = window >= 0 ? window : (norm_first ? 4 : 0);
+    d.window = window_override >= 0 ? window_override : shape_window;
     // ---- position arms ----------------------------------------------------
     // RoPE only ever sees DISTANCES, so a per-row offset cannot change a single
     // score: row i's q and row j's k are both rotated by their own absolute
@@ -5508,6 +5535,179 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
     const MtpAbl abl = mtp_abl();
     if (abl != MtpAbl::Attn && abl != MtpAbl::Both)
         be_->add_residual(ws_x_, ws_x2_, 1, n_embd_, static_cast<i32 *>(mtp_rep_));
+    return true;
+}
+
+// The qwen4exp MTP block (plan step 1.6). Four stages, in the reference's
+// order:
+//
+//   x  = prefix([e | R])                       the dense prefix, per lane
+//   x  = hc_attn(x) -> attention -> combine    hyper-connection around attention
+//   x  = hc_ffn(x)  -> MoE        -> combine   hyper-connection around the FFN
+//   logits = head(hc_head(x))                  the trunk's own head
+//
+// The lane stack lives in `ws_hc_`, the same buffer the trunk's own layers use,
+// because the two mixers are the same arithmetic (`hc_enter`/`hc_leave`). That
+// is also why the block cannot run on a trunk that has no lane stack: the
+// head's lanes ARE the trunk's residual lanes, and a head that invents them is
+// drafting from a state the model never had.
+bool Engine::mtp_hf_block_forward(const MtpBlock &m, i32 pos, bool want_logits,
+                                 bool from_chain) {
+    const ModelConfig &mc = model_.cfg();
+    const size_t as = be_->act_size();
+    const i64 ne = n_embd_;
+    const i64 wide = static_cast<i64>(m.n_lane) * ne;
+    if (!mtp_e_ || !mtp_gate_ || !mtp_kv_k_ || !mtp_kv_v_ || !ws_hc_ ||
+        !ws_hc_n_ || !ws_hc_lo_ || !ws_hc_g_ || !ws_hc_inj_ || !ws_hc_mix_) {
+        forward_error_ = "the block's hyper-connection workspaces are not allocated";
+        return false;
+    }
+    if (!mtp_lanes_) {
+        forward_error_ = "the block's lane capture is not allocated";
+        return false;
+    }
+    if (!hc_active_) {
+        forward_error_ =
+            "the head is a hyper-connection block and this trunk has no lane "
+            "stack -- its lanes are the trunk's residual lanes, not rows this "
+            "block may invent";
+        return false;
+    }
+    if (m.n_lane != hc_.hc || m.n_hc_rank != hc_.low_rank) {
+        forward_error_ = "the head's mixers are " + std::to_string(m.n_lane) +
+                         " lanes x rank " + std::to_string(m.n_hc_rank) +
+                         " and this trunk's hyper-connection workspace is " +
+                         std::to_string(hc_.hc) + " x " +
+                         std::to_string(hc_.low_rank);
+        return false;
+    }
+    if (!m.eh_proj_split && !m.eh_proj.present()) {
+        forward_error_ = "the head has no dense prefix";
+        return false;
+    }
+    if (m.eh_proj_split && (!m.fc_embedding.present() || !m.fc_hidden.present())) {
+        forward_error_ = "the head's split dense prefix is incomplete";
+        return false;
+    }
+
+    // ---- the block's inputs, at this position -----------------------------
+    // The lane stack is either the trunk's final multi-stream residual at the
+    // cell being drafted (captured by the trunk's own passes) or, for the
+    // second and later proposals of one round, the stack this block itself
+    // produced last -- the reference's `t_h_nextn`, one draft step on. The
+    // embedding is always the token the step is fed.
+    const void *lane_src = from_chain && mtp_chain_
+                               ? mtp_chain_
+                               : act_at(mtp_lanes_, as, mtp_capture_row(pos) * wide);
+    be_->copy_act(ws_hc_, lane_src, wide);
+    u8 *cat = static_cast<u8 *>(mtp_cat_);
+    void *cat_e = cat;
+    void *cat_h = cat + static_cast<size_t>(ne) * as;
+    be_->rmsnorm(cat_e, mtp_e_, m.enorm, 1, ne, mc.rms_eps);
+
+    // ---- the prefix, per lane ---------------------------------------------
+    // One lane at a time: `h_l = rms(R_l) * hnorm[l]`, then the lane's row
+    // through the projection. The fused form multiplies [e | h_l] by one
+    // 2*n_embd-wide matrix; the split form adds two ne-wide products. Both
+    // leave the result in that lane of ws_hc_, so the mixers below see exactly
+    // the layout the trunk's own layers use.
+    for (i32 l = 0; l < m.n_lane; l++) {
+        void *lane = act_at(ws_hc_, as, static_cast<i64>(l) * ne);
+        be_->rmsnorm(cat_h, lane, m.hnorm ? m.hnorm + static_cast<i64>(l) * ne
+                                          : nullptr,
+                     1, ne, mc.rms_eps);
+        if (!m.eh_proj_split) {
+            gemm_w(lane, mtp_cat_, m.eh_proj, ne, 2 * ne, 1);
+        } else {
+            // fc([e | h]) == fc_embedding(e) + fc_hidden(h): the split form is
+            // the fused matrix's two column blocks, applied per lane.
+            gemm_w(lane, cat_h, m.fc_hidden, ne, ne, 1);
+            gemm_w(ws_x2_, cat_e, m.fc_embedding, ne, ne, 1);
+            be_->add_inplace(lane, ws_x2_, ne);
+        }
+    }
+
+    // ---- hyper-connection around attention --------------------------------
+    be_->fill0(mtp_rep_, sizeof(i32));
+    const MtpAbl abl = mtp_abl();
+    hc_enter(m.hc_attn.norm, m.hc_attn.down, m.hc_attn.up, m.hc_attn.inject, 1);
+    if (!mtp_attn_body(m, pos, /*norm_first=*/false, /*window=*/-1)) return false;
+    hc_leave(1);
+
+    // ---- hyper-connection around the FFN ----------------------------------
+    // The MoE is the same routine a stack layer uses, keyed on the block's own
+    // index, so its 512 experts page through the same budget.
+    hc_enter(m.hc_ffn.norm, m.hc_ffn.down, m.hc_ffn.up, m.hc_ffn.inject, 1);
+    if (abl != MtpAbl::Ffn && abl != MtpAbl::Both && !mtp_ffn(m, 1)) return false;
+    hc_leave(1);
+
+    // The stack the NEXT proposal of this round starts from. Saved here, at the
+    // end of the block, because that is the state the reference carries
+    // (`embeddings_nextn` is the flat lane stack after both mixers).
+    if (mtp_chain_) be_->copy_act(mtp_chain_, ws_hc_, wide);
+
+    if (want_logits) {
+        // The head mixer IS this family's output norm -- the file carries no
+        // output_norm -- and the vocabulary projection is the trunk's own
+        // `output.weight`: there is no head of its own in the 31 tensors.
+        if (!m.hc_head.present()) {
+            forward_error_ = "the head has no final mixer, so it has no row for "
+                             "the trunk's head to read";
+            return false;
+        }
+        hc_head_mix(0, m.hc_head.norm, m.hc_head.down, m.hc_head.up);
+        const void *xn = ws_xn_;
+        if (model_.had().head_folded) {
+            had_xform(ws_had_, ws_xn_, 1, n_embd_, false, false);
+            xn = ws_had_;
+        }
+        logit_head(xn);
+    }
+    return true;
+}
+
+bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits,
+                               bool from_chain) {
+    // The two head shapes are two different blocks, not two spellings of one:
+    // the llama-style block is a residual stream plus a concat fusion, the
+    // qwen4exp one is a hyper-connection lane stack with its own input pair.
+    // One entry point, so every caller (the probe, the re-feed, the proposer)
+    // reaches the right forward without knowing which kind it loaded.
+    if (m.hf) return mtp_hf_block_forward(m, pos, want_logits, from_chain);
+    const ModelConfig &mc = model_.cfg();
+    const size_t as = be_->act_size();
+    const i64 hd = m.head_dim;
+    const i64 nh = m.n_head;
+    const i64 nkv = m.n_head_kv;
+    const i64 q = nh * hd;
+    const i64 kvw = nkv * hd;
+    if (!mtp_h_ || !mtp_e_ || !mtp_cat_ || !mtp_gate_ || !mtp_kv_k_ || !mtp_kv_v_)
+        return false;
+    if (q > q_dim_ || kvw > kv_dim_ || m.n_ff_exp > model_.n_ff_ws() ||
+        m.n_ff > model_.n_ff_ws())
+        return false;
+
+    // DeepSeek's MTP fuses [embedding_norm | hidden_norm]; KRK_MTP_CONCAT=he is
+    // the swapped order, kept as an arm because the concat side is not stated
+    // in the GGUF and an order that is wrong here reads as a mediocre drafter
+    // rather than as an error.
+    static const bool hidden_first = [] {
+        const char *e = std::getenv("KRK_MTP_CONCAT");
+        return e && e[0] == 'h';
+    }();
+    u8 *cat = static_cast<u8 *>(mtp_cat_);
+    const size_t half = static_cast<size_t>(n_embd_) * as;
+    void *cat_h = hidden_first ? static_cast<void *>(cat)
+                               : static_cast<void *>(cat + half);
+    void *cat_e = hidden_first ? static_cast<void *>(cat + half)
+                               : static_cast<void *>(cat);
+    be_->rmsnorm(cat_e, mtp_e_, m.enorm, 1, n_embd_, mc.rms_eps);
+    be_->rmsnorm(cat_h, mtp_h_, m.hnorm, 1, n_embd_, mc.rms_eps);
+    gemm_w(ws_x_, mtp_cat_, m.eh_proj, n_embd_, 2 * n_embd_, 1);
+    be_->fill0(mtp_rep_, sizeof(i32));
+
+    if (!mtp_attn_body(m, pos, /*norm_first=*/true, /*window=*/-1)) return false;
+    const MtpAbl abl = mtp_abl();
     be_->rmsnorm(ws_xn_, ws_x_, m.post_attn_norm, 1, n_embd_, mc.rms_eps);
     if (abl != MtpAbl::Ffn && abl != MtpAbl::Both && !mtp_ffn(m, 1)) return false;
 
@@ -7566,6 +7766,15 @@ bool Engine::generate_speculative_head(const GenerateParams &p, GenerateResult *
         for (i32 j = 0; j < a; j++) {
             if (res->generated >= p.max_tokens) break;
             const i32 t = prop[static_cast<size_t>(j)];
+            // An accepted proposal is still a generated token, and the
+            // plain decode loop tests the end token BEFORE emitting it.
+            // A round has to do the same: without this the block's own
+            // </s> proposal was emitted and the run carried on past it.
+            if (t == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
             draft_accepted_++;
             stop_hit = emit.accept(t);
             emitted++;
@@ -12518,13 +12727,20 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
                           static_cast<f64>(draft_proposed_)
                     : 0.0;
             KRK_INFO("mtp spec: %llu round(s), %llu of %llu proposals kept "
-                     "(%.1f%%), %.2f token(s)/round | propose %.0f ms | verify "
+                     "(%.1f%%), step-1 %llu of %llu (%.1f%%), %.2f "
+                     "token(s)/round | propose %.0f ms | verify "
                      "%.0f ms | snapshot %.0f ms | refeed %.0f ms | block "
                      "experts %.0f ms, %llu of %llu promoted | second forward "
                      "%.0f ms over %llu round(s)",
                      static_cast<unsigned long long>(spec_steps_),
                      static_cast<unsigned long long>(draft_accepted_),
                      static_cast<unsigned long long>(draft_proposed_), rate,
+                     static_cast<unsigned long long>(step1_hits_),
+                     static_cast<unsigned long long>(step1_tries_),
+                     step1_tries_ > 0
+                         ? 100.0 * static_cast<f64>(step1_hits_) /
+                               static_cast<f64>(step1_tries_)
+                         : 0.0,
                      spec_steps_ > 0
                          ? static_cast<f64>(res->generated) /
                                static_cast<f64>(spec_steps_)
@@ -12660,12 +12876,16 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
                               act_at(mtp_hidden_, be_->act_size(),
                                      mtp_capture_row(fpos) * n_embd_),
                               n_embd_);
-            } else {
+            } else if (!m.hf) {
                 // The block's residual from the previous proposal. Copied
-                // before this forward overwrites ws_x_.
+                // before this forward overwrites ws_x_. A hyper-connection head
+                // carries its LANE STACK instead (mtp_chain_), so for it the
+                // forward reads that buffer directly and this copy is neither
+                // needed nor wanted -- `mtp_h_` is one row and would silently
+                // truncate the state.
                 be_->copy_act(mtp_h_, ws_x_, n_embd_);
             }
-            if (!mtp_block_forward(m, static_cast<i32>(fpos), true)) break;
+            if (!mtp_block_forward(m, static_cast<i32>(fpos), true, d > 0)) break;
             const u64 t_e2 = pm();
             i32 id = -1;
             if (!topk_argmax(&id)) {
@@ -12680,6 +12900,10 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
                 prop_timed_++;
             }
             if (id < 0) break;
+            // The target confirms EOS itself: keeping it as a proposal made the
+            // accept loop emit the end token and continue past it. The generic
+            // draft-head path breaks here too.
+            if (id == tok_.eos()) break;
             prop[static_cast<size_t>(d)] = id;
             draft_proposed_++;
         }
@@ -12692,6 +12916,13 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
         timed_decode_steps++;
 
         // ---- pre-check: the target must agree with proposal 0 -------------
+        // Step-1 acceptance is this comparison, and only this comparison: a
+        // round whose chain stopped at d == 0 made no step-1 claim, so it is
+        // counted as neither a hit nor a try.
+        if (d > 0) {
+            step1_tries_++;
+            if (first == prop[0]) step1_hits_++;
+        }
         if (d == 0 || first != prop[0]) {
             if (spec_trace())
                 std::fprintf(stderr,
@@ -12788,6 +13019,15 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
         for (i32 j = 0; j < a; j++) {
             if (res->generated >= p.max_tokens) break;
             const i32 t = prop[static_cast<size_t>(j)];
+            // An accepted proposal is still a generated token, and the
+            // plain decode loop tests the end token BEFORE emitting it.
+            // A round has to do the same: without this the block's own
+            // </s> proposal was emitted and the run carried on past it.
+            if (t == tok_.eos()) {
+                if (!recurrent) kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
             draft_accepted_++;
             stop_hit = emit.accept(t);
             emitted++;
@@ -13113,6 +13353,15 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         for (i32 j = 0; j < a; j++) {
             if (res->generated >= p.max_tokens) break;
             const i32 t = prop[static_cast<size_t>(j)];
+            // An accepted proposal is still a generated token, and the
+            // plain decode loop tests the end token BEFORE emitting it.
+            // A round has to do the same: without this the block's own
+            // </s> proposal was emitted and the run carried on past it.
+            if (t == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
             draft_accepted_++;
             stop_hit = emit.accept(t);
             emitted++;
@@ -13351,6 +13600,12 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             } else {
                 prop[static_cast<size_t>(j)] = argmax_of(drow, n_vocab_);
             }
+            // An end token is not a proposal: the target confirms EOS itself.
+            // Truncating here keeps it out of the count and out of the round.
+            if (prop[static_cast<size_t>(j)] == tok_.eos()) {
+                d = j;
+                break;
+            }
         }
         draft_proposed_ += static_cast<u64>(d);
         spec_steps_++;
@@ -13543,6 +13798,15 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             for (i32 j = 0; j < ra; j++) {
                 if (res->generated >= p.max_tokens) break;
                 const i32 t = prop[static_cast<size_t>(j)];
+                // An accepted proposal is still a generated token, and the
+                // plain decode loop tests the end token BEFORE emitting it.
+                // A round has to do the same: without this the block's own
+                // </s> proposal was emitted and the run carried on past it.
+                if (t == tok_.eos()) {
+                    kv_rollback(pos + emitted);
+                    finish_run(FinishEos);
+                    return true;
+                }
                 draft_accepted_++;
                 stop_hit = emit.accept(t);
                 emitted++;
@@ -13636,6 +13900,15 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
         for (i32 j = 0; j < a; j++) {
             if (res->generated >= p.max_tokens) break;
             const i32 t = prop[static_cast<size_t>(j)];
+            // An accepted proposal is still a generated token, and the
+            // plain decode loop tests the end token BEFORE emitting it.
+            // A round has to do the same: without this the block's own
+            // </s> proposal was emitted and the run carried on past it.
+            if (t == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
             draft_accepted_++;
             stop_hit = emit.accept(t);
             emitted++;
@@ -13920,6 +14193,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     auto run_mtp_probe = [&]() {
         if (!mtp_probe_report_ || !mtp_probe_enabled()) return;
         const MtpProbe mp = mtp_probe_step();
+        mtp_last_probe_ = mp;
         if (!mp.ok) {
             KRK_WARN("mtp probe: did not run -- %s", mp.note.c_str());
             return;

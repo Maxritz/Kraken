@@ -993,7 +993,13 @@ constexpr ArchSpec kTable[] = {
     // The MTP/prediction-head shard of DeepSeek-V4: `mtp.*` tensors, nothing else.
     {"deepseek4-dspark", ArchShape::Moe, ArchSupport::No, ArchRole::Draft,
      "deepseek4",
-     "multi-token-prediction head shard (mtp.*) rather than a model",
+     "a multi-token-prediction head set (mtp.*) rather than a model. Its block "
+     "is the "
+     "trunk's own latent attention -- attn_q_a/attn_q_b, attn_kv_a_mqa/"
+     "attn_kv_b -- plus the nextn fusion, so the sidecar loader (which reads "
+     "llama-style q/k/v blocks) refuses it by naming MLA rather than a missing "
+     "attn_q. Wiring the trunk's MLA attention into MtpBlock is what this row "
+     "needs; the family check no longer refuses it as a stranger",
      false, false, false, false},
     // Hybrid Mamba/attention stacks: the mamba blocks are not the gated delta
     // net this engine implements (different recurrence, different state).
@@ -1037,11 +1043,14 @@ constexpr ArchSpec kTable[] = {
     {"qwen4-mtp", ArchShape::Moe, ArchSupport::Partial, ArchRole::Draft,
      "qwen4exp",
      "an MTP head set for a qwen4exp target: one block with gated attention, a "
-     "QSA indexer, hyper-connections and a 512-expert MoE. It loads, its "
-     "shapes are checked against the trunk and its fused expert bank is split "
-     "into gate/up views with no copy, but the block's forward is not "
-     "implemented yet, so it cannot propose a token "
-     "(docs/PLAN-mtp-and-prefill.md 1.5-1.7)",
+     "QSA indexer (loaded and run dense -- a standalone head declares no block "
+     "budget), hyper-connections and a 512-expert MoE. It loads, its shapes "
+     "are checked against the trunk, its fused expert bank is split into "
+     "gate/up views with no copy, and the block runs and drafts: --mtp-probe "
+     "predicts, and --mtp-spec now chains, carrying the whole lane stack from "
+     "one proposal into the next instead of a single row. What is missing is "
+     "the measurement: acceptance and tokens/s against a real checkpoint are "
+     "unmeasured, so the row stays Partial",
      true, true, false, false},
 
     // A head set is not a model: no token embedding, no output head, nothing to

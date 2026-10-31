@@ -624,3 +624,78 @@ not depend on the block at all. It is now built once per call
 effect is under the noise floor on this host -- the rebuild is small next to the
 GEMM it feeds -- but it was free to fix and it is now proportional to the work,
 not to the block count.
+
+## A longer scale group by construction: built, measured, rejected (2026-10-31)
+
+The paragraph above ends with "a format whose scale group is longer than 32 *by
+construction* ... that is a format decision". `tools/bench_prefill_fmt.cpp`
+answers it before any engine code exists: four kernels over the same data at
+768x2048x512, plus the quantisation error each layout costs.
+
+**The speed is real, and it is not where the plan expected it to be.** The cost
+a longer group removes is not the multiply -- it is the *scale vector build*: the
+shipped kernel assembles a 512-bit vector of per-block scale products (two
+broadcasts and an insert) every 64 values. One broadcast per group is only
+possible when the weight AND the activation are quantised over the same run,
+because the kernel multiplies `s_w * s_x` and a single scalar is a single number
+only if both sides share the group. Lengthening the weight group alone makes the
+kernel slower:
+
+| kernel (8 rows/call, best of 5 in-process, two runs) | run A | run B |
+|---|---:|---:|
+| q8_0, the shipped kernel | 30.05 | 29.17 |
+| 128-value weight group, activation still per-32 | 24.18 | 23.55 |
+| **128-value weight group, activation per-128** | **43.64** | **41.49** |
+| 128-value weight group with per-32 exponents, activation per-128 | 29.58 | 29.53 |
+
+So the 1.43x is bought by the *activation* group, not the weight group. That is
+the finding that reverses the plan's arithmetic: item 4 was written as "the
+weight format carries a longer run", but the kernel needs both sides to share it,
+and the activation side is the one that cannot be fitted offline.
+
+**And the error is what the plan's gate said it would be.** Relative RMS against
+f32 rows (`max` is max per-element error over max|w|; `logit` is the dot-product
+error against f32 activations; three row shapes because the layout question is
+about the spread of values inside a group):
+
+| layout | B/value | gauss | heavy | hetero |
+|---|---:|---:|---:|---:|
+| q8_0 (32-value blocks, f16 scale) | 1.0625 | 5.94e-3 | 5.25e-3 | 5.34e-3 |
+| 128-value group, max scale | 1.0156 | 7.40e-3 | 6.41e-3 | 6.51e-3 |
+| 128-value group, least-squares scale | 1.0156 | 7.38e-3 | 6.37e-3 | 6.53e-3 |
+| 128 groups + 2-bit exponents | 1.0234 | 7.23e-3 | 6.32e-3 | 6.42e-3 |
+| 128 groups + 4-bit exponents | 1.0312 | 7.21e-3 | 6.31e-3 | 6.42e-3 |
+| 128 groups + 8-bit exponents | 1.0469 | 7.17e-3 | 6.28e-3 | 6.47e-3 |
+
+Three things were expected and did not happen:
+
+* **Least squares does not rescue the long group.** 7.38e-3 against max-scaling's
+  7.40e-3: on rows without an extreme outlier the max scale is already close to
+  the least-squares one, and on heavy-tailed rows it is 6.37 against 6.41. The
+  hypothesis was that an outlier wastes the range; measured, it does not.
+* **The per-32 exponent ladder buys precision the ladder cannot hold.** It was
+  supposed to keep q8_0's per-32 grid while merging four blocks onto one scale.
+  A power-of-two ladder can only land on scales `anchor / 2^e`, so the chosen
+  grid is up to 2x coarser than the block's ideal one, and the error stays at
+  the long-group level (7.2e-3). More exponent bits do not help either -- 2, 4
+  and 8 bits all measure within noise -- because the limit is the ladder's
+  *granularity*, not its range.
+* **The activation group costs error too.** Per-32 to per-128 activation
+  quantisation moves the dot by 1.16x (gauss), 1.10x (heavy), 1.37x (hetero)
+  against f32 activations.
+
+**Verdict: the format does not ship.** The gate was 1.15x over W *and* logits
+that move no more than q8_0's already do. The speed gate passes at 1.43x; the
+error gate fails at 1.25x (weights) times ~1.16x (activations), and the
+compromise design -- per-32 exponents, which was the whole point of candidate
+(b) -- measures **1.00x** over the shipped kernel and no better in error. It
+would be a slower format and a more complex one at the same time.
+
+What would change the answer is a real artifact showing q8_0's error is far
+below what the model tolerates; nothing here can show that, and shipping a
+format whose degradation is unmeasured is exactly the trade this file exists to
+refuse. The bench stays in the tree (`kraken-prefill-fmt-bench`) so the decision
+can be re-run instead of re-argued, and every prototype is checked against
+dequant-then-f32 before its speed is quoted (g4 1.1e-6, g4-with-per-32-activation
+2.8e-7, s4 8.5e-4 -- the last is the s-layout's own sub-scale truncation, which
+is another reason it is out).

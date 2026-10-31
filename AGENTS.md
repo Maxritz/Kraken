@@ -4126,3 +4126,93 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   `sum(per_expert(gate)+per_expert(up)+per_expert(down)) / n_layer` from the
   tensor table (`tools/gguf_tensors.py`), not from the layer-0 field.
 - **A batched decode must resolve only the experts it can KEEP resident, and nothing checked that.** `moe_decode_batch` resolves every routed expert before the first launch, then launches; `ExpertCache::acquire` evicts when the budget cannot hold the routed set, so with a one-slot cache the second resolve hands back the cell the first expert was in. Both experts then multiply ONE expert's weights: finite, plausible, no refusal, and it reaches the sampler. Measured on the synthetic 4-expert fixture: one slot decoded `5 4 5 4 5 4` where a large cache decoded `5 5 4 5 4 5`, and `KRK_MOE_BATCH=0` returned `test_moe_schema_and_laziness` to 32/32 -- that arm is what named the path. Two guards now sit in `moe_decode_batch`: `capacity_slots() >= distinct routed experts` before any acquire (the semantic condition), and all pairwise slice-pointer distinctness after the resolve, 3 slices against 3 slices per expert pair, because a tiered cache can hand expert 2 the cell expert 1 used for a DIFFERENT slice and a same-field comparison misses it -- that shape decoded `5 0 0 0 0 0` at `--expert-cache-slots 1 --expert-warm-mb 64`. Result: 32/32 in a child process and under `KRK_TEST_INPROC=1`, four consecutive runs (suite 3870/3870). `Engine::moe_batch_layers()` / `moe_batch_skips()` expose the counters, and `test_moe_batch_fallback` pins BOTH arms: with 2 experts routed and 1 slot, zero layers batched and the per-expert loop ran; with room for the routed set the batch does compute layers. The roomy arm exists so a guard that refuses unconditionally cannot pass. The general rule: a batch whose members are acquired up front needs a residency guarantee; "the cache will sort it out" is a silent wrong answer, not a fallback.
+- **A speculative round emitted the end token and ran on past it, in all three
+  speculative families.** The plain decode loop tests `next1 == tok_.eos()`
+  *before* `emit.accept`, so the end token is never written. A round writes its
+  accepted proposals in a loop that had no such test, and the proposers
+  disagreed about whether an end-token proposal was legal: the draft-head path
+  breaks on it, the MTP and DFlash paths did not. Measured on the qwen4exp MTP
+  fixture (`test_mtp_hf_spec_chain`): the block proposed `</s>` at position 34,
+  verification agreed, the loop emitted it, and the run produced
+  `8 3 3 3 3 3 3 3 2 3 3 3` where plain greedy produced
+  `8 3 3 3 3 3 3 3` and stopped -- same first eight tokens, three extra after
+  the end, `finish=length` instead of `finish=eos`. Two-sided fix, in **all
+  five** speculative loops (draft-head greedy, MTP greedy, MTP sampled, DFlash
+  greedy, DFlash sampled): proposals drop an end token before they are stored
+  (`draft_proposed_` no longer counts them), and the accept loops end the run
+  with `FinishEos` if one ever arrives anyway. The group checks the `finish`
+  code, not only the text: the text comparison alone passed the moment the
+  trailing `2` happened to be trimmed. General rule: a verification loop's
+  emission is the plain loop's emission, and every stop condition the plain
+  loop has -- the end token first among them -- has to exist in the round.
+- **Step-1 acceptance is not `draft_accepted/draft_proposed`.** The plan gates
+  the MTP head on "acceptance ≥ 0.6 at step 1", and the aggregate ratio cannot
+  answer it: it mixes steps 2..k, where a chain that stopped early is not
+  evidence about the head, and a pre-check miss is counted as a rejected
+  proposal in some paths. `Engine::step1_hits()/step1_tries()` count one thing
+  -- a round that proposed at all, and whether proposal 0 equalled the target's
+  own greedy token -- and the `mtp spec:` line prints it. On the synthetic
+  fixtures the two arms separate as they should: **3 of 3** for the pass-through
+  head, **0 of 9** for the live-attention control that proposes the wrong token
+  on purpose. A counter that just returned `hits == tries` would pass the first
+  arm and fail the second, which is why the group asserts both.
+- **A longer scale group only pays if BOTH sides of the GEMM are quantised over
+  it, and that is where its error comes from.** The plan for the prefill format
+  was "make the weight format carry a 128-value scale run"; the kernel measured
+  otherwise. The shipped kernel's per-64-value cost is the scale-VECTOR build
+  (two broadcasts and an insert), and one broadcast per group is only possible
+  when `d_w * d_x` is a single scalar, i.e. when the weight and the activation
+  share the run. Measured at 768x2048x512, best-of-5 in-process, two runs
+  (GMAC/s): shipped q8_0 30.05/29.17; 128-value weight group with per-32
+  activations **24.18/23.55 (0.80x, slower)**; the same weights with per-128
+  activations **43.64/41.49 (1.43x)**; the per-32-exponent variant with per-128
+  activations 29.58/29.53 (**1.00x**). The error that buys: 1.25x q8_0's on the
+  weight side (max scale 7.40e-3 against q8_0's 5.94e-3 RMS, gauss rows) and
+  1.16x on the activation side. Two escape routes were tested and both failed:
+  a least-squares scale instead of max (7.38e-3, no better on any of three row
+  shapes -- the outlier-wastes-range hypothesis is false on these rows), and a
+  power-of-two exponent per 32-value block (7.2e-3: a ladder can only land on
+  `anchor/2^e`, so the grid is up to 2x coarser than the block's ideal one, and
+  2, 4 and 8 exponent bits all measure within noise -- the limit is ladder
+  GRANULARITY, not range). Verdict: does not ship; the gate's error half fails
+  even though its speed half passes. Bench: `tools/bench_prefill_fmt.cpp`
+  (`kraken-prefill-fmt-bench`), which checks every prototype against
+  dequant-then-f32 before quoting its speed -- g4 1.1e-6, g4 with per-32
+  activations 2.8e-7, s4 8.5e-4.
+- **A prototype kernel's own harness can produce the failure that its format
+  then gets blamed for.** Three worth recording from one afternoon: `#ifdef
+  __AVX512F__` silently deleted all three prototype kernels from a baseline-ISA
+  build (the tool printed the shipped kernel and nothing else -- attribute the
+  functions and dispatch on `__builtin_cpu_supports` instead); `floor(log2(r))`
+  for the per-block exponent is off by one whenever the ratio sits within an
+  f16-ulp of 1.0, which halved the scale and saturated every block (select the
+  finest exponent that FITS instead); and the correctness check compared the
+  s-layout's bytes against the g4 reference, reporting a 3e-2 failure that was
+  the harness's (each kernel must be checked against its own dequantised
+  weights). The s4 dot still fails 1e-5 -- 8.5e-4 -- and that one is the format:
+  merging blocks onto a common scale truncates the per-lane partial sums.
+- **A head set is named for the head, so comparing its `general.architecture`
+  with the trunk's string refuses every one of them.** `--mtp` compared
+  `side_arch != cfg_.arch` and a `deepseek4-dspark` file beside a `deepseek4`
+  trunk (or `qwen4exp-mtp` beside `qwen4exp`) failed as "a head from another
+  family" before a tensor was read -- the same trap the HF `mtp.*` path had
+  already been fixed for, by sniffing tensors. The comparison now forgives a
+  **registered head set** (`ArchRole::Draft`) whose table `family` matches, and
+  keeps refusing a *model* of the same schema: `qwen2` reads against `llama`, so
+  a family-only rule would accept a whole model as a drafter, and the existing
+  `test_mtp_sidecar` arm caught exactly that (it went red the moment the rule
+  was widened to family alone). Two arms pin it now: `test_mtp_sidecar` (17/17,
+  qwen2 still refused by name) and `test_mtp_sidecar_mla` (9/9, a dspark head
+  set reaches the block loader).
+- **`deepseek4-dspark`'s block is MLA, and the loader said "no attn_q".** The
+  nextn layer in upstream `src/models/deepseek4.cpp` is built from the trunk's
+  own attention -- `attn_q_a`/`attn_q_b`, `attn_kv_a_mqa`/`attn_kv_b` for the
+  V3-class spelling, the shared latent for V4 -- plus `nextn.eh_proj`/`enorm`/
+  `hnorm`/`shared_head_norm`. It is NOT a second hyper-connection block, so
+  item 1's qwen4exp port does not apply; what it needs is the trunk's MLA
+  attention body inside `MtpBlock` (reuse, not a new family). Until then the
+  loader refuses it by naming MLA and the four tensors it found, because "no
+  readable blk.N.attn_q.weight" sends a reader hunting for a missing tensor when
+  the attention BODY is what is missing. General rule: a refusal should name the
+  thing that is absent, and when a family spells the same layer differently, the
+  spelling is the finding.
