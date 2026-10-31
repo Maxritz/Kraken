@@ -513,6 +513,34 @@ bool Gguf::add_row_slice(const std::string &to, const std::string &from,
     return true;
 }
 
+bool Gguf::add_expert_plane_slice(const std::string &to, const std::string &from,
+                                  i64 row0, i64 rows, i64 n_in) {
+    if (to.empty() || from.empty()) return false;
+    const GgufTensor *src = tensor(from);
+    if (!src) return false;
+    if (tensor(to)) return true;
+    if (row0 < 0 || rows <= 0 || n_in <= 0) return false;
+    if (src->n_dims < 3 || src->ne[2] < 1) return false;
+    if (n_in != static_cast<i64>(src->ne[0])) return false;
+    const i64 plane_rows = static_cast<i64>(src->ne[1]);
+    if (row0 + rows > plane_rows) return false;
+    const size_t rb = dtype_row_bytes(src->type, static_cast<u64>(n_in));
+    if (rb == 0) return false;
+    GgufTensor t = *src;
+    t.name = to;
+    t.data = src->data + static_cast<size_t>(row0) * rb;
+    t.ne[0] = static_cast<u64>(n_in);
+    t.ne[1] = static_cast<u64>(rows);
+    t.n_dims = 3;
+    t.n_elements = n_in * rows * static_cast<i64>(src->ne[2]);
+    // The slice's own payload is one row block; the plane distance is the
+    // source's, so `plane(e)` still lands on expert e's plane.
+    t.n_bytes = static_cast<size_t>(rb) * static_cast<size_t>(rows);
+    t.plane_stride = static_cast<size_t>(rb) * static_cast<size_t>(plane_rows);
+    tensors_.push_back(std::move(t));
+    return true;
+}
+
 bool Gguf::add_tensor_entry(GgufTensor t) {
     if (t.name.empty() || !t.data) return false;
     if (tensor(t.name)) return false;

@@ -1017,6 +1017,46 @@ struct MtpBlock {
     const GgufTensor *exps_gate = nullptr;
     const GgufTensor *exps_up = nullptr;
     const GgufTensor *exps_down = nullptr;
+
+    // ---- the HF `mtp.*` form -------------------------------------------
+    // qwen4exp's MTP head is not a llama block: it carries four
+    // hyper-connection lanes, a QSA indexer with its own KV, and its own
+    // 512-expert MoE stored as one fused `gate_up_proj`. Every field below is
+    // zero for the llama-style block above, so the two shapes share this struct
+    // without either one's forward having to guess. docs/MTP-HEAD-SCHEMA.md
+    // lists the tensors, their shapes and the consumer of each.
+    bool hf = false;        // loaded from `mtp.*` names
+    i32 n_lane = 0;         // hyper-connection lanes (hc); 0 = not an HC block
+    i32 n_hc_rank = 0;      // mixer bottleneck width (320 on qwen4exp)
+    i32 n_index_head = 0;   // QSA indexer heads
+    i32 index_dim = 0;      // QSA indexer head size
+    // One hyper-connection mixer: a per-lane norm gamma, the down/up bottleneck
+    // and the inject row that sets each lane's weight. `inject` is empty for
+    // the head mixer, which has no residual to feed.
+    struct HcMixer {
+        QuantTensor down, up, inject;   // [n_embd,rank] [rank,n_embd] [n_embd(n_lane)]
+        f32 *norm = nullptr;            // [n_embd * n_lane]
+        bool present() const { return down.present() && up.present(); }
+    };
+    HcMixer hc_attn, hc_ffn, hc_head;
+    // The dense prefix, in two spellings of the same function:
+    //   fused:  x = eh_proj_mlp( cat([e_norm | h_norm_lane]) )  per lane
+    //   split:  x = fc_embedding(e_norm) + fc_hidden(h_norm_lane)
+    // A file has one or the other (the fused form is the plain BF16 export, the
+    // split the EXL3 one), never both.
+    QuantTensor fc_embedding;   // [n_embd, n_embd]
+    QuantTensor fc_hidden;      // [n_embd, n_embd] applied per lane
+    bool eh_proj_split = false;
+    // QSA indexer: its own query/key projections and the norm pair that scales
+    // them. Absent on heads that keep plain dense attention.
+    QuantTensor index_q, index_k;
+    f32 *index_q_norm = nullptr;
+    f32 *index_k_norm = nullptr;
+    // The fused routed bank, when the file stores gate and up together:
+    // `gate_up_proj` `[2*n_ff_exp, n_embd, n_expert]`. `exps_gate`/`exps_up`
+    // then point at the two plane views of it (see Gguf::add_expert_plane_slice)
+    // and this is the underlying tensor.
+    const GgufTensor *exps_gate_up = nullptr;
 };
 
 // One dense tensor that is NOT resident: its source in the GGUF mapping and
@@ -1656,6 +1696,12 @@ private:
     // trunk being broken.
     bool load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
                              std::string *err);
+    // The HF `mtp.*` form (qwen4exp/qwen4-mtp). Takes a mutable Gguf because
+    // the fused `gate_up_proj` is split into its two plane views by appending
+    // directory entries -- offset arithmetic, no copy. Returns false with the
+    // offending tensor's name in `*err` when the geometry disagrees with the
+    // trunk or with the head's own other tensors.
+    bool load_mtp_hf_block(Gguf &g, const std::string &origin, std::string *err);
     // Upload the nextn block, if the file has one. Called at the end of load()
     // and only when KRK_MTP_LOAD is set: it is ~855 MB of experts on a 35B-A3B
     // and nothing in the main stack reads it.

@@ -163,7 +163,14 @@ bool DsparkDraft::load_head(std::string *err) {
 
     // The confidence projection reads [hidden ; w1_prev], so its contraction is
     // n_embd + rank. It is optional, and so is its bias.
-    if (const GgufTensor *tc = pick(*gguf_, {"dspark_conf_proj.weight",
+    // The reference's own spelling is `conf_proj.weight`
+    // (llama-arch.cpp: {LLM_TENSOR_DSPARK_CONF_PROJ, "conf_proj"}), verified
+    // against spiritbuun/buun-llama-cpp master on 2026-10-31. The longer
+    // spellings are the pre-validation guesses and stay accepted so an older
+    // repack still loads.
+    if (const GgufTensor *tc = pick(*gguf_, {"conf_proj.weight",
+                                             "conf_proj",
+                                             "dspark_conf_proj.weight",
                                              "dspark_conf_proj",
                                              "confidence.proj.weight",
                                              "confidence.proj"})) {
@@ -178,7 +185,8 @@ bool DsparkDraft::load_head(std::string *err) {
         }
         conf_ = upload(tc, "dspark_conf_proj");
         if (!conf_.data) return false;
-        if (const GgufTensor *tb = pick(*gguf_, {"dspark_conf_proj.bias",
+        if (const GgufTensor *tb = pick(*gguf_, {"conf_proj.bias",
+                                                 "dspark_conf_proj.bias",
                                                  "confidence.proj.bias"})) {
             f32 v = 0.0f;
             if (tb->type == DType::F32 && tb->n_elements >= 1)
