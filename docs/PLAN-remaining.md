@@ -373,10 +373,84 @@ gate) and `test_batch_throughput` (serial group):
 *Done when:* 4 concurrent requests hold aggregate tok/s above one-at-a-time with
 each response identical to its solo run. **Met, with the throughput caveat stated
 in the numbers above:** exactness is met and gated for every family the engine can
-batch; the aggregate win is real only where the step is transfer-bound
-(1.08x-1.27x measured) and is parity when every expert is resident. The remaining
-lever is the MoE expert-grouping that makes a wave share one expert read -- not
-the scheduler and not the attention.
+batch; the aggregate win is real only where the step is transfer-bound and is
+parity when every expert is resident.
+
+### Where the wave's time actually goes (measured, not assumed)
+
+The expert *grouping* this section used to call "the remaining lever" is already
+in the engine and has been since the grouped plan landed: the per-expert loop
+buckets the layer's `(token, slot)` pairs by expert, gathers one block of `m`
+rows per expert, and runs ONE gate/up + one down per expert (`plan_off_`,
+`gather_rows`, `gemm_group`). A wave therefore already reads each expert's
+weights once for all of its rows. Two further things follow from the width sweep
+in `test_batch_throughput` (8-expert fixture, 64 MB expert budget, median of 3):
+
+| wave | serial | batched | aggregate | per-row cost of a step |
+|---|---|---|---|---|
+| 4 | 85-93 tok/s | 120-126 tok/s | **1.35x-1.41x** | 4.6 ms |
+| 8 | 86-90 tok/s | 92-102 tok/s | **1.07x-1.13x** | 2.3 ms |
+
+* The wave's expert traffic is the **union** of its rows' experts, not the sum:
+  `(width * k) / union`. Over 8 experts with k=2 that saturates fast -- about
+  1.25x at width 4 and about 2x at width 8 -- so the win is bounded by the pool,
+  not by the code.
+* **The win is not a compute artifact, and it is not launch overhead either.**
+  The same sweep on the same shape with Q8_0 experts (the int8 dot path, which
+  is ~1.7x faster per token than the fixture's f16 one) keeps the win and even
+  grows it at width 8:
+
+  | experts | serial | batched | aggregate |
+  |---|---|---|---|
+  | f16 | 75 / 63 tok/s | 101 / 87 tok/s | 1.34x (w4) / 1.38x (w8) |
+  | Q8_0 | 130 / 131 tok/s | 144 / 168 tok/s | 1.11x (w4) / 1.28x (w8) |
+
+  So batching pays for something that survives a 1.7x faster dot path -- weight
+  traffic and per-step fixed cost -- while the absolute number nearly doubles
+  when the weights are 8-bit. The width-8 ratio moves between 1.07x and 1.38x
+  across runs on this machine, which is the noise floor these claims live in.
+* A group of exactly one row no longer pays its gather (`KRK_MOE_GATHER=0` is the
+  control arm): the row already exists in the activation block, so the copy is
+  skipped and the GEMMs read it in place. On this fixture the arm measures
+  **inside the noise** (the two arms bracket each other) -- kept because it is
+  strictly less work, not because a number here can see it. It matters in the
+  regime it was written for: a wide expert pool (128-256) where a wave of 4
+  rarely lands two rows on one expert, so every group is a group of one.
+
+**The next lever, and why it is parked.** The candidate was a grouped MoE GEMM:
+one call for all experts' gate/up over the stacked plan, one for the downs,
+removing the per-expert call fan-out (~40 per layer). The component table now
+answers it, and the answer is no:
+
+| kernel row | calls | µs/call | GMAC/s |
+|---|---|---|---|
+| `gemm_q8_0_i8_r1` | 7083 | 116.9 | 5.0 |
+| `gemm_q8_0_i8_rN` | 1494 | 300.4 | 4.9 |
+| `gemm_f16_r1` | 4062 | 107.4 | 3.2 |
+| `gemm_f16_rN` | 1440 | 277.3 | 4.7 |
+
+(`KRK_PROFILE=1 KRK_KPROF=1 KRK_BATCH_BENCH_Q8=1 KRK_BATCH_BENCH_W=4`; 2 cores,
+AVX-512 VNNI.) The rows>1 kernel runs at the **same** GMAC/s as the rows==1 one,
+and the per-call times scale with the work inside them -- so the expert phase is
+compute-bound at ~5 GMAC/s, not fan-out bound. Fewer, larger calls would remove
+dispatch the table says is not there. Under `KRK_CPU_Q80_WSC=1` the serial arm
+gains 13% (150 -> 170 tok/s) while the wave does not move (1.11x -> 1.01x), which
+is consistent: the fast Q8_0 kernel changes the rate of a GEMV, not the number of
+calls.
+
+What the same table does say the wave's time goes to, on this fixture:
+
+| component | phase | ops | host ms | % of decode |
+|---|---|---|---|---|
+| decode | decode | 330 | 977.6 | 48.1% |
+| routing | decode | 5160 | 623.5 | 30.7% |
+| experts | decode | 1032 | 430.4 | 21.2% |
+
+Routing at ~121 µs per op -- a 768x8 router GEMM, a softmax over 8 values, a
+top-k and a plan build -- is the next thing to look at, and the expert-cache
+staging inside that phase (`stage_batch`/`promote_batch`, which copies expert
+weights into the HOT tier per layer) is the first suspect. That is a measurement
+to make, not a kernel to write.
 
 ### B3 -- A trace file carries no identity -- DONE
 
