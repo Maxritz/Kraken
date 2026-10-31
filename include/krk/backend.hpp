@@ -281,6 +281,17 @@ struct MlaDesc {
     // declares; a file needing the half-split pairing is a different layout
     // and is refused by the loader today.
     const f32 *inv_freq = nullptr;
+    // ---- multi-sequence rows (see AttnDesc) --------------------------------
+    // Row t is written at and attends from row_pos[t] of the region starting at
+    // row_kv_base[t]. Both default to null, which is the one-sequence case:
+    // consecutive positions from pos0 in the caller's single region -- every
+    // caller before batching, and the degenerate batch.
+    //
+    // The base is in ELEMENTS, the same unit as pos_stride here, so a region is
+    // `kv_cap * pos_stride` elements and slot s starts at s times that. Keys are
+    // addressed as `base + position * pos_stride`, exactly as in attention().
+    const i64 *row_pos = nullptr;
+    const i64 *row_kv_base = nullptr;
 };
 
 // V4's shared-latent MLA (MlaLayout::Shared), which is a different graph from
@@ -313,6 +324,10 @@ struct MlaSharedDesc {
     // Per-head attention-sink logit, entered into the softmax DENOMINATOR only
     // (never attended). HOST memory, [n_head]; null on a file with no sinks.
     const f32 *sinks = nullptr;
+    // Per-row positions and region bases, exactly as in MlaDesc above: null is
+    // one sequence, consecutive from pos0, in the caller's region.
+    const i64 *row_pos = nullptr;
+    const i64 *row_kv_base = nullptr;
     i64 heads_per_group() const { return o_groups > 0 ? n_head / o_groups : 0; }
     i64 gout() const { return o_groups * o_lora; }
 };
@@ -1144,6 +1159,12 @@ public:
     // text that is not the model. The CPU reference implements both, and the
     // suite drives it, so "supported" has something behind it.
     virtual bool mla_supported() const { return false; }
+    // Whether the MLA ops honour MlaDesc/MlaSharedDesc::row_pos and row_kv_base,
+    // i.e. whether a layer can carry rows from different sequences. False by
+    // default for the same reason as attn_multiseq_supported(): a backend that
+    // ignores the tables reads its own region and returns fluent text from the
+    // wrong sequence, and the engine has no way to notice.
+    virtual bool mla_multiseq_supported() const { return false; }
     // cache[pos0 + t] = [ rmsnorm(proj[t][0..kv_lora)) * gamma | proj[t][kv_lora..) ]
     // from ONE [n_tok, kv_lora+rope] projection: the latent and the decoupled
     // key come from the same row, and only the latent half is normed.

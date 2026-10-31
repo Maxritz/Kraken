@@ -1799,7 +1799,10 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                 idx_state_kv_.resize(static_cast<size_t>(mc.n_layer));
                 idx_state_sc_.resize(static_cast<size_t>(mc.n_layer));
                 idx_key_.resize(static_cast<size_t>(mc.n_layer));
-                comp_nblocks_.assign(static_cast<size_t>(mc.n_layer), 0);
+                // Every buffer below is n_slots copies: one sequence's state each.
+                comp_nblocks_.assign(
+                    static_cast<size_t>(mc.n_layer) *
+                        static_cast<size_t>(n_slots_), 0);
                 i64 pool_rows = 0, state_w = 0, max_blocks = 0;
                 for (i32 i = 0; i < mc.n_layer; i++) {
                     const size_t k = static_cast<size_t>(i);
@@ -1808,12 +1811,16 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                     const i64 coff = r == kDsv4CsaRatio ? 2 : 1;
                     const i64 blocks = static_cast<i64>(cfg.n_ctx) / r + 2;
                     comp_state_kv_[k].assign(
-                        static_cast<size_t>(2 * r * coff * hd), 0.0f);
+                        static_cast<size_t>(2 * r * coff * hd) *
+                            static_cast<size_t>(n_slots_), 0.0f);
                     comp_state_sc_[k].assign(
-                        static_cast<size_t>(2 * r * coff * hd), 0.0f);
+                        static_cast<size_t>(2 * r * coff * hd) *
+                            static_cast<size_t>(n_slots_), 0.0f);
                     comp_pooled_[k].assign(
-                        static_cast<size_t>(blocks * hd), 0.0f);
-                    comp_kpos_[k].assign(static_cast<size_t>(blocks), 0);
+                        static_cast<size_t>(blocks * hd) *
+                            static_cast<size_t>(n_slots_), 0.0f);
+                    comp_kpos_[k].assign(
+                        static_cast<size_t>(blocks) * static_cast<size_t>(n_slots_), 0);
                     if (r == kDsv4CsaRatio) {
                         if (mc.idx_head_dim <= 0 || mc.idx_n_head <= 0) {
                             KRK_ERROR("compressed attention: a CSA layer needs "
@@ -1822,13 +1829,14 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                             return false;
                         }
                         idx_state_kv_[k].assign(
-                            static_cast<size_t>(2 * r * 2 * mc.idx_head_dim),
-                            0.0f);
+                            static_cast<size_t>(2 * r * 2 * mc.idx_head_dim) *
+                                static_cast<size_t>(n_slots_), 0.0f);
                         idx_state_sc_[k].assign(
-                            static_cast<size_t>(2 * r * 2 * mc.idx_head_dim),
-                            0.0f);
+                            static_cast<size_t>(2 * r * 2 * mc.idx_head_dim) *
+                                static_cast<size_t>(n_slots_), 0.0f);
                         idx_key_[k].assign(
-                            static_cast<size_t>(blocks * mc.idx_head_dim), 0.0f);
+                            static_cast<size_t>(blocks * mc.idx_head_dim) *
+                                static_cast<size_t>(n_slots_), 0.0f);
                     }
                     pool_rows = std::max(pool_rows, coff * r);
                     state_w = std::max(state_w, coff * hd);
@@ -4231,6 +4239,16 @@ bool Engine::rope_chunk(void *q, void *k, i64 lh, i64 lkvh, i64 hd, i32 n,
     return true;
 }
 
+const i64 *Engine::row_kv_bases(i32 n, i64 pos_stride) {
+    if (!fwd_row_slot_) return nullptr;
+    fwd_kv_base_row_.resize(static_cast<size_t>(n));
+    const i64 slot_rows = kv_cap_ * pos_stride;
+    for (i32 t = 0; t < n; t++)
+        fwd_kv_base_row_[static_cast<size_t>(t)] =
+            static_cast<i64>(fwd_row_slot_[t]) * slot_rows;
+    return fwd_kv_base_row_.data();
+}
+
 bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     KRK_TRACE_COMP("forward-core");
     forward_error_.clear();
@@ -4482,12 +4500,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // base is built per layer because pos_stride is per layer and, for
             // an int8 cache, is counted in BYTES -- the same units the append
             // and the attention add it in.
-            fwd_kv_base_row_.resize(static_cast<size_t>(n));
-            const i64 slot_rows = kv_cap_ * d.pos_stride;
-            for (i32 t = 0; t < n; t++)
-                fwd_kv_base_row_[static_cast<size_t>(t)] =
-                    static_cast<i64>(fwd_row_slot_[t]) * slot_rows;
-            d.row_kv_base = fwd_kv_base_row_.data();
+            d.row_kv_base = row_kv_bases(n, d.pos_stride);
             d.row_pos = fwd_row_pos_;
         }
         dump_stage("enter", l);
@@ -8593,6 +8606,11 @@ bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     d.n_tok = n;
     d.pos0 = pos0;
     d.pos_stride = row;
+    // A batched pass carries rows from different sequences: each row reads and
+    // writes its own region of this layer's plane and rotates at its own
+    // position. Null tables leave the single-sequence address exactly as it was.
+    d.row_kv_base = row_kv_bases(n, row);
+    d.row_pos = fwd_row_pos_;
     // The reference's kq_scale for this family: mscale^2 / sqrt(key_length),
     // which is NOT 1/sqrt(v_dim) and not 1/sqrt(rope) -- the score is a dot
     // over the whole per-head key, nope + rope -- and not plain 1/sqrt(qk)
@@ -8722,6 +8740,11 @@ bool Engine::mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     sd.pos0 = pos0;
     // One row: K and V are the same latent, so the stride IS the row.
     sd.pos_stride = d;
+    // A batched pass carries rows from different sequences: each row rotates at
+    // its own position and reads and writes its own region of this layer's
+    // plane. Null tables (any single-sequence pass) leave the address alone.
+    sd.row_kv_base = row_kv_bases(n, d);
+    sd.row_pos = fwd_row_pos_;
     // The score is a dot over the whole latent, so this is 1/sqrt(key_length)
     // and nothing else. The mscale correction belongs to the lite (V2/V3)
     // family's YaRN files and is deliberately NOT applied here: the reference's
@@ -8907,6 +8930,9 @@ bool Engine::mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
     sd.n_tok = n;
     sd.pos0 = pos0;
     sd.pos_stride = d;
+    // Same rule as the lite path: a row carries its own position and region.
+    sd.row_kv_base = row_kv_bases(n, d);
+    sd.row_pos = fwd_row_pos_;
     sd.scale = 1.0f / std::sqrt(static_cast<f32>(d));
     sd.eps = mc.rms_eps;
     sd.window = mc.dsv4_window > 0 ? mc.dsv4_window : 0;
@@ -8924,16 +8950,56 @@ bool Engine::mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
     const f32 *host_xn = static_cast<const f32 *>(ws_xn_);
     const f32 *host_ql = static_cast<const f32 *>(ws_mlaqn_);
     const f32 *host_q = static_cast<const f32 *>(ws_q_);
-    f32 *pooled = comp_pooled_[li].data();
-    i64 *kpos = comp_kpos_[li].data();
     const i64 prows = coff * ratio;
+    // One sequence's copy of this layer's state: the compressor ring, the pooled
+    // keys and their positions, the indexer's state and keys, and the block
+    // count. Each buffer holds n_slots copies, so a batch's rows each find their
+    // own; with one slot every offset below is 0 and the arithmetic is what it
+    // has always been.
+    auto span_of = [&](const std::vector<f32> &v) -> i64 {
+        return static_cast<i64>(v.size() / static_cast<size_t>(n_slots_));
+    };
+    auto ispan_of = [&](const std::vector<i64> &v) -> i64 {
+        return static_cast<i64>(v.size() / static_cast<size_t>(n_slots_));
+    };
     const f32 iw_scale = csa ? 1.0f / std::sqrt(static_cast<f32>(ih * inh)) : 0.0f;
 
     for (i32 t = 0; t < n; t++) {
-        const i64 pos = pos0 + t;
+        // The row's own position. A batched pass gives every row one, and pos0
+        // is only the origin when there is one sequence; using pos0 + t here
+        // would key the compressor's ring and every pooled position off the
+        // wrong token, which produces fluent text from a shifted history.
+        const i64 pos = fwd_row_pos_ ? fwd_row_pos_[t] : pos0 + t;
+        // This row's sequence, and that sequence's state below. `sq` is 0 for
+        // every pass that carries one sequence, which is every caller before the
+        // batched decode loop.
+        const i32 sq = fwd_row_slot_ ? fwd_row_slot_[t] : 0;
+        f32 *st_kv = comp_state_kv_[li].data() + sq * span_of(comp_state_kv_[li]);
+        f32 *st_sc = comp_state_sc_[li].data() + sq * span_of(comp_state_sc_[li]);
+        f32 *pooled = comp_pooled_[li].data() + sq * span_of(comp_pooled_[li]);
+        i64 *kpos = comp_kpos_[li].data() + sq * ispan_of(comp_kpos_[li]);
+        f32 *ix_kv = csa ? idx_state_kv_[li].data() +
+                               sq * span_of(idx_state_kv_[li])
+                         : nullptr;
+        f32 *ix_sc = csa ? idx_state_sc_[li].data() +
+                               sq * span_of(idx_state_sc_[li])
+                         : nullptr;
+        f32 *ikey = csa ? idx_key_[li].data() + sq * span_of(idx_key_[li]) : nullptr;
+        i64 &nblocks = comp_nblocks_[static_cast<size_t>(li) *
+                                         static_cast<size_t>(n_slots_) +
+                                     static_cast<size_t>(sq)];
         MlaSharedDesc one = sd;
         one.n_tok = 1;
         one.pos0 = pos;
+        // The row's own address, in the units mla_shared_* read: its position
+        // and the start of its region of this layer's plane. Set only for a
+        // batch, so a single-sequence pass runs the same instructions as before.
+        i64 one_base = 0;
+        if (fwd_row_pos_) {
+            one_base = sd.row_kv_base ? sd.row_kv_base[t] : 0;
+            one.row_pos = &one.pos0;
+            one.row_kv_base = &one_base;
+        }
         // 1. the latent row, written before it is read: row pos is visible to
         //    itself, exactly as in the dense path.
         be_->mla_shared_latent(
@@ -8950,9 +9016,9 @@ bool Engine::mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
                       static_cast<int>(l), static_cast<long long>(pos));
             return false;
         }
-        std::memcpy(comp_state_kv_[li].data() + slot * sw, comp_row_kv_.data(),
+        std::memcpy(st_kv + slot * sw, comp_row_kv_.data(),
                     static_cast<size_t>(sw) * sizeof(f32));
-        std::memcpy(comp_state_sc_[li].data() + slot * sw, comp_row_sc_.data(),
+        std::memcpy(st_sc + slot * sw, comp_row_sc_.data(),
                     static_cast<size_t>(sw) * sizeof(f32));
         if (csa) {
             const i64 islot =
@@ -8964,16 +9030,14 @@ bool Engine::mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
                           static_cast<int>(l), static_cast<long long>(pos));
                 return false;
             }
-            std::memcpy(idx_state_kv_[li].data() + islot * 2 * ih,
-                        comp_idx_kv_.data(),
+            std::memcpy(ix_kv + islot * 2 * ih, comp_idx_kv_.data(),
                         static_cast<size_t>(2 * ih) * sizeof(f32));
-            std::memcpy(idx_state_sc_[li].data() + islot * 2 * ih,
-                        comp_idx_sc_.data(),
+            std::memcpy(ix_sc + islot * 2 * ih, comp_idx_sc_.data(),
                         static_cast<size_t>(2 * ih) * sizeof(f32));
         }
         // 3. the attention for THIS row, over the raw window and the pooled
         //    keys of the blocks that are already complete.
-        i64 nb = comp_nblocks_[li];
+        i64 nb = nblocks;
         const i32 *sel = nullptr;
         i64 nsel = 0;
         if (csa && nb > 0) {
@@ -9001,7 +9065,7 @@ bool Engine::mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
                 comp_iw_[static_cast<size_t>(h2)] = s2 * iw_scale;
             }
             if (!dsv4_indexer_scores(static_cast<i32>(inh), static_cast<i32>(ih),
-                                     comp_iq_.data(), idx_key_[li].data(),
+                                     comp_iq_.data(), ikey,
                                      comp_iw_.data(), nullptr,
                                      static_cast<i32>(nb), comp_score_.data())) {
                 KRK_ERROR("mla-shared-compressed: layer %d indexer scores",
@@ -9048,10 +9112,10 @@ bool Engine::mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
                     src = ((b - 1) % 2) * ratio + k2;
                 }
                 std::memcpy(&comp_pool_kv_[static_cast<size_t>(k2 * sw)],
-                            comp_state_kv_[li].data() + src * sw,
+                            st_kv + src * sw,
                             static_cast<size_t>(sw) * sizeof(f32));
                 std::memcpy(&comp_pool_sc_[static_cast<size_t>(k2 * sw)],
-                            comp_state_sc_[li].data() + src * sw,
+                            st_sc + src * sw,
                             static_cast<size_t>(sw) * sizeof(f32));
             }
             if (!dsv4_comp_pool(cc, comp_pool_kv_.data(), comp_pool_sc_.data(),
@@ -9079,13 +9143,13 @@ bool Engine::mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
                         src = ((b - 1) % 2) * ratio + k2;
                     }
                     std::memcpy(&comp_pool_kv_[static_cast<size_t>(k2 * 2 * ih)],
-                                idx_state_kv_[li].data() + src * 2 * ih,
+                                ix_kv + src * 2 * ih,
                                 static_cast<size_t>(2 * ih) * sizeof(f32));
                     std::memcpy(&comp_pool_sc_[static_cast<size_t>(k2 * 2 * ih)],
-                                idx_state_sc_[li].data() + src * 2 * ih,
+                                ix_sc + src * 2 * ih,
                                 static_cast<size_t>(2 * ih) * sizeof(f32));
                 }
-                f32 *iout = &idx_key_[li][static_cast<size_t>(nb * ih)];
+                f32 *iout = ikey + nb * ih;
                 if (!dsv4_comp_pool(ic, comp_pool_kv_.data(),
                                     comp_pool_sc_.data(), iout)) {
                     KRK_ERROR("mla-shared-compressed: layer %d indexer pool of "
@@ -9099,7 +9163,7 @@ bool Engine::mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
                 dsv4_comp_rope(iout, static_cast<i32>(ih), static_cast<i32>(rope),
                                kpos[nb], mc.dsv4_compress_rope_base);
             }
-            comp_nblocks_[li] = nb + 1;
+            nblocks = nb + 1;
         }
     }
     kvt_k_.end_layer(l);
@@ -14855,11 +14919,11 @@ std::string Engine::batch_refusal() const {
         return "a masked-diffusion pass denoises one sequence and appends no KV";
     if (model_.is_recurrent())
         return "a recurrent model keeps one sequence's delta-rule state";
-    if (mc.mla)
-        return "MLA attention addresses its own cache layout and does not take a "
-               "per-row base yet";
-    if (!comp_nblocks_.empty())
-        return "compressed attention (CSA/HCA) pools keys per sequence";
+    // MLA and the V4 compressed layers are addressable per row (see
+    // mla_multiseq_supported and the per-slot state in mla_shared_compressed).
+    // A backend that has not implemented that says so here.
+    if (mc.mla && !be_->mla_multiseq_supported())
+        return "this backend's latent attention does not address its cache per row";
     if (qsa_active_ || msa_active_)
         return "the block indexer selects keys per sequence";
     if (hc_active_)

@@ -10713,6 +10713,60 @@ public:
         inner_->logits_topk(lg, n, k, pm, rp, sc, tp, ids, vals, mass_out,
                             scratch, cand_cap, count_out);
     }
+    // The batch's per-row contract, answered from a flag: the refusal has to be
+    // observable on a backend that cannot address its caches by row, and that is
+    // the state a device backend is in until it implements the tables.
+    bool attn_multiseq_supported() const override {
+        return force_no_attn_rows_ ? false : inner_->attn_multiseq_supported();
+    }
+    bool mla_multiseq_supported() const override {
+        return force_no_mla_rows_ ? false : inner_->mla_multiseq_supported();
+    }
+    void set_test_no_row_addressing(bool attn, bool mla) {
+        force_no_attn_rows_ = attn;
+        force_no_mla_rows_ = mla;
+    }
+    // The latent-attention family, forwarded whole: a wrapper that claimed
+    // mla_supported() and dropped these would be the very backend the refusal
+    // exists to keep off a batch.
+    bool mla_supported() const override { return inner_->mla_supported(); }
+    void mla_kv_write(void *cache, const void *proj, const void *gamma,
+                      const MlaDesc &d) override {
+        inner_->mla_kv_write(cache, proj, gamma, d);
+    }
+    void mla_attention(void *out, const void *q, const void *cache,
+                       const void *wkv_b, const MlaDesc &d) override {
+        inner_->mla_attention(out, q, cache, wkv_b, d);
+    }
+    bool mla_shared_supported() const override {
+        return inner_->mla_shared_supported();
+    }
+    void mla_shared_latent(void *cache, const void *proj, const void *gamma,
+                           const MlaSharedDesc &d) override {
+        inner_->mla_shared_latent(cache, proj, gamma, d);
+    }
+    void mla_shared_attention(void *a, const void *q, const void *cache,
+                              const MlaSharedDesc &d) override {
+        inner_->mla_shared_attention(a, q, cache, d);
+    }
+    bool mla_shared_compressed_supported() const override {
+        return inner_->mla_shared_compressed_supported();
+    }
+    void mla_shared_attention_compressed(void *a, const void *q,
+                                         const void *cache, const void *pooled,
+                                         const i64 *pooled_pos, i64 n_pooled,
+                                         const i32 *sel, i64 n_sel,
+                                         const MlaSharedDesc &d,
+                                         const f32 *compress_inv_freq) override {
+        inner_->mla_shared_attention_compressed(a, q, cache, pooled, pooled_pos,
+                                                n_pooled, sel, n_sel, d,
+                                                compress_inv_freq);
+    }
+    void mla_shared_output(void *out, const void *a, void *scratch,
+                           const void *wo_a, const void *wo_b,
+                           const MlaSharedDesc &d) override {
+        inner_->mla_shared_output(out, a, scratch, wo_a, wo_b, d);
+    }
     void rope(void *q, void *k, i64 nh, i64 nk, i64 hd, i64 nt, i64 p0,
               const f32 *iv, f32 s, f32 f, bool nx) override {
         inner_->rope(q, k, nh, nk, hd, nt, p0, iv, s, f, nx);
@@ -10841,6 +10895,8 @@ private:
     DeviceCaps fake_caps_;
     bool fake_hip_ = false;
     bool fake_host_load_ = false;
+    bool force_no_attn_rows_ = false;
+    bool force_no_mla_rows_ = false;
     bool fake_device_memory_ = false;
     bool fake_host_memory_ = false;
     size_t fake_device_total_ = 0;
@@ -31184,6 +31240,129 @@ static void test_batch_decode() {
                       std::string::npos,
                   tag + " reports its usage");
         }
+    }
+
+    // --- MLA: lite (V2/V3) and shared-latent (V4, dense and compressed) ----
+    // These are the families whose attention owns its cache layout -- the reason
+    // they were refused before the row tables reached them. Each arm compares
+    // against the model's own solo runs, because a wrong region base reads
+    // another sequence's history and still writes fluent text: that is the
+    // failure an exactness check catches and a crash does not.
+    auto mla_batch_arm = [&](const std::string &path, const MlaFix &fix,
+                             const char *label) {
+        const std::string tag = label;
+        if (!build_mla_fixture(path, fix)) {
+            CHECK(false, tag + ": the fixture writes");
+            return;
+        }
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = 4;
+        std::string err;
+        if (!engine.init(cpu, cfg, &err)) {
+            CHECK(false, tag + ": the engine initialises (" + err + ")");
+            return;
+        }
+        const std::string why = engine.batch_refusal();
+        CHECK(why.empty(), tag + " is batchable: " + why);
+        if (!why.empty()) return;
+        const char *mp[3] = {"the", "a the", "the the"};
+        const i32 ml[3] = {5, 5, 4};
+        std::vector<std::vector<i32>> solo(3);
+        for (int i = 0; i < 3; i++) {
+            GenerateParams p = params(mp[i], ml[i]);
+            GenerateResult r;
+            CHECK(engine.generate(p, &r), tag + ": solo run completes");
+            solo[static_cast<size_t>(i)] = r.tokens;
+        }
+        std::vector<GenerateParams> reqs;
+        for (int i = 0; i < 3; i++) reqs.push_back(params(mp[i], ml[i]));
+        std::vector<GenerateResult> outs;
+        CHECK(engine.generate_batch(reqs, &outs), tag + ": the wave runs");
+        for (int i = 0; i < 3 && i < static_cast<int>(outs.size()); i++) {
+            if (outs[static_cast<size_t>(i)].tokens != solo[static_cast<size_t>(i)]) {
+                std::string a, b;
+                for (i32 tok : solo[static_cast<size_t>(i)])
+                    a += std::to_string(tok) + " ";
+                for (i32 tok : outs[static_cast<size_t>(i)].tokens)
+                    b += std::to_string(tok) + " ";
+                std::fprintf(stderr, "  [dbg] %s slot %d solo=[%s] batch=[%s]\n",
+                             tag.c_str(), i, a.c_str(), b.c_str());
+            }
+            CHECK(outs[static_cast<size_t>(i)].tokens == solo[static_cast<size_t>(i)],
+                  tag + ": slot " + std::to_string(i) + " matches its solo run");
+        }
+        std::remove(path.c_str());
+    };
+
+    MlaFix mla_lite;
+    mla_lite.n_layer = 1;
+    mla_batch_arm("kraken-batch-mla-lite.gguf", mla_lite, "MLA lite (deepseek2)");
+
+    MlaFix mla_shared;
+    mla_shared.kind = MlaFixKind::Shared;
+    mla_shared.n_layer = 1;
+    mla_batch_arm("kraken-batch-mla-shared.gguf", mla_shared, "V4 shared-latent");
+
+    MlaFix mla_csa;
+    mla_csa.kind = MlaFixKind::Shared;
+    mla_csa.n_layer = 2;
+    mla_csa.ratios = {4, 128};   // layer 0 CSA (indexer), layer 1 HCA
+    mla_csa.idx_heads = 2;
+    mla_csa.idx_head = 8;
+    mla_csa.idx_top_k = 2;
+    mla_csa.ctx = 192;
+    mla_batch_arm("kraken-batch-dsv4-csa.gguf", mla_csa, "V4 CSA+HCA (compressed)");
+
+    // --- the negative controls: a backend that cannot address rows ----------
+    // The batch must not be enabled by the model's shape alone. These two arms
+    // take a backend that reports the plain cache per row (so the MLA refusal is
+    // the one under test) and then one that reports neither. The measured
+    // outcome is the refusal string and a FinishError per request: not a crash
+    // and, above all, not fluent text decoded through another sequence's ring.
+    {
+        MlaFix fix;
+        fix.n_layer = 1;
+        const std::string path = "kraken-batch-mla-narrow.gguf";
+        CHECK(build_mla_fixture(path, fix),
+              "wrote the V2-lite fixture for the refusal arms");
+        for (int arm = 0; arm < 2; arm++) {
+            CountingBackend narrow(make_cpu_backend());
+            // arm 0: rows are addressable, the LATENT cache is not.
+            // arm 1: neither is.
+            narrow.set_test_no_row_addressing(/*attn=*/arm != 0, /*mla=*/true);
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = path;
+            cfg.n_ctx = 32;
+            cfg.n_slots = 4;
+            std::string err;
+            const bool up = engine.init(&narrow, cfg, &err);
+            CHECK(up, "the engine initialises over the narrow backend: " + err);
+            if (!up) continue;
+            const std::string why = engine.batch_refusal();
+            const char *want = arm == 0 ? "per row" : "per row";
+            CHECK(why.find(want) != std::string::npos,
+                  std::string(arm == 0 ? "a backend without per-row latent attention"
+                                       : "a backend without per-row attention") +
+                      " is refused: " + why);
+            if (arm == 0)
+                CHECK(why.find("latent") != std::string::npos,
+                      "the MLA refusal names the latent cache, not the KV cache");
+            std::vector<GenerateParams> reqs;
+            for (int i = 0; i < 3; i++) reqs.push_back(params("the a", 3));
+            std::vector<GenerateResult> outs;
+            CHECK(!engine.generate_batch(reqs, &outs),
+                  "the wave is refused rather than run against one cache region");
+            bool all_err = outs.size() == 3;
+            for (const GenerateResult &r : outs)
+                all_err = all_err && r.finish == FinishError;
+            CHECK(all_err, "every request in the refused wave carries the error");
+        }
+        std::remove(path.c_str());
     }
 
     // --- more requests than slots is a refusal, not a crash -----------------

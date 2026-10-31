@@ -335,6 +335,22 @@ inline i64 attn_kv_base(const AttnDesc &d, i64 t) {
     return d.row_kv_base ? d.row_kv_base[t] : 0;
 }
 
+// The same two questions for the latent-attention descriptors: which position
+// is row t at, and where does its region start. Null tables are the historical
+// single-sequence answer, so every existing caller is bit-for-bit unchanged.
+inline i64 mla_pos(const MlaDesc &d, i64 t) {
+    return d.row_pos ? d.row_pos[t] : d.pos0 + t;
+}
+inline i64 mla_row_base(const MlaDesc &d, i64 t) {
+    return d.row_kv_base ? d.row_kv_base[t] : 0;
+}
+inline i64 mla_pos(const MlaSharedDesc &d, i64 t) {
+    return d.row_pos ? d.row_pos[t] : d.pos0 + t;
+}
+inline i64 mla_row_base(const MlaSharedDesc &d, i64 t) {
+    return d.row_kv_base ? d.row_kv_base[t] : 0;
+}
+
 // True when this call addresses more than one KV region. The gather path
 // copies one head's slices out of ONE contiguous run of keys, so it has no
 // meaning here and the per-row paths below are used instead.
@@ -1916,6 +1932,9 @@ public:
     // the same numbers -- a mismatch between them is arithmetic, never a
     // different weight.
     bool mla_supported() const override { return true; }
+    // mla_pos()/mla_row_base() are what make this true: every latent-attention
+    // op below resolves the row's own position and region start.
+    bool mla_multiseq_supported() const override { return true; }
 
     void mla_kv_write(void *cache, const void *proj, const void *gamma,
                       const MlaDesc &d) override {
@@ -1931,7 +1950,8 @@ public:
                 [&](i64 b, i64 e) {
                     for (i64 t = b; t < e; t++) {
                         const f32 *src = p + t * width;
-                        f32 *dst = c + (d.pos0 + t) * d.pos_stride;
+                        f32 *dst =
+                            c + mla_row_base(d, t) + mla_pos(d, t) * d.pos_stride;
                         // The norm covers the LATENT alone: the decoupled key
                         // is not normed, and it is cached UNROTATED.
                         f64 ss = 0.0;
@@ -1972,7 +1992,10 @@ public:
                     for (i64 u = b; u < e; u++) {
                         const i64 r = u / d.n_head;
                         const i64 h = u - r * d.n_head;
-                        const i64 pos = d.pos0 + r;
+                        const i64 pos = mla_pos(d, r);
+                        // The row's own KV region: its keys are that region's
+                        // prefix, at the positions they were written at.
+                        const f32 *cbase = cf + mla_row_base(d, r);
                         const i64 n_keys = pos + 1; // causal
                         const f32 *qrow =
                             qf + r * (d.n_head * d.qk) + h * d.qk;
@@ -2000,7 +2023,7 @@ public:
                         scores.assign(static_cast<size_t>(n_keys), 0.0f);
                         f32 mx = -1e30f;
                         for (i64 t = 0; t < n_keys; t++) {
-                            const f32 *c = cf + t * d.pos_stride;
+                            const f32 *c = cbase + t * d.pos_stride;
                             f32 s = 0.0f;
                             for (i64 k = 0; k < kv; k++)
                                 s += qk[static_cast<size_t>(k)] * c[k];
@@ -2030,7 +2053,7 @@ public:
                             f32 a = 0.0f;
                             for (i64 t = 0; t < n_keys; t++)
                                 a += scores[static_cast<size_t>(t)] *
-                                     cf[t * d.pos_stride + k];
+                                     cbase[t * d.pos_stride + k];
                             cv[static_cast<size_t>(k)] = a / sum;
                         }
                         f32 *oh = of + r * (d.n_head * vd) + h * vd;
@@ -2064,7 +2087,8 @@ public:
                 [&](i64 b, i64 e) {
                     for (i64 t = b; t < e; t++) {
                         const f32 *src = p + t * kv;
-                        f32 *dst = c + (d.pos0 + t) * d.pos_stride;
+                        f32 *dst =
+                            c + mla_row_base(d, t) + mla_pos(d, t) * d.pos_stride;
                         f64 ss = 0.0;
                         for (i64 i = 0; i < kv; i++) {
                             const f64 v = src[i];
@@ -2096,7 +2120,8 @@ public:
                     for (i64 u = b; u < e; u++) {
                         const i64 r = u / nh;
                         const i64 h = u - r * nh;
-                        const i64 pos = d.pos0 + r;
+                        const i64 pos = mla_pos(d, r);
+                        const f32 *cbase = cf + mla_row_base(d, r);
                         const f32 *qrow = qf + r * (nh * kv) + h * kv;
                         for (i64 i = 0; i < kv; i++) qr[static_cast<size_t>(i)] = qrow[i];
                         for (i64 i = 0; i + 1 < rope; i += 2) {
@@ -2113,7 +2138,7 @@ public:
                         p.assign(static_cast<size_t>(nk), 0.0f);
                         f32 mx = d.sinks ? d.sinks[h] : -1e30f;
                         for (i64 t = t_lo; t <= pos; t++) {
-                            const f32 *c = cf + t * d.pos_stride;
+                            const f32 *c = cbase + t * d.pos_stride;
                             for (i64 i = 0; i < kv; i++) kr[static_cast<size_t>(i)] = c[i];
                             for (i64 i = 0; i + 1 < rope; i += 2) {
                                 const f32 th =
@@ -2142,7 +2167,7 @@ public:
                             f32 acc = 0.0f;
                             for (i64 t = 0; t < nk; t++)
                                 acc += p[static_cast<size_t>(t)] /
-                                       sum * cf[(t_lo + t) * d.pos_stride + i];
+                                       sum * cbase[(t_lo + t) * d.pos_stride + i];
                             out[i] = acc;
                         }
                     }
@@ -2185,7 +2210,8 @@ public:
                     for (i64 u = b; u < e; u++) {
                         const i64 r = u / nh;
                         const i64 h = u - r * nh;
-                        const i64 pos = d.pos0 + r;
+                        const i64 pos = mla_pos(d, r);
+                        const f32 *cbase = cf + mla_row_base(d, r);
                         const f32 *qrow = qf + r * (nh * kv) + h * kv;
                         for (i64 i = 0; i < kv; i++) qr[static_cast<size_t>(i)] = qrow[i];
                         for (i64 i = 0; i + 1 < rope; i += 2) {
@@ -2221,7 +2247,7 @@ public:
                             return s * d.scale;
                         };
                         for (i64 t = t_lo; t <= pos; t++) {
-                            const f32 s = score_row(cf + t * d.pos_stride, t,
+                            const f32 s = score_row(cbase + t * d.pos_stride, t,
                                                     d.inv_freq);
                             p[static_cast<size_t>(t - t_lo)] = s;
                             if (s > mx) mx = s;
@@ -2246,7 +2272,7 @@ public:
                             f32 acc = 0.0f;
                             for (i64 t = 0; t < nk; t++)
                                 acc += p[static_cast<size_t>(t)] / sum *
-                                       cf[(t_lo + t) * d.pos_stride + i];
+                                       cbase[(t_lo + t) * d.pos_stride + i];
                             for (i64 j = 0; j < nsel; j++) {
                                 const i64 blk = sel ? sel[j] : j;
                                 acc += p[static_cast<size_t>(nk + j)] / sum *
