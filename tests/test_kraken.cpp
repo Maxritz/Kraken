@@ -31427,6 +31427,46 @@ static bool build_batch_bench_model(const std::string &path) {
         for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
         return v;
     };
+    // The expert tensors are f16 by default and Q8_0 under
+    // KRK_BATCH_BENCH_Q8=1. That switch exists to answer ONE question the wave's
+    // numbers ask: is a batched step limited by launches or by the f16 dot path?
+    // A real 8-bit checkpoint runs the int8 dot, which is several times faster
+    // per MAC, so the same wave on the same shape separates the two.
+    const bool q8_exps = [] {
+        const char *q = std::getenv("KRK_BATCH_BENCH_Q8");
+        return q && q[0] == '1';
+    }();
+    auto emit_exps = [&](const std::string &name, const std::vector<u64> &ne,
+                         const std::vector<f32> &v, i64 n_in) {
+        if (!q8_exps) {
+            b.tensor_f16(name, ne, v);
+            return;
+        }
+        const i64 rows = static_cast<i64>(v.size()) / n_in;
+        const i64 nblk = n_in / 32;
+        std::vector<u8> out(static_cast<size_t>(rows * nblk * 34));
+        size_t at = 0;
+        for (i64 r = 0; r < rows; r++) {
+            const f32 *x = v.data() + r * n_in;
+            for (i64 bi = 0; bi < nblk; bi++) {
+                const f32 *xs = x + bi * 32;
+                f32 amax = 0.0f;
+                for (i64 i = 0; i < 32; i++)
+                    amax = std::max(amax, std::fabs(xs[i]));
+                const f32 d = amax > 0.0f ? amax / 127.0f : 0.0f;
+                const f32 inv = d > 0.0f ? 1.0f / d : 0.0f;
+                const u16 h = fp32_to_fp16(d);
+                out[at++] = static_cast<u8>(h & 0xFF);
+                out[at++] = static_cast<u8>(h >> 8);
+                for (i64 i = 0; i < 32; i++) {
+                    i32 qv = static_cast<i32>(std::lround(xs[i] * inv));
+                    qv = std::max(-127, std::min(127, qv));
+                    out[at++] = static_cast<u8>(static_cast<i8>(qv));
+                }
+            }
+        }
+        b.tensor_raw(name, 8 /* Q8_0 */, ne, out.data(), out.size());
+    };
     std::vector<f32> ones(static_cast<size_t>(n_embd), 1.0f);
     b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
                  vec(static_cast<size_t>(n_embd) * vocab, 0));
@@ -31459,12 +31499,12 @@ static bool build_batch_bench_model(const std::string &path) {
             for (size_t k = 0; k < dsz; k++)
                 down[e * dsz + k] = wv(1300 + static_cast<i64>(k) + eb);
         }
-        b.tensor_f16(p_ + "ffn_gate_exps.weight",
-                     {u64(n_embd), u64(n_ff_exp), u64(ne)}, gate);
-        b.tensor_f16(p_ + "ffn_up_exps.weight",
-                     {u64(n_embd), u64(n_ff_exp), u64(ne)}, up);
-        b.tensor_f16(p_ + "ffn_down_exps.weight",
-                     {u64(n_ff_exp), u64(n_embd), u64(ne)}, down);
+        emit_exps(p_ + "ffn_gate_exps.weight",
+                  {u64(n_embd), u64(n_ff_exp), u64(ne)}, gate, n_embd);
+        emit_exps(p_ + "ffn_up_exps.weight",
+                  {u64(n_embd), u64(n_ff_exp), u64(ne)}, up, n_embd);
+        emit_exps(p_ + "ffn_down_exps.weight",
+                  {u64(n_ff_exp), u64(n_embd), u64(ne)}, down, n_ff_exp);
     }
     return b.write(path);
 }
@@ -31580,7 +31620,13 @@ static void test_batch_throughput() {
         const f64 serial_tps =
             1000.0 * static_cast<f64>(serial_tokens) / serial_med;
         const f64 batch_tps = 1000.0 * static_cast<f64>(batch_tokens) / batch_med;
-        std::fprintf(stderr,
+        const bool q8_exps_out = [] {
+        const char *q = std::getenv("KRK_BATCH_BENCH_Q8");
+        return q && q[0] == '1';
+    }();
+    std::fprintf(stderr, "  [batch] expert format: %s\n",
+                 q8_exps_out ? "Q8_0 (int8 dot)" : "f16");
+    std::fprintf(stderr,
                      "  [batch] %lld sequences x %lld token(s), median of %d: "
                      "serial %.1f tok/s (%.0f ms), batched %.1f tok/s (%.0f ms) "
                      "-> %.2fx aggregate\n",

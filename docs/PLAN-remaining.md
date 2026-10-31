@@ -393,30 +393,41 @@ in `test_batch_throughput` (8-expert fixture, 64 MB expert budget, median of 3):
 
 * The wave's expert traffic is the **union** of its rows' experts, not the sum:
   `(width * k) / union`. Over 8 experts with k=2 that saturates fast -- about
-  1.25x at width 4 and about 2x at width 8 -- which is why the win is bounded
-  by the pool, not by the code.
-* Per-row cost halves from width 4 to width 8 while the *aggregate* ratio falls.
-  That is the signature of the limiter: the wave step is **launch-bound**, not
-  weight-read-bound -- roughly 40 launches per layer (gather, gate/up, silu,
-  down, scatter per expert), against the ~4 the single-row path takes because
-  `moe_decode_batch` batches ALL of a token's experts into a few launches. The
-  1-row path is the fast one; the wave pays the fan-out.
+  1.25x at width 4 and about 2x at width 8 -- so the win is bounded by the pool,
+  not by the code.
+* **The win is not a compute artifact, and it is not launch overhead either.**
+  The same sweep on the same shape with Q8_0 experts (the int8 dot path, which
+  is ~1.7x faster per token than the fixture's f16 one) keeps the win and even
+  grows it at width 8:
+
+  | experts | serial | batched | aggregate |
+  |---|---|---|---|
+  | f16 | 75 / 63 tok/s | 101 / 87 tok/s | 1.34x (w4) / 1.38x (w8) |
+  | Q8_0 | 130 / 131 tok/s | 144 / 168 tok/s | 1.11x (w4) / 1.28x (w8) |
+
+  So batching pays for something that survives a 1.7x faster dot path -- weight
+  traffic and per-step fixed cost -- while the absolute number nearly doubles
+  when the weights are 8-bit. The width-8 ratio moves between 1.07x and 1.38x
+  across runs on this machine, which is the noise floor these claims live in.
 * A group of exactly one row no longer pays its gather (`KRK_MOE_GATHER=0` is the
   control arm): the row already exists in the activation block, so the copy is
   skipped and the GEMMs read it in place. On this fixture the arm measures
-  **inside the noise** (1.35x/1.13x against 1.41x/1.07x, i.e. the two arms
-  bracket each other) -- it is kept because it is strictly less work, not because
-  a number here can see it. It matters in the regime it was written for: a wide
-  expert pool (128-256) where a wave of 4 rarely lands two rows on one expert, so
-  every group is a group of one.
+  **inside the noise** (the two arms bracket each other) -- kept because it is
+  strictly less work, not because a number here can see it. It matters in the
+  regime it was written for: a wide expert pool (128-256) where a wave of 4
+  rarely lands two rows on one expert, so every group is a group of one.
 
-**The next lever, scoped:** a grouped MoE GEMM -- one call for all experts' gate
-and up over the stacked plan, one for the downs -- which is what removes the
-per-expert launch fan-out above. It needs a backend op with per-matrix activation
-pointers and row ranges (`gemm_group` takes ONE `x` today, which is exactly why
-the wave cannot express it). Not attempted here: it is a kernel plus a backend
-contract, and this section is closed on evidence that the arithmetic it targets
-is launch overhead rather than the expert read.
+**The next lever, and why it is parked.** The candidate was a grouped MoE GEMM:
+one call for all experts' gate/up over the stacked plan, one for the downs,
+removing the per-expert call fan-out (~40 per layer). It is **not built**, and
+the reason is the measurement above rather than the effort: the wave already
+wins in both weight formats, and the format control shows the win is not
+explained by the dot path. Before writing a kernel for launch overhead, the
+engine's own component table (`--profile`) has to say that the per-expert calls
+cost more than the GEMMs inside them; until it does, a grouped GEMM would be a
+kernel built on a hypothesis this table does not support. The experiment is
+one run of the batched arm with `--profile` and a comparison of `moe.experts.batch`
+against its child GEMM rows.
 
 ### B3 -- A trace file carries no identity -- DONE
 
