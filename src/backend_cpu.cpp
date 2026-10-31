@@ -1272,6 +1272,24 @@ public:
         rope_apply(static_cast<f32 *>(k), n_kv, hd, n_tok, pos0, inv_freq, scale, frac, neox);
     }
 
+    // The reference implementation of the batched form: the same rope_apply,
+    // once per row, with that row's own position. The arithmetic is literally
+    // the single-sequence code, which is what makes it an oracle for a device
+    // kernel that batches the rotations.
+    bool rope_rows(void *q, void *k, i64 n_head, i64 n_kv, i64 hd, i64 n_tok,
+                   const i64 *row_pos, const f32 *inv_freq, f32 scale, f32 frac,
+                   bool neox) override {
+        KRK_KTIME("rope");
+        npu_flush_();
+        for (i64 t = 0; t < n_tok; t++) {
+            rope_apply(static_cast<f32 *>(q) + t * n_head * hd, n_head, hd, 1, 0,
+                       inv_freq, scale, frac, neox, row_pos + t);
+            rope_apply(static_cast<f32 *>(k) + t * n_kv * hd, n_kv, hd, 1, 0,
+                       inv_freq, scale, frac, neox, row_pos + t);
+        }
+        return true;
+    }
+
     void qk_norm(void *q, void *k, const f32 *wq, const f32 *wk, i64 n_head,
                  i64 n_kv, i64 hd, i64 n_tok, f32 eps, bool wide) override {
         // Both arms of this are one RMSNorm per row with a row-wide weight, so
@@ -1343,8 +1361,11 @@ public:
                             const bool is_v = u >= d.n_tok;
                             const i64 t = is_v ? u - d.n_tok : u;
                             const f32 *src = (is_v ? vs : ks) + t * kv_dim;
-                            u8 *row =
-                                (is_v ? vc : kc) + (d.pos0 + t) * d.pos_stride;
+                            // Per-row base and position: zero and pos0 + t for
+                            // every caller that does not set the tables, so this
+                            // is the old address for the old shape.
+                            u8 *row = (is_v ? vc : kc) + attn_kv_base(d, t) +
+                                      attn_pos(d, t) * d.pos_stride;
                             f32 *sc = reinterpret_cast<f32 *>(row + kv_dim);
                             for (i64 o = 0; o < kv_dim; o += 32) {
                                 const i64 nn = std::min<i64>(32, kv_dim - o);
@@ -1373,7 +1394,8 @@ public:
         par_for(d.n_tok, 4, 2.0 * static_cast<f64>(d.n_tok) * d.pos_stride,
                 [&](i64 b, i64 e) {
                     for (i64 t = b; t < e; t++) {
-                        const i64 dst = (d.pos0 + t) * d.pos_stride;
+                        const i64 dst = attn_kv_base(d, t) +
+                                        attn_pos(d, t) * d.pos_stride;
                         std::memcpy(kc + dst, ks + t * d.pos_stride,
                                     static_cast<size_t>(d.pos_stride) * 4);
                         std::memcpy(vc + dst, vs + t * d.pos_stride,
@@ -1450,9 +1472,14 @@ public:
                 for (const auto &rn : runs) {
                     for (i64 j = rn.first; j < rn.second; j++, k++) {
                         const char *kb = static_cast<const char *>(kcache);
+                        // Base in ELEMENTS plus j's stride, the same address
+                        // every other attention path forms. This one used to
+                        // multiply the region base by pos_stride as well, which
+                        // was invisible while no caller set row_kv_base and
+                        // would have read past the cache as soon as one did.
                         const i64 off = (d.layer * d.layer_stride +
-                                         (attn_kv_base(d, t) + j) * d.pos_stride +
-                                         kh * hd);
+                                         attn_kv_base(d, t) +
+                                         j * d.pos_stride + kh * hd);
                         const f32 *kv = reinterpret_cast<const f32 *>(kb + off * 4);
                         f32 s = 0.0f;
                         for (i64 i = 0; i < hd; i++) s += qh[i] * kv[i];
@@ -1481,9 +1508,14 @@ public:
                     for (i64 j = rn.first; j < rn.second; j++, k++) {
                         const f32 p = sc[static_cast<size_t>(k)] * inv;
                         const char *vb = static_cast<const char *>(vcache);
+                        // Base in ELEMENTS plus j's stride, the same address
+                        // every other attention path forms. This one used to
+                        // multiply the region base by pos_stride as well, which
+                        // was invisible while no caller set row_kv_base and
+                        // would have read past the cache as soon as one did.
                         const i64 off = (d.layer * d.layer_stride +
-                                         (attn_kv_base(d, t) + j) * d.pos_stride +
-                                         kh * hd);
+                                         attn_kv_base(d, t) +
+                                         j * d.pos_stride + kh * hd);
                         const f32 *vv = reinterpret_cast<const f32 *>(vb + off * 4);
                         for (i64 i = 0; i < hd; i++) oh[i] += p * vv[i];
                     }
@@ -3127,8 +3159,12 @@ private:
     // the only difference is *which* channels a pair is made of — and since
     // only the relative rotation between q and k reaches the score, that is
     // the difference between the reference answer and a plausible wrong one.
+    // `row_pos` (optional) is the per-row position table: row t rotates at
+    // row_pos[t] instead of pos0 + t, which is the only difference between a
+    // single sequence's prefill and a batch of rows from different sequences.
     static void rope_apply(f32 *x, i64 n_heads, i64 hd, i64 n_tok, i64 pos0,
-                           const f32 *inv_freq, f32 scale, f32 frac, bool neox) {
+                           const f32 *inv_freq, f32 scale, f32 frac, bool neox,
+                           const i64 *row_pos = nullptr) {
         const i64 half = hd / 2;
         const i64 rot = std::max<i64>(1, static_cast<i64>(static_cast<f32>(half) * frac));
         const f32 s = scale > 0 ? scale : 1.0f;
@@ -3139,7 +3175,8 @@ private:
                     for (i64 u = b; u < e; u++) {
                         const i64 t = u / n_heads;
                         const i64 h = u - t * n_heads;
-                        const f32 p = static_cast<f32>(pos0 + t) / s;
+                        const f32 p = static_cast<f32>(row_pos ? row_pos[t]
+                                                              : pos0 + t) / s;
                         f32 *hx = x + (t * n_heads + h) * hd;
                         for (i64 i = 0; i < rot && i < half; i++) {
                             const f32 theta = p * inv_freq[i];

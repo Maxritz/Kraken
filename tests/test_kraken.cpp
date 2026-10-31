@@ -776,6 +776,65 @@ static void test_gemm_batched_bit_identical() {
               "the 16-lane scale-table kernel is the no-table kernel, bit for bit");
     }
 
+    // ---- the two q8_0 x8 prefill kernels the engine can pick --------------
+    // They differ in uops, not in arithmetic: the 16-lane table holds the same
+    // two f32 the kernel would decode from the row header. So byte equality is
+    // the gate -- a kernel that is faster because it reassociated the sum is a
+    // different model, and on a real file that reads as a slightly worse token.
+    // Without this, "the table is free" is a claim about speed that nothing
+    // pins to the same arithmetic.
+    //
+    // A third kernel (the pair table) was measured slower and lives in
+    // tools/bench_q80_gemm.cpp, which checks it byte-identical to x8 every run;
+    // it is deliberately not referenced here, because the suite is about what
+    // ships.
+    {
+        constexpr i64 nk = 512;      // 16 blocks = 8 block pairs
+        constexpr i64 nrows_k = 8;   // the tile the kernels are built around
+        constexpr i64 nout_k = 16;
+        const i64 nbk = nk / 32, npair_k = nbk / 2;
+        const i64 rb = nk + 2 * nbk; // q8_0 block: 2-byte header + 32 weights
+        std::vector<u8> wk(static_cast<size_t>(nout_k) * static_cast<size_t>(rb));
+        for (i64 o = 0; o < nout_k; o++) {
+            for (i64 b = 0; b < nbk; b++) {
+                u8 *p = wk.data() + static_cast<size_t>(o * rb) +
+                        static_cast<size_t>(b * 34);
+                const u16 dh = fp32_to_fp16(0.004f + 0.0007f *
+                                                       static_cast<f32>(b + 3 * o));
+                p[0] = static_cast<u8>(dh & 0xFF);
+                p[1] = static_cast<u8>(dh >> 8);
+                for (int i = 0; i < 32; i++)
+                    p[2 + i] = static_cast<u8>(
+                        static_cast<i8>(static_cast<i32>(rnd() % 255) - 127));
+            }
+        }
+        std::vector<f32> xf(static_cast<size_t>(nrows_k) * static_cast<size_t>(nk));
+        for (auto &v : xf)
+            v = static_cast<f32>(static_cast<i32>(rnd() % 2001) - 1000) / 1000.0f;
+        std::vector<i8> xq(xf.size());
+        std::vector<f32> xd(static_cast<size_t>(nrows_k) * static_cast<size_t>(nbk));
+        for (i64 r = 0; r < nrows_k; r++)
+            quantize_q8_row(xf.data() + r * nk, nk, xq.data() + r * nk,
+                            xd.data() + r * nbk);
+        std::vector<f32> wsc(static_cast<size_t>(nout_k * npair_k) * 16);
+        std::vector<f32> xsc(static_cast<size_t>(nrows_k * npair_k) * 16);
+        build_q8_0_wscales(wk.data(), rb, nout_k, nk, wsc.data());
+        build_q8_0_xscales(xd.data(), nbk, nrows_k, nk, xsc.data());
+        const size_t cells = static_cast<size_t>(nrows_k * nout_k);
+        std::vector<f32> kx8(cells, 0.0f), kwsc(cells, 0.0f);
+        for (i64 o = 0; o < nout_k; o++) {
+            const u8 *wr = wk.data() + static_cast<size_t>(o) * static_cast<size_t>(rb);
+            dot_q8_0_q8_x8(wr, xq.data(), xd.data(), nk, nk, nbk, kx8.data() + o,
+                           nout_k);
+            dot_q8_0_q8_wsc8(wr, xq.data(), xd.data(), nk, nk, nbk, kwsc.data() + o,
+                             nout_k,
+                             wsc.data() + static_cast<size_t>(o * npair_k) * 16,
+                             xsc.data());
+        }
+        CHECK(std::memcmp(kx8.data(), kwsc.data(), cells * sizeof(f32)) == 0,
+              "the 16-lane table kernel is the no-table kernel, bit for bit");
+    }
+
     set_vec_dot_fast(false);
     set_vec_dot_avx2(false);
 }

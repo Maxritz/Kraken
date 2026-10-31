@@ -1,9 +1,9 @@
 {
   "format": 1,
   "suite": "kraken-tests",
-  "recorded_utc": "2026-10-31T15:34:15Z",
-  "recorded_commit": "33189b5",
-  "totals": {"groups": 175, "passed": 7401, "run": 7401, "exit": 0},
+  "recorded_utc": "2026-10-31T15:42:27Z",
+  "recorded_commit": "aa80885",
+  "totals": {"groups": 175, "passed": 7402, "run": 7402, "exit": 0},
   "groups": [
     {"name": "test_quant_geometry", "status": "pass", "passed": 46, "run": 46},
     {"name": "test_q4_0_layout", "status": "pass", "passed": 32, "run": 32},
@@ -13,7 +13,7 @@
     {"name": "test_dspark_head_set", "status": "pass", "passed": 19, "run": 19},
     {"name": "test_msa_block_sparse", "status": "pass", "passed": 15, "run": 15},
     {"name": "test_vec_dot_fast_opt_in", "status": "pass", "passed": 4, "run": 4},
-    {"name": "test_gemm_batched_bit_identical", "status": "pass", "passed": 101, "run": 101},
+    {"name": "test_gemm_batched_bit_identical", "status": "pass", "passed": 102, "run": 102},
     {"name": "test_dump_identity", "status": "pass", "passed": 17, "run": 17},
     {"name": "test_cancel_and_prefix", "status": "pass", "passed": 24, "run": 24},
     {"name": "test_vec_dot_avx2_matches_fast", "status": "pass", "passed": 2, "run": 2},

@@ -144,8 +144,14 @@ result:
   the 16-lane scale-table kernel (`dot_q8_0_q8_wsc8`) since the table landed.
 * In `kraken-q80-gemm-bench` on this host, same process, same shape
   (768x2048x512, nc=128, best of five, four runs): **wsc8 48.1-49.1 GMAC/s**
-  against **x8 34.0-35.7**. The shipping kernel is therefore at **~60 % of V1**,
-  not 40 %.
+  against **x8 34.0-35.7**, i.e. the shipped kernel is **1.40x the one the
+  ablation calls "production"**.
+* The distance to V1 is **not resolvable on this host**: `kraken-isa-ceiling`
+  measures the shipped kernel against V1 in one process and returns 70 % in one
+  call and 110 % in the next, same function, same data. That 1.5x spread is the
+  noise floor, so a "60 % of V1" claim would be as unfounded as the "40 %" one --
+  what can be said is "within the host's noise of its own instruction-mix
+  ceiling".
 
 | kernel | r1 | r2 | r3 | r4 |
 |---|---:|---:|---:|---:|
@@ -185,12 +191,19 @@ numbers are about.
 **What this means for the target.** Do the arithmetic with the number this node
 measures, not the one the plan assumed. A 30B-A3B-class token is ~3 GMAC; at
 48-49 GMAC/s that is **~16 tok/s of prefill per core**, so four cores project to
-**~64 tok/s**, not 200. The kernel is at the V1 mix ceiling (see
-[GEMM-PERF-WALL.md](GEMM-PERF-WALL.md), "The prefill GEMM is at its own
-ceiling"), so no legal kernel change closes the 3x: it needs a format whose scale
-group is longer than 32 by construction (a format decision, A6-adjacent) or
+**~64 tok/s**, not 200. The kernel is within this host's noise of its own
+instruction-mix ceiling (see [GEMM-PERF-WALL.md](GEMM-PERF-WALL.md), "What B1
+closes as"), so no legal kernel change closes the 3x: it needs a format whose
+scale group is longer than 32 by construction (a format decision, A6-adjacent) or
 hardware with AMX-class MACs. Stating the projection is the point of B1.4; a
 projection that assumed the 40 % premise would have promised 300.
+
+**One number in the ceiling tool is a harness artifact, and it was nearly
+mistaken for a win.** `kraken-isa-ceiling`'s `W` arm prints 1.38x over the
+shipped kernel -- but its activation scale table is built from constants outside
+the timed loop, so it prices a kernel that needs no activation scale at all
+(that is L1, the rung the ablation shows is free). Recorded in GEMM-PERF-WALL.md
+so it is not picked up later as "a 1.38x we never took".
 
 ### B2 -- The server runs one generation at a time
 
@@ -243,28 +256,53 @@ covers rows the first request generated.
 loses the tail) and asserts the claim equals the longest prefix the record and
 the new prompt share -- no over-claim, nothing left on the table.
 
-**B2.3 continuous batching -- OPEN, and it is an engine change.** The enabling
-interface exists: `AttnDesc::row_pos` / `row_kv_base` are implemented in the CPU
-attention path and pinned by `kraken-attn-multiseq` (per-row position and per-row
-KV region for rows from different sequences). What is missing:
+**B2.3 continuous batching -- OPEN. The three ops that are NOT row-independent
+now honour the per-row tables; the engine and the scheduler are what is left.**
 
-1. `Backend::rope` takes a scalar `pos0` -- a batch whose rows are at different
-   positions needs the per-row table, and that is a new backend entry point with
-   a capability query, because the HIP/NPU backends cannot silently inherit it.
-2. `kv_append` still writes at `pos0 + t` and ignores `row_kv_base` (both the f32
-   and the int8 arm), so a batched decode would overwrite another sequence's row.
-3. The engine has one `kv_pos_` and one KV region; batching needs N regions
-   (`region = layer_stride * n_layer`, base per row) and a per-slot cursor.
-4. The server needs a scheduler that admits, prefills one at a time and
-   decode-batches the active set, with per-sequence sampler state.
+`AttnDesc::row_pos` / `row_kv_base` were already implemented in the CPU attention
+path. This session finished the other two, and `kraken-attn-multiseq` now proves
+the whole contract bit for bit -- five arms, each comparing one batched call
+against one call per sequence:
 
-Items 1 and 2 are small and testable on their own (`kraken-attn-multiseq` already
-proves the contract for attention). Item 3 is the one that decides whether this
-ships for MLA models too: the dense/GQA path is row-independent, but
-`mla_attention`/`mla_shared_attention*` and the compressed/indexer variants each
-own their cache addressing, so a batched MLA decode is a separate piece of work.
+| op | change | arm |
+|---|---|---|
+| `attention()` | (was already done) | dense causal, non-causal, sparse run list |
+| `kv_append()` | per-row position and region base, f32 and int8 | 2 arms |
+| `rope()` | new `Backend::rope_rows()`, default REFUSES (`false`) so HIP/NPU cannot silently rotate at `pos0 + t` | 1 arm |
+
+**The negative controls were observed**, because an arm that cannot fail is not
+evidence: with `kv_append` reverted to `pos0 + t` both write arms print
+`CHANGED`; with `rope_rows` removed the tool prints
+`unsupported on this backend (refused, not guessed)` and fails; and with the
+pre-session sparse addressing restored the run **segfaults**, which is the
+out-of-bounds the fix removed.
+
+That segfault was a real latent defect, not a test artifact:
+`attn_sparse_rows` formed its address as `(row_kv_base + j) * pos_stride` while
+every other path uses `row_kv_base + j * pos_stride`. It was harmless only
+because no caller sets `row_kv_base` yet -- i.e. it would have failed exactly when
+B2.3 started using the field. Fixed, and the arm above is what keeps it fixed.
+
+What is left, in order:
+
+1. **N KV regions in the engine.** One `kv_pos_` and one region today; batching
+   needs `region = layer_stride * n_layer`, a per-row base, and a per-slot
+   cursor. This is the invasive one: `kv_pos_` is read by the KV tier, the dump
+   header, health, prefix reuse and the speculative paths.
+2. **A batched decode step** -- one `forward` with K rows, per-row
+   (token, position, slot base), K logit rows, per-sequence sampler state.
+3. **A scheduler in the server** that admits, prefills one at a time (a prefill
+   of sequence s is just rows 0..n-1 at slot s) and decode-batches the active
+   set, streaming each sequence's deltas to its own connection.
+4. **MLA/compressed attention for the batched case.** The dense/GQA path is
+   row-independent once the cache base is per row; `mla_attention`,
+   `mla_shared_attention*` and the compressed/indexer variants each own their
+   cache addressing, so they need the same treatment before a deepseek-class
+   model can be batched.
+
 *Done when:* 4 concurrent requests hold aggregate tok/s above one-at-a-time with
-each response identical to its solo run.
+each response identical to its solo run -- unchanged, and not yet met. The honest
+statement today: the per-op contract is ready and pinned, the engine is not.
 
 ### B3 -- A trace file carries no identity -- DONE
 

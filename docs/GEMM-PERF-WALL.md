@@ -354,12 +354,19 @@ corrections, both from `tools/bench_isa_ceiling.cpp` in one process:
 
 > **Correction, same day.** `E` is not the production kernel: the engine has
 > called the 16-lane scale-table kernel (`dot_q8_0_q8_wsc8`) since the table
-> landed, and that one measures 48.1-49.1 GMAC/s in
-> `kraken-q80-gemm-bench` (768x2048x512, nc=128) -- **~60% of V1, not 40%**.
-> The paragraph below is kept as written because its argument (judge against V1,
-> not against the maddubs ceiling) is right; its fraction is about the wrong
-> kernel. See *The prefill GEMM is at its own ceiling*, and the pv8 section at
-> the end of this file, for what is true of the shipped one.
+> landed. In one process, interleaved, `kraken-q80-gemm-bench` (768x2048x512,
+> nc=128, best of five, four runs) measures **wsc8 at 1.40x `E`** -- 48.1-49.1
+> against 34.0-35.7 GMAC/s. The paragraph below is kept because its argument
+> (judge against V1, not against the maddubs ceiling) is right; its 40% is about
+> the pre-table kernel.
+>
+> **And the ratio to V1 cannot be stated more precisely than "within the noise
+> floor".** `kraken-isa-ceiling` measures the shipped kernel `T` against `V1` in
+> ONE process and gets **70% in one call and 110% in the next**, same function,
+> same data. This host's run-to-run spread for identical code is up to 1.5x, so
+> every absolute GMAC/s number in this file is a same-session ratio and nothing
+> else. That is also why "40% of V1" (a cross-session comparison against the
+> wrong kernel) should never have been quoted.
 
 So the number the kernel should be judged against is **V1, the exact
 instruction mix it ships**, not the maddubs ceiling. Against V1 the production
@@ -566,7 +573,8 @@ Same-run ratios, which is the only comparison the host's noise permits:
 
 * **the table is worth 1.45x / 1.47x / 1.52x / 1.56x on prefill** — consistently
   larger than the 1.08-1.19x it is worth on decode, exactly as an
-  instruction-bound loop should behave;
+  instruction-bound loop should behave (re-measured 2026-10-31 as 1.38-1.41x
+  with both kernels timed back to back in one process);
 * the shipped GEMM is at **67-105% of V1** (median ~76%), not the 40% that was
   reported against the pre-table kernel.
 
@@ -742,3 +750,29 @@ The kernel now lives in `tools/bench_q80_gemm.cpp` -- the bench that measures it
 shipped code. The bench prints `identical: x8 vs pv8` on every run, so the
 identity claim in the paragraph above is checked by the artifact that reports the
 loss.
+
+### The `W` arm is not a shippable 1.38x
+
+`kraken-isa-ceiling`'s `W` arm prints 1.38x over `T` (60.7 against 44.0 GMAC/s in
+one process, 2026-10-31). It is a harness artifact, and saying so matters more
+than the number: `W`'s ACTIVATION scale table is built from constants
+(`e0 = 0.011f + ...`) outside the timed loop, while `T` calls
+`build_q8_0_xscales` per row tile INSIDE it. So `W` prices a kernel that does not
+need an activation scale at all -- which is L1, the rung the ablation already
+showed is free. The only legal form of the idea is hoisting the per-tile build,
+which the backend already does (`KRK_CPU_XSC_HOIST`), and its effect is under the
+noise floor.
+
+### What B1 closes as
+
+| claim | evidence |
+|---|---|
+| the engine ships the table kernel; the "40% / 32.2 GMAC/s" numbers are the pre-table one | `src/backend_cpu.cpp` calls `dot_q8_0_q8_wsc8` when `q8_0_wsc_supported()`; `bench_q80_ablate` L0 and `bench_isa_ceiling` E both drive `dot_q8_0_q8_x8` |
+| the table is worth ~1.4x, measured interleaved in one process | `bench_q80_gemm` 4-column sweep, four runs |
+| no remaining legal repack pays | pv8, bit-identical, 0.93x |
+| the distance to V1 is unresolvable here | T/V1 = 70% and 110% in one process, same function |
+| the target is arithmetic, not a kernel | 48-49 GMAC/s is ~16 tok/s of prefill per core at ~3 GMAC/token; four cores ~64 against a 200 target |
+
+**Conclusion: B1 is measured and closed with no legal win.** The next lever is a
+format whose scale group is longer than 32 by construction -- a different model's
+arithmetic, not a faster kernel for this one.
