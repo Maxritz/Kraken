@@ -1404,6 +1404,11 @@ public:
                 });
     }
 
+    // attn_pos()/attn_kv_base() are what make this true: every attention arm
+    // above (int8, f32 vector, f32 scalar, sparse) and kv_append() resolve the
+    // row's own position and region base.
+    bool attn_multiseq_supported() const override { return true; }
+
     bool gather_rows_supported() const override { return true; }
 
     void gather_rows(void *dst, const void *src, const i64 *idx, i64 n_rows,

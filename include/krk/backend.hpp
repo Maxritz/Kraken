@@ -1053,6 +1053,13 @@ public:
                       i64 pos0, const f32 *inv_freq, f32 scale, f32 frac,
                       bool neox) = 0;
 
+    // Whether attention()/kv_append() honour AttnDesc::row_pos and
+    // row_kv_base. False by default, because a backend that ignores them reads
+    // whatever region its own base points at and returns fluent text from the
+    // wrong sequence -- the failure mode batching makes possible. The CPU
+    // backend implements both (see attn_pos/attn_kv_base in backend_cpu.cpp).
+    virtual bool attn_multiseq_supported() const { return false; }
+
     // Per-row rotary positions, for a forward that carries rows from different
     // sequences (the batching case AttnDesc::row_pos exists for). Row t is
     // rotated at row_pos[t]; everything else is rope()'s contract.
