@@ -46,7 +46,7 @@ ways:
 | `gpt-oss` | Partial | loads, inits, generates on its own schema | **Partial** (loader schema only) |
 | `deepseek4` | Partial | covered by C1 above | **Partial** |
 | `k2-horizon` | No | refused, names "routed experts on the attention values (attn_v_exps)" | **No** |
-| `minimax-m3` | No | refused, names MiniMax Sparse Attention | **No** |
+| `minimax-m3` | **Yes** | refused, names MiniMax Sparse Attention | **DONE 2026-10-31**: schema from llama.cpp, block selector in `Engine::msa_select_block` |
 | `diffuse` | No | refused, names block diffusion | **No** |
 | `dspark` | No | refused, names its markov head | **No** |
 | `deepseek4-dspark` | No | refused, names the multi-token-prediction head shard | **No** |

@@ -541,3 +541,47 @@ logits for one block on THIS pairing decide the file.
 at load with `[error] hipErrorLaunchFailure` inside the paging H2D
 `hipMemcpyAsync`, rc=127 with buffered stdout lost; a plain rerun and a
 debug rerun both completed rc=0. One occurrence, non-reproducing.
+
+---
+
+## DSpark, as the reference defines it
+
+A DSpark file **is** a DFlash file: the reference loads it with its DFlash
+loader and adds two heads when `markov_w1` is present. That is why
+`general.architecture` cannot be used to tell the two apart, and why
+`Engine::load_draft` probes the tensors instead.
+
+| tensor | shape (ggml order) | role |
+|---|---|---|
+| `markov_w1.weight` | `[rank, n_vocab]` | row gather by the previous token |
+| `markov_w2.weight` | `[rank, n_vocab_draft]` | the bigram bias, one column per candidate |
+| `markov_w2.scale` | `[n_vocab]` | optional, multiplies the gathered row before `w2` |
+| `dspark_conf_proj.weight` | `[n_embd + rank, 1]` | confidence, over `[hidden ; w1_prev]` |
+| `dspark_conf_proj.bias` | `[1]` | optional |
+
+Metadata: `dflash.block_size` (required) and `dflash.sample_from_anchor`.
+
+The chain, per candidate row `i`:
+
+```
+w1_prev = row(markov_w1, prev)          # prev starts at the last committed token
+bias    = markov_w2 @ w1_prev           # NO activation between the two tables
+col     = logits_i + bias
+prev    = argmax(col)                   # greedy by construction
+conf_i  = sigmoid(dot(conf_proj, [hidden_i ; w1_prev]) + conf_bias)
+```
+
+Two things this engine got wrong before the rewrite, both now pinned by
+`test_dspark_head_set`:
+
+* a ReLU between the two Markov tables -- the reference has none, and a
+  plausible-looking extra activation biases every proposal;
+* a confidence projection over `[n_embd]` instead of `[n_embd + rank]`, which a
+  real file would have been refused for as "inconsistent shapes".
+
+`src/dspark.cpp` owns a `DflashDraft` for the block rather than reimplementing
+one, so a block fix reaches both drafters. The confidence is not decoration:
+`KRK_DSPARK_CONF_THRESH` (0 = report only, the default) cuts the staged
+proposals at the first row the drafter itself does not believe, keeping at least
+one -- a row the drafter disbelieves costs a verifier slot it will lose and a
+rollback it will pay for.

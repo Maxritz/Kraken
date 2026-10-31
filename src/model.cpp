@@ -664,6 +664,32 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // Nothing here pretends otherwise.
     }
 
+    // minimax-m3: llama.cpp spells the indexer's four tensors `index_{q,k}_proj`
+    // / `index_{q,k}_norm`, this engine binds qwen4exp's `indexer.*` names, and
+    // that is the whole difference between the two schemas' indexers. One alias
+    // per tensor, added only where the target is absent so a file using either
+    // spelling loads.
+    if (aspec.msa) {
+        const std::pair<const char *, const char *> idx_map[] = {
+            {"blk.%d.indexer.q_proj.weight", "blk.%d.index_q_proj.weight"},
+            {"blk.%d.indexer.k_proj.weight", "blk.%d.index_k_proj.weight"},
+            {"blk.%d.indexer.q_norm.weight", "blk.%d.index_q_norm.weight"},
+            {"blk.%d.indexer.k_norm.weight", "blk.%d.index_k_norm.weight"},
+        };
+        i32 bound = 0;
+        for (i32 l = 0; l < cfg_.n_layer; l++)
+            for (const auto &m : idx_map)
+                if (gguf_.add_alias(blk_key(m.first, l), blk_key(m.second, l))) bound++;
+        if (bound == 0) {
+            if (err)
+                *err = "arch '" + a + "': every layer after the dense lead "
+                       "selects its keys by block, and no layer carries the "
+                       "indexer tensors (index_q_proj / index_k_proj / "
+                       "index_q_norm / index_k_norm)";
+            return false;
+        }
+    }
+
     cfg_.tied_embeddings = (gguf_.tensor("output.weight") == nullptr);
 
     // ---- chat template ---------------------------------------------------
@@ -1089,6 +1115,27 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                        "nope = key_length - rope.dimension_count)";
             return false;
         }
+    }
+
+    // ---- minimax-m3: MiniMax Sparse Attention ----------------------------
+    // The indexer's geometry keys are the same three V4's lightning indexer
+    // uses; what it does with them is different, so the block size and the
+    // forced local window are read here and the selection is decided by the
+    // layer's position in the stack (the leading layers are dense). A file
+    // that declares a block size but no geometry is refused in Engine::init,
+    // where the selector asks for all five.
+    if (aspec.msa) {
+        cfg_.msa = true;
+        cfg_.idx_block = static_cast<i32>(
+            gguf_.get_i64(key(".attention.indexer.block_size"), 0));
+        cfg_.idx_local = static_cast<i32>(
+            gguf_.get_i64(key(".attention.indexer.local_blocks"), 0));
+        cfg_.idx_n_head = static_cast<i32>(
+            gguf_.get_i64(key(".attention.indexer.head_count"), 0));
+        cfg_.idx_head_dim = static_cast<i32>(
+            gguf_.get_i64(key(".attention.indexer.key_length"), 0));
+        cfg_.idx_top_k = static_cast<i32>(
+            gguf_.get_i64(key(".attention.indexer.top_k"), 0));
     }
 
     // ---- DeepSeek-V4 extras ---------------------------------------------
@@ -3828,7 +3875,13 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // A layer's QSA indexer is keyed on its own compress ratio.
         if (cfg_.qsa && l < static_cast<i32>(cfg_.qsa_ratio.size()))
             L.qsa_ratio = cfg_.qsa_ratio[static_cast<size_t>(l)];
-        if (L.qsa_ratio > 0) {
+        // minimax-m3's split is the opposite way round: the LEADING layers are
+        // dense and every layer after them selects blocks, so the flag is
+        // derived from the leading-dense count rather than per-layer metadata.
+        // `M3.1 replaced the last full-attention layers`, so there is no dense
+        // tail to fall back on.
+        if (cfg_.msa) L.msa = l >= cfg_.n_dense_lead;
+        if (L.qsa_ratio > 0 || L.msa) {
             L.idx_q_proj = need(blk_key("blk.%d.indexer.q_proj.weight", l));
             L.idx_k_proj = need(blk_key("blk.%d.indexer.k_proj.weight", l));
             L.idx_q_norm = upload_f32(blk_key("blk.%d.indexer.q_norm.weight", l));
@@ -3849,9 +3902,10 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 !L.idx_q_norm || !L.idx_k_norm) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
-                           " declares a compress ratio (" +
-                           std::to_string(L.qsa_ratio) +
-                           ") but carries no QSA indexer tensors";
+                           (L.msa ? " selects its keys by block (MSA)"
+                                  : " declares a compress ratio (" +
+                                        std::to_string(L.qsa_ratio) + ")") +
+                           " but carries no indexer tensors";
                 return false;
             }
         }
