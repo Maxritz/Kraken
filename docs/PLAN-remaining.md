@@ -98,7 +98,7 @@ the mask row at any depth -- gaps 0.02-1.1 from embed through post-`l4`, flat
 final -- while capture scale, KV norms, the KV self-check, the attention route
 and the mask id are all healthy. Plumbing is excluded; the open branch is
 **checkpoint pairing / basis mismatch**. Full probe data in
-[DFLASH-DRAFFER.md](DFLASH-DRAFFER.md) §11.
+[DFLASH-DRAFTER.md](DFLASH-DRAFTER.md) §11.
 
 **How:** (i) a DFlash2 head on its own Qwen3.8 pairing -- proves the engine path
 can produce sharp rows at all; (ii) upstream reference logits for one block on
