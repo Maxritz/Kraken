@@ -395,6 +395,18 @@ Refusal stays by name for what genuinely has no per-row form: diffusion,
 recurrent state, block indexers (QSA/MSA), hyper-connections, PLE windows, the MoE
 route predictor, draft heads, learned positions, ALiBi and a paged KV tier.
 
+**Verified in the tree, 2026-10-31** (this is what the summary line above used to
+contradict): `Backend::mla_multiseq_supported()` defaults to false at
+`include/krk/backend.hpp:1167` and the CPU backend overrides it to true at
+`src/backend_cpu.cpp:1937`; the per-slot spans are `src/engine.cpp:1805-1840`
+(`comp_state_kv_`/`comp_state_sc_`/`comp_pooled_`/`comp_kpos_`/`idx_state_*`/
+`idx_key_`, each `n_slots` copies, `comp_nblocks_` `n_layer * n_slots`); the row
+resolution is one pair of accessors, `mla_pos`/`mla_row_base`, at
+`src/backend_cpu.cpp:341-350`, used by every latent op; and the pass -- not just
+the refusal -- is asserted by `mla_batch_arm` in `test_batch_decode`, which runs
+a wave against a V2-lite, a V4 shared-latent and a V4 CSA+HCA fixture and
+compares each slot's tokens to that sequence's solo run.
+
 **Measured.** Both arms are in `test_batch_decode` (86 checks, in the default
 gate) and `test_batch_throughput` (serial group):
 
@@ -667,14 +679,23 @@ Status is per bucket as of 2026-10-31.
 | 6 | **B1.4** -- GMAC/s -> tok/s projection | **done** (numbers under *B1*): 48-49 GMAC/s is ~16 tok/s of prefill per core at ~3 GMAC/token, so 4 cores is ~64, and the gap to 200 is arithmetic no kernel change closes |
 | 7 | **B2.1** -- server cancellation | **done**, `test_cancel_and_prefix` |
 | 8 | **B2.2** -- prefix reuse across requests (the record is the run, not the prompt) | **done**, same group |
-| 9 | **B2.3** -- continuous batching | **partly done**: slots, batched decode and the wave scheduler are in and gated (52 checks); MLA/compressed/indexer models are refused by name; the aggregate win is measured at 1.08x-1.27x transfer-bound, 1.02x resident |
+| 9 | **B2.3** -- continuous batching | **done**: slots, batched decode, the wave scheduler and per-row addressing in all three latent-attention layouts are in and gated (`test_batch_decode`, 86 checks -- MLA lite, V4 shared-latent and V4 CSA+HCA each produce their solo tokens exactly); refused by name only for what has no per-row form; aggregate win 1.08x-1.27x transfer-bound, 1.02x resident |
 | 10 | **B3** -- trace identity and truncation reporting | **done**, `test_dump_identity` 17/17 |
 | 11 | **B4** -- TSAN listen-descriptor lifetime | **done**, `kraken-tsan-http-listen` clean, old code reproduces the race |
 | 12 | **A3** -- DFlash2 head on its own pairing, then upstream logits | *needs files* |
 | 13 | **A5** -- OLMoE against an independent oracle | *needs a file and an oracle run* |
 | 14 | **A4** -- `gemma2` (and the vision rows, if wanted) on real files | *needs files* |
 
-**What a session without files can still move:** B2.3 item 4 -- per-row
-addressing for MLA/compressed attention -- which is the one part of it that is
-refused rather than implemented. Everything else in the table either needs a
-checkpoint or is closed by a measurement that now exists.
+**What a session without files can still move:** nothing in B2.3. Item 4
+landed with the per-row tables and is gated end to end -- three latent-attention
+layouts, batched against their own solo runs -- so the wave is not a code item
+any more. Everything else in the table either needs a checkpoint or a second
+machine, or is closed by a measurement that now exists.
+
+*Corrected 2026-10-31.* This paragraph used to name item 4 as "the one part of
+it that is refused rather than implemented", and the order table repeated it.
+Both were true when B2.3 was written and stopped being true when the per-row
+tables landed. The cost of the drift is on the record because it is the point:
+a session read the claim, treated a finished feature as the next piece of work,
+and spent an hour re-deriving the code before finding the tests. A stale line in
+this file is not cosmetic.

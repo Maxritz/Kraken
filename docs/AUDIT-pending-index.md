@@ -37,9 +37,16 @@ No commits, pushes, deployments or sibling-project edits were performed.
   equivalence.
 - **Long Spark CPU coherence:** 160-token scalar arm timed out (120s).
   All 133 observed picks matched; no full long CPU pass asserted.
-- **TSAN:** listen descriptor race, reported GDN test lifetime/UAF, stale
-  sanitizer baseline. An atomic descriptor alone does not settle close/reuse
-  ownership; design shutdown lifetime then verify under sanitizer.
+- ~~**TSAN:** listen descriptor race, reported GDN test lifetime/UAF, stale
+  sanitizer baseline.~~ **Settled 2026-10-31 (B4).** The descriptor's ownership
+  was redesigned rather than made atomic: it belongs to the thread inside
+  `run()` until that thread returns, `stop()` raises a flag and never touches
+  the number, the loop waits in a bounded `poll()` instead of `accept()`, and
+  the close is a `compare_exchange_weak(fd, -1)`. `tools/tsan_http_listen.cpp`
+  reports the race on the pre-B4 `src/http.cpp` (stop:510 vs run:481) and is
+  clean on the current one; `test_http_listener_lifetime` is 15/15. See
+  [PLAN-remaining.md](PLAN-remaining.md) §B4. Do not re-open without new
+  evidence -- the negative control is recorded.
 - **T13:** permanent fast-path numerical/text equivalence coverage beyond the
   new attention probe; speculation is tested in the suite already, not the
   bench gate. Do not call the existing self-draft coverage missing.
